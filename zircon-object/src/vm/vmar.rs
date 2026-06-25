@@ -1031,10 +1031,32 @@ impl VmMapping {
         Ok(())
     }
 
-    /// Clone VMO and map it to a new page table. (For Linux)
+    /// Clone VMO and map it to a new page table. (For Linux fork)
+    ///
+    /// Eager full copy — NOT copy-on-write. The Zircon-style hidden-node COW
+    /// tree mis-replicated the address space for a process that *runs* (rather
+    /// than immediately `execve`s) after `fork`: openrc-init and its forked
+    /// children faulted with SIGSEGV on writes to pages that fork should have
+    /// provided (NULL / unmapped heap-BSS writes, and writes to pages whose COW
+    /// copy never happened), while busybox — which always fork+exec's — never
+    /// exercised it. We give the child a straight, independent copy of the
+    /// parent VMO's current contents instead. It costs more memory and copy time
+    /// than COW, but it is correct, and it leaves the PARENT completely untouched
+    /// (no COW write-protect of its pages), so the forking process keeps writing
+    /// to its own frames without faulting.
     fn clone_map(&self, page_table: Arc<Mutex<dyn GenericPageTable>>) -> ZxResult<Arc<Self>> {
-        //这里调用 hal protect 后, protect() 好像会破坏页表
-        let new_vmo = self.vmo.create_child(false, 0, self.vmo.len())?;
+        let len = self.vmo.len();
+        let new_vmo = VmObject::new_paged(len / PAGE_SIZE);
+        // Copy the parent's current contents page by page. `read` commits /
+        // fills-from-source as needed (so file-backed .text and demand-zero BSS
+        // come through correctly); `write` commits the fresh child frames.
+        let mut buf = vec![0u8; PAGE_SIZE];
+        let mut off = 0;
+        while off < len {
+            self.vmo.read(off, &mut buf)?;
+            new_vmo.write(off, &buf)?;
+            off += PAGE_SIZE;
+        }
         let mapping = Arc::new(VmMapping {
             inner: Mutex::new(self.inner.lock().clone()),
             permissions: self.permissions,
