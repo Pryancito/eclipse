@@ -346,60 +346,23 @@ impl Ext2MountINode {
         blocks.min(MAX_DIR_BLOCKS)
     }
 
-    /// Look up a single child by name scanning every directory block,
-    /// including those reachable through indirect block pointers.
+    /// Look up a single child by name.
+    ///
+    /// Path resolution is hot: opening, stat-ing or accessing any path calls
+    /// this once per component. Reuse the parsed, cached directory listing — the
+    /// same one `readdir` uses, invalidated on every `create`/`unlink`/`link`/
+    /// `move_` — so repeated lookups in a directory don't re-scan and re-parse
+    /// its blocks each time. (The block-level cache already keeps the underlying
+    /// sectors in RAM; this additionally skips the per-lookup parse.) The cached
+    /// listing excludes "." and "..", and `find` resolves those before calling
+    /// here, so a plain name search is complete.
     fn find_direct_child(&self, name: &str) -> Result<usize> {
-        let cur = self.fresh_inode();
-        if !cur.is_dir() {
-            return Err(FsError::NotDir);
-        }
-        let block_size = self.fs.block_size;
-        let log_block_size = self.fs.synced.inner().log_block_size();
-        let n_blocks = self.data_block_count(&cur).max(1);
-        for block_idx in 0..n_blocks {
-            let disk_block = match cur.try_block(block_idx) {
-                Ok(Some(b)) => b.get(),
-                Ok(None) => break,
-                Err(_) => return Err(FsError::DeviceError),
-            };
-            let byte_base = Address::<Size512>::with_block_size(disk_block, 0, log_block_size)
-                .into_index() as usize;
-            let mut block = vec![0u8; block_size];
-            self.fs
-                .device
-                .read_at(byte_base, &mut block)
-                .map_err(|_| FsError::DeviceError)?;
-            let mut off = 0usize;
-            while off < block_size {
-                if off + 8 > block_size {
-                    break;
-                }
-                let rec = &block[off..];
-                let inode_num = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
-                let rec_len = u16::from_le_bytes([rec[4], rec[5]]) as usize;
-                if rec_len < 8 || rec_len % 4 != 0 || off + rec_len > block_size {
-                    break;
-                }
-                if inode_num == 0 {
-                    // A zero inode is a deleted entry (hole), not end-of-block:
-                    // `remove_dir_entry` leaves one when the first entry of a
-                    // block is unlinked. Live entries may follow it.
-                    off += rec_len;
-                    continue;
-                }
-                let name_len = rec[6] as usize;
-                if name_len + 8 > rec_len {
-                    break;
-                }
-                let entry_name = core::str::from_utf8(&rec[8..8 + name_len])
-                    .map_err(|_| FsError::InvalidParam)?;
-                if entry_name != "." && entry_name != ".." && entry_name == name {
-                    return Ok(inode_num as usize);
-                }
-                off += rec_len;
-            }
-        }
-        Err(FsError::EntryNotFound)
+        let entries = self.list_dir_entries()?;
+        entries
+            .iter()
+            .find(|(entry_name, _)| entry_name == name)
+            .map(|(_, inode_num)| *inode_num)
+            .ok_or(FsError::EntryNotFound)
     }
 
     /// Scan directory data blocks using the synced inode's block map, walking
