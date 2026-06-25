@@ -1,9 +1,9 @@
 //! File handle for process
 
-use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc};
 
 use async_trait::async_trait;
-use lock::{Mutex, RwLock};
+use lock::RwLock;
 
 use rcore_fs::vfs::{FileType, FsError, INode, Metadata, PollStatus, Timespec};
 use zircon_object::object::*;
@@ -110,95 +110,11 @@ pub struct File {
 
 impl_kobject!(File);
 
-/// Readahead window ceiling, in pages. A purely-sequential scan reads at most
-/// this many pages in one backing read before serving from memory.
-const READAHEAD_MAX_PAGES: usize = 16; // 64 KiB at a 4 KiB page
-
-/// Per-mapping sequential-readahead buffer.
-///
-/// A file-backed mapping is demand-paged one page per fault, i.e. one inode
-/// read per page for a sequential scan. This buffer collapses such a scan into
-/// a few large reads: on a sequential miss it reads a window of several pages
-/// at once and serves the following faults from memory, ramping the window up
-/// while access stays sequential and snapping back to a single page on a random
-/// jump (so random access never reads more than it needs).
-///
-/// It is purely an I/O optimisation — the bytes placed into a page are exactly
-/// those a single-page read would have produced (see the equivalence tests).
-struct Readahead {
-    /// Cached source bytes and the mapping offset `buf[0]` corresponds to.
-    buf: Vec<u8>,
-    buf_off: usize,
-    /// Valid bytes in `buf`; a short backing read leaves the tail invalid.
-    buf_len: usize,
-    /// Mapping offset the next *sequential* fault is expected at.
-    next_off: usize,
-    /// Current readahead window in pages, ramped 1 -> MAX while sequential.
-    window_pages: usize,
-}
-
-impl Readahead {
-    fn new() -> Self {
-        Self {
-            buf: Vec::new(),
-            buf_off: 0,
-            buf_len: 0,
-            next_off: usize::MAX, // first access counts as non-sequential
-            window_pages: 1,
-        }
-    }
-
-    /// Fills one pre-zeroed `page` with source bytes at mapping `offset`.
-    ///
-    /// `source_len` bounds the readable region (bytes at or past it stay zero,
-    /// the BSS tail). `read(off, dst) -> valid` fetches source bytes starting at
-    /// mapping offset `off` into `dst`, returning how many are valid (0 at
-    /// EOF/error); the caller bounds `dst` to the source so `read` never runs
-    /// past end-of-file.
-    fn fill_page<F>(&mut self, offset: usize, page: &mut [u8], source_len: usize, mut read: F)
-    where
-        F: FnMut(usize, &mut [u8]) -> usize,
-    {
-        if offset >= source_len {
-            return; // wholly past end-of-file: leave the page zero
-        }
-        let want = (source_len - offset).min(page.len());
-
-        // 1. Serve from the buffer when the whole requested span is cached.
-        if offset >= self.buf_off && offset + want <= self.buf_off + self.buf_len {
-            let s = offset - self.buf_off;
-            page[..want].copy_from_slice(&self.buf[s..s + want]);
-            self.next_off = offset + page.len();
-            return;
-        }
-
-        // 2. Miss: read a window ahead when sequential, else just this page.
-        self.window_pages = if offset == self.next_off {
-            (self.window_pages * 2).min(READAHEAD_MAX_PAGES)
-        } else {
-            1
-        };
-        let chunk = (self.window_pages * page.len()).min(source_len - offset);
-        self.buf.clear();
-        self.buf.resize(chunk, 0);
-        let valid = read(offset, &mut self.buf).min(chunk);
-        self.buf_off = offset;
-        self.buf_len = valid;
-
-        // 3. Serve this page from the freshly read window (short read -> the
-        // unread tail stays zero, exactly as a single-page read would leave it).
-        let avail = want.min(valid);
-        page[..avail].copy_from_slice(&self.buf[..avail]);
-        self.next_off = offset + page.len();
-    }
-}
-
 /// Demand-paging source for a file-backed `mmap` (see [`get_vmo`]).
 ///
-/// Reads from the backing inode the first time a page is touched, so a large
-/// mapping (e.g. `libLLVM.so`) is paged in lazily instead of being read into
-/// memory in full at map time. A [`Readahead`] window batches the inode reads
-/// of a sequential scan without changing the bytes any page receives.
+/// Reads one page from the backing inode the first time that page is touched,
+/// so a large mapping (e.g. `libLLVM.so`) is paged in lazily instead of being
+/// read into memory in full at map time.
 ///
 /// [`get_vmo`]: File::get_vmo
 struct FileFrameFiller {
@@ -208,9 +124,6 @@ struct FileFrameFiller {
     /// Number of readable bytes from `file_offset` within the mapping. Pages
     /// past this are left zero (the BSS tail of the mapping).
     source_len: usize,
-    /// Sequential-readahead state. Guarded by a mutex for soundness; in practice
-    /// the VMO serialises `fill_page` under its own lock, so it never contends.
-    readahead: Mutex<Readahead>,
 }
 
 impl zircon_object::vm::FrameFiller for FileFrameFiller {
@@ -219,26 +132,21 @@ impl zircon_object::vm::FrameFiller for FileFrameFiller {
     }
 
     fn fill_page(&self, offset: usize, buf: &mut [u8]) {
-        let inode = &self.inode;
-        let file_offset = self.file_offset;
-        self.readahead
-            .lock()
-            .fill_page(offset, buf, self.source_len, |off, dst| {
-                // Read `dst` worth of source bytes at mapping offset `off`,
-                // looping over short reads. A read error mid-mapping leaves the
-                // rest zero-filled; the faulting access proceeds rather than
-                // wedging the kernel.
-                let file_pos = file_offset + off;
-                let mut done = 0;
-                while done < dst.len() {
-                    match inode.read_at(file_pos + done, &mut dst[done..]) {
-                        Ok(0) => break,
-                        Ok(n) => done += n,
-                        Err(_) => break,
-                    }
-                }
-                done
-            });
+        if offset >= self.source_len {
+            return;
+        }
+        let want = (self.source_len - offset).min(buf.len());
+        let file_pos = self.file_offset + offset;
+        let mut done = 0;
+        while done < want {
+            match self.inode.read_at(file_pos + done, &mut buf[done..want]) {
+                Ok(0) => break,
+                Ok(n) => done += n,
+                // A read error mid-mapping leaves the rest zero-filled; the
+                // faulting access proceeds rather than wedging the kernel.
+                Err(_) => break,
+            }
+        }
     }
 }
 
@@ -570,7 +478,6 @@ impl FileLike for File {
                     inode: inner.inode.clone(),
                     file_offset: offset,
                     source_len,
-                    readahead: Mutex::new(Readahead::new()),
                 });
                 Ok(VmObject::new_paged_with_source(pages(len), source))
             }
@@ -586,93 +493,5 @@ impl FileLike for File {
             }
             _ => Err(LxError::ENOSYS),
         }
-    }
-}
-
-#[cfg(test)]
-mod readahead_tests {
-    use super::{Readahead, READAHEAD_MAX_PAGES};
-    use alloc::vec;
-    use alloc::vec::Vec;
-    use core::cell::Cell;
-
-    const PAGE: usize = 16;
-
-    /// Deterministic, non-aligned source pattern.
-    fn data(len: usize) -> Vec<u8> {
-        (0..len).map(|i| (i % 251) as u8).collect()
-    }
-
-    /// What a single-page (non-readahead) fill must produce for `off`.
-    fn reference(src: &[u8], source_len: usize, off: usize) -> Vec<u8> {
-        let mut page = vec![0u8; PAGE];
-        if off < source_len {
-            let want = (source_len - off).min(PAGE);
-            page[..want].copy_from_slice(&src[off..off + want]);
-        }
-        page
-    }
-
-    /// Drives `Readahead` over `offsets`, asserting every page matches the
-    /// single-page reference; returns how many backing reads it issued.
-    fn run(src: &[u8], source_len: usize, offsets: &[usize]) -> usize {
-        let reads = Cell::new(0usize);
-        let mut ra = Readahead::new();
-        for &off in offsets {
-            let mut page = vec![0u8; PAGE];
-            ra.fill_page(off, &mut page, source_len, |o, dst| {
-                reads.set(reads.get() + 1);
-                let n = dst.len().min(source_len.saturating_sub(o));
-                dst[..n].copy_from_slice(&src[o..o + n]);
-                n
-            });
-            assert_eq!(page, reference(src, source_len, off), "offset {}", off);
-        }
-        reads.get()
-    }
-
-    #[test]
-    fn sequential_scan_is_equivalent_and_batches_reads() {
-        let len = PAGE * 40;
-        let src = data(len);
-        let offsets: Vec<usize> = (0..40).map(|p| p * PAGE).collect();
-        let reads = run(&src, len, &offsets);
-        // Equivalence held (asserted inside `run`); and readahead actually
-        // collapsed the 40 per-page reads into far fewer windowed ones.
-        assert!(reads < 40, "expected batching, got {} reads", reads);
-        assert!(reads >= len.div_ceil(READAHEAD_MAX_PAGES * PAGE));
-    }
-
-    #[test]
-    fn random_and_strided_access_stay_equivalent() {
-        let len = PAGE * 64;
-        let src = data(len);
-        // Strided (every other page) then a deterministic pseudo-random walk.
-        let mut offsets: Vec<usize> = (0..32).map(|p| (p * 2) * PAGE).collect();
-        let mut x: usize = 12345;
-        for _ in 0..200 {
-            x = x.wrapping_mul(1103515245).wrapping_add(12345);
-            offsets.push((x % 64) * PAGE);
-        }
-        run(&src, len, &offsets);
-    }
-
-    #[test]
-    fn partial_eof_page_and_beyond_are_equivalent() {
-        // source_len ends mid-page: the straddling page is half data/half zero,
-        // and any page wholly past the end is all zero.
-        let len = PAGE * 8 + 7;
-        let src = data(len + PAGE); // backing store longer than source_len
-        let offsets: Vec<usize> = (0..12).map(|p| p * PAGE).collect();
-        run(&src, len, &offsets);
-        // Re-touching the partial and the past-end pages out of order still matches.
-        run(&src, len, &[PAGE * 8, PAGE * 10, PAGE * 8, 0]);
-    }
-
-    #[test]
-    fn repeated_same_offset_is_equivalent() {
-        let len = PAGE * 4;
-        let src = data(len);
-        run(&src, len, &[0, 0, PAGE, PAGE, 0, PAGE * 3]);
     }
 }
