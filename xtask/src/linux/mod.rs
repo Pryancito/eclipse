@@ -899,8 +899,44 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         // /run exist so OpenRC's state dir has somewhere to attach.
         let _ = fs::create_dir_all(rootfs.join("run").join("openrc"));
 
+        // Stamp the dependency-tree source files (/etc/init.d, /etc/conf.d,
+        // /etc/rc.conf) with a fixed PAST mtime (2020-01-01 UTC). OpenRC's
+        // `rc_deptree_update_needed` takes the newest mtime among these and, if
+        // it is greater than the current time, prints "clock skew detected" and
+        // rewrites the deptree. The files otherwise carry their build-host mtime,
+        // which can sit *ahead* of the guest/RTC clock (timezone / RTC-convention
+        // differences), triggering the spurious warning on every boot. Pinning
+        // them to a clearly-past instant makes them older than any sane boot
+        // clock, on QEMU and on real hardware alike.
+        Self::pin_mtime_past(&rootfs.join("etc").join("init.d"));
+        Self::pin_mtime_past(&rootfs.join("etc").join("conf.d"));
+        Self::pin_mtime_past(&rootfs.join("etc").join("rc.conf"));
+
         println!("Installed OpenRC as the default init system (PID 1).");
         true
+    }
+
+    /// Set `path` (and, recursively, everything under it if it is a directory)
+    /// to a fixed past modification time: 2020-01-01 00:00:00 UTC
+    /// (`@1577836800`). Best-effort via `touch`; a failure just leaves the
+    /// build-host mtime and at worst re-arms the cosmetic OpenRC clock-skew
+    /// warning, so it never aborts the build.
+    fn pin_mtime_past(path: &Path) {
+        if !path.exists() {
+            return;
+        }
+        // `@SECONDS` is an absolute, timezone-independent epoch; `find ... +`
+        // touches the path itself and every entry beneath it in one pass.
+        let _ = Ext::new("find")
+            .arg(path)
+            .arg("-exec")
+            .arg("touch")
+            .arg("-h")
+            .arg("-d")
+            .arg("@1577836800")
+            .arg("{}")
+            .arg("+")
+            .status();
     }
 
     /// Compila thr3 con gcc del host (bare metal, sin libc).
