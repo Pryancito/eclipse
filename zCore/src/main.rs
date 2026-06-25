@@ -19,6 +19,7 @@ mod lang;
 
 mod fs;
 mod handler;
+mod invariants;
 mod platform;
 mod utils;
 
