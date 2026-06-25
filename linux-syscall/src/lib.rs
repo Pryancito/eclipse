@@ -234,10 +234,7 @@ impl Syscall<'_> {
             Sys::MMAP => self.sys_mmap(a0, a1, a2, a3, a4.into(), a5 as _).await,
             Sys::MPROTECT => self.sys_mprotect(a0, a1, a2),
             Sys::MUNMAP => self.sys_munmap(a0, a1),
-            Sys::MADVISE => {
-                info!("madvise unimplemented");
-                Ok(0)
-            }
+            Sys::MADVISE => self.sys_madvise(a0, a1, a2),
             Sys::MREMAP => self.unimplemented("mremap", Err(LxError::ENOMEM)),
             Sys::MBIND => self.unimplemented("mbind", Err(LxError::ENOSYS)),
             Sys::GET_MEMPOLICY => self.unimplemented("get_mempolicy", Err(LxError::ENOSYS)),
