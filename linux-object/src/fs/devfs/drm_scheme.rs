@@ -470,7 +470,7 @@ impl INode for DrmDev {
                 } else {
                     "card0"
                 };
-                log::error!(
+                log::debug!(
                     "[drm] VERSION — /dev/dri/{} opened by userspace (minor={})",
                     node,
                     self.minor
@@ -535,7 +535,7 @@ impl INode for DrmDev {
                     0x12 => cap.value = 1,
                     _ => cap.value = 0,
                 }
-                log::error!(
+                log::debug!(
                     "[drm] GET_CAP minor={} cap={:#x} -> {}",
                     self.minor,
                     cap.capability,
@@ -561,11 +561,11 @@ impl INode for DrmDev {
                 // the client stalls before presenting a frame (e.g. its renderer
                 // fails to init), the kernel text console stays usable and its
                 // logs visible instead of freezing on a black screen.
-                log::error!("[drm] SET_MASTER (minor={})", self.minor);
+                log::debug!("[drm] SET_MASTER (minor={})", self.minor);
                 Ok(0)
             }
             DRM_IOCTL_DROP_MASTER => {
-                log::error!(
+                log::debug!(
                     "[drm] DROP_MASTER (minor={}) — restoring text console",
                     self.minor
                 );
@@ -580,7 +580,7 @@ impl INode for DrmDev {
                     // back to the legacy KMS path, which the software
                     // framebuffer scanout implements.
                     DRM_CLIENT_CAP_ATOMIC | DRM_CLIENT_CAP_WRITEBACK_CONNECTORS => {
-                        log::error!(
+                        log::debug!(
                             "[drm] SET_CLIENT_CAP cap={} -> rejected (force legacy KMS)",
                             cap
                         );
@@ -588,7 +588,7 @@ impl INode for DrmDev {
                     }
                     // STEREO_3D, UNIVERSAL_PLANES, ASPECT_RATIO: accept.
                     _ => {
-                        log::error!("[drm] SET_CLIENT_CAP cap={} -> accepted", cap);
+                        log::debug!("[drm] SET_CLIENT_CAP cap={} -> accepted", cap);
                         Ok(0)
                     }
                 }
@@ -603,7 +603,7 @@ impl INode for DrmDev {
                     info.handle = handle.id;
                     info.pitch = pitch;
                     info.size = size as u64;
-                    log::error!(
+                    log::debug!(
                         "[drm] CREATE_DUMB {}x{} bpp={} -> handle={} pitch={} size={}",
                         info.width,
                         info.height,
@@ -614,7 +614,7 @@ impl INode for DrmDev {
                     );
                     Ok(0)
                 } else {
-                    log::error!(
+                    log::debug!(
                         "[drm] CREATE_DUMB {}x{} bpp={} -> alloc failed",
                         info.width,
                         info.height,
@@ -661,7 +661,7 @@ impl INode for DrmDev {
             DRM_IOCTL_MODE_SETCRTC => {
                 // struct drm_mode_crtc has the same layout as DrmModeGetCrtc.
                 let req = unsafe { &mut *(data as *mut DrmModeGetCrtc) };
-                log::error!(
+                log::debug!(
                     "[drm] SETCRTC crtc={} fb={} ({}x{}+{})",
                     req.crtc_id,
                     req.fb_id,
@@ -763,7 +763,7 @@ impl INode for DrmDev {
                 // The software scanout has no programmable object state, so
                 // accept and ignore rather than failing the client's modeset.
                 let req = unsafe { *(data as *const DrmModeObjSetProperty) };
-                log::error!(
+                log::debug!(
                     "[drm] OBJ_SETPROPERTY obj={} type={:#x} prop={} val={} (accepted, no-op)",
                     req.obj_id,
                     req.obj_type,
@@ -873,7 +873,7 @@ impl INode for DrmDev {
                         conn_res.count_modes = 0;
                     }
                     conn_res.count_props = 0;
-                    log::error!(
+                    log::debug!(
                         "[drm] GETCONNECTOR id={} connected={} modes={} mode={:?}",
                         conn_res.connector_id,
                         conn.connected,
@@ -882,7 +882,7 @@ impl INode for DrmDev {
                     );
                     Ok(0)
                 } else {
-                    log::error!(
+                    log::debug!(
                         "[drm] GETCONNECTOR id={} -> NOT FOUND",
                         conn_res.connector_id
                     );
@@ -973,7 +973,7 @@ impl INode for DrmDev {
                     }
                 }
                 res.count_props = n as u32;
-                log::error!(
+                log::debug!(
                     "[drm] OBJ_GETPROPERTIES obj_id={} obj_type={:#x} -> {} props",
                     res.obj_id,
                     res.obj_type,
@@ -1035,7 +1035,7 @@ impl INode for DrmDev {
                 let nr = (cmd >> 8) & 0xff;
                 let size = (cmd >> 16) & 0x3fff;
                 let dir = cmd >> 30;
-                log::error!(
+                log::debug!(
                     "[drm] UNHANDLED ioctl cmd={:#010x} (drm nr={:#04x} size={} dir={})",
                     cmd,
                     nr,
