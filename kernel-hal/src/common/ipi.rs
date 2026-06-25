@@ -171,9 +171,21 @@ pub fn remote_flush_tlb(_vaddr: Option<usize>) {
     const SPIN_BUDGET: u64 = 1 << 15;
     let mut spins: u64 = 0;
     loop {
+        // A target that is *halted* (idle) needs no synchronous wait: it is not
+        // executing, so it has no live use of the freed frame, and the shootdown
+        // IPI already queued to it flushes its TLB when it wakes — before it runs
+        // any user instruction — exactly as the budget-exhaustion fire-and-forget
+        // fallback below already relies on. Treating idle targets as satisfied
+        // reaches that same safe state immediately instead of burning the whole
+        // budget on a halted core that is slow to ack (the dominant cause of
+        // fork/exec stalls on real multi-core hardware). Re-read each spin so a
+        // target that parks mid-wait is dropped too; a target still *running* is
+        // waited on as before.
+        let idle = crate::kstats::cpu_idle_mask();
         let mut all_acked = true;
         for cpu in 0..MAX_CORE_NUM {
             if targets & (1u64 << cpu) != 0
+                && idle & (1u64 << cpu) == 0
                 && SHOOTDOWN_SEQ[cpu].load(Ordering::Acquire) == snapshot[cpu]
             {
                 all_acked = false;
