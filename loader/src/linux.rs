@@ -574,6 +574,11 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                     thread.proc().name(),
                     pc,
                 );
+                // [diag] Dump the VMAR tree at error! level: shows whether the
+                // faulting address is actually covered by a mapping (and in which
+                // VMAR / child) — the key question for the deterministic brk
+                // NOT_FOUND fault in musl's __malloc_alloc_meta.
+                thread.proc().vmar().dump_error();
                 // Make a userspace crash self-diagnosing from dmesg: dump the
                 // registers and the code bytes around the faulting PC. With the
                 // faulting instruction *and* the instructions that computed the

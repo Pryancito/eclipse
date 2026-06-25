@@ -644,6 +644,45 @@ impl VmAddressRegion {
         }
     }
 
+    /// Like [`dump`](Self::dump) but at `error!` level so it is visible under
+    /// `LOG=error`. Used by the page-fault crash dump to show the VMAR tree at
+    /// the moment of an unhandled fault — in particular whether the faulting
+    /// address is covered by a mapping (and in which VMAR).
+    pub fn dump_error(&self) {
+        self.dump_error_impl(0);
+    }
+
+    fn dump_error_impl(&self, depth: usize) {
+        let children = {
+            let guard = self.inner.lock();
+            let inner = match guard.as_ref() {
+                Some(inner) => inner,
+                None => return,
+            };
+            error!(
+                "[vmardump] VMAR d{}: {:#x}-{:#x} (size={:#x})",
+                depth,
+                self.addr,
+                self.addr + self.size,
+                self.size
+            );
+            for map in inner.mappings.iter() {
+                error!(
+                    "[vmardump]   map d{}: {:#x}-{:#x} (size={:#x}) vmo={}",
+                    depth,
+                    map.addr(),
+                    map.addr() + map.size(),
+                    map.size(),
+                    map.vmo.name()
+                );
+            }
+            inner.children.iter().cloned().collect::<alloc::vec::Vec<_>>()
+        };
+        for child in children {
+            child.dump_error_impl(depth + 1);
+        }
+    }
+
     /// Returns statistics about memory used by a task.
     pub fn get_task_stats(&self) -> TaskStatsInfo {
         let mut task_stats = TaskStatsInfo::default();
