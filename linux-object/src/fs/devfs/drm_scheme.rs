@@ -534,10 +534,12 @@ impl INode for DrmDev {
                     0x12 => cap.value = 1,
                     _ => cap.value = 0,
                 }
-                // Bring-up diagnostics: GET_CAP is silent between VERSION and
-                // GETRESOURCES, the window where wlroots probes the device and
-                // inits its renderer — log it so a hang there is visible.
-                log::error!("[drm] GET_CAP cap={:#x} -> {}", cap.capability, cap.value);
+                log::error!(
+                    "[drm] GET_CAP minor={} cap={:#x} -> {}",
+                    self.minor,
+                    cap.capability,
+                    cap.value
+                );
                 Ok(0)
             }
             // A single DRM client on the primary node is implicitly master;

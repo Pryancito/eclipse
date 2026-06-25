@@ -150,6 +150,32 @@ pub fn alloc_buffer(size: usize) -> Option<GemHandle> {
     }
 }
 
+/// Export a GEM handle for PRIME: return its `(phys_addr, size, backing VMO)`
+/// so it can be wrapped in a dma-buf and shared with another DRM node.
+pub fn export_handle(handle_id: u32) -> Option<(u64, usize, Arc<VmObject>)> {
+    let state = DRM_STATE.lock();
+    state
+        .handles
+        .iter()
+        .find(|(h, _)| h.id == handle_id)
+        .map(|(h, vmo)| (h.phys_addr, h.size, vmo.clone()))
+}
+
+/// Import a dma-buf (PRIME): register a new GEM handle over the same backing
+/// frames and return its id. The `VmObject` keeps the memory alive.
+pub fn import_dmabuf(phys_addr: u64, size: usize, vmo: Arc<VmObject>) -> u32 {
+    let mut state = DRM_STATE.lock();
+    let id = state.next_handle_id;
+    state.next_handle_id += 1;
+    let handle = GemHandle {
+        id,
+        size,
+        phys_addr,
+    };
+    state.handles.push((handle, vmo));
+    id
+}
+
 pub fn get_handle(handle_id: u32) -> Option<GemHandle> {
     DRM_STATE
         .lock()
