@@ -34,6 +34,7 @@
 #include <time.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 
@@ -426,8 +427,34 @@ int main(int argc, char **argv) {
 
     // ---- Disk ----
     line();
-    printf("DISK (file in %s, %zu MiB)\n", dir, disk_mb);
+    printf("DISK (in %s, %zu MiB requested)\n", dir, disk_mb);
     size_t dbytes = disk_mb * 1024 * 1024;
+    int meta_max = 4000;
+    // Cap the disk working set to a fraction of the FREE space. A small or
+    // nearly-full filesystem (notably the in-RAM SFS root that `make qemu`
+    // boots) must not be filled: some filesystems panic on ENOSPC instead of
+    // failing the write, which would crash the whole machine mid-benchmark.
+    // Leave a generous margin (use <= 1/3 of free).
+    {
+        struct statvfs vfs;
+        if (statvfs(dir, &vfs) == 0 && vfs.f_bavail > 0) {
+            unsigned long bs = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
+            unsigned long long freeb = (unsigned long long)vfs.f_bavail * bs;
+            unsigned long long usable = freeb / 3;
+            if ((unsigned long long)dbytes > usable) dbytes = (size_t)usable;
+            unsigned long long mm = usable / (8 * 1024); // ~8 KiB/small file
+            if (mm < (unsigned long long)meta_max) meta_max = (int)mm;
+            printf("  free=%llu MiB -> file %zu MiB, up to %d meta files\n",
+                   freeb / (1024 * 1024), dbytes / (1024 * 1024), meta_max);
+        } else {
+            // Could not size the fs: stay tiny so we can't fill it.
+            if (dbytes > 4u * 1024 * 1024) dbytes = 4u * 1024 * 1024;
+            if (meta_max > 500) meta_max = 500;
+            printf("  (statvfs unavailable — capping to %zu MiB / %d files)\n",
+                   dbytes / (1024 * 1024), meta_max);
+        }
+    }
+
     const size_t chunk = 256 * 1024;
     unsigned char *io = malloc(chunk);
     if (!io) {
@@ -437,29 +464,38 @@ int main(int argc, char **argv) {
         char fpath[512];
         snprintf(fpath, sizeof fpath, "%s/eclipse-bench.dat", dir);
 
-        double w = disk_seq_write(fpath, dbytes, chunk, io);
-        if (w < 0) printf("  seq write                     : FAILED (cannot write in %s)\n", dir);
-        else { hr_bytes(w, hb, sizeof hb); printf("  seq write (+fsync)            : %12s\n", hb); }
+        if (dbytes >= 1u * 1024 * 1024) {
+            double w = disk_seq_write(fpath, dbytes, chunk, io);
+            if (w < 0) printf("  seq write                     : FAILED (cannot write in %s)\n", dir);
+            else { hr_bytes(w, hb, sizeof hb); printf("  seq write (+fsync)            : %12s\n", hb); }
 
-        double rd = disk_seq_read(fpath, chunk, io);
-        if (rd < 0) printf("  seq read                      : FAILED\n");
-        else { hr_bytes(rd, hb, sizeof hb); printf("  seq read                      : %12s\n", hb); }
+            double rd = disk_seq_read(fpath, chunk, io);
+            if (rd < 0) printf("  seq read                      : FAILED\n");
+            else { hr_bytes(rd, hb, sizeof hb); printf("  seq read                      : %12s\n", hb); }
 
-        double avg_us = 0;
-        double iops = disk_rand_read(fpath, dbytes, BUDGET_NS, &avg_us);
-        if (iops < 0) printf("  rand 4K read                  : FAILED\n");
-        else printf("  rand 4K read                  : %8.0f IOPS (%.1f us avg)\n", iops, avg_us);
+            double avg_us = 0;
+            double iops = disk_rand_read(fpath, dbytes, BUDGET_NS, &avg_us);
+            if (iops < 0) printf("  rand 4K read                  : FAILED\n");
+            else printf("  rand 4K read                  : %8.0f IOPS (%.1f us avg)\n", iops, avg_us);
 
-        double fs = disk_fsync_ms(fpath, io);
-        if (fs >= 0) printf("  fsync latency (best)          : %8.2f ms\n", fs);
+            double fs = disk_fsync_ms(fpath, io);
+            if (fs >= 0) printf("  fsync latency (best)          : %8.2f ms\n", fs);
 
-        unlink(fpath);
+            unlink(fpath);
+        } else {
+            printf("  (too little free space for the streaming tests — point\n");
+            printf("   DIR at a real disk/partition with more room)\n");
+        }
 
-        double cps, sps, ups;
-        disk_metadata(dir, BUDGET_NS, 4000, &cps, &sps, &ups);
-        if (cps >= 0) printf("  meta create small files       : %8.0f files/s\n", cps);
-        if (sps >= 0) printf("  meta stat                     : %8.0f stats/s\n", sps);
-        if (ups >= 0) printf("  meta unlink                   : %8.0f unlinks/s\n", ups);
+        if (meta_max >= 20) {
+            double cps, sps, ups;
+            disk_metadata(dir, BUDGET_NS, meta_max, &cps, &sps, &ups);
+            if (cps >= 0) printf("  meta create small files       : %8.0f files/s\n", cps);
+            if (sps >= 0) printf("  meta stat                     : %8.0f stats/s\n", sps);
+            if (ups >= 0) printf("  meta unlink                   : %8.0f unlinks/s\n", ups);
+        } else {
+            printf("  meta ops                      : skipped (low free space)\n");
+        }
         free(io);
     }
 
