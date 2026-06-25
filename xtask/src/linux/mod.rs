@@ -53,6 +53,10 @@ impl LinuxRootfs {
             if eclipse_useradd.is_file() {
                 let _ = fs::copy(&eclipse_useradd, bin.join("eclipse-useradd"));
             }
+            let eclipse_bench = self.eclipse_bench(&musl);
+            if eclipse_bench.is_file() {
+                let _ = fs::copy(&eclipse_bench, bin.join("eclipse-bench"));
+            }
             // resize2fs/e2fsck/mke2fs (para expandir ROOT y formatear HOME).
             self.install_e2fsprogs_bins(&musl, &bin);
             self.install_thread_tests(&dir);
@@ -370,6 +374,14 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             let dst = bin.join("eclipse-useradd");
             let _ = dir::rm(&dst);
             fs::copy(&eclipse_useradd, &dst).unwrap();
+        }
+
+        // 拷贝 eclipse-bench (CPU/mem/disk/process benchmark)
+        let eclipse_bench = self.eclipse_bench(&musl);
+        if eclipse_bench.is_file() {
+            let dst = bin.join("eclipse-bench");
+            let _ = dir::rm(&dst);
+            fs::copy(&eclipse_bench, &dst).unwrap();
         }
 
         // 拷贝 resize2fs/e2fsck/mke2fs (e2fsprogs) para el instalador.
@@ -1674,6 +1686,50 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             .status();
         if !status.success() {
             println!("Failed to compile eclipse-useradd");
+            return executable;
+        }
+
+        Ext::new(strip).arg("-s").arg(&executable).status();
+        executable
+    }
+
+    /// Compile the eclipse-bench CPU/memory/disk/process benchmark (static musl)
+    /// so it lands in the rootfs at /bin/eclipse-bench. Skips recompilation when
+    /// the binary is newer than its single source file.
+    fn eclipse_bench(&self, musl: &Path) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join("eclipse-bench");
+        let executable = dir.join("eclipse-bench");
+        let source = dir.join("eclipse-bench.c");
+        if executable.is_file() && source.is_file() {
+            if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
+            {
+                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
+                    if bin_mtime >= src_mtime {
+                        return executable;
+                    }
+                }
+            }
+        }
+
+        println!("Compiling eclipse-bench...");
+        let musl = musl.canonicalize().unwrap();
+        let bin = musl.join("bin");
+        let arch = self.0.name();
+        let cc = format!("{}/{}-linux-musl-gcc", bin.display(), arch);
+        let strip = self.strip(&musl);
+
+        fs::create_dir_all(&dir).unwrap();
+        let status = Ext::new(&cc)
+            .current_dir(&dir)
+            .arg("-static")
+            .arg("-O2")
+            .arg("-s")
+            .arg("-o")
+            .arg(&executable)
+            .arg(&source)
+            .status();
+        if !status.success() {
+            println!("Failed to compile eclipse-bench");
             return executable;
         }
 
