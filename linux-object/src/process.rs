@@ -1271,7 +1271,10 @@ pub fn deliver_sigint_to_foreground() {
 /// This process's effective process-group id: its raw pgid, or its own pid when
 /// the raw value is unset (`0`).
 fn effective_pgid(proc: &Arc<Process>) -> KoID {
-    let raw = proc.linux().pgid_raw();
+    // try_linux: called while walking all_live_processes() (e.g. send_signal_to_pgrp
+    // on Ctrl-C), so `proc` may be tearing down concurrently under SMP churn.
+    // Fall back to the pid when the extension can no longer be resolved.
+    let raw = proc.try_linux().map(|lp| lp.pgid_raw()).unwrap_or(0);
     if raw == 0 {
         proc.id()
     } else {
@@ -1308,7 +1311,7 @@ pub fn set_process_pgid(pid: KoID, pgid: KoID) -> LxResult<()> {
         .into_iter()
         .find(|p| p.id() == pid)
         .ok_or(LxError::ESRCH)?;
-    proc.linux().set_pgid_raw(pgid);
+    proc.try_linux().ok_or(LxError::ESRCH)?.set_pgid_raw(pgid);
     Ok(())
 }
 

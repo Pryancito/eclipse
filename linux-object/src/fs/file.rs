@@ -390,34 +390,43 @@ impl FileLike for File {
 
     fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
         let inner = self.inner.read();
-        let meta = inner.inode.metadata()?;
-        if meta.type_ == FileType::NamedPipe {
-            // A FIFO node opened from the fs has no pipe-buffer / writer tracking
-            // here, so a reader polling an empty FIFO (e.g. openrc-init's control
-            // FIFO, which never gets a writer) would spin: the node reads as an
-            // empty regular file (0 bytes = EOF) yet polls "readable". Treat it as
-            // readable only when it actually holds bytes, so the reader blocks
-            // instead of busy-looping on repeated 0-byte reads.
-            return Ok(PollStatus {
-                read: meta.size > 0,
-                write: true,
-                error: false,
-            });
+        // A FIFO node opened from the fs has no pipe-buffer / writer tracking
+        // here, so a reader polling an empty FIFO (e.g. openrc-init's control
+        // FIFO, which never gets a writer) would spin: the node reads as an
+        // empty regular file (0 bytes = EOF) yet polls "readable". Treat it as
+        // readable only when it actually holds bytes, so the reader blocks
+        // instead of busy-looping on repeated 0-byte reads.
+        //
+        // Use metadata() best-effort: some fds (sockets, special devices) don't
+        // implement it and return ENOSYS — those must fall through to the inode's
+        // own poll(), NOT propagate the error (that regressed `poll()` on packet
+        // sockets, e.g. udhcpc, to "Function not implemented").
+        if let Ok(meta) = inner.inode.metadata() {
+            if meta.type_ == FileType::NamedPipe {
+                return Ok(PollStatus {
+                    read: meta.size > 0,
+                    write: true,
+                    error: false,
+                });
+            }
         }
         Ok(inner.inode.poll()?)
     }
 
     async fn async_poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
         let inode = self.inner.read().inode.clone();
-        let meta = inode.metadata()?;
-        if meta.type_ == FileType::NamedPipe {
-            // See `poll`: an empty FIFO must block, not report readable, or a
-            // reader (openrc-init) spins forever on 0-byte EOF reads.
-            return Ok(PollStatus {
-                read: meta.size > 0,
-                write: true,
-                error: false,
-            });
+        // See `poll`: special-case an empty FIFO so the reader blocks, but only
+        // when metadata() is available — sockets/special devices return ENOSYS
+        // and must fall through to the inode's own async_poll() rather than
+        // failing the whole poll() syscall.
+        if let Ok(meta) = inode.metadata() {
+            if meta.type_ == FileType::NamedPipe {
+                return Ok(PollStatus {
+                    read: meta.size > 0,
+                    write: true,
+                    error: false,
+                });
+            }
         }
         Ok(inode.async_poll().await?)
     }
