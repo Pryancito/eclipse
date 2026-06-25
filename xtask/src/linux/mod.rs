@@ -795,6 +795,27 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             let _ = fs::create_dir_all(runlevels.join(rl));
         }
 
+        // Trim the ~40 stock service scripts from /etc/init.d (keep the *.sh
+        // helpers and the directory). On Eclipse the kernel already mounts root,
+        // brings up the network and spawns the shells, so the stock OS services
+        // (sysfs, devfs, hostname, fsck, localmount, network, swap, …) are
+        // redundant. More importantly, openrc's first-boot dependency cache
+        // ("Caching service dependencies") sources EVERY script in /etc/init.d in
+        // its own shell; reaping that burst of ~40 orphaned shells wedged
+        // openrc-init before it reached its idle poll loop, so it never settled
+        // as PID 1. With init.d trimmed the depscan is trivial. Services can be
+        // re-added later (e.g. via apk) and wired with `rc-update add <svc>`.
+        let initd = rootfs.join("etc").join("init.d");
+        if let Ok(entries) = fs::read_dir(&initd) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let is_helper = name.to_string_lossy().ends_with(".sh");
+                if !is_helper {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+
         // /etc/rc.conf tuned for Eclipse: keep OpenRC lean and out of the
         // kernel's way (no parallel start, no cgroup management, no syslog
         // dependency). `rc_sys=""` = bare-metal/no-container heuristics.
