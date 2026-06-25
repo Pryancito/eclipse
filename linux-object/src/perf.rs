@@ -371,7 +371,14 @@ pub fn kernel_report() -> String {
     // capture it now and surface the spin RIPs up here — the full per-CPU probe
     // is far below the per-core lists, off the first screenful.
     let scheduler_quiet = cb_work_pct < 1.0 && weak_per_s < 1.0 && polls_per_s < 1.0;
-    let off_sched_wedge = busy_pct > 50.0 && scheduler_quiet && timer_per_s < 50.0;
+    // Only trust the wedge verdict on a real measurement window. On the first
+    // read there is no window, so every figure here is the *lifetime* average:
+    // on a long-uptime box that means busy% near 100 (skewed by past load) while
+    // the lifetime poll/weak/timer rates round to ~0/s — which trips this
+    // detector and screams "kernel livelock" at a perfectly idle machine. The
+    // NMI probe then catches every core at its idle `hlt` RIP and mislabels them
+    // as wedge sites. Require `have_window` so the verdict reflects *now*.
+    let off_sched_wedge = have_window && busy_pct > 50.0 && scheduler_quiet && timer_per_s < 50.0;
     kernel_hal::kstats::capture_cpu_rips();
     let nmi = kernel_hal::kstats::nmi_rips();
     // How many cores are parked in idle `hlt` *right now* (robust per-CPU flag set
@@ -386,7 +393,15 @@ pub fn kernel_report() -> String {
         "cores idle now: {}/{} parked in hlt this instant",
         idle_now, online_cpus
     );
-    let suspect = if busy_pct < 50.0 {
+    let suspect = if !have_window {
+        // First read after boot (or after a long gap with no prior sample): only
+        // the lifetime average is available, which says nothing about what the
+        // CPUs are doing *now*. Don't run the live heuristics on it — the
+        // OFF-SCHEDULER wedge detector in particular produces a false "kernel
+        // livelock" verdict here. Defer to the next read (which has a window).
+        "unknown — first read has only the lifetime average; \
+         run `cat` again for a live (windowed) verdict"
+    } else if busy_pct < 50.0 {
         "none — cores mostly reach halt"
     } else if all_halted {
         "NONE NOW — every core is halted in hlt this instant; high busy% is a \
