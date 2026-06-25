@@ -220,6 +220,14 @@ cfg_if! {
         const KERNEL_HEAP_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
         const ORDER: usize = 32;
 
+        // Invariants: `init()` carves the heap into word-sized slots
+        // (`HEAP_BLOCK = KERNEL_HEAP_SIZE / size_of::<usize>()`), so the size
+        // must divide evenly by the machine word — otherwise the backing static
+        // would silently under-provision the allocator. It must also be
+        // page-aligned, since the region is handed to the allocator wholesale.
+        const _: () = assert!(KERNEL_HEAP_SIZE % core::mem::size_of::<usize>() == 0);
+        const _: () = assert!(KERNEL_HEAP_SIZE % 4096 == 0);
+
         #[global_allocator]
         static HEAP_ALLOCATOR: LockedHeap<ORDER> = LockedHeap::<ORDER>::new();
 

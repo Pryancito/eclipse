@@ -1,6 +1,6 @@
 use super::*;
 use bitflags::bitflags;
-use zircon_object::vm::{pages, roundup_pages, MMUFlags, VmObject};
+use zircon_object::vm::{pages, roundup_pages, MMUFlags, VmObject, PAGE_SIZE};
 
 /// Per-call cap for a single `mmap` / `brk` growth. It bounds how much a single
 /// syscall can commit at once (physical frames + per-page VMO metadata).
@@ -362,6 +362,68 @@ impl Syscall<'_> {
         let vmar = proc.vmar();
         vmar.unmap(addr, len)?;
         Ok(0)
+    }
+
+    /// Give advice about use of memory
+    /// (see [linux man madvise(2)](https://www.man7.org/linux/man-pages/man2/madvise.2.html)).
+    ///
+    /// `madvise` is advisory: the kernel is free to ignore the hint. zCore does
+    /// not yet act on any advice, so a recognised request succeeds without
+    /// changing the mapping. An unrecognised advice value, or a start address
+    /// that is not page-aligned, is rejected with `EINVAL` as on Linux — which
+    /// is stricter (and more correct) than the previous stub that accepted any
+    /// value, including garbage, with success.
+    pub fn sys_madvise(&self, addr: usize, len: usize, advice: usize) -> SysResult {
+        info!(
+            "madvise: addr={:#x}, len={:#x}, advice={}",
+            addr, len, advice
+        );
+        if !madvise_advice_known(advice) {
+            return Err(LxError::EINVAL);
+        }
+        if addr % PAGE_SIZE != 0 {
+            return Err(LxError::EINVAL);
+        }
+        // Advisory only: no mapping state is changed. (Linux rounds `len` up to a
+        // page; a zero length is a no-op either way.)
+        Ok(0)
+    }
+}
+
+/// `madvise(2)` advice values zCore recognises. All of zCore's target arches
+/// (x86_64/aarch64/riscv64) share this (asm-generic) numbering:
+///   0 NORMAL, 1 RANDOM, 2 SEQUENTIAL, 3 WILLNEED, 4 DONTNEED, 8 FREE,
+///   9 REMOVE, 10 DONTFORK, 11 DOFORK, 12 MERGEABLE, 13 UNMERGEABLE,
+///   14 HUGEPAGE, 15 NOHUGEPAGE, 16 DONTDUMP, 17 DODUMP, 18 WIPEONFORK,
+///   19 KEEPONFORK, 20 COLD, 21 PAGEOUT, 100 HWPOISON, 101 SOFT_OFFLINE.
+const KNOWN_MADVISE: &[usize] = &[
+    0, 1, 2, 3, 4, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 100, 101,
+];
+
+/// Whether `advice` is a `madvise(2)` value zCore recognises. Pure, so the
+/// classification is unit-testable independently of the syscall plumbing.
+fn madvise_advice_known(advice: usize) -> bool {
+    KNOWN_MADVISE.contains(&advice)
+}
+
+#[cfg(test)]
+mod madvise_tests {
+    use super::madvise_advice_known;
+
+    #[test]
+    fn known_advice_is_accepted() {
+        // NORMAL/RANDOM/SEQUENTIAL/WILLNEED/DONTNEED/FREE and a few higher ones.
+        for a in [0usize, 1, 2, 3, 4, 8, 19, 21, 100, 101] {
+            assert!(madvise_advice_known(a), "advice {} should be known", a);
+        }
+    }
+
+    #[test]
+    fn unknown_advice_is_rejected() {
+        // Gaps in the numbering (5,6,7) and out-of-range values are unknown.
+        for a in [5usize, 6, 7, 22, 99, 102, usize::MAX] {
+            assert!(!madvise_advice_known(a), "advice {} should be unknown", a);
+        }
     }
 }
 
