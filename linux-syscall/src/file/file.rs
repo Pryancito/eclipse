@@ -437,6 +437,66 @@ impl Syscall<'_> {
         Ok(0)
     }
 
+    /// DRM PRIME (dma-buf) ioctls. Handled at the syscall layer because they
+    /// install / look up a process fd (the dma-buf), which the inode-level DRM
+    /// `io_control` cannot do. Returns `Ok(Some(0))` if handled, `Ok(None)` if
+    /// `fd` is not a DRM device (fall through to the normal ioctl path).
+    fn sys_drm_prime(
+        &self,
+        file_like: &alloc::sync::Arc<dyn linux_object::fs::FileLike>,
+        request: usize,
+        arg1: usize,
+    ) -> Result<Option<usize>, LxError> {
+        use linux_object::fs::devfs::{drm, DrmDev};
+        use linux_object::fs::{DmaBuf, File};
+
+        const PRIME_HANDLE_TO_FD: usize = 0xC00C_642D;
+        const PRIME_FD_TO_HANDLE: usize = 0xC00C_642E;
+
+        // struct drm_prime_handle { __u32 handle; __u32 flags; __s32 fd; }
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        struct DrmPrimeHandle {
+            handle: u32,
+            flags: u32,
+            fd: i32,
+        }
+
+        // Only intercept PRIME ioctls on a DRM device fd.
+        let is_drm = file_like
+            .downcast_ref::<File>()
+            .map(|f| f.inode().as_any_ref().downcast_ref::<DrmDev>().is_some())
+            .unwrap_or(false);
+        if !is_drm {
+            return Ok(None);
+        }
+
+        let mut ptr = UserInOutPtr::<DrmPrimeHandle>::from(arg1);
+        let mut h = ptr.read()?;
+        let proc = self.linux_process();
+        match request {
+            PRIME_HANDLE_TO_FD => {
+                let (phys, size, vmo) = drm::export_handle(h.handle).ok_or(LxError::EINVAL)?;
+                let dmabuf = DmaBuf::new(phys, size, vmo);
+                let new_fd = proc.add_file(dmabuf)?;
+                h.fd = i32::from(new_fd);
+                ptr.write(h)?;
+                info!("drm PRIME export: handle={} -> fd={}", h.handle, h.fd);
+                Ok(Some(0))
+            }
+            PRIME_FD_TO_HANDLE => {
+                let target = proc.get_file_like(FileDesc::from(h.fd as usize))?;
+                let dmabuf = target.downcast_ref::<DmaBuf>().ok_or(LxError::EINVAL)?;
+                let handle_id = drm::import_dmabuf(dmabuf.phys_addr, dmabuf.size, dmabuf.vmo());
+                h.handle = handle_id;
+                ptr.write(h)?;
+                info!("drm PRIME import: fd={} -> handle={}", h.fd, h.handle);
+                Ok(Some(0))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Set parameters of device files.
     pub fn sys_ioctl(
         &self,
@@ -462,6 +522,18 @@ impl Syscall<'_> {
         );
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
+        // DRM PRIME (dma-buf) export/import — needs process fd access, so it is
+        // handled here rather than in the DRM inode's io_control.
+        if request == 0xC00C_642D || request == 0xC00C_642E {
+            if let Some(ret) = self.sys_drm_prime(&file_like, request, arg1)? {
+                kernel_hal::klog_info!(
+                    "ioctl LEAVE fd={:?} request={:#x} -> PRIME ok",
+                    fd,
+                    request
+                );
+                return Ok(ret);
+            }
+        }
         // `TIOCGWINSZ` (get terminal window size).
         const TIOCGWINSZ: usize = 0x5413;
         const TCGETS: usize = 0x5401;

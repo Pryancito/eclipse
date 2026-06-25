@@ -3,6 +3,7 @@
 mod block_mount;
 mod btrfs_mount;
 pub mod devfs;
+mod dmabuf;
 mod epoll;
 mod eventfd;
 mod fat_mount;
@@ -69,6 +70,7 @@ use procfs::ProcFS;
 use pseudo::Pseudo;
 use sysfs::SysFS;
 
+pub use dmabuf::DmaBuf;
 pub use epoll::{Epoll, EpollEvent};
 pub use eventfd::EventFd;
 pub use file::{File, OpenFlags, PollEvents, SeekFrom};
