@@ -385,7 +385,7 @@ fn handle_signal(
         // Record the death in the dmesg ring (warn! reaches it at the default
         // level). A process that dies on a default-disposition signal — Xorg
         // aborting in early init, say — otherwise vanishes with no trace at all.
-        warn!(
+        error!(
             "[exit] pid={} killed by signal {:?} ({}) at pc={:#x} (default disposition)",
             thread.proc().id(),
             signal,
@@ -455,7 +455,7 @@ fn force_fault_signal(thread: &CurrentThread, signal: Signal) {
             || action.handler == SIG_IGN
     };
     if undeliverable {
-        warn!(
+        error!(
             "[exit] pid={} killed by fault signal {:?} ({}) — undeliverable, terminating",
             thread.proc().id(),
             signal,
@@ -565,7 +565,7 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                 let pc = thread
                     .with_context(|ctx| ctx.get_field(UserContextField::InstrPointer))
                     .unwrap_or(0);
-                warn!(
+                error!(
                     "unhandled page fault @ {:#x}({:?}): {:?}, pid={} proc={} pc={:#x} -> SIGSEGV",
                     vaddr,
                     flags,
@@ -598,7 +598,7 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                         })
                         .ok()
                     {
-                        warn!(
+                        error!(
                             "[crash] pid={} pc={:#x} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x} r8={:#x}",
                             pid, pc, rax, rbx, rcx, rdx, rsi, rdi, rbp, r8to11,
                         );
@@ -615,12 +615,12 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                         }
                     }
                     if any {
-                        warn!(
+                        error!(
                             "[crash] pid={} code@{:#x} (pc-16): {:02x?}",
                             pid, start, code
                         );
                     } else {
-                        warn!(
+                        error!(
                             "[crash] pid={} pc={:#x} UNMAPPED (jumped through a bad pointer)",
                             pid, pc
                         );
