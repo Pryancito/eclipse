@@ -911,6 +911,27 @@ impl VmMapping {
         }
         let mut inner = self.inner.lock();
         let mut page_table = self.page_table.lock();
+        // [cutdiag] heap-range cuts only: show the mapping being cut, the cut
+        // range, and which branch is taken (subset removes it entirely).
+        if (0x7d0000..0x900000).contains(&begin) || (0x7d0000..0x900000).contains(&inner.addr) {
+            let branch = if inner.addr >= begin && inner.end_addr() <= end {
+                "SUBSET(removed)"
+            } else if inner.addr >= begin && inner.addr < end {
+                "prefix"
+            } else if inner.end_addr() <= end && inner.end_addr() > begin {
+                "postfix"
+            } else {
+                "superset"
+            };
+            error!(
+                "[cutdiag] cut map [{:#x},{:#x}) by [{:#x},{:#x}) -> {}",
+                inner.addr,
+                inner.end_addr(),
+                begin,
+                end,
+                branch
+            );
+        }
         if inner.addr >= begin && inner.end_addr() <= end {
             // subset: [xxxxxxxxxx]
             page_table
