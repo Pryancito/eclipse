@@ -42,6 +42,12 @@ pub trait ProcessExt {
     ) -> ZxResult<Arc<Self>>;
     /// get linux process
     fn linux(&self) -> &LinuxProcess;
+    /// Like [`linux`](Self::linux) but returns `None` instead of panicking when
+    /// the extension is not a [`LinuxProcess`]. Use this on the lock-free
+    /// process-walk / reaper / signal-callback paths: racing against a process
+    /// that is going away (or whose extension cannot be resolved during SMP
+    /// teardown churn) must degrade to "skip it", not bring down the kernel.
+    fn try_linux(&self) -> Option<&LinuxProcess>;
     /// fork from current linux process
     fn fork_from(parent: &Arc<Self>, vfork: bool) -> ZxResult<Arc<Self>>;
 }
@@ -108,11 +114,17 @@ impl ProcessExt for Process {
                     // this process down, so they are not stranded on a dead
                     // parent that will never `wait` for them.
                     reparent_live_children_to_init(&proc);
-                    let mut inner = proc.linux().inner.lock();
-                    inner.files.clear();
-                    inner.futexes.clear();
-                    inner.semaphores = Default::default();
-                    inner.shm_identifiers = Default::default();
+                    // try_linux (not linux): this callback runs from the
+                    // object layer on PROCESS_TERMINATED, concurrently with
+                    // SMP teardown churn. If the extension can no longer be
+                    // resolved, skip the cleanup rather than panic the kernel.
+                    if let Some(lp) = proc.try_linux() {
+                        let mut inner = lp.inner.lock();
+                        inner.files.clear();
+                        inner.futexes.clear();
+                        inner.semaphores = Default::default();
+                        inner.shm_identifiers = Default::default();
+                    }
                 }
                 return true;
             }
@@ -123,6 +135,10 @@ impl ProcessExt for Process {
 
     fn linux(&self) -> &LinuxProcess {
         self.ext().downcast_ref::<LinuxProcess>().unwrap()
+    }
+
+    fn try_linux(&self) -> Option<&LinuxProcess> {
+        self.ext().downcast_ref::<LinuxProcess>()
     }
 
     /// [Fork] the process.
@@ -177,16 +193,22 @@ impl ProcessExt for Process {
                         _ => 0,
                     };
                     reparent_live_children_to_init(&child);
-                    {
-                        let mut inner = child.linux().inner.lock();
+                    // try_linux (not linux): this callback fires from the object
+                    // layer on PROCESS_TERMINATED, concurrently with SMP teardown
+                    // churn. A process whose extension can no longer be resolved
+                    // must be skipped, not panic the kernel.
+                    if let Some(lp) = child.try_linux() {
+                        let mut inner = lp.inner.lock();
                         inner.files.clear();
                         inner.futexes.clear();
                         inner.semaphores = Default::default();
                         inner.shm_identifiers = Default::default();
                     }
                     if let Some(reaper) = reaper_for(&parent) {
-                        reaper.signal_set(Signal::SIGCHLD);
-                        reaper.linux().record_child_exit(child.id(), exit_code);
+                        if let Some(reaper_lp) = reaper.try_linux() {
+                            reaper.signal_set(Signal::SIGCHLD);
+                            reaper_lp.record_child_exit(child.id(), exit_code);
+                        }
                     }
                 }
                 return true;
@@ -1379,8 +1401,12 @@ fn reparent_live_children_to_init(dying: &Arc<Process>) {
         Some(init) => init,
         None => return,
     };
+    let dying_linux = match dying.try_linux() {
+        Some(lp) => lp,
+        None => return,
+    };
     let (orphans, zombies): (Vec<Arc<Process>>, Vec<(KoID, i64)>) = {
-        let mut inner = dying.linux().inner.lock();
+        let mut inner = dying_linux.inner.lock();
         let live_ids: Vec<KoID> = inner
             .children
             .iter()
@@ -1398,7 +1424,11 @@ fn reparent_live_children_to_init(dying: &Arc<Process>) {
         return;
     }
     {
-        let mut init_inner = init.linux().inner.lock();
+        let init_linux = match init.try_linux() {
+            Some(lp) => lp,
+            None => return,
+        };
+        let mut init_inner = init_linux.inner.lock();
         for orphan in orphans {
             init_inner.children.insert(orphan.id(), orphan);
         }
