@@ -133,11 +133,67 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 - **Render / 3D**. No hay aceleración: se usa el render por software de Mesa
   (`llvmpipe`/`softpipe`).
 
-## Cómo probar
+## Cómo lanzar labwc
 
-- **Wayland (wlroots/labwc)**: el compositor abre `/dev/dri/card0`, asigna
-  *dumb buffers*, hace `ADDFB`/`PAGE_FLIP`; el kernel hace *scanout* al
-  framebuffer. Ver los registros `[drm] …` con `LOG=error`.
+El kernel implementa la ruta **legacy-KMS + dumb buffers + scanout por
+software**. Para que wlroots/labwc la usen (y NO intenten GBM/EGL/GL, que no hay
+aceleración) hay que forzar el renderer **pixman** y el KMS legacy por variables
+de entorno:
+
+```sh
+# Gestor de asientos (o arráncalo en /etc/init.d/rcS). Da acceso a
+# /dev/dri/card0 y /dev/input/event* sin logind.
+seatd -g video &
+
+# Directorio de runtime para el socket de Wayland (modo 0700, del usuario).
+export XDG_RUNTIME_DIR=/run/user/0
+mkdir -p "$XDG_RUNTIME_DIR" && chmod 0700 "$XDG_RUNTIME_DIR"
+
+# Render por software (sin GBM/EGL) y KMS legacy (no atómico, sin modifiers).
+export WLR_RENDERER=pixman
+export WLR_DRM_NO_ATOMIC=1
+export WLR_DRM_NO_MODIFIERS=1
+
+labwc
+```
+
+> **Importante**: sin `WLR_RENDERER=pixman`, wlroots intenta primero el renderer
+> GLES2 sobre GBM/EGL (Mesa). Como aquí no hay GPU, esa ruta puede **colgarse o
+> fallar** al inicializar el renderer — el síntoma típico es que el log del
+> kernel se queda en `[drm] VERSION …` y nunca llega al *scanout* (pantalla
+> congelada). Forzar pixman evita esa ruta por completo.
+
+## Diagnóstico
+
+Con `LOG=error`, el kernel registra el avance de la negociación DRM. Una sesión
+sana imprime, en orden:
+
+```
+[drm] VERSION — /dev/dri/card0 opened by userspace (minor=0)
+[drm] GET_CAP cap=0x1 -> 1
+[drm] SET_CLIENT_CAP cap=2 -> accepted        # UNIVERSAL_PLANES
+[drm] SET_CLIENT_CAP cap=3 -> rejected ...     # ATOMIC (forzamos legacy)
+[drm] SET_MASTER (minor=0)
+[drm] GETRESOURCES: software KMS -> 1 crtc, 1 connector ...
+[drm] GETCONNECTOR id=2 connected=true modes=1 ...
+[drm] CREATE_DUMB 1920x1080 bpp=32 -> handle=1 ...
+[drm] SETCRTC crtc=1 fb=1 ...
+[drm] scanout: fb=1 ... -> display ...
+```
+
+- Si se detiene en `VERSION` (o `minor=128`, el render node) y no aparece
+  `GETRESOURCES`, es la inicialización del renderer GL: usa `WLR_RENDERER=pixman`.
+- Si llega a `SETCRTC`/`scanout` pero no se ve nada, el problema está en el
+  *blit* al framebuffer (ver [`drm.rs`](../linux-object/src/fs/devfs/drm.rs)).
+- `[drm] UNHANDLED ioctl …` indica un ioctl que labwc pide y aún no manejamos
+  (el `drm nr` identifica el `DRM_IOCTL_*`).
+
+La consola de texto del kernel cede a gráficos (`KD_GRAPHICS`) solo en el primer
+*scanout* real, no al hacer `SET_MASTER`: así, si labwc se atasca antes de
+pintar, el terminal sigue usable y sus logs visibles.
+
+## Cómo probar (Xorg)
+
 - **Xorg**: driver `fbdev` sobre `/dev/fb0`. Ver [`README-xorg.md`](README-xorg.md).
 
 ## Mapa de archivos

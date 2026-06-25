@@ -465,7 +465,16 @@ impl INode for DrmDev {
     fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
         match cmd {
             DRM_IOCTL_VERSION => {
-                log::error!("[drm] VERSION ioctl — /dev/dri/card0 opened by userspace");
+                let node = if self.minor >= 128 {
+                    "renderD128"
+                } else {
+                    "card0"
+                };
+                log::error!(
+                    "[drm] VERSION — /dev/dri/{} opened by userspace (minor={})",
+                    node,
+                    self.minor
+                );
                 let v = unsafe { &mut *(data as *mut DrmVersion) };
                 v.version_major = 1;
                 v.version_minor = 0;
@@ -525,12 +534,14 @@ impl INode for DrmDev {
                     0x12 => cap.value = 1,
                     _ => cap.value = 0,
                 }
+                // Bring-up diagnostics: GET_CAP is silent between VERSION and
+                // GETRESOURCES, the window where wlroots probes the device and
+                // inits its renderer — log it so a hang there is visible.
+                log::error!("[drm] GET_CAP cap={:#x} -> {}", cap.capability, cap.value);
                 Ok(0)
             }
             // A single DRM client on the primary node is implicitly master;
             // accept (drop-)master so seatd/wlroots session activation succeeds.
-            // Master = the client owns the display: leave/restore the kernel text
-            // console accordingly (KD_GRAPHICS while a compositor is scanning out).
             // Magic/auth: `drmIsMaster()` authenticates magic 0 and treats
             // success as "this fd is DRM master". wlroots' dumb-buffer allocator
             // (pixman path) requires master, so always succeed — the single
@@ -542,10 +553,19 @@ impl INode for DrmDev {
             }
             DRM_IOCTL_AUTH_MAGIC => Ok(0),
             DRM_IOCTL_SET_MASTER => {
-                kernel_hal::console::set_kd_mode(kernel_hal::console::KD_GRAPHICS);
+                // Become DRM master, but do NOT switch the console to graphics
+                // yet: defer that to the first real scanout (`drm::scanout`). If
+                // the client stalls before presenting a frame (e.g. its renderer
+                // fails to init), the kernel text console stays usable and its
+                // logs visible instead of freezing on a black screen.
+                log::error!("[drm] SET_MASTER (minor={})", self.minor);
                 Ok(0)
             }
             DRM_IOCTL_DROP_MASTER => {
+                log::error!(
+                    "[drm] DROP_MASTER (minor={}) — restoring text console",
+                    self.minor
+                );
                 kernel_hal::console::set_kd_mode(kernel_hal::console::KD_TEXT);
                 Ok(0)
             }
@@ -557,10 +577,17 @@ impl INode for DrmDev {
                     // back to the legacy KMS path, which the software
                     // framebuffer scanout implements.
                     DRM_CLIENT_CAP_ATOMIC | DRM_CLIENT_CAP_WRITEBACK_CONNECTORS => {
+                        log::error!(
+                            "[drm] SET_CLIENT_CAP cap={} -> rejected (force legacy KMS)",
+                            cap
+                        );
                         Err(FsError::InvalidParam)
                     }
                     // STEREO_3D, UNIVERSAL_PLANES, ASPECT_RATIO: accept.
-                    _ => Ok(0),
+                    _ => {
+                        log::error!("[drm] SET_CLIENT_CAP cap={} -> accepted", cap);
+                        Ok(0)
+                    }
                 }
             }
             DRM_IOCTL_MODE_CREATE_DUMB => {
@@ -573,8 +600,23 @@ impl INode for DrmDev {
                     info.handle = handle.id;
                     info.pitch = pitch;
                     info.size = size as u64;
+                    log::error!(
+                        "[drm] CREATE_DUMB {}x{} bpp={} -> handle={} pitch={} size={}",
+                        info.width,
+                        info.height,
+                        bpp,
+                        handle.id,
+                        pitch,
+                        size
+                    );
                     Ok(0)
                 } else {
+                    log::error!(
+                        "[drm] CREATE_DUMB {}x{} bpp={} -> alloc failed",
+                        info.width,
+                        info.height,
+                        bpp
+                    );
                     Err(FsError::NoDeviceSpace)
                 }
             }
