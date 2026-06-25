@@ -911,4 +911,133 @@ mod block_byte_tests {
             assert_eq!(warm, data[off..off + len], "warm off={off} len={len}");
         }
     }
+
+    // ---- BlockCache (LRU buffer cache) unit tests ----
+    //
+    // These poke the cache directly rather than through `CachedDevice`, pinning
+    // the eviction policy and the read/patch/insert bookkeeping that the
+    // higher-level coherence tests above rely on.
+
+    #[test]
+    fn cache_lru_evicts_least_recently_used() {
+        let mut c = BlockCache::new(2);
+        c.insert(0, &[0xAA; SECTOR]);
+        c.insert(1, &[0xBB; SECTOR]);
+        assert!(c.contains(0) && c.contains(1));
+        // Touch sector 0 -> sector 1 becomes the least-recently-used victim.
+        let mut buf = [0u8; SECTOR];
+        assert!(c.read_into(0, 0, &mut buf));
+        assert_eq!(buf[0], 0xAA);
+        c.insert(2, &[0xCC; SECTOR]);
+        assert!(c.contains(0), "recently-read sector 0 stays resident");
+        assert!(c.contains(2), "freshly inserted sector 2 present");
+        assert!(!c.contains(1), "LRU sector 1 evicted");
+    }
+
+    #[test]
+    fn cache_read_into_misses_when_absent() {
+        let mut c = BlockCache::new(4);
+        let mut buf = [0u8; SECTOR];
+        assert!(!c.read_into(7, 0, &mut buf));
+    }
+
+    #[test]
+    fn cache_patch_on_resident_updates_in_place() {
+        let mut c = BlockCache::new(4);
+        c.insert(3, &[0u8; SECTOR]);
+        c.patch(3, 100, &[0x9, 0x9, 0x9]);
+        let mut buf = [0u8; SECTOR];
+        assert!(c.read_into(3, 0, &mut buf));
+        assert_eq!(&buf[100..103], &[0x9, 0x9, 0x9]);
+        assert_eq!(buf[99], 0);
+    }
+
+    #[test]
+    fn cache_patch_on_absent_is_noop() {
+        let mut c = BlockCache::new(4);
+        c.patch(9, 0, &[1, 2, 3]); // must not create an entry
+        assert!(!c.contains(9));
+    }
+
+    #[test]
+    fn cache_insert_updates_in_place_without_growing() {
+        let mut c = BlockCache::new(2);
+        c.insert(5, &[0x11; SECTOR]);
+        c.insert(5, &[0x22; SECTOR]); // overwrite, not a new entry
+        let mut buf = [0u8; SECTOR];
+        assert!(c.read_into(5, 0, &mut buf));
+        assert_eq!(buf[0], 0x22);
+        // Still room for exactly one more before eviction.
+        c.insert(6, &[0x33; SECTOR]);
+        assert!(c.contains(5) && c.contains(6));
+    }
+
+    #[test]
+    fn cache_capacity_zero_is_clamped_to_one() {
+        let mut c = BlockCache::new(0);
+        c.insert(0, &[1; SECTOR]);
+        assert!(c.contains(0));
+        c.insert(1, &[2; SECTOR]);
+        assert!(c.contains(1));
+        assert!(!c.contains(0), "capacity floored at 1 -> one resident sector");
+    }
+
+    // ---- probe_ext2_superblock tests ----
+
+    /// A 512-byte sector-2 image that looks like a plausible ext2 superblock.
+    fn good_superblock() -> [u8; 512] {
+        let mut sb = [0u8; 512];
+        sb[0..4].copy_from_slice(&100u32.to_le_bytes()); // inodes_count
+        sb[4..8].copy_from_slice(&200u32.to_le_bytes()); // blocks_count
+        sb[24..28].copy_from_slice(&0i32.to_le_bytes()); // log_block_size=0 -> 1 KiB
+        sb[32..36].copy_from_slice(&50u32.to_le_bytes()); // blocks_per_group
+        sb[56] = 0x53; // magic 0xEF53, little-endian
+        sb[57] = 0xEF;
+        sb
+    }
+
+    fn dev_with_superblock(nsec: usize, sb: &[u8; 512]) -> Arc<dyn BlockScheme> {
+        let dev = MockBlock::new(nsec);
+        dev.write_block(EXT2_SUPERBLOCK_SECTOR, sb).unwrap();
+        dev
+    }
+
+    #[test]
+    fn probe_accepts_valid_superblock() {
+        let dev = dev_with_superblock(4096, &good_superblock());
+        assert!(probe_ext2_superblock(&dev));
+    }
+
+    #[test]
+    fn probe_rejects_bad_magic() {
+        let mut sb = good_superblock();
+        sb[56] = 0;
+        sb[57] = 0;
+        let dev = dev_with_superblock(4096, &sb);
+        assert!(!probe_ext2_superblock(&dev));
+    }
+
+    #[test]
+    fn probe_rejects_tiny_counts() {
+        let mut sb = good_superblock();
+        sb[4..8].copy_from_slice(&5u32.to_le_bytes()); // blocks_count < 11
+        let dev = dev_with_superblock(4096, &sb);
+        assert!(!probe_ext2_superblock(&dev));
+    }
+
+    #[test]
+    fn probe_rejects_absurd_block_size() {
+        let mut sb = good_superblock();
+        sb[24..28].copy_from_slice(&7i32.to_le_bytes()); // log_block_size > 6
+        let dev = dev_with_superblock(4096, &sb);
+        assert!(!probe_ext2_superblock(&dev));
+    }
+
+    #[test]
+    fn probe_rejects_fs_bigger_than_device() {
+        let mut sb = good_superblock();
+        sb[4..8].copy_from_slice(&1_000_000u32.to_le_bytes()); // huge fs...
+        let dev = dev_with_superblock(64, &sb); // ...tiny device
+        assert!(!probe_ext2_superblock(&dev));
+    }
 }
