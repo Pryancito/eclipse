@@ -890,7 +890,7 @@ impl VmMapping {
                 .unmap_cont(begin, cut_len)
                 .expect("failed to unmap");
             inner.size = new_len;
-            inner.flags.truncate(new_len);
+            inner.flags.truncate(pages(new_len));
             None
         } else {
             // superset: [---xxxx---]
@@ -913,7 +913,7 @@ impl VmMapping {
                 }),
             });
             inner.size = new_len1;
-            inner.flags.truncate(new_len1);
+            inner.flags.truncate(pages(new_len1));
             Some(new_mapping)
         }
     }
