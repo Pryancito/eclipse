@@ -175,6 +175,11 @@ pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
         had_jobs
     });
     info!("executor run!");
+    // This CPU is now entering the executor loop, where it runs with interrupts
+    // enabled and will service TLB-shootdown IPIs. Announce it as a valid
+    // shootdown target: until now an AP spins on `STARTED` with IRQs off and
+    // could not ack, so a shootdown that waited on it would stall.
+    kernel_hal::mark_cpu_ipi_ready(kernel_hal::cpu::cpu_id() as usize);
     loop {
         // In normal builds `run_until_idle` never returns (idle work happens in
         // the callback above); it only returns under `baremetal-test` when the

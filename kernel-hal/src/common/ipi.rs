@@ -57,6 +57,27 @@ pub fn online_cpu_count() -> usize {
     CPU_ONLINE.load(Ordering::Acquire).count_ones() as usize
 }
 
+/// Bitmask of CPUs that are actually *servicing* IPIs: running the executor
+/// loop with interrupts enabled, so a TLB-shootdown IPI to them will be taken
+/// and acknowledged promptly.
+///
+/// This is deliberately narrower than [`CPU_ONLINE`]. An AP is marked online in
+/// `secondary_init` but then spins on the boot `STARTED` flag with interrupts
+/// DISABLED until the BSP has spawned init — during which it cannot ack. Waiting
+/// on such a CPU would stall *every* shootdown the BSP issues while it spawns
+/// init (the heavy fork/exec/unmap burst) until the spin budget runs out, which
+/// looks like a hang. A not-yet-ready CPU runs no user process, so it holds no
+/// user TLB entry worth flushing — skipping it is safe.
+static IPI_READY: AtomicU64 = AtomicU64::new(0);
+
+/// Mark this CPU as ready to service TLB-shootdown IPIs. Called once, when the
+/// CPU enters its executor loop with interrupts enabled.
+pub fn mark_cpu_ipi_ready(logical_id: usize) {
+    if logical_id < 64 {
+        IPI_READY.fetch_or(1u64 << logical_id, Ordering::Release);
+    }
+}
+
 /// Per-CPU TLB-shootdown acknowledgement counter. Each CPU bumps its own slot
 /// every time it services a shootdown (i.e. flushes its whole TLB). A shootdown
 /// initiator snapshots a target's counter before signalling it and then waits
@@ -106,28 +127,32 @@ pub fn tlb_shootdown_ack() {
 /// `vaddr` is advisory (each ack is a full flush, which covers every request).
 pub fn remote_flush_tlb(_vaddr: Option<usize>) {
     let me = crate::cpu::cpu_id() as usize;
-    let online = CPU_ONLINE.load(Ordering::Acquire) & !(1u64 << me);
-    if online == 0 {
-        return; // we are the only online CPU
+    // Only target CPUs that are actually servicing IPIs — NOT merely online.
+    // Waiting on a CPU still spinning for `STARTED` with IRQs off (so it can't
+    // ack) would stall the whole init spawn until the budget runs out.
+    let targets = IPI_READY.load(Ordering::Acquire) & !(1u64 << me);
+    if targets == 0 {
+        return; // nobody else is servicing IPIs yet
     }
     let reason: IpiEntry = IpiReason::TlbShutdown { vpn: 0 }.into();
     // Snapshot each target's ack counter BEFORE signalling it, then signal.
     let mut snapshot = [0u64; MAX_CORE_NUM];
     for cpu in 0..MAX_CORE_NUM {
-        if online & (1u64 << cpu) != 0 {
+        if targets & (1u64 << cpu) != 0 {
             snapshot[cpu] = SHOOTDOWN_SEQ[cpu].load(Ordering::Acquire);
             let _ = crate::interrupt::send_ipi(cpu, reason);
         }
     }
-    // Total spin budget across all targets: generous enough that real acks
-    // (microseconds) always arrive first, bounded so a wedged target is
-    // abandoned in finite time instead of hanging the machine.
-    const SPIN_BUDGET: u64 = 1 << 22;
+    // Total spin budget across all targets: generous enough that a real ack from
+    // an IRQ-on target (microseconds) always arrives first, bounded so a target
+    // briefly wedged with IRQs off (spinning on a lock we hold) is abandoned in
+    // finite time — degrading to fire-and-forget for it — instead of hanging.
+    const SPIN_BUDGET: u64 = 1 << 15;
     let mut spins: u64 = 0;
     loop {
         let mut all_acked = true;
         for cpu in 0..MAX_CORE_NUM {
-            if online & (1u64 << cpu) != 0
+            if targets & (1u64 << cpu) != 0
                 && SHOOTDOWN_SEQ[cpu].load(Ordering::Acquire) == snapshot[cpu]
             {
                 all_acked = false;
