@@ -127,7 +127,7 @@ impl LinuxElfLoader {
                 error!("shebang: lookup interp {:?} failed: {:?}", interp_rel, e);
                 e
             })?;
-            let interp_vmo = inode.read_as_vmo().map_err(|e| {
+            let interp_vmo = inode.read_as_vmo_cached().map_err(|e| {
                 error!("shebang: read interp {:?} failed: {:?}", interp_rel, e);
                 e
             })?;
@@ -218,7 +218,7 @@ impl LinuxElfLoader {
                 );
                 e
             })?;
-            let interp_vmo = inode.read_as_vmo().map_err(|e| {
+            let interp_vmo = inode.read_as_vmo_cached().map_err(|e| {
                 error!("elf: read interp {:?} failed: {:?}", interp, e);
                 e
             })?;

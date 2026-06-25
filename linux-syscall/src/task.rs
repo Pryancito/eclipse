@@ -540,7 +540,7 @@ impl Syscall<'_> {
         let inode = proc.lookup_inode(path_str)?;
         let metadata = inode.metadata()?;
         proc.check_access(&metadata, 0o1, true)?;
-        let vmo = inode.read_as_vmo()?;
+        let vmo = inode.read_as_vmo_cached()?;
 
         proc.remove_cloexec_files();
         // POSIX: caught signals are reset to their default disposition across

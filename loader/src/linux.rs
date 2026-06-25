@@ -155,7 +155,7 @@ fn spawn(
         },
     };
     let vmo = inode
-        .read_as_vmo()
+        .read_as_vmo_cached()
         .unwrap_or_else(|e| panic!("failed to read process {:?}: {:?}", args[0], e));
     let path = args[0].clone();
 
