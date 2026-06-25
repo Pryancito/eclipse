@@ -60,6 +60,7 @@ impl LinuxRootfs {
             // fallback. `install_busybox_init` runs first so `/sbin/init` always
             // resolves to *some* PID 1; `install_openrc` then repoints it at
             // `openrc-init` when the (best-effort) OpenRC build is available.
+            Self::install_base_accounts(&dir);
             self.install_busybox_init(&dir);
             self.install_openrc(&dir, &musl);
             return;
@@ -378,6 +379,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         // fallback. busybox lays down `/sbin/init` -> busybox (+ inittab + rcS)
         // first, then OpenRC repoints `/sbin/init` -> `openrc-init` and installs
         // its userland when the (best-effort) cross build succeeds.
+        Self::install_base_accounts(&dir);
         self.install_busybox_init(&dir);
         self.install_openrc(&dir, &musl);
     }
@@ -396,6 +398,57 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                     fs::set_permissions(&dst, fs::Permissions::from_mode(0o755)).unwrap();
                 }
             }
+        }
+    }
+
+    /// Lay down the base `/etc/passwd` and `/etc/group` so name lookups resolve.
+    ///
+    /// OpenRC's `checkpath` sets `/run/lock` to `root:uucp`, so the `uucp` group
+    /// must exist or sysinit logs `checkpath: owner 'root:uucp' not found`. This
+    /// writes a minimal but standard set of system accounts (including `uucp`,
+    /// GID 14, with `root` as a member). `/etc/passwd` is only created when
+    /// absent (so it never clobbers accounts added later); `/etc/group` is
+    /// created when absent, and otherwise just gets a `uucp` line appended if it
+    /// lacks one — idempotent on incremental rebuilds.
+    fn install_base_accounts(rootfs: &Path) {
+        let etc = rootfs.join("etc");
+        let _ = fs::create_dir_all(&etc);
+
+        let passwd = etc.join("passwd");
+        if !passwd.exists() {
+            fs::write(
+                &passwd,
+                "root:x:0:0:root:/root:/bin/sh\n\
+                 nobody:x:65534:65534:nobody:/:/bin/false\n",
+            )
+            .unwrap();
+        }
+
+        let group = etc.join("group");
+        let base = "root:x:0:root\n\
+                    bin:x:1:\n\
+                    daemon:x:2:\n\
+                    sys:x:3:\n\
+                    adm:x:4:\n\
+                    tty:x:5:\n\
+                    disk:x:6:\n\
+                    lp:x:7:\n\
+                    wheel:x:10:root\n\
+                    uucp:x:14:root\n\
+                    nogroup:x:65533:\n\
+                    nobody:x:65534:\n";
+        match fs::read_to_string(&group) {
+            Ok(existing) => {
+                if !existing.lines().any(|l| l.starts_with("uucp:")) {
+                    let mut updated = existing;
+                    if !updated.ends_with('\n') {
+                        updated.push('\n');
+                    }
+                    updated.push_str("uucp:x:14:root\n");
+                    fs::write(&group, updated).unwrap();
+                }
+            }
+            Err(_) => fs::write(&group, base).unwrap(),
         }
     }
 
