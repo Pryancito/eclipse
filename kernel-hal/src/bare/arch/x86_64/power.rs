@@ -26,14 +26,17 @@
 //!
 //! * **Hardware-autonomous P-states.** On Intel via HWP ("Speed Shift"), on AMD
 //!   via CPPC. Enable the feature and let the CPU scale on its own between its
-//!   lowest P-state and a ceiling, biased hard toward power saving (EPP). This
-//!   kernel favours a cool CPU over peak speed, so the ceiling is set to the
-//!   base (guaranteed/nominal) clock — turbo/boost, the hottest and highest-
-//!   voltage bins, is left off — while an idle core still settles at its lowest
-//!   voltage/frequency. No per-tick MSR pokes from the kernel.
+//!   lowest P-state and a ceiling, biased toward *performance* (EPP) so it ramps
+//!   promptly to the ceiling under load. The ceiling is the base
+//!   (guaranteed/nominal) clock — turbo/boost, the hottest and highest-voltage
+//!   bins, is left off as the standing heat lever — while an idle core still
+//!   settles at its lowest voltage/frequency. Sustained-heat control is the
+//!   adaptive thermal governor further down, which walks the ceiling below base
+//!   only when the package actually gets hot; the steady state takes no per-tick
+//!   MSR pokes.
 //! * **Energy-Performance Bias.** The legacy pre-HWP Intel hint (Sandy Bridge …
 //!   Broadwell, and HWP parts that lack the EPP field) nudges the package's
-//!   internal P-state and turbo decisions toward efficiency.
+//!   internal P-state and turbo decisions; kept in step with the EPP preference.
 //! * **MWAIT idle.** Where supported, park in C1E via MONITOR/MWAIT instead of
 //!   `hlt`, shedding a little more idle voltage. C1/C1E never stop the LAPIC
 //!   timer, so this stays correct with the kernel's tickless-idle scheduler
@@ -72,21 +75,28 @@ const MSR_AMD_CPPC_REQUEST: u32 = 0xC001_02B2;
 
 // ── Tunables — cooling-first policy ─────────────────────────────────────────
 //
-// This kernel deliberately prioritises a cool, low-power CPU over peak speed.
-// The three knobs below set how hard. To trade some heat back for performance:
-// lower `EPP_POWER_SAVE` toward 0x80 (balanced) or 0x00 (max performance), and/
-// or set `CAP_AT_BASE_CLOCK = false` to re-enable turbo/boost.
+// This kernel runs the CPU at its base (guaranteed) clock under load and lets
+// it drop to the lowest P-state + C1E at idle, with the adaptive thermal
+// governor (below) as the closed-loop cooling mechanism. Earlier this
+// preference was biased to *maximum power saving* (EPP 0xFF), which pins a
+// bursty, mostly-idle workload near the *lowest* P-state — ~3-4x slower than
+// base on a modern part — so boot and every program launch crawled on real
+// hardware. (This module is skipped under a hypervisor, so QEMU stayed fast and
+// hid it — matching the "fast in QEMU, very slow on USB" report.) Bias to
+// performance instead: ramp promptly to the ceiling under load, and let the
+// thermal governor — not a permanently throttled clock — handle heat.
 //
 // Energy-Performance Preference written into the HWP/CPPC request [31:24]:
 //   0x00 = maximum performance … 0xFF = maximum power saving.
-// 0xFF biases the hardware to keep voltage/frequency as low as the workload
-// allows (lazy to ramp, avoids opportunistic boosts). The idle-heat win comes
-// from the *minimum* field (lowest P-state) regardless; this governs behaviour
-// under load.
-const EPP_POWER_SAVE: u64 = 0xFF;
+// To trade speed back for a cooler package, raise `EPP_PREF` toward 0x80
+// (balanced) or 0xFF (max saving). To go faster still, set
+// `CAP_AT_BASE_CLOCK = false` to re-enable turbo/boost (the governor still walks
+// the ceiling down when the package gets hot).
+const EPP_PREF: u64 = 0x00;
 
 // IA32_ENERGY_PERF_BIAS[3:0]: 0 = performance … 15 = power saving (max).
-const EPB_POWER_SAVE: u64 = 15;
+// Kept in step with EPP_PREF; only consulted on older parts without HWP-EPP.
+const EPB_PREF: u64 = 0;
 
 // Cap the maximum P-state at the CPU's *guaranteed* (base) clock instead of its
 // *highest* (turbo) clock. Turbo/boost bins run at the highest voltage and
@@ -343,7 +353,7 @@ unsafe fn enable_hwp(has_epp: bool) -> (u8, u8, bool) {
     // Desired = 0      → hardware chooses the operating point autonomously.
     // EPP only exists when CPUID.06H:EAX[10] is set; otherwise bits [31:24] are
     // reserved-zero and IA32_ENERGY_PERF_BIAS provides the bias instead.
-    let epp = if has_epp { EPP_POWER_SAVE } else { 0 };
+    let epp = if has_epp { EPP_PREF } else { 0 };
     let request = (lowest as u64) | ((max as u64) << 8) | (0u64 << 16) | (epp << 24);
     Msr::new(IA32_HWP_REQUEST).write(request);
 
@@ -370,7 +380,7 @@ unsafe fn enable_amd_cppc() -> (u8, u8, bool) {
 
     // REQUEST: Max[7:0]=max, Min[15:8]=lowest, Desired[23:16]=0 (autonomous),
     // EPP[31:24]. Out-of-range fields are clamped by hardware to [lowest,highest].
-    let request = (max as u64) | ((lowest as u64) << 8) | (0u64 << 16) | (EPP_POWER_SAVE << 24);
+    let request = (max as u64) | ((lowest as u64) << 8) | (0u64 << 16) | (EPP_PREF << 24);
     Msr::new(MSR_AMD_CPPC_REQUEST).write(request);
 
     (lowest, max, cap)
@@ -382,7 +392,7 @@ unsafe fn enable_amd_cppc() -> (u8, u8, bool) {
 /// set (checked by the caller).
 unsafe fn set_energy_perf_bias() {
     let mut msr = Msr::new(IA32_ENERGY_PERF_BIAS);
-    let value = (msr.read() & !0xf) | EPB_POWER_SAVE;
+    let value = (msr.read() & !0xf) | EPB_PREF;
     msr.write(value);
 }
 
@@ -683,7 +693,7 @@ unsafe fn governor_program_ceiling(mech: u8, lowest: u8, max: u8) {
     match mech {
         1 => {
             let epp = if GOV_HAS_EPP.load(Ordering::Relaxed) {
-                EPP_POWER_SAVE
+                EPP_PREF
             } else {
                 0
             };
@@ -692,7 +702,7 @@ unsafe fn governor_program_ceiling(mech: u8, lowest: u8, max: u8) {
         }
         2 => {
             let request =
-                (max as u64) | ((lowest as u64) << 8) | (0u64 << 16) | (EPP_POWER_SAVE << 24);
+                (max as u64) | ((lowest as u64) << 8) | (0u64 << 16) | (EPP_PREF << 24);
             Msr::new(MSR_AMD_CPPC_REQUEST).write(request);
         }
         _ => {}
