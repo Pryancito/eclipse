@@ -1050,7 +1050,7 @@ impl VmMapping {
         // Copy the parent's current contents page by page. `read` commits /
         // fills-from-source as needed (so file-backed .text and demand-zero BSS
         // come through correctly); `write` commits the fresh child frames.
-        let mut buf = alloc::vec![0u8; PAGE_SIZE];
+        let mut buf = vec![0u8; PAGE_SIZE];
         let mut off = 0;
         while off < len {
             self.vmo.read(off, &mut buf)?;
