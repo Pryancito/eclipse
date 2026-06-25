@@ -23,19 +23,27 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
 
-        let is_seekable =
+        let chunk_size = len.min(super::SYSCALL_IO_MAX);
+        // `is_seekable` only changes the outcome for a multi-chunk request: it
+        // decides whether to keep refilling the buffer past one `chunk_size`
+        // slice. For a single-chunk read (`len <= chunk_size`, the overwhelming
+        // majority) the loop terminates the same way either way, so skip the
+        // `metadata()` probe — it would otherwise re-read the inode on every
+        // read syscall.
+        let is_seekable = if len > chunk_size {
             if let Ok(file) = file_like.clone().downcast_arc::<linux_object::fs::File>() {
-                if let Ok(meta) = file.metadata() {
-                    meta.type_ == linux_object::fs::vfs::FileType::File
-                        || meta.type_ == linux_object::fs::vfs::FileType::BlockDevice
-                } else {
-                    false
-                }
+                file.metadata()
+                    .map(|meta| {
+                        meta.type_ == linux_object::fs::vfs::FileType::File
+                            || meta.type_ == linux_object::fs::vfs::FileType::BlockDevice
+                    })
+                    .unwrap_or(false)
             } else {
                 false
-            };
-
-        let chunk_size = len.min(super::SYSCALL_IO_MAX);
+            }
+        } else {
+            false
+        };
         // Hybrid stack/heap buffer: line-oriented apps (busybox shell, getline,
         // fgetc) drive a stream of small reads — keep those alloc-free. The
         // ~64 KiB ceiling case still goes via the buddy allocator.
