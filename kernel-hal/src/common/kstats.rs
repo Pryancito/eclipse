@@ -108,6 +108,21 @@ pub fn cpus_idle_now() -> usize {
     CPU_IN_IDLE.iter().filter(|c| c.load(Relaxed)).count()
 }
 
+/// Bitmask of logical CPUs currently parked in idle halt (bit `i` = cpu `i`).
+/// Used by the TLB-shootdown initiator to avoid synchronously waiting on a core
+/// that is halted: a halted core is not executing, and the shootdown IPI it was
+/// sent will flush its TLB when it wakes (before it runs any user instruction),
+/// exactly as the existing budget-exhaustion fire-and-forget fallback relies on.
+pub fn cpu_idle_mask() -> u64 {
+    let mut mask = 0u64;
+    for (i, c) in CPU_IN_IDLE.iter().enumerate() {
+        if i < 64 && c.load(Relaxed) {
+            mask |= 1u64 << i;
+        }
+    }
+    mask
+}
+
 /// Account one timer tick.
 pub fn note_timer_tick() {
     TIMER_TICKS.fetch_add(1, Relaxed);
