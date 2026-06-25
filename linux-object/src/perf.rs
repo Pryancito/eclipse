@@ -512,19 +512,6 @@ pub fn kernel_report() -> String {
         ks.irq_total,
         rate(ks.irq_total)
     );
-    // Synchronous TLB shootdowns. A high `budget-exhausted` count means the
-    // initiator kept spinning the full budget waiting for a target (typically an
-    // idle core) to ack — the signature of the fork/exec stall on real
-    // multi-core hardware that single-core / always-awake QEMU never shows.
-    let (tlb_total, tlb_giveups, tlb_spins) = kernel_hal::tlb_shootdown_stats();
-    let _ = writeln!(
-        out,
-        "tlb shootdown: {} ({:.0}/s), {} budget-exhausted, {} avg spins",
-        tlb_total,
-        rate(tlb_total),
-        tlb_giveups,
-        if tlb_total > 0 { tlb_spins / tlb_total } else { 0 }
-    );
     // Idle-callback hit rate: the scheduler only halts when this finds no
     // deferred work, so a high "had work" share means the CPUs busy-spin
     // draining jobs (the heat signature) rather than sleeping. `cb_work_pct` is
