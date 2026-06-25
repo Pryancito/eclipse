@@ -1001,7 +1001,16 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt\n\
               export LD_PRELOAD=/lib/libeclipse_dns.so\n\
               export HOME=/root\n\
-              export TERM=xterm-256color\n",
+              export TERM=xterm-256color\n\
+              # No GPU here: wlroots/labwc must use the software (pixman) renderer.\n\
+              # Otherwise wlroots tries GLES2/EGL then Vulkan, both fail, and labwc\n\
+              # exits with 'Could not initialize renderer' (it does not auto-fall\n\
+              # back to pixman). See docs/README-drm.md.\n\
+              export WLR_RENDERER=pixman\n\
+              export WLR_RENDERER_ALLOW_SOFTWARE=1\n\
+              # Runtime dir for the Wayland socket (created on demand, mode 0700).\n\
+              export XDG_RUNTIME_DIR=/run/user/0\n\
+              [ -d \"$XDG_RUNTIME_DIR\" ] || { mkdir -p \"$XDG_RUNTIME_DIR\" && chmod 0700 \"$XDG_RUNTIME_DIR\"; }\n",
         )
         .unwrap();
     }
