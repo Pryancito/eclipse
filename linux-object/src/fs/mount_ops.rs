@@ -98,6 +98,35 @@ pub(crate) fn open_filesystem(
     }
 }
 
+/// Pseudo-filesystems the Eclipse kernel already provides (procfs at `/proc`,
+/// sysfs at `/sys`) or that need no backing block device and live on the
+/// kernel's writable `/dev`, `/run`, `/tmp` trees. They are not separately
+/// mountable through the block-device path, but they ARE already present, so an
+/// attempt to mount one is treated as a successful no-op rather than ENODEV.
+const VIRTUAL_FSTYPES: &[&str] = &[
+    "proc",
+    "sysfs",
+    "devtmpfs",
+    "devpts",
+    "tmpfs",
+    "ramfs",
+    "cgroup",
+    "cgroup2",
+    "mqueue",
+    "debugfs",
+    "securityfs",
+    "configfs",
+    "tracefs",
+    "fusectl",
+];
+
+/// True for a [`VIRTUAL_FSTYPES`] pseudo-filesystem (case-insensitive).
+pub(crate) fn is_virtual_fstype(fstype: &str) -> bool {
+    VIRTUAL_FSTYPES
+        .iter()
+        .any(|t| fstype.eq_ignore_ascii_case(t))
+}
+
 pub(crate) fn prepare_fs(
     fs: Arc<dyn FileSystem>,
     flags: usize,
@@ -141,6 +170,20 @@ pub fn mount_fs(
         mount_node.mount(fs).map_err(LxError::from)?;
         let opts = build_options_string(flags, data);
         super::register_mount(source, &target_norm, "none", &opts, state);
+        return Ok(());
+    }
+
+    // Pseudo-filesystems the kernel already provides (procfs at /proc, sysfs at
+    // /sys, the writable dev/run/tmp trees). A real mount here is unnecessary
+    // and would shadow the live procfs, so acknowledge the request as a
+    // successful no-op — and record it in /proc/mounts — instead of failing
+    // with ENODEV. This is what lets OpenRC's sysinit `mount -t proc proc /proc`
+    // (and the other pseudo-fs mounts) succeed quietly rather than logging
+    // "mounting proc on /proc failed: No such device".
+    if is_virtual_fstype(fstype) {
+        let opts = build_options_string(flags, data);
+        let state = Arc::new(mount_state::MountState::new(flags_read_only(flags, data)));
+        super::register_mount(source, &target_norm, fstype, &opts, state);
         return Ok(());
     }
 
