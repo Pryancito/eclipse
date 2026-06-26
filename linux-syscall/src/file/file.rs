@@ -447,8 +447,8 @@ impl Syscall<'_> {
         request: usize,
         arg1: usize,
     ) -> Result<Option<usize>, LxError> {
-        use linux_object::fs::devfs::{drm, DrmDev};
-        use linux_object::fs::{DmaBuf, File};
+        use linux_object::fs::devfs::drm;
+        use linux_object::fs::DmaBuf;
 
         const PRIME_HANDLE_TO_FD: usize = 0xC00C_642D;
         const PRIME_FD_TO_HANDLE: usize = 0xC00C_642E;
@@ -476,20 +476,9 @@ impl Syscall<'_> {
             fd: i32,
         }
 
-        // Only intercept on a DRM device fd.
-        let is_drm = file_like
-            .downcast_ref::<File>()
-            .map(|f| f.inode().as_any_ref().downcast_ref::<DrmDev>().is_some())
-            .unwrap_or(false);
-        if !is_drm {
-            error!(
-                "[drm] PRIME/LEASE ioctl {:#x} on non-DRM fd (is_file={}) — passing through",
-                request,
-                file_like.downcast_ref::<File>().is_some()
-            );
-            return Ok(None);
-        }
-
+        // These ioctl numbers are DRM-specific (libdrm only issues them on a DRM
+        // fd), and each operation errors gracefully on a wrong fd, so handle by
+        // request number alone — no fragile fd-type detection.
         let proc = self.linux_process();
         match request {
             PRIME_HANDLE_TO_FD => {
