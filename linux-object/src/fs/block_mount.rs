@@ -1,17 +1,81 @@
 //! Block-backed and file-backed devices for mountable filesystems.
 
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::cmp::min;
 
+use lock::Mutex;
 use rcore_fs::dev::{DevError, Device, Result as DevResult};
 use rcore_fs::vfs::{FsError, INode, Result as VfsResult};
-use zcore_drivers::scheme::BlockScheme;
+use zcore_drivers::{scheme::BlockScheme, DeviceResult};
 
 use super::devfs::BlockDev;
 
 /// 512-byte sector buffer aligned for AHCI DMA.
 #[repr(align(4096))]
 struct SectorBuf([u8; 512]);
+
+const SECTOR: usize = 512;
+
+/// Hot-generation capacity of the per-device block cache, in 512-byte sectors.
+/// ~4 MiB hot; with the warm generation the cache holds up to ~8 MiB. Sized to
+/// keep the boot working set (ext2/btrfs inode & B-tree metadata blocks plus the
+/// repeatedly re-exec'd busybox image) resident.
+const CACHE_HOT_CAP: usize = 8192;
+
+/// A generational ("two-hand clock") LRU cache of disk sectors.
+///
+/// Every filesystem read on Eclipse goes `FS -> BlockByteDevice -> block driver
+/// -> real disk (DMA + IRQ)`. Without caching, the same sectors — inode tables
+/// shared by many inodes, directory/B-tree blocks walked on every lookup, and
+/// the busybox binary re-read on every `exec` — are fetched from the device
+/// again and again, which is what makes OpenRC's exec/stat-heavy startup crawl.
+///
+/// Approximate LRU at O(1): inserts go into `hot`; when `hot` fills, the old
+/// `warm` set is dropped and `hot` becomes the new `warm`. A hit in `warm` is
+/// promoted back to `hot`. Memory is bounded to ~2 * `CACHE_HOT_CAP` sectors.
+struct SectorCache {
+    hot: BTreeMap<usize, Box<[u8; SECTOR]>>,
+    warm: BTreeMap<usize, Box<[u8; SECTOR]>>,
+}
+
+impl SectorCache {
+    fn new() -> Self {
+        Self {
+            hot: BTreeMap::new(),
+            warm: BTreeMap::new(),
+        }
+    }
+
+    /// Copy sector `id` into `out` (must be 512 bytes) if cached, promoting a
+    /// warm hit. Returns `true` on a hit.
+    fn get_into(&mut self, id: usize, out: &mut [u8]) -> bool {
+        if let Some(d) = self.hot.get(&id) {
+            out.copy_from_slice(&d[..]);
+            return true;
+        }
+        if let Some(d) = self.warm.remove(&id) {
+            out.copy_from_slice(&d[..]);
+            self.insert(id, d);
+            return true;
+        }
+        false
+    }
+
+    fn insert(&mut self, id: usize, data: Box<[u8; SECTOR]>) {
+        self.hot.insert(id, data);
+        if self.hot.len() >= CACHE_HOT_CAP {
+            self.warm = core::mem::take(&mut self.hot);
+        }
+    }
+
+    fn put_from(&mut self, id: usize, src: &[u8]) {
+        let mut b = Box::new([0u8; SECTOR]);
+        b.copy_from_slice(src);
+        self.insert(id, b);
+    }
+}
 
 /// Backing store for a mount operation.
 pub enum MountBackend {
@@ -37,14 +101,62 @@ impl MountBackend {
     }
 }
 
-/// Byte-oriented device over a block driver.
+/// Byte-oriented device over a block driver, with a sector cache.
 pub struct BlockByteDevice {
     block: Arc<dyn BlockScheme>,
+    cache: Mutex<SectorCache>,
 }
 
 impl BlockByteDevice {
     pub fn new(block: Arc<dyn BlockScheme>) -> Self {
-        Self { block }
+        Self {
+            block,
+            cache: Mutex::new(SectorCache::new()),
+        }
+    }
+
+    /// Read `buf.len() / 512` consecutive sectors starting at `block_id`,
+    /// serving from the cache and hitting the device only on a miss. `buf.len()`
+    /// must be a non-zero multiple of 512. Returns the same result type as the
+    /// underlying driver so callers keep their existing error handling.
+    fn read_block_cached(&self, block_id: usize, buf: &mut [u8]) -> DeviceResult {
+        let nsec = buf.len() / SECTOR;
+        // Fast path: every requested sector is already cached.
+        {
+            let mut cache = self.cache.lock();
+            let mut all_hit = true;
+            for i in 0..nsec {
+                if !cache.get_into(block_id + i, &mut buf[i * SECTOR..(i + 1) * SECTOR]) {
+                    all_hit = false;
+                    break;
+                }
+            }
+            if all_hit {
+                return Ok(());
+            }
+        }
+        // Miss: one device transfer for the whole run, then warm the cache.
+        self.block.read_block(block_id, buf)?;
+        {
+            let mut cache = self.cache.lock();
+            for i in 0..nsec {
+                cache.put_from(block_id + i, &buf[i * SECTOR..(i + 1) * SECTOR]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Write `buf.len() / 512` consecutive sectors starting at `block_id`,
+    /// write-through to the device and refreshing the cache so later reads stay
+    /// consistent and warm. `buf.len()` must be a non-zero multiple of 512.
+    fn write_block_cached(&self, block_id: usize, buf: &[u8]) -> DeviceResult {
+        self.block.write_block(block_id, buf)?;
+        let nsec = buf.len() / SECTOR;
+        let mut cache = self.cache.lock();
+        for i in 0..nsec {
+            cache.put_from(block_id + i, &buf[i * SECTOR..(i + 1) * SECTOR]);
+        }
+        Ok(())
     }
 }
 
@@ -58,8 +170,7 @@ impl Device for BlockByteDevice {
         let head_off = offset % BS;
         if head_off != 0 && done < buf.len() {
             let take = min(buf.len(), BS - head_off);
-            self.block
-                .read_block(offset / BS, &mut temp.0)
+            self.read_block_cached(offset / BS, &mut temp.0)
                 .map_err(|_| DevError)?;
             buf[..take].copy_from_slice(&temp.0[head_off..head_off + take]);
             done += take;
@@ -69,8 +180,7 @@ impl Device for BlockByteDevice {
         let mid = ((buf.len() - done) / BS) * BS;
         if mid > 0 {
             let block_id = (offset + done) / BS;
-            self.block
-                .read_block(block_id, &mut buf[done..done + mid])
+            self.read_block_cached(block_id, &mut buf[done..done + mid])
                 .map_err(|e| {
                     warn!(
                         "blockdev: read_block(block_id={}, {} sectors) failed: {:?} \
@@ -89,8 +199,7 @@ impl Device for BlockByteDevice {
         // Partial trailing sector.
         if done < buf.len() {
             let take = buf.len() - done;
-            self.block
-                .read_block((offset + done) / BS, &mut temp.0)
+            self.read_block_cached((offset + done) / BS, &mut temp.0)
                 .map_err(|_| DevError)?;
             buf[done..].copy_from_slice(&temp.0[..take]);
             done += take;
@@ -109,12 +218,10 @@ impl Device for BlockByteDevice {
         if head_off != 0 && done < buf.len() {
             let take = min(buf.len(), BS - head_off);
             let block_id = offset / BS;
-            self.block
-                .read_block(block_id, &mut temp.0)
+            self.read_block_cached(block_id, &mut temp.0)
                 .map_err(|_| DevError)?;
             temp.0[head_off..head_off + take].copy_from_slice(&buf[..take]);
-            self.block
-                .write_block(block_id, &temp.0)
+            self.write_block_cached(block_id, &temp.0)
                 .map_err(|_| DevError)?;
             done += take;
         }
@@ -123,8 +230,7 @@ impl Device for BlockByteDevice {
         let mid = ((buf.len() - done) / BS) * BS;
         if mid > 0 {
             let block_id = (offset + done) / BS;
-            self.block
-                .write_block(block_id, &buf[done..done + mid])
+            self.write_block_cached(block_id, &buf[done..done + mid])
                 .map_err(|e| {
                     warn!(
                         "blockdev: write_block(block_id={}, {} sectors) failed: {:?} \
@@ -144,12 +250,10 @@ impl Device for BlockByteDevice {
         if done < buf.len() {
             let take = buf.len() - done;
             let block_id = (offset + done) / BS;
-            self.block
-                .read_block(block_id, &mut temp.0)
+            self.read_block_cached(block_id, &mut temp.0)
                 .map_err(|_| DevError)?;
             temp.0[..take].copy_from_slice(&buf[done..]);
-            self.block
-                .write_block(block_id, &temp.0)
+            self.write_block_cached(block_id, &temp.0)
                 .map_err(|_| DevError)?;
             done += take;
         }
