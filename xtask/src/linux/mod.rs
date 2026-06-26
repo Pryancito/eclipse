@@ -53,8 +53,6 @@ impl LinuxRootfs {
             if eclipse_useradd.is_file() {
                 let _ = fs::copy(&eclipse_useradd, bin.join("eclipse-useradd"));
             }
-            // resize2fs/e2fsck/mke2fs (para expandir ROOT y formatear HOME).
-            self.install_e2fsprogs_bins(&musl, &bin);
             self.install_thread_tests(&dir);
             // INIT (PID 1): OpenRC by default, with busybox init as a resilient
             // fallback. `install_busybox_init` runs first so `/sbin/init` always
@@ -370,8 +368,6 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             fs::copy(&eclipse_useradd, &dst).unwrap();
         }
 
-        // 拷贝 resize2fs/e2fsck/mke2fs (e2fsprogs) para el instalador.
-        self.install_e2fsprogs_bins(&musl, &bin);
         self.install_thread_tests(&dir);
         // INIT (PID 1): OpenRC by default; busybox init kept as a resilient
         // fallback. busybox lays down `/sbin/init` -> busybox (+ inittab + rcS)
@@ -1602,139 +1598,6 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         musl.as_ref()
             .join("bin")
             .join(format!("{}-linux-musl-strip", self.0.name()))
-    }
-
-    /// Cross-compila e2fsprogs (resize2fs, e2fsck, mke2fs) estático con musl y
-    /// devuelve el directorio con los binarios ya recortados.
-    ///
-    /// Necesario porque busybox no incluye estas herramientas: el instalador usa
-    /// `resize2fs` (y `e2fsck -f`) para expandir ROOT a toda la partición tras
-    /// volcar la imagen, y `mke2fs` para formatear HOME en el layout avanzado.
-    ///
-    /// Es best-effort: si la descarga o la compilación fallan, se devuelve el
-    /// directorio aunque esté vacío/incompleto y los llamantes omiten los
-    /// binarios ausentes (igual que el resto de herramientas opcionales).
-    fn e2fsprogs(&self, musl: &Path) -> PathBuf {
-        let out = self.0.target().join("e2fsprogs");
-        let needed = ["resize2fs", "e2fsck", "mke2fs"];
-        if needed.iter().all(|n| out.join(n).is_file()) {
-            return out;
-        }
-
-        // Fuente (clon superficial del mirror canónico de tytso).
-        let source = REPOS.join("e2fsprogs");
-        if !source.is_dir() {
-            fetch_online!(source, |tmp| {
-                Git::clone("https://github.com/tytso/e2fsprogs.git")
-                    .dir(tmp)
-                    .single_branch()
-                    .depth(1)
-                    .done()
-            });
-        }
-
-        let musl = musl.canonicalize().unwrap();
-        let arch = self.0.name();
-        let musl_bin = musl.join("bin");
-        let path_env = join_path_env([&musl_bin]);
-        let cc = format!("{}/{}-linux-musl-gcc", musl_bin.display(), arch);
-        let ar = format!("{}/{}-linux-musl-ar", musl_bin.display(), arch);
-        let ranlib = format!("{}/{}-linux-musl-ranlib", musl_bin.display(), arch);
-        let strip_tool = format!("{}/{}-linux-musl-strip", musl_bin.display(), arch);
-
-        // Build VPATH en árbol separado para no ensuciar la fuente.
-        let build = self.0.target().join("e2fsprogs-build");
-        dir::rm(&build).unwrap();
-        fs::create_dir_all(&build).unwrap();
-
-        // configure cruzado y estático. Las asignaciones CC=/CFLAGS=/LDFLAGS= se
-        // pasan como argumentos (autoconf las acepta así).
-        let configure = source.join("configure");
-        let status = Ext::new("sh")
-            .current_dir(&build)
-            .env("PATH", &path_env)
-            .arg(configure.display().to_string())
-            .arg(format!("CC={cc}"))
-            .arg(format!("AR={ar}"))
-            .arg(format!("RANLIB={ranlib}"))
-            .arg(format!("STRIP={strip_tool}"))
-            .arg("CFLAGS=-O2 -fno-PIC -fno-PIE")
-            .arg("EXTRA_CFLAGS=-O2 -fno-PIC -fno-PIE")
-            .arg("LDFLAGS=-static -no-pie")
-            .arg("EXTRA_LDFLAGS=-static -no-pie")
-            .arg(format!("--host={arch}-linux-musl"))
-            .arg("--disable-nls")
-            .arg("--disable-rpath")
-            .arg("--disable-defrag")
-            .arg("--disable-fuse2fs")
-            .arg("--disable-uuidd")
-            .status();
-        if !status.success() {
-            println!("Failed to configure e2fsprogs");
-            return out;
-        }
-
-        // lib/uuid/Makefile.in enlaza tst_uuid en `all::`; con GCC reciente y
-        // -static falla (R_X86_64_32 vs PIE). Solo necesitamos libuuid.a.
-        let uuid_mk = build.join("lib/uuid/Makefile");
-        if let Ok(text) = fs::read_to_string(&uuid_mk) {
-            let patched = text.replace("all:: tst_uuid uuid_time", "all:: uuid_time");
-            if patched != text {
-                let _ = fs::write(&uuid_mk, patched);
-            }
-        }
-
-        // Bibliotecas estáticas primero. Los binarios se construyen dentro de cada
-        // subdirectorio: `make resize/resize2fs` desde la raíz no enlaza libext2fs.
-        let _ = Make::new()
-            .current_dir(&build)
-            .env("PATH", &path_env)
-            .arg("libs")
-            .status();
-        for (subdir, prog) in [
-            ("resize", "resize2fs"),
-            ("e2fsck", "e2fsck"),
-            ("misc", "mke2fs"),
-        ] {
-            let _ = Make::new()
-                .current_dir(build.join(subdir))
-                .env("PATH", &path_env)
-                .arg(prog)
-                .status();
-        }
-
-        fs::create_dir_all(&out).unwrap();
-        let strip = self.strip(&musl);
-        for (rel, name) in [
-            ("resize/resize2fs", "resize2fs"),
-            ("e2fsck/e2fsck", "e2fsck"),
-            ("misc/mke2fs", "mke2fs"),
-        ] {
-            let built = build.join(rel);
-            if built.is_file() {
-                let dst = out.join(name);
-                let _ = dir::rm(&dst);
-                if fs::copy(&built, &dst).is_ok() {
-                    Ext::new(&strip).arg("-s").arg(&dst).status();
-                }
-            } else {
-                println!("warning: e2fsprogs build did not produce {name}");
-            }
-        }
-        out
-    }
-
-    /// Construye e2fsprogs y copia resize2fs/e2fsck/mke2fs en `bin/` (best-effort).
-    fn install_e2fsprogs_bins(&self, musl: &Path, bin: &Path) {
-        let out = self.e2fsprogs(musl);
-        for name in ["resize2fs", "e2fsck", "mke2fs"] {
-            let built = out.join(name);
-            if built.is_file() {
-                let dst = bin.join(name);
-                let _ = dir::rm(&dst);
-                let _ = fs::copy(&built, &dst);
-            }
-        }
     }
 
     /// 从安装目录拷贝所有 so 和 so 链接到 rootfs
