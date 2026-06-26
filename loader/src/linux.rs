@@ -194,6 +194,7 @@ fn spawn(
             }
         },
     };
+<<<<<<< HEAD
     // A PID 1 / base program whose binary is present but unreadable must not
     // take the whole kernel down: degrade gracefully (skip → caller falls back
     // to the shell) instead of panicking.
@@ -204,6 +205,11 @@ fn spawn(
             return None;
         }
     };
+=======
+    let vmo = inode
+        .read_as_vmo_cached()
+        .unwrap_or_else(|e| panic!("failed to read process {:?}: {:?}", args[0], e));
+>>>>>>> 20e2d576 (perf(exec): cache executable file images across execve)
     let path = args[0].clone();
 
     // hunter P8: verify binary integrity + path policy using a full 64-byte

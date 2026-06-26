@@ -41,7 +41,10 @@ pub fn mock_block() -> mock::MockBlock {
     mock::MockBlock::new()
 }
 
-use alloc::{boxed::Box, fmt::Write as _, string::String, string::ToString, sync::Arc, vec::Vec};
+use alloc::{
+    boxed::Box, collections::BTreeMap, fmt::Write as _, string::String, string::ToString,
+    sync::Arc, vec::Vec,
+};
 use core::convert::TryFrom;
 
 use async_trait::async_trait;
@@ -1108,12 +1111,77 @@ pub fn dns_vfs_root() -> Option<Arc<dyn INode>> {
     mount_ops::vfs_root().map(|root| root as Arc<dyn INode>)
 }
 
+/// Per-inode cache of executable file images, keyed by inode identity.
+///
+/// [`INodeExt::read_as_vmo`] reads a whole file off the filesystem and copies it
+/// into a freshly allocated VMO. On the `execve` hot path that runs for *every*
+/// spawn, so a shell launching commands — or `apk` running hundreds of helper
+/// processes — re-reads and re-copies the same handful of binaries (plus the
+/// `ld-musl` interpreter, loaded on every dynamically-linked exec) over and over.
+/// Each load is CPU work proportional to the binary size; on real hardware this
+/// pegged every core for hours during a large `apk` transaction.
+///
+/// [`INodeExt::read_as_vmo_cached`] memoises the image so a repeatedly-exec'd
+/// binary is read once and shared thereafter. Every caller (ELF parsing + the
+/// loader's segment copy-*out*) treats the VMO as read-only, so handing the same
+/// `Arc<VmObject>` to many processes is safe. The key includes the file size and
+/// mtime, so rewriting the file changes the key and the next exec re-reads it.
+type ElfVmoKey = (usize, usize, usize, i64, i32); // (dev, inode, size, mtime.sec, mtime.nsec)
+
+/// Skip caching files larger than this (don't pin a giant binary like
+/// `libLLVM.so` in the cache for one load).
+const ELF_VMO_CACHE_FILE_MAX: usize = 8 * 1024 * 1024;
+/// Total committed bytes the cache may hold; the oldest entries are evicted
+/// (FIFO) once a new insert would exceed it.
+const ELF_VMO_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+struct ElfVmoCache {
+    map: BTreeMap<ElfVmoKey, Arc<VmObject>>,
+    fifo: Vec<ElfVmoKey>,
+    bytes: usize,
+}
+
+impl ElfVmoCache {
+    fn get(&self, key: &ElfVmoKey) -> Option<Arc<VmObject>> {
+        self.map.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: ElfVmoKey, vmo: Arc<VmObject>) {
+        if self.map.contains_key(&key) {
+            return;
+        }
+        let size = key.2;
+        // Evict oldest entries until this one fits within the byte budget.
+        while self.bytes + size > ELF_VMO_CACHE_MAX_BYTES && !self.fifo.is_empty() {
+            let old = self.fifo.remove(0);
+            if self.map.remove(&old).is_some() {
+                self.bytes = self.bytes.saturating_sub(old.2);
+            }
+        }
+        self.fifo.push(key);
+        self.map.insert(key, vmo);
+        self.bytes += size;
+    }
+}
+
+lazy_static! {
+    static ref ELF_VMO_CACHE: Mutex<ElfVmoCache> = Mutex::new(ElfVmoCache {
+        map: BTreeMap::new(),
+        fifo: Vec::new(),
+        bytes: 0,
+    });
+}
+
 /// extension for INode
 pub trait INodeExt {
     /// similar to read, but return a u8 vector
     fn read_as_vec(&self) -> Result<Vec<u8>>;
     /// read to VmObject
     fn read_as_vmo(&self) -> Result<Arc<VmObject>>;
+    /// Like [`read_as_vmo`](Self::read_as_vmo), but returns a shared, cached
+    /// image for repeatedly-loaded executables. The returned VMO MUST be treated
+    /// as read-only by the caller.
+    fn read_as_vmo_cached(&self) -> Result<Arc<VmObject>>;
 }
 
 impl INodeExt for dyn INode {
@@ -1146,6 +1214,25 @@ impl INodeExt for dyn INode {
         }
         vmo.set_content_size(size)
             .map_err(|_| rcore_fs::vfs::FsError::DeviceError)?;
+        Ok(vmo)
+    }
+
+    fn read_as_vmo_cached(&self) -> Result<Arc<VmObject>> {
+        let m = self.metadata()?;
+        // Only cache regular files of a sane size; devices, pipes, empty and
+        // oversized files fall through to a fresh, uncached read.
+        if m.type_ != FileType::File || m.size == 0 || m.size > ELF_VMO_CACHE_FILE_MAX {
+            return self.read_as_vmo();
+        }
+        let key: ElfVmoKey = (m.dev, m.inode, m.size, m.mtime.sec, m.mtime.nsec);
+        if let Some(vmo) = ELF_VMO_CACHE.lock().get(&key) {
+            return Ok(vmo);
+        }
+        // Read outside the cache lock so a slow filesystem read never serialises
+        // other loads. A concurrent double-miss just reads twice and the second
+        // `insert` is a no-op — both callers get a VMO with identical bytes.
+        let vmo = self.read_as_vmo()?;
+        ELF_VMO_CACHE.lock().insert(key, vmo.clone());
         Ok(vmo)
     }
 }

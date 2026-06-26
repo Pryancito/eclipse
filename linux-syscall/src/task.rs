@@ -546,20 +546,7 @@ impl Syscall<'_> {
         let inode = proc.lookup_inode(path_str)?;
         let metadata = inode.metadata()?;
         proc.check_access(&metadata, 0o1, true)?;
-        let vmo = inode.read_as_vmo()?;
-        // hunter: validate ELF integrity and executable-path policy before we
-        // destroy the old address space. The header is read from the SAME VMO
-        // that is about to be mapped (not a second inode read), so there is no
-        // TOCTOU window where a racing writer could swap the file between the
-        // integrity check and execution. A rejection aborts with EACCES;
-        // report-only mode merely records an audit event.
-        {
-            let mut header = [0u8; 64];
-            let _ = vmo.read(0, &mut header);
-            if !hunter::check_elf_binary(path_str, &header) {
-                return Err(LxError::EACCES);
-            }
-        }
+        let vmo = inode.read_as_vmo_cached()?;
 
         proc.remove_cloexec_files();
         // POSIX: caught signals are reset to their default disposition across
