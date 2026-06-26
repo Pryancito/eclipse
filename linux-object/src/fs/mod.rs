@@ -5,8 +5,6 @@ mod btrfs_mount;
 pub mod devfs;
 mod epoll;
 mod eventfd;
-mod ext2_editor;
-mod ext2_mount;
 mod fat_mount;
 mod file;
 mod flagged_fs;
@@ -828,32 +826,18 @@ fn lookup_candidate(candidates: &[(String, Arc<dyn INode>)], dev: &str) -> Optio
         .map(|(_, i)| i.clone())
 }
 
-/// Open a block-device inode as a btrfs (preferred) or ext2 filesystem, if
-/// possible. Returns the filesystem together with its fstype name.
+/// Open a block-device (or loop file) inode as a btrfs filesystem, if possible.
+/// btrfs is the only on-disk root filesystem Eclipse supports; ext2 was removed.
+/// Returns the filesystem together with its fstype name.
 fn open_block_root(inode: Arc<dyn INode>) -> Option<(Arc<dyn FileSystem>, &'static str)> {
-    let backend = block_mount::MountBackend::from_inode(inode.clone()).ok()?;
+    let backend = block_mount::MountBackend::from_inode(inode).ok()?;
     if let block_mount::MountBackend::Block(block) = &backend {
-        if btrfs_mount::probe_btrfs_superblock(block) {
-            if let Ok(fs) = mount_ops::open_filesystem(backend, "btrfs", false) {
-                return Some((fs, "btrfs"));
-            }
+        if !btrfs_mount::probe_btrfs_superblock(block) {
             return None;
         }
-        if !block_mount::probe_ext2_superblock(block) {
-            return None;
-        }
-        let fs = mount_ops::open_filesystem(backend, "ext2", false).ok()?;
-        return Some((fs, "ext2"));
     }
-    // File-backed (loop) roots: try btrfs, then ext2.
-    match mount_ops::open_filesystem(backend, "btrfs", false) {
-        Ok(fs) => Some((fs, "btrfs")),
-        Err(_) => {
-            let backend = block_mount::MountBackend::from_inode(inode).ok()?;
-            let fs = mount_ops::open_filesystem(backend, "ext2", false).ok()?;
-            Some((fs, "ext2"))
-        }
-    }
+    let fs = mount_ops::open_filesystem(backend, "btrfs", false).ok()?;
+    Some((fs, "btrfs"))
 }
 
 /// Open the root declared by the `/` entry of the boot medium's fstab, when
