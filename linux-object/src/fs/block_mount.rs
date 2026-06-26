@@ -518,48 +518,6 @@ pub fn device_from_backend(backend: &MountBackend) -> VfsResult<Arc<dyn Device>>
     Ok(Arc::new(CachedDevice::new(raw, size_bytes)))
 }
 
-/// ext2 superblock magic (`0xEF53`) at byte offset 56 within the superblock.
-const EXT2_MAGIC: u16 = 0xEF53;
-/// Superblock starts at byte 1024 → sector index 2 on a 512-byte device.
-const EXT2_SUPERBLOCK_SECTOR: usize = 2;
-
-/// Cheap pre-check before mounting: reject devices whose sector 2 does not look
-/// like a plausible ext2 superblock for this partition size.  Without this,
-/// a false-positive magic on vfat/gpt data can make ext2-rs read a huge bogus
-/// block-group table and stall boot for a long time.
-pub(crate) fn probe_ext2_superblock(block: &Arc<dyn BlockScheme>) -> bool {
-    let mut sb = SectorBuf([0u8; 512]);
-    if block.read_block(EXT2_SUPERBLOCK_SECTOR, &mut sb.0).is_err() {
-        return false;
-    }
-    let magic = u16::from_le_bytes([sb.0[56], sb.0[57]]);
-    if magic != EXT2_MAGIC {
-        return false;
-    }
-    let blocks_count = u32::from_le_bytes([sb.0[4], sb.0[5], sb.0[6], sb.0[7]]) as usize;
-    let inodes_count = u32::from_le_bytes([sb.0[0], sb.0[1], sb.0[2], sb.0[3]]) as usize;
-    if blocks_count < 11 || inodes_count < 11 {
-        return false;
-    }
-    let log_block_size = i32::from_le_bytes([sb.0[24], sb.0[25], sb.0[26], sb.0[27]]);
-    if log_block_size < 0 || log_block_size > 6 {
-        return false;
-    }
-    let block_size = 1024usize << log_block_size;
-    let device_sectors = block.block_count();
-    let fs_sectors = blocks_count.saturating_mul(block_size / 512);
-    if fs_sectors > device_sectors.saturating_mul(2) {
-        return false;
-    }
-    let blocks_per_group =
-        u32::from_le_bytes([sb.0[32], sb.0[33], sb.0[34], sb.0[35]]).max(1) as usize;
-    let bg_by_blocks = blocks_count / blocks_per_group + 1;
-    if bg_by_blocks > 8192 {
-        return false;
-    }
-    true
-}
-
 #[cfg(test)]
 mod block_byte_tests {
     //! Host tests for the byte<->sector translation in `BlockByteDevice` — the
@@ -982,62 +940,4 @@ mod block_byte_tests {
         assert!(!c.contains(0), "capacity floored at 1 -> one resident sector");
     }
 
-    // ---- probe_ext2_superblock tests ----
-
-    /// A 512-byte sector-2 image that looks like a plausible ext2 superblock.
-    fn good_superblock() -> [u8; 512] {
-        let mut sb = [0u8; 512];
-        sb[0..4].copy_from_slice(&100u32.to_le_bytes()); // inodes_count
-        sb[4..8].copy_from_slice(&200u32.to_le_bytes()); // blocks_count
-        sb[24..28].copy_from_slice(&0i32.to_le_bytes()); // log_block_size=0 -> 1 KiB
-        sb[32..36].copy_from_slice(&50u32.to_le_bytes()); // blocks_per_group
-        sb[56] = 0x53; // magic 0xEF53, little-endian
-        sb[57] = 0xEF;
-        sb
-    }
-
-    fn dev_with_superblock(nsec: usize, sb: &[u8; 512]) -> Arc<dyn BlockScheme> {
-        let dev = MockBlock::new(nsec);
-        dev.write_block(EXT2_SUPERBLOCK_SECTOR, sb).unwrap();
-        dev
-    }
-
-    #[test]
-    fn probe_accepts_valid_superblock() {
-        let dev = dev_with_superblock(4096, &good_superblock());
-        assert!(probe_ext2_superblock(&dev));
-    }
-
-    #[test]
-    fn probe_rejects_bad_magic() {
-        let mut sb = good_superblock();
-        sb[56] = 0;
-        sb[57] = 0;
-        let dev = dev_with_superblock(4096, &sb);
-        assert!(!probe_ext2_superblock(&dev));
-    }
-
-    #[test]
-    fn probe_rejects_tiny_counts() {
-        let mut sb = good_superblock();
-        sb[4..8].copy_from_slice(&5u32.to_le_bytes()); // blocks_count < 11
-        let dev = dev_with_superblock(4096, &sb);
-        assert!(!probe_ext2_superblock(&dev));
-    }
-
-    #[test]
-    fn probe_rejects_absurd_block_size() {
-        let mut sb = good_superblock();
-        sb[24..28].copy_from_slice(&7i32.to_le_bytes()); // log_block_size > 6
-        let dev = dev_with_superblock(4096, &sb);
-        assert!(!probe_ext2_superblock(&dev));
-    }
-
-    #[test]
-    fn probe_rejects_fs_bigger_than_device() {
-        let mut sb = good_superblock();
-        sb[4..8].copy_from_slice(&1_000_000u32.to_le_bytes()); // huge fs...
-        let dev = dev_with_superblock(64, &sb); // ...tiny device
-        assert!(!probe_ext2_superblock(&dev));
-    }
 }

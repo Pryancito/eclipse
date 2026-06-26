@@ -1091,7 +1091,6 @@ fn proc_filesystems_content() -> String {
      nodev\tdevtmpfs\n\
      nodev\tramfs\n\
      nodev\tdevpts\n\
-     \text2\n\
      \tbtrfs\n\
      \tvfat\n"
         .into()
