@@ -53,15 +53,12 @@ impl LinuxRootfs {
             if eclipse_useradd.is_file() {
                 let _ = fs::copy(&eclipse_useradd, bin.join("eclipse-useradd"));
             }
-<<<<<<< HEAD
-=======
             let eclipse_bench = self.eclipse_bench(&musl);
             if eclipse_bench.is_file() {
                 let _ = fs::copy(&eclipse_bench, bin.join("eclipse-bench"));
             }
             // resize2fs/e2fsck/mke2fs (para expandir ROOT y formatear HOME).
             self.install_e2fsprogs_bins(&musl, &bin);
->>>>>>> 49f14f0b (rootfs: ship eclipse-bench at /bin/eclipse-bench)
             self.install_thread_tests(&dir);
             // INIT (PID 1): OpenRC by default, with busybox init as a resilient
             // fallback. `install_busybox_init` runs first so `/sbin/init` always
@@ -379,8 +376,6 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             fs::copy(&eclipse_useradd, &dst).unwrap();
         }
 
-<<<<<<< HEAD
-=======
         // 拷贝 eclipse-bench (CPU/mem/disk/process benchmark)
         let eclipse_bench = self.eclipse_bench(&musl);
         if eclipse_bench.is_file() {
@@ -391,7 +386,6 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
 
         // 拷贝 resize2fs/e2fsck/mke2fs (e2fsprogs) para el instalador.
         self.install_e2fsprogs_bins(&musl, &bin);
->>>>>>> 49f14f0b (rootfs: ship eclipse-bench at /bin/eclipse-bench)
         self.install_thread_tests(&dir);
         // INIT (PID 1): OpenRC by default; busybox init kept as a resilient
         // fallback. busybox lays down `/sbin/init` -> busybox (+ inittab + rcS)

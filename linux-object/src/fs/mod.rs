@@ -171,7 +171,7 @@ fn resolve_mount_dir(
     name: &str,
     mode: u32,
 ) -> Arc<MNode> {
-    if root_fstype == "ext2" || root_fstype == "btrfs" {
+    if root_fstype == "btrfs" {
         boot_resolve_mount_dir(rootfs, root, name, mode)
     } else {
         root.find(true, name).unwrap_or_else(|_| {
@@ -652,7 +652,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     // Ensure /var/run exists. Skip while pivoting onto an installed block
     // root (btrfs/ext2): scanning /var during early boot has stalled some
     // VBox/VDI setups, and /run is already a dedicated tmpfs mount above.
-    if root_fstype != "ext2" && root_fstype != "btrfs" {
+    if root_fstype != "btrfs" {
         if let Ok(var) = root.find(true, "var") {
             if var.find(true, "run").is_err() {
                 var.create("run", FileType::Dir, 0o755).ok();
@@ -865,9 +865,9 @@ fn root_fs_from_fstab(
         if parts.len() < 3 || parts[1] != "/" {
             continue;
         }
-        // Only block-device roots (btrfs/ext-family) can be mounted here.
+        // Only btrfs block-device roots can be mounted here.
         let fstype = mount_ops::parse_fstype(parts[2]).ok()?;
-        if fstype != "btrfs" && fstype != "ext2" {
+        if fstype != "btrfs" {
             return None;
         }
         let inode = lookup_candidate(candidates, parts[0])?;
