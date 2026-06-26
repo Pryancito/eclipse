@@ -57,8 +57,6 @@ impl LinuxRootfs {
             if eclipse_bench.is_file() {
                 let _ = fs::copy(&eclipse_bench, bin.join("eclipse-bench"));
             }
-            // resize2fs/e2fsck/mke2fs (para expandir ROOT y formatear HOME).
-            self.install_e2fsprogs_bins(&musl, &bin);
             self.install_thread_tests(&dir);
             // INIT (PID 1): OpenRC by default, with busybox init as a resilient
             // fallback. `install_busybox_init` runs first so `/sbin/init` always
@@ -384,8 +382,6 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             fs::copy(&eclipse_bench, &dst).unwrap();
         }
 
-        // 拷贝 resize2fs/e2fsck/mke2fs (e2fsprogs) para el instalador.
-        self.install_e2fsprogs_bins(&musl, &bin);
         self.install_thread_tests(&dir);
         // INIT (PID 1): OpenRC by default; busybox init kept as a resilient
         // fallback. busybox lays down `/sbin/init` -> busybox (+ inittab + rcS)

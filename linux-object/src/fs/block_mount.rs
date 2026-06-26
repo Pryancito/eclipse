@@ -307,10 +307,6 @@ impl Device for FileByteDevice {
     }
 }
 
-/// Cache unit. Every backing block device here is addressed in 512-byte
-/// sectors (see `BlockByteDevice`), so that is the natural cache line.
-const SECTOR: usize = 512;
-
 /// Per-device buffer-cache budget. Entries are allocated lazily as sectors are
 /// touched, so a freshly-mounted device uses nothing and grows up to this cap.
 /// 8 MiB is generous enough to keep the hot working set (inode table, block
