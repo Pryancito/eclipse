@@ -445,10 +445,10 @@ impl Syscall<'_> {
         Ok(0)
     }
 
-    /// DRM PRIME (dma-buf) ioctls. Handled at the syscall layer because they
-    /// install / look up a process fd (the dma-buf), which the inode-level DRM
-    /// `io_control` cannot do. Returns `Ok(Some(0))` if handled, `Ok(None)` if
-    /// `fd` is not a DRM device (fall through to the normal ioctl path).
+    /// DRM ioctls that must install / look up a process fd (PRIME dma-buf
+    /// export-import, and CREATE_LEASE) — the inode-level DRM `io_control`
+    /// cannot touch the fd table. Returns `Ok(Some(0))` if handled, `Ok(None)`
+    /// if `fd` is not a DRM device (fall through to the normal ioctl path).
     fn sys_drm_prime(
         &self,
         file_like: &alloc::sync::Arc<dyn linux_object::fs::FileLike>,
@@ -460,6 +460,7 @@ impl Syscall<'_> {
 
         const PRIME_HANDLE_TO_FD: usize = 0xC00C_642D;
         const PRIME_FD_TO_HANDLE: usize = 0xC00C_642E;
+        const MODE_CREATE_LEASE: usize = 0xC018_64C6;
 
         // struct drm_prime_handle { __u32 handle; __u32 flags; __s32 fd; }
         #[repr(C)]
@@ -470,7 +471,20 @@ impl Syscall<'_> {
             fd: i32,
         }
 
-        // Only intercept PRIME ioctls on a DRM device fd.
+        // struct drm_mode_create_lease {
+        //   __u64 object_ids; __u32 object_count; __u32 flags;
+        //   __u32 lessee_id;  __s32 fd; }
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        struct DrmModeCreateLease {
+            object_ids: u64,
+            object_count: u32,
+            flags: u32,
+            lessee_id: u32,
+            fd: i32,
+        }
+
+        // Only intercept on a DRM device fd.
         let is_drm = file_like
             .downcast_ref::<File>()
             .map(|f| f.inode().as_any_ref().downcast_ref::<DrmDev>().is_some())
@@ -479,11 +493,11 @@ impl Syscall<'_> {
             return Ok(None);
         }
 
-        let mut ptr = UserInOutPtr::<DrmPrimeHandle>::from(arg1);
-        let mut h = ptr.read()?;
         let proc = self.linux_process();
         match request {
             PRIME_HANDLE_TO_FD => {
+                let mut ptr = UserInOutPtr::<DrmPrimeHandle>::from(arg1);
+                let mut h = ptr.read()?;
                 let (phys, size, vmo) = drm::export_handle(h.handle).ok_or(LxError::EINVAL)?;
                 let dmabuf = DmaBuf::new(phys, size, vmo);
                 let new_fd = proc.add_file(dmabuf)?;
@@ -493,12 +507,29 @@ impl Syscall<'_> {
                 Ok(Some(0))
             }
             PRIME_FD_TO_HANDLE => {
+                let mut ptr = UserInOutPtr::<DrmPrimeHandle>::from(arg1);
+                let mut h = ptr.read()?;
                 let target = proc.get_file_like(FileDesc::from(h.fd as usize))?;
                 let dmabuf = target.downcast_ref::<DmaBuf>().ok_or(LxError::EINVAL)?;
                 let handle_id = drm::import_dmabuf(dmabuf.phys_addr, dmabuf.size, dmabuf.vmo());
                 h.handle = handle_id;
                 ptr.write(h)?;
                 info!("drm PRIME import: fd={} -> handle={}", h.fd, h.handle);
+                Ok(Some(0))
+            }
+            MODE_CREATE_LEASE => {
+                // An empty lease is just a fresh fd to the same DRM device: our
+                // GEM table is global, so per-fd handle ref-counting (the reason
+                // wlroots' dumb allocator leases) is unnecessary. Hand back a dup
+                // of this fd as the lease.
+                let mut ptr = UserInOutPtr::<DrmModeCreateLease>::from(arg1);
+                let mut l = ptr.read()?;
+                let lease = file_like.dup();
+                let new_fd = proc.add_file(lease)?;
+                l.lessee_id = 1;
+                l.fd = i32::from(new_fd);
+                ptr.write(l)?;
+                info!("drm CREATE_LEASE -> fd={} lessee={}", l.fd, l.lessee_id);
                 Ok(Some(0))
             }
             _ => Ok(None),
@@ -520,9 +551,10 @@ impl Syscall<'_> {
         );
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
-        // DRM PRIME (dma-buf) export/import — needs process fd access, so it is
-        // handled here rather than in the DRM inode's io_control.
-        if request == 0xC00C_642D || request == 0xC00C_642E {
+        // DRM PRIME (dma-buf) export/import and CREATE_LEASE — need process fd
+        // access, so they are handled here rather than in the DRM inode's
+        // io_control.
+        if request == 0xC00C_642D || request == 0xC00C_642E || request == 0xC018_64C6 {
             if let Some(ret) = self.sys_drm_prime(&file_like, request, arg1)? {
                 return Ok(ret);
             }
