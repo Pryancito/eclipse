@@ -482,6 +482,11 @@ impl Syscall<'_> {
             .map(|f| f.inode().as_any_ref().downcast_ref::<DrmDev>().is_some())
             .unwrap_or(false);
         if !is_drm {
+            error!(
+                "[drm] PRIME/LEASE ioctl {:#x} on non-DRM fd (is_file={}) — passing through",
+                request,
+                file_like.downcast_ref::<File>().is_some()
+            );
             return Ok(None);
         }
 
@@ -521,7 +526,7 @@ impl Syscall<'_> {
                 l.lessee_id = 1;
                 l.fd = i32::from(new_fd);
                 ptr.write(l)?;
-                info!("drm CREATE_LEASE -> fd={} lessee={}", l.fd, l.lessee_id);
+                error!("[drm] CREATE_LEASE -> fd={} lessee={}", l.fd, l.lessee_id);
                 Ok(Some(0))
             }
             _ => Ok(None),
