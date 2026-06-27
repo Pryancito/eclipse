@@ -680,8 +680,10 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     // records udevd would: the `I:` initialized line plus the `seat` tag, one
     // per `/dev/input/eventN` (char major 13, minor 64+N).
     {
+        use kernel_hal::drivers::prelude::CapabilityType;
         use rcore_fs::vfs::FileType;
-        let n_input = drivers::all_input().as_vec().len();
+        let devs = drivers::all_input().as_vec();
+        let n_input = devs.len();
         if n_input > 0 {
             let run_root = run_ramfs.root_inode();
             let data_dir = run_root
@@ -691,16 +693,41 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                 // Matches EVDEV_MAJOR / EVDEV_EVENT_MINOR_BASE in `sysfs.rs`.
                 const EVDEV_MAJOR: usize = 13;
                 const EVDEV_EVENT_MINOR_BASE: usize = 64;
-                let body = b"I:1\nE:ID_INPUT=1\nG:seat\nQ:seat\nV:1\n";
-                for id in 0..n_input {
+                for (id, dev) in devs.iter().enumerate() {
+                    // libinput's `evdev_configure_device` ignores any device
+                    // tagged only `ID_INPUT` with no subtype ("not tagged as
+                    // supported input device") — it assigns capabilities from
+                    // the udev `ID_INPUT_KEYBOARD` / `ID_INPUT_MOUSE` properties,
+                    // not from the evdev bits alone. With udevd absent we must
+                    // synthesise those tags, mirroring udev's `input_id` builtin:
+                    // a keyboard has key events (KEY_ESC), a mouse has REL_X +
+                    // REL_Y + BTN_LEFT. Without them the device is added but
+                    // dead — no pointer, no keyboard.
+                    let keys = dev.capability(CapabilityType::Key);
+                    let rel = dev.capability(CapabilityType::RelAxis);
+                    let is_keyboard = keys.contains(1); // KEY_ESC
+                    let is_mouse =
+                        rel.contains(0) && rel.contains(1) && keys.contains(0x110); // REL_X,REL_Y,BTN_LEFT
+                    let mut body = String::from("I:1\nE:ID_INPUT=1\n");
+                    if is_keyboard {
+                        body.push_str("E:ID_INPUT_KEYBOARD=1\n");
+                    }
+                    if is_mouse {
+                        body.push_str("E:ID_INPUT_MOUSE=1\n");
+                    }
+                    body.push_str("G:seat\nQ:seat\nV:1\n");
                     let name =
                         alloc::format!("c{}:{}", EVDEV_MAJOR, EVDEV_EVENT_MINOR_BASE + id);
                     match data_dir.create(&name, FileType::File, 0o644) {
                         Ok(f) => {
-                            let _ = f.write_at(0, body);
+                            let _ = f.write_at(0, body.as_bytes());
                         }
                         Err(e) => warn!("[boot] udev db {}: {:?}", name, e),
                     }
+                    warn!(
+                        "[boot] udev db event{}: keyboard={} mouse={}",
+                        id, is_keyboard, is_mouse
+                    );
                 }
                 warn!("[boot] wrote {} udev db record(s) for input devices", n_input);
             }
