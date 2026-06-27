@@ -450,18 +450,6 @@ impl Socket for UnixSocketState {
             return Vec::new();
         }
         let mut inner = self.inner.lock();
-        // TEMP diag: only fires when fds are actually pending (device opens),
-        // and proves the stream-synchronized SCM_RIGHTS path is in the binary.
-        if let Some((off, batch)) = inner.pending_fds.front() {
-            log::error!(
-                "[input] scm recv_fds: pending={} front_off={} batch={} total_read={} max={}",
-                inner.pending_fds.len(),
-                off,
-                batch.len(),
-                inner.total_read,
-                max
-            );
-        }
         let mut out: Vec<Arc<dyn FileLike>> = Vec::new();
         // Deliver only fd batches whose accompanying bytes have already been
         // read, and only whole batches that fit in the caller's fd budget.
