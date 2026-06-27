@@ -1247,13 +1247,26 @@ impl INode for SysDevCharDirINode {
                 return Ok(Arc::new(SysDrmNodeINode::render(idx)));
             }
         }
-        // evdev: 13:<64+N> -> /sys/class/input/eventN
+        // evdev: 13:<64+N> -> a *symlink* to /sys/class/input/eventN.
+        //
+        // libinput's evdev_device_have_same_syspath() builds a udev device from
+        // the opened fd's device number (reading this `/sys/dev/char/13:N`
+        // path) and compares its canonical syspath to the syspath of the
+        // enumerated device (`/sys/class/input/eventN`). If they differ it
+        // closes the fd with no ioctl and rejects the device. Returning the
+        // SysInputEventINode directory here gave the canonical path
+        // `/sys/dev/char/13:N`, which never equals `/sys/class/input/eventN`,
+        // so every input device was rejected. A symlink makes realpath() of
+        // both resolve to the same `/sys/class/input/eventN`.
         if let Some(rest) = name.strip_prefix("13:") {
             if let Ok(minor) = rest.parse::<usize>() {
                 if minor >= EVDEV_EVENT_MINOR_BASE {
                     let id = minor - EVDEV_EVENT_MINOR_BASE;
                     if id < input_event_count() {
-                        return Ok(Arc::new(SysInputEventINode { id }));
+                        return Ok(Arc::new(Pseudo::new(
+                            &format!("../../class/input/event{}", id),
+                            FileType::SymLink,
+                        )));
                     }
                 }
             }
