@@ -373,9 +373,15 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     devfs_root
         .add("urandom", Arc::new(RandomINode::new(true)))
         .expect("failed to mknod /dev/urandom");
-    devfs_root
-        .add("shm", Arc::new(RandomINode::new(true)))
-        .expect("failed to mknod /dev/shm");
+    // `/dev/shm` is a POSIX shared-memory tmpfs *directory*, not a device node:
+    // `shm_open(name, O_CREAT, ...)` (used by wlroots to allocate the keyboard
+    // keymap fd, and by any program using POSIX shm) creates files under
+    // `/dev/shm/`. Backing it with a single RandomINode made every such create
+    // fail with ENOTDIR ("cannot set keymap"). Add it as a directory here and
+    // mount a RamFS on it once devfs is mounted (below).
+    if let Err(e) = devfs_root.add_dir("shm") {
+        warn!("failed to mkdir /dev/shm: {:?}", e);
+    }
     devfs_root
         .add("tty", stdio::STDIN.clone())
         .expect("failed to mknod /dev/tty");
@@ -615,6 +621,24 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         warn!("[boot] create_root_fs: mount /dev failed: {:?}", e);
     } else {
         register_mount("devfs", "/dev", "devtmpfs", "rw,nosuid", boot_mount_state());
+        // Mount a writable RamFS on the /dev/shm directory so POSIX shm_open()
+        // can create files there (e.g. wlroots' xkb keymap fd).
+        match dev.find(true, "shm") {
+            Ok(shm) => {
+                if let Err(e) = shm.mount(RamFS::new()) {
+                    warn!("[boot] create_root_fs: mount /dev/shm failed: {:?}", e);
+                } else {
+                    register_mount(
+                        "tmpfs",
+                        "/dev/shm",
+                        "tmpfs",
+                        "rw,nosuid,nodev",
+                        boot_mount_state(),
+                    );
+                }
+            }
+            Err(e) => warn!("[boot] create_root_fs: /dev/shm lookup failed: {:?}", e),
+        }
     }
 
     // mount RamFS at /tmp
