@@ -593,6 +593,13 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # back to pixman). See docs/README-drm.md.\n\
               export WLR_RENDERER=pixman\n\
               export WLR_RENDERER_ALLOW_SOFTWARE=1\n\
+              # wlroots' libinput backend aborts the whole compositor if it\n\
+              # enumerates zero input devices ('libinput initialization failed,\n\
+              # no input devices'). Without a running udevd to tag devices,\n\
+              # libinput may find none even when /sys/class/input is populated.\n\
+              # This flag lets the compositor start regardless; devices that ARE\n\
+              # discovered still work, so it is safe to leave on permanently.\n\
+              export WLR_LIBINPUT_NO_DEVICES=1\n\
               # Runtime dir for the Wayland socket (created on demand, mode 0700).\n\
               export XDG_RUNTIME_DIR=/run/user/0\n\
               [ -d \"$XDG_RUNTIME_DIR\" ] || { mkdir -p \"$XDG_RUNTIME_DIR\" && chmod 0700 \"$XDG_RUNTIME_DIR\"; }\n",
