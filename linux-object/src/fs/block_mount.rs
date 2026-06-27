@@ -30,7 +30,7 @@ const CACHE_HOT_CAP: usize = 8192;
 /// -> real disk (DMA + IRQ)`. Without caching, the same sectors — inode tables
 /// shared by many inodes, directory/B-tree blocks walked on every lookup, and
 /// the busybox binary re-read on every `exec` — are fetched from the device
-/// again and again, which is what makes OpenRC's exec/stat-heavy startup crawl.
+/// again and again, which is what makes an exec/stat-heavy boot crawl.
 ///
 /// Approximate LRU at O(1): inserts go into `hot`; when `hot` fills, the old
 /// `warm` set is dropped and `hot` becomes the new `warm`. A hit in `warm` is
@@ -317,7 +317,7 @@ const CACHE_CAPACITY_SECTORS: usize = 8 * 1024 * 1024 / SECTOR;
 /// Forward read-ahead window. On a cache miss for a request smaller than this,
 /// the backing device is read this far past the request in one command and the
 /// extra sectors are cached. Sequential access — the dominant pattern during
-/// OpenRC boot (scripts, configs) and demand-paging of executables/libraries —
+/// boot (init/service files) and demand-paging of executables/libraries —
 /// then hits the cache instead of issuing one synchronous device command per
 /// piece, which is the dominant cost on high-latency media (USB/SATA, polled
 /// AHCI). Sized to roughly one AHCI command so the prefetch is ~free latency-wise.

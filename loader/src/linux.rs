@@ -79,7 +79,7 @@ pub fn run_init_if_present(
     }
     if !program_exists(&args[0], &shared_root, &rootfs) {
         warn!(
-            "INIT {:?} not present on root or initramfs; booting WITHOUT a PID 1 init (only the per-terminal shells run). Expected /sbin/init (default INIT=/sbin/init -> openrc-init, busybox init fallback); rebuild the rootfs or set INIT= in rboot.conf.",
+            "INIT {:?} not present on root or initramfs; booting WITHOUT a PID 1 init (only the per-terminal shells run). Expected /sbin/init (default INIT=/sbin/init -> eclipse-init, busybox init fallback); rebuild the rootfs or set INIT= in rboot.conf.",
             args[0]
         );
         return None;

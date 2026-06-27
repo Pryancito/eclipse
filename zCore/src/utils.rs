@@ -67,9 +67,9 @@ pub fn boot_options() -> BootOptions {
                 cmdline: cmdline.clone(),
                 log_level: options.get("LOG").unwrap_or(&"").to_string(),
                 // `INIT` selects the PID 1 process. Default `/sbin/init`, which
-                // the rootfs points at OpenRC's `openrc-init` (the default init
-                // system); if the OpenRC cross-build was unavailable the same
-                // `/sbin/init` symlink falls back to busybox's `init` applet.
+                // the rootfs points at Eclipse's native `eclipse-init` (the
+                // default init system); if its cross-build was unavailable the
+                // same `/sbin/init` symlink falls back to busybox's `init` applet.
                 // Run only if it exists. `SHELL` selects the per-terminal shells
                 // at PIDs 101.. (default busybox); `ROOTPROC` is accepted as a
                 // deprecated alias for `SHELL`.
