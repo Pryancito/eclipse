@@ -128,6 +128,7 @@ pub fn push_packet(packet: &[u8]) {
     crate::net::arp_cache::learn_from_frame(packet);
     crate::net::ndp_cache::learn_from_frame(packet);
     crate::net::icmp_rx::deliver_from_frame(packet);
+    crate::net::ra::process_from_frame(packet);
 
     let mut sockets = PACKET_SOCKETS.lock();
     if !sockets.iter().any(|w| w.strong_count() > 0) {

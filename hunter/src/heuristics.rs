@@ -10,6 +10,11 @@
 //! 2. **Rate anomalies** — per-process sliding-window counters that flag
 //!    syscall **floods** and **fork bombs**, plus a **system-wide** fork-rate
 //!    signal so a *distributed* fork bomb (each child forks once) still trips.
+//! 3. **Adaptive baseline** — an EWMA of each process's syscalls-per-window,
+//!    flagging a window that spikes far above *that process's own history*.
+//!    This catches a process-relative flood (e.g. a quiet 200/s task jumping
+//!    to 8k/s) that stays under the absolute flood threshold, while the
+//!    absolute threshold still backstops a process whose baseline is high.
 //!
 //! Hardening: per-arch syscall numbers (P14, finding SYS-3/IDS-3); a
 //! count-based window backstop so a frozen clock cannot silence detection
@@ -39,6 +44,19 @@ static PRIVILEGED_DENY: AtomicBool = AtomicBool::new(false);
 const WINDOW_NS: u64 = 1_000_000_000; // 1 second
 /// Per-process syscalls/window above which we suspect a denial-of-service flood.
 const FLOOD_THRESHOLD: u32 = 50_000;
+/// Adaptive flood: a window whose syscall count exceeds this multiple of the
+/// process's own EWMA baseline is flagged, catching process-relative spikes
+/// that stay below the absolute `FLOOD_THRESHOLD`.
+const ADAPTIVE_MULT: u32 = 20;
+/// Floor below which the adaptive detector stays silent, so low-volume or
+/// merely bursty-but-benign processes never trip it.
+const ADAPTIVE_MIN_COUNT: u32 = 2_000;
+/// Clean (un-flagged) windows of history required before the adaptive baseline
+/// is trusted enough to fire, so a process's first windows just train it.
+const ADAPTIVE_MIN_WINDOWS: u16 = 4;
+/// EWMA smoothing shift for the adaptive baseline: `ewma += (sample - ewma) >> N`
+/// (alpha = 1/8). Slow enough that a ramp-up cannot quietly poison the baseline.
+const EWMA_SHIFT: u32 = 3;
 /// Per-process clone/fork calls/window above which we suspect a fork bomb.
 const FORKBOMB_THRESHOLD: u32 = 200;
 /// System-wide clone/fork calls/window flagged as a distributed fork bomb.
@@ -211,6 +229,12 @@ struct ProcStat {
     watch_count: u32,
     flood_alerted: bool,
     fork_alerted: bool,
+    /// Adaptive (process-relative) flood already reported this window.
+    adaptive_alerted: bool,
+    /// EWMA of syscalls-per-window — the process's learned baseline.
+    ewma_syscalls: u32,
+    /// Count of clean windows folded into `ewma_syscalls` (warm-up gate).
+    windows_observed: u16,
 }
 
 impl ProcStat {
@@ -222,6 +246,9 @@ impl ProcStat {
             watch_count: 0,
             flood_alerted: false,
             fork_alerted: false,
+            adaptive_alerted: false,
+            ewma_syscalls: 0,
+            windows_observed: 0,
         }
     }
     /// Resets the window if the clock advanced past it OR the event backstop
@@ -229,14 +256,37 @@ impl ProcStat {
     fn roll(&mut self, now: u64) {
         let elapsed = now.saturating_sub(self.window_start) >= WINDOW_NS;
         let backstop = self.syscall_count >= WINDOW_EVENTS_BACKSTOP;
-        if elapsed || backstop {
-            self.window_start = now;
-            self.syscall_count = 0;
-            self.fork_count = 0;
-            self.watch_count = 0;
-            self.flood_alerted = false;
-            self.fork_alerted = false;
+        if !(elapsed || backstop) {
+            return;
         }
+        // Fold a *completed time* window into the adaptive baseline — but never
+        // a backstop window (an in-progress flood, not a full second) and never
+        // a window we already flagged, so an attacker cannot train the baseline
+        // upward to silence future detection.
+        if elapsed && !self.flood_alerted && !self.adaptive_alerted {
+            let sample = self.syscall_count;
+            let ewma = self.ewma_syscalls;
+            self.ewma_syscalls = if sample >= ewma {
+                ewma + ((sample - ewma) >> EWMA_SHIFT)
+            } else {
+                ewma - ((ewma - sample) >> EWMA_SHIFT)
+            };
+            self.windows_observed = self.windows_observed.saturating_add(1);
+        }
+        self.window_start = now;
+        self.syscall_count = 0;
+        self.fork_count = 0;
+        self.watch_count = 0;
+        self.flood_alerted = false;
+        self.fork_alerted = false;
+        self.adaptive_alerted = false;
+    }
+    /// Whether the current window is a flood *relative to this process's own*
+    /// learned baseline. Pure (no clock, no logging) so it is unit-testable.
+    fn adaptive_flood(&self) -> bool {
+        self.windows_observed >= ADAPTIVE_MIN_WINDOWS
+            && self.syscall_count > ADAPTIVE_MIN_COUNT
+            && (self.syscall_count as u64) > (ADAPTIVE_MULT as u64) * (self.ewma_syscalls as u64)
     }
 }
 
@@ -309,6 +359,11 @@ pub fn on_syscall(pid: u64, num: u32) -> bool {
 
     let mut alert_flood = false;
     let mut alert_fork = false;
+    let mut alert_adaptive = false;
+    // Per-process window count and baseline captured under the lock for the
+    // adaptive anomaly message.
+    let mut spike_count = 0u32;
+    let mut baseline = 0u32;
     {
         let mut stats = PROC_STATS.lock();
         evict_if_needed(&mut stats, pid);
@@ -321,6 +376,14 @@ pub fn on_syscall(pid: u64, num: u32) -> bool {
         if !st.flood_alerted && st.syscall_count > FLOOD_THRESHOLD {
             st.flood_alerted = true;
             alert_flood = true;
+        }
+        // Adaptive flood: suppressed once the absolute flood already fired this
+        // window, since that path reports the same burst more precisely.
+        if !st.flood_alerted && !st.adaptive_alerted && st.adaptive_flood() {
+            st.adaptive_alerted = true;
+            alert_adaptive = true;
+            spike_count = st.syscall_count;
+            baseline = st.ewma_syscalls;
         }
         if !st.fork_alerted && st.fork_count > FORKBOMB_THRESHOLD {
             st.fork_alerted = true;
@@ -351,6 +414,16 @@ pub fn on_syscall(pid: u64, num: u32) -> bool {
             "syscall flood: >{} syscalls within {}ms",
             FLOOD_THRESHOLD,
             WINDOW_NS / 1_000_000
+        ));
+        deny |= enforce;
+    }
+    if alert_adaptive {
+        log_anomaly(pid, enforce, format!(
+            "adaptive syscall spike: {} within {}ms is >{}x the per-process baseline (~{}/window)",
+            spike_count,
+            WINDOW_NS / 1_000_000,
+            ADAPTIVE_MULT,
+            baseline
         ));
         deny |= enforce;
     }
@@ -403,5 +476,69 @@ fn evict_if_needed(map: &mut BTreeMap<u64, ProcStat>, pid: u64) {
     }
     if let Some((&victim, _)) = map.iter().min_by_key(|(_, st)| st.window_start) {
         map.remove(&victim);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Drives `ProcStat` directly with synthetic timestamps so the adaptive
+    // baseline is exercised without the global (sealed) clock.
+    #[test]
+    fn adaptive_baseline_learns_then_flags_relative_spike() {
+        let mut st = ProcStat::new(0);
+        let mut t = 0u64;
+
+        // Several calm windows of ~200 syscalls each train the baseline.
+        for _ in 0..6 {
+            st.syscall_count = 200;
+            t += WINDOW_NS;
+            st.roll(t);
+        }
+        assert!(st.windows_observed >= ADAPTIVE_MIN_WINDOWS);
+        assert!(st.ewma_syscalls > 0 && st.ewma_syscalls < ADAPTIVE_MIN_COUNT);
+
+        // A calm window — and a fork-heavy but low-volume one — do not trip.
+        st.syscall_count = 200;
+        assert!(!st.adaptive_flood());
+        st.syscall_count = ADAPTIVE_MIN_COUNT; // exactly at the floor: still quiet
+        assert!(!st.adaptive_flood());
+
+        // A spike far above this process's own baseline (and above the floor)
+        // trips, even though it is well below the absolute FLOOD_THRESHOLD.
+        st.syscall_count = 8_000;
+        assert!(st.syscall_count < FLOOD_THRESHOLD);
+        assert!(st.adaptive_flood());
+    }
+
+    #[test]
+    fn flagged_window_does_not_poison_baseline() {
+        let mut st = ProcStat::new(0);
+        let mut t = 0u64;
+        for _ in 0..4 {
+            st.syscall_count = 100;
+            t += WINDOW_NS;
+            st.roll(t);
+        }
+        let before = st.ewma_syscalls;
+
+        // A window we already flagged must not be folded into the baseline,
+        // otherwise an attacker could train it upward to silence detection.
+        st.syscall_count = 1_000_000;
+        st.adaptive_alerted = true;
+        t += WINDOW_NS;
+        st.roll(t);
+        assert_eq!(st.ewma_syscalls, before);
+    }
+
+    #[test]
+    fn cold_process_never_trips_adaptively() {
+        // Before the warm-up gate, even a large count does not trip (no
+        // trusted baseline yet); the absolute threshold still backstops it.
+        let mut st = ProcStat::new(0);
+        st.syscall_count = 40_000;
+        assert!(st.windows_observed < ADAPTIVE_MIN_WINDOWS);
+        assert!(!st.adaptive_flood());
     }
 }

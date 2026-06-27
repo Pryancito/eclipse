@@ -147,6 +147,8 @@ Soporte completo para arquitectura x86_64 en emuladores (QEMU) y en hardware rea
 - **Instalador del Sistema (`install-eclipse`)**: Herramienta de instalación optimizada para desplegar el sistema en discos físicos y virtuales, con detección precisa de tamaño de disco combinando consultas a `sysfs` y la llamada `BLKGETSIZE64`. Realiza escrituras y modificaciones directamente sobre los dispositivos de partición (p. ej. `/dev/sda1` y `/dev/sda2`) para garantizar la consistencia de la caché de bloques y la correcta persistencia de ficheros clave de configuración (`/etc/fstab` y `rboot.conf`).
 - **Sistemas de Archivos**: El sistema de archivos raíz de Eclipse OS es **btrfs**, con un driver propio de lectura/escritura en el kernel (crate `vendor/btrfs-rs`) y generación de imágenes integrada en la compilación (sin depender de `btrfs-progs`); el sistema de archivos se expande automáticamente al tamaño de la partición en el primer montaje. Se mantiene soporte de **ext2/ext3/ext4** (instalaciones antiguas y discos externos) y **vfat/FAT32** (partición EFI). Las imágenes btrfs generadas son montables por Linux y pasan `btrfs check`.
 - **Estabilidad de Memoria ante Presión (OOM)**: Mitigación de pánicos del kernel por agotamiento de heap (BuddyAllocator) mediante límites estrictos de asignación temporal (1 MB) y procesamiento fragmentado (chunked) en syscalls de E/S (`sys_read`, `sys_pread`, etc.), y una estrategia de carga ELF (`sys_execve`) robusta utilizando mapeos dinámicos bajo demanda de `VmObject`s paginados en la región virtual del kernel (`KERNEL_ASPACE`) sin asignar memoria física contigua.
+- **Pila Gráfica (DRM/KMS)**: Implementación de la UAPI DRM/KMS de Linux que permite ejecutar software gráfico estándar — `Xorg` (`startx`) mediante los nodos de consola virtual y los `ioctl`s de VT/KD, y compositores Wayland (`wlroots`/`labwc`, con `WLR_RENDERER=pixman` por defecto cuando no hay GPU). Incluye soporte de PRIME (exportación/importación de dma-buf). Ver [docs/README-drm.md](docs/README-drm.md) y [docs/README-xorg.md](docs/README-xorg.md).
+- **Seguridad (`hunter`)**: Subsistema de seguridad in-kernel que combina una capa de aplicación de políticas estilo LSM con un sistema de detección de intrusiones (IDS) por comportamiento, registrando cada decisión en un log forense legible desde `/proc/hunter`. Ver [docs/hunter-security.md](docs/hunter-security.md).
 - **Estado**: El sistema arranca con éxito en hardware real e inicializa los controladores de almacenamiento, monta el sistema de archivos de forma nativa e inicia la consola interactiva (`busybox`).
 
 ### Qemu/virt (RISC-V)
@@ -184,8 +186,26 @@ Para instalar las claves de confianza de Alpine:
 apk add -X https://dl-cdn.alpinelinux.org/alpine/v3.23/main -u alpine-keys
 ```
 
+## Documentación
+
+### Gráficos y entorno de escritorio
+- [DRM / KMS — conformidad con la UAPI de Linux](docs/README-drm.md)
+- [Ejecutar un servidor X (`startx`)](docs/README-xorg.md)
+
+### Seguridad
+- [hunter — subsistema de seguridad in-kernel](docs/hunter-security.md)
+- [hunter — informe de endurecimiento (red-team)](docs/hunter-hardening.md)
+
+### Plataformas RISC-V
+- [StarFive VisionFive](docs/README-visionfive.md)
+- [Allwinner D1/Nezha](docs/README-D1.md)
+- [Sophgo/CVITEK C910](docs/README-C910.md)
+- [StarFive JH7110 (FU740)](docs/README-fu740.md)
+- [Notas de portado a RISC-V 64](docs/porting-rv64.md)
+
 ## Otros
 
 - [An English README](docs/README_EN.md)
 - [Notas para desarrolladores](docs/for-developers.md)
+- [Documentación de arquitectura original (upstream zCore)](README-arch.md)
 - [Registro de cambios del sistema de construcción](xtask/CHANGELOG.md)

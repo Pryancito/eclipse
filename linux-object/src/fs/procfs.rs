@@ -1081,8 +1081,8 @@ fn proc_mounts_content() -> String {
 
 /// `/proc/filesystems` — the filesystem types the kernel can mount. Each line is
 /// an optional `nodev` (the fs needs no backing block device) followed by a TAB
-/// and the type name. Userland (openrc's sysinit, `mount`, `grep`) probes this
-/// before mounting; a missing file made openrc log
+/// and the type name. Userland (`mount`, `grep`, init scripts) probes this
+/// before mounting; a missing file makes tools log
 /// `grep: /proc/filesystems: No such file or directory`.
 fn proc_filesystems_content() -> String {
     "nodev\tsysfs\n\
@@ -1091,7 +1091,6 @@ fn proc_filesystems_content() -> String {
      nodev\tdevtmpfs\n\
      nodev\tramfs\n\
      nodev\tdevpts\n\
-     \text2\n\
      \tbtrfs\n\
      \tvfat\n"
         .into()

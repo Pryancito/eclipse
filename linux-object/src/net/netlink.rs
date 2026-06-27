@@ -234,6 +234,26 @@ impl Socket for NetlinkSocketState {
                 }
                 // Byte pattern of the pre-DHCP placeholder IPv4 address.
                 let placeholder_v4: [u8; 4] = [240, 0, 0, 0];
+                // RTM_GETADDR carries the requested address family in the first
+                // byte after the netlink header (rtgenmsg.rtgen_family /
+                // ifaddrmsg.ifa_family). `ip -4 addr flush` / `ip -6 addr flush`
+                // dump with AF_INET / AF_INET6 and rely on the kernel to filter,
+                // then turn every returned address into an RTM_DELADDR. If we
+                // ignore the filter and dump every family, `ip -4 addr flush`
+                // also wipes IPv6 addresses (and vice-versa) — e.g. running
+                // `udhcpc` after `udhcpc6` silently drops the DHCPv6 global.
+                let req_family: u8 = data
+                    .get(size_of::<NetlinkMessageHeader>())
+                    .copied()
+                    .unwrap_or(0);
+                let af_inet: u8 = {
+                    let f: u16 = AddressFamily::Internet.into();
+                    f as u8
+                };
+                let af_inet6: u8 = {
+                    let f: u16 = AddressFamily::Internet6.into();
+                    f as u8
+                };
                 for (i, iface) in ifaces.iter().enumerate() {
                     let ip_addrs = iface.get_ip_address();
                     for ip in &ip_addrs {
@@ -247,12 +267,15 @@ impl Socket for NetlinkSocketState {
 
                         // Derive address family from byte width.
                         let ifa_family: u8 = if ip_bytes.len() == 4 {
-                            let f: u16 = AddressFamily::Internet.into();
-                            f as u8
+                            af_inet
                         } else {
-                            let f: u16 = AddressFamily::Internet6.into();
-                            f as u8
+                            af_inet6
                         };
+
+                        // Honor the requested family filter (AF_UNSPEC = dump all).
+                        if req_family != 0 && req_family != ifa_family {
+                            continue;
+                        }
 
                         // Compute scope per RFC 2473 / rt_scope_t:
                         //   RT_SCOPE_HOST=254  (loopback), RT_SCOPE_LINK=253 (link-local), 0 (global)

@@ -165,7 +165,6 @@ pub fn frame_dealloc(target: PhysAddr) {
     // Marcar libre ANTES de devolverlo al allocator: si es un doble-free, lo
     // detectamos antes de reinsertarlo.
     track_mark_free(idx);
-    kernel_hal::dbg_frameowner::clear(idx);
     // DEBUG: envenenar el frame con 0x5A al liberarlo. Si un proceso lee este
     // patrón en su memoria (fault a una dirección ~0x5a5a5a5a...), está leyendo
     // un frame YA LIBERADO -> PTE rancia (free-sin-unmap / use-after-free).
@@ -220,6 +219,14 @@ cfg_if! {
         /// Kernel heap — separate from the physical frame pool.
         const KERNEL_HEAP_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
         const ORDER: usize = 32;
+
+        // Invariants: `init()` carves the heap into word-sized slots
+        // (`HEAP_BLOCK = KERNEL_HEAP_SIZE / size_of::<usize>()`), so the size
+        // must divide evenly by the machine word — otherwise the backing static
+        // would silently under-provision the allocator. It must also be
+        // page-aligned, since the region is handed to the allocator wholesale.
+        const _: () = assert!(KERNEL_HEAP_SIZE % core::mem::size_of::<usize>() == 0);
+        const _: () = assert!(KERNEL_HEAP_SIZE % 4096 == 0);
 
         #[global_allocator]
         static HEAP_ALLOCATOR: LockedHeap<ORDER> = LockedHeap::<ORDER>::new();

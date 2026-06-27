@@ -13,7 +13,6 @@ use crate::process::LinuxProcess;
 
 use super::block_mount::MountBackend;
 use super::btrfs_mount::open_btrfs;
-use super::ext2_mount::open_ext2;
 use super::fat_mount::open_fat;
 use super::flagged_fs::wrap_fs;
 use super::mount_state::{
@@ -66,11 +65,6 @@ pub(crate) fn parse_fstype(fstype: &str) -> LxResult<&'static str> {
     }
     if fstype.eq_ignore_ascii_case("btrfs") {
         Ok("btrfs")
-    } else if fstype.eq_ignore_ascii_case("ext2")
-        || fstype.eq_ignore_ascii_case("ext3")
-        || fstype.eq_ignore_ascii_case("ext4")
-    {
-        Ok("ext2")
     } else if fstype.eq_ignore_ascii_case("vfat")
         || fstype.eq_ignore_ascii_case("fat")
         || fstype.eq_ignore_ascii_case("fat32")
@@ -90,7 +84,6 @@ pub(crate) fn open_filesystem(
 ) -> LxResult<Arc<dyn FileSystem>> {
     match fstype {
         "btrfs" => open_btrfs(&backend, read_only).map_err(LxError::from),
-        "ext2" => open_ext2(&backend).map_err(LxError::from),
         "vfat" => open_fat(backend)
             .map(|fs| fs as Arc<dyn FileSystem>)
             .map_err(LxError::from),
@@ -177,7 +170,7 @@ pub fn mount_fs(
     // /sys, the writable dev/run/tmp trees). A real mount here is unnecessary
     // and would shadow the live procfs, so acknowledge the request as a
     // successful no-op — and record it in /proc/mounts — instead of failing
-    // with ENODEV. This is what lets OpenRC's sysinit `mount -t proc proc /proc`
+    // with ENODEV. This is what lets init's `mount -t proc proc /proc`
     // (and the other pseudo-fs mounts) succeed quietly rather than logging
     // "mounting proc on /proc failed: No such device".
     if is_virtual_fstype(fstype) {

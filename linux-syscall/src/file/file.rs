@@ -23,19 +23,27 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
 
-        let is_seekable =
+        let chunk_size = len.min(super::SYSCALL_IO_MAX);
+        // `is_seekable` only changes the outcome for a multi-chunk request: it
+        // decides whether to keep refilling the buffer past one `chunk_size`
+        // slice. For a single-chunk read (`len <= chunk_size`, the overwhelming
+        // majority) the loop terminates the same way either way, so skip the
+        // `metadata()` probe — it would otherwise re-read the inode on every
+        // read syscall.
+        let is_seekable = if len > chunk_size {
             if let Ok(file) = file_like.clone().downcast_arc::<linux_object::fs::File>() {
-                if let Ok(meta) = file.metadata() {
-                    meta.type_ == linux_object::fs::vfs::FileType::File
-                        || meta.type_ == linux_object::fs::vfs::FileType::BlockDevice
-                } else {
-                    false
-                }
+                file.metadata()
+                    .map(|meta| {
+                        meta.type_ == linux_object::fs::vfs::FileType::File
+                            || meta.type_ == linux_object::fs::vfs::FileType::BlockDevice
+                    })
+                    .unwrap_or(false)
             } else {
                 false
-            };
-
-        let chunk_size = len.min(super::SYSCALL_IO_MAX);
+            }
+        } else {
+            false
+        };
         // Hybrid stack/heap buffer: line-oriented apps (busybox shell, getline,
         // fgetc) drive a stream of small reads — keep those alloc-free. The
         // ~64 KiB ceiling case still goes via the buddy allocator.
@@ -535,16 +543,6 @@ impl Syscall<'_> {
             "ioctl: fd={:?}, request={:#x}, args=[{:#x}, {:#x}, {:#x}]",
             fd, request, arg1, arg2, arg3
         );
-        // Trace into the dmesg ring (always recorded, never echoed to the
-        // screen). If an ioctl blocks, dmesg shows an `ENTER` with no matching
-        // `LEAVE` — that request is the one that hangs. Unhandled ioctls are
-        // recorded as errors, the same way an invalid syscall number is.
-        kernel_hal::klog_info!(
-            "ioctl ENTER fd={:?} request={:#x} arg={:#x}",
-            fd,
-            request,
-            arg1
-        );
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
         // DRM PRIME (dma-buf) export/import and CREATE_LEASE — need process fd
@@ -637,50 +635,32 @@ impl Syscall<'_> {
             Err(LxError::ENOSYS) => Err(LxError::ENOTTY),
             other => other,
         };
-        match &ret {
-            Ok(v) => kernel_hal::klog_info!(
-                "ioctl LEAVE fd={:?} request={:#x} -> Ok({})",
-                fd,
-                request,
-                v
-            ),
-            // Failed/unhandled ioctls go through `error!` so they are printed on
-            // the console (and serial), not only into the dmesg ring — the same
-            // way an invalid syscall number is surfaced. But throttle a program
-            // busy-looping on the same failing ioctl (e.g. polling an unhandled
-            // request) so it can't flood the console thousands of times a
-            // second: log the first occurrence, then only every 4096th repeat.
-            Err(e) => {
+        // Surface a genuinely unhandled/failed ioctl on the console (and serial),
+        // the same way an invalid syscall number is — but throttle a program
+        // busy-looping on the same failing request so it can't flood the console
+        // thousands of times a second: log the first occurrence, then only every
+        // 4096th repeat. `TIOCGWINSZ` returning `ENOTTY` is the normal "not a
+        // terminal" answer (musl's `isatty()` probes devices this way), so it is
+        // not logged at all.
+        if let Err(e) = &ret {
+            if request != TIOCGWINSZ {
                 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-                // `TIOCGWINSZ` returning `ENOTTY` is the normal "not a terminal"
-                // answer — e.g. musl's `isatty()` probes input/fb/char devices
-                // this way. Record it quietly in the dmesg ring instead of
-                // printing an error on the console for every isatty() call.
-                if request == TIOCGWINSZ {
-                    kernel_hal::klog_info!(
-                        "ioctl LEAVE fd={:?} request={:#x} -> ERR {:?} (not a tty)",
+                static LAST_REQ: AtomicU64 = AtomicU64::new(u64::MAX);
+                static REPEATS: AtomicUsize = AtomicUsize::new(0);
+                let n = if LAST_REQ.swap(request as u64, Ordering::Relaxed) == request as u64 {
+                    REPEATS.fetch_add(1, Ordering::Relaxed) + 1
+                } else {
+                    REPEATS.store(0, Ordering::Relaxed);
+                    0
+                };
+                if n == 0 || n % 4096 == 0 {
+                    error!(
+                        "ioctl fd={:?} request={:#x} -> ERR {:?} (unhandled/failed){}",
                         fd,
                         request,
-                        e
+                        e,
+                        if n > 0 { " [repeating, throttled]" } else { "" }
                     );
-                } else {
-                    static LAST_REQ: AtomicU64 = AtomicU64::new(u64::MAX);
-                    static REPEATS: AtomicUsize = AtomicUsize::new(0);
-                    let n = if LAST_REQ.swap(request as u64, Ordering::Relaxed) == request as u64 {
-                        REPEATS.fetch_add(1, Ordering::Relaxed) + 1
-                    } else {
-                        REPEATS.store(0, Ordering::Relaxed);
-                        0
-                    };
-                    if n == 0 || n % 4096 == 0 {
-                        error!(
-                            "ioctl LEAVE fd={:?} request={:#x} -> ERR {:?} (unhandled/failed){}",
-                            fd,
-                            request,
-                            e,
-                            if n > 0 { " [repeating, throttled]" } else { "" }
-                        );
-                    }
                 }
             }
         }

@@ -19,6 +19,9 @@ const PAGE_SIZE: usize = 4096;
 
 // Per-AP stacks: 256 KB each, allocated from the kernel heap on demand.
 const STACK_SIZE: usize = 256 * 1024;
+// AP stacks are allocated via `Layout::from_size_align(STACK_SIZE, PAGE_SIZE)`,
+// which requires the size to be a multiple of the (page) alignment.
+const _: () = assert!(STACK_SIZE % PAGE_SIZE == 0);
 // At most MAX_CORE_NUM logical CPUs total; the BSP is logical 0, so up to
 // MAX_CORE_NUM - 1 application processors.
 const MAX_APS: usize = crate::config::MAX_CORE_NUM - 1;

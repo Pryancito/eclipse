@@ -296,6 +296,9 @@ pub mod ndp_cache;
 /// ICMP echo replies from `push_packet` (ping RX).
 pub mod icmp_rx;
 
+/// IPv6 Router Advertisement handling (default route + SLAAC), fed from RX.
+pub mod ra;
+
 pub mod dns;
 
 pub mod wait;

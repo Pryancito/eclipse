@@ -6,8 +6,6 @@ pub mod devfs;
 mod dmabuf;
 mod epoll;
 mod eventfd;
-mod ext2_editor;
-mod ext2_mount;
 mod fat_mount;
 mod file;
 mod flagged_fs;
@@ -173,7 +171,7 @@ fn resolve_mount_dir(
     name: &str,
     mode: u32,
 ) -> Arc<MNode> {
-    if root_fstype == "ext2" || root_fstype == "btrfs" {
+    if root_fstype == "btrfs" {
         boot_resolve_mount_dir(rootfs, root, name, mode)
     } else {
         root.find(true, name).unwrap_or_else(|_| {
@@ -467,7 +465,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         // scanout) so wlroots/labwc can drive the framebuffer via legacy KMS.
         let have_drm = !drivers::all_drm().as_vec().is_empty();
         let have_display = drivers::all_display().first().is_some();
-        error!(
+        debug!(
             "[drm] graphics inventory: drm_drivers={} display={}",
             drivers::all_drm().as_vec().len(),
             have_display
@@ -477,20 +475,20 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                 if let Err(e) = dri_dev.add("card0", Arc::new(devfs::DrmDev::new(0))) {
                     warn!("failed to mknod /dev/dri/card0: {:?}", e);
                 } else {
-                    error!("[drm] /dev/dri/card0 created (sw_kms path available)");
+                    debug!("[drm] /dev/dri/card0 created (sw_kms path available)");
                 }
                 // Render node (major 226, minor 128) — Mesa/EGL opens this for
                 // GPU-less GL/Vulkan (llvmpipe/lavapipe via the swrast DRI).
                 if let Err(e) = dri_dev.add("renderD128", Arc::new(devfs::DrmDev::new(128))) {
                     warn!("failed to mknod /dev/dri/renderD128: {:?}", e);
                 } else {
-                    error!("[drm] /dev/dri/renderD128 created (render node)");
+                    debug!("[drm] /dev/dri/renderD128 created (render node)");
                 }
             } else {
                 warn!("failed to mkdir /dev/dri");
             }
         } else {
-            error!("[drm] no display and no DRM driver — /dev/dri/card0 NOT created");
+            warn!("[drm] no display and no DRM driver — /dev/dri/card0 NOT created");
         }
     }
 
@@ -654,7 +652,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     // Ensure /var/run exists. Skip while pivoting onto an installed block
     // root (btrfs/ext2): scanning /var during early boot has stalled some
     // VBox/VDI setups, and /run is already a dedicated tmpfs mount above.
-    if root_fstype != "ext2" && root_fstype != "btrfs" {
+    if root_fstype != "btrfs" {
         if let Ok(var) = root.find(true, "var") {
             if var.find(true, "run").is_err() {
                 var.create("run", FileType::Dir, 0o755).ok();
@@ -833,32 +831,18 @@ fn lookup_candidate(candidates: &[(String, Arc<dyn INode>)], dev: &str) -> Optio
         .map(|(_, i)| i.clone())
 }
 
-/// Open a block-device inode as a btrfs (preferred) or ext2 filesystem, if
-/// possible. Returns the filesystem together with its fstype name.
+/// Open a block-device (or loop file) inode as a btrfs filesystem, if possible.
+/// btrfs is the only on-disk root filesystem Eclipse supports; ext2 was removed.
+/// Returns the filesystem together with its fstype name.
 fn open_block_root(inode: Arc<dyn INode>) -> Option<(Arc<dyn FileSystem>, &'static str)> {
-    let backend = block_mount::MountBackend::from_inode(inode.clone()).ok()?;
+    let backend = block_mount::MountBackend::from_inode(inode).ok()?;
     if let block_mount::MountBackend::Block(block) = &backend {
-        if btrfs_mount::probe_btrfs_superblock(block) {
-            if let Ok(fs) = mount_ops::open_filesystem(backend, "btrfs", false) {
-                return Some((fs, "btrfs"));
-            }
+        if !btrfs_mount::probe_btrfs_superblock(block) {
             return None;
         }
-        if !block_mount::probe_ext2_superblock(block) {
-            return None;
-        }
-        let fs = mount_ops::open_filesystem(backend, "ext2", false).ok()?;
-        return Some((fs, "ext2"));
     }
-    // File-backed (loop) roots: try btrfs, then ext2.
-    match mount_ops::open_filesystem(backend, "btrfs", false) {
-        Ok(fs) => Some((fs, "btrfs")),
-        Err(_) => {
-            let backend = block_mount::MountBackend::from_inode(inode).ok()?;
-            let fs = mount_ops::open_filesystem(backend, "ext2", false).ok()?;
-            Some((fs, "ext2"))
-        }
-    }
+    let fs = mount_ops::open_filesystem(backend, "btrfs", false).ok()?;
+    Some((fs, "btrfs"))
 }
 
 /// Open the root declared by the `/` entry of the boot medium's fstab, when
@@ -881,9 +865,9 @@ fn root_fs_from_fstab(
         if parts.len() < 3 || parts[1] != "/" {
             continue;
         }
-        // Only block-device roots (btrfs/ext-family) can be mounted here.
+        // Only btrfs block-device roots can be mounted here.
         let fstype = mount_ops::parse_fstype(parts[2]).ok()?;
-        if fstype != "btrfs" && fstype != "ext2" {
+        if fstype != "btrfs" {
             return None;
         }
         let inode = lookup_candidate(candidates, parts[0])?;

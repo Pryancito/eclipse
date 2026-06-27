@@ -108,6 +108,21 @@ pub fn cpus_idle_now() -> usize {
     CPU_IN_IDLE.iter().filter(|c| c.load(Relaxed)).count()
 }
 
+/// Bitmask of logical CPUs currently parked in idle halt (bit `i` = cpu `i`).
+/// Used by the TLB-shootdown initiator to avoid synchronously waiting on a core
+/// that is halted: a halted core is not executing, and the shootdown IPI it was
+/// sent will flush its TLB when it wakes (before it runs any user instruction),
+/// exactly as the existing budget-exhaustion fire-and-forget fallback relies on.
+pub fn cpu_idle_mask() -> u64 {
+    let mut mask = 0u64;
+    for (i, c) in CPU_IN_IDLE.iter().enumerate() {
+        if i < 64 && c.load(Relaxed) {
+            mask |= 1u64 << i;
+        }
+    }
+    mask
+}
+
 /// Account one timer tick.
 pub fn note_timer_tick() {
     TIMER_TICKS.fetch_add(1, Relaxed);
@@ -259,5 +274,169 @@ pub fn snapshot() -> KStats {
         hid_poll_timer: HID_POLL_TIMER.load(Relaxed),
         hid_poll_iowait: HID_POLL_IOWAIT.load(Relaxed),
         tick_percpu,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Host tests for the CPU runtime-statistics counters. On libos
+    //! `cpu::cpu_id()` is always 0, so every per-CPU update lands in slot 0.
+    //!
+    //! All counters here are process-global monotonic atomics and the test
+    //! runner executes tests in parallel, so the assertions are written to be
+    //! interference-proof: monotonic counters use `>=` deltas, per-vector IRQ
+    //! checks each pick a vector no other test touches (exact delta), and the
+    //! few tests that read non-monotonic shared state (the per-CPU idle flag,
+    //! the last-RIP slot) serialise through `SERIAL`.
+    use super::*;
+    use spin::Mutex;
+
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    fn irq_count(snap: &KStats, vector: u16) -> u64 {
+        snap.irqs
+            .iter()
+            .find(|(v, _)| *v == vector)
+            .map(|(_, c)| *c)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn note_irq_counts_specific_vector() {
+        // Vector 0xF1 is used by no other test, so the delta is exactly ours.
+        const V: u16 = 0xF1;
+        let before = irq_count(&snapshot(), V);
+        let total_before = snapshot().irq_total;
+        for _ in 0..5 {
+            note_irq(V as usize);
+        }
+        assert_eq!(irq_count(&snapshot(), V) - before, 5);
+        assert!(snapshot().irq_total >= total_before + 5);
+    }
+
+    #[test]
+    fn note_irq_out_of_range_still_counts_total() {
+        // A vector beyond the tracked table bumps the grand total but no slot.
+        let total_before = snapshot().irq_total;
+        note_irq(NVEC + 10);
+        assert!(snapshot().irq_total >= total_before + 1);
+        // It must not have created a per-vector entry.
+        assert!(snapshot().irqs.iter().all(|(v, _)| (*v as usize) < NVEC));
+    }
+
+    #[test]
+    fn idle_accounting_is_monotonic() {
+        let before = snapshot();
+        for _ in 0..4 {
+            note_idle(1000);
+        }
+        let after = snapshot();
+        assert!(after.idle_ns >= before.idle_ns + 4000);
+        assert!(after.idle_entries >= before.idle_entries + 4);
+        // The per-CPU breakdown for cpu 0 must have grown too.
+        let entries0 = |s: &KStats| {
+            s.idle_percpu
+                .iter()
+                .find(|(c, _, _)| *c == 0)
+                .map(|(_, n, _)| *n)
+                .unwrap_or(0)
+        };
+        assert!(entries0(&after) >= entries0(&before) + 4);
+    }
+
+    #[test]
+    fn timer_ticks_monotonic() {
+        let before = snapshot().timer_ticks;
+        for _ in 0..7 {
+            note_timer_tick();
+        }
+        assert!(snapshot().timer_ticks >= before + 7);
+    }
+
+    #[test]
+    fn hid_poll_counters_monotonic() {
+        let before = snapshot();
+        note_hid_poll_timer();
+        note_hid_poll_timer();
+        note_hid_poll_iowait();
+        let after = snapshot();
+        assert!(after.hid_poll_timer >= before.hid_poll_timer + 2);
+        assert!(after.hid_poll_iowait >= before.hid_poll_iowait + 1);
+    }
+
+    #[test]
+    fn idle_callback_busy_never_exceeds_total() {
+        let before = snapshot();
+        note_idle_callback(true); // found work
+        note_idle_callback(false); // went to sleep
+        note_idle_callback(false);
+        let after = snapshot();
+        assert!(after.idle_cb_total >= before.idle_cb_total + 3);
+        assert!(after.idle_cb_busy >= before.idle_cb_busy + 1);
+        // Structural invariant: busy is a subset of total, always.
+        assert!(after.idle_cb_busy <= after.idle_cb_total);
+    }
+
+    #[test]
+    fn snapshot_structural_invariants() {
+        // Make sure there is some data to inspect.
+        note_irq(0x42);
+        note_idle(500);
+        let s = snapshot();
+        // Every reported vector fired at least once.
+        assert!(s.irqs.iter().all(|(_, c)| *c > 0));
+        // The grand total is at least the sum of the per-vector counts (the
+        // total also includes out-of-range vectors).
+        let per_vec_sum: u64 = s.irqs.iter().map(|(_, c)| *c).sum();
+        assert!(s.irq_total >= per_vec_sum);
+        // Idle naps imply idle time and vice-versa are both accounted.
+        assert!(s.idle_entries > 0 && s.idle_ns > 0);
+        // Per-CPU idle entries never exceed the global count.
+        let percpu_entries: u64 = s.idle_percpu.iter().map(|(_, n, _)| *n).sum();
+        assert!(percpu_entries <= s.idle_entries);
+    }
+
+    #[test]
+    fn cpu_idle_flag_roundtrip() {
+        let _g = SERIAL.lock();
+        // Only cpu 0 is ever marked on libos, and SERIAL keeps the other
+        // flag-touching test out, so the count is exact here.
+        set_cpu_idle(false);
+        assert_eq!(cpus_idle_now(), 0);
+        set_cpu_idle(true);
+        assert_eq!(cpus_idle_now(), 1);
+        set_cpu_idle(false);
+        assert_eq!(cpus_idle_now(), 0);
+    }
+
+    #[test]
+    fn tick_context_records_user_and_rip() {
+        let _g = SERIAL.lock();
+        let total0 = |s: &KStats| {
+            s.tick_percpu
+                .iter()
+                .find(|(c, ..)| *c == 0)
+                .map(|(_, t, ..)| *t)
+                .unwrap_or(0)
+        };
+        let user0 = |s: &KStats| {
+            s.tick_percpu
+                .iter()
+                .find(|(c, ..)| *c == 0)
+                .map(|(_, _, u, _)| *u)
+                .unwrap_or(0)
+        };
+        let before = snapshot();
+        note_tick_context(true, 0xdead_beef); // interrupted user mode
+        note_tick_context(false, 0xc0ff_ee00); // interrupted kernel mode
+        let after = snapshot();
+        // Two more ticks on cpu 0, exactly one of them in user mode.
+        assert!(total0(&after) >= total0(&before) + 2);
+        assert!(user0(&after) >= user0(&before) + 1);
+        // user ticks are a subset of total ticks.
+        let entry = after.tick_percpu.iter().find(|(c, ..)| *c == 0).unwrap();
+        assert!(entry.2 <= entry.1);
+        // The last recorded RIP is the most recent call's (kernel-mode one).
+        assert_eq!(entry.3, 0xc0ff_ee00);
     }
 }

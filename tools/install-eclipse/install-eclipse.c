@@ -2454,10 +2454,8 @@ static int write_fstab_via_mount(const char *root_dev, const char *efi_dev,
     if (shell_mkdir_p(INST_ROOT_MNT, dry_run) != 0) {
         return -1;
     }
-    /* ROOT instalado: btrfs en instalaciones nuevas; ext2 sólo como
-     * compatibilidad con instalaciones antiguas. */
-    if (shell_mount(root_dev, INST_ROOT_MNT, "btrfs", 0, dry_run) != 0 &&
-        shell_mount(root_dev, INST_ROOT_MNT, "ext2", 0, dry_run) != 0) {
+    /* ROOT instalado: btrfs (único FS de disco soportado). */
+    if (shell_mount(root_dev, INST_ROOT_MNT, "btrfs", 0, dry_run) != 0) {
         return -1;
     }
 
@@ -2759,8 +2757,7 @@ static int run_upgrade(const char *disk_path, int dry_run) {
         if (shell_mkdir_p(UPD_ROOT_MNT, dry_run) != 0) {
             return -1;
         }
-        if (shell_mount(root_dev, UPD_ROOT_MNT, "btrfs", 0, dry_run) != 0 &&
-            shell_mount(root_dev, UPD_ROOT_MNT, "ext2", 0, dry_run) != 0) {
+        if (shell_mount(root_dev, UPD_ROOT_MNT, "btrfs", 0, dry_run) != 0) {
             log(COLOR_RED COLOR_BOLD "ERROR: No se pudo montar la partición ROOT (%s) para la descompresión." COLOR_RESET, root_dev);
             return -1;
         }

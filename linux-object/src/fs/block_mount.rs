@@ -1,17 +1,81 @@
 //! Block-backed and file-backed devices for mountable filesystems.
 
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use core::cmp::min;
+use core::cmp::{max, min};
 
+use lock::Mutex;
 use rcore_fs::dev::{DevError, Device, Result as DevResult};
 use rcore_fs::vfs::{FsError, INode, Result as VfsResult};
-use zcore_drivers::scheme::BlockScheme;
+use zcore_drivers::{scheme::BlockScheme, DeviceResult};
 
 use super::devfs::BlockDev;
 
 /// 512-byte sector buffer aligned for AHCI DMA.
 #[repr(align(4096))]
 struct SectorBuf([u8; 512]);
+
+const SECTOR: usize = 512;
+
+/// Hot-generation capacity of the per-device block cache, in 512-byte sectors.
+/// ~4 MiB hot; with the warm generation the cache holds up to ~8 MiB. Sized to
+/// keep the boot working set (ext2/btrfs inode & B-tree metadata blocks plus the
+/// repeatedly re-exec'd busybox image) resident.
+const CACHE_HOT_CAP: usize = 8192;
+
+/// A generational ("two-hand clock") LRU cache of disk sectors.
+///
+/// Every filesystem read on Eclipse goes `FS -> BlockByteDevice -> block driver
+/// -> real disk (DMA + IRQ)`. Without caching, the same sectors — inode tables
+/// shared by many inodes, directory/B-tree blocks walked on every lookup, and
+/// the busybox binary re-read on every `exec` — are fetched from the device
+/// again and again, which is what makes an exec/stat-heavy boot crawl.
+///
+/// Approximate LRU at O(1): inserts go into `hot`; when `hot` fills, the old
+/// `warm` set is dropped and `hot` becomes the new `warm`. A hit in `warm` is
+/// promoted back to `hot`. Memory is bounded to ~2 * `CACHE_HOT_CAP` sectors.
+struct SectorCache {
+    hot: BTreeMap<usize, Box<[u8; SECTOR]>>,
+    warm: BTreeMap<usize, Box<[u8; SECTOR]>>,
+}
+
+impl SectorCache {
+    fn new() -> Self {
+        Self {
+            hot: BTreeMap::new(),
+            warm: BTreeMap::new(),
+        }
+    }
+
+    /// Copy sector `id` into `out` (must be 512 bytes) if cached, promoting a
+    /// warm hit. Returns `true` on a hit.
+    fn get_into(&mut self, id: usize, out: &mut [u8]) -> bool {
+        if let Some(d) = self.hot.get(&id) {
+            out.copy_from_slice(&d[..]);
+            return true;
+        }
+        if let Some(d) = self.warm.remove(&id) {
+            out.copy_from_slice(&d[..]);
+            self.insert(id, d);
+            return true;
+        }
+        false
+    }
+
+    fn insert(&mut self, id: usize, data: Box<[u8; SECTOR]>) {
+        self.hot.insert(id, data);
+        if self.hot.len() >= CACHE_HOT_CAP {
+            self.warm = core::mem::take(&mut self.hot);
+        }
+    }
+
+    fn put_from(&mut self, id: usize, src: &[u8]) {
+        let mut b = Box::new([0u8; SECTOR]);
+        b.copy_from_slice(src);
+        self.insert(id, b);
+    }
+}
 
 /// Backing store for a mount operation.
 pub enum MountBackend {
@@ -37,14 +101,62 @@ impl MountBackend {
     }
 }
 
-/// Byte-oriented device over a block driver.
+/// Byte-oriented device over a block driver, with a sector cache.
 pub struct BlockByteDevice {
     block: Arc<dyn BlockScheme>,
+    cache: Mutex<SectorCache>,
 }
 
 impl BlockByteDevice {
     pub fn new(block: Arc<dyn BlockScheme>) -> Self {
-        Self { block }
+        Self {
+            block,
+            cache: Mutex::new(SectorCache::new()),
+        }
+    }
+
+    /// Read `buf.len() / 512` consecutive sectors starting at `block_id`,
+    /// serving from the cache and hitting the device only on a miss. `buf.len()`
+    /// must be a non-zero multiple of 512. Returns the same result type as the
+    /// underlying driver so callers keep their existing error handling.
+    fn read_block_cached(&self, block_id: usize, buf: &mut [u8]) -> DeviceResult {
+        let nsec = buf.len() / SECTOR;
+        // Fast path: every requested sector is already cached.
+        {
+            let mut cache = self.cache.lock();
+            let mut all_hit = true;
+            for i in 0..nsec {
+                if !cache.get_into(block_id + i, &mut buf[i * SECTOR..(i + 1) * SECTOR]) {
+                    all_hit = false;
+                    break;
+                }
+            }
+            if all_hit {
+                return Ok(());
+            }
+        }
+        // Miss: one device transfer for the whole run, then warm the cache.
+        self.block.read_block(block_id, buf)?;
+        {
+            let mut cache = self.cache.lock();
+            for i in 0..nsec {
+                cache.put_from(block_id + i, &buf[i * SECTOR..(i + 1) * SECTOR]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Write `buf.len() / 512` consecutive sectors starting at `block_id`,
+    /// write-through to the device and refreshing the cache so later reads stay
+    /// consistent and warm. `buf.len()` must be a non-zero multiple of 512.
+    fn write_block_cached(&self, block_id: usize, buf: &[u8]) -> DeviceResult {
+        self.block.write_block(block_id, buf)?;
+        let nsec = buf.len() / SECTOR;
+        let mut cache = self.cache.lock();
+        for i in 0..nsec {
+            cache.put_from(block_id + i, &buf[i * SECTOR..(i + 1) * SECTOR]);
+        }
+        Ok(())
     }
 }
 
@@ -58,8 +170,7 @@ impl Device for BlockByteDevice {
         let head_off = offset % BS;
         if head_off != 0 && done < buf.len() {
             let take = min(buf.len(), BS - head_off);
-            self.block
-                .read_block(offset / BS, &mut temp.0)
+            self.read_block_cached(offset / BS, &mut temp.0)
                 .map_err(|_| DevError)?;
             buf[..take].copy_from_slice(&temp.0[head_off..head_off + take]);
             done += take;
@@ -69,8 +180,7 @@ impl Device for BlockByteDevice {
         let mid = ((buf.len() - done) / BS) * BS;
         if mid > 0 {
             let block_id = (offset + done) / BS;
-            self.block
-                .read_block(block_id, &mut buf[done..done + mid])
+            self.read_block_cached(block_id, &mut buf[done..done + mid])
                 .map_err(|e| {
                     warn!(
                         "blockdev: read_block(block_id={}, {} sectors) failed: {:?} \
@@ -89,8 +199,7 @@ impl Device for BlockByteDevice {
         // Partial trailing sector.
         if done < buf.len() {
             let take = buf.len() - done;
-            self.block
-                .read_block((offset + done) / BS, &mut temp.0)
+            self.read_block_cached((offset + done) / BS, &mut temp.0)
                 .map_err(|_| DevError)?;
             buf[done..].copy_from_slice(&temp.0[..take]);
             done += take;
@@ -109,12 +218,10 @@ impl Device for BlockByteDevice {
         if head_off != 0 && done < buf.len() {
             let take = min(buf.len(), BS - head_off);
             let block_id = offset / BS;
-            self.block
-                .read_block(block_id, &mut temp.0)
+            self.read_block_cached(block_id, &mut temp.0)
                 .map_err(|_| DevError)?;
             temp.0[head_off..head_off + take].copy_from_slice(&buf[..take]);
-            self.block
-                .write_block(block_id, &temp.0)
+            self.write_block_cached(block_id, &temp.0)
                 .map_err(|_| DevError)?;
             done += take;
         }
@@ -123,8 +230,7 @@ impl Device for BlockByteDevice {
         let mid = ((buf.len() - done) / BS) * BS;
         if mid > 0 {
             let block_id = (offset + done) / BS;
-            self.block
-                .write_block(block_id, &buf[done..done + mid])
+            self.write_block_cached(block_id, &buf[done..done + mid])
                 .map_err(|e| {
                     warn!(
                         "blockdev: write_block(block_id={}, {} sectors) failed: {:?} \
@@ -144,12 +250,10 @@ impl Device for BlockByteDevice {
         if done < buf.len() {
             let take = buf.len() - done;
             let block_id = (offset + done) / BS;
-            self.block
-                .read_block(block_id, &mut temp.0)
+            self.read_block_cached(block_id, &mut temp.0)
                 .map_err(|_| DevError)?;
             temp.0[..take].copy_from_slice(&buf[done..]);
-            self.block
-                .write_block(block_id, &temp.0)
+            self.write_block_cached(block_id, &temp.0)
                 .map_err(|_| DevError)?;
             done += take;
         }
@@ -203,54 +307,314 @@ impl Device for FileByteDevice {
     }
 }
 
+/// Per-device buffer-cache budget. Entries are allocated lazily as sectors are
+/// touched, so a freshly-mounted device uses nothing and grows up to this cap.
+/// 8 MiB is generous enough to keep the hot working set (inode table, block
+/// group descriptors, directory blocks, recently-read file data) resident while
+/// staying well under the per-mount budget the exec/VMO cache already spends.
+const CACHE_CAPACITY_SECTORS: usize = 8 * 1024 * 1024 / SECTOR;
+
+/// Forward read-ahead window. On a cache miss for a request smaller than this,
+/// the backing device is read this far past the request in one command and the
+/// extra sectors are cached. Sequential access — the dominant pattern during
+/// boot (init/service files) and demand-paging of executables/libraries —
+/// then hits the cache instead of issuing one synchronous device command per
+/// piece, which is the dominant cost on high-latency media (USB/SATA, polled
+/// AHCI). Sized to roughly one AHCI command so the prefetch is ~free latency-wise.
+const READAHEAD_BYTES: usize = 64 * 1024;
+
+/// One cached 512-byte sector plus its LRU timestamp.
+struct CacheLine {
+    data: Box<[u8; SECTOR]>,
+    /// Monotonic tick of the last access; the smallest tick is the LRU victim.
+    tick: u64,
+}
+
+/// A write-through, sector-granular LRU buffer cache.
+///
+/// Every on-disk filesystem in the kernel (ext2 via `Synced`/editor, btrfs via
+/// the device adapter) funnels *all* of its reads and writes through a single
+/// `Arc<dyn Device>`. Without a cache each `read_at` reaches the AHCI/virtio
+/// driver, so a workload re-reads the same inode-table sector on every `stat`,
+/// re-scans directory blocks on every path lookup, and re-fetches file data on
+/// every re-open. This decorator keeps recently-touched sectors in RAM:
+///
+/// * **Reads** are served from the cache when every sector of the request is
+///   resident (the common case for hot metadata and re-read data); otherwise a
+///   single backing read of the sector-aligned span fills both the caller's
+///   buffer and the cache.
+/// * **Writes** go straight through to the backing device first (so a crash can
+///   never lose acknowledged data) and then update the cache so a subsequent
+///   read never observes a stale sector.
+///
+/// Correctness rests on one invariant: a sector present in the cache always
+/// holds exactly what is on disk. Write-through plus the post-write update below
+/// maintains it. This assumes the wrapped device is reached *only* through this
+/// cache (the normal one-`CachedDevice`-per-mount case); it is not a coherent
+/// cache across two independent handles to the same disk.
+struct BlockCache {
+    /// Resident sectors keyed by sector id.
+    lines: BTreeMap<u64, CacheLine>,
+    /// LRU index: tick -> sector id. The first entry is the eviction victim.
+    lru: BTreeMap<u64, u64>,
+    /// Monotonic access counter feeding `CacheLine::tick`.
+    clock: u64,
+    /// Maximum number of resident sectors.
+    capacity: usize,
+}
+
+impl BlockCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            lines: BTreeMap::new(),
+            lru: BTreeMap::new(),
+            clock: 1,
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn contains(&self, sector: u64) -> bool {
+        self.lines.contains_key(&sector)
+    }
+
+    /// Hand out the next monotonic access tick. Kept tiny and borrow-free so
+    /// callers can take it *before* borrowing `lines`, never holding a `lines`
+    /// borrow across the `lru` bookkeeping below.
+    fn next_tick(&mut self) -> u64 {
+        let t = self.clock;
+        self.clock = self.clock.wrapping_add(1);
+        t
+    }
+
+    /// Copy `dst.len()` bytes starting at `off` within `sector` out of the
+    /// cache, marking the sector most-recently-used. Returns `false` on a miss.
+    fn read_into(&mut self, sector: u64, off: usize, dst: &mut [u8]) -> bool {
+        let new_tick = self.next_tick();
+        let old = match self.lines.get_mut(&sector) {
+            Some(line) => {
+                dst.copy_from_slice(&line.data[off..off + dst.len()]);
+                let old = line.tick;
+                line.tick = new_tick;
+                old
+            }
+            None => return false,
+        };
+        // `lines` borrow released; update the LRU index.
+        self.lru.remove(&old);
+        self.lru.insert(new_tick, sector);
+        true
+    }
+
+    /// Insert or replace a full sector, evicting the LRU victim(s) if at
+    /// capacity. `data` must be exactly one sector.
+    fn insert(&mut self, sector: u64, data: &[u8]) {
+        debug_assert_eq!(data.len(), SECTOR);
+        let new_tick = self.next_tick();
+        // Update in place if the sector is already resident.
+        let mut old_tick: Option<u64> = None;
+        if let Some(line) = self.lines.get_mut(&sector) {
+            old_tick = Some(line.tick);
+            line.data.copy_from_slice(data);
+            line.tick = new_tick;
+        }
+        if let Some(old) = old_tick {
+            self.lru.remove(&old);
+            self.lru.insert(new_tick, sector);
+            return;
+        }
+        // Fresh sector: evict the least-recently-used until under capacity.
+        while self.lines.len() >= self.capacity {
+            let victim_tick = match self.lru.keys().next().copied() {
+                Some(t) => t,
+                None => break,
+            };
+            if let Some(victim_sector) = self.lru.remove(&victim_tick) {
+                self.lines.remove(&victim_sector);
+            }
+        }
+        let mut boxed = Box::new([0u8; SECTOR]);
+        boxed.copy_from_slice(data);
+        self.lines
+            .insert(sector, CacheLine { data: boxed, tick: new_tick });
+        self.lru.insert(new_tick, sector);
+    }
+
+    /// Patch `src` into a *resident* sector at byte offset `off`. No-op if the
+    /// sector is not cached: write-through already put the bytes on disk, so the
+    /// next read will fetch them fresh.
+    fn patch(&mut self, sector: u64, off: usize, src: &[u8]) {
+        if let Some(line) = self.lines.get_mut(&sector) {
+            line.data[off..off + src.len()].copy_from_slice(src);
+        }
+    }
+}
+
+/// A [`Device`] decorator adding the [`BlockCache`] above to any backing device.
+pub struct CachedDevice {
+    inner: Arc<dyn Device>,
+    cache: Mutex<BlockCache>,
+    /// One past the last addressable byte, rounded up to a sector. Read-ahead is
+    /// clamped to this so a prefetch never runs off the end of the device.
+    dev_end: usize,
+}
+
+impl CachedDevice {
+    pub fn new(inner: Arc<dyn Device>, size_bytes: usize) -> Self {
+        Self::with_capacity(inner, size_bytes, CACHE_CAPACITY_SECTORS)
+    }
+
+    fn with_capacity(inner: Arc<dyn Device>, size_bytes: usize, capacity_sectors: usize) -> Self {
+        let dev_end = ((size_bytes + SECTOR - 1) / SECTOR) * SECTOR;
+        Self {
+            inner,
+            cache: Mutex::new(BlockCache::new(capacity_sectors)),
+            dev_end,
+        }
+    }
+
+    /// Fill the cache from a sector-aligned buffer that was just read from the
+    /// backing device. Only fully-read sectors (`valid_len` may be short at
+    /// end-of-device) are inserted.
+    fn populate(&self, first_sector: u64, data: &[u8], valid_len: usize) {
+        let mut cache = self.cache.lock();
+        let mut off = 0;
+        let mut sector = first_sector;
+        while off + SECTOR <= valid_len {
+            cache.insert(sector, &data[off..off + SECTOR]);
+            off += SECTOR;
+            sector += 1;
+        }
+    }
+}
+
+impl Device for CachedDevice {
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> DevResult<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let end = offset + buf.len();
+        let first = (offset / SECTOR) as u64;
+        let last = ((end - 1) / SECTOR) as u64;
+
+        // Fast path: every sector is resident -> serve entirely from RAM with no
+        // device I/O. This is what turns repeated stat/lookup/re-read traffic
+        // into pure memory copies.
+        {
+            let mut cache = self.cache.lock();
+            if (first..=last).all(|s| cache.contains(s)) {
+                let mut pos = offset;
+                let mut done = 0;
+                while pos < end {
+                    let sector = (pos / SECTOR) as u64;
+                    let soff = pos % SECTOR;
+                    let take = min(SECTOR - soff, end - pos);
+                    let hit = cache.read_into(sector, soff, &mut buf[done..done + take]);
+                    debug_assert!(hit);
+                    done += take;
+                    pos += take;
+                }
+                return Ok(done);
+            }
+        }
+        // Lock released before touching the (slow) backing device.
+
+        let aligned_start = (first as usize) * SECTOR;
+        let aligned_end = (last as usize + 1) * SECTOR;
+
+        // Extend the read forward by the read-ahead window for smallish requests
+        // (clamped to the device, and never below the requested span). Large
+        // requests are already efficient sequential transfers and get no extra.
+        let read_end = if buf.len() < READAHEAD_BYTES {
+            (aligned_end + READAHEAD_BYTES)
+                .min(self.dev_end)
+                .max(aligned_end)
+        } else {
+            aligned_end
+        };
+        let read_len = read_end - aligned_start;
+
+        // No read-ahead and already sector-aligned: read straight into the
+        // caller's buffer and cache from it — no temporary allocation.
+        if read_end == aligned_end && offset == aligned_start && buf.len() == read_len {
+            let n = self.inner.read_at(aligned_start, buf)?;
+            self.populate(first, buf, n);
+            return Ok(n);
+        }
+
+        // Otherwise read the (possibly read-ahead-extended) span once, cache
+        // whole sectors, then return just the requested slice.
+        let mut tmp = vec![0u8; read_len];
+        let n = self.inner.read_at(aligned_start, &mut tmp)?;
+        self.populate(first, &tmp, n);
+        let skip = offset - aligned_start;
+        let avail = n.saturating_sub(skip);
+        let copy = min(buf.len(), avail);
+        buf[..copy].copy_from_slice(&tmp[skip..skip + copy]);
+        Ok(copy)
+    }
+
+    fn write_at(&self, offset: usize, buf: &[u8]) -> DevResult<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // Write-through first: the disk is authoritative and acknowledged bytes
+        // survive a crash regardless of cache state.
+        let n = self.inner.write_at(offset, buf)?;
+        if n == 0 {
+            return Ok(0);
+        }
+        // Then reconcile the cache with exactly the bytes that landed on disk.
+        let end = offset + n;
+        let first = offset / SECTOR;
+        let last = (end - 1) / SECTOR;
+        let mut cache = self.cache.lock();
+        for sector in first..=last {
+            let s_start = sector * SECTOR;
+            let s_end = s_start + SECTOR;
+            let cov_start = max(s_start, offset);
+            let cov_end = min(s_end, end);
+            if cov_start == s_start && cov_end == s_end {
+                // Whole sector overwritten: store the authoritative copy.
+                cache.insert(sector as u64, &buf[cov_start - offset..cov_end - offset]);
+            } else {
+                // Partial sector: patch a resident copy so it cannot go stale;
+                // if absent, leave it out (disk already has the new bytes).
+                cache.patch(
+                    sector as u64,
+                    cov_start - s_start,
+                    &buf[cov_start - offset..cov_end - offset],
+                );
+            }
+        }
+        Ok(n)
+    }
+
+    fn sync(&self) -> DevResult<()> {
+        // Write-through keeps the cache clean, so flushing the backing device is
+        // sufficient.
+        self.inner.sync()
+    }
+}
+
 pub fn device_from_backend(backend: &MountBackend) -> VfsResult<Arc<dyn Device>> {
-    match backend {
-        MountBackend::Block(block) => Ok(Arc::new(BlockByteDevice::new(block.clone()))),
-        MountBackend::File(file) => Ok(Arc::new(FileByteDevice::new(file.clone())?)),
-    }
+    let (raw, size_bytes): (Arc<dyn Device>, usize) = match backend {
+        MountBackend::Block(block) => (
+            Arc::new(BlockByteDevice::new(block.clone())) as Arc<dyn Device>,
+            block.block_count() * 512,
+        ),
+        MountBackend::File(file) => {
+            let dev = FileByteDevice::new(file.clone())?;
+            let size = dev.len;
+            (Arc::new(dev) as Arc<dyn Device>, size)
+        }
+    };
+    // Wrap every mount's backing device in the buffer cache. ext2 and btrfs both
+    // reach disk exclusively through this handle, so the cache accelerates all
+    // of their metadata and data traffic transparently, and read-ahead collapses
+    // sequential boot/exec reads into far fewer (synchronous) device commands.
+    Ok(Arc::new(CachedDevice::new(raw, size_bytes)))
 }
 
-/// ext2 superblock magic (`0xEF53`) at byte offset 56 within the superblock.
-const EXT2_MAGIC: u16 = 0xEF53;
-/// Superblock starts at byte 1024 → sector index 2 on a 512-byte device.
-const EXT2_SUPERBLOCK_SECTOR: usize = 2;
-
-/// Cheap pre-check before mounting: reject devices whose sector 2 does not look
-/// like a plausible ext2 superblock for this partition size.  Without this,
-/// a false-positive magic on vfat/gpt data can make ext2-rs read a huge bogus
-/// block-group table and stall boot for a long time.
-pub(crate) fn probe_ext2_superblock(block: &Arc<dyn BlockScheme>) -> bool {
-    let mut sb = SectorBuf([0u8; 512]);
-    if block.read_block(EXT2_SUPERBLOCK_SECTOR, &mut sb.0).is_err() {
-        return false;
-    }
-    let magic = u16::from_le_bytes([sb.0[56], sb.0[57]]);
-    if magic != EXT2_MAGIC {
-        return false;
-    }
-    let blocks_count = u32::from_le_bytes([sb.0[4], sb.0[5], sb.0[6], sb.0[7]]) as usize;
-    let inodes_count = u32::from_le_bytes([sb.0[0], sb.0[1], sb.0[2], sb.0[3]]) as usize;
-    if blocks_count < 11 || inodes_count < 11 {
-        return false;
-    }
-    let log_block_size = i32::from_le_bytes([sb.0[24], sb.0[25], sb.0[26], sb.0[27]]);
-    if log_block_size < 0 || log_block_size > 6 {
-        return false;
-    }
-    let block_size = 1024usize << log_block_size;
-    let device_sectors = block.block_count();
-    let fs_sectors = blocks_count.saturating_mul(block_size / 512);
-    if fs_sectors > device_sectors.saturating_mul(2) {
-        return false;
-    }
-    let blocks_per_group =
-        u32::from_le_bytes([sb.0[32], sb.0[33], sb.0[34], sb.0[35]]).max(1) as usize;
-    let bg_by_blocks = blocks_count / blocks_per_group + 1;
-    if bg_by_blocks > 8192 {
-        return false;
-    }
-    true
-}
 
 #[cfg(test)]
 mod block_byte_tests {
@@ -264,23 +628,32 @@ mod block_byte_tests {
     use alloc::sync::Arc;
     use alloc::vec;
     use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicUsize, Ordering};
     use rcore_fs::dev::Device;
     use std::sync::Mutex;
     use zcore_drivers::scheme::{BlockScheme, Scheme};
     use zcore_drivers::{DeviceError, DeviceResult};
 
     /// In-memory 512-byte-sector block device. Records every `write_block`
-    /// length so the test can also assert how the byte layer chunked the I/O.
+    /// length so the test can also assert how the byte layer chunked the I/O,
+    /// and counts sectors fetched via `read_block` so cache tests can prove a
+    /// repeat read touched the device zero times.
     struct MockBlock {
         sectors: Mutex<Vec<u8>>,
         nsec: usize,
+        sectors_read: AtomicUsize,
     }
     impl MockBlock {
         fn new(nsec: usize) -> Arc<Self> {
             Arc::new(Self {
                 sectors: Mutex::new(vec![0u8; nsec * 512]),
                 nsec,
+                sectors_read: AtomicUsize::new(0),
             })
+        }
+        /// Total sectors transferred out of the device via `read_block`.
+        fn sectors_read(&self) -> usize {
+            self.sectors_read.load(Ordering::Relaxed)
         }
     }
     impl Scheme for MockBlock {
@@ -299,6 +672,7 @@ mod block_byte_tests {
                 return Err(DeviceError::InvalidParam);
             }
             buf.copy_from_slice(&d[start..start + buf.len()]);
+            self.sectors_read.fetch_add(buf.len() / 512, Ordering::Relaxed);
             Ok(())
         }
         fn write_block(&self, block_id: usize, buf: &[u8]) -> DeviceResult {
@@ -396,5 +770,330 @@ mod block_byte_tests {
             p += bbd.read_at(2048 + p, &mut got[p..]).unwrap();
         }
         assert_eq!(got, payload);
+    }
+
+    // ---- CachedDevice (buffer cache) tests ----
+
+    /// Build a buffer-cached device over a fresh `BlockByteDevice` on `dev`.
+    fn cached(dev: Arc<MockBlock>, cap_sectors: usize) -> CachedDevice {
+        let size = dev.block_count() * 512;
+        CachedDevice::with_capacity(Arc::new(BlockByteDevice::new(dev)), size, cap_sectors)
+    }
+
+    /// A small cold read must prefetch ahead, so a following sequential read is
+    /// served from cache with no further device I/O.
+    #[test]
+    fn cache_readahead_prefetches_sequential() {
+        let dev = MockBlock::new(2048); // 1 MiB
+        let raw = BlockByteDevice::new(dev.clone());
+        let total = 2048 * 512;
+        let data: Vec<u8> = (0..total).map(pat).collect();
+        raw.write_at(0, &data).unwrap();
+
+        let cache = cached(dev.clone(), 4096);
+        let mut b0 = [0u8; 512];
+        cache.read_at(0, &mut b0).unwrap();
+        assert_eq!(&b0[..], &data[0..512]);
+        let after_first = dev.sectors_read();
+        assert!(
+            after_first > 1,
+            "a small cold read should prefetch more than the one requested sector"
+        );
+        // Sequential follow-up within the prefetched window: cache hit, correct.
+        let mut b1 = [0u8; 512];
+        cache.read_at(512, &mut b1).unwrap();
+        assert_eq!(&b1[..], &data[512..1024]);
+        assert_eq!(
+            dev.sectors_read(),
+            after_first,
+            "sequential read within the prefetch window must not touch the device"
+        );
+    }
+
+    /// Once a span is resident, repeat reads must not touch the device at all.
+    #[test]
+    fn cache_serves_repeat_reads() {
+        let dev = MockBlock::new(2048);
+        let cache = cached(dev.clone(), 4096);
+        // Seed disk through the cache (write-through); 8 aligned sectors.
+        let data: Vec<u8> = (0..4096).map(pat).collect();
+        assert_eq!(cache.write_at(0, &data).unwrap(), 4096);
+        let base = dev.sectors_read();
+        for _ in 0..16 {
+            let mut buf = vec![0u8; 4096];
+            assert_eq!(cache.read_at(0, &mut buf).unwrap(), 4096);
+            assert_eq!(buf, data);
+        }
+        assert_eq!(
+            dev.sectors_read(),
+            base,
+            "repeat reads of a resident span must be served from cache"
+        );
+    }
+
+    /// A cold read fetches from disk and populates the cache; the next identical
+    /// read is free.
+    #[test]
+    fn cache_cold_then_warm() {
+        let dev = MockBlock::new(2048);
+        // Seed disk directly (bypass cache) so the cache starts cold.
+        let raw = BlockByteDevice::new(dev.clone());
+        let data: Vec<u8> = (0..8192).map(pat).collect();
+        raw.write_at(0, &data).unwrap();
+
+        let cache = cached(dev.clone(), 4096);
+        let r0 = dev.sectors_read();
+        let mut buf = vec![0u8; 8192];
+        cache.read_at(0, &mut buf).unwrap();
+        assert_eq!(buf, data);
+        let r1 = dev.sectors_read();
+        assert!(r1 > r0, "cold read should hit the device");
+        cache.read_at(0, &mut buf).unwrap();
+        assert_eq!(dev.sectors_read(), r1, "warm read should be cache-only");
+        assert_eq!(buf, data);
+    }
+
+    /// With a cache far smaller than the working set, every read must still
+    /// return exactly what is on disk — eviction never serves stale/corrupt data.
+    #[test]
+    fn cache_eviction_preserves_correctness() {
+        let nsec = 256;
+        let dev = MockBlock::new(nsec);
+        let cache = cached(dev.clone(), 8); // 8-sector cache vs 256-sector device
+        let total = nsec * 512;
+        let data: Vec<u8> = (0..total).map(pat).collect();
+        assert_eq!(cache.write_at(0, &data).unwrap(), total);
+        for k in 0..nsec {
+            let s = (k * 397) % nsec; // odd stride -> visits every sector, churns LRU
+            let mut buf = [0u8; 512];
+            cache.read_at(s * 512, &mut buf).unwrap();
+            assert_eq!(&buf[..], &data[s * 512..s * 512 + 512], "sector {s}");
+        }
+    }
+
+    /// A sub-sector write must update a resident cached sector in place so a
+    /// later cache hit reflects the new bytes, and the disk must agree.
+    #[test]
+    fn cache_partial_write_consistency() {
+        let dev = MockBlock::new(64);
+        let cache = cached(dev.clone(), 4096);
+        // Make sector 0 resident.
+        let mut warm = [0u8; 512];
+        cache.read_at(0, &mut warm).unwrap();
+        // Patch 10 bytes in the middle of sector 0.
+        let patch = [0xABu8; 10];
+        assert_eq!(cache.write_at(100, &patch).unwrap(), 10);
+        // Cache hit must see the patch and leave neighbours untouched.
+        let mut got = [0u8; 512];
+        cache.read_at(0, &mut got).unwrap();
+        assert_eq!(&got[100..110], &patch);
+        assert_eq!(got[99], 0);
+        assert_eq!(got[110], 0);
+        // Disk (read via an independent uncached handle) must agree.
+        let raw = BlockByteDevice::new(dev.clone());
+        let mut disk = [0u8; 512];
+        raw.read_at(0, &mut disk).unwrap();
+        assert_eq!(&disk[100..110], &patch, "write-through lost the partial write");
+    }
+
+    /// Drive a mix of aligned/unaligned writes through the cache (small cache to
+    /// force eviction), then require a full readback through the cache to equal a
+    /// full readback taken straight from the backing store. Proves write-through
+    /// plus the post-write cache reconciliation stay coherent.
+    #[test]
+    fn cache_write_through_matches_disk() {
+        let nsec = 512;
+        let dev = MockBlock::new(nsec);
+        let cache = cached(dev.clone(), 64);
+        let total = nsec * 512;
+        let mut reference = vec![0u8; total];
+
+        let cases = [
+            (0usize, 512usize),
+            (1, 10),
+            (511, 2),
+            (500, 100),
+            (0, 4096),
+            (1234, 5000),
+            (512 * 100 + 7, 9000),
+            (total - 10, 10),
+            (total - 513, 513),
+            (777, 1),
+        ];
+        for (k, &(off, len)) in cases.iter().enumerate() {
+            let payload: Vec<u8> = (0..len).map(|i| pat(off + i + k * 31)).collect();
+            assert_eq!(cache.write_at(off, &payload).unwrap(), len);
+            reference[off..off + len].copy_from_slice(&payload);
+        }
+        // Readback via the cache.
+        let mut via_cache = vec![0u8; total];
+        let mut p = 0;
+        while p < total {
+            let n = cache.read_at(p, &mut via_cache[p..]).unwrap();
+            assert!(n > 0);
+            p += n;
+        }
+        assert_eq!(via_cache, reference, "cache readback mismatch");
+        // Readback straight from disk via a fresh uncached handle.
+        let raw = BlockByteDevice::new(dev.clone());
+        let mut via_disk = vec![0u8; total];
+        let mut q = 0;
+        while q < total {
+            let n = raw.read_at(q, &mut via_disk[q..]).unwrap();
+            assert!(n > 0);
+            q += n;
+        }
+        assert_eq!(via_disk, reference, "disk content mismatch (write-through failed)");
+    }
+
+    /// Unaligned reads spanning sector boundaries must return the right bytes
+    /// whether served cold (from disk) or warm (from cache).
+    #[test]
+    fn cache_unaligned_reads() {
+        let dev = MockBlock::new(64);
+        let warm_cache = cached(dev.clone(), 4096);
+        let total = 64 * 512;
+        let data: Vec<u8> = (0..total).map(pat).collect();
+        warm_cache.write_at(0, &data).unwrap(); // populates sectors 0..64 in warm_cache
+        for &(off, len) in &[(1usize, 600usize), (511, 3), (1000, 2048), (5, 5000)] {
+            // Cold: a fresh cache must reconstruct the span from disk.
+            let fresh = cached(dev.clone(), 4096);
+            let mut cold = vec![0u8; len];
+            fresh.read_at(off, &mut cold).unwrap();
+            assert_eq!(cold, data[off..off + len], "cold off={off} len={len}");
+            // Warm: the same span served from cache must match.
+            let mut warm = vec![0u8; len];
+            warm_cache.read_at(off, &mut warm).unwrap();
+            assert_eq!(warm, data[off..off + len], "warm off={off} len={len}");
+        }
+    }
+
+    // ---- BlockCache (LRU buffer cache) unit tests ----
+    //
+    // These poke the cache directly rather than through `CachedDevice`, pinning
+    // the eviction policy and the read/patch/insert bookkeeping that the
+    // higher-level coherence tests above rely on.
+
+    #[test]
+    fn cache_lru_evicts_least_recently_used() {
+        let mut c = BlockCache::new(2);
+        c.insert(0, &[0xAA; SECTOR]);
+        c.insert(1, &[0xBB; SECTOR]);
+        assert!(c.contains(0) && c.contains(1));
+        // Touch sector 0 -> sector 1 becomes the least-recently-used victim.
+        let mut buf = [0u8; SECTOR];
+        assert!(c.read_into(0, 0, &mut buf));
+        assert_eq!(buf[0], 0xAA);
+        c.insert(2, &[0xCC; SECTOR]);
+        assert!(c.contains(0), "recently-read sector 0 stays resident");
+        assert!(c.contains(2), "freshly inserted sector 2 present");
+        assert!(!c.contains(1), "LRU sector 1 evicted");
+    }
+
+    #[test]
+    fn cache_read_into_misses_when_absent() {
+        let mut c = BlockCache::new(4);
+        let mut buf = [0u8; SECTOR];
+        assert!(!c.read_into(7, 0, &mut buf));
+    }
+
+    #[test]
+    fn cache_patch_on_resident_updates_in_place() {
+        let mut c = BlockCache::new(4);
+        c.insert(3, &[0u8; SECTOR]);
+        c.patch(3, 100, &[0x9, 0x9, 0x9]);
+        let mut buf = [0u8; SECTOR];
+        assert!(c.read_into(3, 0, &mut buf));
+        assert_eq!(&buf[100..103], &[0x9, 0x9, 0x9]);
+        assert_eq!(buf[99], 0);
+    }
+
+    #[test]
+    fn cache_patch_on_absent_is_noop() {
+        let mut c = BlockCache::new(4);
+        c.patch(9, 0, &[1, 2, 3]); // must not create an entry
+        assert!(!c.contains(9));
+    }
+
+    #[test]
+    fn cache_insert_updates_in_place_without_growing() {
+        let mut c = BlockCache::new(2);
+        c.insert(5, &[0x11; SECTOR]);
+        c.insert(5, &[0x22; SECTOR]); // overwrite, not a new entry
+        let mut buf = [0u8; SECTOR];
+        assert!(c.read_into(5, 0, &mut buf));
+        assert_eq!(buf[0], 0x22);
+        // Still room for exactly one more before eviction.
+        c.insert(6, &[0x33; SECTOR]);
+        assert!(c.contains(5) && c.contains(6));
+    }
+
+    #[test]
+    fn cache_capacity_zero_is_clamped_to_one() {
+        let mut c = BlockCache::new(0);
+        c.insert(0, &[1; SECTOR]);
+        assert!(c.contains(0));
+        c.insert(1, &[2; SECTOR]);
+        assert!(c.contains(1));
+        assert!(!c.contains(0), "capacity floored at 1 -> one resident sector");
+    }
+
+    // ---- probe_ext2_superblock tests ----
+
+    /// A 512-byte sector-2 image that looks like a plausible ext2 superblock.
+    fn good_superblock() -> [u8; 512] {
+        let mut sb = [0u8; 512];
+        sb[0..4].copy_from_slice(&100u32.to_le_bytes()); // inodes_count
+        sb[4..8].copy_from_slice(&200u32.to_le_bytes()); // blocks_count
+        sb[24..28].copy_from_slice(&0i32.to_le_bytes()); // log_block_size=0 -> 1 KiB
+        sb[32..36].copy_from_slice(&50u32.to_le_bytes()); // blocks_per_group
+        sb[56] = 0x53; // magic 0xEF53, little-endian
+        sb[57] = 0xEF;
+        sb
+    }
+
+    fn dev_with_superblock(nsec: usize, sb: &[u8; 512]) -> Arc<dyn BlockScheme> {
+        let dev = MockBlock::new(nsec);
+        dev.write_block(EXT2_SUPERBLOCK_SECTOR, sb).unwrap();
+        dev
+    }
+
+    #[test]
+    fn probe_accepts_valid_superblock() {
+        let dev = dev_with_superblock(4096, &good_superblock());
+        assert!(probe_ext2_superblock(&dev));
+    }
+
+    #[test]
+    fn probe_rejects_bad_magic() {
+        let mut sb = good_superblock();
+        sb[56] = 0;
+        sb[57] = 0;
+        let dev = dev_with_superblock(4096, &sb);
+        assert!(!probe_ext2_superblock(&dev));
+    }
+
+    #[test]
+    fn probe_rejects_tiny_counts() {
+        let mut sb = good_superblock();
+        sb[4..8].copy_from_slice(&5u32.to_le_bytes()); // blocks_count < 11
+        let dev = dev_with_superblock(4096, &sb);
+        assert!(!probe_ext2_superblock(&dev));
+    }
+
+    #[test]
+    fn probe_rejects_absurd_block_size() {
+        let mut sb = good_superblock();
+        sb[24..28].copy_from_slice(&7i32.to_le_bytes()); // log_block_size > 6
+        let dev = dev_with_superblock(4096, &sb);
+        assert!(!probe_ext2_superblock(&dev));
+    }
+
+    #[test]
+    fn probe_rejects_fs_bigger_than_device() {
+        let mut sb = good_superblock();
+        sb[4..8].copy_from_slice(&1_000_000u32.to_le_bytes()); // huge fs...
+        let dev = dev_with_superblock(64, &sb); // ...tiny device
+        assert!(!probe_ext2_superblock(&dev));
     }
 }
