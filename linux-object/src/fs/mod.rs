@@ -394,8 +394,11 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     // lookups then traverse into the RamFS where create/write work. (Mounting
     // via MountFS does not work here because `/dev/*` resolution uses the
     // `lookup_virtual_fs` fast path against the raw `DEVFS_ROOT`.)
-    if let Err(e) = devfs_root.add("shm", DEV_SHM_FS.root_inode()) {
-        warn!("failed to mknod /dev/shm: {:?}", e);
+    match devfs_root.add("shm", DEV_SHM_FS.root_inode()) {
+        // Unique marker so a running kernel can be confirmed fresh:
+        // `dmesg | grep SHM_RAMFS_V2`. If absent, an older kernel is booted.
+        Ok(()) => warn!("[boot] /dev/shm: writable ramfs ready (SHM_RAMFS_V2)"),
+        Err(e) => warn!("failed to mknod /dev/shm: {:?}", e),
     }
     devfs_root
         .add("tty", stdio::STDIN.clone())
