@@ -186,9 +186,6 @@ impl INode for EventDev {
     /// userspace buffer size from it.
     #[allow(unsafe_code)]
     fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
-        if data == 0 {
-            return Err(FsError::InvalidParam);
-        }
         let size = ((cmd >> 16) & 0x3fff) as usize;
         let typ = (cmd >> 8) & 0xff;
         let nr = (cmd & 0xff) as usize;
@@ -199,7 +196,27 @@ impl INode for EventDev {
         // TEMP diag: trace libinput's evdev probe so dmesg shows whether it
         // ever opens and queries each /dev/input/eventN (vs. never finding it
         // via udev enumeration).
-        log::error!("[input] evdev event{} EVIOC nr={:#x} size={}", self.id, nr, size);
+        log::error!(
+            "[input] evdev event{} EVIOC nr={:#x} size={} data={:#x}",
+            self.id,
+            nr,
+            size,
+            data
+        );
+        // EVIOCSCLOCKID / EVIOCGRAB / EVIOCREVOKE pass their argument by value
+        // and never dereference the pointer; in particular seatd issues
+        // EVIOCREVOKE with a NULL argument (`data == 0`) when it revokes a
+        // device on session (de)activation. Handle them before the null-pointer
+        // guard below — that guard is only for the ioctls that read/write
+        // through `data`. We do not enforce grab/revoke, so accept as no-ops.
+        // (Rejecting EVIOCREVOKE with EINVAL made seatd treat the open as failed
+        // and never hand the device fd to libinput → "no input devices".)
+        if matches!(nr, 0xa0 | 0x90 | 0x91) {
+            return Ok(0);
+        }
+        if data == 0 {
+            return Err(FsError::InvalidParam);
+        }
         match nr {
             // EVIOCGVERSION -> EV_VERSION (0x010001).
             0x01 => {
@@ -237,8 +254,6 @@ impl INode for EventDev {
                 dst.fill(0);
                 Ok(size)
             }
-            // EVIOCSCLOCKID / EVIOCGRAB / EVIOCREVOKE: accept as no-ops.
-            0xa0 | 0x90 | 0x91 => Ok(0),
             // EVIOCGBIT(ev, len): supported event types / codes bitmap.
             0x20..=0x3f => {
                 let bytes = self.capability_for_ev((nr - 0x20) as u16).to_le_bytes();
