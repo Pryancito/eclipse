@@ -425,13 +425,15 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         let epoll_file = proc.get_file_like(epfd)?;
         let epoll = epoll_file.downcast_ref::<Epoll>().ok_or(LxError::EBADF)?;
-        let event = if op == 2 {
-            // EPOLL_CTL_DEL
-            EpollEvent { events: 0, data: 0 }
+        let (event, file) = if op == 2 {
+            // EPOLL_CTL_DEL: no event payload, no file handle needed.
+            (EpollEvent { events: 0, data: 0 }, None)
         } else {
-            event.read()?
+            // ADD/MOD: resolve the target fd so the epoll can poll it directly
+            // (required for nested-epoll readiness).
+            (event.read()?, Some(proc.get_file_like(fd)?))
         };
-        epoll.ctl(op, fd, event)
+        epoll.ctl(op, fd, event, file)
     }
 
     /// wait for an I/O event on an epoll file descriptor
