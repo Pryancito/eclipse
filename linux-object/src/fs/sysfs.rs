@@ -1380,6 +1380,12 @@ impl INode for SysClassInputDirINode {
         if id >= input_event_count() {
             return Err(FsError::EntryNotFound);
         }
+        // TEMP diag: fires when something (libudev) lists /sys/class/input/.
+        log::error!(
+            "[input] sysfs readdir /sys/class/input -> event{} (of {})",
+            id,
+            input_event_count()
+        );
         Ok(format!("event{}", id))
     }
 }
@@ -1433,6 +1439,13 @@ impl INode for SysInputEventINode {
                     minor,
                     self.id,
                     input_id_props(self.id),
+                );
+                // TEMP diag: fires when libudev reads this input device's
+                // properties — i.e. it got past /sys/class/input enumeration.
+                log::error!(
+                    "[input] sysfs read event{} uevent -> {}",
+                    self.id,
+                    content.replace('\n', " ")
                 );
                 Ok(Arc::new(Pseudo::new(&content, FileType::File)))
             }

@@ -196,6 +196,10 @@ impl INode for EventDev {
         if typ != 'E' as u32 {
             return Err(FsError::NotSupported);
         }
+        // TEMP diag: trace libinput's evdev probe so dmesg shows whether it
+        // ever opens and queries each /dev/input/eventN (vs. never finding it
+        // via udev enumeration).
+        log::error!("[input] evdev event{} EVIOC nr={:#x} size={}", self.id, nr, size);
         match nr {
             // EVIOCGVERSION -> EV_VERSION (0x010001).
             0x01 => {
