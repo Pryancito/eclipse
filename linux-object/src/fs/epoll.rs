@@ -11,9 +11,15 @@ pub struct Epoll {
     flags: OpenFlags,
 }
 
-#[derive(Debug)]
 struct EpollInner {
-    interest_list: BTreeMap<FileDesc, EpollEvent>,
+    /// Each watched fd maps to its requested event mask plus a handle to the
+    /// underlying file. The file handle lets `Epoll::poll()` report readiness
+    /// of the watched fds *without* a process context — which is what makes a
+    /// nested epoll (an epoll fd added to another epoll's interest list) work.
+    /// wlroots/labwc relies on exactly this: it adds `libinput_get_fd()` (an
+    /// epoll fd) to its `wl_event_loop` epoll, so the outer epoll must surface
+    /// the inner epoll's readiness or input events are never dispatched.
+    interest_list: BTreeMap<FileDesc, (EpollEvent, Arc<dyn FileLike>)>,
 }
 
 /// epoll event
@@ -41,8 +47,15 @@ impl Epoll {
         })
     }
 
-    /// add, modify, or remove a file descriptor from the interest list
-    pub fn ctl(&self, op: i32, fd: FileDesc, event: EpollEvent) -> LxResult<usize> {
+    /// add, modify, or remove a file descriptor from the interest list. `file`
+    /// is the resolved handle for `fd` (required for ADD/MOD; ignored for DEL).
+    pub fn ctl(
+        &self,
+        op: i32,
+        fd: FileDesc,
+        event: EpollEvent,
+        file: Option<Arc<dyn FileLike>>,
+    ) -> LxResult<usize> {
         let mut inner = self.inner.lock();
         match op {
             1 => {
@@ -50,7 +63,8 @@ impl Epoll {
                 if inner.interest_list.contains_key(&fd) {
                     return Err(LxError::EEXIST);
                 }
-                inner.interest_list.insert(fd, event);
+                let file = file.ok_or(LxError::EBADF)?;
+                inner.interest_list.insert(fd, (event, file));
             }
             2 => {
                 // EPOLL_CTL_DEL
@@ -58,12 +72,35 @@ impl Epoll {
             }
             3 => {
                 // EPOLL_CTL_MOD
+                let file = file.ok_or(LxError::EBADF)?;
                 let e = inner.interest_list.get_mut(&fd).ok_or(LxError::ENOENT)?;
-                *e = event;
+                *e = (event, file);
             }
             _ => return Err(LxError::EINVAL),
         }
         Ok(0)
+    }
+
+    /// Returns whether any watched fd is currently ready for its requested
+    /// events. Shared by `poll`/`async_poll` so a nested epoll surfaces its
+    /// inner readiness to an outer epoll/poll.
+    fn any_ready(&self) -> bool {
+        // Snapshot the handles so we don't hold the lock across `poll()` calls
+        // (a watched fd could itself be an epoll that re-enters).
+        let entries: Vec<(EpollEvent, Arc<dyn FileLike>)> =
+            self.inner.lock().interest_list.values().cloned().collect();
+        for (event, file) in entries {
+            let interest = PollEvents::from_bits_truncate(event.events as u16);
+            if let Ok(status) = file.poll(interest) {
+                if (status.read && interest.contains(PollEvents::IN))
+                    || (status.write && interest.contains(PollEvents::OUT))
+                    || status.error
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -100,13 +137,22 @@ impl FileLike for Epoll {
     }
 
     fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
-        // Epoll itself is usually not polled, but it can be.
-        // For simplicity, return not ready.
-        Ok(PollStatus::default())
+        // An epoll fd is readable iff any watched fd is ready. Surfacing this is
+        // what lets a nested epoll (e.g. libinput's fd inside wlroots' event
+        // loop) wake an outer epoll/poll.
+        Ok(PollStatus {
+            read: self.any_ready(),
+            write: false,
+            error: false,
+        })
     }
 
     async fn async_poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
-        Ok(PollStatus::default())
+        Ok(PollStatus {
+            read: self.any_ready(),
+            write: false,
+            error: false,
+        })
     }
 }
 
@@ -130,7 +176,7 @@ impl Epoll {
                 .any(|fd| crate::net::fd_is_interactive(*fd));
             crate::net::io_wait_tick(watch_net, watch_interactive);
             let mut events = Vec::new();
-            for (fd, event) in interest_list {
+            for (fd, (event, _)) in interest_list {
                 if let Ok(file) = process.get_file_like(fd) {
                     let interest = PollEvents::from_bits_truncate(event.events as u16);
                     let status = file.poll(interest)?;
