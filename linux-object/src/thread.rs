@@ -52,7 +52,21 @@ impl ThreadExt for Thread {
             robust_list_len: 0,
             handling_signal: None,
         });
-        Thread::create_with_ext(proc, "", linux_thread)
+        // The thread-group leader (the process's first/main thread) must have a
+        // TID equal to the process PID, just like Linux. Userspace relies on
+        // this: e.g. winit's `is_main_thread()` panics unless gettid()==getpid()
+        // on the main thread, and tgkill(getpid(), gettid()) must reach the
+        // leader. Without it, every KObject (process, thread, VMO, ...) draws a
+        // distinct id from one global counter, so the leader's TID never matched
+        // its PID. Subsequent threads (pthread_create) keep getting fresh,
+        // unique ids — only the leader reuses the PID, which is allocated to no
+        // other object.
+        let leader_id = if proc.thread_ids().is_empty() {
+            Some(proc.id())
+        } else {
+            None
+        };
+        Thread::create_with_ext_id(proc, "", linux_thread, leader_id)
     }
 
     fn lock_linux(&self) -> MutexGuard<'_, LinuxThread> {
