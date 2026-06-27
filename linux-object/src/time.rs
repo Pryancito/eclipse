@@ -49,6 +49,14 @@ impl TimeVal {
     pub fn now() -> TimeVal {
         TimeSpec::now().into()
     }
+    /// Monotonic time since boot (`CLOCK_MONOTONIC`). Used to timestamp evdev
+    /// input events: libinput selects `CLOCK_MONOTONIC` via `EVIOCSCLOCKID` and
+    /// compares event times against `clock_gettime(CLOCK_MONOTONIC)`. Stamping
+    /// events with the wall clock instead makes libinput's timers (button
+    /// debounce, tap, scroll) see multi-second offsets and misbehave.
+    pub fn now_monotonic() -> TimeVal {
+        TimeSpec::now_monotonic().into()
+    }
     /// to msec
     pub fn to_msec(&self) -> usize {
         self.sec * 1_000 + self.usec / 1_000
