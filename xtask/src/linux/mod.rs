@@ -600,6 +600,12 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # This flag lets the compositor start regardless; devices that ARE\n\
               # discovered still work, so it is safe to leave on permanently.\n\
               export WLR_LIBINPUT_NO_DEVICES=1\n\
+              # No hardware cursor plane on the pixman/dumb-buffer path: wlroots'\n\
+              # legacy DRM backend calls drmModeSetCursor, which fails (ENOTTY)\n\
+              # and takes the whole frame commit down with it ('Failed to commit\n\
+              # frame'), leaving no visible mouse pointer. Force the software\n\
+              # cursor so wlroots composites the pointer into the framebuffer.\n\
+              export WLR_NO_HARDWARE_CURSORS=1\n\
               # Runtime dir for the Wayland socket (created on demand, mode 0700).\n\
               export XDG_RUNTIME_DIR=/run/user/0\n\
               [ -d \"$XDG_RUNTIME_DIR\" ] || { mkdir -p \"$XDG_RUNTIME_DIR\" && chmod 0700 \"$XDG_RUNTIME_DIR\"; }\n",
