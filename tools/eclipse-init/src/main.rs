@@ -1,0 +1,432 @@
+//! Eclipse OS init — a small, purpose-built PID 1 / service supervisor.
+//!
+//! Eclipse's kernel already mounts the root, brings up the network and spawns
+//! the per-VT shells, so init does NOT need a heavyweight, shell-driven service
+//! manager (OpenRC's per-step `busybox sh` fork/exec churn is exactly what
+//! stressed the kernel's fragile paths). This init does only what PID 1 must:
+//!
+//!   * reap orphaned children forever (the defining duty of PID 1),
+//!   * mount any pseudo-filesystems that are missing (idempotent, best-effort),
+//!   * launch the userspace declared in `/etc/eclipse/services/*.service`
+//!     (`oneshot` tasks run to completion in order; `respawn` services are
+//!     supervised and restarted if they exit),
+//!   * shut the system down cleanly on SIGTERM (halt) / SIGINT (reboot).
+//!
+//! Design borrowed from runit/s6/dinit (supervision, declarative services,
+//! dependency ordering); implementation is our own so every syscall is under
+//! our control on the still-maturing kernel. No shell is involved.
+
+use std::collections::BTreeMap;
+use std::ffi::CString;
+use std::fs;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set by the SIGTERM handler: bring the system down (halt/power off).
+static WANT_HALT: AtomicBool = AtomicBool::new(false);
+/// Set by the SIGINT handler (Ctrl-Alt-Del is delivered to PID 1 as SIGINT):
+/// bring the system down and reboot.
+static WANT_REBOOT: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_sigterm(_sig: libc::c_int) {
+    WANT_HALT.store(true, Ordering::SeqCst);
+}
+extern "C" fn on_sigint(_sig: libc::c_int) {
+    WANT_REBOOT.store(true, Ordering::SeqCst);
+}
+
+/// How a service is managed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// Run once to completion during boot (mounts, one-time setup).
+    Oneshot,
+    /// Long-running; supervised and restarted if it exits.
+    Respawn,
+}
+
+struct Service {
+    name: String,
+    /// argv (argv[0] is the absolute program path).
+    exec: Vec<String>,
+    kind: Kind,
+    /// Names of services that must be started before this one.
+    after: Vec<String>,
+    /// Live child pid for a running `respawn` service.
+    pid: Option<i32>,
+}
+
+/// Default environment handed to every service (and inherited by their
+/// children). Kept tiny and absolute-path friendly; service `exec` lines use
+/// absolute paths, so this is mostly for the programs' own sub-exec needs.
+const CHILD_ENV: &[&str] = &[
+    "PATH=/bin:/sbin:/usr/bin:/usr/sbin",
+    "HOME=/root",
+    "TERM=linux",
+];
+
+fn log(msg: &str) {
+    // PID 1 has stdout/stderr wired to the console by the kernel.
+    println!("[eclipse-init] {msg}");
+}
+
+fn main() {
+    log("starting");
+
+    mount_pseudo_filesystems();
+    install_signal_handlers();
+
+    let mut services = load_services(Path::new("/etc/eclipse/services"));
+    let order = ordered_names(&services);
+
+    for name in &order {
+        // Re-check shutdown between starts so a SIGTERM during boot is honoured.
+        if WANT_HALT.load(Ordering::SeqCst) || WANT_REBOOT.load(Ordering::SeqCst) {
+            break;
+        }
+        start_service(services.get_mut(name).expect("known service"));
+    }
+
+    log("entering supervision loop");
+    supervise(&mut services);
+}
+
+// ---------------------------------------------------------------------------
+// Pseudo-filesystems
+// ---------------------------------------------------------------------------
+
+/// Mount the standard pseudo-filesystems if they are not already present. The
+/// Eclipse kernel already provides procfs/sysfs/devfs and treats these mounts
+/// as successful no-ops, so this is cheap and idempotent; it is here so the
+/// system is correct even on a kernel build where a mount point is empty.
+fn mount_pseudo_filesystems() {
+    // (source, target, fstype)
+    let mounts = [
+        ("proc", "/proc", "proc"),
+        ("sysfs", "/sys", "sysfs"),
+        ("devtmpfs", "/dev", "devtmpfs"),
+        ("tmpfs", "/run", "tmpfs"),
+        ("tmpfs", "/tmp", "tmpfs"),
+    ];
+    for (src, target, fstype) in mounts {
+        if !Path::new(target).exists() {
+            let _ = fs::create_dir_all(target);
+        }
+        let c_src = CString::new(src).unwrap();
+        let c_target = CString::new(target).unwrap();
+        let c_fstype = CString::new(fstype).unwrap();
+        // SAFETY: all pointers are valid NUL-terminated strings; data is null.
+        let rc = unsafe {
+            libc::mount(
+                c_src.as_ptr(),
+                c_target.as_ptr(),
+                c_fstype.as_ptr(),
+                0,
+                core::ptr::null(),
+            )
+        };
+        if rc != 0 {
+            // Already mounted / kernel-provided: not fatal.
+            log(&format!("note: mount {fstype} on {target} skipped"));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Signals
+// ---------------------------------------------------------------------------
+
+fn install_signal_handlers() {
+    install_handler(libc::SIGTERM, on_sigterm as usize);
+    install_handler(libc::SIGINT, on_sigint as usize);
+    // SIGCHLD is left at its default: the blocking `waitpid` in the supervision
+    // loop reaps children directly, so no handler is needed for reaping.
+}
+
+fn install_handler(sig: libc::c_int, handler: usize) {
+    // SAFETY: zeroed sigaction with a valid handler pointer; standard install.
+    unsafe {
+        let mut sa: libc::sigaction = core::mem::zeroed();
+        sa.sa_sigaction = handler;
+        libc::sigemptyset(&mut sa.sa_mask);
+        // No SA_RESTART: we WANT `waitpid` to return EINTR so the loop notices
+        // the shutdown flag promptly.
+        sa.sa_flags = 0;
+        libc::sigaction(sig, &sa, core::ptr::null_mut());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Service files
+// ---------------------------------------------------------------------------
+
+/// Parse every `*.service` file in `dir` into a map keyed by service name (the
+/// file stem). Malformed or empty (no `exec`) files are skipped with a warning
+/// rather than aborting boot.
+fn load_services(dir: &Path) -> BTreeMap<String, Service> {
+    let mut out = BTreeMap::new();
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => {
+            log(&format!("no service directory {} (nothing to start)", dir.display()));
+            return out;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("service") {
+            continue;
+        }
+        let name = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(_) => {
+                log(&format!("warning: cannot read {}", path.display()));
+                continue;
+            }
+        };
+        match parse_service(&name, &text) {
+            Some(svc) => {
+                out.insert(name, svc);
+            }
+            None => log(&format!("warning: {} has no 'exec', skipped", path.display())),
+        }
+    }
+    out
+}
+
+/// Parse a single service file. Format is line-based `key = value`, `#`
+/// comments and blank lines ignored:
+///   exec  = /usr/sbin/foo --flag      (required; whitespace-split into argv)
+///   type  = respawn | oneshot         (default: oneshot)
+///   after = bar baz                   (optional; space-separated dep names)
+fn parse_service(name: &str, text: &str) -> Option<Service> {
+    let mut exec: Vec<String> = Vec::new();
+    let mut kind = Kind::Oneshot;
+    let mut after: Vec<String> = Vec::new();
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = match line.split_once('=') {
+            Some((k, v)) => (k.trim(), v.trim()),
+            None => continue,
+        };
+        match key {
+            "exec" => exec = value.split_whitespace().map(String::from).collect(),
+            "type" => {
+                kind = match value {
+                    "respawn" => Kind::Respawn,
+                    _ => Kind::Oneshot,
+                }
+            }
+            "after" => after = value.split_whitespace().map(String::from).collect(),
+            _ => {}
+        }
+    }
+
+    if exec.is_empty() {
+        return None;
+    }
+    Some(Service {
+        name: name.to_string(),
+        exec,
+        kind,
+        after,
+        pid: None,
+    })
+}
+
+/// Produce a start order honouring `after =` dependencies: a service is only
+/// emitted once every dependency it lists has been emitted. Remaining services
+/// (missing deps or dependency cycles) are appended in name order so a bad
+/// `after =` never wedges boot.
+fn ordered_names(services: &BTreeMap<String, Service>) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    let mut pending: Vec<String> = services.keys().cloned().collect();
+
+    loop {
+        let mut progressed = false;
+        let mut still_pending: Vec<String> = Vec::new();
+        for name in pending {
+            let deps = &services[&name].after;
+            let ready = deps
+                .iter()
+                // A dep that doesn't exist can never be satisfied: ignore it
+                // (treat as already-met) rather than deadlock.
+                .all(|d| !services.contains_key(d) || order.contains(d));
+            if ready {
+                order.push(name);
+                progressed = true;
+            } else {
+                still_pending.push(name);
+            }
+        }
+        pending = still_pending;
+        if pending.is_empty() {
+            break;
+        }
+        if !progressed {
+            // Cycle or unsatisfiable deps: emit the rest in name order.
+            pending.sort();
+            order.extend(pending);
+            break;
+        }
+    }
+    order
+}
+
+// ---------------------------------------------------------------------------
+// Launching & supervision
+// ---------------------------------------------------------------------------
+
+/// Start a service. `oneshot` runs to completion (blocking) before returning;
+/// `respawn` is forked and its pid recorded for the supervision loop.
+fn start_service(svc: &mut Service) {
+    match svc.kind {
+        Kind::Oneshot => {
+            log(&format!("oneshot: {}", svc.name));
+            if let Some(pid) = spawn(&svc.exec) {
+                // Wait specifically for this child to finish.
+                let mut status = 0;
+                // SAFETY: pid is a child of ours.
+                unsafe { libc::waitpid(pid, &mut status, 0) };
+            }
+        }
+        Kind::Respawn => {
+            log(&format!("respawn: {} (starting)", svc.name));
+            svc.pid = spawn(&svc.exec);
+        }
+    }
+}
+
+/// fork + execv the given argv. Returns the child pid in the parent, or `None`
+/// if the fork failed. In the child, signal dispositions are reset to default
+/// and a fresh session is started before exec.
+fn spawn(argv: &[String]) -> Option<i32> {
+    let prog = CString::new(argv[0].as_str()).ok()?;
+    let c_args: Vec<CString> = argv
+        .iter()
+        .map(|a| CString::new(a.as_str()).unwrap())
+        .collect();
+    let mut p_args: Vec<*const libc::c_char> = c_args.iter().map(|a| a.as_ptr()).collect();
+    p_args.push(core::ptr::null());
+
+    let c_env: Vec<CString> = CHILD_ENV
+        .iter()
+        .map(|e| CString::new(*e).unwrap())
+        .collect();
+    let mut p_env: Vec<*const libc::c_char> = c_env.iter().map(|e| e.as_ptr()).collect();
+    p_env.push(core::ptr::null());
+
+    // SAFETY: standard fork/exec. The child only calls async-signal-safe libc
+    // functions (signal reset, setsid, execve) before exec.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        log(&format!("error: fork failed for {}", argv[0]));
+        return None;
+    }
+    if pid == 0 {
+        unsafe {
+            // Reset signals to default so the child isn't born with init's
+            // handlers, and give it its own session/process group.
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::setsid();
+            libc::execve(prog.as_ptr(), p_args.as_ptr(), p_env.as_ptr());
+            // execve only returns on failure.
+            libc::_exit(127);
+        }
+    }
+    Some(pid)
+}
+
+/// The PID 1 main loop: block in `waitpid`, reaping every child. A reaped
+/// `respawn` service is restarted; orphans reparented to init are simply
+/// reaped. A pending shutdown/reboot signal breaks out to `shutdown`.
+fn supervise(services: &mut BTreeMap<String, Service>) {
+    loop {
+        if WANT_HALT.load(Ordering::SeqCst) {
+            return shutdown(false, services);
+        }
+        if WANT_REBOOT.load(Ordering::SeqCst) {
+            return shutdown(true, services);
+        }
+
+        let mut status = 0;
+        // SAFETY: blocking wait for any child.
+        let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
+        if pid < 0 {
+            let err = errno();
+            if err == libc::EINTR {
+                // A signal arrived; loop to re-check the shutdown flags.
+                continue;
+            }
+            if err == libc::ECHILD {
+                // No children to wait on: pause until the next signal so we are
+                // not a busy loop. Returns on EINTR (a delivered signal).
+                unsafe { libc::pause() };
+                continue;
+            }
+            // Unexpected: avoid spinning.
+            unsafe { libc::pause() };
+            continue;
+        }
+
+        // Did a supervised respawn service just exit? If so, restart it.
+        if let Some(svc) = services.values_mut().find(|s| s.pid == Some(pid)) {
+            log(&format!("respawn: {} exited, restarting", svc.name));
+            svc.pid = spawn(&svc.exec);
+        }
+        // Otherwise it was a oneshot's leftover or a reparented orphan: reaped.
+    }
+}
+
+/// Stop everything and ask the kernel to reboot (`reboot == true`) or power
+/// off. Best-effort: SIGTERM to all, a short grace period, SIGKILL, sync, then
+/// the reboot syscall. If the kernel cannot reboot, halt in a pause loop.
+fn shutdown(reboot: bool, _services: &mut BTreeMap<String, Service>) {
+    log(if reboot { "rebooting" } else { "powering off" });
+
+    unsafe {
+        // Politely ask every process to terminate, then force it.
+        libc::kill(-1, libc::SIGTERM);
+        sleep_secs(2);
+        libc::kill(-1, libc::SIGKILL);
+        libc::sync();
+
+        let cmd = if reboot {
+            libc::RB_AUTOBOOT
+        } else {
+            libc::RB_POWER_OFF
+        };
+        libc::reboot(cmd);
+        // reboot(2) failed (ENOSYS or denied): nothing left to do but idle.
+        log("reboot syscall returned; halting");
+        loop {
+            libc::pause();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+fn errno() -> libc::c_int {
+    // SAFETY: __errno_location returns a valid pointer on musl/glibc.
+    unsafe { *libc::__errno_location() }
+}
+
+fn sleep_secs(secs: u64) {
+    let ts = libc::timespec {
+        tv_sec: secs as libc::time_t,
+        tv_nsec: 0,
+    };
+    // SAFETY: valid timespec; null remainder.
+    unsafe { libc::nanosleep(&ts, core::ptr::null_mut()) };
+}

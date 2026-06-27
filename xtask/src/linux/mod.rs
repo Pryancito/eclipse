@@ -58,13 +58,14 @@ impl LinuxRootfs {
                 let _ = fs::copy(&eclipse_bench, bin.join("eclipse-bench"));
             }
             self.install_thread_tests(&dir);
-            // INIT (PID 1): OpenRC by default, with busybox init as a resilient
-            // fallback. `install_busybox_init` runs first so `/sbin/init` always
-            // resolves to *some* PID 1; `install_openrc` then repoints it at
-            // `openrc-init` when the (best-effort) OpenRC build is available.
+            // INIT (PID 1): the Eclipse-native Rust init by default, with busybox
+            // init as a resilient fallback. `install_busybox_init` runs first so
+            // `/sbin/init` always resolves to *some* PID 1; `install_eclipse_init`
+            // then repoints it at `eclipse-init` when its (best-effort) build is
+            // available.
             Self::install_base_accounts(&dir);
             self.install_busybox_init(&dir);
-            self.install_openrc(&dir, &musl);
+            self.install_eclipse_init(&dir, &musl);
             return;
         }
         // 准备最小系统需要的资源
@@ -383,13 +384,13 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         }
 
         self.install_thread_tests(&dir);
-        // INIT (PID 1): OpenRC by default; busybox init kept as a resilient
-        // fallback. busybox lays down `/sbin/init` -> busybox (+ inittab + rcS)
-        // first, then OpenRC repoints `/sbin/init` -> `openrc-init` and installs
-        // its userland when the (best-effort) cross build succeeds.
+        // INIT (PID 1): the Eclipse-native Rust init by default; busybox init
+        // kept as a resilient fallback. busybox lays down `/sbin/init` -> busybox
+        // (+ inittab + rcS) first, then `install_eclipse_init` repoints
+        // `/sbin/init` -> `eclipse-init` when its (best-effort) build succeeds.
         Self::install_base_accounts(&dir);
         self.install_busybox_init(&dir);
-        self.install_openrc(&dir, &musl);
+        self.install_eclipse_init(&dir, &musl);
     }
 
     /// Instala tests freestanding de multihilo (thr3: repro de la barrier de sysbench).
@@ -537,6 +538,10 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
     /// install so OpenRC's static link resolves `-lcap` to `libcap.a` (OpenRC is
     /// built fully static — see [`openrc`](Self::openrc) — so nothing needs the
     /// shared object at runtime).
+    // Retained (unused) OpenRC build support — eclipse-init is now the default
+    // PID 1. Kept behind allow(dead_code) for easy revert during the init
+    // transition; remove once eclipse-init is confirmed in production.
+    #[allow(dead_code)]
     fn libcap(&self, musl: &Path) -> Option<PathBuf> {
         const VERSION: &str = "2.69";
         let sysroot = self.0.target().join("libcap-sysroot");
@@ -662,6 +667,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
     ///      fork/exec churn of `openrc sysinit` (one CPU faulted with a mangled
     ///      frame pointer). Static binaries reuse busybox's proven fork path and
     ///      need no librc/libcap/ld-musl at runtime.
+    #[allow(dead_code)]
     fn openrc(&self, musl: &Path) -> Option<PathBuf> {
         let libcap_sysroot = self.libcap(musl)?;
         let staging = self.0.target().join("openrc-install");
@@ -825,6 +831,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
     /// fs, brings up the network and spawns the per-VT shells, so those would
     /// only fight it. The full OpenRC userland is still present, so an operator
     /// can `rc-update add <svc> default` to wire real services later.
+    #[allow(dead_code)]
     fn install_openrc(&self, rootfs: &Path, musl: &Path) -> bool {
         let staging = match self.openrc(musl) {
             Some(s) => s,
@@ -1739,6 +1746,112 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             .join(format!("{}-linux-musl-strip", self.0.name()))
     }
 
+    /// Rust target triple for the userspace musl build of `eclipse-init`.
+    fn musl_rust_triple(&self) -> &'static str {
+        match self.0 {
+            Arch::X86_64 => "x86_64-unknown-linux-musl",
+            Arch::Aarch64 => "aarch64-unknown-linux-musl",
+            Arch::Riscv64 => "riscv64gc-unknown-linux-musl",
+        }
+    }
+
+    /// Cross-compile the Eclipse-native init (`tools/eclipse-init`, Rust) as a
+    /// static, non-PIE musl binary and return its path. Best-effort: on failure
+    /// the path may not exist and the caller keeps busybox init as PID 1.
+    ///
+    /// Built static + `relocation-model=static` (non-PIE) to match the rest of
+    /// the rootfs (busybox/apk are static non-PIE ET_EXEC), which the Eclipse
+    /// loader handles well.
+    fn eclipse_init(&self, _musl: &Path) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join("eclipse-init");
+        let triple = self.musl_rust_triple();
+        let executable = dir
+            .join("target")
+            .join(triple)
+            .join("release")
+            .join("eclipse-init");
+        let source = dir.join("src").join("main.rs");
+        if executable.is_file() && source.is_file() {
+            if let (Ok(b), Ok(s)) = (fs::metadata(&executable), fs::metadata(&source)) {
+                if let (Ok(bm), Ok(sm)) = (b.modified(), s.modified()) {
+                    if bm >= sm {
+                        return executable;
+                    }
+                }
+            }
+        }
+
+        println!("Compiling eclipse-init (Rust, {triple})...");
+        // Make sure the userspace musl target is available (best-effort).
+        let _ = Ext::new("rustup")
+            .arg("target")
+            .arg("add")
+            .arg(triple)
+            .status();
+
+        let status = Ext::new("cargo")
+            .current_dir(&dir)
+            .arg("build")
+            .arg("--release")
+            .arg("--target")
+            .arg(triple)
+            // Static non-PIE, like busybox/apk in the rootfs.
+            .env("RUSTFLAGS", "-C relocation-model=static")
+            .status();
+        if !status.success() {
+            eprintln!("warning: eclipse-init build failed; busybox init remains PID 1");
+        }
+        executable
+    }
+
+    /// Install the Eclipse-native init as the default PID 1: copy the binary to
+    /// `/sbin/eclipse-init`, repoint `/sbin/init` at it (overriding the busybox
+    /// fallback laid down by `install_busybox_init`), and seed
+    /// `/etc/eclipse/services/` with a documented example. Returns `true` on
+    /// success, `false` (leaving busybox init as PID 1) if the build is absent.
+    fn install_eclipse_init(&self, rootfs: &Path, musl: &Path) -> bool {
+        let bin = self.eclipse_init(musl);
+        if !bin.is_file() {
+            eprintln!("warning: eclipse-init not built; keeping busybox init as PID 1");
+            return false;
+        }
+        let sbin = rootfs.join("sbin");
+        let _ = fs::create_dir_all(&sbin);
+        let dst = sbin.join("eclipse-init");
+        let _ = fs::remove_file(&dst);
+        fs::copy(&bin, &dst).unwrap();
+
+        // /sbin/init -> eclipse-init (the kernel boots INIT=/sbin/init).
+        let init_link = sbin.join("init");
+        let _ = fs::remove_file(&init_link);
+        #[cfg(unix)]
+        {
+            let _ = unix::fs::symlink("eclipse-init", &init_link);
+        }
+
+        // Service directory + a documented (inert) example. Eclipse's kernel
+        // already mounts root, brings up the network and spawns the per-VT
+        // shells, so there are no required services by default — drop
+        // `*.service` files here to launch your own programs/daemons.
+        let svc_dir = rootfs.join("etc").join("eclipse").join("services");
+        let _ = fs::create_dir_all(&svc_dir);
+        fs::write(
+            svc_dir.join("example.service.txt"),
+            b"# Eclipse init service file. Copy to '<name>.service' to enable.\n\
+              #\n\
+              # exec  = /usr/sbin/mydaemon --foreground   (required; argv, space-split)\n\
+              # type  = respawn                            (respawn | oneshot; default oneshot)\n\
+              # after = othersvc                           (optional; space-separated deps)\n\
+              #\n\
+              # 'oneshot' runs to completion in order during boot; 'respawn' is\n\
+              # supervised and restarted if it exits. No shell is involved.\n",
+        )
+        .unwrap();
+
+        println!("Installed eclipse-init as the default init system (PID 1).");
+        true
+    }
+
     /// 从安装目录拷贝所有 so 和 so 链接到 rootfs
     fn put_libs(&self, musl: impl AsRef<Path>, dir: impl AsRef<Path>) {
         let lib = self.path().join("lib");
@@ -1771,6 +1884,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
 
 /// True if a host build tool can be executed (probed via `--version`). Used to
 /// gate the best-effort OpenRC build on meson / ninja being installed.
+#[allow(dead_code)]
 fn host_tool_exists(name: &str) -> bool {
     std::process::Command::new(name)
         .arg("--version")
@@ -1783,6 +1897,7 @@ fn host_tool_exists(name: &str) -> bool {
 /// preserving symlinks and unix permissions. Used to mirror the staged OpenRC
 /// `DESTDIR` tree into the rootfs without clobbering sibling files already
 /// present there (unlike `dircpy`, which expects a fresh destination).
+#[allow(dead_code)]
 fn copy_tree(src: &Path, dst: &Path) {
     let md = match fs::symlink_metadata(src) {
         Ok(m) => m,
