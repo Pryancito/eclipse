@@ -258,6 +258,15 @@ impl INode for EventDev {
                 dst[n - 1] = 0;
                 Ok(n)
             }
+            // EVIOCGPHYS / EVIOCGUNIQ: physical location / unique id strings.
+            // We have neither, but libevdev (which libinput uses) treats any
+            // ioctl error here OTHER than ENOENT as fatal and aborts the whole
+            // device setup — so returning ENOTTY made libinput reject every
+            // device. Return an empty (NUL-terminated) string instead.
+            0x07 | 0x08 => {
+                unsafe { *(data as *mut u8) = 0 };
+                Ok(1)
+            }
             // EVIOCGPROP / EVIOCGKEY / EVIOCGLED / EVIOCGSND / EVIOCGSW: report
             // an all-zero state (no properties, nothing currently pressed/lit).
             0x09 | 0x18 | 0x19 | 0x1a | 0x1b => {
