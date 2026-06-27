@@ -285,6 +285,16 @@ impl INode for EventDev {
     }
 
     fn metadata(&self) -> Result<Metadata> {
+        // TEMP diag: libinput fstat()s the device fd right after open and
+        // rejects it (closing without any ioctl) if it is not S_IFCHR. Logging
+        // this shows whether libinput reaches the fstat step on the passed fd
+        // and that we report a char device.
+        log::error!(
+            "[input] pid={} evdev event{} metadata() -> CharDevice rdev=13:{}",
+            current_pid_for_diag(),
+            self.id,
+            EVENT_DEV_MINOR_BASE + self.id
+        );
         Ok(Metadata {
             dev: 1,
             inode: self.inode_id,
