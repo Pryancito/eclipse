@@ -106,6 +106,17 @@ lazy_static! {
 }
 static MEMFD_SEQ: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+lazy_static! {
+    /// Writable ramfs exposed as the `/dev/shm` directory so POSIX `shm_open()`
+    /// can create files there (e.g. wlroots' xkb keymap fd). It is inserted
+    /// straight into devfs (not mounted via MountFS): `/dev/*` lookups take the
+    /// `lookup_virtual_fs` fast path, which resolves against the raw `DEVFS_ROOT`
+    /// and never consults the MountFS overlay — so a RamFS *mounted* on a devfs
+    /// `shm` dir would be invisible. Kept alive for the kernel's lifetime so the
+    /// inodes' `Weak<RamFS>` back-refs always upgrade.
+    static ref DEV_SHM_FS: Arc<RamFS> = RamFS::new();
+}
+
 /// Create an anonymous in-RAM file for `memfd_create(2)`. The inode lives in a
 /// hidden ramfs and is immediately unlinked, so it has no name in any mounted
 /// namespace and is freed once the last fd referring to it closes — while
@@ -377,10 +388,14 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     // `shm_open(name, O_CREAT, ...)` (used by wlroots to allocate the keyboard
     // keymap fd, and by any program using POSIX shm) creates files under
     // `/dev/shm/`. Backing it with a single RandomINode made every such create
-    // fail with ENOTDIR ("cannot set keymap"). Add it as a directory here and
-    // mount a RamFS on it once devfs is mounted (below).
-    if let Err(e) = devfs_root.add_dir("shm") {
-        warn!("failed to mkdir /dev/shm: {:?}", e);
+    // fail with ENOTDIR, and a plain `add_dir` gives a *read-only* devfs dir
+    // (create → ENOSYS, "cannot set keymap"). Expose a real writable RamFS by
+    // inserting its root inode directly as the `shm` entry: `/dev/shm/<name>`
+    // lookups then traverse into the RamFS where create/write work. (Mounting
+    // via MountFS does not work here because `/dev/*` resolution uses the
+    // `lookup_virtual_fs` fast path against the raw `DEVFS_ROOT`.)
+    if let Err(e) = devfs_root.add("shm", DEV_SHM_FS.root_inode()) {
+        warn!("failed to mknod /dev/shm: {:?}", e);
     }
     devfs_root
         .add("tty", stdio::STDIN.clone())
@@ -621,35 +636,17 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         warn!("[boot] create_root_fs: mount /dev failed: {:?}", e);
     } else {
         register_mount("devfs", "/dev", "devtmpfs", "rw,nosuid", boot_mount_state());
-        // Mount a writable RamFS on the /dev/shm directory so POSIX shm_open()
-        // can create files there (e.g. wlroots' xkb keymap fd).
-        //
-        // The shm node must be reached *through* the devfs mount layer, not via
-        // `dev` (which wraps the rootfs `/dev` placeholder and lives in the root
-        // MountFS). `dev.mount(devfs)` registered devfs in the root MountFS, but
-        // a RamFS mounted via `dev.find(...)` would register in that same root
-        // layer — while path resolution of `/dev/shm` crosses into the devfs
-        // MountFS and consults *its* mountpoint table, which would still see the
-        // read-only devfs directory (every create → ENOSYS / "cannot set
-        // keymap"). Re-resolving `dev` from `root` crosses the mountpoint and
-        // yields the devfs-layer shm inode, so the mount lands where lookups
-        // look.
-        match root.find(true, "dev").and_then(|d| d.find(true, "shm")) {
-            Ok(shm) => {
-                if let Err(e) = shm.mount(RamFS::new()) {
-                    warn!("[boot] create_root_fs: mount /dev/shm failed: {:?}", e);
-                } else {
-                    register_mount(
-                        "tmpfs",
-                        "/dev/shm",
-                        "tmpfs",
-                        "rw,nosuid,nodev",
-                        boot_mount_state(),
-                    );
-                }
-            }
-            Err(e) => warn!("[boot] create_root_fs: /dev/shm lookup failed: {:?}", e),
-        }
+        // `/dev/shm` is served by a RamFS inserted directly into devfs (see the
+        // `add("shm", ...)` above); it is not a MountFS mount, because `/dev/*`
+        // lookups bypass MountFS via the `lookup_virtual_fs` fast path. Register
+        // it in the mount table only so `/proc/mounts` reflects reality.
+        register_mount(
+            "tmpfs",
+            "/dev/shm",
+            "tmpfs",
+            "rw,nosuid,nodev",
+            boot_mount_state(),
+        );
     }
 
     // mount RamFS at /tmp
