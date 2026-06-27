@@ -39,7 +39,10 @@ pub struct EventDev {
 impl TimedInputEvent {
     pub fn from(e: &InputEvent) -> Self {
         TimedInputEvent {
-            time: TimeVal::now(),
+            // evdev timestamps must be CLOCK_MONOTONIC (libinput sets that via
+            // EVIOCSCLOCKID and times its filters against it); the wall clock
+            // would desync libinput's button-debounce/tap/scroll timers.
+            time: TimeVal::now_monotonic(),
             event_type: e.event_type,
             code: e.code,
             value: e.value,
