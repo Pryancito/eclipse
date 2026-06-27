@@ -143,7 +143,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                         primary_shell = Some(proc);
                     }
                 }
-                // Optionally run INIT as PID 1 (default /sbin/init -> openrc-init,
+                // Optionally run INIT as PID 1 (default /sbin/init -> eclipse-init,
                 // busybox init fallback), if it exists. The shells already did
                 // the boot work, so don't repeat.
                 let init = zcore_loader::linux::run_init_if_present(

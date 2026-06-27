@@ -170,7 +170,7 @@ pub fn mount_fs(
     // /sys, the writable dev/run/tmp trees). A real mount here is unnecessary
     // and would shadow the live procfs, so acknowledge the request as a
     // successful no-op — and record it in /proc/mounts — instead of failing
-    // with ENODEV. This is what lets OpenRC's sysinit `mount -t proc proc /proc`
+    // with ENODEV. This is what lets init's `mount -t proc proc /proc`
     // (and the other pseudo-fs mounts) succeed quietly rather than logging
     // "mounting proc on /proc failed: No such device".
     if is_virtual_fstype(fstype) {
