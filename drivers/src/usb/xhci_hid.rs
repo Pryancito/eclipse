@@ -2137,7 +2137,11 @@ impl XhciInner {
                     lis.trigger(InputEvent {
                         event_type: InputEventType::RelAxis,
                         code: REL_Y,
-                        value: -dy,
+                        // USB HID reports Y as down-positive, exactly the evdev
+                        // REL_Y convention libinput expects — emit as-is. (The
+                        // earlier `-dy` was copied from the PS/2 driver, where
+                        // +Y means up; under libinput it inverted the axis.)
+                        value: dy,
                     });
                 }
                 if h.report_len >= 4 {
