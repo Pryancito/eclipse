@@ -453,19 +453,25 @@ impl LinuxProcess {
     /// `Arc`, like `fork`), bound to virtual terminal `vt`. Used to spawn the
     /// extra per-VT shells without re-scanning disks / re-mounting.
     pub fn with_root(root_inode: Arc<dyn INode>, vt: usize) -> Self {
+        // fd 0/1/2 are the process's controlling terminal: the per-VT console
+        // device node `/dev/tty{vt+1}`. Naming the path after the real device
+        // node — rather than `/dev/stdin`, which has no devfs entry — lets
+        // `/proc/self/fd/N` resolve to a node `stat()` can find. musl's
+        // `ttyname()` reads that symlink and then requires `stat(path)` and
+        // `fstat(fd)` to report the same (st_dev, st_ino); both resolve to the
+        // same `Stdin`/`Stdout` inode, so they match and `isatty()`/`ttyname()`
+        // (and the `tty` command) report the terminal instead of failing with
+        // ENOTTY ("not a tty").
+        let tty_path = alloc::format!("/dev/tty{}", vt + 1);
         let stdin = File::new(
             crate::fs::stdio::vt_stdin(vt),
             OpenFlags::RDONLY,
-            String::from("/dev/stdin"),
+            tty_path.clone(),
         ) as Arc<dyn FileLike>;
         let stdout_dev = crate::fs::stdio::vt_stdout(vt);
-        let stdout = File::new(
-            stdout_dev.clone(),
-            OpenFlags::WRONLY,
-            String::from("/dev/stdout"),
-        ) as Arc<dyn FileLike>;
-        let stderr = File::new(stdout_dev, OpenFlags::WRONLY, String::from("/dev/stderr"))
+        let stdout = File::new(stdout_dev.clone(), OpenFlags::WRONLY, tty_path.clone())
             as Arc<dyn FileLike>;
+        let stderr = File::new(stdout_dev, OpenFlags::WRONLY, tty_path) as Arc<dyn FileLike>;
         let mut files = HashMap::new();
         files.insert(0.into(), stdin);
         files.insert(1.into(), stdout);
