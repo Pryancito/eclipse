@@ -256,10 +256,11 @@ impl Syscall<'_> {
             None => inode,
         };
         let abs_path = proc.get_absolute_path(dir_fd, path)?;
-        // TEMP diag: trace opens of input device nodes so dmesg shows whether
+        // TEMP diag: trace opens of input device *nodes* so dmesg shows whether
         // libinput/seatd ever opens /dev/input/eventN (vs. filtering it out in
-        // libinput's device_added before the open).
-        if abs_path.contains("input/event") || abs_path.contains("input/mice") {
+        // libinput's device_added before the open). Restricted to /dev/input so
+        // it does not also match the /sys/class/input/*/uevent reads.
+        if abs_path.starts_with("/dev/input/") {
             log::error!("[input] open {} flags={:#x}", abs_path, flags.bits());
         }
         let file = File::new(inode, flags, abs_path);

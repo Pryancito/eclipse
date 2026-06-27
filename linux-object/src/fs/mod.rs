@@ -636,6 +636,41 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     // mount RamFS at /run (essential for DHCP clients and other daemons)
     warn!("[boot] create_root_fs: mount /run");
     let run_ramfs = RamFS::new();
+    // Emulate udevd's database so libudev/libinput treat the input devices as
+    // initialized and seat-assigned. With no udevd running there is no
+    // /run/udev/data, and libudev's enumerate (MATCH_INITIALIZED_COMPAT)
+    // excludes every device that has a /dev node but lacks an "initialized"
+    // (`I:`) marker — which is why labwc's libinput backend found zero input
+    // devices despite /sys/class/input being fully populated. Write the same
+    // records udevd would: the `I:` initialized line plus the `seat` tag, one
+    // per `/dev/input/eventN` (char major 13, minor 64+N).
+    {
+        use rcore_fs::vfs::FileType;
+        let n_input = drivers::all_input().as_vec().len();
+        if n_input > 0 {
+            let run_root = run_ramfs.root_inode();
+            let data_dir = run_root
+                .create("udev", FileType::Dir, 0o755)
+                .and_then(|udev| udev.create("data", FileType::Dir, 0o755));
+            if let Ok(data_dir) = data_dir {
+                // Matches EVDEV_MAJOR / EVDEV_EVENT_MINOR_BASE in `sysfs.rs`.
+                const EVDEV_MAJOR: usize = 13;
+                const EVDEV_EVENT_MINOR_BASE: usize = 64;
+                let body = b"I:1\nE:ID_INPUT=1\nG:seat\nQ:seat\nV:1\n";
+                for id in 0..n_input {
+                    let name =
+                        alloc::format!("c{}:{}", EVDEV_MAJOR, EVDEV_EVENT_MINOR_BASE + id);
+                    match data_dir.create(&name, FileType::File, 0o644) {
+                        Ok(f) => {
+                            let _ = f.write_at(0, body);
+                        }
+                        Err(e) => warn!("[boot] udev db {}: {:?}", name, e),
+                    }
+                }
+                warn!("[boot] wrote {} udev db record(s) for input devices", n_input);
+            }
+        }
+    }
     let run = resolve_mount_dir(&rootfs, &root, root_fstype, "run", 0o755);
     if let Err(e) = run.mount(run_ramfs) {
         warn!("[boot] create_root_fs: mount /run failed: {:?}", e);
