@@ -178,10 +178,42 @@ fn user_copy<T>(r: core::result::Result<T, UserError>) -> Result<T> {
     r.map_err(|_| FsError::InvalidParam)
 }
 
+/// TEMP diag: current pid, to attribute VT ioctls to seatd vs labwc.
+fn diag_pid() -> u64 {
+    use zircon_object::object::KernelObject;
+    kernel_hal::thread::get_current_thread()
+        .and_then(|arc| arc.downcast::<Thread>().ok())
+        .map(|t| t.proc().id())
+        .unwrap_or(0)
+}
+
 /// Shared TTY/console ioctl handling for every VT-backed device node
 /// (`/dev/tty`, `/dev/tty[0-9]`, `/dev/console`, stdin and stdout). `vt` is the
 /// virtual terminal the file refers to.
 fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
+    // TEMP diag: trace seatd's VT/console dance, which decides whether the
+    // session is active (and thus whether it hands input devices to labwc).
+    if matches!(
+        cmd as usize,
+        VT_GETSTATE
+            | VT_SETMODE
+            | VT_GETMODE
+            | VT_ACTIVATE
+            | VT_WAITACTIVE
+            | VT_OPENQRY
+            | VT_RELDISP
+            | KDSETMODE
+            | KDSKBMODE
+    ) {
+        log::error!(
+            "[input] pid={} tty_ioctl vt={} cmd={:#x} data={:#x} active_vt={}",
+            diag_pid(),
+            vt,
+            cmd,
+            data,
+            kernel_hal::console::active_vt()
+        );
+    }
     match cmd as usize {
         TIOCGWINSZ => {
             user_copy(UserOutPtr::<ConsoleWinSize>::from(data).write(console::console_win_size()))?;
