@@ -82,6 +82,17 @@ const DRM_IOCTL_MODE_GETPROPERTY: u32 = 0xC04064AA;
 // prop_id; __u32 connector_id; }` (16 bytes).
 const DRM_IOCTL_MODE_SETPROPERTY: u32 = 0xC01064AB;
 
+// Legacy cursor ioctls (`drmModeSetCursor`/`drmModeMoveCursor`/`...2`). On the
+// software-KMS / pixman path there is no hardware cursor plane, so wlroots is
+// told to use a software cursor (WLR_NO_HARDWARE_CURSORS=1) and normally never
+// issues these. But if that env var is missing, wlroots' legacy backend calls
+// drmModeSetCursor during a commit; returning an error (ENOTTY) failed the
+// whole frame commit ("Failed to commit frame") and left the screen black.
+// Accept them as no-ops so rendering proceeds regardless (the pointer is then
+// only visible when the software-cursor path is used).
+const DRM_IOCTL_MODE_CURSOR: u32 = 0xC01C64A3;
+const DRM_IOCTL_MODE_CURSOR2: u32 = 0xC02464BB;
+
 // Core (non-MODE) vblank wait.
 const DRM_IOCTL_WAIT_VBLANK: u32 = 0xC018643A;
 // Query an existing framebuffer object.
@@ -805,6 +816,12 @@ impl INode for DrmDev {
                     prop_id,
                     value
                 );
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_CURSOR | DRM_IOCTL_MODE_CURSOR2 => {
+                // No hardware cursor plane: accept set/move/hide as a no-op so a
+                // legacy commit that touches the cursor still succeeds. The
+                // visible pointer comes from wlroots' software cursor.
                 Ok(0)
             }
             DRM_IOCTL_GEM_CLOSE => {
