@@ -47,6 +47,11 @@ struct UnixInner {
     peer: Option<Weak<Mutex<UnixInner>>>,
     /// Inbound data buffer
     buffer: VecDeque<u8>,
+    /// Monotonic total bytes ever appended to `buffer` (for SCM_RIGHTS fd/byte
+    /// stream synchronization).
+    total_written: usize,
+    /// Monotonic total bytes ever consumed from `buffer`.
+    total_read: usize,
     eventbus: EventBus,
     /// True after listen() is called
     is_listening: bool,
@@ -62,10 +67,14 @@ struct UnixInner {
     /// `SO_PEERCRED` (seatd reads it to authorize a Wayland client). `0` until
     /// set by `sys_socket`.
     owner_pid: i32,
-    /// File descriptors handed to us by the peer via `SCM_RIGHTS`, one batch per
-    /// `sendmsg`, delivered FIFO to our `recvmsg`. This is how seatd passes the
-    /// opened DRM/input device fd to a Wayland compositor.
-    pending_fds: VecDeque<Vec<Arc<dyn FileLike>>>,
+    /// File descriptors handed to us by the peer via `SCM_RIGHTS`. Each batch is
+    /// tagged with the `total_written` stream offset at which it was attached
+    /// (the end of the carrying message's bytes), so a `recvmsg` only receives
+    /// the fds once it has consumed the bytes they accompanied. Without this
+    /// byte/fd synchronization a `recvmsg` reading an fd-less message (e.g.
+    /// seatd's ENABLE_SEAT event) would steal the fd queued for a later
+    /// OPEN_DEVICE reply, so the compositor's device fd arrives mismatched.
+    pending_fds: VecDeque<(usize, Vec<Arc<dyn FileLike>>)>,
 }
 
 impl Default for UnixSocketState {
@@ -77,6 +86,8 @@ impl Default for UnixSocketState {
                 path: String::new(),
                 peer: None,
                 buffer: VecDeque::new(),
+                total_written: 0,
+                total_read: 0,
                 eventbus: EventBus::default(),
                 is_listening: false,
                 accept_queue: VecDeque::new(),
@@ -211,6 +222,7 @@ impl Socket for UnixSocketState {
                 for d in data[..len].iter_mut() {
                     *d = inner.buffer.pop_front().unwrap();
                 }
+                inner.total_read += len;
                 if inner.buffer.is_empty() {
                     inner.eventbus.clear(Event::READABLE);
                 }
@@ -255,6 +267,7 @@ impl Socket for UnixSocketState {
                     return Err(LxError::EPIPE);
                 }
                 pi.buffer.extend(data.iter().copied());
+                pi.total_written += data.len();
                 pi.eventbus.set(Event::READABLE);
                 Ok(data.len())
             } else {
@@ -419,7 +432,13 @@ impl Socket for UnixSocketState {
         };
         match peer {
             Some(peer) => {
-                peer.lock().pending_fds.push_back(fds);
+                let mut pi = peer.lock();
+                // Tag the batch with the current end-of-stream offset. `write`
+                // (which appended this message's bytes) ran first in sendmsg, so
+                // `total_written` is the offset just past those bytes; the peer
+                // receives the fds only once its reads have consumed up to here.
+                let offset = pi.total_written;
+                pi.pending_fds.push_back((offset, fds));
                 Ok(0)
             }
             None => Err(LxError::ENOTCONN),
@@ -431,13 +450,21 @@ impl Socket for UnixSocketState {
             return Vec::new();
         }
         let mut inner = self.inner.lock();
-        match inner.pending_fds.pop_front() {
-            Some(mut batch) => {
-                batch.truncate(max);
-                batch
+        let mut out: Vec<Arc<dyn FileLike>> = Vec::new();
+        // Deliver only fd batches whose accompanying bytes have already been
+        // read, and only whole batches that fit in the caller's fd budget.
+        loop {
+            let take = match inner.pending_fds.front() {
+                Some((offset, batch)) => *offset <= inner.total_read && out.len() + batch.len() <= max,
+                None => false,
+            };
+            if !take {
+                break;
             }
-            None => Vec::new(),
+            let (_, batch) = inner.pending_fds.pop_front().unwrap();
+            out.extend(batch);
         }
+        out
     }
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> SysResult {
