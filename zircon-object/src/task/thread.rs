@@ -312,8 +312,29 @@ impl Thread {
         name: &str,
         ext: impl Any + Send + Sync,
     ) -> ZxResult<Arc<Self>> {
+        Self::create_with_ext_id(proc, name, ext, None)
+    }
+
+    /// Create a new thread with extension info and an optional fixed KoID.
+    ///
+    /// When `id` is `Some`, the thread is created with that exact KoID instead
+    /// of a freshly allocated one. This is used to give a process's *leader*
+    /// (main) thread a TID equal to the process PID, matching Linux — where the
+    /// thread-group leader's TID always equals the TGID. Callers must guarantee
+    /// the id is unique among the process's threads (it is, since only the
+    /// leader reuses the PID and the PID is allocated to nothing else).
+    pub fn create_with_ext_id(
+        proc: &Arc<Process>,
+        name: &str,
+        ext: impl Any + Send + Sync,
+        id: Option<KoID>,
+    ) -> ZxResult<Arc<Self>> {
+        let base = match id {
+            Some(id) => KObjectBase::with_id(id, name, Default::default()),
+            None => KObjectBase::with_name(name),
+        };
         let thread = Arc::new(Thread {
-            base: KObjectBase::with_name(name),
+            base,
             _counter: CountHelper::new(),
             proc: proc.clone(),
             ext: Box::new(ext),
