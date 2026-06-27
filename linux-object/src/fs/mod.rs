@@ -623,7 +623,18 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         register_mount("devfs", "/dev", "devtmpfs", "rw,nosuid", boot_mount_state());
         // Mount a writable RamFS on the /dev/shm directory so POSIX shm_open()
         // can create files there (e.g. wlroots' xkb keymap fd).
-        match dev.find(true, "shm") {
+        //
+        // The shm node must be reached *through* the devfs mount layer, not via
+        // `dev` (which wraps the rootfs `/dev` placeholder and lives in the root
+        // MountFS). `dev.mount(devfs)` registered devfs in the root MountFS, but
+        // a RamFS mounted via `dev.find(...)` would register in that same root
+        // layer — while path resolution of `/dev/shm` crosses into the devfs
+        // MountFS and consults *its* mountpoint table, which would still see the
+        // read-only devfs directory (every create → ENOSYS / "cannot set
+        // keymap"). Re-resolving `dev` from `root` crosses the mountpoint and
+        // yields the devfs-layer shm inode, so the mount lands where lookups
+        // look.
+        match root.find(true, "dev").and_then(|d| d.find(true, "shm")) {
             Ok(shm) => {
                 if let Err(e) = shm.mount(RamFS::new()) {
                     warn!("[boot] create_root_fs: mount /dev/shm failed: {:?}", e);

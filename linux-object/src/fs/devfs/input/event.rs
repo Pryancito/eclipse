@@ -15,16 +15,6 @@ const BUF_CAPACITY: usize = 64;
 
 const EVENT_DEV_MINOR_BASE: usize = 0x40;
 
-/// TEMP diag: current process id, to attribute evdev ioctls to seatd vs labwc.
-fn current_pid_for_diag() -> u64 {
-    use zircon_object::object::KernelObject;
-    use zircon_object::task::Thread;
-    kernel_hal::thread::get_current_thread()
-        .and_then(|arc| arc.downcast::<Thread>().ok())
-        .map(|t| t.proc().id())
-        .unwrap_or(0)
-}
-
 /// The event structure itself
 #[repr(C)]
 struct TimedInputEvent {
@@ -203,17 +193,6 @@ impl INode for EventDev {
         if typ != 'E' as u32 {
             return Err(FsError::NotSupported);
         }
-        // TEMP diag: trace libinput's evdev probe so dmesg shows whether it
-        // ever opens and queries each /dev/input/eventN (vs. never finding it
-        // via udev enumeration).
-        log::error!(
-            "[input] pid={} evdev event{} EVIOC nr={:#x} size={} data={:#x}",
-            current_pid_for_diag(),
-            self.id,
-            nr,
-            size,
-            data
-        );
         // EVIOCSCLOCKID / EVIOCGRAB / EVIOCREVOKE pass their argument by value
         // and never dereference the pointer; in particular seatd issues
         // EVIOCREVOKE with a NULL argument (`data == 0`) when it revokes a
@@ -294,16 +273,6 @@ impl INode for EventDev {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        // TEMP diag: libinput fstat()s the device fd right after open and
-        // rejects it (closing without any ioctl) if it is not S_IFCHR. Logging
-        // this shows whether libinput reaches the fstat step on the passed fd
-        // and that we report a char device.
-        log::error!(
-            "[input] pid={} evdev event{} metadata() -> CharDevice rdev=13:{}",
-            current_pid_for_diag(),
-            self.id,
-            EVENT_DEV_MINOR_BASE + self.id
-        );
         Ok(Metadata {
             dev: 1,
             inode: self.inode_id,
