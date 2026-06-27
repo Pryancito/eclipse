@@ -1654,9 +1654,14 @@ impl INode for Stdout {
 
     /// Get metadata of the INode
     fn metadata(&self) -> Result<Metadata> {
+        // Same (dev, inode) as `Stdin`: a VT's read and write halves are one
+        // terminal device, so `fstat(stdout)` must match `stat("/dev/ttyN")`
+        // (which resolves to the `Stdin` inode) for musl's `ttyname()` on fd
+        // 1/2 to succeed — exactly as on a real console where fd 0/1/2 share
+        // one `/dev/ttyN` inode.
         Ok(Metadata {
             dev: 1,
-            inode: 13,
+            inode: 12,
             size: 0,
             blk_size: 0,
             blocks: 0,
