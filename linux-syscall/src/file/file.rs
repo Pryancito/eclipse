@@ -550,8 +550,19 @@ impl Syscall<'_> {
         // DRM PRIME (dma-buf) export/import and CREATE_LEASE — need process fd
         // access, so they are handled here rather than in the DRM inode's
         // io_control.
-        if request == 0xC00C_642D || request == 0xC00C_642E || request == 0xC018_64C6 {
-            if let Some(ret) = self.sys_drm_prime(&file_like, request, arg1)? {
+        //
+        // libdrm defines these request numbers via `_IOWR(...)`, whose value
+        // has bit 31 set (direction `_IOC_READ|_IOC_WRITE` == 0xC0...) and is
+        // typed `int`. Passed to the variadic `ioctl(int, unsigned long, ...)`
+        // it sign-extends to 64 bits — e.g. CREATE_LEASE arrives as
+        // 0xFFFF_FFFF_C018_64C6, not 0xC018_64C6. The inode-level `io_control`
+        // path never saw this because it takes `cmd: u32` (truncated), but here
+        // `request` is the full 64-bit value, so mask to 32 bits before
+        // matching. Without this the dispatch misses and the ioctl falls
+        // through to ENOTTY ("Not a tty").
+        let cmd = request as u32 as usize;
+        if cmd == 0xC00C_642D || cmd == 0xC00C_642E || cmd == 0xC018_64C6 {
+            if let Some(ret) = self.sys_drm_prime(&file_like, cmd, arg1)? {
                 kernel_hal::klog_info!(
                     "ioctl LEAVE fd={:?} request={:#x} -> PRIME ok",
                     fd,
