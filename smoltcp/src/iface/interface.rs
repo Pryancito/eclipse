@@ -780,14 +780,20 @@ where
                 (Err(Error::Exhausted), _) => break,   // nowhere to transmit
                 (Ok(()), Err(Error::Exhausted)) => (), // nothing to transmit
                 (Err(Error::Unaddressable), _) => {
-                    // `NeighborCache` already takes care of rate limiting the neighbor discovery
-                    // requests from the socket. However, without an additional rate limiting
-                    // mechanism, we would spin on every socket that has yet to discover its
-                    // neighboor.
+                    // This socket's next-hop neighbor is not yet resolved (an ARP /
+                    // Neighbor Solicitation was just queued). Mark the socket as
+                    // waiting — `neighbor_missing` + `egress_permitted` rate-limit
+                    // its retries (DISCOVERY_SILENT_TIME), so we will not spin on it.
+                    //
+                    // Do NOT `break` here: that would stop servicing every *other*
+                    // socket later in the set for this poll. In a dual-stack setup an
+                    // unresolved IPv6 gateway would then starve egress for IPv4 TCP/UDP
+                    // sockets (and vice-versa) — head-of-line blocking across families.
+                    // `continue` lets the remaining sockets transmit.
                     socket
                         .meta_mut()
                         .neighbor_missing(cx.now, neighbor_addr.expect("non-IP response packet"));
-                    break;
+                    continue;
                 }
                 (Err(err), _) | (_, Err(err)) => {
                     net_debug!(
