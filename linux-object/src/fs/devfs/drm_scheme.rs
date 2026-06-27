@@ -27,7 +27,12 @@ impl DrmDev {
 
     /// Returns the [`VmObject`] representing the file with given `offset` and `len`.
     pub fn get_vmo(&self, offset: usize, len: usize) -> Result<Arc<VmObject>> {
-        let handle_id = offset as u32;
+        // MAP_DUMB handed userspace a page-aligned fake mmap offset that encodes
+        // the GEM handle in its upper bits (`handle << PAGE_SHIFT`). musl's
+        // `mmap()` rejects a non-page-aligned offset with EINVAL *before* the
+        // syscall, so the cookie must be page-aligned; recover the handle by
+        // shifting it back down.
+        let handle_id = (offset >> 12) as u32;
         if let Some(handle) = drm::get_handle(handle_id) {
             let len = len.min(handle.size);
             Ok(VmObject::new_physical(
@@ -654,7 +659,11 @@ impl INode for DrmDev {
             }
             DRM_IOCTL_MODE_MAP_DUMB => {
                 let map = unsafe { &mut *(data as *mut DrmModeMapDumb) };
-                map.offset = map.handle as u64;
+                // Return a page-aligned fake offset (`handle << PAGE_SHIFT`). The
+                // subsequent mmap of the dumb buffer passes this back as the file
+                // offset; musl's `mmap()` rejects a non-page-aligned offset with
+                // EINVAL, and `get_vmo()` shifts it back to the handle id.
+                map.offset = (map.handle as u64) << 12;
                 Ok(0)
             }
             DRM_IOCTL_MODE_DESTROY_DUMB => {
