@@ -15,6 +15,16 @@ const BUF_CAPACITY: usize = 64;
 
 const EVENT_DEV_MINOR_BASE: usize = 0x40;
 
+/// TEMP diag: current process id, to attribute evdev ioctls to seatd vs labwc.
+fn current_pid_for_diag() -> u64 {
+    use zircon_object::object::KernelObject;
+    use zircon_object::task::Thread;
+    kernel_hal::thread::get_current_thread()
+        .and_then(|arc| arc.downcast::<Thread>().ok())
+        .map(|t| t.proc().id())
+        .unwrap_or(0)
+}
+
 /// The event structure itself
 #[repr(C)]
 struct TimedInputEvent {
@@ -197,7 +207,8 @@ impl INode for EventDev {
         // ever opens and queries each /dev/input/eventN (vs. never finding it
         // via udev enumeration).
         log::error!(
-            "[input] evdev event{} EVIOC nr={:#x} size={} data={:#x}",
+            "[input] pid={} evdev event{} EVIOC nr={:#x} size={} data={:#x}",
+            current_pid_for_diag(),
             self.id,
             nr,
             size,

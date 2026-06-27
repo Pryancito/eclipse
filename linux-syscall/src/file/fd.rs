@@ -261,7 +261,12 @@ impl Syscall<'_> {
         // libinput's device_added before the open). Restricted to /dev/input so
         // it does not also match the /sys/class/input/*/uevent reads.
         if abs_path.starts_with("/dev/input/") {
-            log::error!("[input] open {} flags={:#x}", abs_path, flags.bits());
+            log::error!(
+                "[input] pid={} open {} flags={:#x}",
+                self.zircon_process().id(),
+                abs_path,
+                flags.bits()
+            );
         }
         let file = File::new(inode, flags, abs_path);
         let fd = proc.add_file(file)?;
