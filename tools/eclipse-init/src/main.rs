@@ -337,12 +337,34 @@ fn spawn(argv: &[String]) -> Option<i32> {
             libc::signal(libc::SIGTERM, libc::SIG_DFL);
             libc::signal(libc::SIGINT, libc::SIG_DFL);
             libc::setsid();
+            // Detach the service from the console: its stdin/stdout/stderr go
+            // to /dev/null so service chatter never reaches the screen. init
+            // keeps the real console for its own concise status lines.
+            silence_stdio();
             libc::execve(prog.as_ptr(), p_args.as_ptr(), p_env.as_ptr());
             // execve only returns on failure.
             libc::_exit(127);
         }
     }
     Some(pid)
+}
+
+/// Redirect fds 0/1/2 to `/dev/null` (read-write). Called in the forked child
+/// before `execve`, so the service inherits a silent stdio and never writes to
+/// the console. Async-signal-safe (only `open`/`dup2`/`close`); failures are
+/// ignored — at worst the service keeps the inherited console.
+unsafe fn silence_stdio() {
+    let devnull = b"/dev/null\0";
+    let fd = libc::open(devnull.as_ptr() as *const libc::c_char, libc::O_RDWR);
+    if fd < 0 {
+        return;
+    }
+    libc::dup2(fd, libc::STDIN_FILENO);
+    libc::dup2(fd, libc::STDOUT_FILENO);
+    libc::dup2(fd, libc::STDERR_FILENO);
+    if fd > libc::STDERR_FILENO {
+        libc::close(fd);
+    }
 }
 
 /// The PID 1 main loop: block in `waitpid`, reaping every child. A reaped
