@@ -76,6 +76,11 @@ const DRM_IOCTL_MODE_SETPLANE: u32 = 0xC03064B7;
 const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = 0xC02064B9;
 const DRM_IOCTL_MODE_OBJ_SETPROPERTY: u32 = 0xC01864BA;
 const DRM_IOCTL_MODE_GETPROPERTY: u32 = 0xC04064AA;
+// Legacy connector property setter (`drmModeConnectorSetProperty`), used by
+// wlroots' legacy DRM path to drive the connector DPMS state to "on" during a
+// modeset commit. `struct drm_mode_connector_set_property { __u64 value; __u32
+// prop_id; __u32 connector_id; }` (16 bytes).
+const DRM_IOCTL_MODE_SETPROPERTY: u32 = 0xC01064AB;
 
 // Core (non-MODE) vblank wait.
 const DRM_IOCTL_WAIT_VBLANK: u32 = 0xC018643A;
@@ -782,6 +787,23 @@ impl INode for DrmDev {
                     req.obj_type,
                     req.prop_id,
                     req.value
+                );
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_SETPROPERTY => {
+                // Legacy connector property write — wlroots sets the DPMS
+                // property to "on" as part of committing a modeset. Software
+                // scanout is always powered, so accept and ignore rather than
+                // failing the commit (which left the screen blank with
+                // "Failed to set DPMS property").
+                let value = unsafe { *(data as *const u64) };
+                let (prop_id, connector_id) =
+                    unsafe { (*(data.wrapping_add(8) as *const u32), *(data.wrapping_add(12) as *const u32)) };
+                log::debug!(
+                    "[drm] SETPROPERTY connector={} prop={} val={} (accepted, no-op)",
+                    connector_id,
+                    prop_id,
+                    value
                 );
                 Ok(0)
             }
