@@ -317,7 +317,21 @@ impl Syscall<'_> {
         );
 
         let proc = self.linux_process();
-        let inode = proc.lookup_inode_at(dirfd, path, false)?;
+        // readlink(2) must follow symlinks in *intermediate* path components but
+        // NOT the final one. Resolving the whole path with follow=false breaks
+        // any link whose parent dir is itself reached through a symlink — e.g.
+        // libdrm's readlink("/sys/dev/char/226:0/device/subsystem"), where
+        // `device` is a symlink: a no-follow resolution stops at it and the next
+        // component fails with ENOTDIR. Resolve the parent with follow=true,
+        // then look up the final component without following it.
+        let (dir_path, file_name) = split_path(path);
+        let inode = if file_name.is_empty() || file_name == "." || file_name == ".." {
+            // No trailing component to treat as a link; resolve as-is.
+            proc.lookup_inode_at(dirfd, path, false)?
+        } else {
+            let dir = proc.lookup_inode_at(dirfd, dir_path, true)?;
+            dir.find(file_name).map_err(LxError::from)?
+        };
         if inode.metadata()?.type_ != FileType::SymLink {
             return Err(LxError::EINVAL);
         }
