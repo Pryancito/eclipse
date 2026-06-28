@@ -606,6 +606,13 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # frame'), leaving no visible mouse pointer. Force the software\n\
               # cursor so wlroots composites the pointer into the framebuffer.\n\
               export WLR_NO_HARDWARE_CURSORS=1\n\
+              # Software GL via Mesa (no usable HW 3D). The DRM node reports a\n\
+              # real NVIDIA PCI id, so Mesa would try the hardware nouveau driver\n\
+              # and fail; force the KMS software rasteriser (kms_swrast/llvmpipe)\n\
+              # which renders into dumb buffers. Only used when a GL renderer is\n\
+              # selected (WLR_RENDERER=gles2); pixman ignores Mesa.\n\
+              export GALLIUM_DRIVER=llvmpipe\n\
+              export MESA_LOADER_DRIVER_OVERRIDE=kms_swrast\n\
               # Runtime dir for the Wayland socket (created on demand, mode 0700).\n\
               export XDG_RUNTIME_DIR=/run/user/0\n\
               [ -d \"$XDG_RUNTIME_DIR\" ] || { mkdir -p \"$XDG_RUNTIME_DIR\" && chmod 0700 \"$XDG_RUNTIME_DIR\"; }\n",
