@@ -256,26 +256,31 @@ impl Socket for UnixSocketState {
     // write — append bytes into the peer's inbound buffer
     // -----------------------------------------------------------------------
     fn write(&self, data: &[u8], _sendto_endpoint: Option<Endpoint>) -> SysResult {
-        let inner = self.inner.lock();
-        if inner.write_closed {
+        // Resolve the peer and release our own lock BEFORE taking the peer's, so
+        // two connected ends writing concurrently can't deadlock: holding
+        // self→peer here while the peer's `write` holds peer→self is a classic
+        // AB-BA lock cycle. Because `lock::Mutex` is an IRQ-disabling spinlock,
+        // that cycle hangs the whole machine — which is exactly what happened
+        // when a Wayland client (alacritty) and the compositor (labwc) flooded
+        // their socket bidirectionally. Mirrors `peer_pid`/`send_fds`.
+        let peer = {
+            let inner = self.inner.lock();
+            if inner.write_closed {
+                return Err(LxError::EPIPE);
+            }
+            match &inner.peer {
+                None => return Err(LxError::ENOTCONN),
+                Some(peer_weak) => peer_weak.upgrade().ok_or(LxError::EPIPE)?,
+            }
+        };
+        let mut pi = peer.lock();
+        if pi.read_closed {
             return Err(LxError::EPIPE);
         }
-        if let Some(peer_weak) = &inner.peer {
-            if let Some(peer) = peer_weak.upgrade() {
-                let mut pi = peer.lock();
-                if pi.read_closed {
-                    return Err(LxError::EPIPE);
-                }
-                pi.buffer.extend(data.iter().copied());
-                pi.total_written += data.len();
-                pi.eventbus.set(Event::READABLE);
-                Ok(data.len())
-            } else {
-                Err(LxError::EPIPE)
-            }
-        } else {
-            Err(LxError::ENOTCONN)
-        }
+        pi.buffer.extend(data.iter().copied());
+        pi.total_written += data.len();
+        pi.eventbus.set(Event::READABLE);
+        Ok(data.len())
     }
 
     // -----------------------------------------------------------------------
@@ -369,20 +374,25 @@ impl Socket for UnixSocketState {
     }
 
     fn shutdown(&self, howto: usize) -> SysResult {
-        let mut inner = self.inner.lock();
-        if howto == 0 || howto == 2 {
-            inner.read_closed = true;
-            inner.eventbus.set(Event::READABLE); // wake blocked reader
-        }
-        if howto == 1 || howto == 2 {
-            inner.write_closed = true;
-            if let Some(peer_weak) = &inner.peer {
-                if let Some(peer) = peer_weak.upgrade() {
-                    let mut pi = peer.lock();
-                    pi.peer_closed = true;
-                    pi.eventbus.set(Event::READABLE); // wake blocked reader
-                }
+        // Take the peer ref under our lock but drop our lock before locking the
+        // peer, to avoid the self→peer / peer→self AB-BA deadlock (see `write`).
+        let peer = {
+            let mut inner = self.inner.lock();
+            if howto == 0 || howto == 2 {
+                inner.read_closed = true;
+                inner.eventbus.set(Event::READABLE); // wake blocked reader
             }
+            if howto == 1 || howto == 2 {
+                inner.write_closed = true;
+                inner.peer.as_ref().and_then(|w| w.upgrade())
+            } else {
+                None
+            }
+        };
+        if let Some(peer) = peer {
+            let mut pi = peer.lock();
+            pi.peer_closed = true;
+            pi.eventbus.set(Event::READABLE); // wake blocked reader
         }
         Ok(0)
     }
@@ -397,12 +407,13 @@ impl Socket for UnixSocketState {
     }
 
     fn remote_endpoint(&self) -> Option<Endpoint> {
-        let inner = self.inner.lock();
-        inner
-            .peer
-            .as_ref()?
-            .upgrade()
-            .map(|p| Endpoint::Unix(p.lock().path.clone()))
+        // Drop our lock before taking the peer's (see `write`): holding self→peer
+        // here races AB-BA against a concurrent `write`/`shutdown` on the peer.
+        let peer = {
+            let inner = self.inner.lock();
+            inner.peer.as_ref()?.upgrade()?
+        };
+        Some(Endpoint::Unix(peer.lock().path.clone()))
     }
 
     fn setsockopt(&self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
