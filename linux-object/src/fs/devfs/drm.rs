@@ -122,10 +122,24 @@ pub fn alloc_buffer(size: usize) -> Option<GemHandle> {
     if size == 0 {
         return None;
     }
-    let mut state = DRM_STATE.lock();
-    let id = state.next_handle_id;
 
-    // Allocate contiguous physical memory via VMO
+    // Reserve an id and snapshot the driver under the lock, then RELEASE it.
+    // `DRM_STATE`'s `lock::Mutex` is an IRQ-disabling spinlock, so the heavy
+    // work below must run with it dropped: zeroing a full-screen dumb buffer
+    // (1080p ≈ 8 MiB = 2048 pages) under the lock keeps interrupts off for the
+    // whole memset — starving the timer, scheduler and input — and serializes
+    // every other DRM ioctl behind it. Calling into the driver under the lock
+    // is also a latent deadlock if `import_buffer` ever waits on the GPU.
+    // (Reserving the id unconditionally can leave a gap on failure; handle ids
+    // only need to be unique, so a skipped id is harmless.)
+    let (id, driver) = {
+        let mut state = DRM_STATE.lock();
+        let id = state.next_handle_id;
+        state.next_handle_id += 1;
+        (id, state.drivers.first().cloned())
+    };
+
+    // Allocate contiguous physical memory via VMO (lock released).
     let vmo = VmObject::new_contiguous(pages(size), 12).ok()?;
     let phys_addr = vmo.commit_page(0, MMUFlags::READ).ok()? as u64;
 
@@ -137,13 +151,13 @@ pub fn alloc_buffer(size: usize) -> Option<GemHandle> {
 
     // Tell the driver about the new buffer (if any). Without a driver the dumb
     // buffer is software-only and always succeeds.
-    let accepted = match state.drivers.first().cloned() {
+    let accepted = match driver {
         Some(driver) => driver.import_buffer(handle),
         None => true,
     };
     if accepted {
-        state.next_handle_id += 1;
-        state.handles.push((handle, vmo));
+        // Re-acquire only for the bookkeeping push.
+        DRM_STATE.lock().handles.push((handle, vmo));
         Some(handle)
     } else {
         None
