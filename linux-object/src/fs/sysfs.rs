@@ -833,11 +833,36 @@ impl INode for SysPciDevDirINode {
                 &pci_modalias(&self.vendor, &self.device, &self.class),
                 FileType::File,
             ))),
+            // libdrm's drmParseSubsystemType() readlink()s `<dev>/subsystem`
+            // and takes the basename ("pci") to classify the bus; without it
+            // drmGetDevice2() can't determine the device type.
+            "subsystem" => Ok(Arc::new(Pseudo::new("../../../bus/pci", FileType::SymLink))),
+            "revision" => Ok(Arc::new(Pseudo::new("0x00\n", FileType::File))),
+            "subsystem_vendor" => Ok(Arc::new(Pseudo::new("0x0000\n", FileType::File))),
+            "subsystem_device" => Ok(Arc::new(Pseudo::new("0x0000\n", FileType::File))),
+            // `<dev>/drm/` lists this device's DRM nodes (card0/renderD128);
+            // libdrm's drmGetRenderDeviceNameFromFd() scans it for the render
+            // node. Reached via the card's `device` symlink that points here.
+            "drm" => Ok(Arc::new(SysDrmDeviceDrmDirINode {
+                pci_index: self.index,
+            })),
             _ => Err(FsError::EntryNotFound),
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        let entries = ["vendor", "device", "class", "config", "uevent", "modalias"];
+        let entries = [
+            "vendor",
+            "device",
+            "class",
+            "config",
+            "uevent",
+            "modalias",
+            "subsystem",
+            "revision",
+            "subsystem_vendor",
+            "subsystem_device",
+            "drm",
+        ];
         if id >= entries.len() {
             return Err(FsError::EntryNotFound);
         }
@@ -1027,9 +1052,24 @@ impl INode for SysDrmNodeINode {
                 "../../../class/drm",
                 FileType::SymLink,
             ))),
-            "device" => Ok(Arc::new(SysDrmCardDeviceINode {
-                pci_index: self.pci_index,
-            })),
+            // `<card>/device` must resolve (via realpath) to a PCI-BDF-named
+            // directory so libdrm's drmGetDevice2() can parse the bus info —
+            // otherwise Mesa/wlroots fail with "failed to retrieve device
+            // information" / "Failed to get DRM device". Point it at the real
+            // PCI device node under /sys/devices, which carries
+            // vendor/device/config/subsystem. Both /sys/class/drm/card0 and
+            // /sys/dev/char/226:N are three levels under /sys, so the same
+            // relative target works from either.
+            "device" => {
+                let bdf = get_pci_devices()
+                    .get(self.pci_index)
+                    .map(|d| d.name.clone())
+                    .unwrap_or_else(|| "0000:00:00.0".into());
+                Ok(Arc::new(Pseudo::new(
+                    &format!("../../../devices/pci0000:00/{}", bdf),
+                    FileType::SymLink,
+                )))
+            }
             _ => Err(FsError::EntryNotFound),
         }
     }
@@ -1042,71 +1082,6 @@ impl INode for SysDrmNodeINode {
     }
 }
 
-struct SysDrmCardDeviceINode {
-    pci_index: usize,
-}
-
-impl INode for SysDrmCardDeviceINode {
-    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
-        Ok(0)
-    }
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
-        Err(FsError::NotSupported)
-    }
-    fn poll(&self) -> Result<PollStatus> {
-        Ok(PollStatus {
-            read: true,
-            write: false,
-            error: false,
-        })
-    }
-    fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(23))
-    }
-    fn as_any_ref(&self) -> &dyn Any {
-        self
-    }
-    fn fs(&self) -> Arc<dyn FileSystem> {
-        Arc::new(SysFS)
-    }
-    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
-        match name {
-            "." => {
-                return Ok(Arc::new(SysDrmCardDeviceINode {
-                    pci_index: self.pci_index,
-                }))
-            }
-            ".." => {
-                return Ok(Arc::new(SysDrmNodeINode::card(self.pci_index)));
-            }
-            // `<dev>/device/drm/` lists this device's DRM nodes. libdrm's
-            // drmNodeIsDRM() stat()s the dir; drmGetRenderDeviceNameFromFd()
-            // scans it for a `renderD*` entry to resolve the render node.
-            "drm" => {
-                return Ok(Arc::new(SysDrmDeviceDrmDirINode {
-                    pci_index: self.pci_index,
-                }))
-            }
-            _ => {}
-        }
-        let devs = get_pci_devices();
-        let pci = devs.get(self.pci_index).ok_or(FsError::EntryNotFound)?;
-        match name {
-            "modalias" => Ok(Arc::new(Pseudo::new(
-                &pci_modalias(&pci.vendor, &pci.device, &pci.class),
-                FileType::File,
-            ))),
-            _ => Err(FsError::EntryNotFound),
-        }
-    }
-    fn get_entry(&self, id: usize) -> Result<String> {
-        match id {
-            0 => Ok("drm".into()),
-            1 => Ok("modalias".into()),
-            _ => Err(FsError::EntryNotFound),
-        }
-    }
-}
 
 /// `<pci-dev>/device/drm/` — lists this device's DRM nodes (`card0`,
 /// `renderD128`). libdrm's drmGetRenderDeviceNameFromFd() scans it for the
