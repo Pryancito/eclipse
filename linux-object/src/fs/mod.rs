@@ -1429,8 +1429,14 @@ pub fn split_path(path: &str) -> (&str, &str) {
     (dir_path, file_name)
 }
 
-/// the max depth for following a link
-const FOLLOW_MAX_DEPTH: usize = 1;
+/// Max number of symlinks to follow when resolving a single path. Linux uses
+/// 40 (`MAXSYMLINKS`). It was 1, which is enough for a lone symlink but breaks
+/// any path that chains several — notably the DRM sysfs hierarchy libdrm/Mesa
+/// walk (`/sys/dev/char/226:0/device` -> PCI dir -> `subsystem`/`drm` symlinks).
+/// When the budget ran out, `lookup_follow` left a symlink inode in place and
+/// the next component failed with ENOTDIR ("Failed to get DRM device: Not a
+/// directory").
+const FOLLOW_MAX_DEPTH: usize = 40;
 
 /// Fast path for virtual filesystems mounted at `/proc`, `/sys`, and `/dev`.
 /// Avoids ext2 directory scans on every access (VBox AHCI can stall there).
