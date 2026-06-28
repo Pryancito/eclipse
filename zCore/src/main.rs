@@ -123,6 +123,16 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 "WLR_RENDERER_ALLOW_SOFTWARE=1".into(),
                 "WLR_NO_HARDWARE_CURSORS=1".into(),
                 "WLR_LIBINPUT_NO_DEVICES=1".into(),
+                // Software GL/Vulkan via Mesa (no usable HW 3D engine here). The
+                // DRM device now advertises a real NVIDIA PCI id, so Mesa would
+                // otherwise try to load the hardware `nouveau` driver (whose
+                // ioctls we don't implement) and fail/hang. Force the KMS
+                // software rasteriser (kms_swrast → llvmpipe) instead, which
+                // renders into dumb buffers — exactly our DRM capabilities.
+                // Only takes effect when a GL renderer is selected
+                // (WLR_RENDERER=gles2); the pixman default ignores Mesa.
+                "GALLIUM_DRIVER=llvmpipe".into(),
+                "MESA_LOADER_DRIVER_OVERRIDE=kms_swrast".into(),
             ];
             let rootfs = fs::rootfs();
             // Load hunter's /etc/hunter/{whitelist,blacklist} from the root fs
