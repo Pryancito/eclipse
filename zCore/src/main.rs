@@ -112,6 +112,17 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 // box-drawing/block code points procedurally).
                 "LANG=C.UTF-8".into(),
                 "LC_ALL=C.UTF-8".into(),
+                // wlroots/labwc configuration. Set in the real environment (not
+                // only /etc/profile) so a compositor launched from a *non-login*
+                // shell — which busybox sh does not source /etc/profile for —
+                // still gets them. Without WLR_RENDERER=pixman labwc tries
+                // GLES2/EGL then Vulkan (both fail with no GPU) and exits with
+                // "unable to create renderer". See xtask write_profile for the
+                // rationale of each.
+                "WLR_RENDERER=pixman".into(),
+                "WLR_RENDERER_ALLOW_SOFTWARE=1".into(),
+                "WLR_NO_HARDWARE_CURSORS=1".into(),
+                "WLR_LIBINPUT_NO_DEVICES=1".into(),
             ];
             let rootfs = fs::rootfs();
             // Load hunter's /etc/hunter/{whitelist,blacklist} from the root fs
