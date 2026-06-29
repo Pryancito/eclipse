@@ -83,6 +83,14 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// GPU copy-engine bring-up **Step 4** (`/proc/gpustep4`): ring the doorbell
+    /// with a pushbuffer that binds the copy class (`SET_OBJECT`), exercising the
+    /// full doorbell → PBDMA → GMMU-translated pushbuffer fetch → method-parse
+    /// path. Same non-console auto-targeting. Default: nothing.
+    fn bringup_step4(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Import a buffer allocated by the kernel (DRM core)
     fn import_buffer(&self, _handle: GemHandle) -> bool {
         true
