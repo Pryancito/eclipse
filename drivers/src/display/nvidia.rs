@@ -1167,7 +1167,7 @@ impl DrmScheme for NvidiaGpu {
             let mut g = self.bringup.lock();
             if g.is_none() {
                 // GPU VA base for the packed 2 MiB region (avoids null-VA).
-                *g = GpuBringup::build(0x0020_0000, 0x8000_0000);
+                *g = GpuBringup::build(0x0020_0000, 0x0300_0000);
             }
             match g.as_ref() {
                 Some(b) => s.push_str(&b.dump()),
@@ -1198,7 +1198,7 @@ impl DrmScheme for NvidiaGpu {
 
         let mut g = self.bringup.lock();
         if g.is_none() {
-            *g = GpuBringup::build(0x0020_0000, 0x8000_0000);
+            *g = GpuBringup::build(0x0020_0000, 0x0300_0000);
         }
         let b = match g.as_ref() {
             Some(b) => b,
@@ -1313,7 +1313,7 @@ impl DrmScheme for NvidiaGpu {
 
         let mut g = self.bringup.lock();
         if g.is_none() {
-            *g = GpuBringup::build(0x0020_0000, 0x8000_0000);
+            *g = GpuBringup::build(0x0020_0000, 0x0300_0000);
         }
         let b = match g.as_ref() {
             Some(b) => b,
@@ -1418,7 +1418,7 @@ impl DrmScheme for NvidiaGpu {
 
         let mut g = self.bringup.lock();
         if g.is_none() {
-            *g = GpuBringup::build(0x0020_0000, 0x8000_0000);
+            *g = GpuBringup::build(0x0020_0000, 0x0300_0000);
         }
         let b = match g.as_ref() {
             Some(b) => b,
