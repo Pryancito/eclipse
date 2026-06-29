@@ -320,6 +320,34 @@ impl GpuBringup {
         w32(0x18, inst as u32); // | chan_id, chan_id=0
         w32(0x1c, (inst >> 32) as u32);
     }
+
+    /// Step 4: write a minimal method stream into the pushbuffer — just
+    /// `SET_OBJECT(TURING_DMA_COPY_A=0xC5B5)` on subchannel 4. Returns the dword
+    /// count. Header `(mthd>>2)|(subc<<13)|(count<<16)|(INC=1<<29)`; for
+    /// mthd 0x0, subc 4, count 1 that is 0x20018000. No GPU register touched.
+    fn write_setobject_pushbuffer(&self) -> u32 {
+        let pb = self.pushbuf.vaddr();
+        let w32 = |i: usize, v: u32| unsafe {
+            core::ptr::write_volatile((pb as *mut u32).add(i), v)
+        };
+        w32(0, 0x2001_8000); // INC subc4 mthd 0x000 (SET_OBJECT) count1
+        w32(1, 0x0000_c5b5); // TURING_DMA_COPY_A class
+        2
+    }
+
+    /// Write a GPFIFO launch entry into ring `slot` pointing at pushbuffer GPU
+    /// VA `pb_va` of `n` dwords. entry0 = GET (pb[31:2]); entry1 = GET_HI |
+    /// LENGTH<<10. Verified against clc36f.h NVC36F_GP_ENTRY*.
+    fn write_gpfifo_entry(&self, slot: usize, pb_va: u64, n: u32) {
+        let gp = self.gpfifo.vaddr();
+        let w32 = |i: usize, v: u32| unsafe {
+            core::ptr::write_volatile((gp as *mut u32).add(i), v)
+        };
+        let entry0 = (pb_va as u32) & 0xFFFF_FFFC;
+        let entry1 = ((pb_va >> 32) as u32 & 0xFF) | (n << 10);
+        w32(slot * 2, entry0);
+        w32(slot * 2 + 1, entry1);
+    }
 }
 
 static BOOT_FB_INFO: Mutex<Option<BootFbInfo>> = Mutex::new(None);
@@ -634,6 +662,46 @@ impl NvidiaGpu {
             core::hint::spin_loop();
         }
         (pre, post, ok)
+    }
+
+    /// Idempotently bring the channel to the committed + enabled state (the
+    /// Step 3 end-state): instance block, GMMU flush, runlist commit, doorbell
+    /// and channel enable. Returns whether the runlist commit completed. Safe to
+    /// repeat — used by Step 4+ so each is self-contained across reboots.
+    fn setup_channel(&self, b: &GpuBringup) -> bool {
+        const RUNL_ID: u32 = 0;
+        const CHID: u32 = 0;
+        let bar0 = self._bar0;
+        let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
+        let wr = |off: u32, v: u32| unsafe {
+            core::ptr::write_volatile((bar0 + off as usize) as *mut u32, v)
+        };
+
+        b.write_instance_block();
+        b.write_runlist();
+        let _ = self.gmmu_flush(b.root.paddr() as u64);
+
+        // Doorbell enable.
+        wr(0x00b6_5000, rd(0x00b6_5000) | 0x8000_0000);
+
+        // Runlist commit (2 entries).
+        let base = 0x0000_2b00 + RUNL_ID * 0x10;
+        let runlist_phys = b.runlist.paddr() as u64;
+        wr(base, runlist_phys as u32);
+        wr(base + 4, (runlist_phys >> 32) as u32);
+        wr(base + 8, 2);
+        let mut ok = false;
+        for _ in 0..5_000_000u64 {
+            if rd(base + 0xc) & 0x0000_8000 == 0 {
+                ok = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        // Channel enable.
+        wr(0x0080_0004 + CHID * 8, rd(0x0080_0004 + CHID * 8) | 0x0000_0400);
+        ok
     }
 
     pub fn fill_rect(&self, x: u32, y: u32, w: u32, h: u32, color: u32) {
@@ -1137,6 +1205,93 @@ impl DrmScheme for NvidiaGpu {
             let _ = writeln!(
                 s,
                 "[gpustep3]  TIMEOUT — runlist pending bit never cleared. Inspect /proc/gpudbg; runl_id 0 may be wrong (do NOT re-commit)."
+            );
+        }
+        s
+    }
+
+    /// Step 4: ring the doorbell with a SET_OBJECT(0xC5B5) pushbuffer. Exercises
+    /// doorbell -> PBDMA -> GMMU-translated pushbuffer fetch -> method parse.
+    /// Auto-skips the console GPU. Opt-in (`/proc/gpustep4`).
+    fn bringup_step4(&self) -> String {
+        use core::fmt::Write;
+        const RUNL_ID: u32 = 0;
+        const CHID: u32 = 0;
+
+        let mut s = String::new();
+        if self.drives_boot_display() {
+            let _ = writeln!(s, "[gpustep4] {} SKIPPED — drives the boot console", self.name);
+            return s;
+        }
+
+        let mut g = self.bringup.lock();
+        if g.is_none() {
+            *g = GpuBringup::build(0x0020_0000);
+        }
+        let b = match g.as_ref() {
+            Some(b) => b,
+            None => {
+                let _ = writeln!(s, "[gpustep4] {} alloc_coherent FAILED", self.name);
+                return s;
+            }
+        };
+
+        let _ = writeln!(
+            s,
+            "[gpustep4] === {} ({}) — Step 4: ring doorbell with SET_OBJECT(0xC5B5) ===",
+            self.name, self.gpu_model
+        );
+
+        // Bring the channel live (idempotent; covers a fresh boot).
+        let commit_ok = self.setup_channel(b);
+        let _ = writeln!(s, "[gpustep4]  channel setup: runlist_commit={}", commit_ok);
+
+        // Build the method stream + a GPFIFO launch entry at the current PUT slot.
+        let n = b.write_setobject_pushbuffer();
+        let pb_va = b.va_base + 0x3000;
+        let userd = b.userd.vaddr();
+        let put_before = unsafe { core::ptr::read_volatile((userd + 0x8c) as *const u32) };
+        let get_before = unsafe { core::ptr::read_volatile((userd + 0x88) as *const u32) };
+        let ring_entries = (b.gpfifo.byte_len() / 8) as u32;
+        let slot = (put_before % ring_entries) as usize;
+        b.write_gpfifo_entry(slot, pb_va, n);
+        let target = put_before + 1;
+
+        // Advance GP_PUT, fence, ring the doorbell.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        unsafe { core::ptr::write_volatile((userd + 0x8c) as *mut u32, target) };
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        let token = (RUNL_ID << 16) | CHID;
+        unsafe { core::ptr::write_volatile((self._bar0 + 0x00bb_0090) as *mut u32, token) };
+
+        // Poll GP_GET catching up to GP_PUT.
+        let mut get_after = get_before;
+        let mut advanced = false;
+        for _ in 0..5_000_000u64 {
+            get_after = unsafe { core::ptr::read_volatile((userd + 0x88) as *const u32) };
+            if get_after == target {
+                advanced = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        let chan_cfg = unsafe { core::ptr::read_volatile((self._bar0 + 0x0080_0004) as *const u32) };
+        let _ = writeln!(
+            s,
+            "[gpustep4]  pb_va={:#x} n={} slot={} GP_PUT {}->{} GP_GET {}->{} advanced={} doorbell=0xbb0090 token={:#x}",
+            pb_va, n, slot, put_before, target, get_before, get_after, advanced, token
+        );
+        let _ = writeln!(s, "[gpustep4]  chan{}-cfg(0x800004)={:#010x}", CHID, chan_cfg);
+        if advanced {
+            let _ = writeln!(
+                s,
+                "[gpustep4]  OK — channel fetched the pushbuffer via GMMU and bound the copy class, no fault. Ready for Step 5 (real copy)."
+            );
+        } else {
+            let _ = writeln!(
+                s,
+                "[gpustep4]  TIMEOUT — GP_GET did not advance; PBDMA likely faulted (GPFIFO/pushbuffer mapping). Inspect /proc/gpudbg (do NOT re-ring)."
             );
         }
         s

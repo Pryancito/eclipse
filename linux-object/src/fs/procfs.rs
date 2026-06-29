@@ -14,9 +14,9 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 16] = [
+const PROC_ROOT_STATIC: [&str; 17] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
-    "perf", "hunter", "filesystems", "gpudbg", "gpustep2", "gpustep3",
+    "perf", "hunter", "filesystems", "gpudbg", "gpustep2", "gpustep3", "gpustep4",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -290,6 +290,7 @@ impl INode for ProcRootINode {
             "gpudbg" => Ok(PROC_GPUDBG.clone()),
             "gpustep2" => Ok(PROC_GPUSTEP2.clone()),
             "gpustep3" => Ok(PROC_GPUSTEP3.clone()),
+            "gpustep4" => Ok(PROC_GPUSTEP4.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
                 if let Ok(pid) = name.parse::<u64>() {
@@ -1069,6 +1070,19 @@ fn proc_gpustep3_content() -> String {
     s
 }
 
+/// `/proc/gpustep4` — opt-in bring-up Step 4 (ring doorbell + SET_OBJECT) on the
+/// non-console GPU.
+fn proc_gpustep4_content() -> String {
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.bringup_step4());
+    }
+    if s.is_empty() {
+        s.push_str("[gpustep4] no DRM driver with bring-up support\n");
+    }
+    s
+}
+
 fn proc_cpuinfo_content() -> String {
     let mut brand = kernel_hal::cpu::cpu_brand();
     if brand.is_empty() {
@@ -1283,6 +1297,11 @@ lazy_static! {
     static ref PROC_GPUSTEP3: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 97,
         generate: proc_gpustep3_content,
+    });
+    /// `/proc/gpustep4` — opt-in: ring doorbell + SET_OBJECT on the non-console GPU.
+    static ref PROC_GPUSTEP4: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 96,
+        generate: proc_gpustep4_content,
     });
     static ref PROC_SWAPS: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 18,
