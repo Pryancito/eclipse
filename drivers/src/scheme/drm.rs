@@ -75,6 +75,14 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// GPU copy-engine bring-up **Step 3** (`/proc/gpustep3`): enable the
+    /// doorbell, commit the channel runlist, and enable the channel in the
+    /// scheduler — with an empty GPFIFO so nothing actually executes. Same
+    /// non-console auto-targeting as `bringup_step2`. Default: nothing.
+    fn bringup_step3(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Import a buffer allocated by the kernel (DRM core)
     fn import_buffer(&self, _handle: GemHandle) -> bool {
         true

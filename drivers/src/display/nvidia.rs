@@ -100,6 +100,8 @@ struct GpuBringup {
     sem: DmaRegion,
     src: DmaRegion,
     dst: DmaRegion,
+    /// Runlist buffer (cgrp entry + chan entry, 16 B each).
+    runlist: DmaRegion,
     /// Base GPU virtual address of the packed 2 MiB region.
     va_base: u64,
 }
@@ -121,6 +123,7 @@ impl GpuBringup {
         let sem = DmaRegion::alloc_coherent(0x1000)?;
         let src = DmaRegion::alloc_coherent(0x1000)?;
         let dst = DmaRegion::alloc_coherent(0x1000)?;
+        let runlist = DmaRegion::alloc_coherent(0x1000)?;
 
         // Pack the four engine-visible buffers into one 2 MiB region:
         //   src=+0x0  dst=+0x1000  sem=+0x2000  pushbuffer=+0x3000
@@ -162,6 +165,7 @@ impl GpuBringup {
             sem,
             src,
             dst,
+            runlist,
             va_base,
         })
     }
@@ -291,6 +295,30 @@ impl GpuBringup {
         w32(0x0e8, 0x0000_0000); // chan_id 0
         w32(0x0f4, 0x0000_1100); // 0x1000 | priv 0x100
         w32(0x0f8, 0x1000_3080);
+    }
+
+    /// Step 3 (part 1): build the runlist in sysmem — a channel-group entry
+    /// followed by the channel entry (TU102 forces cgrp). 16 B each. No GPU
+    /// register touched. Offsets per nouveau `gv100_runl_insert_cgrp/chan`
+    /// (chan_id=0, cgrp_id=0, chan_nr=1, runq=0).
+    fn write_runlist(&self) {
+        let rl = self.runlist.vaddr();
+        let w32 = |off: usize, v: u32| unsafe {
+            core::ptr::write_volatile((rl + off) as *mut u32, v)
+        };
+        let userd = self.userd.paddr() as u64;
+        let inst = self.inst.paddr() as u64;
+
+        // Cgrp entry (+0x0).
+        w32(0x00, 0x8003_0001);
+        w32(0x04, 1); // chan_nr
+        w32(0x08, 0); // cgrp_id
+        w32(0x0c, 0);
+        // Chan entry (+0x10): runq=0, chan_id=0.
+        w32(0x10, userd as u32); // | (runq<<1), runq=0
+        w32(0x14, (userd >> 32) as u32);
+        w32(0x18, inst as u32); // | chan_id, chan_id=0
+        w32(0x1c, (inst >> 32) as u32);
     }
 }
 
@@ -999,6 +1027,116 @@ impl DrmScheme for NvidiaGpu {
             let _ = writeln!(
                 s,
                 "[gpustep2]  TIMEOUT — bit31 never cleared. Suspect bad PDB; inspect /proc/gpudbg fault regs (do NOT re-trigger)."
+            );
+        }
+        s
+    }
+
+    /// Step 3: doorbell-enable + runlist commit + channel enable (empty GPFIFO).
+    /// Auto-skips the console GPU. Opt-in (`/proc/gpustep3`). Requires Step 2 to
+    /// have built the instance block; runs it here if not already done.
+    fn bringup_step3(&self) -> String {
+        use core::fmt::Write;
+        // runlist 0 (GR/CE runlist) and channel 0.
+        const RUNL_ID: u32 = 0;
+        const CHID: u32 = 0;
+
+        let mut s = String::new();
+        if self.drives_boot_display() {
+            let _ = writeln!(
+                s,
+                "[gpustep3] {} SKIPPED — drives the boot console",
+                self.name
+            );
+            return s;
+        }
+
+        let mut g = self.bringup.lock();
+        if g.is_none() {
+            *g = GpuBringup::build(0x0020_0000);
+        }
+        let b = match g.as_ref() {
+            Some(b) => b,
+            None => {
+                let _ = writeln!(s, "[gpustep3] {} alloc_coherent FAILED", self.name);
+                return s;
+            }
+        };
+
+        let _ = writeln!(
+            s,
+            "[gpustep3] === {} ({}) — Step 3: doorbell + runlist commit (empty GPFIFO) ===",
+            self.name, self.gpu_model
+        );
+
+        // Ensure the instance block + runlist exist in sysmem (idempotent).
+        b.write_instance_block();
+        b.write_runlist();
+        let runlist_phys = b.runlist.paddr() as u64;
+
+        let bar0 = self._bar0;
+        let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
+        let wr = |off: u32, v: u32| unsafe {
+            core::ptr::write_volatile((bar0 + off as usize) as *mut u32, v)
+        };
+
+        // 1) Enable the doorbell (mask bit31).
+        let db_before = rd(0x00b6_5000);
+        wr(0x00b6_5000, db_before | 0x8000_0000);
+        let db_after = rd(0x00b6_5000);
+        let _ = writeln!(
+            s,
+            "[gpustep3]  doorbell-en(0xb65000) {:#010x} -> {:#010x} (bit31={})",
+            db_before,
+            db_after,
+            db_after >> 31
+        );
+
+        // 2) Commit the runlist (base lo/hi + count=2 submits; poll bit15).
+        let base = 0x0000_2b00 + RUNL_ID * 0x10;
+        wr(base, runlist_phys as u32);
+        wr(base + 4, (runlist_phys >> 32) as u32);
+        wr(base + 8, 2); // 2 entries (cgrp + chan) — this write submits
+        let mut cfg_post = rd(base + 0xc);
+        let mut commit_ok = false;
+        for _ in 0..5_000_000u64 {
+            cfg_post = rd(base + 0xc);
+            if cfg_post & 0x0000_8000 == 0 {
+                commit_ok = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        let _ = writeln!(
+            s,
+            "[gpustep3]  runlist@{:#x} commit RUNL{} cfg(0x{:x})={:#010x} pending_cleared={}",
+            runlist_phys,
+            RUNL_ID,
+            base + 0xc,
+            cfg_post,
+            commit_ok
+        );
+
+        // 3) Enable the channel in the scheduler (mask 0x400).
+        let ce = 0x0080_0004 + CHID * 8;
+        let chan_before = rd(ce);
+        wr(ce, chan_before | 0x0000_0400);
+        let chan_after = rd(ce);
+        let _ = writeln!(
+            s,
+            "[gpustep3]  chan{}-cfg(0x{:x}) {:#010x} -> {:#010x}",
+            CHID, ce, chan_before, chan_after
+        );
+
+        if commit_ok {
+            let _ = writeln!(
+                s,
+                "[gpustep3]  OK — scheduler accepted the runlist, no fault. Ready for Step 4 (ring doorbell, empty PB)."
+            );
+        } else {
+            let _ = writeln!(
+                s,
+                "[gpustep3]  TIMEOUT — runlist pending bit never cleared. Inspect /proc/gpudbg; runl_id 0 may be wrong (do NOT re-commit)."
             );
         }
         s

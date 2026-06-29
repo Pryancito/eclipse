@@ -14,9 +14,9 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 15] = [
+const PROC_ROOT_STATIC: [&str; 16] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
-    "perf", "hunter", "filesystems", "gpudbg", "gpustep2",
+    "perf", "hunter", "filesystems", "gpudbg", "gpustep2", "gpustep3",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -289,6 +289,7 @@ impl INode for ProcRootINode {
             "filesystems" => Ok(PROC_FILESYSTEMS.clone()),
             "gpudbg" => Ok(PROC_GPUDBG.clone()),
             "gpustep2" => Ok(PROC_GPUSTEP2.clone()),
+            "gpustep3" => Ok(PROC_GPUSTEP3.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
                 if let Ok(pid) = name.parse::<u64>() {
@@ -1055,6 +1056,19 @@ fn proc_gpustep2_content() -> String {
     s
 }
 
+/// `/proc/gpustep3` — opt-in bring-up Step 3 (doorbell + runlist commit) on the
+/// non-console GPU.
+fn proc_gpustep3_content() -> String {
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.bringup_step3());
+    }
+    if s.is_empty() {
+        s.push_str("[gpustep3] no DRM driver with bring-up support\n");
+    }
+    s
+}
+
 fn proc_cpuinfo_content() -> String {
     let mut brand = kernel_hal::cpu::cpu_brand();
     if brand.is_empty() {
@@ -1262,6 +1276,12 @@ lazy_static! {
     static ref PROC_GPUSTEP2: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 100,
         generate: proc_gpustep2_content,
+    });
+    /// `/proc/gpustep3` — opt-in: doorbell-enable + runlist commit on the
+    /// non-console GPU.
+    static ref PROC_GPUSTEP3: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 101,
+        generate: proc_gpustep3_content,
     });
     static ref PROC_SWAPS: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 18,
