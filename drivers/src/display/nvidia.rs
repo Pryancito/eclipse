@@ -500,6 +500,50 @@ impl DisplayScheme for NvidiaGpu {
             blit: true,
         }
     }
+
+    /// Read-only GPU state dump (surfaced at `/proc/gpudbg`). Step 1 of the GPU
+    /// copy-engine bring-up: confirm MMIO works bidirectionally, identify the
+    /// exact chip, and record the VRAM/BAR layout we need for channel structs.
+    /// All reads, no writes — safe to run on demand post-boot.
+    fn debug_dump(&self) -> String {
+        use core::fmt::Write;
+        let bar0 = self._bar0;
+        let rd = |off: u32| unsafe {
+            core::ptr::read_volatile((bar0 + off as usize) as *const u32)
+        };
+        // NV_PMC_BOOT_0: architecture/chipset id. NV_PCFG mirror at BAR0+0x88000
+        // exposes PCI config dword 0 (vendor | device<<16) — reading 0x10de here
+        // proves MMIO is alive. (Offsets per nouveau nvkm.)
+        let boot0 = rd(regs::NV_PMC_BOOT_0);
+        let chipset = (boot0 >> 20) & 0x1ff;
+        let pcfg = rd(0x8_8000);
+        let cstatus = rd(regs::NV_PFB_CSTATUS);
+        let mut s = String::new();
+        let _ = writeln!(s, "[gpudbg] {} ({:?})", self.gpu_model, self.architecture);
+        let _ = writeln!(
+            s,
+            "[gpudbg] BAR0={:#x} BAR1/fb_vaddr={:#x} fb_size={:#x} VRAM={}MB",
+            bar0, self._bar1, self.info.fb_size, self.vram_size_mb
+        );
+        let _ = writeln!(
+            s,
+            "[gpudbg] PMC_BOOT_0(0x0)={:#010x} -> chipset=0x{:03x}",
+            boot0, chipset
+        );
+        let _ = writeln!(
+            s,
+            "[gpudbg] PCFG(0x88000)={:#010x} vendor={:#06x} device={:#06x}",
+            pcfg,
+            pcfg & 0xffff,
+            pcfg >> 16
+        );
+        let _ = writeln!(
+            s,
+            "[gpudbg] PFB_CSTATUS(0x10020c)={:#010x}",
+            cstatus
+        );
+        s
+    }
 }
 
 impl DrmScheme for NvidiaGpu {
