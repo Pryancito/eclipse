@@ -805,6 +805,36 @@ fn arch_from_pmc_boot0(boot0: u32) -> NvidiaArchitecture {
     }
 }
 
+/// NV_PFAULT_FAULT_TYPE ([4:0] of INFO1) decode (Turing dev_fault.ref.txt).
+fn fault_reason_name(r: u32) -> &'static str {
+    match r {
+        0 => "PDE",
+        1 => "PDE_SIZE",
+        2 => "PTE(unmapped)",
+        3 => "VA_LIMIT",
+        4 => "UNBOUND_INST",
+        5 => "PRIV",
+        6 => "RO",
+        7 => "WO",
+        0xa => "BAD_APERTURE",
+        _ => "?",
+    }
+}
+
+/// NV_PFAULT_ACCESS_TYPE ([19:16] of INFO1) decode.
+fn fault_access_name(a: u32) -> &'static str {
+    match a {
+        0 => "READ",
+        1 => "WRITE",
+        2 => "ATOMIC",
+        3 => "PREFETCH",
+        8 => "PHYS_READ",
+        9 => "PHYS_WRITE",
+        0xa => "PHYS_ATOMIC",
+        _ => "?",
+    }
+}
+
 fn read_temperature(bar0: usize) -> Option<i32> {
     let raw =
         unsafe { core::ptr::read_volatile((bar0 + regs::NV_THERM_TEMP as usize) as *const u32) };
@@ -1002,6 +1032,83 @@ impl DrmScheme for NvidiaGpu {
             rd(0x00b8_30a4),
             rd(0x00b8_30b0)
         );
+
+        // --- MMU fault snapshot (Turing tu102: 0xb83080..0xb83094, read-only) ---
+        // These latch the most recent non-replayable fault. We never write the
+        // clear reg (0xb83094) so the fault stays pinned for inspection.
+        let f_info1 = rd(0x00b8_3090);
+        let _ = writeln!(s, "[gpudbg]  --- MMU fault snapshot (read-only) ---");
+        let _ = writeln!(
+            s,
+            "[gpudbg]  FAULT_INFO1(0xb83090)={:#010x} valid={} hub={} access={}({}) client={:#x} reason={}({})",
+            f_info1,
+            f_info1 >> 31,
+            (f_info1 >> 20) & 1,
+            (f_info1 >> 16) & 0xf,
+            fault_access_name((f_info1 >> 16) & 0xf),
+            (f_info1 >> 8) & 0x7f,
+            f_info1 & 0x1f,
+            fault_reason_name(f_info1 & 0x1f),
+        );
+        if f_info1 & 0x8000_0000 != 0 {
+            let addr_lo = rd(0x00b8_3080);
+            let addr_hi = rd(0x00b8_3084);
+            let info0 = rd(0x00b8_3088);
+            let inst_hi = rd(0x00b8_308c);
+            let _ = writeln!(
+                s,
+                "[gpudbg]  FAULT_VA={:#x}{:08x} engine_id={:#x} inst={:#x}{:08x}",
+                addr_hi,
+                addr_lo & 0xffff_f000,
+                info0 & 0xff,
+                inst_hi,
+                info0 & 0xffff_f000,
+            );
+        }
+
+        // --- Per-channel (PCCSR) + per-PBDMA status (read-only) ---
+        let pccsr = rd(0x0080_0004);
+        let _ = writeln!(
+            s,
+            "[gpudbg]  PCCSR0(0x800004)={:#010x} enable={} busy={} status={} pbdma_faulted={} eng_faulted={}",
+            pccsr,
+            pccsr & 1,
+            (pccsr >> 28) & 1,
+            (pccsr >> 24) & 0xf,
+            (pccsr >> 22) & 1,
+            (pccsr >> 23) & 1,
+        );
+        let _ = writeln!(
+            s,
+            "[gpudbg]  PCCSR0_INST(0x800000)={:#010x}",
+            rd(0x0080_0000)
+        );
+        for i in 0..2u32 {
+            let pb = 0x0004_0000 + i * 0x2000;
+            let _ = writeln!(
+                s,
+                "[gpudbg]  PBDMA{} STATUS(0x{:x})={:#010x} CHANNEL={:#010x} GP_GET={:#010x} GP_PUT={:#010x} GET={:#010x} INTR_0={:#010x}",
+                i,
+                pb + 0x100,
+                rd(pb + 0x100),
+                rd(pb + 0x120),
+                rd(pb + 0x14),
+                rd(pb),
+                rd(pb + 0x18),
+                rd(pb + 0x108),
+            );
+        }
+
+        // --- Engine -> runlist map (NV_PTOP_DEVICE_INFO 0x022700, read-only) ---
+        // Walk the device-info table; dump non-zero raw entries so we can decode
+        // which runlist owns the copy engines.
+        let _ = writeln!(s, "[gpudbg]  --- PTOP device-info (0x022700, non-zero) ---");
+        for i in 0..64u32 {
+            let e = rd(0x0002_2700 + i * 4);
+            if e != 0 {
+                let _ = writeln!(s, "[gpudbg]  DEVINFO[{:2}]={:#010x}", i, e);
+            }
+        }
 
         // --- Step 1: build the GMMU tables in RAM and dump them (no GPU writes) ---
         {
