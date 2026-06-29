@@ -1027,12 +1027,14 @@ fn proc_meminfo_content() -> String {
 
 /// Minimal `/proc/cpuinfo` for fastfetch CPU detection on x86_64.
 fn proc_gpudbg_content() -> String {
+    // GPUs register as DRM devices (Device::Drm), not displays, and there may be
+    // more than one — dump every one.
     let mut s = String::new();
-    for d in kernel_hal::drivers::all_display().as_vec().iter() {
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
         s.push_str(&d.debug_dump());
     }
     if s.is_empty() {
-        s.push_str("[gpudbg] no display driver with debug support\n");
+        s.push_str("[gpudbg] no DRM driver with debug support\n");
     }
     s
 }

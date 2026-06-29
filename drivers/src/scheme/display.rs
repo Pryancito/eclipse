@@ -190,14 +190,6 @@ pub trait DisplayScheme: Scheme {
     /// Returns the framebuffer.
     fn fb(&self) -> FrameBuffer<'_>;
 
-    /// Read-only register/state dump for GPU bring-up debugging, surfaced at
-    /// `/proc/gpudbg`. Default: nothing. Hardware drivers override it to read
-    /// (never write) device registers post-boot — early BAR0 access can hang
-    /// some GPUs, so this is only ever invoked on demand from userspace.
-    fn debug_dump(&self) -> alloc::string::String {
-        alloc::string::String::new()
-    }
-
     /// Report the 2D acceleration capabilities of this device.
     ///
     /// The default is "no acceleration"; the generic software paths below are

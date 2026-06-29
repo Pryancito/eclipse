@@ -55,6 +55,15 @@ pub struct DrmPlane {
 pub trait DrmScheme: Scheme {
     fn get_caps(&self) -> DrmCaps;
 
+    /// Read-only register/state dump for GPU bring-up debugging, surfaced at
+    /// `/proc/gpudbg`. Default: nothing. Hardware drivers override it to read
+    /// (never write) device registers post-boot — early BAR0 access can hang
+    /// some GPUs, so this is only ever invoked on demand from userspace. With
+    /// multiple GPUs every DRM device is dumped, each labelled by its own name.
+    fn debug_dump(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Import a buffer allocated by the kernel (DRM core)
     fn import_buffer(&self, _handle: GemHandle) -> bool {
         true

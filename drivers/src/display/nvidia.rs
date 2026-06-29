@@ -500,11 +500,15 @@ impl DisplayScheme for NvidiaGpu {
             blit: true,
         }
     }
+}
 
+impl DrmScheme for NvidiaGpu {
     /// Read-only GPU state dump (surfaced at `/proc/gpudbg`). Step 1 of the GPU
     /// copy-engine bring-up: confirm MMIO works bidirectionally, identify the
     /// exact chip, and record the VRAM/BAR layout we need for channel structs.
-    /// All reads, no writes — safe to run on demand post-boot.
+    /// All reads, no writes — safe to run on demand post-boot. With two GPUs
+    /// this runs once per NvidiaGpu; `name` (PCI bus:dev.fn) tells them apart,
+    /// and a matching BAR1/fb_vaddr marks the one actually driving the display.
     fn debug_dump(&self) -> String {
         use core::fmt::Write;
         let bar0 = self._bar0;
@@ -519,34 +523,28 @@ impl DisplayScheme for NvidiaGpu {
         let pcfg = rd(0x8_8000);
         let cstatus = rd(regs::NV_PFB_CSTATUS);
         let mut s = String::new();
-        let _ = writeln!(s, "[gpudbg] {} ({:?})", self.gpu_model, self.architecture);
+        let _ = writeln!(s, "[gpudbg] === {} ({}) ===", self.name, self.gpu_model);
         let _ = writeln!(
             s,
-            "[gpudbg] BAR0={:#x} BAR1/fb_vaddr={:#x} fb_size={:#x} VRAM={}MB",
-            bar0, self._bar1, self.info.fb_size, self.vram_size_mb
+            "[gpudbg]  arch={:?} BAR0={:#x} BAR1/fb_vaddr={:#x} fb_size={:#x} VRAM={}MB",
+            self.architecture, bar0, self._bar1, self.info.fb_size, self.vram_size_mb
         );
         let _ = writeln!(
             s,
-            "[gpudbg] PMC_BOOT_0(0x0)={:#010x} -> chipset=0x{:03x}",
+            "[gpudbg]  PMC_BOOT_0(0x0)={:#010x} -> chipset=0x{:03x}",
             boot0, chipset
         );
         let _ = writeln!(
             s,
-            "[gpudbg] PCFG(0x88000)={:#010x} vendor={:#06x} device={:#06x}",
+            "[gpudbg]  PCFG(0x88000)={:#010x} vendor={:#06x} device={:#06x}",
             pcfg,
             pcfg & 0xffff,
             pcfg >> 16
         );
-        let _ = writeln!(
-            s,
-            "[gpudbg] PFB_CSTATUS(0x10020c)={:#010x}",
-            cstatus
-        );
+        let _ = writeln!(s, "[gpudbg]  PFB_CSTATUS(0x10020c)={:#010x}", cstatus);
         s
     }
-}
 
-impl DrmScheme for NvidiaGpu {
     fn get_caps(&self) -> DrmCaps {
         DrmCaps {
             has_3d: true,
