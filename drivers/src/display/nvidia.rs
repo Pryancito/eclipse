@@ -92,47 +92,69 @@ struct GpuBringup {
     pd2: DmaRegion,  // desc_12[2], PGD 9-bit
     pd0: DmaRegion,  // desc_12[1], dual-PDE 8-bit
     spt: DmaRegion,  // desc_12[0], SPT leaf, 512×8 B PTEs
-    // Channel / FIFO structures (filled in later steps).
-    inst: DmaRegion,
-    userd: DmaRegion,
+    // Sysmem structures the engine reaches through the GMMU (by GPU VA), so
+    // they stay in coherent sysmem and are mapped into the channel page tables.
     gpfifo: DmaRegion,
     pushbuf: DmaRegion,
     sem: DmaRegion,
     src: DmaRegion,
     dst: DmaRegion,
-    /// Runlist buffer (cgrp entry + chan entry, 16 B each).
-    runlist: DmaRegion,
     /// Base GPU virtual address of the packed 2 MiB region.
     va_base: u64,
+    /// Base VRAM offset (0-based into VRAM) for the structures the host reads by
+    /// raw physical address — instance block, runlist, USERD. Turing's host
+    /// scheduler walks these as VRAM-physical (the 0x002b00 runlist path has no
+    /// target field), so they cannot live in sysmem. They are CPU-written via
+    /// the PRAMIN window. Layout: inst=+0, runlist=+0x1000, userd=+0x2000.
+    vram_base: u64,
+}
+
+impl GpuBringup {
+    #[inline]
+    fn inst_vram(&self) -> u64 {
+        self.vram_base
+    }
+    #[inline]
+    fn runlist_vram(&self) -> u64 {
+        self.vram_base + 0x1000
+    }
+    #[inline]
+    fn userd_vram(&self) -> u64 {
+        self.vram_base + 0x2000
+    }
+    #[inline]
+    fn gpfifo_va(&self) -> u64 {
+        self.va_base + 0x4000
+    }
 }
 
 impl GpuBringup {
     /// Allocate the memory plan and build the GMMU page tables in RAM. No GPU
     /// register is touched here — only sysmem is written, so this is safe to run
     /// on demand. Returns `None` if the coherent DMA allocator is exhausted.
-    fn build(va_base: u64) -> Option<Self> {
+    fn build(va_base: u64, vram_base: u64) -> Option<Self> {
         let root = DmaRegion::alloc_coherent(0x1000)?;
         let pd3 = DmaRegion::alloc_coherent(0x1000)?;
         let pd2 = DmaRegion::alloc_coherent(0x1000)?;
         let pd0 = DmaRegion::alloc_coherent(0x1000)?;
         let spt = DmaRegion::alloc_coherent(0x1000)?;
-        let inst = DmaRegion::alloc_coherent(0x1000)?;
-        let userd = DmaRegion::alloc_coherent(0x1000)?;
         let gpfifo = DmaRegion::alloc_coherent(0x1000)?;
         let pushbuf = DmaRegion::alloc_coherent(0x1000)?;
         let sem = DmaRegion::alloc_coherent(0x1000)?;
         let src = DmaRegion::alloc_coherent(0x1000)?;
         let dst = DmaRegion::alloc_coherent(0x1000)?;
-        let runlist = DmaRegion::alloc_coherent(0x1000)?;
 
-        // Pack the four engine-visible buffers into one 2 MiB region:
-        //   src=+0x0  dst=+0x1000  sem=+0x2000  pushbuffer=+0x3000
+        // Pack the engine-visible buffers into one 2 MiB region:
+        //   src=+0x0 dst=+0x1000 sem=+0x2000 pushbuffer=+0x3000 gpfifo=+0x4000
+        // The GPFIFO ring is referenced by GPU VA in RAMFC (not physically), so
+        // it is GMMU-mapped just like the pushbuffer.
         let src_va = va_base;
         let dst_va = va_base + 0x1000;
         let sem_va = va_base + 0x2000;
         let pb_va = va_base + 0x3000;
+        let gpfifo_va = va_base + 0x4000;
 
-        // Leaf PTEs (SPT). idx = (va>>12)&0x1ff; the four pages occupy idx 0..3.
+        // Leaf PTEs (SPT). idx = (va>>12)&0x1ff; the five pages occupy idx 0..4.
         let wr64 = |r: &DmaRegion, i: usize, v: u64| unsafe {
             core::ptr::write_volatile(r.as_ptr::<u64>().add(i), v)
         };
@@ -140,8 +162,9 @@ impl GpuBringup {
         wr64(&spt, ((dst_va >> 12) & 0x1ff) as usize, gmmu::encode_pte_sys(dst.paddr() as u64));
         wr64(&spt, ((sem_va >> 12) & 0x1ff) as usize, gmmu::encode_pte_sys(sem.paddr() as u64));
         wr64(&spt, ((pb_va >> 12) & 0x1ff) as usize, gmmu::encode_pte_sys(pushbuf.paddr() as u64));
+        wr64(&spt, ((gpfifo_va >> 12) & 0x1ff) as usize, gmmu::encode_pte_sys(gpfifo.paddr() as u64));
 
-        // PD0 dual-PDE: pdei = (va>>21)&0xff (== 1 for all four, same 2 MiB slot).
+        // PD0 dual-PDE: pdei = (va>>21)&0xff (== 1 for all, same 2 MiB slot).
         // Low qword = BIG (unused, 0); high qword = SMALL = single-PDE form.
         let pdei = ((src_va >> 21) & 0xff) as usize;
         wr64(&pd0, pdei * 2, 0);
@@ -158,15 +181,13 @@ impl GpuBringup {
             pd2,
             pd0,
             spt,
-            inst,
-            userd,
             gpfifo,
             pushbuf,
             sem,
             src,
             dst,
-            runlist,
             va_base,
+            vram_base,
         })
     }
 
@@ -194,14 +215,19 @@ impl GpuBringup {
         );
         let _ = writeln!(
             s,
-            "[gpudbg]  buf phys: inst={:#x} userd={:#x} gpfifo={:#x} pb={:#x} sem={:#x} src={:#x} dst={:#x}",
-            self.inst.paddr(),
-            self.userd.paddr(),
+            "[gpudbg]  sysmem phys: gpfifo={:#x} pb={:#x} sem={:#x} src={:#x} dst={:#x}",
             self.gpfifo.paddr(),
             self.pushbuf.paddr(),
             self.sem.paddr(),
             self.src.paddr(),
             self.dst.paddr()
+        );
+        let _ = writeln!(
+            s,
+            "[gpudbg]  VRAM off: inst={:#x} runlist={:#x} userd={:#x} (host-read via PRAMIN)",
+            self.inst_vram(),
+            self.runlist_vram(),
+            self.userd_vram()
         );
         let va = self.va_base;
         let ri = ((va >> 47) & 0x3) as usize;
@@ -223,7 +249,13 @@ impl GpuBringup {
             rd64(&self.pd0, pdei * 2),
             rd64(&self.pd0, pdei * 2 + 1)
         );
-        for (name, off) in [("src", 0u64), ("dst", 0x1000), ("sem", 0x2000), ("pb", 0x3000)] {
+        for (name, off) in [
+            ("src", 0u64),
+            ("dst", 0x1000),
+            ("sem", 0x2000),
+            ("pb", 0x3000),
+            ("gpfifo", 0x4000),
+        ] {
             let v = va + off;
             let si = ((v >> 12) & 0x1ff) as usize;
             let _ = writeln!(
@@ -237,88 +269,10 @@ impl GpuBringup {
         }
         let _ = writeln!(
             s,
-            "[gpudbg]  inst PD-base qword(@0x200) = {:#018x} (root|0xC06)",
+            "[gpudbg]  inst PD-base qword(@0x200) = {:#018x} (root|0xC06, points at sysmem PDs)",
             gmmu::inst_pd_base(self.root.paddr() as u64)
         );
         s
-    }
-
-    /// Step 2 (part 1): write the channel instance block into our sysmem
-    /// `inst` region — PD base, the Turing PDB descriptor table, and the RAMFC
-    /// (USERD / GPFIFO / channel id). No GPU register is touched here; this only
-    /// writes coherent RAM. Offsets verified against nouveau
-    /// `gv100_vmm_join` / `gv100_chan_ramfc_write` (priv kernel channel, id 0).
-    fn write_instance_block(&self) {
-        let inst = self.inst.vaddr();
-        let w32 = |off: usize, v: u32| unsafe {
-            core::ptr::write_volatile((inst + off) as *mut u32, v)
-        };
-        let w64 = |off: usize, v: u64| {
-            w32(off, v as u32);
-            w32(off + 4, (v >> 32) as u32);
-        };
-        let pd_phys = self.root.paddr() as u64;
-        let base = gmmu::inst_pd_base(pd_phys); // root | 0xC06
-
-        // PD base + VA limit (full 49-bit space).
-        w64(0x200, base);
-        w64(0x208, (1u64 << 49) - 1);
-
-        // Turing PDB descriptor table (gv100_vmm_join): entry 0 is the real PDB,
-        // entries 1..63 are the "invalid" 0x1/0x1/0 filler.
-        w32(0x21c, 0);
-        w32(0x2a0, base as u32);
-        w32(0x2a4, (base >> 32) as u32);
-        w32(0x2a8, 0);
-        for i in 1..64usize {
-            let o = 0x2a0 + i * 0x10;
-            w32(o, 0x1);
-            w32(o + 4, 0x1);
-            w32(o + 8, 0);
-        }
-        w32(0x298, 0x1);
-        w32(0x29c, 0x0);
-
-        // RAMFC: USERD pointer, GPFIFO base+size, channel id (priv).
-        let userd = self.userd.paddr() as u64;
-        let gpfifo = self.gpfifo.paddr() as u64;
-        let limit2 = (self.gpfifo.byte_len() as u64 / 8).trailing_zeros();
-        w32(0x008, userd as u32);
-        w32(0x00c, (userd >> 32) as u32);
-        w32(0x010, 0x0000_face);
-        w32(0x030, 0x7fff_f902);
-        w32(0x048, gpfifo as u32);
-        w32(0x04c, ((gpfifo >> 32) as u32) | (limit2 << 16));
-        w32(0x084, 0x2040_0000);
-        w32(0x094, 0x3000_0000 | 0xfff);
-        w32(0x0e4, 0x0000_0020); // priv
-        w32(0x0e8, 0x0000_0000); // chan_id 0
-        w32(0x0f4, 0x0000_1100); // 0x1000 | priv 0x100
-        w32(0x0f8, 0x1000_3080);
-    }
-
-    /// Step 3 (part 1): build the runlist in sysmem — a channel-group entry
-    /// followed by the channel entry (TU102 forces cgrp). 16 B each. No GPU
-    /// register touched. Offsets per nouveau `gv100_runl_insert_cgrp/chan`
-    /// (chan_id=0, cgrp_id=0, chan_nr=1, runq=0).
-    fn write_runlist(&self) {
-        let rl = self.runlist.vaddr();
-        let w32 = |off: usize, v: u32| unsafe {
-            core::ptr::write_volatile((rl + off) as *mut u32, v)
-        };
-        let userd = self.userd.paddr() as u64;
-        let inst = self.inst.paddr() as u64;
-
-        // Cgrp entry (+0x0).
-        w32(0x00, 0x8003_0001);
-        w32(0x04, 1); // chan_nr
-        w32(0x08, 0); // cgrp_id
-        w32(0x0c, 0);
-        // Chan entry (+0x10): runq=0, chan_id=0.
-        w32(0x10, userd as u32); // | (runq<<1), runq=0
-        w32(0x14, (userd >> 32) as u32);
-        w32(0x18, inst as u32); // | chan_id, chan_id=0
-        w32(0x1c, (inst >> 32) as u32);
     }
 
     /// Step 4: write a minimal method stream into the pushbuffer — just
@@ -638,6 +592,103 @@ impl NvidiaGpu {
     /// completion. Returns `(pre, post, ok)` — the trigger register before and
     /// after, and whether bit31 cleared. Aborts (no write) if a flush is already
     /// in flight. This is the only GPU register write of Step 2.
+    /// CPU-write a u32 into VRAM at raw VRAM offset `vram_off` via the PRAMIN
+    /// window: point the window base (BAR0+0x1700 = off>>16), then access
+    /// BAR0+0x700000+(off&0xFFFF). The window is 64 KiB; we re-point per access
+    /// for simplicity. This is how the CPU reaches instmem (BAR1 is GMMU-remapped
+    /// and cannot give a known VRAM-physical address).
+    fn pramin_w32(&self, vram_off: u64, val: u32) {
+        let bar0 = self._bar0;
+        unsafe {
+            core::ptr::write_volatile((bar0 + 0x1700) as *mut u32, (vram_off >> 16) as u32);
+            core::ptr::write_volatile(
+                (bar0 + 0x0070_0000 + (vram_off & 0xFFFF) as usize) as *mut u32,
+                val,
+            );
+        }
+    }
+
+    fn pramin_r32(&self, vram_off: u64) -> u32 {
+        let bar0 = self._bar0;
+        unsafe {
+            core::ptr::write_volatile((bar0 + 0x1700) as *mut u32, (vram_off >> 16) as u32);
+            core::ptr::read_volatile(
+                (bar0 + 0x0070_0000 + (vram_off & 0xFFFF) as usize) as *const u32,
+            )
+        }
+    }
+
+    fn pramin_zero(&self, vram_off: u64, len: usize) {
+        for i in (0..len).step_by(4) {
+            self.pramin_w32(vram_off + i as u64, 0);
+        }
+    }
+
+    /// Write the channel instance block into VRAM (via PRAMIN). The host reads it
+    /// as VRAM-physical. The PD-base at 0x200 points at the *sysmem* page tables
+    /// (target=2). USERD pointer is VRAM-physical; the GPFIFO base is a GPU VA
+    /// (GMMU-translated). Offsets per nouveau gv100_vmm_join / ramfc_write.
+    fn write_instance_block_vram(&self, b: &GpuBringup) {
+        let inst = b.inst_vram();
+        self.pramin_zero(inst, 0x1000);
+        let w32 = |off: u64, v: u32| self.pramin_w32(inst + off, v);
+        let w64 = |off: u64, v: u64| {
+            w32(off, v as u32);
+            w32(off + 4, (v >> 32) as u32);
+        };
+        let base = gmmu::inst_pd_base(b.root.paddr() as u64); // root | 0xC06 (sysmem target)
+        w64(0x200, base);
+        w64(0x208, (1u64 << 49) - 1);
+        // Turing PDB descriptor table (gv100_vmm_join).
+        w32(0x21c, 0);
+        w32(0x2a0, base as u32);
+        w32(0x2a4, (base >> 32) as u32);
+        w32(0x2a8, 0);
+        for i in 1..64u64 {
+            let o = 0x2a0 + i * 0x10;
+            w32(o, 0x1);
+            w32(o + 4, 0x1);
+            w32(o + 8, 0);
+        }
+        w32(0x298, 0x1);
+        w32(0x29c, 0x0);
+        // RAMFC: USERD (VRAM phys), GPFIFO (GPU VA), ids.
+        let userd = b.userd_vram();
+        let gpfifo_va = b.gpfifo_va();
+        let limit2 = (b.gpfifo.byte_len() as u64 / 8).trailing_zeros();
+        w32(0x008, userd as u32);
+        w32(0x00c, (userd >> 32) as u32);
+        w32(0x010, 0x0000_face);
+        w32(0x030, 0x7fff_f902);
+        w32(0x048, gpfifo_va as u32);
+        w32(0x04c, ((gpfifo_va >> 32) as u32) | (limit2 << 16));
+        w32(0x084, 0x2040_0000);
+        w32(0x094, 0x3000_0000 | 0xfff);
+        w32(0x0e4, 0x0000_0020); // priv
+        w32(0x0e8, 0x0000_0000); // chan_id 0
+        w32(0x0f4, 0x0000_1100); // 0x1000 | priv 0x100
+        w32(0x0f8, 0x1000_3080);
+    }
+
+    /// Write the runlist into VRAM (via PRAMIN): cgrp entry + chan entry. The
+    /// USERD/inst pointers in the chan entry are VRAM-physical. Per nouveau
+    /// gv100_runl_insert_cgrp/chan (chan_id=0, cgrp_id=0, chan_nr=1, runq=0).
+    fn write_runlist_vram(&self, b: &GpuBringup) {
+        let rl = b.runlist_vram();
+        self.pramin_zero(rl, 0x20);
+        let w32 = |off: u64, v: u32| self.pramin_w32(rl + off, v);
+        let userd = b.userd_vram();
+        let inst = b.inst_vram();
+        w32(0x00, 0x8003_0001);
+        w32(0x04, 1); // chan_nr
+        w32(0x08, 0); // cgrp_id
+        w32(0x0c, 0);
+        w32(0x10, userd as u32); // | (runq<<1), runq=0
+        w32(0x14, (userd >> 32) as u32);
+        w32(0x18, inst as u32); // | chan_id, chan_id=0
+        w32(0x1c, (inst >> 32) as u32);
+    }
+
     fn gmmu_flush(&self, root_phys: u64) -> (u32, u32, bool) {
         let bar0 = self._bar0;
         let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
@@ -677,18 +728,19 @@ impl NvidiaGpu {
             core::ptr::write_volatile((bar0 + off as usize) as *mut u32, v)
         };
 
-        b.write_instance_block();
-        b.write_runlist();
+        self.write_instance_block_vram(b);
+        self.write_runlist_vram(b);
         let _ = self.gmmu_flush(b.root.paddr() as u64);
 
         // Doorbell enable.
         wr(0x00b6_5000, rd(0x00b6_5000) | 0x8000_0000);
 
-        // Runlist commit (2 entries).
+        // Runlist commit (2 entries). The runlist lives in VRAM; the host reads
+        // it as VRAM-physical, so no target field is needed (tu102_runl_commit).
         let base = 0x0000_2b00 + RUNL_ID * 0x10;
-        let runlist_phys = b.runlist.paddr() as u64;
-        wr(base, runlist_phys as u32);
-        wr(base + 4, (runlist_phys >> 32) as u32);
+        let runlist_vram = b.runlist_vram();
+        wr(base, runlist_vram as u32);
+        wr(base + 4, (runlist_vram >> 32) as u32);
         wr(base + 8, 2);
         let mut ok = false;
         for _ in 0..5_000_000u64 {
@@ -1115,7 +1167,7 @@ impl DrmScheme for NvidiaGpu {
             let mut g = self.bringup.lock();
             if g.is_none() {
                 // GPU VA base for the packed 2 MiB region (avoids null-VA).
-                *g = GpuBringup::build(0x0020_0000);
+                *g = GpuBringup::build(0x0020_0000, 0x8000_0000);
             }
             match g.as_ref() {
                 Some(b) => s.push_str(&b.dump()),
@@ -1146,7 +1198,7 @@ impl DrmScheme for NvidiaGpu {
 
         let mut g = self.bringup.lock();
         if g.is_none() {
-            *g = GpuBringup::build(0x0020_0000);
+            *g = GpuBringup::build(0x0020_0000, 0x8000_0000);
         }
         let b = match g.as_ref() {
             Some(b) => b,
@@ -1162,10 +1214,18 @@ impl DrmScheme for NvidiaGpu {
             self.name, self.gpu_model
         );
 
-        // Part 1: build the instance block in sysmem (no GPU write).
-        b.write_instance_block();
-        let inst = b.inst.vaddr();
-        let rb = |off: usize| unsafe { core::ptr::read_volatile((inst + off) as *const u32) };
+        // Part 1: write the instance block into VRAM (via PRAMIN). First a PRAMIN
+        // round-trip self-test so we know the window works on this GPU.
+        let inst = b.inst_vram();
+        self.pramin_w32(inst + 0x100, 0xDEAD_BEEF);
+        let pramin_ok = self.pramin_r32(inst + 0x100) == 0xDEAD_BEEF;
+        self.write_instance_block_vram(b);
+        let rb = |off: u64| self.pramin_r32(inst + off);
+        let _ = writeln!(
+            s,
+            "[gpustep2]  PRAMIN self-test={} inst@VRAM {:#x}",
+            pramin_ok, inst
+        );
         let _ = writeln!(
             s,
             "[gpustep2]  inst@0x200={:08x}{:08x} @0x208={:08x}{:08x} userd@0x008={:08x}{:08x}",
@@ -1228,7 +1288,7 @@ impl DrmScheme for NvidiaGpu {
 
         let mut g = self.bringup.lock();
         if g.is_none() {
-            *g = GpuBringup::build(0x0020_0000);
+            *g = GpuBringup::build(0x0020_0000, 0x8000_0000);
         }
         let b = match g.as_ref() {
             Some(b) => b,
@@ -1244,10 +1304,10 @@ impl DrmScheme for NvidiaGpu {
             self.name, self.gpu_model
         );
 
-        // Ensure the instance block + runlist exist in sysmem (idempotent).
-        b.write_instance_block();
-        b.write_runlist();
-        let runlist_phys = b.runlist.paddr() as u64;
+        // Ensure the instance block + runlist exist in VRAM (idempotent).
+        self.write_instance_block_vram(b);
+        self.write_runlist_vram(b);
+        let runlist_vram = b.runlist_vram();
 
         let bar0 = self._bar0;
         let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
@@ -1269,8 +1329,8 @@ impl DrmScheme for NvidiaGpu {
 
         // 2) Commit the runlist (base lo/hi + count=2 submits; poll bit15).
         let base = 0x0000_2b00 + RUNL_ID * 0x10;
-        wr(base, runlist_phys as u32);
-        wr(base + 4, (runlist_phys >> 32) as u32);
+        wr(base, runlist_vram as u32);
+        wr(base + 4, (runlist_vram >> 32) as u32);
         wr(base + 8, 2); // 2 entries (cgrp + chan) — this write submits
         let mut cfg_post = rd(base + 0xc);
         let mut commit_ok = false;
@@ -1285,7 +1345,7 @@ impl DrmScheme for NvidiaGpu {
         let _ = writeln!(
             s,
             "[gpustep3]  runlist@{:#x} commit RUNL{} cfg(0x{:x})={:#010x} pending_cleared={}",
-            runlist_phys,
+            runlist_vram,
             RUNL_ID,
             base + 0xc,
             cfg_post,
@@ -1333,7 +1393,7 @@ impl DrmScheme for NvidiaGpu {
 
         let mut g = self.bringup.lock();
         if g.is_none() {
-            *g = GpuBringup::build(0x0020_0000);
+            *g = GpuBringup::build(0x0020_0000, 0x8000_0000);
         }
         let b = match g.as_ref() {
             Some(b) => b,
@@ -1353,29 +1413,31 @@ impl DrmScheme for NvidiaGpu {
         let commit_ok = self.setup_channel(b);
         let _ = writeln!(s, "[gpustep4]  channel setup: runlist_commit={}", commit_ok);
 
-        // Build the method stream + a GPFIFO launch entry at the current PUT slot.
+        // Build the method stream (sysmem pushbuffer) + a GPFIFO launch entry at
+        // the current PUT slot. The GPFIFO entry points at the pushbuffer GPU VA.
         let n = b.write_setobject_pushbuffer();
         let pb_va = b.va_base + 0x3000;
-        let userd = b.userd.vaddr();
-        let put_before = unsafe { core::ptr::read_volatile((userd + 0x8c) as *const u32) };
-        let get_before = unsafe { core::ptr::read_volatile((userd + 0x88) as *const u32) };
+        // USERD lives in VRAM — GP_PUT/GP_GET are accessed via PRAMIN.
+        let userd = b.userd_vram();
+        let put_before = self.pramin_r32(userd + 0x8c);
+        let get_before = self.pramin_r32(userd + 0x88);
         let ring_entries = (b.gpfifo.byte_len() / 8) as u32;
         let slot = (put_before % ring_entries) as usize;
         b.write_gpfifo_entry(slot, pb_va, n);
         let target = put_before + 1;
 
-        // Advance GP_PUT, fence, ring the doorbell.
+        // Advance GP_PUT (VRAM USERD, via PRAMIN), fence, ring the doorbell.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        unsafe { core::ptr::write_volatile((userd + 0x8c) as *mut u32, target) };
+        self.pramin_w32(userd + 0x8c, target);
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         let token = (RUNL_ID << 16) | CHID;
         unsafe { core::ptr::write_volatile((self._bar0 + 0x00bb_0090) as *mut u32, token) };
 
-        // Poll GP_GET catching up to GP_PUT.
+        // Poll GP_GET (VRAM USERD) catching up to GP_PUT.
         let mut get_after = get_before;
         let mut advanced = false;
         for _ in 0..5_000_000u64 {
-            get_after = unsafe { core::ptr::read_volatile((userd + 0x88) as *const u32) };
+            get_after = self.pramin_r32(userd + 0x88);
             if get_after == target {
                 advanced = true;
                 break;
