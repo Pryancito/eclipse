@@ -284,6 +284,12 @@ pub trait FileLike: KernelObject + downcast_rs::DowncastSync {
     fn write_at(&self, _offset: u64, _buf: &[u8]) -> LxResult<usize> {
         Err(LxError::ENOSYS)
     }
+    /// reposition the file offset. Default: not seekable (`ESPIPE`), like a
+    /// pipe/socket. Seekable objects (regular files, dma-bufs whose size Mesa
+    /// probes with `lseek(SEEK_END)`) override this.
+    fn seek(&self, _pos: SeekFrom) -> LxResult<u64> {
+        Err(LxError::ESPIPE)
+    }
     /// wait for some event on a file descriptor
     fn poll(&self, events: PollEvents) -> LxResult<PollStatus>;
     /// wait for some event on a file descriptor use async
