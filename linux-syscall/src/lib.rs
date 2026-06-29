@@ -146,12 +146,6 @@ impl Syscall<'_> {
             }
         };
         let [a0, a1, a2, a3, a4, a5] = args;
-        // TEMP diag (GL hang): trace blocking syscalls for the labwc compositor
-        // so the last line before it deadlocks during Mesa init points at the
-        // exact syscall it is stuck in. Remove once the hang is located.
-        // (Per-syscall futex/poll tracing removed: threading is confirmed
-        // working. The DRM-ioctl trace in sys_ioctl + the clone/run/exit
-        // lifecycle traces are what we still need for the GL buffer-alloc hunt.)
         // Eclipse's own perf accounting: time every syscall and attribute it to
         // both the system-wide and per-process tables (surfaced at `/proc/perf`
         // and `/proc/<pid>/perf`). The name resolver is registered lazily here

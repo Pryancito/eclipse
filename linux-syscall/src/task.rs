@@ -276,10 +276,6 @@ impl Syscall<'_> {
             new_thread.set_tid_address(child_tid);
         }
         new_thread.start(self.thread_fn)?;
-        // TEMP diag (GL hang): trace worker-thread lifecycle for labwc.
-        if self.zircon_process().name().contains("labwc") {
-            log::error!("[gltrace] CLONE by tid={} -> new tid={}", self.thread.id(), tid);
-        }
         Ok(tid as usize)
     }
 
@@ -646,9 +642,6 @@ impl Syscall<'_> {
     /// last thread in the thread group.
     pub fn sys_exit(&mut self, exit_code: i32) -> SysResult {
         info!("exit: code={}", exit_code);
-        if self.zircon_process().name().contains("labwc") {
-            log::error!("[gltrace] EXIT tid={} code={}", self.thread.id(), exit_code);
-        }
         self.thread.exit_linux(exit_code);
         Ok(0)
     }
