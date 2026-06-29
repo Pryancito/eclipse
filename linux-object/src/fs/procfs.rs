@@ -1274,13 +1274,14 @@ lazy_static! {
     /// `/proc/gpustep2` — opt-in: each read performs Step 2 (instance block +
     /// GMMU flush) on the non-console GPU and reports the result.
     static ref PROC_GPUSTEP2: Arc<dyn INode> = Arc::new(ProcSeqINode {
-        inode: 100,
+        inode: 98,
         generate: proc_gpustep2_content,
     });
     /// `/proc/gpustep3` — opt-in: doorbell-enable + runlist commit on the
-    /// non-console GPU.
+    /// non-console GPU. Inodes 97/98 are deliberately below the `100 + pid`
+    /// per-process inode range to avoid colliding with process directories.
     static ref PROC_GPUSTEP3: Arc<dyn INode> = Arc::new(ProcSeqINode {
-        inode: 101,
+        inode: 97,
         generate: proc_gpustep3_content,
     });
     static ref PROC_SWAPS: Arc<dyn INode> = Arc::new(ProcSeqINode {
