@@ -14,9 +14,9 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 14] = [
+const PROC_ROOT_STATIC: [&str; 15] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
-    "perf", "hunter", "filesystems", "gpudbg",
+    "perf", "hunter", "filesystems", "gpudbg", "gpustep2",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -288,6 +288,7 @@ impl INode for ProcRootINode {
             "hunter" => Ok(PROC_HUNTER.clone()),
             "filesystems" => Ok(PROC_FILESYSTEMS.clone()),
             "gpudbg" => Ok(PROC_GPUDBG.clone()),
+            "gpustep2" => Ok(PROC_GPUSTEP2.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
                 if let Ok(pid) = name.parse::<u64>() {
@@ -1039,6 +1040,21 @@ fn proc_gpudbg_content() -> String {
     s
 }
 
+/// `/proc/gpustep2` — opt-in GPU copy-engine bring-up Step 2 (instance block +
+/// GMMU flush). NOT read-only: each `cat` issues the real GPU writes, but only
+/// on the GPU that does not drive the console. Kept separate from `/proc/gpudbg`
+/// so the latter stays safe to poll.
+fn proc_gpustep2_content() -> String {
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.bringup_step2());
+    }
+    if s.is_empty() {
+        s.push_str("[gpustep2] no DRM driver with bring-up support\n");
+    }
+    s
+}
+
 fn proc_cpuinfo_content() -> String {
     let mut brand = kernel_hal::cpu::cpu_brand();
     if brand.is_empty() {
@@ -1240,6 +1256,12 @@ lazy_static! {
     static ref PROC_GPUDBG: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 99,
         generate: proc_gpudbg_content,
+    });
+    /// `/proc/gpustep2` — opt-in: each read performs Step 2 (instance block +
+    /// GMMU flush) on the non-console GPU and reports the result.
+    static ref PROC_GPUSTEP2: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 100,
+        generate: proc_gpustep2_content,
     });
     static ref PROC_SWAPS: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 18,

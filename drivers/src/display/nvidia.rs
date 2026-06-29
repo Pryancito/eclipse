@@ -238,13 +238,67 @@ impl GpuBringup {
         );
         s
     }
+
+    /// Step 2 (part 1): write the channel instance block into our sysmem
+    /// `inst` region — PD base, the Turing PDB descriptor table, and the RAMFC
+    /// (USERD / GPFIFO / channel id). No GPU register is touched here; this only
+    /// writes coherent RAM. Offsets verified against nouveau
+    /// `gv100_vmm_join` / `gv100_chan_ramfc_write` (priv kernel channel, id 0).
+    fn write_instance_block(&self) {
+        let inst = self.inst.vaddr();
+        let w32 = |off: usize, v: u32| unsafe {
+            core::ptr::write_volatile((inst + off) as *mut u32, v)
+        };
+        let w64 = |off: usize, v: u64| {
+            w32(off, v as u32);
+            w32(off + 4, (v >> 32) as u32);
+        };
+        let pd_phys = self.root.paddr() as u64;
+        let base = gmmu::inst_pd_base(pd_phys); // root | 0xC06
+
+        // PD base + VA limit (full 49-bit space).
+        w64(0x200, base);
+        w64(0x208, (1u64 << 49) - 1);
+
+        // Turing PDB descriptor table (gv100_vmm_join): entry 0 is the real PDB,
+        // entries 1..63 are the "invalid" 0x1/0x1/0 filler.
+        w32(0x21c, 0);
+        w32(0x2a0, base as u32);
+        w32(0x2a4, (base >> 32) as u32);
+        w32(0x2a8, 0);
+        for i in 1..64usize {
+            let o = 0x2a0 + i * 0x10;
+            w32(o, 0x1);
+            w32(o + 4, 0x1);
+            w32(o + 8, 0);
+        }
+        w32(0x298, 0x1);
+        w32(0x29c, 0x0);
+
+        // RAMFC: USERD pointer, GPFIFO base+size, channel id (priv).
+        let userd = self.userd.paddr() as u64;
+        let gpfifo = self.gpfifo.paddr() as u64;
+        let limit2 = (self.gpfifo.byte_len() as u64 / 8).trailing_zeros();
+        w32(0x008, userd as u32);
+        w32(0x00c, (userd >> 32) as u32);
+        w32(0x010, 0x0000_face);
+        w32(0x030, 0x7fff_f902);
+        w32(0x048, gpfifo as u32);
+        w32(0x04c, ((gpfifo >> 32) as u32) | (limit2 << 16));
+        w32(0x084, 0x2040_0000);
+        w32(0x094, 0x3000_0000 | 0xfff);
+        w32(0x0e4, 0x0000_0020); // priv
+        w32(0x0e8, 0x0000_0000); // chan_id 0
+        w32(0x0f4, 0x0000_1100); // 0x1000 | priv 0x100
+        w32(0x0f8, 0x1000_3080);
+    }
 }
 
 static BOOT_FB_INFO: Mutex<Option<BootFbInfo>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Copy)]
 struct BootFbInfo {
-    _phys: u64,
+    phys: u64,
     width: u32,
     height: u32,
     pitch: u32,
@@ -252,11 +306,17 @@ struct BootFbInfo {
 
 pub fn set_boot_fb_info(phys: u64, width: u32, height: u32, pitch: u32) {
     *BOOT_FB_INFO.lock() = Some(BootFbInfo {
-        _phys: phys,
+        phys,
         width,
         height,
         pitch,
     });
+}
+
+/// Physical address of the boot (UEFI GOP) framebuffer, if known. The GPU whose
+/// BAR1 aperture contains this address is the one driving the console.
+fn boot_fb_phys() -> Option<u64> {
+    BOOT_FB_INFO.lock().map(|b| b.phys)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,6 +338,10 @@ pub struct NvidiaGpu {
     pitch_override: Option<u32>,
     _bar0: usize,
     _bar1: usize,
+    /// Physical base of BAR1 (the VRAM aperture). Used to decide whether this GPU
+    /// backs the boot framebuffer (i.e. drives the console) and must therefore be
+    /// spared from the risky copy-engine bring-up writes.
+    bar1_phys: u64,
     vram_allocator: Mutex<Option<NvidiaVramAllocator>>,
     /// Copy-engine bring-up state (GMMU tables + channel structs). Built lazily
     /// on the first `/proc/gpudbg` read so the memory plan is only allocated
@@ -396,6 +460,7 @@ impl NvidiaGpu {
         bar0: usize,
         fb_vaddr: usize,
         fb_size: usize,
+        bar1_phys: u64,
         default_width: u32,
         default_height: u32,
     ) -> DeviceResult<Self> {
@@ -477,6 +542,7 @@ impl NvidiaGpu {
             pitch_override,
             _bar0: bar0,
             _bar1: final_fb_vaddr,
+            bar1_phys,
             vram_allocator: Mutex::new(Some(NvidiaVramAllocator::new(
                 fb_vaddr as u64,
                 fb_size as u64,
@@ -496,6 +562,50 @@ impl NvidiaGpu {
     }
     pub fn temperature(&self) -> Option<i32> {
         read_temperature(self._bar0)
+    }
+
+    /// True if this GPU's BAR1 aperture contains the boot framebuffer — i.e. it
+    /// is the GPU scanning out to the monitor. Such a GPU is spared from the
+    /// copy-engine bring-up writes so a wedge can never blank the console.
+    fn drives_boot_display(&self) -> bool {
+        match boot_fb_phys() {
+            Some(phys) if phys != 0 => {
+                let lo = self.bar1_phys;
+                let hi = lo.saturating_add(self.info.fb_size as u64);
+                phys >= lo && phys < hi
+            }
+            _ => false,
+        }
+    }
+
+    /// Issue the tu102 GMMU invalidate for our channel's PDB and poll for
+    /// completion. Returns `(pre, post, ok)` — the trigger register before and
+    /// after, and whether bit31 cleared. Aborts (no write) if a flush is already
+    /// in flight. This is the only GPU register write of Step 2.
+    fn gmmu_flush(&self, root_phys: u64) -> (u32, u32, bool) {
+        let bar0 = self._bar0;
+        let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
+        let wr = |off: u32, v: u32| unsafe {
+            core::ptr::write_volatile((bar0 + off as usize) as *mut u32, v)
+        };
+        let pre = rd(0x00b8_30b0);
+        if pre & 0x8000_0000 != 0 {
+            return (pre, pre, false); // flush already pending — never stack
+        }
+        wr(0x00b8_30a0, (root_phys >> 8) as u32);
+        wr(0x00b8_30a4, 0);
+        wr(0x00b8_30b0, 0x8000_0001); // trigger PAGE_ALL invalidate
+        let mut post = pre;
+        let mut ok = false;
+        for _ in 0..5_000_000u64 {
+            post = rd(0x00b8_30b0);
+            if post & 0x8000_0000 == 0 {
+                ok = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        (pre, post, ok)
     }
 
     pub fn fill_rect(&self, x: u32, y: u32, w: u32, h: u32, color: u32) {
@@ -747,7 +857,12 @@ impl DrmScheme for NvidiaGpu {
             pcfg & 0xffff,
             pcfg >> 16
         );
-        let _ = writeln!(s, "[gpudbg]  PFB_CSTATUS(0x10020c)={:#010x}", cstatus);
+        let _ = writeln!(
+            s,
+            "[gpudbg]  PFB_CSTATUS(0x10020c)={:#010x} drives_console={}",
+            cstatus,
+            self.drives_boot_display()
+        );
 
         // --- Step 0: FIFO / MMU status (read-only "hang oracle") ---
         // Confirms which runlist owns the copy engine and that no MMU fault is
@@ -808,6 +923,83 @@ impl DrmScheme for NvidiaGpu {
                     );
                 }
             }
+        }
+        s
+    }
+
+    /// Step 2: instance block + GMMU flush — the first GPU register writes.
+    /// Auto-skips the GPU that drives the boot console. Opt-in (`/proc/gpustep2`).
+    fn bringup_step2(&self) -> String {
+        use core::fmt::Write;
+        let mut s = String::new();
+        if self.drives_boot_display() {
+            let _ = writeln!(
+                s,
+                "[gpustep2] {} ({}) SKIPPED — drives the boot console (bar1_phys={:#x}); too risky without serial",
+                self.name, self.gpu_model, self.bar1_phys
+            );
+            return s;
+        }
+
+        let mut g = self.bringup.lock();
+        if g.is_none() {
+            *g = GpuBringup::build(0x0020_0000);
+        }
+        let b = match g.as_ref() {
+            Some(b) => b,
+            None => {
+                let _ = writeln!(s, "[gpustep2] {} alloc_coherent FAILED", self.name);
+                return s;
+            }
+        };
+
+        let _ = writeln!(
+            s,
+            "[gpustep2] === {} ({}) — Step 2: instance block + GMMU flush ===",
+            self.name, self.gpu_model
+        );
+
+        // Part 1: build the instance block in sysmem (no GPU write).
+        b.write_instance_block();
+        let inst = b.inst.vaddr();
+        let rb = |off: usize| unsafe { core::ptr::read_volatile((inst + off) as *const u32) };
+        let _ = writeln!(
+            s,
+            "[gpustep2]  inst@0x200={:08x}{:08x} @0x208={:08x}{:08x} userd@0x008={:08x}{:08x}",
+            rb(0x204),
+            rb(0x200),
+            rb(0x20c),
+            rb(0x208),
+            rb(0x00c),
+            rb(0x008)
+        );
+
+        // Part 2: the only GPU register write — flush our PDB.
+        let root_phys = b.root.paddr() as u64;
+        let (pre, post, ok) = self.gmmu_flush(root_phys);
+        let _ = writeln!(
+            s,
+            "[gpustep2]  flush PDB=(root>>8)={:#x}  trigger(0xb830b0) pre={:#010x} post={:#010x} bit31_cleared={}",
+            root_phys >> 8,
+            pre,
+            post,
+            ok
+        );
+        if ok {
+            let _ = writeln!(
+                s,
+                "[gpustep2]  OK — GMMU accepted the PDB, MMU not wedged. Ready for Step 3 (runlist + doorbell)."
+            );
+        } else if pre & 0x8000_0000 != 0 {
+            let _ = writeln!(
+                s,
+                "[gpustep2]  ABORTED — a flush was already in flight (bit31 set); no write performed."
+            );
+        } else {
+            let _ = writeln!(
+                s,
+                "[gpustep2]  TIMEOUT — bit31 never cleared. Suspect bad PDB; inspect /proc/gpudbg fault regs (do NOT re-trigger)."
+            );
         }
         s
     }
@@ -1058,6 +1250,7 @@ impl PciDriver for NvidiaGpuDriverPci {
                 bar0_vaddr,
                 fb_vaddr,
                 fb_len as usize,
+                fb_addr,
                 1920,
                 1080,
             )?);
