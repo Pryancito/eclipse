@@ -1214,11 +1214,31 @@ impl DrmScheme for NvidiaGpu {
             self.name, self.gpu_model
         );
 
-        // Part 1: write the instance block into VRAM (via PRAMIN). First a PRAMIN
-        // round-trip self-test so we know the window works on this GPU.
+        // Part 1: diagnose the PRAMIN window before trusting it. Probe the
+        // window-base register and round-trip a value at several VRAM offsets.
+        let bar0 = self._bar0;
+        let rd0 = |off: usize| unsafe { core::ptr::read_volatile((bar0 + off) as *const u32) };
+        let wr0 = |off: usize, v: u32| unsafe {
+            core::ptr::write_volatile((bar0 + off) as *mut u32, v)
+        };
+        // (a) window-base register readback.
+        wr0(0x1700, 0x8000);
+        let win_rb = rd0(0x1700);
+        // (b) raw read of the data window at the current base.
+        let praw = rd0(0x0070_0000);
+        // (c) round-trip at VRAM 2 GiB.
         let inst = b.inst_vram();
-        self.pramin_w32(inst + 0x100, 0xDEAD_BEEF);
-        let pramin_ok = self.pramin_r32(inst + 0x100) == 0xDEAD_BEEF;
+        self.pramin_w32(inst + 0x40, 0xCAFE_0001);
+        let rt_2g = self.pramin_r32(inst + 0x40);
+        // (d) round-trip at VRAM offset 0 (low).
+        self.pramin_w32(0x40, 0xCAFE_0002);
+        let rt_lo = self.pramin_r32(0x40);
+        let _ = writeln!(
+            s,
+            "[gpustep2]  PRAMIN probe: win(0x1700)<-0x8000 rb={:#010x} raw(0x700000)={:#010x} rt@2G={:#010x} rt@0={:#010x}",
+            win_rb, praw, rt_2g, rt_lo
+        );
+        let pramin_ok = rt_2g == 0xCAFE_0001 || rt_lo == 0xCAFE_0002;
         self.write_instance_block_vram(b);
         let rb = |off: u64| self.pramin_r32(inst + off);
         let _ = writeln!(
