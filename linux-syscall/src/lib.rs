@@ -149,30 +149,40 @@ impl Syscall<'_> {
         // TEMP diag (GL hang): trace blocking syscalls for the labwc compositor
         // so the last line before it deadlocks during Mesa init points at the
         // exact syscall it is stuck in. Remove once the hang is located.
+        // Only block-on-each-other primitives, no per-read flood: enough to see
+        // the futex handshake / wait structure without drowning the console.
         if matches!(
             sys_type,
             Sys::FUTEX
-                | Sys::READ
-                | Sys::PREAD64
                 | Sys::PPOLL
                 | Sys::POLL
                 | Sys::EPOLL_WAIT
                 | Sys::EPOLL_PWAIT
-                | Sys::PSELECT6
-                | Sys::SELECT
-                | Sys::RECVMSG
-                | Sys::RECVFROM
                 | Sys::NANOSLEEP
                 | Sys::CLOCK_NANOSLEEP
                 | Sys::WAIT4
         ) && self.zircon_process().name().contains("labwc")
         {
+            // For FUTEX, decode WAIT vs WAKE from the op in a1 so the deadlock
+            // structure is readable at a glance.
+            let kind = if matches!(sys_type, Sys::FUTEX) {
+                match a1 & 0xf {
+                    0 => "FUTEX_WAIT",
+                    1 => "FUTEX_WAKE",
+                    9 => "FUTEX_WAIT_BITSET",
+                    10 => "FUTEX_WAKE_BITSET",
+                    3 | 4 => "FUTEX_REQUEUE",
+                    _ => "FUTEX_?",
+                }
+            } else {
+                "BLOCK"
+            };
             log::error!(
-                "[gltrace] tid={} {:?} a0={:#x} a1={:#x} a2={:#x}",
+                "[gltrace] tid={} {:?}/{} a0={:#x} a2={:#x}",
                 self.thread.id(),
                 sys_type,
+                kind,
                 a0,
-                a1,
                 a2
             );
         }
