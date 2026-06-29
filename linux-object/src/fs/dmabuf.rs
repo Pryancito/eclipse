@@ -73,6 +73,24 @@ impl FileLike for DmaBuf {
         Err(LxError::ENOSYS)
     }
 
+    /// Mesa's software dma-buf import (`kms_sw_displaytarget_from_handle`) sizes
+    /// the buffer with `lseek(fd, 0, SEEK_END)` before mmap()ing it. Report the
+    /// backing size so the import succeeds; without this lseek failed (EBADF on
+    /// a non-`File` fd) and eglCreateImageKHR returned EGL_BAD_ALLOC.
+    fn seek(&self, pos: SeekFrom) -> LxResult<u64> {
+        let offset = match pos {
+            SeekFrom::Start(off) => off as i64,
+            SeekFrom::End(off) => self.size as i64 + off,
+            // dma-bufs are stateless here (no kept cursor); treat relative seeks
+            // from a zero base, which is all Mesa needs.
+            SeekFrom::Current(off) => off,
+        };
+        if offset < 0 {
+            return Err(LxError::EINVAL);
+        }
+        Ok(offset as u64)
+    }
+
     fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
         Ok(PollStatus {
             read: true,

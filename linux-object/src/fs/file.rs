@@ -324,6 +324,12 @@ impl FileLike for File {
         })
     }
 
+    fn seek(&self, pos: SeekFrom) -> LxResult<u64> {
+        // Delegate to the inherent offset-tracking seek (UFCS avoids recursing
+        // into this trait method).
+        File::seek(self, pos)
+    }
+
     async fn read(&self, buf: &mut [u8]) -> LxResult<usize> {
         let (offset, flags, inode) = {
             let inner = self.inner.read();

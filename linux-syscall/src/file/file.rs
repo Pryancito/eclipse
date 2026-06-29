@@ -256,7 +256,10 @@ impl Syscall<'_> {
         info!("lseek: fd={:?}, pos={:?}", fd, pos);
 
         let proc = self.linux_process();
-        let file = proc.get_file(fd)?;
+        // Use the FileLike seek so it works on non-`File` fds too — notably the
+        // DRM PRIME dma-buf fd, which Mesa's software importer sizes with
+        // lseek(SEEK_END). `get_file` would reject it with EBADF.
+        let file = proc.get_file_like(fd)?;
         let offset = file.seek(pos)?;
         Ok(offset as usize)
     }
