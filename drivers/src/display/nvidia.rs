@@ -1214,31 +1214,36 @@ impl DrmScheme for NvidiaGpu {
             self.name, self.gpu_model
         );
 
-        // Part 1: diagnose the PRAMIN window before trusting it. Probe the
-        // window-base register and round-trip a value at several VRAM offsets.
-        let bar0 = self._bar0;
-        let rd0 = |off: usize| unsafe { core::ptr::read_volatile((bar0 + off) as *const u32) };
-        let wr0 = |off: usize, v: u32| unsafe {
-            core::ptr::write_volatile((bar0 + off) as *mut u32, v)
-        };
-        // (a) window-base register readback.
-        wr0(0x1700, 0x8000);
-        let win_rb = rd0(0x1700);
-        // (b) raw read of the data window at the current base.
-        let praw = rd0(0x0070_0000);
-        // (c) round-trip at VRAM 2 GiB.
+        // Part 1: read-only PRAMIN accessibility ladder. PRAMIN works (rt@0
+        // round-tripped) but VRAM at 2 GiB read back the 0xBAD0ACxx PRI-error
+        // sentinel, so probe which offsets the window actually reaches. An
+        // inaccessible offset reads the sentinel; real VRAM does not. No writes.
+        let ladder = [
+            ("0", 0u64),
+            ("1M", 0x10_0000),
+            ("4M", 0x40_0000),
+            ("16M", 0x100_0000),
+            ("64M", 0x400_0000),
+            ("256M", 0x1000_0000),
+            ("512M", 0x2000_0000),
+            ("1G", 0x4000_0000),
+            ("2G", 0x8000_0000),
+        ];
+        let _ = write!(s, "[gpustep2]  PRAMIN ladder:");
+        let mut last_ok = 0u64;
+        for (name, off) in ladder {
+            let v = self.pramin_r32(off);
+            let bad = (v & 0xFFFF_FF00) == 0xBAD0_AC00;
+            if !bad {
+                last_ok = off;
+            }
+            let _ = write!(s, " {}={}", name, if bad { "BAD" } else { "ok" });
+        }
+        let _ = writeln!(s, " (highest ok={:#x})", last_ok);
+
         let inst = b.inst_vram();
-        self.pramin_w32(inst + 0x40, 0xCAFE_0001);
-        let rt_2g = self.pramin_r32(inst + 0x40);
-        // (d) round-trip at VRAM offset 0 (low).
-        self.pramin_w32(0x40, 0xCAFE_0002);
-        let rt_lo = self.pramin_r32(0x40);
-        let _ = writeln!(
-            s,
-            "[gpustep2]  PRAMIN probe: win(0x1700)<-0x8000 rb={:#010x} raw(0x700000)={:#010x} rt@2G={:#010x} rt@0={:#010x}",
-            win_rb, praw, rt_2g, rt_lo
-        );
-        let pramin_ok = rt_2g == 0xCAFE_0001 || rt_lo == 0xCAFE_0002;
+        let st = self.pramin_r32(inst);
+        let pramin_ok = (st & 0xFFFF_FF00) != 0xBAD0_AC00;
         self.write_instance_block_vram(b);
         let rb = |off: u64| self.pramin_r32(inst + off);
         let _ = writeln!(
