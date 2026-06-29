@@ -3,6 +3,7 @@ use alloc::vec::Vec;
 
 use crate::bus::pci_drivers::PciDriver;
 use crate::prelude::{AccelCaps, ColorFormat, DisplayInfo, FrameBuffer};
+use crate::utils::dma::DmaRegion;
 use crate::scheme::drm::{DrmCaps, DrmConnector, DrmCrtc, DrmPlane, GemHandle};
 use crate::scheme::{DisplayScheme, DrmScheme, Scheme};
 use crate::{builder::IoMapper, Device, DeviceError, DeviceResult};
@@ -37,6 +38,206 @@ mod regs {
     // Display resolution registers (legacy/fallback)
     pub const NV50_HEAD0_RASTER_SIZE: u32 = 0x610798;
     pub const NV40_PCRTC_HEAD0_SIZE: u32 = 0x60002C;
+}
+
+/// TU106 (Turing) GMMU encode helpers — NV_MMU_VER2 page-table format.
+///
+/// Verified against nouveau `vmmgp100.c` / open-gpu `gp100/dev_mmu.h` (Turing
+/// reuses the gp100 VER2 VMM verbatim). These build page tables in *RAM only*;
+/// the GPU never sees them until the instance block is written and the GMMU is
+/// flushed (a later, riskier step). Critical fact: the leaf PTE address field
+/// is `phys >> 4` (the 53:8 field stores `phys>>12`, and `(phys>>12)<<8 ==
+/// phys>>4`); writing `phys>>12` directly hangs the GPU.
+mod gmmu {
+    /// SYSTEM_COHERENT aperture (HOST). VRAM=0, HOST=2, NCOH=3.
+    pub const AP_HOST: u64 = 2;
+    /// PITCH (uncompressed) kind.
+    pub const KIND_PITCH: u64 = 0x00;
+
+    /// Leaf PTE for a 4 KiB sysmem page, read-write, uncompressed.
+    /// VALID(0) | APERTURE 2:1 = HOST | VOL(3) | ADDRESS=phys>>4 | KIND 63:56.
+    #[inline]
+    pub fn encode_pte_sys(phys: u64) -> u64 {
+        (phys >> 4) | (1 << 0) | (AP_HOST << 1) | (1 << 3) | (KIND_PITCH << 56)
+    }
+
+    /// Single PDE (PD1/PD2/PD3 levels) pointing at the next table in sysmem.
+    /// APERTURE 2:1 = HOST (aperture != 0 ⇒ present; there is no VALID bit) |
+    /// VOL(3) | ADDRESS_SYS 53:8 = next>>4. The dual-PDE SMALL half is encoded
+    /// identically and stored in the high qword at byte `pdei*0x10 + 8`.
+    #[inline]
+    pub fn encode_pde_sys(next_table_phys: u64) -> u64 {
+        (next_table_phys >> 4) | (AP_HOST << 1) | (1 << 3)
+    }
+
+    /// Instance-block PD-base qword (@0x200): root PD phys OR'd with
+    /// VER2(1<<10) | 64KiB(1<<11) | HOST_target(2<<0) | VOL(1<<2) == `|0xC06`.
+    #[inline]
+    pub fn inst_pd_base(root_phys: u64) -> u64 {
+        root_phys | 0xC06
+    }
+}
+
+/// Coherent-sysmem structures for the Turing copy-engine bring-up (the verified
+/// memory plan). All allocated via `DmaRegion::alloc_coherent` (page-aligned,
+/// zeroed, UC). Built and dumped read-only at `/proc/gpudbg` for hand
+/// verification BEFORE any GPU state is changed. The four buffers the *engine*
+/// dereferences by VA (src/dst/sem/pushbuffer) are packed into a single 2 MiB
+/// GMMU region so one SPT leaf and one PD0 entry cover everything.
+#[allow(dead_code)] // inst/userd/gpfifo are wired up in later bring-up steps
+struct GpuBringup {
+    // 5-level page-directory chain (sysmem-coherent, one 4 KiB page each).
+    root: DmaRegion, // desc_12[4], PGD 2-bit, the PDB given to the GPU
+    pd3: DmaRegion,  // desc_12[3], PGD 9-bit
+    pd2: DmaRegion,  // desc_12[2], PGD 9-bit
+    pd0: DmaRegion,  // desc_12[1], dual-PDE 8-bit
+    spt: DmaRegion,  // desc_12[0], SPT leaf, 512×8 B PTEs
+    // Channel / FIFO structures (filled in later steps).
+    inst: DmaRegion,
+    userd: DmaRegion,
+    gpfifo: DmaRegion,
+    pushbuf: DmaRegion,
+    sem: DmaRegion,
+    src: DmaRegion,
+    dst: DmaRegion,
+    /// Base GPU virtual address of the packed 2 MiB region.
+    va_base: u64,
+}
+
+impl GpuBringup {
+    /// Allocate the memory plan and build the GMMU page tables in RAM. No GPU
+    /// register is touched here — only sysmem is written, so this is safe to run
+    /// on demand. Returns `None` if the coherent DMA allocator is exhausted.
+    fn build(va_base: u64) -> Option<Self> {
+        let root = DmaRegion::alloc_coherent(0x1000)?;
+        let pd3 = DmaRegion::alloc_coherent(0x1000)?;
+        let pd2 = DmaRegion::alloc_coherent(0x1000)?;
+        let pd0 = DmaRegion::alloc_coherent(0x1000)?;
+        let spt = DmaRegion::alloc_coherent(0x1000)?;
+        let inst = DmaRegion::alloc_coherent(0x1000)?;
+        let userd = DmaRegion::alloc_coherent(0x1000)?;
+        let gpfifo = DmaRegion::alloc_coherent(0x1000)?;
+        let pushbuf = DmaRegion::alloc_coherent(0x1000)?;
+        let sem = DmaRegion::alloc_coherent(0x1000)?;
+        let src = DmaRegion::alloc_coherent(0x1000)?;
+        let dst = DmaRegion::alloc_coherent(0x1000)?;
+
+        // Pack the four engine-visible buffers into one 2 MiB region:
+        //   src=+0x0  dst=+0x1000  sem=+0x2000  pushbuffer=+0x3000
+        let src_va = va_base;
+        let dst_va = va_base + 0x1000;
+        let sem_va = va_base + 0x2000;
+        let pb_va = va_base + 0x3000;
+
+        // Leaf PTEs (SPT). idx = (va>>12)&0x1ff; the four pages occupy idx 0..3.
+        let wr64 = |r: &DmaRegion, i: usize, v: u64| unsafe {
+            core::ptr::write_volatile(r.as_ptr::<u64>().add(i), v)
+        };
+        wr64(&spt, ((src_va >> 12) & 0x1ff) as usize, gmmu::encode_pte_sys(src.paddr() as u64));
+        wr64(&spt, ((dst_va >> 12) & 0x1ff) as usize, gmmu::encode_pte_sys(dst.paddr() as u64));
+        wr64(&spt, ((sem_va >> 12) & 0x1ff) as usize, gmmu::encode_pte_sys(sem.paddr() as u64));
+        wr64(&spt, ((pb_va >> 12) & 0x1ff) as usize, gmmu::encode_pte_sys(pushbuf.paddr() as u64));
+
+        // PD0 dual-PDE: pdei = (va>>21)&0xff (== 1 for all four, same 2 MiB slot).
+        // Low qword = BIG (unused, 0); high qword = SMALL = single-PDE form.
+        let pdei = ((src_va >> 21) & 0xff) as usize;
+        wr64(&pd0, pdei * 2, 0);
+        wr64(&pd0, pdei * 2 + 1, gmmu::encode_pde_sys(spt.paddr() as u64));
+
+        // PD2 / PD3 / root: single PDEs; idx == 0 at all three top levels here.
+        wr64(&pd2, ((src_va >> 29) & 0x1ff) as usize, gmmu::encode_pde_sys(pd0.paddr() as u64));
+        wr64(&pd3, ((src_va >> 38) & 0x1ff) as usize, gmmu::encode_pde_sys(pd2.paddr() as u64));
+        wr64(&root, ((src_va >> 47) & 0x3) as usize, gmmu::encode_pde_sys(pd3.paddr() as u64));
+
+        Some(Self {
+            root,
+            pd3,
+            pd2,
+            pd0,
+            spt,
+            inst,
+            userd,
+            gpfifo,
+            pushbuf,
+            sem,
+            src,
+            dst,
+            va_base,
+        })
+    }
+
+    /// Read-only dump of the allocated physical layout and every encoded
+    /// page-table entry, for hand-verification against the spec before the GPU
+    /// is ever pointed at these tables.
+    fn dump(&self) -> String {
+        use core::fmt::Write;
+        let rd64 = |r: &DmaRegion, i: usize| unsafe {
+            core::ptr::read_volatile(r.as_ptr::<u64>().add(i))
+        };
+        let mut s = String::new();
+        let _ = writeln!(
+            s,
+            "[gpudbg]  --- GMMU tables (Step 1, built in RAM; GPU not yet pointed at them) ---"
+        );
+        let _ = writeln!(
+            s,
+            "[gpudbg]  PD  phys: root={:#x} pd3={:#x} pd2={:#x} pd0={:#x} spt={:#x}",
+            self.root.paddr(),
+            self.pd3.paddr(),
+            self.pd2.paddr(),
+            self.pd0.paddr(),
+            self.spt.paddr()
+        );
+        let _ = writeln!(
+            s,
+            "[gpudbg]  buf phys: inst={:#x} userd={:#x} gpfifo={:#x} pb={:#x} sem={:#x} src={:#x} dst={:#x}",
+            self.inst.paddr(),
+            self.userd.paddr(),
+            self.gpfifo.paddr(),
+            self.pushbuf.paddr(),
+            self.sem.paddr(),
+            self.src.paddr(),
+            self.dst.paddr()
+        );
+        let va = self.va_base;
+        let ri = ((va >> 47) & 0x3) as usize;
+        let d3 = ((va >> 38) & 0x1ff) as usize;
+        let d2 = ((va >> 29) & 0x1ff) as usize;
+        let pdei = ((va >> 21) & 0xff) as usize;
+        let _ = writeln!(
+            s,
+            "[gpudbg]  VA base={:#x} idx[root={} pd3={} pd2={} pd0={}]",
+            va, ri, d3, d2, pdei
+        );
+        let _ = writeln!(s, "[gpudbg]  root[{}] = {:#018x}", ri, rd64(&self.root, ri));
+        let _ = writeln!(s, "[gpudbg]  pd3 [{}] = {:#018x}", d3, rd64(&self.pd3, d3));
+        let _ = writeln!(s, "[gpudbg]  pd2 [{}] = {:#018x}", d2, rd64(&self.pd2, d2));
+        let _ = writeln!(
+            s,
+            "[gpudbg]  pd0 [{}] big={:#018x} small={:#018x}",
+            pdei,
+            rd64(&self.pd0, pdei * 2),
+            rd64(&self.pd0, pdei * 2 + 1)
+        );
+        for (name, off) in [("src", 0u64), ("dst", 0x1000), ("sem", 0x2000), ("pb", 0x3000)] {
+            let v = va + off;
+            let si = ((v >> 12) & 0x1ff) as usize;
+            let _ = writeln!(
+                s,
+                "[gpudbg]  spt [{:3}] {} va={:#x} pte={:#018x}",
+                si,
+                name,
+                v,
+                rd64(&self.spt, si)
+            );
+        }
+        let _ = writeln!(
+            s,
+            "[gpudbg]  inst PD-base qword(@0x200) = {:#018x} (root|0xC06)",
+            gmmu::inst_pd_base(self.root.paddr() as u64)
+        );
+        s
+    }
 }
 
 static BOOT_FB_INFO: Mutex<Option<BootFbInfo>> = Mutex::new(None);
@@ -78,6 +279,10 @@ pub struct NvidiaGpu {
     _bar0: usize,
     _bar1: usize,
     vram_allocator: Mutex<Option<NvidiaVramAllocator>>,
+    /// Copy-engine bring-up state (GMMU tables + channel structs). Built lazily
+    /// on the first `/proc/gpudbg` read so the memory plan is only allocated
+    /// when someone is actually debugging GPU bring-up.
+    bringup: Mutex<Option<GpuBringup>>,
 }
 
 /// Simple bitmap-based VRAM allocator for BAR1 aperture (4KB page granularity)
@@ -276,6 +481,7 @@ impl NvidiaGpu {
                 fb_vaddr as u64,
                 fb_size as u64,
             ))),
+            bringup: Mutex::new(None),
         })
     }
 
@@ -542,6 +748,67 @@ impl DrmScheme for NvidiaGpu {
             pcfg >> 16
         );
         let _ = writeln!(s, "[gpudbg]  PFB_CSTATUS(0x10020c)={:#010x}", cstatus);
+
+        // --- Step 0: FIFO / MMU status (read-only "hang oracle") ---
+        // Confirms which runlist owns the copy engine and that no MMU fault is
+        // latched at boot, BEFORE any risky write. All reads. Offsets per
+        // nouveau tu102 (vfn/fifo/mmu). A PRI-error sentinel (0xbadfxxxx) here
+        // just means the engine block is in reset — still harmless to read.
+        let doorbell_en = rd(0x00b6_5000);
+        let _ = writeln!(
+            s,
+            "[gpudbg]  --- FIFO/MMU (Step 0, read-only) ---"
+        );
+        let _ = writeln!(
+            s,
+            "[gpudbg]  DOORBELL_EN(0xb65000)={:#010x} (bit31={})",
+            doorbell_en,
+            doorbell_en >> 31
+        );
+        for rl in 0..2u32 {
+            let base = 0x0000_2b00 + rl * 0x10;
+            let _ = writeln!(
+                s,
+                "[gpudbg]  RUNL{} base_lo(0x{:x})={:#010x} base_hi={:#010x} submit={:#010x} cfg(0x{:x})={:#010x}",
+                rl,
+                base,
+                rd(base),
+                rd(base + 4),
+                rd(base + 8),
+                base + 0xc,
+                rd(base + 0xc)
+            );
+        }
+        let _ = writeln!(
+            s,
+            "[gpudbg]  CHAN0_CFG(0x800004)={:#010x}",
+            rd(0x0080_0004)
+        );
+        let _ = writeln!(
+            s,
+            "[gpudbg]  MMU flush PDB(0xb830a0)={:#010x} hi(0xb830a4)={:#010x} trigger(0xb830b0)={:#010x}",
+            rd(0x00b8_30a0),
+            rd(0x00b8_30a4),
+            rd(0x00b8_30b0)
+        );
+
+        // --- Step 1: build the GMMU tables in RAM and dump them (no GPU writes) ---
+        {
+            let mut g = self.bringup.lock();
+            if g.is_none() {
+                // GPU VA base for the packed 2 MiB region (avoids null-VA).
+                *g = GpuBringup::build(0x0020_0000);
+            }
+            match g.as_ref() {
+                Some(b) => s.push_str(&b.dump()),
+                None => {
+                    let _ = writeln!(
+                        s,
+                        "[gpudbg]  GMMU: alloc_coherent FAILED (DMA pool exhausted)"
+                    );
+                }
+            }
+        }
         s
     }
 
