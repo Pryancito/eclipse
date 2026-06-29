@@ -64,6 +64,17 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// GPU copy-engine bring-up **Step 2**, surfaced (opt-in) at
+    /// `/proc/gpustep2`: write the channel instance block into sysmem and issue
+    /// the GMMU flush — the first real GPU register writes of the bring-up.
+    /// Default: nothing. The hardware driver auto-targets the GPU that does NOT
+    /// drive the boot console (so a wedge cannot blank the only output) and
+    /// returns a human-readable report. Unlike `debug_dump` this is NOT
+    /// read-only, hence its own node: `/proc/gpudbg` stays safe to poll.
+    fn bringup_step2(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Import a buffer allocated by the kernel (DRM core)
     fn import_buffer(&self, _handle: GemHandle) -> bool {
         true
