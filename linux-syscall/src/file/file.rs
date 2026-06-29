@@ -635,6 +635,25 @@ impl Syscall<'_> {
             Err(LxError::ENOSYS) => Err(LxError::ENOTTY),
             other => other,
         };
+        // TEMP diag (GL buffers): trace every DRM ioctl ('d' group) labwc issues
+        // with its result, to find which call fails (or returns junk) during the
+        // gbm_bo_create / dmabuf swapchain allocation. Remove once located.
+        if ((request >> 8) & 0xff) == 0x64 && self.zircon_process().name().contains("labwc") {
+            match &ret {
+                Ok(n) => log::error!(
+                    "[gltrace-drm] req={:#x} a1={:#x} -> Ok({})",
+                    request as u32,
+                    arg1,
+                    n
+                ),
+                Err(e) => log::error!(
+                    "[gltrace-drm] req={:#x} a1={:#x} -> ERR {:?}",
+                    request as u32,
+                    arg1,
+                    e
+                ),
+            }
+        }
         // Surface a genuinely unhandled/failed ioctl on the console (and serial),
         // the same way an invalid syscall number is — but throttle a program
         // busy-looping on the same failing request so it can't flood the console
