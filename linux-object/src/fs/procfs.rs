@@ -14,9 +14,9 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 13] = [
+const PROC_ROOT_STATIC: [&str; 14] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
-    "perf", "hunter", "filesystems",
+    "perf", "hunter", "filesystems", "gpudbg",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -287,6 +287,7 @@ impl INode for ProcRootINode {
             "perf" => Ok(PROC_PERF_DIR.clone()),
             "hunter" => Ok(PROC_HUNTER.clone()),
             "filesystems" => Ok(PROC_FILESYSTEMS.clone()),
+            "gpudbg" => Ok(PROC_GPUDBG.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
                 if let Ok(pid) = name.parse::<u64>() {
@@ -1025,6 +1026,19 @@ fn proc_meminfo_content() -> String {
 }
 
 /// Minimal `/proc/cpuinfo` for fastfetch CPU detection on x86_64.
+fn proc_gpudbg_content() -> String {
+    // GPUs register as DRM devices (Device::Drm), not displays, and there may be
+    // more than one — dump every one.
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.debug_dump());
+    }
+    if s.is_empty() {
+        s.push_str("[gpudbg] no DRM driver with debug support\n");
+    }
+    s
+}
+
 fn proc_cpuinfo_content() -> String {
     let mut brand = kernel_hal::cpu::cpu_brand();
     if brand.is_empty() {
@@ -1219,6 +1233,13 @@ lazy_static! {
     static ref PROC_CPUINFO: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 12,
         generate: proc_cpuinfo_content,
+    });
+    /// `/proc/gpudbg` — on-demand, read-only GPU register/state dump for the GPU
+    /// copy-engine bring-up. Re-reads live each `cat`, so it doubles as the dev
+    /// loop: change the driver's `debug_dump`, rebuild, `cat /proc/gpudbg`.
+    static ref PROC_GPUDBG: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 99,
+        generate: proc_gpudbg_content,
     });
     static ref PROC_SWAPS: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 18,

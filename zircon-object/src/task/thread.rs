@@ -1003,8 +1003,6 @@ struct ThreadSwitchFuture {
     // The future is only ever polled by one executor at a time (task borrow
     // bit), so this mutex is never actually contended.
     future: spin::Mutex<ThreadFuturePinned>,
-    // TEMP diag (GL hang): set once the thread is first polled by an executor.
-    first_polled: core::sync::atomic::AtomicBool,
 }
 
 impl ThreadSwitchFuture {
@@ -1012,7 +1010,6 @@ impl ThreadSwitchFuture {
         Self {
             future: spin::Mutex::new(future),
             thread,
-            first_polled: core::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -1020,17 +1017,6 @@ impl ThreadSwitchFuture {
 impl Future for ThreadSwitchFuture {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // TEMP diag (GL hang): log the first time each labwc thread is polled by
-        // an executor, to confirm a freshly-cloned worker actually gets to run.
-        if !self
-            .first_polled
-            .swap(true, core::sync::atomic::Ordering::Relaxed)
-        {
-            use crate::object::KernelObject as _;
-            if self.thread.proc().name().contains("labwc") {
-                log::error!("[gltrace] RUN tid={}", self.thread.base.id);
-            }
-        }
         cfg_if! {
             if #[cfg(all(target_os = "none", target_arch = "aarch64"))] {
                 use kernel_hal::arch::config::USER_TABLE_FLAG;
