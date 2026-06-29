@@ -146,6 +146,36 @@ impl Syscall<'_> {
             }
         };
         let [a0, a1, a2, a3, a4, a5] = args;
+        // TEMP diag (GL hang): trace blocking syscalls for the labwc compositor
+        // so the last line before it deadlocks during Mesa init points at the
+        // exact syscall it is stuck in. Remove once the hang is located.
+        if matches!(
+            sys_type,
+            Sys::FUTEX
+                | Sys::READ
+                | Sys::PREAD64
+                | Sys::PPOLL
+                | Sys::POLL
+                | Sys::EPOLL_WAIT
+                | Sys::EPOLL_PWAIT
+                | Sys::PSELECT6
+                | Sys::SELECT
+                | Sys::RECVMSG
+                | Sys::RECVFROM
+                | Sys::NANOSLEEP
+                | Sys::CLOCK_NANOSLEEP
+                | Sys::WAIT4
+        ) && self.zircon_process().name().contains("labwc")
+        {
+            log::error!(
+                "[gltrace] tid={} {:?} a0={:#x} a1={:#x} a2={:#x}",
+                self.thread.id(),
+                sys_type,
+                a0,
+                a1,
+                a2
+            );
+        }
         // Eclipse's own perf accounting: time every syscall and attribute it to
         // both the system-wide and per-process tables (surfaced at `/proc/perf`
         // and `/proc/<pid>/perf`). The name resolver is registered lazily here
