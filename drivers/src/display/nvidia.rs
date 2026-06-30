@@ -894,6 +894,17 @@ impl NvidiaGpu {
         // so it must see an enabled channel). gk104_chan_start: 0x800004 |= 0x400.
         wr(0x0080_0004 + CHID * 8, rd(0x0080_0004 + CHID * 8) | 0x0000_0400);
 
+        // tu102_chan_start does MORE than gk104_chan_start: right after the
+        // PCCSR enable write it ALSO rings the doorbell immediately, with the
+        // SAME token a later GPFIFO push would use (runl_id<<16 | chid). This
+        // is the actual kick that wakes the HW scheduler to notice a freshly
+        // enabled channel and pull it off PENDING — without it the channel
+        // can sit at PENDING forever even after a clean runlist commit, which
+        // is exactly the symptom we hit. device->vfn->addr.user + 0x0090 ==
+        // BAR0 + 0xb80000(priv) + 0x030000(user) + 0x90 == 0xbb0090.
+        let token = (RUNL_ID << 16) | CHID;
+        wr(0x00bb_0090, token);
+
         // Runlist commit LAST (2 entries). The runlist lives in VRAM; the host
         // reads it VRAM-physical, no target field needed (tu102_runl_commit).
         let base = 0x0000_2b00 + RUNL_ID * 0x10;
@@ -1697,6 +1708,23 @@ impl DrmScheme for NvidiaGpu {
             rd(0x0004_0120),
             rd(0x0004_2100),
             rd(0x0004_2120)
+        );
+        // 0x040100 is NV_PPBDMA_STATUS — all-SUSPENDED (0x10011111) is just the
+        // idle/reset value, not a fault signal; nouveau's actual liveness check
+        // (gk104_runq_idle) polls NV_PFIFO_PBDMA_STATUS at 0x003080+id*4,
+        // CHAN_STATUS = bits 15:13 (0=INVALID/idle,1=VALID,5=LOAD,6=SAVE,7=SWITCH),
+        // ID = bits 11:0 (loaded chid).
+        let pfs0 = rd(0x0000_3080);
+        let pfs1 = rd(0x0000_3084);
+        let _ = writeln!(
+            s,
+            "[gpustep4]  PFIFO_PBDMA_STATUS q0(0x3080)={:#010x} chan_status={} id={:#x}  q1(0x3084)={:#010x} chan_status={} id={:#x}",
+            pfs0,
+            (pfs0 >> 13) & 0x7,
+            pfs0 & 0xfff,
+            pfs1,
+            (pfs1 >> 13) & 0x7,
+            pfs1 & 0xfff
         );
         let _ = writeln!(
             s,
