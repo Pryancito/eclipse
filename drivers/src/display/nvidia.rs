@@ -810,6 +810,19 @@ impl NvidiaGpu {
         let wr = |off: u32, v: u32| unsafe {
             core::ptr::write_volatile((bar0 + off as usize) as *mut u32, v)
         };
+        // (0) PMC reset pulse for FIFO (nvkm_mc_reset, gk104_mc_reset[]: FIFO =
+        // mask 0x00000100 at NV_PMC_ENABLE 0x000200). This is the FIRST thing
+        // nouveau does for any engine before touching its registers — disable
+        // then re-enable the bit, deasserting reset. We never did this: the
+        // register *file* tolerates R/W while clock/reset-gated (writes latch,
+        // reads echo them back), but the scheduler FSM that walks
+        // PENDING -> ON_PBDMA never actually runs while FIFO sits in reset,
+        // which matches every symptom seen so far (clean fault, clean writes,
+        // zero scheduling progress). Idempotent — safe to repeat.
+        wr(0x0000_0200, rd(0x0000_0200) & !0x0000_0100);
+        let _ = rd(0x0000_0200);
+        wr(0x0000_0200, rd(0x0000_0200) | 0x0000_0100);
+        let _ = rd(0x0000_0200);
         // (A) doorbell-enable (tu102_fifo_init_pbdmas).
         wr(0x00b6_5000, rd(0x00b6_5000) | 0x8000_0000);
         // (B) per-PBDMA (runq) init, stride id*0x2000. Init a generous range to
@@ -1628,8 +1641,21 @@ impl DrmScheme for NvidiaGpu {
             self.name, self.gpu_model
         );
 
+        // PMC_ENABLE before/after: confirms whether FIFO (mask 0x100) was
+        // actually sitting in reset before setup_channel's reset pulse.
+        let pmc_pre = unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_0200) as *const u32) };
+
         // Bring the channel live (idempotent; covers a fresh boot).
         let commit_ok = self.setup_channel(b);
+        let pmc_post = unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_0200) as *const u32) };
+        let _ = writeln!(
+            s,
+            "[gpustep4]  PMC_ENABLE(0x200) pre={:#010x} post={:#010x} (FIFO bit 0x100: pre={} post={})",
+            pmc_pre,
+            pmc_post,
+            (pmc_pre >> 8) & 1,
+            (pmc_post >> 8) & 1
+        );
         let _ = writeln!(s, "[gpustep4]  channel setup: runlist_commit={}", commit_ok);
 
         // Build the method stream (sysmem pushbuffer) + a GPFIFO launch entry at
