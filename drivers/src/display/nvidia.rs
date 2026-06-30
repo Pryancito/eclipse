@@ -1477,14 +1477,20 @@ impl DrmScheme for NvidiaGpu {
     }
 
     /// Step 2: instance block + GMMU flush — the first GPU register writes.
-    /// Auto-skips the GPU that drives the boot console. Opt-in (`/proc/gpustep2`).
+    /// TEMPORARY: the secondary (non-console) GPU has its own unrelated
+    /// problems (USB breaks in Eclipse when it's made primary; likely never
+    /// got a VBIOS devinit replay since it's never POSTed), so for now we
+    /// target the ONLY GPU available — the one driving the console — and
+    /// skip the other one instead. This trades away the original safety net
+    /// (a hang here now means losing the only display and a hard reboot);
+    /// the user has explicitly accepted that risk. Opt-in (`/proc/gpustep2`).
     fn bringup_step2(&self) -> String {
         use core::fmt::Write;
         let mut s = String::new();
-        if self.drives_boot_display() {
+        if !self.drives_boot_display() {
             let _ = writeln!(
                 s,
-                "[gpustep2] {} ({}) SKIPPED — drives the boot console (bar1_phys={:#x}); too risky without serial",
+                "[gpustep2] {} ({}) SKIPPED — not the console GPU (bar1_phys={:#x}); only testing the single available GPU",
                 self.name, self.gpu_model, self.bar1_phys
             );
             return s;
@@ -1623,10 +1629,12 @@ impl DrmScheme for NvidiaGpu {
         const CHID: u32 = 0;
 
         let mut s = String::new();
-        if self.drives_boot_display() {
+        // TEMPORARY: targeting the console GPU instead of skipping it — see
+        // the comment on bringup_step2 for why.
+        if !self.drives_boot_display() {
             let _ = writeln!(
                 s,
-                "[gpustep3] {} SKIPPED — drives the boot console",
+                "[gpustep3] {} SKIPPED — not the console GPU; only testing the single available GPU",
                 self.name
             );
             return s;
@@ -1731,8 +1739,14 @@ impl DrmScheme for NvidiaGpu {
         const CHID: u32 = 0;
 
         let mut s = String::new();
-        if self.drives_boot_display() {
-            let _ = writeln!(s, "[gpustep4] {} SKIPPED — drives the boot console", self.name);
+        // TEMPORARY: targeting the console GPU instead of skipping it — see
+        // the comment on bringup_step2 for why.
+        if !self.drives_boot_display() {
+            let _ = writeln!(
+                s,
+                "[gpustep4] {} SKIPPED — not the console GPU; only testing the single available GPU",
+                self.name
+            );
             return s;
         }
 
