@@ -1813,6 +1813,11 @@ impl DrmScheme for NvidiaGpu {
         // stale (write bit31 to the fault-clear reg 0xb83094).
         unsafe { core::ptr::write_volatile((self._bar0 + 0x00b8_3094) as *mut u32, 0x8000_0000) };
 
+        // PFIFO_INTR_0 before the ring — did a prior interrupt condition
+        // latch (e.g. a scheduler/runlist-update completion) that we never
+        // acked, possibly stalling forward progress.
+        let intr0_pre = unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_2100) as *const u32) };
+
         // Advance GP_PUT (VRAM USERD, via PRAMIN), fence, ring the doorbell.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         self.pramin_w32(userd + 0x8c, target);
@@ -1831,6 +1836,49 @@ impl DrmScheme for NvidiaGpu {
             }
             core::hint::spin_loop();
         }
+
+        let intr0_post = unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_2100) as *const u32) };
+        let _ = writeln!(
+            s,
+            "[gpustep4]  PFIFO_INTR_0(0x2100) pre={:#010x} post={:#010x} (new bits={:#010x})",
+            intr0_pre,
+            intr0_post,
+            intr0_post & !intr0_pre
+        );
+
+        // Speculative retry: ack any latched interrupt, re-commit the
+        // runlist (idempotent), and ring the doorbell again — on the off
+        // chance the very first commit on a cold/never-scheduled-before
+        // FIFO needs a second nudge to actually wake the arbiter, even
+        // though the register-level sequence matches real driver source
+        // exactly. Cheap and safe (everything here is designed by NVIDIA
+        // to be re-entrant/idempotent); only attempted if the first try
+        // timed out.
+        let mut retried = false;
+        let mut retry_advanced = false;
+        if !advanced {
+            unsafe {
+                core::ptr::write_volatile((self._bar0 + 0x0000_2100) as *mut u32, intr0_post);
+            }
+            let (retry_commit_ok, _) = self.setup_channel(b);
+            unsafe { core::ptr::write_volatile((self._bar0 + 0x00bb_0090) as *mut u32, token) };
+            retried = true;
+            for _ in 0..2_000_000u64 {
+                get_after = self.pramin_r32(userd + 0x88);
+                if get_after == target {
+                    retry_advanced = true;
+                    advanced = true;
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+            let _ = writeln!(
+                s,
+                "[gpustep4]  retry: ack_intr + re-commit({}) + re-ring -> advanced={}",
+                retry_commit_ok, retry_advanced
+            );
+        }
+        let _ = (retried, retry_advanced);
 
         // Read the MMU fault THIS step generated (cleared just before the ring).
         let rd = |off: u32| unsafe { core::ptr::read_volatile((self._bar0 + off as usize) as *const u32) };
