@@ -99,11 +99,15 @@ struct GpuBringup {
     sem: DmaRegion,
     src: DmaRegion,
     dst: DmaRegion,
-    /// Copy-engine fault-method buffer (sysmem). The host reads its pointer
-    /// from the instance block through the BAR2 MMU when binding the CE engine,
-    /// so it must be reachable via BAR2; we map it into the shared page tables
-    /// (BAR2 reuses the channel's PD), 8 pages at va_base+0x5000.
+    /// Copy-engine fault-method buffer (sysmem). Only dereferenced by the CE
+    /// engine on a faulting method; a red herring for channel load, kept mapped
+    /// at va_base+0x5000 but its instance-block pointer is left disarmed.
     ce_fault: DmaRegion,
+    /// HUB MMU non-replayable fault buffer (sysmem). On Volta+ the host requires
+    /// a fault buffer armed (NV_VIRTUAL_FUNCTION_PRIV_MMU_FAULT_BUFFER, 0xb83000)
+    /// before any channel can run — nouveau arms it in the `fault` subdev before
+    /// the FIFO. We arm it in PHYSICAL/SYS_COH mode so no BAR2 mapping is needed.
+    fault_buf: DmaRegion,
     /// Base GPU virtual address of the packed 2 MiB region.
     va_base: u64,
     /// Base VRAM offset (0-based into VRAM) for the structures the host reads by
@@ -136,7 +140,9 @@ impl GpuBringup {
     fn gpfifo_va(&self) -> u64 {
         self.va_base + 0x4000
     }
-    /// GPU/BAR2 VA of the CE fault-method buffer.
+    /// GPU/BAR2 VA of the CE fault-method buffer. Used once we arm the real CE
+    /// engine context (after HOST/GP_GET is brought up).
+    #[allow(dead_code)]
     #[inline]
     fn ce_fault_va(&self) -> u64 {
         self.va_base + 0x5000
@@ -161,6 +167,8 @@ impl GpuBringup {
         // CE fault-method buffer: 8 pages (32 KiB) covers the nouveau size
         // formula for any realistic PCE count.
         let ce_fault = DmaRegion::alloc_coherent(0x8000)?;
+        // HUB MMU fault buffer: 256 KiB (8192 × 32 B entries) — generous.
+        let fault_buf = DmaRegion::alloc_coherent(0x4_0000)?;
 
         // Pack the engine-visible buffers into one 2 MiB region:
         //  src=+0x0 dst=+0x1000 sem=+0x2000 pushbuffer=+0x3000 gpfifo=+0x4000
@@ -215,6 +223,7 @@ impl GpuBringup {
             src,
             dst,
             ce_fault,
+            fault_buf,
             va_base,
             vram_base,
         })
@@ -657,18 +666,17 @@ impl NvidiaGpu {
     /// as VRAM-physical. The PD-base at 0x200 points at the *sysmem* page tables
     /// (target=2). USERD pointer is VRAM-physical; the GPFIFO base is a GPU VA
     /// (GMMU-translated). Offsets per nouveau gv100_vmm_join / ramfc_write.
-    fn write_instance_block_vram(&self, b: &GpuBringup) {
-        let inst = b.inst_vram();
-        self.pramin_zero(inst, 0x1000);
+    /// Write the Turing VER2 PDB join (gv100_vmm_join) into a VRAM instance
+    /// block via PRAMIN: PD-base @0x200, VA limit @0x208, and the 0x2a0
+    /// subcontext descriptor table (entry 0 = real PDB, 1..63 = 0x1/0x1/0).
+    /// Shared by the channel and BAR2 instance blocks. Assumes already zeroed.
+    fn write_pdb_join_vram(&self, inst: u64, root_phys: u64) {
         let w32 = |off: u64, v: u32| self.pramin_w32(inst + off, v);
-        let w64 = |off: u64, v: u64| {
-            w32(off, v as u32);
-            w32(off + 4, (v >> 32) as u32);
-        };
-        let base = gmmu::inst_pd_base(b.root.paddr() as u64); // root | 0xC06 (sysmem target)
-        w64(0x200, base);
-        w64(0x208, (1u64 << 49) - 1);
-        // Turing PDB descriptor table (gv100_vmm_join).
+        let base = gmmu::inst_pd_base(root_phys); // root | 0xC06 (sysmem target)
+        w32(0x200, base as u32);
+        w32(0x204, (base >> 32) as u32);
+        w32(0x208, ((1u64 << 49) - 1) as u32);
+        w32(0x20c, (((1u64 << 49) - 1) >> 32) as u32);
         w32(0x21c, 0);
         w32(0x2a0, base as u32);
         w32(0x2a4, (base >> 32) as u32);
@@ -681,6 +689,14 @@ impl NvidiaGpu {
         }
         w32(0x298, 0x1);
         w32(0x29c, 0x0);
+    }
+
+    fn write_instance_block_vram(&self, b: &GpuBringup) {
+        let inst = b.inst_vram();
+        self.pramin_zero(inst, 0x1000);
+        let w32 = |off: u64, v: u32| self.pramin_w32(inst + off, v);
+        // PD-base + VA limit + Turing PDB descriptor table.
+        self.write_pdb_join_vram(inst, b.root.paddr() as u64);
         // RAMFC: USERD (VRAM phys), GPFIFO (GPU VA), ids.
         let userd = b.userd_vram();
         let gpfifo_va = b.gpfifo_va();
@@ -697,15 +713,38 @@ impl NvidiaGpu {
         w32(0x0e8, 0x0000_0000); // chan_id 0
         w32(0x0f4, 0x0000_1100); // 0x1000 | priv 0x100
         w32(0x0f8, 0x1000_3080);
+        // CE/GR engine-context pointers (0x210-0x224, arm bits 0x10000/0x20000
+        // at 0x0ac) are left ZERO: HOST never reads them during channel load —
+        // only the engine does, on a faulting method, which never happens before
+        // GP_GET advances. Arming a CE context with a BAR2 pointer is a red
+        // herring for the load-time fault, so we bring up HOST first.
+    }
 
-        // CE engine-context pointer (gv100_ectx_ce_bind): the fault-method
-        // buffer's BAR2 address goes at 0x220/0x224, armed by bit 0x20000 at
-        // 0x0ac. BAR2 reuses the channel's page tables, so the BAR2 address is
-        // just the buffer's GPU VA. (GR's 0x210/0x214 stays 0 — we don't use GR.)
-        let ce_bar2 = b.ce_fault_va();
-        w32(0x220, ce_bar2 as u32);
-        w32(0x224, (ce_bar2 >> 32) as u32);
-        w32(0x0ac, 0x0002_0000);
+    /// Arm the HUB MMU non-replayable fault buffer (buffer 0) so the host will
+    /// schedule channels. NV_VIRTUAL_FUNCTION_PRIV_MMU_FAULT_BUFFER at 0xb83000:
+    /// LO = addr|aperture|mode, HI = addr_hi, SIZE = count|ENABLE. We use
+    /// PHYSICAL mode + SYS_COH aperture so the buffer is plain sysmem (no BAR2).
+    /// Returns (hw_count, lo, hi, size) for reporting.
+    fn setup_fault_buffer(&self, b: &GpuBringup) -> (u32, u32, u32, u32) {
+        let bar0 = self._bar0;
+        let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
+        let wr = |off: u32, v: u32| unsafe {
+            core::ptr::write_volatile((bar0 + off as usize) as *mut u32, v)
+        };
+        // Latch + read the HW-reported entry count (set bit30, clear ENABLE).
+        wr(0x00b8_3010, (rd(0x00b8_3010) & !0xc000_0000) | 0x4000_0000);
+        let hw_count = rd(0x00b8_3010) & 0x000f_ffff;
+        // Our buffer holds at most 0x40000/32 = 0x2000 entries.
+        let cap = (b.fault_buf.byte_len() / 32) as u32;
+        let count = hw_count.min(cap);
+        let phys = b.fault_buf.paddr() as u64;
+        // LO: PHYSICAL(bit0=1) | PHYS_APERTURE SYS_COH(2<<1) | VOL(1<<3) | ADDR.
+        let lo = (phys as u32 & 0xffff_f000) | 0x1 | (2 << 1) | (1 << 3);
+        wr(0x00b8_3004, (phys >> 32) as u32);
+        wr(0x00b8_3000, lo);
+        // SIZE: entry count + ENABLE(bit31).
+        wr(0x00b8_3010, count | 0x8000_0000);
+        (hw_count, lo, (phys >> 32) as u32, rd(0x00b8_3010))
     }
 
     /// Set BAR2 live so the host can dereference the CE fault-method-buffer
@@ -713,15 +752,12 @@ impl NvidiaGpu {
     /// BAR2 instance block (VRAM, via PRAMIN) points at the SAME page tables as
     /// the channel, so BAR2 VA == channel VA. Register per tu102_bar_bar2_init.
     fn setup_bar2(&self, b: &GpuBringup) -> (u32, u32, u32) {
-        // Build the BAR2 instance block in VRAM: just PD-base + VA limit
-        // (gf100_vmm_join_; no channel descriptor table needed for a BAR vmm).
+        // Build the BAR2 instance block in VRAM with the FULL Turing VER2 PDB
+        // join (PD-base + VA limit + the 0x2a0 descriptor table), same as a
+        // channel — on Turing even a BAR vmm uses the VER2 join. Shared root.
         let bi = b.bar2_inst_vram();
         self.pramin_zero(bi, 0x1000);
-        let base = gmmu::inst_pd_base(b.root.paddr() as u64); // shared root, sysmem target
-        self.pramin_w32(bi + 0x200, base as u32);
-        self.pramin_w32(bi + 0x204, (base >> 32) as u32);
-        self.pramin_w32(bi + 0x208, ((1u64 << 49) - 1) as u32);
-        self.pramin_w32(bi + 0x20c, (((1u64 << 49) - 1) >> 32) as u32);
+        self.write_pdb_join_vram(bi, b.root.paddr() as u64);
 
         let bar0 = self._bar0;
         let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
@@ -804,8 +840,8 @@ impl NvidiaGpu {
 
         self.write_instance_block_vram(b);
         self.write_runlist_vram(b);
-        // BAR2 must be live before the channel runs (the host reads the CE
-        // context pointer through the BAR2 MMU).
+        // Arm the HUB MMU fault buffer — required before any channel can run.
+        let _ = self.setup_fault_buffer(b);
         let _ = self.setup_bar2(b);
         let _ = self.gmmu_flush(b.root.paddr() as u64);
 
@@ -1340,11 +1376,21 @@ impl DrmScheme for NvidiaGpu {
         );
         let _ = writeln!(
             s,
-            "[gpustep2]  CE ctx: inst@0x220={:08x}{:08x} @0x0ac={:08x} (ce_fault_va={:#x})",
+            "[gpustep2]  CE ctx (disarmed): inst@0x220={:08x}{:08x} @0x0ac={:08x}",
             rb(0x224),
             rb(0x220),
             rb(0x0ac),
-            b.ce_fault_va()
+        );
+        // Arm the HUB MMU fault buffer (the likely root cause) and report it.
+        let (fb_count, fb_lo, fb_hi, fb_size) = self.setup_fault_buffer(b);
+        let _ = writeln!(
+            s,
+            "[gpustep2]  FAULT_BUF: hw_count={:#x} buf_phys={:#x} LO(0xb83000)={:#010x} HI={:#010x} SIZE(0xb83010)={:#010x}",
+            fb_count,
+            b.fault_buf.paddr(),
+            fb_lo,
+            fb_hi,
+            fb_size
         );
         // Make BAR2 live and report the bind, plus the PCE map (CE buffer size).
         let (b2_before, b2_after, b2_wait) = self.setup_bar2(b);
@@ -1545,6 +1591,10 @@ impl DrmScheme for NvidiaGpu {
         b.write_gpfifo_entry(slot, pb_va, n);
         let target = put_before + 1;
 
+        // Clear any latched MMU fault so the one we read after is OURS, not
+        // stale (write bit31 to the fault-clear reg 0xb83094).
+        unsafe { core::ptr::write_volatile((self._bar0 + 0x00b8_3094) as *mut u32, 0x8000_0000) };
+
         // Advance GP_PUT (VRAM USERD, via PRAMIN), fence, ring the doorbell.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         self.pramin_w32(userd + 0x8c, target);
@@ -1563,6 +1613,24 @@ impl DrmScheme for NvidiaGpu {
             }
             core::hint::spin_loop();
         }
+
+        // Read the MMU fault THIS step generated (cleared just before the ring).
+        let rd = |off: u32| unsafe { core::ptr::read_volatile((self._bar0 + off as usize) as *const u32) };
+        let f_info1 = rd(0x00b8_3090);
+        let f_alo = rd(0x00b8_3080);
+        let f_ahi = rd(0x00b8_3084);
+        let f_info0 = rd(0x00b8_3088);
+        let _ = writeln!(
+            s,
+            "[gpustep4]  fresh fault: INFO1={:#010x} valid={} access={} reason={} VA={:#x}{:08x} eng={:#x}",
+            f_info1,
+            f_info1 >> 31,
+            (f_info1 >> 16) & 0xf,
+            f_info1 & 0x1f,
+            f_ahi,
+            f_alo & 0xffff_f000,
+            f_info0 & 0xff,
+        );
 
         let chan_cfg = unsafe { core::ptr::read_volatile((self._bar0 + 0x0080_0004) as *const u32) };
         let _ = writeln!(
