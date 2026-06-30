@@ -1675,7 +1675,31 @@ impl DrmScheme for NvidiaGpu {
             "[gpustep4]  pb_va={:#x} n={} slot={} GP_PUT {}->{} GP_GET {}->{} advanced={} doorbell=0xbb0090 token={:#x}",
             pb_va, n, slot, put_before, target, get_before, get_after, advanced, token
         );
-        let _ = writeln!(s, "[gpustep4]  chan{}-cfg(0x800004)={:#010x}", CHID, chan_cfg);
+        let _ = writeln!(
+            s,
+            "[gpustep4]  chan{}-cfg(0x800004)={:#010x} status={}",
+            CHID,
+            chan_cfg,
+            (chan_cfg >> 24) & 0xf
+        );
+        // PBDMA state: did the init un-SUSPEND them (STATUS != 0x10011111), who
+        // serves runlist 0 (PBDMA_MAP RUNLISTS mask), is our channel loaded?
+        let _ = writeln!(
+            s,
+            "[gpustep4]  PBDMA0 st(0x40100)={:#010x} ch={:#010x}  PBDMA1 st(0x42100)={:#010x} ch={:#010x}",
+            rd(0x0004_0100),
+            rd(0x0004_0120),
+            rd(0x0004_2100),
+            rd(0x0004_2120)
+        );
+        let _ = writeln!(
+            s,
+            "[gpustep4]  PBDMA_MAP p0(0x2390)={:#06x} p1={:#06x} p2={:#06x} p3={:#06x} (bit n = serves runlist n)",
+            rd(0x0000_2390) & 0xffff,
+            rd(0x0000_2394) & 0xffff,
+            rd(0x0000_2398) & 0xffff,
+            rd(0x0000_239c) & 0xffff
+        );
         if advanced {
             let _ = writeln!(
                 s,
