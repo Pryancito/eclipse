@@ -67,10 +67,14 @@ pub trait DrmScheme: Scheme {
     /// GPU copy-engine bring-up **Step 2**, surfaced (opt-in) at
     /// `/proc/gpustep2`: write the channel instance block into sysmem and issue
     /// the GMMU flush — the first real GPU register writes of the bring-up.
-    /// Default: nothing. The hardware driver auto-targets the GPU that does NOT
-    /// drive the boot console (so a wedge cannot blank the only output) and
+    /// Default: nothing. The hardware driver targets a specific GPU and
     /// returns a human-readable report. Unlike `debug_dump` this is NOT
     /// read-only, hence its own node: `/proc/gpudbg` stays safe to poll.
+    ///
+    /// TEMPORARY (see nvidia.rs `bringup_step2`): currently targets the
+    /// CONSOLE GPU (only one GPU available; the other has unrelated
+    /// problems) instead of the original non-console safety net — a wedge
+    /// here can blank the only display and require a hard reboot.
     fn bringup_step2(&self) -> alloc::string::String {
         alloc::string::String::new()
     }
@@ -78,7 +82,7 @@ pub trait DrmScheme: Scheme {
     /// GPU copy-engine bring-up **Step 3** (`/proc/gpustep3`): enable the
     /// doorbell, commit the channel runlist, and enable the channel in the
     /// scheduler — with an empty GPFIFO so nothing actually executes. Same
-    /// non-console auto-targeting as `bringup_step2`. Default: nothing.
+    /// targeting as `bringup_step2` (see its TEMPORARY note). Default: nothing.
     fn bringup_step3(&self) -> alloc::string::String {
         alloc::string::String::new()
     }
@@ -86,7 +90,7 @@ pub trait DrmScheme: Scheme {
     /// GPU copy-engine bring-up **Step 4** (`/proc/gpustep4`): ring the doorbell
     /// with a pushbuffer that binds the copy class (`SET_OBJECT`), exercising the
     /// full doorbell → PBDMA → GMMU-translated pushbuffer fetch → method-parse
-    /// path. Same non-console auto-targeting. Default: nothing.
+    /// path. Same targeting as `bringup_step2` (see its TEMPORARY note). Default: nothing.
     fn bringup_step4(&self) -> alloc::string::String {
         alloc::string::String::new()
     }
