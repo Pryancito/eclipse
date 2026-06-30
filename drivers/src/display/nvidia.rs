@@ -885,8 +885,28 @@ impl NvidiaGpu {
         let inst_vram = b.inst_vram();
         wr(0x0080_0000 + CHID * 8, 0x8000_0000 | (inst_vram >> 12) as u32);
 
-        // Runlist commit (2 entries). The runlist lives in VRAM; the host reads
-        // it as VRAM-physical, so no target field is needed (tu102_runl_commit).
+        // Ensure runlist scheduling is allowed (NV_PFIFO_SCHED_DISABLE bit=runl
+        // id; gk104_runl_allow clears it). Default is 0, but clear it to be sure.
+        wr(0x0000_2630, rd(0x0000_2630) & !(1u32 << RUNL_ID));
+
+        // Enable the channel BEFORE committing the runlist (nouveau order is
+        // bind -> start(enable) -> commit; the commit is what loads the channel,
+        // so it must see an enabled channel). gk104_chan_start: 0x800004 |= 0x400.
+        wr(0x0080_0004 + CHID * 8, rd(0x0080_0004 + CHID * 8) | 0x0000_0400);
+
+        // tu102_chan_start does MORE than gk104_chan_start: right after the
+        // PCCSR enable write it ALSO rings the doorbell immediately, with the
+        // SAME token a later GPFIFO push would use (runl_id<<16 | chid). This
+        // is the actual kick that wakes the HW scheduler to notice a freshly
+        // enabled channel and pull it off PENDING — without it the channel
+        // can sit at PENDING forever even after a clean runlist commit, which
+        // is exactly the symptom we hit. device->vfn->addr.user + 0x0090 ==
+        // BAR0 + 0xb80000(priv) + 0x030000(user) + 0x90 == 0xbb0090.
+        let token = (RUNL_ID << 16) | CHID;
+        wr(0x00bb_0090, token);
+
+        // Runlist commit LAST (2 entries). The runlist lives in VRAM; the host
+        // reads it VRAM-physical, no target field needed (tu102_runl_commit).
         let base = 0x0000_2b00 + RUNL_ID * 0x10;
         let runlist_vram = b.runlist_vram();
         wr(base, runlist_vram as u32);
@@ -900,9 +920,6 @@ impl NvidiaGpu {
             }
             core::hint::spin_loop();
         }
-
-        // Channel enable (gk104_chan_start).
-        wr(0x0080_0004 + CHID * 8, rd(0x0080_0004 + CHID * 8) | 0x0000_0400);
         ok
     }
 
@@ -1692,6 +1709,23 @@ impl DrmScheme for NvidiaGpu {
             rd(0x0004_2100),
             rd(0x0004_2120)
         );
+        // 0x040100 is NV_PPBDMA_STATUS — all-SUSPENDED (0x10011111) is just the
+        // idle/reset value, not a fault signal; nouveau's actual liveness check
+        // (gk104_runq_idle) polls NV_PFIFO_PBDMA_STATUS at 0x003080+id*4,
+        // CHAN_STATUS = bits 15:13 (0=INVALID/idle,1=VALID,5=LOAD,6=SAVE,7=SWITCH),
+        // ID = bits 11:0 (loaded chid).
+        let pfs0 = rd(0x0000_3080);
+        let pfs1 = rd(0x0000_3084);
+        let _ = writeln!(
+            s,
+            "[gpustep4]  PFIFO_PBDMA_STATUS q0(0x3080)={:#010x} chan_status={} id={:#x}  q1(0x3084)={:#010x} chan_status={} id={:#x}",
+            pfs0,
+            (pfs0 >> 13) & 0x7,
+            pfs0 & 0xfff,
+            pfs1,
+            (pfs1 >> 13) & 0x7,
+            pfs1 & 0xfff
+        );
         let _ = writeln!(
             s,
             "[gpustep4]  PBDMA_MAP p0(0x2390)={:#06x} p1={:#06x} p2={:#06x} p3={:#06x} (bit n = serves runlist n)",
@@ -1699,6 +1733,22 @@ impl DrmScheme for NvidiaGpu {
             rd(0x0000_2394) & 0xffff,
             rd(0x0000_2398) & 0xffff,
             rd(0x0000_239c) & 0xffff
+        );
+        // Scheduler gate + the runlist entries as the host sees them in VRAM.
+        let rl = b.runlist_vram();
+        let _ = writeln!(
+            s,
+            "[gpustep4]  SCHED_DISABLE(0x2630)={:#010x}  runlist@{:#x} cgrp[{:08x} {:08x} {:08x} {:08x}] chan[{:08x} {:08x} {:08x} {:08x}]",
+            rd(0x0000_2630),
+            rl,
+            self.pramin_r32(rl + 0x0),
+            self.pramin_r32(rl + 0x4),
+            self.pramin_r32(rl + 0x8),
+            self.pramin_r32(rl + 0xc),
+            self.pramin_r32(rl + 0x10),
+            self.pramin_r32(rl + 0x14),
+            self.pramin_r32(rl + 0x18),
+            self.pramin_r32(rl + 0x1c)
         );
         if advanced {
             let _ = writeln!(
