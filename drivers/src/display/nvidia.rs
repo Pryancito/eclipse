@@ -1700,6 +1700,22 @@ impl DrmScheme for NvidiaGpu {
             rd(0x0000_2398) & 0xffff,
             rd(0x0000_239c) & 0xffff
         );
+        // Scheduler gate + the runlist entries as the host sees them in VRAM.
+        let rl = b.runlist_vram();
+        let _ = writeln!(
+            s,
+            "[gpustep4]  SCHED_DISABLE(0x2630)={:#010x}  runlist@{:#x} cgrp[{:08x} {:08x} {:08x} {:08x}] chan[{:08x} {:08x} {:08x} {:08x}]",
+            rd(0x0000_2630),
+            rl,
+            self.pramin_r32(rl + 0x0),
+            self.pramin_r32(rl + 0x4),
+            self.pramin_r32(rl + 0x8),
+            self.pramin_r32(rl + 0xc),
+            self.pramin_r32(rl + 0x10),
+            self.pramin_r32(rl + 0x14),
+            self.pramin_r32(rl + 0x18),
+            self.pramin_r32(rl + 0x1c)
+        );
         if advanced {
             let _ = writeln!(
                 s,
