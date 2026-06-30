@@ -885,8 +885,17 @@ impl NvidiaGpu {
         let inst_vram = b.inst_vram();
         wr(0x0080_0000 + CHID * 8, 0x8000_0000 | (inst_vram >> 12) as u32);
 
-        // Runlist commit (2 entries). The runlist lives in VRAM; the host reads
-        // it as VRAM-physical, so no target field is needed (tu102_runl_commit).
+        // Ensure runlist scheduling is allowed (NV_PFIFO_SCHED_DISABLE bit=runl
+        // id; gk104_runl_allow clears it). Default is 0, but clear it to be sure.
+        wr(0x0000_2630, rd(0x0000_2630) & !(1u32 << RUNL_ID));
+
+        // Enable the channel BEFORE committing the runlist (nouveau order is
+        // bind -> start(enable) -> commit; the commit is what loads the channel,
+        // so it must see an enabled channel). gk104_chan_start: 0x800004 |= 0x400.
+        wr(0x0080_0004 + CHID * 8, rd(0x0080_0004 + CHID * 8) | 0x0000_0400);
+
+        // Runlist commit LAST (2 entries). The runlist lives in VRAM; the host
+        // reads it VRAM-physical, no target field needed (tu102_runl_commit).
         let base = 0x0000_2b00 + RUNL_ID * 0x10;
         let runlist_vram = b.runlist_vram();
         wr(base, runlist_vram as u32);
@@ -900,9 +909,6 @@ impl NvidiaGpu {
             }
             core::hint::spin_loop();
         }
-
-        // Channel enable (gk104_chan_start).
-        wr(0x0080_0004 + CHID * 8, rd(0x0080_0004 + CHID * 8) | 0x0000_0400);
         ok
     }
 
