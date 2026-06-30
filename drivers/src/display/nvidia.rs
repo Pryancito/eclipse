@@ -869,12 +869,126 @@ impl NvidiaGpu {
         (pre, post, ok)
     }
 
+    /// Scan the PTOP device-info table (0x022700+i*4, 64 slots) for the copy
+    /// engine's runlist id. Volta+ gives EVERY engine its own dedicated
+    /// runlist (discovered, not fixed) — we had been assuming runlist 0 is
+    /// the copy engine's without ever checking, and runlist 0 may actually
+    /// belong to GR instead. Mirrors nvkm's gk104_top_parse exactly: each
+    /// logical device spans 1+ consecutive 32-bit words (continuation while
+    /// bit31 is set; the final word of an entry, bit31 clear, carries the
+    /// ENGINE_TYPE -> NVKM engine dispatch). Returns the runlist id of the
+    /// first CE engine instance found (type 0x1/0x2/0x3 = CE0/1/2, or 0x13 =
+    /// CE with explicit inst from a DATA word), or None if no CE entry
+    /// carried a runlist field.
+    fn find_ce_runlist(&self) -> Option<u32> {
+        let bar0 = self._bar0;
+        let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
+        let mut ty: u32 = !0;
+        let mut have_entry = false;
+        let mut runlist: u32 = 0;
+        let mut have_runlist = false;
+        for i in 0..64u32 {
+            if !have_entry {
+                ty = !0;
+                have_runlist = false;
+                have_entry = true;
+            }
+            let data = rd(0x0002_2700 + i * 4);
+            match data & 0x3 {
+                0 => continue, // NOT_VALID — skip, keep accumulating this entry
+                1 => {}        // DATA — addr/fault/inst, unused here
+                2 => {
+                    if data & 0x10 != 0 {
+                        runlist = (data >> 21) & 0xf;
+                        have_runlist = true;
+                    }
+                }
+                3 => ty = (data >> 2) & 0x1fff_ffff, // ENGINE_TYPE
+                _ => unreachable!(),
+            }
+            if data & 0x8000_0000 != 0 {
+                continue; // more words follow for this same entry
+            }
+            // Finalize: type 1/2/3 = CE0/1/2 fixed inst, 0x13 = CE w/ DATA inst.
+            if have_runlist && matches!(ty, 0x1 | 0x2 | 0x3 | 0x13) {
+                return Some(runlist);
+            }
+            have_entry = false;
+        }
+        None
+    }
+
+    /// Same scan as `find_ce_runlist` but reports every finalized entry
+    /// (type, inst, runlist) as text, for hardware visibility — does this
+    /// chip even expose a runlist field for CE, and what does GR's look like
+    /// for comparison.
+    fn ptop_report(&self) -> alloc::string::String {
+        use core::fmt::Write;
+        let bar0 = self._bar0;
+        let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
+        let mut out = alloc::string::String::new();
+        let mut ty: u32 = !0;
+        let mut have_entry = false;
+        let mut runlist: u32 = 0;
+        let mut have_runlist = false;
+        for i in 0..64u32 {
+            if !have_entry {
+                ty = !0;
+                have_runlist = false;
+                have_entry = true;
+            }
+            let data = rd(0x0002_2700 + i * 4);
+            match data & 0x3 {
+                0 => continue,
+                1 => {}
+                2 => {
+                    if data & 0x10 != 0 {
+                        runlist = (data >> 21) & 0xf;
+                        have_runlist = true;
+                    }
+                }
+                3 => ty = (data >> 2) & 0x1fff_ffff,
+                _ => unreachable!(),
+            }
+            if data & 0x8000_0000 != 0 {
+                continue;
+            }
+            let name = match ty {
+                0x0 => "GR",
+                0x1 | 0x2 | 0x3 | 0x13 => "CE",
+                0x8 => "MSPDEC",
+                0x9 => "MSPPP",
+                0xa => "MSVLD",
+                0xb => "MSENC",
+                0xc => "VIC",
+                0xd => "SEC2",
+                0xe | 0xf => "NVENC",
+                0x10 => "NVDEC",
+                0x14 => "GSP",
+                0x15 => "NVJPG",
+                _ if ty == !0 => "?",
+                _ => "OTHER",
+            };
+            if ty != !0 {
+                let _ = write!(
+                    out,
+                    " {}(ty={:#x})/rl={}",
+                    name,
+                    ty,
+                    if have_runlist { runlist as i64 } else { -1 }
+                );
+            }
+            have_entry = false;
+        }
+        out
+    }
+
     /// Idempotently bring the channel to the committed + enabled state (the
     /// Step 3 end-state): instance block, GMMU flush, runlist commit, doorbell
-    /// and channel enable. Returns whether the runlist commit completed. Safe to
+    /// and channel enable. Returns (commit_ok, runlist_id_used). Safe to
     /// repeat — used by Step 4+ so each is self-contained across reboots.
-    fn setup_channel(&self, b: &GpuBringup) -> bool {
-        const RUNL_ID: u32 = 0;
+    fn setup_channel(&self, b: &GpuBringup) -> (bool, u32) {
+        let runl_id = self.find_ce_runlist().unwrap_or(0);
         const CHID: u32 = 0;
         let bar0 = self._bar0;
         let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
@@ -900,7 +1014,7 @@ impl NvidiaGpu {
 
         // Ensure runlist scheduling is allowed (NV_PFIFO_SCHED_DISABLE bit=runl
         // id; gk104_runl_allow clears it). Default is 0, but clear it to be sure.
-        wr(0x0000_2630, rd(0x0000_2630) & !(1u32 << RUNL_ID));
+        wr(0x0000_2630, rd(0x0000_2630) & !(1u32 << runl_id));
 
         // Enable the channel BEFORE committing the runlist (nouveau order is
         // bind -> start(enable) -> commit; the commit is what loads the channel,
@@ -915,12 +1029,12 @@ impl NvidiaGpu {
         // can sit at PENDING forever even after a clean runlist commit, which
         // is exactly the symptom we hit. device->vfn->addr.user + 0x0090 ==
         // BAR0 + 0xb80000(priv) + 0x030000(user) + 0x90 == 0xbb0090.
-        let token = (RUNL_ID << 16) | CHID;
+        let token = (runl_id << 16) | CHID;
         wr(0x00bb_0090, token);
 
         // Runlist commit LAST (2 entries). The runlist lives in VRAM; the host
         // reads it VRAM-physical, no target field needed (tu102_runl_commit).
-        let base = 0x0000_2b00 + RUNL_ID * 0x10;
+        let base = 0x0000_2b00 + runl_id * 0x10;
         let runlist_vram = b.runlist_vram();
         wr(base, runlist_vram as u32);
         wr(base + 4, (runlist_vram >> 32) as u32);
@@ -933,7 +1047,7 @@ impl NvidiaGpu {
             }
             core::hint::spin_loop();
         }
-        ok
+        (ok, runl_id)
     }
 
     pub fn fill_rect(&self, x: u32, y: u32, w: u32, h: u32, color: u32) {
@@ -1614,7 +1728,6 @@ impl DrmScheme for NvidiaGpu {
     /// Auto-skips the console GPU. Opt-in (`/proc/gpustep4`).
     fn bringup_step4(&self) -> String {
         use core::fmt::Write;
-        const RUNL_ID: u32 = 0;
         const CHID: u32 = 0;
 
         let mut s = String::new();
@@ -1645,8 +1758,12 @@ impl DrmScheme for NvidiaGpu {
         // actually sitting in reset before setup_channel's reset pulse.
         let pmc_pre = unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_0200) as *const u32) };
 
-        // Bring the channel live (idempotent; covers a fresh boot).
-        let commit_ok = self.setup_channel(b);
+        // Bring the channel live (idempotent; covers a fresh boot). Volta+
+        // gives every engine its OWN runlist id, discovered via PTOP — using
+        // a hardcoded runlist 0 was an unverified assumption (it might
+        // belong to GR instead of CE); setup_channel now discovers the
+        // actual CE runlist id and commits to that.
+        let (commit_ok, runl_id) = self.setup_channel(b);
         let pmc_post = unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_0200) as *const u32) };
         let _ = writeln!(
             s,
@@ -1656,7 +1773,14 @@ impl DrmScheme for NvidiaGpu {
             (pmc_pre >> 8) & 1,
             (pmc_post >> 8) & 1
         );
-        let _ = writeln!(s, "[gpustep4]  channel setup: runlist_commit={}", commit_ok);
+        let _ = writeln!(
+            s,
+            "[gpustep4]  PTOP-discovered CE runlist id={} (fallback-to-0={}) channel setup: runlist_commit={}",
+            runl_id,
+            self.find_ce_runlist().is_none(),
+            commit_ok
+        );
+        let _ = writeln!(s, "[gpustep4]  PTOP entries:{}", self.ptop_report());
 
         // Build the method stream (sysmem pushbuffer) + a GPFIFO launch entry at
         // the current PUT slot. The GPFIFO entry points at the pushbuffer GPU VA.
@@ -1679,7 +1803,7 @@ impl DrmScheme for NvidiaGpu {
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         self.pramin_w32(userd + 0x8c, target);
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        let token = (RUNL_ID << 16) | CHID;
+        let token = (runl_id << 16) | CHID;
         unsafe { core::ptr::write_volatile((self._bar0 + 0x00bb_0090) as *mut u32, token) };
 
         // Poll GP_GET (VRAM USERD) catching up to GP_PUT.
@@ -1764,8 +1888,10 @@ impl DrmScheme for NvidiaGpu {
         let rl = b.runlist_vram();
         let _ = writeln!(
             s,
-            "[gpustep4]  SCHED_DISABLE(0x2630)={:#010x}  runlist@{:#x} cgrp[{:08x} {:08x} {:08x} {:08x}] chan[{:08x} {:08x} {:08x} {:08x}]",
+            "[gpustep4]  SCHED_DISABLE(0x2630)={:#010x} (runl{} bit={})  runlist@{:#x} cgrp[{:08x} {:08x} {:08x} {:08x}] chan[{:08x} {:08x} {:08x} {:08x}]",
             rd(0x0000_2630),
+            runl_id,
+            (rd(0x0000_2630) >> runl_id) & 1,
             rl,
             self.pramin_r32(rl + 0x0),
             self.pramin_r32(rl + 0x4),
