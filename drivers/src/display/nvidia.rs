@@ -99,11 +99,15 @@ struct GpuBringup {
     sem: DmaRegion,
     src: DmaRegion,
     dst: DmaRegion,
-    /// Copy-engine fault-method buffer (sysmem). The host reads its pointer
-    /// from the instance block through the BAR2 MMU when binding the CE engine,
-    /// so it must be reachable via BAR2; we map it into the shared page tables
-    /// (BAR2 reuses the channel's PD), 8 pages at va_base+0x5000.
+    /// Copy-engine fault-method buffer (sysmem). Only dereferenced by the CE
+    /// engine on a faulting method; a red herring for channel load, kept mapped
+    /// at va_base+0x5000 but its instance-block pointer is left disarmed.
     ce_fault: DmaRegion,
+    /// HUB MMU non-replayable fault buffer (sysmem). On Volta+ the host requires
+    /// a fault buffer armed (NV_VIRTUAL_FUNCTION_PRIV_MMU_FAULT_BUFFER, 0xb83000)
+    /// before any channel can run — nouveau arms it in the `fault` subdev before
+    /// the FIFO. We arm it in PHYSICAL/SYS_COH mode so no BAR2 mapping is needed.
+    fault_buf: DmaRegion,
     /// Base GPU virtual address of the packed 2 MiB region.
     va_base: u64,
     /// Base VRAM offset (0-based into VRAM) for the structures the host reads by
@@ -136,7 +140,9 @@ impl GpuBringup {
     fn gpfifo_va(&self) -> u64 {
         self.va_base + 0x4000
     }
-    /// GPU/BAR2 VA of the CE fault-method buffer.
+    /// GPU/BAR2 VA of the CE fault-method buffer. Used once we arm the real CE
+    /// engine context (after HOST/GP_GET is brought up).
+    #[allow(dead_code)]
     #[inline]
     fn ce_fault_va(&self) -> u64 {
         self.va_base + 0x5000
@@ -161,6 +167,8 @@ impl GpuBringup {
         // CE fault-method buffer: 8 pages (32 KiB) covers the nouveau size
         // formula for any realistic PCE count.
         let ce_fault = DmaRegion::alloc_coherent(0x8000)?;
+        // HUB MMU fault buffer: 256 KiB (8192 × 32 B entries) — generous.
+        let fault_buf = DmaRegion::alloc_coherent(0x4_0000)?;
 
         // Pack the engine-visible buffers into one 2 MiB region:
         //  src=+0x0 dst=+0x1000 sem=+0x2000 pushbuffer=+0x3000 gpfifo=+0x4000
@@ -215,6 +223,7 @@ impl GpuBringup {
             src,
             dst,
             ce_fault,
+            fault_buf,
             va_base,
             vram_base,
         })
@@ -704,15 +713,38 @@ impl NvidiaGpu {
         w32(0x0e8, 0x0000_0000); // chan_id 0
         w32(0x0f4, 0x0000_1100); // 0x1000 | priv 0x100
         w32(0x0f8, 0x1000_3080);
+        // CE/GR engine-context pointers (0x210-0x224, arm bits 0x10000/0x20000
+        // at 0x0ac) are left ZERO: HOST never reads them during channel load —
+        // only the engine does, on a faulting method, which never happens before
+        // GP_GET advances. Arming a CE context with a BAR2 pointer is a red
+        // herring for the load-time fault, so we bring up HOST first.
+    }
 
-        // CE engine-context pointer (gv100_ectx_ce_bind): the fault-method
-        // buffer's BAR2 address goes at 0x220/0x224, armed by bit 0x20000 at
-        // 0x0ac. BAR2 reuses the channel's page tables, so the BAR2 address is
-        // just the buffer's GPU VA. (GR's 0x210/0x214 stays 0 — we don't use GR.)
-        let ce_bar2 = b.ce_fault_va();
-        w32(0x220, ce_bar2 as u32);
-        w32(0x224, (ce_bar2 >> 32) as u32);
-        w32(0x0ac, 0x0002_0000);
+    /// Arm the HUB MMU non-replayable fault buffer (buffer 0) so the host will
+    /// schedule channels. NV_VIRTUAL_FUNCTION_PRIV_MMU_FAULT_BUFFER at 0xb83000:
+    /// LO = addr|aperture|mode, HI = addr_hi, SIZE = count|ENABLE. We use
+    /// PHYSICAL mode + SYS_COH aperture so the buffer is plain sysmem (no BAR2).
+    /// Returns (hw_count, lo, hi, size) for reporting.
+    fn setup_fault_buffer(&self, b: &GpuBringup) -> (u32, u32, u32, u32) {
+        let bar0 = self._bar0;
+        let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
+        let wr = |off: u32, v: u32| unsafe {
+            core::ptr::write_volatile((bar0 + off as usize) as *mut u32, v)
+        };
+        // Latch + read the HW-reported entry count (set bit30, clear ENABLE).
+        wr(0x00b8_3010, (rd(0x00b8_3010) & !0xc000_0000) | 0x4000_0000);
+        let hw_count = rd(0x00b8_3010) & 0x000f_ffff;
+        // Our buffer holds at most 0x40000/32 = 0x2000 entries.
+        let cap = (b.fault_buf.byte_len() / 32) as u32;
+        let count = hw_count.min(cap);
+        let phys = b.fault_buf.paddr() as u64;
+        // LO: PHYSICAL(bit0=1) | PHYS_APERTURE SYS_COH(2<<1) | VOL(1<<3) | ADDR.
+        let lo = (phys as u32 & 0xffff_f000) | 0x1 | (2 << 1) | (1 << 3);
+        wr(0x00b8_3004, (phys >> 32) as u32);
+        wr(0x00b8_3000, lo);
+        // SIZE: entry count + ENABLE(bit31).
+        wr(0x00b8_3010, count | 0x8000_0000);
+        (hw_count, lo, (phys >> 32) as u32, rd(0x00b8_3010))
     }
 
     /// Set BAR2 live so the host can dereference the CE fault-method-buffer
@@ -808,8 +840,8 @@ impl NvidiaGpu {
 
         self.write_instance_block_vram(b);
         self.write_runlist_vram(b);
-        // BAR2 must be live before the channel runs (the host reads the CE
-        // context pointer through the BAR2 MMU).
+        // Arm the HUB MMU fault buffer — required before any channel can run.
+        let _ = self.setup_fault_buffer(b);
         let _ = self.setup_bar2(b);
         let _ = self.gmmu_flush(b.root.paddr() as u64);
 
@@ -1344,11 +1376,21 @@ impl DrmScheme for NvidiaGpu {
         );
         let _ = writeln!(
             s,
-            "[gpustep2]  CE ctx: inst@0x220={:08x}{:08x} @0x0ac={:08x} (ce_fault_va={:#x})",
+            "[gpustep2]  CE ctx (disarmed): inst@0x220={:08x}{:08x} @0x0ac={:08x}",
             rb(0x224),
             rb(0x220),
             rb(0x0ac),
-            b.ce_fault_va()
+        );
+        // Arm the HUB MMU fault buffer (the likely root cause) and report it.
+        let (fb_count, fb_lo, fb_hi, fb_size) = self.setup_fault_buffer(b);
+        let _ = writeln!(
+            s,
+            "[gpustep2]  FAULT_BUF: hw_count={:#x} buf_phys={:#x} LO(0xb83000)={:#010x} HI={:#010x} SIZE(0xb83010)={:#010x}",
+            fb_count,
+            b.fault_buf.paddr(),
+            fb_lo,
+            fb_hi,
+            fb_size
         );
         // Make BAR2 live and report the bind, plus the PCE map (CE buffer size).
         let (b2_before, b2_after, b2_wait) = self.setup_bar2(b);
