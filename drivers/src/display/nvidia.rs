@@ -657,18 +657,17 @@ impl NvidiaGpu {
     /// as VRAM-physical. The PD-base at 0x200 points at the *sysmem* page tables
     /// (target=2). USERD pointer is VRAM-physical; the GPFIFO base is a GPU VA
     /// (GMMU-translated). Offsets per nouveau gv100_vmm_join / ramfc_write.
-    fn write_instance_block_vram(&self, b: &GpuBringup) {
-        let inst = b.inst_vram();
-        self.pramin_zero(inst, 0x1000);
+    /// Write the Turing VER2 PDB join (gv100_vmm_join) into a VRAM instance
+    /// block via PRAMIN: PD-base @0x200, VA limit @0x208, and the 0x2a0
+    /// subcontext descriptor table (entry 0 = real PDB, 1..63 = 0x1/0x1/0).
+    /// Shared by the channel and BAR2 instance blocks. Assumes already zeroed.
+    fn write_pdb_join_vram(&self, inst: u64, root_phys: u64) {
         let w32 = |off: u64, v: u32| self.pramin_w32(inst + off, v);
-        let w64 = |off: u64, v: u64| {
-            w32(off, v as u32);
-            w32(off + 4, (v >> 32) as u32);
-        };
-        let base = gmmu::inst_pd_base(b.root.paddr() as u64); // root | 0xC06 (sysmem target)
-        w64(0x200, base);
-        w64(0x208, (1u64 << 49) - 1);
-        // Turing PDB descriptor table (gv100_vmm_join).
+        let base = gmmu::inst_pd_base(root_phys); // root | 0xC06 (sysmem target)
+        w32(0x200, base as u32);
+        w32(0x204, (base >> 32) as u32);
+        w32(0x208, ((1u64 << 49) - 1) as u32);
+        w32(0x20c, (((1u64 << 49) - 1) >> 32) as u32);
         w32(0x21c, 0);
         w32(0x2a0, base as u32);
         w32(0x2a4, (base >> 32) as u32);
@@ -681,6 +680,14 @@ impl NvidiaGpu {
         }
         w32(0x298, 0x1);
         w32(0x29c, 0x0);
+    }
+
+    fn write_instance_block_vram(&self, b: &GpuBringup) {
+        let inst = b.inst_vram();
+        self.pramin_zero(inst, 0x1000);
+        let w32 = |off: u64, v: u32| self.pramin_w32(inst + off, v);
+        // PD-base + VA limit + Turing PDB descriptor table.
+        self.write_pdb_join_vram(inst, b.root.paddr() as u64);
         // RAMFC: USERD (VRAM phys), GPFIFO (GPU VA), ids.
         let userd = b.userd_vram();
         let gpfifo_va = b.gpfifo_va();
@@ -713,15 +720,12 @@ impl NvidiaGpu {
     /// BAR2 instance block (VRAM, via PRAMIN) points at the SAME page tables as
     /// the channel, so BAR2 VA == channel VA. Register per tu102_bar_bar2_init.
     fn setup_bar2(&self, b: &GpuBringup) -> (u32, u32, u32) {
-        // Build the BAR2 instance block in VRAM: just PD-base + VA limit
-        // (gf100_vmm_join_; no channel descriptor table needed for a BAR vmm).
+        // Build the BAR2 instance block in VRAM with the FULL Turing VER2 PDB
+        // join (PD-base + VA limit + the 0x2a0 descriptor table), same as a
+        // channel — on Turing even a BAR vmm uses the VER2 join. Shared root.
         let bi = b.bar2_inst_vram();
         self.pramin_zero(bi, 0x1000);
-        let base = gmmu::inst_pd_base(b.root.paddr() as u64); // shared root, sysmem target
-        self.pramin_w32(bi + 0x200, base as u32);
-        self.pramin_w32(bi + 0x204, (base >> 32) as u32);
-        self.pramin_w32(bi + 0x208, ((1u64 << 49) - 1) as u32);
-        self.pramin_w32(bi + 0x20c, (((1u64 << 49) - 1) >> 32) as u32);
+        self.write_pdb_join_vram(bi, b.root.paddr() as u64);
 
         let bar0 = self._bar0;
         let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
@@ -1545,6 +1549,10 @@ impl DrmScheme for NvidiaGpu {
         b.write_gpfifo_entry(slot, pb_va, n);
         let target = put_before + 1;
 
+        // Clear any latched MMU fault so the one we read after is OURS, not
+        // stale (write bit31 to the fault-clear reg 0xb83094).
+        unsafe { core::ptr::write_volatile((self._bar0 + 0x00b8_3094) as *mut u32, 0x8000_0000) };
+
         // Advance GP_PUT (VRAM USERD, via PRAMIN), fence, ring the doorbell.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         self.pramin_w32(userd + 0x8c, target);
@@ -1563,6 +1571,24 @@ impl DrmScheme for NvidiaGpu {
             }
             core::hint::spin_loop();
         }
+
+        // Read the MMU fault THIS step generated (cleared just before the ring).
+        let rd = |off: u32| unsafe { core::ptr::read_volatile((self._bar0 + off as usize) as *const u32) };
+        let f_info1 = rd(0x00b8_3090);
+        let f_alo = rd(0x00b8_3080);
+        let f_ahi = rd(0x00b8_3084);
+        let f_info0 = rd(0x00b8_3088);
+        let _ = writeln!(
+            s,
+            "[gpustep4]  fresh fault: INFO1={:#010x} valid={} access={} reason={} VA={:#x}{:08x} eng={:#x}",
+            f_info1,
+            f_info1 >> 31,
+            (f_info1 >> 16) & 0xf,
+            f_info1 & 0x1f,
+            f_ahi,
+            f_alo & 0xffff_f000,
+            f_info0 & 0xff,
+        );
 
         let chan_cfg = unsafe { core::ptr::read_volatile((self._bar0 + 0x0080_0004) as *const u32) };
         let _ = writeln!(
