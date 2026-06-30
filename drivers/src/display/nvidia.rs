@@ -799,6 +799,37 @@ impl NvidiaGpu {
         w32(0x1c, (inst >> 32) as u32);
     }
 
+    /// Global FIFO + per-PBDMA init — the bring-up nouveau does in the fifo
+    /// subdev BEFORE any channel commit, which we had skipped. Un-SUSPENDs the
+    /// PBDMAs so the host will load a committed channel onto one. Order &
+    /// values per nvkm fifo: tu102_fifo_init_pbdmas + gk208/gk104/gf100_runq_init
+    /// + gk104_fifo_init. Idempotent.
+    fn setup_fifo(&self) {
+        let bar0 = self._bar0;
+        let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
+        let wr = |off: u32, v: u32| unsafe {
+            core::ptr::write_volatile((bar0 + off as usize) as *mut u32, v)
+        };
+        // (A) doorbell-enable (tu102_fifo_init_pbdmas).
+        wr(0x00b6_5000, rd(0x00b6_5000) | 0x8000_0000);
+        // (B) per-PBDMA (runq) init, stride id*0x2000. Init a generous range to
+        // cover whichever PBDMA serves our runlist; writes to absent PBDMAs are
+        // harmless.
+        for q in 0..6u32 {
+            let s = q * 0x2000;
+            // INTR_STALL: clear 0x10000100.
+            wr(0x0004_013c + s, rd(0x0004_013c + s) & !0x1000_0100);
+            wr(0x0004_0108 + s, 0xffff_ffff); // INTR_0   clear
+            wr(0x0004_010c + s, 0xffff_feff); // INTR_EN_0
+            wr(0x0004_0148 + s, 0xffff_ffff); // INTR_1   clear
+            wr(0x0004_014c + s, 0xffff_ffff); // INTR_EN_1
+            wr(0x0004_012c + s, 0x000f_4240); // TIMEOUT = 1000000
+        }
+        // (C) global fifo init (gk104_fifo_init).
+        wr(0x0000_2100, 0xffff_ffff); // PFIFO INTR_0     clear
+        wr(0x0000_2140, 0x7fff_ffff); // PFIFO INTR_EN_0
+    }
+
     fn gmmu_flush(&self, root_phys: u64) -> (u32, u32, bool) {
         let bar0 = self._bar0;
         let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
@@ -845,8 +876,14 @@ impl NvidiaGpu {
         let _ = self.setup_bar2(b);
         let _ = self.gmmu_flush(b.root.paddr() as u64);
 
-        // Doorbell enable.
-        wr(0x00b6_5000, rd(0x00b6_5000) | 0x8000_0000);
+        // Global FIFO + PBDMA init (un-SUSPEND the PBDMAs) — must precede the
+        // runlist commit, else the host leaves the channel at STATUS=PENDING.
+        self.setup_fifo();
+
+        // Bind the channel's instance block in CHRAM so the host can find it
+        // (gk104_chan_bind_inst: 0x800000+chid*8 = BIND | inst>>12, VRAM target).
+        let inst_vram = b.inst_vram();
+        wr(0x0080_0000 + CHID * 8, 0x8000_0000 | (inst_vram >> 12) as u32);
 
         // Runlist commit (2 entries). The runlist lives in VRAM; the host reads
         // it as VRAM-physical, so no target field is needed (tu102_runl_commit).
@@ -864,7 +901,7 @@ impl NvidiaGpu {
             core::hint::spin_loop();
         }
 
-        // Channel enable.
+        // Channel enable (gk104_chan_start).
         wr(0x0080_0004 + CHID * 8, rd(0x0080_0004 + CHID * 8) | 0x0000_0400);
         ok
     }
