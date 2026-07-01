@@ -70,13 +70,37 @@ fn main() {
     build_first_real_nvidia_file();
 }
 
-/// First real (not hand-written) NVIDIA source: src/nvidia/src/libraries/
-/// fnv_hash/fnv_hash.c -- picked for having the smallest #include list of
-/// any real .c file surveyed so far (message_queue_cpu.c, the file we
-/// actually want for GSP RPC, pulls in 16+ headers including ones NVIDIA's
-/// own build generates at build time -- too much to take on before proving
-/// the include-path plumbing itself works).
+/// Parses src/nvidia/srcs.mk -- NVIDIA's own real, authoritative list of
+/// every .c file their build compiles into the Resource Manager core
+/// (`SRCS += <path-relative-to-src/nvidia>`) -- rather than hand-picking
+/// files and chasing undefined symbols one at a time. Confirmed by
+/// actually compiling the full resulting set (1038 of 1054 entries) in an
+/// isolated scratch build against the pinned submodule commit: it leaves
+/// only the genuine os-interface.h/OBJOS boundary undefined, exactly the
+/// surface os_interface.rs/os_services.rs/os_boundary.rs exist to fill.
 ///
+/// Deliberately excludes `arch/nvalloc/unix/src/` -- NVIDIA's own Linux
+/// platform-integration layer (the real `/dev/nvidia0` character device
+/// driver, ioctls, registry access, etc.), which Eclipse replaces with
+/// its own os_interface.rs implementation rather than vendoring.
+fn parse_srcs_mk(nvidia_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let srcs_mk = nvidia_dir.join("srcs.mk");
+    let text = std::fs::read_to_string(&srcs_mk)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", srcs_mk.display()));
+    let mut files = Vec::new();
+    for line in text.lines() {
+        let Some(rel) = line.strip_prefix("SRCS += ") else {
+            continue;
+        };
+        let rel = rel.trim();
+        if rel.contains("arch/nvalloc/unix/src/") {
+            continue;
+        }
+        files.push(nvidia_dir.join(rel));
+    }
+    files
+}
+
 /// Only runs if the submodule is actually checked out
 /// (`git submodule update --init nvidia-rm-sys/vendor/open-gpu-kernel-modules`
 /// from a machine with real GitHub access -- blocked in the sandbox this
@@ -84,64 +108,15 @@ fn main() {
 /// without it, same as the smoke test above always has.
 fn build_first_real_nvidia_file() {
     let vendor = std::path::Path::new("vendor/open-gpu-kernel-modules");
-    // fnv_hash.c's NV_ASSERT calls need a real definition of
-    // nvAssertFailedNoLog -- confirmed by an actual link failure against
-    // the checked-out submodule ("undefined symbol: nvAssertFailedNoLog,
-    // referenced by fnv_hash.c:419"). That symbol lives in nvassert.c,
-    // the real NVIDIA source right next to nvassert.h. nvassert.c in turn
-    // needs nvstatusToString (src/common/shared/nvstatus/nvstatus.c, self
-    // contained) -- confirmed by reproducing the full header/link graph
-    // locally against the pinned submodule commit rather than guessing
-    // blind. rcdbRmAssert (the RCDB crash-journal hook) is avoided instead
-    // of vendored: nvassert.h's own NV_JOURNAL_ASSERT_ENABLE override
-    // point (`#if !defined(NV_JOURNAL_ASSERT_ENABLE)`) is used below to
-    // turn it off, rather than pulling in NVIDIA's whole diagnostics
-    // subsystem for an assert-logging path we don't need yet.
-    let source_files = [
-        vendor.join("src/nvidia/src/libraries/fnv_hash/fnv_hash.c"),
-        vendor.join("src/nvidia/src/libraries/utils/nvassert.c"),
-        vendor.join("src/common/shared/nvstatus/nvstatus.c"),
-        // GSP RPC message-queue support layer: msgq.c is the actual RPC
-        // ring-buffer transport; the rest are its real, load-bearing
-        // dependencies (memory descriptors, timeout tracking, generic
-        // containers, thread-local storage, the nvport portability
-        // library, and the Unix-build "no-op" OS stubs), pulled in by
-        // reproducing the real link-time undefined-symbol chain against
-        // the pinned submodule commit rather than guessing. NOT included
-        // yet: gpu/gsp/message_queue_cpu.c itself, whose own memdesc
-        // calls pull in mem_desc.c's much larger heap/bus/gpu-manager
-        // dependency graph -- scoped as a separate follow-up so this
-        // vendoring pass still links cleanly on its own.
-        vendor.join("src/nvidia/src/kernel/core/thread_state.c"),
-        vendor.join("src/nvidia/src/libraries/msgq/msgq.c"),
-        vendor.join("src/nvidia/src/libraries/containers/list.c"),
-        vendor.join("src/nvidia/src/libraries/containers/map.c"),
-        vendor.join("src/nvidia/src/libraries/tls/tls.c"),
-        vendor.join("src/nvidia/src/kernel/diagnostics/nvlog_printf.c"),
-        vendor.join("src/nvidia/src/kernel/os/os_stubs.c"),
-        vendor.join("src/nvidia/src/libraries/nvport/memory/memory_tracking.c"),
-        vendor.join("src/nvidia/src/libraries/nvport/memory/memory_unix_kernel_os.c"),
-        vendor.join("src/nvidia/src/libraries/nvport/sync/sync_unix_kernel_os.c"),
-        vendor.join("src/nvidia/src/libraries/nvport/core/core.c"),
-        vendor.join("src/nvidia/src/libraries/nvport/string/string_generic.c"),
-        vendor.join("src/nvidia/src/libraries/nvport/thread/thread_unix_kernel_os.c"),
-        vendor.join("src/nvidia/src/libraries/nvport/util/util_gcc_clang.c"),
-        vendor.join("src/nvidia/src/libraries/nvport/util/util_unix_kernel_os.c"),
-        vendor.join("src/nvidia/src/libraries/nvport/cpu/cpu_common.c"),
-        vendor.join("src/nvidia/src/libraries/nvport/cpu/cpu_x86_amd64.c"),
-        vendor.join("src/nvidia/src/libraries/nvport/crypto/crypto_random_xorshift.c"),
-        vendor.join("src/nvidia/src/libraries/nvport/time/time_generic.c"),
-        vendor.join("src/nvidia/src/libraries/nvport/time/time_unix_kernel_os.c"),
-    ];
-    if !source_files[0].exists() {
+    let nvidia = vendor.join("src/nvidia");
+    if !nvidia.join("srcs.mk").exists() {
         println!(
             "cargo:warning=nvidia-rm-sys: submodule not checked out ({} missing) -- skipping real NVIDIA source, only the hand-written smoke test compiled this run",
-            source_files[0].display()
+            nvidia.join("srcs.mk").display()
         );
         return;
     }
-
-    let nvidia = vendor.join("src/nvidia");
+    let source_files = parse_srcs_mk(&nvidia);
     // SRC_COMMON below is INFERRED as <submodule>/src/common (matches every
     // one of these paths existing under a "common" sibling of "nvidia" --
     // e.g. sdk/nvidia/inc, mbedtls/... -- but the exact `SRC_COMMON =`
@@ -151,8 +126,11 @@ fn build_first_real_nvidia_file() {
     let common = vendor.join("src/common");
 
     // Transcribed from src/nvidia/Makefile's `CFLAGS += -I ...` lines, in
-    // the same order, with $(SRC_COMMON) substituted.
-    let include_dirs: [std::path::PathBuf; 26] = [
+    // the same order, with $(SRC_COMMON) substituted, plus the extra
+    // dirs below needed once the full nvswitch/nvlink kernel libraries
+    // and the real libspdm third-party library (both part of NVIDIA's
+    // own srcs.mk) are compiled in too.
+    let include_dirs: [std::path::PathBuf; 35] = [
         nvidia.join("kernel/inc"),
         nvidia.join("interface"),
         common.join("sdk/nvidia/inc"),
@@ -186,15 +164,40 @@ fn build_first_real_nvidia_file() {
         // it recurses into src/nvidia's build; src/nvidia/Makefile alone
         // never mentions it.
         vendor.join("kernel-open/common/inc"),
+        // NVSwitch/NVLink kernel-library internals (as opposed to just
+        // their public interface headers above) -- needed once their
+        // real .c files are compiled in (srcs.mk includes them
+        // unconditionally; other kept files like kern_bus.c/gpu_mgr.c
+        // reference their real API even on a system with neither piece
+        // of hardware, confirmed empirically: excluding these files
+        // orphaned MORE symbols than it removed).
+        common.join("nvswitch/kernel"),
+        common.join("nvlink/kernel/nvlink"),
+        common.join("nvlink/kernel/nvlink/interface"),
+        // libspdm (real, BSD-3-Clause-licensed DMTF SPDM reference
+        // implementation NVIDIA vendors for Confidential-Computing
+        // attestation) -- include paths transcribed from
+        // src/nvidia/src/libraries/libspdm/nvidia/openspdm.mk.
+        nvidia.join("src/libraries/libspdm/3.5.0/include"),
+        nvidia.join("src/libraries/libspdm/3.5.0/include/hal"),
+        nvidia.join("src/libraries/libspdm/3.5.0/os_stub/include"),
+        nvidia.join("src/libraries/libspdm/3.5.0/os_stub"),
+        nvidia.join("src/libraries/libspdm/3.5.0/os_stub/cryptlib_null"),
+        nvidia.join("src/libraries/libspdm/nvidia"),
     ];
 
     let mut build = cc::Build::new();
     for f in &source_files {
         build.file(f);
     }
-    // Our own shim (vendor/glue.c, not NVIDIA source) providing nvDbg_Printf
-    // -- see that file for why. No include dirs needed for it.
+    // Our own shims (not NVIDIA source): vendor/glue.c provides nv_printf
+    // (see that file for why); vendor/rm_boundary_stubs.c provides safe
+    // "not implemented" bodies for real NVIDIA function signatures that
+    // only matter for hardware/features Eclipse's target GPU doesn't have
+    // (NVSwitch, NVLink, SPDM/Confidential Computing, the Linux ioctl
+    // control-call surface) -- see that file's own header comment.
     build.file("vendor/glue.c");
+    build.file("vendor/rm_boundary_stubs.c");
     for dir in &include_dirs {
         build.include(dir);
     }
@@ -253,12 +256,18 @@ fn build_first_real_nvidia_file() {
     ] {
         build.define(def, None);
     }
+    // libspdm's own config-override mechanism: its headers do
+    // `#include LIBSPDM_CONFIG` to pull in build-specific feature
+    // toggles instead of hardcoding them, exactly like NVIDIA's real
+    // openspdm.mk sets it.
+    build.define("LIBSPDM_CONFIG", "<nvspdm_rmconfig.h>");
 
     apply_kernel_flags(&mut build);
 
-    build.compile("nvrm_fnv_hash");
+    build.compile("nvrm_core");
     for f in &source_files {
         println!("cargo:rerun-if-changed={}", f.display());
     }
     println!("cargo:rerun-if-changed=vendor/glue.c");
+    println!("cargo:rerun-if-changed=vendor/rm_boundary_stubs.c");
 }
