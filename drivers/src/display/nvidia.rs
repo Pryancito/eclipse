@@ -1966,6 +1966,31 @@ impl DrmScheme for NvidiaGpu {
         }
         let _ = (retried, retry_advanced);
 
+        // SCHED_STATUS was sampled ONCE, before the ring (runlist_fetch_busy=1
+        // in the last real-hardware run). A single snapshot can't tell a
+        // fetch unit that is genuinely wedged apart from one merely caught
+        // mid-cycle — those point at different bugs (a broken runlist-fetch
+        // memory path vs. a fetch that completes fine but still never loads
+        // the channel). Poll it here so the next run distinguishes the two.
+        let mut fetch_busy_cleared = false;
+        let mut fetch_busy_iters = 0u64;
+        let mut sched_status_repoll = sched_status;
+        for i in 0..2_000_000u64 {
+            sched_status_repoll =
+                unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_263c) as *const u32) };
+            if (sched_status_repoll >> 2) & 1 == 0 {
+                fetch_busy_cleared = true;
+                fetch_busy_iters = i;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        let _ = writeln!(
+            s,
+            "[gpustep4]  SCHED_STATUS re-poll(0x263c)={:#010x} runlist_fetch_busy_cleared={} after_iters={}",
+            sched_status_repoll, fetch_busy_cleared, fetch_busy_iters
+        );
+
         // Read the MMU fault THIS step generated (cleared just before the ring).
         let rd = |off: u32| unsafe { core::ptr::read_volatile((self._bar0 + off as usize) as *const u32) };
         let f_info1 = rd(0x00b8_3090);
@@ -2007,6 +2032,32 @@ impl DrmScheme for NvidiaGpu {
             rd(0x0004_2100),
             rd(0x0004_2120)
         );
+        // PBDMA0/1 above are stale from the runlist-0 era and, per the last
+        // real-hardware run, are NOT the PBDMA our channel goes through
+        // (PBDMA_MAP showed only p9 serving a runl_id=8). Their own block
+        // registers (STATUS/CHANNEL/GP_GET/GP_PUT/GET/INTR_0 — same offsets
+        // as debug_dump's Step-1 report) had never actually been read for
+        // whichever PBDMA(s) serve runl_id. Dump them here, dynamically.
+        let _ = write!(s, "[gpustep4]  PBDMA(runl{}'s, raw block):", runl_id);
+        for i in 0..12u32 {
+            let map = rd(0x0000_2390 + i * 4) & 0xffff;
+            if map & (1 << runl_id) == 0 {
+                continue;
+            }
+            let pb = 0x0004_0000 + i * 0x2000;
+            let _ = write!(
+                s,
+                " p{}[STATUS={:#010x} CHANNEL={:#010x} GP_GET={:#010x} GP_PUT={:#010x} GET={:#010x} INTR_0={:#010x}]",
+                i,
+                rd(pb + 0x100),
+                rd(pb + 0x120),
+                rd(pb + 0x14),
+                rd(pb),
+                rd(pb + 0x18),
+                rd(pb + 0x108),
+            );
+        }
+        let _ = writeln!(s);
         // 0x040100 is NV_PPBDMA_STATUS — all-SUSPENDED (0x10011111) is just the
         // idle/reset value, not a fault signal; nouveau's actual liveness check
         // (gk104_runq_idle) polls NV_PFIFO_PBDMA_STATUS at 0x003080+id*4,
