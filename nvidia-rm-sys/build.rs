@@ -10,46 +10,60 @@
 //   2. C code can call back into a Rust-exported function -- the same
 //      shape NVIDIA's RM uses to call into an os-interface.h implementation.
 // Replace this file with real vendored NVIDIA sources once both are proven.
+/// True when actually building for Eclipse's no_std kernel target
+/// (CARGO_CFG_TARGET_OS reflects the JSON target spec's "os" field,
+/// "none", regardless of how cc's own TARGET-string parsing handles a
+/// non-triple custom target name).
+fn building_for_kernel() -> bool {
+    std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("none")
+}
+
+/// Applies the freestanding kernel flags shared by every C translation
+/// unit compiled into Eclipse's kernel binary.
+fn apply_kernel_flags(build: &mut cc::Build) {
+    if !building_for_kernel() {
+        return;
+    }
+    // cc's own TARGET-string auto-detection rejects Cargo's custom JSON
+    // target name ("x86_64" -- a single component, not a full triple):
+    // "target `x86_64` only had a single component (at least two
+    // required)". Override explicitly with the JSON's own "llvm-target"
+    // value so cc's Unix-like defaults apply instead of erroring; this
+    // does not change which compiler binary gets invoked (still the
+    // host's cc/gcc), only cc's internal flag heuristics.
+    build.target("x86_64-unknown-none");
+    build
+        .flag("-ffreestanding")
+        .flag("-fno-builtin")
+        .flag("-fno-stack-protector")
+        .flag("-fno-asynchronous-unwind-tables")
+        .flag("-mno-red-zone")
+        // NOT -mcmodel=kernel: that GCC code model assumes the kernel
+        // lives in the top 2GB of the address space (like Linux's own
+        // 0xFFFFFFFF80000000 convention) and emits absolute 32-bit
+        // sign-extended (R_X86_64_32S) relocations on that assumption.
+        // zCore's actual KERNEL_BEGIN is 0xffffff0000000000 -- about 1.1
+        // TB below that window -- so those relocations overflowed at
+        // real link time ("relocation R_X86_64_32S out of range").
+        // Explicit -fPIC keeps GCC on RIP-relative (R_X86_64_PC32)
+        // addressing instead, which only depends on the DISTANCE between
+        // code and data (both land in the same linked image, so it's
+        // always in range), not the absolute base address -- confirmed
+        // by comparing `readelf -r` output between the two flag sets on
+        // a minimal reproduction before changing this for real.
+        .flag("-fPIC")
+        // Match zCore/x86_64.json's `"features": "-mmx,+sse2"` exactly:
+        // MMX off, SSE2 left enabled (it's the x86_64 baseline anyway).
+        // Do NOT also disable SSE/SSE2 here -- that would diverge from
+        // the Rust side's actual ABI assumptions.
+        .flag("-mno-mmx")
+        .flag("-nostdlib");
+}
+
 fn main() {
     let mut build = cc::Build::new();
     build.file("vendor/smoketest.c").flag_if_supported("-Wall");
-
-    // Only apply the freestanding kernel flags when actually building for
-    // Eclipse's no_std kernel target (CARGO_CFG_TARGET_OS reflects the
-    // JSON target spec's "os" field, "none", regardless of how cc's own
-    // TARGET-string parsing handles a non-triple custom target name).
-    let building_for_kernel =
-        std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("none");
-    if building_for_kernel {
-        // cc's own TARGET-string auto-detection rejects Cargo's custom JSON
-        // target name ("x86_64" -- a single component, not a full triple):
-        // "target `x86_64` only had a single component (at least two
-        // required)". Override explicitly with the JSON's own
-        // "llvm-target" value so cc's Unix-like defaults apply instead of
-        // erroring; this does not change which compiler binary gets
-        // invoked (still the host's cc/gcc), only cc's internal flag
-        // heuristics.
-        build.target("x86_64-unknown-none");
-        build
-            .flag("-ffreestanding")
-            .flag("-fno-builtin")
-            .flag("-fno-stack-protector")
-            .flag("-fno-asynchronous-unwind-tables")
-            .flag("-mno-red-zone")
-            .flag("-mcmodel=kernel")
-            // gcc on most distros defaults to PIE/PIC; -mcmodel=kernel is
-            // incompatible with PIC ("code model kernel does not support
-            // PIC mode") and fails to compile without these.
-            .flag("-fno-pic")
-            .flag("-fno-pie")
-            // Match zCore/x86_64.json's `"features": "-mmx,+sse2"` exactly:
-            // MMX off, SSE2 left enabled (it's the x86_64 baseline anyway).
-            // Do NOT also disable SSE/SSE2 here -- that would diverge from
-            // the Rust side's actual ABI assumptions.
-            .flag("-mno-mmx")
-            .flag("-nostdlib");
-    }
-
+    apply_kernel_flags(&mut build);
     build.compile("nvrm_smoketest");
     println!("cargo:rerun-if-changed=vendor/smoketest.c");
 
@@ -209,21 +223,7 @@ fn build_first_real_nvidia_file() {
         build.define(def, None);
     }
 
-    let building_for_kernel = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("none");
-    if building_for_kernel {
-        build.target("x86_64-unknown-none");
-        build
-            .flag("-ffreestanding")
-            .flag("-fno-builtin")
-            .flag("-fno-stack-protector")
-            .flag("-fno-asynchronous-unwind-tables")
-            .flag("-mno-red-zone")
-            .flag("-mcmodel=kernel")
-            .flag("-fno-pic")
-            .flag("-fno-pie")
-            .flag("-mno-mmx")
-            .flag("-nostdlib");
-    }
+    apply_kernel_flags(&mut build);
 
     build.compile("nvrm_fnv_hash");
     for f in &source_files {
