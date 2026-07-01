@@ -1904,6 +1904,22 @@ impl DrmScheme for NvidiaGpu {
         );
         let _ = writeln!(s, "[gpustep4]  PTOP entries:{}", self.ptop_report());
 
+        // PCE_MAP (0x104028): maps each LOGICAL copy engine (what PTOP/runlist
+        // enumerate, e.g. our engine_id=8) to a PHYSICAL copy engine, or marks
+        // it unmapped. Already read in bringup_step2 but never shown here —
+        // across two real-hardware runs PBDMA9 (runl8's PBDMA) was COMPLETELY
+        // inert (its aggregate PFIFO_PBDMA_STATUS read bit-for-bit identical
+        // both times, unlike PBDMA0/1 which changed), i.e. the host scheduler
+        // never touched it even once. If engine_id=8's nibble here reads as
+        // the unmapped sentinel, that would explain why nothing ever gets
+        // scheduled regardless of how correctly the runlist/channel is set up.
+        let pce_map = unsafe { core::ptr::read_volatile((self._bar0 + 0x0010_4028) as *const u32) };
+        let _ = writeln!(
+            s,
+            "[gpustep4]  PCE_MAP(0x104028)={:#010x} (raw; per-LCE nibble layout not yet decoded)",
+            pce_map
+        );
+
         // NV_PFIFO_SCHED_STATUS (0x263c): global scheduler status — is the
         // runlist-fetch unit even busy/idle, is a channel switch in
         // progress. NV_PFIFO_ENGINE_STATUS(engine_id) (0x2640+id*8): the
