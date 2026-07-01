@@ -835,10 +835,17 @@ impl NvidiaGpu {
         let _ = rd(0x0000_0200);
         // (A) doorbell-enable (tu102_fifo_init_pbdmas).
         wr(0x00b6_5000, rd(0x00b6_5000) | 0x8000_0000);
-        // (B) per-PBDMA (runq) init, stride id*0x2000. Init a generous range to
-        // cover whichever PBDMA serves our runlist; writes to absent PBDMAs are
-        // harmless.
-        for q in 0..6u32 {
+        // (B) per-PBDMA (runq) init, stride id*0x2000. NV_PFIFO_PBDMA_MAP has
+        // up to 12 entries (same __SIZE_1=12 as the PBDMA_MAP scan elsewhere
+        // in this file) -- 0..6 was NOT generous enough: a real-hardware run
+        // discovered our CE's runlist is served by PBDMA9, which this loop
+        // never touched. Its INTR_STALL/INTR_0/INTR_EN/TIMEOUT were left at
+        // whatever the hardware defaulted to, and its GET/GP_GET registers
+        // still held stale non-zero values from some prior context -- exactly
+        // consistent with SCHED_STATUS.runlist_fetch_busy staying stuck at 1
+        // forever and PBDMA9's CHANNEL register reading 0 (nothing ever
+        // loaded). Cover the full range; writes to absent PBDMAs are harmless.
+        for q in 0..12u32 {
             let s = q * 0x2000;
             // INTR_STALL: clear 0x10000100.
             wr(0x0004_013c + s, rd(0x0004_013c + s) & !0x1000_0100);
@@ -1414,6 +1421,26 @@ impl DrmScheme for NvidiaGpu {
                 rd(base + 0xc)
             );
         }
+        // RUNL0/1 above are only ever the console/GR runlists on this chip —
+        // a real-hardware run discovered the CE's actual runlist is 8 (not
+        // 0/1), so its own commit/submit registers had never been shown here.
+        // find_ce_runlist is a read-only PTOP scan; safe in this always-on dump.
+        if let Some((ce_rl, _)) = self.find_ce_runlist() {
+            if ce_rl >= 2 {
+                let base = 0x0000_2b00 + ce_rl * 0x10;
+                let _ = writeln!(
+                    s,
+                    "[gpudbg]  RUNL{}(CE) base_lo(0x{:x})={:#010x} base_hi={:#010x} submit={:#010x} cfg(0x{:x})={:#010x}",
+                    ce_rl,
+                    base,
+                    rd(base),
+                    rd(base + 4),
+                    rd(base + 8),
+                    base + 0xc,
+                    rd(base + 0xc)
+                );
+            }
+        }
         let _ = writeln!(
             s,
             "[gpudbg]  CHAN0_CFG(0x800004)={:#010x}",
@@ -1491,6 +1518,36 @@ impl DrmScheme for NvidiaGpu {
                 rd(pb + 0x18),
                 rd(pb + 0x108),
             );
+        }
+        // PBDMA0/1 above are not necessarily the PBDMA(s) that serve the CE's
+        // runlist (discovered as PBDMA9 on the last real-hardware run). Dump
+        // whichever PBDMA(s) NV_PFIFO_PBDMA_MAP actually routes the CE's
+        // runlist to, so a stuck/never-armed PBDMA is visible without needing
+        // the opt-in /proc/gpustep4.
+        if let Some((ce_rl, _)) = self.find_ce_runlist() {
+            for i in 0..12u32 {
+                if i < 2 {
+                    continue; // already shown above
+                }
+                let map = rd(0x0000_2390 + i * 4) & 0xffff;
+                if map & (1 << ce_rl) == 0 {
+                    continue;
+                }
+                let pb = 0x0004_0000 + i * 0x2000;
+                let _ = writeln!(
+                    s,
+                    "[gpudbg]  PBDMA{}(serves CE runl{}) STATUS(0x{:x})={:#010x} CHANNEL={:#010x} GP_GET={:#010x} GP_PUT={:#010x} GET={:#010x} INTR_0={:#010x}",
+                    i,
+                    ce_rl,
+                    pb + 0x100,
+                    rd(pb + 0x100),
+                    rd(pb + 0x120),
+                    rd(pb + 0x14),
+                    rd(pb),
+                    rd(pb + 0x18),
+                    rd(pb + 0x108),
+                );
+            }
         }
 
         // --- Engine -> runlist map (NV_PTOP_DEVICE_INFO 0x022700, read-only) ---
