@@ -13,6 +13,7 @@ extern crate alloc;
 pub mod fnv_hash;
 pub mod hooks;
 pub mod os_interface;
+pub mod os_services;
 pub mod types;
 
 use core::sync::atomic::{AtomicU32, Ordering};
