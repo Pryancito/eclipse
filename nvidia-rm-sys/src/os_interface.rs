@@ -283,17 +283,35 @@ pub extern "C" fn os_mem_cmp(buf0: *const NvU8, buf1: *const NvU8, length: NvU32
 #[no_mangle]
 pub extern "C" fn os_pci_init_handle(
     _domain: NvU32,
-    _bus: NvU8,
-    _slot: NvU8,
-    _function: NvU8,
-    _vendor: *mut NvU16,
-    _device: *mut NvU16,
+    bus: NvU8,
+    slot: NvU8,
+    function: NvU8,
+    vendor: *mut NvU16,
+    device: *mut NvU16,
 ) -> *mut c_void {
-    // TODO: needs a hook too (allocate/return a handle drivers recognizes
-    // for later pci_config_read/write calls); Eclipse's PCI enumeration
-    // already runs before this driver is even constructed, so this will
-    // likely just wrap the already-known Location. Left unwired this pass.
-    core::ptr::null_mut()
+    // Pack (bus, device, function) into the usize handle every other
+    // os_pci_* function already passes through verbatim to
+    // `KernelHooks::pci_config_read/write` (see those functions just
+    // below). Top bit is a "valid handle" tag so the packed value is
+    // never 0/null even for bus=device=function=0 (a real, valid
+    // location -- e.g. this GPU's own function 0).
+    let handle = 0x8000_0000usize
+        | ((bus as usize) << 16)
+        | ((slot as usize) << 8)
+        | (function as usize);
+
+    // Vendor/device ID live in the first PCI config dword (offset 0),
+    // vendor in the low 16 bits, device in the high 16 bits -- standard
+    // PCI config space layout, not NVIDIA-specific.
+    let id_dword = with_hooks(0xFFFF_FFFF, |h| h.pci_config_read(handle, 0, 4));
+    if !vendor.is_null() {
+        unsafe { *vendor = (id_dword & 0xFFFF) as NvU16 };
+    }
+    if !device.is_null() {
+        unsafe { *device = ((id_dword >> 16) & 0xFFFF) as NvU16 };
+    }
+
+    handle as *mut c_void
 }
 #[no_mangle]
 pub extern "C" fn os_pci_read_byte(handle: *mut c_void, offset: NvU32, value: *mut NvU8) -> NV_STATUS {

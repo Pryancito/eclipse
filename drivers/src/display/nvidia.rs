@@ -2469,6 +2469,12 @@ impl PciDriver for NvidiaGpuDriverPci {
             return Err(DeviceError::NoResources);
         }
 
+        // Wire up nvidia-rm-sys's KernelHooks facade so any real vendored
+        // NVIDIA C file that reaches through os-interface.h for PCI config
+        // space, MMIO mappings, port I/O, or timing gets Eclipse's actual
+        // hardware primitives instead of the crate's safe-default stubs.
+        super::nvidia_hooks::install(mapper);
+
         if let Some(m) = mapper {
             m.query_or_map(bar0_addr as usize, PAGE_SIZE * 1024);
         }
