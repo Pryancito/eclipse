@@ -52,4 +52,102 @@ fn main() {
 
     build.compile("nvrm_smoketest");
     println!("cargo:rerun-if-changed=vendor/smoketest.c");
+
+    build_first_real_nvidia_file();
+}
+
+/// First real (not hand-written) NVIDIA source: src/nvidia/src/libraries/
+/// fnv_hash/fnv_hash.c -- picked for having the smallest #include list of
+/// any real .c file surveyed so far (message_queue_cpu.c, the file we
+/// actually want for GSP RPC, pulls in 16+ headers including ones NVIDIA's
+/// own build generates at build time -- too much to take on before proving
+/// the include-path plumbing itself works).
+///
+/// Only runs if the submodule is actually checked out
+/// (`git submodule update --init nvidia-rm-sys/vendor/open-gpu-kernel-modules`
+/// from a machine with real GitHub access -- blocked in the sandbox this
+/// was authored in). Skips silently otherwise so the crate still builds
+/// without it, same as the smoke test above always has.
+fn build_first_real_nvidia_file() {
+    let vendor = std::path::Path::new("vendor/open-gpu-kernel-modules");
+    let target_file = vendor.join("src/nvidia/src/libraries/fnv_hash/fnv_hash.c");
+    if !target_file.exists() {
+        println!(
+            "cargo:warning=nvidia-rm-sys: submodule not checked out ({} missing) -- skipping real NVIDIA source, only the hand-written smoke test compiled this run",
+            target_file.display()
+        );
+        return;
+    }
+
+    let nvidia = vendor.join("src/nvidia");
+    // SRC_COMMON below is INFERRED as <submodule>/src/common (matches every
+    // one of these paths existing under a "common" sibling of "nvidia" --
+    // e.g. sdk/nvidia/inc, mbedtls/... -- but the exact `SRC_COMMON =`
+    // assignment itself wasn't tracked down across kernel-open/Makefile,
+    // src/nvidia/Makefile, and utils.mk). Verify/fix once this actually
+    // runs against the checked-out submodule and reports real path errors.
+    let common = vendor.join("src/common");
+
+    // Transcribed from src/nvidia/Makefile's `CFLAGS += -I ...` lines, in
+    // the same order, with $(SRC_COMMON) substituted.
+    let include_dirs: [std::path::PathBuf; 25] = [
+        nvidia.join("kernel/inc"),
+        nvidia.join("interface"),
+        common.join("sdk/nvidia/inc"),
+        common.join("sdk/nvidia/inc/hw"),
+        nvidia.join("arch/nvalloc/common/inc"),
+        nvidia.join("arch/nvalloc/common/inc/gsp"),
+        nvidia.join("arch/nvalloc/common/inc/deprecated"),
+        nvidia.join("arch/nvalloc/unix/include"),
+        nvidia.join("inc"),
+        nvidia.join("inc/os"),
+        common.join("shared/inc"),
+        common.join("inc"),
+        common.join("uproc/os/libos-v2.0.0/include"),
+        common.join("uproc/os/common/include"),
+        common.join("inc/swref"),
+        common.join("inc/swref/published"),
+        nvidia.join("generated"),
+        common.join("nvswitch/kernel/inc"),
+        common.join("nvswitch/interface"),
+        common.join("nvswitch/common/inc"),
+        common.join("inc/displayport"),
+        common.join("nvlink/interface"),
+        common.join("nvlink/inband/interface"),
+        nvidia.join("inc/libraries"),
+        nvidia.join("inc/kernel"),
+    ];
+
+    let mut build = cc::Build::new();
+    build.file(&target_file);
+    for dir in &include_dirs {
+        build.include(dir);
+    }
+    // -include $(SRC_COMMON)/sdk/nvidia/inc/cpuopsys.h from the real
+    // Makefile: force-included ahead of every translation unit, defines
+    // the platform macros (NV_LINUX / NVCPU_* / etc.) most NVIDIA headers
+    // key off of instead of detecting the compiler target themselves.
+    build.flag(&format!(
+        "-include{}",
+        common.join("sdk/nvidia/inc/cpuopsys.h").display()
+    ));
+
+    let building_for_kernel = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("none");
+    if building_for_kernel {
+        build.target("x86_64-unknown-none");
+        build
+            .flag("-ffreestanding")
+            .flag("-fno-builtin")
+            .flag("-fno-stack-protector")
+            .flag("-fno-asynchronous-unwind-tables")
+            .flag("-mno-red-zone")
+            .flag("-mcmodel=kernel")
+            .flag("-fno-pic")
+            .flag("-fno-pie")
+            .flag("-mno-mmx")
+            .flag("-nostdlib");
+    }
+
+    build.compile("nvrm_fnv_hash");
+    println!("cargo:rerun-if-changed={}", target_file.display());
 }

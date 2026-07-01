@@ -1,7 +1,18 @@
-//! Bring-up smoke test for the C-compile + FFI-link pipeline that will host
-//! vendored NVIDIA open-gpu-kernel-modules source in Eclipse. See build.rs
-//! and vendor/smoketest.c -- none of this is NVIDIA code yet.
+//! FFI bridge to vendored NVIDIA open-gpu-kernel-modules C source for
+//! Eclipse. `os_interface` implements NVIDIA's real os-interface.h ABI
+//! (transcribed verbatim, MIT) against Eclipse's own primitives; `hooks`
+//! is the registration point for the handful of operations (PCI config,
+//! MMIO mapping, I/O ports, timing) that only `drivers` can provide
+//! without creating a dependency cycle. The smoke test below predates
+//! both and stays as a standing canary that the C-compile + FFI-link
+//! pipeline itself still works -- see build.rs and vendor/smoketest.c.
 #![no_std]
+
+extern crate alloc;
+
+pub mod hooks;
+pub mod os_interface;
+pub mod types;
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
