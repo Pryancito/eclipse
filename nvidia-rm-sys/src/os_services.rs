@@ -9,10 +9,15 @@
 //! primitives (via `crate::hooks`) or a safe default, same convention as
 //! `os_interface.rs`.
 //!
-//! Also holds a handful of standalone placeholders for RM-internal
-//! symbols outside both ABIs that the same vendored files reference
-//! unconditionally, but that belong to subsystems (OBJSYS, OBJGPUMGR,
-//! the RCDB crash journal, OS thread-priority boosting) not vendored yet.
+//! A few functions that originally looked missing from this same header
+//! (osGetMaximumCoreCount, osReadRegistryDword/String, g_pSys,
+//! gpumgrGetCurrentGpuInstance, threadPriorityStateAlloc/Free,
+//! rcdbAddAssertJournalRecWithLine) turned out to already have real
+//! implementations in other vendored files once the full RM core linked
+//! (os_init.c, system.c, gpu_mgr.c, locks_common.c, journal.c) --
+//! confirmed by an actual `duplicate symbol` link error against a hand-
+//! written stand-in, not assumed -- so they are deliberately NOT
+//! duplicated here.
 #![allow(non_snake_case)]
 
 use crate::hooks::with_hooks;
@@ -30,11 +35,6 @@ pub extern "C" fn osGetCurrentThread(handle: *mut NvU64) -> NV_STATUS {
 #[no_mangle]
 pub extern "C" fn osGetCurrentProcessorNumber() -> NvU32 {
     0
-}
-
-#[no_mangle]
-pub extern "C" fn osGetMaximumCoreCount() -> NvU32 {
-    1
 }
 
 #[no_mangle]
@@ -79,31 +79,6 @@ pub extern "C" fn osSchedule() -> NV_STATUS {
 }
 
 #[no_mangle]
-pub extern "C" fn osReadRegistryDword(
-    _gpu: *mut c_void,
-    _name: *const c_char,
-    data: *mut NvU32,
-) -> NV_STATUS {
-    if !data.is_null() {
-        unsafe { *data = 0 };
-    }
-    NV_ERR_OPERATING_SYSTEM
-}
-
-#[no_mangle]
-pub extern "C" fn osReadRegistryString(
-    _gpu: *mut c_void,
-    _name: *const c_char,
-    _data: *mut NvU8,
-    length: *mut NvU32,
-) -> NV_STATUS {
-    if !length.is_null() {
-        unsafe { *length = 0 };
-    }
-    NV_ERR_OPERATING_SYSTEM
-}
-
-#[no_mangle]
 pub extern "C" fn osGetSystemTime(sec: *mut NvU32, usec: *mut NvU32) -> NV_STATUS {
     let ns = with_hooks(0u64, |h| h.monotonic_time_ns());
     unsafe {
@@ -117,33 +92,3 @@ pub extern "C" fn osGetSystemTime(sec: *mut NvU32, usec: *mut NvU32) -> NV_STATU
     NV_OK
 }
 
-/// The real `struct OBJSYS` singleton, normally constructed by
-/// src/nvidia/src/kernel/core/system.c (not vendored yet). NULL until
-/// that subsystem is brought up; nothing vendored this pass dereferences
-/// it, only checks it for NULL defensively.
-#[no_mangle]
-pub static mut g_pSys: *mut c_void = core::ptr::null_mut();
-
-#[no_mangle]
-pub extern "C" fn gpumgrGetCurrentGpuInstance() -> NvU32 {
-    0
-}
-
-#[no_mangle]
-pub extern "C" fn threadPriorityStateAlloc() {}
-#[no_mangle]
-pub extern "C" fn threadPriorityStateFree() {}
-
-#[no_mangle]
-pub extern "C" fn rcdbAddAssertJournalRecWithLine(
-    _gpu: *mut c_void,
-    _line_num: NvU32,
-    _rec: *mut *mut c_void,
-    _group: NvU8,
-    _rec_type: NvU8,
-    _size: NvU16,
-    _level: NvU32,
-    _key: NvU64,
-) -> NV_STATUS {
-    NV_ERR_NOT_SUPPORTED
-}
