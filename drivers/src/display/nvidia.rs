@@ -1972,14 +1972,48 @@ impl DrmScheme for NvidiaGpu {
             (pfs1 >> 13) & 0x7,
             pfs1 & 0xfff
         );
-        let _ = writeln!(
-            s,
-            "[gpustep4]  PBDMA_MAP p0(0x2390)={:#06x} p1={:#06x} p2={:#06x} p3={:#06x} (bit n = serves runlist n)",
-            rd(0x0000_2390) & 0xffff,
-            rd(0x0000_2394) & 0xffff,
-            rd(0x0000_2398) & 0xffff,
-            rd(0x0000_239c) & 0xffff
-        );
+        // Same status register, but for whichever PBDMA index(es) actually
+        // serve our runl_id (may not be q0/q1 at all for a non-zero runlist).
+        let _ = write!(s, "[gpustep4]  PFIFO_PBDMA_STATUS(runl{}'s PBDMAs):", runl_id);
+        for i in 0..12u32 {
+            let m = rd(0x0000_2390 + i * 4) & 0xffff;
+            if m & (1 << runl_id) != 0 {
+                let v = rd(0x0000_3080 + i * 4);
+                let _ = write!(
+                    s,
+                    " q{}={:#010x}(chan_status={} id={:#x})",
+                    i,
+                    v,
+                    (v >> 13) & 0x7,
+                    v & 0xfff
+                );
+            }
+        }
+        let _ = writeln!(s);
+        // NV_PFIFO_PBDMA_MAP has up to 12 entries (__SIZE_1=12 per NVIDIA's
+        // manual) — we'd only ever looked at p0-p3. If our discovered
+        // runl_id (8/9/10, a standalone CE) isn't served by ANY of them,
+        // that's a dead end: no hardware PBDMA route exists for it at all.
+        let _ = write!(s, "[gpustep4]  PBDMA_MAP servers-of-runl{}:", runl_id);
+        let mut any_serves = false;
+        for i in 0..12u32 {
+            let m = rd(0x0000_2390 + i * 4) & 0xffff;
+            if m & (1 << runl_id) != 0 {
+                let _ = write!(s, " p{}", i);
+                any_serves = true;
+            }
+        }
+        if !any_serves {
+            let _ = write!(s, " NONE(!)");
+        }
+        let _ = write!(s, "  all-nonzero:");
+        for i in 0..12u32 {
+            let m = rd(0x0000_2390 + i * 4) & 0xffff;
+            if m != 0 {
+                let _ = write!(s, " p{}={:#06x}", i, m);
+            }
+        }
+        let _ = writeln!(s);
         // Scheduler gate + the runlist entries as the host sees them in VRAM.
         let rl = b.runlist_vram();
         let _ = writeln!(
