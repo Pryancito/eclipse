@@ -1,0 +1,10 @@
+[package]
+name = "nvidia-rm-sys"
+version = "0.1.0"
+edition = "2018"
+description = "FFI bridge to vendored NVIDIA open-gpu-kernel-modules C source (Resource Manager core) for the Eclipse kernel"
+
+[lib]
+
+[build-dependencies]
+cc = "1"

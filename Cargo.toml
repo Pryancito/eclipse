@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "drivers",
+    "nvidia-rm-sys",
     "kernel-hal",
     "zircon-object",
     "zircon-syscall",
