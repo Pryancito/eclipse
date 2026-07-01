@@ -101,6 +101,37 @@ fn build_first_real_nvidia_file() {
         vendor.join("src/nvidia/src/libraries/fnv_hash/fnv_hash.c"),
         vendor.join("src/nvidia/src/libraries/utils/nvassert.c"),
         vendor.join("src/common/shared/nvstatus/nvstatus.c"),
+        // GSP RPC message-queue support layer: msgq.c is the actual RPC
+        // ring-buffer transport; the rest are its real, load-bearing
+        // dependencies (memory descriptors, timeout tracking, generic
+        // containers, thread-local storage, the nvport portability
+        // library, and the Unix-build "no-op" OS stubs), pulled in by
+        // reproducing the real link-time undefined-symbol chain against
+        // the pinned submodule commit rather than guessing. NOT included
+        // yet: gpu/gsp/message_queue_cpu.c itself, whose own memdesc
+        // calls pull in mem_desc.c's much larger heap/bus/gpu-manager
+        // dependency graph -- scoped as a separate follow-up so this
+        // vendoring pass still links cleanly on its own.
+        vendor.join("src/nvidia/src/kernel/core/thread_state.c"),
+        vendor.join("src/nvidia/src/libraries/msgq/msgq.c"),
+        vendor.join("src/nvidia/src/libraries/containers/list.c"),
+        vendor.join("src/nvidia/src/libraries/containers/map.c"),
+        vendor.join("src/nvidia/src/libraries/tls/tls.c"),
+        vendor.join("src/nvidia/src/kernel/diagnostics/nvlog_printf.c"),
+        vendor.join("src/nvidia/src/kernel/os/os_stubs.c"),
+        vendor.join("src/nvidia/src/libraries/nvport/memory/memory_tracking.c"),
+        vendor.join("src/nvidia/src/libraries/nvport/memory/memory_unix_kernel_os.c"),
+        vendor.join("src/nvidia/src/libraries/nvport/sync/sync_unix_kernel_os.c"),
+        vendor.join("src/nvidia/src/libraries/nvport/core/core.c"),
+        vendor.join("src/nvidia/src/libraries/nvport/string/string_generic.c"),
+        vendor.join("src/nvidia/src/libraries/nvport/thread/thread_unix_kernel_os.c"),
+        vendor.join("src/nvidia/src/libraries/nvport/util/util_gcc_clang.c"),
+        vendor.join("src/nvidia/src/libraries/nvport/util/util_unix_kernel_os.c"),
+        vendor.join("src/nvidia/src/libraries/nvport/cpu/cpu_common.c"),
+        vendor.join("src/nvidia/src/libraries/nvport/cpu/cpu_x86_amd64.c"),
+        vendor.join("src/nvidia/src/libraries/nvport/crypto/crypto_random_xorshift.c"),
+        vendor.join("src/nvidia/src/libraries/nvport/time/time_generic.c"),
+        vendor.join("src/nvidia/src/libraries/nvport/time/time_unix_kernel_os.c"),
     ];
     if !source_files[0].exists() {
         println!(
