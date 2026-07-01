@@ -709,19 +709,21 @@ impl NvidiaGpu {
         w32(0x04c, ((gpfifo_va >> 32) as u32) | (limit2 << 16));
         w32(0x084, 0x2040_0000);
         w32(0x094, 0x3000_0000 | 0xfff);
-        // priv=false: verified against real nvkm_chan_new_/gv100_chan_ramfc_write
-        // — nvkm_wo32(inst, 0x0e4, priv ? 0x20 : 0) and 0x0f4 = 0x1000 | (priv ?
-        // 0x100 : 0). We'd been unconditionally setting the priv bits (0x0e4=
-        // 0x20, 0x0f4|=0x100) without ever checking what a normal client channel
-        // uses. priv=true is for kernel-internal channels; a "privileged"
-        // channel may need additional PRIV_LEVEL_MASK config elsewhere that we
-        // haven't done, which could plausibly make the scheduler refuse to load
-        // it silently (no fault, since this predates any GMMU access). A plain
-        // copy-engine class channel needs no special privilege, so use priv=false
-        // like a normal client channel would.
-        w32(0x0e4, 0x0000_0000);
+        // Fetched the real source (nvkm subdev/fifo/gv100.c, gv100_chan_ramfc):
+        //   const struct nvkm_chan_func_ramfc gv100_chan_ramfc = {
+        //       .write = gv100_chan_ramfc_write, .devm = 0xfff, .priv = true,
+        //   };
+        // `priv` is a FIXED property of the ramfc func table for this chip
+        // generation, not a per-channel choice — EVERY gv100/tu102 channel
+        // (client or kernel) uses priv=true. A previous commit here reasoned
+        // priv should be false for a "normal client channel" and set
+        // 0x0e4=0/0x0f4=0x1000; that directly contradicts the real source,
+        // which always writes 0x0e4=(priv?0x20:0)=0x20 and
+        // 0x0f4=0x1000|(priv?0x100:0)=0x1100 for this ramfc variant. Fixing
+        // to match verbatim.
+        w32(0x0e4, 0x0000_0020);
         w32(0x0e8, 0x0000_0000); // chan_id 0
-        w32(0x0f4, 0x0000_1000);
+        w32(0x0f4, 0x0000_1100);
         w32(0x0f8, 0x1000_3080);
         // CE/GR engine-context pointers (0x210-0x224, arm bits 0x10000/0x20000
         // at 0x0ac) are left ZERO: HOST never reads them during channel load —
@@ -1918,6 +1920,31 @@ impl DrmScheme for NvidiaGpu {
             s,
             "[gpustep4]  PCE_MAP(0x104028)={:#010x} (raw; per-LCE nibble layout not yet decoded)",
             pce_map
+        );
+
+        // Real nouveau (nvkm subdev/devinit/tu102.c, tu102_devinit_wait): on
+        // Turing+, devinit's VBIOS init-table execution runs on a HARDWARE
+        // sequencer automatically at POST, before any OS/driver runs at all.
+        // The host driver's only job is to *wait* for it, checking exactly:
+        //   (rd(0x118128) & 1) != 0 && (rd(0x118234) & 0xff) == 0xff
+        // We have NEVER checked this. If it never completed (e.g. this OS's
+        // boot path skipped something a full firmware POST normally does),
+        // downstream engines could be left un-floorplanned/un-clocked —
+        // which would explain a logical CE that never faults, never shows
+        // scheduler activity, and whose PBDMA is never touched at all,
+        // regardless of how correctly we set up the channel/runlist on top.
+        // Read-only; safe to check every time.
+        let di_128 = unsafe { core::ptr::read_volatile((self._bar0 + 0x0011_8128) as *const u32) };
+        let di_234 = unsafe { core::ptr::read_volatile((self._bar0 + 0x0011_8234) as *const u32) };
+        let devinit_done = (di_128 & 1) != 0 && (di_234 & 0xff) == 0xff;
+        let _ = writeln!(
+            s,
+            "[gpustep4]  DEVINIT_WAIT: 0x118128={:#010x}(bit0={}) 0x118234={:#010x}(low8={:#04x}) devinit_done={}",
+            di_128,
+            di_128 & 1,
+            di_234,
+            di_234 & 0xff,
+            devinit_done
         );
 
         // NV_PFIFO_SCHED_STATUS (0x263c): global scheduler status — is the
