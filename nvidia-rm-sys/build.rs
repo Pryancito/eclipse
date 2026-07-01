@@ -70,11 +70,19 @@ fn main() {
 /// without it, same as the smoke test above always has.
 fn build_first_real_nvidia_file() {
     let vendor = std::path::Path::new("vendor/open-gpu-kernel-modules");
-    let target_file = vendor.join("src/nvidia/src/libraries/fnv_hash/fnv_hash.c");
-    if !target_file.exists() {
+    // fnv_hash.c's NV_ASSERT calls need a real definition of
+    // nvAssertFailedNoLog -- confirmed by an actual link failure against
+    // the checked-out submodule ("undefined symbol: nvAssertFailedNoLog,
+    // referenced by fnv_hash.c:419"). That symbol lives in nvassert.c,
+    // the real NVIDIA source right next to nvassert.h. Compiling both now.
+    let source_files = [
+        vendor.join("src/nvidia/src/libraries/fnv_hash/fnv_hash.c"),
+        vendor.join("src/nvidia/src/libraries/utils/nvassert.c"),
+    ];
+    if !source_files[0].exists() {
         println!(
             "cargo:warning=nvidia-rm-sys: submodule not checked out ({} missing) -- skipping real NVIDIA source, only the hand-written smoke test compiled this run",
-            target_file.display()
+            source_files[0].display()
         );
         return;
     }
@@ -119,7 +127,9 @@ fn build_first_real_nvidia_file() {
     ];
 
     let mut build = cc::Build::new();
-    build.file(&target_file);
+    for f in &source_files {
+        build.file(f);
+    }
     for dir in &include_dirs {
         build.include(dir);
     }
@@ -157,6 +167,18 @@ fn build_first_real_nvidia_file() {
         "PORT_MODULE_thread=1",
         "PORT_MODULE_time=1",
         "PORT_MODULE_util=1",
+        "PORT_MODULE_example=0",
+        "PORT_MODULE_mmio=0",
+        "RS_STANDALONE=0",
+        "RS_STANDALONE_TEST=0",
+        "RS_COMPATABILITY_MODE=1",
+        "RS_PROVIDES_API_STATE=0",
+        "NV_CONTAINERS_NO_TEMPLATES",
+        "INCLUDE_NVLINK_LIB",
+        "INCLUDE_NVSWITCH_LIB",
+        "NV_PRINTF_STRINGS_ALLOWED=1",
+        "NV_ASSERT_FAILED_USES_STRINGS=1",
+        "PORT_ASSERT_FAILED_USES_STRINGS=1",
     ] {
         build.define(def, None);
     }
@@ -178,5 +200,7 @@ fn build_first_real_nvidia_file() {
     }
 
     build.compile("nvrm_fnv_hash");
-    println!("cargo:rerun-if-changed={}", target_file.display());
+    for f in &source_files {
+        println!("cargo:rerun-if-changed={}", f.display());
+    }
 }
