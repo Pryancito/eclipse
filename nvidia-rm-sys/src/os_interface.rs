@@ -431,8 +431,7 @@ pub extern "C" fn os_dbg_set_level(_level: NvU32) {}
 pub extern "C" fn os_dump_stack() {
     log::warn!("[nvidia-rm] os_dump_stack() -- no unwinder wired up, nothing to print");
 }
-#[no_mangle]
-pub extern "C" fn out_string(str_: *const c_char) {
+fn log_raw_cstr(str_: *const c_char) {
     unsafe {
         let mut p = str_;
         let mut len = 0usize;
@@ -446,7 +445,20 @@ pub extern "C" fn out_string(str_: *const c_char) {
         }
     }
 }
+#[no_mangle]
+pub extern "C" fn out_string(str_: *const c_char) {
+    log_raw_cstr(str_);
+}
 // TODO(variadic): nv_printf -- see note above os_snprintf.
+
+/// Called from vendor/glue.c's `nvDbg_Printf` -- NVIDIA's real printf
+/// backend (NVRM_PRINTF_FUNCTION) is variadic, which stable Rust can't
+/// export directly (see the TODO above os_snprintf). glue.c forwards the
+/// unexpanded format string here, dropping the variadic args for now.
+#[no_mangle]
+pub extern "C" fn nvrm_shim_log_raw(str_: *const c_char) {
+    log_raw_cstr(str_);
+}
 
 // ---------------------------------------------------------------------
 // CPU topology (HOOK, conservative single-CPU fallback).

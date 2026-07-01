@@ -74,10 +74,19 @@ fn build_first_real_nvidia_file() {
     // nvAssertFailedNoLog -- confirmed by an actual link failure against
     // the checked-out submodule ("undefined symbol: nvAssertFailedNoLog,
     // referenced by fnv_hash.c:419"). That symbol lives in nvassert.c,
-    // the real NVIDIA source right next to nvassert.h. Compiling both now.
+    // the real NVIDIA source right next to nvassert.h. nvassert.c in turn
+    // needs nvstatusToString (src/common/shared/nvstatus/nvstatus.c, self
+    // contained) -- confirmed by reproducing the full header/link graph
+    // locally against the pinned submodule commit rather than guessing
+    // blind. rcdbRmAssert (the RCDB crash-journal hook) is avoided instead
+    // of vendored: nvassert.h's own NV_JOURNAL_ASSERT_ENABLE override
+    // point (`#if !defined(NV_JOURNAL_ASSERT_ENABLE)`) is used below to
+    // turn it off, rather than pulling in NVIDIA's whole diagnostics
+    // subsystem for an assert-logging path we don't need yet.
     let source_files = [
         vendor.join("src/nvidia/src/libraries/fnv_hash/fnv_hash.c"),
         vendor.join("src/nvidia/src/libraries/utils/nvassert.c"),
+        vendor.join("src/common/shared/nvstatus/nvstatus.c"),
     ];
     if !source_files[0].exists() {
         println!(
@@ -98,7 +107,7 @@ fn build_first_real_nvidia_file() {
 
     // Transcribed from src/nvidia/Makefile's `CFLAGS += -I ...` lines, in
     // the same order, with $(SRC_COMMON) substituted.
-    let include_dirs: [std::path::PathBuf; 25] = [
+    let include_dirs: [std::path::PathBuf; 26] = [
         nvidia.join("kernel/inc"),
         nvidia.join("interface"),
         common.join("sdk/nvidia/inc"),
@@ -124,12 +133,23 @@ fn build_first_real_nvidia_file() {
         common.join("nvlink/inband/interface"),
         nvidia.join("inc/libraries"),
         nvidia.join("inc/kernel"),
+        // NOT part of src/nvidia/Makefile's own -I list -- confirmed by a
+        // real "No such file" failure that os-interface.h (and friends
+        // like nvmisc.h, nvgputypes.h, rs_access.h, nv-caps.h) live under
+        // kernel-open/, not src/nvidia/ or src/common/. The real build
+        // must pass this in from the parent (kernel-open/Makefile) when
+        // it recurses into src/nvidia's build; src/nvidia/Makefile alone
+        // never mentions it.
+        vendor.join("kernel-open/common/inc"),
     ];
 
     let mut build = cc::Build::new();
     for f in &source_files {
         build.file(f);
     }
+    // Our own shim (vendor/glue.c, not NVIDIA source) providing nvDbg_Printf
+    // -- see that file for why. No include dirs needed for it.
+    build.file("vendor/glue.c");
     for dir in &include_dirs {
         build.include(dir);
     }
@@ -179,6 +199,12 @@ fn build_first_real_nvidia_file() {
         "NV_PRINTF_STRINGS_ALLOWED=1",
         "NV_ASSERT_FAILED_USES_STRINGS=1",
         "PORT_ASSERT_FAILED_USES_STRINGS=1",
+        // NOT from the real Makefile -- deliberately overriding
+        // nvassert.h's own default (on for NVRM+Unix builds) to avoid
+        // needing NVIDIA's RCDB crash-journal subsystem (rcdbRmAssert)
+        // just to log an assertion failure. nvassert.h explicitly
+        // supports this override (`#if !defined(NV_JOURNAL_ASSERT_ENABLE)`).
+        "NV_JOURNAL_ASSERT_ENABLE=0",
     ] {
         build.define(def, None);
     }
@@ -203,4 +229,5 @@ fn build_first_real_nvidia_file() {
     for f in &source_files {
         println!("cargo:rerun-if-changed={}", f.display());
     }
+    println!("cargo:rerun-if-changed=vendor/glue.c");
 }
