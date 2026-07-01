@@ -25,6 +25,7 @@ fu740 = []
 board_malta = []
 
 [dependencies]
+nvidia-rm-sys = { path = "../nvidia-rm-sys" }
 log = "0.4"
 cfg-if = "1.0"
 bitflags = "1.3"

@@ -1369,6 +1369,18 @@ impl DrmScheme for NvidiaGpu {
         let cstatus = rd(regs::NV_PFB_CSTATUS);
         let mut s = String::new();
         let _ = writeln!(s, "[gpudbg] === {} ({}) ===", self.name, self.gpu_model);
+        // nvidia-rm-sys bring-up: first real-hardware exercise of the C-compile
+        // + FFI-link pipeline that will host vendored NVIDIA open-gpu-kernel-
+        // modules source. Not NVIDIA code yet -- see nvidia-rm-sys/build.rs.
+        // A prior isolated (non-workspace) build already confirmed the object
+        // code and cross-language linkage are correct; this is the first time
+        // it runs inside the actual kernel binary/linker script/panic handler.
+        let (nvrm_result, nvrm_logged) = nvidia_rm_sys::smoke_test(17, 25);
+        let _ = writeln!(
+            s,
+            "[gpudbg]  nvrm-sys smoke test: C-add(17,25)={} C->Rust-callback-saw={} (both should be 42)",
+            nvrm_result, nvrm_logged
+        );
         let _ = writeln!(
             s,
             "[gpudbg]  arch={:?} BAR0={:#x} BAR1/fb_vaddr={:#x} fb_size={:#x} VRAM={}MB",
