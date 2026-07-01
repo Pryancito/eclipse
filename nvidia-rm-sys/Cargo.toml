@@ -6,5 +6,9 @@ description = "FFI bridge to vendored NVIDIA open-gpu-kernel-modules C source (R
 
 [lib]
 
+[dependencies]
+log = "0.4"
+lock = { git = "https://github.com/DeathWish5/kernel-sync", rev = "8486b8" }
+
 [build-dependencies]
 cc = "1"
