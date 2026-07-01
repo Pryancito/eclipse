@@ -1381,6 +1381,20 @@ impl DrmScheme for NvidiaGpu {
             "[gpudbg]  nvrm-sys smoke test: C-add(17,25)={} C->Rust-callback-saw={} (both should be 42)",
             nvrm_result, nvrm_logged
         );
+        // First REAL vendored NVIDIA C (src/nvidia/src/libraries/fnv_hash/
+        // fnv_hash.c, MIT) exercised on real hardware, not the hand-written
+        // smoke test above. fnv1Hash64 on an empty slice can't touch the
+        // hash loop at all (zero-length buffer), so it must return the raw
+        // FNV-1 64-bit offset basis unchanged: 0xcbf29ce484222325. Any other
+        // value means either the wrong function ran or something is broken
+        // in the real NVIDIA source path, not something we wrote.
+        let nvrm_fnv_empty = nvidia_rm_sys::fnv_hash::fnv1_hash64(&[]);
+        let nvrm_fnv_hello = nvidia_rm_sys::fnv_hash::fnv1_hash64(b"hello");
+        let _ = writeln!(
+            s,
+            "[gpudbg]  nvrm-sys REAL NVIDIA fnv1Hash64(\"\")={:#018x} (expect 0xcbf29ce484222325) fnv1Hash64(\"hello\")={:#018x}",
+            nvrm_fnv_empty, nvrm_fnv_hello
+        );
         let _ = writeln!(
             s,
             "[gpudbg]  arch={:?} BAR0={:#x} BAR1/fb_vaddr={:#x} fb_size={:#x} VRAM={}MB",

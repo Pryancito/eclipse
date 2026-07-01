@@ -10,6 +10,7 @@
 
 extern crate alloc;
 
+pub mod fnv_hash;
 pub mod hooks;
 pub mod os_interface;
 pub mod types;
