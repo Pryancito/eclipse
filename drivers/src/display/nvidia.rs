@@ -882,14 +882,18 @@ impl NvidiaGpu {
     /// Scan the PTOP device-info table (0x022700+i*4, 64 slots) for the copy
     /// engine's runlist id. Volta+ gives EVERY engine its own dedicated
     /// runlist (discovered, not fixed) — we had been assuming runlist 0 is
-    /// the copy engine's without ever checking, and runlist 0 may actually
-    /// belong to GR instead. Mirrors nvkm's gk104_top_parse exactly: each
-    /// logical device spans 1+ consecutive 32-bit words (continuation while
-    /// bit31 is set; the final word of an entry, bit31 clear, carries the
-    /// ENGINE_TYPE -> NVKM engine dispatch). Returns the runlist id of the
-    /// first CE engine instance found (type 0x1/0x2/0x3 = CE0/1/2, or 0x13 =
-    /// CE with explicit inst from a DATA word), or None if no CE entry
-    /// carried a runlist field.
+    /// the copy engine's without ever checking. Mirrors nvkm's
+    /// gk104_top_parse exactly: each logical device spans 1+ consecutive
+    /// 32-bit words (continuation while bit31 is set; the final word of an
+    /// entry, bit31 clear, carries the ENGINE_TYPE -> NVKM engine dispatch).
+    ///
+    /// On this chip PTOP reports MULTIPLE CE-type entries (type 0x1/0x2/0x3/
+    /// 0x13) with DIFFERENT runlist ids — some sharing GR's runlist (almost
+    /// certainly a "GRCE", a copy engine reserved for GR context-switch use,
+    /// not general DMA) and others standalone. Picking the first one blindly
+    /// landed on the GRCE (runlist 0 == GR's runlist), which is plausibly
+    /// why nothing ever go scheduled: GRCE's runlist may not be a normal
+    /// user-DMA path at all. Prefer a CE runlist that does NOT match GR's.
     fn find_ce_runlist(&self) -> Option<u32> {
         let bar0 = self._bar0;
         let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
@@ -897,6 +901,9 @@ impl NvidiaGpu {
         let mut have_entry = false;
         let mut runlist: u32 = 0;
         let mut have_runlist = false;
+        let mut gr_runlist: Option<u32> = None;
+        let mut first_ce_runlist: Option<u32> = None;
+        let mut standalone_ce_runlist: Option<u32> = None;
         for i in 0..64u32 {
             if !have_entry {
                 ty = !0;
@@ -919,13 +926,30 @@ impl NvidiaGpu {
             if data & 0x8000_0000 != 0 {
                 continue; // more words follow for this same entry
             }
-            // Finalize: type 1/2/3 = CE0/1/2 fixed inst, 0x13 = CE w/ DATA inst.
-            if have_runlist && matches!(ty, 0x1 | 0x2 | 0x3 | 0x13) {
-                return Some(runlist);
+            if have_runlist {
+                if ty == 0x0 {
+                    gr_runlist = Some(runlist);
+                } else if matches!(ty, 0x1 | 0x2 | 0x3 | 0x13) {
+                    if first_ce_runlist.is_none() {
+                        first_ce_runlist = Some(runlist);
+                    }
+                    if standalone_ce_runlist.is_none() && Some(runlist) != gr_runlist {
+                        standalone_ce_runlist = Some(runlist);
+                    }
+                }
             }
             have_entry = false;
         }
-        None
+        // Re-check standalone candidates against GR's runlist now that GR
+        // (which can appear before OR after CE entries in the table) is
+        // fully known — a single forward pass may have picked a CE entry
+        // that only *looked* standalone before GR's own entry was parsed.
+        if let Some(gr) = gr_runlist {
+            if standalone_ce_runlist == Some(gr) {
+                standalone_ce_runlist = None;
+            }
+        }
+        standalone_ce_runlist.or(first_ce_runlist)
     }
 
     /// Same scan as `find_ce_runlist` but reports every finalized entry
