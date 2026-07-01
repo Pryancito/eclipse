@@ -894,20 +894,29 @@ impl NvidiaGpu {
     /// landed on the GRCE (runlist 0 == GR's runlist), which is plausibly
     /// why nothing ever go scheduled: GRCE's runlist may not be a normal
     /// user-DMA path at all. Prefer a CE runlist that does NOT match GR's.
-    fn find_ce_runlist(&self) -> Option<u32> {
+    /// Returns (runlist_id, engine_id) for the chosen CE. `engine_id` is the
+    /// PTOP ENUM word's "engine" field (bits 29:26, gated by bit5=0x20) — a
+    /// THIRD id namespace, distinct from both runlist id and PBDMA index,
+    /// used to index NV_PFIFO_ENGINE_STATUS(i) = 0x2640+i*8 (per-engine
+    /// scheduler status: CTX_STATUS, FAULTED, ENGINE busy/idle). We had
+    /// never read this register at all.
+    fn find_ce_runlist(&self) -> Option<(u32, u32)> {
         let bar0 = self._bar0;
         let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
         let mut ty: u32 = !0;
         let mut have_entry = false;
         let mut runlist: u32 = 0;
         let mut have_runlist = false;
+        let mut engine: u32 = 0;
+        let mut have_engine = false;
         let mut gr_runlist: Option<u32> = None;
-        let mut first_ce_runlist: Option<u32> = None;
-        let mut standalone_ce_runlist: Option<u32> = None;
+        let mut first_ce: Option<(u32, u32)> = None;
+        let mut standalone_ce: Option<(u32, u32)> = None;
         for i in 0..64u32 {
             if !have_entry {
                 ty = !0;
                 have_runlist = false;
+                have_engine = false;
                 have_entry = true;
             }
             let data = rd(0x0002_2700 + i * 4);
@@ -915,6 +924,10 @@ impl NvidiaGpu {
                 0 => continue, // NOT_VALID — skip, keep accumulating this entry
                 1 => {}        // DATA — addr/fault/inst, unused here
                 2 => {
+                    if data & 0x20 != 0 {
+                        engine = (data >> 26) & 0xf;
+                        have_engine = true;
+                    }
                     if data & 0x10 != 0 {
                         runlist = (data >> 21) & 0xf;
                         have_runlist = true;
@@ -930,11 +943,12 @@ impl NvidiaGpu {
                 if ty == 0x0 {
                     gr_runlist = Some(runlist);
                 } else if matches!(ty, 0x1 | 0x2 | 0x3 | 0x13) {
-                    if first_ce_runlist.is_none() {
-                        first_ce_runlist = Some(runlist);
+                    let eng = if have_engine { engine } else { u32::MAX };
+                    if first_ce.is_none() {
+                        first_ce = Some((runlist, eng));
                     }
-                    if standalone_ce_runlist.is_none() && Some(runlist) != gr_runlist {
-                        standalone_ce_runlist = Some(runlist);
+                    if standalone_ce.is_none() && Some(runlist) != gr_runlist {
+                        standalone_ce = Some((runlist, eng));
                     }
                 }
             }
@@ -945,11 +959,11 @@ impl NvidiaGpu {
         // fully known — a single forward pass may have picked a CE entry
         // that only *looked* standalone before GR's own entry was parsed.
         if let Some(gr) = gr_runlist {
-            if standalone_ce_runlist == Some(gr) {
-                standalone_ce_runlist = None;
+            if standalone_ce.map(|(rl, _)| rl) == Some(gr) {
+                standalone_ce = None;
             }
         }
-        standalone_ce_runlist.or(first_ce_runlist)
+        standalone_ce.or(first_ce)
     }
 
     /// Same scan as `find_ce_runlist` but reports every finalized entry
@@ -1022,7 +1036,7 @@ impl NvidiaGpu {
     /// and channel enable. Returns (commit_ok, runlist_id_used). Safe to
     /// repeat — used by Step 4+ so each is self-contained across reboots.
     fn setup_channel(&self, b: &GpuBringup) -> (bool, u32) {
-        let runl_id = self.find_ce_runlist().unwrap_or(0);
+        let runl_id = self.find_ce_runlist().map(|(rl, _)| rl).unwrap_or(0);
         const CHID: u32 = 0;
         let bar0 = self._bar0;
         let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
@@ -1821,14 +1835,52 @@ impl DrmScheme for NvidiaGpu {
             (pmc_pre >> 8) & 1,
             (pmc_post >> 8) & 1
         );
+        let ce = self.find_ce_runlist();
+        let engine_id = ce.map(|(_, e)| e).unwrap_or(u32::MAX);
         let _ = writeln!(
             s,
-            "[gpustep4]  PTOP-discovered CE runlist id={} (fallback-to-0={}) channel setup: runlist_commit={}",
+            "[gpustep4]  PTOP-discovered CE runlist id={} engine_id={} (fallback-to-0={}) channel setup: runlist_commit={}",
             runl_id,
-            self.find_ce_runlist().is_none(),
+            engine_id,
+            ce.is_none(),
             commit_ok
         );
         let _ = writeln!(s, "[gpustep4]  PTOP entries:{}", self.ptop_report());
+
+        // NV_PFIFO_SCHED_STATUS (0x263c): global scheduler status — is the
+        // runlist-fetch unit even busy/idle, is a channel switch in
+        // progress. NV_PFIFO_ENGINE_STATUS(engine_id) (0x2640+id*8): the
+        // per-ENGINE (a third id space, distinct from runlist id and PBDMA
+        // index) scheduler status — CTX_STATUS, FAULTED, ENGINE busy/idle,
+        // currently-loaded ID. Neither had ever been read before.
+        let sched_status = unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_263c) as *const u32) };
+        let _ = writeln!(
+            s,
+            "[gpustep4]  SCHED_STATUS(0x263c)={:#010x} chsw_in_progress={} runlist_fetch_busy={}",
+            sched_status,
+            (sched_status >> 1) & 1,
+            (sched_status >> 2) & 1
+        );
+        if engine_id != u32::MAX {
+            let eoff = engine_id as usize * 8;
+            let eng_status =
+                unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_2640 + eoff) as *const u32) };
+            let eng_debug =
+                unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_2644 + eoff) as *const u32) };
+            let _ = writeln!(
+                s,
+                "[gpustep4]  ENGINE_STATUS(engine{})={:#010x} ctx_status={} id={:#x} id_type={} engine_busy={} faulted={} eng_reload={}  DEBUG={:#010x}",
+                engine_id,
+                eng_status,
+                (eng_status >> 13) & 0x7,
+                eng_status & 0xfff,
+                (eng_status >> 12) & 1,
+                (eng_status >> 31) & 1,
+                (eng_status >> 30) & 1,
+                (eng_status >> 29) & 1,
+                eng_debug
+            );
+        }
 
         // Build the method stream (sysmem pushbuffer) + a GPFIFO launch entry at
         // the current PUT slot. The GPFIFO entry points at the pushbuffer GPU VA.
