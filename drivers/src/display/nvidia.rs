@@ -709,9 +709,19 @@ impl NvidiaGpu {
         w32(0x04c, ((gpfifo_va >> 32) as u32) | (limit2 << 16));
         w32(0x084, 0x2040_0000);
         w32(0x094, 0x3000_0000 | 0xfff);
-        w32(0x0e4, 0x0000_0020); // priv
+        // priv=false: verified against real nvkm_chan_new_/gv100_chan_ramfc_write
+        // — nvkm_wo32(inst, 0x0e4, priv ? 0x20 : 0) and 0x0f4 = 0x1000 | (priv ?
+        // 0x100 : 0). We'd been unconditionally setting the priv bits (0x0e4=
+        // 0x20, 0x0f4|=0x100) without ever checking what a normal client channel
+        // uses. priv=true is for kernel-internal channels; a "privileged"
+        // channel may need additional PRIV_LEVEL_MASK config elsewhere that we
+        // haven't done, which could plausibly make the scheduler refuse to load
+        // it silently (no fault, since this predates any GMMU access). A plain
+        // copy-engine class channel needs no special privilege, so use priv=false
+        // like a normal client channel would.
+        w32(0x0e4, 0x0000_0000);
         w32(0x0e8, 0x0000_0000); // chan_id 0
-        w32(0x0f4, 0x0000_1100); // 0x1000 | priv 0x100
+        w32(0x0f4, 0x0000_1000);
         w32(0x0f8, 0x1000_3080);
         // CE/GR engine-context pointers (0x210-0x224, arm bits 0x10000/0x20000
         // at 0x0ac) are left ZERO: HOST never reads them during channel load —
