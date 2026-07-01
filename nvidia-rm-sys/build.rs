@@ -132,6 +132,35 @@ fn build_first_real_nvidia_file() {
         common.join("sdk/nvidia/inc/cpuopsys.h").display()
     ));
 
+    // Transcribed from src/nvidia/Makefile's `CFLAGS += -D...` lines. First
+    // real build against the checked-out submodule failed without these --
+    // nvassert.h hard-#errors ("NV_PORT_HEADER must define
+    // PORT_IS_CHECKED_BUILD") unless PORT_IS_CHECKED_BUILD is defined one
+    // way or the other; NVIDIA's own real build uses the release (0) value.
+    for def in [
+        "PORT_IS_CHECKED_BUILD=0",
+        "_LANGUAGE_C",
+        "__NO_CTYPE",
+        "NVRM",
+        "LOCK_VAL_ENABLED=0",
+        "PORT_ATOMIC_64_BIT_SUPPORTED=1",
+        "PORT_IS_KERNEL_BUILD=1",
+        "PORT_MODULE_atomic=1",
+        "PORT_MODULE_core=1",
+        "PORT_MODULE_cpu=1",
+        "PORT_MODULE_crypto=1",
+        "PORT_MODULE_debug=1",
+        "PORT_MODULE_memory=1",
+        "PORT_MODULE_safe=1",
+        "PORT_MODULE_string=1",
+        "PORT_MODULE_sync=1",
+        "PORT_MODULE_thread=1",
+        "PORT_MODULE_time=1",
+        "PORT_MODULE_util=1",
+    ] {
+        build.define(def, None);
+    }
+
     let building_for_kernel = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("none");
     if building_for_kernel {
         build.target("x86_64-unknown-none");
