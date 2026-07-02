@@ -30,6 +30,18 @@
 #include "gpu/gsp/kernel_gsp.h"
 
 /*
+ * TEMPORARY: checkpoint tracing to find exactly where real hardware hung
+ * during the first-ever exercise of this call chain (gpustep5 froze the
+ * machine solid, confirmed on real Turing hardware -- no output at all
+ * reached /proc/gpustep5, so the hang is somewhere in here or deeper).
+ * nv_printf (vendor/glue.c) forwards straight to Eclipse's synchronous
+ * console logger, so whatever printed last before a freeze pinpoints the
+ * exact call that never returns. Remove once the real hang is found.
+ */
+extern int nv_printf(unsigned int debuglevel, const char *printf_format, ...);
+#define ECLIPSE_TRACE(msg) nv_printf(0, "[eclipse-rm-trace] " msg "\n")
+
+/*
  * Constructs the real OBJSYS singleton and the RM resource server.
  * Call exactly once, before eclipse_rm_attach_gpu.
  */
@@ -38,22 +50,28 @@ NV_STATUS eclipse_rm_init_core(void)
     OBJSYS *pSys = NULL;
     NV_STATUS status;
 
+    ECLIPSE_TRACE("init_core: before __nvoc_objCreate_OBJSYS");
     status = __nvoc_objCreate_OBJSYS(&pSys, NULL, 0);
+    ECLIPSE_TRACE("init_core: after __nvoc_objCreate_OBJSYS");
     if (status != NV_OK)
     {
         return status;
     }
 
+    ECLIPSE_TRACE("init_core: before rmapiInitialize");
     status = rmapiInitialize();
+    ECLIPSE_TRACE("init_core: after rmapiInitialize");
     if (status != NV_OK)
     {
         return status;
     }
 
+    ECLIPSE_TRACE("init_core: before threadStateInitSetupFlags");
     threadStateInitSetupFlags(THREAD_STATE_SETUP_FLAGS_ENABLED |
                               THREAD_STATE_SETUP_FLAGS_TIMEOUT_ENABLED |
                               THREAD_STATE_SETUP_FLAGS_SLI_LOGIC_ENABLED |
                               THREAD_STATE_SETUP_FLAGS_DO_NOT_INCLUDE_SLEEP_TIME_ENABLED);
+    ECLIPSE_TRACE("init_core: after threadStateInitSetupFlags, done");
 
     return NV_OK;
 }
@@ -84,19 +102,25 @@ NV_STATUS eclipse_rm_attach_gpu(
     GPUATTACHARG gpuAttachArg;
     NV_STATUS status;
 
+    ECLIPSE_TRACE("attach_gpu: before gpumgrAllocGpuInstance");
     status = gpumgrAllocGpuInstance(&gpuInstance);
+    ECLIPSE_TRACE("attach_gpu: after gpumgrAllocGpuInstance");
     if (status != NV_OK)
     {
         return status;
     }
 
+    ECLIPSE_TRACE("attach_gpu: before rmGpuLockAlloc");
     status = rmGpuLockAlloc(gpuInstance);
+    ECLIPSE_TRACE("attach_gpu: after rmGpuLockAlloc");
     if (status != NV_OK)
     {
         return status;
     }
 
+    ECLIPSE_TRACE("attach_gpu: before gpumgrCreateDevice");
     status = gpumgrCreateDevice(&deviceInstance, NVBIT(gpuInstance), NULL);
+    ECLIPSE_TRACE("attach_gpu: after gpumgrCreateDevice");
     if (status != NV_OK)
     {
         rmGpuLockFree(gpuInstance);
@@ -125,7 +149,9 @@ NV_STATUS eclipse_rm_attach_gpu(
     gpuAttachArg.cpuNumaNodeId         = -1;
     gpuAttachArg.pOsAttachArg          = NULL;
 
+    ECLIPSE_TRACE("attach_gpu: before gpumgrAttachGpu");
     status = gpumgrAttachGpu(deviceInstance, &gpuAttachArg);
+    ECLIPSE_TRACE("attach_gpu: after gpumgrAttachGpu");
     if (status != NV_OK)
     {
         gpumgrDestroyDevice(deviceInstance);
@@ -138,6 +164,7 @@ NV_STATUS eclipse_rm_attach_gpu(
         *pDeviceInstance = deviceInstance;
     }
 
+    ECLIPSE_TRACE("attach_gpu: done, OK");
     return NV_OK;
 }
 
