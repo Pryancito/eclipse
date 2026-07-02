@@ -225,7 +225,6 @@ fn primary_main(config: kernel_hal::KernelConfig) {
 /// at image-build time (best-effort, see xtask/src/linux/nvidia_firmware.rs).
 #[cfg(feature = "linux")]
 fn load_nvidia_gsp_firmware(root: &alloc::sync::Arc<dyn rcore_fs::vfs::INode>) {
-    use rcore_fs::vfs::INode;
     let inode = match root.lookup("/lib/firmware/nvidia/gsp/gsp.bin") {
         Ok(i) => i,
         Err(_) => return,

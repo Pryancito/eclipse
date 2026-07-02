@@ -8,8 +8,24 @@ use std::{fs, path::Path};
 /// that additionally embeds the installer payloads under `/boot`.
 #[cfg(test)]
 const INITRAMFS_BYTES: usize = 80 * 1024 * 1024;
-/// FAT32 ESP image: initramfs + zcore (~40 MiB) + boot loader + metadata.
-const EFI_FAT_BYTES: usize = 128 * 1024 * 1024;
+/// ESP / primera partición (EFI). Debe coincidir con `PART1_SIZE_MIB` en
+/// install-eclipse y `ESP_IMG_SIZE_MB` en el Makefile.
+const EFI_PARTITION_BYTES: usize = 256 * 1024 * 1024;
+
+/// FAT32 ESP: siempre [`EFI_PARTITION_BYTES`]. Falla en build si los payloads
+/// no caben (p. ej. zcore.elf + initramfs superan ~252 MiB).
+fn efi_fat_size_for(initramfs_bytes: u64, zcore_bytes: u64, boot_bytes: u64) -> usize {
+    let payload = initramfs_bytes + zcore_bytes + boot_bytes;
+    const FAT_METADATA_SLACK: u64 = 4 * 1024 * 1024;
+    let max_payload = EFI_PARTITION_BYTES as u64 - FAT_METADATA_SLACK;
+    assert!(
+        payload <= max_payload,
+        "EFI payloads ({} MiB) do not fit in the {} MiB ESP; strip zcore or raise PART1_SIZE_MIB",
+        payload.div_ceil(1024 * 1024),
+        EFI_PARTITION_BYTES / (1024 * 1024),
+    );
+    EFI_PARTITION_BYTES
+}
 
 /// Installer payloads staged under the rootfs `/boot` for the live installer.
 const BOOT_PAYLOADS: [&str; 3] = ["efi.img.gz", "rootfs.btrfs.gz", "home.btrfs.gz"];
@@ -199,8 +215,20 @@ impl super::LinuxRootfs {
             let initramfs_img = PROJECT_DIR.join("zCore").join("x86_64.img");
             fuse(&live_root, &initramfs_img, bootstrap_size);
 
+            let rboot_efi = rboot_dir.join("target/x86_64-unknown-uefi/release/rboot.efi");
+            let rboot_conf = PROJECT_DIR.join("zCore/rboot.conf");
+            let zcore_elf = PROJECT_DIR.join("target/x86_64/release/zcore");
+
             // 4. Build efi.img (FAT32)
-            println!("Building efi.img...");
+            let initramfs_len = fs::metadata(&initramfs_img).unwrap().len();
+            let zcore_len = fs::metadata(&zcore_elf).unwrap().len();
+            let boot_len = fs::metadata(&rboot_efi).unwrap().len()
+                + fs::metadata(&rboot_conf).unwrap().len();
+            let efi_fat_bytes = efi_fat_size_for(initramfs_len, zcore_len, boot_len);
+            println!(
+                "Building efi.img ({} MiB)...",
+                efi_fat_bytes / (1024 * 1024)
+            );
             let efi_img = TARGET.join("efi.img");
             let _ = fs::remove_file(&efi_img);
 
@@ -210,7 +238,7 @@ impl super::LinuxRootfs {
                 .truncate(true)
                 .open(&efi_img)
                 .unwrap();
-            file.set_len(EFI_FAT_BYTES as u64).unwrap();
+            file.set_len(efi_fat_bytes as u64).unwrap();
             drop(file);
 
             let status = std::process::Command::new("mkfs.vfat")
@@ -230,10 +258,6 @@ impl super::LinuxRootfs {
                 .status()
                 .unwrap();
             assert!(status.success(), "Failed to create EFI directories");
-
-            let rboot_efi = rboot_dir.join("target/x86_64-unknown-uefi/release/rboot.efi");
-            let rboot_conf = PROJECT_DIR.join("zCore/rboot.conf");
-            let zcore_elf = PROJECT_DIR.join("target/x86_64/release/zcore");
 
             let status = std::process::Command::new("mcopy")
                 .arg("-i")
