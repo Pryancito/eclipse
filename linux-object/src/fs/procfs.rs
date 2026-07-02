@@ -1091,9 +1091,23 @@ fn proc_gpustep4_content() -> String {
 /// real hardware on a plain `cat` -- deliberately separate so `gpudbg`
 /// stays safe to poll.
 fn proc_gpustep5_content() -> String {
+    // TEMPORARY: bracket the generic driver-enumeration dispatch itself,
+    // to isolate whether a real-hardware hang is inside NvidiaGpu's own
+    // bringup_step5 or already stuck in all_drm()/the per-driver loop
+    // before it -- two prior real-hardware tests (confirmed-fresh
+    // binaries) showed zero trace output even from bringup_step5's own
+    // first line, so this checkpoint runs strictly before that call.
+    log::warn!("[gpustep5] proc_gpustep5_content: entered, about to enumerate drm drivers");
+    let drivers = kernel_hal::drivers::all_drm();
+    log::warn!(
+        "[gpustep5] proc_gpustep5_content: got driver list, count={}",
+        drivers.as_vec().len()
+    );
     let mut s = String::new();
-    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+    for d in drivers.as_vec().iter() {
+        log::warn!("[gpustep5] proc_gpustep5_content: calling bringup_step5 on next driver");
         s.push_str(&d.bringup_step5());
+        log::warn!("[gpustep5] proc_gpustep5_content: bringup_step5 returned");
     }
     if s.is_empty() {
         s.push_str("[gpustep5] no DRM driver with bring-up support\n");

@@ -1681,9 +1681,21 @@ impl DrmScheme for NvidiaGpu {
     /// first attempt so repeated reads don't re-run it.
     fn bringup_step5(&self) -> String {
         use core::fmt::Write;
+        // TEMPORARY: absolute-first-line checkpoint, using the exact same
+        // log::warn! mechanism already proven visible at driver-init time
+        // ("[NVIDIA] GPU at ..."), bypassing nv_printf/C entirely -- two
+        // real-hardware tests in a row (with confirmed-fresh binaries)
+        // produced zero output even after fixing the info->warn level
+        // bug, so this determines whether the function is even entered/
+        // whether ANY print is visible from this exact call context
+        // before reaching the lock or any real RM code.
+        log::warn!("[NVIDIA] bringup_step5: entered");
         let bar0 = self._bar0;
+        log::warn!("[NVIDIA] bringup_step5: read self._bar0 = {:#x}", bar0 as usize);
         let mut s = String::new();
+        log::warn!("[NVIDIA] bringup_step5: about to lock rm_attach_result");
         let mut attach = self.rm_attach_result.lock();
+        log::warn!("[NVIDIA] bringup_step5: locked rm_attach_result");
         if attach.is_none() {
             let core_status = rm_core_init_once();
             *attach = Some(if core_status != 0 {
