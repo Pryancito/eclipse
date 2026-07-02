@@ -344,6 +344,20 @@ impl GpuBringup {
 
 static BOOT_FB_INFO: Mutex<Option<BootFbInfo>> = Mutex::new(None);
 
+/// Runs `nvidia_rm_sys::rm_init::init_core()` (constructs the real OBJSYS
+/// singleton + RM resource server) at most once, regardless of how many
+/// GPUs attach or how many times a caller asks. Safe to call from every
+/// `NvidiaGpu::debug_dump()`; only the first call actually invokes RM.
+static RM_CORE_INIT_STATUS: Mutex<Option<u32>> = Mutex::new(None);
+
+fn rm_core_init_once() -> u32 {
+    let mut status = RM_CORE_INIT_STATUS.lock();
+    if status.is_none() {
+        *status = Some(nvidia_rm_sys::rm_init::init_core());
+    }
+    status.unwrap()
+}
+
 #[derive(Debug, Clone, Copy)]
 struct BootFbInfo {
     phys: u64,
@@ -390,11 +404,24 @@ pub struct NvidiaGpu {
     /// backs the boot framebuffer (i.e. drives the console) and must therefore be
     /// spared from the risky copy-engine bring-up writes.
     bar1_phys: u64,
+    /// Physical base and mapped length of BAR0 (the MMIO register aperture),
+    /// and this GPU's real PCI location -- needed to attach it to the real
+    /// vendored RM core via nvidia_rm_sys::rm_init (GPUATTACHARG wants the
+    /// same info NVIDIA's own osInitNvMapping packages from nv_state_t).
+    bar0_phys: u64,
+    bar0_len: u64,
+    pci_domain: u32,
+    pci_bus: u8,
+    pci_device: u8,
     vram_allocator: Mutex<Option<NvidiaVramAllocator>>,
     /// Copy-engine bring-up state (GMMU tables + channel structs). Built lazily
     /// on the first `/proc/gpudbg` read so the memory plan is only allocated
     /// when someone is actually debugging GPU bring-up.
     bringup: Mutex<Option<GpuBringup>>,
+    /// Result of the real RM attach attempt (nvidia_rm_sys::rm_init), cached
+    /// after the first `/proc/gpudbg` read triggers it so repeated reads
+    /// don't re-run RM's own object-construction logic.
+    rm_attach_result: Mutex<Option<String>>,
 }
 
 /// Simple bitmap-based VRAM allocator for BAR1 aperture (4KB page granularity)
@@ -502,6 +529,7 @@ impl NvidiaGpu {
         width
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: String,
         device_id: u16,
@@ -511,6 +539,11 @@ impl NvidiaGpu {
         bar1_phys: u64,
         default_width: u32,
         default_height: u32,
+        bar0_phys: u64,
+        bar0_len: u64,
+        pci_domain: u32,
+        pci_bus: u8,
+        pci_device: u8,
     ) -> DeviceResult<Self> {
         // Boot path: identify from PCI ID only. BAR0 MMIO reads during early
         // driver init can stall the CPU indefinitely on some firmware/GPU combos
@@ -591,11 +624,17 @@ impl NvidiaGpu {
             _bar0: bar0,
             _bar1: final_fb_vaddr,
             bar1_phys,
+            bar0_phys,
+            bar0_len,
+            pci_domain,
+            pci_bus,
+            pci_device,
             vram_allocator: Mutex::new(Some(NvidiaVramAllocator::new(
                 fb_vaddr as u64,
                 fb_size as u64,
             ))),
             bringup: Mutex::new(None),
+            rm_attach_result: Mutex::new(None),
         })
     }
 
@@ -1606,6 +1645,50 @@ impl DrmScheme for NvidiaGpu {
                 }
             }
         }
+
+        // --- Real RM attach (nvidia_rm_sys::rm_init) ---
+        // First real invocation of the vendored RM core's own object
+        // construction (OBJSYS/resource-server/OBJGPU via NVOC), never
+        // exercised before this point. Cached after the first attempt so
+        // repeated /proc/gpudbg reads don't re-run it; result (success or
+        // the real NV_STATUS failure code) is reported either way.
+        {
+            let mut attach = self.rm_attach_result.lock();
+            if attach.is_none() {
+                let core_status = rm_core_init_once();
+                *attach = Some(if core_status != 0 {
+                    alloc::format!(
+                        "eclipse_rm_init_core FAILED, NV_STATUS={:#x}",
+                        core_status
+                    )
+                } else {
+                    match nvidia_rm_sys::rm_init::attach_gpu(
+                        self.pci_domain,
+                        self.pci_bus,
+                        self.pci_device,
+                        self.bar0_phys,
+                        bar0 as *mut core::ffi::c_void,
+                        self.bar0_len,
+                        self.bar1_phys,
+                        self.vram_size_mb as u64 * 1024 * 1024,
+                    ) {
+                        Ok(device_instance) => alloc::format!(
+                            "gpumgrAttachGpu OK, deviceInstance={}",
+                            device_instance
+                        ),
+                        Err(status) => {
+                            alloc::format!("gpumgrAttachGpu FAILED, NV_STATUS={:#x}", status)
+                        }
+                    }
+                });
+            }
+            let _ = writeln!(
+                s,
+                "[gpudbg]  --- Real RM attach: {} ---",
+                attach.as_deref().unwrap_or("(unreachable)")
+            );
+        }
+
         s
     }
 
@@ -2530,6 +2613,11 @@ impl PciDriver for NvidiaGpuDriverPci {
                 fb_addr,
                 1920,
                 1080,
+                bar0_addr,
+                (PAGE_SIZE * 1024) as u64,
+                0, // PCI domain: Eclipse only tracks bus/device/function, single-segment system
+                dev.loc.bus,
+                dev.loc.device,
             )?);
             Ok(Device::Drm(gpu))
         } else {

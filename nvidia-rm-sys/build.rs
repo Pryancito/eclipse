@@ -198,6 +198,12 @@ fn build_first_real_nvidia_file() {
     // control-call surface) -- see that file's own header comment.
     build.file("vendor/glue.c");
     build.file("vendor/rm_boundary_stubs.c");
+    // vendor/eclipse_rm_init.c: Eclipse's own equivalent of the Linux-
+    // specific osRmInitRm/osInitNvMapping/RmInitAdapter orchestration in
+    // arch/nvalloc/unix/src/osinit.c -- constructs the real OBJSYS
+    // singleton and resource server, then attaches a GPU by real PCI
+    // location and BAR info. See that file's header comment.
+    build.file("vendor/eclipse_rm_init.c");
     for dir in &include_dirs {
         build.include(dir);
     }
@@ -270,4 +276,5 @@ fn build_first_real_nvidia_file() {
     }
     println!("cargo:rerun-if-changed=vendor/glue.c");
     println!("cargo:rerun-if-changed=vendor/rm_boundary_stubs.c");
+    println!("cargo:rerun-if-changed=vendor/eclipse_rm_init.c");
 }
