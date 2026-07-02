@@ -35,7 +35,14 @@ pub fn register_hooks(hooks: &'static dyn KernelHooks) {
 }
 
 pub(crate) fn with_hooks<R>(default: R, f: impl FnOnce(&dyn KernelHooks) -> R) -> R {
-    match *HOOKS.lock() {
+    // Bind and drop the guard *before* calling `f` -- matching on
+    // `*HOOKS.lock()` directly would keep the lock held for the entire
+    // match arm (including `f(h)`), which would self-deadlock solid on
+    // any call path that re-enters `with_hooks` from inside `f` (no
+    // current caller does, but the lock gives no warning if one ever
+    // does -- this costs nothing and removes the landmine).
+    let hooks = *HOOKS.lock();
+    match hooks {
         Some(h) => f(h),
         None => default,
     }

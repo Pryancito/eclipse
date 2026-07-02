@@ -2591,29 +2591,58 @@ impl PciDriver for NvidiaGpuDriverPci {
         #[cfg(target_arch = "x86_64")]
         use crate::bus::pci::{read_bar_addr, PortOpsImpl, PCI_ACCESS};
         use crate::bus::phys_to_virt;
-        use crate::bus::PAGE_SIZE;
         #[cfg(target_arch = "x86_64")]
         const BAR0: u16 = 0x10;
 
+        // Turing's real BAR0 register aperture is 16 MiB (0x0-0xFFFFFF);
+        // used as a fallback only when the PCI-enumerated BAR length is
+        // unavailable (e.g. the direct config-space re-read fallback
+        // path below has no length to report). Do NOT re-probe BAR sizes
+        // here (see the "do not probe BAR size at boot" note below) --
+        // `dev.bars[0]`'s length already comes from the bus's own
+        // one-time enumeration, same as every other driver's BAR1+
+        // handling (e1000e, ixgbe, virtio_pci) already reads directly.
+        const NVIDIA_BAR0_APERTURE_FALLBACK: u64 = 16 * 1024 * 1024;
+
         #[cfg(target_arch = "x86_64")]
-        let bar0_addr = {
-            if let Some(BAR::Memory(a, _, _, _)) = dev.bars[0] {
+        let (bar0_addr, bar0_map_len) = {
+            if let Some(BAR::Memory(a, len, _, _)) = dev.bars[0] {
                 if a != 0 {
-                    a
+                    (
+                        a,
+                        if len == 0 {
+                            NVIDIA_BAR0_APERTURE_FALLBACK
+                        } else {
+                            len as u64
+                        },
+                    )
                 } else {
                     let ops = &PortOpsImpl;
-                    unsafe { read_bar_addr(ops, PCI_ACCESS, dev.loc, BAR0) }
+                    (
+                        unsafe { read_bar_addr(ops, PCI_ACCESS, dev.loc, BAR0) },
+                        NVIDIA_BAR0_APERTURE_FALLBACK,
+                    )
                 }
             } else {
                 let ops = &PortOpsImpl;
-                unsafe { read_bar_addr(ops, PCI_ACCESS, dev.loc, BAR0) }
+                (
+                    unsafe { read_bar_addr(ops, PCI_ACCESS, dev.loc, BAR0) },
+                    NVIDIA_BAR0_APERTURE_FALLBACK,
+                )
             }
         };
         #[cfg(not(target_arch = "x86_64"))]
-        let bar0_addr = if let Some(BAR::Memory(a, _, _, _)) = dev.bars[0] {
-            a
+        let (bar0_addr, bar0_map_len) = if let Some(BAR::Memory(a, len, _, _)) = dev.bars[0] {
+            (
+                a,
+                if len == 0 {
+                    NVIDIA_BAR0_APERTURE_FALLBACK
+                } else {
+                    len as u64
+                },
+            )
         } else {
-            0
+            (0, NVIDIA_BAR0_APERTURE_FALLBACK)
         };
 
         if bar0_addr == 0 {
@@ -2627,7 +2656,7 @@ impl PciDriver for NvidiaGpuDriverPci {
         super::nvidia_hooks::install(mapper);
 
         if let Some(m) = mapper {
-            m.query_or_map(bar0_addr as usize, PAGE_SIZE * 1024);
+            m.query_or_map(bar0_addr as usize, bar0_map_len as usize);
         }
         let bar0_vaddr = phys_to_virt(bar0_addr as usize);
 
@@ -2682,7 +2711,7 @@ impl PciDriver for NvidiaGpuDriverPci {
                 1920,
                 1080,
                 bar0_addr,
-                (PAGE_SIZE * 1024) as u64,
+                bar0_map_len,
                 0, // PCI domain: Eclipse only tracks bus/device/function, single-segment system
                 dev.loc.bus,
                 dev.loc.device,

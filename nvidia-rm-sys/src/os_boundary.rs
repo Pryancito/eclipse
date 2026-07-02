@@ -287,52 +287,87 @@ pub extern "C" fn osDetachFromProcess(arg0: *mut c_void) {
     let _ = arg0;
 }
 
+// osDevRead/WriteReg{008,016,032} were unconditional stubs (always read 0,
+// writes dropped) -- a confirmed real bug, not a deliberate "not supported"
+// stub: this is the exact function real chip-ID detection uses BEFORE an
+// OBJGPU even exists (gpumgrGetGpuHalFactor in gpu_mgr.c, pGpu=NULL), so
+// stubbing it made TU106 undetectable (chipId0/chipId1 always read as 0).
+//
+// Real DEVICE_MAPPING layout (src/nvidia/generated/g_gpu_access_nvoc.h,
+// aggregated from gpu_access.h -- confirmed against the actual struct body,
+// not guessed):
+//   typedef struct DEVICE_MAPPING {
+//       GPUHWREG  *gpuNvAddr;   // CPU Virtual Address -- first field
+//       RmPhysAddr gpuNvPAddr;
+//       NvU64      gpuNvLength;
+//       ...
+//   } DEVICE_MAPPING;
+// `gpuNvAddr` is the already page-table-mapped CPU virtual base of the
+// aperture (for the discrete-GPU path, Eclipse's own bar0_virt -- see
+// gpu_mgr.c's `gpuDevMapping.gpuNvAddr = pAttachArg->regBaseAddr`, and
+// eclipse_rm_init.c's `gpuAttachArg.regBaseAddr = (GPUHWREG*)bar0_virt`).
+// Being first means reading the pointer-sized value at pMapping's own
+// address gets it directly, with no need to know the rest of the struct.
+// This is a plain mapped-memory read, not port I/O or PCI config space, so
+// (unlike PCI/MMIO-map/timing) it needs no KernelHooks indirection.
 #[no_mangle]
-pub extern "C" fn osDevReadReg008(pGpu: *mut c_void, pMapping: *mut c_void, thisAddress: NvU32) -> NvU8 {
-    let _ = pGpu;
-    let _ = pMapping;
-    let _ = thisAddress;
-    0
+pub extern "C" fn osDevReadReg008(_pGpu: *mut c_void, pMapping: *mut c_void, this_address: NvU32) -> NvU8 {
+    match dev_mapping_base(pMapping) {
+        Some(base) => unsafe { core::ptr::read_volatile(base.add(this_address as usize)) },
+        None => 0xFF,
+    }
 }
 
 #[no_mangle]
-pub extern "C" fn osDevReadReg016(pGpu: *mut c_void, pMapping: *mut c_void, thisAddress: NvU32) -> NvU16 {
-    let _ = pGpu;
-    let _ = pMapping;
-    let _ = thisAddress;
-    0
+pub extern "C" fn osDevReadReg016(_pGpu: *mut c_void, pMapping: *mut c_void, this_address: NvU32) -> NvU16 {
+    match dev_mapping_base(pMapping) {
+        Some(base) => unsafe { core::ptr::read_volatile(base.add(this_address as usize) as *const NvU16) },
+        None => 0xFFFF,
+    }
 }
 
 #[no_mangle]
-pub extern "C" fn osDevReadReg032(pGpu: *mut c_void, pMapping: *mut c_void, thisAddress: NvU32) -> NvU32 {
-    let _ = pGpu;
-    let _ = pMapping;
-    let _ = thisAddress;
-    0
+pub extern "C" fn osDevReadReg032(_pGpu: *mut c_void, pMapping: *mut c_void, this_address: NvU32) -> NvU32 {
+    match dev_mapping_base(pMapping) {
+        Some(base) => unsafe { core::ptr::read_volatile(base.add(this_address as usize) as *const NvU32) },
+        None => 0xFFFF_FFFF,
+    }
 }
 
 #[no_mangle]
-pub extern "C" fn osDevWriteReg008(pGpu: *mut c_void, pMapping: *mut c_void, thisAddress: NvU32, thisValue: NvU8) {
-    let _ = pGpu;
-    let _ = pMapping;
-    let _ = thisAddress;
-    let _ = thisValue;
+pub extern "C" fn osDevWriteReg008(_pGpu: *mut c_void, pMapping: *mut c_void, this_address: NvU32, this_value: NvU8) {
+    if let Some(base) = dev_mapping_base(pMapping) {
+        unsafe { core::ptr::write_volatile(base.add(this_address as usize), this_value) };
+    }
 }
 
 #[no_mangle]
-pub extern "C" fn osDevWriteReg016(pGpu: *mut c_void, pMapping: *mut c_void, thisAddress: NvU32, thisValue: NvU16) {
-    let _ = pGpu;
-    let _ = pMapping;
-    let _ = thisAddress;
-    let _ = thisValue;
+pub extern "C" fn osDevWriteReg016(_pGpu: *mut c_void, pMapping: *mut c_void, this_address: NvU32, this_value: NvU16) {
+    if let Some(base) = dev_mapping_base(pMapping) {
+        unsafe { core::ptr::write_volatile(base.add(this_address as usize) as *mut NvU16, this_value) };
+    }
 }
 
 #[no_mangle]
-pub extern "C" fn osDevWriteReg032(pGpu: *mut c_void, pMapping: *mut c_void, thisAddress: NvU32, thisValue: NvU32) {
-    let _ = pGpu;
-    let _ = pMapping;
-    let _ = thisAddress;
-    let _ = thisValue;
+pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, this_address: NvU32, this_value: NvU32) {
+    if let Some(base) = dev_mapping_base(pMapping) {
+        unsafe { core::ptr::write_volatile(base.add(this_address as usize) as *mut NvU32, this_value) };
+    }
+}
+
+/// Extracts `DEVICE_MAPPING::gpuNvAddr` (the first field) without needing
+/// the rest of the struct's layout. Returns `None` for a null mapping or a
+/// null/not-yet-mapped `gpuNvAddr`.
+fn dev_mapping_base(p_mapping: *mut c_void) -> Option<*mut u8> {
+    if p_mapping.is_null() {
+        return None;
+    }
+    let base = unsafe { *(p_mapping as *const *mut u8) };
+    if base.is_null() {
+        None
+    } else {
+        Some(base)
+    }
 }
 
 #[no_mangle]
