@@ -145,6 +145,12 @@ impl super::LinuxRootfs {
             let boot_dir = rootfs_path.join("boot");
             fs::create_dir_all(&boot_dir).unwrap();
 
+            // Real NVIDIA GSP-RM firmware for the vendored driver (see
+            // nvidia-rm-sys) -- into the FULL rootfs only, never the
+            // minimal live/installer root built below (LIVE_KEEP omits
+            // lib/firmware entirely).
+            super::nvidia_firmware::install(&rootfs_path);
+
             // Remove any installer payloads left over from a previous (possibly
             // failed) build. `make(false)` never clears the rootfs, so without
             // this the base initramfs / rootfs.btrfs below would be polluted
