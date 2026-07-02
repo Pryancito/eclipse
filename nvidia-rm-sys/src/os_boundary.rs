@@ -1379,18 +1379,25 @@ pub extern "C" fn osMapKernelSpace(start: NvU64, size: NvU64, _mode: NvU32, _pro
     crate::os_interface::os_map_kernel_space(start, size, _mode)
 }
 
-// The five functions below (plus osNv_rdxcr0, added defensively since it's
-// declared right alongside osNv_rdcr4/osNv_cpuid and used in the same
-// cpu.c code paths) surfaced as real link failures on actual hardware
+// The functions below surfaced as real link failures on actual hardware
 // builds: they're referenced from vendored core files (os_init.c, cpu.c,
 // phys_mem_allocator.c, locks.c) but aren't part of the open-sourced
 // Linux platform glue (arch/nvalloc/unix/src/), so they were missed by
 // the original os_boundary.rs sweep. Real declarations transcribed from
 // g_os_nvoc.h.
 //
-// osNv_cpuid/osNv_rdcr4/osNv_rdxcr0 are genuine host-CPU operations --
-// Eclipse runs directly on the x86_64 CPU, so these execute the real
-// instructions rather than stubbing, unlike GPU-hardware-dependent calls.
+// Note: osNv_rdxcr0 is NOT implemented here even though it's declared
+// right alongside osNv_rdcr4/osNv_cpuid -- unlike those two, the real
+// os_stubs.c (vendored, always compiled) defines it unconditionally
+// (no RMCFG_FEATURE_PLATFORM_UNIX/NVCPU_IS_X86_64 guard), so providing
+// it here is a duplicate-symbol link error, confirmed against a real
+// build. osNv_rdcr4/osNv_cpuid ARE guarded out by os_stubs.c specifically
+// for RMCFG_FEATURE_PLATFORM_UNIX && NVCPU_IS_X86_64, which is why they
+// were genuinely missing.
+//
+// osNv_cpuid/osNv_rdcr4 are genuine host-CPU operations -- Eclipse runs
+// directly on the x86_64 CPU, so these execute the real instructions
+// rather than stubbing, unlike GPU-hardware-dependent calls.
 
 #[no_mangle]
 pub extern "C" fn osInitObjOS(pOS: *mut c_void) {
@@ -1408,21 +1415,6 @@ pub extern "C" fn osNv_rdcr4() -> NvU32 {
         core::arch::asm!("mov {}, cr4", out(reg) value);
     }
     value as NvU32
-}
-
-#[no_mangle]
-pub extern "C" fn osNv_rdxcr0() -> NvU64 {
-    let eax: u32;
-    let edx: u32;
-    unsafe {
-        core::arch::asm!(
-            "xgetbv",
-            in("ecx") 0u32,
-            out("eax") eax,
-            out("edx") edx,
-        );
-    }
-    ((edx as u64) << 32) | (eax as u64)
 }
 
 #[no_mangle]
