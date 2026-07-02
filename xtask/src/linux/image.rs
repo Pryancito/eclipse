@@ -10,7 +10,7 @@ use std::{fs, path::Path};
 const INITRAMFS_BYTES: usize = 80 * 1024 * 1024;
 /// ESP / primera partición (EFI). Debe coincidir con `PART1_SIZE_MIB` en
 /// install-eclipse y `ESP_IMG_SIZE_MB` en el Makefile.
-const EFI_PARTITION_BYTES: usize = 256 * 1024 * 1024;
+const EFI_PARTITION_BYTES: usize = 1024 * 1024 * 1024;
 
 /// FAT32 ESP: siempre [`EFI_PARTITION_BYTES`]. Falla en build si los payloads
 /// no caben (p. ej. zcore.elf + initramfs superan ~252 MiB).

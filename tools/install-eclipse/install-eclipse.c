@@ -19,7 +19,7 @@
 
 #define SECTOR_SIZE 512ULL
 #define PART1_START 2048ULL
-#define PART1_SIZE_MIB 256ULL
+#define PART1_SIZE_MIB 1024ULL
 #define PART1_SECTORS ((PART1_SIZE_MIB * 1024ULL * 1024ULL) / SECTOR_SIZE)
 #define GPT_BACKUP_RESERVED_SECTORS 34ULL
 #define MAX_DISKS 64
@@ -459,8 +459,7 @@ static int verify_efi_image_fits_partition(const struct partition_plan *efi_part
             "ERROR: efi.img.gz descomprimido (%llu MiB) excede la partición EFI (%llu MiB)."
             COLOR_RESET,
             (unsigned long long)(unc / MIB), (unsigned long long)(part_bytes / MIB));
-        log("Reconstruya la imagen live (`make image`) con efi.img de %llu MiB o aumente PART1_SIZE_MIB.",
-            (unsigned long long)PART1_SIZE_MIB);
+        log("Reconstruya la imagen live (`make image`) con efi.img del mismo tamaño o aumente PART1_SIZE_MIB.");
         return -1;
     }
     return 0;
@@ -753,12 +752,28 @@ static const char *mode_label(enum install_mode mode) {
     }
 }
 
+static void part1_size_label(char *buf, size_t len) {
+    if (PART1_SIZE_MIB >= 1024 && (PART1_SIZE_MIB % 1024) == 0) {
+        snprintf(buf, len, "%llu GB", (unsigned long long)(PART1_SIZE_MIB / 1024));
+    } else {
+        snprintf(buf, len, "%llu MB", (unsigned long long)PART1_SIZE_MIB);
+    }
+}
+
 static const char *layout_label(enum layout_mode layout) {
+    static char simple_buf[80];
+    static char advanced_buf[96];
+    char efi_label[16];
+
+    part1_size_label(efi_label, sizeof(efi_label));
     switch (layout) {
         case LAYOUT_SIMPLE:
-            return "Simple (EFI 256MB + ROOT resto)";
+            snprintf(simple_buf, sizeof(simple_buf), "Simple (EFI %s + ROOT resto)", efi_label);
+            return simple_buf;
         case LAYOUT_ADVANCED:
-            return "Avanzado (EFI 256MB + ROOT + HOME + SWAP)";
+            snprintf(advanced_buf, sizeof(advanced_buf),
+                      "Avanzado (EFI %s + ROOT + HOME + SWAP)", efi_label);
+            return advanced_buf;
         default:
             return "Sin definir";
     }
@@ -1115,9 +1130,11 @@ static int prompt_layout(struct config *cfg) {
     }
 
     char input[32];
+    char efi_label[16];
+    part1_size_label(efi_label, sizeof(efi_label));
     log("Seleccione el esquema de particiones:");
-    log("  [1] Simple    -> EFI 256MB + ROOT resto");
-    log("  [2] Avanzado  -> EFI 256MB + ROOT + HOME + SWAP");
+    log("  [1] Simple    -> EFI %s + ROOT resto", efi_label);
+    log("  [2] Avanzado  -> EFI %s + ROOT + HOME + SWAP", efi_label);
     log("Opción recomendada [1]:");
     if (safe_flush_input(input, sizeof(input)) != 0 || input[0] == '\0') {
         cfg->layout = LAYOUT_SIMPLE;
@@ -1363,7 +1380,11 @@ static int build_partition_plan(enum layout_mode layout, enum table_mode table, 
         parts[1].write_image = 1;
         parts[1].verify_after_write = 1;
         *part_count = 2;
-        snprintf(summary, summary_size, "Simple (EFI 256MB + ROOT resto)");
+        {
+            char efi_label[16];
+            part1_size_label(efi_label, sizeof(efi_label));
+            snprintf(summary, summary_size, "Simple (EFI %s + ROOT resto)", efi_label);
+        }
         return 0;
     }
 
@@ -1429,7 +1450,11 @@ static int build_partition_plan(enum layout_mode layout, enum table_mode table, 
     parts[3].verify_after_write = 0;
 
     *part_count = 4;
-    snprintf(summary, summary_size, "Avanzado (EFI 256MB + ROOT + HOME + SWAP)");
+    {
+        char efi_label[16];
+        part1_size_label(efi_label, sizeof(efi_label));
+        snprintf(summary, summary_size, "Avanzado (EFI %s + ROOT + HOME + SWAP)", efi_label);
+    }
     return 0;
 }
 
@@ -3101,8 +3126,12 @@ int main(int argc, char **argv) {
         int total_steps = (cfg.layout == LAYOUT_ADVANCED) ? 5 : 3;
         (void)total_steps;
 
-        log(COLOR_GREEN "[2/%d] Escribiendo partición EFI (%llu MiB)..." COLOR_RESET,
-            (cfg.layout == LAYOUT_ADVANCED) ? 5 : 3, (unsigned long long)PART1_SIZE_MIB);
+        {
+            char efi_label[16];
+            part1_size_label(efi_label, sizeof(efi_label));
+            log(COLOR_GREEN "[2/%d] Escribiendo partición EFI (%s)..." COLOR_RESET,
+                (cfg.layout == LAYOUT_ADVANCED) ? 5 : 3, efi_label);
+        }
         if (verify_efi_image_fits_partition(&parts[0]) != 0) {
             return 1;
         }
