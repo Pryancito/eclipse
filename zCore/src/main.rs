@@ -138,6 +138,15 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // Load hunter's /etc/hunter/{whitelist,blacklist} from the root fs
             // and enable exec learning (trust-on-first-use). Safe if absent.
             linux_object::fs::hunter_config::load(&rootfs.root_inode());
+            // Real NVIDIA GSP-RM firmware (see xtask's nvidia_firmware and
+            // nvidia-rm-sys/vendor/eclipse_rm_init.c): the display driver
+            // runs during early PCI enumeration, before any filesystem
+            // exists, so it can't read this itself -- pushed down here,
+            // right after rootfs mount, to every registered DRM driver
+            // (only the real NVIDIA one does anything with it). Missing
+            // file (fetch failed at image-build time, or a non-NVIDIA
+            // build) is a normal, silent no-op.
+            load_nvidia_gsp_firmware(&rootfs.root_inode());
             kernel_hal::console::early_progress_bar(95);
 
             // Whose exit takes the system down: INIT (PID 1) if present, else
@@ -206,6 +215,37 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         } else {
             panic!("One of the features `linux` or `zircon` must be specified!");
         }
+    }
+}
+
+/// Reads NVIDIA GSP-RM firmware from the mounted rootfs and hands it to
+/// every registered DRM driver (only the real NVIDIA one acts on it --
+/// see `DrmScheme::set_gsp_firmware`). Missing file is a silent no-op:
+/// happens for any non-NVIDIA build, or if xtask's firmware fetch failed
+/// at image-build time (best-effort, see xtask/src/linux/nvidia_firmware.rs).
+#[cfg(feature = "linux")]
+fn load_nvidia_gsp_firmware(root: &alloc::sync::Arc<dyn rcore_fs::vfs::INode>) {
+    use rcore_fs::vfs::INode;
+    let inode = match root.lookup("/lib/firmware/nvidia/gsp/gsp.bin") {
+        Ok(i) => i,
+        Err(_) => return,
+    };
+    let size = match inode.metadata() {
+        Ok(m) => m.size,
+        Err(_) => return,
+    };
+    if size == 0 {
+        return;
+    }
+    let mut buf = alloc::vec![0u8; size];
+    let n = match inode.read_at(0, &mut buf) {
+        Ok(n) => n,
+        Err(_) => return,
+    };
+    buf.truncate(n);
+    klog_info!("Eclipse: loaded NVIDIA GSP-RM firmware ({} bytes)", n);
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        d.set_gsp_firmware(buf.clone());
     }
 }
 

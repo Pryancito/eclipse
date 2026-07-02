@@ -1,8 +1,20 @@
-//! Fetches NVIDIA's real GSP-RM firmware for Turing GPUs (source: NVIDIA's
-//! own public `linux-firmware` distribution) into the rootfs, where
-//! `drivers::display::nvidia` reads it at runtime through the mounted
-//! rootfs VFS and hands it to the vendored `kgspInitRm` (see
-//! nvidia-rm-sys/vendor/eclipse_rm_init.c).
+//! Fetches NVIDIA's real GSP-RM firmware image for Turing GPUs (source:
+//! NVIDIA's own public `linux-firmware` distribution) into the rootfs,
+//! where it's read at runtime (after rootfs mount, from `zCore`'s boot
+//! sequence -- `drivers` can't reach the filesystem itself, see
+//! `NvidiaGpu::set_gsp_firmware`) and handed to the vendored `kgspInitRm`
+//! (nvidia-rm-sys/vendor/eclipse_rm_init.c).
+//!
+//! Only `gsp.bin` itself is needed here: it's the one genuinely
+//! proprietary blob NVIDIA doesn't ship in the open-sourced RM core (real
+//! Linux driver sources it the same way, via `request_firmware`/
+//! `nv_get_firmware` in arch/nvalloc/unix/src/osinit.c). The Booter Load/
+//! Unload ucodes and the GSP-RM RISC-V bootloader stub that linux-firmware
+//! also ships alongside it are NOT needed -- confirmed those are already
+//! compiled into the vendored RM core as `BINDATA_ARCHIVE` blobs
+//! (`generated/g_bindata.c`, fetched via `kgspGetBinArchiveBooterLoadUcode_HAL`
+//! / `kgspGetGspRmBootUcodeStorage_HAL` in kernel_gsp_booter.c / kernel_gsp.c),
+//! not loaded from external files.
 //!
 //! TU102/TU104/TU106/TU116/TU117 (which includes the RTX 2060 Super's
 //! TU106) all share one GSP firmware bucket -- confirmed via
@@ -11,16 +23,7 @@
 use std::{fs, path::Path};
 
 const NVIDIA_FW_VERSION: &str = "535.113.01";
-const NVIDIA_FW_BASE: &str =
-    "https://raw.githubusercontent.com/NVIDIA/linux-firmware/main/nvidia/tu102/gsp";
-
-/// (upstream filename stem, stable destination filename Eclipse looks for)
-const NVIDIA_FW_FILES: [(&str, &str); 4] = [
-    ("gsp", "gsp.bin"),
-    ("bootloader", "bootloader.bin"),
-    ("booter_load", "booter_load.bin"),
-    ("booter_unload", "booter_unload.bin"),
-];
+const NVIDIA_FW_URL: &str = "https://raw.githubusercontent.com/NVIDIA/linux-firmware/main/nvidia/tu102/gsp/gsp-535.113.01.bin";
 
 /// Best-effort: a missing/failed download just means the real GPU driver
 /// finds no firmware at runtime and reports that (same as upstream
@@ -29,29 +32,25 @@ const NVIDIA_FW_FILES: [(&str, &str); 4] = [
 /// every non-NVIDIA-GPU build and boot path.
 pub(super) fn install(rootfs: &Path) {
     let dest_dir = rootfs.join("lib/firmware/nvidia/gsp");
-    if dest_dir.join("gsp.bin").is_file() {
+    let dst = dest_dir.join("gsp.bin");
+    if dst.is_file() {
         return;
     }
     if let Err(e) = fs::create_dir_all(&dest_dir) {
         eprintln!("warning: could not create {dest_dir:?}: {e}; skipping NVIDIA GSP firmware");
         return;
     }
-    for (src_stem, dst_name) in NVIDIA_FW_FILES {
-        let url = format!("{NVIDIA_FW_BASE}/{src_stem}-{NVIDIA_FW_VERSION}.bin");
-        let dst = dest_dir.join(dst_name);
-        println!("Fetching NVIDIA GSP firmware {dst_name} from linux-firmware...");
-        let status = std::process::Command::new("wget")
-            .arg(&url)
-            .arg("-O")
-            .arg(&dst)
-            .status();
-        let ok = matches!(&status, Ok(s) if s.success());
-        if !ok {
-            eprintln!(
-                "warning: failed to fetch {url} ({status:?}); NVIDIA GSP firmware will be unavailable"
-            );
-            let _ = fs::remove_dir_all(&dest_dir);
-            return;
-        }
+    println!("Fetching NVIDIA GSP-RM firmware ({NVIDIA_FW_VERSION}) from linux-firmware...");
+    let status = std::process::Command::new("wget")
+        .arg(NVIDIA_FW_URL)
+        .arg("-O")
+        .arg(&dst)
+        .status();
+    let ok = matches!(&status, Ok(s) if s.success());
+    if !ok {
+        eprintln!(
+            "warning: failed to fetch {NVIDIA_FW_URL} ({status:?}); NVIDIA GSP firmware will be unavailable"
+        );
+        let _ = fs::remove_file(&dst);
     }
 }

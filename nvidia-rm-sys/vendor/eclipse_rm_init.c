@@ -27,6 +27,7 @@
 #include "core/locks.h"
 #include "rmapi/rmapi.h"
 #include "core/thread_state.h"
+#include "gpu/gsp/kernel_gsp.h"
 
 /*
  * Constructs the real OBJSYS singleton and the RM resource server.
@@ -138,4 +139,44 @@ NV_STATUS eclipse_rm_attach_gpu(
     }
 
     return NV_OK;
+}
+
+/*
+ * Boots GSP-RM via the vendored, unmodified kgspInitRm (kernel_gsp.c).
+ * Only the raw gsp.bin bytes are supplied: RM parses the image/signature
+ * sections out of pBuf itself (_kgspPrepareGspRmBinaryImage), and
+ * self-allocates the Booter Load/Unload ucodes and the RISC-V bootloader
+ * stub from BINDATA_ARCHIVE blobs already compiled into this vendored
+ * core (kernel_gsp_booter.c's kgspGetBinArchiveBooterLoadUcode_HAL /
+ * kernel_gsp.c's kgspGetGspRmBootUcodeStorage_HAL) rather than from any
+ * file Eclipse provides -- confirmed those are NOT external-file reads.
+ *
+ * pGpu->isGspClient defaults to NV_TRUE for any non-Tegra chip under the
+ * PF_KERNEL_ONLY RM variant (__nvoc_init_dataField_OBJGPU in
+ * g_gpu_nvoc.c), which is what a discrete-GPU build like this one
+ * selects, so Eclipse doesn't need to force it on.
+ */
+NV_STATUS eclipse_rm_init_gsp(NvU32 deviceInstance, const void *pBuf, NvU32 size)
+{
+    OBJGPU *pGpu;
+    KernelGsp *pKernelGsp;
+    GSP_FIRMWARE gspFw;
+
+    pGpu = gpumgrGetGpu(deviceInstance);
+    if (pGpu == NULL)
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+
+    pKernelGsp = GPU_GET_KERNEL_GSP(pGpu);
+    if (pKernelGsp == NULL)
+    {
+        return NV_ERR_NOT_SUPPORTED;
+    }
+
+    portMemSet(&gspFw, 0, sizeof(gspFw));
+    gspFw.pBuf = pBuf;
+    gspFw.size = size;
+
+    return kgspInitRm(pGpu, pKernelGsp, &gspFw);
 }
