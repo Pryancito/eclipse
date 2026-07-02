@@ -1668,91 +1668,95 @@ impl DrmScheme for NvidiaGpu {
             }
         }
 
-        // --- Real RM attach (nvidia_rm_sys::rm_init) ---
-        // First real invocation of the vendored RM core's own object
-        // construction (OBJSYS/resource-server/OBJGPU via NVOC), never
-        // exercised before this point. Cached after the first attempt so
-        // repeated /proc/gpudbg reads don't re-run it; result (success or
-        // the real NV_STATUS failure code) is reported either way.
-        {
-            let mut attach = self.rm_attach_result.lock();
-            if attach.is_none() {
-                let core_status = rm_core_init_once();
-                *attach = Some(if core_status != 0 {
-                    alloc::format!(
-                        "eclipse_rm_init_core FAILED, NV_STATUS={:#x}",
-                        core_status
-                    )
-                } else {
-                    match nvidia_rm_sys::rm_init::attach_gpu(
-                        self.pci_domain,
-                        self.pci_bus,
-                        self.pci_device,
-                        self.bar0_phys,
-                        bar0 as *mut core::ffi::c_void,
-                        self.bar0_len,
-                        self.bar1_phys,
-                        self.vram_size_mb as u64 * 1024 * 1024,
-                    ) {
-                        Ok(device_instance) => {
-                            *self.rm_device_instance.lock() = Some(device_instance);
-                            alloc::format!(
-                                "gpumgrAttachGpu OK, deviceInstance={}",
-                                device_instance
-                            )
-                        }
-                        Err(status) => {
-                            alloc::format!("gpumgrAttachGpu FAILED, NV_STATUS={:#x}", status)
-                        }
+        s
+    }
+
+    /// Step 5 (`/proc/gpustep5`), NOT read-only and NOT part of `/proc/gpudbg`:
+    /// first real invocation of the vendored RM core's own object
+    /// construction (`nvidia_rm_sys::rm_init`, OBJSYS/resource-server/OBJGPU
+    /// via NVOC). Moved out of `debug_dump` after it hung the machine on a
+    /// plain `cat /proc/gpudbg` on real hardware -- this does real HAL
+    /// bind/attach work, not a safe register read, so it gets its own
+    /// deliberate opt-in trigger like bringup_step2/3/4. Cached after the
+    /// first attempt so repeated reads don't re-run it.
+    fn bringup_step5(&self) -> String {
+        use core::fmt::Write;
+        let bar0 = self._bar0;
+        let mut s = String::new();
+        let mut attach = self.rm_attach_result.lock();
+        if attach.is_none() {
+            let core_status = rm_core_init_once();
+            *attach = Some(if core_status != 0 {
+                alloc::format!(
+                    "eclipse_rm_init_core FAILED, NV_STATUS={:#x}",
+                    core_status
+                )
+            } else {
+                match nvidia_rm_sys::rm_init::attach_gpu(
+                    self.pci_domain,
+                    self.pci_bus,
+                    self.pci_device,
+                    self.bar0_phys,
+                    bar0 as *mut core::ffi::c_void,
+                    self.bar0_len,
+                    self.bar1_phys,
+                    self.vram_size_mb as u64 * 1024 * 1024,
+                ) {
+                    Ok(device_instance) => {
+                        *self.rm_device_instance.lock() = Some(device_instance);
+                        alloc::format!("gpumgrAttachGpu OK, deviceInstance={}", device_instance)
                     }
+                    Err(status) => {
+                        alloc::format!("gpumgrAttachGpu FAILED, NV_STATUS={:#x}", status)
+                    }
+                }
+            });
+        }
+        let _ = writeln!(
+            s,
+            "[gpustep5]  --- Real RM attach: {} ---",
+            attach.as_deref().unwrap_or("(unreachable)")
+        );
+        s
+    }
+
+    /// Step 6 (`/proc/gpustep6`), NOT read-only and NOT part of `/proc/gpudbg`:
+    /// first real invocation of `kgspInitRm` (kernel_gsp.c) -- the deepest,
+    /// riskiest bring-up step yet (VBIOS/FWSEC extraction, Booter ucode
+    /// secure boot on SEC2, WPR2 setup). Kept on its own explicit trigger,
+    /// same reasoning as `bringup_step5`. Requires a successful
+    /// `bringup_step5` first AND gsp.bin already pushed down by
+    /// `set_gsp_firmware` (zCore's boot code, after rootfs mount) --
+    /// reports which is missing rather than erroring if either is absent.
+    fn bringup_step6(&self) -> String {
+        use core::fmt::Write;
+        let mut s = String::new();
+        let device_instance = *self.rm_device_instance.lock();
+        let fw = self.gsp_firmware.lock();
+        if let (Some(device_instance), Some(fw_bytes)) = (device_instance, fw.as_ref()) {
+            let mut gsp = self.gsp_init_result.lock();
+            if gsp.is_none() {
+                *gsp = Some(match nvidia_rm_sys::rm_init::init_gsp(device_instance, fw_bytes) {
+                    Ok(()) => String::from("kgspInitRm OK"),
+                    Err(status) => alloc::format!("kgspInitRm FAILED, NV_STATUS={:#x}", status),
                 });
             }
             let _ = writeln!(
                 s,
-                "[gpudbg]  --- Real RM attach: {} ---",
-                attach.as_deref().unwrap_or("(unreachable)")
+                "[gpustep6]  --- Real GSP-RM boot: {} ---",
+                gsp.as_deref().unwrap_or("(unreachable)")
+            );
+        } else {
+            let _ = writeln!(
+                s,
+                "[gpustep6]  --- Real GSP-RM boot: skipped ({}) ---",
+                if device_instance.is_none() {
+                    "run /proc/gpustep5 (RM attach) first"
+                } else {
+                    "no gsp.bin (rootfs not mounted yet, or fetch failed)"
+                }
             );
         }
-
-        // --- Real GSP-RM boot (nvidia_rm_sys::rm_init::init_gsp) ---
-        // First real invocation of kgspInitRm (kernel_gsp.c), the deepest
-        // bring-up step yet: VBIOS/FWSEC extraction, Booter ucode secure
-        // boot on SEC2, and WPR2 setup all run for real here. Requires a
-        // successful RM attach above AND gsp.bin already pushed down by
-        // `set_gsp_firmware` (zCore's boot code, after rootfs mount) --
-        // silently skipped (not an error) if either is missing, since a
-        // GPU with no rootfs-provided firmware yet is a normal, expected
-        // state (e.g. libos/QEMU builds, or before the real boot sequence
-        // reaches rootfs mount). Cached like the attach step above.
-        {
-            let device_instance = *self.rm_device_instance.lock();
-            let fw = self.gsp_firmware.lock();
-            if let (Some(device_instance), Some(fw_bytes)) = (device_instance, fw.as_ref()) {
-                let mut gsp = self.gsp_init_result.lock();
-                if gsp.is_none() {
-                    *gsp = Some(match nvidia_rm_sys::rm_init::init_gsp(device_instance, fw_bytes) {
-                        Ok(()) => String::from("kgspInitRm OK"),
-                        Err(status) => alloc::format!("kgspInitRm FAILED, NV_STATUS={:#x}", status),
-                    });
-                }
-                let _ = writeln!(
-                    s,
-                    "[gpudbg]  --- Real GSP-RM boot: {} ---",
-                    gsp.as_deref().unwrap_or("(unreachable)")
-                );
-            } else {
-                let _ = writeln!(
-                    s,
-                    "[gpudbg]  --- Real GSP-RM boot: skipped ({}) ---",
-                    if device_instance.is_none() {
-                        "RM attach did not succeed"
-                    } else {
-                        "no gsp.bin (rootfs not mounted yet, or fetch failed)"
-                    }
-                );
-            }
-        }
-
         s
     }
 

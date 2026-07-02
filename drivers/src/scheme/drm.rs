@@ -103,6 +103,23 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Bring-up **Step 5** (`/proc/gpustep5`): the real vendored RM core's
+    /// own attach path (`nvidia_rm_sys::rm_init::attach_gpu`) -- real HAL
+    /// bind/attach work, not a safe register read. Originally wired into
+    /// `debug_dump`, moved out after it hung real hardware on a plain
+    /// `cat /proc/gpudbg`. Default: nothing.
+    fn bringup_step5(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
+    /// Bring-up **Step 6** (`/proc/gpustep6`): the real vendored `kgspInitRm`
+    /// GSP-RM boot (VBIOS/FWSEC extraction, Booter secure boot, WPR2 setup).
+    /// The deepest and riskiest step yet -- requires `bringup_step5` to have
+    /// succeeded first. Default: nothing.
+    fn bringup_step6(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Import a buffer allocated by the kernel (DRM core)
     fn import_buffer(&self, _handle: GemHandle) -> bool {
         true
