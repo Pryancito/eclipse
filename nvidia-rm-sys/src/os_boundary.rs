@@ -1378,3 +1378,112 @@ pub extern "C" fn osPciWriteDword(pHandle: *mut c_void, offset: NvU32, value: Nv
 pub extern "C" fn osMapKernelSpace(start: NvU64, size: NvU64, _mode: NvU32, _protect: NvU32) -> *mut c_void {
     crate::os_interface::os_map_kernel_space(start, size, _mode)
 }
+
+// The five functions below (plus osNv_rdxcr0, added defensively since it's
+// declared right alongside osNv_rdcr4/osNv_cpuid and used in the same
+// cpu.c code paths) surfaced as real link failures on actual hardware
+// builds: they're referenced from vendored core files (os_init.c, cpu.c,
+// phys_mem_allocator.c, locks.c) but aren't part of the open-sourced
+// Linux platform glue (arch/nvalloc/unix/src/), so they were missed by
+// the original os_boundary.rs sweep. Real declarations transcribed from
+// g_os_nvoc.h.
+//
+// osNv_cpuid/osNv_rdcr4/osNv_rdxcr0 are genuine host-CPU operations --
+// Eclipse runs directly on the x86_64 CPU, so these execute the real
+// instructions rather than stubbing, unlike GPU-hardware-dependent calls.
+
+#[no_mangle]
+pub extern "C" fn osInitObjOS(pOS: *mut c_void) {
+    // Real Linux implementations of this hook are platform-specific
+    // bookkeeping (not part of the open-sourced RM core); OBJOS is
+    // already zero-initialized by NVOC construction, so there is
+    // nothing Eclipse needs to add here.
+    let _ = pOS;
+}
+
+#[no_mangle]
+pub extern "C" fn osNv_rdcr4() -> NvU32 {
+    let value: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) value);
+    }
+    value as NvU32
+}
+
+#[no_mangle]
+pub extern "C" fn osNv_rdxcr0() -> NvU64 {
+    let eax: u32;
+    let edx: u32;
+    unsafe {
+        core::arch::asm!(
+            "xgetbv",
+            in("ecx") 0u32,
+            out("eax") eax,
+            out("edx") edx,
+        );
+    }
+    ((edx as u64) << 32) | (eax as u64)
+}
+
+#[no_mangle]
+pub extern "C" fn osNv_cpuid(
+    leaf: i32,
+    subleaf: i32,
+    peax: *mut NvU32,
+    pebx: *mut NvU32,
+    pecx: *mut NvU32,
+    pedx: *mut NvU32,
+) -> i32 {
+    let a: u32;
+    let b: u32;
+    let c: u32;
+    let d: u32;
+    unsafe {
+        core::arch::asm!(
+            "mov {tmp:e}, ebx",
+            "cpuid",
+            "xchg {tmp:e}, ebx",
+            tmp = out(reg) b,
+            inout("eax") leaf as u32 => a,
+            inout("ecx") subleaf as u32 => c,
+            out("edx") d,
+        );
+        if !peax.is_null() { *peax = a; }
+        if !pebx.is_null() { *pebx = b; }
+        if !pecx.is_null() { *pecx = c; }
+        if !pedx.is_null() { *pedx = d; }
+    }
+    1
+}
+
+#[no_mangle]
+pub extern "C" fn osGetNumaMemoryUsage(
+    numa_id: NvS32,
+    free_memory_bytes: *mut NvU64,
+    total_memory_bytes: *mut NvU64,
+) {
+    // STUB: Eclipse has no NUMA concept (single discrete GPU, no ACPI
+    // NUMA topology), matching the existing os_get_numa_node_memory_usage
+    // precedent in os_interface.rs.
+    let _ = numa_id;
+    unsafe {
+        if !free_memory_bytes.is_null() {
+            *free_memory_bytes = 0;
+        }
+        if !total_memory_bytes.is_null() {
+            *total_memory_bytes = 0;
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn osGpuLocksQueueRelease(pGpu: *mut c_void, dpc_gpu_lock_release: NvU32) -> NV_STATUS {
+    // Real Linux implementation defers lock release to a deferred
+    // procedure call (DPC) queue for interrupt-context safety; Eclipse's
+    // lock implementation doesn't need that indirection, so this is a
+    // no-op that reports success (locks are released synchronously by
+    // the caller elsewhere).
+    let _ = pGpu;
+    let _ = dpc_gpu_lock_release;
+    NV_OK
+}
