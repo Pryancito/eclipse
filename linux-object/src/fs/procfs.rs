@@ -14,9 +14,10 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 17] = [
+const PROC_ROOT_STATIC: [&str; 19] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
-    "perf", "hunter", "filesystems", "gpudbg", "gpustep2", "gpustep3", "gpustep4",
+    "perf", "hunter", "filesystems", "gpudbg", "gpustep2", "gpustep3", "gpustep4", "gpustep5",
+    "gpustep6",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -291,6 +292,8 @@ impl INode for ProcRootINode {
             "gpustep2" => Ok(PROC_GPUSTEP2.clone()),
             "gpustep3" => Ok(PROC_GPUSTEP3.clone()),
             "gpustep4" => Ok(PROC_GPUSTEP4.clone()),
+            "gpustep5" => Ok(PROC_GPUSTEP5.clone()),
+            "gpustep6" => Ok(PROC_GPUSTEP6.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
                 if let Ok(pid) = name.parse::<u64>() {
@@ -1083,6 +1086,35 @@ fn proc_gpustep4_content() -> String {
     s
 }
 
+/// `/proc/gpustep5` — opt-in: the real vendored RM core's own attach path
+/// (real HAL bind/attach work). Moved out of `/proc/gpudbg` after it hung
+/// real hardware on a plain `cat` -- deliberately separate so `gpudbg`
+/// stays safe to poll.
+fn proc_gpustep5_content() -> String {
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.bringup_step5());
+    }
+    if s.is_empty() {
+        s.push_str("[gpustep5] no DRM driver with bring-up support\n");
+    }
+    s
+}
+
+/// `/proc/gpustep6` — opt-in: real `kgspInitRm` GSP-RM boot. Requires
+/// `/proc/gpustep5` to have succeeded first. The deepest, riskiest bring-up
+/// step yet (VBIOS/FWSEC extraction, Booter secure boot, WPR2 setup).
+fn proc_gpustep6_content() -> String {
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.bringup_step6());
+    }
+    if s.is_empty() {
+        s.push_str("[gpustep6] no DRM driver with bring-up support\n");
+    }
+    s
+}
+
 fn proc_cpuinfo_content() -> String {
     let mut brand = kernel_hal::cpu::cpu_brand();
     if brand.is_empty() {
@@ -1302,6 +1334,19 @@ lazy_static! {
     static ref PROC_GPUSTEP4: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 96,
         generate: proc_gpustep4_content,
+    });
+    /// `/proc/gpustep5` — opt-in: real vendored RM core attach
+    /// (`nvidia_rm_sys::rm_init::attach_gpu`). Moved out of `/proc/gpudbg`
+    /// after it hung real hardware on a plain `cat`.
+    static ref PROC_GPUSTEP5: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 95,
+        generate: proc_gpustep5_content,
+    });
+    /// `/proc/gpustep6` — opt-in: real `kgspInitRm` GSP-RM boot. Requires
+    /// `/proc/gpustep5` to have succeeded first.
+    static ref PROC_GPUSTEP6: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 94,
+        generate: proc_gpustep6_content,
     });
     static ref PROC_SWAPS: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 18,
