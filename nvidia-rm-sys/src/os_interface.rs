@@ -459,7 +459,17 @@ fn log_raw_cstr(str_: *const c_char) {
         }
         let slice = core::slice::from_raw_parts(str_ as *const u8, len);
         if let Ok(s) = core::str::from_utf8(slice) {
-            log::info!("[nvidia-rm] {}", s);
+            // WARN, not info: the kernel's default max log level is WARN
+            // (zCore/src/logging.rs) -- `log::info!` is silently dropped by
+            // the `log` crate's own level check before SimpleLogger ever
+            // runs, so every real NV_PRINTF (which routes here via
+            // nvDbg_Printf -> nv_printf -> nvrm_shim_log_raw) and every
+            // ECLIPSE_TRACE checkpoint (eclipse_rm_init.c) was silently
+            // going nowhere -- confirmed empirically: a real-hardware test
+            // with trace checkpoints already deployed produced zero output
+            // at all, not even the very first checkpoint, which is only
+            // consistent with the print calls never executing their body.
+            log::warn!("[nvidia-rm] {}", s);
         }
     }
 }
