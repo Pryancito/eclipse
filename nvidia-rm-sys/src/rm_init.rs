@@ -21,6 +21,8 @@ extern "C" {
         bar1_len: NvU64,
         out_device_instance: *mut NvU32,
     ) -> NV_STATUS;
+
+    fn eclipse_rm_init_gsp(device_instance: NvU32, buf: *const c_void, size: NvU32) -> NV_STATUS;
 }
 
 /// Constructs the real OBJSYS singleton and the RM resource server.
@@ -63,6 +65,27 @@ pub fn attach_gpu(
     };
     if status == NV_OK {
         Ok(device_instance)
+    } else {
+        Err(status)
+    }
+}
+
+/// Boots GSP-RM on an already-attached GPU via the real, vendored
+/// `kgspInitRm`, given the raw bytes of NVIDIA's `gsp.bin` (the one
+/// firmware blob genuinely external to the open-sourced RM core --
+/// everything else `kgspInitRm` needs, it self-derives from `buf` or
+/// from bindata already compiled into this crate). `device_instance` is
+/// the value returned by a prior successful `attach_gpu`.
+pub fn init_gsp(device_instance: u32, buf: &[u8]) -> Result<(), NV_STATUS> {
+    let status = unsafe {
+        eclipse_rm_init_gsp(
+            device_instance,
+            buf.as_ptr() as *const c_void,
+            buf.len() as NvU32,
+        )
+    };
+    if status == NV_OK {
+        Ok(())
     } else {
         Err(status)
     }

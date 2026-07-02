@@ -422,6 +422,17 @@ pub struct NvidiaGpu {
     /// after the first `/proc/gpudbg` read triggers it so repeated reads
     /// don't re-run RM's own object-construction logic.
     rm_attach_result: Mutex<Option<String>>,
+    /// Real RM device instance from a successful attach, needed to look the
+    /// `OBJGPU*` back up (`gpumgrGetGpu`) for the GSP init step below.
+    rm_device_instance: Mutex<Option<u32>>,
+    /// Real GSP-RM firmware (`gsp.bin`), pushed down by `zCore`'s boot code
+    /// via `set_gsp_firmware` once the rootfs is mounted -- this driver runs
+    /// during early PCI enumeration, well before any filesystem exists, so
+    /// it cannot read the file itself (see DrmScheme::set_gsp_firmware).
+    gsp_firmware: Mutex<Option<Vec<u8>>>,
+    /// Result of the real kgspInitRm attempt, cached the same way as
+    /// `rm_attach_result`.
+    gsp_init_result: Mutex<Option<String>>,
 }
 
 /// Simple bitmap-based VRAM allocator for BAR1 aperture (4KB page granularity)
@@ -635,6 +646,9 @@ impl NvidiaGpu {
             ))),
             bringup: Mutex::new(None),
             rm_attach_result: Mutex::new(None),
+            rm_device_instance: Mutex::new(None),
+            gsp_firmware: Mutex::new(None),
+            gsp_init_result: Mutex::new(None),
         })
     }
 
@@ -1387,6 +1401,14 @@ impl DisplayScheme for NvidiaGpu {
 }
 
 impl DrmScheme for NvidiaGpu {
+    /// Receives `gsp.bin` read from the mounted rootfs by `zCore`'s boot
+    /// code (see `zCore/src/main.rs`, right after rootfs mount) -- stored
+    /// for the real `kgspInitRm` call made lazily on the first
+    /// `/proc/gpudbg` read, same trigger as the RM attach itself.
+    fn set_gsp_firmware(&self, bytes: Vec<u8>) {
+        *self.gsp_firmware.lock() = Some(bytes);
+    }
+
     /// Read-only GPU state dump (surfaced at `/proc/gpudbg`). Step 1 of the GPU
     /// copy-engine bring-up: confirm MMIO works bidirectionally, identify the
     /// exact chip, and record the VRAM/BAR layout we need for channel structs.
@@ -1672,10 +1694,13 @@ impl DrmScheme for NvidiaGpu {
                         self.bar1_phys,
                         self.vram_size_mb as u64 * 1024 * 1024,
                     ) {
-                        Ok(device_instance) => alloc::format!(
-                            "gpumgrAttachGpu OK, deviceInstance={}",
-                            device_instance
-                        ),
+                        Ok(device_instance) => {
+                            *self.rm_device_instance.lock() = Some(device_instance);
+                            alloc::format!(
+                                "gpumgrAttachGpu OK, deviceInstance={}",
+                                device_instance
+                            )
+                        }
                         Err(status) => {
                             alloc::format!("gpumgrAttachGpu FAILED, NV_STATUS={:#x}", status)
                         }
@@ -1687,6 +1712,45 @@ impl DrmScheme for NvidiaGpu {
                 "[gpudbg]  --- Real RM attach: {} ---",
                 attach.as_deref().unwrap_or("(unreachable)")
             );
+        }
+
+        // --- Real GSP-RM boot (nvidia_rm_sys::rm_init::init_gsp) ---
+        // First real invocation of kgspInitRm (kernel_gsp.c), the deepest
+        // bring-up step yet: VBIOS/FWSEC extraction, Booter ucode secure
+        // boot on SEC2, and WPR2 setup all run for real here. Requires a
+        // successful RM attach above AND gsp.bin already pushed down by
+        // `set_gsp_firmware` (zCore's boot code, after rootfs mount) --
+        // silently skipped (not an error) if either is missing, since a
+        // GPU with no rootfs-provided firmware yet is a normal, expected
+        // state (e.g. libos/QEMU builds, or before the real boot sequence
+        // reaches rootfs mount). Cached like the attach step above.
+        {
+            let device_instance = *self.rm_device_instance.lock();
+            let fw = self.gsp_firmware.lock();
+            if let (Some(device_instance), Some(fw_bytes)) = (device_instance, fw.as_ref()) {
+                let mut gsp = self.gsp_init_result.lock();
+                if gsp.is_none() {
+                    *gsp = Some(match nvidia_rm_sys::rm_init::init_gsp(device_instance, fw_bytes) {
+                        Ok(()) => String::from("kgspInitRm OK"),
+                        Err(status) => alloc::format!("kgspInitRm FAILED, NV_STATUS={:#x}", status),
+                    });
+                }
+                let _ = writeln!(
+                    s,
+                    "[gpudbg]  --- Real GSP-RM boot: {} ---",
+                    gsp.as_deref().unwrap_or("(unreachable)")
+                );
+            } else {
+                let _ = writeln!(
+                    s,
+                    "[gpudbg]  --- Real GSP-RM boot: skipped ({}) ---",
+                    if device_instance.is_none() {
+                        "RM attach did not succeed"
+                    } else {
+                        "no gsp.bin (rootfs not mounted yet, or fetch failed)"
+                    }
+                );
+            }
         }
 
         s

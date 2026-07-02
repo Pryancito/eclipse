@@ -64,6 +64,14 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Hand the driver a firmware blob read from the mounted rootfs (e.g.
+    /// GSP-RM's `gsp.bin`). Drivers can't read files themselves --
+    /// `drivers` sits below `linux-object`/`kernel-hal` in the dependency
+    /// graph, so the blob must be pushed down from boot code that already
+    /// has filesystem access, once the rootfs is mounted. Default: ignore
+    /// (most drivers need no firmware).
+    fn set_gsp_firmware(&self, _bytes: alloc::vec::Vec<u8>) {}
+
     /// GPU copy-engine bring-up **Step 2**, surfaced (opt-in) at
     /// `/proc/gpustep2`: write the channel instance block into sysmem and issue
     /// the GMMU flush — the first real GPU register writes of the bring-up.

@@ -1,5 +1,6 @@
 mod btrfs_image;
 mod image;
+mod nvidia_firmware;
 mod opencv;
 mod test;
 
