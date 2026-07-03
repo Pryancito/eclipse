@@ -84,7 +84,11 @@ pub extern "C" fn osApiLockAcquireConfigureFlags(flags: NvU32) -> NvU32 {
 
 #[no_mangle]
 pub extern "C" fn osAssertFailed() {
-
+    // Loud on purpose: a silent assert hook cost real diagnostic time --
+    // the assert TEXT arrives separately via nv_printf (now with real
+    // formatting, see vendor/glue.c), but this marker proves the failure
+    // path itself ran even if that message is ever garbled or filtered.
+    log::error!("[nvidia-rm] osAssertFailed() -- an RM NV_ASSERT fired; see adjacent [nvidia-rm] message for details");
 }
 
 #[no_mangle]
