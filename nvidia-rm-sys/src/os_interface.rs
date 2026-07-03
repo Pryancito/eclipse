@@ -134,12 +134,17 @@ pub extern "C" fn os_get_cpu_frequency() -> NvU64 {
     if cached != 0 {
         return cached;
     }
+    log::warn!("[nvidia-rm] os_get_cpu_frequency: calibrating TSC (10ms)...");
     // 10 ms calibration window: long enough to make delay_us's own
     // resolution error negligible, short enough to be a one-off blip.
     let t0 = unsafe { core::arch::x86_64::_rdtsc() };
     with_hooks((), |h| h.delay_us(10_000));
     let t1 = unsafe { core::arch::x86_64::_rdtsc() };
     let hz = t1.wrapping_sub(t0).saturating_mul(100);
+    log::warn!(
+        "[nvidia-rm] os_get_cpu_frequency: calibrated {} MHz",
+        hz / 1_000_000
+    );
     if hz != 0 {
         CACHED_HZ.store(hz, Ordering::Relaxed);
     }
@@ -165,6 +170,17 @@ pub extern "C" fn os_get_current_process_name(buffer: *mut c_char, length: NvU32
 }
 #[no_mangle]
 pub extern "C" fn os_get_current_thread(thread_id: *mut NvU64) -> NV_STATUS {
+    // TEMPORARY one-shot bring-up marker: portThreadGetCurrentThreadId
+    // funnels here; in the sysConstruct stretch under investigation its
+    // callers are threadStateGlobalAlloc / rmapiInitialize's lock setup /
+    // rmapiLockAcquire. Remove with the other trace checkpoints.
+    {
+        use core::sync::atomic::AtomicBool;
+        static SEEN: AtomicBool = AtomicBool::new(false);
+        if !SEEN.swap(true, Ordering::Relaxed) {
+            log::warn!("[nvidia-rm] first os_get_current_thread call (threadState/rmapi lock path reached)");
+        }
+    }
     if thread_id.is_null() {
         return NV_ERR_INVALID_ARGUMENT;
     }
