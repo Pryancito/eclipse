@@ -504,6 +504,17 @@ pub extern "C" fn osGetCpuFrequency() -> NvU32 {
 
 #[no_mangle]
 pub extern "C" fn osGetCurrentProcess() -> NvU32 {
+    // TEMPORARY one-shot bring-up marker: first called from the resource
+    // server's client-construction path, i.e. _sysInitMemExportClient's
+    // NV01_ROOT allocation near the end of sysConstruct. Remove with the
+    // other trace checkpoints once the attach path is through.
+    {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        static SEEN: AtomicBool = AtomicBool::new(false);
+        if !SEEN.swap(true, Ordering::Relaxed) {
+            log::warn!("[nvidia-rm] first osGetCurrentProcess call (resource-server client alloc reached)");
+        }
+    }
     0
 }
 
@@ -1479,6 +1490,18 @@ pub extern "C" fn osNv_cpuid(
     pecx: *mut NvU32,
     pedx: *mut NvU32,
 ) -> i32 {
+    // TEMPORARY one-shot bring-up marker: the first caller in the real
+    // sysConstruct sequence is RmInitCpuInfo (cpu.c), right after
+    // "osRmInitRm: done" -- the last checkpoint the previous real-hardware
+    // test reached. Remove with the other trace checkpoints once the
+    // attach path is through.
+    {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        static SEEN: AtomicBool = AtomicBool::new(false);
+        if !SEEN.swap(true, Ordering::Relaxed) {
+            log::warn!("[nvidia-rm] first osNv_cpuid call (RmInitCpuInfo reached)");
+        }
+    }
     let a: u32;
     let b: u32;
     let c: u32;
