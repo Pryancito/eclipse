@@ -350,12 +350,40 @@ static BOOT_FB_INFO: Mutex<Option<BootFbInfo>> = Mutex::new(None);
 /// `NvidiaGpu::debug_dump()`; only the first call actually invokes RM.
 static RM_CORE_INIT_STATUS: Mutex<Option<u32>> = Mutex::new(None);
 
+/// Set before invoking RM init, never cleared. If it's already set while
+/// `RM_CORE_INIT_STATUS` is still `None`, a previous attempt started and
+/// DIED mid-initialization (bring-up faults kill the reading task, not
+/// the machine) -- RM's global C state (nvport/TLS init counts, g_pSys,
+/// half-constructed OBJSYS children, rm locks) is debris at that point,
+/// and re-running real NVIDIA init over it fails nondeterministically at
+/// unrelated-looking places. Cost us a full diagnostic cycle: a re-run on
+/// a dirty boot "regressed" three trace lines earlier than the previous
+/// run and looked like a new bug. Refuse instead; only a reboot resets it.
+static RM_CORE_INIT_ATTEMPTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Distinctive sentinel (not a real NV_STATUS) reported when RM init is
+/// refused because a prior in-boot attempt died partway through.
+const RM_INIT_POISONED: u32 = 0xDEAD_1417;
+
 fn rm_core_init_once() -> u32 {
+    use core::sync::atomic::Ordering;
     let mut status = RM_CORE_INIT_STATUS.lock();
-    if status.is_none() {
-        *status = Some(nvidia_rm_sys::rm_init::init_core());
+    if let Some(s) = *status {
+        return s;
     }
-    status.unwrap()
+    if RM_CORE_INIT_ATTEMPTED.swap(true, Ordering::SeqCst) {
+        log::error!(
+            "[NVIDIA] rm_core_init_once: a previous RM init attempt this boot died \
+             mid-initialization; refusing to re-enter over its half-initialized \
+             global state. Reboot to retry (status={:#x}).",
+            RM_INIT_POISONED
+        );
+        return RM_INIT_POISONED;
+    }
+    let s = nvidia_rm_sys::rm_init::init_core();
+    *status = Some(s);
+    s
 }
 
 #[derive(Debug, Clone, Copy)]
