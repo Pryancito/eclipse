@@ -31,9 +31,21 @@ fn panic(info: &PanicInfo) -> ! {
 
     // Use spin variant: interrupts are already off above, and try_lock silently
     // discards output if another CPU holds the lock — unacceptable in panic context.
+    //
+    // Mirror to the graphic console too: on a real bring-up box with only a
+    // monitor (no serial capture), a serial-only panic is invisible and reads
+    // as a silent freeze. graphic_console_write_fmt is a best-effort try_lock
+    // that no-ops if the VT lock is held, so it can't deadlock the panic path.
     if let Some(loc) = info.location() {
         kernel_hal::console::serial_write_fmt_spin(format_args!(
             "\n\npanic cpu={} at {}:{}:{}\n",
+            kernel_hal::cpu::cpu_id(),
+            loc.file(),
+            loc.line(),
+            loc.column(),
+        ));
+        kernel_hal::console::graphic_console_write_fmt(format_args!(
+            "\n\n[PANIC] cpu={} at {}:{}:{}\n",
             kernel_hal::cpu::cpu_id(),
             loc.file(),
             loc.line(),
@@ -44,10 +56,15 @@ fn panic(info: &PanicInfo) -> ! {
             "\n\npanic cpu={}\n",
             kernel_hal::cpu::cpu_id(),
         ));
+        kernel_hal::console::graphic_console_write_fmt(format_args!(
+            "\n\n[PANIC] cpu={}\n",
+            kernel_hal::cpu::cpu_id(),
+        ));
     }
     // `as_str()` returns None for any panic! with format arguments — use
     // Display on the Arguments directly so the message is always printed.
     kernel_hal::console::serial_write_fmt_spin(format_args!("{}\n", info.message()));
+    kernel_hal::console::graphic_console_write_fmt(format_args!("{}\n", info.message()));
 
     if cfg!(feature = "baremetal-test") {
         kernel_hal::cpu::reset();
