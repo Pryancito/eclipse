@@ -31,10 +31,13 @@ impl KernelHandler for ZcoreKernelHandler {
                 // heap pointer. The fault address + flags name the culprit
                 // directly instead of leaving a silent frozen `cat`.
                 kernel_hal::console::console_write_fmt(format_args!(
-                    "\n[KERNEL PAGE FAULT] vaddr={:#x} flags={:?} err={:?} \
+                    "\n[KERNEL PAGE FAULT] vaddr={:#x} flags={:?} err={:?} rip={:#x} \
                      (unresolved against the faulting thread's user vmar -- \
                      likely a kernel-side driver bug, not a userspace fault)\n",
-                    fault_vaddr, access_flags, err
+                    fault_vaddr,
+                    access_flags,
+                    err,
+                    kernel_hal::kstats::last_fault_rip(),
                 ));
                 panic!(
                     "handle kernel page fault error: {:?} vaddr(0x{:x}) flags({:?})",

@@ -67,7 +67,15 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
 
     match TrapReason::from(tf.trap_num, tf.error_code) {
         TrapReason::HardwareBreakpoint | TrapReason::SoftwareBreakpoint => breakpoint(),
-        TrapReason::PageFault(vaddr, flags) => crate::KHANDLER.handle_page_fault(vaddr, flags),
+        TrapReason::PageFault(vaddr, flags) => {
+            // [diag] Stash the faulting instruction pointer so the kernel-side
+            // page-fault handler can name the exact code that faulted (the
+            // handler only receives vaddr+flags, not the trap frame). Read
+            // back in ZcoreKernelHandler::handle_page_fault before it panics.
+            // Cheap: one relaxed store per fault, overwritten on the next.
+            crate::kstats::note_fault_rip(tf.rip as u64);
+            crate::KHANDLER.handle_page_fault(vaddr, flags)
+        }
         TrapReason::Interrupt(vector) => {
             // [diag] Attribute the scheduler tick to the context it interrupted:
             // ring 3 (CS low 2 bits == 3) means a user thread was running; ring 0

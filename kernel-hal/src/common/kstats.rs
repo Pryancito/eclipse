@@ -168,6 +168,23 @@ pub fn note_nmi_rip(rip: u64) {
     }
 }
 
+/// [diag] Most-recent page-fault instruction pointer, stashed by the trap
+/// handler (which has the trap frame) so the kernel page-fault handler --
+/// which only receives vaddr+flags -- can name the exact faulting code in
+/// its panic message. Single global: faults are handled to completion
+/// (panic) before the next, so there's no cross-fault race that matters.
+static FAULT_RIP: AtomicU64 = AtomicU64::new(0);
+
+/// [diag] Record the RIP of the instruction that just page-faulted.
+pub fn note_fault_rip(rip: u64) {
+    FAULT_RIP.store(rip, Relaxed);
+}
+
+/// [diag] Read back the last page-fault RIP recorded by `note_fault_rip`.
+pub fn last_fault_rip() -> u64 {
+    FAULT_RIP.load(Relaxed)
+}
+
 /// [diag] Broadcast an NMI to all other CPUs and busy-wait briefly so their NMI
 /// handlers record their current RIP via `note_nmi_rip`. Call immediately before
 /// `nmi_rips()`. No-op off bare x86_64.
