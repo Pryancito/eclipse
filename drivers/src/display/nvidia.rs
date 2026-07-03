@@ -1693,12 +1693,23 @@ impl DrmScheme for NvidiaGpu {
         let bar0 = self._bar0;
         log::warn!("[NVIDIA] bringup_step5: read self._bar0 = {:#x}", bar0 as usize);
         let mut s = String::new();
-        log::warn!("[NVIDIA] bringup_step5: about to lock rm_attach_result");
-        let mut attach = self.rm_attach_result.lock();
-        log::warn!("[NVIDIA] bringup_step5: locked rm_attach_result");
-        if attach.is_none() {
+
+        // Check the cache and release the lock immediately -- previously
+        // `rm_attach_result` was held for the ENTIRE attach_gpu FFI call,
+        // nesting RM_CORE_INIT_STATUS's lock inside it. That specific
+        // nesting can't deadlock today (no other call site takes these
+        // two locks in the opposite order), but it's still a real "lock
+        // held across slow FFI" smell worth removing regardless of
+        // whether it explains the current hang.
+        log::warn!("[NVIDIA] bringup_step5: checking cached result");
+        let cached = self.rm_attach_result.lock().clone();
+        log::warn!("[NVIDIA] bringup_step5: cache check done, cached={}", cached.is_some());
+
+        let result = if let Some(cached) = cached {
+            cached
+        } else {
             let core_status = rm_core_init_once();
-            *attach = Some(if core_status != 0 {
+            let computed = if core_status != 0 {
                 alloc::format!(
                     "eclipse_rm_init_core FAILED, NV_STATUS={:#x}",
                     core_status
@@ -1722,13 +1733,18 @@ impl DrmScheme for NvidiaGpu {
                         alloc::format!("gpumgrAttachGpu FAILED, NV_STATUS={:#x}", status)
                     }
                 }
-            });
-        }
-        let _ = writeln!(
-            s,
-            "[gpustep5]  --- Real RM attach: {} ---",
-            attach.as_deref().unwrap_or("(unreachable)")
-        );
+            };
+            // Publish; harmless if two callers race here (single-shell
+            // manual testing only today) since both compute the same
+            // real result and either write wins.
+            let mut attach = self.rm_attach_result.lock();
+            if attach.is_none() {
+                *attach = Some(computed.clone());
+            }
+            computed
+        };
+
+        let _ = writeln!(s, "[gpustep5]  --- Real RM attach: {} ---", result);
         s
     }
 
@@ -1744,30 +1760,49 @@ impl DrmScheme for NvidiaGpu {
         use core::fmt::Write;
         let mut s = String::new();
         let device_instance = *self.rm_device_instance.lock();
-        let fw = self.gsp_firmware.lock();
-        if let (Some(device_instance), Some(fw_bytes)) = (device_instance, fw.as_ref()) {
-            let mut gsp = self.gsp_init_result.lock();
-            if gsp.is_none() {
-                *gsp = Some(match nvidia_rm_sys::rm_init::init_gsp(device_instance, fw_bytes) {
+
+        // Check the cache before touching gsp_firmware's lock at all, so
+        // the two locks are never nested across the FFI call below (same
+        // reasoning as bringup_step5).
+        let cached = self.gsp_init_result.lock().clone();
+
+        let result = if let Some(cached) = cached {
+            Some(cached)
+        } else if let Some(device_instance) = device_instance {
+            let fw = self.gsp_firmware.lock();
+            if let Some(fw_bytes) = fw.as_ref() {
+                let computed = match nvidia_rm_sys::rm_init::init_gsp(device_instance, fw_bytes) {
                     Ok(()) => String::from("kgspInitRm OK"),
                     Err(status) => alloc::format!("kgspInitRm FAILED, NV_STATUS={:#x}", status),
-                });
-            }
-            let _ = writeln!(
-                s,
-                "[gpustep6]  --- Real GSP-RM boot: {} ---",
-                gsp.as_deref().unwrap_or("(unreachable)")
-            );
-        } else {
-            let _ = writeln!(
-                s,
-                "[gpustep6]  --- Real GSP-RM boot: skipped ({}) ---",
-                if device_instance.is_none() {
-                    "run /proc/gpustep5 (RM attach) first"
-                } else {
-                    "no gsp.bin (rootfs not mounted yet, or fetch failed)"
+                };
+                drop(fw);
+                let mut gsp = self.gsp_init_result.lock();
+                if gsp.is_none() {
+                    *gsp = Some(computed.clone());
                 }
-            );
+                Some(computed)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        match result {
+            Some(r) => {
+                let _ = writeln!(s, "[gpustep6]  --- Real GSP-RM boot: {} ---", r);
+            }
+            None => {
+                let _ = writeln!(
+                    s,
+                    "[gpustep6]  --- Real GSP-RM boot: skipped ({}) ---",
+                    if device_instance.is_none() {
+                        "run /proc/gpustep5 (RM attach) first"
+                    } else {
+                        "no gsp.bin (rootfs not mounted yet, or fetch failed)"
+                    }
+                );
+            }
         }
         s
     }
