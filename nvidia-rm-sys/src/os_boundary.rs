@@ -93,9 +93,16 @@ pub extern "C" fn osAssertFailed() {
 
 #[no_mangle]
 pub extern "C" fn osAttachGpu(arg0: *mut c_void, arg1: *mut c_void) -> NV_STATUS {
+    // Real osAttachGpu (osinit.c:300) is Linux platform bookkeeping --
+    // it links pGpu <-> nv_state_t via pOsGpuInfo and returns NV_OK.
+    // Eclipse has no nv_state_t (we pass pOsAttachArg=NULL) and tracks the
+    // GPU its own way, so there is nothing to do -- but it MUST return
+    // NV_OK: gpumgrAttachGpu (gpu_mgr.c:1569) checks the result and bails
+    // the whole attach with this status otherwise. The old NOT_SUPPORTED
+    // stub is exactly the 0x56 real hardware reported.
     let _ = arg0;
     let _ = arg1;
-    NV_ERR_NOT_SUPPORTED
+    NV_OK
 }
 
 #[no_mangle]
@@ -398,9 +405,12 @@ pub extern "C" fn osDmabufIsSupported() -> NvBool {
 
 #[no_mangle]
 pub extern "C" fn osDpcAttachGpu(arg0: *mut c_void, arg1: *mut c_void) -> NV_STATUS {
+    // Real osDpcAttachGpu (osinit.c:325) is literally
+    // `return NV_OK; // Nothing to do for unix`. gpumgrAttachGpu checks
+    // its result too, so the old NOT_SUPPORTED stub would fail attach.
     let _ = arg0;
     let _ = arg1;
-    NV_ERR_NOT_SUPPORTED
+    NV_OK
 }
 
 #[no_mangle]
@@ -1146,9 +1156,16 @@ pub extern "C" fn osRmCapInitDescriptor(pCapDescriptor: *mut NvU64) {
 
 #[no_mangle]
 pub extern "C" fn osRmCapRegisterGpu(pOsGpuInfo: *mut c_void, ppOsRmCaps: *mut *mut c_void) -> NV_STATUS {
+    // Real osRmCapRegisterGpu (os.c:4834) opens with
+    // "Return success on the unsupported platforms. if (nvidia_caps_root
+    // == NULL) return NV_OK;" -- i.e. when there's no capability
+    // filesystem (exactly Eclipse's case) it succeeds without doing
+    // anything. _gpumgrRegisterRmCapsForGpu (gpu_mgr.c:95) RETURNS this
+    // status and gpumgrAttachGpu bails on it (gpu_mgr.c:1579), so the old
+    // NOT_SUPPORTED stub also broke attach. Leave *ppOsRmCaps as-is (NULL).
     let _ = pOsGpuInfo;
     let _ = ppOsRmCaps;
-    NV_ERR_NOT_SUPPORTED
+    NV_OK
 }
 
 #[no_mangle]
