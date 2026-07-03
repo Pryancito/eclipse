@@ -485,6 +485,16 @@ pub extern "C" fn os_dump_stack() {
     log::warn!("[nvidia-rm] os_dump_stack() -- no unwinder wired up, nothing to print");
 }
 fn log_raw_cstr(str_: *const c_char) {
+    // TEMPORARY: stamp every RM diagnostic line with the current stack
+    // pointer. Two things fall out of one photo: (a) actual stack
+    // consumption across the init sequence (deltas between lines), and
+    // (b) WHICH stack this is running on -- the BSP boot stack (2 MiB,
+    // ~0xffffff80_xxxxxxxx) vs a heap-allocated 256 KiB AP stack
+    // (~0xffff8000_xxxxxxxx, and crucially NO guard page below it, so an
+    // overflow is silent heap corruption, not a clean fault). Remove with
+    // the other bring-up checkpoints.
+    let rsp: u64;
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp) };
     unsafe {
         let mut p = str_;
         let mut len = 0usize;
@@ -504,7 +514,7 @@ fn log_raw_cstr(str_: *const c_char) {
             // with trace checkpoints already deployed produced zero output
             // at all, not even the very first checkpoint, which is only
             // consistent with the print calls never executing their body.
-            log::warn!("[nvidia-rm] {}", s);
+            log::warn!("[nvidia-rm] {} [rsp={:#x}]", s, rsp);
         }
     }
 }
