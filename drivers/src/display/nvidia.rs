@@ -1718,17 +1718,6 @@ impl DrmScheme for NvidiaGpu {
         // whether ANY print is visible from this exact call context
         // before reaching the lock or any real RM code.
         log::warn!("[NVIDIA] bringup_step5: entered");
-        {
-            // TEMPORARY: baseline stack pointer for the stack-usage
-            // measurement -- every [nvidia-rm] trace line now stamps its
-            // own rsp; the delta against this value is the RM init call
-            // chain's real stack consumption, and the address range
-            // identifies which stack (BSP 2 MiB vs heap-allocated 256 KiB
-            // AP stack with no guard page) this context runs on.
-            let rsp: u64;
-            unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp) };
-            log::warn!("[NVIDIA] bringup_step5: baseline rsp={:#x}", rsp);
-        }
         let bar0 = self._bar0;
         log::warn!("[NVIDIA] bringup_step5: read self._bar0 = {:#x}", bar0 as usize);
         let mut s = String::new();
@@ -1751,18 +1740,32 @@ impl DrmScheme for NvidiaGpu {
                 unsafe { core::ptr::read_volatile(bar0 as *const u32) };
             let boot42 =
                 unsafe { core::ptr::read_volatile((bar0 + 0xA00) as *const u32) };
+            // PMC_BOOT_1 @ 0x4: gpuDetermineVirtualMode (gpu.c:4552) asserts
+            // that the VGPU field (bits 17:16) read at attach time matches
+            // the value read later through the IoAperture; a mismatch is the
+            // 0x40 (NV_ERR_INVALID_STATE). _VF==0x2, _PV==0x1, _REAL==0x0;
+            // a bare-metal PF TU106 must read _REAL (0x0) in bits 17:16.
+            let boot1 =
+                unsafe { core::ptr::read_volatile((bar0 + 0x4) as *const u32) };
             let arch = (boot42 >> 24) & 0x3F;
             let impl_ = (boot42 >> 20) & 0xF;
+            let vgpu = (boot1 >> 16) & 0x3;
             let _ = writeln!(
                 s,
                 "[gpustep5]  BAR0 chip-ID probe: PMC_BOOT_0={:#010x} PMC_BOOT_42={:#010x} \
                  (arch={:#x} impl={:#x}; TU106 expects arch=0x16 impl=0x6)",
                 boot0, boot42, arch, impl_
             );
+            let _ = writeln!(
+                s,
+                "[gpustep5]  PMC_BOOT_1={:#010x} VGPU(bits17:16)={:#x} \
+                 (0=REAL/bare-metal, 1=PV, 2=VF; bare-metal PF must be 0)",
+                boot1, vgpu
+            );
             log::warn!(
-                "[NVIDIA] bringup_step5: BAR0 chip-ID probe: PMC_BOOT_0={:#010x} \
-                 PMC_BOOT_42={:#010x} (arch={:#x} impl={:#x}; TU106 expects arch=0x16 impl=0x6)",
-                boot0, boot42, arch, impl_
+                "[NVIDIA] bringup_step5: BAR0 probe: PMC_BOOT_0={:#010x} \
+                 PMC_BOOT_42={:#010x} PMC_BOOT_1={:#010x} (arch={:#x} impl={:#x} vgpu={:#x})",
+                boot0, boot42, boot1, arch, impl_, vgpu
             );
         }
 

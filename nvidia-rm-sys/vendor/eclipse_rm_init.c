@@ -125,6 +125,47 @@ NV_STATUS eclipse_rm_init_core(void)
     ECLIPSE_TRACE("init_core: before coreInitializeRm");
     status = coreInitializeRm();
     ECLIPSE_TRACE("init_core: after coreInitializeRm, done");
+    if (status != NV_OK)
+    {
+        return status;
+    }
+
+    /*
+     * Eclipse diagnostic (not NVIDIA's): make the RM narrate the attach
+     * chain. In a release build nvlog_printf.c's nvDbg_PrintMsg filters
+     * every NV_PRINTF below LEVEL_ERROR (debuglevel_min = LEVEL_ERROR),
+     * and the RmMsg override string that would lower that threshold is
+     * only ever populated by nvDbgInitRmMsg() -- which lives in the Linux
+     * platform layer (osReadRegistryString of NV_REG_STR_RM_MSG) that
+     * Eclipse does not vendor, so RmMsg stays empty (bss) and all of
+     * NVIDIA's own INFO/NOTICE step tracing is silently dropped. That's
+     * why a graceful failure like gpumgrAttachGpu returning 0x40
+     * (NV_ERR_INVALID_STATE) reaches us with no RM-side explanation on
+     * the console at all.
+     *
+     * Populate RmMsg directly with a *targeted* rule. Per the RmMsg
+     * grammar (nvlog_printf.c: `"dmanv50.c" - enable all printfs in
+     * dmanv50.c`), a bare filename forces every printf level in that file
+     * to print. Scope it to just the two files the attach walks --
+     * gpu.c (gpuPostConstruct / gpuDetermineVirtualMode / child-engine
+     * construction) and gpu_mgr.c (gpumgrAttachGpu /
+     * _gpumgrDetermineConfComputeCapabilities) -- so the last step before
+     * the failure is visible without flooding the console (and scrolling
+     * the critical line off a monitor-only bring-up box) with every
+     * subsystem's INFO spam. Written here, once, after DBG_INIT (inside
+     * coreInitializeRm) has run and before eclipse_rm_attach_gpu.
+     */
+    {
+        extern char RmMsg[];
+        static const char rule[] = "gpu.c,gpu_mgr.c";
+        unsigned int i;
+        for (i = 0; rule[i] != '\0'; i++)
+        {
+            RmMsg[i] = rule[i];
+        }
+        RmMsg[i] = '\0';
+    }
+
     return status;
 }
 

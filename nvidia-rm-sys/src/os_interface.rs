@@ -485,16 +485,16 @@ pub extern "C" fn os_dump_stack() {
     log::warn!("[nvidia-rm] os_dump_stack() -- no unwinder wired up, nothing to print");
 }
 fn log_raw_cstr(str_: *const c_char) {
-    // TEMPORARY: stamp every RM diagnostic line with the current stack
-    // pointer. Two things fall out of one photo: (a) actual stack
-    // consumption across the init sequence (deltas between lines), and
-    // (b) WHICH stack this is running on -- the BSP boot stack (2 MiB,
-    // ~0xffffff80_xxxxxxxx) vs a heap-allocated 256 KiB AP stack
-    // (~0xffff8000_xxxxxxxx, and crucially NO guard page below it, so an
-    // overflow is silent heap corruption, not a clean fault). Remove with
-    // the other bring-up checkpoints.
-    let rsp: u64;
-    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp) };
+    // The rsp stamp is gone (it did its job: the RM init sequence runs on
+    // the BSP 2 MiB stack with tiny per-frame deltas, so the "stack too
+    // small / AP-stack overflow" theory is dead). Keeping this lean now
+    // matters: RM's asserts print their expr/file/line through here
+    // (nvassert.c -> nv_printf), and that failing-assertion line is the
+    // one thing worth NOT burying under noise on a real-hardware run.
+    //
+    // WARN, not info: the kernel's default max log level is WARN
+    // (zCore/src/logging.rs), so log::info! would be dropped before
+    // SimpleLogger ever runs.
     unsafe {
         let mut p = str_;
         let mut len = 0usize;
@@ -504,17 +504,7 @@ fn log_raw_cstr(str_: *const c_char) {
         }
         let slice = core::slice::from_raw_parts(str_ as *const u8, len);
         if let Ok(s) = core::str::from_utf8(slice) {
-            // WARN, not info: the kernel's default max log level is WARN
-            // (zCore/src/logging.rs) -- `log::info!` is silently dropped by
-            // the `log` crate's own level check before SimpleLogger ever
-            // runs, so every real NV_PRINTF (which routes here via
-            // nvDbg_Printf -> nv_printf -> nvrm_shim_log_raw) and every
-            // ECLIPSE_TRACE checkpoint (eclipse_rm_init.c) was silently
-            // going nowhere -- confirmed empirically: a real-hardware test
-            // with trace checkpoints already deployed produced zero output
-            // at all, not even the very first checkpoint, which is only
-            // consistent with the print calls never executing their body.
-            log::warn!("[nvidia-rm] {} [rsp={:#x}]", s, rsp);
+            log::warn!("[nvidia-rm] {}", s);
         }
     }
 }
