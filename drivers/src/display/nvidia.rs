@@ -1718,17 +1718,6 @@ impl DrmScheme for NvidiaGpu {
         // whether ANY print is visible from this exact call context
         // before reaching the lock or any real RM code.
         log::warn!("[NVIDIA] bringup_step5: entered");
-        {
-            // TEMPORARY: baseline stack pointer for the stack-usage
-            // measurement -- every [nvidia-rm] trace line now stamps its
-            // own rsp; the delta against this value is the RM init call
-            // chain's real stack consumption, and the address range
-            // identifies which stack (BSP 2 MiB vs heap-allocated 256 KiB
-            // AP stack with no guard page) this context runs on.
-            let rsp: u64;
-            unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp) };
-            log::warn!("[NVIDIA] bringup_step5: baseline rsp={:#x}", rsp);
-        }
         let bar0 = self._bar0;
         log::warn!("[NVIDIA] bringup_step5: read self._bar0 = {:#x}", bar0 as usize);
         let mut s = String::new();
