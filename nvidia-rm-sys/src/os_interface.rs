@@ -121,10 +121,29 @@ pub extern "C" fn os_delay_us(microseconds: NvU32) -> NV_STATUS {
     with_hooks((), |h| h.delay_us(microseconds));
     NV_OK
 }
-/// STUB: no calibrated TSC/APIC-timer frequency wired up yet.
+/// Real: TSC frequency in Hz, calibrated once against the hook-provided
+/// microsecond delay and cached. Feeds `osGetCpuFrequency` (os_init.c,
+/// Hz -> MHz) and from there `pSys->cpuInfo.clock` (cpu.c) -- a 0 here is
+/// not a divisor anywhere at construction time (checked), but a 0 MHz
+/// CPU clock would flow into later consumers (e.g. GSP boot arguments),
+/// so report the real value.
 #[no_mangle]
 pub extern "C" fn os_get_cpu_frequency() -> NvU64 {
-    0
+    static CACHED_HZ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let cached = CACHED_HZ.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    // 10 ms calibration window: long enough to make delay_us's own
+    // resolution error negligible, short enough to be a one-off blip.
+    let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+    with_hooks((), |h| h.delay_us(10_000));
+    let t1 = unsafe { core::arch::x86_64::_rdtsc() };
+    let hz = t1.wrapping_sub(t0).saturating_mul(100);
+    if hz != 0 {
+        CACHED_HZ.store(hz, Ordering::Relaxed);
+    }
+    hz
 }
 
 // ---------------------------------------------------------------------

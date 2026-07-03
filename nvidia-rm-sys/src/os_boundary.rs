@@ -655,13 +655,25 @@ pub extern "C" fn osGetSyncpointAperture(pOsGpuInfo: *mut c_void, syncpointId: N
 }
 
 #[no_mangle]
-pub extern "C" fn osGetTimestamp() -> *mut c_void {
-    core::ptr::null_mut()
+pub extern "C" fn osGetTimestamp() -> NvU64 {
+    // Real semantics (arch/nvalloc/unix/src/os.c): a timestamp in the
+    // unit whose frequency osGetTimestampFreq() reports -- Linux returns
+    // microseconds with freq=1e6, and Eclipse mirrors that exactly. The
+    // previous auto-generated stub returned 0 with a WRONG signature
+    // (*mut c_void) -- same register ABI, but semantically garbage.
+    crate::hooks::with_hooks(0u64, |h| h.monotonic_time_ns()) / 1_000
 }
 
 #[no_mangle]
 pub extern "C" fn osGetTimestampFreq() -> NvU64 {
-    0
+    // MUST NOT be 0: rcdbConstruct_IMPL (journal.c) computes
+    // `(timeStamp * 1000000) / osGetTimestampFreq()` during OBJSYS
+    // construction -- the previous 0 stub caused a kernel divide-by-zero
+    // (#DE) that killed /proc/gpustep5 with no output on real hardware,
+    // right after _sysCreateOs's benign "Sys Cap creation failed: 0x56"
+    // line (OBJRCDB is constructed a few children later). Matches the
+    // real Linux value for microsecond timestamps (os.c: return 1000000).
+    1_000_000
 }
 
 #[no_mangle]
