@@ -151,6 +151,8 @@ NV_STATUS eclipse_rm_attach_gpu(
 {
     NvU32 gpuInstance = 0;
     NvU32 deviceInstance = 0;
+    NvU32 gpuId;
+    NvU64 gpuDomainBusDevice;
     GPUATTACHARG gpuAttachArg;
     NV_STATUS status;
 
@@ -169,11 +171,35 @@ NV_STATUS eclipse_rm_attach_gpu(
         return status;
     }
 
+    /*
+     * Register the GPU in OBJGPUMGR's probedGpus table BEFORE attach, the
+     * same thing the real Linux probe (RmInitGpuInfoWithRmApi in
+     * arch/nvalloc/unix/src/osinit.c) does. Without this, gpumgrAttachGpu's
+     * very first child call (_gpumgrCreateGpu -> gpumgrGetRegisteredIds)
+     * finds no probedGpus entry matching this DBDF and returns 0x57
+     * (NV_ERR_OBJECT_NOT_FOUND) before OBJGPU is even constructed -- which
+     * is exactly the error real hardware just reported. gpuId and
+     * gpuDomainBusDevice are derived from the same (domain,bus,device) as
+     * the attach arg's nvDomainBusDeviceFunc, matching osinit.c's use of
+     * gpuGenerate32BitId / gpuEncodeDomainBusDevice.
+     */
+    gpuId              = gpuGenerate32BitId(domain, bus, device);
+    gpuDomainBusDevice = gpuEncodeDomainBusDevice(domain, bus, device);
+    ECLIPSE_TRACE("attach_gpu: before gpumgrRegisterGpuId");
+    status = gpumgrRegisterGpuId(gpuId, gpuDomainBusDevice);
+    ECLIPSE_TRACE("attach_gpu: after gpumgrRegisterGpuId");
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        return status;
+    }
+
     ECLIPSE_TRACE("attach_gpu: before gpumgrAllocGpuInstance");
     status = gpumgrAllocGpuInstance(&gpuInstance);
     ECLIPSE_TRACE("attach_gpu: after gpumgrAllocGpuInstance");
     if (status != NV_OK)
     {
+        gpumgrUnregisterGpuId(gpuId);
         rmapiLockRelease();
         return status;
     }
@@ -183,6 +209,7 @@ NV_STATUS eclipse_rm_attach_gpu(
     ECLIPSE_TRACE("attach_gpu: after rmGpuLockAlloc");
     if (status != NV_OK)
     {
+        gpumgrUnregisterGpuId(gpuId);
         rmapiLockRelease();
         return status;
     }
@@ -193,6 +220,7 @@ NV_STATUS eclipse_rm_attach_gpu(
     if (status != NV_OK)
     {
         rmGpuLockFree(gpuInstance);
+        gpumgrUnregisterGpuId(gpuId);
         rmapiLockRelease();
         return status;
     }
@@ -226,6 +254,7 @@ NV_STATUS eclipse_rm_attach_gpu(
     {
         gpumgrDestroyDevice(deviceInstance);
         rmGpuLockFree(gpuInstance);
+        gpumgrUnregisterGpuId(gpuId);
         rmapiLockRelease();
         return status;
     }

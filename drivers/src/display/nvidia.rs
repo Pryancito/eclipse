@@ -1731,6 +1731,30 @@ impl DrmScheme for NvidiaGpu {
         }
         let bar0 = self._bar0;
         log::warn!("[NVIDIA] bringup_step5: read self._bar0 = {:#x}", bar0 as usize);
+        {
+            // TEMPORARY chip-ID probe: read PMC_BOOT_0 (offset 0) and
+            // PMC_BOOT_42 (offset 0xA00) directly through our mapped BAR0,
+            // the exact registers RM's gpumgrGetGpuHalFactor reads to
+            // identify the chip. gpumgrAttachGpu now returns 0x57
+            // (OBJECT_NOT_FOUND); the leading theory is our BAR0 reads
+            // don't return the real chip ID (so the HAL never matches).
+            // For a TU106 the real values are: PMC_BOOT_42 bits 29:24
+            // (ARCHITECTURE) == 0x16 and the IMPLEMENTATION nibble == 6.
+            // 0x00000000 or 0xFFFFFFFF here means BAR0 MMIO is not actually
+            // reaching the GPU (mapping/decode wrong), which is the whole
+            // ballgame -- everything downstream depends on this read.
+            let boot0 =
+                unsafe { core::ptr::read_volatile(bar0 as *const u32) };
+            let boot42 =
+                unsafe { core::ptr::read_volatile((bar0 + 0xA00) as *const u32) };
+            let arch = (boot42 >> 24) & 0x3F;
+            let impl_ = (boot42 >> 20) & 0xF;
+            log::warn!(
+                "[NVIDIA] bringup_step5: BAR0 chip-ID probe: PMC_BOOT_0={:#010x} \
+                 PMC_BOOT_42={:#010x} (arch={:#x} impl={:#x}; TU106 expects arch=0x16 impl=0x6)",
+                boot0, boot42, arch, impl_
+            );
+        }
         let mut s = String::new();
 
         // Check the cache and release the lock immediately -- previously
