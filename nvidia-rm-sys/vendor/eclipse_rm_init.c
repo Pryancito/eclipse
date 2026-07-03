@@ -194,11 +194,35 @@ NV_STATUS eclipse_rm_attach_gpu(
         return status;
     }
 
+    /*
+     * The whole attach path needs "expanded GPU visibility" on this thread,
+     * exactly as RmInitAdapter enables it around osInitNvMapping
+     * (osinit.c:2039, comment: "Initialization path requires expanded GPU
+     * visibility in GPUMGR in order to access the GPU undergoing
+     * initialization"). Without it, gpumgrGetGpu (gpu_mgr.c:500) refuses to
+     * return a GPU whose PDB_PROP_GPU_STATE_INITIALIZED is still false --
+     * which it is during attach -- so gpumgrAttachGpu's own
+     * `pGpu = gpumgrGetGpu(...)` (gpu_mgr.c:1538) returns NULL and the very
+     * next line dereferences it (pGpu->gpuInstance), the real
+     * [KERNEL PAGE FAULT] READ @ 0x7cc (offset of gpuInstance in a NULL
+     * OBJGPU) hardware just reported at gpu_mgr.c:1540.
+     */
+    ECLIPSE_TRACE("attach_gpu: before gpumgrThreadEnableExpandedGpuVisibility");
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    ECLIPSE_TRACE("attach_gpu: after gpumgrThreadEnableExpandedGpuVisibility");
+    if (status != NV_OK)
+    {
+        gpumgrUnregisterGpuId(gpuId);
+        rmapiLockRelease();
+        return status;
+    }
+
     ECLIPSE_TRACE("attach_gpu: before gpumgrAllocGpuInstance");
     status = gpumgrAllocGpuInstance(&gpuInstance);
     ECLIPSE_TRACE("attach_gpu: after gpumgrAllocGpuInstance");
     if (status != NV_OK)
     {
+        gpumgrThreadDisableExpandedGpuVisibility();
         gpumgrUnregisterGpuId(gpuId);
         rmapiLockRelease();
         return status;
@@ -209,6 +233,7 @@ NV_STATUS eclipse_rm_attach_gpu(
     ECLIPSE_TRACE("attach_gpu: after rmGpuLockAlloc");
     if (status != NV_OK)
     {
+        gpumgrThreadDisableExpandedGpuVisibility();
         gpumgrUnregisterGpuId(gpuId);
         rmapiLockRelease();
         return status;
@@ -220,6 +245,7 @@ NV_STATUS eclipse_rm_attach_gpu(
     if (status != NV_OK)
     {
         rmGpuLockFree(gpuInstance);
+        gpumgrThreadDisableExpandedGpuVisibility();
         gpumgrUnregisterGpuId(gpuId);
         rmapiLockRelease();
         return status;
@@ -247,23 +273,39 @@ NV_STATUS eclipse_rm_attach_gpu(
     gpuAttachArg.cpuNumaNodeId         = -1;
     gpuAttachArg.pOsAttachArg          = NULL;
 
+    /*
+     * Pass gpuInstance (from gpumgrAllocGpuInstance), NOT deviceInstance
+     * (from gpumgrCreateDevice) -- osinit.c:889 does exactly this:
+     * `gpumgrAttachGpu(*pDeviceReference, ...)` where *pDeviceReference is
+     * the gpuInstance filled by gpumgrAllocGpuInstance at osinit.c:793.
+     * gpumgrAttachGpu constructs the OBJGPU at index gpuInstance and looks
+     * it back up by the same gpuInstance (gpu_mgr.c:1531/1538), so the
+     * argument must be the gpuInstance, not the device grouping index.
+     */
     ECLIPSE_TRACE("attach_gpu: before gpumgrAttachGpu");
-    status = gpumgrAttachGpu(deviceInstance, &gpuAttachArg);
+    status = gpumgrAttachGpu(gpuInstance, &gpuAttachArg);
     ECLIPSE_TRACE("attach_gpu: after gpumgrAttachGpu");
     if (status != NV_OK)
     {
         gpumgrDestroyDevice(deviceInstance);
         rmGpuLockFree(gpuInstance);
+        gpumgrThreadDisableExpandedGpuVisibility();
         gpumgrUnregisterGpuId(gpuId);
         rmapiLockRelease();
         return status;
     }
 
+    /*
+     * Return gpuInstance (not deviceInstance): the GSP-boot path
+     * (eclipse_rm_init_gsp) uses this value with gpumgrGetGpu, which is
+     * keyed by gpuInstance.
+     */
     if (pDeviceInstance != NULL)
     {
-        *pDeviceInstance = deviceInstance;
+        *pDeviceInstance = gpuInstance;
     }
 
+    gpumgrThreadDisableExpandedGpuVisibility();
     rmapiLockRelease();
     ECLIPSE_TRACE("attach_gpu: done, OK");
     return NV_OK;
@@ -284,21 +326,37 @@ NV_STATUS eclipse_rm_attach_gpu(
  * g_gpu_nvoc.c), which is what a discrete-GPU build like this one
  * selects, so Eclipse doesn't need to force it on.
  */
-NV_STATUS eclipse_rm_init_gsp(NvU32 deviceInstance, const void *pBuf, NvU32 size)
+NV_STATUS eclipse_rm_init_gsp(NvU32 gpuInstance, const void *pBuf, NvU32 size)
 {
     OBJGPU *pGpu;
     KernelGsp *pKernelGsp;
     GSP_FIRMWARE gspFw;
+    NV_STATUS status;
 
-    pGpu = gpumgrGetGpu(deviceInstance);
+    /*
+     * Same expanded-visibility requirement as the attach path: the GPU is
+     * attached but not yet PDB_PROP_GPU_STATE_INITIALIZED at this point, so
+     * gpumgrGetGpu (gpu_mgr.c:500) would return NULL without it. gpuInstance
+     * is the value eclipse_rm_attach_gpu returned (it is keyed by
+     * gpuInstance, not the device grouping index).
+     */
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        return status;
+    }
+
+    pGpu = gpumgrGetGpu(gpuInstance);
     if (pGpu == NULL)
     {
+        gpumgrThreadDisableExpandedGpuVisibility();
         return NV_ERR_INVALID_ARGUMENT;
     }
 
     pKernelGsp = GPU_GET_KERNEL_GSP(pGpu);
     if (pKernelGsp == NULL)
     {
+        gpumgrThreadDisableExpandedGpuVisibility();
         return NV_ERR_NOT_SUPPORTED;
     }
 
@@ -306,5 +364,7 @@ NV_STATUS eclipse_rm_init_gsp(NvU32 deviceInstance, const void *pBuf, NvU32 size
     gspFw.pBuf = pBuf;
     gspFw.size = size;
 
-    return kgspInitRm(pGpu, pKernelGsp, &gspFw);
+    status = kgspInitRm(pGpu, pKernelGsp, &gspFw);
+    gpumgrThreadDisableExpandedGpuVisibility();
+    return status;
 }
