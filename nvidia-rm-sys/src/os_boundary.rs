@@ -1502,19 +1502,30 @@ pub extern "C" fn osNv_cpuid(
             log::warn!("[nvidia-rm] first osNv_cpuid call (RmInitCpuInfo reached)");
         }
     }
-    let a: u32;
+    let mut a: u32 = leaf as u32;
     let b: u32;
-    let c: u32;
+    let mut c: u32 = subleaf as u32;
     let d: u32;
     unsafe {
+        // CRITICAL: save/restore rbx via the STACK, and never name ebx as
+        // an operand. The previous version used a scratch-reg save/restore
+        // ("mov tmp,ebx; cpuid; xchg tmp,ebx"), which corrupted a caller
+        // pointer -- reproduced on the host as an immediate segfault, and
+        // on real hardware as the [KERNEL PAGE FAULT] WRITE to a
+        // 32-bit-truncated stack address (0x311eed4) during RmInitCpuInfo's
+        // very first osNv_cpuid call. cpuid clobbers all of eax/ebx/ecx/edx
+        // at once; leaving rbx for LLVM to juggle across it is fragile.
+        // push/pop rbx keeps rbx fully out of the register allocator's way.
         core::arch::asm!(
-            "mov {tmp:e}, ebx",
+            "push rbx",
             "cpuid",
-            "xchg {tmp:e}, ebx",
-            tmp = out(reg) b,
-            inout("eax") leaf as u32 => a,
-            inout("ecx") subleaf as u32 => c,
-            out("edx") d,
+            "mov {ebx_out:e}, ebx",
+            "pop rbx",
+            ebx_out = lateout(reg) b,
+            inout("eax") a,
+            inout("ecx") c,
+            lateout("edx") d,
+            options(preserves_flags),
         );
         if !peax.is_null() { *peax = a; }
         if !pebx.is_null() { *pebx = b; }
