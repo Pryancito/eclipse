@@ -1156,10 +1156,12 @@ pub extern "C" fn osRmCapUnregister(ppOsRmCaps: *mut *mut c_void) {
     let _ = ppOsRmCaps;
 }
 
-#[no_mangle]
-pub extern "C" fn osRmInitRm() -> NV_STATUS {
-    NV_ERR_NOT_SUPPORTED
-}
+// osRmInitRm is NOT stubbed here: sysConstruct_IMPL (system.c) calls it
+// during OBJSYS construction and a NOT_SUPPORTED return would fail the
+// whole construction. The real Eclipse implementation (REGISTER_ALL_HALS
+// + threadStateInitSetupFlags, mirroring Linux's osinit.c version) lives
+// in vendor/eclipse_rm_init.c where the generated g_hal_register.h
+// inline registration functions are reachable from C.
 
 #[no_mangle]
 pub extern "C" fn osSetEvent(arg0: *mut c_void, arg1: *mut c_void) -> NvU32 {

@@ -1,25 +1,44 @@
 /*
  * OUR code, not NVIDIA's -- the Eclipse-native equivalent of what
- * NVIDIA's real Linux platform layer does in
- * arch/nvalloc/unix/src/osinit.c (osRmInitRm / osInitNvMapping /
- * RmInitAdapter), which Eclipse doesn't vendor since it's Linux-specific.
- * Every RM function called from here (__nvoc_objCreate_OBJSYS,
- * rmapiInitialize, gpumgrAllocGpuInstance, rmGpuLockAlloc,
- * gpumgrCreateDevice, gpumgrAttachGpu, gpuEncodeDomainBusDevice) is real,
- * unmodified NVIDIA code already vendored via build.rs -- this file only
- * sequences the calls and packages Eclipse's own PCI/BAR info into the
- * real GPUATTACHARG struct, the same way osInitNvMapping does from
+ * NVIDIA's real Linux platform layer does around RM bring-up
+ * (kernel-open's rm_init_rm entry + arch/nvalloc/unix/src/osinit.c's
+ * osRmInitRm / osInitNvMapping / RmInitAdapter), which Eclipse doesn't
+ * vendor since it's Linux-specific. Every RM function called from here
+ * (tlsInitialize, coreInitializeRm, REGISTER_ALL_HALS,
+ * threadStateInitSetupFlags, rmapiLockAcquire/Release,
+ * gpumgrAllocGpuInstance, rmGpuLockAlloc, gpumgrCreateDevice,
+ * gpumgrAttachGpu, gpuEncodeDomainBusDevice) is real, unmodified NVIDIA
+ * code already vendored via build.rs -- this file only sequences the
+ * calls and packages Eclipse's own PCI/BAR info into the real
+ * GPUATTACHARG struct, the same way osInitNvMapping does from
  * nv_state_t.
  *
- * NOT called yet: REGISTER_ALL_HALS(), the rmconfig-generated HAL
- * registration macro osRmInitRm calls before any of this. It isn't
- * defined anywhere in the portable RM core we vendor (confirmed: our
- * 1038-file build already links with zero undefined symbols without
- * it) -- it appears to be Linux-build-specific glue superseded by the
- * newer per-chip chips2halspec/NVOC halspec construction path that runs
- * automatically inside gpuPostConstruct_IMPL/gpuBindHalLegacy_IMPL
- * during attach itself. Left out for now; revisit if GPU attach fails
- * specifically on missing HAL bindings.
+ * HISTORY -- the original version of this file hand-rolled init as
+ * __nvoc_objCreate_OBJSYS + rmapiInitialize + threadStateInitSetupFlags,
+ * which hung real hardware solid on first use: constructing OBJSYS runs
+ * portMemAllocNonPaged (and much more) on an nvport runtime that
+ * portInitialize() had never set up (uninitialized global-allocator
+ * state and tracking locks -- undefined behavior, in practice a wedge
+ * with no output), and then called rmapiInitialize a SECOND time (the
+ * real sysConstruct_IMPL already calls it internally, system.c). The
+ * real, portable, already-vendored entry point that does everything in
+ * the right order is coreInitializeRm() (system.c): portInitialize ->
+ * NVLOG_INIT -> DBG_INIT -> objCreate(OBJSYS) -> nvAssertInit, with
+ * sysConstruct_IMPL itself then running osRmInitRm, RmInitCpuInfo,
+ * rmLocksAlloc, threadStateGlobalAlloc, rmapiInitialize and the rest.
+ * tlsInitialize() (tls.c, also real+vendored) must run first, exactly
+ * like NVIDIA's own kernel-open interface layer does, since the rmapi
+ * lock allocates TLS entries.
+ *
+ * REGISTER_ALL_HALS mystery, RESOLVED: it's a real generated
+ * `static NV_INLINE` function in src/nvidia/generated/g_hal_register.h
+ * (not a Linux-only macro as previously hypothesized), and TU106's HAL
+ * module is the third thing it registers. sysConstruct_IMPL calls the
+ * platform hook osRmInitRm() (which Linux implements in osinit.c to run
+ * REGISTER_ALL_HALS + threadStateInitSetupFlags); Eclipse's equivalent
+ * implementation of that hook lives right here in this file now,
+ * replacing the old os_boundary.rs stub that returned NOT_SUPPORTED
+ * (which would have failed OBJSYS construction cleanly).
  */
 #include "gpu_mgr/gpu_mgr.h"
 #include "gpu/gpu.h"
@@ -28,6 +47,16 @@
 #include "rmapi/rmapi.h"
 #include "core/thread_state.h"
 #include "gpu/gsp/kernel_gsp.h"
+#include "os/os.h"
+#include "tls/tls.h"
+#include "g_hal_register.h"
+
+/*
+ * Real, vendored (src/nvidia/src/kernel/core/system.c), but its declaring
+ * header (rmosxfac.h) is not part of the vendored include surface --
+ * declared here directly instead.
+ */
+extern NV_STATUS coreInitializeRm(void);
 
 /*
  * TEMPORARY: checkpoint tracing to find exactly where real hardware hung
@@ -42,38 +71,61 @@ extern int nv_printf(unsigned int debuglevel, const char *printf_format, ...);
 #define ECLIPSE_TRACE(msg) nv_printf(0, "[eclipse-rm-trace] " msg "\n")
 
 /*
- * Constructs the real OBJSYS singleton and the RM resource server.
- * Call exactly once, before eclipse_rm_attach_gpu.
+ * Eclipse's implementation of the osRmInitRm platform hook, called from
+ * the real sysConstruct_IMPL (system.c) during OBJSYS construction --
+ * the portable subset of what Linux's osinit.c version does: register
+ * every generated HAL module (TU10X first -- the user's TU106 included)
+ * and set up the default ThreadState flags (same four flags as the real
+ * Linux implementation). The Linux-only parts (module-param registry
+ * import, PCIe-Gen3 regkey plumbing, S0ix checks, nvlog re-init) have no
+ * Eclipse equivalent yet and are deliberately omitted.
  */
-NV_STATUS eclipse_rm_init_core(void)
+NV_STATUS osRmInitRm(void)
 {
-    OBJSYS *pSys = NULL;
     NV_STATUS status;
 
-    ECLIPSE_TRACE("init_core: before __nvoc_objCreate_OBJSYS");
-    status = __nvoc_objCreate_OBJSYS(&pSys, NULL, 0);
-    ECLIPSE_TRACE("init_core: after __nvoc_objCreate_OBJSYS");
+    ECLIPSE_TRACE("osRmInitRm: before REGISTER_ALL_HALS");
+    status = REGISTER_ALL_HALS();
+    ECLIPSE_TRACE("osRmInitRm: after REGISTER_ALL_HALS");
     if (status != NV_OK)
     {
         return status;
     }
 
-    ECLIPSE_TRACE("init_core: before rmapiInitialize");
-    status = rmapiInitialize();
-    ECLIPSE_TRACE("init_core: after rmapiInitialize");
-    if (status != NV_OK)
-    {
-        return status;
-    }
-
-    ECLIPSE_TRACE("init_core: before threadStateInitSetupFlags");
     threadStateInitSetupFlags(THREAD_STATE_SETUP_FLAGS_ENABLED |
                               THREAD_STATE_SETUP_FLAGS_TIMEOUT_ENABLED |
                               THREAD_STATE_SETUP_FLAGS_SLI_LOGIC_ENABLED |
                               THREAD_STATE_SETUP_FLAGS_DO_NOT_INCLUDE_SLEEP_TIME_ENABLED);
-    ECLIPSE_TRACE("init_core: after threadStateInitSetupFlags, done");
+    ECLIPSE_TRACE("osRmInitRm: done");
 
     return NV_OK;
+}
+
+/*
+ * Brings up the real RM core exactly the way NVIDIA's own driver does:
+ * tlsInitialize() (as kernel-open's interface layer does before touching
+ * RM) followed by coreInitializeRm() (system.c) -- which runs
+ * portInitialize, NVLOG_INIT, DBG_INIT, then constructs OBJSYS, whose
+ * real constructor performs the entire remaining init sequence
+ * (osRmInitRm above, RmInitCpuInfo, rmLocksAlloc, threadStateGlobalAlloc,
+ * rmapiInitialize, ...). Call exactly once, before eclipse_rm_attach_gpu.
+ */
+NV_STATUS eclipse_rm_init_core(void)
+{
+    NV_STATUS status;
+
+    ECLIPSE_TRACE("init_core: before tlsInitialize");
+    status = tlsInitialize();
+    ECLIPSE_TRACE("init_core: after tlsInitialize");
+    if (status != NV_OK)
+    {
+        return status;
+    }
+
+    ECLIPSE_TRACE("init_core: before coreInitializeRm");
+    status = coreInitializeRm();
+    ECLIPSE_TRACE("init_core: after coreInitializeRm, done");
+    return status;
 }
 
 /*
@@ -102,11 +154,27 @@ NV_STATUS eclipse_rm_attach_gpu(
     GPUATTACHARG gpuAttachArg;
     NV_STATUS status;
 
+    /*
+     * gpumgrAttachGpu's first line is
+     * NV_ASSERT_OR_RETURN(rmapiLockIsOwner(), NV_ERR_INVALID_LOCK_STATE)
+     * (gpu_mgr.c) -- the real driver always attaches with the RM API lock
+     * held, so take it the same way sysConstruct's own internal callers
+     * do (API_LOCK_FLAGS_NONE = exclusive write).
+     */
+    ECLIPSE_TRACE("attach_gpu: before rmapiLockAcquire");
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    ECLIPSE_TRACE("attach_gpu: after rmapiLockAcquire");
+    if (status != NV_OK)
+    {
+        return status;
+    }
+
     ECLIPSE_TRACE("attach_gpu: before gpumgrAllocGpuInstance");
     status = gpumgrAllocGpuInstance(&gpuInstance);
     ECLIPSE_TRACE("attach_gpu: after gpumgrAllocGpuInstance");
     if (status != NV_OK)
     {
+        rmapiLockRelease();
         return status;
     }
 
@@ -115,6 +183,7 @@ NV_STATUS eclipse_rm_attach_gpu(
     ECLIPSE_TRACE("attach_gpu: after rmGpuLockAlloc");
     if (status != NV_OK)
     {
+        rmapiLockRelease();
         return status;
     }
 
@@ -124,6 +193,7 @@ NV_STATUS eclipse_rm_attach_gpu(
     if (status != NV_OK)
     {
         rmGpuLockFree(gpuInstance);
+        rmapiLockRelease();
         return status;
     }
 
@@ -156,6 +226,7 @@ NV_STATUS eclipse_rm_attach_gpu(
     {
         gpumgrDestroyDevice(deviceInstance);
         rmGpuLockFree(gpuInstance);
+        rmapiLockRelease();
         return status;
     }
 
@@ -164,6 +235,7 @@ NV_STATUS eclipse_rm_attach_gpu(
         *pDeviceInstance = deviceInstance;
     }
 
+    rmapiLockRelease();
     ECLIPSE_TRACE("attach_gpu: done, OK");
     return NV_OK;
 }
