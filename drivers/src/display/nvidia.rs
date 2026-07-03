@@ -1690,6 +1690,22 @@ impl DrmScheme for NvidiaGpu {
         // whether ANY print is visible from this exact call context
         // before reaching the lock or any real RM code.
         log::warn!("[NVIDIA] bringup_step5: entered");
+        // TEMPORARY BISECTION: return immediately, touching NOTHING else
+        // (no self._bar0, no locks, no rm_core_init_once, no FFI at all).
+        // Four straight real-hardware tests -- with checkpoints at every
+        // layer down to this exact point -- showed zero visible output,
+        // which is now more consistent with log::warn! simply not
+        // reaching this physical console from this call context than
+        // with a hang this early. This determines that directly: if
+        // this string appears via `cat`, the /proc dispatch and the
+        // returned-content path are both fine regardless of what
+        // log::warn! did or didn't show, and tracing should switch to
+        // building up the returned String incrementally instead of
+        // relying on log::warn!. If it *still* hangs/shows nothing, the
+        // problem is upstream of this function entirely.
+        return String::from("[gpustep5] BISECTION: reached top of bringup_step5, returning immediately\n");
+        #[allow(unreachable_code)]
+        {
         let bar0 = self._bar0;
         log::warn!("[NVIDIA] bringup_step5: read self._bar0 = {:#x}", bar0 as usize);
         let mut s = String::new();
@@ -1746,6 +1762,7 @@ impl DrmScheme for NvidiaGpu {
 
         let _ = writeln!(s, "[gpustep5]  --- Real RM attach: {} ---", result);
         s
+        }
     }
 
     /// Step 6 (`/proc/gpustep6`), NOT read-only and NOT part of `/proc/gpudbg`:
