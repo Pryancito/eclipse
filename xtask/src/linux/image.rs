@@ -13,7 +13,9 @@ const INITRAMFS_BYTES: usize = 80 * 1024 * 1024;
 const EFI_PARTITION_BYTES: usize = 1024 * 1024 * 1024;
 
 /// FAT32 ESP: siempre [`EFI_PARTITION_BYTES`]. Falla en build si los payloads
-/// no caben (p. ej. zcore.elf + initramfs superan ~252 MiB).
+/// no caben (p. ej. zcore.elf + initramfs superan ~252 MiB). The 1 GiB ESP
+/// comfortably absorbs the ~23 MiB NVIDIA GSP firmware now kept in the
+/// bootstrap initramfs (see the build step below).
 fn efi_fat_size_for(initramfs_bytes: u64, zcore_bytes: u64, boot_bytes: u64) -> usize {
     let payload = initramfs_bytes + zcore_bytes + boot_bytes;
     const FAT_METADATA_SLACK: u64 = 4 * 1024 * 1024;
@@ -184,6 +186,41 @@ impl super::LinuxRootfs {
             let live_root = TARGET.join("live-rootfs");
             println!("Building minimal live/installer root...");
             build_live_rootfs(&rootfs_path, &live_root);
+
+            // The vendored NVIDIA driver reads gsp.bin at boot from the
+            // initramfs (zCore/src/main.rs load_nvidia_gsp_firmware, right
+            // after mounting the SFS root) -- BEFORE the full btrfs rootfs is
+            // pivoted in. build_live_rootfs above copies `lib` but
+            // copy_tree_capped drops gsp.bin for exceeding LIVE_FILE_CAP
+            // (16 MiB < ~23 MiB), so the initramfs would lack it and
+            // kgspInitRm could never run (confirmed on real hardware:
+            // "lookup(/lib/firmware/nvidia/gsp/gsp.bin) failed: EntryNotFound"
+            // at boot even though the mounted btrfs root has it). Install it
+            // straight into the live root, uncapped, so it ships in the RAM
+            // initramfs; sfs_size_for(dir_size(&live_root)) below then sizes
+            // the image to fit. This is the one heavy file deliberately kept
+            // in the initramfs -- the GPU needs its firmware at bring-up time,
+            // not after root pivot. Copy the blob already installed into the
+            // full rootfs (line above) rather than re-fetching it.
+            {
+                let fw_rel = "lib/firmware/nvidia/gsp/gsp.bin";
+                let fw_src = rootfs_path.join(fw_rel);
+                if fw_src.is_file() {
+                    let fw_dst = live_root.join(fw_rel);
+                    if let Some(parent) = fw_dst.parent() {
+                        fs::create_dir_all(parent).unwrap();
+                    }
+                    match fs::copy(&fw_src, &fw_dst) {
+                        Ok(n) => println!(
+                            "  live-rootfs: kept NVIDIA GSP firmware ({} MiB) for boot-time load",
+                            n / (1024 * 1024)
+                        ),
+                        Err(e) => eprintln!(
+                            "warning: could not copy GSP firmware into live root: {e}"
+                        ),
+                    }
+                }
+            }
 
             // 1. Build bootloader (rboot)
             println!("Building bootloader (rboot)...");
