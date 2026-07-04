@@ -629,7 +629,17 @@ pub extern "C" fn osGetPageShift() -> NvU8 {
 
 #[no_mangle]
 pub extern "C" fn osGetPageSize() -> NvU64 {
-    0
+    // The host CPU page size, exactly as NVIDIA's Linux osGetPageSize
+    // returns os_page_size (== PAGE_SIZE == 4096 on x86_64). Returning 0
+    // here was a real bug: memdesc's _memdescCalculateAllocSize does
+    // `allocSize = RM_ALIGN_UP(requestedSize, osGetPageSize())` for every
+    // ADDR_SYSMEM allocation, and RM_ALIGN_UP(x, 0) collapses to 0, so the
+    // subsequent `allocSize < requestedSize` check returned
+    // NV_ERR_INVALID_ARGUMENT (0x1F) -- which is exactly what
+    // kmemsysInitFlushSysmemBuffer_HAL's first sysmem memdescCreate hit on
+    // real hardware (kern_mem_sys.c:98). Must match the os_page_size global
+    // (os_interface.rs) RM also reads directly.
+    crate::os_interface::os_page_size
 }
 
 #[no_mangle]
