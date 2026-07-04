@@ -157,7 +157,27 @@ NV_STATUS eclipse_rm_init_core(void)
      */
     {
         extern char RmMsg[];
-        static const char rule[] = "gpu.c,gpu_mgr.c";
+        /*
+         * RmMsg grammar (nvDbgRmMsgCheck, nvlog_printf.c): a comma-separated
+         * list of nouns; each noun is substring-matched (nv_strnstr) against
+         * the source filename, and a hit forces every printf level in that
+         * file to print regardless of the release build's LEVEL_ERROR
+         * threshold. So the bare substring "kernel_gsp" enables all six
+         * kernel_gsp*.c files (kernel_gsp.c orchestration plus the per-arch
+         * kernel_gsp_tu102/ga102/gh100/booter_tu102.c that run the actual
+         * GSP bootstrap), and "kernel_falcon" enables the FALCON reset/RISC-V
+         * bring-up files. This makes the GSP boot narrate itself live: each
+         * NV_PRINTF reaches log::warn! -> the graphic console synchronously
+         * (drivers/.../nvidia_hooks.rs), so on a hard hang inside
+         * kgspBootstrap the LAST line left on the monitor pinpoints which
+         * FALCON/Booter/FWSEC step wedged -- the captured /proc/gpustep6
+         * buffer is useless for a hang because it is only flushed when the
+         * read returns. The chatty post-boot log-polling (kgspStartLogPolling)
+         * runs only after _kgspBootGspRm succeeds, so enabling kernel_gsp.c
+         * does not flood a boot that hangs before then. gpu.c/gpu_mgr.c stay
+         * for the attach (gpustep5) narration.
+         */
+        static const char rule[] = "gpu.c,gpu_mgr.c,kernel_gsp,kernel_falcon";
         unsigned int i;
         for (i = 0; rule[i] != '\0'; i++)
         {
@@ -432,7 +452,22 @@ NV_STATUS eclipse_rm_init_gsp(NvU32 gpuInstance, const void *pBuf, NvU32 size)
     gspFw.pBuf = pBuf;
     gspFw.size = size;
 
+    /*
+     * Guaranteed-visible bracket around the vendored kgspInitRm. ECLIPSE_TRACE
+     * goes straight to nv_printf -> log::warn! -> the graphic console, bypassing
+     * the RM's LEVEL_ERROR release filter, so this line lands on the monitor
+     * synchronously the instant it runs. If the box hard-hangs inside GSP boot
+     * (kgspBootstrap polling a FALCON/Booter register that never settles, IRQs
+     * off, no timeout possible), the "before kgspInitRm" line is the proof the
+     * live console path works and the freeze is inside kgspInitRm; the
+     * finer-grained "NVRM: ..." lines that follow (enabled via the kernel_gsp/
+     * kernel_falcon RmMsg rule in eclipse_rm_init_core) then pinpoint the exact
+     * step. The captured /proc/gpustep6 buffer cannot show any of this on a
+     * hang because it is only returned once the read completes.
+     */
+    ECLIPSE_TRACE("init_gsp: before kgspInitRm (GSP bootstrap begins)");
     status = kgspInitRm(pGpu, pKernelGsp, &gspFw);
+    ECLIPSE_TRACE("init_gsp: after kgspInitRm (GSP bootstrap returned)");
     gpumgrThreadDisableExpandedGpuVisibility();
     return status;
 }
