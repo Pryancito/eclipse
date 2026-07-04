@@ -708,6 +708,48 @@ pub extern "C" fn osGetTimestampFreq() -> NvU64 {
 }
 
 #[no_mangle]
+pub extern "C" fn osGetCurrentTick(pTimeInNs: *mut NvU64) -> NV_STATUS {
+    // Real Linux (arch/nvalloc/unix/src/os.c): *pTimeInNs = os_get_current_tick().
+    // Feeds the RM GPU-lock acquire timeout (locks.c _rmGpuLocksAcquire) and
+    // gpu_timeout.c's OS-timer deadlines, so this MUST return a real,
+    // monotonically-increasing nanosecond clock -- a constant would make lock
+    // acquisition either time out instantly or never. The 570.144 RM
+    // references this unconditionally (610 did not link it in), which is why
+    // it only surfaced at link time on this re-vendor.
+    if !pTimeInNs.is_null() {
+        unsafe { *pTimeInNs = with_hooks(0u64, |h| h.monotonic_time_ns()); }
+    }
+    NV_OK
+}
+
+#[no_mangle]
+pub extern "C" fn osGetTickResolution() -> NvU64 {
+    // Real Linux (os.c: os_get_tick_resolution). Used ONLY additively in
+    // gpu_timeout.c timeoutSet() to pad a deadline out to the next tick, never
+    // as a divisor, so any small non-zero value is safe. Mirror the Linux
+    // fallback where os_get_current_tick has microsecond granularity:
+    // NSEC_PER_USEC = 1000 ns.
+    1_000
+}
+
+#[no_mangle]
+pub extern "C" fn osGetCurrentTime(pSeconds: *mut NvU32, pMicroSeconds: *mut NvU32) -> NV_STATUS {
+    // Real Linux (os.c: os_get_current_time) returns wall-clock seconds +
+    // microseconds since the epoch. Eclipse has no RTC wired into the RM, so
+    // derive both from the same monotonic nanosecond clock used everywhere
+    // else here; callers use it for log/journal timestamps and elapsed-time
+    // deltas (client_resource.c, rpc.c), for which a monotonic base is fine.
+    let ns = with_hooks(0u64, |h| h.monotonic_time_ns());
+    if !pSeconds.is_null() {
+        unsafe { *pSeconds = (ns / 1_000_000_000) as NvU32; }
+    }
+    if !pMicroSeconds.is_null() {
+        unsafe { *pMicroSeconds = ((ns / 1_000) % 1_000_000) as NvU32; }
+    }
+    NV_OK
+}
+
+#[no_mangle]
 pub extern "C" fn osGetVersionDump(arg0: *mut c_void) -> NV_STATUS {
     let _ = arg0;
     NV_ERR_NOT_SUPPORTED
@@ -1049,8 +1091,16 @@ pub extern "C" fn osQueueSystemWorkItem(arg0: *mut c_void, arg1: *mut c_void) ->
     NV_ERR_NOT_SUPPORTED
 }
 
+// 570.144 replaced the bare osQueueWorkItem entry point with
+// osQueueWorkItemWithFlags(OBJGPU *, OSWorkItemFunction, void *, NvU32 flags)
+// -- osQueueWorkItem is now a static inline in g_os_nvoc.h that forwards to it,
+// so the linker needs the *WithFlags* symbol. Deferred work items require an OS
+// worker-thread pool Eclipse's RM host does not run; returning NOT_SUPPORTED
+// matches the prior 610 behaviour (the old osQueueWorkItem stub also refused),
+// and callers (mem_mapper.c, gpuRefreshRecoveryAction, vgpu_events.c) treat a
+// failed queue as "not available" rather than fatal.
 #[no_mangle]
-pub extern "C" fn osQueueWorkItem(pGpu: *mut c_void, pFunction: *mut c_void, pParams: *mut c_void, flags: *mut c_void) -> NV_STATUS {
+pub extern "C" fn osQueueWorkItemWithFlags(pGpu: *mut c_void, pFunction: *mut c_void, pParams: *mut c_void, flags: NvU32) -> NV_STATUS {
     let _ = pGpu;
     let _ = pFunction;
     let _ = pParams;
