@@ -315,6 +315,33 @@ NV_STATUS eclipse_rm_attach_gpu(
     gpuAttachArg.pOsAttachArg          = NULL;
 
     /*
+     * Run as a GSP firmware client, NOT monolithic RM. This is the single
+     * most important attach flag for a Turing GPU on the open kernel
+     * modules: the real Linux driver sets nv->request_fw_client_rm =
+     * NV_TRUE whenever the GSP firmware image loads successfully
+     * (osinit.c:1946, RmInitGspFirmware) -- which for our TU106 it does,
+     * gsp.bin is present -- and then copies it straight into the attach
+     * arg (osinit.c:884: `gpuAttachArg->bRequestFwClientRm =
+     * nv->request_fw_client_rm`). From there gpumgrGetGpuHalFactor ->
+     * gpumgrCheckRmFirmwarePolicy turns it into isFwClient=TRUE (TU106 is
+     * >= TU100 so _gpumgrIsRmFirmwareCapableChip passes), which selects
+     * RM_RUNTIME_VARIANT_PF_KERNEL_ONLY and makes IS_GSP_CLIENT(pGpu) true
+     * for the whole engine topology.
+     *
+     * Leaving this NV_FALSE (the portMemSet default) selected
+     * RM_RUNTIME_VARIANT_PF_MONOLITHIC -- a full-fat monolithic RM that
+     * the open kernel modules do not support on Turing+ (GSP is enabled by
+     * default for every TU100+ chip per gpumgrIsDeviceRmFirmwareCapable),
+     * so gpuPostConstruct built the wrong, unsupported engine topology.
+     * That mismatch is the prime suspect for the graceful
+     * NV_ERR_INVALID_STATE (0x40) gpumgrAttachGpu returns on real
+     * hardware. GSP is only *constructed* during attach here; it is not
+     * booted until eclipse_rm_init_gsp (gpustep6, kgspInitRm), so this
+     * does not itself touch GSP hardware.
+     */
+    gpuAttachArg.bRequestFwClientRm    = NV_TRUE;
+
+    /*
      * Pass gpuInstance (from gpumgrAllocGpuInstance), NOT deviceInstance
      * (from gpumgrCreateDevice) -- osinit.c:889 does exactly this:
      * `gpumgrAttachGpu(*pDeviceReference, ...)` where *pDeviceReference is

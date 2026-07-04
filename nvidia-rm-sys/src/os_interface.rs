@@ -19,7 +19,9 @@ use crate::hooks::with_hooks;
 use crate::types::*;
 use alloc::alloc::{alloc, dealloc, Layout};
 use alloc::boxed::Box;
+use alloc::string::String;
 use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use lock::Mutex;
 
 // ---------------------------------------------------------------------
 // Globals RM reads directly (not functions) -- from the bottom of
@@ -484,6 +486,40 @@ pub extern "C" fn os_dbg_set_level(_level: NvU32) {}
 pub extern "C" fn os_dump_stack() {
     log::warn!("[nvidia-rm] os_dump_stack() -- no unwinder wired up, nothing to print");
 }
+// ---------------------------------------------------------------------
+// Log capture. On the real bring-up box the kernel `log::warn!` stream
+// (where every RM nv_printf / assert / ECLIPSE_TRACE line lands) does NOT
+// reach the monitor the user watches -- only the `cat /proc/gpustepN`
+// stdout does. So a diagnostic that only `log::warn!`s is invisible in
+// practice. This lets the driver bracket a bring-up call
+// (capture_begin/capture_take) and fold the RM's own narration into the
+// String `cat` returns, which the user can actually read. Bounded so a
+// chatty RmMsg rule can't grow it without limit.
+// ---------------------------------------------------------------------
+static LOG_CAPTURE: Mutex<Option<String>> = Mutex::new(None);
+const LOG_CAPTURE_CAP: usize = 32 * 1024;
+
+/// Start (or restart) capturing RM log lines into an in-memory buffer, in
+/// addition to the normal `log::warn!` sink.
+pub fn capture_begin() {
+    *LOG_CAPTURE.lock() = Some(String::new());
+}
+
+/// Stop capturing and return everything captured since `capture_begin`.
+pub fn capture_take() -> Option<String> {
+    LOG_CAPTURE.lock().take()
+}
+
+fn capture_push(s: &str) {
+    let mut guard = LOG_CAPTURE.lock();
+    if let Some(buf) = guard.as_mut() {
+        if buf.len() < LOG_CAPTURE_CAP {
+            buf.push_str(s);
+            buf.push('\n');
+        }
+    }
+}
+
 fn log_raw_cstr(str_: *const c_char) {
     // The rsp stamp is gone (it did its job: the RM init sequence runs on
     // the BSP 2 MiB stack with tiny per-frame deltas, so the "stack too
@@ -505,6 +541,7 @@ fn log_raw_cstr(str_: *const c_char) {
         let slice = core::slice::from_raw_parts(str_ as *const u8, len);
         if let Ok(s) = core::str::from_utf8(slice) {
             log::warn!("[nvidia-rm] {}", s);
+            capture_push(s);
         }
     }
 }
