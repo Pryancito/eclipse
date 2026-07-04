@@ -1769,18 +1769,24 @@ impl DrmScheme for NvidiaGpu {
             );
         }
 
-        // Check the cache and release the lock immediately -- previously
-        // `rm_attach_result` was held for the ENTIRE attach_gpu FFI call,
-        // nesting RM_CORE_INIT_STATUS's lock inside it. That specific
-        // nesting can't deadlock today (no other call site takes these
-        // two locks in the opposite order), but it's still a real "lock
-        // held across slow FFI" smell worth removing regardless of
-        // whether it explains the current hang.
+        // The /proc read is served by seq_read_at, which re-invokes this
+        // generator for EVERY chunk `cat` requests. So the returned String
+        // must be byte-for-byte identical across calls: cat's first read
+        // (offset 0) runs the attach and yields the full string incl.
+        // narration; its second read (offset = first-chunk length) calls us
+        // again. If that second string is a different length -- which it was
+        // when the narration only got appended on the non-cached path -- the
+        // offset lands past its end, read returns 0/EOF, and the output is
+        // truncated mid-line (exactly what hid the RM narration and the
+        // real result last run). The BAR0 probe above is deterministic; the
+        // attach + narration is not (runs once, then cached), so cache the
+        // ENTIRE post-probe block -- narration and result line together --
+        // and emit it verbatim on every call.
         log::warn!("[NVIDIA] bringup_step5: checking cached result");
         let cached = self.rm_attach_result.lock().clone();
         log::warn!("[NVIDIA] bringup_step5: cache check done, cached={}", cached.is_some());
 
-        let result = if let Some(cached) = cached {
+        let block = if let Some(cached) = cached {
             cached
         } else {
             // Capture the RM's own nv_printf / assert / ECLIPSE_TRACE
@@ -1820,30 +1826,30 @@ impl DrmScheme for NvidiaGpu {
                 }
             };
             let captured = nvidia_rm_sys::os_interface::capture_take();
-            // Publish; harmless if two callers race here (single-shell
-            // manual testing only today) since both compute the same
-            // real result and either write wins.
-            let mut attach = self.rm_attach_result.lock();
-            if attach.is_none() {
-                *attach = Some(computed.clone());
-            }
-            drop(attach);
-            // Fold the captured RM narration into what `cat` returns. Only
-            // the tail matters for pinning a failure, but the buffer is
-            // already bounded (32 KiB) on the producing side.
+            // Build the full post-probe block: captured RM narration first
+            // (each line prefixed for the `cat` reader), then the result.
+            let mut block = String::new();
             if let Some(log) = captured {
                 if !log.is_empty() {
-                    let _ = writeln!(s, "[gpustep5]  --- RM narration (captured) ---");
+                    let _ = writeln!(block, "[gpustep5]  --- RM narration (captured) ---");
                     for line in log.lines() {
-                        let _ = writeln!(s, "[gpustep5]  | {}", line);
+                        let _ = writeln!(block, "[gpustep5]  | {}", line);
                     }
-                    let _ = writeln!(s, "[gpustep5]  --- end RM narration ---");
+                    let _ = writeln!(block, "[gpustep5]  --- end RM narration ---");
                 }
             }
-            computed
+            let _ = writeln!(block, "[gpustep5]  --- Real RM attach: {} ---", computed);
+            // Publish; harmless if two callers race here (single-shell
+            // manual testing only today) since both compute the same block
+            // and either write wins.
+            let mut attach = self.rm_attach_result.lock();
+            if attach.is_none() {
+                *attach = Some(block.clone());
+            }
+            block
         };
 
-        let _ = writeln!(s, "[gpustep5]  --- Real RM attach: {} ---", result);
+        s.push_str(&block);
         s
     }
 
