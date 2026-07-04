@@ -1783,6 +1783,16 @@ impl DrmScheme for NvidiaGpu {
         let result = if let Some(cached) = cached {
             cached
         } else {
+            // Capture the RM's own nv_printf / assert / ECLIPSE_TRACE
+            // narration into an in-memory buffer for the duration of core
+            // init + attach. On this bring-up box the kernel `log::warn!`
+            // stream never reaches the monitor -- only this returned String
+            // (the `cat /proc/gpustep5` stdout) does -- so folding the RM's
+            // narration in here is the only way it's actually visible. The
+            // RmMsg rule set in eclipse_rm_init_core makes gpu.c/gpu_mgr.c
+            // narrate every step, so the last captured line pins where a
+            // graceful failure (e.g. 0x40) originates inside gpumgrAttachGpu.
+            nvidia_rm_sys::os_interface::capture_begin();
             let core_status = rm_core_init_once();
             let computed = if core_status != 0 {
                 alloc::format!(
@@ -1809,12 +1819,26 @@ impl DrmScheme for NvidiaGpu {
                     }
                 }
             };
+            let captured = nvidia_rm_sys::os_interface::capture_take();
             // Publish; harmless if two callers race here (single-shell
             // manual testing only today) since both compute the same
             // real result and either write wins.
             let mut attach = self.rm_attach_result.lock();
             if attach.is_none() {
                 *attach = Some(computed.clone());
+            }
+            drop(attach);
+            // Fold the captured RM narration into what `cat` returns. Only
+            // the tail matters for pinning a failure, but the buffer is
+            // already bounded (32 KiB) on the producing side.
+            if let Some(log) = captured {
+                if !log.is_empty() {
+                    let _ = writeln!(s, "[gpustep5]  --- RM narration (captured) ---");
+                    for line in log.lines() {
+                        let _ = writeln!(s, "[gpustep5]  | {}", line);
+                    }
+                    let _ = writeln!(s, "[gpustep5]  --- end RM narration ---");
+                }
             }
             computed
         };
