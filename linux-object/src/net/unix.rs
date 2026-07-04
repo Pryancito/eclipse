@@ -413,7 +413,8 @@ impl Socket for UnixSocketState {
             let inner = self.inner.lock();
             inner.peer.as_ref()?.upgrade()?
         };
-        Some(Endpoint::Unix(peer.lock().path.clone()))
+        let path = peer.lock().path.clone();
+        Some(Endpoint::Unix(path))
     }
 
     fn setsockopt(&self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
