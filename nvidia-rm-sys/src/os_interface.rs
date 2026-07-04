@@ -497,7 +497,11 @@ pub extern "C" fn os_dump_stack() {
 // chatty RmMsg rule can't grow it without limit.
 // ---------------------------------------------------------------------
 static LOG_CAPTURE: Mutex<Option<String>> = Mutex::new(None);
-const LOG_CAPTURE_CAP: usize = 32 * 1024;
+// Generous cap: the GSP-RM boot path (gpustep6) narrates far more than the
+// attach path, and the whole buffer is folded into the /proc read (which is
+// offset-chunked, so size is not a problem). Bounded only so a runaway loop
+// can't grow it without limit.
+const LOG_CAPTURE_CAP: usize = 256 * 1024;
 
 /// Start (or restart) capturing RM log lines into an in-memory buffer, in
 /// addition to the normal `log::warn!` sink.
