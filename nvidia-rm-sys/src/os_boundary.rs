@@ -44,11 +44,14 @@ pub extern "C" fn osAllocAcquirePage(arg0: NvU64, arg1: NvU32) {
     let _ = arg1;
 }
 
-#[no_mangle]
-pub extern "C" fn osAllocPagesInternal(arg0: *mut c_void) -> *mut c_void {
-    let _ = arg0;
-    core::ptr::null_mut()
-}
+// osAllocPagesInternal / osFreePagesInternal / osMapSystemMemory /
+// osUnmapSystemMemory now have REAL implementations in
+// vendor/eclipse_rm_mem.c (backed by Eclipse's contiguous DMA frame
+// allocator + kernel physmap), replacing the no-op stubs that used to live
+// here. The no-op osAllocPagesInternal in particular silently "succeeded"
+// (returned null == NV_OK) without allocating anything, so every sysmem
+// memdesc had empty PTEs -- which surfaced on real hardware as
+// GspMsgQueuesInit failing to map its shared buffer (NV_ERR_NO_MEMORY).
 
 #[no_mangle]
 pub extern "C" fn osAllocPagesNode(arg0: NvS32, arg1: NvU64, arg2: NvU32, arg3: *mut NvU64) -> NV_STATUS {
@@ -478,10 +481,7 @@ pub extern "C" fn osFlushGpuCoherentCpuCacheRange(pOsGpuInfo: *mut c_void, cpuVi
     let _ = size;
 }
 
-#[no_mangle]
-pub extern "C" fn osFreePagesInternal(arg0: *mut c_void) {
-    let _ = arg0;
-}
+// osFreePagesInternal: real impl in vendor/eclipse_rm_mem.c.
 
 #[no_mangle]
 pub extern "C" fn osFreeWaitQueue(pWq: *mut c_void) {
@@ -915,17 +915,7 @@ pub extern "C" fn osMapPciMemoryUser(arg0: *mut c_void, arg1: NvU64, arg2: NvU64
     core::ptr::null_mut()
 }
 
-#[no_mangle]
-pub extern "C" fn osMapSystemMemory(arg0: *mut c_void, arg1: NvU64, arg2: NvU64, arg3: NvBool, arg4: NvU32, arg5: *mut c_void, arg6: *mut c_void) -> *mut c_void {
-    let _ = arg0;
-    let _ = arg1;
-    let _ = arg2;
-    let _ = arg3;
-    let _ = arg4;
-    let _ = arg5;
-    let _ = arg6;
-    core::ptr::null_mut()
-}
+// osMapSystemMemory: real impl in vendor/eclipse_rm_mem.c.
 
 #[no_mangle]
 pub extern "C" fn osMatchGpuOsInfo(pGpu: *mut c_void, pOsInfo: *mut c_void) -> NvBool {
@@ -1363,13 +1353,7 @@ pub extern "C" fn osUnmapPciMemoryUser(arg0: *mut c_void, arg1: *mut c_void, arg
     let _ = arg3;
 }
 
-#[no_mangle]
-pub extern "C" fn osUnmapSystemMemory(arg0: *mut c_void, arg1: NvBool, arg2: *mut c_void, arg3: *mut c_void) {
-    let _ = arg0;
-    let _ = arg1;
-    let _ = arg2;
-    let _ = arg3;
-}
+// osUnmapSystemMemory: real impl in vendor/eclipse_rm_mem.c.
 
 #[no_mangle]
 pub extern "C" fn osUnrefGpuAccessNeeded(pOsGpuInfo: *mut c_void) {

@@ -204,6 +204,11 @@ fn build_first_real_nvidia_file() {
     // singleton and resource server, then attaches a GPU by real PCI
     // location and BAR info. See that file's header comment.
     build.file("vendor/eclipse_rm_init.c");
+    // vendor/eclipse_rm_mem.c: Eclipse's real osAllocPagesInternal /
+    // osFreePagesInternal / osMapSystemMemory / osUnmapSystemMemory,
+    // replacing the no-op os_boundary.rs stubs -- backed by kernel-hal's
+    // contiguous DMA frame allocator + physmap. See that file's header.
+    build.file("vendor/eclipse_rm_mem.c");
     for dir in &include_dirs {
         build.include(dir);
     }
@@ -277,4 +282,5 @@ fn build_first_real_nvidia_file() {
     println!("cargo:rerun-if-changed=vendor/glue.c");
     println!("cargo:rerun-if-changed=vendor/rm_boundary_stubs.c");
     println!("cargo:rerun-if-changed=vendor/eclipse_rm_init.c");
+    println!("cargo:rerun-if-changed=vendor/eclipse_rm_mem.c");
 }
