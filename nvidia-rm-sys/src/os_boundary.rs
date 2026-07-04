@@ -1050,13 +1050,10 @@ pub extern "C" fn osOpenTemporaryFile(ppFile: *mut *mut c_void) -> NV_STATUS {
     NV_ERR_NOT_SUPPORTED
 }
 
-#[no_mangle]
-pub extern "C" fn osPackageRegistry(arg0: *mut c_void, arg1: *mut c_void, arg2: *mut NvU32) -> NV_STATUS {
-    let _ = arg0;
-    let _ = arg1;
-    let _ = arg2;
-    NV_ERR_NOT_SUPPORTED
-}
+// osPackageRegistry is implemented in C (vendor/eclipse_rm_init.c) where the
+// real PACKED_REGISTRY_TABLE type is in scope: the GSP SET_REGISTRY RPC
+// (rpcSetRegistry_v17_00) needs a well-formed packed table, and the prior
+// Rust NV_ERR_NOT_SUPPORTED stub aborted kgspInitRm at kernel_gsp.c:3376.
 
 #[no_mangle]
 pub extern "C" fn osPciInitHandle(domain: NvU32, bus: NvU8, slot: NvU8, function: NvU8, pVendor: *mut NvU16, pDevice: *mut NvU16) -> *mut c_void {
