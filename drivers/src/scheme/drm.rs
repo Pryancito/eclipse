@@ -72,6 +72,13 @@ pub trait DrmScheme: Scheme {
     /// (most drivers need no firmware).
     fn set_gsp_firmware(&self, _bytes: alloc::vec::Vec<u8>) {}
 
+    /// Record a human-readable outcome of the boot-time firmware-load attempt
+    /// (see `set_gsp_firmware`). Pushed down from boot code even when the load
+    /// FAILED, so a driver whose `set_gsp_firmware` was never called can still
+    /// report *why* (file not found, short read, etc.) in its bring-up output
+    /// instead of a bare "no firmware". Default: ignore.
+    fn set_gsp_firmware_status(&self, _status: alloc::string::String) {}
+
     /// GPU copy-engine bring-up **Step 2**, surfaced (opt-in) at
     /// `/proc/gpustep2`: write the channel instance block into sysmem and issue
     /// the GMMU flush — the first real GPU register writes of the bring-up.
