@@ -22,8 +22,14 @@
 //! tu117 -> tu116 for the `gsp/` directory.
 use std::{fs, path::Path};
 
-const NVIDIA_FW_VERSION: &str = "535.113.01";
-const NVIDIA_FW_URL: &str = "https://raw.githubusercontent.com/NVIDIA/linux-firmware/main/nvidia/tu102/gsp/gsp-535.113.01.bin";
+// Must match the vendored open-gpu-kernel-modules version EXACTLY: kgspInitRm's
+// _kgspFwContainerVerifyVersion (kernel_gsp.c) hard-fails with
+// NV_ERR_INVALID_DATA unless the GSP firmware image's embedded .fwversion
+// equals the RM's NV_VERSION_STRING. The submodule is pinned at the 570.144
+// tag (the newest release for which NVIDIA publishes a matching GSP firmware
+// in linux-firmware -- 610.x is not there yet), so this is 570.144 too.
+const NVIDIA_FW_VERSION: &str = "570.144";
+const NVIDIA_FW_URL: &str = "https://raw.githubusercontent.com/NVIDIA/linux-firmware/main/nvidia/tu102/gsp/gsp-570.144.bin";
 
 /// Best-effort: a missing/failed download just means the real GPU driver
 /// finds no firmware at runtime and reports that (same as upstream
