@@ -32,6 +32,7 @@
 #include "os/os.h"
 #include "nvos.h"
 #include "gpu/mem_mgr/mem_desc.h"
+#include "gpu/mem_mgr/rm_page_size.h"
 #include "nvport/nvport.h"
 
 /* Eclipse kernel-hal seams (kernel-hal/src/drivers.rs, all #[no_mangle]).
@@ -177,6 +178,7 @@ NV_STATUS osMapSystemMemory(
 void osUnmapSystemMemory(
     MEMORY_DESCRIPTOR *pMemDesc,
     NvBool             Kernel,
+    NvU32              ProcessId,
     NvP64              pAddress,
     NvP64              pPrivate
 )
@@ -186,6 +188,7 @@ void osUnmapSystemMemory(
      * osFreePagesInternal). */
     (void) pMemDesc;
     (void) Kernel;
+    (void) ProcessId;
     (void) pAddress;
     (void) pPrivate;
 }

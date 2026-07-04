@@ -74,19 +74,9 @@ NV_STATUS cliresCtrlCmdOsUnixImportObjectsFromFd_IMPL(struct RmClientResource *p
     return NV_ERR_NOT_SUPPORTED;
 }
 
-NV_STATUS cliresCtrlCmdOsUnixMemacctGetLimits_IMPL(struct RmClientResource *pRmCliRes, NV0000_CTRL_OS_UNIX_MEMACCT_GET_LIMITS_PARAMS *pParams)
-{
-    (void)pRmCliRes;
-    (void)pParams;
-    return NV_ERR_NOT_SUPPORTED;
-}
-
-NV_STATUS cliresCtrlCmdOsUnixMemacctSetLimits_IMPL(struct RmClientResource *pRmCliRes, NV0000_CTRL_OS_UNIX_MEMACCT_SET_LIMITS_PARAMS *pParams)
-{
-    (void)pRmCliRes;
-    (void)pParams;
-    return NV_ERR_NOT_SUPPORTED;
-}
+/* NV0000_CTRL_OS_UNIX_MEMACCT_GET/SET_LIMITS control calls (and their
+ * *_PARAMS types) do not exist in the 570.144 RM -- they were added later --
+ * so there is nothing to stub for this vendored release. */
 
 NV_STATUS deviceCtrlCmdOsUnixVTGetFBInfo_IMPL(struct Device *pDevice, NV0080_CTRL_OS_UNIX_VT_GET_FB_INFO_PARAMS *pParams)
 {
