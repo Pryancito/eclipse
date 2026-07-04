@@ -1871,44 +1871,54 @@ impl DrmScheme for NvidiaGpu {
         // reasoning as bringup_step5).
         let cached = self.gsp_init_result.lock().clone();
 
-        let result = if let Some(cached) = cached {
-            Some(cached)
+        // Cache the ENTIRE block (captured GSP-RM boot narration + result
+        // line) so the /proc generator is idempotent across cat's chunked
+        // reads -- same requirement (and same fix) as bringup_step5.
+        let block = if let Some(cached) = cached {
+            cached
         } else if let Some(device_instance) = device_instance {
             let fw = self.gsp_firmware.lock();
             if let Some(fw_bytes) = fw.as_ref() {
+                // Capture kgspInitRm's own nv_printf / assert / ECLIPSE_TRACE
+                // narration -- the GSP boot is the deepest step and its RM
+                // LEVEL_ERROR failure lines only reach the user folded in
+                // here (the kernel log::warn! stream is invisible on the
+                // bring-up box; see bringup_step5).
+                nvidia_rm_sys::os_interface::capture_begin();
                 let computed = match nvidia_rm_sys::rm_init::init_gsp(device_instance, fw_bytes) {
                     Ok(()) => String::from("kgspInitRm OK"),
                     Err(status) => alloc::format!("kgspInitRm FAILED, NV_STATUS={:#x}", status),
                 };
+                let captured = nvidia_rm_sys::os_interface::capture_take();
                 drop(fw);
+                let mut block = String::new();
+                if let Some(log) = captured {
+                    if !log.is_empty() {
+                        let _ = writeln!(block, "[gpustep6]  --- GSP-RM narration (captured) ---");
+                        for line in log.lines() {
+                            let _ = writeln!(block, "[gpustep6]  | {}", line);
+                        }
+                        let _ = writeln!(block, "[gpustep6]  --- end GSP-RM narration ---");
+                    }
+                }
+                let _ = writeln!(block, "[gpustep6]  --- Real GSP-RM boot: {} ---", computed);
                 let mut gsp = self.gsp_init_result.lock();
                 if gsp.is_none() {
-                    *gsp = Some(computed.clone());
+                    *gsp = Some(block.clone());
                 }
-                Some(computed)
+                block
             } else {
-                None
+                alloc::format!(
+                    "[gpustep6]  --- Real GSP-RM boot: skipped (no gsp.bin (rootfs not mounted yet, or fetch failed)) ---\n"
+                )
             }
         } else {
-            None
+            alloc::format!(
+                "[gpustep6]  --- Real GSP-RM boot: skipped (run /proc/gpustep5 (RM attach) first) ---\n"
+            )
         };
 
-        match result {
-            Some(r) => {
-                let _ = writeln!(s, "[gpustep6]  --- Real GSP-RM boot: {} ---", r);
-            }
-            None => {
-                let _ = writeln!(
-                    s,
-                    "[gpustep6]  --- Real GSP-RM boot: skipped ({}) ---",
-                    if device_instance.is_none() {
-                        "run /proc/gpustep5 (RM attach) first"
-                    } else {
-                        "no gsp.bin (rootfs not mounted yet, or fetch failed)"
-                    }
-                );
-            }
-        }
+        s.push_str(&block);
         s
     }
 
