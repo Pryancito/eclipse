@@ -225,27 +225,88 @@ fn primary_main(config: kernel_hal::KernelConfig) {
 /// at image-build time (best-effort, see xtask/src/linux/nvidia_firmware.rs).
 #[cfg(feature = "linux")]
 fn load_nvidia_gsp_firmware(root: &alloc::sync::Arc<dyn rcore_fs::vfs::INode>) {
-    let inode = match root.lookup("/lib/firmware/nvidia/gsp/gsp.bin") {
+    use alloc::string::String;
+    use rcore_fs::vfs::INode;
+    const PATH: &str = "/lib/firmware/nvidia/gsp/gsp.bin";
+
+    // Push a status string to every DRM driver even on failure, so a driver
+    // whose set_gsp_firmware never gets called can still report *why* in its
+    // /proc/gpustep6 output (the kernel log is invisible on a headless-but-
+    // monitored bring-up box). all_drm() is populated during primary_init()'s
+    // PCI scan, well before this runs.
+    fn report(status: String) {
+        for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+            d.set_gsp_firmware_status(status.clone());
+        }
+    }
+
+    let inode = match root.lookup(PATH) {
         Ok(i) => i,
-        Err(_) => return,
+        Err(e) => {
+            report(alloc::format!("lookup({PATH}) failed: {e:?}"));
+            return;
+        }
     };
     let size = match inode.metadata() {
         Ok(m) => m.size,
-        Err(_) => return,
+        Err(e) => {
+            report(alloc::format!("metadata failed: {e:?}"));
+            return;
+        }
     };
     if size == 0 {
+        report(String::from("file is 0 bytes"));
         return;
     }
-    let mut buf = alloc::vec![0u8; size];
-    let n = match inode.read_at(0, &mut buf) {
-        Ok(n) => n,
-        Err(_) => return,
-    };
-    buf.truncate(n);
+
+    // Read in bounded chunks and accumulate: a single read_at over a
+    // multi-megabyte buffer can fail or short-read on some filesystems (SFS
+    // walks block-by-block); looping is the robust way and also handles
+    // partial reads (which the old one-shot read silently truncated to the
+    // first chunk).
+    let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(size);
+    let mut chunk = alloc::vec![0u8; 256 * 1024];
+    let mut off = 0usize;
+    loop {
+        match inode.read_at(off, &mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                off += n;
+                if off >= size {
+                    break;
+                }
+            }
+            Err(e) => {
+                // Report how far we got -- pinpoints a bad block / read cap.
+                report(alloc::format!(
+                    "read_at(off={off}) failed after {} of {} bytes: {e:?}",
+                    buf.len(),
+                    size
+                ));
+                if buf.is_empty() {
+                    return;
+                }
+                break;
+            }
+        }
+    }
+
+    if buf.is_empty() {
+        report(String::from("read produced 0 bytes"));
+        return;
+    }
+
+    let n = buf.len();
     klog_info!("Eclipse: loaded NVIDIA GSP-RM firmware ({} bytes)", n);
-    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+    let drms = kernel_hal::drivers::all_drm();
+    let drm_count = drms.as_vec().len();
+    for d in drms.as_vec().iter() {
         d.set_gsp_firmware(buf.clone());
     }
+    report(alloc::format!(
+        "OK: {n} of {size} bytes delivered to {drm_count} DRM driver(s)"
+    ));
 }
 
 #[cfg(not(feature = "libos"))]

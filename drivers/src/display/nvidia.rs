@@ -458,6 +458,10 @@ pub struct NvidiaGpu {
     /// during early PCI enumeration, well before any filesystem exists, so
     /// it cannot read the file itself (see DrmScheme::set_gsp_firmware).
     gsp_firmware: Mutex<Option<Vec<u8>>>,
+    /// Human-readable outcome of the boot-time firmware load (set even when it
+    /// failed), so `bringup_step6` can explain a missing blob. See
+    /// `DrmScheme::set_gsp_firmware_status`.
+    gsp_fw_status: Mutex<Option<String>>,
     /// Result of the real kgspInitRm attempt, cached the same way as
     /// `rm_attach_result`.
     gsp_init_result: Mutex<Option<String>>,
@@ -676,6 +680,7 @@ impl NvidiaGpu {
             rm_attach_result: Mutex::new(None),
             rm_device_instance: Mutex::new(None),
             gsp_firmware: Mutex::new(None),
+            gsp_fw_status: Mutex::new(None),
             gsp_init_result: Mutex::new(None),
         })
     }
@@ -1437,6 +1442,10 @@ impl DrmScheme for NvidiaGpu {
         *self.gsp_firmware.lock() = Some(bytes);
     }
 
+    fn set_gsp_firmware_status(&self, status: String) {
+        *self.gsp_fw_status.lock() = Some(status);
+    }
+
     /// Read-only GPU state dump (surfaced at `/proc/gpudbg`). Step 1 of the GPU
     /// copy-engine bring-up: confirm MMIO works bidirectionally, identify the
     /// exact chip, and record the VRAM/BAR layout we need for channel structs.
@@ -1908,8 +1917,15 @@ impl DrmScheme for NvidiaGpu {
                 }
                 block
             } else {
+                let status = self
+                    .gsp_fw_status
+                    .lock()
+                    .clone()
+                    .unwrap_or_else(|| String::from("no status recorded (loader never ran?)"));
                 alloc::format!(
-                    "[gpustep6]  --- Real GSP-RM boot: skipped (no gsp.bin (rootfs not mounted yet, or fetch failed)) ---\n"
+                    "[gpustep6]  --- Real GSP-RM boot: skipped (no gsp.bin in driver) ---\n\
+                     [gpustep6]  boot-time firmware load: {}\n",
+                    status
                 )
             }
         } else {
