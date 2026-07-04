@@ -436,3 +436,46 @@ NV_STATUS eclipse_rm_init_gsp(NvU32 gpuInstance, const void *pBuf, NvU32 size)
     gpumgrThreadDisableExpandedGpuVisibility();
     return status;
 }
+
+/*
+ * osPackageRegistry -- OUR implementation (the real one lives in the excluded
+ * arch/nvalloc/unix/src/registry.c and depends on the Linux nv_state_t
+ * registry chain Eclipse does not have). The GSP SET_REGISTRY RPC
+ * (rpcSetRegistry_v17_00, kernel_gsp.c:3376 via kgspQueueAsyncInitRpcs) hands
+ * GSP-RM the set of driver registry-key overrides. Eclipse sets none, so we
+ * emit a well-formed *empty* PACKED_REGISTRY_TABLE (header only, zero
+ * entries): GSP-RM reads numEntries == 0 and simply applies its own built-in
+ * defaults. We must return NV_OK here rather than the NV_WARN_NOTHING_TO_DO
+ * the Linux implementation returns for an empty table, because the RPC caller
+ * treats any status != NV_OK as failure and would abort GSP boot.
+ */
+NV_STATUS osPackageRegistry(
+    OBJGPU                *pGpu,
+    PACKED_REGISTRY_TABLE *pRegTable,
+    NvU32                 *pSize
+)
+{
+    const NvU32 headerSize = (NvU32)NV_OFFSETOF(PACKED_REGISTRY_TABLE, entries);
+
+    (void)pGpu;
+
+    if (pSize == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    /* Sizing pass: report the size of the (empty) table. */
+    if (pRegTable == NULL)
+    {
+        *pSize = headerSize;
+        return NV_OK;
+    }
+
+    /* Fill pass: caller-provided buffer must hold at least the header. */
+    if (*pSize < headerSize)
+        return NV_ERR_BUFFER_TOO_SMALL;
+
+    pRegTable->size       = headerSize;
+    pRegTable->numEntries = 0;
+    *pSize                = headerSize;
+
+    return NV_OK;
+}
