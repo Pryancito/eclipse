@@ -324,6 +324,12 @@ pub extern "C" fn osDetachFromProcess(arg0: *mut c_void) {
 // address gets it directly, with no need to know the rest of the struct.
 // This is a plain mapped-memory read, not port I/O or PCI config space, so
 // (unlike PCI/MMIO-map/timing) it needs no KernelHooks indirection.
+/// Set once SEC2 is started for the GSP-RM resume (STARTCPU bracket in
+/// osDevWriteReg032): from that point on, GSP-falcon-aperture accesses are
+/// probed too, to catch the first post-"GSP FW RM ready" MMIO (the RPC
+/// doorbell) that the machine now freezes on.
+static GSP_PROBE_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 #[no_mangle]
 pub extern "C" fn osDevReadReg008(_pGpu: *mut c_void, pMapping: *mut c_void, this_address: NvU32) -> NvU8 {
     match dev_mapping_base(pMapping) {
@@ -357,13 +363,24 @@ pub extern "C" fn osDevReadReg032(_pGpu: *mut c_void, pMapping: *mut c_void, thi
     // wait exits immediately on a garbage 0xffffffff (bit 26 set) read --
     // which would explain reading SEC2 MAILBOX0 while SEC2 is still executing
     // and hanging.
+    //
+    // GSP-falcon aperture (0x110000..0x112000) probing is gated on
+    // GSP_PROBE_ON (set when SEC2 is started for the GSP-RM resume): the
+    // machine now freezes ~60 ms AFTER "GSP FW RM ready.", and the first
+    // post-ready MMIO is the RPC doorbell write to the GSP falcon
+    // (SET_GUEST_SYSTEM_INFO -> GspMsgQueueSendCommand -> queue-head write).
+    // Gating avoids burning the line cap on the hundreds of GSP-falcon
+    // accesses the earlier bootstrap performs.
     let is_sec2 = this_address >= 0x0084_0000 && this_address < 0x0084_4000;
     let is_bsi = this_address >= 0x0011_8000 && this_address < 0x0011_8200;
-    if is_sec2 || is_bsi {
+    let is_gsp = this_address >= 0x0011_0000
+        && this_address < 0x0011_2000
+        && GSP_PROBE_ON.load(core::sync::atomic::Ordering::Relaxed);
+    if is_sec2 || is_bsi || is_gsp {
         use core::sync::atomic::{AtomicU32, Ordering};
         static PROBE_RD_LOGS: AtomicU32 = AtomicU32::new(0);
-        if PROBE_RD_LOGS.fetch_add(1, Ordering::Relaxed) < 80 {
-            let tag = if is_bsi { "BSI" } else { "SEC2" };
+        if PROBE_RD_LOGS.fetch_add(1, Ordering::Relaxed) < 160 {
+            let tag = if is_bsi { "BSI" } else if is_gsp { "GSPF" } else { "SEC2" };
             log::warn!("[nvidia-rm] {} RD off={:#x} (about to deref)", tag, this_address);
         }
     }
@@ -371,11 +388,11 @@ pub extern "C" fn osDevReadReg032(_pGpu: *mut c_void, pMapping: *mut c_void, thi
         Some(base) => unsafe { core::ptr::read_volatile(base.add(this_address as usize) as *const NvU32) },
         None => 0xFFFF_FFFF,
     };
-    if is_sec2 || is_bsi {
+    if is_sec2 || is_bsi || is_gsp {
         use core::sync::atomic::{AtomicU32, Ordering};
         static PROBE_RD_DONE: AtomicU32 = AtomicU32::new(0);
-        if PROBE_RD_DONE.fetch_add(1, Ordering::Relaxed) < 80 {
-            let tag = if is_bsi { "BSI" } else { "SEC2" };
+        if PROBE_RD_DONE.fetch_add(1, Ordering::Relaxed) < 160 {
+            let tag = if is_bsi { "BSI" } else if is_gsp { "GSPF" } else { "SEC2" };
             log::warn!("[nvidia-rm] {} RD off={:#x} = {:#x}", tag, this_address, v);
         }
     }
@@ -408,11 +425,17 @@ pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, th
     // before CORE_RESUME. STARTCPU goes to CPUCTL_ALIAS (0x130), so this shows
     // it and nothing noisy.
     let is_sec2 = this_address >= 0x0084_0000 && this_address < 0x0084_4000;
-    if is_sec2 && (this_address & 0xffff) < 0x0180 {
+    let is_gsp_wr = this_address >= 0x0011_0000
+        && this_address < 0x0011_2000
+        && GSP_PROBE_ON.load(core::sync::atomic::Ordering::Relaxed);
+    if (is_sec2 && (this_address & 0xffff) < 0x0180) || is_gsp_wr {
         use core::sync::atomic::{AtomicU32, Ordering};
         static SEC2_WR_LOGS: AtomicU32 = AtomicU32::new(0);
-        if SEC2_WR_LOGS.fetch_add(1, Ordering::Relaxed) < 96 {
-            log::warn!("[nvidia-rm] SEC2 WR off={:#x} <= {:#x}", this_address, this_value);
+        if SEC2_WR_LOGS.fetch_add(1, Ordering::Relaxed) < 200 {
+            let tag = if is_gsp_wr { "GSPF" } else { "SEC2" };
+            // Logged BEFORE the store: if the posted write itself wedges the
+            // CPU, the last line on screen names the exact register.
+            log::warn!("[nvidia-rm] {} WR off={:#x} <= {:#x}", tag, this_address, this_value);
         }
     }
     // STARTCPU bracket. Observed on real hardware: the last line that ever
@@ -430,6 +453,7 @@ pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, th
     let is_sec2_startcpu = this_address == 0x0084_0130;
     let base_for_bracket = dev_mapping_base(pMapping);
     if is_sec2_startcpu {
+        GSP_PROBE_ON.store(true, core::sync::atomic::Ordering::Relaxed);
         if let Some(base) = base_for_bracket {
             let bsi_before =
                 unsafe { core::ptr::read_volatile(base.add(0x0011_80f8) as *const NvU32) };
@@ -1359,8 +1383,11 @@ pub extern "C" fn osSpinLoop() {
     use core::sync::atomic::{AtomicU64, Ordering};
     static SPIN_COUNT: AtomicU64 = AtomicU64::new(0);
     let n = SPIN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if n % 2_000_000 == 0 && n <= 80_000_000 {
-        log::warn!("[nvidia-rm] osSpinLoop heartbeat: {}M iterations", n / 1_000_000);
+    // First beat early (200k ≈ ~10 ms): the machine froze ~60 ms after "GSP
+    // FW RM ready.", too soon for a 2M-iteration first beat to prove whether
+    // a wait loop was even running.
+    if n == 200_000 || (n % 2_000_000 == 0 && n <= 80_000_000) {
+        log::warn!("[nvidia-rm] osSpinLoop heartbeat: {}k iterations", n / 1_000);
     }
     core::hint::spin_loop();
 }
