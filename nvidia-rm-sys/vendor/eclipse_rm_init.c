@@ -488,8 +488,31 @@ NV_STATUS eclipse_rm_init_gsp(NvU32 gpuInstance, const void *pBuf, NvU32 size)
     nv_printf(0, "[eclipse-rm-trace] init_gsp: timeoutData AFTER  arm: defaultFlags=0x%x defaultus=%u\n",
               pGpu->timeoutData.defaultFlags, pGpu->timeoutData.defaultus);
 
+    /*
+     * kgspInitRm's lock contract (matching Linux's RmInitAdapter, which always
+     * calls it with the RM API lock held): _kgspBootGspRm's relaxed-init path
+     * (default-ON for Unix, _kgspShouldRelaxGspInitLocking) unconditionally
+     * does rmapiLockRelease() before kgspBootstrap and rmapiLockAcquire()
+     * afterwards (_kgspBootReacquireLocks). Calling kgspInitRm WITHOUT owning
+     * the API lock made that release corrupt the rwlock state, and the
+     * post-boot reacquire then spun forever inside portSync -- silently: no
+     * MMIO (no GSPF probe lines) and no osSpinLoop (no heartbeats). That was
+     * the machine freeze right after "GSP FW RM ready." on real hardware,
+     * three boots in a row. The GPU locks need no action here: kgspInitRm
+     * acquires them itself into gpusLockedMask and releases them at its own
+     * exit.
+     */
+    ECLIPSE_TRACE("init_gsp: acquiring RM API lock (kgspInitRm contract)");
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        return status;
+    }
+
     status = kgspInitRm(pGpu, pKernelGsp, &gspFw);
     ECLIPSE_TRACE("init_gsp: after kgspInitRm (GSP bootstrap returned)");
+    rmapiLockRelease();
     gpumgrThreadDisableExpandedGpuVisibility();
     return status;
 }
