@@ -415,8 +415,43 @@ pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, th
             log::warn!("[nvidia-rm] SEC2 WR off={:#x} <= {:#x}", this_address, this_value);
         }
     }
+    // STARTCPU bracket. Observed on real hardware: the last line that ever
+    // renders is this probe's own "WR off=0x840130 <= 0x2" -- the BSI read
+    // probe's PRE-log line never appears, even though it prints before its
+    // deref. The console framebuffer lives in this same GPU's BAR1, so the
+    // freeze is the first CPU access to the GPU (BAR0 read or BAR1 pixel
+    // write) after SEC2 launches: SEC2's secure GSP-RM reload blocks the
+    // GPU's apertures, and any access during that window stalls the CPU with
+    // IRQs off. So after the STARTCPU store, go completely silent -- no MMIO,
+    // no console (console IS MMIO here) -- for 500 ms (TSC-based delay only),
+    // then read the BSI handoff register RAW (no pre-log) and only log once
+    // it has returned. If the window theory is right this also simply works:
+    // the RM's own reload poll then sees DONE on its first iteration.
+    let is_sec2_startcpu = this_address == 0x0084_0130;
+    let base_for_bracket = dev_mapping_base(pMapping);
+    if is_sec2_startcpu {
+        if let Some(base) = base_for_bracket {
+            let bsi_before =
+                unsafe { core::ptr::read_volatile(base.add(0x0011_80f8) as *const NvU32) };
+            log::warn!(
+                "[nvidia-rm] STARTCPU(SEC2): BSI_SECURE_SCRATCH_14 before = {:#x}; going silent 500ms after start",
+                bsi_before
+            );
+        }
+    }
     if let Some(base) = dev_mapping_base(pMapping) {
         unsafe { core::ptr::write_volatile(base.add(this_address as usize) as *mut NvU32, this_value) };
+    }
+    if is_sec2_startcpu {
+        if let Some(base) = base_for_bracket {
+            crate::hooks::with_hooks((), |h| h.delay_us(500_000));
+            let bsi_after =
+                unsafe { core::ptr::read_volatile(base.add(0x0011_80f8) as *const NvU32) };
+            log::warn!(
+                "[nvidia-rm] STARTCPU(SEC2): BSI_SECURE_SCRATCH_14 after 500ms = {:#x} (bit26=DONE expected 1)",
+                bsi_after
+            );
+        }
     }
 }
 
