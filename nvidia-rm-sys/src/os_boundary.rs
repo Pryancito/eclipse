@@ -350,23 +350,33 @@ pub extern "C" fn osDevReadReg032(_pGpu: *mut c_void, pMapping: *mut c_void, thi
     // returns and the hang is the following write, we see the value first).
     // Only reads are probed -- the ucode-load flood is writes -- and it is
     // capped so a runaway can't spam the console.
+    // SEC2 aperture (0x840000..0x844000) OR the PGC6/BSI scratch island
+    // (0x118000..0x118200, which holds BSI_SECURE_SCRATCH_14 @ 0x1180f8 --
+    // bit 26 is the SEC2 GSP-RM BOOT_STAGE_3_HANDOFF DONE flag polled by
+    // _kgspIsReloadCompleted). Logging the BSI read shows whether the reload
+    // wait exits immediately on a garbage 0xffffffff (bit 26 set) read --
+    // which would explain reading SEC2 MAILBOX0 while SEC2 is still executing
+    // and hanging.
     let is_sec2 = this_address >= 0x0084_0000 && this_address < 0x0084_4000;
-    if is_sec2 {
+    let is_bsi = this_address >= 0x0011_8000 && this_address < 0x0011_8200;
+    if is_sec2 || is_bsi {
         use core::sync::atomic::{AtomicU32, Ordering};
-        static SEC2_RD_LOGS: AtomicU32 = AtomicU32::new(0);
-        if SEC2_RD_LOGS.fetch_add(1, Ordering::Relaxed) < 64 {
-            log::warn!("[nvidia-rm] SEC2 RD off={:#x} (about to deref)", this_address);
+        static PROBE_RD_LOGS: AtomicU32 = AtomicU32::new(0);
+        if PROBE_RD_LOGS.fetch_add(1, Ordering::Relaxed) < 80 {
+            let tag = if is_bsi { "BSI" } else { "SEC2" };
+            log::warn!("[nvidia-rm] {} RD off={:#x} (about to deref)", tag, this_address);
         }
     }
     let v = match dev_mapping_base(pMapping) {
         Some(base) => unsafe { core::ptr::read_volatile(base.add(this_address as usize) as *const NvU32) },
         None => 0xFFFF_FFFF,
     };
-    if is_sec2 {
+    if is_sec2 || is_bsi {
         use core::sync::atomic::{AtomicU32, Ordering};
-        static SEC2_RD_DONE: AtomicU32 = AtomicU32::new(0);
-        if SEC2_RD_DONE.fetch_add(1, Ordering::Relaxed) < 64 {
-            log::warn!("[nvidia-rm] SEC2 RD off={:#x} = {:#x}", this_address, v);
+        static PROBE_RD_DONE: AtomicU32 = AtomicU32::new(0);
+        if PROBE_RD_DONE.fetch_add(1, Ordering::Relaxed) < 80 {
+            let tag = if is_bsi { "BSI" } else { "SEC2" };
+            log::warn!("[nvidia-rm] {} RD off={:#x} = {:#x}", tag, this_address, v);
         }
     }
     v
