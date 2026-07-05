@@ -388,6 +388,23 @@ pub extern "C" fn osDevWriteReg016(_pGpu: *mut c_void, pMapping: *mut c_void, th
 
 #[no_mangle]
 pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, this_address: NvU32, this_value: NvU32) {
+    // SEC2-aperture write probe (companion to the read probe above). SEC2 reads
+    // return real values, so the CORE_RESUME freeze is at/after kflcnStartCpu's
+    // STARTCPU write (which the read-only probe couldn't show). Log SEC2 writes
+    // to the FALCON *control* registers only -- CPUCTL (0x100), BOOTVEC (0x104),
+    // CPUCTL_ALIAS (0x130) all sit below 0x180, while the IMEMC/IMEMD (0x180+)
+    // and DMEMC/DMEMD (0x1c0+) ucode-load windows must be excluded or the
+    // hundreds of ucode DWORD writes flood the console and exhaust the cap
+    // before CORE_RESUME. STARTCPU goes to CPUCTL_ALIAS (0x130), so this shows
+    // it and nothing noisy.
+    let is_sec2 = this_address >= 0x0084_0000 && this_address < 0x0084_4000;
+    if is_sec2 && (this_address & 0xffff) < 0x0180 {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static SEC2_WR_LOGS: AtomicU32 = AtomicU32::new(0);
+        if SEC2_WR_LOGS.fetch_add(1, Ordering::Relaxed) < 96 {
+            log::warn!("[nvidia-rm] SEC2 WR off={:#x} <= {:#x}", this_address, this_value);
+        }
+    }
     if let Some(base) = dev_mapping_base(pMapping) {
         unsafe { core::ptr::write_volatile(base.add(this_address as usize) as *mut NvU32, this_value) };
     }
