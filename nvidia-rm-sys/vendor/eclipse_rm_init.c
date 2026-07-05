@@ -200,7 +200,7 @@ NV_STATUS eclipse_rm_init_core(void)
  * by Eclipse ahead of time the way BAR0 is, matching
  * osInitNvMapping's own `fbBaseAddr = (GPUHWREG*) 0 // not mapped`).
  */
-NV_STATUS eclipse_rm_attach_gpu(
+static NV_STATUS _eclipse_rm_attach_gpu_body(
     NvU32 domain,
     NvU8  bus,
     NvU8  device,
@@ -401,6 +401,35 @@ NV_STATUS eclipse_rm_attach_gpu(
 }
 
 /*
+ * Public attach entry: registers a THREAD_STATE_NODE around the body, like
+ * every real RM entry point (see the identical bracket and rationale in
+ * eclipse_rm_init_gsp -- without a node, threadStateGetCurrent() returns
+ * NV_ERR_OBJECT_NOT_FOUND and explicit-timeout RM waits abort on their first
+ * gpuCheckTimeout instead of waiting).
+ */
+NV_STATUS eclipse_rm_attach_gpu(
+    NvU32 domain,
+    NvU8  bus,
+    NvU8  device,
+    NvU64 bar0_phys,
+    void *bar0_virt,
+    NvU64 bar0_len,
+    NvU64 bar1_phys,
+    NvU64 bar1_len,
+    NvU32 *pDeviceInstance)
+{
+    THREAD_STATE_NODE threadState;
+    NV_STATUS status;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = _eclipse_rm_attach_gpu_body(domain, bus, device,
+                                         bar0_phys, bar0_virt, bar0_len,
+                                         bar1_phys, bar1_len, pDeviceInstance);
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
+}
+
+/*
  * Boots GSP-RM via the vendored, unmodified kgspInitRm (kernel_gsp.c).
  * Only the raw gsp.bin bytes are supplied: RM parses the image/signature
  * sections out of pBuf itself (_kgspPrepareGspRmBinaryImage), and
@@ -421,6 +450,24 @@ NV_STATUS eclipse_rm_init_gsp(NvU32 gpuInstance, const void *pBuf, NvU32 size)
     KernelGsp *pKernelGsp;
     GSP_FIRMWARE gspFw;
     NV_STATUS status;
+    THREAD_STATE_NODE threadState;
+
+    /*
+     * Register a THREAD_STATE_NODE for this bring-up call, exactly like every
+     * real RM entry point does (rmapi/*.c: threadStateInit(&threadState,
+     * THREAD_STATE_FLAGS_NONE) around the work). Without it,
+     * threadStateGetCurrent() fails with NV_ERR_OBJECT_NOT_FOUND (0x57), and
+     * any RM wait that uses an EXPLICIT timeout (not GPU_TIMEOUT_DEFAULT)
+     * aborts on its FIRST gpuCheckTimeout call instead of waiting:
+     * timeoutCheck always consults threadStateCheckTimeout in addition to the
+     * local timer, and only falls back to the local timer when
+     * USE_THREAD_STATE was set (i.e. only for GPU_TIMEOUT_DEFAULT waits).
+     * Real-hardware consequence: GspStatusQueueInit's 4-second wait for
+     * GSP-RM to link the status queue died at retries=0 with 0x57 whenever
+     * GSP-RM was not ALREADY ready on the first poll -- a boot-to-boot race
+     * (one boot hit it, the previous one did not).
+     */
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
 
     /*
      * Same expanded-visibility requirement as the attach path: the GPU is
@@ -432,6 +479,7 @@ NV_STATUS eclipse_rm_init_gsp(NvU32 gpuInstance, const void *pBuf, NvU32 size)
     status = gpumgrThreadEnableExpandedGpuVisibility();
     if (status != NV_OK)
     {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
         return status;
     }
 
@@ -439,6 +487,7 @@ NV_STATUS eclipse_rm_init_gsp(NvU32 gpuInstance, const void *pBuf, NvU32 size)
     if (pGpu == NULL)
     {
         gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
         return NV_ERR_INVALID_ARGUMENT;
     }
 
@@ -446,6 +495,7 @@ NV_STATUS eclipse_rm_init_gsp(NvU32 gpuInstance, const void *pBuf, NvU32 size)
     if (pKernelGsp == NULL)
     {
         gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
         return NV_ERR_NOT_SUPPORTED;
     }
 
@@ -507,6 +557,7 @@ NV_STATUS eclipse_rm_init_gsp(NvU32 gpuInstance, const void *pBuf, NvU32 size)
     if (status != NV_OK)
     {
         gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
         return status;
     }
 
@@ -514,6 +565,7 @@ NV_STATUS eclipse_rm_init_gsp(NvU32 gpuInstance, const void *pBuf, NvU32 size)
     ECLIPSE_TRACE("init_gsp: after kgspInitRm (GSP bootstrap returned)");
     rmapiLockRelease();
     gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
     return status;
 }
 

@@ -48,23 +48,40 @@ impl EclipseNvrmHooks {
     }
 }
 
-// Busy-wait helper shared by `delay_us` -- same spin-with-hard-cap idiom
-// already used by `drivers/src/ata/ahci.rs`'s `udelay`, so a stalled or
-// non-advancing timer can't hang the GSP-RM bring-up path forever.
+// Busy-wait helper shared by `delay_us`. Time-based (TSC via
+// drivers_timer_now_as_micros), with the escape hatch scoped to what it was
+// actually for: a TRULY frozen timer. The previous version capped TOTAL
+// iterations at 10M, which real hardware showed truncates any long delay to
+// ~140 ms regardless of the (healthy, advancing) timer -- the "500 ms" SEC2
+// silent window really waited ~140 ms, and every long RM osDelayUs was
+// silently cut short, shrinking count-based firmware waits. Now the delay
+// runs to true completion as long as the timer advances, and only bails if
+// the reading stays IDENTICAL for 10M consecutive spins (a genuinely dead
+// timer, where waiting can never terminate anyway).
 fn udelay(us: u64) {
     let t0 = unsafe { drivers_timer_now_as_micros() };
-    const MAX_SPINS: u64 = 10_000_000;
-    let mut spins = 0u64;
-    while unsafe { drivers_timer_now_as_micros() }.wrapping_sub(t0) < us {
-        spin_loop();
-        spins = spins.wrapping_add(1);
-        if spins >= MAX_SPINS {
-            log::warn!(
-                "[NVRM-HOOKS] delay_us fallback hit ({}us requested — timer did not advance)",
-                us
-            );
+    const MAX_STUCK_SPINS: u64 = 10_000_000;
+    let mut last = t0;
+    let mut stuck = 0u64;
+    loop {
+        let now = unsafe { drivers_timer_now_as_micros() };
+        if now.wrapping_sub(t0) >= us {
             break;
         }
+        if now == last {
+            stuck += 1;
+            if stuck >= MAX_STUCK_SPINS {
+                log::warn!(
+                    "[NVRM-HOOKS] delay_us aborted ({}us requested — timer genuinely frozen)",
+                    us
+                );
+                break;
+            }
+        } else {
+            stuck = 0;
+            last = now;
+        }
+        spin_loop();
     }
 }
 
