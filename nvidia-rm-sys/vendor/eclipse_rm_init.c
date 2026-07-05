@@ -47,6 +47,7 @@
 #include "rmapi/rmapi.h"
 #include "core/thread_state.h"
 #include "gpu/gsp/kernel_gsp.h"
+#include "gpu/gpu_timeout.h"
 #include "os/os.h"
 #include "tls/tls.h"
 #include "g_hal_register.h"
@@ -466,6 +467,27 @@ NV_STATUS eclipse_rm_init_gsp(NvU32 gpuInstance, const void *pBuf, NvU32 size)
      * hang because it is only returned once the read completes.
      */
     ECLIPSE_TRACE("init_gsp: before kgspInitRm (GSP bootstrap begins)");
+
+    /*
+     * The GSP bootstrap hard-hangs the whole box in kgspExecuteSequencerCommand
+     * _TU102's SEC2 GSP-RM resume: gpuTimeoutCondWait polls a scratch register
+     * that never handshakes, and the loop is only bounded if pGpu->timeoutData
+     * carries a real timer-source flag (GPU_TIMEOUT_FLAGS_OSTIMER) -- otherwise
+     * _checkTimeout returns NV_OK forever and the CPU spins with interrupts off
+     * (verified: the box stays frozen indefinitely, never printing the SEC2
+     * timeout error). timeoutData is normally armed by timeoutInitializeGpuDefault
+     * inside gpuPostConstruct, which Eclipse's minimal attach may not run -- so
+     * arm it explicitly here, right before the boot, and narrate the before/after
+     * so we can see whether it was uninitialised (defaultFlags == 0) on this box.
+     * timeoutInitializeGpuDefault just recomputes from osGetTimeoutParams (which
+     * now returns OSTIMER + 4s), so calling it again is harmless if it already ran.
+     */
+    nv_printf(0, "[eclipse-rm-trace] init_gsp: timeoutData BEFORE arm: defaultFlags=0x%x defaultus=%u\n",
+              pGpu->timeoutData.defaultFlags, pGpu->timeoutData.defaultus);
+    timeoutInitializeGpuDefault(&pGpu->timeoutData, pGpu);
+    nv_printf(0, "[eclipse-rm-trace] init_gsp: timeoutData AFTER  arm: defaultFlags=0x%x defaultus=%u\n",
+              pGpu->timeoutData.defaultFlags, pGpu->timeoutData.defaultus);
+
     status = kgspInitRm(pGpu, pKernelGsp, &gspFw);
     ECLIPSE_TRACE("init_gsp: after kgspInitRm (GSP bootstrap returned)");
     gpumgrThreadDisableExpandedGpuVisibility();
