@@ -53,6 +53,20 @@ pub extern "C" fn osGetMonotonicTimeNs() -> NvU64 {
     with_hooks(0, |h| h.monotonic_time_ns())
 }
 
+// GPU_TIMEOUT_FLAGS_OSTIMER = NVBIT(3) (gpu_timeout.h). This MUST be set:
+// the RM's timeout engine (_checkTimeout, gpu_timeout.c) starts every check
+// at status = NV_OK and only ever returns NV_ERR_TIMEOUT from inside a branch
+// gated on one of the timer-source flags (OSTIMER / OSDELAY / TMR). With flags
+// = 0 the timeout is structurally disabled -- _checkTimeout returns NV_OK
+// forever, so any gpuTimeoutCondWait whose condition never comes true (e.g.
+// kgspExecuteSequencerCommand_TU102 polling BSI_SECURE_SCRATCH_14 for the SEC2
+// GSP-RM resume handoff) spins the CPU with interrupts off and hard-hangs the
+// whole box instead of timing out. The real Linux osGetTimeoutParams
+// (arch/nvalloc/unix/src/os.c) returns GPU_TIMEOUT_FLAGS_OSTIMER, which routes
+// the check to osGetCurrentTick (which Eclipse now backs with a real TSC
+// clock), so this matches it.
+const GPU_TIMEOUT_FLAGS_OSTIMER: NvU32 = 1 << 3;
+
 #[no_mangle]
 pub extern "C" fn osGetTimeoutParams(
     _gpu: *mut c_void,
@@ -62,13 +76,16 @@ pub extern "C" fn osGetTimeoutParams(
 ) {
     unsafe {
         if !time_out_us.is_null() {
-            *time_out_us = 2_000_000;
+            // Real Linux graphics-mode default (os.c: 4 * 1000000). Long enough
+            // not to trip on a healthy multi-second GSP bootstrap, short enough
+            // that a genuinely stuck poll reports a clean NV_ERR_TIMEOUT.
+            *time_out_us = 4_000_000;
         }
         if !scale.is_null() {
             *scale = 1;
         }
         if !flags.is_null() {
-            *flags = 0;
+            *flags = GPU_TIMEOUT_FLAGS_OSTIMER;
         }
     }
 }
