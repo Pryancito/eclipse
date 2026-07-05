@@ -1349,7 +1349,20 @@ pub extern "C" fn osSetEvent(arg0: *mut c_void, arg1: *mut c_void) -> NvU32 {
 
 #[no_mangle]
 pub extern "C" fn osSpinLoop() {
-
+    // Heartbeat: osSpinLoop is called on every iteration of every RM wait
+    // loop (timeoutCondWait, RPC recv polls, register polls). After "GSP FW
+    // RM ready." the machine stopped producing output with no error -- this
+    // distinguishes "alive but stuck in an RM wait loop" (heartbeats keep
+    // printing, and the count says how hard it is spinning) from "CPU wedged
+    // on a dead MMIO access" (heartbeats stop too). Throttled to one line
+    // per 2M iterations and hard-capped so it can never flood the console.
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static SPIN_COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = SPIN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 2_000_000 == 0 && n <= 80_000_000 {
+        log::warn!("[nvidia-rm] osSpinLoop heartbeat: {}M iterations", n / 1_000_000);
+    }
+    core::hint::spin_loop();
 }
 
 #[no_mangle]

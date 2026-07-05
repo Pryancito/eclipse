@@ -1909,6 +1909,37 @@ impl DrmScheme for NvidiaGpu {
         } else if let Some(device_instance) = device_instance {
             let fw = self.gsp_firmware.lock();
             if let Some(fw_bytes) = fw.as_ref() {
+                // Mask this GPU's legacy INTx at the PCI level before booting
+                // GSP-RM. On real hardware the boot now gets all the way to
+                // "GSP FW RM ready." on the secondary GPU and THEN the machine
+                // livelocks: once GSP-RM is alive it asserts interrupts (RPC
+                // completions, log buffers, NOCAT posts), and Eclipse has no
+                // ISR for the GPU -- nobody acks or masks a level-triggered
+                // INTx, so it screams and starves the CPU. Linux never sees
+                // this because the RM registers its ISR before RmInitAdapter.
+                // Eclipse's bring-up is 100% polled (the RPC message queue is
+                // read directly), so the correct equivalent is to keep the
+                // device's INTx disabled: PCI COMMAND register (offset 4)
+                // bit 10 (Interrupt Disable), the standard way a polled
+                // driver quiesces a function. MSI/MSI-X were never enabled,
+                // so INTx is the only line it can raise.
+                {
+                    use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+                    use pci::Location;
+                    let loc = Location {
+                        bus: self.pci_bus,
+                        device: self.pci_device,
+                        function: 0,
+                    };
+                    let ops = &PortOpsImpl;
+                    let cmd = unsafe { PCI_ACCESS.read16(ops, loc, 0x04) };
+                    unsafe { PCI_ACCESS.write16(ops, loc, 0x04, cmd | (1 << 10)) };
+                    log::warn!(
+                        "[NVIDIA] gpustep6: PCI INTx disabled before GSP boot (COMMAND {:#06x} -> {:#06x})",
+                        cmd,
+                        cmd | (1 << 10)
+                    );
+                }
                 // Capture kgspInitRm's own nv_printf / assert / ECLIPSE_TRACE
                 // narration -- the GSP boot is the deepest step and its RM
                 // LEVEL_ERROR failure lines only reach the user folded in
