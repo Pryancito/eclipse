@@ -1862,6 +1862,59 @@ impl DrmScheme for NvidiaGpu {
         s
     }
 
+    /// Step 7: read back the `GspStaticConfigInfo` the live GSP-RM returned
+    /// during step 6's GET_GSP_STATIC_INFO RPC. Pure readback -- no RPCs, no
+    /// register writes -- so it is safe to run any number of times. All-zero
+    /// name means step 6 has not completed on this GPU.
+    fn bringup_step7(&self) -> String {
+        use core::fmt::Write;
+        let mut s = String::new();
+        let device_instance = *self.rm_device_instance.lock();
+        let Some(device_instance) = device_instance else {
+            return String::from(
+                "[gpustep7]  skipped (run /proc/gpustep5 (RM attach) first)\n",
+            );
+        };
+        match nvidia_rm_sys::rm_init::get_gsp_info(device_instance) {
+            Ok(info) => {
+                let name_len = info.gpu_name.iter().position(|&b| b == 0).unwrap_or(64);
+                let short_len = info.gpu_short_name.iter().position(|&b| b == 0).unwrap_or(64);
+                let name = core::str::from_utf8(&info.gpu_name[..name_len]).unwrap_or("<non-utf8>");
+                let short = core::str::from_utf8(&info.gpu_short_name[..short_len]).unwrap_or("<non-utf8>");
+                if name.is_empty() {
+                    let _ = writeln!(
+                        s,
+                        "[gpustep7]  GSP static info is all zeros -- GSP-RM not booted on this GPU yet (run /proc/gpustep6)"
+                    );
+                } else {
+                    let _ = writeln!(s, "[gpustep7]  --- Firmware-reported GPU info (from live GSP-RM via GET_GSP_STATIC_INFO) ---");
+                    let _ = writeln!(s, "[gpustep7]  GPU name:   {}", name);
+                    let _ = writeln!(s, "[gpustep7]  Short name: {}", short);
+                    let _ = writeln!(
+                        s,
+                        "[gpustep7]  VRAM:       {} MiB ({} bytes), bus width {} bits, ram type {}",
+                        info.fb_length / (1024 * 1024),
+                        info.fb_length,
+                        info.fb_bus_width,
+                        info.fb_ram_type
+                    );
+                    let _ = writeln!(s, "[gpustep7]  L2 cache:   {} KiB", info.l2_cache_size / 1024);
+                    let _ = writeln!(
+                        s,
+                        "[gpustep7]  VBIOS:      valid={} subvendor={:#06x} subdevice={:#06x}",
+                        info.vbios_valid != 0,
+                        info.vbios_sub_vendor,
+                        info.vbios_sub_device
+                    );
+                }
+            }
+            Err(status) => {
+                let _ = writeln!(s, "[gpustep7]  eclipse_rm_get_gsp_info FAILED, NV_STATUS={:#x}", status);
+            }
+        }
+        s
+    }
+
     /// Step 6 (`/proc/gpustep6`), NOT read-only and NOT part of `/proc/gpudbg`:
     /// first real invocation of `kgspInitRm` (kernel_gsp.c) -- the deepest,
     /// riskiest bring-up step yet (VBIOS/FWSEC extraction, Booter ucode

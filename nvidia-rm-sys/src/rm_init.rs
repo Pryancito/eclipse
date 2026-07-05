@@ -90,3 +90,46 @@ pub fn init_gsp(device_instance: u32, buf: &[u8]) -> Result<(), NV_STATUS> {
         Err(status)
     }
 }
+
+/// Fixed-layout mirror of `EclipseGspInfo` (vendor/eclipse_rm_init.c): the
+/// subset of `GspStaticConfigInfo` that the live GSP-RM returned during
+/// `kgspInitRm`'s GET_GSP_STATIC_INFO RPC. All-zero fields mean the RPC has
+/// not run yet (gpustep6 not completed on this GPU).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GspInfo {
+    pub gpu_name: [u8; 64],
+    pub gpu_short_name: [u8; 64],
+    pub fb_length: NvU64,
+    pub fb_bus_width: NvU32,
+    pub fb_ram_type: NvU32,
+    pub l2_cache_size: NvU32,
+    pub vbios_valid: u8,
+    pub vbios_sub_vendor: NvU32,
+    pub vbios_sub_device: NvU32,
+}
+
+extern "C" {
+    fn eclipse_rm_get_gsp_info(device_instance: NvU32, info: *mut GspInfo) -> NV_STATUS;
+}
+
+/// Reads back the firmware-provided static config for an attached GPU.
+pub fn get_gsp_info(device_instance: u32) -> Result<GspInfo, NV_STATUS> {
+    let mut info = GspInfo {
+        gpu_name: [0; 64],
+        gpu_short_name: [0; 64],
+        fb_length: 0,
+        fb_bus_width: 0,
+        fb_ram_type: 0,
+        l2_cache_size: 0,
+        vbios_valid: 0,
+        vbios_sub_vendor: 0,
+        vbios_sub_device: 0,
+    };
+    let status = unsafe { eclipse_rm_get_gsp_info(device_instance, &mut info) };
+    if status == NV_OK {
+        Ok(info)
+    } else {
+        Err(status)
+    }
+}
