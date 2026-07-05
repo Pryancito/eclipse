@@ -127,6 +127,14 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Bring-up **Step 7** (`/proc/gpustep7`): read back the
+    /// `GspStaticConfigInfo` the live GSP-RM firmware returned during
+    /// `bringup_step6` (GPU name, VRAM geometry, VBIOS IDs) -- proves the
+    /// CPU<->GSP RPC channel end-to-end beyond boot. Default: nothing.
+    fn bringup_step7(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Import a buffer allocated by the kernel (DRM core)
     fn import_buffer(&self, _handle: GemHandle) -> bool {
         true
