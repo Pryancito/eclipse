@@ -342,10 +342,34 @@ pub extern "C" fn osDevReadReg016(_pGpu: *mut c_void, pMapping: *mut c_void, thi
 
 #[no_mangle]
 pub extern "C" fn osDevReadReg032(_pGpu: *mut c_void, pMapping: *mut c_void, this_address: NvU32) -> NvU32 {
-    match dev_mapping_base(pMapping) {
+    // SEC2-aperture probe (0x840000..0x844000). The box hard-freezes in
+    // kflcnStartCpu_TU102(SEC2) at CORE_RESUME reading FALCON_CPUCTL (0x840100)
+    // -- the first BAR0 access above ~7 MiB. Log the offset synchronously
+    // BEFORE the volatile deref (so if the read itself stalls the last line on
+    // the monitor is "about to deref"), and the value AFTER (so if the read
+    // returns and the hang is the following write, we see the value first).
+    // Only reads are probed -- the ucode-load flood is writes -- and it is
+    // capped so a runaway can't spam the console.
+    let is_sec2 = this_address >= 0x0084_0000 && this_address < 0x0084_4000;
+    if is_sec2 {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static SEC2_RD_LOGS: AtomicU32 = AtomicU32::new(0);
+        if SEC2_RD_LOGS.fetch_add(1, Ordering::Relaxed) < 64 {
+            log::warn!("[nvidia-rm] SEC2 RD off={:#x} (about to deref)", this_address);
+        }
+    }
+    let v = match dev_mapping_base(pMapping) {
         Some(base) => unsafe { core::ptr::read_volatile(base.add(this_address as usize) as *const NvU32) },
         None => 0xFFFF_FFFF,
+    };
+    if is_sec2 {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static SEC2_RD_DONE: AtomicU32 = AtomicU32::new(0);
+        if SEC2_RD_DONE.fetch_add(1, Ordering::Relaxed) < 64 {
+            log::warn!("[nvidia-rm] SEC2 RD off={:#x} = {:#x}", this_address, v);
+        }
     }
+    v
 }
 
 #[no_mangle]
