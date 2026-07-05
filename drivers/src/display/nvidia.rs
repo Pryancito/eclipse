@@ -1873,6 +1873,27 @@ impl DrmScheme for NvidiaGpu {
     fn bringup_step6(&self) -> String {
         use core::fmt::Write;
         let mut s = String::new();
+
+        // EXPERIMENT (SEC2 CORE_RESUME wedge): starting SEC2 to resume GSP-RM
+        // permanently wedges the GPU's bus interface on the CONSOLE GPU -- even
+        // a raw BSI read after 500 ms of total MMIO silence never returns. The
+        // software sequence is byte-for-byte what nouveau/Linux run successfully
+        // on Turing, so the suspect is console-GPU-specific state: it is the
+        // VBIOS-POSTed primary with GOP scanout live, and its BAR1 is being
+        // written by this very console (GSP-RM's devinit sequencer may also
+        // reconfigure apertures under our feet). The second RTX 2060 Super has
+        // none of that baggage. So: boot GSP only on the GPU(s) NOT driving the
+        // boot display. If the secondary boots clean, the driver stack is
+        // proven end-to-end and the console-GPU collision is isolated as the
+        // remaining problem (likely fix: stop console rendering during its GSP
+        // boot). If the secondary wedges identically, the console theory dies.
+        if self.drives_boot_display() {
+            return String::from(
+                "[gpustep6]  --- Real GSP-RM boot: SKIPPED on console GPU (SEC2 resume wedges its bus; \
+                 booting GSP on the secondary GPU only -- see nvidia.rs bringup_step6) ---\n",
+            );
+        }
+
         let device_instance = *self.rm_device_instance.lock();
 
         // Check the cache before touching gsp_firmware's lock at all, so
