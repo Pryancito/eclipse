@@ -188,7 +188,18 @@ NV_STATUS eclipse_rm_init_core(void)
          * state machine touches, so with this rule the LAST engine line
          * before the 0x63 names the culprit.
          */
-        static const char rule[] = "gpu.c,gpu_mgr.c,kernel_gsp,kernel_falcon,eng_state.c";
+        /*
+         * kernel_graphics added for step 9 postLoad: gpuStateLoad reaches the
+         * Post-Load phase (KernelBus/BAR2 passed, KernelCE loaded) then faults
+         * with a NULL write (vaddr 0x90) after a burst of ~23 GSP RPCs. That
+         * RPC count matches kgraphicsStatePostLoad -> kgraphicsLoadStaticInfo,
+         * which issues ~12 internal STATIC_KGR_GET_* controls plus the GR
+         * internal client/device/subdevice allocs. Enabling kernel_graphics
+         * makes that engine narrate itself so the last line before the fault
+         * confirms whether GR static-info load is the crasher (its eng_state
+         * "state change" line never prints -- it dies mid-postLoad).
+         */
+        static const char rule[] = "gpu.c,gpu_mgr.c,kernel_gsp,kernel_falcon,eng_state.c,kernel_graphics";
         unsigned int i;
         for (i = 0; rule[i] != '\0'; i++)
         {
@@ -971,7 +982,7 @@ NV_STATUS eclipse_rm_state_init(NvU32 gpuInstance, EclipseStateInitResult *pOut)
      * this string whenever step-9 diagnostics change so the output
      * self-identifies which build produced it.
      */
-    ECLIPSE_TRACE("state_init: narration v3 (live ERROR-level echo; last 'Engine X state change' line = last engine that finished StateInit, crasher is the next one)");
+    ECLIPSE_TRACE("state_init: narration v4 (GSPF probe flood removed + kernel_graphics trace; watch for GR static-info load before the postLoad fault)");
     ECLIPSE_TRACE("state_init: before gpumgrStatePreInitGpu");
     pOut->preInitStatus = gpumgrStatePreInitGpu(pGpu);
     nv_printf(0, "[eclipse-rm-trace] state_init: gpumgrStatePreInitGpu -> 0x%x\n",
