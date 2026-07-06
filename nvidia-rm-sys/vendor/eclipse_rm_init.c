@@ -900,7 +900,6 @@ NV_STATUS eclipse_rm_state_init(NvU32 gpuInstance, EclipseStateInitResult *pOut)
     Intr *pIntr;
     NV_STATUS status;
     THREAD_STATE_NODE threadState;
-    GPU_MASK gpusLockedMask = 0;
     const NvU32 not_run = 0xFFFFFFFFu;
 
     if (pOut == NULL)
@@ -928,21 +927,20 @@ NV_STATUS eclipse_rm_state_init(NvU32 gpuInstance, EclipseStateInitResult *pOut)
         return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
     }
 
-    /* gpuStatePreInit asserts rmGpuLockIsOwner(); hold API + GPU-group locks
-     * across all three phases, like RmInitAdapter's callers do. */
+    /*
+     * Hold ONLY the API lock here -- NOT the GPU locks. This was the silent
+     * 0x63: the gpumgrState*Gpu wrappers each open with
+     * rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, ...) (gpu_mgr.c) and acquire
+     * the GPU locks themselves around gpuStatePreInit/Init/Load (that is who
+     * satisfies gpuStatePreInit's rmGpuLockIsOwner assert). With our wrapper
+     * pre-holding the group lock, that acquire found the lock already
+     * running and returned NV_ERR_STATE_IN_USE (locks.c) without printing
+     * anything, before a single engine ran. RmInitNvDevice (osinit.c) calls
+     * these wrappers with only the API lock held -- match it exactly.
+     */
     status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
     if (status != NV_OK)
     {
-        gpumgrThreadDisableExpandedGpuVisibility();
-        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
-        return status;
-    }
-    status = rmGpuGroupLockAcquire(pGpu->gpuInstance, GPU_LOCK_GRP_SUBDEVICE,
-                                   GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT,
-                                   &gpusLockedMask);
-    if (status != NV_OK)
-    {
-        rmapiLockRelease();
         gpumgrThreadDisableExpandedGpuVisibility();
         threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
         return status;
@@ -988,7 +986,6 @@ NV_STATUS eclipse_rm_state_init(NvU32 gpuInstance, EclipseStateInitResult *pOut)
               pOut->loadStatus);
 
 unlock:
-    rmGpuGroupLockRelease(gpusLockedMask, GPUS_LOCK_FLAGS_NONE);
     rmapiLockRelease();
     gpumgrThreadDisableExpandedGpuVisibility();
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
