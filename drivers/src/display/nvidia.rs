@@ -2017,7 +2017,16 @@ impl DrmScheme for NvidiaGpu {
             cached
         } else {
             nvidia_rm_sys::os_interface::capture_begin();
+            // Live-echo state-init narration at ERROR level so it survives the
+            // default LOG=error filter and lands on the console AS IT RUNS.
+            // gpuStateInit currently faults on real hardware (NULL write at
+            // vaddr 0x90); the captured buffer is only folded into this /proc
+            // read on a clean return, so without live echo a fault prints
+            // nothing and we can't see which engine died. The last live
+            // "[nvidia-rm] ..." line before the panic pinpoints it.
+            nvidia_rm_sys::os_interface::live_echo_begin();
             let result = nvidia_rm_sys::rm_init::state_init(device_instance);
+            nvidia_rm_sys::os_interface::live_echo_end();
             let captured = nvidia_rm_sys::os_interface::capture_take();
             let mut block = String::new();
             if let Some(log) = captured {
