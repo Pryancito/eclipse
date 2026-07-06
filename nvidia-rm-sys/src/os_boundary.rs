@@ -1034,25 +1034,54 @@ pub extern "C" fn osMapPciMemoryAreaUser(arg0: *mut c_void, arg1: *mut c_void, a
 }
 
 #[no_mangle]
-pub extern "C" fn osMapPciMemoryKernel64(arg0: *mut c_void, arg1: NvU64, arg2: NvU64, arg3: NvU32, arg4: *mut c_void, arg5: NvU32) -> *mut c_void {
-    let _ = arg0;
-    let _ = arg1;
-    let _ = arg2;
-    let _ = arg3;
-    let _ = arg4;
-    let _ = arg5;
-    core::ptr::null_mut()
+pub extern "C" fn osMapPciMemoryKernel64(
+    _pGpu: *mut c_void,
+    busAddress: NvU64,
+    length: NvU64,
+    _protect: NvU32,
+    pVirtualAddress: *mut NvU64,
+    modeFlag: NvU32,
+) -> NV_STATUS {
+    // Real semantics (arch/nvalloc/unix/src/os.c): NV_STATUS return, kernel
+    // VA written through the NvP64 out-param, backed by os_map_kernel_space.
+    // The previous auto-generated stub returned NULL with a void* return
+    // type -- NULL reads as NV_OK while the out-param stayed garbage/NULL,
+    // which is exactly how kbusInitVirtualBar2 died with pMapping == NULL /
+    // 0x1A during gpuStateInit's KernelBus phase on real hardware: this is
+    // the function that maps the BAR2 PCI aperture for CPU access.
+    if pVirtualAddress.is_null() {
+        return NV_ERR_GENERIC;
+    }
+    let va = crate::os_interface::os_map_kernel_space(busAddress, length, modeFlag);
+    if va.is_null() {
+        return NV_ERR_GENERIC;
+    }
+    unsafe { *pVirtualAddress = va as usize as NvU64 };
+    NV_OK
 }
 
 #[no_mangle]
-pub extern "C" fn osMapPciMemoryKernelOld(arg0: *mut c_void, arg1: NvU64, arg2: NvU64, arg3: NvU32, arg4: *mut *mut c_void, arg5: NvU32) -> *mut c_void {
-    let _ = arg0;
-    let _ = arg1;
-    let _ = arg2;
-    let _ = arg3;
-    let _ = arg4;
-    let _ = arg5;
-    core::ptr::null_mut()
+pub extern "C" fn osMapPciMemoryKernelOld(
+    _pGpu: *mut c_void,
+    busAddress: NvU64,
+    length: NvU64,
+    _protect: NvU32,
+    pVirtualAddress: *mut *mut c_void,
+    modeFlag: NvU32,
+) -> NV_STATUS {
+    // Same contract as osMapPciMemoryKernel64 (see above), void** flavor.
+    // Linux additionally chains an nv_kern_mapping_t bookkeeping node for
+    // driver teardown; Eclipse never tears the driver down, and unmap goes
+    // straight to os_unmap_kernel_space, so no list is needed.
+    if pVirtualAddress.is_null() {
+        return NV_ERR_GENERIC;
+    }
+    let va = crate::os_interface::os_map_kernel_space(busAddress, length, modeFlag);
+    if va.is_null() {
+        return NV_ERR_GENERIC;
+    }
+    unsafe { *pVirtualAddress = va };
+    NV_OK
 }
 
 #[no_mangle]
