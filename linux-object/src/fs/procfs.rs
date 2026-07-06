@@ -14,10 +14,10 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 20] = [
+const PROC_ROOT_STATIC: [&str; 21] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
     "perf", "hunter", "filesystems", "gpudbg", "gpustep2", "gpustep3", "gpustep4", "gpustep5",
-    "gpustep6", "gpustep7",
+    "gpustep6", "gpustep7", "gpustep8",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -295,6 +295,7 @@ impl INode for ProcRootINode {
             "gpustep5" => Ok(PROC_GPUSTEP5.clone()),
             "gpustep6" => Ok(PROC_GPUSTEP6.clone()),
             "gpustep7" => Ok(PROC_GPUSTEP7.clone()),
+            "gpustep8" => Ok(PROC_GPUSTEP8.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
                 if let Ok(pid) = name.parse::<u64>() {
@@ -1144,6 +1145,19 @@ fn proc_gpustep7_content() -> String {
     s
 }
 
+/// `/proc/gpustep8` â RM API controls served by the live GSP-RM (name,
+/// UUID, FB heap total/free). Read-only; safe to cat repeatedly.
+fn proc_gpustep8_content() -> String {
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.bringup_step8());
+    }
+    if s.is_empty() {
+        s.push_str("[gpustep8] no DRM driver with bring-up support\n");
+    }
+    s
+}
+
 fn proc_cpuinfo_content() -> String {
     let mut brand = kernel_hal::cpu::cpu_brand();
     if brand.is_empty() {
@@ -1381,6 +1395,11 @@ lazy_static! {
     static ref PROC_GPUSTEP7: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 93,
         generate: proc_gpustep7_content,
+    });
+    /// `/proc/gpustep8` â live-GSP RM API control demo (see proc_gpustep8_content).
+    static ref PROC_GPUSTEP8: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 92,
+        generate: proc_gpustep8_content,
     });
     static ref PROC_SWAPS: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 18,

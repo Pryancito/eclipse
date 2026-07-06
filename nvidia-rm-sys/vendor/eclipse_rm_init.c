@@ -48,6 +48,8 @@
 #include "core/thread_state.h"
 #include "gpu/gsp/kernel_gsp.h"
 #include "gpu/gpu_timeout.h"
+#include "ctrl/ctrl2080/ctrl2080gpu.h"
+#include "ctrl/ctrl2080/ctrl2080fb.h"
 #include "os/os.h"
 #include "tls/tls.h"
 #include "g_hal_register.h"
@@ -679,4 +681,181 @@ NV_STATUS eclipse_rm_get_gsp_info(NvU32 gpuInstance, EclipseGspInfo *pInfo)
 
     gpumgrThreadDisableExpandedGpuVisibility();
     return NV_OK;
+}
+
+/*
+ * Step-8: real RM API controls served by the live GSP-RM's own resource
+ * server. On a GSP client, GPU_GET_PHYSICAL_RMAPI(pGpu)->Control was
+ * replaced at attach time (initRpcObject -> rpcRmApiSetup, rpc_common.c)
+ * with rpcRmApiControl_GSP -- a direct NV_VGPU_MSG_FUNCTION_GSP_RM_CONTROL
+ * RPC that GSP-RM executes against ITS resource-server objects. The client/
+ * subdevice handles for that are the GSP-side internal handles GSP-RM
+ * advertised in GspStaticConfigInfo -- normally adopted into pGpu by
+ * _gpuAllocateInternalObjects during gpuStatePreInit (gpu.c), which
+ * Eclipse's minimal bring-up has not run, so adopt them here the same way.
+ *
+ * Three read-only controls, chosen to be served entirely by the firmware:
+ * GPU name string, GPU GID/UUID (GSP computes it), and FB heap total/free
+ * (dynamic data straight out of GSP-RM's live heap bookkeeping).
+ */
+typedef struct EclipseRmApiDemo
+{
+    NvU32 nameStatus;
+    NvU8  name[64];
+    NvU32 gidStatus;
+    NvU32 gidLength;
+    NvU8  gid[136];
+    NvU32 fbStatus;
+    NvU32 heapSizeKb;
+    NvU32 heapFreeKb;
+    NvU32 busWidth;
+} EclipseRmApiDemo;
+
+NV_STATUS eclipse_rm_step8(NvU32 gpuInstance, EclipseRmApiDemo *pOut)
+{
+    OBJGPU *pGpu;
+    RM_API *pRmApi;
+    NV_STATUS status;
+    THREAD_STATE_NODE threadState;
+    GPU_MASK gpusLockedMask = 0;
+
+    if (pOut == NULL)
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    portMemSet(pOut, 0, sizeof(*pOut));
+    pOut->nameStatus = NV_ERR_NOT_READY;
+    pOut->gidStatus  = NV_ERR_NOT_READY;
+    pOut->fbStatus   = NV_ERR_NOT_READY;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pGpu = gpumgrGetGpu(gpuInstance);
+    if (pGpu == NULL || !pGpu->gspRmInitialized)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
+    }
+
+    /*
+     * Hold the API lock and this GPU's group lock across the RPC controls:
+     * rpcWriteCommonHeader asserts rmDeviceGpuLockIsOwner, and
+     * rpcRmApiControl_GSP only self-acquires (with a warning) as a fallback.
+     */
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    status = rmGpuGroupLockAcquire(pGpu->gpuInstance, GPU_LOCK_GRP_SUBDEVICE,
+                                   GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT,
+                                   &gpusLockedMask);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    /* Adopt the GSP-side internal handles (gpuStatePreInit's GSP-client
+     * branch of _gpuAllocateInternalObjects, which we never ran). */
+    if (pGpu->hInternalClient == 0)
+    {
+        GspStaticConfigInfo *pGSCI = GPU_GET_GSP_STATIC_INFO(pGpu);
+        if (pGSCI == NULL || pGSCI->hInternalClient == 0)
+        {
+            status = NV_ERR_INVALID_STATE;
+            goto unlock;
+        }
+        pGpu->hInternalClient = pGSCI->hInternalClient;
+        pGpu->hInternalDevice = pGSCI->hInternalDevice;
+        pGpu->hInternalSubdevice = pGSCI->hInternalSubdevice;
+        rmapiControlCacheSetGpuAttrForObject(pGpu->hInternalClient,
+                                             pGpu->hInternalSubdevice, pGpu);
+        rmapiControlCacheSetGpuAttrForObject(pGpu->hInternalClient,
+                                             pGpu->hInternalDevice, pGpu);
+        nv_printf(0, "[eclipse-rm-trace] step8: adopted GSP internal handles client=0x%x subdevice=0x%x\n",
+                  pGpu->hInternalClient, pGpu->hInternalSubdevice);
+    }
+
+    pRmApi = GPU_GET_PHYSICAL_RMAPI(pGpu);
+
+    {
+        NV2080_CTRL_GPU_GET_NAME_STRING_PARAMS nameParams;
+        portMemSet(&nameParams, 0, sizeof(nameParams));
+        nameParams.gpuNameStringFlags = NV2080_CTRL_GPU_GET_NAME_STRING_FLAGS_TYPE_ASCII;
+        pOut->nameStatus = pRmApi->Control(pRmApi, pGpu->hInternalClient,
+                                           pGpu->hInternalSubdevice,
+                                           NV2080_CTRL_CMD_GPU_GET_NAME_STRING,
+                                           &nameParams, sizeof(nameParams));
+        nv_printf(0, "[eclipse-rm-trace] step8: GET_NAME_STRING -> 0x%x\n", pOut->nameStatus);
+        if (pOut->nameStatus == NV_OK)
+        {
+            portMemCopy(pOut->name, sizeof(pOut->name) - 1,
+                        nameParams.gpuNameString.ascii, sizeof(pOut->name) - 1);
+        }
+    }
+
+    {
+        NV2080_CTRL_GPU_GET_GID_INFO_PARAMS gidParams;
+        portMemSet(&gidParams, 0, sizeof(gidParams));
+        gidParams.index = 0;
+        gidParams.flags = NV2080_GPU_CMD_GPU_GET_GID_FLAGS_FORMAT_ASCII;
+        pOut->gidStatus = pRmApi->Control(pRmApi, pGpu->hInternalClient,
+                                          pGpu->hInternalSubdevice,
+                                          NV2080_CTRL_CMD_GPU_GET_GID_INFO,
+                                          &gidParams, sizeof(gidParams));
+        nv_printf(0, "[eclipse-rm-trace] step8: GET_GID_INFO -> 0x%x (len %u)\n",
+                  pOut->gidStatus, gidParams.length);
+        if (pOut->gidStatus == NV_OK)
+        {
+            NvU32 n = gidParams.length;
+            if (n > sizeof(pOut->gid) - 1)
+            {
+                n = sizeof(pOut->gid) - 1;
+            }
+            portMemCopy(pOut->gid, n, gidParams.data, n);
+            pOut->gidLength = n;
+        }
+    }
+
+    {
+        NV2080_CTRL_FB_GET_INFO_V2_PARAMS fbParams;
+        portMemSet(&fbParams, 0, sizeof(fbParams));
+        fbParams.fbInfoListSize = 3;
+        fbParams.fbInfoList[0].index = NV2080_CTRL_FB_INFO_INDEX_HEAP_SIZE;
+        fbParams.fbInfoList[1].index = NV2080_CTRL_FB_INFO_INDEX_HEAP_FREE;
+        fbParams.fbInfoList[2].index = NV2080_CTRL_FB_INFO_INDEX_BUS_WIDTH;
+        pOut->fbStatus = pRmApi->Control(pRmApi, pGpu->hInternalClient,
+                                         pGpu->hInternalSubdevice,
+                                         NV2080_CTRL_CMD_FB_GET_INFO_V2,
+                                         &fbParams, sizeof(fbParams));
+        nv_printf(0, "[eclipse-rm-trace] step8: FB_GET_INFO_V2 -> 0x%x\n", pOut->fbStatus);
+        if (pOut->fbStatus == NV_OK)
+        {
+            pOut->heapSizeKb = fbParams.fbInfoList[0].data;
+            pOut->heapFreeKb = fbParams.fbInfoList[1].data;
+            pOut->busWidth   = fbParams.fbInfoList[2].data;
+        }
+    }
+
+    status = NV_OK;
+
+unlock:
+    rmGpuGroupLockRelease(gpusLockedMask, GPUS_LOCK_FLAGS_NONE);
+    rmapiLockRelease();
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
 }

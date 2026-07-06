@@ -1915,6 +1915,71 @@ impl DrmScheme for NvidiaGpu {
         s
     }
 
+    /// Step 8: three read-only RM API controls answered by the live GSP-RM's
+    /// resource server (GSP_RM_CONTROL RPC): GPU name, GID/UUID, FB heap
+    /// total/free. heap_free is dynamic firmware bookkeeping -- proof of a
+    /// live, working RM API path end-to-end. Safe to run repeatedly.
+    fn bringup_step8(&self) -> String {
+        use core::fmt::Write;
+        let mut s = String::new();
+        let device_instance = *self.rm_device_instance.lock();
+        let Some(device_instance) = device_instance else {
+            return String::from("[gpustep8]  skipped (run /proc/gpustep5 (RM attach) first)\n");
+        };
+        nvidia_rm_sys::os_interface::capture_begin();
+        let result = nvidia_rm_sys::rm_init::rm_api_demo(device_instance);
+        let captured = nvidia_rm_sys::os_interface::capture_take();
+        if let Some(log) = captured {
+            for line in log.lines() {
+                let _ = writeln!(s, "[gpustep8]  | {}", line);
+            }
+        }
+        match result {
+            Ok(demo) => {
+                let _ = writeln!(s, "[gpustep8]  --- RM API controls served by live GSP-RM (GSP_RM_CONTROL RPC) ---");
+                if demo.name_status == 0 {
+                    let n = demo.name.iter().position(|&b| b == 0).unwrap_or(64);
+                    let _ = writeln!(
+                        s,
+                        "[gpustep8]  GET_NAME_STRING: {}",
+                        core::str::from_utf8(&demo.name[..n]).unwrap_or("<non-utf8>")
+                    );
+                } else {
+                    let _ = writeln!(s, "[gpustep8]  GET_NAME_STRING: NV_STATUS={:#x}", demo.name_status);
+                }
+                if demo.gid_status == 0 {
+                    let n = (demo.gid_length as usize).min(demo.gid.len());
+                    let _ = writeln!(
+                        s,
+                        "[gpustep8]  GET_GID_INFO (UUID): {}",
+                        core::str::from_utf8(&demo.gid[..n]).unwrap_or("<non-utf8>")
+                    );
+                } else {
+                    let _ = writeln!(s, "[gpustep8]  GET_GID_INFO: NV_STATUS={:#x}", demo.gid_status);
+                }
+                if demo.fb_status == 0 {
+                    let _ = writeln!(
+                        s,
+                        "[gpustep8]  FB_GET_INFO_V2: heap {} MiB total, {} MiB free, bus width {} bits",
+                        demo.heap_size_kb / 1024,
+                        demo.heap_free_kb / 1024,
+                        demo.bus_width
+                    );
+                } else {
+                    let _ = writeln!(s, "[gpustep8]  FB_GET_INFO_V2: NV_STATUS={:#x}", demo.fb_status);
+                }
+            }
+            Err(status) => {
+                let _ = writeln!(
+                    s,
+                    "[gpustep8]  eclipse_rm_step8 FAILED, NV_STATUS={:#x} (GSP not booted? run /proc/gpustep6)",
+                    status
+                );
+            }
+        }
+        s
+    }
+
     /// Step 6 (`/proc/gpustep6`), NOT read-only and NOT part of `/proc/gpudbg`:
     /// first real invocation of `kgspInitRm` (kernel_gsp.c) -- the deepest,
     /// riskiest bring-up step yet (VBIOS/FWSEC extraction, Booter ucode
