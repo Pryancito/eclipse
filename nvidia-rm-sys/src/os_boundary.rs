@@ -371,16 +371,21 @@ pub extern "C" fn osDevReadReg032(_pGpu: *mut c_void, pMapping: *mut c_void, thi
     // (SET_GUEST_SYSTEM_INFO -> GspMsgQueueSendCommand -> queue-head write).
     // Gating avoids burning the line cap on the hundreds of GSP-falcon
     // accesses the earlier bootstrap performs.
+    // GSP-falcon (GSPF) probe logging RETIRED: the one register it kept
+    // catching post-boot is 0x110c00 = NV_PGSP_QUEUE_HEAD(0), the normal
+    // per-RPC doorbell (kgspSetCmdQueueHead writes it 0 after every
+    // GspMsgQueueSendCommand). During step-9 gpuStateLoad that floods the
+    // console with hundreds of identical "GSPF ... 0x110c00" lines and buries
+    // the eng_state transition trace that names the crashing engine. The SEC2
+    // boot-hang this probe was added for is solved, so drop GSPF entirely and
+    // keep only the SEC2/BSI apertures (boot-only, capped, don't fire here).
     let is_sec2 = this_address >= 0x0084_0000 && this_address < 0x0084_4000;
     let is_bsi = this_address >= 0x0011_8000 && this_address < 0x0011_8200;
-    let is_gsp = this_address >= 0x0011_0000
-        && this_address < 0x0011_2000
-        && GSP_PROBE_ON.load(core::sync::atomic::Ordering::Relaxed);
-    if is_sec2 || is_bsi || is_gsp {
+    if is_sec2 || is_bsi {
         use core::sync::atomic::{AtomicU32, Ordering};
         static PROBE_RD_LOGS: AtomicU32 = AtomicU32::new(0);
         if PROBE_RD_LOGS.fetch_add(1, Ordering::Relaxed) < 160 {
-            let tag = if is_bsi { "BSI" } else if is_gsp { "GSPF" } else { "SEC2" };
+            let tag = if is_bsi { "BSI" } else { "SEC2" };
             log::warn!("[nvidia-rm] {} RD off={:#x} (about to deref)", tag, this_address);
         }
     }
@@ -388,11 +393,11 @@ pub extern "C" fn osDevReadReg032(_pGpu: *mut c_void, pMapping: *mut c_void, thi
         Some(base) => unsafe { core::ptr::read_volatile(base.add(this_address as usize) as *const NvU32) },
         None => 0xFFFF_FFFF,
     };
-    if is_sec2 || is_bsi || is_gsp {
+    if is_sec2 || is_bsi {
         use core::sync::atomic::{AtomicU32, Ordering};
         static PROBE_RD_DONE: AtomicU32 = AtomicU32::new(0);
         if PROBE_RD_DONE.fetch_add(1, Ordering::Relaxed) < 160 {
-            let tag = if is_bsi { "BSI" } else if is_gsp { "GSPF" } else { "SEC2" };
+            let tag = if is_bsi { "BSI" } else { "SEC2" };
             log::warn!("[nvidia-rm] {} RD off={:#x} = {:#x}", tag, this_address, v);
         }
     }
@@ -424,18 +429,17 @@ pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, th
     // hundreds of ucode DWORD writes flood the console and exhaust the cap
     // before CORE_RESUME. STARTCPU goes to CPUCTL_ALIAS (0x130), so this shows
     // it and nothing noisy.
+    // GSPF write logging retired for the same reason as the read probe above
+    // (0x110c00 = NV_PGSP_QUEUE_HEAD RPC doorbell floods step-9 postLoad).
+    // Keep only the SEC2 falcon *control* registers (boot-only, capped).
     let is_sec2 = this_address >= 0x0084_0000 && this_address < 0x0084_4000;
-    let is_gsp_wr = this_address >= 0x0011_0000
-        && this_address < 0x0011_2000
-        && GSP_PROBE_ON.load(core::sync::atomic::Ordering::Relaxed);
-    if (is_sec2 && (this_address & 0xffff) < 0x0180) || is_gsp_wr {
+    if is_sec2 && (this_address & 0xffff) < 0x0180 {
         use core::sync::atomic::{AtomicU32, Ordering};
         static SEC2_WR_LOGS: AtomicU32 = AtomicU32::new(0);
         if SEC2_WR_LOGS.fetch_add(1, Ordering::Relaxed) < 200 {
-            let tag = if is_gsp_wr { "GSPF" } else { "SEC2" };
             // Logged BEFORE the store: if the posted write itself wedges the
             // CPU, the last line on screen names the exact register.
-            log::warn!("[nvidia-rm] {} WR off={:#x} <= {:#x}", tag, this_address, this_value);
+            log::warn!("[nvidia-rm] SEC2 WR off={:#x} <= {:#x}", this_address, this_value);
         }
     }
     // STARTCPU bracket. Observed on real hardware: the last line that ever
