@@ -180,7 +180,15 @@ NV_STATUS eclipse_rm_init_core(void)
          * does not flood a boot that hangs before then. gpu.c/gpu_mgr.c stay
          * for the attach (gpustep5) narration.
          */
-        static const char rule[] = "gpu.c,gpu_mgr.c,kernel_gsp,kernel_falcon";
+        /*
+         * eng_state.c added for step 9: gpuStatePreInit failed with a silent
+         * NV_ERR_STATE_IN_USE (0x63) from some engine's StatePreInit (no
+         * assert printed). engstateLogStateTransitionPost prints
+         * "Engine %s state change: ..." at LEVEL_INFO for every engine the
+         * state machine touches, so with this rule the LAST engine line
+         * before the 0x63 names the culprit.
+         */
+        static const char rule[] = "gpu.c,gpu_mgr.c,kernel_gsp,kernel_falcon,eng_state.c";
         unsigned int i;
         for (i = 0; rule[i] != '\0'; i++)
         {
