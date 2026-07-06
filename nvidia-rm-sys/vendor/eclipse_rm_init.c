@@ -209,6 +209,10 @@ NV_STATUS eclipse_rm_init_core(void)
  * bar1_phys/bar1_len: BAR1, the framebuffer/VRAM aperture (not mapped
  * by Eclipse ahead of time the way BAR0 is, matching
  * osInitNvMapping's own `fbBaseAddr = (GPUHWREG*) 0 // not mapped`).
+ * bar2_phys/bar2_len: BAR2 (NVIDIA logical index IMEM), the small
+ * instance-memory aperture. Becomes GPUATTACHARG.instPhysAddr/instLength,
+ * matching osinit.c:708 (nv->bars[NV_GPU_BAR_INDEX_IMEM]); required for the
+ * BAR2 MMU self-test (kbusVerifyBar2) during gpuStateInit.
  */
 static NV_STATUS _eclipse_rm_attach_gpu_body(
     NvU32 domain,
@@ -219,6 +223,8 @@ static NV_STATUS _eclipse_rm_attach_gpu_body(
     NvU64 bar0_len,
     NvU64 bar1_phys,
     NvU64 bar1_len,
+    NvU64 bar2_phys,
+    NvU64 bar2_len,
     NvU32 *pDeviceInstance)
 {
     NvU32 gpuInstance = 0;
@@ -330,9 +336,18 @@ static NV_STATUS _eclipse_rm_attach_gpu_body(
     gpuAttachArg.fbPhysAddr            = bar1_phys;
     gpuAttachArg.fbBaseAddr            = (GPUHWREG *)0; /* not mapped, same as real driver */
     gpuAttachArg.fbLength              = bar1_len;
-    gpuAttachArg.instPhysAddr          = 0;
-    gpuAttachArg.instBaseAddr          = (GPUHWREG *)0;
-    gpuAttachArg.instLength            = 0;
+    /*
+     * BAR2 / IMEM instance-memory aperture. osinit.c:708 sets
+     * instPhysAddr = nv->bars[NV_GPU_BAR_INDEX_IMEM].cpu_address,
+     * instBaseAddr = 0 (not mapped), instLength = that BAR's size. RM
+     * programs BAR2 from instPhysAddr; without it kbusVerifyBar2_GM107's
+     * MMU self-test write cannot reach VRAM and gpuStateInit fails 0x72.
+     */
+    gpuAttachArg.instPhysAddr          = bar2_phys;
+    gpuAttachArg.instBaseAddr          = (GPUHWREG *)0; /* not mapped, same as real driver */
+    gpuAttachArg.instLength            = bar2_len;
+    nv_printf(0, "[eclipse-rm-trace] attach_gpu: BAR2/IMEM instPhysAddr=0x%llx instLength=0x%llx\n",
+              (unsigned long long)bar2_phys, (unsigned long long)bar2_len);
     gpuAttachArg.intLine               = 0;
     gpuAttachArg.nvDomainBusDeviceFunc = gpuEncodeDomainBusDevice(domain, bus, device);
     // NV_IOVA_DOMAIN_NONE/NV0000_CTRL_NO_NUMA_NODE live in headers this
@@ -426,6 +441,8 @@ NV_STATUS eclipse_rm_attach_gpu(
     NvU64 bar0_len,
     NvU64 bar1_phys,
     NvU64 bar1_len,
+    NvU64 bar2_phys,
+    NvU64 bar2_len,
     NvU32 *pDeviceInstance)
 {
     THREAD_STATE_NODE threadState;
@@ -434,7 +451,8 @@ NV_STATUS eclipse_rm_attach_gpu(
     threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
     status = _eclipse_rm_attach_gpu_body(domain, bus, device,
                                          bar0_phys, bar0_virt, bar0_len,
-                                         bar1_phys, bar1_len, pDeviceInstance);
+                                         bar1_phys, bar1_len,
+                                         bar2_phys, bar2_len, pDeviceInstance);
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
     return status;
 }

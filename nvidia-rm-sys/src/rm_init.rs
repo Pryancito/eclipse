@@ -19,6 +19,8 @@ extern "C" {
         bar0_len: NvU64,
         bar1_phys: NvU64,
         bar1_len: NvU64,
+        bar2_phys: NvU64,
+        bar2_len: NvU64,
         out_device_instance: *mut NvU32,
     ) -> NV_STATUS;
 
@@ -31,14 +33,17 @@ pub fn init_core() -> NV_STATUS {
     unsafe { eclipse_rm_init_core() }
 }
 
-/// Attaches a GPU to RM by its real PCI location and BAR0/BAR1
+/// Attaches a GPU to RM by its real PCI location and BAR0/BAR1/BAR2
 /// physical/virtual addresses, mirroring what NVIDIA's own
 /// `osInitNvMapping` packages into a `GPUATTACHARG`. `bar0_virt` must
-/// already be mapped (Eclipse maps BAR0 during PCI probe); BAR1 is
-/// passed as a physical address only, same as the real driver
-/// (`fbBaseAddr = NULL // not mapped`).
+/// already be mapped (Eclipse maps BAR0 during PCI probe); BAR1 (FB) and
+/// BAR2 (IMEM) are passed as physical addresses only, same as the real
+/// driver (`fbBaseAddr`/`instBaseAddr = NULL // not mapped`). BAR2 becomes
+/// `GPUATTACHARG.instPhysAddr`/`instLength`, required by the BAR2 MMU
+/// self-test in `gpuStateInit` (osinit.c:708).
 ///
 /// Returns the real RM device instance on success.
+#[allow(clippy::too_many_arguments)]
 pub fn attach_gpu(
     domain: u32,
     bus: u8,
@@ -48,6 +53,8 @@ pub fn attach_gpu(
     bar0_len: u64,
     bar1_phys: u64,
     bar1_len: u64,
+    bar2_phys: u64,
+    bar2_len: u64,
 ) -> Result<u32, NV_STATUS> {
     let mut device_instance: NvU32 = 0;
     let status = unsafe {
@@ -60,6 +67,8 @@ pub fn attach_gpu(
             bar0_len,
             bar1_phys,
             bar1_len,
+            bar2_phys,
+            bar2_len,
             &mut device_instance,
         )
     };

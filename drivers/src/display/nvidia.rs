@@ -438,6 +438,15 @@ pub struct NvidiaGpu {
     /// same info NVIDIA's own osInitNvMapping packages from nv_state_t).
     bar0_phys: u64,
     bar0_len: u64,
+    /// Physical base and size of BAR2 (NVIDIA logical index `IMEM`, the small
+    /// ~32 MiB "instance memory" aperture -- PCI BAR3 on Turing). RM needs this
+    /// as `GPUATTACHARG.instPhysAddr`/`instLength`: without it, `kbusVerifyBar2`
+    /// (kern_bus_gm107.c) has no BAR2 physical aperture to program, its MMU
+    /// self-test write never lands in VRAM, and `gpumgrStateInitGpu` fails with
+    /// NV_ERR_MEMORY_ERROR (0x72). Matches osinit.c:708
+    /// (`nv->bars[NV_GPU_BAR_INDEX_IMEM]`).
+    bar2_phys: u64,
+    bar2_len: u64,
     pci_domain: u32,
     pci_bus: u8,
     pci_device: u8,
@@ -588,6 +597,8 @@ impl NvidiaGpu {
         default_height: u32,
         bar0_phys: u64,
         bar0_len: u64,
+        bar2_phys: u64,
+        bar2_len: u64,
         pci_domain: u32,
         pci_bus: u8,
         pci_device: u8,
@@ -673,6 +684,8 @@ impl NvidiaGpu {
             bar1_phys,
             bar0_phys,
             bar0_len,
+            bar2_phys,
+            bar2_len,
             pci_domain,
             pci_bus,
             pci_device,
@@ -1829,6 +1842,8 @@ impl DrmScheme for NvidiaGpu {
                     self.bar0_len,
                     self.bar1_phys,
                     self.vram_size_mb as u64 * 1024 * 1024,
+                    self.bar2_phys,
+                    self.bar2_len,
                 ) {
                     Ok(device_instance) => {
                         *self.rm_device_instance.lock() = Some(device_instance);
@@ -3076,27 +3091,60 @@ impl PciDriver for NvidiaGpuDriverPci {
         }
         let bar0_vaddr = phys_to_virt(bar0_addr as usize);
 
-        let fb_bar = (1..6usize).find_map(|i| {
-            if let Some(BAR::Memory(addr, len, _, _)) = dev.bars[i] {
-                if addr == 0 {
-                    return None;
+        // Compact the six raw PCI BAR slots into the ordered list of populated
+        // *memory* BARs, exactly as NVIDIA's own nv-pci.c does (it walks the PCI
+        // resources and assigns each valid memory BAR to nv->bars[j++]). A
+        // 64-bit BAR occupies one slot here and leaves the next `None`, so this
+        // walk yields the same logical ordering NVIDIA uses:
+        //   index 0 = REGS (16 MiB registers), 1 = FB (VRAM window),
+        //   index 2 = IMEM (the ~32 MiB instance-memory aperture).
+        // Do NOT probe BAR sizes here (writing 0xFFFFFFFF to a BAR register can
+        // wedge config space on some GPUs and hang the machine); the lengths
+        // already came from the bus's one-time enumeration.
+        let mem_bars: Vec<(u64, u64)> = (0..6usize)
+            .filter_map(|i| {
+                if let Some(BAR::Memory(addr, len, _, _)) = dev.bars[i] {
+                    if addr != 0 {
+                        return Some((addr, len as u64));
+                    }
                 }
-                // Do not probe BAR size at boot (writes 0xFFFFFFFF to BAR registers);
-                // on some GPUs that wedges config space and hangs the machine.
-                let actual_len: u64 = if len == 0 {
-                    256 * 1024 * 1024
-                } else {
-                    len as u64
-                };
-                if actual_len >= (16 * 1024 * 1024) {
-                    Some((addr, actual_len))
-                } else {
-                    None
-                }
-            } else {
                 None
-            }
-        });
+            })
+            .collect();
+
+        // FB is the second memory BAR (index 1); fall back to a size-based
+        // search for the first >= 16 MiB aperture past REGS if the ordering is
+        // unexpected, matching the previous behaviour.
+        let fb_bar = mem_bars
+            .get(1)
+            .map(|&(addr, len)| {
+                (
+                    addr,
+                    if len == 0 { 256 * 1024 * 1024 } else { len },
+                )
+            })
+            .filter(|&(_, len)| len >= (16 * 1024 * 1024))
+            .or_else(|| {
+                mem_bars.iter().skip(1).find_map(|&(addr, len)| {
+                    let actual_len = if len == 0 { 256 * 1024 * 1024 } else { len };
+                    (actual_len >= (16 * 1024 * 1024)).then_some((addr, actual_len))
+                })
+            });
+
+        // IMEM/BAR2 is the third memory BAR (index 2). RM needs its physical
+        // base+size as GPUATTACHARG.instPhysAddr/instLength for the BAR2 MMU
+        // self-test in gpuStateInit; 0/0 if the GPU somehow exposes fewer than
+        // three memory BARs (then the BAR2 test will still fail, but attach and
+        // the earlier steps stay intact).
+        let (imem_phys, imem_len) = mem_bars
+            .get(2)
+            .map(|&(addr, len)| {
+                (
+                    addr,
+                    if len == 0 { 32 * 1024 * 1024 } else { len },
+                )
+            })
+            .unwrap_or((0, 0));
 
         if let Some((fb_addr, fb_len)) = fb_bar {
             if let Some(m) = mapper {
@@ -3111,11 +3159,13 @@ impl PciDriver for NvidiaGpuDriverPci {
                 dev.loc.function
             );
             log::warn!(
-                "[NVIDIA] GPU at {} bar0={:#x} fb={:#x} fb_len={:#x}",
+                "[NVIDIA] GPU at {} bar0={:#x} fb={:#x} fb_len={:#x} imem={:#x} imem_len={:#x}",
                 gpu_name,
                 bar0_addr,
                 fb_addr,
-                fb_len
+                fb_len,
+                imem_phys,
+                imem_len
             );
             let gpu = Arc::new(NvidiaGpu::new(
                 gpu_name,
@@ -3128,6 +3178,8 @@ impl PciDriver for NvidiaGpuDriverPci {
                 1080,
                 bar0_addr,
                 bar0_map_len,
+                imem_phys,
+                imem_len,
                 0, // PCI domain: Eclipse only tracks bus/device/function, single-segment system
                 dev.loc.bus,
                 dev.loc.device,
