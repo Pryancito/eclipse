@@ -971,7 +971,7 @@ NV_STATUS eclipse_rm_state_init(NvU32 gpuInstance, EclipseStateInitResult *pOut)
      * this string whenever step-9 diagnostics change so the output
      * self-identifies which build produced it.
      */
-    ECLIPSE_TRACE("state_init: narration v2 (eng_state.c engine trace enabled)");
+    ECLIPSE_TRACE("state_init: narration v3 (live ERROR-level echo; last 'Engine X state change' line = last engine that finished StateInit, crasher is the next one)");
     ECLIPSE_TRACE("state_init: before gpumgrStatePreInitGpu");
     pOut->preInitStatus = gpumgrStatePreInitGpu(pGpu);
     nv_printf(0, "[eclipse-rm-trace] state_init: gpumgrStatePreInitGpu -> 0x%x\n",

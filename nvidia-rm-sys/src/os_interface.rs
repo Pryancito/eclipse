@@ -497,6 +497,26 @@ pub extern "C" fn os_dump_stack() {
 // chatty RmMsg rule can't grow it without limit.
 // ---------------------------------------------------------------------
 static LOG_CAPTURE: Mutex<Option<String>> = Mutex::new(None);
+
+// When set, RM narration is echoed at ERROR level (not WARN) so it survives
+// the kernel's default `LOG=error` max-level filter and reaches the live
+// console. This is the ONLY way to see how far a *crashing* RM path got: the
+// capture buffer (folded into the /proc read) is only emitted on a clean
+// return, so a page fault mid-step loses it entirely. Scoped by the caller
+// (live_echo_begin/end) around a risky step (e.g. gpuStateInit) so the far
+// chattier, non-crashing GSP-boot narration isn't dumped live every boot.
+static LIVE_ECHO: AtomicBool = AtomicBool::new(false);
+
+/// Echo subsequent RM narration at ERROR level so it passes `LOG=error` and
+/// appears live on the console. Pair with `live_echo_end`.
+pub fn live_echo_begin() {
+    LIVE_ECHO.store(true, Ordering::Relaxed);
+}
+
+/// Stop live-echoing RM narration.
+pub fn live_echo_end() {
+    LIVE_ECHO.store(false, Ordering::Relaxed);
+}
 // Generous cap: the GSP-RM boot path (gpustep6) narrates far more than the
 // attach path, and the whole buffer is folded into the /proc read (which is
 // offset-chunked, so size is not a problem). Bounded only so a runaway loop
@@ -544,7 +564,14 @@ fn log_raw_cstr(str_: *const c_char) {
         }
         let slice = core::slice::from_raw_parts(str_ as *const u8, len);
         if let Ok(s) = core::str::from_utf8(slice) {
-            log::warn!("[nvidia-rm] {}", s);
+            // ERROR level when live-echo is armed (default LOG=error filters
+            // WARN, so a crashing step would otherwise print nothing live);
+            // WARN otherwise, same as before.
+            if LIVE_ECHO.load(Ordering::Relaxed) {
+                log::error!("[nvidia-rm] {}", s);
+            } else {
+                log::warn!("[nvidia-rm] {}", s);
+            }
             capture_push(s);
         }
     }
