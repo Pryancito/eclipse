@@ -142,6 +142,14 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Bring-up **Step 9** (`/proc/gpustep9`): the rest of the real
+    /// RmInitAdapter sequence -- gpuStatePreInit/StateInit/StateLoad for all
+    /// kernel-side engines against the live GSP. Destructive/one-shot per
+    /// boot (result cached). Default: nothing.
+    fn bringup_step9(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Import a buffer allocated by the kernel (DRM core)
     fn import_buffer(&self, _handle: GemHandle) -> bool {
         true
