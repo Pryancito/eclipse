@@ -135,6 +135,13 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Bring-up **Step 8** (`/proc/gpustep8`): read-only RM API controls
+    /// (GPU name, UUID, FB heap total/free) executed by the live GSP-RM's
+    /// own resource server over the GSP_RM_CONTROL RPC. Default: nothing.
+    fn bringup_step8(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Import a buffer allocated by the kernel (DRM core)
     fn import_buffer(&self, _handle: GemHandle) -> bool {
         true

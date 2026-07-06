@@ -133,3 +133,46 @@ pub fn get_gsp_info(device_instance: u32) -> Result<GspInfo, NV_STATUS> {
         Err(status)
     }
 }
+
+/// Fixed-layout mirror of `EclipseRmApiDemo` (vendor/eclipse_rm_init.c):
+/// results of three read-only RM API controls executed by the live GSP-RM's
+/// own resource server via `rpcRmApiControl_GSP` (the GSP_RM_CONTROL RPC).
+/// Each control carries its own NV_STATUS so partial success is visible.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RmApiDemo {
+    pub name_status: NV_STATUS,
+    pub name: [u8; 64],
+    pub gid_status: NV_STATUS,
+    pub gid_length: NvU32,
+    pub gid: [u8; 136],
+    pub fb_status: NV_STATUS,
+    pub heap_size_kb: NvU32,
+    pub heap_free_kb: NvU32,
+    pub bus_width: NvU32,
+}
+
+extern "C" {
+    fn eclipse_rm_step8(device_instance: NvU32, out: *mut RmApiDemo) -> NV_STATUS;
+}
+
+/// Runs the step-8 RM-API-control demo against the live GSP.
+pub fn rm_api_demo(device_instance: u32) -> Result<RmApiDemo, NV_STATUS> {
+    let mut out = RmApiDemo {
+        name_status: 0,
+        name: [0; 64],
+        gid_status: 0,
+        gid_length: 0,
+        gid: [0; 136],
+        fb_status: 0,
+        heap_size_kb: 0,
+        heap_free_kb: 0,
+        bus_width: 0,
+    };
+    let status = unsafe { eclipse_rm_step8(device_instance, &mut out) };
+    if status == NV_OK {
+        Ok(out)
+    } else {
+        Err(status)
+    }
+}
