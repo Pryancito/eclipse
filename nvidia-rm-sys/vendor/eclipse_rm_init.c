@@ -859,3 +859,122 @@ unlock:
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
     return status;
 }
+
+/*
+ * Step-9: the rest of the real RmInitAdapter device bring-up
+ * (arch/nvalloc/unix/src/osinit.c, RmInitNvDevice), run after kgspInitRm
+ * exactly like the Linux driver does:
+ *
+ *   gpumgrStatePreInitGpu -> gpumgrStateInitGpu ->
+ *   intrSetIntrEn(DISABLED) -> gpumgrStateLoadGpu(GPU_STATE_DEFAULT)
+ *
+ * This runs every kernel-side engine's StatePreInit/StateInit/StateLoad
+ * against the live GSP (FIFO, GMMU, bus/BAR mappings, memory manager, CE,
+ * ...) -- the gateway to actually using the GPU. Interrupts are explicitly
+ * left DISABLED (same call the real driver makes before StateLoad), which
+ * also matches Eclipse's fully-polled operation. Each phase's status is
+ * reported separately so a failure names its phase; the RM's own
+ * LEVEL_ERROR prints (and our RmMsg-enabled files) land in the /proc
+ * capture for the exact failing engine.
+ */
+#include "gpu/intr/intr.h"
+
+typedef struct EclipseStateInitResult
+{
+    NvU32 preInitStatus;
+    NvU32 initStatus;
+    NvU32 loadStatus;
+} EclipseStateInitResult;
+
+NV_STATUS eclipse_rm_state_init(NvU32 gpuInstance, EclipseStateInitResult *pOut)
+{
+    OBJGPU *pGpu;
+    Intr *pIntr;
+    NV_STATUS status;
+    THREAD_STATE_NODE threadState;
+    GPU_MASK gpusLockedMask = 0;
+    const NvU32 not_run = 0xFFFFFFFFu;
+
+    if (pOut == NULL)
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    pOut->preInitStatus = not_run;
+    pOut->initStatus    = not_run;
+    pOut->loadStatus    = not_run;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pGpu = gpumgrGetGpu(gpuInstance);
+    if (pGpu == NULL || !pGpu->gspRmInitialized)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
+    }
+
+    /* gpuStatePreInit asserts rmGpuLockIsOwner(); hold API + GPU-group locks
+     * across all three phases, like RmInitAdapter's callers do. */
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    status = rmGpuGroupLockAcquire(pGpu->gpuInstance, GPU_LOCK_GRP_SUBDEVICE,
+                                   GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT,
+                                   &gpusLockedMask);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    ECLIPSE_TRACE("state_init: before gpumgrStatePreInitGpu");
+    pOut->preInitStatus = gpumgrStatePreInitGpu(pGpu);
+    nv_printf(0, "[eclipse-rm-trace] state_init: gpumgrStatePreInitGpu -> 0x%x\n",
+              pOut->preInitStatus);
+    if (pOut->preInitStatus != NV_OK)
+    {
+        goto unlock;
+    }
+
+    ECLIPSE_TRACE("state_init: before gpumgrStateInitGpu");
+    pOut->initStatus = gpumgrStateInitGpu(pGpu);
+    nv_printf(0, "[eclipse-rm-trace] state_init: gpumgrStateInitGpu -> 0x%x\n",
+              pOut->initStatus);
+    if (pOut->initStatus != NV_OK)
+    {
+        goto unlock;
+    }
+
+    /* Same as RmInitNvDevice: keep RM's interrupt enable state at zero so
+     * nothing gets enabled during StateLoad (Eclipse is fully polled). */
+    pIntr = GPU_GET_INTR(pGpu);
+    if (pIntr != NULL)
+    {
+        intrSetIntrEn(pIntr, INTERRUPT_TYPE_DISABLED);
+    }
+
+    ECLIPSE_TRACE("state_init: before gpumgrStateLoadGpu");
+    pOut->loadStatus = gpumgrStateLoadGpu(pGpu, GPU_STATE_DEFAULT);
+    nv_printf(0, "[eclipse-rm-trace] state_init: gpumgrStateLoadGpu -> 0x%x\n",
+              pOut->loadStatus);
+
+unlock:
+    rmGpuGroupLockRelease(gpusLockedMask, GPUS_LOCK_FLAGS_NONE);
+    rmapiLockRelease();
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return NV_OK;
+}

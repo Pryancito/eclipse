@@ -465,6 +465,10 @@ pub struct NvidiaGpu {
     /// Result of the real kgspInitRm attempt, cached the same way as
     /// `rm_attach_result`.
     gsp_init_result: Mutex<Option<String>>,
+    /// Cached step-9 result (gpuState PreInit/Init/Load). One-shot per boot:
+    /// the RM state machine is not re-runnable, so the first outcome is
+    /// what /proc/gpustep9 keeps reporting.
+    state_init_result: Mutex<Option<String>>,
 }
 
 /// Simple bitmap-based VRAM allocator for BAR1 aperture (4KB page granularity)
@@ -682,6 +686,7 @@ impl NvidiaGpu {
             gsp_firmware: Mutex::new(None),
             gsp_fw_status: Mutex::new(None),
             gsp_init_result: Mutex::new(None),
+            state_init_result: Mutex::new(None),
         })
     }
 
@@ -1977,6 +1982,69 @@ impl DrmScheme for NvidiaGpu {
                 );
             }
         }
+        s
+    }
+
+    /// Step 9: gpuStatePreInit + gpuStateInit + gpuStateLoad -- the rest of
+    /// the real RmInitAdapter device bring-up, run against the live GSP.
+    /// One-shot per boot (the RM state machine is not re-runnable), so the
+    /// whole block (captured narration + per-phase result) is cached and
+    /// re-served on subsequent reads, like step 6.
+    fn bringup_step9(&self) -> String {
+        use core::fmt::Write;
+        let mut s = String::new();
+        let device_instance = *self.rm_device_instance.lock();
+        let Some(device_instance) = device_instance else {
+            return String::from("[gpustep9]  skipped (run /proc/gpustep5 (RM attach) first)\n");
+        };
+        let cached = self.state_init_result.lock().clone();
+        let block = if let Some(cached) = cached {
+            cached
+        } else {
+            nvidia_rm_sys::os_interface::capture_begin();
+            let result = nvidia_rm_sys::rm_init::state_init(device_instance);
+            let captured = nvidia_rm_sys::os_interface::capture_take();
+            let mut block = String::new();
+            if let Some(log) = captured {
+                if !log.is_empty() {
+                    let _ = writeln!(block, "[gpustep9]  --- state-init narration (captured) ---");
+                    for line in log.lines() {
+                        let _ = writeln!(block, "[gpustep9]  | {}", line);
+                    }
+                    let _ = writeln!(block, "[gpustep9]  --- end narration ---");
+                }
+            }
+            match result {
+                Ok(r) => {
+                    let phase = |st: u32| -> String {
+                        match st {
+                            0 => String::from("OK"),
+                            0xFFFF_FFFF => String::from("not reached"),
+                            e => alloc::format!("FAILED NV_STATUS={:#x}", e),
+                        }
+                    };
+                    let _ = writeln!(block, "[gpustep9]  gpuStatePreInit: {}", phase(r.pre_init_status));
+                    let _ = writeln!(block, "[gpustep9]  gpuStateInit:    {}", phase(r.init_status));
+                    let _ = writeln!(block, "[gpustep9]  gpuStateLoad:    {}", phase(r.load_status));
+                    if r.pre_init_status == 0 && r.init_status == 0 && r.load_status == 0 {
+                        let _ = writeln!(block, "[gpustep9]  --- FULL RmInitAdapter-equivalent bring-up COMPLETE: GPU is state-loaded ---");
+                    }
+                }
+                Err(status) => {
+                    let _ = writeln!(
+                        block,
+                        "[gpustep9]  eclipse_rm_state_init FAILED, NV_STATUS={:#x} (GSP not booted? run /proc/gpustep6)",
+                        status
+                    );
+                }
+            }
+            let mut cache = self.state_init_result.lock();
+            if cache.is_none() {
+                *cache = Some(block.clone());
+            }
+            block
+        };
+        s.push_str(&block);
         s
     }
 

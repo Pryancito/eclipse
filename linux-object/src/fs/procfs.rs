@@ -14,10 +14,10 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 21] = [
+const PROC_ROOT_STATIC: [&str; 22] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
     "perf", "hunter", "filesystems", "gpudbg", "gpustep2", "gpustep3", "gpustep4", "gpustep5",
-    "gpustep6", "gpustep7", "gpustep8",
+    "gpustep6", "gpustep7", "gpustep8", "gpustep9",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -296,6 +296,7 @@ impl INode for ProcRootINode {
             "gpustep6" => Ok(PROC_GPUSTEP6.clone()),
             "gpustep7" => Ok(PROC_GPUSTEP7.clone()),
             "gpustep8" => Ok(PROC_GPUSTEP8.clone()),
+            "gpustep9" => Ok(PROC_GPUSTEP9.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
                 if let Ok(pid) = name.parse::<u64>() {
@@ -1158,6 +1159,19 @@ fn proc_gpustep8_content() -> String {
     s
 }
 
+/// `/proc/gpustep9` â gpuStatePreInit/StateInit/StateLoad (rest of the real
+/// RmInitAdapter) against the live GSP. One-shot per boot; result cached.
+fn proc_gpustep9_content() -> String {
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.bringup_step9());
+    }
+    if s.is_empty() {
+        s.push_str("[gpustep9] no DRM driver with bring-up support\n");
+    }
+    s
+}
+
 fn proc_cpuinfo_content() -> String {
     let mut brand = kernel_hal::cpu::cpu_brand();
     if brand.is_empty() {
@@ -1400,6 +1414,11 @@ lazy_static! {
     static ref PROC_GPUSTEP8: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 92,
         generate: proc_gpustep8_content,
+    });
+    /// `/proc/gpustep9` â full device state bring-up (see proc_gpustep9_content).
+    static ref PROC_GPUSTEP9: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 91,
+        generate: proc_gpustep9_content,
     });
     static ref PROC_SWAPS: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 18,

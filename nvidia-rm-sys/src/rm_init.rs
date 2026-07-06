@@ -176,3 +176,34 @@ pub fn rm_api_demo(device_instance: u32) -> Result<RmApiDemo, NV_STATUS> {
         Err(status)
     }
 }
+
+/// Mirror of `EclipseStateInitResult` (vendor/eclipse_rm_init.c): per-phase
+/// NV_STATUS of the real RmInitAdapter device bring-up. `0xFFFFFFFF` means
+/// the phase was not reached (an earlier phase failed).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct StateInitResult {
+    pub pre_init_status: NvU32,
+    pub init_status: NvU32,
+    pub load_status: NvU32,
+}
+
+extern "C" {
+    fn eclipse_rm_state_init(device_instance: NvU32, out: *mut StateInitResult) -> NV_STATUS;
+}
+
+/// Runs gpumgrStatePreInitGpu / StateInitGpu / StateLoadGpu on an attached,
+/// GSP-booted GPU -- the rest of the real RmInitAdapter sequence.
+pub fn state_init(device_instance: u32) -> Result<StateInitResult, NV_STATUS> {
+    let mut out = StateInitResult {
+        pre_init_status: 0xFFFF_FFFF,
+        init_status: 0xFFFF_FFFF,
+        load_status: 0xFFFF_FFFF,
+    };
+    let status = unsafe { eclipse_rm_state_init(device_instance, &mut out) };
+    if status == NV_OK {
+        Ok(out)
+    } else {
+        Err(status)
+    }
+}
