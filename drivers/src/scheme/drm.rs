@@ -174,6 +174,15 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Read-only hardware-state dump (`/proc/gpudump`): the discriminating
+    /// registers (display head liveness, VGA workspace, PMC, BSI, sysmem
+    /// flush) for this GPU, with NO GSP boot -- zero wedge risk. Lets us
+    /// diff primary vs secondary and pre-decide the display experiments
+    /// without spending a boot. Default: nothing.
+    fn hw_dump(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Import a buffer allocated by the kernel (DRM core)
     fn import_buffer(&self, _handle: GemHandle) -> bool {
         true

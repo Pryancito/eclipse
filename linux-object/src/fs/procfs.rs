@@ -14,10 +14,11 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 25] = [
+const PROC_ROOT_STATIC: [&str; 26] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
     "perf", "hunter", "filesystems", "gpudbg", "gpustep2", "gpustep3", "gpustep4", "gpustep5",
     "gpustep6", "gpustep7", "gpustep8", "gpustep9", "gpustep10", "gpustep11", "gpustep12",
+    "gpudump",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -300,6 +301,7 @@ impl INode for ProcRootINode {
             "gpustep10" => Ok(PROC_GPUSTEP10.clone()),
             "gpustep11" => Ok(PROC_GPUSTEP11.clone()),
             "gpustep12" => Ok(PROC_GPUSTEP12.clone()),
+            "gpudump" => Ok(PROC_GPUDUMP.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
                 if let Ok(pid) = name.parse::<u64>() {
@@ -1231,6 +1233,21 @@ fn proc_gpustep12_content() -> String {
     s
 }
 
+/// `/proc/gpudump` — read-only discriminating hardware dump for every NVIDIA
+/// GPU (console + secondary): display head liveness, VGA workspace base, PMC,
+/// BSI scratch, sysmem flush. NO GSP boot -> ZERO wedge risk. Read this first
+/// and diff primary vs secondary to pre-decide the display experiments.
+fn proc_gpudump_content() -> String {
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.hw_dump());
+    }
+    if s.is_empty() {
+        s.push_str("[gpudump] no DRM driver with bring-up support\n");
+    }
+    s
+}
+
 fn proc_cpuinfo_content() -> String {
     let mut brand = kernel_hal::cpu::cpu_brand();
     if brand.is_empty() {
@@ -1495,6 +1512,12 @@ lazy_static! {
     static ref PROC_GPUSTEP12: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 88,
         generate: proc_gpustep12_content,
+    });
+    /// `/proc/gpudump` -- read-only discriminating HW dump, both GPUs (see
+    /// proc_gpudump_content).
+    static ref PROC_GPUDUMP: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 87,
+        generate: proc_gpudump_content,
     });
     static ref PROC_SWAPS: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 18,
