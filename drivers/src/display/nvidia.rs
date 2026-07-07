@@ -734,6 +734,108 @@ impl NvidiaGpu {
         }
     }
 
+    /// Shared GSP-boot body used by `bringup_step6` (secondary GPU) and
+    /// `bringup_step11` (console GPU, with the graphic console frozen by the
+    /// /proc generator around this call): INTx mask, kgspInitRm, narration
+    /// capture, per-GPU result cache. `tag` labels the output lines
+    /// ("gpustep6"/"gpustep11") so each proc file reads naturally.
+    fn gsp_boot_run(&self, tag: &str) -> String {
+        use core::fmt::Write;
+        let device_instance = *self.rm_device_instance.lock();
+
+        // Check the cache before touching gsp_firmware's lock at all, so
+        // the two locks are never nested across the FFI call below (same
+        // reasoning as bringup_step5).
+        let cached = self.gsp_init_result.lock().clone();
+
+        // Cache the ENTIRE block (captured GSP-RM boot narration + result
+        // line) so the /proc generator is idempotent across cat's chunked
+        // reads -- same requirement (and same fix) as bringup_step5.
+        if let Some(cached) = cached {
+            cached
+        } else if let Some(device_instance) = device_instance {
+            let fw = self.gsp_firmware.lock();
+            if let Some(fw_bytes) = fw.as_ref() {
+                // Mask this GPU's legacy INTx at the PCI level before booting
+                // GSP-RM. On real hardware the boot now gets all the way to
+                // "GSP FW RM ready." and THEN the machine livelocks: once
+                // GSP-RM is alive it asserts interrupts (RPC completions, log
+                // buffers, NOCAT posts), and Eclipse has no ISR for the GPU --
+                // nobody acks or masks a level-triggered INTx, so it screams
+                // and starves the CPU. Linux never sees this because the RM
+                // registers its ISR before RmInitAdapter. Eclipse's bring-up
+                // is 100% polled (the RPC message queue is read directly), so
+                // the correct equivalent is to keep the device's INTx
+                // disabled: PCI COMMAND register (offset 4) bit 10 (Interrupt
+                // Disable), the standard way a polled driver quiesces a
+                // function. MSI/MSI-X were never enabled, so INTx is the only
+                // line it can raise.
+                {
+                    use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+                    use pci::Location;
+                    let loc = Location {
+                        bus: self.pci_bus,
+                        device: self.pci_device,
+                        function: 0,
+                    };
+                    let ops = &PortOpsImpl;
+                    let cmd = unsafe { PCI_ACCESS.read16(ops, loc, 0x04) };
+                    unsafe { PCI_ACCESS.write16(ops, loc, 0x04, cmd | (1 << 10)) };
+                    log::warn!(
+                        "[NVIDIA] {}: PCI INTx disabled before GSP boot (COMMAND {:#06x} -> {:#06x})",
+                        tag,
+                        cmd,
+                        cmd | (1 << 10)
+                    );
+                }
+                // Capture kgspInitRm's own nv_printf / assert / ECLIPSE_TRACE
+                // narration -- the GSP boot is the deepest step and its RM
+                // LEVEL_ERROR failure lines only reach the user folded in
+                // here (the kernel log::warn! stream is invisible on the
+                // bring-up box; see bringup_step5).
+                nvidia_rm_sys::os_interface::capture_begin();
+                let computed = match nvidia_rm_sys::rm_init::init_gsp(device_instance, fw_bytes) {
+                    Ok(()) => String::from("kgspInitRm OK"),
+                    Err(status) => alloc::format!("kgspInitRm FAILED, NV_STATUS={:#x}", status),
+                };
+                let captured = nvidia_rm_sys::os_interface::capture_take();
+                drop(fw);
+                let mut block = String::new();
+                if let Some(log) = captured {
+                    if !log.is_empty() {
+                        let _ = writeln!(block, "[{}]  --- GSP-RM narration (captured) ---", tag);
+                        for line in log.lines() {
+                            let _ = writeln!(block, "[{}]  | {}", tag, line);
+                        }
+                        let _ = writeln!(block, "[{}]  --- end GSP-RM narration ---", tag);
+                    }
+                }
+                let _ = writeln!(block, "[{}]  --- Real GSP-RM boot: {} ---", tag, computed);
+                let mut gsp = self.gsp_init_result.lock();
+                if gsp.is_none() {
+                    *gsp = Some(block.clone());
+                }
+                block
+            } else {
+                let status = self
+                    .gsp_fw_status
+                    .lock()
+                    .clone()
+                    .unwrap_or_else(|| String::from("no status recorded (loader never ran?)"));
+                alloc::format!(
+                    "[{}]  --- Real GSP-RM boot: skipped (no gsp.bin in driver) ---\n\
+                     [{}]  boot-time firmware load: {}\n",
+                    tag, tag, status
+                )
+            }
+        } else {
+            alloc::format!(
+                "[{}]  --- Real GSP-RM boot: skipped (run /proc/gpustep5 (RM attach) first) ---\n",
+                tag
+            )
+        }
+    }
+
     /// Issue the tu102 GMMU invalidate for our channel's PDB and poll for
     /// completion. Returns `(pre, post, ok)` — the trigger register before and
     /// after, and whether bit31 cleared. Aborts (no write) if a flush is already
@@ -2213,7 +2315,6 @@ impl DrmScheme for NvidiaGpu {
     /// `set_gsp_firmware` (zCore's boot code, after rootfs mount) --
     /// reports which is missing rather than erroring if either is absent.
     fn bringup_step6(&self) -> String {
-        use core::fmt::Write;
         let mut s = String::new();
 
         // EXPERIMENT (SEC2 CORE_RESUME wedge): starting SEC2 to resume GSP-RM
@@ -2231,105 +2332,35 @@ impl DrmScheme for NvidiaGpu {
         // boot). If the secondary wedges identically, the console theory dies.
         if self.drives_boot_display() {
             return String::from(
-                "[gpustep6]  --- Real GSP-RM boot: SKIPPED on console GPU (SEC2 resume wedges its bus; \
-                 booting GSP on the secondary GPU only -- see nvidia.rs bringup_step6) ---\n",
+                "[gpustep6]  --- Real GSP-RM boot: SKIPPED on console GPU (SEC2 resume wedges its bus \
+                 while the console renders into its BAR1; use /proc/gpustep11, which freezes the \
+                 graphic console around the boot) ---\n",
             );
         }
 
-        let device_instance = *self.rm_device_instance.lock();
-
-        // Check the cache before touching gsp_firmware's lock at all, so
-        // the two locks are never nested across the FFI call below (same
-        // reasoning as bringup_step5).
-        let cached = self.gsp_init_result.lock().clone();
-
-        // Cache the ENTIRE block (captured GSP-RM boot narration + result
-        // line) so the /proc generator is idempotent across cat's chunked
-        // reads -- same requirement (and same fix) as bringup_step5.
-        let block = if let Some(cached) = cached {
-            cached
-        } else if let Some(device_instance) = device_instance {
-            let fw = self.gsp_firmware.lock();
-            if let Some(fw_bytes) = fw.as_ref() {
-                // Mask this GPU's legacy INTx at the PCI level before booting
-                // GSP-RM. On real hardware the boot now gets all the way to
-                // "GSP FW RM ready." on the secondary GPU and THEN the machine
-                // livelocks: once GSP-RM is alive it asserts interrupts (RPC
-                // completions, log buffers, NOCAT posts), and Eclipse has no
-                // ISR for the GPU -- nobody acks or masks a level-triggered
-                // INTx, so it screams and starves the CPU. Linux never sees
-                // this because the RM registers its ISR before RmInitAdapter.
-                // Eclipse's bring-up is 100% polled (the RPC message queue is
-                // read directly), so the correct equivalent is to keep the
-                // device's INTx disabled: PCI COMMAND register (offset 4)
-                // bit 10 (Interrupt Disable), the standard way a polled
-                // driver quiesces a function. MSI/MSI-X were never enabled,
-                // so INTx is the only line it can raise.
-                {
-                    use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
-                    use pci::Location;
-                    let loc = Location {
-                        bus: self.pci_bus,
-                        device: self.pci_device,
-                        function: 0,
-                    };
-                    let ops = &PortOpsImpl;
-                    let cmd = unsafe { PCI_ACCESS.read16(ops, loc, 0x04) };
-                    unsafe { PCI_ACCESS.write16(ops, loc, 0x04, cmd | (1 << 10)) };
-                    log::warn!(
-                        "[NVIDIA] gpustep6: PCI INTx disabled before GSP boot (COMMAND {:#06x} -> {:#06x})",
-                        cmd,
-                        cmd | (1 << 10)
-                    );
-                }
-                // Capture kgspInitRm's own nv_printf / assert / ECLIPSE_TRACE
-                // narration -- the GSP boot is the deepest step and its RM
-                // LEVEL_ERROR failure lines only reach the user folded in
-                // here (the kernel log::warn! stream is invisible on the
-                // bring-up box; see bringup_step5).
-                nvidia_rm_sys::os_interface::capture_begin();
-                let computed = match nvidia_rm_sys::rm_init::init_gsp(device_instance, fw_bytes) {
-                    Ok(()) => String::from("kgspInitRm OK"),
-                    Err(status) => alloc::format!("kgspInitRm FAILED, NV_STATUS={:#x}", status),
-                };
-                let captured = nvidia_rm_sys::os_interface::capture_take();
-                drop(fw);
-                let mut block = String::new();
-                if let Some(log) = captured {
-                    if !log.is_empty() {
-                        let _ = writeln!(block, "[gpustep6]  --- GSP-RM narration (captured) ---");
-                        for line in log.lines() {
-                            let _ = writeln!(block, "[gpustep6]  | {}", line);
-                        }
-                        let _ = writeln!(block, "[gpustep6]  --- end GSP-RM narration ---");
-                    }
-                }
-                let _ = writeln!(block, "[gpustep6]  --- Real GSP-RM boot: {} ---", computed);
-                let mut gsp = self.gsp_init_result.lock();
-                if gsp.is_none() {
-                    *gsp = Some(block.clone());
-                }
-                block
-            } else {
-                let status = self
-                    .gsp_fw_status
-                    .lock()
-                    .clone()
-                    .unwrap_or_else(|| String::from("no status recorded (loader never ran?)"));
-                alloc::format!(
-                    "[gpustep6]  --- Real GSP-RM boot: skipped (no gsp.bin in driver) ---\n\
-                     [gpustep6]  boot-time firmware load: {}\n",
-                    status
-                )
-            }
-        } else {
-            alloc::format!(
-                "[gpustep6]  --- Real GSP-RM boot: skipped (run /proc/gpustep5 (RM attach) first) ---\n"
-            )
-        };
-
-        s.push_str(&block);
+        s.push_str(&self.gsp_boot_run("gpustep6"));
         s
+    }
+
+    /// Step 11 (`/proc/gpustep11`): GSP-RM boot on the CONSOLE GPU -- the one
+    /// step 6 refuses to touch. The wedge theory, refined by the secondary
+    /// GPU booting flawlessly with byte-identical software: during the SEC2
+    /// GSP-RM resume window, CPU writes into this GPU's BAR1 (which is
+    /// exactly where the graphic console framebuffer lives -- and step 6's
+    /// RmMsg narration prints DOZENS of lines, each one drawing pixels) stall
+    /// the bus for good. NVIDIA's own driver avoids this class of collision
+    /// with os_disable_console_access() around init. Eclipse's equivalent:
+    /// the /proc/gpustep11 generator (linux-object procfs) puts the active VT
+    /// into KD_GRAPHICS around this call -- pixel presentation stops (the VT
+    /// shadow buffer keeps accumulating; serial/dmesg unaffected), and the
+    /// return to KD_TEXT repaints everything that happened meanwhile.
+    fn bringup_step11(&self) -> String {
+        if !self.drives_boot_display() {
+            return String::from(
+                "[gpustep11] SKIPPED on secondary GPU (already boots via /proc/gpustep6)\n",
+            );
+        }
+        self.gsp_boot_run("gpustep11")
     }
 
     /// Step 2: instance block + GMMU flush — the first GPU register writes.
