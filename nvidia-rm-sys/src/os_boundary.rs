@@ -454,38 +454,44 @@ unsafe fn sec2_intr_snapshot_and_drain(base: *mut u8) {
         }
     }
 
-    // (2) Bounded write-1-to-clear service loop: drain pending leaves until the
-    // top register reads quiescent (0) or we stop making progress. A source
-    // that keeps re-asserting (level-triggered, needs clearing at the engine,
-    // not the leaf) leaves top_final != 0 -- itself diagnostic for round 2.
-    let mut iters = 0u32;
+    // (2) EXP3 -- UNCONDITIONAL write-1-to-clear drain. The EXP2 run showed
+    // CPU_INTR_TOP=0 (the top register only reflects ENABLED leaves) yet
+    // LEAF[4] bit28 (0x10000000) was pending with en=0 -- a MASKED-but-
+    // asserted source, mirrored in the legacy PMC_INTR0 bit28. The old loop
+    // broke on TOP==0 and never touched that leaf. Now: clear every nonzero
+    // leaf regardless of TOP (a masked pending bit is still latched there),
+    // then re-read each to classify the source -- a bit that STAYS cleared was
+    // latched/edge (W1C suffices, mimics servicing); a bit that RE-ASSERTS is
+    // a live level source that must be cleared at the engine, not the leaf.
     let mut cleared_bits = 0u32;
-    loop {
-        let top = rd(TOP);
-        if top == 0 {
-            break;
+    for i in 0..8usize {
+        let leaf = rd(LEAF + i * 4);
+        if leaf != 0 {
+            wr(LEAF + i * 4, leaf); // write-1-to-clear (unconditional)
+            cleared_bits = cleared_bits.wrapping_add(leaf.count_ones());
         }
-        let mut any = false;
-        for i in 0..8usize {
-            let leaf = rd(LEAF + i * 4);
-            if leaf != 0 {
-                wr(LEAF + i * 4, leaf); // write-1-to-clear
-                cleared_bits = cleared_bits.wrapping_add(leaf.count_ones());
-                any = true;
-            }
-        }
-        iters += 1;
-        if !any || iters >= 2000 {
-            break;
+    }
+    // Re-read pass: which leaves re-asserted (level source) vs stayed clear?
+    let mut still_pending = 0u32;
+    for i in 0..8usize {
+        let after = rd(LEAF + i * 4);
+        if after != 0 {
+            still_pending = still_pending.wrapping_add(1);
+            log::error!(
+                "[nvidia-rm] EXP3 LEAF[{}] STILL pending after W1C = {:#010x} (LIVE LEVEL source -- clear at engine)",
+                i, after
+            );
         }
     }
     let top_final = rd(TOP);
+    let pmc0_final = rd(0x100);
     log::error!(
-        "[nvidia-rm] EXP2 drain done: iters={} bits_cleared={} CPU_INTR_TOP_final={:#010x} ({})",
-        iters,
+        "[nvidia-rm] EXP3 drain done: bits_cleared={} leaves_still_pending={} CPU_INTR_TOP_final={:#010x} PMC_INTR0_final={:#010x} ({})",
         cleared_bits,
+        still_pending,
         top_final,
-        if top_final == 0 { "quiescent" } else { "STILL PENDING -- level source, clear at engine" }
+        pmc0_final,
+        if still_pending == 0 { "leaves latched -- W1C stuck" } else { "re-asserting level source" }
     );
 }
 
