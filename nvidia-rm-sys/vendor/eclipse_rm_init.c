@@ -1164,7 +1164,8 @@ NV_STATUS eclipse_rm_step10(NvU32 gpuInstance, EclipseStep10Result *pOut)
     MemoryManager *pMemoryManager;
     MEMORY_DESCRIPTOR *pMemDescA = NULL;
     MEMORY_DESCRIPTOR *pMemDescB = NULL;
-    NvU8 *pVa = NULL;
+    NvU8 *pVaA = NULL;
+    NvU8 *pVaB = NULL;
     NV_STATUS status;
     THREAD_STATE_NODE threadState;
     GPU_MASK gpusLockedMask = 0;
@@ -1173,6 +1174,19 @@ NV_STATUS eclipse_rm_step10(NvU32 gpuInstance, EclipseStep10Result *pOut)
                                          * uncached BAR2 readback stays fast */
     const NvU32 PATTERN = 0xCAFED00Du;
     const NvU32 POISON  = 0x0BAD0BADu;
+    /*
+     * CE memset REAL semantics (learned on hardware, v1 of this test): the
+     * pushbuffer builder programs SET_REMAP_COMPONENTS with
+     * _COMPONENT_SIZE_ONE / _NUM_DST_COMPONENTS_ONE (channel_utils.c:1009),
+     * so only the LOW BYTE of `pattern` is written, replicated across the
+     * surface -- memset A=0xcafed00d really fills A with 0x0d bytes, and the
+     * v1 run read back a perfectly uniform 0x0d0d0d0d (proof the memset,
+     * copy AND readback all worked; only the test's expectation was wrong).
+     */
+#define ECLIPSE_BYTE_REP(x) (((NvU32)((x) & 0xFFu)) * 0x01010101u)
+    /* Per-dword unique expected value for the CPU-filled copy test: catches
+     * offset/aliasing errors a repeated byte cannot. 0x01000193 = FNV prime. */
+#define ECLIPSE_FILL(i) (PATTERN ^ ((NvU32)(i) * 0x01000193u))
     const NvU32 not_run = 0xFFFFFFFFu;
 
     if (pOut == NULL)
@@ -1228,7 +1242,7 @@ NV_STATUS eclipse_rm_step10(NvU32 gpuInstance, EclipseStep10Result *pOut)
         return status;
     }
 
-    ECLIPSE_TRACE("step10: CE data-movement test v1 (memset+copy+readback)");
+    ECLIPSE_TRACE("step10: CE data-movement test v2 (byte-remap-aware memset verify + CPU-unique-fill copy verify)");
 
     pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
     if (pMemoryManager == NULL || pMemoryManager->pCeUtils == NULL)
@@ -1272,7 +1286,19 @@ NV_STATUS eclipse_rm_step10(NvU32 gpuInstance, EclipseStep10Result *pOut)
     nv_printf(0, "[eclipse-rm-trace] step10: A PA=0x%llx B PA=0x%llx size=0x%llx\n",
               pOut->paA, pOut->paB, SIZE);
 
-    /* --- CE memset B = poison (so the later copy visibly overwrites it) --- */
+    /* --- CPU (BAR2) mappings of both buffers, up front: the memset spot
+     * checks and the CPU fill/verify all need them, and BAR2 mapping was
+     * already proven by gpuStateInit's own MMU self-test --- */
+    pVaA = kbusMapRmAperture_HAL(pGpu, pMemDescA);
+    pVaB = kbusMapRmAperture_HAL(pGpu, pMemDescB);
+    if (pVaA == NULL || pVaB == NULL)
+    {
+        pOut->verifyStatus = NV_ERR_INSUFFICIENT_RESOURCES;
+        ECLIPSE_TRACE("step10: BAR2 map of A/B failed");
+        goto cleanup;
+    }
+
+    /* --- CE memset B = poison, spot-verified (byte-remap semantics) --- */
     {
         CEUTILS_MEMSET_PARAMS params;
         portMemSet(&params, 0, sizeof(params));
@@ -1282,15 +1308,26 @@ NV_STATUS eclipse_rm_step10(NvU32 gpuInstance, EclipseStep10Result *pOut)
         params.pattern  = POISON;
         params.flags    = 0; /* synchronous */
         pOut->poisonStatus = ceutilsMemset(pMemoryManager->pCeUtils, &params);
+        if (pOut->poisonStatus == NV_OK)
+        {
+            NvU32 first = MEM_RD32(pVaB);
+            NvU32 last  = MEM_RD32(pVaB + SIZE - 4);
+            if (first != ECLIPSE_BYTE_REP(POISON) || last != ECLIPSE_BYTE_REP(POISON))
+            {
+                nv_printf(0, "[eclipse-rm-trace] step10: poison spot-check first=0x%x last=0x%x expected=0x%x\n",
+                          first, last, ECLIPSE_BYTE_REP(POISON));
+                pOut->poisonStatus = NV_ERR_INVALID_DATA;
+            }
+        }
     }
-    nv_printf(0, "[eclipse-rm-trace] step10: CE memset B=poison -> 0x%x\n",
+    nv_printf(0, "[eclipse-rm-trace] step10: CE memset B=poison + spot-check -> 0x%x\n",
               pOut->poisonStatus);
     if (pOut->poisonStatus != NV_OK)
     {
         goto cleanup;
     }
 
-    /* --- CE memset A = test pattern --- */
+    /* --- CE memset A = pattern low byte, spot-verified the same way --- */
     {
         CEUTILS_MEMSET_PARAMS params;
         portMemSet(&params, 0, sizeof(params));
@@ -1300,17 +1337,38 @@ NV_STATUS eclipse_rm_step10(NvU32 gpuInstance, EclipseStep10Result *pOut)
         params.pattern  = PATTERN;
         params.flags    = 0;
         pOut->memsetStatus = ceutilsMemset(pMemoryManager->pCeUtils, &params);
+        if (pOut->memsetStatus == NV_OK)
+        {
+            NvU32 first = MEM_RD32(pVaA);
+            NvU32 last  = MEM_RD32(pVaA + SIZE - 4);
+            if (first != ECLIPSE_BYTE_REP(PATTERN) || last != ECLIPSE_BYTE_REP(PATTERN))
+            {
+                nv_printf(0, "[eclipse-rm-trace] step10: memset spot-check first=0x%x last=0x%x expected=0x%x\n",
+                          first, last, ECLIPSE_BYTE_REP(PATTERN));
+                pOut->memsetStatus = NV_ERR_INVALID_DATA;
+            }
+        }
     }
-    nv_printf(0, "[eclipse-rm-trace] step10: CE memset A=pattern -> 0x%x\n",
+    nv_printf(0, "[eclipse-rm-trace] step10: CE memset A=pattern + spot-check -> 0x%x\n",
               pOut->memsetStatus);
     if (pOut->memsetStatus != NV_OK)
     {
         goto cleanup;
     }
 
-    /* --- CE copy A -> B --- */
+    /* --- CPU-fill A with a per-dword unique sequence, then CE copy A -> B.
+     * A repeated byte can't catch offset or aliasing bugs; a unique value in
+     * every dword proves the copy engine moved THESE 256 KiB, in order. --- */
     {
         CEUTILS_MEMCOPY_PARAMS params;
+        NvU32 i;
+        const NvU32 n = (NvU32)(SIZE / 4);
+        for (i = 0; i < n; i++)
+        {
+            MEM_WR32(pVaA + i * 4, ECLIPSE_FILL(i));
+        }
+        osFlushCpuWriteCombineBuffer();
+
         portMemSet(&params, 0, sizeof(params));
         params.pSrcMemDesc = pMemDescA;
         params.pDstMemDesc = pMemDescB;
@@ -1320,29 +1378,23 @@ NV_STATUS eclipse_rm_step10(NvU32 gpuInstance, EclipseStep10Result *pOut)
         params.flags       = 0;
         pOut->copyStatus = ceutilsMemcopy(pMemoryManager->pCeUtils, &params);
     }
-    nv_printf(0, "[eclipse-rm-trace] step10: CE copy A->B -> 0x%x\n",
+    nv_printf(0, "[eclipse-rm-trace] step10: CPU fill A + CE copy A->B -> 0x%x\n",
               pOut->copyStatus);
     if (pOut->copyStatus != NV_OK)
     {
         goto cleanup;
     }
 
-    /* --- CPU readback of B through BAR2 --- */
-    pVa = kbusMapRmAperture_HAL(pGpu, pMemDescB);
-    if (pVa == NULL)
-    {
-        pOut->verifyStatus = NV_ERR_INSUFFICIENT_RESOURCES;
-        ECLIPSE_TRACE("step10: BAR2 map of B failed");
-        goto cleanup;
-    }
+    /* --- CPU readback of B through BAR2: every dword must equal the unique
+     * fill value the CPU wrote into A --- */
     {
         NvU32 i;
         const NvU32 n = (NvU32)(SIZE / 4);
         pOut->dwordsChecked = n;
         for (i = 0; i < n; i++)
         {
-            NvU32 v = MEM_RD32(pVa + i * 4);
-            if (v != PATTERN)
+            NvU32 v = MEM_RD32(pVaB + i * 4);
+            if (v != ECLIPSE_FILL(i))
             {
                 if (pOut->mismatchCount == 0)
                 {
@@ -1359,9 +1411,13 @@ NV_STATUS eclipse_rm_step10(NvU32 gpuInstance, EclipseStep10Result *pOut)
               pOut->verifyStatus, pOut->dwordsChecked, pOut->mismatchCount);
 
 cleanup:
-    if (pVa != NULL)
+    if (pVaA != NULL)
     {
-        kbusUnmapRmAperture_HAL(pGpu, pMemDescB, &pVa, NV_TRUE);
+        kbusUnmapRmAperture_HAL(pGpu, pMemDescA, &pVaA, NV_TRUE);
+    }
+    if (pVaB != NULL)
+    {
+        kbusUnmapRmAperture_HAL(pGpu, pMemDescB, &pVaB, NV_TRUE);
     }
     if (pMemDescB != NULL)
     {
