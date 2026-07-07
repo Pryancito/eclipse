@@ -361,6 +361,55 @@ pub fn seq_trace_disarm() {
     SEQ_TRACE_LIVE.store(false, Ordering::Relaxed);
 }
 
+/// Post-STARTCPU bus autopsy (EXP 2 of the SEC2-resume investigation).
+/// Config-space cycles are completed by the root complex even when the
+/// endpoint's host interface is priv-locked (a failed config read returns
+/// all-ones instead of hanging the core, unlike a MMIO read), so a paced
+/// config poll right after the STARTCPU write classifies the failure
+/// physics without risking the machine: (a) config alive + BAR0 dead =
+/// HS-payload priv holdoff; (b) config dead / ID=0xFFFF = device fell off
+/// the bus; (c) everything alive after ~2s = race, not a wedge. Armed by
+/// bringup_step11/12 with the GPU's and its root port's packed config
+/// handles (same 0x8000_0000|bus<<16|dev<<8|fn packing as
+/// os_pci_init_handle).
+static AUTOPSY_GPU_HANDLE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static AUTOPSY_RP_HANDLE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Arm the post-STARTCPU autopsy. `rp_handle` may be 0 (no root port found).
+pub fn autopsy_arm(gpu_handle: usize, rp_handle: usize) {
+    use core::sync::atomic::Ordering;
+    AUTOPSY_GPU_HANDLE.store(gpu_handle, Ordering::Relaxed);
+    AUTOPSY_RP_HANDLE.store(rp_handle, Ordering::Relaxed);
+}
+
+/// Disarm the post-STARTCPU autopsy.
+pub fn autopsy_disarm() {
+    use core::sync::atomic::Ordering;
+    AUTOPSY_GPU_HANDLE.store(0, Ordering::Relaxed);
+    AUTOPSY_RP_HANDLE.store(0, Ordering::Relaxed);
+}
+
+/// EXP 1 (PDISP hold-in-reset): when armed, the first completed read of
+/// NV_PDISP_VGA_WORKSPACE_BASE (0x625F04 -- kgspCalculateFbLayout's read,
+/// i.e. "after the FB-layout code consumed the register, before Booter/
+/// bootstrap") triggers clearing NV_PMC_ENABLE bit 30 (PDISP,
+/// tu102/dev_boot.h:116) with the same clear+2-readback propagation
+/// sequence kbifDoFullChipReset_GM107 uses. Engine-level reset = zero
+/// isochronous display FB fetch during the SEC2-RTOS resume. One-way for
+/// the boot: the console goes dark (scanout stops) until reboot. Armed
+/// only by /proc/gpustep12.
+static PDISP_KILL_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Arm the PDISP hold-in-reset experiment for the next GSP boot.
+pub fn pdisp_kill_arm() {
+    PDISP_KILL_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Disarm the PDISP experiment (boot returned or never triggered).
+pub fn pdisp_kill_disarm() {
+    PDISP_KILL_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Switch the armed trace live. Called by os_interface's narration hook the
 /// moment the RM logs receiving the GSP_RUN_CPU_SEQUENCER RPC, so the trace
 /// covers the entire sequencer buffer execution, and (belt-and-braces) by
@@ -499,6 +548,32 @@ pub extern "C" fn osDevReadReg032(_pGpu: *mut c_void, pMapping: *mut c_void, thi
             v
         ));
     }
+    // EXP 1 trigger: kgspCalculateFbLayout has just consumed
+    // NV_PDISP_VGA_WORKSPACE_BASE -- from here to bootstrap nothing else
+    // needs the display engine, so hold PDISP in engine-level reset
+    // (NV_PMC_ENABLE bit 30 clear + two propagation readbacks, the
+    // kbifDoFullChipReset_GM107 sequence). Scanout DMA stops dead; the
+    // console goes dark until reboot. Only /proc/gpustep12 arms this.
+    if this_address == 0x0062_5F04
+        && PDISP_KILL_ARMED.swap(false, core::sync::atomic::Ordering::Relaxed)
+    {
+        if let Some(base) = dev_mapping_base(pMapping) {
+            unsafe {
+                let pmc = base.add(0x200) as *mut NvU32;
+                let old = core::ptr::read_volatile(pmc);
+                core::ptr::write_volatile(pmc, old & !(1u32 << 30));
+                let rb1 = core::ptr::read_volatile(pmc);
+                let rb2 = core::ptr::read_volatile(pmc);
+                seq_trace_emit(&alloc::format!(
+                    "[nvidia-rm] EXP1: PDISP held in reset (PMC_ENABLE {:#010x} -> {:#010x}, readbacks {:#010x}/{:#010x}); screen goes dark now, boot continues",
+                    old,
+                    old & !(1u32 << 30),
+                    rb1,
+                    rb2
+                ));
+            }
+        }
+    }
     if is_sec2 || is_bsi {
         use core::sync::atomic::{AtomicU32, Ordering};
         static PROBE_RD_DONE: AtomicU32 = AtomicU32::new(0);
@@ -589,6 +664,53 @@ pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, th
     // resume handling, and both wedge rounds proved silence changes nothing.
     // The per-access seq_trace above now narrates the RM's own immediate
     // BSI polling instead -- higher fidelity AND better diagnostics.
+    //
+    // EXP 2 (post-STARTCPU bus autopsy): when armed, spend ~2s after the
+    // STARTCPU write reading ONLY config space (root-complex-completed, so a
+    // dead endpoint yields all-ones instead of a hang), logging transitions;
+    // then attempt exactly one BAR0 read. Every outcome classifies the
+    // failure physics -- see autopsy_arm's doc comment.
+    if is_sec2_startcpu {
+        let gpu_h = AUTOPSY_GPU_HANDLE.load(core::sync::atomic::Ordering::Relaxed);
+        if gpu_h != 0 {
+            let rp_h = AUTOPSY_RP_HANDLE.load(core::sync::atomic::Ordering::Relaxed);
+            let mut last_gpu_id = 0xDEAD_BEEFu32;
+            let mut last_gpu_cs = 0xDEAD_BEEFu32;
+            let mut last_rp_id = 0xDEAD_BEEFu32;
+            log::error!("[nvidia-rm] AUTOPSY: config-space watch begins (2s @ 1ms; transitions only)");
+            for ms in 0..2000u32 {
+                crate::hooks::with_hooks((), |h| h.delay_us(1_000));
+                let gpu_id = crate::hooks::with_hooks(0xFFFF_FFFF, |h| h.pci_config_read(gpu_h, 0, 4));
+                let gpu_cs = crate::hooks::with_hooks(0xFFFF_FFFF, |h| h.pci_config_read(gpu_h, 4, 4));
+                let rp_id = if rp_h != 0 {
+                    crate::hooks::with_hooks(0xFFFF_FFFF, |h| h.pci_config_read(rp_h, 0, 4))
+                } else {
+                    0
+                };
+                if gpu_id != last_gpu_id || gpu_cs != last_gpu_cs || rp_id != last_rp_id {
+                    log::error!(
+                        "[nvidia-rm] AUTOPSY t={}ms: GPU id={:#010x} cmd/status={:#010x} RP id={:#010x}",
+                        ms, gpu_id, gpu_cs, rp_id
+                    );
+                    last_gpu_id = gpu_id;
+                    last_gpu_cs = gpu_cs;
+                    last_rp_id = rp_id;
+                }
+            }
+            log::error!(
+                "[nvidia-rm] AUTOPSY t=2000ms final: GPU id={:#010x} cmd/status={:#010x} RP id={:#010x}; now ONE BAR0 read of 0x1180f8 (about to)",
+                last_gpu_id, last_gpu_cs, last_rp_id
+            );
+            if let Some(base) = base_for_bracket {
+                let bsi = unsafe { core::ptr::read_volatile(base.add(0x0011_80F8) as *const NvU32) };
+                log::error!(
+                    "[nvidia-rm] AUTOPSY: BAR0 read RETURNED = {:#010x} (bit26 DONE={}) -- bus alive",
+                    bsi,
+                    (bsi >> 26) & 1
+                );
+            }
+        }
+    }
 }
 
 /// Extracts `DEVICE_MAPPING::gpuNvAddr` (the first field) without needing

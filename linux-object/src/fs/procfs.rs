@@ -14,10 +14,10 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 24] = [
+const PROC_ROOT_STATIC: [&str; 25] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
     "perf", "hunter", "filesystems", "gpudbg", "gpustep2", "gpustep3", "gpustep4", "gpustep5",
-    "gpustep6", "gpustep7", "gpustep8", "gpustep9", "gpustep10", "gpustep11",
+    "gpustep6", "gpustep7", "gpustep8", "gpustep9", "gpustep10", "gpustep11", "gpustep12",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -299,6 +299,7 @@ impl INode for ProcRootINode {
             "gpustep9" => Ok(PROC_GPUSTEP9.clone()),
             "gpustep10" => Ok(PROC_GPUSTEP10.clone()),
             "gpustep11" => Ok(PROC_GPUSTEP11.clone()),
+            "gpustep12" => Ok(PROC_GPUSTEP12.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
                 if let Ok(pid) = name.parse::<u64>() {
@@ -1216,6 +1217,20 @@ fn proc_gpustep11_content() -> String {
     s
 }
 
+/// `/proc/gpustep12` — EXP 1: console-GPU GSP boot with the display engine
+/// held in reset (scanout stopped). BLANKS THE SCREEN; run blind and capture
+/// to a file (`cat /proc/gpustep12 > /r12.txt; sync`), then hard-reset.
+fn proc_gpustep12_content() -> String {
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.bringup_step12());
+    }
+    if s.is_empty() {
+        s.push_str("[gpustep12] no DRM driver with bring-up support\n");
+    }
+    s
+}
+
 fn proc_cpuinfo_content() -> String {
     let mut brand = kernel_hal::cpu::cpu_brand();
     if brand.is_empty() {
@@ -1474,6 +1489,12 @@ lazy_static! {
     static ref PROC_GPUSTEP11: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 89,
         generate: proc_gpustep11_content,
+    });
+    /// `/proc/gpustep12` -- EXP1 console-GPU GSP boot, PDISP held in reset
+    /// (see proc_gpustep12_content).
+    static ref PROC_GPUSTEP12: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 88,
+        generate: proc_gpustep12_content,
     });
     static ref PROC_SWAPS: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 18,
