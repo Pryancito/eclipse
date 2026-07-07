@@ -1014,17 +1014,17 @@ pub extern "C" fn osLockShouldToggleInterrupts(arg0: *mut c_void) -> NvBool {
     NV_FALSE
 }
 
-#[no_mangle]
-pub extern "C" fn osMapGPU(arg0: *mut c_void, arg1: *mut c_void, arg2: NvU64, arg3: NvU64, arg4: NvU32, arg5: *mut c_void, arg6: *mut c_void) -> *mut c_void {
-    let _ = arg0;
-    let _ = arg1;
-    let _ = arg2;
-    let _ = arg3;
-    let _ = arg4;
-    let _ = arg5;
-    let _ = arg6;
-    core::ptr::null_mut()
-}
+// osMapGPU / osUnmapGPU: REAL implementations live in C
+// (vendor/eclipse_rm_init.c), NOT here. The auto-stub this crate used to
+// carry had the WRONG ABI (returned `*mut c_void` null = 0 = NV_OK while
+// never writing the `NvP64 *pAddress` out-param), which made
+// rmapiMapToCpu's ADDR_REGMEM path "succeed" with a NULL CPU pointer.
+// memmgrScrubMapDoorbellRegion_GV100 then set
+// pDoorbellRegisterOffset = NULL + NVC361_NOTIFY_CHANNEL_PENDING (0x90)
+// and bUseDoorbellRegister = TRUE, and the first CE work submission
+// (channelFillGpFifo) faulted writing vaddr 0x90 -- the exact step-9
+// gpuStateLoad crash on real hardware. Same bug family as the
+// osMapPciMemoryKernel64/Old fix below.
 
 #[no_mangle]
 pub extern "C" fn osMapPciMemoryAreaUser(arg0: *mut c_void, arg1: *mut c_void, arg2: NvU32, arg3: NvU32, arg4: *mut c_void, arg5: *mut c_void) -> *mut c_void {
@@ -1525,14 +1525,8 @@ pub extern "C" fn osUnlockMem(arg0: *mut c_void) -> NV_STATUS {
     NV_ERR_NOT_SUPPORTED
 }
 
-#[no_mangle]
-pub extern "C" fn osUnmapGPU(arg0: *mut c_void, arg1: *mut c_void, arg2: *mut c_void, arg3: NvU64, arg4: *mut c_void) {
-    let _ = arg0;
-    let _ = arg1;
-    let _ = arg2;
-    let _ = arg3;
-    let _ = arg4;
-}
+// osUnmapGPU: real implementation in C (vendor/eclipse_rm_init.c),
+// paired with osMapGPU -- see the rationale at the osMapGPU comment above.
 
 #[no_mangle]
 pub extern "C" fn osUnmapKernelSpace(addr: *mut c_void, size: NvU64) {
