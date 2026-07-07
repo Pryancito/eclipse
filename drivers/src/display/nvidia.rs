@@ -2360,7 +2360,47 @@ impl DrmScheme for NvidiaGpu {
                 "[gpustep11] SKIPPED on secondary GPU (already boots via /proc/gpustep6)\n",
             );
         }
-        self.gsp_boot_run("gpustep11")
+        let mut s = String::new();
+        // Declare this GPU's real identity to RM BEFORE the GSP boot, exactly
+        // where Linux does (RmDeterminePrimaryDevice /
+        // RmSetConsolePreservationParams right before kgspInitRm): it is the
+        // PRIMARY device with a live UEFI GOP console in its BAR1. Without
+        // this, the SET_GUEST_SYSTEM_INFO RPC told GSP-RM `bIsPrimary=false`
+        // and no console region was reserved -- the one remaining difference
+        // vs. the (working) secondary GPU after the console-freeze experiment
+        // exonerated CPU pixel writes. Idempotent: plain property/field
+        // writes, safe to repeat on a cached re-read.
+        if let Some(device_instance) = *self.rm_device_instance.lock() {
+            let (console_size, at_bar1_base) = match *BOOT_FB_INFO.lock() {
+                Some(fb) => (
+                    fb.pitch as u64 * fb.height as u64,
+                    fb.phys == self.bar1_phys,
+                ),
+                None => (0, false),
+            };
+            let mark = nvidia_rm_sys::rm_init::mark_console_gpu(
+                device_instance,
+                console_size,
+                at_bar1_base,
+            );
+            match mark {
+                Ok(()) => {
+                    s.push_str(&alloc::format!(
+                        "[gpustep11] console-GPU identity declared to RM (PRIMARY_DEVICE, console {} KiB, at BAR1 base: {})\n",
+                        console_size / 1024,
+                        at_bar1_base
+                    ));
+                }
+                Err(status) => {
+                    s.push_str(&alloc::format!(
+                        "[gpustep11] mark_console_gpu FAILED, NV_STATUS={:#x} (continuing to boot anyway)\n",
+                        status
+                    ));
+                }
+            }
+        }
+        s.push_str(&self.gsp_boot_run("gpustep11"));
+        s
     }
 
     /// Step 2: instance block + GMMU flush — the first GPU register writes.

@@ -244,6 +244,37 @@ pub struct Step10Result {
 
 extern "C" {
     fn eclipse_rm_step10(device_instance: NvU32, out: *mut Step10Result) -> NV_STATUS;
+
+    fn eclipse_rm_mark_console_gpu(
+        device_instance: NvU32,
+        console_size: NvU64,
+        console_at_bar1_base: u8,
+    ) -> NV_STATUS;
+}
+
+/// Declares a GPU as the primary/console device to RM, NVIDIA's own way
+/// (PDB_PROP_GPU_PRIMARY_DEVICE + BAR1-console preservation + reserved
+/// console display memory -- what Linux's RmDeterminePrimaryDevice /
+/// RmSetConsolePreservationParams do right before kgspInitRm). Must be
+/// called BEFORE `init_gsp` so the SET_GUEST_SYSTEM_INFO RPC reports
+/// `bIsPrimary = true` to the GSP.
+pub fn mark_console_gpu(
+    device_instance: u32,
+    console_size: u64,
+    console_at_bar1_base: bool,
+) -> Result<(), NV_STATUS> {
+    let status = unsafe {
+        eclipse_rm_mark_console_gpu(
+            device_instance,
+            console_size,
+            console_at_bar1_base as u8,
+        )
+    };
+    if status == NV_OK {
+        Ok(())
+    } else {
+        Err(status)
+    }
 }
 
 /// Runs the step-10 CE memset/copy + readback-verify test against the
