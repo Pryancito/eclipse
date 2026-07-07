@@ -150,6 +150,14 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Bring-up **Step 10** (`/proc/gpustep10`): first real copy-engine data
+    /// movement on the state-loaded GPU -- CE memset + copy between two VRAM
+    /// buffers, verified by CPU readback through BAR2. Cached per boot.
+    /// Default: nothing.
+    fn bringup_step10(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Import a buffer allocated by the kernel (DRM core)
     fn import_buffer(&self, _handle: GemHandle) -> bool {
         true

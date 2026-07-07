@@ -216,3 +216,61 @@ pub fn state_init(device_instance: u32) -> Result<StateInitResult, NV_STATUS> {
         Err(status)
     }
 }
+
+/// Mirror of `EclipseStep10Result` (vendor/eclipse_rm_init.c): per-phase
+/// NV_STATUS of the first real copy-engine data movement (CE memset A,
+/// CE memset B=poison, CE copy A->B, CPU readback verify of B through BAR2)
+/// on the state-loaded GPU. `0xFFFFFFFF` = phase not reached.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Step10Result {
+    pub ce_utils_status: NvU32,
+    pub alloc_a_status: NvU32,
+    pub alloc_b_status: NvU32,
+    pub poison_status: NvU32,
+    pub memset_status: NvU32,
+    pub copy_status: NvU32,
+    pub verify_status: NvU32,
+    pub buffer_size: NvU64,
+    pub pa_a: NvU64,
+    pub pa_b: NvU64,
+    pub pattern: NvU32,
+    pub poison: NvU32,
+    pub dwords_checked: NvU32,
+    pub mismatch_count: NvU32,
+    pub first_mismatch_idx: NvU32,
+    pub first_mismatch_val: NvU32,
+}
+
+extern "C" {
+    fn eclipse_rm_step10(device_instance: NvU32, out: *mut Step10Result) -> NV_STATUS;
+}
+
+/// Runs the step-10 CE memset/copy + readback-verify test against the
+/// state-loaded GPU (requires a successful `state_init` first).
+pub fn step10(device_instance: u32) -> Result<Step10Result, NV_STATUS> {
+    let mut out = Step10Result {
+        ce_utils_status: 0xFFFF_FFFF,
+        alloc_a_status: 0xFFFF_FFFF,
+        alloc_b_status: 0xFFFF_FFFF,
+        poison_status: 0xFFFF_FFFF,
+        memset_status: 0xFFFF_FFFF,
+        copy_status: 0xFFFF_FFFF,
+        verify_status: 0xFFFF_FFFF,
+        buffer_size: 0,
+        pa_a: 0,
+        pa_b: 0,
+        pattern: 0,
+        poison: 0,
+        dwords_checked: 0,
+        mismatch_count: 0,
+        first_mismatch_idx: 0,
+        first_mismatch_val: 0,
+    };
+    let status = unsafe { eclipse_rm_step10(device_instance, &mut out) };
+    if status == NV_OK {
+        Ok(out)
+    } else {
+        Err(status)
+    }
+}

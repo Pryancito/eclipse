@@ -478,6 +478,9 @@ pub struct NvidiaGpu {
     /// the RM state machine is not re-runnable, so the first outcome is
     /// what /proc/gpustep9 keeps reporting.
     state_init_result: Mutex<Option<String>>,
+    /// Cached step-10 result (CE memset/copy + readback verify). Cached like
+    /// the others so repeated `cat`s don't re-run CE work; a reboot re-arms.
+    step10_result: Mutex<Option<String>>,
 }
 
 /// Simple bitmap-based VRAM allocator for BAR1 aperture (4KB page granularity)
@@ -700,6 +703,7 @@ impl NvidiaGpu {
             gsp_fw_status: Mutex::new(None),
             gsp_init_result: Mutex::new(None),
             state_init_result: Mutex::new(None),
+            step10_result: Mutex::new(None),
         })
     }
 
@@ -2063,6 +2067,115 @@ impl DrmScheme for NvidiaGpu {
                 }
             }
             let mut cache = self.state_init_result.lock();
+            if cache.is_none() {
+                *cache = Some(block.clone());
+            }
+            block
+        };
+        s.push_str(&block);
+        s
+    }
+
+    /// Step 10 (`/proc/gpustep10`): first real DATA MOVEMENT through the
+    /// copy engine on the state-loaded GPU -- CE memset of a pattern into
+    /// vidmem buffer A (and a poison into B), CE copy A->B, then CPU
+    /// readback of B through BAR2 verifying every dword. Uses the RM's own
+    /// internal CeUtils channel (the VRAM scrubber's machinery), driving the
+    /// exact doorbell path the step-9 osMapGPU fix repaired. Requires a
+    /// successful step 9 first (gpuStateLoad OK).
+    fn bringup_step10(&self) -> String {
+        use core::fmt::Write;
+        let mut s = String::new();
+        let device_instance = *self.rm_device_instance.lock();
+        let Some(device_instance) = device_instance else {
+            return String::from(
+                "[gpustep10] skipped (run steps 5/6/9 first: attach, GSP boot, state init)\n",
+            );
+        };
+        let cached = self.step10_result.lock().clone();
+        let block = if let Some(cached) = cached {
+            cached
+        } else {
+            nvidia_rm_sys::os_interface::capture_begin();
+            // Live-echo like step 9: CE submission exercises channel +
+            // doorbell paths for the first time; if anything faults, the
+            // last live line names the phase.
+            nvidia_rm_sys::os_interface::live_echo_begin();
+            let result = nvidia_rm_sys::rm_init::step10(device_instance);
+            nvidia_rm_sys::os_interface::live_echo_end();
+            let captured = nvidia_rm_sys::os_interface::capture_take();
+            let mut block = String::new();
+            if let Some(log) = captured {
+                if !log.is_empty() {
+                    let _ = writeln!(block, "[gpustep10] --- CE-test narration (captured) ---");
+                    for line in log.lines() {
+                        let _ = writeln!(block, "[gpustep10] | {}", line);
+                    }
+                    let _ = writeln!(block, "[gpustep10] --- end narration ---");
+                }
+            }
+            match result {
+                Ok(r) => {
+                    let phase = |st: u32| -> String {
+                        match st {
+                            0 => String::from("OK"),
+                            0xFFFF_FFFF => String::from("not reached"),
+                            e => alloc::format!("FAILED NV_STATUS={:#x}", e),
+                        }
+                    };
+                    let _ = writeln!(
+                        block,
+                        "[gpustep10] buffers: {} KiB each, A PA={:#x} B PA={:#x} (VRAM)",
+                        r.buffer_size / 1024,
+                        r.pa_a,
+                        r.pa_b
+                    );
+                    let _ = writeln!(block, "[gpustep10] CeUtils channel:   {}", phase(r.ce_utils_status));
+                    let _ = writeln!(block, "[gpustep10] alloc A:           {}", phase(r.alloc_a_status));
+                    let _ = writeln!(block, "[gpustep10] alloc B:           {}", phase(r.alloc_b_status));
+                    let _ = writeln!(
+                        block,
+                        "[gpustep10] CE memset B={:#010x}: {}",
+                        r.poison,
+                        phase(r.poison_status)
+                    );
+                    let _ = writeln!(
+                        block,
+                        "[gpustep10] CE memset A={:#010x}: {}",
+                        r.pattern,
+                        phase(r.memset_status)
+                    );
+                    let _ = writeln!(block, "[gpustep10] CE copy A->B:      {}", phase(r.copy_status));
+                    let _ = writeln!(
+                        block,
+                        "[gpustep10] CPU verify B:      {} ({} dwords checked, {} mismatches)",
+                        phase(r.verify_status),
+                        r.dwords_checked,
+                        r.mismatch_count
+                    );
+                    if r.mismatch_count > 0 {
+                        let _ = writeln!(
+                            block,
+                            "[gpustep10] first mismatch: dword {} = {:#010x} (expected {:#010x})",
+                            r.first_mismatch_idx, r.first_mismatch_val, r.pattern
+                        );
+                    }
+                    if r.verify_status == 0 {
+                        let _ = writeln!(
+                            block,
+                            "[gpustep10] --- COPY ENGINE DATA MOVEMENT VERIFIED: pattern written, copied and read back through real hardware ---"
+                        );
+                    }
+                }
+                Err(status) => {
+                    let _ = writeln!(
+                        block,
+                        "[gpustep10] eclipse_rm_step10 FAILED, NV_STATUS={:#x} (state not loaded? run /proc/gpustep9)",
+                        status
+                    );
+                }
+            }
+            let mut cache = self.step10_result.lock();
             if cache.is_none() {
                 *cache = Some(block.clone());
             }
