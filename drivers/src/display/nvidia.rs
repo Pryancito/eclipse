@@ -819,6 +819,19 @@ impl NvidiaGpu {
         s
     }
 
+    /// Read-only discriminating dump for `/proc/gpudump`: labels the GPU by
+    /// role (console vs secondary) and its PCI location, then the full
+    /// register snapshot. Safe -- pure BAR0/config reads, no boot.
+    fn hw_dump_impl(&self) -> String {
+        let role = if self.drives_boot_display() { "CONSOLE/primary" } else { "secondary/headless" };
+        let mut s = alloc::format!(
+            "[gpudump] === {} GPU {:02x}:{:02x}.0 (bar0_phys={:#x} bar1_phys={:#x} vram={}MB) ===\n",
+            role, self.pci_bus, self.pci_device, self.bar0_phys, self.bar1_phys, self.vram_size_mb
+        );
+        s.push_str(&self.dump_preboot_state("gpudump"));
+        s
+    }
+
     /// Packed config-space handle for THIS GPU (os_pci_init_handle format:
     /// valid-tag | bus<<16 | device<<8 | function).
     fn config_handle(&self) -> usize {
@@ -2740,6 +2753,10 @@ impl DrmScheme for NvidiaGpu {
     /// then hard-reset and read /r12.txt. Skip this experiment entirely if
     /// the step-11 preboot dump showed the primary's heads already
     /// SLEEP/frozen (theory pre-falsified).
+    fn hw_dump(&self) -> String {
+        self.hw_dump_impl()
+    }
+
     fn bringup_step12(&self) -> String {
         if !self.drives_boot_display() {
             return String::from(
