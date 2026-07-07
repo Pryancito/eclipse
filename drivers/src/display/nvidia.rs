@@ -2811,7 +2811,7 @@ impl DrmScheme for NvidiaGpu {
         }
         let mut s = String::new();
         s.push_str(
-            "[gpustep13] EXP2: pre-STARTCPU interrupt drain (pseudo-ISR service loop); no PDISP/display touch -- snapshot at ERROR survives a wedge; capture with `cat /proc/gpustep13 > /r13.txt; sync`\n",
+            "[gpustep13] EXP3: pre-STARTCPU interrupt snapshot + UNCONDITIONAL W1C drain (classifies latched vs live-level source); no PDISP/display touch -- snapshot at ERROR survives a wedge; capture with `cat /proc/gpustep13 > /r13.txt; sync`\n",
         );
         // Same containment + autopsy instrumentation as step11/12 so the
         // post-STARTCPU physics are classified either way. The ONLY new
