@@ -550,6 +550,10 @@ pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, th
     if is_sec2_startcpu {
         if let Some(base) = base_for_bracket {
             crate::hooks::with_hooks((), |h| h.delay_us(500_000));
+            // Pre-log the post-silence read explicitly: on the console GPU
+            // this exact read is the one that never returned (round-2 trace:
+            // "going silent 500ms after start" was the machine's last line).
+            log::error!("[nvidia-rm] SEQ RD off=0x1180f8 post-silence (about to)");
             let bsi_after =
                 unsafe { core::ptr::read_volatile(base.add(0x0011_80f8) as *const NvU32) };
             log::warn!(

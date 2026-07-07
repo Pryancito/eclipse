@@ -2399,16 +2399,60 @@ impl DrmScheme for NvidiaGpu {
                 }
             }
         }
-        // Diagnostics round: the fully-frozen-console run wedged identically,
-        // exonerating CPU pixel writes -- so narrate LIVE this time. live_echo
-        // lifts RM narration to ERROR (passes LOG=error); seq_trace_arm makes
-        // every register access after this GPU's SEC2 STARTCPU pre-log itself,
-        // so a wedge leaves the exact hanging register as the last line.
+        // EXPERIMENT (SEC2-RTOS resume wedge, round 3): the live trace showed
+        // the console GPU boots GSP-RM fine all the way to the CPU sequencer's
+        // CORE_RESUME -- Booter Load clean, RISC-V started, RUN_CPU_SEQUENCER
+        // RPC received -- and then the FIRST BAR0 read after restarting SEC2
+        // (whose VBIOS SEC2-RTOS/BSI payload runs display/VGA restore phases
+        // on a PRIMARY device) never completes. NVIDIA's own primary-VGA
+        // detection keys on PCI I/O decode (kbifIsPciIoAccessEnabled,
+        // osinit.c:900) -- the one config-space difference vs. the (working)
+        // secondary GPU, and one the GPU firmware can see through its own
+        // config mirror. So: clear PCI COMMAND bit 0 (I/O Space Enable) for
+        // the duration of the boot, making the console GPU indistinguishable
+        // from a secondary to the SEC2-RTOS, and restore it afterwards.
+        // Console rendering is untouched (BAR1 is MEM space, bit 1).
+        let io_cmd_old = {
+            use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+            use pci::Location;
+            let loc = Location {
+                bus: self.pci_bus,
+                device: self.pci_device,
+                function: 0,
+            };
+            let ops = &PortOpsImpl;
+            let cmd = unsafe { PCI_ACCESS.read16(ops, loc, 0x04) };
+            unsafe { PCI_ACCESS.write16(ops, loc, 0x04, cmd & !0x0001) };
+            s.push_str(&alloc::format!(
+                "[gpustep11] PCI I/O decode disabled for the boot (COMMAND {:#06x} -> {:#06x}; SEC2-RTOS should now see a non-primary GPU)\n",
+                cmd,
+                cmd & !0x0001
+            ));
+            cmd
+        };
+        // Diagnostics stay on: live_echo lifts RM narration to ERROR (passes
+        // LOG=error); seq_trace_arm makes every register access after this
+        // GPU's SEC2 STARTCPU pre-log itself, so a wedge leaves the exact
+        // hanging register as the last line on screen.
         nvidia_rm_sys::os_interface::live_echo_begin();
         nvidia_rm_sys::os_boundary::seq_trace_arm();
         let boot = self.gsp_boot_run("gpustep11");
         nvidia_rm_sys::os_boundary::seq_trace_disarm();
         nvidia_rm_sys::os_interface::live_echo_end();
+        {
+            use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+            use pci::Location;
+            let loc = Location {
+                bus: self.pci_bus,
+                device: self.pci_device,
+                function: 0,
+            };
+            let ops = &PortOpsImpl;
+            // Restore the original COMMAND value, except INTx stays masked
+            // (gsp_boot_run masked it; Eclipse is fully polled).
+            unsafe { PCI_ACCESS.write16(ops, loc, 0x04, io_cmd_old | (1 << 10)) };
+            s.push_str("[gpustep11] PCI I/O decode restored after boot\n");
+        }
         s.push_str(&boot);
         s
     }
