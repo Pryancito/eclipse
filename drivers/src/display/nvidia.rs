@@ -734,6 +734,104 @@ impl NvidiaGpu {
         }
     }
 
+    /// Pre-boot hardware-state snapshot (Copilot/checklist item: "comparar
+    /// dump de config-space/PMC/display regs primaria vs secundaria justo
+    /// antes del resume"). Raw BAR0 reads only -- no RM involvement. Emitted
+    /// into the /proc block AND live at ERROR level so the console GPU's
+    /// values survive a wedge on screen. The interesting delta vs. the
+    /// secondary: PDISP_VGA_WORKSPACE_BASE (live VGA workspace => bit0
+    /// VALID) and BSI_SECURE_SCRATCH_14 (BRSS handoff state).
+    fn dump_preboot_state(&self, tag: &str) -> String {
+        use core::fmt::Write;
+        let bar0 = self._bar0;
+        let rd = |off: usize| -> u32 { unsafe { core::ptr::read_volatile((bar0 + off) as *const u32) } };
+        let regs: [(&str, usize); 5] = [
+            ("PMC_ENABLE", 0x000200),
+            ("PDISP_VGA_WORKSPACE_BASE", 0x625F04),
+            ("BSI_SECURE_SCRATCH_14", 0x1180F8),
+            ("PBUS_BAR0_WINDOW", 0x001700),
+            ("PMC_BOOT_0", 0x000000),
+        ];
+        let mut s = String::new();
+        for (name, off) in regs {
+            let v = rd(off);
+            let line = alloc::format!("[{}] preboot {} ({:#08x}) = {:#010x}", tag, name, off, v);
+            log::error!("{}", line);
+            let _ = writeln!(s, "{}", line);
+        }
+        let cmd = {
+            use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+            use pci::Location;
+            let loc = Location { bus: self.pci_bus, device: self.pci_device, function: 0 };
+            unsafe { PCI_ACCESS.read16(&PortOpsImpl, loc, 0x04) }
+        };
+        let line = alloc::format!("[{}] preboot PCI COMMAND = {:#06x}", tag, cmd);
+        log::error!("{}", line);
+        let _ = writeln!(s, "{}", line);
+        s
+    }
+
+    /// Disable (or restore) legacy VGA routing on every PCI bridge between
+    /// the root and this GPU -- PCI Bridge Control (offset 0x3E) bit 3
+    /// "VGA Enable". Copilot/checklist item: the earlier experiment only
+    /// cleared the GPU function's own I/O decode; the full chain includes
+    /// the root port/bridges that forward VGA cycles. Returns the list of
+    /// (bus, device, function, old bridge-control value) actually changed,
+    /// for the caller to restore afterwards.
+    fn set_path_vga_routing(&self, disable: bool, restore: &[(u8, u8, u8, u16)]) -> (String, Vec<(u8, u8, u8, u16)>) {
+        use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+        use core::fmt::Write;
+        use pci::Location;
+        let ops = &PortOpsImpl;
+        let mut changed: Vec<(u8, u8, u8, u16)> = Vec::new();
+        let mut s = String::new();
+        if disable {
+            // Walk every bus below the GPU's: any bridge whose
+            // [secondary..subordinate] window routes the GPU's bus is on the
+            // path (covers nested switches too, not just the root port).
+            for bus in 0..=self.pci_bus {
+                for dev in 0..32u8 {
+                    for func in 0..8u8 {
+                        let loc = Location { bus, device: dev, function: func };
+                        let vend = unsafe { PCI_ACCESS.read16(ops, loc, 0x00) };
+                        if vend == 0xFFFF {
+                            continue;
+                        }
+                        let hdr = unsafe { PCI_ACCESS.read8(ops, loc, 0x0E) };
+                        if hdr & 0x7F != 0x01 {
+                            continue; // not a PCI-PCI bridge
+                        }
+                        let sec = unsafe { PCI_ACCESS.read8(ops, loc, 0x19) };
+                        let sub = unsafe { PCI_ACCESS.read8(ops, loc, 0x1A) };
+                        if !(sec <= self.pci_bus && self.pci_bus <= sub) {
+                            continue;
+                        }
+                        let bctl = unsafe { PCI_ACCESS.read16(ops, loc, 0x3E) };
+                        if bctl & (1 << 3) != 0 {
+                            unsafe { PCI_ACCESS.write16(ops, loc, 0x3E, bctl & !(1 << 3)) };
+                            changed.push((bus, dev, func, bctl));
+                            let _ = writeln!(
+                                s,
+                                "[gpustep11] bridge {:02x}:{:02x}.{} VGA routing disabled (BRIDGE_CTL {:#06x} -> {:#06x})",
+                                bus, dev, func, bctl, bctl & !(1 << 3)
+                            );
+                        }
+                    }
+                }
+            }
+            if changed.is_empty() {
+                let _ = writeln!(s, "[gpustep11] no bridge on the path had VGA routing enabled");
+            }
+        } else {
+            for &(bus, dev, func, old) in restore {
+                let loc = Location { bus, device: dev, function: func };
+                unsafe { PCI_ACCESS.write16(ops, loc, 0x3E, old) };
+                let _ = writeln!(s, "[gpustep11] bridge {:02x}:{:02x}.{} VGA routing restored", bus, dev, func);
+            }
+        }
+        (s, changed)
+    }
+
     /// Shared GSP-boot body used by `bringup_step6` (secondary GPU) and
     /// `bringup_step11` (console GPU, with the graphic console frozen by the
     /// /proc generator around this call): INTx mask, kgspInitRm, narration
@@ -756,6 +854,9 @@ impl NvidiaGpu {
         } else if let Some(device_instance) = device_instance {
             let fw = self.gsp_firmware.lock();
             if let Some(fw_bytes) = fw.as_ref() {
+                // Snapshot the pre-boot hardware state first (diffable
+                // primary-vs-secondary; survives a wedge via the live echo).
+                let preboot = self.dump_preboot_state(tag);
                 // Mask this GPU's legacy INTx at the PCI level before booting
                 // GSP-RM. On real hardware the boot now gets all the way to
                 // "GSP FW RM ready." and THEN the machine livelocks: once
@@ -810,6 +911,7 @@ impl NvidiaGpu {
                 let captured = nvidia_rm_sys::os_interface::capture_take();
                 drop(fw);
                 let mut block = String::new();
+                block.push_str(&preboot);
                 if let Some(log) = captured {
                     if !log.is_empty() {
                         let _ = writeln!(block, "[{}]  --- GSP-RM narration (captured) ---", tag);
@@ -2439,6 +2541,12 @@ impl DrmScheme for NvidiaGpu {
             ));
             cmd
         };
+        // Full-chain legacy-VGA routing disable (device I/O decode above +
+        // every bridge on the path here): the SEC2-RTOS display/VGA handoff
+        // suspects legacy routing state; the earlier round only cleared the
+        // function-level bit. Restored after the boot returns.
+        let (bridge_log, bridges_changed) = self.set_path_vga_routing(true, &[]);
+        s.push_str(&bridge_log);
         // Diagnostics stay on: live_echo lifts RM narration (and the
         // sequencer register trace, armed inside gsp_boot_run) to ERROR so
         // it renders live at LOG=error -- a wedge leaves the exact hanging
@@ -2446,6 +2554,8 @@ impl DrmScheme for NvidiaGpu {
         nvidia_rm_sys::os_interface::live_echo_begin();
         let boot = self.gsp_boot_run("gpustep11");
         nvidia_rm_sys::os_interface::live_echo_end();
+        let (restore_log, _) = self.set_path_vga_routing(false, &bridges_changed);
+        s.push_str(&restore_log);
         {
             use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
             use pci::Location;
