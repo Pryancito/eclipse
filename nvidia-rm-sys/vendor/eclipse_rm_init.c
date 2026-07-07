@@ -1437,3 +1437,84 @@ unlock:
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
     return NV_OK;
 }
+
+/*
+ * Console-GPU identity, NVIDIA's own way (osinit.c RmInitNvDevice, run just
+ * BEFORE kgspInitRm on Linux -- osinit.c:1831-1862):
+ *
+ *   RmDeterminePrimaryDevice  -> pGpu->setProperty(PDB_PROP_GPU_PRIMARY_DEVICE)
+ *   RmSetConsolePreservationParams
+ *       -> pKernelBus->bPreserveBar1ConsoleEnabled (console fb at BAR1 base)
+ *       -> pMemoryManager->Ram.ReservedConsoleDispMemSize (aligned console size)
+ *
+ * Neither ever ran in Eclipse, so on the console GPU the SET_GUEST_SYSTEM_INFO
+ * RPC (rpc.c:9577: `rpcInfo->bIsPrimary = pGpu->getProperty(pGpu,
+ * PDB_PROP_GPU_PRIMARY_DEVICE)`) told GSP-RM it was a headless secondary --
+ * while the UEFI GOP scanout was live in its FB and its VGA decode active.
+ * The secondary GPU (for which bIsPrimary=false is TRUE) boots perfectly;
+ * the console GPU wedges during the SEC2 GSP-RM resume even with the graphic
+ * console fully frozen (KD_GRAPHICS, zero CPU pixel writes) -- so the
+ * remaining delta vs. Linux is exactly this mis-declared identity plus the
+ * missing console-region reservation. Called by bringup_step11 (nvidia.rs)
+ * before eclipse_rm_init_gsp, i.e. at the same point in the sequence where
+ * Linux runs the real thing.
+ */
+NV_STATUS eclipse_rm_mark_console_gpu(
+    NvU32 gpuInstance,
+    NvU64 consoleSize,
+    NvU8  bConsoleAtBar1Base)
+{
+    OBJGPU *pGpu;
+    KernelBus *pKernelBus;
+    MemoryManager *pMemoryManager;
+    NV_STATUS status;
+    THREAD_STATE_NODE threadState;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pGpu = gpumgrGetGpu(gpuInstance);
+    if (pGpu == NULL)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+
+    pGpu->setProperty(pGpu, PDB_PROP_GPU_PRIMARY_DEVICE, NV_TRUE);
+
+    /*
+     * BAR1-based console (EFI GOP maps the console fb at the start of BAR1,
+     * exactly our case): RM keeps a BAR1 mapping alive for it. osinit.c:1004:
+     * bPreserveBar1ConsoleEnabled = (fbBaseAddress == nv->fb->cpu_address).
+     */
+    pKernelBus = GPU_GET_KERNEL_BUS(pGpu);
+    if (pKernelBus != NULL && bConsoleAtBar1Base)
+    {
+        pKernelBus->bPreserveBar1ConsoleEnabled = NV_TRUE;
+    }
+
+    /* osinit.c:1017: reserve the console's display memory so nothing (GSP
+     * scrubber, heap) allocates over the live scanout surface. */
+    pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
+    if (pMemoryManager != NULL && consoleSize > 0)
+    {
+        pMemoryManager->Ram.ReservedConsoleDispMemSize =
+            NV_ALIGN_UP(consoleSize, 0x10000);
+    }
+
+    nv_printf(0, "[eclipse-rm-trace] mark_console_gpu: PRIMARY_DEVICE set, "
+              "preserveBar1Console=%u reservedConsoleDispMem=0x%llx\n",
+              (NvU32)(bConsoleAtBar1Base ? 1 : 0),
+              (pMemoryManager != NULL) ? pMemoryManager->Ram.ReservedConsoleDispMemSize : 0);
+
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return NV_OK;
+}
