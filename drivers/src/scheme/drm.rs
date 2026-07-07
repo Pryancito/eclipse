@@ -174,6 +174,16 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Bring-up **Step 13** (`/proc/gpustep13`): EXP 2 -- console-GPU GSP boot
+    /// with a pre-STARTCPU interrupt-drain "pseudo-ISR service loop". Snapshots
+    /// + write-1-to-clears the CPU-facing top-level interrupt tree right before
+    /// the SEC2 STARTCPU posted store, testing whether an unserviced
+    /// fabric/display interrupt (Eclipse is 100% polled, no RM ISR) is what
+    /// stalls the write. Does NOT touch PDISP. Cached per boot. Default: nothing.
+    fn bringup_step13(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Read-only hardware-state dump (`/proc/gpudump`): the discriminating
     /// registers (display head liveness, VGA workspace, PMC, BSI, sysmem
     /// flush) for this GPU, with NO GSP boot -- zero wedge risk. Lets us

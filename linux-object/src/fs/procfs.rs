@@ -14,11 +14,11 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 26] = [
+const PROC_ROOT_STATIC: [&str; 27] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
     "perf", "hunter", "filesystems", "gpudbg", "gpustep2", "gpustep3", "gpustep4", "gpustep5",
     "gpustep6", "gpustep7", "gpustep8", "gpustep9", "gpustep10", "gpustep11", "gpustep12",
-    "gpudump",
+    "gpustep13", "gpudump",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -301,6 +301,7 @@ impl INode for ProcRootINode {
             "gpustep10" => Ok(PROC_GPUSTEP10.clone()),
             "gpustep11" => Ok(PROC_GPUSTEP11.clone()),
             "gpustep12" => Ok(PROC_GPUSTEP12.clone()),
+            "gpustep13" => Ok(PROC_GPUSTEP13.clone()),
             "gpudump" => Ok(PROC_GPUDUMP.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
@@ -1233,6 +1234,23 @@ fn proc_gpustep12_content() -> String {
     s
 }
 
+/// `/proc/gpustep13` — EXP 2: console-GPU GSP boot with a pre-STARTCPU
+/// interrupt-drain "pseudo-ISR service loop" (no display touch). Snapshots +
+/// W1C-drains the CPU-facing interrupt tree right before the SEC2 STARTCPU
+/// store. Screen is untouched, but if STARTCPU still wedges the snapshot only
+/// survives on the framebuffer/serial -- capture with
+/// `cat /proc/gpustep13 > /r13.txt; sync`, then read /r13.txt.
+fn proc_gpustep13_content() -> String {
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.bringup_step13());
+    }
+    if s.is_empty() {
+        s.push_str("[gpustep13] no DRM driver with bring-up support\n");
+    }
+    s
+}
+
 /// `/proc/gpudump` — read-only discriminating hardware dump for every NVIDIA
 /// GPU (console + secondary): display head liveness, VGA workspace base, PMC,
 /// BSI scratch, sysmem flush. NO GSP boot -> ZERO wedge risk. Read this first
@@ -1512,6 +1530,12 @@ lazy_static! {
     static ref PROC_GPUSTEP12: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 88,
         generate: proc_gpustep12_content,
+    });
+    /// `/proc/gpustep13` -- EXP2 console-GPU GSP boot, pre-STARTCPU interrupt
+    /// drain (see proc_gpustep13_content).
+    static ref PROC_GPUSTEP13: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 86,
+        generate: proc_gpustep13_content,
     });
     /// `/proc/gpudump` -- read-only discriminating HW dump, both GPUs (see
     /// proc_gpudump_content).
