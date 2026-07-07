@@ -2086,6 +2086,14 @@ impl DrmScheme for NvidiaGpu {
     fn bringup_step10(&self) -> String {
         use core::fmt::Write;
         let mut s = String::new();
+        // Same guard as step 6: the console GPU never gets its GSP booted
+        // (SEC2 resume wedges its bus), so state-load/CE work can't run
+        // there -- say so instead of a confusing NV_STATUS=0x40 line.
+        if self.drives_boot_display() {
+            return String::from(
+                "[gpustep10] SKIPPED on console GPU (GSP not booted here; CE test runs on the secondary GPU)\n",
+            );
+        }
         let device_instance = *self.rm_device_instance.lock();
         let Some(device_instance) = device_instance else {
             return String::from(
@@ -2133,31 +2141,42 @@ impl DrmScheme for NvidiaGpu {
                     let _ = writeln!(block, "[gpustep10] CeUtils channel:   {}", phase(r.ce_utils_status));
                     let _ = writeln!(block, "[gpustep10] alloc A:           {}", phase(r.alloc_a_status));
                     let _ = writeln!(block, "[gpustep10] alloc B:           {}", phase(r.alloc_b_status));
+                    // CE memset writes only the pattern's LOW BYTE replicated
+                    // (SET_REMAP_COMPONENTS _COMPONENT_SIZE_ONE,
+                    // channel_utils.c) -- spot checks in C already account
+                    // for that; show the byte the hardware actually wrote.
                     let _ = writeln!(
                         block,
-                        "[gpustep10] CE memset B={:#010x}: {}",
-                        r.poison,
+                        "[gpustep10] CE memset B (byte {:#04x}) + spot-check: {}",
+                        r.poison & 0xFF,
                         phase(r.poison_status)
                     );
                     let _ = writeln!(
                         block,
-                        "[gpustep10] CE memset A={:#010x}: {}",
-                        r.pattern,
+                        "[gpustep10] CE memset A (byte {:#04x}) + spot-check: {}",
+                        r.pattern & 0xFF,
                         phase(r.memset_status)
                     );
-                    let _ = writeln!(block, "[gpustep10] CE copy A->B:      {}", phase(r.copy_status));
                     let _ = writeln!(
                         block,
-                        "[gpustep10] CPU verify B:      {} ({} dwords checked, {} mismatches)",
+                        "[gpustep10] CPU unique-fill A + CE copy A->B: {}",
+                        phase(r.copy_status)
+                    );
+                    let _ = writeln!(
+                        block,
+                        "[gpustep10] CPU verify B (per-dword unique): {} ({} dwords checked, {} mismatches)",
                         phase(r.verify_status),
                         r.dwords_checked,
                         r.mismatch_count
                     );
                     if r.mismatch_count > 0 {
+                        // Expected value mirrors the C's ECLIPSE_FILL(i).
+                        let expected =
+                            r.pattern ^ r.first_mismatch_idx.wrapping_mul(0x0100_0193);
                         let _ = writeln!(
                             block,
                             "[gpustep10] first mismatch: dword {} = {:#010x} (expected {:#010x})",
-                            r.first_mismatch_idx, r.first_mismatch_val, r.pattern
+                            r.first_mismatch_idx, r.first_mismatch_val, expected
                         );
                     }
                     if r.verify_status == 0 {
