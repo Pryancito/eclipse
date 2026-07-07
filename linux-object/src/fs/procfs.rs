@@ -1199,16 +1199,17 @@ fn proc_gpustep10_content() -> String {
 /// still for the few seconds the boot takes. NVIDIA's own driver does the
 /// same thing around init via os_disable_console_access() (osinit.c).
 fn proc_gpustep11_content() -> String {
-    use kernel_hal::console::{active_vt, set_kd_mode_vt, KD_GRAPHICS, KD_TEXT};
-    let vt = active_vt();
-    set_kd_mode_vt(vt, KD_GRAPHICS);
+    // NOTE: an earlier revision froze the graphic console (KD_GRAPHICS)
+    // around this call, mirroring Linux's os_disable_console_access(). The
+    // console GPU wedged identically with zero CPU pixel writes -- so the
+    // console is exonerated and this now runs UNFROZEN, with the driver
+    // narrating every post-STARTCPU register access live (see
+    // bringup_step11): on a wedge, the last line on screen names the exact
+    // register access that never completed.
     let mut s = String::new();
     for d in kernel_hal::drivers::all_drm().as_vec().iter() {
         s.push_str(&d.bringup_step11());
     }
-    // Back to text mode; this also repaints the VT from its shadow buffer,
-    // restoring everything logged while frozen.
-    set_kd_mode_vt(vt, KD_TEXT);
     if s.is_empty() {
         s.push_str("[gpustep11] no DRM driver with bring-up support\n");
     }
