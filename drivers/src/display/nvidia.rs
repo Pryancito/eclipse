@@ -2399,7 +2399,17 @@ impl DrmScheme for NvidiaGpu {
                 }
             }
         }
-        s.push_str(&self.gsp_boot_run("gpustep11"));
+        // Diagnostics round: the fully-frozen-console run wedged identically,
+        // exonerating CPU pixel writes -- so narrate LIVE this time. live_echo
+        // lifts RM narration to ERROR (passes LOG=error); seq_trace_arm makes
+        // every register access after this GPU's SEC2 STARTCPU pre-log itself,
+        // so a wedge leaves the exact hanging register as the last line.
+        nvidia_rm_sys::os_interface::live_echo_begin();
+        nvidia_rm_sys::os_boundary::seq_trace_arm();
+        let boot = self.gsp_boot_run("gpustep11");
+        nvidia_rm_sys::os_boundary::seq_trace_disarm();
+        nvidia_rm_sys::os_interface::live_echo_end();
+        s.push_str(&boot);
         s
     }
 

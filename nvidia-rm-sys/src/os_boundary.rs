@@ -330,6 +330,67 @@ pub extern "C" fn osDetachFromProcess(arg0: *mut c_void) {
 /// doorbell) that the machine now freezes on.
 static GSP_PROBE_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Console-GPU SEC2-resume register trace (step 11 diagnostics). Armed by
+/// `seq_trace_arm()` (bringup_step11) before the console GPU's GSP boot;
+/// goes LIVE at that boot's own SEC2 STARTCPU write (the point after which
+/// the machine has always wedged on this GPU). From then on EVERY BAR0
+/// register access logs at ERROR level (passes LOG=error, renders live),
+/// pre-logged BEFORE the volatile access -- so when the wedge hits, the
+/// last line on screen names the exact register and direction. Consecutive
+/// same-offset repeats are collapsed (poll loops), capped as a backstop.
+/// CPU pixel writes during this window are exonerated as the trigger: the
+/// fully-frozen-console run (KD_GRAPHICS, zero presents) wedged identically.
+static SEQ_TRACE_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static SEQ_TRACE_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Arm the SEC2-resume register trace for the next GSP boot (step 11).
+pub fn seq_trace_arm() {
+    use core::sync::atomic::Ordering;
+    SEQ_TRACE_ARMED.store(true, Ordering::Relaxed);
+    SEQ_TRACE_LIVE.store(false, Ordering::Relaxed);
+}
+
+/// Disarm the SEC2-resume register trace (boot returned).
+pub fn seq_trace_disarm() {
+    use core::sync::atomic::Ordering;
+    SEQ_TRACE_ARMED.store(false, Ordering::Relaxed);
+    SEQ_TRACE_LIVE.store(false, Ordering::Relaxed);
+}
+
+// Collapse consecutive repeats of the same (kind, offset) so a poll loop
+// doesn't eat the cap; 0 = read, 1 = write, packed with the offset.
+static SEQ_TRACE_LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+static SEQ_TRACE_LINES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+const SEQ_TRACE_CAP: u32 = 400;
+
+/// Pre-log a traced register access. Returns true if a line was emitted
+/// (first access of a run, under cap) so the read path can pair it with a
+/// completion line carrying the value.
+#[inline]
+fn seq_trace(kind_write: bool, offset: NvU32, value: Option<NvU32>) -> bool {
+    use core::sync::atomic::Ordering;
+    if !SEQ_TRACE_LIVE.load(Ordering::Relaxed) {
+        return false;
+    }
+    let key = ((kind_write as u64) << 32) | offset as u64;
+    if SEQ_TRACE_LAST.swap(key, Ordering::Relaxed) == key {
+        return false; // consecutive repeat (poll loop) -- already narrated once
+    }
+    if SEQ_TRACE_LINES.fetch_add(1, Ordering::Relaxed) >= SEQ_TRACE_CAP {
+        return false;
+    }
+    if kind_write {
+        log::error!(
+            "[nvidia-rm] SEQ WR off={:#x} <= {:#x} (about to)",
+            offset,
+            value.unwrap_or(0)
+        );
+    } else {
+        log::error!("[nvidia-rm] SEQ RD off={:#x} (about to)", offset);
+    }
+    true
+}
+
 #[no_mangle]
 pub extern "C" fn osDevReadReg008(_pGpu: *mut c_void, pMapping: *mut c_void, this_address: NvU32) -> NvU8 {
     match dev_mapping_base(pMapping) {
@@ -389,10 +450,17 @@ pub extern "C" fn osDevReadReg032(_pGpu: *mut c_void, pMapping: *mut c_void, thi
             log::warn!("[nvidia-rm] {} RD off={:#x} (about to deref)", tag, this_address);
         }
     }
+    // Step-11 SEC2-resume trace: pre-log EVERY read live (ERROR level)
+    // before the volatile access -- the read that never completes leaves
+    // its "(about to)" line as the last thing on screen.
+    let seq_logged = seq_trace(false, this_address, None);
     let v = match dev_mapping_base(pMapping) {
         Some(base) => unsafe { core::ptr::read_volatile(base.add(this_address as usize) as *const NvU32) },
         None => 0xFFFF_FFFF,
     };
+    if seq_logged {
+        log::error!("[nvidia-rm] SEQ RD off={:#x} = {:#x}", this_address, v);
+    }
     if is_sec2 || is_bsi {
         use core::sync::atomic::{AtomicU32, Ordering};
         static PROBE_RD_DONE: AtomicU32 = AtomicU32::new(0);
@@ -442,6 +510,8 @@ pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, th
             log::warn!("[nvidia-rm] SEC2 WR off={:#x} <= {:#x}", this_address, this_value);
         }
     }
+    // Step-11 SEC2-resume trace (see seq_trace): pre-log every write live.
+    let _ = seq_trace(true, this_address, Some(this_value));
     // STARTCPU bracket. Observed on real hardware: the last line that ever
     // renders is this probe's own "WR off=0x840130 <= 0x2" -- the BSI read
     // probe's PRE-log line never appears, even though it prints before its
@@ -458,6 +528,13 @@ pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, th
     let base_for_bracket = dev_mapping_base(pMapping);
     if is_sec2_startcpu {
         GSP_PROBE_ON.store(true, core::sync::atomic::Ordering::Relaxed);
+        // Step-11 trace goes LIVE exactly here: this GPU's SEC2 resume is
+        // starting -- the window it has always wedged in. (No-op unless
+        // bringup_step11 armed the trace; step 6 secondary boots stay quiet.)
+        if SEQ_TRACE_ARMED.load(core::sync::atomic::Ordering::Relaxed) {
+            SEQ_TRACE_LIVE.store(true, core::sync::atomic::Ordering::Relaxed);
+            log::error!("[nvidia-rm] SEQ trace LIVE (STARTCPU on traced GPU; every reg access narrates until boot returns)");
+        }
         if let Some(base) = base_for_bracket {
             let bsi_before =
                 unsafe { core::ptr::read_volatile(base.add(0x0011_80f8) as *const NvU32) };
