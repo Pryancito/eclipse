@@ -768,6 +768,156 @@ impl NvidiaGpu {
         let line = alloc::format!("[{}] preboot PCI COMMAND = {:#06x}", tag, cmd);
         log::error!("{}", line);
         let _ = writeln!(s, "{}", line);
+        // Sysmem flush buffer target (kern_mem_sys_gm107.c programs it; a
+        // zero/garbage value on one GPU would resurrect that theory).
+        let flush = rd(0x100C10);
+        let line = alloc::format!("[{}] preboot PFB_NISO_FLUSH_SYSMEM_ADDR (0x100c10) = {:#010x}", tag, flush);
+        log::error!("{}", line);
+        let _ = writeln!(s, "{}", line);
+        // Display liveness: the scanout theory REQUIRES the primary's heads
+        // to be AWAKE with an advancing raster before it can explain the
+        // wedge. NV_PDISP_FE_CORE_HEAD_STATE(i)=0x612078+i*2048, mode bits
+        // 9:8 (0=SLEEP,1=SNOOZE,2=AWAKE, dev_disp.h v04_00:31-35);
+        // NV_PDISP_RG_DPCA(i)=0x616330+i*2048 (v03_00 header -- read-only
+        // probe, 0xBADFxxxx = not present at that offset on v04) read twice
+        // ~30ms apart: FRM/LINE counters advancing = live raster fetch.
+        // Gated on PMC_ENABLE bit30 (PDISP engine enabled) to avoid priv
+        // errors on a display-less config.
+        if rd(0x000200) & (1 << 30) != 0 {
+            let mut dpca_a = [0u32; 4];
+            for (i, slot) in dpca_a.iter_mut().enumerate() {
+                *slot = rd(0x616330 + i * 2048);
+            }
+            // ~30ms spin so a live raster visibly advances its counters.
+            let t0 = unsafe { crate::bus::drivers_timer_now_as_micros() };
+            while unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(t0) < 30_000 {
+                core::hint::spin_loop();
+            }
+            for i in 0..4usize {
+                let head = rd(0x612078 + i * 2048);
+                let mode = (head >> 8) & 0x3;
+                let dpca_b = rd(0x616330 + i * 2048);
+                let line = alloc::format!(
+                    "[{}] preboot head{} STATE={:#010x} (mode={} {}) DPCA {:#010x} -> {:#010x} ({})",
+                    tag,
+                    i,
+                    head,
+                    mode,
+                    match mode { 0 => "SLEEP", 1 => "SNOOZE", 2 => "AWAKE", _ => "?" },
+                    dpca_a[i],
+                    dpca_b,
+                    if dpca_a[i] != dpca_b { "ADVANCING = live raster" } else { "frozen" }
+                );
+                log::error!("{}", line);
+                let _ = writeln!(s, "{}", line);
+            }
+        } else {
+            let line = alloc::format!("[{}] preboot PDISP disabled in PMC_ENABLE (no head dump)", tag);
+            log::error!("{}", line);
+            let _ = writeln!(s, "{}", line);
+        }
+        s
+    }
+
+    /// Packed config-space handle for THIS GPU (os_pci_init_handle format:
+    /// valid-tag | bus<<16 | device<<8 | function).
+    fn config_handle(&self) -> usize {
+        0x8000_0000usize | ((self.pci_bus as usize) << 16) | ((self.pci_device as usize) << 8)
+    }
+
+    /// Packed config-space handle for the immediate upstream bridge, 0 if
+    /// none found.
+    fn parent_config_handle(&self) -> usize {
+        self.find_parent_bridge()
+            .map(|(b, d, f)| {
+                0x8000_0000usize | ((b as usize) << 16) | ((d as usize) << 8) | f as usize
+            })
+            .unwrap_or(0)
+    }
+
+    /// Immediate upstream bridge (the one whose secondary bus IS this GPU's
+    /// bus) -- the root port for a directly-attached GPU.
+    fn find_parent_bridge(&self) -> Option<(u8, u8, u8)> {
+        use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+        use pci::Location;
+        let ops = &PortOpsImpl;
+        for bus in 0..=self.pci_bus {
+            for dev in 0..32u8 {
+                for func in 0..8u8 {
+                    let loc = Location { bus, device: dev, function: func };
+                    let vend = unsafe { PCI_ACCESS.read16(ops, loc, 0x00) };
+                    if vend == 0xFFFF {
+                        continue;
+                    }
+                    let hdr = unsafe { PCI_ACCESS.read8(ops, loc, 0x0E) };
+                    if hdr & 0x7F != 0x01 {
+                        continue;
+                    }
+                    let sec = unsafe { PCI_ACCESS.read8(ops, loc, 0x19) };
+                    if sec == self.pci_bus {
+                        return Some((bus, dev, func));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Containment: program the root port's PCIe Completion Timeout so a
+    /// dead endpoint turns CPU reads into bounded all-ones completions
+    /// instead of an unbounded core stall. Best-effort -- logs what it
+    /// found; if the platform doesn't support CTO ranges (DevCap2[3:0]==0)
+    /// nothing is written.
+    fn arm_completion_timeout(&self) -> String {
+        use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+        use core::fmt::Write;
+        use pci::Location;
+        let mut s = String::new();
+        let Some((b, d, f)) = self.find_parent_bridge() else {
+            let _ = writeln!(s, "[gpustep11] CTO: no parent bridge found");
+            return s;
+        };
+        let ops = &PortOpsImpl;
+        let loc = Location { bus: b, device: d, function: f };
+        // Walk the capability list for the PCIe capability (ID 0x10).
+        let mut ptr = unsafe { PCI_ACCESS.read8(ops, loc, 0x34) };
+        let mut cap = 0u8;
+        for _ in 0..16 {
+            if ptr == 0 || ptr == 0xFF {
+                break;
+            }
+            let id = unsafe { PCI_ACCESS.read8(ops, loc, ptr as u16) };
+            if id == 0x10 {
+                cap = ptr;
+                break;
+            }
+            ptr = unsafe { PCI_ACCESS.read8(ops, loc, ptr as u16 + 1) };
+        }
+        if cap == 0 {
+            let _ = writeln!(s, "[gpustep11] CTO: root port {:02x}:{:02x}.{} has no PCIe cap?", b, d, f);
+            return s;
+        }
+        let devcap2 = unsafe { PCI_ACCESS.read32(ops, loc, cap as u16 + 0x24) };
+        let ranges = devcap2 & 0xF;
+        let dc2 = unsafe { PCI_ACCESS.read16(ops, loc, cap as u16 + 0x28) };
+        if ranges == 0 {
+            let _ = writeln!(
+                s,
+                "[gpustep11] CTO: root port {:02x}:{:02x}.{} supports no timeout ranges (DevCap2={:#010x}, DC2={:#06x}) -- containment unavailable",
+                b, d, f, devcap2, dc2
+            );
+            return s;
+        }
+        // Pick the shortest supported range: A(bit0)->0b0001, B->0b0101,
+        // C->0b1001, D->0b1101 (PCIe base spec encoding).
+        let val: u16 = if ranges & 1 != 0 { 0b0001 } else if ranges & 2 != 0 { 0b0101 } else if ranges & 4 != 0 { 0b1001 } else { 0b1101 };
+        let new_dc2 = (dc2 & !0x001F) | val; // clear CTO-disable (bit4) + set range
+        unsafe { PCI_ACCESS.write16(ops, loc, cap as u16 + 0x28, new_dc2) };
+        let _ = writeln!(
+            s,
+            "[gpustep11] CTO armed on root port {:02x}:{:02x}.{}: DevCap2={:#010x} DC2 {:#06x} -> {:#06x} (reads of a dead endpoint now complete all-ones instead of hanging, chipset permitting)",
+            b, d, f, devcap2, dc2, new_dc2
+        );
         s
     }
 
@@ -2547,6 +2697,10 @@ impl DrmScheme for NvidiaGpu {
         // function-level bit. Restored after the boot returns.
         let (bridge_log, bridges_changed) = self.set_path_vga_routing(true, &[]);
         s.push_str(&bridge_log);
+        // Containment (root-port completion timeout) + post-STARTCPU bus
+        // autopsy instrumentation -- see their doc comments.
+        s.push_str(&self.arm_completion_timeout());
+        nvidia_rm_sys::os_boundary::autopsy_arm(self.config_handle(), self.parent_config_handle());
         // Diagnostics stay on: live_echo lifts RM narration (and the
         // sequencer register trace, armed inside gsp_boot_run) to ERROR so
         // it renders live at LOG=error -- a wedge leaves the exact hanging
@@ -2554,6 +2708,7 @@ impl DrmScheme for NvidiaGpu {
         nvidia_rm_sys::os_interface::live_echo_begin();
         let boot = self.gsp_boot_run("gpustep11");
         nvidia_rm_sys::os_interface::live_echo_end();
+        nvidia_rm_sys::os_boundary::autopsy_disarm();
         let (restore_log, _) = self.set_path_vga_routing(false, &bridges_changed);
         s.push_str(&restore_log);
         {
@@ -2570,6 +2725,53 @@ impl DrmScheme for NvidiaGpu {
             unsafe { PCI_ACCESS.write16(ops, loc, 0x04, io_cmd_old | (1 << 10)) };
             s.push_str("[gpustep11] PCI I/O decode restored after boot\n");
         }
+        s.push_str(&boot);
+        s
+    }
+
+    /// Step 12 (`/proc/gpustep12`): EXP 1 -- console-GPU GSP boot with the
+    /// DISPLAY ENGINE HELD IN RESET (PMC_ENABLE bit 30 cleared right after
+    /// kgspCalculateFbLayout consumes NV_PDISP_VGA_WORKSPACE_BASE, via the
+    /// register-shim trigger in os_boundary). Zero isochronous scanout
+    /// traffic during the SEC2-RTOS resume: if the wedge is live-display FB
+    /// fetch vs. the HS payload, this boot COMPLETES. THE SCREEN GOES DARK
+    /// at the trigger and stays dark until reboot -- run it blind:
+    ///   `cat /proc/gpustep12 > /r12.txt; sync`
+    /// then hard-reset and read /r12.txt. Skip this experiment entirely if
+    /// the step-11 preboot dump showed the primary's heads already
+    /// SLEEP/frozen (theory pre-falsified).
+    fn bringup_step12(&self) -> String {
+        if !self.drives_boot_display() {
+            return String::from(
+                "[gpustep12] SKIPPED on secondary GPU (already boots via /proc/gpustep6)\n",
+            );
+        }
+        let mut s = String::new();
+        s.push_str(
+            "[gpustep12] EXP1: GSP boot with PDISP held in reset -- screen goes dark at the trigger; capture with `cat /proc/gpustep12 > /r12.txt; sync`\n",
+        );
+        if let Some(device_instance) = *self.rm_device_instance.lock() {
+            let (console_size, at_bar1_base) = match *BOOT_FB_INFO.lock() {
+                Some(fb) => (
+                    fb.pitch as u64 * fb.height as u64,
+                    fb.phys == self.bar1_phys,
+                ),
+                None => (0, false),
+            };
+            let _ = nvidia_rm_sys::rm_init::mark_console_gpu(
+                device_instance,
+                console_size,
+                at_bar1_base,
+            );
+        }
+        s.push_str(&self.arm_completion_timeout());
+        nvidia_rm_sys::os_boundary::autopsy_arm(self.config_handle(), self.parent_config_handle());
+        nvidia_rm_sys::os_boundary::pdisp_kill_arm();
+        nvidia_rm_sys::os_interface::live_echo_begin();
+        let boot = self.gsp_boot_run("gpustep12");
+        nvidia_rm_sys::os_interface::live_echo_end();
+        nvidia_rm_sys::os_boundary::pdisp_kill_disarm();
+        nvidia_rm_sys::os_boundary::autopsy_disarm();
         s.push_str(&boot);
         s
     }
