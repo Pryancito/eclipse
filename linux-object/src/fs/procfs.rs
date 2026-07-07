@@ -14,10 +14,10 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 23] = [
+const PROC_ROOT_STATIC: [&str; 24] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
     "perf", "hunter", "filesystems", "gpudbg", "gpustep2", "gpustep3", "gpustep4", "gpustep5",
-    "gpustep6", "gpustep7", "gpustep8", "gpustep9", "gpustep10",
+    "gpustep6", "gpustep7", "gpustep8", "gpustep9", "gpustep10", "gpustep11",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -298,6 +298,7 @@ impl INode for ProcRootINode {
             "gpustep8" => Ok(PROC_GPUSTEP8.clone()),
             "gpustep9" => Ok(PROC_GPUSTEP9.clone()),
             "gpustep10" => Ok(PROC_GPUSTEP10.clone()),
+            "gpustep11" => Ok(PROC_GPUSTEP11.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
                 if let Ok(pid) = name.parse::<u64>() {
@@ -1186,6 +1187,34 @@ fn proc_gpustep10_content() -> String {
     s
 }
 
+/// `/proc/gpustep11` — GSP-RM boot on the CONSOLE GPU, with the graphic
+/// console frozen around it. The wedge that made step 6 skip this GPU is
+/// (per every experiment so far) CPU pixel writes landing in its BAR1 —
+/// the console framebuffer — during the SEC2 GSP-RM resume window; step 6's
+/// own narration draws dozens of lines right into that window. Freezing =
+/// KD_GRAPHICS on the active VT: pixel presentation stops (this is the
+/// battle-tested Xorg handover path), while the VT shadow buffer keeps
+/// accumulating and serial/dmesg stay live. Returning to KD_TEXT repaints
+/// the whole backlog, so nothing is visually lost — the screen just stands
+/// still for the few seconds the boot takes. NVIDIA's own driver does the
+/// same thing around init via os_disable_console_access() (osinit.c).
+fn proc_gpustep11_content() -> String {
+    use kernel_hal::console::{active_vt, set_kd_mode_vt, KD_GRAPHICS, KD_TEXT};
+    let vt = active_vt();
+    set_kd_mode_vt(vt, KD_GRAPHICS);
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.bringup_step11());
+    }
+    // Back to text mode; this also repaints the VT from its shadow buffer,
+    // restoring everything logged while frozen.
+    set_kd_mode_vt(vt, KD_TEXT);
+    if s.is_empty() {
+        s.push_str("[gpustep11] no DRM driver with bring-up support\n");
+    }
+    s
+}
+
 fn proc_cpuinfo_content() -> String {
     let mut brand = kernel_hal::cpu::cpu_brand();
     if brand.is_empty() {
@@ -1438,6 +1467,12 @@ lazy_static! {
     static ref PROC_GPUSTEP10: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 90,
         generate: proc_gpustep10_content,
+    });
+    /// `/proc/gpustep11` -- console-GPU GSP boot, console frozen (see
+    /// proc_gpustep11_content).
+    static ref PROC_GPUSTEP11: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 89,
+        generate: proc_gpustep11_content,
     });
     static ref PROC_SWAPS: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 18,

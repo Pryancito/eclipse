@@ -158,6 +158,14 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Bring-up **Step 11** (`/proc/gpustep11`): GSP-RM boot on the CONSOLE
+    /// GPU. The /proc generator freezes the graphic console (KD_GRAPHICS)
+    /// around this call so no pixel write touches the GPU's BAR1 during the
+    /// SEC2 resume window. Cached per boot. Default: nothing.
+    fn bringup_step11(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Import a buffer allocated by the kernel (DRM core)
     fn import_buffer(&self, _handle: GemHandle) -> bool {
         true
