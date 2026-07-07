@@ -400,6 +400,15 @@ pub fn autopsy_disarm() {
 /// only by /proc/gpustep12.
 static PDISP_KILL_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+// EXP1c: PDISP is held in reset only for the SEC2 HS-resume window (which
+// wedges the bus on live scanout), then RESTORED once the RM narrates
+// "RISCV started" -- past the wedge, GSP-RM about to run its own init, which
+// timed out in EXP1/EXP1b because it touches the display engine we'd left in
+// reset. Restoring here mirrors Linux (scanout live throughout GSP-RM run).
+static PDISP_SAVED_BASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static PDISP_SAVED_PMC: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static PDISP_RESTORE_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Arm the PDISP hold-in-reset experiment for the next GSP boot.
 pub fn pdisp_kill_arm() {
     PDISP_KILL_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
@@ -408,6 +417,32 @@ pub fn pdisp_kill_arm() {
 /// Disarm the PDISP experiment (boot returned or never triggered).
 pub fn pdisp_kill_disarm() {
     PDISP_KILL_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
+    PDISP_RESTORE_PENDING.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Restore PDISP (re-set NV_PMC_ENABLE bit 30) if the kill experiment armed
+/// it. Called from the RM narration hook the moment "RISCV started" is seen
+/// -- the SEC2 HS-resume window is over, so scanout can safely come back and
+/// GSP-RM finds the display engine alive for its own init.
+pub fn pdisp_restore() {
+    use core::sync::atomic::Ordering;
+    if !PDISP_RESTORE_PENDING.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let base = PDISP_SAVED_BASE.load(Ordering::Relaxed);
+    let pmc = PDISP_SAVED_PMC.load(Ordering::Relaxed);
+    if base != 0 {
+        unsafe {
+            let p = (base + 0x200) as *mut NvU32;
+            core::ptr::write_volatile(p, pmc);
+            let _ = core::ptr::read_volatile(p);
+            let _ = core::ptr::read_volatile(p);
+        }
+        seq_trace_emit(&alloc::format!(
+            "[nvidia-rm] EXP1c: PDISP restored (PMC_ENABLE <- {:#010x}) after RISCV start -- past the wedge window, scanout back for GSP-RM init",
+            pmc
+        ));
+    }
 }
 
 /// Switch the armed trace live. Called by os_interface's narration hook the
@@ -564,6 +599,13 @@ pub extern "C" fn osDevReadReg032(_pGpu: *mut c_void, pMapping: *mut c_void, thi
                 core::ptr::write_volatile(pmc, old & !(1u32 << 30));
                 let rb1 = core::ptr::read_volatile(pmc);
                 let rb2 = core::ptr::read_volatile(pmc);
+                // Stash the original PMC_ENABLE and this GPU's BAR0 base so
+                // pdisp_restore() (fired from the "RISCV started" narration
+                // marker, i.e. AFTER the SEC2 HS resume window that wedges on
+                // live scanout) can bring PDISP back before GSP-RM needs it.
+                PDISP_SAVED_BASE.store(base as usize, core::sync::atomic::Ordering::Relaxed);
+                PDISP_SAVED_PMC.store(old, core::sync::atomic::Ordering::Relaxed);
+                PDISP_RESTORE_PENDING.store(true, core::sync::atomic::Ordering::Relaxed);
                 seq_trace_emit(&alloc::format!(
                     "[nvidia-rm] EXP1: PDISP held in reset (PMC_ENABLE {:#010x} -> {:#010x}, readbacks {:#010x}/{:#010x}); screen goes dark now, boot continues",
                     old,

@@ -593,6 +593,12 @@ fn log_raw_cstr(str_: *const c_char) {
             if s.contains("RUN_CPU_SEQUENCER") {
                 crate::os_boundary::seq_trace_go_live();
             }
+            // EXP1c: the SEC2 HS-resume window (which wedges on live scanout)
+            // is over once GSP's RISC-V core is up -- restore PDISP now so
+            // GSP-RM finds the display engine alive during its own init.
+            if s.contains("RISCV started") {
+                crate::os_boundary::pdisp_restore();
+            }
         }
     }
 }

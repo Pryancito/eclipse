@@ -2765,15 +2765,15 @@ impl DrmScheme for NvidiaGpu {
         }
         let mut s = String::new();
         s.push_str(
-            "[gpustep12] EXP1b: GSP boot with PDISP held in reset AND declared NON-primary -- screen goes dark at the trigger; capture with `cat /proc/gpustep12 > /r12.txt; sync`\n",
+            "[gpustep12] EXP1c: PDISP reset ONLY for the SEC2-resume window, then restored at 'RISCV started' -- screen blanks then comes back; capture with `cat /proc/gpustep12 > /r12.txt; sync`\n",
         );
-        // EXP1b: do NOT call mark_console_gpu here (v1 did, and GSP-RM then
-        // timed out in kgspWaitForRmInitDone -- it took the primary-display
-        // path while PDISP was in reset). Leaving bIsPrimary=false makes the
-        // console GPU look exactly like the working headless secondary to
-        // GSP-RM, so it skips primary-display handling and should reach
-        // GSP_INIT_DONE. The screen stays dark (GSP won't own the display);
-        // lighting it is a follow-up once the boot completes.
+        // EXP1c: EXP1b proved being non-primary doesn't fix the
+        // kgspWaitForRmInitDone timeout -- so PDISP-in-reset itself is what
+        // stalls GSP-RM's init (it touches the display engine before
+        // GSP_INIT_DONE). Fix: os_boundary holds PDISP in reset only across
+        // the SEC2 HS-resume (the wedge window) and restores it on the
+        // "RISCV started" narration marker, so GSP-RM finds the display alive.
+        // Still non-primary for now to isolate the timeout fix.
         s.push_str(&self.arm_completion_timeout());
         nvidia_rm_sys::os_boundary::autopsy_arm(self.config_handle(), self.parent_config_handle());
         nvidia_rm_sys::os_boundary::pdisp_kill_arm();
