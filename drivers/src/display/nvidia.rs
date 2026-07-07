@@ -794,10 +794,19 @@ impl NvidiaGpu {
                 // here (the kernel log::warn! stream is invisible on the
                 // bring-up box; see bringup_step5).
                 nvidia_rm_sys::os_interface::capture_begin();
+                // Arm the sequencer register trace for EVERY GSP boot: it goes
+                // live at the RUN_CPU_SEQUENCER RPC and records each register
+                // access into the capture buffer (readable later in this
+                // /proc file) -- and onto the live screen too when live_echo
+                // is armed (step 11's console-GPU boot). The successful
+                // secondary boot thus yields a full reference sequence to
+                // diff against the console GPU's wedge point.
+                nvidia_rm_sys::os_boundary::seq_trace_arm();
                 let computed = match nvidia_rm_sys::rm_init::init_gsp(device_instance, fw_bytes) {
                     Ok(()) => String::from("kgspInitRm OK"),
                     Err(status) => alloc::format!("kgspInitRm FAILED, NV_STATUS={:#x}", status),
                 };
+                nvidia_rm_sys::os_boundary::seq_trace_disarm();
                 let captured = nvidia_rm_sys::os_interface::capture_take();
                 drop(fw);
                 let mut block = String::new();
@@ -2430,14 +2439,12 @@ impl DrmScheme for NvidiaGpu {
             ));
             cmd
         };
-        // Diagnostics stay on: live_echo lifts RM narration to ERROR (passes
-        // LOG=error); seq_trace_arm makes every register access after this
-        // GPU's SEC2 STARTCPU pre-log itself, so a wedge leaves the exact
-        // hanging register as the last line on screen.
+        // Diagnostics stay on: live_echo lifts RM narration (and the
+        // sequencer register trace, armed inside gsp_boot_run) to ERROR so
+        // it renders live at LOG=error -- a wedge leaves the exact hanging
+        // register access as the last line on screen.
         nvidia_rm_sys::os_interface::live_echo_begin();
-        nvidia_rm_sys::os_boundary::seq_trace_arm();
         let boot = self.gsp_boot_run("gpustep11");
-        nvidia_rm_sys::os_boundary::seq_trace_disarm();
         nvidia_rm_sys::os_interface::live_echo_end();
         {
             use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
