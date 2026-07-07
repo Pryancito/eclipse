@@ -2765,22 +2765,15 @@ impl DrmScheme for NvidiaGpu {
         }
         let mut s = String::new();
         s.push_str(
-            "[gpustep12] EXP1: GSP boot with PDISP held in reset -- screen goes dark at the trigger; capture with `cat /proc/gpustep12 > /r12.txt; sync`\n",
+            "[gpustep12] EXP1b: GSP boot with PDISP held in reset AND declared NON-primary -- screen goes dark at the trigger; capture with `cat /proc/gpustep12 > /r12.txt; sync`\n",
         );
-        if let Some(device_instance) = *self.rm_device_instance.lock() {
-            let (console_size, at_bar1_base) = match *BOOT_FB_INFO.lock() {
-                Some(fb) => (
-                    fb.pitch as u64 * fb.height as u64,
-                    fb.phys == self.bar1_phys,
-                ),
-                None => (0, false),
-            };
-            let _ = nvidia_rm_sys::rm_init::mark_console_gpu(
-                device_instance,
-                console_size,
-                at_bar1_base,
-            );
-        }
+        // EXP1b: do NOT call mark_console_gpu here (v1 did, and GSP-RM then
+        // timed out in kgspWaitForRmInitDone -- it took the primary-display
+        // path while PDISP was in reset). Leaving bIsPrimary=false makes the
+        // console GPU look exactly like the working headless secondary to
+        // GSP-RM, so it skips primary-display handling and should reach
+        // GSP_INIT_DONE. The screen stays dark (GSP won't own the display);
+        // lighting it is a follow-up once the boot completes.
         s.push_str(&self.arm_completion_timeout());
         nvidia_rm_sys::os_boundary::autopsy_arm(self.config_handle(), self.parent_config_handle());
         nvidia_rm_sys::os_boundary::pdisp_kill_arm();
