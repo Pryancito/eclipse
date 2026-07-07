@@ -14,10 +14,10 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 22] = [
+const PROC_ROOT_STATIC: [&str; 23] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
     "perf", "hunter", "filesystems", "gpudbg", "gpustep2", "gpustep3", "gpustep4", "gpustep5",
-    "gpustep6", "gpustep7", "gpustep8", "gpustep9",
+    "gpustep6", "gpustep7", "gpustep8", "gpustep9", "gpustep10",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -297,6 +297,7 @@ impl INode for ProcRootINode {
             "gpustep7" => Ok(PROC_GPUSTEP7.clone()),
             "gpustep8" => Ok(PROC_GPUSTEP8.clone()),
             "gpustep9" => Ok(PROC_GPUSTEP9.clone()),
+            "gpustep10" => Ok(PROC_GPUSTEP10.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
                 if let Ok(pid) = name.parse::<u64>() {
@@ -1172,6 +1173,19 @@ fn proc_gpustep9_content() -> String {
     s
 }
 
+/// `/proc/gpustep10` — first real copy-engine data movement (CE memset +
+/// copy between VRAM buffers, CPU readback verify). Cached per boot.
+fn proc_gpustep10_content() -> String {
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.bringup_step10());
+    }
+    if s.is_empty() {
+        s.push_str("[gpustep10] no DRM driver with bring-up support\n");
+    }
+    s
+}
+
 fn proc_cpuinfo_content() -> String {
     let mut brand = kernel_hal::cpu::cpu_brand();
     if brand.is_empty() {
@@ -1419,6 +1433,11 @@ lazy_static! {
     static ref PROC_GPUSTEP9: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 91,
         generate: proc_gpustep9_content,
+    });
+    /// `/proc/gpustep10` -- CE data-movement verify (see proc_gpustep10_content).
+    static ref PROC_GPUSTEP10: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 90,
+        generate: proc_gpustep10_content,
     });
     static ref PROC_SWAPS: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 18,

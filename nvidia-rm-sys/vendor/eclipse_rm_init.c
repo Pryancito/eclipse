@@ -53,6 +53,11 @@
 #include "os/os.h"
 #include "tls/tls.h"
 #include "g_hal_register.h"
+/* Step 10 (CE memset/copy + readback verify) */
+#include "gpu/mem_mgr/mem_mgr.h"
+#include "gpu/mem_mgr/mem_desc.h"
+#include "gpu/mem_mgr/ce_utils.h"
+#include "gpu/bus/kern_bus.h"
 
 /*
  * Real, vendored (src/nvidia/src/kernel/core/system.c), but its declaring
@@ -1102,6 +1107,275 @@ NV_STATUS eclipse_rm_state_init(NvU32 gpuInstance, EclipseStateInitResult *pOut)
               pOut->loadStatus);
 
 unlock:
+    rmapiLockRelease();
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return NV_OK;
+}
+
+/*
+ * Step-10: first real DATA MOVEMENT through the copy engine on the
+ * state-loaded GPU. Uses the RM's own internal CE utility channel
+ * (MemoryManager.pCeUtils -- constructed during gpuStateLoad's
+ * post-scheduling-enable callbacks, mem_mgr.c memmgrInitCeUtils), i.e. the
+ * exact same machinery the RM's VRAM scrubber uses, on the exact doorbell
+ * path (channelFillGpFifo -> pDoorbellRegisterOffset) that step 9 debugging
+ * fixed via the real osMapGPU:
+ *
+ *   1. Allocate two vidmem buffers A and B (memdescCreate + memdescTagAlloc,
+ *      the same pattern kbusVerifyBar2 uses -- already proven on this
+ *      hardware during gpuStateInit).
+ *   2. CE-memset B with a poison pattern, CE-memset A with the test pattern
+ *      (both synchronous: ceutilsMemset waits on the channel semaphore via
+ *      channelWaitForFinishPayload -- CE completion is itself part of the
+ *      proof).
+ *   3. CE-memcopy A -> B.
+ *   4. Map B for CPU access through BAR2 (kbusMapRmAperture_HAL, the mapping
+ *      path gpuStateInit's MMU self-test already validated) and verify every
+ *      dword equals the test pattern -- proving the bytes physically moved
+ *      through the GPU's copy engine into VRAM.
+ *
+ * Every phase reports its own NV_STATUS so a partial failure is directly
+ * attributable. All buffers are freed on every path.
+ */
+typedef struct EclipseStep10Result
+{
+    NvU32 ceUtilsStatus;   /* pCeUtils present? */
+    NvU32 allocAStatus;
+    NvU32 allocBStatus;
+    NvU32 poisonStatus;    /* CE memset B = poison */
+    NvU32 memsetStatus;    /* CE memset A = pattern */
+    NvU32 copyStatus;      /* CE copy A -> B */
+    NvU32 verifyStatus;    /* CPU readback of B */
+    NvU64 bufferSize;
+    NvU64 paA;
+    NvU64 paB;
+    NvU32 pattern;
+    NvU32 poison;
+    NvU32 dwordsChecked;
+    NvU32 mismatchCount;
+    NvU32 firstMismatchIdx;
+    NvU32 firstMismatchVal;
+} EclipseStep10Result;
+
+NV_STATUS eclipse_rm_step10(NvU32 gpuInstance, EclipseStep10Result *pOut)
+{
+    OBJGPU *pGpu;
+    MemoryManager *pMemoryManager;
+    MEMORY_DESCRIPTOR *pMemDescA = NULL;
+    MEMORY_DESCRIPTOR *pMemDescB = NULL;
+    NvU8 *pVa = NULL;
+    NV_STATUS status;
+    THREAD_STATE_NODE threadState;
+    GPU_MASK gpusLockedMask = 0;
+    const NvU64 SIZE = 256 * 1024;      /* 256 KiB: big enough to be a real
+                                         * transfer, small enough that the
+                                         * uncached BAR2 readback stays fast */
+    const NvU32 PATTERN = 0xCAFED00Du;
+    const NvU32 POISON  = 0x0BAD0BADu;
+    const NvU32 not_run = 0xFFFFFFFFu;
+
+    if (pOut == NULL)
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    portMemSet(pOut, 0, sizeof(*pOut));
+    pOut->ceUtilsStatus = not_run;
+    pOut->allocAStatus  = not_run;
+    pOut->allocBStatus  = not_run;
+    pOut->poisonStatus  = not_run;
+    pOut->memsetStatus  = not_run;
+    pOut->copyStatus    = not_run;
+    pOut->verifyStatus  = not_run;
+    pOut->bufferSize    = SIZE;
+    pOut->pattern       = PATTERN;
+    pOut->poison        = POISON;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pGpu = gpumgrGetGpu(gpuInstance);
+    if (pGpu == NULL || !pGpu->gspRmInitialized || !pGpu->bStateLoaded)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
+    }
+
+    /* Same lock discipline as step 8: API lock + this GPU's group lock (CE
+     * submission RPCs and vidmem allocation both assert GPU-lock ownership). */
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    status = rmGpuGroupLockAcquire(pGpu->gpuInstance, GPU_LOCK_GRP_SUBDEVICE,
+                                   GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT,
+                                   &gpusLockedMask);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    ECLIPSE_TRACE("step10: CE data-movement test v1 (memset+copy+readback)");
+
+    pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
+    if (pMemoryManager == NULL || pMemoryManager->pCeUtils == NULL)
+    {
+        pOut->ceUtilsStatus = NV_ERR_OBJECT_NOT_FOUND;
+        ECLIPSE_TRACE("step10: pCeUtils missing (gpuStateLoad incomplete?)");
+        goto unlock;
+    }
+    pOut->ceUtilsStatus = NV_OK;
+
+    /* --- vidmem buffers A and B, kbusVerifyBar2's own allocation pattern --- */
+    pOut->allocAStatus = memdescCreate(&pMemDescA, pGpu, SIZE, 0, NV_TRUE,
+                                       ADDR_FBMEM, NV_MEMORY_UNCACHED,
+                                       MEMDESC_FLAGS_NONE);
+    if (pOut->allocAStatus == NV_OK)
+    {
+        memdescTagAlloc(pOut->allocAStatus,
+                        NV_FB_ALLOC_RM_INTERNAL_OWNER_UNNAMED_TAG_65, pMemDescA);
+    }
+    nv_printf(0, "[eclipse-rm-trace] step10: alloc A -> 0x%x\n", pOut->allocAStatus);
+    if (pOut->allocAStatus != NV_OK)
+    {
+        goto cleanup;
+    }
+    pOut->paA = memdescGetPhysAddr(pMemDescA, AT_GPU, 0);
+
+    pOut->allocBStatus = memdescCreate(&pMemDescB, pGpu, SIZE, 0, NV_TRUE,
+                                       ADDR_FBMEM, NV_MEMORY_UNCACHED,
+                                       MEMDESC_FLAGS_NONE);
+    if (pOut->allocBStatus == NV_OK)
+    {
+        memdescTagAlloc(pOut->allocBStatus,
+                        NV_FB_ALLOC_RM_INTERNAL_OWNER_UNNAMED_TAG_65, pMemDescB);
+    }
+    nv_printf(0, "[eclipse-rm-trace] step10: alloc B -> 0x%x\n", pOut->allocBStatus);
+    if (pOut->allocBStatus != NV_OK)
+    {
+        goto cleanup;
+    }
+    pOut->paB = memdescGetPhysAddr(pMemDescB, AT_GPU, 0);
+    nv_printf(0, "[eclipse-rm-trace] step10: A PA=0x%llx B PA=0x%llx size=0x%llx\n",
+              pOut->paA, pOut->paB, SIZE);
+
+    /* --- CE memset B = poison (so the later copy visibly overwrites it) --- */
+    {
+        CEUTILS_MEMSET_PARAMS params;
+        portMemSet(&params, 0, sizeof(params));
+        params.pMemDesc = pMemDescB;
+        params.offset   = 0;
+        params.length   = SIZE;
+        params.pattern  = POISON;
+        params.flags    = 0; /* synchronous */
+        pOut->poisonStatus = ceutilsMemset(pMemoryManager->pCeUtils, &params);
+    }
+    nv_printf(0, "[eclipse-rm-trace] step10: CE memset B=poison -> 0x%x\n",
+              pOut->poisonStatus);
+    if (pOut->poisonStatus != NV_OK)
+    {
+        goto cleanup;
+    }
+
+    /* --- CE memset A = test pattern --- */
+    {
+        CEUTILS_MEMSET_PARAMS params;
+        portMemSet(&params, 0, sizeof(params));
+        params.pMemDesc = pMemDescA;
+        params.offset   = 0;
+        params.length   = SIZE;
+        params.pattern  = PATTERN;
+        params.flags    = 0;
+        pOut->memsetStatus = ceutilsMemset(pMemoryManager->pCeUtils, &params);
+    }
+    nv_printf(0, "[eclipse-rm-trace] step10: CE memset A=pattern -> 0x%x\n",
+              pOut->memsetStatus);
+    if (pOut->memsetStatus != NV_OK)
+    {
+        goto cleanup;
+    }
+
+    /* --- CE copy A -> B --- */
+    {
+        CEUTILS_MEMCOPY_PARAMS params;
+        portMemSet(&params, 0, sizeof(params));
+        params.pSrcMemDesc = pMemDescA;
+        params.pDstMemDesc = pMemDescB;
+        params.srcOffset   = 0;
+        params.dstOffset   = 0;
+        params.length      = SIZE;
+        params.flags       = 0;
+        pOut->copyStatus = ceutilsMemcopy(pMemoryManager->pCeUtils, &params);
+    }
+    nv_printf(0, "[eclipse-rm-trace] step10: CE copy A->B -> 0x%x\n",
+              pOut->copyStatus);
+    if (pOut->copyStatus != NV_OK)
+    {
+        goto cleanup;
+    }
+
+    /* --- CPU readback of B through BAR2 --- */
+    pVa = kbusMapRmAperture_HAL(pGpu, pMemDescB);
+    if (pVa == NULL)
+    {
+        pOut->verifyStatus = NV_ERR_INSUFFICIENT_RESOURCES;
+        ECLIPSE_TRACE("step10: BAR2 map of B failed");
+        goto cleanup;
+    }
+    {
+        NvU32 i;
+        const NvU32 n = (NvU32)(SIZE / 4);
+        pOut->dwordsChecked = n;
+        for (i = 0; i < n; i++)
+        {
+            NvU32 v = MEM_RD32(pVa + i * 4);
+            if (v != PATTERN)
+            {
+                if (pOut->mismatchCount == 0)
+                {
+                    pOut->firstMismatchIdx = i;
+                    pOut->firstMismatchVal = v;
+                }
+                pOut->mismatchCount++;
+            }
+        }
+        pOut->verifyStatus = (pOut->mismatchCount == 0) ? NV_OK
+                                                        : NV_ERR_INVALID_DATA;
+    }
+    nv_printf(0, "[eclipse-rm-trace] step10: verify -> 0x%x (%u dwords, %u mismatches)\n",
+              pOut->verifyStatus, pOut->dwordsChecked, pOut->mismatchCount);
+
+cleanup:
+    if (pVa != NULL)
+    {
+        kbusUnmapRmAperture_HAL(pGpu, pMemDescB, &pVa, NV_TRUE);
+    }
+    if (pMemDescB != NULL)
+    {
+        memdescFree(pMemDescB);
+        memdescDestroy(pMemDescB);
+    }
+    if (pMemDescA != NULL)
+    {
+        memdescFree(pMemDescA);
+        memdescDestroy(pMemDescA);
+    }
+
+unlock:
+    rmGpuGroupLockRelease(gpusLockedMask, GPUS_LOCK_FLAGS_NONE);
     rmapiLockRelease();
     gpumgrThreadDisableExpandedGpuVisibility();
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
