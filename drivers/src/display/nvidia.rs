@@ -2786,6 +2786,48 @@ impl DrmScheme for NvidiaGpu {
         s
     }
 
+    /// Step 13 (`/proc/gpustep13`): EXP2 -- console-GPU GSP boot with a
+    /// pre-STARTCPU interrupt-drain "pseudo-ISR service loop" (Copilot's
+    /// leading hypothesis). Eclipse is 100% polled with INTx masked and no RM
+    /// ISR, so during the SEC2 CORE_RESUME window a fabric/display interrupt
+    /// the GPU raises is never serviced -- the prime suspect for the STARTCPU
+    /// posted-write stall (flow-control credit exhaustion) that Linux, whose
+    /// ISR drains it, never hits. Right before the STARTCPU store, os_boundary
+    /// snapshots the CPU-facing top-level interrupt tree (ERROR level, survives
+    /// the wedge -> names the pending vector) and write-1-to-clears the leaves
+    /// until quiescent, then lets the store through. Unlike EXP1 it does NOT
+    /// touch PDISP, so it can't break GSP-RM's early boot. Two outcomes, both
+    /// useful in one boot: STARTCPU drains (autopsy runs, boot continues) =>
+    /// hypothesis confirmed, drain is the fix; still wedges => the snapshot
+    /// tells us exactly which interrupt Linux services in that window. The
+    /// screen is untouched (no display reset) -- but capture to a file anyway
+    /// in case STARTCPU still wedges:
+    ///   `cat /proc/gpustep13 > /r13.txt; sync` then read /r13.txt.
+    fn bringup_step13(&self) -> String {
+        if !self.drives_boot_display() {
+            return String::from(
+                "[gpustep13] SKIPPED on secondary GPU (already boots via /proc/gpustep6)\n",
+            );
+        }
+        let mut s = String::new();
+        s.push_str(
+            "[gpustep13] EXP2: pre-STARTCPU interrupt drain (pseudo-ISR service loop); no PDISP/display touch -- snapshot at ERROR survives a wedge; capture with `cat /proc/gpustep13 > /r13.txt; sync`\n",
+        );
+        // Same containment + autopsy instrumentation as step11/12 so the
+        // post-STARTCPU physics are classified either way. The ONLY new
+        // variable vs. a plain console boot is the interrupt drain armed below.
+        s.push_str(&self.arm_completion_timeout());
+        nvidia_rm_sys::os_boundary::autopsy_arm(self.config_handle(), self.parent_config_handle());
+        nvidia_rm_sys::os_boundary::sec2_drain_arm();
+        nvidia_rm_sys::os_interface::live_echo_begin();
+        let boot = self.gsp_boot_run("gpustep13");
+        nvidia_rm_sys::os_interface::live_echo_end();
+        nvidia_rm_sys::os_boundary::sec2_drain_disarm();
+        nvidia_rm_sys::os_boundary::autopsy_disarm();
+        s.push_str(&boot);
+        s
+    }
+
     /// Step 2: instance block + GMMU flush — the first GPU register writes.
     /// TEMPORARY: the secondary (non-console) GPU has its own unrelated
     /// problems (USB breaks in Eclipse when it's made primary; likely never

@@ -389,6 +389,106 @@ pub fn autopsy_disarm() {
     AUTOPSY_RP_HANDLE.store(0, Ordering::Relaxed);
 }
 
+/// EXP 2 (pre-STARTCPU interrupt drain -- the Copilot "pseudo-ISR service
+/// loop" hypothesis). Eclipse is 100% polled with INTx masked and NO RM ISR,
+/// so during the SEC2 CORE_RESUME window a fabric/display interrupt the GPU
+/// raises is never serviced -- the leading theory for why the console GPU's
+/// STARTCPU posted-write stalls (fabric flow-control credit exhaustion) while
+/// Linux, whose ISR drains that same interrupt, does not wedge. When armed,
+/// the STARTCPU bracket in osDevWriteReg032 does, right BEFORE the posted
+/// store: (1) snapshot the CPU-facing top-level interrupt tree at ERROR level
+/// (survives a wedge -> names the exact pending vector), then (2) a bounded
+/// write-1-to-clear service loop draining the leaf-pending registers until the
+/// top register quiesces. If the wedge is unserviced-interrupt backpressure
+/// this makes STARTCPU drain and the autopsy then runs; if not, the snapshot
+/// still tells us which source Linux's ISR services in that window. Does NOT
+/// touch PDISP (unlike EXP1), so it can't break GSP-RM's early boot. Armed
+/// only by bringup_step13.
+static SEC2_DRAIN_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Arm the pre-STARTCPU interrupt-drain experiment for the next GSP boot.
+pub fn sec2_drain_arm() {
+    SEC2_DRAIN_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Disarm the pre-STARTCPU interrupt-drain experiment (boot returned).
+pub fn sec2_drain_disarm() {
+    SEC2_DRAIN_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Snapshot + drain the CPU-facing top-level interrupt tree just before the
+/// SEC2 STARTCPU posted write. `base` is this GPU's BAR0 virtual base
+/// (`DEVICE_MAPPING::gpuNvAddr`). Register map (Turing bare-metal, PF: the
+/// VF-priv window sits at BAR0 + `NV_VIRTUAL_FUNCTION_FULL_PHYS_OFFSET` =
+/// 0x00B8_0000, per gpuGetVirtRegPhysOffset_TU102):
+///   CPU_INTR_TOP(0)      = 0x00B8_1600  (RO pending, 32 subtree bits)
+///   CPU_INTR_LEAF(i)     = 0x00B8_1000 + i*4, i=0..7  (RW, write-1-to-clear)
+///   CPU_INTR_LEAF_EN(i)  = 0x00B8_1200 + i*4, i=0..7  (enable mask)
+/// plus the legacy NV_PMC_INTR(0)/(1) at 0x100/0x104. All are ordinary BAR0
+/// accesses (reads/writes immediately before STARTCPU are known-good from
+/// prior traces); none touch the SEC2 aperture.
+unsafe fn sec2_intr_snapshot_and_drain(base: *mut u8) {
+    const TOP: usize = 0x00B8_1600;
+    const LEAF: usize = 0x00B8_1000;
+    const LEAF_EN: usize = 0x00B8_1200;
+    let rd = |off: usize| core::ptr::read_volatile(base.add(off) as *const NvU32);
+    let wr = |off: usize, v: NvU32| core::ptr::write_volatile(base.add(off) as *mut NvU32, v);
+
+    // (1) Snapshot BEFORE draining -- ERROR level so it survives the wedge.
+    let top0 = rd(TOP);
+    let pmc0 = rd(0x100);
+    let pmc1 = rd(0x104);
+    log::error!(
+        "[nvidia-rm] EXP2 pre-STARTCPU intr snapshot: CPU_INTR_TOP={:#010x} PMC_INTR0={:#010x} PMC_INTR1={:#010x}",
+        top0, pmc0, pmc1
+    );
+    for i in 0..8usize {
+        let leaf = rd(LEAF + i * 4);
+        let en = rd(LEAF_EN + i * 4);
+        if leaf != 0 || en != 0 {
+            log::error!(
+                "[nvidia-rm] EXP2   LEAF[{}] pending={:#010x} en={:#010x}",
+                i, leaf, en
+            );
+        }
+    }
+
+    // (2) Bounded write-1-to-clear service loop: drain pending leaves until the
+    // top register reads quiescent (0) or we stop making progress. A source
+    // that keeps re-asserting (level-triggered, needs clearing at the engine,
+    // not the leaf) leaves top_final != 0 -- itself diagnostic for round 2.
+    let mut iters = 0u32;
+    let mut cleared_bits = 0u32;
+    loop {
+        let top = rd(TOP);
+        if top == 0 {
+            break;
+        }
+        let mut any = false;
+        for i in 0..8usize {
+            let leaf = rd(LEAF + i * 4);
+            if leaf != 0 {
+                wr(LEAF + i * 4, leaf); // write-1-to-clear
+                cleared_bits = cleared_bits.wrapping_add(leaf.count_ones());
+                any = true;
+            }
+        }
+        iters += 1;
+        if !any || iters >= 2000 {
+            break;
+        }
+    }
+    let top_final = rd(TOP);
+    log::error!(
+        "[nvidia-rm] EXP2 drain done: iters={} bits_cleared={} CPU_INTR_TOP_final={:#010x} ({})",
+        iters,
+        cleared_bits,
+        top_final,
+        if top_final == 0 { "quiescent" } else { "STILL PENDING -- level source, clear at engine" }
+    );
+}
+
 /// EXP 1 (PDISP hold-in-reset): when armed, the first completed read of
 /// NV_PDISP_VGA_WORKSPACE_BASE (0x625F04 -- kgspCalculateFbLayout's read,
 /// i.e. "after the FB-layout code consumed the register, before Booter/
@@ -695,6 +795,15 @@ pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, th
                 "[nvidia-rm] STARTCPU(SEC2): BSI_SECURE_SCRATCH_14 before = {:#x}",
                 bsi_before
             );
+        }
+        // EXP2 (pre-STARTCPU interrupt drain): when armed, snapshot + drain the
+        // CPU-facing top-level interrupt tree BEFORE letting the posted store
+        // through -- the pseudo-ISR service window that a fully-polled/INTx-
+        // masked driver otherwise lacks. See sec2_intr_snapshot_and_drain.
+        if SEC2_DRAIN_ARMED.load(core::sync::atomic::Ordering::Relaxed) {
+            if let Some(base) = base_for_bracket {
+                unsafe { sec2_intr_snapshot_and_drain(base) };
+            }
         }
     }
     if let Some(base) = dev_mapping_base(pMapping) {
