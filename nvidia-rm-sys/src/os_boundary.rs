@@ -343,9 +343,13 @@ static GSP_PROBE_ON: core::sync::atomic::AtomicBool = core::sync::atomic::Atomic
 static SEQ_TRACE_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static SEQ_TRACE_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Arm the SEC2-resume register trace for the next GSP boot (step 11).
+/// Arm the SEC2-resume register trace for the next GSP boot. Resets the
+/// per-boot line budget and dedup state so a second armed boot (e.g. the
+/// console GPU after the secondary) gets a full budget of its own.
 pub fn seq_trace_arm() {
     use core::sync::atomic::Ordering;
+    SEQ_TRACE_LINES.store(0, Ordering::Relaxed);
+    SEQ_TRACE_LAST.store(u64::MAX, Ordering::Relaxed);
     SEQ_TRACE_ARMED.store(true, Ordering::Relaxed);
     SEQ_TRACE_LIVE.store(false, Ordering::Relaxed);
 }
@@ -357,11 +361,41 @@ pub fn seq_trace_disarm() {
     SEQ_TRACE_LIVE.store(false, Ordering::Relaxed);
 }
 
+/// Switch the armed trace live. Called by os_interface's narration hook the
+/// moment the RM logs receiving the GSP_RUN_CPU_SEQUENCER RPC, so the trace
+/// covers the entire sequencer buffer execution, and (belt-and-braces) by
+/// the SEC2 STARTCPU bracket below in case the narration line never matched.
+pub fn seq_trace_go_live() {
+    use core::sync::atomic::Ordering;
+    if SEQ_TRACE_ARMED.load(Ordering::Relaxed)
+        && !SEQ_TRACE_LIVE.swap(true, Ordering::Relaxed)
+    {
+        let line = "[nvidia-rm] SEQ trace LIVE (sequencer RPC received; every reg access narrates until boot returns)";
+        if crate::os_interface::live_echo_on() {
+            log::error!("{}", line);
+        }
+        crate::os_interface::capture_line(line);
+    }
+}
+
 // Collapse consecutive repeats of the same (kind, offset) so a poll loop
 // doesn't eat the cap; 0 = read, 1 = write, packed with the offset.
 static SEQ_TRACE_LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 static SEQ_TRACE_LINES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 const SEQ_TRACE_CAP: u32 = 400;
+
+/// Emit a trace line to both sinks: the /proc capture buffer (always -- so
+/// the SUCCESSFUL secondary-GPU boot's full register sequence is readable at
+/// leisure in /proc/gpustep6 and diffable against the console GPU's), and
+/// the live screen at ERROR level (only when live-echo is armed, i.e. the
+/// console-GPU step-11 boot -- where a wedge makes the last line the
+/// diagnosis).
+fn seq_trace_emit(line: &str) {
+    if crate::os_interface::live_echo_on() {
+        log::error!("{}", line);
+    }
+    crate::os_interface::capture_line(line);
+}
 
 /// Pre-log a traced register access. Returns true if a line was emitted
 /// (first access of a run, under cap) so the read path can pair it with a
@@ -380,13 +414,13 @@ fn seq_trace(kind_write: bool, offset: NvU32, value: Option<NvU32>) -> bool {
         return false;
     }
     if kind_write {
-        log::error!(
+        seq_trace_emit(&alloc::format!(
             "[nvidia-rm] SEQ WR off={:#x} <= {:#x} (about to)",
             offset,
             value.unwrap_or(0)
-        );
+        ));
     } else {
-        log::error!("[nvidia-rm] SEQ RD off={:#x} (about to)", offset);
+        seq_trace_emit(&alloc::format!("[nvidia-rm] SEQ RD off={:#x} (about to)", offset));
     }
     true
 }
@@ -459,7 +493,11 @@ pub extern "C" fn osDevReadReg032(_pGpu: *mut c_void, pMapping: *mut c_void, thi
         None => 0xFFFF_FFFF,
     };
     if seq_logged {
-        log::error!("[nvidia-rm] SEQ RD off={:#x} = {:#x}", this_address, v);
+        seq_trace_emit(&alloc::format!(
+            "[nvidia-rm] SEQ RD off={:#x} = {:#x}",
+            this_address,
+            v
+        ));
     }
     if is_sec2 || is_bsi {
         use core::sync::atomic::{AtomicU32, Ordering};
@@ -528,18 +566,16 @@ pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, th
     let base_for_bracket = dev_mapping_base(pMapping);
     if is_sec2_startcpu {
         GSP_PROBE_ON.store(true, core::sync::atomic::Ordering::Relaxed);
-        // Step-11 trace goes LIVE exactly here: this GPU's SEC2 resume is
-        // starting -- the window it has always wedged in. (No-op unless
-        // bringup_step11 armed the trace; step 6 secondary boots stay quiet.)
-        if SEQ_TRACE_ARMED.load(core::sync::atomic::Ordering::Relaxed) {
-            SEQ_TRACE_LIVE.store(true, core::sync::atomic::Ordering::Relaxed);
-            log::error!("[nvidia-rm] SEQ trace LIVE (STARTCPU on traced GPU; every reg access narrates until boot returns)");
-        }
+        // Belt-and-braces trace trigger: normally the trace went live already
+        // when the RUN_CPU_SEQUENCER narration line was seen (covering the
+        // whole sequencer buffer); if that match ever fails, going live at
+        // STARTCPU still covers the resume window.
+        seq_trace_go_live();
         if let Some(base) = base_for_bracket {
             let bsi_before =
                 unsafe { core::ptr::read_volatile(base.add(0x0011_80f8) as *const NvU32) };
             log::warn!(
-                "[nvidia-rm] STARTCPU(SEC2): BSI_SECURE_SCRATCH_14 before = {:#x}; going silent 500ms after start",
+                "[nvidia-rm] STARTCPU(SEC2): BSI_SECURE_SCRATCH_14 before = {:#x}",
                 bsi_before
             );
         }
@@ -547,17 +583,12 @@ pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, th
     if let Some(base) = dev_mapping_base(pMapping) {
         unsafe { core::ptr::write_volatile(base.add(this_address as usize) as *mut NvU32, this_value) };
     }
-    if is_sec2_startcpu {
-        if let Some(base) = base_for_bracket {
-            crate::hooks::with_hooks((), |h| h.delay_us(500_000));
-            let bsi_after =
-                unsafe { core::ptr::read_volatile(base.add(0x0011_80f8) as *const NvU32) };
-            log::warn!(
-                "[nvidia-rm] STARTCPU(SEC2): BSI_SECURE_SCRATCH_14 after 500ms = {:#x} (bit26=DONE expected 1)",
-                bsi_after
-            );
-        }
-    }
+    // The old post-STARTCPU "500ms silent window + raw BSI readback" bracket
+    // is GONE: it was an Eclipse-only divergence from the real driver (which
+    // starts polling _kgspIsReloadCompleted immediately), it delayed the
+    // resume handling, and both wedge rounds proved silence changes nothing.
+    // The per-access seq_trace above now narrates the RM's own immediate
+    // BSI polling instead -- higher fidelity AND better diagnostics.
 }
 
 /// Extracts `DEVICE_MAPPING::gpuNvAddr` (the first field) without needing

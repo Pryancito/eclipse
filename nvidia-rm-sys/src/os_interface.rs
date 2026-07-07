@@ -544,6 +544,18 @@ fn capture_push(s: &str) {
     }
 }
 
+/// Append a line to the active capture buffer from outside this module
+/// (used by os_boundary's SEC2-resume register trace so the traced register
+/// sequence lands in the /proc output block too, not just the live screen).
+pub fn capture_line(s: &str) {
+    capture_push(s);
+}
+
+/// Whether live-echo (ERROR-level narration) is currently armed.
+pub fn live_echo_on() -> bool {
+    LIVE_ECHO.load(Ordering::Relaxed)
+}
+
 fn log_raw_cstr(str_: *const c_char) {
     // The rsp stamp is gone (it did its job: the RM init sequence runs on
     // the BSP 2 MiB stack with tiny per-frame deltas, so the "stack too
@@ -573,6 +585,14 @@ fn log_raw_cstr(str_: *const c_char) {
                 log::warn!("[nvidia-rm] {}", s);
             }
             capture_push(s);
+            // SEC2-resume register trace goes live the moment the RM narrates
+            // receiving the GSP's RUN_CPU_SEQUENCER RPC -- that captures the
+            // WHOLE sequencer buffer execution (dozens of pre-STARTCPU
+            // register ops), not just the post-STARTCPU tail. No-op unless
+            // the trace was armed for this boot.
+            if s.contains("RUN_CPU_SEQUENCER") {
+                crate::os_boundary::seq_trace_go_live();
+            }
         }
     }
 }
