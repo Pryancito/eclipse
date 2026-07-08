@@ -50,6 +50,7 @@
 #include "gpu/gpu_timeout.h"
 #include "ctrl/ctrl2080/ctrl2080gpu.h"
 #include "ctrl/ctrl2080/ctrl2080fb.h"
+#include "ctrl/ctrl2080/ctrl2080gr.h"
 #include "os/os.h"
 #include "tls/tls.h"
 #include "g_hal_register.h"
@@ -976,6 +977,162 @@ NV_STATUS eclipse_rm_step8(NvU32 gpuInstance, EclipseRmApiDemo *pOut)
             pOut->heapSizeKb = fbParams.fbInfoList[0].data;
             pOut->heapFreeKb = fbParams.fbInfoList[1].data;
             pOut->busWidth   = fbParams.fbInfoList[2].data;
+        }
+    }
+
+    status = NV_OK;
+
+unlock:
+    rmGpuGroupLockRelease(gpusLockedMask, GPUS_LOCK_FLAGS_NONE);
+    rmapiLockRelease();
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
+}
+
+/*
+ * Step-15: probe the graphics/compute (GR) engine's shader config on the
+ * state-loaded GPU, over the live GSP's resource server (GSP_RM_CONTROL RPC),
+ * the same read-only Control path as step-8. Uses the mask controls
+ * (GR_GET_GPC_MASK, GR_GET_TPC_MASK) rather than GR_GET_INFO: the mask params
+ * are flat scalars (no embedded pointer list to marshal across the RPC), so
+ * this stays low-risk. On Turing there is exactly one SM per TPC, so the total
+ * enabled TPC count is the GPU's usable SM count -- the first real read of the
+ * shader array the compute engine will run on. Proves the GR subsystem is live
+ * and queryable end-to-end; groundwork for a future real compute launch.
+ */
+typedef struct EclipseGrProbe
+{
+    NvU32 gpcMaskStatus;
+    NvU32 gpcMask;
+    NvU32 numGpc;
+    NvU32 tpcMaskStatus; /* first non-OK per-GPC status, else NV_OK */
+    NvU32 totalTpc;      /* == usable SM count on Turing (1 SM/TPC) */
+    NvU32 perGpcTpc[8];  /* enabled TPCs per GPC index */
+} EclipseGrProbe;
+
+/* Local bit-population count (nvPopCount32 is not part of the vendored public
+ * boundary we link against here). */
+static NvU32 eclipse_popcount32(NvU32 v)
+{
+    NvU32 c = 0;
+    while (v != 0)
+    {
+        v &= (v - 1);
+        c++;
+    }
+    return c;
+}
+
+NV_STATUS eclipse_rm_step15(NvU32 gpuInstance, EclipseGrProbe *pOut)
+{
+    OBJGPU *pGpu;
+    RM_API *pRmApi;
+    NV_STATUS status;
+    THREAD_STATE_NODE threadState;
+    GPU_MASK gpusLockedMask = 0;
+
+    if (pOut == NULL)
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    portMemSet(pOut, 0, sizeof(*pOut));
+    pOut->gpcMaskStatus = NV_ERR_NOT_READY;
+    pOut->tpcMaskStatus = NV_ERR_NOT_READY;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pGpu = gpumgrGetGpu(gpuInstance);
+    if (pGpu == NULL || !pGpu->gspRmInitialized)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
+    }
+
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    status = rmGpuGroupLockAcquire(pGpu->gpuInstance, GPU_LOCK_GRP_SUBDEVICE,
+                                   GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT,
+                                   &gpusLockedMask);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    if (pGpu->hInternalClient == 0)
+    {
+        GspStaticConfigInfo *pGSCI = GPU_GET_GSP_STATIC_INFO(pGpu);
+        if (pGSCI == NULL || pGSCI->hInternalClient == 0)
+        {
+            status = NV_ERR_INVALID_STATE;
+            goto unlock;
+        }
+        pGpu->hInternalClient = pGSCI->hInternalClient;
+        pGpu->hInternalDevice = pGSCI->hInternalDevice;
+        pGpu->hInternalSubdevice = pGSCI->hInternalSubdevice;
+        rmapiControlCacheSetGpuAttrForObject(pGpu->hInternalClient,
+                                             pGpu->hInternalSubdevice, pGpu);
+        rmapiControlCacheSetGpuAttrForObject(pGpu->hInternalClient,
+                                             pGpu->hInternalDevice, pGpu);
+    }
+
+    pRmApi = GPU_GET_PHYSICAL_RMAPI(pGpu);
+
+    {
+        NV2080_CTRL_GR_GET_GPC_MASK_PARAMS gpcParams;
+        portMemSet(&gpcParams, 0, sizeof(gpcParams));
+        pOut->gpcMaskStatus = pRmApi->Control(pRmApi, pGpu->hInternalClient,
+                                              pGpu->hInternalSubdevice,
+                                              NV2080_CTRL_CMD_GR_GET_GPC_MASK,
+                                              &gpcParams, sizeof(gpcParams));
+        nv_printf(0, "[eclipse-rm-trace] step15: GR_GET_GPC_MASK -> 0x%x mask=0x%x\n",
+                  pOut->gpcMaskStatus, gpcParams.gpcMask);
+        if (pOut->gpcMaskStatus == NV_OK)
+        {
+            NvU32 gpcId;
+            pOut->gpcMask = gpcParams.gpcMask;
+            pOut->numGpc = eclipse_popcount32(gpcParams.gpcMask);
+            pOut->tpcMaskStatus = NV_OK;
+            for (gpcId = 0; gpcId < 8; gpcId++)
+            {
+                NV2080_CTRL_GR_GET_TPC_MASK_PARAMS tpcParams;
+                NV_STATUS ts;
+                if ((gpcParams.gpcMask & NVBIT32(gpcId)) == 0)
+                {
+                    continue;
+                }
+                portMemSet(&tpcParams, 0, sizeof(tpcParams));
+                tpcParams.gpcId = gpcId;
+                ts = pRmApi->Control(pRmApi, pGpu->hInternalClient,
+                                     pGpu->hInternalSubdevice,
+                                     NV2080_CTRL_CMD_GR_GET_TPC_MASK,
+                                     &tpcParams, sizeof(tpcParams));
+                nv_printf(0, "[eclipse-rm-trace] step15: GR_GET_TPC_MASK gpc=%u -> 0x%x mask=0x%x\n",
+                          gpcId, ts, tpcParams.tpcMask);
+                if (ts != NV_OK)
+                {
+                    pOut->tpcMaskStatus = ts;
+                    continue;
+                }
+                pOut->perGpcTpc[gpcId] = eclipse_popcount32(tpcParams.tpcMask);
+                pOut->totalTpc += pOut->perGpcTpc[gpcId];
+            }
         }
     }
 

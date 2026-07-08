@@ -2891,6 +2891,70 @@ impl DrmScheme for NvidiaGpu {
         s
     }
 
+    /// Step 15 (`/proc/gpustep15`): probe the GR (graphics/compute) engine's
+    /// shader config on a state-loaded GPU via the live GSP-RM's resource
+    /// server (GR_GET_GPC_MASK / GR_GET_TPC_MASK controls) -- the first read of
+    /// the SM array the compute engine runs on. Read-only, repeatable, no
+    /// channel machinery; groundwork toward a real compute launch. Works on
+    /// any GPU that has completed state-load (secondary via gpustep9, console
+    /// via gpustep14).
+    fn bringup_step15(&self) -> String {
+        use core::fmt::Write;
+        let mut s = String::new();
+        let device_instance = *self.rm_device_instance.lock();
+        let Some(device_instance) = device_instance else {
+            return String::from(
+                "[gpustep15] skipped (bring the GPU up first: gpustep5/6/8/9 on the secondary, or gpustep14 on the console)\n",
+            );
+        };
+        nvidia_rm_sys::os_interface::capture_begin();
+        let result = nvidia_rm_sys::rm_init::step15(device_instance);
+        let captured = nvidia_rm_sys::os_interface::capture_take();
+        if let Some(log) = captured {
+            for line in log.lines() {
+                let _ = writeln!(s, "[gpustep15] | {}", line);
+            }
+        }
+        let phase = |st: u32| -> String {
+            if st == 0 {
+                String::from("OK")
+            } else {
+                alloc::format!("NV_STATUS={:#x}", st)
+            }
+        };
+        match result {
+            Ok(gr) => {
+                let _ = writeln!(s, "[gpustep15] --- GR (graphics/compute) engine config from live GSP-RM ---");
+                let _ = writeln!(
+                    s,
+                    "[gpustep15] GR_GET_GPC_MASK: {} mask={:#010x} ({} GPCs)",
+                    phase(gr.gpc_mask_status), gr.gpc_mask, gr.num_gpc
+                );
+                if gr.gpc_mask_status == 0 {
+                    for gpc in 0..8usize {
+                        if (gr.gpc_mask >> gpc) & 1 == 1 {
+                            let _ = writeln!(s, "[gpustep15]   GPC{}: {} TPCs", gpc, gr.per_gpc_tpc[gpc]);
+                        }
+                    }
+                    let _ = writeln!(s, "[gpustep15] GR_GET_TPC_MASK: {}", phase(gr.tpc_mask_status));
+                    let _ = writeln!(
+                        s,
+                        "[gpustep15] --- {} TPCs total => {} usable SMs (Turing: 1 SM/TPC) ---",
+                        gr.total_tpc, gr.total_tpc
+                    );
+                }
+            }
+            Err(status) => {
+                let _ = writeln!(
+                    s,
+                    "[gpustep15] eclipse_rm_step15 FAILED, NV_STATUS={:#x} (GR not state-loaded? run gpustep9 or gpustep14)",
+                    status
+                );
+            }
+        }
+        s
+    }
+
     /// Step 2: instance block + GMMU flush — the first GPU register writes.
     /// TEMPORARY: the secondary (non-console) GPU has its own unrelated
     /// problems (USB breaks in Eclipse when it's made primary; likely never

@@ -193,6 +193,14 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Bring-up **Step 15** (`/proc/gpustep15`): probe the GR (graphics/compute)
+    /// engine's GPC/TPC/SM shader config on a state-loaded GPU via the live
+    /// GSP-RM (GR_GET_GPC_MASK / GR_GET_TPC_MASK controls). Read-only,
+    /// repeatable; groundwork toward a real compute launch. Default: nothing.
+    fn bringup_step15(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Read-only hardware-state dump (`/proc/gpudump`): the discriminating
     /// registers (display head liveness, VGA workspace, PMC, BSI, sysmem
     /// flush) for this GPU, with NO GSP boot -- zero wedge risk. Lets us
