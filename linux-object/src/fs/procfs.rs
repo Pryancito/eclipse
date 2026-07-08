@@ -14,11 +14,11 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 28] = [
+const PROC_ROOT_STATIC: [&str; 29] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
     "perf", "hunter", "filesystems", "gpudbg", "gpustep2", "gpustep3", "gpustep4", "gpustep5",
     "gpustep6", "gpustep7", "gpustep8", "gpustep9", "gpustep10", "gpustep11", "gpustep12",
-    "gpustep13", "gpustep14", "gpudump",
+    "gpustep13", "gpustep14", "gpustep15", "gpudump",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -303,6 +303,7 @@ impl INode for ProcRootINode {
             "gpustep12" => Ok(PROC_GPUSTEP12.clone()),
             "gpustep13" => Ok(PROC_GPUSTEP13.clone()),
             "gpustep14" => Ok(PROC_GPUSTEP14.clone()),
+            "gpustep15" => Ok(PROC_GPUSTEP15.clone()),
             "gpudump" => Ok(PROC_GPUDUMP.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
@@ -1267,6 +1268,19 @@ fn proc_gpustep14_content() -> String {
     s
 }
 
+/// `/proc/gpustep15` — GR (graphics/compute) engine GPC/TPC/SM config probe on
+/// a state-loaded GPU, via the live GSP-RM. Read-only, repeatable.
+fn proc_gpustep15_content() -> String {
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.bringup_step15());
+    }
+    if s.is_empty() {
+        s.push_str("[gpustep15] no DRM driver with bring-up support\n");
+    }
+    s
+}
+
 /// `/proc/gpudump` — read-only discriminating hardware dump for every NVIDIA
 /// GPU (console + secondary): display head liveness, VGA workspace base, PMC,
 /// BSI scratch, sysmem flush. NO GSP boot -> ZERO wedge risk. Read this first
@@ -1558,6 +1572,12 @@ lazy_static! {
     static ref PROC_GPUSTEP14: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 85,
         generate: proc_gpustep14_content,
+    });
+    /// `/proc/gpustep15` -- GR engine GPC/TPC/SM config probe (see
+    /// proc_gpustep15_content).
+    static ref PROC_GPUSTEP15: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 84,
+        generate: proc_gpustep15_content,
     });
     /// `/proc/gpudump` -- read-only discriminating HW dump, both GPUs (see
     /// proc_gpudump_content).

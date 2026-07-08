@@ -186,6 +186,44 @@ pub fn rm_api_demo(device_instance: u32) -> Result<RmApiDemo, NV_STATUS> {
     }
 }
 
+/// Fixed-layout mirror of `EclipseGrProbe` (vendor/eclipse_rm_init.c): the
+/// graphics/compute (GR) engine's shader config as reported by the live GSP-RM
+/// via the GR_GET_GPC_MASK / GR_GET_TPC_MASK controls. On Turing there is one
+/// SM per TPC, so `total_tpc` is the GPU's usable SM count.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GrProbe {
+    pub gpc_mask_status: NV_STATUS,
+    pub gpc_mask: NvU32,
+    pub num_gpc: NvU32,
+    pub tpc_mask_status: NV_STATUS,
+    pub total_tpc: NvU32,
+    pub per_gpc_tpc: [NvU32; 8],
+}
+
+extern "C" {
+    fn eclipse_rm_step15(device_instance: NvU32, out: *mut GrProbe) -> NV_STATUS;
+}
+
+/// Probes the GR (graphics/compute) engine's GPC/TPC/SM config on a
+/// state-loaded GPU, over the live GSP resource server.
+pub fn step15(device_instance: u32) -> Result<GrProbe, NV_STATUS> {
+    let mut out = GrProbe {
+        gpc_mask_status: 0,
+        gpc_mask: 0,
+        num_gpc: 0,
+        tpc_mask_status: 0,
+        total_tpc: 0,
+        per_gpc_tpc: [0; 8],
+    };
+    let status = unsafe { eclipse_rm_step15(device_instance, &mut out) };
+    if status == NV_OK {
+        Ok(out)
+    } else {
+        Err(status)
+    }
+}
+
 /// Mirror of `EclipseStateInitResult` (vendor/eclipse_rm_init.c): per-phase
 /// NV_STATUS of the real RmInitAdapter device bring-up. `0xFFFFFFFF` means
 /// the phase was not reached (an earlier phase failed).
