@@ -1155,6 +1155,86 @@ impl NvidiaGpu {
         s
     }
 
+    /// Find the PCIe capability (ID 0x10) offset in config space, or None.
+    fn pcie_cap_ptr(loc: pci::Location) -> Option<u16> {
+        use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+        let ops = &PortOpsImpl;
+        let status = unsafe { PCI_ACCESS.read16(ops, loc, 0x06) };
+        if status & (1 << 4) == 0 {
+            return None;
+        }
+        let mut ptr = unsafe { PCI_ACCESS.read8(ops, loc, 0x34) } as u16;
+        let mut hops = 0;
+        while ptr != 0 && hops < 48 {
+            let id = unsafe { PCI_ACCESS.read8(ops, loc, ptr) };
+            if id == 0x10 {
+                return Some(ptr);
+            }
+            ptr = unsafe { PCI_ACCESS.read8(ops, loc, ptr + 1) } as u16;
+            hops += 1;
+        }
+        None
+    }
+
+    /// PCIe MPS normalization -- Eclipse's equivalent of Linux's
+    /// pcie_bus_config tree walk, applied to the one link that matters.
+    /// ROOT CAUSE (gpudump on real hardware): UEFI left BOTH GPUs with
+    /// DevCtl MPS=256 while BOTH root ports sit at MPS=128 -- a protocol
+    /// violation. A GPU-sourced upstream TLP with a >128-byte payload is a
+    /// Malformed TLP at the root port; with no OS AER handling the port stops
+    /// releasing flow-control credits and every subsequent access through it
+    /// stalls -- the CPU then wedges on its next posted write, which is
+    /// EXACTLY the observed physics (the Linux-byte-parity bare store to
+    /// STARTCPU wedged; every driver-level knob had been equalized). The
+    /// secondary GPU survives because its display-less SEC2-HS resume never
+    /// generates such bursts. Linux never sees any of this because its PCI
+    /// core normalizes MPS across every tree at boot -- the one Linux
+    /// behavior Eclipse hadn't replicated. Clamp the GPU's MPS down to the
+    /// root port's (lowering is always protocol-safe); MRRS is left alone
+    /// (mismatched MRRS is legal -- completers split completions).
+    fn normalize_mps(&self, tag: &str) -> String {
+        use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+        use pci::Location;
+        let ops = &PortOpsImpl;
+        let gpu_loc = Location { bus: self.pci_bus, device: self.pci_device, function: 0 };
+        let Some((b, d, f)) = self.find_parent_bridge() else {
+            return alloc::format!("[{}] MPS normalize: no parent bridge found (skipped)\n", tag);
+        };
+        let rp_loc = Location { bus: b, device: d, function: f };
+        let (Some(gpu_cap), Some(rp_cap)) =
+            (Self::pcie_cap_ptr(gpu_loc), Self::pcie_cap_ptr(rp_loc))
+        else {
+            return alloc::format!("[{}] MPS normalize: PCIe cap not found (skipped)\n", tag);
+        };
+        let gpu_devctl = unsafe { PCI_ACCESS.read16(ops, gpu_loc, gpu_cap + 0x08) };
+        let rp_devctl = unsafe { PCI_ACCESS.read16(ops, rp_loc, rp_cap + 0x08) };
+        let gpu_mps = (gpu_devctl >> 5) & 0x7;
+        let rp_mps = (rp_devctl >> 5) & 0x7;
+        if gpu_mps <= rp_mps {
+            return alloc::format!(
+                "[{}] MPS already consistent (GPU {} <= root-port {}); nothing to do\n",
+                tag,
+                128u32 << gpu_mps,
+                128u32 << rp_mps
+            );
+        }
+        let new_devctl = (gpu_devctl & !(0x7 << 5)) | (rp_mps << 5);
+        unsafe { PCI_ACCESS.write16(ops, gpu_loc, gpu_cap + 0x08, new_devctl) };
+        let rb = unsafe { PCI_ACCESS.read16(ops, gpu_loc, gpu_cap + 0x08) };
+        let line = alloc::format!(
+            "[{}] MPS NORMALIZED (Linux pcie_bus_config equivalent): GPU DevCtl {:#06x} -> {:#06x} (readback {:#06x}); MPS {} -> {} to match root-port {}\n",
+            tag,
+            gpu_devctl,
+            new_devctl,
+            rb,
+            128u32 << gpu_mps,
+            128u32 << ((new_devctl >> 5) & 0x7),
+            128u32 << rp_mps
+        );
+        log::error!("{}", line.trim_end());
+        line
+    }
+
     fn gsp_boot_run(&self, tag: &str, quiet: bool) -> String {
         use core::fmt::Write;
         let device_instance = *self.rm_device_instance.lock();
@@ -1175,6 +1255,9 @@ impl NvidiaGpu {
                 // Snapshot the pre-boot hardware state first (diffable
                 // primary-vs-secondary; survives a wedge via the live echo).
                 let preboot = self.dump_preboot_state(tag);
+                // Normalize this GPU's PCIe MPS to its root port BEFORE any
+                // GSP traffic -- the root-cause fix (see normalize_mps).
+                let mps_log = self.normalize_mps(tag);
                 // Mask this GPU's legacy INTx at the PCI level before booting
                 // GSP-RM. On real hardware the boot now gets all the way to
                 // "GSP FW RM ready." and THEN the machine livelocks: once
@@ -1300,6 +1383,7 @@ impl NvidiaGpu {
                 drop(fw);
                 let mut block = String::new();
                 block.push_str(&preboot);
+                block.push_str(&mps_log);
                 block.push_str(&pbus_log);
                 if let Some(log) = captured {
                     if !log.is_empty() {
