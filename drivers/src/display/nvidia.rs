@@ -2873,6 +2873,38 @@ impl DrmScheme for NvidiaGpu {
             s.push_str("[gpustep14] --- stage 1: RM attach (gpustep5) ---\n");
             s.push_str(&self.bringup_step5());
         }
+        // 1.5. Declare this GPU's real identity to RM BEFORE the GSP boot,
+        //    exactly where Linux does (RmDeterminePrimaryDevice /
+        //    RmSetConsolePreservationParams right before kgspInitRm): PRIMARY
+        //    device with a live UEFI GOP console in its BAR1. Review finding:
+        //    only step11 ever did this -- the step13/14 boots were telling
+        //    GSP-RM bIsPrimary=false with no console reservation, so GSP-RM's
+        //    FB carving/scrubbing had no idea the scanout surface existed.
+        //    Idempotent property/field writes; safe on cached re-reads.
+        if let Some(device_instance) = *self.rm_device_instance.lock() {
+            let (console_size, at_bar1_base) = match *BOOT_FB_INFO.lock() {
+                Some(fb) => (
+                    fb.pitch as u64 * fb.height as u64,
+                    fb.phys == self.bar1_phys,
+                ),
+                None => (0, false),
+            };
+            match nvidia_rm_sys::rm_init::mark_console_gpu(
+                device_instance,
+                console_size,
+                at_bar1_base,
+            ) {
+                Ok(()) => s.push_str(&alloc::format!(
+                    "[gpustep14] --- stage 1.5: console identity declared to RM (PRIMARY_DEVICE, console {} KiB, at BAR1 base: {}) ---\n",
+                    console_size / 1024,
+                    at_bar1_base
+                )),
+                Err(status) => s.push_str(&alloc::format!(
+                    "[gpustep14] --- stage 1.5: mark_console_gpu FAILED, NV_STATUS={:#x} (continuing) ---\n",
+                    status
+                )),
+            }
+        }
         // 2. GSP-RM boot. gsp_boot_run arms the console SEC2 drain internally
         //    now, so this is the proven path; cached after the first boot.
         s.push_str("[gpustep14] --- stage 2: GSP-RM boot (kgspInitRm, console drain) ---\n");
@@ -2937,10 +2969,13 @@ impl DrmScheme for NvidiaGpu {
                         }
                     }
                     let _ = writeln!(s, "[gpustep15] GR_GET_TPC_MASK: {}", phase(gr.tpc_mask_status));
+                    // Turing packs TWO SMs per TPC (Volta+; the 1-SM/TPC layout
+                    // was consumer Pascal). RTX 2060 Super: 17 TPCs => 34 SMs.
                     let _ = writeln!(
                         s,
-                        "[gpustep15] --- {} TPCs total => {} usable SMs (Turing: 1 SM/TPC) ---",
-                        gr.total_tpc, gr.total_tpc
+                        "[gpustep15] --- {} TPCs total => {} usable SMs (Turing: 2 SMs/TPC) ---",
+                        gr.total_tpc,
+                        gr.total_tpc * 2
                     );
                 }
             }

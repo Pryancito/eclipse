@@ -188,8 +188,8 @@ pub fn rm_api_demo(device_instance: u32) -> Result<RmApiDemo, NV_STATUS> {
 
 /// Fixed-layout mirror of `EclipseGrProbe` (vendor/eclipse_rm_init.c): the
 /// graphics/compute (GR) engine's shader config as reported by the live GSP-RM
-/// via the GR_GET_GPC_MASK / GR_GET_TPC_MASK controls. On Turing there is one
-/// SM per TPC, so `total_tpc` is the GPU's usable SM count.
+/// via the GR_GET_GPC_MASK / GR_GET_TPC_MASK controls. Turing packs TWO SMs
+/// per TPC (Volta+ layout), so the usable SM count is `2 * total_tpc`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct GrProbe {

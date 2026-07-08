@@ -996,8 +996,8 @@ unlock:
  * the same read-only Control path as step-8. Uses the mask controls
  * (GR_GET_GPC_MASK, GR_GET_TPC_MASK) rather than GR_GET_INFO: the mask params
  * are flat scalars (no embedded pointer list to marshal across the RPC), so
- * this stays low-risk. On Turing there is exactly one SM per TPC, so the total
- * enabled TPC count is the GPU's usable SM count -- the first real read of the
+ * this stays low-risk. Turing packs TWO SMs per TPC (Volta+ layout), so the
+ * usable SM count is twice the enabled TPC count -- the first real read of the
  * shader array the compute engine will run on. Proves the GR subsystem is live
  * and queryable end-to-end; groundwork for a future real compute launch.
  */
@@ -1007,7 +1007,7 @@ typedef struct EclipseGrProbe
     NvU32 gpcMask;
     NvU32 numGpc;
     NvU32 tpcMaskStatus; /* first non-OK per-GPC status, else NV_OK */
-    NvU32 totalTpc;      /* == usable SM count on Turing (1 SM/TPC) */
+    NvU32 totalTpc;      /* usable SMs = 2 * totalTpc on Turing (2 SMs/TPC) */
     NvU32 perGpcTpc[8];  /* enabled TPCs per GPC index */
 } EclipseGrProbe;
 
