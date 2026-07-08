@@ -453,6 +453,21 @@ unsafe fn sec2_intr_snapshot_and_drain(base: *mut u8) {
             );
         }
     }
+    // EXP4 source-identification: LEAF[4] bit28 is a live level source, but its
+    // engine identity is unconfirmed (the "display underflow" guess is not
+    // proven -- dev_disp.h has no underflow reg, and HEAD_TIMING is frame-end
+    // only). Read the two prime suspects directly so the next hang's photo
+    // names the culprit: the display->RM aggregate interrupt status
+    // (NV_PDISP_FE_RM_INTR_STAT_CTRL_DISP = 0x611C30, RO) and the priv-ring
+    // master ring interrupt status (NV_PPRIV_MASTER_RING_INTERRUPT_STATUS0/1 =
+    // 0x120058/0x12005c, RO). Both are ordinary BAR0 reads, safe here.
+    let disp_ctrl = rd(0x0061_1C30);
+    let priv0 = rd(0x0012_0058);
+    let priv1 = rd(0x0012_005C);
+    log::error!(
+        "[nvidia-rm] EXP4 source probe: PDISP_RM_INTR_STAT_CTRL_DISP={:#010x} PPRIV_RING_INTR_STATUS0={:#010x} STATUS1={:#010x}",
+        disp_ctrl, priv0, priv1
+    );
 
     // (2) EXP3 -- UNCONDITIONAL write-1-to-clear drain. The EXP2 run showed
     // CPU_INTR_TOP=0 (the top register only reflects ENABLED leaves) yet
@@ -826,12 +841,24 @@ pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, th
                 // write so its flow-control credits drain and STARTCPU
                 // completes. Bypass the generic write below (would double-post).
                 unsafe {
+                    // Clear leaves 0..7 EXCEPT leaf 4 first...
                     for i in 0..8usize {
+                        if i == 4 {
+                            continue;
+                        }
                         let off = 0x00B8_1000 + i * 4; // CPU_INTR_LEAF(i)
                         let leaf = core::ptr::read_volatile(base.add(off) as *const NvU32);
                         if leaf != 0 {
                             core::ptr::write_volatile(base.add(off) as *mut NvU32, leaf);
                         }
+                    }
+                    // ...then W1C leaf 4 (the known live-level source) as the
+                    // VERY LAST operation before the posted store, so the
+                    // de-assert is as fresh as possible when STARTCPU posts.
+                    let l4_off = 0x00B8_1000 + 4 * 4;
+                    let l4 = core::ptr::read_volatile(base.add(l4_off) as *const NvU32);
+                    if l4 != 0 {
+                        core::ptr::write_volatile(base.add(l4_off) as *mut NvU32, l4);
                     }
                     core::ptr::write_volatile(
                         base.add(this_address as usize) as *mut NvU32,
