@@ -14,11 +14,11 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 27] = [
+const PROC_ROOT_STATIC: [&str; 28] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
     "perf", "hunter", "filesystems", "gpudbg", "gpustep2", "gpustep3", "gpustep4", "gpustep5",
     "gpustep6", "gpustep7", "gpustep8", "gpustep9", "gpustep10", "gpustep11", "gpustep12",
-    "gpustep13", "gpudump",
+    "gpustep13", "gpustep14", "gpudump",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -302,6 +302,7 @@ impl INode for ProcRootINode {
             "gpustep11" => Ok(PROC_GPUSTEP11.clone()),
             "gpustep12" => Ok(PROC_GPUSTEP12.clone()),
             "gpustep13" => Ok(PROC_GPUSTEP13.clone()),
+            "gpustep14" => Ok(PROC_GPUSTEP14.clone()),
             "gpudump" => Ok(PROC_GPUDUMP.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
@@ -1251,6 +1252,21 @@ fn proc_gpustep13_content() -> String {
     s
 }
 
+/// `/proc/gpustep14` — CONSOLE GPU full bring-up chained in one shot (attach ->
+/// GSP boot with console SEC2 drain -> RM controls -> state-load -> CE),
+/// bringing the primary to the same state as the secondary. Capture with
+/// `cat /proc/gpustep14 > /r14.txt; sync`.
+fn proc_gpustep14_content() -> String {
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.bringup_step14());
+    }
+    if s.is_empty() {
+        s.push_str("[gpustep14] no DRM driver with bring-up support\n");
+    }
+    s
+}
+
 /// `/proc/gpudump` — read-only discriminating hardware dump for every NVIDIA
 /// GPU (console + secondary): display head liveness, VGA workspace base, PMC,
 /// BSI scratch, sysmem flush. NO GSP boot -> ZERO wedge risk. Read this first
@@ -1536,6 +1552,12 @@ lazy_static! {
     static ref PROC_GPUSTEP13: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 86,
         generate: proc_gpustep13_content,
+    });
+    /// `/proc/gpustep14` -- console GPU full bring-up chain (see
+    /// proc_gpustep14_content).
+    static ref PROC_GPUSTEP14: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 85,
+        generate: proc_gpustep14_content,
     });
     /// `/proc/gpudump` -- read-only discriminating HW dump, both GPUs (see
     /// proc_gpudump_content).

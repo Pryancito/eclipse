@@ -1066,10 +1066,34 @@ impl NvidiaGpu {
                 // secondary boot thus yields a full reference sequence to
                 // diff against the console GPU's wedge point.
                 nvidia_rm_sys::os_boundary::seq_trace_arm();
+                // Console-GPU SEC2-resume fix (proven on real hardware, EXP3 /
+                // gpustep13): on the primary GPU with live GOP scanout, the
+                // display engine underflows during the SEC2 CORE_RESUME window
+                // and continuously asserts a masked interrupt (CPU vector 156 /
+                // LEAF[4] bit28, mirrored in PMC_INTR0 bit28); that unserviced
+                // level assertion backpressures the memory/priv fabric and
+                // stalls the STARTCPU posted write (0x840130) that resumes
+                // GSP-RM -- the wedge that blocked the console GPU for many
+                // sessions. Arming the drain makes os_boundary write-1-to-clear
+                // the interrupt leaf right before the STARTCPU store; the
+                // momentary de-assert lets the posted write drain its flow-
+                // control credits and complete (the source re-asserts after,
+                // but STARTCPU is already through). The secondary/headless GPU
+                // (head SLEEP, no scanout, no underflow) never needs this, so
+                // arm only for the console GPU. This is the permanent fix, no
+                // longer experiment-gated (gpustep13 keeps the EXP3 diagnostics
+                // snapshot for reference).
+                let drain_for_console = self.drives_boot_display();
+                if drain_for_console {
+                    nvidia_rm_sys::os_boundary::sec2_drain_arm();
+                }
                 let computed = match nvidia_rm_sys::rm_init::init_gsp(device_instance, fw_bytes) {
                     Ok(()) => String::from("kgspInitRm OK"),
                     Err(status) => alloc::format!("kgspInitRm FAILED, NV_STATUS={:#x}", status),
                 };
+                if drain_for_console {
+                    nvidia_rm_sys::os_boundary::sec2_drain_disarm();
+                }
                 nvidia_rm_sys::os_boundary::seq_trace_disarm();
                 let captured = nvidia_rm_sys::os_interface::capture_take();
                 drop(fw);
@@ -2462,14 +2486,9 @@ impl DrmScheme for NvidiaGpu {
     fn bringup_step10(&self) -> String {
         use core::fmt::Write;
         let mut s = String::new();
-        // Same guard as step 6: the console GPU never gets its GSP booted
-        // (SEC2 resume wedges its bus), so state-load/CE work can't run
-        // there -- say so instead of a confusing NV_STATUS=0x40 line.
-        if self.drives_boot_display() {
-            return String::from(
-                "[gpustep10] SKIPPED on console GPU (GSP not booted here; CE test runs on the secondary GPU)\n",
-            );
-        }
+        // The console-GPU guard is gone: the SEC2-resume wedge that once
+        // blocked its GSP boot is fixed (gsp_boot_run's console drain), so the
+        // primary can be state-loaded and run the CE test like the secondary.
         let device_instance = *self.rm_device_instance.lock();
         let Some(device_instance) = device_instance else {
             return String::from(
@@ -2825,6 +2844,50 @@ impl DrmScheme for NvidiaGpu {
         nvidia_rm_sys::os_boundary::sec2_drain_disarm();
         nvidia_rm_sys::os_boundary::autopsy_disarm();
         s.push_str(&boot);
+        s
+    }
+
+    /// Step 14 (`/proc/gpustep14`): the CONSOLE GPU's full bring-up chained in
+    /// one shot -- RM attach, GSP-RM boot (with the permanent console SEC2
+    /// drain in gsp_boot_run), RM-client controls, gpuStatePreInit/Init/Load,
+    /// and the copy-engine data-movement test -- so the primary reaches the
+    /// same state-loaded, CE-verified state the secondary already has, in a
+    /// single `cat`. Each sub-step is cached and live-echoed, so a wedge or
+    /// failure at any stage leaves its trail on the console and in the capture.
+    /// Blanks nothing and needs no display reset. Capture with
+    /// `cat /proc/gpustep14 > /r14.txt; sync`. On the secondary GPU this is a
+    /// no-op (it already boots via gpustep6 and runs 8/9/10 directly).
+    fn bringup_step14(&self) -> String {
+        if !self.drives_boot_display() {
+            return String::from(
+                "[gpustep14] SKIPPED on secondary GPU (use gpustep5/6/8/9/10 directly)\n",
+            );
+        }
+        let mut s = String::new();
+        s.push_str(
+            "[gpustep14] === CONSOLE GPU full bring-up: attach -> GSP boot (drain) -> RM controls -> state-load -> CE ===\n",
+        );
+        // 1. RM attach (sets rm_device_instance). bringup_step5 is idempotent
+        //    (cached); safe to always call -- it no-ops if already attached.
+        if self.rm_device_instance.lock().is_none() {
+            s.push_str("[gpustep14] --- stage 1: RM attach (gpustep5) ---\n");
+            s.push_str(&self.bringup_step5());
+        }
+        // 2. GSP-RM boot. gsp_boot_run arms the console SEC2 drain internally
+        //    now, so this is the proven path; cached after the first boot.
+        s.push_str("[gpustep14] --- stage 2: GSP-RM boot (kgspInitRm, console drain) ---\n");
+        nvidia_rm_sys::os_interface::live_echo_begin();
+        s.push_str(&self.gsp_boot_run("gpustep14"));
+        nvidia_rm_sys::os_interface::live_echo_end();
+        // 3-5. RM controls, state pre-init/init/load, CE data movement -- reuse
+        //    the exact same code paths proven on the secondary GPU.
+        s.push_str("[gpustep14] --- stage 3: RM API controls (gpustep8) ---\n");
+        s.push_str(&self.bringup_step8());
+        s.push_str("[gpustep14] --- stage 4: gpuStatePreInit/Init/Load (gpustep9) ---\n");
+        s.push_str(&self.bringup_step9());
+        s.push_str("[gpustep14] --- stage 5: copy-engine data movement (gpustep10) ---\n");
+        s.push_str(&self.bringup_step10());
+        s.push_str("[gpustep14] === console GPU bring-up chain complete (see per-stage results above) ===\n");
         s
     }
 
