@@ -188,8 +188,8 @@ pub fn rm_api_demo(device_instance: u32) -> Result<RmApiDemo, NV_STATUS> {
 
 /// Fixed-layout mirror of `EclipseGrProbe` (vendor/eclipse_rm_init.c): the
 /// graphics/compute (GR) engine's shader config as reported by the live GSP-RM
-/// via the GR_GET_GPC_MASK / GR_GET_TPC_MASK controls. On Turing there is one
-/// SM per TPC, so `total_tpc` is the GPU's usable SM count.
+/// via the GR_GET_GPC_MASK / GR_GET_TPC_MASK controls. Turing packs TWO SMs
+/// per TPC (Volta+ layout), so the usable SM count is `2 * total_tpc`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct GrProbe {
@@ -217,6 +217,53 @@ pub fn step15(device_instance: u32) -> Result<GrProbe, NV_STATUS> {
         per_gpc_tpc: [0; 8],
     };
     let status = unsafe { eclipse_rm_step15(device_instance, &mut out) };
+    if status == NV_OK {
+        Ok(out)
+    } else {
+        Err(status)
+    }
+}
+
+/// One row of the GSP-reported interrupt kernel table (mirror of
+/// `EclipseIntrTableEntry`): which engine (MC_ENGINE_IDX_*) owns which
+/// stall/nonstall vector in the Turing+ CPU_INTR tree, plus its legacy PMC
+/// mask. `0xFFFFFFFF` vectors mean not-applicable.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IntrTableEntry {
+    pub engine_idx: NvU32,
+    pub pmc_intr_mask: NvU32,
+    pub vector_stall: NvU32,
+    pub vector_non_stall: NvU32,
+}
+
+/// Mirror of `EclipseIntrTable`: the live GSP-RM's authoritative
+/// vector->engine interrupt map (NV2080_CTRL_CMD_INTERNAL_INTR_GET_KERNEL_TABLE,
+/// the same control kernel RM uses to build its own interrupt table).
+#[repr(C)]
+pub struct IntrTable {
+    pub ctrl_status: NV_STATUS,
+    pub table_len: NvU32,
+    pub entries: [IntrTableEntry; 128],
+}
+
+extern "C" {
+    fn eclipse_rm_intr_table(device_instance: NvU32, out: *mut IntrTable) -> NV_STATUS;
+}
+
+/// Fetches the GSP-reported interrupt kernel table (boxed: ~2 KiB).
+pub fn intr_table(device_instance: u32) -> Result<alloc::boxed::Box<IntrTable>, NV_STATUS> {
+    let mut out = alloc::boxed::Box::new(IntrTable {
+        ctrl_status: 0,
+        table_len: 0,
+        entries: [IntrTableEntry {
+            engine_idx: 0,
+            pmc_intr_mask: 0,
+            vector_stall: 0,
+            vector_non_stall: 0,
+        }; 128],
+    });
+    let status = unsafe { eclipse_rm_intr_table(device_instance, &mut *out) };
     if status == NV_OK {
         Ok(out)
     } else {

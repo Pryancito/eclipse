@@ -517,6 +517,57 @@ pub fn live_echo_begin() {
 pub fn live_echo_end() {
     LIVE_ECHO.store(false, Ordering::Relaxed);
 }
+
+/// Saved `log::max_level` across a console-quiet window (encoded as usize via
+/// `LevelFilter as usize`; usize::MAX = no window active).
+static QUIET_SAVED_LEVEL: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Enter the console-quiet window: suppress ALL kernel log rendering (the
+/// console framebuffer lives in the console GPU's own BAR1, so every log line
+/// is a burst of posted CPU writes into the GPU under bring-up). This is
+/// Eclipse's equivalent of what the Linux driver does around kgspInitRm on a
+/// client-managed-console GPU: os_disable_console_access() == console_lock()
+/// (osinit.c:1841-1845, NVIDIA's own comment: "to ensure no console writes
+/// through BAR1 can interfere"). Every prior console-GPU boot here rendered
+/// the live seq-trace INTO BAR1 interleaved with the sequencer MMIO -- the
+/// single biggest divergence from Linux in the exact wedge window. Capture
+/// paths (capture_push / seq trace) are unaffected: they run before the log
+/// macros, so the narration still lands in the /proc output afterwards.
+/// Pair with `console_quiet_end`; nesting is not supported.
+pub fn console_quiet_begin() {
+    let cur = log::max_level();
+    QUIET_SAVED_LEVEL.store(cur as usize, Ordering::Relaxed);
+    log::set_max_level(log::LevelFilter::Off);
+}
+
+/// Leave the console-quiet window, restoring the saved log level. An
+/// unpaired call (no matching begin) is a no-op; a machine running with
+/// logging Off keeps it Off.
+pub fn console_quiet_end() {
+    let saved = QUIET_SAVED_LEVEL.swap(usize::MAX, Ordering::Relaxed);
+    let level = match saved {
+        0 => log::LevelFilter::Off,
+        1 => log::LevelFilter::Error,
+        2 => log::LevelFilter::Warn,
+        3 => log::LevelFilter::Info,
+        4 => log::LevelFilter::Debug,
+        5 => log::LevelFilter::Trace,
+        _ => return, // usize::MAX sentinel: no window was active
+    };
+    log::set_max_level(level);
+}
+
+/// Probe-diagnostic line: ALWAYS lands in the capture buffer (folded into the
+/// /proc output afterwards) and ALSO renders at ERROR level when rendering is
+/// on. Inside the console-quiet window the log macro short-circuits at
+/// `max_level` (Off) but the capture still records -- use this instead of a
+/// bare `log::error!` for any diagnostic that runs inside the GSP boot
+/// window, or quiet mode silently discards it (review finding).
+pub fn probe_line(s: &str) {
+    capture_push(s);
+    log::error!("{}", s);
+}
 // Generous cap: the GSP-RM boot path (gpustep6) narrates far more than the
 // attach path, and the whole buffer is folded into the /proc read (which is
 // offset-chunked, so size is not a problem). Bounded only so a runaway loop

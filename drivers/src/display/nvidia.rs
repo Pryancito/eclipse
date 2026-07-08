@@ -1000,7 +1000,107 @@ impl NvidiaGpu {
     /// /proc generator around this call): INTx mask, kgspInitRm, narration
     /// capture, per-GPU result cache. `tag` labels the output lines
     /// ("gpustep6"/"gpustep11") so each proc file reads naturally.
-    fn gsp_boot_run(&self, tag: &str) -> String {
+    /// PBUS PRI-error pre-boot diagnose + engine-level retire (console GPU).
+    /// The workflow research identified the pre-STARTCPU pending LEAF[4] bit28
+    /// (CPU vector 156, mirrored in legacy PMC_INTR0 bit 28) as PBUS -- the
+    /// PRI (priv bus) error collector: nouveau maps legacy PMC bit 28 to
+    /// NVKM_SUBDEV_BUS on this whole lineage, and its unit-level status is
+    /// NV_PBUS_INTR_0 @ 0x1100 (PRI_SQUASH bit1 / PRI_FECSERR bit2 /
+    /// PRI_TIMEOUT bit3), with the FAULTING PRI ADDRESS latched in 0x9084 and
+    /// the write data in 0x9088 (nouveau gf100_bus_intr, valid through Turing:
+    /// tu102 uses gf100_bus in non-GSP nouveau). A leaf W1C can never retire
+    /// it -- the level line follows the unit latch, which is why EXP3's leaf
+    /// clear re-asserted "within microseconds". nouveau's documented quench:
+    /// read 0x9084/0x9088 for diagnosis, write 0x9084=0, then W1C the handled
+    /// bits into 0x1100. Runs BEFORE kgspInitRm with full logging (safe: no
+    /// SEC2 resume in flight), so one boot both names the original PRI fault
+    /// (smoking gun for WHY only the GOP/primary GPU has it latched) and
+    /// retires the level source for real instead of racing it.
+    fn pbus_pri_diagnose_and_clear(&self, tag: &str) -> String {
+        use core::fmt::Write;
+        let mut s = String::new();
+        let bar0 = self._bar0;
+        let rd = |off: usize| unsafe { core::ptr::read_volatile((bar0 + off) as *const u32) };
+        let wr = |off: usize, v: u32| unsafe {
+            core::ptr::write_volatile((bar0 + off) as *mut u32, v)
+        };
+        // Looks like the 0xBADFxxxx PRI-error sentinel (register absent /
+        // priv fault)? Never write to a register that read back as one.
+        let is_badf = |v: u32| (v & 0xFFFF_0000) == 0xBADF_0000;
+
+        let intr0 = rd(0x1100);
+        let save0 = rd(0x9084);
+        let save1 = rd(0x9088);
+        // LR10-lineage candidates (the only offsets published in this tree);
+        // reads may themselves fault (sentinel) -- we clear PBUS right after,
+        // so a probe-induced PRI_TIMEOUT is retired too.
+        let lr_save0 = rd(0x1984);
+        let lr_save1 = rd(0x1988);
+        let lr_errc = rd(0x198C);
+        let leaf4 = rd(0x00B8_1010);
+        let pmc0 = rd(0x100);
+        let _ = writeln!(
+            s,
+            "[{}] PBUS pre-boot: INTR_0={:#010x} (SQUASH={} FECSERR={} TIMEOUT={}) SAVE_0(0x9084)={:#010x} SAVE_1(0x9088)={:#010x}",
+            tag,
+            intr0,
+            (intr0 >> 1) & 1,
+            (intr0 >> 2) & 1,
+            (intr0 >> 3) & 1,
+            save0,
+            save1
+        );
+        if save0 != 0 && !is_badf(save0) {
+            let _ = writeln!(
+                s,
+                "[{}] PBUS latched PRI fault: {} of data {:#010x} at PRI address {:#08x}",
+                tag,
+                if save0 & 0x2 != 0 { "WRITE" } else { "READ" },
+                save1,
+                save0 & 0x00FF_FFFC
+            );
+        }
+        let _ = writeln!(
+            s,
+            "[{}] PBUS alt regs: 0x1984={:#010x} 0x1988={:#010x} 0x198C={:#010x}; LEAF[4]={:#010x} PMC_INTR0={:#010x}",
+            tag, lr_save0, lr_save1, lr_errc, leaf4, pmc0
+        );
+        log::error!("{}", s.trim_end());
+        // Retire at the unit: clear the fault latch, then W1C the status.
+        if !is_badf(save0) {
+            wr(0x9084, 0);
+        }
+        // 0x1984 (LR10-lineage SAVE_0) stays READ-ONLY: that offset is only
+        // published for NVSwitch/LR10 and was never verified on Turing -- a
+        // blind write could hit an unrelated register. The nouveau-documented
+        // Turing clear path (0x9084=0 + W1C 0x1100) above already covers it.
+        let intr0_now = rd(0x1100);
+        if intr0_now != 0 && !is_badf(intr0_now) {
+            wr(0x1100, intr0_now);
+        }
+        // Leaf W1C after the unit clear, then verify the level line dropped.
+        let leaf4_mid = rd(0x00B8_1010);
+        if leaf4_mid != 0 && !is_badf(leaf4_mid) {
+            wr(0x00B8_1010, leaf4_mid);
+        }
+        let leaf4_after = rd(0x00B8_1010);
+        let pmc0_after = rd(0x100);
+        let intr0_after = rd(0x1100);
+        let verdict = if leaf4_after & 0x1000_0000 == 0 && pmc0_after & 0x1000_0000 == 0 {
+            "RETIRED (level source quenched at the unit)"
+        } else {
+            "STILL PENDING (source is not PBUS-latch-only; see values)"
+        };
+        let tail = alloc::format!(
+            "[{}] PBUS after clear: INTR_0={:#010x} LEAF[4]={:#010x} PMC_INTR0={:#010x} -> {}",
+            tag, intr0_after, leaf4_after, pmc0_after, verdict
+        );
+        log::error!("{}", tail);
+        let _ = writeln!(s, "{}", tail);
+        s
+    }
+
+    fn gsp_boot_run(&self, tag: &str, quiet: bool) -> String {
         use core::fmt::Write;
         let device_instance = *self.rm_device_instance.lock();
 
@@ -1066,31 +1166,63 @@ impl NvidiaGpu {
                 // secondary boot thus yields a full reference sequence to
                 // diff against the console GPU's wedge point.
                 nvidia_rm_sys::os_boundary::seq_trace_arm();
-                // Console-GPU SEC2-resume fix (proven on real hardware, EXP3 /
-                // gpustep13): on the primary GPU with live GOP scanout, the
-                // display engine underflows during the SEC2 CORE_RESUME window
-                // and continuously asserts a masked interrupt (CPU vector 156 /
-                // LEAF[4] bit28, mirrored in PMC_INTR0 bit28); that unserviced
-                // level assertion backpressures the memory/priv fabric and
-                // stalls the STARTCPU posted write (0x840130) that resumes
-                // GSP-RM -- the wedge that blocked the console GPU for many
-                // sessions. Arming the drain makes os_boundary write-1-to-clear
-                // the interrupt leaf right before the STARTCPU store; the
-                // momentary de-assert lets the posted write drain its flow-
-                // control credits and complete (the source re-asserts after,
-                // but STARTCPU is already through). The secondary/headless GPU
-                // (head SLEEP, no scanout, no underflow) never needs this, so
-                // arm only for the console GPU. This is the permanent fix, no
-                // longer experiment-gated (gpustep13 keeps the EXP3 diagnostics
-                // snapshot for reference).
+                // Console-GPU SEC2-resume mitigation stack. History: the
+                // primary GPU (live GOP scanout) wedged at the SEC2 STARTCPU
+                // posted write with CPU vector 156 (LEAF[4] bit28, mirrored in
+                // legacy PMC_INTR0 bit28) pending-but-masked. Research
+                // identified that source as PBUS (the PRI-error collector; a
+                // PRI fault sits latched in NV_PBUS_INTR_0 until cleared at
+                // the unit -- leaf W1C can never retire it, hence EXP3's
+                // "re-asserts within microseconds"). It is retired for real by
+                // pbus_pri_diagnose_and_clear() below, BEFORE the boot. The
+                // pre-STARTCPU leaf drain stays armed as belt-and-braces (it
+                // correlated with the one lucky pre-fix success), and the real
+                // Linux-faithful fix is the console-quiet window (see `quiet`):
+                // prior-art (nouveau r535 / RM / nova-core) does the STARTCPU
+                // write unconditionally -- what they all ALSO do, and we
+                // didn't, is never touch the console framebuffer (this GPU's
+                // BAR1!) during the boot. The secondary/headless GPU needs
+                // none of this.
                 let drain_for_console = self.drives_boot_display();
                 if drain_for_console {
                     nvidia_rm_sys::os_boundary::sec2_drain_arm();
+                }
+                // Console GPU: diagnose + retire the latched PBUS PRI error at
+                // the unit BEFORE the boot (fully logged -- no SEC2 window in
+                // flight yet), so the LEAF[4] bit28 level source is quenched
+                // for real instead of raced at STARTCPU time. See the method's
+                // doc comment for the research trail.
+                let pbus_log = if drain_for_console {
+                    self.pbus_pri_diagnose_and_clear(tag)
+                } else {
+                    String::new()
+                };
+                // Console-quiet window (Linux console_lock equivalent) when the
+                // caller asked for it: the console framebuffer lives in THIS
+                // GPU's BAR1, and every prior console-GPU boot interleaved live
+                // seq-trace pixel writes with the sequencer MMIO -- the one
+                // thing Linux explicitly forbids around kgspInitRm
+                // (osinit.c:1841: "to ensure no console writes through BAR1
+                // can interfere"). Everything is still captured and folded
+                // into this /proc read afterwards; only live rendering stops.
+                if quiet && drain_for_console {
+                    log::error!(
+                        "[NVIDIA] {}: entering console-silent GSP boot window (Linux console_lock equivalent) -- next render after kgspInitRm returns",
+                        tag
+                    );
+                    nvidia_rm_sys::os_interface::console_quiet_begin();
                 }
                 let computed = match nvidia_rm_sys::rm_init::init_gsp(device_instance, fw_bytes) {
                     Ok(()) => String::from("kgspInitRm OK"),
                     Err(status) => alloc::format!("kgspInitRm FAILED, NV_STATUS={:#x}", status),
                 };
+                if quiet && drain_for_console {
+                    nvidia_rm_sys::os_interface::console_quiet_end();
+                    log::error!(
+                        "[NVIDIA] {}: console-silent window exited (kgspInitRm returned)",
+                        tag
+                    );
+                }
                 if drain_for_console {
                     nvidia_rm_sys::os_boundary::sec2_drain_disarm();
                 }
@@ -1099,6 +1231,7 @@ impl NvidiaGpu {
                 drop(fw);
                 let mut block = String::new();
                 block.push_str(&preboot);
+                block.push_str(&pbus_log);
                 if let Some(log) = captured {
                     if !log.is_empty() {
                         let _ = writeln!(block, "[{}]  --- GSP-RM narration (captured) ---", tag);
@@ -2631,7 +2764,7 @@ impl DrmScheme for NvidiaGpu {
             );
         }
 
-        s.push_str(&self.gsp_boot_run("gpustep6"));
+        s.push_str(&self.gsp_boot_run("gpustep6", false));
         s
     }
 
@@ -2738,7 +2871,7 @@ impl DrmScheme for NvidiaGpu {
         // it renders live at LOG=error -- a wedge leaves the exact hanging
         // register access as the last line on screen.
         nvidia_rm_sys::os_interface::live_echo_begin();
-        let boot = self.gsp_boot_run("gpustep11");
+        let boot = self.gsp_boot_run("gpustep11", false);
         nvidia_rm_sys::os_interface::live_echo_end();
         nvidia_rm_sys::os_boundary::autopsy_disarm();
         let (restore_log, _) = self.set_path_vga_routing(false, &bridges_changed);
@@ -2797,7 +2930,7 @@ impl DrmScheme for NvidiaGpu {
         nvidia_rm_sys::os_boundary::autopsy_arm(self.config_handle(), self.parent_config_handle());
         nvidia_rm_sys::os_boundary::pdisp_kill_arm();
         nvidia_rm_sys::os_interface::live_echo_begin();
-        let boot = self.gsp_boot_run("gpustep12");
+        let boot = self.gsp_boot_run("gpustep12", false);
         nvidia_rm_sys::os_interface::live_echo_end();
         nvidia_rm_sys::os_boundary::pdisp_kill_disarm();
         nvidia_rm_sys::os_boundary::autopsy_disarm();
@@ -2839,7 +2972,7 @@ impl DrmScheme for NvidiaGpu {
         nvidia_rm_sys::os_boundary::autopsy_arm(self.config_handle(), self.parent_config_handle());
         nvidia_rm_sys::os_boundary::sec2_drain_arm();
         nvidia_rm_sys::os_interface::live_echo_begin();
-        let boot = self.gsp_boot_run("gpustep13");
+        let boot = self.gsp_boot_run("gpustep13", false);
         nvidia_rm_sys::os_interface::live_echo_end();
         nvidia_rm_sys::os_boundary::sec2_drain_disarm();
         nvidia_rm_sys::os_boundary::autopsy_disarm();
@@ -2873,12 +3006,48 @@ impl DrmScheme for NvidiaGpu {
             s.push_str("[gpustep14] --- stage 1: RM attach (gpustep5) ---\n");
             s.push_str(&self.bringup_step5());
         }
+        // 1.5. Declare this GPU's real identity to RM BEFORE the GSP boot,
+        //    exactly where Linux does (RmDeterminePrimaryDevice /
+        //    RmSetConsolePreservationParams right before kgspInitRm): PRIMARY
+        //    device with a live UEFI GOP console in its BAR1. Review finding:
+        //    only step11 ever did this -- the step13/14 boots were telling
+        //    GSP-RM bIsPrimary=false with no console reservation, so GSP-RM's
+        //    FB carving/scrubbing had no idea the scanout surface existed.
+        //    Idempotent property/field writes; safe on cached re-reads.
+        if let Some(device_instance) = *self.rm_device_instance.lock() {
+            let (console_size, at_bar1_base) = match *BOOT_FB_INFO.lock() {
+                Some(fb) => (
+                    fb.pitch as u64 * fb.height as u64,
+                    fb.phys == self.bar1_phys,
+                ),
+                None => (0, false),
+            };
+            match nvidia_rm_sys::rm_init::mark_console_gpu(
+                device_instance,
+                console_size,
+                at_bar1_base,
+            ) {
+                Ok(()) => s.push_str(&alloc::format!(
+                    "[gpustep14] --- stage 1.5: console identity declared to RM (PRIMARY_DEVICE, console {} KiB, at BAR1 base: {}) ---\n",
+                    console_size / 1024,
+                    at_bar1_base
+                )),
+                Err(status) => s.push_str(&alloc::format!(
+                    "[gpustep14] --- stage 1.5: mark_console_gpu FAILED, NV_STATUS={:#x} (continuing) ---\n",
+                    status
+                )),
+            }
+        }
         // 2. GSP-RM boot. gsp_boot_run arms the console SEC2 drain internally
         //    now, so this is the proven path; cached after the first boot.
-        s.push_str("[gpustep14] --- stage 2: GSP-RM boot (kgspInitRm, console drain) ---\n");
-        nvidia_rm_sys::os_interface::live_echo_begin();
-        s.push_str(&self.gsp_boot_run("gpustep14"));
-        nvidia_rm_sys::os_interface::live_echo_end();
+        s.push_str("[gpustep14] --- stage 2: GSP-RM boot (kgspInitRm, console-SILENT, PBUS pre-clear) ---\n");
+        // No live_echo here (review finding): Linux holds console_lock() for
+        // the whole kgspInitRm on a console GPU -- zero CPU writes into this
+        // GPU's BAR1 while SEC2 runs its HS reload. Our live echo painted the
+        // seq trace INTO that BAR1 during the wedge window on every prior
+        // boot. gsp_boot_run(quiet=true) now replicates the Linux behavior;
+        // everything is still captured and shown in this /proc read after.
+        s.push_str(&self.gsp_boot_run("gpustep14", true));
         // 3-5. RM controls, state pre-init/init/load, CE data movement -- reuse
         //    the exact same code paths proven on the secondary GPU.
         s.push_str("[gpustep14] --- stage 3: RM API controls (gpustep8) ---\n");
@@ -2937,10 +3106,13 @@ impl DrmScheme for NvidiaGpu {
                         }
                     }
                     let _ = writeln!(s, "[gpustep15] GR_GET_TPC_MASK: {}", phase(gr.tpc_mask_status));
+                    // Turing packs TWO SMs per TPC (Volta+; the 1-SM/TPC layout
+                    // was consumer Pascal). RTX 2060 Super: 17 TPCs => 34 SMs.
                     let _ = writeln!(
                         s,
-                        "[gpustep15] --- {} TPCs total => {} usable SMs (Turing: 1 SM/TPC) ---",
-                        gr.total_tpc, gr.total_tpc
+                        "[gpustep15] --- {} TPCs total => {} usable SMs (Turing: 2 SMs/TPC) ---",
+                        gr.total_tpc,
+                        gr.total_tpc * 2
                     );
                 }
             }
@@ -2950,6 +3122,103 @@ impl DrmScheme for NvidiaGpu {
                     "[gpustep15] eclipse_rm_step15 FAILED, NV_STATUS={:#x} (GR not state-loaded? run gpustep9 or gpustep14)",
                     status
                 );
+            }
+        }
+        // Interrupt kernel table: the GSP's own authoritative vector->engine
+        // map (the same control kernel RM uses to build its interrupt table:
+        // NV2080_CTRL_CMD_INTERNAL_INTR_GET_KERNEL_TABLE). Settles empirically
+        // which engine owns CPU vector 156 (the LEAF[4] bit28 level source
+        // behind the console GPU's SEC2 wedge) and which engine drives legacy
+        // PMC mask 0x10000000 -- research says PBUS for both; this is the
+        // ground truth from this exact GPU.
+        fn engine_name(idx: u32) -> &'static str {
+            match idx {
+                0 => "NULL",
+                1 => "TMR",
+                2 => "DISP",
+                3 => "FB",
+                4 => "FIFO",
+                7 => "BUS",
+                8 => "PMGR",
+                11 => "BIF",
+                13 => "PRIVRING",
+                14 => "PMU",
+                15 => "CE0",
+                16 => "CE1",
+                17 => "CE2",
+                18 => "CE3",
+                19 => "CE4",
+                20 => "CE5",
+                43 => "LTC",
+                44 => "FBHUB",
+                45 => "HDACODEC",
+                46 => "GMMU",
+                47 => "SEC2",
+                49 => "NVLINK",
+                50 => "GSP",
+                59 => "REPLAYABLE_FAULT",
+                60 => "ACCESS_CNTR",
+                61 => "NON_REPLAYABLE_FAULT",
+                64 => "INFO_FAULT",
+                65 => "NVDEC0",
+                73 => "CPU_DOORBELL",
+                74 => "PRIV_DOORBELL",
+                75 => "MMU_ECC_ERROR",
+                77 => "PERFMON",
+                84 => "GR0",
+                156 => "GR_FECS_LOG",
+                164 => "TMR_SWRL",
+                165 => "DISP_GSP",
+                166 => "REPLAYABLE_FAULT_CPU",
+                167 => "NON_REPLAYABLE_FAULT_CPU",
+                _ => "?",
+            }
+        }
+        match nvidia_rm_sys::rm_init::intr_table(device_instance) {
+            Ok(t) => {
+                if t.ctrl_status != 0 {
+                    let _ = writeln!(
+                        s,
+                        "[gpustep15] INTR_GET_KERNEL_TABLE control FAILED, NV_STATUS={:#x} (table below is empty)",
+                        t.ctrl_status
+                    );
+                }
+                let _ = writeln!(
+                    s,
+                    "[gpustep15] --- GSP interrupt kernel table ({} entries; rows with a vector or legacy PMC mask; >>> = vector 156 or mask 0x10000000) ---",
+                    t.table_len
+                );
+                for e in t.entries.iter().take(t.table_len as usize) {
+                    let hot = e.vector_stall == 156
+                        || e.vector_non_stall == 156
+                        || e.pmc_intr_mask & 0x1000_0000 != 0;
+                    let has_vec = e.vector_stall != u32::MAX || e.vector_non_stall != u32::MAX;
+                    if hot || e.pmc_intr_mask != 0 || has_vec {
+                        let vs = if e.vector_stall == u32::MAX {
+                            String::from("-")
+                        } else {
+                            alloc::format!("{}", e.vector_stall)
+                        };
+                        let vn = if e.vector_non_stall == u32::MAX {
+                            String::from("-")
+                        } else {
+                            alloc::format!("{}", e.vector_non_stall)
+                        };
+                        let _ = writeln!(
+                            s,
+                            "[gpustep15] {} engine={:3} ({:<22}) pmcMask={:#010x} vecStall={:>5} vecNonStall={:>5}",
+                            if hot { ">>>" } else { "   " },
+                            e.engine_idx,
+                            engine_name(e.engine_idx),
+                            e.pmc_intr_mask,
+                            vs,
+                            vn
+                        );
+                    }
+                }
+            }
+            Err(status) => {
+                let _ = writeln!(s, "[gpustep15] intr_table FAILED, NV_STATUS={:#x}", status);
             }
         }
         s
