@@ -417,6 +417,31 @@ pub fn sec2_drain_disarm() {
     SEC2_DRAIN_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Linux byte-parity mode for the STARTCPU bracket. Stock Linux CORE_RESUME
+/// performs EXACTLY: read SEC2 CPUCTL (0x840100), write CPUCTL_ALIAS
+/// (0x840130) -- with ZERO intervening MMIO (kernel_falcon_tu102.c:231-244).
+/// Eclipse's bracket historically inserted a BSI pre-read, an interrupt-tree
+/// snapshot (including a DISPLAY register read at 0x611C30 and priv-ring
+/// reads at 0x120058), and a W1C drain sweep between those two accesses.
+/// Falsification status of the wedge theories so far: console-silent boot +
+/// pre-boot PBUS clean still wedged, and the single successful boot ran a
+/// build WITHOUT the display/priv-ring probe reads. When armed, the bracket
+/// does NOTHING: no BSI read, no snapshot, no drain -- the store goes through
+/// the generic path exactly like Linux. Armed by gsp_boot_run(quiet=true)
+/// together with the console-silent window; supersedes SEC2_DRAIN_ARMED.
+static LINUX_PARITY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Arm Linux byte-parity mode for the next GSP boot's STARTCPU bracket.
+pub fn linux_parity_arm() {
+    LINUX_PARITY.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Disarm Linux byte-parity mode (boot returned).
+pub fn linux_parity_disarm() {
+    LINUX_PARITY.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Snapshot + drain the CPU-facing top-level interrupt tree just before the
 /// SEC2 STARTCPU posted write. `base` is this GPU's BAR0 virtual base
 /// (`DEVICE_MAPPING::gpuNvAddr`). Register map (Turing bare-metal, PF: the
@@ -808,7 +833,12 @@ pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, th
     // Set when the STARTCPU store is posted inside the drain path below (tight
     // W1C-then-store), so the generic write at the end is skipped (no double-post).
     let mut startcpu_posted = false;
-    if is_sec2_startcpu {
+    // Linux byte-parity mode: the bracket contributes ZERO extra MMIO and zero
+    // logging -- the store proceeds through the generic write below, exactly
+    // like kflcnStartCpu_TU102 on Linux (read CPUCTL, write CPUCTL_ALIAS,
+    // nothing between). See LINUX_PARITY's doc for the falsification trail.
+    let parity = LINUX_PARITY.load(core::sync::atomic::Ordering::Relaxed);
+    if is_sec2_startcpu && !parity {
         GSP_PROBE_ON.store(true, core::sync::atomic::Ordering::Relaxed);
         // Belt-and-braces trace trigger: normally the trace went live already
         // when the RUN_CPU_SEQUENCER narration line was seen (covering the
