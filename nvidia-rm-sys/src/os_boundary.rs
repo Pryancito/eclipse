@@ -435,22 +435,25 @@ unsafe fn sec2_intr_snapshot_and_drain(base: *mut u8) {
     let rd = |off: usize| core::ptr::read_volatile(base.add(off) as *const NvU32);
     let wr = |off: usize, v: NvU32| core::ptr::write_volatile(base.add(off) as *mut NvU32, v);
 
-    // (1) Snapshot BEFORE draining -- ERROR level so it survives the wedge.
+    // (1) Snapshot BEFORE draining. probe_line captures ALWAYS (folded into
+    // the /proc read) and renders at ERROR when outside the console-quiet
+    // window (quiet mode deliberately gives up live wedge forensics; step13
+    // stays loud for that).
     let top0 = rd(TOP);
     let pmc0 = rd(0x100);
     let pmc1 = rd(0x104);
-    log::error!(
+    crate::os_interface::probe_line(&alloc::format!(
         "[nvidia-rm] EXP2 pre-STARTCPU intr snapshot: CPU_INTR_TOP={:#010x} PMC_INTR0={:#010x} PMC_INTR1={:#010x}",
         top0, pmc0, pmc1
-    );
+    ));
     for i in 0..8usize {
         let leaf = rd(LEAF + i * 4);
         let en = rd(LEAF_EN + i * 4);
         if leaf != 0 || en != 0 {
-            log::error!(
+            crate::os_interface::probe_line(&alloc::format!(
                 "[nvidia-rm] EXP2   LEAF[{}] pending={:#010x} en={:#010x}",
                 i, leaf, en
-            );
+            ));
         }
     }
     // EXP4 source-identification: LEAF[4] bit28 is a live level source, but its
@@ -464,10 +467,10 @@ unsafe fn sec2_intr_snapshot_and_drain(base: *mut u8) {
     let disp_ctrl = rd(0x0061_1C30);
     let priv0 = rd(0x0012_0058);
     let priv1 = rd(0x0012_005C);
-    log::error!(
+    crate::os_interface::probe_line(&alloc::format!(
         "[nvidia-rm] EXP4 source probe: PDISP_RM_INTR_STAT_CTRL_DISP={:#010x} PPRIV_RING_INTR_STATUS0={:#010x} STATUS1={:#010x}",
         disp_ctrl, priv0, priv1
-    );
+    ));
 
     // (2) EXP3 -- UNCONDITIONAL write-1-to-clear drain. The EXP2 run showed
     // CPU_INTR_TOP=0 (the top register only reflects ENABLED leaves) yet
@@ -492,22 +495,22 @@ unsafe fn sec2_intr_snapshot_and_drain(base: *mut u8) {
         let after = rd(LEAF + i * 4);
         if after != 0 {
             still_pending = still_pending.wrapping_add(1);
-            log::error!(
+            crate::os_interface::probe_line(&alloc::format!(
                 "[nvidia-rm] EXP3 LEAF[{}] STILL pending after W1C = {:#010x} (LIVE LEVEL source -- clear at engine)",
                 i, after
-            );
+            ));
         }
     }
     let top_final = rd(TOP);
     let pmc0_final = rd(0x100);
-    log::error!(
+    crate::os_interface::probe_line(&alloc::format!(
         "[nvidia-rm] EXP3 drain done: bits_cleared={} leaves_still_pending={} CPU_INTR_TOP_final={:#010x} PMC_INTR0_final={:#010x} ({})",
         cleared_bits,
         still_pending,
         top_final,
         pmc0_final,
         if still_pending == 0 { "leaves latched -- W1C stuck" } else { "re-asserting level source" }
-    );
+    ));
 }
 
 /// EXP 1 (PDISP hold-in-reset): when armed, the first completed read of

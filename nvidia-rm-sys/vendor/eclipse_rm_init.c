@@ -51,6 +51,7 @@
 #include "ctrl/ctrl2080/ctrl2080gpu.h"
 #include "ctrl/ctrl2080/ctrl2080fb.h"
 #include "ctrl/ctrl2080/ctrl2080gr.h"
+#include "ctrl/ctrl2080/ctrl2080internal.h"
 #include "os/os.h"
 #include "tls/tls.h"
 #include "g_hal_register.h"
@@ -1135,6 +1136,147 @@ NV_STATUS eclipse_rm_step15(NvU32 gpuInstance, EclipseGrProbe *pOut)
             }
         }
     }
+
+    status = NV_OK;
+
+unlock:
+    rmGpuGroupLockRelease(gpusLockedMask, GPUS_LOCK_FLAGS_NONE);
+    rmapiLockRelease();
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
+}
+
+/*
+ * Interrupt kernel table dump: ask the live GSP-RM for its authoritative
+ * vector->engine map via NV2080_CTRL_CMD_INTERNAL_INTR_GET_KERNEL_TABLE --
+ * the exact control kernel RM's intrInitInterruptTable uses on a GSP client
+ * (intr.c:1044, ROUTE_TO_PHYSICAL|INTERNAL, served by GSP firmware). Each
+ * entry names an engine (MC_ENGINE_IDX_*), its legacy PMC mask, and its
+ * stall/nonstall vectors in the Turing+ CPU_INTR tree. This settles, from the
+ * GPU's own table, which engine owns CPU vector 156 (the LEAF[4] bit28 level
+ * source observed pending before the console GPU's SEC2 STARTCPU wedge) and
+ * which engine drives legacy PMC_INTR_0 bit 28 (mask 0x10000000). Read-only.
+ */
+typedef struct EclipseIntrTableEntry
+{
+    NvU32 engineIdx;
+    NvU32 pmcIntrMask;
+    NvU32 vectorStall;
+    NvU32 vectorNonStall;
+} EclipseIntrTableEntry;
+
+typedef struct EclipseIntrTable
+{
+    NvU32 ctrlStatus;
+    NvU32 tableLen;
+    EclipseIntrTableEntry entries[NV2080_CTRL_INTERNAL_INTR_MAX_TABLE_SIZE];
+} EclipseIntrTable;
+
+NV_STATUS eclipse_rm_intr_table(NvU32 gpuInstance, EclipseIntrTable *pOut)
+{
+    OBJGPU *pGpu;
+    RM_API *pRmApi;
+    NV_STATUS status;
+    THREAD_STATE_NODE threadState;
+    GPU_MASK gpusLockedMask = 0;
+    NV2080_CTRL_INTERNAL_INTR_GET_KERNEL_TABLE_PARAMS *pParams = NULL;
+
+    if (pOut == NULL)
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    portMemSet(pOut, 0, sizeof(*pOut));
+    pOut->ctrlStatus = NV_ERR_NOT_READY;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pGpu = gpumgrGetGpu(gpuInstance);
+    if (pGpu == NULL || !pGpu->gspRmInitialized)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
+    }
+
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    status = rmGpuGroupLockAcquire(pGpu->gpuInstance, GPU_LOCK_GRP_SUBDEVICE,
+                                   GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT,
+                                   &gpusLockedMask);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    if (pGpu->hInternalClient == 0)
+    {
+        GspStaticConfigInfo *pGSCI = GPU_GET_GSP_STATIC_INFO(pGpu);
+        if (pGSCI == NULL || pGSCI->hInternalClient == 0)
+        {
+            status = NV_ERR_INVALID_STATE;
+            goto unlock;
+        }
+        pGpu->hInternalClient = pGSCI->hInternalClient;
+        pGpu->hInternalDevice = pGSCI->hInternalDevice;
+        pGpu->hInternalSubdevice = pGSCI->hInternalSubdevice;
+        rmapiControlCacheSetGpuAttrForObject(pGpu->hInternalClient,
+                                             pGpu->hInternalSubdevice, pGpu);
+        rmapiControlCacheSetGpuAttrForObject(pGpu->hInternalClient,
+                                             pGpu->hInternalDevice, pGpu);
+    }
+
+    pRmApi = GPU_GET_PHYSICAL_RMAPI(pGpu);
+
+    /* ~2 KiB params: heap-allocate exactly like intrInitInterruptTable does
+     * (intr.c:1041, portMemAllocNonPaged) -- too big for comfort on stack. */
+    pParams = portMemAllocNonPaged(sizeof(*pParams));
+    if (pParams == NULL)
+    {
+        status = NV_ERR_NO_MEMORY;
+        goto unlock;
+    }
+    portMemSet(pParams, 0, sizeof(*pParams));
+
+    pOut->ctrlStatus = pRmApi->Control(pRmApi, pGpu->hInternalClient,
+                                       pGpu->hInternalSubdevice,
+                                       NV2080_CTRL_CMD_INTERNAL_INTR_GET_KERNEL_TABLE,
+                                       pParams, sizeof(*pParams));
+    nv_printf(0, "[eclipse-rm-trace] intr_table: INTR_GET_KERNEL_TABLE -> 0x%x len=%u\n",
+              pOut->ctrlStatus, pParams->tableLen);
+    if (pOut->ctrlStatus == NV_OK)
+    {
+        NvU32 i;
+        NvU32 n = pParams->tableLen;
+        if (n > NV2080_CTRL_INTERNAL_INTR_MAX_TABLE_SIZE)
+        {
+            n = NV2080_CTRL_INTERNAL_INTR_MAX_TABLE_SIZE;
+        }
+        pOut->tableLen = n;
+        for (i = 0; i < n; i++)
+        {
+            pOut->entries[i].engineIdx      = pParams->table[i].engineIdx;
+            pOut->entries[i].pmcIntrMask    = pParams->table[i].pmcIntrMask;
+            pOut->entries[i].vectorStall    = pParams->table[i].vectorStall;
+            pOut->entries[i].vectorNonStall = pParams->table[i].vectorNonStall;
+        }
+    }
+    portMemFree(pParams);
 
     status = NV_OK;
 

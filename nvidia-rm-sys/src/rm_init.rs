@@ -224,6 +224,53 @@ pub fn step15(device_instance: u32) -> Result<GrProbe, NV_STATUS> {
     }
 }
 
+/// One row of the GSP-reported interrupt kernel table (mirror of
+/// `EclipseIntrTableEntry`): which engine (MC_ENGINE_IDX_*) owns which
+/// stall/nonstall vector in the Turing+ CPU_INTR tree, plus its legacy PMC
+/// mask. `0xFFFFFFFF` vectors mean not-applicable.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IntrTableEntry {
+    pub engine_idx: NvU32,
+    pub pmc_intr_mask: NvU32,
+    pub vector_stall: NvU32,
+    pub vector_non_stall: NvU32,
+}
+
+/// Mirror of `EclipseIntrTable`: the live GSP-RM's authoritative
+/// vector->engine interrupt map (NV2080_CTRL_CMD_INTERNAL_INTR_GET_KERNEL_TABLE,
+/// the same control kernel RM uses to build its own interrupt table).
+#[repr(C)]
+pub struct IntrTable {
+    pub ctrl_status: NV_STATUS,
+    pub table_len: NvU32,
+    pub entries: [IntrTableEntry; 128],
+}
+
+extern "C" {
+    fn eclipse_rm_intr_table(device_instance: NvU32, out: *mut IntrTable) -> NV_STATUS;
+}
+
+/// Fetches the GSP-reported interrupt kernel table (boxed: ~2 KiB).
+pub fn intr_table(device_instance: u32) -> Result<alloc::boxed::Box<IntrTable>, NV_STATUS> {
+    let mut out = alloc::boxed::Box::new(IntrTable {
+        ctrl_status: 0,
+        table_len: 0,
+        entries: [IntrTableEntry {
+            engine_idx: 0,
+            pmc_intr_mask: 0,
+            vector_stall: 0,
+            vector_non_stall: 0,
+        }; 128],
+    });
+    let status = unsafe { eclipse_rm_intr_table(device_instance, &mut *out) };
+    if status == NV_OK {
+        Ok(out)
+    } else {
+        Err(status)
+    }
+}
+
 /// Mirror of `EclipseStateInitResult` (vendor/eclipse_rm_init.c): per-phase
 /// NV_STATUS of the real RmInitAdapter device bring-up. `0xFFFFFFFF` means
 /// the phase was not reached (an earlier phase failed).
