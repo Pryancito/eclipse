@@ -768,6 +768,61 @@ impl NvidiaGpu {
         let line = alloc::format!("[{}] preboot PCI COMMAND = {:#06x}", tag, cmd);
         log::error!("{}", line);
         let _ = writeln!(s, "{}", line);
+        // PCIe link config of this GPU and its root port: MPS (Max Payload
+        // Size) and MRRS (Max Read Request Size) from the PCIe capability's
+        // Device Control register. Linux's PCI core NORMALIZES MPS across
+        // every tree at boot; Eclipse inherits whatever UEFI programmed, and
+        // the two GPUs hang off DIFFERENT root ports. A GPU-vs-root-port MPS
+        // mismatch on the primary's port (absent on the secondary's) would
+        // explain a TLP-level stall no driver knob can fix -- the top
+        // remaining hypothesis now that every Linux-visible knob is matched.
+        // Pure config reads, zero risk.
+        {
+            use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+            use pci::Location;
+            let ops = &PortOpsImpl;
+            let pcie_dump = |loc: Location, label: &str| -> String {
+                // Walk the capability list for the PCIe capability (ID 0x10).
+                let status = unsafe { PCI_ACCESS.read16(ops, loc, 0x06) };
+                if status & (1 << 4) == 0 {
+                    return alloc::format!("[{}] preboot PCIe {}: no cap list", tag, label);
+                }
+                let mut ptr = unsafe { PCI_ACCESS.read8(ops, loc, 0x34) } as u16;
+                let mut hops = 0;
+                while ptr != 0 && hops < 48 {
+                    let id = unsafe { PCI_ACCESS.read8(ops, loc, ptr) };
+                    if id == 0x10 {
+                        let devcap = unsafe { PCI_ACCESS.read32(ops, loc, ptr + 0x04) };
+                        let devctl = unsafe { PCI_ACCESS.read16(ops, loc, ptr + 0x08) };
+                        let devsta = unsafe { PCI_ACCESS.read16(ops, loc, ptr + 0x0A) };
+                        let lnksta = unsafe { PCI_ACCESS.read16(ops, loc, ptr + 0x12) };
+                        // MPS/MRRS encode as 128 << field.
+                        let mps_cap = 128u32 << (devcap & 0x7);
+                        let mps = 128u32 << ((devctl >> 5) & 0x7);
+                        let mrrs = 128u32 << ((devctl >> 12) & 0x7);
+                        return alloc::format!(
+                            "[{}] preboot PCIe {}: DevCtl={:#06x} (MPS={} MRRS={}, cap {}), DevSta={:#06x}, LnkSta={:#06x} (gen{} x{})",
+                            tag, label, devctl, mps, mrrs, mps_cap, devsta, lnksta,
+                            lnksta & 0xF,
+                            (lnksta >> 4) & 0x3F
+                        );
+                    }
+                    ptr = unsafe { PCI_ACCESS.read8(ops, loc, ptr + 1) } as u16;
+                    hops += 1;
+                }
+                alloc::format!("[{}] preboot PCIe {}: cap not found", tag, label)
+            };
+            let gpu_loc = Location { bus: self.pci_bus, device: self.pci_device, function: 0 };
+            let line = pcie_dump(gpu_loc, "GPU");
+            log::error!("{}", line);
+            let _ = writeln!(s, "{}", line);
+            if let Some((b, d, f)) = self.find_parent_bridge() {
+                let rp_loc = Location { bus: b, device: d, function: f };
+                let line = pcie_dump(rp_loc, "root-port");
+                log::error!("{}", line);
+                let _ = writeln!(s, "{}", line);
+            }
+        }
         // Sysmem flush buffer target (kern_mem_sys_gm107.c programs it; a
         // zero/garbage value on one GPU would resurrect that theory).
         let flush = rd(0x100C10);
@@ -3082,13 +3137,22 @@ impl DrmScheme for NvidiaGpu {
         };
         let (bridge_log, bridges_changed) = self.set_path_vga_routing(true, &[]);
         s.push_str(&bridge_log);
-        // No live_echo here (review finding): Linux holds console_lock() for
-        // the whole kgspInitRm on a console GPU -- zero CPU writes into this
-        // GPU's BAR1 while SEC2 runs its HS reload. Our live echo painted the
-        // seq trace INTO that BAR1 during the wedge window on every prior
-        // boot. gsp_boot_run(quiet=true) now replicates the Linux behavior;
-        // everything is still captured and shown in this /proc read after.
-        s.push_str(&self.gsp_boot_run("gpustep14", true));
+        // LOUD + Linux-parity bracket (this exact combination was never
+        // tested). The console-silent run (full quiet + PBUS clean + parity +
+        // VGA off) STILL wedged inside the window -- which falsifies console
+        // BAR1 writes as the trigger and, with it, the reason for flying
+        // blind: rendering is exonerated, so bring the live seq trace back
+        // for LOCALIZATION while keeping the bracket at byte-parity (zero
+        // extra MMIO around the STARTCPU store). If the last line is now
+        // "SEQ WR off=0x840130 <= 0x2 (about to)" with nothing of ours in
+        // between, the bare store wedges in our environment and the delta is
+        // platform-level (see the new PCIe MPS/MRRS preboot dump), not
+        // driver-visible state.
+        nvidia_rm_sys::os_boundary::linux_parity_arm();
+        nvidia_rm_sys::os_interface::live_echo_begin();
+        s.push_str(&self.gsp_boot_run("gpustep14", false));
+        nvidia_rm_sys::os_interface::live_echo_end();
+        nvidia_rm_sys::os_boundary::linux_parity_disarm();
         let (restore_log, _) = self.set_path_vga_routing(false, &bridges_changed);
         s.push_str(&restore_log);
         {
