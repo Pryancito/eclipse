@@ -184,6 +184,15 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Bring-up **Step 14** (`/proc/gpustep14`): the CONSOLE GPU's full
+    /// bring-up chained in one shot -- attach, GSP-RM boot (with the permanent
+    /// console SEC2 drain), RM controls, gpuStatePreInit/Init/Load, and the
+    /// copy-engine data-movement test -- bringing the primary to the same
+    /// state-loaded, CE-verified state as the secondary. Default: nothing.
+    fn bringup_step14(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Read-only hardware-state dump (`/proc/gpudump`): the discriminating
     /// registers (display head liveness, VGA workspace, PMC, BSI, sysmem
     /// flush) for this GPU, with NO GSP boot -- zero wedge risk. Lets us
