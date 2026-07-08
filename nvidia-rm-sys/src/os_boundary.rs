@@ -881,13 +881,24 @@ pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, th
                         }
                     }
                     // ...then W1C leaf 4 (the known live-level source) as the
-                    // VERY LAST operation before the posted store, so the
-                    // de-assert is as fresh as possible when STARTCPU posts.
+                    // last pre-op before the store.
                     let l4_off = 0x00B8_1000 + 4 * 4;
                     let l4 = core::ptr::read_volatile(base.add(l4_off) as *const NvU32);
                     if l4 != 0 {
                         core::ptr::write_volatile(base.add(l4_off) as *mut NvU32, l4);
                     }
+                    // SYS-domain settle fence (Copilot's cross-cluster
+                    // forward-progress model): a NON-POSTED read of the same
+                    // leaf register forces the posted W1C to complete inside
+                    // the GPU and the level line to settle BEFORE the
+                    // STARTCPU store issues. The proven 0058b6f4 recipe fired
+                    // the store nanoseconds after the posted W1C -- the
+                    // deassert may not have propagated, which would explain
+                    // the 2-of-3 (rather than deterministic) survival rate.
+                    // Same register, SYS/VF interrupt fabric: honors the
+                    // hard no-DISP/no-PBUS/no-PPRIV critical-window rule.
+                    let _settle =
+                        core::ptr::read_volatile(base.add(l4_off) as *const NvU32);
                     core::ptr::write_volatile(
                         base.add(this_address as usize) as *mut NvU32,
                         this_value,
