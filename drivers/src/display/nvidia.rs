@@ -3221,22 +3221,22 @@ impl DrmScheme for NvidiaGpu {
         };
         let (bridge_log, bridges_changed) = self.set_path_vga_routing(true, &[]);
         s.push_str(&bridge_log);
-        // LOUD + Linux-parity bracket (this exact combination was never
-        // tested). The console-silent run (full quiet + PBUS clean + parity +
-        // VGA off) STILL wedged inside the window -- which falsifies console
-        // BAR1 writes as the trigger and, with it, the reason for flying
-        // blind: rendering is exonerated, so bring the live seq trace back
-        // for LOCALIZATION while keeping the bracket at byte-parity (zero
-        // extra MMIO around the STARTCPU store). If the last line is now
-        // "SEQ WR off=0x840130 <= 0x2 (about to)" with nothing of ours in
-        // between, the bare store wedges in our environment and the delta is
-        // platform-level (see the new PCIe MPS/MRRS preboot dump), not
-        // driver-visible state.
-        nvidia_rm_sys::os_boundary::linux_parity_arm();
+        // LOUD + the empirical 0058b6f4 bracket (tight leaf-W1C before the
+        // store, NO display/priv-ring reads). The falsification ladder is
+        // complete: console silence, PBUS unit clear, VGA decode off, MPS
+        // normalization and full Linux byte-parity (empty bracket) ALL
+        // wedged; the only two boots that ever survived STARTCPU ran the
+        // tight-W1C bracket without the EXP4 display-cluster reads (r13 on
+        // 359cef1e, full r14 chain on 0058b6f4). Mechanism is only partially
+        // understood (a hub-leaf W1C posted immediately before the store,
+        // plausibly flushing/fencing the PRI path across the SEC2 handoff),
+        // but the correlation is 2-for-3 vs 0-for-everything-else, so run
+        // the exact recipe with all the new pre-boot hygiene (console-mark,
+        // MPS normalize, PBUS clear, VGA off) layered on top. gsp_boot_run
+        // arms the drain for console GPUs when quiet=false.
         nvidia_rm_sys::os_interface::live_echo_begin();
         s.push_str(&self.gsp_boot_run("gpustep14", false));
         nvidia_rm_sys::os_interface::live_echo_end();
-        nvidia_rm_sys::os_boundary::linux_parity_disarm();
         let (restore_log, _) = self.set_path_vga_routing(false, &bridges_changed);
         s.push_str(&restore_log);
         {

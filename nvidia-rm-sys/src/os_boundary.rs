@@ -481,21 +481,16 @@ unsafe fn sec2_intr_snapshot_and_drain(base: *mut u8) {
             ));
         }
     }
-    // EXP4 source-identification: LEAF[4] bit28 is a live level source, but its
-    // engine identity is unconfirmed (the "display underflow" guess is not
-    // proven -- dev_disp.h has no underflow reg, and HEAD_TIMING is frame-end
-    // only). Read the two prime suspects directly so the next hang's photo
-    // names the culprit: the display->RM aggregate interrupt status
-    // (NV_PDISP_FE_RM_INTR_STAT_CTRL_DISP = 0x611C30, RO) and the priv-ring
-    // master ring interrupt status (NV_PPRIV_MASTER_RING_INTERRUPT_STATUS0/1 =
-    // 0x120058/0x12005c, RO). Both are ordinary BAR0 reads, safe here.
-    let disp_ctrl = rd(0x0061_1C30);
-    let priv0 = rd(0x0012_0058);
-    let priv1 = rd(0x0012_005C);
-    crate::os_interface::probe_line(&alloc::format!(
-        "[nvidia-rm] EXP4 source probe: PDISP_RM_INTR_STAT_CTRL_DISP={:#010x} PPRIV_RING_INTR_STATUS0={:#010x} STATUS1={:#010x}",
-        disp_ctrl, priv0, priv1
-    ));
+    // EXP4's display/priv-ring probe reads (NV_PDISP_FE_RM_INTR_STAT_CTRL_DISP
+    // 0x611C30 + NV_PPRIV_MASTER_RING_INTERRUPT_STATUS0/1 0x120058/5c) are
+    // REMOVED. Cross-build success statistics: the only two boots that ever
+    // survived STARTCPU ran builds with the tight leaf-W1C and WITHOUT these
+    // reads (359cef1e r13, 0058b6f4 full r14); the commit that added them
+    // (d6ddc853) and everything after -- including full Linux byte-parity
+    // with NO bracket at all -- wedged 100%. Empirically, touching the
+    // display PRI cluster microseconds before the SEC2 HS resume correlates
+    // with the wedge, and the leaf W1C right before the store correlates
+    // with survival. This restores the exact 0058b6f4 recipe.
 
     // (2) EXP3 -- UNCONDITIONAL write-1-to-clear drain. The EXP2 run showed
     // CPU_INTR_TOP=0 (the top register only reflects ENABLED leaves) yet
