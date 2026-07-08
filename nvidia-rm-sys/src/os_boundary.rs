@@ -787,6 +787,9 @@ pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, th
     // the RM's own reload poll then sees DONE on its first iteration.
     let is_sec2_startcpu = this_address == 0x0084_0130;
     let base_for_bracket = dev_mapping_base(pMapping);
+    // Set when the STARTCPU store is posted inside the drain path below (tight
+    // W1C-then-store), so the generic write at the end is skipped (no double-post).
+    let mut startcpu_posted = false;
     if is_sec2_startcpu {
         GSP_PROBE_ON.store(true, core::sync::atomic::Ordering::Relaxed);
         // Belt-and-braces trace trigger: normally the trace went live already
@@ -808,12 +811,41 @@ pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, th
         // masked driver otherwise lacks. See sec2_intr_snapshot_and_drain.
         if SEC2_DRAIN_ARMED.load(core::sync::atomic::Ordering::Relaxed) {
             if let Some(base) = base_for_bracket {
+                // Diagnostic snapshot + classification (does its own logging).
                 unsafe { sec2_intr_snapshot_and_drain(base) };
+                // FINAL tight de-assert, then the STARTCPU store, with NOTHING
+                // between them. The console display underflow is a live LEVEL
+                // source that re-asserts within microseconds (EXP3 confirmed it
+                // survives a W1C), and its fabric backpressure is what stalls
+                // the posted STARTCPU write. The "drain done" log above takes
+                // milliseconds to render -- long enough for the interrupt to
+                // come back and re-stall the store (the flaky wedge). So here,
+                // as the immediately-preceding operations, W1C every pending
+                // leaf and then issue the posted store on the very next
+                // instruction: the interrupt line stays de-asserted across the
+                // write so its flow-control credits drain and STARTCPU
+                // completes. Bypass the generic write below (would double-post).
+                unsafe {
+                    for i in 0..8usize {
+                        let off = 0x00B8_1000 + i * 4; // CPU_INTR_LEAF(i)
+                        let leaf = core::ptr::read_volatile(base.add(off) as *const NvU32);
+                        if leaf != 0 {
+                            core::ptr::write_volatile(base.add(off) as *mut NvU32, leaf);
+                        }
+                    }
+                    core::ptr::write_volatile(
+                        base.add(this_address as usize) as *mut NvU32,
+                        this_value,
+                    );
+                }
+                startcpu_posted = true;
             }
         }
     }
-    if let Some(base) = dev_mapping_base(pMapping) {
-        unsafe { core::ptr::write_volatile(base.add(this_address as usize) as *mut NvU32, this_value) };
+    if !startcpu_posted {
+        if let Some(base) = dev_mapping_base(pMapping) {
+            unsafe { core::ptr::write_volatile(base.add(this_address as usize) as *mut NvU32, this_value) };
+        }
     }
     // The old post-STARTCPU "500ms silent window + raw BSI readback" bracket
     // is GONE: it was an Eclipse-only divergence from the real driver (which
