@@ -3645,6 +3645,65 @@ impl DrmScheme for NvidiaGpu {
         s
     }
 
+    /// Step 18 (`/proc/gpustep18`): the first Eclipse-authored GPU
+    /// execution. Writes a method stream (host semaphore RELEASE +
+    /// SET_OBJECT(TURING_COMPUTE_A) + compute report semaphore RELEASE)
+    /// into the step-17 pushbuffer, submits it (GP entry, GPPut, work-
+    /// submit token, usermode doorbell) and CPU-polls both semaphore
+    /// landing zones. Host sem OK = ESCHED/PBDMA fetched and ran our
+    /// pushbuffer; engine sem OK = the compute engine context-switched
+    /// into our channel and processed class methods. Requires gpustep17.
+    fn bringup_step18(&self) -> String {
+        use core::fmt::Write;
+        let mut s = String::new();
+        let device_instance = *self.rm_device_instance.lock();
+        let Some(device_instance) = device_instance else {
+            return String::from(
+                "[gpustep18] skipped (bring the GPU up first, then gpustep16/17)\n",
+            );
+        };
+        nvidia_rm_sys::os_interface::capture_begin();
+        let result = nvidia_rm_sys::rm_init::step18(device_instance);
+        let captured = nvidia_rm_sys::os_interface::capture_take();
+        if let Some(log) = captured {
+            for line in log.lines() {
+                let _ = writeln!(s, "[gpustep18] | {}", line);
+            }
+        }
+        let phase = |st: u32| -> String {
+            match st {
+                0 => String::from("OK"),
+                0xFFFF_FFFF => String::from("not reached"),
+                0x65 => String::from("TIMEOUT (never landed)"),
+                e => alloc::format!("FAILED NV_STATUS={:#x}", e),
+            }
+        };
+        match result {
+            Ok(l) => {
+                let _ = writeln!(s, "[gpustep18] --- first Eclipse-authored submission on the live channel ---");
+                let _ = writeln!(s, "[gpustep18] lookup (chan/buf/USERD):  {}", phase(l.lookup_status));
+                let _ = writeln!(s, "[gpustep18] CPU map (buf + USERD):    {}", phase(l.map_status));
+                let _ = writeln!(s, "[gpustep18] work-submit token:        {} (token={:#010x}, runlist={})", phase(l.token_status), l.work_token, l.runlist_id);
+                let _ = writeln!(s, "[gpustep18] submit ({} dw + doorbell): {}", l.push_dwords, phase(l.submit_status));
+                let _ = writeln!(s, "[gpustep18] HOST semaphore (PBDMA):   {} (value={:#010x}, {} ms)", phase(l.host_sem_status), l.host_sem_value, l.host_poll_iters);
+                let _ = writeln!(s, "[gpustep18] ENGINE semaphore (compute FE): {} (value={:#010x}, {} ms)", phase(l.eng_sem_status), l.eng_sem_value, l.eng_poll_iters);
+                if l.host_sem_status == 0 && l.eng_sem_status == 0 {
+                    let _ = writeln!(s, "[gpustep18] --- THE GPU RAN OUR PUSHBUFFER: PBDMA fetch + compute-engine context switch both proven; step19 = QMD + SASS kernel (real compute launch) ---");
+                } else if l.host_sem_status == 0 {
+                    let _ = writeln!(s, "[gpustep18] --- PBDMA ran our methods but the compute engine never reported: suspect ctxsw/golden-context or SET_OBJECT path ---");
+                }
+            }
+            Err(status) => {
+                let _ = writeln!(
+                    s,
+                    "[gpustep18] eclipse_rm_step18 FAILED, NV_STATUS={:#x} (run gpustep17 first in this boot; GPU state-loaded?)",
+                    status
+                );
+            }
+        }
+        s
+    }
+
     /// Step 2: instance block + GMMU flush — the first GPU register writes.
     /// TEMPORARY: the secondary (non-console) GPU has its own unrelated
     /// problems (USB breaks in Eclipse when it's made primary; likely never

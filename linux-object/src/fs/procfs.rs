@@ -14,11 +14,11 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 31] = [
+const PROC_ROOT_STATIC: [&str; 32] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
     "perf", "hunter", "filesystems", "gpudbg", "gpustep2", "gpustep3", "gpustep4", "gpustep5",
     "gpustep6", "gpustep7", "gpustep8", "gpustep9", "gpustep10", "gpustep11", "gpustep12",
-    "gpustep13", "gpustep14", "gpustep15", "gpustep16", "gpustep17", "gpudump",
+    "gpustep13", "gpustep14", "gpustep15", "gpustep16", "gpustep17", "gpustep18", "gpudump",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -306,6 +306,7 @@ impl INode for ProcRootINode {
             "gpustep15" => Ok(PROC_GPUSTEP15.clone()),
             "gpustep16" => Ok(PROC_GPUSTEP16.clone()),
             "gpustep17" => Ok(PROC_GPUSTEP17.clone()),
+            "gpustep18" => Ok(PROC_GPUSTEP18.clone()),
             "gpudump" => Ok(PROC_GPUDUMP.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
@@ -1310,6 +1311,20 @@ fn proc_gpustep17_content() -> String {
     s
 }
 
+/// `/proc/gpustep18` — first Eclipse-authored submission on the step-17
+/// channel (semaphore method stream + GP entry + GPPut + doorbell + CPU
+/// poll). Idempotent once fully successful.
+fn proc_gpustep18_content() -> String {
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.bringup_step18());
+    }
+    if s.is_empty() {
+        s.push_str("[gpustep18] no DRM driver with bring-up support\n");
+    }
+    s
+}
+
 /// `/proc/gpudump` — read-only discriminating hardware dump for every NVIDIA
 /// GPU (console + secondary): display head liveness, VGA workspace base, PMC,
 /// BSI scratch, sysmem flush. NO GSP boot -> ZERO wedge risk. Read this first
@@ -1617,6 +1632,12 @@ lazy_static! {
     static ref PROC_GPUSTEP17: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 81,
         generate: proc_gpustep17_content,
+    });
+    /// `/proc/gpustep18` -- first Eclipse-authored GPU submission (see
+    /// proc_gpustep18_content).
+    static ref PROC_GPUSTEP18: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 80,
+        generate: proc_gpustep18_content,
     });
     /// `/proc/gpudump` -- read-only discriminating HW dump, both GPUs (see
     /// proc_gpudump_content).

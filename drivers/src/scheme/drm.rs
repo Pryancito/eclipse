@@ -216,6 +216,14 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Bring-up **Step 18** (`/proc/gpustep18`): first Eclipse-authored
+    /// submission on the step-17 channel — semaphore-release method stream,
+    /// GP entry, GPPut, usermode doorbell, CPU-polled verification.
+    /// Idempotent once fully successful. Default: nothing.
+    fn bringup_step18(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Read-only hardware-state dump (`/proc/gpudump`): the discriminating
     /// registers (display head liveness, VGA workspace, PMC, BSI, sysmem
     /// flush) for this GPU, with NO GSP boot -- zero wedge risk. Lets us
