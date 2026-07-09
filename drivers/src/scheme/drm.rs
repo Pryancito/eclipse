@@ -209,6 +209,13 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Bring-up **Step 17** (`/proc/gpustep17`): compute channel on the
+    /// step-16 ladder (USERD + GPFIFO memory + channel-in-TSG +
+    /// TURING_COMPUTE_A + schedule). Idempotent. Default: nothing.
+    fn bringup_step17(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Read-only hardware-state dump (`/proc/gpudump`): the discriminating
     /// registers (display head liveness, VGA workspace, PMC, BSI, sysmem
     /// flush) for this GPU, with NO GSP boot -- zero wedge risk. Lets us

@@ -301,6 +301,65 @@ pub fn step16(device_instance: u32) -> Result<GrAlloc, NV_STATUS> {
     }
 }
 
+/// Mirror of `EclipseGrChannel` (vendor/eclipse_rm_init.c): per-stage
+/// NV_STATUS (`0xFFFFFFFF` = not reached) and handles for the step-17
+/// compute-channel bring-up on the step-16 ladder.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GrChannel {
+    pub userd_status: NvU32,
+    pub buf_status: NvU32,
+    pub virt_status: NvU32,
+    pub map_status: NvU32,
+    pub notif_status: NvU32,
+    pub chan_status: NvU32,
+    pub compute_status: NvU32,
+    pub sched_status: NvU32,
+    pub h_userd: NvU32,
+    pub h_phys_buf: NvU32,
+    pub h_virt_buf: NvU32,
+    pub h_notifier: NvU32,
+    pub h_channel: NvU32,
+    pub h_compute: NvU32,
+    pub channel_class: NvU32,
+    pub userd_size: NvU32,
+    pub buf_gpu_va: u64,
+}
+
+extern "C" {
+    fn eclipse_rm_step17(device_instance: NvU32, out: *mut GrChannel) -> NV_STATUS;
+}
+
+/// Runs step-17 (USERD + buffers + GPFIFO channel + TURING_COMPUTE_A +
+/// schedule) on the cached step-16 ladder. Idempotent.
+pub fn step17(device_instance: u32) -> Result<GrChannel, NV_STATUS> {
+    let mut out = GrChannel {
+        userd_status: 0xFFFF_FFFF,
+        buf_status: 0xFFFF_FFFF,
+        virt_status: 0xFFFF_FFFF,
+        map_status: 0xFFFF_FFFF,
+        notif_status: 0xFFFF_FFFF,
+        chan_status: 0xFFFF_FFFF,
+        compute_status: 0xFFFF_FFFF,
+        sched_status: 0xFFFF_FFFF,
+        h_userd: 0,
+        h_phys_buf: 0,
+        h_virt_buf: 0,
+        h_notifier: 0,
+        h_channel: 0,
+        h_compute: 0,
+        channel_class: 0,
+        userd_size: 0,
+        buf_gpu_va: 0,
+    };
+    let status = unsafe { eclipse_rm_step17(device_instance, &mut out) };
+    if status == NV_OK {
+        Ok(out)
+    } else {
+        Err(status)
+    }
+}
+
 /// Fetches the GSP-reported interrupt kernel table (boxed: ~2 KiB).
 pub fn intr_table(device_instance: u32) -> Result<alloc::boxed::Box<IntrTable>, NV_STATUS> {
     let mut out = alloc::boxed::Box::new(IntrTable {
