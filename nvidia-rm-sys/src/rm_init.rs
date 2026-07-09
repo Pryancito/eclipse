@@ -251,6 +251,56 @@ extern "C" {
     fn eclipse_rm_intr_table(device_instance: NvU32, out: *mut IntrTable) -> NV_STATUS;
 }
 
+/// Mirror of `EclipseGrAlloc` (vendor/eclipse_rm_init.c): per-stage NV_STATUS
+/// (`0xFFFFFFFF` = not reached) and the allocated handles of the GR
+/// allocation ladder: client -> device -> subdevice -> VA space -> TSG
+/// (GRAPHICS engine) -> context share. Handles stay alive C-side for step17.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GrAlloc {
+    pub client_status: NvU32,
+    pub device_status: NvU32,
+    pub subdev_status: NvU32,
+    pub vas_status: NvU32,
+    pub tsg_status: NvU32,
+    pub ctxshare_status: NvU32,
+    pub h_client: NvU32,
+    pub h_device: NvU32,
+    pub h_subdevice: NvU32,
+    pub h_vas: NvU32,
+    pub h_tsg: NvU32,
+    pub h_ctxshare: NvU32,
+}
+
+extern "C" {
+    fn eclipse_rm_step16(device_instance: NvU32, out: *mut GrAlloc) -> NV_STATUS;
+}
+
+/// Runs the step-16 GR allocation ladder on a state-loaded GPU (idempotent:
+/// repeat calls return the cached, still-alive allocation).
+pub fn step16(device_instance: u32) -> Result<GrAlloc, NV_STATUS> {
+    let mut out = GrAlloc {
+        client_status: 0xFFFF_FFFF,
+        device_status: 0xFFFF_FFFF,
+        subdev_status: 0xFFFF_FFFF,
+        vas_status: 0xFFFF_FFFF,
+        tsg_status: 0xFFFF_FFFF,
+        ctxshare_status: 0xFFFF_FFFF,
+        h_client: 0,
+        h_device: 0,
+        h_subdevice: 0,
+        h_vas: 0,
+        h_tsg: 0,
+        h_ctxshare: 0,
+    };
+    let status = unsafe { eclipse_rm_step16(device_instance, &mut out) };
+    if status == NV_OK {
+        Ok(out)
+    } else {
+        Err(status)
+    }
+}
+
 /// Fetches the GSP-reported interrupt kernel table (boxed: ~2 KiB).
 pub fn intr_table(device_instance: u32) -> Result<alloc::boxed::Box<IntrTable>, NV_STATUS> {
     let mut out = alloc::boxed::Box::new(IntrTable {

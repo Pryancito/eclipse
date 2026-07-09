@@ -54,6 +54,14 @@
 #include "ctrl/ctrl2080/ctrl2080internal.h"
 #include "os/os.h"
 #include "tls/tls.h"
+#include "resserv/rs_server.h"
+#include "resserv/rs_client.h"
+#include "class/cl0080.h"      /* NV01_DEVICE_0 */
+#include "class/cl2080.h"      /* NV20_SUBDEVICE_0 */
+#include "class/cl2080_notification.h" /* NV2080_ENGINE_TYPE_GRAPHICS */
+#include "class/cl90f1.h"      /* FERMI_VASPACE_A */
+#include "class/cla06c.h"      /* KEPLER_CHANNEL_GROUP_A */
+#include "class/cl9067.h"      /* FERMI_CONTEXT_SHARE_A */
 #include "g_hal_register.h"
 /* Step 10 (CE memset/copy + readback verify) */
 #include "gpu/mem_mgr/mem_mgr.h"
@@ -1282,6 +1290,270 @@ NV_STATUS eclipse_rm_intr_table(NvU32 gpuInstance, EclipseIntrTable *pOut)
 
 unlock:
     rmGpuGroupLockRelease(gpusLockedMask, GPUS_LOCK_FLAGS_NONE);
+    rmapiLockRelease();
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
+}
+
+/*
+ * Step-16: the graphics/compute allocation ladder -- the first resource-
+ * server allocations Eclipse makes itself (everything before this adopted
+ * the GSP's internal handles). Allocates, on a state-loaded GPU:
+ *
+ *   NV01_ROOT client -> NV01_DEVICE_0 -> NV20_SUBDEVICE_0 ->
+ *   FERMI_VASPACE_A -> KEPLER_CHANNEL_GROUP_A (TSG, engineType GRAPHICS) ->
+ *   FERMI_CONTEXT_SHARE_A (SYNC subcontext)
+ *
+ * This is the exact front half of what any user-mode driver does to run
+ * compute, and every step exercises real vendored RM machinery against the
+ * live GSP (engine validation, VAS construction, TSG runlist selection,
+ * subcontext/VEID bookkeeping). The recipe (rmapiGetInterface with
+ * RMAPI_GPU_LOCK_INTERNAL under the API lock only, client handle generator
+ * setup, clientGenResourceHandle for child handles) is transliterated from
+ * channelAllocSubdevice/ceutilsConstruct (channel_utils.c/ce_utils.c) --
+ * the same code that already ran successfully in THIS environment when
+ * step-9's state-load constructed CeUtils. Handles are kept alive and
+ * cached in statics for step-17 (GPFIFO channel + TURING_COMPUTE_A object
+ * -> golden-context creation); a repeat call returns the cached result so
+ * the /proc read is idempotent. On any failure the client (and thus the
+ * whole child tree) is freed and the per-stage NV_STATUS pinpoints the
+ * failing allocation. 0xFFFFFFFF = stage not reached.
+ */
+typedef struct EclipseGrAlloc
+{
+    NvU32 clientStatus;
+    NvU32 deviceStatus;
+    NvU32 subdevStatus;
+    NvU32 vasStatus;
+    NvU32 tsgStatus;
+    NvU32 ctxshareStatus;
+    NvU32 hClient;
+    NvU32 hDevice;
+    NvU32 hSubdevice;
+    NvU32 hVas;
+    NvU32 hTsg;
+    NvU32 hCtxShare;
+} EclipseGrAlloc;
+
+static EclipseGrAlloc g_grAllocCache;
+static NvBool g_grAllocDone = NV_FALSE;
+
+NV_STATUS eclipse_rm_step16(NvU32 gpuInstance, EclipseGrAlloc *pOut)
+{
+    OBJGPU *pGpu;
+    RM_API *pRmApi;
+    NV_STATUS status;
+    THREAD_STATE_NODE threadState;
+    RsClient *pRsClient = NULL;
+
+    if (pOut == NULL)
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    if (g_grAllocDone)
+    {
+        portMemCopy(pOut, sizeof(*pOut), &g_grAllocCache, sizeof(g_grAllocCache));
+        return NV_OK;
+    }
+    portMemSet(pOut, 0, sizeof(*pOut));
+    pOut->clientStatus   = 0xFFFFFFFF;
+    pOut->deviceStatus   = 0xFFFFFFFF;
+    pOut->subdevStatus   = 0xFFFFFFFF;
+    pOut->vasStatus      = 0xFFFFFFFF;
+    pOut->tsgStatus      = 0xFFFFFFFF;
+    pOut->ctxshareStatus = 0xFFFFFFFF;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pGpu = gpumgrGetGpu(gpuInstance);
+    if (pGpu == NULL || !pGpu->gspRmInitialized)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
+    }
+
+    /*
+     * API lock ONLY, exactly like eclipse_rm_state_init: the allocation
+     * path (RMAPI_GPU_LOCK_INTERNAL) acquires GPU locks itself per call --
+     * this is the lock state CeUtils' own AllocWithHandle sequence ran
+     * under during step-9's state-load in this environment.
+     */
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
+
+    /* 1. Client (RM assigns the handle). */
+    pOut->hClient = NV01_NULL_OBJECT;
+    pOut->clientStatus = pRmApi->AllocWithHandle(pRmApi, NV01_NULL_OBJECT,
+                                                 NV01_NULL_OBJECT, NV01_NULL_OBJECT,
+                                                 NV01_ROOT, &pOut->hClient,
+                                                 sizeof(pOut->hClient));
+    nv_printf(0, "[eclipse-rm-trace] step16: NV01_ROOT client -> 0x%x hClient=0x%x\n",
+              pOut->clientStatus, pOut->hClient);
+    if (pOut->clientStatus != NV_OK)
+    {
+        status = NV_OK; /* per-stage status carries the failure */
+        goto unlock;
+    }
+
+    status = serverGetClientUnderLock(&g_resServ, pOut->hClient, &pRsClient);
+    if (status != NV_OK)
+    {
+        goto free_client;
+    }
+    status = clientSetHandleGenerator(pRsClient, 1U, ~0U - 1U);
+    if (status != NV_OK)
+    {
+        goto free_client;
+    }
+
+    /* 2. Device. */
+    {
+        NV0080_ALLOC_PARAMETERS params;
+        portMemSet(&params, 0, sizeof(params));
+        params.deviceId = gpuGetDeviceInstance(pGpu);
+        params.hClientShare = pOut->hClient;
+        status = clientGenResourceHandle(pRsClient, &pOut->hDevice);
+        if (status != NV_OK)
+        {
+            goto free_client;
+        }
+        pOut->deviceStatus = pRmApi->AllocWithHandle(pRmApi, pOut->hClient,
+                                                     pOut->hClient, pOut->hDevice,
+                                                     NV01_DEVICE_0,
+                                                     &params, sizeof(params));
+        nv_printf(0, "[eclipse-rm-trace] step16: NV01_DEVICE_0 -> 0x%x hDevice=0x%x\n",
+                  pOut->deviceStatus, pOut->hDevice);
+        if (pOut->deviceStatus != NV_OK)
+        {
+            status = NV_OK;
+            goto free_client;
+        }
+    }
+
+    /* 3. Subdevice. */
+    {
+        NV2080_ALLOC_PARAMETERS params;
+        portMemSet(&params, 0, sizeof(params));
+        params.subDeviceId = gpumgrGetSubDeviceInstanceFromGpu(pGpu);
+        status = clientGenResourceHandle(pRsClient, &pOut->hSubdevice);
+        if (status != NV_OK)
+        {
+            goto free_client;
+        }
+        pOut->subdevStatus = pRmApi->AllocWithHandle(pRmApi, pOut->hClient,
+                                                     pOut->hDevice, pOut->hSubdevice,
+                                                     NV20_SUBDEVICE_0,
+                                                     &params, sizeof(params));
+        nv_printf(0, "[eclipse-rm-trace] step16: NV20_SUBDEVICE_0 -> 0x%x hSubdevice=0x%x\n",
+                  pOut->subdevStatus, pOut->hSubdevice);
+        if (pOut->subdevStatus != NV_OK)
+        {
+            status = NV_OK;
+            goto free_client;
+        }
+    }
+
+    /* 4. VA space (fresh, default geometry). */
+    {
+        NV_VASPACE_ALLOCATION_PARAMETERS params;
+        portMemSet(&params, 0, sizeof(params));
+        params.index = NV_VASPACE_ALLOCATION_INDEX_GPU_NEW;
+        status = clientGenResourceHandle(pRsClient, &pOut->hVas);
+        if (status != NV_OK)
+        {
+            goto free_client;
+        }
+        pOut->vasStatus = pRmApi->AllocWithHandle(pRmApi, pOut->hClient,
+                                                  pOut->hDevice, pOut->hVas,
+                                                  FERMI_VASPACE_A,
+                                                  &params, sizeof(params));
+        nv_printf(0, "[eclipse-rm-trace] step16: FERMI_VASPACE_A -> 0x%x hVas=0x%x\n",
+                  pOut->vasStatus, pOut->hVas);
+        if (pOut->vasStatus != NV_OK)
+        {
+            status = NV_OK;
+            goto free_client;
+        }
+    }
+
+    /* 5. TSG bound to the GRAPHICS engine -- the first GR-side allocation. */
+    {
+        NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS params;
+        portMemSet(&params, 0, sizeof(params));
+        params.hVASpace = pOut->hVas;
+        params.engineType = NV2080_ENGINE_TYPE_GRAPHICS;
+        status = clientGenResourceHandle(pRsClient, &pOut->hTsg);
+        if (status != NV_OK)
+        {
+            goto free_client;
+        }
+        pOut->tsgStatus = pRmApi->AllocWithHandle(pRmApi, pOut->hClient,
+                                                  pOut->hDevice, pOut->hTsg,
+                                                  KEPLER_CHANNEL_GROUP_A,
+                                                  &params, sizeof(params));
+        nv_printf(0, "[eclipse-rm-trace] step16: KEPLER_CHANNEL_GROUP_A(GR) -> 0x%x hTsg=0x%x\n",
+                  pOut->tsgStatus, pOut->hTsg);
+        if (pOut->tsgStatus != NV_OK)
+        {
+            status = NV_OK;
+            goto free_client;
+        }
+    }
+
+    /* 6. Context share (SYNC subcontext / VEID 0) on the TSG. */
+    {
+        NV_CTXSHARE_ALLOCATION_PARAMETERS params;
+        portMemSet(&params, 0, sizeof(params));
+        params.hVASpace = pOut->hVas;
+        params.flags = NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_SYNC;
+        status = clientGenResourceHandle(pRsClient, &pOut->hCtxShare);
+        if (status != NV_OK)
+        {
+            goto free_client;
+        }
+        pOut->ctxshareStatus = pRmApi->AllocWithHandle(pRmApi, pOut->hClient,
+                                                       pOut->hTsg, pOut->hCtxShare,
+                                                       FERMI_CONTEXT_SHARE_A,
+                                                       &params, sizeof(params));
+        nv_printf(0, "[eclipse-rm-trace] step16: FERMI_CONTEXT_SHARE_A -> 0x%x hCtxShare=0x%x\n",
+                  pOut->ctxshareStatus, pOut->hCtxShare);
+        if (pOut->ctxshareStatus != NV_OK)
+        {
+            status = NV_OK;
+            goto free_client;
+        }
+    }
+
+    /* Full ladder allocated: keep it alive for step-17 and cache the result. */
+    portMemCopy(&g_grAllocCache, sizeof(g_grAllocCache), pOut, sizeof(*pOut));
+    g_grAllocDone = NV_TRUE;
+    status = NV_OK;
+    goto unlock;
+
+free_client:
+    /* Freeing the client tears down the whole child tree. */
+    if (pOut->hClient != NV01_NULL_OBJECT)
+    {
+        pRmApi->Free(pRmApi, pOut->hClient, pOut->hClient);
+    }
+
+unlock:
     rmapiLockRelease();
     gpumgrThreadDisableExpandedGpuVisibility();
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
