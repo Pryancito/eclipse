@@ -432,6 +432,58 @@ pub fn sec2_drain_disarm() {
 static LINUX_PARITY: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// Wedge containment (the "no more pointless reboots" machinery). The console
+/// GPU's SEC2 CORE_RESUME wedge is a ~25-30% race that no driver-visible knob
+/// controls (falsification ladder: console silence, PBUS clear, VGA decode,
+/// MPS normalize, Linux byte-parity bracket, bIsPrimary on/off -- every
+/// single-variable theory died). Instead of avoiding it, contain it: after
+/// the STARTCPU store the bracket runs a SILENT config-space watch (config
+/// cycles are completed by the root complex even when the endpoint's fabric
+/// is dead -- a failed config read returns all-ones instead of hanging the
+/// core, the same physics the old autopsy relied on). On detection,
+/// WEDGE_FAKE_MMIO flips: every osDevReadReg* returns all-ones WITHOUT
+/// touching hardware and every osDevWriteReg* is dropped, so the vendored
+/// RM's own BSI/mailbox polling fails GRACEFULLY (NV_ERR_TIMEOUT) instead of
+/// wedging the CPU on its next BAR0 access -- the machine survives, the
+/// /proc read completes, and the caller can attempt a secondary-bus-reset
+/// recovery + retry. NOTE: the flag is global (both GPUs' MMIO gets faked
+/// while set) -- acceptable: it is only set when the fabric is already dead,
+/// and cleared after a successful recovery.
+static WEDGE_FAKE_MMIO: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static WEDGE_DETECTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static WEDGE_CFG_HANDLE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Arm the post-STARTCPU wedge watch with the GPU's packed config handle
+/// (same 0x8000_0000|bus<<16|dev<<8|fn packing as os_pci_init_handle).
+pub fn wedge_watch_arm(gpu_cfg_handle: usize) {
+    WEDGE_CFG_HANDLE.store(gpu_cfg_handle, core::sync::atomic::Ordering::Relaxed);
+    WEDGE_DETECTED.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Disarm the wedge watch (boot returned).
+pub fn wedge_watch_disarm() {
+    WEDGE_CFG_HANDLE.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Did the last armed boot detect a fabric wedge after STARTCPU?
+pub fn wedge_detected() -> bool {
+    WEDGE_DETECTED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Clear fake-MMIO mode after a successful bus recovery (BARs restored and
+/// the device answering config cycles again).
+pub fn wedge_fake_mmio_clear() {
+    WEDGE_FAKE_MMIO.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Is fake-MMIO mode active?
+pub fn wedge_fake_mmio_on() -> bool {
+    WEDGE_FAKE_MMIO.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Arm Linux byte-parity mode for the next GSP boot's STARTCPU bracket.
 pub fn linux_parity_arm() {
     LINUX_PARITY.store(true, core::sync::atomic::Ordering::Relaxed);
@@ -655,6 +707,9 @@ fn seq_trace(kind_write: bool, offset: NvU32, value: Option<NvU32>) -> bool {
 
 #[no_mangle]
 pub extern "C" fn osDevReadReg008(_pGpu: *mut c_void, pMapping: *mut c_void, this_address: NvU32) -> NvU8 {
+    if WEDGE_FAKE_MMIO.load(core::sync::atomic::Ordering::Relaxed) {
+        return 0xFF;
+    }
     match dev_mapping_base(pMapping) {
         Some(base) => unsafe { core::ptr::read_volatile(base.add(this_address as usize)) },
         None => 0xFF,
@@ -663,6 +718,9 @@ pub extern "C" fn osDevReadReg008(_pGpu: *mut c_void, pMapping: *mut c_void, thi
 
 #[no_mangle]
 pub extern "C" fn osDevReadReg016(_pGpu: *mut c_void, pMapping: *mut c_void, this_address: NvU32) -> NvU16 {
+    if WEDGE_FAKE_MMIO.load(core::sync::atomic::Ordering::Relaxed) {
+        return 0xFFFF;
+    }
     match dev_mapping_base(pMapping) {
         Some(base) => unsafe { core::ptr::read_volatile(base.add(this_address as usize) as *const NvU16) },
         None => 0xFFFF,
@@ -671,6 +729,12 @@ pub extern "C" fn osDevReadReg016(_pGpu: *mut c_void, pMapping: *mut c_void, thi
 
 #[no_mangle]
 pub extern "C" fn osDevReadReg032(_pGpu: *mut c_void, pMapping: *mut c_void, this_address: NvU32) -> NvU32 {
+    // Wedge containment: with the fabric confirmed dead, answer all-ones
+    // WITHOUT touching hardware so the RM's polls fail gracefully instead of
+    // hanging the CPU (see WEDGE_FAKE_MMIO).
+    if WEDGE_FAKE_MMIO.load(core::sync::atomic::Ordering::Relaxed) {
+        return 0xFFFF_FFFF;
+    }
     // SEC2-aperture probe (0x840000..0x844000). The box hard-freezes in
     // kflcnStartCpu_TU102(SEC2) at CORE_RESUME reading FALCON_CPUCTL (0x840100)
     // -- the first BAR0 access above ~7 MiB. Log the offset synchronously
@@ -773,6 +837,9 @@ pub extern "C" fn osDevReadReg032(_pGpu: *mut c_void, pMapping: *mut c_void, thi
 
 #[no_mangle]
 pub extern "C" fn osDevWriteReg008(_pGpu: *mut c_void, pMapping: *mut c_void, this_address: NvU32, this_value: NvU8) {
+    if WEDGE_FAKE_MMIO.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     if let Some(base) = dev_mapping_base(pMapping) {
         unsafe { core::ptr::write_volatile(base.add(this_address as usize), this_value) };
     }
@@ -780,6 +847,9 @@ pub extern "C" fn osDevWriteReg008(_pGpu: *mut c_void, pMapping: *mut c_void, th
 
 #[no_mangle]
 pub extern "C" fn osDevWriteReg016(_pGpu: *mut c_void, pMapping: *mut c_void, this_address: NvU32, this_value: NvU16) {
+    if WEDGE_FAKE_MMIO.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     if let Some(base) = dev_mapping_base(pMapping) {
         unsafe { core::ptr::write_volatile(base.add(this_address as usize) as *mut NvU16, this_value) };
     }
@@ -787,6 +857,9 @@ pub extern "C" fn osDevWriteReg016(_pGpu: *mut c_void, pMapping: *mut c_void, th
 
 #[no_mangle]
 pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, this_address: NvU32, this_value: NvU32) {
+    if WEDGE_FAKE_MMIO.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     // SEC2-aperture write probe (companion to the read probe above). SEC2 reads
     // return real values, so the CORE_RESUME freeze is at/after kflcnStartCpu's
     // STARTCPU write (which the read-only probe couldn't show). Log SEC2 writes
@@ -903,6 +976,46 @@ pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, th
                         base.add(this_address as usize) as *mut NvU32,
                         this_value,
                     );
+                }
+                // Post-store SILENT fabric watch (wedge containment). ZERO
+                // MMIO and ZERO logging here -- if the fabric wedged, any
+                // BAR0/BAR1 access (a log line renders into this GPU's BAR1
+                // framebuffer!) hangs the CPU for good. Config cycles are
+                // root-complex-completed and return all-ones on a dead
+                // endpoint instead of hanging, so poll the GPU's config
+                // VendorID/DeviceID: ~50 consecutive dead milliseconds =>
+                // fabric wedged => flip fake-MMIO + suppress all console
+                // rendering; the RM's own BSI poll then times out gracefully
+                // and the machine SURVIVES with the full report in /proc.
+                // On a healthy boot this adds a bounded pre-poll delay only
+                // (the RM's reload poll then sees DONE, as every successful
+                // run did).
+                let cfg_h = WEDGE_CFG_HANDLE.load(core::sync::atomic::Ordering::Relaxed);
+                if cfg_h != 0 {
+                    let mut dead_run = 0u32;
+                    for _ in 0..400u32 {
+                        crate::hooks::with_hooks((), |h| h.delay_us(1_000));
+                        let id = crate::hooks::with_hooks(0xFFFF_FFFFu32, |h| {
+                            h.pci_config_read(cfg_h, 0, 4)
+                        });
+                        if id == 0xFFFF_FFFF {
+                            dead_run += 1;
+                            if dead_run >= 50 {
+                                break;
+                            }
+                        } else {
+                            dead_run = 0;
+                        }
+                    }
+                    if dead_run >= 50 {
+                        WEDGE_FAKE_MMIO.store(true, core::sync::atomic::Ordering::Relaxed);
+                        WEDGE_DETECTED.store(true, core::sync::atomic::Ordering::Relaxed);
+                        // The console framebuffer lives in the dead GPU's
+                        // BAR1: suppress ALL rendering or the next log line
+                        // kills the machine. Capture keeps recording for the
+                        // /proc report.
+                        crate::os_interface::console_quiet_begin();
+                    }
                 }
                 startcpu_posted = true;
             }

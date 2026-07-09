@@ -1235,6 +1235,81 @@ impl NvidiaGpu {
         line
     }
 
+    /// Secondary-bus-reset recovery after a detected post-STARTCPU fabric
+    /// wedge (see os_boundary's wedge containment). All bridge/GPU accesses
+    /// here are CONFIG space (root-complex-completed, can't hang the core)
+    /// until the device answers config again; only then is fake-MMIO cleared
+    /// and one BAR0 probe attempted. Returns (recovered, log).
+    fn sbr_recover(&self, tag: &str, attempt: u32) -> (bool, String) {
+        use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+        use core::fmt::Write;
+        use pci::Location;
+        let mut s = String::new();
+        let ops = &PortOpsImpl;
+        let _ = writeln!(
+            s,
+            "[{}] WEDGE DETECTED after STARTCPU (config space went all-ones); machine kept ALIVE; secondary-bus-reset recovery attempt #{}",
+            tag, attempt
+        );
+        let Some((bb, bd, bf)) = self.find_parent_bridge() else {
+            let _ = writeln!(s, "[{}] recovery: no parent bridge found; cannot SBR", tag);
+            return (false, s);
+        };
+        let bridge = Location { bus: bb, device: bd, function: bf };
+        let gpu = Location { bus: self.pci_bus, device: self.pci_device, function: 0 };
+        let spin_ms = |ms: u64| {
+            let t0 = unsafe { crate::bus::drivers_timer_now_as_micros() };
+            while unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(t0)
+                < ms * 1000
+            {
+                core::hint::spin_loop();
+            }
+        };
+        unsafe {
+            let bc = PCI_ACCESS.read16(ops, bridge, 0x3E);
+            PCI_ACCESS.write16(ops, bridge, 0x3E, bc | 0x40); // Secondary Bus Reset
+            spin_ms(5);
+            PCI_ACCESS.write16(ops, bridge, 0x3E, bc);
+        }
+        spin_ms(250); // link retrain + device-ready time
+        // Restore the GPU's config: BARs (address bits; RO flag bits are
+        // ignored by the device), COMMAND (MEM+BME, INTx masked). The GPU's
+        // ROM-based GFW/IFR re-runs its own boot after a hot reset;
+        // kgspInitRm's kgspWaitForGfwBootOk then waits for it like on a
+        // cold boot (the vfio/VM-passthrough flow relies on exactly this).
+        unsafe {
+            PCI_ACCESS.write32(ops, gpu, 0x10, self.bar0_phys as u32);
+            PCI_ACCESS.write32(ops, gpu, 0x14, self.bar1_phys as u32);
+            PCI_ACCESS.write32(ops, gpu, 0x18, (self.bar1_phys >> 32) as u32);
+            PCI_ACCESS.write32(ops, gpu, 0x1C, self.bar2_phys as u32);
+            PCI_ACCESS.write32(ops, gpu, 0x20, (self.bar2_phys >> 32) as u32);
+            PCI_ACCESS.write16(ops, gpu, 0x04, 0x0406);
+        }
+        s.push_str(&self.normalize_mps(tag));
+        let id = unsafe { PCI_ACCESS.read32(ops, gpu, 0x00) };
+        let _ = writeln!(s, "[{}] recovery: post-SBR config ID = {:#010x}", tag, id);
+        if id & 0xFFFF != 0x10DE {
+            let _ = writeln!(
+                s,
+                "[{}] recovery FAILED (no config answer); console rendering stays suppressed -- capture this /proc output to a file and reboot",
+                tag
+            );
+            return (false, s);
+        }
+        // Device answers config again: clear fake-MMIO and risk ONE BAR0
+        // probe (without it no retry is possible anyway).
+        nvidia_rm_sys::os_boundary::wedge_fake_mmio_clear();
+        let boot0 = unsafe { core::ptr::read_volatile(self._bar0 as *const u32) };
+        let _ = writeln!(
+            s,
+            "[{}] recovery: BAR0 PMC_BOOT_0 = {:#010x}; re-enabling console rendering, retrying GSP boot",
+            tag, boot0
+        );
+        nvidia_rm_sys::os_interface::console_quiet_end();
+        log::error!("{}", s.trim_end());
+        (true, s)
+    }
+
     fn gsp_boot_run(&self, tag: &str, quiet: bool) -> String {
         use core::fmt::Write;
         let device_instance = *self.rm_device_instance.lock();
@@ -1363,10 +1438,44 @@ impl NvidiaGpu {
                     );
                     nvidia_rm_sys::os_interface::console_quiet_begin();
                 }
-                let computed = match nvidia_rm_sys::rm_init::init_gsp(device_instance, fw_bytes) {
-                    Ok(()) => String::from("kgspInitRm OK"),
-                    Err(status) => alloc::format!("kgspInitRm FAILED, NV_STATUS={:#x}", status),
+                // Arm the post-STARTCPU wedge watch (console GPU only): if
+                // the fabric dies, the machine survives with fake-MMIO and
+                // we get to attempt SBR recovery + retry -- converting the
+                // ~25-30% per-boot race into up to 3 chances per boot.
+                if drain_for_console {
+                    nvidia_rm_sys::os_boundary::wedge_watch_arm(self.config_handle());
+                }
+                let mut recovery_log = String::new();
+                let mut attempt = 1u32;
+                let computed = loop {
+                    match nvidia_rm_sys::rm_init::init_gsp(device_instance, fw_bytes) {
+                        Ok(()) => break String::from("kgspInitRm OK"),
+                        Err(status) => {
+                            let msg = alloc::format!(
+                                "kgspInitRm FAILED, NV_STATUS={:#x} (attempt {})",
+                                status, attempt
+                            );
+                            if drain_for_console
+                                && nvidia_rm_sys::os_boundary::wedge_detected()
+                                && attempt < 3
+                            {
+                                let (recovered, rlog) = self.sbr_recover(tag, attempt);
+                                recovery_log.push_str(&rlog);
+                                if recovered {
+                                    attempt += 1;
+                                    nvidia_rm_sys::os_boundary::sec2_drain_arm();
+                                    nvidia_rm_sys::os_boundary::seq_trace_arm();
+                                    nvidia_rm_sys::os_boundary::wedge_watch_arm(
+                                        self.config_handle(),
+                                    );
+                                    continue;
+                                }
+                            }
+                            break msg;
+                        }
+                    }
                 };
+                nvidia_rm_sys::os_boundary::wedge_watch_disarm();
                 if quiet && drain_for_console {
                     nvidia_rm_sys::os_interface::console_quiet_end();
                     log::error!(
@@ -1385,6 +1494,14 @@ impl NvidiaGpu {
                 block.push_str(&preboot);
                 block.push_str(&mps_log);
                 block.push_str(&pbus_log);
+                block.push_str(&recovery_log);
+                if nvidia_rm_sys::os_boundary::wedge_fake_mmio_on() {
+                    let _ = writeln!(
+                        block,
+                        "[{}] NOTE: fabric wedge unrecovered -- console rendering suppressed to keep the machine alive; this /proc output is intact (capture to a file + sync), then reboot.",
+                        tag
+                    );
+                }
                 if let Some(log) = captured {
                     if !log.is_empty() {
                         let _ = writeln!(block, "[{}]  --- GSP-RM narration (captured) ---", tag);
