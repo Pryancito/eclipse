@@ -1796,7 +1796,12 @@ NV_STATUS eclipse_rm_step17(NvU32 gpuInstance, EclipseGrChannel *pOut)
         params.gpFifoOffset  = pOut->bufGpuVA + ECLIPSE_CHAN_GPFIFO_OFF;
         params.gpFifoEntries = ECLIPSE_CHAN_GPFIFO_ENTRIES;
         params.hContextShare = g_grAllocCache.hCtxShare;
-        params.hVASpace      = g_grAllocCache.hVas;
+        /* hVASpace MUST be null when hContextShare is given: the channel
+         * inherits the VAS from the context share (which carries hVas).
+         * Real hardware said it verbatim: "kchannelConstruct_IMPL: Both
+         * context share and vaspace handles can't be valid at the same
+         * time" (NV_ERR_INVALID_ARGUMENT 0x1f). */
+        params.hVASpace      = NV01_NULL_OBJECT;
         params.hUserdMemory[0] = pOut->hUserd;
         params.userdOffset[0]  = 0;
         params.engineType    = NV2080_ENGINE_TYPE_GRAPHICS;
