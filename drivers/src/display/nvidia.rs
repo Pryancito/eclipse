@@ -3588,6 +3588,63 @@ impl DrmScheme for NvidiaGpu {
         s
     }
 
+    /// Step 17 (`/proc/gpustep17`): compute channel on the step-16 ladder --
+    /// USERD (vidmem) + 64 KiB pushbuffer/GPFIFO memory mapped in our VAS +
+    /// error notifier + GPFIFO channel (chip class, e.g. TURING_CHANNEL_
+    /// GPFIFO_A) inside the TSG with our ctxshare + TURING_COMPUTE_A object
+    /// + GPFIFO_SCHEDULE. After this the channel is live on the GRAPHICS
+    /// runlist; step18 = QMD + SASS kernel + doorbell = first Eclipse-
+    /// authored compute launch. Requires gpustep16 first. Idempotent.
+    fn bringup_step17(&self) -> String {
+        use core::fmt::Write;
+        let mut s = String::new();
+        let device_instance = *self.rm_device_instance.lock();
+        let Some(device_instance) = device_instance else {
+            return String::from(
+                "[gpustep17] skipped (bring the GPU up first, then gpustep16)\n",
+            );
+        };
+        nvidia_rm_sys::os_interface::capture_begin();
+        let result = nvidia_rm_sys::rm_init::step17(device_instance);
+        let captured = nvidia_rm_sys::os_interface::capture_take();
+        if let Some(log) = captured {
+            for line in log.lines() {
+                let _ = writeln!(s, "[gpustep17] | {}", line);
+            }
+        }
+        let phase = |st: u32| -> String {
+            match st {
+                0 => String::from("OK"),
+                0xFFFF_FFFF => String::from("not reached"),
+                e => alloc::format!("FAILED NV_STATUS={:#x}", e),
+            }
+        };
+        match result {
+            Ok(c) => {
+                let _ = writeln!(s, "[gpustep17] --- compute channel on the step-16 ladder ---");
+                let _ = writeln!(s, "[gpustep17] USERD (vidmem, {} B):     {} (hUserd={:#010x})", c.userd_size, phase(c.userd_status), c.h_userd);
+                let _ = writeln!(s, "[gpustep17] sysmem buf 64K:           {} (hPhysBuf={:#010x})", phase(c.buf_status), c.h_phys_buf);
+                let _ = writeln!(s, "[gpustep17] virtual in hVas:          {} (hVirtBuf={:#010x})", phase(c.virt_status), c.h_virt_buf);
+                let _ = writeln!(s, "[gpustep17] Map -> GPU VA:            {} (VA={:#x})", phase(c.map_status), c.buf_gpu_va);
+                let _ = writeln!(s, "[gpustep17] error notifier 4K:        {} (hNotifier={:#010x})", phase(c.notif_status), c.h_notifier);
+                let _ = writeln!(s, "[gpustep17] GPFIFO channel (class {:#06x}): {} (hChannel={:#010x})", c.channel_class, phase(c.chan_status), c.h_channel);
+                let _ = writeln!(s, "[gpustep17] TURING_COMPUTE_A:         {} (hCompute={:#010x})", phase(c.compute_status), c.h_compute);
+                let _ = writeln!(s, "[gpustep17] GPFIFO_SCHEDULE:          {}", phase(c.sched_status));
+                if c.sched_status == 0 {
+                    let _ = writeln!(s, "[gpustep17] --- COMPUTE CHANNEL LIVE ON THE GRAPHICS RUNLIST: step18 = QMD + SASS kernel + doorbell (first Eclipse compute launch) ---");
+                }
+            }
+            Err(status) => {
+                let _ = writeln!(
+                    s,
+                    "[gpustep17] eclipse_rm_step17 FAILED, NV_STATUS={:#x} (run gpustep16 first; GPU state-loaded?)",
+                    status
+                );
+            }
+        }
+        s
+    }
+
     /// Step 2: instance block + GMMU flush — the first GPU register writes.
     /// TEMPORARY: the secondary (non-console) GPU has its own unrelated
     /// problems (USB breaks in Eclipse when it's made primary; likely never

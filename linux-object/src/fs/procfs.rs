@@ -14,11 +14,11 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 30] = [
+const PROC_ROOT_STATIC: [&str; 31] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
     "perf", "hunter", "filesystems", "gpudbg", "gpustep2", "gpustep3", "gpustep4", "gpustep5",
     "gpustep6", "gpustep7", "gpustep8", "gpustep9", "gpustep10", "gpustep11", "gpustep12",
-    "gpustep13", "gpustep14", "gpustep15", "gpustep16", "gpudump",
+    "gpustep13", "gpustep14", "gpustep15", "gpustep16", "gpustep17", "gpudump",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -305,6 +305,7 @@ impl INode for ProcRootINode {
             "gpustep14" => Ok(PROC_GPUSTEP14.clone()),
             "gpustep15" => Ok(PROC_GPUSTEP15.clone()),
             "gpustep16" => Ok(PROC_GPUSTEP16.clone()),
+            "gpustep17" => Ok(PROC_GPUSTEP17.clone()),
             "gpudump" => Ok(PROC_GPUDUMP.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
@@ -1296,6 +1297,19 @@ fn proc_gpustep16_content() -> String {
     s
 }
 
+/// `/proc/gpustep17` — compute channel on the step-16 ladder (USERD + GPFIFO
+/// memory + channel-in-TSG + TURING_COMPUTE_A + schedule). Idempotent.
+fn proc_gpustep17_content() -> String {
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.bringup_step17());
+    }
+    if s.is_empty() {
+        s.push_str("[gpustep17] no DRM driver with bring-up support\n");
+    }
+    s
+}
+
 /// `/proc/gpudump` — read-only discriminating hardware dump for every NVIDIA
 /// GPU (console + secondary): display head liveness, VGA workspace base, PMC,
 /// BSI scratch, sysmem flush. NO GSP boot -> ZERO wedge risk. Read this first
@@ -1598,6 +1612,11 @@ lazy_static! {
     static ref PROC_GPUSTEP16: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 83,
         generate: proc_gpustep16_content,
+    });
+    /// `/proc/gpustep17` -- compute channel bring-up (see proc_gpustep17_content).
+    static ref PROC_GPUSTEP17: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 81,
+        generate: proc_gpustep17_content,
     });
     /// `/proc/gpudump` -- read-only discriminating HW dump, both GPUs (see
     /// proc_gpudump_content).
