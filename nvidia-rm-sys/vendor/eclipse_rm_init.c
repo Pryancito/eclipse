@@ -2008,6 +2008,23 @@ NV_STATUS eclipse_rm_step18(NvU32 gpuInstance, EclipseGrLaunch *pOut)
         return status;
     }
 
+    /*
+     * Unlike step-16/17 (allocation, which asserts the GPU lock is NOT
+     * held), step-18 does no allocation but DOES CPU-map the USERD out of
+     * vidmem via the FB aperture (kbusMapFbAperture_HAL), which asserts
+     * rmDeviceGpuLockIsOwner. So we additionally hold the GPU lock across
+     * the whole map/submit/poll -- exactly like RM's own CeUtils submit
+     * path. API lock first, then GPU locks (standard RM lock order).
+     */
+    status = rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
     pKernelFifo = GPU_GET_KERNEL_FIFO(pGpu);
     pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
 
@@ -2176,6 +2193,7 @@ report:
         g_grLaunchDone = NV_TRUE;
     }
 
+    rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
     rmapiLockRelease();
     gpumgrThreadDisableExpandedGpuVisibility();
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
