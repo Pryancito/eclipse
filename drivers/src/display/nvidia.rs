@@ -3159,38 +3159,24 @@ impl DrmScheme for NvidiaGpu {
             s.push_str("[gpustep14] --- stage 1: RM attach (gpustep5) ---\n");
             s.push_str(&self.bringup_step5());
         }
-        // 1.5. Declare this GPU's real identity to RM BEFORE the GSP boot,
-        //    exactly where Linux does (RmDeterminePrimaryDevice /
-        //    RmSetConsolePreservationParams right before kgspInitRm): PRIMARY
-        //    device with a live UEFI GOP console in its BAR1. Review finding:
-        //    only step11 ever did this -- the step13/14 boots were telling
-        //    GSP-RM bIsPrimary=false with no console reservation, so GSP-RM's
-        //    FB carving/scrubbing had no idea the scanout surface existed.
-        //    Idempotent property/field writes; safe on cached re-reads.
-        if let Some(device_instance) = *self.rm_device_instance.lock() {
-            let (console_size, at_bar1_base) = match *BOOT_FB_INFO.lock() {
-                Some(fb) => (
-                    fb.pitch as u64 * fb.height as u64,
-                    fb.phys == self.bar1_phys,
-                ),
-                None => (0, false),
-            };
-            match nvidia_rm_sys::rm_init::mark_console_gpu(
-                device_instance,
-                console_size,
-                at_bar1_base,
-            ) {
-                Ok(()) => s.push_str(&alloc::format!(
-                    "[gpustep14] --- stage 1.5: console identity declared to RM (PRIMARY_DEVICE, console {} KiB, at BAR1 base: {}) ---\n",
-                    console_size / 1024,
-                    at_bar1_base
-                )),
-                Err(status) => s.push_str(&alloc::format!(
-                    "[gpustep14] --- stage 1.5: mark_console_gpu FAILED, NV_STATUS={:#x} (continuing) ---\n",
-                    status
-                )),
-            }
-        }
+        // 1.5 REMOVED: do NOT declare PRIMARY_DEVICE/console to RM before the
+        //    boot. Cross-build statistics over every console-GPU boot ever
+        //    made: with mark_console_gpu (bIsPrimary=true + consoleMemSize in
+        //    SET_SYSTEM_INFO -- all step11 runs and every step14 run since
+        //    da884def): 0 successes in 9+ boots. WITHOUT it (bIsPrimary=false,
+        //    no console reservation -- the pre-da884def step13/14 runs): 2
+        //    successes in 3, INCLUDING the full attach->boot->state-load->CE
+        //    chain with the console visibly still working afterwards. The
+        //    mechanism matches the cross-cluster model exactly: declaring a
+        //    primary/console GPU makes the SEC2-HS CORE_RESUME payload run
+        //    its display/VGA/console-preservation path -- display-domain PRI
+        //    traffic while the head is actively scanning, the precise
+        //    SYS<->DISP forward-progress hazard that wedges the fabric. Linux
+        //    tolerates it via something environmental we haven't identified;
+        //    our polled bring-up doesn't need the reservation (the GSP's FB
+        //    carving demonstrably left the scanout surface intact on the
+        //    successful full-chain run). Revisit console preservation later,
+        //    post-boot, if FB carving ever eats the console.
         // 2. GSP-RM boot. gsp_boot_run arms the console SEC2 drain internally
         //    now, so this is the proven path; cached after the first boot.
         s.push_str("[gpustep14] --- stage 2: GSP-RM boot (kgspInitRm, console-SILENT, Linux-parity STARTCPU, VGA decode off, PBUS pre-clear) ---\n");
