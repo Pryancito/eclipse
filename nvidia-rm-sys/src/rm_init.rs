@@ -360,6 +360,59 @@ pub fn step17(device_instance: u32) -> Result<GrChannel, NV_STATUS> {
     }
 }
 
+/// Mirror of `EclipseGrLaunch` (vendor/eclipse_rm_init.c): per-stage
+/// NV_STATUS (`0xFFFFFFFF` = not reached) for step-18, the first
+/// Eclipse-authored pushbuffer submission (host + compute-engine
+/// semaphore releases through the live step-17 channel).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GrLaunch {
+    pub lookup_status: NvU32,
+    pub map_status: NvU32,
+    pub token_status: NvU32,
+    pub submit_status: NvU32,
+    pub host_sem_status: NvU32,
+    pub eng_sem_status: NvU32,
+    pub work_token: NvU32,
+    pub runlist_id: NvU32,
+    pub host_sem_value: NvU32,
+    pub eng_sem_value: NvU32,
+    pub host_poll_iters: NvU32,
+    pub eng_poll_iters: NvU32,
+    pub push_dwords: NvU32,
+}
+
+extern "C" {
+    fn eclipse_rm_step18(device_instance: NvU32, out: *mut GrLaunch) -> NV_STATUS;
+}
+
+/// Runs step-18: writes semaphore-release methods into the step-17
+/// pushbuffer, submits via GP entry + GPPut + usermode doorbell, and
+/// CPU-polls both landing zones. Idempotent once fully successful.
+pub fn step18(device_instance: u32) -> Result<GrLaunch, NV_STATUS> {
+    let mut out = GrLaunch {
+        lookup_status: 0xFFFF_FFFF,
+        map_status: 0xFFFF_FFFF,
+        token_status: 0xFFFF_FFFF,
+        submit_status: 0xFFFF_FFFF,
+        host_sem_status: 0xFFFF_FFFF,
+        eng_sem_status: 0xFFFF_FFFF,
+        work_token: 0,
+        runlist_id: 0,
+        host_sem_value: 0,
+        eng_sem_value: 0,
+        host_poll_iters: 0,
+        eng_poll_iters: 0,
+        push_dwords: 0,
+    };
+    let status = unsafe { eclipse_rm_step18(device_instance, &mut out) };
+    if status == NV_OK {
+        Ok(out)
+    } else {
+        Err(status)
+    }
+}
+
 /// Fetches the GSP-reported interrupt kernel table (boxed: ~2 KiB).
 pub fn intr_table(device_instance: u32) -> Result<alloc::boxed::Box<IntrTable>, NV_STATUS> {
     let mut out = alloc::boxed::Box::new(IntrTable {

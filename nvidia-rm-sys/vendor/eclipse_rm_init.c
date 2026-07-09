@@ -69,6 +69,10 @@
 #include "alloc/alloc_channel.h" /* NV_CHANNEL_ALLOC_PARAMS */
 #include "ctrl/ctrla06f.h"     /* NVA06F_CTRL_CMD_GPFIFO_SCHEDULE */
 #include "kernel/gpu/fifo/kernel_fifo.h" /* kfifoGetChannelClassId / UserdSizeAlign */
+#include "kernel/gpu/fifo/kernel_channel.h" /* CliGetKernelChannel / runlist / USERD memdesc */
+#include "class/cl906f.h"      /* GP_ENTRY + DMA method encoding (Fermi format, current) */
+#include "class/clc46f.h"      /* TURING_CHANNEL_GPFIFO_A host methods + Nvc46fControl */
+#include "mem_mgr/mem.h"       /* Memory / memGetByHandle */
 #include "gpu/mem_mgr/heap.h"  /* HEAP_OWNER_RM_CLIENT_GENERIC */
 #include "g_hal_register.h"
 /* Step 10 (CE memset/copy + readback verify) */
@@ -1877,6 +1881,305 @@ unlock:
     gpumgrThreadDisableExpandedGpuVisibility();
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
     return status;
+}
+
+/*
+ * Step-18: the first Eclipse-authored GPU execution. Everything before this
+ * point allocated and scheduled; nothing ever made the GPU *fetch and run*
+ * methods we wrote. This step does, on the live step-17 channel:
+ *
+ *   CPU-map the 64 KiB channel buffer (sysmem) and the USERD (vidmem via
+ *   BAR1, exactly channelFillGpFifo's memmgrMemDescBeginTransfer recipe) ->
+ *   write a method stream at +0x0:
+ *     - NVC46F host semaphore RELEASE (SEM_ADDR/PAYLOAD/EXECUTE) to
+ *       GPU VA buf+0x8000: proves ESCHED/PBDMA fetched and executed our
+ *       pushbuffer (no engine involved), payload 0x0EC11B5E
+ *     - SET_OBJECT(subch 1) = TURING_COMPUTE_A, then NVC5C0
+ *       SET_REPORT_SEMAPHORE_A..D RELEASE to GPU VA buf+0x8040: proves the
+ *       GR/compute engine context-switched into OUR channel (golden context
+ *       load) and processed class methods, payload 0x600DC0DE
+ *   -> GP_ENTRY0/1 (NV906F format) at ring slot 0 (buf+0xC000) ->
+ *   USERD->GPPut = 1 -> work-submit token (kfifoGenerateWorkSubmitToken,
+ *   runlistId | chId per kernel_fifo_tu102.c) -> usermode doorbell
+ *   (kfifoUpdateUsermodeDoorbell_HAL = NV_VIRTUAL_FUNCTION_DOORBELL write)
+ *   -> CPU-poll both semaphores in the sysmem buffer.
+ *
+ * Every piece is the RM's own submit path (channel_utils.c channelFillGpFifo
+ * / channelPushMethod encoding), transliterated for our raw RMAPI channel.
+ * Both semaphore observations are reported with poll iteration counts, so a
+ * hardware run distinguishes "PBDMA never fetched" (host sem timeout) from
+ * "engine never switched in" (host OK, engine timeout). Idempotent via
+ * cache; requires step17 in the same boot.
+ */
+typedef struct EclipseGrLaunch
+{
+    NvU32 lookupStatus;   /* KernelChannel + memdescs located */
+    NvU32 mapStatus;      /* CPU mappings of channel buffer + USERD */
+    NvU32 tokenStatus;    /* work-submit token generation */
+    NvU32 submitStatus;   /* methods + GP entry + GPPut + doorbell */
+    NvU32 hostSemStatus;  /* NV_OK = host semaphore landed, 0x65 = timeout */
+    NvU32 engSemStatus;   /* NV_OK = compute report semaphore landed */
+    NvU32 workToken;
+    NvU32 runlistId;
+    NvU32 hostSemValue;   /* CPU readback (expect 0x0EC11B5E) */
+    NvU32 engSemValue;    /* CPU readback (expect 0x600DC0DE) */
+    NvU32 hostPollIters;  /* 1 ms units until seen */
+    NvU32 engPollIters;
+    NvU32 pushDwords;     /* method stream length actually submitted */
+} EclipseGrLaunch;
+
+static EclipseGrLaunch g_grLaunchCache;
+static NvBool g_grLaunchDone = NV_FALSE;
+
+#define ECLIPSE_LAUNCH_HOST_SEM_OFF 0x8000
+#define ECLIPSE_LAUNCH_ENG_SEM_OFF  0x8040
+#define ECLIPSE_LAUNCH_HOST_PAYLOAD 0x0EC11B5E
+#define ECLIPSE_LAUNCH_ENG_PAYLOAD  0x600DC0DE
+#define ECLIPSE_LAUNCH_POLL_MS      3000
+
+#define ECLIPSE_PUSH_HDR(subch, mthd, count)                       \
+    (DRF_DEF(906F, _DMA, _SEC_OP, _INC_METHOD) |                   \
+     DRF_NUM(906F, _DMA, _METHOD_ADDRESS, (mthd) >> 2) |           \
+     DRF_NUM(906F, _DMA, _METHOD_SUBCHANNEL, (subch)) |            \
+     DRF_NUM(906F, _DMA, _METHOD_COUNT, (count)))
+
+/* Eclipse-side (os_interface.rs) calibrated microsecond delay. */
+extern NV_STATUS os_delay_us(NvU32 microseconds);
+
+NV_STATUS eclipse_rm_step18(NvU32 gpuInstance, EclipseGrLaunch *pOut)
+{
+    OBJGPU *pGpu;
+    NV_STATUS status;
+    THREAD_STATE_NODE threadState;
+    RsClient *pRsClient = NULL;
+    KernelChannel *pKernelChannel = NULL;
+    KernelFifo *pKernelFifo;
+    MemoryManager *pMemoryManager;
+    Memory *pBufMemory = NULL;
+    MEMORY_DESCRIPTOR *pBufMemDesc = NULL;
+    MEMORY_DESCRIPTOR *pUserdMemDesc = NULL;
+    NvU8 *pBufCpu = NULL;
+    NvU8 *pUserdCpu = NULL;
+    NvU32 userdFlags = TRANSFER_FLAGS_USE_BAR1 |
+                       TRANSFER_FLAGS_SHADOW_ALLOC |
+                       TRANSFER_FLAGS_SHADOW_INIT_MEM;
+
+    if (pOut == NULL)
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    if (g_grLaunchDone)
+    {
+        portMemCopy(pOut, sizeof(*pOut), &g_grLaunchCache, sizeof(g_grLaunchCache));
+        return NV_OK;
+    }
+    portMemSet(pOut, 0, sizeof(*pOut));
+    pOut->lookupStatus  = 0xFFFFFFFF;
+    pOut->mapStatus     = 0xFFFFFFFF;
+    pOut->tokenStatus   = 0xFFFFFFFF;
+    pOut->submitStatus  = 0xFFFFFFFF;
+    pOut->hostSemStatus = 0xFFFFFFFF;
+    pOut->engSemStatus  = 0xFFFFFFFF;
+
+    if (!g_grChanDone)
+    {
+        return NV_ERR_INVALID_STATE; /* run step17 first */
+    }
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    pGpu = gpumgrGetGpu(gpuInstance);
+    if (pGpu == NULL || !pGpu->gspRmInitialized)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
+    }
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pKernelFifo = GPU_GET_KERNEL_FIFO(pGpu);
+    pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
+
+    /* 1. Locate the live objects behind the step-17 handles. */
+    {
+        NvU32 subdevInst;
+        status = serverGetClientUnderLock(&g_resServ, g_grAllocCache.hClient, &pRsClient);
+        if (status == NV_OK)
+            status = CliGetKernelChannel(pRsClient, g_grChanCache.hChannel, &pKernelChannel);
+        if (status == NV_OK)
+            status = memGetByHandle(pRsClient, g_grChanCache.hPhysBuf, &pBufMemory);
+        if (status == NV_OK)
+        {
+            pBufMemDesc = pBufMemory->pMemDesc;
+            subdevInst = gpumgrGetSubDeviceInstanceFromGpu(pGpu);
+            pUserdMemDesc = pKernelChannel->pUserdSubDeviceMemDesc[subdevInst];
+            if (pBufMemDesc == NULL || pUserdMemDesc == NULL)
+                status = NV_ERR_INVALID_STATE;
+        }
+        pOut->lookupStatus = status;
+        nv_printf(0, "[eclipse-rm-trace] step18: lookup (chan/buf/userd) -> 0x%x\n",
+                  pOut->lookupStatus);
+        if (status != NV_OK) goto report;
+    }
+
+    /* 2. CPU mappings: sysmem buffer direct, USERD via BAR1 (channel_utils
+     *    channelFillGpFifo's exact transfer flags). */
+    {
+        pBufCpu = memmgrMemDescBeginTransfer(pMemoryManager, pBufMemDesc,
+                                             TRANSFER_FLAGS_NONE);
+        pUserdCpu = memmgrMemDescBeginTransfer(pMemoryManager, pUserdMemDesc,
+                                               userdFlags);
+        pOut->mapStatus = (pBufCpu != NULL && pUserdCpu != NULL)
+                              ? NV_OK : NV_ERR_GENERIC;
+        nv_printf(0, "[eclipse-rm-trace] step18: CPU map buf=%s userd=%s -> 0x%x\n",
+                  pBufCpu ? "ok" : "NULL", pUserdCpu ? "ok" : "NULL",
+                  pOut->mapStatus);
+        if (pOut->mapStatus != NV_OK) goto report;
+    }
+
+    /* 3. Work-submit token (kernel_fifo_tu102: runlistId | chId). */
+    {
+        pOut->tokenStatus = kfifoGenerateWorkSubmitToken(pGpu, pKernelFifo,
+                                                         pKernelChannel,
+                                                         &pOut->workToken,
+                                                         NV_TRUE);
+        pOut->runlistId = kchannelGetRunlistId(pKernelChannel);
+        nv_printf(0, "[eclipse-rm-trace] step18: work token -> 0x%x token=0x%x runlist=%u\n",
+                  pOut->tokenStatus, pOut->workToken, pOut->runlistId);
+        if (pOut->tokenStatus != NV_OK) goto report;
+    }
+
+    /* 4. Method stream + GP entry + GPPut + doorbell. */
+    {
+        volatile NvU32 *pb = (volatile NvU32 *)pBufCpu;
+        volatile NvU32 *gp = (volatile NvU32 *)(pBufCpu + ECLIPSE_CHAN_GPFIFO_OFF);
+        volatile Nvc46fControl *pUserd = (volatile Nvc46fControl *)pUserdCpu;
+        NvU64 semHostVA = g_grChanCache.bufGpuVA + ECLIPSE_LAUNCH_HOST_SEM_OFF;
+        NvU64 semEngVA  = g_grChanCache.bufGpuVA + ECLIPSE_LAUNCH_ENG_SEM_OFF;
+        NvU32 n = 0;
+        NvU32 gpEntry0, gpEntry1;
+
+        /* Clear the semaphore landing zones first. */
+        pb[ECLIPSE_LAUNCH_HOST_SEM_OFF / 4] = 0;
+        pb[ECLIPSE_LAUNCH_ENG_SEM_OFF / 4]  = 0;
+
+        /* Host semaphore RELEASE: SEM_ADDR_LO..SEM_EXECUTE (0x5c..0x6c). */
+        pb[n++] = ECLIPSE_PUSH_HDR(0, NVC46F_SEM_ADDR_LO, 5);
+        pb[n++] = NvU64_LO32(semHostVA);
+        pb[n++] = DRF_NUM(C46F, _SEM_ADDR_HI, _OFFSET, NvU64_HI32(semHostVA));
+        pb[n++] = ECLIPSE_LAUNCH_HOST_PAYLOAD;
+        pb[n++] = 0; /* PAYLOAD_HI */
+        pb[n++] = DRF_DEF(C46F, _SEM_EXECUTE, _OPERATION, _RELEASE) |
+                  DRF_DEF(C46F, _SEM_EXECUTE, _RELEASE_WFI, _DIS) |
+                  DRF_DEF(C46F, _SEM_EXECUTE, _PAYLOAD_SIZE, _32BIT) |
+                  DRF_DEF(C46F, _SEM_EXECUTE, _RELEASE_TIMESTAMP, _DIS);
+
+        /* Bind TURING_COMPUTE_A on subchannel 1, then engine report
+         * semaphore RELEASE through the compute FE. */
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC46F_SET_OBJECT, 1);
+        pb[n++] = TURING_COMPUTE_A;
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_SET_REPORT_SEMAPHORE_A, 4);
+        pb[n++] = DRF_NUM(C5C0, _SET_REPORT_SEMAPHORE_A, _OFFSET_UPPER,
+                          NvU64_HI32(semEngVA));
+        pb[n++] = NvU64_LO32(semEngVA);
+        pb[n++] = ECLIPSE_LAUNCH_ENG_PAYLOAD;
+        pb[n++] = DRF_DEF(C5C0, _SET_REPORT_SEMAPHORE_D, _OPERATION, _RELEASE) |
+                  DRF_DEF(C5C0, _SET_REPORT_SEMAPHORE_D, _STRUCTURE_SIZE, _ONE_WORD);
+        pOut->pushDwords = n;
+
+        /* GP entry 0 (NV906F format, channelFillGpFifo verbatim). */
+        gpEntry0 = DRF_DEF(906F, _GP_ENTRY0, _NO_CONTEXT_SWITCH, _FALSE) |
+                   DRF_NUM(906F, _GP_ENTRY0, _GET, NvU64_LO32(g_grChanCache.bufGpuVA) >> 2);
+        gpEntry1 = DRF_NUM(906F, _GP_ENTRY1, _GET_HI, NvU64_HI32(g_grChanCache.bufGpuVA)) |
+                   DRF_NUM(906F, _GP_ENTRY1, _LENGTH, n) |
+                   DRF_DEF(906F, _GP_ENTRY1, _LEVEL, _MAIN);
+        gp[0] = gpEntry0;
+        gp[1] = gpEntry1;
+        osFlushCpuWriteCombineBuffer();
+
+        pUserd->GPPut = 1;
+        osFlushCpuWriteCombineBuffer();
+
+        status = kbusFlushPcieForBar0Doorbell_HAL(pGpu, GPU_GET_KERNEL_BUS(pGpu));
+        if (status == NV_OK)
+        {
+            status = kfifoUpdateUsermodeDoorbell_HAL(pGpu, pKernelFifo,
+                                                     pOut->workToken,
+                                                     pOut->runlistId);
+        }
+        pOut->submitStatus = status;
+        nv_printf(0, "[eclipse-rm-trace] step18: submit (%u dwords, GPPut=1, doorbell) -> 0x%x\n",
+                  n, pOut->submitStatus);
+        if (status != NV_OK) goto report;
+    }
+
+    /* 5+6. CPU-poll both semaphores (1 ms ticks). */
+    {
+        volatile NvU32 *pHostSem = (volatile NvU32 *)(pBufCpu + ECLIPSE_LAUNCH_HOST_SEM_OFF);
+        volatile NvU32 *pEngSem  = (volatile NvU32 *)(pBufCpu + ECLIPSE_LAUNCH_ENG_SEM_OFF);
+        NvU32 i;
+        for (i = 0; i < ECLIPSE_LAUNCH_POLL_MS; i++)
+        {
+            if (pOut->hostSemStatus != NV_OK && *pHostSem == ECLIPSE_LAUNCH_HOST_PAYLOAD)
+            {
+                pOut->hostSemStatus = NV_OK;
+                pOut->hostPollIters = i;
+            }
+            if (pOut->engSemStatus != NV_OK && *pEngSem == ECLIPSE_LAUNCH_ENG_PAYLOAD)
+            {
+                pOut->engSemStatus = NV_OK;
+                pOut->engPollIters = i;
+            }
+            if (pOut->hostSemStatus == NV_OK && pOut->engSemStatus == NV_OK)
+                break;
+            os_delay_us(1000);
+        }
+        pOut->hostSemValue = *pHostSem;
+        pOut->engSemValue  = *pEngSem;
+        if (pOut->hostSemStatus != NV_OK)
+        {
+            pOut->hostSemStatus = NV_ERR_TIMEOUT;
+            pOut->hostPollIters = i;
+        }
+        if (pOut->engSemStatus != NV_OK)
+        {
+            pOut->engSemStatus = NV_ERR_TIMEOUT;
+            pOut->engPollIters = i;
+        }
+        nv_printf(0, "[eclipse-rm-trace] step18: host sem 0x%x (val=0x%x @%u ms) eng sem 0x%x (val=0x%x @%u ms)\n",
+                  pOut->hostSemStatus, pOut->hostSemValue, pOut->hostPollIters,
+                  pOut->engSemStatus, pOut->engSemValue, pOut->engPollIters);
+    }
+
+report:
+    if (pBufCpu != NULL)
+        memmgrMemDescEndTransfer(pMemoryManager, pBufMemDesc, TRANSFER_FLAGS_NONE);
+    if (pUserdCpu != NULL)
+        memmgrMemDescEndTransfer(pMemoryManager, pUserdMemDesc, userdFlags);
+
+    /* Cache only a fully-successful launch so a failed attempt can be
+     * retried on the next read without a reboot. */
+    if (pOut->hostSemStatus == NV_OK && pOut->engSemStatus == NV_OK)
+    {
+        portMemCopy(&g_grLaunchCache, sizeof(g_grLaunchCache), pOut, sizeof(*pOut));
+        g_grLaunchDone = NV_TRUE;
+    }
+
+    rmapiLockRelease();
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return NV_OK; /* per-stage statuses carry any failure */
 }
 
 /*
