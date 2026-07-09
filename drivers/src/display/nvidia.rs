@@ -3532,6 +3532,62 @@ impl DrmScheme for NvidiaGpu {
         s
     }
 
+    /// Step 16 (`/proc/gpustep16`): the GR allocation ladder on a
+    /// state-loaded GPU -- client -> device -> subdevice -> VA space -> TSG
+    /// bound to the GRAPHICS engine -> context share (SYNC/VEID0), all
+    /// through the vendored resource server against the live GSP. The first
+    /// allocations Eclipse makes itself (everything before adopted GSP
+    /// internal handles), and the front half of a real compute launch;
+    /// step17 adds the GPFIFO channel + TURING_COMPUTE_A (golden context).
+    /// Idempotent: the C side keeps the ladder alive and caches the result.
+    fn bringup_step16(&self) -> String {
+        use core::fmt::Write;
+        let mut s = String::new();
+        let device_instance = *self.rm_device_instance.lock();
+        let Some(device_instance) = device_instance else {
+            return String::from(
+                "[gpustep16] skipped (bring the GPU up first: gpustep5/6/8/9 on the secondary, or gpustep14 on the console)\n",
+            );
+        };
+        nvidia_rm_sys::os_interface::capture_begin();
+        let result = nvidia_rm_sys::rm_init::step16(device_instance);
+        let captured = nvidia_rm_sys::os_interface::capture_take();
+        if let Some(log) = captured {
+            for line in log.lines() {
+                let _ = writeln!(s, "[gpustep16] | {}", line);
+            }
+        }
+        let phase = |st: u32| -> String {
+            match st {
+                0 => String::from("OK"),
+                0xFFFF_FFFF => String::from("not reached"),
+                e => alloc::format!("FAILED NV_STATUS={:#x}", e),
+            }
+        };
+        match result {
+            Ok(g) => {
+                let _ = writeln!(s, "[gpustep16] --- GR allocation ladder (resource server on live GSP) ---");
+                let _ = writeln!(s, "[gpustep16] NV01_ROOT client:        {} (hClient={:#010x})", phase(g.client_status), g.h_client);
+                let _ = writeln!(s, "[gpustep16] NV01_DEVICE_0:           {} (hDevice={:#010x})", phase(g.device_status), g.h_device);
+                let _ = writeln!(s, "[gpustep16] NV20_SUBDEVICE_0:        {} (hSubdevice={:#010x})", phase(g.subdev_status), g.h_subdevice);
+                let _ = writeln!(s, "[gpustep16] FERMI_VASPACE_A:         {} (hVas={:#010x})", phase(g.vas_status), g.h_vas);
+                let _ = writeln!(s, "[gpustep16] KEPLER_CHANNEL_GROUP_A:  {} (hTsg={:#010x}, engineType=GRAPHICS)", phase(g.tsg_status), g.h_tsg);
+                let _ = writeln!(s, "[gpustep16] FERMI_CONTEXT_SHARE_A:   {} (hCtxShare={:#010x})", phase(g.ctxshare_status), g.h_ctxshare);
+                if g.ctxshare_status == 0 {
+                    let _ = writeln!(s, "[gpustep16] --- GR ALLOCATION LADDER COMPLETE: TSG on the GRAPHICS runlist with a live subcontext; step17 = GPFIFO channel + TURING_COMPUTE_A (golden context) ---");
+                }
+            }
+            Err(status) => {
+                let _ = writeln!(
+                    s,
+                    "[gpustep16] eclipse_rm_step16 FAILED, NV_STATUS={:#x} (GPU not GSP-booted/state-loaded?)",
+                    status
+                );
+            }
+        }
+        s
+    }
+
     /// Step 2: instance block + GMMU flush — the first GPU register writes.
     /// TEMPORARY: the secondary (non-console) GPU has its own unrelated
     /// problems (USB breaks in Eclipse when it's made primary; likely never

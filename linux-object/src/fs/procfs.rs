@@ -14,11 +14,11 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 29] = [
+const PROC_ROOT_STATIC: [&str; 30] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
     "perf", "hunter", "filesystems", "gpudbg", "gpustep2", "gpustep3", "gpustep4", "gpustep5",
     "gpustep6", "gpustep7", "gpustep8", "gpustep9", "gpustep10", "gpustep11", "gpustep12",
-    "gpustep13", "gpustep14", "gpustep15", "gpudump",
+    "gpustep13", "gpustep14", "gpustep15", "gpustep16", "gpudump",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -304,6 +304,7 @@ impl INode for ProcRootINode {
             "gpustep13" => Ok(PROC_GPUSTEP13.clone()),
             "gpustep14" => Ok(PROC_GPUSTEP14.clone()),
             "gpustep15" => Ok(PROC_GPUSTEP15.clone()),
+            "gpustep16" => Ok(PROC_GPUSTEP16.clone()),
             "gpudump" => Ok(PROC_GPUDUMP.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
@@ -1281,6 +1282,20 @@ fn proc_gpustep15_content() -> String {
     s
 }
 
+/// `/proc/gpustep16` — GR allocation ladder (client/device/subdevice/VAS/
+/// TSG(GR)/ctxshare) on a state-loaded GPU via the vendored resource server.
+/// Idempotent (the ladder stays alive for step17).
+fn proc_gpustep16_content() -> String {
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.bringup_step16());
+    }
+    if s.is_empty() {
+        s.push_str("[gpustep16] no DRM driver with bring-up support\n");
+    }
+    s
+}
+
 /// `/proc/gpudump` — read-only discriminating hardware dump for every NVIDIA
 /// GPU (console + secondary): display head liveness, VGA workspace base, PMC,
 /// BSI scratch, sysmem flush. NO GSP boot -> ZERO wedge risk. Read this first
@@ -1578,6 +1593,11 @@ lazy_static! {
     static ref PROC_GPUSTEP15: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 84,
         generate: proc_gpustep15_content,
+    });
+    /// `/proc/gpustep16` -- GR allocation ladder (see proc_gpustep16_content).
+    static ref PROC_GPUSTEP16: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 83,
+        generate: proc_gpustep16_content,
     });
     /// `/proc/gpudump` -- read-only discriminating HW dump, both GPUs (see
     /// proc_gpudump_content).

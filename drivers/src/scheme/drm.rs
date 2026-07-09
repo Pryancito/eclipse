@@ -201,6 +201,14 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Bring-up **Step 16** (`/proc/gpustep16`): GR allocation ladder on a
+    /// state-loaded GPU (client/device/subdevice/VAS/TSG(GR)/ctxshare) via
+    /// the vendored resource server -- front half of a compute launch.
+    /// Idempotent. Default: nothing.
+    fn bringup_step16(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Read-only hardware-state dump (`/proc/gpudump`): the discriminating
     /// registers (display head liveness, VGA workspace, PMC, BSI, sysmem
     /// flush) for this GPU, with NO GSP boot -- zero wedge risk. Lets us
