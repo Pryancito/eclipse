@@ -14,11 +14,12 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 32] = [
+const PROC_ROOT_STATIC: [&str; 33] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
     "perf", "hunter", "filesystems", "gpudbg", "gpustep2", "gpustep3", "gpustep4", "gpustep5",
     "gpustep6", "gpustep7", "gpustep8", "gpustep9", "gpustep10", "gpustep11", "gpustep12",
-    "gpustep13", "gpustep14", "gpustep15", "gpustep16", "gpustep17", "gpustep18", "gpudump",
+    "gpustep13", "gpustep14", "gpustep15", "gpustep16", "gpustep17", "gpustep18", "gpustep19",
+    "gpudump",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -307,6 +308,7 @@ impl INode for ProcRootINode {
             "gpustep16" => Ok(PROC_GPUSTEP16.clone()),
             "gpustep17" => Ok(PROC_GPUSTEP17.clone()),
             "gpustep18" => Ok(PROC_GPUSTEP18.clone()),
+            "gpustep19" => Ok(PROC_GPUSTEP19.clone()),
             "gpudump" => Ok(PROC_GPUDUMP.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
@@ -1325,6 +1327,20 @@ fn proc_gpustep18_content() -> String {
     s
 }
 
+/// `/proc/gpustep19` — first real compute launch (Turing QMD + minimal SM75
+/// kernel via SEND_PCAS, verified by the QMD RELEASE0 semaphore). Idempotent
+/// once the semaphore lands.
+fn proc_gpustep19_content() -> String {
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.bringup_step19());
+    }
+    if s.is_empty() {
+        s.push_str("[gpustep19] no DRM driver with bring-up support\n");
+    }
+    s
+}
+
 /// `/proc/gpudump` — read-only discriminating hardware dump for every NVIDIA
 /// GPU (console + secondary): display head liveness, VGA workspace base, PMC,
 /// BSI scratch, sysmem flush. NO GSP boot -> ZERO wedge risk. Read this first
@@ -1638,6 +1654,12 @@ lazy_static! {
     static ref PROC_GPUSTEP18: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 80,
         generate: proc_gpustep18_content,
+    });
+    /// `/proc/gpustep19` -- first real compute launch (see
+    /// proc_gpustep19_content).
+    static ref PROC_GPUSTEP19: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 79,
+        generate: proc_gpustep19_content,
     });
     /// `/proc/gpudump` -- read-only discriminating HW dump, both GPUs (see
     /// proc_gpudump_content).

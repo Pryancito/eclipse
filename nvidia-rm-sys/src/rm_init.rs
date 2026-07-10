@@ -413,6 +413,56 @@ pub fn step18(device_instance: u32) -> Result<GrLaunch, NV_STATUS> {
     }
 }
 
+/// Mirror of `EclipseGrCompute` (vendor/eclipse_rm_init.c): step-19, the
+/// first real compute launch — a minimal SM75 kernel run via a QMD on the
+/// live step-17/18 channel, verified by the QMD's RELEASE0 semaphore.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GrCompute {
+    pub lookup_status: NvU32,
+    pub map_status: NvU32,
+    pub token_status: NvU32,
+    pub submit_status: NvU32,
+    pub sem_status: NvU32,
+    pub work_token: NvU32,
+    pub runlist_id: NvU32,
+    pub sem_value: NvU32,
+    pub poll_iters: NvU32,
+    pub push_dwords: NvU32,
+    pub kernel_va: u64,
+    pub qmd_va: u64,
+}
+
+extern "C" {
+    fn eclipse_rm_step19(device_instance: NvU32, out: *mut GrCompute) -> NV_STATUS;
+}
+
+/// Runs step-19: builds a Turing (Volta V02_02) QMD pointing at a minimal
+/// SM75 EXIT kernel, submits it via SEND_PCAS on the step-17/18 channel, and
+/// CPU-polls the QMD RELEASE0 semaphore. Idempotent once the semaphore lands.
+pub fn step19(device_instance: u32) -> Result<GrCompute, NV_STATUS> {
+    let mut out = GrCompute {
+        lookup_status: 0xFFFF_FFFF,
+        map_status: 0xFFFF_FFFF,
+        token_status: 0xFFFF_FFFF,
+        submit_status: 0xFFFF_FFFF,
+        sem_status: 0xFFFF_FFFF,
+        work_token: 0,
+        runlist_id: 0,
+        sem_value: 0,
+        poll_iters: 0,
+        push_dwords: 0,
+        kernel_va: 0,
+        qmd_va: 0,
+    };
+    let status = unsafe { eclipse_rm_step19(device_instance, &mut out) };
+    if status == NV_OK {
+        Ok(out)
+    } else {
+        Err(status)
+    }
+}
+
 /// Fetches the GSP-reported interrupt kernel table (boxed: ~2 KiB).
 pub fn intr_table(device_instance: u32) -> Result<alloc::boxed::Box<IntrTable>, NV_STATUS> {
     let mut out = alloc::boxed::Box::new(IntrTable {

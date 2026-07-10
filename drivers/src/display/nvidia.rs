@@ -3704,6 +3704,66 @@ impl DrmScheme for NvidiaGpu {
         s
     }
 
+    /// Step 19 (`/proc/gpustep19`): the first real compute launch. Builds a
+    /// Turing (Volta V02_02) QMD pointing at a minimal SM75 EXIT kernel and
+    /// submits it through the live step-17/18 channel via SEND_PCAS; the
+    /// QMD's RELEASE0 semaphore landing in sysmem proves the SMs ran our
+    /// program. Requires gpustep17 (and is happiest after gpustep18) first.
+    fn bringup_step19(&self) -> String {
+        use core::fmt::Write;
+        let mut s = String::new();
+        let device_instance = *self.rm_device_instance.lock();
+        let Some(device_instance) = device_instance else {
+            return String::from(
+                "[gpustep19] skipped (bring the GPU up first, then gpustep16/17)\n",
+            );
+        };
+        nvidia_rm_sys::os_interface::capture_begin();
+        let result = nvidia_rm_sys::rm_init::step19(device_instance);
+        let captured = nvidia_rm_sys::os_interface::capture_take();
+        if let Some(log) = captured {
+            for line in log.lines() {
+                let _ = writeln!(s, "[gpustep19] | {}", line);
+            }
+        }
+        let phase = |st: u32| -> String {
+            match st {
+                0 => String::from("OK"),
+                0xFFFF_FFFF => String::from("not reached"),
+                0x65 => String::from("TIMEOUT (grid never released)"),
+                e => alloc::format!("FAILED NV_STATUS={:#x}", e),
+            }
+        };
+        match result {
+            Ok(c) => {
+                let _ = writeln!(s, "[gpustep19] --- first Eclipse-authored COMPUTE LAUNCH (QMD + SM75 kernel) ---");
+                let _ = writeln!(s, "[gpustep19] lookup (chan/buf/USERD):  {}", phase(c.lookup_status));
+                let _ = writeln!(s, "[gpustep19] CPU map (buf + USERD):    {}", phase(c.map_status));
+                let _ = writeln!(s, "[gpustep19] work-submit token:        {} (token={:#010x}, runlist={})", phase(c.token_status), c.work_token, c.runlist_id);
+                let _ = writeln!(s, "[gpustep19] QMD @ {:#x}, kernel @ {:#x}", c.qmd_va, c.kernel_va);
+                let _ = writeln!(s, "[gpustep19] launch ({} dw + SEND_PCAS + doorbell): {}", c.push_dwords, phase(c.submit_status));
+                let _ = writeln!(s, "[gpustep19] QMD RELEASE0 semaphore:   {} (value={:#010x}, {} ms)", phase(c.sem_status), c.sem_value, c.poll_iters);
+                if c.sem_status == 0 {
+                    let _ = writeln!(s, "[gpustep19] ============================================================");
+                    let _ = writeln!(s, "[gpustep19]  THE 34 SMs RAN OUR SASS KERNEL. Eclipse launched compute");
+                    let _ = writeln!(s, "[gpustep19]  on the TU106 and the grid completed. step20 = kernel that");
+                    let _ = writeln!(s, "[gpustep19]  stores a computed result to memory (params + STG).");
+                    let _ = writeln!(s, "[gpustep19] ============================================================");
+                } else if c.submit_status == 0 {
+                    let _ = writeln!(s, "[gpustep19] --- SEND_PCAS accepted but no RELEASE: QMD was taken by SKED, so the grid launched but the SM did not complete/release. Suspect the SASS kernel encoding or PROGRAM_ADDRESS; the RM/GSP capture above should carry any SM exception. ---");
+                }
+            }
+            Err(status) => {
+                let _ = writeln!(
+                    s,
+                    "[gpustep19] eclipse_rm_step19 FAILED, NV_STATUS={:#x} (run gpustep17 first in this boot; GPU state-loaded?)",
+                    status
+                );
+            }
+        }
+        s
+    }
+
     /// Step 2: instance block + GMMU flush — the first GPU register writes.
     /// TEMPORARY: the secondary (non-console) GPU has its own unrelated
     /// problems (USB breaks in Eclipse when it's made primary; likely never
