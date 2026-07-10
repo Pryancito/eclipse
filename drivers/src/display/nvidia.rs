@@ -3830,6 +3830,72 @@ impl DrmScheme for NvidiaGpu {
         s
     }
 
+    /// Step 21 (`/proc/gpustep21`): multi-thread computation — 32 threads
+    /// each compute out[tid] = tid*3+7 (S2R thread-ID with real write-
+    /// barrier scoreboarding, IMAD math, IMAD.WIDE per-thread addressing,
+    /// per-thread STG), CPU-verifies all 32 slots. Requires gpustep17.
+    fn bringup_step21(&self) -> String {
+        use core::fmt::Write;
+        let mut s = String::new();
+        let device_instance = *self.rm_device_instance.lock();
+        let Some(device_instance) = device_instance else {
+            return String::from(
+                "[gpustep21] skipped (bring the GPU up first, then gpustep16/17)\n",
+            );
+        };
+        nvidia_rm_sys::os_interface::capture_begin();
+        let result = nvidia_rm_sys::rm_init::step21(device_instance);
+        let captured = nvidia_rm_sys::os_interface::capture_take();
+        if let Some(log) = captured {
+            for line in log.lines() {
+                let _ = writeln!(s, "[gpustep21] | {}", line);
+            }
+        }
+        let phase = |st: u32| -> String {
+            match st {
+                0 => String::from("OK"),
+                0xFFFF_FFFF => String::from("not reached"),
+                0x65 => String::from("TIMEOUT"),
+                e => alloc::format!("FAILED NV_STATUS={:#x}", e),
+            }
+        };
+        match result {
+            Ok(c) => {
+                let _ = writeln!(s, "[gpustep21] --- 32-THREAD kernel: out[tid] = tid*3 + 7 ---");
+                let _ = writeln!(s, "[gpustep21] lookup / CPU map:         {} / {}", phase(c.lookup_status), phase(c.map_status));
+                let _ = writeln!(s, "[gpustep21] token:                    {} (token={:#010x}, runlist={})", phase(c.token_status), c.work_token, c.runlist_id);
+                let _ = writeln!(s, "[gpustep21] QMD @ {:#x}, kernel @ {:#x}, out[] @ {:#x}", c.qmd_va, c.kernel_va, c.out_va);
+                let _ = writeln!(s, "[gpustep21] launch ({} dw):            {}", c.push_dwords, phase(c.submit_status));
+                let _ = writeln!(s, "[gpustep21] post-PCAS host fence:     {} ({} ms)", phase(c.fence_status), c.fence_iters);
+                let _ = writeln!(s, "[gpustep21] QMD RELEASE0 semaphore:   {} ({} ms)", phase(c.sem_status), c.sem_iters);
+                let _ = writeln!(s, "[gpustep21] per-thread verification:  {} ({}/32 slots correct)", phase(c.verify_status), c.match_count);
+                if c.first_bad_idx != 0xFFFF_FFFF {
+                    let _ = writeln!(s, "[gpustep21] first mismatch: out[{}]={:#010x} (expected {:#x})", c.first_bad_idx, c.first_bad_val, 3 * c.first_bad_idx + 7);
+                }
+                if c.sem_status == 0 && c.verify_status == 0 {
+                    let _ = writeln!(s, "[gpustep21] ============================================================");
+                    let _ = writeln!(s, "[gpustep21]  32 THREADS, 32 CORRECT RESULTS: per-thread IDs, integer");
+                    let _ = writeln!(s, "[gpustep21]  math, per-thread addressing and stores, and real Volta");
+                    let _ = writeln!(s, "[gpustep21]  scoreboarding all verified. Eclipse now runs real");
+                    let _ = writeln!(s, "[gpustep21]  parallel compute on the TU106.");
+                    let _ = writeln!(s, "[gpustep21] ============================================================");
+                } else if c.sem_status == 0 {
+                    let _ = writeln!(s, "[gpustep21] --- grid completed but results are wrong: math/addressing path suspect (check first mismatch above) ---");
+                } else if c.fence_status == 0 {
+                    let _ = writeln!(s, "[gpustep21] --- methods consumed but grid never released: S2R/IMAD encoding or scoreboard suspect (SM trap) ---");
+                }
+            }
+            Err(status) => {
+                let _ = writeln!(
+                    s,
+                    "[gpustep21] eclipse_rm_step21 FAILED, NV_STATUS={:#x} (run gpustep17 first in this boot)",
+                    status
+                );
+            }
+        }
+        s
+    }
+
     /// Step 2: instance block + GMMU flush — the first GPU register writes.
     /// TEMPORARY: the secondary (non-console) GPU has its own unrelated
     /// problems (USB breaks in Eclipse when it's made primary; likely never
