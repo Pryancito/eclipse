@@ -2611,6 +2611,349 @@ report:
 }
 
 /*
+ * Step-20: the first kernel that COMPUTES for Eclipse -- stores a value we
+ * chose to an address we chose, from the SM. Same QMD/SEND_PCAS harness as
+ * the hardware-proven step19, new program:
+ *
+ *   MOV R2, dest_lo ; MOV R3, dest_hi ; MOV R5, value ;
+ *   STG.E.SYS [R2:R3], R5 ; EXIT ; (NOP pad)
+ *
+ * The destination VA and value are PATCHED into the instruction immediates
+ * at runtime (no constant-buffer plumbing needed for this rung). Encodings
+ * come from CuAssembler's sm_75 instruction repository -- a table solved
+ * from real nvdisasm output -- and the extraction convention was validated
+ * by reproducing our two hardware-proven pairs (EXIT 0x03800000/0x794d and
+ * NOP 0x7918) plus two solver instances each for MOV-imm and STG.E.SYS:
+ *   MOV Rd, imm32     low64 = imm<<32 | Rd<<16 | 0x7802, code-high 0xf00
+ *   STG.E.SYS [Ra],Rd low64 = Rd<<32 | Ra<<24 | 0x7386, code-high 0x0010e900
+ * Control words: quiet-NOP control with the stall field maxed (0x000fcf)
+ * on every ALU/store instruction, so no scoreboard/latency assumptions;
+ * EXIT/NOP keep their proven controls verbatim.
+ *
+ * Verification adds a third check beyond step19's fence + RELEASE0: after
+ * the grid releases, CPU-read the destination dword and compare. RELEASE0
+ * landing but the store missing would isolate a memory-path bug; both
+ * landing = the SM executed a program that computed an effect we observe.
+ */
+#define ECLIPSE_STORE_KERNEL_OFF   0x1200   /* keep step19's kernel intact */
+#define ECLIPSE_STORE_QMD_OFF      0x2100
+#define ECLIPSE_STORE_DEST_OFF     0x8100
+#define ECLIPSE_STORE_VALUE        0xEC0DE520
+#define ECLIPSE_STORE_SEM_OFF      0x8180
+#define ECLIPSE_STORE_SEM_PAYLOAD  0x5A55C0D2
+#define ECLIPSE_STORE_FENCE_OFF    0x81C0
+#define ECLIPSE_STORE_FENCE_PAYLOAD 0xFE7C4ED2
+
+/* SM75 store kernel template; immediates at dword indices 1 (dest lo),
+ * 5 (dest hi), 9 (value) are patched before submission. */
+static const NvU32 g_sm75StoreKernel[32] = {
+    0x00027802, 0xDEAD0000, 0x00000f00, 0x000fcf00, /* MOV R2, dest_lo   */
+    0x00037802, 0x00000000, 0x00000f00, 0x000fcf00, /* MOV R3, dest_hi   */
+    0x00057802, 0xEC0DE520, 0x00000f00, 0x000fcf00, /* MOV R5, value     */
+    0x02007386, 0x00000005, 0x0010e900, 0x000fcf00, /* STG.E.SYS [R2],R5 */
+    0x0000794d, 0x00000000, 0x03800000, 0x000fea00, /* EXIT              */
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* NOP               */
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* NOP               */
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* NOP               */
+};
+
+typedef struct EclipseGrStore
+{
+    NvU32 lookupStatus;
+    NvU32 mapStatus;
+    NvU32 tokenStatus;
+    NvU32 submitStatus;
+    NvU32 fenceStatus;
+    NvU32 semStatus;
+    NvU32 storeStatus;   /* NV_OK = dest dword == ECLIPSE_STORE_VALUE */
+    NvU32 workToken;
+    NvU32 runlistId;
+    NvU32 fenceValue;
+    NvU32 fenceIters;
+    NvU32 semValue;
+    NvU32 semIters;
+    NvU32 storeValue;    /* CPU readback of the kernel's destination */
+    NvU32 pushDwords;
+    NvU32 reservedPad;
+    NvU64 kernelVA;
+    NvU64 qmdVA;
+    NvU64 destVA;
+} EclipseGrStore;
+
+static EclipseGrStore g_grStoreCache;
+static NvBool g_grStoreDone = NV_FALSE;
+
+NV_STATUS eclipse_rm_step20(NvU32 gpuInstance, EclipseGrStore *pOut)
+{
+    OBJGPU *pGpu;
+    NV_STATUS status;
+    THREAD_STATE_NODE threadState;
+    RsClient *pRsClient = NULL;
+    KernelChannel *pKernelChannel = NULL;
+    KernelFifo *pKernelFifo;
+    MemoryManager *pMemoryManager;
+    Memory *pBufMemory = NULL;
+    MEMORY_DESCRIPTOR *pBufMemDesc = NULL;
+    MEMORY_DESCRIPTOR *pUserdMemDesc = NULL;
+    NvU8 *pBufCpu = NULL;
+    NvU8 *pUserdCpu = NULL;
+    NvU32 userdFlags = TRANSFER_FLAGS_USE_BAR1 |
+                       TRANSFER_FLAGS_SHADOW_ALLOC |
+                       TRANSFER_FLAGS_SHADOW_INIT_MEM;
+
+    if (pOut == NULL)
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    if (g_grStoreDone)
+    {
+        portMemCopy(pOut, sizeof(*pOut), &g_grStoreCache, sizeof(g_grStoreCache));
+        return NV_OK;
+    }
+    portMemSet(pOut, 0, sizeof(*pOut));
+    pOut->lookupStatus = 0xFFFFFFFF;
+    pOut->mapStatus    = 0xFFFFFFFF;
+    pOut->tokenStatus  = 0xFFFFFFFF;
+    pOut->submitStatus = 0xFFFFFFFF;
+    pOut->fenceStatus  = 0xFFFFFFFF;
+    pOut->semStatus    = 0xFFFFFFFF;
+    pOut->storeStatus  = 0xFFFFFFFF;
+
+    if (!g_grChanDone)
+    {
+        return NV_ERR_INVALID_STATE; /* run step17 first */
+    }
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    pGpu = gpumgrGetGpu(gpuInstance);
+    if (pGpu == NULL || !pGpu->gspRmInitialized)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
+    }
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    status = rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pKernelFifo = GPU_GET_KERNEL_FIFO(pGpu);
+    pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
+
+    /* 1. Locate channel/buffer/USERD. */
+    {
+        NvU32 subdevInst;
+        status = serverGetClientUnderLock(&g_resServ, g_grAllocCache.hClient, &pRsClient);
+        if (status == NV_OK)
+            status = CliGetKernelChannel(pRsClient, g_grChanCache.hChannel, &pKernelChannel);
+        if (status == NV_OK)
+            status = memGetByHandle(pRsClient, g_grChanCache.hPhysBuf, &pBufMemory);
+        if (status == NV_OK)
+        {
+            pBufMemDesc = pBufMemory->pMemDesc;
+            subdevInst = gpumgrGetSubDeviceInstanceFromGpu(pGpu);
+            pUserdMemDesc = pKernelChannel->pUserdSubDeviceMemDesc[subdevInst];
+            if (pBufMemDesc == NULL || pUserdMemDesc == NULL)
+                status = NV_ERR_INVALID_STATE;
+        }
+        pOut->lookupStatus = status;
+        nv_printf(0, "[eclipse-rm-trace] step20: lookup -> 0x%x\n", pOut->lookupStatus);
+        if (status != NV_OK) goto report;
+    }
+
+    /* 2. CPU maps. */
+    {
+        pBufCpu = memmgrMemDescBeginTransfer(pMemoryManager, pBufMemDesc, TRANSFER_FLAGS_NONE);
+        pUserdCpu = memmgrMemDescBeginTransfer(pMemoryManager, pUserdMemDesc, userdFlags);
+        pOut->mapStatus = (pBufCpu != NULL && pUserdCpu != NULL) ? NV_OK : NV_ERR_GENERIC;
+        nv_printf(0, "[eclipse-rm-trace] step20: CPU map -> 0x%x\n", pOut->mapStatus);
+        if (pOut->mapStatus != NV_OK) goto report;
+    }
+
+    pOut->kernelVA = g_grChanCache.bufGpuVA + ECLIPSE_STORE_KERNEL_OFF;
+    pOut->qmdVA    = g_grChanCache.bufGpuVA + ECLIPSE_STORE_QMD_OFF;
+    pOut->destVA   = g_grChanCache.bufGpuVA + ECLIPSE_STORE_DEST_OFF;
+
+    /* 3. Patch + write the kernel, build the QMD. */
+    {
+        NvU32 kern[32];
+        NvU32 *qmd = (NvU32 *)(pBufCpu + ECLIPSE_STORE_QMD_OFF);
+        NvU64 semVA = g_grChanCache.bufGpuVA + ECLIPSE_STORE_SEM_OFF;
+        portMemCopy(kern, sizeof(kern), g_sm75StoreKernel, sizeof(g_sm75StoreKernel));
+        kern[1] = NvU64_LO32(pOut->destVA);   /* MOV R2, dest_lo */
+        kern[5] = NvU64_HI32(pOut->destVA);   /* MOV R3, dest_hi */
+        kern[9] = ECLIPSE_STORE_VALUE;        /* MOV R5, value   */
+        portMemCopy(pBufCpu + ECLIPSE_STORE_KERNEL_OFF, sizeof(kern), kern, sizeof(kern));
+        /* Clear landing zones: dest, sem, fence. */
+        *(volatile NvU32 *)(pBufCpu + ECLIPSE_STORE_DEST_OFF) = 0;
+        *(volatile NvU32 *)(pBufCpu + ECLIPSE_STORE_SEM_OFF) = 0;
+        *(volatile NvU32 *)(pBufCpu + ECLIPSE_STORE_FENCE_OFF) = 0;
+
+        portMemSet(qmd, 0, 256);
+        QMD_SET(qmd, QMDF_QMD_MAJOR_VERSION, 2);
+        QMD_SET(qmd, QMDF_QMD_VERSION, 2);
+        QMD_SET(qmd, QMDF_API_VISIBLE_CALL_LIMIT, 1);
+        QMD_SET(qmd, QMDF_SAMPLER_INDEX, 0);
+        QMD_SET(qmd, QMDF_SM_GLOBAL_CACHING_ENABLE, 1);
+        QMD_SET(qmd, QMDF_CTA_RASTER_WIDTH, 1);
+        QMD_SET(qmd, QMDF_CTA_RASTER_HEIGHT, 1);
+        QMD_SET(qmd, QMDF_CTA_RASTER_DEPTH, 1);
+        QMD_SET(qmd, QMDF_CTA_THREAD_DIMENSION0, 32);
+        QMD_SET(qmd, QMDF_CTA_THREAD_DIMENSION1, 1);
+        QMD_SET(qmd, QMDF_CTA_THREAD_DIMENSION2, 1);
+        QMD_SET(qmd, QMDF_PROGRAM_ADDRESS_LOWER, (NvU32)(pOut->kernelVA & 0xFFFFFFFFu));
+        QMD_SET(qmd, QMDF_PROGRAM_ADDRESS_UPPER, (NvU32)(pOut->kernelVA >> 32));
+        QMD_SET(qmd, QMDF_REGISTER_COUNT_V, ECLIPSE_LAUNCH_REG_COUNT);
+        QMD_SET(qmd, QMDF_MIN_SM_CONFIG_SHMEM, 9);
+        QMD_SET(qmd, QMDF_TARGET_SM_CONFIG_SHMEM, 9);
+        QMD_SET(qmd, QMDF_MAX_SM_CONFIG_SHMEM, 17);
+        QMD_SET(qmd, QMDF_CWD_MEMBAR_TYPE, 1);
+        QMD_SET(qmd, QMDF_RELEASE_MEMBAR_TYPE, 1);
+        QMD_SET(qmd, QMDF_SEMAPHORE_RELEASE_ENABLE0, 1);
+        QMD_SET(qmd, QMDF_RELEASE0_ADDRESS_LOWER, (NvU32)(semVA & 0xFFFFFFFFu));
+        QMD_SET(qmd, QMDF_RELEASE0_ADDRESS_UPPER, (NvU32)(semVA >> 32));
+        QMD_SET(qmd, QMDF_RELEASE0_STRUCTURE_SIZE, 1);
+        QMD_SET(qmd, QMDF_RELEASE0_PAYLOAD, ECLIPSE_STORE_SEM_PAYLOAD);
+        osFlushCpuWriteCombineBuffer();
+    }
+
+    /* 4. Token. */
+    {
+        pOut->tokenStatus = kfifoGenerateWorkSubmitToken(pGpu, pKernelFifo,
+                                                         pKernelChannel,
+                                                         &pOut->workToken, NV_TRUE);
+        pOut->runlistId = kchannelGetRunlistId(pKernelChannel);
+        if (pOut->tokenStatus != NV_OK) goto report;
+    }
+
+    /* 5. Launch stream (step19 shape, step20 QMD) + fence. */
+    {
+        volatile NvU32 *pb = (volatile NvU32 *)pBufCpu;
+        volatile NvU32 *gp = (volatile NvU32 *)(pBufCpu + ECLIPSE_CHAN_GPFIFO_OFF);
+        volatile Nvc46fControl *pUserd = (volatile Nvc46fControl *)pUserdCpu;
+        NvU32 n = 0, put, gpEntry0, gpEntry1;
+        NvU64 pbVA = g_grChanCache.bufGpuVA;
+        NvU64 fenceVA = g_grChanCache.bufGpuVA + ECLIPSE_STORE_FENCE_OFF;
+
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_SET_OBJECT, 1);
+        pb[n++] = TURING_COMPUTE_A;
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_SET_SHADER_SHARED_MEMORY_WINDOW_A, 2);
+        pb[n++] = 0;
+        pb[n++] = 0xFE000000;
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_SET_SHADER_LOCAL_MEMORY_WINDOW_A, 2);
+        pb[n++] = 0;
+        pb[n++] = 0xFF000000;
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_INVALIDATE_SKED_CACHES, 1);
+        pb[n++] = 0;
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_SEND_PCAS_A, 1);
+        pb[n++] = (NvU32)(pOut->qmdVA >> 8);
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_SEND_SIGNALING_PCAS_B, 1);
+        pb[n++] = DRF_DEF(C5C0, _SEND_SIGNALING_PCAS_B, _INVALIDATE, _TRUE) |
+                  DRF_DEF(C5C0, _SEND_SIGNALING_PCAS_B, _SCHEDULE, _TRUE);
+        pb[n++] = ECLIPSE_PUSH_HDR(0, NVC46F_SEM_ADDR_LO, 5);
+        pb[n++] = NvU64_LO32(fenceVA);
+        pb[n++] = DRF_NUM(C46F, _SEM_ADDR_HI, _OFFSET, NvU64_HI32(fenceVA));
+        pb[n++] = ECLIPSE_STORE_FENCE_PAYLOAD;
+        pb[n++] = 0;
+        pb[n++] = DRF_DEF(C46F, _SEM_EXECUTE, _OPERATION, _RELEASE) |
+                  DRF_DEF(C46F, _SEM_EXECUTE, _RELEASE_WFI, _DIS) |
+                  DRF_DEF(C46F, _SEM_EXECUTE, _PAYLOAD_SIZE, _32BIT);
+        pOut->pushDwords = n;
+
+        put = pUserd->GPPut;
+        gpEntry0 = DRF_DEF(906F, _GP_ENTRY0, _NO_CONTEXT_SWITCH, _FALSE) |
+                   DRF_NUM(906F, _GP_ENTRY0, _GET, NvU64_LO32(pbVA) >> 2);
+        gpEntry1 = DRF_NUM(906F, _GP_ENTRY1, _GET_HI, NvU64_HI32(pbVA)) |
+                   DRF_NUM(906F, _GP_ENTRY1, _LENGTH, n) |
+                   DRF_DEF(906F, _GP_ENTRY1, _LEVEL, _MAIN);
+        gp[(put % ECLIPSE_CHAN_GPFIFO_ENTRIES) * 2 + 0] = gpEntry0;
+        gp[(put % ECLIPSE_CHAN_GPFIFO_ENTRIES) * 2 + 1] = gpEntry1;
+        osFlushCpuWriteCombineBuffer();
+
+        pUserd->GPPut = put + 1;
+        osFlushCpuWriteCombineBuffer();
+
+        status = kbusFlushPcieForBar0Doorbell_HAL(pGpu, GPU_GET_KERNEL_BUS(pGpu));
+        if (status == NV_OK)
+            status = kfifoUpdateUsermodeDoorbell_HAL(pGpu, pKernelFifo,
+                                                     pOut->workToken, pOut->runlistId);
+        pOut->submitStatus = status;
+        nv_printf(0, "[eclipse-rm-trace] step20: launch (%u dw, GPPut=%u) -> 0x%x qmd=0x%llx prog=0x%llx dest=0x%llx\n",
+                  n, put + 1, pOut->submitStatus, pOut->qmdVA, pOut->kernelVA, pOut->destVA);
+        if (status != NV_OK) goto report;
+    }
+
+    /* 6. Poll fence + RELEASE0, then read back the kernel's store. */
+    {
+        volatile NvU32 *pSem = (volatile NvU32 *)(pBufCpu + ECLIPSE_STORE_SEM_OFF);
+        volatile NvU32 *pFence = (volatile NvU32 *)(pBufCpu + ECLIPSE_STORE_FENCE_OFF);
+        volatile NvU32 *pDest = (volatile NvU32 *)(pBufCpu + ECLIPSE_STORE_DEST_OFF);
+        NvU32 i;
+        for (i = 0; i < ECLIPSE_LAUNCH_POLL_MS2; i++)
+        {
+            if (pOut->fenceStatus != NV_OK && *pFence == ECLIPSE_STORE_FENCE_PAYLOAD)
+            {
+                pOut->fenceStatus = NV_OK;
+                pOut->fenceIters = i;
+            }
+            if (pOut->semStatus != NV_OK && *pSem == ECLIPSE_STORE_SEM_PAYLOAD)
+            {
+                pOut->semStatus = NV_OK;
+                pOut->semIters = i;
+            }
+            if (pOut->fenceStatus == NV_OK && pOut->semStatus == NV_OK)
+                break;
+            os_delay_us(1000);
+        }
+        pOut->semValue = *pSem;
+        pOut->fenceValue = *pFence;
+        pOut->storeValue = *pDest;
+        if (pOut->fenceStatus != NV_OK) { pOut->fenceStatus = NV_ERR_TIMEOUT; pOut->fenceIters = i; }
+        if (pOut->semStatus != NV_OK)   { pOut->semStatus = NV_ERR_TIMEOUT;   pOut->semIters = i; }
+        pOut->storeStatus = (pOut->storeValue == ECLIPSE_STORE_VALUE)
+                                ? NV_OK : NV_ERR_INVALID_DATA;
+        nv_printf(0, "[eclipse-rm-trace] step20: fence 0x%x (@%u ms) sem 0x%x (@%u ms) store 0x%x (val=0x%x)\n",
+                  pOut->fenceStatus, pOut->fenceIters, pOut->semStatus, pOut->semIters,
+                  pOut->storeStatus, pOut->storeValue);
+    }
+
+report:
+    if (pBufCpu != NULL)
+        memmgrMemDescEndTransfer(pMemoryManager, pBufMemDesc, TRANSFER_FLAGS_NONE);
+    if (pUserdCpu != NULL)
+        memmgrMemDescEndTransfer(pMemoryManager, pUserdMemDesc, userdFlags);
+
+    if (pOut->semStatus == NV_OK && pOut->storeStatus == NV_OK)
+    {
+        portMemCopy(&g_grStoreCache, sizeof(g_grStoreCache), pOut, sizeof(*pOut));
+        g_grStoreDone = NV_TRUE;
+    }
+
+    rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
+    rmapiLockRelease();
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return NV_OK; /* per-stage statuses carry any failure */
+}
+
+/*
  * Step-9: the rest of the real RmInitAdapter device bring-up
  * (arch/nvalloc/unix/src/osinit.c, RmInitNvDevice), run after kgspInitRm
  * exactly like the Linux driver does:

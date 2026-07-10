@@ -3767,6 +3767,69 @@ impl DrmScheme for NvidiaGpu {
         s
     }
 
+    /// Step 20 (`/proc/gpustep20`): the first kernel that computes an
+    /// observable effect for Eclipse — MOV dest/value immediates (patched
+    /// into the SASS at runtime) + STG.E.SYS + EXIT on the proven step-19
+    /// QMD harness. Triple verification: post-PCAS fence, QMD RELEASE0,
+    /// and CPU readback of the stored dword. Requires gpustep17 first.
+    fn bringup_step20(&self) -> String {
+        use core::fmt::Write;
+        let mut s = String::new();
+        let device_instance = *self.rm_device_instance.lock();
+        let Some(device_instance) = device_instance else {
+            return String::from(
+                "[gpustep20] skipped (bring the GPU up first, then gpustep16/17)\n",
+            );
+        };
+        nvidia_rm_sys::os_interface::capture_begin();
+        let result = nvidia_rm_sys::rm_init::step20(device_instance);
+        let captured = nvidia_rm_sys::os_interface::capture_take();
+        if let Some(log) = captured {
+            for line in log.lines() {
+                let _ = writeln!(s, "[gpustep20] | {}", line);
+            }
+        }
+        let phase = |st: u32| -> String {
+            match st {
+                0 => String::from("OK"),
+                0xFFFF_FFFF => String::from("not reached"),
+                0x65 => String::from("TIMEOUT"),
+                e => alloc::format!("FAILED NV_STATUS={:#x}", e),
+            }
+        };
+        match result {
+            Ok(c) => {
+                let _ = writeln!(s, "[gpustep20] --- kernel STORE: GPU writes a value we chose to memory we chose ---");
+                let _ = writeln!(s, "[gpustep20] lookup / CPU map:         {} / {}", phase(c.lookup_status), phase(c.map_status));
+                let _ = writeln!(s, "[gpustep20] token:                    {} (token={:#010x}, runlist={})", phase(c.token_status), c.work_token, c.runlist_id);
+                let _ = writeln!(s, "[gpustep20] QMD @ {:#x}, kernel @ {:#x}, dest @ {:#x}", c.qmd_va, c.kernel_va, c.dest_va);
+                let _ = writeln!(s, "[gpustep20] launch ({} dw):            {}", c.push_dwords, phase(c.submit_status));
+                let _ = writeln!(s, "[gpustep20] post-PCAS host fence:     {} (value={:#010x}, {} ms)", phase(c.fence_status), c.fence_value, c.fence_iters);
+                let _ = writeln!(s, "[gpustep20] QMD RELEASE0 semaphore:   {} (value={:#010x}, {} ms)", phase(c.sem_status), c.sem_value, c.sem_iters);
+                let _ = writeln!(s, "[gpustep20] stored dword @ dest:      {} (value={:#010x}, expect 0xec0de520)", phase(c.store_status), c.store_value);
+                if c.sem_status == 0 && c.store_status == 0 {
+                    let _ = writeln!(s, "[gpustep20] ============================================================");
+                    let _ = writeln!(s, "[gpustep20]  THE GPU COMPUTED FOR ECLIPSE: our SASS ran on an SM and");
+                    let _ = writeln!(s, "[gpustep20]  stored our value at our address. MOV+STG+EXIT verified.");
+                    let _ = writeln!(s, "[gpustep20]  The compute bring-up ladder is COMPLETE.");
+                    let _ = writeln!(s, "[gpustep20] ============================================================");
+                } else if c.sem_status == 0 {
+                    let _ = writeln!(s, "[gpustep20] --- grid completed but the store is missing/wrong: STG encoding or GMMU write path suspect ---");
+                } else if c.fence_status == 0 {
+                    let _ = writeln!(s, "[gpustep20] --- methods consumed but grid never released: MOV/STG encoding suspect (SM trap); RELEASE0 did not land ---");
+                }
+            }
+            Err(status) => {
+                let _ = writeln!(
+                    s,
+                    "[gpustep20] eclipse_rm_step20 FAILED, NV_STATUS={:#x} (run gpustep17 first in this boot)",
+                    status
+                );
+            }
+        }
+        s
+    }
+
     /// Step 2: instance block + GMMU flush — the first GPU register writes.
     /// TEMPORARY: the secondary (non-console) GPU has its own unrelated
     /// problems (USB breaks in Eclipse when it's made primary; likely never
