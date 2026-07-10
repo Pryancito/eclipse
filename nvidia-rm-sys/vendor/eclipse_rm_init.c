@@ -2236,6 +2236,7 @@ report:
 /* Volta V02_02 QMD field positions (hi,lo), from open-gpu-doc clc3c0qmd.h. */
 #define QMDF_SM_GLOBAL_CACHING_ENABLE   134,134
 #define QMDF_SEMAPHORE_RELEASE_ENABLE0  138,138
+#define QMDF_RELEASE_MEMBAR_TYPE        366,366
 #define QMDF_CWD_MEMBAR_TYPE            369,368
 #define QMDF_API_VISIBLE_CALL_LIMIT     378,378
 #define QMDF_SAMPLER_INDEX              382,382
@@ -2271,9 +2272,16 @@ static void eclipse_qmd_set_field(NvU32 *qmd, NvU32 hi, NvU32 lo, NvU32 val)
 #define QMD_SET(q, field, val) eclipse_qmd_set_field((q), field, (val))
 
 /* Minimal Turing SM75 kernel: EXIT + NOP padding (128 B, one fetch block).
- * Operandless, invariant SM75 encodings (low64, then control high64). */
+ * Encodings are verbatim sm_75 cuobjdump/nvdisasm pairs (low qword, then
+ * high qword), dword order little-endian:
+ *   EXIT ;  0x000000000000794d / 0x000fea0003800000
+ *   NOP ;   0x0000000000007918 / 0x000fc00000000000
+ * First hardware run confirmed the harness end-to-end and timed out only
+ * on grid release -- the EXIT then lacked the 0x03800000 word (control-
+ * flow instructions carry it; a malformed EXIT = illegal instruction =
+ * trapped warp = grid never releases). */
 static const NvU32 g_sm75ExitKernel[32] = {
-    0x0000794d, 0x00000000, 0x00000000, 0x000fea00, /* EXIT */
+    0x0000794d, 0x00000000, 0x03800000, 0x000fea00, /* EXIT */
     0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* NOP  */
     0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* NOP  */
     0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* NOP  */
@@ -2287,6 +2295,8 @@ static const NvU32 g_sm75ExitKernel[32] = {
 #define ECLIPSE_LAUNCH_QMD_OFF     0x2000   /* QMD (256 B aligned for >>8)   */
 #define ECLIPSE_LAUNCH_QMD_SEM_OFF 0x8080   /* QMD RELEASE0 landing zone     */
 #define ECLIPSE_LAUNCH_QMD_PAYLOAD 0x5A55C0DE
+#define ECLIPSE_LAUNCH_FENCE_OFF   0x80C0   /* post-PCAS host-fence zone     */
+#define ECLIPSE_LAUNCH_FENCE_PAYLOAD 0xFE7C4ED0
 #define ECLIPSE_LAUNCH_REG_COUNT   16       /* >= kernel usage (0); granular */
 
 typedef struct EclipseGrCompute
@@ -2295,12 +2305,17 @@ typedef struct EclipseGrCompute
     NvU32 mapStatus;
     NvU32 tokenStatus;
     NvU32 submitStatus;
+    NvU32 fenceStatus;    /* NV_OK = host fence AFTER SEND_PCAS landed:
+                           * proves the PBDMA consumed the compute stream */
     NvU32 semStatus;      /* NV_OK = QMD RELEASE0 landed, else timeout */
     NvU32 workToken;
     NvU32 runlistId;
+    NvU32 fenceValue;
+    NvU32 fenceIters;
     NvU32 semValue;       /* CPU readback (expect ECLIPSE_LAUNCH_QMD_PAYLOAD) */
     NvU32 pollIters;      /* 1 ms units until seen */
     NvU32 pushDwords;
+    NvU32 reservedPad;    /* keep the NvU64s 8-byte aligned on both sides */
     NvU64 kernelVA;
     NvU64 qmdVA;
 } EclipseGrCompute;
@@ -2342,6 +2357,7 @@ NV_STATUS eclipse_rm_step19(NvU32 gpuInstance, EclipseGrCompute *pOut)
     pOut->mapStatus    = 0xFFFFFFFF;
     pOut->tokenStatus  = 0xFFFFFFFF;
     pOut->submitStatus = 0xFFFFFFFF;
+    pOut->fenceStatus  = 0xFFFFFFFF;
     pOut->semStatus    = 0xFFFFFFFF;
 
     if (!g_grChanDone)
@@ -2425,8 +2441,9 @@ NV_STATUS eclipse_rm_step19(NvU32 gpuInstance, EclipseGrCompute *pOut)
         portMemCopy(pBufCpu + ECLIPSE_LAUNCH_KERNEL_OFF, sizeof(g_sm75ExitKernel),
                     g_sm75ExitKernel, sizeof(g_sm75ExitKernel));
         portMemSet(qmd, 0, 256);
-        /* Clear the RELEASE landing zone. */
+        /* Clear the RELEASE and post-PCAS fence landing zones. */
         *(volatile NvU32 *)(pBufCpu + ECLIPSE_LAUNCH_QMD_SEM_OFF) = 0;
+        *(volatile NvU32 *)(pBufCpu + ECLIPSE_LAUNCH_FENCE_OFF) = 0;
 
         /* Constant init (NAK Qmd2_2::new). */
         QMD_SET(qmd, QMDF_QMD_MAJOR_VERSION, 2);
@@ -2451,6 +2468,7 @@ NV_STATUS eclipse_rm_step19(NvU32 gpuInstance, EclipseGrCompute *pOut)
         QMD_SET(qmd, QMDF_TARGET_SM_CONFIG_SHMEM, 9);
         QMD_SET(qmd, QMDF_MAX_SM_CONFIG_SHMEM, 17);
         QMD_SET(qmd, QMDF_CWD_MEMBAR_TYPE, 1);          /* L1_SYSMEMBAR */
+        QMD_SET(qmd, QMDF_RELEASE_MEMBAR_TYPE, 1);      /* FE_SYSMEMBAR */
         /* Completion semaphore: plain 1-word payload write on grid done. */
         QMD_SET(qmd, QMDF_SEMAPHORE_RELEASE_ENABLE0, 1);
         QMD_SET(qmd, QMDF_RELEASE0_ADDRESS_LOWER, (NvU32)(semVA & 0xFFFFFFFFu));
@@ -2496,6 +2514,20 @@ NV_STATUS eclipse_rm_step19(NvU32 gpuInstance, EclipseGrCompute *pOut)
         pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_SEND_SIGNALING_PCAS_B, 1);
         pb[n++] = DRF_DEF(C5C0, _SEND_SIGNALING_PCAS_B, _INVALIDATE, _TRUE) |
                   DRF_DEF(C5C0, _SEND_SIGNALING_PCAS_B, _SCHEDULE, _TRUE);
+        /* Host fence AFTER the PCAS methods: when this lands, the PBDMA
+         * definitively consumed the whole compute stream (removes the
+         * "did the methods even run?" ambiguity from grid-only timeouts). */
+        {
+            NvU64 fenceVA = g_grChanCache.bufGpuVA + ECLIPSE_LAUNCH_FENCE_OFF;
+            pb[n++] = ECLIPSE_PUSH_HDR(0, NVC46F_SEM_ADDR_LO, 5);
+            pb[n++] = NvU64_LO32(fenceVA);
+            pb[n++] = DRF_NUM(C46F, _SEM_ADDR_HI, _OFFSET, NvU64_HI32(fenceVA));
+            pb[n++] = ECLIPSE_LAUNCH_FENCE_PAYLOAD;
+            pb[n++] = 0;
+            pb[n++] = DRF_DEF(C46F, _SEM_EXECUTE, _OPERATION, _RELEASE) |
+                      DRF_DEF(C46F, _SEM_EXECUTE, _RELEASE_WFI, _DIS) |
+                      DRF_DEF(C46F, _SEM_EXECUTE, _PAYLOAD_SIZE, _32BIT);
+        }
         pOut->pushDwords = n;
 
         put = pUserd->GPPut;         /* continue the ring after step18 */
@@ -2521,27 +2553,41 @@ NV_STATUS eclipse_rm_step19(NvU32 gpuInstance, EclipseGrCompute *pOut)
         if (status != NV_OK) goto report;
     }
 
-    /* 6. CPU-poll the QMD RELEASE0 semaphore (grid completion). */
+    /* 6. CPU-poll the post-PCAS fence AND the QMD RELEASE0 semaphore. */
     {
         volatile NvU32 *pSem = (volatile NvU32 *)(pBufCpu + ECLIPSE_LAUNCH_QMD_SEM_OFF);
+        volatile NvU32 *pFence = (volatile NvU32 *)(pBufCpu + ECLIPSE_LAUNCH_FENCE_OFF);
         NvU32 i;
         for (i = 0; i < ECLIPSE_LAUNCH_POLL_MS2; i++)
         {
-            if (*pSem == ECLIPSE_LAUNCH_QMD_PAYLOAD)
+            if (pOut->fenceStatus != NV_OK && *pFence == ECLIPSE_LAUNCH_FENCE_PAYLOAD)
+            {
+                pOut->fenceStatus = NV_OK;
+                pOut->fenceIters = i;
+            }
+            if (pOut->semStatus != NV_OK && *pSem == ECLIPSE_LAUNCH_QMD_PAYLOAD)
             {
                 pOut->semStatus = NV_OK;
                 pOut->pollIters = i;
-                break;
             }
+            if (pOut->fenceStatus == NV_OK && pOut->semStatus == NV_OK)
+                break;
             os_delay_us(1000);
         }
         pOut->semValue = *pSem;
+        pOut->fenceValue = *pFence;
+        if (pOut->fenceStatus != NV_OK)
+        {
+            pOut->fenceStatus = NV_ERR_TIMEOUT;
+            pOut->fenceIters = i;
+        }
         if (pOut->semStatus != NV_OK)
         {
             pOut->semStatus = NV_ERR_TIMEOUT;
             pOut->pollIters = i;
         }
-        nv_printf(0, "[eclipse-rm-trace] step19: QMD release sem 0x%x (val=0x%x @%u ms)\n",
+        nv_printf(0, "[eclipse-rm-trace] step19: pcas fence 0x%x (val=0x%x @%u ms) QMD release sem 0x%x (val=0x%x @%u ms)\n",
+                  pOut->fenceStatus, pOut->fenceValue, pOut->fenceIters,
                   pOut->semStatus, pOut->semValue, pOut->pollIters);
     }
 
