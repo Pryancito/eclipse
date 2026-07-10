@@ -224,6 +224,14 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Bring-up **Step 19** (`/proc/gpustep19`): first real compute launch —
+    /// a Turing QMD pointing at a minimal SM75 kernel, submitted via
+    /// SEND_PCAS on the step-17/18 channel, verified by the QMD RELEASE0
+    /// semaphore. Idempotent once the semaphore lands. Default: nothing.
+    fn bringup_step19(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Read-only hardware-state dump (`/proc/gpudump`): the discriminating
     /// registers (display head liveness, VGA workspace, PMC, BSI, sysmem
     /// flush) for this GPU, with NO GSP boot -- zero wedge risk. Lets us

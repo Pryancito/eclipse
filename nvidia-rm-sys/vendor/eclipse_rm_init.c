@@ -2201,6 +2201,370 @@ report:
 }
 
 /*
+ * Step-19: the first real compute LAUNCH -- a minimal SASS kernel executing
+ * on the TU106 SMs, driven by a QMD we build and submit through the live
+ * step-17/18 channel. Everything before ran host/CE methods; this makes the
+ * Streaming Multiprocessors fetch and run instructions we authored.
+ *
+ * QMD layout: Turing (TURING_COMPUTE_A / C5C0) consumes the VOLTA QMD
+ * V02_02 (clc3c0 QMDV02_02), NOT the clc5c0 V02_03 header. Verified against
+ * mesa's NAK compiler, which runs on real Turing: nak_fill_qmd dispatches
+ * `cls_compute >= VOLTA_COMPUTE_A && < AMPERE_COMPUTE_A => Qmd2_2`
+ * (clc3c0 QMDV02_02). The field bit positions below are from NVIDIA's
+ * open-gpu-doc clc3c0qmd.h; the field VALUES and which-fields-to-set follow
+ * NAK's Qmd2_2::new()/fill_qmd (version=(2,2), API_VISIBLE_CALL_LIMIT=
+ * NO_CHECK, SAMPLER_INDEX=INDEPENDENTLY, SM_GLOBAL_CACHING_ENABLE=1, plus
+ * dims/prog-addr/register-count/smem-config). The launch method sequence
+ * (shared/local memory windows, SKED-cache invalidate, SEND_PCAS_A +
+ * SEND_SIGNALING_PCAS_B) follows nvk's nvk_push_dispatch_state_init /
+ * nvk_cmd_dispatch. QMD is 64 dwords (256 B), 256-B aligned for SEND_PCAS_A
+ * (qmd>>8).
+ *
+ * Kernel: the minimal Turing (SM75) program -- a single EXIT (operandless,
+ * invariant encoding) followed by NOP padding to a 128-B fetch block. It
+ * uses no registers, shared, local, or barriers; it launches, every lane
+ * hits EXIT, the CTA and 1x1x1 grid complete, and the QMD's RELEASE0
+ * semaphore is written to sysmem where we CPU-poll it. That write is proof
+ * the SMs ran OUR program. A store-from-kernel + params is step20.
+ *
+ * Diagnostics separate "QMD rejected by SKED" (submit path) from "grid
+ * launched but SM never released" (kernel/exec), so a single boot pinpoints
+ * whether anything is still off and, if so, whether it's the QMD or the
+ * SASS. Idempotent once the RELEASE semaphore lands.
+ */
+
+/* Volta V02_02 QMD field positions (hi,lo), from open-gpu-doc clc3c0qmd.h. */
+#define QMDF_SM_GLOBAL_CACHING_ENABLE   134,134
+#define QMDF_SEMAPHORE_RELEASE_ENABLE0  138,138
+#define QMDF_CWD_MEMBAR_TYPE            369,368
+#define QMDF_API_VISIBLE_CALL_LIMIT     378,378
+#define QMDF_SAMPLER_INDEX              382,382
+#define QMDF_CTA_RASTER_WIDTH           415,384
+#define QMDF_CTA_RASTER_HEIGHT          431,416
+#define QMDF_CTA_RASTER_DEPTH           463,448
+#define QMDF_MIN_SM_CONFIG_SHMEM        568,562
+#define QMDF_MAX_SM_CONFIG_SHMEM        575,569
+#define QMDF_QMD_VERSION                579,576
+#define QMDF_QMD_MAJOR_VERSION          583,580
+#define QMDF_CTA_THREAD_DIMENSION0      607,592
+#define QMDF_CTA_THREAD_DIMENSION1      623,608
+#define QMDF_CTA_THREAD_DIMENSION2      639,624
+#define QMDF_REGISTER_COUNT_V           656,648
+#define QMDF_TARGET_SM_CONFIG_SHMEM     663,657
+#define QMDF_RELEASE0_ADDRESS_LOWER     767,736
+#define QMDF_RELEASE0_ADDRESS_UPPER     775,768
+#define QMDF_RELEASE0_STRUCTURE_SIZE    799,799
+#define QMDF_RELEASE0_PAYLOAD           831,800
+#define QMDF_PROGRAM_ADDRESS_LOWER      1567,1536
+#define QMDF_PROGRAM_ADDRESS_UPPER      1584,1568
+
+/* Set bits [hi:lo] of the packed QMD to val (handles any range/crossing). */
+static void eclipse_qmd_set_field(NvU32 *qmd, NvU32 hi, NvU32 lo, NvU32 val)
+{
+    NvU32 b;
+    for (b = lo; b <= hi; b++)
+    {
+        NvU32 bit = (val >> (b - lo)) & 1u;
+        qmd[b >> 5] = (qmd[b >> 5] & ~(1u << (b & 31))) | (bit << (b & 31));
+    }
+}
+#define QMD_SET(q, field, val) eclipse_qmd_set_field((q), field, (val))
+
+/* Minimal Turing SM75 kernel: EXIT + NOP padding (128 B, one fetch block).
+ * Operandless, invariant SM75 encodings (low64, then control high64). */
+static const NvU32 g_sm75ExitKernel[32] = {
+    0x0000794d, 0x00000000, 0x00000000, 0x000fea00, /* EXIT */
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* NOP  */
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* NOP  */
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* NOP  */
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* NOP  */
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* NOP  */
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* NOP  */
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* NOP  */
+};
+
+#define ECLIPSE_LAUNCH_KERNEL_OFF  0x1000   /* SASS program (>=0x80 aligned) */
+#define ECLIPSE_LAUNCH_QMD_OFF     0x2000   /* QMD (256 B aligned for >>8)   */
+#define ECLIPSE_LAUNCH_QMD_SEM_OFF 0x8080   /* QMD RELEASE0 landing zone     */
+#define ECLIPSE_LAUNCH_QMD_PAYLOAD 0x5A55C0DE
+#define ECLIPSE_LAUNCH_REG_COUNT   16       /* >= kernel usage (0); granular */
+
+typedef struct EclipseGrCompute
+{
+    NvU32 lookupStatus;
+    NvU32 mapStatus;
+    NvU32 tokenStatus;
+    NvU32 submitStatus;
+    NvU32 semStatus;      /* NV_OK = QMD RELEASE0 landed, else timeout */
+    NvU32 workToken;
+    NvU32 runlistId;
+    NvU32 semValue;       /* CPU readback (expect ECLIPSE_LAUNCH_QMD_PAYLOAD) */
+    NvU32 pollIters;      /* 1 ms units until seen */
+    NvU32 pushDwords;
+    NvU64 kernelVA;
+    NvU64 qmdVA;
+} EclipseGrCompute;
+
+static EclipseGrCompute g_grComputeCache;
+static NvBool g_grComputeDone = NV_FALSE;
+
+#define ECLIPSE_LAUNCH_POLL_MS2 3000
+
+NV_STATUS eclipse_rm_step19(NvU32 gpuInstance, EclipseGrCompute *pOut)
+{
+    OBJGPU *pGpu;
+    NV_STATUS status;
+    THREAD_STATE_NODE threadState;
+    RsClient *pRsClient = NULL;
+    KernelChannel *pKernelChannel = NULL;
+    KernelFifo *pKernelFifo;
+    MemoryManager *pMemoryManager;
+    Memory *pBufMemory = NULL;
+    MEMORY_DESCRIPTOR *pBufMemDesc = NULL;
+    MEMORY_DESCRIPTOR *pUserdMemDesc = NULL;
+    NvU8 *pBufCpu = NULL;
+    NvU8 *pUserdCpu = NULL;
+    NvU32 userdFlags = TRANSFER_FLAGS_USE_BAR1 |
+                       TRANSFER_FLAGS_SHADOW_ALLOC |
+                       TRANSFER_FLAGS_SHADOW_INIT_MEM;
+
+    if (pOut == NULL)
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    if (g_grComputeDone)
+    {
+        portMemCopy(pOut, sizeof(*pOut), &g_grComputeCache, sizeof(g_grComputeCache));
+        return NV_OK;
+    }
+    portMemSet(pOut, 0, sizeof(*pOut));
+    pOut->lookupStatus = 0xFFFFFFFF;
+    pOut->mapStatus    = 0xFFFFFFFF;
+    pOut->tokenStatus  = 0xFFFFFFFF;
+    pOut->submitStatus = 0xFFFFFFFF;
+    pOut->semStatus    = 0xFFFFFFFF;
+
+    if (!g_grChanDone)
+    {
+        return NV_ERR_INVALID_STATE; /* run step17 first */
+    }
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    pGpu = gpumgrGetGpu(gpuInstance);
+    if (pGpu == NULL || !pGpu->gspRmInitialized)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
+    }
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    /* GPU lock: same as step18 -- we CPU-map the vidmem USERD via the FB
+     * aperture, which asserts rmDeviceGpuLockIsOwner. */
+    status = rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pKernelFifo = GPU_GET_KERNEL_FIFO(pGpu);
+    pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
+
+    /* 1. Locate the live channel + buffer + USERD (step-17 handles). */
+    {
+        NvU32 subdevInst;
+        status = serverGetClientUnderLock(&g_resServ, g_grAllocCache.hClient, &pRsClient);
+        if (status == NV_OK)
+            status = CliGetKernelChannel(pRsClient, g_grChanCache.hChannel, &pKernelChannel);
+        if (status == NV_OK)
+            status = memGetByHandle(pRsClient, g_grChanCache.hPhysBuf, &pBufMemory);
+        if (status == NV_OK)
+        {
+            pBufMemDesc = pBufMemory->pMemDesc;
+            subdevInst = gpumgrGetSubDeviceInstanceFromGpu(pGpu);
+            pUserdMemDesc = pKernelChannel->pUserdSubDeviceMemDesc[subdevInst];
+            if (pBufMemDesc == NULL || pUserdMemDesc == NULL)
+                status = NV_ERR_INVALID_STATE;
+        }
+        pOut->lookupStatus = status;
+        nv_printf(0, "[eclipse-rm-trace] step19: lookup -> 0x%x\n", pOut->lookupStatus);
+        if (status != NV_OK) goto report;
+    }
+
+    /* 2. CPU-map channel buffer (sysmem) + USERD (BAR1). */
+    {
+        pBufCpu = memmgrMemDescBeginTransfer(pMemoryManager, pBufMemDesc, TRANSFER_FLAGS_NONE);
+        pUserdCpu = memmgrMemDescBeginTransfer(pMemoryManager, pUserdMemDesc, userdFlags);
+        pOut->mapStatus = (pBufCpu != NULL && pUserdCpu != NULL) ? NV_OK : NV_ERR_GENERIC;
+        nv_printf(0, "[eclipse-rm-trace] step19: CPU map buf=%s userd=%s -> 0x%x\n",
+                  pBufCpu ? "ok" : "NULL", pUserdCpu ? "ok" : "NULL", pOut->mapStatus);
+        if (pOut->mapStatus != NV_OK) goto report;
+    }
+
+    pOut->kernelVA = g_grChanCache.bufGpuVA + ECLIPSE_LAUNCH_KERNEL_OFF;
+    pOut->qmdVA    = g_grChanCache.bufGpuVA + ECLIPSE_LAUNCH_QMD_OFF;
+
+    /* 3. Write the SASS kernel and build the QMD in the channel buffer. */
+    {
+        NvU32 *qmd = (NvU32 *)(pBufCpu + ECLIPSE_LAUNCH_QMD_OFF);
+        NvU64 semVA = g_grChanCache.bufGpuVA + ECLIPSE_LAUNCH_QMD_SEM_OFF;
+        portMemCopy(pBufCpu + ECLIPSE_LAUNCH_KERNEL_OFF, sizeof(g_sm75ExitKernel),
+                    g_sm75ExitKernel, sizeof(g_sm75ExitKernel));
+        portMemSet(qmd, 0, 256);
+        /* Clear the RELEASE landing zone. */
+        *(volatile NvU32 *)(pBufCpu + ECLIPSE_LAUNCH_QMD_SEM_OFF) = 0;
+
+        /* Constant init (NAK Qmd2_2::new). */
+        QMD_SET(qmd, QMDF_QMD_MAJOR_VERSION, 2);
+        QMD_SET(qmd, QMDF_QMD_VERSION, 2);
+        QMD_SET(qmd, QMDF_API_VISIBLE_CALL_LIMIT, 1);   /* NO_CHECK */
+        QMD_SET(qmd, QMDF_SAMPLER_INDEX, 0);            /* INDEPENDENTLY */
+        QMD_SET(qmd, QMDF_SM_GLOBAL_CACHING_ENABLE, 1);
+        /* Grid 1x1x1, block 32x1x1 (one warp). */
+        QMD_SET(qmd, QMDF_CTA_RASTER_WIDTH, 1);
+        QMD_SET(qmd, QMDF_CTA_RASTER_HEIGHT, 1);
+        QMD_SET(qmd, QMDF_CTA_RASTER_DEPTH, 1);
+        QMD_SET(qmd, QMDF_CTA_THREAD_DIMENSION0, 32);
+        QMD_SET(qmd, QMDF_CTA_THREAD_DIMENSION1, 1);
+        QMD_SET(qmd, QMDF_CTA_THREAD_DIMENSION2, 1);
+        /* Program address (raw VA, no shift). */
+        QMD_SET(qmd, QMDF_PROGRAM_ADDRESS_LOWER, (NvU32)(pOut->kernelVA & 0xFFFFFFFFu));
+        QMD_SET(qmd, QMDF_PROGRAM_ADDRESS_UPPER, (NvU32)(pOut->kernelVA >> 32));
+        QMD_SET(qmd, QMDF_REGISTER_COUNT_V, ECLIPSE_LAUNCH_REG_COUNT);
+        /* Shared-mem config for TU106 (carveouts {32,64} KiB, 0 requested):
+         * min=target=32KiB=hw9, max=64KiB=hw17 (NAK gv100_smem_size_to_hw). */
+        QMD_SET(qmd, QMDF_MIN_SM_CONFIG_SHMEM, 9);
+        QMD_SET(qmd, QMDF_TARGET_SM_CONFIG_SHMEM, 9);
+        QMD_SET(qmd, QMDF_MAX_SM_CONFIG_SHMEM, 17);
+        QMD_SET(qmd, QMDF_CWD_MEMBAR_TYPE, 1);          /* L1_SYSMEMBAR */
+        /* Completion semaphore: plain 1-word payload write on grid done. */
+        QMD_SET(qmd, QMDF_SEMAPHORE_RELEASE_ENABLE0, 1);
+        QMD_SET(qmd, QMDF_RELEASE0_ADDRESS_LOWER, (NvU32)(semVA & 0xFFFFFFFFu));
+        QMD_SET(qmd, QMDF_RELEASE0_ADDRESS_UPPER, (NvU32)(semVA >> 32));
+        QMD_SET(qmd, QMDF_RELEASE0_STRUCTURE_SIZE, 1);  /* ONE_WORD */
+        QMD_SET(qmd, QMDF_RELEASE0_PAYLOAD, ECLIPSE_LAUNCH_QMD_PAYLOAD);
+        osFlushCpuWriteCombineBuffer();
+    }
+
+    /* 4. Work-submit token (same channel as step18). */
+    {
+        pOut->tokenStatus = kfifoGenerateWorkSubmitToken(pGpu, pKernelFifo,
+                                                         pKernelChannel,
+                                                         &pOut->workToken, NV_TRUE);
+        pOut->runlistId = kchannelGetRunlistId(pKernelChannel);
+        nv_printf(0, "[eclipse-rm-trace] step19: token -> 0x%x token=0x%x runlist=%u\n",
+                  pOut->tokenStatus, pOut->workToken, pOut->runlistId);
+        if (pOut->tokenStatus != NV_OK) goto report;
+    }
+
+    /* 5. Compute launch method stream + GP entry + GPPut + doorbell. */
+    {
+        volatile NvU32 *pb = (volatile NvU32 *)pBufCpu; /* pushbuffer @ +0 */
+        volatile NvU32 *gp = (volatile NvU32 *)(pBufCpu + ECLIPSE_CHAN_GPFIFO_OFF);
+        volatile Nvc46fControl *pUserd = (volatile Nvc46fControl *)pUserdCpu;
+        NvU32 n = 0, put, gpEntry0, gpEntry1;
+        NvU64 pbVA = g_grChanCache.bufGpuVA;
+
+        /* Bind compute on subch 1, set shader windows, invalidate SKED,
+         * then SEND_PCAS + SEND_SIGNALING_PCAS (nvk dispatch sequence). */
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_SET_OBJECT, 1);
+        pb[n++] = TURING_COMPUTE_A;
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_SET_SHADER_SHARED_MEMORY_WINDOW_A, 2);
+        pb[n++] = 0;                 /* WINDOW_A: base>>32 = 0 */
+        pb[n++] = 0xFE000000;        /* WINDOW_B: 0xfe << 24   */
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_SET_SHADER_LOCAL_MEMORY_WINDOW_A, 2);
+        pb[n++] = 0;
+        pb[n++] = 0xFF000000;        /* 0xff << 24 */
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_INVALIDATE_SKED_CACHES, 1);
+        pb[n++] = 0;
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_SEND_PCAS_A, 1);
+        pb[n++] = (NvU32)(pOut->qmdVA >> 8);
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_SEND_SIGNALING_PCAS_B, 1);
+        pb[n++] = DRF_DEF(C5C0, _SEND_SIGNALING_PCAS_B, _INVALIDATE, _TRUE) |
+                  DRF_DEF(C5C0, _SEND_SIGNALING_PCAS_B, _SCHEDULE, _TRUE);
+        pOut->pushDwords = n;
+
+        put = pUserd->GPPut;         /* continue the ring after step18 */
+        gpEntry0 = DRF_DEF(906F, _GP_ENTRY0, _NO_CONTEXT_SWITCH, _FALSE) |
+                   DRF_NUM(906F, _GP_ENTRY0, _GET, NvU64_LO32(pbVA) >> 2);
+        gpEntry1 = DRF_NUM(906F, _GP_ENTRY1, _GET_HI, NvU64_HI32(pbVA)) |
+                   DRF_NUM(906F, _GP_ENTRY1, _LENGTH, n) |
+                   DRF_DEF(906F, _GP_ENTRY1, _LEVEL, _MAIN);
+        gp[(put % ECLIPSE_CHAN_GPFIFO_ENTRIES) * 2 + 0] = gpEntry0;
+        gp[(put % ECLIPSE_CHAN_GPFIFO_ENTRIES) * 2 + 1] = gpEntry1;
+        osFlushCpuWriteCombineBuffer();
+
+        pUserd->GPPut = put + 1;
+        osFlushCpuWriteCombineBuffer();
+
+        status = kbusFlushPcieForBar0Doorbell_HAL(pGpu, GPU_GET_KERNEL_BUS(pGpu));
+        if (status == NV_OK)
+            status = kfifoUpdateUsermodeDoorbell_HAL(pGpu, pKernelFifo,
+                                                     pOut->workToken, pOut->runlistId);
+        pOut->submitStatus = status;
+        nv_printf(0, "[eclipse-rm-trace] step19: launch (%u dw, GPPut=%u, doorbell) -> 0x%x qmd=0x%llx prog=0x%llx\n",
+                  n, put + 1, pOut->submitStatus, pOut->qmdVA, pOut->kernelVA);
+        if (status != NV_OK) goto report;
+    }
+
+    /* 6. CPU-poll the QMD RELEASE0 semaphore (grid completion). */
+    {
+        volatile NvU32 *pSem = (volatile NvU32 *)(pBufCpu + ECLIPSE_LAUNCH_QMD_SEM_OFF);
+        NvU32 i;
+        for (i = 0; i < ECLIPSE_LAUNCH_POLL_MS2; i++)
+        {
+            if (*pSem == ECLIPSE_LAUNCH_QMD_PAYLOAD)
+            {
+                pOut->semStatus = NV_OK;
+                pOut->pollIters = i;
+                break;
+            }
+            os_delay_us(1000);
+        }
+        pOut->semValue = *pSem;
+        if (pOut->semStatus != NV_OK)
+        {
+            pOut->semStatus = NV_ERR_TIMEOUT;
+            pOut->pollIters = i;
+        }
+        nv_printf(0, "[eclipse-rm-trace] step19: QMD release sem 0x%x (val=0x%x @%u ms)\n",
+                  pOut->semStatus, pOut->semValue, pOut->pollIters);
+    }
+
+report:
+    if (pBufCpu != NULL)
+        memmgrMemDescEndTransfer(pMemoryManager, pBufMemDesc, TRANSFER_FLAGS_NONE);
+    if (pUserdCpu != NULL)
+        memmgrMemDescEndTransfer(pMemoryManager, pUserdMemDesc, userdFlags);
+
+    if (pOut->semStatus == NV_OK)
+    {
+        portMemCopy(&g_grComputeCache, sizeof(g_grComputeCache), pOut, sizeof(*pOut));
+        g_grComputeDone = NV_TRUE;
+    }
+
+    rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
+    rmapiLockRelease();
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return NV_OK; /* per-stage statuses carry any failure */
+}
+
+/*
  * Step-9: the rest of the real RmInitAdapter device bring-up
  * (arch/nvalloc/unix/src/osinit.c, RmInitNvDevice), run after kgspInitRm
  * exactly like the Linux driver does:
