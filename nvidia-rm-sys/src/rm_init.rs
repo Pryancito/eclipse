@@ -536,6 +536,69 @@ pub fn step20(device_instance: u32) -> Result<GrStore, NV_STATUS> {
     }
 }
 
+/// Mirror of `EclipseGrThreads` (vendor/eclipse_rm_init.c): step-21, the
+/// multi-thread kernel — 32 threads each compute out[tid] = tid*3+7 with
+/// real scoreboarding (S2R + IMAD + IMAD.WIDE + STG), CPU-verified per slot.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GrThreads {
+    pub lookup_status: NvU32,
+    pub map_status: NvU32,
+    pub token_status: NvU32,
+    pub submit_status: NvU32,
+    pub fence_status: NvU32,
+    pub sem_status: NvU32,
+    pub verify_status: NvU32,
+    pub work_token: NvU32,
+    pub runlist_id: NvU32,
+    pub fence_iters: NvU32,
+    pub sem_iters: NvU32,
+    pub match_count: NvU32,
+    pub first_bad_idx: NvU32,
+    pub first_bad_val: NvU32,
+    pub push_dwords: NvU32,
+    pub reserved_pad: NvU32,
+    pub kernel_va: u64,
+    pub qmd_va: u64,
+    pub out_va: u64,
+}
+
+extern "C" {
+    fn eclipse_rm_step21(device_instance: NvU32, out: *mut GrThreads) -> NV_STATUS;
+}
+
+/// Runs step-21: 32-thread compute kernel with per-thread verification.
+/// Idempotent once RELEASE0 lands and all 32 slots verify.
+pub fn step21(device_instance: u32) -> Result<GrThreads, NV_STATUS> {
+    let mut out = GrThreads {
+        lookup_status: 0xFFFF_FFFF,
+        map_status: 0xFFFF_FFFF,
+        token_status: 0xFFFF_FFFF,
+        submit_status: 0xFFFF_FFFF,
+        fence_status: 0xFFFF_FFFF,
+        sem_status: 0xFFFF_FFFF,
+        verify_status: 0xFFFF_FFFF,
+        work_token: 0,
+        runlist_id: 0,
+        fence_iters: 0,
+        sem_iters: 0,
+        match_count: 0,
+        first_bad_idx: 0xFFFF_FFFF,
+        first_bad_val: 0,
+        push_dwords: 0,
+        reserved_pad: 0,
+        kernel_va: 0,
+        qmd_va: 0,
+        out_va: 0,
+    };
+    let status = unsafe { eclipse_rm_step21(device_instance, &mut out) };
+    if status == NV_OK {
+        Ok(out)
+    } else {
+        Err(status)
+    }
+}
+
 /// Fetches the GSP-reported interrupt kernel table (boxed: ~2 KiB).
 pub fn intr_table(device_instance: u32) -> Result<alloc::boxed::Box<IntrTable>, NV_STATUS> {
     let mut out = alloc::boxed::Box::new(IntrTable {

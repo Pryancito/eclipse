@@ -240,6 +240,13 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Bring-up **Step 21** (`/proc/gpustep21`): 32-thread kernel
+    /// (out[tid] = tid*3+7) with per-thread CPU verification of all 32
+    /// slots. Idempotent once release+verify pass. Default: nothing.
+    fn bringup_step21(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Read-only hardware-state dump (`/proc/gpudump`): the discriminating
     /// registers (display head liveness, VGA workspace, PMC, BSI, sysmem
     /// flush) for this GPU, with NO GSP boot -- zero wedge risk. Lets us
