@@ -3742,6 +3742,7 @@ impl DrmScheme for NvidiaGpu {
                 let _ = writeln!(s, "[gpustep19] work-submit token:        {} (token={:#010x}, runlist={})", phase(c.token_status), c.work_token, c.runlist_id);
                 let _ = writeln!(s, "[gpustep19] QMD @ {:#x}, kernel @ {:#x}", c.qmd_va, c.kernel_va);
                 let _ = writeln!(s, "[gpustep19] launch ({} dw + SEND_PCAS + doorbell): {}", c.push_dwords, phase(c.submit_status));
+                let _ = writeln!(s, "[gpustep19] post-PCAS host fence:     {} (value={:#010x}, {} ms)", phase(c.fence_status), c.fence_value, c.fence_iters);
                 let _ = writeln!(s, "[gpustep19] QMD RELEASE0 semaphore:   {} (value={:#010x}, {} ms)", phase(c.sem_status), c.sem_value, c.poll_iters);
                 if c.sem_status == 0 {
                     let _ = writeln!(s, "[gpustep19] ============================================================");
@@ -3749,8 +3750,10 @@ impl DrmScheme for NvidiaGpu {
                     let _ = writeln!(s, "[gpustep19]  on the TU106 and the grid completed. step20 = kernel that");
                     let _ = writeln!(s, "[gpustep19]  stores a computed result to memory (params + STG).");
                     let _ = writeln!(s, "[gpustep19] ============================================================");
+                } else if c.fence_status == 0 {
+                    let _ = writeln!(s, "[gpustep19] --- PBDMA consumed the whole compute stream (fence landed) but the grid never released: QMD scheduling or SM execution is stuck. The RM/GSP capture above should carry any SM exception. ---");
                 } else if c.submit_status == 0 {
-                    let _ = writeln!(s, "[gpustep19] --- SEND_PCAS accepted but no RELEASE: QMD was taken by SKED, so the grid launched but the SM did not complete/release. Suspect the SASS kernel encoding or PROGRAM_ADDRESS; the RM/GSP capture above should carry any SM exception. ---");
+                    let _ = writeln!(s, "[gpustep19] --- doorbell rung but the post-PCAS fence never landed: the PBDMA did not consume the compute stream (channel faulted on an earlier method?). ---");
                 }
             }
             Err(status) => {
