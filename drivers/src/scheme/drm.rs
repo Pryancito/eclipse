@@ -232,6 +232,14 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Bring-up **Step 20** (`/proc/gpustep20`): kernel that stores a chosen
+    /// value to a chosen VA (patched immediates + STG.E.SYS + EXIT), triple
+    /// verified (fence, RELEASE0, CPU readback of the stored dword).
+    /// Idempotent once release+store verify. Default: nothing.
+    fn bringup_step20(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Read-only hardware-state dump (`/proc/gpudump`): the discriminating
     /// registers (display head liveness, VGA workspace, PMC, BSI, sysmem
     /// flush) for this GPU, with NO GSP boot -- zero wedge risk. Lets us

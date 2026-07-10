@@ -14,12 +14,12 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 33] = [
+const PROC_ROOT_STATIC: [&str; 34] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
     "perf", "hunter", "filesystems", "gpudbg", "gpustep2", "gpustep3", "gpustep4", "gpustep5",
     "gpustep6", "gpustep7", "gpustep8", "gpustep9", "gpustep10", "gpustep11", "gpustep12",
     "gpustep13", "gpustep14", "gpustep15", "gpustep16", "gpustep17", "gpustep18", "gpustep19",
-    "gpudump",
+    "gpustep20", "gpudump",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -309,6 +309,7 @@ impl INode for ProcRootINode {
             "gpustep17" => Ok(PROC_GPUSTEP17.clone()),
             "gpustep18" => Ok(PROC_GPUSTEP18.clone()),
             "gpustep19" => Ok(PROC_GPUSTEP19.clone()),
+            "gpustep20" => Ok(PROC_GPUSTEP20.clone()),
             "gpudump" => Ok(PROC_GPUDUMP.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
@@ -1341,6 +1342,19 @@ fn proc_gpustep19_content() -> String {
     s
 }
 
+/// `/proc/gpustep20` — kernel store: patched-immediate MOV+STG+EXIT on the
+/// step-19 harness with triple verification. Idempotent once verified.
+fn proc_gpustep20_content() -> String {
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.bringup_step20());
+    }
+    if s.is_empty() {
+        s.push_str("[gpustep20] no DRM driver with bring-up support\n");
+    }
+    s
+}
+
 /// `/proc/gpudump` — read-only discriminating hardware dump for every NVIDIA
 /// GPU (console + secondary): display head liveness, VGA workspace base, PMC,
 /// BSI scratch, sysmem flush. NO GSP boot -> ZERO wedge risk. Read this first
@@ -1660,6 +1674,12 @@ lazy_static! {
     static ref PROC_GPUSTEP19: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 79,
         generate: proc_gpustep19_content,
+    });
+    /// `/proc/gpustep20` -- kernel store, triple verified (see
+    /// proc_gpustep20_content).
+    static ref PROC_GPUSTEP20: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 78,
+        generate: proc_gpustep20_content,
     });
     /// `/proc/gpudump` -- read-only discriminating HW dump, both GPUs (see
     /// proc_gpudump_content).

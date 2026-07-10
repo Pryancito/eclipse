@@ -471,6 +471,71 @@ pub fn step19(device_instance: u32) -> Result<GrCompute, NV_STATUS> {
     }
 }
 
+/// Mirror of `EclipseGrStore` (vendor/eclipse_rm_init.c): step-20, a kernel
+/// that stores a chosen value to a chosen VA from the SM (immediates patched
+/// into the SASS), triple-verified: post-PCAS fence, QMD RELEASE0, and a CPU
+/// readback of the destination dword.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GrStore {
+    pub lookup_status: NvU32,
+    pub map_status: NvU32,
+    pub token_status: NvU32,
+    pub submit_status: NvU32,
+    pub fence_status: NvU32,
+    pub sem_status: NvU32,
+    pub store_status: NvU32,
+    pub work_token: NvU32,
+    pub runlist_id: NvU32,
+    pub fence_value: NvU32,
+    pub fence_iters: NvU32,
+    pub sem_value: NvU32,
+    pub sem_iters: NvU32,
+    pub store_value: NvU32,
+    pub push_dwords: NvU32,
+    pub reserved_pad: NvU32,
+    pub kernel_va: u64,
+    pub qmd_va: u64,
+    pub dest_va: u64,
+}
+
+extern "C" {
+    fn eclipse_rm_step20(device_instance: NvU32, out: *mut GrStore) -> NV_STATUS;
+}
+
+/// Runs step-20: MOV/MOV/MOV/STG.E.SYS/EXIT kernel with runtime-patched
+/// immediates on the proven step-19 QMD harness. Idempotent once the
+/// RELEASE0 semaphore AND the stored value verify.
+pub fn step20(device_instance: u32) -> Result<GrStore, NV_STATUS> {
+    let mut out = GrStore {
+        lookup_status: 0xFFFF_FFFF,
+        map_status: 0xFFFF_FFFF,
+        token_status: 0xFFFF_FFFF,
+        submit_status: 0xFFFF_FFFF,
+        fence_status: 0xFFFF_FFFF,
+        sem_status: 0xFFFF_FFFF,
+        store_status: 0xFFFF_FFFF,
+        work_token: 0,
+        runlist_id: 0,
+        fence_value: 0,
+        fence_iters: 0,
+        sem_value: 0,
+        sem_iters: 0,
+        store_value: 0,
+        push_dwords: 0,
+        reserved_pad: 0,
+        kernel_va: 0,
+        qmd_va: 0,
+        dest_va: 0,
+    };
+    let status = unsafe { eclipse_rm_step20(device_instance, &mut out) };
+    if status == NV_OK {
+        Ok(out)
+    } else {
+        Err(status)
+    }
+}
+
 /// Fetches the GSP-reported interrupt kernel table (boxed: ~2 KiB).
 pub fn intr_table(device_instance: u32) -> Result<alloc::boxed::Box<IntrTable>, NV_STATUS> {
     let mut out = alloc::boxed::Box::new(IntrTable {
