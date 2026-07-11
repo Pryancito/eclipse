@@ -14,12 +14,12 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 35] = [
+const PROC_ROOT_STATIC: [&str; 36] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
     "perf", "hunter", "filesystems", "gpudbg", "gpustep2", "gpustep3", "gpustep4", "gpustep5",
     "gpustep6", "gpustep7", "gpustep8", "gpustep9", "gpustep10", "gpustep11", "gpustep12",
     "gpustep13", "gpustep14", "gpustep15", "gpustep16", "gpustep17", "gpustep18", "gpustep19",
-    "gpustep20", "gpustep21", "gpudump",
+    "gpustep20", "gpustep21", "gpustep22", "gpudump",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -311,6 +311,7 @@ impl INode for ProcRootINode {
             "gpustep19" => Ok(PROC_GPUSTEP19.clone()),
             "gpustep20" => Ok(PROC_GPUSTEP20.clone()),
             "gpustep21" => Ok(PROC_GPUSTEP21.clone()),
+            "gpustep22" => Ok(PROC_GPUSTEP22.clone()),
             "gpudump" => Ok(PROC_GPUDUMP.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
@@ -1368,6 +1369,18 @@ fn proc_gpustep21_content() -> String {
     s
 }
 
+/// `/proc/gpustep22` — chip-scale grid (68 CTAs / 2176 threads), verified.
+fn proc_gpustep22_content() -> String {
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.bringup_step22());
+    }
+    if s.is_empty() {
+        s.push_str("[gpustep22] no DRM driver with bring-up support\n");
+    }
+    s
+}
+
 /// `/proc/gpudump` — read-only discriminating hardware dump for every NVIDIA
 /// GPU (console + secondary): display head liveness, VGA workspace base, PMC,
 /// BSI scratch, sysmem flush. NO GSP boot -> ZERO wedge risk. Read this first
@@ -1699,6 +1712,12 @@ lazy_static! {
     static ref PROC_GPUSTEP21: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 77,
         generate: proc_gpustep21_content,
+    });
+    /// `/proc/gpustep22` -- chip-scale grid, verified (see
+    /// proc_gpustep22_content).
+    static ref PROC_GPUSTEP22: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 76,
+        generate: proc_gpustep22_content,
     });
     /// `/proc/gpudump` -- read-only discriminating HW dump, both GPUs (see
     /// proc_gpudump_content).
