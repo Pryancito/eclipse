@@ -599,6 +599,43 @@ pub fn step21(device_instance: u32) -> Result<GrThreads, NV_STATUS> {
     }
 }
 
+extern "C" {
+    fn eclipse_rm_step22(device_instance: NvU32, out: *mut GrThreads) -> NV_STATUS;
+}
+
+/// Runs step-22: chip-scale grid — 68 CTAs x 32 threads (2176 threads over
+/// all 34 SMs), out[gid] = gid*3+7, CPU-verified per slot. Same result
+/// shape as step-21. Idempotent once RELEASE0 + all 2176 slots verify.
+pub fn step22(device_instance: u32) -> Result<GrThreads, NV_STATUS> {
+    let mut out = GrThreads {
+        lookup_status: 0xFFFF_FFFF,
+        map_status: 0xFFFF_FFFF,
+        token_status: 0xFFFF_FFFF,
+        submit_status: 0xFFFF_FFFF,
+        fence_status: 0xFFFF_FFFF,
+        sem_status: 0xFFFF_FFFF,
+        verify_status: 0xFFFF_FFFF,
+        work_token: 0,
+        runlist_id: 0,
+        fence_iters: 0,
+        sem_iters: 0,
+        match_count: 0,
+        first_bad_idx: 0xFFFF_FFFF,
+        first_bad_val: 0,
+        push_dwords: 0,
+        reserved_pad: 0,
+        kernel_va: 0,
+        qmd_va: 0,
+        out_va: 0,
+    };
+    let status = unsafe { eclipse_rm_step22(device_instance, &mut out) };
+    if status == NV_OK {
+        Ok(out)
+    } else {
+        Err(status)
+    }
+}
+
 /// Fetches the GSP-reported interrupt kernel table (boxed: ~2 KiB).
 pub fn intr_table(device_instance: u32) -> Result<alloc::boxed::Box<IntrTable>, NV_STATUS> {
     let mut out = alloc::boxed::Box::new(IntrTable {

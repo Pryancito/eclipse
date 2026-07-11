@@ -247,6 +247,13 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Bring-up **Step 22** (`/proc/gpustep22`): chip-scale grid — 68 CTAs
+    /// x 32 threads across all 34 SMs, out[gid] = gid*3+7, all 2176 slots
+    /// CPU-verified. Idempotent once release+verify pass. Default: nothing.
+    fn bringup_step22(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Read-only hardware-state dump (`/proc/gpudump`): the discriminating
     /// registers (display head liveness, VGA workspace, PMC, BSI, sysmem
     /// flush) for this GPU, with NO GSP boot -- zero wedge risk. Lets us

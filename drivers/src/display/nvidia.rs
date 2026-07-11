@@ -3896,6 +3896,70 @@ impl DrmScheme for NvidiaGpu {
         s
     }
 
+    /// Step 22 (`/proc/gpustep22`): chip-scale grid — 68 CTAs x 32 threads
+    /// = 2176 threads across all 34 SMs (two waves), out[gid] = gid*3+7
+    /// with gid = ctaid*32 + tid, all 2176 slots CPU-verified.
+    fn bringup_step22(&self) -> String {
+        use core::fmt::Write;
+        let mut s = String::new();
+        let device_instance = *self.rm_device_instance.lock();
+        let Some(device_instance) = device_instance else {
+            return String::from(
+                "[gpustep22] skipped (bring the GPU up first, then gpustep16/17)\n",
+            );
+        };
+        nvidia_rm_sys::os_interface::capture_begin();
+        let result = nvidia_rm_sys::rm_init::step22(device_instance);
+        let captured = nvidia_rm_sys::os_interface::capture_take();
+        if let Some(log) = captured {
+            for line in log.lines() {
+                let _ = writeln!(s, "[gpustep22] | {}", line);
+            }
+        }
+        let phase = |st: u32| -> String {
+            match st {
+                0 => String::from("OK"),
+                0xFFFF_FFFF => String::from("not reached"),
+                0x65 => String::from("TIMEOUT"),
+                e => alloc::format!("FAILED NV_STATUS={:#x}", e),
+            }
+        };
+        match result {
+            Ok(c) => {
+                let _ = writeln!(s, "[gpustep22] --- CHIP-SCALE grid: 68 CTAs x 32 threads over all 34 SMs ---");
+                let _ = writeln!(s, "[gpustep22] lookup / CPU map:         {} / {}", phase(c.lookup_status), phase(c.map_status));
+                let _ = writeln!(s, "[gpustep22] token:                    {} (token={:#010x}, runlist={})", phase(c.token_status), c.work_token, c.runlist_id);
+                let _ = writeln!(s, "[gpustep22] QMD @ {:#x}, kernel @ {:#x}, out[] @ {:#x}", c.qmd_va, c.kernel_va, c.out_va);
+                let _ = writeln!(s, "[gpustep22] launch ({} dw):            {}", c.push_dwords, phase(c.submit_status));
+                let _ = writeln!(s, "[gpustep22] post-PCAS host fence:     {} ({} ms)", phase(c.fence_status), c.fence_iters);
+                let _ = writeln!(s, "[gpustep22] QMD RELEASE0 semaphore:   {} ({} ms)", phase(c.sem_status), c.sem_iters);
+                let _ = writeln!(s, "[gpustep22] per-thread verification:  {} ({}/2176 slots correct)", phase(c.verify_status), c.match_count);
+                if c.first_bad_idx != 0xFFFF_FFFF {
+                    let _ = writeln!(s, "[gpustep22] first mismatch: out[{}]={:#010x} (expected {:#x})", c.first_bad_idx, c.first_bad_val, 3 * c.first_bad_idx + 7);
+                }
+                if c.sem_status == 0 && c.verify_status == 0 {
+                    let _ = writeln!(s, "[gpustep22] ============================================================");
+                    let _ = writeln!(s, "[gpustep22]  2176 THREADS, 68 CTAs, ALL 34 SMs: the whole TU106 chip");
+                    let _ = writeln!(s, "[gpustep22]  computed for Eclipse in one dispatch and every result");
+                    let _ = writeln!(s, "[gpustep22]  verified. Chip-scale parallel compute is proven.");
+                    let _ = writeln!(s, "[gpustep22] ============================================================");
+                } else if c.sem_status == 0 {
+                    let _ = writeln!(s, "[gpustep22] --- grid completed but results wrong (check first mismatch: CTA scheduling/addressing suspect) ---");
+                } else if c.fence_status == 0 {
+                    let _ = writeln!(s, "[gpustep22] --- methods consumed but grid never released: multi-CTA dispatch suspect ---");
+                }
+            }
+            Err(status) => {
+                let _ = writeln!(
+                    s,
+                    "[gpustep22] eclipse_rm_step22 FAILED, NV_STATUS={:#x} (run gpustep17 first in this boot)",
+                    status
+                );
+            }
+        }
+        s
+    }
+
     /// Step 2: instance block + GMMU flush — the first GPU register writes.
     /// TEMPORARY: the secondary (non-console) GPU has its own unrelated
     /// problems (USB breaks in Eclipse when it's made primary; likely never
