@@ -3678,40 +3678,35 @@ report:
 #define ECLIPSE_SAXPY_FENCE_OFF  0x8440
 #define ECLIPSE_SAXPY_FENCE_PAYLOAD 0xFE7C4ED5
 
-/* SM75 SAXPY -- DIAGNOSTIC variant, 24 instructions. It also stores the
- * loaded x and y back to dbgx[tid]/dbgy[tid] so the CPU can see exactly
- * what the GPU's LDG returned (isolates load-data vs compute/store).
- * Patched immediates at dword indices 5 (a), 9/13 (x lo/hi),
- * 17/21 (y lo/hi), 25/29 (dbgx lo/hi), 33/37 (dbgy lo/hi).
+/* SM75 -- MINIMAL LOAD DIAGNOSTIC, 10 instructions + NOP pad. Pure
+ * load-passthrough: dbgx[tid] = x[tid], with conservative scheduling
+ * (stall 6 between dependent instructions) so a scoreboard slip can't
+ * mask the real question: does LDG return the data the CPU wrote?
+ * x[] is CPU-seeded with a distinctive 0x12340000|tid pattern.
+ *   dbgx[tid]==0x1234000i -> LDG works AND CPU->GPU coherence works
+ *   dbgx[tid]==0          -> LDG returns zero (coherence or encoding)
+ *   dbgx[tid]==0xD00D00.. -> kernel trapped before the store
+ * Patched immediates at dword indices 5 (x_lo), 9 (x_hi),
+ * 21 (dbgx_lo), 25 (dbgx_hi).
  *   S2R R0,SR_TID.X (wr0)
- *   MOV R4,a; MOV R2:R3,x; MOV R6:R7,y; MOV R10:R11,dbgx; MOV R12:R13,dbgy
- *   IMAD.WIDE R2,R0,4,R2 / R6 / R10 / R12  (each waits wr0)   per-thread addrs
- *   LDG.E.SYS R8,[R2] (wr1) ; LDG.E.SYS R9,[R6] (wr2)
- *   STG.E.SYS [R10],R8 (wait wr1)   dbgx = loaded x
- *   STG.E.SYS [R12],R9 (wait wr2)   dbgy = loaded y
- *   IMAD R8,R8,R4,R9 (wait wr1+wr2) ; STG.E.SYS [R6],R8 ; EXIT ; NOP pad */
-static const NvU32 g_sm75SaxpyKernel[96] = {
-    0x00007919, 0x00000000, 0x00002100, 0x000e0200,
-    0x00047802, 0x0000000A, 0x00000f00, 0x000fc400,
+ *   MOV R2,x_lo ; MOV R3,x_hi ; IMAD.WIDE R2,R0,4,R2 (wait wr0)
+ *   LDG.E.SYS R8,[R2] (wr1)
+ *   MOV R6,dbgx_lo ; MOV R7,dbgx_hi ; IMAD.WIDE R6,R0,4,R6 (wait wr0)
+ *   STG.E.SYS [R6],R8 (wait wr1) ; EXIT ; NOP pad                     */
+static const NvU32 g_sm75SaxpyKernel[64] = {
+    0x00007919, 0x00000000, 0x00002100, 0x000e0400,
     0x00027802, 0xBBBB0000, 0x00000f00, 0x000fc400,
     0x00037802, 0x00000000, 0x00000f00, 0x000fc400,
-    0x00067802, 0xCCCC0000, 0x00000f00, 0x000fc400,
-    0x00077802, 0x00000000, 0x00000f00, 0x000fc400,
-    0x000a7802, 0xDDDD0000, 0x00000f00, 0x000fc400,
-    0x000b7802, 0x00000000, 0x00000f00, 0x000fc400,
-    0x000c7802, 0xEEEE0000, 0x00000f00, 0x000fc400,
-    0x000d7802, 0x00000000, 0x00000f00, 0x000fc400,
-    0x00027825, 0x00000004, 0x078e0002, 0x001fc400,
-    0x00067825, 0x00000004, 0x078e0006, 0x001fc400,
-    0x000a7825, 0x00000004, 0x078e000a, 0x001fc400,
-    0x000c7825, 0x00000004, 0x078e000c, 0x001fc800,
+    0x00027825, 0x00000004, 0x078e0002, 0x001fcc00,
     0x02087381, 0x00000000, 0x001ee900, 0x000e4400,
-    0x06097381, 0x00000000, 0x001ee900, 0x000e8400,
-    0x0a007386, 0x00000008, 0x0010e900, 0x002fc400,
-    0x0c007386, 0x00000009, 0x0010e900, 0x004fc400,
-    0x08087224, 0x00000004, 0x078e0209, 0x006fc800,
-    0x06007386, 0x00000008, 0x0010e900, 0x000fc400,
+    0x00067802, 0xDDDD0000, 0x00000f00, 0x000fc400,
+    0x00077802, 0x00000000, 0x00000f00, 0x000fc400,
+    0x00067825, 0x00000004, 0x078e0006, 0x001fcc00,
+    0x06007386, 0x00000008, 0x0010e900, 0x002fcc00,
     0x0000794d, 0x00000000, 0x03800000, 0x000fea00,
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000,
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000,
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000,
     0x00007918, 0x00000000, 0x00000000, 0x000fc000,
     0x00007918, 0x00000000, 0x00000000, 0x000fc000,
     0x00007918, 0x00000000, 0x00000000, 0x000fc000,
@@ -3841,18 +3836,15 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
         volatile NvU32 *pdx = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF);
         volatile NvU32 *pdy = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGY_OFF);
         NvU32 i;
-        for (i = 0; i < 32; i++) { px[i] = i; py[i] = 100u + i; pdx[i] = 0xD00D0000u | i; pdy[i] = 0xD00D0000u | i; }
+        (void)yVA; (void)dyVA; (void)pdy;
+        /* x seeded with a distinctive pattern so a correct load is unmistakable. */
+        for (i = 0; i < 32; i++) { px[i] = 0x12340000u | i; py[i] = 100u + i; pdx[i] = 0xD00D0000u | i; pdy[i] = 0xD00D0000u | i; }
 
         portMemCopy(kern, sizeof(kern), g_sm75SaxpyKernel, sizeof(g_sm75SaxpyKernel));
-        kern[5]  = ECLIPSE_SAXPY_A;
-        kern[9]  = NvU64_LO32(xVA);
-        kern[13] = NvU64_HI32(xVA);
-        kern[17] = NvU64_LO32(yVA);
-        kern[21] = NvU64_HI32(yVA);
-        kern[25] = NvU64_LO32(dxVA);
-        kern[29] = NvU64_HI32(dxVA);
-        kern[33] = NvU64_LO32(dyVA);
-        kern[37] = NvU64_HI32(dyVA);
+        kern[5]  = NvU64_LO32(xVA);    /* MOV R2, x_lo   */
+        kern[9]  = NvU64_HI32(xVA);    /* MOV R3, x_hi   */
+        kern[21] = NvU64_LO32(dxVA);   /* MOV R6, dbgx_lo */
+        kern[25] = NvU64_HI32(dxVA);   /* MOV R7, dbgx_hi */
         portMemCopy(pBufCpu + ECLIPSE_SAXPY_KERNEL_OFF, sizeof(kern), kern, sizeof(kern));
         *(volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_SEM_OFF) = 0;
         *(volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_FENCE_OFF) = 0;
@@ -3978,33 +3970,35 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
         if (pOut->semStatus != NV_OK)   { pOut->semStatus = NV_ERR_TIMEOUT;   pOut->semIters = i; }
 
         pOut->matchCount = 0;
-        for (i = 0; i < 32; i++)
         {
-            NvU32 v = pY[i];
-            if (v == (NvU32)ECLIPSE_SAXPY_A * i + (100u + i))
+            volatile NvU32 *pdx = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF);
+            for (i = 0; i < 32; i++)
             {
-                pOut->matchCount++;
-            }
-            else if (pOut->firstBadIdx == 0xFFFFFFFF)
-            {
-                pOut->firstBadIdx = i;
-                pOut->firstBadVal = v;
+                NvU32 v = pdx[i];   /* what the GPU loaded from x[i] and stored */
+                if (v == (0x12340000u | i))
+                {
+                    pOut->matchCount++;
+                }
+                else if (pOut->firstBadIdx == 0xFFFFFFFF)
+                {
+                    pOut->firstBadIdx = i;
+                    pOut->firstBadVal = v;
+                }
             }
         }
         pOut->verifyStatus = (pOut->matchCount == 32) ? NV_OK : NV_ERR_INVALID_DATA;
-        nv_printf(0, "[eclipse-rm-trace] step23: fence 0x%x (@%u ms) sem 0x%x (@%u ms) verify 0x%x (%u/32, firstBad=%u val=0x%x)\n",
-                  pOut->fenceStatus, pOut->fenceIters, pOut->semStatus, pOut->semIters,
-                  pOut->verifyStatus, pOut->matchCount, pOut->firstBadIdx, pOut->firstBadVal);
+        (void)pY;
         {
             volatile NvU32 *pdx = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF);
-            volatile NvU32 *pdy = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGY_OFF);
             volatile NvU32 *px  = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_X_OFF);
-            volatile NvU32 *py  = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_Y_OFF);
-            nv_printf(0, "[eclipse-rm-trace] step23 DIAG: cpu x[0..2]={%u,%u,%u} y[0..2]={%u,%u,%u}\n",
-                      px[0], px[1], px[2], py[0], py[1], py[2]);
-            nv_printf(0, "[eclipse-rm-trace] step23 DIAG: gpu-loaded dbgx[0..3]={0x%x,0x%x,0x%x,0x%x} dbgy[0..3]={0x%x,0x%x,0x%x,0x%x}\n",
-                      pdx[0], pdx[1], pdx[2], pdx[3], pdy[0], pdy[1], pdy[2], pdy[3]);
-            nv_printf(0, "[eclipse-rm-trace] step23 DIAG: (dbgx should be tid=0,1,2,3; dbgy should be 100,101,102,103; 0xD00D.. = kernel never stored)\n");
+            nv_printf(0, "[eclipse-rm-trace] step23: fence 0x%x (@%u ms) sem 0x%x (@%u ms) LOAD-verify 0x%x (%u/32 dbgx==pattern)\n",
+                      pOut->fenceStatus, pOut->fenceIters, pOut->semStatus, pOut->semIters,
+                      pOut->verifyStatus, pOut->matchCount);
+            nv_printf(0, "[eclipse-rm-trace] step23 DIAG: cpu-wrote x[0..3]={0x%x,0x%x,0x%x,0x%x}\n",
+                      px[0], px[1], px[2], px[3]);
+            nv_printf(0, "[eclipse-rm-trace] step23 DIAG: gpu-loaded dbgx[0..3]={0x%x,0x%x,0x%x,0x%x}\n",
+                      pdx[0], pdx[1], pdx[2], pdx[3]);
+            nv_printf(0, "[eclipse-rm-trace] step23 DIAG: want 0x12340000|i; ==0 -> LDG reads zero; ==0xD00D.. -> kernel trapped pre-store\n");
         }
     }
 
