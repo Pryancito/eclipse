@@ -2236,6 +2236,12 @@ report:
 /* Volta V02_02 QMD field positions (hi,lo), from open-gpu-doc clc3c0qmd.h. */
 #define QMDF_SM_GLOBAL_CACHING_ENABLE   134,134
 #define QMDF_SEMAPHORE_RELEASE_ENABLE0  138,138
+#define QMDF_INVAL_TEX_HEADER_CACHE     186,186
+#define QMDF_INVAL_TEX_SAMPLER_CACHE    187,187
+#define QMDF_INVAL_TEX_DATA_CACHE       188,188
+#define QMDF_INVAL_SHADER_DATA_CACHE    189,189
+#define QMDF_INVAL_INSTRUCTION_CACHE    190,190
+#define QMDF_INVAL_SHADER_CONST_CACHE   191,191
 #define QMDF_RELEASE_MEMBAR_TYPE        366,366
 #define QMDF_CWD_MEMBAR_TYPE            369,368
 #define QMDF_API_VISIBLE_CALL_LIMIT     378,378
@@ -3678,40 +3684,43 @@ report:
 #define ECLIPSE_SAXPY_FENCE_OFF  0x8440
 #define ECLIPSE_SAXPY_FENCE_PAYLOAD 0xFE7C4ED5
 
-/* SM75 -- MINIMAL LOAD DIAGNOSTIC, 10 instructions + NOP pad. Pure
- * load-passthrough: dbgx[tid] = x[tid], with conservative scheduling
- * (stall 6 between dependent instructions) so a scoreboard slip can't
- * mask the real question: does LDG return the data the CPU wrote?
- * x[] is CPU-seeded with a distinctive 0x12340000|tid pattern.
- *   dbgx[tid]==0x1234000i -> LDG works AND CPU->GPU coherence works
- *   dbgx[tid]==0          -> LDG returns zero (coherence or encoding)
- *   dbgx[tid]==0xD00D00.. -> kernel trapped before the store
- *
- * ROOT-CAUSE FIX vs the first two failing runs: the load is now
- * LDG.E.STRONG.SYS (hi-code 0x1f6900), bit-exact against the corpus
- * instance "LDG.E.STRONG.SYS R28,[R30]" = 0x1e1c7381/0x1f6900. The
- * earlier 0x1ee900 was an INTERPOLATED B32+weak+SYS combination that
- * appears NOWHERE in the 3672-record sm_75 corpus (weak-SYS exists only
- * for U16/S16/128 there) -- an unobserved order/scope combo, matching
- * the erratic behavior seen on silicon (zeros once, hang once).
- *
- * Patched immediates at dword indices 5 (x_lo), 9 (x_hi),
- * 21 (dbgx_lo), 25 (dbgx_hi).
- *   S2R R0,SR_TID.X (wr0)
- *   MOV R2,x_lo ; MOV R3,x_hi ; IMAD.WIDE R2,R0,4,R2 (wait wr0)
- *   LDG.E.STRONG.SYS R8,[R2] (wr1)
- *   MOV R6,dbgx_lo ; MOV R7,dbgx_hi ; IMAD.WIDE R6,R0,4,R6 (wait wr0)
- *   STG.E.SYS [R6],R8 (wait wr1) ; EXIT ; NOP pad                     */
-static const NvU32 g_sm75SaxpyKernel[64] = {
+/* SM75 -- THREE-EXPERIMENT LOAD BATTERY, 18 instructions + NOP pad.
+ * Hardware so far: weak load "completes" with zeros, STRONG load hangs,
+ * while SM ifetch, SM stores (same page!), and PBDMA/SKED reads all work.
+ * That asymmetry singles out the L1TEX *data* path -- the one consumer
+ * of the texture/L1 data cache, which we have NEVER invalidated on this
+ * virgin GR context. This QMD now sets all six INVALIDATE_*_CACHE bits
+ * (MW 186..191, official clc3c0qmd.h positions -- CUDA sets these
+ * routinely) and the kernel runs three independent load experiments,
+ * each storing to its own sentinel-seeded dbg slot so one photo shows
+ * exactly how far execution got and what each load returned:
+ *   exp1 dbg0[tid]: LDG.E.STRONG.SYS of the KERNEL'S OWN first dword
+ *        (ifetch-proven page; expect 0x00007919)
+ *   exp2 dbg1[tid]: LDG.E.STRONG.SYS of x[tid] (expect 0x12340000|tid)
+ *   exp3 dbg2[tid]: LDG.E.CONSTANT.SYS of x[tid] (corpus 0x1e6900)
+ * Sentinels: dbg0 0xD00D...., dbg1 0xD11D...., dbg2 0xD22D.....
+ * All forms corpus-verbatim; IADD3 Rd,Ra,imm,RZ validated against
+ * "IADD3 R7, R4, 0x20, RZ" = 0x04077810/0x07ffe0ff.
+ * Patched immediates at dword indices 5/9 (dbg base lo/hi),
+ * 17/21 (kernel VA lo/hi), 33/37 (x lo/hi).                            */
+static const NvU32 g_sm75SaxpyKernel[96] = {
     0x00007919, 0x00000000, 0x00002100, 0x000e0400,
-    0x00027802, 0xBBBB0000, 0x00000f00, 0x000fc400,
-    0x00037802, 0x00000000, 0x00000f00, 0x000fc400,
-    0x00027825, 0x00000004, 0x078e0002, 0x001fcc00,
-    0x02087381, 0x00000000, 0x001f6900, 0x000e4400,
-    0x00067802, 0xDDDD0000, 0x00000f00, 0x000fc400,
+    0x00067802, 0x00000000, 0x00000f00, 0x000fc400,
     0x00077802, 0x00000000, 0x00000f00, 0x000fc400,
     0x00067825, 0x00000004, 0x078e0006, 0x001fcc00,
-    0x06007386, 0x00000008, 0x0010e900, 0x002fcc00,
+    0x00047802, 0x00000000, 0x00000f00, 0x000fc400,
+    0x00057802, 0x00000000, 0x00000f00, 0x000fc400,
+    0x040c7381, 0x00000000, 0x001f6900, 0x000e4400,
+    0x06007386, 0x0000000c, 0x0010e900, 0x002fcc00,
+    0x00027802, 0x00000000, 0x00000f00, 0x000fc400,
+    0x00037802, 0x00000000, 0x00000f00, 0x000fc400,
+    0x00027825, 0x00000004, 0x078e0002, 0x001fcc00,
+    0x02087381, 0x00000000, 0x001f6900, 0x000e8400,
+    0x06067810, 0x00000080, 0x07ffe0ff, 0x000fcc00,
+    0x06007386, 0x00000008, 0x0010e900, 0x004fcc00,
+    0x02097381, 0x00000000, 0x001e6900, 0x000ec400,
+    0x06067810, 0x00000080, 0x07ffe0ff, 0x000fcc00,
+    0x06007386, 0x00000009, 0x0010e900, 0x008fcc00,
     0x0000794d, 0x00000000, 0x03800000, 0x000fea00,
     0x00007918, 0x00000000, 0x00000000, 0x000fc000,
     0x00007918, 0x00000000, 0x00000000, 0x000fc000,
@@ -3845,15 +3854,25 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
         volatile NvU32 *pdx = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF);
         volatile NvU32 *pdy = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGY_OFF);
         NvU32 i;
-        (void)yVA; (void)dyVA; (void)pdy;
-        /* x seeded with a distinctive pattern so a correct load is unmistakable. */
-        for (i = 0; i < 32; i++) { px[i] = 0x12340000u | i; py[i] = 100u + i; pdx[i] = 0xD00D0000u | i; pdy[i] = 0xD00D0000u | i; }
+        (void)yVA; (void)dyVA;
+        /* x seeded with a distinctive pattern; three dbg slots (0x80 apart)
+         * each carry their own sentinel family. */
+        for (i = 0; i < 32; i++)
+        {
+            px[i] = 0x12340000u | i;
+            py[i] = 100u + i;
+            pdx[i] = 0xD00D0000u | i;          /* dbg0 @ +0x5200 */
+            pdx[32 + i] = 0xD11D0000u | i;     /* dbg1 @ +0x5280 */
+            pdy[i] = 0xD22D0000u | i;          /* dbg2 @ +0x5300 */
+        }
 
         portMemCopy(kern, sizeof(kern), g_sm75SaxpyKernel, sizeof(g_sm75SaxpyKernel));
-        kern[5]  = NvU64_LO32(xVA);    /* MOV R2, x_lo   */
-        kern[9]  = NvU64_HI32(xVA);    /* MOV R3, x_hi   */
-        kern[21] = NvU64_LO32(dxVA);   /* MOV R6, dbgx_lo */
-        kern[25] = NvU64_HI32(dxVA);   /* MOV R7, dbgx_hi */
+        kern[5]  = NvU64_LO32(dxVA);            /* MOV R6, dbg base lo */
+        kern[9]  = NvU64_HI32(dxVA);            /* MOV R7, dbg base hi */
+        kern[17] = NvU64_LO32(pOut->kernelVA);  /* MOV R4, kernel lo   */
+        kern[21] = NvU64_HI32(pOut->kernelVA);  /* MOV R5, kernel hi   */
+        kern[33] = NvU64_LO32(xVA);             /* MOV R2, x lo        */
+        kern[37] = NvU64_HI32(xVA);             /* MOV R3, x hi        */
         portMemCopy(pBufCpu + ECLIPSE_SAXPY_KERNEL_OFF, sizeof(kern), kern, sizeof(kern));
         *(volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_SEM_OFF) = 0;
         *(volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_FENCE_OFF) = 0;
@@ -3864,6 +3883,16 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
         QMD_SET(qmd, QMDF_API_VISIBLE_CALL_LIMIT, 1);
         QMD_SET(qmd, QMDF_SAMPLER_INDEX, 0);
         QMD_SET(qmd, QMDF_SM_GLOBAL_CACHING_ENABLE, 1);
+        /* Invalidate every shader-visible cache at launch (CUDA does this
+         * routinely; our virgin GR context has never had its L1TEX data
+         * cache invalidated -- prime suspect for loads hanging while
+         * stores/ifetch work). Official clc3c0qmd.h bit positions. */
+        QMD_SET(qmd, QMDF_INVAL_TEX_HEADER_CACHE, 1);
+        QMD_SET(qmd, QMDF_INVAL_TEX_SAMPLER_CACHE, 1);
+        QMD_SET(qmd, QMDF_INVAL_TEX_DATA_CACHE, 1);
+        QMD_SET(qmd, QMDF_INVAL_SHADER_DATA_CACHE, 1);
+        QMD_SET(qmd, QMDF_INVAL_INSTRUCTION_CACHE, 1);
+        QMD_SET(qmd, QMDF_INVAL_SHADER_CONST_CACHE, 1);
         QMD_SET(qmd, QMDF_CTA_RASTER_WIDTH, 1);
         QMD_SET(qmd, QMDF_CTA_RASTER_HEIGHT, 1);
         QMD_SET(qmd, QMDF_CTA_RASTER_DEPTH, 1);
@@ -3980,10 +4009,10 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
 
         pOut->matchCount = 0;
         {
-            volatile NvU32 *pdx = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF);
+            volatile NvU32 *pd1 = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF + 0x80);
             for (i = 0; i < 32; i++)
             {
-                NvU32 v = pdx[i];   /* what the GPU loaded from x[i] and stored */
+                NvU32 v = pd1[i];   /* exp2: STRONG load of x[tid] */
                 if (v == (0x12340000u | i))
                 {
                     pOut->matchCount++;
@@ -3998,16 +4027,18 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
         pOut->verifyStatus = (pOut->matchCount == 32) ? NV_OK : NV_ERR_INVALID_DATA;
         (void)pY;
         {
-            volatile NvU32 *pdx = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF);
-            volatile NvU32 *px  = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_X_OFF);
-            nv_printf(0, "[eclipse-rm-trace] step23: fence 0x%x (@%u ms) sem 0x%x (@%u ms) LOAD-verify 0x%x (%u/32 dbgx==pattern)\n",
+            volatile NvU32 *pd0 = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF);
+            volatile NvU32 *pd1 = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF + 0x80);
+            volatile NvU32 *pd2 = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF + 0x100);
+            nv_printf(0, "[eclipse-rm-trace] step23: fence 0x%x (@%u ms) sem 0x%x (@%u ms) LOAD-verify 0x%x (%u/32)\n",
                       pOut->fenceStatus, pOut->fenceIters, pOut->semStatus, pOut->semIters,
                       pOut->verifyStatus, pOut->matchCount);
-            nv_printf(0, "[eclipse-rm-trace] step23 DIAG: cpu-wrote x[0..3]={0x%x,0x%x,0x%x,0x%x}\n",
-                      px[0], px[1], px[2], px[3]);
-            nv_printf(0, "[eclipse-rm-trace] step23 DIAG: gpu-loaded dbgx[0..3]={0x%x,0x%x,0x%x,0x%x}\n",
-                      pdx[0], pdx[1], pdx[2], pdx[3]);
-            nv_printf(0, "[eclipse-rm-trace] step23 DIAG: want 0x12340000|i; ==0 -> LDG reads zero; ==0xD00D.. -> kernel trapped pre-store\n");
+            nv_printf(0, "[eclipse-rm-trace] step23 DIAG exp1 (STRONG, kernel self, want 0x00007919): {0x%x,0x%x} sentinel 0xD00D\n",
+                      pd0[0], pd0[1]);
+            nv_printf(0, "[eclipse-rm-trace] step23 DIAG exp2 (STRONG, x[tid], want 0x1234000i): {0x%x,0x%x} sentinel 0xD11D\n",
+                      pd1[0], pd1[1]);
+            nv_printf(0, "[eclipse-rm-trace] step23 DIAG exp3 (CONSTANT, x[tid], want 0x1234000i): {0x%x,0x%x} sentinel 0xD22D\n",
+                      pd2[0], pd2[1]);
         }
     }
 
