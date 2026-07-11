@@ -3960,6 +3960,71 @@ impl DrmScheme for NvidiaGpu {
         s
     }
 
+    /// Step 23 (`/proc/gpustep23`): integer SAXPY — 32 threads each load
+    /// x[tid] and y[tid] from GPU arrays, compute y = a*x + y (LDG global
+    /// loads + IMAD + STG), CPU-verified per element. The load-compute-
+    /// store canon; the first kernel that reads from memory.
+    fn bringup_step23(&self) -> String {
+        use core::fmt::Write;
+        let mut s = String::new();
+        let device_instance = *self.rm_device_instance.lock();
+        let Some(device_instance) = device_instance else {
+            return String::from(
+                "[gpustep23] skipped (bring the GPU up first, then gpustep16/17)\n",
+            );
+        };
+        nvidia_rm_sys::os_interface::capture_begin();
+        let result = nvidia_rm_sys::rm_init::step23(device_instance);
+        let captured = nvidia_rm_sys::os_interface::capture_take();
+        if let Some(log) = captured {
+            for line in log.lines() {
+                let _ = writeln!(s, "[gpustep23] | {}", line);
+            }
+        }
+        let phase = |st: u32| -> String {
+            match st {
+                0 => String::from("OK"),
+                0xFFFF_FFFF => String::from("not reached"),
+                0x65 => String::from("TIMEOUT"),
+                e => alloc::format!("FAILED NV_STATUS={:#x}", e),
+            }
+        };
+        match result {
+            Ok(c) => {
+                let _ = writeln!(s, "[gpustep23] --- integer SAXPY: y[i] = 3*x[i] + y[i], x[i]=i, y[i]=100+i ---");
+                let _ = writeln!(s, "[gpustep23] lookup / CPU map:         {} / {}", phase(c.lookup_status), phase(c.map_status));
+                let _ = writeln!(s, "[gpustep23] token:                    {} (token={:#010x}, runlist={})", phase(c.token_status), c.work_token, c.runlist_id);
+                let _ = writeln!(s, "[gpustep23] QMD @ {:#x}, kernel @ {:#x}, y[] @ {:#x}", c.qmd_va, c.kernel_va, c.out_va);
+                let _ = writeln!(s, "[gpustep23] launch ({} dw):            {}", c.push_dwords, phase(c.submit_status));
+                let _ = writeln!(s, "[gpustep23] post-PCAS host fence:     {} ({} ms)", phase(c.fence_status), c.fence_iters);
+                let _ = writeln!(s, "[gpustep23] QMD RELEASE0 semaphore:   {} ({} ms)", phase(c.sem_status), c.sem_iters);
+                let _ = writeln!(s, "[gpustep23] SAXPY verification:       {} ({}/32 elements = 4i+100)", phase(c.verify_status), c.match_count);
+                if c.first_bad_idx != 0xFFFF_FFFF {
+                    let _ = writeln!(s, "[gpustep23] first mismatch: y[{}]={:#x} ({}) expected {}", c.first_bad_idx, c.first_bad_val, c.first_bad_val, 4 * c.first_bad_idx + 100);
+                }
+                if c.sem_status == 0 && c.verify_status == 0 {
+                    let _ = writeln!(s, "[gpustep23] ============================================================");
+                    let _ = writeln!(s, "[gpustep23]  LOAD-COMPUTE-STORE PROVEN: the GPU read two arrays from");
+                    let _ = writeln!(s, "[gpustep23]  memory, did a*x+y per element, and wrote the results back.");
+                    let _ = writeln!(s, "[gpustep23]  Eclipse has the full GPU compute primitive.");
+                    let _ = writeln!(s, "[gpustep23] ============================================================");
+                } else if c.sem_status == 0 {
+                    let _ = writeln!(s, "[gpustep23] --- grid completed but results wrong: LDG address/data path suspect (check first mismatch) ---");
+                } else if c.fence_status == 0 {
+                    let _ = writeln!(s, "[gpustep23] --- methods consumed but grid never released: LDG encoding or load scoreboard suspect (SM trap) ---");
+                }
+            }
+            Err(status) => {
+                let _ = writeln!(
+                    s,
+                    "[gpustep23] eclipse_rm_step23 FAILED, NV_STATUS={:#x} (run gpustep17 first in this boot)",
+                    status
+                );
+            }
+        }
+        s
+    }
+
     /// Step 2: instance block + GMMU flush — the first GPU register writes.
     /// TEMPORARY: the secondary (non-console) GPU has its own unrelated
     /// problems (USB breaks in Eclipse when it's made primary; likely never
