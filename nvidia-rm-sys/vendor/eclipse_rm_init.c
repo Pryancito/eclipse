@@ -68,6 +68,7 @@
 #include "class/clc5c0.h"      /* TURING_COMPUTE_A */
 #include "alloc/alloc_channel.h" /* NV_CHANNEL_ALLOC_PARAMS */
 #include "ctrl/ctrla06f.h"     /* NVA06F_CTRL_CMD_GPFIFO_SCHEDULE */
+#include "ctrl/ctrl906f.h"     /* NV906F_CTRL_CMD_GET_MMU_FAULT_INFO */
 #include "kernel/gpu/fifo/kernel_fifo.h" /* kfifoGetChannelClassId / UserdSizeAlign */
 #include "kernel/gpu/fifo/kernel_channel.h" /* CliGetKernelChannel / runlist / USERD memdesc */
 #include "class/cl906f.h"      /* GP_ENTRY + DMA method encoding (Fermi format, current) */
@@ -3684,46 +3685,44 @@ report:
 #define ECLIPSE_SAXPY_FENCE_OFF  0x8440
 #define ECLIPSE_SAXPY_FENCE_PAYLOAD 0xFE7C4ED5
 
-/* SM75 -- THREE-EXPERIMENT LOAD BATTERY, 18 instructions + NOP pad.
- * Hardware so far: weak load "completes" with zeros, STRONG load hangs,
- * while SM ifetch, SM stores (same page!), and PBDMA/SKED reads all work.
- * That asymmetry singles out the L1TEX *data* path -- the one consumer
- * of the texture/L1 data cache, which we have NEVER invalidated on this
- * virgin GR context. This QMD now sets all six INVALIDATE_*_CACHE bits
- * (MW 186..191, official clc3c0qmd.h positions -- CUDA sets these
- * routinely) and the kernel runs three independent load experiments,
- * each storing to its own sentinel-seeded dbg slot so one photo shows
- * exactly how far execution got and what each load returned:
- *   exp1 dbg0[tid]: LDG.E.STRONG.SYS of the KERNEL'S OWN first dword
- *        (ifetch-proven page; expect 0x00007919)
- *   exp2 dbg1[tid]: LDG.E.STRONG.SYS of x[tid] (expect 0x12340000|tid)
- *   exp3 dbg2[tid]: LDG.E.CONSTANT.SYS of x[tid] (corpus 0x1e6900)
- * Sentinels: dbg0 0xD00D...., dbg1 0xD11D...., dbg2 0xD22D.....
- * All forms corpus-verbatim; IADD3 Rd,Ra,imm,RZ validated against
- * "IADD3 R7, R4, 0x20, RZ" = 0x04077810/0x07ffe0ff.
- * Patched immediates at dword indices 5/9 (dbg base lo/hi),
- * 17/21 (kernel VA lo/hi), 33/37 (x lo/hi).                            */
-static const NvU32 g_sm75SaxpyKernel[96] = {
+/* SM75 -- SINGLE LOAD + MARKERS, 15 instructions + NOP pad. The three-
+ * experiment battery proved the warp HANGS on the very first STRONG load
+ * (all sentinels intact, fence+RELEASE0 timeout) even when the address is
+ * the kernel's own ifetch-proven page, and the cache-invalidate bits did
+ * not help. SM stores and ifetch work; the SM *data read* path does not.
+ * That is the signature of an MMU fault on the load's data access, which
+ * hangs the warp with interrupts disabled. So: one load, bracketed by
+ * posted stores that DO land regardless, then the RM's own
+ * NV906F_CTRL_CMD_GET_MMU_FAULT_INFO is queried after the timeout to name
+ * the fault (address, type, string).
+ * marker[tid] (12 B): +0 BEFORE(0xBE40|tid, lands pre-load),
+ *                     +4 loaded value, +8 AFTER(0xAF7E|tid, post-load).
+ * Patched immediates at dword indices 5/9 (marker base), 25/29 (x).
+ *   S2R R0,SR_TID.X (wr0)
+ *   MOV R6,mk_lo; MOV R7,mk_hi; IMAD.WIDE R6,R0,12,R6 (wait wr0)
+ *   MOV R10,0xBE400000 ; STG [R6],R10                    (before)
+ *   MOV R2,x_lo; MOV R3,x_hi; IMAD.WIDE R2,R0,4,R2 (wait wr0)
+ *   LDG.E.STRONG.SYS R8,[R2] (wr1)                        THE load
+ *   IADD3 R11,R6,4 ; STG [R11],R8 (wait wr1)              (loaded)
+ *   IADD3 R12,R6,8 ; MOV R13,0xAF7E0000 ; STG [R12],R13   (after)
+ *   EXIT ; NOP pad                                                     */
+static const NvU32 g_sm75SaxpyKernel[80] = {
     0x00007919, 0x00000000, 0x00002100, 0x000e0400,
     0x00067802, 0x00000000, 0x00000f00, 0x000fc400,
     0x00077802, 0x00000000, 0x00000f00, 0x000fc400,
-    0x00067825, 0x00000004, 0x078e0006, 0x001fcc00,
-    0x00047802, 0x00000000, 0x00000f00, 0x000fc400,
-    0x00057802, 0x00000000, 0x00000f00, 0x000fc400,
-    0x040c7381, 0x00000000, 0x001f6900, 0x000e4400,
-    0x06007386, 0x0000000c, 0x0010e900, 0x002fcc00,
+    0x00067825, 0x0000000c, 0x078e0006, 0x001fcc00,
+    0x000a7802, 0xbe400000, 0x00000f00, 0x000fc400,
+    0x06007386, 0x0000000a, 0x0010e900, 0x000fcc00,
     0x00027802, 0x00000000, 0x00000f00, 0x000fc400,
     0x00037802, 0x00000000, 0x00000f00, 0x000fc400,
     0x00027825, 0x00000004, 0x078e0002, 0x001fcc00,
-    0x02087381, 0x00000000, 0x001f6900, 0x000e8400,
-    0x06067810, 0x00000080, 0x07ffe0ff, 0x000fcc00,
-    0x06007386, 0x00000008, 0x0010e900, 0x004fcc00,
-    0x02097381, 0x00000000, 0x001e6900, 0x000ec400,
-    0x06067810, 0x00000080, 0x07ffe0ff, 0x000fcc00,
-    0x06007386, 0x00000009, 0x0010e900, 0x008fcc00,
+    0x02087381, 0x00000000, 0x001f6900, 0x000e4400,
+    0x060b7810, 0x00000004, 0x07ffe0ff, 0x000fcc00,
+    0x0b007386, 0x00000008, 0x0010e900, 0x002fcc00,
+    0x060c7810, 0x00000008, 0x07ffe0ff, 0x000fc400,
+    0x000d7802, 0xaf7e0000, 0x00000f00, 0x000fc400,
+    0x0c007386, 0x0000000d, 0x0010e900, 0x002fcc00,
     0x0000794d, 0x00000000, 0x03800000, 0x000fea00,
-    0x00007918, 0x00000000, 0x00000000, 0x000fc000,
-    0x00007918, 0x00000000, 0x00000000, 0x000fc000,
     0x00007918, 0x00000000, 0x00000000, 0x000fc000,
     0x00007918, 0x00000000, 0x00000000, 0x000fc000,
     0x00007918, 0x00000000, 0x00000000, 0x000fc000,
@@ -3854,25 +3853,23 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
         volatile NvU32 *pdx = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF);
         volatile NvU32 *pdy = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGY_OFF);
         NvU32 i;
-        (void)yVA; (void)dyVA;
-        /* x seeded with a distinctive pattern; three dbg slots (0x80 apart)
-         * each carry their own sentinel family. */
+        (void)yVA; (void)dyVA; (void)pdy;
+        /* x seeded with a distinctive pattern; marker area (dbg base)
+         * seeded per-thread with 3 dwords: before/loaded/after slots. */
         for (i = 0; i < 32; i++)
         {
             px[i] = 0x12340000u | i;
             py[i] = 100u + i;
-            pdx[i] = 0xD00D0000u | i;          /* dbg0 @ +0x5200 */
-            pdx[32 + i] = 0xD11D0000u | i;     /* dbg1 @ +0x5280 */
-            pdy[i] = 0xD22D0000u | i;          /* dbg2 @ +0x5300 */
+            pdx[i * 3 + 0] = 0x5EED0000u | i;   /* before slot (kernel writes 0xBE40|.. hi only) */
+            pdx[i * 3 + 1] = 0x5EED1111u;       /* loaded slot */
+            pdx[i * 3 + 2] = 0x5EED2222u;       /* after slot  */
         }
 
         portMemCopy(kern, sizeof(kern), g_sm75SaxpyKernel, sizeof(g_sm75SaxpyKernel));
-        kern[5]  = NvU64_LO32(dxVA);            /* MOV R6, dbg base lo */
-        kern[9]  = NvU64_HI32(dxVA);            /* MOV R7, dbg base hi */
-        kern[17] = NvU64_LO32(pOut->kernelVA);  /* MOV R4, kernel lo   */
-        kern[21] = NvU64_HI32(pOut->kernelVA);  /* MOV R5, kernel hi   */
-        kern[33] = NvU64_LO32(xVA);             /* MOV R2, x lo        */
-        kern[37] = NvU64_HI32(xVA);             /* MOV R3, x hi        */
+        kern[5]  = NvU64_LO32(dxVA);            /* MOV R6, marker base lo */
+        kern[9]  = NvU64_HI32(dxVA);            /* MOV R7, marker base hi */
+        kern[25] = NvU64_LO32(xVA);             /* MOV R2, x lo           */
+        kern[29] = NvU64_HI32(xVA);             /* MOV R3, x hi           */
         portMemCopy(pBufCpu + ECLIPSE_SAXPY_KERNEL_OFF, sizeof(kern), kern, sizeof(kern));
         *(volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_SEM_OFF) = 0;
         *(volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_FENCE_OFF) = 0;
@@ -4009,36 +4006,38 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
 
         pOut->matchCount = 0;
         {
-            volatile NvU32 *pd1 = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF + 0x80);
+            volatile NvU32 *pm = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF);
             for (i = 0; i < 32; i++)
             {
-                NvU32 v = pd1[i];   /* exp2: STRONG load of x[tid] */
-                if (v == (0x12340000u | i))
-                {
+                /* "load completed" = the AFTER marker landed. */
+                if (pm[i * 3 + 2] == 0xAF7E0000u)
                     pOut->matchCount++;
-                }
-                else if (pOut->firstBadIdx == 0xFFFFFFFF)
-                {
-                    pOut->firstBadIdx = i;
-                    pOut->firstBadVal = v;
-                }
             }
         }
         pOut->verifyStatus = (pOut->matchCount == 32) ? NV_OK : NV_ERR_INVALID_DATA;
         (void)pY;
         {
-            volatile NvU32 *pd0 = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF);
-            volatile NvU32 *pd1 = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF + 0x80);
-            volatile NvU32 *pd2 = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF + 0x100);
-            nv_printf(0, "[eclipse-rm-trace] step23: fence 0x%x (@%u ms) sem 0x%x (@%u ms) LOAD-verify 0x%x (%u/32)\n",
+            volatile NvU32 *pm = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF);
+            nv_printf(0, "[eclipse-rm-trace] step23: fence 0x%x (@%u ms) sem 0x%x (@%u ms) load-completed %u/32\n",
                       pOut->fenceStatus, pOut->fenceIters, pOut->semStatus, pOut->semIters,
-                      pOut->verifyStatus, pOut->matchCount);
-            nv_printf(0, "[eclipse-rm-trace] step23 DIAG exp1 (STRONG, kernel self, want 0x00007919): {0x%x,0x%x} sentinel 0xD00D\n",
-                      pd0[0], pd0[1]);
-            nv_printf(0, "[eclipse-rm-trace] step23 DIAG exp2 (STRONG, x[tid], want 0x1234000i): {0x%x,0x%x} sentinel 0xD11D\n",
-                      pd1[0], pd1[1]);
-            nv_printf(0, "[eclipse-rm-trace] step23 DIAG exp3 (CONSTANT, x[tid], want 0x1234000i): {0x%x,0x%x} sentinel 0xD22D\n",
-                      pd2[0], pd2[1]);
+                      pOut->matchCount);
+            nv_printf(0, "[eclipse-rm-trace] step23 MARK tid0: before=0x%x loaded=0x%x after=0x%x (want BE400000 / 0x12340000 / AF7E0000)\n",
+                      pm[0], pm[1], pm[2]);
+            nv_printf(0, "[eclipse-rm-trace] step23 MARK tid1: before=0x%x loaded=0x%x after=0x%x\n",
+                      pm[3], pm[4], pm[5]);
+        }
+        /* Ask the RM why: MMU fault info for this channel. If the load
+         * data-faulted, this names the address, type and human string. */
+        {
+            NV906F_CTRL_GET_MMU_FAULT_INFO_PARAMS fp;
+            RM_API *pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
+            NV_STATUS fs;
+            portMemSet(&fp, 0, sizeof(fp));
+            fs = pRmApi->Control(pRmApi, g_grAllocCache.hClient, g_grChanCache.hChannel,
+                                 NV906F_CTRL_CMD_GET_MMU_FAULT_INFO, &fp, sizeof(fp));
+            fp.faultString[NV906F_CTRL_MMU_FAULT_STRING_LEN - 1] = '\0';
+            nv_printf(0, "[eclipse-rm-trace] step23 MMU-FAULT ctrl=0x%x addr=0x%x%08x type=0x%x str='%s'\n",
+                      fs, fp.addrHi, fp.addrLo, fp.faultType, fp.faultString);
         }
     }
 
