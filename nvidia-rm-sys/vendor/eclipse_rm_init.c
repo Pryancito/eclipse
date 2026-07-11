@@ -3732,6 +3732,17 @@ static const NvU32 g_sm75SaxpyKernel[80] = {
 static EclipseGrThreads g_grSaxpyCache;
 static NvBool g_grSaxpyDone = NV_FALSE;
 
+/* A dedicated GPU_CACHEABLE=YES sysmem buffer the SM can actually READ.
+ * The default sysmem alloc is GPU_CACHEABLE=NO (mem_mgr_gm107.c: "the GPU
+ * cache is not sysmem coherent"), which is why SM data loads from the main
+ * channel buffer fault/hang while stores and ifetch work. Allocated once,
+ * under the API lock only (allocation asserts the GPU lock is NOT held),
+ * and mapped into the compute VAS. */
+static NvU64  g_saxpyCacheableVA = 0;
+static NvU32  g_saxpyCacheableHandle = 0;
+static NvBool g_saxpyCacheableDone = NV_FALSE;
+#define ECLIPSE_SAXPY_CACHEABLE_SIZE 0x1000
+
 NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
 {
     OBJGPU *pGpu;
@@ -3744,8 +3755,11 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
     Memory *pBufMemory = NULL;
     MEMORY_DESCRIPTOR *pBufMemDesc = NULL;
     MEMORY_DESCRIPTOR *pUserdMemDesc = NULL;
+    Memory *pCacheMemory = NULL;
+    MEMORY_DESCRIPTOR *pCacheMemDesc = NULL;
     NvU8 *pBufCpu = NULL;
     NvU8 *pUserdCpu = NULL;
+    NvU8 *pCacheCpu = NULL;
     NvU32 userdFlags = TRANSFER_FLAGS_USE_BAR1 |
                        TRANSFER_FLAGS_SHADOW_ALLOC |
                        TRANSFER_FLAGS_SHADOW_INIT_MEM;
@@ -3795,6 +3809,60 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
         threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
         return status;
     }
+
+    /* Allocate the GPU_CACHEABLE=YES sysmem data buffer + map it into the
+     * compute VAS -- under the API lock ONLY, before the GPU lock, because
+     * the allocation path asserts the GPU lock is not held. Idempotent. */
+    if (!g_saxpyCacheableDone)
+    {
+        RM_API *pAlloc = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
+        RsClient *pAllocClient = NULL;
+        NvU32 hPhys = 0, hVirt = 0;
+        NV_STATUS as = serverGetClientUnderLock(&g_resServ, g_grAllocCache.hClient, &pAllocClient);
+        if (as == NV_OK)
+        {
+            NV_MEMORY_ALLOCATION_PARAMS mp;
+            portMemSet(&mp, 0, sizeof(mp));
+            mp.owner = HEAP_OWNER_RM_CLIENT_GENERIC;
+            mp.type  = NVOS32_TYPE_IMAGE;
+            mp.size  = ECLIPSE_SAXPY_CACHEABLE_SIZE;
+            mp.attr  = DRF_DEF(OS32, _ATTR, _LOCATION, _PCI);
+            mp.attr2 = DRF_DEF(OS32, _ATTR2, _GPU_CACHEABLE, _YES);
+            as = clientGenResourceHandle(pAllocClient, &hPhys);
+            if (as == NV_OK)
+                as = pAlloc->AllocWithHandle(pAlloc, g_grAllocCache.hClient,
+                                             g_grAllocCache.hDevice, hPhys,
+                                             NV01_MEMORY_SYSTEM, &mp, sizeof(mp));
+        }
+        if (as == NV_OK)
+        {
+            NV_MEMORY_ALLOCATION_PARAMS mp;
+            portMemSet(&mp, 0, sizeof(mp));
+            mp.owner = HEAP_OWNER_RM_CLIENT_GENERIC;
+            mp.type  = NVOS32_TYPE_IMAGE;
+            mp.size  = ECLIPSE_SAXPY_CACHEABLE_SIZE;
+            mp.attr  = DRF_DEF(OS32, _ATTR, _LOCATION, _PCI);
+            mp.flags = NVOS32_ALLOC_FLAGS_VIRTUAL;
+            mp.hVASpace = g_grAllocCache.hVas;
+            as = clientGenResourceHandle(pAllocClient, &hVirt);
+            if (as == NV_OK)
+                as = pAlloc->AllocWithHandle(pAlloc, g_grAllocCache.hClient,
+                                             g_grAllocCache.hDevice, hVirt,
+                                             NV50_MEMORY_VIRTUAL, &mp, sizeof(mp));
+        }
+        if (as == NV_OK)
+            as = pAlloc->Map(pAlloc, g_grAllocCache.hClient, g_grAllocCache.hDevice,
+                             hVirt, hPhys, 0, ECLIPSE_SAXPY_CACHEABLE_SIZE,
+                             NV04_MAP_MEMORY_FLAGS_NONE, &g_saxpyCacheableVA);
+        nv_printf(0, "[eclipse-rm-trace] step23: cacheable buf alloc -> 0x%x hPhys=0x%x VA=0x%llx\n",
+                  as, hPhys, g_saxpyCacheableVA);
+        if (as == NV_OK)
+        {
+            g_saxpyCacheableHandle = hPhys;
+            g_saxpyCacheableDone = NV_TRUE;
+        }
+    }
+
     status = rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
     if (status != NV_OK)
     {
@@ -3823,15 +3891,23 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
             if (pBufMemDesc == NULL || pUserdMemDesc == NULL)
                 status = NV_ERR_INVALID_STATE;
         }
+        if (status == NV_OK)
+            status = memGetByHandle(pRsClient, g_saxpyCacheableHandle, &pCacheMemory);
+        if (status == NV_OK)
+        {
+            pCacheMemDesc = pCacheMemory->pMemDesc;
+            if (pCacheMemDesc == NULL) status = NV_ERR_INVALID_STATE;
+        }
         pOut->lookupStatus = status;
         if (status != NV_OK) goto report;
     }
 
-    /* 2. CPU maps. */
+    /* 2. CPU maps (channel buffer, USERD, and the cacheable data buffer). */
     {
         pBufCpu = memmgrMemDescBeginTransfer(pMemoryManager, pBufMemDesc, TRANSFER_FLAGS_NONE);
         pUserdCpu = memmgrMemDescBeginTransfer(pMemoryManager, pUserdMemDesc, userdFlags);
-        pOut->mapStatus = (pBufCpu != NULL && pUserdCpu != NULL) ? NV_OK : NV_ERR_GENERIC;
+        pCacheCpu = memmgrMemDescBeginTransfer(pMemoryManager, pCacheMemDesc, TRANSFER_FLAGS_NONE);
+        pOut->mapStatus = (pBufCpu != NULL && pUserdCpu != NULL && pCacheCpu != NULL) ? NV_OK : NV_ERR_GENERIC;
         if (pOut->mapStatus != NV_OK) goto report;
     }
 
@@ -3865,11 +3941,19 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
             pdx[i * 3 + 2] = 0x5EED2222u;       /* after slot  */
         }
 
+        /* Seed the CACHEABLE data buffer (GPU_CACHEABLE=YES) that the SM
+         * will load from -- this is the actual coherence test. */
+        {
+            volatile NvU32 *pc = (volatile NvU32 *)pCacheCpu;
+            for (i = 0; i < 32; i++) pc[i] = 0x12340000u | i;
+        }
+
         portMemCopy(kern, sizeof(kern), g_sm75SaxpyKernel, sizeof(g_sm75SaxpyKernel));
         kern[5]  = NvU64_LO32(dxVA);            /* MOV R6, marker base lo */
         kern[9]  = NvU64_HI32(dxVA);            /* MOV R7, marker base hi */
-        kern[25] = NvU64_LO32(xVA);             /* MOV R2, x lo           */
-        kern[29] = NvU64_HI32(xVA);             /* MOV R3, x hi           */
+        kern[25] = NvU64_LO32(g_saxpyCacheableVA); /* MOV R2, cacheable data lo */
+        kern[29] = NvU64_HI32(g_saxpyCacheableVA); /* MOV R3, cacheable data hi */
+        (void)xVA;
         portMemCopy(pBufCpu + ECLIPSE_SAXPY_KERNEL_OFF, sizeof(kern), kern, sizeof(kern));
         *(volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_SEM_OFF) = 0;
         *(volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_FENCE_OFF) = 0;
@@ -4009,8 +4093,8 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
             volatile NvU32 *pm = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF);
             for (i = 0; i < 32; i++)
             {
-                /* "load completed" = the AFTER marker landed. */
-                if (pm[i * 3 + 2] == 0xAF7E0000u)
+                /* success = the load landed the right value in the loaded slot. */
+                if (pm[i * 3 + 1] == (0x12340000u | i))
                     pOut->matchCount++;
             }
         }
@@ -4021,9 +4105,9 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
             nv_printf(0, "[eclipse-rm-trace] step23: fence 0x%x (@%u ms) sem 0x%x (@%u ms) load-completed %u/32\n",
                       pOut->fenceStatus, pOut->fenceIters, pOut->semStatus, pOut->semIters,
                       pOut->matchCount);
-            nv_printf(0, "[eclipse-rm-trace] step23 MARK tid0: before=0x%x loaded=0x%x after=0x%x (want BE400000 / 0x12340000 / AF7E0000)\n",
+            nv_printf(0, "[eclipse-rm-trace] step23 CACHEABLE-load MARK tid0: before=0x%x loaded=0x%x after=0x%x (want BE400000 / 0x12340000 / AF7E0000)\n",
                       pm[0], pm[1], pm[2]);
-            nv_printf(0, "[eclipse-rm-trace] step23 MARK tid1: before=0x%x loaded=0x%x after=0x%x\n",
+            nv_printf(0, "[eclipse-rm-trace] step23 MARK tid1: before=0x%x loaded=0x%x after=0x%x (want .. / 0x12340001 / ..)\n",
                       pm[3], pm[4], pm[5]);
         }
         /* Ask the RM why: MMU fault info for this channel. If the load
@@ -4046,6 +4130,8 @@ report:
         memmgrMemDescEndTransfer(pMemoryManager, pBufMemDesc, TRANSFER_FLAGS_NONE);
     if (pUserdCpu != NULL)
         memmgrMemDescEndTransfer(pMemoryManager, pUserdMemDesc, userdFlags);
+    if (pCacheCpu != NULL)
+        memmgrMemDescEndTransfer(pMemoryManager, pCacheMemDesc, TRANSFER_FLAGS_NONE);
 
     if (pOut->semStatus == NV_OK && pOut->verifyStatus == NV_OK)
     {
