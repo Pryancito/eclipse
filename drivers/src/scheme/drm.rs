@@ -254,6 +254,13 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Bring-up **Step 23** (`/proc/gpustep23`): integer SAXPY
+    /// (y[i] = a*x[i] + y[i]) with real global loads (LDG) -- the
+    /// load-compute-store canon, per-element verified. Default: nothing.
+    fn bringup_step23(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Read-only hardware-state dump (`/proc/gpudump`): the discriminating
     /// registers (display head liveness, VGA workspace, PMC, BSI, sysmem
     /// flush) for this GPU, with NO GSP boot -- zero wedge risk. Lets us

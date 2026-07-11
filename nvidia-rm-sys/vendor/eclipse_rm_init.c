@@ -3645,6 +3645,358 @@ report:
 }
 
 /*
+ * Step-23: the load-compute-store canon -- integer SAXPY. Each of 32
+ * threads loads x[tid] and y[tid] from two GPU arrays, computes
+ * y[tid] = a*x[tid] + y[tid], and stores it back. This is the first
+ * kernel that READS from memory (global loads) rather than only writing:
+ * the missing third of the fundamental GPU compute pattern.
+ *
+ * The one new instruction form vs step22 is LDG.E.SYS Rd,[Ra] (global
+ * load, GPR-addressed). Its low word is validated bit-exactly against
+ * three CuAssembler sm_75 corpus instances (opcode 0x381 -- the form real
+ * nvdisasm emits for [Rn] addressing, not NAK's 0x981 uniform-base path);
+ * the high/control word carries the .E (64-bit address, bit 72) and .SYS
+ * scope bits, derived from the corpus CONSTANT/SYS/width deltas. Loads are
+ * variable-latency, so each LDG sets a write barrier and the consuming
+ * IMAD waits on both. IMAD Rd,Ra,Rb,Rc (register form) is corpus-verbatim;
+ * everything else (S2R, IMAD.WIDE, STG, MOV-imm) is silicon-proven.
+ *
+ * Params (a, x base, y base) are patched into the SASS immediates (proven
+ * in step20); CPU prefills x[i]=i and y[i]=100+i, so the expected result
+ * is y[i] = 3*i + 100 + i = 4*i + 100 -- values only a correct
+ * load->compute->store roundtrip produces. All 32 verified.
+ */
+#define ECLIPSE_SAXPY_KERNEL_OFF 0x1800
+#define ECLIPSE_SAXPY_QMD_OFF    0x2600
+#define ECLIPSE_SAXPY_X_OFF      0x5000   /* x[32] */
+#define ECLIPSE_SAXPY_Y_OFF      0x5100   /* y[32] (also the output) */
+#define ECLIPSE_SAXPY_A          3
+#define ECLIPSE_SAXPY_SEM_OFF    0x8400
+#define ECLIPSE_SAXPY_SEM_PAYLOAD 0x5A55C0D5
+#define ECLIPSE_SAXPY_FENCE_OFF  0x8440
+#define ECLIPSE_SAXPY_FENCE_PAYLOAD 0xFE7C4ED5
+
+/* SM75 integer SAXPY, 16 instructions. Patched immediates at dword indices
+ * 5 (a), 9 (x_lo), 13 (x_hi), 17 (y_lo), 21 (y_hi).
+ *   S2R R0, SR_TID.X (wr0)
+ *   MOV R4,a ; MOV R2,x_lo ; MOV R3,x_hi ; MOV R6,y_lo ; MOV R7,y_hi
+ *   IMAD.WIDE.U32 R2,R0,4,R2 (wait wr0)   &x[tid]
+ *   IMAD.WIDE.U32 R6,R0,4,R6 (wait wr0)   &y[tid]
+ *   LDG.E.SYS R8,[R2] (wr1)               x[tid]
+ *   LDG.E.SYS R9,[R6] (wr2)               y[tid]
+ *   IMAD R8,R8,R4,R9  (wait wr1+wr2)       a*x + y
+ *   STG.E.SYS [R6],R8 ; EXIT ; NOP pad                            */
+static const NvU32 g_sm75SaxpyKernel[64] = {
+    0x00007919, 0x00000000, 0x00002100, 0x000e0200,
+    0x00047802, 0xAAAA0000, 0x00000f00, 0x000fc400,
+    0x00027802, 0xBBBB0000, 0x00000f00, 0x000fc400,
+    0x00037802, 0x00000000, 0x00000f00, 0x000fc400,
+    0x00067802, 0xCCCC0000, 0x00000f00, 0x000fc400,
+    0x00077802, 0x00000000, 0x00000f00, 0x000fc400,
+    0x00027825, 0x00000004, 0x078e0002, 0x001fc800,
+    0x00067825, 0x00000004, 0x078e0006, 0x001fc800,
+    0x02087381, 0x00000000, 0x001ee900, 0x000e4400,
+    0x06097381, 0x00000000, 0x001ee900, 0x000e8400,
+    0x08087224, 0x00000004, 0x078e0209, 0x006fc800,
+    0x06007386, 0x00000008, 0x0010e900, 0x000fc400,
+    0x0000794d, 0x00000000, 0x03800000, 0x000fea00,
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000,
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000,
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000,
+};
+
+static EclipseGrThreads g_grSaxpyCache;
+static NvBool g_grSaxpyDone = NV_FALSE;
+
+NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
+{
+    OBJGPU *pGpu;
+    NV_STATUS status;
+    THREAD_STATE_NODE threadState;
+    RsClient *pRsClient = NULL;
+    KernelChannel *pKernelChannel = NULL;
+    KernelFifo *pKernelFifo;
+    MemoryManager *pMemoryManager;
+    Memory *pBufMemory = NULL;
+    MEMORY_DESCRIPTOR *pBufMemDesc = NULL;
+    MEMORY_DESCRIPTOR *pUserdMemDesc = NULL;
+    NvU8 *pBufCpu = NULL;
+    NvU8 *pUserdCpu = NULL;
+    NvU32 userdFlags = TRANSFER_FLAGS_USE_BAR1 |
+                       TRANSFER_FLAGS_SHADOW_ALLOC |
+                       TRANSFER_FLAGS_SHADOW_INIT_MEM;
+
+    if (pOut == NULL)
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    if (g_grSaxpyDone)
+    {
+        portMemCopy(pOut, sizeof(*pOut), &g_grSaxpyCache, sizeof(g_grSaxpyCache));
+        return NV_OK;
+    }
+    portMemSet(pOut, 0, sizeof(*pOut));
+    pOut->lookupStatus = 0xFFFFFFFF;
+    pOut->mapStatus    = 0xFFFFFFFF;
+    pOut->tokenStatus  = 0xFFFFFFFF;
+    pOut->submitStatus = 0xFFFFFFFF;
+    pOut->fenceStatus  = 0xFFFFFFFF;
+    pOut->semStatus    = 0xFFFFFFFF;
+    pOut->verifyStatus = 0xFFFFFFFF;
+    pOut->firstBadIdx  = 0xFFFFFFFF;
+
+    if (!g_grChanDone)
+    {
+        return NV_ERR_INVALID_STATE; /* run step17 first */
+    }
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    pGpu = gpumgrGetGpu(gpuInstance);
+    if (pGpu == NULL || !pGpu->gspRmInitialized)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
+    }
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    status = rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pKernelFifo = GPU_GET_KERNEL_FIFO(pGpu);
+    pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
+
+    /* 1. Locate channel/buffer/USERD. */
+    {
+        NvU32 subdevInst;
+        status = serverGetClientUnderLock(&g_resServ, g_grAllocCache.hClient, &pRsClient);
+        if (status == NV_OK)
+            status = CliGetKernelChannel(pRsClient, g_grChanCache.hChannel, &pKernelChannel);
+        if (status == NV_OK)
+            status = memGetByHandle(pRsClient, g_grChanCache.hPhysBuf, &pBufMemory);
+        if (status == NV_OK)
+        {
+            pBufMemDesc = pBufMemory->pMemDesc;
+            subdevInst = gpumgrGetSubDeviceInstanceFromGpu(pGpu);
+            pUserdMemDesc = pKernelChannel->pUserdSubDeviceMemDesc[subdevInst];
+            if (pBufMemDesc == NULL || pUserdMemDesc == NULL)
+                status = NV_ERR_INVALID_STATE;
+        }
+        pOut->lookupStatus = status;
+        if (status != NV_OK) goto report;
+    }
+
+    /* 2. CPU maps. */
+    {
+        pBufCpu = memmgrMemDescBeginTransfer(pMemoryManager, pBufMemDesc, TRANSFER_FLAGS_NONE);
+        pUserdCpu = memmgrMemDescBeginTransfer(pMemoryManager, pUserdMemDesc, userdFlags);
+        pOut->mapStatus = (pBufCpu != NULL && pUserdCpu != NULL) ? NV_OK : NV_ERR_GENERIC;
+        if (pOut->mapStatus != NV_OK) goto report;
+    }
+
+    pOut->kernelVA = g_grChanCache.bufGpuVA + ECLIPSE_SAXPY_KERNEL_OFF;
+    pOut->qmdVA    = g_grChanCache.bufGpuVA + ECLIPSE_SAXPY_QMD_OFF;
+    pOut->outVA    = g_grChanCache.bufGpuVA + ECLIPSE_SAXPY_Y_OFF;
+
+    /* 3. Prefill x[i]=i, y[i]=100+i; patch a/x/y; build the QMD. */
+    {
+        NvU32 kern[64];
+        NvU32 *qmd = (NvU32 *)(pBufCpu + ECLIPSE_SAXPY_QMD_OFF);
+        NvU64 semVA = g_grChanCache.bufGpuVA + ECLIPSE_SAXPY_SEM_OFF;
+        NvU64 xVA = g_grChanCache.bufGpuVA + ECLIPSE_SAXPY_X_OFF;
+        NvU64 yVA = pOut->outVA;
+        volatile NvU32 *px = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_X_OFF);
+        volatile NvU32 *py = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_Y_OFF);
+        NvU32 i;
+        for (i = 0; i < 32; i++) { px[i] = i; py[i] = 100u + i; }
+
+        portMemCopy(kern, sizeof(kern), g_sm75SaxpyKernel, sizeof(g_sm75SaxpyKernel));
+        kern[5]  = ECLIPSE_SAXPY_A;
+        kern[9]  = NvU64_LO32(xVA);
+        kern[13] = NvU64_HI32(xVA);
+        kern[17] = NvU64_LO32(yVA);
+        kern[21] = NvU64_HI32(yVA);
+        portMemCopy(pBufCpu + ECLIPSE_SAXPY_KERNEL_OFF, sizeof(kern), kern, sizeof(kern));
+        *(volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_SEM_OFF) = 0;
+        *(volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_FENCE_OFF) = 0;
+
+        portMemSet(qmd, 0, 256);
+        QMD_SET(qmd, QMDF_QMD_MAJOR_VERSION, 2);
+        QMD_SET(qmd, QMDF_QMD_VERSION, 2);
+        QMD_SET(qmd, QMDF_API_VISIBLE_CALL_LIMIT, 1);
+        QMD_SET(qmd, QMDF_SAMPLER_INDEX, 0);
+        QMD_SET(qmd, QMDF_SM_GLOBAL_CACHING_ENABLE, 1);
+        QMD_SET(qmd, QMDF_CTA_RASTER_WIDTH, 1);
+        QMD_SET(qmd, QMDF_CTA_RASTER_HEIGHT, 1);
+        QMD_SET(qmd, QMDF_CTA_RASTER_DEPTH, 1);
+        QMD_SET(qmd, QMDF_CTA_THREAD_DIMENSION0, 32);
+        QMD_SET(qmd, QMDF_CTA_THREAD_DIMENSION1, 1);
+        QMD_SET(qmd, QMDF_CTA_THREAD_DIMENSION2, 1);
+        QMD_SET(qmd, QMDF_PROGRAM_ADDRESS_LOWER, (NvU32)(pOut->kernelVA & 0xFFFFFFFFu));
+        QMD_SET(qmd, QMDF_PROGRAM_ADDRESS_UPPER, (NvU32)(pOut->kernelVA >> 32));
+        QMD_SET(qmd, QMDF_REGISTER_COUNT_V, ECLIPSE_LAUNCH_REG_COUNT);
+        QMD_SET(qmd, QMDF_MIN_SM_CONFIG_SHMEM, 9);
+        QMD_SET(qmd, QMDF_TARGET_SM_CONFIG_SHMEM, 9);
+        QMD_SET(qmd, QMDF_MAX_SM_CONFIG_SHMEM, 17);
+        QMD_SET(qmd, QMDF_CWD_MEMBAR_TYPE, 1);
+        QMD_SET(qmd, QMDF_RELEASE_MEMBAR_TYPE, 1);
+        QMD_SET(qmd, QMDF_SEMAPHORE_RELEASE_ENABLE0, 1);
+        QMD_SET(qmd, QMDF_RELEASE0_ADDRESS_LOWER, (NvU32)(semVA & 0xFFFFFFFFu));
+        QMD_SET(qmd, QMDF_RELEASE0_ADDRESS_UPPER, (NvU32)(semVA >> 32));
+        QMD_SET(qmd, QMDF_RELEASE0_STRUCTURE_SIZE, 1);
+        QMD_SET(qmd, QMDF_RELEASE0_PAYLOAD, ECLIPSE_SAXPY_SEM_PAYLOAD);
+        osFlushCpuWriteCombineBuffer();
+    }
+
+    /* 4. Token. */
+    {
+        pOut->tokenStatus = kfifoGenerateWorkSubmitToken(pGpu, pKernelFifo,
+                                                         pKernelChannel,
+                                                         &pOut->workToken, NV_TRUE);
+        pOut->runlistId = kchannelGetRunlistId(pKernelChannel);
+        if (pOut->tokenStatus != NV_OK) goto report;
+    }
+
+    /* 5. Launch. */
+    {
+        volatile NvU32 *pb = (volatile NvU32 *)pBufCpu;
+        volatile NvU32 *gp = (volatile NvU32 *)(pBufCpu + ECLIPSE_CHAN_GPFIFO_OFF);
+        volatile Nvc46fControl *pUserd = (volatile Nvc46fControl *)pUserdCpu;
+        NvU32 n = 0, put, gpEntry0, gpEntry1;
+        NvU64 pbVA = g_grChanCache.bufGpuVA;
+        NvU64 fenceVA = g_grChanCache.bufGpuVA + ECLIPSE_SAXPY_FENCE_OFF;
+
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_SET_OBJECT, 1);
+        pb[n++] = TURING_COMPUTE_A;
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_SET_SHADER_SHARED_MEMORY_WINDOW_A, 2);
+        pb[n++] = 0;
+        pb[n++] = 0xFE000000;
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_SET_SHADER_LOCAL_MEMORY_WINDOW_A, 2);
+        pb[n++] = 0;
+        pb[n++] = 0xFF000000;
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_INVALIDATE_SKED_CACHES, 1);
+        pb[n++] = 0;
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_SEND_PCAS_A, 1);
+        pb[n++] = (NvU32)(pOut->qmdVA >> 8);
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_SEND_SIGNALING_PCAS_B, 1);
+        pb[n++] = DRF_DEF(C5C0, _SEND_SIGNALING_PCAS_B, _INVALIDATE, _TRUE) |
+                  DRF_DEF(C5C0, _SEND_SIGNALING_PCAS_B, _SCHEDULE, _TRUE);
+        pb[n++] = ECLIPSE_PUSH_HDR(0, NVC46F_SEM_ADDR_LO, 5);
+        pb[n++] = NvU64_LO32(fenceVA);
+        pb[n++] = DRF_NUM(C46F, _SEM_ADDR_HI, _OFFSET, NvU64_HI32(fenceVA));
+        pb[n++] = ECLIPSE_SAXPY_FENCE_PAYLOAD;
+        pb[n++] = 0;
+        pb[n++] = DRF_DEF(C46F, _SEM_EXECUTE, _OPERATION, _RELEASE) |
+                  DRF_DEF(C46F, _SEM_EXECUTE, _RELEASE_WFI, _DIS) |
+                  DRF_DEF(C46F, _SEM_EXECUTE, _PAYLOAD_SIZE, _32BIT);
+        pOut->pushDwords = n;
+
+        put = pUserd->GPPut;
+        gpEntry0 = DRF_DEF(906F, _GP_ENTRY0, _NO_CONTEXT_SWITCH, _FALSE) |
+                   DRF_NUM(906F, _GP_ENTRY0, _GET, NvU64_LO32(pbVA) >> 2);
+        gpEntry1 = DRF_NUM(906F, _GP_ENTRY1, _GET_HI, NvU64_HI32(pbVA)) |
+                   DRF_NUM(906F, _GP_ENTRY1, _LENGTH, n) |
+                   DRF_DEF(906F, _GP_ENTRY1, _LEVEL, _MAIN);
+        gp[(put % ECLIPSE_CHAN_GPFIFO_ENTRIES) * 2 + 0] = gpEntry0;
+        gp[(put % ECLIPSE_CHAN_GPFIFO_ENTRIES) * 2 + 1] = gpEntry1;
+        osFlushCpuWriteCombineBuffer();
+
+        pUserd->GPPut = put + 1;
+        osFlushCpuWriteCombineBuffer();
+
+        status = kbusFlushPcieForBar0Doorbell_HAL(pGpu, GPU_GET_KERNEL_BUS(pGpu));
+        if (status == NV_OK)
+            status = kfifoUpdateUsermodeDoorbell_HAL(pGpu, pKernelFifo,
+                                                     pOut->workToken, pOut->runlistId);
+        pOut->submitStatus = status;
+        nv_printf(0, "[eclipse-rm-trace] step23: launch (%u dw, GPPut=%u) -> 0x%x qmd=0x%llx prog=0x%llx y=0x%llx a=%u\n",
+                  n, put + 1, pOut->submitStatus, pOut->qmdVA, pOut->kernelVA, pOut->outVA,
+                  (NvU32)ECLIPSE_SAXPY_A);
+        if (status != NV_OK) goto report;
+    }
+
+    /* 6. Poll fence + RELEASE0, then verify y[i] == a*i + (100+i) = 4i+100. */
+    {
+        volatile NvU32 *pSem = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_SEM_OFF);
+        volatile NvU32 *pFence = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_FENCE_OFF);
+        volatile NvU32 *pY = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_Y_OFF);
+        NvU32 i;
+        for (i = 0; i < ECLIPSE_LAUNCH_POLL_MS2; i++)
+        {
+            if (pOut->fenceStatus != NV_OK && *pFence == ECLIPSE_SAXPY_FENCE_PAYLOAD)
+            {
+                pOut->fenceStatus = NV_OK;
+                pOut->fenceIters = i;
+            }
+            if (pOut->semStatus != NV_OK && *pSem == ECLIPSE_SAXPY_SEM_PAYLOAD)
+            {
+                pOut->semStatus = NV_OK;
+                pOut->semIters = i;
+            }
+            if (pOut->fenceStatus == NV_OK && pOut->semStatus == NV_OK)
+                break;
+            os_delay_us(1000);
+        }
+        if (pOut->fenceStatus != NV_OK) { pOut->fenceStatus = NV_ERR_TIMEOUT; pOut->fenceIters = i; }
+        if (pOut->semStatus != NV_OK)   { pOut->semStatus = NV_ERR_TIMEOUT;   pOut->semIters = i; }
+
+        pOut->matchCount = 0;
+        for (i = 0; i < 32; i++)
+        {
+            NvU32 v = pY[i];
+            if (v == (NvU32)ECLIPSE_SAXPY_A * i + (100u + i))
+            {
+                pOut->matchCount++;
+            }
+            else if (pOut->firstBadIdx == 0xFFFFFFFF)
+            {
+                pOut->firstBadIdx = i;
+                pOut->firstBadVal = v;
+            }
+        }
+        pOut->verifyStatus = (pOut->matchCount == 32) ? NV_OK : NV_ERR_INVALID_DATA;
+        nv_printf(0, "[eclipse-rm-trace] step23: fence 0x%x (@%u ms) sem 0x%x (@%u ms) verify 0x%x (%u/32, firstBad=%u val=0x%x)\n",
+                  pOut->fenceStatus, pOut->fenceIters, pOut->semStatus, pOut->semIters,
+                  pOut->verifyStatus, pOut->matchCount, pOut->firstBadIdx, pOut->firstBadVal);
+    }
+
+report:
+    if (pBufCpu != NULL)
+        memmgrMemDescEndTransfer(pMemoryManager, pBufMemDesc, TRANSFER_FLAGS_NONE);
+    if (pUserdCpu != NULL)
+        memmgrMemDescEndTransfer(pMemoryManager, pUserdMemDesc, userdFlags);
+
+    if (pOut->semStatus == NV_OK && pOut->verifyStatus == NV_OK)
+    {
+        portMemCopy(&g_grSaxpyCache, sizeof(g_grSaxpyCache), pOut, sizeof(*pOut));
+        g_grSaxpyDone = NV_TRUE;
+    }
+
+    rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
+    rmapiLockRelease();
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return NV_OK; /* per-stage statuses carry any failure */
+}
+
+/*
  * Step-9: the rest of the real RmInitAdapter device bring-up
  * (arch/nvalloc/unix/src/osinit.c, RmInitNvDevice), run after kgspInitRm
  * exactly like the Linux driver does:
