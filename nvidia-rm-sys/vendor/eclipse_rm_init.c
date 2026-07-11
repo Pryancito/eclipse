@@ -3686,11 +3686,20 @@ report:
  *   dbgx[tid]==0x1234000i -> LDG works AND CPU->GPU coherence works
  *   dbgx[tid]==0          -> LDG returns zero (coherence or encoding)
  *   dbgx[tid]==0xD00D00.. -> kernel trapped before the store
+ *
+ * ROOT-CAUSE FIX vs the first two failing runs: the load is now
+ * LDG.E.STRONG.SYS (hi-code 0x1f6900), bit-exact against the corpus
+ * instance "LDG.E.STRONG.SYS R28,[R30]" = 0x1e1c7381/0x1f6900. The
+ * earlier 0x1ee900 was an INTERPOLATED B32+weak+SYS combination that
+ * appears NOWHERE in the 3672-record sm_75 corpus (weak-SYS exists only
+ * for U16/S16/128 there) -- an unobserved order/scope combo, matching
+ * the erratic behavior seen on silicon (zeros once, hang once).
+ *
  * Patched immediates at dword indices 5 (x_lo), 9 (x_hi),
  * 21 (dbgx_lo), 25 (dbgx_hi).
  *   S2R R0,SR_TID.X (wr0)
  *   MOV R2,x_lo ; MOV R3,x_hi ; IMAD.WIDE R2,R0,4,R2 (wait wr0)
- *   LDG.E.SYS R8,[R2] (wr1)
+ *   LDG.E.STRONG.SYS R8,[R2] (wr1)
  *   MOV R6,dbgx_lo ; MOV R7,dbgx_hi ; IMAD.WIDE R6,R0,4,R6 (wait wr0)
  *   STG.E.SYS [R6],R8 (wait wr1) ; EXIT ; NOP pad                     */
 static const NvU32 g_sm75SaxpyKernel[64] = {
@@ -3698,7 +3707,7 @@ static const NvU32 g_sm75SaxpyKernel[64] = {
     0x00027802, 0xBBBB0000, 0x00000f00, 0x000fc400,
     0x00037802, 0x00000000, 0x00000f00, 0x000fc400,
     0x00027825, 0x00000004, 0x078e0002, 0x001fcc00,
-    0x02087381, 0x00000000, 0x001ee900, 0x000e4400,
+    0x02087381, 0x00000000, 0x001f6900, 0x000e4400,
     0x00067802, 0xDDDD0000, 0x00000f00, 0x000fc400,
     0x00077802, 0x00000000, 0x00000f00, 0x000fc400,
     0x00067825, 0x00000004, 0x078e0006, 0x001fcc00,
