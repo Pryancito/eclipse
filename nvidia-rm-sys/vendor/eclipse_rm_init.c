@@ -3685,47 +3685,61 @@ report:
 #define ECLIPSE_SAXPY_FENCE_OFF  0x8440
 #define ECLIPSE_SAXPY_FENCE_PAYLOAD 0xFE7C4ED5
 
-/* SM75 -- SINGLE LOAD + MARKERS, 15 instructions + NOP pad. The three-
- * experiment battery proved the warp HANGS on the very first STRONG load
- * (all sentinels intact, fence+RELEASE0 timeout) even when the address is
- * the kernel's own ifetch-proven page, and the cache-invalidate bits did
- * not help. SM stores and ifetch work; the SM *data read* path does not.
- * That is the signature of an MMU fault on the load's data access, which
- * hangs the warp with interrupts disabled. So: one load, bracketed by
- * posted stores that DO land regardless, then the RM's own
- * NV906F_CTRL_CMD_GET_MMU_FAULT_INFO is queried after the timeout to name
- * the fault (address, type, string).
- * marker[tid] (12 B): +0 BEFORE(0xBE40|tid, lands pre-load),
- *                     +4 loaded value, +8 AFTER(0xAF7E|tid, post-load).
- * Patched immediates at dword indices 5/9 (marker base), 25/29 (x).
+/* SM75 -- TWO-SCOPE LOAD PROBE + MARKERS, 18 instructions + NOP pad.
+ *
+ * Re-diagnosis after the cacheable-buffer boot (6ccdf7d8): the grid did
+ * NOT hang on the load -- it never LAUNCHED at all (even the pre-load
+ * BEFORE store, an instruction-5 register->store with no memory read
+ * ahead of it, did not land). The one and only QMD delta vs run #1
+ * (5b131eb7, which DID launch and complete) is the six INVALIDATE_*_CACHE
+ * bits added in c71fbad6. Invalidating the instruction/texture caches at
+ * dispatch -- with no TIC/TSC bound -- kills the launch. So every "STRONG
+ * hangs" verdict from the battery/marker runs was an artifact: those grids
+ * never ran. Fix: drop the invalidate bits (QMD == run #1's launching QMD).
+ *
+ * Established facts: weak LDG.E.SYS (0x1ee900) LAUNCHES and COMPLETES
+ * (run #1) -- it only read 0 there because run #1's buffer was
+ * GPU_CACHEABLE=NO (stale/uncoherent). The cacheable buffer (honored per
+ * mem_mgr_gm107.c) is the missing half. Never-tried combo, tested here:
+ * weak load + cacheable buffer + no invalidate bits. A corpus-verified
+ * CONSTANT.SYS load (0x1e6900, read-only path) rides along as a second,
+ * independent probe -- weak first (proven to complete, result always
+ * lands), constant second -- so one boot reads out both memory paths.
+ *
+ * marker[tid] (16 B): +0 BEFORE(0xBE400000, pre-load landmark),
+ *                     +4 weak-load value, +8 constant-load value,
+ *                     +12 AFTER(0xAF7E0000, post-load landmark).
+ * Patched immediates at dword indices 5/9 (marker base), 25/29 (cache VA).
  *   S2R R0,SR_TID.X (wr0)
- *   MOV R6,mk_lo; MOV R7,mk_hi; IMAD.WIDE R6,R0,12,R6 (wait wr0)
+ *   MOV R6,mk_lo; MOV R7,mk_hi; IMAD.WIDE R6,R0,16,R6 (wait wr0)
  *   MOV R10,0xBE400000 ; STG [R6],R10                    (before)
- *   MOV R2,x_lo; MOV R3,x_hi; IMAD.WIDE R2,R0,4,R2 (wait wr0)
- *   LDG.E.STRONG.SYS R8,[R2] (wr1)                        THE load
- *   IADD3 R11,R6,4 ; STG [R11],R8 (wait wr1)              (loaded)
- *   IADD3 R12,R6,8 ; MOV R13,0xAF7E0000 ; STG [R12],R13   (after)
+ *   MOV R2,c_lo; MOV R3,c_hi; IMAD.WIDE R2,R0,4,R2 (wait wr0)
+ *   LDG.E.SYS R8,[R2] (weak, wr1)                         weak load
+ *   IADD3 R11,R6,4 ; STG [R11],R8 (wait wr1)              (weak slot)
+ *   LDG.E.CONSTANT.SYS R12,[R2] (wr2)                     constant load
+ *   IADD3 R13,R6,8 ; STG [R13],R12 (wait wr2)             (const slot)
+ *   IADD3 R14,R6,12 ; MOV R15,0xAF7E0000 ; STG [R14],R15  (after)
  *   EXIT ; NOP pad                                                     */
 static const NvU32 g_sm75SaxpyKernel[80] = {
-    0x00007919, 0x00000000, 0x00002100, 0x000e0400,
+    0x00007919, 0x00000000, 0x00002100, 0x000e0200,
     0x00067802, 0x00000000, 0x00000f00, 0x000fc400,
     0x00077802, 0x00000000, 0x00000f00, 0x000fc400,
-    0x00067825, 0x0000000c, 0x078e0006, 0x001fcc00,
+    0x00067825, 0x00000010, 0x078e0006, 0x001fca00,
     0x000a7802, 0xbe400000, 0x00000f00, 0x000fc400,
-    0x06007386, 0x0000000a, 0x0010e900, 0x000fcc00,
+    0x06007386, 0x0000000a, 0x0010e900, 0x000fc400,
     0x00027802, 0x00000000, 0x00000f00, 0x000fc400,
     0x00037802, 0x00000000, 0x00000f00, 0x000fc400,
-    0x00027825, 0x00000004, 0x078e0002, 0x001fcc00,
-    0x02087381, 0x00000000, 0x001f6900, 0x000e4400,
-    0x060b7810, 0x00000004, 0x07ffe0ff, 0x000fcc00,
+    0x00027825, 0x00000004, 0x078e0002, 0x001fca00,
+    0x02087381, 0x00000000, 0x001ee900, 0x000e4400,
+    0x060b7810, 0x00000004, 0x07ffe0ff, 0x000fc400,
     0x0b007386, 0x00000008, 0x0010e900, 0x002fcc00,
-    0x060c7810, 0x00000008, 0x07ffe0ff, 0x000fc400,
-    0x000d7802, 0xaf7e0000, 0x00000f00, 0x000fc400,
-    0x0c007386, 0x0000000d, 0x0010e900, 0x002fcc00,
+    0x0c087381, 0x00000000, 0x001e6900, 0x000e8400,
+    0x060d7810, 0x00000008, 0x07ffe0ff, 0x000fc400,
+    0x0d007386, 0x0000000c, 0x0010e900, 0x004fcc00,
+    0x060e7810, 0x0000000c, 0x07ffe0ff, 0x000fc400,
+    0x000f7802, 0xaf7e0000, 0x00000f00, 0x000fc400,
+    0x0e007386, 0x0000000f, 0x0010e900, 0x000fc400,
     0x0000794d, 0x00000000, 0x03800000, 0x000fea00,
-    0x00007918, 0x00000000, 0x00000000, 0x000fc000,
-    0x00007918, 0x00000000, 0x00000000, 0x000fc000,
-    0x00007918, 0x00000000, 0x00000000, 0x000fc000,
     0x00007918, 0x00000000, 0x00000000, 0x000fc000,
 };
 
@@ -3936,9 +3950,10 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
         {
             px[i] = 0x12340000u | i;
             py[i] = 100u + i;
-            pdx[i * 3 + 0] = 0x5EED0000u | i;   /* before slot (kernel writes 0xBE40|.. hi only) */
-            pdx[i * 3 + 1] = 0x5EED1111u;       /* loaded slot */
-            pdx[i * 3 + 2] = 0x5EED2222u;       /* after slot  */
+            pdx[i * 4 + 0] = 0x5EED0000u | i;   /* before slot (kernel writes 0xBE400000) */
+            pdx[i * 4 + 1] = 0x5EED1111u;       /* weak-load slot   */
+            pdx[i * 4 + 2] = 0x5EED2222u;       /* const-load slot  */
+            pdx[i * 4 + 3] = 0x5EED3333u;       /* after slot       */
         }
 
         /* Seed the CACHEABLE data buffer (GPU_CACHEABLE=YES) that the SM
@@ -3964,16 +3979,11 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
         QMD_SET(qmd, QMDF_API_VISIBLE_CALL_LIMIT, 1);
         QMD_SET(qmd, QMDF_SAMPLER_INDEX, 0);
         QMD_SET(qmd, QMDF_SM_GLOBAL_CACHING_ENABLE, 1);
-        /* Invalidate every shader-visible cache at launch (CUDA does this
-         * routinely; our virgin GR context has never had its L1TEX data
-         * cache invalidated -- prime suspect for loads hanging while
-         * stores/ifetch work). Official clc3c0qmd.h bit positions. */
-        QMD_SET(qmd, QMDF_INVAL_TEX_HEADER_CACHE, 1);
-        QMD_SET(qmd, QMDF_INVAL_TEX_SAMPLER_CACHE, 1);
-        QMD_SET(qmd, QMDF_INVAL_TEX_DATA_CACHE, 1);
-        QMD_SET(qmd, QMDF_INVAL_SHADER_DATA_CACHE, 1);
-        QMD_SET(qmd, QMDF_INVAL_INSTRUCTION_CACHE, 1);
-        QMD_SET(qmd, QMDF_INVAL_SHADER_CONST_CACHE, 1);
+        /* NO INVALIDATE_*_CACHE bits: they were the sole QMD delta vs the
+         * launching run #1, and setting them (invalidating instruction /
+         * texture caches with no TIC/TSC bound) kills the grid dispatch --
+         * the grid never runs. A fresh channel's L2 is cold anyway, so the
+         * first load of the cacheable buffer misses -> fetches from sysmem. */
         QMD_SET(qmd, QMDF_CTA_RASTER_WIDTH, 1);
         QMD_SET(qmd, QMDF_CTA_RASTER_HEIGHT, 1);
         QMD_SET(qmd, QMDF_CTA_RASTER_DEPTH, 1);
@@ -4093,8 +4103,8 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
             volatile NvU32 *pm = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF);
             for (i = 0; i < 32; i++)
             {
-                /* success = the load landed the right value in the loaded slot. */
-                if (pm[i * 3 + 1] == (0x12340000u | i))
+                /* success = the weak load landed the right value. */
+                if (pm[i * 4 + 1] == (0x12340000u | i))
                     pOut->matchCount++;
             }
         }
@@ -4105,10 +4115,10 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
             nv_printf(0, "[eclipse-rm-trace] step23: fence 0x%x (@%u ms) sem 0x%x (@%u ms) load-completed %u/32\n",
                       pOut->fenceStatus, pOut->fenceIters, pOut->semStatus, pOut->semIters,
                       pOut->matchCount);
-            nv_printf(0, "[eclipse-rm-trace] step23 CACHEABLE-load MARK tid0: before=0x%x loaded=0x%x after=0x%x (want BE400000 / 0x12340000 / AF7E0000)\n",
-                      pm[0], pm[1], pm[2]);
-            nv_printf(0, "[eclipse-rm-trace] step23 MARK tid1: before=0x%x loaded=0x%x after=0x%x (want .. / 0x12340001 / ..)\n",
-                      pm[3], pm[4], pm[5]);
+            nv_printf(0, "[eclipse-rm-trace] step23 CACHEABLE MARK tid0: before=0x%x weak=0x%x const=0x%x after=0x%x (want BE400000 / 0x12340000 / 0x12340000 / AF7E0000)\n",
+                      pm[0], pm[1], pm[2], pm[3]);
+            nv_printf(0, "[eclipse-rm-trace] step23 MARK tid1: before=0x%x weak=0x%x const=0x%x after=0x%x (want .. / 0x12340001 / 0x12340001 / ..)\n",
+                      pm[4], pm[5], pm[6], pm[7]);
         }
         /* Ask the RM why: MMU fault info for this channel. If the load
          * data-faulted, this names the address, type and human string. */

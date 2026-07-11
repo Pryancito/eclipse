@@ -226,7 +226,6 @@ fn primary_main(config: kernel_hal::KernelConfig) {
 #[cfg(feature = "linux")]
 fn load_nvidia_gsp_firmware(root: &alloc::sync::Arc<dyn rcore_fs::vfs::INode>) {
     use alloc::string::String;
-    use rcore_fs::vfs::INode;
     const PATH: &str = "/lib/firmware/nvidia/gsp/gsp.bin";
 
     // Push a status string to every DRM driver even on failure, so a driver
