@@ -3670,33 +3670,45 @@ report:
 #define ECLIPSE_SAXPY_QMD_OFF    0x2600
 #define ECLIPSE_SAXPY_X_OFF      0x5000   /* x[32] */
 #define ECLIPSE_SAXPY_Y_OFF      0x5100   /* y[32] (also the output) */
+#define ECLIPSE_SAXPY_DBGX_OFF   0x5200   /* debug: loaded x per thread */
+#define ECLIPSE_SAXPY_DBGY_OFF   0x5300   /* debug: loaded y per thread */
 #define ECLIPSE_SAXPY_A          3
 #define ECLIPSE_SAXPY_SEM_OFF    0x8400
 #define ECLIPSE_SAXPY_SEM_PAYLOAD 0x5A55C0D5
 #define ECLIPSE_SAXPY_FENCE_OFF  0x8440
 #define ECLIPSE_SAXPY_FENCE_PAYLOAD 0xFE7C4ED5
 
-/* SM75 integer SAXPY, 16 instructions. Patched immediates at dword indices
- * 5 (a), 9 (x_lo), 13 (x_hi), 17 (y_lo), 21 (y_hi).
- *   S2R R0, SR_TID.X (wr0)
- *   MOV R4,a ; MOV R2,x_lo ; MOV R3,x_hi ; MOV R6,y_lo ; MOV R7,y_hi
- *   IMAD.WIDE.U32 R2,R0,4,R2 (wait wr0)   &x[tid]
- *   IMAD.WIDE.U32 R6,R0,4,R6 (wait wr0)   &y[tid]
- *   LDG.E.SYS R8,[R2] (wr1)               x[tid]
- *   LDG.E.SYS R9,[R6] (wr2)               y[tid]
- *   IMAD R8,R8,R4,R9  (wait wr1+wr2)       a*x + y
- *   STG.E.SYS [R6],R8 ; EXIT ; NOP pad                            */
-static const NvU32 g_sm75SaxpyKernel[64] = {
+/* SM75 SAXPY -- DIAGNOSTIC variant, 24 instructions. It also stores the
+ * loaded x and y back to dbgx[tid]/dbgy[tid] so the CPU can see exactly
+ * what the GPU's LDG returned (isolates load-data vs compute/store).
+ * Patched immediates at dword indices 5 (a), 9/13 (x lo/hi),
+ * 17/21 (y lo/hi), 25/29 (dbgx lo/hi), 33/37 (dbgy lo/hi).
+ *   S2R R0,SR_TID.X (wr0)
+ *   MOV R4,a; MOV R2:R3,x; MOV R6:R7,y; MOV R10:R11,dbgx; MOV R12:R13,dbgy
+ *   IMAD.WIDE R2,R0,4,R2 / R6 / R10 / R12  (each waits wr0)   per-thread addrs
+ *   LDG.E.SYS R8,[R2] (wr1) ; LDG.E.SYS R9,[R6] (wr2)
+ *   STG.E.SYS [R10],R8 (wait wr1)   dbgx = loaded x
+ *   STG.E.SYS [R12],R9 (wait wr2)   dbgy = loaded y
+ *   IMAD R8,R8,R4,R9 (wait wr1+wr2) ; STG.E.SYS [R6],R8 ; EXIT ; NOP pad */
+static const NvU32 g_sm75SaxpyKernel[96] = {
     0x00007919, 0x00000000, 0x00002100, 0x000e0200,
-    0x00047802, 0xAAAA0000, 0x00000f00, 0x000fc400,
+    0x00047802, 0x0000000A, 0x00000f00, 0x000fc400,
     0x00027802, 0xBBBB0000, 0x00000f00, 0x000fc400,
     0x00037802, 0x00000000, 0x00000f00, 0x000fc400,
     0x00067802, 0xCCCC0000, 0x00000f00, 0x000fc400,
     0x00077802, 0x00000000, 0x00000f00, 0x000fc400,
-    0x00027825, 0x00000004, 0x078e0002, 0x001fc800,
-    0x00067825, 0x00000004, 0x078e0006, 0x001fc800,
+    0x000a7802, 0xDDDD0000, 0x00000f00, 0x000fc400,
+    0x000b7802, 0x00000000, 0x00000f00, 0x000fc400,
+    0x000c7802, 0xEEEE0000, 0x00000f00, 0x000fc400,
+    0x000d7802, 0x00000000, 0x00000f00, 0x000fc400,
+    0x00027825, 0x00000004, 0x078e0002, 0x001fc400,
+    0x00067825, 0x00000004, 0x078e0006, 0x001fc400,
+    0x000a7825, 0x00000004, 0x078e000a, 0x001fc400,
+    0x000c7825, 0x00000004, 0x078e000c, 0x001fc800,
     0x02087381, 0x00000000, 0x001ee900, 0x000e4400,
     0x06097381, 0x00000000, 0x001ee900, 0x000e8400,
+    0x0a007386, 0x00000008, 0x0010e900, 0x002fc400,
+    0x0c007386, 0x00000009, 0x0010e900, 0x004fc400,
     0x08087224, 0x00000004, 0x078e0209, 0x006fc800,
     0x06007386, 0x00000008, 0x0010e900, 0x000fc400,
     0x0000794d, 0x00000000, 0x03800000, 0x000fea00,
@@ -3822,10 +3834,14 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
         NvU64 semVA = g_grChanCache.bufGpuVA + ECLIPSE_SAXPY_SEM_OFF;
         NvU64 xVA = g_grChanCache.bufGpuVA + ECLIPSE_SAXPY_X_OFF;
         NvU64 yVA = pOut->outVA;
+        NvU64 dxVA = g_grChanCache.bufGpuVA + ECLIPSE_SAXPY_DBGX_OFF;
+        NvU64 dyVA = g_grChanCache.bufGpuVA + ECLIPSE_SAXPY_DBGY_OFF;
         volatile NvU32 *px = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_X_OFF);
         volatile NvU32 *py = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_Y_OFF);
+        volatile NvU32 *pdx = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF);
+        volatile NvU32 *pdy = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGY_OFF);
         NvU32 i;
-        for (i = 0; i < 32; i++) { px[i] = i; py[i] = 100u + i; }
+        for (i = 0; i < 32; i++) { px[i] = i; py[i] = 100u + i; pdx[i] = 0xD00D0000u | i; pdy[i] = 0xD00D0000u | i; }
 
         portMemCopy(kern, sizeof(kern), g_sm75SaxpyKernel, sizeof(g_sm75SaxpyKernel));
         kern[5]  = ECLIPSE_SAXPY_A;
@@ -3833,6 +3849,10 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
         kern[13] = NvU64_HI32(xVA);
         kern[17] = NvU64_LO32(yVA);
         kern[21] = NvU64_HI32(yVA);
+        kern[25] = NvU64_LO32(dxVA);
+        kern[29] = NvU64_HI32(dxVA);
+        kern[33] = NvU64_LO32(dyVA);
+        kern[37] = NvU64_HI32(dyVA);
         portMemCopy(pBufCpu + ECLIPSE_SAXPY_KERNEL_OFF, sizeof(kern), kern, sizeof(kern));
         *(volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_SEM_OFF) = 0;
         *(volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_FENCE_OFF) = 0;
@@ -3975,6 +3995,17 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
         nv_printf(0, "[eclipse-rm-trace] step23: fence 0x%x (@%u ms) sem 0x%x (@%u ms) verify 0x%x (%u/32, firstBad=%u val=0x%x)\n",
                   pOut->fenceStatus, pOut->fenceIters, pOut->semStatus, pOut->semIters,
                   pOut->verifyStatus, pOut->matchCount, pOut->firstBadIdx, pOut->firstBadVal);
+        {
+            volatile NvU32 *pdx = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF);
+            volatile NvU32 *pdy = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGY_OFF);
+            volatile NvU32 *px  = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_X_OFF);
+            volatile NvU32 *py  = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_Y_OFF);
+            nv_printf(0, "[eclipse-rm-trace] step23 DIAG: cpu x[0..2]={%u,%u,%u} y[0..2]={%u,%u,%u}\n",
+                      px[0], px[1], px[2], py[0], py[1], py[2]);
+            nv_printf(0, "[eclipse-rm-trace] step23 DIAG: gpu-loaded dbgx[0..3]={0x%x,0x%x,0x%x,0x%x} dbgy[0..3]={0x%x,0x%x,0x%x,0x%x}\n",
+                      pdx[0], pdx[1], pdx[2], pdx[3], pdy[0], pdy[1], pdy[2], pdy[3]);
+            nv_printf(0, "[eclipse-rm-trace] step23 DIAG: (dbgx should be tid=0,1,2,3; dbgy should be 100,101,102,103; 0xD00D.. = kernel never stored)\n");
+        }
     }
 
 report:
