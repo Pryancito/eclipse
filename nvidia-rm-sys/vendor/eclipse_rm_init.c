@@ -3725,7 +3725,7 @@ static const NvU32 g_sm75SaxpyKernel[80] = {
     0x00067802, 0x00000000, 0x00000f00, 0x000fc400,
     0x00077802, 0x00000000, 0x00000f00, 0x000fc400,
     0x00067825, 0x00000010, 0x078e0006, 0x001fca00,
-    0x000a7802, 0xbe400000, 0x00000f00, 0x000fc400,
+    0x000a7802, 0xbe400000, 0x00000f00, 0x000fcf00,
     0x06007386, 0x0000000a, 0x0010e900, 0x000fc400,
     0x00027802, 0x00000000, 0x00000f00, 0x000fc400,
     0x00037802, 0x00000000, 0x00000f00, 0x000fc400,
@@ -3737,7 +3737,7 @@ static const NvU32 g_sm75SaxpyKernel[80] = {
     0x060d7810, 0x00000008, 0x07ffe0ff, 0x000fc400,
     0x0d007386, 0x0000000c, 0x0010e900, 0x004fcc00,
     0x060e7810, 0x0000000c, 0x07ffe0ff, 0x000fc400,
-    0x000f7802, 0xaf7e0000, 0x00000f00, 0x000fc400,
+    0x000f7802, 0xaf7e0000, 0x00000f00, 0x000fcf00,
     0x0e007386, 0x0000000f, 0x0010e900, 0x000fc400,
     0x0000794d, 0x00000000, 0x03800000, 0x000fea00,
     0x00007918, 0x00000000, 0x00000000, 0x000fc000,
@@ -3972,9 +3972,16 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
         portMemCopy(kern, sizeof(kern), g_sm75SaxpyKernel, sizeof(g_sm75SaxpyKernel));
         kern[5]  = NvU64_LO32(dxVA);            /* MOV R6, marker base lo */
         kern[9]  = NvU64_HI32(dxVA);            /* MOV R7, marker base hi */
-        kern[25] = NvU64_LO32(g_saxpyCacheableVA); /* MOV R2, cacheable data lo */
-        kern[29] = NvU64_HI32(g_saxpyCacheableVA); /* MOV R3, cacheable data hi */
-        (void)xVA;
+        /* Load from the MAIN channel buffer's x[] region -- proven SM-
+         * accessible (run #1 loaded from here without faulting). The
+         * separately-mapped GPU_CACHEABLE=YES buffer MMU-faulted on access
+         * (its VA 0x120190000 is not validly reachable from the SM -- the
+         * NV50_MEMORY_VIRTUAL+Map mapping is the suspect, not the load), so
+         * we sidestep it and instead flush the stale L2 via the QMD
+         * SHADER_DATA cache invalidate to get a coherent read of x[]. */
+        kern[25] = NvU64_LO32(xVA);             /* MOV R2, main-buf x lo */
+        kern[29] = NvU64_HI32(xVA);             /* MOV R3, main-buf x hi */
+        (void)g_saxpyCacheableVA;
         portMemCopy(pBufCpu + ECLIPSE_SAXPY_KERNEL_OFF, sizeof(kern), kern, sizeof(kern));
         *(volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_SEM_OFF) = 0;
         *(volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_FENCE_OFF) = 0;
@@ -3985,11 +3992,13 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
         QMD_SET(qmd, QMDF_API_VISIBLE_CALL_LIMIT, 1);
         QMD_SET(qmd, QMDF_SAMPLER_INDEX, 0);
         QMD_SET(qmd, QMDF_SM_GLOBAL_CACHING_ENABLE, 1);
-        /* NO INVALIDATE_*_CACHE bits: they were the sole QMD delta vs the
-         * launching run #1, and setting them (invalidating instruction /
-         * texture caches with no TIC/TSC bound) kills the grid dispatch --
-         * the grid never runs. A fresh channel's L2 is cold anyway, so the
-         * first load of the cacheable buffer misses -> fetches from sysmem. */
+        /* Only the SHADER_DATA cache invalidate -- flush a possibly-stale
+         * (zero) L2 line for the sysmem x[] so the global load reads the
+         * CPU-seeded value coherently. The earlier launch failure was NOT
+         * these bits (it was a kern[] buffer too small to receive the
+         * kernel); the texture/instruction invalidates are left off since
+         * we bind no TIC/TSC and don't need them. */
+        QMD_SET(qmd, QMDF_INVAL_SHADER_DATA_CACHE, 1);
         QMD_SET(qmd, QMDF_CTA_RASTER_WIDTH, 1);
         QMD_SET(qmd, QMDF_CTA_RASTER_HEIGHT, 1);
         QMD_SET(qmd, QMDF_CTA_RASTER_DEPTH, 1);
@@ -4121,7 +4130,7 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
             nv_printf(0, "[eclipse-rm-trace] step23: fence 0x%x (@%u ms) sem 0x%x (@%u ms) load-completed %u/32\n",
                       pOut->fenceStatus, pOut->fenceIters, pOut->semStatus, pOut->semIters,
                       pOut->matchCount);
-            nv_printf(0, "[eclipse-rm-trace] step23 CACHEABLE MARK tid0: before=0x%x weak=0x%x const=0x%x after=0x%x (want BE400000 / 0x12340000 / 0x12340000 / AF7E0000)\n",
+            nv_printf(0, "[eclipse-rm-trace] step23 MAINBUF+INVAL MARK tid0: before=0x%x weak=0x%x const=0x%x after=0x%x (want BE400000 / 0x12340000 / 0x12340000 / AF7E0000)\n",
                       pm[0], pm[1], pm[2], pm[3]);
             nv_printf(0, "[eclipse-rm-trace] step23 MARK tid1: before=0x%x weak=0x%x const=0x%x after=0x%x (want .. / 0x12340001 / 0x12340001 / ..)\n",
                       pm[4], pm[5], pm[6], pm[7]);
