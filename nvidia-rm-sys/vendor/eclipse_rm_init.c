@@ -3931,7 +3931,13 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
 
     /* 3. Prefill x[i]=i, y[i]=100+i; patch a/x/y; build the QMD. */
     {
-        NvU32 kern[64];
+        /* MUST be >= g_sm75SaxpyKernel's length: portMemCopy is a silent
+         * NO-OP (returns NULL, copies nothing) when srcSize > destSize, so
+         * a kern[] smaller than the kernel array leaves it uninitialised
+         * stack garbage -> the SM fetches garbage and the GSP RCs the
+         * channel before a single instruction retires. This was THE step23
+         * launch bug: the kernel grew from 64 to 80 dwords, kern[] didn't. */
+        NvU32 kern[80];
         NvU32 *qmd = (NvU32 *)(pBufCpu + ECLIPSE_SAXPY_QMD_OFF);
         NvU64 semVA = g_grChanCache.bufGpuVA + ECLIPSE_SAXPY_SEM_OFF;
         NvU64 xVA = g_grChanCache.bufGpuVA + ECLIPSE_SAXPY_X_OFF;
