@@ -3720,27 +3720,30 @@ report:
  *   IADD3 R13,R6,8 ; STG [R13],R12 (wait wr2)             (const slot)
  *   IADD3 R14,R6,12 ; MOV R15,0xAF7E0000 ; STG [R14],R15  (after)
  *   EXIT ; NOP pad                                                     */
+/* Loads FIRST (like run #1, which completed without faulting), then all
+ * four marker stores. Patched immediates: dword 5/9 (marker base),
+ * 17/21 (x base). */
 static const NvU32 g_sm75SaxpyKernel[80] = {
-    0x00007919, 0x00000000, 0x00002100, 0x000e0200,
-    0x00067802, 0x00000000, 0x00000f00, 0x000fc400,
-    0x00077802, 0x00000000, 0x00000f00, 0x000fc400,
-    0x00067825, 0x00000010, 0x078e0006, 0x001fca00,
-    0x000a7802, 0xbe400000, 0x00000f00, 0x000fcf00,
-    0x06007386, 0x0000000a, 0x0010e900, 0x000fc400,
-    0x00027802, 0x00000000, 0x00000f00, 0x000fc400,
-    0x00037802, 0x00000000, 0x00000f00, 0x000fc400,
-    0x00027825, 0x00000004, 0x078e0002, 0x001fca00,
-    0x02087381, 0x00000000, 0x001ee900, 0x000e4400,
-    0x060b7810, 0x00000004, 0x07ffe0ff, 0x000fc400,
-    0x0b007386, 0x00000008, 0x0010e900, 0x002fcc00,
-    0x0c087381, 0x00000000, 0x001e6900, 0x000e8400,
-    0x060d7810, 0x00000008, 0x07ffe0ff, 0x000fc400,
-    0x0d007386, 0x0000000c, 0x0010e900, 0x004fcc00,
-    0x060e7810, 0x0000000c, 0x07ffe0ff, 0x000fc400,
-    0x000f7802, 0xaf7e0000, 0x00000f00, 0x000fcf00,
-    0x0e007386, 0x0000000f, 0x0010e900, 0x000fc400,
-    0x0000794d, 0x00000000, 0x03800000, 0x000fea00,
-    0x00007918, 0x00000000, 0x00000000, 0x000fc000,
+    0x00007919, 0x00000000, 0x00002100, 0x000e0200, /* 0  S2R R0,SR_TID.X (wr0)          */
+    0x00067802, 0x00000000, 0x00000f00, 0x000fc400, /* 1  MOV R6, mk_lo  [patch 5]       */
+    0x00077802, 0x00000000, 0x00000f00, 0x000fc400, /* 2  MOV R7, mk_hi  [patch 9]       */
+    0x00067825, 0x00000010, 0x078e0006, 0x001fca00, /* 3  IMAD.WIDE R6,R0,16,R6 (wait 0) */
+    0x00027802, 0x00000000, 0x00000f00, 0x000fc400, /* 4  MOV R2, x_lo   [patch 17]      */
+    0x00037802, 0x00000000, 0x00000f00, 0x000fc400, /* 5  MOV R3, x_hi   [patch 21]      */
+    0x00027825, 0x00000004, 0x078e0002, 0x001fca00, /* 6  IMAD.WIDE R2,R0,4,R2 (wait 0)  */
+    0x02087381, 0x00000000, 0x001ee900, 0x000e4400, /* 7  LDG.E.SYS R8,[R2] (weak, wr1)  */
+    0x0c087381, 0x00000000, 0x001e6900, 0x000e8400, /* 8  LDG.E.CONSTANT.SYS R12,[R2](wr2)*/
+    0x000a7802, 0xbe400000, 0x00000f00, 0x000fcf00, /* 9  MOV R10, 0xBE400000            */
+    0x06007386, 0x0000000a, 0x0010e900, 0x000fc400, /* 10 STG [R6], R10 (before)         */
+    0x060b7810, 0x00000004, 0x07ffe0ff, 0x000fc400, /* 11 IADD3 R11,R6,4,RZ              */
+    0x0b007386, 0x00000008, 0x0010e900, 0x002fcc00, /* 12 STG [R11],R8 (weak,  wait wr1) */
+    0x060d7810, 0x00000008, 0x07ffe0ff, 0x000fc400, /* 13 IADD3 R13,R6,8,RZ              */
+    0x0d007386, 0x0000000c, 0x0010e900, 0x004fcc00, /* 14 STG [R13],R12 (const, wait wr2)*/
+    0x060e7810, 0x0000000c, 0x07ffe0ff, 0x000fc400, /* 15 IADD3 R14,R6,12,RZ             */
+    0x000f7802, 0xaf7e0000, 0x00000f00, 0x000fcf00, /* 16 MOV R15, 0xAF7E0000            */
+    0x0e007386, 0x0000000f, 0x0010e900, 0x000fc400, /* 17 STG [R14],R15 (after)          */
+    0x0000794d, 0x00000000, 0x03800000, 0x000fea00, /* 18 EXIT                           */
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* 19 NOP                            */
 };
 
 static EclipseGrThreads g_grSaxpyCache;
@@ -3988,8 +3991,8 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
          * NV50_MEMORY_VIRTUAL+Map mapping is the suspect, not the load), so
          * we sidestep it and instead flush the stale L2 via the QMD
          * SHADER_DATA cache invalidate to get a coherent read of x[]. */
-        kern[25] = NvU64_LO32(xVA);             /* MOV R2, main-buf x lo */
-        kern[29] = NvU64_HI32(xVA);             /* MOV R3, main-buf x hi */
+        kern[17] = NvU64_LO32(xVA);             /* MOV R2, main-buf x lo */
+        kern[21] = NvU64_HI32(xVA);             /* MOV R3, main-buf x hi */
         (void)g_saxpyCacheableVA;
         portMemCopy(pBufCpu + ECLIPSE_SAXPY_KERNEL_OFF, sizeof(kern), kern, sizeof(kern));
         *(volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_SEM_OFF) = 0;
