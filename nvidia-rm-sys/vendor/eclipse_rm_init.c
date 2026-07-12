@@ -3824,10 +3824,14 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
         return status;
     }
 
-    /* Allocate the GPU_CACHEABLE=YES sysmem data buffer + map it into the
-     * compute VAS -- under the API lock ONLY, before the GPU lock, because
-     * the allocation path asserts the GPU lock is not held. Idempotent. */
-    if (!g_saxpyCacheableDone)
+    /* DISABLED (was the load-fault poison): mapping this buffer into the
+     * LIVE compute VAS at runtime via NV50_MEMORY_VIRTUAL+Map, without a
+     * GMMU TLB invalidate, left stale TLB state so EVERY subsequent SM
+     * global LOAD faulted (MMU_FAULT_QUEUED) -- even loads from the main
+     * channel buffer, which stores reach fine. run #1 (no such alloc)
+     * loaded from the main buffer without faulting. Re-enable only paired
+     * with an explicit GMMU invalidate. */
+    if (0 && !g_saxpyCacheableDone)
     {
         RM_API *pAlloc = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
         RsClient *pAllocClient = NULL;
@@ -3905,12 +3909,14 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
             if (pBufMemDesc == NULL || pUserdMemDesc == NULL)
                 status = NV_ERR_INVALID_STATE;
         }
-        if (status == NV_OK)
-            status = memGetByHandle(pRsClient, g_saxpyCacheableHandle, &pCacheMemory);
-        if (status == NV_OK)
+        if (status == NV_OK && g_saxpyCacheableHandle != 0)
         {
-            pCacheMemDesc = pCacheMemory->pMemDesc;
-            if (pCacheMemDesc == NULL) status = NV_ERR_INVALID_STATE;
+            status = memGetByHandle(pRsClient, g_saxpyCacheableHandle, &pCacheMemory);
+            if (status == NV_OK)
+            {
+                pCacheMemDesc = pCacheMemory->pMemDesc;
+                if (pCacheMemDesc == NULL) status = NV_ERR_INVALID_STATE;
+            }
         }
         pOut->lookupStatus = status;
         if (status != NV_OK) goto report;
@@ -3920,8 +3926,10 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
     {
         pBufCpu = memmgrMemDescBeginTransfer(pMemoryManager, pBufMemDesc, TRANSFER_FLAGS_NONE);
         pUserdCpu = memmgrMemDescBeginTransfer(pMemoryManager, pUserdMemDesc, userdFlags);
-        pCacheCpu = memmgrMemDescBeginTransfer(pMemoryManager, pCacheMemDesc, TRANSFER_FLAGS_NONE);
-        pOut->mapStatus = (pBufCpu != NULL && pUserdCpu != NULL && pCacheCpu != NULL) ? NV_OK : NV_ERR_GENERIC;
+        if (pCacheMemDesc != NULL)
+            pCacheCpu = memmgrMemDescBeginTransfer(pMemoryManager, pCacheMemDesc, TRANSFER_FLAGS_NONE);
+        pOut->mapStatus = (pBufCpu != NULL && pUserdCpu != NULL &&
+                           (pCacheMemDesc == NULL || pCacheCpu != NULL)) ? NV_OK : NV_ERR_GENERIC;
         if (pOut->mapStatus != NV_OK) goto report;
     }
 
@@ -3962,8 +3970,9 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
             pdx[i * 4 + 3] = 0x5EED3333u;       /* after slot       */
         }
 
-        /* Seed the CACHEABLE data buffer (GPU_CACHEABLE=YES) that the SM
-         * will load from -- this is the actual coherence test. */
+        /* (cacheable buffer disabled -- see the alloc block; loading from
+         * the main channel buffer instead.) */
+        if (pCacheCpu != NULL)
         {
             volatile NvU32 *pc = (volatile NvU32 *)pCacheCpu;
             for (i = 0; i < 32; i++) pc[i] = 0x12340000u | i;
