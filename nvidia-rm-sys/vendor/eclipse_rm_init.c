@@ -4001,13 +4001,11 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
         QMD_SET(qmd, QMDF_API_VISIBLE_CALL_LIMIT, 1);
         QMD_SET(qmd, QMDF_SAMPLER_INDEX, 0);
         QMD_SET(qmd, QMDF_SM_GLOBAL_CACHING_ENABLE, 1);
-        /* Only the SHADER_DATA cache invalidate -- flush a possibly-stale
-         * (zero) L2 line for the sysmem x[] so the global load reads the
-         * CPU-seeded value coherently. The earlier launch failure was NOT
-         * these bits (it was a kern[] buffer too small to receive the
-         * kernel); the texture/instruction invalidates are left off since
-         * we bind no TIC/TSC and don't need them. */
-        QMD_SET(qmd, QMDF_INVAL_SHADER_DATA_CACHE, 1);
+        /* NO cache-invalidate bits: isolating whether the SHADER_DATA
+         * invalidate is what made the first global LOAD MMU-fault. run #1
+         * had no invalidate and its load COMPLETED (read 0). If loads now
+         * complete, the invalidate was the fault trigger and the remaining
+         * issue is pure sysmem-read coherence (-> VRAM staging next). */
         QMD_SET(qmd, QMDF_CTA_RASTER_WIDTH, 1);
         QMD_SET(qmd, QMDF_CTA_RASTER_HEIGHT, 1);
         QMD_SET(qmd, QMDF_CTA_RASTER_DEPTH, 1);
