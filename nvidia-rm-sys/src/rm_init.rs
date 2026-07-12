@@ -561,6 +561,12 @@ pub struct GrThreads {
     pub kernel_va: u64,
     pub qmd_va: u64,
     pub out_va: u64,
+    /// MMU-fault telemetry (filled by step23 only; 0xFFFF_FFFF ctrl status
+    /// means "not queried"). Survives nv_printf capture truncation.
+    pub fault_ctrl_status: NvU32,
+    pub fault_addr_hi: NvU32,
+    pub fault_addr_lo: NvU32,
+    pub fault_type: NvU32,
 }
 
 extern "C" {
@@ -590,6 +596,10 @@ pub fn step21(device_instance: u32) -> Result<GrThreads, NV_STATUS> {
         kernel_va: 0,
         qmd_va: 0,
         out_va: 0,
+        fault_ctrl_status: 0xFFFF_FFFF,
+        fault_addr_hi: 0,
+        fault_addr_lo: 0,
+        fault_type: 0,
     };
     let status = unsafe { eclipse_rm_step21(device_instance, &mut out) };
     if status == NV_OK {
@@ -631,6 +641,10 @@ pub fn step22(device_instance: u32) -> Result<GrThreads, NV_STATUS> {
         kernel_va: 0,
         qmd_va: 0,
         out_va: 0,
+        fault_ctrl_status: 0xFFFF_FFFF,
+        fault_addr_hi: 0,
+        fault_addr_lo: 0,
+        fault_type: 0,
     };
     let status = unsafe { eclipse_rm_step22(device_instance, &mut out) };
     if status == NV_OK {
@@ -664,6 +678,10 @@ pub fn step23(device_instance: u32) -> Result<GrThreads, NV_STATUS> {
         kernel_va: 0,
         qmd_va: 0,
         out_va: 0,
+        fault_ctrl_status: 0xFFFF_FFFF,
+        fault_addr_hi: 0,
+        fault_addr_lo: 0,
+        fault_type: 0,
     };
     let status = unsafe { eclipse_rm_step23(device_instance, &mut out) };
     if status == NV_OK { Ok(out) } else { Err(status) }

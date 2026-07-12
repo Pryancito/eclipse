@@ -3999,6 +3999,13 @@ impl DrmScheme for NvidiaGpu {
                 let _ = writeln!(s, "[gpustep23] post-PCAS host fence:     {} ({} ms)", phase(c.fence_status), c.fence_iters);
                 let _ = writeln!(s, "[gpustep23] QMD RELEASE0 semaphore:   {} ({} ms)", phase(c.sem_status), c.sem_iters);
                 let _ = writeln!(s, "[gpustep23] SAXPY verification:       {} ({}/32 elements = 4i+100)", phase(c.verify_status), c.match_count);
+                if c.fault_ctrl_status != 0xFFFF_FFFF {
+                    let _ = writeln!(
+                        s,
+                        "[gpustep23] MMU fault query:          ctrl={:#x} addr={:#x}_{:08x} type={:#x}",
+                        c.fault_ctrl_status, c.fault_addr_hi, c.fault_addr_lo, c.fault_type
+                    );
+                }
                 if c.first_bad_idx != 0xFFFF_FFFF {
                     let _ = writeln!(s, "[gpustep23] first mismatch: y[{}]={:#x} ({}) expected {}", c.first_bad_idx, c.first_bad_val, c.first_bad_val, 4 * c.first_bad_idx + 100);
                 }
