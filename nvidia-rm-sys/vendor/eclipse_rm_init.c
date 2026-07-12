@@ -3034,6 +3034,14 @@ typedef struct EclipseGrThreads
     NvU64 kernelVA;
     NvU64 qmdVA;
     NvU64 outVA;
+    /* MMU-fault telemetry (step23): filled from NV906F_CTRL_CMD_GET_MMU_
+     * FAULT_INFO after a failed poll, so the fault address/type reach the
+     * /proc formatter even when the nv_printf capture drops lines.
+     * faultCtrlStatus = 0xFFFFFFFF means "not queried". */
+    NvU32 faultCtrlStatus;
+    NvU32 faultAddrHi;
+    NvU32 faultAddrLo;
+    NvU32 faultType;
 } EclipseGrThreads;
 
 static EclipseGrThreads g_grThreadsCache;
@@ -3732,7 +3740,13 @@ static const NvU32 g_sm75SaxpyKernel[80] = {
     0x00037802, 0x00000000, 0x00000f00, 0x000fc400, /* 5  MOV R3, x_hi   [patch 21]      */
     0x00027825, 0x00000004, 0x078e0002, 0x001fca00, /* 6  IMAD.WIDE R2,R0,4,R2 (wait 0)  */
     0x02087381, 0x00000000, 0x001ee900, 0x000e4400, /* 7  LDG.E.SYS R8,[R2] (weak, wr1)  */
-    0x0c087381, 0x00000000, 0x001e6900, 0x000e8400, /* 8  LDG.E.CONSTANT.SYS R12,[R2](wr2)*/
+    0x020c7381, 0x00000000, 0x001ee900, 0x000e8400, /* 8  LDG.E.SYS R12,[R2] (weak, wr2)
+        THE WILD-LOAD FIX: this dword was 0x0c087381 since the two-scope
+        kernel (38f84799) -- rd/ra SWAPPED, i.e. LDG R8,[R12] with R12:R13
+        UNINITIALIZED, a load from a garbage VA. That wild load is the MMU
+        fault every boot since has hit (corpus proof of field order:
+        LDG.E.STRONG.SYS R28,[R30] = 0x1e1c7381: rd=0x1C@16-23, ra=0x1E@
+        24-31). Correct encoding: rd=R12 (0x0C@16-23), ra=R2 (0x02@24-31). */
     0x000a7802, 0xbe400000, 0x00000f00, 0x000fcf00, /* 9  MOV R10, 0xBE400000            */
     0x06007386, 0x0000000a, 0x0010e900, 0x000fc400, /* 10 STG [R6], R10 (before)         */
     0x060b7810, 0x00000004, 0x07ffe0ff, 0x000fc400, /* 11 IADD3 R11,R6,4,RZ              */
@@ -3791,6 +3805,7 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
         return NV_OK;
     }
     portMemSet(pOut, 0, sizeof(*pOut));
+    pOut->faultCtrlStatus = 0xFFFFFFFF; /* not queried */
     pOut->lookupStatus = 0xFFFFFFFF;
     pOut->mapStatus    = 0xFFFFFFFF;
     pOut->tokenStatus  = 0xFFFFFFFF;
@@ -4003,12 +4018,10 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
         QMD_SET(qmd, QMDF_QMD_VERSION, 2);
         QMD_SET(qmd, QMDF_API_VISIBLE_CALL_LIMIT, 1);
         QMD_SET(qmd, QMDF_SAMPLER_INDEX, 0);
+        /* Exactly the proven QMD of run #1 / steps 19-22: caching enabled,
+         * no invalidate bits. The MMU faults were never the QMD -- they
+         * were a wild-address load (rd/ra swapped in the second LDG). */
         QMD_SET(qmd, QMDF_SM_GLOBAL_CACHING_ENABLE, 1);
-        /* NO cache-invalidate bits: isolating whether the SHADER_DATA
-         * invalidate is what made the first global LOAD MMU-fault. run #1
-         * had no invalidate and its load COMPLETED (read 0). If loads now
-         * complete, the invalidate was the fault trigger and the remaining
-         * issue is pure sysmem-read coherence (-> VRAM staging next). */
         QMD_SET(qmd, QMDF_CTA_RASTER_WIDTH, 1);
         QMD_SET(qmd, QMDF_CTA_RASTER_HEIGHT, 1);
         QMD_SET(qmd, QMDF_CTA_RASTER_DEPTH, 1);
@@ -4145,8 +4158,9 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
             nv_printf(0, "[eclipse-rm-trace] step23 MARK tid1: before=0x%x weak=0x%x const=0x%x after=0x%x (want .. / 0x12340001 / 0x12340001 / ..)\n",
                       pm[4], pm[5], pm[6], pm[7]);
         }
-        /* Ask the RM why: MMU fault info for this channel. If the load
-         * data-faulted, this names the address, type and human string. */
+        /* Ask the RM why: MMU fault info for this channel. Fill the struct
+         * (survives capture truncation -- the formatter always prints it)
+         * AND nv_printf the string form. */
         {
             NV906F_CTRL_GET_MMU_FAULT_INFO_PARAMS fp;
             RM_API *pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
@@ -4155,6 +4169,10 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
             fs = pRmApi->Control(pRmApi, g_grAllocCache.hClient, g_grChanCache.hChannel,
                                  NV906F_CTRL_CMD_GET_MMU_FAULT_INFO, &fp, sizeof(fp));
             fp.faultString[NV906F_CTRL_MMU_FAULT_STRING_LEN - 1] = '\0';
+            pOut->faultCtrlStatus = fs;
+            pOut->faultAddrHi = fp.addrHi;
+            pOut->faultAddrLo = fp.addrLo;
+            pOut->faultType   = fp.faultType;
             nv_printf(0, "[eclipse-rm-trace] step23 MMU-FAULT ctrl=0x%x addr=0x%x%08x type=0x%x str='%s'\n",
                       fs, fp.addrHi, fp.addrLo, fp.faultType, fp.faultString);
         }
@@ -4168,11 +4186,16 @@ report:
     if (pCacheCpu != NULL)
         memmgrMemDescEndTransfer(pMemoryManager, pCacheMemDesc, TRANSFER_FLAGS_NONE);
 
-    if (pOut->semStatus == NV_OK && pOut->verifyStatus == NV_OK)
-    {
-        portMemCopy(&g_grSaxpyCache, sizeof(g_grSaxpyCache), pOut, sizeof(*pOut));
-        g_grSaxpyDone = NV_TRUE;
-    }
+    /* Cache the result after the FIRST attempt regardless of outcome.
+     * procfs regenerates the /proc content once per read() chunk, so a
+     * single `cat` used to re-enter this function 2-4 times: each rerun
+     * re-seeded the markers (destroying the previous grid's stored
+     * evidence) and re-launched on a possibly-wedged channel -- which is
+     * also why the captured trace ("fence @2ms") and the final summary
+     * ("fence TIMEOUT") could contradict each other in one output. One
+     * launch per boot; reruns return this snapshot. */
+    portMemCopy(&g_grSaxpyCache, sizeof(g_grSaxpyCache), pOut, sizeof(*pOut));
+    g_grSaxpyDone = NV_TRUE;
 
     rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
     rmapiLockRelease();
