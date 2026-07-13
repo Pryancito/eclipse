@@ -3670,8 +3670,8 @@ impl DrmScheme for NvidiaGpu {
         };
         match result {
             Ok(c) => {
-                let _ = writeln!(s, "[gpuedid] --- real display query (NV04_DISPLAY_COMMON) ---");
-                let _ = writeln!(s, "[gpuedid] alloc NV04_DISPLAY_COMMON: {}", phase(c.alloc_status));
+                let _ = writeln!(s, "[gpuedid] --- real display query (RM internal NV04_DISPLAY_COMMON) ---");
+                let _ = writeln!(s, "[gpuedid] DispCommon handle:         {}", phase(c.alloc_status));
                 let _ = writeln!(s, "[gpuedid] GET_SUPPORTED:            {} (outputs={:#x}, DDC-capable={:#x})", phase(c.supported_status), c.display_mask, c.display_mask_ddc);
                 let _ = writeln!(s, "[gpuedid] GET_CONNECT_STATE:        {} (connected={:#x})", phase(c.connect_status), c.connected_mask);
                 if c.connected_mask == 0 && c.connect_status == 0 {

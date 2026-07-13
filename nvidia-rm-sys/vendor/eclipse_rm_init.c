@@ -60,6 +60,7 @@
 #include "class/cl0073.h"      /* NV04_DISPLAY_COMMON */
 #include "ctrl/ctrl0073/ctrl0073system.h"    /* GET_SUPPORTED / GET_CONNECT_STATE */
 #include "ctrl/ctrl0073/ctrl0073specific.h"  /* GET_EDID_V2 */
+#include "kernel/gpu/disp/kern_disp.h" /* GPU_GET_KERNEL_DISPLAY + kdispGet* handles */
 #include "class/cl2080.h"      /* NV20_SUBDEVICE_0 */
 #include "class/cl2080_notification.h" /* NV2080_ENGINE_TYPE_GRAPHICS */
 #include "class/cl90f1.h"      /* FERMI_VASPACE_A */
@@ -5077,6 +5078,9 @@ typedef struct EclipseGrEdid
     NvU8  edidHead[32];     /* header + PNP id + product + serial + date */
 } EclipseGrEdid;
 
+static NvBool       g_edidDone = NV_FALSE;
+static EclipseGrEdid g_edidCache;
+
 NV_STATUS eclipse_rm_edid(NvU32 gpuInstance, EclipseGrEdid *pOut)
 {
     OBJGPU *pGpu;
@@ -5084,12 +5088,24 @@ NV_STATUS eclipse_rm_edid(NvU32 gpuInstance, EclipseGrEdid *pOut)
     NV_STATUS status;
     THREAD_STATE_NODE threadState;
     GPU_MASK gpusLockedMask = 0;
-    RsClient *pRsClient = NULL;
-    NvU32 hDisp = 0;
-    NvBool dispAllocated = NV_FALSE;
+    KernelDisplay *pKernelDisplay;
+    NvHandle hDispClient;
+    NvHandle hDispCommon;
 
     if (pOut == NULL)
         return NV_ERR_INVALID_ARGUMENT;
+
+    /*
+     * Idempotent: busybox `cat` reads /proc in 4KB chunks, re-invoking the
+     * content generator (and hence this query) several times. Do the real
+     * RM work exactly once per boot and replay the cached result thereafter.
+     */
+    if (g_edidDone)
+    {
+        *pOut = g_edidCache;
+        return NV_OK;
+    }
+
     portMemSet(pOut, 0, sizeof(*pOut));
     pOut->allocStatus     = 0xFFFFFFFF;
     pOut->supportedStatus = 0xFFFFFFFF;
@@ -5132,29 +5148,43 @@ NV_STATUS eclipse_rm_edid(NvU32 gpuInstance, EclipseGrEdid *pOut)
     }
 
     pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
-    status = serverGetClientUnderLock(&g_resServ, g_grAllocCache.hClient, &pRsClient);
-    if (status != NV_OK)
-        goto unlock;
 
-    status = clientGenResourceHandle(pRsClient, &hDisp);
-    if (status != NV_OK)
-        goto unlock;
-    pOut->allocStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache.hClient,
-                                                g_grAllocCache.hDevice, hDisp,
-                                                NV04_DISPLAY_COMMON, NULL, 0);
-    nv_printf(0, "[eclipse-rm-trace] edid: NV04_DISPLAY_COMMON alloc -> 0x%x hDisp=0x%x\n",
-              pOut->allocStatus, hDisp);
-    if (pOut->allocStatus != NV_OK)
+    /*
+     * NV04_DISPLAY_COMMON is single-instance per Device (alloc_free.c: if
+     * !bMultiInstance and the parent already owns one -> NV_ERR_STATE_IN_USE,
+     * 0x63). The RM's own KernelDisplay already allocated the one-and-only
+     * DispCommon during display StateLoad (kdispAllocateCommonHandle), so a
+     * second alloc always collides. Instead, borrow the RM's internal handle
+     * pair -- exactly what the RM itself uses to issue NV0073 controls
+     * (see kdispGetSupportedDisplayMask / kdispIsDisplayConnected).
+     */
+    pKernelDisplay = GPU_GET_KERNEL_DISPLAY(pGpu);
+    if (pKernelDisplay == NULL)
     {
-        status = NV_OK; /* report the status, not a hard failure */
+        /* No display engine on this GPU (headless secondary). */
+        pOut->allocStatus = NV_ERR_NOT_SUPPORTED;
+        nv_printf(0, "[eclipse-rm-trace] edid: no KernelDisplay on this GPU (headless)\n");
+        status = NV_OK;
         goto unlock;
     }
-    dispAllocated = NV_TRUE;
+    hDispClient = kdispGetInternalClientHandle(pKernelDisplay);
+    hDispCommon = kdispGetDispCommonHandle(pKernelDisplay);
+    if (hDispClient == 0 || hDispCommon == 0)
+    {
+        pOut->allocStatus = NV_ERR_INVALID_STATE;
+        nv_printf(0, "[eclipse-rm-trace] edid: RM DispCommon not initialized (client=0x%x common=0x%x)\n",
+                  hDispClient, hDispCommon);
+        status = NV_OK;
+        goto unlock;
+    }
+    pOut->allocStatus = NV_OK; /* have a usable DispCommon handle */
+    nv_printf(0, "[eclipse-rm-trace] edid: reuse RM DispCommon (client=0x%x common=0x%x)\n",
+              hDispClient, hDispCommon);
 
     {
         NV0073_CTRL_SYSTEM_GET_SUPPORTED_PARAMS sp;
         portMemSet(&sp, 0, sizeof(sp));
-        pOut->supportedStatus = pRmApi->Control(pRmApi, g_grAllocCache.hClient, hDisp,
+        pOut->supportedStatus = pRmApi->Control(pRmApi, hDispClient, hDispCommon,
                                                 NV0073_CTRL_CMD_SYSTEM_GET_SUPPORTED,
                                                 &sp, sizeof(sp));
         pOut->displayMask    = sp.displayMask;
@@ -5166,7 +5196,8 @@ NV_STATUS eclipse_rm_edid(NvU32 gpuInstance, EclipseGrEdid *pOut)
         NV0073_CTRL_SYSTEM_GET_CONNECT_STATE_PARAMS cs;
         portMemSet(&cs, 0, sizeof(cs));
         cs.displayMask = pOut->displayMask;
-        pOut->connectStatus = pRmApi->Control(pRmApi, g_grAllocCache.hClient, hDisp,
+        cs.flags = NV0073_CTRL_SYSTEM_GET_CONNECT_STATE_FLAGS_METHOD_CACHED;
+        pOut->connectStatus = pRmApi->Control(pRmApi, hDispClient, hDispCommon,
                                               NV0073_CTRL_CMD_SYSTEM_GET_CONNECT_STATE,
                                               &cs, sizeof(cs));
         pOut->connectedMask = cs.displayMask;
@@ -5183,7 +5214,7 @@ NV_STATUS eclipse_rm_edid(NvU32 gpuInstance, EclipseGrEdid *pOut)
             portMemSet(ep, 0, sizeof(*ep));
             ep->displayId  = did;
             ep->bufferSize = NV0073_CTRL_SPECIFIC_GET_EDID_MAX_EDID_BYTES;
-            pOut->edidStatus = pRmApi->Control(pRmApi, g_grAllocCache.hClient, hDisp,
+            pOut->edidStatus = pRmApi->Control(pRmApi, hDispClient, hDispCommon,
                                                NV0073_CTRL_CMD_SPECIFIC_GET_EDID_V2,
                                                ep, sizeof(*ep));
             pOut->edidDisplayId = did;
@@ -5211,11 +5242,16 @@ NV_STATUS eclipse_rm_edid(NvU32 gpuInstance, EclipseGrEdid *pOut)
     status = NV_OK;
 
 unlock:
-    if (dispAllocated)
-        pRmApi->Free(pRmApi, g_grAllocCache.hClient, hDisp);
     rmGpuGroupLockRelease(gpusLockedMask, GPUS_LOCK_FLAGS_NONE);
     rmapiLockRelease();
     gpumgrThreadDisableExpandedGpuVisibility();
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+
+    /* Cache the outcome so subsequent proc reads replay it verbatim. */
+    if (status == NV_OK)
+    {
+        g_edidCache = *pOut;
+        g_edidDone  = NV_TRUE;
+    }
     return status;
 }
