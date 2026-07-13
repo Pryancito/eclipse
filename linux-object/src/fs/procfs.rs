@@ -14,12 +14,12 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 37] = [
+const PROC_ROOT_STATIC: [&str; 39] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
     "perf", "hunter", "filesystems", "gpudbg", "gpustep2", "gpustep3", "gpustep4", "gpustep5",
     "gpustep6", "gpustep7", "gpustep8", "gpustep9", "gpustep10", "gpustep11", "gpustep12",
     "gpustep13", "gpustep14", "gpustep15", "gpustep16", "gpustep17", "gpustep18", "gpustep19",
-    "gpustep20", "gpustep21", "gpustep22", "gpustep23", "gpudump",
+    "gpustep20", "gpustep21", "gpustep22", "gpustep23", "gpudump", "gpuinit", "gpubench",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -313,6 +313,8 @@ impl INode for ProcRootINode {
             "gpustep21" => Ok(PROC_GPUSTEP21.clone()),
             "gpustep22" => Ok(PROC_GPUSTEP22.clone()),
             "gpustep23" => Ok(PROC_GPUSTEP23.clone()),
+            "gpuinit" => Ok(PROC_GPUINIT.clone()),
+            "gpubench" => Ok(PROC_GPUBENCH.clone()),
             "gpudump" => Ok(PROC_GPUDUMP.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
@@ -1394,6 +1396,46 @@ fn proc_gpustep23_content() -> String {
     s
 }
 
+/// `/proc/gpuinit` — the whole compute bring-up ladder in one cat:
+/// core RM attach (5) → GSP-RM boot (6) → state load (9) → GR alloc
+/// ladder (16) → GPFIFO channel (17). Each internal step is idempotent
+/// (guarded by its own done-flag), so re-catting is safe and a stage that
+/// already ran is a fast no-op. After this, /proc/gpustep23 (or the
+/// benchmark) can launch compute directly.
+fn proc_gpuinit_content() -> String {
+    let mut s = String::new();
+    let drivers = kernel_hal::drivers::all_drm();
+    if drivers.as_vec().is_empty() {
+        return String::from("[gpuinit] no DRM driver with bring-up support\n");
+    }
+    for d in drivers.as_vec().iter() {
+        s.push_str("[gpuinit] ===== stage 1/5: RM core attach (step5) =====\n");
+        s.push_str(&d.bringup_step5());
+        s.push_str("[gpuinit] ===== stage 2/5: GSP-RM boot (step6) =====\n");
+        s.push_str(&d.bringup_step6());
+        s.push_str("[gpuinit] ===== stage 3/5: state pre-init/init/load (step9) =====\n");
+        s.push_str(&d.bringup_step9());
+        s.push_str("[gpuinit] ===== stage 4/5: GR alloc ladder (step16) =====\n");
+        s.push_str(&d.bringup_step16());
+        s.push_str("[gpuinit] ===== stage 5/5: GPFIFO + TURING_COMPUTE_A channel (step17) =====\n");
+        s.push_str(&d.bringup_step17());
+    }
+    s.push_str("[gpuinit] ===== chain complete -- GPU ready; cat /proc/gpustep23 to run SAXPY =====\n");
+    s
+}
+
+/// `/proc/gpubench` — integer-ALU GIOPS benchmark (needs /proc/gpuinit first).
+fn proc_gpubench_content() -> String {
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.bringup_bench());
+    }
+    if s.is_empty() {
+        s.push_str("[gpubench] no DRM driver with bench support\n");
+    }
+    s
+}
+
 /// `/proc/gpudump` — read-only discriminating hardware dump for every NVIDIA
 /// GPU (console + secondary): display head liveness, VGA workspace base, PMC,
 /// BSI scratch, sysmem flush. NO GSP boot -> ZERO wedge risk. Read this first
@@ -1736,6 +1778,16 @@ lazy_static! {
     static ref PROC_GPUSTEP23: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 75,
         generate: proc_gpustep23_content,
+    });
+    /// `/proc/gpuinit` -- one-cat compute bring-up chain (steps 5,6,9,16,17).
+    static ref PROC_GPUINIT: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 101,
+        generate: proc_gpuinit_content,
+    });
+    /// `/proc/gpubench` -- integer-ALU GIOPS benchmark.
+    static ref PROC_GPUBENCH: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 102,
+        generate: proc_gpubench_content,
     });
     /// `/proc/gpudump` -- read-only discriminating HW dump, both GPUs (see
     /// proc_gpudump_content).

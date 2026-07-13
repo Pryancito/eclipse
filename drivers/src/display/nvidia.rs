@@ -4032,6 +4032,63 @@ impl DrmScheme for NvidiaGpu {
         s
     }
 
+    /// `/proc/gpubench`: integer-ALU GIOPS benchmark — a big grid of
+    /// dependent-IMAD chains timed by the GPU PTIMER. GIOPS is computed
+    /// here (u128) to avoid a 64-bit divide in the C.
+    fn bringup_bench(&self) -> String {
+        use core::fmt::Write;
+        let mut s = String::new();
+        let device_instance = *self.rm_device_instance.lock();
+        let Some(device_instance) = device_instance else {
+            return String::from("[gpubench] skipped (run /proc/gpuinit first)\n");
+        };
+        nvidia_rm_sys::os_interface::capture_begin();
+        let result = nvidia_rm_sys::rm_init::bench(device_instance);
+        let captured = nvidia_rm_sys::os_interface::capture_take();
+        if let Some(log) = captured {
+            for line in log.lines() {
+                let _ = writeln!(s, "[gpubench] | {}", line);
+            }
+        }
+        let phase = |st: u32| -> String {
+            match st {
+                0 => String::from("OK"),
+                0xFFFF_FFFF => String::from("not reached"),
+                e => alloc::format!("FAILED NV_STATUS={:#x}", e),
+            }
+        };
+        match result {
+            Ok(c) => {
+                let _ = writeln!(s, "[gpubench] --- integer-ALU throughput (IMAD.U32 dependent chain) ---");
+                let _ = writeln!(s, "[gpubench] lookup/map:   {} / {}", phase(c.lookup_status), phase(c.map_status));
+                let _ = writeln!(s, "[gpubench] launch ({} dw): {}", c.push_dwords, phase(c.submit_status));
+                let _ = writeln!(s, "[gpubench] grid:         {} threads x {} IMAD = {} ops",
+                    c.num_threads, c.imads_per_thread, c.total_ops);
+                let _ = writeln!(s, "[gpubench] timestamp sem: {} (@{} ms)", phase(c.sem_status), c.sem_iters);
+                if c.sem_status == 0 && c.elapsed_ns > 0 {
+                    // GIOPS = total_ops / elapsed_ns (ops/ns == giga-ops/s).
+                    // x1000 for three decimals, u128 to avoid overflow.
+                    let giops_milli =
+                        (c.total_ops as u128 * 1000u128) / (c.elapsed_ns as u128);
+                    let _ = writeln!(s, "[gpubench] elapsed:      {} ns ({}.{:03} ms)",
+                        c.elapsed_ns, c.elapsed_ns / 1_000_000, (c.elapsed_ns / 1000) % 1000);
+                    let _ = writeln!(s, "[gpubench] ============================================================");
+                    let _ = writeln!(s, "[gpubench]  {}.{:03} GIOPS (integer multiply-add) on the RTX 2060 Super",
+                        giops_milli / 1000, giops_milli % 1000);
+                    let _ = writeln!(s, "[gpubench] ============================================================");
+                } else if c.sem_status == 0 {
+                    let _ = writeln!(s, "[gpubench] grid ran but timestamps were zero (t0={:#x} t1={:#x})", c.t0_ns, c.t1_ns);
+                } else {
+                    let _ = writeln!(s, "[gpubench] --- grid did not signal within poll window ---");
+                }
+            }
+            Err(status) => {
+                let _ = writeln!(s, "[gpubench] eclipse_rm_bench FAILED, NV_STATUS={:#x} (run /proc/gpuinit first)", status);
+            }
+        }
+        s
+    }
+
     /// Step 2: instance block + GMMU flush — the first GPU register writes.
     /// TEMPORARY: the secondary (non-console) GPU has its own unrelated
     /// problems (USB breaks in Eclipse when it's made primary; likely never

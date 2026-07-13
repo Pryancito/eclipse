@@ -687,6 +687,59 @@ pub fn step23(device_instance: u32) -> Result<GrThreads, NV_STATUS> {
     if status == NV_OK { Ok(out) } else { Err(status) }
 }
 
+/// Mirror of `EclipseGrBench` (vendor/eclipse_rm_init.c): the GIOPS
+/// benchmark result. Field order/types MUST match the C struct exactly.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GrBench {
+    pub lookup_status: NvU32,
+    pub map_status: NvU32,
+    pub token_status: NvU32,
+    pub submit_status: NvU32,
+    pub sem_status: NvU32,
+    pub num_threads: NvU32,
+    pub imads_per_thread: NvU32,
+    pub push_dwords: NvU32,
+    pub sem_iters: NvU32,
+    pub reserved_pad: NvU32,
+    pub t0_ns: u64,
+    pub t1_ns: u64,
+    pub elapsed_ns: u64,
+    pub total_ops: u64,
+    pub kernel_va: u64,
+    pub qmd_va: u64,
+}
+
+extern "C" {
+    fn eclipse_rm_bench(device_instance: NvU32, out: *mut GrBench) -> NV_STATUS;
+}
+
+/// Runs the integer-ALU GIOPS benchmark: a big grid of dependent-IMAD
+/// chains, timed with the GPU PTIMER. Idempotent (cached after the first
+/// run). Requires step17 first.
+pub fn bench(device_instance: u32) -> Result<GrBench, NV_STATUS> {
+    let mut out = GrBench {
+        lookup_status: 0xFFFF_FFFF,
+        map_status: 0xFFFF_FFFF,
+        token_status: 0xFFFF_FFFF,
+        submit_status: 0xFFFF_FFFF,
+        sem_status: 0xFFFF_FFFF,
+        num_threads: 0,
+        imads_per_thread: 0,
+        push_dwords: 0,
+        sem_iters: 0,
+        reserved_pad: 0,
+        t0_ns: 0,
+        t1_ns: 0,
+        elapsed_ns: 0,
+        total_ops: 0,
+        kernel_va: 0,
+        qmd_va: 0,
+    };
+    let status = unsafe { eclipse_rm_bench(device_instance, &mut out) };
+    if status == NV_OK { Ok(out) } else { Err(status) }
+}
+
 /// Fetches the GSP-reported interrupt kernel table (boxed: ~2 KiB).
 pub fn intr_table(device_instance: u32) -> Result<alloc::boxed::Box<IntrTable>, NV_STATUS> {
     let mut out = alloc::boxed::Box::new(IntrTable {
