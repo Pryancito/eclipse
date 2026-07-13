@@ -261,6 +261,12 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// GIOPS benchmark (`/proc/gpubench`): a big grid of dependent-IMAD
+    /// chains timed with the GPU PTIMER. Default: nothing.
+    fn bringup_bench(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Read-only hardware-state dump (`/proc/gpudump`): the discriminating
     /// registers (display head liveness, VGA workspace, PMC, BSI, sysmem
     /// flush) for this GPU, with NO GSP boot -- zero wedge risk. Lets us

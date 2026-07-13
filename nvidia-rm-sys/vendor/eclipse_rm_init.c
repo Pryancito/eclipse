@@ -4184,6 +4184,323 @@ report:
     return NV_OK; /* per-stage statuses carry any failure */
 }
 
+/* ===================================================================
+ * GIOPS BENCHMARK -- integer-ALU throughput.
+ *
+ * A big grid (BENCH_CTAS x 32 threads) where each thread runs a
+ * dependent chain of BENCH_IMADS IMAD.U32 ops (proven encoding, delay 7
+ * so the RAW accumulator never reads stale). No memory traffic in the
+ * inner loop -> pure ALU. Timed with the GPU's own PTIMER: two host
+ * semaphore releases with RELEASE_TIMESTAMP write a 16-byte report
+ * {payload, ts_ns} -- one before SEND_PCAS (t0), one after with
+ * RELEASE_WFI (t1, waits for the grid to drain). delta = real grid ns.
+ * ops = threads * IMADS * 2 (each IMAD = a multiply + an add).
+ * =================================================================== */
+#define ECLIPSE_BENCH_KERNEL_OFF 0x1800
+#define ECLIPSE_BENCH_QMD_OFF    0x3200
+#define ECLIPSE_BENCH_T0_OFF     0x4000   /* 16 B ts report (start) */
+#define ECLIPSE_BENCH_T1_OFF     0x4040   /* 16 B ts report (end)   */
+#define ECLIPSE_BENCH_SEM_OFF    0x4080   /* QMD RELEASE0 (4 B)      */
+#define ECLIPSE_BENCH_SEM_PAYLOAD 0x5A55B0D5
+#define ECLIPSE_BENCH_T0_PAYLOAD  0x0000B000
+#define ECLIPSE_BENCH_T1_PAYLOAD  0x0000B111
+#define ECLIPSE_BENCH_IMADS      256
+#define ECLIPSE_BENCH_CTAS       4096
+#define ECLIPSE_BENCH_TPC        32       /* threads per CTA */
+#define ECLIPSE_BENCH_POLL_MS    5000
+
+typedef struct EclipseGrBench
+{
+    NvU32 lookupStatus;
+    NvU32 mapStatus;
+    NvU32 tokenStatus;
+    NvU32 submitStatus;
+    NvU32 semStatus;
+    NvU32 numThreads;
+    NvU32 imadsPerThread;
+    NvU32 pushDwords;
+    NvU32 semIters;
+    NvU32 reservedPad;
+    NvU64 t0Ns;
+    NvU64 t1Ns;
+    NvU64 elapsedNs;
+    NvU64 totalOps;
+    NvU64 kernelVA;
+    NvU64 qmdVA;
+} EclipseGrBench;
+
+static EclipseGrBench g_grBenchCache;
+static NvBool g_grBenchDone = NV_FALSE;
+
+NV_STATUS eclipse_rm_bench(NvU32 gpuInstance, EclipseGrBench *pOut)
+{
+    OBJGPU *pGpu;
+    NV_STATUS status;
+    THREAD_STATE_NODE threadState;
+    RsClient *pRsClient = NULL;
+    KernelChannel *pKernelChannel = NULL;
+    KernelFifo *pKernelFifo;
+    MemoryManager *pMemoryManager;
+    Memory *pBufMemory = NULL;
+    MEMORY_DESCRIPTOR *pBufMemDesc = NULL;
+    MEMORY_DESCRIPTOR *pUserdMemDesc = NULL;
+    NvU8 *pBufCpu = NULL;
+    NvU8 *pUserdCpu = NULL;
+    NvU32 userdFlags = TRANSFER_FLAGS_USE_BAR1 |
+                       TRANSFER_FLAGS_SHADOW_ALLOC |
+                       TRANSFER_FLAGS_SHADOW_INIT_MEM;
+
+    if (pOut == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+    if (g_grBenchDone)
+    {
+        portMemCopy(pOut, sizeof(*pOut), &g_grBenchCache, sizeof(g_grBenchCache));
+        return NV_OK;
+    }
+    portMemSet(pOut, 0, sizeof(*pOut));
+    pOut->lookupStatus = 0xFFFFFFFF;
+    pOut->mapStatus    = 0xFFFFFFFF;
+    pOut->tokenStatus  = 0xFFFFFFFF;
+    pOut->submitStatus = 0xFFFFFFFF;
+    pOut->semStatus    = 0xFFFFFFFF;
+    pOut->numThreads     = ECLIPSE_BENCH_CTAS * ECLIPSE_BENCH_TPC;
+    pOut->imadsPerThread = ECLIPSE_BENCH_IMADS;
+
+    if (!g_grChanDone)
+        return NV_ERR_INVALID_STATE; /* run step17 first */
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    pGpu = gpumgrGetGpu(gpuInstance);
+    if (pGpu == NULL || !pGpu->gspRmInitialized)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
+    }
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    status = rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pKernelFifo = GPU_GET_KERNEL_FIFO(pGpu);
+    pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
+
+    /* 1. Locate channel + buffer + USERD. */
+    {
+        NvU32 subdevInst;
+        status = serverGetClientUnderLock(&g_resServ, g_grAllocCache.hClient, &pRsClient);
+        if (status == NV_OK)
+            status = CliGetKernelChannel(pRsClient, g_grChanCache.hChannel, &pKernelChannel);
+        if (status == NV_OK)
+            status = memGetByHandle(pRsClient, g_grChanCache.hPhysBuf, &pBufMemory);
+        if (status == NV_OK)
+        {
+            pBufMemDesc = pBufMemory->pMemDesc;
+            subdevInst = gpumgrGetSubDeviceInstanceFromGpu(pGpu);
+            pUserdMemDesc = pKernelChannel->pUserdSubDeviceMemDesc[subdevInst];
+            if (pBufMemDesc == NULL || pUserdMemDesc == NULL)
+                status = NV_ERR_INVALID_STATE;
+        }
+        pOut->lookupStatus = status;
+        if (status != NV_OK) goto report;
+    }
+
+    /* 2. CPU maps. */
+    {
+        pBufCpu = memmgrMemDescBeginTransfer(pMemoryManager, pBufMemDesc, TRANSFER_FLAGS_NONE);
+        pUserdCpu = memmgrMemDescBeginTransfer(pMemoryManager, pUserdMemDesc, userdFlags);
+        pOut->mapStatus = (pBufCpu != NULL && pUserdCpu != NULL) ? NV_OK : NV_ERR_GENERIC;
+        if (pOut->mapStatus != NV_OK) goto report;
+    }
+
+    pOut->kernelVA = g_grChanCache.bufGpuVA + ECLIPSE_BENCH_KERNEL_OFF;
+    pOut->qmdVA    = g_grChanCache.bufGpuVA + ECLIPSE_BENCH_QMD_OFF;
+
+    /* 3. Emit the IMAD-throughput kernel + build the QMD. */
+    {
+        volatile NvU32 *k = (volatile NvU32 *)(pBufCpu + ECLIPSE_BENCH_KERNEL_OFF);
+        NvU32 *qmd = (NvU32 *)(pBufCpu + ECLIPSE_BENCH_QMD_OFF);
+        NvU64 semVA = g_grChanCache.bufGpuVA + ECLIPSE_BENCH_SEM_OFF;
+        NvU32 ki = 0, j;
+
+        /* setup: S2R R0,tid ; MOV R2,3 ; MOV R3,7 ; MOV R4,1 */
+        k[ki++] = 0x00007919; k[ki++] = 0x00000000; k[ki++] = 0x00002100; k[ki++] = 0x000e0200;
+        k[ki++] = 0x00027802; k[ki++] = 0x00000003; k[ki++] = 0x00000f00; k[ki++] = 0x000fc400;
+        k[ki++] = 0x00037802; k[ki++] = 0x00000007; k[ki++] = 0x00000f00; k[ki++] = 0x000fc400;
+        k[ki++] = 0x00047802; k[ki++] = 0x00000001; k[ki++] = 0x00000f00; k[ki++] = 0x000fc400;
+        /* IMAD.U32 R4,R4,R2,R3 x N  (dependent chain, delay 7 = RAW-safe) */
+        for (j = 0; j < ECLIPSE_BENCH_IMADS; j++)
+        {
+            k[ki++] = 0x04047224;   /* op 0x224, Rd=R4, Ra=R4 */
+            k[ki++] = 0x00000002;   /* Rb=R2 */
+            k[ki++] = 0x078e0203;   /* signed rrr, Rc=R3 */
+            k[ki++] = 0x000fce00;   /* delay 7, no barriers, no wait */
+        }
+        k[ki++] = 0x0000794d; k[ki++] = 0x00000000; k[ki++] = 0x03800000; k[ki++] = 0x000fea00; /* EXIT */
+        for (j = 0; j < 4; j++) { k[ki++] = 0x00007918; k[ki++] = 0; k[ki++] = 0; k[ki++] = 0x000fc000; }
+
+        *(volatile NvU32 *)(pBufCpu + ECLIPSE_BENCH_SEM_OFF) = 0;
+        *(volatile NvU32 *)(pBufCpu + ECLIPSE_BENCH_T0_OFF)  = 0;
+        *(volatile NvU32 *)(pBufCpu + ECLIPSE_BENCH_T1_OFF)  = 0;
+        *(volatile NvU64 *)(pBufCpu + ECLIPSE_BENCH_T0_OFF + 8) = 0;
+        *(volatile NvU64 *)(pBufCpu + ECLIPSE_BENCH_T1_OFF + 8) = 0;
+
+        portMemSet(qmd, 0, 256);
+        QMD_SET(qmd, QMDF_QMD_MAJOR_VERSION, 2);
+        QMD_SET(qmd, QMDF_QMD_VERSION, 2);
+        QMD_SET(qmd, QMDF_API_VISIBLE_CALL_LIMIT, 1);
+        QMD_SET(qmd, QMDF_SAMPLER_INDEX, 0);
+        QMD_SET(qmd, QMDF_SM_GLOBAL_CACHING_ENABLE, 1);
+        QMD_SET(qmd, QMDF_CTA_RASTER_WIDTH, ECLIPSE_BENCH_CTAS);
+        QMD_SET(qmd, QMDF_CTA_RASTER_HEIGHT, 1);
+        QMD_SET(qmd, QMDF_CTA_RASTER_DEPTH, 1);
+        QMD_SET(qmd, QMDF_CTA_THREAD_DIMENSION0, ECLIPSE_BENCH_TPC);
+        QMD_SET(qmd, QMDF_CTA_THREAD_DIMENSION1, 1);
+        QMD_SET(qmd, QMDF_CTA_THREAD_DIMENSION2, 1);
+        QMD_SET(qmd, QMDF_PROGRAM_ADDRESS_LOWER, (NvU32)(pOut->kernelVA & 0xFFFFFFFFu));
+        QMD_SET(qmd, QMDF_PROGRAM_ADDRESS_UPPER, (NvU32)(pOut->kernelVA >> 32));
+        QMD_SET(qmd, QMDF_REGISTER_COUNT_V, ECLIPSE_LAUNCH_REG_COUNT);
+        QMD_SET(qmd, QMDF_MIN_SM_CONFIG_SHMEM, 9);
+        QMD_SET(qmd, QMDF_TARGET_SM_CONFIG_SHMEM, 9);
+        QMD_SET(qmd, QMDF_MAX_SM_CONFIG_SHMEM, 17);
+        QMD_SET(qmd, QMDF_CWD_MEMBAR_TYPE, 1);
+        QMD_SET(qmd, QMDF_RELEASE_MEMBAR_TYPE, 1);
+        QMD_SET(qmd, QMDF_SEMAPHORE_RELEASE_ENABLE0, 1);
+        QMD_SET(qmd, QMDF_RELEASE0_ADDRESS_LOWER, (NvU32)(semVA & 0xFFFFFFFFu));
+        QMD_SET(qmd, QMDF_RELEASE0_ADDRESS_UPPER, (NvU32)(semVA >> 32));
+        QMD_SET(qmd, QMDF_RELEASE0_STRUCTURE_SIZE, 1);
+        QMD_SET(qmd, QMDF_RELEASE0_PAYLOAD, ECLIPSE_BENCH_SEM_PAYLOAD);
+        osFlushCpuWriteCombineBuffer();
+        nv_printf(0, "[eclipse-rm-trace] bench: kernel %u instr (%u IMAD), grid %u CTAs x %u = %u threads\n",
+                  ki / 4, (NvU32)ECLIPSE_BENCH_IMADS, (NvU32)ECLIPSE_BENCH_CTAS,
+                  (NvU32)ECLIPSE_BENCH_TPC, pOut->numThreads);
+    }
+
+    /* 4. Launch: t0 timestamp -> SEND_PCAS -> t1 timestamp (WFI). */
+    {
+        volatile NvU32 *pb = (volatile NvU32 *)pBufCpu;
+        volatile NvU32 *gp = (volatile NvU32 *)(pBufCpu + ECLIPSE_CHAN_GPFIFO_OFF);
+        volatile Nvc46fControl *pUserd = (volatile Nvc46fControl *)pUserdCpu;
+        NvU32 n = 0, put, gpEntry0, gpEntry1, workToken = 0, runlistId;
+        NvU64 pbVA = g_grChanCache.bufGpuVA;
+        NvU64 t0VA = g_grChanCache.bufGpuVA + ECLIPSE_BENCH_T0_OFF;
+        NvU64 t1VA = g_grChanCache.bufGpuVA + ECLIPSE_BENCH_T1_OFF;
+
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_SET_OBJECT, 1);
+        pb[n++] = TURING_COMPUTE_A;
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_SET_SHADER_SHARED_MEMORY_WINDOW_A, 2);
+        pb[n++] = 0;
+        pb[n++] = 0xFE000000;
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_SET_SHADER_LOCAL_MEMORY_WINDOW_A, 2);
+        pb[n++] = 0;
+        pb[n++] = 0xFF000000;
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_INVALIDATE_SKED_CACHES, 1);
+        pb[n++] = 0;
+        /* t0: start timestamp (no WFI) */
+        pb[n++] = ECLIPSE_PUSH_HDR(0, NVC46F_SEM_ADDR_LO, 5);
+        pb[n++] = NvU64_LO32(t0VA);
+        pb[n++] = DRF_NUM(C46F, _SEM_ADDR_HI, _OFFSET, NvU64_HI32(t0VA));
+        pb[n++] = ECLIPSE_BENCH_T0_PAYLOAD;
+        pb[n++] = 0;
+        pb[n++] = DRF_DEF(C46F, _SEM_EXECUTE, _OPERATION, _RELEASE) |
+                  DRF_DEF(C46F, _SEM_EXECUTE, _RELEASE_WFI, _DIS) |
+                  DRF_DEF(C46F, _SEM_EXECUTE, _PAYLOAD_SIZE, _32BIT) |
+                  DRF_DEF(C46F, _SEM_EXECUTE, _RELEASE_TIMESTAMP, _EN);
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_SEND_PCAS_A, 1);
+        pb[n++] = (NvU32)(pOut->qmdVA >> 8);
+        pb[n++] = ECLIPSE_PUSH_HDR(1, NVC5C0_SEND_SIGNALING_PCAS_B, 1);
+        pb[n++] = DRF_DEF(C5C0, _SEND_SIGNALING_PCAS_B, _INVALIDATE, _TRUE) |
+                  DRF_DEF(C5C0, _SEND_SIGNALING_PCAS_B, _SCHEDULE, _TRUE);
+        /* t1: end timestamp WITH WFI -- waits for the grid to drain */
+        pb[n++] = ECLIPSE_PUSH_HDR(0, NVC46F_SEM_ADDR_LO, 5);
+        pb[n++] = NvU64_LO32(t1VA);
+        pb[n++] = DRF_NUM(C46F, _SEM_ADDR_HI, _OFFSET, NvU64_HI32(t1VA));
+        pb[n++] = ECLIPSE_BENCH_T1_PAYLOAD;
+        pb[n++] = 0;
+        pb[n++] = DRF_DEF(C46F, _SEM_EXECUTE, _OPERATION, _RELEASE) |
+                  DRF_DEF(C46F, _SEM_EXECUTE, _RELEASE_WFI, _EN) |
+                  DRF_DEF(C46F, _SEM_EXECUTE, _PAYLOAD_SIZE, _32BIT) |
+                  DRF_DEF(C46F, _SEM_EXECUTE, _RELEASE_TIMESTAMP, _EN);
+        pOut->pushDwords = n;
+
+        (void)kfifoGenerateWorkSubmitToken(pGpu, pKernelFifo, pKernelChannel, &workToken, NV_TRUE);
+        pOut->tokenStatus = NV_OK;
+        runlistId = kchannelGetRunlistId(pKernelChannel);
+
+        put = pUserd->GPPut;
+        gpEntry0 = DRF_DEF(906F, _GP_ENTRY0, _NO_CONTEXT_SWITCH, _FALSE) |
+                   DRF_NUM(906F, _GP_ENTRY0, _GET, NvU64_LO32(pbVA) >> 2);
+        gpEntry1 = DRF_NUM(906F, _GP_ENTRY1, _GET_HI, NvU64_HI32(pbVA)) |
+                   DRF_NUM(906F, _GP_ENTRY1, _LENGTH, n) |
+                   DRF_DEF(906F, _GP_ENTRY1, _LEVEL, _MAIN);
+        gp[(put % ECLIPSE_CHAN_GPFIFO_ENTRIES) * 2 + 0] = gpEntry0;
+        gp[(put % ECLIPSE_CHAN_GPFIFO_ENTRIES) * 2 + 1] = gpEntry1;
+        osFlushCpuWriteCombineBuffer();
+        pUserd->GPPut = put + 1;
+        osFlushCpuWriteCombineBuffer();
+
+        status = kbusFlushPcieForBar0Doorbell_HAL(pGpu, GPU_GET_KERNEL_BUS(pGpu));
+        if (status == NV_OK)
+            status = kfifoUpdateUsermodeDoorbell_HAL(pGpu, pKernelFifo, workToken, runlistId);
+        pOut->submitStatus = status;
+        nv_printf(0, "[eclipse-rm-trace] bench: launch (%u dw) -> 0x%x qmd=0x%llx prog=0x%llx\n",
+                  n, pOut->submitStatus, pOut->qmdVA, pOut->kernelVA);
+        if (status != NV_OK) goto report;
+    }
+
+    /* 5. Poll the t1 timestamp payload, then read both PTIMER stamps. */
+    {
+        volatile NvU32 *pT1p = (volatile NvU32 *)(pBufCpu + ECLIPSE_BENCH_T1_OFF);
+        NvU32 i;
+        for (i = 0; i < ECLIPSE_BENCH_POLL_MS; i++)
+        {
+            if (*pT1p == ECLIPSE_BENCH_T1_PAYLOAD) { pOut->semStatus = NV_OK; break; }
+            os_delay_us(1000);
+        }
+        pOut->semIters = i;
+        if (pOut->semStatus != NV_OK) pOut->semStatus = NV_ERR_TIMEOUT;
+
+        pOut->t0Ns = *(volatile NvU64 *)(pBufCpu + ECLIPSE_BENCH_T0_OFF + 8);
+        pOut->t1Ns = *(volatile NvU64 *)(pBufCpu + ECLIPSE_BENCH_T1_OFF + 8);
+        pOut->elapsedNs = (pOut->t1Ns > pOut->t0Ns) ? (pOut->t1Ns - pOut->t0Ns) : 0;
+        pOut->totalOps = (NvU64)pOut->numThreads * (NvU64)ECLIPSE_BENCH_IMADS * 2ull;
+        nv_printf(0, "[eclipse-rm-trace] bench: sem 0x%x (@%u ms) dt=%llu ns ops=%llu\n",
+                  pOut->semStatus, pOut->semIters, pOut->elapsedNs, pOut->totalOps);
+    }
+
+report:
+    if (pBufCpu != NULL)
+        memmgrMemDescEndTransfer(pMemoryManager, pBufMemDesc, TRANSFER_FLAGS_NONE);
+    if (pUserdCpu != NULL)
+        memmgrMemDescEndTransfer(pMemoryManager, pUserdMemDesc, userdFlags);
+
+    portMemCopy(&g_grBenchCache, sizeof(g_grBenchCache), pOut, sizeof(*pOut));
+    g_grBenchDone = NV_TRUE;
+
+    rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
+    rmapiLockRelease();
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return NV_OK;
+}
+
 /*
  * Step-9: the rest of the real RmInitAdapter device bring-up
  * (arch/nvalloc/unix/src/osinit.c, RmInitNvDevice), run after kgspInitRm
