@@ -216,6 +216,14 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// `/proc/gpuedid`: real display query via NV04_DISPLAY_COMMON — which
+    /// outputs exist, which are connected, and the EDID of the first
+    /// connected one. Read-only (never programs the display engine).
+    /// Requires step16. Default: nothing.
+    fn bringup_edid(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Bring-up **Step 18** (`/proc/gpustep18`): first Eclipse-authored
     /// submission on the step-17 channel — semaphore-release method stream,
     /// GP entry, GPPut, usermode doorbell, CPU-polled verification.

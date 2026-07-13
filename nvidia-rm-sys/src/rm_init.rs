@@ -740,6 +740,50 @@ pub fn bench(device_instance: u32) -> Result<GrBench, NV_STATUS> {
     if status == NV_OK { Ok(out) } else { Err(status) }
 }
 
+/// Mirror of `EclipseGrEdid` (vendor/eclipse_rm_init.c): real EDID/connector
+/// query via NV04_DISPLAY_COMMON + NV0073 GET_SUPPORTED/GET_CONNECT_STATE/
+/// GET_EDID_V2. 72 bytes: 10 u32 + edid_head[32].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GrEdid {
+    pub alloc_status: NvU32,
+    pub supported_status: NvU32,
+    pub display_mask: NvU32,
+    pub display_mask_ddc: NvU32,
+    pub connect_status: NvU32,
+    pub connected_mask: NvU32,
+    pub edid_status: NvU32,
+    pub edid_display_id: NvU32,
+    pub edid_size: NvU32,
+    pub edid_valid: NvU32,
+    pub edid_head: [u8; 32],
+}
+
+extern "C" {
+    fn eclipse_rm_edid(device_instance: NvU32, out: *mut GrEdid) -> NV_STATUS;
+}
+
+/// Real display query: which outputs exist, which are connected, and the
+/// EDID of the first connected one. Read-only (never programs the display
+/// engine). Requires step16 first.
+pub fn edid(device_instance: u32) -> Result<GrEdid, NV_STATUS> {
+    let mut out = GrEdid {
+        alloc_status: 0xFFFF_FFFF,
+        supported_status: 0xFFFF_FFFF,
+        display_mask: 0,
+        display_mask_ddc: 0,
+        connect_status: 0xFFFF_FFFF,
+        connected_mask: 0,
+        edid_status: 0xFFFF_FFFF,
+        edid_display_id: 0,
+        edid_size: 0,
+        edid_valid: 0,
+        edid_head: [0u8; 32],
+    };
+    let status = unsafe { eclipse_rm_edid(device_instance, &mut out) };
+    if status == NV_OK { Ok(out) } else { Err(status) }
+}
+
 /// Fetches the GSP-reported interrupt kernel table (boxed: ~2 KiB).
 pub fn intr_table(device_instance: u32) -> Result<alloc::boxed::Box<IntrTable>, NV_STATUS> {
     let mut out = alloc::boxed::Box::new(IntrTable {

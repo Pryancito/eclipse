@@ -57,6 +57,9 @@
 #include "resserv/rs_server.h"
 #include "resserv/rs_client.h"
 #include "class/cl0080.h"      /* NV01_DEVICE_0 */
+#include "class/cl0073.h"      /* NV04_DISPLAY_COMMON */
+#include "ctrl/ctrl0073/ctrl0073system.h"    /* GET_SUPPORTED / GET_CONNECT_STATE */
+#include "ctrl/ctrl0073/ctrl0073specific.h"  /* GET_EDID_V2 */
 #include "class/cl2080.h"      /* NV20_SUBDEVICE_0 */
 #include "class/cl2080_notification.h" /* NV2080_ENGINE_TYPE_GRAPHICS */
 #include "class/cl90f1.h"      /* FERMI_VASPACE_A */
@@ -5044,4 +5047,175 @@ NV_STATUS eclipse_rm_mark_console_gpu(
     gpumgrThreadDisableExpandedGpuVisibility();
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
     return NV_OK;
+}
+
+/* ===================================================================
+ * DRM: real EDID / connector query via the RM's NV04_DISPLAY_COMMON.
+ *
+ * Allocates NV04_DISPLAY_COMMON (0x0073) under the step-16 device, then
+ * asks the GSP-resident display RM: which outputs exist (GET_SUPPORTED
+ * displayMask + which support DDC), which are connected (GET_CONNECT_
+ * STATE), and reads the EDID of the first connected one (GET_EDID_V2).
+ * Everything is ROUTED through the live RM -- no register bit-banging.
+ * On the headless compute GPU this reports "0 connected" (its own real
+ * answer); on a GPU with a monitor it returns the panel's EDID head
+ * (00 FF..FF 00 magic + PNP manufacturer id + product code), which then
+ * feeds DRM get_connector. Read-only: never programs the display engine.
+ * =================================================================== */
+typedef struct EclipseGrEdid
+{
+    NvU32 allocStatus;      /* NV04_DISPLAY_COMMON alloc                */
+    NvU32 supportedStatus;
+    NvU32 displayMask;      /* outputs that physically exist            */
+    NvU32 displayMaskDDC;   /* subset that supports DDC/EDID            */
+    NvU32 connectStatus;
+    NvU32 connectedMask;    /* outputs with something plugged in        */
+    NvU32 edidStatus;
+    NvU32 edidDisplayId;    /* the display whose EDID we read           */
+    NvU32 edidSize;
+    NvU32 edidValid;        /* 1 = 00 FF FF FF FF FF FF 00 header seen   */
+    NvU8  edidHead[32];     /* header + PNP id + product + serial + date */
+} EclipseGrEdid;
+
+NV_STATUS eclipse_rm_edid(NvU32 gpuInstance, EclipseGrEdid *pOut)
+{
+    OBJGPU *pGpu;
+    RM_API *pRmApi;
+    NV_STATUS status;
+    THREAD_STATE_NODE threadState;
+    GPU_MASK gpusLockedMask = 0;
+    RsClient *pRsClient = NULL;
+    NvU32 hDisp = 0;
+    NvBool dispAllocated = NV_FALSE;
+
+    if (pOut == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+    portMemSet(pOut, 0, sizeof(*pOut));
+    pOut->allocStatus     = 0xFFFFFFFF;
+    pOut->supportedStatus = 0xFFFFFFFF;
+    pOut->connectStatus   = 0xFFFFFFFF;
+    pOut->edidStatus      = 0xFFFFFFFF;
+
+    if (!g_grAllocDone)
+        return NV_ERR_INVALID_STATE; /* run step16 first */
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    pGpu = gpumgrGetGpu(gpuInstance);
+    if (pGpu == NULL || !pGpu->gspRmInitialized)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
+    }
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    status = rmGpuGroupLockAcquire(pGpu->gpuInstance, GPU_LOCK_GRP_SUBDEVICE,
+                                   GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT,
+                                   &gpusLockedMask);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
+    status = serverGetClientUnderLock(&g_resServ, g_grAllocCache.hClient, &pRsClient);
+    if (status != NV_OK)
+        goto unlock;
+
+    status = clientGenResourceHandle(pRsClient, &hDisp);
+    if (status != NV_OK)
+        goto unlock;
+    pOut->allocStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache.hClient,
+                                                g_grAllocCache.hDevice, hDisp,
+                                                NV04_DISPLAY_COMMON, NULL, 0);
+    nv_printf(0, "[eclipse-rm-trace] edid: NV04_DISPLAY_COMMON alloc -> 0x%x hDisp=0x%x\n",
+              pOut->allocStatus, hDisp);
+    if (pOut->allocStatus != NV_OK)
+    {
+        status = NV_OK; /* report the status, not a hard failure */
+        goto unlock;
+    }
+    dispAllocated = NV_TRUE;
+
+    {
+        NV0073_CTRL_SYSTEM_GET_SUPPORTED_PARAMS sp;
+        portMemSet(&sp, 0, sizeof(sp));
+        pOut->supportedStatus = pRmApi->Control(pRmApi, g_grAllocCache.hClient, hDisp,
+                                                NV0073_CTRL_CMD_SYSTEM_GET_SUPPORTED,
+                                                &sp, sizeof(sp));
+        pOut->displayMask    = sp.displayMask;
+        pOut->displayMaskDDC = sp.displayMaskDDC;
+        nv_printf(0, "[eclipse-rm-trace] edid: GET_SUPPORTED -> 0x%x mask=0x%x ddc=0x%x\n",
+                  pOut->supportedStatus, sp.displayMask, sp.displayMaskDDC);
+    }
+    {
+        NV0073_CTRL_SYSTEM_GET_CONNECT_STATE_PARAMS cs;
+        portMemSet(&cs, 0, sizeof(cs));
+        cs.displayMask = pOut->displayMask;
+        pOut->connectStatus = pRmApi->Control(pRmApi, g_grAllocCache.hClient, hDisp,
+                                              NV0073_CTRL_CMD_SYSTEM_GET_CONNECT_STATE,
+                                              &cs, sizeof(cs));
+        pOut->connectedMask = cs.displayMask;
+        nv_printf(0, "[eclipse-rm-trace] edid: GET_CONNECT_STATE -> 0x%x connected=0x%x\n",
+                  pOut->connectStatus, cs.displayMask);
+    }
+    if (pOut->connectStatus == NV_OK && pOut->connectedMask != 0)
+    {
+        NvU32 did = pOut->connectedMask & (0U - pOut->connectedMask); /* lowest set bit */
+        NV0073_CTRL_SPECIFIC_GET_EDID_V2_PARAMS *ep =
+            portMemAllocNonPaged(sizeof(*ep));
+        if (ep != NULL)
+        {
+            portMemSet(ep, 0, sizeof(*ep));
+            ep->displayId  = did;
+            ep->bufferSize = NV0073_CTRL_SPECIFIC_GET_EDID_MAX_EDID_BYTES;
+            pOut->edidStatus = pRmApi->Control(pRmApi, g_grAllocCache.hClient, hDisp,
+                                               NV0073_CTRL_CMD_SPECIFIC_GET_EDID_V2,
+                                               ep, sizeof(*ep));
+            pOut->edidDisplayId = did;
+            pOut->edidSize      = ep->bufferSize;
+            if (pOut->edidStatus == NV_OK && ep->bufferSize >= 32)
+            {
+                NvU32 b;
+                for (b = 0; b < 32; b++)
+                    pOut->edidHead[b] = ep->edidBuffer[b];
+                pOut->edidValid = (ep->edidBuffer[0] == 0x00 &&
+                                   ep->edidBuffer[1] == 0xFF &&
+                                   ep->edidBuffer[7] == 0x00) ? 1 : 0;
+            }
+            nv_printf(0, "[eclipse-rm-trace] edid: GET_EDID id=0x%x -> 0x%x size=%u valid=%u mfg=%02x%02x prod=%02x%02x\n",
+                      did, pOut->edidStatus, pOut->edidSize, pOut->edidValid,
+                      pOut->edidHead[8], pOut->edidHead[9],
+                      pOut->edidHead[10], pOut->edidHead[11]);
+            portMemFree(ep);
+        }
+        else
+        {
+            pOut->edidStatus = NV_ERR_NO_MEMORY;
+        }
+    }
+    status = NV_OK;
+
+unlock:
+    if (dispAllocated)
+        pRmApi->Free(pRmApi, g_grAllocCache.hClient, hDisp);
+    rmGpuGroupLockRelease(gpusLockedMask, GPUS_LOCK_FLAGS_NONE);
+    rmapiLockRelease();
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
 }
