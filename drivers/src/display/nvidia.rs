@@ -3645,6 +3645,61 @@ impl DrmScheme for NvidiaGpu {
         s
     }
 
+    /// `/proc/gpuedid`: real display query via the RM's NV04_DISPLAY_COMMON.
+    fn bringup_edid(&self) -> String {
+        use core::fmt::Write;
+        let mut s = String::new();
+        let device_instance = *self.rm_device_instance.lock();
+        let Some(device_instance) = device_instance else {
+            return String::from("[gpuedid] skipped (run /proc/gpuinit first)\n");
+        };
+        nvidia_rm_sys::os_interface::capture_begin();
+        let result = nvidia_rm_sys::rm_init::edid(device_instance);
+        let captured = nvidia_rm_sys::os_interface::capture_take();
+        if let Some(log) = captured {
+            for line in log.lines() {
+                let _ = writeln!(s, "[gpuedid] | {}", line);
+            }
+        }
+        let phase = |st: u32| -> String {
+            match st {
+                0 => String::from("OK"),
+                0xFFFF_FFFF => String::from("not reached"),
+                e => alloc::format!("FAILED NV_STATUS={:#x}", e),
+            }
+        };
+        match result {
+            Ok(c) => {
+                let _ = writeln!(s, "[gpuedid] --- real display query (NV04_DISPLAY_COMMON) ---");
+                let _ = writeln!(s, "[gpuedid] alloc NV04_DISPLAY_COMMON: {}", phase(c.alloc_status));
+                let _ = writeln!(s, "[gpuedid] GET_SUPPORTED:            {} (outputs={:#x}, DDC-capable={:#x})", phase(c.supported_status), c.display_mask, c.display_mask_ddc);
+                let _ = writeln!(s, "[gpuedid] GET_CONNECT_STATE:        {} (connected={:#x})", phase(c.connect_status), c.connected_mask);
+                if c.connected_mask == 0 && c.connect_status == 0 {
+                    let _ = writeln!(s, "[gpuedid] no monitor connected to this GPU's outputs (expected on the headless compute GPU)");
+                } else if c.edid_status != 0xFFFF_FFFF {
+                    let _ = writeln!(s, "[gpuedid] GET_EDID (id={:#x}):         {} ({} bytes, header {})", c.edid_display_id, phase(c.edid_status), c.edid_size, if c.edid_valid == 1 { "VALID" } else { "invalid" });
+                    if c.edid_valid == 1 {
+                        // EDID bytes 8-9 = PNP manufacturer id (5-bit packed letters); 10-11 = product code.
+                        let m = ((c.edid_head[8] as u16) << 8) | c.edid_head[9] as u16;
+                        let l1 = (b'A' - 1 + ((m >> 10) & 0x1f) as u8) as char;
+                        let l2 = (b'A' - 1 + ((m >> 5) & 0x1f) as u8) as char;
+                        let l3 = (b'A' - 1 + (m & 0x1f) as u8) as char;
+                        let prod = ((c.edid_head[11] as u16) << 8) | c.edid_head[10] as u16;
+                        let year = 1990u32 + c.edid_head[17] as u32;
+                        let _ = writeln!(s, "[gpuedid] MONITOR: {}{}{} product={:#06x} year={} (EDID v{}.{})", l1, l2, l3, prod, year, c.edid_head[18], c.edid_head[19]);
+                        let _ = write!(s, "[gpuedid] EDID head:");
+                        for b in c.edid_head.iter() { let _ = write!(s, " {:02x}", b); }
+                        let _ = writeln!(s);
+                    }
+                }
+            }
+            Err(status) => {
+                let _ = writeln!(s, "[gpuedid] eclipse_rm_edid FAILED, NV_STATUS={:#x} (run /proc/gpuinit first)", status);
+            }
+        }
+        s
+    }
+
     /// Step 18 (`/proc/gpustep18`): the first Eclipse-authored GPU
     /// execution. Writes a method stream (host semaphore RELEASE +
     /// SET_OBJECT(TURING_COMPUTE_A) + compute report semaphore RELEASE)
