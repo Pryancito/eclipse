@@ -3693,61 +3693,50 @@ report:
 #define ECLIPSE_SAXPY_FENCE_OFF  0x8440
 #define ECLIPSE_SAXPY_FENCE_PAYLOAD 0xFE7C4ED5
 
-/* SM75 -- TWO-LOAD PROBE + MARKERS, 16 instructions + NOP pad.
+/* SM75 -- RUN #1 REPLAY (byte-exact), the empirical anchor.
  *
- * Probe kernel, fully audited (corpus-verbatim operand fields, NAK
- * latencies, pair-addressing rules). Loads first, then marker stores.
- * All four stores address through the intact base pair R6:R7 with
- * IMMEDIATE offsets (STG.E [Rn+imm]: imm in word1 bits 8-31, data reg
- * in word1 bits 0-7 -- corpus: "STG.E.SYS [UR6+0x4],R3" w1=0x00000403).
- * Never add a 32-bit IADD3 base and store through it: STG.E reads the
- * address PAIR {Ra,Ra+1}, and the register after the IADD3 result is
- * not the high half (that bug -- stores via {R11,R12}/{R13,R14}/{R14,
- * R15} -- lived here undetected because the stores were always blocked
- * behind a faulting load).
+ * Three probe kernels in a row hung at their first LDG with mutually
+ * inconsistent fault reports (VA 0x1_00000000 then 0x0), while stores
+ * and ifetch always work. The ONLY kernel whose loads ever COMPLETED on
+ * this silicon is run #1 (5b131eb7): fence+RELEASE0 fired, y[] was
+ * written (zeros). So: replay run #1's 16 instructions VERBATIM -- same
+ * bytes, same patch slots, same QMD -- and only make the CPU seeds more
+ * diagnostic. Outcomes: (a) completes with y=3x+y -> SAXPY done;
+ * (b) completes with zeros -> loads execute but sysmem reads are
+ * incoherent -> stage data in VRAM next; (c) hangs -> the environment
+ * (not the kernel) changed since run #1 and the hunt moves there.
  *
- * Latency law (NAK sm75, confirmed by every silicon run): integer-ALU
- * GPR results (IMAD/IMAD.WIDE/IADD3) need >= 6 cycles before a consumer
- * reads them; MOV is fast (2 proven). Every faulting boot gave the LDG
- * only 5 cycles after IMAD.WIDE -> it read the address pair half-updated
- * ({lo=stale 0, hi=fresh 1} = the observed VA 0x1_00000000 PDE fault);
- * run #1 (the only completing load) had 8. IMAD.WIDE R2 carries delay 8.
- *
- * marker[tid] (16 B at dxVA + tid*16): +0 BEFORE (0xBE400000),
- * +4 mk-load result, +8 x-load result, +12 AFTER (0xAF7E0000).
- * i7 loads [R6+12] = the after-slot seed 0x5EED3333 through the PROVEN
- * marker address pair (isolates load-path health from the x pair);
- * i8 loads [R2] = x[tid] (0x12340000|tid). Patched immediates:
- * kern[5]/[9] = marker base lo/hi, kern[17]/[21] = x base lo/hi.
- *   S2R R0 (wr0) ; MOV R6,mk_lo ; MOV R7,mk_hi ;
- *   IMAD.WIDE.U32 R6,R0,16,R6 (wait0) ;
- *   MOV R2,x_lo ; MOV R3,x_hi ;
- *   IMAD.WIDE.U32 R2,R0,4,R2 (wait0, DELAY 8) ;
- *   LDG.E.SYS R8,[R6+12] (wr1) ; LDG.E.SYS R12,[R2] (wr2) ;
- *   MOV R10,0xBE400000 ; STG.E.SYS [R6+0],R10 ;
- *   STG.E.SYS [R6+4],R8 (wait wr1) ; STG.E.SYS [R6+8],R12 (wait wr2) ;
- *   MOV R15,0xAF7E0000 ; STG.E.SYS [R6+12],R15 ; EXIT ; NOP pad      */
+ * y[i] signatures (x seeded 0x1000+i, y seeded 100+i, a=3):
+ *   0x3064+4i = loads+IMAD+store all correct
+ *   0         = loads executed but read zero (run #1''s result)
+ *   0x1000+i  = store used stale R8 (pre-IMAD load value)
+ *   100+i     = store never landed
+ * Patched dwords: 5=a, 9=x_lo, 13=x_hi, 17=y_lo, 21=y_hi.
+ *   S2R R0 (wr0); MOV R4,a; MOV R2,x_lo; MOV R3,x_hi; MOV R6,y_lo;
+ *   MOV R7,y_hi; IMAD.WIDE R2,R0,4,R2 (wait0); IMAD.WIDE R6,R0,4,R6
+ *   (wait0); LDG.E.SYS R8,[R2] (wr1); LDG.E.SYS R9,[R6] (wr2);
+ *   IMAD R8,R8,R4,R9 (wait1+2); STG.E.SYS [R6],R8; EXIT; NOP pad     */
 static const NvU32 g_sm75SaxpyKernel[80] = {
-    0x00007919, 0x00000000, 0x00002100, 0x000e0200, /* 0  S2R R0,SR_TID.X (wr0)          */
-    0x00067802, 0x00000000, 0x00000f00, 0x000fc400, /* 1  MOV R6, mk_lo  [patch 5]       */
-    0x00077802, 0x00000000, 0x00000f00, 0x000fc400, /* 2  MOV R7, mk_hi  [patch 9]       */
-    0x00067825, 0x00000010, 0x078e0006, 0x001fca00, /* 3  IMAD.WIDE R6,R0,16,R6 (wait 0) */
-    0x00027802, 0x00000000, 0x00000f00, 0x000fc400, /* 4  MOV R2, x_lo   [patch 17]      */
-    0x00037802, 0x00000000, 0x00000f00, 0x000fc400, /* 5  MOV R3, x_hi   [patch 21]      */
-    0x00027825, 0x00000004, 0x078e0002, 0x001fd000, /* 6  IMAD.WIDE R2,R0,4,R2 (wait0,d8)*/
-    0x06087381, 0x00000c00, 0x001ee900, 0x000e4400, /* 7  LDG.E.SYS R8,[R6+12] (wr1)     */
-    0x020c7381, 0x00000000, 0x001ee900, 0x000e8400, /* 8  LDG.E.SYS R12,[R2] (wr2)       */
-    0x000a7802, 0xbe400000, 0x00000f00, 0x000fcf00, /* 9  MOV R10, 0xBE400000 (d7)       */
-    0x06007386, 0x0000000a, 0x0010e900, 0x000fc400, /* 10 STG [R6+0],  R10 (before)      */
-    0x06007386, 0x00000408, 0x0010e900, 0x002fcc00, /* 11 STG [R6+4],  R8  (wait wr1)    */
-    0x06007386, 0x0000080c, 0x0010e900, 0x004fcc00, /* 12 STG [R6+8],  R12 (wait wr2)    */
-    0x000f7802, 0xaf7e0000, 0x00000f00, 0x000fcf00, /* 13 MOV R15, 0xAF7E0000 (d7)       */
-    0x06007386, 0x00000c0f, 0x0010e900, 0x000fc400, /* 14 STG [R6+12], R15 (after)       */
-    0x0000794d, 0x00000000, 0x03800000, 0x000fea00, /* 15 EXIT                           */
-    0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* 16 NOP                            */
-    0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* 17 NOP                            */
-    0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* 18 NOP                            */
-    0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* 19 NOP                            */
+    0x00007919, 0x00000000, 0x00002100, 0x000e0200, /* 0  S2R R0,SR_TID.X (wr0)         */
+    0x00047802, 0xAAAA0000, 0x00000f00, 0x000fc400, /* 1  MOV R4, a      [patch 5]      */
+    0x00027802, 0xBBBB0000, 0x00000f00, 0x000fc400, /* 2  MOV R2, x_lo   [patch 9]      */
+    0x00037802, 0x00000000, 0x00000f00, 0x000fc400, /* 3  MOV R3, x_hi   [patch 13]     */
+    0x00067802, 0xCCCC0000, 0x00000f00, 0x000fc400, /* 4  MOV R6, y_lo   [patch 17]     */
+    0x00077802, 0x00000000, 0x00000f00, 0x000fc400, /* 5  MOV R7, y_hi   [patch 21]     */
+    0x00027825, 0x00000004, 0x078e0002, 0x001fc800, /* 6  IMAD.WIDE R2,R0,4,R2 (wait 0) */
+    0x00067825, 0x00000004, 0x078e0006, 0x001fc800, /* 7  IMAD.WIDE R6,R0,4,R6 (wait 0) */
+    0x02087381, 0x00000000, 0x001ee900, 0x000e4400, /* 8  LDG.E.SYS R8,[R2] (wr1)       */
+    0x06097381, 0x00000000, 0x001ee900, 0x000e8400, /* 9  LDG.E.SYS R9,[R6] (wr2)       */
+    0x08087224, 0x00000004, 0x078e0209, 0x006fc800, /* 10 IMAD R8,R8,R4,R9 (wait 1+2)   */
+    0x06007386, 0x00000008, 0x0010e900, 0x000fc400, /* 11 STG.E.SYS [R6],R8             */
+    0x0000794d, 0x00000000, 0x03800000, 0x000fea00, /* 12 EXIT                          */
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* 13 NOP                           */
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* 14 NOP                           */
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* 15 NOP                           */
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* 16 NOP                           */
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* 17 NOP                           */
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* 18 NOP                           */
+    0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* 19 NOP                           */
 };
 
 static EclipseGrThreads g_grSaxpyCache;
@@ -3965,21 +3954,18 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
         volatile NvU32 *pdx = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF);
         volatile NvU32 *pdy = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGY_OFF);
         NvU32 i;
-        (void)yVA; (void)dyVA; (void)pdy;
-        /* x seeded with a distinctive pattern; marker area (dbg base)
-         * seeded per-thread with 3 dwords: before/loaded/after slots. */
+        (void)dxVA; (void)dyVA; (void)pdx; (void)pdy; (void)g_saxpyCacheableVA;
+        /* run #1 replay seeds, made maximally diagnostic. y[i] signatures:
+         * 0x3064+4i = full 3*x+y correct; 0 = loads executed but read
+         * zero (run #1's original result); 0x1000+i = store used stale
+         * pre-IMAD R8 (= the raw x load); 100+i = store never landed. */
         for (i = 0; i < 32; i++)
         {
-            px[i] = 0x12340000u | i;
+            px[i] = 0x1000u + i;
             py[i] = 100u + i;
-            pdx[i * 4 + 0] = 0x5EED0000u | i;   /* before slot (kernel writes 0xBE400000) */
-            pdx[i * 4 + 1] = 0x5EED1111u;       /* weak-load slot   */
-            pdx[i * 4 + 2] = 0x5EED2222u;       /* const-load slot  */
-            pdx[i * 4 + 3] = 0x5EED3333u;       /* after slot       */
         }
 
-        /* (cacheable buffer disabled -- see the alloc block; loading from
-         * the main channel buffer instead.) */
+        /* (cacheable buffer disabled -- see the alloc block.) */
         if (pCacheCpu != NULL)
         {
             volatile NvU32 *pc = (volatile NvU32 *)pCacheCpu;
@@ -3987,27 +3973,19 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
         }
 
         portMemCopy(kern, sizeof(kern), g_sm75SaxpyKernel, sizeof(g_sm75SaxpyKernel));
-        kern[5]  = NvU64_LO32(dxVA);            /* MOV R6, marker base lo */
-        kern[9]  = NvU64_HI32(dxVA);            /* MOV R7, marker base hi */
-        /* Load from the MAIN channel buffer's x[] region -- proven SM-
-         * accessible (run #1 loaded from here without faulting). The
-         * separately-mapped GPU_CACHEABLE=YES buffer MMU-faulted on access
-         * (its VA 0x120190000 is not validly reachable from the SM -- the
-         * NV50_MEMORY_VIRTUAL+Map mapping is the suspect, not the load), so
-         * we sidestep it and instead flush the stale L2 via the QMD
-         * SHADER_DATA cache invalidate to get a coherent read of x[]. */
-        kern[17] = NvU64_LO32(xVA);             /* MOV R2, main-buf x lo */
-        kern[21] = NvU64_HI32(xVA);             /* MOV R3, main-buf x hi */
-        (void)g_saxpyCacheableVA;
+        /* run #1's exact patch map: a, then the x pair, then the y pair. */
+        kern[5]  = (NvU32)ECLIPSE_SAXPY_A;      /* MOV R4, a      */
+        kern[9]  = NvU64_LO32(xVA);             /* MOV R2, x lo   */
+        kern[13] = NvU64_HI32(xVA);             /* MOV R3, x hi   */
+        kern[17] = NvU64_LO32(yVA);             /* MOV R6, y lo   */
+        kern[21] = NvU64_HI32(yVA);             /* MOV R7, y hi   */
         portMemCopy(pBufCpu + ECLIPSE_SAXPY_KERNEL_OFF, sizeof(kern), kern, sizeof(kern));
-        /* Read back the patched immediates from the GPU-visible upload:
-         * proves whether dw17 (x lo) actually carries 0x...5000 -- the
-         * last boot faulted at VA {hi=1, lo=0}, i.e. the x pair's low
-         * half was zero at load time. Early print, survives capture. */
+        /* Read back the patched immediates from the GPU-visible upload
+         * (early print, survives capture truncation). */
         {
             volatile NvU32 *pk = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_KERNEL_OFF);
-            nv_printf(0, "[eclipse-rm-trace] step23 uploaded patches: dw5=0x%x dw9=0x%x dw17=0x%x dw21=0x%x (want mk_lo/mk_hi/x_lo/x_hi)\n",
-                      pk[5], pk[9], pk[17], pk[21]);
+            nv_printf(0, "[eclipse-rm-trace] step23 uploaded patches: dw5=0x%x dw9=0x%x dw13=0x%x dw17=0x%x dw21=0x%x (want a/x_lo/x_hi/y_lo/y_hi)\n",
+                      pk[5], pk[9], pk[13], pk[17], pk[21]);
         }
         *(volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_SEM_OFF) = 0;
         *(volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_FENCE_OFF) = 0;
@@ -4136,27 +4114,23 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
         if (pOut->semStatus != NV_OK)   { pOut->semStatus = NV_ERR_TIMEOUT;   pOut->semIters = i; }
 
         pOut->matchCount = 0;
+        for (i = 0; i < 32; i++)
         {
-            volatile NvU32 *pm = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF);
-            for (i = 0; i < 32; i++)
+            /* full-correct signature: y[i] = 3*(0x1000+i) + (100+i). */
+            if (pY[i] == 0x3000u + 100u + 4u * i)
+                pOut->matchCount++;
+            else if (pOut->firstBadIdx == 0xFFFFFFFF)
             {
-                /* success = the x-pair load (const slot) got x[i]. */
-                if (pm[i * 4 + 2] == (0x12340000u | i))
-                    pOut->matchCount++;
+                pOut->firstBadIdx = i;
+                pOut->firstBadVal = pY[i];
             }
         }
         pOut->verifyStatus = (pOut->matchCount == 32) ? NV_OK : NV_ERR_INVALID_DATA;
-        (void)pY;
-        {
-            volatile NvU32 *pm = (volatile NvU32 *)(pBufCpu + ECLIPSE_SAXPY_DBGX_OFF);
-            nv_printf(0, "[eclipse-rm-trace] step23: fence 0x%x (@%u ms) sem 0x%x (@%u ms) load-completed %u/32\n",
-                      pOut->fenceStatus, pOut->fenceIters, pOut->semStatus, pOut->semIters,
-                      pOut->matchCount);
-            nv_printf(0, "[eclipse-rm-trace] step23 PROBE MARK tid0: before=0x%x mk-load=0x%x x-load=0x%x after=0x%x (want BE400000 / 5EED3333 / 0x12340000 / AF7E0000)\n",
-                      pm[0], pm[1], pm[2], pm[3]);
-            nv_printf(0, "[eclipse-rm-trace] step23 MARK tid1: before=0x%x mk-load=0x%x x-load=0x%x after=0x%x (want .. / 5EED3333 / 0x12340001 / ..)\n",
-                      pm[4], pm[5], pm[6], pm[7]);
-        }
+        nv_printf(0, "[eclipse-rm-trace] step23: fence 0x%x (@%u ms) sem 0x%x (@%u ms) correct %u/32\n",
+                  pOut->fenceStatus, pOut->fenceIters, pOut->semStatus, pOut->semIters,
+                  pOut->matchCount);
+        nv_printf(0, "[eclipse-rm-trace] step23 REPLAY y[0..3]: 0x%x 0x%x 0x%x 0x%x (0x3064+4i=all-correct, 0=loads-read-zero, 0x1000+i=stale-R8-store, 100+i=0x64+i=store-dead)\n",
+                  pY[0], pY[1], pY[2], pY[3]);
         /* Ask the RM why: MMU fault info for this channel. Fill the struct
          * (survives capture truncation -- the formatter always prints it)
          * AND nv_printf the string form. */
