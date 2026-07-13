@@ -3727,7 +3727,14 @@ static const NvU32 g_sm75SaxpyKernel[80] = {
     0x00067825, 0x00000004, 0x078e0006, 0x001fc800, /* 7  IMAD.WIDE R6,R0,4,R6 (wait 0) */
     0x02087381, 0x00000000, 0x001ee900, 0x000e4400, /* 8  LDG.E.SYS R8,[R2] (wr1)       */
     0x06097381, 0x00000000, 0x001ee900, 0x000e8400, /* 9  LDG.E.SYS R9,[R6] (wr2)       */
-    0x08087224, 0x00000004, 0x078e0209, 0x006fc800, /* 10 IMAD R8,R8,R4,R9 (wait 1+2)   */
+    0x08087224, 0x00000004, 0x078e0209, 0x006fd000, /* 10 IMAD R8,R8,R4,R9 (wait 1+2, DELAY 8)
+        THE FINAL FIX: the replay boot proved the loads read correct
+        sysmem data (y[i] came back = x[i] exactly) and the only failure
+        was this IMAD's result not being in R8 when the STG read it 4
+        cycles later -- the SM75 6-cycle integer-ALU latency law, in its
+        true home. run #1's famous "loads returned zero" was x[0]=0 seed
+        + this same stale-R8 store all along; no coherence problem ever
+        existed. Delay 4 -> 8.                                          */
     0x06007386, 0x00000008, 0x0010e900, 0x000fc400, /* 11 STG.E.SYS [R6],R8             */
     0x0000794d, 0x00000000, 0x03800000, 0x000fea00, /* 12 EXIT                          */
     0x00007918, 0x00000000, 0x00000000, 0x000fc000, /* 13 NOP                           */

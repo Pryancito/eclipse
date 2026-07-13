@@ -3991,14 +3991,14 @@ impl DrmScheme for NvidiaGpu {
         };
         match result {
             Ok(c) => {
-                let _ = writeln!(s, "[gpustep23] --- integer SAXPY: y[i] = 3*x[i] + y[i], x[i]=i, y[i]=100+i ---");
+                let _ = writeln!(s, "[gpustep23] --- integer SAXPY: y[i] = 3*x[i] + y[i], x[i]=0x1000+i, y[i]=100+i ---");
                 let _ = writeln!(s, "[gpustep23] lookup / CPU map:         {} / {}", phase(c.lookup_status), phase(c.map_status));
                 let _ = writeln!(s, "[gpustep23] token:                    {} (token={:#010x}, runlist={})", phase(c.token_status), c.work_token, c.runlist_id);
                 let _ = writeln!(s, "[gpustep23] QMD @ {:#x}, kernel @ {:#x}, y[] @ {:#x}", c.qmd_va, c.kernel_va, c.out_va);
                 let _ = writeln!(s, "[gpustep23] launch ({} dw):            {}", c.push_dwords, phase(c.submit_status));
                 let _ = writeln!(s, "[gpustep23] post-PCAS host fence:     {} ({} ms)", phase(c.fence_status), c.fence_iters);
                 let _ = writeln!(s, "[gpustep23] QMD RELEASE0 semaphore:   {} ({} ms)", phase(c.sem_status), c.sem_iters);
-                let _ = writeln!(s, "[gpustep23] SAXPY verification:       {} ({}/32 elements = 4i+100)", phase(c.verify_status), c.match_count);
+                let _ = writeln!(s, "[gpustep23] SAXPY verification:       {} ({}/32 elements = 0x3064+4i)", phase(c.verify_status), c.match_count);
                 if c.fault_ctrl_status != 0xFFFF_FFFF {
                     let _ = writeln!(
                         s,
@@ -4007,7 +4007,7 @@ impl DrmScheme for NvidiaGpu {
                     );
                 }
                 if c.first_bad_idx != 0xFFFF_FFFF {
-                    let _ = writeln!(s, "[gpustep23] first mismatch: y[{}]={:#x} ({}) expected {}", c.first_bad_idx, c.first_bad_val, c.first_bad_val, 4 * c.first_bad_idx + 100);
+                    let _ = writeln!(s, "[gpustep23] first mismatch: y[{}]={:#x} ({}) expected {:#x}", c.first_bad_idx, c.first_bad_val, c.first_bad_val, 0x3064 + 4 * c.first_bad_idx);
                 }
                 if c.sem_status == 0 && c.verify_status == 0 {
                     let _ = writeln!(s, "[gpustep23] ============================================================");
