@@ -4187,13 +4187,18 @@ report:
 /* ===================================================================
  * GIOPS BENCHMARK -- integer-ALU throughput.
  *
- * A big grid (BENCH_CTAS x 32 threads) where each thread runs a
- * dependent chain of BENCH_IMADS IMAD.U32 ops (proven encoding, delay 7
- * so the RAW accumulator never reads stale). No memory traffic in the
- * inner loop -> pure ALU. Timed with the GPU's own PTIMER: two host
- * semaphore releases with RELEASE_TIMESTAMP write a 16-byte report
- * {payload, ts_ns} -- one before SEND_PCAS (t0), one after with
- * RELEASE_WFI (t1, waits for the grid to drain). delta = real grid ns.
+ * A big grid (BENCH_CTAS x BENCH_TPC threads) where each thread runs
+ * BENCH_IMADS IMAD.U32 ops spread across BENCH_ACCUM INDEPENDENT
+ * accumulators (Rk = Rk*R2+R3, k rotating over 8 registers). Consecutive
+ * instructions touch different accumulators, so the SM issues them
+ * back-to-back (delay 1) instead of stalling on each op's ~6-cycle
+ * integer-ALU latency: the 8-deep rotation gives an 8-cycle RAW gap per
+ * accumulator, > the 6-cycle latency (validated, and the same 8-gap that
+ * silicon proved safe in the SAXPY). 256 threads/CTA = 8 warps/CTA so
+ * the four SM schedulers stay fed (latency hidden by occupancy). No
+ * memory traffic -> pure ALU throughput. Timed by the GPU PTIMER: two
+ * host semaphore releases with RELEASE_TIMESTAMP write {payload, ts_ns}
+ * -- t0 before SEND_PCAS, t1 after with RELEASE_WFI (drains the grid).
  * ops = threads * IMADS * 2 (each IMAD = a multiply + an add).
  * =================================================================== */
 #define ECLIPSE_BENCH_KERNEL_OFF 0x1800
@@ -4204,9 +4209,10 @@ report:
 #define ECLIPSE_BENCH_SEM_PAYLOAD 0x5A55B0D5
 #define ECLIPSE_BENCH_T0_PAYLOAD  0x0000B000
 #define ECLIPSE_BENCH_T1_PAYLOAD  0x0000B111
-#define ECLIPSE_BENCH_IMADS      256
-#define ECLIPSE_BENCH_CTAS       4096
-#define ECLIPSE_BENCH_TPC        32       /* threads per CTA */
+#define ECLIPSE_BENCH_IMADS      256      /* per thread, over 8 accumulators */
+#define ECLIPSE_BENCH_ACCUM      8        /* independent accumulators R4..R11 */
+#define ECLIPSE_BENCH_CTAS       2048
+#define ECLIPSE_BENCH_TPC        256      /* threads per CTA = 8 warps */
 #define ECLIPSE_BENCH_POLL_MS    5000
 
 typedef struct EclipseGrBench
@@ -4340,18 +4346,27 @@ NV_STATUS eclipse_rm_bench(NvU32 gpuInstance, EclipseGrBench *pOut)
         NvU64 semVA = g_grChanCache.bufGpuVA + ECLIPSE_BENCH_SEM_OFF;
         NvU32 ki = 0, j;
 
-        /* setup: S2R R0,tid ; MOV R2,3 ; MOV R3,7 ; MOV R4,1 */
+        /* setup: S2R R0,tid ; MOV R2,3 ; MOV R3,7 ; MOV R4..R11 = 1..8 */
         k[ki++] = 0x00007919; k[ki++] = 0x00000000; k[ki++] = 0x00002100; k[ki++] = 0x000e0200;
         k[ki++] = 0x00027802; k[ki++] = 0x00000003; k[ki++] = 0x00000f00; k[ki++] = 0x000fc400;
         k[ki++] = 0x00037802; k[ki++] = 0x00000007; k[ki++] = 0x00000f00; k[ki++] = 0x000fc400;
-        k[ki++] = 0x00047802; k[ki++] = 0x00000001; k[ki++] = 0x00000f00; k[ki++] = 0x000fc400;
-        /* IMAD.U32 R4,R4,R2,R3 x N  (dependent chain, delay 7 = RAW-safe) */
+        for (j = 0; j < ECLIPSE_BENCH_ACCUM; j++)
+        {
+            NvU32 r = 4 + j;
+            k[ki++] = 0x00007802 | (r << 16);   /* MOV Rr, imm */
+            k[ki++] = j + 1;
+            k[ki++] = 0x00000f00;
+            k[ki++] = 0x000fc400;
+        }
+        /* IMAD.U32 Rk,Rk,R2,R3 x N, k rotating over 8 accumulators so
+         * consecutive ops are independent -> delay 1 (8-deep RAW gap). */
         for (j = 0; j < ECLIPSE_BENCH_IMADS; j++)
         {
-            k[ki++] = 0x04047224;   /* op 0x224, Rd=R4, Ra=R4 */
+            NvU32 r = 4 + (j % ECLIPSE_BENCH_ACCUM);
+            k[ki++] = 0x00007224 | (r << 16) | (r << 24);  /* IMAD Rr,Rr,.. */
             k[ki++] = 0x00000002;   /* Rb=R2 */
             k[ki++] = 0x078e0203;   /* signed rrr, Rc=R3 */
-            k[ki++] = 0x000fce00;   /* delay 7, no barriers, no wait */
+            k[ki++] = 0x000fc200;   /* delay 1, no barriers, no wait */
         }
         k[ki++] = 0x0000794d; k[ki++] = 0x00000000; k[ki++] = 0x03800000; k[ki++] = 0x000fea00; /* EXIT */
         for (j = 0; j < 4; j++) { k[ki++] = 0x00007918; k[ki++] = 0; k[ki++] = 0; k[ki++] = 0x000fc000; }
