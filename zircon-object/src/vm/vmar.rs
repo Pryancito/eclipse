@@ -1023,6 +1023,11 @@ impl VmMapping {
         const FAULT_AROUND_PAGES: usize = 16;
 
         let vaddr = round_down_pages(vaddr);
+        // Resolved BEFORE taking `self.inner`: it acquires the VMO family lock,
+        // and the established discipline is to never hold the mapping lock
+        // while taking a VMO lock (the reverse direction exists via
+        // `range_change`, which only survives that nesting by using try_lock).
+        let demand_paged = self.vmo.is_demand_paged();
         let (vmo_offset, mut flags, around) = {
             let inner = self.inner.lock();
             let offset = vaddr - inner.addr;
@@ -1032,7 +1037,7 @@ impl VmMapping {
             // filesystem read; anonymous pages are cheap zero-fills and eager
             // commit would only waste frames.
             let mut around = Vec::new();
-            if self.vmo.is_demand_paged() {
+            if demand_paged {
                 let total_pages = inner.size / PAGE_SIZE;
                 let end = (page_idx + FAULT_AROUND_PAGES).min(total_pages);
                 for idx in (page_idx + 1)..end {

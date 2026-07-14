@@ -437,18 +437,33 @@ pub fn gem_close(handle_id: u32) -> bool {
     }
 }
 
+/// Snapshot the registered drivers so they can be called with `DRM_STATE`
+/// RELEASED. `DRM_STATE`'s `lock::Mutex` is an IRQ-disabling spinlock, and a
+/// driver query is NOT guaranteed to be cheap: the NVIDIA RM one runs GSP RPCs
+/// and a DDC/EDID probe on its first use (labwc's initial GETRESOURCES /
+/// GETCONNECTOR), which can take hundreds of milliseconds — or wedge outright
+/// on flaky hardware. Holding the spinlock across that stalls this CPU with
+/// interrupts off and piles every other DRM caller (scanout, page flips,
+/// events) up behind it, each also spinning with interrupts off: the whole
+/// machine freezes. Same rule `alloc_buffer` already documents.
+fn snapshot_drivers() -> Vec<Arc<dyn DrmScheme>> {
+    DRM_STATE.lock().drivers.clone()
+}
+
 pub fn get_resources() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
-    let state = DRM_STATE.lock();
-    let fbs: Vec<u32> = state.framebuffers.iter().map(|fb| fb.id).collect();
+    let (fbs, drivers) = {
+        let state = DRM_STATE.lock();
+        let fbs: Vec<u32> = state.framebuffers.iter().map(|fb| fb.id).collect();
+        (fbs, state.drivers.clone())
+    };
 
     let mut crtcs = Vec::new();
     let mut connectors = Vec::new();
-    for driver in &state.drivers {
+    for driver in &drivers {
         let (_, d_crtcs, d_conns) = driver.get_resources();
         crtcs.extend(d_crtcs);
         connectors.extend(d_conns);
     }
-    drop(state);
 
     // Prefer the software framebuffer KMS path: synthesize one CRTC + connector
     // so `drmIsKMS()` passes and wlroots drives the output through our scanout
@@ -474,12 +489,10 @@ pub fn get_resources() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
 }
 
 pub fn get_connector(id: u32) -> Option<DrmConnector> {
-    {
-        let state = DRM_STATE.lock();
-        for driver in &state.drivers {
-            if let Some(conn) = driver.get_connector(id) {
-                return Some(conn);
-            }
+    // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
+    for driver in snapshot_drivers() {
+        if let Some(conn) = driver.get_connector(id) {
+            return Some(conn);
         }
     }
     // Software framebuffer fallback (no driver, or driver without KMS).
@@ -498,12 +511,10 @@ pub fn get_connector(id: u32) -> Option<DrmConnector> {
 }
 
 pub fn get_crtc(id: u32) -> Option<DrmCrtc> {
-    {
-        let state = DRM_STATE.lock();
-        for driver in &state.drivers {
-            if let Some(crtc) = driver.get_crtc(id) {
-                return Some(crtc);
-            }
+    // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
+    for driver in snapshot_drivers() {
+        if let Some(crtc) = driver.get_crtc(id) {
+            return Some(crtc);
         }
     }
     // Software framebuffer fallback (no driver, or driver without KMS).
@@ -525,21 +536,19 @@ pub fn get_planes() -> Vec<u32> {
         // One synthetic primary plane bound to the synthetic CRTC.
         return vec![SYNTH_PLANE_ID];
     }
-    let state = DRM_STATE.lock();
+    // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
     let mut planes = Vec::new();
-    for driver in &state.drivers {
+    for driver in snapshot_drivers() {
         planes.extend(driver.get_planes());
     }
     planes
 }
 
 pub fn get_plane(id: u32) -> Option<DrmPlane> {
-    {
-        let state = DRM_STATE.lock();
-        for driver in &state.drivers {
-            if let Some(plane) = driver.get_plane(id) {
-                return Some(plane);
-            }
+    // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
+    for driver in snapshot_drivers() {
+        if let Some(plane) = driver.get_plane(id) {
+            return Some(plane);
         }
     }
     if software_kms_active() && id == SYNTH_PLANE_ID {

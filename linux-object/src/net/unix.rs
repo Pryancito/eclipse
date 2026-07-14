@@ -239,22 +239,35 @@ impl Future for UnixEventWait {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
-        let mut inner = this.inner.lock();
-        if !(inner.eventbus.events() & this.mask).is_empty() {
-            return Poll::Ready(());
+        {
+            let mut inner = this.inner.lock();
+            if !(inner.eventbus.events() & this.mask).is_empty() {
+                return Poll::Ready(());
+            }
+            if !this.subscribed {
+                this.subscribed = true;
+                let waker = cx.waker().clone();
+                let mask = this.mask;
+                inner.eventbus.subscribe(Box::new(move |ev| {
+                    if (ev & mask).is_empty() {
+                        return false;
+                    }
+                    waker.wake_by_ref();
+                    true
+                }));
+            }
         }
-        if !this.subscribed {
-            this.subscribed = true;
-            let waker = cx.waker().clone();
-            let mask = this.mask;
-            inner.eventbus.subscribe(Box::new(move |ev| {
-                if (ev & mask).is_empty() {
-                    return false;
-                }
-                waker.wake_by_ref();
-                true
-            }));
-        }
+        // Backstop timer, re-armed on every Pending: the eventbus wake is the
+        // fast path, but a parked callback can be evicted from a full table.
+        // The event *bits* stay correct regardless, so a periodic re-check
+        // bounds a lost wakeup to one tick instead of hanging the reader
+        // forever. (This is what froze the compositor: a blocked recvmsg whose
+        // only waker had been silently dropped.)
+        let waker = cx.waker().clone();
+        kernel_hal::timer::timer_set(
+            kernel_hal::timer::deadline_after(core::time::Duration::from_millis(20)),
+            Box::new(move |_| waker.wake_by_ref()),
+        );
         Poll::Pending
     }
 }
