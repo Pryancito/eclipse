@@ -90,6 +90,13 @@ impl EventBus {
         }
     }
 
+    /// The currently set event flags. Callers that need a race-free
+    /// check-then-subscribe must hold the same lock that writers use to
+    /// `set()`/`change()` the bus while calling this and `subscribe`.
+    pub fn events(&self) -> Event {
+        self.event
+    }
+
     /// push a EventHandler into the callback vector
     pub fn subscribe(&mut self, callback: EventHandler) {
         if self.callbacks.len() >= MAX_EVENT_CALLBACKS {

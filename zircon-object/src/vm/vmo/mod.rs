@@ -121,6 +121,22 @@ pub trait VMObjectTrait: Sync + Send {
         false
     }
 
+    /// Returns true if the object fills untouched pages lazily from a backing
+    /// source (a file-backed mapping). Used to decide whether fault-around
+    /// pre-commit is worthwhile.
+    fn is_demand_paged(&self) -> bool {
+        false
+    }
+
+    /// Independent copy for Linux `fork`: committed pages are copied eagerly;
+    /// pages never touched by the parent stay lazy in the child (refilled from
+    /// the same backing source, or demand-zero). Implementations that cannot
+    /// guarantee those semantics return `NOT_SUPPORTED` and the caller falls
+    /// back to an eager full copy.
+    fn fork_copy(&self) -> ZxResult<Arc<dyn VMObjectTrait>> {
+        Err(ZxError::NOT_SUPPORTED)
+    }
+
     /// If contiguous, transmute vmo to a mutable buffer
     fn as_mut_buf(&self) -> ZxResult<(MutexGuard<'_, ()>, &mut [u8])> {
         Err(ZxError::NOT_SUPPORTED)
@@ -402,6 +418,24 @@ impl VmObject {
     /// Returns true if the object is backed by a contiguous range of physical memory.
     pub fn is_contiguous(&self) -> bool {
         self.trait_.is_contiguous()
+    }
+
+    /// Independent copy for Linux `fork`: only committed pages are copied;
+    /// untouched pages stay lazy (see [`VMObjectTrait::fork_copy`]). Returns
+    /// `NOT_SUPPORTED` when the backing object cannot provide those semantics,
+    /// in which case the caller must do an eager full copy.
+    pub fn fork_copy(self: &Arc<Self>) -> ZxResult<Arc<Self>> {
+        let trait_ = self.trait_.fork_copy()?;
+        Ok(Arc::new(VmObject {
+            base: KObjectBase::with_signal(Signal::VMO_ZERO_CHILDREN),
+            resizable: false,
+            _counter: CountHelper::new(),
+            trait_,
+            inner: Mutex::new(VmObjectInner {
+                content_size: self.inner.lock().content_size,
+                ..VmObjectInner::default()
+            }),
+        }))
     }
 }
 

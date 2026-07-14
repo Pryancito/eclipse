@@ -257,6 +257,7 @@ impl BtrfsMountFs {
         Arc::new(BtrfsMountINode {
             fs: self.arc(),
             ino,
+            kind: Mutex::new(None),
         })
     }
 
@@ -367,6 +368,23 @@ impl FileSystem for BtrfsMountFs {
 struct BtrfsMountINode {
     fs: Arc<BtrfsMountFs>,
     ino: u64,
+    /// The inode's kind, resolved once on first use. A btrfs object never
+    /// changes kind while it exists, and `read_at` runs once per 4 KiB on the
+    /// demand-paging path — a full B-tree `stat` per call is pure overhead.
+    kind: Mutex<Option<FileKind>>,
+}
+
+impl BtrfsMountINode {
+    /// The inode's kind, from cache or via one `stat` on the locked fs.
+    fn kind(&self, fs: &mut Btrfs) -> Result<FileKind> {
+        let mut cached = self.kind.lock();
+        if let Some(kind) = *cached {
+            return Ok(kind);
+        }
+        let kind = fs.stat(self.ino).map_err(map_err)?.kind;
+        *cached = Some(kind);
+        Ok(kind)
+    }
 }
 
 fn vfs_type(kind: FileKind) -> FileType {
@@ -427,8 +445,7 @@ impl INode for BtrfsMountINode {
         // A read must observe everything written so far: flush this inode's
         // coalescing buffer before serving it.
         self.fs.flush_inode(&mut fs, self.ino)?;
-        let st = fs.stat(self.ino).map_err(map_err)?;
-        match st.kind {
+        match self.kind(&mut fs)? {
             FileKind::Dir => Err(FsError::IsDir),
             FileKind::Symlink => {
                 let target = fs.read_link(self.ino).map_err(map_err)?;
