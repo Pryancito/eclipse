@@ -21,8 +21,8 @@ extern crate alloc;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::{format, vec};
 use alloc::vec::Vec;
+use alloc::{format, vec};
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use lock::Mutex;
 
@@ -384,8 +384,16 @@ pub fn add_trusted_exec_prefix(prefix: String) {
 /// `Enforce`. Not called by default — opt-in.
 pub fn install_default_trusted_exec() {
     for d in [
-        "/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/", "/usr/local/bin/", "/usr/local/sbin/",
-        "/lib/", "/lib64/", "/usr/lib/", "/usr/lib64/",
+        "/bin/",
+        "/sbin/",
+        "/usr/bin/",
+        "/usr/sbin/",
+        "/usr/local/bin/",
+        "/usr/local/sbin/",
+        "/lib/",
+        "/lib64/",
+        "/usr/lib/",
+        "/usr/lib64/",
     ] {
         add_trusted_exec_prefix(String::from(d));
     }
@@ -416,7 +424,10 @@ pub fn exec_allowlist_active() -> bool {
 pub fn is_exec_listed(path: &str) -> bool {
     let canon = canonicalize(path);
     TRUSTED_EXEC_PATHS.lock().iter().any(|p| *p == canon)
-        || TRUSTED_EXEC_PREFIXES.lock().iter().any(|p| canon.starts_with(p.as_str()))
+        || TRUSTED_EXEC_PREFIXES
+            .lock()
+            .iter()
+            .any(|p| canon.starts_with(p.as_str()))
         || LEARNED_EXEC_PATHS.lock().iter().any(|p| *p == canon)
 }
 
@@ -441,7 +452,10 @@ pub fn set_exec_learning(enabled: bool) {
             Severity::Notice,
             "CONTROL",
             "CONFIG",
-            format!("exec learning {}", if enabled { "enabled" } else { "disabled" }),
+            format!(
+                "exec learning {}",
+                if enabled { "enabled" } else { "disabled" }
+            ),
         );
     }
 }
@@ -483,7 +497,13 @@ pub fn add_blacklisted_exec_path(path: String) {
     let canon = canonicalize(&path);
     let mut list = BLACKLISTED_EXEC_PATHS.lock();
     if !list.iter().any(|p| *p == canon) {
-        record(0, Severity::Notice, "CONTROL", "CONFIG", format!("blacklisted program: {}", canon));
+        record(
+            0,
+            Severity::Notice,
+            "CONTROL",
+            "CONFIG",
+            format!("blacklisted program: {}", canon),
+        );
         list.push(canon);
     }
 }
@@ -492,7 +512,13 @@ pub fn add_blacklisted_exec_path(path: String) {
 pub fn add_blacklisted_exec_prefix(prefix: String) {
     let mut list = BLACKLISTED_EXEC_PREFIXES.lock();
     if !list.iter().any(|p| *p == prefix) {
-        record(0, Severity::Notice, "CONTROL", "CONFIG", format!("blacklisted directory: {}", prefix));
+        record(
+            0,
+            Severity::Notice,
+            "CONTROL",
+            "CONFIG",
+            format!("blacklisted directory: {}", prefix),
+        );
         list.push(prefix);
     }
 }
@@ -506,7 +532,10 @@ pub fn blacklisted_exec_count() -> usize {
 pub fn is_exec_blacklisted(path: &str) -> bool {
     let canon = canonicalize(path);
     BLACKLISTED_EXEC_PATHS.lock().iter().any(|p| *p == canon)
-        || BLACKLISTED_EXEC_PREFIXES.lock().iter().any(|p| canon.starts_with(p.as_str()))
+        || BLACKLISTED_EXEC_PREFIXES
+            .lock()
+            .iter()
+            .any(|p| canon.starts_with(p.as_str()))
 }
 
 /// Returns `true` when `path` is in a world-writable location (`/tmp`,
@@ -519,5 +548,8 @@ pub fn is_world_writable_exec_path(path: &str) -> bool {
         return true;
     }
     let canon = canonicalize(path);
-    UNTRUSTED_EXEC_PREFIXES.lock().iter().any(|p| canon.starts_with(p.as_str()))
+    UNTRUSTED_EXEC_PREFIXES
+        .lock()
+        .iter()
+        .any(|p| canon.starts_with(p.as_str()))
 }

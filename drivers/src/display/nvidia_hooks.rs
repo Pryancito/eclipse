@@ -10,9 +10,9 @@
 //! bus/device/function tuple, tagged with a high "valid" bit so a real
 //! bus=device=function=0 location never collides with 0/null.
 
+use crate::builder::IoMapper;
 use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
 use crate::bus::{drivers_timer_now_as_micros, phys_to_virt};
-use crate::builder::IoMapper;
 use alloc::sync::Arc;
 use core::hint::spin_loop;
 use lock::Mutex;

@@ -36,8 +36,7 @@ pub const SYNTH_PLANE_ID: u32 = 4;
 static FLIP_SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// One-shot guard so the first scanout logs (every-frame logging would spam).
-static SCANOUT_LOGGED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static SCANOUT_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Return the primary framebuffer display, if any.
 fn primary_display() -> Option<Arc<dyn DisplayScheme>> {
@@ -305,8 +304,7 @@ pub fn scanout(fb_id: u32) -> bool {
     let vaddr = phys_to_virt(fb.phys_addr as usize);
     // SAFETY: the buffer is contiguous physical memory of `fb.size` bytes,
     // identity-mapped into the kernel's physmap window at `vaddr`.
-    let pixels =
-        unsafe { core::slice::from_raw_parts(vaddr as *const u32, fb.size / 4) };
+    let pixels = unsafe { core::slice::from_raw_parts(vaddr as *const u32, fb.size / 4) };
     let src_stride = (fb.pitch / 4) as usize;
     let width = fb.width.min(info.width);
     let height = fb.height.min(info.height);

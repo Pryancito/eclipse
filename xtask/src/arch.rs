@@ -51,7 +51,6 @@ impl Arch {
         }
         let _ = std::fs::remove_dir_all(&dir);
 
-
         wget(
             format!("https://github.com/YdrMaster/zCore/releases/download/musl-cache/{name}.tgz"),
             &tgz,

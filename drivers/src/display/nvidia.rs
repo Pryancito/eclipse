@@ -3,9 +3,9 @@ use alloc::vec::Vec;
 
 use crate::bus::pci_drivers::PciDriver;
 use crate::prelude::{AccelCaps, ColorFormat, DisplayInfo, FrameBuffer};
-use crate::utils::dma::DmaRegion;
 use crate::scheme::drm::{DrmCaps, DrmConnector, DrmCrtc, DrmPlane, GemHandle};
 use crate::scheme::{DisplayScheme, DrmScheme, Scheme};
+use crate::utils::dma::DmaRegion;
 use crate::{builder::IoMapper, Device, DeviceError, DeviceResult};
 use alloc::sync::Arc;
 use lock::Mutex;
@@ -185,11 +185,31 @@ impl GpuBringup {
         let wr64 = |r: &DmaRegion, i: usize, v: u64| unsafe {
             core::ptr::write_volatile(r.as_ptr::<u64>().add(i), v)
         };
-        wr64(&spt, ((src_va >> 12) & 0x1ff) as usize, gmmu::encode_pte_sys(src.paddr() as u64));
-        wr64(&spt, ((dst_va >> 12) & 0x1ff) as usize, gmmu::encode_pte_sys(dst.paddr() as u64));
-        wr64(&spt, ((sem_va >> 12) & 0x1ff) as usize, gmmu::encode_pte_sys(sem.paddr() as u64));
-        wr64(&spt, ((pb_va >> 12) & 0x1ff) as usize, gmmu::encode_pte_sys(pushbuf.paddr() as u64));
-        wr64(&spt, ((gpfifo_va >> 12) & 0x1ff) as usize, gmmu::encode_pte_sys(gpfifo.paddr() as u64));
+        wr64(
+            &spt,
+            ((src_va >> 12) & 0x1ff) as usize,
+            gmmu::encode_pte_sys(src.paddr() as u64),
+        );
+        wr64(
+            &spt,
+            ((dst_va >> 12) & 0x1ff) as usize,
+            gmmu::encode_pte_sys(dst.paddr() as u64),
+        );
+        wr64(
+            &spt,
+            ((sem_va >> 12) & 0x1ff) as usize,
+            gmmu::encode_pte_sys(sem.paddr() as u64),
+        );
+        wr64(
+            &spt,
+            ((pb_va >> 12) & 0x1ff) as usize,
+            gmmu::encode_pte_sys(pushbuf.paddr() as u64),
+        );
+        wr64(
+            &spt,
+            ((gpfifo_va >> 12) & 0x1ff) as usize,
+            gmmu::encode_pte_sys(gpfifo.paddr() as u64),
+        );
         // CE fault buffer: 8 contiguous pages.
         for p in 0..8u64 {
             let va = ce_fault_va + p * 0x1000;
@@ -207,9 +227,21 @@ impl GpuBringup {
         wr64(&pd0, pdei * 2 + 1, gmmu::encode_pde_sys(spt.paddr() as u64));
 
         // PD2 / PD3 / root: single PDEs; idx == 0 at all three top levels here.
-        wr64(&pd2, ((src_va >> 29) & 0x1ff) as usize, gmmu::encode_pde_sys(pd0.paddr() as u64));
-        wr64(&pd3, ((src_va >> 38) & 0x1ff) as usize, gmmu::encode_pde_sys(pd2.paddr() as u64));
-        wr64(&root, ((src_va >> 47) & 0x3) as usize, gmmu::encode_pde_sys(pd3.paddr() as u64));
+        wr64(
+            &pd2,
+            ((src_va >> 29) & 0x1ff) as usize,
+            gmmu::encode_pde_sys(pd0.paddr() as u64),
+        );
+        wr64(
+            &pd3,
+            ((src_va >> 38) & 0x1ff) as usize,
+            gmmu::encode_pde_sys(pd2.paddr() as u64),
+        );
+        wr64(
+            &root,
+            ((src_va >> 47) & 0x3) as usize,
+            gmmu::encode_pde_sys(pd3.paddr() as u64),
+        );
 
         Some(Self {
             root,
@@ -234,9 +266,8 @@ impl GpuBringup {
     /// is ever pointed at these tables.
     fn dump(&self) -> String {
         use core::fmt::Write;
-        let rd64 = |r: &DmaRegion, i: usize| unsafe {
-            core::ptr::read_volatile(r.as_ptr::<u64>().add(i))
-        };
+        let rd64 =
+            |r: &DmaRegion, i: usize| unsafe { core::ptr::read_volatile(r.as_ptr::<u64>().add(i)) };
         let mut s = String::new();
         let _ = writeln!(
             s,
@@ -319,9 +350,8 @@ impl GpuBringup {
     /// mthd 0x0, subc 4, count 1 that is 0x20018000. No GPU register touched.
     fn write_setobject_pushbuffer(&self) -> u32 {
         let pb = self.pushbuf.vaddr();
-        let w32 = |i: usize, v: u32| unsafe {
-            core::ptr::write_volatile((pb as *mut u32).add(i), v)
-        };
+        let w32 =
+            |i: usize, v: u32| unsafe { core::ptr::write_volatile((pb as *mut u32).add(i), v) };
         w32(0, 0x2001_8000); // INC subc4 mthd 0x000 (SET_OBJECT) count1
         w32(1, 0x0000_c5b5); // TURING_DMA_COPY_A class
         2
@@ -332,9 +362,8 @@ impl GpuBringup {
     /// LENGTH<<10. Verified against clc36f.h NVC36F_GP_ENTRY*.
     fn write_gpfifo_entry(&self, slot: usize, pb_va: u64, n: u32) {
         let gp = self.gpfifo.vaddr();
-        let w32 = |i: usize, v: u32| unsafe {
-            core::ptr::write_volatile((gp as *mut u32).add(i), v)
-        };
+        let w32 =
+            |i: usize, v: u32| unsafe { core::ptr::write_volatile((gp as *mut u32).add(i), v) };
         let entry0 = (pb_va as u32) & 0xFFFF_FFFC;
         let entry1 = ((pb_va >> 32) as u32 & 0xFF) | (n << 10);
         w32(slot * 2, entry0);
@@ -744,7 +773,8 @@ impl NvidiaGpu {
     fn dump_preboot_state(&self, tag: &str) -> String {
         use core::fmt::Write;
         let bar0 = self._bar0;
-        let rd = |off: usize| -> u32 { unsafe { core::ptr::read_volatile((bar0 + off) as *const u32) } };
+        let rd =
+            |off: usize| -> u32 { unsafe { core::ptr::read_volatile((bar0 + off) as *const u32) } };
         let regs: [(&str, usize); 5] = [
             ("PMC_ENABLE", 0x000200),
             ("PDISP_VGA_WORKSPACE_BASE", 0x625F04),
@@ -762,7 +792,11 @@ impl NvidiaGpu {
         let cmd = {
             use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
             use pci::Location;
-            let loc = Location { bus: self.pci_bus, device: self.pci_device, function: 0 };
+            let loc = Location {
+                bus: self.pci_bus,
+                device: self.pci_device,
+                function: 0,
+            };
             unsafe { PCI_ACCESS.read16(&PortOpsImpl, loc, 0x04) }
         };
         let line = alloc::format!("[{}] preboot PCI COMMAND = {:#06x}", tag, cmd);
@@ -812,12 +846,20 @@ impl NvidiaGpu {
                 }
                 alloc::format!("[{}] preboot PCIe {}: cap not found", tag, label)
             };
-            let gpu_loc = Location { bus: self.pci_bus, device: self.pci_device, function: 0 };
+            let gpu_loc = Location {
+                bus: self.pci_bus,
+                device: self.pci_device,
+                function: 0,
+            };
             let line = pcie_dump(gpu_loc, "GPU");
             log::error!("{}", line);
             let _ = writeln!(s, "{}", line);
             if let Some((b, d, f)) = self.find_parent_bridge() {
-                let rp_loc = Location { bus: b, device: d, function: f };
+                let rp_loc = Location {
+                    bus: b,
+                    device: d,
+                    function: f,
+                };
                 let line = pcie_dump(rp_loc, "root-port");
                 log::error!("{}", line);
                 let _ = writeln!(s, "{}", line);
@@ -826,7 +868,11 @@ impl NvidiaGpu {
         // Sysmem flush buffer target (kern_mem_sys_gm107.c programs it; a
         // zero/garbage value on one GPU would resurrect that theory).
         let flush = rd(0x100C10);
-        let line = alloc::format!("[{}] preboot PFB_NISO_FLUSH_SYSMEM_ADDR (0x100c10) = {:#010x}", tag, flush);
+        let line = alloc::format!(
+            "[{}] preboot PFB_NISO_FLUSH_SYSMEM_ADDR (0x100c10) = {:#010x}",
+            tag,
+            flush
+        );
         log::error!("{}", line);
         let _ = writeln!(s, "{}", line);
         // Display liveness: the scanout theory REQUIRES the primary's heads
@@ -867,7 +913,10 @@ impl NvidiaGpu {
                 let _ = writeln!(s, "{}", line);
             }
         } else {
-            let line = alloc::format!("[{}] preboot PDISP disabled in PMC_ENABLE (no head dump)", tag);
+            let line = alloc::format!(
+                "[{}] preboot PDISP disabled in PMC_ENABLE (no head dump)",
+                tag
+            );
             log::error!("{}", line);
             let _ = writeln!(s, "{}", line);
         }
@@ -878,7 +927,11 @@ impl NvidiaGpu {
     /// role (console vs secondary) and its PCI location, then the full
     /// register snapshot. Safe -- pure BAR0/config reads, no boot.
     fn hw_dump_impl(&self) -> String {
-        let role = if self.drives_boot_display() { "CONSOLE/primary" } else { "secondary/headless" };
+        let role = if self.drives_boot_display() {
+            "CONSOLE/primary"
+        } else {
+            "secondary/headless"
+        };
         let mut s = alloc::format!(
             "[gpudump] === {} GPU {:02x}:{:02x}.0 (bar0_phys={:#x} bar1_phys={:#x} vram={}MB) ===\n",
             role, self.pci_bus, self.pci_device, self.bar0_phys, self.bar1_phys, self.vram_size_mb
@@ -912,7 +965,11 @@ impl NvidiaGpu {
         for bus in 0..=self.pci_bus {
             for dev in 0..32u8 {
                 for func in 0..8u8 {
-                    let loc = Location { bus, device: dev, function: func };
+                    let loc = Location {
+                        bus,
+                        device: dev,
+                        function: func,
+                    };
                     let vend = unsafe { PCI_ACCESS.read16(ops, loc, 0x00) };
                     if vend == 0xFFFF {
                         continue;
@@ -946,7 +1003,11 @@ impl NvidiaGpu {
             return s;
         };
         let ops = &PortOpsImpl;
-        let loc = Location { bus: b, device: d, function: f };
+        let loc = Location {
+            bus: b,
+            device: d,
+            function: f,
+        };
         // Walk the capability list for the PCIe capability (ID 0x10).
         let mut ptr = unsafe { PCI_ACCESS.read8(ops, loc, 0x34) };
         let mut cap = 0u8;
@@ -962,7 +1023,11 @@ impl NvidiaGpu {
             ptr = unsafe { PCI_ACCESS.read8(ops, loc, ptr as u16 + 1) };
         }
         if cap == 0 {
-            let _ = writeln!(s, "[gpustep11] CTO: root port {:02x}:{:02x}.{} has no PCIe cap?", b, d, f);
+            let _ = writeln!(
+                s,
+                "[gpustep11] CTO: root port {:02x}:{:02x}.{} has no PCIe cap?",
+                b, d, f
+            );
             return s;
         }
         let devcap2 = unsafe { PCI_ACCESS.read32(ops, loc, cap as u16 + 0x24) };
@@ -978,7 +1043,15 @@ impl NvidiaGpu {
         }
         // Pick the shortest supported range: A(bit0)->0b0001, B->0b0101,
         // C->0b1001, D->0b1101 (PCIe base spec encoding).
-        let val: u16 = if ranges & 1 != 0 { 0b0001 } else if ranges & 2 != 0 { 0b0101 } else if ranges & 4 != 0 { 0b1001 } else { 0b1101 };
+        let val: u16 = if ranges & 1 != 0 {
+            0b0001
+        } else if ranges & 2 != 0 {
+            0b0101
+        } else if ranges & 4 != 0 {
+            0b1001
+        } else {
+            0b1101
+        };
         let new_dc2 = (dc2 & !0x001F) | val; // clear CTO-disable (bit4) + set range
         unsafe { PCI_ACCESS.write16(ops, loc, cap as u16 + 0x28, new_dc2) };
         let _ = writeln!(
@@ -996,7 +1069,11 @@ impl NvidiaGpu {
     /// the root port/bridges that forward VGA cycles. Returns the list of
     /// (bus, device, function, old bridge-control value) actually changed,
     /// for the caller to restore afterwards.
-    fn set_path_vga_routing(&self, disable: bool, restore: &[(u8, u8, u8, u16)]) -> (String, Vec<(u8, u8, u8, u16)>) {
+    fn set_path_vga_routing(
+        &self,
+        disable: bool,
+        restore: &[(u8, u8, u8, u16)],
+    ) -> (String, Vec<(u8, u8, u8, u16)>) {
         use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
         use core::fmt::Write;
         use pci::Location;
@@ -1010,7 +1087,11 @@ impl NvidiaGpu {
             for bus in 0..=self.pci_bus {
                 for dev in 0..32u8 {
                     for func in 0..8u8 {
-                        let loc = Location { bus, device: dev, function: func };
+                        let loc = Location {
+                            bus,
+                            device: dev,
+                            function: func,
+                        };
                         let vend = unsafe { PCI_ACCESS.read16(ops, loc, 0x00) };
                         if vend == 0xFFFF {
                             continue;
@@ -1038,13 +1119,24 @@ impl NvidiaGpu {
                 }
             }
             if changed.is_empty() {
-                let _ = writeln!(s, "[gpustep11] no bridge on the path had VGA routing enabled");
+                let _ = writeln!(
+                    s,
+                    "[gpustep11] no bridge on the path had VGA routing enabled"
+                );
             }
         } else {
             for &(bus, dev, func, old) in restore {
-                let loc = Location { bus, device: dev, function: func };
+                let loc = Location {
+                    bus,
+                    device: dev,
+                    function: func,
+                };
                 unsafe { PCI_ACCESS.write16(ops, loc, 0x3E, old) };
-                let _ = writeln!(s, "[gpustep11] bridge {:02x}:{:02x}.{} VGA routing restored", bus, dev, func);
+                let _ = writeln!(
+                    s,
+                    "[gpustep11] bridge {:02x}:{:02x}.{} VGA routing restored",
+                    bus, dev, func
+                );
             }
         }
         (s, changed)
@@ -1076,9 +1168,8 @@ impl NvidiaGpu {
         let mut s = String::new();
         let bar0 = self._bar0;
         let rd = |off: usize| unsafe { core::ptr::read_volatile((bar0 + off) as *const u32) };
-        let wr = |off: usize, v: u32| unsafe {
-            core::ptr::write_volatile((bar0 + off) as *mut u32, v)
-        };
+        let wr =
+            |off: usize, v: u32| unsafe { core::ptr::write_volatile((bar0 + off) as *mut u32, v) };
         // Looks like the 0xBADFxxxx PRI-error sentinel (register absent /
         // priv fault)? Never write to a register that read back as one.
         let is_badf = |v: u32| (v & 0xFFFF_0000) == 0xBADF_0000;
@@ -1148,7 +1239,11 @@ impl NvidiaGpu {
         };
         let tail = alloc::format!(
             "[{}] PBUS after clear: INTR_0={:#010x} LEAF[4]={:#010x} PMC_INTR0={:#010x} -> {}",
-            tag, intr0_after, leaf4_after, pmc0_after, verdict
+            tag,
+            intr0_after,
+            leaf4_after,
+            pmc0_after,
+            verdict
         );
         log::error!("{}", tail);
         let _ = writeln!(s, "{}", tail);
@@ -1196,11 +1291,22 @@ impl NvidiaGpu {
         use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
         use pci::Location;
         let ops = &PortOpsImpl;
-        let gpu_loc = Location { bus: self.pci_bus, device: self.pci_device, function: 0 };
-        let Some((b, d, f)) = self.find_parent_bridge() else {
-            return alloc::format!("[{}] MPS normalize: no parent bridge found (skipped)\n", tag);
+        let gpu_loc = Location {
+            bus: self.pci_bus,
+            device: self.pci_device,
+            function: 0,
         };
-        let rp_loc = Location { bus: b, device: d, function: f };
+        let Some((b, d, f)) = self.find_parent_bridge() else {
+            return alloc::format!(
+                "[{}] MPS normalize: no parent bridge found (skipped)\n",
+                tag
+            );
+        };
+        let rp_loc = Location {
+            bus: b,
+            device: d,
+            function: f,
+        };
         let (Some(gpu_cap), Some(rp_cap)) =
             (Self::pcie_cap_ptr(gpu_loc), Self::pcie_cap_ptr(rp_loc))
         else {
@@ -1255,12 +1361,19 @@ impl NvidiaGpu {
             let _ = writeln!(s, "[{}] recovery: no parent bridge found; cannot SBR", tag);
             return (false, s);
         };
-        let bridge = Location { bus: bb, device: bd, function: bf };
-        let gpu = Location { bus: self.pci_bus, device: self.pci_device, function: 0 };
+        let bridge = Location {
+            bus: bb,
+            device: bd,
+            function: bf,
+        };
+        let gpu = Location {
+            bus: self.pci_bus,
+            device: self.pci_device,
+            function: 0,
+        };
         let spin_ms = |ms: u64| {
             let t0 = unsafe { crate::bus::drivers_timer_now_as_micros() };
-            while unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(t0)
-                < ms * 1000
+            while unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(t0) < ms * 1000
             {
                 core::hint::spin_loop();
             }
@@ -1272,11 +1385,11 @@ impl NvidiaGpu {
             PCI_ACCESS.write16(ops, bridge, 0x3E, bc);
         }
         spin_ms(250); // link retrain + device-ready time
-        // Restore the GPU's config: BARs (address bits; RO flag bits are
-        // ignored by the device), COMMAND (MEM+BME, INTx masked). The GPU's
-        // ROM-based GFW/IFR re-runs its own boot after a hot reset;
-        // kgspInitRm's kgspWaitForGfwBootOk then waits for it like on a
-        // cold boot (the vfio/VM-passthrough flow relies on exactly this).
+                      // Restore the GPU's config: BARs (address bits; RO flag bits are
+                      // ignored by the device), COMMAND (MEM+BME, INTx masked). The GPU's
+                      // ROM-based GFW/IFR re-runs its own boot after a hot reset;
+                      // kgspInitRm's kgspWaitForGfwBootOk then waits for it like on a
+                      // cold boot (the vfio/VM-passthrough flow relies on exactly this).
         unsafe {
             PCI_ACCESS.write32(ops, gpu, 0x10, self.bar0_phys as u32);
             PCI_ACCESS.write32(ops, gpu, 0x14, self.bar1_phys as u32);
@@ -1453,7 +1566,8 @@ impl NvidiaGpu {
                         Err(status) => {
                             let msg = alloc::format!(
                                 "kgspInitRm FAILED, NV_STATUS={:#x} (attempt {})",
-                                status, attempt
+                                status,
+                                attempt
                             );
                             if drain_for_console
                                 && nvidia_rm_sys::os_boundary::wedge_detected()
@@ -1526,7 +1640,9 @@ impl NvidiaGpu {
                 alloc::format!(
                     "[{}]  --- Real GSP-RM boot: skipped (no gsp.bin in driver) ---\n\
                      [{}]  boot-time firmware load: {}\n",
-                    tag, tag, status
+                    tag,
+                    tag,
+                    status
                 )
             }
         } else {
@@ -1650,7 +1766,8 @@ impl NvidiaGpu {
     /// Returns (hw_count, lo, hi, size) for reporting.
     fn setup_fault_buffer(&self, b: &GpuBringup) -> (u32, u32, u32, u32) {
         let bar0 = self._bar0;
-        let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
+        let rd =
+            |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
         let wr = |off: u32, v: u32| unsafe {
             core::ptr::write_volatile((bar0 + off as usize) as *mut u32, v)
         };
@@ -1683,7 +1800,8 @@ impl NvidiaGpu {
         self.write_pdb_join_vram(bi, b.root.paddr() as u64);
 
         let bar0 = self._bar0;
-        let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
+        let rd =
+            |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
         let wr = |off: u32, v: u32| unsafe {
             core::ptr::write_volatile((bar0 + off as usize) as *mut u32, v)
         };
@@ -1729,7 +1847,8 @@ impl NvidiaGpu {
     /// + gk104_fifo_init. Idempotent.
     fn setup_fifo(&self) {
         let bar0 = self._bar0;
-        let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
+        let rd =
+            |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
         let wr = |off: u32, v: u32| unsafe {
             core::ptr::write_volatile((bar0 + off as usize) as *mut u32, v)
         };
@@ -1775,7 +1894,8 @@ impl NvidiaGpu {
 
     fn gmmu_flush(&self, root_phys: u64) -> (u32, u32, bool) {
         let bar0 = self._bar0;
-        let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
+        let rd =
+            |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
         let wr = |off: u32, v: u32| unsafe {
             core::ptr::write_volatile((bar0 + off as usize) as *mut u32, v)
         };
@@ -1822,7 +1942,8 @@ impl NvidiaGpu {
     /// never read this register at all.
     fn find_ce_runlist(&self) -> Option<(u32, u32)> {
         let bar0 = self._bar0;
-        let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
+        let rd =
+            |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
         let mut ty: u32 = !0;
         let mut have_entry = false;
         let mut runlist: u32 = 0;
@@ -1893,7 +2014,8 @@ impl NvidiaGpu {
     fn ptop_report(&self) -> alloc::string::String {
         use core::fmt::Write;
         let bar0 = self._bar0;
-        let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
+        let rd =
+            |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
         let mut out = alloc::string::String::new();
         let mut ty: u32 = !0;
         let mut have_entry = false;
@@ -1959,7 +2081,8 @@ impl NvidiaGpu {
         let runl_id = self.find_ce_runlist().map(|(rl, _)| rl).unwrap_or(0);
         const CHID: u32 = 0;
         let bar0 = self._bar0;
-        let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
+        let rd =
+            |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
         let wr = |off: u32, v: u32| unsafe {
             core::ptr::write_volatile((bar0 + off as usize) as *mut u32, v)
         };
@@ -1978,7 +2101,10 @@ impl NvidiaGpu {
         // Bind the channel's instance block in CHRAM so the host can find it
         // (gk104_chan_bind_inst: 0x800000+chid*8 = BIND | inst>>12, VRAM target).
         let inst_vram = b.inst_vram();
-        wr(0x0080_0000 + CHID * 8, 0x8000_0000 | (inst_vram >> 12) as u32);
+        wr(
+            0x0080_0000 + CHID * 8,
+            0x8000_0000 | (inst_vram >> 12) as u32,
+        );
 
         // Ensure runlist scheduling is allowed (NV_PFIFO_SCHED_DISABLE bit=runl
         // id; gk104_runl_allow clears it). Default is 0, but clear it to be sure.
@@ -1987,7 +2113,10 @@ impl NvidiaGpu {
         // Enable the channel BEFORE committing the runlist (nouveau order is
         // bind -> start(enable) -> commit; the commit is what loads the channel,
         // so it must see an enabled channel). gk104_chan_start: 0x800004 |= 0x400.
-        wr(0x0080_0004 + CHID * 8, rd(0x0080_0004 + CHID * 8) | 0x0000_0400);
+        wr(
+            0x0080_0004 + CHID * 8,
+            rd(0x0080_0004 + CHID * 8) | 0x0000_0400,
+        );
 
         // tu102_chan_start does MORE than gk104_chan_start: right after the
         // PCCSR enable write it ALSO rings the doorbell immediately, with the
@@ -2280,9 +2409,8 @@ impl DrmScheme for NvidiaGpu {
     fn debug_dump(&self) -> String {
         use core::fmt::Write;
         let bar0 = self._bar0;
-        let rd = |off: u32| unsafe {
-            core::ptr::read_volatile((bar0 + off as usize) as *const u32)
-        };
+        let rd =
+            |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
         // NV_PMC_BOOT_0: architecture/chipset id. NV_PCFG mirror at BAR0+0x88000
         // exposes PCI config dword 0 (vendor | device<<16) — reading 0x10de here
         // proves MMIO is alive. (Offsets per nouveau nvkm.)
@@ -2348,10 +2476,7 @@ impl DrmScheme for NvidiaGpu {
         // nouveau tu102 (vfn/fifo/mmu). A PRI-error sentinel (0xbadfxxxx) here
         // just means the engine block is in reset — still harmless to read.
         let doorbell_en = rd(0x00b6_5000);
-        let _ = writeln!(
-            s,
-            "[gpudbg]  --- FIFO/MMU (Step 0, read-only) ---"
-        );
+        let _ = writeln!(s, "[gpudbg]  --- FIFO/MMU (Step 0, read-only) ---");
         let _ = writeln!(
             s,
             "[gpudbg]  DOORBELL_EN(0xb65000)={:#010x} (bit31={})",
@@ -2392,11 +2517,7 @@ impl DrmScheme for NvidiaGpu {
                 );
             }
         }
-        let _ = writeln!(
-            s,
-            "[gpudbg]  CHAN0_CFG(0x800004)={:#010x}",
-            rd(0x0080_0004)
-        );
+        let _ = writeln!(s, "[gpudbg]  CHAN0_CFG(0x800004)={:#010x}", rd(0x0080_0004));
         let _ = writeln!(
             s,
             "[gpudbg]  MMU flush PDB(0xb830a0)={:#010x} hi(0xb830a4)={:#010x} trigger(0xb830b0)={:#010x}",
@@ -2553,7 +2674,10 @@ impl DrmScheme for NvidiaGpu {
         // before reaching the lock or any real RM code.
         log::warn!("[NVIDIA] bringup_step5: entered");
         let bar0 = self._bar0;
-        log::warn!("[NVIDIA] bringup_step5: read self._bar0 = {:#x}", bar0 as usize);
+        log::warn!(
+            "[NVIDIA] bringup_step5: read self._bar0 = {:#x}",
+            bar0 as usize
+        );
         let mut s = String::new();
         {
             // TEMPORARY chip-ID probe: read PMC_BOOT_0 (offset 0) and
@@ -2570,17 +2694,14 @@ impl DrmScheme for NvidiaGpu {
             // which is the whole ballgame. Written into the RETURNED string
             // (not just log::warn) so it survives the RM init log spew and
             // is always visible in the `cat` output.
-            let boot0 =
-                unsafe { core::ptr::read_volatile(bar0 as *const u32) };
-            let boot42 =
-                unsafe { core::ptr::read_volatile((bar0 + 0xA00) as *const u32) };
+            let boot0 = unsafe { core::ptr::read_volatile(bar0 as *const u32) };
+            let boot42 = unsafe { core::ptr::read_volatile((bar0 + 0xA00) as *const u32) };
             // PMC_BOOT_1 @ 0x4: gpuDetermineVirtualMode (gpu.c:4552) asserts
             // that the VGPU field (bits 17:16) read at attach time matches
             // the value read later through the IoAperture; a mismatch is the
             // 0x40 (NV_ERR_INVALID_STATE). _VF==0x2, _PV==0x1, _REAL==0x0;
             // a bare-metal PF TU106 must read _REAL (0x0) in bits 17:16.
-            let boot1 =
-                unsafe { core::ptr::read_volatile((bar0 + 0x4) as *const u32) };
+            let boot1 = unsafe { core::ptr::read_volatile((bar0 + 0x4) as *const u32) };
             let arch = (boot42 >> 24) & 0x3F;
             let impl_ = (boot42 >> 20) & 0xF;
             let vgpu = (boot1 >> 16) & 0x3;
@@ -2599,7 +2720,12 @@ impl DrmScheme for NvidiaGpu {
             log::warn!(
                 "[NVIDIA] bringup_step5: BAR0 probe: PMC_BOOT_0={:#010x} \
                  PMC_BOOT_42={:#010x} PMC_BOOT_1={:#010x} (arch={:#x} impl={:#x} vgpu={:#x})",
-                boot0, boot42, boot1, arch, impl_, vgpu
+                boot0,
+                boot42,
+                boot1,
+                arch,
+                impl_,
+                vgpu
             );
         }
 
@@ -2618,7 +2744,10 @@ impl DrmScheme for NvidiaGpu {
         // and emit it verbatim on every call.
         log::warn!("[NVIDIA] bringup_step5: checking cached result");
         let cached = self.rm_attach_result.lock().clone();
-        log::warn!("[NVIDIA] bringup_step5: cache check done, cached={}", cached.is_some());
+        log::warn!(
+            "[NVIDIA] bringup_step5: cache check done, cached={}",
+            cached.is_some()
+        );
 
         let block = if let Some(cached) = cached {
             cached
@@ -2635,10 +2764,7 @@ impl DrmScheme for NvidiaGpu {
             nvidia_rm_sys::os_interface::capture_begin();
             let core_status = rm_core_init_once();
             let computed = if core_status != 0 {
-                alloc::format!(
-                    "eclipse_rm_init_core FAILED, NV_STATUS={:#x}",
-                    core_status
-                )
+                alloc::format!("eclipse_rm_init_core FAILED, NV_STATUS={:#x}", core_status)
             } else {
                 match nvidia_rm_sys::rm_init::attach_gpu(
                     self.pci_domain,
@@ -2698,16 +2824,19 @@ impl DrmScheme for NvidiaGpu {
         let mut s = String::new();
         let device_instance = *self.rm_device_instance.lock();
         let Some(device_instance) = device_instance else {
-            return String::from(
-                "[gpustep7]  skipped (run /proc/gpustep5 (RM attach) first)\n",
-            );
+            return String::from("[gpustep7]  skipped (run /proc/gpustep5 (RM attach) first)\n");
         };
         match nvidia_rm_sys::rm_init::get_gsp_info(device_instance) {
             Ok(info) => {
                 let name_len = info.gpu_name.iter().position(|&b| b == 0).unwrap_or(64);
-                let short_len = info.gpu_short_name.iter().position(|&b| b == 0).unwrap_or(64);
+                let short_len = info
+                    .gpu_short_name
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(64);
                 let name = core::str::from_utf8(&info.gpu_name[..name_len]).unwrap_or("<non-utf8>");
-                let short = core::str::from_utf8(&info.gpu_short_name[..short_len]).unwrap_or("<non-utf8>");
+                let short =
+                    core::str::from_utf8(&info.gpu_short_name[..short_len]).unwrap_or("<non-utf8>");
                 if name.is_empty() {
                     let _ = writeln!(
                         s,
@@ -2725,7 +2854,11 @@ impl DrmScheme for NvidiaGpu {
                         info.fb_bus_width,
                         info.fb_ram_type
                     );
-                    let _ = writeln!(s, "[gpustep7]  L2 cache:   {} KiB", info.l2_cache_size / 1024);
+                    let _ = writeln!(
+                        s,
+                        "[gpustep7]  L2 cache:   {} KiB",
+                        info.l2_cache_size / 1024
+                    );
                     let _ = writeln!(
                         s,
                         "[gpustep7]  VBIOS:      valid={} subvendor={:#06x} subdevice={:#06x}",
@@ -2736,7 +2869,11 @@ impl DrmScheme for NvidiaGpu {
                 }
             }
             Err(status) => {
-                let _ = writeln!(s, "[gpustep7]  eclipse_rm_get_gsp_info FAILED, NV_STATUS={:#x}", status);
+                let _ = writeln!(
+                    s,
+                    "[gpustep7]  eclipse_rm_get_gsp_info FAILED, NV_STATUS={:#x}",
+                    status
+                );
             }
         }
         s
@@ -2772,7 +2909,11 @@ impl DrmScheme for NvidiaGpu {
                         core::str::from_utf8(&demo.name[..n]).unwrap_or("<non-utf8>")
                     );
                 } else {
-                    let _ = writeln!(s, "[gpustep8]  GET_NAME_STRING: NV_STATUS={:#x}", demo.name_status);
+                    let _ = writeln!(
+                        s,
+                        "[gpustep8]  GET_NAME_STRING: NV_STATUS={:#x}",
+                        demo.name_status
+                    );
                 }
                 if demo.gid_status == 0 {
                     let n = (demo.gid_length as usize).min(demo.gid.len());
@@ -2782,7 +2923,11 @@ impl DrmScheme for NvidiaGpu {
                         core::str::from_utf8(&demo.gid[..n]).unwrap_or("<non-utf8>")
                     );
                 } else {
-                    let _ = writeln!(s, "[gpustep8]  GET_GID_INFO: NV_STATUS={:#x}", demo.gid_status);
+                    let _ = writeln!(
+                        s,
+                        "[gpustep8]  GET_GID_INFO: NV_STATUS={:#x}",
+                        demo.gid_status
+                    );
                 }
                 if demo.fb_status == 0 {
                     let _ = writeln!(
@@ -2793,7 +2938,11 @@ impl DrmScheme for NvidiaGpu {
                         demo.bus_width
                     );
                 } else {
-                    let _ = writeln!(s, "[gpustep8]  FB_GET_INFO_V2: NV_STATUS={:#x}", demo.fb_status);
+                    let _ = writeln!(
+                        s,
+                        "[gpustep8]  FB_GET_INFO_V2: NV_STATUS={:#x}",
+                        demo.fb_status
+                    );
                 }
             }
             Err(status) => {
@@ -2854,9 +3003,21 @@ impl DrmScheme for NvidiaGpu {
                             e => alloc::format!("FAILED NV_STATUS={:#x}", e),
                         }
                     };
-                    let _ = writeln!(block, "[gpustep9]  gpuStatePreInit: {}", phase(r.pre_init_status));
-                    let _ = writeln!(block, "[gpustep9]  gpuStateInit:    {}", phase(r.init_status));
-                    let _ = writeln!(block, "[gpustep9]  gpuStateLoad:    {}", phase(r.load_status));
+                    let _ = writeln!(
+                        block,
+                        "[gpustep9]  gpuStatePreInit: {}",
+                        phase(r.pre_init_status)
+                    );
+                    let _ = writeln!(
+                        block,
+                        "[gpustep9]  gpuStateInit:    {}",
+                        phase(r.init_status)
+                    );
+                    let _ = writeln!(
+                        block,
+                        "[gpustep9]  gpuStateLoad:    {}",
+                        phase(r.load_status)
+                    );
                     if r.pre_init_status == 0 && r.init_status == 0 && r.load_status == 0 {
                         let _ = writeln!(block, "[gpustep9]  --- FULL RmInitAdapter-equivalent bring-up COMPLETE: GPU is state-loaded ---");
                     }
@@ -2936,9 +3097,21 @@ impl DrmScheme for NvidiaGpu {
                         r.pa_a,
                         r.pa_b
                     );
-                    let _ = writeln!(block, "[gpustep10] CeUtils channel:   {}", phase(r.ce_utils_status));
-                    let _ = writeln!(block, "[gpustep10] alloc A:           {}", phase(r.alloc_a_status));
-                    let _ = writeln!(block, "[gpustep10] alloc B:           {}", phase(r.alloc_b_status));
+                    let _ = writeln!(
+                        block,
+                        "[gpustep10] CeUtils channel:   {}",
+                        phase(r.ce_utils_status)
+                    );
+                    let _ = writeln!(
+                        block,
+                        "[gpustep10] alloc A:           {}",
+                        phase(r.alloc_a_status)
+                    );
+                    let _ = writeln!(
+                        block,
+                        "[gpustep10] alloc B:           {}",
+                        phase(r.alloc_b_status)
+                    );
                     // CE memset writes only the pattern's LOW BYTE replicated
                     // (SET_REMAP_COMPONENTS _COMPONENT_SIZE_ONE,
                     // channel_utils.c) -- spot checks in C already account
@@ -2969,8 +3142,7 @@ impl DrmScheme for NvidiaGpu {
                     );
                     if r.mismatch_count > 0 {
                         // Expected value mirrors the C's ECLIPSE_FILL(i).
-                        let expected =
-                            r.pattern ^ r.first_mismatch_idx.wrapping_mul(0x0100_0193);
+                        let expected = r.pattern ^ r.first_mismatch_idx.wrapping_mul(0x0100_0193);
                         let _ = writeln!(
                             block,
                             "[gpustep10] first mismatch: dword {} = {:#010x} (expected {:#010x})",
@@ -3401,19 +3573,32 @@ impl DrmScheme for NvidiaGpu {
         };
         match result {
             Ok(gr) => {
-                let _ = writeln!(s, "[gpustep15] --- GR (graphics/compute) engine config from live GSP-RM ---");
+                let _ = writeln!(
+                    s,
+                    "[gpustep15] --- GR (graphics/compute) engine config from live GSP-RM ---"
+                );
                 let _ = writeln!(
                     s,
                     "[gpustep15] GR_GET_GPC_MASK: {} mask={:#010x} ({} GPCs)",
-                    phase(gr.gpc_mask_status), gr.gpc_mask, gr.num_gpc
+                    phase(gr.gpc_mask_status),
+                    gr.gpc_mask,
+                    gr.num_gpc
                 );
                 if gr.gpc_mask_status == 0 {
                     for gpc in 0..8usize {
                         if (gr.gpc_mask >> gpc) & 1 == 1 {
-                            let _ = writeln!(s, "[gpustep15]   GPC{}: {} TPCs", gpc, gr.per_gpc_tpc[gpc]);
+                            let _ = writeln!(
+                                s,
+                                "[gpustep15]   GPC{}: {} TPCs",
+                                gpc, gr.per_gpc_tpc[gpc]
+                            );
                         }
                     }
-                    let _ = writeln!(s, "[gpustep15] GR_GET_TPC_MASK: {}", phase(gr.tpc_mask_status));
+                    let _ = writeln!(
+                        s,
+                        "[gpustep15] GR_GET_TPC_MASK: {}",
+                        phase(gr.tpc_mask_status)
+                    );
                     // Turing packs TWO SMs per TPC (Volta+; the 1-SM/TPC layout
                     // was consumer Pascal). RTX 2060 Super: 17 TPCs => 34 SMs.
                     let _ = writeln!(
@@ -3566,13 +3751,46 @@ impl DrmScheme for NvidiaGpu {
         };
         match result {
             Ok(g) => {
-                let _ = writeln!(s, "[gpustep16] --- GR allocation ladder (resource server on live GSP) ---");
-                let _ = writeln!(s, "[gpustep16] NV01_ROOT client:        {} (hClient={:#010x})", phase(g.client_status), g.h_client);
-                let _ = writeln!(s, "[gpustep16] NV01_DEVICE_0:           {} (hDevice={:#010x})", phase(g.device_status), g.h_device);
-                let _ = writeln!(s, "[gpustep16] NV20_SUBDEVICE_0:        {} (hSubdevice={:#010x})", phase(g.subdev_status), g.h_subdevice);
-                let _ = writeln!(s, "[gpustep16] FERMI_VASPACE_A:         {} (hVas={:#010x})", phase(g.vas_status), g.h_vas);
-                let _ = writeln!(s, "[gpustep16] KEPLER_CHANNEL_GROUP_A:  {} (hTsg={:#010x}, engineType=GRAPHICS)", phase(g.tsg_status), g.h_tsg);
-                let _ = writeln!(s, "[gpustep16] FERMI_CONTEXT_SHARE_A:   {} (hCtxShare={:#010x})", phase(g.ctxshare_status), g.h_ctxshare);
+                let _ = writeln!(
+                    s,
+                    "[gpustep16] --- GR allocation ladder (resource server on live GSP) ---"
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep16] NV01_ROOT client:        {} (hClient={:#010x})",
+                    phase(g.client_status),
+                    g.h_client
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep16] NV01_DEVICE_0:           {} (hDevice={:#010x})",
+                    phase(g.device_status),
+                    g.h_device
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep16] NV20_SUBDEVICE_0:        {} (hSubdevice={:#010x})",
+                    phase(g.subdev_status),
+                    g.h_subdevice
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep16] FERMI_VASPACE_A:         {} (hVas={:#010x})",
+                    phase(g.vas_status),
+                    g.h_vas
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep16] KEPLER_CHANNEL_GROUP_A:  {} (hTsg={:#010x}, engineType=GRAPHICS)",
+                    phase(g.tsg_status),
+                    g.h_tsg
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep16] FERMI_CONTEXT_SHARE_A:   {} (hCtxShare={:#010x})",
+                    phase(g.ctxshare_status),
+                    g.h_ctxshare
+                );
                 if g.ctxshare_status == 0 {
                     let _ = writeln!(s, "[gpustep16] --- GR ALLOCATION LADDER COMPLETE: TSG on the GRAPHICS runlist with a live subcontext; step17 = GPFIFO channel + TURING_COMPUTE_A (golden context) ---");
                 }
@@ -3600,9 +3818,7 @@ impl DrmScheme for NvidiaGpu {
         let mut s = String::new();
         let device_instance = *self.rm_device_instance.lock();
         let Some(device_instance) = device_instance else {
-            return String::from(
-                "[gpustep17] skipped (bring the GPU up first, then gpustep16)\n",
-            );
+            return String::from("[gpustep17] skipped (bring the GPU up first, then gpustep16)\n");
         };
         nvidia_rm_sys::os_interface::capture_begin();
         let result = nvidia_rm_sys::rm_init::step17(device_instance);
@@ -3621,15 +3837,59 @@ impl DrmScheme for NvidiaGpu {
         };
         match result {
             Ok(c) => {
-                let _ = writeln!(s, "[gpustep17] --- compute channel on the step-16 ladder ---");
-                let _ = writeln!(s, "[gpustep17] USERD (vidmem, {} B):     {} (hUserd={:#010x})", c.userd_size, phase(c.userd_status), c.h_userd);
-                let _ = writeln!(s, "[gpustep17] sysmem buf 64K:           {} (hPhysBuf={:#010x})", phase(c.buf_status), c.h_phys_buf);
-                let _ = writeln!(s, "[gpustep17] virtual in hVas:          {} (hVirtBuf={:#010x})", phase(c.virt_status), c.h_virt_buf);
-                let _ = writeln!(s, "[gpustep17] Map -> GPU VA:            {} (VA={:#x})", phase(c.map_status), c.buf_gpu_va);
-                let _ = writeln!(s, "[gpustep17] error notifier 4K:        {} (hNotifier={:#010x})", phase(c.notif_status), c.h_notifier);
-                let _ = writeln!(s, "[gpustep17] GPFIFO channel (class {:#06x}): {} (hChannel={:#010x})", c.channel_class, phase(c.chan_status), c.h_channel);
-                let _ = writeln!(s, "[gpustep17] TURING_COMPUTE_A:         {} (hCompute={:#010x})", phase(c.compute_status), c.h_compute);
-                let _ = writeln!(s, "[gpustep17] GPFIFO_SCHEDULE:          {}", phase(c.sched_status));
+                let _ = writeln!(
+                    s,
+                    "[gpustep17] --- compute channel on the step-16 ladder ---"
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep17] USERD (vidmem, {} B):     {} (hUserd={:#010x})",
+                    c.userd_size,
+                    phase(c.userd_status),
+                    c.h_userd
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep17] sysmem buf 64K:           {} (hPhysBuf={:#010x})",
+                    phase(c.buf_status),
+                    c.h_phys_buf
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep17] virtual in hVas:          {} (hVirtBuf={:#010x})",
+                    phase(c.virt_status),
+                    c.h_virt_buf
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep17] Map -> GPU VA:            {} (VA={:#x})",
+                    phase(c.map_status),
+                    c.buf_gpu_va
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep17] error notifier 4K:        {} (hNotifier={:#010x})",
+                    phase(c.notif_status),
+                    c.h_notifier
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep17] GPFIFO channel (class {:#06x}): {} (hChannel={:#010x})",
+                    c.channel_class,
+                    phase(c.chan_status),
+                    c.h_channel
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep17] TURING_COMPUTE_A:         {} (hCompute={:#010x})",
+                    phase(c.compute_status),
+                    c.h_compute
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep17] GPFIFO_SCHEDULE:          {}",
+                    phase(c.sched_status)
+                );
                 if c.sched_status == 0 {
                     let _ = writeln!(s, "[gpustep17] --- COMPUTE CHANNEL LIVE ON THE GRAPHICS RUNLIST: step18 = QMD + SASS kernel + doorbell (first Eclipse compute launch) ---");
                 }
@@ -3651,9 +3911,16 @@ impl DrmScheme for NvidiaGpu {
         let mut s = String::new();
         let device_instance = *self.rm_device_instance.lock();
         let Some(device_instance) = device_instance else {
-            return alloc::format!("[gpuedid] === {} === skipped (run /proc/gpuinit first)\n", self.name);
+            return alloc::format!(
+                "[gpuedid] === {} === skipped (run /proc/gpuinit first)\n",
+                self.name
+            );
         };
-        let _ = writeln!(s, "[gpuedid] === {} (rm instance {}) ===", self.name, device_instance);
+        let _ = writeln!(
+            s,
+            "[gpuedid] === {} (rm instance {}) ===",
+            self.name, device_instance
+        );
         nvidia_rm_sys::os_interface::capture_begin();
         let result = nvidia_rm_sys::rm_init::edid(device_instance);
         let captured = nvidia_rm_sys::os_interface::capture_take();
@@ -3671,20 +3938,49 @@ impl DrmScheme for NvidiaGpu {
         };
         match result {
             Ok(c) => {
-                let _ = writeln!(s, "[gpuedid] --- real display query (RM internal NV04_DISPLAY_COMMON) ---");
+                let _ = writeln!(
+                    s,
+                    "[gpuedid] --- real display query (RM internal NV04_DISPLAY_COMMON) ---"
+                );
                 // 0x56 NV_ERR_NOT_SUPPORTED here is the intentional "no
                 // display engine on this GPU" early-out, not a failure.
                 if c.alloc_status == 0x56 {
                     let _ = writeln!(s, "[gpuedid] DispCommon handle:         none -- no display engine (headless GPU)");
                 } else {
-                    let _ = writeln!(s, "[gpuedid] DispCommon handle:         {}", phase(c.alloc_status));
+                    let _ = writeln!(
+                        s,
+                        "[gpuedid] DispCommon handle:         {}",
+                        phase(c.alloc_status)
+                    );
                 }
-                let _ = writeln!(s, "[gpuedid] GET_SUPPORTED:            {} (outputs={:#x}, DDC-capable={:#x})", phase(c.supported_status), c.display_mask, c.display_mask_ddc);
-                let _ = writeln!(s, "[gpuedid] GET_CONNECT_STATE:        {} (connected={:#x})", phase(c.connect_status), c.connected_mask);
+                let _ = writeln!(
+                    s,
+                    "[gpuedid] GET_SUPPORTED:            {} (outputs={:#x}, DDC-capable={:#x})",
+                    phase(c.supported_status),
+                    c.display_mask,
+                    c.display_mask_ddc
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpuedid] GET_CONNECT_STATE:        {} (connected={:#x})",
+                    phase(c.connect_status),
+                    c.connected_mask
+                );
                 if c.connected_mask == 0 && c.connect_status == 0 {
                     let _ = writeln!(s, "[gpuedid] no monitor connected to this GPU's outputs (expected on the headless compute GPU)");
                 } else if c.edid_status != 0xFFFF_FFFF {
-                    let _ = writeln!(s, "[gpuedid] GET_EDID (id={:#x}):         {} ({} bytes, header {})", c.edid_display_id, phase(c.edid_status), c.edid_size, if c.edid_valid == 1 { "VALID" } else { "invalid" });
+                    let _ = writeln!(
+                        s,
+                        "[gpuedid] GET_EDID (id={:#x}):         {} ({} bytes, header {})",
+                        c.edid_display_id,
+                        phase(c.edid_status),
+                        c.edid_size,
+                        if c.edid_valid == 1 {
+                            "VALID"
+                        } else {
+                            "invalid"
+                        }
+                    );
                     if c.edid_valid == 1 {
                         // EDID bytes 8-9 = PNP manufacturer id (5-bit packed letters); 10-11 = product code.
                         let m = ((c.edid_head[8] as u16) << 8) | c.edid_head[9] as u16;
@@ -3693,15 +3989,25 @@ impl DrmScheme for NvidiaGpu {
                         let l3 = (b'A' - 1 + (m & 0x1f) as u8) as char;
                         let prod = ((c.edid_head[11] as u16) << 8) | c.edid_head[10] as u16;
                         let year = 1990u32 + c.edid_head[17] as u32;
-                        let _ = writeln!(s, "[gpuedid] MONITOR: {}{}{} product={:#06x} year={} (EDID v{}.{})", l1, l2, l3, prod, year, c.edid_head[18], c.edid_head[19]);
+                        let _ = writeln!(
+                            s,
+                            "[gpuedid] MONITOR: {}{}{} product={:#06x} year={} (EDID v{}.{})",
+                            l1, l2, l3, prod, year, c.edid_head[18], c.edid_head[19]
+                        );
                         let _ = write!(s, "[gpuedid] EDID head:");
-                        for b in c.edid_head.iter() { let _ = write!(s, " {:02x}", b); }
+                        for b in c.edid_head.iter() {
+                            let _ = write!(s, " {:02x}", b);
+                        }
                         let _ = writeln!(s);
                     }
                 }
             }
             Err(status) => {
-                let _ = writeln!(s, "[gpuedid] eclipse_rm_edid FAILED, NV_STATUS={:#x} (run /proc/gpuinit first)", status);
+                let _ = writeln!(
+                    s,
+                    "[gpuedid] eclipse_rm_edid FAILED, NV_STATUS={:#x} (run /proc/gpuinit first)",
+                    status
+                );
             }
         }
         s
@@ -3742,13 +4048,47 @@ impl DrmScheme for NvidiaGpu {
         };
         match result {
             Ok(l) => {
-                let _ = writeln!(s, "[gpustep18] --- first Eclipse-authored submission on the live channel ---");
-                let _ = writeln!(s, "[gpustep18] lookup (chan/buf/USERD):  {}", phase(l.lookup_status));
-                let _ = writeln!(s, "[gpustep18] CPU map (buf + USERD):    {}", phase(l.map_status));
-                let _ = writeln!(s, "[gpustep18] work-submit token:        {} (token={:#010x}, runlist={})", phase(l.token_status), l.work_token, l.runlist_id);
-                let _ = writeln!(s, "[gpustep18] submit ({} dw + doorbell): {}", l.push_dwords, phase(l.submit_status));
-                let _ = writeln!(s, "[gpustep18] HOST semaphore (PBDMA):   {} (value={:#010x}, {} ms)", phase(l.host_sem_status), l.host_sem_value, l.host_poll_iters);
-                let _ = writeln!(s, "[gpustep18] ENGINE semaphore (compute FE): {} (value={:#010x}, {} ms)", phase(l.eng_sem_status), l.eng_sem_value, l.eng_poll_iters);
+                let _ = writeln!(
+                    s,
+                    "[gpustep18] --- first Eclipse-authored submission on the live channel ---"
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep18] lookup (chan/buf/USERD):  {}",
+                    phase(l.lookup_status)
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep18] CPU map (buf + USERD):    {}",
+                    phase(l.map_status)
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep18] work-submit token:        {} (token={:#010x}, runlist={})",
+                    phase(l.token_status),
+                    l.work_token,
+                    l.runlist_id
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep18] submit ({} dw + doorbell): {}",
+                    l.push_dwords,
+                    phase(l.submit_status)
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep18] HOST semaphore (PBDMA):   {} (value={:#010x}, {} ms)",
+                    phase(l.host_sem_status),
+                    l.host_sem_value,
+                    l.host_poll_iters
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep18] ENGINE semaphore (compute FE): {} (value={:#010x}, {} ms)",
+                    phase(l.eng_sem_status),
+                    l.eng_sem_value,
+                    l.eng_poll_iters
+                );
                 if l.host_sem_status == 0 && l.eng_sem_status == 0 {
                     let _ = writeln!(s, "[gpustep18] --- THE GPU RAN OUR PUSHBUFFER: PBDMA fetch + compute-engine context switch both proven; step19 = QMD + SASS kernel (real compute launch) ---");
                 } else if l.host_sem_status == 0 {
@@ -3798,20 +4138,73 @@ impl DrmScheme for NvidiaGpu {
         };
         match result {
             Ok(c) => {
-                let _ = writeln!(s, "[gpustep19] --- first Eclipse-authored COMPUTE LAUNCH (QMD + SM75 kernel) ---");
-                let _ = writeln!(s, "[gpustep19] lookup (chan/buf/USERD):  {}", phase(c.lookup_status));
-                let _ = writeln!(s, "[gpustep19] CPU map (buf + USERD):    {}", phase(c.map_status));
-                let _ = writeln!(s, "[gpustep19] work-submit token:        {} (token={:#010x}, runlist={})", phase(c.token_status), c.work_token, c.runlist_id);
-                let _ = writeln!(s, "[gpustep19] QMD @ {:#x}, kernel @ {:#x}", c.qmd_va, c.kernel_va);
-                let _ = writeln!(s, "[gpustep19] launch ({} dw + SEND_PCAS + doorbell): {}", c.push_dwords, phase(c.submit_status));
-                let _ = writeln!(s, "[gpustep19] post-PCAS host fence:     {} (value={:#010x}, {} ms)", phase(c.fence_status), c.fence_value, c.fence_iters);
-                let _ = writeln!(s, "[gpustep19] QMD RELEASE0 semaphore:   {} (value={:#010x}, {} ms)", phase(c.sem_status), c.sem_value, c.poll_iters);
+                let _ = writeln!(
+                    s,
+                    "[gpustep19] --- first Eclipse-authored COMPUTE LAUNCH (QMD + SM75 kernel) ---"
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep19] lookup (chan/buf/USERD):  {}",
+                    phase(c.lookup_status)
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep19] CPU map (buf + USERD):    {}",
+                    phase(c.map_status)
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep19] work-submit token:        {} (token={:#010x}, runlist={})",
+                    phase(c.token_status),
+                    c.work_token,
+                    c.runlist_id
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep19] QMD @ {:#x}, kernel @ {:#x}",
+                    c.qmd_va, c.kernel_va
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep19] launch ({} dw + SEND_PCAS + doorbell): {}",
+                    c.push_dwords,
+                    phase(c.submit_status)
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep19] post-PCAS host fence:     {} (value={:#010x}, {} ms)",
+                    phase(c.fence_status),
+                    c.fence_value,
+                    c.fence_iters
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep19] QMD RELEASE0 semaphore:   {} (value={:#010x}, {} ms)",
+                    phase(c.sem_status),
+                    c.sem_value,
+                    c.poll_iters
+                );
                 if c.sem_status == 0 {
-                    let _ = writeln!(s, "[gpustep19] ============================================================");
-                    let _ = writeln!(s, "[gpustep19]  THE 34 SMs RAN OUR SASS KERNEL. Eclipse launched compute");
-                    let _ = writeln!(s, "[gpustep19]  on the TU106 and the grid completed. step20 = kernel that");
-                    let _ = writeln!(s, "[gpustep19]  stores a computed result to memory (params + STG).");
-                    let _ = writeln!(s, "[gpustep19] ============================================================");
+                    let _ = writeln!(
+                        s,
+                        "[gpustep19] ============================================================"
+                    );
+                    let _ = writeln!(
+                        s,
+                        "[gpustep19]  THE 34 SMs RAN OUR SASS KERNEL. Eclipse launched compute"
+                    );
+                    let _ = writeln!(
+                        s,
+                        "[gpustep19]  on the TU106 and the grid completed. step20 = kernel that"
+                    );
+                    let _ = writeln!(
+                        s,
+                        "[gpustep19]  stores a computed result to memory (params + STG)."
+                    );
+                    let _ = writeln!(
+                        s,
+                        "[gpustep19] ============================================================"
+                    );
                 } else if c.fence_status == 0 {
                     let _ = writeln!(s, "[gpustep19] --- PBDMA consumed the whole compute stream (fence landed) but the grid never released: QMD scheduling or SM execution is stuck. The RM/GSP capture above should carry any SM exception. ---");
                 } else if c.submit_status == 0 {
@@ -3862,19 +4255,68 @@ impl DrmScheme for NvidiaGpu {
         match result {
             Ok(c) => {
                 let _ = writeln!(s, "[gpustep20] --- kernel STORE: GPU writes a value we chose to memory we chose ---");
-                let _ = writeln!(s, "[gpustep20] lookup / CPU map:         {} / {}", phase(c.lookup_status), phase(c.map_status));
-                let _ = writeln!(s, "[gpustep20] token:                    {} (token={:#010x}, runlist={})", phase(c.token_status), c.work_token, c.runlist_id);
-                let _ = writeln!(s, "[gpustep20] QMD @ {:#x}, kernel @ {:#x}, dest @ {:#x}", c.qmd_va, c.kernel_va, c.dest_va);
-                let _ = writeln!(s, "[gpustep20] launch ({} dw):            {}", c.push_dwords, phase(c.submit_status));
-                let _ = writeln!(s, "[gpustep20] post-PCAS host fence:     {} (value={:#010x}, {} ms)", phase(c.fence_status), c.fence_value, c.fence_iters);
-                let _ = writeln!(s, "[gpustep20] QMD RELEASE0 semaphore:   {} (value={:#010x}, {} ms)", phase(c.sem_status), c.sem_value, c.sem_iters);
-                let _ = writeln!(s, "[gpustep20] stored dword @ dest:      {} (value={:#010x}, expect 0xec0de520)", phase(c.store_status), c.store_value);
+                let _ = writeln!(
+                    s,
+                    "[gpustep20] lookup / CPU map:         {} / {}",
+                    phase(c.lookup_status),
+                    phase(c.map_status)
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep20] token:                    {} (token={:#010x}, runlist={})",
+                    phase(c.token_status),
+                    c.work_token,
+                    c.runlist_id
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep20] QMD @ {:#x}, kernel @ {:#x}, dest @ {:#x}",
+                    c.qmd_va, c.kernel_va, c.dest_va
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep20] launch ({} dw):            {}",
+                    c.push_dwords,
+                    phase(c.submit_status)
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep20] post-PCAS host fence:     {} (value={:#010x}, {} ms)",
+                    phase(c.fence_status),
+                    c.fence_value,
+                    c.fence_iters
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep20] QMD RELEASE0 semaphore:   {} (value={:#010x}, {} ms)",
+                    phase(c.sem_status),
+                    c.sem_value,
+                    c.sem_iters
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep20] stored dword @ dest:      {} (value={:#010x}, expect 0xec0de520)",
+                    phase(c.store_status),
+                    c.store_value
+                );
                 if c.sem_status == 0 && c.store_status == 0 {
-                    let _ = writeln!(s, "[gpustep20] ============================================================");
-                    let _ = writeln!(s, "[gpustep20]  THE GPU COMPUTED FOR ECLIPSE: our SASS ran on an SM and");
-                    let _ = writeln!(s, "[gpustep20]  stored our value at our address. MOV+STG+EXIT verified.");
+                    let _ = writeln!(
+                        s,
+                        "[gpustep20] ============================================================"
+                    );
+                    let _ = writeln!(
+                        s,
+                        "[gpustep20]  THE GPU COMPUTED FOR ECLIPSE: our SASS ran on an SM and"
+                    );
+                    let _ = writeln!(
+                        s,
+                        "[gpustep20]  stored our value at our address. MOV+STG+EXIT verified."
+                    );
                     let _ = writeln!(s, "[gpustep20]  The compute bring-up ladder is COMPLETE.");
-                    let _ = writeln!(s, "[gpustep20] ============================================================");
+                    let _ = writeln!(
+                        s,
+                        "[gpustep20] ============================================================"
+                    );
                 } else if c.sem_status == 0 {
                     let _ = writeln!(s, "[gpustep20] --- grid completed but the store is missing/wrong: STG encoding or GMMU write path suspect ---");
                 } else if c.fence_status == 0 {
@@ -3923,24 +4365,83 @@ impl DrmScheme for NvidiaGpu {
         };
         match result {
             Ok(c) => {
-                let _ = writeln!(s, "[gpustep21] --- 32-THREAD kernel: out[tid] = tid*3 + 7 ---");
-                let _ = writeln!(s, "[gpustep21] lookup / CPU map:         {} / {}", phase(c.lookup_status), phase(c.map_status));
-                let _ = writeln!(s, "[gpustep21] token:                    {} (token={:#010x}, runlist={})", phase(c.token_status), c.work_token, c.runlist_id);
-                let _ = writeln!(s, "[gpustep21] QMD @ {:#x}, kernel @ {:#x}, out[] @ {:#x}", c.qmd_va, c.kernel_va, c.out_va);
-                let _ = writeln!(s, "[gpustep21] launch ({} dw):            {}", c.push_dwords, phase(c.submit_status));
-                let _ = writeln!(s, "[gpustep21] post-PCAS host fence:     {} ({} ms)", phase(c.fence_status), c.fence_iters);
-                let _ = writeln!(s, "[gpustep21] QMD RELEASE0 semaphore:   {} ({} ms)", phase(c.sem_status), c.sem_iters);
-                let _ = writeln!(s, "[gpustep21] per-thread verification:  {} ({}/32 slots correct)", phase(c.verify_status), c.match_count);
+                let _ = writeln!(
+                    s,
+                    "[gpustep21] --- 32-THREAD kernel: out[tid] = tid*3 + 7 ---"
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep21] lookup / CPU map:         {} / {}",
+                    phase(c.lookup_status),
+                    phase(c.map_status)
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep21] token:                    {} (token={:#010x}, runlist={})",
+                    phase(c.token_status),
+                    c.work_token,
+                    c.runlist_id
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep21] QMD @ {:#x}, kernel @ {:#x}, out[] @ {:#x}",
+                    c.qmd_va, c.kernel_va, c.out_va
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep21] launch ({} dw):            {}",
+                    c.push_dwords,
+                    phase(c.submit_status)
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep21] post-PCAS host fence:     {} ({} ms)",
+                    phase(c.fence_status),
+                    c.fence_iters
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep21] QMD RELEASE0 semaphore:   {} ({} ms)",
+                    phase(c.sem_status),
+                    c.sem_iters
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep21] per-thread verification:  {} ({}/32 slots correct)",
+                    phase(c.verify_status),
+                    c.match_count
+                );
                 if c.first_bad_idx != 0xFFFF_FFFF {
-                    let _ = writeln!(s, "[gpustep21] first mismatch: out[{}]={:#010x} (expected {:#x})", c.first_bad_idx, c.first_bad_val, 3 * c.first_bad_idx + 7);
+                    let _ = writeln!(
+                        s,
+                        "[gpustep21] first mismatch: out[{}]={:#010x} (expected {:#x})",
+                        c.first_bad_idx,
+                        c.first_bad_val,
+                        3 * c.first_bad_idx + 7
+                    );
                 }
                 if c.sem_status == 0 && c.verify_status == 0 {
-                    let _ = writeln!(s, "[gpustep21] ============================================================");
-                    let _ = writeln!(s, "[gpustep21]  32 THREADS, 32 CORRECT RESULTS: per-thread IDs, integer");
-                    let _ = writeln!(s, "[gpustep21]  math, per-thread addressing and stores, and real Volta");
-                    let _ = writeln!(s, "[gpustep21]  scoreboarding all verified. Eclipse now runs real");
+                    let _ = writeln!(
+                        s,
+                        "[gpustep21] ============================================================"
+                    );
+                    let _ = writeln!(
+                        s,
+                        "[gpustep21]  32 THREADS, 32 CORRECT RESULTS: per-thread IDs, integer"
+                    );
+                    let _ = writeln!(
+                        s,
+                        "[gpustep21]  math, per-thread addressing and stores, and real Volta"
+                    );
+                    let _ = writeln!(
+                        s,
+                        "[gpustep21]  scoreboarding all verified. Eclipse now runs real"
+                    );
                     let _ = writeln!(s, "[gpustep21]  parallel compute on the TU106.");
-                    let _ = writeln!(s, "[gpustep21] ============================================================");
+                    let _ = writeln!(
+                        s,
+                        "[gpustep21] ============================================================"
+                    );
                 } else if c.sem_status == 0 {
                     let _ = writeln!(s, "[gpustep21] --- grid completed but results are wrong: math/addressing path suspect (check first mismatch above) ---");
                 } else if c.fence_status == 0 {
@@ -3988,23 +4489,82 @@ impl DrmScheme for NvidiaGpu {
         };
         match result {
             Ok(c) => {
-                let _ = writeln!(s, "[gpustep22] --- CHIP-SCALE grid: 68 CTAs x 32 threads over all 34 SMs ---");
-                let _ = writeln!(s, "[gpustep22] lookup / CPU map:         {} / {}", phase(c.lookup_status), phase(c.map_status));
-                let _ = writeln!(s, "[gpustep22] token:                    {} (token={:#010x}, runlist={})", phase(c.token_status), c.work_token, c.runlist_id);
-                let _ = writeln!(s, "[gpustep22] QMD @ {:#x}, kernel @ {:#x}, out[] @ {:#x}", c.qmd_va, c.kernel_va, c.out_va);
-                let _ = writeln!(s, "[gpustep22] launch ({} dw):            {}", c.push_dwords, phase(c.submit_status));
-                let _ = writeln!(s, "[gpustep22] post-PCAS host fence:     {} ({} ms)", phase(c.fence_status), c.fence_iters);
-                let _ = writeln!(s, "[gpustep22] QMD RELEASE0 semaphore:   {} ({} ms)", phase(c.sem_status), c.sem_iters);
-                let _ = writeln!(s, "[gpustep22] per-thread verification:  {} ({}/2176 slots correct)", phase(c.verify_status), c.match_count);
+                let _ = writeln!(
+                    s,
+                    "[gpustep22] --- CHIP-SCALE grid: 68 CTAs x 32 threads over all 34 SMs ---"
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep22] lookup / CPU map:         {} / {}",
+                    phase(c.lookup_status),
+                    phase(c.map_status)
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep22] token:                    {} (token={:#010x}, runlist={})",
+                    phase(c.token_status),
+                    c.work_token,
+                    c.runlist_id
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep22] QMD @ {:#x}, kernel @ {:#x}, out[] @ {:#x}",
+                    c.qmd_va, c.kernel_va, c.out_va
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep22] launch ({} dw):            {}",
+                    c.push_dwords,
+                    phase(c.submit_status)
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep22] post-PCAS host fence:     {} ({} ms)",
+                    phase(c.fence_status),
+                    c.fence_iters
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep22] QMD RELEASE0 semaphore:   {} ({} ms)",
+                    phase(c.sem_status),
+                    c.sem_iters
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep22] per-thread verification:  {} ({}/2176 slots correct)",
+                    phase(c.verify_status),
+                    c.match_count
+                );
                 if c.first_bad_idx != 0xFFFF_FFFF {
-                    let _ = writeln!(s, "[gpustep22] first mismatch: out[{}]={:#010x} (expected {:#x})", c.first_bad_idx, c.first_bad_val, 3 * c.first_bad_idx + 7);
+                    let _ = writeln!(
+                        s,
+                        "[gpustep22] first mismatch: out[{}]={:#010x} (expected {:#x})",
+                        c.first_bad_idx,
+                        c.first_bad_val,
+                        3 * c.first_bad_idx + 7
+                    );
                 }
                 if c.sem_status == 0 && c.verify_status == 0 {
-                    let _ = writeln!(s, "[gpustep22] ============================================================");
-                    let _ = writeln!(s, "[gpustep22]  2176 THREADS, 68 CTAs, ALL 34 SMs: the whole TU106 chip");
-                    let _ = writeln!(s, "[gpustep22]  computed for Eclipse in one dispatch and every result");
-                    let _ = writeln!(s, "[gpustep22]  verified. Chip-scale parallel compute is proven.");
-                    let _ = writeln!(s, "[gpustep22] ============================================================");
+                    let _ = writeln!(
+                        s,
+                        "[gpustep22] ============================================================"
+                    );
+                    let _ = writeln!(
+                        s,
+                        "[gpustep22]  2176 THREADS, 68 CTAs, ALL 34 SMs: the whole TU106 chip"
+                    );
+                    let _ = writeln!(
+                        s,
+                        "[gpustep22]  computed for Eclipse in one dispatch and every result"
+                    );
+                    let _ = writeln!(
+                        s,
+                        "[gpustep22]  verified. Chip-scale parallel compute is proven."
+                    );
+                    let _ = writeln!(
+                        s,
+                        "[gpustep22] ============================================================"
+                    );
                 } else if c.sem_status == 0 {
                     let _ = writeln!(s, "[gpustep22] --- grid completed but results wrong (check first mismatch: CTA scheduling/addressing suspect) ---");
                 } else if c.fence_status == 0 {
@@ -4054,13 +4614,48 @@ impl DrmScheme for NvidiaGpu {
         match result {
             Ok(c) => {
                 let _ = writeln!(s, "[gpustep23] --- integer SAXPY: y[i] = 3*x[i] + y[i], x[i]=0x1000+i, y[i]=100+i ---");
-                let _ = writeln!(s, "[gpustep23] lookup / CPU map:         {} / {}", phase(c.lookup_status), phase(c.map_status));
-                let _ = writeln!(s, "[gpustep23] token:                    {} (token={:#010x}, runlist={})", phase(c.token_status), c.work_token, c.runlist_id);
-                let _ = writeln!(s, "[gpustep23] QMD @ {:#x}, kernel @ {:#x}, y[] @ {:#x}", c.qmd_va, c.kernel_va, c.out_va);
-                let _ = writeln!(s, "[gpustep23] launch ({} dw):            {}", c.push_dwords, phase(c.submit_status));
-                let _ = writeln!(s, "[gpustep23] post-PCAS host fence:     {} ({} ms)", phase(c.fence_status), c.fence_iters);
-                let _ = writeln!(s, "[gpustep23] QMD RELEASE0 semaphore:   {} ({} ms)", phase(c.sem_status), c.sem_iters);
-                let _ = writeln!(s, "[gpustep23] SAXPY verification:       {} ({}/32 elements = 0x3064+4i)", phase(c.verify_status), c.match_count);
+                let _ = writeln!(
+                    s,
+                    "[gpustep23] lookup / CPU map:         {} / {}",
+                    phase(c.lookup_status),
+                    phase(c.map_status)
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep23] token:                    {} (token={:#010x}, runlist={})",
+                    phase(c.token_status),
+                    c.work_token,
+                    c.runlist_id
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep23] QMD @ {:#x}, kernel @ {:#x}, y[] @ {:#x}",
+                    c.qmd_va, c.kernel_va, c.out_va
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep23] launch ({} dw):            {}",
+                    c.push_dwords,
+                    phase(c.submit_status)
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep23] post-PCAS host fence:     {} ({} ms)",
+                    phase(c.fence_status),
+                    c.fence_iters
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep23] QMD RELEASE0 semaphore:   {} ({} ms)",
+                    phase(c.sem_status),
+                    c.sem_iters
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpustep23] SAXPY verification:       {} ({}/32 elements = 0x3064+4i)",
+                    phase(c.verify_status),
+                    c.match_count
+                );
                 if c.fault_ctrl_status != 0xFFFF_FFFF {
                     let _ = writeln!(
                         s,
@@ -4069,14 +4664,36 @@ impl DrmScheme for NvidiaGpu {
                     );
                 }
                 if c.first_bad_idx != 0xFFFF_FFFF {
-                    let _ = writeln!(s, "[gpustep23] first mismatch: y[{}]={:#x} ({}) expected {:#x}", c.first_bad_idx, c.first_bad_val, c.first_bad_val, 0x3064 + 4 * c.first_bad_idx);
+                    let _ = writeln!(
+                        s,
+                        "[gpustep23] first mismatch: y[{}]={:#x} ({}) expected {:#x}",
+                        c.first_bad_idx,
+                        c.first_bad_val,
+                        c.first_bad_val,
+                        0x3064 + 4 * c.first_bad_idx
+                    );
                 }
                 if c.sem_status == 0 && c.verify_status == 0 {
-                    let _ = writeln!(s, "[gpustep23] ============================================================");
-                    let _ = writeln!(s, "[gpustep23]  LOAD-COMPUTE-STORE PROVEN: the GPU read two arrays from");
-                    let _ = writeln!(s, "[gpustep23]  memory, did a*x+y per element, and wrote the results back.");
-                    let _ = writeln!(s, "[gpustep23]  Eclipse has the full GPU compute primitive.");
-                    let _ = writeln!(s, "[gpustep23] ============================================================");
+                    let _ = writeln!(
+                        s,
+                        "[gpustep23] ============================================================"
+                    );
+                    let _ = writeln!(
+                        s,
+                        "[gpustep23]  LOAD-COMPUTE-STORE PROVEN: the GPU read two arrays from"
+                    );
+                    let _ = writeln!(
+                        s,
+                        "[gpustep23]  memory, did a*x+y per element, and wrote the results back."
+                    );
+                    let _ = writeln!(
+                        s,
+                        "[gpustep23]  Eclipse has the full GPU compute primitive."
+                    );
+                    let _ = writeln!(
+                        s,
+                        "[gpustep23] ============================================================"
+                    );
                 } else if c.sem_status == 0 {
                     let _ = writeln!(s, "[gpustep23] --- grid completed but results wrong: LDG address/data path suspect (check first mismatch) ---");
                 } else if c.fence_status == 0 {
@@ -4121,31 +4738,77 @@ impl DrmScheme for NvidiaGpu {
         };
         match result {
             Ok(c) => {
-                let _ = writeln!(s, "[gpubench] --- integer-ALU throughput (IMAD.U32 dependent chain) ---");
-                let _ = writeln!(s, "[gpubench] lookup/map:   {} / {}", phase(c.lookup_status), phase(c.map_status));
-                let _ = writeln!(s, "[gpubench] launch ({} dw): {}", c.push_dwords, phase(c.submit_status));
-                let _ = writeln!(s, "[gpubench] grid:         {} threads x {} IMAD = {} ops",
-                    c.num_threads, c.imads_per_thread, c.total_ops);
-                let _ = writeln!(s, "[gpubench] timestamp sem: {} (@{} ms)", phase(c.sem_status), c.sem_iters);
+                let _ = writeln!(
+                    s,
+                    "[gpubench] --- integer-ALU throughput (IMAD.U32 dependent chain) ---"
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpubench] lookup/map:   {} / {}",
+                    phase(c.lookup_status),
+                    phase(c.map_status)
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpubench] launch ({} dw): {}",
+                    c.push_dwords,
+                    phase(c.submit_status)
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpubench] grid:         {} threads x {} IMAD = {} ops",
+                    c.num_threads, c.imads_per_thread, c.total_ops
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpubench] timestamp sem: {} (@{} ms)",
+                    phase(c.sem_status),
+                    c.sem_iters
+                );
                 if c.sem_status == 0 && c.elapsed_ns > 0 {
                     // GIOPS = total_ops / elapsed_ns (ops/ns == giga-ops/s).
                     // x1000 for three decimals, u128 to avoid overflow.
-                    let giops_milli =
-                        (c.total_ops as u128 * 1000u128) / (c.elapsed_ns as u128);
-                    let _ = writeln!(s, "[gpubench] elapsed:      {} ns ({}.{:03} ms)",
-                        c.elapsed_ns, c.elapsed_ns / 1_000_000, (c.elapsed_ns / 1000) % 1000);
-                    let _ = writeln!(s, "[gpubench] ============================================================");
-                    let _ = writeln!(s, "[gpubench]  {}.{:03} GIOPS (integer multiply-add) on the RTX 2060 Super",
-                        giops_milli / 1000, giops_milli % 1000);
-                    let _ = writeln!(s, "[gpubench] ============================================================");
+                    let giops_milli = (c.total_ops as u128 * 1000u128) / (c.elapsed_ns as u128);
+                    let _ = writeln!(
+                        s,
+                        "[gpubench] elapsed:      {} ns ({}.{:03} ms)",
+                        c.elapsed_ns,
+                        c.elapsed_ns / 1_000_000,
+                        (c.elapsed_ns / 1000) % 1000
+                    );
+                    let _ = writeln!(
+                        s,
+                        "[gpubench] ============================================================"
+                    );
+                    let _ = writeln!(
+                        s,
+                        "[gpubench]  {}.{:03} GIOPS (integer multiply-add) on the RTX 2060 Super",
+                        giops_milli / 1000,
+                        giops_milli % 1000
+                    );
+                    let _ = writeln!(
+                        s,
+                        "[gpubench] ============================================================"
+                    );
                 } else if c.sem_status == 0 {
-                    let _ = writeln!(s, "[gpubench] grid ran but timestamps were zero (t0={:#x} t1={:#x})", c.t0_ns, c.t1_ns);
+                    let _ = writeln!(
+                        s,
+                        "[gpubench] grid ran but timestamps were zero (t0={:#x} t1={:#x})",
+                        c.t0_ns, c.t1_ns
+                    );
                 } else {
-                    let _ = writeln!(s, "[gpubench] --- grid did not signal within poll window ---");
+                    let _ = writeln!(
+                        s,
+                        "[gpubench] --- grid did not signal within poll window ---"
+                    );
                 }
             }
             Err(status) => {
-                let _ = writeln!(s, "[gpubench] eclipse_rm_bench FAILED, NV_STATUS={:#x} (run /proc/gpuinit first)", status);
+                let _ = writeln!(
+                    s,
+                    "[gpubench] eclipse_rm_bench FAILED, NV_STATUS={:#x} (run /proc/gpuinit first)",
+                    status
+                );
             }
         }
         s
@@ -4256,8 +4919,7 @@ impl DrmScheme for NvidiaGpu {
         );
         // Make BAR2 live and report the bind, plus the PCE map (CE buffer size).
         let (b2_before, b2_after, b2_wait) = self.setup_bar2(b);
-        let pce_map =
-            unsafe { core::ptr::read_volatile((self._bar0 + 0x0010_4028) as *const u32) };
+        let pce_map = unsafe { core::ptr::read_volatile((self._bar0 + 0x0010_4028) as *const u32) };
         let _ = writeln!(
             s,
             "[gpustep2]  BAR2(0xb80f48) {:#010x}->{:#010x} wait(0xb80f50)={:#010x} PCE_MAP(0x104028)={:#010x}",
@@ -4339,7 +5001,8 @@ impl DrmScheme for NvidiaGpu {
         let runlist_vram = b.runlist_vram();
 
         let bar0 = self._bar0;
-        let rd = |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
+        let rd =
+            |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
         let wr = |off: u32, v: u32| unsafe {
             core::ptr::write_volatile((bar0 + off as usize) as *mut u32, v)
         };
@@ -4453,7 +5116,8 @@ impl DrmScheme for NvidiaGpu {
         // belong to GR instead of CE); setup_channel now discovers the
         // actual CE runlist id and commits to that.
         let (commit_ok, runl_id) = self.setup_channel(b);
-        let pmc_post = unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_0200) as *const u32) };
+        let pmc_post =
+            unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_0200) as *const u32) };
         let _ = writeln!(
             s,
             "[gpustep4]  PMC_ENABLE(0x200) pre={:#010x} post={:#010x} (FIFO bit 0x100: pre={} post={})",
@@ -4521,7 +5185,8 @@ impl DrmScheme for NvidiaGpu {
         // per-ENGINE (a third id space, distinct from runlist id and PBDMA
         // index) scheduler status — CTX_STATUS, FAULTED, ENGINE busy/idle,
         // currently-loaded ID. Neither had ever been read before.
-        let sched_status = unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_263c) as *const u32) };
+        let sched_status =
+            unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_263c) as *const u32) };
         let _ = writeln!(
             s,
             "[gpustep4]  SCHED_STATUS(0x263c)={:#010x} chsw_in_progress={} runlist_fetch_busy={}",
@@ -4531,10 +5196,12 @@ impl DrmScheme for NvidiaGpu {
         );
         if engine_id != u32::MAX {
             let eoff = engine_id as usize * 8;
-            let eng_status =
-                unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_2640 + eoff) as *const u32) };
-            let eng_debug =
-                unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_2644 + eoff) as *const u32) };
+            let eng_status = unsafe {
+                core::ptr::read_volatile((self._bar0 + 0x0000_2640 + eoff) as *const u32)
+            };
+            let eng_debug = unsafe {
+                core::ptr::read_volatile((self._bar0 + 0x0000_2644 + eoff) as *const u32)
+            };
             let _ = writeln!(
                 s,
                 "[gpustep4]  ENGINE_STATUS(engine{})={:#010x} ctx_status={} id={:#x} id_type={} engine_busy={} faulted={} eng_reload={}  DEBUG={:#010x}",
@@ -4570,7 +5237,8 @@ impl DrmScheme for NvidiaGpu {
         // PFIFO_INTR_0 before the ring — did a prior interrupt condition
         // latch (e.g. a scheduler/runlist-update completion) that we never
         // acked, possibly stalling forward progress.
-        let intr0_pre = unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_2100) as *const u32) };
+        let intr0_pre =
+            unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_2100) as *const u32) };
 
         // Advance GP_PUT (VRAM USERD, via PRAMIN), fence, ring the doorbell.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -4591,7 +5259,8 @@ impl DrmScheme for NvidiaGpu {
             core::hint::spin_loop();
         }
 
-        let intr0_post = unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_2100) as *const u32) };
+        let intr0_post =
+            unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_2100) as *const u32) };
         let _ = writeln!(
             s,
             "[gpustep4]  PFIFO_INTR_0(0x2100) pre={:#010x} post={:#010x} (new bits={:#010x})",
@@ -4660,7 +5329,9 @@ impl DrmScheme for NvidiaGpu {
         );
 
         // Read the MMU fault THIS step generated (cleared just before the ring).
-        let rd = |off: u32| unsafe { core::ptr::read_volatile((self._bar0 + off as usize) as *const u32) };
+        let rd = |off: u32| unsafe {
+            core::ptr::read_volatile((self._bar0 + off as usize) as *const u32)
+        };
         let f_info1 = rd(0x00b8_3090);
         let f_alo = rd(0x00b8_3080);
         let f_ahi = rd(0x00b8_3084);
@@ -4677,7 +5348,8 @@ impl DrmScheme for NvidiaGpu {
             f_info0 & 0xff,
         );
 
-        let chan_cfg = unsafe { core::ptr::read_volatile((self._bar0 + 0x0080_0004) as *const u32) };
+        let chan_cfg =
+            unsafe { core::ptr::read_volatile((self._bar0 + 0x0080_0004) as *const u32) };
         let _ = writeln!(
             s,
             "[gpustep4]  pb_va={:#x} n={} slot={} GP_PUT {}->{} GP_GET {}->{} advanced={} doorbell=0xbb0090 token={:#x}",
@@ -4745,7 +5417,11 @@ impl DrmScheme for NvidiaGpu {
         );
         // Same status register, but for whichever PBDMA index(es) actually
         // serve our runl_id (may not be q0/q1 at all for a non-zero runlist).
-        let _ = write!(s, "[gpustep4]  PFIFO_PBDMA_STATUS(runl{}'s PBDMAs):", runl_id);
+        let _ = write!(
+            s,
+            "[gpustep4]  PFIFO_PBDMA_STATUS(runl{}'s PBDMAs):",
+            runl_id
+        );
         for i in 0..12u32 {
             let m = rd(0x0000_2390 + i * 4) & 0xffff;
             if m & (1 << runl_id) != 0 {
@@ -5077,12 +5753,7 @@ impl PciDriver for NvidiaGpuDriverPci {
         // unexpected, matching the previous behaviour.
         let fb_bar = mem_bars
             .get(1)
-            .map(|&(addr, len)| {
-                (
-                    addr,
-                    if len == 0 { 256 * 1024 * 1024 } else { len },
-                )
-            })
+            .map(|&(addr, len)| (addr, if len == 0 { 256 * 1024 * 1024 } else { len }))
             .filter(|&(_, len)| len >= (16 * 1024 * 1024))
             .or_else(|| {
                 mem_bars.iter().skip(1).find_map(|&(addr, len)| {
@@ -5098,12 +5769,7 @@ impl PciDriver for NvidiaGpuDriverPci {
         // the earlier steps stay intact).
         let (imem_phys, imem_len) = mem_bars
             .get(2)
-            .map(|&(addr, len)| {
-                (
-                    addr,
-                    if len == 0 { 32 * 1024 * 1024 } else { len },
-                )
-            })
+            .map(|&(addr, len)| (addr, if len == 0 { 32 * 1024 * 1024 } else { len }))
             .unwrap_or((0, 0));
 
         if let Some((fb_addr, fb_len)) = fb_bar {

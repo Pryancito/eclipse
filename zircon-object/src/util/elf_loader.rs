@@ -196,7 +196,7 @@ impl ElfExt for ElfFile<'_> {
         // Base-relative relocations (write `B + A`).
         // x86_64
         const REL_RELATIVE: u32 = 8; // R_X86_64_RELATIVE
-        // riscv64
+                                     // riscv64
         const R_RISCV_RELATIVE: u32 = 3;
         // aarch64
         const R_AARCH64_RELATIVE: u32 = 0x403;
@@ -217,14 +217,21 @@ impl ElfExt for ElfFile<'_> {
                 Some(section) => section,
                 None => continue,
             };
-            let entries = match section.get_data(self).map_err(|_| "corrupted relocation section")? {
+            let entries = match section
+                .get_data(self)
+                .map_err(|_| "corrupted relocation section")?
+            {
                 SectionData::Rela64(entries) => entries,
                 _ => continue,
             };
             found_any = true;
             for entry in entries.iter() {
                 match entry.get_type() {
-                    REL_GOT | REL_PLT | R_X86_64_64 | R_RISCV_64 | R_AARCH64_GLOBAL_DATA
+                    REL_GOT
+                    | REL_PLT
+                    | R_X86_64_64
+                    | R_RISCV_64
+                    | R_AARCH64_GLOBAL_DATA
                     | R_AARCH64_JUMP_SLOT => {
                         let dynsym = match dynsym {
                             Some(dynsym) => dynsym,

@@ -21,8 +21,7 @@ static IDLE_ENTRIES: AtomicU64 = AtomicU64::new(0);
 /// (frequent short naps → it is the one driving the background HID poll) or
 /// sleeps long (deep idle). Used to debug input-responsiveness-vs-heat.
 static IDLE_NS_PERCPU: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
-static IDLE_ENTRIES_PERCPU: [AtomicU64; MAX_CORE_NUM] =
-    [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+static IDLE_ENTRIES_PERCPU: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
 
 /// [diag] xHCI HID poll invocations split by the path that issued them: the
 /// timer tick (`timer`) vs an I/O-wait loop (`iowait`). Keyboard/mouse input is
@@ -139,7 +138,8 @@ static TICK_USER_PERCPU: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) 
 /// wedged in an interrupts-off spin (no more ticks) this stays frozen at the RIP
 /// it had on its last tick — i.e. near where it entered the spin — so it can be
 /// resolved to a symbol with addr2line.
-static TICK_LAST_RIP_PERCPU: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+static TICK_LAST_RIP_PERCPU: [AtomicU64; MAX_CORE_NUM] =
+    [const { AtomicU64::new(0) }; MAX_CORE_NUM];
 
 /// [diag] Account one timer tick by the context it interrupted, recording the
 /// interrupted instruction pointer.

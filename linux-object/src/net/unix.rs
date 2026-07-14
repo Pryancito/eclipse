@@ -467,7 +467,9 @@ impl Socket for UnixSocketState {
         // read, and only whole batches that fit in the caller's fd budget.
         loop {
             let take = match inner.pending_fds.front() {
-                Some((offset, batch)) => *offset <= inner.total_read && out.len() + batch.len() <= max,
+                Some((offset, batch)) => {
+                    *offset <= inner.total_read && out.len() + batch.len() <= max
+                }
                 None => false,
             };
             if !take {

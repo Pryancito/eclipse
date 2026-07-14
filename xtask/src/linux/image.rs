@@ -87,11 +87,11 @@ const LIVE_FILE_CAP: u64 = 16 * 1024 * 1024;
 const LIVE_KEEP: [&str; 8] = [
     "bin",              // busybox + applets + install-eclipse + e2fsprogs + net tools + rc-*
     "lib",              // ld-musl + libeclipse_dns + apk db + OpenRC /lib/rc helpers (capped)
-    "etc",              // fstab, profile, ssl certs, apk repo, machine-id, X11, OpenRC (init.d/conf.d/runlevels/rc.conf)
-    "var",              // apk dbs (small)
-    "sbin",             // openrc-init / openrc / rc-* + /sbin/init -> openrc-init (INIT)
-    "root",             // root's home / rc files (capped)
-    "usr/sbin",         // openssl -> ssl_client wrapper
+    "etc", // fstab, profile, ssl certs, apk repo, machine-id, X11, OpenRC (init.d/conf.d/runlevels/rc.conf)
+    "var", // apk dbs (small)
+    "sbin", // openrc-init / openrc / rc-* + /sbin/init -> openrc-init (INIT)
+    "root", // root's home / rc files (capped)
+    "usr/sbin", // openssl -> ssl_client wrapper
     "usr/share/udhcpc", // DHCP dispatcher scripts
 ];
 
@@ -215,9 +215,9 @@ impl super::LinuxRootfs {
                             "  live-rootfs: kept NVIDIA GSP firmware ({} MiB) for boot-time load",
                             n / (1024 * 1024)
                         ),
-                        Err(e) => eprintln!(
-                            "warning: could not copy GSP firmware into live root: {e}"
-                        ),
+                        Err(e) => {
+                            eprintln!("warning: could not copy GSP firmware into live root: {e}")
+                        }
                     }
                 }
             }
@@ -259,8 +259,8 @@ impl super::LinuxRootfs {
             // 4. Build efi.img (FAT32)
             let initramfs_len = fs::metadata(&initramfs_img).unwrap().len();
             let zcore_len = fs::metadata(&zcore_elf).unwrap().len();
-            let boot_len = fs::metadata(&rboot_efi).unwrap().len()
-                + fs::metadata(&rboot_conf).unwrap().len();
+            let boot_len =
+                fs::metadata(&rboot_efi).unwrap().len() + fs::metadata(&rboot_conf).unwrap().len();
             let efi_fat_bytes = efi_fat_size_for(initramfs_len, zcore_len, boot_len);
             println!(
                 "Building efi.img ({} MiB)...",

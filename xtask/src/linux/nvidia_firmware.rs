@@ -29,7 +29,8 @@ use std::{fs, path::Path};
 // tag (the newest release for which NVIDIA publishes a matching GSP firmware
 // in linux-firmware -- 610.x is not there yet), so this is 570.144 too.
 const NVIDIA_FW_VERSION: &str = "570.144";
-const NVIDIA_FW_URL: &str = "https://raw.githubusercontent.com/NVIDIA/linux-firmware/main/nvidia/tu102/gsp/gsp-570.144.bin";
+const NVIDIA_FW_URL: &str =
+    "https://raw.githubusercontent.com/NVIDIA/linux-firmware/main/nvidia/tu102/gsp/gsp-570.144.bin";
 
 /// Best-effort: a missing/failed download just means the real GPU driver
 /// finds no firmware at runtime and reports that (same as upstream

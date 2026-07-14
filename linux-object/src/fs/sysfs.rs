@@ -1082,7 +1082,6 @@ impl INode for SysDrmNodeINode {
     }
 }
 
-
 /// `<pci-dev>/device/drm/` — lists this device's DRM nodes (`card0`,
 /// `renderD128`). libdrm's drmGetRenderDeviceNameFromFd() scans it for the
 /// `renderD*` entry to resolve the render node path.

@@ -684,7 +684,11 @@ pub fn step23(device_instance: u32) -> Result<GrThreads, NV_STATUS> {
         fault_type: 0,
     };
     let status = unsafe { eclipse_rm_step23(device_instance, &mut out) };
-    if status == NV_OK { Ok(out) } else { Err(status) }
+    if status == NV_OK {
+        Ok(out)
+    } else {
+        Err(status)
+    }
 }
 
 /// Mirror of `EclipseGrBench` (vendor/eclipse_rm_init.c): the GIOPS
@@ -737,7 +741,11 @@ pub fn bench(device_instance: u32) -> Result<GrBench, NV_STATUS> {
         qmd_va: 0,
     };
     let status = unsafe { eclipse_rm_bench(device_instance, &mut out) };
-    if status == NV_OK { Ok(out) } else { Err(status) }
+    if status == NV_OK {
+        Ok(out)
+    } else {
+        Err(status)
+    }
 }
 
 /// Mirror of `EclipseGrEdid` (vendor/eclipse_rm_init.c): real EDID/connector
@@ -781,7 +789,11 @@ pub fn edid(device_instance: u32) -> Result<GrEdid, NV_STATUS> {
         edid_head: [0u8; 32],
     };
     let status = unsafe { eclipse_rm_edid(device_instance, &mut out) };
-    if status == NV_OK { Ok(out) } else { Err(status) }
+    if status == NV_OK {
+        Ok(out)
+    } else {
+        Err(status)
+    }
 }
 
 /// Fetches the GSP-reported interrupt kernel table (boxed: ~2 KiB).
@@ -882,11 +894,7 @@ pub fn mark_console_gpu(
     console_at_bar1_base: bool,
 ) -> Result<(), NV_STATUS> {
     let status = unsafe {
-        eclipse_rm_mark_console_gpu(
-            device_instance,
-            console_size,
-            console_at_bar1_base as u8,
-        )
+        eclipse_rm_mark_console_gpu(device_instance, console_size, console_at_bar1_base as u8)
     };
     if status == NV_OK {
         Ok(())

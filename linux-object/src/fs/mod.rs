@@ -712,8 +712,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                     let keys = dev.capability(CapabilityType::Key);
                     let rel = dev.capability(CapabilityType::RelAxis);
                     let is_keyboard = keys.contains(1); // KEY_ESC
-                    let is_mouse =
-                        rel.contains(0) && rel.contains(1) && keys.contains(0x110); // REL_X,REL_Y,BTN_LEFT
+                    let is_mouse = rel.contains(0) && rel.contains(1) && keys.contains(0x110); // REL_X,REL_Y,BTN_LEFT
                     let mut body = String::from("I:1\nE:ID_INPUT=1\n");
                     if is_keyboard {
                         body.push_str("E:ID_INPUT_KEYBOARD=1\n");
@@ -722,8 +721,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                         body.push_str("E:ID_INPUT_MOUSE=1\n");
                     }
                     body.push_str("G:seat\nQ:seat\nV:1\n");
-                    let name =
-                        alloc::format!("c{}:{}", EVDEV_MAJOR, EVDEV_EVENT_MINOR_BASE + id);
+                    let name = alloc::format!("c{}:{}", EVDEV_MAJOR, EVDEV_EVENT_MINOR_BASE + id);
                     match data_dir.create(&name, FileType::File, 0o644) {
                         Ok(f) => {
                             let _ = f.write_at(0, body.as_bytes());
@@ -735,7 +733,10 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                         id, is_keyboard, is_mouse
                     );
                 }
-                warn!("[boot] wrote {} udev db record(s) for input devices", n_input);
+                warn!(
+                    "[boot] wrote {} udev db record(s) for input devices",
+                    n_input
+                );
             }
         }
     }

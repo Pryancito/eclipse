@@ -701,8 +701,7 @@ unsafe fn governor_program_ceiling(mech: u8, lowest: u8, max: u8) {
             Msr::new(IA32_HWP_REQUEST).write(request);
         }
         2 => {
-            let request =
-                (max as u64) | ((lowest as u64) << 8) | (0u64 << 16) | (EPP_PREF << 24);
+            let request = (max as u64) | ((lowest as u64) << 8) | (0u64 << 16) | (EPP_PREF << 24);
             Msr::new(MSR_AMD_CPPC_REQUEST).write(request);
         }
         _ => {}

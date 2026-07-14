@@ -434,8 +434,13 @@ impl BlockCache {
         }
         let mut boxed = Box::new([0u8; SECTOR]);
         boxed.copy_from_slice(data);
-        self.lines
-            .insert(sector, CacheLine { data: boxed, tick: new_tick });
+        self.lines.insert(
+            sector,
+            CacheLine {
+                data: boxed,
+                tick: new_tick,
+            },
+        );
         self.lru.insert(new_tick, sector);
     }
 
@@ -615,7 +620,6 @@ pub fn device_from_backend(backend: &MountBackend) -> VfsResult<Arc<dyn Device>>
     Ok(Arc::new(CachedDevice::new(raw, size_bytes)))
 }
 
-
 #[cfg(test)]
 mod block_byte_tests {
     //! Host tests for the byte<->sector translation in `BlockByteDevice` — the
@@ -672,7 +676,8 @@ mod block_byte_tests {
                 return Err(DeviceError::InvalidParam);
             }
             buf.copy_from_slice(&d[start..start + buf.len()]);
-            self.sectors_read.fetch_add(buf.len() / 512, Ordering::Relaxed);
+            self.sectors_read
+                .fetch_add(buf.len() / 512, Ordering::Relaxed);
             Ok(())
         }
         fn write_block(&self, block_id: usize, buf: &[u8]) -> DeviceResult {
@@ -893,7 +898,11 @@ mod block_byte_tests {
         let raw = BlockByteDevice::new(dev.clone());
         let mut disk = [0u8; 512];
         raw.read_at(0, &mut disk).unwrap();
-        assert_eq!(&disk[100..110], &patch, "write-through lost the partial write");
+        assert_eq!(
+            &disk[100..110],
+            &patch,
+            "write-through lost the partial write"
+        );
     }
 
     /// Drive a mix of aligned/unaligned writes through the cache (small cache to
@@ -943,7 +952,10 @@ mod block_byte_tests {
             assert!(n > 0);
             q += n;
         }
-        assert_eq!(via_disk, reference, "disk content mismatch (write-through failed)");
+        assert_eq!(
+            via_disk, reference,
+            "disk content mismatch (write-through failed)"
+        );
     }
 
     /// Unaligned reads spanning sector boundaries must return the right bytes
@@ -1035,7 +1047,10 @@ mod block_byte_tests {
         assert!(c.contains(0));
         c.insert(1, &[2; SECTOR]);
         assert!(c.contains(1));
-        assert!(!c.contains(0), "capacity floored at 1 -> one resident sector");
+        assert!(
+            !c.contains(0),
+            "capacity floored at 1 -> one resident sector"
+        );
     }
 
     // ---- probe_ext2_superblock tests ----
