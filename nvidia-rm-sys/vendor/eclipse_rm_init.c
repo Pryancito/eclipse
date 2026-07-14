@@ -5076,6 +5076,12 @@ typedef struct EclipseGrEdid
     NvU32 edidSize;
     NvU32 edidValid;        /* 1 = 00 FF FF FF FF FF FF 00 header seen   */
     NvU8  edidHead[32];     /* header + PNP id + product + serial + date */
+    /* Physical connector type per output (GET_CONNECTOR_DATA 0x730250). */
+#define ECLIPSE_EDID_MAX_OUTS 16
+    NvU32 connTypeStatus;   /* first error, else NV_OK; 0xFFFFFFFF = not reached */
+    NvU32 connTypeCount;
+    NvU32 connTypeDisplayId[ECLIPSE_EDID_MAX_OUTS];
+    NvU32 connType[ECLIPSE_EDID_MAX_OUTS]; /* NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_* */
 } EclipseGrEdid;
 
 /*
@@ -5116,6 +5122,7 @@ NV_STATUS eclipse_rm_edid(NvU32 gpuInstance, EclipseGrEdid *pOut)
     pOut->supportedStatus = 0xFFFFFFFF;
     pOut->connectStatus   = 0xFFFFFFFF;
     pOut->edidStatus      = 0xFFFFFFFF;
+    pOut->connTypeStatus  = 0xFFFFFFFF;
 
     if (!g_grAllocDone)
         return NV_ERR_INVALID_STATE; /* run step16 first */
@@ -5247,6 +5254,37 @@ NV_STATUS eclipse_rm_edid(NvU32 gpuInstance, EclipseGrEdid *pOut)
         else
         {
             pOut->edidStatus = NV_ERR_NO_MEMORY;
+        }
+    }
+    /*
+     * Physical connector type of every output (DP/HDMI/DVI/...), one
+     * GET_CONNECTOR_DATA per displayId bit -- the control only accepts a
+     * single display per call. Read-only, same proven handle pair.
+     */
+    if (pOut->supportedStatus == NV_OK && pOut->displayMask != 0)
+    {
+        NvU32 rem = pOut->displayMask;
+        while (rem != 0 && pOut->connTypeCount < ECLIPSE_EDID_MAX_OUTS)
+        {
+            NvU32 did = rem & (0U - rem); /* lowest set bit */
+            NV_STATUS ctStatus;
+            NV0073_CTRL_SPECIFIC_GET_CONNECTOR_DATA_PARAMS cd;
+            portMemSet(&cd, 0, sizeof(cd));
+            cd.displayId = did;
+            ctStatus = pRmApi->Control(pRmApi, hDispClient, hDispCommon,
+                                       NV0073_CTRL_CMD_SPECIFIC_GET_CONNECTOR_DATA,
+                                       &cd, sizeof(cd));
+            /* Keep the first error so a partial failure is visible. */
+            if (pOut->connTypeStatus == 0xFFFFFFFF || pOut->connTypeStatus == NV_OK)
+                pOut->connTypeStatus = ctStatus;
+            pOut->connTypeDisplayId[pOut->connTypeCount] = did;
+            pOut->connType[pOut->connTypeCount] =
+                (ctStatus == NV_OK && cd.count > 0) ? cd.data[0].type : 0xFFFFFFFF;
+            nv_printf(0, "[eclipse-rm-trace] edid: CONNECTOR_DATA id=0x%x -> 0x%x count=%u type=0x%x\n",
+                      did, ctStatus, cd.count,
+                      pOut->connType[pOut->connTypeCount]);
+            pOut->connTypeCount++;
+            rem &= rem - 1;
         }
     }
     status = NV_OK;

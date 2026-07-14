@@ -30,6 +30,9 @@ pub struct DrmConnector {
     pub connected: bool,
     pub mm_width: u32,
     pub mm_height: u32,
+    /// DRM_MODE_CONNECTOR_* (0 = Unknown). Synthetic/fallback connectors
+    /// keep the historical hardcoded 11.
+    pub connector_type: u32,
 }
 
 /// DRM CRTC (display controller)

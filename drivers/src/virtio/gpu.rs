@@ -174,6 +174,7 @@ impl<'a> DrmScheme for VirtIoGpu<'a> {
                 connected: true,
                 mm_width: 0,
                 mm_height: 0,
+                connector_type: 11,
             })
         } else {
             None

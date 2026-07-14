@@ -750,7 +750,8 @@ pub fn bench(device_instance: u32) -> Result<GrBench, NV_STATUS> {
 
 /// Mirror of `EclipseGrEdid` (vendor/eclipse_rm_init.c): real EDID/connector
 /// query via NV04_DISPLAY_COMMON + NV0073 GET_SUPPORTED/GET_CONNECT_STATE/
-/// GET_EDID_V2. 72 bytes: 10 u32 + edid_head[32].
+/// GET_EDID_V2/GET_CONNECTOR_DATA. 208 bytes: 10 u32 + edid_head[32] +
+/// 2 u32 + 2x [u32; 16].
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct GrEdid {
@@ -765,6 +766,11 @@ pub struct GrEdid {
     pub edid_size: NvU32,
     pub edid_valid: NvU32,
     pub edid_head: [u8; 32],
+    pub conn_type_status: NvU32,
+    pub conn_type_count: NvU32,
+    pub conn_type_display_id: [NvU32; 16],
+    /// NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_* per output.
+    pub conn_type: [NvU32; 16],
 }
 
 extern "C" {
@@ -787,6 +793,10 @@ pub fn edid(device_instance: u32) -> Result<GrEdid, NV_STATUS> {
         edid_size: 0,
         edid_valid: 0,
         edid_head: [0u8; 32],
+        conn_type_status: 0xFFFF_FFFF,
+        conn_type_count: 0,
+        conn_type_display_id: [0u32; 16],
+        conn_type: [0u32; 16],
     };
     let status = unsafe { eclipse_rm_edid(device_instance, &mut out) };
     if status == NV_OK {

@@ -493,6 +493,7 @@ pub fn get_connector(id: u32) -> Option<DrmConnector> {
         // Physical size assuming ~96 DPI (1 inch = 25.4 mm, 96 px/inch).
         mm_width: (w * 254 / 960).max(1),
         mm_height: (h * 254 / 960).max(1),
+        connector_type: 11,
     })
 }
 
