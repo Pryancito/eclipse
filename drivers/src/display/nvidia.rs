@@ -2221,6 +2221,23 @@ impl NvidiaGpu {
             }
         }
     }
+
+    /// Live RM display state for this GPU: outputs, connected mask and EDID
+    /// head, straight from the NV0073 query (per-instance cached on the C
+    /// side, so repeated calls are cheap). `None` until this GPU's bring-up
+    /// chain has run, or when the GPU has no display engine.
+    fn rm_display_state(&self) -> Option<(u32, nvidia_rm_sys::rm_init::GrEdid)> {
+        let instance = (*self.rm_device_instance.lock())?;
+        let d = nvidia_rm_sys::rm_init::edid(instance).ok()?;
+        (d.supported_status == 0 && d.display_mask != 0).then_some((instance, d))
+    }
+
+    /// DRM connector id for output bit `bit` on RM instance `instance`.
+    /// Both are < 32, so ids are unique across GPUs and never collide with
+    /// the synthetic software-KMS ids (1..3) or the legacy fallback (1001).
+    fn rm_connector_id(instance: u32, bit: u32) -> u32 {
+        1001 + 100 * instance + bit
+    }
 }
 
 #[allow(dead_code)] // used when deferred BAR0 MMIO probe is enabled
@@ -3953,19 +3970,24 @@ impl DrmScheme for NvidiaGpu {
                         phase(c.alloc_status)
                     );
                 }
-                let _ = writeln!(
-                    s,
-                    "[gpuedid] GET_SUPPORTED:            {} (outputs={:#x}, DDC-capable={:#x})",
-                    phase(c.supported_status),
-                    c.display_mask,
-                    c.display_mask_ddc
-                );
-                let _ = writeln!(
-                    s,
-                    "[gpuedid] GET_CONNECT_STATE:        {} (connected={:#x})",
-                    phase(c.connect_status),
-                    c.connected_mask
-                );
+                let _ = writeln!(s, "[gpuedid] GET_SUPPORTED:            {} (outputs={:#x}, DDC-capable={:#x})", phase(c.supported_status), c.display_mask, c.display_mask_ddc);
+                let _ = writeln!(s, "[gpuedid] GET_CONNECT_STATE:        {} (connected={:#x})", phase(c.connect_status), c.connected_mask);
+                // The DRM view: connector ids GETRESOURCES/GETCONNECTOR now
+                // serve for this GPU (real topology, not the 1001 stub).
+                if c.supported_status == 0 && c.display_mask != 0 {
+                    let _ = write!(s, "[gpuedid] DRM connectors:");
+                    for b in 0..32u32 {
+                        if c.display_mask & (1 << b) != 0 {
+                            let _ = write!(
+                                s,
+                                " {}{}",
+                                Self::rm_connector_id(device_instance, b),
+                                if c.connected_mask & (1 << b) != 0 { "*" } else { "" }
+                            );
+                        }
+                    }
+                    let _ = writeln!(s, " (*=connected)");
+                }
                 if c.connected_mask == 0 && c.connect_status == 0 {
                     let _ = writeln!(s, "[gpuedid] no monitor connected to this GPU's outputs (expected on the headless compute GPU)");
                 } else if c.edid_status != 0xFFFF_FFFF {
@@ -5534,10 +5556,46 @@ impl DrmScheme for NvidiaGpu {
     }
 
     fn get_resources(&self) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+        // Real connector topology straight from the RM (NV0073
+        // GET_SUPPORTED): one connector per physical output bit. Until this
+        // GPU's bring-up chain has run, fall back to the legacy synthetic
+        // connector so pre-init userspace behaviour is unchanged.
+        if let Some((instance, d)) = self.rm_display_state() {
+            let conns: Vec<u32> = (0..32u32)
+                .filter(|b| d.display_mask & (1 << b) != 0)
+                .map(|b| Self::rm_connector_id(instance, b))
+                .collect();
+            return (Vec::new(), alloc::vec![2001], conns);
+        }
         (Vec::new(), alloc::vec![2001], alloc::vec![1001])
     }
 
     fn get_connector(&self, id: u32) -> Option<DrmConnector> {
+        if let Some((instance, d)) = self.rm_display_state() {
+            let bit = id.checked_sub(1001 + 100 * instance)?;
+            if bit >= 32 || d.display_mask & (1u32 << bit) == 0 {
+                return None;
+            }
+            let did = 1u32 << bit;
+            let connected = d.connected_mask & did != 0;
+            // EDID bytes 21/22 = max image size in cm; only known for the
+            // output whose EDID the RM actually read.
+            let (mm_width, mm_height) =
+                if connected && d.edid_valid == 1 && d.edid_display_id == did {
+                    (
+                        u32::from(d.edid_head[21]) * 10,
+                        u32::from(d.edid_head[22]) * 10,
+                    )
+                } else {
+                    (0, 0)
+                };
+            return Some(DrmConnector {
+                id,
+                connected,
+                mm_width,
+                mm_height,
+            });
+        }
         if id == 1001 {
             Some(DrmConnector {
                 id,
