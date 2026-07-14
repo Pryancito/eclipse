@@ -68,12 +68,22 @@ pub struct Btrfs {
     sb_dirty: bool,
     deferred_sb_commits: u32,
     clock: Option<fn() -> (u64, u32)>,
-    /// Read-side cache for the most recently read file: its inode and full
-    /// extent list. Sequential reads otherwise re-walk the fs tree (inode +
-    /// extent lookups) on every call, which dominated read cost. Keyed by the
-    /// volume's write epoch so any mutation invalidates it.
-    read_cache: Option<ReadCacheEntry>,
+    /// Read-side cache of recently read files: inode plus the extent list
+    /// looked up so far, in LRU order (most recently used last). Sequential
+    /// reads otherwise re-walk the fs tree (inode + extent lookups) on every
+    /// call, which dominated read cost. Demand-paging faults interleave reads
+    /// across many files (every mapped shared library at once), so a
+    /// single-entry cache thrashed on every inode switch — hence a small LRU.
+    /// Entries are keyed by the volume's write epoch so any mutation
+    /// invalidates them.
+    read_cache: Vec<ReadCacheEntry>,
 }
+
+/// Number of files whose extent maps are kept cached for reads. Demand paging
+/// a large process touches its executable plus every mapped library in an
+/// interleaved pattern; a few dozen entries keep all of them warm at a few
+/// hundred bytes each.
+const READ_CACHE_FILES: usize = 32;
 
 struct ReadCacheEntry {
     ino: u64,
@@ -110,7 +120,7 @@ impl Btrfs {
             read_only,
             sb_dirty: false,
             deferred_sb_commits: 0,
-            read_cache: None,
+            read_cache: Vec::new(),
             clock: None,
         };
         fs.alloc.nodesize = fs.vol.nodesize as u64;
@@ -1196,29 +1206,36 @@ impl Btrfs {
     }
 
     pub fn read(&mut self, ino: u64, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        // (Re)build the per-file read cache when the file changed (different
-        // ino) or the volume was written since (epoch bumped). Caches the inode
-        // and the full extent list so sequential reads avoid a tree walk each
-        // call.
+        // Locate (or rebuild) this file's read-cache entry and move it to the
+        // MRU slot (the vector's tail): the code below always works on
+        // `read_cache.last()`. Entries predating the last volume write are
+        // dropped wholesale — a CoW mutation anywhere may have relocated any
+        // file's extents.
         let epoch = self.vol.write_epoch();
-        let stale = match &self.read_cache {
-            Some(c) => c.ino != ino || c.epoch != epoch,
-            None => true,
-        };
-        if stale {
-            let inode = self.read_inode(ino)?;
-            if inode.kind() == FileKind::Dir {
-                return Err(Error::IsDir);
+        self.read_cache.retain(|c| c.epoch == epoch);
+        match self.read_cache.iter().position(|c| c.ino == ino) {
+            Some(i) => {
+                let entry = self.read_cache.remove(i);
+                self.read_cache.push(entry);
             }
-            self.read_cache = Some(ReadCacheEntry {
-                ino,
-                epoch,
-                inode,
-                extents: Vec::new(),
-                cached_end: 0,
-            });
+            None => {
+                let inode = self.read_inode(ino)?;
+                if inode.kind() == FileKind::Dir {
+                    return Err(Error::IsDir);
+                }
+                if self.read_cache.len() >= READ_CACHE_FILES {
+                    self.read_cache.remove(0);
+                }
+                self.read_cache.push(ReadCacheEntry {
+                    ino,
+                    epoch,
+                    inode,
+                    extents: Vec::new(),
+                    cached_end: 0,
+                });
+            }
         }
-        let size = self.read_cache.as_ref().unwrap().inode.size;
+        let size = self.read_cache.last().unwrap().inode.size;
         if offset >= size {
             return Ok(0);
         }
@@ -1229,10 +1246,10 @@ impl Btrfs {
         // Extend the cached extent list to cover `[.., end)`. Only extents
         // beginning at/after the previously-cached boundary are appended;
         // an extent that merely spans the boundary was cached earlier.
-        let from = self.read_cache.as_ref().unwrap().cached_end;
+        let from = self.read_cache.last().unwrap().cached_end;
         if end > from {
             let mut found = self.extents_in_range(ino, from, end)?;
-            let c = self.read_cache.as_mut().unwrap();
+            let c = self.read_cache.last_mut().unwrap();
             for e in found.drain(..) {
                 if e.0 >= from {
                     c.extents.push(e);
@@ -1240,7 +1257,7 @@ impl Btrfs {
             }
             c.cached_end = end;
         }
-        let cache = self.read_cache.as_ref().unwrap();
+        let cache = self.read_cache.last().unwrap();
         for (file_off, ext, raw) in cache.extents.iter() {
             let file_off = *file_off;
             match ext {
