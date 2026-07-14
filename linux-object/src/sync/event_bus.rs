@@ -11,7 +11,7 @@ use core::{
 };
 use lock::Mutex;
 
-const MAX_EVENT_CALLBACKS: usize = 1024;
+const MAX_EVENT_CALLBACKS: usize = 4096;
 
 bitflags! {
     #[derive(Default)]
@@ -100,11 +100,18 @@ impl EventBus {
     /// push a EventHandler into the callback vector
     pub fn subscribe(&mut self, callback: EventHandler) {
         if self.callbacks.len() >= MAX_EVENT_CALLBACKS {
+            // The table only fills on a long-idle bus being poll-scanned
+            // (poll/select/epoll park a fresh waker per scan and drop none, so
+            // orphaned entries pile up until the next event drains them). Evict
+            // the OLDEST entry instead of ignoring the newcomer: silently
+            // dropping the incoming subscription loses the wakeup of a waiter
+            // that may have no other entry — a blocking socket read parked
+            // here forever froze the whole compositor.
             trace!(
-                "EventBus: callback table full ({}), ignoring subscribe",
+                "EventBus: callback table full ({}), evicting oldest",
                 MAX_EVENT_CALLBACKS
             );
-            return;
+            let _evicted = self.callbacks.remove(0);
         }
         self.callbacks.push(callback);
     }
