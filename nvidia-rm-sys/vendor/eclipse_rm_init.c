@@ -5078,8 +5078,13 @@ typedef struct EclipseGrEdid
     NvU8  edidHead[32];     /* header + PNP id + product + serial + date */
 } EclipseGrEdid;
 
-static NvBool       g_edidDone = NV_FALSE;
-static EclipseGrEdid g_edidCache;
+/*
+ * Per-GPU cache: both TU106s register a DRM driver and /proc/gpuedid
+ * queries each with its own gpuInstance -- a single global here would
+ * replay GPU A's connectors/EDID as GPU B's answer.
+ */
+static NvBool        g_edidDone[NV_MAX_DEVICES];
+static EclipseGrEdid g_edidCache[NV_MAX_DEVICES];
 
 NV_STATUS eclipse_rm_edid(NvU32 gpuInstance, EclipseGrEdid *pOut)
 {
@@ -5092,17 +5097,17 @@ NV_STATUS eclipse_rm_edid(NvU32 gpuInstance, EclipseGrEdid *pOut)
     NvHandle hDispClient;
     NvHandle hDispCommon;
 
-    if (pOut == NULL)
+    if (pOut == NULL || gpuInstance >= NV_MAX_DEVICES)
         return NV_ERR_INVALID_ARGUMENT;
 
     /*
      * Idempotent: busybox `cat` reads /proc in 4KB chunks, re-invoking the
      * content generator (and hence this query) several times. Do the real
-     * RM work exactly once per boot and replay the cached result thereafter.
+     * RM work exactly once per boot per GPU and replay the cached result.
      */
-    if (g_edidDone)
+    if (g_edidDone[gpuInstance])
     {
-        *pOut = g_edidCache;
+        *pOut = g_edidCache[gpuInstance];
         return NV_OK;
     }
 
@@ -5150,13 +5155,15 @@ NV_STATUS eclipse_rm_edid(NvU32 gpuInstance, EclipseGrEdid *pOut)
     pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
 
     /*
-     * NV04_DISPLAY_COMMON is single-instance per Device (alloc_free.c: if
-     * !bMultiInstance and the parent already owns one -> NV_ERR_STATE_IN_USE,
-     * 0x63). The RM's own KernelDisplay already allocated the one-and-only
-     * DispCommon during display StateLoad (kdispAllocateCommonHandle), so a
-     * second alloc always collides. Instead, borrow the RM's internal handle
-     * pair -- exactly what the RM itself uses to issue NV0073 controls
-     * (see kdispGetSupportedDisplayMask / kdispIsDisplayConnected).
+     * NV04_DISPLAY_COMMON is effectively one-per-GPU: the RM's KernelDisplay
+     * allocates its own DispCommon in kdispStatePreInitLocked
+     * (kdispAllocateCommonHandle, kern_disp.c), and a second alloc came back
+     * NV_ERR_STATE_IN_USE (0x63) on hardware -- the collision is enforced on
+     * the GSP/physical side of the RPCed alloc (the CPU-side alloc_free.c
+     * single-instance check is only per-parent-Device). Instead, borrow the
+     * RM's internal handle pair -- exactly what the RM itself uses to issue
+     * NV0073 controls (see kdispGetSupportedDisplayMask /
+     * kdispIsDisplayConnected).
      */
     pKernelDisplay = GPU_GET_KERNEL_DISPLAY(pGpu);
     if (pKernelDisplay == NULL)
@@ -5224,9 +5231,12 @@ NV_STATUS eclipse_rm_edid(NvU32 gpuInstance, EclipseGrEdid *pOut)
                 NvU32 b;
                 for (b = 0; b < 32; b++)
                     pOut->edidHead[b] = ep->edidBuffer[b];
+                /* Full EDID 1.x header: 00 FF FF FF FF FF FF 00 */
                 pOut->edidValid = (ep->edidBuffer[0] == 0x00 &&
-                                   ep->edidBuffer[1] == 0xFF &&
                                    ep->edidBuffer[7] == 0x00) ? 1 : 0;
+                for (b = 1; b <= 6; b++)
+                    if (ep->edidBuffer[b] != 0xFF)
+                        pOut->edidValid = 0;
             }
             nv_printf(0, "[eclipse-rm-trace] edid: GET_EDID id=0x%x -> 0x%x size=%u valid=%u mfg=%02x%02x prod=%02x%02x\n",
                       did, pOut->edidStatus, pOut->edidSize, pOut->edidValid,
@@ -5250,8 +5260,8 @@ unlock:
     /* Cache the outcome so subsequent proc reads replay it verbatim. */
     if (status == NV_OK)
     {
-        g_edidCache = *pOut;
-        g_edidDone  = NV_TRUE;
+        g_edidCache[gpuInstance] = *pOut;
+        g_edidDone[gpuInstance]  = NV_TRUE;
     }
     return status;
 }
