@@ -67,7 +67,11 @@ const EXPECTED_MACHINE: Option<u16> = {
     {
         Some(243)
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )))]
     {
         None
     }
@@ -98,7 +102,10 @@ pub fn init() {
             policy::anomaly_mode().as_str(),
         ),
     );
-    info!("hunter: security subsystem v{} online", env!("CARGO_PKG_VERSION"));
+    info!(
+        "hunter: security subsystem v{} online",
+        env!("CARGO_PKG_VERSION")
+    );
 }
 
 /// Syscall hook. Enforces the per-process whitelist and feeds the anomaly
@@ -255,7 +262,10 @@ pub fn check_exec_path(path: &str) -> bool {
         "WARNING",
         format!("exec policy violation ({}): {}", reason, path),
     );
-    warn!("hunter: exec policy violation ({}, report): {}", reason, path);
+    warn!(
+        "hunter: exec policy violation ({}, report): {}",
+        reason, path
+    );
     true
 }
 
@@ -294,7 +304,13 @@ pub fn record_mapping(pid: u64, addr: usize, len: usize, prot_write: bool) {
 /// W^X hook for `mprotect`. Catches both the immediate write+execute request
 /// and execute-over-an-ever-writable-region (the two-step bypass). Call
 /// *before* applying the protection change. Returns `true` if it may proceed.
-pub fn check_mprotect(pid: u64, addr: usize, len: usize, prot_write: bool, prot_exec: bool) -> bool {
+pub fn check_mprotect(
+    pid: u64,
+    addr: usize,
+    len: usize,
+    prot_write: bool,
+    prot_exec: bool,
+) -> bool {
     let mode = policy::wx_mode();
     if mode == Mode::Off {
         return true;
@@ -570,14 +586,22 @@ mod tests {
         policy::set_exec_learning(true);
         assert_eq!(policy::learned_exec_count(), 0);
         // A relative apk-style path is safe (not world-writable) -> learned.
-        assert!(check_elf_binary("lib/apk/exec/busybox-1.37.0-r", b"\x7fELF"));
+        assert!(check_elf_binary(
+            "lib/apk/exec/busybox-1.37.0-r",
+            b"\x7fELF"
+        ));
         assert!(policy::is_exec_listed("/lib/apk/exec/busybox-1.37.0-r"));
         assert_eq!(policy::learned_exec_count(), 1);
         // Re-exec does not double-learn.
-        assert!(check_elf_binary("/lib/apk/exec/busybox-1.37.0-r", b"\x7fELF"));
+        assert!(check_elf_binary(
+            "/lib/apk/exec/busybox-1.37.0-r",
+            b"\x7fELF"
+        ));
         assert_eq!(policy::learned_exec_count(), 1);
         // World-writable programs are not auto-learned.
-        assert!(!policy::is_world_writable_exec_path("/lib/apk/exec/busybox-1.37.0-r"));
+        assert!(!policy::is_world_writable_exec_path(
+            "/lib/apk/exec/busybox-1.37.0-r"
+        ));
         assert!(policy::is_world_writable_exec_path("/tmp/payload"));
         // Blacklist still wins under learning.
         assert!(!check_elf_binary("/usr/bin/evil", b"\x7fELF"));

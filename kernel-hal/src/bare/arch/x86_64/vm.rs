@@ -68,9 +68,20 @@ hal_fn_impl! {
             let src_table = unsafe { slice::from_raw_parts(phys_to_virt(src_pt_root) as *const X86PTE, 512) };
             for i in entry_range {
                 dst_table[i] = src_table[i];
-                if !dst_table[i].is_unused() {
-                    dst_table[i].0 |= PTF::GLOBAL.bits();
-                }
+                // Do NOT set PTF::GLOBAL here. Bit 8 (the G bit of *leaf*
+                // entries) is IGNORED in a PML4E on Intel but RESERVED
+                // (must-be-zero) on AMD: with it set, the first hardware page
+                // walk through this entry raises #PF with the RSVD error bit.
+                // Every kernel address in the new user address space resolves
+                // through these entries — including the fault handler itself —
+                // so on an AMD CPU (QEMU/KVM or VirtualBox on an AMD host, or
+                // bare metal) activating the first user CR3 escalated to a
+                // triple fault and rebooted the machine right when boot
+                // reached 100%. Intel silently ignored the bit, which is why
+                // this only ever crashed on AMD. (See AMD APM Vol. 2 §5.3.3,
+                // and KVM's `nonleaf_bit8_rsvd` in arch/x86/kvm/mmu.c.)
+                // Global-TLB retention for kernel mappings, if ever wanted,
+                // must be done via the G bit on leaf PTEs/PDEs instead.
             }
         }
     }

@@ -128,7 +128,11 @@ mod nr {
         pub const VFORK: u32 = super::ABSENT;
     }
 
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )))]
     mod imp {
         pub const PTRACE: u32 = super::ABSENT;
         pub const SETUID: u32 = super::ABSENT;
@@ -401,46 +405,60 @@ pub fn on_syscall(pid: u64, num: u32) -> bool {
             SYS_FORK_ALERTED.store(false, Ordering::Relaxed);
         }
         let total = SYS_FORK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if total > SYS_FORKBOMB_THRESHOLD
-            && !SYS_FORK_ALERTED.swap(true, Ordering::Relaxed)
-        {
+        if total > SYS_FORKBOMB_THRESHOLD && !SYS_FORK_ALERTED.swap(true, Ordering::Relaxed) {
             alert_sys_fork = true;
         }
     }
 
     let mut deny = false;
     if alert_flood {
-        log_anomaly(pid, enforce, format!(
-            "syscall flood: >{} syscalls within {}ms",
-            FLOOD_THRESHOLD,
-            WINDOW_NS / 1_000_000
-        ));
+        log_anomaly(
+            pid,
+            enforce,
+            format!(
+                "syscall flood: >{} syscalls within {}ms",
+                FLOOD_THRESHOLD,
+                WINDOW_NS / 1_000_000
+            ),
+        );
         deny |= enforce;
     }
     if alert_adaptive {
-        log_anomaly(pid, enforce, format!(
+        log_anomaly(
+            pid,
+            enforce,
+            format!(
             "adaptive syscall spike: {} within {}ms is >{}x the per-process baseline (~{}/window)",
             spike_count,
             WINDOW_NS / 1_000_000,
             ADAPTIVE_MULT,
             baseline
-        ));
+        ),
+        );
         deny |= enforce;
     }
     if alert_fork {
-        log_anomaly(pid, enforce, format!(
-            "possible fork bomb: >{} clone/fork within {}ms",
-            FORKBOMB_THRESHOLD,
-            WINDOW_NS / 1_000_000
-        ));
+        log_anomaly(
+            pid,
+            enforce,
+            format!(
+                "possible fork bomb: >{} clone/fork within {}ms",
+                FORKBOMB_THRESHOLD,
+                WINDOW_NS / 1_000_000
+            ),
+        );
         deny |= enforce;
     }
     if alert_sys_fork {
-        log_anomaly(pid, enforce, format!(
-            "system-wide fork storm: >{} clone/fork within {}ms",
-            SYS_FORKBOMB_THRESHOLD,
-            WINDOW_NS / 1_000_000
-        ));
+        log_anomaly(
+            pid,
+            enforce,
+            format!(
+                "system-wide fork storm: >{} clone/fork within {}ms",
+                SYS_FORKBOMB_THRESHOLD,
+                WINDOW_NS / 1_000_000
+            ),
+        );
         deny |= enforce;
     }
 

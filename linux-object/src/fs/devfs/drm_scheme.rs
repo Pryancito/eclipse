@@ -403,7 +403,7 @@ fn make_modeinfo(w: u32, h: u32) -> [u8; 68] {
                                                   // vscan @22..24 = 0
     m[24..28].copy_from_slice(&refresh.to_ne_bytes()); // vrefresh
                                                        // flags @28..32 = 0
-    // type @32..36: DRM_MODE_TYPE_DRIVER(0x40) | DRM_MODE_TYPE_PREFERRED(0x08)
+                                                       // type @32..36: DRM_MODE_TYPE_DRIVER(0x40) | DRM_MODE_TYPE_PREFERRED(0x08)
     m[32..36].copy_from_slice(&0x48u32.to_ne_bytes());
     // name @36..68 ("WxH")
     let mut name = [0u8; 32];
@@ -808,8 +808,12 @@ impl INode for DrmDev {
                 // failing the commit (which left the screen blank with
                 // "Failed to set DPMS property").
                 let value = unsafe { *(data as *const u64) };
-                let (prop_id, connector_id) =
-                    unsafe { (*(data.wrapping_add(8) as *const u32), *(data.wrapping_add(12) as *const u32)) };
+                let (prop_id, connector_id) = unsafe {
+                    (
+                        *(data.wrapping_add(8) as *const u32),
+                        *(data.wrapping_add(12) as *const u32),
+                    )
+                };
                 log::debug!(
                     "[drm] SETPROPERTY connector={} prop={} val={} (accepted, no-op)",
                     connector_id,
@@ -988,9 +992,7 @@ impl INode for DrmDev {
                         0x3432_5258, // DRM_FORMAT_XRGB8888 ("XR24")
                         0x3432_5241, // DRM_FORMAT_ARGB8888 ("AR24")
                     ];
-                    if res.format_type_ptr != 0
-                        && res.count_format_types >= FORMATS.len() as u32
-                    {
+                    if res.format_type_ptr != 0 && res.count_format_types >= FORMATS.len() as u32 {
                         unsafe {
                             core::ptr::copy_nonoverlapping(
                                 FORMATS.as_ptr(),
@@ -1043,13 +1045,9 @@ impl INode for DrmDev {
                         name[..4].copy_from_slice(b"type");
                         res.name = name;
 
-                        const ENUMS: [(u64, &[u8]); 3] = [
-                            (0, b"Overlay"),
-                            (1, b"Primary"),
-                            (2, b"Cursor"),
-                        ];
-                        if res.enum_blob_ptr != 0
-                            && (res.count_enum_blobs as usize) >= ENUMS.len()
+                        const ENUMS: [(u64, &[u8]); 3] =
+                            [(0, b"Overlay"), (1, b"Primary"), (2, b"Cursor")];
+                        if res.enum_blob_ptr != 0 && (res.count_enum_blobs as usize) >= ENUMS.len()
                         {
                             for (i, (val, nm)) in ENUMS.iter().enumerate() {
                                 let mut e = DrmModePropertyEnum {

@@ -54,7 +54,12 @@ pub extern "C" fn osAllocAcquirePage(arg0: NvU64, arg1: NvU32) {
 // GspMsgQueuesInit failing to map its shared buffer (NV_ERR_NO_MEMORY).
 
 #[no_mangle]
-pub extern "C" fn osAllocPagesNode(arg0: NvS32, arg1: NvU64, arg2: NvU32, arg3: *mut NvU64) -> NV_STATUS {
+pub extern "C" fn osAllocPagesNode(
+    arg0: NvS32,
+    arg1: NvU64,
+    arg2: NvU32,
+    arg3: *mut NvU64,
+) -> NV_STATUS {
     let _ = arg0;
     let _ = arg1;
     let _ = arg2;
@@ -121,7 +126,13 @@ pub extern "C" fn osBugCheck(bugCode: NvU32) {
 }
 
 #[no_mangle]
-pub extern "C" fn osCallACPI_DDC(arg0: *mut c_void, arg1: NvU32, arg2: *mut NvU8, arg3: *mut NvU32, arg4: NvBool) -> NV_STATUS {
+pub extern "C" fn osCallACPI_DDC(
+    arg0: *mut c_void,
+    arg1: NvU32,
+    arg2: *mut NvU8,
+    arg3: *mut NvU32,
+    arg4: NvBool,
+) -> NV_STATUS {
     let _ = arg0;
     let _ = arg1;
     let _ = arg2;
@@ -131,7 +142,11 @@ pub extern "C" fn osCallACPI_DDC(arg0: *mut c_void, arg1: NvU32, arg2: *mut NvU8
 }
 
 #[no_mangle]
-pub extern "C" fn osCallACPI_DOD(arg0: *mut c_void, arg1: *mut NvU32, arg2: *mut NvU32) -> NV_STATUS {
+pub extern "C" fn osCallACPI_DOD(
+    arg0: *mut c_void,
+    arg1: *mut NvU32,
+    arg2: *mut NvU32,
+) -> NV_STATUS {
     let _ = arg0;
     let _ = arg1;
     let _ = arg2;
@@ -139,7 +154,13 @@ pub extern "C" fn osCallACPI_DOD(arg0: *mut c_void, arg1: *mut NvU32, arg2: *mut
 }
 
 #[no_mangle]
-pub extern "C" fn osCallACPI_DSM(pGpu: *mut c_void, acpiDSMFunction: *mut c_void, NVHGDSMSubfunction: NvU32, pInOut: *mut NvU32, size: *mut NvU16) -> NV_STATUS {
+pub extern "C" fn osCallACPI_DSM(
+    pGpu: *mut c_void,
+    acpiDSMFunction: *mut c_void,
+    NVHGDSMSubfunction: NvU32,
+    pInOut: *mut NvU32,
+    size: *mut NvU16,
+) -> NV_STATUS {
     let _ = pGpu;
     let _ = acpiDSMFunction;
     let _ = NVHGDSMSubfunction;
@@ -165,7 +186,11 @@ pub extern "C" fn osCallACPI_MXDS(arg0: *mut c_void, arg1: NvU32, arg2: *mut NvU
 }
 
 #[no_mangle]
-pub extern "C" fn osCallACPI_NVHG_ROM(arg0: *mut c_void, arg1: *mut NvU32, arg2: *mut NvU32) -> NV_STATUS {
+pub extern "C" fn osCallACPI_NVHG_ROM(
+    arg0: *mut c_void,
+    arg1: *mut NvU32,
+    arg2: *mut NvU32,
+) -> NV_STATUS {
     let _ = arg0;
     let _ = arg1;
     let _ = arg2;
@@ -227,7 +252,10 @@ pub extern "C" fn osCondAcquireRmSema(arg0: *mut c_void) -> *mut c_void {
 }
 
 #[no_mangle]
-pub extern "C" fn osConfigurePcieReqAtomics(pOsGpuInfo: *mut c_void, pMask: *mut NvU32) -> NV_STATUS {
+pub extern "C" fn osConfigurePcieReqAtomics(
+    pOsGpuInfo: *mut c_void,
+    pMask: *mut NvU32,
+) -> NV_STATUS {
     let _ = pOsGpuInfo;
     let _ = pMask;
     NV_ERR_NOT_SUPPORTED
@@ -240,7 +268,16 @@ pub extern "C" fn osCountTailPages(arg0: NvU64) -> NvU32 {
 }
 
 #[no_mangle]
-pub extern "C" fn osCreateMemFromOsDescriptor(pGpu: *mut c_void, pDescriptor: *mut c_void, hClient: *mut c_void, flags: NvU32, pLimit: *mut NvU64, ppMemDesc: *mut *mut c_void, descriptorType: NvU32, privilegeLevel: *mut c_void) -> NV_STATUS {
+pub extern "C" fn osCreateMemFromOsDescriptor(
+    pGpu: *mut c_void,
+    pDescriptor: *mut c_void,
+    hClient: *mut c_void,
+    flags: NvU32,
+    pLimit: *mut NvU64,
+    ppMemDesc: *mut *mut c_void,
+    descriptorType: NvU32,
+    privilegeLevel: *mut c_void,
+) -> NV_STATUS {
     let _ = pGpu;
     let _ = pDescriptor;
     let _ = hClient;
@@ -253,7 +290,11 @@ pub extern "C" fn osCreateMemFromOsDescriptor(pGpu: *mut c_void, pDescriptor: *m
 }
 
 #[no_mangle]
-pub extern "C" fn osCreateNanoTimer(pArg1: *mut c_void, tmrEvent: *mut c_void, tmrUserData: *mut *mut c_void) -> NV_STATUS {
+pub extern "C" fn osCreateNanoTimer(
+    pArg1: *mut c_void,
+    tmrEvent: *mut c_void,
+    tmrUserData: *mut *mut c_void,
+) -> NV_STATUS {
     let _ = pArg1;
     let _ = tmrEvent;
     let _ = tmrUserData;
@@ -372,7 +413,8 @@ pub fn seq_trace_disarm() {
 /// bringup_step11/12 with the GPU's and its root port's packed config
 /// handles (same 0x8000_0000|bus<<16|dev<<8|fn packing as
 /// os_pci_init_handle).
-static AUTOPSY_GPU_HANDLE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static AUTOPSY_GPU_HANDLE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 static AUTOPSY_RP_HANDLE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Arm the post-STARTCPU autopsy. `rp_handle` may be 0 (no root port found).
@@ -429,8 +471,7 @@ pub fn sec2_drain_disarm() {
 /// does NOTHING: no BSI read, no snapshot, no drain -- the store goes through
 /// the generic path exactly like Linux. Armed by gsp_boot_run(quiet=true)
 /// together with the console-silent window; supersedes SEC2_DRAIN_ARMED.
-static LINUX_PARITY: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static LINUX_PARITY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Wedge containment (the "no more pointless reboots" machinery). The console
 /// GPU's SEC2 CORE_RESUME wedge is a ~25-30% race that no driver-visible knob
@@ -449,12 +490,9 @@ static LINUX_PARITY: core::sync::atomic::AtomicBool =
 /// recovery + retry. NOTE: the flag is global (both GPUs' MMIO gets faked
 /// while set) -- acceptable: it is only set when the fabric is already dead,
 /// and cleared after a successful recovery.
-static WEDGE_FAKE_MMIO: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-static WEDGE_DETECTED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-static WEDGE_CFG_HANDLE: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static WEDGE_FAKE_MMIO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static WEDGE_DETECTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static WEDGE_CFG_HANDLE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Arm the post-STARTCPU wedge watch with the GPU's packed config handle
 /// (same 0x8000_0000|bus<<16|dev<<8|fn packing as os_pci_init_handle).
@@ -529,7 +567,9 @@ unsafe fn sec2_intr_snapshot_and_drain(base: *mut u8) {
         if leaf != 0 || en != 0 {
             crate::os_interface::probe_line(&alloc::format!(
                 "[nvidia-rm] EXP2   LEAF[{}] pending={:#010x} en={:#010x}",
-                i, leaf, en
+                i,
+                leaf,
+                en
             ));
         }
     }
@@ -594,7 +634,8 @@ unsafe fn sec2_intr_snapshot_and_drain(base: *mut u8) {
 /// isochronous display FB fetch during the SEC2-RTOS resume. One-way for
 /// the boot: the console goes dark (scanout stops) until reboot. Armed
 /// only by /proc/gpustep12.
-static PDISP_KILL_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static PDISP_KILL_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 // EXP1c: PDISP is held in reset only for the SEC2 HS-resume window (which
 // wedges the bus on live scanout), then RESTORED once the RM narrates
@@ -603,7 +644,8 @@ static PDISP_KILL_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::At
 // reset. Restoring here mirrors Linux (scanout live throughout GSP-RM run).
 static PDISP_SAVED_BASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static PDISP_SAVED_PMC: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-static PDISP_RESTORE_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static PDISP_RESTORE_PENDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Arm the PDISP hold-in-reset experiment for the next GSP boot.
 pub fn pdisp_kill_arm() {
@@ -647,9 +689,7 @@ pub fn pdisp_restore() {
 /// the SEC2 STARTCPU bracket below in case the narration line never matched.
 pub fn seq_trace_go_live() {
     use core::sync::atomic::Ordering;
-    if SEQ_TRACE_ARMED.load(Ordering::Relaxed)
-        && !SEQ_TRACE_LIVE.swap(true, Ordering::Relaxed)
-    {
+    if SEQ_TRACE_ARMED.load(Ordering::Relaxed) && !SEQ_TRACE_LIVE.swap(true, Ordering::Relaxed) {
         let line = "[nvidia-rm] SEQ trace LIVE (sequencer RPC received; every reg access narrates until boot returns)";
         if crate::os_interface::live_echo_on() {
             log::error!("{}", line);
@@ -700,13 +740,20 @@ fn seq_trace(kind_write: bool, offset: NvU32, value: Option<NvU32>) -> bool {
             value.unwrap_or(0)
         ));
     } else {
-        seq_trace_emit(&alloc::format!("[nvidia-rm] SEQ RD off={:#x} (about to)", offset));
+        seq_trace_emit(&alloc::format!(
+            "[nvidia-rm] SEQ RD off={:#x} (about to)",
+            offset
+        ));
     }
     true
 }
 
 #[no_mangle]
-pub extern "C" fn osDevReadReg008(_pGpu: *mut c_void, pMapping: *mut c_void, this_address: NvU32) -> NvU8 {
+pub extern "C" fn osDevReadReg008(
+    _pGpu: *mut c_void,
+    pMapping: *mut c_void,
+    this_address: NvU32,
+) -> NvU8 {
     if WEDGE_FAKE_MMIO.load(core::sync::atomic::Ordering::Relaxed) {
         return 0xFF;
     }
@@ -717,18 +764,28 @@ pub extern "C" fn osDevReadReg008(_pGpu: *mut c_void, pMapping: *mut c_void, thi
 }
 
 #[no_mangle]
-pub extern "C" fn osDevReadReg016(_pGpu: *mut c_void, pMapping: *mut c_void, this_address: NvU32) -> NvU16 {
+pub extern "C" fn osDevReadReg016(
+    _pGpu: *mut c_void,
+    pMapping: *mut c_void,
+    this_address: NvU32,
+) -> NvU16 {
     if WEDGE_FAKE_MMIO.load(core::sync::atomic::Ordering::Relaxed) {
         return 0xFFFF;
     }
     match dev_mapping_base(pMapping) {
-        Some(base) => unsafe { core::ptr::read_volatile(base.add(this_address as usize) as *const NvU16) },
+        Some(base) => unsafe {
+            core::ptr::read_volatile(base.add(this_address as usize) as *const NvU16)
+        },
         None => 0xFFFF,
     }
 }
 
 #[no_mangle]
-pub extern "C" fn osDevReadReg032(_pGpu: *mut c_void, pMapping: *mut c_void, this_address: NvU32) -> NvU32 {
+pub extern "C" fn osDevReadReg032(
+    _pGpu: *mut c_void,
+    pMapping: *mut c_void,
+    this_address: NvU32,
+) -> NvU32 {
     // Wedge containment: with the fabric confirmed dead, answer all-ones
     // WITHOUT touching hardware so the RM's polls fail gracefully instead of
     // hanging the CPU (see WEDGE_FAKE_MMIO).
@@ -773,7 +830,11 @@ pub extern "C" fn osDevReadReg032(_pGpu: *mut c_void, pMapping: *mut c_void, thi
         static PROBE_RD_LOGS: AtomicU32 = AtomicU32::new(0);
         if PROBE_RD_LOGS.fetch_add(1, Ordering::Relaxed) < 160 {
             let tag = if is_bsi { "BSI" } else { "SEC2" };
-            log::warn!("[nvidia-rm] {} RD off={:#x} (about to deref)", tag, this_address);
+            log::warn!(
+                "[nvidia-rm] {} RD off={:#x} (about to deref)",
+                tag,
+                this_address
+            );
         }
     }
     // Step-11 SEC2-resume trace: pre-log EVERY read live (ERROR level)
@@ -781,7 +842,9 @@ pub extern "C" fn osDevReadReg032(_pGpu: *mut c_void, pMapping: *mut c_void, thi
     // its "(about to)" line as the last thing on screen.
     let seq_logged = seq_trace(false, this_address, None);
     let v = match dev_mapping_base(pMapping) {
-        Some(base) => unsafe { core::ptr::read_volatile(base.add(this_address as usize) as *const NvU32) },
+        Some(base) => unsafe {
+            core::ptr::read_volatile(base.add(this_address as usize) as *const NvU32)
+        },
         None => 0xFFFF_FFFF,
     };
     if seq_logged {
@@ -836,7 +899,12 @@ pub extern "C" fn osDevReadReg032(_pGpu: *mut c_void, pMapping: *mut c_void, thi
 }
 
 #[no_mangle]
-pub extern "C" fn osDevWriteReg008(_pGpu: *mut c_void, pMapping: *mut c_void, this_address: NvU32, this_value: NvU8) {
+pub extern "C" fn osDevWriteReg008(
+    _pGpu: *mut c_void,
+    pMapping: *mut c_void,
+    this_address: NvU32,
+    this_value: NvU8,
+) {
     if WEDGE_FAKE_MMIO.load(core::sync::atomic::Ordering::Relaxed) {
         return;
     }
@@ -846,17 +914,29 @@ pub extern "C" fn osDevWriteReg008(_pGpu: *mut c_void, pMapping: *mut c_void, th
 }
 
 #[no_mangle]
-pub extern "C" fn osDevWriteReg016(_pGpu: *mut c_void, pMapping: *mut c_void, this_address: NvU32, this_value: NvU16) {
+pub extern "C" fn osDevWriteReg016(
+    _pGpu: *mut c_void,
+    pMapping: *mut c_void,
+    this_address: NvU32,
+    this_value: NvU16,
+) {
     if WEDGE_FAKE_MMIO.load(core::sync::atomic::Ordering::Relaxed) {
         return;
     }
     if let Some(base) = dev_mapping_base(pMapping) {
-        unsafe { core::ptr::write_volatile(base.add(this_address as usize) as *mut NvU16, this_value) };
+        unsafe {
+            core::ptr::write_volatile(base.add(this_address as usize) as *mut NvU16, this_value)
+        };
     }
 }
 
 #[no_mangle]
-pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, this_address: NvU32, this_value: NvU32) {
+pub extern "C" fn osDevWriteReg032(
+    _pGpu: *mut c_void,
+    pMapping: *mut c_void,
+    this_address: NvU32,
+    this_value: NvU32,
+) {
     if WEDGE_FAKE_MMIO.load(core::sync::atomic::Ordering::Relaxed) {
         return;
     }
@@ -879,7 +959,11 @@ pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, th
         if SEC2_WR_LOGS.fetch_add(1, Ordering::Relaxed) < 200 {
             // Logged BEFORE the store: if the posted write itself wedges the
             // CPU, the last line on screen names the exact register.
-            log::warn!("[nvidia-rm] SEC2 WR off={:#x} <= {:#x}", this_address, this_value);
+            log::warn!(
+                "[nvidia-rm] SEC2 WR off={:#x} <= {:#x}",
+                this_address,
+                this_value
+            );
         }
     }
     // Step-11 SEC2-resume trace (see seq_trace): pre-log every write live.
@@ -970,8 +1054,7 @@ pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, th
                     // the 2-of-3 (rather than deterministic) survival rate.
                     // Same register, SYS/VF interrupt fabric: honors the
                     // hard no-DISP/no-PBUS/no-PPRIV critical-window rule.
-                    let _settle =
-                        core::ptr::read_volatile(base.add(l4_off) as *const NvU32);
+                    let _settle = core::ptr::read_volatile(base.add(l4_off) as *const NvU32);
                     core::ptr::write_volatile(
                         base.add(this_address as usize) as *mut NvU32,
                         this_value,
@@ -1023,7 +1106,9 @@ pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, th
     }
     if !startcpu_posted {
         if let Some(base) = dev_mapping_base(pMapping) {
-            unsafe { core::ptr::write_volatile(base.add(this_address as usize) as *mut NvU32, this_value) };
+            unsafe {
+                core::ptr::write_volatile(base.add(this_address as usize) as *mut NvU32, this_value)
+            };
         }
     }
     // The old post-STARTCPU "500ms silent window + raw BSI readback" bracket
@@ -1045,11 +1130,15 @@ pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, th
             let mut last_gpu_id = 0xDEAD_BEEFu32;
             let mut last_gpu_cs = 0xDEAD_BEEFu32;
             let mut last_rp_id = 0xDEAD_BEEFu32;
-            log::error!("[nvidia-rm] AUTOPSY: config-space watch begins (2s @ 1ms; transitions only)");
+            log::error!(
+                "[nvidia-rm] AUTOPSY: config-space watch begins (2s @ 1ms; transitions only)"
+            );
             for ms in 0..2000u32 {
                 crate::hooks::with_hooks((), |h| h.delay_us(1_000));
-                let gpu_id = crate::hooks::with_hooks(0xFFFF_FFFF, |h| h.pci_config_read(gpu_h, 0, 4));
-                let gpu_cs = crate::hooks::with_hooks(0xFFFF_FFFF, |h| h.pci_config_read(gpu_h, 4, 4));
+                let gpu_id =
+                    crate::hooks::with_hooks(0xFFFF_FFFF, |h| h.pci_config_read(gpu_h, 0, 4));
+                let gpu_cs =
+                    crate::hooks::with_hooks(0xFFFF_FFFF, |h| h.pci_config_read(gpu_h, 4, 4));
                 let rp_id = if rp_h != 0 {
                     crate::hooks::with_hooks(0xFFFF_FFFF, |h| h.pci_config_read(rp_h, 0, 4))
                 } else {
@@ -1070,7 +1159,8 @@ pub extern "C" fn osDevWriteReg032(_pGpu: *mut c_void, pMapping: *mut c_void, th
                 last_gpu_id, last_gpu_cs, last_rp_id
             );
             if let Some(base) = base_for_bracket {
-                let bsi = unsafe { core::ptr::read_volatile(base.add(0x0011_80F8) as *const NvU32) };
+                let bsi =
+                    unsafe { core::ptr::read_volatile(base.add(0x0011_80F8) as *const NvU32) };
                 log::error!(
                     "[nvidia-rm] AUTOPSY: BAR0 read RETURNED = {:#010x} (bit26 DONE={}) -- bus alive",
                     bsi,
@@ -1139,7 +1229,12 @@ pub extern "C" fn osEnableInterrupts(pGpu: *mut c_void) {
 }
 
 #[no_mangle]
-pub extern "C" fn osErrorLogV(pGpu: *mut c_void, context: *mut c_void, pFormat: *mut c_char, arglist: *mut c_void) -> *mut c_void {
+pub extern "C" fn osErrorLogV(
+    pGpu: *mut c_void,
+    context: *mut c_void,
+    pFormat: *mut c_char,
+    arglist: *mut c_void,
+) -> *mut c_void {
     let _ = pGpu;
     let _ = context;
     let _ = pFormat;
@@ -1148,7 +1243,13 @@ pub extern "C" fn osErrorLogV(pGpu: *mut c_void, context: *mut c_void, pFormat: 
 }
 
 #[no_mangle]
-pub extern "C" fn osEventNotification(arg0: *mut c_void, arg1: *mut c_void, arg2: NvU32, arg3: *mut c_void, arg4: NvU32) -> NV_STATUS {
+pub extern "C" fn osEventNotification(
+    arg0: *mut c_void,
+    arg1: *mut c_void,
+    arg2: NvU32,
+    arg3: *mut c_void,
+    arg4: NvU32,
+) -> NV_STATUS {
     let _ = arg0;
     let _ = arg1;
     let _ = arg2;
@@ -1158,7 +1259,15 @@ pub extern "C" fn osEventNotification(arg0: *mut c_void, arg1: *mut c_void, arg2
 }
 
 #[no_mangle]
-pub extern "C" fn osEventNotificationWithInfo(arg0: *mut c_void, arg1: *mut c_void, arg2: NvU32, arg3: NvU32, arg4: NvU16, arg5: *mut c_void, arg6: NvU32) -> NV_STATUS {
+pub extern "C" fn osEventNotificationWithInfo(
+    arg0: *mut c_void,
+    arg1: *mut c_void,
+    arg2: NvU32,
+    arg3: NvU32,
+    arg4: NvU16,
+    arg5: *mut c_void,
+    arg6: NvU32,
+) -> NV_STATUS {
     let _ = arg0;
     let _ = arg1;
     let _ = arg2;
@@ -1182,12 +1291,14 @@ pub extern "C" fn osFlushCpuCache() -> NV_STATUS {
 }
 
 #[no_mangle]
-pub extern "C" fn osFlushCpuWriteCombineBuffer() {
-
-}
+pub extern "C" fn osFlushCpuWriteCombineBuffer() {}
 
 #[no_mangle]
-pub extern "C" fn osFlushGpuCoherentCpuCacheRange(pOsGpuInfo: *mut c_void, cpuVirtual: NvU64, size: NvU64) {
+pub extern "C" fn osFlushGpuCoherentCpuCacheRange(
+    pOsGpuInfo: *mut c_void,
+    cpuVirtual: NvU64,
+    size: NvU64,
+) {
     let _ = pOsGpuInfo;
     let _ = cpuVirtual;
     let _ = size;
@@ -1234,7 +1345,9 @@ pub extern "C" fn osGetCurrentProcess() -> NvU32 {
         use core::sync::atomic::{AtomicBool, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
         if !SEEN.swap(true, Ordering::Relaxed) {
-            log::warn!("[nvidia-rm] first osGetCurrentProcess call (resource-server client alloc reached)");
+            log::warn!(
+                "[nvidia-rm] first osGetCurrentProcess call (resource-server client alloc reached)"
+            );
         }
     }
     0
@@ -1264,7 +1377,12 @@ pub extern "C" fn osGetDynamicPowerSupportMask() -> NvU32 {
 }
 
 #[no_mangle]
-pub extern "C" fn osGetEgmInfo(pGpu: *mut c_void, pPhysAddr: *mut NvU64, pSize: *mut NvU64, pNodeId: *mut NvS32) -> NV_STATUS {
+pub extern "C" fn osGetEgmInfo(
+    pGpu: *mut c_void,
+    pPhysAddr: *mut NvU64,
+    pSize: *mut NvU64,
+    pNodeId: *mut NvS32,
+) -> NV_STATUS {
     let _ = pGpu;
     let _ = pPhysAddr;
     let _ = pSize;
@@ -1273,7 +1391,13 @@ pub extern "C" fn osGetEgmInfo(pGpu: *mut c_void, pPhysAddr: *mut NvU64, pSize: 
 }
 
 #[no_mangle]
-pub extern "C" fn osGetFbNumaInfo(pGpu: *mut c_void, pAddrPhys: *mut NvU64, pSizePhys: *mut NvU64, pAddrRsvdPhys: *mut NvU64, pNodeId: *mut NvS32) -> NV_STATUS {
+pub extern "C" fn osGetFbNumaInfo(
+    pGpu: *mut c_void,
+    pAddrPhys: *mut NvU64,
+    pSizePhys: *mut NvU64,
+    pAddrRsvdPhys: *mut NvU64,
+    pNodeId: *mut NvS32,
+) -> NV_STATUS {
     let _ = pGpu;
     let _ = pAddrPhys;
     let _ = pSizePhys;
@@ -1283,7 +1407,11 @@ pub extern "C" fn osGetFbNumaInfo(pGpu: *mut c_void, pAddrPhys: *mut NvU64, pSiz
 }
 
 #[no_mangle]
-pub extern "C" fn osGetForcedNVLinkConnection(pGpu: *mut c_void, maxLinks: NvU32, pLinkConnection: *mut NvU32) -> NV_STATUS {
+pub extern "C" fn osGetForcedNVLinkConnection(
+    pGpu: *mut c_void,
+    maxLinks: NvU32,
+    pLinkConnection: *mut NvU32,
+) -> NV_STATUS {
     let _ = pGpu;
     let _ = maxLinks;
     let _ = pLinkConnection;
@@ -1301,7 +1429,11 @@ pub extern "C" fn osGetMaxUserVa() -> NvU64 {
 }
 
 #[no_mangle]
-pub extern "C" fn osGetMemoryPages(pMemDesc: *mut c_void, pPages: *mut c_void, pNumPages: *mut NvU32) -> NV_STATUS {
+pub extern "C" fn osGetMemoryPages(
+    pMemDesc: *mut c_void,
+    pPages: *mut c_void,
+    pNumPages: *mut NvU32,
+) -> NV_STATUS {
     let _ = pMemDesc;
     let _ = pPages;
     let _ = pNumPages;
@@ -1316,7 +1448,11 @@ pub extern "C" fn osGetNumMemoryPages(pMemDesc: *mut c_void, pNumPages: *mut NvU
 }
 
 #[no_mangle]
-pub extern "C" fn NVBIT(numaId: *mut c_void, free_memory_bytes: *mut NvU64, total_memory_bytes: *mut NvU64) -> *mut c_void {
+pub extern "C" fn NVBIT(
+    numaId: *mut c_void,
+    free_memory_bytes: *mut NvU64,
+    total_memory_bytes: *mut NvU64,
+) -> *mut c_void {
     let _ = numaId;
     let _ = free_memory_bytes;
     let _ = total_memory_bytes;
@@ -1366,7 +1502,10 @@ pub extern "C" fn osGetPidInfo() -> *mut c_void {
 }
 
 #[no_mangle]
-pub extern "C" fn osGetPlatformNvlinkLinerate(pGpu: *mut c_void, lineRate: *mut NvU32) -> NV_STATUS {
+pub extern "C" fn osGetPlatformNvlinkLinerate(
+    pGpu: *mut c_void,
+    lineRate: *mut NvU32,
+) -> NV_STATUS {
     let _ = pGpu;
     let _ = lineRate;
     NV_ERR_NOT_SUPPORTED
@@ -1388,7 +1527,13 @@ pub extern "C" fn osGetSupportedSysmemPageSizeMask() -> NvU64 {
 }
 
 #[no_mangle]
-pub extern "C" fn osGetSyncpointAperture(pOsGpuInfo: *mut c_void, syncpointId: NvU32, physAddr: *mut NvU64, limit: *mut NvU64, offset: *mut NvU32) -> NV_STATUS {
+pub extern "C" fn osGetSyncpointAperture(
+    pOsGpuInfo: *mut c_void,
+    syncpointId: NvU32,
+    physAddr: *mut NvU64,
+    limit: *mut NvU64,
+    offset: *mut NvU32,
+) -> NV_STATUS {
     let _ = pOsGpuInfo;
     let _ = syncpointId;
     let _ = physAddr;
@@ -1429,7 +1574,9 @@ pub extern "C" fn osGetCurrentTick(pTimeInNs: *mut NvU64) -> NV_STATUS {
     // references this unconditionally (610 did not link it in), which is why
     // it only surfaced at link time on this re-vendor.
     if !pTimeInNs.is_null() {
-        unsafe { *pTimeInNs = with_hooks(0u64, |h| h.monotonic_time_ns()); }
+        unsafe {
+            *pTimeInNs = with_hooks(0u64, |h| h.monotonic_time_ns());
+        }
     }
     NV_OK
 }
@@ -1453,10 +1600,14 @@ pub extern "C" fn osGetCurrentTime(pSeconds: *mut NvU32, pMicroSeconds: *mut NvU
     // deltas (client_resource.c, rpc.c), for which a monotonic base is fine.
     let ns = with_hooks(0u64, |h| h.monotonic_time_ns());
     if !pSeconds.is_null() {
-        unsafe { *pSeconds = (ns / 1_000_000_000) as NvU32; }
+        unsafe {
+            *pSeconds = (ns / 1_000_000_000) as NvU32;
+        }
     }
     if !pMicroSeconds.is_null() {
-        unsafe { *pMicroSeconds = ((ns / 1_000) % 1_000_000) as NvU32; }
+        unsafe {
+            *pMicroSeconds = ((ns / 1_000) % 1_000_000) as NvU32;
+        }
     }
     NV_OK
 }
@@ -1474,7 +1625,10 @@ pub extern "C" fn osGpuIsCxlDevice(pGpu: *mut c_void) -> NvBool {
 }
 
 #[no_mangle]
-pub extern "C" fn DPC_RELEASE_ALL_GPU_LOCKS(pGpu: *mut c_void, dpcGpuLockRelease: NvU32) -> *mut c_void {
+pub extern "C" fn DPC_RELEASE_ALL_GPU_LOCKS(
+    pGpu: *mut c_void,
+    dpcGpuLockRelease: NvU32,
+) -> *mut c_void {
     let _ = pGpu;
     let _ = dpcGpuLockRelease;
     core::ptr::null_mut()
@@ -1625,7 +1779,14 @@ pub extern "C" fn osLockShouldToggleInterrupts(arg0: *mut c_void) -> NvBool {
 // osMapPciMemoryKernel64/Old fix below.
 
 #[no_mangle]
-pub extern "C" fn osMapPciMemoryAreaUser(arg0: *mut c_void, arg1: *mut c_void, arg2: NvU32, arg3: NvU32, arg4: *mut c_void, arg5: *mut c_void) -> *mut c_void {
+pub extern "C" fn osMapPciMemoryAreaUser(
+    arg0: *mut c_void,
+    arg1: *mut c_void,
+    arg2: NvU32,
+    arg3: NvU32,
+    arg4: *mut c_void,
+    arg5: *mut c_void,
+) -> *mut c_void {
     let _ = arg0;
     let _ = arg1;
     let _ = arg2;
@@ -1687,7 +1848,15 @@ pub extern "C" fn osMapPciMemoryKernelOld(
 }
 
 #[no_mangle]
-pub extern "C" fn osMapPciMemoryUser(arg0: *mut c_void, arg1: NvU64, arg2: NvU64, arg3: NvU32, arg4: *mut c_void, arg5: *mut c_void, arg6: NvU32) -> *mut c_void {
+pub extern "C" fn osMapPciMemoryUser(
+    arg0: *mut c_void,
+    arg1: NvU64,
+    arg2: NvU64,
+    arg3: NvU32,
+    arg4: *mut c_void,
+    arg5: *mut c_void,
+    arg6: NvU32,
+) -> *mut c_void {
     let _ = arg0;
     let _ = arg1;
     let _ = arg2;
@@ -1714,7 +1883,11 @@ pub extern "C" fn osMemacctReleaseCharge(pool: *mut c_void, size: NvU64) {
 }
 
 #[no_mangle]
-pub extern "C" fn osMemacctTryCharge(pRegion: *mut c_void, size: NvU64, ppPool: *mut *mut c_void) -> NV_STATUS {
+pub extern "C" fn osMemacctTryCharge(
+    pRegion: *mut c_void,
+    size: NvU64,
+    ppPool: *mut *mut c_void,
+) -> NV_STATUS {
     let _ = pRegion;
     let _ = size;
     let _ = ppPool;
@@ -1728,7 +1901,14 @@ pub extern "C" fn osModifyGpuSwStatePersistence(arg0: *mut c_void, arg1: NvBool)
 }
 
 #[no_mangle]
-pub extern "C" fn osNotifyEvent(arg0: *mut c_void, arg1: *mut c_void, arg2: NvU32, arg3: NvU32, arg4: NV_STATUS, arg5: NvBool) -> *mut c_void {
+pub extern "C" fn osNotifyEvent(
+    arg0: *mut c_void,
+    arg1: *mut c_void,
+    arg2: NvU32,
+    arg3: NvU32,
+    arg4: NV_STATUS,
+    arg5: NvBool,
+) -> *mut c_void {
     let _ = arg0;
     let _ = arg1;
     let _ = arg2;
@@ -1739,7 +1919,12 @@ pub extern "C" fn osNotifyEvent(arg0: *mut c_void, arg1: *mut c_void, arg2: NvU3
 }
 
 #[no_mangle]
-pub extern "C" fn osNumaAddGpuMemory(pOsGpuInfo: *mut c_void, offset: NvU64, size: NvU64, pNumaNodeId: *mut NvU32) -> NV_STATUS {
+pub extern "C" fn osNumaAddGpuMemory(
+    pOsGpuInfo: *mut c_void,
+    offset: NvU64,
+    size: NvU64,
+    pNumaNodeId: *mut NvU32,
+) -> NV_STATUS {
     let _ = pOsGpuInfo;
     let _ = offset;
     let _ = size;
@@ -1760,7 +1945,12 @@ pub extern "C" fn osNumaOnliningEnabled(arg0: *mut c_void) -> NvBool {
 }
 
 #[no_mangle]
-pub extern "C" fn osNumaRemoveGpuMemory(pOsGpuInfo: *mut c_void, offset: NvU64, size: NvU64, numaNodeId: NvU32) {
+pub extern "C" fn osNumaRemoveGpuMemory(
+    pOsGpuInfo: *mut c_void,
+    offset: NvU64,
+    size: NvU64,
+    numaNodeId: NvU32,
+) {
     let _ = pOsGpuInfo;
     let _ = offset;
     let _ = size;
@@ -1768,7 +1958,15 @@ pub extern "C" fn osNumaRemoveGpuMemory(pOsGpuInfo: *mut c_void, offset: NvU64, 
 }
 
 #[no_mangle]
-pub extern "C" fn osObjectEventNotification(arg0: *mut c_void, arg1: *mut c_void, arg2: NvU32, arg3: *mut c_void, arg4: NvU32, arg5: *mut c_void, arg6: NvU32) -> NV_STATUS {
+pub extern "C" fn osObjectEventNotification(
+    arg0: *mut c_void,
+    arg1: *mut c_void,
+    arg2: NvU32,
+    arg3: *mut c_void,
+    arg4: NvU32,
+    arg5: *mut c_void,
+    arg6: NvU32,
+) -> NV_STATUS {
     let _ = arg0;
     let _ = arg1;
     let _ = arg2;
@@ -1797,7 +1995,14 @@ pub extern "C" fn osOpenTemporaryFile(ppFile: *mut *mut c_void) -> NV_STATUS {
 // Rust NV_ERR_NOT_SUPPORTED stub aborted kgspInitRm at kernel_gsp.c:3376.
 
 #[no_mangle]
-pub extern "C" fn osPciInitHandle(domain: NvU32, bus: NvU8, slot: NvU8, function: NvU8, pVendor: *mut NvU16, pDevice: *mut NvU16) -> *mut c_void {
+pub extern "C" fn osPciInitHandle(
+    domain: NvU32,
+    bus: NvU8,
+    slot: NvU8,
+    function: NvU8,
+    pVendor: *mut NvU16,
+    pDevice: *mut NvU16,
+) -> *mut c_void {
     crate::os_interface::os_pci_init_handle(domain, bus, slot, function, pVendor, pDevice)
 }
 
@@ -1838,7 +2043,12 @@ pub extern "C" fn osQueueSystemWorkItem(arg0: *mut c_void, arg1: *mut c_void) ->
 // and callers (mem_mapper.c, gpuRefreshRecoveryAction, vgpu_events.c) treat a
 // failed queue as "not available" rather than fatal.
 #[no_mangle]
-pub extern "C" fn osQueueWorkItemWithFlags(pGpu: *mut c_void, pFunction: *mut c_void, pParams: *mut c_void, flags: NvU32) -> NV_STATUS {
+pub extern "C" fn osQueueWorkItemWithFlags(
+    pGpu: *mut c_void,
+    pFunction: *mut c_void,
+    pParams: *mut c_void,
+    flags: NvU32,
+) -> NV_STATUS {
     let _ = pGpu;
     let _ = pFunction;
     let _ = pParams;
@@ -1847,7 +2057,12 @@ pub extern "C" fn osQueueWorkItemWithFlags(pGpu: *mut c_void, pFunction: *mut c_
 }
 
 #[no_mangle]
-pub extern "C" fn osReadFromFile(pFile: *mut c_void, buffer: *mut NvU8, size: NvU64, offset: NvU64) -> NV_STATUS {
+pub extern "C" fn osReadFromFile(
+    pFile: *mut c_void,
+    buffer: *mut NvU8,
+    size: NvU64,
+    offset: NvU64,
+) -> NV_STATUS {
     let _ = pFile;
     let _ = buffer;
     let _ = size;
@@ -1856,7 +2071,12 @@ pub extern "C" fn osReadFromFile(pFile: *mut c_void, buffer: *mut NvU8, size: Nv
 }
 
 #[no_mangle]
-pub extern "C" fn osReadRegistryBinary(arg0: *mut c_void, arg1: *mut c_char, arg2: *mut NvU8, arg3: *mut NvU32) -> NV_STATUS {
+pub extern "C" fn osReadRegistryBinary(
+    arg0: *mut c_void,
+    arg1: *mut c_char,
+    arg2: *mut NvU8,
+    arg3: *mut NvU32,
+) -> NV_STATUS {
     let _ = arg0;
     let _ = arg1;
     let _ = arg2;
@@ -1865,7 +2085,11 @@ pub extern "C" fn osReadRegistryBinary(arg0: *mut c_void, arg1: *mut c_char, arg
 }
 
 #[no_mangle]
-pub extern "C" fn osReadRegistryDwordBase(arg0: *mut c_void, arg1: *mut c_char, arg2: *mut NvU32) -> NV_STATUS {
+pub extern "C" fn osReadRegistryDwordBase(
+    arg0: *mut c_void,
+    arg1: *mut c_char,
+    arg2: *mut NvU32,
+) -> NV_STATUS {
     let _ = arg0;
     let _ = arg1;
     let _ = arg2;
@@ -1873,7 +2097,12 @@ pub extern "C" fn osReadRegistryDwordBase(arg0: *mut c_void, arg1: *mut c_char, 
 }
 
 #[no_mangle]
-pub extern "C" fn osReadRegistryStringBase(arg0: *mut c_void, arg1: *mut c_char, arg2: *mut NvU8, arg3: *mut NvU32) -> NV_STATUS {
+pub extern "C" fn osReadRegistryStringBase(
+    arg0: *mut c_void,
+    arg1: *mut c_char,
+    arg2: *mut NvU8,
+    arg3: *mut NvU32,
+) -> NV_STATUS {
     let _ = arg0;
     let _ = arg1;
     let _ = arg2;
@@ -1882,7 +2111,12 @@ pub extern "C" fn osReadRegistryStringBase(arg0: *mut c_void, arg1: *mut c_char,
 }
 
 #[no_mangle]
-pub extern "C" fn osReadRegistryVolatile(arg0: *mut c_void, arg1: *mut c_char, arg2: *mut NvU8, arg3: NvU32) -> NV_STATUS {
+pub extern "C" fn osReadRegistryVolatile(
+    arg0: *mut c_void,
+    arg1: *mut c_char,
+    arg2: *mut NvU8,
+    arg3: NvU32,
+) -> NV_STATUS {
     let _ = arg0;
     let _ = arg1;
     let _ = arg2;
@@ -1891,7 +2125,11 @@ pub extern "C" fn osReadRegistryVolatile(arg0: *mut c_void, arg1: *mut c_char, a
 }
 
 #[no_mangle]
-pub extern "C" fn osReadRegistryVolatileSize(arg0: *mut c_void, arg1: *mut c_char, arg2: *mut NvU32) -> NV_STATUS {
+pub extern "C" fn osReadRegistryVolatileSize(
+    arg0: *mut c_void,
+    arg1: *mut c_char,
+    arg2: *mut NvU32,
+) -> NV_STATUS {
     let _ = arg0;
     let _ = arg1;
     let _ = arg2;
@@ -1929,7 +2167,12 @@ pub extern "C" fn osRemoveGpuSupported() -> NvBool {
 }
 
 #[no_mangle]
-pub extern "C" fn osRmCapAcquire(pOsRmCaps: *mut c_void, rmCap: NvU32, capDescriptor: NvU64, dupedCapDescriptor: *mut NvU64) -> NV_STATUS {
+pub extern "C" fn osRmCapAcquire(
+    pOsRmCaps: *mut c_void,
+    rmCap: NvU32,
+    capDescriptor: NvU64,
+    dupedCapDescriptor: *mut NvU64,
+) -> NV_STATUS {
     let _ = pOsRmCaps;
     let _ = rmCap;
     let _ = capDescriptor;
@@ -1943,7 +2186,10 @@ pub extern "C" fn osRmCapInitDescriptor(pCapDescriptor: *mut NvU64) {
 }
 
 #[no_mangle]
-pub extern "C" fn osRmCapRegisterGpu(pOsGpuInfo: *mut c_void, ppOsRmCaps: *mut *mut c_void) -> NV_STATUS {
+pub extern "C" fn osRmCapRegisterGpu(
+    pOsGpuInfo: *mut c_void,
+    ppOsRmCaps: *mut *mut c_void,
+) -> NV_STATUS {
     // Real osRmCapRegisterGpu (os.c:4834) opens with
     // "Return success on the unsupported platforms. if (nvidia_caps_root
     // == NULL) return NV_OK;" -- i.e. when there's no capability
@@ -1957,7 +2203,11 @@ pub extern "C" fn osRmCapRegisterGpu(pOsGpuInfo: *mut c_void, ppOsRmCaps: *mut *
 }
 
 #[no_mangle]
-pub extern "C" fn osRmCapRegisterSmcExecutionPartition(pPartitionOsRmCaps: *mut c_void, ppExecPartitionOsRmCaps: *mut *mut c_void, execPartitionId: NvU32) -> NV_STATUS {
+pub extern "C" fn osRmCapRegisterSmcExecutionPartition(
+    pPartitionOsRmCaps: *mut c_void,
+    ppExecPartitionOsRmCaps: *mut *mut c_void,
+    execPartitionId: NvU32,
+) -> NV_STATUS {
     let _ = pPartitionOsRmCaps;
     let _ = ppExecPartitionOsRmCaps;
     let _ = execPartitionId;
@@ -1965,7 +2215,11 @@ pub extern "C" fn osRmCapRegisterSmcExecutionPartition(pPartitionOsRmCaps: *mut 
 }
 
 #[no_mangle]
-pub extern "C" fn osRmCapRegisterSmcPartition(pGpuOsRmCaps: *mut c_void, ppPartitionOsRmCaps: *mut *mut c_void, partitionId: NvU32) -> NV_STATUS {
+pub extern "C" fn osRmCapRegisterSmcPartition(
+    pGpuOsRmCaps: *mut c_void,
+    ppPartitionOsRmCaps: *mut *mut c_void,
+    partitionId: NvU32,
+) -> NV_STATUS {
     let _ = pGpuOsRmCaps;
     let _ = ppPartitionOsRmCaps;
     let _ = partitionId;
@@ -2018,13 +2272,20 @@ pub extern "C" fn osSpinLoop() {
     // FW RM ready.", too soon for a 2M-iteration first beat to prove whether
     // a wait loop was even running.
     if n == 200_000 || (n % 2_000_000 == 0 && n <= 80_000_000) {
-        log::warn!("[nvidia-rm] osSpinLoop heartbeat: {}k iterations", n / 1_000);
+        log::warn!(
+            "[nvidia-rm] osSpinLoop heartbeat: {}k iterations",
+            n / 1_000
+        );
     }
     core::hint::spin_loop();
 }
 
 #[no_mangle]
-pub extern "C" fn osStartNanoTimer(pArg1: *mut c_void, pTimer: *mut c_void, timeNs: NvU64) -> NV_STATUS {
+pub extern "C" fn osStartNanoTimer(
+    pArg1: *mut c_void,
+    pTimer: *mut c_void,
+    timeNs: NvU64,
+) -> NV_STATUS {
     let _ = pArg1;
     let _ = pTimer;
     let _ = timeNs;
@@ -2037,12 +2298,14 @@ pub extern "C" fn osSyncWithGpuDestroy(arg0: NvBool) {
 }
 
 #[no_mangle]
-pub extern "C" fn osSyncWithRmDestroy() {
-
-}
+pub extern "C" fn osSyncWithRmDestroy() {}
 
 #[no_mangle]
-pub extern "C" fn osTegraAllocateDisplayBandwidth(pOsGpuInfo: *mut c_void, averageBandwidthKBPS: NvU32, floorBandwidthKBPS: NvU32) -> NV_STATUS {
+pub extern "C" fn osTegraAllocateDisplayBandwidth(
+    pOsGpuInfo: *mut c_void,
+    averageBandwidthKBPS: NvU32,
+    floorBandwidthKBPS: NvU32,
+) -> NV_STATUS {
     let _ = pOsGpuInfo;
     let _ = averageBandwidthKBPS;
     let _ = floorBandwidthKBPS;
@@ -2050,7 +2313,11 @@ pub extern "C" fn osTegraAllocateDisplayBandwidth(pOsGpuInfo: *mut c_void, avera
 }
 
 #[no_mangle]
-pub extern "C" fn osTegraDceClientIpcSendRecv(clientId: NvU32, msg: *mut c_void, msgLength: NvU32) -> NV_STATUS {
+pub extern "C" fn osTegraDceClientIpcSendRecv(
+    clientId: NvU32,
+    msg: *mut c_void,
+    msgLength: NvU32,
+) -> NV_STATUS {
     let _ = clientId;
     let _ = msg;
     let _ = msgLength;
@@ -2058,7 +2325,11 @@ pub extern "C" fn osTegraDceClientIpcSendRecv(clientId: NvU32, msg: *mut c_void,
 }
 
 #[no_mangle]
-pub extern "C" fn osTegraDceRegisterIpcClient(interfaceType: NvU32, usrCtx: *mut c_void, clientId: *mut NvU32) -> NV_STATUS {
+pub extern "C" fn osTegraDceRegisterIpcClient(
+    interfaceType: NvU32,
+    usrCtx: *mut c_void,
+    clientId: *mut NvU32,
+) -> NV_STATUS {
     let _ = interfaceType;
     let _ = usrCtx;
     let _ = clientId;
@@ -2072,7 +2343,12 @@ pub extern "C" fn osTegraDceUnregisterIpcClient(clientId: NvU32) -> NV_STATUS {
 }
 
 #[no_mangle]
-pub extern "C" fn osTegraSocGetDispClockRates(pOsGpuInfo: *mut c_void, pMaxDispClkRateDisppll: *mut NvU32, pMaxDispClkRateSppllClkouta: *mut NvU32, pMaxHubClkRateSppllClkoutb: *mut NvU32) -> NV_STATUS {
+pub extern "C" fn osTegraSocGetDispClockRates(
+    pOsGpuInfo: *mut c_void,
+    pMaxDispClkRateDisppll: *mut NvU32,
+    pMaxDispClkRateSppllClkouta: *mut NvU32,
+    pMaxHubClkRateSppllClkoutb: *mut NvU32,
+) -> NV_STATUS {
     let _ = pOsGpuInfo;
     let _ = pMaxDispClkRateDisppll;
     let _ = pMaxDispClkRateSppllClkouta;
@@ -2081,14 +2357,21 @@ pub extern "C" fn osTegraSocGetDispClockRates(pOsGpuInfo: *mut c_void, pMaxDispC
 }
 
 #[no_mangle]
-pub extern "C" fn osTegraSocGetImpImportData(pGpu: *mut c_void, pTegraImpImportData: *mut c_void) -> NV_STATUS {
+pub extern "C" fn osTegraSocGetImpImportData(
+    pGpu: *mut c_void,
+    pTegraImpImportData: *mut c_void,
+) -> NV_STATUS {
     let _ = pGpu;
     let _ = pTegraImpImportData;
     NV_ERR_NOT_SUPPORTED
 }
 
 #[no_mangle]
-pub extern "C" fn osTegraSocGetImpUefiData(pOsGpuInfo: *mut c_void, pIsoBwKbps: *mut NvU32, pFloorBwKbps: *mut NvU32) -> NV_STATUS {
+pub extern "C" fn osTegraSocGetImpUefiData(
+    pOsGpuInfo: *mut c_void,
+    pIsoBwKbps: *mut NvU32,
+    pFloorBwKbps: *mut NvU32,
+) -> NV_STATUS {
     let _ = pOsGpuInfo;
     let _ = pIsoBwKbps;
     let _ = pFloorBwKbps;
@@ -2096,7 +2379,11 @@ pub extern "C" fn osTegraSocGetImpUefiData(pOsGpuInfo: *mut c_void, pIsoBwKbps: 
 }
 
 #[no_mangle]
-pub extern "C" fn osTegraiGpuPerfBoost(pGpu: *mut c_void, enable: NvBool, duration: NvU32) -> NV_STATUS {
+pub extern "C" fn osTegraiGpuPerfBoost(
+    pGpu: *mut c_void,
+    enable: NvBool,
+    duration: NvU32,
+) -> NV_STATUS {
     let _ = pGpu;
     let _ = enable;
     let _ = duration;
@@ -2144,7 +2431,12 @@ pub extern "C" fn osUnmapPciMemoryKernelOld(arg0: *mut c_void, arg1: *mut c_void
 }
 
 #[no_mangle]
-pub extern "C" fn osUnmapPciMemoryUser(arg0: *mut c_void, arg1: *mut c_void, arg2: NvU64, arg3: *mut c_void) {
+pub extern "C" fn osUnmapPciMemoryUser(
+    arg0: *mut c_void,
+    arg1: *mut c_void,
+    arg2: NvU64,
+    arg3: *mut c_void,
+) {
     let _ = arg0;
     let _ = arg1;
     let _ = arg2;
@@ -2159,7 +2451,11 @@ pub extern "C" fn osUnrefGpuAccessNeeded(pOsGpuInfo: *mut c_void) {
 }
 
 #[no_mangle]
-pub extern "C" fn osUserHandleToKernelPtr(hClient: NvU32, Handle: *mut c_void, pHandle: *mut c_void) -> NV_STATUS {
+pub extern "C" fn osUserHandleToKernelPtr(
+    hClient: NvU32,
+    Handle: *mut c_void,
+    pHandle: *mut c_void,
+) -> NV_STATUS {
     let _ = hClient;
     let _ = Handle;
     let _ = pHandle;
@@ -2190,7 +2486,11 @@ pub extern "C" fn osWakeUp(pWq: *mut c_void) {
 }
 
 #[no_mangle]
-pub extern "C" fn osWriteRegistryDword(arg0: *mut c_void, arg1: *mut c_char, arg2: NvU32) -> NV_STATUS {
+pub extern "C" fn osWriteRegistryDword(
+    arg0: *mut c_void,
+    arg1: *mut c_char,
+    arg2: NvU32,
+) -> NV_STATUS {
     let _ = arg0;
     let _ = arg1;
     let _ = arg2;
@@ -2198,7 +2498,12 @@ pub extern "C" fn osWriteRegistryDword(arg0: *mut c_void, arg1: *mut c_char, arg
 }
 
 #[no_mangle]
-pub extern "C" fn osWriteRegistryVolatile(arg0: *mut c_void, arg1: *mut c_char, arg2: *mut NvU8, arg3: NvU32) -> NV_STATUS {
+pub extern "C" fn osWriteRegistryVolatile(
+    arg0: *mut c_void,
+    arg1: *mut c_char,
+    arg2: *mut NvU8,
+    arg3: NvU32,
+) -> NV_STATUS {
     let _ = arg0;
     let _ = arg1;
     let _ = arg2;
@@ -2207,7 +2512,12 @@ pub extern "C" fn osWriteRegistryVolatile(arg0: *mut c_void, arg1: *mut c_char, 
 }
 
 #[no_mangle]
-pub extern "C" fn osWriteToFile(pFile: *mut c_void, buffer: *mut NvU8, size: NvU64, offset: NvU64) -> NV_STATUS {
+pub extern "C" fn osWriteToFile(
+    pFile: *mut c_void,
+    buffer: *mut NvU8,
+    size: NvU64,
+    offset: NvU64,
+) -> NV_STATUS {
     let _ = pFile;
     let _ = buffer;
     let _ = size;
@@ -2234,21 +2544,32 @@ pub extern "C" fn osPciReadWord(pHandle: *mut c_void, offset: NvU32) -> NvU16 {
 
 #[no_mangle]
 pub extern "C" fn osPciReadDword(pHandle: *mut c_void, offset: NvU32) -> NvU32 {
-    with_hooks(0xFFFF_FFFF, |h| h.pci_config_read(pHandle as usize, offset, 4))
+    with_hooks(0xFFFF_FFFF, |h| {
+        h.pci_config_read(pHandle as usize, offset, 4)
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn osPciWriteWord(pHandle: *mut c_void, offset: NvU32, value: NvU16) {
-    with_hooks((), |h| h.pci_config_write(pHandle as usize, offset, 2, value as u32));
+    with_hooks((), |h| {
+        h.pci_config_write(pHandle as usize, offset, 2, value as u32)
+    });
 }
 
 #[no_mangle]
 pub extern "C" fn osPciWriteDword(pHandle: *mut c_void, offset: NvU32, value: NvU32) {
-    with_hooks((), |h| h.pci_config_write(pHandle as usize, offset, 4, value));
+    with_hooks((), |h| {
+        h.pci_config_write(pHandle as usize, offset, 4, value)
+    });
 }
 
 #[no_mangle]
-pub extern "C" fn osMapKernelSpace(start: NvU64, size: NvU64, _mode: NvU32, _protect: NvU32) -> *mut c_void {
+pub extern "C" fn osMapKernelSpace(
+    start: NvU64,
+    size: NvU64,
+    _mode: NvU32,
+    _protect: NvU32,
+) -> *mut c_void {
     crate::os_interface::os_map_kernel_space(start, size, _mode)
 }
 
@@ -2283,11 +2604,20 @@ pub extern "C" fn osInitObjOS(pOS: *mut c_void) {
 
 #[no_mangle]
 pub extern "C" fn osNv_rdcr4() -> NvU32 {
-    let value: u64;
-    unsafe {
-        core::arch::asm!("mov {}, cr4", out(reg) value);
+    // x86_64: read the CR4 control register directly.
+    // On non-x86_64 architectures there is no CR4 equivalent; return 0
+    // so RM's CPU feature detection sees a clear register (no unexpected
+    // bits set) rather than an undefined value.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let value: u64;
+        unsafe {
+            core::arch::asm!("mov {}, cr4", out(reg) value);
+        }
+        value as NvU32
     }
-    value as NvU32
+    #[cfg(not(target_arch = "x86_64"))]
+    0
 }
 
 #[no_mangle]
@@ -2311,37 +2641,71 @@ pub extern "C" fn osNv_cpuid(
             log::warn!("[nvidia-rm] first osNv_cpuid call (RmInitCpuInfo reached)");
         }
     }
-    let mut a: u32 = leaf as u32;
-    let b: u32;
-    let mut c: u32 = subleaf as u32;
-    let d: u32;
-    unsafe {
-        // CRITICAL: save/restore rbx via the STACK, and never name ebx as
-        // an operand. The previous version used a scratch-reg save/restore
-        // ("mov tmp,ebx; cpuid; xchg tmp,ebx"), which corrupted a caller
-        // pointer -- reproduced on the host as an immediate segfault, and
-        // on real hardware as the [KERNEL PAGE FAULT] WRITE to a
-        // 32-bit-truncated stack address (0x311eed4) during RmInitCpuInfo's
-        // very first osNv_cpuid call. cpuid clobbers all of eax/ebx/ecx/edx
-        // at once; leaving rbx for LLVM to juggle across it is fragile.
-        // push/pop rbx keeps rbx fully out of the register allocator's way.
-        core::arch::asm!(
-            "push rbx",
-            "cpuid",
-            "mov {ebx_out:e}, ebx",
-            "pop rbx",
-            ebx_out = lateout(reg) b,
-            inout("eax") a,
-            inout("ecx") c,
-            lateout("edx") d,
-            options(preserves_flags),
-        );
-        if !peax.is_null() { *peax = a; }
-        if !pebx.is_null() { *pebx = b; }
-        if !pecx.is_null() { *pecx = c; }
-        if !pedx.is_null() { *pedx = d; }
+    // x86_64: execute the CPUID instruction.
+    // CRITICAL: save/restore rbx via the STACK, and never name ebx as
+    // an operand. The previous version used a scratch-reg save/restore
+    // ("mov tmp,ebx; cpuid; xchg tmp,ebx"), which corrupted a caller
+    // pointer -- reproduced on the host as an immediate segfault, and
+    // on real hardware as the [KERNEL PAGE FAULT] WRITE to a
+    // 32-bit-truncated stack address (0x311eed4) during RmInitCpuInfo's
+    // very first osNv_cpuid call. cpuid clobbers all of eax/ebx/ecx/edx
+    // at once; leaving rbx for LLVM to juggle across it is fragile.
+    // push/pop rbx keeps rbx fully out of the register allocator's way.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut a: u32 = leaf as u32;
+        let b: u32;
+        let mut c: u32 = subleaf as u32;
+        let d: u32;
+        unsafe {
+            core::arch::asm!(
+                "push rbx",
+                "cpuid",
+                "mov {ebx_out:e}, ebx",
+                "pop rbx",
+                ebx_out = lateout(reg) b,
+                inout("eax") a,
+                inout("ecx") c,
+                lateout("edx") d,
+                options(preserves_flags),
+            );
+            if !peax.is_null() {
+                *peax = a;
+            }
+            if !pebx.is_null() {
+                *pebx = b;
+            }
+            if !pecx.is_null() {
+                *pecx = c;
+            }
+            if !pedx.is_null() {
+                *pedx = d;
+            }
+        }
+        1
     }
-    1
+    // On non-x86_64 architectures CPUID does not exist; zero all outputs
+    // and return 0 (unsupported) so RM's CPU-info initialisation sees
+    // an empty feature set rather than undefined values.
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (leaf, subleaf);
+        unsafe {
+            if !peax.is_null() {
+                *peax = 0;
+            }
+            if !pebx.is_null() {
+                *pebx = 0;
+            }
+            if !pecx.is_null() {
+                *pecx = 0;
+            }
+            if !pedx.is_null() {
+                *pedx = 0;
+            }
+        }
+        0
+    }
 }
 
 #[no_mangle]
@@ -2365,7 +2729,10 @@ pub extern "C" fn osGetNumaMemoryUsage(
 }
 
 #[no_mangle]
-pub extern "C" fn osGpuLocksQueueRelease(pGpu: *mut c_void, dpc_gpu_lock_release: NvU32) -> NV_STATUS {
+pub extern "C" fn osGpuLocksQueueRelease(
+    pGpu: *mut c_void,
+    dpc_gpu_lock_release: NvU32,
+) -> NV_STATUS {
     // Real Linux implementation defers lock release to a deferred
     // procedure call (DPC) queue for interrupt-context safety; Eclipse's
     // lock implementation doesn't need that indirection, so this is a

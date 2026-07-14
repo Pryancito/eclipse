@@ -44,10 +44,7 @@ static SCHED_WEAK_YIELD: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 /// `(tasks polled, weak-executor yields)` since boot.
 pub fn sched_stats() -> (u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
-    (
-        SCHED_POLLED.load(Relaxed),
-        SCHED_WEAK_YIELD.load(Relaxed),
-    )
+    (SCHED_POLLED.load(Relaxed), SCHED_WEAK_YIELD.load(Relaxed))
 }
 
 const STACK_SIZE: usize = 4096 * 32;

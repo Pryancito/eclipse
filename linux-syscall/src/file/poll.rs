@@ -41,8 +41,8 @@ const SLOW_IO_WAIT_TICK: Duration = Duration::from_millis(100);
 /// watch for (a socket, or an interactive fd on the *active* VT), else the slow
 /// tick so background-VT shells don't busy-poll.
 fn io_wait_interval(s: &Syscall, watch_net: bool, watch_interactive: bool) -> Duration {
-    let active_interactive = watch_interactive
-        && s.linux_process().vt() == kernel_hal::console::active_vt();
+    let active_interactive =
+        watch_interactive && s.linux_process().vt() == kernel_hal::console::active_vt();
     if watch_net || active_interactive {
         IO_WAIT_TICK
     } else {
