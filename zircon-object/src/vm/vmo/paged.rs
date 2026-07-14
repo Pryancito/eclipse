@@ -208,6 +208,53 @@ impl VMObjectPaged {
         )
     }
 
+    /// Independent copy for Linux `fork`: committed pages are copied eagerly,
+    /// but pages never touched by the parent stay uncommitted in the child and
+    /// keep resolving lazily — from the same backing source (file mapping) when
+    /// there is one, or as demand-zero otherwise. This is what makes forking a
+    /// process with hundreds of MiB of demand-paged libraries cheap: only the
+    /// resident pages are copied, instead of faulting the whole file in from
+    /// disk just to duplicate it.
+    ///
+    /// Only the plain origin-node case is supported; anything with a parent,
+    /// pinned/contiguous frames or a special cache policy must use the caller's
+    /// eager fallback.
+    fn fork_copy(&self) -> ZxResult<Arc<Self>> {
+        let (inner, _guard) = self.get_inner();
+        if !matches!(inner.type_, VMOType::Origin)
+            || inner.parent.is_some()
+            || inner.contiguous
+            || inner.pin_count != 0
+            || inner.cache_policy != CachePolicy::Cached
+        {
+            return Err(ZxError::NOT_SUPPORTED);
+        }
+        let mut frames = BTreeMap::new();
+        for (&idx, state) in inner.frames.iter() {
+            let frame = PhysFrame::new().ok_or(ZxError::NO_MEMORY)?;
+            kernel_hal::mem::pmem_copy(frame.paddr(), state.frame.paddr(), PAGE_SIZE);
+            frames.insert(idx, PageState::new(frame));
+        }
+        Ok(VMObjectPaged::wrap(
+            VMObjectPagedInner {
+                owner: new_owner_id(),
+                type_: VMOType::Origin,
+                parent: None,
+                parent_offset: 0,
+                parent_limit: 0,
+                size: inner.size,
+                frames,
+                mappings: Vec::new(),
+                cache_policy: CachePolicy::Cached,
+                contiguous: false,
+                self_ref: Default::default(),
+                pin_count: 0,
+                source: inner.source.clone(),
+            },
+            None,
+        ))
+    }
+
     /// Create a new VMO backing on contiguous pages.
     pub fn new_contiguous(pages: usize, align_log2: usize) -> ZxResult<Arc<Self>> {
         let vmo = Self::new(pages);
@@ -482,6 +529,14 @@ impl VMObjectTrait for VMObjectPaged {
 
     fn is_paged(&self) -> bool {
         true
+    }
+
+    fn is_demand_paged(&self) -> bool {
+        self.get_inner().0.source.is_some()
+    }
+
+    fn fork_copy(&self) -> ZxResult<Arc<dyn VMObjectTrait>> {
+        VMObjectPaged::fork_copy(self).map(|v| v as Arc<dyn VMObjectTrait>)
     }
 
     fn as_mut_buf(&self) -> ZxResult<(MutexGuard<'_, ()>, &mut [u8])> {
@@ -1200,6 +1255,34 @@ mod tests {
         child_vmo.test_write(0, 2);
         assert_eq!(vmo.test_read(0), 1);
         assert_eq!(child_vmo.test_read(0), 2);
+    }
+
+    #[test]
+    fn fork_copy_lazy() {
+        struct Filler;
+        impl FrameFiller for Filler {
+            fn source_len(&self) -> usize {
+                2 * PAGE_SIZE
+            }
+            fn fill_page(&self, offset: usize, buf: &mut [u8]) {
+                buf.fill(if offset == 0 { 0xaa } else { 0xbb });
+            }
+        }
+        let vmo = VmObject::new_paged_with_source(2, Arc::new(Filler));
+        // Touch (and modify) only page 0; page 1 stays uncommitted.
+        vmo.commit_page(0, MMUFlags::WRITE).unwrap();
+        vmo.test_write(0, 1);
+
+        let child = vmo.fork_copy().unwrap();
+        // The committed page was copied with the parent's modification…
+        assert_eq!(child.test_read(0), 1);
+        // …and further parent writes don't leak into the child (independent frame).
+        vmo.test_write(0, 7);
+        assert_eq!(child.test_read(0), 1);
+        // The untouched page still demand-fills from the shared source.
+        let mut buf = [0u8; 1];
+        child.read(PAGE_SIZE, &mut buf).unwrap();
+        assert_eq!(buf[0], 0xbb);
     }
 
     #[test]
