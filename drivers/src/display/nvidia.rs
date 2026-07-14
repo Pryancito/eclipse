@@ -2238,6 +2238,49 @@ impl NvidiaGpu {
     fn rm_connector_id(instance: u32, bit: u32) -> u32 {
         1001 + 100 * instance + bit
     }
+
+    /// RM connector type (NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_*) for a
+    /// single-bit displayId, from the cached GET_CONNECTOR_DATA sweep.
+    fn rm_conn_type(d: &nvidia_rm_sys::rm_init::GrEdid, did: u32) -> Option<u32> {
+        let n = (d.conn_type_count as usize).min(d.conn_type_display_id.len());
+        (0..n)
+            .find(|&i| d.conn_type_display_id[i] == did)
+            .map(|i| d.conn_type[i])
+    }
+}
+
+/// NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_* -> DRM_MODE_CONNECTOR_*.
+fn nv_conn_type_to_drm(t: u32) -> u32 {
+    match t {
+        0x00 => 1,                               // VGA_15_PIN
+        0x30 | 0x38 | 0x39 => 2,                 // DVI_I / LFH_DVI_I_{1,2}
+        0x31 => 3,                               // DVI_D
+        0x46 | 0x47 | 0x49 | 0x64 | 0x65 => 10,  // DP ext/int/serializer, LFH_DP
+        0x48 => 10,                              // DP_MINI_EXT
+        0x61 | 0x63 => 11,                       // HDMI_A / HDMI_C_MINI
+        0x70 => 15,                              // VIRTUAL_WFD
+        0x71 | 0x74 => 10,                       // USB_C (DP alt mode)
+        0x72 => 16,                              // DSI
+        _ => 0,                                  // Unknown
+    }
+}
+
+/// Short human name for the /proc/gpuedid dump.
+fn nv_conn_type_name(t: u32) -> &'static str {
+    match t {
+        0x00 => "VGA",
+        0x30 | 0x38 | 0x39 => "DVI-I",
+        0x31 => "DVI-D",
+        0x46 | 0x47 | 0x49 | 0x64 | 0x65 => "DP",
+        0x48 => "miniDP",
+        0x61 => "HDMI",
+        0x63 => "miniHDMI",
+        0x70 => "virtual",
+        0x71 | 0x74 => "USB-C",
+        0x72 => "DSI",
+        0xFFFF_FFFF => "?",
+        _ => "other",
+    }
 }
 
 #[allow(dead_code)] // used when deferred BAR0 MMIO probe is enabled
@@ -3988,6 +4031,20 @@ impl DrmScheme for NvidiaGpu {
                     }
                     let _ = writeln!(s, " (*=connected)");
                 }
+                if c.conn_type_count > 0 {
+                    let _ = write!(s, "[gpuedid] connector types:");
+                    let n = (c.conn_type_count as usize).min(c.conn_type_display_id.len());
+                    for i in 0..n {
+                        let bit = c.conn_type_display_id[i].trailing_zeros();
+                        let _ = write!(
+                            s,
+                            " {}={}",
+                            Self::rm_connector_id(device_instance, bit),
+                            nv_conn_type_name(c.conn_type[i])
+                        );
+                    }
+                    let _ = writeln!(s);
+                }
                 if c.connected_mask == 0 && c.connect_status == 0 {
                     let _ = writeln!(s, "[gpuedid] no monitor connected to this GPU's outputs (expected on the headless compute GPU)");
                 } else if c.edid_status != 0xFFFF_FFFF {
@@ -5594,6 +5651,9 @@ impl DrmScheme for NvidiaGpu {
                 connected,
                 mm_width,
                 mm_height,
+                connector_type: Self::rm_conn_type(&d, did)
+                    .map(nv_conn_type_to_drm)
+                    .unwrap_or(0),
             });
         }
         if id == 1001 {
@@ -5602,6 +5662,7 @@ impl DrmScheme for NvidiaGpu {
                 connected: true,
                 mm_width: 0,
                 mm_height: 0,
+                connector_type: 11,
             })
         } else {
             None

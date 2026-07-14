@@ -898,7 +898,10 @@ impl INode for DrmDev {
                     conn_res.connection = if conn.connected { 1 } else { 2 };
                     conn_res.mm_width = conn.mm_width;
                     conn_res.mm_height = conn.mm_height;
-                    conn_res.connector_type = 11; // DRM_MODE_CONNECTOR_VIRTUAL
+                    // Real DRM_MODE_CONNECTOR_* from the driver (NVIDIA fills
+                    // it from the RM's GET_CONNECTOR_DATA); synthetic and
+                    // fallback connectors keep the historical 11.
+                    conn_res.connector_type = conn.connector_type;
                     conn_res.connector_type_id = 1;
                     conn_res.encoder_id = drm::SYNTH_ENCODER_ID;
                     conn_res.subpixel = 0; // SubPixelUnknown
