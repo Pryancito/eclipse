@@ -3651,8 +3651,9 @@ impl DrmScheme for NvidiaGpu {
         let mut s = String::new();
         let device_instance = *self.rm_device_instance.lock();
         let Some(device_instance) = device_instance else {
-            return String::from("[gpuedid] skipped (run /proc/gpuinit first)\n");
+            return alloc::format!("[gpuedid] === {} === skipped (run /proc/gpuinit first)\n", self.name);
         };
+        let _ = writeln!(s, "[gpuedid] === {} (rm instance {}) ===", self.name, device_instance);
         nvidia_rm_sys::os_interface::capture_begin();
         let result = nvidia_rm_sys::rm_init::edid(device_instance);
         let captured = nvidia_rm_sys::os_interface::capture_take();
@@ -3671,7 +3672,13 @@ impl DrmScheme for NvidiaGpu {
         match result {
             Ok(c) => {
                 let _ = writeln!(s, "[gpuedid] --- real display query (RM internal NV04_DISPLAY_COMMON) ---");
-                let _ = writeln!(s, "[gpuedid] DispCommon handle:         {}", phase(c.alloc_status));
+                // 0x56 NV_ERR_NOT_SUPPORTED here is the intentional "no
+                // display engine on this GPU" early-out, not a failure.
+                if c.alloc_status == 0x56 {
+                    let _ = writeln!(s, "[gpuedid] DispCommon handle:         none -- no display engine (headless GPU)");
+                } else {
+                    let _ = writeln!(s, "[gpuedid] DispCommon handle:         {}", phase(c.alloc_status));
+                }
                 let _ = writeln!(s, "[gpuedid] GET_SUPPORTED:            {} (outputs={:#x}, DDC-capable={:#x})", phase(c.supported_status), c.display_mask, c.display_mask_ddc);
                 let _ = writeln!(s, "[gpuedid] GET_CONNECT_STATE:        {} (connected={:#x})", phase(c.connect_status), c.connected_mask);
                 if c.connected_mask == 0 && c.connect_status == 0 {
