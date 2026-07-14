@@ -107,6 +107,16 @@ fn parse_srcs_mk(nvidia_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// was authored in). Skips silently otherwise so the crate still builds
 /// without it, same as the smoke test above always has.
 fn build_first_real_nvidia_file() {
+    // The real NVIDIA RM core is x86_64 hardware: skip C compilation for
+    // non-x86_64 targets to avoid cross-compilation issues (wrong-arch
+    // object files) and missing-cross-compiler build failures.
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("x86_64") {
+        println!(
+            "cargo:warning=nvidia-rm-sys: skipping real NVIDIA C source for non-x86_64 target ({})",
+            std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "unknown".to_string())
+        );
+        return;
+    }
     let vendor = std::path::Path::new("vendor/open-gpu-kernel-modules");
     let nvidia = vendor.join("src/nvidia");
     if !nvidia.join("srcs.mk").exists() {

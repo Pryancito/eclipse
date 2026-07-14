@@ -139,10 +139,18 @@ pub extern "C" fn os_get_cpu_frequency() -> NvU64 {
     log::warn!("[nvidia-rm] os_get_cpu_frequency: calibrating TSC (10ms)...");
     // 10 ms calibration window: long enough to make delay_us's own
     // resolution error negligible, short enough to be a one-off blip.
-    let t0 = unsafe { core::arch::x86_64::_rdtsc() };
-    with_hooks((), |h| h.delay_us(10_000));
-    let t1 = unsafe { core::arch::x86_64::_rdtsc() };
-    let hz = t1.wrapping_sub(t0).saturating_mul(100);
+    #[cfg(target_arch = "x86_64")]
+    let hz = {
+        let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+        with_hooks((), |h| h.delay_us(10_000));
+        let t1 = unsafe { core::arch::x86_64::_rdtsc() };
+        t1.wrapping_sub(t0).saturating_mul(100)
+    };
+    // On non-x86_64 architectures the TSC intrinsic is unavailable; fall
+    // back to 1 GHz as a conservative placeholder (RM uses this only for
+    // timeout calculations, not performance measurement).
+    #[cfg(not(target_arch = "x86_64"))]
+    let hz = 1_000_000_000u64;
     log::warn!(
         "[nvidia-rm] os_get_cpu_frequency: calibrated {} MHz",
         hz / 1_000_000
@@ -423,7 +431,13 @@ pub extern "C" fn os_flush_user_cache() -> NV_STATUS {
 }
 #[no_mangle]
 pub extern "C" fn os_flush_cpu_write_combine_buffer() {
+    // x86_64: use the SFENCE instruction to flush the write-combining buffer.
+    // Other architectures do not have a write-combining buffer requiring an
+    // explicit flush; a compiler fence suffices.
+    #[cfg(target_arch = "x86_64")]
     unsafe { core::arch::asm!("sfence") };
+    #[cfg(not(target_arch = "x86_64"))]
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 }
 #[no_mangle]
 pub extern "C" fn os_io_read_byte(port: NvU32) -> NvU8 {
@@ -1113,12 +1127,17 @@ pub extern "C" fn os_is_nvswitch_present() -> NvBool {
 /// `#[target_feature]` functions must be `unsafe fn` -- kept as a small
 /// private helper so the exported `os_get_random_bytes` can stay a plain
 /// `extern "C" fn` matching NVIDIA's real signature exactly.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "rdrand")]
 unsafe fn rdrand64_step(val: &mut u64) -> i32 {
     core::arch::x86_64::_rdrand64_step(val)
 }
 
 /// REAL: x86 RDRAND, no OS entropy pool needed.
+/// On non-x86_64 architectures RDRAND is unavailable; fill the output
+/// buffer with a simple deterministic sequence (RM uses this only for
+/// internal resource-server handle generation, not security-critical
+/// purposes on the bring-up path).
 #[no_mangle]
 pub extern "C" fn os_get_random_bytes(bytes: *mut NvU8, length: NvU16) -> NV_STATUS {
     if bytes.is_null() {
@@ -1126,6 +1145,7 @@ pub extern "C" fn os_get_random_bytes(bytes: *mut NvU8, length: NvU16) -> NV_STA
     }
     let mut remaining = length as usize;
     let mut out = bytes;
+    #[cfg(target_arch = "x86_64")]
     while remaining > 0 {
         let mut val: u64 = 0;
         let ok = unsafe { rdrand64_step(&mut val) };
@@ -1138,6 +1158,22 @@ pub extern "C" fn os_get_random_bytes(bytes: *mut NvU8, length: NvU16) -> NV_STA
             out = out.add(chunk);
         }
         remaining -= chunk;
+    }
+    // On non-x86_64 architectures: fill with a simple counter-based
+    // sequence as a best-effort placeholder.
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0xdeadbeefcafe1234);
+        while remaining > 0 {
+            let val = COUNTER.fetch_add(0x9e3779b97f4a7c15, Ordering::Relaxed);
+            let chunk = core::cmp::min(remaining, 8);
+            unsafe {
+                core::ptr::copy_nonoverlapping(&val as *const u64 as *const u8, out, chunk);
+                out = out.add(chunk);
+            }
+            remaining -= chunk;
+        }
     }
     NV_OK
 }
