@@ -2227,8 +2227,21 @@ impl NvidiaGpu {
     /// side, so repeated calls are cheap). `None` until this GPU's bring-up
     /// chain has run, or when the GPU has no display engine.
     fn rm_display_state(&self) -> Option<(u32, nvidia_rm_sys::rm_init::GrEdid)> {
+        use core::sync::atomic::{AtomicBool, Ordering};
         let instance = (*self.rm_device_instance.lock())?;
-        let d = nvidia_rm_sys::rm_init::edid(instance).ok()?;
+        // The FIRST query runs the full RM/GSP control chain plus a DDC/EDID
+        // probe (the C side then caches it for the rest of the boot). That can
+        // take a long time and is not reentrant, so serialize opportunistically:
+        // a caller that finds another query in flight reports "no RM topology"
+        // and the DRM layer falls back to the synthetic connector, instead of
+        // parking a second CPU behind it.
+        static EDID_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        if EDID_IN_FLIGHT.swap(true, Ordering::Acquire) {
+            return None;
+        }
+        let d = nvidia_rm_sys::rm_init::edid(instance).ok();
+        EDID_IN_FLIGHT.store(false, Ordering::Release);
+        let d = d?;
         (d.supported_status == 0 && d.display_mask != 0).then_some((instance, d))
     }
 
@@ -3970,8 +3983,19 @@ impl DrmScheme for NvidiaGpu {
                         phase(c.alloc_status)
                     );
                 }
-                let _ = writeln!(s, "[gpuedid] GET_SUPPORTED:            {} (outputs={:#x}, DDC-capable={:#x})", phase(c.supported_status), c.display_mask, c.display_mask_ddc);
-                let _ = writeln!(s, "[gpuedid] GET_CONNECT_STATE:        {} (connected={:#x})", phase(c.connect_status), c.connected_mask);
+                let _ = writeln!(
+                    s,
+                    "[gpuedid] GET_SUPPORTED:            {} (outputs={:#x}, DDC-capable={:#x})",
+                    phase(c.supported_status),
+                    c.display_mask,
+                    c.display_mask_ddc
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpuedid] GET_CONNECT_STATE:        {} (connected={:#x})",
+                    phase(c.connect_status),
+                    c.connected_mask
+                );
                 // The DRM view: connector ids GETRESOURCES/GETCONNECTOR now
                 // serve for this GPU (real topology, not the 1001 stub).
                 if c.supported_status == 0 && c.display_mask != 0 {
@@ -3982,7 +4006,11 @@ impl DrmScheme for NvidiaGpu {
                                 s,
                                 " {}{}",
                                 Self::rm_connector_id(device_instance, b),
-                                if c.connected_mask & (1 << b) != 0 { "*" } else { "" }
+                                if c.connected_mask & (1 << b) != 0 {
+                                    "*"
+                                } else {
+                                    ""
+                                }
                             );
                         }
                     }
