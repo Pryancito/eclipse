@@ -2265,16 +2265,16 @@ impl NvidiaGpu {
 /// NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_* -> DRM_MODE_CONNECTOR_*.
 fn nv_conn_type_to_drm(t: u32) -> u32 {
     match t {
-        0x00 => 1,                               // VGA_15_PIN
-        0x30 | 0x38 | 0x39 => 2,                 // DVI_I / LFH_DVI_I_{1,2}
-        0x31 => 3,                               // DVI_D
-        0x46 | 0x47 | 0x49 | 0x64 | 0x65 => 10,  // DP ext/int/serializer, LFH_DP
-        0x48 => 10,                              // DP_MINI_EXT
-        0x61 | 0x63 => 11,                       // HDMI_A / HDMI_C_MINI
-        0x70 => 15,                              // VIRTUAL_WFD
-        0x71 | 0x74 => 10,                       // USB_C (DP alt mode)
-        0x72 => 16,                              // DSI
-        _ => 0,                                  // Unknown
+        0x00 => 1,                              // VGA_15_PIN
+        0x30 | 0x38 | 0x39 => 2,                // DVI_I / LFH_DVI_I_{1,2}
+        0x31 => 3,                              // DVI_D
+        0x46 | 0x47 | 0x49 | 0x64 | 0x65 => 10, // DP ext/int/serializer, LFH_DP
+        0x48 => 10,                             // DP_MINI_EXT
+        0x61 | 0x63 => 11,                      // HDMI_A / HDMI_C_MINI
+        0x70 => 15,                             // VIRTUAL_WFD
+        0x71 | 0x74 => 10,                      // USB_C (DP alt mode)
+        0x72 => 16,                             // DSI
+        _ => 0,                                 // Unknown
     }
 }
 
