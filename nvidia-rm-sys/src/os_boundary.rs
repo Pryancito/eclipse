@@ -2283,11 +2283,20 @@ pub extern "C" fn osInitObjOS(pOS: *mut c_void) {
 
 #[no_mangle]
 pub extern "C" fn osNv_rdcr4() -> NvU32 {
-    let value: u64;
-    unsafe {
-        core::arch::asm!("mov {}, cr4", out(reg) value);
+    // x86_64: read the CR4 control register directly.
+    // On non-x86_64 architectures there is no CR4 equivalent; return 0
+    // so RM's CPU feature detection sees a clear register (no unexpected
+    // bits set) rather than an undefined value.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let value: u64;
+        unsafe {
+            core::arch::asm!("mov {}, cr4", out(reg) value);
+        }
+        value as NvU32
     }
-    value as NvU32
+    #[cfg(not(target_arch = "x86_64"))]
+    0
 }
 
 #[no_mangle]
@@ -2311,37 +2320,55 @@ pub extern "C" fn osNv_cpuid(
             log::warn!("[nvidia-rm] first osNv_cpuid call (RmInitCpuInfo reached)");
         }
     }
-    let mut a: u32 = leaf as u32;
-    let b: u32;
-    let mut c: u32 = subleaf as u32;
-    let d: u32;
-    unsafe {
-        // CRITICAL: save/restore rbx via the STACK, and never name ebx as
-        // an operand. The previous version used a scratch-reg save/restore
-        // ("mov tmp,ebx; cpuid; xchg tmp,ebx"), which corrupted a caller
-        // pointer -- reproduced on the host as an immediate segfault, and
-        // on real hardware as the [KERNEL PAGE FAULT] WRITE to a
-        // 32-bit-truncated stack address (0x311eed4) during RmInitCpuInfo's
-        // very first osNv_cpuid call. cpuid clobbers all of eax/ebx/ecx/edx
-        // at once; leaving rbx for LLVM to juggle across it is fragile.
-        // push/pop rbx keeps rbx fully out of the register allocator's way.
-        core::arch::asm!(
-            "push rbx",
-            "cpuid",
-            "mov {ebx_out:e}, ebx",
-            "pop rbx",
-            ebx_out = lateout(reg) b,
-            inout("eax") a,
-            inout("ecx") c,
-            lateout("edx") d,
-            options(preserves_flags),
-        );
-        if !peax.is_null() { *peax = a; }
-        if !pebx.is_null() { *pebx = b; }
-        if !pecx.is_null() { *pecx = c; }
-        if !pedx.is_null() { *pedx = d; }
+    // x86_64: execute the CPUID instruction.
+    // CRITICAL: save/restore rbx via the STACK, and never name ebx as
+    // an operand. The previous version used a scratch-reg save/restore
+    // ("mov tmp,ebx; cpuid; xchg tmp,ebx"), which corrupted a caller
+    // pointer -- reproduced on the host as an immediate segfault, and
+    // on real hardware as the [KERNEL PAGE FAULT] WRITE to a
+    // 32-bit-truncated stack address (0x311eed4) during RmInitCpuInfo's
+    // very first osNv_cpuid call. cpuid clobbers all of eax/ebx/ecx/edx
+    // at once; leaving rbx for LLVM to juggle across it is fragile.
+    // push/pop rbx keeps rbx fully out of the register allocator's way.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut a: u32 = leaf as u32;
+        let b: u32;
+        let mut c: u32 = subleaf as u32;
+        let d: u32;
+        unsafe {
+            core::arch::asm!(
+                "push rbx",
+                "cpuid",
+                "mov {ebx_out:e}, ebx",
+                "pop rbx",
+                ebx_out = lateout(reg) b,
+                inout("eax") a,
+                inout("ecx") c,
+                lateout("edx") d,
+                options(preserves_flags),
+            );
+            if !peax.is_null() { *peax = a; }
+            if !pebx.is_null() { *pebx = b; }
+            if !pecx.is_null() { *pecx = c; }
+            if !pedx.is_null() { *pedx = d; }
+        }
+        1
     }
-    1
+    // On non-x86_64 architectures CPUID does not exist; zero all outputs
+    // and return 0 (unsupported) so RM's CPU-info initialisation sees
+    // an empty feature set rather than undefined values.
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (leaf, subleaf);
+        unsafe {
+            if !peax.is_null() { *peax = 0; }
+            if !pebx.is_null() { *pebx = 0; }
+            if !pecx.is_null() { *pecx = 0; }
+            if !pedx.is_null() { *pedx = 0; }
+        }
+        0
+    }
 }
 
 #[no_mangle]
