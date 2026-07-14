@@ -108,4 +108,3 @@ pub extern "C" fn osGetSystemTime(sec: *mut NvU32, usec: *mut NvU32) -> NV_STATU
     }
     NV_OK
 }
-

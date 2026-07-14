@@ -328,7 +328,10 @@ fn main() {
                 SimpleFileSystem::create(Arc::new(Mutex::new(file)), arg.size).expect("create sfs");
             zip_dir(std::path::Path::new(&arg.dir), fs.root_inode()).expect("zip");
             fs.sync().expect("sync");
-            println!("SFS image {} ({} bytes) from {}", arg.image, arg.size, arg.dir);
+            println!(
+                "SFS image {} ({} bytes) from {}",
+                arg.image, arg.size, arg.dir
+            );
         }
 
         Asm(args) => args.asm(),

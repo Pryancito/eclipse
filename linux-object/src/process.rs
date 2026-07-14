@@ -469,8 +469,8 @@ impl LinuxProcess {
             tty_path.clone(),
         ) as Arc<dyn FileLike>;
         let stdout_dev = crate::fs::stdio::vt_stdout(vt);
-        let stdout = File::new(stdout_dev.clone(), OpenFlags::WRONLY, tty_path.clone())
-            as Arc<dyn FileLike>;
+        let stdout =
+            File::new(stdout_dev.clone(), OpenFlags::WRONLY, tty_path.clone()) as Arc<dyn FileLike>;
         let stderr = File::new(stdout_dev, OpenFlags::WRONLY, tty_path) as Arc<dyn FileLike>;
         let mut files = HashMap::new();
         files.insert(0.into(), stdin);

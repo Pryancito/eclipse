@@ -204,7 +204,13 @@ pub fn kernel_report() -> String {
     // ── Lifetime (since boot) figures ──
     let life_idle_pct = pct_idle(ks.idle_ns, uptime_ns, online_cpus);
     let life_busy_pct = (100.0 - life_idle_pct).max(0.0);
-    let rate = |n: u64| if uptime_s > 0.0 { n as f64 / uptime_s } else { 0.0 };
+    let rate = |n: u64| {
+        if uptime_s > 0.0 {
+            n as f64 / uptime_s
+        } else {
+            0.0
+        }
+    };
     let life_cb_work_pct = if ks.idle_cb_total > 0 {
         ks.idle_cb_busy as f64 * 100.0 / ks.idle_cb_total as f64
     } else {
@@ -304,7 +310,11 @@ pub fn kernel_report() -> String {
                 throttled, ceiling, base
             );
         } else {
-            let _ = writeln!(out, "pstate gov:   nominal — cpu0 ceiling {}/{}", ceiling, base);
+            let _ = writeln!(
+                out,
+                "pstate gov:   nominal — cpu0 ceiling {}/{}",
+                ceiling, base
+            );
         }
     }
     let _ = writeln!(
@@ -532,10 +542,7 @@ pub fn kernel_report() -> String {
     let _ = writeln!(
         out,
         "sched: {} task polls ({:.0}/s), {} weak-exec yields ({:.0}/s)",
-        sched_polled,
-        polls_per_s,
-        sched_weak,
-        weak_per_s
+        sched_polled, polls_per_s, sched_weak, weak_per_s
     );
     let _ = writeln!(out);
     if busy_pct > 50.0 {
@@ -547,7 +554,10 @@ pub fn kernel_report() -> String {
             out,
             "      something is busy-spinning (a likely source of heat). The busiest",
         );
-        let _ = writeln!(out, "      IRQ vectors below hint at runaway interrupt sources.");
+        let _ = writeln!(
+            out,
+            "      IRQ vectors below hint at runaway interrupt sources."
+        );
         let _ = writeln!(out);
     }
     let _ = writeln!(

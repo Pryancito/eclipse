@@ -15,11 +15,46 @@ use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
 const PROC_ROOT_STATIC: [&str; 40] = [
-    "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
-    "perf", "hunter", "filesystems", "gpudbg", "gpustep2", "gpustep3", "gpustep4", "gpustep5",
-    "gpustep6", "gpustep7", "gpustep8", "gpustep9", "gpustep10", "gpustep11", "gpustep12",
-    "gpustep13", "gpustep14", "gpustep15", "gpustep16", "gpustep17", "gpustep18", "gpustep19",
-    "gpustep20", "gpustep21", "gpustep22", "gpustep23", "gpudump", "gpuinit", "gpubench", "gpuedid",
+    "net",
+    "meminfo",
+    "cpuinfo",
+    "swaps",
+    "uptime",
+    "mounts",
+    "self",
+    "stat",
+    "loadavg",
+    "sys",
+    "perf",
+    "hunter",
+    "filesystems",
+    "gpudbg",
+    "gpustep2",
+    "gpustep3",
+    "gpustep4",
+    "gpustep5",
+    "gpustep6",
+    "gpustep7",
+    "gpustep8",
+    "gpustep9",
+    "gpustep10",
+    "gpustep11",
+    "gpustep12",
+    "gpustep13",
+    "gpustep14",
+    "gpustep15",
+    "gpustep16",
+    "gpustep17",
+    "gpustep18",
+    "gpustep19",
+    "gpustep20",
+    "gpustep21",
+    "gpustep22",
+    "gpustep23",
+    "gpudump",
+    "gpuinit",
+    "gpubench",
+    "gpuedid",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -79,7 +114,10 @@ fn proc_comm(proc: &Process) -> String {
     // try_linux: /proc readers run on processes looked up by pid, which may be
     // tearing down concurrently. Fall back to the kobject name on a miss rather
     // than panicking the reader.
-    let path = proc.try_linux().map(|lp| lp.execute_path()).unwrap_or_default();
+    let path = proc
+        .try_linux()
+        .map(|lp| lp.execute_path())
+        .unwrap_or_default();
     if !path.is_empty() {
         let base = path.rsplit('/').next().unwrap_or(&path);
         return sanitize_comm(base);
@@ -1421,7 +1459,9 @@ fn proc_gpuinit_content() -> String {
         s.push_str("[gpuinit] ===== stage 5/5: GPFIFO + TURING_COMPUTE_A channel (step17) =====\n");
         s.push_str(&d.bringup_step17());
     }
-    s.push_str("[gpuinit] ===== chain complete -- GPU ready; cat /proc/gpustep23 to run SAXPY =====\n");
+    s.push_str(
+        "[gpuinit] ===== chain complete -- GPU ready; cat /proc/gpustep23 to run SAXPY =====\n",
+    );
     s
 }
 

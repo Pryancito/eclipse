@@ -295,11 +295,19 @@ pub extern "C" fn os_mem_copy(dst: *mut c_void, src: *const c_void, length: NvU3
 }
 /// STUB: no userspace address space to copy from/to yet.
 #[no_mangle]
-pub extern "C" fn os_memcpy_from_user(_to: *mut c_void, _from: *const c_void, _n: NvU32) -> NV_STATUS {
+pub extern "C" fn os_memcpy_from_user(
+    _to: *mut c_void,
+    _from: *const c_void,
+    _n: NvU32,
+) -> NV_STATUS {
     NV_ERR_NOT_SUPPORTED
 }
 #[no_mangle]
-pub extern "C" fn os_memcpy_to_user(_to: *mut c_void, _from: *const c_void, _n: NvU32) -> NV_STATUS {
+pub extern "C" fn os_memcpy_to_user(
+    _to: *mut c_void,
+    _from: *const c_void,
+    _n: NvU32,
+) -> NV_STATUS {
     NV_ERR_NOT_SUPPORTED
 }
 #[no_mangle]
@@ -340,10 +348,8 @@ pub extern "C" fn os_pci_init_handle(
     // below). Top bit is a "valid handle" tag so the packed value is
     // never 0/null even for bus=device=function=0 (a real, valid
     // location -- e.g. this GPU's own function 0).
-    let handle = 0x8000_0000usize
-        | ((bus as usize) << 16)
-        | ((slot as usize) << 8)
-        | (function as usize);
+    let handle =
+        0x8000_0000usize | ((bus as usize) << 16) | ((slot as usize) << 8) | (function as usize);
 
     // Vendor/device ID live in the first PCI config dword (offset 0),
     // vendor in the low 16 bits, device in the high 16 bits -- standard
@@ -359,7 +365,11 @@ pub extern "C" fn os_pci_init_handle(
     handle as *mut c_void
 }
 #[no_mangle]
-pub extern "C" fn os_pci_read_byte(handle: *mut c_void, offset: NvU32, value: *mut NvU8) -> NV_STATUS {
+pub extern "C" fn os_pci_read_byte(
+    handle: *mut c_void,
+    offset: NvU32,
+    value: *mut NvU8,
+) -> NV_STATUS {
     if value.is_null() {
         return NV_ERR_INVALID_ARGUMENT;
     }
@@ -367,34 +377,58 @@ pub extern "C" fn os_pci_read_byte(handle: *mut c_void, offset: NvU32, value: *m
     NV_OK
 }
 #[no_mangle]
-pub extern "C" fn os_pci_read_word(handle: *mut c_void, offset: NvU32, value: *mut NvU16) -> NV_STATUS {
+pub extern "C" fn os_pci_read_word(
+    handle: *mut c_void,
+    offset: NvU32,
+    value: *mut NvU16,
+) -> NV_STATUS {
     if value.is_null() {
         return NV_ERR_INVALID_ARGUMENT;
     }
-    unsafe { *value = with_hooks(0xFFFF, |h| h.pci_config_read(handle as usize, offset, 2)) as NvU16 };
+    unsafe {
+        *value = with_hooks(0xFFFF, |h| h.pci_config_read(handle as usize, offset, 2)) as NvU16
+    };
     NV_OK
 }
 #[no_mangle]
-pub extern "C" fn os_pci_read_dword(handle: *mut c_void, offset: NvU32, value: *mut NvU32) -> NV_STATUS {
+pub extern "C" fn os_pci_read_dword(
+    handle: *mut c_void,
+    offset: NvU32,
+    value: *mut NvU32,
+) -> NV_STATUS {
     if value.is_null() {
         return NV_ERR_INVALID_ARGUMENT;
     }
-    unsafe { *value = with_hooks(0xFFFF_FFFF, |h| h.pci_config_read(handle as usize, offset, 4)) };
+    unsafe {
+        *value = with_hooks(0xFFFF_FFFF, |h| {
+            h.pci_config_read(handle as usize, offset, 4)
+        })
+    };
     NV_OK
 }
 #[no_mangle]
 pub extern "C" fn os_pci_write_byte(handle: *mut c_void, offset: NvU32, value: NvU8) -> NV_STATUS {
-    with_hooks((), |h| h.pci_config_write(handle as usize, offset, 1, value as u32));
+    with_hooks((), |h| {
+        h.pci_config_write(handle as usize, offset, 1, value as u32)
+    });
     NV_OK
 }
 #[no_mangle]
 pub extern "C" fn os_pci_write_word(handle: *mut c_void, offset: NvU32, value: NvU16) -> NV_STATUS {
-    with_hooks((), |h| h.pci_config_write(handle as usize, offset, 2, value as u32));
+    with_hooks((), |h| {
+        h.pci_config_write(handle as usize, offset, 2, value as u32)
+    });
     NV_OK
 }
 #[no_mangle]
-pub extern "C" fn os_pci_write_dword(handle: *mut c_void, offset: NvU32, value: NvU32) -> NV_STATUS {
-    with_hooks((), |h| h.pci_config_write(handle as usize, offset, 4, value));
+pub extern "C" fn os_pci_write_dword(
+    handle: *mut c_void,
+    offset: NvU32,
+    value: NvU32,
+) -> NV_STATUS {
+    with_hooks((), |h| {
+        h.pci_config_write(handle as usize, offset, 4, value)
+    });
     NV_OK
 }
 #[no_mangle]
@@ -435,7 +469,9 @@ pub extern "C" fn os_flush_cpu_write_combine_buffer() {
     // Other architectures do not have a write-combining buffer requiring an
     // explicit flush; a compiler fence suffices.
     #[cfg(target_arch = "x86_64")]
-    unsafe { core::arch::asm!("sfence") };
+    unsafe {
+        core::arch::asm!("sfence")
+    };
     #[cfg(not(target_arch = "x86_64"))]
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 }
@@ -1025,11 +1061,20 @@ pub extern "C" fn os_bug_check(code: NvU32, message: *const c_char) -> ! {
     panic!("[nvidia-rm] os_bug_check({:#x}): {}", code, msg);
 }
 #[no_mangle]
-pub extern "C" fn os_lock_user_pages(_a: *mut c_void, _b: NvU64, _c: *mut *mut c_void, _d: NvU32) -> NV_STATUS {
+pub extern "C" fn os_lock_user_pages(
+    _a: *mut c_void,
+    _b: NvU64,
+    _c: *mut *mut c_void,
+    _d: NvU32,
+) -> NV_STATUS {
     NV_ERR_NOT_SUPPORTED
 }
 #[no_mangle]
-pub extern "C" fn os_lookup_user_io_memory(_a: *mut c_void, _b: NvU64, _c: *mut *mut NvU64) -> NV_STATUS {
+pub extern "C" fn os_lookup_user_io_memory(
+    _a: *mut c_void,
+    _b: NvU64,
+    _c: *mut *mut NvU64,
+) -> NV_STATUS {
     NV_ERR_NOT_SUPPORTED
 }
 #[no_mangle]
@@ -1065,7 +1110,12 @@ pub extern "C" fn os_numa_memblock_size(_a: *mut NvU64) -> NV_STATUS {
     NV_ERR_NOT_SUPPORTED
 }
 #[no_mangle]
-pub extern "C" fn os_alloc_pages_node(_a: NvS32, _b: NvU32, _c: NvU32, _d: *mut NvU64) -> NV_STATUS {
+pub extern "C" fn os_alloc_pages_node(
+    _a: NvS32,
+    _b: NvU32,
+    _c: NvU32,
+    _d: *mut NvU64,
+) -> NV_STATUS {
     NV_ERR_NOT_SUPPORTED
 }
 #[no_mangle]
@@ -1104,14 +1154,21 @@ pub extern "C" fn os_read_file(_a: *mut c_void, _b: *mut NvU8, _c: NvU64, _d: Nv
     NV_ERR_NOT_SUPPORTED
 }
 #[no_mangle]
-pub extern "C" fn os_open_readonly_file(_path: *const c_char, handle: *mut *mut c_void) -> NV_STATUS {
+pub extern "C" fn os_open_readonly_file(
+    _path: *const c_char,
+    handle: *mut *mut c_void,
+) -> NV_STATUS {
     if !handle.is_null() {
         unsafe { *handle = core::ptr::null_mut() };
     }
     NV_ERR_NOT_SUPPORTED
 }
 #[no_mangle]
-pub extern "C" fn os_open_and_read_file(_path: *const c_char, _buf: *mut NvU8, _len: NvU64) -> NV_STATUS {
+pub extern "C" fn os_open_and_read_file(
+    _path: *const c_char,
+    _buf: *mut NvU8,
+    _len: NvU64,
+) -> NV_STATUS {
     // NOTE: the GSP/booter firmware blobs will most likely be loaded by a
     // path we control directly (Eclipse's own filesystem access before
     // handing buffers to RM), not through this call -- revisit if RM
@@ -1186,11 +1243,19 @@ pub extern "C" fn os_nv_cap_init(_path: *const c_char) -> *mut c_void {
     core::ptr::null_mut()
 }
 #[no_mangle]
-pub extern "C" fn os_nv_cap_create_dir_entry(_a: *mut c_void, _b: *const c_char, _c: i32) -> *mut c_void {
+pub extern "C" fn os_nv_cap_create_dir_entry(
+    _a: *mut c_void,
+    _b: *const c_char,
+    _c: i32,
+) -> *mut c_void {
     core::ptr::null_mut()
 }
 #[no_mangle]
-pub extern "C" fn os_nv_cap_create_file_entry(_a: *mut c_void, _b: *const c_char, _c: i32) -> *mut c_void {
+pub extern "C" fn os_nv_cap_create_file_entry(
+    _a: *mut c_void,
+    _b: *const c_char,
+    _c: i32,
+) -> *mut c_void {
     core::ptr::null_mut()
 }
 #[no_mangle]
@@ -1218,15 +1283,29 @@ pub extern "C" fn os_get_tegra_platform(_a: *mut NvU32) -> NV_STATUS {
     NV_ERR_NOT_SUPPORTED
 }
 #[no_mangle]
-pub extern "C" fn os_get_numa_node_memory_usage(_a: NvS32, _b: *mut NvU64, _c: *mut NvU64) -> NV_STATUS {
+pub extern "C" fn os_get_numa_node_memory_usage(
+    _a: NvS32,
+    _b: *mut NvU64,
+    _c: *mut NvU64,
+) -> NV_STATUS {
     NV_ERR_NOT_SUPPORTED
 }
 #[no_mangle]
-pub extern "C" fn os_numa_add_gpu_memory(_a: *mut c_void, _b: NvU64, _c: NvU64, _d: *mut NvU32) -> NV_STATUS {
+pub extern "C" fn os_numa_add_gpu_memory(
+    _a: *mut c_void,
+    _b: NvU64,
+    _c: NvU64,
+    _d: *mut NvU32,
+) -> NV_STATUS {
     NV_ERR_NOT_SUPPORTED
 }
 #[no_mangle]
-pub extern "C" fn os_numa_remove_gpu_memory(_a: *mut c_void, _b: NvU64, _c: NvU64, _d: NvU32) -> NV_STATUS {
+pub extern "C" fn os_numa_remove_gpu_memory(
+    _a: *mut c_void,
+    _b: NvU64,
+    _c: NvU64,
+    _d: NvU32,
+) -> NV_STATUS {
     NV_ERR_NOT_SUPPORTED
 }
 #[no_mangle]
@@ -1251,7 +1330,11 @@ pub extern "C" fn os_is_init_ns() -> NvBool {
     NV_TRUE // no namespaces at all -- vacuously "the" (only) namespace
 }
 #[no_mangle]
-pub extern "C" fn os_iommu_sva_bind(_a: *mut c_void, _b: *mut *mut c_void, _c: *mut NvU32) -> NV_STATUS {
+pub extern "C" fn os_iommu_sva_bind(
+    _a: *mut c_void,
+    _b: *mut *mut c_void,
+    _c: *mut NvU32,
+) -> NV_STATUS {
     NV_ERR_NOT_SUPPORTED
 }
 #[no_mangle]
@@ -1265,7 +1348,10 @@ pub extern "C" fn os_cgroup_implementation() -> NvU32 {
     0 // OS_CGROUP_IMPL_NONE
 }
 #[no_mangle]
-pub extern "C" fn os_dmem_cgroup_register_region(_size: NvU64, _name: *const c_char) -> *mut c_void {
+pub extern "C" fn os_dmem_cgroup_register_region(
+    _size: NvU64,
+    _name: *const c_char,
+) -> *mut c_void {
     core::ptr::null_mut()
 }
 #[no_mangle]
