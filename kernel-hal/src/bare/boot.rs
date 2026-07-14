@@ -13,6 +13,7 @@ hal_fn_impl! {
         }
 
         fn primary_init_early(cfg: KernelConfig, handler: &'static impl KernelHandler) {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             lock::set_phys_virt_offset(cfg.phys_to_virt_offset as u64);
             KCONFIG.init_once_by(cfg);
             KHANDLER.init_once_by(handler);
