@@ -1014,11 +1014,41 @@ impl VmMapping {
 
     /// Handle page fault happened on this VmMapping.
     pub(crate) fn handle_page_fault(&self, vaddr: VirtAddr, access_flags: MMUFlags) -> ZxResult {
+        /// Fault-around window for demand-paged (file-backed) mappings: on a
+        /// fault, also pre-commit and pre-map up to this many *following* pages.
+        /// Each 4 KiB fault otherwise pays the full trap → VMO lock → filesystem
+        /// → disk stack on its own; faulting code/data is overwhelmingly
+        /// sequential, so one window amortizes that stack 16× and lines up with
+        /// the block layer's 64 KiB read-ahead.
+        const FAULT_AROUND_PAGES: usize = 16;
+
         let vaddr = round_down_pages(vaddr);
-        let (vmo_offset, mut flags) = {
+        // Resolved BEFORE taking `self.inner`: it acquires the VMO family lock,
+        // and the established discipline is to never hold the mapping lock
+        // while taking a VMO lock (the reverse direction exists via
+        // `range_change`, which only survives that nesting by using try_lock).
+        let demand_paged = self.vmo.is_demand_paged();
+        let (vmo_offset, mut flags, around) = {
             let inner = self.inner.lock();
             let offset = vaddr - inner.addr;
-            (offset + inner.vmo_offset, inner.flags[offset / PAGE_SIZE])
+            let page_idx = offset / PAGE_SIZE;
+            // Collect the following in-bounds pages for fault-around. Only
+            // worthwhile for demand-paged VMOs, where committing a page means a
+            // filesystem read; anonymous pages are cheap zero-fills and eager
+            // commit would only waste frames.
+            let mut around = Vec::new();
+            if demand_paged {
+                let total_pages = inner.size / PAGE_SIZE;
+                let end = (page_idx + FAULT_AROUND_PAGES).min(total_pages);
+                for idx in (page_idx + 1)..end {
+                    around.push((
+                        inner.addr + idx * PAGE_SIZE,
+                        idx * PAGE_SIZE + inner.vmo_offset,
+                        inner.flags[idx],
+                    ));
+                }
+            }
+            (offset + inner.vmo_offset, inner.flags[page_idx], around)
         };
         // error!("page fault: addr = {:x}, access_flag = {:?}, flags = {:?}", vaddr, access_flags, flags);
         if !flags.contains(access_flags) {
@@ -1031,18 +1061,38 @@ impl VmMapping {
         }
         let paddr = self.vmo.commit_page(vmo_offset / PAGE_SIZE, access_flags)?;
         // error!("paddr = {:x}", paddr);
-        let mut pg_table = self.page_table.lock();
-        let mut res = pg_table.map(Page::new_aligned(vaddr, PageSize::Size4K), paddr, flags);
-        if let Err(PagingError::AlreadyMapped) = res {
-            res = pg_table.update(vaddr, Some(paddr), Some(flags)).map(|_| ());
+        {
+            let mut pg_table = self.page_table.lock();
+            let mut res = pg_table.map(Page::new_aligned(vaddr, PageSize::Size4K), paddr, flags);
+            if let Err(PagingError::AlreadyMapped) = res {
+                res = pg_table.update(vaddr, Some(paddr), Some(flags)).map(|_| ());
+            }
+            res.map_err(|_| ZxError::ACCESS_DENIED)?;
         }
-        res.map_err(|_| ZxError::ACCESS_DENIED)?;
+        // Best-effort fault-around: pre-map the following pages read-only. A
+        // later write to any of them still takes its own fault (preserving the
+        // COW write-protect dance above); any error just stops the read-ahead.
+        for (va, vmo_off, mut pflags) in around {
+            if !pflags.contains(MMUFlags::READ) {
+                continue;
+            }
+            pflags.remove(MMUFlags::WRITE);
+            let paddr = match self.vmo.commit_page(vmo_off / PAGE_SIZE, MMUFlags::READ) {
+                Ok(paddr) => paddr,
+                Err(_) => break,
+            };
+            let mut pg_table = self.page_table.lock();
+            match pg_table.map(Page::new_aligned(va, PageSize::Size4K), paddr, pflags) {
+                Ok(_) | Err(PagingError::AlreadyMapped) => {}
+                Err(_) => break,
+            }
+        }
         Ok(())
     }
 
     /// Clone VMO and map it to a new page table. (For Linux fork)
     ///
-    /// Eager full copy — NOT copy-on-write. The Zircon-style hidden-node COW
+    /// Independent copy — NOT copy-on-write. The Zircon-style hidden-node COW
     /// tree mis-replicated the address space for a process that *runs* (rather
     /// than immediately `execve`s) after `fork`: openrc-init and its forked
     /// children faulted with SIGSEGV on writes to pages that fork should have
@@ -1053,19 +1103,42 @@ impl VmMapping {
     /// than COW, but it is correct, and it leaves the PARENT completely untouched
     /// (no COW write-protect of its pages), so the forking process keeps writing
     /// to its own frames without faulting.
+    ///
+    /// "Current contents" only requires copying pages the parent has actually
+    /// committed: an untouched page reads back exactly as it will re-fault in
+    /// the child (file bytes for a demand-paged mapping, zeros for anonymous
+    /// memory), so `fork_copy` skips it and keeps it lazy. Only when the VMO
+    /// can't guarantee that (slices, pinned/contiguous, clone trees) do we fall
+    /// back to the eager full read-copy.
     fn clone_map(&self, page_table: Arc<Mutex<dyn GenericPageTable>>) -> ZxResult<Arc<Self>> {
-        let len = self.vmo.len();
-        let new_vmo = VmObject::new_paged(len / PAGE_SIZE);
-        // Copy the parent's current contents page by page. `read` commits /
-        // fills-from-source as needed (so file-backed .text and demand-zero BSS
-        // come through correctly); `write` commits the fresh child frames.
-        let mut buf = vec![0u8; PAGE_SIZE];
-        let mut off = 0;
-        while off < len {
-            self.vmo.read(off, &mut buf)?;
-            new_vmo.write(off, &buf)?;
-            off += PAGE_SIZE;
-        }
+        // Fast path: copy only the pages the parent has actually committed.
+        // Untouched pages of a file-backed mapping stay lazy in the child and
+        // fault in from the same file later; untouched anonymous pages stay
+        // demand-zero. Without this, forking a process with large demand-paged
+        // libraries (a Wayland compositor maps 100+ MiB of wlroots/Mesa) read
+        // EVERY byte of EVERY mapped file from disk 4 KiB at a time — minutes
+        // of wall-clock on polled AHCI — only for the child to execve() and
+        // throw the copy away.
+        let new_vmo = match self.vmo.fork_copy() {
+            Ok(vmo) => vmo,
+            Err(_) => {
+                // Eager full copy — NOT copy-on-write (see the doc comment
+                // above for why COW is not used here). `read` commits /
+                // fills-from-source as needed (so file-backed .text and
+                // demand-zero BSS come through correctly); `write` commits the
+                // fresh child frames.
+                let len = self.vmo.len();
+                let new_vmo = VmObject::new_paged(len / PAGE_SIZE);
+                let mut buf = vec![0u8; PAGE_SIZE];
+                let mut off = 0;
+                while off < len {
+                    self.vmo.read(off, &mut buf)?;
+                    new_vmo.write(off, &buf)?;
+                    off += PAGE_SIZE;
+                }
+                new_vmo
+            }
+        };
         let mapping = Arc::new(VmMapping {
             inner: Mutex::new(self.inner.lock().clone()),
             permissions: self.permissions,

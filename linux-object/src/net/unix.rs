@@ -12,6 +12,9 @@ use alloc::{
     vec::Vec,
 };
 use async_trait::async_trait;
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
 use hashbrown::HashMap;
 use lazy_static::lazy_static;
 use lock::Mutex;
@@ -200,6 +203,125 @@ impl Drop for UnixSocketState {
         if !path.is_empty() {
             Self::unregister(path.as_str());
         }
+        // EOF notification: when the last handle sharing this end drops (dup()s
+        // and SCM_RIGHTS-passed fds share `inner`), mark the peer closed and
+        // wake anything parked on its eventbus. Blocking readers and pollers
+        // are event-driven now, so without this they would never notice a peer
+        // that vanished without calling shutdown().
+        if Arc::strong_count(&self.inner) == 1 {
+            let peer = {
+                let inner = self.inner.lock();
+                inner.peer.as_ref().and_then(|w| w.upgrade())
+            };
+            if let Some(peer) = peer {
+                let mut pi = peer.lock();
+                pi.peer_closed = true;
+                pi.eventbus.set(Event::READABLE | Event::CLOSED);
+            }
+        }
+    }
+}
+
+/// Future that resolves once the socket's eventbus carries any bit of `mask`.
+///
+/// The bits are checked under the same `UnixInner` lock that every writer
+/// holds while `set()`ing them, so a transition between the check and the
+/// waker subscription cannot be lost. Used by the blocking `read`/`accept`
+/// paths, which re-validate their own condition after each wake.
+struct UnixEventWait {
+    inner: Arc<Mutex<UnixInner>>,
+    mask: Event,
+    subscribed: bool,
+}
+
+impl Future for UnixEventWait {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        {
+            let mut inner = this.inner.lock();
+            if !(inner.eventbus.events() & this.mask).is_empty() {
+                return Poll::Ready(());
+            }
+            if !this.subscribed {
+                this.subscribed = true;
+                let waker = cx.waker().clone();
+                let mask = this.mask;
+                inner.eventbus.subscribe(Box::new(move |ev| {
+                    if (ev & mask).is_empty() {
+                        return false;
+                    }
+                    waker.wake_by_ref();
+                    true
+                }));
+            }
+        }
+        // Backstop timer, re-armed on every Pending: the eventbus wake is the
+        // fast path, but a parked callback can be evicted from a full table.
+        // The event *bits* stay correct regardless, so a periodic re-check
+        // bounds a lost wakeup to one tick instead of hanging the reader
+        // forever. (This is what froze the compositor: a blocked recvmsg whose
+        // only waker had been silently dropped.)
+        let waker = cx.waker().clone();
+        kernel_hal::timer::timer_set(
+            kernel_hal::timer::deadline_after(core::time::Duration::from_millis(20)),
+            Box::new(move |_| waker.wake_by_ref()),
+        );
+        Poll::Pending
+    }
+}
+
+/// Future behind [`FileLike::async_poll`]: resolves with the poll status once
+/// any *requested* readiness (or an EOF/error condition) holds, parking a
+/// waker on the eventbus meanwhile. This is what lets `poll`/`select`/`epoll`
+/// wake on the very write that makes a Wayland socket readable, instead of
+/// noticing it on the multiplex fallback tick.
+struct UnixPollWait<'a> {
+    sock: &'a UnixSocketState,
+    events: PollEvents,
+    subscribed: bool,
+}
+
+impl Future for UnixPollWait<'_> {
+    type Output = LxResult<PollStatus>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let ready = {
+            let mut inner = this.sock.inner.lock();
+            let peer_gone =
+                inner.peer_closed || inner.peer.as_ref().map_or(true, |w| w.strong_count() == 0);
+            let readable = !inner.buffer.is_empty()
+                || (inner.is_listening && !inner.accept_queue.is_empty())
+                || inner.read_closed
+                || peer_gone;
+            let writable = !peer_gone;
+            let want_read = this.events.contains(PollEvents::IN);
+            let want_write = this.events.contains(PollEvents::OUT);
+            let ready = (want_read && readable)
+                || (want_write && (writable || peer_gone))
+                || (!want_read && !want_write);
+            if !ready && !this.subscribed {
+                this.subscribed = true;
+                let waker = cx.waker().clone();
+                inner.eventbus.subscribe(Box::new(move |ev| {
+                    if (ev & (Event::READABLE | Event::WRITABLE | Event::CLOSED | Event::ERROR))
+                        .is_empty()
+                    {
+                        return false;
+                    }
+                    waker.wake_by_ref();
+                    true
+                }));
+            }
+            ready
+        };
+        if !ready {
+            return Poll::Pending;
+        }
+        let (read, write, error) = Socket::poll(this.sock, this.events);
+        Poll::Ready(Ok(PollStatus { read, write, error }))
     }
 }
 
@@ -241,13 +363,15 @@ impl Socket for UnixSocketState {
             }
 
             drop(inner);
-            // Throttle the blocking retry to ~200 Hz instead of busy-spinning
-            // with yield_now, which pegged a core. This loop doesn't subscribe
-            // to the eventbus, so the 5 ms timer bounds worst-case latency; a
-            // proper eventbus park (like stdin) could drop it further later.
-            kernel_hal::thread::sleep_until(kernel_hal::timer::deadline_after(
-                core::time::Duration::from_millis(5),
-            ))
+            // Park on the eventbus until a peer write / shutdown / close flips
+            // READABLE (or CLOSED); the loop re-validates the condition after
+            // each wake. Event-driven, so a blocked reader resumes on the very
+            // write instead of on a retry timer.
+            UnixEventWait {
+                inner: self.inner.clone(),
+                mask: Event::READABLE | Event::CLOSED,
+                subscribed: false,
+            }
             .await;
         }
     }
@@ -362,13 +486,13 @@ impl Socket for UnixSocketState {
                 return Err(LxError::EAGAIN);
             }
             drop(inner);
-            // Throttle the blocking retry to ~200 Hz instead of busy-spinning
-            // with yield_now, which pegged a core. This loop doesn't subscribe
-            // to the eventbus, so the 5 ms timer bounds worst-case latency; a
-            // proper eventbus park (like stdin) could drop it further later.
-            kernel_hal::thread::sleep_until(kernel_hal::timer::deadline_after(
-                core::time::Duration::from_millis(5),
-            ))
+            // Park on the eventbus: `push_accept` sets READABLE when a client
+            // connects, so a blocked accept resumes immediately.
+            UnixEventWait {
+                inner: self.inner.clone(),
+                mask: Event::READABLE | Event::CLOSED,
+                subscribed: false,
+            }
             .await;
         }
     }
@@ -487,9 +611,12 @@ impl Socket for UnixSocketState {
 
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
         let inner = self.inner.lock();
+        // `read_closed` counts as readable: a read would return immediately
+        // (EOF), which is exactly what POLLIN promises.
         let readable = !inner.buffer.is_empty()
             || (inner.is_listening && !inner.accept_queue.is_empty())
-            || inner.peer_closed;
+            || inner.peer_closed
+            || inner.read_closed;
         let writable = inner.peer.as_ref().map_or(false, |w| w.strong_count() > 0);
         (readable, writable, false)
     }
@@ -542,35 +669,17 @@ impl FileLike for UnixSocketState {
     }
 
     async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
-        // For blocking sockets: wait until something is readable or writable.
-        let non_block = self.inner.lock().flags.contains(OpenFlags::NON_BLOCK);
-        if !non_block {
-            loop {
-                {
-                    let inner = self.inner.lock();
-                    let peer_gone = inner.peer_closed
-                        || inner.peer.as_ref().map_or(true, |w| w.strong_count() == 0);
-                    let readable = !inner.buffer.is_empty()
-                        || (inner.is_listening && !inner.accept_queue.is_empty())
-                        || peer_gone;
-                    let want_read = events.contains(PollEvents::IN);
-                    let want_write = events.contains(PollEvents::OUT);
-                    let writable = !peer_gone;
-                    if (want_read && readable) || (want_write && (writable || peer_gone)) {
-                        break;
-                    }
-                }
-                // Throttle the blocking retry to ~200 Hz instead of busy-spinning with
-                // yield_now (which pegs a core). A peer write also sets the eventbus,
-                // so latency stays low; the timer just bounds the idle spin.
-                kernel_hal::thread::sleep_until(kernel_hal::timer::deadline_after(
-                    core::time::Duration::from_millis(5),
-                ))
-                .await;
-            }
+        // Event-driven readiness: stay Pending with a waker parked on the
+        // socket's eventbus until a requested event (or EOF/close) holds, then
+        // report the status. `sys_poll`/`select`/`epoll` poll this future with
+        // their own Context, so a peer write wakes them immediately — the same
+        // contract the pipe implementation follows.
+        UnixPollWait {
+            sock: self,
+            events,
+            subscribed: false,
         }
-        let (read, write, error) = Socket::poll(self, events);
-        Ok(PollStatus { read, write, error })
+        .await
     }
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> LxResult<usize> {
@@ -639,6 +748,50 @@ mod tests {
 
         UnixSocketState::unregister(&path);
         assert!(UnixSocketState::lookup(&path).is_none());
+    }
+
+    /// A reader blocked on an empty socket is woken by the peer's write (no
+    /// retry timer involved — the eventbus subscription must fire).
+    #[async_std::test]
+    async fn blocked_read_wakes_on_peer_write() {
+        let a = UnixSocketState::new();
+        let b = UnixSocketState::new();
+        UnixSocketState::connect_pair(&a, &b);
+
+        let reader = {
+            let b = b.clone();
+            async_std::task::spawn(async move {
+                let mut buf = [0u8; 8];
+                let (r, _) = Socket::read(&*b, &mut buf).await;
+                (r.unwrap(), buf)
+            })
+        };
+        // Give the reader a chance to park on the eventbus first.
+        async_std::task::sleep(core::time::Duration::from_millis(20)).await;
+        Socket::write(&*a, b"hola", None).unwrap();
+        let (n, buf) = reader.await;
+        assert_eq!(&buf[..n], b"hola");
+    }
+
+    /// Dropping the last handle of one end must wake and EOF a blocked reader
+    /// on the other end, even without an explicit shutdown().
+    #[async_std::test]
+    async fn blocked_read_eofs_when_peer_drops() {
+        let a = UnixSocketState::new();
+        let b = UnixSocketState::new();
+        UnixSocketState::connect_pair(&a, &b);
+
+        let reader = {
+            let b = b.clone();
+            async_std::task::spawn(async move {
+                let mut buf = [0u8; 8];
+                let (r, _) = Socket::read(&*b, &mut buf).await;
+                r.unwrap()
+            })
+        };
+        async_std::task::sleep(core::time::Duration::from_millis(20)).await;
+        drop(a);
+        assert_eq!(reader.await, 0, "peer drop must read as EOF");
     }
 
     /// End-to-end: after the server accepts, it reads what the client wrote

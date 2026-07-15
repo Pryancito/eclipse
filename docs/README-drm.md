@@ -158,10 +158,13 @@ labwc
 ```
 
 > **Importante**: sin `WLR_RENDERER=pixman`, wlroots intenta primero el renderer
-> GLES2 sobre GBM/EGL (Mesa). Como aquí no hay GPU, esa ruta puede **colgarse o
-> fallar** al inicializar el renderer — el síntoma típico es que el log del
-> kernel se queda en `[drm] VERSION …` y nunca llega al *scanout* (pantalla
-> congelada). Forzar pixman evita esa ruta por completo.
+> GLES2 sobre GBM/EGL (Mesa). Como aquí no hay GPU, esa ruta puede **colgarse,
+> fallar o funcionar extremadamente lenta**: Mesa cae a `llvmpipe` (render por
+> CPU) y cada frame además se vuelve a copiar al framebuffer DRM por software.
+> El síntoma típico del fallo de inicialización es que el log del kernel se queda
+> en `[drm] VERSION …` y nunca llega al *scanout* (pantalla congelada). Si sí
+> arranca con `WLR_RENDERER=gles2`, el compositor seguirá siendo muy lento por
+> ese doble trabajo en CPU. Forzar pixman evita esa ruta por completo.
 
 ## Diagnóstico
 

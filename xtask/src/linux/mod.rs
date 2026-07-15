@@ -590,9 +590,10 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               export HOME=/root\n\
               export TERM=xterm-256color\n\
               # No GPU here: wlroots/labwc must use the software (pixman) renderer.\n\
-              # Otherwise wlroots tries GLES2/EGL then Vulkan, both fail, and labwc\n\
-              # exits with 'Could not initialize renderer' (it does not auto-fall\n\
-              # back to pixman). See docs/README-drm.md.\n\
+              # Otherwise wlroots tries GLES2/EGL then Vulkan. With no GPU that\n\
+              # path can fail outright, or start on Mesa llvmpipe and become\n\
+              # extremely slow because every frame is rendered and copied on CPU.\n\
+              # It does not auto-fall back to pixman. See docs/README-drm.md.\n\
               export WLR_RENDERER=pixman\n\
               export WLR_RENDERER_ALLOW_SOFTWARE=1\n\
               # wlroots' libinput backend aborts the whole compositor if it\n\
@@ -612,7 +613,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # real NVIDIA PCI id, so Mesa would try the hardware nouveau driver\n\
               # and fail; force the KMS software rasteriser (kms_swrast/llvmpipe)\n\
               # which renders into dumb buffers. Only used when a GL renderer is\n\
-              # selected (WLR_RENDERER=gles2); pixman ignores Mesa.\n\
+              # selected (WLR_RENDERER=gles2); that path is intentionally avoided\n\
+              # by default because it is much slower than pixman here.\n\
               export GALLIUM_DRIVER=llvmpipe\n\
               export MESA_LOADER_DRIVER_OVERRIDE=kms_swrast\n\
               # Runtime dir for the Wayland socket (created on demand, mode 0700).\n\

@@ -421,6 +421,28 @@ impl FileLike for File {
 
     async fn async_poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
         let inode = self.inner.read().inode.clone();
+
+        // Special-case DrmDev: since INode::async_poll doesn't accept the requested
+        // PollEvents, its default implementation blocks on Event::READABLE even if
+        // the caller only polled for writability (which is always ready on DRM).
+        // Intercept it here and return immediately if the requested events are ready.
+        use super::devfs::DrmDev;
+        if let Some(drmdev) = inode.downcast_ref::<DrmDev>() {
+            let want_read = _events.contains(PollEvents::IN);
+            let want_write = _events.contains(PollEvents::OUT);
+            let bus = super::devfs::drm::get_eventbus();
+            loop {
+                let status = drmdev.poll()?;
+                let ready = (want_read && status.read)
+                    || (want_write && status.write)
+                    || (!want_read && !want_write);
+                if ready {
+                    return Ok(status);
+                }
+                crate::sync::wait_for_event(bus.clone(), crate::sync::Event::READABLE).await;
+            }
+        }
+
         // See `poll`: special-case an empty FIFO so the reader blocks, but only
         // when metadata() is available — sockets/special devices return ENOSYS
         // and must fall through to the inode's own async_poll() rather than

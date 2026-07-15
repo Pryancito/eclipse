@@ -2,9 +2,13 @@
 //!
 //! Exposes the DRM subsystem to userspace via IOCTLs and memory mapping.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::any::Any;
+use core::future::Future;
+use core::pin::Pin;
 
+use crate::sync::{wait_for_event, Event};
 use rcore_fs::vfs::*;
 use zircon_object::vm::{pages, VmObject};
 
@@ -394,23 +398,35 @@ const _: () = {
 fn make_modeinfo(w: u32, h: u32) -> [u8; 68] {
     let mut m = [0u8; 68];
     let refresh: u32 = 60;
-    let clock = ((w as u64 * h as u64 * refresh as u64) / 1000) as u32; // kHz, nominal
+    // Standard blanking: add 10 % horizontal and 5 % vertical blanking so the
+    // pixel clock matches what wlroots expects (clock ≈ htotal * vtotal * refresh
+    // / 1000 kHz).  Using only the active area gives an unusably low clock and
+    // a calculated refresh of 59.xxx Hz rather than the 59.999 wlroots logs.
+    let htotal = (w * 11 / 10) as u16; // +10 % H blanking
+    let vtotal = (h * 21 / 20) as u16; // +5 % V blanking
+    let clock = (htotal as u64 * vtotal as u64 * refresh as u64 / 1000) as u32; // kHz
     m[0..4].copy_from_slice(&clock.to_ne_bytes());
     let wh = w as u16;
     m[4..6].copy_from_slice(&wh.to_ne_bytes()); // hdisplay
-    m[6..8].copy_from_slice(&wh.to_ne_bytes()); // hsync_start
-    m[8..10].copy_from_slice(&wh.to_ne_bytes()); // hsync_end
-    m[10..12].copy_from_slice(&wh.to_ne_bytes()); // htotal
-                                                  // hskew @12..14 = 0
+    // hsync_start / hsync_end / htotal: use simple 10 % blanking
+    let hsync_start = (w + w / 16) as u16;
+    let hsync_end = (w + w / 8) as u16;
+    m[6..8].copy_from_slice(&hsync_start.to_ne_bytes());
+    m[8..10].copy_from_slice(&hsync_end.to_ne_bytes());
+    m[10..12].copy_from_slice(&htotal.to_ne_bytes());
+    // hskew @12..14 = 0
     let hh = h as u16;
     m[14..16].copy_from_slice(&hh.to_ne_bytes()); // vdisplay
-    m[16..18].copy_from_slice(&hh.to_ne_bytes()); // vsync_start
-    m[18..20].copy_from_slice(&hh.to_ne_bytes()); // vsync_end
-    m[20..22].copy_from_slice(&hh.to_ne_bytes()); // vtotal
-                                                  // vscan @22..24 = 0
+    // vsync_start / vsync_end / vtotal: use simple 5 % blanking
+    let vsync_start = (h + h / 40) as u16;
+    let vsync_end = (h + h / 20) as u16;
+    m[16..18].copy_from_slice(&vsync_start.to_ne_bytes());
+    m[18..20].copy_from_slice(&vsync_end.to_ne_bytes());
+    m[20..22].copy_from_slice(&vtotal.to_ne_bytes());
+    // vscan @22..24 = 0
     m[24..28].copy_from_slice(&refresh.to_ne_bytes()); // vrefresh
-                                                       // flags @28..32 = 0
-                                                       // type @32..36: DRM_MODE_TYPE_DRIVER(0x40) | DRM_MODE_TYPE_PREFERRED(0x08)
+    // flags @28..32 = 0
+    // type @32..36: DRM_MODE_TYPE_DRIVER(0x40) | DRM_MODE_TYPE_PREFERRED(0x08)
     m[32..36].copy_from_slice(&0x48u32.to_ne_bytes());
     // name @36..68 ("WxH")
     let mut name = [0u8; 32];
@@ -467,6 +483,21 @@ impl INode for DrmDev {
             read: drm::has_events(),
             write: true,
             error: false,
+        })
+    }
+
+    fn async_poll<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<PollStatus>> + Send + Sync + 'a>> {
+        let bus = drm::get_eventbus();
+        Box::pin(async move {
+            loop {
+                let status = self.poll()?;
+                if status.read {
+                    return Ok(status);
+                }
+                wait_for_event(bus.clone(), Event::READABLE).await;
+            }
         })
     }
 
@@ -706,8 +737,9 @@ impl INode for DrmDev {
                     );
                 }
                 if req.fb_id != 0 {
-                    drm::set_crtc_fb(req.crtc_id, req.fb_id);
-                    drm::scanout(req.fb_id);
+                    if !drm::present_now(req.fb_id, req.crtc_id) {
+                        return Err(FsError::DeviceError);
+                    }
                 }
                 Ok(0)
             }
@@ -734,6 +766,11 @@ impl INode for DrmDev {
                 let req = unsafe { &mut *(data as *mut DrmWaitVblank) };
                 let typ = req.typ;
                 let signal = req.val1;
+                if !drm::software_kms_active() {
+                    if let Some(driver) = drm::get_primary_driver() {
+                        let _ = driver.wait_vblank(0);
+                    }
+                }
                 let seq = drm::vblank_seq_now().wrapping_add(1);
                 if typ & _DRM_VBLANK_EVENT != 0 {
                     drm::queue_vblank_event(seq, signal);
@@ -747,13 +784,13 @@ impl INode for DrmDev {
                 Ok(0)
             }
             DRM_IOCTL_MODE_SETPLANE => {
-                // Software KMS: a primary-plane update is equivalent to scanning
-                // the framebuffer out (the legacy SETCRTC path). fb_id == 0
-                // disables the plane, which we treat as a no-op.
+                // Primary-plane update: present immediately on the target CRTC.
+                // fb_id == 0 disables the plane, which we treat as a no-op.
                 let req = unsafe { *(data as *const DrmModeSetPlane) };
                 if req.fb_id != 0 {
-                    drm::set_crtc_fb(req.crtc_id, req.fb_id);
-                    drm::scanout(req.fb_id);
+                    if !drm::present_now(req.fb_id, req.crtc_id) {
+                        return Err(FsError::DeviceError);
+                    }
                 }
                 Ok(0)
             }
@@ -795,8 +832,8 @@ impl INode for DrmDev {
                 // DIRTYFB (X's modesetting shadow, simple toolkits) rely on this
                 // to update the screen.
                 let cmd = unsafe { *(data as *const DrmModeFbDirtyCmd) };
-                if drm::software_kms_active() {
-                    drm::scanout(cmd.fb_id);
+                if !drm::present_now(cmd.fb_id, 1) {
+                    return Err(FsError::DeviceError);
                 }
                 Ok(0)
             }
@@ -885,10 +922,14 @@ impl INode for DrmDev {
                 res.count_crtcs = crtcs.len() as u32;
                 res.count_connectors = connectors.len() as u32;
 
-                // Software framebuffer path: expose the one synthetic encoder
-                // here too, consistent with GETCONNECTOR/GETENCODER. With a
-                // KMS-capable driver we don't enumerate encoders (no trait API).
-                if drm::software_kms_active() && !connectors.is_empty() {
+                // Always expose the synthetic encoder when connectors exist so
+                // that `drmIsKMS` (which checks count_crtcs > 0 &&
+                // count_connectors > 0 && count_encoders > 0) succeeds.  The
+                // synthetic encoder is valid for both the software KMS path and
+                // the hardware KMS path: `possible_crtcs = 1` maps to index 0
+                // of the CRTC list, which is SYNTH_CRTC_ID on the software path
+                // and the hardware CRTC on the hardware path.
+                if !connectors.is_empty() {
                     if res.encoder_id_ptr != 0 && res.count_encoders >= 1 {
                         unsafe {
                             *(res.encoder_id_ptr as *mut u32) = drm::SYNTH_ENCODER_ID;
@@ -909,8 +950,18 @@ impl INode for DrmDev {
                 let conn_res = unsafe { &mut *(data as *mut DrmModeGetConnector) };
                 if let Some(conn) = drm::get_connector(conn_res.connector_id) {
                     conn_res.connection = if conn.connected { 1 } else { 2 };
-                    conn_res.mm_width = conn.mm_width;
-                    conn_res.mm_height = conn.mm_height;
+                    // Physical dimensions: use the connector's reported values
+                    // and fall back to a calculation from the display resolution
+                    // so wlroots never sees "Physical size: 0x0" (which prevents
+                    // correct DPI/scaling in many compositors).
+                    let (fallback_w, fallback_h) = drm::display_mode()
+                        .map(|(w, h, _)| {
+                            // Assume ~96 DPI (1 in = 25.4 mm, 96 px/in).
+                            ((w * 254 / 960).max(1), (h * 254 / 960).max(1))
+                        })
+                        .unwrap_or((1, 1));
+                    conn_res.mm_width = if conn.mm_width > 0 { conn.mm_width } else { fallback_w };
+                    conn_res.mm_height = if conn.mm_height > 0 { conn.mm_height } else { fallback_h };
                     // Real DRM_MODE_CONNECTOR_* from the driver (NVIDIA fills
                     // it from the RM's GET_CONNECTOR_DATA); synthetic and
                     // fallback connectors keep the historical 11.
@@ -964,8 +1015,19 @@ impl INode for DrmDev {
             DRM_IOCTL_MODE_GETENCODER => {
                 let enc = unsafe { &mut *(data as *mut DrmModeGetEncoder) };
                 enc.encoder_id = drm::SYNTH_ENCODER_ID;
-                enc.encoder_type = 0; // DRM_MODE_ENCODER_NONE
-                enc.crtc_id = 1; // synthetic CRTC
+                // DRM_MODE_ENCODER_VIRTUAL=6: correct type for a software/
+                // virtual encoder that drives a dumb-buffer scanout path.
+                // Reporting NONE(0) causes some compositors to skip property
+                // queries and misidentify the output type.
+                enc.encoder_type = 6; // DRM_MODE_ENCODER_VIRTUAL
+                // On the software KMS path the only CRTC is the synthetic one
+                // (id=1). On the hardware KMS path, report crtc_id=0 (no
+                // currently active CRTC) because CRTC 1 does not appear in the
+                // resource list that hardware drivers expose; wlroots will
+                // configure the CRTC itself via SETCRTC.
+                // possible_crtcs=1 means bit 0 = index 0 of the CRTC list,
+                // which is correct in both paths.
+                enc.crtc_id = if drm::software_kms_active() { drm::SYNTH_CRTC_ID } else { 0 };
                 enc.possible_crtcs = 1; // bitmask: CRTC index 0
                 enc.possible_clones = 0;
                 Ok(0)
@@ -1028,8 +1090,13 @@ impl INode for DrmDev {
                 // Identify the object by id (libdrm often passes obj_type=ANY).
                 // Only the plane "type" property is mandatory; connectors/CRTCs
                 // report none (the legacy backend tolerates their absence).
-                let props: &[(u32, u64)] = if res.obj_id == drm::SYNTH_PLANE_ID {
-                    &[(PROP_TYPE, 1)] // value 1 = DRM_PLANE_TYPE_PRIMARY
+                // Look up any registered plane — not only SYNTH_PLANE_ID — so
+                // hardware planes (e.g. NVIDIA 3001, VirtIO 3000) are also
+                // classified as PRIMARY/OVERLAY/CURSOR by wlroots.
+                let plane_prop: [(u32, u64); 1];
+                let props: &[(u32, u64)] = if let Some(p) = drm::get_plane(res.obj_id) {
+                    plane_prop = [(PROP_TYPE, p.plane_type as u64)];
+                    &plane_prop
                 } else {
                     &[]
                 };

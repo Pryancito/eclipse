@@ -134,7 +134,12 @@ impl FileLike for EventFd {
     async fn async_poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
         loop {
             let status = self.poll(_events)?;
-            if status.read || status.write {
+            let want_read = _events.contains(PollEvents::IN);
+            let want_write = _events.contains(PollEvents::OUT);
+            let ready = (want_read && status.read)
+                || (want_write && status.write)
+                || (!want_read && !want_write);
+            if ready {
                 return Ok(status);
             }
             let bus = self.eventbus.clone();

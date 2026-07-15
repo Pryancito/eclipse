@@ -232,11 +232,13 @@ hal_fn_def! {
         pub fn fill_random(buf: &mut [u8]) {
             cfg_if! {
                 if #[cfg(target_arch = "x86_64")] {
-                    // TODO: optimize
-                    for x in buf.iter_mut() {
-                        let mut r = 0;
-                        unsafe { core::arch::x86_64::_rdrand16_step(&mut r) };
-                        *x = r as _;
+                    // One RDRAND yields 8 bytes; issuing it per *byte* made
+                    // /dev/urandom ~1000 cycles/byte, which stalls library
+                    // startups that read entropy in bulk.
+                    for chunk in buf.chunks_mut(8) {
+                        let mut r: u64 = 0;
+                        unsafe { core::arch::x86_64::_rdrand64_step(&mut r) };
+                        chunk.copy_from_slice(&r.to_ne_bytes()[..chunk.len()]);
                     }
                 } else {
                     static mut SEED: u64 = 0xdead_beef_cafe_babe;

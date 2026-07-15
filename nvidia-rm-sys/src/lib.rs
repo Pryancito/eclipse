@@ -7,6 +7,7 @@
 //! both and stays as a standing canary that the C-compile + FFI-link
 //! pipeline itself still works -- see build.rs and vendor/smoketest.c.
 #![no_std]
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 extern crate alloc;
 

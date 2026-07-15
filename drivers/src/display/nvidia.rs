@@ -1,5 +1,6 @@
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::bus::pci_drivers::PciDriver;
 use crate::prelude::{AccelCaps, ColorFormat, DisplayInfo, FrameBuffer};
@@ -471,6 +472,31 @@ pub enum NvidiaArchitecture {
     Blackwell,   // RTX 50 series
 }
 
+#[derive(Clone, Copy)]
+struct ImportedGemHandle {
+    id: u32,
+    phys_addr: u64,
+    size: usize,
+}
+
+#[derive(Clone, Copy)]
+struct NvidiaKmsFramebuffer {
+    id: u32,
+    handle_id: u32,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    phys_addr: u64,
+    size: usize,
+}
+
+#[derive(Clone, Copy)]
+struct NvidiaKmsState {
+    crtc_fb: u32,
+    plane_fb: u32,
+    last_vblank_us: u64,
+}
+
 pub struct NvidiaGpu {
     name: String,
     info: DisplayInfo,
@@ -533,6 +559,14 @@ pub struct NvidiaGpu {
     /// Cached step-10 result (CE memset/copy + readback verify). Cached like
     /// the others so repeated `cat`s don't re-run CE work; a reboot re-arms.
     step10_result: Mutex<Option<String>>,
+    /// Imported GEM handles from the DRM core; indexed by core handle id.
+    imported_handles: Mutex<Vec<ImportedGemHandle>>,
+    /// Driver-private framebuffer objects keyed by driver fb id.
+    kms_framebuffers: Mutex<Vec<NvidiaKmsFramebuffer>>,
+    /// Driver-side ids for framebuffer objects.
+    next_kms_fb_id: AtomicU32,
+    /// Current KMS state exposed by GETCRTC/GETPLANE and used by wait_vblank.
+    kms_state: Mutex<NvidiaKmsState>,
 }
 
 /// Simple bitmap-based VRAM allocator for BAR1 aperture (4KB page granularity)
@@ -756,6 +790,14 @@ impl NvidiaGpu {
             gsp_init_result: Mutex::new(None),
             state_init_result: Mutex::new(None),
             step10_result: Mutex::new(None),
+            imported_handles: Mutex::new(Vec::new()),
+            kms_framebuffers: Mutex::new(Vec::new()),
+            next_kms_fb_id: AtomicU32::new(1),
+            kms_state: Mutex::new(NvidiaKmsState {
+                crtc_fb: 0,
+                plane_fb: 0,
+                last_vblank_us: 0,
+            }),
         })
     }
 
@@ -784,6 +826,45 @@ impl NvidiaGpu {
             }
             _ => false,
         }
+    }
+
+    fn imported_handle(&self, handle_id: u32) -> Option<ImportedGemHandle> {
+        self.imported_handles
+            .lock()
+            .iter()
+            .find(|h| h.id == handle_id)
+            .copied()
+    }
+
+    fn kms_fb(&self, fb_id: u32) -> Option<NvidiaKmsFramebuffer> {
+        self.kms_framebuffers
+            .lock()
+            .iter()
+            .find(|f| f.id == fb_id)
+            .copied()
+    }
+
+    fn present_kms_fb(&self, fb_id: u32) -> bool {
+        use crate::bus::phys_to_virt;
+        let Some(fb) = self.kms_fb(fb_id) else {
+            return false;
+        };
+        if fb.phys_addr == 0 || fb.size < 4 || fb.pitch == 0 {
+            return false;
+        }
+        let src_vaddr = phys_to_virt(fb.phys_addr as usize);
+        let src = unsafe { core::slice::from_raw_parts(src_vaddr as *const u32, fb.size / 4) };
+        let width = fb.width.min(self.info.width);
+        let height = fb.height.min(self.info.height);
+        let src_stride = (fb.pitch / 4) as usize;
+        self.blit_from(0, 0, src, src_stride, width, height);
+        let _ = self.flush();
+        let now = unsafe { crate::bus::drivers_timer_now_as_micros() };
+        let mut state = self.kms_state.lock();
+        state.crtc_fb = fb.id;
+        state.plane_fb = fb.id;
+        state.last_vblank_us = now;
+        true
     }
 
     /// Pre-boot hardware-state snapshot (Copilot/checklist item: "comparar
@@ -2250,8 +2331,21 @@ impl NvidiaGpu {
     /// side, so repeated calls are cheap). `None` until this GPU's bring-up
     /// chain has run, or when the GPU has no display engine.
     fn rm_display_state(&self) -> Option<(u32, nvidia_rm_sys::rm_init::GrEdid)> {
+        use core::sync::atomic::{AtomicBool, Ordering};
         let instance = (*self.rm_device_instance.lock())?;
-        let d = nvidia_rm_sys::rm_init::edid(instance).ok()?;
+        // The FIRST query runs the full RM/GSP control chain plus a DDC/EDID
+        // probe (the C side then caches it for the rest of the boot). That can
+        // take a long time and is not reentrant, so serialize opportunistically:
+        // a caller that finds another query in flight reports "no RM topology"
+        // and the DRM layer falls back to the synthetic connector, instead of
+        // parking a second CPU behind it.
+        static EDID_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        if EDID_IN_FLIGHT.swap(true, Ordering::Acquire) {
+            return None;
+        }
+        let d = nvidia_rm_sys::rm_init::edid(instance).ok();
+        EDID_IN_FLIGHT.store(false, Ordering::Release);
+        let d = d?;
         (d.supported_status == 0 && d.display_mask != 0).then_some((instance, d))
     }
 
@@ -2275,16 +2369,16 @@ impl NvidiaGpu {
 /// NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_* -> DRM_MODE_CONNECTOR_*.
 fn nv_conn_type_to_drm(t: u32) -> u32 {
     match t {
-        0x00 => 1,                               // VGA_15_PIN
-        0x30 | 0x38 | 0x39 => 2,                 // DVI_I / LFH_DVI_I_{1,2}
-        0x31 => 3,                               // DVI_D
-        0x46 | 0x47 | 0x49 | 0x64 | 0x65 => 10,  // DP ext/int/serializer, LFH_DP
-        0x48 => 10,                              // DP_MINI_EXT
-        0x61 | 0x63 => 11,                       // HDMI_A / HDMI_C_MINI
-        0x70 => 15,                              // VIRTUAL_WFD
-        0x71 | 0x74 => 10,                       // USB_C (DP alt mode)
-        0x72 => 16,                              // DSI
-        _ => 0,                                  // Unknown
+        0x00 => 1,                              // VGA_15_PIN
+        0x30 | 0x38 | 0x39 => 2,                // DVI_I / LFH_DVI_I_{1,2}
+        0x31 => 3,                              // DVI_D
+        0x46 | 0x47 | 0x49 | 0x64 | 0x65 => 10, // DP ext/int/serializer, LFH_DP
+        0x48 => 10,                             // DP_MINI_EXT
+        0x61 | 0x63 => 11,                      // HDMI_A / HDMI_C_MINI
+        0x70 => 15,                             // VIRTUAL_WFD
+        0x71 | 0x74 => 10,                      // USB_C (DP alt mode)
+        0x72 => 16,                             // DSI
+        _ => 0,                                 // Unknown
     }
 }
 
@@ -4050,8 +4144,19 @@ impl DrmScheme for NvidiaGpu {
                         phase(c.alloc_status)
                     );
                 }
-                let _ = writeln!(s, "[gpuedid] GET_SUPPORTED:            {} (outputs={:#x}, DDC-capable={:#x})", phase(c.supported_status), c.display_mask, c.display_mask_ddc);
-                let _ = writeln!(s, "[gpuedid] GET_CONNECT_STATE:        {} (connected={:#x})", phase(c.connect_status), c.connected_mask);
+                let _ = writeln!(
+                    s,
+                    "[gpuedid] GET_SUPPORTED:            {} (outputs={:#x}, DDC-capable={:#x})",
+                    phase(c.supported_status),
+                    c.display_mask,
+                    c.display_mask_ddc
+                );
+                let _ = writeln!(
+                    s,
+                    "[gpuedid] GET_CONNECT_STATE:        {} (connected={:#x})",
+                    phase(c.connect_status),
+                    c.connected_mask
+                );
                 // The DRM view: connector ids GETRESOURCES/GETCONNECTOR now
                 // serve for this GPU (real topology, not the 1001 stub).
                 if c.supported_status == 0 && c.display_mask != 0 {
@@ -4062,7 +4167,11 @@ impl DrmScheme for NvidiaGpu {
                                 s,
                                 " {}{}",
                                 Self::rm_connector_id(device_instance, b),
-                                if c.connected_mask & (1 << b) != 0 { "*" } else { "" }
+                                if c.connected_mask & (1 << b) != 0 {
+                                    "*"
+                                } else {
+                                    ""
+                                }
                             );
                         }
                     }
@@ -5618,18 +5727,74 @@ impl DrmScheme for NvidiaGpu {
         }
     }
 
-    fn import_buffer(&self, _handle: GemHandle) -> bool {
+    fn has_hardware_kms(&self) -> bool {
+        self.info.width > 0 && self.info.height > 0 && self.info.fb_size >= 4
+    }
+
+    fn import_buffer(&self, handle: GemHandle) -> bool {
+        let mut handles = self.imported_handles.lock();
+        if let Some(existing) = handles.iter_mut().find(|h| h.id == handle.id) {
+            *existing = ImportedGemHandle {
+                id: handle.id,
+                phys_addr: handle.phys_addr,
+                size: handle.size,
+            };
+            return true;
+        }
+        handles.push(ImportedGemHandle {
+            id: handle.id,
+            phys_addr: handle.phys_addr,
+            size: handle.size,
+        });
         true
     }
 
     fn free_buffer(&self, handle: GemHandle) {
+        self.imported_handles.lock().retain(|h| h.id != handle.id);
+        let removed_ids: Vec<u32> = {
+            let mut fbs = self.kms_framebuffers.lock();
+            let ids: Vec<u32> = fbs
+                .iter()
+                .filter(|fb| fb.handle_id == handle.id)
+                .map(|fb| fb.id)
+                .collect();
+            fbs.retain(|fb| fb.handle_id != handle.id);
+            ids
+        };
+        if !removed_ids.is_empty() {
+            let mut state = self.kms_state.lock();
+            if removed_ids.iter().any(|id| *id == state.crtc_fb) {
+                state.crtc_fb = 0;
+            }
+            if removed_ids.iter().any(|id| *id == state.plane_fb) {
+                state.plane_fb = 0;
+            }
+        }
         if let Some(ref mut a) = *self.vram_allocator.lock() {
             a.free(handle.phys_addr, handle.size);
         }
     }
 
-    fn create_fb(&self, handle_id: u32, _width: u32, _height: u32, _pitch: u32) -> Option<u32> {
-        Some(handle_id)
+    fn create_fb(&self, handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<u32> {
+        let handle = self.imported_handle(handle_id)?;
+        if width == 0 || height == 0 || pitch == 0 {
+            return None;
+        }
+        let size = (pitch as usize).checked_mul(height as usize)?;
+        if size == 0 || size > handle.size {
+            return None;
+        }
+        let fb_id = self.next_kms_fb_id.fetch_add(1, Ordering::Relaxed);
+        self.kms_framebuffers.lock().push(NvidiaKmsFramebuffer {
+            id: fb_id,
+            handle_id,
+            width,
+            height,
+            pitch,
+            phys_addr: handle.phys_addr,
+            size,
+        });
+        Some(fb_id)
     }
 
     fn page_flip(&self, _fb_id: u32) -> bool {
@@ -5652,6 +5817,19 @@ impl DrmScheme for NvidiaGpu {
     }
 
     fn wait_vblank(&self, _crtc_id: u32) -> bool {
+        const FRAME_US: u64 = 1_000_000 / 60;
+        let state = self.kms_state.lock();
+        let now = unsafe { crate::bus::drivers_timer_now_as_micros() };
+        let target = if state.last_vblank_us == 0 {
+            now.saturating_add(FRAME_US)
+        } else {
+            state.last_vblank_us.saturating_add(FRAME_US)
+        };
+        drop(state);
+        while unsafe { crate::bus::drivers_timer_now_as_micros() } < target {
+            core::hint::spin_loop();
+        }
+        self.kms_state.lock().last_vblank_us = target;
         true
     }
 
@@ -5714,9 +5892,10 @@ impl DrmScheme for NvidiaGpu {
 
     fn get_crtc(&self, id: u32) -> Option<DrmCrtc> {
         if id == 2001 {
+            let state = self.kms_state.lock();
             Some(DrmCrtc {
                 id,
-                fb_id: 0,
+                fb_id: state.crtc_fb,
                 x: 0,
                 y: 0,
             })
@@ -5727,10 +5906,11 @@ impl DrmScheme for NvidiaGpu {
 
     fn get_plane(&self, id: u32) -> Option<DrmPlane> {
         if id == 3001 {
+            let state = self.kms_state.lock();
             Some(DrmPlane {
                 id,
                 crtc_id: 2001,
-                fb_id: 0,
+                fb_id: state.plane_fb,
                 possible_crtcs: 1,
                 plane_type: 1,
             })
@@ -5745,9 +5925,9 @@ impl DrmScheme for NvidiaGpu {
 
     fn set_plane(
         &self,
-        _plane_id: u32,
+        plane_id: u32,
         _crtc_id: u32,
-        _fb_id: u32,
+        fb_id: u32,
         _x: i32,
         _y: i32,
         _w: u32,
@@ -5757,7 +5937,18 @@ impl DrmScheme for NvidiaGpu {
         _src_w: u32,
         _src_h: u32,
     ) -> bool {
-        true
+        if plane_id != 3001 {
+            return false;
+        }
+        if fb_id == 0 {
+            self.kms_state.lock().plane_fb = 0;
+            return true;
+        }
+        let ok = self.present_kms_fb(fb_id);
+        if ok {
+            self.kms_state.lock().plane_fb = fb_id;
+        }
+        ok
     }
 
     fn ioctl(&self, request: u32, arg: usize) -> Result<usize, i32> {

@@ -37,16 +37,20 @@ const IO_WAIT_TICK: Duration = Duration::from_millis(linux_object::net::wait::IO
 /// this bound it notices its VT becoming active and resumes fast polling.
 const SLOW_IO_WAIT_TICK: Duration = Duration::from_millis(100);
 
-/// Pick the io-wait re-poll interval: the fast tick when there is real work to
-/// watch for (a socket, or an interactive fd on the *active* VT), else the slow
-/// tick so background-VT shells don't busy-poll.
+/// Pick the io-wait re-poll interval. The slow tick exists for exactly one
+/// pattern: a shell parked in poll(stdin) on a *background* VT, whose input can
+/// only ever arrive once its VT becomes active — re-polling that at 4 ms just
+/// burns CPU. Everything else gets the fast tick: in particular a poll set with
+/// *no* interactive fd at all (DRM fds, timerfds, pipes, device fds — the shape
+/// of a compositor's startup waits) must NOT be demoted to 100 ms, or every
+/// such roundtrip is gated at a tenth of a second and startup takes minutes.
 fn io_wait_interval(s: &Syscall, watch_net: bool, watch_interactive: bool) -> Duration {
-    let active_interactive =
-        watch_interactive && s.linux_process().vt() == kernel_hal::console::active_vt();
-    if watch_net || active_interactive {
-        IO_WAIT_TICK
-    } else {
+    let background_interactive =
+        watch_interactive && s.linux_process().vt() != kernel_hal::console::active_vt();
+    if !watch_net && background_interactive {
         SLOW_IO_WAIT_TICK
+    } else {
+        IO_WAIT_TICK
     }
 }
 
@@ -126,7 +130,11 @@ impl Syscall<'_> {
                         let status = match fut.as_mut().poll(cx) {
                             Poll::Ready(Ok(ret)) => ret,
                             Poll::Ready(Err(err)) => {
-                                warn!("poll ret err: {:?}", err);
+                                // debug, not warn: synchronous serial logging in
+                                // this path costs milliseconds per line, and a
+                                // program that polls a failing fd in a loop
+                                // turns that into a continuous stall.
+                                debug!("poll ret err: {:?}", err);
                                 return Poll::Ready(Err(err));
                             }
                             Poll::Pending => continue,
@@ -147,7 +155,11 @@ impl Syscall<'_> {
                         // POSIX poll(2): negative fds are ignored (udhcpc6 leaves -1 in the set).
                         poll.revents = PE::empty();
                     } else {
-                        warn!("can not find filelike object from fd: {:?}", poll.fd);
+                        // POLLNVAL is a well-defined answer, not a kernel
+                        // error; keep the diagnostic off the (synchronous,
+                        // slow) warn channel — a program polling a stale fd in
+                        // a loop would stall on serial output otherwise.
+                        debug!("can not find filelike object from fd: {:?}", poll.fd);
                         poll.revents |= PE::INVAL;
                         events += 1;
                     }
