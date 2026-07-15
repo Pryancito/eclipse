@@ -558,6 +558,23 @@ pub fn get_connector(id: u32) -> Option<DrmConnector> {
     })
 }
 
+pub fn get_connector_edid(id: u32) -> Option<[u8; 128]> {
+    // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
+    for driver in snapshot_drivers() {
+        if let Some(edid) = driver.get_connector_edid(id) {
+            return Some(edid);
+        }
+    }
+    if id == SYNTH_CONNECTOR_ID {
+        if let Some((e, len)) = zcore_drivers::display::boot_edid() {
+            if len >= 128 {
+                return Some(e);
+            }
+        }
+    }
+    None
+}
+
 pub fn get_crtc(id: u32) -> Option<DrmCrtc> {
     // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
     for driver in snapshot_drivers() {

@@ -5731,6 +5731,29 @@ impl DrmScheme for NvidiaGpu {
         self.info.width > 0 && self.info.height > 0 && self.info.fb_size >= 4
     }
 
+    fn get_connector_edid(&self, id: u32) -> Option<[u8; 128]> {
+        let (instance, d) = self.rm_display_state()?;
+        let bit = id.checked_sub(1001 + 100 * instance)?;
+        if bit >= 32 || d.display_mask & (1u32 << bit) == 0 {
+            return None;
+        }
+        let did = 1u32 << bit;
+        let connected = d.connected_mask & did != 0;
+        if connected && d.edid_valid == 1 && d.edid_display_id == did {
+            if let Some((boot_e, boot_len)) = boot_edid() {
+                if boot_len >= 128 {
+                    if boot_e[8..12] == d.edid_head[8..12] {
+                        return Some(boot_e);
+                    }
+                }
+            }
+            let mut edid = [0u8; 128];
+            edid[..32].copy_from_slice(&d.edid_head);
+            return Some(edid);
+        }
+        None
+    }
+
     fn import_buffer(&self, handle: GemHandle) -> bool {
         let mut handles = self.imported_handles.lock();
         if let Some(existing) = handles.iter_mut().find(|h| h.id == handle.id) {

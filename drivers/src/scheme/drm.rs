@@ -64,6 +64,11 @@ pub trait DrmScheme: Scheme {
         false
     }
 
+    /// Retrieve the raw 128-byte EDID for a connector, if available.
+    fn get_connector_edid(&self, _id: u32) -> Option<[u8; 128]> {
+        None
+    }
+
     /// Read-only register/state dump for GPU bring-up debugging, surfaced at
     /// `/proc/gpudbg`. Default: nothing. Hardware drivers override it to read
     /// (never write) device registers post-boot — early BAR0 access can hang

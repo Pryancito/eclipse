@@ -87,6 +87,7 @@ const DRM_IOCTL_MODE_SETPLANE: u32 = 0xC03064B7;
 const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = 0xC02064B9;
 const DRM_IOCTL_MODE_OBJ_SETPROPERTY: u32 = 0xC01864BA;
 const DRM_IOCTL_MODE_GETPROPERTY: u32 = 0xC04064AA;
+const DRM_IOCTL_MODE_GETPROPBLOB: u32 = 0xC01064AC;
 // Legacy connector property setter (`drmModeConnectorSetProperty`), used by
 // wlroots' legacy DRM path to drive the connector DPMS state to "on" during a
 // modeset commit. `struct drm_mode_connector_set_property { __u64 value; __u32
@@ -118,6 +119,7 @@ const _DRM_VBLANK_EVENT: u32 = 0x0400_0000;
 // Synthetic property ids (software KMS). Only the plane "type" is mandatory for
 // wlroots' legacy backend to classify the primary plane.
 const PROP_TYPE: u32 = 10;
+const PROP_EDID: u32 = 11;
 
 // DRM client capabilities (DRM_IOCTL_SET_CLIENT_CAP).
 const DRM_CLIENT_CAP_ATOMIC: u64 = 3;
@@ -302,6 +304,14 @@ struct DrmModeGetProperty {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
+struct DrmModeGetBlob {
+    blob_id: u32,
+    length: u32,
+    data: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
 struct DrmModePropertyEnum {
     value: u64,
     name: [u8; 32],
@@ -384,6 +394,7 @@ const _: () = {
     assert!(size_of::<DrmModeCrtcPageFlip>() == 24); // DRM_IOCTL_MODE_PAGE_FLIP 0x..18..
     assert!(size_of::<DrmModeObjGetProperties>() == 32); // OBJ_GETPROPERTIES 0x..20..
     assert!(size_of::<DrmModeGetProperty>() == 64); // GETPROPERTY        0x..40..
+    assert!(size_of::<DrmModeGetBlob>() == 16); // GETPROPBLOB        0x..10..
     assert!(size_of::<DrmModePropertyEnum>() == 40);
     assert!(size_of::<DrmModeGetPlane>() == 32); // DRM_IOCTL_MODE_GETPLANE 0x..20..
     assert!(size_of::<DrmWaitVblank>() == 24); // DRM_IOCTL_WAIT_VBLANK   0x..18..
@@ -995,7 +1006,18 @@ impl INode for DrmDev {
                     } else {
                         conn_res.count_modes = 0;
                     }
-                    conn_res.count_props = 0;
+                    let mut count_props = 0;
+                    if drm::get_connector_edid(conn_res.connector_id).is_some() {
+                        count_props = 1;
+                        if conn_res.props_ptr != 0 && conn_res.prop_values_ptr != 0 && conn_res.count_props >= 1 {
+                            let blob_id = 20000 + conn_res.connector_id;
+                            unsafe {
+                                *(conn_res.props_ptr as *mut u32) = PROP_EDID;
+                                *(conn_res.prop_values_ptr as *mut u64) = blob_id as u64;
+                            }
+                        }
+                    }
+                    conn_res.count_props = count_props;
                     log::debug!(
                         "[drm] GETCONNECTOR id={} connected={} modes={} mode={:?}",
                         conn_res.connector_id,
@@ -1094,9 +1116,16 @@ impl INode for DrmDev {
                 // hardware planes (e.g. NVIDIA 3001, VirtIO 3000) are also
                 // classified as PRIMARY/OVERLAY/CURSOR by wlroots.
                 let plane_prop: [(u32, u64); 1];
+                let conn_prop: [(u32, u64); 1];
                 let props: &[(u32, u64)] = if let Some(p) = drm::get_plane(res.obj_id) {
                     plane_prop = [(PROP_TYPE, p.plane_type as u64)];
                     &plane_prop
+                } else if drm::get_connector(res.obj_id).is_some()
+                    && drm::get_connector_edid(res.obj_id).is_some()
+                {
+                    let blob_id = 20000 + res.obj_id;
+                    conn_prop = [(PROP_EDID, blob_id as u64)];
+                    &conn_prop
                 } else {
                     &[]
                 };
@@ -1156,7 +1185,39 @@ impl INode for DrmDev {
                         res.count_values = VALUES.len() as u32;
                         Ok(0)
                     }
+                    PROP_EDID => {
+                        res.flags = 16 | 4; // DRM_MODE_PROP_BLOB | IMMUTABLE
+                        let mut name = [0u8; 32];
+                        name[..4].copy_from_slice(b"EDID");
+                        res.name = name;
+                        res.count_values = 0;
+                        res.count_enum_blobs = 0;
+                        Ok(0)
+                    }
                     _ => Err(FsError::InvalidParam),
+                }
+            }
+            DRM_IOCTL_MODE_GETPROPBLOB => {
+                let res = unsafe { &mut *(data as *mut DrmModeGetBlob) };
+                let connector_id = res.blob_id.checked_sub(20000);
+                if let Some(conn_id) = connector_id {
+                    if let Some(edid) = drm::get_connector_edid(conn_id) {
+                        if res.data != 0 && res.length >= edid.len() as u32 {
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    edid.as_ptr(),
+                                    res.data as *mut u8,
+                                    edid.len(),
+                                );
+                            }
+                        }
+                        res.length = edid.len() as u32;
+                        Ok(0)
+                    } else {
+                        Err(FsError::InvalidParam)
+                    }
+                } else {
+                    Err(FsError::InvalidParam)
                 }
             }
             _ => {
