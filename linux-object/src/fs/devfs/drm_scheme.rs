@@ -2,11 +2,15 @@
 //!
 //! Exposes the DRM subsystem to userspace via IOCTLs and memory mapping.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::any::Any;
+use core::future::Future;
+use core::pin::Pin;
 
 use rcore_fs::vfs::*;
 use zircon_object::vm::{pages, VmObject};
+use crate::sync::{Event, wait_for_event};
 
 use super::drm;
 
@@ -460,6 +464,21 @@ impl INode for DrmDev {
             read: drm::has_events(),
             write: true,
             error: false,
+        })
+    }
+
+    fn async_poll<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<PollStatus>> + Send + Sync + 'a>> {
+        let bus = drm::get_eventbus();
+        Box::pin(async move {
+            loop {
+                let status = self.poll()?;
+                if status.read {
+                    return Ok(status);
+                }
+                wait_for_event(bus.clone(), Event::READABLE).await;
+            }
         })
     }
 

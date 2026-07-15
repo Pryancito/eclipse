@@ -15,6 +15,7 @@ use kernel_hal::mem::phys_to_virt;
 pub use zcore_drivers::scheme::drm::{DrmCaps, DrmConnector, DrmCrtc, DrmPlane, GemHandle};
 use zcore_drivers::scheme::{DisplayScheme, DrmScheme};
 use zircon_object::vm::{pages, MMUFlags, VmObject};
+use crate::sync::{Event, EventBus};
 
 /// Synthetic KMS object IDs used when there is no real DRM/KMS driver — only a
 /// dumb framebuffer (`DisplayScheme`, e.g. the UEFI GOP display on bare metal).
@@ -82,6 +83,7 @@ struct DrmState {
     /// Pending DRM events (page-flip completions) waiting to be `read()` from
     /// the card fd. Each entry is one fully-encoded `struct drm_event_vblank`.
     events: VecDeque<Vec<u8>>,
+    eventbus: Arc<Mutex<EventBus>>,
 }
 
 lazy_static::lazy_static! {
@@ -93,6 +95,7 @@ lazy_static::lazy_static! {
         framebuffers: Vec::new(),
         crtc_fb: 0,
         events: VecDeque::new(),
+        eventbus: EventBus::new(),
     });
 }
 
@@ -355,7 +358,9 @@ fn push_drm_event(ev_type: u32, crtc_id: u32, seq: u32, user_data: u64) {
     ev.extend_from_slice(&now.subsec_micros().to_ne_bytes());
     ev.extend_from_slice(&seq.to_ne_bytes());
     ev.extend_from_slice(&crtc_id.to_ne_bytes());
-    DRM_STATE.lock().events.push_back(ev);
+    let mut state = DRM_STATE.lock();
+    state.events.push_back(ev);
+    state.eventbus.lock().set(Event::READABLE);
 }
 
 /// Enqueue a `DRM_EVENT_FLIP_COMPLETE` for a completed page flip.
@@ -396,12 +401,20 @@ pub fn read_event(buf: &mut [u8]) -> Option<usize> {
     let n = ev.len();
     buf[..n].copy_from_slice(&ev[..n]);
     state.events.pop_front();
+    if state.events.is_empty() {
+        state.eventbus.lock().clear(Event::READABLE);
+    }
     Some(n)
 }
 
 /// Whether any DRM events are queued for reading.
 pub fn has_events() -> bool {
     !DRM_STATE.lock().events.is_empty()
+}
+
+/// Expose the DRM event bus
+pub fn get_eventbus() -> Arc<Mutex<EventBus>> {
+    DRM_STATE.lock().eventbus.clone()
 }
 
 pub fn get_caps() -> Option<DrmCaps> {
