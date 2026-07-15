@@ -5185,6 +5185,25 @@ NV_STATUS eclipse_rm_edid(NvU32 gpuInstance, EclipseGrEdid *pOut)
     hDispCommon = kdispGetDispCommonHandle(pKernelDisplay);
     if (hDispClient == 0 || hDispCommon == 0)
     {
+        /*
+         * The RM normally creates the internal DispCommon pair in
+         * kdispStatePreInitLocked, but on the console GPU the CPU-side
+         * state chain hangs after the EXP1c PDISP reset (run r17) -- and
+         * the display controls don't actually need it: they are
+         * ROUTE_TO_PHYSICAL RPCs served by the GSP, whose own display
+         * state has been live since kgspInitRm. Create the handle pair on
+         * demand with the RM's own allocator (an object alloc that RPCs to
+         * the GSP; our held locks match kdispStatePreInitLocked's calling
+         * context).
+         */
+        NV_STATUS allocSt = kdispAllocateCommonHandle(pGpu, pKernelDisplay);
+        nv_printf(0, "[eclipse-rm-trace] edid: kdispAllocateCommonHandle on demand -> 0x%x\n",
+                  allocSt);
+        hDispClient = kdispGetInternalClientHandle(pKernelDisplay);
+        hDispCommon = kdispGetDispCommonHandle(pKernelDisplay);
+    }
+    if (hDispClient == 0 || hDispCommon == 0)
+    {
         pOut->allocStatus = NV_ERR_INVALID_STATE;
         nv_printf(0, "[eclipse-rm-trace] edid: RM DispCommon not initialized (client=0x%x common=0x%x)\n",
                   hDispClient, hDispCommon);
