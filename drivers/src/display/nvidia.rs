@@ -5728,7 +5728,22 @@ impl DrmScheme for NvidiaGpu {
     }
 
     fn has_hardware_kms(&self) -> bool {
-        self.info.width > 0 && self.info.height > 0 && self.info.fb_size >= 4
+        // This driver does NOT have a working hardware-KMS presentation path on
+        // this hardware. `page_flip` is a no-op (see below) because a real
+        // display modeset/scanout on these GPUs wedges (the isochronous-scanout
+        // dead-end documented in the display bring-up work). Claiming hardware
+        // KMS here is actively harmful:
+        //   * it disables `software_kms_active()` (linux-object drm.rs), so the
+        //     dumb-buffer -> UEFI-GOP-framebuffer scanout blit — the ONLY path
+        //     that actually lights up the panel — never runs (black screen);
+        //   * it makes wlroots treat the node as a real KMS GPU and take the
+        //     GLES2/GBM path, which hangs the whole OS at GL FBO creation on
+        //     this stub (no usable GL/GBM). pixman + software scanout is the
+        //     only combination that works here.
+        // Return false so the software-KMS path drives the output. The KMS
+        // framebuffer machinery above (create_fb/present_kms_fb) is left in
+        // place, dormant, for the day a real modeset path exists.
+        false
     }
 
     fn get_connector_edid(&self, id: u32) -> Option<[u8; 128]> {

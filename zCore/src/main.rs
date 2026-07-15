@@ -101,7 +101,9 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // greets with "I can't find my home directory!" and readline (tab
             // completion) misbehaves for lack of `TERM`.
             let envs: alloc::vec::Vec<alloc::string::String> = alloc::vec![
-                "PATH=/usr/sbin:/usr/bin:/sbin:/bin".into(),
+                // /usr/local/bin first so the Eclipse labwc wrapper (which
+                // forces the pixman renderer) shadows the apk-installed binary.
+                "PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
                 "ENV=/etc/profile".into(),
                 "HOME=/root".into(),
                 "TERM=xterm-256color".into(),

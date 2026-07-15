@@ -582,7 +582,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
     fn write_profile(etc: &Path) {
         fs::write(
             etc.join("profile"),
-            b"export PATH=/bin:/sbin:/usr/bin:/usr/sbin\n\
+            b"export PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin\n\
               export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n\
               export SSL_CERT_DIR=/etc/ssl/certs\n\
               export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt\n\
@@ -609,6 +609,17 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # frame'), leaving no visible mouse pointer. Force the software\n\
               # cursor so wlroots composites the pointer into the framebuffer.\n\
               export WLR_NO_HARDWARE_CURSORS=1\n\
+              # Pin wlroots to the console GPU's DRM node (card0 =\n\
+              # nvidia-gpu-23:0.0). This box has TWO nvidia DRM cards (card0 =\n\
+              # console GPU driving the physical monitor via the UEFI GOP\n\
+              # framebuffer; card1 = the compute GPU we run kernels on). Without\n\
+              # this, wlroots may enumerate both and bind a phantom connector on\n\
+              # the compute GPU. Pinning card0 gives labwc a SINGLE logical\n\
+              # output and keeps it off the compute GPU. Physical pixels always\n\
+              # land on the GOP framebuffer via the kernel's software-KMS\n\
+              # scanout regardless, so this is really about presenting one\n\
+              # output, not about which port lights up.\n\
+              export WLR_DRM_DEVICES=/dev/dri/card0\n\
               # Software GL via Mesa (no usable HW 3D). The DRM node reports a\n\
               # real NVIDIA PCI id, so Mesa would try the hardware nouveau driver\n\
               # and fail; force the KMS software rasteriser (kms_swrast/llvmpipe)\n\
@@ -743,6 +754,47 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               </labwc_config>\n",
         )
         .unwrap();
+
+        // Bulletproof `labwc` launcher. wlroots picks its renderer from
+        // WLR_RENDERER *at exec time*, and it does NOT auto-fall-back from
+        // gles2 to pixman. On this box the nvidia DRM node is a stub with no
+        // usable GLES2/GBM: the gles2/GBM path hangs the whole OS at GL FBO
+        // creation. Only pixman + the kernel's software-KMS scanout works.
+        //
+        // We set these vars in the kernel init env and /etc/profile, but
+        // login(1) rebuilds the environment and strips arbitrary vars, so a
+        // compositor started from a post-login shell can lose them and fall
+        // into the freezing gles2 path. A wrapper is the only delivery that
+        // cannot be stripped: it re-exports the vars in labwc's own process
+        // and execs the real binary. Placed in /usr/local/bin, which we
+        // prepend to PATH (kernel init env + /etc/profile) so it always wins.
+        let localbin = rootfs.join("usr").join("local").join("bin");
+        let _ = fs::create_dir_all(&localbin);
+        let wrapper = localbin.join("labwc");
+        fs::write(
+            &wrapper,
+            b"#!/bin/sh\n\
+              # Eclipse OS: force the pixman software renderer for labwc.\n\
+              # The nvidia DRM node is a stub with no real GLES2/GBM; the\n\
+              # hardware-KMS/gles2 path hangs the whole OS at GL FBO creation.\n\
+              # pixman + the kernel's software-KMS scanout (dumb buffer -> UEFI\n\
+              # GOP framebuffer) is the only working combination here.\n\
+              export WLR_RENDERER=pixman\n\
+              export WLR_RENDERER_ALLOW_SOFTWARE=1\n\
+              export WLR_NO_HARDWARE_CURSORS=1\n\
+              export WLR_LIBINPUT_NO_DEVICES=1\n\
+              export WLR_DRM_DEVICES=/dev/dri/card0\n\
+              for d in /usr/bin /bin /usr/sbin /sbin; do\n\
+              \x20 if [ -x \"$d/labwc\" ]; then exec \"$d/labwc\" \"$@\"; fi\n\
+              done\n\
+              echo 'labwc: real binary not found (apk add labwc)' >&2\n\
+              exit 127\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     /// Creates symlinks in `bin/` for every busybox applet.

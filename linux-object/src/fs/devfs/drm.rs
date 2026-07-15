@@ -217,11 +217,25 @@ pub fn get_fb(fb_id: u32) -> Option<DrmFramebuffer> {
 pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<u32> {
     let handle = get_handle(handle_id)?;
 
-    // If a hardware DRM driver is present, let it create its own framebuffer
-    // object; otherwise the framebuffer is purely software (scanned out via the
-    // display's `blit_from`).
-    let driver_fb_id =
-        get_primary_driver().and_then(|driver| driver.create_fb(handle_id, width, height, pitch));
+    // The framebuffer must fit within the backing GEM buffer: `scanout()` maps
+    // `size` bytes from the buffer's contiguous phys range and blits them, so a
+    // fb larger than its buffer would read past the VMO into adjacent physical
+    // RAM (info leak / fault). Compute in usize with a checked multiply and
+    // reject ADDFB whose dimensions overflow or exceed the buffer.
+    let size = (pitch as usize).checked_mul(height as usize)?;
+    if size == 0 || size > handle.size {
+        return None;
+    }
+
+    // Only a hardware-KMS driver needs its own framebuffer object. On the
+    // software-KMS path the fb is scanned out purely via the display's
+    // `blit_from`, so a `driver.create_fb` (a GSP RPC on the NVIDIA driver) is
+    // both useless and leaked — RMFB has no driver-side destroy path.
+    let driver_fb_id = if software_kms_active() {
+        None
+    } else {
+        get_primary_driver().and_then(|driver| driver.create_fb(handle_id, width, height, pitch))
+    };
 
     let mut state = DRM_STATE.lock();
     let fb_id = state.next_fb_id;
@@ -235,7 +249,7 @@ pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<
         height,
         pitch,
         phys_addr: handle.phys_addr,
-        size: (pitch as usize) * (height as usize),
+        size,
     };
 
     state.framebuffers.push(fb);
@@ -491,12 +505,28 @@ pub fn get_resources() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
         (fbs, state.drivers.clone())
     };
 
-    // When a hardware-KMS driver is present (e.g. NVIDIA), only include
-    // resources from hardware-KMS drivers. Including non-KMS drivers (e.g.
-    // VirtIO) alongside them produces a broken DRM topology: multiple CRTCs
-    // sharing a single synthetic encoder, which causes wlroots to fail with
-    // "Failed to create DRM backend". If no driver has hardware KMS, include
-    // all drivers (e.g. VirtIO-only with no framebuffer display).
+    // Software KMS path: synthesize one CRTC + connector so `drmIsKMS()`
+    // passes and wlroots drives output through software scanout. Checked
+    // FIRST, before touching any driver: `driver.get_resources()` on the
+    // NVIDIA driver runs a live NV0073 display-control + DDC/EDID probe over
+    // GSP (see nvidia.rs `rm_display_state`), and both GPU instances — the
+    // console GPU AND the compute GPU — are registered as DRM drivers. Calling
+    // it here would drive display RPCs through the compute GPU on every
+    // GETRESOURCES and then throw the result away for the synthetic topology.
+    if software_kms_active() {
+        warn!(
+            "[drm] GETRESOURCES: software KMS -> 1 crtc, 1 connector ({:?})",
+            display_mode(),
+        );
+        return (fbs, vec![SYNTH_CRTC_ID], vec![SYNTH_CONNECTOR_ID]);
+    }
+
+    // No framebuffer display: fall back to driver-provided resources. When a
+    // hardware-KMS driver is present, only include resources from hardware-KMS
+    // drivers. Mixing non-KMS drivers (e.g. VirtIO) alongside them produces a
+    // broken DRM topology (multiple CRTCs sharing one synthetic encoder), which
+    // makes wlroots fail with "Failed to create DRM backend". If no driver has
+    // hardware KMS, include all drivers (e.g. VirtIO-only with no display).
     let has_hardware_kms = drivers.iter().any(|d| d.has_hardware_kms());
     let mut crtcs = Vec::new();
     let mut connectors = Vec::new();
@@ -506,18 +536,6 @@ pub fn get_resources() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
             crtcs.extend(d_crtcs);
             connectors.extend(d_conns);
         }
-    }
-
-    // Software fallback path: synthesize one CRTC + connector so `drmIsKMS()`
-    // passes and wlroots can drive output through software scanout.
-    if software_kms_active() {
-        warn!(
-            "[drm] GETRESOURCES: software KMS -> 1 crtc, 1 connector ({:?}) [drivers offered crtcs={} conns={}]",
-            display_mode(),
-            crtcs.len(),
-            connectors.len()
-        );
-        return (fbs, vec![SYNTH_CRTC_ID], vec![SYNTH_CONNECTOR_ID]);
     }
 
     warn!(
@@ -530,10 +548,17 @@ pub fn get_resources() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
 }
 
 pub fn get_connector(id: u32) -> Option<DrmConnector> {
-    // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
-    for driver in snapshot_drivers() {
-        if let Some(conn) = driver.get_connector(id) {
-            return Some(conn);
+    // Software KMS: serve the synthetic connector directly. Do NOT fall out to
+    // the drivers first — `nvidia.get_connector` runs a live GSP/DDC EDID probe
+    // (rm_display_state) before it even range-checks the id, so a GETCONNECTOR
+    // for the synthetic id would still drive an RPC on both GPUs (incl. the
+    // compute GPU) and stall wlroots' bind. See get_resources for detail.
+    if !software_kms_active() {
+        // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
+        for driver in snapshot_drivers() {
+            if let Some(conn) = driver.get_connector(id) {
+                return Some(conn);
+            }
         }
     }
     // Software framebuffer fallback (no driver, or driver without KMS).
@@ -576,14 +601,20 @@ pub fn get_connector_edid(id: u32) -> Option<[u8; 128]> {
 }
 
 pub fn get_crtc(id: u32) -> Option<DrmCrtc> {
-    // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
-    for driver in snapshot_drivers() {
-        if let Some(mut crtc) = driver.get_crtc(id) {
-            // Keep userspace-facing fb ids in the DRM core namespace.
-            if DRM_STATE.lock().crtc_fb != 0 {
-                crtc.fb_id = DRM_STATE.lock().crtc_fb;
+    // Software KMS: serve the synthetic CRTC directly (see get_resources —
+    // avoids driving a GSP/EDID probe through the drivers).
+    if !software_kms_active() {
+        // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
+        for driver in snapshot_drivers() {
+            if let Some(mut crtc) = driver.get_crtc(id) {
+                // Keep userspace-facing fb ids in the DRM core namespace.
+                // Read crtc_fb once (a second lock could observe a torn update).
+                let crtc_fb = DRM_STATE.lock().crtc_fb;
+                if crtc_fb != 0 {
+                    crtc.fb_id = crtc_fb;
+                }
+                return Some(crtc);
             }
-            return Some(crtc);
         }
     }
     // Software framebuffer fallback (no driver, or driver without KMS).
@@ -620,13 +651,18 @@ pub fn get_planes() -> Vec<u32> {
 }
 
 pub fn get_plane(id: u32) -> Option<DrmPlane> {
-    // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
-    for driver in snapshot_drivers() {
-        if let Some(mut plane) = driver.get_plane(id) {
-            if DRM_STATE.lock().crtc_fb != 0 {
-                plane.fb_id = DRM_STATE.lock().crtc_fb;
+    // Software KMS: serve the synthetic plane directly (see get_resources —
+    // avoids driving a GSP/EDID probe through the drivers).
+    if !software_kms_active() {
+        // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
+        for driver in snapshot_drivers() {
+            if let Some(mut plane) = driver.get_plane(id) {
+                let crtc_fb = DRM_STATE.lock().crtc_fb;
+                if crtc_fb != 0 {
+                    plane.fb_id = crtc_fb;
+                }
+                return Some(plane);
             }
-            return Some(plane);
         }
     }
     if software_kms_active() && id == SYNTH_PLANE_ID {

@@ -670,8 +670,28 @@ impl INode for DrmDev {
             DRM_IOCTL_MODE_CREATE_DUMB => {
                 let info = unsafe { &mut *(data as *mut DrmModeCreateDumb) };
                 let bpp = info.bpp.max(32);
-                let pitch = (info.width * bpp / 8 + 63) & !63;
-                let size = (pitch * info.height) as usize;
+                // width/height/bpp are userspace-controlled: compute pitch/size
+                // in 64-bit. A 32-bit `width*bpp` or `pitch*height` would wrap
+                // (e.g. 50000x50000x32) and under-allocate the buffer while
+                // echoing a huge size back, becoming an OOB read at scanout.
+                // Bound the result to a sane ceiling (64 MiB — a 4K XRGB frame
+                // is ~33 MiB) and require pitch to fit the u32 written back.
+                const MAX_DUMB_SIZE: u64 = 64 * 1024 * 1024;
+                let pitch64 = (info.width as u64 * bpp as u64 / 8 + 63) & !63;
+                let size64 = pitch64.saturating_mul(info.height as u64);
+                if pitch64 == 0
+                    || pitch64 > u32::MAX as u64
+                    || size64 == 0
+                    || size64 > MAX_DUMB_SIZE
+                {
+                    log::warn!(
+                        "[drm] CREATE_DUMB {}x{} bpp={} -> rejected (pitch={} size={} out of range)",
+                        info.width, info.height, bpp, pitch64, size64
+                    );
+                    return Err(FsError::InvalidParam);
+                }
+                let pitch = pitch64 as u32;
+                let size = size64 as usize;
 
                 if let Some(handle) = drm::alloc_buffer(size) {
                     info.handle = handle.id;
@@ -1130,7 +1150,14 @@ impl INode for DrmDev {
                     &[]
                 };
                 let n = props.len();
-                if n > 0 && res.props_ptr != 0 && (res.count_props as usize) >= n {
+                // Both output arrays are written below, so both pointers must be
+                // non-null: a client passing props_ptr set but prop_values_ptr=0
+                // would otherwise trigger a kernel write to address 0.
+                if n > 0
+                    && res.props_ptr != 0
+                    && res.prop_values_ptr != 0
+                    && (res.count_props as usize) >= n
+                {
                     for (i, (pid, val)) in props.iter().enumerate() {
                         unsafe {
                             *(res.props_ptr as *mut u32).add(i) = *pid;
