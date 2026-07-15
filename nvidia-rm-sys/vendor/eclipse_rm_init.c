@@ -5148,7 +5148,16 @@ NV_STATUS eclipse_rm_edid(NvU32 gpuInstance, EclipseGrEdid *pOut)
         threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
         return status;
     }
-    status = rmGpuGroupLockAcquire(pGpu->gpuInstance, GPU_LOCK_GRP_SUBDEVICE,
+    /*
+     * ALL-GPUs lock (not just this subdevice's): the on-demand
+     * kdispAllocateCommonHandle below constructs an RM client, and
+     * clientConstruct (client.c:163, r18) asserts unless the thread either
+     * owns ALL GPU locks or none -- a partial group lock trips the
+     * deadlock-prevention 0x1A. kdispStatePreInitLocked, the RM's own
+     * caller, runs under the gpumgr wrappers' all-GPUs lock; replicate
+     * that exact context.
+     */
+    status = rmGpuGroupLockAcquire(pGpu->gpuInstance, GPU_LOCK_GRP_ALL,
                                    GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT,
                                    &gpusLockedMask);
     if (status != NV_OK)
