@@ -141,6 +141,7 @@ impl LinuxRootfs {
         Self::write_profile(&etc);
         Self::write_passwd(&etc, &dir);
         Self::write_console_configs(&etc, &dir);
+        Self::write_labwc_config(&dir);
         Self::install_ca_certs(&dir);
 
         // /etc/machine-id — prevents dhcp_vendor "No such file or directory"
@@ -689,6 +690,55 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               set tabsize 4\n\
               set tabstospaces\n\
               set autoindent\n",
+        )
+        .unwrap();
+    }
+
+    /// Lay down a labwc config so the compositor shows a real desktop instead
+    /// of the empty-black modeset buffer. labwc paints no wallpaper itself and
+    /// only repaints on damage, so an empty session (no clients) stays black.
+    ///
+    /// - `~/.config/labwc/autostart`: on session start, paint a solid
+    ///   background with `swaybg` and open a `foot` terminal, so there is
+    ///   visible content and a continuous damage source. Each launch is guarded
+    ///   by `command -v` so a missing client never aborts the session.
+    /// - `~/.config/labwc/rc.xml`: bind Super/Alt+Return to a new terminal and
+    ///   Alt+F4 to close, so the desktop is usable even if autostart is edited.
+    ///
+    /// Requires the Wayland clients at runtime: `apk add foot swaybg`.
+    fn write_labwc_config(rootfs: &Path) {
+        let cfg = rootfs.join("root").join(".config").join("labwc");
+        let _ = fs::create_dir_all(&cfg);
+
+        // autostart: swaybg wallpaper (solid teal) + a foot terminal. `hash`
+        // (POSIX) / `command -v` guards mean a missing binary is skipped, not
+        // fatal. The trailing `&` keeps the session from blocking on them.
+        fs::write(
+            cfg.join("autostart"),
+            b"# Eclipse OS - labwc autostart.\n\
+              # Needs the Wayland clients: `apk add foot swaybg`.\n\
+              # Solid-colour wallpaper so the desktop is not black; swaybg is a\n\
+              # continuous surface, giving labwc something to composite.\n\
+              command -v swaybg >/dev/null 2>&1 && swaybg -c '#1f6f6f' &\n\
+              # A terminal so the desktop is immediately usable.\n\
+              command -v foot   >/dev/null 2>&1 && foot &\n",
+        )
+        .unwrap();
+
+        // rc.xml: minimal, valid labwc config with a couple of key bindings so
+        // a terminal can always be opened. Kept intentionally small.
+        fs::write(
+            cfg.join("rc.xml"),
+            b"<?xml version=\"1.0\"?>\n\
+              <labwc_config>\n\
+              \x20 <core><gap>0</gap></core>\n\
+              \x20 <keyboard>\n\
+              \x20   <keybind key=\"W-Return\"><action name=\"Execute\"><command>foot</command></action></keybind>\n\
+              \x20   <keybind key=\"A-Return\"><action name=\"Execute\"><command>foot</command></action></keybind>\n\
+              \x20   <keybind key=\"A-F4\"><action name=\"Close\"/></keybind>\n\
+              \x20   <keybind key=\"A-Tab\"><action name=\"NextWindow\"/></keybind>\n\
+              \x20 </keyboard>\n\
+              </labwc_config>\n",
         )
         .unwrap();
     }
