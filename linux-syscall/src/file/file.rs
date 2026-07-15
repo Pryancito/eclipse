@@ -461,8 +461,8 @@ impl Syscall<'_> {
         use linux_object::fs::devfs::drm;
         use linux_object::fs::DmaBuf;
 
-        const PRIME_HANDLE_TO_FD: usize = 0xC00C_642D;
-        const PRIME_FD_TO_HANDLE: usize = 0xC00C_642E;
+        const PRIME_HANDLE_TO_FD: usize = 0xC00C_642E; // DRM_IOWR(0x2e, drm_prime_handle)
+        const PRIME_FD_TO_HANDLE: usize = 0xC00C_642D; // DRM_IOWR(0x2d, drm_prime_handle)
         const MODE_CREATE_LEASE: usize = 0xC018_64C6;
 
         // struct drm_prime_handle { __u32 handle; __u32 flags; __s32 fd; }
