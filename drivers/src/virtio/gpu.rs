@@ -169,11 +169,17 @@ impl<'a> DrmScheme for VirtIoGpu<'a> {
 
     fn get_connector(&self, id: u32) -> Option<DrmConnector> {
         if id == 1000 {
+            // Compute physical dimensions from the display resolution at ~96 DPI
+            // (25.4 mm/inch, 96 px/inch). Use .max(1) to ensure non-zero values
+            // so compositors do not see "Physical size: 0x0" warnings.
+            let info = self.info();
+            let mm_width = (info.width * 254 / 960).max(1);
+            let mm_height = (info.height * 254 / 960).max(1);
             Some(DrmConnector {
                 id,
                 connected: true,
-                mm_width: 0,
-                mm_height: 0,
+                mm_width,
+                mm_height,
                 connector_type: 11,
             })
         } else {

@@ -26,7 +26,8 @@ use zircon_object::vm::{pages, MMUFlags, VmObject};
 /// The ids must be **distinct across object types**: libdrm identifies objects
 /// (for OBJ_GETPROPERTIES etc.) by id alone, often passing obj_type=ANY, so
 /// reusing one id for CRTC/connector/plane makes them indistinguishable.
-const SYNTH_CRTC_ID: u32 = 1;
+/// Synthetic CRTC id exposed to userspace for the synthetic output.
+pub const SYNTH_CRTC_ID: u32 = 1;
 const SYNTH_CONNECTOR_ID: u32 = 2;
 /// Encoder id exposed to userspace for the synthetic output.
 pub const SYNTH_ENCODER_ID: u32 = 3;
