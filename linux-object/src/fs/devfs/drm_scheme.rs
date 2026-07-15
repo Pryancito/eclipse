@@ -897,10 +897,14 @@ impl INode for DrmDev {
                 res.count_crtcs = crtcs.len() as u32;
                 res.count_connectors = connectors.len() as u32;
 
-                // Software framebuffer path: expose the one synthetic encoder
-                // here too, consistent with GETCONNECTOR/GETENCODER. With a
-                // KMS-capable driver we don't enumerate encoders (no trait API).
-                if drm::software_kms_active() && !connectors.is_empty() {
+                // Always expose the synthetic encoder when connectors exist so
+                // that `drmIsKMS` (which checks count_crtcs > 0 &&
+                // count_connectors > 0 && count_encoders > 0) succeeds.  The
+                // synthetic encoder is valid for both the software KMS path and
+                // the hardware KMS path: `possible_crtcs = 1` maps to index 0
+                // of the CRTC list, which is SYNTH_CRTC_ID on the software path
+                // and the hardware CRTC on the hardware path.
+                if !connectors.is_empty() {
                     if res.encoder_id_ptr != 0 && res.count_encoders >= 1 {
                         unsafe {
                             *(res.encoder_id_ptr as *mut u32) = drm::SYNTH_ENCODER_ID;
@@ -977,7 +981,14 @@ impl INode for DrmDev {
                 let enc = unsafe { &mut *(data as *mut DrmModeGetEncoder) };
                 enc.encoder_id = drm::SYNTH_ENCODER_ID;
                 enc.encoder_type = 0; // DRM_MODE_ENCODER_NONE
-                enc.crtc_id = 1; // synthetic CRTC
+                // On the software KMS path the only CRTC is the synthetic one
+                // (id=1). On the hardware KMS path, report crtc_id=0 (no
+                // currently active CRTC) because CRTC 1 does not appear in the
+                // resource list that hardware drivers expose; wlroots will
+                // configure the CRTC itself via SETCRTC.
+                // possible_crtcs=1 means bit 0 = index 0 of the CRTC list,
+                // which is correct in both paths.
+                enc.crtc_id = if drm::software_kms_active() { 1 } else { 0 };
                 enc.possible_crtcs = 1; // bitmask: CRTC index 0
                 enc.possible_clones = 0;
                 Ok(0)
