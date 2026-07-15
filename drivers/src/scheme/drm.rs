@@ -58,6 +58,12 @@ pub struct DrmPlane {
 pub trait DrmScheme: Scheme {
     fn get_caps(&self) -> DrmCaps;
 
+    /// Whether this driver can own legacy-KMS scanout/presentation for dumb
+    /// framebuffers instead of falling back to software KMS blits.
+    fn has_hardware_kms(&self) -> bool {
+        false
+    }
+
     /// Read-only register/state dump for GPU bring-up debugging, surfaced at
     /// `/proc/gpudbg`. Default: nothing. Hardware drivers override it to read
     /// (never write) device registers post-boot — early BAR0 access can hang

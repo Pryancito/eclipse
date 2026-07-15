@@ -8,9 +8,9 @@ use core::any::Any;
 use core::future::Future;
 use core::pin::Pin;
 
+use crate::sync::{wait_for_event, Event};
 use rcore_fs::vfs::*;
 use zircon_object::vm::{pages, VmObject};
-use crate::sync::{Event, wait_for_event};
 
 use super::drm;
 
@@ -718,8 +718,9 @@ impl INode for DrmDev {
                     req.mode_valid
                 );
                 if req.fb_id != 0 {
-                    drm::set_crtc_fb(req.crtc_id, req.fb_id);
-                    drm::scanout(req.fb_id);
+                    if !drm::present_now(req.fb_id, req.crtc_id) {
+                        return Err(FsError::DeviceError);
+                    }
                 }
                 Ok(0)
             }
@@ -740,6 +741,11 @@ impl INode for DrmDev {
                 let req = unsafe { &mut *(data as *mut DrmWaitVblank) };
                 let typ = req.typ;
                 let signal = req.val1;
+                if !drm::software_kms_active() {
+                    if let Some(driver) = drm::get_primary_driver() {
+                        let _ = driver.wait_vblank(0);
+                    }
+                }
                 let seq = drm::vblank_seq_now().wrapping_add(1);
                 if typ & _DRM_VBLANK_EVENT != 0 {
                     drm::queue_vblank_event(seq, signal);
@@ -753,13 +759,13 @@ impl INode for DrmDev {
                 Ok(0)
             }
             DRM_IOCTL_MODE_SETPLANE => {
-                // Software KMS: a primary-plane update is equivalent to scanning
-                // the framebuffer out (the legacy SETCRTC path). fb_id == 0
-                // disables the plane, which we treat as a no-op.
+                // Primary-plane update: present immediately on the target CRTC.
+                // fb_id == 0 disables the plane, which we treat as a no-op.
                 let req = unsafe { *(data as *const DrmModeSetPlane) };
                 if req.fb_id != 0 {
-                    drm::set_crtc_fb(req.crtc_id, req.fb_id);
-                    drm::scanout(req.fb_id);
+                    if !drm::present_now(req.fb_id, req.crtc_id) {
+                        return Err(FsError::DeviceError);
+                    }
                 }
                 Ok(0)
             }
@@ -801,8 +807,8 @@ impl INode for DrmDev {
                 // DIRTYFB (X's modesetting shadow, simple toolkits) rely on this
                 // to update the screen.
                 let cmd = unsafe { *(data as *const DrmModeFbDirtyCmd) };
-                if drm::software_kms_active() {
-                    drm::scanout(cmd.fb_id);
+                if !drm::present_now(cmd.fb_id, 1) {
+                    return Err(FsError::DeviceError);
                 }
                 Ok(0)
             }
