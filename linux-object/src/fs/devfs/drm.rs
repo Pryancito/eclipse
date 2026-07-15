@@ -490,12 +490,21 @@ pub fn get_resources() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
         (fbs, state.drivers.clone())
     };
 
+    // When a hardware-KMS driver is present (e.g. NVIDIA), only include
+    // resources from hardware-KMS drivers. Including non-KMS drivers (e.g.
+    // VirtIO) alongside them produces a broken DRM topology: multiple CRTCs
+    // sharing a single synthetic encoder, which causes wlroots to fail with
+    // "Failed to create DRM backend". If no driver has hardware KMS, include
+    // all drivers (e.g. VirtIO-only with no framebuffer display).
+    let has_hardware_kms = drivers.iter().any(|d| d.has_hardware_kms());
     let mut crtcs = Vec::new();
     let mut connectors = Vec::new();
     for driver in &drivers {
-        let (_, d_crtcs, d_conns) = driver.get_resources();
-        crtcs.extend(d_crtcs);
-        connectors.extend(d_conns);
+        if !has_hardware_kms || driver.has_hardware_kms() {
+            let (_, d_crtcs, d_conns) = driver.get_resources();
+            crtcs.extend(d_crtcs);
+            connectors.extend(d_conns);
+        }
     }
 
     // Software fallback path: synthesize one CRTC + connector so `drmIsKMS()`
@@ -572,9 +581,15 @@ pub fn get_planes() -> Vec<u32> {
         return vec![SYNTH_PLANE_ID];
     }
     // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
+    // Mirror the get_resources() filter: when a hardware-KMS driver exists,
+    // only expose its planes to avoid a mixed 2-plane topology.
+    let drivers = snapshot_drivers();
+    let has_hardware_kms = drivers.iter().any(|d| d.has_hardware_kms());
     let mut planes = Vec::new();
-    for driver in snapshot_drivers() {
-        planes.extend(driver.get_planes());
+    for driver in &drivers {
+        if !has_hardware_kms || driver.has_hardware_kms() {
+            planes.extend(driver.get_planes());
+        }
     }
     planes
 }
