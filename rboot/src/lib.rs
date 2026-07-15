@@ -27,6 +27,12 @@ pub struct BootInfo {
     pub initramfs_size: u64,
     /// Kernel command line
     pub cmdline: &'static str,
+    /// Raw EDID (first 128-byte block) of the active display, read from the
+    /// UEFI `EFI_EDID_ACTIVE_PROTOCOL` at boot. `edid_size` is 0 when the
+    /// firmware exposed no EDID. Kept LAST so growing it never shifts any
+    /// existing field's offset (ABI-stable across partial rebuilds).
+    pub edid: [u8; 128],
+    pub edid_size: u32,
 }
 
 /// Graphic output information
@@ -36,9 +42,4 @@ pub struct GraphicInfo {
     pub mode: ModeInfo,
     pub fb_addr: u64,
     pub fb_size: u64,
-    /// Raw EDID (first 128-byte block) of the active display, read from the
-    /// UEFI `EFI_EDID_ACTIVE_PROTOCOL` at boot. `edid_size` is 0 when the
-    /// firmware exposed no EDID.
-    pub edid: [u8; 128],
-    pub edid_size: u32,
 }
