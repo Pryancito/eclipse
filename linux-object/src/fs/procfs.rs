@@ -1481,12 +1481,85 @@ fn proc_gpubench_content() -> String {
 /// NV04_DISPLAY_COMMON. Read-only; needs /proc/gpuinit first.
 fn proc_gpuedid_content() -> String {
     let mut s = String::new();
+    // UEFI-captured EDID of the active console panel first: this is the real
+    // monitor (on the GOP-driving GPU), read by the firmware at power-on with
+    // no GPU display bring-up. Available even when the console GPU's GSP
+    // display cannot be brought up.
+    s.push_str(&format_uefi_edid());
     for d in kernel_hal::drivers::all_drm().as_vec().iter() {
         s.push_str(&d.bringup_edid());
     }
     if s.is_empty() {
         s.push_str("[gpuedid] no DRM driver with display support\n");
     }
+    s
+}
+
+/// Decode the bootloader-captured UEFI EDID into a human block.
+fn format_uefi_edid() -> String {
+    use core::fmt::Write;
+    let mut s = String::new();
+    let Some((e, len)) = zcore_drivers::display::boot_edid() else {
+        s.push_str("[gpuedid] === UEFI active-panel EDID: none captured by firmware ===\n");
+        return s;
+    };
+    let valid = len >= 128
+        && e[0] == 0x00
+        && e[7] == 0x00
+        && e[1..=6].iter().all(|&b| b == 0xFF);
+    if !valid {
+        let _ = writeln!(
+            s,
+            "[gpuedid] === UEFI active-panel EDID: {} bytes, header INVALID ===",
+            len
+        );
+        return s;
+    }
+    // Manufacturer PNP id: bytes 8-9, big-endian, 5-bit packed letters.
+    let m = ((e[8] as u16) << 8) | e[9] as u16;
+    let l1 = (b'A' - 1 + ((m >> 10) & 0x1f) as u8) as char;
+    let l2 = (b'A' - 1 + ((m >> 5) & 0x1f) as u8) as char;
+    let l3 = (b'A' - 1 + (m & 0x1f) as u8) as char;
+    let product = ((e[11] as u16) << 8) | e[10] as u16;
+    let serial = (e[12] as u32)
+        | ((e[13] as u32) << 8)
+        | ((e[14] as u32) << 16)
+        | ((e[15] as u32) << 24);
+    let year = 1990u32 + e[17] as u32;
+    let (cm_w, cm_h) = (e[21] as u32, e[22] as u32);
+    let _ = writeln!(
+        s,
+        "[gpuedid] === UEFI active-panel EDID: {}{}{} product={:#06x} serial={:#010x} year={} (EDID v{}.{}) ===",
+        l1, l2, l3, product, serial, year, e[18], e[19]
+    );
+    let _ = writeln!(
+        s,
+        "[gpuedid] MONITOR: {}{}{} product={:#06x} year={} -- {}x{} mm",
+        l1,
+        l2,
+        l3,
+        product,
+        year,
+        cm_w * 10,
+        cm_h * 10
+    );
+    // First detailed timing descriptor (byte 54) = preferred/native mode.
+    let d = &e[54..72];
+    let pclk_khz = (((d[1] as u32) << 8) | d[0] as u32) * 10;
+    if pclk_khz != 0 {
+        let h_active = (d[2] as u32) | (((d[4] as u32) & 0xF0) << 4);
+        let v_active = (d[5] as u32) | (((d[7] as u32) & 0xF0) << 4);
+        let _ = writeln!(
+            s,
+            "[gpuedid] native mode: {}x{} (pixel clock {} kHz)",
+            h_active, v_active, pclk_khz
+        );
+    }
+    let _ = write!(s, "[gpuedid] EDID head:");
+    for b in e[..32].iter() {
+        let _ = write!(s, " {:02x}", b);
+    }
+    let _ = writeln!(s);
     s
 }
 

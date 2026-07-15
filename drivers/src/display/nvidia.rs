@@ -433,6 +433,29 @@ pub fn set_boot_fb_info(phys: u64, width: u32, height: u32, pitch: u32) {
     });
 }
 
+/// Raw EDID of the active display captured by the UEFI bootloader
+/// (`EFI_EDID_ACTIVE_PROTOCOL`), stashed at driver init. This is the real
+/// panel on the GPU that drives the GOP console -- available with no GPU
+/// display bring-up at all. `len` is the valid byte count (0 = none).
+static BOOT_EDID: Mutex<Option<([u8; 128], u32)>> = Mutex::new(None);
+
+/// Record the boot-time EDID (called from kernel-hal with the bootloader's
+/// `GraphicInfo.edid`). A zero length is stored as "no EDID".
+pub fn set_boot_edid(edid: &[u8], len: u32) {
+    if len == 0 || edid.is_empty() {
+        return;
+    }
+    let mut buf = [0u8; 128];
+    let n = (len as usize).min(edid.len()).min(128);
+    buf[..n].copy_from_slice(&edid[..n]);
+    *BOOT_EDID.lock() = Some((buf, n as u32));
+}
+
+/// The captured UEFI EDID (bytes, valid length), if the firmware exposed one.
+pub fn boot_edid() -> Option<([u8; 128], u32)> {
+    *BOOT_EDID.lock()
+}
+
 /// Physical address of the boot (UEFI GOP) framebuffer, if known. The GPU whose
 /// BAR1 aperture contains this address is the one driving the console.
 fn boot_fb_phys() -> Option<u64> {
