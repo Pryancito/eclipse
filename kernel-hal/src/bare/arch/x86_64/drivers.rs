@@ -143,6 +143,8 @@ pub(super) fn init() -> DeviceResult {
                 height as u32,
                 (stride * 4) as u32,
             );
+            // Real panel EDID captured by the bootloader from UEFI.
+            zcore_drivers::display::set_boot_edid(&KCONFIG.fb_edid, KCONFIG.fb_edid_size);
         }
 
         boot_progress(84);

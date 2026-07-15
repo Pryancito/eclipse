@@ -487,12 +487,19 @@ pub fn get_connector(id: u32) -> Option<DrmConnector> {
         return None;
     }
     let (w, h, _) = display_mode()?;
+    // Prefer the real panel size from the UEFI-captured EDID (bytes 21/22 =
+    // max image size in cm); fall back to a ~96 DPI estimate from the mode.
+    let (mm_width, mm_height) = match zcore_drivers::display::boot_edid() {
+        Some((e, len)) if len >= 23 && (e[21] != 0 || e[22] != 0) => {
+            (e[21] as u32 * 10, e[22] as u32 * 10)
+        }
+        _ => ((w * 254 / 960).max(1), (h * 254 / 960).max(1)),
+    };
     Some(DrmConnector {
         id: SYNTH_CONNECTOR_ID,
         connected: true,
-        // Physical size assuming ~96 DPI (1 inch = 25.4 mm, 96 px/inch).
-        mm_width: (w * 254 / 960).max(1),
-        mm_height: (h * 254 / 960).max(1),
+        mm_width,
+        mm_height,
         connector_type: 11,
     })
 }

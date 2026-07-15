@@ -23,6 +23,7 @@ use core::arch::asm;
 use log::LevelFilter;
 use rboot::{BootInfo, GraphicInfo};
 use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
+use uefi::proto::unsafe_protocol;
 use uefi::proto::media::file::*;
 use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::table::boot::*;
@@ -412,11 +413,73 @@ fn init_graphic(bs: &BootServices, resolution: Option<(usize, usize)>) -> Graphi
         //info!("switching graphic mode");
         gop.set_mode(&mode).expect("Failed to set graphics mode");
     }
+    let (edid, edid_size) = read_active_edid(bs, gop_handle);
     GraphicInfo {
         mode: gop.current_mode_info(),
         fb_addr: gop.frame_buffer().as_mut_ptr() as u64,
         fb_size: gop.frame_buffer().size() as u64,
+        edid,
+        edid_size,
     }
+}
+
+/// `EFI_EDID_ACTIVE_PROTOCOL` — the raw EDID of the currently-active display,
+/// as read by the firmware at power-on to set the GOP mode (UEFI 2.x §12.9).
+/// The console monitor hangs off the GPU that drives the GOP, so this is the
+/// user's real panel EDID — obtained without any GPU display bring-up.
+#[repr(C)]
+#[unsafe_protocol("bd8c1056-9f36-44ec-92a8-a6337f817986")]
+struct EdidActiveProtocol {
+    size_of_edid: u32,
+    edid: *const u8,
+}
+
+/// `EFI_EDID_DISCOVERED_PROTOCOL` — EDID as read over DDC, exposed by some
+/// firmwares even when the active protocol is absent. Same layout.
+#[repr(C)]
+#[unsafe_protocol("1c0c34f6-d380-41fa-a049-8ad06c1a66aa")]
+struct EdidDiscoveredProtocol {
+    size_of_edid: u32,
+    edid: *const u8,
+}
+
+/// Read the active display's EDID (first 128-byte block). Tries the GOP
+/// handle first (where the active-display EDID normally lives), then a global
+/// lookup, then the discovered-EDID protocol. Returns `([0; 128], 0)` when no
+/// EDID is available.
+fn read_active_edid(bs: &BootServices, gop_handle: uefi::Handle) -> ([u8; 128], u32) {
+    let mut buf = [0u8; 128];
+
+    let mut copy_from = |size: u32, ptr: *const u8| -> u32 {
+        let n = (size as usize).min(128);
+        if ptr.is_null() || n == 0 {
+            return 0;
+        }
+        unsafe { core::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), n) };
+        n as u32
+    };
+
+    if let Ok(p) = bs.open_protocol_exclusive::<EdidActiveProtocol>(gop_handle) {
+        let n = copy_from(p.size_of_edid, p.edid);
+        if n > 0 {
+            return (buf, n);
+        }
+    }
+    if let Ok(h) = bs.get_handle_for_protocol::<EdidActiveProtocol>() {
+        if let Ok(p) = bs.open_protocol_exclusive::<EdidActiveProtocol>(h) {
+            let n = copy_from(p.size_of_edid, p.edid);
+            if n > 0 {
+                return (buf, n);
+            }
+        }
+    }
+    if let Ok(p) = bs.open_protocol_exclusive::<EdidDiscoveredProtocol>(gop_handle) {
+        let n = copy_from(p.size_of_edid, p.edid);
+        if n > 0 {
+            return (buf, n);
+        }
+    }
+    (buf, 0)
 }
 
 fn current_page_table() -> OffsetPageTable<'static> {
