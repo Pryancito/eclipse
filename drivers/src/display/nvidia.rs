@@ -3054,6 +3054,7 @@ impl DrmScheme for NvidiaGpu {
                     let _ = writeln!(block, "[gpustep9]  --- end narration ---");
                 }
             }
+            let early_err = result.is_err();
             match result {
                 Ok(r) => {
                     let phase = |st: u32| -> String {
@@ -3090,9 +3091,17 @@ impl DrmScheme for NvidiaGpu {
                     );
                 }
             }
-            let mut cache = self.state_init_result.lock();
-            if cache.is_none() {
-                *cache = Some(block.clone());
+            // Cache only when the C call actually ran (Ok). An early Err --
+            // e.g. "GSP not booted" from gpuinit's pass over the console GPU
+            // -- has no RM side effects, and caching it shadowed the real
+            // step14 attempt later in the same boot (r16 run: stage 4
+            // replayed gpuinit's 0x40 even though step8 had just proven the
+            // GSP live).
+            if !early_err {
+                let mut cache = self.state_init_result.lock();
+                if cache.is_none() {
+                    *cache = Some(block.clone());
+                }
             }
             block
         };
@@ -3141,6 +3150,7 @@ impl DrmScheme for NvidiaGpu {
                     let _ = writeln!(block, "[gpustep10] --- end narration ---");
                 }
             }
+            let early_err = result.is_err();
             match result {
                 Ok(r) => {
                     let phase = |st: u32| -> String {
@@ -3224,9 +3234,13 @@ impl DrmScheme for NvidiaGpu {
                     );
                 }
             }
-            let mut cache = self.step10_result.lock();
-            if cache.is_none() {
-                *cache = Some(block.clone());
+            // Same rule as step9: an early Err ran nothing in the RM, so
+            // caching it would shadow a later real attempt in this boot.
+            if !early_err {
+                let mut cache = self.step10_result.lock();
+                if cache.is_none() {
+                    *cache = Some(block.clone());
+                }
             }
             block
         };

@@ -5295,8 +5295,15 @@ unlock:
     gpumgrThreadDisableExpandedGpuVisibility();
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
 
-    /* Cache the outcome so subsequent proc reads replay it verbatim. */
-    if (status == NV_OK)
+    /*
+     * Cache the outcome so subsequent proc reads replay it verbatim -- but
+     * ONLY when the query actually ran (we had a usable DispCommon handle).
+     * The transient early-outs (no KernelDisplay yet, handles not populated
+     * because gpuStatePreInit hasn't run) must NOT be cached: the r16 run
+     * proved the handles appear later in the same boot (step14 stage 4),
+     * and a cached miss would shadow them for the rest of the boot.
+     */
+    if (status == NV_OK && pOut->allocStatus == NV_OK)
     {
         g_edidCache[gpuInstance] = *pOut;
         g_edidDone[gpuInstance]  = NV_TRUE;
