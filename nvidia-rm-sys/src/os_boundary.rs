@@ -308,9 +308,22 @@ pub extern "C" fn osCxlSetCaching(pGpu: *mut c_void, bEnableCache: NvBool) {
 }
 
 #[no_mangle]
-pub extern "C" fn osDelay(arg0: NvU32) -> NV_STATUS {
-    let _ = arg0;
-    NV_ERR_NOT_SUPPORTED
+pub extern "C" fn osDelay(ms: NvU32) -> NV_STATUS {
+    // Bounded spin on the monotonic clock: Eclipse's RM bring-up is
+    // single-threaded and polled, so a busy-wait is the correct primitive
+    // at this layer (there is no scheduler sleep to yield to). Used by RM
+    // retry paths and by the eclipse glue (EXP1c PDISP-restore pacing,
+    // GET_CONNECT_STATE real-detection retry).
+    let start = with_hooks(0u64, |h| h.monotonic_time_ns());
+    if start == 0 {
+        // No clock hook (early boot): degrade to no delay rather than hang.
+        return NV_OK;
+    }
+    let target = start + (ms as u64) * 1_000_000;
+    while with_hooks(0u64, |h| h.monotonic_time_ns()) < target {
+        core::hint::spin_loop();
+    }
+    NV_OK
 }
 
 #[no_mangle]
@@ -1093,6 +1106,21 @@ pub extern "C" fn osDevWriteReg032(
                         this_value,
                     );
                 }
+                // EXP1d: CPU-side re-anchor of the EXP1c PDISP restore. The
+                // old trigger ("RISCV started" narration) NEVER fired -- that
+                // NV_PRINTF is LEVEL_INFO and info is filtered before the
+                // narration hook -- so PDISP stayed in reset through all of
+                // GSP-RM's init: its display StateInit failed, display
+                // classes were pruned, and NV04_DISPLAY_COMMON allocs
+                // returned 0x22 INVALID_CLASS (run r19). Restore here
+                // instead: 15 ms after the STARTCPU store the SEC2 HS
+                // CORE_RESUME payload (microseconds-scale) is over with
+                // margin, while GSP-RM's libos hasn't even loaded the RM
+                // image yet -- so its display init finds PDISP alive. The
+                // 400 ms fabric watch below then doubles as containment if
+                // resuming scanout at +15 ms re-triggers the hazard.
+                crate::hooks::with_hooks((), |h| h.delay_us(15_000));
+                pdisp_restore();
                 // Post-store SILENT fabric watch (wedge containment). ZERO
                 // MMIO and ZERO logging here -- if the fabric wedged, any
                 // BAR0/BAR1 access (a log line renders into this GPU's BAR1
@@ -1142,6 +1170,13 @@ pub extern "C" fn osDevWriteReg032(
             unsafe {
                 core::ptr::write_volatile(base.add(this_address as usize) as *mut NvU32, this_value)
             };
+        }
+        // EXP1d for the non-drain STARTCPU paths (parity mode etc.): same
+        // CPU-side restore anchor; pdisp_restore() is a no-op unless the
+        // EXP1 kill armed it (PDISP_RESTORE_PENDING swap).
+        if is_sec2_startcpu {
+            crate::hooks::with_hooks((), |h| h.delay_us(15_000));
+            pdisp_restore();
         }
     }
     // The old post-STARTCPU "500ms silent window + raw BSI readback" bracket

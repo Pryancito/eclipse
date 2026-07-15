@@ -5091,6 +5091,13 @@ typedef struct EclipseGrEdid
  */
 static NvBool        g_edidDone[NV_MAX_DEVICES];
 static EclipseGrEdid g_edidCache[NV_MAX_DEVICES];
+/*
+ * One-shot latch for the on-demand kdispAllocateCommonHandle: its failure
+ * path leaks the freshly-allocated client/device/subdevice trio
+ * (kern_disp.c NV_ASSERT_OR_RETURN quirk), so a persistently failing alloc
+ * must run once per boot, not once per proc chunk read.
+ */
+static NvBool        g_edidAllocTried[NV_MAX_DEVICES];
 
 NV_STATUS eclipse_rm_edid(NvU32 gpuInstance, EclipseGrEdid *pOut)
 {
@@ -5205,11 +5212,21 @@ NV_STATUS eclipse_rm_edid(NvU32 gpuInstance, EclipseGrEdid *pOut)
          * the GSP; our held locks match kdispStatePreInitLocked's calling
          * context).
          */
-        NV_STATUS allocSt = kdispAllocateCommonHandle(pGpu, pKernelDisplay);
-        nv_printf(0, "[eclipse-rm-trace] edid: kdispAllocateCommonHandle on demand -> 0x%x\n",
-                  allocSt);
-        hDispClient = kdispGetInternalClientHandle(pKernelDisplay);
-        hDispCommon = kdispGetDispCommonHandle(pKernelDisplay);
+        if (!g_edidAllocTried[gpuInstance])
+        {
+            NV_STATUS allocSt;
+            g_edidAllocTried[gpuInstance] = NV_TRUE;
+            allocSt = kdispAllocateCommonHandle(pGpu, pKernelDisplay);
+            hDispClient = kdispGetInternalClientHandle(pKernelDisplay);
+            hDispCommon = kdispGetDispCommonHandle(pKernelDisplay);
+            /*
+             * NOTE: the RM returns NV_FALSE (== 0 == NV_OK) on its failure
+             * paths here, so ret is meaningless -- the re-read handles are
+             * the only truth.
+             */
+            nv_printf(0, "[eclipse-rm-trace] edid: kdispAllocateCommonHandle on demand -> ret=0x%x client=0x%x common=0x%x\n",
+                      allocSt, hDispClient, hDispCommon);
+        }
     }
     if (hDispClient == 0 || hDispCommon == 0)
     {
@@ -5245,6 +5262,38 @@ NV_STATUS eclipse_rm_edid(NvU32 gpuInstance, EclipseGrEdid *pOut)
         pOut->connectedMask = cs.displayMask;
         nv_printf(0, "[eclipse-rm-trace] edid: GET_CONNECT_STATE -> 0x%x connected=0x%x\n",
                   pOut->connectStatus, cs.displayMask);
+        /*
+         * _METHOD_CACHED returns the GSP's LAST detection pass. On the
+         * console GPU nobody (no nvkms, no CPU-side display client) has
+         * ever run one, so an empty cache reads back as "0 connected" even
+         * with the monitor physically plugged in -- and that false negative
+         * would then be cached for the boot. When the cached answer is
+         * empty but DDC-capable outputs exist, run a REAL detection
+         * (_METHOD_DEFAULT), honoring the documented
+         * NVOS_STATUS_ERROR_RETRY/retryTimeMs handshake, bounded.
+         */
+        if (pOut->connectStatus == NV_OK && pOut->connectedMask == 0 &&
+            pOut->displayMaskDDC != 0)
+        {
+            NvU32 attempt;
+            for (attempt = 0; attempt < 4; attempt++)
+            {
+                portMemSet(&cs, 0, sizeof(cs));
+                cs.displayMask = pOut->displayMask;
+                cs.flags = NV0073_CTRL_SYSTEM_GET_CONNECT_STATE_FLAGS_METHOD_DEFAULT;
+                pOut->connectStatus = pRmApi->Control(pRmApi, hDispClient, hDispCommon,
+                                                      NV0073_CTRL_CMD_SYSTEM_GET_CONNECT_STATE,
+                                                      &cs, sizeof(cs));
+                nv_printf(0, "[eclipse-rm-trace] edid: GET_CONNECT_STATE(real detect, try %u) -> 0x%x connected=0x%x retryMs=%u\n",
+                          attempt, pOut->connectStatus, cs.displayMask, cs.retryTimeMs);
+                if (pOut->connectStatus != NV_ERR_TIMEOUT_RETRY)
+                {
+                    pOut->connectedMask = cs.displayMask;
+                    break;
+                }
+                osDelay((cs.retryTimeMs != 0 && cs.retryTimeMs < 500) ? cs.retryTimeMs : 100);
+            }
+        }
     }
     if (pOut->connectStatus == NV_OK && pOut->connectedMask != 0)
     {
@@ -5331,7 +5380,10 @@ unlock:
      * proved the handles appear later in the same boot (step14 stage 4),
      * and a cached miss would shadow them for the rest of the boot.
      */
-    if (status == NV_OK && pOut->allocStatus == NV_OK)
+    if (status == NV_OK && pOut->allocStatus == NV_OK &&
+        pOut->supportedStatus == NV_OK && pOut->connectStatus == NV_OK &&
+        pOut->edidStatus != NV_ERR_TIMEOUT &&
+        pOut->edidStatus != NV_ERR_TIMEOUT_RETRY)
     {
         g_edidCache[gpuInstance] = *pOut;
         g_edidDone[gpuInstance]  = NV_TRUE;
