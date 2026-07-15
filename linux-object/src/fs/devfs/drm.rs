@@ -10,12 +10,12 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 use lock::Mutex;
 
+use crate::sync::{Event, EventBus};
 use kernel_hal::drivers;
 use kernel_hal::mem::phys_to_virt;
 pub use zcore_drivers::scheme::drm::{DrmCaps, DrmConnector, DrmCrtc, DrmPlane, GemHandle};
 use zcore_drivers::scheme::{DisplayScheme, DrmScheme};
 use zircon_object::vm::{pages, MMUFlags, VmObject};
-use crate::sync::{Event, EventBus};
 
 /// Synthetic KMS object IDs used when there is no real DRM/KMS driver — only a
 /// dumb framebuffer (`DisplayScheme`, e.g. the UEFI GOP display on bare metal).
@@ -46,16 +46,15 @@ fn primary_display() -> Option<Arc<dyn DisplayScheme>> {
 
 /// Whether the software KMS path should drive the output.
 ///
-/// True whenever a framebuffer display exists. The only DRM drivers in this
-/// tree (the nvidia stub, virtio-gpu) cannot drive a real legacy-KMS scanout
-/// for wlroots' dumb-buffer + pixman path — the nvidia driver in particular
-/// advertises a CRTC/connector but its `page_flip`/`create_fb` are no-ops, so
-/// deferring to it leaves the screen black. Scanning the dumb buffer out to the
-/// framebuffer display (`blit_from`) is the authoritative output on every
-/// machine that has a framebuffer, so we always prefer it. (virtio-gpu also
-/// registers a framebuffer display, so its host-shared buffer still updates.)
+/// True when a framebuffer display exists but no registered DRM driver declares
+/// hardware-KMS scanout support. In that case we keep the software fallback:
+/// dumb-buffer blits to the primary framebuffer display (`blit_from`).
 pub fn software_kms_active() -> bool {
-    primary_display().is_some()
+    let have_display = primary_display().is_some();
+    let driver_can_scanout = get_primary_driver()
+        .map(|d| d.has_hardware_kms())
+        .unwrap_or(false);
+    have_display && !driver_can_scanout
 }
 
 /// A DRM Framebuffer object
@@ -63,6 +62,8 @@ pub fn software_kms_active() -> bool {
 #[allow(dead_code)]
 pub struct DrmFramebuffer {
     pub id: u32,
+    /// Optional driver-private framebuffer id returned by `DrmScheme::create_fb`.
+    pub driver_fb_id: Option<u32>,
     /// GEM handle that backs this framebuffer
     pub gem_handle_id: u32,
     pub width: u32,
@@ -218,9 +219,8 @@ pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<
     // If a hardware DRM driver is present, let it create its own framebuffer
     // object; otherwise the framebuffer is purely software (scanned out via the
     // display's `blit_from`).
-    if let Some(driver) = get_primary_driver() {
-        driver.create_fb(handle_id, width, height, pitch)?;
-    }
+    let driver_fb_id =
+        get_primary_driver().and_then(|driver| driver.create_fb(handle_id, width, height, pitch));
 
     let mut state = DRM_STATE.lock();
     let fb_id = state.next_fb_id;
@@ -228,6 +228,7 @@ pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<
 
     let fb = DrmFramebuffer {
         id: fb_id,
+        driver_fb_id,
         gem_handle_id: handle_id,
         width,
         height,
@@ -324,19 +325,38 @@ pub fn scanout(fb_id: u32) -> bool {
 /// `crtc_id`/`user_data` come from the page-flip request and are echoed back in
 /// the `drm_event_vblank` so libdrm's event loop can match the flip.
 pub fn page_flip(fb_id: u32, crtc_id: u32, user_data: u64) -> bool {
+    let flipped = present_now(fb_id, crtc_id);
+    if flipped {
+        queue_flip_event(crtc_id, user_data);
+    }
+    flipped
+}
+
+/// Present a framebuffer immediately on `crtc_id` without queuing a DRM flip
+/// event. Used by SETCRTC/SETPLANE paths that are not page-flip ioctls.
+pub fn present_now(fb_id: u32, crtc_id: u32) -> bool {
     let flipped = if software_kms_active() {
         // No usable hardware KMS: blit the dumb buffer to the framebuffer.
         scanout(fb_id)
     } else if let Some(driver) = get_primary_driver() {
+        // Translate core fb id to the driver's private fb id when available.
+        let driver_fb_id = DRM_STATE
+            .lock()
+            .framebuffers
+            .iter()
+            .find(|f| f.id == fb_id)
+            .and_then(|f| f.driver_fb_id)
+            .unwrap_or(fb_id);
         // Hardware driver owns scanout; fall back to a software blit if it
-        // declines (e.g. a framebuffer-only "simplefb" DRM shim).
-        driver.page_flip(fb_id) || scanout(fb_id)
+        // declines.
+        driver.page_flip(driver_fb_id) || scanout(fb_id)
     } else {
         scanout(fb_id)
     };
     if flipped {
         set_crtc_fb(crtc_id, fb_id);
-        queue_flip_event(crtc_id, user_data);
+        // A DRM client owns the framebuffer now: stop text console drawing.
+        kernel_hal::console::set_kd_mode(kernel_hal::console::KD_GRAPHICS);
     }
     flipped
 }
@@ -478,10 +498,8 @@ pub fn get_resources() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
         connectors.extend(d_conns);
     }
 
-    // Prefer the software framebuffer KMS path: synthesize one CRTC + connector
-    // so `drmIsKMS()` passes and wlroots drives the output through our scanout
-    // (the hardware DRM stubs here cannot). Falls through to driver-provided
-    // resources only when there is no framebuffer display at all.
+    // Software fallback path: synthesize one CRTC + connector so `drmIsKMS()`
+    // passes and wlroots can drive output through software scanout.
     if software_kms_active() {
         debug!(
             "[drm] GETRESOURCES: software KMS -> 1 crtc, 1 connector ({:?}) [drivers offered crtcs={} conns={}]",
@@ -526,7 +544,11 @@ pub fn get_connector(id: u32) -> Option<DrmConnector> {
 pub fn get_crtc(id: u32) -> Option<DrmCrtc> {
     // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
     for driver in snapshot_drivers() {
-        if let Some(crtc) = driver.get_crtc(id) {
+        if let Some(mut crtc) = driver.get_crtc(id) {
+            // Keep userspace-facing fb ids in the DRM core namespace.
+            if DRM_STATE.lock().crtc_fb != 0 {
+                crtc.fb_id = DRM_STATE.lock().crtc_fb;
+            }
             return Some(crtc);
         }
     }
@@ -560,7 +582,10 @@ pub fn get_planes() -> Vec<u32> {
 pub fn get_plane(id: u32) -> Option<DrmPlane> {
     // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
     for driver in snapshot_drivers() {
-        if let Some(plane) = driver.get_plane(id) {
+        if let Some(mut plane) = driver.get_plane(id) {
+            if DRM_STATE.lock().crtc_fb != 0 {
+                plane.fb_id = DRM_STATE.lock().crtc_fb;
+            }
             return Some(plane);
         }
     }

@@ -116,9 +116,10 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 // only /etc/profile) so a compositor launched from a *non-login*
                 // shell — which busybox sh does not source /etc/profile for —
                 // still gets them. Without WLR_RENDERER=pixman labwc tries
-                // GLES2/EGL then Vulkan (both fail with no GPU) and exits with
-                // "unable to create renderer". See xtask write_profile for the
-                // rationale of each.
+                // GLES2/EGL then Vulkan; with no GPU that path may fail outright,
+                // or run on Mesa llvmpipe and be extremely slow because each
+                // frame is rendered and copied on CPU. See xtask write_profile
+                // for the rationale of each.
                 "WLR_RENDERER=pixman".into(),
                 "WLR_RENDERER_ALLOW_SOFTWARE=1".into(),
                 "WLR_NO_HARDWARE_CURSORS=1".into(),
@@ -130,7 +131,8 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 // software rasteriser (kms_swrast → llvmpipe) instead, which
                 // renders into dumb buffers — exactly our DRM capabilities.
                 // Only takes effect when a GL renderer is selected
-                // (WLR_RENDERER=gles2); the pixman default ignores Mesa.
+                // (WLR_RENDERER=gles2); the pixman default ignores Mesa because
+                // the llvmpipe GL path is much slower here.
                 "GALLIUM_DRIVER=llvmpipe".into(),
                 "MESA_LOADER_DRIVER_OVERRIDE=kms_swrast".into(),
             ];
