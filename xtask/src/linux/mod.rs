@@ -609,6 +609,17 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # frame'), leaving no visible mouse pointer. Force the software\n\
               # cursor so wlroots composites the pointer into the framebuffer.\n\
               export WLR_NO_HARDWARE_CURSORS=1\n\
+              # Pin wlroots to the console GPU's DRM node (card0 =\n\
+              # nvidia-gpu-23:0.0). This box has TWO nvidia DRM cards (card0 =\n\
+              # console GPU driving the physical monitor via the UEFI GOP\n\
+              # framebuffer; card1 = the compute GPU we run kernels on). Without\n\
+              # this, wlroots may enumerate both and bind a phantom connector on\n\
+              # the compute GPU. Pinning card0 gives labwc a SINGLE logical\n\
+              # output and keeps it off the compute GPU. Physical pixels always\n\
+              # land on the GOP framebuffer via the kernel's software-KMS\n\
+              # scanout regardless, so this is really about presenting one\n\
+              # output, not about which port lights up.\n\
+              export WLR_DRM_DEVICES=/dev/dri/card0\n\
               # Software GL via Mesa (no usable HW 3D). The DRM node reports a\n\
               # real NVIDIA PCI id, so Mesa would try the hardware nouveau driver\n\
               # and fail; force the KMS software rasteriser (kms_swrast/llvmpipe)\n\
