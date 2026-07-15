@@ -91,6 +91,57 @@ pub(super) fn init() -> DeviceResult {
     drivers::add_device(Device::Irq(irq.clone()));
     boot_progress(83);
 
+    // Register the UEFI GOP framebuffer as a Display device EARLY and
+    // UNCONDITIONALLY, before the fallible PCI / nvidia bring-up below.
+    //
+    // linux-object's software-KMS path (drm.rs `software_kms_active`) is what
+    // actually drives the compositor: it blits wlroots' dumb buffer into the
+    // GOP framebuffer via `scanout`. That path is gated purely on
+    // `drivers::all_display().first().is_some()`. If we only registered the
+    // display in the graphics-console block further down, it would run AFTER
+    // `pci::init(...)?` (which can return Err and bail out of `init`) and
+    // behind an else-arm, so a fallible/reordered PCI path could leave
+    // `all_display()` empty. In that state GETRESOURCES hands wlroots the
+    // nvidia stub CRTC (whose `page_flip` is a no-op) and the screen stays
+    // black. Registering here guarantees a real scanout target regardless of
+    // how PCI / nvidia bring-up goes.
+    #[cfg(feature = "graphic")]
+    {
+        use crate::KCONFIG;
+        use zcore_drivers::display::UefiDisplay;
+        use zcore_drivers::prelude::{ColorFormat, DisplayInfo};
+
+        let (width, height) = KCONFIG.fb_mode.resolution();
+        let stride = KCONFIG.fb_mode.stride();
+
+        // Publish the boot framebuffer geometry + real panel EDID to the
+        // display layer up front so the DRM connector / blit code sees them
+        // regardless of the PCI path (also covers the `no-pci` build).
+        zcore_drivers::display::set_boot_fb_info(
+            KCONFIG.fb_addr,
+            width as u32,
+            height as u32,
+            (stride * 4) as u32,
+        );
+        zcore_drivers::display::set_boot_edid(&KCONFIG.fb_edid, KCONFIG.fb_edid_size);
+
+        if KCONFIG.fb_addr != 0
+            && width != 0
+            && height != 0
+            && crate::drivers::all_display().first().is_none()
+        {
+            let display = Arc::new(UefiDisplay::new(DisplayInfo {
+                width: width as _,
+                height: height as _,
+                pitch: (stride * 4) as u32,
+                format: ColorFormat::ARGB8888,
+                fb_base_vaddr: crate::mem::phys_to_virt(KCONFIG.fb_addr as usize),
+                fb_size: KCONFIG.fb_size as usize,
+            }));
+            crate::drivers::add_device(Device::Display(display));
+        }
+    }
+
     #[cfg(not(feature = "no-pci"))]
     {
         // PCI scan
@@ -131,21 +182,9 @@ pub(super) fn init() -> DeviceResult {
             }
         }
 
-        // Pass boot framebuffer info to display drivers for native resolution inheritance
-        #[cfg(feature = "graphic")]
-        {
-            use crate::KCONFIG;
-            let (width, height) = KCONFIG.fb_mode.resolution();
-            let stride = KCONFIG.fb_mode.stride();
-            zcore_drivers::display::set_boot_fb_info(
-                KCONFIG.fb_addr,
-                width as u32,
-                height as u32,
-                (stride * 4) as u32,
-            );
-            // Real panel EDID captured by the bootloader from UEFI.
-            zcore_drivers::display::set_boot_edid(&KCONFIG.fb_edid, KCONFIG.fb_edid_size);
-        }
+        // Boot framebuffer geometry + panel EDID were already published to the
+        // display layer in the early graphic block above (before this fallible
+        // PCI init), so display drivers already have native-resolution info.
 
         boot_progress(84);
         let pci_devs = pci::init(Some(Arc::new(IoMapperImpl)))?;

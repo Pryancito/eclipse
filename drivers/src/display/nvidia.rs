@@ -5633,7 +5633,13 @@ impl DrmScheme for NvidiaGpu {
     }
 
     fn page_flip(&self, _fb_id: u32) -> bool {
-        true
+        // This stub cannot perform a real hardware page-flip / scanout for
+        // wlroots' dumb-buffer + pixman path. Returning `true` here would be a
+        // lie: it short-circuits the DRM layer's `driver.page_flip(fb) ||
+        // scanout(fb)` fallback (drm.rs) and the framebuffer never gets the
+        // blit, leaving the screen black. Return `false` so the software
+        // scanout path always runs when this driver is the primary one.
+        false
     }
 
     fn set_cursor(&self, _crtc_id: u32, _x: i32, _y: i32, _handle: u32, flags: u32) -> bool {
