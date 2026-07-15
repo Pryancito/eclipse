@@ -1513,6 +1513,13 @@ fn format_uefi_edid() -> String {
             "[gpuedid] === UEFI active-panel EDID: {} bytes, header INVALID ===",
             len
         );
+        // Dump what we captured so a bad pointer (garbage) is distinguishable
+        // from an empty buffer (zeros) or a real-but-nonstandard block.
+        let _ = write!(s, "[gpuedid] raw head:");
+        for b in e[..32].iter() {
+            let _ = write!(s, " {:02x}", b);
+        }
+        let _ = writeln!(s);
         return s;
     }
     // Manufacturer PNP id: bytes 8-9, big-endian, 5-bit packed letters.
