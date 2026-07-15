@@ -277,7 +277,7 @@ pub fn scanout(fb_id: u32) -> bool {
         match state.framebuffers.iter().find(|f| f.id == fb_id) {
             Some(f) => *f,
             None => {
-                debug!("[drm] scanout: fb_id={} not found", fb_id);
+                warn!("[drm] scanout: fb_id={} not found", fb_id);
                 return false;
             }
         }
@@ -285,7 +285,7 @@ pub fn scanout(fb_id: u32) -> bool {
     let display = match primary_display() {
         Some(d) => d,
         None => {
-            debug!("[drm] scanout: no display");
+            warn!("[drm] scanout: no display -- software_kms inactive, nothing to blit to");
             return false;
         }
     };
@@ -294,7 +294,7 @@ pub fn scanout(fb_id: u32) -> bool {
     }
     // Log the first scanout so a console photo confirms pixels are flowing.
     if !SCANOUT_LOGGED.swap(true, Ordering::Relaxed) {
-        debug!(
+        warn!(
             "[drm] scanout: fb={} {}x{} pitch={} phys={:#x} -> display {}x{}",
             fb_id,
             fb.width,
@@ -511,7 +511,7 @@ pub fn get_resources() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     // Software fallback path: synthesize one CRTC + connector so `drmIsKMS()`
     // passes and wlroots can drive output through software scanout.
     if software_kms_active() {
-        debug!(
+        warn!(
             "[drm] GETRESOURCES: software KMS -> 1 crtc, 1 connector ({:?}) [drivers offered crtcs={} conns={}]",
             display_mode(),
             crtcs.len(),
@@ -520,8 +520,8 @@ pub fn get_resources() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
         return (fbs, vec![SYNTH_CRTC_ID], vec![SYNTH_CONNECTOR_ID]);
     }
 
-    debug!(
-        "[drm] GETRESOURCES: crtcs={} connectors={} fbs={} (driver-provided, no display)",
+    warn!(
+        "[drm] GETRESOURCES: crtcs={} connectors={} fbs={} (driver-provided, NO framebuffer display -> scanout will NOT blit)",
         crtcs.len(),
         connectors.len(),
         fbs.len()
