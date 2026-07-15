@@ -451,39 +451,74 @@ struct EdidDiscoveredProtocol {
 /// handle first (where the active-display EDID normally lives), then a global
 /// lookup, then the discovered-EDID protocol. Returns `([0; 128], 0)` when no
 /// EDID is available.
-fn read_active_edid(bs: &BootServices, gop_handle: uefi::Handle) -> ([u8; 128], u32) {
-    let mut buf = [0u8; 128];
+fn edid_header_ok(b: &[u8]) -> bool {
+    b.len() >= 8
+        && b[0] == 0x00
+        && b[7] == 0x00
+        && b[1..7].iter().all(|&x| x == 0xFF)
+}
 
-    let mut copy_from = |size: u32, ptr: *const u8| -> u32 {
+fn read_active_edid(bs: &BootServices, gop_handle: uefi::Handle) -> ([u8; 128], u32) {
+    // Copy one source's bytes into a fresh buffer; returns (buf, len).
+    let read_one = |size: u32, ptr: *const u8| -> ([u8; 128], u32) {
+        let mut buf = [0u8; 128];
         let n = (size as usize).min(128);
         if ptr.is_null() || n == 0 {
-            return 0;
+            return (buf, 0);
         }
         unsafe { core::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), n) };
-        n as u32
+        (buf, n as u32)
+    };
+
+    // All candidate sources, in order of preference. Some firmwares populate
+    // the DISCOVERED protocol (raw DDC read) but leave ACTIVE empty, or expose
+    // the protocol on a child handle rather than the GOP handle -- so gather
+    // every candidate and pick the first with a valid EDID header.
+    let mut first_nonempty: Option<([u8; 128], u32)> = None;
+    let mut consider = |buf: [u8; 128], n: u32| -> Option<([u8; 128], u32)> {
+        if n == 0 {
+            return None;
+        }
+        if edid_header_ok(&buf[..n.min(128) as usize]) {
+            return Some((buf, n));
+        }
+        if first_nonempty.is_none() {
+            first_nonempty = Some((buf, n));
+        }
+        None
     };
 
     if let Ok(p) = bs.open_protocol_exclusive::<EdidActiveProtocol>(gop_handle) {
-        let n = copy_from(p.size_of_edid, p.edid);
-        if n > 0 {
-            return (buf, n);
+        let (b, n) = read_one(p.size_of_edid, p.edid);
+        if let Some(v) = consider(b, n) {
+            return v;
         }
     }
     if let Ok(h) = bs.get_handle_for_protocol::<EdidActiveProtocol>() {
         if let Ok(p) = bs.open_protocol_exclusive::<EdidActiveProtocol>(h) {
-            let n = copy_from(p.size_of_edid, p.edid);
-            if n > 0 {
-                return (buf, n);
+            let (b, n) = read_one(p.size_of_edid, p.edid);
+            if let Some(v) = consider(b, n) {
+                return v;
             }
         }
     }
     if let Ok(p) = bs.open_protocol_exclusive::<EdidDiscoveredProtocol>(gop_handle) {
-        let n = copy_from(p.size_of_edid, p.edid);
-        if n > 0 {
-            return (buf, n);
+        let (b, n) = read_one(p.size_of_edid, p.edid);
+        if let Some(v) = consider(b, n) {
+            return v;
         }
     }
-    (buf, 0)
+    if let Ok(h) = bs.get_handle_for_protocol::<EdidDiscoveredProtocol>() {
+        if let Ok(p) = bs.open_protocol_exclusive::<EdidDiscoveredProtocol>(h) {
+            let (b, n) = read_one(p.size_of_edid, p.edid);
+            if let Some(v) = consider(b, n) {
+                return v;
+            }
+        }
+    }
+    // No source had a valid header; hand back the first non-empty capture (if
+    // any) so /proc can dump it for diagnosis.
+    first_nonempty.unwrap_or(([0u8; 128], 0))
 }
 
 fn current_page_table() -> OffsetPageTable<'static> {
