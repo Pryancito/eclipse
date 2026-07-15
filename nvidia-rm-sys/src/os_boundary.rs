@@ -630,7 +630,8 @@ unsafe fn sec2_intr_snapshot_and_drain(base: *mut u8) {
         let save0 = rd(0x9084);
         crate::os_interface::probe_line(&alloc::format!(
             "[nvidia-rm] EXP5 PBUS at bracket: INTR_0={:#010x} SAVE_0={:#010x} -- unit retire",
-            pbus_intr, save0
+            pbus_intr,
+            save0
         ));
         wr(0x9084, 0);
         wr(0x1100, pbus_intr);
