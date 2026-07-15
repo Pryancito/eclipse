@@ -1051,8 +1051,13 @@ impl INode for DrmDev {
                 // Identify the object by id (libdrm often passes obj_type=ANY).
                 // Only the plane "type" property is mandatory; connectors/CRTCs
                 // report none (the legacy backend tolerates their absence).
-                let props: &[(u32, u64)] = if res.obj_id == drm::SYNTH_PLANE_ID {
-                    &[(PROP_TYPE, 1)] // value 1 = DRM_PLANE_TYPE_PRIMARY
+                // Look up any registered plane — not only SYNTH_PLANE_ID — so
+                // hardware planes (e.g. NVIDIA 3001, VirtIO 3000) are also
+                // classified as PRIMARY/OVERLAY/CURSOR by wlroots.
+                let plane_prop: [(u32, u64); 1];
+                let props: &[(u32, u64)] = if let Some(p) = drm::get_plane(res.obj_id) {
+                    plane_prop = [(PROP_TYPE, p.plane_type as u64)];
+                    &plane_prop
                 } else {
                     &[]
                 };
