@@ -95,7 +95,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     // and must not be read after firmware reclaims that memory.
     let use_rboot_idt = has_cmdline_flag(config.cmdline, "RBOOT_IDT");
 
-    let graphic_info = init_graphic(bs, config.resolution);
+    let (graphic_info, edid, edid_size) = init_graphic(bs, config.resolution);
     // Boot progress is continuous across rboot (0..50) and kernel (50..100).
     if has_cmdline_flag(config.cmdline, "FB_ROT180") {
         progress::set_rot180(true);
@@ -238,6 +238,8 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         initramfs_addr,
         initramfs_size,
         cmdline: config.cmdline,
+        edid,
+        edid_size,
     });
 
     // On some real machines, ExitBootServices can be the point where things go wrong.
@@ -394,7 +396,10 @@ fn find_active_gop_handle(bs: &BootServices) -> Option<Handle> {
     best
 }
 
-fn init_graphic(bs: &BootServices, resolution: Option<(usize, usize)>) -> GraphicInfo {
+fn init_graphic(
+    bs: &BootServices,
+    resolution: Option<(usize, usize)>,
+) -> (GraphicInfo, [u8; 128], u32) {
     let gop_handle = find_active_gop_handle(bs)
         .or_else(|| bs.get_handle_for_protocol::<GraphicsOutput>().ok())
         .expect("failed to find GraphicsOutput handle");
@@ -413,14 +418,13 @@ fn init_graphic(bs: &BootServices, resolution: Option<(usize, usize)>) -> Graphi
         //info!("switching graphic mode");
         gop.set_mode(&mode).expect("Failed to set graphics mode");
     }
-    let (edid, edid_size) = read_active_edid(bs, gop_handle);
-    GraphicInfo {
+    let info = GraphicInfo {
         mode: gop.current_mode_info(),
         fb_addr: gop.frame_buffer().as_mut_ptr() as u64,
         fb_size: gop.frame_buffer().size() as u64,
-        edid,
-        edid_size,
-    }
+    };
+    let (edid, edid_size) = read_active_edid(bs, gop_handle);
+    (info, edid, edid_size)
 }
 
 /// `EFI_EDID_ACTIVE_PROTOCOL` — the raw EDID of the currently-active display,
