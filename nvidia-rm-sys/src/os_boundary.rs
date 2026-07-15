@@ -601,6 +601,39 @@ unsafe fn sec2_intr_snapshot_and_drain(base: *mut u8) {
             cleared_bits = cleared_bits.wrapping_add(leaf.count_ones());
         }
     }
+    // EXP5 -- retire the PBUS PRI-error latch AT THE UNIT, i.e. do what
+    // EXP3's own verdict says ("clear at engine"). The pre-boot quench
+    // (pbus_pri_diagnose_and_clear) demonstrably gets undone by the boot
+    // itself: the r15 wedge photo shows LEAF[4] bit28 pending again at this
+    // bracket on a build whose pre-boot clear ran minutes earlier -- one of
+    // the sequencer's own PRI accesses re-latches it. A leaf W1C can never
+    // retire a level line that follows the unit latch, so quench the unit
+    // here, at the last instant before the STARTCPU store: nouveau's
+    // documented sequence (SAVE_0(0x9084)=0, then W1C the bits into
+    // NV_PBUS_INTR_0(0x1100)). PBUS registers only -- none of the
+    // empirically-fatal display/priv-ring cluster reads.
+    let pbus_intr = rd(0x1100);
+    if pbus_intr != 0 && (pbus_intr & 0xFFFF_0000) != 0xBADF_0000 {
+        let save0 = rd(0x9084);
+        crate::os_interface::probe_line(&alloc::format!(
+            "[nvidia-rm] EXP5 PBUS at bracket: INTR_0={:#010x} SAVE_0={:#010x} -- unit retire",
+            pbus_intr, save0
+        ));
+        wr(0x9084, 0);
+        wr(0x1100, pbus_intr);
+        // The leaf may still hold the (now-orphaned) latched bit; W1C it
+        // once more now that the level line should have dropped.
+        let leaf4 = rd(LEAF + 4 * 4);
+        if leaf4 != 0 {
+            wr(LEAF + 4 * 4, leaf4);
+        }
+        crate::os_interface::probe_line(&alloc::format!(
+            "[nvidia-rm] EXP5 after unit retire: PBUS_INTR_0={:#010x} LEAF[4]={:#010x} PMC_INTR0={:#010x}",
+            rd(0x1100),
+            rd(LEAF + 4 * 4),
+            rd(0x100)
+        ));
+    }
     // Re-read pass: which leaves re-asserted (level source) vs stayed clear?
     let mut still_pending = 0u32;
     for i in 0..8usize {
