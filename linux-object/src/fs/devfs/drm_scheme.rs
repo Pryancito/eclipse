@@ -391,23 +391,35 @@ const _: () = {
 fn make_modeinfo(w: u32, h: u32) -> [u8; 68] {
     let mut m = [0u8; 68];
     let refresh: u32 = 60;
-    let clock = ((w as u64 * h as u64 * refresh as u64) / 1000) as u32; // kHz, nominal
+    // Standard blanking: add 10 % horizontal and 5 % vertical blanking so the
+    // pixel clock matches what wlroots expects (clock ≈ htotal * vtotal * refresh
+    // / 1000 kHz).  Using only the active area gives an unusably low clock and
+    // a calculated refresh of 59.xxx Hz rather than the 59.999 wlroots logs.
+    let htotal = (w * 11 / 10) as u16; // +10 % H blanking
+    let vtotal = (h * 21 / 20) as u16; // +5 % V blanking
+    let clock = (htotal as u64 * vtotal as u64 * refresh as u64 / 1000) as u32; // kHz
     m[0..4].copy_from_slice(&clock.to_ne_bytes());
     let wh = w as u16;
     m[4..6].copy_from_slice(&wh.to_ne_bytes()); // hdisplay
-    m[6..8].copy_from_slice(&wh.to_ne_bytes()); // hsync_start
-    m[8..10].copy_from_slice(&wh.to_ne_bytes()); // hsync_end
-    m[10..12].copy_from_slice(&wh.to_ne_bytes()); // htotal
-                                                  // hskew @12..14 = 0
+    // hsync_start / hsync_end / htotal: use simple 10 % blanking
+    let hsync_start = (w + w / 16) as u16;
+    let hsync_end = (w + w / 8) as u16;
+    m[6..8].copy_from_slice(&hsync_start.to_ne_bytes());
+    m[8..10].copy_from_slice(&hsync_end.to_ne_bytes());
+    m[10..12].copy_from_slice(&htotal.to_ne_bytes());
+    // hskew @12..14 = 0
     let hh = h as u16;
     m[14..16].copy_from_slice(&hh.to_ne_bytes()); // vdisplay
-    m[16..18].copy_from_slice(&hh.to_ne_bytes()); // vsync_start
-    m[18..20].copy_from_slice(&hh.to_ne_bytes()); // vsync_end
-    m[20..22].copy_from_slice(&hh.to_ne_bytes()); // vtotal
-                                                  // vscan @22..24 = 0
+    // vsync_start / vsync_end / vtotal: use simple 5 % blanking
+    let vsync_start = (h + h / 40) as u16;
+    let vsync_end = (h + h / 20) as u16;
+    m[16..18].copy_from_slice(&vsync_start.to_ne_bytes());
+    m[18..20].copy_from_slice(&vsync_end.to_ne_bytes());
+    m[20..22].copy_from_slice(&vtotal.to_ne_bytes());
+    // vscan @22..24 = 0
     m[24..28].copy_from_slice(&refresh.to_ne_bytes()); // vrefresh
-                                                       // flags @28..32 = 0
-                                                       // type @32..36: DRM_MODE_TYPE_DRIVER(0x40) | DRM_MODE_TYPE_PREFERRED(0x08)
+    // flags @28..32 = 0
+    // type @32..36: DRM_MODE_TYPE_DRIVER(0x40) | DRM_MODE_TYPE_PREFERRED(0x08)
     m[32..36].copy_from_slice(&0x48u32.to_ne_bytes());
     // name @36..68 ("WxH")
     let mut name = [0u8; 32];
@@ -925,8 +937,18 @@ impl INode for DrmDev {
                 let conn_res = unsafe { &mut *(data as *mut DrmModeGetConnector) };
                 if let Some(conn) = drm::get_connector(conn_res.connector_id) {
                     conn_res.connection = if conn.connected { 1 } else { 2 };
-                    conn_res.mm_width = conn.mm_width;
-                    conn_res.mm_height = conn.mm_height;
+                    // Physical dimensions: use the connector's reported values
+                    // and fall back to a calculation from the display resolution
+                    // so wlroots never sees "Physical size: 0x0" (which prevents
+                    // correct DPI/scaling in many compositors).
+                    let (fallback_w, fallback_h) = drm::display_mode()
+                        .map(|(w, h, _)| {
+                            // Assume ~96 DPI (1 in = 25.4 mm, 96 px/in).
+                            ((w * 254 / 960).max(1), (h * 254 / 960).max(1))
+                        })
+                        .unwrap_or((1, 1));
+                    conn_res.mm_width = if conn.mm_width > 0 { conn.mm_width } else { fallback_w };
+                    conn_res.mm_height = if conn.mm_height > 0 { conn.mm_height } else { fallback_h };
                     // Real DRM_MODE_CONNECTOR_* from the driver (NVIDIA fills
                     // it from the RM's GET_CONNECTOR_DATA); synthetic and
                     // fallback connectors keep the historical 11.
@@ -980,7 +1002,11 @@ impl INode for DrmDev {
             DRM_IOCTL_MODE_GETENCODER => {
                 let enc = unsafe { &mut *(data as *mut DrmModeGetEncoder) };
                 enc.encoder_id = drm::SYNTH_ENCODER_ID;
-                enc.encoder_type = 0; // DRM_MODE_ENCODER_NONE
+                // DRM_MODE_ENCODER_VIRTUAL=6: correct type for a software/
+                // virtual encoder that drives a dumb-buffer scanout path.
+                // Reporting NONE(0) causes some compositors to skip property
+                // queries and misidentify the output type.
+                enc.encoder_type = 6; // DRM_MODE_ENCODER_VIRTUAL
                 // On the software KMS path the only CRTC is the synthetic one
                 // (id=1). On the hardware KMS path, report crtc_id=0 (no
                 // currently active CRTC) because CRTC 1 does not appear in the
@@ -988,7 +1014,7 @@ impl INode for DrmDev {
                 // configure the CRTC itself via SETCRTC.
                 // possible_crtcs=1 means bit 0 = index 0 of the CRTC list,
                 // which is correct in both paths.
-                enc.crtc_id = if drm::software_kms_active() { 1 } else { 0 };
+                enc.crtc_id = if drm::software_kms_active() { drm::SYNTH_CRTC_ID } else { 0 };
                 enc.possible_crtcs = 1; // bitmask: CRTC index 0
                 enc.possible_clones = 0;
                 Ok(0)
