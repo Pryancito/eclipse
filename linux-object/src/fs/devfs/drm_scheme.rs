@@ -10,6 +10,13 @@ use zircon_object::vm::{pages, VmObject};
 
 use super::drm;
 
+/// One-shot guards so the first SETCRTC / PAGE_FLIP log at warn! (visible at
+/// the default log level) without spamming every frame.
+static SETCRTC_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static PAGEFLIP_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// DRM Device INode
 pub struct DrmDev {
     inode_id: usize,
@@ -690,14 +697,14 @@ impl INode for DrmDev {
             DRM_IOCTL_MODE_SETCRTC => {
                 // struct drm_mode_crtc has the same layout as DrmModeGetCrtc.
                 let req = unsafe { &mut *(data as *mut DrmModeGetCrtc) };
-                log::debug!(
-                    "[drm] SETCRTC crtc={} fb={} ({}x{}+{})",
-                    req.crtc_id,
-                    req.fb_id,
-                    req.x,
-                    req.y,
-                    req.mode_valid
-                );
+                // One-shot at warn! so a console photo shows whether labwc ever
+                // drives a modeset (and with which fb) without needing LOG=debug.
+                if !SETCRTC_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                    log::warn!(
+                        "[drm] SETCRTC crtc={} fb={} ({}x{}+{})",
+                        req.crtc_id, req.fb_id, req.x, req.y, req.mode_valid
+                    );
+                }
                 if req.fb_id != 0 {
                     drm::set_crtc_fb(req.crtc_id, req.fb_id);
                     drm::scanout(req.fb_id);
@@ -706,6 +713,12 @@ impl INode for DrmDev {
             }
             DRM_IOCTL_MODE_PAGE_FLIP => {
                 let flip = unsafe { *(data as *const DrmModeCrtcPageFlip) };
+                if !PAGEFLIP_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                    log::warn!(
+                        "[drm] PAGE_FLIP fb={} crtc={} (first flip)",
+                        flip.fb_id, flip.crtc_id
+                    );
+                }
                 if drm::page_flip(flip.fb_id, flip.crtc_id, flip.user_data) {
                     Ok(0)
                 } else {
