@@ -572,24 +572,56 @@ impl VmAddressRegion {
     ///
     /// The fault virtual address is `vaddr` and the reason is in `flags`.
     pub fn handle_page_fault(&self, vaddr: VirtAddr, flags: MMUFlags) -> ZxResult {
-        let guard = self.inner.lock();
-        let inner = guard.as_ref().unwrap();
-        if !self.contains(vaddr) {
-            return Err(ZxError::NOT_FOUND);
-        }
+        // Resolve the owning child sub-VMAR / mapping UNDER the lock, then
+        // release the lock BEFORE doing the actual fault work.
+        //
+        // `self.inner` is an IRQ-disabling spinlock. `mapping.handle_page_fault`
+        // demand-pages from disk (commit_page -> FrameFiller -> block device),
+        // and with fault-around it commits up to 16 pages per fault. Holding
+        // this lock across all of that keeps interrupts OFF for the entire
+        // multi-page (polled) disk-read window — starving the timer, scheduler
+        // and input for as long as the paging takes. On a real polled-AHCI disk
+        // a compositor's clients (swaybg/foot) paging in tens of MiB of
+        // libraries then presents as a full-machine hang. Dropping the lock
+        // first bounds the interrupts-off window to a single page read, with
+        // the CPU able to service interrupts between reads.
+        //
+        // The child/mapping are reference-counted (`Arc`); cloning them keeps
+        // them alive if a concurrent VMAR edit removes them from the list, and
+        // the actual page-table update is serialized by the mapping's own
+        // page-table lock, so releasing the VMAR lock here is safe.
+        //
         // Prefer a child sub-VMAR that owns this address — but if the child can
         // NOT resolve the fault (no mapping there), fall through to this VMAR's
         // own mappings instead of returning the child's NOT_FOUND. A mapping
         // placed in the parent must not be shadowed into a spurious SIGSEGV just
         // because some child sub-region's address *range* happens to cover
         // `vaddr` while owning no mapping for it.
-        if let Some(child) = inner.children.iter().find(|ch| ch.contains(vaddr)) {
+        let (child, mapping) = {
+            let guard = self.inner.lock();
+            let inner = guard.as_ref().unwrap();
+            if !self.contains(vaddr) {
+                return Err(ZxError::NOT_FOUND);
+            }
+            let child = inner
+                .children
+                .iter()
+                .find(|ch| ch.contains(vaddr))
+                .cloned();
+            let mapping = inner
+                .mappings
+                .iter()
+                .find(|map| map.contains(vaddr))
+                .cloned();
+            (child, mapping)
+        };
+        if let Some(child) = child {
             match child.handle_page_fault(vaddr, flags) {
                 Err(ZxError::NOT_FOUND) => {}
                 res => return res,
             }
         }
-        if let Some(mapping) = inner.mappings.iter().find(|map| map.contains(vaddr)) {
+        if let Some(mapping) = mapping {
             return mapping.handle_page_fault(vaddr, flags);
         }
         Err(ZxError::NOT_FOUND)
