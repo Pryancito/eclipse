@@ -502,7 +502,7 @@ impl Syscall<'_> {
                         // swapchain buffer; if the handle isn't in the GEM table
                         // the whole output bring-up fails. Surface at warn so a
                         // single console photo shows it without LOG=debug.
-                        kernel_hal::klog_warn!(
+                        warn!(
                             "[drm] PRIME export FAILED: handle={} not in GEM table",
                             h.handle
                         );
@@ -513,7 +513,7 @@ impl Syscall<'_> {
                 let new_fd = proc.add_file(dmabuf)?;
                 h.fd = i32::from(new_fd);
                 ptr.write(h)?;
-                kernel_hal::klog_warn!(
+                warn!(
                     "[drm] PRIME export: handle={} -> fd={} (phys={:#x} size={})",
                     h.handle,
                     h.fd,
@@ -573,7 +573,7 @@ impl Syscall<'_> {
         {
             let c = request as u32;
             if c == 0xC00C_642D || c == 0xC00C_642E || c == 0xC02064B2 {
-                kernel_hal::klog_warn!(
+                warn!(
                     "[drm] ioctl arrive fd={:?} request={:#x} (masked={:#x})",
                     fd,
                     request,
