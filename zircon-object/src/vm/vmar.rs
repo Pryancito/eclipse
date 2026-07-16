@@ -750,14 +750,28 @@ impl VmarInner {
     ) -> ZxResult {
         let src_guard = src.inner.lock();
         let src_inner = src_guard.as_ref().unwrap();
+        // DIAGNOSTIC (visible on the console): fork clones the whole address
+        // space under BOTH VMAR spinlocks (IRQs off). If the machine freezes
+        // here, the last "[fork] mapping i/N" line localizes the wedge.
+        error!(
+            "[fork] start: {} mappings, {} children from vmar {:#x}",
+            src_inner.mappings.len(),
+            src_inner.children.len(),
+            src.addr
+        );
         for child in src_inner.children.iter() {
             self.fork_from(child, page_table)?;
         }
-        for map in src_inner.mappings.iter() {
+        let total = src_inner.mappings.len();
+        for (i, map) in src_inner.mappings.iter().enumerate() {
+            if i % 16 == 0 {
+                error!("[fork] mapping {}/{} @ {:#x}", i, total, map.addr());
+            }
             let mapping = map.clone_map(page_table.clone())?;
             mapping.map()?;
             self.mappings.push(mapping);
         }
+        error!("[fork] done: {} mappings from vmar {:#x}", total, src.addr);
         Ok(())
     }
 }
@@ -1053,6 +1067,17 @@ impl VmMapping {
         /// sequential, so one window amortizes that stack 16× and lines up with
         /// the block layer's 64 KiB read-ahead.
         const FAULT_AROUND_PAGES: usize = 16;
+
+        // DIAGNOSTIC (visible on the console, throttled): if the machine freezes
+        // during demand paging, the last "[pf]" line shows the faulting vaddr.
+        {
+            use core::sync::atomic::{AtomicUsize, Ordering};
+            static PF_COUNT: AtomicUsize = AtomicUsize::new(0);
+            let n = PF_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n % 256 == 0 {
+                error!("[pf] #{} vaddr={:#x} access={:?}", n, vaddr, access_flags);
+            }
+        }
 
         let vaddr = round_down_pages(vaddr);
         // Resolved BEFORE taking `self.inner`: it acquires the VMO family lock,
