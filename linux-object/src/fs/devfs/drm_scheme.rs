@@ -797,9 +797,17 @@ impl INode for DrmDev {
                 let req = unsafe { &mut *(data as *mut DrmWaitVblank) };
                 let typ = req.typ;
                 let signal = req.val1;
+                // Only ask the driver for a real vblank when it has hardware
+                // KMS support. Without hardware KMS (e.g. the NVIDIA stub
+                // registers has_hardware_kms()=false) wait_vblank is
+                // implemented as a busy 16.7 ms spin, and calling it on every
+                // WAIT_VBLANK ioctl causes severe CPU starvation on a
+                // cooperative async runtime — making the system appear frozen.
                 if !drm::software_kms_active() {
                     if let Some(driver) = drm::get_primary_driver() {
-                        let _ = driver.wait_vblank(0);
+                        if driver.has_hardware_kms() {
+                            let _ = driver.wait_vblank(0);
+                        }
                     }
                 }
                 let seq = drm::vblank_seq_now().wrapping_add(1);
