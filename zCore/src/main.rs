@@ -126,6 +126,22 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 "WLR_RENDERER_ALLOW_SOFTWARE=1".into(),
                 "WLR_NO_HARDWARE_CURSORS=1".into(),
                 "WLR_LIBINPUT_NO_DEVICES=1".into(),
+                // On systems with multiple GPUs (e.g. two NVIDIA RTX 2060
+                // SUPER cards) wlroots enumerates ALL DRM nodes unless this
+                // variable restricts it. Opening card1 (compute GPU, no UEFI
+                // framebuffer) in addition to card0 causes two problems:
+                //   1. Both cards share the same global DRM_STATE and expose
+                //      identical synthetic CRTC/connector IDs → wlroots
+                //      allocates 0×0 dumb buffers for the "second" output.
+                //   2. The NVIDIA stub DRM node has no real GLES2/GBM support;
+                //      the gles2/GBM path hangs the whole OS at GL FBO
+                //      creation (see xtask write_labwc_config comment).
+                // Restricting to card0 (the console GPU that has the UEFI
+                // framebuffer) prevents both issues. Also set in /etc/profile
+                // and the /usr/local/bin/labwc wrapper, but only this kernel-
+                // env entry is visible to labwc when launched from a non-login
+                // shell or directly from an init script.
+                "WLR_DRM_DEVICES=/dev/dri/card0".into(),
                 // Software GL/Vulkan via Mesa (no usable HW 3D engine here). The
                 // DRM device now advertises a real NVIDIA PCI id, so Mesa would
                 // otherwise try to load the hardware `nouveau` driver (whose

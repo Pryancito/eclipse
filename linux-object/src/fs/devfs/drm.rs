@@ -528,13 +528,26 @@ pub fn get_resources() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     // makes wlroots fail with "Failed to create DRM backend". If no driver has
     // hardware KMS, include all drivers (e.g. VirtIO-only with no display).
     let has_hardware_kms = drivers.iter().any(|d| d.has_hardware_kms());
-    let mut crtcs = Vec::new();
-    let mut connectors = Vec::new();
+    let mut crtcs: Vec<u32> = Vec::new();
+    let mut connectors: Vec<u32> = Vec::new();
     for driver in &drivers {
         if !has_hardware_kms || driver.has_hardware_kms() {
             let (_, d_crtcs, d_conns) = driver.get_resources();
-            crtcs.extend(d_crtcs);
-            connectors.extend(d_conns);
+            // De-duplicate IDs that can appear across multiple drivers sharing
+            // the same global DRM_STATE (e.g. two NVIDIA GPUs that both return
+            // the same synthetic CRTC/connector IDs). Duplicate IDs confuse
+            // wlroots into creating multiple outputs with identical resource
+            // IDs, which leads to 0×0 dumb-buffer allocations and EINVAL.
+            for id in d_crtcs {
+                if !crtcs.contains(&id) {
+                    crtcs.push(id);
+                }
+            }
+            for id in d_conns {
+                if !connectors.contains(&id) {
+                    connectors.push(id);
+                }
+            }
         }
     }
 
