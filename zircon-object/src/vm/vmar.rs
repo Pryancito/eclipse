@@ -753,7 +753,7 @@ impl VmarInner {
         // DIAGNOSTIC (visible on the console): fork clones the whole address
         // space under BOTH VMAR spinlocks (IRQs off). If the machine freezes
         // here, the last "[fork] mapping i/N" line localizes the wedge.
-        warn!(
+        error!(
             "[fork] start: {} mappings, {} children from vmar {:#x}",
             src_inner.mappings.len(),
             src_inner.children.len(),
@@ -765,13 +765,13 @@ impl VmarInner {
         let total = src_inner.mappings.len();
         for (i, map) in src_inner.mappings.iter().enumerate() {
             if i % 16 == 0 {
-                warn!("[fork] mapping {}/{} @ {:#x}", i, total, map.addr());
+                error!("[fork] mapping {}/{} @ {:#x}", i, total, map.addr());
             }
             let mapping = map.clone_map(page_table.clone())?;
             mapping.map()?;
             self.mappings.push(mapping);
         }
-        warn!("[fork] done: {} mappings from vmar {:#x}", total, src.addr);
+        error!("[fork] done: {} mappings from vmar {:#x}", total, src.addr);
         Ok(())
     }
 }
@@ -1075,7 +1075,7 @@ impl VmMapping {
             static PF_COUNT: AtomicUsize = AtomicUsize::new(0);
             let n = PF_COUNT.fetch_add(1, Ordering::Relaxed);
             if n % 256 == 0 {
-                warn!("[pf] #{} vaddr={:#x} access={:?}", n, vaddr, access_flags);
+                error!("[pf] #{} vaddr={:#x} access={:?}", n, vaddr, access_flags);
             }
         }
 

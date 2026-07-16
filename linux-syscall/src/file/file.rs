@@ -513,7 +513,7 @@ impl Syscall<'_> {
                 let new_fd = proc.add_file(dmabuf)?;
                 h.fd = i32::from(new_fd);
                 ptr.write(h)?;
-                warn!(
+                error!(
                     "[drm] PRIME export: handle={} -> fd={} (phys={:#x} size={})",
                     h.handle,
                     h.fd,
@@ -573,7 +573,7 @@ impl Syscall<'_> {
         {
             let c = request as u32;
             if c == 0xC00C_642D || c == 0xC00C_642E || c == 0xC02064B2 {
-                warn!(
+                error!(
                     "[drm] ioctl arrive fd={:?} request={:#x} (masked={:#x})",
                     fd,
                     request,
