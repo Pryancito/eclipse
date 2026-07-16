@@ -750,28 +750,14 @@ impl VmarInner {
     ) -> ZxResult {
         let src_guard = src.inner.lock();
         let src_inner = src_guard.as_ref().unwrap();
-        // DIAGNOSTIC (visible on the console): fork clones the whole address
-        // space under BOTH VMAR spinlocks (IRQs off). If the machine freezes
-        // here, the last "[fork] mapping i/N" line localizes the wedge.
-        error!(
-            "[fork] start: {} mappings, {} children from vmar {:#x}",
-            src_inner.mappings.len(),
-            src_inner.children.len(),
-            src.addr
-        );
         for child in src_inner.children.iter() {
             self.fork_from(child, page_table)?;
         }
-        let total = src_inner.mappings.len();
-        for (i, map) in src_inner.mappings.iter().enumerate() {
-            if i % 16 == 0 {
-                error!("[fork] mapping {}/{} @ {:#x}", i, total, map.addr());
-            }
+        for map in src_inner.mappings.iter() {
             let mapping = map.clone_map(page_table.clone())?;
             mapping.map()?;
             self.mappings.push(mapping);
         }
-        error!("[fork] done: {} mappings from vmar {:#x}", total, src.addr);
         Ok(())
     }
 }
@@ -1060,52 +1046,16 @@ impl VmMapping {
 
     /// Handle page fault happened on this VmMapping.
     pub(crate) fn handle_page_fault(&self, vaddr: VirtAddr, access_flags: MMUFlags) -> ZxResult {
-        /// Fault-around window for demand-paged (file-backed) mappings: on a
-        /// fault, also pre-commit and pre-map up to this many *following* pages.
-        /// Each 4 KiB fault otherwise pays the full trap → VMO lock → filesystem
-        /// → disk stack on its own; faulting code/data is overwhelmingly
-        /// sequential, so one window amortizes that stack 16× and lines up with
-        /// the block layer's 64 KiB read-ahead.
-        const FAULT_AROUND_PAGES: usize = 16;
-
-        // DIAGNOSTIC (visible on the console, throttled): if the machine freezes
-        // during demand paging, the last "[pf]" line shows the faulting vaddr.
-        {
-            use core::sync::atomic::{AtomicUsize, Ordering};
-            static PF_COUNT: AtomicUsize = AtomicUsize::new(0);
-            let n = PF_COUNT.fetch_add(1, Ordering::Relaxed);
-            if n % 256 == 0 {
-                error!("[pf] #{} vaddr={:#x} access={:?}", n, vaddr, access_flags);
-            }
-        }
-
         let vaddr = round_down_pages(vaddr);
         // Resolved BEFORE taking `self.inner`: it acquires the VMO family lock,
         // and the established discipline is to never hold the mapping lock
         // while taking a VMO lock (the reverse direction exists via
         // `range_change`, which only survives that nesting by using try_lock).
-        let demand_paged = self.vmo.is_demand_paged();
-        let (vmo_offset, mut flags, around) = {
+        let (vmo_offset, mut flags) = {
             let inner = self.inner.lock();
             let offset = vaddr - inner.addr;
             let page_idx = offset / PAGE_SIZE;
-            // Collect the following in-bounds pages for fault-around. Only
-            // worthwhile for demand-paged VMOs, where committing a page means a
-            // filesystem read; anonymous pages are cheap zero-fills and eager
-            // commit would only waste frames.
-            let mut around = Vec::new();
-            if demand_paged {
-                let total_pages = inner.size / PAGE_SIZE;
-                let end = (page_idx + FAULT_AROUND_PAGES).min(total_pages);
-                for idx in (page_idx + 1)..end {
-                    around.push((
-                        inner.addr + idx * PAGE_SIZE,
-                        idx * PAGE_SIZE + inner.vmo_offset,
-                        inner.flags[idx],
-                    ));
-                }
-            }
-            (offset + inner.vmo_offset, inner.flags[page_idx], around)
+            (offset + inner.vmo_offset, inner.flags[page_idx])
         };
         // error!("page fault: addr = {:x}, access_flag = {:?}, flags = {:?}", vaddr, access_flags, flags);
         if !flags.contains(access_flags) {
@@ -1125,24 +1075,6 @@ impl VmMapping {
                 res = pg_table.update(vaddr, Some(paddr), Some(flags)).map(|_| ());
             }
             res.map_err(|_| ZxError::ACCESS_DENIED)?;
-        }
-        // Best-effort fault-around: pre-map the following pages read-only. A
-        // later write to any of them still takes its own fault (preserving the
-        // COW write-protect dance above); any error just stops the read-ahead.
-        for (va, vmo_off, mut pflags) in around {
-            if !pflags.contains(MMUFlags::READ) {
-                continue;
-            }
-            pflags.remove(MMUFlags::WRITE);
-            let paddr = match self.vmo.commit_page(vmo_off / PAGE_SIZE, MMUFlags::READ) {
-                Ok(paddr) => paddr,
-                Err(_) => break,
-            };
-            let mut pg_table = self.page_table.lock();
-            match pg_table.map(Page::new_aligned(va, PageSize::Size4K), paddr, pflags) {
-                Ok(_) | Err(PagingError::AlreadyMapped) => {}
-                Err(_) => break,
-            }
         }
         Ok(())
     }
@@ -1176,26 +1108,26 @@ impl VmMapping {
         // EVERY byte of EVERY mapped file from disk 4 KiB at a time — minutes
         // of wall-clock on polled AHCI — only for the child to execve() and
         // throw the copy away.
-        let new_vmo = match self.vmo.fork_copy() {
-            Ok(vmo) => vmo,
-            Err(_) => {
-                // Eager full copy — NOT copy-on-write (see the doc comment
-                // above for why COW is not used here). `read` commits /
-                // fills-from-source as needed (so file-backed .text and
-                // demand-zero BSS come through correctly); `write` commits the
-                // fresh child frames.
-                let len = self.vmo.len();
-                let new_vmo = VmObject::new_paged(len / PAGE_SIZE);
-                let mut buf = vec![0u8; PAGE_SIZE];
-                let mut off = 0;
-                while off < len {
-                    self.vmo.read(off, &mut buf)?;
-                    new_vmo.write(off, &buf)?;
-                    off += PAGE_SIZE;
-                }
-                new_vmo
-            }
-        };
+        // Eager full copy — NOT copy-on-write and NOT the lazy `fork_copy`
+        // fast path. `fork_copy` (a VMObjectPaged::get_inner immutable borrow
+        // on the SOURCE vmo) races the COW machinery's UNLOCKED borrow_mut of
+        // the same shared vmo on another CPU (a shared library forked in one
+        // process while COW-faulted in another), tripping the RefCell
+        // "already mutably borrowed" panic at vmo/paged.rs:301 and wedging the
+        // machine. The eager per-page copy takes the vmo family lock for every
+        // access (read/write -> get_inner_mut), so it cannot race that way.
+        // `read` commits / fills-from-source as needed (file-backed .text and
+        // demand-zero BSS come through correctly); `write` commits the fresh
+        // child frames.
+        let len = self.vmo.len();
+        let new_vmo = VmObject::new_paged(len / PAGE_SIZE);
+        let mut buf = vec![0u8; PAGE_SIZE];
+        let mut off = 0;
+        while off < len {
+            self.vmo.read(off, &mut buf)?;
+            new_vmo.write(off, &buf)?;
+            off += PAGE_SIZE;
+        }
         let mapping = Arc::new(VmMapping {
             inner: Mutex::new(self.inner.lock().clone()),
             permissions: self.permissions,
