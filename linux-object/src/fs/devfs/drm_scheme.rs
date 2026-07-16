@@ -673,7 +673,10 @@ impl INode for DrmDev {
                     || size64 == 0
                     || size64 > MAX_DUMB_SIZE
                 {
-                    log::warn!(
+                    // error!-level: this rejection was invisible at LOG=error
+                    // and produced an unexplained EINVAL during the labwc
+                    // bring-up — the dims here say WHY it was rejected.
+                    log::error!(
                         "[drm] CREATE_DUMB {}x{} bpp={} -> rejected (pitch={} size={} out of range)",
                         info.width, info.height, bpp, pitch64, size64
                     );
@@ -686,7 +689,10 @@ impl INode for DrmDev {
                     info.handle = handle.id;
                     info.pitch = pitch;
                     info.size = size as u64;
-                    log::debug!(
+                    // error!-level while diagnosing the black screen: shows the
+                    // handle so it can be correlated with the PRIME export that
+                    // follows it in the console log.
+                    log::error!(
                         "[drm] CREATE_DUMB {}x{} bpp={} -> handle={} pitch={} size={}",
                         info.width,
                         info.height,
@@ -697,11 +703,12 @@ impl INode for DrmDev {
                     );
                     Ok(0)
                 } else {
-                    log::debug!(
-                        "[drm] CREATE_DUMB {}x{} bpp={} -> alloc failed",
+                    log::error!(
+                        "[drm] CREATE_DUMB {}x{} bpp={} -> alloc failed (size={})",
                         info.width,
                         info.height,
-                        bpp
+                        bpp,
+                        size
                     );
                     Err(FsError::NoDeviceSpace)
                 }

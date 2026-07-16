@@ -493,16 +493,26 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         match request {
             PRIME_HANDLE_TO_FD => {
+                // Diagnostic build: every exit of this path logs at error! so a
+                // single console photo (LOG=error) pins the failing step — the
+                // black-screen bring-up failed here with a misleading userspace
+                // errno and every earlier trace was filtered or in klog.
                 let mut ptr = UserInOutPtr::<DrmPrimeHandle>::from(arg1);
-                let mut h = ptr.read()?;
+                let mut h = match ptr.read() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        error!("[drm] PRIME read(args @ {:#x}) FAILED: {:?}", arg1, e);
+                        return Err(e.into());
+                    }
+                };
+                error!(
+                    "[drm] PRIME handle_to_fd: handle={} flags={:#x}",
+                    h.handle, h.flags
+                );
                 let (phys, size, vmo) = match drm::export_handle(h.handle) {
                     Some(v) => v,
                     None => {
-                        // Diagnostic: wlroots' dumb allocator PRIME-exports every
-                        // swapchain buffer; if the handle isn't in the GEM table
-                        // the whole output bring-up fails. Surface at warn so a
-                        // single console photo shows it without LOG=debug.
-                        warn!(
+                        error!(
                             "[drm] PRIME export FAILED: handle={} not in GEM table",
                             h.handle
                         );
@@ -510,9 +520,18 @@ impl Syscall<'_> {
                     }
                 };
                 let dmabuf = DmaBuf::new(phys, size, vmo);
-                let new_fd = proc.add_file(dmabuf)?;
+                let new_fd = match proc.add_file(dmabuf) {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        error!("[drm] PRIME add_file FAILED: {:?}", e);
+                        return Err(e);
+                    }
+                };
                 h.fd = i32::from(new_fd);
-                ptr.write(h)?;
+                if let Err(e) = ptr.write(h) {
+                    error!("[drm] PRIME write-back FAILED: {:?}", e);
+                    return Err(e.into());
+                }
                 error!(
                     "[drm] PRIME export: handle={} -> fd={} (phys={:#x} size={})",
                     h.handle,
@@ -581,7 +600,21 @@ impl Syscall<'_> {
                 );
             }
         }
-        let file_like = proc.get_file_like(fd)?;
+        let file_like = match proc.get_file_like(fd) {
+            Ok(f) => f,
+            Err(e) => {
+                // A DRM ioctl ('d' = 0x64 family) on an fd that is NOT in the
+                // fd table would otherwise fail EBADF with zero trace — make it
+                // visible: this is how a stale/ghost fd in userspace shows up.
+                if (request as u32 >> 8) & 0xff == 0x64 {
+                    error!(
+                        "[drm] ioctl {:#x}: fd {:?} NOT in fd table -> {:?}",
+                        request as u32, fd, e
+                    );
+                }
+                return Err(e);
+            }
+        };
         // DRM PRIME (dma-buf) export/import and CREATE_LEASE — need process fd
         // access, so they are handled here rather than in the DRM inode's
         // io_control.
@@ -597,13 +630,29 @@ impl Syscall<'_> {
         // through to ENOTTY ("Not a tty").
         let cmd = request as u32 as usize;
         if cmd == 0xC00C_642D || cmd == 0xC00C_642E || cmd == 0xC018_64C6 {
-            if let Some(ret) = self.sys_drm_prime(&file_like, cmd, arg1)? {
-                kernel_hal::klog_info!(
-                    "ioctl LEAVE fd={:?} request={:#x} -> PRIME ok",
-                    fd,
-                    request
-                );
-                return Ok(ret);
+            // Log the definitive kernel-side RESULT of every PRIME-family
+            // ioctl. Userspace error strings proved misleading (a stale errno
+            // can be printed when the failure position is ambiguous), so this
+            // line — not wlroots' log — is the ground truth for what the
+            // kernel actually answered.
+            match self.sys_drm_prime(&file_like, cmd, arg1) {
+                Ok(Some(ret)) => {
+                    error!(
+                        "[drm] PRIME ioctl {:#x} fd={:?} -> Ok({})",
+                        cmd, fd, ret
+                    );
+                    return Ok(ret);
+                }
+                Ok(None) => {
+                    error!(
+                        "[drm] PRIME ioctl {:#x} fd={:?} -> unmatched, falling to inode handler",
+                        cmd, fd
+                    );
+                }
+                Err(e) => {
+                    error!("[drm] PRIME ioctl {:#x} fd={:?} -> Err({:?})", cmd, fd, e);
+                    return Err(e);
+                }
             }
         }
         // `TIOCGWINSZ` (get terminal window size).
