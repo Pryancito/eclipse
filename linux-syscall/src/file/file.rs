@@ -495,12 +495,31 @@ impl Syscall<'_> {
             PRIME_HANDLE_TO_FD => {
                 let mut ptr = UserInOutPtr::<DrmPrimeHandle>::from(arg1);
                 let mut h = ptr.read()?;
-                let (phys, size, vmo) = drm::export_handle(h.handle).ok_or(LxError::EINVAL)?;
+                let (phys, size, vmo) = match drm::export_handle(h.handle) {
+                    Some(v) => v,
+                    None => {
+                        // Diagnostic: wlroots' dumb allocator PRIME-exports every
+                        // swapchain buffer; if the handle isn't in the GEM table
+                        // the whole output bring-up fails. Surface at warn so a
+                        // single console photo shows it without LOG=debug.
+                        kernel_hal::klog_warn!(
+                            "[drm] PRIME export FAILED: handle={} not in GEM table",
+                            h.handle
+                        );
+                        return Err(LxError::EINVAL);
+                    }
+                };
                 let dmabuf = DmaBuf::new(phys, size, vmo);
                 let new_fd = proc.add_file(dmabuf)?;
                 h.fd = i32::from(new_fd);
                 ptr.write(h)?;
-                info!("drm PRIME export: handle={} -> fd={}", h.handle, h.fd);
+                kernel_hal::klog_warn!(
+                    "[drm] PRIME export: handle={} -> fd={} (phys={:#x} size={})",
+                    h.handle,
+                    h.fd,
+                    phys,
+                    size
+                );
                 Ok(Some(0))
             }
             PRIME_FD_TO_HANDLE => {
@@ -547,6 +566,21 @@ impl Syscall<'_> {
             fd, request, arg1, arg2, arg3
         );
         let proc = self.linux_process();
+        // Diagnostic: log DRM PRIME / dumb-buffer requests at their arrival,
+        // BEFORE get_file_like — otherwise a bad fd returns EBADF silently via
+        // `?` and wlroots reports "Failed to get PRIME handle: Bad file
+        // descriptor" with nothing in our log to explain it.
+        {
+            let c = request as u32;
+            if c == 0xC00C_642D || c == 0xC00C_642E || c == 0xC02064B2 {
+                kernel_hal::klog_warn!(
+                    "[drm] ioctl arrive fd={:?} request={:#x} (masked={:#x})",
+                    fd,
+                    request,
+                    c
+                );
+            }
+        }
         let file_like = proc.get_file_like(fd)?;
         // DRM PRIME (dma-buf) export/import and CREATE_LEASE — need process fd
         // access, so they are handled here rather than in the DRM inode's
