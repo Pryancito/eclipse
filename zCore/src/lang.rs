@@ -29,6 +29,16 @@ fn panic(info: &PanicInfo) -> ! {
     // RefCell → nested panic → abort() → ud2 → triple fault → QEMU reset.
     kernel_hal::interrupt::intr_off();
 
+    // Make the panic VISIBLE after a compositor took the screen. Once labwc
+    // sets KD_GRAPHICS the kernel stops PRESENTING the text console (writes
+    // still land in the shadow buffer but are never pushed to the display), so
+    // a panic here would only reach serial — the monitor stays black on the
+    // compositor's last frame and the crash reads as a silent freeze. Forcing
+    // the active VT back to KD_TEXT repaints the text console and makes every
+    // graphic_console_write_fmt below actually appear on the monitor. It is
+    // panic-safe: the repaint is best-effort try_lock and allocates nothing.
+    kernel_hal::console::set_kd_mode(kernel_hal::console::KD_TEXT);
+
     // Use spin variant: interrupts are already off above, and try_lock silently
     // discards output if another CPU holds the lock — unacceptable in panic context.
     //

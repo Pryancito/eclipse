@@ -63,7 +63,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     // PRIME/DRM diagnostics in that photo predate the current instrumentation.
     // Bump the tag on every diagnostic generation so a glance settles "is this
     // the build I just made?" without parsing dense logs.
-    log::error!("[eclipse] BUILD MARKER gen6: PRIME content-based export/import dispatch ACTIVE");
+    log::error!("[eclipse] BUILD MARKER gen7: panic restores KD_TEXT (crashes visible after labwc) ACTIVE");
     memory::insert_regions(&kernel_hal::mem::free_pmem_regions());
     kernel_hal::console::early_progress_bar(80);
     kernel_hal::primary_init();
