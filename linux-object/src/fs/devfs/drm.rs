@@ -86,6 +86,28 @@ struct DrmState {
     /// the card fd. Each entry is one fully-encoded `struct drm_event_vblank`.
     events: VecDeque<Vec<u8>>,
     eventbus: Arc<Mutex<EventBus>>,
+    /// Kernel-composited hardware cursor (legacy `DRM_IOCTL_MODE_CURSOR`). The
+    /// bitmap is a copy of the client's cursor BO (premultiplied ARGB8888,
+    /// `w`x`h`), drawn on top of every scanned-out frame at `(x, y)`.
+    cursor: CursorState,
+}
+
+/// State for the kernel-composited cursor. wlroots (forced to legacy KMS) sets
+/// the pointer image with `DRM_MODE_CURSOR_BO` and moves it with
+/// `DRM_MODE_CURSOR_MOVE`; `scanout()` composites it over the frame.
+#[derive(Default)]
+struct CursorState {
+    visible: bool,
+    /// Top-left position of the cursor bitmap in output pixels (already
+    /// hotspot-adjusted by the compositor for the legacy path).
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    /// A private copy of the client's cursor pixels (premultiplied ARGB8888,
+    /// tightly packed `w`*`h`). Copied out of the GEM buffer so a later
+    /// GEM_CLOSE / buffer reuse can't tear the image mid-scanout.
+    bitmap: Vec<u32>,
 }
 
 lazy_static::lazy_static! {
@@ -98,6 +120,14 @@ lazy_static::lazy_static! {
         crtc_fb: 0,
         events: VecDeque::new(),
         eventbus: EventBus::new(),
+        cursor: CursorState {
+            visible: false,
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+            bitmap: Vec::new(),
+        },
     });
 }
 
@@ -328,11 +358,82 @@ pub fn scanout(fb_id: u32) -> bool {
     let width = fb.width.min(info.width);
     let height = fb.height.min(info.height);
     display.blit_from(0, 0, pixels, src_stride, width, height);
+    // Composite the kernel cursor on top of the just-blitted frame, so a
+    // page-flip never erases the pointer. Snapshot the cursor under the lock,
+    // then blend lock-free (blending reads the slow PCIe framebuffer for
+    // antialiased edges, which must not run with the DRM spinlock held).
+    let cursor = {
+        let state = DRM_STATE.lock();
+        let c = &state.cursor;
+        if c.visible && c.w > 0 && c.h > 0 && !c.bitmap.is_empty() {
+            Some((c.x, c.y, c.w, c.h, c.bitmap.clone()))
+        } else {
+            None
+        }
+    };
+    if let Some((cx, cy, cw, ch, bmp)) = cursor {
+        display.blit_argb_over(cx, cy, &bmp, cw as usize, cw, ch);
+    }
     let _ = display.flush();
     // A DRM client owns the framebuffer now: stop the kernel text console from
     // drawing over it (like fbcon yielding to KMS). Restored on DROP_MASTER.
     kernel_hal::console::set_kd_mode(kernel_hal::console::KD_GRAPHICS);
     true
+}
+
+/// Set (or hide) the cursor bitmap from a GEM handle (`DRM_MODE_CURSOR_BO`).
+///
+/// `handle_id == 0` (or a zero-sized image) hides the cursor. Otherwise the
+/// client's cursor BO is a tightly-packed premultiplied-ARGB8888 dumb buffer of
+/// `w`x`h` pixels; copy it out so a later GEM_CLOSE / reuse can't tear the image
+/// mid-scanout. Returns true if the cursor state changed enough to warrant a
+/// repaint.
+pub fn set_cursor_bo(handle_id: u32, w: u32, h: u32) -> bool {
+    let mut state = DRM_STATE.lock();
+    if handle_id == 0 || w == 0 || h == 0 {
+        let was_visible = state.cursor.visible;
+        state.cursor.visible = false;
+        return was_visible;
+    }
+    let handle = match state.handles.iter().find(|(g, _)| g.id == handle_id) {
+        Some((g, _)) => *g,
+        None => {
+            state.cursor.visible = false;
+            return true;
+        }
+    };
+    let px = (w as usize).saturating_mul(h as usize);
+    if px == 0 || handle.size < px * 4 || handle.phys_addr == 0 {
+        state.cursor.visible = false;
+        return true;
+    }
+    let vaddr = phys_to_virt(handle.phys_addr as usize);
+    // SAFETY: contiguous physical dumb buffer of `handle.size` bytes,
+    // identity-mapped at `vaddr`; we read exactly `px` u32 pixels (<= size/4).
+    let src = unsafe { core::slice::from_raw_parts(vaddr as *const u32, px) };
+    state.cursor.bitmap.clear();
+    state.cursor.bitmap.extend_from_slice(src);
+    state.cursor.w = w;
+    state.cursor.h = h;
+    state.cursor.visible = true;
+    true
+}
+
+/// Move the cursor's top-left to `(x, y)` in output pixels
+/// (`DRM_MODE_CURSOR_MOVE`). The compositor has already applied the hotspot.
+pub fn move_cursor(x: i32, y: i32) {
+    let mut state = DRM_STATE.lock();
+    state.cursor.x = x;
+    state.cursor.y = y;
+}
+
+/// Re-present the current CRTC framebuffer so a cursor set/move takes effect
+/// immediately (the legacy cursor ioctls carry no page-flip of their own).
+pub fn repaint_for_cursor() {
+    let fb_id = DRM_STATE.lock().crtc_fb;
+    if fb_id != 0 && software_kms_active() {
+        scanout(fb_id);
+    }
 }
 
 /// Page-flip to `fb_id` and queue a completion event for the card fd.

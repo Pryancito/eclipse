@@ -900,9 +900,38 @@ impl INode for DrmDev {
                 Ok(0)
             }
             DRM_IOCTL_MODE_CURSOR | DRM_IOCTL_MODE_CURSOR2 => {
-                // No hardware cursor plane: accept set/move/hide as a no-op so a
-                // legacy commit that touches the cursor still succeeds. The
-                // visible pointer comes from wlroots' software cursor.
+                // Kernel-composited hardware cursor. wlroots is forced onto the
+                // legacy KMS path (atomic is rejected), so it drives the pointer
+                // with these ioctls; `scanout()` draws the bitmap over each
+                // frame. The `drm_mode_cursor2` layout begins with the same 28
+                // bytes as `drm_mode_cursor` (flags, crtc_id, x, y, width,
+                // height, handle) and only appends hot_x/hot_y — which we don't
+                // need for drawing, since the compositor pre-adjusts x/y for the
+                // hotspot — so one 28-byte view serves both ioctls.
+                #[repr(C)]
+                struct DrmModeCursor {
+                    flags: u32,
+                    crtc_id: u32,
+                    x: i32,
+                    y: i32,
+                    width: u32,
+                    height: u32,
+                    handle: u32,
+                }
+                const DRM_MODE_CURSOR_BO: u32 = 0x01;
+                const DRM_MODE_CURSOR_MOVE: u32 = 0x02;
+                let cur = unsafe { &*(data as *const DrmModeCursor) };
+                let mut changed = false;
+                if cur.flags & DRM_MODE_CURSOR_BO != 0 {
+                    changed |= drm::set_cursor_bo(cur.handle, cur.width, cur.height);
+                }
+                if cur.flags & DRM_MODE_CURSOR_MOVE != 0 {
+                    drm::move_cursor(cur.x, cur.y);
+                    changed = true;
+                }
+                if changed {
+                    drm::repaint_for_cursor();
+                }
                 Ok(0)
             }
             DRM_IOCTL_GEM_CLOSE => {
