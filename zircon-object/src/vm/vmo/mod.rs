@@ -121,6 +121,15 @@ pub trait VMObjectTrait: Sync + Send {
         false
     }
 
+    /// Returns true if the object is a fixed window onto a specific physical
+    /// range (device/BAR/contiguous buffer shared via `new_physical`), as
+    /// opposed to owned RAM. Such an object must be SHARED across `fork`, never
+    /// copied: it has no per-process contents, and eager-copying a device range
+    /// page-by-page can wedge the machine.
+    fn is_physical(&self) -> bool {
+        false
+    }
+
     /// Returns true if the object fills untouched pages lazily from a backing
     /// source (a file-backed mapping). Used to decide whether fault-around
     /// pre-commit is worthwhile.
@@ -418,6 +427,12 @@ impl VmObject {
     /// Returns true if the object is backed by a contiguous range of physical memory.
     pub fn is_contiguous(&self) -> bool {
         self.trait_.is_contiguous()
+    }
+
+    /// Returns true if this is a fixed physical-memory window (see
+    /// [`VMObjectTrait::is_physical`]): shared, not copied, on `fork`.
+    pub fn is_physical(&self) -> bool {
+        self.trait_.is_physical()
     }
 
     /// Independent copy for Linux `fork`: only committed pages are copied;
