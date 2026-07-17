@@ -730,11 +730,23 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             cfg.join("autostart"),
             b"# Eclipse OS - labwc autostart.\n\
               # Needs the Wayland clients: `apk add foot swaybg`.\n\
+              # Everything here is logged so a black desktop is diagnosable\n\
+              # WITHOUT a reboot: `cat ~/.config/labwc/autostart.log`.\n\
+              LOG=\"$HOME/.config/labwc/autostart.log\"\n\
+              exec >\"$LOG\" 2>&1\n\
+              echo \"[autostart] $(date 2>/dev/null || echo boot) begin\"\n\
+              echo \"[autostart] XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR WAYLAND_DISPLAY=$WAYLAND_DISPLAY\"\n\
               # Solid-colour wallpaper so the desktop is not black; swaybg is a\n\
               # continuous surface, giving labwc something to composite.\n\
-              command -v swaybg >/dev/null 2>&1 && swaybg -c '#1f6f6f' &\n\
+              if command -v swaybg >/dev/null 2>&1; then\n\
+              \x20 echo '[autostart] launching swaybg'; swaybg -c '#1f6f6f' &\n\
+              else echo '[autostart] MISSING swaybg -> desktop stays black (apk add swaybg)'; fi\n\
               # A terminal so the desktop is immediately usable.\n\
-              command -v foot   >/dev/null 2>&1 && foot &\n",
+              if command -v foot >/dev/null 2>&1; then\n\
+              \x20 echo '[autostart] launching foot'; foot &\n\
+              else echo '[autostart] MISSING foot -> no terminal (apk add foot)'; fi\n\
+              echo \"[autostart] cursor theme dir: $(ls -d /usr/share/icons/*/cursors 2>/dev/null || echo NONE)\"\n\
+              echo '[autostart] done'\n",
         )
         .unwrap();
 
@@ -784,6 +796,19 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               export WLR_NO_HARDWARE_CURSORS=1\n\
               export WLR_LIBINPUT_NO_DEVICES=1\n\
               export WLR_DRM_DEVICES=/dev/dri/card0\n\
+              # A Wayland compositor needs XDG_RUNTIME_DIR for its socket; set it\n\
+              # here too in case labwc was started from a non-login shell that\n\
+              # never sourced /etc/profile (otherwise clients can't connect and\n\
+              # the desktop stays black with no autostart).\n\
+              : \"${XDG_RUNTIME_DIR:=/run/user/0}\"\n\
+              export XDG_RUNTIME_DIR\n\
+              [ -d \"$XDG_RUNTIME_DIR\" ] || { mkdir -p \"$XDG_RUNTIME_DIR\" && chmod 0700 \"$XDG_RUNTIME_DIR\"; }\n\
+              # Software cursor needs an XCURSOR theme on disk; wlroots draws NO\n\
+              # pointer without one. Point at the first installed theme (or the\n\
+              # conventional 'default') so a mouse pointer is visible once a\n\
+              # cursor theme is present (apk add adwaita-icon-theme).\n\
+              : \"${XCURSOR_THEME:=default}\"; export XCURSOR_THEME\n\
+              : \"${XCURSOR_SIZE:=24}\"; export XCURSOR_SIZE\n\
               for d in /usr/bin /bin /usr/sbin /sbin; do\n\
               \x20 if [ -x \"$d/labwc\" ]; then exec \"$d/labwc\" \"$@\"; fi\n\
               done\n\
