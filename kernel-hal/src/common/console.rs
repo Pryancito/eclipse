@@ -97,7 +97,6 @@ cfg_if! {
     if #[cfg(feature = "graphic")] {
         use crate::utils::init_once::InitOnce;
         use alloc::sync::Arc;
-        use core::sync::atomic::AtomicBool;
         use zcore_drivers::{scheme::DisplayScheme, utils::GraphicConsole};
 
         use alloc::vec::Vec;
