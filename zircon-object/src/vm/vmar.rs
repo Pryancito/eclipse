@@ -1139,26 +1139,41 @@ impl VmMapping {
         // EVERY byte of EVERY mapped file from disk 4 KiB at a time — minutes
         // of wall-clock on polled AHCI — only for the child to execve() and
         // throw the copy away.
-        // Eager full copy — NOT copy-on-write and NOT the lazy `fork_copy`
-        // fast path. `fork_copy` (a VMObjectPaged::get_inner immutable borrow
-        // on the SOURCE vmo) races the COW machinery's UNLOCKED borrow_mut of
-        // the same shared vmo on another CPU (a shared library forked in one
-        // process while COW-faulted in another), tripping the RefCell
-        // "already mutably borrowed" panic at vmo/paged.rs:301 and wedging the
-        // machine. The eager per-page copy takes the vmo family lock for every
-        // access (read/write -> get_inner_mut), so it cannot race that way.
-        // `read` commits / fills-from-source as needed (file-backed .text and
-        // demand-zero BSS come through correctly); `write` commits the fresh
-        // child frames.
-        let len = self.vmo.len();
-        let new_vmo = VmObject::new_paged(len / PAGE_SIZE);
-        let mut buf = vec![0u8; PAGE_SIZE];
-        let mut off = 0;
-        while off < len {
-            self.vmo.read(off, &mut buf)?;
-            new_vmo.write(off, &buf)?;
-            off += PAGE_SIZE;
-        }
+        // Lazy fast path: copy only the pages the parent has actually
+        // committed; untouched pages of a file-backed mapping stay lazy in the
+        // child and fault in from the same file later. Without this, forking a
+        // compositor eagerly reads its ENTIRE mapped set (251 MiB across ~600
+        // mappings observed on real hardware) from the polled disk, 4 KiB at a
+        // time — many minutes per fork, unusable.
+        //
+        // History: this fast path was previously reverted because forks raced
+        // the COW machinery with a "RefCell already mutably borrowed" panic in
+        // vmo/paged.rs. The actual root cause was a drop-order bug in
+        // get_inner/get_inner_mut: every call site destructures the returned
+        // (borrow, guard) tuple, and pattern bindings drop in REVERSE order,
+        // so the family mutex was released a few instructions BEFORE the
+        // RefCell borrow died — any concurrent vmo op could then panic. That
+        // is now fixed at the source (guard first, borrow second — see
+        // paged.rs get_inner), making this fast path sound again.
+        let new_vmo = match self.vmo.fork_copy() {
+            Ok(vmo) => vmo,
+            Err(_) => {
+                // Eager full copy fallback (slices, contiguous, clone trees,
+                // pinned or non-Origin vmos). `read` commits / fills from the
+                // backing source as needed; `write` commits the fresh child
+                // frames.
+                let len = self.vmo.len();
+                let new_vmo = VmObject::new_paged(len / PAGE_SIZE);
+                let mut buf = vec![0u8; PAGE_SIZE];
+                let mut off = 0;
+                while off < len {
+                    self.vmo.read(off, &mut buf)?;
+                    new_vmo.write(off, &buf)?;
+                    off += PAGE_SIZE;
+                }
+                new_vmo
+            }
+        };
         let mapping = Arc::new(VmMapping {
             inner: Mutex::new(self.inner.lock().clone()),
             permissions: self.permissions,
