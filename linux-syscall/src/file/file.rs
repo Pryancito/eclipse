@@ -501,87 +501,85 @@ impl Syscall<'_> {
         static PRIME_SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = PRIME_SEQ.fetch_add(1, Ordering::Relaxed);
         let pid = self.zircon_process().id();
-        // Name the matched arm INLINE on the entry line. If a call logs
-        // `req=0xc00c642d(H2F)` its result is a HANDLE_TO_FD outcome, full stop
-        // — no cross-referencing constants against a blurry request value.
-        let arm = match request {
-            PRIME_HANDLE_TO_FD => "H2F",
-            PRIME_FD_TO_HANDLE => "F2H",
-            MODE_CREATE_LEASE => "LEASE",
-            _ => "?",
-        };
-        error!("[drm] PRIME#{} pid={} req={:#x}({})", seq, pid, request, arm);
+        error!("[drm] PRIME#{} pid={} req={:#x}", seq, pid, request);
         match request {
-            PRIME_HANDLE_TO_FD => {
+            // EXPORT (HANDLE_TO_FD) and IMPORT (FD_TO_HANDLE) share one arm and
+            // are told apart by STRUCT CONTENT, not the ioctl number. On real
+            // hardware the number-based dispatch mis-routed 0xc00c642d (export)
+            // into the import path — verified impossible in the source yet
+            // reproducible on the target — so the number is no longer trusted to
+            // pick the operation. libdrm's drmPrimeHandleToFD presets the output
+            // `fd` field to -1 and passes a real GEM `handle`; drmPrimeFDToHandle
+            // passes a real `fd` (>=0) and a zero output `handle`. Thus `fd < 0`
+            // is an unambiguous, dispatch-independent marker of an export.
+            PRIME_HANDLE_TO_FD | PRIME_FD_TO_HANDLE => {
                 let mut ptr = UserInOutPtr::<DrmPrimeHandle>::from(arg1);
                 let mut h = match ptr.read() {
                     Ok(h) => h,
                     Err(e) => {
-                        error!("[drm] PRIME#{} H2F read(args @ {:#x}) EFAULT: {:?}", seq, arg1, e);
+                        error!("[drm] PRIME#{} read(args @ {:#x}) EFAULT: {:?}", seq, arg1, e);
                         return Err(e.into());
                     }
                 };
+                let is_export = h.fd < 0;
                 error!(
-                    "[drm] PRIME#{} H2F struct: handle={} flags={:#x} fd={}",
-                    seq, h.handle, h.flags, h.fd
+                    "[drm] PRIME#{} {} struct: handle={} flags={:#x} fd={}",
+                    seq,
+                    if is_export { "EXPORT" } else { "IMPORT" },
+                    h.handle,
+                    h.flags,
+                    h.fd
                 );
-                let (phys, size, vmo) = match drm::export_handle(h.handle) {
-                    Some(v) => v,
-                    None => {
-                        error!(
-                            "[drm] PRIME#{} H2F EINVAL: handle={} not in GEM table",
-                            seq, h.handle
-                        );
-                        return Err(LxError::EINVAL);
+                if is_export {
+                    // handle -> new dma-buf fd
+                    let (phys, size, vmo) = match drm::export_handle(h.handle) {
+                        Some(v) => v,
+                        None => {
+                            error!(
+                                "[drm] PRIME#{} EXPORT EINVAL: handle={} not in GEM table",
+                                seq, h.handle
+                            );
+                            return Err(LxError::EINVAL);
+                        }
+                    };
+                    let dmabuf = DmaBuf::new(phys, size, vmo);
+                    let new_fd = match proc.add_file(dmabuf) {
+                        Ok(fd) => fd,
+                        Err(e) => {
+                            error!("[drm] PRIME#{} EXPORT add_file {:?}", seq, e);
+                            return Err(e);
+                        }
+                    };
+                    h.fd = i32::from(new_fd);
+                    if let Err(e) = ptr.write(h) {
+                        error!("[drm] PRIME#{} EXPORT write-back EFAULT: {:?}", seq, e);
+                        return Err(e.into());
                     }
-                };
-                let dmabuf = DmaBuf::new(phys, size, vmo);
-                let new_fd = match proc.add_file(dmabuf) {
-                    Ok(fd) => fd,
-                    Err(e) => {
-                        error!("[drm] PRIME#{} H2F add_file {:?}", seq, e);
-                        return Err(e);
-                    }
-                };
-                h.fd = i32::from(new_fd);
-                if let Err(e) = ptr.write(h) {
-                    error!("[drm] PRIME#{} H2F write-back EFAULT: {:?}", seq, e);
-                    return Err(e.into());
+                    error!(
+                        "[drm] PRIME#{} EXPORT OK: handle={} -> fd={} size={}",
+                        seq, h.handle, h.fd, size
+                    );
+                    Ok(Some(0))
+                } else {
+                    // fd -> new GEM handle
+                    let target = match proc.get_file_like(FileDesc::from(h.fd as usize)) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            error!(
+                                "[drm] PRIME#{} IMPORT EBADF: fd={} not in fd table",
+                                seq, h.fd
+                            );
+                            return Err(e);
+                        }
+                    };
+                    let dmabuf = target.downcast_ref::<DmaBuf>().ok_or(LxError::EINVAL)?;
+                    let handle_id =
+                        drm::import_dmabuf(dmabuf.phys_addr, dmabuf.size, dmabuf.vmo());
+                    h.handle = handle_id;
+                    ptr.write(h)?;
+                    error!("[drm] PRIME#{} IMPORT OK: fd={} -> handle={}", seq, h.fd, h.handle);
+                    Ok(Some(0))
                 }
-                error!(
-                    "[drm] PRIME#{} H2F OK: handle={} -> fd={} size={}",
-                    seq, h.handle, h.fd, size
-                );
-                Ok(Some(0))
-            }
-            PRIME_FD_TO_HANDLE => {
-                let mut ptr = UserInOutPtr::<DrmPrimeHandle>::from(arg1);
-                let mut h = ptr.read()?;
-                // Decode the whole struct. If this arm ever fires with a NONZERO
-                // handle and fd=-1, the caller actually issued an EXPORT
-                // (HANDLE_TO_FD) whose output fd field is still the -1 sentinel —
-                // i.e. the request was mis-routed here — and the fix is dispatch,
-                // not import. A genuine import carries a real fd.
-                error!(
-                    "[drm] PRIME#{} F2H struct: handle={} flags={:#x} fd={}",
-                    seq, h.handle, h.flags, h.fd
-                );
-                let target = match proc.get_file_like(FileDesc::from(h.fd as usize)) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        error!(
-                            "[drm] PRIME#{} F2H EBADF: import fd={} not in fd table",
-                            seq, h.fd
-                        );
-                        return Err(e);
-                    }
-                };
-                let dmabuf = target.downcast_ref::<DmaBuf>().ok_or(LxError::EINVAL)?;
-                let handle_id = drm::import_dmabuf(dmabuf.phys_addr, dmabuf.size, dmabuf.vmo());
-                h.handle = handle_id;
-                ptr.write(h)?;
-                error!("[drm] PRIME#{} F2H OK: fd={} -> handle={}", seq, h.fd, h.handle);
-                Ok(Some(0))
             }
             MODE_CREATE_LEASE => {
                 // An empty lease is just a fresh fd to the same DRM device: our
