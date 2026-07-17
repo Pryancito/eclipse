@@ -568,6 +568,28 @@ impl LinuxProcess {
         self.insert_file(inner, fd, file)
     }
 
+    /// Atomically replace the file at `fd` (Linux dup2 semantics): the old
+    /// entry (if any) is removed and the new one inserted under a SINGLE lock
+    /// acquisition. The previous close-then-insert sequence left a window in
+    /// which `fd` was absent from the table, so a concurrent thread's syscall
+    /// on that fd got a spurious EBADF. Returns the previously installed file,
+    /// if any, so the caller can log/inspect it.
+    pub fn replace_file(
+        &self,
+        fd: FileDesc,
+        file: Arc<dyn FileLike>,
+    ) -> LxResult<Option<Arc<dyn FileLike>>> {
+        let mut inner = self.inner.lock();
+        let old = inner.files.remove(&fd);
+        // Net table size is unchanged (replace) or +1 (plain insert); apply the
+        // same limit check as insert_file for the growth case.
+        if old.is_none() && inner.files.len() >= inner.file_limit.cur as usize {
+            return Err(LxError::EMFILE);
+        }
+        inner.files.insert(fd, file);
+        Ok(old)
+    }
+
     /// insert a file and fd into the file descriptor table
     fn insert_file(
         &self,
@@ -648,7 +670,12 @@ impl LinuxProcess {
             .cloned()
             .collect();
         for fd in fds {
-            inner.files.remove(&fd);
+            if let Some(f) = inner.files.remove(&fd) {
+                // DRM diagnostics: see fs::drm_fd_desc.
+                if let Some(desc) = crate::fs::drm_fd_desc(&f) {
+                    error!("[drm] fd {:?} ({}) closed by close_range", fd, desc);
+                }
+            }
         }
     }
 
@@ -1198,7 +1225,16 @@ impl LinuxProcess {
             })
             .collect::<Vec<_>>();
         for fd in close_fds {
-            inner.files.remove(&fd).map(|_| ()).unwrap();
+            if let Some(f) = inner.files.remove(&fd) {
+                // DRM diagnostics: every removal of a DRM/dmabuf fd must be
+                // visible — see fs::drm_fd_desc.
+                if let Some(desc) = crate::fs::drm_fd_desc(&f) {
+                    error!(
+                        "[drm] fd {:?} ({}) closed by execve CLOEXEC sweep",
+                        fd, desc
+                    );
+                }
+            }
         }
     }
 

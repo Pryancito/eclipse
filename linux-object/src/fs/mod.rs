@@ -75,6 +75,26 @@ use sysfs::SysFS;
 
 pub use dmabuf::DmaBuf;
 pub use epoll::{Epoll, EpollEvent};
+
+/// If `f` is a DRM-related fd (a /dev/dri device File or a PRIME dma-buf),
+/// return a short description for diagnostics; None otherwise.
+///
+/// Used by the fd close paths to make every removal of a DRM fd visible on the
+/// console: the labwc bring-up failed with a PRIME ioctl arriving on an fd
+/// that was NOT in the fd table, and without close-side logging it is
+/// undecidable who removed it (or which process the stale number belonged to).
+pub fn drm_fd_desc(f: &alloc::sync::Arc<dyn FileLike>) -> Option<alloc::string::String> {
+    if f.downcast_ref::<DmaBuf>().is_some() {
+        return Some(alloc::string::String::from("dmabuf"));
+    }
+    if let Some(file) = f.downcast_ref::<File>() {
+        let p = file.path();
+        if p.starts_with("/dev/dri") {
+            return Some(p.clone());
+        }
+    }
+    None
+}
 pub use eventfd::EventFd;
 pub use file::{File, OpenFlags, PollEvents, SeekFrom};
 pub use perf::{sample_user as perf_sample_user, PerfEvent};
