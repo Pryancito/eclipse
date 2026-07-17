@@ -2,7 +2,7 @@
 
 use crate::drivers;
 use core::fmt::{Arguments, Result, Write};
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 // ---------------------------------------------------------------------------
 // Kernel log (dmesg) callback
@@ -169,7 +169,7 @@ cfg_if! {
             if let Some(cons) = vt_mutex(vt) {
                 if let Some(mut g) = cons.try_lock() {
                     let _ = g.write_str(s);
-                    if active && kd_mode_vt(vt) == KD_TEXT {
+                    if active && present_allowed(vt) {
                         g.present();
                     }
                 }
@@ -184,7 +184,7 @@ cfg_if! {
             if let Some(cons) = vt_mutex(vt) {
                 if let Some(mut g) = cons.try_lock() {
                     let _ = g.write_fmt(fmt);
-                    if active && kd_mode_vt(vt) == KD_TEXT {
+                    if active && present_allowed(vt) {
                         g.present();
                     }
                 }
@@ -253,6 +253,27 @@ pub const KD_GRAPHICS: u32 = 0x01;
 // `KD_GRAPHICS` must not stop the kernel drawing the other text consoles, so
 // switching away from the graphics VT still shows a normal text terminal.
 static KD_MODES: [AtomicU32; NUM_VTS] = [const { AtomicU32::new(KD_TEXT) }; NUM_VTS];
+
+/// Diagnostic: when true, kernel text-console writes are PRESENTED to the
+/// display even while a userspace compositor holds the VT in `KD_GRAPHICS`.
+/// Normally KD_GRAPHICS suppresses presentation so labwc owns the screen, but
+/// that also hides a hard hang's last kernel log line on a monitor-only box.
+/// With this on, the console log stays visible over the compositor, so the last
+/// message before a freeze is frozen on screen.
+static DIAG_PRESENT_OVER_GRAPHICS: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable presenting kernel console output over a KD_GRAPHICS VT.
+pub fn set_diag_present_over_graphics(on: bool) {
+    DIAG_PRESENT_OVER_GRAPHICS.store(on, Ordering::Relaxed);
+}
+
+/// Whether a write to VT `vt` should be pushed to the display now: always in
+/// text mode, and in graphics mode only when the diagnostic override is on.
+#[inline]
+#[allow(dead_code)]
+fn present_allowed(vt: usize) -> bool {
+    kd_mode_vt(vt) == KD_TEXT || DIAG_PRESENT_OVER_GRAPHICS.load(Ordering::Relaxed)
+}
 
 /// Set the KD mode of a specific VT (`KD_TEXT` or `KD_GRAPHICS`).
 pub fn set_kd_mode_vt(vt: usize, mode: u32) {
