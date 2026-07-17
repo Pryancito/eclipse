@@ -57,6 +57,13 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         init_proc,
         shell_proc
     );
+    // Console-visible build stamp (error! -> console at LOG=error). This is the
+    // single unambiguous signal that the running kernel is the current build:
+    // if this exact line is NOT in a boot photo, the binary is stale and any
+    // PRIME/DRM diagnostics in that photo predate the current instrumentation.
+    // Bump the tag on every diagnostic generation so a glance settles "is this
+    // the build I just made?" without parsing dense logs.
+    log::error!("[eclipse] BUILD MARKER gen3: PRIME request-marker + FD_TO_HANDLE trace ACTIVE");
     memory::insert_regions(&kernel_hal::mem::free_pmem_regions());
     kernel_hal::console::early_progress_bar(80);
     kernel_hal::primary_init();

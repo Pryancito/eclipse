@@ -491,6 +491,16 @@ impl Syscall<'_> {
         // fd), and each operation errors gracefully on a wrong fd, so handle by
         // request number alone — no fragile fd-type detection.
         let proc = self.linux_process();
+        // Atomic entry marker: one line, printed for EVERY PRIME-family call
+        // BEFORE any branch, so the exact request value that reached the match
+        // is unambiguous even if later lines are dense. If this prints 642e the
+        // failing call is an IMPORT (FD_TO_HANDLE), not the export wlroots
+        // claims at drm_dumb.c:90.
+        error!(
+            "[drm] pid={} sys_drm_prime request={:#x}",
+            self.zircon_process().id(),
+            request
+        );
         match request {
             PRIME_HANDLE_TO_FD => {
                 // Diagnostic build: every exit of this path logs at error! so a
@@ -547,12 +557,32 @@ impl Syscall<'_> {
             PRIME_FD_TO_HANDLE => {
                 let mut ptr = UserInOutPtr::<DrmPrimeHandle>::from(arg1);
                 let mut h = ptr.read()?;
-                let target = proc.get_file_like(FileDesc::from(h.fd as usize))?;
+                // Instrumented: this get_file_like is the ONLY EBADF source in
+                // the whole PRIME path. If the black-screen bring-up is really
+                // hitting an IMPORT (642e) mislabeled as export, THIS line —
+                // one atomic error! — proves it and names the dma-buf fd.
+                let target = match proc.get_file_like(FileDesc::from(h.fd as usize)) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!(
+                            "[drm] pid={} PRIME FD_TO_HANDLE: dmabuf fd={} NOT in table -> {:?}",
+                            self.zircon_process().id(),
+                            h.fd,
+                            e
+                        );
+                        return Err(e);
+                    }
+                };
                 let dmabuf = target.downcast_ref::<DmaBuf>().ok_or(LxError::EINVAL)?;
                 let handle_id = drm::import_dmabuf(dmabuf.phys_addr, dmabuf.size, dmabuf.vmo());
                 h.handle = handle_id;
                 ptr.write(h)?;
-                info!("drm PRIME import: fd={} -> handle={}", h.fd, h.handle);
+                error!(
+                    "[drm] pid={} PRIME FD_TO_HANDLE: fd={} -> handle={}",
+                    self.zircon_process().id(),
+                    h.fd,
+                    h.handle
+                );
                 Ok(Some(0))
             }
             MODE_CREATE_LEASE => {
