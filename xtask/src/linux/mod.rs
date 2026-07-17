@@ -603,12 +603,12 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # This flag lets the compositor start regardless; devices that ARE\n\
               # discovered still work, so it is safe to leave on permanently.\n\
               export WLR_LIBINPUT_NO_DEVICES=1\n\
-              # No hardware cursor plane on the pixman/dumb-buffer path: wlroots'\n\
-              # legacy DRM backend calls drmModeSetCursor, which fails (ENOTTY)\n\
-              # and takes the whole frame commit down with it ('Failed to commit\n\
-              # frame'), leaving no visible mouse pointer. Force the software\n\
-              # cursor so wlroots composites the pointer into the framebuffer.\n\
-              export WLR_NO_HARDWARE_CURSORS=1\n\
+              # Hardware cursor is now composited by the kernel: wlroots' legacy\n\
+              # DRM backend calls drmModeSetCursor/MoveCursor, which the DRM\n\
+              # scheme accepts and draws over each scanned-out frame. So do NOT\n\
+              # set WLR_NO_HARDWARE_CURSORS -- letting wlroots use the hardware\n\
+              # cursor path avoids re-rendering the whole scene on every pointer\n\
+              # move (the whole point of a HW cursor).\n\
               # Pin wlroots to the console GPU's DRM node (card0 =\n\
               # nvidia-gpu-23:0.0). This box has TWO nvidia DRM cards (card0 =\n\
               # console GPU driving the physical monitor via the UEFI GOP\n\
@@ -793,7 +793,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # GOP framebuffer) is the only working combination here.\n\
               export WLR_RENDERER=pixman\n\
               export WLR_RENDERER_ALLOW_SOFTWARE=1\n\
-              export WLR_NO_HARDWARE_CURSORS=1\n\
+              # Hardware cursor is composited by the kernel DRM scheme, so leave\n\
+              # WLR_NO_HARDWARE_CURSORS unset and let wlroots use the legacy\n\
+              # drmModeSetCursor/MoveCursor path we now handle.\n\
               export WLR_LIBINPUT_NO_DEVICES=1\n\
               export WLR_DRM_DEVICES=/dev/dri/card0\n\
               # A Wayland compositor needs XDG_RUNTIME_DIR for its socket; set it\n\

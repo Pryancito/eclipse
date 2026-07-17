@@ -360,6 +360,78 @@ pub trait DisplayScheme: Scheme {
         }
     }
 
+    /// Alpha-composite a premultiplied ARGB8888 source "over" the framebuffer at
+    /// `(dst_x, dst_y)`, which may be negative (the source is clipped to the
+    /// visible area). This is the kernel-composited hardware cursor: wlroots is
+    /// forced onto the legacy KMS path, so it hands us the pointer bitmap via
+    /// `DRM_IOCTL_MODE_CURSOR` and we draw it on top of every scanned-out frame
+    /// instead of the compositor re-rendering the whole scene on each move.
+    ///
+    /// wlroots renders cursors with premultiplied alpha, so the "over" operator
+    /// is `out = src + dst * (255 - a) / 255`. Fully transparent pixels are
+    /// skipped and fully opaque pixels are copied without reading the (slow,
+    /// PCIe-mapped) destination — so only the antialiased edge pays for a
+    /// read-modify-write.
+    fn blit_argb_over(
+        &self,
+        dst_x: i32,
+        dst_y: i32,
+        src: &[u32],
+        src_stride: usize,
+        width: u32,
+        height: u32,
+    ) {
+        let info = self.info();
+        if info.format != ColorFormat::ARGB8888 || src_stride == 0 {
+            return;
+        }
+        let pitch = info.pitch() as usize;
+        let (fw, fh) = (info.width as i32, info.height as i32);
+        let mut fb = self.fb();
+        let buf: &mut [u8] = &mut fb;
+        for r in 0..height as i32 {
+            let py = dst_y + r;
+            if py < 0 || py >= fh {
+                continue;
+            }
+            let src_row = r as usize * src_stride;
+            for c in 0..width as i32 {
+                let px = dst_x + c;
+                if px < 0 || px >= fw {
+                    continue;
+                }
+                let si = src_row + c as usize;
+                if si >= src.len() {
+                    break;
+                }
+                let s = src[si];
+                let a = s >> 24;
+                if a == 0 {
+                    continue;
+                }
+                let d_off = py as usize * pitch + px as usize * 4;
+                if d_off + 4 > buf.len() {
+                    continue;
+                }
+                let out = if a == 0xff {
+                    s & 0x00FF_FFFF
+                } else {
+                    let inv = 255 - a;
+                    let (sr, sg, sb) = ((s >> 16) & 0xff, (s >> 8) & 0xff, s & 0xff);
+                    let d = u32::from_ne_bytes([buf[d_off], buf[d_off + 1], buf[d_off + 2], 0]);
+                    let (dr, dg, db) = ((d >> 16) & 0xff, (d >> 8) & 0xff, d & 0xff);
+                    // premultiplied over; clamp guards against a non-premultiplied
+                    // source (would otherwise bleed into the next channel).
+                    let or = (sr + dr * inv / 255).min(0xff);
+                    let og = (sg + dg * inv / 255).min(0xff);
+                    let ob = (sb + db * inv / 255).min(0xff);
+                    (or << 16) | (og << 8) | ob
+                };
+                buf[d_off..d_off + 4].copy_from_slice(&out.to_ne_bytes());
+            }
+        }
+    }
+
     /// Clear the screen with `color`.
     fn clear(&self, color: RgbColor) {
         let info = self.info();
