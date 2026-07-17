@@ -640,9 +640,61 @@ impl VmAddressRegion {
 
     /// Clone the entire address space and VMOs from source VMAR. (For Linux fork)
     pub fn fork_from(&self, src: &Arc<Self>) -> ZxResult {
+        // Snapshot the source tree's mappings under its lock, then do the
+        // actual copy with NO VMAR lock held.
+        //
+        // `clone_map` eagerly copies every page of every mapping; for
+        // demand-paged file mappings each page can be a (polled) disk read.
+        // The VMAR `inner` locks are IRQ-disabling spinlocks — the previous
+        // code held BOTH this VMAR's and the source's lock across the entire
+        // walk, keeping interrupts off for the whole multi-second copy of a
+        // large process (a Wayland compositor maps 100+ MiB of libraries).
+        // The machine appeared dead the moment the compositor forked its
+        // autostart shell. A point-in-time snapshot is sound: the forking
+        // parent is blocked inside the fork syscall, and the mapping Arcs
+        // keep the objects alive regardless of concurrent VMAR edits.
+        let mut src_mappings = Vec::new();
+        Self::collect_mappings_for_fork(src, &mut src_mappings);
+
+        // Console heartbeat for very large forks (compositor-sized): confirms
+        // the machine is alive while the eager copy grinds through the disk.
+        let total_bytes: usize = src_mappings.iter().map(|m| m.size()).sum();
+        let big = total_bytes >= 32 << 20;
+        if big {
+            error!(
+                "[fork] eager-copying {} MiB across {} mappings (interrupts stay on)",
+                total_bytes >> 20,
+                src_mappings.len()
+            );
+        }
+
+        let mut new_mappings = Vec::with_capacity(src_mappings.len());
+        for map in src_mappings {
+            let mapping = map.clone_map(self.page_table.clone())?;
+            mapping.map()?;
+            new_mappings.push(mapping);
+        }
+        if big {
+            error!("[fork] eager copy done ({} MiB)", total_bytes >> 20);
+        }
+
         let mut guard = self.inner.lock();
-        let inner = guard.as_mut().unwrap();
-        inner.fork_from(src, &self.page_table)
+        let inner = guard.as_mut().ok_or(ZxError::BAD_STATE)?;
+        inner.mappings.extend(new_mappings);
+        Ok(())
+    }
+
+    /// Collect (a snapshot of) every mapping in `vmar`'s tree for `fork_from`,
+    /// children first — the same flattening order the fork used when it walked
+    /// the tree directly.
+    fn collect_mappings_for_fork(vmar: &Arc<Self>, out: &mut Vec<Arc<VmMapping>>) {
+        let guard = vmar.inner.lock();
+        if let Some(inner) = guard.as_ref() {
+            for child in inner.children.iter() {
+                Self::collect_mappings_for_fork(child, out);
+            }
+            out.extend(inner.mappings.iter().cloned());
+        }
     }
 
     /// Dump VMAR tree (for debugging).
@@ -738,27 +790,6 @@ impl VmAddressRegion {
         let map_size: usize = inner.mappings.iter().map(|map| map.size()).sum();
         let vmar_size: usize = inner.children.iter().map(|vmar| vmar.size).sum();
         map_size + vmar_size
-    }
-}
-
-impl VmarInner {
-    /// Clone the entire address space and VMOs from source VMAR. (For Linux fork)
-    fn fork_from(
-        &mut self,
-        src: &Arc<VmAddressRegion>,
-        page_table: &Arc<Mutex<dyn GenericPageTable>>,
-    ) -> ZxResult {
-        let src_guard = src.inner.lock();
-        let src_inner = src_guard.as_ref().unwrap();
-        for child in src_inner.children.iter() {
-            self.fork_from(child, page_table)?;
-        }
-        for map in src_inner.mappings.iter() {
-            let mapping = map.clone_map(page_table.clone())?;
-            mapping.map()?;
-            self.mappings.push(mapping);
-        }
-        Ok(())
     }
 }
 

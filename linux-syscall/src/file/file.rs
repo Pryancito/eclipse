@@ -506,8 +506,10 @@ impl Syscall<'_> {
                     }
                 };
                 error!(
-                    "[drm] PRIME handle_to_fd: handle={} flags={:#x}",
-                    h.handle, h.flags
+                    "[drm] pid={} PRIME handle_to_fd: handle={} flags={:#x}",
+                    self.zircon_process().id(),
+                    h.handle,
+                    h.flags
                 );
                 let (phys, size, vmo) = match drm::export_handle(h.handle) {
                     Some(v) => v,
@@ -533,7 +535,8 @@ impl Syscall<'_> {
                     return Err(e.into());
                 }
                 error!(
-                    "[drm] PRIME export: handle={} -> fd={} (phys={:#x} size={})",
+                    "[drm] pid={} PRIME export: handle={} -> fd={} (phys={:#x} size={})",
+                    self.zircon_process().id(),
                     h.handle,
                     h.fd,
                     phys,
@@ -564,7 +567,12 @@ impl Syscall<'_> {
                 l.lessee_id = 1;
                 l.fd = i32::from(new_fd);
                 ptr.write(l)?;
-                error!("[drm] CREATE_LEASE -> fd={} lessee={}", l.fd, l.lessee_id);
+                error!(
+                    "[drm] pid={} CREATE_LEASE -> fd={} lessee={}",
+                    self.zircon_process().id(),
+                    l.fd,
+                    l.lessee_id
+                );
                 Ok(Some(0))
             }
             _ => Ok(None),
@@ -591,11 +599,22 @@ impl Syscall<'_> {
         // descriptor" with nothing in our log to explain it.
         {
             let c = request as u32;
-            if c == 0xC00C_642D || c == 0xC00C_642E || c == 0xC02064B2 {
+            // PRIME export/import, CREATE_DUMB, CREATE_LEASE, MAP_DUMB,
+            // DESTROY_DUMB — the buffer-lifecycle calls whose fd/pid identity
+            // decides the stale-fd mystery. pid included: without it, an fd
+            // number cannot be attributed to a process (two labwc instances or
+            // an fd number reused across closes are indistinguishable).
+            if c == 0xC00C_642D
+                || c == 0xC00C_642E
+                || c == 0xC020_64B2
+                || c == 0xC018_64C6
+                || c == 0xC010_64B3
+                || c == 0xC004_64B4
+            {
                 error!(
-                    "[drm] ioctl arrive fd={:?} request={:#x} (masked={:#x})",
+                    "[drm] pid={} ioctl arrive fd={:?} masked={:#x}",
+                    self.zircon_process().id(),
                     fd,
-                    request,
                     c
                 );
             }
@@ -608,8 +627,11 @@ impl Syscall<'_> {
                 // visible: this is how a stale/ghost fd in userspace shows up.
                 if (request as u32 >> 8) & 0xff == 0x64 {
                     error!(
-                        "[drm] ioctl {:#x}: fd {:?} NOT in fd table -> {:?}",
-                        request as u32, fd, e
+                        "[drm] pid={} ioctl {:#x}: fd {:?} NOT in fd table -> {:?}",
+                        self.zircon_process().id(),
+                        request as u32,
+                        fd,
+                        e
                     );
                 }
                 return Err(e);
@@ -638,8 +660,11 @@ impl Syscall<'_> {
             match self.sys_drm_prime(&file_like, cmd, arg1) {
                 Ok(Some(ret)) => {
                     error!(
-                        "[drm] PRIME ioctl {:#x} fd={:?} -> Ok({})",
-                        cmd, fd, ret
+                        "[drm] pid={} PRIME ioctl {:#x} fd={:?} -> Ok({})",
+                        self.zircon_process().id(),
+                        cmd,
+                        fd,
+                        ret
                     );
                     return Ok(ret);
                 }
@@ -650,7 +675,13 @@ impl Syscall<'_> {
                     );
                 }
                 Err(e) => {
-                    error!("[drm] PRIME ioctl {:#x} fd={:?} -> Err({:?})", cmd, fd, e);
+                    error!(
+                        "[drm] pid={} PRIME ioctl {:#x} fd={:?} -> Err({:?})",
+                        self.zircon_process().id(),
+                        cmd,
+                        fd,
+                        e
+                    );
                     return Err(e);
                 }
             }

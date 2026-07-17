@@ -265,6 +265,18 @@ impl Syscall<'_> {
     pub fn sys_close(&self, fd: FileDesc) -> SysResult {
         info!("close: fd={:?}", fd);
         let proc = self.linux_process();
+        // DRM diagnostics: every removal of a DRM/dmabuf fd is logged with the
+        // pid so a stale-fd DRM ioctl can be traced to whoever closed it.
+        if let Ok(f) = proc.get_file_like(fd) {
+            if let Some(desc) = linux_object::fs::drm_fd_desc(&f) {
+                error!(
+                    "[drm] pid={} close(fd={:?}) of {}",
+                    self.zircon_process().id(),
+                    fd,
+                    desc
+                );
+            }
+        }
         proc.close_file(fd)?;
         Ok(0)
     }
@@ -288,13 +300,25 @@ impl Syscall<'_> {
             let _ = proc.get_file_like(fd1)?;
             return Ok(fd2.into());
         }
-        // close fd2 first if it is opened
-        let _ = proc.close_file(fd2);
         let file_like = proc.get_file_like(fd1)?.dup();
         let mut flags = file_like.flags();
         flags -= OpenFlags::CLOEXEC;
         file_like.set_flags(flags)?;
-        let fd2 = proc.add_file_at(fd2, file_like)?;
+        // Atomic replace (Linux dup2 semantics). The previous close-then-insert
+        // pair took the fd-table lock twice, leaving a window where fd2 was
+        // absent — a concurrent syscall on fd2 in that window got a spurious
+        // EBADF.
+        let old = proc.replace_file(fd2, file_like)?;
+        if let Some(old) = old {
+            if let Some(desc) = linux_object::fs::drm_fd_desc(&old) {
+                error!(
+                    "[drm] pid={} dup2 clobbered fd={:?} ({})",
+                    self.zircon_process().id(),
+                    fd2,
+                    desc
+                );
+            }
+        }
         Ok(fd2.into())
     }
 
