@@ -521,6 +521,10 @@ impl Syscall<'_> {
                         return Err(e.into());
                     }
                 };
+                error!(
+                    "[drm] PRIME#{} H2F struct: handle={} flags={:#x} fd={}",
+                    seq, h.handle, h.flags, h.fd
+                );
                 let (phys, size, vmo) = match drm::export_handle(h.handle) {
                     Some(v) => v,
                     None => {
@@ -553,6 +557,15 @@ impl Syscall<'_> {
             PRIME_FD_TO_HANDLE => {
                 let mut ptr = UserInOutPtr::<DrmPrimeHandle>::from(arg1);
                 let mut h = ptr.read()?;
+                // Decode the whole struct. If this arm ever fires with a NONZERO
+                // handle and fd=-1, the caller actually issued an EXPORT
+                // (HANDLE_TO_FD) whose output fd field is still the -1 sentinel —
+                // i.e. the request was mis-routed here — and the fix is dispatch,
+                // not import. A genuine import carries a real fd.
+                error!(
+                    "[drm] PRIME#{} F2H struct: handle={} flags={:#x} fd={}",
+                    seq, h.handle, h.flags, h.fd
+                );
                 let target = match proc.get_file_like(FileDesc::from(h.fd as usize)) {
                     Ok(t) => t,
                     Err(e) => {
