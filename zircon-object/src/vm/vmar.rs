@@ -669,7 +669,20 @@ impl VmAddressRegion {
         }
 
         let mut new_mappings = Vec::with_capacity(src_mappings.len());
-        for map in src_mappings {
+        let n_maps = src_mappings.len();
+        for (i, map) in src_mappings.into_iter().enumerate() {
+            // Progress heartbeat every 64 mappings: with diagnostic present-over-
+            // graphics on, this pins WHICH mapping a fork hang wedges on (a hard
+            // hang leaves the last printed index frozen on screen).
+            if big && i % 64 == 0 {
+                error!(
+                    "[fork] copying mapping {}/{} (addr={:#x} size={:#x})",
+                    i,
+                    n_maps,
+                    map.addr(),
+                    map.size()
+                );
+            }
             let mapping = map.clone_map(self.page_table.clone())?;
             mapping.map()?;
             new_mappings.push(mapping);
