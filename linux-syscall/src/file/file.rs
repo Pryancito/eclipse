@@ -491,42 +491,42 @@ impl Syscall<'_> {
         // fd), and each operation errors gracefully on a wrong fd, so handle by
         // request number alone — no fragile fd-type detection.
         let proc = self.linux_process();
-        // Atomic entry marker: one line, printed for EVERY PRIME-family call
-        // BEFORE any branch, so the exact request value that reached the match
-        // is unambiguous even if later lines are dense. If this prints 642e the
-        // failing call is an IMPORT (FD_TO_HANDLE), not the export wlroots
-        // claims at drm_dumb.c:90.
-        error!(
-            "[drm] pid={} sys_drm_prime request={:#x}",
-            self.zircon_process().id(),
-            request
-        );
+        // One monotonic id per PRIME-family call. Every log line below carries
+        // it, so even when the console interleaves these with wlroots' own
+        // output (and wraps long lines), the entry line and its single result
+        // line for a given call share a `#<seq>` and cannot be misattributed to
+        // an adjacent call — the ambiguity that made the earlier firehose
+        // impossible to read from a photo.
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static PRIME_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = PRIME_SEQ.fetch_add(1, Ordering::Relaxed);
+        let pid = self.zircon_process().id();
+        // Name the matched arm INLINE on the entry line. If a call logs
+        // `req=0xc00c642d(H2F)` its result is a HANDLE_TO_FD outcome, full stop
+        // — no cross-referencing constants against a blurry request value.
+        let arm = match request {
+            PRIME_HANDLE_TO_FD => "H2F",
+            PRIME_FD_TO_HANDLE => "F2H",
+            MODE_CREATE_LEASE => "LEASE",
+            _ => "?",
+        };
+        error!("[drm] PRIME#{} pid={} req={:#x}({})", seq, pid, request, arm);
         match request {
             PRIME_HANDLE_TO_FD => {
-                // Diagnostic build: every exit of this path logs at error! so a
-                // single console photo (LOG=error) pins the failing step — the
-                // black-screen bring-up failed here with a misleading userspace
-                // errno and every earlier trace was filtered or in klog.
                 let mut ptr = UserInOutPtr::<DrmPrimeHandle>::from(arg1);
                 let mut h = match ptr.read() {
                     Ok(h) => h,
                     Err(e) => {
-                        error!("[drm] PRIME read(args @ {:#x}) FAILED: {:?}", arg1, e);
+                        error!("[drm] PRIME#{} H2F read(args @ {:#x}) EFAULT: {:?}", seq, arg1, e);
                         return Err(e.into());
                     }
                 };
-                error!(
-                    "[drm] pid={} PRIME handle_to_fd: handle={} flags={:#x}",
-                    self.zircon_process().id(),
-                    h.handle,
-                    h.flags
-                );
                 let (phys, size, vmo) = match drm::export_handle(h.handle) {
                     Some(v) => v,
                     None => {
                         error!(
-                            "[drm] PRIME export FAILED: handle={} not in GEM table",
-                            h.handle
+                            "[drm] PRIME#{} H2F EINVAL: handle={} not in GEM table",
+                            seq, h.handle
                         );
                         return Err(LxError::EINVAL);
                     }
@@ -535,40 +535,30 @@ impl Syscall<'_> {
                 let new_fd = match proc.add_file(dmabuf) {
                     Ok(fd) => fd,
                     Err(e) => {
-                        error!("[drm] PRIME add_file FAILED: {:?}", e);
+                        error!("[drm] PRIME#{} H2F add_file {:?}", seq, e);
                         return Err(e);
                     }
                 };
                 h.fd = i32::from(new_fd);
                 if let Err(e) = ptr.write(h) {
-                    error!("[drm] PRIME write-back FAILED: {:?}", e);
+                    error!("[drm] PRIME#{} H2F write-back EFAULT: {:?}", seq, e);
                     return Err(e.into());
                 }
                 error!(
-                    "[drm] pid={} PRIME export: handle={} -> fd={} (phys={:#x} size={})",
-                    self.zircon_process().id(),
-                    h.handle,
-                    h.fd,
-                    phys,
-                    size
+                    "[drm] PRIME#{} H2F OK: handle={} -> fd={} size={}",
+                    seq, h.handle, h.fd, size
                 );
                 Ok(Some(0))
             }
             PRIME_FD_TO_HANDLE => {
                 let mut ptr = UserInOutPtr::<DrmPrimeHandle>::from(arg1);
                 let mut h = ptr.read()?;
-                // Instrumented: this get_file_like is the ONLY EBADF source in
-                // the whole PRIME path. If the black-screen bring-up is really
-                // hitting an IMPORT (642e) mislabeled as export, THIS line —
-                // one atomic error! — proves it and names the dma-buf fd.
                 let target = match proc.get_file_like(FileDesc::from(h.fd as usize)) {
                     Ok(t) => t,
                     Err(e) => {
                         error!(
-                            "[drm] pid={} PRIME FD_TO_HANDLE: dmabuf fd={} NOT in table -> {:?}",
-                            self.zircon_process().id(),
-                            h.fd,
-                            e
+                            "[drm] PRIME#{} F2H EBADF: import fd={} not in fd table",
+                            seq, h.fd
                         );
                         return Err(e);
                     }
@@ -577,12 +567,7 @@ impl Syscall<'_> {
                 let handle_id = drm::import_dmabuf(dmabuf.phys_addr, dmabuf.size, dmabuf.vmo());
                 h.handle = handle_id;
                 ptr.write(h)?;
-                error!(
-                    "[drm] pid={} PRIME FD_TO_HANDLE: fd={} -> handle={}",
-                    self.zircon_process().id(),
-                    h.fd,
-                    h.handle
-                );
+                error!("[drm] PRIME#{} F2H OK: fd={} -> handle={}", seq, h.fd, h.handle);
                 Ok(Some(0))
             }
             MODE_CREATE_LEASE => {
@@ -597,12 +582,7 @@ impl Syscall<'_> {
                 l.lessee_id = 1;
                 l.fd = i32::from(new_fd);
                 ptr.write(l)?;
-                error!(
-                    "[drm] pid={} CREATE_LEASE -> fd={} lessee={}",
-                    self.zircon_process().id(),
-                    l.fd,
-                    l.lessee_id
-                );
+                error!("[drm] PRIME#{} LEASE OK -> fd={} lessee={}", seq, l.fd, l.lessee_id);
                 Ok(Some(0))
             }
             _ => Ok(None),
@@ -623,32 +603,6 @@ impl Syscall<'_> {
             fd, request, arg1, arg2, arg3
         );
         let proc = self.linux_process();
-        // Diagnostic: log DRM PRIME / dumb-buffer requests at their arrival,
-        // BEFORE get_file_like — otherwise a bad fd returns EBADF silently via
-        // `?` and wlroots reports "Failed to get PRIME handle: Bad file
-        // descriptor" with nothing in our log to explain it.
-        {
-            let c = request as u32;
-            // PRIME export/import, CREATE_DUMB, CREATE_LEASE, MAP_DUMB,
-            // DESTROY_DUMB — the buffer-lifecycle calls whose fd/pid identity
-            // decides the stale-fd mystery. pid included: without it, an fd
-            // number cannot be attributed to a process (two labwc instances or
-            // an fd number reused across closes are indistinguishable).
-            if c == 0xC00C_642D
-                || c == 0xC00C_642E
-                || c == 0xC020_64B2
-                || c == 0xC018_64C6
-                || c == 0xC010_64B3
-                || c == 0xC004_64B4
-            {
-                error!(
-                    "[drm] pid={} ioctl arrive fd={:?} masked={:#x}",
-                    self.zircon_process().id(),
-                    fd,
-                    c
-                );
-            }
-        }
         let file_like = match proc.get_file_like(fd) {
             Ok(f) => f,
             Err(e) => {
@@ -682,38 +636,15 @@ impl Syscall<'_> {
         // through to ENOTTY ("Not a tty").
         let cmd = request as u32 as usize;
         if cmd == 0xC00C_642D || cmd == 0xC00C_642E || cmd == 0xC018_64C6 {
-            // Log the definitive kernel-side RESULT of every PRIME-family
-            // ioctl. Userspace error strings proved misleading (a stale errno
-            // can be printed when the failure position is ambiguous), so this
-            // line — not wlroots' log — is the ground truth for what the
-            // kernel actually answered.
+            // `sys_drm_prime` owns its own single-line PRIME#<seq> trace (entry +
+            // one exit line), so the wrapper stays silent here — a second log
+            // per call is what made the console an unreadable, self-wrapping
+            // firehose. Ok(None) means "not a PRIME request after all"; fall
+            // through to the inode `io_control`.
             match self.sys_drm_prime(&file_like, cmd, arg1) {
-                Ok(Some(ret)) => {
-                    error!(
-                        "[drm] pid={} PRIME ioctl {:#x} fd={:?} -> Ok({})",
-                        self.zircon_process().id(),
-                        cmd,
-                        fd,
-                        ret
-                    );
-                    return Ok(ret);
-                }
-                Ok(None) => {
-                    error!(
-                        "[drm] PRIME ioctl {:#x} fd={:?} -> unmatched, falling to inode handler",
-                        cmd, fd
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        "[drm] pid={} PRIME ioctl {:#x} fd={:?} -> Err({:?})",
-                        self.zircon_process().id(),
-                        cmd,
-                        fd,
-                        e
-                    );
-                    return Err(e);
-                }
+                Ok(Some(ret)) => return Ok(ret),
+                Ok(None) => {}
+                Err(e) => return Err(e),
             }
         }
         // `TIOCGWINSZ` (get terminal window size).
