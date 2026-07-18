@@ -112,6 +112,10 @@ impl VMObjectTrait for VMObjectPhysical {
     fn is_contiguous(&self) -> bool {
         true
     }
+
+    fn is_physical(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

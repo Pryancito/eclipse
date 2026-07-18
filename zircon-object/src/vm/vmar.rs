@@ -1168,23 +1168,37 @@ impl VmMapping {
         // RefCell borrow died — any concurrent vmo op could then panic. That
         // is now fixed at the source (guard first, borrow second — see
         // paged.rs get_inner), making this fast path sound again.
-        let new_vmo = match self.vmo.fork_copy() {
-            Ok(vmo) => vmo,
-            Err(_) => {
-                // Eager full copy fallback (slices, contiguous, clone trees,
-                // pinned or non-Origin vmos). `read` commits / fills from the
-                // backing source as needed; `write` commits the fresh child
-                // frames.
-                let len = self.vmo.len();
-                let new_vmo = VmObject::new_paged(len / PAGE_SIZE);
-                let mut buf = vec![0u8; PAGE_SIZE];
-                let mut off = 0;
-                while off < len {
-                    self.vmo.read(off, &mut buf)?;
-                    new_vmo.write(off, &buf)?;
-                    off += PAGE_SIZE;
+        let new_vmo = if self.vmo.is_physical() {
+            // A physical/device window (dumb buffer, dma-buf, or framebuffer
+            // mapped via `new_physical`) is NOT per-process memory: it is a view
+            // onto a fixed physical range. `fork` must SHARE it — both processes
+            // see the same pixels — so hand the child a mapping over the SAME
+            // VMObject. Copying it was doubly wrong: the child got a private
+            // stale snapshot, and the eager fallback below read the range page-
+            // by-page with `pmem_read`, which on a BAR/device range is
+            // catastrophically slow and wedged the machine mid-fork (observed:
+            // labwc's fork of swaybg/foot froze copying a mapping in the middle
+            // of its 596-mapping address space).
+            self.vmo.clone()
+        } else {
+            match self.vmo.fork_copy() {
+                Ok(vmo) => vmo,
+                Err(_) => {
+                    // Eager full copy fallback (slices, contiguous, clone trees,
+                    // pinned or non-Origin vmos). `read` commits / fills from the
+                    // backing source as needed; `write` commits the fresh child
+                    // frames.
+                    let len = self.vmo.len();
+                    let new_vmo = VmObject::new_paged(len / PAGE_SIZE);
+                    let mut buf = vec![0u8; PAGE_SIZE];
+                    let mut off = 0;
+                    while off < len {
+                        self.vmo.read(off, &mut buf)?;
+                        new_vmo.write(off, &buf)?;
+                        off += PAGE_SIZE;
+                    }
+                    new_vmo
                 }
-                new_vmo
             }
         };
         let mapping = Arc::new(VmMapping {
