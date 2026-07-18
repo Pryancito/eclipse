@@ -877,7 +877,7 @@ pub extern "C" fn osDevReadReg032(
         static PROBE_RD_LOGS: AtomicU32 = AtomicU32::new(0);
         if PROBE_RD_LOGS.fetch_add(1, Ordering::Relaxed) < 160 {
             let tag = if is_bsi { "BSI" } else { "SEC2" };
-            log::warn!(
+            log::debug!(
                 "[nvidia-rm] {} RD off={:#x} (about to deref)",
                 tag,
                 this_address
@@ -939,7 +939,7 @@ pub extern "C" fn osDevReadReg032(
         static PROBE_RD_DONE: AtomicU32 = AtomicU32::new(0);
         if PROBE_RD_DONE.fetch_add(1, Ordering::Relaxed) < 160 {
             let tag = if is_bsi { "BSI" } else { "SEC2" };
-            log::warn!("[nvidia-rm] {} RD off={:#x} = {:#x}", tag, this_address, v);
+            log::debug!("[nvidia-rm] {} RD off={:#x} = {:#x}", tag, this_address, v);
         }
     }
     v
@@ -1006,7 +1006,7 @@ pub extern "C" fn osDevWriteReg032(
         if SEC2_WR_LOGS.fetch_add(1, Ordering::Relaxed) < 200 {
             // Logged BEFORE the store: if the posted write itself wedges the
             // CPU, the last line on screen names the exact register.
-            log::warn!(
+            log::debug!(
                 "[nvidia-rm] SEC2 WR off={:#x} <= {:#x}",
                 this_address,
                 this_value
@@ -1047,7 +1047,7 @@ pub extern "C" fn osDevWriteReg032(
         if let Some(base) = base_for_bracket {
             let bsi_before =
                 unsafe { core::ptr::read_volatile(base.add(0x0011_80f8) as *const NvU32) };
-            log::warn!(
+            log::debug!(
                 "[nvidia-rm] STARTCPU(SEC2): BSI_SECURE_SCRATCH_14 before = {:#x}",
                 bsi_before
             );
@@ -1406,19 +1406,6 @@ pub extern "C" fn osGetCpuFrequency() -> NvU32 {
 
 #[no_mangle]
 pub extern "C" fn osGetCurrentProcess() -> NvU32 {
-    // TEMPORARY one-shot bring-up marker: first called from the resource
-    // server's client-construction path, i.e. _sysInitMemExportClient's
-    // NV01_ROOT allocation near the end of sysConstruct. Remove with the
-    // other trace checkpoints once the attach path is through.
-    {
-        use core::sync::atomic::{AtomicBool, Ordering};
-        static SEEN: AtomicBool = AtomicBool::new(false);
-        if !SEEN.swap(true, Ordering::Relaxed) {
-            log::warn!(
-                "[nvidia-rm] first osGetCurrentProcess call (resource-server client alloc reached)"
-            );
-        }
-    }
     0
 }
 
@@ -2341,7 +2328,7 @@ pub extern "C" fn osSpinLoop() {
     // FW RM ready.", too soon for a 2M-iteration first beat to prove whether
     // a wait loop was even running.
     if n == 200_000 || (n % 2_000_000 == 0 && n <= 80_000_000) {
-        log::warn!(
+        log::debug!(
             "[nvidia-rm] osSpinLoop heartbeat: {}k iterations",
             n / 1_000
         );
@@ -2698,18 +2685,6 @@ pub extern "C" fn osNv_cpuid(
     pecx: *mut NvU32,
     pedx: *mut NvU32,
 ) -> i32 {
-    // TEMPORARY one-shot bring-up marker: the first caller in the real
-    // sysConstruct sequence is RmInitCpuInfo (cpu.c), right after
-    // "osRmInitRm: done" -- the last checkpoint the previous real-hardware
-    // test reached. Remove with the other trace checkpoints once the
-    // attach path is through.
-    {
-        use core::sync::atomic::{AtomicBool, Ordering};
-        static SEEN: AtomicBool = AtomicBool::new(false);
-        if !SEEN.swap(true, Ordering::Relaxed) {
-            log::warn!("[nvidia-rm] first osNv_cpuid call (RmInitCpuInfo reached)");
-        }
-    }
     // x86_64: execute the CPUID instruction.
     // CRITICAL: save/restore rbx via the STACK, and never name ebx as
     // an operand. The previous version used a scratch-reg save/restore

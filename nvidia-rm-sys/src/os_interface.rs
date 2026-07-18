@@ -136,7 +136,7 @@ pub extern "C" fn os_get_cpu_frequency() -> NvU64 {
     if cached != 0 {
         return cached;
     }
-    log::warn!("[nvidia-rm] os_get_cpu_frequency: calibrating TSC (10ms)...");
+    log::debug!("[nvidia-rm] os_get_cpu_frequency: calibrating TSC (10ms)...");
     // 10 ms calibration window: long enough to make delay_us's own
     // resolution error negligible, short enough to be a one-off blip.
     #[cfg(target_arch = "x86_64")]
@@ -151,7 +151,7 @@ pub extern "C" fn os_get_cpu_frequency() -> NvU64 {
     // timeout calculations, not performance measurement).
     #[cfg(not(target_arch = "x86_64"))]
     let hz = 1_000_000_000u64;
-    log::warn!(
+    log::debug!(
         "[nvidia-rm] os_get_cpu_frequency: calibrated {} MHz",
         hz / 1_000_000
     );
@@ -180,17 +180,6 @@ pub extern "C" fn os_get_current_process_name(buffer: *mut c_char, length: NvU32
 }
 #[no_mangle]
 pub extern "C" fn os_get_current_thread(thread_id: *mut NvU64) -> NV_STATUS {
-    // TEMPORARY one-shot bring-up marker: portThreadGetCurrentThreadId
-    // funnels here; in the sysConstruct stretch under investigation its
-    // callers are threadStateGlobalAlloc / rmapiInitialize's lock setup /
-    // rmapiLockAcquire. Remove with the other trace checkpoints.
-    {
-        use core::sync::atomic::AtomicBool;
-        static SEEN: AtomicBool = AtomicBool::new(false);
-        if !SEEN.swap(true, Ordering::Relaxed) {
-            log::warn!("[nvidia-rm] first os_get_current_thread call (threadState/rmapi lock path reached)");
-        }
-    }
     if thread_id.is_null() {
         return NV_ERR_INVALID_ARGUMENT;
     }
@@ -658,16 +647,14 @@ pub fn live_echo_on() -> bool {
 }
 
 fn log_raw_cstr(str_: *const c_char) {
-    // The rsp stamp is gone (it did its job: the RM init sequence runs on
-    // the BSP 2 MiB stack with tiny per-frame deltas, so the "stack too
-    // small / AP-stack overflow" theory is dead). Keeping this lean now
-    // matters: RM's asserts print their expr/file/line through here
-    // (nvassert.c -> nv_printf), and that failing-assertion line is the
-    // one thing worth NOT burying under noise on a real-hardware run.
-    //
-    // WARN, not info: the kernel's default max log level is WARN
-    // (zCore/src/logging.rs), so log::info! would be dropped before
-    // SimpleLogger ever runs.
+    // Every RM nv_printf / assert line lands here (nvassert.c -> nv_printf).
+    // The console GPU's GSP bring-up narrates hundreds of these per boot; now
+    // that bring-up is done and stable, the routine narration is demoted to
+    // DEBUG so it is dropped at the default LOG level and no longer floods the
+    // desktop-boot console. It is NOT lost: `capture_push` still records every
+    // line into the /proc/gpustep* buffers, `osAssertFailed` still fires its
+    // own ERROR line on a real assert, and arming live-echo re-promotes this
+    // path to ERROR for step-by-step debugging.
     unsafe {
         let mut p = str_;
         let mut len = 0usize;
@@ -677,13 +664,13 @@ fn log_raw_cstr(str_: *const c_char) {
         }
         let slice = core::slice::from_raw_parts(str_ as *const u8, len);
         if let Ok(s) = core::str::from_utf8(slice) {
-            // ERROR level when live-echo is armed (default LOG=error filters
-            // WARN, so a crashing step would otherwise print nothing live);
-            // WARN otherwise, same as before.
+            // ERROR level when live-echo is armed (opt-in step debugging);
+            // DEBUG otherwise, so the routine RM narration is filtered at the
+            // default LOG level.
             if LIVE_ECHO.load(Ordering::Relaxed) {
                 log::error!("[nvidia-rm] {}", s);
             } else {
-                log::warn!("[nvidia-rm] {}", s);
+                log::debug!("[nvidia-rm] {}", s);
             }
             capture_push(s);
             // SEC2-resume register trace goes live the moment the RM narrates
