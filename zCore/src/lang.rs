@@ -20,6 +20,23 @@ fn alloc_error(layout: Layout) -> ! {
     panic!("memory allocation of {} bytes failed", layout.size());
 }
 
+/// Fixed-size, no-alloc formatter for the panic banner. The panic handler must
+/// not allocate (the panic may BE an OOM) and must not depend on any lock.
+struct StackBuf {
+    buf: [u8; 512],
+    len: usize,
+}
+
+impl core::fmt::Write for StackBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let room = self.buf.len() - self.len;
+        let n = s.len().min(room);
+        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     // Disable interrupts immediately. With panic-strategy=abort, local variables
@@ -28,6 +45,43 @@ fn panic(info: &PanicInfo) -> ! {
     // is running, push_off/pop_off will call borrow_mut() on an already-borrowed
     // RefCell → nested panic → abort() → ud2 → triple fault → QEMU reset.
     kernel_hal::interrupt::intr_off();
+
+    // FIRST, before anything that touches a lock: rasterize the panic straight
+    // onto the framebuffer (red band, raw pixel writes, no locks, no alloc).
+    // Everything below can be silently dropped or deadlock when another CPU —
+    // or THIS one — holds the console/serial locks (a panic inside an IRQ
+    // handler mid-print left the screen frozen half-line with the real panic
+    // visible only on serial). This banner cannot.
+    {
+        use core::fmt::Write;
+        let mut b = StackBuf {
+            buf: [0u8; 512],
+            len: 0,
+        };
+        if let Some(loc) = info.location() {
+            let _ = write!(
+                b,
+                "KERNEL PANIC cpu={} {}:{}\n{}",
+                kernel_hal::cpu::cpu_id(),
+                loc.file(),
+                loc.line(),
+                info.message()
+            );
+        } else {
+            let _ = write!(
+                b,
+                "KERNEL PANIC cpu={}\n{}",
+                kernel_hal::cpu::cpu_id(),
+                info.message()
+            );
+        }
+        let valid = match core::str::from_utf8(&b.buf[..b.len]) {
+            Ok(s) => s,
+            // Truncation can split a multi-byte char; keep the valid prefix.
+            Err(e) => core::str::from_utf8(&b.buf[..e.valid_up_to()]).unwrap_or(""),
+        };
+        kernel_hal::console::panic_banner(valid);
+    }
 
     // Make the panic VISIBLE after a compositor took the screen. Once labwc
     // sets KD_GRAPHICS the kernel stops PRESENTING the text console (writes

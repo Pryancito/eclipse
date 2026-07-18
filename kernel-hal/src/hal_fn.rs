@@ -169,6 +169,9 @@ hal_fn_def! {
     pub mod console {
         pub fn console_write_early(_s: &str) {}
         pub fn console_progress_early(_progress: u32) {}
+        /// Last-resort panic banner drawn raw to the framebuffer (no locks, no
+        /// alloc). No-op where there is no direct framebuffer access.
+        pub fn console_panic_banner(_s: &str) {}
     }
 
     /// Thread spawning.
