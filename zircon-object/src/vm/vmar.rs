@@ -713,7 +713,7 @@ impl VmAddressRegion {
             let t0 = kernel_hal::timer::timer_now();
             let mapping = map.clone_map(self.page_table.clone())?;
             let t1 = kernel_hal::timer::timer_now();
-            mapping.map()?;
+            mapping.map_committed()?;
             if big {
                 let t2 = kernel_hal::timer::timer_now();
                 let d_copy = t1.saturating_sub(t0).as_millis();
@@ -936,6 +936,38 @@ impl VmMapping {
     /// Commit pages to vmo, and map those to frames in page_table.
     /// Temporarily used for development. A standard procedure for
     /// vmo is: create_vmo, op_range(commit), map
+    /// Lazy map for fork: install PTEs ONLY for pages the VMO already has
+    /// committed; untouched pages stay unmapped and demand-fault in the child
+    /// exactly like they would have in the parent (zero-fill or backing-source
+    /// fill on first touch).
+    ///
+    /// This replaces `map()` on the fork path. `map()` COMMITS every page of
+    /// the vmo up front, which on hardware turned a 107 MiB mapping the parent
+    /// had barely touched (copy=0 — nothing committed to duplicate) into 6.4s
+    /// of per-page content creation (~240us/page: disk fill / zero-fill +
+    /// allocation) for pages the child may never read. Multiplied across
+    /// labwc's 596-mapping address space and two client spawns, that was the
+    /// minutes-long "frozen" fork. Physical windows (framebuffer/dumb buffers)
+    /// report every page committed, so they still map fully and eagerly.
+    fn map_committed(self: &Arc<Self>) -> ZxResult {
+        let inner = self.inner.lock();
+        let mut page_table = self.page_table.lock();
+        let page_num = inner.size / PAGE_SIZE;
+        let vmo_offset = inner.vmo_offset / PAGE_SIZE;
+        for i in 0..page_num {
+            if let Some(paddr) = self.vmo.committed_paddr(vmo_offset + i) {
+                page_table
+                    .map(
+                        Page::new_aligned(inner.addr + i * PAGE_SIZE, PageSize::Size4K),
+                        paddr,
+                        inner.flags[i],
+                    )
+                    .expect("failed to map");
+            }
+        }
+        Ok(())
+    }
+
     fn map(self: &Arc<Self>) -> ZxResult {
         // Phase timing: hardware showed map() dominating fork at ~250us/page
         // (100x too slow for alloc+zero+PTE) PLUS a fixed several-hundred-ms

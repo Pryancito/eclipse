@@ -589,6 +589,11 @@ impl VMObjectTrait for VMObjectPaged {
         true
     }
 
+    fn committed_paddr(&self, page_idx: usize) -> Option<PhysAddr> {
+        let inner = self.get_inner();
+        inner.frames.get(&page_idx).map(|s| s.frame.paddr())
+    }
+
     fn is_demand_paged(&self) -> bool {
         self.get_inner().source.is_some()
     }

@@ -137,6 +137,15 @@ pub trait VMObjectTrait: Sync + Send {
         false
     }
 
+    /// Physical address of `page_idx` IF it is already committed — WITHOUT
+    /// committing it. Used by the lazy fork map: only committed pages get PTEs
+    /// installed eagerly; untouched pages stay unmapped and demand-fault later
+    /// (zero-fill or backing-source fill), exactly like the parent's did.
+    /// Default `None` means "treat every page as uncommitted".
+    fn committed_paddr(&self, _page_idx: usize) -> Option<PhysAddr> {
+        None
+    }
+
     /// Independent copy for Linux `fork`: committed pages are copied eagerly;
     /// pages never touched by the parent stay lazy in the child (refilled from
     /// the same backing source, or demand-zero). Implementations that cannot
@@ -438,6 +447,11 @@ impl VmObject {
     /// Returns true if this object is backed by ordinary RAM (a paged VMO).
     pub fn is_paged(&self) -> bool {
         self.trait_.is_paged()
+    }
+
+    /// Physical address of `page_idx` if already committed (never commits).
+    pub fn committed_paddr(&self, page_idx: usize) -> Option<PhysAddr> {
+        self.trait_.committed_paddr(page_idx)
     }
 
     /// Independent copy for Linux `fork`: only committed pages are copied;
