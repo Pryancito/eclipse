@@ -127,9 +127,22 @@ pub fn insert_regions(regions: &[Range<PhysAddr>]) {
 }
 
 pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
-    let start_idx = FRAME_ALLOCATOR
-        .lock()
-        .alloc_contiguous(frame_count, align_log2);
+    // Single-frame allocations (the page-fault/commit hot path — every
+    // demand-paged page in the system) MUST use the cascade fast path.
+    // `alloc_contiguous(1, 0)` goes through `find_contiguous`, which probes
+    // linearly FROM INDEX 0 across the already-allocated region on every call:
+    // O(allocated) per allocation, quadratic overall. Measured on hardware:
+    // fork()'s per-page commit degraded 114 -> 240 us/page as allocation grew,
+    // turning a 107 MiB mapping into 6.4 s of frame allocation (and the fork's
+    // tail into an apparent freeze). `alloc()` descends the bitmap cascade via
+    // trailing_zeros — O(log) — restoring ~us-scale commits.
+    let start_idx = if frame_count == 1 && align_log2 == 0 {
+        FRAME_ALLOCATOR.lock().alloc()
+    } else {
+        FRAME_ALLOCATOR
+            .lock()
+            .alloc_contiguous(frame_count, align_log2)
+    };
     if let Some(idx) = start_idx {
         FRAMES_USED.fetch_add(frame_count << PAGE_BITS, Ordering::Relaxed);
         for i in 0..frame_count {
