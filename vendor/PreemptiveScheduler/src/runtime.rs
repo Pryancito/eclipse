@@ -189,7 +189,7 @@ pub(crate) fn steal_task_from_other_cpu() -> Option<(Key, Arc<Task>, WakerRef, D
     // Most-loaded victims first to spread work off the busiest cores.
     candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1));
     for (cpu, _) in candidates {
-        let runtime = GLOBAL_RUNTIME[cpu].lock();
+        let runtime = crate::diag::diag_lock(&GLOBAL_RUNTIME[cpu]);
         if runtime.task_num() > 0 {
             if let Some(task) = runtime.task_collection.take_task() {
                 return Some(task);
@@ -329,7 +329,7 @@ pub fn spawn_task(
         }
         &GLOBAL_RUNTIME[best]
     };
-    runtime.lock().add_task(priority, future, affinity);
+    crate::diag::diag_lock(runtime).add_task(priority, future, affinity);
 }
 
 /// check whether the running coroutine of current cpu time out, if yes, we will
@@ -384,7 +384,7 @@ pub(crate) fn get_current_runtime() -> MutexGuard<'static, ExecutorRuntime> {
         id,
         MAX_CORE_NUM
     );
-    GLOBAL_RUNTIME[id].lock()
+    crate::diag::diag_lock(&GLOBAL_RUNTIME[id])
 }
 
 #[allow(dead_code)]

@@ -64,6 +64,20 @@ impl KlogBuf {
     }
 }
 
+// The dmesg ring lock is a `lock::Mutex` (IRQ-disabling ticket lock), NOT a
+// raw CAS spinlock. This is load-bearing — the previous hand-rolled AtomicBool
+// lock froze the whole machine: it did not mask interrupts, and EVERY log line
+// takes this lock (the ring copy in `SimpleLogger::log` and every `klog_*!`).
+// If a timer IRQ landed while its CPU was inside the critical section and the
+// handler itself logged anything (thermal-governor transition, an xhci/apic
+// warn, frametrack), the handler re-entered the same lock ON THE SAME CPU and
+// spun forever with IRQs off — no panic, no deadlock report (the raw loop was
+// invisible to the spin-diagnostics), console dead mid-line, every other CPU
+// wedging at its own next log line. Observed on real 16-thread hardware,
+// reproducibly, ~6-7s into fork()'s CPU-pegged eager copy (right when the
+// thermal governor logs its first throttle transition). `lock::Mutex` masks
+// IRQs for the (short) critical section, making the re-entry impossible, and
+// participates in the >8s-spin deadlock self-report.
 static KLOG: lock::Mutex<KlogBuf> = lock::Mutex::new(KlogBuf::new());
 
 /// Write a slice of bytes into the kernel log ring buffer.

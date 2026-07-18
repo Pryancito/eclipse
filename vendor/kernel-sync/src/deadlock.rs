@@ -29,3 +29,9 @@ pub(crate) fn report_deadlock(file: &'static str, line: u32) {
         f(file, line);
     }
 }
+
+/// Public variant for OTHER crates' spinlocks (e.g. the scheduler's
+/// `spin::Mutex`-based runtime locks) to self-report through the same hook.
+pub fn report_stuck(file: &'static str, line: u32) {
+    report_deadlock(file, line);
+}
