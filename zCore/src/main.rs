@@ -63,7 +63,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     // PRIME/DRM diagnostics in that photo predate the current instrumentation.
     // Bump the tag on every diagnostic generation so a glance settles "is this
     // the build I just made?" without parsing dense logs.
-    log::error!("[eclipse] BUILD MARKER gen11: fork per-mapping kind trace (pin the hang) ACTIVE");
+    log::error!("[eclipse] BUILD MARKER gen12: RefCell drop-order fixed structurally (guard newtypes) ACTIVE");
     // Diagnostic: keep kernel console output visible on the monitor even after
     // labwc puts the VT into KD_GRAPHICS, so a hard hang's last log line stays
     // frozen on screen (the machine hangs black with no panic -> a deadlock /
