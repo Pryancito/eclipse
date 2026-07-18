@@ -615,7 +615,7 @@ pub fn get_resources() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     // it here would drive display RPCs through the compute GPU on every
     // GETRESOURCES and then throw the result away for the synthetic topology.
     if software_kms_active() {
-        warn!(
+        debug!(
             "[drm] GETRESOURCES: software KMS -> 1 crtc, 1 connector ({:?})",
             display_mode(),
         );
