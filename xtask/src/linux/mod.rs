@@ -587,7 +587,15 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n\
               export SSL_CERT_DIR=/etc/ssl/certs\n\
               export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt\n\
-              export LD_PRELOAD=/lib/libeclipse_dns.so\n\
+              # NOTE: /lib/libeclipse_dns.so is deliberately NOT in LD_PRELOAD.\n\
+              # Until the kernel published AT_SECURE/AT_UID..AT_EGID in the\n\
+              # auxv, musl ran every process in secure mode and silently\n\
+              # DROPPED this preload -- so the whole system (apk, TLS, DNS)\n\
+              # has always run without the shim actually loaded. The moment\n\
+              # the auxv was fixed and the shim really injected everywhere,\n\
+              # labwc froze within seconds of starting. Keep the system on\n\
+              # its proven configuration; opt in per command if needed:\n\
+              #   LD_PRELOAD=/lib/libeclipse_dns.so some-command\n\
               export HOME=/root\n\
               export TERM=xterm-256color\n\
               # No GPU here: wlroots/labwc must use the software (pixman) renderer.\n\
