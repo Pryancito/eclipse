@@ -183,10 +183,20 @@ fn write_labwc_environment(rootfs: &Path) {
     .unwrap();
 }
 
-/// Session autostart: wallpaper, panel, first terminal. Everything is logged
-/// so a black desktop is diagnosable WITHOUT a reboot
+/// Session autostart: wallpaper, first terminal, then the panel LAST.
+/// Everything is logged so a black desktop is diagnosable WITHOUT a reboot
 /// (`cat ~/.config/labwc/autostart.log`), and every launch is guarded by
 /// `command -v` so a missing client is skipped, never fatal.
+///
+/// waybar gets two extra layers of protection because it is GTK and this
+/// box's GL/GBM path can hang the whole OS (see the labwc wrapper note):
+/// - `GDK_GL=disable` keeps GTK off EGL/GBM entirely — waybar renders via
+///   cairo/shm just like swaybg and foot, which are known-good here;
+/// - a crash-once lock file: the lock is taken before launching waybar and
+///   cleared only after it survives 15 s. If the session dies with the lock
+///   held (hang, crash, power cycle), the NEXT session skips waybar and
+///   says so in the log, so one bad panel can never hang the OS on every
+///   boot. `rm ~/.config/labwc/panel.lock` re-arms it.
 fn write_labwc_autostart(rootfs: &Path) {
     let cfg = rootfs.join("root/.config/labwc");
     let _ = fs::create_dir_all(&cfg);
@@ -202,6 +212,7 @@ fn write_labwc_autostart(rootfs: &Path) {
           # solid dark violet if the image is missing. swaybg is also a\n\
           # continuous surface, giving labwc something to composite.\n\
           WALL=/usr/share/backgrounds/eclipse/eclipse-night.png\n\
+          echo \"[autostart] wallpaper: $(ls -l \"$WALL\" 2>&1)\"\n\
           if command -v swaybg >/dev/null 2>&1; then\n\
           \x20 if [ -r \"$WALL\" ]; then\n\
           \x20   echo '[autostart] launching swaybg (eclipse-night)'; swaybg -i \"$WALL\" -m fill &\n\
@@ -209,23 +220,41 @@ fn write_labwc_autostart(rootfs: &Path) {
           \x20   echo '[autostart] wallpaper missing, solid colour'; swaybg -c '#1a1440' &\n\
           \x20 fi\n\
           else echo '[autostart] MISSING swaybg -> desktop stays black (apk add swaybg)'; fi\n\
-          # Bottom panel: taskbar, clock, sysinfo.\n\
-          if command -v waybar >/dev/null 2>&1; then\n\
-          \x20 echo '[autostart] launching waybar'; waybar &\n\
-          else echo '[autostart] MISSING waybar -> no panel (apk add waybar)'; fi\n\
-          # A terminal so the desktop is immediately usable.\n\
+          # A terminal FIRST so the desktop is usable even if the panel\n\
+          # below takes the session down.\n\
           if command -v foot >/dev/null 2>&1; then\n\
           \x20 echo '[autostart] launching foot'; foot &\n\
           else echo '[autostart] MISSING foot -> no terminal (apk add foot)'; fi\n\
+          # Bottom panel: taskbar, clock, sysinfo. GTK app -> keep it off the\n\
+          # EGL/GBM path (hangs this box, see /usr/local/bin/labwc) and guard\n\
+          # with a crash-once lock so a hang cannot recur on every boot.\n\
+          PANEL_LOCK=\"$HOME/.config/labwc/panel.lock\"\n\
+          if ! command -v waybar >/dev/null 2>&1; then\n\
+          \x20 echo '[autostart] MISSING waybar -> no panel (apk add waybar)'\n\
+          elif [ -e \"$PANEL_LOCK\" ]; then\n\
+          \x20 echo \"[autostart] panel.lock present: last session died while waybar ran.\"\n\
+          \x20 echo \"[autostart] SKIPPING waybar. To retry: rm $PANEL_LOCK\"\n\
+          else\n\
+          \x20 echo '[autostart] launching waybar (GDK_GL=disable, crash-once lock armed)'\n\
+          \x20 touch \"$PANEL_LOCK\"\n\
+          \x20 GDK_GL=disable GDK_BACKEND=wayland waybar &\n\
+          \x20 ( sleep 15 && rm -f \"$PANEL_LOCK\" && echo '[autostart] waybar survived 15s, lock cleared' >>\"$LOG\" ) &\n\
+          fi\n\
           echo \"[autostart] cursor theme dir: $(ls -d /usr/share/icons/*/cursors 2>/dev/null || echo NONE)\"\n\
           echo '[autostart] done'\n",
     )
     .unwrap();
 }
 
-/// Waybar bottom panel: launcher + taskbar on the left, tray/network/audio/
-/// cpu/mem/clock on the right. Text-only module formats so no icon font is
-/// required beyond DejaVu.
+/// Waybar bottom panel: launcher + taskbar on the left, cpu/mem/clock on the
+/// right. Text-only module formats so no icon font is required beyond DejaVu.
+///
+/// Deliberately restricted to modules that only need the Wayland socket and
+/// /proc: `tray` (dbus), `network` (rtnetlink dumps) and `pulseaudio`
+/// (connection retry loop) exercise kernel paths that are partial on
+/// Eclipse OS and are the prime suspects for a whole-OS hang the first time
+/// the panel ever ran. Re-add them one at a time only after they are proven
+/// against this kernel.
 fn write_waybar(rootfs: &Path) {
     let cfg = rootfs.join("root/.config/waybar");
     let _ = fs::create_dir_all(&cfg);
@@ -237,7 +266,7 @@ fn write_waybar(rootfs: &Path) {
     "height": 34,
     "spacing": 2,
     "modules-left": ["custom/launcher", "wlr/taskbar"],
-    "modules-right": ["tray", "network", "pulseaudio", "cpu", "memory", "clock"],
+    "modules-right": ["cpu", "memory", "clock"],
 
     "custom/launcher": {
         "format": " ◑ ",
@@ -250,18 +279,6 @@ fn write_waybar(rootfs: &Path) {
         "tooltip-format": "{title}",
         "on-click": "activate",
         "on-click-right": "close"
-    },
-    "tray": { "icon-size": 16, "spacing": 8 },
-    "network": {
-        "format-wifi": "wifi {signalStrength}%",
-        "format-ethernet": "eth {ipaddr}",
-        "format-disconnected": "sin red",
-        "tooltip-format": "{ifname}: {ipaddr}"
-    },
-    "pulseaudio": {
-        "format": "vol {volume}%",
-        "format-muted": "vol mute",
-        "on-click": "pactl set-sink-mute @DEFAULT_SINK@ toggle"
     },
     "cpu": { "format": "cpu {usage}%", "interval": 3 },
     "memory": { "format": "mem {percentage}%", "interval": 5 },
@@ -305,7 +322,7 @@ window#waybar {
     background: #3a3357;
     color: #ffffff;
 }
-#tray, #network, #pulseaudio, #cpu, #memory, #clock {
+#cpu, #memory, #clock {
     padding: 0 10px;
     margin: 3px 1px;
     border-radius: 6px;
@@ -316,7 +333,6 @@ window#waybar {
     color: #e8e4f8;
     font-weight: bold;
 }
-#network.disconnected { color: #e07a7a; }
 "#,
     )
     .unwrap();
@@ -414,6 +430,27 @@ fn write_labwc_wrapper(rootfs: &Path) {
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The autostart carries real shell logic (crash-once lock) — make sure
+    /// what we generate actually parses as POSIX sh.
+    #[test]
+    fn autostart_is_valid_sh() {
+        let dir = std::env::temp_dir().join(format!("eclipse-desktop-test-{}", std::process::id()));
+        write_labwc_autostart(&dir);
+        let script = dir.join("root/.config/labwc/autostart");
+        let status = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&script)
+            .status()
+            .expect("run sh -n");
+        let _ = fs::remove_dir_all(&dir);
+        assert!(status.success(), "generated autostart is not valid sh");
     }
 }
 
