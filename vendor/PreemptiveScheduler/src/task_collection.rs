@@ -237,8 +237,26 @@ impl TaskCollection {
         (self.task_num(), n, d, b)
     }
 
+    /// Non-blocking take for the work-stealing path: if the generator is busy
+    /// (the owning CPU is inside its own `take_task`, possibly parked there by
+    /// a timer preemption), give up instead of spinning. A thief that spins
+    /// here while holding the victim's runtime lock deadlocks against the
+    /// victim's timer IRQ (see `steal_task_from_other_cpu`).
+    pub fn try_take_task(&self) -> Option<(Key, Arc<Task>, WakerRef, DroperRef)> {
+        let mut generator = self.generator.as_ref().unwrap().try_lock()?;
+        self.resume_generator(&mut generator)
+    }
+
     pub fn take_task(&self) -> Option<(Key, Arc<Task>, WakerRef, DroperRef)> {
         let mut generator = crate::diag::diag_lock(self.generator.as_ref().unwrap());
+        self.resume_generator(&mut generator)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn resume_generator(
+        &self,
+        generator: &mut Pin<Box<dyn Coroutine<Yield = Option<Key>, Return = ()>>>,
+    ) -> Option<(Key, Arc<Task>, WakerRef, DroperRef)> {
         match generator.as_mut().resume(()) {
             CoroutineState::Yielded(key) => {
                 if let Some(key) = key {

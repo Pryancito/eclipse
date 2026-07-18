@@ -46,13 +46,17 @@ impl KernelHandler for ZcoreKernelHandler {
             }
         } else {
             kernel_hal::console::console_write_fmt(format_args!(
-                "\n[KERNEL PAGE FAULT] vaddr={:#x} flags={:?} \
+                "\n[KERNEL PAGE FAULT] vaddr={:#x} flags={:?} rip={:#x} \
                  (no current thread -- fault in kernel-private context)\n",
-                fault_vaddr, access_flags
+                fault_vaddr,
+                access_flags,
+                kernel_hal::kstats::last_fault_rip(),
             ));
             panic!(
-                "page fault from kernel private address 0x{:x}, flags = {:?}",
-                fault_vaddr, access_flags
+                "page fault from kernel private address 0x{:x}, flags = {:?}, rip = {:#x}",
+                fault_vaddr,
+                access_flags,
+                kernel_hal::kstats::last_fault_rip(),
             );
         }
     }
