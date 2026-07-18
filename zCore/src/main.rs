@@ -63,7 +63,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     // PRIME/DRM diagnostics in that photo predate the current instrumentation.
     // Bump the tag on every diagnostic generation so a glance settles "is this
     // the build I just made?" without parsing dense logs.
-    log::error!("[eclipse] BUILD MARKER gen19: klog ring lock IRQ-safe (fixes silent freeze self-deadlock) ACTIVE");
+    log::error!("[eclipse] BUILD MARKER gen20: klog IRQ-safe + copy/map phase timing (stall recovers, measure it) ACTIVE");
     // Deadlock self-report: any CPU spinning >~8s on a kernel spinlock paints
     // the stuck call site(s) onto the red framebuffer banner (lock-free), so a
     // silent freeze names its own deadlock instead of needing a serial cable.
