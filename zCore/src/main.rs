@@ -63,17 +63,16 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     // PRIME/DRM diagnostics in that photo predate the current instrumentation.
     // Bump the tag on every diagnostic generation so a glance settles "is this
     // the build I just made?" without parsing dense logs.
-    log::error!("[eclipse] BUILD MARKER gen23: LAZY fork map (PTEs only for committed pages) ACTIVE");
+    log::error!("[eclipse] BUILD MARKER gen24: desktop cleanup (quiet logs, kernel cursor live) ACTIVE");
     // Deadlock self-report: any CPU spinning >~8s on a kernel spinlock paints
     // the stuck call site(s) onto the red framebuffer banner (lock-free), so a
     // silent freeze names its own deadlock instead of needing a serial cable.
+    // Kept permanently -- it is free until something actually deadlocks.
     #[cfg(not(feature = "libos"))]
     lock::set_deadlock_hook(lang::deadlock_report);
-    // Diagnostic: keep kernel console output visible on the monitor even after
-    // labwc puts the VT into KD_GRAPHICS, so a hard hang's last log line stays
-    // frozen on screen (the machine hangs black with no panic -> a deadlock /
-    // long loop, whose location only the last visible kernel log can reveal).
-    kernel_hal::console::set_diag_present_over_graphics(true);
+    // NOTE: present-over-graphics diagnostic is now OFF (the lazy fork map
+    // fixed the stall it was hunting) -- labwc owns the screen again in
+    // KD_GRAPHICS; kernel logs go to dmesg and the text console only.
     memory::insert_regions(&kernel_hal::mem::free_pmem_regions());
     kernel_hal::console::early_progress_bar(80);
     kernel_hal::primary_init();
@@ -141,7 +140,11 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 // for the rationale of each.
                 "WLR_RENDERER=pixman".into(),
                 "WLR_RENDERER_ALLOW_SOFTWARE=1".into(),
-                "WLR_NO_HARDWARE_CURSORS=1".into(),
+                // WLR_NO_HARDWARE_CURSORS deliberately NOT set: the kernel DRM
+                // scheme composites the legacy MODE_CURSOR bitmap over every
+                // scanned-out frame (drm.rs set_cursor_bo/move_cursor), so
+                // wlroots' hardware-cursor path both works and avoids
+                // re-rendering the whole scene on pointer moves.
                 "WLR_LIBINPUT_NO_DEVICES=1".into(),
                 // On systems with multiple GPUs (e.g. two NVIDIA RTX 2060
                 // SUPER cards) wlroots enumerates ALL DRM nodes unless this

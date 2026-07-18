@@ -696,7 +696,10 @@ impl VmAddressRegion {
             // mapping, plus any large one up front (they take seconds of real
             // copying -- a 107 MiB heap took 6.3s -- and must not look like a
             // freeze), plus the >100ms elapsed line below.
-            if big && (i % 32 == 0 || map.size() >= 16 << 20) {
+            // Only announce large mappings up front (multi-second copies must
+            // not look like a hang); routine progress lines are gone now that
+            // the lazy map made the fork fast.
+            if big && map.size() >= 16 << 20 {
                 error!(
                     "[fork] mapping {}/{} kind={} addr={:#x} size={:#x}",
                     i,
