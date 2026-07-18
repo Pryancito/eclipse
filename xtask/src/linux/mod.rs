@@ -791,13 +791,13 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # hardware-KMS/gles2 path hangs the whole OS at GL FBO creation.\n\
               # pixman + the kernel's software-KMS scanout (dumb buffer -> UEFI\n\
               # GOP framebuffer) is the only working combination here.\n\
-              export WLR_RENDERER=pixman\n\
-              export WLR_RENDERER_ALLOW_SOFTWARE=1\n\
+              # export WLR_RENDERER=pixman\n\
+              # export WLR_RENDERER_ALLOW_SOFTWARE=1\n\
               # Hardware cursor is composited by the kernel DRM scheme, so leave\n\
               # WLR_NO_HARDWARE_CURSORS unset and let wlroots use the legacy\n\
               # drmModeSetCursor/MoveCursor path we now handle.\n\
-              export WLR_LIBINPUT_NO_DEVICES=1\n\
-              export WLR_DRM_DEVICES=/dev/dri/card0\n\
+              # export WLR_LIBINPUT_NO_DEVICES=1\n\
+              # export WLR_DRM_DEVICES=/dev/dri/card0\n\
               # A Wayland compositor needs XDG_RUNTIME_DIR for its socket; set it\n\
               # here too in case labwc was started from a non-login shell that\n\
               # never sourced /etc/profile (otherwise clients can't connect and\n\
