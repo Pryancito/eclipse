@@ -141,12 +141,23 @@ impl<T: ?Sized> RwLock<T> {
     ///     // The lock is dropped
     /// }
     /// ```
-    #[inline]
+    #[track_caller]
     pub fn read(&self) -> RwLockReadGuard<T> {
+        let caller = core::panic::Location::caller();
+        let mut spins: u64 = 0;
         loop {
             match self.try_read() {
                 Some(guard) => return guard,
-                None => spin_loop(),
+                None => {
+                    spin_loop();
+                    spins += 1;
+                    if spins == crate::deadlock::DEADLOCK_SPINS {
+                        // Many seconds of continuous spinning: almost certainly
+                        // a deadlock (e.g. a writer wedged while holding this
+                        // lock). Self-report once, keep spinning.
+                        crate::deadlock::report_deadlock(caller.file(), caller.line());
+                    }
+                }
             }
         }
     }
@@ -169,12 +180,21 @@ impl<T: ?Sized> RwLock<T> {
     ///     // The lock is dropped
     /// }
     /// ```
-    #[inline]
+    #[track_caller]
     pub fn write(&self) -> RwLockWriteGuard<T> {
+        let caller = core::panic::Location::caller();
+        let mut spins: u64 = 0;
         loop {
             match self.try_write_internal(false) {
                 Some(guard) => return guard,
-                None => spin_loop(),
+                None => {
+                    spin_loop();
+                    spins += 1;
+                    if spins == crate::deadlock::DEADLOCK_SPINS {
+                        // See `read` — same self-report contract.
+                        crate::deadlock::report_deadlock(caller.file(), caller.line());
+                    }
+                }
             }
         }
     }

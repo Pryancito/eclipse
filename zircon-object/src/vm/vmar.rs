@@ -937,11 +937,21 @@ impl VmMapping {
     /// Temporarily used for development. A standard procedure for
     /// vmo is: create_vmo, op_range(commit), map
     fn map(self: &Arc<Self>) -> ZxResult {
+        // Phase timing: hardware showed map() dominating fork at ~250us/page
+        // (100x too slow for alloc+zero+PTE) PLUS a fixed several-hundred-ms
+        // cost even for 2-page mappings. The breakdown line below names the
+        // guilty phase: family-lock acquisition (enter->closure), inner/pt
+        // locks, per-page commit (frame alloc+zero), or per-page PTE install.
+        let t_enter = kernel_hal::timer::timer_now();
         self.vmo.commit_pages_with(&mut |commit| {
+            let t_closure = kernel_hal::timer::timer_now();
             let inner = self.inner.lock();
             let mut page_table = self.page_table.lock();
+            let t_loop = kernel_hal::timer::timer_now();
             let page_num = inner.size / PAGE_SIZE;
             let vmo_offset = inner.vmo_offset / PAGE_SIZE;
+            let mut ns_commit: u64 = 0;
+            let mut ns_pt: u64 = 0;
             for i in 0..page_num {
                 // Liveness heartbeat for huge mappings: this loop COMMITS every
                 // page of the vmo (alloc+zero for anonymous ranges) and maps it,
@@ -951,7 +961,9 @@ impl VmMapping {
                 if i > 0 && i % 8192 == 0 {
                     error!("[fork/map] {}/{} pages mapped", i, page_num);
                 }
+                let ta = kernel_hal::timer::timer_now();
                 let paddr = commit(vmo_offset + i, inner.flags[i])?;
+                let tb = kernel_hal::timer::timer_now();
                 //通过GenericPageTable的hal_pt_map进行页表映射
                 page_table
                     .map(
@@ -960,6 +972,21 @@ impl VmMapping {
                         inner.flags[i],
                     )
                     .expect("failed to map");
+                let tc = kernel_hal::timer::timer_now();
+                ns_commit += tb.saturating_sub(ta).as_nanos() as u64;
+                ns_pt += tc.saturating_sub(tb).as_nanos() as u64;
+            }
+            let total = kernel_hal::timer::timer_now().saturating_sub(t_enter);
+            if total.as_millis() > 100 {
+                error!(
+                    "[fork/map] {} pages breakdown: family={}ms locks={}ms commit={}ms pt={}ms total={}ms",
+                    page_num,
+                    t_closure.saturating_sub(t_enter).as_millis(),
+                    t_loop.saturating_sub(t_closure).as_millis(),
+                    ns_commit / 1_000_000,
+                    ns_pt / 1_000_000,
+                    total.as_millis()
+                );
             }
             Ok(())
         })
