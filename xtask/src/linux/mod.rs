@@ -1,4 +1,5 @@
 mod btrfs_image;
+mod desktop;
 mod image;
 mod nvidia_firmware;
 mod opencv;
@@ -141,7 +142,7 @@ impl LinuxRootfs {
         Self::write_profile(&etc);
         Self::write_passwd(&etc, &dir);
         Self::write_console_configs(&etc, &dir);
-        Self::write_labwc_config(&dir);
+        desktop::install(&dir);
         Self::install_ca_certs(&dir);
 
         // /etc/machine-id — prevents dhcp_vendor "No such file or directory"
@@ -705,123 +706,6 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               set autoindent\n",
         )
         .unwrap();
-    }
-
-    /// Lay down a labwc config so the compositor shows a real desktop instead
-    /// of the empty-black modeset buffer. labwc paints no wallpaper itself and
-    /// only repaints on damage, so an empty session (no clients) stays black.
-    ///
-    /// - `~/.config/labwc/autostart`: on session start, paint a solid
-    ///   background with `swaybg` and open a `foot` terminal, so there is
-    ///   visible content and a continuous damage source. Each launch is guarded
-    ///   by `command -v` so a missing client never aborts the session.
-    /// - `~/.config/labwc/rc.xml`: bind Super/Alt+Return to a new terminal and
-    ///   Alt+F4 to close, so the desktop is usable even if autostart is edited.
-    ///
-    /// Requires the Wayland clients at runtime: `apk add foot swaybg`.
-    fn write_labwc_config(rootfs: &Path) {
-        let cfg = rootfs.join("root").join(".config").join("labwc");
-        let _ = fs::create_dir_all(&cfg);
-
-        // autostart: swaybg wallpaper (solid teal) + a foot terminal. `hash`
-        // (POSIX) / `command -v` guards mean a missing binary is skipped, not
-        // fatal. The trailing `&` keeps the session from blocking on them.
-        fs::write(
-            cfg.join("autostart"),
-            b"# Eclipse OS - labwc autostart.\n\
-              # Needs the Wayland clients: `apk add foot swaybg`.\n\
-              # Everything here is logged so a black desktop is diagnosable\n\
-              # WITHOUT a reboot: `cat ~/.config/labwc/autostart.log`.\n\
-              LOG=\"$HOME/.config/labwc/autostart.log\"\n\
-              exec >\"$LOG\" 2>&1\n\
-              echo \"[autostart] $(date 2>/dev/null || echo boot) begin\"\n\
-              echo \"[autostart] XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR WAYLAND_DISPLAY=$WAYLAND_DISPLAY\"\n\
-              # Solid-colour wallpaper so the desktop is not black; swaybg is a\n\
-              # continuous surface, giving labwc something to composite.\n\
-              if command -v swaybg >/dev/null 2>&1; then\n\
-              \x20 echo '[autostart] launching swaybg'; swaybg -c '#1f6f6f' &\n\
-              else echo '[autostart] MISSING swaybg -> desktop stays black (apk add swaybg)'; fi\n\
-              # A terminal so the desktop is immediately usable.\n\
-              if command -v foot >/dev/null 2>&1; then\n\
-              \x20 echo '[autostart] launching foot'; foot &\n\
-              else echo '[autostart] MISSING foot -> no terminal (apk add foot)'; fi\n\
-              echo \"[autostart] cursor theme dir: $(ls -d /usr/share/icons/*/cursors 2>/dev/null || echo NONE)\"\n\
-              echo '[autostart] done'\n",
-        )
-        .unwrap();
-
-        // rc.xml: minimal, valid labwc config with a couple of key bindings so
-        // a terminal can always be opened. Kept intentionally small.
-        fs::write(
-            cfg.join("rc.xml"),
-            b"<?xml version=\"1.0\"?>\n\
-              <labwc_config>\n\
-              \x20 <core><gap>0</gap></core>\n\
-              \x20 <keyboard>\n\
-              \x20   <keybind key=\"W-Return\"><action name=\"Execute\"><command>foot</command></action></keybind>\n\
-              \x20   <keybind key=\"A-Return\"><action name=\"Execute\"><command>foot</command></action></keybind>\n\
-              \x20   <keybind key=\"A-F4\"><action name=\"Close\"/></keybind>\n\
-              \x20   <keybind key=\"A-Tab\"><action name=\"NextWindow\"/></keybind>\n\
-              \x20 </keyboard>\n\
-              </labwc_config>\n",
-        )
-        .unwrap();
-
-        // Bulletproof `labwc` launcher. wlroots picks its renderer from
-        // WLR_RENDERER *at exec time*, and it does NOT auto-fall-back from
-        // gles2 to pixman. On this box the nvidia DRM node is a stub with no
-        // usable GLES2/GBM: the gles2/GBM path hangs the whole OS at GL FBO
-        // creation. Only pixman + the kernel's software-KMS scanout works.
-        //
-        // We set these vars in the kernel init env and /etc/profile, but
-        // login(1) rebuilds the environment and strips arbitrary vars, so a
-        // compositor started from a post-login shell can lose them and fall
-        // into the freezing gles2 path. A wrapper is the only delivery that
-        // cannot be stripped: it re-exports the vars in labwc's own process
-        // and execs the real binary. Placed in /usr/local/bin, which we
-        // prepend to PATH (kernel init env + /etc/profile) so it always wins.
-        let localbin = rootfs.join("usr").join("local").join("bin");
-        let _ = fs::create_dir_all(&localbin);
-        let wrapper = localbin.join("labwc");
-        fs::write(
-            &wrapper,
-            b"#!/bin/sh\n\
-              # Eclipse OS: force the pixman software renderer for labwc.\n\
-              # The nvidia DRM node is a stub with no real GLES2/GBM; the\n\
-              # hardware-KMS/gles2 path hangs the whole OS at GL FBO creation.\n\
-              # pixman + the kernel's software-KMS scanout (dumb buffer -> UEFI\n\
-              # GOP framebuffer) is the only working combination here.\n\
-              # export WLR_RENDERER=pixman\n\
-              # export WLR_RENDERER_ALLOW_SOFTWARE=1\n\
-              # Hardware cursor is composited by the kernel DRM scheme, so leave\n\
-              # WLR_NO_HARDWARE_CURSORS unset and let wlroots use the legacy\n\
-              # drmModeSetCursor/MoveCursor path we now handle.\n\
-              # export WLR_LIBINPUT_NO_DEVICES=1\n\
-              # export WLR_DRM_DEVICES=/dev/dri/card0\n\
-              # A Wayland compositor needs XDG_RUNTIME_DIR for its socket; set it\n\
-              # here too in case labwc was started from a non-login shell that\n\
-              # never sourced /etc/profile (otherwise clients can't connect and\n\
-              # the desktop stays black with no autostart).\n\
-              : \"${XDG_RUNTIME_DIR:=/run/user/0}\"\n\
-              export XDG_RUNTIME_DIR\n\
-              [ -d \"$XDG_RUNTIME_DIR\" ] || { mkdir -p \"$XDG_RUNTIME_DIR\" && chmod 0700 \"$XDG_RUNTIME_DIR\"; }\n\
-              # Software cursor needs an XCURSOR theme on disk; wlroots draws NO\n\
-              # pointer without one. Point at the first installed theme (or the\n\
-              # conventional 'default') so a mouse pointer is visible once a\n\
-              # cursor theme is present (apk add adwaita-icon-theme).\n\
-              : \"${XCURSOR_THEME:=default}\"; export XCURSOR_THEME\n\
-              : \"${XCURSOR_SIZE:=24}\"; export XCURSOR_SIZE\n\
-              for d in /usr/bin /bin /usr/sbin /sbin; do\n\
-              \x20 if [ -x \"$d/labwc\" ]; then exec \"$d/labwc\" \"$@\"; fi\n\
-              done\n\
-              echo 'labwc: real binary not found (apk add labwc)' >&2\n\
-              exit 127\n",
-        )
-        .unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
-        }
     }
 
     /// Creates symlinks in `bin/` for every busybox applet.
