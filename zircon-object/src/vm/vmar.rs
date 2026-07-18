@@ -660,25 +660,44 @@ impl VmAddressRegion {
         // the machine is alive while the eager copy grinds through the disk.
         let total_bytes: usize = src_mappings.iter().map(|m| m.size()).sum();
         let big = total_bytes >= 32 << 20;
+        // Classifier used both in the summary and per-mapping trace so a photo
+        // shows, unambiguously, whether the gen10 "share physical VMOs" fix is
+        // in this binary and which VMO kind a hang wedges on.
+        fn kind(m: &VmMapping) -> &'static str {
+            if m.vmo_is_physical() {
+                "phys"
+            } else if m.vmo_is_paged() {
+                "paged"
+            } else {
+                "other"
+            }
+        }
         if big {
+            let phys = src_mappings.iter().filter(|m| m.vmo_is_physical()).count();
+            // If this line reports "N phys shared" the fix IS present; physical
+            // mappings are Arc-shared (instant), so any remaining hang is a
+            // non-physical mapping.
             error!(
-                "[fork] eager-copying {} MiB across {} mappings (interrupts stay on)",
+                "[fork] eager-copying {} MiB across {} mappings ({} phys shared, gen10-fix)",
                 total_bytes >> 20,
-                src_mappings.len()
+                src_mappings.len(),
+                phys
             );
         }
 
         let mut new_mappings = Vec::with_capacity(src_mappings.len());
         let n_maps = src_mappings.len();
         for (i, map) in src_mappings.into_iter().enumerate() {
-            // Progress heartbeat every 64 mappings: with diagnostic present-over-
-            // graphics on, this pins WHICH mapping a fork hang wedges on (a hard
-            // hang leaves the last printed index frozen on screen).
-            if big && i % 64 == 0 {
+            // Progress heartbeat every 16 mappings + the kind: with diagnostic
+            // present-over-graphics on, this pins WHICH mapping (and its VMO
+            // kind) a fork hang wedges on -- a hard hang leaves the last printed
+            // line frozen on screen.
+            if big && i % 16 == 0 {
                 error!(
-                    "[fork] copying mapping {}/{} (addr={:#x} size={:#x})",
+                    "[fork] mapping {}/{} kind={} addr={:#x} size={:#x}",
                     i,
                     n_maps,
+                    kind(&map),
                     map.addr(),
                     map.size()
                 );
@@ -1038,6 +1057,17 @@ impl VmMapping {
 
     fn addr(&self) -> VirtAddr {
         self.inner.lock().addr
+    }
+
+    /// True if this mapping is backed by a fixed physical-memory window (shared,
+    /// not copied, on fork). Used by the fork diagnostic/classifier.
+    fn vmo_is_physical(&self) -> bool {
+        self.vmo.is_physical()
+    }
+
+    /// True if this mapping is backed by ordinary RAM (a paged VMO).
+    fn vmo_is_paged(&self) -> bool {
+        self.vmo.is_paged()
     }
 
     fn end_addr(&self) -> VirtAddr {

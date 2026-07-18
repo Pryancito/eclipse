@@ -435,6 +435,11 @@ impl VmObject {
         self.trait_.is_physical()
     }
 
+    /// Returns true if this object is backed by ordinary RAM (a paged VMO).
+    pub fn is_paged(&self) -> bool {
+        self.trait_.is_paged()
+    }
+
     /// Independent copy for Linux `fork`: only committed pages are copied;
     /// untouched pages stay lazy (see [`VMObjectTrait::fork_copy`]). Returns
     /// `NOT_SUPPORTED` when the backing object cannot provide those semantics,
