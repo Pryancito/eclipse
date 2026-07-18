@@ -57,13 +57,6 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         init_proc,
         shell_proc
     );
-    // Console-visible build stamp (error! -> console at LOG=error). This is the
-    // single unambiguous signal that the running kernel is the current build:
-    // if this exact line is NOT in a boot photo, the binary is stale and any
-    // PRIME/DRM diagnostics in that photo predate the current instrumentation.
-    // Bump the tag on every diagnostic generation so a glance settles "is this
-    // the build I just made?" without parsing dense logs.
-    log::error!("[eclipse] BUILD MARKER gen24: desktop cleanup (quiet logs, kernel cursor live) ACTIVE");
     // Deadlock self-report: any CPU spinning >~8s on a kernel spinlock paints
     // the stuck call site(s) onto the red framebuffer banner (lock-free), so a
     // silent freeze names its own deadlock instead of needing a serial cable.

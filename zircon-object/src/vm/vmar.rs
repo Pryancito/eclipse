@@ -656,86 +656,15 @@ impl VmAddressRegion {
         let mut src_mappings = Vec::new();
         Self::collect_mappings_for_fork(src, &mut src_mappings);
 
-        // Console heartbeat for very large forks (compositor-sized): confirms
-        // the machine is alive while the eager copy grinds through the disk.
-        let total_bytes: usize = src_mappings.iter().map(|m| m.size()).sum();
-        let big = total_bytes >= 32 << 20;
-        // Classifier used both in the summary and per-mapping trace so a photo
-        // shows, unambiguously, whether the gen10 "share physical VMOs" fix is
-        // in this binary and which VMO kind a hang wedges on.
-        fn kind(m: &VmMapping) -> &'static str {
-            if m.vmo_is_physical() {
-                "phys"
-            } else if m.vmo_is_paged() {
-                "paged"
-            } else {
-                "other"
-            }
-        }
-        if big {
-            let phys = src_mappings.iter().filter(|m| m.vmo_is_physical()).count();
-            // If this line reports "N phys shared" the fix IS present; physical
-            // mappings are Arc-shared (instant), so any remaining hang is a
-            // non-physical mapping.
-            error!(
-                "[fork] eager-copying {} MiB across {} mappings ({} phys shared, gen10-fix)",
-                total_bytes >> 20,
-                src_mappings.len(),
-                phys
-            );
-        }
-
+        // Copy each mapping with no VMAR lock held. Physical VMOs are Arc-shared
+        // (instant); paged VMOs copy-on-write. `map_committed` installs PTEs only
+        // for already-committed pages, leaving the rest to demand-fault — so a
+        // large compositor fork no longer stalls eagerly populating page tables.
         let mut new_mappings = Vec::with_capacity(src_mappings.len());
-        let n_maps = src_mappings.len();
-        for (i, map) in src_mappings.into_iter().enumerate() {
-            // Sparse progress trace. The gen13 every-mapping version proved the
-            // fork was never wedged -- it was GRINDING: each error! line costs
-            // ~50ms (a full-screen present over PCIe with the diagnostic
-            // present-over-graphics on), so 596 lines added ~30s of pure
-            // logging per fork on top of the real copy work. Print every 32nd
-            // mapping, plus any large one up front (they take seconds of real
-            // copying -- a 107 MiB heap took 6.3s -- and must not look like a
-            // freeze), plus the >100ms elapsed line below.
-            // Only announce large mappings up front (multi-second copies must
-            // not look like a hang); routine progress lines are gone now that
-            // the lazy map made the fork fast.
-            if big && map.size() >= 16 << 20 {
-                error!(
-                    "[fork] mapping {}/{} kind={} addr={:#x} size={:#x}",
-                    i,
-                    n_maps,
-                    kind(&map),
-                    map.addr(),
-                    map.size()
-                );
-            }
-            // Phase-split timing: hardware showed a 61 MiB and a 107 MiB
-            // mapping both take ~6.2s — cost is NOT proportional to size, so
-            // the time hides in ONE phase with a nonlinear cost. Separating
-            // copy (fork_copy/eager) from map (page-table populate) names it.
-            let t0 = kernel_hal::timer::timer_now();
+        for map in src_mappings.into_iter() {
             let mapping = map.clone_map(self.page_table.clone())?;
-            let t1 = kernel_hal::timer::timer_now();
             mapping.map_committed()?;
-            if big {
-                let t2 = kernel_hal::timer::timer_now();
-                let d_copy = t1.saturating_sub(t0).as_millis();
-                let d_map = t2.saturating_sub(t1).as_millis();
-                if d_copy + d_map > 100 {
-                    error!(
-                        "[fork] mapping {}/{} took {} ms (copy={} map={})",
-                        i,
-                        n_maps,
-                        d_copy + d_map,
-                        d_copy,
-                        d_map
-                    );
-                }
-            }
             new_mappings.push(mapping);
-        }
-        if big {
-            error!("[fork] eager copy done ({} MiB)", total_bytes >> 20);
         }
 
         let mut guard = self.inner.lock();
@@ -972,34 +901,13 @@ impl VmMapping {
     }
 
     fn map(self: &Arc<Self>) -> ZxResult {
-        // Phase timing: hardware showed map() dominating fork at ~250us/page
-        // (100x too slow for alloc+zero+PTE) PLUS a fixed several-hundred-ms
-        // cost even for 2-page mappings. The breakdown line below names the
-        // guilty phase: family-lock acquisition (enter->closure), inner/pt
-        // locks, per-page commit (frame alloc+zero), or per-page PTE install.
-        let t_enter = kernel_hal::timer::timer_now();
         self.vmo.commit_pages_with(&mut |commit| {
-            let t_closure = kernel_hal::timer::timer_now();
             let inner = self.inner.lock();
             let mut page_table = self.page_table.lock();
-            let t_loop = kernel_hal::timer::timer_now();
             let page_num = inner.size / PAGE_SIZE;
             let vmo_offset = inner.vmo_offset / PAGE_SIZE;
-            let mut ns_commit: u64 = 0;
-            let mut ns_pt: u64 = 0;
             for i in 0..page_num {
-                // Liveness heartbeat for huge mappings: this loop COMMITS every
-                // page of the vmo (alloc+zero for anonymous ranges) and maps it,
-                // all under the VMO family lock — for a 100+ MiB mapping that is
-                // seconds of work that must not read as a freeze. Every 8192
-                // pages = 32 MiB.
-                if i > 0 && i % 8192 == 0 {
-                    error!("[fork/map] {}/{} pages mapped", i, page_num);
-                }
-                let ta = kernel_hal::timer::timer_now();
                 let paddr = commit(vmo_offset + i, inner.flags[i])?;
-                let tb = kernel_hal::timer::timer_now();
-                //通过GenericPageTable的hal_pt_map进行页表映射
                 page_table
                     .map(
                         Page::new_aligned(inner.addr + i * PAGE_SIZE, PageSize::Size4K),
@@ -1007,21 +915,6 @@ impl VmMapping {
                         inner.flags[i],
                     )
                     .expect("failed to map");
-                let tc = kernel_hal::timer::timer_now();
-                ns_commit += tb.saturating_sub(ta).as_nanos() as u64;
-                ns_pt += tc.saturating_sub(tb).as_nanos() as u64;
-            }
-            let total = kernel_hal::timer::timer_now().saturating_sub(t_enter);
-            if total.as_millis() > 100 {
-                error!(
-                    "[fork/map] {} pages breakdown: family={}ms locks={}ms commit={}ms pt={}ms total={}ms",
-                    page_num,
-                    t_closure.saturating_sub(t_enter).as_millis(),
-                    t_loop.saturating_sub(t_closure).as_millis(),
-                    ns_commit / 1_000_000,
-                    ns_pt / 1_000_000,
-                    total.as_millis()
-                );
             }
             Ok(())
         })
@@ -1152,17 +1045,6 @@ impl VmMapping {
 
     fn addr(&self) -> VirtAddr {
         self.inner.lock().addr
-    }
-
-    /// True if this mapping is backed by a fixed physical-memory window (shared,
-    /// not copied, on fork). Used by the fork diagnostic/classifier.
-    fn vmo_is_physical(&self) -> bool {
-        self.vmo.is_physical()
-    }
-
-    /// True if this mapping is backed by ordinary RAM (a paged VMO).
-    fn vmo_is_paged(&self) -> bool {
-        self.vmo.is_paged()
     }
 
     fn end_addr(&self) -> VirtAddr {
@@ -1312,12 +1194,9 @@ impl VmMapping {
                     // Eager full copy fallback (slices, contiguous, clone trees,
                     // pinned or non-Origin vmos). `read` commits / fills from the
                     // backing source as needed; `write` commits the fresh child
-                    // frames. This path reads the ENTIRE vmo page-by-page --
-                    // announce it, because for a demand-paged vmo those reads hit
-                    // the (polled) disk under the VMO family lock and are the
-                    // prime suspect whenever a fork stalls on one mapping.
-                    error!(
-                        "[fork] eager FALLBACK copy: vmo len={:#x} (fork_copy unsupported)",
+                    // frames.
+                    warn!(
+                        "fork: eager fallback copy of vmo len={:#x} (fork_copy unsupported)",
                         self.vmo.len()
                     );
                     let len = self.vmo.len();
@@ -1325,16 +1204,6 @@ impl VmMapping {
                     let mut buf = vec![0u8; PAGE_SIZE];
                     let mut off = 0;
                     while off < len {
-                        // Liveness heartbeat every 8 MiB: this loop can hit the
-                        // polled disk per page, so big VMOs take long enough to
-                        // look like a freeze without progress on screen.
-                        if off > 0 && off % (8 << 20) == 0 {
-                            error!(
-                                "[fork] eager fallback: {}/{} MiB",
-                                off >> 20,
-                                len >> 20
-                            );
-                        }
                         self.vmo.read(off, &mut buf)?;
                         new_vmo.write(off, &buf)?;
                         off += PAGE_SIZE;

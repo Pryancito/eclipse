@@ -230,19 +230,7 @@ impl VMObjectPaged {
             return Err(ZxError::NOT_SUPPORTED);
         }
         let mut frames = BTreeMap::new();
-        let total_pages = inner.frames.len();
-        for (n, (&idx, state)) in inner.frames.iter().enumerate() {
-            // Liveness heartbeat for compositor-sized VMOs: a 100+ MiB heap
-            // takes seconds to duplicate, and without intra-copy progress that
-            // read as a freeze on the console. Every 8192 pages = 32 MiB.
-            if n > 0 && n % 8192 == 0 {
-                error!(
-                    "[fork] fork_copy: {}/{} pages ({} MiB copied)",
-                    n,
-                    total_pages,
-                    (n * PAGE_SIZE) >> 20
-                );
-            }
+        for (&idx, state) in inner.frames.iter() {
             let frame = PhysFrame::new().ok_or(ZxError::NO_MEMORY)?;
             kernel_hal::mem::pmem_copy(frame.paddr(), state.frame.paddr(), PAGE_SIZE);
             frames.insert(idx, PageState::new(frame));

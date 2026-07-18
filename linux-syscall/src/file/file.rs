@@ -491,17 +491,6 @@ impl Syscall<'_> {
         // fd), and each operation errors gracefully on a wrong fd, so handle by
         // request number alone — no fragile fd-type detection.
         let proc = self.linux_process();
-        // One monotonic id per PRIME-family call. Every log line below carries
-        // it, so even when the console interleaves these with wlroots' own
-        // output (and wraps long lines), the entry line and its single result
-        // line for a given call share a `#<seq>` and cannot be misattributed to
-        // an adjacent call — the ambiguity that made the earlier firehose
-        // impossible to read from a photo.
-        use core::sync::atomic::{AtomicU64, Ordering};
-        static PRIME_SEQ: AtomicU64 = AtomicU64::new(0);
-        let seq = PRIME_SEQ.fetch_add(1, Ordering::Relaxed);
-        let pid = self.zircon_process().id();
-        error!("[drm] PRIME#{} pid={} req={:#x}", seq, pid, request);
         match request {
             // EXPORT (HANDLE_TO_FD) and IMPORT (FD_TO_HANDLE) share one arm and
             // are told apart by STRUCT CONTENT, not the ioctl number. On real
@@ -517,27 +506,19 @@ impl Syscall<'_> {
                 let mut h = match ptr.read() {
                     Ok(h) => h,
                     Err(e) => {
-                        error!("[drm] PRIME#{} read(args @ {:#x}) EFAULT: {:?}", seq, arg1, e);
+                        warn!("[drm] PRIME read(args @ {:#x}) EFAULT: {:?}", arg1, e);
                         return Err(e.into());
                     }
                 };
                 let is_export = h.fd < 0;
-                error!(
-                    "[drm] PRIME#{} {} struct: handle={} flags={:#x} fd={}",
-                    seq,
-                    if is_export { "EXPORT" } else { "IMPORT" },
-                    h.handle,
-                    h.flags,
-                    h.fd
-                );
                 if is_export {
                     // handle -> new dma-buf fd
                     let (phys, size, vmo) = match drm::export_handle(h.handle) {
                         Some(v) => v,
                         None => {
-                            error!(
-                                "[drm] PRIME#{} EXPORT EINVAL: handle={} not in GEM table",
-                                seq, h.handle
+                            warn!(
+                                "[drm] PRIME export EINVAL: handle={} not in GEM table",
+                                h.handle
                             );
                             return Err(LxError::EINVAL);
                         }
@@ -546,29 +527,22 @@ impl Syscall<'_> {
                     let new_fd = match proc.add_file(dmabuf) {
                         Ok(fd) => fd,
                         Err(e) => {
-                            error!("[drm] PRIME#{} EXPORT add_file {:?}", seq, e);
+                            warn!("[drm] PRIME export add_file {:?}", e);
                             return Err(e);
                         }
                     };
                     h.fd = i32::from(new_fd);
                     if let Err(e) = ptr.write(h) {
-                        error!("[drm] PRIME#{} EXPORT write-back EFAULT: {:?}", seq, e);
+                        warn!("[drm] PRIME export write-back EFAULT: {:?}", e);
                         return Err(e.into());
                     }
-                    error!(
-                        "[drm] PRIME#{} EXPORT OK: handle={} -> fd={} size={}",
-                        seq, h.handle, h.fd, size
-                    );
                     Ok(Some(0))
                 } else {
                     // fd -> new GEM handle
                     let target = match proc.get_file_like(FileDesc::from(h.fd as usize)) {
                         Ok(t) => t,
                         Err(e) => {
-                            error!(
-                                "[drm] PRIME#{} IMPORT EBADF: fd={} not in fd table",
-                                seq, h.fd
-                            );
+                            warn!("[drm] PRIME import EBADF: fd={} not in fd table", h.fd);
                             return Err(e);
                         }
                     };
@@ -577,7 +551,6 @@ impl Syscall<'_> {
                         drm::import_dmabuf(dmabuf.phys_addr, dmabuf.size, dmabuf.vmo());
                     h.handle = handle_id;
                     ptr.write(h)?;
-                    error!("[drm] PRIME#{} IMPORT OK: fd={} -> handle={}", seq, h.fd, h.handle);
                     Ok(Some(0))
                 }
             }
@@ -593,7 +566,6 @@ impl Syscall<'_> {
                 l.lessee_id = 1;
                 l.fd = i32::from(new_fd);
                 ptr.write(l)?;
-                error!("[drm] PRIME#{} LEASE OK -> fd={} lessee={}", seq, l.fd, l.lessee_id);
                 Ok(Some(0))
             }
             _ => Ok(None),
@@ -647,11 +619,9 @@ impl Syscall<'_> {
         // through to ENOTTY ("Not a tty").
         let cmd = request as u32 as usize;
         if cmd == 0xC00C_642D || cmd == 0xC00C_642E || cmd == 0xC018_64C6 {
-            // `sys_drm_prime` owns its own single-line PRIME#<seq> trace (entry +
-            // one exit line), so the wrapper stays silent here — a second log
-            // per call is what made the console an unreadable, self-wrapping
-            // firehose. Ok(None) means "not a PRIME request after all"; fall
-            // through to the inode `io_control`.
+            // `sys_drm_prime` logs only on genuine failures; the wrapper stays
+            // silent on the hot path. Ok(None) means "not a PRIME request after
+            // all"; fall through to the inode `io_control`.
             match self.sys_drm_prime(&file_like, cmd, arg1) {
                 Ok(Some(ret)) => return Ok(ret),
                 Ok(None) => {}
