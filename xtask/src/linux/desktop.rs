@@ -208,6 +208,17 @@ fn write_labwc_autostart(rootfs: &Path) {
           exec >\"$LOG\" 2>&1\n\
           echo \"[autostart] $(date 2>/dev/null || echo boot) begin\"\n\
           echo \"[autostart] XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR WAYLAND_DISPLAY=$WAYLAND_DISPLAY\"\n\
+          # gdk-pixbuf loader cache: apk installs it via a trigger that may\n\
+          # never have run under Eclipse OS. Without loaders.cache gdk-pixbuf\n\
+          # recognises NO image format at all, so swaybg logs \"Failed to\n\
+          # load image\" for a perfectly good PNG (and GTK apps lose their\n\
+          # icons). Generate it once if absent.\n\
+          if command -v gdk-pixbuf-query-loaders >/dev/null 2>&1; then\n\
+          \x20 if ! ls /usr/lib/gdk-pixbuf-2.0/*/loaders.cache >/dev/null 2>&1; then\n\
+          \x20   echo '[autostart] generating gdk-pixbuf loaders.cache'\n\
+          \x20   gdk-pixbuf-query-loaders --update-cache\n\
+          \x20 fi\n\
+          fi\n\
           # Wallpaper: the build-time Eclipse night render; fall back to a\n\
           # solid dark violet if the image is missing. swaybg is also a\n\
           # continuous surface, giving labwc something to composite.\n\
@@ -215,7 +226,17 @@ fn write_labwc_autostart(rootfs: &Path) {
           echo \"[autostart] wallpaper: $(ls -l \"$WALL\" 2>&1)\"\n\
           if command -v swaybg >/dev/null 2>&1; then\n\
           \x20 if [ -r \"$WALL\" ]; then\n\
-          \x20   echo '[autostart] launching swaybg (eclipse-night)'; swaybg -i \"$WALL\" -m fill &\n\
+          \x20   echo '[autostart] launching swaybg (eclipse-night)'\n\
+          \x20   swaybg -i \"$WALL\" -m fill &\n\
+          \x20   WALLPID=$!\n\
+          \x20   # Watchdog: if swaybg cannot decode the image it exits right\n\
+          \x20   # away -- fall back to the solid colour so the desktop never\n\
+          \x20   # ends up with no background at all.\n\
+          \x20   ( sleep 2\n\
+          \x20     if ! kill -0 \"$WALLPID\" 2>/dev/null; then\n\
+          \x20       echo '[autostart] swaybg died loading the image -> solid colour fallback'\n\
+          \x20       swaybg -c '#1a1440' &\n\
+          \x20     fi ) &\n\
           \x20 else\n\
           \x20   echo '[autostart] wallpaper missing, solid colour'; swaybg -c '#1a1440' &\n\
           \x20 fi\n\
@@ -364,7 +385,10 @@ fn write_foot_config(rootfs: &Path) {
     fs::write(
         dir.join("foot.ini"),
         b"# Eclipse OS - foot terminal theme.\n\
-          font=monospace:size=10\n\
+          # Name a real monospace family first: the bare 'monospace' alias\n\
+          # can resolve to a non-mono font (DejaVuMathTeXGyre) on a minimal\n\
+          # fontconfig, which foot warns about on every start.\n\
+          font=DejaVu Sans Mono:size=10,monospace:size=10\n\
           pad=6x6\n\
           \n\
           [colors]\n\

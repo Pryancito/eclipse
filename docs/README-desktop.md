@@ -84,9 +84,17 @@ cat ~/.config/labwc/autostart.log
 ```
 
 Cada cliente que falte aparece como `MISSING <cliente>` con el `apk add`
-necesario. La línea `wallpaper:` registra el `ls -l` del PNG, así que un
-fondo de color liso (violeta `#1a1440`) en vez de la escena nocturna
-significa que el PNG no está en esa instalación — el log dice por qué.
+necesario. La línea `wallpaper:` registra el `ls -l` del PNG.
+
+**Fondo liso en vez de la escena nocturna.** Si swaybg registra
+`Failed to load image` / `Couldn't recognize the image file format` con el
+PNG presente en disco, es gdk-pixbuf sin su `loaders.cache`: apk lo genera
+con un *trigger* que puede no haberse ejecutado bajo Eclipse OS, y sin él
+gdk-pixbuf no reconoce **ningún** formato de imagen (swaybg no carga fondos
+y las apps GTK pierden sus iconos). El autoarranque lo detecta y ejecuta
+`gdk-pixbuf-query-loaders --update-cache` automáticamente; además, si
+swaybg muere al cargar la imagen, un vigilante relanza el fondo con color
+sólido a los 2 s para que el escritorio nunca se quede sin fondo.
 
 Si el sistema se cuelga al arrancar la sesión y necesitas entrar sin
 escritorio: cambia a otra consola virtual (`Ctrl+Alt+F2`) antes de lanzar
