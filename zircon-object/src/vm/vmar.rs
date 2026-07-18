@@ -706,17 +706,26 @@ impl VmAddressRegion {
                     map.size()
                 );
             }
+            // Phase-split timing: hardware showed a 61 MiB and a 107 MiB
+            // mapping both take ~6.2s — cost is NOT proportional to size, so
+            // the time hides in ONE phase with a nonlinear cost. Separating
+            // copy (fork_copy/eager) from map (page-table populate) names it.
             let t0 = kernel_hal::timer::timer_now();
             let mapping = map.clone_map(self.page_table.clone())?;
+            let t1 = kernel_hal::timer::timer_now();
             mapping.map()?;
             if big {
-                let dt = kernel_hal::timer::timer_now().saturating_sub(t0);
-                if dt.as_millis() > 100 {
+                let t2 = kernel_hal::timer::timer_now();
+                let d_copy = t1.saturating_sub(t0).as_millis();
+                let d_map = t2.saturating_sub(t1).as_millis();
+                if d_copy + d_map > 100 {
                     error!(
-                        "[fork] mapping {}/{} took {} ms",
+                        "[fork] mapping {}/{} took {} ms (copy={} map={})",
                         i,
                         n_maps,
-                        dt.as_millis()
+                        d_copy + d_map,
+                        d_copy,
+                        d_map
                     );
                 }
             }
@@ -934,6 +943,14 @@ impl VmMapping {
             let page_num = inner.size / PAGE_SIZE;
             let vmo_offset = inner.vmo_offset / PAGE_SIZE;
             for i in 0..page_num {
+                // Liveness heartbeat for huge mappings: this loop COMMITS every
+                // page of the vmo (alloc+zero for anonymous ranges) and maps it,
+                // all under the VMO family lock — for a 100+ MiB mapping that is
+                // seconds of work that must not read as a freeze. Every 8192
+                // pages = 32 MiB.
+                if i > 0 && i % 8192 == 0 {
+                    error!("[fork/map] {}/{} pages mapped", i, page_num);
+                }
                 let paddr = commit(vmo_offset + i, inner.flags[i])?;
                 //通过GenericPageTable的hal_pt_map进行页表映射
                 page_table
