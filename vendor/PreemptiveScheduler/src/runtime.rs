@@ -189,22 +189,25 @@ pub(crate) fn steal_task_from_other_cpu() -> Option<(Key, Arc<Task>, WakerRef, D
     // Most-loaded victims first to spread work off the busiest cores.
     candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1));
     for (cpu, _) in candidates {
-        // Do NOT blocking-lock the victim's runtime, and NEVER hold it across
-        // take_task. The deadlock: thief holds RUNTIME[victim] and spins on
-        // the victim collection's generator lock; the victim's executor holds
-        // that generator (mid take_task) and is interrupted by a timer IRQ
-        // whose sched_yield spins on RUNTIME[victim] with interrupts off ->
-        // the executor can never resume to release the generator -> both CPUs
-        // spin forever (the >8s DEADLOCK banner). The runtime lock is only
-        // needed to reach the Arc'd collection: clone the Arc under try_lock,
-        // drop the guard, then steal — exactly how the victim's own executor
-        // calls take_task (collection Arc, no runtime lock held).
-        let collection = match GLOBAL_RUNTIME[cpu].try_lock() {
-            Some(rt) if rt.task_num() > 0 => rt.task_collection.clone(),
-            _ => continue,
+        // Deadlock discipline: the thief may hold the victim's runtime lock
+        // while stealing (that serialization keeps the victim's executor
+        // transitions — which run under lazily-retained user CR3s — from
+        // overlapping with thief-driven task drops on the victim collection),
+        // but it must NEVER SPIN while holding it. The AB-BA otherwise: thief
+        // holds RUNTIME[victim] and spins on the victim's generator lock; the
+        // victim's executor holds that generator (mid take_task) and is
+        // interrupted by a timer IRQ whose sched_yield spins on
+        // RUNTIME[victim] with interrupts off -> the executor can never
+        // resume to release the generator -> both CPUs spin forever (the >8s
+        // DEADLOCK banner). Hence try_lock on BOTH locks: a busy victim is
+        // skipped, never waited on.
+        let Some(runtime) = GLOBAL_RUNTIME[cpu].try_lock() else {
+            continue;
         };
-        if let Some(task) = collection.take_task() {
-            return Some(task);
+        if runtime.task_num() > 0 {
+            if let Some(task) = runtime.task_collection.try_take_task() {
+                return Some(task);
+            }
         }
     }
     None
