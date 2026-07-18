@@ -6,8 +6,8 @@ use log::{self, Level, LevelFilter, Log, Metadata, Record};
 // ---------------------------------------------------------------------------
 //
 // A fixed circular buffer holds all kernel log messages. Access is serialized
-// with a simple spinlock so it is safe to call from any context, including
-// interrupt handlers.
+// with `lock::Mutex` (IRQ-safe ticket spinlock) so it is safe to call from any
+// context, including interrupt handlers.
 //
 // Sized to hold a full X-server startup syscall trace (tens of thousands of
 // lines) so the structurally interesting calls are not evicted before `dmesg`
@@ -64,56 +64,22 @@ impl KlogBuf {
     }
 }
 
-struct KlogLock {
-    locked: core::sync::atomic::AtomicBool,
-    buf: core::cell::UnsafeCell<KlogBuf>,
-}
-
-// SAFETY: we serialise all access with the spinlock.
-unsafe impl Sync for KlogLock {}
-unsafe impl Send for KlogLock {}
-
-impl KlogLock {
-    const fn new() -> Self {
-        Self {
-            locked: core::sync::atomic::AtomicBool::new(false),
-            buf: core::cell::UnsafeCell::new(KlogBuf::new()),
-        }
-    }
-
-    fn with<R>(&self, f: impl FnOnce(&mut KlogBuf) -> R) -> R {
-        use core::sync::atomic::Ordering;
-        // Spin until we acquire the lock.
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        // SAFETY: we hold the lock.
-        let r = f(unsafe { &mut *self.buf.get() });
-        self.locked.store(false, Ordering::Release);
-        r
-    }
-}
-
-static KLOG: KlogLock = KlogLock::new();
+static KLOG: lock::Mutex<KlogBuf> = lock::Mutex::new(KlogBuf::new());
 
 /// Write a slice of bytes into the kernel log ring buffer.
 fn klog_write(data: &[u8]) {
-    KLOG.with(|b| b.write(data));
+    KLOG.lock().write(data);
 }
 
 /// Copy the full kernel log into `dst` (oldest first).
 /// Returns the number of bytes written.
 pub fn klog_read_all(dst: &mut [u8]) -> usize {
-    KLOG.with(|b| b.read_all(dst))
+    KLOG.lock().read_all(dst)
 }
 
 /// Total bytes currently stored in the kernel log ring buffer.
 pub fn klog_size() -> usize {
-    KLOG.with(|b| b.size())
+    KLOG.lock().size()
 }
 
 /// Write a kernel message into the dmesg ring buffer only (not echoed to the graphic/serial console).
