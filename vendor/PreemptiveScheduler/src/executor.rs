@@ -189,7 +189,6 @@ impl Executor {
                 }
                 debug!("back from future {}:{}", self.id(), task.id());
                 self.task_id = 0;
-                waker_ref.mark_borrowed(false);
                 // Pin this task's address space for the upcoming take_task/steal
                 // (which run under the CR3 this poll just (re)loaded). Replacing
                 // the previous pin here is safe: CR3 now points at *this* task's
@@ -198,13 +197,37 @@ impl Executor {
                 // is no longer the active one. See the comment at the top of
                 // `run`.
                 _cr3_pin = Some(task.clone());
+                // Borrow-release ordering — this is load-bearing for SMP.
+                //
+                // The OLD order (mark_borrowed(false), then drop_by_ref on
+                // Ready) opened a window where a completed task was published
+                // as (borrowed=0, dropped=0). A wake that raced with the poll
+                // (deferred by take_notified while we were borrowed — routine
+                // for IRQ-driven futures) then let ANOTHER executor take and
+                // re-poll the SAME completed task. If a timer preemption
+                // parked either executor in that window, the late
+                // mark_borrowed(false) could land on a slab slot that had
+                // been removed and REUSED, wiping the borrow bit of an
+                // unrelated live task -> two executors polling one future ->
+                // the second spins forever on the future lock
+                // (task_collection.rs, Task::poll) while the first sits
+                // parked as a weak executor: the >8s DEADLOCK banner.
+                //
+                // Therefore: on Ready, publish `dropped` FIRST and leave the
+                // borrow bit SET. take_notified masks dropped tasks, so the
+                // task can never be handed out again; the generator's
+                // dropped-branch remove() -> clear() wipes all bits (borrow
+                // included) atomically with freeing the slot, BEFORE the slot
+                // can be reused by insert(). Only a Pending poll releases the
+                // borrow here, and only after Task::poll has returned (future
+                // lock already released).
                 match ret {
                     Poll::Ready(()) => {
                         debug!("task over id = {}", task.id());
                         droper.drop_by_ref();
                     }
                     Poll::Pending => {
-                        // Do Nothing
+                        waker_ref.mark_borrowed(false);
                     }
                 };
                 if let ExecutorState::WEAK = self.state {
