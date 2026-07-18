@@ -220,7 +220,7 @@ impl VMObjectPaged {
     /// pinned/contiguous frames or a special cache policy must use the caller's
     /// eager fallback.
     fn fork_copy(&self) -> ZxResult<Arc<Self>> {
-        let (_guard, inner) = self.get_inner();
+        let inner = self.get_inner();
         if !matches!(inner.type_, VMOType::Origin)
             || inner.parent.is_some()
             || inner.contiguous
@@ -263,7 +263,7 @@ impl VMObjectPaged {
             return Err(ZxError::NO_MEMORY);
         }
         {
-            let (_guard, mut inner) = vmo.get_inner_mut();
+            let mut inner = vmo.get_inner_mut();
             inner.contiguous = true;
             for (i, f) in frames.drain(0..).enumerate() {
                 kernel_hal::mem::pmem_zero(f.paddr(), PAGE_SIZE);
@@ -287,34 +287,78 @@ impl VMObjectPaged {
 
     /// get the reference to inner by lock the shared lock
     ///
-    /// DROP-ORDER CONTRACT (the source of the recurring "RefCell already
-    /// mutably borrowed" panic at this file's borrow sites): the RefCell
+    /// Take the family lock, then borrow `inner`.
+    ///
+    /// DROP-ORDER CONTRACT (the source of the twice-recurring "RefCell
+    /// already borrowed" panic at this file's borrow sites): the RefCell
     /// borrow must die BEFORE the family mutex is released, or another CPU
     /// can take the mutex and borrow_mut() while our borrow is still alive
-    /// for a few instructions. Every call site DESTRUCTURES the tuple
-    /// (`let (_guard, inner) = ...`), and Rust drops the bindings of one
-    /// pattern in REVERSE order of appearance — the binding named LAST dies
-    /// FIRST. Therefore the guard must be the FIRST element and the borrow
-    /// the SECOND, so that `inner` (last) drops first and `_guard` (first)
-    /// drops last, releasing the mutex only after the borrow is dead. (The
-    /// previous (borrow, guard) order was correct only for an intact tuple
-    /// value — destructuring inverted it and reintroduced the race.)
-    fn get_inner(&self) -> (MutexGuard<'_, ()>, Ref<'_, VMObjectPagedInner>) {
+    /// for a few instructions. A `(guard, borrow)` tuple could not enforce
+    /// this: destructuring drops bindings in REVERSE order (borrow first —
+    /// correct) but an intact temporary like `self.get_inner().size` drops
+    /// tuple fields in FORWARD order (guard first — the mutex was released
+    /// while the borrow lived, which is exactly the cross-CPU race that
+    /// kept coming back, last seen as a fork-time panic on real 8-core
+    /// hardware). These guard newtypes make the order structural: struct
+    /// fields drop in declaration order, `inner` is declared before `guard`,
+    /// so the borrow ALWAYS dies before the mutex releases, no matter how a
+    /// call site uses the value.
+    fn get_inner(&self) -> InnerGuard<'_> {
         let guard = self.lock.lock();
-        (guard, self.inner.borrow())
+        InnerGuard {
+            inner: self.inner.borrow(),
+            _guard: guard,
+        }
     }
 
-    /// get the mutable reference to inner by lock the shared lock
-    /// (same drop-order contract as `get_inner` -- see above).
-    fn get_inner_mut(&self) -> (MutexGuard<'_, ()>, RefMut<'_, VMObjectPagedInner>) {
+    /// Mutable variant of [`get_inner`] — same structural drop-order contract.
+    fn get_inner_mut(&self) -> InnerGuardMut<'_> {
         let guard = self.lock.lock();
-        (guard, self.inner.borrow_mut())
+        InnerGuardMut {
+            inner: self.inner.borrow_mut(),
+            _guard: guard,
+        }
+    }
+}
+
+/// Shared borrow of a `VMObjectPaged`'s inner state, holding the family lock.
+/// Field order is load-bearing: `inner` (the RefCell borrow) drops first,
+/// `_guard` (the family mutex) last. See `get_inner` for the full contract.
+struct InnerGuard<'a> {
+    inner: Ref<'a, VMObjectPagedInner>,
+    _guard: MutexGuard<'a, ()>,
+}
+
+impl core::ops::Deref for InnerGuard<'_> {
+    type Target = VMObjectPagedInner;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+/// Exclusive borrow of a `VMObjectPaged`'s inner state, holding the family
+/// lock. Same structural drop-order guarantee as [`InnerGuard`].
+struct InnerGuardMut<'a> {
+    inner: RefMut<'a, VMObjectPagedInner>,
+    _guard: MutexGuard<'a, ()>,
+}
+
+impl core::ops::Deref for InnerGuardMut<'_> {
+    type Target = VMObjectPagedInner;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl core::ops::DerefMut for InnerGuardMut<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
     }
 }
 
 impl VMObjectTrait for VMObjectPaged {
     fn read(&self, offset: usize, buf: &mut [u8]) -> ZxResult {
-        let (_guard, mut inner) = self.get_inner_mut();
+        let mut inner = self.get_inner_mut();
         if inner.cache_policy != CachePolicy::Cached {
             return Err(ZxError::BAD_STATE);
         }
@@ -324,7 +368,7 @@ impl VMObjectTrait for VMObjectPaged {
     }
 
     fn write(&self, offset: usize, buf: &[u8]) -> ZxResult {
-        let (_guard, mut inner) = self.get_inner_mut();
+        let mut inner = self.get_inner_mut();
         if inner.cache_policy != CachePolicy::Cached {
             return Err(ZxError::BAD_STATE);
         }
@@ -334,7 +378,7 @@ impl VMObjectTrait for VMObjectPaged {
     }
 
     fn zero(&self, offset: usize, len: usize) -> ZxResult {
-        let (_guard, mut inner) = self.get_inner_mut();
+        let mut inner = self.get_inner_mut();
         if offset + len > inner.size {
             return Err(ZxError::OUT_OF_RANGE);
         }
@@ -361,13 +405,13 @@ impl VMObjectTrait for VMObjectPaged {
     }
 
     fn len(&self) -> usize {
-        self.get_inner().1.size
+        self.get_inner().size
     }
 
     fn set_len(&self, len: usize) -> ZxResult {
         assert!(page_aligned(len));
         let old_parent = {
-            let (_guard, mut inner) = self.get_inner_mut();
+            let mut inner = self.get_inner_mut();
             if inner.pin_count > 0 {
                 return Err(ZxError::BAD_STATE);
             }
@@ -378,19 +422,19 @@ impl VMObjectTrait for VMObjectPaged {
     }
 
     fn commit_page(&self, page_idx: usize, flags: MMUFlags) -> ZxResult<PhysAddr> {
-        self.get_inner_mut().1.commit_page(page_idx, flags)
+        self.get_inner_mut().commit_page(page_idx, flags)
     }
 
     fn commit_pages_with(
         &self,
         f: &mut dyn FnMut(&mut dyn FnMut(usize, MMUFlags) -> ZxResult<PhysAddr>) -> ZxResult,
     ) -> ZxResult {
-        let (_guard, mut inner) = self.get_inner_mut();
+        let mut inner = self.get_inner_mut();
         f(&mut |page_idx, flags| inner.commit_page(page_idx, flags))
     }
 
     fn commit(&self, offset: usize, len: usize) -> ZxResult {
-        let (_guard, mut inner) = self.get_inner_mut();
+        let mut inner = self.get_inner_mut();
         let start_page = offset / PAGE_SIZE;
         let pages = len / PAGE_SIZE;
         for i in 0..pages {
@@ -400,7 +444,7 @@ impl VMObjectTrait for VMObjectPaged {
     }
 
     fn decommit(&self, offset: usize, len: usize) -> ZxResult {
-        let (_guard, mut inner) = self.get_inner_mut();
+        let mut inner = self.get_inner_mut();
         if inner.parent.is_some() {
             return Err(ZxError::NOT_SUPPORTED);
         }
@@ -415,32 +459,31 @@ impl VMObjectTrait for VMObjectPaged {
     fn create_child(&self, offset: usize, len: usize) -> ZxResult<Arc<dyn VMObjectTrait>> {
         assert!(page_aligned(offset));
         assert!(page_aligned(len));
-        let (_guard, mut inner) = self.get_inner_mut();
+        let mut inner = self.get_inner_mut();
         let child = inner.create_child(offset, len, &self.lock)?;
         Ok(child)
     }
 
     fn append_mapping(&self, mapping: Weak<VmMapping>) {
-        self.get_inner_mut().1.mappings.push(mapping);
+        self.get_inner_mut().mappings.push(mapping);
     }
 
     fn remove_mapping(&self, mapping: Weak<VmMapping>) {
         // Drop the target mapping and any dead weak refs in a single in-place
         // pass, without taking and rebuilding the vector.
         self.get_inner_mut()
-            .1
             .mappings
             .retain(|x| x.strong_count() > 0 && !Weak::ptr_eq(x, &mapping));
     }
 
     fn complete_info(&self, info: &mut VmoInfo) {
-        let (_guard, inner) = self.get_inner();
+        let inner = self.get_inner();
         info.flags |= VmoInfoFlags::TYPE_PAGED;
         inner.complete_info(info);
     }
 
     fn cache_policy(&self) -> CachePolicy {
-        let (_guard, inner) = self.get_inner();
+        let inner = self.get_inner();
         inner.cache_policy
     }
 
@@ -451,7 +494,7 @@ impl VMObjectTrait for VMObjectPaged {
         // 3) vmo has no mappings
         // 4) vmo has no children (TODO)
         // 5) vmo is not a child
-        let (_guard, mut inner) = self.get_inner_mut();
+        let mut inner = self.get_inner_mut();
         if !inner.frames.is_empty() && inner.cache_policy != CachePolicy::Cached {
             return Err(ZxError::BAD_STATE);
         }
@@ -475,12 +518,12 @@ impl VMObjectTrait for VMObjectPaged {
     }
 
     fn committed_pages_in_range(&self, start_idx: usize, end_idx: usize) -> usize {
-        let (_guard, inner) = self.get_inner();
+        let inner = self.get_inner();
         inner.committed_pages_in_range(start_idx, end_idx)
     }
 
     fn pin(&self, offset: usize, len: usize) -> ZxResult {
-        let (_guard, mut inner) = self.get_inner_mut();
+        let mut inner = self.get_inner_mut();
         if offset + len > inner.size {
             return Err(ZxError::OUT_OF_RANGE);
         }
@@ -503,7 +546,7 @@ impl VMObjectTrait for VMObjectPaged {
     }
 
     fn unpin(&self, offset: usize, len: usize) -> ZxResult {
-        let (_guard, mut inner) = self.get_inner_mut();
+        let mut inner = self.get_inner_mut();
         if offset + len > inner.size {
             return Err(ZxError::OUT_OF_RANGE);
         }
@@ -527,7 +570,7 @@ impl VMObjectTrait for VMObjectPaged {
     }
 
     fn is_contiguous(&self) -> bool {
-        self.get_inner().1.is_contiguous()
+        self.get_inner().is_contiguous()
     }
 
     fn is_paged(&self) -> bool {
@@ -535,7 +578,7 @@ impl VMObjectTrait for VMObjectPaged {
     }
 
     fn is_demand_paged(&self) -> bool {
-        self.get_inner().1.source.is_some()
+        self.get_inner().source.is_some()
     }
 
     fn fork_copy(&self) -> ZxResult<Arc<dyn VMObjectTrait>> {
@@ -543,8 +586,15 @@ impl VMObjectTrait for VMObjectPaged {
     }
 
     fn as_mut_buf(&self) -> ZxResult<(MutexGuard<'_, ()>, &mut [u8])> {
-        let (guard, mut inner) = self.get_inner_mut();
-        inner.as_mut_buf().map(|(addr, size)| {
+        // This is the one site that hands the family lock OUT to the caller
+        // (the returned slice aliases the contiguous frames, so the lock must
+        // outlive it). Take the lock manually and keep the RefCell borrow as a
+        // statement-scoped temporary: it dies at the end of the second
+        // statement, strictly before the guard leaves this function — the same
+        // borrow-dies-before-mutex-releases contract the guard newtypes enforce.
+        let guard = self.lock.lock();
+        let res = self.inner.borrow_mut().as_mut_buf();
+        res.map(|(addr, size)| {
             (guard, unsafe {
                 core::slice::from_raw_parts_mut(addr as *mut u8, size)
             })
@@ -552,7 +602,7 @@ impl VMObjectTrait for VMObjectPaged {
     }
 
     fn unset_contiguous(&self) {
-        let (_guard, mut inner) = self.get_inner_mut();
+        let mut inner = self.get_inner_mut();
         if inner.contiguous {
             inner.contiguous = false;
             for (_index, frame) in inner.frames.iter_mut() {
@@ -1206,7 +1256,7 @@ impl VMObjectPagedInner {
 
 impl Drop for VMObjectPaged {
     fn drop(&mut self) {
-        let (_guard, mut inner) = self.get_inner_mut();
+        let mut inner = self.get_inner_mut();
         // remove self from parent
         if let Some(parent) = &inner.parent {
             parent.inner.borrow_mut().remove_child(&inner.self_ref);
