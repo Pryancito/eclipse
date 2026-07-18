@@ -22,6 +22,8 @@ cfg_if::cfg_if! {
         pub mod mcslock;
         pub mod rwlock;
         pub use {rwlock::*, mcslock::*};
+        mod deadlock;
+        pub use deadlock::set_deadlock_hook;
         pub mod ticket;
         pub use ticket::{TicketMutex as Mutex, TicketMutexGuard as MutexGuard};
     } else if #[cfg(target_os = "none")] {
@@ -40,8 +42,10 @@ cfg_if::cfg_if! {
         pub mod mcslock;
         pub mod rwlock;
         pub use {rwlock::*, mcslock::*};
+        mod deadlock;
+        pub use deadlock::set_deadlock_hook;
         pub mod spin;
-        pub use spin::{set_deadlock_hook, SpinMutex as Mutex, SpinMutexGuard as MutexGuard};
+        pub use spin::{SpinMutex as Mutex, SpinMutexGuard as MutexGuard};
     } else {
         pub use spin::*;
     }
