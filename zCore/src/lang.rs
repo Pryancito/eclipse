@@ -37,6 +37,66 @@ impl core::fmt::Write for StackBuf {
     }
 }
 
+// ── Spinlock deadlock self-report ────────────────────────────────────────────
+//
+// Slots recording every CPU stuck >~8s on a spinlock (see kernel-sync's
+// DEADLOCK_SPINS). The hook rebuilds a multi-line banner from ALL slots on
+// each report, so a photo shows every stuck call site at once — both sides of
+// an AB-BA deadlock, not just the last reporter. Lock-free by construction:
+// atomics + the raw-framebuffer banner.
+const DL_SLOTS: usize = 8;
+static DL_FILE_PTR: [core::sync::atomic::AtomicUsize; DL_SLOTS] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; DL_SLOTS];
+static DL_FILE_LEN: [core::sync::atomic::AtomicUsize; DL_SLOTS] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; DL_SLOTS];
+static DL_LINE_CPU: [core::sync::atomic::AtomicUsize; DL_SLOTS] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; DL_SLOTS];
+
+pub fn deadlock_report(file: &'static str, line: u32) {
+    use core::sync::atomic::Ordering;
+    let cpu = kernel_hal::cpu::cpu_id() as usize;
+    let ptr = file.as_ptr() as usize;
+    // Claim a slot (or find this site already recorded).
+    for i in 0..DL_SLOTS {
+        let cur = DL_FILE_PTR[i].load(Ordering::SeqCst);
+        if cur == ptr && DL_LINE_CPU[i].load(Ordering::SeqCst) as u32 & 0xffff_ffff == line {
+            break;
+        }
+        if cur == 0
+            && DL_FILE_PTR[i]
+                .compare_exchange(0, ptr, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            DL_FILE_LEN[i].store(file.len(), Ordering::SeqCst);
+            DL_LINE_CPU[i].store((cpu << 32) | line as usize, Ordering::SeqCst);
+            break;
+        }
+    }
+    // Rebuild the banner from all recorded slots.
+    use core::fmt::Write;
+    let mut b = StackBuf {
+        buf: [0u8; 512],
+        len: 0,
+    };
+    let _ = write!(b, "DEADLOCK: spinlock(s) stuck >8s");
+    for i in 0..DL_SLOTS {
+        let p = DL_FILE_PTR[i].load(Ordering::SeqCst);
+        if p == 0 {
+            continue;
+        }
+        let l = DL_FILE_LEN[i].load(Ordering::SeqCst);
+        let lc = DL_LINE_CPU[i].load(Ordering::SeqCst);
+        // SAFETY: (p, l) were stored from a live &'static str.
+        let f = unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(p as *const u8, l)) };
+        let _ = write!(b, "\ncpu={} at {}:{}", lc >> 32, f, lc & 0xffff_ffff);
+    }
+    let valid = match core::str::from_utf8(&b.buf[..b.len]) {
+        Ok(s) => s,
+        Err(e) => core::str::from_utf8(&b.buf[..e.valid_up_to()]).unwrap_or(""),
+    };
+    kernel_hal::console::panic_banner(valid);
+}
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     // Disable interrupts immediately. With panic-strategy=abort, local variables
