@@ -6,8 +6,8 @@ use log::{self, Level, LevelFilter, Log, Metadata, Record};
 // ---------------------------------------------------------------------------
 //
 // A fixed circular buffer holds all kernel log messages. Access is serialized
-// with a simple spinlock so it is safe to call from any context, including
-// interrupt handlers.
+// with `lock::Mutex` (IRQ-safe ticket spinlock) so it is safe to call from any
+// context, including interrupt handlers.
 //
 // Sized to hold a full X-server startup syscall trace (tens of thousands of
 // lines) so the structurally interesting calls are not evicted before `dmesg`
