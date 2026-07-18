@@ -27,6 +27,7 @@ extern crate alloc;
 extern crate log;
 
 mod context;
+mod diag;
 mod executor;
 mod runtime;
 mod task_collection;

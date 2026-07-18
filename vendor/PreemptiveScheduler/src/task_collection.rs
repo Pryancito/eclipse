@@ -45,7 +45,7 @@ struct TaskInner {
 
 impl core::fmt::Debug for Task {
     fn fmt(&self, f: &mut Formatter) -> Result {
-        let inner = self.inner.lock();
+        let inner = crate::diag::diag_lock(&self.inner);
         let mut f = f.debug_struct("X86PTE");
         f.field("priority", &inner.priority);
         f.field("state", &inner.state);
@@ -93,9 +93,9 @@ impl Task {
         // if self.finish.load(Ordering::Relaxed) {
         //     return Poll::Ready(());
         // }
-        let mut f = self.future.lock();
+        let mut f = crate::diag::diag_lock(&self.future);
         let ret = f.as_mut().poll(cx);
-        self.inner.lock().intr_enable = crate::arch::intr_get();
+        crate::diag::diag_lock(&self.inner).intr_enable = crate::arch::intr_get();
         ret
     }
 
@@ -205,16 +205,14 @@ impl TaskCollection {
         affinity: Option<Arc<AtomicU64>>,
     ) -> Key {
         debug_assert!(priority == DEFAULT_PRIORITY);
-        let key = self.future_collections[priority]
-            .lock()
-            .insert(future, affinity);
+        let key = crate::diag::diag_lock(&self.future_collections[priority]).insert(future, affinity);
         debug_assert!(key < TASK_NUM_PER_PRIORITY);
         self.task_num.fetch_add(1, Ordering::Relaxed);
         key | (priority << PRIORITY_SHIFT)
     }
 
     fn get_mut_inner(&self, priority: usize) -> MutexGuard<'_, FutureCollection> {
-        self.future_collections[priority].lock()
+        crate::diag::diag_lock(&self.future_collections[priority])
     }
 
     pub fn task_num(&self) -> usize {
@@ -228,7 +226,7 @@ impl TaskCollection {
     pub fn debug_pending(&self) -> (usize, u32, u32, u32) {
         let (mut n, mut d, mut b) = (0u32, 0u32, 0u32);
         for fc in &self.future_collections {
-            let inner = fc.lock();
+            let inner = crate::diag::diag_lock(fc);
             for page in &inner.pages {
                 let (pn, pd, pb) = page.peek();
                 n += pn.count_ones();
@@ -240,7 +238,7 @@ impl TaskCollection {
     }
 
     pub fn take_task(&self) -> Option<(Key, Arc<Task>, WakerRef, DroperRef)> {
-        let mut generator = self.generator.as_ref().unwrap().lock();
+        let mut generator = crate::diag::diag_lock(self.generator.as_ref().unwrap());
         match generator.as_mut().resume(()) {
             CoroutineState::Yielded(key) => {
                 if let Some(key) = key {
