@@ -1246,6 +1246,16 @@ impl VmMapping {
                     let mut buf = vec![0u8; PAGE_SIZE];
                     let mut off = 0;
                     while off < len {
+                        // Liveness heartbeat every 8 MiB: this loop can hit the
+                        // polled disk per page, so big VMOs take long enough to
+                        // look like a freeze without progress on screen.
+                        if off > 0 && off % (8 << 20) == 0 {
+                            error!(
+                                "[fork] eager fallback: {}/{} MiB",
+                                off >> 20,
+                                len >> 20
+                            );
+                        }
                         self.vmo.read(off, &mut buf)?;
                         new_vmo.write(off, &buf)?;
                         off += PAGE_SIZE;

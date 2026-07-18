@@ -487,6 +487,15 @@ pub fn graphic_console_write_fmt_spin(fmt: Arguments) {
     vt_write_fmt_spin_impl(active_vt(), fmt);
 }
 
+/// Absolute last-resort panic output: rasterize `s` onto a red band at the top
+/// of the framebuffer with raw pixel writes — no locks, no RefCell, no
+/// allocation. Works even when every console lock is wedged (e.g. a panic
+/// inside an IRQ handler while another CPU holds the VT/serial locks). No-op on
+/// targets with no direct framebuffer.
+pub fn panic_banner(s: &str) {
+    crate::hal_fn::console::console_panic_banner(s);
+}
+
 /// Writes a string slice into the serial, and the graphic console if it exists.
 pub fn console_write_str(s: &str) {
     serial_write_str(s);

@@ -143,7 +143,11 @@ pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
         // shortage apart from a code path bug when something reports ENOMEM.
         let used = FRAMES_USED.load(Ordering::Relaxed);
         let total = TOTAL_MEMORY.load(Ordering::Relaxed);
-        crate::klog_warn!(
+        // error! (console), not klog: physical-RAM exhaustion during a fork's
+        // eager copy surfaces as a mysterious ENOMEM/stall with nothing on
+        // screen — this line is the difference between diagnosing it from a
+        // photo and chasing ghosts.
+        log::error!(
             "frame_alloc FAILED: count={} align_log2={} | {} MiB used / {} MiB managed",
             frame_count,
             align_log2,

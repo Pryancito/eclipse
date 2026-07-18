@@ -220,6 +220,52 @@ pub fn write_str(s: &str) {
     }
 }
 
+/// LAST-RESORT panic banner: draw `text` on a red band across the top of the
+/// framebuffer, using ONLY atomics and raw pixel writes — no mutex, no RefCell,
+/// no allocation. This is the output of record when a panic happens while some
+/// CPU (possibly the panicking one) holds the console/serial locks: every other
+/// path can be silently dropped or deadlock, this one cannot. Multi-line text
+/// wraps; the band grows to fit.
+pub fn panic_banner(text: &str) {
+    if !try_init() {
+        return;
+    }
+    let sw = FB_WIDTH.load(Ordering::SeqCst);
+    if sw == 0 {
+        return;
+    }
+    let cols = (sw / CHAR_W).max(1);
+    // Pre-measure wrapped lines to size the band.
+    let mut lines: u32 = 1;
+    let mut col: u32 = 0;
+    for &b in text.as_bytes() {
+        if b == b'\n' || col >= cols {
+            lines += 1;
+            col = 0;
+            if b == b'\n' {
+                continue;
+            }
+        }
+        col += 1;
+    }
+    let band_h = (lines + 1) * CHAR_H;
+    const RED: u32 = 0xFFCC_0000;
+    const WHITE: u32 = 0xFFFF_FFFF;
+    fill_rect(0, 0, sw, band_h, RED);
+    let (mut x, mut y) = (0u32, CHAR_H / 2);
+    for &b in text.as_bytes() {
+        if b == b'\n' || x >= cols {
+            x = 0;
+            y += CHAR_H;
+            if b == b'\n' {
+                continue;
+            }
+        }
+        draw_char_at(x * CHAR_W, y, b, WHITE, RED);
+        x += 1;
+    }
+}
+
 /// Draw a centered boot progress bar (0..=100) on the early framebuffer.
 ///
 /// White border + white fill, black background inside bar area.
