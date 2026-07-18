@@ -337,6 +337,21 @@ impl LinuxElfLoader {
                     map.insert(abi::AT_PHENT, elf.header.pt2.ph_entry_size() as usize);
                     map.insert(abi::AT_PHNUM, elf.header.pt2.ph_count() as usize);
                     map.insert(abi::AT_PAGESZ, PAGE_SIZE);
+                    // Identity + AT_SECURE block. musl computes `libc.secure`
+                    // at startup as "AT_UID/EUID/GID/EGID not all present, or
+                    // ruid != euid, or rgid != egid, or AT_SECURE != 0"; glib's
+                    // g_check_setuid() treats an unreadable AT_SECURE the same
+                    // way. Omitting these made EVERY process run in secure
+                    // mode: musl silently dropped LD_PRELOAD/LD_LIBRARY_PATH
+                    // and GLib refused to autolaunch a D-Bus session bus
+                    // ("Cannot spawn a message bus when AT_SECURE is set",
+                    // which killed waybar). Everything runs as root (uid 0)
+                    // and nothing is setuid, so publish 0s explicitly.
+                    map.insert(abi::AT_UID, 0usize);
+                    map.insert(abi::AT_EUID, 0usize);
+                    map.insert(abi::AT_GID, 0usize);
+                    map.insert(abi::AT_EGID, 0usize);
+                    map.insert(abi::AT_SECURE, 0usize);
                     map
                 },
             };
@@ -451,6 +466,14 @@ impl LinuxElfLoader {
                 map.insert(abi::AT_PHENT, elf.header.pt2.ph_entry_size() as usize);
                 map.insert(abi::AT_PHNUM, elf.header.pt2.ph_count() as usize);
                 map.insert(abi::AT_PAGESZ, PAGE_SIZE);
+                // Identity + AT_SECURE block — same rationale as the sys_execve
+                // path above: without it musl flips every process into secure
+                // mode (LD_PRELOAD dropped, GLib refuses D-Bus autolaunch).
+                map.insert(abi::AT_UID, 0usize);
+                map.insert(abi::AT_EUID, 0usize);
+                map.insert(abi::AT_GID, 0usize);
+                map.insert(abi::AT_EGID, 0usize);
+                map.insert(abi::AT_SECURE, 0usize);
                 map
             },
         };
