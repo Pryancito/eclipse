@@ -688,13 +688,15 @@ impl VmAddressRegion {
         let mut new_mappings = Vec::with_capacity(src_mappings.len());
         let n_maps = src_mappings.len();
         for (i, map) in src_mappings.into_iter().enumerate() {
-            // Per-mapping trace: with diagnostic present-over-graphics on, the
-            // LAST line frozen on screen names the exact mapping (and VMO kind)
-            // a fork hang wedges on. Every mapping is printed -- a stride would
-            // leave the culprit unnamed -- and any mapping that takes over
-            // 100ms gets its elapsed time logged, separating "wedged" from
-            // "grinding through the polled disk".
-            if big {
+            // Sparse progress trace. The gen13 every-mapping version proved the
+            // fork was never wedged -- it was GRINDING: each error! line costs
+            // ~50ms (a full-screen present over PCIe with the diagnostic
+            // present-over-graphics on), so 596 lines added ~30s of pure
+            // logging per fork on top of the real copy work. Print every 32nd
+            // mapping, plus any large one up front (they take seconds of real
+            // copying -- a 107 MiB heap took 6.3s -- and must not look like a
+            // freeze), plus the >100ms elapsed line below.
+            if big && (i % 32 == 0 || map.size() >= 16 << 20) {
                 error!(
                     "[fork] mapping {}/{} kind={} addr={:#x} size={:#x}",
                     i,
