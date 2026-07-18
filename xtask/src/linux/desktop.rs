@@ -254,7 +254,10 @@ fn write_labwc_autostart(rootfs: &Path) {
           # A terminal FIRST so the desktop is usable even if the panel\n\
           # below takes the session down.\n\
           if command -v foot >/dev/null 2>&1; then\n\
-          \x20 echo '[autostart] launching foot'; foot &\n\
+          \x20 echo '[autostart] launching foot'\n\
+          \x20 # Wrapper subshell: log the exit code, so a foot that dies\n\
+          \x20 # instantly and silently is at least attributable.\n\
+          \x20 ( foot; echo \"[autostart] foot exited rc=$?\" ) &\n\
           else echo '[autostart] MISSING foot -> no terminal (apk add foot)'; fi\n\
           # Bottom panel: taskbar, clock, sysinfo. GTK app -> keep it off the\n\
           # EGL/GBM path (hangs this box, see /usr/local/bin/labwc) and guard\n\
@@ -271,7 +274,8 @@ fn write_labwc_autostart(rootfs: &Path) {
           \x20 # GSETTINGS_BACKEND=memory: GTK otherwise reads settings through\n\
           \x20 # dconf, whose D-Bus autolaunch is another failure point on a\n\
           \x20 # system with no session bus.\n\
-          \x20 GDK_GL=disable GDK_BACKEND=wayland GSETTINGS_BACKEND=memory waybar &\n\
+          \x20 ( GDK_GL=disable GDK_BACKEND=wayland GSETTINGS_BACKEND=memory waybar\n\
+          \x20   echo \"[autostart] waybar exited rc=$?\" ) &\n\
           \x20 ( sleep 15 && rm -f \"$PANEL_LOCK\" && echo '[autostart] waybar survived 15s, lock cleared' >>\"$LOG\" ) &\n\
           fi\n\
           echo \"[autostart] cursor theme dir: $(ls -d /usr/share/icons/*/cursors 2>/dev/null || echo NONE)\"\n\
