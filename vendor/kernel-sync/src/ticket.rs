@@ -6,6 +6,7 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use crate::deadlock::{report_deadlock, DEADLOCK_SPINS};
 use crate::interrupt::{pop_off, push_off};
 
 pub struct TicketMutex<T: ?Sized> {
@@ -51,12 +52,22 @@ impl<T> TicketMutex<T> {
 }
 
 impl<T: ?Sized> TicketMutex<T> {
-    #[inline(always)]
+    #[track_caller]
     pub fn lock(&self) -> TicketMutexGuard<T> {
         push_off();
+        let caller = core::panic::Location::caller();
+        let mut spins: u64 = 0;
         let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
         while self.next_serving.load(Ordering::Acquire) != ticket {
             core::hint::spin_loop();
+            spins += 1;
+            if spins == DEADLOCK_SPINS {
+                // Many seconds of continuous spinning with IRQs off: this CPU
+                // is almost certainly part of a deadlock. Self-report the stuck
+                // call site (once), then keep spinning — if the holder ever
+                // releases, behavior is unchanged.
+                report_deadlock(caller.file(), caller.line());
+            }
         }
         TicketMutexGuard {
             next_serving: &self.next_serving,
