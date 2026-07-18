@@ -1654,11 +1654,16 @@ impl E1000eInterface {
             self.driver.hw.lock().ensure_rx_armed_if_link_up();
         }
 
-        // Keep IRQs off while SOCKETS + iface are locked (rtlx / e1000 pattern).
-        let intr_was_on = super::intr_get();
-        if intr_was_on {
-            super::intr_off();
-        }
+        // Do NOT manually toggle interrupts around the SOCKETS + iface locks.
+        // `super::intr_off/on` are raw hardware toggles (drivers_intr_*) that
+        // bypass the kernel-sync Mutex's push_off/pop_off noff accounting. The
+        // Mutex already keeps interrupts disabled for the whole locked critical
+        // section, so a NIC IRQ cannot reenter and deadlock on SOCKETS while we
+        // hold it. Force-toggling the raw flag here (as this code previously did,
+        // mislabeled the "rtlx / e1000 pattern") desyncs pop_off and re-enables
+        // interrupts mid-section under an outer lock holder — panicking
+        // ("RefCell already borrowed") or deadlocking on SOCKETS under SMP.
+        // e1000.rs and rtlx.rs document this exact hazard; rely on the Mutex alone.
         let sockets = get_sockets();
         let mut had_rx = (irq_icr & ICR_RX_ANY) != 0;
         {
@@ -1668,9 +1673,6 @@ impl E1000eInterface {
                 Ok(false) => {}
                 Err(e) => warn!("e1000e smoltcp poll: {:?}", e),
             }
-        }
-        if intr_was_on {
-            super::intr_on();
         }
 
         super::net_flush_deferred_packets();
