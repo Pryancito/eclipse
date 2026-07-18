@@ -148,12 +148,21 @@ cfg_if! {
                 return;
             }
             if let (Some(display), Some(cons)) = (GRAPHIC_DISPLAY.try_get(), vt_mutex(vt)) {
-                // Clear to black with opaque alpha (ARGB8888) and reset the console state.
-                let _ = crate::boot_logo::clear_screen(
-                    &**display,
-                    zcore_drivers::prelude::RgbColor::new(0, 0, 0),
-                );
-                *cons.lock() = GraphicConsole::new(display.clone());  // spin::Mutex — IRQs stay enabled
+                // try_lock, NOT lock: this was the console path's only BLOCKING
+                // uninstrumented spin::Mutex acquisition, reachable from any
+                // logging context (incl. IRQ) — a wedged holder turned it into
+                // an invisible infinite spin. On contention, re-arm the flag so
+                // the clear happens on the next write instead.
+                if let Some(mut g) = cons.try_lock() {
+                    // Clear to black with opaque alpha (ARGB8888) and reset the console state.
+                    let _ = crate::boot_logo::clear_screen(
+                        &**display,
+                        zcore_drivers::prelude::RgbColor::new(0, 0, 0),
+                    );
+                    *g = GraphicConsole::new(display.clone());
+                } else {
+                    CLEAR_ON_NEXT_GRAPHIC_WRITE.store(true, Ordering::SeqCst);
+                }
             }
         }
 
