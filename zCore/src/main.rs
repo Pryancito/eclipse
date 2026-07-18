@@ -63,7 +63,12 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     // PRIME/DRM diagnostics in that photo predate the current instrumentation.
     // Bump the tag on every diagnostic generation so a glance settles "is this
     // the build I just made?" without parsing dense logs.
-    log::error!("[eclipse] BUILD MARKER gen16: lock-free red panic banner + intra-copy heartbeat ACTIVE");
+    log::error!("[eclipse] BUILD MARKER gen17: spinlock deadlock self-report (red banner names stuck locks) ACTIVE");
+    // Deadlock self-report: any CPU spinning >~8s on a kernel spinlock paints
+    // the stuck call site(s) onto the red framebuffer banner (lock-free), so a
+    // silent freeze names its own deadlock instead of needing a serial cable.
+    #[cfg(not(feature = "libos"))]
+    lock::set_deadlock_hook(lang::deadlock_report);
     // Diagnostic: keep kernel console output visible on the monitor even after
     // labwc puts the VT into KD_GRAPHICS, so a hard hang's last log line stays
     // frozen on screen (the machine hangs black with no panic -> a deadlock /

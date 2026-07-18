@@ -3,10 +3,37 @@ use core::{
     default::Default,
     fmt,
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use crate::interrupt::{pop_off, push_off};
+
+/// Deadlock self-report hook. A spinlock that spins "forever" (billions of
+/// PAUSEs, i.e. many seconds) is a deadlock on an IRQ-off kernel: the machine
+/// freezes with no panic and no console output — indistinguishable from a hard
+/// hang on a monitor-only box. When a waiter crosses the threshold it calls
+/// this hook ONCE with its `#[track_caller]` location, so the kernel can paint
+/// the stuck call site somewhere lock-free (e.g. straight onto the
+/// framebuffer). The hook MUST NOT take locks or allocate.
+static DEADLOCK_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// ~8s of PAUSE iterations on current hardware. Normal contention is orders of
+/// magnitude below this; only a genuine deadlock/livelock crosses it.
+const DEADLOCK_SPINS: u64 = 1_000_000_000;
+
+/// Install the deadlock self-report hook (`file`, `line` of the stuck caller).
+pub fn set_deadlock_hook(f: fn(&'static str, u32)) {
+    DEADLOCK_HOOK.store(f as usize, Ordering::SeqCst);
+}
+
+#[inline(never)]
+fn report_deadlock(file: &'static str, line: u32) {
+    let h = DEADLOCK_HOOK.load(Ordering::Relaxed);
+    if h != 0 {
+        let f: fn(&'static str, u32) = unsafe { core::mem::transmute(h) };
+        f(file, line);
+    }
+}
 
 pub struct SpinMutex<T: ?Sized> {
     locked: AtomicBool,
@@ -49,8 +76,11 @@ impl<T> SpinMutex<T> {
 
 impl<T: ?Sized> SpinMutex<T> {
     #[inline(always)]
+    #[track_caller]
     pub fn lock(&self) -> SpinMutexGuard<T> {
         push_off();
+        let caller = core::panic::Location::caller();
+        let mut spins: u64 = 0;
         while self
             .locked
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -59,6 +89,14 @@ impl<T: ?Sized> SpinMutex<T> {
             // Wait until the lock looks unlocked before retrying
             while self.is_locked() {
                 core::hint::spin_loop();
+                spins += 1;
+                if spins == DEADLOCK_SPINS {
+                    // Many seconds of continuous spinning with IRQs off: this
+                    // CPU is almost certainly part of a deadlock. Self-report
+                    // the stuck call site (once), then keep spinning — if the
+                    // holder ever releases, we still proceed correctly.
+                    report_deadlock(caller.file(), caller.line());
+                }
             }
         }
         SpinMutexGuard {

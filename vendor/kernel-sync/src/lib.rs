@@ -41,7 +41,7 @@ cfg_if::cfg_if! {
         pub mod rwlock;
         pub use {rwlock::*, mcslock::*};
         pub mod spin;
-        pub use spin::{SpinMutex as Mutex, SpinMutexGuard as MutexGuard};
+        pub use spin::{set_deadlock_hook, SpinMutex as Mutex, SpinMutexGuard as MutexGuard};
     } else {
         pub use spin::*;
     }
