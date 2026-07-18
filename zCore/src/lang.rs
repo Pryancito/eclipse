@@ -54,7 +54,7 @@ fn panic(info: &PanicInfo) -> ! {
             loc.line(),
             loc.column(),
         ));
-        kernel_hal::console::graphic_console_write_fmt(format_args!(
+        kernel_hal::console::graphic_console_write_fmt_spin(format_args!(
             "\n\n[PANIC] cpu={} at {}:{}:{}\n",
             kernel_hal::cpu::cpu_id(),
             loc.file(),
@@ -66,7 +66,7 @@ fn panic(info: &PanicInfo) -> ! {
             "\n\npanic cpu={}\n",
             kernel_hal::cpu::cpu_id(),
         ));
-        kernel_hal::console::graphic_console_write_fmt(format_args!(
+        kernel_hal::console::graphic_console_write_fmt_spin(format_args!(
             "\n\n[PANIC] cpu={}\n",
             kernel_hal::cpu::cpu_id(),
         ));
@@ -74,7 +74,7 @@ fn panic(info: &PanicInfo) -> ! {
     // `as_str()` returns None for any panic! with format arguments — use
     // Display on the Arguments directly so the message is always printed.
     kernel_hal::console::serial_write_fmt_spin(format_args!("{}\n", info.message()));
-    kernel_hal::console::graphic_console_write_fmt(format_args!("{}\n", info.message()));
+    kernel_hal::console::graphic_console_write_fmt_spin(format_args!("{}\n", info.message()));
 
     if cfg!(feature = "baremetal-test") {
         kernel_hal::cpu::reset();

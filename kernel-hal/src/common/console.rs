@@ -175,6 +175,26 @@ cfg_if! {
             }
         }
 
+        /// Panic-path write: the normal path `try_lock`s and silently DROPS the
+        /// write when another CPU holds the VT console lock (it is mid-print of
+        /// its own line). A panic message must not be droppable — that exact
+        /// race produced a screen frozen mid-line with the real panic visible
+        /// only on serial. Spin (bounded) for the lock instead: a live holder
+        /// releases within microseconds; the bound keeps a wedged holder from
+        /// turning the panic handler itself into a hang.
+        pub(crate) fn vt_write_fmt_spin_impl(vt: usize, fmt: Arguments) {
+            if let Some(cons) = vt_mutex(vt) {
+                for _ in 0..50_000_000u64 {
+                    if let Some(mut g) = cons.try_lock() {
+                        let _ = g.write_fmt(fmt);
+                        g.present();
+                        return;
+                    }
+                    core::hint::spin_loop();
+                }
+            }
+        }
+
         pub(crate) fn vt_write_fmt_impl(vt: usize, fmt: Arguments) {
             let active = vt == ACTIVE_VT.load(Ordering::SeqCst);
             if active {
@@ -456,6 +476,15 @@ pub fn graphic_console_write_str(s: &str) {
 pub fn graphic_console_write_fmt(fmt: Arguments) {
     #[cfg(feature = "graphic")]
     vt_write_fmt_impl(active_vt(), fmt);
+}
+
+/// Panic-path graphic write: bounded-spins for the VT console lock instead of
+/// silently dropping the message when another CPU is mid-print (see
+/// `vt_write_fmt_spin_impl`). Use ONLY from the panic handler.
+#[allow(unused_variables)]
+pub fn graphic_console_write_fmt_spin(fmt: Arguments) {
+    #[cfg(feature = "graphic")]
+    vt_write_fmt_spin_impl(active_vt(), fmt);
 }
 
 /// Writes a string slice into the serial, and the graphic console if it exists.

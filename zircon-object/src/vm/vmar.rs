@@ -688,11 +688,13 @@ impl VmAddressRegion {
         let mut new_mappings = Vec::with_capacity(src_mappings.len());
         let n_maps = src_mappings.len();
         for (i, map) in src_mappings.into_iter().enumerate() {
-            // Progress heartbeat every 16 mappings + the kind: with diagnostic
-            // present-over-graphics on, this pins WHICH mapping (and its VMO
-            // kind) a fork hang wedges on -- a hard hang leaves the last printed
-            // line frozen on screen.
-            if big && i % 16 == 0 {
+            // Per-mapping trace: with diagnostic present-over-graphics on, the
+            // LAST line frozen on screen names the exact mapping (and VMO kind)
+            // a fork hang wedges on. Every mapping is printed -- a stride would
+            // leave the culprit unnamed -- and any mapping that takes over
+            // 100ms gets its elapsed time logged, separating "wedged" from
+            // "grinding through the polled disk".
+            if big {
                 error!(
                     "[fork] mapping {}/{} kind={} addr={:#x} size={:#x}",
                     i,
@@ -702,8 +704,20 @@ impl VmAddressRegion {
                     map.size()
                 );
             }
+            let t0 = kernel_hal::timer::timer_now();
             let mapping = map.clone_map(self.page_table.clone())?;
             mapping.map()?;
+            if big {
+                let dt = kernel_hal::timer::timer_now().saturating_sub(t0);
+                if dt.as_millis() > 100 {
+                    error!(
+                        "[fork] mapping {}/{} took {} ms",
+                        i,
+                        n_maps,
+                        dt.as_millis()
+                    );
+                }
+            }
             new_mappings.push(mapping);
         }
         if big {
@@ -1217,7 +1231,14 @@ impl VmMapping {
                     // Eager full copy fallback (slices, contiguous, clone trees,
                     // pinned or non-Origin vmos). `read` commits / fills from the
                     // backing source as needed; `write` commits the fresh child
-                    // frames.
+                    // frames. This path reads the ENTIRE vmo page-by-page --
+                    // announce it, because for a demand-paged vmo those reads hit
+                    // the (polled) disk under the VMO family lock and are the
+                    // prime suspect whenever a fork stalls on one mapping.
+                    error!(
+                        "[fork] eager FALLBACK copy: vmo len={:#x} (fork_copy unsupported)",
+                        self.vmo.len()
+                    );
                     let len = self.vmo.len();
                     let new_vmo = VmObject::new_paged(len / PAGE_SIZE);
                     let mut buf = vec![0u8; PAGE_SIZE];
