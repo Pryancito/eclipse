@@ -14,13 +14,6 @@ use zircon_object::vm::{pages, VmObject};
 
 use super::drm;
 
-/// One-shot guards so the first SETCRTC / PAGE_FLIP log at warn! (visible at
-/// the default log level) without spamming every frame.
-static SETCRTC_LOGGED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-static PAGEFLIP_LOGGED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
 /// DRM Device INode
 pub struct DrmDev {
     inode_id: usize,
@@ -611,10 +604,7 @@ impl INode for DrmDev {
                     cap.capability,
                     cap.value
                 );
-                // Bring-up diagnostics: GET_CAP is silent between VERSION and
-                // GETRESOURCES, the window where wlroots probes the device and
-                // inits its renderer — log it so a hang there is visible.
-                log::error!("[drm] GET_CAP cap={:#x} -> {}", cap.capability, cap.value);
+                log::debug!("[drm] GET_CAP cap={:#x} -> {}", cap.capability, cap.value);
                 Ok(0)
             }
             // A single DRM client on the primary node is implicitly master;
@@ -684,10 +674,7 @@ impl INode for DrmDev {
                     || size64 == 0
                     || size64 > MAX_DUMB_SIZE
                 {
-                    // error!-level: this rejection was invisible at LOG=error
-                    // and produced an unexplained EINVAL during the labwc
-                    // bring-up — the dims here say WHY it was rejected.
-                    log::error!(
+                    log::warn!(
                         "[drm] CREATE_DUMB {}x{} bpp={} -> rejected (pitch={} size={} out of range)",
                         info.width, info.height, bpp, pitch64, size64
                     );
@@ -700,10 +687,7 @@ impl INode for DrmDev {
                     info.handle = handle.id;
                     info.pitch = pitch;
                     info.size = size as u64;
-                    // error!-level while diagnosing the black screen: shows the
-                    // handle so it can be correlated with the PRIME export that
-                    // follows it in the console log.
-                    log::error!(
+                    log::debug!(
                         "[drm] CREATE_DUMB {}x{} bpp={} -> handle={} pitch={} size={}",
                         info.width,
                         info.height,
@@ -766,14 +750,6 @@ impl INode for DrmDev {
             DRM_IOCTL_MODE_SETCRTC => {
                 // struct drm_mode_crtc has the same layout as DrmModeGetCrtc.
                 let req = unsafe { &mut *(data as *mut DrmModeGetCrtc) };
-                // One-shot at warn! so a console photo shows whether labwc ever
-                // drives a modeset (and with which fb) without needing LOG=debug.
-                if !SETCRTC_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
-                    log::warn!(
-                        "[drm] SETCRTC crtc={} fb={} ({}x{}+{})",
-                        req.crtc_id, req.fb_id, req.x, req.y, req.mode_valid
-                    );
-                }
                 if req.fb_id != 0 {
                     if !drm::present_now(req.fb_id, req.crtc_id) {
                         return Err(FsError::DeviceError);
@@ -783,12 +759,6 @@ impl INode for DrmDev {
             }
             DRM_IOCTL_MODE_PAGE_FLIP => {
                 let flip = unsafe { *(data as *const DrmModeCrtcPageFlip) };
-                if !PAGEFLIP_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
-                    log::warn!(
-                        "[drm] PAGE_FLIP fb={} crtc={} (first flip)",
-                        flip.fb_id, flip.crtc_id
-                    );
-                }
                 if drm::page_flip(flip.fb_id, flip.crtc_id, flip.user_data) {
                     Ok(0)
                 } else {
