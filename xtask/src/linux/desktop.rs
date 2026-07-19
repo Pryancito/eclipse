@@ -310,7 +310,7 @@ fn write_labwc_autostart(rootfs: &Path) {
           \x20 # child directly has been seen wedged in wait() on this kernel\n\
           \x20 # after the child died (its exit-rc line never appeared), which\n\
           \x20 # swallowed the retry. pidof needs neither wait() nor exit\n\
-          \x20 # codes: it observes the fact we care about — a living panel.\n\
+          \x20 # codes: it observes the fact we care about - a living panel.\n\
           \x20 ( n=1\n\
           \x20   while [ \"$n\" -le 5 ]; do\n\
           \x20     sleep 2\n\
