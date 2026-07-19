@@ -1503,10 +1503,7 @@ fn format_uefi_edid() -> String {
         s.push_str("[gpuedid] === UEFI active-panel EDID: none captured by firmware ===\n");
         return s;
     };
-    let valid = len >= 128
-        && e[0] == 0x00
-        && e[7] == 0x00
-        && e[1..=6].iter().all(|&b| b == 0xFF);
+    let valid = len >= 128 && e[0] == 0x00 && e[7] == 0x00 && e[1..=6].iter().all(|&b| b == 0xFF);
     if !valid {
         let _ = writeln!(
             s,
@@ -1528,10 +1525,8 @@ fn format_uefi_edid() -> String {
     let l2 = (b'A' - 1 + ((m >> 5) & 0x1f) as u8) as char;
     let l3 = (b'A' - 1 + (m & 0x1f) as u8) as char;
     let product = ((e[11] as u16) << 8) | e[10] as u16;
-    let serial = (e[12] as u32)
-        | ((e[13] as u32) << 8)
-        | ((e[14] as u32) << 16)
-        | ((e[15] as u32) << 24);
+    let serial =
+        (e[12] as u32) | ((e[13] as u32) << 8) | ((e[14] as u32) << 16) | ((e[15] as u32) << 24);
     let year = 1990u32 + e[17] as u32;
     let (cm_w, cm_h) = (e[21] as u32, e[22] as u32);
     let _ = writeln!(

@@ -603,11 +603,7 @@ impl VmAddressRegion {
             if !self.contains(vaddr) {
                 return Err(ZxError::NOT_FOUND);
             }
-            let child = inner
-                .children
-                .iter()
-                .find(|ch| ch.contains(vaddr))
-                .cloned();
+            let child = inner.children.iter().find(|ch| ch.contains(vaddr)).cloned();
             let mapping = inner
                 .mappings
                 .iter()

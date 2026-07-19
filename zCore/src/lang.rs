@@ -87,7 +87,9 @@ pub fn deadlock_report(file: &'static str, line: u32) {
         let l = DL_FILE_LEN[i].load(Ordering::SeqCst);
         let lc = DL_LINE_CPU[i].load(Ordering::SeqCst);
         // SAFETY: (p, l) were stored from a live &'static str.
-        let f = unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(p as *const u8, l)) };
+        let f = unsafe {
+            core::str::from_utf8_unchecked(core::slice::from_raw_parts(p as *const u8, l))
+        };
         let _ = write!(b, "\ncpu={} at {}:{}", lc >> 32, f, lc & 0xffff_ffff);
     }
     let valid = match core::str::from_utf8(&b.buf[..b.len]) {

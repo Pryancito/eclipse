@@ -547,8 +547,7 @@ impl Syscall<'_> {
                         }
                     };
                     let dmabuf = target.downcast_ref::<DmaBuf>().ok_or(LxError::EINVAL)?;
-                    let handle_id =
-                        drm::import_dmabuf(dmabuf.phys_addr, dmabuf.size, dmabuf.vmo());
+                    let handle_id = drm::import_dmabuf(dmabuf.phys_addr, dmabuf.size, dmabuf.vmo());
                     h.handle = handle_id;
                     ptr.write(h)?;
                     Ok(Some(0))

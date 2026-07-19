@@ -205,7 +205,8 @@ impl TaskCollection {
         affinity: Option<Arc<AtomicU64>>,
     ) -> Key {
         debug_assert!(priority == DEFAULT_PRIORITY);
-        let key = crate::diag::diag_lock(&self.future_collections[priority]).insert(future, affinity);
+        let key =
+            crate::diag::diag_lock(&self.future_collections[priority]).insert(future, affinity);
         debug_assert!(key < TASK_NUM_PER_PRIORITY);
         self.task_num.fetch_add(1, Ordering::Relaxed);
         key | (priority << PRIORITY_SHIFT)
