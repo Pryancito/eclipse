@@ -14,7 +14,7 @@ arranque sin pasos manuales.
 
 | Pieza | Archivo generado | Qué hace |
 |---|---|---|
-| **lunarbg** | `/bin/lunarbg` | Cliente de fondo nativo de Eclipse OS (`tools/lunarbg`, Rust estático). Dibuja la escena nocturna **proceduralmente a la resolución nativa** de cada salida vía wlr-layer-shell + wl_shm: sin archivos de imagen ni gdk-pixbuf. Incluye la rejilla azul y el tamaño de logo del compositor smithay original de eclipse-old. Modo debug: `LUNARBG_DUMP=/tmp/out.raw:1920x1080 lunarbg`. |
+| **lunarbg** | `/bin/lunarbg` | Cliente de fondo **animado** de Eclipse OS (`tools/lunarbg`, Rust estático). Recrea el fondo del compositor smithay original de eclipse-old: media luna dorada central, anillo de texto «ECLIPSE-SYSTEM-KERNEL…» orbitando, tres arcos tech girando a velocidades distintas, anillos pulsantes y ticks técnicos, sobre base cósmica con estrellas y rejilla de 48 px. Dibuja proceduralmente a resolución nativa vía wlr-layer-shell + wl_shm (sin imágenes ni gdk-pixbuf) y solo redibuja/daña la región del logo por frame. `LUNARBG_STATIC=1` desactiva la animación; debug: `LUNARBG_DUMP=/tmp/out.raw:1920x1080` (+`LUNARBG_DUMP_MS=N`). |
 | Wallpaper (respaldo) | `/usr/share/backgrounds/eclipse/eclipse-night.png` | La misma escena, renderizada en build a PNG (encoder propio, sin dependencias). Solo se usa si lunarbg no está y toca recurrir a swaybg. |
 | Tema de ventanas | `/usr/share/themes/Eclipse-Dark/openbox-3/themerc` | Tema openbox-3 oscuro que labwc aplica a bordes de ventana, menús y OSD. |
 | Config labwc | `/root/.config/labwc/rc.xml` | Tema `Eclipse-Dark`, esquinas redondeadas, 4 escritorios y atajos de teclado. |

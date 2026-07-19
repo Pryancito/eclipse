@@ -1,259 +1,428 @@
-//! The Eclipse OS night scene, rendered procedurally at the output's native
-//! resolution — no image files, no decoders.
+//! The Eclipse OS animated cosmic background, ported from the original
+//! smithay compositor (eclipse-old: `sidewind/src/ui.rs`).
 //!
-//! Composition (back to front):
-//! - vertical night gradient (deep navy -> violet) with a warm horizon glow;
-//! - deterministic starfield (kept clear of the logo);
-//! - subtle blueprint grid, 48 px spacing, rgb(18,28,55) — carried over from
-//!   the original Eclipse OS smithay compositor's cosmic background;
-//! - crescent moon;
-//! - two mountain silhouette layers;
-//! - the Eclipse disc (halo, rim, three white stripes), radius scaled to the
-//!   output using the original compositor's formula
-//!   `clamp(min(w,h)/2 - 120, 120, 280)`;
-//! - "Eclipse OS" wordmark in a 5x7 pixel font.
+//! Static base (rendered once per size):
+//! - vertical cosmic gradient, COSMIC_DEEP -> COSMIC_MID, with a soft cyan
+//!   nebula glow behind the logo;
+//! - deterministic starfield scaled to the output area;
+//! - the 48 px blueprint grid, rgb(18,28,55).
 //!
-//! Output is little-endian XRGB8888 (B, G, R, X per pixel), ready for wl_shm.
+//! Animated logo (redrawn every frame inside [`Layout::region`]):
+//! - the eclipse crescent: a golden sun disc masked by an offset moon circle
+//!   (mask offset `(r/4, -r/5)`, moon radius `9r/10` — the mask shows the
+//!   cosmic background through it);
+//! - the orbiting text ring "ECLIPSE-SYSTEM-KERNEL-…" (upright characters
+//!   with a dark outline, as in the original);
+//! - three tech arcs rotating at different speeds and directions;
+//! - five pulsing concentric rings;
+//! - technical ticks every 5° (major every 30°) with shimmering brightness;
+//! - the "ECLIPSE OS" wordmark under the crescent.
+//!
+//! All radii come from the original design (crescent 140, text ring 165,
+//! arcs 145/180/195, ticks 230..255, rings 240..280 — on a 280 px logo) and
+//! scale with the output via the original sizing rule
+//! `clamp(min(w,h)/2 - 120, 120, 280)`.
 
-/// Render the scene and return one XRGB8888 row-major buffer.
-pub fn render_xrgb(w: usize, h: usize) -> Vec<u8> {
+// ---------------------------------------------------------------- palette
+
+const COSMIC_DEEP: Rgb = (2.0 / 255.0, 2.0 / 255.0, 8.0 / 255.0);
+const COSMIC_MID: Rgb = (8.0 / 255.0, 15.0 / 255.0, 35.0 / 255.0);
+const NEBULA_CYAN: Rgb = (0.0, 70.0 / 255.0, 110.0 / 255.0);
+const GRID_BLUE: Rgb = (18.0 / 255.0, 28.0 / 255.0, 55.0 / 255.0);
+const ACCENT_CYAN: Rgb = (0.0, 229.0 / 255.0, 1.0);
+const ACCENT_VIOLET: Rgb = (180.0 / 255.0, 140.0 / 255.0, 1.0);
+const GLOW_HI: Rgb = ACCENT_CYAN;
+const GLOW_MID: Rgb = (0.0, 128.0 / 255.0, 160.0 / 255.0);
+const GLOW_DIM: Rgb = (0.0, 64.0 / 255.0, 80.0 / 255.0);
+const SUN_FILL: Rgb = (1.0, 220.0 / 255.0, 80.0 / 255.0);
+const SUN_EDGE: Rgb = (1.0, 200.0 / 255.0, 50.0 / 255.0);
+
+const TEXT_RING: &str = "ECLIPSE-SYSTEM-KERNEL-6.X-STABLE-LINK-ACTIVE-";
+
+type Rgb = (f32, f32, f32);
+
+// ---------------------------------------------------------------- layout
+
+/// Placement of the animated logo on an output.
+pub struct Layout {
+    pub cx: f32,
+    pub cy: f32,
+    /// Scale relative to the original 280 px design.
+    pub s: f32,
+    /// (x, y, w, h) of the square that the animation redraws each frame.
+    pub region: (usize, usize, usize, usize),
+}
+
+pub fn layout(w: usize, h: usize) -> Layout {
+    let logo_r = ((w.min(h) as f32 / 2.0) - 120.0).clamp(120.0, 280.0);
+    let s = logo_r / 280.0;
+    let cx = w as f32 * 0.5;
+    let cy = h as f32 * 0.46;
+    // Outermost animated element: ring 280 + 5 px oscillation, plus the
+    // wordmark below at 170 + text height. Take a comfortable margin.
+    let reach = (300.0 * s).max(215.0 * s + 40.0) + 8.0;
+    let x0 = ((cx - reach).floor().max(0.0)) as usize;
+    let y0 = ((cy - reach).floor().max(0.0)) as usize;
+    let x1 = ((cx + reach).ceil() as usize).min(w);
+    let y1 = ((cy + reach).ceil() as usize).min(h);
+    Layout {
+        cx,
+        cy,
+        s,
+        region: (x0, y0, x1 - x0, y1 - y0),
+    }
+}
+
+// ---------------------------------------------------------------- base
+
+/// Render the static cosmic base as XRGB8888.
+pub fn render_base(w: usize, h: usize) -> Vec<u8> {
+    let lay = layout(w, h);
     let mut buf = vec![0f32; w * h * 3];
 
-    let fw = w as f32;
+    // Cosmic vertical gradient + nebula glow behind the logo.
     let fh = h as f32;
-    let cx = fw * 0.5;
-    let cy = fh * 0.43;
-    // Logo radius: the original smithay compositor's sizing rule.
-    let radius = ((fw.min(fh) / 2.0) - 120.0).clamp(120.0, 280.0);
-
-    // --- sky gradient + horizon glow ---
     for y in 0..h {
         let t = y as f32 / fh;
-        let (r, g, b) = sky_color(t);
-        let glow = (-((y as f32 - fh * 0.78) / (fh * 0.10)).powi(2)).exp() * 0.30;
+        let (r, g, b) = lerp3(COSMIC_DEEP, COSMIC_MID, t);
         for x in 0..w {
             let i = (y * w + x) * 3;
-            buf[i] = r + glow * 0.75;
-            buf[i + 1] = g + glow * 0.35;
-            buf[i + 2] = b + glow * 0.60;
+            buf[i] = r;
+            buf[i + 1] = g;
+            buf[i + 2] = b;
+        }
+    }
+    // Soft radial nebula centred on the logo.
+    let neb_r = 420.0 * lay.s + 120.0;
+    let (nx0, nx1) = span(lay.cx, neb_r, w);
+    let (ny0, ny1) = span(lay.cy, neb_r, h);
+    for y in ny0..ny1 {
+        for x in nx0..nx1 {
+            let d = dist(x as f32, y as f32, lay.cx, lay.cy);
+            if d < neb_r {
+                let t = 1.0 - d / neb_r;
+                let a = t * t * 0.22;
+                let i = (y * w + x) * 3;
+                buf[i] += NEBULA_CYAN.0 * a;
+                buf[i + 1] += NEBULA_CYAN.1 * a;
+                buf[i + 2] += NEBULA_CYAN.2 * a;
+            }
         }
     }
 
-    draw_stars(&mut buf, w, h, cx, cy, radius);
-    draw_grid(&mut buf, w, h);
-    draw_crescent_moon(&mut buf, w, h, fw * 0.83, fh * 0.16, fh * 0.05);
-    draw_mountains(&mut buf, w, h);
-    draw_logo(&mut buf, w, h, cx, cy, radius);
-    draw_wordmark(&mut buf, w, h, cx, cy + radius + fh * 0.075);
+    // Starfield, scaled to area.
+    let count = ((w * h) as f32 / 6000.0) as u32;
+    for i in 0..count {
+        let x = (hash2(i, 1) % w as u32) as i32;
+        let y = (hash2(i, 2) % h as u32) as i32;
+        let bright = 0.25 + (hash2(i, 3) % 1000) as f32 / 1000.0 * 0.75;
+        add_px_f(&mut buf, w, h, x, y, (bright, bright, bright * 0.95));
+        if bright > 0.85 {
+            let half = bright * 0.35;
+            for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                add_px_f(&mut buf, w, h, x + dx, y + dy, (half, half, half));
+            }
+        }
+    }
 
-    // Quantise with a hair of deterministic noise so the smooth gradients do
-    // not band at 8 bits, packing straight into XRGB8888.
+    // Blueprint grid, 48 px.
+    const SPACING: usize = 48;
+    for y in (0..h).step_by(SPACING) {
+        for x in 0..w {
+            blend_px_f(&mut buf, w, x, y, GRID_BLUE, 0.38);
+        }
+    }
+    for x in (0..w).step_by(SPACING) {
+        for y in 0..h {
+            if y % SPACING != 0 {
+                blend_px_f(&mut buf, w, x, y, GRID_BLUE, 0.38);
+            }
+        }
+    }
+
+    // Quantise to XRGB8888 with light dithering noise.
     let mut out = vec![0u8; w * h * 4];
     for px in 0..w * h {
         let i = px * 3;
         let o = px * 4;
         let n = (hash2(i as u32, 0x9e37_79b9) as f32 / u32::MAX as f32 - 0.5) * 1.5;
         let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + n).round().clamp(0.0, 255.0) as u8;
-        out[o] = q(buf[i + 2]); // B
-        out[o + 1] = q(buf[i + 1]); // G
-        out[o + 2] = q(buf[i]); // R
-        out[o + 3] = 0xff; // X
+        out[o] = q(buf[i + 2]);
+        out[o + 1] = q(buf[i + 1]);
+        out[o + 2] = q(buf[i]);
+        out[o + 3] = 0xff;
     }
     out
 }
 
-fn sky_color(t: f32) -> (f32, f32, f32) {
-    let a = (0.051, 0.043, 0.118); // #0d0b1e
-    let b = (0.102, 0.078, 0.251); // #1a1440
-    let c = (0.239, 0.165, 0.388); // #3d2a63
-    if t < 0.55 {
-        lerp3(a, b, t / 0.55)
-    } else {
-        lerp3(b, c, (t - 0.55) / 0.45)
-    }
-}
+// ---------------------------------------------------------------- frame
 
-fn lerp3(a: (f32, f32, f32), b: (f32, f32, f32), t: f32) -> (f32, f32, f32) {
-    let t = t.clamp(0.0, 1.0);
-    (
-        a.0 + (b.0 - a.0) * t,
-        a.1 + (b.1 - a.1) * t,
-        a.2 + (b.2 - a.2) * t,
-    )
-}
-
-/// Blueprint grid from the original Eclipse compositor: 48 px spacing,
-/// rgb(18,28,55), blended gently so it reads as texture, not lines.
-fn draw_grid(buf: &mut [f32], w: usize, h: usize) {
-    const SPACING: usize = 48;
-    const COLOR: (f32, f32, f32) = (18.0 / 255.0, 28.0 / 255.0, 55.0 / 255.0);
-    const ALPHA: f32 = 0.38;
-    for y in (0..h).step_by(SPACING) {
-        for x in 0..w {
-            blend_px(buf, w, x, y, COLOR, ALPHA);
-        }
+/// Draw one animation frame: restore the logo region from `base`, then paint
+/// the animated logo. `t_ms` is a monotonic millisecond clock; the original
+/// compositor advanced `counter` once per ~60 Hz frame, so `counter =
+/// t_ms * 0.06` reproduces its speeds.
+pub fn render_frame(frame: &mut [u8], w: usize, base: &[u8], lay: &Layout, t_ms: u32) {
+    let (rx, ry, rw, rh) = lay.region;
+    for row in 0..rh {
+        let off = ((ry + row) * w + rx) * 4;
+        frame[off..off + rw * 4].copy_from_slice(&base[off..off + rw * 4]);
     }
-    for x in (0..w).step_by(SPACING) {
-        for y in 0..h {
-            if y % SPACING != 0 {
-                blend_px(buf, w, x, y, COLOR, ALPHA);
-            }
-        }
-    }
-}
 
-fn draw_stars(buf: &mut [f32], w: usize, h: usize, cx: f32, cy: f32, radius: f32) {
-    // Star count scales with area so 4K doesn't look sparse.
-    let count = ((w * h) as f32 / 6000.0) as u32;
-    for i in 0..count {
-        let x = (hash2(i, 1) % w as u32) as f32;
-        let y = (hash2(i, 2) % (h as u32 * 6 / 10)) as f32;
-        let d = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
-        if d < radius + 70.0 {
-            continue;
-        }
-        let bright = 0.25 + (hash2(i, 3) % 1000) as f32 / 1000.0 * 0.75;
-        add_px(buf, w, h, x as i32, y as i32, (bright, bright, bright * 0.95));
-        if bright > 0.85 {
-            let half = bright * 0.35;
-            for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-                add_px(buf, w, h, x as i32 + dx, y as i32 + dy, (half, half, half));
-            }
-        }
-    }
-}
+    let mut pb = PixBuf {
+        data: frame,
+        w,
+        clip: (rx, ry, rx + rw, ry + rh),
+    };
+    let counter = t_ms as f32 * 0.06;
+    let (cx, cy, s) = (lay.cx, lay.cy, lay.s);
 
-fn draw_crescent_moon(buf: &mut [f32], w: usize, h: usize, mx: f32, my: f32, r: f32) {
-    let bite_x = mx + r * 0.45;
-    let bite_y = my - r * 0.18;
-    let (x0, x1) = span(mx, r + 2.0, w);
-    let (y0, y1) = span(my, r + 2.0, h);
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let d = dist(x as f32, y as f32, mx, my);
-            let db = dist(x as f32, y as f32, bite_x, bite_y);
-            let cover = coverage(r, d) * (1.0 - coverage(r * 0.92, db));
-            if cover > 0.0 {
-                blend_px(buf, w, x, y, (0.85, 0.83, 0.94), cover * 0.9);
-            }
-        }
+    // --- five pulsing concentric rings (backmost) ---
+    for (i, base_r) in [280.0f32, 275.0, 260.0, 255.0, 240.0].iter().enumerate() {
+        let osc = (counter * (0.01 + i as f32 * 0.005)).sin() * 5.0;
+        let r = (base_r + osc) * s;
+        let color = if i % 2 == 0 { GLOW_DIM } else { ACCENT_VIOLET };
+        let alpha = if i % 2 == 0 { 0.55 } else { 0.18 };
+        pb.ring(cx, cy, r, 1.4, color, alpha);
     }
-}
 
-fn draw_mountains(buf: &mut [f32], w: usize, h: usize) {
-    let fh = h as f32;
-    let layers: [(f32, [f32; 6], (f32, f32, f32)); 2] = [
-        (
-            fh * 0.780,
-            [0.0040, 1.7, 0.011, 0.4, 0.027, 2.2],
-            (0.133, 0.102, 0.220), // #221a38
-        ),
-        (
-            fh * 0.845,
-            [0.0060, 4.1, 0.015, 1.1, 0.033, 0.0],
-            (0.090, 0.067, 0.161), // #171129
-        ),
-    ];
-    for (base, p, color) in layers {
-        for x in 0..w {
-            let fx = x as f32;
-            let ridge = base
-                + (fx * p[0] + p[1]).sin() * fh * 0.055
-                + (fx * p[2] + p[3]).sin() * fh * 0.028
-                + (fx * p[4] + p[5]).sin() * fh * 0.012;
-            let start = ridge.max(0.0) as usize;
-            for y in start..h {
-                let cover = if y == start {
-                    1.0 - (ridge - ridge.floor())
-                } else {
-                    1.0
-                };
-                blend_px(buf, w, x, y, color, cover);
-            }
-        }
+    // --- technical ticks every 5°, major every 30°, slow shimmer+drift ---
+    let tick_phase = counter * 0.05; // degrees
+    for angle in (0..360).step_by(5) {
+        let is_major = angle % 30 == 0;
+        let a = (angle as f32 + tick_phase).to_radians();
+        let (r0, r1) = if is_major {
+            (230.0 * s, 255.0 * s)
+        } else {
+            (235.0 * s, 250.0 * s)
+        };
+        let shimmer = (a * 2.0 + counter * 0.02).sin().abs();
+        let (color, alpha) = if is_major {
+            (ACCENT_CYAN, 0.25 + 0.45 * shimmer)
+        } else {
+            (GLOW_MID, 0.15 + 0.25 * shimmer)
+        };
+        let (sin, cos) = a.sin_cos();
+        pb.line(
+            cx + cos * r0,
+            cy + sin * r0,
+            cx + cos * r1,
+            cy + sin * r1,
+            1.2,
+            color,
+            alpha,
+        );
     }
-}
 
-fn draw_logo(buf: &mut [f32], w: usize, h: usize, cx: f32, cy: f32, r: f32) {
-    let halo = r * 0.55;
-    let (x0, x1) = span(cx, r + halo, w);
-    let (y0, y1) = span(cy, r + halo, h);
-    for y in y0..y1 {
-        for x in x0..x1 {
+    // --- three tech arcs at different speeds/directions ---
+    let arc_rot = counter * 0.5; // degrees
+    pb.arc(cx, cy, 180.0 * s, -arc_rot * 1.5, 60.0, 2.0, GLOW_HI, 0.9);
+    pb.arc(cx, cy, 195.0 * s, arc_rot * 0.8 + 180.0, 30.0, 2.0, ACCENT_VIOLET, 0.9);
+    pb.arc(cx, cy, 145.0 * s, arc_rot * 1.2, 45.0, 2.0, ACCENT_CYAN, 0.9);
+
+    // --- orbiting text ring (upright chars, dark outline) ---
+    let chars: Vec<char> = TEXT_RING.chars().collect();
+    let n = chars.len() as f32;
+    let rot_phase = counter * 0.12; // degrees
+    let text_r = 165.0 * s;
+    let scale = ((2.0 * s).round() as usize).max(1);
+    for (i, ch) in chars.iter().enumerate() {
+        let a = ((i as f32 * 360.0 / n) + rot_phase).to_radians();
+        let (sin, cos) = a.sin_cos();
+        let gx = cx + cos * text_r;
+        let gy = cy + sin * text_r;
+        pb.glyph_outlined(*ch, gx, gy, scale, GLOW_HI, 0.85, COSMIC_DEEP);
+    }
+
+    // --- the eclipse crescent core ---
+    let sun_r = 140.0 * s;
+    let moon_r = sun_r * 9.0 / 10.0;
+    let (mx, my) = (cx + sun_r / 4.0, cy - sun_r / 5.0);
+    let (sx0, sx1) = pb.clip_span_x(cx, sun_r + 2.0);
+    let (sy0, sy1) = pb.clip_span_y(cy, sun_r + 2.0);
+    for y in sy0..sy1 {
+        for x in sx0..sx1 {
             let d = dist(x as f32, y as f32, cx, cy);
-            if d > r && d < r + halo {
-                let t = 1.0 - (d - r) / halo;
-                let a = t * t * 0.45;
-                add_px(
-                    buf,
-                    w,
-                    h,
-                    x as i32,
-                    y as i32,
-                    (0.55 * a, 0.47 * a, 0.86 * a),
-                );
+            let cover = (sun_r - d + 0.5).clamp(0.0, 1.0);
+            if cover <= 0.0 {
+                continue;
             }
+            // Moon mask: transparent, the cosmic base shows through.
+            let dm = dist(x as f32, y as f32, mx, my);
+            let mask = (moon_r - dm + 0.5).clamp(0.0, 1.0);
+            let a = cover * (1.0 - mask);
+            if a <= 0.0 {
+                continue;
+            }
+            // Edge tint on the outer 6 px of the sun.
+            let edge = ((sun_r - d) / 6.0).clamp(0.0, 1.0);
+            let color = lerp3(SUN_EDGE, SUN_FILL, edge);
+            pb.blend(x, y, color, a);
         }
     }
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let d = dist(x as f32, y as f32, cx, cy);
-            let cover = coverage(r, d);
-            if cover > 0.0 {
-                let shade = 0.5 + (y as f32 - cy) / (2.0 * r);
-                let base = lerp3((0.110, 0.086, 0.208), (0.055, 0.043, 0.118), shade);
-                blend_px(buf, w, x, y, base, cover);
-            }
-            let rim = (1.0 - ((d - r).abs() / 3.0)).clamp(0.0, 1.0);
-            if rim > 0.0 {
-                blend_px(buf, w, x, y, (0.66, 0.60, 0.91), rim * 0.9);
-            }
-        }
-    }
-    for (off_frac, bar_frac) in [(-0.36f32, 0.085f32), (-0.02, 0.085), (0.32, 0.085)] {
-        let yb = cy + r * off_frac;
-        let bar_r = r * bar_frac;
-        let dy = yb - cy;
-        let chord = (r * r - dy * dy).max(0.0).sqrt();
-        let half = chord - r * 0.16;
-        if half <= 0.0 {
-            continue;
-        }
-        let (bx0, bx1) = span(cx, half + bar_r + 2.0, w);
-        let (by0, by1) = span(yb, bar_r + 2.0, h);
-        for y in by0..by1 {
-            for x in bx0..bx1 {
-                let d = capsule_dist(x as f32, y as f32, cx - half, yb, cx + half, yb);
-                let cover = coverage(bar_r, d);
-                if cover > 0.0 {
-                    blend_px(buf, w, x, y, (0.95, 0.94, 0.98), cover);
-                }
-            }
-        }
+
+    // --- "ECLIPSE OS" wordmark under the crescent ---
+    let scale = ((3.0 * s).round() as usize).max(2);
+    let text = "ECLIPSE OS";
+    let advance = (6 * scale) as f32;
+    let total = text.len() as f32 * advance - scale as f32;
+    // Below the text ring (165) so the wordmark never collides with the
+    // orbiting characters. The original drew it at +170, overlapping.
+    let ty = cy + 215.0 * s;
+    for (i, ch) in text.chars().enumerate() {
+        let gx = cx - total / 2.0 + i as f32 * advance + advance / 2.0;
+        pb.glyph_outlined(ch, gx, ty, scale, (0.90, 0.96, 1.0), 0.95, COSMIC_DEEP);
     }
 }
 
-fn draw_wordmark(buf: &mut [f32], w: usize, h: usize, cx: f32, cy: f32) {
-    let text = "Eclipse OS";
-    let scale = (h as f32 * 0.008).round().max(3.0) as usize;
-    let advance = (6 * scale) as i32;
-    let total = text.len() as i32 * advance - scale as i32;
-    let left = cx as i32 - total / 2;
-    let top = cy as i32;
-    for (ci, ch) in text.chars().enumerate() {
-        let glyph = glyph5x7(ch);
-        let gx = left + ci as i32 * advance;
-        for (row, bits) in glyph.iter().enumerate() {
-            for col in 0..5 {
-                if bits & (0b10000 >> col) == 0 {
+// ------------------------------------------------------------- draw utils
+
+struct PixBuf<'a> {
+    data: &'a mut [u8],
+    w: usize,
+    /// (x0, y0, x1, y1) — drawing outside is discarded.
+    clip: (usize, usize, usize, usize),
+}
+
+impl PixBuf<'_> {
+    fn blend(&mut self, x: usize, y: usize, c: Rgb, a: f32) {
+        if x < self.clip.0 || y < self.clip.1 || x >= self.clip.2 || y >= self.clip.3 {
+            return;
+        }
+        let i = (y * self.w + x) * 4;
+        let a = a.clamp(0.0, 1.0);
+        let mix = |old: u8, new: f32| -> u8 {
+            (old as f32 * (1.0 - a) + new * 255.0 * a)
+                .round()
+                .clamp(0.0, 255.0) as u8
+        };
+        self.data[i] = mix(self.data[i], c.2);
+        self.data[i + 1] = mix(self.data[i + 1], c.1);
+        self.data[i + 2] = mix(self.data[i + 2], c.0);
+    }
+
+    fn clip_span_x(&self, c: f32, r: f32) -> (usize, usize) {
+        let lo = (c - r).floor().max(self.clip.0 as f32) as usize;
+        let hi = (((c + r).ceil() as usize) + 1).min(self.clip.2);
+        (lo, hi)
+    }
+
+    fn clip_span_y(&self, c: f32, r: f32) -> (usize, usize) {
+        let lo = (c - r).floor().max(self.clip.1 as f32) as usize;
+        let hi = (((c + r).ceil() as usize) + 1).min(self.clip.3);
+        (lo, hi)
+    }
+
+    /// Thin anti-aliased ring.
+    fn ring(&mut self, cx: f32, cy: f32, r: f32, thick: f32, c: Rgb, alpha: f32) {
+        let (x0, x1) = self.clip_span_x(cx, r + thick + 1.0);
+        let (y0, y1) = self.clip_span_y(cy, r + thick + 1.0);
+        let inner = r - thick;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let d = dist(x as f32, y as f32, cx, cy);
+                if d < inner - 1.0 || d > r + thick + 1.0 {
                     continue;
                 }
-                for sy in 0..scale {
-                    for sx in 0..scale {
-                        let x = gx + (col * scale + sx) as i32;
-                        let y = top + (row * scale + sy) as i32;
-                        if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
-                            blend_px(buf, w, x as usize, y as usize, (0.85, 0.82, 0.94), 0.95);
+                let cover = (thick / 2.0 - (d - (r - thick / 2.0)).abs() + 0.5).clamp(0.0, 1.0);
+                if cover > 0.0 {
+                    self.blend(x, y, c, alpha * cover);
+                }
+            }
+        }
+    }
+
+    /// Anti-aliased thick line (capsule).
+    fn line(&mut self, ax: f32, ay: f32, bx: f32, by: f32, thick: f32, c: Rgb, alpha: f32) {
+        let half = thick / 2.0;
+        let x0 = (ax.min(bx) - half - 1.0).floor().max(self.clip.0 as f32) as usize;
+        let x1 = (((ax.max(bx) + half + 1.0).ceil() as usize) + 1).min(self.clip.2);
+        let y0 = (ay.min(by) - half - 1.0).floor().max(self.clip.1 as f32) as usize;
+        let y1 = (((ay.max(by) + half + 1.0).ceil() as usize) + 1).min(self.clip.3);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let d = capsule_dist(x as f32, y as f32, ax, ay, bx, by);
+                let cover = (half - d + 0.5).clamp(0.0, 1.0);
+                if cover > 0.0 {
+                    self.blend(x, y, c, alpha * cover);
+                }
+            }
+        }
+    }
+
+    /// Arc as in the original: the span walked in 20 line segments, with
+    /// glowing endpoint dots.
+    #[allow(clippy::too_many_arguments)]
+    fn arc(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        r: f32,
+        start_deg: f32,
+        span_deg: f32,
+        thick: f32,
+        c: Rgb,
+        alpha: f32,
+    ) {
+        const SEGS: usize = 20;
+        let mut prev: Option<(f32, f32)> = None;
+        for k in 0..=SEGS {
+            let a = (start_deg + span_deg * k as f32 / SEGS as f32).to_radians();
+            let (sin, cos) = a.sin_cos();
+            let p = (cx + cos * r, cy + sin * r);
+            if let Some(q) = prev {
+                self.line(q.0, q.1, p.0, p.1, thick, c, alpha);
+            }
+            prev = Some(p);
+        }
+        for k in [0usize, SEGS] {
+            let a = (start_deg + span_deg * k as f32 / SEGS as f32).to_radians();
+            let (sin, cos) = a.sin_cos();
+            self.dot(cx + cos * r, cy + sin * r, 2.5, c, alpha);
+        }
+    }
+
+    fn dot(&mut self, cx: f32, cy: f32, r: f32, c: Rgb, alpha: f32) {
+        let (x0, x1) = self.clip_span_x(cx, r + 1.0);
+        let (y0, y1) = self.clip_span_y(cy, r + 1.0);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let d = dist(x as f32, y as f32, cx, cy);
+                let cover = (r - d + 0.5).clamp(0.0, 1.0);
+                if cover > 0.0 {
+                    self.blend(x, y, c, alpha * cover);
+                }
+            }
+        }
+    }
+
+    /// A 5x7 glyph centred at (gx, gy), upright, with a 1 px dark outline
+    /// (four offset passes, as the original text ring does).
+    fn glyph_outlined(&mut self, ch: char, gx: f32, gy: f32, scale: usize, c: Rgb, alpha: f32, outline: Rgb) {
+        let gw = (5 * scale) as f32;
+        let gh = (7 * scale) as f32;
+        let left = (gx - gw / 2.0) as i32;
+        let top = (gy - gh / 2.0) as i32;
+        let glyph = glyph5x7(ch);
+        for pass in 0..5 {
+            let (dx, dy, color, a) = match pass {
+                0 => (-1i32, 0i32, outline, alpha * 0.9),
+                1 => (1, 0, outline, alpha * 0.9),
+                2 => (0, -1, outline, alpha * 0.9),
+                3 => (0, 1, outline, alpha * 0.9),
+                _ => (0, 0, c, alpha),
+            };
+            for (row, bits) in glyph.iter().enumerate() {
+                for col in 0..5 {
+                    if bits & (0b10000 >> col) == 0 {
+                        continue;
+                    }
+                    for sy in 0..scale {
+                        for sx in 0..scale {
+                            let x = left + (col * scale + sx) as i32 + dx;
+                            let y = top + (row * scale + sy) as i32 + dy;
+                            if x >= 0 && y >= 0 {
+                                self.blend(x as usize, y as usize, color, a);
+                            }
                         }
                     }
                 }
@@ -264,25 +433,43 @@ fn draw_wordmark(buf: &mut [f32], w: usize, h: usize, cx: f32, cy: f32) {
 
 fn glyph5x7(c: char) -> [u8; 7] {
     match c {
+        'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
+        'C' => [0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111],
         'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
-        'c' => [0b00000, 0b00000, 0b01111, 0b10000, 0b10000, 0b10000, 0b01111],
-        'l' => [0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-        'i' => [0b00100, 0b00000, 0b01100, 0b00100, 0b00100, 0b00100, 0b01110],
-        'p' => [0b00000, 0b00000, 0b11110, 0b10001, 0b10001, 0b11110, 0b10000],
-        's' => [0b00000, 0b00000, 0b01111, 0b10000, 0b01110, 0b00001, 0b11110],
-        'e' => [0b00000, 0b00000, 0b01110, 0b10001, 0b11111, 0b10000, 0b01111],
+        'I' => [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        'K' => [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001],
+        'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
+        'M' => [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
+        'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
         'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
+        'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
         'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
+        'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
+        'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
+        'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
+        'Y' => [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
+        '6' => [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
+        '.' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100],
+        '-' => [0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000],
         _ => [0; 7],
     }
 }
 
-fn dist(x: f32, y: f32, cx: f32, cy: f32) -> f32 {
-    ((x - cx).powi(2) + (y - cy).powi(2)).sqrt()
+// --------------------------------------------------------------- helpers
+
+fn lerp3(a: Rgb, b: Rgb, t: f32) -> Rgb {
+    let t = t.clamp(0.0, 1.0);
+    (
+        a.0 + (b.0 - a.0) * t,
+        a.1 + (b.1 - a.1) * t,
+        a.2 + (b.2 - a.2) * t,
+    )
 }
 
-fn coverage(r: f32, d: f32) -> f32 {
-    (r - d + 0.5).clamp(0.0, 1.0)
+fn dist(x: f32, y: f32, cx: f32, cy: f32) -> f32 {
+    ((x - cx).powi(2) + (y - cy).powi(2)).sqrt()
 }
 
 fn capsule_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
@@ -302,7 +489,7 @@ fn span(c: f32, r: f32, limit: usize) -> (usize, usize) {
     (lo, hi)
 }
 
-fn add_px(buf: &mut [f32], w: usize, h: usize, x: i32, y: i32, c: (f32, f32, f32)) {
+fn add_px_f(buf: &mut [f32], w: usize, h: usize, x: i32, y: i32, c: Rgb) {
     if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
         return;
     }
@@ -312,7 +499,7 @@ fn add_px(buf: &mut [f32], w: usize, h: usize, x: i32, y: i32, c: (f32, f32, f32
     buf[i + 2] += c.2;
 }
 
-fn blend_px(buf: &mut [f32], w: usize, x: usize, y: usize, c: (f32, f32, f32), a: f32) {
+fn blend_px_f(buf: &mut [f32], w: usize, x: usize, y: usize, c: Rgb, a: f32) {
     let i = (y * w + x) * 3;
     buf[i] = buf[i] * (1.0 - a) + c.0 * a;
     buf[i + 1] = buf[i + 1] * (1.0 - a) + c.1 * a;
