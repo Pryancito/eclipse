@@ -72,6 +72,12 @@ const DRM_IOCTL_MODE_DESTROY_DUMB: u32 = 0xC00464B4;
 const DRM_IOCTL_MODE_ADDFB: u32 = 0xC01C64AE;
 const DRM_IOCTL_MODE_ADDFB2: u32 = 0xC06864B8;
 const DRM_IOCTL_MODE_RMFB: u32 = 0xC00464AF;
+/// `struct drm_mode_closefb { u32 fb_id; u32 pad; }` — Linux 6.6+. wlroots
+/// prefers it over RMFB when tearing down framebuffers (CLOSEFB drops the
+/// caller's reference WITHOUT disabling the plane/CRTC it may still be on);
+/// with it unhandled every fb teardown logged "Failed to close FB" and fell
+/// back to RMFB.
+const DRM_IOCTL_MODE_CLOSEFB: u32 = 0xC00864D0;
 const DRM_IOCTL_MODE_PAGE_FLIP: u32 = 0xC01864B0;
 
 const DRM_IOCTL_MODE_GETPLANERESOURCES: u32 = 0xC01064B5;
@@ -732,6 +738,19 @@ impl INode for DrmDev {
                 let fb_id = unsafe { *(data as *const u32) };
                 drm::rmfb(fb_id);
                 Ok(0)
+            }
+            DRM_IOCTL_MODE_CLOSEFB => {
+                // Our software-KMS `rmfb` already only drops the fb object —
+                // scanout keeps showing the last blitted frame until the next
+                // present — which is exactly CLOSEFB's "close without
+                // disabling" contract. Reject unknown ids like Linux (EINVAL
+                // via DeviceError is close enough for wlroots' fallback).
+                let fb_id = unsafe { *(data as *const u32) };
+                if drm::rmfb(fb_id) {
+                    Ok(0)
+                } else {
+                    Err(FsError::InvalidParam)
+                }
             }
             DRM_IOCTL_MODE_MAP_DUMB => {
                 let map = unsafe { &mut *(data as *mut DrmModeMapDumb) };

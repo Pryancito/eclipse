@@ -551,6 +551,7 @@ impl Syscall<'_> {
                 sockaddr_in.write_to_msg(msg)?;
             }
             // SCM_RIGHTS: install any fds the peer attached and emit a cmsg.
+            let mut ctrl_written = 0usize;
             if !hdr.msg_control.is_null() && hdr.msg_controllen >= 16 {
                 let max_fds = (hdr.msg_controllen - 16) / 4;
                 let fds = socket.recv_fds(max_fds);
@@ -566,14 +567,23 @@ impl Syscall<'_> {
                         let raw: i32 = newfd.into();
                         cbuf.extend_from_slice(&raw.to_ne_bytes());
                     }
-                    let towrite = cbuf.len().min(hdr.msg_controllen);
-                    hdr.msg_control.write_array(&cbuf[..towrite])?;
-                    // Update msg_controllen so the receiver's CMSG_*HDR macros
-                    // walk exactly our ancillary data and no further.
-                    let controllen_addr = msg_addr + core::mem::offset_of!(MsgHdr, msg_controllen);
-                    let mut p = UserOutPtr::<usize>::from(controllen_addr);
-                    p.write(towrite)?;
+                    ctrl_written = cbuf.len().min(hdr.msg_controllen);
+                    hdr.msg_control.write_array(&cbuf[..ctrl_written])?;
                 }
+            }
+            // Linux ALWAYS reports how much ancillary data it wrote through
+            // msg_controllen — 0 when there is none. Leaving the caller's IN
+            // value (the buffer CAPACITY) there handed strict cmsg parsers a
+            // buffer's worth of stale user memory to walk as if it were
+            // kernel-written control headers: rustix (wayland-rs / lunarbg)
+            // read a garbage cmsg_len there and panicked with
+            // "range start index 18446744069414584321 out of range for slice
+            // of length 136" — 136 being exactly the untouched capacity.
+            // libwayland's C macros merely skidded over the same garbage.
+            if !hdr.msg_control.is_null() {
+                let controllen_addr = msg_addr + core::mem::offset_of!(MsgHdr, msg_controllen);
+                let mut p = UserOutPtr::<usize>::from(controllen_addr);
+                p.write(ctrl_written)?;
             }
         }
 
