@@ -142,8 +142,8 @@ fn write_labwc_rc(rootfs: &Path) {
   <desktops number="4"/>
   <keyboard>
     <!-- Terminals -->
-    <keybind key="W-Return"><action name="Execute"><command>eclipse-terminal</command></action></keybind>
-    <keybind key="A-Return"><action name="Execute"><command>eclipse-terminal</command></action></keybind>
+    <keybind key="W-Return"><action name="Execute"><command>/usr/local/bin/eclipse-terminal</command></action></keybind>
+    <keybind key="A-Return"><action name="Execute"><command>/usr/local/bin/eclipse-terminal</command></action></keybind>
     <!-- Desktop menu also on a key, in case the mouse is missing -->
     <keybind key="W-space"><action name="ShowMenu"><menu>root-menu</menu></action></keybind>
     <!-- Window management -->
@@ -186,9 +186,9 @@ fn write_labwc_menu(rootfs: &Path) {
         br#"<?xml version="1.0" encoding="UTF-8"?>
 <openbox_menu>
   <menu id="root-menu" label="Eclipse OS">
-    <item label="Terminal"><action name="Execute"><command>eclipse-terminal</command></action></item>
-    <item label="Editor (nano)"><action name="Execute"><command>eclipse-terminal nano</command></action></item>
-    <item label="Monitor (top)"><action name="Execute"><command>eclipse-terminal top</command></action></item>
+    <item label="Terminal"><action name="Execute"><command>/usr/local/bin/eclipse-terminal</command></action></item>
+    <item label="Editor (nano)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal nano</command></action></item>
+    <item label="Monitor (top)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal top</command></action></item>
     <separator/>
     <item label="Recargar labwc"><action name="Reconfigure"/></item>
     <item label="Salir de la sesion"><action name="Exit"/></item>
@@ -207,6 +207,12 @@ fn write_labwc_environment(rootfs: &Path) {
     fs::write(
         cfg.join("environment"),
         b"# Eclipse OS - env for the labwc session (sourced by labwc itself).\n\
+          # PATH first: the per-VT console shells do NOT source /etc/profile,\n\
+          # so a labwc launched from one inherits a PATH without\n\
+          # /usr/local/bin - bypassing the labwc wrapper and making keybinds\n\
+          # and autostart unable to find eclipse-terminal (seen as the\n\
+          # terminal retry loop failing with rc=127 while foot was installed).\n\
+          PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin\n\
           XCURSOR_THEME=Adwaita\n\
           XCURSOR_SIZE=24\n\
           GTK_THEME=Adwaita:dark\n\
@@ -244,6 +250,10 @@ fn write_labwc_autostart(rootfs: &Path) {
           # Wayland clients used (all optional): apk add foot swaybg waybar\n\
           LOG=\"$HOME/.config/labwc/autostart.log\"\n\
           exec >\"$LOG\" 2>&1\n\
+          # Defensive: the VT shells skip /etc/profile, so PATH may lack\n\
+          # /usr/local/bin (eclipse-terminal, wrappers) when labwc was\n\
+          # launched straight from a console.\n\
+          export PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin\n\
           echo \"[autostart] $(date 2>/dev/null || echo boot) begin\"\n\
           echo \"[autostart] XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR WAYLAND_DISPLAY=$WAYLAND_DISPLAY\"\n\
           # gdk-pixbuf loader cache: apk installs it via a trigger that may\n\
@@ -410,7 +420,7 @@ fn write_waybar(rootfs: &Path) {
     "custom/launcher": {
         "format": " ◑ ",
         "tooltip-format": "Terminal (Super+Enter)",
-        "on-click": "eclipse-terminal"
+        "on-click": "/usr/local/bin/eclipse-terminal"
     },
     "wlr/taskbar": {
         "format": "{icon} {title:.18}",
