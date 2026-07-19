@@ -24,13 +24,12 @@
 
 mod scene;
 
-use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::time::Instant;
 
 use wayland_client::{
     protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool,
-        wl_surface,
+        wl_buffer, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool, wl_surface,
     },
     Connection, Dispatch, Proxy, QueueHandle, WEnum,
 };
@@ -214,14 +213,16 @@ impl State {
         let frames = bg.frames.as_ref().unwrap();
         bg.surface.attach(Some(&frames.buffers[0]), 0, 0);
         bg.surface.damage_buffer(0, 0, w as i32, h as i32);
-        if self.animate {
-            bg.surface.frame(qh, layer_id);
-        }
         bg.surface.commit();
+        let _ = qh; // configure no longer schedules callbacks; the timer loop drives ticks
     }
 
-    /// One animation step for a background, driven by its frame callback.
-    fn tick(&mut self, qh: &QueueHandle<State>, layer_id: u32) {
+    /// One animation step for a background, driven by the main loop's timer
+    /// (NOT compositor frame callbacks: callback-paced rendering ran at the
+    /// compositor's full rate, and on this software-rendered stack that
+    /// overloaded the machine — libinput logged "event processing lagging,
+    /// your system is too slow" right after session start).
+    fn tick(&mut self, layer_id: u32) {
         let t_ms = self.now_ms();
         let Some(idx) = self.bg_index_by_layer(layer_id) else {
             return;
@@ -254,8 +255,20 @@ impl State {
         bg.surface.attach(Some(&frames.buffers[i]), 0, 0);
         bg.surface
             .damage_buffer(rx as i32, ry as i32, rw as i32, rh as i32);
-        bg.surface.frame(qh, layer_id);
         bg.surface.commit();
+    }
+
+    /// Render a tick on every configured background.
+    fn tick_all(&mut self) {
+        let ids: Vec<u32> = self
+            .backgrounds
+            .iter()
+            .filter(|b| b.frames.is_some())
+            .map(|b| b.layer.id().protocol_id())
+            .collect();
+        for id in ids {
+            self.tick(id);
+        }
     }
 }
 
@@ -323,22 +336,6 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
                 }
             }
             _ => {}
-        }
-    }
-}
-
-/// Frame callback: udata is the layer surface's protocol id.
-impl Dispatch<wl_callback::WlCallback, u32> for State {
-    fn event(
-        state: &mut Self,
-        _: &wl_callback::WlCallback,
-        event: wl_callback::Event,
-        layer_id: &u32,
-        _: &Connection,
-        qh: &QueueHandle<State>,
-    ) {
-        if let wl_callback::Event::Done { .. } = event {
-            state.tick(qh, *layer_id);
         }
     }
 }
@@ -432,11 +429,59 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Timer-paced animation loop. LUNARBG_FPS (default 12) bounds the load:
+    // this stack composites in software and scans out by copying, so pacing
+    // at the compositor's frame-callback rate overloaded the whole machine.
+    let fps: u32 = std::env::var("LUNARBG_FPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|f| (1..=60).contains(f))
+        .unwrap_or(12);
+    let interval = std::time::Duration::from_millis(1000 / fps as u64);
+    let mut next_tick = std::time::Instant::now() + interval;
+
     loop {
         state.ensure_surfaces(&qh);
-        if let Err(e) = queue.blocking_dispatch(&mut state) {
+        if let Err(e) = queue.flush() {
             eprintln!("lunarbg: connection lost: {e}");
             std::process::exit(1);
+        }
+
+        // Wait for server events OR the next animation tick, whichever first.
+        if let Some(guard) = queue.prepare_read() {
+            let timeout_ms: i32 = if state.animate {
+                next_tick
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis()
+                    .min(1000) as i32
+            } else {
+                1000
+            };
+            let mut pfd = libc::pollfd {
+                fd: guard.connection_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut pfd, 1, timeout_ms.max(0)) };
+            if ready > 0 {
+                let _ = guard.read();
+            } else {
+                drop(guard);
+            }
+        }
+        if let Err(e) = queue.dispatch_pending(&mut state) {
+            eprintln!("lunarbg: protocol error: {e}");
+            std::process::exit(1);
+        }
+
+        if state.animate && std::time::Instant::now() >= next_tick {
+            state.tick_all();
+            next_tick += interval;
+            // If we fell behind (system busy), resync rather than bursting.
+            let now = std::time::Instant::now();
+            if next_tick < now {
+                next_tick = now + interval;
+            }
         }
     }
 }
