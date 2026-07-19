@@ -259,10 +259,12 @@ fn write_labwc_autostart(rootfs: &Path) {
           if command -v lunarbg >/dev/null 2>&1; then\n\
           \x20 echo '[autostart] launching lunarbg (native wallpaper)'\n\
           \x20 ( lunarbg; echo \"[autostart] lunarbg exited rc=$?\" ) &\n\
-          \x20 LUNARPID=$!\n\
-          \x20 ( sleep 2\n\
-          \x20   if ! kill -0 \"$LUNARPID\" 2>/dev/null; then\n\
-          \x20     echo '[autostart] lunarbg died -> swaybg fallback'\n\
+          \x20 # Watchdog by PROCESS NAME: kill -0 on the wrapper-subshell pid\n\
+          \x20 # produced a false \"died\" on this kernel, which stacked the\n\
+          \x20 # solid-colour swaybg ON TOP of a perfectly alive lunarbg.\n\
+          \x20 ( sleep 3\n\
+          \x20   if ! pidof lunarbg >/dev/null 2>&1; then\n\
+          \x20     echo '[autostart] lunarbg not running after 3s -> swaybg fallback'\n\
           \x20     start_swaybg\n\
           \x20   fi ) &\n\
           else\n\
@@ -291,8 +293,20 @@ fn write_labwc_autostart(rootfs: &Path) {
           \x20 # GSETTINGS_BACKEND=memory: GTK otherwise reads settings through\n\
           \x20 # dconf, whose D-Bus autolaunch is another failure point on a\n\
           \x20 # system with no session bus.\n\
-          \x20 ( GDK_GL=disable GDK_BACKEND=wayland GSETTINGS_BACKEND=memory waybar\n\
-          \x20   echo \"[autostart] waybar exited rc=$?\" ) &\n\
+          \x20 # Delayed start + one retry: connects that race the session\n\
+          \x20 # bring-up have been seen failing transiently (waybar could not\n\
+          \x20 # reach the compositor while clients started moments earlier\n\
+          \x20 # were fine), and a panel is worth a second attempt.\n\
+          \x20 ( sleep 1\n\
+          \x20   GDK_GL=disable GDK_BACKEND=wayland GSETTINGS_BACKEND=memory waybar\n\
+          \x20   rc=$?\n\
+          \x20   echo \"[autostart] waybar exited rc=$rc\"\n\
+          \x20   if [ \"$rc\" -ne 0 ]; then\n\
+          \x20     sleep 4\n\
+          \x20     echo '[autostart] retrying waybar'\n\
+          \x20     GDK_GL=disable GDK_BACKEND=wayland GSETTINGS_BACKEND=memory waybar\n\
+          \x20     echo \"[autostart] waybar retry exited rc=$?\"\n\
+          \x20   fi ) &\n\
           \x20 ( sleep 15 && rm -f \"$PANEL_LOCK\" && echo '[autostart] waybar survived 15s, lock cleared' >>\"$LOG\" ) &\n\
           fi\n\
           echo \"[autostart] cursor theme dir: $(ls -d /usr/share/icons/*/cursors 2>/dev/null || echo NONE)\"\n\
