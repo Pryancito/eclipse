@@ -2,12 +2,6 @@ use crate::{commands::wget, Arch, PROJECT_DIR, TARGET};
 use os_xtask_utils::{dir, CommandExt, Tar};
 use std::{fs, path::Path};
 
-/// Fallback SFS initramfs size, only used by the `dbg_repack_initramfs` test.
-/// Production images are sized dynamically: [`sfs_size_for`] for the minimal
-/// efi-embedded bootstrap initramfs and [`live_image_size`] for the live image
-/// that additionally embeds the installer payloads under `/boot`.
-#[cfg(test)]
-const INITRAMFS_BYTES: usize = 80 * 1024 * 1024;
 /// ESP / primera partición (EFI). Debe coincidir con `PART1_SIZE_MIB` en
 /// install-eclipse y `ESP_IMG_SIZE_MB` en el Makefile.
 const EFI_PARTITION_BYTES: usize = 1024 * 1024 * 1024;
@@ -449,8 +443,17 @@ impl super::LinuxRootfs {
 fn dbg_repack_initramfs() {
     let rootfs = PROJECT_DIR.join("rootfs").join("x86_64");
     let image = PROJECT_DIR.join("zCore").join("x86_64.img");
-    eprintln!("repack {} -> {}", rootfs.display(), image.display());
-    fuse(&rootfs, &image, INITRAMFS_BYTES);
+    // Size dynamically like the production images do — the old fixed 80 MiB
+    // made this helper useless the moment the rootfs grew past it.
+    let size = sfs_size_for(dir_size(&rootfs));
+    eprintln!(
+        "repack {} ({} MiB) -> {} ({} MiB image)",
+        rootfs.display(),
+        dir_size(&rootfs) / (1024 * 1024),
+        image.display(),
+        size / (1024 * 1024),
+    );
+    fuse(&rootfs, &image, size);
     eprintln!("repack done");
 }
 
