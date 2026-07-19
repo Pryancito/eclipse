@@ -173,9 +173,27 @@ impl UnixSocketState {
         None
     }
 
-    /// Remove a registration (called on drop / close).
+    /// Remove a registration, but ONLY if its socket is already dead.
+    ///
+    /// This is identity-checked on purpose. `sys_connect` stamps the
+    /// LISTENER's path onto every accepted server-side socket (so
+    /// getsockname works), and `dup()` creates additional droppable handles
+    /// carrying the same path. An unconditional remove-by-key meant the
+    /// first accepted connection the server closed evicted the LISTENER's
+    /// own registry entry: from that moment every new connect() failed
+    /// ECONNREFUSED while the server was alive and serving — exactly the
+    /// "some Wayland clients connect, later ones are refused" flakiness
+    /// seen at desktop-session start. A dropping socket can never upgrade
+    /// its own Weak (strong count already 0), so "entry is dead" is
+    /// equivalent to "entry is me (or stale)": the live listener's entry
+    /// survives any same-path sibling's death.
     pub fn unregister(path: &str) {
-        UNIX_SOCKETS.lock().remove(path);
+        let mut map = UNIX_SOCKETS.lock();
+        if let Some(w) = map.get(path) {
+            if w.upgrade().is_none() {
+                map.remove(path);
+            }
+        }
     }
 
     /// Push an already-wired server-side endpoint into this server's accept
@@ -732,7 +750,12 @@ mod tests {
         ));
     }
 
-    /// bind registry: register/lookup/unregister and duplicate-bind refusal.
+    /// bind registry: register/lookup and duplicate-bind refusal; unregister
+    /// is identity-checked, so a dying same-path sibling (an accepted socket
+    /// carries the listener's path, dup() handles do too) can NEVER evict a
+    /// live listener — that eviction was exactly the bug that made Wayland
+    /// clients get ECONNREFUSED as soon as the compositor closed its first
+    /// accepted connection.
     #[test]
     fn register_lookup_roundtrip() {
         let path = String::from("\0/tmp/.X11-unix/Xtest-reg");
@@ -746,7 +769,19 @@ mod tests {
             Err(LxError::EADDRINUSE)
         ));
 
+        // A same-path sibling dying (its Drop calls unregister) must not
+        // remove the live listener's entry.
+        let sibling = UnixSocketState::new();
+        sibling.set_path(path.clone());
+        drop(sibling);
+        assert!(UnixSocketState::lookup(&path).is_some());
+
+        // Explicit unregister while the listener is alive is a no-op too.
         UnixSocketState::unregister(&path);
+        assert!(UnixSocketState::lookup(&path).is_some());
+
+        // Once the listener itself dies, the entry goes with it.
+        drop(s);
         assert!(UnixSocketState::lookup(&path).is_none());
     }
 

@@ -288,6 +288,21 @@ impl Process {
             thread.kill();
         }
         inner.handles.clear();
+        drop(inner);
+        // Linux wait semantics: a process becomes waitable the moment its
+        // exit status is published (a zombie), NOT when its last thread has
+        // finished dying. Signal termination NOW: `Thread::kill` is a no-op
+        // for threads parked inside blocking Linux syscalls (only futex's
+        // `blocking_run` arms the killer; poll/epoll/read never observe
+        // `Dying`), so e.g. a GTK helper thread parked in poll(-1) keeps the
+        // process in Exited-but-not-terminated limbo forever. With the
+        // signal deferred to `terminate()`, the parent's wait4 slept forever
+        // on a child whose status was already on file — observed as shell
+        // wrappers wedged on children that ps no longer showed. Setting the
+        // signal here wakes wait_child/wait_child_any and fires the
+        // fork-time SIGCHLD callback exactly once (signal_set on an
+        // already-set bit does not refire when `terminate()` runs later).
+        self.base.signal_set(Signal::PROCESS_TERMINATED);
     }
 
     /// The process finally terminates.
