@@ -274,9 +274,19 @@ fn write_labwc_autostart(rootfs: &Path) {
           # below takes the session down.\n\
           if command -v foot >/dev/null 2>&1; then\n\
           \x20 echo '[autostart] launching foot'\n\
-          \x20 # Wrapper subshell: log the exit code, so a foot that dies\n\
-          \x20 # instantly and silently is at least attributable.\n\
-          \x20 ( foot; echo \"[autostart] foot exited rc=$?\" ) &\n\
+          \x20 # Log the exit code; on failure retry once with info logging so\n\
+          \x20 # foot itself names the failing subsystem (pty, shell spawn,\n\
+          \x20 # fonts, seat) in this log. Seen: silent death with rc=230.\n\
+          \x20 ( sleep 1\n\
+          \x20   foot\n\
+          \x20   rc=$?\n\
+          \x20   echo \"[autostart] foot exited rc=$rc\"\n\
+          \x20   if [ \"$rc\" -ne 0 ]; then\n\
+          \x20     sleep 2\n\
+          \x20     echo '[autostart] retrying foot with -d info'\n\
+          \x20     foot -d info\n\
+          \x20     echo \"[autostart] foot retry exited rc=$?\"\n\
+          \x20   fi ) &\n\
           else echo '[autostart] MISSING foot -> no terminal (apk add foot)'; fi\n\
           # Bottom panel: taskbar, clock, sysinfo. GTK app -> keep it off the\n\
           # EGL/GBM path (hangs this box, see /usr/local/bin/labwc) and guard\n\
@@ -293,19 +303,30 @@ fn write_labwc_autostart(rootfs: &Path) {
           \x20 # GSETTINGS_BACKEND=memory: GTK otherwise reads settings through\n\
           \x20 # dconf, whose D-Bus autolaunch is another failure point on a\n\
           \x20 # system with no session bus.\n\
-          \x20 # Delayed start + one retry: connects that race the session\n\
-          \x20 # bring-up have been seen failing transiently (waybar could not\n\
-          \x20 # reach the compositor while clients started moments earlier\n\
-          \x20 # were fine), and a panel is worth a second attempt.\n\
-          \x20 ( sleep 1\n\
-          \x20   GDK_GL=disable GDK_BACKEND=wayland GSETTINGS_BACKEND=memory waybar\n\
-          \x20   rc=$?\n\
-          \x20   echo \"[autostart] waybar exited rc=$rc\"\n\
-          \x20   if [ \"$rc\" -ne 0 ]; then\n\
-          \x20     sleep 4\n\
-          \x20     echo '[autostart] retrying waybar'\n\
-          \x20     GDK_GL=disable GDK_BACKEND=wayland GSETTINGS_BACKEND=memory waybar\n\
-          \x20     echo \"[autostart] waybar retry exited rc=$?\"\n\
+          \x20 # Retry LOOP keyed on `pidof waybar`, with each attempt launched\n\
+          \x20 # in the background. Two reasons: waybar's compositor connect\n\
+          \x20 # fails transiently during session bring-up (clients started a\n\
+          \x20 # moment earlier connect fine), and a wrapper that waits on the\n\
+          \x20 # child directly has been seen wedged in wait() on this kernel\n\
+          \x20 # after the child died (its exit-rc line never appeared), which\n\
+          \x20 # swallowed the retry. pidof needs neither wait() nor exit\n\
+          \x20 # codes: it observes the fact we care about — a living panel.\n\
+          \x20 ( n=1\n\
+          \x20   while [ \"$n\" -le 5 ]; do\n\
+          \x20     sleep 2\n\
+          \x20     if pidof waybar >/dev/null 2>&1; then\n\
+          \x20       echo \"[autostart] waybar up (attempt $n)\"\n\
+          \x20       exit 0\n\
+          \x20     fi\n\
+          \x20     echo \"[autostart] waybar attempt $n\"\n\
+          \x20     GDK_GL=disable GDK_BACKEND=wayland GSETTINGS_BACKEND=memory waybar &\n\
+          \x20     n=$((n+1))\n\
+          \x20   done\n\
+          \x20   sleep 2\n\
+          \x20   if pidof waybar >/dev/null 2>&1; then\n\
+          \x20     echo '[autostart] waybar up (last attempt)'\n\
+          \x20   else\n\
+          \x20     echo '[autostart] waybar FAILED after 5 attempts'\n\
           \x20   fi ) &\n\
           \x20 ( sleep 15 && rm -f \"$PANEL_LOCK\" && echo '[autostart] waybar survived 15s, lock cleared' >>\"$LOG\" ) &\n\
           fi\n\
