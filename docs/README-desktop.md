@@ -14,7 +14,8 @@ arranque sin pasos manuales.
 
 | Pieza | Archivo generado | Qué hace |
 |---|---|---|
-| Wallpaper | `/usr/share/backgrounds/eclipse/eclipse-night.png` | Escena nocturna (cielo degradado, estrellas, luna, montañas y el disco de Eclipse). Se **renderiza en build** con un encoder PNG propio, sin dependencias. |
+| **lunarbg** | `/bin/lunarbg` | Cliente de fondo nativo de Eclipse OS (`tools/lunarbg`, Rust estático). Dibuja la escena nocturna **proceduralmente a la resolución nativa** de cada salida vía wlr-layer-shell + wl_shm: sin archivos de imagen ni gdk-pixbuf. Incluye la rejilla azul y el tamaño de logo del compositor smithay original de eclipse-old. Modo debug: `LUNARBG_DUMP=/tmp/out.raw:1920x1080 lunarbg`. |
+| Wallpaper (respaldo) | `/usr/share/backgrounds/eclipse/eclipse-night.png` | La misma escena, renderizada en build a PNG (encoder propio, sin dependencias). Solo se usa si lunarbg no está y toca recurrir a swaybg. |
 | Tema de ventanas | `/usr/share/themes/Eclipse-Dark/openbox-3/themerc` | Tema openbox-3 oscuro que labwc aplica a bordes de ventana, menús y OSD. |
 | Config labwc | `/root/.config/labwc/rc.xml` | Tema `Eclipse-Dark`, esquinas redondeadas, 4 escritorios y atajos de teclado. |
 | Menú de escritorio | `/root/.config/labwc/menu.xml` | Clic derecho en el fondo: terminal, editor, monitor, recargar y salir. |
@@ -36,7 +37,8 @@ apk add labwc waybar foot swaybg font-dejavu adwaita-icon-theme
 ```
 
 - `labwc` — el compositor.
-- `swaybg` — pinta el wallpaper (sin él, escritorio negro con color de respaldo).
+- `swaybg` — solo como respaldo del fondo: `lunarbg` (incluido en el rootfs)
+  pinta el fondo sin necesitar swaybg ni gdk-pixbuf.
 - `waybar` — el panel inferior (sin él, no hay barra pero todo funciona).
 - `foot` — terminal Wayland.
 - `font-dejavu` — tipografía usada por tema, panel y menús.

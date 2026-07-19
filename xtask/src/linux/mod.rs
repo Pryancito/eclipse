@@ -145,10 +145,16 @@ impl LinuxRootfs {
         desktop::install(&dir);
         Self::install_ca_certs(&dir);
 
-        // /etc/machine-id — prevents dhcp_vendor "No such file or directory"
+        // /etc/machine-id — prevents dhcp_vendor "No such file or directory".
+        // MUST be 32 lowercase hex digits: dbus validates it and refuses to
+        // autolaunch ("Invalid machine ID in /etc/machine-id") on anything
+        // else, which breaks GTK apps' session-bus fallback. "ec1195e0" is
+        // hex-alphabet leetspeak for "eclipse0". Written only when absent, so
+        // an existing (installer-generated) id is preserved — an installed
+        // system with the old non-hex id needs it rewritten once by hand.
         let machine_id = etc.join("machine-id");
         if !machine_id.exists() {
-            fs::write(&machine_id, b"eclipseoseclipseoseclipseoseclip\n").unwrap();
+            fs::write(&machine_id, b"ec1195e0ec1195e0ec1195e0ec1195e0\n").unwrap();
         }
 
         // /etc/hostname
@@ -360,6 +366,17 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         if libeclipse_dns.is_file() {
             let _ = dir::rm(&lib.join("libeclipse_dns.so"));
             fs::copy(&libeclipse_dns, lib.join("libeclipse_dns.so")).unwrap();
+        }
+
+        // lunarbg: the native wallpaper client (Rust, static musl). Renders
+        // the Eclipse night scene procedurally over wlr-layer-shell, replacing
+        // swaybg and its gdk-pixbuf image-decoding dependency entirely.
+        let lunarbg = self.lunarbg();
+        if lunarbg.is_file() {
+            let _ = dir::rm(&bin.join("lunarbg"));
+            fs::copy(&lunarbg, bin.join("lunarbg")).unwrap();
+        } else {
+            eprintln!("warning: lunarbg not built; autostart will fall back to swaybg");
         }
 
         // 拷贝 install-eclipse
@@ -1410,6 +1427,50 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             .status();
         if !status.success() {
             eprintln!("warning: eclipse-init build failed; busybox init remains PID 1");
+        }
+        executable
+    }
+
+    /// Cross-compile lunarbg (`tools/lunarbg`, Rust) as a static musl binary
+    /// and return its path. Best-effort: if the build fails the desktop
+    /// autostart falls back to swaybg (see xtask/src/linux/desktop.rs).
+    fn lunarbg(&self) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join("lunarbg");
+        let triple = self.musl_rust_triple();
+        let executable = dir
+            .join("target")
+            .join(triple)
+            .join("release")
+            .join("lunarbg");
+        // Rebuild when any source file is newer than the binary.
+        let newest_src = ["src/main.rs", "src/scene.rs", "Cargo.toml"]
+            .iter()
+            .filter_map(|rel| fs::metadata(dir.join(rel)).ok()?.modified().ok())
+            .max();
+        if let (Ok(bin_meta), Some(src_mtime)) = (fs::metadata(&executable), newest_src) {
+            if let Ok(bin_mtime) = bin_meta.modified() {
+                if bin_mtime >= src_mtime {
+                    return executable;
+                }
+            }
+        }
+
+        println!("Compiling lunarbg (Rust, {triple})...");
+        let _ = Ext::new("rustup")
+            .arg("target")
+            .arg("add")
+            .arg(triple)
+            .status();
+        let status = Ext::new("cargo")
+            .current_dir(&dir)
+            .arg("build")
+            .arg("--release")
+            .arg("--target")
+            .arg(triple)
+            .env("RUSTFLAGS", "-C relocation-model=static")
+            .status();
+        if !status.success() {
+            eprintln!("warning: lunarbg build failed; swaybg fallback remains");
         }
         executable
     }
