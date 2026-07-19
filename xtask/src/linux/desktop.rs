@@ -229,12 +229,17 @@ fn write_labwc_autostart(rootfs: &Path) {
           \x20 echo '[autostart] gdk-pixbuf-query-loaders NOT installed -> swaybg cannot decode images (apk add gdk-pixbuf)'\n\
           fi\n\
           echo \"[autostart] pixbuf modules: $(ls /usr/lib/gdk-pixbuf-2.0/*/loaders/ 2>/dev/null | tr '\\n' ' ')\"\n\
-          # Wallpaper: the build-time Eclipse night render; fall back to a\n\
-          # solid dark violet if the image is missing. swaybg is also a\n\
-          # continuous surface, giving labwc something to composite.\n\
-          WALL=/usr/share/backgrounds/eclipse/eclipse-night.png\n\
-          echo \"[autostart] wallpaper: $(ls -l \"$WALL\" 2>&1)\"\n\
-          if command -v swaybg >/dev/null 2>&1; then\n\
+          # Background: lunarbg, Eclipse's own wallpaper client. It renders\n\
+          # the night scene procedurally at the output's native resolution --\n\
+          # no image files, no gdk-pixbuf. swaybg (image, then solid colour)\n\
+          # remains as a fallback chain for systems without it.\n\
+          start_swaybg() {\n\
+          \x20 WALL=/usr/share/backgrounds/eclipse/eclipse-night.png\n\
+          \x20 echo \"[autostart] wallpaper: $(ls -l \"$WALL\" 2>&1)\"\n\
+          \x20 if ! command -v swaybg >/dev/null 2>&1; then\n\
+          \x20   echo '[autostart] MISSING swaybg -> desktop stays black (apk add swaybg)'\n\
+          \x20   return\n\
+          \x20 fi\n\
           \x20 if [ -r \"$WALL\" ]; then\n\
           \x20   echo '[autostart] launching swaybg (eclipse-night)'\n\
           \x20   swaybg -i \"$WALL\" -m fill &\n\
@@ -250,7 +255,19 @@ fn write_labwc_autostart(rootfs: &Path) {
           \x20 else\n\
           \x20   echo '[autostart] wallpaper missing, solid colour'; swaybg -c '#1a1440' &\n\
           \x20 fi\n\
-          else echo '[autostart] MISSING swaybg -> desktop stays black (apk add swaybg)'; fi\n\
+          }\n\
+          if command -v lunarbg >/dev/null 2>&1; then\n\
+          \x20 echo '[autostart] launching lunarbg (native wallpaper)'\n\
+          \x20 ( lunarbg; echo \"[autostart] lunarbg exited rc=$?\" ) &\n\
+          \x20 LUNARPID=$!\n\
+          \x20 ( sleep 2\n\
+          \x20   if ! kill -0 \"$LUNARPID\" 2>/dev/null; then\n\
+          \x20     echo '[autostart] lunarbg died -> swaybg fallback'\n\
+          \x20     start_swaybg\n\
+          \x20   fi ) &\n\
+          else\n\
+          \x20 start_swaybg\n\
+          fi\n\
           # A terminal FIRST so the desktop is usable even if the panel\n\
           # below takes the session down.\n\
           if command -v foot >/dev/null 2>&1; then\n\
@@ -283,7 +300,7 @@ fn write_labwc_autostart(rootfs: &Path) {
           # after start. A client that launched but died (bad config, missing\n\
           # lib) shows as DEAD here, with its stderr earlier in this log.\n\
           ( sleep 5\n\
-          \x20 echo \"[autostart] after 5s: swaybg=$(pidof swaybg >/dev/null 2>&1 && echo ok || echo DEAD) waybar=$(pidof waybar >/dev/null 2>&1 && echo ok || echo DEAD) foot=$(pidof foot >/dev/null 2>&1 && echo ok || echo DEAD)\" ) &\n\
+          \x20 echo \"[autostart] after 5s: lunarbg=$(pidof lunarbg >/dev/null 2>&1 && echo ok || echo DEAD) swaybg=$(pidof swaybg >/dev/null 2>&1 && echo ok || echo n/a) waybar=$(pidof waybar >/dev/null 2>&1 && echo ok || echo DEAD) foot=$(pidof foot >/dev/null 2>&1 && echo ok || echo DEAD)\" ) &\n\
           echo '[autostart] done'\n",
     )
     .unwrap();
