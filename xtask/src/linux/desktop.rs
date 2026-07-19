@@ -35,6 +35,37 @@ pub fn install(rootfs: &Path) {
     write_gtk_settings(rootfs);
     write_foot_config(rootfs);
     write_labwc_wrapper(rootfs);
+    write_terminal_wrapper(rootfs);
+}
+
+/// `/usr/local/bin/eclipse-terminal`: launch the first terminal that exists.
+/// foot is preferred (pixman/shm, matches this stack); alacritty is the
+/// fallback, forced onto software GL (client-side llvmpipe renders via shm,
+/// which does not touch the DRM GL path that hangs this box). Keybinds, the
+/// desktop menu, the panel launcher and autostart all go through this, so
+/// "a terminal" keeps working no matter which one is installed.
+fn write_terminal_wrapper(rootfs: &Path) {
+    let localbin = rootfs.join("usr/local/bin");
+    let _ = fs::create_dir_all(&localbin);
+    let wrapper = localbin.join("eclipse-terminal");
+    fs::write(
+        &wrapper,
+        b"#!/bin/sh\n\
+          # Eclipse OS: launch whichever terminal is installed.\n\
+          if command -v foot >/dev/null 2>&1; then\n\
+          \x20 exec foot \"$@\"\n\
+          fi\n\
+          if command -v alacritty >/dev/null 2>&1; then\n\
+          \x20 LIBGL_ALWAYS_SOFTWARE=1 exec alacritty \"$@\"\n\
+          fi\n\
+          echo 'eclipse-terminal: no terminal found (apk add foot)' >&2\n\
+          exit 127\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }
 
 fn write_wallpaper(rootfs: &Path) {
@@ -111,8 +142,8 @@ fn write_labwc_rc(rootfs: &Path) {
   <desktops number="4"/>
   <keyboard>
     <!-- Terminals -->
-    <keybind key="W-Return"><action name="Execute"><command>foot</command></action></keybind>
-    <keybind key="A-Return"><action name="Execute"><command>foot</command></action></keybind>
+    <keybind key="W-Return"><action name="Execute"><command>eclipse-terminal</command></action></keybind>
+    <keybind key="A-Return"><action name="Execute"><command>eclipse-terminal</command></action></keybind>
     <!-- Desktop menu also on a key, in case the mouse is missing -->
     <keybind key="W-space"><action name="ShowMenu"><menu>root-menu</menu></action></keybind>
     <!-- Window management -->
@@ -155,9 +186,9 @@ fn write_labwc_menu(rootfs: &Path) {
         br#"<?xml version="1.0" encoding="UTF-8"?>
 <openbox_menu>
   <menu id="root-menu" label="Eclipse OS">
-    <item label="Terminal"><action name="Execute"><command>foot</command></action></item>
-    <item label="Editor (nano)"><action name="Execute"><command>foot nano</command></action></item>
-    <item label="Monitor (top)"><action name="Execute"><command>foot top</command></action></item>
+    <item label="Terminal"><action name="Execute"><command>eclipse-terminal</command></action></item>
+    <item label="Editor (nano)"><action name="Execute"><command>eclipse-terminal nano</command></action></item>
+    <item label="Monitor (top)"><action name="Execute"><command>eclipse-terminal top</command></action></item>
     <separator/>
     <item label="Recargar labwc"><action name="Reconfigure"/></item>
     <item label="Salir de la sesion"><action name="Exit"/></item>
@@ -272,12 +303,35 @@ fn write_labwc_autostart(rootfs: &Path) {
           fi\n\
           # A terminal FIRST so the desktop is usable even if the panel\n\
           # below takes the session down.\n\
-          if command -v foot >/dev/null 2>&1; then\n\
-          \x20 echo '[autostart] launching foot'\n\
-          \x20 # Wrapper subshell: log the exit code, so a foot that dies\n\
-          \x20 # instantly and silently is at least attributable.\n\
-          \x20 ( foot; echo \"[autostart] foot exited rc=$?\" ) &\n\
-          else echo '[autostart] MISSING foot -> no terminal (apk add foot)'; fi\n\
+          # THE TERMINAL IS THE PRIORITY: without one there is no way to type\n\
+          # commands and watch the desktop come up. Retry loop keyed on pidof\n\
+          # (never on wait()/exit codes, see the waybar note below): up to 5\n\
+          # attempts through eclipse-terminal (foot, else alacritty on\n\
+          # software GL). Attempt 2 runs foot verbosely so a flaky-start foot\n\
+          # documents its own failure (seen: silent death, rc=230).\n\
+          if command -v foot >/dev/null 2>&1 || command -v alacritty >/dev/null 2>&1; then\n\
+          \x20 ( sleep 1\n\
+          \x20   n=1\n\
+          \x20   while [ \"$n\" -le 5 ]; do\n\
+          \x20     if pidof foot alacritty >/dev/null 2>&1; then\n\
+          \x20       echo \"[autostart] terminal up (attempt $n)\"\n\
+          \x20       exit 0\n\
+          \x20     fi\n\
+          \x20     echo \"[autostart] terminal attempt $n\"\n\
+          \x20     if [ \"$n\" -eq 2 ] && command -v foot >/dev/null 2>&1; then\n\
+          \x20       ( foot -d info; echo \"[autostart] foot -d info exited rc=$?\" ) &\n\
+          \x20     else\n\
+          \x20       ( eclipse-terminal; echo \"[autostart] terminal exited rc=$?\" ) &\n\
+          \x20     fi\n\
+          \x20     sleep 2\n\
+          \x20     n=$((n+1))\n\
+          \x20   done\n\
+          \x20   if pidof foot alacritty >/dev/null 2>&1; then\n\
+          \x20     echo '[autostart] terminal up (last attempt)'\n\
+          \x20   else\n\
+          \x20     echo '[autostart] terminal FAILED after 5 attempts (apk add foot)'\n\
+          \x20   fi ) &\n\
+          else echo '[autostart] MISSING foot/alacritty -> no terminal (apk add foot)'; fi\n\
           # Bottom panel: taskbar, clock, sysinfo. GTK app -> keep it off the\n\
           # EGL/GBM path (hangs this box, see /usr/local/bin/labwc) and guard\n\
           # with a crash-once lock so a hang cannot recur on every boot.\n\
@@ -293,19 +347,30 @@ fn write_labwc_autostart(rootfs: &Path) {
           \x20 # GSETTINGS_BACKEND=memory: GTK otherwise reads settings through\n\
           \x20 # dconf, whose D-Bus autolaunch is another failure point on a\n\
           \x20 # system with no session bus.\n\
-          \x20 # Delayed start + one retry: connects that race the session\n\
-          \x20 # bring-up have been seen failing transiently (waybar could not\n\
-          \x20 # reach the compositor while clients started moments earlier\n\
-          \x20 # were fine), and a panel is worth a second attempt.\n\
-          \x20 ( sleep 1\n\
-          \x20   GDK_GL=disable GDK_BACKEND=wayland GSETTINGS_BACKEND=memory waybar\n\
-          \x20   rc=$?\n\
-          \x20   echo \"[autostart] waybar exited rc=$rc\"\n\
-          \x20   if [ \"$rc\" -ne 0 ]; then\n\
-          \x20     sleep 4\n\
-          \x20     echo '[autostart] retrying waybar'\n\
-          \x20     GDK_GL=disable GDK_BACKEND=wayland GSETTINGS_BACKEND=memory waybar\n\
-          \x20     echo \"[autostart] waybar retry exited rc=$?\"\n\
+          \x20 # Retry LOOP keyed on `pidof waybar`, with each attempt launched\n\
+          \x20 # in the background. Two reasons: waybar's compositor connect\n\
+          \x20 # fails transiently during session bring-up (clients started a\n\
+          \x20 # moment earlier connect fine), and a wrapper that waits on the\n\
+          \x20 # child directly has been seen wedged in wait() on this kernel\n\
+          \x20 # after the child died (its exit-rc line never appeared), which\n\
+          \x20 # swallowed the retry. pidof needs neither wait() nor exit\n\
+          \x20 # codes: it observes the fact we care about - a living panel.\n\
+          \x20 ( n=1\n\
+          \x20   while [ \"$n\" -le 5 ]; do\n\
+          \x20     sleep 2\n\
+          \x20     if pidof waybar >/dev/null 2>&1; then\n\
+          \x20       echo \"[autostart] waybar up (attempt $n)\"\n\
+          \x20       exit 0\n\
+          \x20     fi\n\
+          \x20     echo \"[autostart] waybar attempt $n\"\n\
+          \x20     GDK_GL=disable GDK_BACKEND=wayland GSETTINGS_BACKEND=memory waybar &\n\
+          \x20     n=$((n+1))\n\
+          \x20   done\n\
+          \x20   sleep 2\n\
+          \x20   if pidof waybar >/dev/null 2>&1; then\n\
+          \x20     echo '[autostart] waybar up (last attempt)'\n\
+          \x20   else\n\
+          \x20     echo '[autostart] waybar FAILED after 5 attempts'\n\
           \x20   fi ) &\n\
           \x20 ( sleep 15 && rm -f \"$PANEL_LOCK\" && echo '[autostart] waybar survived 15s, lock cleared' >>\"$LOG\" ) &\n\
           fi\n\
@@ -314,7 +379,7 @@ fn write_labwc_autostart(rootfs: &Path) {
           # after start. A client that launched but died (bad config, missing\n\
           # lib) shows as DEAD here, with its stderr earlier in this log.\n\
           ( sleep 5\n\
-          \x20 echo \"[autostart] after 5s: lunarbg=$(pidof lunarbg >/dev/null 2>&1 && echo ok || echo DEAD) swaybg=$(pidof swaybg >/dev/null 2>&1 && echo ok || echo n/a) waybar=$(pidof waybar >/dev/null 2>&1 && echo ok || echo DEAD) foot=$(pidof foot >/dev/null 2>&1 && echo ok || echo DEAD)\" ) &\n\
+          \x20 echo \"[autostart] after 5s: lunarbg=$(pidof lunarbg >/dev/null 2>&1 && echo ok || echo DEAD) swaybg=$(pidof swaybg >/dev/null 2>&1 && echo ok || echo n/a) waybar=$(pidof waybar >/dev/null 2>&1 && echo ok || echo DEAD) terminal=$(pidof foot alacritty >/dev/null 2>&1 && echo ok || echo DEAD)\" ) &\n\
           echo '[autostart] done'\n",
     )
     .unwrap();
@@ -345,7 +410,7 @@ fn write_waybar(rootfs: &Path) {
     "custom/launcher": {
         "format": " ◑ ",
         "tooltip-format": "Terminal (Super+Enter)",
-        "on-click": "foot"
+        "on-click": "eclipse-terminal"
     },
     "wlr/taskbar": {
         "format": "{icon} {title:.18}",
