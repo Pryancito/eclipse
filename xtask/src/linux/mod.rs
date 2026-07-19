@@ -145,10 +145,16 @@ impl LinuxRootfs {
         desktop::install(&dir);
         Self::install_ca_certs(&dir);
 
-        // /etc/machine-id — prevents dhcp_vendor "No such file or directory"
+        // /etc/machine-id — prevents dhcp_vendor "No such file or directory".
+        // MUST be 32 lowercase hex digits: dbus validates it and refuses to
+        // autolaunch ("Invalid machine ID in /etc/machine-id") on anything
+        // else, which breaks GTK apps' session-bus fallback. "ec1195e0" is
+        // hex-alphabet leetspeak for "eclipse0". Written only when absent, so
+        // an existing (installer-generated) id is preserved — an installed
+        // system with the old non-hex id needs it rewritten once by hand.
         let machine_id = etc.join("machine-id");
         if !machine_id.exists() {
-            fs::write(&machine_id, b"eclipseoseclipseoseclipseoseclip\n").unwrap();
+            fs::write(&machine_id, b"ec1195e0ec1195e0ec1195e0ec1195e0\n").unwrap();
         }
 
         // /etc/hostname
