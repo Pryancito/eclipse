@@ -102,6 +102,17 @@ impl Syscall<'_> {
         if len == 0 || len > MAX_MMAP_LEN {
             return Err(LxError::ENOMEM);
         }
+        // Linux UAPI: `len` is rounded UP to whole pages by the kernel for
+        // mmap/munmap/mprotect; only `addr` must be page-aligned (and only
+        // for MAP_FIXED). glibc's ld.so depends on this — its zero-fill
+        // mmap passes the raw unaligned segment length, and our former
+        // aligned-length requirement bounced it with EINVAL, killing every
+        // glibc binary at load with "cannot map zero-fill pages" (musl
+        // rounds in userspace, which hid the gap for years).
+        if flags.contains(MmapFlags::FIXED) && addr % PAGE_SIZE != 0 {
+            return Err(LxError::EINVAL);
+        }
+        let len = roundup_pages(len);
         // hunter W^X: reject (or audit) simultaneously writable+executable maps.
         if !hunter::check_mmap(
             self.zircon_process().id(),
@@ -325,6 +336,11 @@ impl Syscall<'_> {
             "mprotect: addr={:#x}, size={:#x}, prot={:?}",
             addr, len, prot
         );
+        // Linux UAPI: addr must be page-aligned; len is rounded up to pages.
+        if addr % PAGE_SIZE != 0 {
+            return Err(LxError::EINVAL);
+        }
+        let len = roundup_pages(len);
         // hunter W^X: reject (or audit) transitions to writable+executable,
         // including the two-step mmap(W)-then-mprotect(X) bypass (it tracks the
         // ever-writable history of this exact range).
@@ -380,6 +396,11 @@ impl Syscall<'_> {
     /// Otherwise, an [`EINVAL`](LxError::EINVAL) is returned.
     pub fn sys_munmap(&self, addr: usize, len: usize) -> SysResult {
         info!("munmap: addr={:#x}, size={:#x}", addr, len);
+        // Linux UAPI: addr must be page-aligned; len is rounded up to pages.
+        if addr % PAGE_SIZE != 0 || len == 0 {
+            return Err(LxError::EINVAL);
+        }
+        let len = roundup_pages(len);
         let proc = self.thread.proc();
         // hunter P3: the range is gone, so drop its W^X writable-history.
         hunter::check_munmap(proc.id(), addr, len);
