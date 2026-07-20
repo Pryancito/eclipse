@@ -706,7 +706,13 @@ impl Syscall<'_> {
             new_socket.flags()
         );
 
-        // SOCK_NONBLOCK / SOCK_CLOEXEC requested for the accepted socket.
+        // SOCK_NONBLOCK / SOCK_CLOEXEC requested for the accepted socket; any
+        // other bit is invalid (GLib's GDBus path only ever passes these two).
+        const SOCK_NONBLOCK: usize = 0o4000;
+        const SOCK_CLOEXEC: usize = 0o2000000;
+        if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+            return Err(LxError::EINVAL);
+        }
         if flags != 0 {
             let new_flags = OpenFlags::from_bits_truncate(flags);
             new_socket.set_flags(new_flags)?;
@@ -718,37 +724,6 @@ impl Syscall<'_> {
             sockaddr_in.write_to(addr, addrlen)?;
         }
         Ok(new_fd.into())
-    }
-
-    /// `accept4(2)`: accept plus flags applied atomically to the NEW socket.
-    /// `SOCK_NONBLOCK` sets O_NONBLOCK; `SOCK_CLOEXEC` sets close-on-exec.
-    /// GLib's GDBus server path calls this unconditionally (there is no
-    /// fallback to plain accept), so waybar's D-Bus handshake needs it.
-    pub async fn sys_accept4(
-        &mut self,
-        sockfd: usize,
-        addr: UserOutPtr<SockAddr>,
-        addrlen: UserInOutPtr<u32>,
-        flags: usize,
-    ) -> SysResult {
-        const SOCK_NONBLOCK: usize = 0o4000;
-        const SOCK_CLOEXEC: usize = 0o2000000;
-        if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
-            return Err(LxError::EINVAL);
-        }
-        info!("sys_accept4: sockfd:{}, flags:{:#o}", sockfd, flags);
-        let new_fd = self.sys_accept(sockfd, addr, addrlen).await?;
-        let proc = self.linux_process();
-        let file_like = proc.get_file_like(new_fd.into())?;
-        let mut fl = file_like.flags();
-        if flags & SOCK_NONBLOCK != 0 {
-            fl |= OpenFlags::NON_BLOCK;
-        }
-        if flags & SOCK_CLOEXEC != 0 {
-            fl |= OpenFlags::CLOEXEC;
-        }
-        file_like.set_flags(fl)?;
-        Ok(new_fd)
     }
 
     /// returns the current address to which the socket sockfd is bound,

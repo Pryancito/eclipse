@@ -49,8 +49,28 @@ pub struct Layout {
     pub cy: f32,
     /// Scale relative to the original 280 px design.
     pub s: f32,
-    /// (x, y, w, h) of the square that the animation redraws each frame.
+    /// Horizontal squeeze so circles LOOK circular on the monitor.
+    ///
+    /// The synthetic KMS exposes the UEFI GOP mode (often 4:3, e.g.
+    /// 1024x768); a 16:9 panel then stretches the framebuffer and every
+    /// circle shows as an ellipse. `LUNARBG_ASPECT` names the PHYSICAL
+    /// monitor aspect ("16:9", "16:10" or a decimal like "1.778"): the logo
+    /// is pre-squeezed by fb_aspect/monitor_aspect so the panel's stretch
+    /// cancels out. Unset or invalid -> 1.0 (draw round, e.g. QEMU).
+    pub sx: f32,
+    /// (x, y, w, h) of the rect that the animation redraws each frame.
     pub region: (usize, usize, usize, usize),
+}
+
+fn monitor_aspect_from_env() -> Option<f32> {
+    let v = std::env::var("LUNARBG_ASPECT").ok()?;
+    let v = v.trim();
+    let aspect = if let Some((a, b)) = v.split_once(':') {
+        a.trim().parse::<f32>().ok()? / b.trim().parse::<f32>().ok()?
+    } else {
+        v.parse::<f32>().ok()?
+    };
+    (aspect.is_finite() && aspect > 0.1).then_some(aspect)
 }
 
 pub fn layout(w: usize, h: usize) -> Layout {
@@ -58,17 +78,22 @@ pub fn layout(w: usize, h: usize) -> Layout {
     let s = logo_r / 280.0;
     let cx = w as f32 * 0.5;
     let cy = h as f32 * 0.46;
+    let fb_aspect = w as f32 / h as f32;
+    let sx = monitor_aspect_from_env()
+        .map(|mon| (fb_aspect / mon).clamp(0.5, 1.5))
+        .unwrap_or(1.0);
     // Outermost animated element: ring 280 + 5 px oscillation, plus the
     // wordmark below at 170 + text height. Take a comfortable margin.
     let reach = (300.0 * s).max(215.0 * s + 40.0) + 8.0;
-    let x0 = ((cx - reach).floor().max(0.0)) as usize;
+    let x0 = ((cx - reach * sx).floor().max(0.0)) as usize;
     let y0 = ((cy - reach).floor().max(0.0)) as usize;
-    let x1 = ((cx + reach).ceil() as usize).min(w);
+    let x1 = ((cx + reach * sx).ceil() as usize).min(w);
     let y1 = ((cy + reach).ceil() as usize).min(h);
     Layout {
         cx,
         cy,
         s,
+        sx,
         region: (x0, y0, x1 - x0, y1 - y0),
     }
 }
@@ -92,13 +117,14 @@ pub fn render_base(w: usize, h: usize) -> Vec<u8> {
             buf[i + 2] = b;
         }
     }
-    // Soft radial nebula centred on the logo.
+    // Soft radial nebula centred on the logo (squeezed like the logo so the
+    // glow stays concentric with it on a stretching panel).
     let neb_r = 420.0 * lay.s + 120.0;
-    let (nx0, nx1) = span(lay.cx, neb_r, w);
+    let (nx0, nx1) = span(lay.cx, neb_r * lay.sx, w);
     let (ny0, ny1) = span(lay.cy, neb_r, h);
     for y in ny0..ny1 {
         for x in nx0..nx1 {
-            let d = dist(x as f32, y as f32, lay.cx, lay.cy);
+            let d = dist((x as f32 - lay.cx) / lay.sx + lay.cx, y as f32, lay.cx, lay.cy);
             if d < neb_r {
                 let t = 1.0 - d / neb_r;
                 let a = t * t * 0.22;
@@ -172,6 +198,7 @@ pub fn render_frame(frame: &mut [u8], w: usize, base: &[u8], lay: &Layout, t_ms:
         data: frame,
         w,
         clip: (rx, ry, rx + rw, ry + rh),
+        sx: lay.sx,
     };
     let counter = t_ms as f32 * 0.06;
     let (cx, cy, s) = (lay.cx, lay.cy, lay.s);
@@ -203,9 +230,9 @@ pub fn render_frame(frame: &mut [u8], w: usize, base: &[u8], lay: &Layout, t_ms:
         };
         let (sin, cos) = a.sin_cos();
         pb.line(
-            cx + cos * r0,
+            cx + cos * r0 * pb.sx,
             cy + sin * r0,
-            cx + cos * r1,
+            cx + cos * r1 * pb.sx,
             cy + sin * r1,
             1.2,
             color,
@@ -228,7 +255,7 @@ pub fn render_frame(frame: &mut [u8], w: usize, base: &[u8], lay: &Layout, t_ms:
     for (i, ch) in chars.iter().enumerate() {
         let a = ((i as f32 * 360.0 / n) + rot_phase).to_radians();
         let (sin, cos) = a.sin_cos();
-        let gx = cx + cos * text_r;
+        let gx = cx + cos * text_r * pb.sx;
         let gy = cy + sin * text_r;
         pb.glyph_outlined(*ch, gx, gy, scale, GLOW_HI, 0.85, COSMIC_DEEP);
     }
@@ -236,18 +263,20 @@ pub fn render_frame(frame: &mut [u8], w: usize, base: &[u8], lay: &Layout, t_ms:
     // --- the eclipse crescent core ---
     let sun_r = 140.0 * s;
     let moon_r = sun_r * 9.0 / 10.0;
-    let (mx, my) = (cx + sun_r / 4.0, cy - sun_r / 5.0);
-    let (sx0, sx1) = pb.clip_span_x(cx, sun_r + 2.0);
+    // The moon-mask centre offset lives in the round pre-stretch space, so
+    // its X component squeezes with everything else.
+    let (mx, my) = (cx + sun_r / 4.0 * pb.sx, cy - sun_r / 5.0);
+    let (sx0, sx1) = pb.clip_span_x(cx, (sun_r + 2.0) * pb.sx);
     let (sy0, sy1) = pb.clip_span_y(cy, sun_r + 2.0);
     for y in sy0..sy1 {
         for x in sx0..sx1 {
-            let d = dist(x as f32, y as f32, cx, cy);
+            let d = pb.edist(x as f32, y as f32, cx, cy);
             let cover = (sun_r - d + 0.5).clamp(0.0, 1.0);
             if cover <= 0.0 {
                 continue;
             }
             // Moon mask: transparent, the cosmic base shows through.
-            let dm = dist(x as f32, y as f32, mx, my);
+            let dm = pb.edist(x as f32, y as f32, mx, my);
             let mask = (moon_r - dm + 0.5).clamp(0.0, 1.0);
             let a = cover * (1.0 - mask);
             if a <= 0.0 {
@@ -281,6 +310,9 @@ struct PixBuf<'a> {
     w: usize,
     /// (x0, y0, x1, y1) — drawing outside is discarded.
     clip: (usize, usize, usize, usize),
+    /// Horizontal squeeze (see [`Layout::sx`]): circles are drawn as ellipses
+    /// with X semi-axis `r * sx` so a stretching monitor shows them round.
+    sx: f32,
 }
 
 impl PixBuf<'_> {
@@ -312,14 +344,20 @@ impl PixBuf<'_> {
         (lo, hi)
     }
 
+    /// Undo the horizontal squeeze: distance is measured in the round,
+    /// pre-stretch space so an on-screen ellipse reads as a circle.
+    fn edist(&self, x: f32, y: f32, cx: f32, cy: f32) -> f32 {
+        dist((x - cx) / self.sx + cx, y, cx, cy)
+    }
+
     /// Thin anti-aliased ring.
     fn ring(&mut self, cx: f32, cy: f32, r: f32, thick: f32, c: Rgb, alpha: f32) {
-        let (x0, x1) = self.clip_span_x(cx, r + thick + 1.0);
+        let (x0, x1) = self.clip_span_x(cx, (r + thick + 1.0) * self.sx);
         let (y0, y1) = self.clip_span_y(cy, r + thick + 1.0);
         let inner = r - thick;
         for y in y0..y1 {
             for x in x0..x1 {
-                let d = dist(x as f32, y as f32, cx, cy);
+                let d = self.edist(x as f32, y as f32, cx, cy);
                 if d < inner - 1.0 || d > r + thick + 1.0 {
                     continue;
                 }
@@ -368,7 +406,7 @@ impl PixBuf<'_> {
         for k in 0..=SEGS {
             let a = (start_deg + span_deg * k as f32 / SEGS as f32).to_radians();
             let (sin, cos) = a.sin_cos();
-            let p = (cx + cos * r, cy + sin * r);
+            let p = (cx + cos * r * self.sx, cy + sin * r);
             if let Some(q) = prev {
                 self.line(q.0, q.1, p.0, p.1, thick, c, alpha);
             }
@@ -377,7 +415,7 @@ impl PixBuf<'_> {
         for k in [0usize, SEGS] {
             let a = (start_deg + span_deg * k as f32 / SEGS as f32).to_radians();
             let (sin, cos) = a.sin_cos();
-            self.dot(cx + cos * r, cy + sin * r, 2.5, c, alpha);
+            self.dot(cx + cos * r * self.sx, cy + sin * r, 2.5, c, alpha);
         }
     }
 

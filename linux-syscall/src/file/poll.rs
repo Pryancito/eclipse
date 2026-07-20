@@ -463,12 +463,20 @@ impl Syscall<'_> {
             maxevents,
             timeout
         );
-        let proc = self.linux_process();
-        let epoll_file = proc.get_file_like(epfd)?;
-        let epoll = epoll_file.downcast_ref::<Epoll>().ok_or(LxError::EBADF)?;
+        // Resolve the epoll object to an owned Arc (not a borrow of a local):
+        // `wait` awaits, and a stale net/timer waker re-polling this future
+        // after teardown must not dereference a freed process/file. The Arc
+        // keeps the epoll object itself alive for the whole wait; `wait`
+        // likewise holds each watched file by Arc, so the future carries no
+        // reference that outlives what it points at.
+        let epoll = self
+            .linux_process()
+            .get_file_like(epfd)?
+            .downcast_arc::<Epoll>()
+            .map_err(|_| LxError::EBADF)?;
 
         // TODO: handle timeout
-        let res_events = epoll.wait(maxevents, proc, timeout).await?;
+        let res_events = epoll.wait(maxevents, timeout).await?;
         events.write_array(&res_events)?;
         Ok(res_events.len())
     }

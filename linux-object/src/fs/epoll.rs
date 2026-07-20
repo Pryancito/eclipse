@@ -162,7 +162,6 @@ impl Epoll {
     pub async fn wait(
         &self,
         maxevents: usize,
-        process: &crate::process::LinuxProcess,
         timeout_msecs: isize,
     ) -> LxResult<Vec<EpollEvent>> {
         let begin_time = kernel_hal::timer::timer_now();
@@ -170,11 +169,35 @@ impl Epoll {
             if let Err(e) = crate::process::check_signals() {
                 return Err(e);
             }
-            let interest_list = self.inner.lock().interest_list.clone();
-            let watch_net = interest_list.keys().any(|fd| crate::net::fd_is_socket(*fd));
+            // Snapshot the interest list, keeping each watched file's OWN
+            // `Arc<dyn FileLike>`. Two reasons this is the handle to poll,
+            // rather than re-resolving the fd number through the process:
+            //  * Correctness — epoll watches the open file *description*, not
+            //    the fd. If userspace closes the fd and reuses the number for
+            //    something else, Linux keeps reporting the original
+            //    description until EPOLL_CTL_DEL; re-resolving by number
+            //    watched the wrong file.
+            //  * Lifetime — polling the stored Arc means this future holds NO
+            //    `&LinuxProcess` borrow across its `.await` points. The borrow
+            //    reached the process through the thread, and a stale
+            //    net/timer waker re-polling a parked epoll after the owning
+            //    thread had torn down dereferenced freed process memory
+            //    (a use-after-free #GP with the free-poison pattern in the
+            //    faulting register). The Arc keeps exactly what we touch
+            //    alive for as long as we touch it.
+            let interest_list: Vec<(FileDesc, EpollEvent, Arc<dyn FileLike>)> = self
+                .inner
+                .lock()
+                .interest_list
+                .iter()
+                .map(|(fd, (event, file))| (*fd, *event, file.clone()))
+                .collect();
+            let watch_net = interest_list
+                .iter()
+                .any(|(fd, _, _)| crate::net::fd_is_socket(*fd));
             let watch_interactive = interest_list
-                .keys()
-                .any(|fd| crate::net::fd_is_interactive(*fd));
+                .iter()
+                .any(|(fd, _, _)| crate::net::fd_is_interactive(*fd));
             crate::net::io_wait_tick(watch_net, watch_interactive);
             // Scan readiness through `async_poll` with this task's own Context:
             // files with real wakers (pipes, unix sockets, …) park one on their
@@ -184,37 +207,35 @@ impl Epoll {
             // behave exactly as the old sync `poll()` scan did.
             let events = core::future::poll_fn(|cx| {
                 let mut events = Vec::new();
-                for (fd, (event, _)) in &interest_list {
-                    if let Ok(file) = process.get_file_like(*fd) {
-                        let interest = PollEvents::from_bits_truncate(event.events as u16);
-                        let mut fut = alloc::boxed::Box::pin(file.async_poll(interest));
-                        let status = match fut.as_mut().poll(cx) {
-                            core::task::Poll::Ready(Ok(status)) => status,
-                            core::task::Poll::Ready(Err(err)) => {
-                                return core::task::Poll::Ready(Err(err))
-                            }
-                            // Not ready; a waker is now parked on the file.
-                            core::task::Poll::Pending => continue,
-                        };
-                        let mut ready_events = 0u32;
-                        if status.read && interest.contains(PollEvents::IN) {
-                            ready_events |= PollEvents::IN.bits() as u32;
+                for (_fd, event, file) in &interest_list {
+                    let interest = PollEvents::from_bits_truncate(event.events as u16);
+                    let mut fut = alloc::boxed::Box::pin(file.async_poll(interest));
+                    let status = match fut.as_mut().poll(cx) {
+                        core::task::Poll::Ready(Ok(status)) => status,
+                        core::task::Poll::Ready(Err(err)) => {
+                            return core::task::Poll::Ready(Err(err))
                         }
-                        if status.write && interest.contains(PollEvents::OUT) {
-                            ready_events |= PollEvents::OUT.bits() as u32;
-                        }
-                        if status.error {
-                            ready_events |= PollEvents::ERR.bits() as u32;
-                        }
+                        // Not ready; a waker is now parked on the file.
+                        core::task::Poll::Pending => continue,
+                    };
+                    let mut ready_events = 0u32;
+                    if status.read && interest.contains(PollEvents::IN) {
+                        ready_events |= PollEvents::IN.bits() as u32;
+                    }
+                    if status.write && interest.contains(PollEvents::OUT) {
+                        ready_events |= PollEvents::OUT.bits() as u32;
+                    }
+                    if status.error {
+                        ready_events |= PollEvents::ERR.bits() as u32;
+                    }
 
-                        if ready_events != 0 {
-                            events.push(EpollEvent {
-                                events: ready_events,
-                                data: event.data,
-                            });
-                            if events.len() >= maxevents {
-                                break;
-                            }
+                    if ready_events != 0 {
+                        events.push(EpollEvent {
+                            events: ready_events,
+                            data: event.data,
+                        });
+                        if events.len() >= maxevents {
+                            break;
                         }
                     }
                 }

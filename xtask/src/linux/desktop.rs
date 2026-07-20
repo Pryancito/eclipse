@@ -214,6 +214,9 @@ fn write_labwc_environment(rootfs: &Path) {
           # terminal retry loop failing with rc=127 while foot was installed).\n\
           PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin\n\
           XCURSOR_THEME=Adwaita\n\
+          # Monitor fisico 16:9 con GOP 4:3 (el panel estira y los circulos\n\
+          # de lunarbg salen elipticos): descomenta para compensar.\n\
+          # LUNARBG_ASPECT=16:9\n\
           XCURSOR_SIZE=24\n\
           GTK_THEME=Adwaita:dark\n\
           # UTF-8 locale: foot refuses box-drawing/unicode and prints\n\
