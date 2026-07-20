@@ -421,6 +421,18 @@ pub trait FileLike: KernelObject + downcast_rs::DowncastSync {
     fn get_vmo(&self, _offset: usize, _len: usize) -> LxResult<Arc<VmObject>> {
         Err(LxError::ENOSYS)
     }
+    /// Like [`get_vmo`](Self::get_vmo), but for `MAP_SHARED` mappings: every
+    /// mapper of the same file must receive the SAME `VmObject`, so stores by
+    /// one process are visible to every other mapper (the wl_shm contract —
+    /// clients render into a mapped memfd and the compositor reads the pixels
+    /// through its own mapping). Returns `(vmo, vmo_offset)`: the vmo may span
+    /// the whole file with the caller mapping at `vmo_offset`.
+    ///
+    /// The default falls back to the per-call snapshot; `File` overrides it
+    /// with a per-inode registry.
+    fn get_vmo_shared(&self, offset: usize, len: usize) -> LxResult<(Arc<VmObject>, usize)> {
+        self.get_vmo(offset, len).map(|vmo| (vmo, 0))
+    }
     /// Casting between trait objects, or use crate: cast_trait_object
     fn as_socket(&self) -> LxResult<&dyn Socket> {
         Err(LxError::ENOTSOCK)

@@ -155,12 +155,27 @@ impl Syscall<'_> {
             Ok(addr)
         } else {
             let file_like = self.linux_process().get_file_like(fd)?;
-            let vmo = file_like.get_vmo(offset as usize, len).inspect_err(|e| {
-                warn!(
-                    "mmap(file) get_vmo FAILED: {:?} fd={:?} offset={:#x} len={:#x}",
-                    e, fd, offset, len
-                );
-            })?;
+            // MAP_SHARED must hand every mapper of the file the SAME VmObject
+            // (stores propagate between processes — the wl_shm pixel path);
+            // MAP_PRIVATE keeps the per-call demand-paged snapshot.
+            let (vmo, vmo_offset) = if flags.contains(MmapFlags::SHARED) {
+                file_like
+                    .get_vmo_shared(offset as usize, len)
+                    .inspect_err(|e| {
+                        warn!(
+                            "mmap(file,shared) get_vmo_shared FAILED: {:?} fd={:?} offset={:#x} len={:#x}",
+                            e, fd, offset, len
+                        );
+                    })?
+            } else {
+                let vmo = file_like.get_vmo(offset as usize, len).inspect_err(|e| {
+                    warn!(
+                        "mmap(file) get_vmo FAILED: {:?} fd={:?} offset={:#x} len={:#x}",
+                        e, fd, offset, len
+                    );
+                })?;
+                (vmo, 0)
+            };
             // hunter P1: cap the file-backed mapping's *permission ceiling* to a
             // W^X-preserving set instead of the old blanket `RXW`, so a later
             // mprotect cannot turn writable file pages executable. Executable
@@ -178,12 +193,15 @@ impl Syscall<'_> {
             // pages are read in on the faults that first touch them. Eagerly
             // mapping the whole range here would defeat that and re-introduce the
             // full-file read that froze the machine on `perf` (libLLVM ~150 MiB).
+            // For a shared full-file VMO the requested window starts at
+            // `vmo_offset` inside it; snapshots bake the offset in and use 0.
+            let map_len = len.min(vmo.len() - vmo_offset);
             let addr = vmar
                 .map_ext(
                     vmar_offset,
                     vmo.clone(),
-                    0,
-                    vmo.len(),
+                    vmo_offset,
+                    map_len,
                     ceiling,
                     prot.to_flags(),
                     false,

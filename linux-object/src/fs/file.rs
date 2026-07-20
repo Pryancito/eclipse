@@ -126,6 +126,21 @@ struct FileFrameFiller {
     source_len: usize,
 }
 
+lazy_static::lazy_static! {
+    /// Per-inode shared VMOs for `MAP_SHARED` file mappings, keyed by the
+    /// inode's Arc data pointer. Every mapper of the same file gets the SAME
+    /// VmObject, so stores by one process are visible to all others — the
+    /// wl_shm contract. Without this each mmap produced an independent
+    /// demand-paged snapshot: foot rendered its terminal into its own copy
+    /// while labwc composited an all-zeros copy — every client window and the
+    /// lunarbg background showed pure black.
+    ///
+    /// Entries are Weak: the VMO lives as long as some mapping (or fd-held
+    /// reference) does; dead entries are pruned on access.
+    static ref SHARED_FILE_VMOS: lock::Mutex<alloc::collections::BTreeMap<usize, alloc::sync::Weak<VmObject>>> =
+        lock::Mutex::new(alloc::collections::BTreeMap::new());
+}
+
 impl zircon_object::vm::FrameFiller for FileFrameFiller {
     fn source_len(&self) -> usize {
         self.source_len
@@ -521,5 +536,56 @@ impl FileLike for File {
             }
             _ => Err(LxError::ENOSYS),
         }
+    }
+
+    fn get_vmo_shared(&self, offset: usize, len: usize) -> LxResult<(Arc<VmObject>, usize)> {
+        let inner = self.inner.read();
+        if inner.inode.metadata()?.type_ != FileType::File {
+            // Devices keep their own get_vmo (fb/drm are inherently shared).
+            drop(inner);
+            return self.get_vmo(offset, len).map(|vmo| (vmo, 0));
+        }
+        if offset % 4096 != 0 {
+            return Err(LxError::EINVAL);
+        }
+        let file_size = inner.inode.metadata()?.size;
+        let key = Arc::as_ptr(&inner.inode) as *const () as usize;
+        let mut registry = SHARED_FILE_VMOS.lock();
+        if let Some(vmo) = registry.get(&key).and_then(|w| w.upgrade()) {
+            if offset + len <= vmo.len() {
+                return Ok((vmo, offset));
+            }
+            // Mapping reaches past the shared VMO (file grew after the first
+            // MAP_SHARED). Rare; fall back to a snapshot rather than silently
+            // truncating — but warn, because writes through this mapping will
+            // NOT be visible to other mappers.
+            warn!(
+                "get_vmo_shared: mapping {:#x}+{:#x} exceeds shared vmo len {:#x} for {} — snapshot fallback",
+                offset,
+                len,
+                vmo.len(),
+                self.path()
+            );
+            drop(registry);
+            drop(inner);
+            return self.get_vmo(offset, len).map(|vmo| (vmo, 0));
+        }
+        // First MAP_SHARED of this file: build one VMO covering the whole file
+        // (so later mappers at other offsets share it too), demand-paged from
+        // the inode. Created under the registry lock so a concurrent first-map
+        // cannot race us into two unshared VMOs.
+        let vmo_len = file_size.max(offset + len);
+        let source: Arc<dyn zircon_object::vm::FrameFiller> = Arc::new(FileFrameFiller {
+            inode: inner.inode.clone(),
+            file_offset: 0,
+            source_len: file_size,
+        });
+        let vmo = VmObject::new_paged_with_source(pages(vmo_len), source);
+        registry.insert(key, Arc::downgrade(&vmo));
+        // Opportunistic prune so dead files don't accumulate keys forever.
+        if registry.len() > 64 {
+            registry.retain(|_, w| w.strong_count() > 0);
+        }
+        Ok((vmo, offset))
     }
 }
