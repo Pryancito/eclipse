@@ -214,6 +214,10 @@ impl Syscall<'_> {
                     .await
             }
             Sys::EVENTFD2 => self.sys_eventfd2(a0 as u32, a1),
+            Sys::INOTIFY_INIT => self.sys_inotify_init1(0),
+            Sys::INOTIFY_INIT1 => self.sys_inotify_init1(a0),
+            Sys::INOTIFY_ADD_WATCH => self.sys_inotify_add_watch(a0, a1.into(), a2 as u32),
+            Sys::INOTIFY_RM_WATCH => self.sys_inotify_rm_watch(a0, a1 as i32),
             Sys::MEMFD_CREATE => self.sys_memfd_create(a0.into(), a1),
             Sys::TIMERFD_CREATE => self.sys_timerfd_create(a0, a1),
             Sys::TIMERFD_SETTIME => self.sys_timerfd_settime(a0.into(), a1, a2.into(), a3.into()),

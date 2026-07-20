@@ -410,6 +410,53 @@ impl Syscall<'_> {
         Ok(fd.into())
     }
 
+    /// `inotify_init1(2)`: create an inotify instance. `flags` may carry
+    /// `IN_NONBLOCK` (0o4000) / `IN_CLOEXEC` (0o2000000), sharing the
+    /// `O_NONBLOCK` / `O_CLOEXEC` bit values. `inotify_init(2)` is this with
+    /// flags = 0. labwc and GTK apps call this to watch their config dirs.
+    pub fn sys_inotify_init1(&self, flags: usize) -> SysResult {
+        info!("inotify_init1: flags={:#x}", flags);
+        // Only NONBLOCK/CLOEXEC are valid; reject anything else like Linux.
+        const IN_NONBLOCK: usize = 0o4000;
+        const IN_CLOEXEC: usize = 0o2000000;
+        if flags & !(IN_NONBLOCK | IN_CLOEXEC) != 0 {
+            return Err(LxError::EINVAL);
+        }
+        let inotify = linux_object::fs::Inotify::new(OpenFlags::from_bits_truncate(flags));
+        let fd = self.linux_process().add_file(inotify)?;
+        Ok(fd.into())
+    }
+
+    /// `inotify_add_watch(2)`: add `pathname` to the watch list of the inotify
+    /// instance `fd`, returning a watch descriptor.
+    pub fn sys_inotify_add_watch(
+        &self,
+        fd: usize,
+        pathname: UserInPtr<u8>,
+        mask: u32,
+    ) -> SysResult {
+        let path = pathname.as_c_str()?;
+        info!(
+            "inotify_add_watch: fd={}, path={:?}, mask={:#x}",
+            fd, path, mask
+        );
+        let file = self.linux_process().get_file_like(fd.into())?;
+        let inotify = file
+            .downcast_arc::<linux_object::fs::Inotify>()
+            .map_err(|_| LxError::EINVAL)?;
+        inotify.add_watch(path, mask)
+    }
+
+    /// `inotify_rm_watch(2)`: remove watch descriptor `wd` from inotify `fd`.
+    pub fn sys_inotify_rm_watch(&self, fd: usize, wd: i32) -> SysResult {
+        info!("inotify_rm_watch: fd={}, wd={}", fd, wd);
+        let file = self.linux_process().get_file_like(fd.into())?;
+        let inotify = file
+            .downcast_arc::<linux_object::fs::Inotify>()
+            .map_err(|_| LxError::EINVAL)?;
+        inotify.rm_watch(wd)
+    }
+
     /// `perf_event_open(2)`: open a performance-monitoring file descriptor.
     ///
     /// Implements software CPU-clock sampling (no hardware PMU). The returned fd
