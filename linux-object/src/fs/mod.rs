@@ -127,6 +127,68 @@ lazy_static! {
 static MEMFD_SEQ: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 lazy_static! {
+    /// Weak refs to every memfd inode ever created, for leak diagnostics: the
+    /// desktop OOM traced to ~456 MiB of LIVE ramfs page blocks reachable only
+    /// from memfd files that should have been freed on close. `memfd_stats`
+    /// prunes dead entries and reports how many inodes are still alive and how
+    /// many bytes they pin.
+    static ref MEMFD_LIVE: Mutex<Vec<(usize, alloc::sync::Weak<dyn INode>)>> =
+        Mutex::new(Vec::new());
+}
+
+/// (created_total, live_count, live_bytes) for memfd inodes.
+///
+/// Uses `try_lock`: this is called from the OOM handler, and a concurrent
+/// `new_memfd` registration (or a caller further up the stack) may hold the
+/// registry lock — blocking here would wedge the OOM report (seen in the lab:
+/// both CPUs froze mid-report). Returns zeros for live/bytes if contended.
+pub fn memfd_stats() -> (usize, usize, usize) {
+    let created = MEMFD_SEQ.load(core::sync::atomic::Ordering::Relaxed);
+    let mut live = match MEMFD_LIVE.try_lock() {
+        Some(guard) => guard,
+        None => return (created, 0, 0),
+    };
+    live.retain(|(_, w)| w.strong_count() > 0);
+    let mut bytes = 0usize;
+    let count = live.len();
+    for (_, w) in live.iter() {
+        if let Some(inode) = w.upgrade() {
+            if let Ok(m) = inode.metadata() {
+                bytes += m.size;
+            }
+        }
+    }
+    (created, count, bytes)
+}
+
+/// One line per live memfd (seq, size, inode strong count), newest first,
+/// up to `max` entries — enough to tell leaked wl_shm pools (MiB-sized, extra
+/// strong refs) from cursor-sized scratch files.
+pub fn memfd_dump_live(max: usize) {
+    let live = match MEMFD_LIVE.try_lock() {
+        Some(guard) => guard,
+        None => return,
+    };
+    let (created, count) = (
+        MEMFD_SEQ.load(core::sync::atomic::Ordering::Relaxed),
+        live.iter().filter(|(_, w)| w.strong_count() > 0).count(),
+    );
+    warn!("[memfd] created={} live={}", created, count);
+    for (seq, w) in live.iter().rev().take(max) {
+        if let Some(inode) = w.upgrade() {
+            let size = inode.metadata().map(|m| m.size).unwrap_or(0);
+            // strong_count includes our temporary upgrade — report without it.
+            warn!(
+                "[memfd]   seq={} size={} strong={}",
+                seq,
+                size,
+                alloc::sync::Weak::strong_count(w).saturating_sub(1)
+            );
+        }
+    }
+}
+
+lazy_static! {
     /// Writable ramfs exposed as the `/dev/shm` directory so POSIX `shm_open()`
     /// can create files there (e.g. wlroots' xkb keymap fd). It is inserted
     /// straight into devfs (not mounted via MountFS): `/dev/*` lookups take the
@@ -156,6 +218,33 @@ pub fn new_memfd(name: &str, flags: usize) -> LxResult<Arc<File>> {
     // Detach the directory entry: the open fd is the sole owner now, so a close
     // frees the RAM and nothing can resolve the (hidden) name.
     let _ = root.unlink(&backing);
+    {
+        // Never allocate while holding the registry lock: a Vec growth OOMing
+        // under it self-deadlocks the OOM reporter (which takes this lock).
+        // Grow by building a bigger buffer OUTSIDE the lock and swapping it in
+        // (drain+extend under the lock is a plain memcpy, no allocation).
+        let mut elem = Some((seq, alloc::sync::Arc::downgrade(&inode)));
+        loop {
+            let cap = {
+                let mut live = MEMFD_LIVE.lock();
+                if live.len() < live.capacity() {
+                    live.push(elem.take().unwrap());
+                    break;
+                }
+                live.capacity()
+            };
+            let mut spare = Vec::with_capacity((cap * 2).max(64));
+            let mut live = MEMFD_LIVE.lock();
+            if live.len() < spare.capacity() {
+                spare.extend(live.drain(..));
+                spare.push(elem.take().unwrap());
+                *live = spare;
+                break;
+            }
+            // Raced with another grower that filled even the doubled size;
+            // retry with the fresh capacity.
+        }
+    }
 
     let mut open_flags = OpenFlags::RDWR;
     if flags & MFD_CLOEXEC != 0 {
@@ -331,6 +420,18 @@ pub trait FileLike: KernelObject + downcast_rs::DowncastSync {
     /// Returns the [`VmObject`] representing the file with given `offset` and `len`.
     fn get_vmo(&self, _offset: usize, _len: usize) -> LxResult<Arc<VmObject>> {
         Err(LxError::ENOSYS)
+    }
+    /// Like [`get_vmo`](Self::get_vmo), but for `MAP_SHARED` mappings: every
+    /// mapper of the same file must receive the SAME `VmObject`, so stores by
+    /// one process are visible to every other mapper (the wl_shm contract —
+    /// clients render into a mapped memfd and the compositor reads the pixels
+    /// through its own mapping). Returns `(vmo, vmo_offset)`: the vmo may span
+    /// the whole file with the caller mapping at `vmo_offset`.
+    ///
+    /// The default falls back to the per-call snapshot; `File` overrides it
+    /// with a per-inode registry.
+    fn get_vmo_shared(&self, offset: usize, len: usize) -> LxResult<(Arc<VmObject>, usize)> {
+        self.get_vmo(offset, len).map(|vmo| (vmo, 0))
     }
     /// Casting between trait objects, or use crate: cast_trait_object
     fn as_socket(&self) -> LxResult<&dyn Socket> {

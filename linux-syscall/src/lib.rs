@@ -273,6 +273,9 @@ impl Syscall<'_> {
             Sys::SOCKET => self.sys_socket(a0, a1, a2),
             Sys::CONNECT => self.sys_connect(a0, a1.into(), a2).await,
             Sys::ACCEPT => self.sys_accept(a0, a1.into(), a2.into()).await,
+            // accept4 == accept + flags on the NEW socket (SOCK_CLOEXEC /
+            // SOCK_NONBLOCK). GLib/GDBus uses it unconditionally; falling
+            // through to `unknown syscall` broke waybar's D-Bus socket path.
             Sys::ACCEPT4 => self.sys_accept4(a0, a1.into(), a2.into(), a3).await,
             Sys::SENDTO => self.sys_sendto(a0, a1.into(), a2, a3, a4.into(), a5),
             Sys::RECVFROM => {
@@ -292,6 +295,23 @@ impl Syscall<'_> {
 
             // process
             Sys::EXECVE => self.sys_execve(a0.into(), a1.into(), a2.into()),
+            // clone3 is deliberately ENOSYS (pre-Linux-5.3 behaviour; glibc and
+            // musl fall back to legacy clone cleanly). Root cause, found in the
+            // QEMU desktop lab: glibc's __clone3 child stub starts with
+            // `mov %r8,%rdi; call *%rdx` — it requires RDX (and R8) to survive
+            // the syscall INTO THE NEW CHILD. Legacy clone's stub instead pops
+            // the function/argument off the child STACK, which is robust. Our
+            // new-thread first-entry path does not preserve the parent's RDX
+            // into the child, so clone3-started threads jumped to garbage
+            // (observed: kernel wild jump to 0x400000006, a #GP on a
+            // non-canonical pointer inside epoll_pwait, and an all-idle wedge
+            // when the crashed thread held a compositor lock). Until the child
+            // context provably carries every caller-saved register, answering
+            // ENOSYS is the correct, safe behaviour — sys_clone3 below stays
+            // implemented for when that is fixed.
+            Sys::CLONE3 => Err(LxError::ENOSYS),
+            #[allow(unreachable_patterns)]
+            Sys::CLONE3 => self.sys_clone3(a0.into(), a1).await,
             Sys::EXIT => self.sys_exit(a0 as _),
             Sys::EXIT_GROUP => self.sys_exit_group(a0 as _),
             Sys::WAIT4 => self.sys_wait4(a0 as _, a1.into(), a2 as _).await,
@@ -401,6 +421,10 @@ impl Syscall<'_> {
             // implement, nor (b) flood the log with "unknown syscall: RSEQ" on
             // every process spawn (very visible under `perf`/exec-heavy loads).
             Sys::RSEQ => Err(LxError::ENOSYS),
+            // Same treatment: glibc/util-linux/wlroots stacks probe
+            // name_to_handle_at on hotplug/device paths and handle ENOSYS
+            // fine; the loud per-call ERROR line was pure log noise.
+            Sys::NAME_TO_HANDLE_AT => Err(LxError::ENOSYS),
             Sys::MEMBARRIER => self.sys_membarrier(a0 as i32, a1 as u32, a2 as i32),
             Sys::PRLIMIT64 => self.sys_prlimit64(a0, a1, a2.into(), a3.into()),
             Sys::REBOOT => self.sys_reboot(a0 as u32, a1 as u32, a2 as u32, a3.into()),

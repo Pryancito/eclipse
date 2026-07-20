@@ -67,6 +67,13 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     // fixed the stall it was hunting) -- labwc owns the screen again in
     // KD_GRAPHICS; kernel logs go to dmesg and the text console only.
     memory::insert_regions(&kernel_hal::mem::free_pmem_regions());
+    // The kernel runs on the BOOTLOADER's page tables, which live in memory
+    // UEFI reports as reclaimable — the line above just fed those live
+    // page-table frames to the allocator as free RAM. Pull them back out
+    // before the first allocation can recycle one (see the function's doc for
+    // the corruption/triple-fault chain this caused).
+    #[cfg(target_arch = "x86_64")]
+    memory::reserve_active_page_table_frames();
     kernel_hal::console::early_progress_bar(80);
     kernel_hal::primary_init();
     // Bring up the hunter security subsystem. Register the monotonic clock

@@ -24,6 +24,18 @@ pub fn init() {
         if i == 3 || i == 4 {
             opt.set_privilege_level(PrivilegeLevel::Ring3);
         }
+        // Double fault (#DF, vector 8) runs on its own known-good IST stack
+        // (see gdt.rs). Without it, the dominant #DF cause — a kernel stack
+        // overflow — pushes the exception frame onto the very stack that just
+        // overflowed, faults again, and TRIPLE-FAULTS: the machine silently
+        // resets with no banner (observed: the desktop rebooting every ~50 s
+        // once waybar started, with nothing on serial). With the IST the #DF
+        // handler runs and panics with the trap frame instead.
+        if i == 8 {
+            unsafe {
+                opt.set_stack_index(0);
+            }
+        }
     }
     idt.load();
     // Store pointer for APs.

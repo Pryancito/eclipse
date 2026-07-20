@@ -208,6 +208,67 @@ pub fn frame_stats() -> (usize, usize) {
     )
 }
 
+/// Reserve every frame of the CURRENTLY ACTIVE page-table tree so the frame
+/// allocator can never hand them out as ordinary RAM.
+///
+/// Root cause of the desktop's escalating corruption: on x86_64 the kernel
+/// keeps running on the page tables the BOOTLOADER built — and UEFI marks
+/// that memory as reclaimable boot-services data, so `insert_regions` fed the
+/// LIVE page-table frames into the allocator as free RAM. Nothing failed
+/// until memory pressure (waybar's GTK heap) finally reused one of those
+/// frames: translations then rotted progressively (kernel #GPs whose
+/// registers held ELF file bytes, an all-idle wakeup wedge) and, once the
+/// root PML4 itself was recycled, the next `activate_kernel_paging()` loaded
+/// a CR3 whose tree was user data — instruction fetch of the kernel faulted,
+/// the #DF handler was unfetchable for the same reason, and the machine
+/// TRIPLE-FAULTED with no banner (QEMU `-d int` was needed to see it).
+///
+/// Must run right after `insert_regions`, before any frame allocation.
+pub fn reserve_active_page_table_frames() {
+    let root = kernel_hal::vm::current_vmtoken();
+    if root == 0 {
+        return; // libos / no paging context: nothing to reserve
+    }
+    let mut ba = FRAME_ALLOCATOR.lock();
+    let mut reserved = 0usize;
+    // Depth-first walk of the 4-level tree. Huge-page entries (PS bit) have no
+    // lower table; entry bit 0 = present. Physical addresses are masked to 52
+    // bits and page-aligned.
+    fn walk(ba: &mut FrameAlloc, table_pa: usize, level: u8, reserved: &mut usize) {
+        const PRESENT: u64 = 1;
+        const HUGE: u64 = 1 << 7;
+        let idx = table_pa >> PAGE_BITS;
+        if table_pa != 0 && table_pa < MAX_MANAGED_PADDR_EXCLUSIVE {
+            // `remove` marks the frame used regardless of current state.
+            ba.remove(idx..idx + 1);
+            *reserved += 1;
+        }
+        if level == 1 {
+            return;
+        }
+        let entries = unsafe {
+            core::slice::from_raw_parts(
+                kernel_hal::mem::phys_to_virt(table_pa) as *const u64,
+                512,
+            )
+        };
+        for &e in entries {
+            if e & PRESENT == 0 || (level < 4 && e & HUGE != 0) {
+                continue;
+            }
+            let child = (e & 0x000f_ffff_ffff_f000) as usize;
+            walk(ba, child, level - 1, reserved);
+        }
+    }
+    walk(&mut ba, root, 4, &mut reserved);
+    drop(ba);
+    crate::klog_info!(
+        "memory: reserved {} live page-table frame(s) of the boot tree (root {:#x})",
+        reserved,
+        root
+    );
+}
+
 /// Combined usage for `/proc/meminfo` and diagnostics.
 pub fn stats() -> (usize, usize) {
     let heap_used = HEAP_USED.load(Ordering::Relaxed);
@@ -234,7 +295,13 @@ cfg_if! {
         };
 
         /// Kernel heap — separate from the physical frame pool.
-        const KERNEL_HEAP_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
+        ///
+        /// 512 MiB: the full desktop session (labwc + lunarbg + foot + waybar,
+        /// each mapping dozens of glibc shared objects through the SFS block
+        /// cache) OOMed the previous 256 MiB pool while the clients were still
+        /// loading. The heap is a BSS static, so this costs nothing on disk and
+        /// only reserves (zero-fill) RAM at boot.
+        const KERNEL_HEAP_SIZE: usize = 512 * 1024 * 1024; // 512 MiB
         const ORDER: usize = 32;
 
         // Invariants: `init()` carves the heap into word-sized slots
@@ -285,12 +352,144 @@ cfg_if! {
             }
         }
 
-        // DEBUG: redzone/canario tras cada asignación del heap. Si algo desborda
-        // una asignación (escribe pasado su final), se detecta al liberar y se
-        // panica con el tamaño/posición -> identifica la asignación culpable de la
-        // corrupción del heap (que se sospecha pisa los BTreeMap de frames de VMO).
+        // Sin redzone: el canario de depuración (16 bytes tras cada asignación)
+        // ya cumplió su función (la corrupción de heap que perseguía está
+        // arreglada) y tenía un coste oculto brutal: el buddy allocator
+        // redondea cada asignación a la potencia de dos superior, así que una
+        // asignación de 4096 bytes (la clase dominante: caché de bloques del
+        // SFS, buffers de pipe) pasaba a consumir 8192 reales. La sesión de
+        // escritorio agotaba el pool con `HEAP_USED` marcando solo ~54%, porque
+        // la contabilidad cuenta `sz` y no el bloque redondeado.
+
+        // Histograma de asignaciones VIVAS por clase de tamaño (log2). El OOM
+        // del escritorio (499/512 MiB usados) necesita atribución: qué clase
+        // de tamaño retiene el heap. Coste: un fetch_add relajado por
+        // alloc/dealloc. `heap_live_histogram` lo vuelca el alloc_error
+        // handler sin asignar memoria.
+        const HEAP_BUCKETS: usize = 32;
+        static HEAP_LIVE: [AtomicUsize; HEAP_BUCKETS] = {
+            const Z: AtomicUsize = AtomicUsize::new(0);
+            [Z; HEAP_BUCKETS]
+        };
+
+        #[inline]
+        fn bucket_of(size: usize) -> usize {
+            (usize::BITS - size.max(1).leading_zeros()) as usize % HEAP_BUCKETS
+        }
+
+        /// Live-allocation counts per power-of-two size class, for the OOM
+        /// report. Index i counts allocations with size in (2^(i-1), 2^i].
+        pub fn heap_live_histogram() -> [usize; HEAP_BUCKETS] {
+            let mut out = [0usize; HEAP_BUCKETS];
+            for (i, slot) in HEAP_LIVE.iter().enumerate() {
+                out[i] = slot.load(Ordering::Relaxed);
+            }
+            out
+        }
+
+        // Exact-size tracking for the OOM's dominant class: the first report
+        // showed ~116k live allocations in the 4..8 KiB bucket eating the whole
+        // heap, and the exact byte size is usually enough to name the struct
+        // responsible. Track live counts for up to 16 distinct sizes in
+        // [4096, 8192], first-come-first-served.
+        const HOT_LO: usize = 4096;
+        const HOT_HI: usize = 8192;
+        const HOT_SLOTS: usize = 16;
+        static HOT_SIZE: [AtomicUsize; HOT_SLOTS] = {
+            const Z: AtomicUsize = AtomicUsize::new(0);
+            [Z; HOT_SLOTS]
+        };
+        static HOT_LIVE: [AtomicUsize; HOT_SLOTS] = {
+            const Z: AtomicUsize = AtomicUsize::new(0);
+            [Z; HOT_SLOTS]
+        };
+
+        fn hot_track(size: usize, delta: isize) {
+            if !(HOT_LO..=HOT_HI).contains(&size) {
+                return;
+            }
+            for i in 0..HOT_SLOTS {
+                let cur = HOT_SIZE[i].load(Ordering::Relaxed);
+                let claimed = cur == size
+                    || (cur == 0
+                        && HOT_SIZE[i]
+                            .compare_exchange(0, size, Ordering::Relaxed, Ordering::Relaxed)
+                            .map_or_else(|racer| racer == size, |_| true));
+                if claimed {
+                    if delta > 0 {
+                        let live = HOT_LIVE[i].fetch_add(1, Ordering::Relaxed) + 1;
+                        // Leak-site sampler: the desktop OOM is ~117k live
+                        // 4096-byte allocations. There is no panic backtrace in
+                        // this kernel, so when the live count crosses a
+                        // threshold, scan the current stack for kernel-text
+                        // return addresses and print them — a poor man's
+                        // backtrace naming the allocating call chain
+                        // (resolve offline with addr2line).
+                        if size == 4096 && (live == 50_000 || live == 90_000) {
+                            leak_trace_dump(live);
+                        }
+                    } else {
+                        HOT_LIVE[i].fetch_sub(1, Ordering::Relaxed);
+                    }
+                    return;
+                }
+            }
+        }
+
+        /// Print kernel-.text-looking words found on the current stack (the
+        /// return-address chain of whoever is allocating), via the no-alloc
+        /// spin serial writer. Reads stay inside the mapped kernel heap /
+        /// physmap, so over-scanning past the coroutine stack top is safe.
+        #[cold]
+        fn leak_trace_dump(live: usize) {
+            let mut rsp: usize;
+            unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp) };
+            kernel_hal::console::serial_write_fmt_spin(format_args!(
+                "\n[leaktrace] 4096B live={} stack-scan:",
+                live
+            ));
+            const TEXT_LO: usize = 0xffffff00_0000_1000;
+            const TEXT_HI: usize = 0xffffff00_0100_0000;
+            let mut printed = 0;
+            let mut p = rsp;
+            while printed < 24 && p < rsp + 32 * 1024 {
+                let v = unsafe { core::ptr::read_volatile(p as *const usize) };
+                if (TEXT_LO..TEXT_HI).contains(&v) {
+                    kernel_hal::console::serial_write_fmt_spin(format_args!(" {:#x}", v));
+                    printed += 1;
+                }
+                p += 8;
+            }
+            kernel_hal::console::serial_write_fmt_spin(format_args!("\n"));
+        }
+
+        /// (size, live-count) pairs for the exact-size tracker (0 = unused slot).
+        pub fn heap_hot_sizes() -> [(usize, usize); HOT_SLOTS] {
+            let mut out = [(0usize, 0usize); HOT_SLOTS];
+            for i in 0..HOT_SLOTS {
+                out[i] = (
+                    HOT_SIZE[i].load(Ordering::Relaxed),
+                    HOT_LIVE[i].load(Ordering::Relaxed),
+                );
+            }
+            out
+        }
+
+        // Heap-corruption forensics, reinstated after the desktop soak kept
+        // dying on #GPs whose registers held ELF-magic bytes (a freed heap
+        // block reused as a file buffer while its old owner still points at
+        // it). Two tools:
+        //  * REDZONE canary after every allocation: linear overflows panic at
+        //    dealloc naming the clobbered block. (This was removed earlier
+        //    because the buddy's power-of-two rounding doubled the dominant
+        //    4 KiB class; with the ramfs now sparse the headroom is back.)
+        //  * Poison-on-free (0xA5): a use-after-free READ yields the
+        //    unmistakable 0xa5a5... pattern in crash registers instead of
+        //    whatever the next owner wrote, separating "read after free" from
+        //    "read after free AND reuse".
         const REDZONE: usize = 16;
         const CANARY: u8 = 0xAB;
+        const POISON: u8 = 0xA5;
 
         unsafe impl<const ORDER: usize> GlobalAlloc for LockedHeap<ORDER> {
             unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -302,6 +501,8 @@ cfg_if! {
                     .ok()
                     .map_or(core::ptr::null_mut::<u8>(), |allocation| {
                         HEAP_USED.fetch_add(sz, Ordering::Relaxed);
+                        HEAP_LIVE[bucket_of(sz)].fetch_add(1, Ordering::Relaxed);
+                        hot_track(sz, 1);
                         let p = allocation.as_ptr();
                         let cz = p.add(sz);
                         for i in 0..REDZONE {
@@ -313,12 +514,11 @@ cfg_if! {
 
             unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
                 let sz = layout.size();
-                // Comprobar el canario ANTES de tomar el lock del heap.
                 let cz = ptr.add(sz);
                 for i in 0..REDZONE {
                     if core::ptr::read_volatile(cz.add(i)) != CANARY {
                         panic!(
-                            "[heapcanary] HEAP OVERFLOW: ptr={:#x} size={} align={} clobbered en +{} (val={:#x})",
+                            "[heapcanary] HEAP OVERFLOW: ptr={:#x} size={} align={} clobbered at +{} (val={:#x})",
                             ptr as usize,
                             sz,
                             layout.align(),
@@ -327,7 +527,12 @@ cfg_if! {
                         );
                     }
                 }
+                // Poison the payload before returning it to the buddy so a
+                // stale reader sees 0xa5a5... instead of plausible data.
+                core::ptr::write_bytes(ptr, POISON, sz);
                 HEAP_USED.fetch_sub(sz, Ordering::Relaxed);
+                HEAP_LIVE[bucket_of(sz)].fetch_sub(1, Ordering::Relaxed);
+                hot_track(sz, -1);
                 let ext = Layout::from_size_align_unchecked(sz + REDZONE, layout.align());
                 self.0.lock().dealloc(NonNull::new_unchecked(ptr), ext)
             }
