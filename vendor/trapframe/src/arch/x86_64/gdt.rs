@@ -170,6 +170,12 @@ pub fn init() {
     // wild UserContext corruption -> iret to ring-0 junk -> #UD). Use 64 KiB.
     let trap_stack_top = Box::leak(Box::new([0u8; 0x10000])).as_ptr() as u64 + 0x10000;
     region.tss.privilege_stack_table[0] = VirtAddr::new(trap_stack_top);
+    // Dedicated #DF stack (IST1; see idt.rs vector 8). A double fault caused
+    // by a kernel stack overflow cannot be handled on the faulting stack —
+    // the CPU must switch to a known-good one or the machine triple-faults
+    // silently. 16 KiB is ample: the #DF handler only prints and panics.
+    let df_stack_top = Box::leak(Box::new([0u8; 0x4000])).as_ptr() as u64 + 0x4000;
+    region.tss.interrupt_stack_table[0] = VirtAddr::new(df_stack_top);
     let region: &'static CpuLocalRegion = Box::leak(region);
     let tss: &'static TSS = &region.tss;
     let (tss0, tss1) = match Descriptor::tss_segment(tss) {
@@ -248,6 +254,12 @@ pub fn init_ap() {
     // wild UserContext corruption -> iret to ring-0 junk -> #UD). Use 64 KiB.
     let trap_stack_top = Box::leak(Box::new([0u8; 0x10000])).as_ptr() as u64 + 0x10000;
     region.tss.privilege_stack_table[0] = VirtAddr::new(trap_stack_top);
+    // Dedicated #DF stack (IST1; see idt.rs vector 8). A double fault caused
+    // by a kernel stack overflow cannot be handled on the faulting stack —
+    // the CPU must switch to a known-good one or the machine triple-faults
+    // silently. 16 KiB is ample: the #DF handler only prints and panics.
+    let df_stack_top = Box::leak(Box::new([0u8; 0x4000])).as_ptr() as u64 + 0x4000;
+    region.tss.interrupt_stack_table[0] = VirtAddr::new(df_stack_top);
     let region: &'static CpuLocalRegion = Box::leak(region);
     let tss: &'static TSS = &region.tss;
     let (tss0, tss1) = match Descriptor::tss_segment(tss) {
