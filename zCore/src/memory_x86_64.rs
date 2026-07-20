@@ -356,13 +356,50 @@ cfg_if! {
                             .map_or_else(|racer| racer == size, |_| true));
                 if claimed {
                     if delta > 0 {
-                        HOT_LIVE[i].fetch_add(1, Ordering::Relaxed);
+                        let live = HOT_LIVE[i].fetch_add(1, Ordering::Relaxed) + 1;
+                        // Leak-site sampler: the desktop OOM is ~117k live
+                        // 4096-byte allocations. There is no panic backtrace in
+                        // this kernel, so when the live count crosses a
+                        // threshold, scan the current stack for kernel-text
+                        // return addresses and print them — a poor man's
+                        // backtrace naming the allocating call chain
+                        // (resolve offline with addr2line).
+                        if size == 4096 && (live == 50_000 || live == 90_000) {
+                            leak_trace_dump(live);
+                        }
                     } else {
                         HOT_LIVE[i].fetch_sub(1, Ordering::Relaxed);
                     }
                     return;
                 }
             }
+        }
+
+        /// Print kernel-.text-looking words found on the current stack (the
+        /// return-address chain of whoever is allocating), via the no-alloc
+        /// spin serial writer. Reads stay inside the mapped kernel heap /
+        /// physmap, so over-scanning past the coroutine stack top is safe.
+        #[cold]
+        fn leak_trace_dump(live: usize) {
+            let mut rsp: usize;
+            unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp) };
+            kernel_hal::console::serial_write_fmt_spin(format_args!(
+                "\n[leaktrace] 4096B live={} stack-scan:",
+                live
+            ));
+            const TEXT_LO: usize = 0xffffff00_0000_1000;
+            const TEXT_HI: usize = 0xffffff00_0100_0000;
+            let mut printed = 0;
+            let mut p = rsp;
+            while printed < 24 && p < rsp + 32 * 1024 {
+                let v = unsafe { core::ptr::read_volatile(p as *const usize) };
+                if (TEXT_LO..TEXT_HI).contains(&v) {
+                    kernel_hal::console::serial_write_fmt_spin(format_args!(" {:#x}", v));
+                    printed += 1;
+                }
+                p += 8;
+            }
+            kernel_hal::console::serial_write_fmt_spin(format_args!("\n"));
         }
 
         /// (size, live-count) pairs for the exact-size tracker (0 = unused slot).
