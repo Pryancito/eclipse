@@ -280,7 +280,19 @@ impl Syscall<'_> {
     pub fn sys_ftruncate(&self, fd: FileDesc, len: usize) -> SysResult {
         info!("ftruncate: fd={:?}, len={}", fd, len);
         let proc = self.linux_process();
-        proc.get_file(fd)?.set_len(len as u64)?;
+        let file = proc.get_file(fd)?;
+        // The desktop OOM was a single ftruncate growing one RAM-backed file
+        // to ~456 MiB (117k live 4 KiB ramfs blocks in one resize). Name any
+        // suspicious-sized truncate loudly: which file, how big, and who.
+        if len >= 16 * 1024 * 1024 {
+            warn!(
+                "[ftruncate] BIG: len={} MiB path={} comm={}",
+                len >> 20,
+                file.path(),
+                self.zircon_process().name(),
+            );
+        }
+        file.set_len(len as u64)?;
         // Leak telemetry: the desktop OOM is unfreed memfd content, and
         // ftruncate is the call that sizes memfds — every 64th call, log the
         // live-memfd census (count, sizes, strong refs) so the growth and its
