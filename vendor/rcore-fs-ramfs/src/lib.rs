@@ -21,10 +21,18 @@ use spin::{RwLock, RwLockWriteGuard};
 /// units and removes the O(n) realloc-copy that dominated large writes.
 const BLOCK: usize = 4096;
 
-/// Paged byte buffer: `len` logical bytes stored across `BLOCK`-sized blocks.
+/// Paged byte buffer: `len` logical bytes stored SPARSELY across `BLOCK`-sized
+/// blocks — `None` slots are holes that read back as zeros and cost no memory.
+///
+/// Sparseness is load-bearing, matching Linux tmpfs/memfd semantics: clients
+/// size shm files far beyond what they touch. foot ftruncates its
+/// wl_shm buffer pool memfd to 512 MiB and then writes only the few MiB it
+/// actually renders; the previous eager zero-filled `resize` allocated all
+/// 131k blocks from the kernel heap in that one call and OOM-panicked the
+/// whole desktop. Blocks now materialize only when first written.
 #[derive(Default)]
 struct PagedBytes {
-    blocks: Vec<alloc::boxed::Box<[u8]>>,
+    blocks: Vec<Option<alloc::boxed::Box<[u8]>>>,
     len: usize,
 }
 
@@ -38,23 +46,21 @@ impl PagedBytes {
         alloc::vec![0u8; BLOCK].into_boxed_slice()
     }
 
-    /// Resize to `new_len`, zero-filling any newly exposed bytes.
+    /// Resize to `new_len`. Growing exposes a hole (zeros, no allocation);
+    /// shrinking frees now-unreachable blocks and zeroes the stale tail of the
+    /// last partial block so a later grow does not resurrect old bytes.
     fn resize(&mut self, new_len: usize) {
         let nblocks = (new_len + BLOCK - 1) / BLOCK;
         if nblocks < self.blocks.len() {
             self.blocks.truncate(nblocks);
         } else {
-            self.blocks.reserve(nblocks - self.blocks.len());
-            while self.blocks.len() < nblocks {
-                self.blocks.push(Self::alloc_zeroed_block());
-            }
+            // Hole: slots exist but hold no storage until first written.
+            self.blocks.resize_with(nblocks, || None);
         }
         if new_len < self.len {
-            // Shrinking: clear the stale tail of the last (now partial) block
-            // so a later grow does not resurrect old bytes.
             let off = new_len % BLOCK;
             if off != 0 {
-                if let Some(b) = self.blocks.get_mut(new_len / BLOCK) {
+                if let Some(Some(b)) = self.blocks.get_mut(new_len / BLOCK) {
                     for x in &mut b[off..] {
                         *x = 0;
                     }
@@ -75,40 +81,45 @@ impl PagedBytes {
             let bi = pos / BLOCK;
             let bo = pos % BLOCK;
             let chunk = (BLOCK - bo).min(n - done);
-            buf[done..done + chunk].copy_from_slice(&self.blocks[bi][bo..bo + chunk]);
+            match self.blocks.get(bi).and_then(|b| b.as_ref()) {
+                Some(b) => buf[done..done + chunk].copy_from_slice(&b[bo..bo + chunk]),
+                // Hole: reads as zeros.
+                None => buf[done..done + chunk].fill(0),
+            }
             done += chunk;
         }
         n
     }
 
     fn write_at(&mut self, offset: usize, buf: &[u8]) {
-        // A hole (offset past current end) must read back as zeros; materialize
-        // it before writing the data so intermediate blocks exist and are zeroed.
-        if offset > self.len {
-            self.resize(offset);
-        }
         let end = offset + buf.len();
         let nblocks = (end + BLOCK - 1) / BLOCK;
-        self.blocks.reserve(nblocks.saturating_sub(self.blocks.len()));
+        if nblocks > self.blocks.len() {
+            // Any implicit gap between old EOF and `offset` stays a hole.
+            self.blocks.resize_with(nblocks, || None);
+        }
         let mut done = 0;
         while done < buf.len() {
             let pos = offset + done;
             let bi = pos / BLOCK;
             let bo = pos % BLOCK;
             let chunk = (BLOCK - bo).min(buf.len() - done);
-            if bi < self.blocks.len() {
-                self.blocks[bi][bo..bo + chunk].copy_from_slice(&buf[done..done + chunk]);
-            } else if bo == 0 && chunk == BLOCK {
-                // New block fully covered by this write: allocate and copy in a
-                // single pass, skipping the zero-fill entirely.
-                let mut v = Vec::with_capacity(BLOCK);
-                v.extend_from_slice(&buf[done..done + chunk]);
-                self.blocks.push(v.into_boxed_slice());
-            } else {
-                // New trailing block only partially written: zero then fill.
-                let mut b = Self::alloc_zeroed_block();
-                b[bo..bo + chunk].copy_from_slice(&buf[done..done + chunk]);
-                self.blocks.push(b);
+            match &mut self.blocks[bi] {
+                Some(b) => b[bo..bo + chunk].copy_from_slice(&buf[done..done + chunk]),
+                slot @ None => {
+                    // First write materializes the block. A fully covered block
+                    // skips the zero-fill.
+                    let b = if bo == 0 && chunk == BLOCK {
+                        let mut v = alloc::vec::Vec::with_capacity(BLOCK);
+                        v.extend_from_slice(&buf[done..done + chunk]);
+                        v.into_boxed_slice()
+                    } else {
+                        let mut b = Self::alloc_zeroed_block();
+                        b[bo..bo + chunk].copy_from_slice(&buf[done..done + chunk]);
+                        b
+                    };
+                    *slot = Some(b);
+                }
             }
             done += chunk;
         }
@@ -214,7 +225,23 @@ impl INode for LockedINode {
         if file.extra.type_ == FileType::Dir {
             return Err(FsError::IsDir);
         }
+        let before = file.content.len();
         file.content.write_at(offset, buf);
+        // Growth telemetry: a ramfs file silently growing without bound is a
+        // kernel-heap leak (each 4 KiB block is a heap allocation) — the
+        // desktop OOM was ~456 MiB of such blocks with no obvious owner. Warn
+        // each time a file crosses another 32 MiB boundary, with its inode id
+        // so the writer can be identified.
+        let after = file.content.len();
+        const STEP: usize = 32 * 1024 * 1024;
+        if after / STEP > before / STEP {
+            log::warn!(
+                "[ramfs] inode={} grew to {} MiB (write_at offset={})",
+                file.extra.inode,
+                after >> 20,
+                offset
+            );
+        }
         Ok(buf.len())
     }
 
@@ -259,6 +286,16 @@ impl INode for LockedINode {
     fn resize(&self, len: usize) -> Result<()> {
         let mut file = self.0.write();
         if file.extra.type_ == FileType::File {
+            // See write_at: name any file resized past each 32 MiB boundary.
+            const STEP: usize = 32 * 1024 * 1024;
+            if len / STEP > file.content.len() / STEP {
+                log::warn!(
+                    "[ramfs] inode={} resized {} -> {} MiB",
+                    file.extra.inode,
+                    file.content.len() >> 20,
+                    len >> 20
+                );
+            }
             file.content.resize(len);
             Ok(())
         } else {
