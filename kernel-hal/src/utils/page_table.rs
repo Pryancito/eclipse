@@ -228,6 +228,18 @@ impl<L: PageTableLevel, PTE: GenericPTE> GenericPageTable for PageTableImpl<L, P
     }
 
     fn unmap(&mut self, vaddr: VirtAddr) -> PagingResult<(PhysAddr, PageSize)> {
+        let ret = self.unmap_no_shootdown(vaddr)?;
+        // Removing a mapping leaves stale TLB entries on the other CPUs that
+        // still point at the old frame; once it is freed and reused this
+        // corrupts the new owner. Shoot down the entry on every other online
+        // CPU. Range operations use `unmap_no_shootdown` in a loop plus one
+        // `remote_flush_all` instead — a synchronous shootdown per page is
+        // O(pages × ack-wait) and livelocks when a peer can't ack.
+        crate::common::ipi::remote_flush_tlb(Some(vaddr));
+        Ok(ret)
+    }
+
+    fn unmap_no_shootdown(&mut self, vaddr: VirtAddr) -> PagingResult<(PhysAddr, PageSize)> {
         let (entry, size) = self.get_entry_mut(vaddr)?;
         if entry.is_unused() {
             return Err(PagingError::NotMapped);
@@ -235,15 +247,24 @@ impl<L: PageTableLevel, PTE: GenericPTE> GenericPageTable for PageTableImpl<L, P
         let paddr = entry.addr();
         entry.clear();
         crate::vm::flush_tlb(Some(vaddr));
-        // Removing a mapping leaves stale TLB entries on the other CPUs that
-        // still point at `paddr`; once it is freed and reused this corrupts the
-        // new owner. Shoot down the entry on every other online CPU.
-        crate::common::ipi::remote_flush_tlb(Some(vaddr));
         trace!("PageTable unmap: {:x?} in {:#x?}", vaddr, self.table_phys());
         Ok((paddr, size))
     }
 
     fn update(
+        &mut self,
+        vaddr: VirtAddr,
+        paddr: Option<PhysAddr>,
+        flags: Option<MMUFlags>,
+    ) -> PagingResult<PageSize> {
+        let size = self.update_no_shootdown(vaddr, paddr, flags)?;
+        // Reducing permissions / repointing a live mapping (e.g. COW write
+        // protect) must invalidate the stale entry on the other CPUs too.
+        crate::common::ipi::remote_flush_tlb(Some(vaddr));
+        Ok(size)
+    }
+
+    fn update_no_shootdown(
         &mut self,
         vaddr: VirtAddr,
         paddr: Option<PhysAddr>,
@@ -257,9 +278,6 @@ impl<L: PageTableLevel, PTE: GenericPTE> GenericPageTable for PageTableImpl<L, P
             entry.set_flags(flags, size.is_huge());
         }
         crate::vm::flush_tlb(Some(vaddr));
-        // Reducing permissions / repointing a live mapping (e.g. COW write
-        // protect) must invalidate the stale entry on the other CPUs too.
-        crate::common::ipi::remote_flush_tlb(Some(vaddr));
         trace!(
             "PageTable update: {:x?}, flags={:?} in {:#x?}",
             vaddr,
@@ -267,6 +285,10 @@ impl<L: PageTableLevel, PTE: GenericPTE> GenericPageTable for PageTableImpl<L, P
             self.table_phys()
         );
         Ok(size)
+    }
+
+    fn remote_flush_all(&self) {
+        crate::common::ipi::remote_flush_tlb(None);
     }
 
     fn query(&self, vaddr: VirtAddr) -> PagingResult<(PhysAddr, MMUFlags, PageSize)> {

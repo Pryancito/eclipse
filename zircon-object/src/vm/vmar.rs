@@ -1027,15 +1027,21 @@ impl VmMapping {
     fn protect(&self, flags: MMUFlags, start_index: usize, end_index: usize) {
         let mut inner = self.inner.lock();
         let mut pg_table = self.page_table.lock();
+        // mmu-gather: defer the cross-CPU shootdown to one flush after the
+        // loop; a synchronous shootdown per page livelocks large mprotects
+        // whenever a peer CPU can't ack promptly.
         for i in start_index..end_index {
             let mut new_flags = inner.flags[i];
             new_flags.remove(MMUFlags::RXW);
             new_flags.insert(flags & MMUFlags::RXW);
             inner.flags[i] = new_flags;
             pg_table
-                .update(inner.addr + i * PAGE_SIZE, None, Some(new_flags))
+                .update_no_shootdown(inner.addr + i * PAGE_SIZE, None, Some(new_flags))
                 .ignore()
                 .unwrap();
+        }
+        if start_index < end_index {
+            pg_table.remote_flush_all();
         }
     }
 
@@ -1076,21 +1082,28 @@ impl VmMapping {
             let end = (inner.vmo_offset + inner.size / PAGE_SIZE).min(offset + len);
             if !(start..end).is_empty() {
                 let mut pg_table = self.page_table.lock();
+                // mmu-gather: one cross-CPU shootdown for the whole range
+                // (see `protect` above); per-page synchronous shootdowns
+                // livelock when a peer CPU can't ack.
                 for i in (start - inner.vmo_offset)..(end - inner.vmo_offset) {
                     match op {
                         RangeChangeOp::RemoveWrite => {
                             let mut new_flag = inner.flags[i];
                             new_flag.remove(MMUFlags::WRITE);
                             pg_table
-                                .update(inner.addr + i * PAGE_SIZE, None, Some(new_flag))
+                                .update_no_shootdown(inner.addr + i * PAGE_SIZE, None, Some(new_flag))
                                 .ignore()
                                 .unwrap();
                         }
                         RangeChangeOp::Unmap => {
-                            pg_table.unmap(inner.addr + i * PAGE_SIZE).ignore().unwrap();
+                            pg_table
+                                .unmap_no_shootdown(inner.addr + i * PAGE_SIZE)
+                                .ignore()
+                                .unwrap();
                         }
                     };
                 }
+                pg_table.remote_flush_all();
             }
         }
     }

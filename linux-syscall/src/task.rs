@@ -279,6 +279,72 @@ impl Syscall<'_> {
         Ok(tid as usize)
     }
 
+    /// `clone3` — the extensible successor of `clone`. glibc ≥ 2.34 tries it
+    /// FIRST for `fork()`, `pthread_create()` and `posix_spawn()` and only
+    /// falls back to legacy `clone` on ENOSYS, so answering it natively keeps
+    /// glibc userspace on its primary path (and the log free of
+    /// `unknown syscall: CLONE3`).
+    ///
+    /// Reads `struct clone_args` from `uargs` (`size` bytes, ≥ 64):
+    /// flags / pidfd / child_tid / parent_tid / exit_signal / stack /
+    /// stack_size / tls, all u64. Differences from legacy `clone` handled
+    /// here:
+    ///  * flags and the exit signal are separate fields (legacy packs the
+    ///    signal into the low byte of flags);
+    ///  * `stack` is the LOW address of the child stack and the kernel
+    ///    computes the initial SP as `stack + stack_size` (legacy passes the
+    ///    top directly);
+    ///  * the pidfd (CLONE_PIDFD) has its own output pointer instead of
+    ///    sharing `parent_tid`.
+    /// Everything else is delegated to [`sys_clone`](Self::sys_clone).
+    pub async fn sys_clone3(&self, uargs: UserInPtr<u64>, size: usize) -> SysResult {
+        const CLONE_ARGS_SIZE_VER0: usize = 64;
+        if size < CLONE_ARGS_SIZE_VER0 {
+            return Err(LxError::EINVAL);
+        }
+        let words = uargs.read_array(CLONE_ARGS_SIZE_VER0 / 8)?;
+        let [flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls] =
+            <[u64; 8]>::try_from(words).unwrap();
+        info!(
+            "clone3: flags={:#x} exit_signal={} stack={:#x} stack_size={:#x}",
+            flags, exit_signal, stack, stack_size
+        );
+        // The exit signal lives in its own field; flags carrying low-byte bits
+        // is invalid here, as is an out-of-range signal number.
+        if flags & 0xff != 0 || exit_signal > 64 {
+            return Err(LxError::EINVAL);
+        }
+        if (stack == 0) != (stack_size == 0) {
+            return Err(LxError::EINVAL);
+        }
+        let newsp = if stack != 0 {
+            (stack + stack_size) as usize
+        } else {
+            0
+        };
+        let clone_flags = CloneFlags::from_bits_truncate(flags as usize);
+        // Legacy clone reports the pidfd through the parent_tid slot; clone3
+        // gives it a dedicated field. PARENT_SETTID and PIDFD together can't
+        // be expressed through the legacy entry point — glibc never combines
+        // them, so reject rather than misdeliver one of the two.
+        let parent_slot = if clone_flags.contains(CloneFlags::PIDFD) {
+            if clone_flags.contains(CloneFlags::PARENT_SETTID) {
+                return Err(LxError::EINVAL);
+            }
+            pidfd
+        } else {
+            parent_tid
+        };
+        self.sys_clone(
+            flags as usize | exit_signal as usize,
+            newsp,
+            (parent_slot as usize).into(),
+            tls as usize,
+            (child_tid as usize).into(),
+        )
+        .await
+    }
+
     /// `sys_wait4` suspends execution of the calling thread
     /// until a child specified by `pid` argument has changed state
     /// (see [linux man wait4(2)](https://www.man7.org/linux/man-pages/man2/wait4.2.html)).

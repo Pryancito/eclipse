@@ -90,6 +90,37 @@ pub trait GenericPageTable: Sync + Send {
     /// Query the physical address which the page of `vaddr` maps to.
     fn query(&self, vaddr: VirtAddr) -> PagingResult<(PhysAddr, MMUFlags, PageSize)>;
 
+    /// Like [`unmap`](Self::unmap), but the implementation may DEFER the
+    /// cross-CPU TLB shootdown, leaving only the local flush. Callers looping
+    /// over a range use this and then issue ONE
+    /// [`remote_flush_all`](Self::remote_flush_all) at the end — the mmu-gather
+    /// pattern. A per-page synchronous shootdown is O(pages × ack-wait); with a
+    /// peer CPU that cannot ack promptly (spinning on a lock with IRQs off,
+    /// e.g. a page fault contending for the same address space) each page burns
+    /// the full spin budget and a large `munmap` turns into an hours-long
+    /// livelock. Seen in practice: glibc's malloc arena setup
+    /// (mmap 128 MiB, munmap the unaligned head) from a fresh labwc thread
+    /// wedged the whole desktop.
+    fn unmap_no_shootdown(&mut self, vaddr: VirtAddr) -> PagingResult<(PhysAddr, PageSize)> {
+        self.unmap(vaddr)
+    }
+
+    /// Like [`update`](Self::update), but may defer the cross-CPU TLB
+    /// shootdown (see [`unmap_no_shootdown`](Self::unmap_no_shootdown)).
+    fn update_no_shootdown(
+        &mut self,
+        vaddr: VirtAddr,
+        paddr: Option<PhysAddr>,
+        flags: Option<MMUFlags>,
+    ) -> PagingResult<PageSize> {
+        self.update(vaddr, paddr, flags)
+    }
+
+    /// Flush the TLB of every other CPU once, synchronously. Pairs with the
+    /// `*_no_shootdown` methods above. Default is a no-op for implementations
+    /// (libos, tests) whose `unmap`/`update` don't defer anything.
+    fn remote_flush_all(&self) {}
+
     fn map_cont(
         &mut self,
         start_vaddr: VirtAddr,
@@ -152,10 +183,17 @@ pub trait GenericPageTable: Sync + Send {
         );
         let mut vaddr = start_vaddr;
         let end_vaddr = vaddr + size;
+        // mmu-gather: clear every PTE first (local flush only), then shoot the
+        // whole range down on the other CPUs with ONE synchronous IPI round.
+        // The frames are not freed until after this function returns, so the
+        // single flush at the end still closes the stale-TLB window before any
+        // freed frame can be reused.
+        let mut any_unmapped = false;
         while vaddr < end_vaddr {
-            let page_size = match self.unmap(vaddr) {
+            let page_size = match self.unmap_no_shootdown(vaddr) {
                 Ok((_, s)) => {
                     assert!(s.is_aligned(vaddr));
+                    any_unmapped = true;
                     s as usize
                 }
                 Err(PagingError::NotMapped) => PageSize::Size4K as usize,
@@ -163,6 +201,9 @@ pub trait GenericPageTable: Sync + Send {
             };
             vaddr += page_size;
             assert!(vaddr <= end_vaddr);
+        }
+        if any_unmapped {
+            self.remote_flush_all();
         }
         Ok(())
     }
