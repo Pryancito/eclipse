@@ -401,6 +401,10 @@ impl Syscall<'_> {
             // implement, nor (b) flood the log with "unknown syscall: RSEQ" on
             // every process spawn (very visible under `perf`/exec-heavy loads).
             Sys::RSEQ => Err(LxError::ENOSYS),
+            // Same treatment: glibc/util-linux/wlroots stacks probe
+            // name_to_handle_at on hotplug/device paths and handle ENOSYS
+            // fine; the loud per-call ERROR line was pure log noise.
+            Sys::NAME_TO_HANDLE_AT => Err(LxError::ENOSYS),
             Sys::MEMBARRIER => self.sys_membarrier(a0 as i32, a1 as u32, a2 as i32),
             Sys::PRLIMIT64 => self.sys_prlimit64(a0, a1, a2.into(), a3.into()),
             Sys::REBOOT => self.sys_reboot(a0 as u32, a1 as u32, a2 as u32, a3.into()),
