@@ -273,7 +273,10 @@ impl Syscall<'_> {
             Sys::SOCKET => self.sys_socket(a0, a1, a2),
             Sys::CONNECT => self.sys_connect(a0, a1.into(), a2).await,
             Sys::ACCEPT => self.sys_accept(a0, a1.into(), a2.into()).await,
-            //            Sys::ACCEPT4 => self.sys_accept(a0, a1.into(), a2.into()), // use accept for accept4
+            // accept4 == accept + flags on the NEW socket (SOCK_CLOEXEC /
+            // SOCK_NONBLOCK). GLib/GDBus uses it unconditionally; falling
+            // through to `unknown syscall` broke waybar's D-Bus socket path.
+            Sys::ACCEPT4 => self.sys_accept4(a0, a1.into(), a2.into(), a3).await,
             Sys::SENDTO => self.sys_sendto(a0, a1.into(), a2, a3, a4.into(), a5),
             Sys::RECVFROM => {
                 self.sys_recvfrom(a0, a1.into(), a2, a3, a4.into(), a5.into())
