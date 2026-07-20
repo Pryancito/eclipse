@@ -208,6 +208,67 @@ pub fn frame_stats() -> (usize, usize) {
     )
 }
 
+/// Reserve every frame of the CURRENTLY ACTIVE page-table tree so the frame
+/// allocator can never hand them out as ordinary RAM.
+///
+/// Root cause of the desktop's escalating corruption: on x86_64 the kernel
+/// keeps running on the page tables the BOOTLOADER built — and UEFI marks
+/// that memory as reclaimable boot-services data, so `insert_regions` fed the
+/// LIVE page-table frames into the allocator as free RAM. Nothing failed
+/// until memory pressure (waybar's GTK heap) finally reused one of those
+/// frames: translations then rotted progressively (kernel #GPs whose
+/// registers held ELF file bytes, an all-idle wakeup wedge) and, once the
+/// root PML4 itself was recycled, the next `activate_kernel_paging()` loaded
+/// a CR3 whose tree was user data — instruction fetch of the kernel faulted,
+/// the #DF handler was unfetchable for the same reason, and the machine
+/// TRIPLE-FAULTED with no banner (QEMU `-d int` was needed to see it).
+///
+/// Must run right after `insert_regions`, before any frame allocation.
+pub fn reserve_active_page_table_frames() {
+    let root = kernel_hal::vm::current_vmtoken();
+    if root == 0 {
+        return; // libos / no paging context: nothing to reserve
+    }
+    let mut ba = FRAME_ALLOCATOR.lock();
+    let mut reserved = 0usize;
+    // Depth-first walk of the 4-level tree. Huge-page entries (PS bit) have no
+    // lower table; entry bit 0 = present. Physical addresses are masked to 52
+    // bits and page-aligned.
+    fn walk(ba: &mut FrameAlloc, table_pa: usize, level: u8, reserved: &mut usize) {
+        const PRESENT: u64 = 1;
+        const HUGE: u64 = 1 << 7;
+        let idx = table_pa >> PAGE_BITS;
+        if table_pa != 0 && table_pa < MAX_MANAGED_PADDR_EXCLUSIVE {
+            // `remove` marks the frame used regardless of current state.
+            ba.remove(idx..idx + 1);
+            *reserved += 1;
+        }
+        if level == 1 {
+            return;
+        }
+        let entries = unsafe {
+            core::slice::from_raw_parts(
+                kernel_hal::mem::phys_to_virt(table_pa) as *const u64,
+                512,
+            )
+        };
+        for &e in entries {
+            if e & PRESENT == 0 || (level < 4 && e & HUGE != 0) {
+                continue;
+            }
+            let child = (e & 0x000f_ffff_ffff_f000) as usize;
+            walk(ba, child, level - 1, reserved);
+        }
+    }
+    walk(&mut ba, root, 4, &mut reserved);
+    drop(ba);
+    crate::klog_info!(
+        "memory: reserved {} live page-table frame(s) of the boot tree (root {:#x})",
+        reserved,
+        root
+    );
+}
+
 /// Combined usage for `/proc/meminfo` and diagnostics.
 pub fn stats() -> (usize, usize) {
     let heap_used = HEAP_USED.load(Ordering::Relaxed);
