@@ -349,6 +349,23 @@ fn write_labwc_autostart(rootfs: &Path) {
           \x20     echo '[autostart] terminal FAILED after 5 attempts (apk add foot)'\n\
           \x20   fi ) &\n\
           else echo '[autostart] MISSING foot/alacritty -> no terminal (apk add foot)'; fi\n\
+          # Session D-Bus: waybar is a GTK app and GApplication registers on\n\
+          # the session bus at startup. Without a reachable bus GLib prints\n\
+          # \"Could not connect: Connection refused\" and waybar exits before it\n\
+          # ever maps its panel. Start a real private session bus (dbus-daemon\n\
+          # ships with the desktop packages) and export its address, instead of\n\
+          # pinning DBUS_SESSION_BUS_ADDRESS at a dead socket. Idempotent: skip\n\
+          # if one is already provided.\n\
+          if command -v dbus-daemon >/dev/null 2>&1 && [ -z \"$DBUS_SESSION_BUS_ADDRESS\" ]; then\n\
+          \x20 mkdir -p \"$XDG_RUNTIME_DIR\" 2>/dev/null\n\
+          \x20 DBUS_ADDR=$(dbus-daemon --session --print-address --fork 2>/dev/null)\n\
+          \x20 if [ -n \"$DBUS_ADDR\" ]; then\n\
+          \x20   export DBUS_SESSION_BUS_ADDRESS=\"$DBUS_ADDR\"\n\
+          \x20   echo \"[autostart] session dbus: $DBUS_SESSION_BUS_ADDRESS\"\n\
+          \x20 else\n\
+          \x20   echo '[autostart] dbus-daemon failed to start; waybar may not map'\n\
+          \x20 fi\n\
+          fi\n\
           # Bottom panel: taskbar, clock, sysinfo. GTK app -> keep it off the\n\
           # EGL/GBM path (hangs this box, see /usr/local/bin/labwc) and guard\n\
           # with a crash-once lock so a hang cannot recur on every boot.\n\
@@ -380,12 +397,9 @@ fn write_labwc_autostart(rootfs: &Path) {
           \x20       exit 0\n\
           \x20     fi\n\
           \x20     echo \"[autostart] waybar attempt $n\"\n\
-          # DBUS_SESSION_BUS_ADDRESS pinned to a dead path: with it UNSET,\n\
-          # GLib fork/execs `dbus-launch --autolaunch` retries on a system\n\
-          # with no session bus; pinned, waybar degrades gracefully instead\n\
-          # of spawn-churning. NO_AT_BRIDGE skips the a11y bus for the same\n\
-          # reason.\n\
-          \x20     DBUS_SESSION_BUS_ADDRESS=\"unix:path=/run/dbus/none\" NO_AT_BRIDGE=1 GDK_GL=disable GDK_BACKEND=wayland GSETTINGS_BACKEND=memory waybar &\n\
+          # DBUS_SESSION_BUS_ADDRESS is exported above (real private bus);\n\
+          # NO_AT_BRIDGE skips the a11y bus, which has no daemon here.\n\
+          \x20     NO_AT_BRIDGE=1 GDK_GL=disable GDK_BACKEND=wayland GSETTINGS_BACKEND=memory waybar &\n\
           \x20     n=$((n+1))\n\
           \x20   done\n\
           \x20   sleep 2\n\
