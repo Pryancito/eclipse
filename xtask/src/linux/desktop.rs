@@ -377,7 +377,12 @@ fn write_labwc_autostart(rootfs: &Path) {
           \x20       exit 0\n\
           \x20     fi\n\
           \x20     echo \"[autostart] waybar attempt $n\"\n\
-          \x20     GDK_GL=disable GDK_BACKEND=wayland GSETTINGS_BACKEND=memory waybar &\n\
+          # DBUS_SESSION_BUS_ADDRESS pinned to a dead path: with it UNSET,\n\
+          # GLib fork/execs `dbus-launch --autolaunch` retries on a system\n\
+          # with no session bus; pinned, waybar degrades gracefully instead\n\
+          # of spawn-churning. NO_AT_BRIDGE skips the a11y bus for the same\n\
+          # reason.\n\
+          \x20     DBUS_SESSION_BUS_ADDRESS=\"unix:path=/run/dbus/none\" NO_AT_BRIDGE=1 GDK_GL=disable GDK_BACKEND=wayland GSETTINGS_BACKEND=memory waybar &\n\
           \x20     n=$((n+1))\n\
           \x20   done\n\
           \x20   sleep 2\n\
