@@ -292,6 +292,13 @@ impl Syscall<'_> {
 
             // process
             Sys::EXECVE => self.sys_execve(a0.into(), a1.into(), a2.into()),
+            // Bisect: three distinct intermittent failures (all-idle wedge, #GP
+            // in epoll, kernel wild jump to 0x400000006) appeared in boots that
+            // also introduced native clone3. Temporarily answer ENOSYS so glibc
+            // uses its legacy-clone fallback (identical flags, historically
+            // solid) while the corruption is isolated.
+            Sys::CLONE3 => Err(LxError::ENOSYS),
+            #[allow(unreachable_patterns)]
             Sys::CLONE3 => self.sys_clone3(a0.into(), a1).await,
             Sys::EXIT => self.sys_exit(a0 as _),
             Sys::EXIT_GROUP => self.sys_exit_group(a0 as _),
