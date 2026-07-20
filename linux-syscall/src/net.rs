@@ -677,9 +677,23 @@ impl Syscall<'_> {
         addr: UserOutPtr<SockAddr>,
         addrlen: UserInOutPtr<u32>,
     ) -> SysResult {
+        self.sys_accept4(sockfd, addr, addrlen, 0).await
+    }
+
+    /// Like [`Self::sys_accept`], but takes an extra `flags` argument that may
+    /// carry `SOCK_NONBLOCK` (`0x800`) and/or `SOCK_CLOEXEC` (`0x80000`),
+    /// applied to the newly accepted socket. These share the bit values of
+    /// `O_NONBLOCK`/`O_CLOEXEC`, so they map directly onto [`OpenFlags`].
+    pub async fn sys_accept4(
+        &mut self,
+        sockfd: usize,
+        addr: UserOutPtr<SockAddr>,
+        addrlen: UserInOutPtr<u32>,
+        flags: usize,
+    ) -> SysResult {
         info!(
-            "sys_accept: sockfd:{}, addr:{:?}, addrlen={:?}",
-            sockfd, addr, addrlen
+            "sys_accept4: sockfd:{}, addr:{:?}, addrlen={:?}, flags={:#x}",
+            sockfd, addr, addrlen, flags
         );
         // smoltcp tcp sockets do not support backlog
         // open multiple sockets for each connection
@@ -691,6 +705,12 @@ impl Syscall<'_> {
             file_like.flags(),
             new_socket.flags()
         );
+
+        // SOCK_NONBLOCK / SOCK_CLOEXEC requested for the accepted socket.
+        if flags != 0 {
+            let new_flags = OpenFlags::from_bits_truncate(flags);
+            new_socket.set_flags(new_flags)?;
+        }
 
         let new_fd = self.linux_process().add_socket(new_socket)?;
         if !addr.is_null() {
