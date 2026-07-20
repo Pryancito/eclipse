@@ -52,6 +52,7 @@ fn write_terminal_wrapper(rootfs: &Path) {
         &wrapper,
         b"#!/bin/sh\n\
           # Eclipse OS: launch whichever terminal is installed.\n\
+          export LANG=\"${LANG:-C.UTF-8}\"\n\
           if command -v foot >/dev/null 2>&1; then\n\
           \x20 exec foot \"$@\"\n\
           fi\n\
@@ -261,6 +262,12 @@ fn write_labwc_autostart(rootfs: &Path) {
           # /usr/local/bin (eclipse-terminal, wrappers) when labwc was\n\
           # launched straight from a console.\n\
           export PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin\n\
+          # UTF-8 locale for every client (foot refuses box-drawing and warns\n\
+          # \"'C' is not a UTF-8 locale\" without it). glibc ships C.UTF-8 as a\n\
+          # builtin; musl accepts any UTF-8 name. Belt-and-suspenders with the\n\
+          # labwc `environment` file, since a client launched outside the\n\
+          # compositor env (attempt-2 `foot -d info`) would otherwise miss it.\n\
+          export LANG=C.UTF-8\n\
           echo \"[autostart] $(date 2>/dev/null || echo boot) begin\"\n\
           echo \"[autostart] XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR WAYLAND_DISPLAY=$WAYLAND_DISPLAY\"\n\
           # gdk-pixbuf loader cache: apk installs it via a trigger that may\n\
