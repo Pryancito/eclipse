@@ -35,6 +35,18 @@ fn alloc_error(layout: Layout) -> ! {
                 ));
             }
         }
+        // memfd attribution: the 4 KiB blocks are ramfs file pages, and the
+        // desktop's big page consumers are wl_shm pools backed by memfd.
+        #[cfg(feature = "linux")]
+        {
+            let (created, live, bytes) = linux_object::fs::memfd_stats();
+            kernel_hal::console::serial_write_fmt_spin(format_args!(
+                "memfd: created={} live={} live_bytes={} MiB\n",
+                created,
+                live,
+                bytes >> 20,
+            ));
+        }
         kernel_hal::console::serial_write_fmt_spin(format_args!("hot exact sizes (4..8KiB):\n"));
         for (size, live) in crate::memory::heap_hot_sizes() {
             if size != 0 && live > 0 {

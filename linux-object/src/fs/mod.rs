@@ -127,6 +127,33 @@ lazy_static! {
 static MEMFD_SEQ: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 lazy_static! {
+    /// Weak refs to every memfd inode ever created, for leak diagnostics: the
+    /// desktop OOM traced to ~456 MiB of LIVE ramfs page blocks reachable only
+    /// from memfd files that should have been freed on close. `memfd_stats`
+    /// prunes dead entries and reports how many inodes are still alive and how
+    /// many bytes they pin.
+    static ref MEMFD_LIVE: Mutex<Vec<(usize, alloc::sync::Weak<dyn INode>)>> =
+        Mutex::new(Vec::new());
+}
+
+/// (created_total, live_count, live_bytes) for memfd inodes.
+pub fn memfd_stats() -> (usize, usize, usize) {
+    let created = MEMFD_SEQ.load(core::sync::atomic::Ordering::Relaxed);
+    let mut live = MEMFD_LIVE.lock();
+    live.retain(|(_, w)| w.strong_count() > 0);
+    let mut bytes = 0usize;
+    let count = live.len();
+    for (_, w) in live.iter() {
+        if let Some(inode) = w.upgrade() {
+            if let Ok(m) = inode.metadata() {
+                bytes += m.size;
+            }
+        }
+    }
+    (created, count, bytes)
+}
+
+lazy_static! {
     /// Writable ramfs exposed as the `/dev/shm` directory so POSIX `shm_open()`
     /// can create files there (e.g. wlroots' xkb keymap fd). It is inserted
     /// straight into devfs (not mounted via MountFS): `/dev/*` lookups take the
@@ -156,6 +183,9 @@ pub fn new_memfd(name: &str, flags: usize) -> LxResult<Arc<File>> {
     // Detach the directory entry: the open fd is the sole owner now, so a close
     // frees the RAM and nothing can resolve the (hidden) name.
     let _ = root.unlink(&backing);
+    MEMFD_LIVE
+        .lock()
+        .push((seq, alloc::sync::Arc::downgrade(&inode)));
 
     let mut open_flags = OpenFlags::RDWR;
     if flags & MFD_CLOEXEC != 0 {
