@@ -192,11 +192,18 @@ impl State {
         let layout = scene::layout(w, h);
         let base = scene::render_base(w, h);
 
-        // First frame: full copy of the base + animated logo, full damage.
+        // Seed BOTH buffers with the full base scene. Only buffer 0 used to
+        // get it; buffer 1 stayed zeroed (memfd), and since ticks repaint just
+        // the logo region, every frame shown from buffer 1 had BLACK outside
+        // the logo — on the real monitor the wallpaper alternated between the
+        // full cosmic scene and a dark screen with a floating square.
         let frame0: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(map, frame_size) };
         frame0.copy_from_slice(&base);
         scene::render_frame(frame0, w, &base, &layout, t_ms);
+        let frame1: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(map.add(frame_size), frame_size) };
+        frame1.copy_from_slice(&base);
 
         let bg = &mut self.backgrounds[idx];
         bg.frames = Some(Frames {
