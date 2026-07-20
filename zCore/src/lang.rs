@@ -35,6 +35,17 @@ fn alloc_error(layout: Layout) -> ! {
                 ));
             }
         }
+        kernel_hal::console::serial_write_fmt_spin(format_args!("hot exact sizes (4..8KiB):\n"));
+        for (size, live) in crate::memory::heap_hot_sizes() {
+            if size != 0 && live > 0 {
+                kernel_hal::console::serial_write_fmt_spin(format_args!(
+                    "  {}B x {} (~{} MiB)\n",
+                    size,
+                    live,
+                    (size * live) >> 20,
+                ));
+            }
+        }
     }
     panic!("memory allocation of {} bytes failed", layout.size());
 }

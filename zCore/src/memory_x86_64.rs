@@ -326,6 +326,57 @@ cfg_if! {
             out
         }
 
+        // Exact-size tracking for the OOM's dominant class: the first report
+        // showed ~116k live allocations in the 4..8 KiB bucket eating the whole
+        // heap, and the exact byte size is usually enough to name the struct
+        // responsible. Track live counts for up to 16 distinct sizes in
+        // [4096, 8192], first-come-first-served.
+        const HOT_LO: usize = 4096;
+        const HOT_HI: usize = 8192;
+        const HOT_SLOTS: usize = 16;
+        static HOT_SIZE: [AtomicUsize; HOT_SLOTS] = {
+            const Z: AtomicUsize = AtomicUsize::new(0);
+            [Z; HOT_SLOTS]
+        };
+        static HOT_LIVE: [AtomicUsize; HOT_SLOTS] = {
+            const Z: AtomicUsize = AtomicUsize::new(0);
+            [Z; HOT_SLOTS]
+        };
+
+        fn hot_track(size: usize, delta: isize) {
+            if !(HOT_LO..=HOT_HI).contains(&size) {
+                return;
+            }
+            for i in 0..HOT_SLOTS {
+                let cur = HOT_SIZE[i].load(Ordering::Relaxed);
+                let claimed = cur == size
+                    || (cur == 0
+                        && HOT_SIZE[i]
+                            .compare_exchange(0, size, Ordering::Relaxed, Ordering::Relaxed)
+                            .map_or_else(|racer| racer == size, |_| true));
+                if claimed {
+                    if delta > 0 {
+                        HOT_LIVE[i].fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        HOT_LIVE[i].fetch_sub(1, Ordering::Relaxed);
+                    }
+                    return;
+                }
+            }
+        }
+
+        /// (size, live-count) pairs for the exact-size tracker (0 = unused slot).
+        pub fn heap_hot_sizes() -> [(usize, usize); HOT_SLOTS] {
+            let mut out = [(0usize, 0usize); HOT_SLOTS];
+            for i in 0..HOT_SLOTS {
+                out[i] = (
+                    HOT_SIZE[i].load(Ordering::Relaxed),
+                    HOT_LIVE[i].load(Ordering::Relaxed),
+                );
+            }
+            out
+        }
+
         unsafe impl<const ORDER: usize> GlobalAlloc for LockedHeap<ORDER> {
             unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
                 self.0
@@ -335,6 +386,7 @@ cfg_if! {
                     .map_or(core::ptr::null_mut::<u8>(), |allocation| {
                         HEAP_USED.fetch_add(layout.size(), Ordering::Relaxed);
                         HEAP_LIVE[bucket_of(layout.size())].fetch_add(1, Ordering::Relaxed);
+                        hot_track(layout.size(), 1);
                         allocation.as_ptr()
                     })
             }
@@ -342,6 +394,7 @@ cfg_if! {
             unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
                 HEAP_USED.fetch_sub(layout.size(), Ordering::Relaxed);
                 HEAP_LIVE[bucket_of(layout.size())].fetch_sub(1, Ordering::Relaxed);
+                hot_track(layout.size(), -1);
                 self.0.lock().dealloc(NonNull::new_unchecked(ptr), layout)
             }
         }
