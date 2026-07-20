@@ -414,25 +414,66 @@ cfg_if! {
             out
         }
 
+        // Heap-corruption forensics, reinstated after the desktop soak kept
+        // dying on #GPs whose registers held ELF-magic bytes (a freed heap
+        // block reused as a file buffer while its old owner still points at
+        // it). Two tools:
+        //  * REDZONE canary after every allocation: linear overflows panic at
+        //    dealloc naming the clobbered block. (This was removed earlier
+        //    because the buddy's power-of-two rounding doubled the dominant
+        //    4 KiB class; with the ramfs now sparse the headroom is back.)
+        //  * Poison-on-free (0xA5): a use-after-free READ yields the
+        //    unmistakable 0xa5a5... pattern in crash registers instead of
+        //    whatever the next owner wrote, separating "read after free" from
+        //    "read after free AND reuse".
+        const REDZONE: usize = 16;
+        const CANARY: u8 = 0xAB;
+        const POISON: u8 = 0xA5;
+
         unsafe impl<const ORDER: usize> GlobalAlloc for LockedHeap<ORDER> {
             unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let sz = layout.size();
+                let ext = Layout::from_size_align_unchecked(sz + REDZONE, layout.align());
                 self.0
                     .lock()
-                    .alloc(layout)
+                    .alloc(ext)
                     .ok()
                     .map_or(core::ptr::null_mut::<u8>(), |allocation| {
-                        HEAP_USED.fetch_add(layout.size(), Ordering::Relaxed);
-                        HEAP_LIVE[bucket_of(layout.size())].fetch_add(1, Ordering::Relaxed);
-                        hot_track(layout.size(), 1);
-                        allocation.as_ptr()
+                        HEAP_USED.fetch_add(sz, Ordering::Relaxed);
+                        HEAP_LIVE[bucket_of(sz)].fetch_add(1, Ordering::Relaxed);
+                        hot_track(sz, 1);
+                        let p = allocation.as_ptr();
+                        let cz = p.add(sz);
+                        for i in 0..REDZONE {
+                            core::ptr::write_volatile(cz.add(i), CANARY);
+                        }
+                        p
                     })
             }
 
             unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-                HEAP_USED.fetch_sub(layout.size(), Ordering::Relaxed);
-                HEAP_LIVE[bucket_of(layout.size())].fetch_sub(1, Ordering::Relaxed);
-                hot_track(layout.size(), -1);
-                self.0.lock().dealloc(NonNull::new_unchecked(ptr), layout)
+                let sz = layout.size();
+                let cz = ptr.add(sz);
+                for i in 0..REDZONE {
+                    if core::ptr::read_volatile(cz.add(i)) != CANARY {
+                        panic!(
+                            "[heapcanary] HEAP OVERFLOW: ptr={:#x} size={} align={} clobbered at +{} (val={:#x})",
+                            ptr as usize,
+                            sz,
+                            layout.align(),
+                            i,
+                            core::ptr::read_volatile(cz.add(i))
+                        );
+                    }
+                }
+                // Poison the payload before returning it to the buddy so a
+                // stale reader sees 0xa5a5... instead of plausible data.
+                core::ptr::write_bytes(ptr, POISON, sz);
+                HEAP_USED.fetch_sub(sz, Ordering::Relaxed);
+                HEAP_LIVE[bucket_of(sz)].fetch_sub(1, Ordering::Relaxed);
+                hot_track(sz, -1);
+                let ext = Layout::from_size_align_unchecked(sz + REDZONE, layout.align());
+                self.0.lock().dealloc(NonNull::new_unchecked(ptr), ext)
             }
         }
     } else {
