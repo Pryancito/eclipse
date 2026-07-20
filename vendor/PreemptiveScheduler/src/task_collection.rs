@@ -90,9 +90,20 @@ impl Task {
         }
     }
     pub fn poll(&self, cx: &mut Context) -> Poll<()> {
-        // if self.finish.load(Ordering::Relaxed) {
-        //     return Poll::Ready(());
-        // }
+        // Never poll a task whose future already completed. `finish` is set by
+        // `drop_by_ref` the instant a poll returns Ready, BEFORE the generator
+        // removes the slab slot and frees the future Box. A stale waker (a
+        // net-RX / IoMultiplexWait timer still holding a clone) that re-notifies
+        // in that window could otherwise get the slot handed out and re-polled,
+        // running the completed future again — its captured state
+        // (interest_list buffer, process path) is being torn down, so the
+        // re-poll dereferenced freed+poisoned heap (the intermittent
+        // sys_epoll_pwait #GP with 0xa5.. in the faulting register). `self` is
+        // the Arc<Task> the executor holds, so reading `finish` here is always
+        // safe.
+        if self.finish.load(Ordering::Relaxed) {
+            return Poll::Ready(());
+        }
         let mut f = crate::diag::diag_lock(&self.future);
         let ret = f.as_mut().poll(cx);
         crate::diag::diag_lock(&self.inner).intr_enable = crate::arch::intr_get();
