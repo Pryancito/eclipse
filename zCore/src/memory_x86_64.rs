@@ -234,7 +234,13 @@ cfg_if! {
         };
 
         /// Kernel heap — separate from the physical frame pool.
-        const KERNEL_HEAP_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
+        ///
+        /// 512 MiB: the full desktop session (labwc + lunarbg + foot + waybar,
+        /// each mapping dozens of glibc shared objects through the SFS block
+        /// cache) OOMed the previous 256 MiB pool while the clients were still
+        /// loading. The heap is a BSS static, so this costs nothing on disk and
+        /// only reserves (zero-fill) RAM at boot.
+        const KERNEL_HEAP_SIZE: usize = 512 * 1024 * 1024; // 512 MiB
         const ORDER: usize = 32;
 
         // Invariants: `init()` carves the heap into word-sized slots
@@ -285,51 +291,29 @@ cfg_if! {
             }
         }
 
-        // DEBUG: redzone/canario tras cada asignación del heap. Si algo desborda
-        // una asignación (escribe pasado su final), se detecta al liberar y se
-        // panica con el tamaño/posición -> identifica la asignación culpable de la
-        // corrupción del heap (que se sospecha pisa los BTreeMap de frames de VMO).
-        const REDZONE: usize = 16;
-        const CANARY: u8 = 0xAB;
-
+        // Sin redzone: el canario de depuración (16 bytes tras cada asignación)
+        // ya cumplió su función (la corrupción de heap que perseguía está
+        // arreglada) y tenía un coste oculto brutal: el buddy allocator
+        // redondea cada asignación a la potencia de dos superior, así que una
+        // asignación de 4096 bytes (la clase dominante: caché de bloques del
+        // SFS, buffers de pipe) pasaba a consumir 8192 reales. La sesión de
+        // escritorio agotaba el pool con `HEAP_USED` marcando solo ~54%, porque
+        // la contabilidad cuenta `sz` y no el bloque redondeado.
         unsafe impl<const ORDER: usize> GlobalAlloc for LockedHeap<ORDER> {
             unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-                let sz = layout.size();
-                let ext = Layout::from_size_align_unchecked(sz + REDZONE, layout.align());
                 self.0
                     .lock()
-                    .alloc(ext)
+                    .alloc(layout)
                     .ok()
                     .map_or(core::ptr::null_mut::<u8>(), |allocation| {
-                        HEAP_USED.fetch_add(sz, Ordering::Relaxed);
-                        let p = allocation.as_ptr();
-                        let cz = p.add(sz);
-                        for i in 0..REDZONE {
-                            core::ptr::write_volatile(cz.add(i), CANARY);
-                        }
-                        p
+                        HEAP_USED.fetch_add(layout.size(), Ordering::Relaxed);
+                        allocation.as_ptr()
                     })
             }
 
             unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-                let sz = layout.size();
-                // Comprobar el canario ANTES de tomar el lock del heap.
-                let cz = ptr.add(sz);
-                for i in 0..REDZONE {
-                    if core::ptr::read_volatile(cz.add(i)) != CANARY {
-                        panic!(
-                            "[heapcanary] HEAP OVERFLOW: ptr={:#x} size={} align={} clobbered en +{} (val={:#x})",
-                            ptr as usize,
-                            sz,
-                            layout.align(),
-                            i,
-                            core::ptr::read_volatile(cz.add(i))
-                        );
-                    }
-                }
-                HEAP_USED.fetch_sub(sz, Ordering::Relaxed);
-                let ext = Layout::from_size_align_unchecked(sz + REDZONE, layout.align());
-                self.0.lock().dealloc(NonNull::new_unchecked(ptr), ext)
+                HEAP_USED.fetch_sub(layout.size(), Ordering::Relaxed);
+                self.0.lock().dealloc(NonNull::new_unchecked(ptr), layout)
             }
         }
     } else {
