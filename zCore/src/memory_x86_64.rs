@@ -299,6 +299,33 @@ cfg_if! {
         // SFS, buffers de pipe) pasaba a consumir 8192 reales. La sesión de
         // escritorio agotaba el pool con `HEAP_USED` marcando solo ~54%, porque
         // la contabilidad cuenta `sz` y no el bloque redondeado.
+
+        // Histograma de asignaciones VIVAS por clase de tamaño (log2). El OOM
+        // del escritorio (499/512 MiB usados) necesita atribución: qué clase
+        // de tamaño retiene el heap. Coste: un fetch_add relajado por
+        // alloc/dealloc. `heap_live_histogram` lo vuelca el alloc_error
+        // handler sin asignar memoria.
+        const HEAP_BUCKETS: usize = 32;
+        static HEAP_LIVE: [AtomicUsize; HEAP_BUCKETS] = {
+            const Z: AtomicUsize = AtomicUsize::new(0);
+            [Z; HEAP_BUCKETS]
+        };
+
+        #[inline]
+        fn bucket_of(size: usize) -> usize {
+            (usize::BITS - size.max(1).leading_zeros()) as usize % HEAP_BUCKETS
+        }
+
+        /// Live-allocation counts per power-of-two size class, for the OOM
+        /// report. Index i counts allocations with size in (2^(i-1), 2^i].
+        pub fn heap_live_histogram() -> [usize; HEAP_BUCKETS] {
+            let mut out = [0usize; HEAP_BUCKETS];
+            for (i, slot) in HEAP_LIVE.iter().enumerate() {
+                out[i] = slot.load(Ordering::Relaxed);
+            }
+            out
+        }
+
         unsafe impl<const ORDER: usize> GlobalAlloc for LockedHeap<ORDER> {
             unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
                 self.0
@@ -307,12 +334,14 @@ cfg_if! {
                     .ok()
                     .map_or(core::ptr::null_mut::<u8>(), |allocation| {
                         HEAP_USED.fetch_add(layout.size(), Ordering::Relaxed);
+                        HEAP_LIVE[bucket_of(layout.size())].fetch_add(1, Ordering::Relaxed);
                         allocation.as_ptr()
                     })
             }
 
             unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
                 HEAP_USED.fetch_sub(layout.size(), Ordering::Relaxed);
+                HEAP_LIVE[bucket_of(layout.size())].fetch_sub(1, Ordering::Relaxed);
                 self.0.lock().dealloc(NonNull::new_unchecked(ptr), layout)
             }
         }

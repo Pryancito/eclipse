@@ -17,6 +17,25 @@ fn alloc_error(layout: Layout) -> ! {
         heap_used / 1024 / 1024,
         heap_total / 1024 / 1024,
     ));
+    // Attribution: live allocations per size class, so the OOM report says
+    // WHICH class holds the heap (each line: class upper bound, live count,
+    // total bytes if every allocation were at the bound).
+    #[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
+    {
+        let hist = crate::memory::heap_live_histogram();
+        kernel_hal::console::serial_write_fmt_spin(format_args!("heap live by size class:\n"));
+        for (i, count) in hist.iter().enumerate() {
+            if *count > 0 {
+                let size = 1usize << i;
+                kernel_hal::console::serial_write_fmt_spin(format_args!(
+                    "  <={:>10}B x {:<8} (~{} MiB)\n",
+                    size,
+                    count,
+                    (count * size) >> 20,
+                ));
+            }
+        }
+    }
     panic!("memory allocation of {} bytes failed", layout.size());
 }
 
