@@ -292,11 +292,20 @@ impl Syscall<'_> {
 
             // process
             Sys::EXECVE => self.sys_execve(a0.into(), a1.into(), a2.into()),
-            // Bisect: three distinct intermittent failures (all-idle wedge, #GP
-            // in epoll, kernel wild jump to 0x400000006) appeared in boots that
-            // also introduced native clone3. Temporarily answer ENOSYS so glibc
-            // uses its legacy-clone fallback (identical flags, historically
-            // solid) while the corruption is isolated.
+            // clone3 is deliberately ENOSYS (pre-Linux-5.3 behaviour; glibc and
+            // musl fall back to legacy clone cleanly). Root cause, found in the
+            // QEMU desktop lab: glibc's __clone3 child stub starts with
+            // `mov %r8,%rdi; call *%rdx` — it requires RDX (and R8) to survive
+            // the syscall INTO THE NEW CHILD. Legacy clone's stub instead pops
+            // the function/argument off the child STACK, which is robust. Our
+            // new-thread first-entry path does not preserve the parent's RDX
+            // into the child, so clone3-started threads jumped to garbage
+            // (observed: kernel wild jump to 0x400000006, a #GP on a
+            // non-canonical pointer inside epoll_pwait, and an all-idle wedge
+            // when the crashed thread held a compositor lock). Until the child
+            // context provably carries every caller-saved register, answering
+            // ENOSYS is the correct, safe behaviour — sys_clone3 below stays
+            // implemented for when that is fixed.
             Sys::CLONE3 => Err(LxError::ENOSYS),
             #[allow(unreachable_patterns)]
             Sys::CLONE3 => self.sys_clone3(a0.into(), a1).await,
