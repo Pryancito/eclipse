@@ -118,21 +118,38 @@ impl Syscall<'_> {
 
         if flags.contains(MmapFlags::FIXED) {
             // unmap first
-            vmar.unmap(addr, len)?;
+            vmar.unmap(addr, len).inspect_err(|e| {
+                warn!(
+                    "mmap(FIXED) pre-unmap FAILED: {:?} addr={:#x} len={:#x}",
+                    e, addr, len
+                );
+            })?;
             // hunter: the old contents are gone, so drop any W^X bookkeeping.
             hunter::check_munmap(pid, addr, len);
         }
         let vmar_offset = flags.contains(MmapFlags::FIXED).then(|| addr - vmar.addr());
         if flags.contains(MmapFlags::ANONYMOUS) {
             let vmo = VmObject::new_paged(pages(len));
-            let addr = vmar.map(vmar_offset, vmo.clone(), 0, vmo.len(), prot.to_flags())?;
+            let addr = vmar
+                .map(vmar_offset, vmo.clone(), 0, vmo.len(), prot.to_flags())
+                .inspect_err(|e| {
+                    warn!(
+                        "mmap(anon) FAILED: {:?} addr={:#x} len={:#x} prot={:?} flags={:?}",
+                        e, addr, len, prot, flags
+                    );
+                })?;
             // hunter P3: remember a writable mapping so a later mprotect(EXEC)
             // over it is recognised as the two-step W^X bypass.
             hunter::record_mapping(pid, addr, len, want_write);
             Ok(addr)
         } else {
             let file_like = self.linux_process().get_file_like(fd)?;
-            let vmo = file_like.get_vmo(offset as usize, len)?;
+            let vmo = file_like.get_vmo(offset as usize, len).inspect_err(|e| {
+                warn!(
+                    "mmap(file) get_vmo FAILED: {:?} fd={:?} offset={:#x} len={:#x}",
+                    e, fd, offset, len
+                );
+            })?;
             // hunter P1: cap the file-backed mapping's *permission ceiling* to a
             // W^X-preserving set instead of the old blanket `RXW`, so a later
             // mprotect cannot turn writable file pages executable. Executable
@@ -150,16 +167,23 @@ impl Syscall<'_> {
             // pages are read in on the faults that first touch them. Eagerly
             // mapping the whole range here would defeat that and re-introduce the
             // full-file read that froze the machine on `perf` (libLLVM ~150 MiB).
-            let addr = vmar.map_ext(
-                vmar_offset,
-                vmo.clone(),
-                0,
-                vmo.len(),
-                ceiling,
-                prot.to_flags(),
-                false,
-                false,
-            )?;
+            let addr = vmar
+                .map_ext(
+                    vmar_offset,
+                    vmo.clone(),
+                    0,
+                    vmo.len(),
+                    ceiling,
+                    prot.to_flags(),
+                    false,
+                    false,
+                )
+                .inspect_err(|e| {
+                    warn!(
+                        "mmap(file) map_ext FAILED: {:?} addr={:#x} len={:#x} vmo_len={:#x} prot={:?} flags={:?} offset={:#x}",
+                        e, addr, len, vmo.len(), prot, flags, offset
+                    );
+                })?;
             hunter::record_mapping(pid, addr, len, want_write);
             Ok(addr)
         }
