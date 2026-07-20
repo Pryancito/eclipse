@@ -137,9 +137,17 @@ lazy_static! {
 }
 
 /// (created_total, live_count, live_bytes) for memfd inodes.
+///
+/// Uses `try_lock`: this is called from the OOM handler, and a concurrent
+/// `new_memfd` registration (or a caller further up the stack) may hold the
+/// registry lock — blocking here would wedge the OOM report (seen in the lab:
+/// both CPUs froze mid-report). Returns zeros for live/bytes if contended.
 pub fn memfd_stats() -> (usize, usize, usize) {
     let created = MEMFD_SEQ.load(core::sync::atomic::Ordering::Relaxed);
-    let mut live = MEMFD_LIVE.lock();
+    let mut live = match MEMFD_LIVE.try_lock() {
+        Some(guard) => guard,
+        None => return (created, 0, 0),
+    };
     live.retain(|(_, w)| w.strong_count() > 0);
     let mut bytes = 0usize;
     let count = live.len();
@@ -151,6 +159,33 @@ pub fn memfd_stats() -> (usize, usize, usize) {
         }
     }
     (created, count, bytes)
+}
+
+/// One line per live memfd (seq, size, inode strong count), newest first,
+/// up to `max` entries — enough to tell leaked wl_shm pools (MiB-sized, extra
+/// strong refs) from cursor-sized scratch files.
+pub fn memfd_dump_live(max: usize) {
+    let live = match MEMFD_LIVE.try_lock() {
+        Some(guard) => guard,
+        None => return,
+    };
+    let (created, count) = (
+        MEMFD_SEQ.load(core::sync::atomic::Ordering::Relaxed),
+        live.iter().filter(|(_, w)| w.strong_count() > 0).count(),
+    );
+    warn!("[memfd] created={} live={}", created, count);
+    for (seq, w) in live.iter().rev().take(max) {
+        if let Some(inode) = w.upgrade() {
+            let size = inode.metadata().map(|m| m.size).unwrap_or(0);
+            // strong_count includes our temporary upgrade — report without it.
+            warn!(
+                "[memfd]   seq={} size={} strong={}",
+                seq,
+                size,
+                alloc::sync::Weak::strong_count(w).saturating_sub(1)
+            );
+        }
+    }
 }
 
 lazy_static! {
@@ -183,9 +218,33 @@ pub fn new_memfd(name: &str, flags: usize) -> LxResult<Arc<File>> {
     // Detach the directory entry: the open fd is the sole owner now, so a close
     // frees the RAM and nothing can resolve the (hidden) name.
     let _ = root.unlink(&backing);
-    MEMFD_LIVE
-        .lock()
-        .push((seq, alloc::sync::Arc::downgrade(&inode)));
+    {
+        // Never allocate while holding the registry lock: a Vec growth OOMing
+        // under it self-deadlocks the OOM reporter (which takes this lock).
+        // Grow by building a bigger buffer OUTSIDE the lock and swapping it in
+        // (drain+extend under the lock is a plain memcpy, no allocation).
+        let mut elem = Some((seq, alloc::sync::Arc::downgrade(&inode)));
+        loop {
+            let cap = {
+                let mut live = MEMFD_LIVE.lock();
+                if live.len() < live.capacity() {
+                    live.push(elem.take().unwrap());
+                    break;
+                }
+                live.capacity()
+            };
+            let mut spare = Vec::with_capacity((cap * 2).max(64));
+            let mut live = MEMFD_LIVE.lock();
+            if live.len() < spare.capacity() {
+                spare.extend(live.drain(..));
+                spare.push(elem.take().unwrap());
+                *live = spare;
+                break;
+            }
+            // Raced with another grower that filled even the doubled size;
+            // retry with the fresh capacity.
+        }
+    }
 
     let mut open_flags = OpenFlags::RDWR;
     if flags & MFD_CLOEXEC != 0 {

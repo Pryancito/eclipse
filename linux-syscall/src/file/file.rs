@@ -281,6 +281,17 @@ impl Syscall<'_> {
         info!("ftruncate: fd={:?}, len={}", fd, len);
         let proc = self.linux_process();
         proc.get_file(fd)?.set_len(len as u64)?;
+        // Leak telemetry: the desktop OOM is unfreed memfd content, and
+        // ftruncate is the call that sizes memfds — every 64th call, log the
+        // live-memfd census (count, sizes, strong refs) so the growth and its
+        // holder are visible in real time without waiting for the OOM.
+        {
+            use core::sync::atomic::{AtomicUsize, Ordering};
+            static FTRUNCATE_N: AtomicUsize = AtomicUsize::new(0);
+            if FTRUNCATE_N.fetch_add(1, Ordering::Relaxed) % 64 == 0 {
+                linux_object::fs::memfd_dump_live(8);
+            }
+        }
         Ok(0)
     }
 
