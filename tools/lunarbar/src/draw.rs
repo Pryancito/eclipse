@@ -254,6 +254,38 @@ impl Canvas {
             dst[o + 3] = 0xff; // X
         }
     }
+
+    /// Swizzle the finished RGBA frame into an ARGB8888 (B,G,R,A) buffer,
+    /// preserving alpha. tiny-skia stores premultiplied RGBA and wl_shm's
+    /// Argb8888 also expects premultiplied, so the bytes map straight across.
+    /// Used by the translucent menu overlay.
+    pub fn blit_argb(&self, dst: &mut [u8]) {
+        let src = self.pix.data();
+        let n = (self.pix.width() * self.pix.height()) as usize;
+        assert!(dst.len() >= n * 4 && src.len() >= n * 4);
+        for i in 0..n {
+            let o = i * 4;
+            dst[o] = src[o + 2]; // B
+            dst[o + 1] = src[o + 1]; // G
+            dst[o + 2] = src[o]; // R
+            dst[o + 3] = src[o + 3]; // A
+        }
+    }
+
+    /// Draw a filled path at the given RGB with explicit alpha — for the
+    /// menu's translucent scrim and hover highlights.
+    pub fn fill_rect_a(&mut self, x: i32, y: i32, rw: i32, rh: i32, c: Rgb, a: f32) {
+        if let Some(r) = Rect::from_xywh(x as f32, y as f32, rw.max(0) as f32, rh.max(0) as f32) {
+            self.fill(&PathBuilder::from_rect(r), c, a);
+        }
+    }
+
+    /// Filled rounded rect with explicit alpha.
+    pub fn round_rect_a(&mut self, x: i32, y: i32, rw: i32, rh: i32, rad: i32, c: Rgb, a: f32) {
+        if let Some(p) = rounded_rect_path(x as f32, y as f32, rw as f32, rh as f32, rad as f32) {
+            self.fill(&p, c, a);
+        }
+    }
 }
 
 // embedded-graphics draw target: text renders straight into the RGBA pixmap.
