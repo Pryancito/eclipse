@@ -17,8 +17,18 @@
 //!   renderer environment (login(1) strips arbitrary env vars, so a wrapper
 //!   is the only delivery that survives every launch path).
 //!
-//! Runtime packages (all optional, the session degrades gracefully):
-//! `apk add labwc waybar foot swaybg font-dejavu adwaita-icon-theme`.
+//! Runtime packages:
+//! `apk add labwc foot xkeyboard-config font-dejavu adwaita-icon-theme`
+//! (optional extras: `waybar swaybg`, only used as fallbacks now that lunarbar
+//! and lunarbg are the native panel and wallpaper).
+//!
+//! `xkeyboard-config` is REQUIRED, not optional: it ships the XKB data under
+//! `/usr/share/X11/xkb`. Without it labwc still starts but cannot compile a
+//! keymap, so it hands clients an empty one — and foot (and any xkbcommon
+//! client) then SEGFAULTs parsing it ("[XKB-822] Failed to parse input xkb
+//! string", terminal exits rc=139). lunarbg/lunarbar survive only because they
+//! never parse the keymap. On the musl/Alpine install this package is not
+//! pulled in automatically by foot or labwc, so it must be named explicitly.
 
 use std::{fs, path::Path};
 
@@ -295,6 +305,17 @@ fn write_labwc_autostart(rootfs: &Path) {
           export LANG=C.UTF-8\n\
           echo \"[autostart] $(date 2>/dev/null || echo boot) begin\"\n\
           echo \"[autostart] XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR WAYLAND_DISPLAY=$WAYLAND_DISPLAY\"\n\
+          # XKB data check: without /usr/share/X11/xkb labwc cannot compile a\n\
+          # keymap and hands clients an empty one, on which foot (and every\n\
+          # other xkbcommon client) SEGFAULTs (\"[XKB-822] Failed to parse input\n\
+          # xkb string\", terminal exits rc=139). lunarbg/lunarbar survive as\n\
+          # they never parse it, so the desktop looks alive but no terminal ever\n\
+          # opens. Warn loudly instead of leaving it a silent crash loop.\n\
+          if [ ! -e /usr/share/X11/xkb/rules/evdev ]; then\n\
+          \x20 echo '[autostart] *** MISSING xkeyboard-config: /usr/share/X11/xkb absent.'\n\
+          \x20 echo '[autostart] *** foot/terminals will SEGFAULT (rc=139) on the empty keymap.'\n\
+          \x20 echo '[autostart] *** FIX: apk add xkeyboard-config'\n\
+          fi\n\
           # gdk-pixbuf loader cache: apk installs it via a trigger that may\n\
           # never have run under Eclipse OS. Without loaders.cache gdk-pixbuf\n\
           # recognises NO image format at all, so swaybg logs \"Failed to\n\
