@@ -379,6 +379,17 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             eprintln!("warning: lunarbg not built; autostart will fall back to swaybg");
         }
 
+        // lunarbar: the native status/task bar (Rust, static musl). A two-bar
+        // panel over wlr-layer-shell + wlr-foreign-toplevel-management, replacing
+        // waybar and its GTK/D-Bus/gdk-pixbuf/fontconfig dependency chain.
+        let lunarbar = self.lunarbar();
+        if lunarbar.is_file() {
+            let _ = dir::rm(&bin.join("lunarbar"));
+            fs::copy(&lunarbar, bin.join("lunarbar")).unwrap();
+        } else {
+            eprintln!("warning: lunarbar not built; autostart will fall back to waybar");
+        }
+
         // 拷贝 install-eclipse
         let install_eclipse = self.install_eclipse(&musl);
         if install_eclipse.is_file() {
@@ -1471,6 +1482,50 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             .status();
         if !status.success() {
             eprintln!("warning: lunarbg build failed; swaybg fallback remains");
+        }
+        executable
+    }
+
+    /// Cross-compile lunarbar (`tools/lunarbar`, Rust) as a static musl binary
+    /// and return its path. Best-effort: if the build fails the desktop
+    /// autostart falls back to waybar (see xtask/src/linux/desktop.rs).
+    fn lunarbar(&self) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join("lunarbar");
+        let triple = self.musl_rust_triple();
+        let executable = dir
+            .join("target")
+            .join(triple)
+            .join("release")
+            .join("lunarbar");
+        // Rebuild when any source file is newer than the binary.
+        let newest_src = ["src/main.rs", "src/draw.rs", "src/sysinfo.rs", "Cargo.toml"]
+            .iter()
+            .filter_map(|rel| fs::metadata(dir.join(rel)).ok()?.modified().ok())
+            .max();
+        if let (Ok(bin_meta), Some(src_mtime)) = (fs::metadata(&executable), newest_src) {
+            if let Ok(bin_mtime) = bin_meta.modified() {
+                if bin_mtime >= src_mtime {
+                    return executable;
+                }
+            }
+        }
+
+        println!("Compiling lunarbar (Rust, {triple})...");
+        let _ = Ext::new("rustup")
+            .arg("target")
+            .arg("add")
+            .arg(triple)
+            .status();
+        let status = Ext::new("cargo")
+            .current_dir(&dir)
+            .arg("build")
+            .arg("--release")
+            .arg("--target")
+            .arg(triple)
+            .env("RUSTFLAGS", "-C relocation-model=static")
+            .status();
+        if !status.success() {
+            eprintln!("warning: lunarbar build failed; waybar fallback remains");
         }
         executable
     }

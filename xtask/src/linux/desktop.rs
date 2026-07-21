@@ -356,6 +356,33 @@ fn write_labwc_autostart(rootfs: &Path) {
           \x20     echo '[autostart] terminal FAILED after 5 attempts (apk add foot)'\n\
           \x20   fi ) &\n\
           else echo '[autostart] MISSING foot/alacritty -> no terminal (apk add foot)'; fi\n\
+          # Panel: prefer lunarbar, Eclipse's own two-bar panel (top sysinfo\n\
+          # bar, bottom taskbar). It is a static musl binary over wlr-layer-\n\
+          # shell + wlr-foreign-toplevel-management: NO GTK, NO D-Bus, NO\n\
+          # gdk-pixbuf, NO fontconfig, NO locale, so none of waybar's session-\n\
+          # bus/locale failure modes apply and it needs no crash-once lock (it\n\
+          # renders in software shm and cannot wedge the EGL/GBM path). Retry\n\
+          # loop keyed on `pidof lunarbar` like every other client here.\n\
+          if command -v lunarbar >/dev/null 2>&1; then\n\
+          \x20 echo '[autostart] launching lunarbar (native panel)'\n\
+          \x20 ( n=1\n\
+          \x20   while [ \"$n\" -le 5 ]; do\n\
+          \x20     if pidof lunarbar >/dev/null 2>&1; then\n\
+          \x20       echo \"[autostart] lunarbar up (attempt $n)\"\n\
+          \x20       exit 0\n\
+          \x20     fi\n\
+          \x20     echo \"[autostart] lunarbar attempt $n\"\n\
+          \x20     ( lunarbar; echo \"[autostart] lunarbar exited rc=$?\" ) &\n\
+          \x20     sleep 2\n\
+          \x20     n=$((n+1))\n\
+          \x20   done\n\
+          \x20   if pidof lunarbar >/dev/null 2>&1; then\n\
+          \x20     echo '[autostart] lunarbar up (last attempt)'\n\
+          \x20   else\n\
+          \x20     echo '[autostart] lunarbar FAILED after 5 attempts'\n\
+          \x20   fi ) &\n\
+          else\n\
+          # Fallback path (lunarbar absent): waybar, a GTK app.\n\
           # Session D-Bus: waybar is a GTK app and GApplication registers on\n\
           # the session bus at startup. Without a reachable bus GLib prints\n\
           # \"Could not connect: Connection refused\" and waybar exits before it\n\
@@ -417,12 +444,13 @@ fn write_labwc_autostart(rootfs: &Path) {
           \x20   fi ) &\n\
           \x20 ( sleep 15 && rm -f \"$PANEL_LOCK\" && echo '[autostart] waybar survived 15s, lock cleared' >>\"$LOG\" ) &\n\
           fi\n\
+          fi\n\
           echo \"[autostart] cursor theme dir: $(ls -d /usr/share/icons/*/cursors 2>/dev/null || echo NONE)\"\n\
           # Post-launch health check: which clients are still alive shortly\n\
           # after start. A client that launched but died (bad config, missing\n\
           # lib) shows as DEAD here, with its stderr earlier in this log.\n\
           ( sleep 5\n\
-          \x20 echo \"[autostart] after 5s: lunarbg=$(pidof lunarbg >/dev/null 2>&1 && echo ok || echo DEAD) swaybg=$(pidof swaybg >/dev/null 2>&1 && echo ok || echo n/a) waybar=$(pidof waybar >/dev/null 2>&1 && echo ok || echo DEAD) terminal=$(pidof foot alacritty >/dev/null 2>&1 && echo ok || echo DEAD)\" ) &\n\
+          \x20 echo \"[autostart] after 5s: lunarbg=$(pidof lunarbg >/dev/null 2>&1 && echo ok || echo DEAD) swaybg=$(pidof swaybg >/dev/null 2>&1 && echo ok || echo n/a) lunarbar=$(pidof lunarbar >/dev/null 2>&1 && echo ok || echo n/a) waybar=$(pidof waybar >/dev/null 2>&1 && echo ok || echo n/a) terminal=$(pidof foot alacritty >/dev/null 2>&1 && echo ok || echo DEAD)\" ) &\n\
           echo '[autostart] done'\n",
     )
     .unwrap();
