@@ -135,10 +135,25 @@ lazy_static::lazy_static! {
     /// while labwc composited an all-zeros copy — every client window and the
     /// lunarbg background showed pure black.
     ///
-    /// Entries are Weak: the VMO lives as long as some mapping (or fd-held
-    /// reference) does; dead entries are pruned on access.
-    static ref SHARED_FILE_VMOS: lock::Mutex<alloc::collections::BTreeMap<usize, alloc::sync::Weak<VmObject>>> =
+    /// The VMO is held with a STRONG ref, anchored to the *inode's* lifetime
+    /// (a Weak<INode> alongside it), NOT to any one mapping's. This is what
+    /// makes the wl_keyboard keymap work: wlroots writes the keymap into a
+    /// memfd via mmap(MAP_SHARED)+memcpy and then *munmaps and closes the write
+    /// fd* before sending the read fd — with a Weak VMO the shared pages would
+    /// be freed on that munmap, so the client's later read (and the MAP_PRIVATE
+    /// COW off this VMO) would see zeros and foot would SIGSEGV on the empty
+    /// keymap. There is no MAP_SHARED->inode writeback path (msync is a no-op),
+    /// so the shared VMO *is* the file's storage for as long as an fd keeps the
+    /// inode alive. Dead-inode entries are pruned on every access, freeing the
+    /// VMO (and its frames) once the last fd closes.
+    static ref SHARED_FILE_VMOS: lock::Mutex<alloc::collections::BTreeMap<usize, (Arc<VmObject>, alloc::sync::Weak<dyn INode>)>> =
         lock::Mutex::new(alloc::collections::BTreeMap::new());
+}
+
+/// Drop shared-VMO entries whose backing inode has been freed (all fds closed).
+/// Called under the registry lock before any lookup/insert.
+fn prune_shared_vmos(registry: &mut alloc::collections::BTreeMap<usize, (Arc<VmObject>, alloc::sync::Weak<dyn INode>)>) {
+    registry.retain(|_, (_, inode_weak)| inode_weak.strong_count() > 0);
 }
 
 impl zircon_object::vm::FrameFiller for FileFrameFiller {
@@ -549,11 +564,12 @@ impl FileLike for File {
                 // the wl_keyboard keymap into the memfd) never reach read_at, so
                 // reading the inode would return stale zeros. See VmoFrameFiller.
                 let key = Arc::as_ptr(&inner.inode) as *const () as usize;
-                if let Some(shared) = SHARED_FILE_VMOS
-                    .lock()
-                    .get(&key)
-                    .and_then(|w| w.upgrade())
-                {
+                let shared_vmo = {
+                    let mut registry = SHARED_FILE_VMOS.lock();
+                    prune_shared_vmos(&mut registry);
+                    registry.get(&key).map(|(vmo, _)| vmo.clone())
+                };
+                if let Some(shared) = shared_vmo {
                     let src_total = shared.len();
                     let source_len = src_total.saturating_sub(offset).min(len);
                     let source: Arc<dyn zircon_object::vm::FrameFiller> =
@@ -608,7 +624,9 @@ impl FileLike for File {
         let file_size = inner.inode.metadata()?.size;
         let key = Arc::as_ptr(&inner.inode) as *const () as usize;
         let mut registry = SHARED_FILE_VMOS.lock();
-        if let Some(vmo) = registry.get(&key).and_then(|w| w.upgrade()) {
+        prune_shared_vmos(&mut registry);
+        if let Some((vmo, _)) = registry.get(&key) {
+            let vmo = vmo.clone();
             if offset + len <= vmo.len() {
                 return Ok((vmo, offset));
             }
@@ -630,7 +648,9 @@ impl FileLike for File {
         // First MAP_SHARED of this file: build one VMO covering the whole file
         // (so later mappers at other offsets share it too), demand-paged from
         // the inode. Created under the registry lock so a concurrent first-map
-        // cannot race us into two unshared VMOs.
+        // cannot race us into two unshared VMOs. Held STRONG, anchored to the
+        // inode's lifetime (see SHARED_FILE_VMOS) so MAP_SHARED writes survive
+        // the writer's munmap — the wl_keyboard keymap depends on this.
         let vmo_len = file_size.max(offset + len);
         let source: Arc<dyn zircon_object::vm::FrameFiller> = Arc::new(FileFrameFiller {
             inode: inner.inode.clone(),
@@ -638,11 +658,7 @@ impl FileLike for File {
             source_len: file_size,
         });
         let vmo = VmObject::new_paged_with_source(pages(vmo_len), source);
-        registry.insert(key, Arc::downgrade(&vmo));
-        // Opportunistic prune so dead files don't accumulate keys forever.
-        if registry.len() > 64 {
-            registry.retain(|_, w| w.strong_count() > 0);
-        }
+        registry.insert(key, (vmo.clone(), Arc::downgrade(&inner.inode)));
         Ok((vmo, offset))
     }
 }
