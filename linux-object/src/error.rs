@@ -201,7 +201,30 @@ impl From<ZxError> for LxError {
             ZxError::TIMED_OUT => LxError::ETIMEDOUT,
             ZxError::STOP => LxError::ESRCH,
             ZxError::BAD_STATE => LxError::EAGAIN,
-            _ => unimplemented!("unknown error type: {:?}", e),
+            // Physical-frame exhaustion must surface as ENOMEM to the caller,
+            // never take the kernel down: seen live as multi-CPU panics when
+            // foot's render load drained the frame pool ("frame_alloc FAILED
+            // ... 1646 MiB used / 1647 MiB managed" followed by one panic per
+            // CPU that hit the exhausted allocator).
+            ZxError::NO_MEMORY => LxError::ENOMEM,
+            ZxError::NO_RESOURCES => LxError::ENOMEM,
+            ZxError::ACCESS_DENIED => LxError::EACCES,
+            ZxError::NOT_FOUND => LxError::ENOENT,
+            ZxError::OUT_OF_RANGE => LxError::EINVAL,
+            ZxError::BUFFER_TOO_SMALL => LxError::EINVAL,
+            ZxError::UNAVAILABLE => LxError::EBUSY,
+            ZxError::CANCELED => LxError::EINTR,
+            ZxError::NOT_DIR => LxError::ENOTDIR,
+            ZxError::NOT_FILE => LxError::EISDIR,
+            ZxError::FILE_BIG => LxError::EFBIG,
+            ZxError::NO_SPACE => LxError::ENOSPC,
+            ZxError::IO => LxError::EIO,
+            // Anything else is still a real error for the caller, not a
+            // reason to bring the machine down: default to EIO and log it.
+            other => {
+                log::error!("ZxError -> LxError fallback: {:?} mapped to EIO", other);
+                LxError::EIO
+            }
         }
     }
 }

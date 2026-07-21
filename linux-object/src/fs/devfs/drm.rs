@@ -82,6 +82,14 @@ struct DrmState {
     framebuffers: Vec<DrmFramebuffer>,
     /// Framebuffer currently bound to the (synthetic) CRTC, reported by GETCRTC.
     crtc_fb: u32,
+    /// The VT the compositor owns the display on, established on its first
+    /// present. While the active VT differs (the user switched to a text
+    /// console with Ctrl+Alt+Fn), the compositor's blits are suppressed so the
+    /// text console stays visible, and its input is paused — Eclipse has no
+    /// VT_PROCESS release/acquire signalling, so this is what makes VT
+    /// switching out of the compositor actually work. Cleared on DROP_MASTER
+    /// (compositor exit) so a later text-only session is never gated.
+    graphics_vt: Option<usize>,
     /// Pending DRM events (page-flip completions) waiting to be `read()` from
     /// the card fd. Each entry is one fully-encoded `struct drm_event_vblank`.
     events: VecDeque<Vec<u8>>,
@@ -118,6 +126,7 @@ lazy_static::lazy_static! {
         handles: Vec::new(),
         framebuffers: Vec::new(),
         crtc_fb: 0,
+        graphics_vt: None,
         events: VecDeque::new(),
         eventbus: EventBus::new(),
         cursor: CursorState {
@@ -450,7 +459,44 @@ pub fn page_flip(fb_id: u32, crtc_id: u32, user_data: u64) -> bool {
 
 /// Present a framebuffer immediately on `crtc_id` without queuing a DRM flip
 /// event. Used by SETCRTC/SETPLANE paths that are not page-flip ioctls.
+/// Re-blit the compositor's last frame IF its VT is the active one. Called
+/// right after a VT switch so returning to the compositor (Ctrl+Alt+F1) shows
+/// its last frame immediately instead of a stale/blank screen; a no-op when the
+/// switch was TO a text console (which the kernel repaints itself).
+pub fn represent_if_owner_active() -> bool {
+    let fb = {
+        let st = DRM_STATE.lock();
+        if st.graphics_vt != Some(kernel_hal::console::active_vt()) {
+            return false;
+        }
+        st.crtc_fb
+    };
+    if fb == 0 {
+        return false;
+    }
+    scanout(fb)
+}
+
+/// Forget the compositor's VT ownership (on DROP_MASTER / compositor exit) so a
+/// subsequent text-only session is never gated off the display or input.
+pub fn clear_graphics_owner() {
+    DRM_STATE.lock().graphics_vt = None;
+}
+
 pub fn present_now(fb_id: u32, crtc_id: u32) -> bool {
+    // Establish / enforce compositor VT ownership. The first present claims the
+    // active VT; later presents while a *different* VT is foreground (the user
+    // switched to a text console) are dropped — reported as complete so the
+    // compositor's frame loop keeps running, but not blitted over the console.
+    {
+        let active = kernel_hal::console::active_vt();
+        let mut st = DRM_STATE.lock();
+        match st.graphics_vt {
+            None => st.graphics_vt = Some(active),
+            Some(owner) if owner != active => return true,
+            _ => {}
+        }
+    }
     let flipped = if software_kms_active() {
         // No usable hardware KMS: blit the dumb buffer to the framebuffer.
         scanout(fb_id)

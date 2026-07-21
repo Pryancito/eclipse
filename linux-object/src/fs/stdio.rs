@@ -330,6 +330,7 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
         VT_ACTIVATE => {
             if data >= 1 && data <= kernel_hal::console::num_vts() {
                 kernel_hal::console::switch_vt(data - 1);
+                crate::fs::devfs::drm::represent_if_owner_active();
             }
             Ok(0)
         }
@@ -610,6 +611,10 @@ fn handle_key_event(event: &InputEvent) {
         if let Some(n) = target {
             if n < kernel_hal::console::num_vts() {
                 kernel_hal::console::switch_vt(n);
+                // If we switched back to the compositor's VT, re-blit its last
+                // frame so it reappears at once (a no-op for a text target,
+                // which the console repaints itself).
+                crate::fs::devfs::drm::represent_if_owner_active();
             }
             return;
         }

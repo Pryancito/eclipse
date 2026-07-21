@@ -640,6 +640,9 @@ impl INode for DrmDev {
                     self.minor
                 );
                 kernel_hal::console::set_kd_mode(kernel_hal::console::KD_TEXT);
+                // Compositor relinquished the display: forget its VT ownership
+                // so text consoles are no longer gated off screen/input.
+                drm::clear_graphics_owner();
                 Ok(0)
             }
             DRM_IOCTL_SET_CLIENT_CAP => {
