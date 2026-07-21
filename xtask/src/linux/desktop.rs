@@ -625,6 +625,13 @@ fn write_foot_config(rootfs: &Path) {
           # fontconfig, which foot warns about on every start.\n\
           font=DejaVu Sans Mono:size=10,monospace:size=10\n\
           pad=6x6\n\
+          # Single render worker. foot defaults to one render thread PER CPU\n\
+          # (logs \"using N rendering threads\"); on a 20-core box that is 20\n\
+          # threads hammering the render mutex/semaphores at once, which\n\
+          # SEGFAULTs foot (terminal exits rc=139) on Eclipse's young SMP;\n\
+          # the crash never reproduces in a 2-CPU VM. One worker trades a\n\
+          # little redraw speed for a terminal that actually starts.\n\
+          workers=1\n\
           \n\
           [colors]\n\
           background=120f1c\n\
