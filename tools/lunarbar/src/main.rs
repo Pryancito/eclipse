@@ -27,6 +27,7 @@
 //! - `LUNARBAR_DUMP=/path:WxH` — render both bars (top + bottom, wallpaper gap
 //!   between) to a raw XRGB8888 file and exit, for offline verification.
 
+mod apps;
 mod draw;
 mod sysinfo;
 
@@ -36,8 +37,8 @@ use draw::{Canvas, Rgb, GLYPH_H};
 use sysinfo::{CpuMeter, NetMeter, NetRate};
 use wayland_client::{
     protocol::{
-        wl_buffer, wl_compositor, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
-        wl_surface,
+        wl_buffer, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm,
+        wl_shm_pool, wl_surface,
     },
     Connection, Dispatch, Proxy, QueueHandle, WEnum,
 };
@@ -59,8 +60,19 @@ const LAUNCH: Rgb = (0xb9, 0xa8, 0xff); // launcher glyph
 const PILL: Rgb = (0x29, 0x23, 0x3f); // clock/date pill background
 const BTN_ACTIVE: Rgb = (0x3a, 0x33, 0x57); // active taskbar button
 const WHITE: Rgb = (0xff, 0xff, 0xff); // active button text
+const MENU_PANEL: Rgb = (0x1a, 0x15, 0x2b); // launcher menu panel
+const MENU_HOVER: Rgb = (0x3a, 0x33, 0x57); // hovered menu row
 
 const BUFFERS: usize = 2;
+
+/// Udata marker: distinguishes the menu's layer surface and buffers from the
+/// bars' in wayland-client's per-(interface,udata) dispatch.
+#[derive(Clone, Copy)]
+struct MenuId;
+
+/// evdev keycode for Escape (closes the menu). wl_keyboard reports evdev
+/// codes offset by 8, so KEY_ESC (1) arrives as 9.
+const KEY_ESC_WL: u32 = 9;
 
 /// activated-state value from wlr-foreign-toplevel-management-unstable-v1
 /// (the `state` array carries u32 enum values; Activated == 2).
@@ -115,6 +127,41 @@ struct Toplevel {
     activated: bool,
 }
 
+/// The launcher's application menu: a full-output translucent overlay surface
+/// (Overlay layer, ARGB) with a panel of clickable app rows. Created on demand
+/// when the launcher is clicked, torn down when dismissed.
+struct Menu {
+    surface: wl_surface::WlSurface,
+    layer: ZwlrLayerSurfaceV1,
+    width: u32,
+    height: u32,
+    map: *mut u8,
+    map_len: usize,
+    buffers: [Option<wl_buffer::WlBuffer>; BUFFERS],
+    busy: [bool; BUFFERS],
+    next: usize,
+    configured: bool,
+    entries: Vec<apps::AppEntry>,
+    hover: Option<usize>,
+    /// Absolute row rects (x0,y0,x1,y1); index maps into `entries`.
+    row_hits: Vec<(i32, i32, i32, i32)>,
+    /// Panel rect (x,y,w,h) — clicks outside it dismiss the menu.
+    panel: (i32, i32, i32, i32),
+}
+
+impl Drop for Menu {
+    fn drop(&mut self) {
+        for b in self.buffers.iter().flatten() {
+            b.destroy();
+        }
+        if !self.map.is_null() {
+            unsafe { libc::munmap(self.map as *mut libc::c_void, self.map_len) };
+        }
+        self.layer.destroy();
+        self.surface.destroy();
+    }
+}
+
 /// One coherent snapshot of every metric both bars draw. Refreshed once per
 /// 1 Hz tick (a single /proc pass; sampling CpuMeter twice per tick would
 /// zero its delta).
@@ -140,9 +187,11 @@ struct State {
     foreign_mgr: Option<ZwlrForeignToplevelManagerV1>,
     seat: Option<wl_seat::WlSeat>,
     pointer: Option<wl_pointer::WlPointer>,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
     pending_outputs: Vec<wl_output::WlOutput>,
     bars: Vec<Bar>,
     toplevels: Vec<Toplevel>,
+    menu: Option<Menu>,
     height: u32,
     terminal: String,
     cpu: CpuMeter,
@@ -152,6 +201,7 @@ struct State {
     ptr_x: f64,
     ptr_y: f64,
     ptr_bar: Option<u32>, // layer id the pointer is over
+    ptr_on_menu: bool,    // pointer is over the menu overlay
 }
 
 impl State {
@@ -390,12 +440,12 @@ impl State {
         }
     }
 
-    /// Launcher click: spawn the terminal, detached via double-fork. The
-    /// intermediate child exits immediately (parent reaps it with a blocking
-    /// waitpid, which returns at once), so the grandchild running the terminal
-    /// is reparented to init — lunarbar never accumulates zombies.
-    fn spawn_terminal(&self) {
-        let cmd = self.terminal.clone();
+    /// Run a shell command detached via double-fork. The intermediate child
+    /// exits immediately (parent reaps it with a blocking waitpid, which
+    /// returns at once), so the grandchild is reparented to init — lunarbar
+    /// never accumulates zombies.
+    fn spawn(&self, cmd: &str) {
+        let cmd = cmd.to_string();
         unsafe {
             let pid = libc::fork();
             if pid == 0 {
@@ -404,7 +454,7 @@ impl State {
                 if libc::fork() == 0 {
                     let sh = b"/bin/sh\0";
                     let dashc = b"-c\0";
-                    let c = std::ffi::CString::new(cmd).unwrap();
+                    let c = std::ffi::CString::new(cmd).unwrap_or_default();
                     let argv = [
                         sh.as_ptr() as *const libc::c_char,
                         dashc.as_ptr() as *const libc::c_char,
@@ -429,6 +479,224 @@ impl State {
             return;
         };
         t.handle.activate(seat);
+    }
+
+    // ── Launcher menu ────────────────────────────────────────────────────────
+
+    /// Toggle the application menu open/closed (the launcher click target).
+    fn toggle_menu(&mut self, qh: &QueueHandle<State>) {
+        if self.menu.is_some() {
+            self.close_menu();
+        } else {
+            self.open_menu(qh);
+        }
+    }
+
+    /// Build the menu's entry list (Terminal first, then scanned XDG apps) and
+    /// map its full-output overlay surface.
+    fn open_menu(&mut self, qh: &QueueHandle<State>) {
+        let (Some(comp), Some(ls)) = (&self.compositor, &self.layer_shell) else {
+            return;
+        };
+        let mut entries = vec![apps::AppEntry {
+            name: "Terminal".into(),
+            exec: self.terminal.clone(),
+        }];
+        entries.extend(apps::scan_apps(&self.terminal));
+
+        let surface = comp.create_surface(qh, ());
+        let layer = ls.get_layer_surface(
+            &surface,
+            None,
+            zwlr_layer_shell_v1::Layer::Overlay,
+            "menu".into(),
+            qh,
+            MenuId,
+        );
+        layer.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
+        layer.set_size(0, 0);
+        // OnDemand: take keyboard focus (for Esc) only while the menu is up.
+        layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+        surface.commit();
+        self.menu = Some(Menu {
+            surface,
+            layer,
+            width: 0,
+            height: 0,
+            map: std::ptr::null_mut(),
+            map_len: 0,
+            buffers: [None, None],
+            busy: [false, false],
+            next: 0,
+            configured: false,
+            entries,
+            hover: None,
+            row_hits: Vec::new(),
+            panel: (0, 0, 0, 0),
+        });
+    }
+
+    /// Tear down the menu overlay (Drop destroys its surfaces and mapping).
+    fn close_menu(&mut self) {
+        self.menu = None;
+        self.ptr_on_menu = false;
+    }
+
+    /// (Re)allocate the menu overlay's ARGB shm pool after a configure.
+    fn configure_menu(&mut self, qh: &QueueHandle<State>, w: u32, h: u32) {
+        let (Some(shm), Some(menu)) = (self.shm.as_ref(), self.menu.as_mut()) else {
+            return;
+        };
+        let w = w.max(1);
+        let h = h.max(1);
+        if menu.configured && menu.width == w && menu.height == h {
+            self.render_menu();
+            return;
+        }
+        // Tear down any previous mapping/buffers.
+        for b in menu.buffers.iter_mut() {
+            if let Some(b) = b.take() {
+                b.destroy();
+            }
+        }
+        if !menu.map.is_null() {
+            unsafe { libc::munmap(menu.map as *mut libc::c_void, menu.map_len) };
+            menu.map = std::ptr::null_mut();
+        }
+        menu.configured = false;
+
+        let stride = w as usize * 4;
+        let frame_size = stride * h as usize;
+        let total = frame_size * BUFFERS;
+        let raw = unsafe {
+            libc::memfd_create(b"lunarbar-menu\0".as_ptr() as *const libc::c_char, libc::MFD_CLOEXEC)
+        };
+        if raw < 0 {
+            return;
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        if unsafe { libc::ftruncate(raw, total as libc::off_t) } != 0 {
+            return;
+        }
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                raw,
+                0,
+            )
+        };
+        if map == libc::MAP_FAILED {
+            return;
+        }
+        let pool = shm.create_pool(fd.as_fd(), total as i32, qh, ());
+        let mk = |i: usize| {
+            pool.create_buffer(
+                (i * frame_size) as i32,
+                w as i32,
+                h as i32,
+                stride as i32,
+                wl_shm::Format::Argb8888,
+                qh,
+                (MenuId, i),
+            )
+        };
+        let buffers = [Some(mk(0)), Some(mk(1))];
+        pool.destroy();
+
+        menu.width = w;
+        menu.height = h;
+        menu.map = map as *mut u8;
+        menu.map_len = total;
+        menu.buffers = buffers;
+        menu.busy = [false, false];
+        menu.next = 0;
+        menu.configured = true;
+        self.render_menu();
+    }
+
+    /// Paint the menu overlay into a free buffer and commit it.
+    fn render_menu(&mut self) {
+        let bar_h = self.height as i32;
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        if !menu.configured || menu.map.is_null() {
+            return;
+        }
+        let (w, h) = (menu.width as usize, menu.height as usize);
+        let frame_size = w * h * 4;
+        // Pick a released buffer or skip this frame.
+        let i = if !menu.busy[menu.next] {
+            menu.next
+        } else if !menu.busy[1 - menu.next] {
+            1 - menu.next
+        } else {
+            return;
+        };
+        menu.next = 1 - i;
+        menu.busy[i] = true;
+
+        let mut cv = Canvas::new(w, h);
+        let (panel, hits) = draw_menu(&mut cv, w, h, bar_h, &menu.entries, menu.hover);
+        let data: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(menu.map.add(i * frame_size), frame_size) };
+        cv.blit_argb(data);
+        menu.panel = panel;
+        menu.row_hits = hits;
+
+        if let Some(buf) = menu.buffers[i].as_ref() {
+            menu.surface.attach(Some(buf), 0, 0);
+            menu.surface.damage_buffer(0, 0, w as i32, h as i32);
+            menu.surface.commit();
+        }
+    }
+
+    /// Handle a pointer click on the menu overlay: launch the row under the
+    /// cursor, or dismiss when the click lands outside the panel.
+    fn menu_click(&mut self, x: i32, y: i32) {
+        let Some(menu) = self.menu.as_ref() else {
+            return;
+        };
+        let hit = menu
+            .row_hits
+            .iter()
+            .enumerate()
+            .find(|(_, (x0, y0, x1, y1))| x >= *x0 && x < *x1 && y >= *y0 && y < *y1)
+            .map(|(i, _)| i);
+        if let Some(i) = hit {
+            if let Some(e) = menu.entries.get(i) {
+                let cmd = e.exec.clone();
+                self.close_menu();
+                self.spawn(&cmd);
+            }
+            return;
+        }
+        // Click outside any row: dismiss (panel body clicks are inert).
+        let (px, py, pw, ph) = menu.panel;
+        let inside_panel = x >= px && x < px + pw && y >= py && y < py + ph;
+        if !inside_panel {
+            self.close_menu();
+        }
+    }
+
+    /// Update the hovered menu row from the pointer position; repaint on change.
+    fn menu_hover(&mut self, x: i32, y: i32) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        let new = menu
+            .row_hits
+            .iter()
+            .enumerate()
+            .find(|(_, (x0, y0, x1, y1))| x >= *x0 && x < *x1 && y >= *y0 && y < *y1)
+            .map(|(i, _)| i);
+        if new != menu.hover {
+            menu.hover = new;
+            self.render_menu();
+        }
     }
 }
 
@@ -681,6 +949,76 @@ fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics) -> (i32, i32) {
     launcher_hit
 }
 
+// ── Launcher menu drawing ────────────────────────────────────────────────────
+
+/// Paint the application menu overlay: a dim scrim over the whole output and a
+/// rounded panel of app rows anchored above the bottom bar's launcher. Returns
+/// the panel rect (x,y,w,h) and the absolute row hitboxes (index → entry).
+fn draw_menu(
+    cv: &mut Canvas,
+    ow: usize,
+    oh: usize,
+    bar_h: i32,
+    entries: &[apps::AppEntry],
+    hover: Option<usize>,
+) -> ((i32, i32, i32, i32), Vec<(i32, i32, i32, i32)>) {
+    // Dim backdrop (the canvas starts fully transparent).
+    cv.fill_rect_a(0, 0, ow as i32, oh as i32, (0, 0, 0), 0.35);
+
+    let pw = 300;
+    let px = 8;
+    let header_h = 34;
+    let row_h = 30;
+    let pad = 8;
+
+    // Panel grows upward from just above the bottom bar; clamp to the top bar.
+    let want_h = header_h + entries.len() as i32 * row_h + pad;
+    let top_limit = bar_h + 8;
+    let bottom = oh as i32 - bar_h - 6;
+    let ph = want_h.min(bottom - top_limit);
+    let py = (bottom - ph).max(top_limit);
+
+    cv.round_rect_a(px, py, pw, ph, 12, MENU_PANEL, 0.98);
+    // Violet accent rule under the header.
+    cv.hline(px + 10, py + header_h - 1, pw - 20, BAR_RULE, 0.7);
+
+    // Header: crescent + title.
+    let icon = 18;
+    cv.crescent(px + 12, py + (header_h - icon) / 2, icon, LAUNCH);
+    cv.text_bold(
+        "aplicaciones",
+        px + 12 + icon + 10,
+        py + (header_h - GLYPH_H) / 2,
+        TEXT,
+    );
+
+    let mut hits = Vec::new();
+    let mut y = py + header_h + 2;
+    for (i, e) in entries.iter().enumerate() {
+        if y + row_h > py + ph {
+            break; // out of panel; a scroll view is future work
+        }
+        let hovered = hover == Some(i);
+        if hovered {
+            cv.round_rect_a(px + 5, y + 1, pw - 10, row_h - 2, 6, MENU_HOVER, 1.0);
+        }
+        let col = if hovered { TEXT } else { MUTED };
+        // Truncate long names to the panel width (font is ISO-8859-1, so a
+        // plain '.' marks truncation, not the '…' glyph it lacks).
+        let max_chars = ((pw - 28) / draw::GLYPH_W) as usize;
+        let label: String = if e.name.chars().count() > max_chars {
+            e.name.chars().take(max_chars.saturating_sub(1)).chain(['.']).collect()
+        } else {
+            e.name.clone()
+        };
+        cv.text(&label, px + 14, y + (row_h - GLYPH_H) / 2, col);
+        hits.push((px + 5, y + 1, px + pw - 5, y + row_h - 1));
+        y += row_h;
+    }
+
+    ((px, py, pw, ph), hits)
+}
+
 /// "42" or "--" for an optional percentage.
 fn opt(v: Option<u32>) -> String {
     v.map(|x| x.to_string()).unwrap_or_else(|| "--".into())
@@ -832,7 +1170,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
         event: wl_pointer::Event,
         _: &(),
         _: &Connection,
-        _: &QueueHandle<State>,
+        qh: &QueueHandle<State>,
     ) {
         match event {
             wl_pointer::Event::Enter {
@@ -843,13 +1181,24 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
             } => {
                 state.ptr_x = surface_x;
                 state.ptr_y = surface_y;
+                state.ptr_on_menu = state
+                    .menu
+                    .as_ref()
+                    .map(|m| m.surface.id() == surface.id())
+                    .unwrap_or(false);
                 state.ptr_bar = state
                     .bars
                     .iter()
                     .find(|b| b.surface.id() == surface.id())
                     .map(|b| b.layer.id().protocol_id());
+                if state.ptr_on_menu {
+                    state.menu_hover(surface_x as i32, surface_y as i32);
+                }
             }
-            wl_pointer::Event::Leave { .. } => state.ptr_bar = None,
+            wl_pointer::Event::Leave { .. } => {
+                state.ptr_bar = None;
+                state.ptr_on_menu = false;
+            }
             wl_pointer::Event::Motion {
                 surface_x,
                 surface_y,
@@ -857,34 +1206,102 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
             } => {
                 state.ptr_x = surface_x;
                 state.ptr_y = surface_y;
+                if state.ptr_on_menu {
+                    state.menu_hover(surface_x as i32, surface_y as i32);
+                }
             }
             wl_pointer::Event::Button {
                 button, state: bs, ..
             } => {
                 // BTN_LEFT = 0x110; act on press.
                 let pressed = matches!(bs, WEnum::Value(wl_pointer::ButtonState::Pressed));
-                if pressed && button == 0x110 {
-                    if let Some(id) = state.ptr_bar {
-                        if let Some(idx) = state.bar_index(id) {
-                            let x = state.ptr_x as i32;
-                            let (hx0, hx1) = state.bars[idx].launcher_hit;
-                            if x >= hx0 && x < hx1 {
-                                state.spawn_terminal();
-                            } else if state.bars[idx].role == Role::Task {
-                                let hit = state.bars[idx]
-                                    .task_hits
-                                    .iter()
-                                    .find(|(x0, x1, _)| x >= *x0 && x < *x1)
-                                    .map(|(_, _, k)| *k);
-                                if let Some(k) = hit {
-                                    state.activate_toplevel(k);
-                                }
+                if !(pressed && button == 0x110) {
+                    return;
+                }
+                let (x, y) = (state.ptr_x as i32, state.ptr_y as i32);
+                if state.ptr_on_menu {
+                    state.menu_click(x, y);
+                } else if let Some(id) = state.ptr_bar {
+                    if let Some(idx) = state.bar_index(id) {
+                        let (hx0, hx1) = state.bars[idx].launcher_hit;
+                        if x >= hx0 && x < hx1 {
+                            state.toggle_menu(qh);
+                        } else if state.bars[idx].role == Role::Task {
+                            let hit = state.bars[idx]
+                                .task_hits
+                                .iter()
+                                .find(|(x0, x1, _)| x >= *x0 && x < *x1)
+                                .map(|(_, _, k)| *k);
+                            if let Some(k) = hit {
+                                state.activate_toplevel(k);
                             }
                         }
                     }
                 }
             }
             _ => {}
+        }
+    }
+}
+
+// Menu overlay: its own layer surface (MenuId udata) and ARGB buffers.
+impl Dispatch<ZwlrLayerSurfaceV1, MenuId> for State {
+    fn event(
+        state: &mut Self,
+        layer: &ZwlrLayerSurfaceV1,
+        event: zwlr_layer_surface_v1::Event,
+        _: &MenuId,
+        _: &Connection,
+        qh: &QueueHandle<State>,
+    ) {
+        match event {
+            zwlr_layer_surface_v1::Event::Configure {
+                serial,
+                width,
+                height,
+            } => {
+                layer.ack_configure(serial);
+                state.configure_menu(qh, width, height);
+            }
+            zwlr_layer_surface_v1::Event::Closed => state.close_menu(),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_buffer::WlBuffer, (MenuId, usize)> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_buffer::WlBuffer,
+        event: wl_buffer::Event,
+        (_, i): &(MenuId, usize),
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+        if let wl_buffer::Event::Release = event {
+            if let Some(menu) = state.menu.as_mut() {
+                menu.busy[*i] = false;
+            }
+        }
+    }
+}
+
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_keyboard::WlKeyboard,
+        event: wl_keyboard::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+        // Only Escape matters, and only to dismiss the menu. Raw evdev keycode
+        // (no xkb needed): KEY_ESC arrives as 9 over the wire.
+        if let wl_keyboard::Event::Key { key, state: ks, .. } = event {
+            let pressed = matches!(ks, WEnum::Value(wl_keyboard::KeyState::Pressed));
+            if pressed && key == KEY_ESC_WL {
+                state.close_menu();
+            }
         }
     }
 }
@@ -994,6 +1411,17 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
                 }
                 state.ptr_bar = None;
             }
+            // Keyboard: only used for Esc-to-close-menu, but bind it here too.
+            let has_kbd = caps.contains(wl_seat::Capability::Keyboard);
+            if has_kbd && state.keyboard.is_none() {
+                state.keyboard = Some(seat.get_keyboard(qh, ()));
+            } else if !has_kbd {
+                if let Some(k) = state.keyboard.take() {
+                    if k.version() >= 3 {
+                        k.release();
+                    }
+                }
+            }
         }
     }
 }
@@ -1074,6 +1502,39 @@ fn main() {
             ];
             draw_task(&mut cv, w, bh, &sample, &m);
             cv.blit_xrgb(&mut buf[off..off + w * bh * 4]);
+        }
+
+        // Optional: composite the open launcher menu over the whole preview
+        // (LUNARBAR_DUMP_MENU=1), so the offline dump shows it as clicked-open.
+        if std::env::var("LUNARBAR_DUMP_MENU").is_ok() {
+            let mut entries = vec![apps::AppEntry {
+                name: "Terminal".into(),
+                exec: terminal.clone(),
+            }];
+            entries.extend(apps::scan_apps(&terminal));
+            if entries.len() == 1 {
+                // No .desktop files in this environment: show sample rows so the
+                // preview still demonstrates the menu.
+                for n in ["Ajustes", "Archivos", "Navegador web", "Editor de texto"] {
+                    entries.push(apps::AppEntry { name: n.into(), exec: String::new() });
+                }
+            }
+            let mut cv = Canvas::new(w, full_h);
+            let (_, _) = draw_menu(&mut cv, w, full_h, bh as i32, &entries, Some(1));
+            // Alpha-composite the menu over the opaque preview.
+            let mut over = vec![0u8; w * full_h * 4];
+            cv.blit_argb(&mut over);
+            for (dst, src) in buf.chunks_exact_mut(4).zip(over.chunks_exact(4)) {
+                let a = src[3] as u32;
+                if a == 0 {
+                    continue;
+                }
+                for c in 0..3 {
+                    // src is premultiplied: out = src + dst*(1-a)
+                    dst[c] = (src[c] as u32 + dst[c] as u32 * (255 - a) / 255).min(255) as u8;
+                }
+                dst[3] = 0xff;
+            }
         }
 
         std::fs::write(&path, buf).expect("write dump");
