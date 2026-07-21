@@ -52,14 +52,39 @@ fn write_terminal_wrapper(rootfs: &Path) {
         &wrapper,
         b"#!/bin/sh\n\
           # Eclipse OS: launch whichever terminal is installed.\n\
+          # Every desktop path (labwc keybinds/menu, lunarbar's launcher,\n\
+          # autostart) goes through this wrapper, so when \"the terminal does\n\
+          # not open\" THIS is the place that must explain why: every attempt\n\
+          # is appended to $HOME/.eclipse-terminal.log with the terminal's\n\
+          # stderr and exit code.\n\
           export LANG=\"${LANG:-C.UTF-8}\"\n\
+          # foot refuses to start without a UTF-8 locale; make sure a broken\n\
+          # profile can never hand us a non-UTF-8 LANG.\n\
+          case \"$LANG\" in *UTF-8|*utf8|*UTF8) ;; *) LANG=C.UTF-8 ;; esac\n\
+          TLOG=\"${HOME:-/root}/.eclipse-terminal.log\"\n\
           if command -v foot >/dev/null 2>&1; then\n\
-          \x20 exec foot \"$@\"\n\
+          \x20 echo \"[$(date '+%H:%M:%S')] foot $* (LANG=$LANG WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-UNSET} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-UNSET})\" >>\"$TLOG\"\n\
+          \x20 t0=$(date +%s)\n\
+          \x20 foot \"$@\" 2>>\"$TLOG\"\n\
+          \x20 rc=$?\n\
+          \x20 t1=$(date +%s)\n\
+          # foot propagates the shell's exit code: a nonzero rc after a long\n\
+          # session is a normal close, not a startup failure. Only fall back\n\
+          # to alacritty when foot died within 5 seconds of launch.\n\
+          \x20 [ \"$rc\" -eq 0 ] && exit 0\n\
+          \x20 [ $((t1 - t0)) -ge 5 ] && exit \"$rc\"\n\
+          \x20 echo \"[eclipse-terminal] foot died at startup rc=$rc; trying alacritty\" >>\"$TLOG\"\n\
           fi\n\
           if command -v alacritty >/dev/null 2>&1; then\n\
-          \x20 LIBGL_ALWAYS_SOFTWARE=1 exec alacritty \"$@\"\n\
+          \x20 echo \"[$(date '+%H:%M:%S')] alacritty $*\" >>\"$TLOG\"\n\
+          \x20 LIBGL_ALWAYS_SOFTWARE=1 alacritty \"$@\" 2>>\"$TLOG\"\n\
+          \x20 rc=$?\n\
+          \x20 [ \"$rc\" -eq 0 ] && exit 0\n\
+          \x20 echo \"[eclipse-terminal] alacritty exited rc=$rc\" >>\"$TLOG\"\n\
+          \x20 exit \"$rc\"\n\
           fi\n\
           echo 'eclipse-terminal: no terminal found (apk add foot)' >&2\n\
+          echo 'eclipse-terminal: no terminal found (apk add foot)' >>\"$TLOG\"\n\
           exit 127\n",
     )
     .unwrap();
