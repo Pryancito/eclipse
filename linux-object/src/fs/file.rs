@@ -165,6 +165,40 @@ impl zircon_object::vm::FrameFiller for FileFrameFiller {
     }
 }
 
+/// Demand-paging source that reads from another VMO instead of the inode.
+///
+/// Used for a `MAP_PRIVATE` file mapping when the file already has a live
+/// `MAP_SHARED` VMO: writes made through the shared mapping live only in that
+/// VMO and never reach `inode.read_at`, so a private reader must copy-on-write
+/// from the shared VMO or it sees stale/zero bytes. This is exactly the
+/// wl_keyboard keymap path — the compositor writes the keymap into the memfd
+/// via `MAP_SHARED` (mmap+memcpy), then the client mmaps the same fd
+/// `MAP_PRIVATE, PROT_READ`; without this the client reads all zeros,
+/// xkbcommon reports "[XKB-822] Failed to parse input xkb string", and foot
+/// (and every xkbcommon client) then SIGSEGVs on the NULL keymap.
+struct VmoFrameFiller {
+    src: Arc<VmObject>,
+    /// File offset (into `src`) that this mapping's VMO offset 0 corresponds to.
+    base_offset: usize,
+    source_len: usize,
+}
+
+impl zircon_object::vm::FrameFiller for VmoFrameFiller {
+    fn source_len(&self) -> usize {
+        self.source_len
+    }
+
+    fn fill_page(&self, offset: usize, buf: &mut [u8]) {
+        if offset >= self.source_len {
+            return;
+        }
+        let want = (self.source_len - offset).min(buf.len());
+        // Best-effort: a short/failed read leaves the tail zero, matching the
+        // inode path.
+        let _ = self.src.read(self.base_offset + offset, &mut buf[..want]);
+    }
+}
+
 impl FileInner {
     /// write to file
     fn write(&mut self, buf: &[u8]) -> LxResult<usize> {
@@ -508,6 +542,29 @@ impl FileLike for File {
                 // The source captures the file inode and the file offset; bytes
                 // past end-of-file stay zero (the BSS tail of a file mapping).
                 let file_size = inner.inode.metadata()?.size;
+
+                // If this file already has a live MAP_SHARED VMO, a MAP_PRIVATE
+                // reader must copy-on-write from THAT, not from inode.read_at:
+                // writes through the shared mapping (e.g. a compositor memcpy'ing
+                // the wl_keyboard keymap into the memfd) never reach read_at, so
+                // reading the inode would return stale zeros. See VmoFrameFiller.
+                let key = Arc::as_ptr(&inner.inode) as *const () as usize;
+                if let Some(shared) = SHARED_FILE_VMOS
+                    .lock()
+                    .get(&key)
+                    .and_then(|w| w.upgrade())
+                {
+                    let src_total = shared.len();
+                    let source_len = src_total.saturating_sub(offset).min(len);
+                    let source: Arc<dyn zircon_object::vm::FrameFiller> =
+                        Arc::new(VmoFrameFiller {
+                            src: shared,
+                            base_offset: offset,
+                            source_len,
+                        });
+                    return Ok(VmObject::new_paged_with_source(pages(len), source));
+                }
+
                 let source_len = file_size.saturating_sub(offset).min(len);
                 if len >= 16 * 1024 * 1024 {
                     info!(
