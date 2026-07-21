@@ -1,0 +1,312 @@
+//! Software drawing for lunarbar, built on two pure-Rust crates that keep the
+//! binary a static musl executable with zero system dependencies:
+//!
+//! - **tiny-skia** rasterises every shape with real anti-aliasing: the rounded
+//!   pills, the ◑/☾ launcher discs (vector paths + mask, no hand-rolled
+//!   coverage math), the ▼/▲ triangles, and the load gauges — which get a
+//!   green→amber→red linear gradient for free.
+//! - **embedded-graphics** supplies the text: mature ISO-8859-1 bitmap fonts
+//!   (FONT_9X15 + real bold), so lowercase, accents and eñes in window titles
+//!   render properly. tiny-skia has no text support; e-g has no AA shapes —
+//!   together they cover each other's blind spot.
+//!
+//! `Canvas` owns an RGBA tiny-skia `Pixmap`; bars draw into it and then
+//! `blit_xrgb` swizzles the finished frame into the wl_shm XRGB8888 buffer.
+
+use embedded_graphics::{
+    mono_font::{
+        iso_8859_1::{FONT_9X15, FONT_9X15_BOLD},
+        MonoTextStyle,
+    },
+    pixelcolor::Rgb888,
+    prelude::*,
+    text::{Baseline, Text},
+};
+use tiny_skia::{
+    Color, FillRule, GradientStop, LinearGradient, Mask, Paint, Path, PathBuilder, Pixmap, Rect,
+    SpreadMode, Stroke, Transform,
+};
+
+pub type Rgb = (u8, u8, u8);
+
+/// Glyph cell height of the bar font (FONT_9X15).
+pub const GLYPH_H: i32 = 15;
+/// Glyph advance (cell width) of the bar font.
+pub const GLYPH_W: i32 = 9;
+
+/// Cubic-Bézier circle constant (approximates a 90° arc).
+const K: f32 = 0.552_284_8;
+
+#[inline]
+fn color(c: Rgb, a: f32) -> Color {
+    Color::from_rgba8(c.0, c.1, c.2, (a.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+/// An RGBA scratch frame with AA vector drawing (tiny-skia) and bitmap text
+/// (embedded-graphics), blitted to XRGB8888 when the frame is complete.
+pub struct Canvas {
+    pix: Pixmap,
+}
+
+impl Canvas {
+    pub fn new(w: usize, h: usize) -> Self {
+        Self {
+            pix: Pixmap::new(w.max(1) as u32, h.max(1) as u32).expect("pixmap alloc"),
+        }
+    }
+
+    fn paint<'a>(c: Rgb, a: f32) -> Paint<'a> {
+        let mut p = Paint::default();
+        p.set_color(color(c, a));
+        p.anti_alias = true;
+        p
+    }
+
+    fn fill(&mut self, path: &Path, c: Rgb, a: f32) {
+        self.pix
+            .fill_path(path, &Self::paint(c, a), FillRule::Winding, Transform::identity(), None);
+    }
+
+    /// Fill the whole canvas with a solid colour.
+    pub fn clear(&mut self, c: Rgb) {
+        self.pix.fill(color(c, 1.0));
+    }
+
+    /// Horizontal 1px line (used for the bars' accent rules).
+    pub fn hline(&mut self, x0: i32, y: i32, len: i32, c: Rgb, a: f32) {
+        if let Some(r) = Rect::from_xywh(x0 as f32, y as f32, len.max(0) as f32, 1.0) {
+            self.fill(&PathBuilder::from_rect(r), c, a);
+        }
+    }
+
+    /// A faint vertical separator line, centred in a bar of height `h`, ~half
+    /// the bar tall. Cleaner than a dot for grouping modules.
+    pub fn vrule(&mut self, x: i32, h: i32, c: Rgb) {
+        let y0 = (h / 4) as f32;
+        let y1 = (h - h / 4) as f32;
+        if let Some(r) = Rect::from_xywh(x as f32, y0, 1.0, y1 - y0) {
+            self.fill(&PathBuilder::from_rect(r), c, 0.30);
+        }
+    }
+
+    /// A filled rounded rectangle, corner radius `rad`. Used for the clock and
+    /// date pills and the active taskbar button, matching waybar's
+    /// `border-radius: 6px` — now genuinely round thanks to tiny-skia's AA.
+    pub fn round_rect(&mut self, x: i32, y: i32, rw: i32, rh: i32, rad: i32, c: Rgb) {
+        if let Some(p) = rounded_rect_path(x as f32, y as f32, rw as f32, rh as f32, rad as f32) {
+            self.fill(&p, c, 1.0);
+        }
+    }
+
+    /// A small solid triangle in an `s`x`s` box at (x,y). `up=true` points up
+    /// (tip at top → upload), else down (tip at bottom → download).
+    pub fn triangle(&mut self, x: i32, y: i32, s: i32, up: bool, c: Rgb) {
+        let (x, y, s) = (x as f32, y as f32, s as f32);
+        let mut pb = PathBuilder::new();
+        if up {
+            pb.move_to(x + s / 2.0, y);
+            pb.line_to(x + s, y + s);
+            pb.line_to(x, y + s);
+        } else {
+            pb.move_to(x, y);
+            pb.line_to(x + s, y);
+            pb.line_to(x + s / 2.0, y + s);
+        }
+        pb.close();
+        if let Some(p) = pb.finish() {
+            self.fill(&p, c, 1.0);
+        }
+    }
+
+    /// A mini horizontal gauge: a pill-shaped dark track filled `frac` (0..1)
+    /// of its width with a green→amber→red gradient (foot-terminal palette),
+    /// so a busy metric reads at a glance.
+    pub fn gauge(&mut self, x: i32, y: i32, gw: i32, gh: i32, frac: f32, track: Rgb) {
+        let frac = frac.clamp(0.0, 1.0);
+        let rad = gh / 2;
+        self.round_rect(x, y, gw, gh, rad, track);
+        let filled = (gw as f32 * frac).round();
+        if filled < 1.0 {
+            return;
+        }
+        let Some(p) = rounded_rect_path(x as f32, y as f32, filled, gh as f32, rad as f32) else {
+            return;
+        };
+        // Gradient spans the FULL track, revealed by the fill width, so the
+        // visible leading edge carries the colour of the current level.
+        let stops = vec![
+            GradientStop::new(0.0, Color::from_rgba8(0x8f, 0xd1, 0x8a, 0xff)), // green
+            GradientStop::new(0.5, Color::from_rgba8(0xe0, 0xc0, 0x7a, 0xff)), // amber
+            GradientStop::new(1.0, Color::from_rgba8(0xe0, 0x7a, 0x7a, 0xff)), // red
+        ];
+        if let Some(shader) = LinearGradient::new(
+            tiny_skia::Point::from_xy(x as f32, y as f32),
+            tiny_skia::Point::from_xy((x + gw) as f32, y as f32),
+            stops,
+            SpreadMode::Pad,
+            Transform::identity(),
+        ) {
+            let mut paint = Paint::default();
+            paint.shader = shader;
+            paint.anti_alias = true;
+            self.pix
+                .fill_path(&p, &paint, FillRule::Winding, Transform::identity(), None);
+        }
+    }
+
+    /// The ◑ launcher: an outlined circle whose right half is filled. Matches
+    /// the waybar `custom/launcher` glyph.
+    pub fn disc_half(&mut self, x: i32, y: i32, d: i32, c: Rgb) {
+        let r = d as f32 / 2.0;
+        let cx = x as f32 + r;
+        let cy = y as f32 + r;
+        // Outer ring.
+        if let Some(circle) = PathBuilder::from_circle(cx, cy, r - 0.75) {
+            self.pix.stroke_path(
+                &circle,
+                &Self::paint(c, 1.0),
+                &Stroke {
+                    width: 1.5,
+                    ..Stroke::default()
+                },
+                Transform::identity(),
+                None,
+            );
+        }
+        // Right-half fill: a semicircle built from two quarter-arc cubics.
+        let ri = r - 0.5;
+        let mut pb = PathBuilder::new();
+        pb.move_to(cx, cy - ri);
+        pb.cubic_to(cx + K * ri, cy - ri, cx + ri, cy - K * ri, cx + ri, cy);
+        pb.cubic_to(cx + ri, cy + K * ri, cx + K * ri, cy + ri, cx, cy + ri);
+        pb.close();
+        if let Some(p) = pb.finish() {
+            self.fill(&p, c, 1.0);
+        }
+    }
+
+    /// The ☾ crescent: the sun disc masked by an offset moon disc — done with
+    /// a real inverted clip mask instead of hand-rolled coverage math.
+    /// Mirrors lunarbg's eclipse crescent so the top bar matches the wallpaper.
+    pub fn crescent(&mut self, x: i32, y: i32, d: i32, c: Rgb) {
+        let r = d as f32 / 2.0;
+        let cx = x as f32 + r;
+        let cy = y as f32 + r;
+        let (mx, my, mr) = (cx + r * 0.42, cy - r * 0.10, r * 0.92);
+        let (Some(sun), Some(moon)) = (
+            PathBuilder::from_circle(cx, cy, r),
+            PathBuilder::from_circle(mx, my, mr),
+        ) else {
+            return;
+        };
+        let Some(mut mask) = Mask::new(self.pix.width(), self.pix.height()) else {
+            return;
+        };
+        mask.fill_path(&moon, FillRule::Winding, true, Transform::identity());
+        mask.invert();
+        self.pix.fill_path(
+            &sun,
+            &Self::paint(c, 1.0),
+            FillRule::Winding,
+            Transform::identity(),
+            Some(&mask),
+        );
+    }
+
+    /// Draw a left-aligned string (FONT_9X15, transparent background) with its
+    /// cell top at `y`. Returns the advance in pixels.
+    pub fn text(&mut self, s: &str, x: i32, y: i32, c: Rgb) -> i32 {
+        let style = MonoTextStyle::new(&FONT_9X15, Rgb888::new(c.0, c.1, c.2));
+        Text::with_baseline(s, Point::new(x, y), style, Baseline::Top)
+            .draw(self)
+            .map(|end| end.x - x)
+            .unwrap_or(0)
+    }
+
+    /// Bold variant of `text` (FONT_9X15_BOLD, same metrics). Matches waybar's
+    /// `font-weight: bold` clock.
+    pub fn text_bold(&mut self, s: &str, x: i32, y: i32, c: Rgb) -> i32 {
+        let style = MonoTextStyle::new(&FONT_9X15_BOLD, Rgb888::new(c.0, c.1, c.2));
+        Text::with_baseline(s, Point::new(x, y), style, Baseline::Top)
+            .draw(self)
+            .map(|end| end.x - x)
+            .unwrap_or(0)
+    }
+
+    /// Pixel width a string will occupy (monospace: chars × cell width).
+    pub fn text_width(s: &str) -> i32 {
+        s.chars().count() as i32 * GLYPH_W
+    }
+
+    /// Swizzle the finished RGBA frame into an XRGB8888 (B,G,R,X) buffer.
+    /// `dst` must be exactly w*h*4 bytes.
+    pub fn blit_xrgb(&self, dst: &mut [u8]) {
+        let src = self.pix.data();
+        let n = (self.pix.width() * self.pix.height()) as usize;
+        assert!(dst.len() >= n * 4 && src.len() >= n * 4);
+        for i in 0..n {
+            let o = i * 4;
+            // Everything drawn is opaque (the bar clears to a solid ground),
+            // so premultiplied RGBA here equals straight RGB.
+            dst[o] = src[o + 2]; // B
+            dst[o + 1] = src[o + 1]; // G
+            dst[o + 2] = src[o]; // R
+            dst[o + 3] = 0xff; // X
+        }
+    }
+}
+
+// embedded-graphics draw target: text renders straight into the RGBA pixmap.
+impl OriginDimensions for Canvas {
+    fn size(&self) -> Size {
+        Size::new(self.pix.width(), self.pix.height())
+    }
+}
+
+impl DrawTarget for Canvas {
+    type Color = Rgb888;
+    type Error = core::convert::Infallible;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        let w = self.pix.width() as i32;
+        let h = self.pix.height() as i32;
+        let data = self.pix.data_mut();
+        for Pixel(p, c) in pixels {
+            if p.x >= 0 && p.y >= 0 && p.x < w && p.y < h {
+                let i = ((p.y * w + p.x) as usize) * 4;
+                // Pixmap is premultiplied RGBA; alpha 255 makes this straight.
+                data[i] = c.r();
+                data[i + 1] = c.g();
+                data[i + 2] = c.b();
+                data[i + 3] = 0xff;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A rounded-rect path with all corners of radius `r` (quarter-arc cubics).
+fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let r = r.clamp(0.0, (w / 2.0).min(h / 2.0));
+    if r <= 0.5 {
+        return Rect::from_xywh(x, y, w, h).map(PathBuilder::from_rect);
+    }
+    let mut pb = PathBuilder::new();
+    pb.move_to(x + r, y);
+    pb.line_to(x + w - r, y);
+    pb.cubic_to(x + w - r + K * r, y, x + w, y + r - K * r, x + w, y + r);
+    pb.line_to(x + w, y + h - r);
+    pb.cubic_to(x + w, y + h - r + K * r, x + w - r + K * r, y + h, x + w - r, y + h);
+    pb.line_to(x + r, y + h);
+    pb.cubic_to(x + r - K * r, y + h, x, y + h - r + K * r, x, y + h - r);
+    pb.line_to(x, y + r);
+    pb.cubic_to(x, y + r - K * r, x + r - K * r, y, x + r, y);
+    pb.close();
+    pb.finish()
+}
