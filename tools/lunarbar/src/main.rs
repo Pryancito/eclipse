@@ -32,7 +32,7 @@ mod sysinfo;
 
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 
-use draw::{Canvas, Rgb};
+use draw::{Canvas, Rgb, GLYPH_H};
 use sysinfo::{CpuMeter, NetMeter, NetRate};
 use wayland_client::{
     protocol::{
@@ -318,13 +318,15 @@ impl State {
             Role::Info => {
                 let (w, h) = (self.bars[idx].width as usize, self.bars[idx].height as usize);
                 let frame_size = w * h * 4;
+                let mut cv = Canvas::new(w, h);
+                let launcher_hit = draw_info(&mut cv, w, h, &m);
                 let bar = &mut self.bars[idx];
                 let i = pick_buffer(bar);
                 let data: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(bar.map.add(i * frame_size), frame_size)
                 };
-                let mut cv = Canvas { data, w, h };
-                bar.launcher_hit = draw_info(&mut cv, w, h, &m);
+                cv.blit_xrgb(data);
+                bar.launcher_hit = launcher_hit;
                 commit_bar(bar, i, w, h);
             }
             Role::Task => {
@@ -337,13 +339,14 @@ impl State {
                     .collect();
                 let (w, h) = (self.bars[idx].width as usize, self.bars[idx].height as usize);
                 let frame_size = w * h * 4;
+                let mut cv = Canvas::new(w, h);
+                let (launcher_hit, hits) = draw_task(&mut cv, w, h, &items, &m);
                 let bar = &mut self.bars[idx];
                 let i = pick_buffer(bar);
                 let data: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(bar.map.add(i * frame_size), frame_size)
                 };
-                let mut cv = Canvas { data, w, h };
-                let (launcher_hit, hits) = draw_task(&mut cv, w, h, &items, &m);
+                cv.blit_xrgb(data);
                 bar.launcher_hit = launcher_hit;
                 bar.task_hits = hits;
                 commit_bar(bar, i, w, h);
@@ -434,18 +437,6 @@ fn commit_bar(bar: &mut Bar, i: usize, w: usize, h: usize) {
     }
 }
 
-// ── Shared layout constants ──────────────────────────────────────────────────
-
-/// Text scale for a bar of height `h`: 14px glyphs in the default 34px bar
-/// (≈ waybar's 13px font), growing only on very tall bars.
-fn text_scale(h: usize) -> i32 {
-    if h >= 48 {
-        3
-    } else {
-        2
-    }
-}
-
 // ── Bottom bar: the waybar layout, replicated ────────────────────────────────
 
 /// Paint the taskbar exactly like the waybar config it replaces:
@@ -463,9 +454,7 @@ fn draw_task(
     cv.hline(0, 0, w as i32, BAR_RULE, 1.0);
     cv.hline(0, 1, w as i32, BAR_RULE, 1.0);
 
-    let scale = text_scale(h);
-    let gh = 7 * scale;
-    let ty = (h as i32 - gh) / 2;
+    let ty = (h as i32 + 2 - GLYPH_H) / 2; // text cell top, below the border
     let btn_h = h as i32 - 10; // waybar: margin 3px + 2px border
     let btn_y = (h as i32 - btn_h) / 2 + 1;
 
@@ -480,23 +469,21 @@ fn draw_task(
     let mut rx = w as i32 - 4;
     {
         // clock: rounded pill, bold, #29233f / #e8e4f8
-        let cw = Canvas::text_width(&m.clock, scale) + 1; // +1 bold offset
+        let cw = Canvas::text_width(&m.clock);
         let pw = cw + 20;
         rx -= pw;
         cv.round_rect(rx, btn_y, pw, btn_h, 6, PILL);
-        cv.text_bold(&m.clock, rx + 10, ty, scale, TEXT);
+        cv.text_bold(&m.clock, rx + 10, ty, TEXT);
         rx -= 10;
 
         let mem_s = format!("mem {}%", opt(m.mem));
-        let tw = Canvas::text_width(&mem_s, scale);
-        rx -= tw + 10;
-        cv.text(&mem_s, rx, ty, scale, MUTED);
+        rx -= Canvas::text_width(&mem_s) + 10;
+        cv.text(&mem_s, rx, ty, MUTED);
         rx -= 10;
 
         let cpu_s = format!("cpu {}%", opt(m.cpu));
-        let tw = Canvas::text_width(&cpu_s, scale);
-        rx -= tw + 10;
-        cv.text(&cpu_s, rx, ty, scale, MUTED);
+        rx -= Canvas::text_width(&cpu_s) + 10;
+        cv.text(&cpu_s, rx, ty, MUTED);
         rx -= 10;
     }
 
@@ -504,7 +491,7 @@ fn draw_task(
     let mut hits = Vec::new();
     let mut x = launcher_hit.1;
     for (k, (label, active)) in items.iter().enumerate() {
-        let tw = Canvas::text_width(label, scale);
+        let tw = Canvas::text_width(label);
         let bw = tw + 16; // padding 0 8px
         if x + bw > rx - 8 {
             break; // out of room; stop rather than overflow
@@ -513,7 +500,7 @@ fn draw_task(
             cv.round_rect(x, btn_y, bw, btn_h, 6, BTN_ACTIVE);
         }
         let fg = if *active { WHITE } else { MUTED };
-        cv.text(label, x + 8, ty, scale, fg);
+        cv.text(label, x + 8, ty, fg);
         hits.push((x, x + bw, k));
         x += bw + 4; // margin 3px 2px
     }
@@ -530,42 +517,41 @@ fn metric(
     right: i32,
     ty: i32,
     h: i32,
-    scale: i32,
     label: &str,
     gauge: Option<f32>,
     col: Rgb,
 ) -> i32 {
-    let tw = Canvas::text_width(label, scale);
-    let (gw, gpad) = if gauge.is_some() { (5 * scale, 5) } else { (0, 0) };
+    let tw = Canvas::text_width(label);
+    let (gw, gpad) = if gauge.is_some() { (26, 6) } else { (0, 0) };
     let total = gw + gpad + tw;
     let x = right - total;
     if let Some(f) = gauge {
-        let ghh = (scale + 2).max(4);
+        let ghh = 7;
         let gy = (h - ghh) / 2;
         cv.gauge(x, gy, gw, ghh, f, PILL);
     }
-    cv.text(label, x + gw + gpad, ty, scale, col);
+    cv.text(label, x + gw + gpad, ty, col);
     x
 }
 
 /// Draw the network module: ▼<down> ▲<up>, right-anchored at `right`.
-fn net_module(cv: &mut Canvas, right: i32, ty: i32, h: i32, scale: i32, n: &NetRate) -> i32 {
+fn net_module(cv: &mut Canvas, right: i32, ty: i32, h: i32, n: &NetRate) -> i32 {
     let down = sysinfo::fmt_rate(n.down);
     let up = sysinfo::fmt_rate(n.up);
-    let ts = 2 * scale + 1;
+    let ts = 9;
     let ty_tri = (h - ts) / 2;
-    let dw = Canvas::text_width(&down, scale);
-    let uw = Canvas::text_width(&up, scale);
+    let dw = Canvas::text_width(&down);
+    let uw = Canvas::text_width(&up);
     let total = ts + 4 + dw + 10 + ts + 4 + uw;
     let x = right - total;
     let mut cx = x;
     cv.triangle(cx, ty_tri, ts, false, LAUNCH); // download ▼
     cx += ts + 4;
-    cx += cv.text(&down, cx, ty, scale, MUTED);
+    cx += cv.text(&down, cx, ty, MUTED);
     cx += 10;
     cv.triangle(cx, ty_tri, ts, true, LAUNCH); // upload ▲
     cx += ts + 4;
-    cv.text(&up, cx, ty, scale, MUTED);
+    cv.text(&up, cx, ty, MUTED);
     x
 }
 
@@ -576,9 +562,7 @@ fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics) -> (i32, i32) {
     cv.hline(0, h as i32 - 1, w as i32, BAR_RULE, 1.0);
     cv.hline(0, h as i32 - 2, w as i32, BAR_RULE, 1.0);
 
-    let scale = text_scale(h);
-    let gh = 7 * scale;
-    let ty = (h as i32 - gh) / 2;
+    let ty = (h as i32 - 2 - GLYPH_H) / 2; // text cell top, above the border
     let hi = h as i32;
     let btn_h = hi - 10;
     let btn_y = (hi - btn_h) / 2;
@@ -588,64 +572,55 @@ fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics) -> (i32, i32) {
     let ly = (hi - d) / 2;
     cv.crescent(10, ly, d, LAUNCH);
     let mut lx = 10 + d + 8;
-    lx += cv.text_bold("eclipse", lx, ty, scale, TEXT) + 1;
+    lx += cv.text_bold("eclipse", lx, ty, TEXT);
     let launcher_hit = (0, lx + 4);
 
     if let Some(up) = &m.uptime {
         lx += 12;
         cv.vrule(lx, hi, BAR_RULE);
         lx += 12;
-        lx += cv.text(&format!("up {up}"), lx, ty, scale, MUTED);
+        lx += cv.text(&format!("up {up}"), lx, ty, MUTED);
     }
     if let Some(load) = m.load {
         lx += 12;
         cv.vrule(lx, hi, BAR_RULE);
         lx += 12;
-        cv.text(&format!("load {load:.2}"), lx, ty, scale, MUTED);
+        cv.text(&format!("load {load:.2}"), lx, ty, MUTED);
     }
 
     // ── right: date pill, battery, temp, disk, net (right-to-left) ──
     let mut rx = w as i32 - 4;
     {
-        let dw = Canvas::text_width(&m.date, scale) + 1;
+        let dw = Canvas::text_width(&m.date);
         let pw = dw + 20;
         rx -= pw;
-        cv.round_rect(rx, btn_y + 1, pw, btn_h, 6, PILL);
-        cv.text_bold(&m.date, rx + 10, ty, scale, TEXT);
+        cv.round_rect(rx, btn_y, pw, btn_h, 6, PILL);
+        cv.text_bold(&m.date, rx + 10, ty, TEXT);
         rx -= 10;
     }
     if let Some((b, ch)) = m.batt {
         rx -= 10;
         let label = if ch { format!("bat {b}% +") } else { format!("bat {b}%") };
-        rx = metric(cv, rx, ty, hi, scale, &label, Some(b as f32 / 100.0), MUTED);
+        rx = metric(cv, rx, ty, hi, &label, Some(b as f32 / 100.0), MUTED);
         rx -= 12;
         cv.vrule(rx, hi, BAR_RULE);
     }
     if let Some(t) = m.temp {
         rx -= 10;
-        rx = metric(cv, rx, ty, hi, scale, &format!("{t}c"), None, MUTED);
+        rx = metric(cv, rx, ty, hi, &format!("{t}°c"), None, MUTED);
         rx -= 12;
         cv.vrule(rx, hi, BAR_RULE);
     }
     if let Some(dk) = m.disk {
         rx -= 10;
-        rx = metric(
-            cv,
-            rx,
-            ty,
-            hi,
-            scale,
-            &format!("disk {dk}%"),
-            Some(dk as f32 / 100.0),
-            MUTED,
-        );
+        rx = metric(cv, rx, ty, hi, &format!("disk {dk}%"), Some(dk as f32 / 100.0), MUTED);
         rx -= 12;
         cv.vrule(rx, hi, BAR_RULE);
     }
     if let Some(n) = &m.net {
         if n.link {
             rx -= 10;
-            net_module(cv, rx, ty, hi, scale, n);
+            net_module(cv, rx, ty, hi, n);
         }
     }
 
@@ -932,11 +907,13 @@ fn main() {
         let bh = (height as usize).min(full_h / 2);
         let mut buf = vec![0u8; w * full_h * 4];
 
-        // Wallpaper-tone fill for the gap between the bars.
+        // Wallpaper-tone fill for the gap between the bars (XRGB: B,G,R,X).
         const WALL: Rgb = (0x0c, 0x0a, 0x18);
-        {
-            let mut cv = Canvas { data: &mut buf, w, h: full_h };
-            cv.clear(WALL);
+        for px in buf.chunks_exact_mut(4) {
+            px[0] = WALL.2;
+            px[1] = WALL.1;
+            px[2] = WALL.0;
+            px[3] = 0xff;
         }
 
         let mut cpu = CpuMeter::default();
@@ -959,21 +936,22 @@ fn main() {
 
         // Top info bar occupies rows [0, bh).
         {
-            let top = &mut buf[..w * bh * 4];
-            let mut cv = Canvas { data: top, w, h: bh };
+            let mut cv = Canvas::new(w, bh);
             draw_info(&mut cv, w, bh, &m);
+            cv.blit_xrgb(&mut buf[..w * bh * 4]);
         }
-        // Bottom taskbar occupies rows [full_h-bh, full_h) with sample windows.
+        // Bottom taskbar occupies rows [full_h-bh, full_h) with sample windows
+        // (one accented, to exercise the ISO-8859-1 font).
         {
             let off = (full_h - bh) * w * 4;
-            let bot = &mut buf[off..off + w * bh * 4];
-            let mut cv = Canvas { data: bot, w, h: bh };
+            let mut cv = Canvas::new(w, bh);
             let sample = [
                 ("foot".to_string(), true),
-                ("eclipse files".to_string(), false),
+                ("configuración".to_string(), false),
                 ("lunar editor".to_string(), false),
             ];
             draw_task(&mut cv, w, bh, &sample, &m);
+            cv.blit_xrgb(&mut buf[off..off + w * bh * 4]);
         }
 
         std::fs::write(&path, buf).expect("write dump");

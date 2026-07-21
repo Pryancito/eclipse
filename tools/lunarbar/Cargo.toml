@@ -15,6 +15,12 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
+# Drawing stack, both pure Rust with zero system dependencies:
+# - tiny-skia: anti-aliased vector shapes (pills, discs, gradients).
+# - embedded-graphics: mature ISO-8859-1 bitmap fonts (tiny-skia has no text).
+# png-format is disabled to keep the png/zlib crates out of the binary.
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+embedded-graphics = "0.8"
 # Pure-Rust Wayland stack (no libwayland-client.so): the default wayland-backend
 # is the Rust implementation, so the binary is fully static. NO GTK, NO D-Bus,
 # NO gdk-pixbuf, NO fontconfig — the whole reason lunarbar exists as waybar's
