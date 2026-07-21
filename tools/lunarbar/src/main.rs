@@ -232,9 +232,15 @@ impl State {
         }
         let Some(shm) = &self.shm else { return };
 
-        // Tear down any previous mapping/buffers.
+        // Tear down any previous mapping/buffers. Mark unconfigured until the
+        // replacement is fully in place: if an allocation below fails and we
+        // bail, render() must not run against the torn-down state (and stale
+        // task_hits must not keep resolving clicks against a frozen frame).
         {
             let bar = &mut self.bars[idx];
+            bar.configured = false;
+            bar.task_hits.clear();
+            bar.launcher_hit = (0, 0);
             for b in bar.buffers.iter_mut() {
                 if let Some(b) = b.take() {
                     b.destroy();
@@ -318,10 +324,13 @@ impl State {
             Role::Info => {
                 let (w, h) = (self.bars[idx].width as usize, self.bars[idx].height as usize);
                 let frame_size = w * h * 4;
+                let bar = &mut self.bars[idx];
+                let Some(i) = pick_buffer(bar) else {
+                    return; // both buffers held by the compositor; retry next tick
+                };
                 let mut cv = Canvas::new(w, h);
                 let launcher_hit = draw_info(&mut cv, w, h, &m);
                 let bar = &mut self.bars[idx];
-                let i = pick_buffer(bar);
                 let data: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(bar.map.add(i * frame_size), frame_size)
                 };
@@ -339,10 +348,13 @@ impl State {
                     .collect();
                 let (w, h) = (self.bars[idx].width as usize, self.bars[idx].height as usize);
                 let frame_size = w * h * 4;
+                let bar = &mut self.bars[idx];
+                let Some(i) = pick_buffer(bar) else {
+                    return; // both buffers held by the compositor; retry next tick
+                };
                 let mut cv = Canvas::new(w, h);
                 let (launcher_hit, hits) = draw_task(&mut cv, w, h, &items, &m);
                 let bar = &mut self.bars[idx];
-                let i = pick_buffer(bar);
                 let data: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(bar.map.add(i * frame_size), frame_size)
                 };
@@ -378,28 +390,35 @@ impl State {
         }
     }
 
-    /// Launcher click: spawn the terminal, detached.
+    /// Launcher click: spawn the terminal, detached via double-fork. The
+    /// intermediate child exits immediately (parent reaps it with a blocking
+    /// waitpid, which returns at once), so the grandchild running the terminal
+    /// is reparented to init — lunarbar never accumulates zombies.
     fn spawn_terminal(&self) {
         let cmd = self.terminal.clone();
         unsafe {
             let pid = libc::fork();
             if pid == 0 {
+                // Intermediate child: new session, fork the real child, exit.
                 libc::setsid();
-                let sh = b"/bin/sh\0";
-                let dashc = b"-c\0";
-                let c = std::ffi::CString::new(cmd).unwrap();
-                let argv = [
-                    sh.as_ptr() as *const libc::c_char,
-                    dashc.as_ptr() as *const libc::c_char,
-                    c.as_ptr(),
-                    std::ptr::null(),
-                ];
-                libc::execv(sh.as_ptr() as *const libc::c_char, argv.as_ptr());
-                libc::_exit(127);
+                if libc::fork() == 0 {
+                    let sh = b"/bin/sh\0";
+                    let dashc = b"-c\0";
+                    let c = std::ffi::CString::new(cmd).unwrap();
+                    let argv = [
+                        sh.as_ptr() as *const libc::c_char,
+                        dashc.as_ptr() as *const libc::c_char,
+                        c.as_ptr(),
+                        std::ptr::null(),
+                    ];
+                    libc::execv(sh.as_ptr() as *const libc::c_char, argv.as_ptr());
+                    libc::_exit(127);
+                }
+                libc::_exit(0);
             }
             if pid > 0 {
                 let mut st = 0;
-                libc::waitpid(pid, &mut st, libc::WNOHANG);
+                libc::waitpid(pid, &mut st, 0);
             }
         }
     }
@@ -415,18 +434,22 @@ impl State {
 
 // ── Buffer helpers ───────────────────────────────────────────────────────────
 
-/// Choose a released buffer (or overwrite a busy one rather than stall).
-fn pick_buffer(bar: &mut Bar) -> usize {
+/// Choose a released buffer. Returns None when the compositor still holds
+/// both — the caller skips this frame (the next 1 Hz tick retries) instead of
+/// writing into shm the compositor may be reading, which both tears and
+/// corrupts the busy[] accounting via the stale Release that would follow a
+/// double-attach.
+fn pick_buffer(bar: &mut Bar) -> Option<usize> {
     let i = if !bar.busy[bar.next] {
         bar.next
     } else if !bar.busy[1 - bar.next] {
         1 - bar.next
     } else {
-        bar.next
+        return None;
     };
     bar.next = 1 - i;
     bar.busy[i] = true;
-    i
+    Some(i)
 }
 
 fn commit_bar(bar: &mut Bar, i: usize, w: usize, h: usize) {
@@ -465,26 +488,36 @@ fn draw_task(
     let launcher_hit = (0, 10 + d + 10);
 
     // ── right side first, so the taskbar knows where to stop ──
-    // modules-right: cpu, memory, clock  →  right-to-left: clock pill, mem, cpu
+    // modules-right: cpu, memory, clock  →  right-to-left: clock pill, mem, cpu.
+    // On very narrow outputs, drop modules that would cross into the launcher
+    // instead of overprinting it (lowest-priority module drops first).
+    let left_min = launcher_hit.1 + 8;
     let mut rx = w as i32 - 4;
     {
         // clock: rounded pill, bold, #29233f / #e8e4f8
-        let cw = Canvas::text_width(&m.clock);
-        let pw = cw + 20;
-        rx -= pw;
-        cv.round_rect(rx, btn_y, pw, btn_h, 6, PILL);
-        cv.text_bold(&m.clock, rx + 10, ty, TEXT);
-        rx -= 10;
+        let pw = Canvas::text_width(&m.clock) + 20;
+        if rx - pw >= left_min {
+            rx -= pw;
+            cv.round_rect(rx, btn_y, pw, btn_h, 6, PILL);
+            cv.text_bold(&m.clock, rx + 10, ty, TEXT);
+            rx -= 10;
+        }
 
         let mem_s = format!("mem {}%", opt(m.mem));
-        rx -= Canvas::text_width(&mem_s) + 10;
-        cv.text(&mem_s, rx, ty, MUTED);
-        rx -= 10;
+        let mw = Canvas::text_width(&mem_s) + 10;
+        if rx - mw >= left_min {
+            rx -= mw;
+            cv.text(&mem_s, rx, ty, MUTED);
+            rx -= 10;
+        }
 
         let cpu_s = format!("cpu {}%", opt(m.cpu));
-        rx -= Canvas::text_width(&cpu_s) + 10;
-        cv.text(&cpu_s, rx, ty, MUTED);
-        rx -= 10;
+        let cw = Canvas::text_width(&cpu_s) + 10;
+        if rx - cw >= left_min {
+            rx -= cw;
+            cv.text(&cpu_s, rx, ty, MUTED);
+            rx -= 10;
+        }
     }
 
     // ── taskbar buttons: rounded 6px, active #3a3357 + white ──
@@ -511,31 +544,37 @@ fn draw_task(
 // ── Top bar: system info in the same visual language ─────────────────────────
 
 /// Draw a right-anchored module (optional mini gauge + label), ending at
-/// `right`. Returns the module's left x.
+/// `right`. Skipped (returns None) when it would cross `min_x` — narrow
+/// outputs drop right modules instead of overprinting the left group.
 fn metric(
     cv: &mut Canvas,
     right: i32,
+    min_x: i32,
     ty: i32,
     h: i32,
     label: &str,
     gauge: Option<f32>,
     col: Rgb,
-) -> i32 {
+) -> Option<i32> {
     let tw = Canvas::text_width(label);
     let (gw, gpad) = if gauge.is_some() { (26, 6) } else { (0, 0) };
     let total = gw + gpad + tw;
     let x = right - total;
+    if x < min_x {
+        return None;
+    }
     if let Some(f) = gauge {
         let ghh = 7;
         let gy = (h - ghh) / 2;
         cv.gauge(x, gy, gw, ghh, f, PILL);
     }
     cv.text(label, x + gw + gpad, ty, col);
-    x
+    Some(x)
 }
 
 /// Draw the network module: ▼<down> ▲<up>, right-anchored at `right`.
-fn net_module(cv: &mut Canvas, right: i32, ty: i32, h: i32, n: &NetRate) -> i32 {
+/// Skipped (returns None) when it would cross `min_x`.
+fn net_module(cv: &mut Canvas, right: i32, min_x: i32, ty: i32, h: i32, n: &NetRate) -> Option<i32> {
     let down = sysinfo::fmt_rate(n.down);
     let up = sysinfo::fmt_rate(n.up);
     let ts = 9;
@@ -544,6 +583,9 @@ fn net_module(cv: &mut Canvas, right: i32, ty: i32, h: i32, n: &NetRate) -> i32 
     let uw = Canvas::text_width(&up);
     let total = ts + 4 + dw + 10 + ts + 4 + uw;
     let x = right - total;
+    if x < min_x {
+        return None;
+    }
     let mut cx = x;
     cv.triangle(cx, ty_tri, ts, false, LAUNCH); // download ▼
     cx += ts + 4;
@@ -552,7 +594,7 @@ fn net_module(cv: &mut Canvas, right: i32, ty: i32, h: i32, n: &NetRate) -> i32 
     cv.triangle(cx, ty_tri, ts, true, LAUNCH); // upload ▲
     cx += ts + 4;
     cv.text(&up, cx, ty, MUTED);
-    x
+    Some(x)
 }
 
 /// Paint the top info bar. Returns the launcher hitbox (x0,x1).
@@ -585,42 +627,54 @@ fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics) -> (i32, i32) {
         lx += 12;
         cv.vrule(lx, hi, BAR_RULE);
         lx += 12;
-        cv.text(&format!("load {load:.2}"), lx, ty, MUTED);
+        lx += cv.text(&format!("load {load:.2}"), lx, ty, MUTED);
     }
 
     // ── right: date pill, battery, temp, disk, net (right-to-left) ──
+    // Modules that would cross into the left group are dropped, lowest
+    // priority (leftmost) first — narrow outputs degrade instead of garbling.
+    let min_x = lx + 12;
     let mut rx = w as i32 - 4;
     {
-        let dw = Canvas::text_width(&m.date);
-        let pw = dw + 20;
-        rx -= pw;
-        cv.round_rect(rx, btn_y, pw, btn_h, 6, PILL);
-        cv.text_bold(&m.date, rx + 10, ty, TEXT);
-        rx -= 10;
+        let pw = Canvas::text_width(&m.date) + 20;
+        if rx - pw >= min_x {
+            rx -= pw;
+            cv.round_rect(rx, btn_y, pw, btn_h, 6, PILL);
+            cv.text_bold(&m.date, rx + 10, ty, TEXT);
+            rx -= 10;
+        }
     }
     if let Some((b, ch)) = m.batt {
-        rx -= 10;
         let label = if ch { format!("bat {b}% +") } else { format!("bat {b}%") };
-        rx = metric(cv, rx, ty, hi, &label, Some(b as f32 / 100.0), MUTED);
-        rx -= 12;
-        cv.vrule(rx, hi, BAR_RULE);
+        if let Some(x) = metric(cv, rx - 10, min_x, ty, hi, &label, Some(b as f32 / 100.0), MUTED) {
+            rx = x - 12;
+            cv.vrule(rx, hi, BAR_RULE);
+        }
     }
     if let Some(t) = m.temp {
-        rx -= 10;
-        rx = metric(cv, rx, ty, hi, &format!("{t}°c"), None, MUTED);
-        rx -= 12;
-        cv.vrule(rx, hi, BAR_RULE);
+        if let Some(x) = metric(cv, rx - 10, min_x, ty, hi, &format!("{t}°c"), None, MUTED) {
+            rx = x - 12;
+            cv.vrule(rx, hi, BAR_RULE);
+        }
     }
     if let Some(dk) = m.disk {
-        rx -= 10;
-        rx = metric(cv, rx, ty, hi, &format!("disk {dk}%"), Some(dk as f32 / 100.0), MUTED);
-        rx -= 12;
-        cv.vrule(rx, hi, BAR_RULE);
+        if let Some(x) = metric(
+            cv,
+            rx - 10,
+            min_x,
+            ty,
+            hi,
+            &format!("disk {dk}%"),
+            Some(dk as f32 / 100.0),
+            MUTED,
+        ) {
+            rx = x - 12;
+            cv.vrule(rx, hi, BAR_RULE);
+        }
     }
     if let Some(n) = &m.net {
         if n.link {
-            rx -= 10;
-            net_module(cv, rx, ty, hi, n);
+            net_module(cv, rx - 10, min_x, ty, hi, n);
         }
     }
 
@@ -641,6 +695,7 @@ fn button_label(t: &Toplevel) -> String {
     } else {
         &t.app_id
     };
+    let src = sanitize_title(src);
     let src = src.trim();
     let src = if src.is_empty() { "window" } else { src };
     let mut s: String = src.chars().take(18).collect();
@@ -648,6 +703,36 @@ fn button_label(t: &Toplevel) -> String {
         s.push('.');
     }
     s
+}
+
+/// Map a raw toplevel title onto FONT_9X15's ISO-8859-1 repertoire. Titles
+/// arrive as arbitrary UTF-8: em/en dashes (Firefox's "page — browser"),
+/// curly quotes, emoji, CJK, even control chars. Untranslatable glyphs would
+/// each render as a full-width '?' — and a stray '\n' would draw a second
+/// text line bleeding out of the button — so translate what has an ASCII
+/// cousin, drop what is invisible, and collapse the rest into a single '?'.
+fn sanitize_title(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    for ch in src.chars() {
+        match ch {
+            '\u{2010}'..='\u{2015}' => out.push('-'),        // hyphens/dashes
+            '\u{2018}' | '\u{2019}' => out.push('\''),       // curly single quotes
+            '\u{201c}' | '\u{201d}' => out.push('"'),        // curly double quotes
+            '\u{2026}' => out.push_str("..."),               // ellipsis
+            // Invisible: zero-width chars, variation selectors, combining marks.
+            '\u{200b}'..='\u{200f}' | '\u{fe00}'..='\u{fe0f}' | '\u{0300}'..='\u{036f}' => {}
+            c if c.is_control() => out.push(' '),            // incl. \n, \t
+            c if (c as u32) < 0x100 => out.push(c),          // Latin-1: has a glyph
+            _ => {
+                // Everything else has no glyph; collapse runs (a CJK title
+                // becomes one '?', not one per codepoint).
+                if !out.ends_with('?') {
+                    out.push('?');
+                }
+            }
+        }
+    }
+    out
 }
 
 // ── Wayland dispatch ─────────────────────────────────────────────────────────
@@ -683,9 +768,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     state.pending_outputs.push(o);
                 }
                 "wl_seat" => {
-                    let seat: wl_seat::WlSeat = registry.bind(name, version.min(5), qh, ());
-                    state.pointer = Some(seat.get_pointer(qh, ()));
-                    state.seat = Some(seat);
+                    // The pointer is created from the Capabilities event, not
+                    // here: requesting one from a pointer-less seat is a
+                    // protocol violation on strict compositors.
+                    state.seat = Some(registry.bind(name, version.min(5), qh, ()));
                 }
                 _ => {}
             }
@@ -881,14 +967,45 @@ wayland_client::delegate_noop!(State: ignore wl_shm::WlShm);
 wayland_client::delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
 wayland_client::delegate_noop!(State: ignore wl_surface::WlSurface);
 wayland_client::delegate_noop!(State: ignore wl_output::WlOutput);
-wayland_client::delegate_noop!(State: ignore wl_seat::WlSeat);
+impl Dispatch<wl_seat::WlSeat, ()> for State {
+    fn event(
+        state: &mut Self,
+        seat: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<State>,
+    ) {
+        // Create/drop the pointer as the seat's POINTER capability toggles.
+        if let wl_seat::Event::Capabilities {
+            capabilities: WEnum::Value(caps),
+        } = event
+        {
+            let has_pointer = caps.contains(wl_seat::Capability::Pointer);
+            if has_pointer && state.pointer.is_none() {
+                state.pointer = Some(seat.get_pointer(qh, ()));
+            } else if !has_pointer {
+                if let Some(p) = state.pointer.take() {
+                    // release() exists from wl_pointer v3; below that the
+                    // object just stays inert.
+                    if p.version() >= 3 {
+                        p.release();
+                    }
+                }
+                state.ptr_bar = None;
+            }
+        }
+    }
+}
 wayland_client::delegate_noop!(State: ignore ZwlrLayerShellV1);
 
 fn main() {
+    // Minimum 26: the 15px font plus the h-10 pill height — anything shorter
+    // draws glyphs taller than the pills that frame them.
     let height: u32 = std::env::var("LUNARBAR_HEIGHT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .filter(|h| (16..=64).contains(h))
+        .filter(|h| (26..=64).contains(h))
         .unwrap_or(34); // waybar's configured height
     let terminal = std::env::var("LUNARBAR_TERMINAL")
         .unwrap_or_else(|_| "/usr/local/bin/eclipse-terminal".into());
@@ -904,6 +1021,11 @@ fn main() {
             }
             _ => (spec, 1280usize, 220usize),
         };
+        // Clamp degenerate specs ("0x220", "1280x1") instead of tripping the
+        // blit size assert — Canvas clamps its pixmap to >=1px but the
+        // destination slices below are sized from the raw values.
+        let w = w.clamp(64, 16384);
+        let full_h = full_h.clamp(2 * height as usize, 16384);
         let bh = (height as usize).min(full_h / 2);
         let mut buf = vec![0u8; w * full_h * 4];
 
@@ -975,6 +1097,11 @@ fn main() {
         terminal,
         ..State::default()
     };
+    // Prime the delta-based meters now: the registry roundtrip below provides
+    // a natural sampling window, so the FIRST committed frame already shows a
+    // real cpu% instead of a "cpu --%" flash.
+    let _ = state.cpu.sample();
+    let _ = state.net.sample();
     if let Err(e) = queue.roundtrip(&mut state) {
         eprintln!("lunarbar: initial roundtrip failed: {e}");
         std::process::exit(1);
