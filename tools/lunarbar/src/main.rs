@@ -1,29 +1,31 @@
 //! lunarbar — Eclipse OS's native panel stack (its waybar replacement).
 //!
-//! Why not waybar: waybar is a GTK application. GTK's GApplication registers on
-//! the session D-Bus at startup, so on a system with no session bus waybar
-//! prints "Could not connect: Connection refused" and exits before it ever maps
-//! its panel — and it further pulls in gdk-pixbuf, fontconfig and a UTF-8 locale
-//! to draw anything. lunarbar instead is a single static musl binary over
-//! wlr-layer-shell + wl_shm, with its own 5x7 font and /proc readers: NO GTK,
-//! NO D-Bus, NO gdk-pixbuf, NO fontconfig, NO locale. It just works.
+//! Why not waybar (or Ironbar/Eww/Riftbar): they are GTK applications. GTK's
+//! GApplication registers on the session D-Bus at startup, so on a system with
+//! no session bus the panel prints "Could not connect: Connection refused" and
+//! exits before it ever maps — and GTK further pulls in gdk-pixbuf, fontconfig
+//! and a UTF-8 locale to draw anything. lunarbar instead is a single static
+//! musl binary over wlr-layer-shell + wl_shm, with its own 5x7 font and /proc
+//! readers: NO GTK, NO D-Bus, NO gdk-pixbuf, NO fontconfig, NO locale.
 //!
-//! Two bars per output:
-//! - a TOP bar with system info — crescent launcher, uptime, load on the left;
-//!   CPU%, MEM%, network, temperature, disk, battery and the clock (with load
-//!   gauges) on the right;
-//! - a BOTTOM taskbar listing every open window via wlr-foreign-toplevel-
-//!   management (no D-Bus), click to focus/raise, the active window highlighted.
+//! Two bars per output, sharing the visual language of the waybar config this
+//! replaces (rgba(15,12,26) ground, #6b5aa8 2px rule, rounded pills):
+//! - BOTTOM (the classic waybar layout, replicated): ◑ launcher, then one
+//!   rounded button per open window via wlr-foreign-toplevel-management
+//!   (click to focus/raise, active button #3a3357 with white text); on the
+//!   right `cpu N%`, `mem N%`, and the bold clock in its violet pill.
+//! - TOP (system info): ☾ eclipse wordmark, uptime and load on the left;
+//!   network ▼/▲ throughput, disk, temperature and battery (auto-hidden when
+//!   absent) with load-tinted mini gauges, and the date pill on the right.
 //!
-//! Both bars reserve their height as an exclusive zone so maximised windows do
-//! not cover them, and repaint once a second.
+//! Both bars reserve their height as an exclusive zone and repaint at 1 Hz.
 //!
 //! Env knobs:
-//! - `LUNARBAR_HEIGHT=N`   — bar height in px (default 30, applies to both).
+//! - `LUNARBAR_HEIGHT=N`   — bar height in px (default 34, waybar's height).
 //! - `LUNARBAR_TERMINAL=…` — command run on launcher click (default
 //!   /usr/local/bin/eclipse-terminal).
-//! - `LUNARBAR_DUMP=/path:WxH` — render one INFO bar to a raw XRGB8888 file and
-//!   exit (no compositor needed), for offline verification.
+//! - `LUNARBAR_DUMP=/path:WxH` — render both bars (top + bottom, wallpaper gap
+//!   between) to a raw XRGB8888 file and exit, for offline verification.
 
 mod draw;
 mod sysinfo;
@@ -48,14 +50,15 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_surface_v1::{self, Anchor, KeyboardInteractivity, ZwlrLayerSurfaceV1},
 };
 
-// ── Palette (matches the Eclipse-Dark labwc theme) ───────────────────────────
-const BAR_BG: Rgb = (0x14, 0x10, 0x22); // deep night
-const BAR_RULE: Rgb = (0x6b, 0x5a, 0xa8); // violet accent rule
-const TEXT: Rgb = (0xe0, 0xdc, 0xf4); // lavender
-const ACCENT: Rgb = (0x9b, 0x8a, 0xe0); // violet — launcher, clock, active
-const DIM: Rgb = (0x83, 0x7d, 0xa0); // muted labels
-const BTN_BG: Rgb = (0x1e, 0x19, 0x30); // idle task button
-const BTN_ACTIVE_BG: Rgb = (0x2c, 0x24, 0x4a); // focused task button
+// ── Palette: lifted from the waybar CSS this bar replicates ──────────────────
+const BAR_BG: Rgb = (0x0f, 0x0c, 0x1a); // window#waybar background
+const BAR_RULE: Rgb = (0x6b, 0x5a, 0xa8); // 2px border, violet
+const TEXT: Rgb = (0xe8, 0xe4, 0xf8); // primary text
+const MUTED: Rgb = (0xc9, 0xc4, 0xe4); // module text (cpu/mem/buttons)
+const LAUNCH: Rgb = (0xb9, 0xa8, 0xff); // launcher glyph
+const PILL: Rgb = (0x29, 0x23, 0x3f); // clock/date pill background
+const BTN_ACTIVE: Rgb = (0x3a, 0x33, 0x57); // active taskbar button
+const WHITE: Rgb = (0xff, 0xff, 0xff); // active button text
 
 const BUFFERS: usize = 2;
 
@@ -67,7 +70,7 @@ const TOPLEVEL_STATE_ACTIVATED: u32 = 2;
 enum Role {
     /// Top bar: system metrics.
     Info,
-    /// Bottom bar: window list.
+    /// Bottom bar: waybar-style launcher + taskbar + cpu/mem/clock.
     Task,
 }
 
@@ -85,7 +88,7 @@ struct Bar {
     busy: [bool; BUFFERS],
     next: usize,
     configured: bool,
-    /// x-range [x0,x1) of the launcher hitbox (Info bars only).
+    /// x-range [x0,x1) of the launcher hitbox.
     launcher_hit: (i32, i32),
     /// (x0,x1,toplevel-index) click targets for each window button (Task bars).
     task_hits: Vec<(i32, i32, usize)>,
@@ -112,6 +115,23 @@ struct Toplevel {
     activated: bool,
 }
 
+/// One coherent snapshot of every metric both bars draw. Refreshed once per
+/// 1 Hz tick (a single /proc pass; sampling CpuMeter twice per tick would
+/// zero its delta).
+#[derive(Default, Clone)]
+struct Metrics {
+    cpu: Option<u32>,
+    mem: Option<u32>,
+    clock: String,
+    date: String,
+    net: Option<NetRate>,
+    uptime: Option<String>,
+    load: Option<f32>,
+    disk: Option<u32>,
+    temp: Option<u32>,
+    batt: Option<(u32, bool)>,
+}
+
 #[derive(Default)]
 struct State {
     compositor: Option<wl_compositor::WlCompositor>,
@@ -127,6 +147,7 @@ struct State {
     terminal: String,
     cpu: CpuMeter,
     net: NetMeter,
+    metrics: Metrics,
     // pointer tracking for clicks
     ptr_x: f64,
     ptr_y: f64,
@@ -134,6 +155,22 @@ struct State {
 }
 
 impl State {
+    /// One metrics pass per tick, shared by every bar render until the next.
+    fn refresh_metrics(&mut self) {
+        self.metrics = Metrics {
+            cpu: self.cpu.sample(),
+            mem: sysinfo::mem_percent(),
+            clock: sysinfo::clock_hhmm(),
+            date: sysinfo::date_dm(),
+            net: self.net.sample(),
+            uptime: sysinfo::uptime(),
+            load: sysinfo::loadavg(),
+            disk: sysinfo::disk_root_percent(),
+            temp: sysinfo::temp_c(),
+            batt: sysinfo::battery(),
+        };
+    }
+
     fn ensure_surfaces(&mut self, qh: &QueueHandle<State>) {
         let (Some(compositor), Some(layer_shell)) = (&self.compositor, &self.layer_shell) else {
             return;
@@ -276,62 +313,42 @@ impl State {
         if !self.bars[idx].configured || self.bars[idx].map.is_null() {
             return;
         }
+        let m = self.metrics.clone();
         match self.bars[idx].role {
-            Role::Info => self.render_info(idx),
-            Role::Task => self.render_task(idx),
+            Role::Info => {
+                let (w, h) = (self.bars[idx].width as usize, self.bars[idx].height as usize);
+                let frame_size = w * h * 4;
+                let bar = &mut self.bars[idx];
+                let i = pick_buffer(bar);
+                let data: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(bar.map.add(i * frame_size), frame_size)
+                };
+                let mut cv = Canvas { data, w, h };
+                bar.launcher_hit = draw_info(&mut cv, w, h, &m);
+                commit_bar(bar, i, w, h);
+            }
+            Role::Task => {
+                // Snapshot the window list first (labels + active flag) to
+                // avoid borrowing self.toplevels while mutating the bar.
+                let items: Vec<(String, bool)> = self
+                    .toplevels
+                    .iter()
+                    .map(|t| (button_label(t), t.activated))
+                    .collect();
+                let (w, h) = (self.bars[idx].width as usize, self.bars[idx].height as usize);
+                let frame_size = w * h * 4;
+                let bar = &mut self.bars[idx];
+                let i = pick_buffer(bar);
+                let data: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(bar.map.add(i * frame_size), frame_size)
+                };
+                let mut cv = Canvas { data, w, h };
+                let (launcher_hit, hits) = draw_task(&mut cv, w, h, &items, &m);
+                bar.launcher_hit = launcher_hit;
+                bar.task_hits = hits;
+                commit_bar(bar, i, w, h);
+            }
         }
-    }
-
-    /// Paint the top info bar: launcher + system metrics.
-    fn render_info(&mut self, idx: usize) {
-        // Sample everything BEFORE borrowing the bar mutably.
-        let m = InfoMetrics {
-            cpu: self.cpu.sample(),
-            mem: sysinfo::mem_percent(),
-            clock: sysinfo::clock_hhmm(),
-            net: self.net.sample(),
-            uptime: sysinfo::uptime(),
-            load: sysinfo::loadavg(),
-            disk: sysinfo::disk_root_percent(),
-            temp: sysinfo::temp_c(),
-            batt: sysinfo::battery(),
-        };
-
-        let (w, h) = (self.bars[idx].width as usize, self.bars[idx].height as usize);
-        let frame_size = w * h * 4;
-        let bar = &mut self.bars[idx];
-        let i = pick_buffer(bar);
-        let data: &mut [u8] =
-            unsafe { std::slice::from_raw_parts_mut(bar.map.add(i * frame_size), frame_size) };
-        let mut cv = Canvas { data, w, h };
-
-        let launcher_hit = draw_info(&mut cv, w, h, &m);
-        bar.launcher_hit = launcher_hit;
-
-        commit_bar(bar, i, w, h);
-    }
-
-    /// Paint the bottom taskbar: one button per open window.
-    fn render_task(&mut self, idx: usize) {
-        // Snapshot the window list first (labels + active flag) to avoid holding
-        // a borrow of self.toplevels while we mutate the bar.
-        let items: Vec<(String, bool)> = self
-            .toplevels
-            .iter()
-            .map(|t| (button_label(t), t.activated))
-            .collect();
-
-        let (w, h) = (self.bars[idx].width as usize, self.bars[idx].height as usize);
-        let frame_size = w * h * 4;
-        let bar = &mut self.bars[idx];
-        let i = pick_buffer(bar);
-        let data: &mut [u8] =
-            unsafe { std::slice::from_raw_parts_mut(bar.map.add(i * frame_size), frame_size) };
-        let mut cv = Canvas { data, w, h };
-
-        bar.task_hits = draw_task(&mut cv, w, h, &items);
-
-        commit_bar(bar, i, w, h);
     }
 
     fn render_all(&mut self) {
@@ -417,22 +434,97 @@ fn commit_bar(bar: &mut Bar, i: usize, w: usize, h: usize) {
     }
 }
 
-// ── Info-bar drawing (shared by render_info and the offscreen dump) ───────────
+// ── Shared layout constants ──────────────────────────────────────────────────
 
-struct InfoMetrics {
-    cpu: Option<u32>,
-    mem: Option<u32>,
-    clock: String,
-    net: Option<NetRate>,
-    uptime: Option<String>,
-    load: Option<f32>,
-    disk: Option<u32>,
-    temp: Option<u32>,
-    batt: Option<(u32, bool)>,
+/// Text scale for a bar of height `h`: 14px glyphs in the default 34px bar
+/// (≈ waybar's 13px font), growing only on very tall bars.
+fn text_scale(h: usize) -> i32 {
+    if h >= 48 {
+        3
+    } else {
+        2
+    }
 }
 
-/// Draw a right-anchored metric: an optional load gauge then its label, the
-/// whole unit ending at `right`. Returns the module's left x.
+// ── Bottom bar: the waybar layout, replicated ────────────────────────────────
+
+/// Paint the taskbar exactly like the waybar config it replaces:
+/// `◑ | [window buttons] … cpu N%  mem N%  [HH:MM]`. Returns the launcher
+/// hitbox and per-button hitboxes.
+fn draw_task(
+    cv: &mut Canvas,
+    w: usize,
+    h: usize,
+    items: &[(String, bool)],
+    m: &Metrics,
+) -> ((i32, i32), Vec<(i32, i32, usize)>) {
+    cv.clear(BAR_BG);
+    // border-top: 2px solid #6b5aa8
+    cv.hline(0, 0, w as i32, BAR_RULE, 1.0);
+    cv.hline(0, 1, w as i32, BAR_RULE, 1.0);
+
+    let scale = text_scale(h);
+    let gh = 7 * scale;
+    let ty = (h as i32 - gh) / 2;
+    let btn_h = h as i32 - 10; // waybar: margin 3px + 2px border
+    let btn_y = (h as i32 - btn_h) / 2 + 1;
+
+    // ── left: ◑ launcher (padding 0 10px, like #custom-launcher) ──
+    let d = (h as i32 * 18) / 34; // ≈18px glyph in a 34px bar
+    let ly = (h as i32 - d) / 2;
+    cv.disc_half(10, ly, d, LAUNCH);
+    let launcher_hit = (0, 10 + d + 10);
+
+    // ── right side first, so the taskbar knows where to stop ──
+    // modules-right: cpu, memory, clock  →  right-to-left: clock pill, mem, cpu
+    let mut rx = w as i32 - 4;
+    {
+        // clock: rounded pill, bold, #29233f / #e8e4f8
+        let cw = Canvas::text_width(&m.clock, scale) + 1; // +1 bold offset
+        let pw = cw + 20;
+        rx -= pw;
+        cv.round_rect(rx, btn_y, pw, btn_h, 6, PILL);
+        cv.text_bold(&m.clock, rx + 10, ty, scale, TEXT);
+        rx -= 10;
+
+        let mem_s = format!("mem {}%", opt(m.mem));
+        let tw = Canvas::text_width(&mem_s, scale);
+        rx -= tw + 10;
+        cv.text(&mem_s, rx, ty, scale, MUTED);
+        rx -= 10;
+
+        let cpu_s = format!("cpu {}%", opt(m.cpu));
+        let tw = Canvas::text_width(&cpu_s, scale);
+        rx -= tw + 10;
+        cv.text(&cpu_s, rx, ty, scale, MUTED);
+        rx -= 10;
+    }
+
+    // ── taskbar buttons: rounded 6px, active #3a3357 + white ──
+    let mut hits = Vec::new();
+    let mut x = launcher_hit.1;
+    for (k, (label, active)) in items.iter().enumerate() {
+        let tw = Canvas::text_width(label, scale);
+        let bw = tw + 16; // padding 0 8px
+        if x + bw > rx - 8 {
+            break; // out of room; stop rather than overflow
+        }
+        if *active {
+            cv.round_rect(x, btn_y, bw, btn_h, 6, BTN_ACTIVE);
+        }
+        let fg = if *active { WHITE } else { MUTED };
+        cv.text(label, x + 8, ty, scale, fg);
+        hits.push((x, x + bw, k));
+        x += bw + 4; // margin 3px 2px
+    }
+
+    (launcher_hit, hits)
+}
+
+// ── Top bar: system info in the same visual language ─────────────────────────
+
+/// Draw a right-anchored module (optional mini gauge + label), ending at
+/// `right`. Returns the module's left x.
 fn metric(
     cv: &mut Canvas,
     right: i32,
@@ -444,164 +536,120 @@ fn metric(
     col: Rgb,
 ) -> i32 {
     let tw = Canvas::text_width(label, scale);
-    let (gw, gpad) = if gauge.is_some() {
-        (5 * scale, 4)
-    } else {
-        (0, 0)
-    };
+    let (gw, gpad) = if gauge.is_some() { (5 * scale, 5) } else { (0, 0) };
     let total = gw + gpad + tw;
     let x = right - total;
     if let Some(f) = gauge {
-        let ghh = (2 * scale).max(4);
+        let ghh = (scale + 2).max(4);
         let gy = (h - ghh) / 2;
-        cv.gauge(x, gy, gw, ghh, f, DIM);
+        cv.gauge(x, gy, gw, ghh, f, PILL);
     }
     cv.text(label, x + gw + gpad, ty, scale, col);
     x
 }
 
-/// Draw the network module: ▼<down>  ▲<up>, right-anchored at `right`.
+/// Draw the network module: ▼<down> ▲<up>, right-anchored at `right`.
 fn net_module(cv: &mut Canvas, right: i32, ty: i32, h: i32, scale: i32, n: &NetRate) -> i32 {
     let down = sysinfo::fmt_rate(n.down);
     let up = sysinfo::fmt_rate(n.up);
-    let ts = (2 * scale + 1).min(h - 2);
+    let ts = 2 * scale + 1;
     let ty_tri = (h - ts) / 2;
     let dw = Canvas::text_width(&down, scale);
     let uw = Canvas::text_width(&up, scale);
-    let total = ts + 3 + dw + 8 + ts + 3 + uw;
+    let total = ts + 4 + dw + 10 + ts + 4 + uw;
     let x = right - total;
     let mut cx = x;
-    cv.triangle(cx, ty_tri, ts, false, ACCENT); // download ▼
-    cx += ts + 3;
-    cx += cv.text(&down, cx, ty, scale, TEXT);
-    cx += 8;
-    cv.triangle(cx, ty_tri, ts, true, ACCENT); // upload ▲
-    cx += ts + 3;
-    cv.text(&up, cx, ty, scale, TEXT);
+    cv.triangle(cx, ty_tri, ts, false, LAUNCH); // download ▼
+    cx += ts + 4;
+    cx += cv.text(&down, cx, ty, scale, MUTED);
+    cx += 10;
+    cv.triangle(cx, ty_tri, ts, true, LAUNCH); // upload ▲
+    cx += ts + 4;
+    cv.text(&up, cx, ty, scale, MUTED);
     x
 }
 
-/// Paint the whole info bar. Returns the launcher hitbox (x0,x1).
-fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &InfoMetrics) -> (i32, i32) {
+/// Paint the top info bar. Returns the launcher hitbox (x0,x1).
+fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics) -> (i32, i32) {
     cv.clear(BAR_BG);
-    cv.hline(0, h as i32 - 1, w as i32, BAR_RULE, 0.85); // bottom accent rule
+    // border-bottom: 2px solid #6b5aa8 (mirrors the bottom bar's top rule)
+    cv.hline(0, h as i32 - 1, w as i32, BAR_RULE, 1.0);
+    cv.hline(0, h as i32 - 2, w as i32, BAR_RULE, 1.0);
 
-    let scale = ((h as i32 - 8) / 7).clamp(2, 4);
+    let scale = text_scale(h);
     let gh = 7 * scale;
     let ty = (h as i32 - gh) / 2;
-    let pad = 8;
+    let hi = h as i32;
+    let btn_h = hi - 10;
+    let btn_y = (hi - btn_h) / 2;
 
-    // ── left: crescent launcher + label, then uptime and load ──
-    let icon_d = gh;
-    cv.crescent(pad, ty, icon_d, ACCENT);
-    let after_icon = pad + icon_d + 6;
-    let label_w = cv.text("ECLIPSE", after_icon, ty, scale, TEXT);
-    let launch_x1 = after_icon + label_w + 6;
-    let launcher_hit = (pad, launch_x1);
+    // ── left: ☾ + eclipse wordmark, uptime, load ──
+    let d = (hi * 18) / 34;
+    let ly = (hi - d) / 2;
+    cv.crescent(10, ly, d, LAUNCH);
+    let mut lx = 10 + d + 8;
+    lx += cv.text_bold("eclipse", lx, ty, scale, TEXT) + 1;
+    let launcher_hit = (0, lx + 4);
 
-    let mut lx = launch_x1 + 6;
     if let Some(up) = &m.uptime {
-        cv.sep(lx, h as i32, DIM);
-        lx += 8;
-        lx += cv.text(&format!("UP {up}"), lx, ty, scale, DIM);
-        lx += 8;
+        lx += 12;
+        cv.vrule(lx, hi, BAR_RULE);
+        lx += 12;
+        lx += cv.text(&format!("up {up}"), lx, ty, scale, MUTED);
     }
     if let Some(load) = m.load {
-        cv.sep(lx, h as i32, DIM);
-        lx += 8;
-        cv.text(&format!("LOAD {load:.2}"), lx, ty, scale, DIM);
+        lx += 12;
+        cv.vrule(lx, hi, BAR_RULE);
+        lx += 12;
+        cv.text(&format!("load {load:.2}"), lx, ty, scale, MUTED);
     }
 
-    // ── right: clock, mem, cpu, temp, disk, net, battery (right-to-left) ──
-    let hi = h as i32;
-    let mut rx = w as i32 - pad;
-
-    rx = metric(cv, rx, ty, hi, scale, &m.clock, None, ACCENT);
-
-    rx -= 8;
-    cv.sep(rx, hi, DIM);
-    rx -= 8;
-    let mem_s = format!("MEM {}%", opt(m.mem));
-    rx = metric(cv, rx, ty, hi, scale, &mem_s, m.mem.map(|v| v as f32 / 100.0), TEXT);
-
-    rx -= 8;
-    cv.sep(rx, hi, DIM);
-    rx -= 8;
-    let cpu_s = format!("CPU {}%", opt(m.cpu));
-    rx = metric(cv, rx, ty, hi, scale, &cpu_s, m.cpu.map(|v| v as f32 / 100.0), TEXT);
-
+    // ── right: date pill, battery, temp, disk, net (right-to-left) ──
+    let mut rx = w as i32 - 4;
+    {
+        let dw = Canvas::text_width(&m.date, scale) + 1;
+        let pw = dw + 20;
+        rx -= pw;
+        cv.round_rect(rx, btn_y + 1, pw, btn_h, 6, PILL);
+        cv.text_bold(&m.date, rx + 10, ty, scale, TEXT);
+        rx -= 10;
+    }
+    if let Some((b, ch)) = m.batt {
+        rx -= 10;
+        let label = if ch { format!("bat {b}% +") } else { format!("bat {b}%") };
+        rx = metric(cv, rx, ty, hi, scale, &label, Some(b as f32 / 100.0), MUTED);
+        rx -= 12;
+        cv.vrule(rx, hi, BAR_RULE);
+    }
     if let Some(t) = m.temp {
-        rx -= 8;
-        cv.sep(rx, hi, DIM);
-        rx -= 8;
-        rx = metric(cv, rx, ty, hi, scale, &format!("{t}C"), None, TEXT);
+        rx -= 10;
+        rx = metric(cv, rx, ty, hi, scale, &format!("{t}c"), None, MUTED);
+        rx -= 12;
+        cv.vrule(rx, hi, BAR_RULE);
     }
-    if let Some(d) = m.disk {
-        rx -= 8;
-        cv.sep(rx, hi, DIM);
-        rx -= 8;
-        rx = metric(cv, rx, ty, hi, scale, &format!("DISK {d}%"), Some(d as f32 / 100.0), TEXT);
+    if let Some(dk) = m.disk {
+        rx -= 10;
+        rx = metric(
+            cv,
+            rx,
+            ty,
+            hi,
+            scale,
+            &format!("disk {dk}%"),
+            Some(dk as f32 / 100.0),
+            MUTED,
+        );
+        rx -= 12;
+        cv.vrule(rx, hi, BAR_RULE);
     }
     if let Some(n) = &m.net {
         if n.link {
-            rx -= 8;
-            cv.sep(rx, hi, DIM);
-            rx -= 8;
-            rx = net_module(cv, rx, ty, hi, scale, n);
+            rx -= 10;
+            net_module(cv, rx, ty, hi, scale, n);
         }
-    }
-    if let Some((b, ch)) = m.batt {
-        rx -= 8;
-        cv.sep(rx, hi, DIM);
-        rx -= 8;
-        let label = if ch {
-            format!("BAT {b}% CH")
-        } else {
-            format!("BAT {b}%")
-        };
-        let _ = metric(cv, rx, ty, hi, scale, &label, Some(b as f32 / 100.0), TEXT);
     }
 
     launcher_hit
-}
-
-/// Paint the taskbar: one button per open window, active one highlighted.
-/// Returns the click hitboxes (x0,x1,index). Shared by render_task and the
-/// offscreen preview.
-fn draw_task(cv: &mut Canvas, w: usize, h: usize, items: &[(String, bool)]) -> Vec<(i32, i32, usize)> {
-    cv.clear(BAR_BG);
-    cv.hline(0, 0, w as i32, BAR_RULE, 0.85); // top accent rule
-
-    let scale = ((h as i32 - 8) / 7).clamp(2, 4);
-    let gh = 7 * scale;
-    let ty = (h as i32 - gh) / 2;
-    let btn_pad = 8;
-    let btn_h = gh + 6;
-    let btn_y = (h as i32 - btn_h) / 2;
-    let gap = 6;
-    let pad = 8;
-
-    let mut hits = Vec::new();
-    let mut x = pad;
-    for (k, (label, active)) in items.iter().enumerate() {
-        let tw = Canvas::text_width(label, scale);
-        let bw = tw + 2 * btn_pad;
-        if x + bw > w as i32 - pad {
-            break; // out of room; stop rather than overflow
-        }
-        let bg = if *active { BTN_ACTIVE_BG } else { BTN_BG };
-        cv.fill_rect(x, btn_y, bw, btn_h, bg);
-        if *active {
-            // accent underline for the focused window
-            cv.hline(x, btn_y + btn_h - 1, bw, ACCENT, 1.0);
-            cv.hline(x, btn_y + btn_h - 2, bw, ACCENT, 0.5);
-        }
-        let fg = if *active { TEXT } else { DIM };
-        cv.text(label, x + btn_pad, ty, scale, fg);
-        hits.push((x, x + bw, k));
-        x += bw + gap;
-    }
-    hits
 }
 
 /// "42" or "--" for an optional percentage.
@@ -609,16 +657,17 @@ fn opt(v: Option<u32>) -> String {
     v.map(|x| x.to_string()).unwrap_or_else(|| "--".into())
 }
 
-/// A short, font-renderable button label for a window: prefer app_id, fall back
-/// to the title, capped so buttons stay a sane width.
+/// A short, font-renderable button label for a window: prefer the title (what
+/// waybar's `{title:.18}` showed), fall back to app_id, capped so buttons stay
+/// a sane width.
 fn button_label(t: &Toplevel) -> String {
-    let src = if !t.app_id.is_empty() {
-        &t.app_id
-    } else {
+    let src = if !t.title.trim().is_empty() {
         &t.title
+    } else {
+        &t.app_id
     };
     let src = src.trim();
-    let src = if src.is_empty() { "WINDOW" } else { src };
+    let src = if src.is_empty() { "window" } else { src };
     let mut s: String = src.chars().take(18).collect();
     if src.chars().count() > 18 {
         s.push('.');
@@ -757,22 +806,17 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     if let Some(id) = state.ptr_bar {
                         if let Some(idx) = state.bar_index(id) {
                             let x = state.ptr_x as i32;
-                            match state.bars[idx].role {
-                                Role::Info => {
-                                    let (hx0, hx1) = state.bars[idx].launcher_hit;
-                                    if x >= hx0 && x < hx1 {
-                                        state.spawn_terminal();
-                                    }
-                                }
-                                Role::Task => {
-                                    let hit = state.bars[idx]
-                                        .task_hits
-                                        .iter()
-                                        .find(|(x0, x1, _)| x >= *x0 && x < *x1)
-                                        .map(|(_, _, k)| *k);
-                                    if let Some(k) = hit {
-                                        state.activate_toplevel(k);
-                                    }
+                            let (hx0, hx1) = state.bars[idx].launcher_hit;
+                            if x >= hx0 && x < hx1 {
+                                state.spawn_terminal();
+                            } else if state.bars[idx].role == Role::Task {
+                                let hit = state.bars[idx]
+                                    .task_hits
+                                    .iter()
+                                    .find(|(x0, x1, _)| x >= *x0 && x < *x1)
+                                    .map(|(_, _, k)| *k);
+                                if let Some(k) = hit {
+                                    state.activate_toplevel(k);
                                 }
                             }
                         }
@@ -870,14 +914,13 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|h| (16..=64).contains(h))
-        .unwrap_or(30);
+        .unwrap_or(34); // waybar's configured height
     let terminal = std::env::var("LUNARBAR_TERMINAL")
         .unwrap_or_else(|_| "/usr/local/bin/eclipse-terminal".into());
 
-    // Offscreen preview for offline verification: render BOTH bars as they'd sit
-    // on screen — top info bar, wallpaper gap, bottom taskbar — to a raw
-    // XRGB8888 file. Spec is `path:WxH`; H is the full preview height (the bars
-    // are `LUNARBAR_HEIGHT` tall each, top-anchored and bottom-anchored).
+    // Offscreen preview for offline verification: render BOTH bars as they'd
+    // sit on screen — top info bar, wallpaper gap, bottom taskbar — to a raw
+    // XRGB8888 file. Spec is `path:WxH`; H is the full preview height.
     if let Ok(spec) = std::env::var("LUNARBAR_DUMP") {
         let (path, w, full_h) = match spec.rsplit_once(':') {
             Some((p, dims)) if dims.contains('x') => {
@@ -901,10 +944,11 @@ fn main() {
         let _ = cpu.sample();
         let _ = net.sample();
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let m = InfoMetrics {
+        let m = Metrics {
             cpu: cpu.sample(),
             mem: sysinfo::mem_percent(),
             clock: sysinfo::clock_hhmm(),
+            date: sysinfo::date_dm(),
             net: net.sample(),
             uptime: sysinfo::uptime(),
             load: sysinfo::loadavg(),
@@ -925,11 +969,11 @@ fn main() {
             let bot = &mut buf[off..off + w * bh * 4];
             let mut cv = Canvas { data: bot, w, h: bh };
             let sample = [
-                ("FOOT".to_string(), true),
-                ("ECLIPSE-FILES".to_string(), false),
-                ("LUNARBG".to_string(), false),
+                ("foot".to_string(), true),
+                ("eclipse files".to_string(), false),
+                ("lunar editor".to_string(), false),
             ];
-            draw_task(&mut cv, w, bh, &sample);
+            draw_task(&mut cv, w, bh, &sample, &m);
         }
 
         std::fs::write(&path, buf).expect("write dump");
@@ -968,6 +1012,7 @@ fn main() {
     if state.foreign_mgr.is_none() {
         eprintln!("lunarbar: no wlr-foreign-toplevel-management — taskbar will be empty");
     }
+    state.refresh_metrics();
 
     // 1 Hz repaint: enough for clock/cpu/mem/net, negligible load on the
     // software-rendered stack.
@@ -1002,6 +1047,7 @@ fn main() {
             std::process::exit(1);
         }
         if std::time::Instant::now() >= next_tick {
+            state.refresh_metrics();
             state.render_all();
             next_tick += interval;
             let now = std::time::Instant::now();

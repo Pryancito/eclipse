@@ -103,32 +103,29 @@ impl Canvas<'_> {
         w
     }
 
-    /// A mini horizontal gauge: a 1px-bordered track filled `frac` (0..1) of
-    /// its inner width. The fill colour lerps cool→warm as it rises, so a busy
-    /// CPU/mem/disk reads at a glance — a visual waybar never gives you for free.
+    /// A mini horizontal gauge: a solid dark track filled `frac` (0..1) of its
+    /// width. The fill colour lerps cool→warm (foot-palette green→amber→red)
+    /// as it rises, so a busy metric reads at a glance — a visual waybar never
+    /// gives you for free.
     pub fn gauge(&mut self, x: i32, y: i32, gw: i32, gh: i32, frac: f32, track: Rgb) {
         let frac = frac.clamp(0.0, 1.0);
-        // Track border.
-        for dx in 0..gw {
-            self.blend(x + dx, y, track, 0.55);
-            self.blend(x + dx, y + gh - 1, track, 0.55);
-        }
         for dy in 0..gh {
-            self.blend(x, y + dy, track, 0.55);
-            self.blend(x + gw - 1, y + dy, track, 0.55);
+            for dx in 0..gw {
+                self.blend(x + dx, y + dy, track, 1.0);
+            }
         }
-        // Fill: cool violet → amber → red as it climbs.
+        // Fill ramp uses the foot terminal palette so the bars and the
+        // terminal share an accent language.
         let fill = lerp3(
-            (0x63, 0xd8, 0xb0), // calm teal-green
-            (0xe6, 0xc2, 0x6a), // amber
-            (0xe0, 0x6c, 0x75), // red
+            (0x8f, 0xd1, 0x8a), // green (regular2)
+            (0xe0, 0xc0, 0x7a), // amber (regular3)
+            (0xe0, 0x7a, 0x7a), // red   (regular1)
             frac,
         );
-        let inner = gw - 2;
-        let filled = ((inner as f32) * frac).round() as i32;
-        for dy in 1..gh - 1 {
+        let filled = ((gw as f32) * frac).round() as i32;
+        for dy in 0..gh {
             for dx in 0..filled {
-                self.blend(x + 1 + dx, y + dy, fill, 1.0);
+                self.blend(x + dx, y + dy, fill, 1.0);
             }
         }
     }
@@ -152,12 +149,78 @@ impl Canvas<'_> {
         }
     }
 
-    /// A small filled dot separator, vertically centred in a bar of height `h`.
-    pub fn sep(&mut self, x: i32, h: i32, c: Rgb) {
-        let cy = h / 2;
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                self.blend(x + dx, cy + dy, c, 0.5);
+    /// Pseudo-bold text: the string drawn twice with a 1px horizontal offset,
+    /// thickening every stroke. Same advance as `text`. Matches waybar's
+    /// `font-weight: bold` clock.
+    pub fn text_bold(&mut self, s_str: &str, x: i32, y: i32, scale: i32, c: Rgb) -> i32 {
+        let w = self.text(s_str, x, y, scale, c);
+        self.text(s_str, x + 1, y, scale, c);
+        w
+    }
+
+    /// A filled rounded rectangle (opaque), corner radius `r`. Used for the
+    /// clock pill and the active taskbar button, matching waybar's
+    /// `border-radius: 6px`.
+    pub fn round_rect(&mut self, x: i32, y: i32, rw: i32, rh: i32, r: i32, c: Rgb) {
+        let r = r.max(0).min(rw / 2).min(rh / 2);
+        for dy in 0..rh {
+            for dx in 0..rw {
+                let mut draw = true;
+                // Clip the four corners to a quarter-circle of radius r.
+                let corner = |ex: i32, ey: i32| ex * ex + ey * ey > r * r;
+                if dx < r && dy < r {
+                    draw = !corner(r - 1 - dx, r - 1 - dy);
+                } else if dx >= rw - r && dy < r {
+                    draw = !corner(dx - (rw - r), r - 1 - dy);
+                } else if dx < r && dy >= rh - r {
+                    draw = !corner(r - 1 - dx, dy - (rh - r));
+                } else if dx >= rw - r && dy >= rh - r {
+                    draw = !corner(dx - (rw - r), dy - (rh - r));
+                }
+                if draw {
+                    self.blend(x + dx, y + dy, c, 1.0);
+                }
+            }
+        }
+    }
+
+    /// A faint vertical separator line, centred in a bar of height `h`, ~half
+    /// the bar tall. Cleaner than a dot for grouping modules.
+    pub fn vrule(&mut self, x: i32, h: i32, c: Rgb) {
+        let y0 = h / 4;
+        let y1 = h - h / 4;
+        for y in y0..y1 {
+            self.blend(x, y, c, 0.30);
+        }
+    }
+
+    /// A half-filled disc launcher (Unicode ◑): a full ring with the right
+    /// half filled. Matches the waybar `custom/launcher` glyph, centred in a
+    /// `d`x`d` box at (x,y).
+    pub fn disc_half(&mut self, x: i32, y: i32, d: i32, c: Rgb) {
+        let r = d as f32 / 2.0;
+        let cx = x as f32 + r;
+        let cy = y as f32 + r;
+        for dy in 0..d {
+            for dx in 0..d {
+                let px = x as f32 + dx as f32 + 0.5;
+                let py = y as f32 + dy as f32 + 0.5;
+                let dist = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt();
+                let cov = (r - dist + 0.5).clamp(0.0, 1.0); // AA disc coverage
+                if cov <= 0.0 {
+                    continue;
+                }
+                // Right half: solid. Left half: only the outer ring.
+                let a = if px >= cx {
+                    cov
+                } else {
+                    // ring where we're within ~1.4px of the edge
+                    let ring = (dist - (r - 1.4)).clamp(0.0, 1.0);
+                    cov * ring
+                };
+                if a > 0.0 {
+                    self.blend(x + dx, y + dy, c, a);
+                }
             }
         }
     }
@@ -207,9 +270,43 @@ fn lerp3(a: Rgb, b: Rgb, c: Rgb, t: f32) -> Rgb {
 }
 
 /// 5-wide x 7-tall bitmap font covering the glyphs lunarbar renders: digits,
-/// A-Z, and the punctuation used by the modules. Bit 4 (0b10000) is the
+/// A-Z, a-z (real lowercase shapes, HD44780-style, so the bar can match
+/// waybar's lowercase labels), and module punctuation. Bit 4 (0b10000) is the
 /// leftmost column. Unknown chars render blank.
 fn font5x7(c: char) -> [u8; 7] {
+    match c {
+        'a' => [0b00000, 0b00000, 0b01110, 0b00001, 0b01111, 0b10001, 0b01111],
+        'b' => [0b10000, 0b10000, 0b10110, 0b11001, 0b10001, 0b10001, 0b11110],
+        'c' => [0b00000, 0b00000, 0b01110, 0b10000, 0b10000, 0b10001, 0b01110],
+        'd' => [0b00001, 0b00001, 0b01101, 0b10011, 0b10001, 0b10001, 0b01111],
+        'e' => [0b00000, 0b00000, 0b01110, 0b10001, 0b11111, 0b10000, 0b01110],
+        'f' => [0b00110, 0b01001, 0b01000, 0b11100, 0b01000, 0b01000, 0b01000],
+        'g' => [0b00000, 0b00000, 0b01111, 0b10001, 0b01111, 0b00001, 0b01110],
+        'h' => [0b10000, 0b10000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001],
+        'i' => [0b00100, 0b00000, 0b01100, 0b00100, 0b00100, 0b00100, 0b01110],
+        'j' => [0b00010, 0b00000, 0b00110, 0b00010, 0b00010, 0b10010, 0b01100],
+        'k' => [0b10000, 0b10000, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010],
+        'l' => [0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        'm' => [0b00000, 0b00000, 0b11010, 0b10101, 0b10101, 0b10101, 0b10101],
+        'n' => [0b00000, 0b00000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001],
+        'o' => [0b00000, 0b00000, 0b01110, 0b10001, 0b10001, 0b10001, 0b01110],
+        'p' => [0b00000, 0b00000, 0b11110, 0b10001, 0b11110, 0b10000, 0b10000],
+        'q' => [0b00000, 0b00000, 0b01111, 0b10001, 0b01111, 0b00001, 0b00001],
+        'r' => [0b00000, 0b00000, 0b10110, 0b11001, 0b10000, 0b10000, 0b10000],
+        's' => [0b00000, 0b00000, 0b01111, 0b10000, 0b01110, 0b00001, 0b11110],
+        't' => [0b01000, 0b01000, 0b11100, 0b01000, 0b01000, 0b01001, 0b00110],
+        'u' => [0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b10011, 0b01101],
+        'v' => [0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
+        'w' => [0b00000, 0b00000, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010],
+        'x' => [0b00000, 0b00000, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001],
+        'y' => [0b00000, 0b00000, 0b10001, 0b10001, 0b01111, 0b00001, 0b01110],
+        'z' => [0b00000, 0b00000, 0b11111, 0b00010, 0b00100, 0b01000, 0b11111],
+        _ => font5x7_upper(c),
+    }
+}
+
+/// Uppercase / digit / punctuation half of the font.
+fn font5x7_upper(c: char) -> [u8; 7] {
     match c.to_ascii_uppercase() {
         '0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
         '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],

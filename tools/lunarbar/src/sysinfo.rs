@@ -115,6 +115,7 @@ pub struct NetMeter {
 
 /// A single network sample: down/up bytes-per-second and whether any real
 /// interface is administratively up.
+#[derive(Clone, Copy)]
 pub struct NetRate {
     pub down: f64,
     pub up: f64,
@@ -198,11 +199,11 @@ pub fn uptime() -> Option<String> {
     let secs = secs as u64;
     let (d, h, m) = (secs / 86400, (secs % 86400) / 3600, (secs % 3600) / 60);
     Some(if d > 0 {
-        format!("{d}D {h}H")
+        format!("{d}d {h}h")
     } else if h > 0 {
-        format!("{h}H {m}M")
+        format!("{h}h {m}m")
     } else {
-        format!("{m}M")
+        format!("{m}m")
     })
 }
 
@@ -273,25 +274,21 @@ pub fn battery() -> Option<(u32, bool)> {
     None
 }
 
-/// Wall clock "Wkd DD Mon HH:MM" for the wider alt form (unused in v1 but
-/// kept for a future click-to-expand).
-#[allow(dead_code)]
-pub fn clock_long() -> String {
-    const WD: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+/// Date "wkd dd mon" (lowercase, e.g. "tue 21 jul") for the top bar's date
+/// pill — the complement of the bottom bar's HH:MM clock.
+pub fn date_dm() -> String {
+    const WD: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
     const MO: [&str; 12] = [
-        "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
     ];
     unsafe {
         let t: libc::time_t = libc::time(std::ptr::null_mut());
         let mut tm: libc::tm = core::mem::zeroed();
         if libc::localtime_r(&t, &mut tm).is_null() {
-            return clock_hhmm();
+            return "-- --".into();
         }
         let wd = WD.get(tm.tm_wday as usize).copied().unwrap_or("");
         let mo = MO.get(tm.tm_mon as usize).copied().unwrap_or("");
-        format!(
-            "{} {:02} {} {:02}:{:02}",
-            wd, tm.tm_mday, mo, tm.tm_hour, tm.tm_min
-        )
+        format!("{} {:02} {}", wd, tm.tm_mday, mo)
     }
 }
