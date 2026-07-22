@@ -142,6 +142,36 @@ pub fn reset_narration() {
     unsafe { cmos_write(CMOS_NARR_OFF, 0) };
 }
 
+// --- Console-GPU MSI accounting (shared drivers <-> os_boundary) ---------
+// The console GSP boot brings the GPU's MSI delivery online (drivers side); the
+// STARTCPU bracket (os_boundary) logs the state right before the posted store,
+// so a wedge's frozen screen shows whether MSI was actually online and how many
+// fired — the datum that scrolls off the top otherwise.
+use core::sync::atomic::AtomicUsize;
+static MSI_ONLINE_VECTOR: AtomicUsize = AtomicUsize::new(usize::MAX);
+static MSI_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Mark the GPU's MSI delivery online for the boot (vector), zeroing the count.
+pub fn msi_set_online(vector: usize) {
+    MSI_COUNT.store(0, Ordering::Relaxed);
+    MSI_ONLINE_VECTOR.store(vector, Ordering::Relaxed);
+}
+/// Mark MSI delivery offline (boot done / never came online).
+pub fn msi_offline() {
+    MSI_ONLINE_VECTOR.store(usize::MAX, Ordering::Relaxed);
+}
+/// One MSI serviced (called from the ISR closure). Returns the new count.
+pub fn msi_tick() -> usize {
+    MSI_COUNT.fetch_add(1, Ordering::Relaxed) + 1
+}
+/// (online-vector | usize::MAX, count) for the pre-STARTCPU status line.
+pub fn msi_status() -> (usize, usize) {
+    (
+        MSI_ONLINE_VECTOR.load(Ordering::Relaxed),
+        MSI_COUNT.load(Ordering::Relaxed),
+    )
+}
+
 static REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// Read back the breadcrumb the previous attempt left, format a one-block

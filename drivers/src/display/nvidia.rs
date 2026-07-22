@@ -416,11 +416,6 @@ fn rm_core_init_once() -> u32 {
     s
 }
 
-/// MSIs serviced during the current console-GPU GSP boot window. Module-level
-/// because the ISR closure registered in `gsp_boot_run` must be `'static` (it
-/// cannot borrow `&self`). There is only ever one console boot in flight.
-static CONSOLE_MSI_COUNT: AtomicUsize = AtomicUsize::new(0);
-
 #[derive(Debug, Clone, Copy)]
 struct BootFbInfo {
     phys: u64,
@@ -1706,12 +1701,13 @@ impl NvidiaGpu {
                     usize::MAX
                 };
                 if msi_vec != usize::MAX {
-                    CONSOLE_MSI_COUNT.store(0, Ordering::Relaxed);
+                    nvidia_rm_sys::survival::msi_set_online(msi_vec);
                     let v = msi_vec;
                     let handler: crate::scheme::IrqHandler = alloc::sync::Arc::new(move || {
                         const STORM_CAP: usize = 200_000;
-                        let n = CONSOLE_MSI_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n == STORM_CAP {
+                        // Counter lives in nvidia-rm-sys so the STARTCPU bracket
+                        // (os_boundary) can print it on the frozen screen.
+                        if nvidia_rm_sys::survival::msi_tick() == STORM_CAP {
                             // Runaway source we cannot clear at the engine
                             // without a wedge-prone BAR access: self-mask so a
                             // storm can never peg the CPU into a hang.
@@ -1724,6 +1720,11 @@ impl NvidiaGpu {
                         tag,
                         msi_vec,
                         ok
+                    );
+                } else {
+                    log::error!(
+                        "[NVIDIA] {}: NO MSI vector on this GPU (msi_vector unset) -- GSP boot runs INTx-masked as before; pci.rs found no legacy MSI cap (0x05). NVIDIA may expose only MSI-X (0x11).",
+                        tag
                     );
                 }
                 let mut recovery_log = String::new();
@@ -1770,7 +1771,8 @@ impl NvidiaGpu {
                 // "do MSIs even fire, and does turning them on shift the wedge?".
                 if msi_vec != usize::MAX {
                     crate::net::msi_mask_and_unregister(msi_vec);
-                    let n = CONSOLE_MSI_COUNT.load(Ordering::Relaxed);
+                    let (_v, n) = nvidia_rm_sys::survival::msi_status();
+                    nvidia_rm_sys::survival::msi_offline();
                     log::error!(
                         "[NVIDIA] {}: MSI delivery offline; {} MSI(s) serviced during the GSP boot{}",
                         tag,
