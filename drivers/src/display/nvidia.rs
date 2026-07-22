@@ -1661,6 +1661,14 @@ impl NvidiaGpu {
                 // ~25-30% per-boot race into up to 3 chances per boot.
                 if drain_for_console {
                     nvidia_rm_sys::os_boundary::wedge_watch_arm(self.config_handle());
+                    // GPU-independent survival breadcrumb: mark that a console
+                    // boot began and zero the RM narration counter, so a wedge
+                    // is legible next boot via /proc/gpusurvive even if nothing
+                    // else survives (no serial, no /proc, dark framebuffer).
+                    nvidia_rm_sys::survival::reset_narration();
+                    nvidia_rm_sys::survival::checkpoint(
+                        nvidia_rm_sys::survival::milestone::INITRM_CALL,
+                    );
                 }
                 let mut recovery_log = String::new();
                 let mut attempt = 1u32;
@@ -1694,6 +1702,13 @@ impl NvidiaGpu {
                     }
                 };
                 nvidia_rm_sys::os_boundary::wedge_watch_disarm();
+                if drain_for_console {
+                    // Past kgspInitRm (OK or a clean NV_STATUS) — so any freeze
+                    // recorded from here on was NOT the SEC2-window wedge.
+                    nvidia_rm_sys::survival::checkpoint(
+                        nvidia_rm_sys::survival::milestone::INITRM_RETURN,
+                    );
+                }
                 if quiet && drain_for_console {
                     nvidia_rm_sys::os_interface::console_quiet_end();
                     log::error!(
@@ -3729,6 +3744,18 @@ impl DrmScheme for NvidiaGpu {
         s.push_str(&self.bringup_step10());
         s.push_str("[gpustep14] === console GPU bring-up chain complete (see per-stage results above) ===\n");
         s
+    }
+
+    /// `/proc/gpusurvive`: read + clear the CMOS survival breadcrumb from the
+    /// previous console-GPU boot attempt. Only the console GPU reports (it is
+    /// the one that wedges, and the breadcrumb is global — a second reader would
+    /// just see the already-cleared slate).
+    fn survival_report(&self) -> String {
+        if self.drives_boot_display() {
+            nvidia_rm_sys::survival::read_report_and_clear()
+        } else {
+            String::new()
+        }
     }
 
     /// Step 15 (`/proc/gpustep15`): probe the GR (graphics/compute) engine's

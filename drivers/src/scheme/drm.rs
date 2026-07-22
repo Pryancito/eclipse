@@ -207,6 +207,15 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Read back (and clear) the CMOS survival breadcrumb the previous
+    /// console-GPU boot attempt left, surfaced at `/proc/gpusurvive`. On a box
+    /// with no serial, this is how a SEC2-window wedge is diagnosed: the CPU
+    /// hangs and nothing else survives, but the CMOS NVRAM keeps the last
+    /// milestone + RM narration count across the reboot. Default: nothing.
+    fn survival_report(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Bring-up **Step 15** (`/proc/gpustep15`): probe the GR (graphics/compute)
     /// engine's GPC/TPC/SM shader config on a state-loaded GPU via the live
     /// GSP-RM (GR_GET_GPC_MASK / GR_GET_TPC_MASK controls). Read-only,

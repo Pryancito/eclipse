@@ -14,7 +14,7 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 40] = [
+const PROC_ROOT_STATIC: [&str; 41] = [
     "net",
     "meminfo",
     "cpuinfo",
@@ -55,6 +55,7 @@ const PROC_ROOT_STATIC: [&str; 40] = [
     "gpuinit",
     "gpubench",
     "gpuedid",
+    "gpusurvive",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -354,6 +355,7 @@ impl INode for ProcRootINode {
             "gpuinit" => Ok(PROC_GPUINIT.clone()),
             "gpubench" => Ok(PROC_GPUBENCH.clone()),
             "gpuedid" => Ok(PROC_GPUEDID.clone()),
+            "gpusurvive" => Ok(PROC_GPUSURVIVE.clone()),
             "gpudump" => Ok(PROC_GPUDUMP.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
@@ -1495,6 +1497,22 @@ fn proc_gpuedid_content() -> String {
     s
 }
 
+/// `/proc/gpusurvive` — read + clear the CMOS survival breadcrumb from the
+/// previous console-GPU GSP-boot attempt. On a serial-less box this is the only
+/// thing that outlives a SEC2-window wedge (the CPU hangs; the CMOS NVRAM keeps
+/// the last milestone + RM narration count across the reboot). Safe/instant:
+/// two port I/O reads, no GPU, no bring-up. Reading it clears the breadcrumb.
+fn proc_gpusurvive_content() -> String {
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.survival_report());
+    }
+    if s.is_empty() {
+        s.push_str("[gpusurvive] no console DRM driver present to read the breadcrumb\n");
+    }
+    s
+}
+
 /// Decode the bootloader-captured UEFI EDID into a human block.
 fn format_uefi_edid() -> String {
     use core::fmt::Write;
@@ -1927,6 +1945,12 @@ lazy_static! {
     static ref PROC_GPUEDID: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 103,
         generate: proc_gpuedid_content,
+    });
+    /// `/proc/gpusurvive` -- CMOS survival breadcrumb from the previous
+    /// console-GPU boot attempt (see proc_gpusurvive_content).
+    static ref PROC_GPUSURVIVE: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 104,
+        generate: proc_gpusurvive_content,
     });
     /// `/proc/gpudump` -- read-only discriminating HW dump, both GPUs (see
     /// proc_gpudump_content).
