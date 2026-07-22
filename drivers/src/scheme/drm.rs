@@ -236,6 +236,20 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Leave this GPU in a clean (cold) state before a system reboot. A GPU we
+    /// brought up carries a live GSP-RM: WPR2 is locked in its VRAM and its
+    /// SEC2/GSP falcons are running. Eclipse's `reboot` is a WARM reset -- it
+    /// restarts the CPU but does NOT power-cycle the GPU -- so without this the
+    /// GPU crosses the reboot still dirty, and the firmware POST that runs
+    /// BEFORE the OS on the next boot chokes on it (long POST / hang / recovery).
+    /// Implementations issue a PCIe Function Level Reset (or similar) to return
+    /// the GPU close to cold state. Only GPUs actually brought up act; the
+    /// console GPU and non-NVIDIA drivers are no-ops. Called from the reset
+    /// path just before the CPU reset. Returns a short log line. Default: none.
+    fn quiesce_for_reboot(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// CE-offload visual test (`/proc/gpucefill`): CE-memset the console GPU's
     /// scanout framebuffer to a solid colour via the persistent CeUtils channel,
     /// to confirm the BAR1->VRAM offset is correct before wiring the full
