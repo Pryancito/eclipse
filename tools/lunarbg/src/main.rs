@@ -80,6 +80,10 @@ struct State {
     backgrounds: Vec<Background>,
     start: Option<Instant>,
     animate: bool,
+    /// Physical panel aspect (width/height) from `wl_output.geometry`, used to
+    /// draw circles round even when the driver's mode is not the panel's
+    /// native aspect. `None` until an output reports a sane physical size.
+    monitor_aspect: Option<f32>,
 }
 
 impl State {
@@ -189,8 +193,8 @@ impl State {
         // server-side and the mapping outlives the closed fd.
         pool.destroy();
 
-        let layout = scene::layout(w, h);
-        let base = scene::render_base(w, h);
+        let layout = scene::layout(w, h, self.monitor_aspect);
+        let base = scene::render_base(w, h, self.monitor_aspect);
 
         // Seed BOTH buffers with the full base scene. Only buffer 0 used to
         // get it; buffer 1 stayed zeroed (memfd), and since ticks repaint just
@@ -372,7 +376,31 @@ wayland_client::delegate_noop!(State: ignore wl_compositor::WlCompositor);
 wayland_client::delegate_noop!(State: ignore wl_shm::WlShm);
 wayland_client::delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
 wayland_client::delegate_noop!(State: ignore wl_surface::WlSurface);
-wayland_client::delegate_noop!(State: ignore wl_output::WlOutput);
+impl Dispatch<wl_output::WlOutput, ()> for State {
+    fn event(
+        state: &mut Self,
+        _output: &wl_output::WlOutput,
+        event: wl_output::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+        // The panel's physical size (mm) lets us derive its true aspect ratio,
+        // so lunarbg draws round circles regardless of whether the driver's
+        // mode matches the panel's native aspect. Guard against panels that
+        // report an unknown (0) or nonsensical physical size.
+        if let wl_output::Event::Geometry {
+            physical_width,
+            physical_height,
+            ..
+        } = event
+        {
+            if physical_width > 0 && physical_height > 0 {
+                state.monitor_aspect = Some(physical_width as f32 / physical_height as f32);
+            }
+        }
+    }
+}
 wayland_client::delegate_noop!(State: ignore ZwlrLayerShellV1);
 
 // The WEnum import keeps signatures readable if event matching grows later.
@@ -475,8 +503,9 @@ fn main() {
             }
             _ => (spec, 1920, 1080),
         };
-        let lay = scene::layout(w, h);
-        let base = scene::render_base(w, h);
+        // Offscreen: no compositor, so honour only the env aspect override.
+        let lay = scene::layout(w, h, None);
+        let base = scene::render_base(w, h, None);
         let mut frame = base.clone();
         let t_ms = std::env::var("LUNARBG_DUMP_MS")
             .ok()

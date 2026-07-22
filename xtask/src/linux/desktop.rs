@@ -249,9 +249,13 @@ fn write_labwc_environment(rootfs: &Path) {
           # terminal retry loop failing with rc=127 while foot was installed).\n\
           PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin\n\
           XCURSOR_THEME=Adwaita\n\
-          # Monitor fisico 16:9 con GOP 4:3 (el panel estira y los circulos\n\
-          # de lunarbg salen elipticos): descomenta para compensar.\n\
-          # LUNARBG_ASPECT=16:9\n\
+          # lunarbg draws its logo round by pre-squeezing for the panel aspect.\n\
+          # It auto-detects the panel aspect from wl_output.geometry (the EDID\n\
+          # physical size), so this is only a FALLBACK for drivers/panels that\n\
+          # report no physical size (then circles would draw round-for-the-mode,\n\
+          # i.e. elliptical on a 16:9 panel driven at a 4:3 mode). Auto-detect\n\
+          # takes priority when available; set it to your panel if needed.\n\
+          LUNARBG_ASPECT=16:9\n\
           XCURSOR_SIZE=24\n\
           GTK_THEME=Adwaita:dark\n\
           # UTF-8 locale: foot refuses box-drawing/unicode and prints\n\
@@ -295,6 +299,20 @@ fn write_labwc_autostart(rootfs: &Path) {
           export LANG=C.UTF-8\n\
           echo \"[autostart] $(date 2>/dev/null || echo boot) begin\"\n\
           echo \"[autostart] XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR WAYLAND_DISPLAY=$WAYLAND_DISPLAY\"\n\
+          # foot (and any libwayland client) does NOT auto-detect the compositor\n\
+          # socket the way lunarbg/lunarbar do -- it needs WAYLAND_DISPLAY. If\n\
+          # labwc left it unset, or a stale wayland-0 bumped the real socket to\n\
+          # wayland-1, foot targets the wrong name and dies at startup while the\n\
+          # wallpaper still shows. Resolve it from the real socket so every child\n\
+          # client inherits a correct WAYLAND_DISPLAY.\n\
+          : \"${XDG_RUNTIME_DIR:=/run/user/0}\"; export XDG_RUNTIME_DIR\n\
+          if [ -z \"$WAYLAND_DISPLAY\" ] || [ ! -S \"$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY\" ]; then\n\
+          for s in \"$XDG_RUNTIME_DIR\"/wayland-[0-9]*; do\n\
+          [ -S \"$s\" ] || continue\n\
+          WAYLAND_DISPLAY=$(basename \"$s\"); export WAYLAND_DISPLAY; break\n\
+          done\n\
+          fi\n\
+          echo \"[autostart] resolved WAYLAND_DISPLAY=$WAYLAND_DISPLAY\"\n\
           # XKB data check: without /usr/share/X11/xkb labwc hands clients an empty\n\
           # keymap, on which foot (every xkbcommon client) SEGFAULTs (rc=139). lunarbg\n\
           # and lunarbar never parse it, so the desktop can look alive with no terminal.\n\
