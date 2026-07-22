@@ -14,7 +14,7 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 41] = [
+const PROC_ROOT_STATIC: [&str; 40] = [
     "net",
     "meminfo",
     "cpuinfo",
@@ -42,7 +42,6 @@ const PROC_ROOT_STATIC: [&str; 41] = [
     "gpustep12",
     "gpustep13",
     "gpustep14",
-    "gpustep14q",
     "gpustep15",
     "gpustep16",
     "gpustep17",
@@ -343,7 +342,6 @@ impl INode for ProcRootINode {
             "gpustep12" => Ok(PROC_GPUSTEP12.clone()),
             "gpustep13" => Ok(PROC_GPUSTEP13.clone()),
             "gpustep14" => Ok(PROC_GPUSTEP14.clone()),
-            "gpustep14q" => Ok(PROC_GPUSTEP14Q.clone()),
             "gpustep15" => Ok(PROC_GPUSTEP15.clone()),
             "gpustep16" => Ok(PROC_GPUSTEP16.clone()),
             "gpustep17" => Ok(PROC_GPUSTEP17.clone()),
@@ -1320,22 +1318,6 @@ fn proc_gpustep14_content() -> String {
     s
 }
 
-/// `/proc/gpustep14q` — CONSOLE GPU full bring-up (same chain as gpustep14) but
-/// with the PDISP-quiesce root-cause mitigation armed across the SEC2 HS-resume
-/// window. Run on a FRESH boot to measure whether quiescing the display engine
-/// makes the console GSP boot reliable (target 3/3 vs gpustep14's ~2/3). Capture
-/// with `cat /proc/gpustep14q > /r14q.txt; sync`.
-fn proc_gpustep14q_content() -> String {
-    let mut s = String::new();
-    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-        s.push_str(&d.bringup_step14_quiesce());
-    }
-    if s.is_empty() {
-        s.push_str("[gpustep14q] no DRM driver with bring-up support\n");
-    }
-    s
-}
-
 /// `/proc/gpustep15` — GR (graphics/compute) engine GPC/TPC/SM config probe on
 /// a state-loaded GPU, via the live GSP-RM. Read-only, repeatable.
 fn proc_gpustep15_content() -> String {
@@ -1879,12 +1861,6 @@ lazy_static! {
     static ref PROC_GPUSTEP14: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 85,
         generate: proc_gpustep14_content,
-    });
-    /// `/proc/gpustep14q` -- console GPU full bring-up WITH PDISP-quiesce across
-    /// the SEC2-resume window (see proc_gpustep14q_content).
-    static ref PROC_GPUSTEP14Q: Arc<dyn INode> = Arc::new(ProcSeqINode {
-        inode: 82,
-        generate: proc_gpustep14q_content,
     });
     /// `/proc/gpustep15` -- GR engine GPC/TPC/SM config probe (see
     /// proc_gpustep15_content).

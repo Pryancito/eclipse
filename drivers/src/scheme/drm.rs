@@ -207,13 +207,6 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
-    /// Bring-up **Step 14q** (`/proc/gpustep14q`): the full console-GPU bring-up
-    /// chain with the PDISP-quiesce root-cause mitigation armed across the SEC2
-    /// HS-resume window, for measuring console-boot reliability vs step 14.
-    fn bringup_step14_quiesce(&self) -> alloc::string::String {
-        alloc::string::String::new()
-    }
-
     /// Bring-up **Step 15** (`/proc/gpustep15`): probe the GR (graphics/compute)
     /// engine's GPC/TPC/SM shader config on a state-loaded GPU via the live
     /// GSP-RM (GR_GET_GPC_MASK / GR_GET_TPC_MASK controls). Read-only,
