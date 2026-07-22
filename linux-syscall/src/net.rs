@@ -724,6 +724,17 @@ impl Syscall<'_> {
             "sys_accept4: sockfd:{}, addr:{:?}, addrlen={:?}, flags={:#x}",
             sockfd, addr, addrlen, flags
         );
+        // Validate flags BEFORE accept() consumes a connection from the queue.
+        // SOCK_NONBLOCK / SOCK_CLOEXEC requested for the accepted socket; any
+        // other bit is invalid (GLib's GDBus path only ever passes these two).
+        // Previously this ran after accept(), so a bad flag accepted then
+        // dropped an established client connection.
+        const SOCK_NONBLOCK: usize = 0o4000;
+        const SOCK_CLOEXEC: usize = 0o2000000;
+        if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+            return Err(LxError::EINVAL);
+        }
+
         // smoltcp tcp sockets do not support backlog
         // open multiple sockets for each connection
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
@@ -735,23 +746,20 @@ impl Syscall<'_> {
             new_socket.flags()
         );
 
-        // SOCK_NONBLOCK / SOCK_CLOEXEC requested for the accepted socket; any
-        // other bit is invalid (GLib's GDBus path only ever passes these two).
-        const SOCK_NONBLOCK: usize = 0o4000;
-        const SOCK_CLOEXEC: usize = 0o2000000;
-        if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
-            return Err(LxError::EINVAL);
-        }
         if flags != 0 {
             let new_flags = OpenFlags::from_bits_truncate(flags);
             new_socket.set_flags(new_flags)?;
         }
 
-        let new_fd = self.linux_process().add_socket(new_socket)?;
+        // Copy the peer address out BEFORE installing the fd, so a bad addr/
+        // addrlen pointer fails the syscall (EFAULT) without leaking the
+        // accepted fd into the process table (Linux copies the address out
+        // before fd_install).
         if !addr.is_null() {
             let sockaddr_in = SockAddr::from(remote_endpoint);
             sockaddr_in.write_to(addr, addrlen)?;
         }
+        let new_fd = self.linux_process().add_socket(new_socket)?;
         Ok(new_fd.into())
     }
 
