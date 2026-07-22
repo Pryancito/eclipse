@@ -207,12 +207,29 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// CE-offloaded present: copy the compositor's dumb buffer (contiguous
+    /// sysmem at `src_sysmem_pa`, `size` bytes) into this GPU's scanout
+    /// framebuffer via the persistent CeUtils channel, replacing the CPU
+    /// `memcpy`-over-PCIe. Returns true if the CE copy was performed (console
+    /// GPU, state-loaded); false to fall back to the CPU blit. Default: false.
+    fn ce_present(&self, _src_sysmem_pa: u64, _size: u64) -> bool {
+        false
+    }
+
     /// CE-offload visual test (`/proc/gpucefill`): CE-memset the console GPU's
     /// scanout framebuffer to a solid colour via the persistent CeUtils channel,
     /// to confirm the BAR1->VRAM offset is correct before wiring the full
     /// per-frame CE present blit. Requires the console GPU to be state-loaded
     /// (`/proc/gpustep14`). Default: nothing.
     fn bringup_ce_fill_fb(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
+    /// P2P CE-offload visual test (`/proc/gpucefillp2p`): from the COMPUTE GPU,
+    /// CE-memset the CONSOLE GPU's scanout framebuffer white over PCIe
+    /// peer-to-peer, to confirm P2P works before relying on it for the present
+    /// path — the via-A route that avoids the flaky console-GPU bring-up.
+    fn bringup_ce_fill_fb_p2p(&self) -> alloc::string::String {
         alloc::string::String::new()
     }
 
