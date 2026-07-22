@@ -40,6 +40,24 @@ static FLIP_SEQ: AtomicU32 = AtomicU32::new(0);
 /// One-shot guard so the first scanout logs (every-frame logging would spam).
 static SCANOUT_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Master switch for the per-frame GPU copy-engine present (`ce_present`).
+/// OFF by default: the CE path fires a GPU DMA on EVERY desktop present
+/// (sysmem read of the dumb buffer + P2P write into the console GPU's BAR1 +
+/// two GMMU-translated semaphore writes into system RAM per submission), and
+/// on real hardware it correlated with random SIGSEGVs in freshly-started
+/// Wayland clients (lunarbg/lunarbar/foot Done(139)) while the CPU-blit
+/// present was rock solid. Until the CE path is proven stable, the proven CPU
+/// blit is the default and the CE present is strictly opt-in via the
+/// `nvidia.cepresent` kernel cmdline flag (see zCore/src/main.rs).
+static CE_PRESENT_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Enable/disable the per-frame CE-offloaded present (set once at boot from
+/// the `nvidia.cepresent` cmdline flag).
+pub fn set_ce_present_enabled(on: bool) {
+    CE_PRESENT_ENABLED.store(on, Ordering::Relaxed);
+}
+
 /// Return the primary framebuffer display, if any.
 fn primary_display() -> Option<Arc<dyn DisplayScheme>> {
     drivers::all_display().first()
@@ -371,8 +389,12 @@ pub fn scanout(fb_id: u32) -> bool {
     // memcpy over PCIe. A flat CE copy needs equal strides, so only when the
     // dumb-buffer pitch matches the scanout pitch; and only the console GPU
     // (state-loaded via /proc/gpustep14) accepts it. Any miss -> CPU blit.
+    //
+    // OPT-IN: gated on `nvidia.cepresent` (see CE_PRESENT_ENABLED) — the CE
+    // DMA per present destabilized the desktop on real hardware, so the
+    // default present is the proven CPU blit.
     let mut blitted_by_ce = false;
-    if fb.pitch == info.pitch {
+    if CE_PRESENT_ENABLED.load(Ordering::Relaxed) && fb.pitch == info.pitch {
         let size = (info.pitch as u64) * (height as u64);
         for d in kernel_hal::drivers::all_drm().as_vec().iter() {
             if d.ce_present(fb.phys_addr, size) {
