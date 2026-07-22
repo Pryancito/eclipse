@@ -10,8 +10,8 @@
 //!   `menu.xml` (right-click desktop menu), `environment` (cursor/GTK vars)
 //!   and `autostart` (wallpaper, panel, first terminal — each guarded so a
 //!   missing client never aborts the session);
-//! - a waybar bottom panel (dark, purple accent, taskbar + clock + sysinfo)
-//!   in `/root/.config/waybar/`;
+//! - lunarbg (procedural wallpaper) and lunarbar (two-bar panel), Eclipse's
+//!   own native Wayland clients, launched from `autostart`;
 //! - dark-mode defaults for GTK 3/4 and a matching `foot` terminal palette;
 //! - the bulletproof `/usr/local/bin/labwc` wrapper that pins the pixman
 //!   renderer environment (login(1) strips arbitrary env vars, so a wrapper
@@ -19,8 +19,8 @@
 //!
 //! Runtime packages:
 //! `apk add labwc foot xkeyboard-config font-dejavu adwaita-icon-theme`
-//! (optional extras: `waybar swaybg`, only used as fallbacks now that lunarbar
-//! and lunarbg are the native panel and wallpaper).
+//! (lunarbg/lunarbar are Eclipse's own binaries; swaybg/waybar are no longer
+//! used — the native clients replaced them).
 //!
 //! `xkeyboard-config` is REQUIRED, not optional: it ships the XKB data under
 //! `/usr/share/X11/xkb`. Without it labwc still starts but cannot compile a
@@ -41,7 +41,6 @@ pub fn install(rootfs: &Path) {
     write_labwc_menu(rootfs);
     write_labwc_environment(rootfs);
     write_labwc_autostart(rootfs);
-    write_waybar(rootfs);
     write_gtk_settings(rootfs);
     write_foot_config(rootfs);
     write_labwc_wrapper(rootfs);
@@ -270,326 +269,103 @@ fn write_labwc_environment(rootfs: &Path) {
     .unwrap();
 }
 
-/// Session autostart: wallpaper, first terminal, then the panel LAST.
-/// Everything is logged so a black desktop is diagnosable WITHOUT a reboot
+/// Session autostart: wallpaper (lunarbg), first terminal (foot), then the
+/// panel (lunarbar) LAST. All three are Eclipse's own native Wayland clients;
+/// the old swaybg/waybar fallbacks are gone now that lunarbg/lunarbar
+/// auto-detect the compositor and connect reliably. Everything is logged so a
+/// black desktop is diagnosable WITHOUT a reboot
 /// (`cat ~/.config/labwc/autostart.log`), and every launch is guarded by
 /// `command -v` so a missing client is skipped, never fatal.
-///
-/// waybar gets two extra layers of protection because it is GTK and this
-/// box's GL/GBM path can hang the whole OS (see the labwc wrapper note):
-/// - `GDK_GL=disable` keeps GTK off EGL/GBM entirely — waybar renders via
-///   cairo/shm just like swaybg and foot, which are known-good here;
-/// - a crash-once lock file: the lock is taken before launching waybar and
-///   cleared only after it survives 15 s. If the session dies with the lock
-///   held (hang, crash, power cycle), the NEXT session skips waybar and
-///   says so in the log, so one bad panel can never hang the OS on every
-///   boot. `rm ~/.config/labwc/panel.lock` re-arms it.
 fn write_labwc_autostart(rootfs: &Path) {
     let cfg = rootfs.join("root/.config/labwc");
     let _ = fs::create_dir_all(&cfg);
     fs::write(
         cfg.join("autostart"),
-        b"# Eclipse OS - labwc autostart.\n\
-          # Wayland clients used (all optional): apk add foot swaybg waybar\n\
+        b"# Eclipse OS - labwc autostart. Native Wayland clients only: lunarbg\n\
+          # (procedural wallpaper), foot (terminal) and lunarbar (the two-bar panel).\n\
+          # The swaybg and waybar fallbacks were removed: the native clients now\n\
+          # auto-detect the compositor and connect reliably (connect_wayland() in\n\
+          # tools/lunarbg and tools/lunarbar), so the fallbacks only added noise.\n\
           LOG=\"$HOME/.config/labwc/autostart.log\"\n\
           exec >\"$LOG\" 2>&1\n\
-          # Defensive: the VT shells skip /etc/profile, so PATH may lack\n\
-          # /usr/local/bin (eclipse-terminal, wrappers) when labwc was\n\
-          # launched straight from a console.\n\
+          # The per-VT shells skip /etc/profile, so a labwc launched from a console may\n\
+          # inherit a PATH without /usr/local/bin (eclipse-terminal, wrappers).\n\
           export PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin\n\
-          # UTF-8 locale for every client (foot refuses box-drawing and warns\n\
-          # \"'C' is not a UTF-8 locale\" without it). glibc ships C.UTF-8 as a\n\
-          # builtin; musl accepts any UTF-8 name. Belt-and-suspenders with the\n\
-          # labwc `environment` file, since a client launched outside the\n\
-          # compositor env (attempt-2 `foot -d info`) would otherwise miss it.\n\
+          # UTF-8 locale: foot refuses box-drawing/unicode without it.\n\
           export LANG=C.UTF-8\n\
           echo \"[autostart] $(date 2>/dev/null || echo boot) begin\"\n\
           echo \"[autostart] XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR WAYLAND_DISPLAY=$WAYLAND_DISPLAY\"\n\
-          # XKB data check: without /usr/share/X11/xkb labwc cannot compile a\n\
-          # keymap and hands clients an empty one, on which foot (and every\n\
-          # other xkbcommon client) SEGFAULTs (\"[XKB-822] Failed to parse input\n\
-          # xkb string\", terminal exits rc=139). lunarbg/lunarbar survive as\n\
-          # they never parse it, so the desktop looks alive but no terminal ever\n\
-          # opens. Warn loudly instead of leaving it a silent crash loop.\n\
+          # XKB data check: without /usr/share/X11/xkb labwc hands clients an empty\n\
+          # keymap, on which foot (every xkbcommon client) SEGFAULTs (rc=139). lunarbg\n\
+          # and lunarbar never parse it, so the desktop can look alive with no terminal.\n\
           if [ ! -e /usr/share/X11/xkb/rules/evdev ]; then\n\
-          \x20 echo '[autostart] *** MISSING xkeyboard-config: /usr/share/X11/xkb absent.'\n\
-          \x20 echo '[autostart] *** foot/terminals will SEGFAULT (rc=139) on the empty keymap.'\n\
-          \x20 echo '[autostart] *** FIX: apk add xkeyboard-config'\n\
+          echo '[autostart] *** MISSING xkeyboard-config: /usr/share/X11/xkb absent.'\n\
+          echo '[autostart] *** foot/terminals will SEGFAULT (rc=139) on the empty keymap.'\n\
+          echo '[autostart] *** FIX: apk add xkeyboard-config'\n\
           fi\n\
-          # gdk-pixbuf loader cache: apk installs it via a trigger that may\n\
-          # never have run under Eclipse OS. Without loaders.cache gdk-pixbuf\n\
-          # recognises NO image format at all, so swaybg logs \"Failed to\n\
-          # load image\" for a perfectly good PNG (and GTK apps lose their\n\
-          # icons). Generate it once if absent.\n\
-          if command -v gdk-pixbuf-query-loaders >/dev/null 2>&1; then\n\
-          \x20 mkdir -p \"$HOME/.cache\"\n\
-          \x20 gdk-pixbuf-query-loaders >\"$HOME/.cache/pixbuf-loaders.cache\" 2>&1\n\
-          \x20 export GDK_PIXBUF_MODULE_FILE=\"$HOME/.cache/pixbuf-loaders.cache\"\n\
-          \x20 echo \"[autostart] pixbuf cache: $(grep -c '^\\\"' \"$GDK_PIXBUF_MODULE_FILE\" 2>/dev/null || echo 0) loaders registered\"\n\
-          else\n\
-          \x20 echo '[autostart] gdk-pixbuf-query-loaders NOT installed -> swaybg cannot decode images (apk add gdk-pixbuf)'\n\
-          fi\n\
-          echo \"[autostart] pixbuf modules: $(ls /usr/lib/gdk-pixbuf-2.0/*/loaders/ 2>/dev/null | tr '\\n' ' ')\"\n\
-          # Background: lunarbg, Eclipse's own wallpaper client. It renders\n\
-          # the night scene procedurally at the output's native resolution --\n\
-          # no image files, no gdk-pixbuf. swaybg (image, then solid colour)\n\
-          # remains as a fallback chain for systems without it.\n\
-          start_swaybg() {\n\
-          \x20 WALL=/usr/share/backgrounds/eclipse/eclipse-night.png\n\
-          \x20 echo \"[autostart] wallpaper: $(ls -l \"$WALL\" 2>&1)\"\n\
-          \x20 if ! command -v swaybg >/dev/null 2>&1; then\n\
-          \x20   echo '[autostart] MISSING swaybg -> desktop stays black (apk add swaybg)'\n\
-          \x20   return\n\
-          \x20 fi\n\
-          \x20 if [ -r \"$WALL\" ]; then\n\
-          \x20   echo '[autostart] launching swaybg (eclipse-night)'\n\
-          \x20   swaybg -i \"$WALL\" -m fill &\n\
-          \x20   WALLPID=$!\n\
-          \x20   # Watchdog: if swaybg cannot decode the image it exits right\n\
-          \x20   # away -- fall back to the solid colour so the desktop never\n\
-          \x20   # ends up with no background at all.\n\
-          \x20   ( sleep 2\n\
-          \x20     if ! kill -0 \"$WALLPID\" 2>/dev/null; then\n\
-          \x20       echo '[autostart] swaybg died loading the image -> solid colour fallback'\n\
-          \x20       swaybg -c '#1a1440' &\n\
-          \x20     fi ) &\n\
-          \x20 else\n\
-          \x20   echo '[autostart] wallpaper missing, solid colour'; swaybg -c '#1a1440' &\n\
-          \x20 fi\n\
-          }\n\
+          # Wallpaper: lunarbg renders the night scene procedurally at the output's\n\
+          # native resolution -- no image files, no gdk-pixbuf, no swaybg.\n\
           if command -v lunarbg >/dev/null 2>&1; then\n\
-          \x20 echo '[autostart] launching lunarbg (native wallpaper)'\n\
-          \x20 ( lunarbg; echo \"[autostart] lunarbg exited rc=$?\" ) &\n\
-          \x20 # Watchdog by PROCESS NAME: kill -0 on the wrapper-subshell pid\n\
-          \x20 # produced a false \"died\" on this kernel, which stacked the\n\
-          \x20 # solid-colour swaybg ON TOP of a perfectly alive lunarbg.\n\
-          \x20 ( sleep 3\n\
-          \x20   if ! pidof lunarbg >/dev/null 2>&1; then\n\
-          \x20     echo '[autostart] lunarbg not running after 3s -> swaybg fallback'\n\
-          \x20     start_swaybg\n\
-          \x20   fi ) &\n\
+          echo '[autostart] launching lunarbg (native wallpaper)'\n\
+          ( lunarbg; echo \"[autostart] lunarbg exited rc=$?\" ) &\n\
           else\n\
-          \x20 start_swaybg\n\
+          echo '[autostart] MISSING lunarbg -> no wallpaper (build tools/lunarbg)'\n\
           fi\n\
-          # A terminal FIRST so the desktop is usable even if the panel\n\
-          # below takes the session down.\n\
-          # THE TERMINAL IS THE PRIORITY: without one there is no way to type\n\
-          # commands and watch the desktop come up. Retry loop keyed on pidof\n\
-          # (never on wait()/exit codes, see the waybar note below): up to 5\n\
-          # attempts through eclipse-terminal (foot, else alacritty on\n\
-          # software GL). Attempt 2 runs foot verbosely so a flaky-start foot\n\
-          # documents its own failure (seen: silent death, rc=230).\n\
+          # Terminal first so the desktop is usable even if the panel fails. Retry loop\n\
+          # keyed on pidof (never on wait()/exit codes). Attempt 2 runs foot verbosely\n\
+          # so a flaky start documents its own failure.\n\
           if command -v foot >/dev/null 2>&1 || command -v alacritty >/dev/null 2>&1; then\n\
-          \x20 ( sleep 1\n\
-          \x20   n=1\n\
-          \x20   while [ \"$n\" -le 5 ]; do\n\
-          \x20     if pidof foot alacritty >/dev/null 2>&1; then\n\
-          \x20       echo \"[autostart] terminal up (attempt $n)\"\n\
-          \x20       exit 0\n\
-          \x20     fi\n\
-          \x20     echo \"[autostart] terminal attempt $n\"\n\
-          \x20     if [ \"$n\" -eq 2 ] && command -v foot >/dev/null 2>&1; then\n\
-          \x20       ( foot -d info; echo \"[autostart] foot -d info exited rc=$?\" ) &\n\
-          \x20     else\n\
-          \x20       ( eclipse-terminal; echo \"[autostart] terminal exited rc=$?\" ) &\n\
-          \x20     fi\n\
-          \x20     sleep 2\n\
-          \x20     n=$((n+1))\n\
-          \x20   done\n\
-          \x20   if pidof foot alacritty >/dev/null 2>&1; then\n\
-          \x20     echo '[autostart] terminal up (last attempt)'\n\
-          \x20   else\n\
-          \x20     echo '[autostart] terminal FAILED after 5 attempts (apk add foot)'\n\
-          \x20   fi ) &\n\
+          ( sleep 1\n\
+          n=1\n\
+          while [ \"$n\" -le 5 ]; do\n\
+          if pidof foot alacritty >/dev/null 2>&1; then\n\
+          echo \"[autostart] terminal up (attempt $n)\"\n\
+          exit 0\n\
+          fi\n\
+          echo \"[autostart] terminal attempt $n\"\n\
+          if [ \"$n\" -eq 2 ] && command -v foot >/dev/null 2>&1; then\n\
+          ( foot -d info; echo \"[autostart] foot -d info exited rc=$?\" ) &\n\
+          else\n\
+          ( eclipse-terminal; echo \"[autostart] terminal exited rc=$?\" ) &\n\
+          fi\n\
+          sleep 2\n\
+          n=$((n+1))\n\
+          done\n\
+          if pidof foot alacritty >/dev/null 2>&1; then\n\
+          echo '[autostart] terminal up (last attempt)'\n\
+          else\n\
+          echo '[autostart] terminal FAILED after 5 attempts (apk add foot)'\n\
+          fi ) &\n\
           else echo '[autostart] MISSING foot/alacritty -> no terminal (apk add foot)'; fi\n\
-          # Panel: prefer lunarbar, Eclipse's own two-bar panel (top sysinfo\n\
-          # bar, bottom taskbar). It is a static musl binary over wlr-layer-\n\
-          # shell + wlr-foreign-toplevel-management: NO GTK, NO D-Bus, NO\n\
-          # gdk-pixbuf, NO fontconfig, NO locale, so none of waybar's session-\n\
-          # bus/locale failure modes apply and it needs no crash-once lock (it\n\
-          # renders in software shm and cannot wedge the EGL/GBM path). Retry\n\
-          # loop keyed on `pidof lunarbar` like every other client here.\n\
+          # Panel: lunarbar, Eclipse's own two-bar panel (top sysinfo bar, bottom\n\
+          # taskbar). Static musl over wlr-layer-shell + wlr-foreign-toplevel-management.\n\
+          # Retry loop keyed on pidof, like every other client here.\n\
           if command -v lunarbar >/dev/null 2>&1; then\n\
-          \x20 echo '[autostart] launching lunarbar (native panel)'\n\
-          \x20 ( n=1\n\
-          \x20   while [ \"$n\" -le 5 ]; do\n\
-          \x20     if pidof lunarbar >/dev/null 2>&1; then\n\
-          \x20       echo \"[autostart] lunarbar up (attempt $n)\"\n\
-          \x20       exit 0\n\
-          \x20     fi\n\
-          \x20     echo \"[autostart] lunarbar attempt $n\"\n\
-          \x20     ( lunarbar; echo \"[autostart] lunarbar exited rc=$?\" ) &\n\
-          \x20     sleep 2\n\
-          \x20     n=$((n+1))\n\
-          \x20   done\n\
-          \x20   if pidof lunarbar >/dev/null 2>&1; then\n\
-          \x20     echo '[autostart] lunarbar up (last attempt)'\n\
-          \x20   else\n\
-          \x20     echo '[autostart] lunarbar FAILED after 5 attempts'\n\
-          \x20   fi ) &\n\
-          else\n\
-          # Fallback path (lunarbar absent): waybar, a GTK app.\n\
-          # Session D-Bus: waybar is a GTK app and GApplication registers on\n\
-          # the session bus at startup. Without a reachable bus GLib prints\n\
-          # \"Could not connect: Connection refused\" and waybar exits before it\n\
-          # ever maps its panel. Start a real private session bus (dbus-daemon\n\
-          # ships with the desktop packages) and export its address, instead of\n\
-          # pinning DBUS_SESSION_BUS_ADDRESS at a dead socket. Idempotent: skip\n\
-          # if one is already provided.\n\
-          if command -v dbus-daemon >/dev/null 2>&1 && [ -z \"$DBUS_SESSION_BUS_ADDRESS\" ]; then\n\
-          \x20 mkdir -p \"$XDG_RUNTIME_DIR\" 2>/dev/null\n\
-          \x20 DBUS_ADDR=$(dbus-daemon --session --print-address --fork 2>/dev/null)\n\
-          \x20 if [ -n \"$DBUS_ADDR\" ]; then\n\
-          \x20   export DBUS_SESSION_BUS_ADDRESS=\"$DBUS_ADDR\"\n\
-          \x20   echo \"[autostart] session dbus: $DBUS_SESSION_BUS_ADDRESS\"\n\
-          \x20 else\n\
-          \x20   echo '[autostart] dbus-daemon failed to start; waybar may not map'\n\
-          \x20 fi\n\
+          echo '[autostart] launching lunarbar (native panel)'\n\
+          ( n=1\n\
+          while [ \"$n\" -le 5 ]; do\n\
+          if pidof lunarbar >/dev/null 2>&1; then\n\
+          echo \"[autostart] lunarbar up (attempt $n)\"\n\
+          exit 0\n\
           fi\n\
-          # Bottom panel: taskbar, clock, sysinfo. GTK app -> keep it off the\n\
-          # EGL/GBM path (hangs this box, see /usr/local/bin/labwc) and guard\n\
-          # with a crash-once lock so a hang cannot recur on every boot.\n\
-          PANEL_LOCK=\"$HOME/.config/labwc/panel.lock\"\n\
-          if ! command -v waybar >/dev/null 2>&1; then\n\
-          \x20 echo '[autostart] MISSING waybar -> no panel (apk add waybar)'\n\
-          elif [ -e \"$PANEL_LOCK\" ]; then\n\
-          \x20 echo \"[autostart] panel.lock present: last session died while waybar ran.\"\n\
-          \x20 echo \"[autostart] SKIPPING waybar. To retry: rm $PANEL_LOCK\"\n\
+          echo \"[autostart] lunarbar attempt $n\"\n\
+          ( lunarbar; echo \"[autostart] lunarbar exited rc=$?\" ) &\n\
+          sleep 2\n\
+          n=$((n+1))\n\
+          done\n\
+          if pidof lunarbar >/dev/null 2>&1; then\n\
+          echo '[autostart] lunarbar up (last attempt)'\n\
           else\n\
-          \x20 echo '[autostart] launching waybar (GDK_GL=disable, crash-once lock armed)'\n\
-          \x20 touch \"$PANEL_LOCK\"\n\
-          \x20 # GSETTINGS_BACKEND=memory: GTK otherwise reads settings through\n\
-          \x20 # dconf, whose D-Bus autolaunch is another failure point on a\n\
-          \x20 # system with no session bus.\n\
-          \x20 # Retry LOOP keyed on `pidof waybar`, with each attempt launched\n\
-          \x20 # in the background. Two reasons: waybar's compositor connect\n\
-          \x20 # fails transiently during session bring-up (clients started a\n\
-          \x20 # moment earlier connect fine), and a wrapper that waits on the\n\
-          \x20 # child directly has been seen wedged in wait() on this kernel\n\
-          \x20 # after the child died (its exit-rc line never appeared), which\n\
-          \x20 # swallowed the retry. pidof needs neither wait() nor exit\n\
-          \x20 # codes: it observes the fact we care about - a living panel.\n\
-          \x20 ( n=1\n\
-          \x20   while [ \"$n\" -le 5 ]; do\n\
-          \x20     sleep 2\n\
-          \x20     if pidof waybar >/dev/null 2>&1; then\n\
-          \x20       echo \"[autostart] waybar up (attempt $n)\"\n\
-          \x20       exit 0\n\
-          \x20     fi\n\
-          \x20     echo \"[autostart] waybar attempt $n\"\n\
-          # DBUS_SESSION_BUS_ADDRESS is exported above (real private bus);\n\
-          # NO_AT_BRIDGE skips the a11y bus, which has no daemon here.\n\
-          \x20     NO_AT_BRIDGE=1 GDK_GL=disable GDK_BACKEND=wayland GSETTINGS_BACKEND=memory waybar &\n\
-          \x20     n=$((n+1))\n\
-          \x20   done\n\
-          \x20   sleep 2\n\
-          \x20   if pidof waybar >/dev/null 2>&1; then\n\
-          \x20     echo '[autostart] waybar up (last attempt)'\n\
-          \x20   else\n\
-          \x20     echo '[autostart] waybar FAILED after 5 attempts'\n\
-          \x20   fi ) &\n\
-          \x20 ( sleep 15 && rm -f \"$PANEL_LOCK\" && echo '[autostart] waybar survived 15s, lock cleared' >>\"$LOG\" ) &\n\
-          fi\n\
+          echo '[autostart] lunarbar FAILED after 5 attempts'\n\
+          fi ) &\n\
+          else\n\
+          echo '[autostart] MISSING lunarbar -> no panel (build tools/lunarbar)'\n\
           fi\n\
           echo \"[autostart] cursor theme dir: $(ls -d /usr/share/icons/*/cursors 2>/dev/null || echo NONE)\"\n\
-          # Post-launch health check: which clients are still alive shortly\n\
-          # after start. A client that launched but died (bad config, missing\n\
-          # lib) shows as DEAD here, with its stderr earlier in this log.\n\
+          # Post-launch health check: which native clients are still alive after 5s.\n\
           ( sleep 5\n\
-          \x20 echo \"[autostart] after 5s: lunarbg=$(pidof lunarbg >/dev/null 2>&1 && echo ok || echo DEAD) swaybg=$(pidof swaybg >/dev/null 2>&1 && echo ok || echo n/a) lunarbar=$(pidof lunarbar >/dev/null 2>&1 && echo ok || echo n/a) waybar=$(pidof waybar >/dev/null 2>&1 && echo ok || echo n/a) terminal=$(pidof foot alacritty >/dev/null 2>&1 && echo ok || echo DEAD)\" ) &\n\
+          echo \"[autostart] after 5s: lunarbg=$(pidof lunarbg >/dev/null 2>&1 && echo ok || echo DEAD) lunarbar=$(pidof lunarbar >/dev/null 2>&1 && echo ok || echo DEAD) terminal=$(pidof foot alacritty >/dev/null 2>&1 && echo ok || echo DEAD)\" ) &\n\
           echo '[autostart] done'\n",
-    )
-    .unwrap();
-}
-
-/// Waybar bottom panel: launcher + taskbar on the left, cpu/mem/clock on the
-/// right. Text-only module formats so no icon font is required beyond DejaVu.
-///
-/// Deliberately restricted to modules that only need the Wayland socket and
-/// /proc: `tray` (dbus), `network` (rtnetlink dumps) and `pulseaudio`
-/// (connection retry loop) exercise kernel paths that are partial on
-/// Eclipse OS and are the prime suspects for a whole-OS hang the first time
-/// the panel ever ran. Re-add them one at a time only after they are proven
-/// against this kernel.
-fn write_waybar(rootfs: &Path) {
-    let cfg = rootfs.join("root/.config/waybar");
-    let _ = fs::create_dir_all(&cfg);
-    fs::write(
-        cfg.join("config"),
-        r#"{
-    "layer": "top",
-    "position": "bottom",
-    "height": 34,
-    "spacing": 2,
-    "modules-left": ["custom/launcher", "wlr/taskbar"],
-    "modules-right": ["cpu", "memory", "clock"],
-
-    "custom/launcher": {
-        "format": " ◑ ",
-        "tooltip-format": "Terminal (Super+Enter)",
-        "on-click": "/usr/local/bin/eclipse-terminal"
-    },
-    "wlr/taskbar": {
-        "format": "{icon} {title:.18}",
-        "icon-size": 16,
-        "tooltip-format": "{title}",
-        "on-click": "activate",
-        "on-click-right": "close"
-    },
-    "cpu": { "format": "cpu {usage}%", "interval": 3 },
-    "memory": { "format": "mem {percentage}%", "interval": 5 },
-    "clock": {
-        "format": "{:%H:%M}",
-        "format-alt": "{:%a %d %b  %H:%M}",
-        "tooltip-format": "{:%A %d %B %Y}"
-    }
-}
-"#,
-    )
-    .unwrap();
-    fs::write(
-        cfg.join("style.css"),
-        br#"/* Eclipse OS - waybar (dark, purple accent, matches Eclipse-Dark). */
-* {
-    font-family: "DejaVu Sans", sans-serif;
-    font-size: 13px;
-    min-height: 0;
-}
-window#waybar {
-    background: rgba(15, 12, 26, 0.92);
-    border-top: 2px solid #6b5aa8;
-    color: #e8e4f8;
-}
-#custom-launcher {
-    font-size: 18px;
-    color: #b9a8ff;
-    padding: 0 10px;
-}
-#custom-launcher:hover { background: #29233f; }
-#taskbar button {
-    padding: 0 8px;
-    margin: 3px 2px;
-    border-radius: 6px;
-    color: #c9c4e4;
-    background: transparent;
-}
-#taskbar button:hover { background: #29233f; }
-#taskbar button.active {
-    background: #3a3357;
-    color: #ffffff;
-}
-#cpu, #memory, #clock {
-    padding: 0 10px;
-    margin: 3px 1px;
-    border-radius: 6px;
-    color: #c9c4e4;
-}
-#clock {
-    background: #29233f;
-    color: #e8e4f8;
-    font-weight: bold;
-}
-"#,
     )
     .unwrap();
 }
