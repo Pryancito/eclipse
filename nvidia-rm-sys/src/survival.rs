@@ -17,10 +17,17 @@
 //! previous attempt died on — e.g. milestone `STARTCPU_PRE` with narration
 //! count N means it hung on the STARTCPU store after N RM narration lines.
 //!
-//! Bytes used (offsets in the classic PC CMOS map, above the BIOS checksum
-//! range 0x10..0x2D): 0x40 magic, 0x41 milestone, 0x42 narration counter. If
-//! the machine's firmware ever reuses those bytes and BIOS settings act up,
-//! clear CMOS — the values here are pure diagnostics.
+//! Bytes it *would* use: 0x40 magic, 0x41 milestone, 0x42 narration counter.
+//!
+//! WRITES ARE NOW DISABLED. On real hardware (ASUS PRIME X299-A II / AMI BIOS)
+//! those bytes turned out to be INSIDE the firmware's checksummed NVRAM region
+//! — not above it as the classic PC map suggested — so every write broke the
+//! BIOS settings checksum and the next boot halted at POST with "Please enter
+//! setup to recover BIOS setting / Press F1", reverting settings to defaults.
+//! The breadcrumb was already superseded by the live console trace, so
+//! `cmos_write` is a no-op; the GPU bring-up must never scribble on CMOS.
+//! Reads are harmless and kept, so `/proc/gpusurvive` still compiles (it now
+//! just reports "no breadcrumb").
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -102,13 +109,18 @@ unsafe fn cmos_read(idx: u8) -> u8 {
     v
 }
 
+/// DISABLED. Writing these extended-CMOS bytes (0x40-0x42) corrupted the BIOS
+/// settings checksum on real hardware (ASUS PRIME X299-A II / AMI BIOS): the
+/// next boot halted at POST with "Please enter setup to recover BIOS setting --
+/// Press F1 to Run SETUP" and the firmware reverted to defaults. Contrary to
+/// the classic PC CMOS map, this firmware's checksummed NVRAM region DOES cover
+/// 0x40-0x42, so any write there breaks the checksum. The survival breadcrumb
+/// was already superseded by the live console trace, so the write is simply a
+/// no-op now -- the GPU bring-up must never touch CMOS. Reads stay (harmless;
+/// they only toggle NMI and never alter settings), so callers keep compiling
+/// and `/proc/gpusurvive` just reports "no breadcrumb".
 #[cfg(target_arch = "x86_64")]
-unsafe fn cmos_write(idx: u8, val: u8) {
-    outb(0x70, 0x80 | (idx & 0x7f));
-    outb(0x71, val);
-    outb(0x70, 0x0d);
-    let _ = inb(0x71);
-}
+unsafe fn cmos_write(_idx: u8, _val: u8) {}
 
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn cmos_read(_idx: u8) -> u8 {
