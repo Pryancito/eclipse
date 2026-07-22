@@ -51,12 +51,17 @@ pub struct Layout {
     pub s: f32,
     /// Horizontal squeeze so circles LOOK circular on the monitor.
     ///
-    /// The synthetic KMS exposes the UEFI GOP mode (often 4:3, e.g.
-    /// 1024x768); a 16:9 panel then stretches the framebuffer and every
-    /// circle shows as an ellipse. `LUNARBG_ASPECT` names the PHYSICAL
-    /// monitor aspect ("16:9", "16:10" or a decimal like "1.778"): the logo
-    /// is pre-squeezed by fb_aspect/monitor_aspect so the panel's stretch
-    /// cancels out. Unset or invalid -> 1.0 (draw round, e.g. QEMU).
+    /// The mode the driver sets (synthetic KMS / GOP, or the NVIDIA KMS
+    /// driver) is often NOT the panel's native aspect (e.g. a 4:3 1024x768
+    /// mode on a 16:9 panel); the panel then stretches the framebuffer and
+    /// every circle shows as an ellipse. We pre-squeeze the logo by
+    /// fb_aspect/monitor_aspect so the panel's stretch cancels out.
+    ///
+    /// The monitor aspect is taken, in order of preference, from: the panel's
+    /// physical size reported in `wl_output.geometry` (fully automatic — see
+    /// `monitor_aspect` in main.rs), then the `LUNARBG_ASPECT` env override
+    /// ("16:9", "16:10" or a decimal like "1.778"), then 1.0 (draw round,
+    /// e.g. QEMU where the mode already matches the virtual panel).
     pub sx: f32,
     /// (x, y, w, h) of the rect that the animation redraws each frame.
     pub region: (usize, usize, usize, usize),
@@ -73,13 +78,17 @@ fn monitor_aspect_from_env() -> Option<f32> {
     (aspect.is_finite() && aspect > 0.1).then_some(aspect)
 }
 
-pub fn layout(w: usize, h: usize) -> Layout {
+pub fn layout(w: usize, h: usize, monitor_aspect: Option<f32>) -> Layout {
     let logo_r = ((w.min(h) as f32 / 2.0) - 120.0).clamp(120.0, 280.0);
     let s = logo_r / 280.0;
     let cx = w as f32 * 0.5;
     let cy = h as f32 * 0.46;
     let fb_aspect = w as f32 / h as f32;
-    let sx = monitor_aspect_from_env()
+    // Prefer the panel aspect detected from wl_output.geometry; fall back to
+    // the LUNARBG_ASPECT override, then to 1.0 (no squeeze).
+    let sx = monitor_aspect
+        .filter(|a| a.is_finite() && *a > 0.1)
+        .or_else(monitor_aspect_from_env)
         .map(|mon| (fb_aspect / mon).clamp(0.5, 1.5))
         .unwrap_or(1.0);
     // Outermost animated element: ring 280 + 5 px oscillation, plus the
@@ -101,8 +110,8 @@ pub fn layout(w: usize, h: usize) -> Layout {
 // ---------------------------------------------------------------- base
 
 /// Render the static cosmic base as XRGB8888.
-pub fn render_base(w: usize, h: usize) -> Vec<u8> {
-    let lay = layout(w, h);
+pub fn render_base(w: usize, h: usize, monitor_aspect: Option<f32>) -> Vec<u8> {
+    let lay = layout(w, h, monitor_aspect);
     let mut buf = vec![0f32; w * h * 3];
 
     // Cosmic vertical gradient + nebula glow behind the logo.
