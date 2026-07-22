@@ -480,6 +480,13 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # pointer without one (apk add adwaita-icon-theme).\n\
           : \"${XCURSOR_THEME:=Adwaita}\"; export XCURSOR_THEME\n\
           : \"${XCURSOR_SIZE:=24}\"; export XCURSOR_SIZE\n\
+          # The NVIDIA / software-KMS DRM node exposes no hardware cursor plane,\n\
+          # so wlroots probes it on every cursor update, fails ('Hardware cursor\n\
+          # not supported' / 'Failed to render cursor buffer'), and falls back to\n\
+          # a software cursor -- flooding the log and burning CPU in a tight loop.\n\
+          # Force the software cursor up front so wlroots never touches the HW\n\
+          # plane (WLR_NO_HARDWARE_CURSORS is wlroots' documented switch for this).\n\
+          : \"${WLR_NO_HARDWARE_CURSORS:=1}\"; export WLR_NO_HARDWARE_CURSORS\n\
           for d in /usr/bin /bin /usr/sbin /sbin; do\n\
           \x20 if [ -x \"$d/labwc\" ]; then exec \"$d/labwc\" \"$@\"; fi\n\
           done\n\
