@@ -1475,12 +1475,41 @@ pub fn send_ip6_ethernet(ip: &[u8]) -> LxResult {
 
 // ============= Rand Port =============
 
-/// !!!! need riscv rng
+/// Return an unpredictable 64-bit value.
+///
+/// Previously this returned the constant `10000`, which made every DNS
+/// transaction ID identical and the ephemeral-port seed fully predictable — the
+/// TXID is the resolver's only anti-spoofing check, so a constant made DNS
+/// responses trivially forgeable. We now mix a hardware timestamp (rdtsc on
+/// x86_64, the monotonic timer elsewhere) into a persistent SplitMix64 counter,
+/// so successive calls are distinct and hard to predict even when the clock is
+/// coarse.
 pub fn rand() -> u64 {
-    // use core::arch::x86_64::_rdtsc;
-    // rdrand is not implemented in QEMU
-    // so use rdtsc instead
-    10000
+    use core::sync::atomic::{AtomicU64, Ordering};
+    // Golden-ratio odd increment (SplitMix64). Persisting the state across calls
+    // guarantees distinct outputs even if two calls read the same timestamp.
+    static STATE: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
+    let ts = timestamp_entropy();
+    let mut z = STATE
+        .fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed)
+        .wrapping_add(ts);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// Best-effort high-resolution entropy for [`rand`].
+#[allow(unsafe_code)]
+fn timestamp_entropy() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: `rdtsc` is a plain timestamp read with no memory effects.
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        kernel_hal::timer::timer_now().as_nanos() as u64
+    }
 }
 
 #[allow(unsafe_code)]
