@@ -176,18 +176,17 @@ impl Syscall<'_> {
                 })?;
                 (vmo, 0)
             };
-            // hunter P1: cap the file-backed mapping's *permission ceiling* to a
-            // W^X-preserving set instead of the old blanket `RXW`, so a later
-            // mprotect cannot turn writable file pages executable. Executable
-            // maps never gain WRITE; non-executable maps may gain WRITE (for
-            // COW / relocations) but never EXECUTE.
-            let mut ceiling = prot.to_flags() | MMUFlags::READ | MMUFlags::USER;
-            if prot.contains(MmapProt::EXEC) {
-                ceiling.remove(MMUFlags::WRITE);
-            } else {
-                ceiling |= MMUFlags::WRITE;
-                ceiling.remove(MMUFlags::EXECUTE);
-            }
+            // Permission ceiling = full RXW: Linux lets mprotect raise a file
+            // mapping to any R/W/X combination, and the dynamic linker relies on
+            // it — ld.so mprotect()s a library's *executable* text segment to RW
+            // to apply text relocations / DT_TEXTREL and to set up GNU_RELRO
+            // (seen with libxul). A W^X-preserving ceiling that strips WRITE from
+            // exec maps made that mprotect fail; the syscall layer then swallowed
+            // the error, leaving GOT entries unrelocated (== 0) and Firefox
+            // crashing on a store through a NULL pointer. W^X is still audited by
+            // hunter::check_mprotect (Report mode by default) — it just isn't
+            // enforced by capping the mapping here.
+            let ceiling = MMUFlags::RXW | MMUFlags::USER;
             // Map without committing the range up front (`map_range = false`):
             // the VMO returned by `get_vmo` is demand-paged from the file, so its
             // pages are read in on the faults that first touch them. Eagerly
