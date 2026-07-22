@@ -71,7 +71,6 @@ bitmap-allocator = { git = "https://github.com/rcore-os/bitmap-allocator.git", r
 
 # Bare-metal mode
 [target.'cfg(target_os = "none")'.dependencies]
-naive-timer = "0.2.0"
 executor = { path = "../vendor/PreemptiveScheduler" }
 
 # For riscv

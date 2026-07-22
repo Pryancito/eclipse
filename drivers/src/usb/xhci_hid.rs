@@ -2776,41 +2776,23 @@ impl InputScheme for XhciUsbHid {
         let mut cap = InputCapability::empty();
         match cap_type {
             CapabilityType::Event => cap.set_all(&[EV_SYN, EV_KEY, EV_REL]),
-            CapabilityType::Key => cap.set_all(&[
-                BTN_LEFT,
-                BTN_RIGHT,
-                BTN_MIDDLE,
-                BTN_SIDE,
-                BTN_EXTRA,
-                KEY_ESC,
-                KEY_ENTER,
-                KEY_SPACE,
-                KEY_TAB,
-                KEY_LEFTSHIFT,
-                KEY_LEFTCTRL,
-                KEY_LEFTALT,
-                KEY_LEFTMETA,
-                KEY_RIGHTSHIFT,
-                KEY_RIGHTCTRL,
-                KEY_RIGHTALT,
-                KEY_RIGHTMETA,
-                KEY_A,
-                KEY_Z,
-                KEY_0,
-                KEY_9,
-                KEY_UP,
-                KEY_DOWN,
-                KEY_LEFT,
-                KEY_RIGHT,
-                KEY_HOME,
-                KEY_END,
-                KEY_PAGEUP,
-                KEY_PAGEDOWN,
-                KEY_INSERT,
-                KEY_DELETE,
-                KEY_F1,
-                KEY_F12,
-            ]),
+            CapabilityType::Key => {
+                // Advertise the full keyboard keycode block plus the mouse
+                // buttons this HID scheme can emit. libinput builds the
+                // device's key set from EVIOCGBIT(EV_KEY) and DROPS any key
+                // event whose code is not in this bitmap. The previous list
+                // named only a sparse sample of keys (KEY_A and KEY_Z as if
+                // they were range endpoints, KEY_0/KEY_9, KEY_F1/KEY_F12) and
+                // NONE of the keys in between — so the compositor only ever
+                // received the handful of explicitly-listed keys (notably just
+                // 'a' among the letters). `hid_usage_to_linux` maps HID usages
+                // across the whole 1..=248 keyboard range, so advertise all of
+                // it, exactly as a real keyboard does.
+                for code in KEY_ESC..=KEY_MICMUTE {
+                    cap.set(code);
+                }
+                cap.set_all(&[BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA]);
+            }
             CapabilityType::RelAxis => cap.set_all(&[REL_X, REL_Y, REL_WHEEL, REL_HWHEEL]),
             _ => {}
         }
