@@ -370,12 +370,25 @@ fn load_nvidia_gsp_firmware(root: &alloc::sync::Arc<dyn rcore_fs::vfs::INode>) {
 /// a single-console-GPU box brings up nothing and falls back to the CPU blit.
 #[cfg(feature = "linux")]
 fn auto_bringup_compute_gpus() {
-    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-        let log = d.auto_bringup_compute();
-        for line in log.lines() {
+    let mut summaries = alloc::vec::Vec::new();
+    // Suppress the driver's own (loud, ERROR-level) bring-up narration for the
+    // whole ladder; `auto_bringup_compute` returns just one clean status line
+    // per compute GPU (empty for the console GPU / non-NVIDIA drivers). The
+    // detail is still captured into /proc/gpustep* for debugging.
+    logging::with_output_suppressed(|| {
+        for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+            let line = d.auto_bringup_compute();
             if !line.is_empty() {
-                klog_info!("Eclipse: {}", line);
+                summaries.push(line);
             }
+        }
+    });
+    // Emit only the tidy summary (klog_emit bypasses the level filter).
+    if summaries.is_empty() {
+        klog_info!("Eclipse: NVIDIA — sin GPU de cómputo; present por CPU");
+    } else {
+        for line in summaries {
+            klog_info!("Eclipse: NVIDIA {}", line);
         }
     }
 }
