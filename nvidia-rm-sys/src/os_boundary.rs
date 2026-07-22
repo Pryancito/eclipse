@@ -1106,6 +1106,16 @@ pub extern "C" fn osDevWriteReg032(
                     // (GPU-independent) immediately before the posted store, so a
                     // wedge here is legible on the next boot via /proc/gpusurvive.
                     crate::survival::checkpoint(crate::survival::milestone::STARTCPU_PRE);
+                    // Last-visible-line MSI status: whether the GPU's MSI
+                    // delivery is online for this window and how many fired, so a
+                    // wedge's frozen screen answers "did MSI even come online?".
+                    let (mv, mc) = crate::survival::msi_status();
+                    crate::os_interface::probe_line(&alloc::format!(
+                        "[nvidia-rm] STARTCPU: MSI online={} vector={} count={} (about to post store)",
+                        mv != usize::MAX,
+                        mv,
+                        mc
+                    ));
                     core::ptr::write_volatile(
                         base.add(this_address as usize) as *mut NvU32,
                         this_value,
@@ -1179,6 +1189,13 @@ pub extern "C" fn osDevWriteReg032(
             // etc.) still hits the same wedge point.
             if is_sec2_startcpu {
                 crate::survival::checkpoint(crate::survival::milestone::STARTCPU_PRE);
+                let (mv, mc) = crate::survival::msi_status();
+                crate::os_interface::probe_line(&alloc::format!(
+                    "[nvidia-rm] STARTCPU: MSI online={} vector={} count={} (about to post store)",
+                    mv != usize::MAX,
+                    mv,
+                    mc
+                ));
             }
             unsafe {
                 core::ptr::write_volatile(base.add(this_address as usize) as *mut NvU32, this_value)

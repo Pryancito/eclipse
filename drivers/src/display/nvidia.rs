@@ -416,11 +416,6 @@ fn rm_core_init_once() -> u32 {
     s
 }
 
-/// MSIs serviced during the current console-GPU GSP boot window. Module-level
-/// because the ISR closure registered in `gsp_boot_run` must be `'static` (it
-/// cannot borrow `&self`). There is only ever one console boot in flight.
-static CONSOLE_MSI_COUNT: AtomicUsize = AtomicUsize::new(0);
-
 #[derive(Debug, Clone, Copy)]
 struct BootFbInfo {
     phys: u64,
@@ -1706,12 +1701,13 @@ impl NvidiaGpu {
                     usize::MAX
                 };
                 if msi_vec != usize::MAX {
-                    CONSOLE_MSI_COUNT.store(0, Ordering::Relaxed);
+                    nvidia_rm_sys::survival::msi_set_online(msi_vec);
                     let v = msi_vec;
                     let handler: crate::scheme::IrqHandler = alloc::sync::Arc::new(move || {
                         const STORM_CAP: usize = 200_000;
-                        let n = CONSOLE_MSI_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n == STORM_CAP {
+                        // Counter lives in nvidia-rm-sys so the STARTCPU bracket
+                        // (os_boundary) can print it on the frozen screen.
+                        if nvidia_rm_sys::survival::msi_tick() == STORM_CAP {
                             // Runaway source we cannot clear at the engine
                             // without a wedge-prone BAR access: self-mask so a
                             // storm can never peg the CPU into a hang.
@@ -1724,6 +1720,11 @@ impl NvidiaGpu {
                         tag,
                         msi_vec,
                         ok
+                    );
+                } else {
+                    log::error!(
+                        "[NVIDIA] {}: NO MSI vector on this GPU (msi_vector unset) -- GSP boot runs INTx-masked as before; pci.rs found no legacy MSI cap (0x05). NVIDIA may expose only MSI-X (0x11).",
+                        tag
                     );
                 }
                 let mut recovery_log = String::new();
@@ -1770,7 +1771,8 @@ impl NvidiaGpu {
                 // "do MSIs even fire, and does turning them on shift the wedge?".
                 if msi_vec != usize::MAX {
                     crate::net::msi_mask_and_unregister(msi_vec);
-                    let n = CONSOLE_MSI_COUNT.load(Ordering::Relaxed);
+                    let (_v, n) = nvidia_rm_sys::survival::msi_status();
+                    nvidia_rm_sys::survival::msi_offline();
                     log::error!(
                         "[NVIDIA] {}: MSI delivery offline; {} MSI(s) serviced during the GSP boot{}",
                         tag,
@@ -3816,6 +3818,65 @@ impl DrmScheme for NvidiaGpu {
         s.push_str("[gpustep14] --- stage 5: copy-engine data movement (gpustep10) ---\n");
         s.push_str(&self.bringup_step10());
         s.push_str("[gpustep14] === console GPU bring-up chain complete (see per-stage results above) ===\n");
+        s
+    }
+
+    /// `/proc/gpucefill`: CE-offload visual test. On the state-loaded console
+    /// GPU, CE-memset the scanout framebuffer to a solid colour via the
+    /// persistent CeUtils channel (`eclipse_rm_ce_fill_fb`). If the screen turns
+    /// that colour, the BAR1->VRAM offset (`fb_phys - bar1_phys`) is correct and
+    /// the CE can drive the display — the green light to wire the full per-frame
+    /// `ce_blit` present path. The low byte of the pattern is what the CE writes
+    /// (byte-remap), so a replicated-byte colour (here 0xFF -> white) results.
+    fn bringup_ce_fill_fb(&self) -> String {
+        use core::fmt::Write;
+        let mut s = String::new();
+        if !self.drives_boot_display() {
+            return String::from(
+                "[gpucefill] SKIPPED on secondary GPU (it has no scanout framebuffer)\n",
+            );
+        }
+        let device_instance = match *self.rm_device_instance.lock() {
+            Some(d) => d,
+            None => {
+                return String::from(
+                    "[gpucefill] skipped: console GPU not state-loaded -- run `cat /proc/gpustep14` first\n",
+                );
+            }
+        };
+        let fb_phys = match boot_fb_phys() {
+            Some(p) if p != 0 => p,
+            _ => return String::from("[gpucefill] no boot framebuffer physical address recorded\n"),
+        };
+        let bar1 = self.bar1_phys;
+        if fb_phys < bar1 {
+            let _ = writeln!(
+                s,
+                "[gpucefill] fb_phys {:#x} < bar1_phys {:#x} -- unexpected; aborting (would underflow the VRAM offset)",
+                fb_phys, bar1
+            );
+            return s;
+        }
+        let fb_vram_offset = fb_phys - bar1;
+        let size = (self.info.pitch as u64) * (self.info.height as u64);
+        // Low byte replicated by the CE: 0xFF -> every byte 0xFF -> white.
+        let pattern: u32 = 0x0000_00FF;
+        let _ = writeln!(
+            s,
+            "[gpucefill] fb_phys={:#x} bar1_phys={:#x} => fb_vram_offset={:#x}  size={:#x} ({}x{} pitch {})  pattern={:#x} (low byte -> white)",
+            fb_phys, bar1, fb_vram_offset, size, self.info.width, self.info.height, self.info.pitch, pattern
+        );
+        let st = nvidia_rm_sys::rm_init::ce_fill_fb(device_instance, fb_vram_offset, size, pattern);
+        let _ = writeln!(
+            s,
+            "[gpucefill] ce_fill_fb -> {:#x} ({})",
+            st,
+            if st == 0 {
+                "OK -- if the screen is now WHITE, the VRAM offset is correct and the CE drives the display"
+            } else {
+                "FAILED -- CE submit did not complete"
+            }
+        );
         s
     }
 
