@@ -3846,32 +3846,39 @@ impl DrmScheme for NvidiaGpu {
     /// (see `bringup_step6`), so it is never auto-booted; the compute GPU(s)
     /// are the reliable path and drive the console's scanout FB over PCIe P2P.
     fn auto_bringup_compute(&self) -> String {
+        // The console GPU is never auto-booted (its GSP boot wedges at the SEC2
+        // STARTCPU store) and drives the display fine via the GOP framebuffer.
+        // Return nothing so the quiet boot path prints no line for it.
         if self.drives_boot_display() {
-            return String::from(
-                "[gpuauto] SKIP console GPU (drives boot display; its GSP boot wedges at SEC2 STARTCPU)\n",
-            );
+            return String::new();
         }
-        let mut s = String::new();
-        s.push_str(
-            "[gpuauto] compute GPU auto bring-up: attach -> GSP-RM boot -> RM API -> gpuStateLoad\n",
-        );
-        // The same sequence a user runs as `cat /proc/gpustep5;6;8;9`, executed
-        // once at boot before any userspace or scanout touches RM (fixed RM
-        // thread-id 0, no concurrent access -> no reentrancy hazard).
-        s.push_str(&self.bringup_step5());
-        s.push_str(&self.bringup_step6());
-        s.push_str(&self.bringup_step8());
-        s.push_str(&self.bringup_step9());
+        // Run the proven state-load chain (the same sequence a user triggers as
+        // `cat /proc/gpustep5;6;8;9`), executed once at boot before any
+        // userspace or scanout touches RM (fixed RM thread-id 0, no concurrent
+        // access -> no reentrancy hazard). The verbose per-step narration is
+        // DISCARDED here -- it still lands in the /proc/gpustep* capture buffers
+        // for debugging, but must not flood the desktop console. The caller
+        // suppresses the driver's own log output around this call; all this
+        // method emits is a single clean status line.
+        let _ = self.bringup_step5();
+        let _ = self.bringup_step6();
+        let _ = self.bringup_step8();
+        let _ = self.bringup_step9();
         if self.rm_device_instance.lock().is_some() {
-            s.push_str(
-                "[gpuauto] compute GPU state-loaded; CE-offload present (P2P) now available\n",
-            );
+            alloc::format!(
+                "GPU {:02x}:{:02x}.0 {} listo — aceleración de present activada (compute/P2P)",
+                self.pci_bus,
+                self.pci_device,
+                self.gpu_model,
+            )
         } else {
-            s.push_str(
-                "[gpuauto] compute GPU NOT state-loaded after chain; present falls back to CPU blit\n",
-            );
+            alloc::format!(
+                "GPU {:02x}:{:02x}.0 {} sin aceleración de present — se usa copia por CPU",
+                self.pci_bus,
+                self.pci_device,
+                self.gpu_model,
+            )
         }
-        s
     }
 
     fn ce_present(&self, src_sysmem_pa: u64, size: u64) -> bool {

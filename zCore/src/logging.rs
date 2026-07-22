@@ -146,6 +146,22 @@ pub fn set_max_level(level: &str) {
     log::set_max_level(level.parse().unwrap_or(LevelFilter::Warn));
 }
 
+/// Run `f` with ALL `log`-crate output suppressed (level = Off), restoring the
+/// previous max level afterwards. Used to bring the GPU up quietly at boot: the
+/// RM / bring-up narration -- much of it deliberately at ERROR level so it is
+/// visible during step debugging -- would otherwise flood the desktop console
+/// with ugly, alarming-looking lines even though the bring-up is routine now.
+/// Nothing is lost: the per-line detail is still captured into the
+/// `/proc/gpustep*` buffers. Note `klog_emit` (and thus `klog_info!`) writes
+/// straight to the ring buffer and is NOT gated by the level, so a clean
+/// summary line emitted via `klog_info!` still prints while this is in effect.
+pub fn with_output_suppressed<F: FnOnce()>(f: F) {
+    let prev = log::max_level();
+    log::set_max_level(LevelFilter::Off);
+    f();
+    log::set_max_level(prev);
+}
+
 #[macro_export]
 macro_rules! klog_info {
     ($($arg:tt)*) => {
