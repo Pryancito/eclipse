@@ -318,19 +318,31 @@ impl Syscall<'_> {
 
         let proc = self.linux_process();
         // readlink(2) must follow symlinks in *intermediate* path components but
-        // NOT the final one. Resolving the whole path with follow=false breaks
-        // any link whose parent dir is itself reached through a symlink — e.g.
-        // libdrm's readlink("/sys/dev/char/226:0/device/subsystem"), where
-        // `device` is a symlink: a no-follow resolution stops at it and the next
-        // component fails with ENOTDIR. Resolve the parent with follow=true,
-        // then look up the final component without following it.
-        let (dir_path, file_name) = split_path(path);
-        let inode = if file_name.is_empty() || file_name == "." || file_name == ".." {
-            // No trailing component to treat as a link; resolve as-is.
-            proc.lookup_inode_at(dirfd, path, false)?
-        } else {
-            let dir = proc.lookup_inode_at(dirfd, dir_path, true)?;
-            dir.find(file_name).map_err(LxError::from)?
+        // NOT the final one.
+        //
+        // Two resolution strategies are needed:
+        //  1. Whole-path, no-follow: this is what reaches the magic links that
+        //     `lookup_inode_at` special-cases on the FULL path string
+        //     (`/proc/self/exe`, `/proc/self/fd/N`, ...). Firefox reads
+        //     `/proc/self/exe` to find its install dir, so this MUST work.
+        //  2. Parent-follow + final-no-follow: needed for a link whose parent
+        //     dir is itself reached through a symlink — e.g. libdrm's
+        //     readlink("/sys/dev/char/226:0/device/subsystem") where `device`
+        //     is a symlink; strategy 1 stops at it (no-follow) and fails.
+        // Try (1) first and accept it only when it yields a symlink; otherwise
+        // fall back to (2). (1) never matched the magic links before because
+        // this function split the path and bypassed the full-path special case.
+        let inode = match proc.lookup_inode_at(dirfd, path, false) {
+            Ok(i) if i.metadata().map(|m| m.type_ == FileType::SymLink).unwrap_or(false) => i,
+            _ => {
+                let (dir_path, file_name) = split_path(path);
+                if file_name.is_empty() || file_name == "." || file_name == ".." {
+                    proc.lookup_inode_at(dirfd, path, false)?
+                } else {
+                    let dir = proc.lookup_inode_at(dirfd, dir_path, true)?;
+                    dir.find(file_name).map_err(LxError::from)?
+                }
+            }
         };
         if inode.metadata()?.type_ != FileType::SymLink {
             return Err(LxError::EINVAL);
