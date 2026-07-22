@@ -198,6 +198,19 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             } else {
                 klog_info!("Eclipse: NVIDIA compute-GPU auto bring-up disabled (nvidia.noautoboot)");
             }
+            // Per-frame CE-offloaded present is strictly OPT-IN: it fires a GPU
+            // DMA on every desktop present and, on real hardware, correlated
+            // with random SIGSEGVs (139) in freshly-started Wayland clients
+            // while the CPU blit was rock solid. Boot with `nvidia.cepresent`
+            // to enable it for testing; the default present is the CPU blit
+            // even when the compute GPU was auto-brought-up above (bring-up
+            // stays useful for /proc/gpustep* work and future acceleration).
+            if options.cmdline.contains("nvidia.cepresent") {
+                linux_object::fs::devfs::drm::set_ce_present_enabled(true);
+                klog_info!("Eclipse: NVIDIA CE-offload present ENABLED (nvidia.cepresent)");
+            } else {
+                klog_info!("Eclipse: present por CPU (CE-offload opt-in: nvidia.cepresent)");
+            }
             kernel_hal::console::early_progress_bar(95);
 
             // Whose exit takes the system down: INIT (PID 1) if present, else

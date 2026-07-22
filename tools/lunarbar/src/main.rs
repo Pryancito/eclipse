@@ -1508,7 +1508,44 @@ fn connect_wayland() -> Result<Connection, String> {
     Err("Could not find a running Wayland compositor (is labwc started?)".into())
 }
 
+/// Install a crash handler that reports the faulting address on
+/// SIGSEGV/SIGBUS/SIGILL before dying, so a crash on real hardware is
+/// self-diagnosing (no dmesg needed). Same handler as lunarbg's: only
+/// async-signal-safe `write(2)` + manual hex, then re-raise with the default
+/// disposition so the shell still sees the real signal exit code (139).
+fn install_crash_handler() {
+    extern "C" fn handler(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
+        let addr = unsafe { (*info).si_addr() } as usize;
+        let mut buf = *b"lunarbar: FATAL signal 00 fault-addr 0x0000000000000000\n";
+        buf[23] = b'0' + ((sig / 10) % 10) as u8;
+        buf[24] = b'0' + (sig % 10) as u8;
+        for i in 0..16 {
+            let nibble = ((addr >> ((15 - i) * 4)) & 0xf) as u8;
+            buf[39 + i] = if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + nibble - 10
+            };
+        }
+        unsafe {
+            libc::write(2, buf.as_ptr() as *const libc::c_void, buf.len());
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
+    unsafe {
+        let mut sa: libc::sigaction = core::mem::zeroed();
+        sa.sa_sigaction = handler as *const () as usize;
+        sa.sa_flags = libc::SA_SIGINFO;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGSEGV, &sa, core::ptr::null_mut());
+        libc::sigaction(libc::SIGBUS, &sa, core::ptr::null_mut());
+        libc::sigaction(libc::SIGILL, &sa, core::ptr::null_mut());
+    }
+}
+
 fn main() {
+    install_crash_handler();
     // Minimum 26: the 15px font plus the h-10 pill height — anything shorter
     // draws glyphs taller than the pills that frame them.
     let height: u32 = std::env::var("LUNARBAR_HEIGHT")
