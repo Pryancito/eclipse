@@ -698,8 +698,13 @@ where
             rxcount += 1;
             self.rx_dirty = (self.rx_dirty + 1) % DMA_DESC_RX;
 
-            // Get length & status from hardware
-            let mut frame_len = (desc.desc0 >> 16) & 0x3fff; // Frame length bit[16:29]
+            // Get length & status from hardware. Clamp to the DMA buffer size:
+            // the hardware length field is 14 bits (up to 16383) and on the last
+            // descriptor of a multi-descriptor frame it reports the WHOLE frame
+            // length, which can exceed our per-buffer MAX_BUF_SZ. Using it
+            // unclamped would read (and invalidate/flush cache) past the 1-page
+            // RX buffer -> OOB read + corruption of adjacent kernel memory.
+            let mut frame_len = ((desc.desc0 >> 16) & 0x3fff).min(MAX_BUF_SZ); // bit[16:29]
 
             //discard frame when last_desc, err_sum, len_err, mii_err
             let status = if (((desc.desc0 >> 8) & 0x1) == 0) || ((desc.desc0 & 0x9008) != 0) {
@@ -740,6 +745,12 @@ where
             }
 
             if status != RxFrameStatus::LlcSnap as i32 {
+                // Guard the FCS strip: a runt/garbage frame shorter than the
+                // 4-byte FCS would underflow frame_len (u32) to ~4 GiB and then
+                // read/copy far out of bounds. Skip such frames.
+                if frame_len < 4 {
+                    continue;
+                }
                 frame_len -= 4; // ETH_FCS_LEN, 帧出错检验
             }
 
