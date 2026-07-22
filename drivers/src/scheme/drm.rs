@@ -207,6 +207,15 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// CE-offload visual test (`/proc/gpucefill`): CE-memset the console GPU's
+    /// scanout framebuffer to a solid colour via the persistent CeUtils channel,
+    /// to confirm the BAR1->VRAM offset is correct before wiring the full
+    /// per-frame CE present blit. Requires the console GPU to be state-loaded
+    /// (`/proc/gpustep14`). Default: nothing.
+    fn bringup_ce_fill_fb(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Read back (and clear) the CMOS survival breadcrumb the previous
     /// console-GPU boot attempt left, surfaced at `/proc/gpusurvive`. On a box
     /// with no serial, this is how a SEC2-window wedge is diagnosed: the CPU

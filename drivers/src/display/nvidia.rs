@@ -3821,6 +3821,65 @@ impl DrmScheme for NvidiaGpu {
         s
     }
 
+    /// `/proc/gpucefill`: CE-offload visual test. On the state-loaded console
+    /// GPU, CE-memset the scanout framebuffer to a solid colour via the
+    /// persistent CeUtils channel (`eclipse_rm_ce_fill_fb`). If the screen turns
+    /// that colour, the BAR1->VRAM offset (`fb_phys - bar1_phys`) is correct and
+    /// the CE can drive the display — the green light to wire the full per-frame
+    /// `ce_blit` present path. The low byte of the pattern is what the CE writes
+    /// (byte-remap), so a replicated-byte colour (here 0xFF -> white) results.
+    fn bringup_ce_fill_fb(&self) -> String {
+        use core::fmt::Write;
+        let mut s = String::new();
+        if !self.drives_boot_display() {
+            return String::from(
+                "[gpucefill] SKIPPED on secondary GPU (it has no scanout framebuffer)\n",
+            );
+        }
+        let device_instance = match *self.rm_device_instance.lock() {
+            Some(d) => d,
+            None => {
+                return String::from(
+                    "[gpucefill] skipped: console GPU not state-loaded -- run `cat /proc/gpustep14` first\n",
+                );
+            }
+        };
+        let fb_phys = match boot_fb_phys() {
+            Some(p) if p != 0 => p,
+            _ => return String::from("[gpucefill] no boot framebuffer physical address recorded\n"),
+        };
+        let bar1 = self.bar1_phys;
+        if fb_phys < bar1 {
+            let _ = writeln!(
+                s,
+                "[gpucefill] fb_phys {:#x} < bar1_phys {:#x} -- unexpected; aborting (would underflow the VRAM offset)",
+                fb_phys, bar1
+            );
+            return s;
+        }
+        let fb_vram_offset = fb_phys - bar1;
+        let size = (self.info.pitch as u64) * (self.info.height as u64);
+        // Low byte replicated by the CE: 0xFF -> every byte 0xFF -> white.
+        let pattern: u32 = 0x0000_00FF;
+        let _ = writeln!(
+            s,
+            "[gpucefill] fb_phys={:#x} bar1_phys={:#x} => fb_vram_offset={:#x}  size={:#x} ({}x{} pitch {})  pattern={:#x} (low byte -> white)",
+            fb_phys, bar1, fb_vram_offset, size, self.info.width, self.info.height, self.info.pitch, pattern
+        );
+        let st = nvidia_rm_sys::rm_init::ce_fill_fb(device_instance, fb_vram_offset, size, pattern);
+        let _ = writeln!(
+            s,
+            "[gpucefill] ce_fill_fb -> {:#x} ({})",
+            st,
+            if st == 0 {
+                "OK -- if the screen is now WHITE, the VRAM offset is correct and the CE drives the display"
+            } else {
+                "FAILED -- CE submit did not complete"
+            }
+        );
+        s
+    }
+
     /// `/proc/gpusurvive`: read + clear the CMOS survival breadcrumb from the
     /// previous console-GPU boot attempt. Only the console GPU reports (it is
     /// the one that wedges, and the breadcrumb is global — a second reader would
