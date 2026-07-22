@@ -179,8 +179,31 @@ impl LinuxElfLoader {
         if let Ok(interp) = elf.get_interpreter() {
             info!("interp: {:?}, path: {:?}", interp, path);
 
-            // Load the main program into the first sub-VMAR (allocated at offset 0 in an
-            // empty address space, so app_base is typically 0 for a non-PIE binary).
+            // A PIE (ET_DYN) executable bases its LOAD segments at vaddr 0.
+            // Loading one at VMAR offset 0 maps its first page — and the whole
+            // low range including the null page — at address 0. That breaks the
+            // null-pointer-faults invariant that libc and allocators such as
+            // Firefox's mozjemalloc rely on, and puts AT_PHDR at a near-null
+            // address. Reserve the low range with a guard sub-VMAR so the
+            // program, interpreter, mmap and stack all load above it and any
+            // access below it faults, matching Linux's non-zero PIE load base.
+            // A non-PIE (ET_EXEC) binary already carries high absolute vaddrs
+            // (0x400000+ on x86-64), so it needs no bias and gets none.
+            const PIE_LOAD_BASE: usize = 0x40_0000;
+            let is_pie =
+                elf.header.pt2.type_().as_type() == xmas_elf::header::Type::SharedObject;
+            if is_pie {
+                vmar.allocate_at(0, PIE_LOAD_BASE, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
+                    .map_err(|e| {
+                        error!("elf: reserve PIE low-address guard failed: {:?}", e);
+                        e
+                    })?;
+            }
+
+            // Load the main program into the first free sub-VMAR. With the PIE
+            // guard in place this lands at PIE_LOAD_BASE; for a non-PIE binary
+            // there is no guard and app_base is 0 (segments carry their own
+            // absolute vaddrs).
             let app_size = elf.load_segment_size();
             let app_vmar = vmar
                 .allocate(None, app_size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
