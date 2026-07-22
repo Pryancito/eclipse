@@ -1,11 +1,78 @@
 //! Time and clock functions.
 
 use alloc::boxed::Box;
+use alloc::collections::BinaryHeap;
+use alloc::vec::Vec;
+use core::cmp::Ordering as CmpOrdering;
 use core::convert::TryFrom;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 use lock::Mutex;
-use naive_timer::Timer;
+
+/// A pending timer event: its absolute deadline and the callback to run.
+///
+/// Ordered so the [`BinaryHeap`] (a max-heap) yields the *earliest* deadline
+/// first — `cmp` is reversed on `deadline`.
+struct TimerEvent {
+    deadline: Duration,
+    callback: Box<dyn FnOnce(Duration) + Send + Sync + 'static>,
+}
+
+impl PartialEq for TimerEvent {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline.eq(&other.deadline)
+    }
+}
+impl Eq for TimerEvent {}
+impl PartialOrd for TimerEvent {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for TimerEvent {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        // Reverse so the min-deadline is at the top of the max-heap.
+        other.deadline.cmp(&self.deadline)
+    }
+}
+
+/// A minimal timer heap.
+///
+/// Unlike `naive_timer::Timer`, whose `expire()` runs every due callback
+/// *inline while the heap is borrowed*, this type separates draining from
+/// invoking: [`Self::drain_expired`] pops the due events and returns their
+/// callbacks so the caller can drop the `NAIVE_TIMER` lock BEFORE running
+/// them. That is essential here — timer callbacks re-arm periodic timers by
+/// calling `timer_set`, which re-locks `NAIVE_TIMER`; running them under the
+/// lock is a same-CPU re-entrant self-deadlock (see `timer_tick`).
+#[derive(Default)]
+struct TimerHeap {
+    events: BinaryHeap<TimerEvent>,
+}
+
+impl TimerHeap {
+    fn add(&mut self, deadline: Duration, callback: Box<dyn FnOnce(Duration) + Send + Sync + 'static>) {
+        self.events.push(TimerEvent { deadline, callback });
+    }
+
+    /// Deadline of the earliest pending timer, if any.
+    fn next(&self) -> Option<Duration> {
+        self.events.peek().map(|e| e.deadline)
+    }
+
+    /// Pop all events whose deadline is `<= now`, returning their callbacks.
+    /// The heap lock can then be released before the callbacks are invoked.
+    fn drain_expired(&mut self, now: Duration) -> Vec<Box<dyn FnOnce(Duration) + Send + Sync + 'static>> {
+        let mut ready = Vec::new();
+        while let Some(t) = self.events.peek() {
+            if t.deadline > now {
+                break;
+            }
+            ready.push(self.events.pop().unwrap().callback);
+        }
+        ready
+    }
+}
 
 /// Timer interrupt frequency in Hz.
 /// 250 Hz gives a 4 ms tick granularity — a good balance between
@@ -40,7 +107,7 @@ const TICKLESS_IDLE: bool = false;
 const IDLE_TICK_CAP_NS: u64 = 50_000_000;
 
 lazy_static::lazy_static! {
-    static ref NAIVE_TIMER: Mutex<Timer> = Mutex::new(Timer::default());
+    static ref NAIVE_TIMER: Mutex<TimerHeap> = Mutex::new(TimerHeap::default());
 }
 
 /// Offset (in nanoseconds) added to monotonic boot time for
@@ -164,10 +231,22 @@ hal_fn_impl! {
             if duration_to_ns(now) < NEXT_DEADLINE_NS.load(Ordering::Acquire) {
                 return;
             }
-            let mut t = NAIVE_TIMER.lock();
-            t.expire(now);
-            let next = t.next().map(duration_to_ns).unwrap_or(u64::MAX);
-            NEXT_DEADLINE_NS.store(next, Ordering::Release);
+            // Drain the due callbacks and republish the next deadline while
+            // holding the lock, then RELEASE it before invoking them. Running a
+            // callback under the lock would deadlock: periodic timers (POSIX
+            // timers, timerfd) re-arm themselves by calling `timer_set`, which
+            // re-locks `NAIVE_TIMER` on this same CPU. Dropping the guard first
+            // makes that re-entrancy safe.
+            let expired = {
+                let mut t = NAIVE_TIMER.lock();
+                let expired = t.drain_expired(now);
+                let next = t.next().map(duration_to_ns).unwrap_or(u64::MAX);
+                NEXT_DEADLINE_NS.store(next, Ordering::Release);
+                expired
+            };
+            for callback in expired {
+                callback(now);
+            }
         }
 
         fn timer_idle_enter() {
