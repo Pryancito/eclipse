@@ -25,12 +25,25 @@ fn loopback_tx_handler(packet: &[u8]) {
         packet.len()
     );
     let ethertype = if version == 6 { 0x86ddu16 } else { 0x0800u16 };
-    const FRAME_CAP: usize = 2048;
-    let payload_len = packet.len().min(FRAME_CAP.saturating_sub(14));
-    let mut eth_frame = [0u8; FRAME_CAP];
+    // Size the ethernet frame to the actual packet. The old fixed 2 KiB stack
+    // buffer truncated any IP packet larger than 2034 bytes, but loopback has a
+    // large MTU; a truncated frame whose IP header still advertises the full
+    // length is malformed and fails checksum/parse (or loses data) on the RX
+    // side. `kernel_vec_zeroed` caps at MAX_KERNEL_VEC and is fallible, so an
+    // oversized packet is dropped rather than truncated.
+    let mut eth_frame = match kernel_vec_zeroed(14 + packet.len()) {
+        Ok(v) => v,
+        Err(_) => {
+            warn!(
+                "[loopback tx] frame alloc failed for {} bytes, dropping",
+                packet.len()
+            );
+            return;
+        }
+    };
     eth_frame[12..14].copy_from_slice(&ethertype.to_be_bytes());
-    eth_frame[14..14 + payload_len].copy_from_slice(&packet[..payload_len]);
-    packet::push_packet(&eth_frame[..14 + payload_len]);
+    eth_frame[14..].copy_from_slice(packet);
+    packet::push_packet(&eth_frame);
 }
 
 /// Global initialization for the network stack.
