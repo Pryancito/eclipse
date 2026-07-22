@@ -855,6 +855,84 @@ impl NvidiaGpu {
         }
     }
 
+    /// This GPU's PCI config-space location (Eclipse is single-segment, so
+    /// domain is dropped; RM only ever runs function 0 of the GPU).
+    fn cfg_loc(&self) -> pci::Location {
+        pci::Location {
+            bus: self.pci_bus,
+            device: self.pci_device,
+            function: 0,
+        }
+    }
+
+    fn cfg_read16(&self, off: u16) -> u16 {
+        unsafe { crate::bus::pci::PCI_ACCESS.read16(&crate::bus::pci::PortOpsImpl, self.cfg_loc(), off) }
+    }
+
+    fn cfg_read32(&self, off: u16) -> u32 {
+        unsafe { crate::bus::pci::PCI_ACCESS.read32(&crate::bus::pci::PortOpsImpl, self.cfg_loc(), off) }
+    }
+
+    fn cfg_write16(&self, off: u16, val: u16) {
+        unsafe {
+            crate::bus::pci::PCI_ACCESS.write16(&crate::bus::pci::PortOpsImpl, self.cfg_loc(), off, val)
+        }
+    }
+
+    /// Offset of the PCI Express capability (cap id 0x10) in config space, or
+    /// 0 if the function has none. Walks the standard capabilities list.
+    fn pcie_cap_offset(&self) -> u8 {
+        // Status register (0x06) bit 4 = capabilities list present.
+        if self.cfg_read16(0x06) & (1 << 4) == 0 {
+            return 0;
+        }
+        let mut ptr = (self.cfg_read16(0x34) & 0xFC) as u8; // capabilities pointer
+        let mut guard = 0;
+        while ptr != 0 && guard < 48 {
+            let hdr = self.cfg_read16(ptr as u16);
+            if (hdr & 0xFF) as u8 == 0x10 {
+                return ptr;
+            }
+            ptr = ((hdr >> 8) & 0xFC) as u8; // next-capability pointer
+            guard += 1;
+        }
+        0
+    }
+
+    /// Issue a PCIe Function Level Reset on this GPU. Returns true if issued.
+    /// Follows the PCIe spec: confirm FLR capability, wait for pending
+    /// transactions to drain, set Initiate FLR, then wait 100 ms for the reset
+    /// to complete. Config state is intentionally NOT restored -- the caller
+    /// resets the CPU immediately after, so the GPU only has to survive to the
+    /// next firmware POST, which re-inits it from cold.
+    fn pcie_flr(&self) -> bool {
+        let cap = self.pcie_cap_offset();
+        if cap == 0 {
+            return false;
+        }
+        // Device Capabilities (cap+0x04) bit 28 = Function Level Reset capable.
+        if self.cfg_read32((cap as u16) + 0x04) & (1 << 28) == 0 {
+            return false;
+        }
+        // Wait (bounded) for Transactions Pending (Device Status cap+0x0A bit 5).
+        let t0 = unsafe { crate::bus::drivers_timer_now_as_micros() };
+        while self.cfg_read16((cap as u16) + 0x0A) & (1 << 5) != 0 {
+            if unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(t0) > 100_000 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        // Set Initiate FLR (Device Control cap+0x08 bit 15).
+        let devctl = self.cfg_read16((cap as u16) + 0x08);
+        self.cfg_write16((cap as u16) + 0x08, devctl | (1 << 15));
+        // PCIe requires up to 100 ms before the function is usable again.
+        let t1 = unsafe { crate::bus::drivers_timer_now_as_micros() };
+        while unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(t1) < 100_000 {
+            core::hint::spin_loop();
+        }
+        true
+    }
+
     fn imported_handle(&self, handle_id: u32) -> Option<ImportedGemHandle> {
         self.imported_handles
             .lock()
@@ -3877,6 +3955,30 @@ impl DrmScheme for NvidiaGpu {
                 self.pci_bus,
                 self.pci_device,
                 self.gpu_model,
+            )
+        }
+    }
+
+    /// Leave this GPU cold for the next firmware POST (see the `DrmScheme`
+    /// trait doc). Only a GPU we actually state-loaded carries a live GSP-RM /
+    /// locked WPR2 that a warm reboot would strand; others are no-ops. Issues a
+    /// PCIe Function Level Reset, which on Turing resets the engines and
+    /// falcons and lets the next VBIOS devinit re-run cleanly.
+    fn quiesce_for_reboot(&self) -> String {
+        if self.rm_device_instance.lock().is_none() {
+            return String::new();
+        }
+        if self.pcie_flr() {
+            alloc::format!(
+                "[gpureset] FLR emitido en {:02x}:{:02x}.0 (estado limpio para el POST)\n",
+                self.pci_bus,
+                self.pci_device,
+            )
+        } else {
+            alloc::format!(
+                "[gpureset] {:02x}:{:02x}.0 sin capacidad FLR; GPU sin resetear\n",
+                self.pci_bus,
+                self.pci_device,
             )
         }
     }

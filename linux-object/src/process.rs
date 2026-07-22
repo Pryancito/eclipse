@@ -1500,7 +1500,48 @@ pub fn send_signal_to_all_processes(signal: LinuxSignal) -> LxResult<()> {
     }
 }
 
-/// Check for pending signals and return EINTR if any.
+/// Whether a pending signal actually interrupts a blocking syscall.
+///
+/// Linux only interrupts a syscall for a signal that will run a handler or
+/// terminate the process. A signal whose disposition is *ignore* — `SIG_IGN`,
+/// or `SIG_DFL` for a signal whose default action is ignore/stop (SIGCHLD,
+/// SIGURG, SIGWINCH, SIGCONT, and the job-control stops this kernel maps to
+/// ignore in `handle_signal`) — is discarded and must NOT wake a blocking
+/// syscall with `EINTR`.
+///
+/// Returning `EINTR` for these was the bug behind a compositor's libinput
+/// dispatch failing with "Interrupted system call": every time an autostart
+/// child exited (or crashed) and raised SIGCHLD, the parent's blocking
+/// `ppoll`/`epoll_pwait` returned `EINTR`, which wlroots treats as a fatal
+/// dispatch error. The disposition list here mirrors the default-ignore set in
+/// `handle_signal` (loader/src/linux.rs) so the two agree on what is a no-op.
+fn signal_interrupts_syscall(proc_linux: &LinuxProcess, sig: LinuxSignal) -> bool {
+    use crate::signal::{SIG_DFL, SIG_IGN};
+    let handler = proc_linux.signal_action(sig).handler;
+    if handler == SIG_IGN {
+        return false;
+    }
+    if handler == SIG_DFL {
+        return !matches!(
+            sig,
+            LinuxSignal::SIGCHLD
+                | LinuxSignal::SIGURG
+                | LinuxSignal::SIGWINCH
+                | LinuxSignal::SIGCONT
+                | LinuxSignal::SIGSTOP
+                | LinuxSignal::SIGTSTP
+                | LinuxSignal::SIGTTIN
+                | LinuxSignal::SIGTTOU
+        );
+    }
+    // A caught signal (custom handler) interrupts the syscall.
+    true
+}
+
+/// Check for pending signals and return EINTR if any *deliverable* signal
+/// would interrupt the syscall. Signals whose disposition is ignore (SIG_IGN /
+/// default-ignore, e.g. SIGCHLD) are skipped — matching Linux, where an ignored
+/// signal is discarded and never returns EINTR from a blocking syscall.
 pub fn check_signals() -> LxResult<()> {
     if let Some(arc) = kernel_hal::thread::get_current_thread() {
         if let Ok(thread) = arc.downcast::<Thread>() {
@@ -1512,10 +1553,23 @@ pub fn check_signals() -> LxResult<()> {
             if matches!(thread.proc().status(), Status::Exited(_)) {
                 return Err(LxError::EINTR);
             }
-            let linux_thread = thread.lock_linux();
-            let pending = linux_thread.signals.mask_with(&linux_thread.signal_mask);
+            // Snapshot the deliverable (unblocked) pending signals, then drop the
+            // per-thread lock before consulting the per-process disposition table
+            // (a different lock) to avoid nesting the two.
+            let pending = {
+                let linux_thread = thread.lock_linux();
+                linux_thread.signals.mask_with(&linux_thread.signal_mask)
+            };
             if pending.is_not_empty() {
-                return Err(LxError::EINTR);
+                let proc = thread.proc();
+                let proc_linux = proc.linux();
+                let mut rest = pending;
+                while let Some(sig) = rest.find_first_signal() {
+                    rest.remove(sig);
+                    if signal_interrupts_syscall(proc_linux, sig) {
+                        return Err(LxError::EINTR);
+                    }
+                }
             }
         }
     }
