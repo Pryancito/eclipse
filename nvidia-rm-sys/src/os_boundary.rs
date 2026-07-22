@@ -1102,10 +1102,15 @@ pub extern "C" fn osDevWriteReg032(
                     // Same register, SYS/VF interrupt fabric: honors the
                     // hard no-DISP/no-PBUS/no-PPRIV critical-window rule.
                     let _settle = core::ptr::read_volatile(base.add(l4_off) as *const NvU32);
+                    // Survival breadcrumb: record "about to STARTCPU" to CMOS
+                    // (GPU-independent) immediately before the posted store, so a
+                    // wedge here is legible on the next boot via /proc/gpusurvive.
+                    crate::survival::checkpoint(crate::survival::milestone::STARTCPU_PRE);
                     core::ptr::write_volatile(
                         base.add(this_address as usize) as *mut NvU32,
                         this_value,
                     );
+                    crate::survival::checkpoint(crate::survival::milestone::STARTCPU_POST);
                 }
                 // EXP1d: CPU-side re-anchor of the EXP1c PDISP restore. The
                 // old trigger ("RISCV started" narration) NEVER fired -- that
@@ -1122,6 +1127,7 @@ pub extern "C" fn osDevWriteReg032(
                 // resuming scanout at +15 ms re-triggers the hazard.
                 crate::hooks::with_hooks((), |h| h.delay_us(15_000));
                 pdisp_restore();
+                crate::survival::checkpoint(crate::survival::milestone::PDISP_RESTORE);
                 // Post-store SILENT fabric watch (wedge containment). ZERO
                 // MMIO and ZERO logging here -- if the fabric wedged, any
                 // BAR0/BAR1 access (a log line renders into this GPU's BAR1
@@ -1168,9 +1174,18 @@ pub extern "C" fn osDevWriteReg032(
     }
     if !startcpu_posted {
         if let Some(base) = dev_mapping_base(pMapping) {
+            // Breadcrumb only for the STARTCPU store (never per-register — a CMOS
+            // write per MMIO would be ruinous); the non-drain path (Linux-parity
+            // etc.) still hits the same wedge point.
+            if is_sec2_startcpu {
+                crate::survival::checkpoint(crate::survival::milestone::STARTCPU_PRE);
+            }
             unsafe {
                 core::ptr::write_volatile(base.add(this_address as usize) as *mut NvU32, this_value)
             };
+            if is_sec2_startcpu {
+                crate::survival::checkpoint(crate::survival::milestone::STARTCPU_POST);
+            }
         }
         // EXP1d for the non-drain STARTCPU paths (parity mode etc.): same
         // CPU-side restore anchor; pdisp_restore() is a no-op unless the

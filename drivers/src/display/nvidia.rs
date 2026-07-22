@@ -416,18 +416,6 @@ fn rm_core_init_once() -> u32 {
     s
 }
 
-/// When set, the console-GPU GSP boot quiesces the display engine (PDISP held
-/// in reset via the EXP1c/1d machinery in os_boundary) across the SEC2 HS-resume
-/// window, then restores it +15 ms after the STARTCPU store. This removes the
-/// live isochronous-scanout underflow — the SYS<->DISP fabric hazard that stalls
-/// the posted STARTCPU write and wedges the console GPU on ~1/3 of boots (the
-/// tight-W1C interrupt bracket only fights the symptom at the CPU leaf, where
-/// the display underflow re-asserts within microseconds). Armed only by
-/// `/proc/gpustep14q` so its reliability can be A/B-measured against the
-/// un-quiesced `/proc/gpustep14` without changing the existing path.
-static CONSOLE_PDISP_QUIESCE: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
 #[derive(Debug, Clone, Copy)]
 struct BootFbInfo {
     phys: u64,
@@ -1673,22 +1661,13 @@ impl NvidiaGpu {
                 // ~25-30% per-boot race into up to 3 chances per boot.
                 if drain_for_console {
                     nvidia_rm_sys::os_boundary::wedge_watch_arm(self.config_handle());
-                }
-                // Root-cause mitigation (opt-in via /proc/gpustep14q): quiesce the
-                // display engine across the SEC2 HS-resume window. The un-serviced
-                // isochronous-scanout underflow is the live LEVEL source whose
-                // DISP<->SYS fabric backpressure stalls the posted STARTCPU write;
-                // holding PDISP in reset for the ~µs resume window (restored +15 ms
-                // later, before GSP-RM's own display StateInit) removes the hazard
-                // at its origin instead of racing the CPU interrupt leaf. Arm only
-                // for the console GPU (the only one scanning out).
-                if drain_for_console
-                    && CONSOLE_PDISP_QUIESCE.load(core::sync::atomic::Ordering::Relaxed)
-                {
-                    nvidia_rm_sys::os_boundary::pdisp_kill_arm();
-                    log::error!(
-                        "[NVIDIA] {}: PDISP-quiesce armed for the SEC2-resume window (gpustep14q experiment)",
-                        tag
+                    // GPU-independent survival breadcrumb: mark that a console
+                    // boot began and zero the RM narration counter, so a wedge
+                    // is legible next boot via /proc/gpusurvive even if nothing
+                    // else survives (no serial, no /proc, dark framebuffer).
+                    nvidia_rm_sys::survival::reset_narration();
+                    nvidia_rm_sys::survival::checkpoint(
+                        nvidia_rm_sys::survival::milestone::INITRM_CALL,
                     );
                 }
                 let mut recovery_log = String::new();
@@ -1723,6 +1702,13 @@ impl NvidiaGpu {
                     }
                 };
                 nvidia_rm_sys::os_boundary::wedge_watch_disarm();
+                if drain_for_console {
+                    // Past kgspInitRm (OK or a clean NV_STATUS) — so any freeze
+                    // recorded from here on was NOT the SEC2-window wedge.
+                    nvidia_rm_sys::survival::checkpoint(
+                        nvidia_rm_sys::survival::milestone::INITRM_RETURN,
+                    );
+                }
                 if quiet && drain_for_console {
                     nvidia_rm_sys::os_interface::console_quiet_end();
                     log::error!(
@@ -1733,7 +1719,6 @@ impl NvidiaGpu {
                 if drain_for_console {
                     nvidia_rm_sys::os_boundary::linux_parity_disarm();
                     nvidia_rm_sys::os_boundary::sec2_drain_disarm();
-                    nvidia_rm_sys::os_boundary::pdisp_kill_disarm();
                 }
                 nvidia_rm_sys::os_boundary::seq_trace_disarm();
                 let captured = nvidia_rm_sys::os_interface::capture_take();
@@ -3761,27 +3746,16 @@ impl DrmScheme for NvidiaGpu {
         s
     }
 
-    /// Step 14q (`/proc/gpustep14q`): the full console-GPU bring-up chain, but
-    /// with the PDISP-quiesce root-cause mitigation armed for the SEC2-resume
-    /// window (see `CONSOLE_PDISP_QUIESCE`). Run this on a FRESH boot instead of
-    /// `/proc/gpustep14` to measure whether quiescing the display engine across
-    /// the SEC2 HS-resume window makes the console GSP boot reliable (target:
-    /// 3/3 vs the un-quiesced ~2/3). If the boot instead reports a display init
-    /// failure (e.g. NV04_DISPLAY_COMMON 0x22), the +15 ms restore mistimed and
-    /// GSP-RM found PDISP still down — that is the tuning signal, not a wedge.
-    fn bringup_step14_quiesce(&self) -> String {
-        if !self.drives_boot_display() {
-            return String::from(
-                "[gpustep14q] SKIPPED on secondary GPU (PDISP-quiesce is console-only)\n",
-            );
+    /// `/proc/gpusurvive`: read + clear the CMOS survival breadcrumb from the
+    /// previous console-GPU boot attempt. Only the console GPU reports (it is
+    /// the one that wedges, and the breadcrumb is global — a second reader would
+    /// just see the already-cleared slate).
+    fn survival_report(&self) -> String {
+        if self.drives_boot_display() {
+            nvidia_rm_sys::survival::read_report_and_clear()
+        } else {
+            String::new()
         }
-        CONSOLE_PDISP_QUIESCE.store(true, core::sync::atomic::Ordering::Relaxed);
-        let mut s = String::from(
-            "[gpustep14q] === CONSOLE GPU full bring-up WITH PDISP-quiesce across the SEC2-resume window ===\n",
-        );
-        s.push_str(&self.bringup_step14());
-        CONSOLE_PDISP_QUIESCE.store(false, core::sync::atomic::Ordering::Relaxed);
-        s
     }
 
     /// Step 15 (`/proc/gpustep15`): probe the GR (graphics/compute) engine's

@@ -42,7 +42,6 @@ const PROC_ROOT_STATIC: [&str; 41] = [
     "gpustep12",
     "gpustep13",
     "gpustep14",
-    "gpustep14q",
     "gpustep15",
     "gpustep16",
     "gpustep17",
@@ -56,6 +55,7 @@ const PROC_ROOT_STATIC: [&str; 41] = [
     "gpuinit",
     "gpubench",
     "gpuedid",
+    "gpusurvive",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -343,7 +343,6 @@ impl INode for ProcRootINode {
             "gpustep12" => Ok(PROC_GPUSTEP12.clone()),
             "gpustep13" => Ok(PROC_GPUSTEP13.clone()),
             "gpustep14" => Ok(PROC_GPUSTEP14.clone()),
-            "gpustep14q" => Ok(PROC_GPUSTEP14Q.clone()),
             "gpustep15" => Ok(PROC_GPUSTEP15.clone()),
             "gpustep16" => Ok(PROC_GPUSTEP16.clone()),
             "gpustep17" => Ok(PROC_GPUSTEP17.clone()),
@@ -356,6 +355,7 @@ impl INode for ProcRootINode {
             "gpuinit" => Ok(PROC_GPUINIT.clone()),
             "gpubench" => Ok(PROC_GPUBENCH.clone()),
             "gpuedid" => Ok(PROC_GPUEDID.clone()),
+            "gpusurvive" => Ok(PROC_GPUSURVIVE.clone()),
             "gpudump" => Ok(PROC_GPUDUMP.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
@@ -1320,22 +1320,6 @@ fn proc_gpustep14_content() -> String {
     s
 }
 
-/// `/proc/gpustep14q` — CONSOLE GPU full bring-up (same chain as gpustep14) but
-/// with the PDISP-quiesce root-cause mitigation armed across the SEC2 HS-resume
-/// window. Run on a FRESH boot to measure whether quiescing the display engine
-/// makes the console GSP boot reliable (target 3/3 vs gpustep14's ~2/3). Capture
-/// with `cat /proc/gpustep14q > /r14q.txt; sync`.
-fn proc_gpustep14q_content() -> String {
-    let mut s = String::new();
-    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-        s.push_str(&d.bringup_step14_quiesce());
-    }
-    if s.is_empty() {
-        s.push_str("[gpustep14q] no DRM driver with bring-up support\n");
-    }
-    s
-}
-
 /// `/proc/gpustep15` — GR (graphics/compute) engine GPC/TPC/SM config probe on
 /// a state-loaded GPU, via the live GSP-RM. Read-only, repeatable.
 fn proc_gpustep15_content() -> String {
@@ -1509,6 +1493,22 @@ fn proc_gpuedid_content() -> String {
     }
     if s.is_empty() {
         s.push_str("[gpuedid] no DRM driver with display support\n");
+    }
+    s
+}
+
+/// `/proc/gpusurvive` — read + clear the CMOS survival breadcrumb from the
+/// previous console-GPU GSP-boot attempt. On a serial-less box this is the only
+/// thing that outlives a SEC2-window wedge (the CPU hangs; the CMOS NVRAM keeps
+/// the last milestone + RM narration count across the reboot). Safe/instant:
+/// two port I/O reads, no GPU, no bring-up. Reading it clears the breadcrumb.
+fn proc_gpusurvive_content() -> String {
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.survival_report());
+    }
+    if s.is_empty() {
+        s.push_str("[gpusurvive] no console DRM driver present to read the breadcrumb\n");
     }
     s
 }
@@ -1880,12 +1880,6 @@ lazy_static! {
         inode: 85,
         generate: proc_gpustep14_content,
     });
-    /// `/proc/gpustep14q` -- console GPU full bring-up WITH PDISP-quiesce across
-    /// the SEC2-resume window (see proc_gpustep14q_content).
-    static ref PROC_GPUSTEP14Q: Arc<dyn INode> = Arc::new(ProcSeqINode {
-        inode: 82,
-        generate: proc_gpustep14q_content,
-    });
     /// `/proc/gpustep15` -- GR engine GPC/TPC/SM config probe (see
     /// proc_gpustep15_content).
     static ref PROC_GPUSTEP15: Arc<dyn INode> = Arc::new(ProcSeqINode {
@@ -1951,6 +1945,12 @@ lazy_static! {
     static ref PROC_GPUEDID: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 103,
         generate: proc_gpuedid_content,
+    });
+    /// `/proc/gpusurvive` -- CMOS survival breadcrumb from the previous
+    /// console-GPU boot attempt (see proc_gpusurvive_content).
+    static ref PROC_GPUSURVIVE: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 104,
+        generate: proc_gpusurvive_content,
     });
     /// `/proc/gpudump` -- read-only discriminating HW dump, both GPUs (see
     /// proc_gpudump_content).

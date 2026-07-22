@@ -207,10 +207,12 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
-    /// Bring-up **Step 14q** (`/proc/gpustep14q`): the full console-GPU bring-up
-    /// chain with the PDISP-quiesce root-cause mitigation armed across the SEC2
-    /// HS-resume window, for measuring console-boot reliability vs step 14.
-    fn bringup_step14_quiesce(&self) -> alloc::string::String {
+    /// Read back (and clear) the CMOS survival breadcrumb the previous
+    /// console-GPU boot attempt left, surfaced at `/proc/gpusurvive`. On a box
+    /// with no serial, this is how a SEC2-window wedge is diagnosed: the CPU
+    /// hangs and nothing else survives, but the CMOS NVRAM keeps the last
+    /// milestone + RM narration count across the reboot. Default: nothing.
+    fn survival_report(&self) -> alloc::string::String {
         alloc::string::String::new()
     }
 
