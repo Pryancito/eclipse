@@ -309,6 +309,42 @@ mod drivers_ffi {
 
     #[no_mangle]
     extern "C" fn drivers_dma_dealloc(paddr: PhysAddr, pages: usize) -> i32 {
+        // Restore the kernel-physmap mapping of every page to the default
+        // cacheable (WB) state BEFORE returning it to the general frame pool.
+        // `drivers_dma_mark_uncached` flips these PTEs to UC for DMA buffers
+        // (NIC rings, the NVIDIA RM's UNCACHED sysmem allocs); without this
+        // restore, a freed page re-enters the pool with a poisoned UC kernel
+        // alias. The next owner (a userspace VMO page, mapped WB in the user's
+        // page table) then has two aliases with CONFLICTING memory types —
+        // architecturally undefined on x86 — and every kernel access through
+        // the physmap (e.g. `PhysFrame::zero()` on commit) goes uncached
+        // underneath the user's cached view. Stale dirty lines evicting later
+        // silently overwrite the new owner's data: random SIGSEGVs in fresh
+        // processes while old ones stay healthy.
+        {
+            use crate::vm::{GenericPageTable, PageTable};
+            use crate::{CachePolicy, MMUFlags};
+            let vaddr_base = paddr + KCONFIG.phys_to_virt_offset;
+            let mut pt = PageTable::from_current();
+            for i in 0..pages {
+                let va = vaddr_base + i * PAGE_SIZE;
+                if let Ok((_, flags, _)) = pt.query(va) {
+                    if flags.bits() & 3 != CachePolicy::Cached as usize {
+                        // Flush any lines for this physical page first (lines are
+                        // physically tagged, so flushing via this alias covers
+                        // every mapping), then re-flag the PTE WB.
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            for line in (0..PAGE_SIZE).step_by(64) {
+                                core::arch::x86_64::_mm_clflush((va + line) as *const u8);
+                            }
+                        }
+                        let _ = pt.update(va, None, Some(MMUFlags::READ | MMUFlags::WRITE));
+                    }
+                }
+            }
+            core::mem::forget(pt);
+        }
         for i in 0..pages {
             KHANDLER.frame_dealloc(paddr + i * PAGE_SIZE);
         }
@@ -335,10 +371,38 @@ mod drivers_ffi {
         for i in 0..pages {
             let va = vaddr + i * PAGE_SIZE;
             match pt.query(va) {
-                Ok((pa, _, _)) => {
-                    if let Err(e) = pt.update(va, Some(pa), Some(flags)) {
+                Ok((_, _, size)) => {
+                    // Refuse to re-flag an entry bigger than the page we were
+                    // asked about: `update` writes the flags of WHATEVER entry
+                    // covers `va`, so on a huge-mapped region it would turn the
+                    // whole 2M/1G window UC — poisoning frames owned by other
+                    // subsystems/processes. (The x86_64 physmap is 4K-mapped by
+                    // rboot, so this only guards future/other-arch layouts.)
+                    if size as usize != PAGE_SIZE {
+                        trace!(
+                            "drivers_dma_mark_uncached: {:#x} covered by a {:?} entry; refusing",
+                            va,
+                            size
+                        );
+                        return -1;
+                    }
+                    // Never pass a paddr here: `update` would `set_addr` the
+                    // entry, and `query` returns the offset-adjusted physical
+                    // address — harmlessly redundant for a 4K entry, but a
+                    // catastrophic repoint should a huge entry ever slip
+                    // through. Flags-only is all this function means.
+                    if let Err(e) = pt.update(va, None, Some(flags)) {
                         trace!("drivers_dma_mark_uncached: update {:#x} failed {:?}", va, e);
                         return -1;
+                    }
+                    // WB -> UC transition: flush any cached lines for this page
+                    // (physically tagged, so this alias covers all mappings) so
+                    // no stale dirty line can later evict on top of device DMA.
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        for line in (0..PAGE_SIZE).step_by(64) {
+                            core::arch::x86_64::_mm_clflush((va + line) as *const u8);
+                        }
                     }
                 }
                 Err(_) => {
