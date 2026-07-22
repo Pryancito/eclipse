@@ -3,7 +3,13 @@
 ARCH ?= x86_64
 PLATFORM ?= qemu
 MODE ?= release
-LOG ?= error
+# warn (not error): the kernel routes its userspace-crash diagnostics through
+# log::warn! — the "unhandled page fault ... -> SIGSEGV" line plus the [crash]
+# dump of registers and the code bytes around the faulting PC (loader/src/
+# linux.rs). LOG=error discarded ALL of that, so a segfaulting client (e.g.
+# foot exiting rc=139) left nothing in dmesg to diagnose it with. Overridable:
+# `make ... LOG=error` for a quiet build.
+LOG ?= warn
 ifeq ($(ARCH), x86_64)
 # Alpine SFS rootfs from `cargo xtask image` needs the linux loader, not userboot/zircon.
 LINUX ?= 1

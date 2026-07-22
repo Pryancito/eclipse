@@ -39,6 +39,26 @@ impl Syscall<'_> {
         Ok(0)
     }
 
+    /// finds the resolution (precision) of the specified clock, and, if the
+    /// buffer is non-NULL, stores it in the struct timespec pointed to by it.
+    /// glibc/musl and some applications (e.g. Firefox) treat a garbage or
+    /// unwritten resolution as a fatal condition, so always fill the struct.
+    pub fn sys_clock_getres(&self, clock: usize, mut buf: UserOutPtr<TimeSpec>) -> SysResult {
+        info!("clock_getres: id={:?} buf={:?}", clock, buf);
+        // Reject unknown clocks the same way clock_gettime does.
+        match clock {
+            0 | 1 | 4 | 5 | 6 | 7 | 2 | 3 => {}
+            _ => return Err(LxError::EINVAL),
+        }
+        if buf.is_null() {
+            return Ok(0);
+        }
+        // We service these clocks from a nanosecond-granularity timer source.
+        let res = TimeSpec { sec: 0, nsec: 1 };
+        buf.write(res)?;
+        Ok(0)
+    }
+
     /// set the time of the clock with id clockid
     pub fn sys_clock_settime(&self, clock: usize, timespec: UserInPtr<TimeSpec>) -> SysResult {
         info!(

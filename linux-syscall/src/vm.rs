@@ -5,15 +5,23 @@ use zircon_object::vm::{pages, roundup_pages, MMUFlags, VmObject, PAGE_SIZE};
 /// Per-call cap for a single `mmap` / `brk` growth. It bounds how much a single
 /// syscall can commit at once (physical frames + per-page VMO metadata).
 ///
-/// This must be larger than the biggest shared library we expect to load in one
-/// `mmap`: the dynamic linker maps a library's whole LOAD span in a single call,
-/// and `libLLVM.so` (pulled in by `perf`) is ~150 MiB — the previous 128 MiB cap
-/// rejected it outright with ENOMEM (surfaced by musl as "Out of memory") long
-/// before the request reached the frame allocator, despite gigabytes being free.
-/// 1 GiB leaves ample headroom for real libraries while still catching runaway
-/// requests; worst-case VMO metadata for a 1 GiB mapping is a few tens of MiB,
-/// comfortably within the kernel heap.
-const MAX_MMAP_LEN: usize = 1024 * 1024 * 1024;
+/// This must be larger than the biggest single-call reservation we expect from
+/// userspace. Two very different consumers push this up:
+///   * the dynamic linker maps a library's whole LOAD span in one call, and
+///     `libLLVM.so` (pulled in by `perf`) is ~150 MiB — the original 128 MiB cap
+///     rejected it outright with ENOMEM (surfaced by musl as "Out of memory")
+///     despite gigabytes being free;
+///   * SpiderMonkey (Firefox's JS engine) reserves its whole JIT executable
+///     region up front as a single `PROT_NONE` anonymous `mmap`. On x86-64 that
+///     reservation is ~1.1 GiB (`MaxCodeBytesPerProcess`), so a 1 GiB cap
+///     bounced it — and, crucially, the early-return did so *silently*, which is
+///     why `js::jit::InitProcessExecutableMemory() failed` fired with no mmap
+///     error in the log. 2 GiB clears the reservation with headroom.
+/// Because anonymous mappings are now demand-paged (see `sys_mmap`), a large
+/// reservation costs only address space plus a sparse per-touched-page frame
+/// entry, not committed RAM — so the cap bounds address-space requests, not
+/// physical footprint.
+const MAX_MMAP_LEN: usize = 2 * 1024 * 1024 * 1024;
 
 /// Syscalls for virtual memory.
 ///
@@ -100,6 +108,14 @@ impl Syscall<'_> {
             addr, len, prot, flags, fd, offset
         );
         if len == 0 || len > MAX_MMAP_LEN {
+            // Log oversized requests: the early-return is the one mmap failure
+            // path with no other trace, and a silently-rejected giant
+            // reservation (e.g. a JIT engine's executable pool) otherwise looks
+            // like a spontaneous userspace crash with nothing in the kernel log.
+            warn!(
+                "mmap: rejecting len={:#x} (cap={:#x}) prot={:?} flags={:?} fd={:?}",
+                len, MAX_MMAP_LEN, prot, flags, fd
+            );
             return Err(LxError::ENOMEM);
         }
         // Linux UAPI: `len` is rounded UP to whole pages by the kernel for
@@ -141,8 +157,30 @@ impl Syscall<'_> {
         let vmar_offset = flags.contains(MmapFlags::FIXED).then(|| addr - vmar.addr());
         if flags.contains(MmapFlags::ANONYMOUS) {
             let vmo = VmObject::new_paged(pages(len));
+            // Demand-page anonymous memory (`map_range = false`) instead of
+            // committing a zero frame for every page up front. Linux mmap does
+            // not commit anonymous pages until first touch, and some programs
+            // rely on that: SpiderMonkey reserves ~1.1 GiB of `PROT_NONE` JIT
+            // address space in a single call and only ever touches the slices
+            // it turns into code — eagerly committing the whole reservation
+            // would burn >1 GiB of RAM (and, before the cap was raised, OOM).
+            // The permission ceiling is RXW so a later `mprotect` can raise a
+            // slice to executable (JIT), matching the file-mapping path. Both
+            // user- and kernel-mode faults on these pages resolve through
+            // `Vmar::handle_page_fault`, so a lazily-mapped buffer handed to a
+            // syscall (e.g. `read`) still faults in correctly on the kernel
+            // store.
             let addr = vmar
-                .map(vmar_offset, vmo.clone(), 0, vmo.len(), prot.to_flags())
+                .map_ext(
+                    vmar_offset,
+                    vmo.clone(),
+                    0,
+                    vmo.len(),
+                    MMUFlags::RXW | MMUFlags::USER,
+                    prot.to_flags(),
+                    false,
+                    false,
+                )
                 .inspect_err(|e| {
                     warn!(
                         "mmap(anon) FAILED: {:?} addr={:#x} len={:#x} prot={:?} flags={:?}",
@@ -176,18 +214,17 @@ impl Syscall<'_> {
                 })?;
                 (vmo, 0)
             };
-            // hunter P1: cap the file-backed mapping's *permission ceiling* to a
-            // W^X-preserving set instead of the old blanket `RXW`, so a later
-            // mprotect cannot turn writable file pages executable. Executable
-            // maps never gain WRITE; non-executable maps may gain WRITE (for
-            // COW / relocations) but never EXECUTE.
-            let mut ceiling = prot.to_flags() | MMUFlags::READ | MMUFlags::USER;
-            if prot.contains(MmapProt::EXEC) {
-                ceiling.remove(MMUFlags::WRITE);
-            } else {
-                ceiling |= MMUFlags::WRITE;
-                ceiling.remove(MMUFlags::EXECUTE);
-            }
+            // Permission ceiling = full RXW: Linux lets mprotect raise a file
+            // mapping to any R/W/X combination, and the dynamic linker relies on
+            // it — ld.so mprotect()s a library's *executable* text segment to RW
+            // to apply text relocations / DT_TEXTREL and to set up GNU_RELRO
+            // (seen with libxul). A W^X-preserving ceiling that strips WRITE from
+            // exec maps made that mprotect fail; the syscall layer then swallowed
+            // the error, leaving GOT entries unrelocated (== 0) and Firefox
+            // crashing on a store through a NULL pointer. W^X is still audited by
+            // hunter::check_mprotect (Report mode by default) — it just isn't
+            // enforced by capping the mapping here.
+            let ceiling = MMUFlags::RXW | MMUFlags::USER;
             // Map without committing the range up front (`map_range = false`):
             // the VMO returned by `get_vmo` is demand-paged from the file, so its
             // pages are read in on the faults that first touch them. Eagerly
