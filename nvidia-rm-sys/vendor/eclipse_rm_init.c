@@ -5228,6 +5228,235 @@ unlock:
 }
 
 /*
+ * eclipse_rm_ce_fill_fb_p2p -- like eclipse_rm_ce_fill_fb, but the destination
+ * is a raw HOST physical address (`dstHostPa`) described as ADDR_SYSMEM instead
+ * of this GPU's own VRAM. Run on the COMPUTE GPU (which boots reliably) with
+ * dstHostPa = the CONSOLE GPU's scanout-FB BAR1 physical address: the compute
+ * GPU's CE then issues PCIe writes to that address, which the fabric routes
+ * peer-to-peer into the console GPU's BAR1 -> its VRAM. This sidesteps the
+ * console GPU's flaky SEC2-resume bring-up entirely. If PCIe P2P is blocked by
+ * the chipset (ACS), the CE still completes but the writes never land (screen
+ * unchanged) -- the empirical test.
+ */
+NV_STATUS eclipse_rm_ce_fill_fb_p2p(
+    NvU32 gpuInstance,
+    NvU64 dstHostPa,
+    NvU64 size,
+    NvU32 pattern)
+{
+    OBJGPU            *pGpu;
+    MemoryManager     *pMemoryManager;
+    MEMORY_DESCRIPTOR *pMemDesc       = NULL;
+    CEUTILS_MEMSET_PARAMS params;
+    NV_STATUS          status;
+    THREAD_STATE_NODE  threadState;
+    GPU_MASK           gpusLockedMask = 0;
+
+    if (size == 0)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pGpu = gpumgrGetGpu(gpuInstance);
+    if (pGpu == NULL || !pGpu->gspRmInitialized || !pGpu->bStateLoaded)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
+    }
+
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    status = rmGpuGroupLockAcquire(pGpu->gpuInstance, GPU_LOCK_GRP_SUBDEVICE,
+                                   GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT,
+                                   &gpusLockedMask);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
+    if (pMemoryManager == NULL || pMemoryManager->pCeUtils == NULL)
+    {
+        nv_printf(0, "[eclipse-rm-trace] ce_fill_fb_p2p: pCeUtils missing (gpuStateLoad incomplete?)\n");
+        status = NV_ERR_OBJECT_NOT_FOUND;
+        goto unlock;
+    }
+
+    /* Destination: a raw host physical address (a peer GPU's BAR1) described as
+     * ADDR_SYSMEM, UNCACHED (it is device MMIO, not cacheable RAM). */
+    status = memdescCreate(&pMemDesc, pGpu, size, 0, NV_TRUE,
+                           ADDR_SYSMEM, NV_MEMORY_UNCACHED, MEMDESC_FLAGS_NONE);
+    if (status != NV_OK)
+    {
+        nv_printf(0, "[eclipse-rm-trace] ce_fill_fb_p2p: memdescCreate -> 0x%x\n", status);
+        goto cleanup;
+    }
+    memdescDescribe(pMemDesc, ADDR_SYSMEM, dstHostPa, size);
+
+    portMemSet(&params, 0, sizeof(params));
+    params.pMemDesc = pMemDesc;
+    params.offset   = 0;
+    params.length   = size;
+    params.pattern  = pattern;
+    params.flags    = 0; /* synchronous */
+    status = ceutilsMemset(pMemoryManager->pCeUtils, &params);
+    nv_printf(0, "[eclipse-rm-trace] ce_fill_fb_p2p: ceutilsMemset(dst_host=0x%llx size=0x%llx pat=0x%x) -> 0x%x\n",
+              dstHostPa, size, pattern, status);
+
+cleanup:
+    if (pMemDesc != NULL)
+    {
+        memdescFree(pMemDesc);
+        memdescDestroy(pMemDesc);
+    }
+
+unlock:
+    rmGpuGroupLockRelease(gpusLockedMask, GPUS_LOCK_FLAGS_NONE);
+    rmapiLockRelease();
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
+}
+
+/*
+ * eclipse_rm_ce_blit_p2p -- like eclipse_rm_ce_blit, but the destination is a
+ * raw HOST physical address (`dstHostPa`, a peer GPU's BAR1) described as
+ * ADDR_SYSMEM. Run on the COMPUTE GPU to copy the compositor dumb buffer
+ * (sysmem RAM) into the CONSOLE GPU's scanout FB via PCIe peer-to-peer, without
+ * bringing up the console GPU. Both memdescs are ADDR_SYSMEM: src = cacheable
+ * RAM, dst = uncacheable peer MMIO.
+ */
+NV_STATUS eclipse_rm_ce_blit_p2p(
+    NvU32 gpuInstance,
+    NvU64 dstHostPa,
+    NvU64 srcSysmemPa,
+    NvU64 size)
+{
+    OBJGPU            *pGpu;
+    MemoryManager     *pMemoryManager;
+    MEMORY_DESCRIPTOR *pSrcMemDesc    = NULL;
+    MEMORY_DESCRIPTOR *pDstMemDesc    = NULL;
+    CEUTILS_MEMCOPY_PARAMS params;
+    NV_STATUS          status;
+    THREAD_STATE_NODE  threadState;
+    GPU_MASK           gpusLockedMask = 0;
+
+    if (size == 0)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pGpu = gpumgrGetGpu(gpuInstance);
+    if (pGpu == NULL || !pGpu->gspRmInitialized || !pGpu->bStateLoaded)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
+    }
+
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    status = rmGpuGroupLockAcquire(pGpu->gpuInstance, GPU_LOCK_GRP_SUBDEVICE,
+                                   GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT,
+                                   &gpusLockedMask);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
+    if (pMemoryManager == NULL || pMemoryManager->pCeUtils == NULL)
+    {
+        nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p: pCeUtils missing (gpuStateLoad incomplete?)\n");
+        status = NV_ERR_OBJECT_NOT_FOUND;
+        goto unlock;
+    }
+
+    /* DST: peer GPU BAR1 host physical address as ADDR_SYSMEM, UNCACHED. */
+    status = memdescCreate(&pDstMemDesc, pGpu, size, 0, NV_TRUE,
+                           ADDR_SYSMEM, NV_MEMORY_UNCACHED, MEMDESC_FLAGS_NONE);
+    if (status != NV_OK)
+    {
+        nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p: DST memdescCreate -> 0x%x\n", status);
+        goto cleanup;
+    }
+    memdescDescribe(pDstMemDesc, ADDR_SYSMEM, dstHostPa, size);
+
+    /* SRC: compositor dumb buffer, cacheable host RAM. */
+    status = memdescCreate(&pSrcMemDesc, pGpu, size, 0, NV_TRUE,
+                           ADDR_SYSMEM, NV_MEMORY_CACHED, MEMDESC_FLAGS_NONE);
+    if (status != NV_OK)
+    {
+        nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p: SRC memdescCreate -> 0x%x\n", status);
+        goto cleanup;
+    }
+    memdescDescribe(pSrcMemDesc, ADDR_SYSMEM, srcSysmemPa, size);
+
+    osFlushCpuWriteCombineBuffer();
+
+    portMemSet(&params, 0, sizeof(params));
+    params.pSrcMemDesc = pSrcMemDesc;
+    params.pDstMemDesc = pDstMemDesc;
+    params.srcOffset   = 0;
+    params.dstOffset   = 0;
+    params.length      = size;
+    params.flags       = 0; /* synchronous */
+    status = ceutilsMemcopy(pMemoryManager->pCeUtils, &params);
+    nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p: ceutilsMemcopy(src=0x%llx dst_host=0x%llx size=0x%llx) -> 0x%x\n",
+              srcSysmemPa, dstHostPa, size, status);
+
+cleanup:
+    if (pDstMemDesc != NULL)
+    {
+        memdescFree(pDstMemDesc);
+        memdescDestroy(pDstMemDesc);
+    }
+    if (pSrcMemDesc != NULL)
+    {
+        memdescFree(pSrcMemDesc);
+        memdescDestroy(pSrcMemDesc);
+    }
+
+unlock:
+    rmGpuGroupLockRelease(gpusLockedMask, GPUS_LOCK_FLAGS_NONE);
+    rmapiLockRelease();
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
+}
+
+/*
  * Console-GPU identity, NVIDIA's own way (osinit.c RmInitNvDevice, run just
  * BEFORE kgspInitRm on Linux -- osinit.c:1831-1862):
  *

@@ -225,6 +225,14 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// P2P CE-offload visual test (`/proc/gpucefillp2p`): from the COMPUTE GPU,
+    /// CE-memset the CONSOLE GPU's scanout framebuffer white over PCIe
+    /// peer-to-peer, to confirm P2P works before relying on it for the present
+    /// path — the via-A route that avoids the flaky console-GPU bring-up.
+    fn bringup_ce_fill_fb_p2p(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Read back (and clear) the CMOS survival breadcrumb the previous
     /// console-GPU boot attempt left, surfaced at `/proc/gpusurvive`. On a box
     /// with no serial, this is how a SEC2-window wedge is diagnosed: the CPU

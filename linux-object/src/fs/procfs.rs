@@ -14,7 +14,7 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 42] = [
+const PROC_ROOT_STATIC: [&str; 43] = [
     "net",
     "meminfo",
     "cpuinfo",
@@ -57,6 +57,7 @@ const PROC_ROOT_STATIC: [&str; 42] = [
     "gpuedid",
     "gpusurvive",
     "gpucefill",
+    "gpucefillp2p",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -358,6 +359,7 @@ impl INode for ProcRootINode {
             "gpuedid" => Ok(PROC_GPUEDID.clone()),
             "gpusurvive" => Ok(PROC_GPUSURVIVE.clone()),
             "gpucefill" => Ok(PROC_GPUCEFILL.clone()),
+            "gpucefillp2p" => Ok(PROC_GPUCEFILLP2P.clone()),
             "gpudump" => Ok(PROC_GPUDUMP.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
@@ -1515,6 +1517,21 @@ fn proc_gpucefill_content() -> String {
     s
 }
 
+/// `/proc/gpucefillp2p` — P2P CE-offload visual test: from the COMPUTE GPU,
+/// CE-memset the CONSOLE GPU's scanout framebuffer white over PCIe
+/// peer-to-peer. Confirms P2P works (screen turns white) before relying on it
+/// for the present path. Requires the compute GPU state-loaded.
+fn proc_gpucefillp2p_content() -> String {
+    let mut s = String::new();
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        s.push_str(&d.bringup_ce_fill_fb_p2p());
+    }
+    if s.is_empty() {
+        s.push_str("[gpucefillp2p] no DRM driver with P2P CE-offload support\n");
+    }
+    s
+}
+
 /// `/proc/gpusurvive` — read + clear the CMOS survival breadcrumb from the
 /// previous console-GPU GSP-boot attempt. On a serial-less box this is the only
 /// thing that outlives a SEC2-window wedge (the CPU hangs; the CMOS NVRAM keeps
@@ -1974,6 +1991,12 @@ lazy_static! {
     static ref PROC_GPUCEFILL: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 105,
         generate: proc_gpucefill_content,
+    });
+    /// `/proc/gpucefillp2p` -- P2P CE-offload visual test (see
+    /// proc_gpucefillp2p_content).
+    static ref PROC_GPUCEFILLP2P: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 106,
+        generate: proc_gpucefillp2p_content,
     });
     /// `/proc/gpudump` -- read-only discriminating HW dump, both GPUs (see
     /// proc_gpudump_content).

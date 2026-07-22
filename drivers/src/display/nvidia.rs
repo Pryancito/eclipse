@@ -466,6 +466,15 @@ fn boot_fb_phys() -> Option<u64> {
     BOOT_FB_INFO.lock().map(|b| b.phys)
 }
 
+/// Byte size of the boot (UEFI GOP) framebuffer (`pitch * height`), if known.
+/// Used by the P2P CE path/tests, which run on the compute GPU and therefore
+/// cannot read the console FB geometry from their own `self.info`.
+fn boot_fb_size() -> Option<u64> {
+    BOOT_FB_INFO
+        .lock()
+        .map(|b| b.pitch as u64 * b.height as u64)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvidiaArchitecture {
     Unknown,
@@ -3831,29 +3840,45 @@ impl DrmScheme for NvidiaGpu {
     /// locks internally (safe: `scanout()` holds no DRM lock here). Returns true
     /// only if the CE copy actually ran, so the caller can fall back to CPU.
     fn ce_present(&self, src_sysmem_pa: u64, size: u64) -> bool {
-        if !self.drives_boot_display() || src_sysmem_pa == 0 || size == 0 {
+        if src_sysmem_pa == 0 || size == 0 {
             return false;
         }
         let device_instance = match *self.rm_device_instance.lock() {
             Some(d) => d,
-            None => return false, // not state-loaded (no /proc/gpustep14 yet)
+            None => return false, // this GPU not state-loaded
         };
         let fb_phys = match boot_fb_phys() {
             Some(p) if p != 0 => p,
             _ => return false,
         };
-        let bar1 = self.bar1_phys;
-        if fb_phys < bar1 {
-            return false;
-        }
-        let fb_vram_offset = fb_phys - bar1;
-        let st = nvidia_rm_sys::rm_init::ce_blit(device_instance, fb_vram_offset, src_sysmem_pa, size);
+        let (st, how) = if self.drives_boot_display() {
+            // Console GPU: its own CE writes its own VRAM (ADDR_FBMEM). Direct,
+            // but only when the console GPU is state-loaded (its bring-up is
+            // unreliable), so this rarely fires in practice.
+            let bar1 = self.bar1_phys;
+            if fb_phys < bar1 {
+                return false;
+            }
+            (
+                nvidia_rm_sys::rm_init::ce_blit(device_instance, fb_phys - bar1, src_sysmem_pa, size),
+                "console/FBMEM",
+            )
+        } else {
+            // Compute GPU: P2P copy into the console GPU's scanout FB (its BAR1
+            // host physical address, ADDR_SYSMEM). The reliable path — the
+            // compute GPU always boots. Depends on PCIe P2P not being ACS-blocked.
+            (
+                nvidia_rm_sys::rm_init::ce_blit_p2p(device_instance, fb_phys, src_sysmem_pa, size),
+                "compute/P2P",
+            )
+        };
         if st == 0 {
             if !CE_PRESENT_LOGGED.swap(true, Ordering::Relaxed) {
                 log::warn!(
-                    "[NVIDIA] CE-offload present ACTIVE: dumb {:#x} -> FB vram_off {:#x} size {:#x} via copy engine",
+                    "[NVIDIA] CE-offload present ACTIVE ({}): src {:#x} -> FB {:#x} size {:#x}",
+                    how,
                     src_sysmem_pa,
-                    fb_vram_offset,
+                    fb_phys,
                     size
                 );
             }
@@ -3919,6 +3944,61 @@ impl DrmScheme for NvidiaGpu {
                 "FAILED -- CE submit did not complete"
             }
         );
+        s
+    }
+
+    /// `/proc/gpucefillp2p`: P2P CE-offload visual test. On the state-loaded
+    /// COMPUTE GPU (the reliable one), CE-memset the CONSOLE GPU's scanout
+    /// framebuffer to white via PCIe peer-to-peer (`eclipse_rm_ce_fill_fb_p2p`
+    /// with dst = the console FB's host physical address). If the screen turns
+    /// white, PCIe P2P works and we can drive the display from the compute GPU
+    /// without ever bringing up the flaky console GPU — the whole point of
+    /// via-A. If the CE returns OK but the screen does NOT change, P2P is
+    /// ACS-blocked. Requires the compute GPU state-loaded (its own bring-up).
+    fn bringup_ce_fill_fb_p2p(&self) -> String {
+        use core::fmt::Write;
+        let mut s = String::new();
+        if self.drives_boot_display() {
+            return String::from(
+                "[gpucefillp2p] skipped on the CONSOLE GPU -- this test drives it FROM the compute GPU via P2P\n",
+            );
+        }
+        let device_instance = match *self.rm_device_instance.lock() {
+            Some(d) => d,
+            None => {
+                return String::from(
+                    "[gpucefillp2p] compute GPU not state-loaded -- bring it up first (gpustep5/6/8/9 on the secondary)\n",
+                );
+            }
+        };
+        let fb_phys = match boot_fb_phys() {
+            Some(p) if p != 0 => p,
+            _ => return String::from("[gpucefillp2p] no boot framebuffer physical address recorded\n"),
+        };
+        let size = match boot_fb_size() {
+            Some(s) if s != 0 => s,
+            _ => return String::from("[gpucefillp2p] no boot framebuffer size recorded\n"),
+        };
+        let pattern: u32 = 0x0000_00FF; // low byte -> white
+        let _ = writeln!(
+            s,
+            "[gpucefillp2p] compute GPU instance={} -> console FB host_pa={:#x} size={:#x} pattern={:#x} (P2P)",
+            device_instance, fb_phys, size, pattern
+        );
+        let st = nvidia_rm_sys::rm_init::ce_fill_fb_p2p(device_instance, fb_phys, size, pattern);
+        let _ = writeln!(
+            s,
+            "[gpucefillp2p] ce_fill_fb_p2p -> {:#x} ({})",
+            st,
+            if st == 0 {
+                "CE OK -- if the screen is now WHITE, PCIe P2P works and the compute GPU can drive the display"
+            } else {
+                "FAILED -- CE submit did not complete"
+            }
+        );
+        if st == 0 {
+            s.push_str("[gpucefillp2p] NOTE: CE OK but screen UNCHANGED => P2P is ACS-blocked (writes routed away from the console BAR1)\n");
+        }
         s
     }
 
