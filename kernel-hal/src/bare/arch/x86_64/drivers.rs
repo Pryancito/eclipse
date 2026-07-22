@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, sync::Arc};
+use alloc::sync::Arc;
 
 #[cfg(feature = "graphic")]
 use alloc::format;
@@ -56,11 +56,11 @@ pub(super) fn init() -> DeviceResult {
 
     use x2apic::lapic::{TimerDivide, TimerMode};
 
-    irq.register_local_apic_handler(trap::X86_INT_APIC_TIMER, Box::new(super::trap::super_timer))?;
+    irq.register_local_apic_handler(trap::X86_INT_APIC_TIMER, Arc::new(super::trap::super_timer))?;
     // IPI vector: 0xf3 = X86_INT_LOCAL_APIC_BASE + 3
     irq.register_local_apic_handler(
         0xf3,
-        Box::new(|| {
+        Arc::new(|| {
             // A remote CPU is doing a TLB shootdown: flush this CPU's TLB and
             // publish the generation we have satisfied so the initiator can
             // proceed. Drains and discards the IPI reason queue.

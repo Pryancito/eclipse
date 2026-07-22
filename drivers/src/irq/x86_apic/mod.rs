@@ -114,14 +114,25 @@ impl Scheme for Apic {
         if LocalApic::is_initialized() {
             Self::local_apic().eoi();
         }
-        let res = if vector >= X86_INT_LOCAL_APIC_BASE {
-            let handler = self.manager_lapic.lock();
-            handler.handle(vector - X86_INT_LOCAL_APIC_BASE)
+        // CRITICAL: look the handler up under the manager lock, then RELEASE the
+        // lock before invoking it. `manager_lapic`/`manager_ioapic` are single
+        // global Mutexes taken on every interrupt (the LAPIC timer fires on
+        // every CPU at 250 Hz), and the handlers re-enter this very path:
+        // `timer_tick` runs a timer callback that can touch the IRQ subsystem,
+        // and the old code (call under the lock) then re-acquired this same
+        // global lock on the SAME CPU — a self-deadlock that pinned the CPU (and
+        // the timer heap lock) forever and froze every other core. This never
+        // reproduced under 2 emulated CPUs; it only bites on real multi-core
+        // hardware. Cloning the `Arc` out keeps the closure alive even if
+        // another CPU unregisters it while it runs.
+        let handler = if vector >= X86_INT_LOCAL_APIC_BASE {
+            self.manager_lapic.lock().get(vector - X86_INT_LOCAL_APIC_BASE)
         } else {
-            self.manager_ioapic.lock().handle(vector)
+            self.manager_ioapic.lock().get(vector)
         };
-        if res.is_err() {
-            warn!("no registered handler for interrupt vector {}!", vector);
+        match handler {
+            Some(f) => f(),
+            None => warn!("no registered handler for interrupt vector {}!", vector),
         }
     }
 }
