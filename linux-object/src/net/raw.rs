@@ -73,6 +73,11 @@ impl Socket for RawSocketState {
             if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
+            // Also honor non-TTY signals (SIGTERM/SIGALRM/...) so a blocked raw
+            // recv returns EINTR, matching the icmp socket path.
+            if let Err(e) = crate::process::check_signals() {
+                return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+            }
             let remote = self.inner.remote.lock().as_ref().and_then(|ep| match ep {
                 Endpoint::Ip(ip) => Some(ip.addr),
                 _ => None,

@@ -51,6 +51,28 @@ fn read_sockaddr(addr: usize, addrlen: usize) -> Result<SockAddr, LxError> {
     Ok(storage)
 }
 
+/// Copy an option value out to a `getsockopt` caller.
+///
+/// `optlen` is a value-result argument (like Linux's `optlen`): the kernel must
+/// write at most the caller-supplied `*optlen` bytes and then store the true
+/// size back. Previously `optlen` was write-only and the input size was ignored,
+/// so an option larger than the caller's buffer (e.g. the 12-byte SO_PEERCRED
+/// `ucred` written into a 4-byte buffer) overflowed adjacent user memory.
+fn write_sockopt_out(
+    optval: UserOutPtr<u32>,
+    mut optlen: UserInOutPtr<u32>,
+    value: &[u8],
+) -> SysResult {
+    let max = optlen.read()? as usize;
+    let n = value.len().min(max);
+    if n > 0 {
+        let mut dst: UserOutPtr<u8> = optval.as_addr().into();
+        dst.write_array(&value[..n])?;
+    }
+    optlen.write(value.len() as u32)?;
+    Ok(0)
+}
+
 impl Syscall<'_> {
     /// creates an endpoint for communication and returns a file descriptor that refers to that endpoint.
     pub fn sys_socket(&mut self, domain: usize, _type: usize, protocol: usize) -> SysResult {
@@ -225,8 +247,8 @@ impl Syscall<'_> {
         sockfd: usize,
         level: usize,
         optname: usize,
-        mut optval: UserOutPtr<u32>,
-        mut optlen: UserOutPtr<u32>,
+        optval: UserOutPtr<u32>,
+        optlen: UserInOutPtr<u32>,
     ) -> SysResult {
         info!(
             "sys_getsockopt: sockfd:{}, level:{}, optname:{}, optval:{:?} , optlen:{:?}",
@@ -235,11 +257,9 @@ impl Syscall<'_> {
         let level = match Level::try_from(level) {
             Ok(level) => level,
             Err(_) => {
-                // Unknown levels (e.g. SOL_PACKET=263) — return Ok(0) to be lenient.
+                // Unknown levels (e.g. SOL_PACKET=263) — return a zeroed int.
                 warn!("getsockopt: unsupported level: {}", level);
-                optval.write(0)?;
-                optlen.write(size_of::<u32>() as u32)?;
-                return Ok(0);
+                return write_sockopt_out(optval, optlen, &0u32.to_ne_bytes());
             }
         };
         if optval.is_null() {
@@ -262,9 +282,12 @@ impl Syscall<'_> {
                         .ok()
                         .and_then(|s| s.peer_pid())
                         .unwrap_or(1);
-                    optval.write_array(&[pid as u32, 0u32, 0u32])?;
-                    optlen.write(12)?; // sizeof(struct ucred)
-                    return Ok(0);
+                    let ucred: [u32; 3] = [pid as u32, 0, 0];
+                    let mut bytes = [0u8; 12];
+                    for (i, w) in ucred.iter().enumerate() {
+                        bytes[i * 4..i * 4 + 4].copy_from_slice(&w.to_ne_bytes());
+                    }
+                    return write_sockopt_out(optval, optlen, &bytes);
                 }
                 let optname = match SolOptname::try_from(optname) {
                     Ok(optname) => optname,
@@ -280,35 +303,18 @@ impl Syscall<'_> {
                     .as_socket()?
                     .get_buffer_capacity()
                     .unwrap_or((64 * 1024, 64 * 1024));
-                debug!("sys_getsockopt recv and send buffer capacity: {}, {}. optval: {:?}, optlen: {:?}", recv_buf_ca, send_buf_ca, optval.check(), optlen.check());
 
                 match optname {
                     SolOptname::SNDBUF => {
-                        optval.write(send_buf_ca as u32)?;
-                        optlen.write(size_of::<u32>() as u32)?;
-                        Ok(0)
+                        write_sockopt_out(optval, optlen, &(send_buf_ca as u32).to_ne_bytes())
                     }
                     SolOptname::RCVBUF => {
-                        optval.write(recv_buf_ca as u32)?;
-                        optlen.write(size_of::<u32>() as u32)?;
-                        Ok(0)
+                        write_sockopt_out(optval, optlen, &(recv_buf_ca as u32).to_ne_bytes())
                     }
-                    SolOptname::REUSEADDR => {
-                        optval.write(1)?;
-                        optlen.write(size_of::<u32>() as u32)?;
-                        Ok(0)
-                    }
-                    SolOptname::ERROR => {
-                        optval.write(0)?;
-                        optlen.write(size_of::<u32>() as u32)?;
-                        Ok(0)
-                    }
-                    SolOptname::LINGER => {
-                        // Return zero-linger: l_onoff=0, l_linger=0
-                        optval.write(0)?;
-                        optlen.write(8)?; // sizeof(struct linger)
-                        Ok(0)
-                    }
+                    SolOptname::REUSEADDR => write_sockopt_out(optval, optlen, &1u32.to_ne_bytes()),
+                    SolOptname::ERROR => write_sockopt_out(optval, optlen, &0u32.to_ne_bytes()),
+                    // struct linger { int l_onoff; int l_linger; } — zero-linger.
+                    SolOptname::LINGER => write_sockopt_out(optval, optlen, &[0u8; 8]),
                 }
             }
             Level::IPPROTO_TCP => {
@@ -332,11 +338,7 @@ impl Syscall<'_> {
                     }
                 };
                 match optname {
-                    IpOptname::HDRINCL => {
-                        optval.write(0)?;
-                        optlen.write(size_of::<u32>() as u32)?;
-                        Ok(0)
-                    }
+                    IpOptname::HDRINCL => write_sockopt_out(optval, optlen, &0u32.to_ne_bytes()),
                 }
             }
         }

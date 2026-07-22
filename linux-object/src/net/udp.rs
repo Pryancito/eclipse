@@ -127,6 +127,11 @@ impl Socket for UdpSocketState {
             if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
+            // Also honor non-TTY signals (SIGTERM/SIGALRM/...) so a blocked
+            // recvfrom returns EINTR, matching the icmp socket path.
+            if let Err(e) = crate::process::check_signals() {
+                return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+            }
             kernel_hal::deferred_job::drain_deferred_jobs();
             // Park on the RX IRQ waker (5 ms fallback) instead of busy-spinning
             // — an idle udhcpc blocked on recvfrom otherwise pegs a core.
@@ -167,6 +172,11 @@ impl Socket for UdpSocketState {
                 }
             }
             if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
+                return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+            }
+            // Also honor non-TTY signals (SIGTERM/SIGALRM/...) so a blocked
+            // recvfrom returns EINTR, matching the icmp socket path.
+            if let Err(e) = crate::process::check_signals() {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
             kernel_hal::deferred_job::drain_deferred_jobs();
