@@ -365,13 +365,17 @@ impl Syscall<'_> {
             Some(endpoint)
         };
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
-        file_like
+        // Return the socket's ACTUAL queued byte count, not the full requested
+        // `len`. TCP `write()` can perform a short write (queues min(len, free TX
+        // space)); reporting `len` regardless makes the caller believe bytes it
+        // never sent were delivered, silently truncating the stream.
+        let written = file_like
             .clone()
             .as_socket()?
             .write(buf.as_slice(len)?, endpoint)?;
         // Do not drain_net_poll here — busybox ping uses sendto; 32× poll_ifaces
         // blocks for a long time (smoltcp + SOCKETS lock). Sockets drive RX in read/poll.
-        Ok(len)
+        Ok(written)
     }
 
     /// receive messages from a socket
@@ -438,11 +442,16 @@ impl Syscall<'_> {
             let cmsg_len = u64::from_ne_bytes(ctrl[off..off + 8].try_into().unwrap()) as usize;
             let level = i32::from_ne_bytes(ctrl[off + 8..off + 12].try_into().unwrap());
             let typ = i32::from_ne_bytes(ctrl[off + 12..off + 16].try_into().unwrap());
-            if cmsg_len < CMSG_HDR_LEN || off + cmsg_len > ctrl.len() {
-                break;
-            }
+            // `cmsg_len` is attacker-controlled; compute the message end with
+            // checked arithmetic so a value near usize::MAX cannot wrap past the
+            // `> ctrl.len()` guard (which would then slice with start > end and
+            // panic the kernel).
+            let cmsg_end = match off.checked_add(cmsg_len) {
+                Some(end) if cmsg_len >= CMSG_HDR_LEN && end <= ctrl.len() => end,
+                _ => break,
+            };
             if level == SOL_SOCKET_LEVEL && typ == SCM_RIGHTS {
-                for chunk in ctrl[off + CMSG_HDR_LEN..off + cmsg_len].chunks_exact(4) {
+                for chunk in ctrl[off + CMSG_HDR_LEN..cmsg_end].chunks_exact(4) {
                     let raw = i32::from_ne_bytes(chunk.try_into().unwrap());
                     if raw >= 0 {
                         if let Ok(fl) = proc.get_file_like(FileDesc::from(raw as usize)) {
@@ -451,7 +460,16 @@ impl Syscall<'_> {
                     }
                 }
             }
-            off += (cmsg_len + 7) & !7; // CMSG_ALIGN
+            // CMSG_ALIGN(cmsg_len); use checked arithmetic and require forward
+            // progress so a wrapped/zero step cannot spin forever.
+            let step = match cmsg_len.checked_add(7).map(|v| v & !7) {
+                Some(s) if s > 0 => s,
+                _ => break,
+            };
+            off = match off.checked_add(step) {
+                Some(n) => n,
+                None => break,
+            };
         }
         fds
     }
@@ -478,7 +496,14 @@ impl Syscall<'_> {
         let data = iovs.read_to_vec()?;
 
         // SCM_RIGHTS: resolve any attached fds before queueing the bytes.
+        // `msg_controllen` is fully user-controlled; bound it before `read_array`
+        // so a huge value cannot request a multi-GiB allocation (alloc abort) or
+        // walk off the mapped control buffer. Linux bounds this by optmem_max.
+        const CONTROL_MAX: usize = 64 * 1024;
         let passed_fds = if !hdr.msg_control.is_null() && hdr.msg_controllen >= 16 {
+            if hdr.msg_controllen > CONTROL_MAX {
+                return Err(LxError::EINVAL);
+            }
             let ctrl = hdr.msg_control.read_array(hdr.msg_controllen)?;
             self.collect_scm_rights_fds(&ctrl)
         } else {
@@ -497,12 +522,14 @@ impl Syscall<'_> {
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
         let socket_fl = file_like.clone();
         let socket = socket_fl.as_socket()?;
-        socket.write(&data, endpoint)?;
+        // Return the actual queued byte count (a TCP short write can queue less
+        // than `data.len()`); reporting the full length silently drops the tail.
+        let written = socket.write(&data, endpoint)?;
         if !passed_fds.is_empty() {
             // Hand the fds to the peer (delivered with its next recvmsg).
             let _ = socket.send_fds(passed_fds);
         }
-        Ok(data.len())
+        Ok(written)
     }
 
     /// receive messages from a socket
