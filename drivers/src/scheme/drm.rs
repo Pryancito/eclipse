@@ -216,6 +216,22 @@ pub trait DrmScheme: Scheme {
         false
     }
 
+    /// Automatic boot-time compute-GPU bring-up. Runs the proven state-load
+    /// chain (attach -> GSP-RM boot -> RM API client -> gpuStateLoad, i.e. the
+    /// `/proc/gpustep5;6;8;9` sequence) on every GPU that does NOT drive the
+    /// boot display, so the copy-engine present path (`ce_present` over PCIe
+    /// P2P) is ready before the compositor starts — no manual `cat` needed.
+    /// The GPU that drives the console is SKIPPED: its GSP boot wedges at the
+    /// SEC2 STARTCPU store (~1/3 of the time, hanging the machine), so it is
+    /// never auto-booted. Called once, synchronously, from the kernel main
+    /// after the GSP firmware is loaded and before any userspace runs, so
+    /// there is no concurrent RM access. Systems with a single (console) GPU
+    /// bring up nothing here and fall back to the CPU blit. General over 1, 2,
+    /// 3+ GPUs. Returns a human-readable log. Default: nothing.
+    fn auto_bringup_compute(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// CE-offload visual test (`/proc/gpucefill`): CE-memset the console GPU's
     /// scanout framebuffer to a solid colour via the persistent CeUtils channel,
     /// to confirm the BAR1->VRAM offset is correct before wiring the full

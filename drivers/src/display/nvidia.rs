@@ -3839,6 +3839,41 @@ impl DrmScheme for NvidiaGpu {
     /// place of the CPU blit, when the console GPU is state-loaded. Takes the RM
     /// locks internally (safe: `scanout()` holds no DRM lock here). Returns true
     /// only if the CE copy actually ran, so the caller can fall back to CPU.
+    /// Automatic boot-time compute-GPU bring-up (see the `DrmScheme` trait
+    /// doc). Runs the proven `/proc/gpustep5;6;8;9` chain on this GPU — but
+    /// only if it does NOT drive the boot display. The console GPU is skipped
+    /// unconditionally: its GSP-RM boot wedges at the SEC2 STARTCPU store
+    /// (see `bringup_step6`), so it is never auto-booted; the compute GPU(s)
+    /// are the reliable path and drive the console's scanout FB over PCIe P2P.
+    fn auto_bringup_compute(&self) -> String {
+        if self.drives_boot_display() {
+            return String::from(
+                "[gpuauto] SKIP console GPU (drives boot display; its GSP boot wedges at SEC2 STARTCPU)\n",
+            );
+        }
+        let mut s = String::new();
+        s.push_str(
+            "[gpuauto] compute GPU auto bring-up: attach -> GSP-RM boot -> RM API -> gpuStateLoad\n",
+        );
+        // The same sequence a user runs as `cat /proc/gpustep5;6;8;9`, executed
+        // once at boot before any userspace or scanout touches RM (fixed RM
+        // thread-id 0, no concurrent access -> no reentrancy hazard).
+        s.push_str(&self.bringup_step5());
+        s.push_str(&self.bringup_step6());
+        s.push_str(&self.bringup_step8());
+        s.push_str(&self.bringup_step9());
+        if self.rm_device_instance.lock().is_some() {
+            s.push_str(
+                "[gpuauto] compute GPU state-loaded; CE-offload present (P2P) now available\n",
+            );
+        } else {
+            s.push_str(
+                "[gpuauto] compute GPU NOT state-loaded after chain; present falls back to CPU blit\n",
+            );
+        }
+        s
+    }
+
     fn ce_present(&self, src_sysmem_pa: u64, size: u64) -> bool {
         if src_sysmem_pa == 0 || size == 0 {
             return false;

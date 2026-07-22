@@ -187,6 +187,17 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // file (fetch failed at image-build time, or a non-NVIDIA
             // build) is a normal, silent no-op.
             load_nvidia_gsp_firmware(&rootfs.root_inode());
+            // Auto bring-up every COMPUTE GPU (any NVIDIA GPU not driving the
+            // boot display) now that the GSP firmware is available, so the
+            // copy-engine present path (ce_present over PCIe P2P) is ready
+            // before the compositor starts -- no manual `cat /proc/gpustep5;6;8;9`.
+            // Runs once, synchronously, before any userspace/scanout touches RM.
+            // Kill switch: boot with `nvidia.noautoboot` on the kernel cmdline.
+            if !options.cmdline.contains("nvidia.noautoboot") {
+                auto_bringup_compute_gpus();
+            } else {
+                klog_info!("Eclipse: NVIDIA compute-GPU auto bring-up disabled (nvidia.noautoboot)");
+            }
             kernel_hal::console::early_progress_bar(95);
 
             // Whose exit takes the system down: INIT (PID 1) if present, else
@@ -346,6 +357,27 @@ fn load_nvidia_gsp_firmware(root: &alloc::sync::Arc<dyn rcore_fs::vfs::INode>) {
     report(alloc::format!(
         "OK: {n} of {size} bytes delivered to {drm_count} DRM driver(s)"
     ));
+}
+
+/// Boot-time auto bring-up of every COMPUTE GPU. Iterates all registered DRM
+/// drivers and asks each to bring itself up if it does NOT drive the boot
+/// display (`DrmScheme::auto_bringup_compute`, a no-op for the console GPU and
+/// for non-NVIDIA drivers). Best-effort: each GPU logs its own outcome and a
+/// failure never aborts boot. Called once, synchronously, right after the GSP
+/// firmware load and before any userspace or scanout touches RM, so the
+/// copy-engine present path (P2P from a compute GPU into the console's scanout
+/// FB) is ready by the time the compositor runs. General over 1, 2, 3+ GPUs:
+/// a single-console-GPU box brings up nothing and falls back to the CPU blit.
+#[cfg(feature = "linux")]
+fn auto_bringup_compute_gpus() {
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        let log = d.auto_bringup_compute();
+        for line in log.lines() {
+            if !line.is_empty() {
+                klog_info!("Eclipse: {}", line);
+            }
+        }
+    }
 }
 
 #[cfg(not(feature = "libos"))]
