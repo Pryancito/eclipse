@@ -1427,6 +1427,87 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
 }
 wayland_client::delegate_noop!(State: ignore ZwlrLayerShellV1);
 
+/// Connect to the Wayland compositor, auto-detecting the socket when the
+/// environment does not point at one.
+///
+/// `Connection::connect_to_env()` — like every wayland-client program — needs
+/// `WAYLAND_DISPLAY` set and resolves it under `XDG_RUNTIME_DIR`. Two common
+/// Eclipse-OS situations leave those unset even though labwc is running:
+///   * launched from a bare init/VT shell that never sourced `/etc/profile`,
+///     so no `XDG_*` is exported;
+///   * labwc's autostart exports `XDG_RUNTIME_DIR` but not `WAYLAND_DISPLAY` —
+///     libwayland clients (foot) fall back to `wayland-0` and connect, but the
+///     pure-Rust wayland-client refuses without the variable. That is exactly
+///     why lunarbg/lunarbar died in autostart while foot ran fine.
+///
+/// So: try the standard connect first; on failure, scan the usual runtime
+/// directories for a live `wayland-N` socket and connect to it directly,
+/// defaulting to `wayland-0` like libwayland. On success we publish
+/// `XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY` into our own environment so the app menu
+/// launches its programs into a working session.
+fn connect_wayland() -> Result<Connection, String> {
+    use std::path::PathBuf;
+
+    // 1) Standard path: honours WAYLAND_SOCKET / WAYLAND_DISPLAY / XDG_RUNTIME_DIR.
+    if let Ok(c) = Connection::connect_to_env() {
+        return Ok(c);
+    }
+
+    // 2) Auto-detect. Probe runtime dirs, most specific first.
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(d) = std::env::var_os("XDG_RUNTIME_DIR") {
+        let p = PathBuf::from(d);
+        if p.is_absolute() {
+            dirs.push(p);
+        }
+    }
+    // Eclipse OS runs as root, so /run/user/0 is the default XDG_RUNTIME_DIR.
+    for d in ["/run/user/0", "/run/user/1000", "/tmp"] {
+        let p = PathBuf::from(d);
+        if !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    }
+
+    // A relative WAYLAND_DISPLAY name (without XDG_RUNTIME_DIR) still guides us.
+    let hinted = std::env::var("WAYLAND_DISPLAY")
+        .ok()
+        .filter(|h| !h.contains('/'));
+
+    for dir in &dirs {
+        // Candidate socket names: the hint, wayland-0.., plus any wayland-*
+        // the directory actually contains.
+        let mut names: Vec<String> = Vec::new();
+        if let Some(ref h) = hinted {
+            names.push(h.clone());
+        }
+        for i in 0..8 {
+            names.push(format!("wayland-{i}"));
+        }
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for ent in rd.flatten() {
+                if let Ok(n) = ent.file_name().into_string() {
+                    if n.starts_with("wayland-") && !n.ends_with(".lock") && !names.contains(&n) {
+                        names.push(n);
+                    }
+                }
+            }
+        }
+        for name in &names {
+            let path = dir.join(name);
+            if let Ok(stream) = std::os::unix::net::UnixStream::connect(&path) {
+                if let Ok(conn) = Connection::from_socket(stream) {
+                    // Publish a working session for any child we spawn.
+                    std::env::set_var("XDG_RUNTIME_DIR", dir);
+                    std::env::set_var("WAYLAND_DISPLAY", name);
+                    return Ok(conn);
+                }
+            }
+        }
+    }
+    Err("Could not find a running Wayland compositor (is labwc started?)".into())
+}
+
 fn main() {
     // Minimum 26: the 15px font plus the h-10 pill height — anything shorter
     // draws glyphs taller than the pills that frame them.
@@ -1542,7 +1623,7 @@ fn main() {
         return;
     }
 
-    let conn = match Connection::connect_to_env() {
+    let conn = match connect_wayland() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("lunarbar: cannot connect to the Wayland compositor: {e}");
