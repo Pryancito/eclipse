@@ -41,6 +41,16 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 /// Two persistent frame buffers per output, alternated each frame.
 const BUFFERS: usize = 2;
 
+/// Emit a one-time setup checkpoint to stderr so that, if the process crashes,
+/// the last line printed pinpoints the stage it died in. Cheap and few (only on
+/// the one-time setup path), so left always-on. Defined here, above its first
+/// use, because `macro_rules!` is only in scope textually after its definition.
+macro_rules! ckpt {
+    ($($arg:tt)*) => {{
+        eprintln!("lunarbg: [ckpt] {}", format_args!($($arg)*));
+    }};
+}
+
 struct Frames {
     width: usize,
     height: usize,
@@ -144,6 +154,7 @@ impl State {
         let stride = w * 4;
         let frame_size = stride * h;
         let total = frame_size * BUFFERS;
+        ckpt!("configure {w}x{h}: allocating shm pool total={total}");
 
         let raw = unsafe {
             libc::memfd_create(
@@ -193,6 +204,7 @@ impl State {
         // server-side and the mapping outlives the closed fd.
         pool.destroy();
 
+        ckpt!("configure {w}x{h}: mmap ok; rendering base scene");
         let layout = scene::layout(w, h, self.monitor_aspect);
         let base = scene::render_base(w, h, self.monitor_aspect);
 
@@ -201,6 +213,7 @@ impl State {
         // the logo region, every frame shown from buffer 1 had BLACK outside
         // the logo — on the real monitor the wallpaper alternated between the
         // full cosmic scene and a dark screen with a floating square.
+        ckpt!("configure {w}x{h}: first write to mmap'd memfd (buffer 0)");
         let frame0: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(map, frame_size) };
         frame0.copy_from_slice(&base);
@@ -208,6 +221,7 @@ impl State {
         let frame1: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(map.add(frame_size), frame_size) };
         frame1.copy_from_slice(&base);
+        ckpt!("configure {w}x{h}: buffers seeded; committing surface");
 
         let bg = &mut self.backgrounds[idx];
         bg.frames = Some(Frames {
@@ -488,7 +502,45 @@ fn connect_wayland() -> Result<Connection, String> {
     Err("Could not find a running Wayland compositor (is labwc started?)".into())
 }
 
+/// Install a crash handler that reports the faulting address on
+/// SIGSEGV/SIGBUS/SIGILL before dying, so a crash on real hardware is
+/// self-diagnosing (no dmesg needed). The handler uses only `write(2)` and
+/// manual hex formatting — both async-signal-safe — then restores the default
+/// disposition and re-raises so the shell still sees the real signal exit code.
+fn install_crash_handler() {
+    extern "C" fn handler(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
+        let addr = unsafe { (*info).si_addr() } as usize;
+        // "lunarbg: FATAL signal SS fault-addr 0xHHHHHHHHHHHHHHHH\n"
+        let mut buf = *b"lunarbg: FATAL signal 00 fault-addr 0x0000000000000000\n";
+        buf[22] = b'0' + ((sig / 10) % 10) as u8;
+        buf[23] = b'0' + (sig % 10) as u8;
+        for i in 0..16 {
+            let nibble = ((addr >> ((15 - i) * 4)) & 0xf) as u8;
+            buf[38 + i] = if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + nibble - 10
+            };
+        }
+        unsafe {
+            libc::write(2, buf.as_ptr() as *const libc::c_void, buf.len());
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
+    unsafe {
+        let mut sa: libc::sigaction = core::mem::zeroed();
+        sa.sa_sigaction = handler as *const () as usize;
+        sa.sa_flags = libc::SA_SIGINFO;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGSEGV, &sa, core::ptr::null_mut());
+        libc::sigaction(libc::SIGBUS, &sa, core::ptr::null_mut());
+        libc::sigaction(libc::SIGILL, &sa, core::ptr::null_mut());
+    }
+}
+
 fn main() {
+    install_crash_handler();
     // Offscreen debug mode: LUNARBG_DUMP=/path[:WxH] renders one animation
     // frame to a raw XRGB8888 file and exits, no compositor needed.
     if let Ok(spec) = std::env::var("LUNARBG_DUMP") {
@@ -517,6 +569,7 @@ fn main() {
         return;
     }
 
+    ckpt!("connecting to compositor");
     let conn = match connect_wayland() {
         Ok(c) => c,
         Err(e) => {
@@ -524,6 +577,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+    ckpt!("connected; creating event queue + registry");
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
     let display = conn.display();
@@ -533,10 +587,18 @@ fn main() {
         animate: std::env::var("LUNARBG_STATIC").map_or(true, |v| v != "1"),
         ..State::default()
     };
+    ckpt!("initial roundtrip");
     if let Err(e) = queue.roundtrip(&mut state) {
         eprintln!("lunarbg: initial roundtrip failed: {e}");
         std::process::exit(1);
     }
+    ckpt!(
+        "roundtrip done: compositor={} shm={} layer_shell={} monitor_aspect={:?}",
+        state.compositor.is_some(),
+        state.shm.is_some(),
+        state.layer_shell.is_some(),
+        state.monitor_aspect
+    );
     if state.layer_shell.is_none() {
         eprintln!("lunarbg: compositor lacks zwlr_layer_shell_v1");
         std::process::exit(1);
@@ -557,6 +619,7 @@ fn main() {
     let interval = std::time::Duration::from_millis(1000 / fps as u64);
     let mut next_tick = std::time::Instant::now() + interval;
 
+    ckpt!("entering event loop (fps={fps})");
     loop {
         state.ensure_surfaces(&qh);
         if let Err(e) = queue.flush() {
