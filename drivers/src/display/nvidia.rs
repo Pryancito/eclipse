@@ -1,6 +1,6 @@
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::bus::pci_drivers::PciDriver;
 use crate::prelude::{AccelCaps, ColorFormat, DisplayInfo, FrameBuffer};
@@ -416,6 +416,11 @@ fn rm_core_init_once() -> u32 {
     s
 }
 
+/// MSIs serviced during the current console-GPU GSP boot window. Module-level
+/// because the ISR closure registered in `gsp_boot_run` must be `'static` (it
+/// cannot borrow `&self`). There is only ever one console boot in flight.
+static CONSOLE_MSI_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 #[derive(Debug, Clone, Copy)]
 struct BootFbInfo {
     phys: u64,
@@ -567,6 +572,11 @@ pub struct NvidiaGpu {
     next_kms_fb_id: AtomicU32,
     /// Current KMS state exposed by GETCRTC/GETPLANE and used by wait_vblank.
     kms_state: Mutex<NvidiaKmsState>,
+    /// MSI interrupt vector assigned by the PCI scan (`irq + 32`), or
+    /// `usize::MAX` if this GPU has no MSI. Used only by the console-GPU GSP
+    /// boot to bring the GPU's MSI delivery online across the SEC2-resume
+    /// window (the Linux-faithful interrupt path). Set once, after construction.
+    msi_vector: AtomicUsize,
 }
 
 /// Simple bitmap-based VRAM allocator for BAR1 aperture (4KB page granularity)
@@ -798,7 +808,16 @@ impl NvidiaGpu {
                 plane_fb: 0,
                 last_vblank_us: 0,
             }),
+            msi_vector: AtomicUsize::new(usize::MAX),
         })
+    }
+
+    /// Record the MSI vector the PCI scan assigned this GPU (`irq + 32`). Called
+    /// once from the probe; `None` (no MSI cap) leaves it as `usize::MAX`.
+    pub fn set_msi_vector(&self, irq: Option<usize>) {
+        if let Some(irq) = irq {
+            self.msi_vector.store(irq + 32, Ordering::Relaxed);
+        }
     }
 
     pub fn architecture(&self) -> NvidiaArchitecture {
@@ -1670,6 +1689,43 @@ impl NvidiaGpu {
                         nvidia_rm_sys::survival::milestone::INITRM_CALL,
                     );
                 }
+                // Linux-faithful interrupt path: bring the GPU's MSI delivery
+                // online for the SEC2-resume window instead of running fully
+                // INTx-masked. The wedge (foto 1) is the STARTCPU posted store
+                // stalling with every CPU-visible interrupt source already
+                // clean — consistent with the SEC2/GSP needing an interrupt
+                // *delivered* (posted to the LAPIC) for forward progress, which
+                // a fully INTx-masked GPU can never provide. The ISR closure
+                // must NOT touch BAR0 (a CPU->GPU access wedges in the window):
+                // it only counts and self-limits, since the mere MSI delivery
+                // (outbound GPU->LAPIC) is the forward-progress signal and the
+                // IRQ framework EOIs after it returns.
+                let msi_vec = if drain_for_console {
+                    self.msi_vector.load(Ordering::Relaxed)
+                } else {
+                    usize::MAX
+                };
+                if msi_vec != usize::MAX {
+                    CONSOLE_MSI_COUNT.store(0, Ordering::Relaxed);
+                    let v = msi_vec;
+                    let handler: crate::scheme::IrqHandler = alloc::boxed::Box::new(move || {
+                        const STORM_CAP: usize = 200_000;
+                        let n = CONSOLE_MSI_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n == STORM_CAP {
+                            // Runaway source we cannot clear at the engine
+                            // without a wedge-prone BAR access: self-mask so a
+                            // storm can never peg the CPU into a hang.
+                            crate::net::msi_mask(v);
+                        }
+                    });
+                    let ok = crate::net::msi_register_and_unmask(msi_vec, handler);
+                    log::error!(
+                        "[NVIDIA] {}: MSI delivery ONLINE for the GSP boot (vector {}, registered={})",
+                        tag,
+                        msi_vec,
+                        ok
+                    );
+                }
                 let mut recovery_log = String::new();
                 let mut attempt = 1u32;
                 let computed = loop {
@@ -1707,6 +1763,23 @@ impl NvidiaGpu {
                     // recorded from here on was NOT the SEC2-window wedge.
                     nvidia_rm_sys::survival::checkpoint(
                         nvidia_rm_sys::survival::milestone::INITRM_RETURN,
+                    );
+                }
+                // Take the GPU's MSI delivery back offline and report how many
+                // MSIs were serviced during the boot — the empirical answer to
+                // "do MSIs even fire, and does turning them on shift the wedge?".
+                if msi_vec != usize::MAX {
+                    crate::net::msi_mask_and_unregister(msi_vec);
+                    let n = CONSOLE_MSI_COUNT.load(Ordering::Relaxed);
+                    log::error!(
+                        "[NVIDIA] {}: MSI delivery offline; {} MSI(s) serviced during the GSP boot{}",
+                        tag,
+                        n,
+                        if n >= 200_000 {
+                            " (STORM CAP hit -- source was masked mid-boot)"
+                        } else {
+                            ""
+                        }
                     );
                 }
                 if quiet && drain_for_console {
@@ -6228,6 +6301,7 @@ impl PciDriver for NvidiaGpuDriverPci {
                 dev.loc.bus,
                 dev.loc.device,
             )?);
+            gpu.set_msi_vector(_irq);
             Ok(Device::Drm(gpu))
         } else {
             Err(DeviceError::NoResources)
