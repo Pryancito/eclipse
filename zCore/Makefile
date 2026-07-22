@@ -9,13 +9,8 @@ MODE ?= release
 # linux.rs). LOG=error discarded ALL of that, so a segfaulting client (e.g.
 # foot exiting rc=139) left nothing in dmesg to diagnose it with. Overridable:
 # `make ... LOG=error` for a quiet build.
-LOG ?= warn
-ifeq ($(ARCH), x86_64)
-# Alpine SFS rootfs from `cargo xtask image` needs the linux loader, not userboot/zircon.
+LOG ?= error
 LINUX ?= 1
-else
-LINUX ?=
-endif
 MOCK ?=
 LIBOS ?=
 TEST ?=

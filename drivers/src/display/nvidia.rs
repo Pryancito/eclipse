@@ -1708,7 +1708,7 @@ impl NvidiaGpu {
                 if msi_vec != usize::MAX {
                     CONSOLE_MSI_COUNT.store(0, Ordering::Relaxed);
                     let v = msi_vec;
-                    let handler: crate::scheme::IrqHandler = alloc::boxed::Box::new(move || {
+                    let handler: crate::scheme::IrqHandler = alloc::sync::Arc::new(move || {
                         const STORM_CAP: usize = 200_000;
                         let n = CONSOLE_MSI_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                         if n == STORM_CAP {
