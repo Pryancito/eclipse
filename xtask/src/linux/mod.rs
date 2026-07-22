@@ -88,7 +88,7 @@ impl LinuxRootfs {
             fs::create_dir_all(&etc_apk).unwrap();
             fs::write(
                 etc_apk.join("repositories"),
-                "http://dl-cdn.alpinelinux.org/alpine/v3.23/main\nhttp://dl-cdn.alpinelinux.org/alpine/v3.23/community\n",
+                "http://dl-cdn.alpinelinux.org/alpine/v3.24/main\nhttp://dl-cdn.alpinelinux.org/alpine/v3.24/community\n",
             )
             .unwrap();
             fs::write(etc_apk.join("world"), "").unwrap();
