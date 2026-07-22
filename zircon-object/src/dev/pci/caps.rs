@@ -63,7 +63,7 @@ impl PciMsiBlock {
         interrupt::msi_register_handler(
             self.base_irq..self.base_irq + self.num_irq,
             msi_id,
-            handle,
+            handle.into(),
         )
         .unwrap();
     }

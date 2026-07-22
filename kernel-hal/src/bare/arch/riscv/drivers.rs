@@ -117,12 +117,12 @@ pub(super) fn intc_init() -> DeviceResult {
     // register soft interrupts handler
     irq.register_handler(
         ScauseIntCode::SupervisorSoft as _,
-        Box::new(super::trap::super_soft),
+        Arc::new(super::trap::super_soft),
     )?;
     // register timer interrupts handler
     irq.register_handler(
         ScauseIntCode::SupervisorTimer as _,
-        Box::new(super::trap::super_timer),
+        Arc::new(super::trap::super_timer),
     )?;
     irq.unmask(ScauseIntCode::SupervisorSoft as _)?;
     irq.unmask(ScauseIntCode::SupervisorTimer as _)?;
