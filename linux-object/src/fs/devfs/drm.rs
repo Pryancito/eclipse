@@ -366,7 +366,24 @@ pub fn scanout(fb_id: u32) -> bool {
     let src_stride = (fb.pitch / 4) as usize;
     let width = fb.width.min(info.width);
     let height = fb.height.min(info.height);
-    display.blit_from(0, 0, pixels, src_stride, width, height);
+    // CE-offloaded present: copy the dumb buffer (sysmem) into the scanout FB
+    // (the console GPU's VRAM) with the GPU copy engine instead of a CPU
+    // memcpy over PCIe. A flat CE copy needs equal strides, so only when the
+    // dumb-buffer pitch matches the scanout pitch; and only the console GPU
+    // (state-loaded via /proc/gpustep14) accepts it. Any miss -> CPU blit.
+    let mut blitted_by_ce = false;
+    if fb.pitch == info.pitch {
+        let size = (info.pitch as u64) * (height as u64);
+        for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+            if d.ce_present(fb.phys_addr, size) {
+                blitted_by_ce = true;
+                break;
+            }
+        }
+    }
+    if !blitted_by_ce {
+        display.blit_from(0, 0, pixels, src_stride, width, height);
+    }
     // Composite the kernel cursor on top of the just-blitted frame, so a
     // page-flip never erases the pointer. Snapshot the cursor under the lock,
     // then blend lock-free (blending reads the slow PCIe framebuffer for

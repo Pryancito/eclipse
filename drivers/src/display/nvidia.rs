@@ -1,6 +1,6 @@
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use crate::bus::pci_drivers::PciDriver;
 use crate::prelude::{AccelCaps, ColorFormat, DisplayInfo, FrameBuffer};
@@ -415,6 +415,10 @@ fn rm_core_init_once() -> u32 {
     *status = Some(s);
     s
 }
+
+/// One-shot guard so the first CE-offloaded present logs once (a console photo
+/// then confirms the desktop is being composited by the copy engine).
+static CE_PRESENT_LOGGED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy)]
 struct BootFbInfo {
@@ -3819,6 +3823,44 @@ impl DrmScheme for NvidiaGpu {
         s.push_str(&self.bringup_step10());
         s.push_str("[gpustep14] === console GPU bring-up chain complete (see per-stage results above) ===\n");
         s
+    }
+
+    /// CE-offloaded present: dumb buffer (sysmem) -> scanout FB (VRAM) via the
+    /// persistent CeUtils channel. Called from the DRM `scanout()` per frame in
+    /// place of the CPU blit, when the console GPU is state-loaded. Takes the RM
+    /// locks internally (safe: `scanout()` holds no DRM lock here). Returns true
+    /// only if the CE copy actually ran, so the caller can fall back to CPU.
+    fn ce_present(&self, src_sysmem_pa: u64, size: u64) -> bool {
+        if !self.drives_boot_display() || src_sysmem_pa == 0 || size == 0 {
+            return false;
+        }
+        let device_instance = match *self.rm_device_instance.lock() {
+            Some(d) => d,
+            None => return false, // not state-loaded (no /proc/gpustep14 yet)
+        };
+        let fb_phys = match boot_fb_phys() {
+            Some(p) if p != 0 => p,
+            _ => return false,
+        };
+        let bar1 = self.bar1_phys;
+        if fb_phys < bar1 {
+            return false;
+        }
+        let fb_vram_offset = fb_phys - bar1;
+        let st = nvidia_rm_sys::rm_init::ce_blit(device_instance, fb_vram_offset, src_sysmem_pa, size);
+        if st == 0 {
+            if !CE_PRESENT_LOGGED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "[NVIDIA] CE-offload present ACTIVE: dumb {:#x} -> FB vram_off {:#x} size {:#x} via copy engine",
+                    src_sysmem_pa,
+                    fb_vram_offset,
+                    size
+                );
+            }
+            true
+        } else {
+            false
+        }
     }
 
     /// `/proc/gpucefill`: CE-offload visual test. On the state-loaded console
