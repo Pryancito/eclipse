@@ -198,6 +198,13 @@ fn write_labwc_rc(rootfs: &Path) {
     <keybind key="W-S-4"><action name="SendToDesktop"><to>4</to></action></keybind>
   </keyboard>
   <mouse>
+    <!-- Restore labwc's built-in mouse bindings FIRST: move (drag the
+         titlebar, or Alt+drag anywhere), resize (Alt+right-drag or drag an
+         edge/corner), focus+raise on click, and the titlebar Close / Iconify /
+         Maximize buttons. Without <default/> a custom <mouse> section REPLACES
+         all of them, which is why windows could not be moved and the titlebar
+         buttons did nothing. Our own bindings below are then added on top. -->
+    <default />
     <context name="Root">
       <mousebind button="Right" action="Press"><action name="ShowMenu"><menu>root-menu</menu></action></mousebind>
     </context>
