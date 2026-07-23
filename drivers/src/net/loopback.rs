@@ -97,12 +97,6 @@ pub fn register_loopback_tx_callback(cb: fn(&[u8])) {
     }
 }
 
-/// Upper bound on frames buffered in the loopback queue. `poll()` uses
-/// `try_lock` and silently skips on contention, so without a cap a sender that
-/// outruns the drain would grow the queue without bound and exhaust the kernel
-/// heap. When full we drop the oldest frame (backpressure); TCP retransmits.
-const LOOPBACK_QUEUE_MAX: usize = 256;
-
 pub struct LoopbackTxToken<'a> {
     queue: &'a mut VecDeque<Vec<u8>>,
     stats: Arc<Mutex<NetStats>>,
@@ -129,9 +123,6 @@ impl<'a> phy::TxToken for LoopbackTxToken<'a> {
             }
         }
 
-        if self.queue.len() >= LOOPBACK_QUEUE_MAX {
-            self.queue.pop_front();
-        }
         self.queue.push_back(buffer);
         result
     }
@@ -160,11 +151,7 @@ impl NetScheme for LoopbackInterface {
     }
     fn send(&self, buf: &[u8]) -> DeviceResult<usize> {
         let mut iface = self.iface.lock();
-        let queue = &mut iface.device_mut().queue;
-        if queue.len() >= LOOPBACK_QUEUE_MAX {
-            queue.pop_front();
-        }
-        queue.push_back(buf.to_vec());
+        iface.device_mut().queue.push_back(buf.to_vec());
         Ok(buf.len())
     }
     fn poll(&self) -> DeviceResult {
