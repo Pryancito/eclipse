@@ -157,6 +157,15 @@ impl Socket for TcpSocketState {
             // Receive half closed and nothing left to read -> real EOF.
             if recv_closed {
                 if let Err(smoltcp::Error::Exhausted) = copied_len {
+                    // Log the terminal state at error! (survives LOG=error) so a
+                    // truncated download (peer FIN/RST mid-transfer -> apk gets a
+                    // short APKINDEX) is visible in dmesg: state names WHY the
+                    // receive half closed (a clean CLOSE-WAIT after all data, vs
+                    // a RST/abort). Fires at most once per connection close.
+                    error!(
+                        "[tcp read] EOF handle={} state={:?} may_recv=false (recv half closed)",
+                        handle, state
+                    );
                     return (Ok(0), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
                 }
             }
@@ -174,11 +183,24 @@ impl Socket for TcpSocketState {
                     // is exactly the "short APKINDEX -> BAD signature" class of
                     // corruption). An error lets the caller retry/fail correctly.
                     if kernel_hal::timer::timer_now() >= deadline {
-                        warn!("[tcp read] deadline exceeded, returning ETIMEDOUT");
-                        return (
-                            Err(LxError::ETIMEDOUT),
-                            Endpoint::Ip(IpEndpoint::UNSPECIFIED),
+                        let (may, rq, sq) = {
+                            let s = get_sockets();
+                            let mut s = s.lock();
+                            let sk = s.get::<TcpSocket>(handle);
+                            (sk.may_recv(), sk.recv_queue(), sk.send_queue())
+                        };
+                        error!(
+                            "[tcp read] deadline exceeded -> EOF handle={} state={:?} may_recv={} recv_queue={} send_queue={} ({})",
+                            handle, state, may, rq, sq,
+                            if rq > 65536 {
+                                "CONSUMER-BLOCKED (app not reading / downstream stall)"
+                            } else if rq == 0 && may {
+                                "PEER-SILENT (window open, no data: lost ACK/window-update)"
+                            } else {
+                                "OTHER"
+                            }
                         );
+                        return (Ok(0), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
                     }
                 }
                 Ok(size) => {
