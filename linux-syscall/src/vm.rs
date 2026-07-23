@@ -526,61 +526,25 @@ impl Syscall<'_> {
         //   * apk's mimalloc aborts ("trying to free from an invalid arena")
         //     mid-`apk update`, killing every package operation;
         //   * Firefox's mozjemalloc red-black tree corrupts (the earlier crash).
-        // Zero the committed, WRITABLE pages in the range so the guarantee
-        // holds. Uncommitted pages already demand-fault in as zero, and
-        // read-only pages are never allocator scratch, so both are left alone.
-        // (This keeps memory committed rather than freeing frames, but that is
-        // an optimisation; correctness — read-as-zero — is what allocators need.)
+        // We DISCARD the range for real (see `Vmar::madv_dontneed`): unmap the
+        // PTEs and drop the VMO frames, so the next touch faults in a fresh zero
+        // page. An earlier version only zeroed page-table-visible pages, which
+        // silently skipped a page whose frame the VMO still held but whose PTE
+        // had been dropped/PROT_NONE'd — mimalloc reused exactly such a page and
+        // found its old bytes, hence the deterministic "corrupted free list
+        // entry" abort during `apk update`.
         const MADV_DONTNEED: usize = 4;
         const MADV_FREE: usize = 8;
         if (advice == MADV_DONTNEED || advice == MADV_FREE) && len != 0 {
-            use kernel_hal::vm::{GenericPageTable, PageTable};
-            let end = addr
-                .checked_add(roundup_pages(len))
-                .ok_or(LxError::EINVAL)?;
-            let pt = PageTable::from_current();
-            let mut va = addr;
-            let mut zeroed = 0usize;
-            let mut protected = 0usize;
-            while va < end {
-                if let Ok((pa, flags, _)) = pt.query(va) {
-                    // Discard = read-back-as-zero. Zero a committed page when it
-                    // is WRITABLE (allocator scratch) OR fully PROT_NONE (empty
-                    // RXW). The PROT_NONE case is the fix: apk's mimalloc
-                    // DECOMMITS an arena region with `mprotect(PROT_NONE)` FIRST,
-                    // then `madvise(MADV_DONTNEED)`. The old `flags.contains(
-                    // WRITE)` gate skipped those already-protected pages, leaving
-                    // stale bytes that reappeared when mimalloc recommitted
-                    // (`mprotect(RW)`) and reused the page — "corrupted free
-                    // list entry". A read-only-but-READABLE page is left alone:
-                    // that is a shared file mapping (library .text/.rodata), and
-                    // zeroing its physmap alias would corrupt the page for every
-                    // process sharing the VMO. `pmem_zero` writes through the
-                    // physmap, so a PROT_NONE page's user protection is no
-                    // obstacle.
-                    let is_none = (flags & MMUFlags::RXW).is_empty();
-                    if flags.contains(MMUFlags::WRITE) || is_none {
-                        kernel_hal::mem::pmem_zero(pa, PAGE_SIZE);
-                        zeroed += 1;
-                        if is_none {
-                            protected += 1;
-                        }
-                    }
-                }
-                va += PAGE_SIZE;
-            }
-            // Do not run PageTable's Drop: it wraps the live CR3 root and would
-            // otherwise try to free the active page-table frames.
-            core::mem::forget(pt);
-            // DIAG [madvtrace]: a non-zero `protected` count proves mimalloc
-            // madvises pages it already PROT_NONE'd — the case the old WRITE
-            // gate silently skipped. error! so it survives LOG=error.
-            if advice == MADV_DONTNEED || advice == MADV_FREE {
-                error!(
-                    "[madvtrace] advice={} addr={:#x} len={:#x} zeroed={} protected={}",
-                    advice, addr, len, zeroed, protected
-                );
-            }
+            // True discard: unmap the PTEs AND drop the underlying VMO frames so
+            // the next access re-faults a fresh zero page. In-place zeroing of
+            // the page-table-visible pages was insufficient — a page whose frame
+            // the VMO still retained but whose PTE was dropped/PROT_NONE'd kept
+            // its stale bytes, and mimalloc's recommit handed that frame back,
+            // aborting with "corrupted free list entry" mid-`apk update`.
+            let proc = self.zircon_process();
+            let vmar = proc.vmar();
+            vmar.madv_dontneed(addr, roundup_pages(len));
         }
         Ok(0)
     }
