@@ -418,7 +418,7 @@ fn make_modeinfo(w: u32, h: u32) -> [u8; 68] {
     m[0..4].copy_from_slice(&clock.to_ne_bytes());
     let wh = w as u16;
     m[4..6].copy_from_slice(&wh.to_ne_bytes()); // hdisplay
-    // hsync_start / hsync_end / htotal: use simple 10 % blanking
+                                                // hsync_start / hsync_end / htotal: use simple 10 % blanking
     let hsync_start = (w + w / 16) as u16;
     let hsync_end = (w + w / 8) as u16;
     m[6..8].copy_from_slice(&hsync_start.to_ne_bytes());
@@ -427,7 +427,7 @@ fn make_modeinfo(w: u32, h: u32) -> [u8; 68] {
     // hskew @12..14 = 0
     let hh = h as u16;
     m[14..16].copy_from_slice(&hh.to_ne_bytes()); // vdisplay
-    // vsync_start / vsync_end / vtotal: use simple 5 % blanking
+                                                  // vsync_start / vsync_end / vtotal: use simple 5 % blanking
     let vsync_start = (h + h / 40) as u16;
     let vsync_end = (h + h / 20) as u16;
     m[16..18].copy_from_slice(&vsync_start.to_ne_bytes());
@@ -435,8 +435,8 @@ fn make_modeinfo(w: u32, h: u32) -> [u8; 68] {
     m[20..22].copy_from_slice(&vtotal.to_ne_bytes());
     // vscan @22..24 = 0
     m[24..28].copy_from_slice(&refresh.to_ne_bytes()); // vrefresh
-    // flags @28..32 = 0
-    // type @32..36: DRM_MODE_TYPE_DRIVER(0x40) | DRM_MODE_TYPE_PREFERRED(0x08)
+                                                       // flags @28..32 = 0
+                                                       // type @32..36: DRM_MODE_TYPE_DRIVER(0x40) | DRM_MODE_TYPE_PREFERRED(0x08)
     m[32..36].copy_from_slice(&0x48u32.to_ne_bytes());
     // name @36..68 ("WxH")
     let mut name = [0u8; 32];
@@ -1027,8 +1027,16 @@ impl INode for DrmDev {
                             ((w * 254 / 960).max(1), (h * 254 / 960).max(1))
                         })
                         .unwrap_or((1, 1));
-                    conn_res.mm_width = if conn.mm_width > 0 { conn.mm_width } else { fallback_w };
-                    conn_res.mm_height = if conn.mm_height > 0 { conn.mm_height } else { fallback_h };
+                    conn_res.mm_width = if conn.mm_width > 0 {
+                        conn.mm_width
+                    } else {
+                        fallback_w
+                    };
+                    conn_res.mm_height = if conn.mm_height > 0 {
+                        conn.mm_height
+                    } else {
+                        fallback_h
+                    };
                     // Real DRM_MODE_CONNECTOR_* from the driver (NVIDIA fills
                     // it from the RM's GET_CONNECTOR_DATA); synthetic and
                     // fallback connectors keep the historical 11.
@@ -1065,7 +1073,10 @@ impl INode for DrmDev {
                     let mut count_props = 0;
                     if drm::get_connector_edid(conn_res.connector_id).is_some() {
                         count_props = 1;
-                        if conn_res.props_ptr != 0 && conn_res.prop_values_ptr != 0 && conn_res.count_props >= 1 {
+                        if conn_res.props_ptr != 0
+                            && conn_res.prop_values_ptr != 0
+                            && conn_res.count_props >= 1
+                        {
                             let blob_id = 20000 + conn_res.connector_id;
                             unsafe {
                                 *(conn_res.props_ptr as *mut u32) = PROP_EDID;
@@ -1098,14 +1109,18 @@ impl INode for DrmDev {
                 // Reporting NONE(0) causes some compositors to skip property
                 // queries and misidentify the output type.
                 enc.encoder_type = 6; // DRM_MODE_ENCODER_VIRTUAL
-                // On the software KMS path the only CRTC is the synthetic one
-                // (id=1). On the hardware KMS path, report crtc_id=0 (no
-                // currently active CRTC) because CRTC 1 does not appear in the
-                // resource list that hardware drivers expose; wlroots will
-                // configure the CRTC itself via SETCRTC.
-                // possible_crtcs=1 means bit 0 = index 0 of the CRTC list,
-                // which is correct in both paths.
-                enc.crtc_id = if drm::software_kms_active() { drm::SYNTH_CRTC_ID } else { 0 };
+                                      // On the software KMS path the only CRTC is the synthetic one
+                                      // (id=1). On the hardware KMS path, report crtc_id=0 (no
+                                      // currently active CRTC) because CRTC 1 does not appear in the
+                                      // resource list that hardware drivers expose; wlroots will
+                                      // configure the CRTC itself via SETCRTC.
+                                      // possible_crtcs=1 means bit 0 = index 0 of the CRTC list,
+                                      // which is correct in both paths.
+                enc.crtc_id = if drm::software_kms_active() {
+                    drm::SYNTH_CRTC_ID
+                } else {
+                    0
+                };
                 enc.possible_crtcs = 1; // bitmask: CRTC index 0
                 enc.possible_clones = 0;
                 Ok(0)
