@@ -311,14 +311,21 @@ impl E1000 {
         (status & 1) != 0
     }
 
-    pub fn send(&mut self, buffer: &[u8]) {
+    /// Post a frame to the TX ring. Returns false (dropping the frame) if the
+    /// target descriptor is still owned by hardware.
+    pub fn send(&mut self, buffer: &[u8]) -> bool {
         let index = self.tx_next_to_use;
         let ring = self.tx_ring.as_ptr::<E1000SendDesc>();
         let desc_addr = unsafe { ring.add(index) };
 
-        // The caller (`NetScheme::send`) gates this on `can_send()` under the
-        // same lock, so the descriptor is guaranteed free (DD set) here.
-        debug_assert!(unsafe { (core::ptr::read_volatile(&((*desc_addr).status)) & 1) != 0 });
+        // Re-check hardware ownership (DD bit) under the CURRENT lock. The
+        // TxToken path checks can_send() under a different lock acquisition than
+        // this send, so on SMP another CPU can consume the slot in between; the
+        // old debug_assert! was compiled out in release and let that race
+        // silently overwrite a descriptor the NIC was still DMA-reading.
+        if unsafe { (core::ptr::read_volatile(&((*desc_addr).status)) & 1) == 0 } {
+            return false;
+        }
 
         // The TX buffer is a single page; never copy more than it can hold,
         // otherwise we would overflow into adjacent DMA buffers.
@@ -346,6 +353,7 @@ impl E1000 {
         }
 
         fence(Ordering::SeqCst);
+        true
     }
 }
 
@@ -495,12 +503,10 @@ impl NetScheme for E1000Interface {
     }
 
     fn send(&self, data: &[u8]) -> DeviceResult<usize> {
-        // Hold the lock across the check and the send: dropping it between
-        // `can_send()` and `send()` let another CPU claim the slot, after which
-        // `send()` would post into a still-in-flight descriptor.
+        // send() re-checks descriptor ownership under this same lock, so a
+        // full/in-flight ring returns NotReady instead of corrupting a slot.
         let mut driver = self.driver.hw.lock();
-        if driver.can_send() {
-            driver.send(data);
+        if driver.send(data) {
             Ok(data.len())
         } else {
             Err(DeviceError::NotReady)
@@ -746,12 +752,17 @@ impl phy::TxToken for E1000TxToken {
         let result = f(&mut buffer[..len]);
 
         let mut driver = self.driver.hw.lock();
-        driver.send(&buffer[..len]);
+        let sent = driver.send(&buffer[..len]);
         drop(driver);
 
-        let mut stats = self.stats.lock();
-        stats.tx_packets += 1;
-        stats.tx_bytes += len as u64;
+        // Only account a frame that was actually posted; if the descriptor was
+        // still in flight, send() dropped it (smoltcp/TCP will retransmit)
+        // rather than overwriting an in-flight slot.
+        if sent {
+            let mut stats = self.stats.lock();
+            stats.tx_packets += 1;
+            stats.tx_bytes += len as u64;
+        }
 
         result
     }
