@@ -271,6 +271,21 @@ impl<L: PageTableLevel, PTE: GenericPTE> GenericPageTable for PageTableImpl<L, P
         flags: Option<MMUFlags>,
     ) -> PagingResult<PageSize> {
         let (entry, size) = self.get_entry_mut(vaddr)?;
+        // Symmetric with `unmap_no_shootdown`/`query`: an update must never
+        // resurrect a decommitted leaf. `get_entry_mut` returns a leaf as long
+        // as the intermediate P4..P1 tables are present, even if the leaf
+        // itself was cleared (e.g. by a prior `unmap`). Without this guard,
+        // `update(va, None, Some(RXW))` on such a cleared leaf stamps
+        // PRESENT|WRITABLE onto an entry whose addr() is 0, producing a phantom
+        // PTE mapping the VA to physical frame 0 — a store then lands in phys 0
+        // with no fault and no VMO commit (the demand-paged anon corruption that
+        // aborted mimalloc/apk with "corrupted free list entry" / SIGSEGV).
+        // Returning NotMapped lets the `.ignore()` at the mprotect/range_change
+        // call sites be the true no-op they assume, so the page stays unmapped
+        // and re-faults cleanly into `handle_page_fault`.
+        if entry.is_unused() {
+            return Err(PagingError::NotMapped);
+        }
         if let Some(paddr) = paddr {
             entry.set_addr(paddr);
         }
