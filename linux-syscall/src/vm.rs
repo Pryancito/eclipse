@@ -190,6 +190,17 @@ impl Syscall<'_> {
             // hunter P3: remember a writable mapping so a later mprotect(EXEC)
             // over it is recognised as the two-step W^X bypass.
             hunter::record_mapping(pid, addr, len, want_write);
+            // DIAG [mmaptrace]: log the arena-sized anon mmaps (mimalloc's
+            // over-allocate-and-trim dance) with the RESULT address, at error!
+            // so it survives LOG=error. Compared against a native strace this
+            // reveals any divergence (wrong/overlapping address) behind apk's
+            // deterministic mimalloc corruption. Gated at >=1 MiB to stay quiet.
+            if len >= 1 << 20 {
+                error!(
+                    "[mmaptrace] mmap(anon) len={:#x} prot={:?} flags={:?} -> {:#x}",
+                    len, prot, flags, addr
+                );
+            }
             Ok(addr)
         } else {
             let file_like = self.linux_process().get_file_like(fd)?;
@@ -417,7 +428,19 @@ impl Syscall<'_> {
         // no-op. But under W^X *enforcement* a failed *narrowing* that leaves
         // pages more permissive than requested would be a silent bypass, so we
         // surface the error instead of swallowing it.
-        match vmar.protect(addr, len, flags) {
+        // DIAG [mmaptrace]: mimalloc's guard-page (PROT_NONE) and commit
+        // (PROT_READ|WRITE) mprotects. A guard that silently fails to protect,
+        // or a commit that fails to restore write access, diverges from the
+        // native strace and localises the corruption. error!, gated to
+        // PROT_NONE or >=1 MiB to stay quiet.
+        let r = vmar.protect(addr, len, flags);
+        if flags & MMUFlags::RXW == MMUFlags::empty() || len >= 1 << 20 {
+            error!(
+                "[mmaptrace] mprotect addr={:#x} len={:#x} prot={:?} -> {:?}",
+                addr, len, prot, r
+            );
+        }
+        match r {
             Ok(()) => Ok(0),
             Err(e) => {
                 if hunter::policy::wx_mode() == hunter::Mode::Enforce {
@@ -460,7 +483,18 @@ impl Syscall<'_> {
         // hunter P3: the range is gone, so drop its W^X writable-history.
         hunter::check_munmap(proc.id(), addr, len);
         let vmar = proc.vmar();
-        vmar.unmap(addr, len)?;
+        let r = vmar.unmap(addr, len);
+        // DIAG [mmaptrace]: the trim-unmaps of mimalloc's over-allocated arena
+        // (prefix/suffix). A FAILED partial unmap here would leave two segments
+        // aliased — exactly the deterministic mimalloc corruption. error! so it
+        // survives LOG=error; gated at >=1 MiB to stay quiet.
+        if len >= 1 << 20 {
+            error!(
+                "[mmaptrace] munmap addr={:#x} len={:#x} -> {:?}",
+                addr, len, r
+            );
+        }
+        r?;
         Ok(0)
     }
 
