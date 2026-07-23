@@ -540,10 +540,31 @@ impl Syscall<'_> {
                 .ok_or(LxError::EINVAL)?;
             let pt = PageTable::from_current();
             let mut va = addr;
+            let mut zeroed = 0usize;
+            let mut protected = 0usize;
             while va < end {
                 if let Ok((pa, flags, _)) = pt.query(va) {
-                    if flags.contains(MMUFlags::WRITE) {
+                    // Discard = read-back-as-zero. Zero a committed page when it
+                    // is WRITABLE (allocator scratch) OR fully PROT_NONE (empty
+                    // RXW). The PROT_NONE case is the fix: apk's mimalloc
+                    // DECOMMITS an arena region with `mprotect(PROT_NONE)` FIRST,
+                    // then `madvise(MADV_DONTNEED)`. The old `flags.contains(
+                    // WRITE)` gate skipped those already-protected pages, leaving
+                    // stale bytes that reappeared when mimalloc recommitted
+                    // (`mprotect(RW)`) and reused the page — "corrupted free
+                    // list entry". A read-only-but-READABLE page is left alone:
+                    // that is a shared file mapping (library .text/.rodata), and
+                    // zeroing its physmap alias would corrupt the page for every
+                    // process sharing the VMO. `pmem_zero` writes through the
+                    // physmap, so a PROT_NONE page's user protection is no
+                    // obstacle.
+                    let is_none = (flags & MMUFlags::RXW).is_empty();
+                    if flags.contains(MMUFlags::WRITE) || is_none {
                         kernel_hal::mem::pmem_zero(pa, PAGE_SIZE);
+                        zeroed += 1;
+                        if is_none {
+                            protected += 1;
+                        }
                     }
                 }
                 va += PAGE_SIZE;
@@ -551,6 +572,15 @@ impl Syscall<'_> {
             // Do not run PageTable's Drop: it wraps the live CR3 root and would
             // otherwise try to free the active page-table frames.
             core::mem::forget(pt);
+            // DIAG [madvtrace]: a non-zero `protected` count proves mimalloc
+            // madvises pages it already PROT_NONE'd — the case the old WRITE
+            // gate silently skipped. error! so it survives LOG=error.
+            if advice == MADV_DONTNEED || advice == MADV_FREE {
+                error!(
+                    "[madvtrace] advice={} addr={:#x} len={:#x} zeroed={} protected={}",
+                    advice, addr, len, zeroed, protected
+                );
+            }
         }
         Ok(0)
     }
