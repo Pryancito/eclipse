@@ -477,6 +477,14 @@ impl Socket for NetlinkSocketState {
                 }
                 push_ack(&mut buffer, header, reply_pid);
             }
+            NetlinkMessageType::SetLink => {
+                // ip link set dev <if> up/down/mtu/etc.
+                // We acknowledge the request but take no action: the link state
+                // is managed by the NIC driver (e1000e watches STATUS_LU) and
+                // MTU changes are not yet supported. Returning EOPNOTSUPP here
+                // caused udhcpc's post-DHCP script to fail on "ip link set eth0 up".
+                push_ack(&mut buffer, header, reply_pid);
+            }
             _ => {
                 // Unknown/unimplemented request: return NLMSG_ERROR with -EOPNOTSUPP.
                 // This is better than a silent NLMSG_DONE which confuses userland.
@@ -1047,11 +1055,7 @@ fn push_route_dump_entry(
         rtm_protocol: 4, // RTPROT_STATIC
         rtm_scope: scope,
         rtm_type: 2, // RTN_UNICAST
-        rtm_flags: if route.gateway.is_some() {
-            0x0001 | 0x0002
-        } else {
-            0x0001
-        },
+        rtm_flags: 0,
     };
     msg.align4();
     msg.push_ext(rtm);
