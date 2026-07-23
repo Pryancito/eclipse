@@ -558,7 +558,12 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                 let pc = thread
                     .with_context(|ctx| ctx.get_field(UserContextField::InstrPointer))
                     .unwrap_or(0);
-                warn!(
+                // error! (not warn!): a userspace SIGSEGV is exactly what a
+                // desktop bring-up needs to see, and the default log level on
+                // some builds is `error`, which would otherwise discard the
+                // whole crash dump below and leave a `Done(139)` with nothing
+                // in dmesg to diagnose it.
+                error!(
                     "unhandled page fault @ {:#x}({:?}): {:?}, pid={} proc={} pc={:#x} -> SIGSEGV",
                     vaddr,
                     flags,
@@ -591,7 +596,7 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                         })
                         .ok()
                     {
-                        warn!(
+                        error!(
                             "[crash] pid={} pc={:#x} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x} r8={:#x}",
                             pid, pc, rax, rbx, rcx, rdx, rsi, rdi, rbp, r8to11,
                         );
@@ -608,12 +613,12 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                         }
                     }
                     if any {
-                        warn!(
+                        error!(
                             "[crash] pid={} code@{:#x} (pc-16): {:02x?}",
                             pid, start, code
                         );
                     } else {
-                        warn!(
+                        error!(
                             "[crash] pid={} pc={:#x} UNMAPPED (jumped through a bad pointer)",
                             pid, pc
                         );
