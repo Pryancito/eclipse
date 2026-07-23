@@ -504,7 +504,7 @@ impl Syscall<'_> {
             let end = addr
                 .checked_add(roundup_pages(len))
                 .ok_or(LxError::EINVAL)?;
-            let mut pt = PageTable::from_current();
+            let pt = PageTable::from_current();
             let mut va = addr;
             while va < end {
                 if let Ok((pa, flags, _)) = pt.query(va) {
