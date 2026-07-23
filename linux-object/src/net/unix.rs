@@ -419,10 +419,22 @@ impl Socket for UnixSocketState {
         if pi.read_closed {
             return Err(LxError::EPIPE);
         }
-        pi.buffer.extend(data.iter().copied());
-        pi.total_written += data.len();
+        // Bound the peer's inbound buffer so a peer that never reads cannot grow
+        // it without limit and exhaust the fixed kernel heap (a local DoS). Write
+        // only what fits and return that count (correct stream semantics — the
+        // syscall layer already loops on short writes); return EAGAIN when the
+        // buffer is completely full. This method is synchronous and never blocked
+        // before, so no blocking behavior is lost.
+        const UNIX_STREAM_BUF_MAX: usize = 4 * 1024 * 1024;
+        let space = UNIX_STREAM_BUF_MAX.saturating_sub(pi.buffer.len());
+        if space == 0 {
+            return Err(LxError::EAGAIN);
+        }
+        let n = data.len().min(space);
+        pi.buffer.extend(data[..n].iter().copied());
+        pi.total_written += n;
         pi.eventbus.set(Event::READABLE);
-        Ok(data.len())
+        Ok(n)
     }
 
     // -----------------------------------------------------------------------

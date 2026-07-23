@@ -1525,21 +1525,40 @@ fn timestamp_entropy() -> u64 {
     }
 }
 
-#[allow(unsafe_code)]
-/// missing documentation
+/// Allocate a local ephemeral port in the dynamic range [49152, 65535].
+///
+/// Uses an atomic counter, seeded once from [`rand`]: the previous `static mut`
+/// read-modify-write was a data race (UB) under SMP and could hand the same port
+/// to two concurrent `connect()`s. NOTE: this does not (cannot) consult the
+/// smoltcp `SocketSet` for an in-use collision — some callers invoke this while
+/// already holding the global SOCKETS lock (e.g. tcp `connect`), so re-locking
+/// it here would deadlock. The random seed plus the monotonically advancing
+/// counter makes a same-4-tuple collision unlikely in practice.
 fn get_ephemeral_port() -> u16 {
-    // TODO selects non-conflict high port
-    static mut EPHEMERAL_PORT: u16 = 0;
-    unsafe {
-        if EPHEMERAL_PORT == 0 {
-            EPHEMERAL_PORT = (49152 + rand() % (65536 - 49152)) as u16;
-        }
-        if EPHEMERAL_PORT == 65535 {
-            EPHEMERAL_PORT = 49152;
+    use core::sync::atomic::{AtomicU16, Ordering};
+    const LOW: u16 = 49152;
+    static EPHEMERAL_PORT: AtomicU16 = AtomicU16::new(0);
+    // Seed once on first use (the seed is always in [LOW, 65535], never 0).
+    let _ = EPHEMERAL_PORT.compare_exchange(
+        0,
+        LOW + (rand() % (65536 - LOW as u64)) as u16,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+    // Atomically advance, wrapping within the dynamic range.
+    loop {
+        let cur = EPHEMERAL_PORT.load(Ordering::Relaxed);
+        let next = if cur >= 65535 || cur < LOW {
+            LOW
         } else {
-            EPHEMERAL_PORT += 1;
+            cur + 1
+        };
+        if EPHEMERAL_PORT
+            .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return next;
         }
-        EPHEMERAL_PORT
     }
 }
 

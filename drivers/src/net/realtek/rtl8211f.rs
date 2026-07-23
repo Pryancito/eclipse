@@ -917,14 +917,22 @@ where
 
         // 再判断下环形缓冲区的空间
 
-        flush_cache(
-            virt_to_phys(&self.send_ring[desc_count] as *const DmaDesc as usize) as u64,
-            size_of::<DmaDesc>() as u64,
-        );
+        // DMA store ordering: the payload MUST be visible in RAM before the NIC
+        // can observe OWN=1, or it may DMA stale bytes onto the wire. Flush the
+        // buffer first, fence, then flush the descriptor carrying OWN, then
+        // fence. Previously the descriptor (OWN=1) was flushed first with no
+        // fence, so a back-to-back transmit could let the NIC follow the chain
+        // into this descriptor before the payload write-back completed.
         flush_cache(
             virt_to_phys(self.send_buffers[desc_count] as usize) as u64,
             send_buff.len() as u64,
         );
+        fence_w();
+        flush_cache(
+            virt_to_phys(&self.send_ring[desc_count] as *const DmaDesc as usize) as u64,
+            size_of::<DmaDesc>() as u64,
+        );
+        fence_w();
 
         info!(
             "######### TX Descriptor DMA: {:#x}",
