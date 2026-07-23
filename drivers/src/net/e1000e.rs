@@ -1666,9 +1666,20 @@ impl E1000eInterface {
         // e1000.rs and rtlx.rs document this exact hazard; rely on the Mutex alone.
         let sockets = get_sockets();
         let mut had_rx = (irq_icr & ICR_RX_ANY) != 0;
+        // Acquire the socket set + iface with try_lock, exactly as the loopback
+        // driver does. A blocking `lock()` here DEADLOCKS: this poll runs from a
+        // deferred job that a socket syscall drains WHILE it holds the socket
+        // set (e.g. a read/write draining the NIC to make progress), so on this
+        // IRQ-off single-CPU kernel the acquire spins forever on a lock the same
+        // CPU already owns — the >8s spinlock the red banner reported at this
+        // line during a large `apk`/`wget` download. If either lock is held,
+        // skip the smoltcp poll: the frame that owns the socket set drives it on
+        // release, and `handle_rx_irq` above already serviced the RX-overrun bit
+        // so nothing is lost.
+        if let (Some(mut sockets), Some(mut iface)) =
+            (sockets.try_lock(), self.iface.try_lock())
         {
-            let mut sockets = sockets.lock();
-            match self.iface.lock().poll(&mut sockets, ts) {
+            match iface.poll(&mut sockets, ts) {
                 Ok(true) => had_rx = true,
                 Ok(false) => {}
                 Err(e) => warn!("e1000e smoltcp poll: {:?}", e),
