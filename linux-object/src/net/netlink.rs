@@ -92,11 +92,14 @@ impl Socket for NetlinkSocketState {
                     None
                 } else {
                     let msg = buffer.remove(0);
-                    info!(
-                        "[netlink] read: type={}, len={}",
-                        u16::from_le_bytes([msg[4], msg[5]]),
-                        msg.len()
-                    );
+                    // Guard the header index: a short/partial buffer would panic
+                    // on `msg[4]`/`msg[5]`.
+                    let msg_type = if msg.len() >= 6 {
+                        u16::from_le_bytes([msg[4], msg[5]])
+                    } else {
+                        0
+                    };
+                    info!("[netlink] read: type={}, len={}", msg_type, msg.len());
                     Some(msg)
                 }
             };
@@ -107,10 +110,12 @@ impl Socket for NetlinkSocketState {
                     if n != 0 {
                         data[..n].copy_from_slice(&msg[..n]);
                     }
-                    if n < msg.len() {
-                        self.data.lock().insert(0, msg[n..].to_vec());
-                    }
-                    info!("[netlink] read hex: {:?}", &msg[..n.min(msg.len())]);
+                    // Netlink is a datagram protocol: a message larger than the
+                    // caller's buffer is truncated and its remainder DISCARDED
+                    // (Linux would set MSG_TRUNC). Do NOT re-queue `msg[n..]` as a
+                    // new message — a headerless fragment corrupts netlink framing
+                    // for the next reader and can be indexed out of bounds.
+                    info!("[netlink] read hex: {:?}", &msg[..n]);
                     return (Ok(n), endpoint);
                 }
                 None if non_block => return (Err(LxError::EAGAIN), endpoint),
@@ -871,7 +876,11 @@ fn parse_ifaddr_cidr(data: &[u8]) -> Option<(u32, IpCidr)> {
         #[allow(unsafe_code)]
         let rta = unsafe { &*(data[ptr..].as_ptr() as *const RouteAttr) };
         let rta_len = rta.rta_len as usize;
-        if rta_len < size_of::<RouteAttr>() {
+        // `rta_len` is attacker-controlled (from the user-supplied buffer).
+        // Require BOTH bounds (Linux `RTA_OK`): the header minimum AND that the
+        // whole attribute fits, otherwise the `data[..ptr + rta_len]` slice
+        // below would panic the kernel.
+        if rta_len < size_of::<RouteAttr>() || rta_len > data.len() - ptr {
             break;
         }
         let payload = &data[ptr + size_of::<RouteAttr>()..ptr + rta_len];
@@ -927,7 +936,9 @@ fn parse_route_request(data: &[u8]) -> Option<(RouteMsg, IpCidr, Option<IpAddres
         #[allow(unsafe_code)]
         let rta = unsafe { &*(data[ptr..].as_ptr() as *const RouteAttr) };
         let rta_len = rta.rta_len as usize;
-        if rta_len < size_of::<RouteAttr>() {
+        // `rta_len` is attacker-controlled; require BOTH bounds (Linux `RTA_OK`)
+        // so the `data[..ptr + rta_len]` slice below cannot panic the kernel.
+        if rta_len < size_of::<RouteAttr>() || rta_len > data.len() - ptr {
             break;
         }
         let payload = &data[ptr + size_of::<RouteAttr>()..ptr + rta_len];

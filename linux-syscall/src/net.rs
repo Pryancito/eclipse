@@ -51,6 +51,28 @@ fn read_sockaddr(addr: usize, addrlen: usize) -> Result<SockAddr, LxError> {
     Ok(storage)
 }
 
+/// Copy an option value out to a `getsockopt` caller.
+///
+/// `optlen` is a value-result argument (like Linux's `optlen`): the kernel must
+/// write at most the caller-supplied `*optlen` bytes and then store the true
+/// size back. Previously `optlen` was write-only and the input size was ignored,
+/// so an option larger than the caller's buffer (e.g. the 12-byte SO_PEERCRED
+/// `ucred` written into a 4-byte buffer) overflowed adjacent user memory.
+fn write_sockopt_out(
+    optval: UserOutPtr<u32>,
+    mut optlen: UserInOutPtr<u32>,
+    value: &[u8],
+) -> SysResult {
+    let max = optlen.read()? as usize;
+    let n = value.len().min(max);
+    if n > 0 {
+        let mut dst: UserOutPtr<u8> = optval.as_addr().into();
+        dst.write_array(&value[..n])?;
+    }
+    optlen.write(value.len() as u32)?;
+    Ok(0)
+}
+
 impl Syscall<'_> {
     /// creates an endpoint for communication and returns a file descriptor that refers to that endpoint.
     pub fn sys_socket(&mut self, domain: usize, _type: usize, protocol: usize) -> SysResult {
@@ -225,8 +247,8 @@ impl Syscall<'_> {
         sockfd: usize,
         level: usize,
         optname: usize,
-        mut optval: UserOutPtr<u32>,
-        mut optlen: UserOutPtr<u32>,
+        optval: UserOutPtr<u32>,
+        optlen: UserInOutPtr<u32>,
     ) -> SysResult {
         info!(
             "sys_getsockopt: sockfd:{}, level:{}, optname:{}, optval:{:?} , optlen:{:?}",
@@ -235,11 +257,9 @@ impl Syscall<'_> {
         let level = match Level::try_from(level) {
             Ok(level) => level,
             Err(_) => {
-                // Unknown levels (e.g. SOL_PACKET=263) — return Ok(0) to be lenient.
+                // Unknown levels (e.g. SOL_PACKET=263) — return a zeroed int.
                 warn!("getsockopt: unsupported level: {}", level);
-                optval.write(0)?;
-                optlen.write(size_of::<u32>() as u32)?;
-                return Ok(0);
+                return write_sockopt_out(optval, optlen, &0u32.to_ne_bytes());
             }
         };
         if optval.is_null() {
@@ -262,9 +282,12 @@ impl Syscall<'_> {
                         .ok()
                         .and_then(|s| s.peer_pid())
                         .unwrap_or(1);
-                    optval.write_array(&[pid as u32, 0u32, 0u32])?;
-                    optlen.write(12)?; // sizeof(struct ucred)
-                    return Ok(0);
+                    let ucred: [u32; 3] = [pid as u32, 0, 0];
+                    let mut bytes = [0u8; 12];
+                    for (i, w) in ucred.iter().enumerate() {
+                        bytes[i * 4..i * 4 + 4].copy_from_slice(&w.to_ne_bytes());
+                    }
+                    return write_sockopt_out(optval, optlen, &bytes);
                 }
                 let optname = match SolOptname::try_from(optname) {
                     Ok(optname) => optname,
@@ -280,35 +303,18 @@ impl Syscall<'_> {
                     .as_socket()?
                     .get_buffer_capacity()
                     .unwrap_or((64 * 1024, 64 * 1024));
-                debug!("sys_getsockopt recv and send buffer capacity: {}, {}. optval: {:?}, optlen: {:?}", recv_buf_ca, send_buf_ca, optval.check(), optlen.check());
 
                 match optname {
                     SolOptname::SNDBUF => {
-                        optval.write(send_buf_ca as u32)?;
-                        optlen.write(size_of::<u32>() as u32)?;
-                        Ok(0)
+                        write_sockopt_out(optval, optlen, &(send_buf_ca as u32).to_ne_bytes())
                     }
                     SolOptname::RCVBUF => {
-                        optval.write(recv_buf_ca as u32)?;
-                        optlen.write(size_of::<u32>() as u32)?;
-                        Ok(0)
+                        write_sockopt_out(optval, optlen, &(recv_buf_ca as u32).to_ne_bytes())
                     }
-                    SolOptname::REUSEADDR => {
-                        optval.write(1)?;
-                        optlen.write(size_of::<u32>() as u32)?;
-                        Ok(0)
-                    }
-                    SolOptname::ERROR => {
-                        optval.write(0)?;
-                        optlen.write(size_of::<u32>() as u32)?;
-                        Ok(0)
-                    }
-                    SolOptname::LINGER => {
-                        // Return zero-linger: l_onoff=0, l_linger=0
-                        optval.write(0)?;
-                        optlen.write(8)?; // sizeof(struct linger)
-                        Ok(0)
-                    }
+                    SolOptname::REUSEADDR => write_sockopt_out(optval, optlen, &1u32.to_ne_bytes()),
+                    SolOptname::ERROR => write_sockopt_out(optval, optlen, &0u32.to_ne_bytes()),
+                    // struct linger { int l_onoff; int l_linger; } — zero-linger.
+                    SolOptname::LINGER => write_sockopt_out(optval, optlen, &[0u8; 8]),
                 }
             }
             Level::IPPROTO_TCP => {
@@ -332,11 +338,7 @@ impl Syscall<'_> {
                     }
                 };
                 match optname {
-                    IpOptname::HDRINCL => {
-                        optval.write(0)?;
-                        optlen.write(size_of::<u32>() as u32)?;
-                        Ok(0)
-                    }
+                    IpOptname::HDRINCL => write_sockopt_out(optval, optlen, &0u32.to_ne_bytes()),
                 }
             }
         }
@@ -365,13 +367,17 @@ impl Syscall<'_> {
             Some(endpoint)
         };
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
-        file_like
+        // Return the socket's ACTUAL queued byte count, not the full requested
+        // `len`. TCP `write()` can perform a short write (queues min(len, free TX
+        // space)); reporting `len` regardless makes the caller believe bytes it
+        // never sent were delivered, silently truncating the stream.
+        let written = file_like
             .clone()
             .as_socket()?
             .write(buf.as_slice(len)?, endpoint)?;
         // Do not drain_net_poll here — busybox ping uses sendto; 32× poll_ifaces
         // blocks for a long time (smoltcp + SOCKETS lock). Sockets drive RX in read/poll.
-        Ok(len)
+        Ok(written)
     }
 
     /// receive messages from a socket
@@ -438,11 +444,16 @@ impl Syscall<'_> {
             let cmsg_len = u64::from_ne_bytes(ctrl[off..off + 8].try_into().unwrap()) as usize;
             let level = i32::from_ne_bytes(ctrl[off + 8..off + 12].try_into().unwrap());
             let typ = i32::from_ne_bytes(ctrl[off + 12..off + 16].try_into().unwrap());
-            if cmsg_len < CMSG_HDR_LEN || off + cmsg_len > ctrl.len() {
-                break;
-            }
+            // `cmsg_len` is attacker-controlled; compute the message end with
+            // checked arithmetic so a value near usize::MAX cannot wrap past the
+            // `> ctrl.len()` guard (which would then slice with start > end and
+            // panic the kernel).
+            let cmsg_end = match off.checked_add(cmsg_len) {
+                Some(end) if cmsg_len >= CMSG_HDR_LEN && end <= ctrl.len() => end,
+                _ => break,
+            };
             if level == SOL_SOCKET_LEVEL && typ == SCM_RIGHTS {
-                for chunk in ctrl[off + CMSG_HDR_LEN..off + cmsg_len].chunks_exact(4) {
+                for chunk in ctrl[off + CMSG_HDR_LEN..cmsg_end].chunks_exact(4) {
                     let raw = i32::from_ne_bytes(chunk.try_into().unwrap());
                     if raw >= 0 {
                         if let Ok(fl) = proc.get_file_like(FileDesc::from(raw as usize)) {
@@ -451,7 +462,16 @@ impl Syscall<'_> {
                     }
                 }
             }
-            off += (cmsg_len + 7) & !7; // CMSG_ALIGN
+            // CMSG_ALIGN(cmsg_len); use checked arithmetic and require forward
+            // progress so a wrapped/zero step cannot spin forever.
+            let step = match cmsg_len.checked_add(7).map(|v| v & !7) {
+                Some(s) if s > 0 => s,
+                _ => break,
+            };
+            off = match off.checked_add(step) {
+                Some(n) => n,
+                None => break,
+            };
         }
         fds
     }
@@ -478,7 +498,14 @@ impl Syscall<'_> {
         let data = iovs.read_to_vec()?;
 
         // SCM_RIGHTS: resolve any attached fds before queueing the bytes.
+        // `msg_controllen` is fully user-controlled; bound it before `read_array`
+        // so a huge value cannot request a multi-GiB allocation (alloc abort) or
+        // walk off the mapped control buffer. Linux bounds this by optmem_max.
+        const CONTROL_MAX: usize = 64 * 1024;
         let passed_fds = if !hdr.msg_control.is_null() && hdr.msg_controllen >= 16 {
+            if hdr.msg_controllen > CONTROL_MAX {
+                return Err(LxError::EINVAL);
+            }
             let ctrl = hdr.msg_control.read_array(hdr.msg_controllen)?;
             self.collect_scm_rights_fds(&ctrl)
         } else {
@@ -497,12 +524,14 @@ impl Syscall<'_> {
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
         let socket_fl = file_like.clone();
         let socket = socket_fl.as_socket()?;
-        socket.write(&data, endpoint)?;
+        // Return the actual queued byte count (a TCP short write can queue less
+        // than `data.len()`); reporting the full length silently drops the tail.
+        let written = socket.write(&data, endpoint)?;
         if !passed_fds.is_empty() {
             // Hand the fds to the peer (delivered with its next recvmsg).
             let _ = socket.send_fds(passed_fds);
         }
-        Ok(data.len())
+        Ok(written)
     }
 
     /// receive messages from a socket
@@ -695,6 +724,17 @@ impl Syscall<'_> {
             "sys_accept4: sockfd:{}, addr:{:?}, addrlen={:?}, flags={:#x}",
             sockfd, addr, addrlen, flags
         );
+        // Validate flags BEFORE accept() consumes a connection from the queue.
+        // SOCK_NONBLOCK / SOCK_CLOEXEC requested for the accepted socket; any
+        // other bit is invalid (GLib's GDBus path only ever passes these two).
+        // Previously this ran after accept(), so a bad flag accepted then
+        // dropped an established client connection.
+        const SOCK_NONBLOCK: usize = 0o4000;
+        const SOCK_CLOEXEC: usize = 0o2000000;
+        if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+            return Err(LxError::EINVAL);
+        }
+
         // smoltcp tcp sockets do not support backlog
         // open multiple sockets for each connection
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
@@ -706,23 +746,20 @@ impl Syscall<'_> {
             new_socket.flags()
         );
 
-        // SOCK_NONBLOCK / SOCK_CLOEXEC requested for the accepted socket; any
-        // other bit is invalid (GLib's GDBus path only ever passes these two).
-        const SOCK_NONBLOCK: usize = 0o4000;
-        const SOCK_CLOEXEC: usize = 0o2000000;
-        if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
-            return Err(LxError::EINVAL);
-        }
         if flags != 0 {
             let new_flags = OpenFlags::from_bits_truncate(flags);
             new_socket.set_flags(new_flags)?;
         }
 
-        let new_fd = self.linux_process().add_socket(new_socket)?;
+        // Copy the peer address out BEFORE installing the fd, so a bad addr/
+        // addrlen pointer fails the syscall (EFAULT) without leaking the
+        // accepted fd into the process table (Linux copies the address out
+        // before fd_install).
         if !addr.is_null() {
             let sockaddr_in = SockAddr::from(remote_endpoint);
             sockaddr_in.write_to(addr, addrlen)?;
         }
+        let new_fd = self.linux_process().add_socket(new_socket)?;
         Ok(new_fd.into())
     }
 

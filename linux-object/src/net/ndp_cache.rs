@@ -24,21 +24,32 @@ fn is_local_mac(mac: EthernetAddress) -> bool {
 
 const CACHE_MAX: usize = 512;
 
+/// How long a learned entry stays valid (ms) before it is re-resolved.
+const REACHABLE_MS: u64 = 60_000;
+
+fn now_ms() -> u64 {
+    kernel_hal::timer::timer_now().as_millis() as u64
+}
+
 lazy_static! {
-    static ref CACHE: Mutex<BTreeMap<Ipv6Address, EthernetAddress>> = Mutex::new(BTreeMap::new());
+    /// value = (MAC, learn timestamp in ms) for TTL expiry and LRU eviction.
+    static ref CACHE: Mutex<BTreeMap<Ipv6Address, (EthernetAddress, u64)>> =
+        Mutex::new(BTreeMap::new());
 }
 
 fn insert_bounded(
-    map: &mut BTreeMap<Ipv6Address, EthernetAddress>,
+    map: &mut BTreeMap<Ipv6Address, (EthernetAddress, u64)>,
     ip: Ipv6Address,
     mac: EthernetAddress,
 ) {
     if map.len() >= CACHE_MAX && !map.contains_key(&ip) {
-        if let Some(old) = map.keys().next().copied() {
+        // Evict the OLDEST entry (by learn time), not the numerically smallest
+        // IP, so an attacker cannot deterministically flush a chosen entry.
+        if let Some(old) = map.iter().min_by_key(|(_, (_, ts))| *ts).map(|(&ip, _)| ip) {
             map.remove(&old);
         }
     }
-    map.insert(ip, mac);
+    map.insert(ip, (mac, now_ms()));
 }
 
 /// Learn mappings from a complete Ethernet frame (called from `push_packet`).
@@ -81,12 +92,10 @@ pub fn learn_from_frame(frame: &[u8]) {
     };
 
     match repr {
-        Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
-            target_addr,
-            lladdr,
-            ..
-        })
-        | Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
+        // Neighbor Advertisement: `target_addr` is the address the sender OWNS
+        // and `lladdr` is its Target Link-Layer Address, so `target_addr ->
+        // lladdr` is the correct mapping.
+        Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
             target_addr,
             lladdr,
             ..
@@ -95,12 +104,25 @@ pub fn learn_from_frame(frame: &[u8]) {
                 insert_bounded(&mut *CACHE.lock(), target_addr, lladdr.unwrap_or(src_mac));
             }
         }
+        // Neighbor Solicitation: `target_addr` is the address being QUERIED (it
+        // is NOT owned by the sender) and `lladdr` is the sender's Source
+        // Link-Layer Address. Learning `target_addr -> lladdr` here would map the
+        // queried IP to the querier's MAC -- a bogus/poisoned entry that redirects
+        // traffic for `target_addr` to whoever solicited it, and corrupts the
+        // cache even under benign NS traffic. The correct `src_ip -> src_mac`
+        // mapping is already learned from the IPv6 header above.
         _ => {}
     }
 }
 
 pub fn lookup(dst: Ipv6Address) -> Option<EthernetAddress> {
-    let mac = CACHE.lock().get(&dst).copied()?;
+    let mut cache = CACHE.lock();
+    let (mac, ts) = *cache.get(&dst)?;
+    // Expire stale entries so a changed/spoofed MAC is re-resolved.
+    if now_ms().saturating_sub(ts) > REACHABLE_MS {
+        cache.remove(&dst);
+        return None;
+    }
     if is_local_mac(mac) {
         return None;
     }
@@ -112,5 +134,9 @@ pub fn clear() {
 }
 
 pub fn get_entries() -> alloc::vec::Vec<(Ipv6Address, EthernetAddress)> {
-    CACHE.lock().iter().map(|(&ip, &mac)| (ip, mac)).collect()
+    CACHE
+        .lock()
+        .iter()
+        .map(|(&ip, &(mac, _))| (ip, mac))
+        .collect()
 }
