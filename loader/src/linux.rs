@@ -417,7 +417,7 @@ fn handle_signal(
             };
             let base = rsp & !0x7;
             let mut words = alloc::vec::Vec::new();
-            for i in 0..40usize {
+            for i in 0..96usize {
                 match rd(base + i * 8) {
                     Some(w) => words.push(w),
                     None => break,
