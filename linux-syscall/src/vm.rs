@@ -502,12 +502,12 @@ impl Syscall<'_> {
         const MADV_DONTNEED: usize = 4;
         const MADV_FREE: usize = 8;
         if (advice == MADV_DONTNEED || advice == MADV_FREE) && len != 0 {
-            // True discard: unmap the PTEs AND drop the underlying VMO frames so
-            // the next access re-faults a fresh zero page. In-place zeroing of
-            // the page-table-visible pages was insufficient — a page whose frame
-            // the VMO still retained but whose PTE was dropped/PROT_NONE'd kept
-            // its stale bytes, and mimalloc's recommit handed that frame back,
-            // aborting with "corrupted free list entry" mid-`apk update`.
+            // Zero the committed pages in the range THROUGH THE VMO so they read
+            // back as zero on next access — including pages whose PTE was dropped
+            // or turned PROT_NONE, which a page-table walk cannot see (that gap
+            // let mimalloc reuse a stale frame and abort). Done in place, leaving
+            // the mapping and frames intact (an earlier unmap+decommit variant
+            // turned the abort into a SIGSEGV).
             let proc = self.zircon_process();
             let vmar = proc.vmar();
             vmar.madv_dontneed(addr, roundup_pages(len));
