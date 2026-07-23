@@ -378,6 +378,52 @@ impl VmAddressRegion {
         Ok(())
     }
 
+    /// `madvise(MADV_DONTNEED)` — discard the committed pages in `[addr, addr+len)`
+    /// so the next access reads back as zero (anonymous) / re-reads from source
+    /// (file-backed private).
+    ///
+    /// Zeroing the page in place is NOT enough: apk's mimalloc decommits an
+    /// arena region with `mprotect(PROT_NONE)` and reuses it later; a page whose
+    /// PTE was dropped/plain-protected still keeps its frame in the VMO, and the
+    /// recommit fault hands that STALE frame back — mimalloc then reads old bytes
+    /// where it assumes fresh OS zeros and aborts ("corrupted free list entry").
+    /// The fix is a true discard: unmap the PTE AND drop the VMO frame, so the
+    /// re-fault installs a brand-new zero page.
+    pub fn madv_dontneed(&self, addr: VirtAddr, len: usize) {
+        if !page_aligned(addr) || len == 0 {
+            return;
+        }
+        let end = addr + len;
+        let (mappings, children) = {
+            let guard = self.inner.lock();
+            let inner = match guard.as_ref() {
+                Some(i) => i,
+                None => return,
+            };
+            let m: Vec<_> = inner
+                .mappings
+                .iter()
+                .filter(|map| map.end_addr() > addr && map.addr() < end)
+                .cloned()
+                .collect();
+            let c: Vec<_> = inner
+                .children
+                .iter()
+                .filter(|ch| ch.end_addr() > addr && ch.addr() < end)
+                .cloned()
+                .collect();
+            (m, c)
+        };
+        for map in mappings {
+            map.dontneed(addr.max(map.addr()), end.min(map.end_addr()));
+        }
+        for child in children {
+            let cb = addr.max(child.addr());
+            let ce = end.min(child.end_addr());
+            child.madv_dontneed(cb, ce - cb);
+        }
+    }
+
     /// Unmap all mappings within the VMAR, and destroy all sub-regions of the region.
     pub fn destroy(self: &Arc<Self>) -> ZxResult {
         self.destroy_internal()?;
@@ -1042,6 +1088,49 @@ impl VmMapping {
         }
         if start_index < end_index {
             pg_table.remote_flush_all();
+        }
+    }
+
+    /// `madvise(MADV_DONTNEED)` for the sub-range `[begin, end)` of this mapping:
+    /// unmap each page's PTE and drop its VMO frame so the next touch faults in a
+    /// fresh zero page. See `Vmar::madv_dontneed` for why in-place zeroing was
+    /// insufficient (mimalloc's stale-frame reuse). Only PRIVATE VMOs are
+    /// decommitted — dropping a frame of a MAP_SHARED VMO would yank it out from
+    /// under the other mappers.
+    fn dontneed(&self, begin: VirtAddr, end: VirtAddr) {
+        // Snapshot geometry under a brief lock; do NOT hold the mapping lock
+        // across the VMO calls below (the borrow/mutex discipline forbids the
+        // mapping->VMO lock nesting that would otherwise deadlock a concurrent
+        // range_change).
+        let (map_addr, vmo_offset_pages) = {
+            let inner = self.inner.lock();
+            (inner.addr, inner.vmo_offset / PAGE_SIZE)
+        };
+        // Never rip frames out of a shared object (MAP_SHARED / wl_shm): another
+        // process is still mapping them.
+        let shared = self.vmo.share_count() > 1;
+        let mut va = round_down_pages(begin.max(map_addr));
+        let end = round_down_pages(end);
+        while va < end {
+            let vmo_page = vmo_offset_pages + (va - map_addr) / PAGE_SIZE;
+            // Unmap the PTE first (+ TLB shootdown) so no stale translation
+            // outlives the frame we are about to free.
+            {
+                let mut pg = self.page_table.lock();
+                let _ = pg.unmap(va);
+            }
+            if !shared {
+                // Drop the frame; the re-fault installs a fresh zero page. On a
+                // COW/unsupported VMO decommit returns Err — then zero the
+                // committed frame in place as a fallback (its PTE is already
+                // gone, so the next fault re-establishes it).
+                if self.vmo.decommit(vmo_page * PAGE_SIZE, PAGE_SIZE).is_err() {
+                    if let Some(pa) = self.vmo.committed_paddr(vmo_page) {
+                        kernel_hal::mem::pmem_zero(pa, PAGE_SIZE);
+                    }
+                }
+            }
+            va += PAGE_SIZE;
         }
     }
 
