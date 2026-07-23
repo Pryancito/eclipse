@@ -388,6 +388,50 @@ fn handle_signal(
             signal as i32,
             user_pc,
         );
+        // For a crash/abort signal, dump the top of the user stack: any word
+        // that lands in the process's own code is a return address, so the
+        // abort()/assert() CALLER chain can be read off by mapping these back
+        // against the binary — turning a bare 'killed by SIGABRT' into "which
+        // function aborted" without a debugger. Read through the process page
+        // table's physmap image, exactly like the page-fault code-bytes dump.
+        #[cfg(not(feature = "libos"))]
+        if matches!(
+            signal,
+            Signal::SIGABRT
+                | Signal::SIGSEGV
+                | Signal::SIGILL
+                | Signal::SIGBUS
+                | Signal::SIGFPE
+                | Signal::SIGTRAP
+        ) {
+            use kernel_hal::vm::{GenericPageTable, PageTable};
+            let rsp = ctx.get_field(UserContextField::StackPointer);
+            let pt = PageTable::from_current();
+            // 8-aligned u64s never cross a page boundary (4096 % 8 == 0), so a
+            // single physmap read per word is safe.
+            let rd = |va: usize| -> Option<u64> {
+                pt.query(va & !0xfff).ok().map(|(pa, _, _)| {
+                    let kv = 0xffff_8000_0000_0000usize + (pa & !0xfff) + (va & 0xfff);
+                    unsafe { core::ptr::read_volatile(kv as *const u64) }
+                })
+            };
+            let base = rsp & !0x7;
+            let mut words = alloc::vec::Vec::new();
+            for i in 0..40usize {
+                match rd(base + i * 8) {
+                    Some(w) => words.push(w),
+                    None => break,
+                }
+            }
+            error!(
+                "[crash] pid={} SIG={:?} rsp={:#x} stack[0..{}]={:#x?}",
+                thread.proc().id(),
+                signal,
+                rsp,
+                words.len(),
+                words
+            );
+        }
         thread.proc().exit(code as i64);
         return ctx;
     }
