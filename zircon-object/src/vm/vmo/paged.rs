@@ -15,44 +15,6 @@ use {
     lock::{Mutex, MutexGuard},
 };
 
-/// DIAGNOSTIC: verify the global demand-zero frame is still all zeros.
-///
-/// apk's mimalloc dies with "corrupted free list entry" because a page it was
-/// handed as fresh (and therefore assumes is zero) reads back non-zero. The
-/// prime suspect is the shared read-only `ZERO_FRAME`: if any kernel path
-/// writes through it (a copy_to_user landing on a still-read-only demand-zero
-/// page, or a physmap store that bypasses the page tables entirely), EVERY
-/// future demand-zero read across the whole system returns those stale bytes.
-///
-/// This samples the first 64 bytes on the read-fault hand-out path. If they are
-/// ever non-zero the frame is poisoned; we log the exact offset/value once per
-/// few thousand hits so it survives LOG=error without flooding the console.
-#[inline]
-fn zeroframe_integrity_probe() {
-    static HITS: AtomicUsize = AtomicUsize::new(0);
-    let pa = kernel_hal::mem::ZERO_FRAME.paddr();
-    let va = phys_to_virt(pa) as *const u64;
-    // 8 u64 = first 64 bytes: mimalloc keeps a page's free-list head + keys at
-    // the very start of its metadata, and bulk download data poisoning a page
-    // is non-zero here too.
-    for i in 0..8 {
-        let w = unsafe { core::ptr::read_volatile(va.add(i)) };
-        if w != 0 {
-            let n = HITS.fetch_add(1, Ordering::Relaxed);
-            if n % 4096 == 0 {
-                error!(
-                    "[zeropoison] ZERO_FRAME pa={:#x} NON-ZERO at word {} = {:#018x} (hit #{})",
-                    pa,
-                    i,
-                    w,
-                    n + 1
-                );
-            }
-            return;
-        }
-    }
-}
-
 enum VMOType {
     /// The original node.
     Origin,
@@ -748,38 +710,11 @@ impl VMObjectPagedInner {
                     .map_or(false, |s| page_idx * PAGE_SIZE < s.source_len());
                 if !flags.contains(MMUFlags::WRITE) && !from_source {
                     // read-only, just return zero frame
-                    zeroframe_integrity_probe();
                     return Ok(CommitResult::Ref(kernel_hal::mem::ZERO_FRAME.paddr()));
                 }
                 // lazy allocate zero frame
                 // 这里会调用HAL层的hal_frame_alloc, 请注意实现该函数时参数要一样
                 let target_frame = PhysFrame::new_zero().ok_or(ZxError::NO_MEMORY)?;
-                if !from_source {
-                    // DIAGNOSTIC: a freshly `new_zero`'d anonymous page MUST read
-                    // back all zeros. If it does not, either the frame allocator
-                    // handed out a frame still aliased/mapped elsewhere (a stale
-                    // PTE writing through it) or `pmem_zero` did not take — either
-                    // way it is the source of apk/mimalloc's "fresh page not zero"
-                    // corruption. Sample the first 64 bytes; rate-limited log.
-                    static FHITS: AtomicUsize = AtomicUsize::new(0);
-                    let va = phys_to_virt(target_frame.paddr()) as *const u64;
-                    for i in 0..8 {
-                        let w = unsafe { core::ptr::read_volatile(va.add(i)) };
-                        if w != 0 {
-                            let n = FHITS.fetch_add(1, Ordering::Relaxed);
-                            if n % 1024 == 0 {
-                                error!(
-                                    "[zeropoison] FRESH anon frame pa={:#x} NON-ZERO at word {} = {:#018x} (hit #{})",
-                                    target_frame.paddr(),
-                                    i,
-                                    w,
-                                    n + 1
-                                );
-                            }
-                            break;
-                        }
-                    }
-                }
                 if from_source {
                     // Read the page from the backing file into the fresh frame.
                     // The frame is already zeroed, so bytes past end-of-file stay
