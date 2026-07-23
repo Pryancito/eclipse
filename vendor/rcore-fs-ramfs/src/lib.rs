@@ -395,6 +395,27 @@ impl INode for LockedINode {
 
     fn move_(&self, old_name: &str, target: &Arc<dyn INode>, new_name: &str) -> Result<()> {
         let elem = self.find(old_name)?;
+        // POSIX rename(2) atomically REPLACES an existing destination. Our
+        // `link` below refuses an existing name with `EntryExist`, so a rename
+        // over an existing file would fail with EEXIST — which breaks any tool
+        // that writes-to-temp-then-renames (apk: "updating <repo>: File exists"
+        // on every index refresh after the first, leaving the cache un-updated).
+        // Remove the destination first, unless it is the very same inode as the
+        // source (rename to itself is a no-op) or a non-empty directory
+        // (ENOTEMPTY — never clobber a populated dir).
+        if let Ok(existing) = target.find(new_name) {
+            let same = matches!(
+                (existing.metadata(), elem.metadata()),
+                (Ok(a), Ok(b)) if a.dev == b.dev && a.inode == b.inode
+            );
+            if same {
+                return Ok(());
+            }
+            if existing.metadata()?.type_ == FileType::Dir && existing.get_entry(2).is_ok() {
+                return Err(FsError::DirNotEmpty);
+            }
+            target.unlink(new_name)?;
+        }
         target.link(new_name, &elem)?;
         if let Err(err) = self.unlink(old_name) {
             // recover
