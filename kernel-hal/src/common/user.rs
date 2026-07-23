@@ -21,22 +21,12 @@ fn dbg_scan_physmap_leak(bytes: &[u8], dst: usize, who: &str) {
     while i + 4 <= n {
         if bytes[i] == 0x00 && bytes[i + 1] == 0x80 && bytes[i + 2] == 0xff && bytes[i + 3] == 0xff
         {
-            // error! (not warn!): the desktop/apk runs at LOG=error, which
-            // suppresses warn — so this scanner (the one instrument that names
-            // a kernel-pointer leak into user memory, the suspected root of
-            // apk's mimalloc corruption) was firing silently. Promote it and
-            // dump the 8-byte qword that starts at the match so the leaked
-            // kernel pointer is visible verbatim.
-            let mut q = [0u8; 8];
-            let take = (n - i).min(8);
-            q[..take].copy_from_slice(&bytes[i..i + take]);
-            error!(
-                "[uleak] physmap-high 0xffff8000 -> user dst={:#x} off={} via={} len={} qword={:#018x}",
+            warn!(
+                "[uleak] physmap-high 0xffff8000 -> usuario dst={:#x} off={} via={} len={}",
                 dst,
                 i,
                 who,
-                bytes.len(),
-                u64::from_le_bytes(q),
+                bytes.len()
             );
             return;
         }

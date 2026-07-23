@@ -73,31 +73,6 @@ impl Syscall<'_> {
                 linux_object::fs::stdio::ctrl_c_pending_set();
                 return Err(LxError::EINTR);
             }
-            // DIAG [readtrace]: log socket reads (base VA, len, returned n, first
-            // bytes) so we can see exactly where downloaded bytes land relative
-            // to mimalloc's arena (0x1000000..). apk's "corrupted free list
-            // entry" carries the DOWNLOADED content, so a read whose destination
-            // overlaps a block mimalloc already freed is the corruption. error!
-            // so it survives LOG=error; rate-limited to the first 64 socket reads
-            // to avoid flooding, and only for socket fds.
-            if file_like.as_socket().is_ok() {
-                use core::sync::atomic::{AtomicUsize, Ordering};
-                static RC: AtomicUsize = AtomicUsize::new(0);
-                let c = RC.fetch_add(1, Ordering::Relaxed);
-                if c < 64 {
-                    let mut head = [0u8; 8];
-                    let k = n.min(8);
-                    head[..k].copy_from_slice(&buf[..k]);
-                    error!(
-                        "[readtrace] sock fd={:?} base={:#x} len={:#x} n={:#x} head={:#018x}",
-                        fd,
-                        base.as_addr() + read_len,
-                        current_len,
-                        n,
-                        u64::from_le_bytes(head),
-                    );
-                }
-            }
             base.add(read_len).write_array(&buf[..n])?;
             read_len += n;
             if n < current_len || !is_seekable {
