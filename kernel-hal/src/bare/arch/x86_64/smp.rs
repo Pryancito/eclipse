@@ -79,9 +79,24 @@ global_asm!(
     "  rdmsr",
     "  or   eax, (1 << 8) | (1 << 11)",
     "  wrmsr",
-    // CR0: PE(0) | MP(1) | PG(31)
+    // CR0: PE(0) | MP(1) | WP(16) | PG(31)
+    //
+    // WP (Write Protect, bit 16) is LOAD-BEARING and must match the BSP, which
+    // runs with WP=1 (rboot re-enables it before entering the kernel). With
+    // WP=0 a *supervisor*-mode store to a read-only page SUCCEEDS SILENTLY
+    // instead of faulting — so a kernel `copy_to_user` (e.g. recvfrom writing
+    // downloaded bytes) onto a page that maps the shared read-only ZERO_FRAME
+    // (a demand-zero heap page that was read-faulted first) would write into
+    // the GLOBAL ZERO_FRAME instead of triggering the copy-on-write that a
+    // WP=1 fault performs. That poisons every future demand-zero page, and
+    // allocators that assume fresh pages are zero (apk's mimalloc: "corrupted
+    // free list entry") abort deterministically. It only surfaced once anon
+    // mmap became demand-paged (before that every anon page owned a private
+    // frame, so the AP's WP=0 write was harmless); it is also a general
+    // integrity hole against any AP-side write to shared RO pages (library
+    // .text/.rodata), so the APs must carry WP=1 exactly like the BSP.
     "  mov  eax, cr0",
-    "  or   eax, (1 << 0) | (1 << 1) | (1 << 31)",
+    "  or   eax, (1 << 0) | (1 << 1) | (1 << 16) | (1 << 31)",
     "  mov  cr0, eax",
     // Temporary stack
     "  mov  esp, temp_stack_top",

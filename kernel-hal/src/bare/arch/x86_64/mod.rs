@@ -97,6 +97,22 @@ pub fn timer_init() {
 }
 
 pub fn secondary_init() {
+    // Defense in depth: re-assert CR0.WP=1 on this AP. The trampoline already
+    // sets it, but this invariant is load-bearing (a WP=0 AP silently writes
+    // through read-only user/shared pages from kernel mode — e.g. a
+    // copy_to_user onto the shared ZERO_FRAME poisons every demand-zero page,
+    // crashing apk's mimalloc), so we also guarantee it here where it is
+    // discoverable in Rust, surviving any future trampoline refactor.
+    unsafe {
+        core::arch::asm!(
+            "mov {tmp}, cr0",
+            "or  {tmp}, {wp}",
+            "mov cr0, {tmp}",
+            tmp = out(reg) _,
+            wp = const 1u64 << 16,
+            options(nostack, preserves_flags),
+        );
+    }
     zcore_drivers::irq::x86::Apic::init_local_apic_ap();
     // The LAPIC timer's mode/divide/initial-count registers are per-CPU and are
     // only programmed on the BSP (in `drivers.rs`). Replicate that here so this
