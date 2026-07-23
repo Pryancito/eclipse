@@ -484,8 +484,40 @@ impl Syscall<'_> {
         if addr % PAGE_SIZE != 0 {
             return Err(LxError::EINVAL);
         }
-        // Advisory only: no mapping state is changed. (Linux rounds `len` up to a
-        // page; a zero length is a no-op either way.)
+        // MADV_DONTNEED (4) / MADV_FREE (8) must actually DISCARD the pages:
+        // Linux guarantees the range reads back as zero on next access. Memory
+        // allocators rely on this — they decommit a region with MADV_DONTNEED
+        // and later REUSE it assuming it is zeroed. Treating it as a pure no-op
+        // leaves STALE data, which corrupts allocator metadata on reuse:
+        //   * apk's mimalloc aborts ("trying to free from an invalid arena")
+        //     mid-`apk update`, killing every package operation;
+        //   * Firefox's mozjemalloc red-black tree corrupts (the earlier crash).
+        // Zero the committed, WRITABLE pages in the range so the guarantee
+        // holds. Uncommitted pages already demand-fault in as zero, and
+        // read-only pages are never allocator scratch, so both are left alone.
+        // (This keeps memory committed rather than freeing frames, but that is
+        // an optimisation; correctness — read-as-zero — is what allocators need.)
+        const MADV_DONTNEED: usize = 4;
+        const MADV_FREE: usize = 8;
+        if (advice == MADV_DONTNEED || advice == MADV_FREE) && len != 0 {
+            use kernel_hal::vm::{GenericPageTable, PageTable};
+            let end = addr
+                .checked_add(roundup_pages(len))
+                .ok_or(LxError::EINVAL)?;
+            let mut pt = PageTable::from_current();
+            let mut va = addr;
+            while va < end {
+                if let Ok((pa, flags, _)) = pt.query(va) {
+                    if flags.contains(MMUFlags::WRITE) {
+                        kernel_hal::mem::pmem_zero(pa, PAGE_SIZE);
+                    }
+                }
+                va += PAGE_SIZE;
+            }
+            // Do not run PageTable's Drop: it wraps the live CR3 root and would
+            // otherwise try to free the active page-table frames.
+            core::mem::forget(pt);
+        }
         Ok(0)
     }
 }
