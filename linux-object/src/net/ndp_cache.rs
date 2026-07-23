@@ -81,12 +81,10 @@ pub fn learn_from_frame(frame: &[u8]) {
     };
 
     match repr {
-        Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
-            target_addr,
-            lladdr,
-            ..
-        })
-        | Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
+        // Neighbor Advertisement: `target_addr` is the address the sender OWNS
+        // and `lladdr` is its Target Link-Layer Address, so `target_addr ->
+        // lladdr` is the correct mapping.
+        Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
             target_addr,
             lladdr,
             ..
@@ -95,6 +93,13 @@ pub fn learn_from_frame(frame: &[u8]) {
                 insert_bounded(&mut *CACHE.lock(), target_addr, lladdr.unwrap_or(src_mac));
             }
         }
+        // Neighbor Solicitation: `target_addr` is the address being QUERIED (it
+        // is NOT owned by the sender) and `lladdr` is the sender's Source
+        // Link-Layer Address. Learning `target_addr -> lladdr` here would map the
+        // queried IP to the querier's MAC -- a bogus/poisoned entry that redirects
+        // traffic for `target_addr` to whoever solicited it, and corrupts the
+        // cache even under benign NS traffic. The correct `src_ip -> src_mac`
+        // mapping is already learned from the IPv6 header above.
         _ => {}
     }
 }

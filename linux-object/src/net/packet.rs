@@ -283,7 +283,12 @@ impl Socket for PacketSocketState {
                     self.base.signal_clear(Signal::READABLE);
                 }
 
-                return (Ok(actual_len), endpoint);
+                // Return the number of bytes actually copied, NOT the full frame
+                // length. The syscall layer slices the caller's buffer by the
+                // returned count (`&data[..n]`); returning `actual_len` when the
+                // frame is larger than the user buffer slices out of bounds and
+                // panics the kernel (every other socket type returns copy_len).
+                return (Ok(copy_len), endpoint);
             }
 
             if non_block {

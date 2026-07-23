@@ -25,12 +25,25 @@ fn loopback_tx_handler(packet: &[u8]) {
         packet.len()
     );
     let ethertype = if version == 6 { 0x86ddu16 } else { 0x0800u16 };
-    const FRAME_CAP: usize = 2048;
-    let payload_len = packet.len().min(FRAME_CAP.saturating_sub(14));
-    let mut eth_frame = [0u8; FRAME_CAP];
+    // Size the ethernet frame to the actual packet. The old fixed 2 KiB stack
+    // buffer truncated any IP packet larger than 2034 bytes, but loopback has a
+    // large MTU; a truncated frame whose IP header still advertises the full
+    // length is malformed and fails checksum/parse (or loses data) on the RX
+    // side. `kernel_vec_zeroed` caps at MAX_KERNEL_VEC and is fallible, so an
+    // oversized packet is dropped rather than truncated.
+    let mut eth_frame = match kernel_vec_zeroed(14 + packet.len()) {
+        Ok(v) => v,
+        Err(_) => {
+            warn!(
+                "[loopback tx] frame alloc failed for {} bytes, dropping",
+                packet.len()
+            );
+            return;
+        }
+    };
     eth_frame[12..14].copy_from_slice(&ethertype.to_be_bytes());
-    eth_frame[14..14 + payload_len].copy_from_slice(&packet[..payload_len]);
-    packet::push_packet(&eth_frame[..14 + payload_len]);
+    eth_frame[14..].copy_from_slice(packet);
+    packet::push_packet(&eth_frame);
 }
 
 /// Global initialization for the network stack.
@@ -1475,12 +1488,41 @@ pub fn send_ip6_ethernet(ip: &[u8]) -> LxResult {
 
 // ============= Rand Port =============
 
-/// !!!! need riscv rng
+/// Return an unpredictable 64-bit value.
+///
+/// Previously this returned the constant `10000`, which made every DNS
+/// transaction ID identical and the ephemeral-port seed fully predictable — the
+/// TXID is the resolver's only anti-spoofing check, so a constant made DNS
+/// responses trivially forgeable. We now mix a hardware timestamp (rdtsc on
+/// x86_64, the monotonic timer elsewhere) into a persistent SplitMix64 counter,
+/// so successive calls are distinct and hard to predict even when the clock is
+/// coarse.
 pub fn rand() -> u64 {
-    // use core::arch::x86_64::_rdtsc;
-    // rdrand is not implemented in QEMU
-    // so use rdtsc instead
-    10000
+    use core::sync::atomic::{AtomicU64, Ordering};
+    // Golden-ratio odd increment (SplitMix64). Persisting the state across calls
+    // guarantees distinct outputs even if two calls read the same timestamp.
+    static STATE: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
+    let ts = timestamp_entropy();
+    let mut z = STATE
+        .fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed)
+        .wrapping_add(ts);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// Best-effort high-resolution entropy for [`rand`].
+#[allow(unsafe_code)]
+fn timestamp_entropy() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: `rdtsc` is a plain timestamp read with no memory effects.
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        kernel_hal::timer::timer_now().as_nanos() as u64
+    }
 }
 
 #[allow(unsafe_code)]

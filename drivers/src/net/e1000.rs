@@ -375,6 +375,35 @@ impl E1000Interface {
             let _ = mmio_read(self.base, E1000_IMS);
         }
     }
+
+    /// Poll the interface WITHOUT re-arming IMS. The IRQ deferred job re-arms
+    /// only AFTER clearing `poll_pending` (see `handle_irq`); re-arming inside
+    /// the poll would unmask IMS while `poll_pending` is still true, so a packet
+    /// arriving in that window fires an IRQ that hits the `else { ims_rearm() }`
+    /// branch — which read-clears ICR without queuing a poll, dropping the RX
+    /// frame until the next interrupt. The periodic `poll()` path re-arms itself.
+    fn poll_inner(&self) -> DeviceResult {
+        let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
+        // Mutex::lock() uses push_off/pop_off which already disables interrupts
+        // for the duration of the critical section. Manual intr_off/on bypasses
+        // the noff accounting and panics ("RefCell already borrowed") under SMP.
+        let sockets = get_sockets();
+        let res = {
+            let mut sockets = sockets.lock();
+            match self.iface.lock().poll(&mut sockets, timestamp) {
+                Ok(p) => {
+                    trace!("e1000 NetScheme poll: {:?}", p);
+                    Ok(())
+                }
+                Err(err) => {
+                    warn!("poll got err {}", err);
+                    Err(DeviceError::IoError)
+                }
+            }
+        };
+        super::net_flush_deferred_packets();
+        res
+    }
 }
 
 impl Scheme for E1000Interface {
@@ -405,8 +434,13 @@ impl Scheme for E1000Interface {
             let poll_pending = self.poll_pending.clone();
             let self_clone = self.clone();
             crate::utils::deferred_job::push_deferred_job(move || {
-                let _ = self_clone.poll();
+                // Drain WITHOUT re-arming, then clear poll_pending BEFORE
+                // re-arming IMS so an IRQ that fires after ims_rearm() finds
+                // poll_pending=false and queues a fresh poll, instead of hitting
+                // the `else { ims_rearm() }` branch and dropping the RX cause.
+                let _ = self_clone.poll_inner();
                 poll_pending.store(false, core::sync::atomic::Ordering::SeqCst);
+                self_clone.ims_rearm();
             });
         } else {
             self.ims_rearm();
@@ -441,25 +475,10 @@ impl NetScheme for E1000Interface {
     }
 
     fn poll(&self) -> DeviceResult {
-        let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
-        // Mutex::lock() uses push_off/pop_off which already disables interrupts
-        // for the duration of the critical section. Manual intr_off/on bypasses
-        // the noff accounting and panics ("RefCell already borrowed") under SMP.
-        let sockets = get_sockets();
-        let res = {
-            let mut sockets = sockets.lock();
-            match self.iface.lock().poll(&mut sockets, timestamp) {
-                Ok(p) => {
-                    trace!("e1000 NetScheme poll: {:?}", p);
-                    Ok(())
-                }
-                Err(err) => {
-                    warn!("poll got err {}", err);
-                    Err(DeviceError::IoError)
-                }
-            }
-        };
-        super::net_flush_deferred_packets();
+        // Periodic (non-IRQ) poll path: drain, then re-arm IMS. The IRQ path
+        // calls poll_inner() directly and re-arms only after clearing
+        // poll_pending (see handle_irq).
+        let res = self.poll_inner();
         self.ims_rearm();
         res
     }
