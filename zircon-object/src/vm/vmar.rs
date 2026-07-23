@@ -1081,10 +1081,33 @@ impl VmMapping {
             new_flags.remove(MMUFlags::RXW);
             new_flags.insert(flags & MMUFlags::RXW);
             inner.flags[i] = new_flags;
-            pg_table
-                .update_no_shootdown(inner.addr + i * PAGE_SIZE, None, Some(new_flags))
-                .ignore()
-                .unwrap();
+            let va = inner.addr + i * PAGE_SIZE;
+            // The shared read-only ZERO_FRAME must never be made writable. A
+            // read-fault on a demand-paged anonymous page maps the VA to the one
+            // global ZERO_FRAME (paged.rs commit_page_internal, no per-page frame
+            // is tracked), so `committed_paddr` for it is None and the VMO cannot
+            // see it. If mprotect then raised WRITE in place, a store would land
+            // in the global zero page with no copy-on-write, poisoning every
+            // future demand-zero fault — the user-mode twin of the CR0.WP kernel
+            // bug, and the source of mimalloc's "corrupted free list entry" abort
+            // once anon mmap became demand-paged. Drop the PTE instead: the next
+            // write re-faults into `handle_page_fault` -> `commit_page(WRITE)`,
+            // which allocates a PRIVATE zero frame (the COW the read-only mapping
+            // was there to force). Cleared / never-faulted leaves are left
+            // untouched (`query` -> NotMapped), so a huge PROT_NONE reservation
+            // stays cheap.
+            let is_zero_frame = matches!(
+                pg_table.query(va),
+                Ok((paddr, _, _)) if paddr == kernel_hal::mem::ZERO_FRAME.paddr()
+            );
+            if is_zero_frame && new_flags.contains(MMUFlags::WRITE) {
+                pg_table.unmap_no_shootdown(va).ignore().unwrap();
+            } else {
+                pg_table
+                    .update_no_shootdown(va, None, Some(new_flags))
+                    .ignore()
+                    .unwrap();
+            }
         }
         if start_index < end_index {
             pg_table.remote_flush_all();
