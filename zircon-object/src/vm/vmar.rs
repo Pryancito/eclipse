@@ -1122,10 +1122,24 @@ impl VmMapping {
         let end = round_down_pages(end);
         while va < end {
             let vmo_page = vmo_offset_pages + (va - map_addr) / PAGE_SIZE;
-            // Only committed pages hold stale bytes; an uncommitted page already
-            // demand-faults in as zero, so leave it alone.
+            // (1) Zero the frame the VMO currently owns for this page. This
+            //     reaches a committed page whose PTE was dropped / turned
+            //     PROT_NONE, which a page-table walk cannot see.
             if let Some(pa) = self.vmo.committed_paddr(vmo_page) {
                 kernel_hal::mem::pmem_zero(pa, PAGE_SIZE);
+            }
+            // (2) Drop the PTE — but NOT the frame. The abort actually came from
+            //     a STALE TRANSLATION: the page table still maps this VA to a
+            //     frame the VMO no longer tracks (committed_paddr == None), so
+            //     zeroing through the VMO missed it and the old bytes kept being
+            //     served. Unmapping forces the next touch to re-resolve through
+            //     the VMO — a fresh demand-zero page, or the frame just zeroed in
+            //     (1). We deliberately do NOT free any frame (the decommit
+            //     variant did, and freeing one the allocator still used turned
+            //     the abort into a SIGSEGV).
+            {
+                let mut pg = self.page_table.lock();
+                let _ = pg.unmap(va);
             }
             va += PAGE_SIZE;
         }
