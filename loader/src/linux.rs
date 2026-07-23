@@ -375,12 +375,15 @@ fn handle_signal(
             _ => {}
         }
         let code = 128 + signal as i32;
-        // Record the death in the dmesg ring (warn! reaches it at the default
-        // level). A process that dies on a default-disposition signal — Xorg
-        // aborting in early init, say — otherwise vanishes with no trace at all.
-        warn!(
-            "[exit] pid={} killed by signal {:?} ({}) at pc={:#x} (default disposition)",
+        // Record the death in the dmesg ring at error! (survives LOG=error): a
+        // process that dies on a default-disposition signal — apk killed by
+        // SIGPIPE when a fetch connection resets, Xorg aborting in early init —
+        // otherwise vanishes with no trace at all, and a `Done(139)`/silent exit
+        // gives no clue which signal took it down.
+        error!(
+            "[exit] pid={} ({}) killed by signal {:?} ({}) at pc={:#x} (default disposition)",
             thread.proc().id(),
+            thread.proc().name(),
             signal,
             signal as i32,
             user_pc,
