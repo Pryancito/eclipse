@@ -166,10 +166,19 @@ impl Socket for TcpSocketState {
                     if flags.contains(OpenFlags::NON_BLOCK) {
                         return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
                     }
-                    // Hard timeout: avoid blocking forever if the peer goes silent.
+                    // Hard timeout: avoid blocking forever if the peer goes
+                    // silent. Return ETIMEDOUT, NOT Ok(0): a length-0 read is
+                    // an orderly-shutdown (EOF) signal, so faking it on a still-
+                    // open connection makes the caller believe the peer closed
+                    // cleanly and treat a truncated transfer as complete (this
+                    // is exactly the "short APKINDEX -> BAD signature" class of
+                    // corruption). An error lets the caller retry/fail correctly.
                     if kernel_hal::timer::timer_now() >= deadline {
-                        warn!("[tcp read] deadline exceeded, returning EOF");
-                        return (Ok(0), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+                        warn!("[tcp read] deadline exceeded, returning ETIMEDOUT");
+                        return (
+                            Err(LxError::ETIMEDOUT),
+                            Endpoint::Ip(IpEndpoint::UNSPECIFIED),
+                        );
                     }
                 }
                 Ok(size) => {
@@ -192,6 +201,11 @@ impl Socket for TcpSocketState {
                 }
             }
             if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
+                return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+            }
+            // Also honor non-TTY signals (SIGTERM/SIGALRM/...) so a blocked
+            // recv returns EINTR, matching the udp/raw/icmp socket paths.
+            if let Err(e) = crate::process::check_signals() {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
             // Park until the NIC's RX IRQ wakes us (immediate on data) or a
@@ -570,6 +584,14 @@ impl Socket for TcpSocketState {
                 let new_listen_handle = {
                     let sockets = get_sockets();
                     let mut sockets = sockets.lock();
+                    // Respect the global socket-count cap that bounds the fixed
+                    // kernel heap (each socket pins SEND/RECV buffers). accept()
+                    // added directly via SocketSet::add and so bypassed the cap
+                    // that register_smoltcp_socket() enforces for every other
+                    // socket creation.
+                    if super::smoltcp_socket_count(&sockets) >= super::MAX_SMOLTCIP_SOCKETS {
+                        return Err(LxError::ENOBUFS);
+                    }
                     sockets.add(new_listen)
                 };
 
