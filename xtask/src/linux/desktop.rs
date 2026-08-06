@@ -1133,13 +1133,11 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # pointer without one (apk add adwaita-icon-theme).\n\
           : \"${XCURSOR_THEME:=Adwaita}\"; export XCURSOR_THEME\n\
           : \"${XCURSOR_SIZE:=24}\"; export XCURSOR_SIZE\n\
-          # The NVIDIA / software-KMS DRM node exposes no hardware cursor plane,\n\
-          # so wlroots probes it on every cursor update, fails ('Hardware cursor\n\
-          # not supported' / 'Failed to render cursor buffer'), and falls back to\n\
-          # a software cursor -- flooding the log and burning CPU in a tight loop.\n\
-          # Force the software cursor up front so wlroots never touches the HW\n\
-          # plane (WLR_NO_HARDWARE_CURSORS is wlroots' documented switch for this).\n\
-          : \"${WLR_NO_HARDWARE_CURSORS:=1}\"; export WLR_NO_HARDWARE_CURSORS\n\
+          # Leave WLR_NO_HARDWARE_CURSORS UNSET by default: the kernel's\n\
+          # MODE_CURSOR path now composites the cursor for wlroots, so forcing\n\
+          # software cursors here regresses the boot session to \"black screen,\n\
+          # no cursor\" even though the DRM cursor ioctls work. A caller can\n\
+          # still export WLR_NO_HARDWARE_CURSORS=1 explicitly if needed.\n\
           # Software renderer. This kernel's /dev/dri/card0 is the software-KMS\n\
           # path (pixman scanout, no GBM/EGL): wlroots' default GLES2 renderer\n\
           # would try to eglCreateContext on a node with no GL and abort before\n\
@@ -1215,12 +1213,22 @@ fn write_labwc_wrapper(rootfs: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn temp_rootfs_dir(name: &str) -> std::path::PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        std::env::temp_dir().join(format!(
+            "eclipse-desktop-test-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     /// The autostart carries real shell logic (crash-once lock) — make sure
     /// what we generate actually parses as POSIX sh.
     #[test]
     fn autostart_is_valid_sh() {
-        let dir = std::env::temp_dir().join(format!("eclipse-desktop-test-{}", std::process::id()));
+        let dir = temp_rootfs_dir("autostart");
         write_labwc_autostart(&dir);
         let script = dir.join("root/.config/labwc/autostart");
         let status = std::process::Command::new("sh")
@@ -1230,6 +1238,20 @@ mod tests {
             .expect("run sh -n");
         let _ = fs::remove_dir_all(&dir);
         assert!(status.success(), "generated autostart is not valid sh");
+    }
+
+    #[test]
+    fn wrapper_keeps_hw_cursor_path_enabled() {
+        let dir = temp_rootfs_dir("wrapper");
+        write_labwc_wrapper(&dir);
+        let wrapper = fs::read_to_string(dir.join("usr/local/bin/labwc")).expect("read wrapper");
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            !wrapper.contains("WLR_NO_HARDWARE_CURSORS:="),
+            "wrapper should not force software cursors"
+        );
+        assert!(wrapper.contains("WLR_RENDERER:=pixman"));
+        assert!(wrapper.contains("WLR_LIBINPUT_NO_DEVICES:=1"));
     }
 }
 
