@@ -13,9 +13,10 @@
 //! - lunarbg (procedural wallpaper) and lunarbar (two-bar panel), Eclipse's
 //!   own native Wayland clients, launched from `autostart`;
 //! - dark-mode defaults for GTK 3/4 and a matching `foot` terminal palette;
-//! - the bulletproof `/usr/local/bin/labwc` wrapper that pins the pixman
-//!   renderer environment (login(1) strips arbitrary env vars, so a wrapper
-//!   is the only delivery that survives every launch path).
+//! - the bulletproof `/usr/local/bin/labwc` wrapper that pins the seat/runtime
+//!   environment labwc needs (login(1) strips arbitrary env vars, so a wrapper
+//!   is the only delivery that survives every launch path) without forcing the
+//!   renderer away from the GPU path.
 //!
 //! Runtime packages:
 //! `apk add labwc foot xkeyboard-config font-dejavu adwaita-icon-theme`
@@ -1103,11 +1104,6 @@ fn write_foot_config(rootfs: &Path) {
     .unwrap();
 }
 
-/// Bulletproof `labwc` launcher. wlroots picks its renderer from
-/// WLR_RENDERER *at exec time*, and it does NOT auto-fall-back from gles2 to
-/// pixman. On this box the nvidia DRM node is a stub with no usable
-/// GLES2/GBM: the gles2/GBM path hangs the whole OS at GL FBO creation.
-///
 /// We set the vars in the kernel init env and /etc/profile, but login(1)
 /// rebuilds the environment and strips arbitrary vars, so a compositor
 /// started from a post-login shell can lose them. A wrapper is the only
@@ -1138,12 +1134,9 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # software cursors here regresses the boot session to \"black screen,\n\
           # no cursor\" even though the DRM cursor ioctls work. A caller can\n\
           # still export WLR_NO_HARDWARE_CURSORS=1 explicitly if needed.\n\
-          # Software renderer. This kernel's /dev/dri/card0 is the software-KMS\n\
-          # path (pixman scanout, no GBM/EGL): wlroots' default GLES2 renderer\n\
-          # would try to eglCreateContext on a node with no GL and abort before\n\
-          # the first frame. pixman is the renderer the whole desktop was\n\
-          # designed around (README-drm.md).\n\
-          : \"${WLR_RENDERER:=pixman}\"; export WLR_RENDERER\n\
+          # Do NOT force WLR_RENDERER here: the boot session is meant to use the\n\
+          # GPU path by default. If a software fallback is needed for debugging,\n\
+          # export WLR_RENDERER=pixman explicitly before launching labwc.\n\
           # Backends: DRM for output + libinput for evdev. Naming them keeps\n\
           # wlroots off the headless/X11 autodetect fallbacks when no parent\n\
           # display exists.\n\
@@ -1241,7 +1234,7 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_keeps_hw_cursor_path_enabled() {
+    fn wrapper_keeps_gpu_and_hw_cursor_paths_enabled() {
         let dir = temp_rootfs_dir("wrapper");
         write_labwc_wrapper(&dir);
         let wrapper = fs::read_to_string(dir.join("usr/local/bin/labwc")).expect("read wrapper");
@@ -1250,7 +1243,10 @@ mod tests {
             !wrapper.contains("WLR_NO_HARDWARE_CURSORS:="),
             "wrapper should not force software cursors"
         );
-        assert!(wrapper.contains("WLR_RENDERER:=pixman"));
+        assert!(
+            !wrapper.contains("WLR_RENDERER:="),
+            "wrapper should not force a software renderer"
+        );
         assert!(wrapper.contains("WLR_LIBINPUT_NO_DEVICES:=1"));
     }
 }

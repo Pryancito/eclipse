@@ -212,8 +212,8 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // greets with "I can't find my home directory!" and readline (tab
             // completion) misbehaves for lack of `TERM`.
             let envs: alloc::vec::Vec<alloc::string::String> = alloc::vec![
-                // /usr/local/bin first so the Eclipse labwc wrapper (which
-                // forces the pixman renderer) shadows the apk-installed binary.
+                // /usr/local/bin first so the Eclipse labwc wrapper shadows the
+                // apk-installed binary and can restore its runtime/seat env.
                 "PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
                 "ENV=/etc/profile".into(),
                 "HOME=/root".into(),
@@ -228,13 +228,8 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 // wlroots/labwc configuration. Set in the real environment (not
                 // only /etc/profile) so a compositor launched from a *non-login*
                 // shell — which busybox sh does not source /etc/profile for —
-                // still gets them. Without WLR_RENDERER=pixman labwc tries
-                // GLES2/EGL then Vulkan; with no GPU that path may fail outright,
-                // or run on Mesa llvmpipe and be extremely slow because each
-                // frame is rendered and copied on CPU. See xtask write_profile
-                // for the rationale of each.
-                "WLR_RENDERER=pixman".into(),
-                "WLR_RENDERER_ALLOW_SOFTWARE=1".into(),
+                // still gets them. Keep the renderer UNSET here: the desired
+                // default is the GPU path, not a forced software fallback.
                 // WLR_NO_HARDWARE_CURSORS deliberately NOT set: the kernel DRM
                 // scheme composites the legacy MODE_CURSOR bitmap over every
                 // scanned-out frame (drm.rs set_cursor_bo/move_cursor), so
@@ -257,17 +252,6 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 // env entry is visible to labwc when launched from a non-login
                 // shell or directly from an init script.
                 "WLR_DRM_DEVICES=/dev/dri/card0".into(),
-                // Software GL/Vulkan via Mesa (no usable HW 3D engine here). The
-                // DRM device now advertises a real NVIDIA PCI id, so Mesa would
-                // otherwise try to load the hardware `nouveau` driver (whose
-                // ioctls we don't implement) and fail/hang. Force the KMS
-                // software rasteriser (kms_swrast → llvmpipe) instead, which
-                // renders into dumb buffers — exactly our DRM capabilities.
-                // Only takes effect when a GL renderer is selected
-                // (WLR_RENDERER=gles2); the pixman default ignores Mesa because
-                // the llvmpipe GL path is much slower here.
-                "GALLIUM_DRIVER=llvmpipe".into(),
-                "MESA_LOADER_DRIVER_OVERRIDE=kms_swrast".into(),
             ];
             let rootfs = fs::rootfs();
             // Load hunter's /etc/hunter/{whitelist,blacklist} from the root fs

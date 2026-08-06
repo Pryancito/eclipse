@@ -631,14 +631,15 @@ pub(super) fn install(rootfs: &Path, apk_bin: &Path, arch: &str) {
             // `usr/libexec/glycin` (as this did) always answered "<missing>",
             // including on builds where glycin-svg was installed the whole
             // time. Walk one level down instead.
-            let glycin_loaders: Vec<String> = ["usr/libexec/glycin-loaders", "usr/lib/glycin-loaders"]
-                .iter()
-                .flat_map(|base| std::fs::read_dir(rootfs.join(base)).into_iter().flatten())
-                .flatten()
-                .flat_map(|ver| std::fs::read_dir(ver.path()).into_iter().flatten())
-                .flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect();
+            let glycin_loaders: Vec<String> =
+                ["usr/libexec/glycin-loaders", "usr/lib/glycin-loaders"]
+                    .iter()
+                    .flat_map(|base| std::fs::read_dir(rootfs.join(base)).into_iter().flatten())
+                    .flatten()
+                    .flat_map(|ver| std::fs::read_dir(ver.path()).into_iter().flatten())
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect();
             println!(
                 "Xorg stack: glycin loaders: {}",
                 if glycin_loaders.is_empty() {
@@ -728,7 +729,7 @@ pub(super) fn install(rootfs: &Path, apk_bin: &Path, arch: &str) {
 /// root. Missing entries are silently skipped, so this is safe whether or not
 /// the `apk` install above actually ran.
 const LIVE_TREES: &[&str] = &[
-    "usr/bin",         // X, Xorg, startx, xinit, xterm, xkbcomp, setxkbmap, xrandr, xset
+    "usr/bin", // X, Xorg, startx, xinit, xterm, xkbcomp, setxkbmap, xrandr, xset
     // seatd lives in /usr/sbin on some providers (Ubuntu); harmless when empty.
     "usr/sbin",
     // glibc runtime paths. The Alpine/musl stack never populates these, but a
@@ -739,9 +740,9 @@ const LIVE_TREES: &[&str] = &[
     // costs nothing there.
     "lib64",
     "lib/x86_64-linux-gnu",
-    "usr/lib",         // libX11/xcb/pixman/drm/input/xkbcommon + usr/lib/xorg modules (minus dri)
-    "usr/libexec",     // Xorg.wrap on some layouts
-    "usr/share/X11",   // xkb data, xorg.conf.d defaults, rgb.txt
+    "usr/lib", // libX11/xcb/pixman/drm/input/xkbcommon + usr/lib/xorg modules (minus dri)
+    "usr/libexec", // Xorg.wrap on some layouts
+    "usr/share/X11", // xkb data, xorg.conf.d defaults, rgb.txt
     "usr/share/fonts", // base bitmap fonts X refuses to start without
     "usr/share/fontconfig",
     // libinput's device-quirks database. Without it X logs "failed to find

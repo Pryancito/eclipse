@@ -684,11 +684,10 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               #   LD_PRELOAD=/lib/libeclipse_dns.so some-command\n\
               export HOME=/root\n\
               export TERM=xterm-256color\n\
-              # No GPU here: wlroots/labwc must use the software (pixman) renderer.\n\
-              # Otherwise wlroots tries GLES2/EGL then Vulkan. With no GPU that\n\
-              # path can fail outright, or start on Mesa llvmpipe and become\n\
-              # extremely slow because every frame is rendered and copied on CPU.\n\
-              # It does not auto-fall back to pixman. See docs/README-drm.md.\n\
+              # Keep wlroots on its default renderer selection: this desktop is\n\
+              # meant to use the GPU path, not a forced pixman/llvmpipe fallback.\n\
+              # If a software fallback is needed for debugging, export\n\
+              # WLR_RENDERER=pixman manually before launching labwc.\n\
               # export WLR_RENDERER=pixman\n\
               # export WLR_RENDERER_ALLOW_SOFTWARE=1\n\
               # wlroots' libinput backend aborts the whole compositor if it\n\
@@ -715,12 +714,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # scanout regardless, so this is really about presenting one\n\
               # output, not about which port lights up.\n\
               export WLR_DRM_DEVICES=/dev/dri/card0\n\
-              # Software GL via Mesa (no usable HW 3D). The DRM node reports a\n\
-              # real NVIDIA PCI id, so Mesa would try the hardware nouveau driver\n\
-              # and fail; force the KMS software rasteriser (kms_swrast/llvmpipe)\n\
-              # which renders into dumb buffers. Only used when a GL renderer is\n\
-              # selected (WLR_RENDERER=gles2); that path is intentionally avoided\n\
-              # by default because it is much slower than pixman here.\n\
+              # Optional software-GL debug overrides. Leave them commented for\n\
+              # normal boots so Mesa can take the real GPU path.\n\
               # export GALLIUM_DRIVER=llvmpipe\n\
               # export MESA_LOADER_DRIVER_OVERRIDE=kms_swrast\n\
               # Runtime dir for the Wayland socket (created on demand, mode 0700).\n\
@@ -1582,10 +1577,17 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             .join("release")
             .join("lunarbar");
         // Rebuild when any source file is newer than the binary.
-        let newest_src = ["src/main.rs", "src/apps.rs", "src/draw.rs", "src/sysinfo.rs", "src/par.rs", "Cargo.toml"]
-            .iter()
-            .filter_map(|rel| fs::metadata(dir.join(rel)).ok()?.modified().ok())
-            .max();
+        let newest_src = [
+            "src/main.rs",
+            "src/apps.rs",
+            "src/draw.rs",
+            "src/sysinfo.rs",
+            "src/par.rs",
+            "Cargo.toml",
+        ]
+        .iter()
+        .filter_map(|rel| fs::metadata(dir.join(rel)).ok()?.modified().ok())
+        .max();
         if let (Ok(bin_meta), Some(src_mtime)) = (fs::metadata(&executable), newest_src) {
             if let Ok(bin_mtime) = bin_meta.modified() {
                 if bin_mtime >= src_mtime {
@@ -1785,10 +1787,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         {
             use std::os::unix::fs::PermissionsExt;
             for w in ["eclipse-udhcpc", "eclipse-seatd", "eclipse-xorg"] {
-                let _ = fs::set_permissions(
-                    localbin.join(w),
-                    fs::Permissions::from_mode(0o755),
-                );
+                let _ = fs::set_permissions(localbin.join(w), fs::Permissions::from_mode(0o755));
             }
         }
 

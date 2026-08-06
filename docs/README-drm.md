@@ -192,10 +192,10 @@ rechaza).
 
 ## Cómo lanzar labwc
 
-El kernel implementa la ruta **legacy-KMS + dumb buffers + scanout por
-software** (y, opt-in, la atómica). Para que wlroots/labwc usen la ruta por
-defecto (y NO intenten GBM/EGL/GL, que no hay aceleración) hay que forzar el
-renderer **pixman** y el KMS legacy por variables de entorno:
+El kernel implementa la ruta **legacy-KMS + dumb buffers + scanout** (y, opt-in,
+la atómica). El arranque normal de labwc deja que wlroots/Mesa elijan la ruta
+de GPU; solo fija el dispositivo DRM y el runtime dir. `pixman` queda como
+fallback manual de depuración, no como predeterminado:
 
 ```sh
 # Gestor de asientos (o arráncalo en /etc/init.d/rcS). Da acceso a
@@ -206,18 +206,15 @@ seatd -g video &
 export XDG_RUNTIME_DIR=/run/user/0
 mkdir -p "$XDG_RUNTIME_DIR" && chmod 0700 "$XDG_RUNTIME_DIR"
 
-# Render por software (sin GBM/EGL) y KMS legacy (no atómico, sin modifiers).
-export WLR_RENDERER=pixman
+# Pin del nodo DRM y KMS legacy (no atómico, sin modifiers).
 export WLR_DRM_NO_ATOMIC=1     # innecesario sin drm.atomic; quítalo para probar la ruta atómica
 export WLR_DRM_NO_MODIFIERS=1
 
 labwc
 ```
 
-> **Importante**: sin `WLR_RENDERER=pixman`, wlroots intenta primero el renderer
-> GLES2 sobre GBM/EGL (Mesa). Como aquí no hay GPU, esa ruta puede **colgarse,
-> fallar o funcionar extremadamente lenta**: Mesa cae a `llvmpipe` (render por
-> CPU) y cada frame además se vuelve a copiar al framebuffer DRM por software.
+> **Nota**: si necesitas volver temporalmente a renderizado software para aislar
+> un problema, exporta `WLR_RENDERER=pixman` manualmente antes de lanzar `labwc`.
 > El síntoma típico del fallo de inicialización es que el log del kernel se queda
 > en `[drm] VERSION …` y nunca llega al *scanout* (pantalla congelada). Si sí
 > arranca con `WLR_RENDERER=gles2`, el compositor seguirá siendo muy lento por
