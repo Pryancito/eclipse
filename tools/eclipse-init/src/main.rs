@@ -773,6 +773,15 @@ fn gpu_is_nvidia() -> bool {
         .unwrap_or(false)
 }
 
+/// Does the kernel command line carry `token`? Same `:`/whitespace splitting
+/// as [`renderer_mode`]. Used for opt-in knobs like `nvidia.wlr_vulkan`.
+fn cmdline_has(token: &str) -> bool {
+    fs::read_to_string("/proc/cmdline")
+        .unwrap_or_default()
+        .split([':', ' ', '\t', '\n'])
+        .any(|t| t == token)
+}
+
 /// The environment handed to every spawned service: the static [`CHILD_ENV`]
 /// base plus the renderer pin. Pixman (CPU software) is the default because with
 /// no working GL driver wlroots' GLES2 path leaves the desktop black — exactly
@@ -789,15 +798,26 @@ fn build_child_env() -> Vec<CString> {
         }
         Renderer::Gl => {
             if gpu_is_nvidia() {
-                // wlroots uses its native Vulkan/NVK renderer on this path (the
-                // NVK bring-up failures were all in render/vulkan/*). Name it
-                // EXPLICITLY rather than leaving it to wlroots' auto-select, so
-                // this init-supervised session, a login-shell labwc (/etc/profile)
-                // and a wrapper-launched one all pick the SAME renderer instead of
-                // three different ones for one boot. WLR_DRM_NO_MODIFIERS is
-                // already in CHILD_ENV (forces LINEAR scanout for the CPU blit).
-                env.push(CString::new("WLR_RENDERER=vulkan").unwrap());
-                log("renderer=gl: NVIDIA GPU -> WLR_RENDERER=vulkan (wlroots native NVK renderer)");
+                // Compositor renderer: GLES2-on-zink by DEFAULT. Proven on the
+                // RTX -- /proc/gpudbg confirmed a client EXEC completing with
+                // fence + syncobj and zero MMU faults, i.e. zink->NVK submission
+                // works end to end. wlroots' NATIVE Vulkan renderer, by contrast,
+                // needs an external/shareable VkSemaphore (VK_KHR_external_
+                // semaphore) that NVK does not export over this partial syncobj
+                // uAPI -> vkCreateSemaphore ERROR_INVALID_EXTERNAL_HANDLE (NVK
+                // rejects it in userspace: no SYNCOBJ ioctl ever reaches dmesg),
+                // and its retry loop churned throwaway contexts until
+                // CHANNEL_ALLOC hit EBUSY and the desktop never came up. gles2/
+                // zink avoids that path entirely. Opt back into native Vulkan
+                // with `nvidia.wlr_vulkan` on the cmdline once the external-
+                // semaphore capability is wired. Named explicitly (not wlroots
+                // auto-select) so init, /etc/profile and the wrapper agree.
+                // WLR_DRM_NO_MODIFIERS is already in CHILD_ENV (LINEAR scanout).
+                let wlr = if cmdline_has("nvidia.wlr_vulkan") { "vulkan" } else { "gles2" };
+                env.push(CString::new(format!("WLR_RENDERER={wlr}")).unwrap());
+                log(&format!(
+                    "renderer=gl: NVIDIA GPU -> WLR_RENDERER={wlr} (default gles2=zink->NVK; vulkan via nvidia.wlr_vulkan)"
+                ));
                 // On real NVIDIA hardware, pin the OpenGL Gallium driver to zink
                 // (GL-on-Vulkan over NVK). Our nouveau uAPI implements the zink/NVK
                 // submission path (VM_BIND/EXEC) but NOT the classic nvc0 Gallium

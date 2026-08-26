@@ -1139,20 +1139,27 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # /etc/profile and eclipse-init's build_child_env: hardware GL only\n\
           # when an NVIDIA GPU AND the nvidia.nouveau_uapi flag are both present\n\
           # (that flag is what turns the kernel's nouveau uAPI on). On that path\n\
-          # wlroots uses its native Vulkan/NVK renderer, forces LINEAR scanout\n\
-          # (WLR_DRM_NO_MODIFIERS -- else the swapchain fails vkBindImageMemory),\n\
-          # and GL CLIENTS launched inside the session (foot -> glxgears,\n\
-          # Xwayland apps, all inheriting this env) are pinned to zink+NVK: our\n\
-          # uAPI implements zink/NVK's VM_BIND/EXEC, not classic nvc0\n\
-          # GEM_PUSHBUF, so an unpinned client falls to llvmpipe and crashes on\n\
-          # dma-buf import. Otherwise pixman: this kernel's /dev/dri/card0 is the\n\
-          # software-KMS path (no GBM/EGL), so wlroots' GLES2 renderer would\n\
+          # the compositor uses GLES2 on zink by DEFAULT (proven on the RTX --\n\
+          # zink->NVK EXEC completes with fence+syncobj); wlroots' native Vulkan\n\
+          # renderer is opt-in via nvidia.wlr_vulkan (it needs an external\n\
+          # VkSemaphore NVK will not export over this partial syncobj uAPI). It\n\
+          # forces LINEAR scanout (WLR_DRM_NO_MODIFIERS -- else the swapchain\n\
+          # fails vkBindImageMemory), and GL CLIENTS launched inside the session\n\
+          # (foot -> glxgears, Xwayland apps, all inheriting this env) are pinned\n\
+          # to zink+NVK: our uAPI implements zink/NVK's VM_BIND/EXEC, not classic\n\
+          # nvc0 GEM_PUSHBUF, so an unpinned client falls to llvmpipe and crashes\n\
+          # on dma-buf import. Otherwise pixman: this kernel's /dev/dri/card0 is\n\
+          # the software-KMS path (no GBM/EGL), so wlroots' GLES2 renderer would\n\
           # eglCreateContext on a node with no GL and abort before the first\n\
           # frame (README-drm.md). Every var uses `:=` so a caller override --\n\
           # or what /etc/profile already exported on a login chain -- wins.\n\
           if grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null && \\\n\
           \x20\x20 [ \"$(cat /sys/class/drm/card0/device/vendor 2>/dev/null)\" = \"0x10de\" ]; then\n\
-          \x20 : \"${WLR_RENDERER:=vulkan}\"; export WLR_RENDERER\n\
+          \x20 if grep -q 'nvidia\\.wlr_vulkan' /proc/cmdline 2>/dev/null; then\n\
+          \x20\x20 : \"${WLR_RENDERER:=vulkan}\"; export WLR_RENDERER\n\
+          \x20 else\n\
+          \x20\x20 : \"${WLR_RENDERER:=gles2}\"; export WLR_RENDERER\n\
+          \x20 fi\n\
           \x20 : \"${WLR_DRM_NO_MODIFIERS:=1}\"; export WLR_DRM_NO_MODIFIERS\n\
           \x20 : \"${GALLIUM_DRIVER:=zink}\"; export GALLIUM_DRIVER\n\
           \x20 : \"${MESA_LOADER_DRIVER_OVERRIDE:=zink}\"; export MESA_LOADER_DRIVER_OVERRIDE\n\
