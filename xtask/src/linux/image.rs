@@ -193,8 +193,10 @@ impl super::LinuxRootfs {
             // per-file cap would truncate — so QEMU (which boots this live
             // initramfs, not the installed btrfs) would have X on disk but not
             // in RAM. Copy the X-owned trees in uncapped so `startx` works in
-            // QEMU too. Excludes usr/lib/dri (heavy mesa GL) to bound the RAM
-            // image; disable with ECLIPSE_XORG_LIVE=0 for a lean installer.
+            // QEMU too, INCLUDING usr/lib/dri (the Mesa DRI entries are symlinks
+            // into libraries already copied under usr/lib, so excluding them
+            // saved nothing and broke GL); disable with ECLIPSE_XORG_LIVE=0 for
+            // a lean installer.
             super::xorg::copy_into_live(&rootfs_path, &live_root);
 
             // The vendored NVIDIA driver reads gsp.bin at boot from the

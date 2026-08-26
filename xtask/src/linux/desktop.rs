@@ -1135,12 +1135,30 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # scene on every pointer move. Forcing software cursors used to paper\n\
           # over a missing cursor ioctl and burned a core idle; leave the var\n\
           # unset unless a caller overrides it for debugging.\n\
-          # Software renderer. This kernel's /dev/dri/card0 is the software-KMS\n\
-          # path (pixman scanout, no GBM/EGL): wlroots' default GLES2 renderer\n\
-          # would try to eglCreateContext on a node with no GL and abort before\n\
-          # the first frame. pixman is the renderer the whole desktop was\n\
-          # designed around (README-drm.md).\n\
-          : \"${WLR_RENDERER:=pixman}\"; export WLR_RENDERER\n\
+          # Renderer, by the SAME two-condition gate as the kernel,\n\
+          # /etc/profile and eclipse-init's build_child_env: hardware GL only\n\
+          # when an NVIDIA GPU AND the nvidia.nouveau_uapi flag are both present\n\
+          # (that flag is what turns the kernel's nouveau uAPI on). On that path\n\
+          # wlroots uses its native Vulkan/NVK renderer, forces LINEAR scanout\n\
+          # (WLR_DRM_NO_MODIFIERS -- else the swapchain fails vkBindImageMemory),\n\
+          # and GL CLIENTS launched inside the session (foot -> glxgears,\n\
+          # Xwayland apps, all inheriting this env) are pinned to zink+NVK: our\n\
+          # uAPI implements zink/NVK's VM_BIND/EXEC, not classic nvc0\n\
+          # GEM_PUSHBUF, so an unpinned client falls to llvmpipe and crashes on\n\
+          # dma-buf import. Otherwise pixman: this kernel's /dev/dri/card0 is the\n\
+          # software-KMS path (no GBM/EGL), so wlroots' GLES2 renderer would\n\
+          # eglCreateContext on a node with no GL and abort before the first\n\
+          # frame (README-drm.md). Every var uses `:=` so a caller override --\n\
+          # or what /etc/profile already exported on a login chain -- wins.\n\
+          if grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null && \\\n\
+          \x20\x20 [ \"$(cat /sys/class/drm/card0/device/vendor 2>/dev/null)\" = \"0x10de\" ]; then\n\
+          \x20 : \"${WLR_RENDERER:=vulkan}\"; export WLR_RENDERER\n\
+          \x20 : \"${WLR_DRM_NO_MODIFIERS:=1}\"; export WLR_DRM_NO_MODIFIERS\n\
+          \x20 : \"${GALLIUM_DRIVER:=zink}\"; export GALLIUM_DRIVER\n\
+          \x20 : \"${MESA_LOADER_DRIVER_OVERRIDE:=zink}\"; export MESA_LOADER_DRIVER_OVERRIDE\n\
+          else\n\
+          \x20 : \"${WLR_RENDERER:=pixman}\"; export WLR_RENDERER\n\
+          fi\n\
           # Backends: DRM for output + libinput for evdev. Naming them keeps\n\
           # wlroots off the headless/X11 autodetect fallbacks when no parent\n\
           # display exists.\n\
@@ -1184,20 +1202,11 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # (\"error: 'C' is not a UTF-8 locale\"). init-launched sessions never\n\
           # source /etc/profile, so set it here like the rest of the session env.\n\
           : \"${LANG:=C.UTF-8}\"; export LANG\n\
-          # GL clients INSIDE this session (foot -> eglgears/glxgears, Xwayland\n\
-          # apps) inherit labwc's environment, so pin them to zink+NVK here on\n\
-          # NVIDIA. Our nouveau uAPI implements zink/NVK's VM_BIND/EXEC\n\
-          # submission, not classic nvc0 GEM_PUSHBUF -- an unpinned client\n\
-          # silently falls back to llvmpipe and crashes on dma-buf import.\n\
-          # eclipse-init pins these in its child env, but login(1) strips\n\
-          # arbitrary vars, so a session started through any login chain lost\n\
-          # them; the wrapper is the one delivery that survives every chain.\n\
-          # `:=` keeps a caller's explicit override. NVIDIA-gated (same check\n\
-          # as eclipse-init) so QEMU's virtio/virgl stays untouched.\n\
-          if [ \"$(cat /sys/class/drm/card0/device/vendor 2>/dev/null)\" = \"0x10de\" ]; then\n\
-          \x20 : \"${GALLIUM_DRIVER:=zink}\"; export GALLIUM_DRIVER\n\
-          \x20 : \"${MESA_LOADER_DRIVER_OVERRIDE:=zink}\"; export MESA_LOADER_DRIVER_OVERRIDE\n\
-          fi\n\
+          # (The zink+NVK client pin and WLR_DRM_NO_MODIFIERS moved UP into the\n\
+          # renderer block above, so the whole hardware-GL stack is chosen by\n\
+          # one two-condition gate -- NVIDIA + nvidia.nouveau_uapi -- instead of\n\
+          # a vendor-only pin that also fired on a recovery boot (renderer=pixman\n\
+          # without the flag), pinning zink over a kernel uAPI that was off.)\n\
           # Capture labwc's own stdout/stderr (wlroots backend/output/input\n\
           # discovery, errors) to a file. init wires a service's stdio to\n\
           # /dev/null, so without this redirect a black-screen bring-up leaves\n\

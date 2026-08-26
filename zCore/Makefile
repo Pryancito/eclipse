@@ -56,7 +56,11 @@ boottrace_arg := $(if $(BOOTTRACE),:BOOTTRACE=$(BOOTTRACE))
 # GL renderer selector. DEFAULT: auto (`GL ?= auto`) — eclipse-init picks the
 # renderer from the GPU present (`detect_renderer()`), so ONE image does the
 # right thing in QEMU and on real hardware. Modes:
-#   GL=auto (default) -> renderer=auto  (per-GPU: gl-sw everywhere today)
+#   GL=auto (default) -> renderer=auto  (per-GPU at boot, detect_renderer:
+#                                         NVIDIA without the nvidia.nouveau_uapi
+#                                         flag -> pixman; any other GPU -> gl-sw;
+#                                         no GPU -> pixman. NVIDIA + the flag is
+#                                         the GL=1 case below.)
 #   GL=0              -> renderer=pixman (CPU 2D software; always renders)
 #   GL=sw             -> renderer=gl-sw  (wlroots GLES2 over Mesa llvmpipe;
 #                                         software GL, RENDERS in QEMU, slow)
@@ -86,8 +90,11 @@ boottrace_arg := $(if $(BOOTTRACE),:BOOTTRACE=$(BOOTTRACE))
 # nouveau path (nvidia.rs), forced by `GL=1`.
 #
 # NOTE for real hardware: the ESP's rboot.conf cmdline is written from CMDLINE,
-# so a default build stamps `renderer=auto` there (-> gl-sw today, safe). Force
-# `GL=1` to try nouveau, or edit the token in the ESP's rboot.conf by hand.
+# so a default build stamps `renderer=auto` there. auto resolves per GPU at
+# boot (eclipse-init detect_renderer): NVIDIA WITHOUT the nvidia.nouveau_uapi
+# flag -> pixman (the kernel uAPI is off, so hardware GL cannot exist — same
+# two-condition rule as everywhere else); any other GPU -> gl-sw; no GPU ->
+# pixman. Force `GL=1` to try nouveau, or edit the ESP's rboot.conf by hand.
 GL ?= auto
 gl_arg := $(if $(filter 0,$(GL)),:renderer=pixman,$(if $(filter sw,$(GL)),:renderer=gl-sw,$(if $(filter 1,$(GL)),:renderer=gl:nvidia.nouveau_uapi,:renderer=auto)))
 

@@ -723,40 +723,43 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # reboot WITHOUT nvidia.nouveau_uapi on the cmdline.\n\
               #\n\
               # TWO conditions, like the kernel's own gate: the cmdline flag is a\n\
-              # REQUEST and the NVIDIA GPU is the CAPABILITY. The GL=1 image is\n\
-              # booted both on the RTX box AND under QEMU, and keying on the flag\n\
-              # alone exported WLR_RENDERER=vulkan on QEMU's 2D-only virtio-gpu\n\
-              # (no Vulkan, no fallback -> dead compositor from any login chain).\n\
-              # Flag without NVIDIA now degrades to the SAME software-GL stack as\n\
-              # renderer=gl-sw, mirroring eclipse-init's build_child_env.\n\
-              if grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null; then\n\
-              \x20 if [ \"$(cat /sys/class/drm/card0/device/vendor 2>/dev/null)\" = \"0x10de\" ]; then\n\
-              \x20\x20 export WLR_RENDERER=vulkan\n\
-              \x20 else\n\
-              \x20\x20 export WLR_RENDERER=gles2\n\
-              \x20\x20 export WLR_RENDERER_ALLOW_SOFTWARE=1\n\
-              \x20\x20 export LIBGL_ALWAYS_SOFTWARE=1\n\
-              \x20 fi\n\
-              else\n\
-              \x20 export WLR_RENDERER=pixman\n\
-              \x20 export WLR_RENDERER_ALLOW_SOFTWARE=1\n\
-              fi\n\
-              # GL CLIENTS (eglgears, glxgears, Xwayland apps) must take the\n\
-              # zink+NVK path on NVIDIA: our nouveau uAPI implements the\n\
-              # VM_BIND/EXEC submission zink/NVK uses, NOT the classic nvc0\n\
-              # GEM_PUSHBUF path -- an unpinned client falls back to llvmpipe\n\
-              # and its dma-buf import crashes (SELF-IMPORT MISS -> ENOENT).\n\
-              # eclipse-init pins these in its child env (build_child_env),\n\
-              # but login(1) STRIPS arbitrary vars, so a login shell (and\n\
-              # everything launched from it) lost them -- making the SAME\n\
-              # command work or crash depending on which chain spawned the\n\
-              # terminal. Re-assert them for login shells here; the labwc\n\
-              # wrapper does the same for the compositor session. Gated on\n\
-              # real NVIDIA hardware (same check as eclipse-init) so QEMU's\n\
-              # virtio/virgl path is untouched.\n\
-              if [ \"$(cat /sys/class/drm/card0/device/vendor 2>/dev/null)\" = \"0x10de\" ]; then\n\
+              # REQUEST and the NVIDIA GPU is the CAPABILITY. Only when BOTH hold\n\
+              # is the kernel's nouveau uAPI actually on, so ONLY then is the\n\
+              # hardware-GL stack correct -- WLR_RENDERER=vulkan (wlroots' native\n\
+              # NVK renderer), WLR_DRM_NO_MODIFIERS=1 (force LINEAR scanout, or the\n\
+              # swapchain fails vkBindImageMemory -> no desktop), and the zink pin\n\
+              # for GL CLIENTS (eglgears/glxgears/Xwayland apps): our uAPI\n\
+              # implements zink/NVK's VM_BIND/EXEC, not the classic nvc0\n\
+              # GEM_PUSHBUF, so an unpinned client falls to llvmpipe and its\n\
+              # dma-buf import crashes (SELF-IMPORT MISS -> ENOENT). login(1)\n\
+              # STRIPS arbitrary vars, so a login-shell labwc (and its clients)\n\
+              # lost what eclipse-init's build_child_env set -- re-assert the WHOLE\n\
+              # hardware-GL stack here so it matches build_child_env and the labwc\n\
+              # wrapper exactly. Keying the zink pin on the flag too (not vendor\n\
+              # alone) is what keeps the documented recovery boot honest: booting\n\
+              # renderer=pixman WITHOUT the flag on the same RTX must NOT pin zink\n\
+              # over a kernel uAPI that is off (no Vulkan device -> every GL client\n\
+              # dies) -- it degrades to software GL like any non-NVIDIA box.\n\
+              if grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null && \\\n\
+              \x20\x20 [ \"$(cat /sys/class/drm/card0/device/vendor 2>/dev/null)\" = \"0x10de\" ]; then\n\
+              \x20 # hardware GL: NVIDIA + flag -> kernel nouveau uAPI ON.\n\
+              \x20 export WLR_RENDERER=vulkan\n\
+              \x20 export WLR_DRM_NO_MODIFIERS=1\n\
               \x20 export GALLIUM_DRIVER=zink\n\
               \x20 export MESA_LOADER_DRIVER_OVERRIDE=zink\n\
+              elif grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null; then\n\
+              \x20 # flag but no NVIDIA (the GL=1 image under QEMU): software GL,\n\
+              \x20 # the same stack as renderer=gl-sw -- labwc on GLES2/llvmpipe.\n\
+              \x20 export WLR_RENDERER=gles2\n\
+              \x20 export WLR_RENDERER_ALLOW_SOFTWARE=1\n\
+              \x20 export LIBGL_ALWAYS_SOFTWARE=1\n\
+              else\n\
+              \x20 # no flag -> kernel uAPI off -> pixman compositor, and GL\n\
+              \x20 # clients from this shell go llvmpipe (no hardware GL exists\n\
+              \x20 # here: QEMU default, or an RTX booted without the flag).\n\
+              \x20 export WLR_RENDERER=pixman\n\
+              \x20 export WLR_RENDERER_ALLOW_SOFTWARE=1\n\
+              \x20 export LIBGL_ALWAYS_SOFTWARE=1\n\
               fi\n\
               # wlroots' libinput backend aborts the whole compositor if it\n\
               # enumerates zero input devices ('libinput initialization failed,\n\
@@ -782,12 +785,13 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # scanout regardless, so this is really about presenting one\n\
               # output, not about which port lights up.\n\
               export WLR_DRM_DEVICES=/dev/dri/card0\n\
-              # Software GL via Mesa (no usable HW 3D). The DRM node reports a\n\
-              # real NVIDIA PCI id, so Mesa would try the hardware nouveau driver\n\
-              # and fail; force the KMS software rasteriser (kms_swrast/llvmpipe)\n\
-              # which renders into dumb buffers. Only used when a GL renderer is\n\
-              # selected (WLR_RENDERER=gles2); that path is intentionally avoided\n\
-              # by default because it is much slower than pixman here.\n\
+              # Last-resort software-GL override, kept commented. The renderer\n\
+              # block above already picks the right stack per the two-condition\n\
+              # gate: hardware GL (vulkan+zink) only on NVIDIA+flag, software GL\n\
+              # (gles2/llvmpipe) with the flag under QEMU, pixman otherwise. These\n\
+              # two force Mesa's KMS software rasteriser explicitly, for a machine\n\
+              # where even llvmpipe autodetect misbehaves -- not needed on any\n\
+              # path validated so far.\n\
               #export GALLIUM_DRIVER=llvmpipe\n\
               #export MESA_LOADER_DRIVER_OVERRIDE=kms_swrast\n\
               # Runtime dir for the Wayland socket (created on demand, mode 0700).\n\
