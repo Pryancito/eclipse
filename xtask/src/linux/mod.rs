@@ -721,8 +721,22 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # it may fail to init cleanly (again, no fallback to pixman), or\n\
               # hang/crash partway through a frame. If labwc does not come up,\n\
               # reboot WITHOUT nvidia.nouveau_uapi on the cmdline.\n\
+              #\n\
+              # TWO conditions, like the kernel's own gate: the cmdline flag is a\n\
+              # REQUEST and the NVIDIA GPU is the CAPABILITY. The GL=1 image is\n\
+              # booted both on the RTX box AND under QEMU, and keying on the flag\n\
+              # alone exported WLR_RENDERER=vulkan on QEMU's 2D-only virtio-gpu\n\
+              # (no Vulkan, no fallback -> dead compositor from any login chain).\n\
+              # Flag without NVIDIA now degrades to the SAME software-GL stack as\n\
+              # renderer=gl-sw, mirroring eclipse-init's build_child_env.\n\
               if grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null; then\n\
-              \x20 export WLR_RENDERER=vulkan\n\
+              \x20 if [ \"$(cat /sys/class/drm/card0/device/vendor 2>/dev/null)\" = \"0x10de\" ]; then\n\
+              \x20\x20 export WLR_RENDERER=vulkan\n\
+              \x20 else\n\
+              \x20\x20 export WLR_RENDERER=gles2\n\
+              \x20\x20 export WLR_RENDERER_ALLOW_SOFTWARE=1\n\
+              \x20\x20 export LIBGL_ALWAYS_SOFTWARE=1\n\
+              \x20 fi\n\
               else\n\
               \x20 export WLR_RENDERER=pixman\n\
               \x20 export WLR_RENDERER_ALLOW_SOFTWARE=1\n\

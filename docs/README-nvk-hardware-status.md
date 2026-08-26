@@ -1054,6 +1054,28 @@ declare `DrmScheme::nouveau_uapi_capable()`, que sólo `NvidiaGpu` hace. Sin
 GPU NVIDIA el kernel lo dice y sigue identificándose como `"zcore"`, igual
 que antes de que `GL=1` arrastrase la bandera. En la RTX no cambia nada.
 
+### El userspace aplica la misma lógica (glxgears en QEMU con `GL=1`)
+
+El gate del kernel dejaba la uAPI apagada, pero el **entorno de sesión**
+seguía keyed sólo por la bandera/modo, y con `GL=1` en QEMU quedaba en tierra
+de nadie: `eclipse-init` (`Renderer::Gl`, no-NVIDIA) no fijaba nada — ni
+`LIBGL_ALWAYS_SOFTWARE` ni `WLR_RENDERER` — así que el wrapper de labwc caía a
+su default **pixman** mientras los clientes GL sondeaban hardware. Resultado
+observado: `glxgears` renderizaba (llvmpipe por fallback de Mesa, **FPS en la
+consola**) pero su ventana **nunca aparecía** — los frames iban por una ruta
+de buffers que el compositor pixman no compone. Y `/etc/profile` era peor:
+exportaba `WLR_RENDERER=vulkan` con sólo ver la bandera en `/proc/cmdline`,
+sin Vulkan alguno en virtio (un labwc lanzado desde una cadena de login moría
+sin fallback).
+
+Corregido con la misma regla de dos condiciones en los dos sitios: bandera
+**sin** GPU NVIDIA (`gpu_is_nvidia()` / vendor sysfs) → degradar al stack
+software de `renderer=gl-sw` (`WLR_RENDERER=gles2` +
+`WLR_RENDERER_ALLOW_SOFTWARE=1` + `LIBGL_ALWAYS_SOFTWARE=1`): labwc sobre
+GLES2/llvmpipe, clientes sobre llvmpipe — la configuración de QEMU que sí
+pinta engranajes. La imagen `GL=1` hace ahora lo correcto en las dos máquinas
+también en userspace; en la RTX (bandera + NVIDIA) nada cambia.
+
 ### Klogs sin estrangular
 
 `klog_info!` no tiene filtro de nivel, ni límite de frecuencia, y escribe de
