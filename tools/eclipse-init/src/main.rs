@@ -759,27 +759,47 @@ fn build_child_env() -> Vec<CString> {
             env.push(CString::new("WLR_RENDERER_ALLOW_SOFTWARE=1").unwrap());
         }
         Renderer::Gl => {
-            log("renderer=gl: letting wlroots/Mesa auto-select the GPU renderer (no pixman pin)");
-            // On real NVIDIA hardware, pin the OpenGL Gallium driver to zink
-            // (GL-on-Vulkan over NVK). Our nouveau uAPI implements the zink/NVK
-            // submission path (VM_BIND/EXEC) but NOT the classic nvc0 Gallium
-            // path (GEM_PUSHBUF returns EOPNOTSUPP). A GL CLIENT (glxgears,
-            // eglgears, anything the user launches) that Mesa steers to nvc0
-            // therefore fails submission and silently falls back to llvmpipe --
-            // a system-memory buffer that is NOT a nouveau GEM object, so the
-            // compositor's PRIME self-import misses it and NVK's dma-buf import
-            // ENOENTs (the client crashes; the desktop survives). Pinning zink
-            // makes clients take the SAME hardware path the compositor already
-            // uses, so their buffers are real nouveau objects that import
-            // cleanly. GATED to NVIDIA: zink needs a Vulkan driver, and QEMU's
-            // virtio-gpu has none (its GL is virgl), so forcing zink there would
-            // break the QEMU desktop -- leave virtio on its virgl path. Both
-            // vars are set because different Mesa builds honour one or the other
-            // for the "force zink over the native DRI driver" override.
             if gpu_is_nvidia() {
+                log("renderer=gl: letting wlroots/Mesa auto-select the GPU renderer (no pixman pin)");
+                // On real NVIDIA hardware, pin the OpenGL Gallium driver to zink
+                // (GL-on-Vulkan over NVK). Our nouveau uAPI implements the zink/NVK
+                // submission path (VM_BIND/EXEC) but NOT the classic nvc0 Gallium
+                // path (GEM_PUSHBUF returns EOPNOTSUPP). A GL CLIENT (glxgears,
+                // eglgears, anything the user launches) that Mesa steers to nvc0
+                // therefore fails submission and silently falls back to llvmpipe --
+                // a system-memory buffer that is NOT a nouveau GEM object, so the
+                // compositor's PRIME self-import misses it and NVK's dma-buf import
+                // ENOENTs (the client crashes; the desktop survives). Pinning zink
+                // makes clients take the SAME hardware path the compositor already
+                // uses, so their buffers are real nouveau objects that import
+                // cleanly. GATED to NVIDIA: zink needs a Vulkan driver, and QEMU's
+                // virtio-gpu has none (its GL is virgl), so forcing zink there would
+                // break the QEMU desktop -- leave virtio on its virgl path. Both
+                // vars are set because different Mesa builds honour one or the other
+                // for the "force zink over the native DRI driver" override.
                 env.push(CString::new("GALLIUM_DRIVER=zink").unwrap());
                 env.push(CString::new("MESA_LOADER_DRIVER_OVERRIDE=zink").unwrap());
                 log("renderer=gl: NVIDIA GPU -> pinning GL clients to zink+NVK (GALLIUM_DRIVER=zink)");
+            } else {
+                // `renderer=gl` (GL=1) on a machine with NO NVIDIA GPU -- the
+                // GL=1 image booted under QEMU. The hardware-GL path cannot
+                // exist here (the kernel's own two-condition gate already left
+                // the nouveau uAPI off; our virtio-gpu is 2D-only, no virgl),
+                // and leaving the environment unpinned was WORSE than either
+                // explicit mode: labwc's wrapper then defaulted WLR_RENDERER to
+                // pixman while GL clients kept hardware-probing Mesa defaults,
+                // and that mix rendered but never composited -- glxgears
+                // printed its FPS to the console with no window ever appearing
+                // (frames swapped into buffers the pixman compositor does not
+                // take). Degrade to the SAME software-GL stack as
+                // `renderer=gl-sw` (labwc on GLES2/llvmpipe, clients on
+                // llvmpipe), which is exactly the QEMU configuration that
+                // renders gears -- so the ONE `GL=1` image does the right thing
+                // on both machines, mirroring what `renderer=auto` picks here.
+                env.push(CString::new("WLR_RENDERER=gles2").unwrap());
+                env.push(CString::new("WLR_RENDERER_ALLOW_SOFTWARE=1").unwrap());
+                env.push(CString::new("LIBGL_ALWAYS_SOFTWARE=1").unwrap());
+                log("renderer=gl: no NVIDIA GPU (QEMU/virtio) -> degrading to software GL (gl-sw stack: labwc GLES2 + llvmpipe clients)");
             }
         }
         Renderer::GlSw => {

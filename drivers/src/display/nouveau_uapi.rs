@@ -44,6 +44,7 @@
 //! `NvidiaGpu::ioctl` behaves exactly as before, byte for byte.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use lock::Mutex;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -181,6 +182,80 @@ pub(super) fn exec_failure_sig(tag: u64, statuses: &[u32]) -> u64 {
         .fold(tag ^ 0x9e37_79b9_7f4a_7c15, |acc, &x| {
             acc.rotate_left(13) ^ x as u64
         })
+}
+
+/// The last client (`ctx >= 1`) EXEC outcome, pre-formatted, for
+/// `/proc/gpudbg`. The reason this exists: on this stack the ONLY thing that
+/// exercises a real GPU 3D/compute draw is a GL/Vulkan client (the compositor
+/// and lunarbar/foot paint via CPU wl_shm blits), and when a client's draw
+/// fails NVK collapses every kernel errno into a single
+/// `VK_ERROR_DEVICE_LOST`. The per-stage detail that says WHERE it failed is
+/// klog'd, but klog means the serial console / dmesg, which is awkward to read
+/// on the target. A GL client is always launched from a terminal, so mirror
+/// the last outcome into a file that terminal can `cat` -- one read names the
+/// failing stage (prime / lookup / map / token / submit / fence-wait) and the
+/// ring pointers, which is exactly what picks between the mutually-exclusive
+/// fixes each stage needs.
+static LAST_CLIENT_EXEC: Mutex<Option<alloc::string::String>> = Mutex::new(None);
+
+/// Record one client EXEC outcome (success or failure). `ok` true = the fence
+/// landed and syncobjs signaled; false = it failed at `stage` with `detail`.
+pub(super) fn record_client_exec(line: alloc::string::String) {
+    *LAST_CLIENT_EXEC.lock() = Some(line);
+}
+
+/// `/proc/gpudbg` section: the last client EXEC outcome, or a note that none
+/// has run this boot (which itself is diagnostic -- it means no GL/Vulkan
+/// client ever reached a real draw submit).
+pub(super) fn format_last_exec() -> alloc::string::String {
+    use core::fmt::Write;
+    let mut s = alloc::string::String::new();
+    let _ = writeln!(s, "[gpudbg] --- last client (ctx>=1) EXEC draw submit ---");
+    match &*LAST_CLIENT_EXEC.lock() {
+        Some(line) => {
+            let _ = writeln!(s, "[gpudbg]  {}", line);
+        }
+        None => {
+            let _ = writeln!(
+                s,
+                "[gpudbg]  (none this boot -- no GL/Vulkan client reached a real draw submit yet)"
+            );
+        }
+    }
+    // The last ioctl error is the one that actually became DEVICE_LOST when the
+    // EXEC itself succeeded. THIS is the line that matters when the EXEC above
+    // says OK but the client still died.
+    let _ = writeln!(s, "[gpudbg] --- last client nouveau-ioctl ERROR (any kind) ---");
+    match &*LAST_CLIENT_IOCTL_ERR.lock() {
+        Some(line) => {
+            let _ = writeln!(s, "[gpudbg]  {}", line);
+        }
+        None => {
+            let _ = writeln!(
+                s,
+                "[gpudbg]  (none this boot -- no client nouveau ioctl has returned an error)"
+            );
+        }
+    }
+    s
+}
+
+/// The last nouveau ioctl (of ANY kind) that returned an error to a client.
+static LAST_CLIENT_IOCTL_ERR: Mutex<Option<alloc::string::String>> = Mutex::new(None);
+
+/// Record one client nouveau-ioctl error for `/proc/gpudbg`. Uses the
+/// module's existing `nouveau_ioctl_name` (which expects the full nr byte and
+/// subtracts `DRM_COMMAND_BASE` itself).
+pub(super) fn record_ioctl_err(pid: u64, request: u32, errno: i32) {
+    let nr = request & 0xff;
+    *LAST_CLIENT_IOCTL_ERR.lock() = Some(alloc::format!(
+        "pid={} ioctl {:#010x} (nr={:#04x} {}) -> errno={}",
+        pid,
+        request,
+        nr,
+        nouveau_ioctl_name(nr),
+        errno
+    ));
 }
 
 // --- Linux errno values used below (matches linux-object's translation) ---

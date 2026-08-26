@@ -60,8 +60,11 @@ boottrace_arg := $(if $(BOOTTRACE),:BOOTTRACE=$(BOOTTRACE))
 #   GL=0              -> renderer=pixman (CPU 2D software; always renders)
 #   GL=sw             -> renderer=gl-sw  (wlroots GLES2 over Mesa llvmpipe;
 #                                         software GL, RENDERS in QEMU, slow)
-#   GL=1              -> renderer=gl + nvidia.nouveau_uapi (hardware GPU renderer;
-#                                         real-HW nouveau, does NOT render in QEMU)
+#   GL=1              -> renderer=gl + nvidia.nouveau_uapi (hardware GPU renderer
+#                                         on real-HW nouveau; on a machine with
+#                                         no NVIDIA GPU -- QEMU -- userspace
+#                                         degrades itself to the gl-sw stack, so
+#                                         the same image still renders, software)
 #
 # GL=1 also stamps `nvidia.nouveau_uapi` (the nouveau-compatible DRM ioctl
 # surface, off by default because it is untested on real hardware — see
@@ -69,15 +72,18 @@ boottrace_arg := $(if $(BOOTTRACE),:BOOTTRACE=$(BOOTTRACE))
 # GETPARAM/GEM/CHANNEL ioctl returns ENOSYS. It is a no-op without a real NVIDIA
 # GPU (nothing to answer), so it is harmless in QEMU.
 #
-# Why GL=1 can't render in QEMU: the virtio-gpu we expose is 2D-ONLY — its DRM
-# ioctl surface is a single GETPARAM stub, no virgl/3D (drivers/src/virtio/
-# gpu.rs). Mesa, seeing the `virtio_gpu` driver name, tries the virgl hardware
-# path, finds no 3D ("virtio_gpu: driver missing"), and the software fallback
-# fails too. So `auto` maps every GPU to the software-GL path (gl-sw / llvmpipe)
-# for now — safe in both QEMU and on the RTX (nouveau GL does not composite yet).
-# Hardware GL in QEMU would need the guest virgl protocol (large) + virglrenderer
-# on the host; hardware GL on the RTX is the nouveau path (nvidia.rs), reached by
-# forcing `GL=1` once it renders.
+# Why GL=1 can't render HARDWARE GL in QEMU: the virtio-gpu we expose is
+# 2D-ONLY — its DRM ioctl surface is a single GETPARAM stub, no virgl/3D
+# (drivers/src/virtio/gpu.rs). Hardware GL in QEMU would need the guest virgl
+# protocol (large) + virglrenderer on the host. What the GL=1 image does in
+# QEMU instead: eclipse-init (build_child_env) and /etc/profile both apply the
+# kernel's own two-condition logic — the flag is a REQUEST, an NVIDIA GPU is
+# the CAPABILITY — and with no NVIDIA GPU they degrade the session to the SAME
+# software-GL stack as GL=sw (labwc on GLES2/llvmpipe, clients on llvmpipe).
+# Leaving the env unpinned instead put labwc on pixman with hardware-probing
+# clients: glxgears rendered (FPS on the console) into buffers the pixman
+# compositor never composited — no window. Hardware GL on the RTX is the
+# nouveau path (nvidia.rs), forced by `GL=1`.
 #
 # NOTE for real hardware: the ESP's rboot.conf cmdline is written from CMDLINE,
 # so a default build stamps `renderer=auto` there (-> gl-sw today, safe). Force

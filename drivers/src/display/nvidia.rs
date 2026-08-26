@@ -3169,6 +3169,10 @@ impl DrmScheme for NvidiaGpu {
             }
         }
 
+        // The last GL/Vulkan client draw-submit outcome, readable from the
+        // terminal that launched the client (`cat /proc/gpudbg`) -- no dmesg.
+        s.push_str(&super::nouveau_uapi::format_last_exec());
+
         s
     }
 
@@ -6768,7 +6772,20 @@ impl DrmScheme for NvidiaGpu {
                 }
                 Ok(0)
             }
-            _ => self.nouveau_ioctl(request, arg, owner_pid),
+            _ => {
+                let r = self.nouveau_ioctl(request, arg, owner_pid);
+                // Record the LAST client nouveau-ioctl error into /proc/gpudbg.
+                // The EXEC record can say OK while the client still dies with
+                // DEVICE_LOST -- because the errno NVK collapses into
+                // device-lost is coming from some OTHER ioctl in the submit
+                // flow. This names which one. (EXEC's own rich failure line is
+                // recorded separately with its per-stage detail; this catches
+                // everything else -- VM_BIND, GEM, syncobj, PRIME.)
+                if let Err(errno) = r {
+                    super::nouveau_uapi::record_ioctl_err(owner_pid, request, errno);
+                }
+                r
+            }
         }
     }
 
@@ -6791,36 +6808,102 @@ impl DrmScheme for NvidiaGpu {
             self.drain_vm_mappings(&alloc::format!("process exit pid={}", pid), |m| {
                 m.owner_pid == pid
             });
-        // 2. Free ONLY this process's GEM objects.
+        // 2. Release this process's GEM objects, RESPECTING the PRIME share
+        //    count. A buffer this process created may still be imported by
+        //    ANOTHER holder: the compositor self-imports a client's on-screen
+        //    buffer to composite it (gem_mmap refcount > 1). The old code freed
+        //    every owned object unconditionally (`gem_mmap::unregister`, which
+        //    ignores the count) + `gem_free`, so a client exiting while the
+        //    compositor still displayed its window tore the buffer out from
+        //    under the compositor -- its next GEM_INFO/VM_BIND/EXEC on that
+        //    handle ENOENT'd or touched freed RM memory -> the COMPOSITOR's own
+        //    VK_ERROR_DEVICE_LOST. That is the "state accumulates over a
+        //    session" wedge: one client exit poisons a live compositor buffer,
+        //    and from then on every client looks broken.
+        //
+        //    Mirror `nouveau_gem_close` instead: `dec_ref`, and free for real
+        //    ONLY when this drops the LAST reference. A still-shared buffer is
+        //    kept alive with its owner detached (`owner_pid = 0`) so no future
+        //    process exit re-reaps it; the last holder's GEM_CLOSE -- which
+        //    finds the entry by handle -- frees it. `dec_ref` (the gem_mmap
+        //    lock) runs with the `nouveau_gem` lock RELEASED, the same order
+        //    GEM_CLOSE takes them, so a concurrent client GEM_CLOSE cannot
+        //    invert the lock order and deadlock.
+        //
+        //    Known residual (benign, documented): a client that self-imports
+        //    its OWN buffer (GBM export -> EGL/NVK re-import; refcount held
+        //    entirely by that one process) and then dies WITHOUT GEM_CLOSE
+        //    (^C/crash) leaks it -- we drop only its creator reference here, not
+        //    its own import references (those are not tracked per-pid). A leak
+        //    until reboot, never a use-after-free; the full fix is per-pid
+        //    reference accounting in gem_mmap. A clean exit closes every
+        //    reference and frees normally.
         let (freed_gems, freed_bytes) = {
-            let mut gem = self.nouveau_gem.lock();
-            let mut mine = Vec::new();
-            let mut i = 0;
-            while i < gem.len() {
-                if gem[i].owner_pid == pid {
-                    mine.push(gem.remove(i));
+            // Phase 1: snapshot this pid's objects. No removal, no gem_mmap touch.
+            let snapshot: Vec<(u32, bool)> = {
+                let gem = self.nouveau_gem.lock();
+                gem.iter()
+                    .filter(|o| o.owner_pid == pid)
+                    .map(|o| (o.handle, o.phys_addr.is_some()))
+                    .collect()
+            };
+            // Phase 2: drop this process's reference to each and decide
+            // free-vs-keep, with NO lock held across the two subsystems. A
+            // no-phys object was never PRIME-registered (cannot be shared) so it
+            // is always this process's alone -> free.
+            let mut to_free: Vec<u32> = Vec::new();
+            let mut to_orphan: Vec<u32> = Vec::new();
+            for (handle, has_phys) in &snapshot {
+                let still_shared = *has_phys
+                    && matches!(
+                        crate::scheme::gem_mmap::dec_ref(*handle),
+                        crate::scheme::gem_mmap::DecRef::StillReferenced(_)
+                    );
+                if still_shared {
+                    to_orphan.push(*handle);
                 } else {
-                    i += 1;
+                    to_free.push(*handle);
                 }
             }
-            drop(gem);
-            let mut bytes = 0u64;
-            for obj in &mine {
-                if obj.phys_addr.is_some() {
-                    crate::scheme::gem_mmap::unregister(obj.handle);
+            // Phase 3: apply under the nouveau_gem lock. Collect h_memory ONLY
+            // for entries actually removed here -- a racing GEM_CLOSE that
+            // already reaped one leaves it absent, so it is never double-freed.
+            let mut to_free_mem: Vec<(u32, u32, u64)> = Vec::new(); // (handle, h_memory, size)
+            {
+                let mut gem = self.nouveau_gem.lock();
+                for handle in &to_free {
+                    if let Some(pos) = gem.iter().position(|o| o.handle == *handle) {
+                        let obj = gem.remove(pos);
+                        to_free_mem.push((obj.handle, obj.h_memory, obj.size));
+                    }
                 }
+                for handle in &to_orphan {
+                    if let Some(o) = gem.iter_mut().find(|o| o.handle == *handle) {
+                        o.owner_pid = 0;
+                    }
+                }
+            }
+            // Phase 4: free RM memory outside every lock.
+            let mut bytes = 0u64;
+            for (handle, h_memory, size) in &to_free_mem {
                 if let Some(device_instance) = device_instance {
-                    let status = nvidia_rm_sys::rm_init::gem_free(device_instance, obj.h_memory);
+                    let status = nvidia_rm_sys::rm_init::gem_free(device_instance, *h_memory);
                     if status != 0 {
                         log::warn!(
                             "[nouveau-uapi] process exit pid={}: gem_free handle={} h_memory={:#010x} failed, NV_STATUS={:#x}",
-                            pid, obj.handle, obj.h_memory, status
+                            pid, handle, h_memory, status
                         );
                     }
                 }
-                bytes += obj.size;
+                bytes += size;
             }
-            (mine.len(), bytes)
+            if !to_orphan.is_empty() {
+                log::info!(
+                    "[nouveau-uapi] process exit pid={}: freed {} GEM object(s), kept {} still-imported by another holder (PRIME refcount > 0)",
+                    pid, to_free_mem.len(), to_orphan.len()
+                );
+            }
+            (to_free_mem.len(), bytes)
         };
         // 2.5. Free this process's RM engine-class objects (3D/2D/copy/inline/
         //      compute, added via NVIF NEW) BEFORE its channel. They are RM
@@ -7552,6 +7635,30 @@ impl NvidiaGpu {
     /// the client's buffers in the wrong VA space and MMU-faulted its channel.
     /// Not in the registry -> context 0 (the compositor, or a client that fell
     /// back to software).
+    /// One-line census of the per-client GPU context registry: how many of the
+    /// `MAX_CTX - 1` client slots are taken and by which pids.
+    ///
+    /// This is the state a long session degrades into. A slot is released when
+    /// its owner exits (`nouveau_release_process`), so slots outliving their
+    /// processes -- a teardown that did not run, an `RM` context that failed to
+    /// free -- eventually leave nothing for a NEW client, and
+    /// `ensure_ctx_for_pid` then hands it context 0. Every GL client failing at
+    /// its first submit while the desktop keeps running looks identical from
+    /// userspace whatever the cause, so print the census wherever a client's
+    /// EXEC gives up: exhaustion names itself instead of being inferred.
+    fn ctx_registry_summary(&self) -> alloc::string::String {
+        use super::nouveau_uapi as nv;
+        let map = self.nouveau_pid_ctx.lock();
+        let mut s = alloc::format!("{}/{} client slots used:", map.len(), nv::MAX_CTX - 1);
+        for t in map.iter() {
+            let _ = core::fmt::Write::write_fmt(
+                &mut s,
+                format_args!(" pid={}->ctx{}{}", t.0, t.1, if nv::ctx_is_wedged(t.1) { "(WEDGED)" } else { "" }),
+            );
+        }
+        s
+    }
+
     fn ctx_idx_for_pid(&self, owner_pid: u64) -> u32 {
         self.nouveau_pid_ctx
             .lock()
@@ -7668,6 +7775,20 @@ impl NvidiaGpu {
                 prime
             );
         }
+        // Record the prime outcome for /proc/gpudbg too: if the golden-context
+        // prime is TIMING OUT, that alone predicts every real draw on this
+        // client will cold-load-hang -> fence-wait timeout -> DEVICE_LOST, and
+        // it is the single most likely root. Seed the last-EXEC slot with it so
+        // `cat /proc/gpudbg` shows the prime verdict even before the client's
+        // first draw overwrites it.
+        nv::record_client_exec(alloc::format!(
+            "ctx={} pid={} PRIME {} (NV_STATUS={:#x}){}",
+            ctx_idx,
+            owner_pid,
+            if prime == 0 { "OK -- golden context loaded" } else { "TIMEOUT/FAIL -- first draw will cold-load" },
+            prime,
+            if prime == 0 { "" } else { " <== prime failure predicts DEVICE_LOST on first draw" }
+        ));
         (ctx_idx, h_vas, h_notifier)
     }
 
@@ -8911,9 +9032,24 @@ impl NvidiaGpu {
                             // this EIO is one NVK maps straight to
                             // VK_ERROR_DEVICE_LOST -- exactly the kind of client
                             // death that used to leave dmesg spotless.
+                            //
+                            // Name the fences, not just how many. The generic
+                            // stall reporter in `syncobj` only fires past 2 s,
+                            // which this 1 s deadline never reaches, so a count
+                            // was all anyone ever got -- and "which fence never
+                            // arrived, and who was supposed to signal it" is the
+                            // whole question on this path.
                             crate::klog_warn!(
-                                "[nouveau-uapi] EXEC: not all {} wait syncobj(s) reached their target within {}us -- NOT submitting (EIO -> NVK device-lost)",
-                                req.wait_count, WAIT_TIMEOUT_US
+                                "[nouveau-uapi] EXEC: {} wait syncobj(s) still unsignaled after {}us -- NOT submitting (EIO -> NVK device-lost) pid={} ctx={}:{} (handle:target/current)",
+                                req.wait_count,
+                                WAIT_TIMEOUT_US,
+                                owner_pid,
+                                self.ctx_idx_for_pid(owner_pid),
+                                crate::scheme::syncobj::describe(&handles, Some(&points))
+                            );
+                            crate::klog_warn!(
+                                "[nouveau-uapi] ctx registry: {}",
+                                self.ctx_registry_summary()
                             );
                             return Err(nv::EIO);
                         }
@@ -8935,7 +9071,52 @@ impl NvidiaGpu {
                 // attempt, starving the compositor's own rendering and freezing
                 // the desktop/cursor. ctx 0 (the compositor) is never wedged.
                 if ctx_idx >= 1 && nv::ctx_is_wedged(ctx_idx) {
+                    // Silent until now, and this is the arm a client stays in:
+                    // once its ring jams, EVERY later submit dies here, so the
+                    // app reports device-lost forever while dmesg says nothing
+                    // (the line explaining the ORIGINAL jam scrolled past long
+                    // before, or was suppressed as a repeat). One line per ctx
+                    // per boot, with the registry census.
+                    use core::sync::atomic::{AtomicU32, Ordering};
+                    static REPORTED: AtomicU32 = AtomicU32::new(0);
+                    if ctx_idx < 32 {
+                        let bit = 1u32 << ctx_idx;
+                        if REPORTED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                            crate::klog_warn!(
+                                "[nouveau-uapi] EXEC: pid={} submitting on CTX {}, latched WEDGED by an earlier fence timeout -- every submit fast-fails EIO (NVK: device-lost) until this process exits. {}",
+                                owner_pid,
+                                ctx_idx,
+                                self.ctx_registry_summary()
+                            );
+                        }
+                    }
                     return Err(nv::EIO);
+                }
+                // A client running on context 0 is running on the COMPOSITOR's
+                // ring, in the compositor's VA space -- where its own VM_BIND
+                // mappings do not exist. That is what `ensure_ctx_for_pid`
+                // falls back to when no slot is free or `ctx_alloc` failed, and
+                // it is documented there as "the client falls back to
+                // software", which is only true if the client's submits then
+                // fail. They may not: they may execute against the wrong VA
+                // space. Either way it is worth one line, because from the app
+                // it is indistinguishable from every other device-lost.
+                if ctx_idx == 0
+                    && !self
+                        .nouveau_channels
+                        .lock()
+                        .iter()
+                        .any(|c| c.rm_backed && c.ctx_idx == 0 && c.owner_pid == owner_pid)
+                {
+                    use core::sync::atomic::{AtomicU32, Ordering};
+                    static NO_CTX_REPORTS: AtomicU32 = AtomicU32::new(0);
+                    if NO_CTX_REPORTS.fetch_add(1, Ordering::Relaxed) < 8 {
+                        crate::klog_warn!(
+                            "[nouveau-uapi] EXEC: pid={} has NO context of its own and is about to submit on CTX 0 (the compositor's). {}",
+                            owner_pid,
+                            self.ctx_registry_summary()
+                        );
+                    }
                 }
                 if req.sig_count == 0 {
                     // No fence needed -- submit every push plainly, in order.
@@ -9065,6 +9246,14 @@ impl NvidiaGpu {
                                 );
                             }
                         }
+                        // Mirror to /proc/gpudbg (readable from the terminal the
+                        // client was launched in -- no dmesg needed).
+                        if ctx_idx >= 1 {
+                            nv::record_client_exec(alloc::format!(
+                                "ctx={} pid={} OK: {} push(es) + fence landed, {} syncobj(s) signaled",
+                                ctx_idx, owner_pid, req.push_count, req.sig_count
+                            ));
+                        }
                         log::info!(
                             "[nouveau-uapi] EXEC: {} push(es) submitted and fence confirmed ({} syncobj(s) signaled)",
                             req.push_count, req.sig_count
@@ -9099,12 +9288,43 @@ impl NvidiaGpu {
                                 r.fence_wait_status,
                             ],
                         );
+                        // Which stage broke, in one word, for the terminal-side
+                        // /proc/gpudbg line. Order matches the submission path.
+                        let stage = if r.lookup_status != 0 {
+                            "lookup(handles/channel)"
+                        } else if r.map_status != 0 {
+                            "cpu-map(pushbuf/userd)"
+                        } else if r.token_status != 0 {
+                            "worksubmit-token"
+                        } else if r.submit_status != 0 {
+                            "submit(ring-full/BUSY_RETRY)"
+                        } else if r.fence_submit_status != 0 {
+                            "doorbell(fence-submit)"
+                        } else if r.fence_wait_status != 0 {
+                            "fence-wait TIMEOUT (push executed but fence never landed -> cold-load/WFI hang or coherency)"
+                        } else {
+                            "unknown"
+                        };
+                        if ctx_idx >= 1 {
+                            nv::record_client_exec(alloc::format!(
+                                "ctx={} pid={} FAILED at {} | lookup={:#x} map={:#x} token={:#x} submit={:#x} fenceSubmit={:#x} fenceWait={:#x} fence={:#x}/exp={:#x} | {}",
+                                ctx_idx, owner_pid, stage,
+                                r.lookup_status, r.map_status, r.token_status, r.submit_status,
+                                r.fence_submit_status, r.fence_wait_status, r.fence_value, fence_payload,
+                                self.ctx_registry_summary()
+                            ));
+                        }
                         if nv::exec_failure_changed(sig) {
                             replay_rm(rm_narration);
                             crate::klog_warn!(
-                                "[nouveau-uapi] EXEC (signaled) failed: lookup={:#x} map={:#x} token={:#x} submit={:#x} fenceSubmit={:#x} fenceWait={:#x} (fence value={:#x} expected={:#x}; identical repeats suppressed)",
+                                "[nouveau-uapi] EXEC (signaled) failed: pid={} ctx={} pushes={} waits={} sigs={} | lookup={:#x} map={:#x} token={:#x} submit={:#x} fenceSubmit={:#x} fenceWait={:#x} (fence value={:#x} expected={:#x}; identical repeats suppressed)",
+                                owner_pid, ctx_idx, req.push_count, req.wait_count, req.sig_count,
                                 r.lookup_status, r.map_status, r.token_status, r.submit_status,
                                 r.fence_submit_status, r.fence_wait_status, r.fence_value, fence_payload
+                            );
+                            crate::klog_warn!(
+                                "[nouveau-uapi] ctx registry: {}",
+                                self.ctx_registry_summary()
                             );
                         }
                         // If the ring is jammed (BUSY_RETRY with GPGet
@@ -9122,8 +9342,17 @@ impl NvidiaGpu {
                         // its API lock inside the failure storm). Once per
                         // boot: the notifier doesn't change after the channel
                         // dies.
+                        //
+                        // Also on a FENCE-WAIT timeout with a submit the RM
+                        // accepted: that is the shape of a channel the GPU
+                        // killed while running (MMU fault on a client's
+                        // buffer, GR exception), where the submit call itself
+                        // reported success and only the fence never landed.
+                        // Gating solely on BUSY_RETRY left exactly that case
+                        // -- the one a GL client hits -- with no notifier.
                         static NOTIFIER_DUMPED: AtomicBool = AtomicBool::new(false);
-                        if r.submit_status == nvidia_rm_sys::types::NV_ERR_BUSY_RETRY
+                        if (r.submit_status == nvidia_rm_sys::types::NV_ERR_BUSY_RETRY
+                            || r.fence_wait_status != 0)
                             && !NOTIFIER_DUMPED.swap(true, Ordering::Relaxed)
                         {
                             match nv::chan_notifier_pa_cached() {

@@ -1054,6 +1054,28 @@ declare `DrmScheme::nouveau_uapi_capable()`, que sólo `NvidiaGpu` hace. Sin
 GPU NVIDIA el kernel lo dice y sigue identificándose como `"zcore"`, igual
 que antes de que `GL=1` arrastrase la bandera. En la RTX no cambia nada.
 
+### El userspace aplica la misma lógica (glxgears en QEMU con `GL=1`)
+
+El gate del kernel dejaba la uAPI apagada, pero el **entorno de sesión**
+seguía keyed sólo por la bandera/modo, y con `GL=1` en QEMU quedaba en tierra
+de nadie: `eclipse-init` (`Renderer::Gl`, no-NVIDIA) no fijaba nada — ni
+`LIBGL_ALWAYS_SOFTWARE` ni `WLR_RENDERER` — así que el wrapper de labwc caía a
+su default **pixman** mientras los clientes GL sondeaban hardware. Resultado
+observado: `glxgears` renderizaba (llvmpipe por fallback de Mesa, **FPS en la
+consola**) pero su ventana **nunca aparecía** — los frames iban por una ruta
+de buffers que el compositor pixman no compone. Y `/etc/profile` era peor:
+exportaba `WLR_RENDERER=vulkan` con sólo ver la bandera en `/proc/cmdline`,
+sin Vulkan alguno en virtio (un labwc lanzado desde una cadena de login moría
+sin fallback).
+
+Corregido con la misma regla de dos condiciones en los dos sitios: bandera
+**sin** GPU NVIDIA (`gpu_is_nvidia()` / vendor sysfs) → degradar al stack
+software de `renderer=gl-sw` (`WLR_RENDERER=gles2` +
+`WLR_RENDERER_ALLOW_SOFTWARE=1` + `LIBGL_ALWAYS_SOFTWARE=1`): labwc sobre
+GLES2/llvmpipe, clientes sobre llvmpipe — la configuración de QEMU que sí
+pinta engranajes. La imagen `GL=1` hace ahora lo correcto en las dos máquinas
+también en userspace; en la RTX (bandera + NVIDIA) nada cambia.
+
 ### Klogs sin estrangular
 
 `klog_info!` no tiene filtro de nivel, ni límite de frecuencia, y escribe de
@@ -1301,3 +1323,109 @@ de CPU lo lee directo. El soporte de tiling real (programar el kind 0x06 en
 las page tables de la GPU + des-swizzlear block-linear en el blit) queda como
 trabajo futuro para render targets internos; para el escritorio básico
 wlroots dibuja directo sobre el buffer de scanout, que ahora es lineal.
+
+## El asesino del cliente GL: `SYNCOBJ_WAIT` con un tamaño de struct de más
+
+`glxgears` y `eglgears_wayland` morían **los dos** en su primer
+`vkQueueSubmit` con `VK_ERROR_DEVICE_LOST`, con una peculiaridad que invirtió
+toda la caza: `/proc/gpudbg` demostró que el **`EXEC` en sí funciona**:
+
+```
+ctx=1 pid=1055 OK: 2 push(es) + fence landed, 2 syncobj(s) signaled
+```
+
+El pushbuffer llega a la GPU, la valla aterriza, los syncobjs se señalan.
+Como NVK colapsa **cualquier** errno en `DEVICE_LOST`, el que lo mataba venía
+de **otra** ioctl del flujo de sumisión. La sospecha recayó sobre la espera de
+syncobj genérica (se despacha en `linux-object`, fuera del registro de
+`/proc/gpudbg`).
+
+La causa raíz, encontrada por lectura de código (no hacía falta hardware para
+verla): las structs `DrmSyncobjWait` y `DrmSyncobjTimelineWait`
+(`linux-object/src/fs/devfs/drm_scheme.rs`) llevaban un campo de cola
+`deadline_nsec: u64` **que no existe en la ABI real de DRM**. La ABI está
+congelada desde 2017: `struct drm_syncobj_wait` mide **32 bytes**,
+`struct drm_syncobj_timeline_wait` **40**. Con el campo de más medían 40 y 48.
+
+Y ahí está la trampa: el número de ioctl se **calcula** a partir del tamaño
+del struct —
+
+```rust
+const DRM_IOCTL_SYNCOBJ_WAIT: u32 = drm_iowr_core(0xC3, size_of::<DrmSyncobjWait>());
+```
+
+— así que el kernel computaba `0xC028_64C3` mientras libdrm emite `0xC020_64C3`
+(tamaño 32). El brazo del `match` (exacto sobre el `u32` completo) **nunca
+casaba** con el `drmSyncobjWait` de Mesa: caía al despacho por defecto → a la
+uAPI nouveau → ningún NR nouveau → `ENOSYS` → `DEVICE_LOST`. Idéntico para
+`TIMELINE_WAIT` (`0xC030_64CA` calculado vs `0xC028_64CA` real).
+
+Encaja con cada observación: el `EXEC` (incluido su sondeo de salud de push
+vacío) casa por número y responde `OK`, pero el `SYNCOBJ_WAIT` que lo acompaña
+en el `nvkmd_nouveau_exec_ctx_sync` de NVK devolvía `ENOSYS`. Y explica por
+qué X (glxgears/Xwayland) y Wayland nativo (eglgears_wayland) mueren igual:
+ninguno depende de PRIME ni de sync_file para esto — **todo** submit-sync de
+NVK pega en el mismo número de WAIT roto.
+
+### El fix (verificado en compilación)
+
+1. Se eliminan los dos `deadline_nsec` fantasma → los structs vuelven a 32 y 40
+   bytes, los números de ioctl vuelven a `0xC020_64C3`/`0xC028_64CA` y el
+   handler despacha.
+2. Se añaden **guardas de tamaño en tiempo de compilación** para las seis
+   structs de syncobj (`CREATE`/`DESTROY`/`WAIT`/`TIMELINE_WAIT`/`ARRAY`/
+   `TIMELINE_ARRAY`), junto a las de las structs MODE que ya las tenían: un
+   layout equivocado ahora **no compila** en vez de fallar en silencio. Este
+   agujero existía porque el bloque de guardas omitía justo las de syncobj.
+3. **`SYNCOBJ_WAIT` en timeout devuelve `ETIME` (62), no `EAGAIN`.** Como
+   ahora el WAIT sí despacha, su rama de timeout deja de ser código muerto:
+   Mesa comprueba `errno == ETIME` para devolver `VK_TIMEOUT`, y `drmIoctl()`
+   **reintenta** en `EAGAIN` (giraría en un busy-loop una espera ya vencida).
+   Se añade `LxError::ETIME` y `FsError::TimedOut` con su mapeo.
+
+En la ruta normal el timeout ni se toca: nuestro `EXEC` con valla señala el
+syncobj **de forma síncrona antes de retornar**, así que el `SYNCOBJ_WAIT`
+posterior lo encuentra ya señalado y vuelve al instante.
+
+### Qué esperar en el próximo arranque
+
+Con el WAIT despachando, el primer `vkQueueSubmit` de un cliente GL debería
+completar en vez de `DEVICE_LOST`, y `glxgears`/`eglgears_wayland` deberían
+llegar a **pintar** (su buffer se compone en el output del compositor, que ya
+se escanea por el blit de CPU). Si aún fallan, `cat /proc/gpudbg` y
+`dmesg | grep -iE "nouveau-uapi|SYNCOBJ|EXEC"` nombran el siguiente muro.
+
+### El teardown de PRIME: liberar respetando el refcount
+
+Un segundo bug, latente hasta que los clientes GL empiecen a **presentar** y
+luego salir, era el candidato a la degradación "el estado se acumula durante la
+sesión" (un cliente que antes funcionaba empieza a fallar tras un rato):
+`nouveau_release_process` (`drivers/src/display/nvidia.rs`) liberaba los objetos
+GEM del proceso que sale con `gem_mmap::unregister` **incondicional**,
+ignorando el refcount de PRIME. Si el compositor **importó** el buffer de un
+cliente para componer su ventana (self-import → refcount 2), la salida del
+cliente lo liberaba por debajo del compositor → su siguiente
+`GEM_INFO`/`VM_BIND`/`EXEC` sobre ese handle ENOENT-ea o toca memoria liberada
+→ otro `DEVICE_LOST`, esta vez **del compositor**, y desde ahí todo cliente
+parece roto.
+
+Corregido: la salida del proceso ahora **refleja `GEM_CLOSE`** — hace `dec_ref`
+y libera de verdad **solo cuando cae la última referencia**. Un buffer que otro
+poseedor aún importa se **mantiene vivo con su dueño desacoplado**
+(`owner_pid = 0`, para que ninguna salida posterior lo re-reape); el `GEM_CLOSE`
+del último poseedor (que busca la entrada por handle) lo libera. Los locks no se
+anidan: `dec_ref` (lock de `gem_mmap`) corre con el lock de `nouveau_gem`
+soltado, el mismo orden que toma `GEM_CLOSE`, así que un `GEM_CLOSE` concurrente
+no puede invertir el orden y colgar; y solo se hace `gem_free` de las entradas
+que este teardown **de verdad** removió, así que un `GEM_CLOSE` que ya reapó una
+nunca provoca doble free. Verificado en compilación (no en la RTX).
+
+Residual conocido, benigno y documentado en el código: un cliente que
+**auto-importa su PROPIO buffer** (GBM export → re-import EGL/NVK; todas las
+referencias en un mismo proceso) y muere **sin `GEM_CLOSE`** (^C/crash) lo
+**fuga** — soltamos solo su referencia de creador, no sus referencias de
+importación (que no se cuentan por-pid). Una fuga hasta el reinicio, nunca un
+use-after-free; una salida limpia cierra cada referencia y libera normal. El
+cierre completo (contabilidad de referencias **por-pid** en `gem_mmap`, que
+también elimina esa fuga) queda como el siguiente trabajo con hardware en el
+bucle.

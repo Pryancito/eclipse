@@ -253,6 +253,16 @@ struct DrmSyncobjDestroy {
     pad: u32,
 }
 
+// EXACT `drm.h` layout: `struct drm_syncobj_wait` is 32 bytes and has been
+// UABI-frozen since 2017. A trailing `deadline_nsec: u64` used to sit here that
+// does NOT exist in the real ABI -- it made `size_of` 40, so the ioctl number
+// `drm_iowr_core(0xC3, size_of::<..>())` computed 0xC028_64C3 while libdrm sends
+// 0xC020_64C3 (size 32). The exact-`u32` match arm therefore NEVER fired for
+// Mesa's `drmSyncobjWait`: it fell through to the driver dispatch, hit no
+// nouveau NR, and returned ENOSYS -- which NVK collapses into
+// VK_ERROR_DEVICE_LOST. That was every GL client (glxgears AND
+// eglgears_wayland) dying at its first submit-sync while the EXEC itself
+// succeeded. The size guards below now pin these two.
 #[repr(C)]
 struct DrmSyncobjWait {
     handles: u64,
@@ -262,8 +272,6 @@ struct DrmSyncobjWait {
     first_signaled: u32,
     #[allow(dead_code)]
     pad: u32,
-    #[allow(dead_code)]
-    deadline_nsec: u64,
 }
 
 #[repr(C)]
@@ -276,8 +284,6 @@ struct DrmSyncobjTimelineWait {
     first_signaled: u32,
     #[allow(dead_code)]
     pad: u32,
-    #[allow(dead_code)]
-    deadline_nsec: u64,
 }
 const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL: u32 = 1 << 0;
 
@@ -738,6 +744,12 @@ const _: () = {
     assert!(size_of::<DrmSetVersion>() == 16); // DRM_IOCTL_SET_VERSION   0x..10..
     assert!(size_of::<DrmModeAtomic>() == 56); // DRM_IOCTL_MODE_ATOMIC   0x..38..
     assert!(size_of::<DrmModeCreateBlob>() == 16); // CREATEPROPBLOB      0x..10..
+    assert!(size_of::<DrmSyncobjCreate>() == 8); // DRM_IOCTL_SYNCOBJ_CREATE   0x..08..
+    assert!(size_of::<DrmSyncobjDestroy>() == 8); // DRM_IOCTL_SYNCOBJ_DESTROY  0x..08..
+    assert!(size_of::<DrmSyncobjWait>() == 32); // DRM_IOCTL_SYNCOBJ_WAIT     0x..20..
+    assert!(size_of::<DrmSyncobjTimelineWait>() == 40); // TIMELINE_WAIT      0x..28..
+    assert!(size_of::<DrmSyncobjArray>() == 16); // RESET/SIGNAL              0x..10..
+    assert!(size_of::<DrmSyncobjTimelineArray>() == 24); // TIMELINE_SIGNAL/QUERY 0x..18..
 };
 
 /// Build a `struct drm_mode_modeinfo` (68 bytes) for a simple 60 Hz mode at
@@ -2500,16 +2512,17 @@ impl INode for DrmDev {
                         }
                         Ok(0)
                     }
-                    // Real Linux returns -ETIME; `FsError` has no exact match,
-                    // `Again` ("not ready, retry") is the closest honest fit.
-                    // KNOWN GAP: libdrm's drmIoctl() retries EINTR *and*
-                    // EAGAIN, so a caller whose deadline already passed spins
-                    // on this arm instead of seeing a timeout -- harmless for
-                    // NVK's infinite-deadline syncs, wrong for real deadlines.
-                    // Needs an ETIME-capable error path to fix honestly.
+                    // Real Linux returns -ETIME on a wait deadline, and Mesa
+                    // checks for it EXACTLY (`errno == ETIME` -> `VK_TIMEOUT`;
+                    // anything else -> lost device). Returning EAGAIN here (the
+                    // old behaviour) was doubly wrong: libdrm's drmIoctl()
+                    // retries EAGAIN, so a caller whose deadline already passed
+                    // spins this arm in a tight busy-loop instead of seeing a
+                    // timeout, and NVK never gets its VK_TIMEOUT. `FsError::TimedOut`
+                    // now maps to `LxError::ETIME` (62).
                     zcore_drivers::scheme::syncobj::WaitOutcome::Timeout => {
-                        syncobj_wait_klog(timeline, &handles, "timeout (EAGAIN to caller)");
-                        Err(FsError::Again)
+                        syncobj_wait_klog(timeline, &handles, "timeout (ETIME to caller)");
+                        Err(FsError::TimedOut)
                     }
                     zcore_drivers::scheme::syncobj::WaitOutcome::Invalid => {
                         syncobj_wait_klog(timeline, &handles, "unknown handle (ENOENT to caller)");
