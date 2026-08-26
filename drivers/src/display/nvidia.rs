@@ -8277,7 +8277,11 @@ impl NvidiaGpu {
                 // RM-backed class objects, free the real RM object too --
                 // NVK deallocates its five subchannels on every context
                 // destroy, and each successive context re-allocates them.
-                if let Some(h_object) = nv::class_object_remove(hdr.object) {
+                // Scoped to the calling pid: the cookie is a userspace heap
+                // pointer, equal values across two Mesa processes are
+                // possible, and an unscoped removal would free another live
+                // client's class object (see `class_object_remove`).
+                if let Some(h_object) = nv::class_object_remove(hdr.object, owner_pid) {
                     if let Some(device_instance) = *self.rm_device_instance.lock() {
                         let status =
                             nvidia_rm_sys::rm_init::class_free(device_instance, h_object);
@@ -8514,9 +8518,31 @@ impl NvidiaGpu {
                     // On no free slot / ctx_alloc failure ensure returns 0 and we
                     // hand back a discovery channel (EXEC ENODEV -> llvmpipe),
                     // never worse than before.
+                    //
+                    // The channel-table lock is RELEASED across ensure_ctx_for_pid:
+                    // building a first-touch context ends in ctx_prime -- a cold
+                    // golden-context load that can take ~500 ms of real RM work --
+                    // and `nouveau_channels` sits on EXEC's hot path (the
+                    // ownership check), taken with IRQs off (lock::Mutex). Held
+                    // here, every EXEC in the system -- the COMPOSITOR's included
+                    // -- span-blocked behind a starting GL client for the whole
+                    // prime (a frozen frame and cursor per client launch). Same
+                    // rule ensure_ctx_for_pid already applies to its own registry
+                    // lock. The id is recomputed after re-locking, since another
+                    // CHANNEL_ALLOC may have raced while the lock was out.
+                    drop(chan);
                     let (ctx_idx, h_vas_out, notif_out) =
                         self.ensure_ctx_for_pid(owner_pid, false);
                     let ok = ctx_idx != 0;
+                    let mut chan = self.nouveau_channels.lock();
+                    if chan.len() >= nv::MAX_CHANNELS {
+                        log::warn!(
+                            "[nouveau-uapi] CHANNEL_ALLOC: {} channels already live",
+                            chan.len()
+                        );
+                        return Err(nv::EBUSY);
+                    }
+                    let new_id = (0i32..).find(|i| !chan.iter().any(|c| c.id == *i)).unwrap_or(0);
                     chan.push(nv::NouveauChannelState {
                         id: new_id,
                         h_vas: h_vas_out,
@@ -8846,6 +8872,67 @@ impl NvidiaGpu {
                     // over on the first frame while dmesg showed no failure
                     // at all. Waits/signals attached to an empty EXEC still
                     // count: NVK uses empty submits to chain syncobjs.
+                    //
+                    // Answer the probe HONESTLY on a wedged context: the whole
+                    // point of nouveau's empty submit is "0 = channel alive,
+                    // -ENODEV = channel killed", and a context latched wedged
+                    // (fence timeout — its ring is jammed for good) is exactly
+                    // the killed case. Reporting it alive made NVK bounce off
+                    // the NEXT real submit's EIO instead, one round later,
+                    // with a less truthful errno.
+                    {
+                        let probe_ctx = self.ctx_idx_for_pid(owner_pid);
+                        if probe_ctx >= 1 && nv::ctx_is_wedged(probe_ctx) {
+                            return Err(nv::ENODEV);
+                        }
+                    }
+                    //
+                    // The WAITS must be honoured BEFORE the signals, exactly
+                    // like the non-empty path below: an empty EXEC with
+                    // waits=[A] sigs=[B] is "B signals once A has signaled".
+                    // Signaling B immediately (as this arm first did) is a
+                    // premature signal whenever A is still pending — which
+                    // can genuinely happen across processes, e.g. a syncobj
+                    // carrying an imported sync_file fence another client has
+                    // not signaled yet. Same bounded wait, same EIO-on-timeout
+                    // contract as a real submission.
+                    if req.wait_count > 0 && req.wait_ptr != 0 {
+                        let waits = unsafe {
+                            core::slice::from_raw_parts(
+                                req.wait_ptr as *const nv::DrmNouveauSync,
+                                req.wait_count as usize,
+                            )
+                        };
+                        let handles: Vec<u32> = waits.iter().map(|s| s.handle).collect();
+                        let points: Vec<u64> = waits
+                            .iter()
+                            .map(|s| {
+                                let timeline =
+                                    s.flags & nv::SYNC_TYPE_MASK == nv::SYNC_TIMELINE_SYNCOBJ;
+                                if timeline { s.timeline_value } else { 1 }
+                            })
+                            .collect();
+                        const WAIT_TIMEOUT_US: u64 = 1_000_000; // 1 s, like the real path
+                        let deadline_us =
+                            unsafe { crate::bus::drivers_timer_now_as_micros() } + WAIT_TIMEOUT_US;
+                        match crate::scheme::syncobj::wait(&handles, Some(&points), true, deadline_us)
+                        {
+                            crate::scheme::syncobj::WaitOutcome::Signaled { .. } => {}
+                            crate::scheme::syncobj::WaitOutcome::Timeout => {
+                                crate::klog_warn!(
+                                    "[nouveau-uapi] EXEC(empty): {} wait syncobj(s) still unsignaled after {}us -- not signaling its sig list (EIO) pid={}:{}",
+                                    req.wait_count,
+                                    WAIT_TIMEOUT_US,
+                                    owner_pid,
+                                    crate::scheme::syncobj::describe(&handles, Some(&points))
+                                );
+                                return Err(nv::EIO);
+                            }
+                            crate::scheme::syncobj::WaitOutcome::Invalid => {
+                                return Err(nv::ENOENT);
+                            }
+                        }
+                    }
                     if req.sig_count > 0 && req.sig_ptr != 0 {
                         let sigs = unsafe {
                             core::slice::from_raw_parts(
@@ -8904,7 +8991,7 @@ impl NvidiaGpu {
                             let known: Vec<i32> = chans.iter().map(|c| c.id).collect();
                             drop(chans);
                             crate::klog_warn!(
-                                "[nouveau-uapi] EXEC: channel={} is not owned by pid={} (live                                  channels: {:?})",
+                                "[nouveau-uapi] EXEC: channel={} is not owned by pid={} (live channels: {:?})",
                                 req.channel,
                                 owner_pid,
                                 known
@@ -8922,7 +9009,7 @@ impl NvidiaGpu {
                 for push in pushes {
                     if push.va_len == 0 || push.va_len % 4 != 0 {
                         crate::klog_warn!(
-                            "[nouveau-uapi] EXEC: push va={:#x} va_len={} is empty or not a                              multiple of 4 (pushbuffers are dword streams)",
+                            "[nouveau-uapi] EXEC: push va={:#x} va_len={} is empty or not a multiple of 4 (pushbuffers are dword streams)",
                             push.va,
                             push.va_len
                         );
@@ -9620,6 +9707,14 @@ impl NvidiaGpu {
                     offset,
                     map_handle
                 );
+                // VRAM here vs GART from GEM_NEW is deliberate, not an
+                // oversight: GEM_INFO is what NVK runs on a PRIME-imported
+                // handle, and reporting the ADVERTISED memory model (NVIF INFO
+                // claims real VRAM so wlroots finds a DEVICE_LOCAL type) keeps
+                // the imported BO's flags device-local -- consistent with the
+                // types the importer allocates from. The backing is still
+                // CPU-visible sysmem either way (GEM_NEW's forced `sysmem`),
+                // and this exact combination is the one validated on the RTX.
                 req.domain = nv::NOUVEAU_GEM_DOMAIN_VRAM;
                 req.size = size;
                 req.offset = offset;
@@ -9634,10 +9729,14 @@ impl NvidiaGpu {
             nv::NR_GEM_CPU_PREP => {
                 let req = unsafe { &*(arg as *const nv::DrmNouveauGemCpuPrep) };
                 let gem = self.nouveau_gem.lock();
-                // No real fencing yet (EXEC has no sync objects, see above):
-                // this only validates the handle exists. A CPU_PREP right
-                // after an EXEC that touches this buffer is NOT actually
-                // safe to trust -- there is no wait for GPU completion here.
+                // Validates the handle and returns: there is no per-BO fence
+                // to wait on here. That is HONEST under this driver's
+                // synchronous submission model -- EXEC blocks until its fence
+                // lands before returning (and before signaling its syncobjs),
+                // so by the time a caller issues CPU_PREP every previously
+                // submitted batch touching this buffer has already completed.
+                // If EXEC ever goes asynchronous, this arm must grow a real
+                // wait (per-BO tracking), or CPU reads will race the GPU.
                 if gem.iter().any(|o| o.handle == req.handle) {
                     Ok(0)
                 } else {

@@ -296,7 +296,9 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // completion) misbehaves for lack of `TERM`.
             let envs: alloc::vec::Vec<alloc::string::String> = alloc::vec![
                 // /usr/local/bin first so the Eclipse labwc wrapper (which
-                // forces the pixman renderer) shadows the apk-installed binary.
+                // selects the renderer by the two-condition GL gate --
+                // hardware GL only on NVIDIA + nvidia.nouveau_uapi, else
+                // pixman) shadows the apk-installed binary.
                 "PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
                 "ENV=/etc/profile".into(),
                 "HOME=/root".into(),
@@ -340,15 +342,14 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 // env entry is visible to labwc when launched from a non-login
                 // shell or directly from an init script.
                 "WLR_DRM_DEVICES=/dev/dri/card0".into(),
-                // Software GL/Vulkan via Mesa (no usable HW 3D engine here). The
-                // DRM device now advertises a real NVIDIA PCI id, so Mesa would
-                // otherwise try to load the hardware `nouveau` driver (whose
-                // ioctls we don't implement) and fail/hang. Force the KMS
-                // software rasteriser (kms_swrast → llvmpipe) instead, which
-                // renders into dumb buffers — exactly our DRM capabilities.
-                // Only takes effect when a GL renderer is selected
-                // (WLR_RENDERER=gles2); the pixman default ignores Mesa because
-                // the llvmpipe GL path is much slower here.
+                // Last-resort software-GL override (kept commented). On NVIDIA
+                // WITHOUT the nvidia.nouveau_uapi flag the DRM node identifies
+                // as "zcore" and Mesa finds no hardware driver, so a GL client
+                // already falls to llvmpipe on its own; WITH the flag the
+                // nouveau uAPI (drivers/src/display/nouveau_uapi.rs) is live and
+                // hardware GL is intended. These force Mesa's KMS software
+                // rasteriser (kms_swrast → llvmpipe) explicitly, only needed on
+                // a box where even that autodetect misbehaves.
                 //"GALLIUM_DRIVER=llvmpipe".into(),
                 //"MESA_LOADER_DRIVER_OVERRIDE=kms_swrast".into(),
             ];

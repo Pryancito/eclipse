@@ -700,9 +700,12 @@ fn renderer_mode() -> Renderer {
 /// does the right thing in QEMU and on real hardware without a build flag
 /// (`renderer=auto`, and the default when the cmdline names no renderer).
 ///
-/// Per-GPU choice: NVIDIA (`0x10de`) now takes the hardware nouveau/NVK path
-/// (it composites the desktop on real Turing+ hardware), while everything else —
-/// notably QEMU's virtio-gpu (`0x1af4`), whose GL is virgl and is not wired into
+/// Per-GPU choice: NVIDIA (`0x10de`) takes the hardware nouveau/NVK path — but
+/// ONLY when `nvidia.nouveau_uapi` is also on the cmdline, because that flag is
+/// what turns the kernel's nouveau uAPI on (without it the DRM node identifies
+/// as "zcore" and NVK can never enumerate; NVIDIA without the flag goes to
+/// pixman, the proven software default there). Everything else — notably QEMU's
+/// virtio-gpu (`0x1af4`), whose GL is virgl and is not wired into
 /// auto-detection — stays on software GL (llvmpipe), which is safe everywhere and
 /// never leaves a black screen. Only when no GPU is visible do we fall back to
 /// pixman. To use virgl in QEMU, pass `renderer=gl` explicitly.
@@ -714,11 +717,37 @@ fn detect_renderer() -> Renderer {
             // pins GL clients to zink so they take the same NVK path instead of
             // the unimplemented classic nvc0 GEM_PUSHBUF one (which would drop
             // them to llvmpipe, whose buffers are not nouveau objects).
-            log(&format!(
-                "renderer=auto: NVIDIA GPU {} -> gl (hardware nouveau/NVK)",
-                v.trim()
-            ));
-            Renderer::Gl
+            //
+            // Same TWO-condition rule as the kernel and /etc/profile: the
+            // NVIDIA GPU is the capability, `nvidia.nouveau_uapi` on the
+            // cmdline is the request that actually TURNS THE KERNEL uAPI ON.
+            // Without the flag the DRM node identifies as "zcore", NVK finds
+            // 0 GPUs, and returning Gl here only bought a doomed zink probe
+            // (labwc: EGL fails -> wlroots falls back to pixman anyway; GL
+            // clients: a zink pin that can never work). In practice this arm
+            // only runs WITHOUT the flag -- `GL=1` stamps `renderer=gl`
+            // alongside the flag, so an explicit token wins before auto ever
+            // gets asked -- but keying on the flag keeps a hand-written
+            // `renderer=auto:nvidia.nouveau_uapi` cmdline honest too.
+            let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
+            if cmdline
+                .split([':', ' ', '\t', '\n'])
+                .any(|t| t == "nvidia.nouveau_uapi")
+            {
+                log(&format!(
+                    "renderer=auto: NVIDIA GPU {} + nvidia.nouveau_uapi -> gl (hardware nouveau/NVK)",
+                    v.trim()
+                ));
+                Renderer::Gl
+            } else {
+                log(&format!(
+                    "renderer=auto: NVIDIA GPU {} but nvidia.nouveau_uapi is OFF (kernel uAPI \
+                     disabled; DRM node is \"zcore\") -> pixman. Boot with GL=1 (or add \
+                     nvidia.nouveau_uapi + renderer=gl to the cmdline) for hardware GL",
+                    v.trim()
+                ));
+                Renderer::Pixman
+            }
         }
         Ok(v) if !v.trim().is_empty() => {
             log(&format!(
@@ -760,7 +789,15 @@ fn build_child_env() -> Vec<CString> {
         }
         Renderer::Gl => {
             if gpu_is_nvidia() {
-                log("renderer=gl: letting wlroots/Mesa auto-select the GPU renderer (no pixman pin)");
+                // wlroots uses its native Vulkan/NVK renderer on this path (the
+                // NVK bring-up failures were all in render/vulkan/*). Name it
+                // EXPLICITLY rather than leaving it to wlroots' auto-select, so
+                // this init-supervised session, a login-shell labwc (/etc/profile)
+                // and a wrapper-launched one all pick the SAME renderer instead of
+                // three different ones for one boot. WLR_DRM_NO_MODIFIERS is
+                // already in CHILD_ENV (forces LINEAR scanout for the CPU blit).
+                env.push(CString::new("WLR_RENDERER=vulkan").unwrap());
+                log("renderer=gl: NVIDIA GPU -> WLR_RENDERER=vulkan (wlroots native NVK renderer)");
                 // On real NVIDIA hardware, pin the OpenGL Gallium driver to zink
                 // (GL-on-Vulkan over NVK). Our nouveau uAPI implements the zink/NVK
                 // submission path (VM_BIND/EXEC) but NOT the classic nvc0 Gallium

@@ -104,11 +104,19 @@ pub(super) fn class_object_insert(token: u64, rm_handle: u32, owner_pid: u64) {
     CLASS_OBJECTS.lock().push((token, rm_handle, owner_pid));
 }
 
-/// Removes and returns the RM handle for `token`, if it was RM-backed.
-pub(super) fn class_object_remove(token: u64) -> Option<u32> {
+/// Removes and returns the RM handle for `token`, if it was RM-backed —
+/// scoped to `owner_pid`. The token is a userspace cookie (mesa passes the
+/// object's heap POINTER), and two processes running the same Mesa code get
+/// deterministic-enough allocators that equal pointer values across processes
+/// are a real possibility. An unscoped removal would let one client's NVIF
+/// DEL free ANOTHER live client's (or the compositor's) engine-class object —
+/// tearing its 3D class out from under a running channel, whose next method
+/// of that class then MMU-faults. Match on (token, pid) so a DEL can only
+/// ever free the caller's own object.
+pub(super) fn class_object_remove(token: u64, owner_pid: u64) -> Option<u32> {
     let mut t = CLASS_OBJECTS.lock();
     t.iter()
-        .position(|(k, _, _)| *k == token)
+        .position(|(k, _, pid)| *k == token && *pid == owner_pid)
         .map(|i| t.remove(i).1)
 }
 
