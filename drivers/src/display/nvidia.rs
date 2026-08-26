@@ -6808,36 +6808,102 @@ impl DrmScheme for NvidiaGpu {
             self.drain_vm_mappings(&alloc::format!("process exit pid={}", pid), |m| {
                 m.owner_pid == pid
             });
-        // 2. Free ONLY this process's GEM objects.
+        // 2. Release this process's GEM objects, RESPECTING the PRIME share
+        //    count. A buffer this process created may still be imported by
+        //    ANOTHER holder: the compositor self-imports a client's on-screen
+        //    buffer to composite it (gem_mmap refcount > 1). The old code freed
+        //    every owned object unconditionally (`gem_mmap::unregister`, which
+        //    ignores the count) + `gem_free`, so a client exiting while the
+        //    compositor still displayed its window tore the buffer out from
+        //    under the compositor -- its next GEM_INFO/VM_BIND/EXEC on that
+        //    handle ENOENT'd or touched freed RM memory -> the COMPOSITOR's own
+        //    VK_ERROR_DEVICE_LOST. That is the "state accumulates over a
+        //    session" wedge: one client exit poisons a live compositor buffer,
+        //    and from then on every client looks broken.
+        //
+        //    Mirror `nouveau_gem_close` instead: `dec_ref`, and free for real
+        //    ONLY when this drops the LAST reference. A still-shared buffer is
+        //    kept alive with its owner detached (`owner_pid = 0`) so no future
+        //    process exit re-reaps it; the last holder's GEM_CLOSE -- which
+        //    finds the entry by handle -- frees it. `dec_ref` (the gem_mmap
+        //    lock) runs with the `nouveau_gem` lock RELEASED, the same order
+        //    GEM_CLOSE takes them, so a concurrent client GEM_CLOSE cannot
+        //    invert the lock order and deadlock.
+        //
+        //    Known residual (benign, documented): a client that self-imports
+        //    its OWN buffer (GBM export -> EGL/NVK re-import; refcount held
+        //    entirely by that one process) and then dies WITHOUT GEM_CLOSE
+        //    (^C/crash) leaks it -- we drop only its creator reference here, not
+        //    its own import references (those are not tracked per-pid). A leak
+        //    until reboot, never a use-after-free; the full fix is per-pid
+        //    reference accounting in gem_mmap. A clean exit closes every
+        //    reference and frees normally.
         let (freed_gems, freed_bytes) = {
-            let mut gem = self.nouveau_gem.lock();
-            let mut mine = Vec::new();
-            let mut i = 0;
-            while i < gem.len() {
-                if gem[i].owner_pid == pid {
-                    mine.push(gem.remove(i));
+            // Phase 1: snapshot this pid's objects. No removal, no gem_mmap touch.
+            let snapshot: Vec<(u32, bool)> = {
+                let gem = self.nouveau_gem.lock();
+                gem.iter()
+                    .filter(|o| o.owner_pid == pid)
+                    .map(|o| (o.handle, o.phys_addr.is_some()))
+                    .collect()
+            };
+            // Phase 2: drop this process's reference to each and decide
+            // free-vs-keep, with NO lock held across the two subsystems. A
+            // no-phys object was never PRIME-registered (cannot be shared) so it
+            // is always this process's alone -> free.
+            let mut to_free: Vec<u32> = Vec::new();
+            let mut to_orphan: Vec<u32> = Vec::new();
+            for (handle, has_phys) in &snapshot {
+                let still_shared = *has_phys
+                    && matches!(
+                        crate::scheme::gem_mmap::dec_ref(*handle),
+                        crate::scheme::gem_mmap::DecRef::StillReferenced(_)
+                    );
+                if still_shared {
+                    to_orphan.push(*handle);
                 } else {
-                    i += 1;
+                    to_free.push(*handle);
                 }
             }
-            drop(gem);
-            let mut bytes = 0u64;
-            for obj in &mine {
-                if obj.phys_addr.is_some() {
-                    crate::scheme::gem_mmap::unregister(obj.handle);
+            // Phase 3: apply under the nouveau_gem lock. Collect h_memory ONLY
+            // for entries actually removed here -- a racing GEM_CLOSE that
+            // already reaped one leaves it absent, so it is never double-freed.
+            let mut to_free_mem: Vec<(u32, u32, u64)> = Vec::new(); // (handle, h_memory, size)
+            {
+                let mut gem = self.nouveau_gem.lock();
+                for handle in &to_free {
+                    if let Some(pos) = gem.iter().position(|o| o.handle == *handle) {
+                        let obj = gem.remove(pos);
+                        to_free_mem.push((obj.handle, obj.h_memory, obj.size));
+                    }
                 }
+                for handle in &to_orphan {
+                    if let Some(o) = gem.iter_mut().find(|o| o.handle == *handle) {
+                        o.owner_pid = 0;
+                    }
+                }
+            }
+            // Phase 4: free RM memory outside every lock.
+            let mut bytes = 0u64;
+            for (handle, h_memory, size) in &to_free_mem {
                 if let Some(device_instance) = device_instance {
-                    let status = nvidia_rm_sys::rm_init::gem_free(device_instance, obj.h_memory);
+                    let status = nvidia_rm_sys::rm_init::gem_free(device_instance, *h_memory);
                     if status != 0 {
                         log::warn!(
                             "[nouveau-uapi] process exit pid={}: gem_free handle={} h_memory={:#010x} failed, NV_STATUS={:#x}",
-                            pid, obj.handle, obj.h_memory, status
+                            pid, handle, h_memory, status
                         );
                     }
                 }
-                bytes += obj.size;
+                bytes += size;
             }
-            (mine.len(), bytes)
+            if !to_orphan.is_empty() {
+                log::info!(
+                    "[nouveau-uapi] process exit pid={}: freed {} GEM object(s), kept {} still-imported by another holder (PRIME refcount > 0)",
+                    pid, to_free_mem.len(), to_orphan.len()
+                );
+            }
+            (to_free_mem.len(), bytes)
         };
         // 2.5. Free this process's RM engine-class objects (3D/2D/copy/inline/
         //      compute, added via NVIF NEW) BEFORE its channel. They are RM

@@ -1373,20 +1373,37 @@ llegar a **pintar** (su buffer se compone en el output del compositor, que ya
 se escanea por el blit de CPU). Si aún fallan, `cat /proc/gpudbg` y
 `dmesg | grep -iE "nouveau-uapi|SYNCOBJ|EXEC"` nombran el siguiente muro.
 
-### Pendiente (requiere validación en hardware): el teardown de PRIME
+### El teardown de PRIME: liberar respetando el refcount
 
 Un segundo bug, latente hasta que los clientes GL empiecen a **presentar** y
-luego salir, es el candidato a la degradación "el estado se acumula durante la
+luego salir, era el candidato a la degradación "el estado se acumula durante la
 sesión" (un cliente que antes funcionaba empieza a fallar tras un rato):
-`nouveau_release_process` (`drivers/src/display/nvidia.rs`) libera los objetos
+`nouveau_release_process` (`drivers/src/display/nvidia.rs`) liberaba los objetos
 GEM del proceso que sale con `gem_mmap::unregister` **incondicional**,
 ignorando el refcount de PRIME. Si el compositor **importó** el buffer de un
-cliente (self-import → refcount 2), la salida del cliente lo libera por debajo
-del compositor → su siguiente `GEM_INFO`/`VM_BIND`/`EXEC` sobre ese handle
-ENOENT-ea o toca memoria liberada → otro `DEVICE_LOST`, esta vez del
-compositor. El fix correcto (respetar el refcount en la salida: `dec_ref` en
-vez de `unregister`, y transferir la responsabilidad del `gem_free` al último
-poseedor) toca el modelo de propiedad y **no se ha hecho aquí porque cambia la
-vida de la memoria en la ruta crítica del compositor y no se puede validar sin
-la RTX** — un `gem_free` prematuro mal resuelto es peor que el bug actual. Es
-el siguiente trabajo con hardware en el bucle.
+cliente para componer su ventana (self-import → refcount 2), la salida del
+cliente lo liberaba por debajo del compositor → su siguiente
+`GEM_INFO`/`VM_BIND`/`EXEC` sobre ese handle ENOENT-ea o toca memoria liberada
+→ otro `DEVICE_LOST`, esta vez **del compositor**, y desde ahí todo cliente
+parece roto.
+
+Corregido: la salida del proceso ahora **refleja `GEM_CLOSE`** — hace `dec_ref`
+y libera de verdad **solo cuando cae la última referencia**. Un buffer que otro
+poseedor aún importa se **mantiene vivo con su dueño desacoplado**
+(`owner_pid = 0`, para que ninguna salida posterior lo re-reape); el `GEM_CLOSE`
+del último poseedor (que busca la entrada por handle) lo libera. Los locks no se
+anidan: `dec_ref` (lock de `gem_mmap`) corre con el lock de `nouveau_gem`
+soltado, el mismo orden que toma `GEM_CLOSE`, así que un `GEM_CLOSE` concurrente
+no puede invertir el orden y colgar; y solo se hace `gem_free` de las entradas
+que este teardown **de verdad** removió, así que un `GEM_CLOSE` que ya reapó una
+nunca provoca doble free. Verificado en compilación (no en la RTX).
+
+Residual conocido, benigno y documentado en el código: un cliente que
+**auto-importa su PROPIO buffer** (GBM export → re-import EGL/NVK; todas las
+referencias en un mismo proceso) y muere **sin `GEM_CLOSE`** (^C/crash) lo
+**fuga** — soltamos solo su referencia de creador, no sus referencias de
+importación (que no se cuentan por-pid). Una fuga hasta el reinicio, nunca un
+use-after-free; una salida limpia cierra cada referencia y libera normal. El
+cierre completo (contabilidad de referencias **por-pid** en `gem_mmap`, que
+también elimina esa fuga) queda como el siguiente trabajo con hardware en el
+bucle.
