@@ -1504,3 +1504,49 @@ puede validarse sin la RTX. En la ruta GLES2/zink el bucle no ocurre (el
 compositor no hace churn de contextos), así que la fuga queda latente. El cierre
 correcto — asociar objetos de clase a su canal/ctx y reaparlos en el free del
 último canal del contexto, sin doble-free — es el siguiente trabajo con hardware.
+
+## GLES2/zink descubre el muro real: agotamiento de contextos (`MAX_CTX`)
+
+El arranque con el compositor en GLES2/zink llegó más lejos (renderizador
+`render/gles2/renderer.c`, no el Vulkan nativo) pero tampoco pintó. El dmesg
+lo dejó claro (grep `SYNCOBJ|errno` — **cero líneas SYNCOBJ**, syncobj queda
+descartado del todo):
+
+```
+EXEC OK (first): fence confirmed, 1 syncobj signaled -- Mesa work is reaching the GPU
+... 47 s después ...
+VM_BIND (nr=0x51) -> errno 5 to userspace
+... y luego en bucle ...
+ctx: no free context slot (max 8) for pid=1085 -- client falls back to software
+CHANNEL_ALLOC owner_pid=1085 -> channel=16 DISCOVERY ONLY (submission ENODEV -> software)
+rm: NVRM: virtmemAllocResources: VA Space alloc failed! Status Code: 0x51 ... RangeLo: 0x3fffff000
+VM_BIND MAP failed: VA=0x3fffff000 -> virt_status=0x1a
+```
+
+La cadena: el compositor **sí ejecuta** temprano (`EXEC OK`), pero los 8 slots
+de `MAX_CTX` se agotan → los clientes nuevos caen a «software» sin contexto
+propio → su `VM_BIND` colisiona en el tope del heap de Mesa (`0x3fffff000`) en
+el VAS compartido → `0x51`/`errno 5`. Y ese fallo de `VM_BIND` es lo que Mesa
+reporta como *"failed to create timeline semaphore"* / `vkCreateDevice failed`
+(el primer buffer que zink reserva). El timeline semaphore era **síntoma**, no
+causa — no hay hueco de capacidad de syncobj.
+
+El hook de salida (`Process::terminate` → `nouveau_release_process`) corre en
+**cada** muerte de proceso, así que un contexto solo se retiene si su proceso
+no termina (un hilo atascado en un busy-poll) o si hay demasiados procesos
+vivos a la vez durante la ráfaga de arranque / solapamiento de respawns del
+crash-loop. `MAX_CTX=8` era demasiado apretado para esa ventana.
+
+**Fix**: `ECLIPSE_MAX_CTX` (C) y `MAX_CTX` (Rust) suben de 8 a **32**. Los
+contextos son perezosos (uno por pid de cliente vivo, liberado a la salida),
+así que es un tope, no una preasignación; una Turing maneja de sobra 32
+canales. El tope se mantiene ≤ 32 porque el latch «wedged» por-contexto es una
+máscara `u32`. Además de dar aire a la ráfaga, limpia el diagnóstico: sin la
+tormenta de agotamiento tapándolo, el próximo log mostrará el fallo REAL del
+primer labwc si aún no pinta (y si es independiente del agotamiento, ahí se
+verá).
+
+Nota: el `labwc` lanzado A MANO desde la shell falla distinto
+(`backend/x11/backend.c: Failed to open xcb connection`) porque el shell lleva
+`DISPLAY=:0` y sin `WLR_BACKENDS=drm` wlroots elige el backend X11 anidado —
+no es la ruta de init (que sí fuerza DRM). Un despiste, no el problema.

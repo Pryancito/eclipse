@@ -878,8 +878,13 @@ pub(super) const MAX_CHANNELS: usize = 64;
 
 /// Number of per-process GPU contexts (index 0 = the compositor's singleton;
 /// 1.. = one per GL client). MUST match `ECLIPSE_MAX_CTX` in
-/// `vendor/eclipse_rm_init.c`.
-pub(super) const MAX_CTX: u32 = 8;
+/// `vendor/eclipse_rm_init.c`. Raised from 8 after a real-RTX boot exhausted
+/// the slots: labwc's startup burst plus crash-loop respawn overlap filled all
+/// 8, dropping later clients to the software path where their VM_BIND collided
+/// at the shared top-of-heap VA (0x3fffff000, RM status 0x51). Contexts are
+/// lazy (one per live client pid, freed on process exit), so this is a cap.
+/// Must stay <= 32: the `CTX_WEDGED` latch is a u32 bitmask (ctx_idx < 32).
+pub(super) const MAX_CTX: u32 = 32;
 
 /// How many class slots mesa offers in an `SCLASS` call
 /// (`NOUVEAU_WS_CONTEXT_MAX_CLASSES`).

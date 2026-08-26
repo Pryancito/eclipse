@@ -1944,8 +1944,19 @@ unlock:
  * acceleration, never crash the compositor. Idempotent per index (a repeat
  * call returns the cached ladder). All allocations are under the API lock, so
  * they are serialized against the compositor's own RM entries.
+ *
+ * Sized 32 (was 8) after a real-RTX boot exhausted the slots. Contexts are
+ * built lazily -- one per distinct client pid, freed on process exit
+ * (eclipse_rm_ctx_free from nouveau_release_process) -- so this is a CAP, not a
+ * preallocation: the g_ctxAlloc bookkeeping grows, but GPU resources are only
+ * spent for contexts actually in use. A Turing runlist holds hundreds of
+ * channels, so 32 is comfortable. The wider cap absorbs the labwc startup burst
+ * and crash-loop respawn overlap (an old generation's teardown racing a new
+ * one's context request) that filled 8 and dropped later clients to the
+ * software path, where their VM_BIND collided at the shared top-of-heap VA. It
+ * must not exceed 32: the per-context "wedged" latch is a u32 bitmask.
  * ───────────────────────────────────────────────────────────────────────── */
-#define ECLIPSE_MAX_CTX 8
+#define ECLIPSE_MAX_CTX 32
 
 typedef struct EclipseCtxAlloc
 {
