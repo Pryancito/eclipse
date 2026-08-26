@@ -1429,3 +1429,78 @@ use-after-free; una salida limpia cierra cada referencia y libera normal. El
 cierre completo (contabilidad de referencias **por-pid** en `gem_mmap`, que
 también elimina esa fuga) queda como el siguiente trabajo con hardware en el
 bucle.
+
+## HITO en la RTX: el EXEC ejecuta, y el escritorio pasa a GLES2/zink
+
+El primer arranque tras la revisión GL (PR #950) dio el dato que faltaba, en
+`/proc/gpudbg`, en **las dos** GPUs (consola bus 23 y cómputo bus 101):
+
+```
+--- last client (ctx>=1) EXEC draw submit ---
+ctx=7 pid=1029 OK: 1 push(es) + fence landed, 1 syncobj(s) signaled
+--- MMU fault snapshot (read-only) ---
+FAULT_INFO1(0xb83090)=0x00000000 valid=0 ...
+```
+
+Es decir: un cliente **zink→NVK** (ctx 7) sometió trabajo, la GPU lo ejecutó,
+la valla aterrizó, el syncobj se señaló, y **cero fallos de MMU**. La tubería
+de submisión completa — GART, PTEs de `VM_BIND`, fetch de PBDMA, ejecución,
+valla, syncobj — funciona de punta a punta en hardware real. Es el objetivo
+que todo este trabajo perseguía.
+
+### El bloqueo del escritorio ya no es submisión, es el semáforo externo
+
+`labwc.log` mostró el compositor en bucle de crash con dos fallos, ambos del
+**renderizador Vulkan NATIVO de wlroots**:
+
+```
+[render/vulkan/renderer.c:2582] vkCreateSemaphore: ERROR_INVALID_EXTERNAL_HANDLE (-1000072003)
+[render/vulkan/vulkan.c:265]    Could not retrieve physical devices: ERROR_INITIALIZATION_FAILED (-3)
+[render/vulkan/renderer.c:2608] Could not match drm and vulkan device
+```
+
+Dato decisivo: en `dmesg` **no aparece ni un ioctl de SYNCOBJ**. NVK rechaza
+el semáforo **externo/compartible** que wlroots-vulkan pide (`VK_KHR_external_
+semaphore`) **en userspace**, por las capacidades que anuncia sobre esta uAPI
+de syncobj parcial — nunca llega a llamar al kernel. No es un bug de ioctl:
+es que el renderizador Vulkan nativo de wlroots exige un tipo de semáforo que
+NVK no exporta aquí todavía.
+
+### El efecto dominó: `CHANNEL_ALLOC` → `EBUSY`
+
+El fallo del semáforo mete a NVK en un bucle de reintentos que recrea
+**contextos de enumeración de usar-y-tirar** (un `CHANNEL_ALLOC` + 5 `NVIF NEW`
+de clase cada uno). `dmesg` lo captó: pid 1029 en ~100 ms acumuló ~40 objetos
+de clase (0x1ba…0x1e3) y los canales se dispararon hasta el tope
+`MAX_CHANNELS=16` → `CHANNEL_ALLOC (nr=0x42) -> errno 16 (EBUSY)` →
+`vkEnumeratePhysicalDevices -3` → *"could not match drm and vulkan device"*.
+La degradación observada (respawns viejos llegan al semáforo, nuevos ni
+enumeran) es ese agotamiento acumulándose.
+
+### La decisión: GLES2/zink por defecto
+
+Como gpudbg **prueba que zink→NVK ejecuta**, el compositor pasa a **GLES2 sobre
+zink** por defecto — la ruta probada, que además no toca el semáforo externo ni
+el bucle que agota los canales. Se hace en las tres fuentes de entorno a la vez
+(`eclipse-init` `build_child_env`, `/etc/profile`, wrapper de labwc), sobre la
+misma compuerta de dos condiciones (NVIDIA + `nvidia.nouveau_uapi`). El
+renderizador **Vulkan nativo de wlroots** queda como opt-in por cmdline
+**`nvidia.wlr_vulkan`**, para retomarlo cuando se cablee la capacidad de
+semáforo externo de NVK.
+
+Blindaje: `MAX_CHANNELS` sube de 16 a 64 para absorber cualquier ráfaga de
+enumeración (los contextos RM reales siguen acotados por `MAX_CTX`). En la ruta
+GLES2/zink no hay churn, así que es cinturón y tirantes.
+
+### Pendiente (con hardware en el bucle): la fuga de objetos de clase
+
+Los ~40 objetos de clase que acumuló el bucle de reintentos son una **fuga**
+real: NVK no envía `NVIF DEL` por ellos y `CHANNEL_FREE` no reapa los objetos
+de clase del contexto (viven en el canal del ctx, no en el canal de usar-y-tirar
+que se libera). Sólo la salida del proceso los libera. **No se corrige a ciegas
+aquí**: liberar objetos de clase de un contexto vivo en el momento equivocado es
+justo el patrón de **doble-free que corrompió el GSP** en un hito anterior, y no
+puede validarse sin la RTX. En la ruta GLES2/zink el bucle no ocurre (el
+compositor no hace churn de contextos), así que la fuga queda latente. El cierre
+correcto — asociar objetos de clase a su canal/ctx y reaparlos en el free del
+último canal del contexto, sin doble-free — es el siguiente trabajo con hardware.

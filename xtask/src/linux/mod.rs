@@ -725,25 +725,30 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # TWO conditions, like the kernel's own gate: the cmdline flag is a\n\
               # REQUEST and the NVIDIA GPU is the CAPABILITY. Only when BOTH hold\n\
               # is the kernel's nouveau uAPI actually on, so ONLY then is the\n\
-              # hardware-GL stack correct -- WLR_RENDERER=vulkan (wlroots' native\n\
-              # NVK renderer), WLR_DRM_NO_MODIFIERS=1 (force LINEAR scanout, or the\n\
-              # swapchain fails vkBindImageMemory -> no desktop), and the zink pin\n\
-              # for GL CLIENTS (eglgears/glxgears/Xwayland apps): our uAPI\n\
-              # implements zink/NVK's VM_BIND/EXEC, not the classic nvc0\n\
-              # GEM_PUSHBUF, so an unpinned client falls to llvmpipe and its\n\
-              # dma-buf import crashes (SELF-IMPORT MISS -> ENOENT). login(1)\n\
-              # STRIPS arbitrary vars, so a login-shell labwc (and its clients)\n\
-              # lost what eclipse-init's build_child_env set -- re-assert the WHOLE\n\
-              # hardware-GL stack here so it matches build_child_env and the labwc\n\
-              # wrapper exactly. Keying the zink pin on the flag too (not vendor\n\
-              # alone) is what keeps the documented recovery boot honest: booting\n\
-              # renderer=pixman WITHOUT the flag on the same RTX must NOT pin zink\n\
-              # over a kernel uAPI that is off (no Vulkan device -> every GL client\n\
-              # dies) -- it degrades to software GL like any non-NVIDIA box.\n\
+              # hardware-GL stack correct. Compositor renderer defaults to GLES2\n\
+              # on zink (proven on the RTX: gpudbg showed a client EXEC completing\n\
+              # with fence+syncobj, no MMU fault). wlroots' NATIVE Vulkan renderer\n\
+              # needs an external VkSemaphore NVK will not export over this partial\n\
+              # syncobj uAPI (vkCreateSemaphore INVALID_EXTERNAL_HANDLE, then a\n\
+              # retry loop that exhausts channels), so it is opt-in via\n\
+              # nvidia.wlr_vulkan. Plus WLR_DRM_NO_MODIFIERS=1 (LINEAR scanout, or\n\
+              # the swapchain fails vkBindImageMemory -> no desktop) and the zink\n\
+              # pin for GL CLIENTS (eglgears/glxgears/Xwayland apps): our uAPI\n\
+              # implements zink/NVK's VM_BIND/EXEC, not classic nvc0 GEM_PUSHBUF,\n\
+              # so an unpinned client falls to llvmpipe and its dma-buf import\n\
+              # crashes. login(1) STRIPS arbitrary vars, so re-assert the WHOLE\n\
+              # hardware-GL stack here to match build_child_env and the wrapper.\n\
+              # Keying the zink pin on the flag too (not vendor alone) keeps the\n\
+              # documented recovery boot honest: renderer=pixman WITHOUT the flag\n\
+              # on the same RTX must NOT pin zink over a kernel uAPI that is off.\n\
               if grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null && \\\n\
               \x20\x20 [ \"$(cat /sys/class/drm/card0/device/vendor 2>/dev/null)\" = \"0x10de\" ]; then\n\
               \x20 # hardware GL: NVIDIA + flag -> kernel nouveau uAPI ON.\n\
-              \x20 export WLR_RENDERER=vulkan\n\
+              \x20 if grep -q 'nvidia\\.wlr_vulkan' /proc/cmdline 2>/dev/null; then\n\
+              \x20\x20 export WLR_RENDERER=vulkan\n\
+              \x20 else\n\
+              \x20\x20 export WLR_RENDERER=gles2\n\
+              \x20 fi\n\
               \x20 export WLR_DRM_NO_MODIFIERS=1\n\
               \x20 export GALLIUM_DRIVER=zink\n\
               \x20 export MESA_LOADER_DRIVER_OVERRIDE=zink\n\

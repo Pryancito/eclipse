@@ -863,10 +863,18 @@ const _: () = {
     assert!(sz::<NvifIoctlV0>() + sz::<NvifIoctlNewV0>() == 56);
 };
 
-/// Ceiling on live nouveau channels per GPU. Only one can ever be RM-backed
-/// (the `step16`+`step17` ladder builds a single GR channel); the rest are
-/// discovery channels, which exist purely so a second client can enumerate.
-pub(super) const MAX_CHANNELS: usize = 16;
+/// Ceiling on live nouveau channels per GPU. Bounds the channel Vec against a
+/// runaway; the number of REAL RM-backed contexts is separately capped by
+/// `MAX_CTX`, so the extra headroom here only ever holds cheap discovery/alias
+/// entries. Raised from 16 after a real-RTX boot: NVK creates throwaway
+/// enumeration contexts (a CHANNEL_ALLOC + 5 NVIF class NEWs each) and, when
+/// wlroots' native-Vulkan renderer retry-loops on its external-semaphore
+/// failure, a single process can allocate channels in a burst faster than it
+/// frees them. At 16 that burst hit the cap -> CHANNEL_ALLOC EBUSY (errno 16)
+/// -> NVK enumerate -3 -> "could not match drm and vulkan device", and the
+/// desktop wedged. The default renderer is GLES2/zink now (which does not
+/// churn), so this is belt-and-braces; 64 absorbs any enumeration burst.
+pub(super) const MAX_CHANNELS: usize = 64;
 
 /// Number of per-process GPU contexts (index 0 = the compositor's singleton;
 /// 1.. = one per GL client). MUST match `ECLIPSE_MAX_CTX` in
