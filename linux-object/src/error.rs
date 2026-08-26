@@ -101,6 +101,10 @@ pub enum LxError {
     EIDRM = 43,
     /// No data available (e.g. no such extended attribute)
     ENODATA = 61,
+    /// Timer expired -- the errno `drm_syncobj_wait` returns on timeout, which
+    /// Mesa checks for explicitly (`errno == ETIME` -> `VK_TIMEOUT`); any other
+    /// errno there is treated as a lost device.
+    ETIME = 62,
     /// Socket operation on non-socket
     ENOTSOCK = 88,
     /// Protocol not available
@@ -181,6 +185,7 @@ impl fmt::Display for LxError {
             ENOMSG => "No message of desired type",
             EIDRM => "Identifier removed",
             ENODATA => "No data available",
+            ETIME => "Timer expired",
             ENOTSOCK => "Socket operation on non-socket",
             ENOPROTOOPT => "Protocol not available",
             EOPNOTSUPP => "Operation not supported",
@@ -266,6 +271,7 @@ impl From<FsError> for LxError {
             // EINVAL makes every such check silently wrong.
             FsError::NoDevice => LxError::ENODEV,
             FsError::Again => LxError::EAGAIN,
+            FsError::TimedOut => LxError::ETIME,
             FsError::SymLoop => LxError::ELOOP,
             FsError::Busy => LxError::EBUSY,
             FsError::ReadOnly => LxError::EROFS,

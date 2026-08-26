@@ -1301,3 +1301,92 @@ de CPU lo lee directo. El soporte de tiling real (programar el kind 0x06 en
 las page tables de la GPU + des-swizzlear block-linear en el blit) queda como
 trabajo futuro para render targets internos; para el escritorio básico
 wlroots dibuja directo sobre el buffer de scanout, que ahora es lineal.
+
+## El asesino del cliente GL: `SYNCOBJ_WAIT` con un tamaño de struct de más
+
+`glxgears` y `eglgears_wayland` morían **los dos** en su primer
+`vkQueueSubmit` con `VK_ERROR_DEVICE_LOST`, con una peculiaridad que invirtió
+toda la caza: `/proc/gpudbg` demostró que el **`EXEC` en sí funciona**:
+
+```
+ctx=1 pid=1055 OK: 2 push(es) + fence landed, 2 syncobj(s) signaled
+```
+
+El pushbuffer llega a la GPU, la valla aterriza, los syncobjs se señalan.
+Como NVK colapsa **cualquier** errno en `DEVICE_LOST`, el que lo mataba venía
+de **otra** ioctl del flujo de sumisión. La sospecha recayó sobre la espera de
+syncobj genérica (se despacha en `linux-object`, fuera del registro de
+`/proc/gpudbg`).
+
+La causa raíz, encontrada por lectura de código (no hacía falta hardware para
+verla): las structs `DrmSyncobjWait` y `DrmSyncobjTimelineWait`
+(`linux-object/src/fs/devfs/drm_scheme.rs`) llevaban un campo de cola
+`deadline_nsec: u64` **que no existe en la ABI real de DRM**. La ABI está
+congelada desde 2017: `struct drm_syncobj_wait` mide **32 bytes**,
+`struct drm_syncobj_timeline_wait` **40**. Con el campo de más medían 40 y 48.
+
+Y ahí está la trampa: el número de ioctl se **calcula** a partir del tamaño
+del struct —
+
+```rust
+const DRM_IOCTL_SYNCOBJ_WAIT: u32 = drm_iowr_core(0xC3, size_of::<DrmSyncobjWait>());
+```
+
+— así que el kernel computaba `0xC028_64C3` mientras libdrm emite `0xC020_64C3`
+(tamaño 32). El brazo del `match` (exacto sobre el `u32` completo) **nunca
+casaba** con el `drmSyncobjWait` de Mesa: caía al despacho por defecto → a la
+uAPI nouveau → ningún NR nouveau → `ENOSYS` → `DEVICE_LOST`. Idéntico para
+`TIMELINE_WAIT` (`0xC030_64CA` calculado vs `0xC028_64CA` real).
+
+Encaja con cada observación: el `EXEC` (incluido su sondeo de salud de push
+vacío) casa por número y responde `OK`, pero el `SYNCOBJ_WAIT` que lo acompaña
+en el `nvkmd_nouveau_exec_ctx_sync` de NVK devolvía `ENOSYS`. Y explica por
+qué X (glxgears/Xwayland) y Wayland nativo (eglgears_wayland) mueren igual:
+ninguno depende de PRIME ni de sync_file para esto — **todo** submit-sync de
+NVK pega en el mismo número de WAIT roto.
+
+### El fix (verificado en compilación)
+
+1. Se eliminan los dos `deadline_nsec` fantasma → los structs vuelven a 32 y 40
+   bytes, los números de ioctl vuelven a `0xC020_64C3`/`0xC028_64CA` y el
+   handler despacha.
+2. Se añaden **guardas de tamaño en tiempo de compilación** para las seis
+   structs de syncobj (`CREATE`/`DESTROY`/`WAIT`/`TIMELINE_WAIT`/`ARRAY`/
+   `TIMELINE_ARRAY`), junto a las de las structs MODE que ya las tenían: un
+   layout equivocado ahora **no compila** en vez de fallar en silencio. Este
+   agujero existía porque el bloque de guardas omitía justo las de syncobj.
+3. **`SYNCOBJ_WAIT` en timeout devuelve `ETIME` (62), no `EAGAIN`.** Como
+   ahora el WAIT sí despacha, su rama de timeout deja de ser código muerto:
+   Mesa comprueba `errno == ETIME` para devolver `VK_TIMEOUT`, y `drmIoctl()`
+   **reintenta** en `EAGAIN` (giraría en un busy-loop una espera ya vencida).
+   Se añade `LxError::ETIME` y `FsError::TimedOut` con su mapeo.
+
+En la ruta normal el timeout ni se toca: nuestro `EXEC` con valla señala el
+syncobj **de forma síncrona antes de retornar**, así que el `SYNCOBJ_WAIT`
+posterior lo encuentra ya señalado y vuelve al instante.
+
+### Qué esperar en el próximo arranque
+
+Con el WAIT despachando, el primer `vkQueueSubmit` de un cliente GL debería
+completar en vez de `DEVICE_LOST`, y `glxgears`/`eglgears_wayland` deberían
+llegar a **pintar** (su buffer se compone en el output del compositor, que ya
+se escanea por el blit de CPU). Si aún fallan, `cat /proc/gpudbg` y
+`dmesg | grep -iE "nouveau-uapi|SYNCOBJ|EXEC"` nombran el siguiente muro.
+
+### Pendiente (requiere validación en hardware): el teardown de PRIME
+
+Un segundo bug, latente hasta que los clientes GL empiecen a **presentar** y
+luego salir, es el candidato a la degradación "el estado se acumula durante la
+sesión" (un cliente que antes funcionaba empieza a fallar tras un rato):
+`nouveau_release_process` (`drivers/src/display/nvidia.rs`) libera los objetos
+GEM del proceso que sale con `gem_mmap::unregister` **incondicional**,
+ignorando el refcount de PRIME. Si el compositor **importó** el buffer de un
+cliente (self-import → refcount 2), la salida del cliente lo libera por debajo
+del compositor → su siguiente `GEM_INFO`/`VM_BIND`/`EXEC` sobre ese handle
+ENOENT-ea o toca memoria liberada → otro `DEVICE_LOST`, esta vez del
+compositor. El fix correcto (respetar el refcount en la salida: `dec_ref` en
+vez de `unregister`, y transferir la responsabilidad del `gem_free` al último
+poseedor) toca el modelo de propiedad y **no se ha hecho aquí porque cambia la
+vida de la memoria en la ruta crítica del compositor y no se puede validar sin
+la RTX** — un `gem_free` prematuro mal resuelto es peor que el bug actual. Es
+el siguiente trabajo con hardware en el bucle.

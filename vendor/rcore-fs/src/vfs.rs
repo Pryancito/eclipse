@@ -324,6 +324,7 @@ pub enum FsError {
     IOCTLError,
     NoDevice,
     Again,       // E_AGAIN, when no data is available, never happens in fs
+    TimedOut,    // E_TIME (62), a wait reached its deadline -- e.g. DRM_IOCTL_SYNCOBJ_WAIT
     SymLoop,     // E_LOOP
     Busy,        // E_BUSY
     ReadOnly,     // E_ROFS
