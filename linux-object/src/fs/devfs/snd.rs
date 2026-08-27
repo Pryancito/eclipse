@@ -578,9 +578,7 @@ impl PcmDev {
         use core::sync::atomic::{AtomicU32, Ordering};
         static BUDGET: AtomicU32 = AtomicU32::new(8);
         if BUDGET
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
-                b.checked_sub(1)
-            })
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| b.checked_sub(1))
             .is_err()
         {
             return;
@@ -617,9 +615,7 @@ impl PcmDev {
         let rate = RATES
             .iter()
             .copied()
-            .find(|&r| {
-                r >= p.intervals[Self::IV_RATE].min && r <= p.intervals[Self::IV_RATE].max
-            })
+            .find(|&r| r >= p.intervals[Self::IV_RATE].min && r <= p.intervals[Self::IV_RATE].max)
             .ok_or(FsError::InvalidParam)?;
         Self::iv_clamp(&mut p.intervals[Self::IV_RATE], rate as u64, rate as u64);
         for _ in 0..8 {

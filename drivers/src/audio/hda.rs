@@ -607,7 +607,8 @@ impl HdaInner {
         frame[4] = channels - 1; // CC, coding type "refer to stream"
                                  // frame[8] = CA (0 = FL/FR), rest zero.
         let sum: u32 = frame.iter().map(|&b| b as u32).sum();
-        frame[3] = (0x100 - (sum & 0xff) as u16 as u32 & 0xff) as u8;
+        // Checksum: the bytes of the frame plus this one must sum to 0 mod 256.
+        frame[3] = ((0x100 - (sum & 0xff)) & 0xff) as u8;
 
         let _ = self.cmd(pin, VERB_SET_DIP_INDEX, 0);
         for &b in &frame {
