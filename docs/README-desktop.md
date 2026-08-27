@@ -24,7 +24,7 @@ arranque sin pasos manuales.
 | Panel | `/root/.config/waybar/{config,style.css}` | Barra inferior: lanzador + barra de tareas a la izquierda; CPU, memoria y reloj a la derecha. |
 | GTK 3/4 | `/root/.config/gtk-{3.0,4.0}/settings.ini` | Modo oscuro por defecto para aplicaciones GTK. |
 | Terminal | `/root/.config/foot/foot.ini` | Paleta violeta oscura a juego con el escritorio. |
-| Lanzador (shell) | `/usr/local/bin/labwc` | Wrapper para shells interactivos (`login` limpia env). Init arranca el binario real `/usr/bin/labwc`. |
+| Lanzador (shell) | `/usr/local/bin/labwc` | Wrapper endurecido de labwc. Lo usan tanto los shells interactivos (`login` limpia env) como `eclipse-init`, para que ambos pasen por la misma selección de renderer y variables de entorno. |
 
 ## Paquetes de runtime
 
