@@ -1964,7 +1964,6 @@ impl E1000eInterface {
                 }
             }
             let _g = Guard(Arc::clone(&me.watchdog_job_scheduled));
-            me.watchdog_job_scheduled.store(false, Ordering::Release);
             let (link_changed, link_up) = {
                 let mut hw = me.driver.hw.lock();
                 let changed = unsafe { hw.watchdog_tick() };
@@ -1973,6 +1972,7 @@ impl E1000eInterface {
             if link_changed {
                 me.link_up_seen.store(link_up, Ordering::Release);
             }
+            me.watchdog_job_scheduled.store(false, Ordering::Release);
             me.schedule_watchdog(false);
         });
     }
@@ -2103,12 +2103,14 @@ impl Scheme for E1000eInterface {
             return;
         }
 
-        if self.poll_pending.load(Ordering::SeqCst) {
+        if self
+            .poll_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             self.ims_rearm();
             return;
         }
-
-        self.poll_pending.store(true, Ordering::SeqCst);
         self.poll_pending_set_us
             .store(timer_now_as_micros(), Ordering::Relaxed);
         unsafe {
@@ -2397,12 +2399,21 @@ impl phy::TxToken for E1000eTxToken {
     where
         F: FnOnce(&mut [u8]) -> SmolResult<R>,
     {
-        // Stack scratch instead of `vec![0; len]`: smoltcp overwrites the
-        // whole frame, so the prior zero-fill was pure overhead (heap alloc +
-        // memset) on every ACK / egress frame.
-        let len = len.min(TX_SCRATCH_LEN);
+        // Stack scratch instead of `vec![0; len]` for the common MTU-sized
+        // case: smoltcp overwrites the whole frame, so zero-filling a heap
+        // buffer would be pure overhead. Do NOT silently clamp oversized
+        // requests though: the closure expects a slice of exactly `len`, and a
+        // truncated slice would either panic in `copy_from_slice` or emit a
+        // shorter/corrupt frame. Fall back to a heap buffer for the rare jumbo
+        // request instead.
         let mut scratch = MaybeUninit::<[u8; TX_SCRATCH_LEN]>::uninit();
-        let buf = unsafe { core::slice::from_raw_parts_mut(scratch.as_mut_ptr() as *mut u8, len) };
+        let mut heap_buf = Vec::new();
+        let buf: &mut [u8] = if len <= TX_SCRATCH_LEN {
+            unsafe { core::slice::from_raw_parts_mut(scratch.as_mut_ptr() as *mut u8, len) }
+        } else {
+            heap_buf.resize(len, 0);
+            heap_buf.as_mut_slice()
+        };
         let result = f(buf)?;
 
         let mut hw = self.0.hw.lock();
@@ -2739,7 +2750,11 @@ impl PciDriver for E1000eDriverPci {
         // "ethN"; disambiguate only when device/function actually vary, which
         // is guaranteed unique since (bus, device, function) is the PCI
         // addressing key.
-        let name = alloc::format!("eth{}", dev.loc.bus);
+        let name = if dev.loc.device == 0 && dev.loc.function == 0 {
+            alloc::format!("eth{}", dev.loc.bus)
+        } else {
+            alloc::format!("eth{}d{}f{}", dev.loc.bus, dev.loc.device, dev.loc.function)
+        };
 
         unsafe {
             let mut cmd = PCI_ACCESS.read16(&PortOpsImpl, dev.loc, 0x04);
@@ -2773,6 +2788,7 @@ mod rx_ring_tests {
     use super::*;
     use alloc::vec;
     use alloc::vec::Vec;
+    extern crate std;
     use std::alloc::{alloc_zeroed, Layout};
 
     // --- mock kernel hooks: identity-mapped host memory, no-op the rest ---
