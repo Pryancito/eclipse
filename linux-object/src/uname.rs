@@ -23,10 +23,10 @@ pub const OS_TYPE: &str = "Eclipse";
 /// value here was the crate version ("0.1.0-zcore"), which fails all of those
 /// checks; 5.15 matches the LTS kernel whose ABI subset this tree implements.
 #[cfg(target_os = "none")]
-pub const OS_RELEASE: &str = "0.4.6";
+pub const OS_RELEASE: &str = "0.4.6.1";
 /// LibOS builds keep their distinguishing suffix, still in parseable form.
 #[cfg(not(target_os = "none"))]
-pub const OS_RELEASE: &str = "0.4.6-libos";
+pub const OS_RELEASE: &str = "0.4.6.1-libos";
 
 /// Maximum length of a host or domain name, per POSIX HOST_NAME_MAX on Linux
 /// (`sethostname(2)` answers EINVAL above this).

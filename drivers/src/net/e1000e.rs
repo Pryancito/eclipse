@@ -2743,11 +2743,7 @@ impl PciDriver for E1000eDriverPci {
         // "ethN"; disambiguate only when device/function actually vary, which
         // is guaranteed unique since (bus, device, function) is the PCI
         // addressing key.
-        let name = if dev.loc.device == 0 && dev.loc.function == 0 {
-            alloc::format!("eth{}", dev.loc.bus)
-        } else {
-            alloc::format!("eth{}_{}_{}", dev.loc.bus, dev.loc.device, dev.loc.function)
-        };
+        let name = alloc::format!("eth{}", dev.loc.bus);
 
         unsafe {
             let mut cmd = PCI_ACCESS.read16(&PortOpsImpl, dev.loc, 0x04);
