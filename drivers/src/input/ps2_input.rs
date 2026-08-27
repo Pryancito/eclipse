@@ -17,13 +17,15 @@ struct MouseState {
     bytes: [u8; 3],
 }
 
-fn wait_write() {
+fn wait_write() -> bool {
     let mut status_port = Port::<u8>::new(0x64);
     let mut timeout = 100_000;
     unsafe {
         while (status_port.read() & 0x02) != 0 && timeout > 0 {
             timeout -= 1;
+            core::hint::spin_loop();
         }
+        timeout > 0
     }
 }
 
@@ -33,9 +35,40 @@ fn wait_read() -> bool {
     unsafe {
         while (status_port.read() & 0x01) == 0 && timeout > 0 {
             timeout -= 1;
+            core::hint::spin_loop();
         }
         timeout > 0
     }
+}
+
+fn drain_output(data_port: &mut Port<u8>, status_port: &mut Port<u8>) {
+    unsafe {
+        while (status_port.read() & 0x01) != 0 {
+            let _ = data_port.read();
+        }
+    }
+}
+
+fn read_data(data_port: &mut Port<u8>) -> Option<u8> {
+    if wait_read() {
+        Some(unsafe { data_port.read() })
+    } else {
+        None
+    }
+}
+
+fn write_aux(data_port: &mut Port<u8>, status_port: &mut Port<u8>, cmd: u8) -> bool {
+    unsafe {
+        if !wait_write() {
+            return false;
+        }
+        status_port.write(0xD4);
+        if !wait_write() {
+            return false;
+        }
+        data_port.write(cmd);
+    }
+    matches!(read_data(data_port), Some(0xFA))
 }
 
 impl Default for Ps2Input {
@@ -51,18 +84,23 @@ impl Ps2Input {
             let mut data_port = Port::<u8>::new(0x60);
             let mut status_port = Port::<u8>::new(0x64);
 
+            drain_output(&mut data_port, &mut status_port);
+
             // 1. Enable ports (keyboard & mouse)
-            wait_write();
-            status_port.write(0xAE); // Enable keyboard port
-            wait_write();
-            status_port.write(0xA8); // Enable mouse port
+            if wait_write() {
+                status_port.write(0xAE); // Enable keyboard port
+            }
+            if wait_write() {
+                status_port.write(0xA8); // Enable mouse port
+            }
 
             // 2. Read Controller Configuration Byte
-            wait_write();
-            status_port.write(0x20);
+            if wait_write() {
+                status_port.write(0x20);
+            }
             let mut config = 0;
-            if wait_read() {
-                config = data_port.read();
+            if let Some(v) = read_data(&mut data_port) {
+                config = v;
             }
 
             // 3. Update Configuration Byte:
@@ -77,22 +115,25 @@ impl Ps2Input {
             config &= !0x20;
             config |= 0x40;
 
-            wait_write();
-            status_port.write(0x60);
-            wait_write();
-            data_port.write(config);
-
-            // 4. Reset & enable mouse data reporting
-            // Write D4 to status port (direct next write to aux device)
-            wait_write();
-            status_port.write(0xD4);
-            wait_write();
-            data_port.write(0xF4); // Enable packet reporting command
-
-            // Wait for mouse ACK (0xFA)
-            if wait_read() {
-                let _ack = data_port.read();
+            if wait_write() {
+                status_port.write(0x60);
+                if wait_write() {
+                    data_port.write(config);
+                }
             }
+
+            drain_output(&mut data_port, &mut status_port);
+
+            // 4. Reset the mouse first: real hardware often ignores follow-up
+            // commands until BAT/device-id have completed.
+            if write_aux(&mut data_port, &mut status_port, 0xFF) {
+                let _ = read_data(&mut data_port); // BAT result (usually 0xAA)
+                let _ = read_data(&mut data_port); // Device ID (usually 0x00)
+            }
+
+            // 5. Restore defaults, then enable streaming packet reports.
+            let _ = write_aux(&mut data_port, &mut status_port, 0xF6);
+            let _ = write_aux(&mut data_port, &mut status_port, 0xF4);
         }
 
         Self {
