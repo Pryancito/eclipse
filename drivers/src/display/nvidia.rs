@@ -919,6 +919,53 @@ impl NvidiaGpu {
     pub fn vram_size_mb(&self) -> u32 {
         self.vram_size_mb
     }
+
+    /// VRAM size in MiB for *reporting and sizing*, never zero for a GPU this
+    /// driver can drive.
+    ///
+    /// `identify_gpu()` runs from the PCI device-id ALONE (BAR0 MMIO is unsafe
+    /// that early — it stalled boot at 80%), and returns 0 MiB for any id not
+    /// in its table: a mere board variant of a supported chip. But
+    /// `nouveau_arch()` still recovers the real architecture from PMC_BOOT_0 at
+    /// runtime, so such a GPU is otherwise handed to NVK as a valid Turing+
+    /// device whose VRAM heap is EMPTY — GETPARAM_FB_SIZE = 0 and the RM's
+    /// `attach_gpu` fbSize = 0. NVK builds the device, then walks a NULL heap
+    /// the instant zink creates its timeline semaphore ("failed to create
+    /// timeline semaphore", the crash at libvulkan_nouveau.so+0x9cc48).
+    ///
+    /// Floor it to a conservative per-architecture value so the heap is never
+    /// empty. Under-reporting is safe (NVK and the RM simply manage less FB
+    /// than exists); adding the variant's device-id to `identify_gpu` restores
+    /// the exact size. BAR0 is safe to read here — every caller is well past
+    /// boot (a GETPARAM ioctl, or the RM attach).
+    fn effective_vram_mb(&self) -> u32 {
+        if self.vram_size_mb != 0 {
+            return self.vram_size_mb;
+        }
+        let floor = match self.nouveau_arch() {
+            NvidiaArchitecture::Turing => 4096,
+            NvidiaArchitecture::Ampere => 8192,
+            NvidiaArchitecture::AdaLovelace => 8192,
+            NvidiaArchitecture::Hopper => 16384,
+            NvidiaArchitecture::Blackwell => 12288,
+            // Truly unrecognized: NVK skips this GPU anyway (engine classes =
+            // None), so 0 changes nothing and we don't invent VRAM for a chip
+            // this driver cannot drive.
+            NvidiaArchitecture::Unknown => return 0,
+        };
+        static LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            crate::klog_warn!(
+                "[nouveau-uapi] PCI device-id {:#06x} not in identify_gpu table -- flooring VRAM \
+                 to {} MiB for {:?}; add the id for the exact size",
+                self.device_id,
+                floor,
+                self.nouveau_arch()
+            );
+        }
+        floor
+    }
+
     pub fn temperature(&self) -> Option<i32> {
         read_temperature(self._bar0)
     }
@@ -3307,7 +3354,7 @@ impl DrmScheme for NvidiaGpu {
                     bar0 as *mut core::ffi::c_void,
                     self.bar0_len,
                     self.bar1_phys,
-                    self.vram_size_mb as u64 * 1024 * 1024,
+                    self.effective_vram_mb() as u64 * 1024 * 1024,
                     self.bar2_phys,
                     self.bar2_len,
                 ) {
@@ -8259,7 +8306,10 @@ impl NvidiaGpu {
                 // every byte is CPU-reachable, which is what the CPU-blit
                 // present path needs. A true BAR1 path can reclaim real VRAM
                 // for device-local-only objects later.
-                let vram_bytes = (self.vram_size_mb as u64) * 1024 * 1024;
+                // Floor a 0 (device-id not in identify_gpu) like GETPARAM_FB_SIZE
+                // does — NVIF device INFO is the OTHER VRAM size NVK reads, and a
+                // 0 here is the same empty-heap NULL walk. See effective_vram_mb.
+                let vram_bytes = (self.effective_vram_mb() as u64) * 1024 * 1024;
                 let chipset = self.nouveau_chipset_id();
                 let mut info = nv::NvDeviceInfoV0 {
                     version: 0,
@@ -8523,24 +8573,32 @@ impl NvidiaGpu {
         match nr {
             nv::NR_GETPARAM => {
                 let req = unsafe { &mut *(arg as *mut nv::DrmNouveauGetparam) };
-                let vram_bytes = (self.vram_size_mb as u64) * 1024 * 1024;
+                // effective_vram_mb() floors a 0 (device-id not in identify_gpu)
+                // up to a per-arch value so NVK's VRAM heap is never empty — see
+                // its doc for the NULL heap-list crash this prevents.
+                let eff_vram_mb = self.effective_vram_mb();
+                let vram_bytes = (eff_vram_mb as u64) * 1024 * 1024;
                 // One-shot, VISIBLE memory picture NVK builds its heaps from.
-                // FB_SIZE = 0 (VRAM undetected) is the classic cause of the NULL
-                // heap-list walk that crashes NVK right after device creation:
-                // the "failed to create timeline semaphore" is zink hitting a
-                // half-built device whose VRAM heap has no memory. VRAM_BAR_SIZE
-                // is the BAR1 host-visible aperture; rm_attached says whether
-                // these came from the live GSP-RM or a fallback.
+                // FB_SIZE = 0 was the classic cause of the NULL heap-list walk
+                // that crashes NVK right after device creation ("failed to
+                // create timeline semaphore"); the floor above stops it, and
+                // this line shows both the raw table value and the effective one
+                // plus the device-id, so an unlisted variant is named for a
+                // follow-up identify_gpu entry with its exact size.
                 {
                     static LOGGED: core::sync::atomic::AtomicBool =
                         core::sync::atomic::AtomicBool::new(false);
                     if !LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
                         let rm_attached = self.rm_device_instance.lock().is_some();
                         crate::klog_info!(
-                            "[nouveau-uapi] NVK mem: FB_SIZE={} MiB (vram_size_mb={}) \
-                             VRAM_BAR_SIZE={} bytes rm_attached={}",
+                            "[nouveau-uapi] NVK mem: device={:#06x} ({}) FB_SIZE={} MiB \
+                             (table vram_size_mb={}, effective={}) VRAM_BAR_SIZE={} bytes \
+                             rm_attached={}",
+                            self.device_id,
+                            self.gpu_model,
                             vram_bytes / (1024 * 1024),
                             self.vram_size_mb,
+                            eff_vram_mb,
                             self.info.fb_size as u64,
                             rm_attached
                         );
