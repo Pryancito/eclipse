@@ -2699,13 +2699,11 @@ pub fn poll() {
                         xi.dump_halt_diagnostics();
                     }
                     if !xi.try_soft_recover() {
-                        if !d.halted.swap(true, Ordering::Relaxed) {
-                            warn!(
-                                "[xhci] recuperación de HCHalted falló de forma terminal en intento {}",
-                                attempts.saturating_add(1)
-                            );
-                            xi.dump_halt_diagnostics();
-                        }
+                        // `try_soft_recover` can fail transiently (backoff
+                        // window still open, or one unsuccessful attempt) and
+                        // the budget is tracked in `halt_attempts`. Only latch
+                        // terminally once `attempts` reaches
+                        // `MAX_HALT_RECOVERY_ATTEMPTS` in the branch below.
                         continue;
                     }
                     // Fall through to normal event drain.
