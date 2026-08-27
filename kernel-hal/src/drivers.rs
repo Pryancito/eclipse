@@ -81,6 +81,10 @@ impl AllDeviceList {
             Device::Net(d) => self.net.add(d),
             Device::Uart(d) => self.uart.add(d),
             Device::Drm(d) => self.drm.add(d),
+            Device::DrmDisplay(drm, display) => {
+                self.drm.add(drm);
+                self.display.add(display);
+            }
             Device::Audio(d) => self.audio.add(d),
         }
     }
