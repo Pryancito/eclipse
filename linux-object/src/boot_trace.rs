@@ -55,7 +55,11 @@ static T0_UPTIME_NS: AtomicU64 = AtomicU64::new(0);
 /// One recorded event, timestamped at [`dt_us`] microseconds since [`T0_NS`].
 enum Rec {
     /// An `open`/`openat`: `result >= 0` is the fd, `< 0` is `-errno`.
-    Open { dt_us: u64, result: i32, path: String },
+    Open {
+        dt_us: u64,
+        result: i32,
+        path: String,
+    },
     /// A syscall that took longer than [`SLOW_SYSCALL_US`] — the raw material
     /// for the gaps in the open timeline where NO file is touched (a blocking
     /// wait, or one very long call). `dur_us` is how long the call itself took;
@@ -240,7 +244,10 @@ pub fn render() -> String {
             Rec::Slow { .. } => slow += 1,
         }
     }
-    let window_ms = recs.last().map(|r| r.dt_us() as f64 / 1000.0).unwrap_or(0.0);
+    let window_ms = recs
+        .last()
+        .map(|r| r.dt_us() as f64 / 1000.0)
+        .unwrap_or(0.0);
 
     let _ = writeln!(
         out,
@@ -278,7 +285,11 @@ pub fn render() -> String {
         let gap_us = r.dt_us().saturating_sub(prev_us);
         let stall = if gap_us > 2000 { '*' } else { ' ' };
         match r {
-            Rec::Open { dt_us, result, path } => {
+            Rec::Open {
+                dt_us,
+                result,
+                path,
+            } => {
                 let res = if *result >= 0 {
                     "ok  ".to_string()
                 } else {

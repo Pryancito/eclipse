@@ -10,10 +10,10 @@ pub(super) mod block;
 pub(super) mod display;
 pub mod drm;
 pub mod gem_mmap;
-pub mod syncobj;
 pub(super) mod input;
 pub(super) mod irq;
 pub(super) mod net;
+pub mod syncobj;
 pub(super) mod uart;
 
 #[macro_use]

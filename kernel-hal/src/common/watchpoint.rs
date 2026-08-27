@@ -81,8 +81,7 @@ static DR_ARMED: [[AtomicU64; 4]; MAX_CORE_NUM] =
 /// hot slot cannot storm the console.
 static SPINE_TRAP_HITS: AtomicU64 = AtomicU64::new(0);
 /// Latched off after enough reports (checked by `sync`).
-static SPINE_WATCH_OFF: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static SPINE_WATCH_OFF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Arm a write watchpoint covering `len` bytes at `addr` on **every** CPU.
 ///

@@ -206,7 +206,10 @@ fn proc_pid_stat(proc: &Process) -> String {
     let stime = (stime_ns / NS_PER_TICK) as i64;
 
     // Field 39 (processor): the CPU the leader thread last ran on.
-    let processor = first_thread.as_ref().map(|t| t.last_cpu() as i64).unwrap_or(0);
+    let processor = first_thread
+        .as_ref()
+        .map(|t| t.last_cpu() as i64)
+        .unwrap_or(0);
 
     // Job-control ids (proc(5) fields 5-8): the effective pgid/sid resolve the
     // "0 = own pid" convention, tty_nr encodes the per-process VT console as
@@ -1821,7 +1824,13 @@ fn proc_memhogs_content() -> String {
     // growing `Paged` count with no process behind it is a plain VMO leak.
     let _ = writeln!(s, "vmo by kind (live / declared MiB):");
     for (kind, live, bytes) in zircon_object::vm::vmo_stats() {
-        let _ = writeln!(s, "  {:<12} {:>6} / {:>6}", alloc::format!("{:?}", kind), live, mib(bytes as u64));
+        let _ = writeln!(
+            s,
+            "  {:<12} {:>6} / {:>6}",
+            alloc::format!("{:?}", kind),
+            live,
+            mib(bytes as u64)
+        );
     }
     let (_, sole, inode_lo, inode_hi) = super::file::shared_file_vmo_refs();
     let _ = writeln!(
@@ -1829,7 +1838,9 @@ fn proc_memhogs_content() -> String {
         "shared-vmo refs: {} entries with no mapper left, inode strong refs {}..{}",
         sole, inode_lo, inode_hi
     );
-    let attributed = sum_priv.saturating_add(sum_shared).saturating_add(reg_bytes);
+    let attributed = sum_priv
+        .saturating_add(sum_shared)
+        .saturating_add(reg_bytes);
     let _ = writeln!(
         s,
         "unattributed: {} MiB (kernel heap, ramfs contents, or leaked frames)",
@@ -1865,9 +1876,7 @@ fn proc_memhogs_content() -> String {
 fn proc_oops_content() -> String {
     let bytes = kernel_hal::oops_log::snapshot();
     if bytes.is_empty() {
-        return String::from(
-            "# no contained kernel faults since boot\n",
-        );
+        return String::from("# no contained kernel faults since boot\n");
     }
     String::from_utf8_lossy(&bytes).into_owned()
 }

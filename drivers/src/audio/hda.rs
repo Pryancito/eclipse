@@ -280,8 +280,7 @@ impl HdaInner {
             return;
         }
         let lpib = self.lpib();
-        let consumed =
-            (lpib as usize + self.ring_len - self.last_lpib as usize) % self.ring_len;
+        let consumed = (lpib as usize + self.ring_len - self.last_lpib as usize) % self.ring_len;
         self.last_lpib = lpib;
         if consumed >= self.queued && consumed > 0 {
             // The engine ran past everything we queued: underrun. Stop; the
@@ -578,11 +577,10 @@ impl HdaInner {
         // Unmute + 0 dB on any output amps in the path.
         for &nid in &[path.conv, path.pin] {
             let amp = self.param(nid, PAR_OUT_AMP_CAP)?;
-            let has_amp = amp != 0
-                || self.param(nid, PAR_AUDIO_WIDGET_CAP)? & (1 << 2) != 0;
+            let has_amp = amp != 0 || self.param(nid, PAR_AUDIO_WIDGET_CAP)? & (1 << 2) != 0;
             if has_amp {
                 let offset = amp & 0x7f; // 0 dB step index
-                // Set output amp, both channels, gain = offset (0 dB).
+                                         // Set output amp, both channels, gain = offset (0 dB).
                 let payload = (1 << 15) | (1 << 13) | (1 << 12) | offset;
                 let _ = self.cmd16(nid, 0x3, payload);
             }
@@ -607,7 +605,7 @@ impl HdaInner {
         frame[1] = 0x01; // version
         frame[2] = 0x0a; // payload length
         frame[4] = channels - 1; // CC, coding type "refer to stream"
-        // frame[8] = CA (0 = FL/FR), rest zero.
+                                 // frame[8] = CA (0 = FL/FR), rest zero.
         let sum: u32 = frame.iter().map(|&b| b as u32).sum();
         frame[3] = (0x100 - (sum & 0xff) as u16 as u32 & 0xff) as u8;
 

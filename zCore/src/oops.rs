@@ -156,10 +156,7 @@ pub fn try_contain(what: &str, restore_kd: Option<u32>) {
     // machine halted" and "the machine halted because the fault arrived with
     // two locks held", which is what says where to look next.
     let decline = |reason: core::fmt::Arguments| {
-        oops_report!(
-            "\n[oops] {} NOT contained ({}) — halting\n",
-            what, reason
-        );
+        oops_report!("\n[oops] {} NOT contained ({}) — halting\n", what, reason);
         CONTAINING.fetch_and(!bit, Ordering::SeqCst);
     };
 
@@ -231,7 +228,12 @@ pub fn try_contain(what: &str, restore_kd: Option<u32>) {
             "\n[isolate] {} — no current thread (IRQ/idle/kernel coroutine); \
              (in_timer_callback={} heap_smash={}) last_tick_rip={:#x} \
              timer_cb={{data:{:#x} vtable:{:#x}}}\n",
-            what, in_timer, smashed, tick_rip, cb_data, cb_vtable,
+            what,
+            in_timer,
+            smashed,
+            tick_rip,
+            cb_data,
+            cb_vtable,
         ),
     }
 
@@ -301,7 +303,9 @@ pub fn try_contain(what: &str, restore_kd: Option<u32>) {
             oops_report!(
                 "[isolate] {} contained ({}/{}): kernel coroutine retired; the \
                  subsystem it served may stay dead until reboot\n",
-                what, n, MAX_CONTAINED,
+                what,
+                n,
+                MAX_CONTAINED,
             );
         }
     }

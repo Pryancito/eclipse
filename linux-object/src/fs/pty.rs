@@ -129,9 +129,7 @@ impl Pty {
     /// Slave read side is satisfiable now (data ready, or master closed → EOF).
     fn slave_readable(&self) -> bool {
         let inner = self.inner.lock();
-        !inner.input.is_empty()
-            || inner.eof_pending
-            || self.master_closed.load(Ordering::Relaxed)
+        !inner.input.is_empty() || inner.eof_pending || self.master_closed.load(Ordering::Relaxed)
     }
 
     /// Feed bytes written to the master through the input line discipline.

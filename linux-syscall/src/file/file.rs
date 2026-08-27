@@ -855,7 +855,10 @@ impl Syscall<'_> {
                     // vs the import-side reverse lookup) is done; keep it at debug.
                     log::debug!(
                         "[drm] PRIME export handle={:#x} -> phys={:#x} size={} fd={}",
-                        h.handle, phys, size, h.fd
+                        h.handle,
+                        phys,
+                        size,
+                        h.fd
                     );
                     if let Err(e) = ptr.write(h) {
                         warn!("[drm] PRIME export write-back EFAULT: {:?}", e);
@@ -901,7 +904,8 @@ impl Syscall<'_> {
                             // path below is the one that logs loudly.
                             log::debug!(
                                 "[drm] PRIME self-import ref++ handle={:#x} -> refcount={:?}",
-                                nouveau_handle, n
+                                nouveau_handle,
+                                n
                             );
                             // ...except the first few per boot, at error! (the
                             // rig runs LOG=error): whether the COMPOSITOR ever
@@ -944,7 +948,11 @@ impl Syscall<'_> {
                     } else {
                         log::debug!(
                             "[drm] PRIME import fd={} phys={:#x} size={} -> {} handle={:#x}",
-                            h.fd, dmabuf.phys_addr, dmabuf.size, kind, handle_id
+                            h.fd,
+                            dmabuf.phys_addr,
+                            dmabuf.size,
+                            kind,
+                            handle_id
                         );
                     }
                     h.handle = handle_id;
@@ -985,8 +993,8 @@ impl Syscall<'_> {
 
         const SYNCOBJ_HANDLE_TO_FD: usize = 0xC010_64C1; // DRM_IOWR(0xc1, drm_syncobj_handle)
         const SYNCOBJ_FD_TO_HANDLE: usize = 0xC010_64C2; // DRM_IOWR(0xc2, drm_syncobj_handle)
-        // Bit 0 on BOTH ioctls: `..._HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE` and
-        // `..._FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE`.
+                                                         // Bit 0 on BOTH ioctls: `..._HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE` and
+                                                         // `..._FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE`.
         const SYNC_FILE: u32 = 1 << 0;
 
         if request != SYNCOBJ_HANDLE_TO_FD && request != SYNCOBJ_FD_TO_HANDLE {

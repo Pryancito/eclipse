@@ -2655,10 +2655,7 @@ impl Drop for VmMapping {
         let inner = self.inner.lock();
         let addr = inner.addr;
         let size = inner.size;
-        info!(
-            "VmMapping::drop: addr={:#x}, size={:#x}",
-            addr, size
-        );
+        info!("VmMapping::drop: addr={:#x}, size={:#x}", addr, size);
         drop(inner);
         if let Err(err) = self.unmap() {
             error!(
@@ -3084,7 +3081,10 @@ mod tests {
             let a = vmar
                 .map(None, VmObject::new_paged(1), 0, 0x1000, flags)
                 .unwrap();
-            assert!(!addrs.contains(&a), "auto-placement returned an occupied slot");
+            assert!(
+                !addrs.contains(&a),
+                "auto-placement returned an occupied slot"
+            );
             addrs.push(a);
         }
         addrs.sort_unstable();

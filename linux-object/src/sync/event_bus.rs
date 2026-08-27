@@ -216,11 +216,7 @@ impl Drop for ReadinessSub {
 /// pending — in that case the waker has been woken right here (the latched
 /// flags + subscribe-time fire in [`EventBus::subscribe`] make
 /// check-then-subscribe race-free) and nothing was stored.
-pub fn subscribe_waker(
-    bus: &mut EventBus,
-    mask: Event,
-    waker: &core::task::Waker,
-) -> Option<u64> {
+pub fn subscribe_waker(bus: &mut EventBus, mask: Event, waker: &core::task::Waker) -> Option<u64> {
     let waker = waker.clone();
     bus.subscribe(Box::new(move |events| {
         if (events & mask).is_empty() {

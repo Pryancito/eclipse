@@ -84,7 +84,10 @@ impl INode for DspDev {
             core::time::Duration::from_secs(self.drain_secs(self.audio.buffer_bytes()));
         let mut deadline = kernel_hal::timer::timer_now() + deadline_step;
         while done < buf.len() {
-            let n = self.audio.write(&buf[done..]).map_err(|_| FsError::DeviceError)?;
+            let n = self
+                .audio
+                .write(&buf[done..])
+                .map_err(|_| FsError::DeviceError)?;
             if n > 0 {
                 done += n;
                 deadline = kernel_hal::timer::timer_now() + deadline_step;
@@ -95,8 +98,15 @@ impl INode for DspDev {
             // spin-retry like the TCP send path does, bounded so a wedged
             // stream cannot hang the writer forever.
             if kernel_hal::timer::timer_now() >= deadline {
-                warn!("[dsp{}] playback ring made no progress; giving up", self.index);
-                return if done > 0 { Ok(done) } else { Err(FsError::DeviceError) };
+                warn!(
+                    "[dsp{}] playback ring made no progress; giving up",
+                    self.index
+                );
+                return if done > 0 {
+                    Ok(done)
+                } else {
+                    Err(FsError::DeviceError)
+                };
             }
             kernel_hal::deferred_job::drain_deferred_jobs();
             core::hint::spin_loop();
@@ -122,9 +132,7 @@ impl INode for DspDev {
             SNDCTL_DSP_SYNC | SNDCTL_DSP_POST => {
                 // Drain: wait until everything queued has played out.
                 let deadline = kernel_hal::timer::timer_now()
-                    + core::time::Duration::from_secs(
-                        self.drain_secs(self.audio.queued_bytes()),
-                    );
+                    + core::time::Duration::from_secs(self.drain_secs(self.audio.queued_bytes()));
                 while self.audio.queued_bytes() > 0 {
                     if kernel_hal::timer::timer_now() >= deadline {
                         break;

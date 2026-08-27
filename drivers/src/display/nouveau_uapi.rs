@@ -234,7 +234,10 @@ pub(super) fn format_last_exec() -> alloc::string::String {
     // The last ioctl error is the one that actually became DEVICE_LOST when the
     // EXEC itself succeeded. THIS is the line that matters when the EXEC above
     // says OK but the client still died.
-    let _ = writeln!(s, "[gpudbg] --- last client nouveau-ioctl ERROR (any kind) ---");
+    let _ = writeln!(
+        s,
+        "[gpudbg] --- last client nouveau-ioctl ERROR (any kind) ---"
+    );
     match &*LAST_CLIENT_IOCTL_ERR.lock() {
         Some(line) => {
             let _ = writeln!(s, "[gpudbg]  {}", line);
@@ -718,7 +721,6 @@ pub(super) struct NouveauVmMapping {
     /// back to a CPU-readable physical address (gem phys + bo_offset + delta).
     pub bo_offset: u64,
 }
-
 
 // ===================== NVIF (`DRM_NOUVEAU_NVIF`, nr 0x47) =====================
 //

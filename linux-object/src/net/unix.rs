@@ -991,10 +991,7 @@ mod tests {
                 WOKE.store(true, Ordering::SeqCst);
             }
             fn drop(_: *const ()) {}
-            RawWaker::new(
-                ptr,
-                &RawWakerVTable::new(clone, wake, wake_by_ref, drop),
-            )
+            RawWaker::new(ptr, &RawWakerVTable::new(clone, wake, wake_by_ref, drop))
         }
 
         WOKE.store(false, Ordering::SeqCst);

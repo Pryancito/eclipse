@@ -632,21 +632,21 @@ impl Syscall<'_> {
         // told apart (MAP_FIXED there forces an unmap + cross-CPU TLB shootdown,
         // the prime suspect for the uniform ~350 ms mmap stalls).
         if linux_object::boot_trace::enabled() {
-            linux_object::boot_trace::record_syscall(pid, num, elapsed_ns, || {
-                match Sys::try_from(num) {
-                    Ok(Sys::MMAP) => alloc::format!(
-                        "len={:#x} prot={:#x} flags={:#x} fd={}",
-                        args[1],
-                        args[2],
-                        args[3],
-                        args[4] as isize
-                    ),
-                    Ok(Sys::MPROTECT) => {
-                        alloc::format!("addr={:#x} len={:#x} prot={:#x}", args[0], args[1], args[2])
-                    }
-                    Ok(Sys::MUNMAP) => alloc::format!("addr={:#x} len={:#x}", args[0], args[1]),
-                    _ => alloc::string::String::new(),
+            linux_object::boot_trace::record_syscall(pid, num, elapsed_ns, || match Sys::try_from(
+                num,
+            ) {
+                Ok(Sys::MMAP) => alloc::format!(
+                    "len={:#x} prot={:#x} flags={:#x} fd={}",
+                    args[1],
+                    args[2],
+                    args[3],
+                    args[4] as isize
+                ),
+                Ok(Sys::MPROTECT) => {
+                    alloc::format!("addr={:#x} len={:#x} prot={:#x}", args[0], args[1], args[2])
                 }
+                Ok(Sys::MUNMAP) => alloc::format!("addr={:#x} len={:#x}", args[0], args[1]),
+                _ => alloc::string::String::new(),
             });
         }
         info!("<= {:?}", ret);

@@ -4,17 +4,17 @@
 // (which compiles C objects and links the RM blob for that target), so the
 // whole stack is gated to x86_64. Other arches get UEFI display only.
 #[cfg(target_arch = "x86_64")]
+mod nouveau_uapi;
+#[cfg(target_arch = "x86_64")]
 mod nvidia;
 #[cfg(target_arch = "x86_64")]
 mod nvidia_hooks;
-#[cfg(target_arch = "x86_64")]
-mod nouveau_uapi;
 mod uefi;
 
 #[cfg(target_arch = "x86_64")]
-pub use nvidia::{boot_edid, set_boot_edid, set_boot_fb_info, NvidiaGpu, NvidiaGpuDriverPci};
-#[cfg(target_arch = "x86_64")]
 pub use nouveau_uapi::{enabled as nouveau_uapi_enabled, set_enabled as set_nouveau_uapi_enabled};
+#[cfg(target_arch = "x86_64")]
+pub use nvidia::{boot_edid, set_boot_edid, set_boot_fb_info, NvidiaGpu, NvidiaGpuDriverPci};
 
 /// Re-export of `nvidia_rm_sys::os_interface::set_thread_id_provider`, so
 /// `zCore` (which depends on this crate via kernel-hal, not on nvidia-rm-sys

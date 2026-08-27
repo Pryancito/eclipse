@@ -265,7 +265,13 @@ pub fn panic_banner(text: &str) {
 
     // Title bar.
     const TITLE: &[u8] = b"*** ECLIPSE OS - KERNEL STOP ***";
-    fill_rect(0, y.saturating_sub(CHAR_H / 4), sw, CHAR_H + CHAR_H / 2, RED);
+    fill_rect(
+        0,
+        y.saturating_sub(CHAR_H / 4),
+        sw,
+        CHAR_H + CHAR_H / 2,
+        RED,
+    );
     for (i, &c) in TITLE.iter().enumerate() {
         draw_char_at(MARGIN_X + (i as u32) * CHAR_W, y, c, WHITE, RED);
     }

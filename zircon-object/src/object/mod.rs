@@ -818,6 +818,9 @@ fn watch_name_if_requested(name: &str) {
     }
     if kernel_hal::watchpoint::watch_write(addr, 8) {
         WATCH_NAME.store(0, Ordering::Relaxed);
-        warn!("[watchpoint] armed on 8B at {:#x} — name buffer of \"{}\"", addr, name);
+        warn!(
+            "[watchpoint] armed on 8B at {:#x} — name buffer of \"{}\"",
+            addr, name
+        );
     }
 }

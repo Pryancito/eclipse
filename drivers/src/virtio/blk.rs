@@ -48,7 +48,11 @@ impl<'a> BlockScheme for VirtIoBlk<'a> {
     // asks for more than 512 bytes (e.g. `CachedDevice`'s 64 KiB read-ahead).
     fn read_block(&self, block_id: usize, buf: &mut [u8]) -> DeviceResult {
         if buf.len() == SECTOR_SIZE {
-            return self.inner.lock().read_block(block_id, buf).map_err(Into::into);
+            return self
+                .inner
+                .lock()
+                .read_block(block_id, buf)
+                .map_err(Into::into);
         }
         if buf.is_empty() || !buf.len().is_multiple_of(SECTOR_SIZE) {
             return Err(crate::DeviceError::InvalidParam);
@@ -62,7 +66,11 @@ impl<'a> BlockScheme for VirtIoBlk<'a> {
 
     fn write_block(&self, block_id: usize, buf: &[u8]) -> DeviceResult {
         if buf.len() == SECTOR_SIZE {
-            return self.inner.lock().write_block(block_id, buf).map_err(Into::into);
+            return self
+                .inner
+                .lock()
+                .write_block(block_id, buf)
+                .map_err(Into::into);
         }
         if buf.is_empty() || !buf.len().is_multiple_of(SECTOR_SIZE) {
             return Err(crate::DeviceError::InvalidParam);

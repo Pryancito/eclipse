@@ -659,11 +659,20 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                     for (card, audio) in audios.iter().enumerate() {
                         let ctl = format!("controlC{}", card);
                         let pcm = format!("pcmC{}D0p", card);
-                        info!("/dev/snd/{{{},{}}} -> audio device '{}'", ctl, pcm, audio.name());
-                        if let Err(e) = snd_dir.add(&ctl, Arc::new(CtlDev::new(audio.clone(), card))) {
+                        info!(
+                            "/dev/snd/{{{},{}}} -> audio device '{}'",
+                            ctl,
+                            pcm,
+                            audio.name()
+                        );
+                        if let Err(e) =
+                            snd_dir.add(&ctl, Arc::new(CtlDev::new(audio.clone(), card)))
+                        {
                             warn!("failed to mknod /dev/snd/{}: {:?}", ctl, e);
                         }
-                        if let Err(e) = snd_dir.add(&pcm, Arc::new(PcmDev::new(audio.clone(), card))) {
+                        if let Err(e) =
+                            snd_dir.add(&pcm, Arc::new(PcmDev::new(audio.clone(), card)))
+                        {
                             warn!("failed to mknod /dev/snd/{}: {:?}", pcm, e);
                         }
                     }
@@ -891,17 +900,16 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     } else {
         determine_real_root(&boot_root, &block_candidates)
     };
-    let (rootfs, root_source, root_fstype) =
-        match pivot {
-            Some((fs, source, fstype)) => {
-                warn!("[boot] create_root_fs: pivot onto {} ({})", source, fstype);
-                (MountFS::new(fs), source, fstype)
-            }
-            None => {
-                warn!("[boot] create_root_fs: keep boot medium as /");
-                (boot_mountfs, String::from("rootfs"), "rootfs")
-            }
-        };
+    let (rootfs, root_source, root_fstype) = match pivot {
+        Some((fs, source, fstype)) => {
+            warn!("[boot] create_root_fs: pivot onto {} ({})", source, fstype);
+            (MountFS::new(fs), source, fstype)
+        }
+        None => {
+            warn!("[boot] create_root_fs: keep boot medium as /");
+            (boot_mountfs, String::from("rootfs"), "rootfs")
+        }
+    };
     warn!("[boot] create_root_fs: root inode");
     let root = rootfs.mountpoint_root_inode();
     reset_mount_table();

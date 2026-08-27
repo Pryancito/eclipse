@@ -425,10 +425,7 @@ impl PcmDev {
         let _ = Self::set_interval(&mut iv[PAR_PERIOD_BYTES - 8], period as u32 * 4);
         let _ = Self::set_interval(&mut iv[PAR_BUFFER_SIZE - 8], buffer as u32);
         let _ = Self::set_interval(&mut iv[PAR_BUFFER_BYTES - 8], buffer as u32 * 4);
-        let _ = Self::set_interval(
-            &mut iv[PAR_PERIODS - 8],
-            (buffer / period).max(1) as u32,
-        );
+        let _ = Self::set_interval(&mut iv[PAR_PERIODS - 8], (buffer / period).max(1) as u32);
         let pt = (period * 1_000_000 / actual_rate as u64) as u32;
         let _ = Self::clamp_interval(&mut iv[PAR_PERIOD_TIME - 8], pt, pt + 1, false);
         let bt = (buffer * 1_000_000 / actual_rate as u64) as u32;
@@ -501,7 +498,13 @@ impl PcmDev {
     }
 
     fn fill_status(&self, s: &mut SndPcmStatus) {
-        unsafe { core::ptr::write_bytes(s as *mut SndPcmStatus as *mut u8, 0, core::mem::size_of::<SndPcmStatus>()) };
+        unsafe {
+            core::ptr::write_bytes(
+                s as *mut SndPcmStatus as *mut u8,
+                0,
+                core::mem::size_of::<SndPcmStatus>(),
+            )
+        };
         let st = self.st.lock();
         s.state = st.state;
         s.appl_ptr = st.appl_ptr;
@@ -552,7 +555,11 @@ impl INode for PcmDev {
                 // INFO
                 let info = unsafe { &mut *(data as *mut SndPcmInfo) };
                 unsafe {
-                    core::ptr::write_bytes(info as *mut SndPcmInfo as *mut u8, 0, core::mem::size_of::<SndPcmInfo>())
+                    core::ptr::write_bytes(
+                        info as *mut SndPcmInfo as *mut u8,
+                        0,
+                        core::mem::size_of::<SndPcmInfo>(),
+                    )
                 };
                 info.device = 0;
                 info.subdevice = 0;
@@ -667,8 +674,8 @@ impl INode for PcmDev {
                 Ok(0)
             }
             0x44 => self.drain().map(|_| 0),
-            0x47 => Ok(0),                       // RESUME
-            0x48 => Ok(0),                       // XRUN
+            0x47 => Ok(0), // RESUME
+            0x48 => Ok(0), // XRUN
             0x50 => {
                 // WRITEI_FRAMES
                 let xfer = unsafe { &mut *(data as *mut SndXferI) };
@@ -760,7 +767,11 @@ impl INode for CtlDev {
                 // CARD_INFO
                 let info = unsafe { &mut *(data as *mut SndCtlCardInfo) };
                 unsafe {
-                    core::ptr::write_bytes(info as *mut SndCtlCardInfo as *mut u8, 0, core::mem::size_of::<SndCtlCardInfo>())
+                    core::ptr::write_bytes(
+                        info as *mut SndCtlCardInfo as *mut u8,
+                        0,
+                        core::mem::size_of::<SndCtlCardInfo>(),
+                    )
                 };
                 info.card = self.card as i32;
                 fill_cstr(&mut info.id, &alloc::format!("EclipseHDA{}", self.card));
@@ -797,7 +808,11 @@ impl INode for CtlDev {
                 let device = info.device;
                 let subdevice = info.subdevice;
                 unsafe {
-                    core::ptr::write_bytes(info as *mut SndPcmInfo as *mut u8, 0, core::mem::size_of::<SndPcmInfo>())
+                    core::ptr::write_bytes(
+                        info as *mut SndPcmInfo as *mut u8,
+                        0,
+                        core::mem::size_of::<SndPcmInfo>(),
+                    )
                 };
                 info.device = device;
                 info.subdevice = subdevice;

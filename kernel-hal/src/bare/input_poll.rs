@@ -1,6 +1,10 @@
 //! Input device poll hook for I/O wait loops and stdin read().
 
-#[cfg(all(target_arch = "x86_64", not(feature = "no-pci"), feature = "xhci-usb-hid"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    not(feature = "no-pci"),
+    feature = "xhci-usb-hid"
+))]
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Minimum spacing between actual xHCI HID polls driven from an I/O-wait loop.
@@ -18,13 +22,21 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// io-wait poll rate to a 1 kHz ceiling keeps input latency imperceptible while
 /// cutting the MMIO/VM-exit storm by ~30x. The periodic 125 Hz timer poll (see
 /// `bare/timer.rs`) still runs independently as the idle-path backstop.
-#[cfg(all(target_arch = "x86_64", not(feature = "no-pci"), feature = "xhci-usb-hid"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    not(feature = "no-pci"),
+    feature = "xhci-usb-hid"
+))]
 const IOWAIT_HID_POLL_INTERVAL_NS: u64 = 1_000_000; // 1 ms == 1 kHz
 
 /// Monotonic time (ns) of the last io-wait-driven xHCI poll, shared across CPUs
 /// so the ceiling bounds the *aggregate* rate no matter how many wait loops call
 /// in. `0` means "never polled", which always lets the first call through.
-#[cfg(all(target_arch = "x86_64", not(feature = "no-pci"), feature = "xhci-usb-hid"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    not(feature = "no-pci"),
+    feature = "xhci-usb-hid"
+))]
 static IOWAIT_HID_LAST_NS: AtomicU64 = AtomicU64::new(0);
 
 pub fn poll_input_devices() {

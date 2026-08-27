@@ -291,10 +291,7 @@ fn dma_quarantine_dealloc(paddr: crate::PhysAddr, pages: usize) {
     // Poison the first word of every page of the block we are now quarantining.
     unsafe {
         for i in 0..pages {
-            core::ptr::write_volatile(
-                phys_to_va(paddr + i * crate::PAGE_SIZE) as *mut u64,
-                POISON,
-            );
+            core::ptr::write_volatile(phys_to_va(paddr + i * crate::PAGE_SIZE) as *mut u64, POISON);
         }
     }
     // Enqueue this block; the block that was in this slot `SLOTS` frees ago is

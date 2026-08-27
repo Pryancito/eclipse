@@ -507,9 +507,7 @@ pub fn remote_flush_tlb_aspace(vaddr: Option<usize>, aspace: Option<usize>) {
         // Self-pump: if a peer asked US to flush, do it now (non-allocating) so
         // it isn't blocked on our ack while we block on its.
         let q = ipi_queue(me);
-        if q.chead() < q.ptail()
-            || IPI_QUEUE_OVERFLOW.load(Ordering::Relaxed) & (1u64 << me) != 0
-        {
+        if q.chead() < q.ptail() || IPI_QUEUE_OVERFLOW.load(Ordering::Relaxed) & (1u64 << me) != 0 {
             tlb_shootdown_ack();
         }
         spins += 1;

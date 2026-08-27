@@ -200,7 +200,10 @@ fn monotonic_tracks_the_tsc() {
     let r = unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) };
     let after = rdtsc();
 
-    assert_eq!(r, 0, "CLOCK_MONOTONIC deberia responderse en espacio de usuario");
+    assert_eq!(
+        r, 0,
+        "CLOCK_MONOTONIC deberia responderse en espacio de usuario"
+    );
     let ns = ts.as_ns();
     assert!(
         ns >= before as u128 && ns <= after as u128,
@@ -209,7 +212,11 @@ fn monotonic_tracks_the_tsc() {
         before,
         after
     );
-    assert!(ts.tv_nsec >= 0 && ts.tv_nsec < 1_000_000_000, "tv_nsec fuera de rango: {:?}", ts);
+    assert!(
+        ts.tv_nsec >= 0 && ts.tv_nsec < 1_000_000_000,
+        "tv_nsec fuera de rango: {:?}",
+        ts
+    );
 }
 
 #[test]
@@ -315,11 +322,25 @@ fn unserved_paths_fall_back_instead_of_failing() {
     let off = Mapping::new(linux_vdso::VdsoData::default());
     let clock_gettime: ClockGettime = off.sym("__vdso_clock_gettime");
     for clk in [CLOCK_REALTIME, CLOCK_MONOTONIC] {
-        let mut ts = Timespec { tv_sec: -1, tv_nsec: -1 };
+        let mut ts = Timespec {
+            tv_sec: -1,
+            tv_nsec: -1,
+        };
         let r = unsafe { clock_gettime(clk, &mut ts) };
-        assert_eq!(r, ENOSYS, "con enabled=0 el reloj {} debe delegar al kernel", clk);
+        assert_eq!(
+            r, ENOSYS,
+            "con enabled=0 el reloj {} debe delegar al kernel",
+            clk
+        );
         assert_ne!(r, EINVAL, "-EINVAL romperia el reloj para todo el proceso");
-        assert_eq!(ts, Timespec { tv_sec: -1, tv_nsec: -1 }, "no debe tocar el timespec");
+        assert_eq!(
+            ts,
+            Timespec {
+                tv_sec: -1,
+                tv_nsec: -1
+            },
+            "no debe tocar el timespec"
+        );
     }
 
     // Enabled, but a clock this image does not implement.
@@ -342,16 +363,29 @@ fn gettimeofday_and_time_agree_with_clock_gettime() {
 
     let mut ts = Timespec::default();
     let mut tv = Timeval::default();
-    let mut tz = Timezone { tz_minuteswest: 7, tz_dsttime: 7 };
+    let mut tz = Timezone {
+        tz_minuteswest: 7,
+        tz_dsttime: 7,
+    };
     assert_eq!(unsafe { clock_gettime(CLOCK_REALTIME, &mut ts) }, 0);
     assert_eq!(unsafe { gettimeofday(&mut tv, &mut tz) }, 0);
     let mut t_out = 0i64;
     let t = unsafe { time(&mut t_out) };
 
-    assert_eq!(tz.tz_minuteswest, 0, "gettimeofday debe rellenar la zona horaria");
+    assert_eq!(
+        tz.tz_minuteswest, 0,
+        "gettimeofday debe rellenar la zona horaria"
+    );
     assert_eq!(tz.tz_dsttime, 0);
-    assert_eq!(tv.tv_sec, ts.tv_sec, "gettimeofday y clock_gettime discrepan");
-    assert!(tv.tv_usec >= 0 && tv.tv_usec < 1_000_000, "tv_usec fuera de rango: {}", tv.tv_usec);
+    assert_eq!(
+        tv.tv_sec, ts.tv_sec,
+        "gettimeofday y clock_gettime discrepan"
+    );
+    assert!(
+        tv.tv_usec >= 0 && tv.tv_usec < 1_000_000,
+        "tv_usec fuera de rango: {}",
+        tv.tv_usec
+    );
     assert_eq!(t, ts.tv_sec, "time() y clock_gettime discrepan");
     assert_eq!(t_out, t, "time() no escribio su argumento");
 

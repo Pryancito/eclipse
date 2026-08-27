@@ -37,19 +37,19 @@ pub use executor::sched_stats;
 pub use executor::{
     alloc_overlaps_live_stack, hard_guard_executor_counts, set_stack_guard_hooks,
     set_stack_quarantine_enabled, set_stack_quarantine_hooks, spine_gen, spine_owner_of,
-    spine_snapshot, spine_verify, stack_guard_hooks_registered, SpineSmash, GUARD_SIZE,
-    STACK_SIZE, TOP_GUARD_SIZE,
+    spine_snapshot, spine_verify, stack_guard_hooks_registered, SpineSmash, GUARD_SIZE, STACK_SIZE,
+    TOP_GUARD_SIZE,
 };
 pub use runtime::{
-    abandon_current_executor, abandon_current_task, abandon_executor_for_sp, attribute_fault_stack_ptrs, check_current_executor_canary,
-    check_current_executor_stack_proximity, current_stack_top_looks_null,
-    current_executor_abandonable, current_task_abandonable, fault_sp_abandonable, handle_timeout,
+    abandon_current_executor, abandon_current_task, abandon_executor_for_sp,
+    attribute_fault_stack_ptrs, check_current_executor_canary,
+    check_current_executor_stack_proximity, current_executor_abandonable,
+    current_stack_top_looks_null, current_task_abandonable, fault_sp_abandonable, handle_timeout,
     heap_smash_suspected, irq_on_idle_executor, irq_should_skip_dyn_dispatch,
     irq_should_skip_heavy_work, note_heap_smash_suspected, run_until_idle, runnable_task_count,
-    sched_yield,
-    set_idle_callback, set_resched_ipi_sender, set_wakeup_preempt, spawn, spawn_with_affinity,
-    take_need_resched, wakeup_preempt_enabled, wakeup_preempt_stats, warm_runtimes,
-    FaultStackAttr, StackAttrHit, StackPtrRegion,
+    sched_yield, set_idle_callback, set_resched_ipi_sender, set_wakeup_preempt, spawn,
+    spawn_with_affinity, take_need_resched, wakeup_preempt_enabled, wakeup_preempt_stats,
+    warm_runtimes, FaultStackAttr, StackAttrHit, StackPtrRegion,
 };
 
 #[macro_export]

@@ -551,10 +551,17 @@ pub struct HwCursorInit {
 }
 
 extern "C" {
-    fn eclipse_rm_hwcursor_init(gpuInstance: NvU32, head: NvU32, out: *mut HwCursorInit)
-        -> NV_STATUS;
-    fn eclipse_rm_hwcursor_image(gpuInstance: NvU32, argb: *const u32, w: NvU32, h: NvU32)
-        -> NV_STATUS;
+    fn eclipse_rm_hwcursor_init(
+        gpuInstance: NvU32,
+        head: NvU32,
+        out: *mut HwCursorInit,
+    ) -> NV_STATUS;
+    fn eclipse_rm_hwcursor_image(
+        gpuInstance: NvU32,
+        argb: *const u32,
+        w: NvU32,
+        h: NvU32,
+    ) -> NV_STATUS;
     fn eclipse_rm_hwcursor_move(x: i32, y: i32) -> NV_STATUS;
     fn eclipse_rm_hwcursor_hide(gpuInstance: NvU32) -> NV_STATUS;
 }
@@ -1092,7 +1099,8 @@ pub fn hdmi_audio(
     hdmi_mask: u32,
 ) -> Result<HdmiAudioOut, NV_STATUS> {
     let mut out = HdmiAudioOut::default();
-    let status = unsafe { eclipse_rm_hdmi_audio(device_instance, display_mask, hdmi_mask, &mut out) };
+    let status =
+        unsafe { eclipse_rm_hdmi_audio(device_instance, display_mask, hdmi_mask, &mut out) };
     if status == NV_OK {
         Ok(out)
     } else {
@@ -1384,8 +1392,7 @@ pub fn gem_alloc(device_instance: u32, size: u64, sysmem: bool) -> Result<GemAll
         alloc_status: 0xFFFF_FFFF,
         h_memory: 0,
     };
-    let status =
-        unsafe { eclipse_rm_gem_alloc(device_instance, size, sysmem as NvU32, &mut out) };
+    let status = unsafe { eclipse_rm_gem_alloc(device_instance, size, sysmem as NvU32, &mut out) };
     if status == NV_OK {
         Ok(out)
     } else {
@@ -1480,7 +1487,11 @@ pub struct GemMapCpu {
 }
 
 extern "C" {
-    fn eclipse_rm_gem_map_cpu(device_instance: NvU32, h_memory: NvU32, out: *mut GemMapCpu) -> NV_STATUS;
+    fn eclipse_rm_gem_map_cpu(
+        device_instance: NvU32,
+        h_memory: NvU32,
+        out: *mut GemMapCpu,
+    ) -> NV_STATUS;
 }
 
 /// `NV_ADDRESS_SPACE` values (open-gpu-kernel-modules
@@ -1490,7 +1501,6 @@ extern "C" {
 pub const ADDR_UNKNOWN: u32 = 0;
 pub const ADDR_SYSMEM: u32 = 1;
 pub const ADDR_FBMEM: u32 = 2;
-
 
 /// Resolves `h_memory` (from [`gem_alloc`]) to the physical address a CPU can
 /// reach it at -- through the GPU's BAR1 aperture for VRAM, or the plain host
@@ -1537,7 +1547,12 @@ extern "C" {
         bo_offset: u64,
         out: *mut VmBind,
     ) -> NV_STATUS;
-    fn eclipse_rm_vm_bind_unmap(device_instance: NvU32, h_virt: NvU32, size: u64, va: u64) -> NV_STATUS;
+    fn eclipse_rm_vm_bind_unmap(
+        device_instance: NvU32,
+        h_virt: NvU32,
+        size: u64,
+        va: u64,
+    ) -> NV_STATUS;
 }
 
 /// Maps `h_memory` (from [`gem_alloc`]) into the VAS of context `ctx_idx` at
@@ -1560,7 +1575,15 @@ pub fn vm_bind_map(
         actual_va: 0,
     };
     let status = unsafe {
-        eclipse_rm_vm_bind_map(device_instance, ctx_idx, h_memory, size, requested_va, bo_offset, &mut out)
+        eclipse_rm_vm_bind_map(
+            device_instance,
+            ctx_idx,
+            h_memory,
+            size,
+            requested_va,
+            bo_offset,
+            &mut out,
+        )
     };
     if status == NV_OK {
         Ok(out)
@@ -1621,7 +1644,9 @@ pub fn exec_submit(
         runlist_id: 0,
         gp_put_after: 0,
     };
-    let status = unsafe { eclipse_rm_exec_submit(device_instance, ctx_idx, push_va, push_len_bytes, &mut out) };
+    let status = unsafe {
+        eclipse_rm_exec_submit(device_instance, ctx_idx, push_va, push_len_bytes, &mut out)
+    };
     if status == NV_OK {
         Ok(out)
     } else {

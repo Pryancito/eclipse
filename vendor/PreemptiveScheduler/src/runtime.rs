@@ -244,7 +244,11 @@ pub(crate) fn request_resched(owner: u8) {
 /// IPI time and cost nothing to wake — else the lowest allowed, whose
 /// `request_resched` publication coalesces with any outstanding request.
 pub(crate) fn kick_for_affinity(mask: u64, skip: usize) {
-    let mask = if skip < 64 { mask & !(1u64 << skip) } else { mask };
+    let mask = if skip < 64 {
+        mask & !(1u64 << skip)
+    } else {
+        mask
+    };
     if mask == 0 {
         return;
     }
@@ -516,7 +520,9 @@ struct StealScratch(core::cell::UnsafeCell<[(usize, usize); MAX_CORE_NUM]>);
 unsafe impl Sync for StealScratch {}
 
 static STEAL_CANDIDATES: [StealScratch; MAX_CORE_NUM] = [const {
-    StealScratch(core::cell::UnsafeCell::new([(0usize, 0usize); MAX_CORE_NUM]))
+    StealScratch(core::cell::UnsafeCell::new(
+        [(0usize, 0usize); MAX_CORE_NUM],
+    ))
 }; MAX_CORE_NUM];
 
 // obtain a task from other cpu.
@@ -1001,7 +1007,7 @@ pub fn check_current_executor_stack_proximity(rsp: usize) {
     /// heap clobber. Raised 32→128 KiB after labwc/lunarbar still smashed
     /// past the old mark between 4 ms timer samples (`[rsp0]=0x13446`).
     const STACK_LOW_WATER_MARK: usize = 128 * 1024; // 128 KiB
-    // Keep in sync with `executor::{STACK_SIZE, GUARD_SIZE, TOP_GUARD_SIZE}`.
+                                                    // Keep in sync with `executor::{STACK_SIZE, GUARD_SIZE, TOP_GUARD_SIZE}`.
     use crate::{GUARD_SIZE, STACK_SIZE, TOP_GUARD_SIZE};
     let cpu = crate::arch::cpu_id() as usize;
     if cpu >= MAX_CORE_NUM {
@@ -1339,8 +1345,7 @@ pub fn current_stack_top_looks_null() -> bool {
         };
         use crate::STACK_SIZE;
         let on_stack = |base: usize| -> bool {
-            classify_stack_ptr(rsp, base).is_some()
-                || (rsp > base && rsp < base + STACK_SIZE)
+            classify_stack_ptr(rsp, base).is_some() || (rsp > base && rsp < base + STACK_SIZE)
         };
         if on_stack(rt.strong_executor.stack_base()) {
             return true;
@@ -1692,9 +1697,7 @@ pub unsafe fn abandon_current_task() -> bool {
     let Some(executor) = runtime.current_executor.clone() else {
         return false;
     };
-    if !executor.is_polling()
-        || !executor.stack_contains(current_sp())
-        || !executor.canary_intact()
+    if !executor.is_polling() || !executor.stack_contains(current_sp()) || !executor.canary_intact()
     {
         return false;
     }

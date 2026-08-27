@@ -2647,12 +2647,16 @@ impl NvidiaGpu {
     fn rm_enable_hdmi_audio_once(instance: u32, d: &nvidia_rm_sys::rm_init::GrEdid) {
         use core::sync::atomic::{AtomicU32, Ordering};
         static ATTEMPTED: AtomicU32 = AtomicU32::new(0);
-        if instance >= 32 || ATTEMPTED.fetch_or(1 << instance, Ordering::AcqRel) & (1 << instance) != 0
+        if instance >= 32
+            || ATTEMPTED.fetch_or(1 << instance, Ordering::AcqRel) & (1 << instance) != 0
         {
             return;
         }
         if d.connected_mask == 0 {
-            log::info!("[hdmi-audio] gpu{}: no connected outputs — audio not enabled", instance);
+            log::info!(
+                "[hdmi-audio] gpu{}: no connected outputs — audio not enabled",
+                instance
+            );
             return;
         }
         // TMDS/HDMI outputs get the GCP un-mute on top of the common path.
@@ -4206,8 +4210,7 @@ impl DrmScheme for NvidiaGpu {
                 "compute/P2P",
             )
         };
-        let elapsed_us =
-            unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(t0);
+        let elapsed_us = unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(t0);
         let narration = nvidia_rm_sys::os_interface::capture_take();
         if st == 0 {
             if !CE_PRESENT_LOGGED.swap(true, Ordering::Relaxed) {
@@ -6456,7 +6459,10 @@ impl DrmScheme for NvidiaGpu {
             m.gem_handle == handle
         });
         let status = match *self.rm_device_instance.lock() {
-            Some(device_instance) => Some(nvidia_rm_sys::rm_init::gem_free(device_instance, obj.h_memory)),
+            Some(device_instance) => Some(nvidia_rm_sys::rm_init::gem_free(
+                device_instance,
+                obj.h_memory,
+            )),
             None => None,
         };
         log::info!(
@@ -6865,8 +6871,8 @@ impl DrmScheme for NvidiaGpu {
         // before CHANNEL_ALLOC.
         let device_instance = *self.rm_device_instance.lock();
         // 1. Drop ONLY this process's VM_BIND mappings (owner-tagged).
-        let dropped_maps =
-            self.drain_vm_mappings(&alloc::format!("process exit pid={}", pid), |m| {
+        let dropped_maps = self
+            .drain_vm_mappings(&alloc::format!("process exit pid={}", pid), |m| {
                 m.owner_pid == pid
             });
         // 2. Release this process's GEM objects, RESPECTING the PRIME share
@@ -7013,7 +7019,9 @@ impl DrmScheme for NvidiaGpu {
                 super::nouveau_uapi::ctx_clear_wedged(ctx_idx);
                 log::info!(
                     "[nouveau-uapi] process exit pid={}: freed CTX {} -> status={:#x}",
-                    pid, ctx_idx, status
+                    pid,
+                    ctx_idx,
+                    status
                 );
             }
         }
@@ -7448,7 +7456,8 @@ impl NvidiaGpu {
         // through klog when the submit fails -- klog has no level filter, so
         // one boot at the hardware's default LOG shows WHY, not just that.
         nvidia_rm_sys::os_interface::capture_begin();
-        let rm_result = nvidia_rm_sys::rm_init::exec_submit(device_instance, ctx_idx, push.va, push.va_len);
+        let rm_result =
+            nvidia_rm_sys::rm_init::exec_submit(device_instance, ctx_idx, push.va, push.va_len);
         let rm_narration = nvidia_rm_sys::os_interface::capture_take();
         let replay_rm = |narration: Option<alloc::string::String>| {
             if let Some(text) = narration {
@@ -7470,7 +7479,12 @@ impl NvidiaGpu {
             Ok(r) => {
                 let sig = nv::exec_failure_sig(
                     0x01,
-                    &[r.lookup_status, r.map_status, r.token_status, r.submit_status],
+                    &[
+                        r.lookup_status,
+                        r.map_status,
+                        r.token_status,
+                        r.submit_status,
+                    ],
                 );
                 if nv::exec_failure_changed(sig) {
                     replay_rm(rm_narration);
@@ -7557,7 +7571,8 @@ impl NvidiaGpu {
                 return;
             }
         };
-        let bind = match rm::vm_bind_map(device_instance, 0, alloc.h_memory, TEST_SIZE, TEST_VA, 0) {
+        let bind = match rm::vm_bind_map(device_instance, 0, alloc.h_memory, TEST_SIZE, TEST_VA, 0)
+        {
             Ok(b) if b.map_status == 0 => b,
             _ => {
                 crate::klog_warn!(
@@ -7628,9 +7643,10 @@ impl NvidiaGpu {
                 500,
             );
             match stage_b {
-                Ok(r) if r.submit_status == 0
-                    && r.fence_submit_status == 0
-                    && r.fence_wait_status == 0 =>
+                Ok(r)
+                    if r.submit_status == 0
+                        && r.fence_submit_status == 0
+                        && r.fence_wait_status == 0 =>
                 {
                     crate::klog_warn!(
                         "[nouveau-uapi] SELFTEST stage B PASS: the same push executed from the channel's RM-mapped buffer ({:#x}) -- the channel is fine and OUR VM_BIND PTEs are NOT GPU-visible (the bug is in vm_bind_map's Map)",
@@ -7714,7 +7730,16 @@ impl NvidiaGpu {
         for t in map.iter() {
             let _ = core::fmt::Write::write_fmt(
                 &mut s,
-                format_args!(" pid={}->ctx{}{}", t.0, t.1, if nv::ctx_is_wedged(t.1) { "(WEDGED)" } else { "" }),
+                format_args!(
+                    " pid={}->ctx{}{}",
+                    t.0,
+                    t.1,
+                    if nv::ctx_is_wedged(t.1) {
+                        "(WEDGED)"
+                    } else {
+                        ""
+                    }
+                ),
             );
         }
         s
@@ -7846,9 +7871,17 @@ impl NvidiaGpu {
             "ctx={} pid={} PRIME {} (NV_STATUS={:#x}){}",
             ctx_idx,
             owner_pid,
-            if prime == 0 { "OK -- golden context loaded" } else { "TIMEOUT/FAIL -- first draw will cold-load" },
+            if prime == 0 {
+                "OK -- golden context loaded"
+            } else {
+                "TIMEOUT/FAIL -- first draw will cold-load"
+            },
             prime,
-            if prime == 0 { "" } else { " <== prime failure predicts DEVICE_LOST on first draw" }
+            if prime == 0 {
+                ""
+            } else {
+                " <== prime failure predicts DEVICE_LOST on first draw"
+            }
         ));
         (ctx_idx, h_vas, h_notifier)
     }
@@ -7939,11 +7972,11 @@ impl NvidiaGpu {
         // these, so over-reporting merely over-allocates, while
         // under-reporting leaves real SMs without scratch and faults the GPU.
         let (gpc, tpc) = match self.nouveau_arch() {
-            NvidiaArchitecture::Turing => (6u64, 36u64),      // TU102
-            NvidiaArchitecture::Ampere => (7, 42),            // GA102
-            NvidiaArchitecture::AdaLovelace => (12, 72),      // AD102
-            NvidiaArchitecture::Hopper => (8, 72),            // GH100
-            NvidiaArchitecture::Blackwell => (12, 96),        // GB202
+            NvidiaArchitecture::Turing => (6u64, 36u64), // TU102
+            NvidiaArchitecture::Ampere => (7, 42),       // GA102
+            NvidiaArchitecture::AdaLovelace => (12, 72), // AD102
+            NvidiaArchitecture::Hopper => (8, 72),       // GH100
+            NvidiaArchitecture::Blackwell => (12, 96),   // GB202
             NvidiaArchitecture::Unknown => (8, 64),
         };
         log::warn!(
@@ -8250,7 +8283,8 @@ impl NvidiaGpu {
                 if body_len < SB {
                     return Err(nv::EINVAL);
                 }
-                let mut sclass = unsafe { core::ptr::read_unaligned(body as *const nv::NvifIoctlSclassV0) };
+                let mut sclass =
+                    unsafe { core::ptr::read_unaligned(body as *const nv::NvifIoctlSclassV0) };
                 // Class enumeration is per CHANNEL: mesa sends route=0xff with
                 // token=<channel> straight after CHANNEL_ALLOC, mirroring real
                 // nouveau where these objects are children of the channel.
@@ -8344,8 +8378,7 @@ impl NvidiaGpu {
                 // client's class object (see `class_object_remove`).
                 if let Some(h_object) = nv::class_object_remove(hdr.object, owner_pid) {
                     if let Some(device_instance) = *self.rm_device_instance.lock() {
-                        let status =
-                            nvidia_rm_sys::rm_init::class_free(device_instance, h_object);
+                        let status = nvidia_rm_sys::rm_init::class_free(device_instance, h_object);
                         if status != 0 {
                             crate::klog_warn!(
                                 "[nouveau-uapi] NVIF DEL: class_free({:#010x}) -> NV_STATUS={:#x}",
@@ -8398,7 +8431,12 @@ impl NvidiaGpu {
         res
     }
 
-    fn nouveau_ioctl_dispatch(&self, request: u32, arg: usize, owner_pid: u64) -> Result<usize, i32> {
+    fn nouveau_ioctl_dispatch(
+        &self,
+        request: u32,
+        arg: usize,
+        owner_pid: u64,
+    ) -> Result<usize, i32> {
         use super::nouveau_uapi as nv;
         if !nv::enabled() {
             return Err(nv::ENOSYS);
@@ -8531,7 +8569,9 @@ impl NvidiaGpu {
                     return Err(nv::EBUSY);
                 }
                 // Lowest free id.
-                let new_id = (0i32..).find(|i| !chan.iter().any(|c| c.id == *i)).unwrap_or(0);
+                let new_id = (0i32..)
+                    .find(|i| !chan.iter().any(|c| c.id == *i))
+                    .unwrap_or(0);
                 // Only ONE channel can be RM-backed: step16+step17 build a
                 // single GR channel on the hardware. A second concurrent
                 // client (typically `vulkaninfo` run beside a compositor that
@@ -8592,8 +8632,7 @@ impl NvidiaGpu {
                     // lock. The id is recomputed after re-locking, since another
                     // CHANNEL_ALLOC may have raced while the lock was out.
                     drop(chan);
-                    let (ctx_idx, h_vas_out, notif_out) =
-                        self.ensure_ctx_for_pid(owner_pid, false);
+                    let (ctx_idx, h_vas_out, notif_out) = self.ensure_ctx_for_pid(owner_pid, false);
                     let ok = ctx_idx != 0;
                     let mut chan = self.nouveau_channels.lock();
                     if chan.len() >= nv::MAX_CHANNELS {
@@ -8603,7 +8642,9 @@ impl NvidiaGpu {
                         );
                         return Err(nv::EBUSY);
                     }
-                    let new_id = (0i32..).find(|i| !chan.iter().any(|c| c.id == *i)).unwrap_or(0);
+                    let new_id = (0i32..)
+                        .find(|i| !chan.iter().any(|c| c.id == *i))
+                        .unwrap_or(0);
                     chan.push(nv::NouveauChannelState {
                         id: new_id,
                         h_vas: h_vas_out,
@@ -8970,14 +9011,22 @@ impl NvidiaGpu {
                             .map(|s| {
                                 let timeline =
                                     s.flags & nv::SYNC_TYPE_MASK == nv::SYNC_TIMELINE_SYNCOBJ;
-                                if timeline { s.timeline_value } else { 1 }
+                                if timeline {
+                                    s.timeline_value
+                                } else {
+                                    1
+                                }
                             })
                             .collect();
                         const WAIT_TIMEOUT_US: u64 = 1_000_000; // 1 s, like the real path
                         let deadline_us =
                             unsafe { crate::bus::drivers_timer_now_as_micros() } + WAIT_TIMEOUT_US;
-                        match crate::scheme::syncobj::wait(&handles, Some(&points), true, deadline_us)
-                        {
+                        match crate::scheme::syncobj::wait(
+                            &handles,
+                            Some(&points),
+                            true,
+                            deadline_us,
+                        ) {
                             crate::scheme::syncobj::WaitOutcome::Signaled { .. } => {}
                             crate::scheme::syncobj::WaitOutcome::Timeout => {
                                 crate::klog_warn!(
@@ -9031,14 +9080,13 @@ impl NvidiaGpu {
                     // `drm_nouveau_channel_alloc.channel` is __s32 -- that
                     // asymmetry is in nouveau_drm.h itself. Ids we hand out are
                     // never negative, so compare in the unsigned domain.
-                    let mine = chans
-                        .iter()
-                        .find(|c| c.id >= 0 && c.id as u32 == req.channel && c.owner_pid == owner_pid);
+                    let mine = chans.iter().find(|c| {
+                        c.id >= 0 && c.id as u32 == req.channel && c.owner_pid == owner_pid
+                    });
                     match mine {
                         Some(c) if c.rm_backed => {}
                         Some(_) => {
-                            let rm_owner =
-                                chans.iter().find(|c| c.rm_backed).map(|c| c.owner_pid);
+                            let rm_owner = chans.iter().find(|c| c.rm_backed).map(|c| c.owner_pid);
                             drop(chans);
                             crate::klog_warn!(
                                 "[nouveau-uapi] EXEC: channel={} belongs to pid={} but is a DISCOVERY channel (no GR channel/GPFIFO behind it); the RM-backed channel is held by pid={:?}",
@@ -9108,10 +9156,7 @@ impl NvidiaGpu {
                                     let w = unsafe {
                                         core::ptr::read_volatile((base + i * 4) as *const u32)
                                     };
-                                    let _ = core::fmt::write(
-                                        &mut line,
-                                        format_args!(" {:08x}", w),
-                                    );
+                                    let _ = core::fmt::write(&mut line, format_args!(" {:08x}", w));
                                 }
                                 crate::klog_info!(
                                     "[nouveau-uapi] first EXEC push: va={:#x} len={}B, first {} dwords:{}",
@@ -9161,8 +9206,13 @@ impl NvidiaGpu {
                     let points: Vec<u64> = waits
                         .iter()
                         .map(|s| {
-                            let timeline = s.flags & nv::SYNC_TYPE_MASK == nv::SYNC_TIMELINE_SYNCOBJ;
-                            if timeline { s.timeline_value } else { 1 }
+                            let timeline =
+                                s.flags & nv::SYNC_TYPE_MASK == nv::SYNC_TIMELINE_SYNCOBJ;
+                            if timeline {
+                                s.timeline_value
+                            } else {
+                                1
+                            }
                         })
                         .collect();
                     const WAIT_TIMEOUT_US: u64 = 1_000_000; // 1 s
@@ -9347,7 +9397,11 @@ impl NvidiaGpu {
                     }
                 };
                 match signaled {
-                    Ok(r) if r.submit_status == 0 && r.fence_submit_status == 0 && r.fence_wait_status == 0 => {
+                    Ok(r)
+                        if r.submit_status == 0
+                            && r.fence_submit_status == 0
+                            && r.fence_wait_status == 0 =>
+                    {
                         let sigs = unsafe {
                             core::slice::from_raw_parts(
                                 req.sig_ptr as *const nv::DrmNouveauSync,
@@ -9355,7 +9409,8 @@ impl NvidiaGpu {
                             )
                         };
                         for sig in sigs {
-                            let timeline = sig.flags & nv::SYNC_TYPE_MASK == nv::SYNC_TIMELINE_SYNCOBJ;
+                            let timeline =
+                                sig.flags & nv::SYNC_TYPE_MASK == nv::SYNC_TIMELINE_SYNCOBJ;
                             let target = if timeline { sig.timeline_value } else { 1 };
                             if !crate::scheme::syncobj::timeline_signal(sig.handle, target) {
                                 crate::klog_warn!(
@@ -9508,12 +9563,15 @@ impl NvidiaGpu {
                                     // NvNotification (nvgputypes.h): u32 ts[2],
                                     // u32 info32, u16 info16, u16 status.
                                     let base = crate::bus::phys_to_virt(pa as usize);
-                                    let info32 =
-                                        unsafe { core::ptr::read_volatile((base + 8) as *const u32) };
-                                    let info16 =
-                                        unsafe { core::ptr::read_volatile((base + 12) as *const u16) };
-                                    let nstatus =
-                                        unsafe { core::ptr::read_volatile((base + 14) as *const u16) };
+                                    let info32 = unsafe {
+                                        core::ptr::read_volatile((base + 8) as *const u32)
+                                    };
+                                    let info16 = unsafe {
+                                        core::ptr::read_volatile((base + 12) as *const u16)
+                                    };
+                                    let nstatus = unsafe {
+                                        core::ptr::read_volatile((base + 14) as *const u16)
+                                    };
                                     // Names from the vendored nverror.h.
                                     let rc_name = match info32 {
                                         13 => "GR_ERROR_SW_NOTIFY (GR exception)",
@@ -9616,37 +9674,38 @@ impl NvidiaGpu {
                     crate::klog_warn!("[nouveau-uapi] GEM_NEW: GPU not attached to the RM yet");
                     return Err(nv::ENODEV);
                 };
-                let alloc = match nvidia_rm_sys::rm_init::gem_alloc(
-                    device_instance,
-                    req.info.size,
-                    sysmem,
-                ) {
-                    Ok(a) if a.alloc_status == 0 => a,
-                    Ok(a) => {
-                        crate::klog_warn!(
+                let alloc =
+                    match nvidia_rm_sys::rm_init::gem_alloc(device_instance, req.info.size, sysmem)
+                    {
+                        Ok(a) if a.alloc_status == 0 => a,
+                        Ok(a) => {
+                            crate::klog_warn!(
                             "[nouveau-uapi] GEM_NEW: RM alloc failed ({}), size={} status={:#x}",
                             if sysmem { "sysmem/GART" } else { "vidmem/VRAM" },
                             req.info.size,
                             a.alloc_status
                         );
-                        return Err(nv::ENOMEM);
-                    }
-                    Err(status) => {
-                        crate::klog_warn!(
-                            "[nouveau-uapi] GEM_NEW: gem_alloc ({}) failed, NV_STATUS={:#x}",
-                            if sysmem { "sysmem/GART" } else { "vidmem/VRAM" },
-                            status
-                        );
-                        return Err(nv::ENOMEM);
-                    }
-                };
+                            return Err(nv::ENOMEM);
+                        }
+                        Err(status) => {
+                            crate::klog_warn!(
+                                "[nouveau-uapi] GEM_NEW: gem_alloc ({}) failed, NV_STATUS={:#x}",
+                                if sysmem { "sysmem/GART" } else { "vidmem/VRAM" },
+                                status
+                            );
+                            return Err(nv::ENOMEM);
+                        }
+                    };
                 let handle = self.nouveau_gem_next_handle.fetch_add(1, Ordering::Relaxed);
                 // Real BAR1-relative CPU physical address for this
                 // allocation, if RM will give us one. Failure here doesn't
                 // fail GEM_NEW itself: the object is still valid for
                 // VM_BIND/EXEC, just not CPU-mmap-able, exactly like real
                 // nouveau leaves map_handle absent for some domains.
-                let phys_addr = match nvidia_rm_sys::rm_init::gem_map_cpu(device_instance, alloc.h_memory) {
+                let phys_addr = match nvidia_rm_sys::rm_init::gem_map_cpu(
+                    device_instance,
+                    alloc.h_memory,
+                ) {
                     // ADDR_FBMEM (2), not 0. `memdescGetAddressSpace` returns
                     // the aperture the object lives in, and VRAM is ADDR_FBMEM;
                     // 0 is ADDR_UNKNOWN. Requiring 0 here rejected EVERY valid
