@@ -10157,7 +10157,7 @@ impl PciDriver for NvidiaGpuDriverPci {
                 dev.loc.device,
             )?);
             gpu.set_msi_vector(_irq);
-            Ok(Device::Drm(gpu))
+            Ok(Device::DrmDisplay(gpu.clone(), gpu))
         } else {
             Err(DeviceError::NoResources)
         }

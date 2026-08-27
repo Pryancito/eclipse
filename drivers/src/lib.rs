@@ -105,6 +105,9 @@ pub enum Device {
     Uart(Arc<dyn scheme::UartScheme>),
     /// DRM device
     Drm(Arc<dyn scheme::DrmScheme>),
+    /// A device that acts as both a DRM device and a framebuffer display
+    /// (e.g. NvidiaGpu).  Registered into both the DRM and display lists.
+    DrmDisplay(Arc<dyn scheme::DrmScheme>, Arc<dyn scheme::DisplayScheme>),
     /// PCM audio output device
     Audio(Arc<dyn scheme::AudioScheme>),
 }
@@ -120,6 +123,7 @@ impl Device {
             Self::Net(d) => d.clone().upcast(),
             Self::Uart(d) => d.clone().upcast(),
             Self::Drm(d) => d.clone().upcast(),
+            Self::DrmDisplay(d, _) => d.clone().upcast(),
             Self::Audio(d) => d.clone().upcast(),
         }
     }
@@ -135,6 +139,7 @@ impl fmt::Debug for Device {
             Self::Net(d) => write!(f, "NetDevice({:?})", d.name()),
             Self::Uart(d) => write!(f, "UartDevice({:?})", d.name()),
             Self::Drm(d) => write!(f, "DrmDevice({:?})", d.name()),
+            Self::DrmDisplay(d, _) => write!(f, "DrmDisplayDevice({:?})", d.name()),
             Self::Audio(d) => write!(f, "AudioDevice({:?})", d.name()),
         }
     }
