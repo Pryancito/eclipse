@@ -1,15 +1,154 @@
 use alloc::sync::Arc;
+use core::ptr::NonNull;
 
 #[cfg(feature = "graphic")]
 use alloc::format;
 
+use acpi::{AcpiHandler, AcpiTables, PhysicalMapping};
+use spin::Mutex;
+use x86_64::instructions::port::Port;
 use zcore_drivers::irq::x86::Apic;
+use zcore_drivers::prelude::{IrqPolarity, IrqTriggerMode};
 use zcore_drivers::scheme::{IrqScheme, SchemeUpcast};
 use zcore_drivers::uart::{BufferedUart, Uart16550Pmio};
 use zcore_drivers::{Device, DeviceResult};
 
 use super::trap;
 use crate::drivers;
+
+const PAGE_SIZE: usize = 4096;
+const ACPI_PM1_PWRBTN: u16 = 1 << 8;
+
+#[derive(Clone)]
+struct AcpiMapHandler {
+    phys_to_virt: fn(usize) -> usize,
+}
+
+impl AcpiHandler for AcpiMapHandler {
+    unsafe fn map_physical_region<T>(
+        &self,
+        physical_address: usize,
+        size: usize,
+    ) -> PhysicalMapping<Self, T> {
+        let aligned_start = physical_address & !(PAGE_SIZE - 1);
+        let aligned_end = (physical_address + size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        PhysicalMapping::new(
+            physical_address,
+            NonNull::new_unchecked((self.phys_to_virt)(physical_address) as *mut T),
+            size,
+            aligned_end - aligned_start,
+            self.clone(),
+        )
+    }
+
+    fn unmap_physical_region<T>(_region: &PhysicalMapping<Self, T>) {}
+}
+
+#[derive(Clone, Copy)]
+struct AcpiPowerButton {
+    pm1a_status: u16,
+    pm1a_enable: u16,
+    pm1b_status: Option<u16>,
+    pm1b_enable: Option<u16>,
+}
+
+impl AcpiPowerButton {
+    fn from_fadt(fadt: &acpi::fadt::Fadt) -> Option<(usize, Self)> {
+        let sci = fadt.sci_interrupt as usize;
+        let event_len = fadt.pm1_event_length as u16;
+        let pm1a = fadt.pm1a_event_block as u16;
+        if sci == 0 || pm1a == 0 || event_len < 4 {
+            return None;
+        }
+        let pm1b = (fadt.pm1b_event_block != 0).then_some(fadt.pm1b_event_block as u16);
+        Some((
+            sci,
+            Self {
+                pm1a_status: pm1a,
+                pm1a_enable: pm1a + 2,
+                pm1b_status: pm1b,
+                pm1b_enable: pm1b.map(|base| base + 2),
+            },
+        ))
+    }
+
+    fn read(port: u16) -> u16 {
+        unsafe { Port::<u16>::new(port).read() }
+    }
+
+    fn clear(status_port: u16) {
+        unsafe { Port::<u16>::new(status_port).write(ACPI_PM1_PWRBTN) }
+    }
+
+    fn asserted_pair(status_port: u16, enable_port: u16) -> bool {
+        let status = Self::read(status_port);
+        let enabled = Self::read(enable_port);
+        (status & enabled & ACPI_PM1_PWRBTN) != 0
+    }
+
+    fn handle_irq(&self) -> bool {
+        let mut pressed = false;
+        if Self::asserted_pair(self.pm1a_status, self.pm1a_enable) {
+            Self::clear(self.pm1a_status);
+            pressed = true;
+        }
+        if let (Some(status), Some(enable)) = (self.pm1b_status, self.pm1b_enable) {
+            if Self::asserted_pair(status, enable) {
+                Self::clear(status);
+                pressed = true;
+            }
+        }
+        pressed
+    }
+}
+
+static ACPI_POWER_BUTTON: Mutex<Option<AcpiPowerButton>> = Mutex::new(None);
+
+fn acpi_power_button_irq() {
+    if ACPI_POWER_BUTTON
+        .lock()
+        .as_ref()
+        .is_some_and(|power| power.handle_irq())
+    {
+        crate::klog_warn!("[acpi] power button pressed; powering off");
+        crate::cpu::reset();
+    }
+}
+
+fn init_acpi_power_button(irq: &Arc<Apic>) {
+    let rsdp = super::special::pc_firmware_tables().0 as usize;
+    if rsdp == 0 {
+        return;
+    }
+    let tables = match unsafe { AcpiTables::from_rsdp(AcpiMapHandler { phys_to_virt: crate::mem::phys_to_virt }, rsdp) } {
+        Ok(t) => t,
+        Err(e) => {
+            crate::klog_warn!("[acpi] power button disabled: ACPI parse failed: {:?}", e);
+            return;
+        }
+    };
+    let fadt = match tables.find_table::<acpi::fadt::Fadt>() {
+        Ok(t) => t,
+        Err(e) => {
+            crate::klog_warn!("[acpi] power button disabled: no FADT: {:?}", e);
+            return;
+        }
+    };
+    let Some((sci, power)) = AcpiPowerButton::from_fadt(&fadt) else {
+        crate::klog_warn!("[acpi] power button disabled: SCI/PM1 event block unavailable");
+        return;
+    };
+    if irq
+        .configure(sci, IrqTriggerMode::Level, IrqPolarity::ActiveLow)
+        .and_then(|_| irq.register_handler(sci, Arc::new(acpi_power_button_irq)))
+        .and_then(|_| irq.unmask(sci))
+        .is_err()
+    {
+        crate::klog_warn!("[acpi] power button disabled: failed to route SCI {}", sci);
+        return;
+    }
+    *ACPI_POWER_BUTTON.lock() = Some(power);
+}
 
 pub(super) fn init_early() -> DeviceResult {
     let uart = Arc::new(Uart16550Pmio::new(0x3F8));
@@ -53,6 +192,7 @@ pub(super) fn init() -> DeviceResult {
     irq.register_device(trap::X86_ISA_IRQ_MOUSE, ps2_input.clone().upcast())?;
     irq.unmask(trap::X86_ISA_IRQ_MOUSE)?;
     drivers::add_device(Device::Input(ps2_input));
+    init_acpi_power_button(&irq);
 
     use x2apic::lapic::{TimerDivide, TimerMode};
 
