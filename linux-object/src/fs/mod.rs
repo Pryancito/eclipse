@@ -25,6 +25,7 @@ pub mod rcore_fs_wrapper;
 pub mod record_lock;
 mod signalfd;
 pub mod stdio;
+mod syncobj_eventfd;
 mod syncobj_file;
 mod sysfs;
 mod timerfd;
@@ -111,6 +112,9 @@ pub use pipe::Pipe;
 pub use rcore_fs::vfs::{self, PollStatus};
 pub use signalfd::SignalFd;
 pub use stdio::{STDIN, STDOUT};
+pub use syncobj_eventfd::{
+    init as syncobj_eventfd_init, register as register_syncobj_eventfd,
+};
 pub use syncobj_file::SyncobjHandle;
 pub use timerfd::TimerFd;
 
@@ -727,6 +731,13 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
             }
         }
         zircon_object::task::set_process_exit_hook(drm_release_on_exit);
+
+        // Wire SYNCOBJ_EVENTFD delivery into the syncobj layer's point-advance
+        // upcall, so an eventfd registered against a not-yet-reached point is
+        // signaled when the syncobj advances (from an ioctl or a driver EXEC
+        // completion). Unconditional: the syncobj table exists even on the
+        // software-KMS path, and the hook is a no-op until an eventfd registers.
+        syncobj_eventfd::init();
 
         // Register DRM drivers from kernel-hal
         for drm in drivers::all_drm().as_vec().iter() {

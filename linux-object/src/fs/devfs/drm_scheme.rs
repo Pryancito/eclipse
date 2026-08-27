@@ -234,11 +234,13 @@ const DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT: u32 =
     drm_iowr_core(0xCA, core::mem::size_of::<DrmSyncobjTimelineWait>());
 const DRM_IOCTL_SYNCOBJ_QUERY: u32 =
     drm_iowr_core(0xCB, core::mem::size_of::<DrmSyncobjTimelineArray>());
-// 0xCC (TRANSFER) not implemented: copying a point between two timelines is
-// an edge case real clients rarely hit.
+const DRM_IOCTL_SYNCOBJ_TRANSFER: u32 =
+    drm_iowr_core(0xCC, core::mem::size_of::<DrmSyncobjTransfer>());
 const DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL: u32 =
     drm_iowr_core(0xCD, core::mem::size_of::<DrmSyncobjTimelineArray>());
-// 0xCF (EVENTFD) not implemented: needs real eventfd/interrupt plumbing.
+// 0xCF (EVENTFD): needs the eventfd from the process fd table, so -- like
+// HANDLE_TO_FD/FD_TO_HANDLE above -- it is intercepted in `linux-syscall`'s
+// `sys_ioctl` before reaching this match (see `sys_drm_syncobj_eventfd`).
 
 #[repr(C)]
 struct DrmSyncobjCreate {
@@ -327,6 +329,20 @@ struct DrmSyncobjTimelineArray {
     count_handles: u32,
     #[allow(dead_code)]
     flags: u32,
+}
+
+// EXACT `drm.h` layout: `struct drm_syncobj_transfer` (32 bytes). Copies the
+// fence at `src_handle`@`src_point` onto `dst_handle`@`dst_point`.
+#[repr(C)]
+struct DrmSyncobjTransfer {
+    src_handle: u32,
+    dst_handle: u32,
+    src_point: u64,
+    dst_point: u64,
+    #[allow(dead_code)]
+    flags: u32,
+    #[allow(dead_code)]
+    pad: u32,
 }
 
 // WAIT_VBLANK request type flags (`<drm/drm.h>`).
@@ -751,6 +767,7 @@ const _: () = {
     assert!(size_of::<DrmSyncobjTimelineWait>() == 40); // TIMELINE_WAIT      0x..28..
     assert!(size_of::<DrmSyncobjArray>() == 16); // RESET/SIGNAL              0x..10..
     assert!(size_of::<DrmSyncobjTimelineArray>() == 24); // TIMELINE_SIGNAL/QUERY 0x..18..
+    assert!(size_of::<DrmSyncobjTransfer>() == 32); // DRM_IOCTL_SYNCOBJ_TRANSFER 0x..20..
 };
 
 /// Build a `struct drm_mode_modeinfo` (68 bytes) for a simple 60 Hz mode at
@@ -2506,6 +2523,23 @@ impl INode for DrmDev {
                     }
                 }
                 Ok(0)
+            }
+
+            DRM_IOCTL_SYNCOBJ_TRANSFER => {
+                if !zcore_drivers::display::nouveau_uapi_enabled() {
+                    return Err(FsError::OpNotSupported);
+                }
+                let req = unsafe { &*(data as *const DrmSyncobjTransfer) };
+                if zcore_drivers::scheme::syncobj::transfer(
+                    req.dst_handle,
+                    req.dst_point,
+                    req.src_handle,
+                    req.src_point,
+                ) {
+                    Ok(0)
+                } else {
+                    Err(FsError::EntryNotFound)
+                }
             }
 
             DRM_IOCTL_SYNCOBJ_QUERY => {

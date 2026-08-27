@@ -76,6 +76,35 @@ lazy_static::lazy_static! {
     static ref TABLE: Mutex<SyncobjTable> = Mutex::new(SyncobjTable { objects: Vec::new() });
 }
 
+/// Optional upcall fired whenever a syncobj point advances, so an upper layer
+/// (linux-object) can service `SYNCOBJ_EVENTFD` registrations — deliver an
+/// eventfd once its target point is reached. Signals arrive from BOTH the
+/// ioctl path and this crate's own `EXEC` completion (`nvidia.rs`), so the
+/// notification has to originate here, at the single choke point every point
+/// advance passes through, rather than in the caller. A null slot (the
+/// default, and the common case with no eventfd registered) costs one relaxed
+/// load per signal. Same registration idiom as `kernel_hal`'s `KLOG_EMIT_FN`.
+static SIGNAL_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Register the point-advance upcall (see [`SIGNAL_HOOK`]). Called once at boot.
+pub fn set_signal_hook(f: fn(u32, u64)) {
+    SIGNAL_HOOK.store(f as usize, Ordering::SeqCst);
+}
+
+/// Fire the point-advance upcall, if one is registered. Must be called with the
+/// [`TABLE`] lock RELEASED: the hook re-enters this module (`query`) to re-check
+/// waiters, which re-takes that lock.
+#[inline]
+fn notify_signal(handle: u32, point: u64) {
+    let p = SIGNAL_HOOK.load(Ordering::Relaxed);
+    if p != 0 {
+        // SAFETY: `p` is only ever stored by `set_signal_hook`, from a value of
+        // exactly this `fn(u32, u64)` type.
+        let f: fn(u32, u64) = unsafe { core::mem::transmute(p) };
+        f(handle, point);
+    }
+}
+
 /// Creates a syncobj, initially at point 0 (or 1 if `signaled`). Returns the
 /// new handle.
 pub fn create(signaled: bool) -> u32 {
@@ -107,16 +136,21 @@ pub fn signal(handle: u32) -> bool {
 /// `drm_syncobj` semantics (a stale/reordered signal can't un-signal a
 /// later one). Returns `false` if `handle` is unknown.
 pub fn timeline_signal(handle: u32, point: u64) -> bool {
-    let mut table = TABLE.lock();
-    let Some(obj) = table.objects.iter_mut().find(|o| o.handle == handle) else {
-        return false;
+    let new_point = {
+        let mut table = TABLE.lock();
+        let Some(obj) = table.objects.iter_mut().find(|o| o.handle == handle) else {
+            return false;
+        };
+        if point > obj.point {
+            obj.point = point;
+        }
+        // A direct signal replaces whatever fence the object carried, imported
+        // sync_file included — same as real drm_syncobj.
+        obj.linked = None;
+        obj.point
     };
-    if point > obj.point {
-        obj.point = point;
-    }
-    // A direct signal replaces whatever fence the object carried, imported
-    // sync_file included — same as real drm_syncobj.
-    obj.linked = None;
+    // Lock released: service any SYNCOBJ_EVENTFD waiters this advance satisfies.
+    notify_signal(handle, new_point);
     true
 }
 
@@ -159,19 +193,69 @@ pub fn export_snapshot(handle: u32) -> Option<u64> {
 /// resolves on its own as `src` advances, so a waiter never has to know an
 /// import happened.
 pub fn import_snapshot(dst: u32, src: u32, target: u64) -> bool {
-    let mut table = TABLE.lock();
-    let Some(src_point) = effective_point(&table.objects, src, LINK_DEPTH) else {
-        return false;
+    let advanced = {
+        let mut table = TABLE.lock();
+        let Some(src_point) = effective_point(&table.objects, src, LINK_DEPTH) else {
+            return false;
+        };
+        let reached = src_point >= target;
+        let Some(obj) = table.objects.iter_mut().find(|o| o.handle == dst) else {
+            return false;
+        };
+        if reached {
+            obj.point = obj.point.max(1);
+            obj.linked = None;
+            Some(obj.point)
+        } else {
+            obj.linked = Some((src, target));
+            None
+        }
     };
-    let reached = src_point >= target;
-    let Some(obj) = table.objects.iter_mut().find(|o| o.handle == dst) else {
-        return false;
+    // Lock released: an already-satisfied import advanced `dst` — wake waiters.
+    if let Some(p) = advanced {
+        notify_signal(dst, p);
+    }
+    true
+}
+
+/// `SYNCOBJ_TRANSFER`: copy the fence "`src` reached `src_point`" onto `dst`
+/// at `dst_point`. Both handles must exist (returns `false` otherwise). A
+/// `*_point` of 0 selects the object's binary fence (its next signal),
+/// matching [`export_snapshot`]'s floor-at-1 treatment of an unsignaled
+/// binary syncobj.
+///
+/// Synchronous model: if `src` has already reached the requested point, `dst`
+/// is advanced to `dst_point` right away (monotonic — never backwards);
+/// otherwise the dependency is recorded like a `sync_file` import so `dst`
+/// resolves on its own as `src` catches up. Because this driver's producer
+/// path signals synchronously (`EXEC` blocks until the GPU fence lands), a
+/// transfer is virtually always of an already-satisfied point — the deferred
+/// branch is a correctness backstop, and (like the import path) it can only
+/// carry a binary dependency, so a still-pending timeline→timeline transfer
+/// lands `dst` at point 1 rather than an arbitrary `dst_point`.
+pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
+    let new_point = {
+        let mut table = TABLE.lock();
+        let Some(src_eff) = effective_point(&table.objects, src, LINK_DEPTH) else {
+            return false;
+        };
+        let need = src_point.max(1);
+        let reached = src_eff >= need;
+        let Some(obj) = table.objects.iter_mut().find(|o| o.handle == dst) else {
+            return false;
+        };
+        if reached {
+            obj.point = obj.point.max(dst_point.max(1));
+            obj.linked = None;
+            Some(obj.point)
+        } else {
+            obj.linked = Some((src, need));
+            None
+        }
     };
-    if reached {
-        obj.point = obj.point.max(1);
-        obj.linked = None;
-    } else {
-        obj.linked = Some((src, target));
+    // Lock released: a satisfied transfer advanced `dst`, so wake its waiters.
+    if let Some(p) = new_point {
+        notify_signal(dst, p);
     }
     true
 }

@@ -1153,6 +1153,66 @@ impl Syscall<'_> {
         }
     }
 
+    /// `SYNCOBJ_EVENTFD` (`drm.h`, core DRM): signal an eventfd when syncobj
+    /// `handle` reaches `point`. Needs the eventfd from the process fd table
+    /// (like the FD ioctls above), so it is dispatched here, not in the DRM
+    /// inode's `io_control`; the waiter table and delivery live in
+    /// [`linux_object::fs::register_syncobj_eventfd`]. This is the wait side of
+    /// wlroots' `linux-drm-syncobj-v1` explicit sync. Gated on the same
+    /// `nvidia.nouveau_uapi` opt-in as the rest of the syncobj ioctls.
+    fn sys_drm_syncobj_eventfd(&self, request: usize, arg1: usize) -> Result<Option<usize>, LxError> {
+        const SYNCOBJ_EVENTFD: usize = 0xC018_64CF; // DRM_IOWR(0xcf, drm_syncobj_eventfd)
+        if request != SYNCOBJ_EVENTFD {
+            return Ok(None);
+        }
+        if !kernel_hal::drivers::nouveau_uapi_enabled() {
+            return Ok(None);
+        }
+
+        // struct drm_syncobj_eventfd {
+        //   __u32 handle; __u32 flags; __u64 point; __s32 fd; __u32 pad; }
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        struct DrmSyncobjEventfd {
+            handle: u32,
+            flags: u32,
+            point: u64,
+            fd: i32,
+            pad: u32,
+        }
+
+        let ptr = UserInPtr::<DrmSyncobjEventfd>::from(arg1);
+        let req = match ptr.read() {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("[drm] SYNCOBJ_EVENTFD read(args @ {:#x}) EFAULT: {:?}", arg1, e);
+                return Err(e.into());
+            }
+        };
+        // The `WAIT_AVAILABLE` flag (fire when a fence is merely submitted, not
+        // signaled) is a no-op here, for the same reason as QUERY's
+        // LAST_SUBMITTED: this model has no separate submitted-vs-signaled state.
+        let _ = req.flags;
+        if kernel_hal::drivers::scheme::syncobj::query(req.handle).is_none() {
+            warn!(
+                "[drm] SYNCOBJ_EVENTFD EINVAL: handle={} not a live syncobj",
+                req.handle
+            );
+            return Err(LxError::EINVAL);
+        }
+        // The target must be an eventfd: delivery is a `write` of 1, which for
+        // any other FileLike would mean something else entirely.
+        let proc = self.linux_process();
+        let ev = proc.get_file_like(FileDesc::from(req.fd as usize))?;
+        if ev.downcast_ref::<linux_object::fs::EventFd>().is_none() {
+            warn!("[drm] SYNCOBJ_EVENTFD EINVAL: fd={} is not an eventfd", req.fd);
+            return Err(LxError::EINVAL);
+        }
+        // The waiter holds this Arc, so the eventfd stays alive until delivered.
+        linux_object::fs::register_syncobj_eventfd(req.handle, req.point, ev);
+        Ok(Some(0))
+    }
+
     /// Set parameters of device files.
     pub fn sys_ioctl(
         &self,
@@ -1255,6 +1315,15 @@ impl Syscall<'_> {
         // reasoning and sign-extension caveat as PRIME above.
         if cmd == 0xC010_64C1 || cmd == 0xC010_64C2 {
             match self.sys_drm_syncobj_fd(cmd, arg1) {
+                Ok(Some(ret)) => return Ok(ret),
+                Ok(None) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        // SYNCOBJ_EVENTFD — same fd-table-access reasoning as the syncobj FD
+        // ioctls above (it takes an eventfd), and the same sign-extension caveat.
+        if cmd == 0xC018_64CF {
+            match self.sys_drm_syncobj_eventfd(cmd, arg1) {
                 Ok(Some(ret)) => return Ok(ret),
                 Ok(None) => {}
                 Err(e) => return Err(e),
