@@ -219,12 +219,31 @@ pub fn net_dispatch_packet(data: &[u8]) {
 }
 
 /// Queue a frame for AF_PACKET while smoltcp holds `SOCKETS` (see [`net_flush_deferred_packets`]).
+///
+/// No-op (and no allocation) when no packet callback is registered — the common
+/// case for normal TCP/UDP traffic without an AF_PACKET tap.
 pub fn net_defer_packet(data: &[u8]) {
+    if PACKET_CALLBACK.lock().is_none() {
+        return;
+    }
     let mut q = DEFERRED_PACKETS.lock();
     if q.len() >= DEFERRED_PACKET_MAX {
         q.pop_front();
     }
     q.push_back(data.to_vec());
+}
+
+/// Like [`net_defer_packet`], but takes ownership so the caller can avoid a
+/// second heap copy when it already holds a `Vec<u8>`.
+pub fn net_defer_packet_owned(data: Vec<u8>) {
+    if PACKET_CALLBACK.lock().is_none() {
+        return;
+    }
+    let mut q = DEFERRED_PACKETS.lock();
+    if q.len() >= DEFERRED_PACKET_MAX {
+        q.pop_front();
+    }
+    q.push_back(data);
 }
 
 /// Flush frames queued by [`net_defer_packet`]; call only after releasing smoltcp locks.

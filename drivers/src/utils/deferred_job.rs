@@ -16,13 +16,24 @@ static JOBS: Mutex<VecDeque<Job>> = Mutex::new(VecDeque::new());
 
 /// Cap queued IRQ work — unbounded growth looks like a kernel leak.
 const MAX_DEFERRED_JOBS: usize = 256;
-/// Run at most this many deferred jobs per drain (long NIC init must not starve PS/2/USB).
-const MAX_JOBS_PER_DRAIN: usize = 2;
+/// Run at most this many deferred jobs per drain.
+///
+/// Was 2: under HID/USB/watchdog pressure that budget silently aged out NIC
+/// bottom-halves (e1000e `poll_pending` stuck → interrupt-deaf). 8 matches the
+/// adaptive net drain floor in `linux-object` and still bounds long jobs so
+/// PS/2/USB keep getting turns across drains.
+const MAX_JOBS_PER_DRAIN: usize = 8;
 
 /// Drop the oldest queued job without running it (IRQ must not execute arbitrary work).
 #[allow(unused_must_use)]
 fn evict_oldest_job(q: &mut VecDeque<Job>) {
     let _ = q.pop_front();
+}
+
+/// Drop the newest queued job (used when inserting an urgent front job).
+#[allow(unused_must_use)]
+fn evict_newest_job(q: &mut VecDeque<Job>) {
+    let _ = q.pop_back();
 }
 
 /// Enqueue a closure to be executed later outside of IRQ context.
@@ -38,6 +49,20 @@ pub fn push_deferred_job<F: FnOnce() + Send + 'static>(f: F) {
         evict_oldest_job(&mut q);
     }
     q.push_back(Box::new(f));
+}
+
+/// Enqueue at the front so the next drain runs this job first.
+///
+/// For NIC IRQ bottom-halves that must not sit behind a backlog of lower-urgency
+/// work (and risk eviction from the 256-cap FIFO). When the queue is full, drop
+/// the newest back entry instead of the oldest — the oldest may itself be an
+/// urgent job already at the front.
+pub fn push_deferred_job_front<F: FnOnce() + Send + 'static>(f: F) {
+    let mut q = JOBS.lock();
+    if q.len() >= MAX_DEFERRED_JOBS {
+        evict_newest_job(&mut q);
+    }
+    q.push_front(Box::new(f));
 }
 
 /// Execute all currently queued deferred jobs.
