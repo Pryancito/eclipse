@@ -791,10 +791,10 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                             unsafe { core::ptr::read_volatile(kv as *const u8) }
                         })
                     };
-                    if let Some((rax, rbx, rcx, rdx, rsi, rdi, rbp, r8to11)) = thread
+                    if let Some((rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp, r8to11)) = thread
                         .with_context(|ctx| {
                             let g = ctx.general();
-                            (g.rax, g.rbx, g.rcx, g.rdx, g.rsi, g.rdi, g.rbp, g.r8)
+                            (g.rax, g.rbx, g.rcx, g.rdx, g.rsi, g.rdi, g.rbp, g.rsp, g.r8)
                         })
                         .ok()
                     {
@@ -849,6 +849,59 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                         dump("rdi", rdi);
                         dump("rcx_page", rcx & !0xfff);
                         dump("rbx", rbx);
+                        // Userspace call chain. Release Mesa/glibc omit frame
+                        // pointers, so an %rbp walk is unreliable; instead SCAN
+                        // the top of the stack for qwords that land in an
+                        // EXECUTABLE, named module mapping. Those are almost all
+                        // genuine return addresses, and printed as `<module> +
+                        // <off>` they reconstruct the caller chain that drove into
+                        // the faulting PC -- e.g. WHICH NVK entry point reached
+                        // libvulkan_nouveau.so + 0x9cc48 -- which a single crash PC
+                        // cannot. The executable filter drops stray data pointers
+                        // that merely happen to hit a mapped file (GOT/rodata).
+                        // Bounded scan + bounded hits so it can never flood dmesg.
+                        let rd64 = |va: usize| -> Option<u64> {
+                            let mut v = 0u64;
+                            for i in 0..8 {
+                                v |= (rd(va.wrapping_add(i))? as u64) << (i * 8);
+                            }
+                            Some(v)
+                        };
+                        let mut shown = 0u32;
+                        let mut soff = 0usize;
+                        while soff < 0x800 && shown < 24 {
+                            let slot = rsp.wrapping_add(soff);
+                            soff += 8;
+                            let val = match rd64(slot) {
+                                Some(v) => v as usize,
+                                None => continue,
+                            };
+                            let is_exec = pt
+                                .query(val & !0xfff)
+                                .map(|(_, f, _)| {
+                                    f.contains(zircon_object::vm::MMUFlags::EXECUTE)
+                                })
+                                .unwrap_or(false);
+                            if !is_exec {
+                                continue;
+                            }
+                            if let Some((base, file_off, name)) = vmar.describe_addr(val) {
+                                if name.is_empty() {
+                                    continue;
+                                }
+                                error!(
+                                    "[crash] pid={} bt[{}] @rsp+{:#x} -> {:#x} in {} + {:#x} (base {:#x})",
+                                    pid,
+                                    shown,
+                                    soff - 8,
+                                    val,
+                                    name,
+                                    file_off,
+                                    base,
+                                );
+                                shown += 1;
+                            }
+                        }
                     }
                     // 16 bytes before + 32 after the PC: shows how the faulting
                     // pointer register was loaded, and the faulting instruction.

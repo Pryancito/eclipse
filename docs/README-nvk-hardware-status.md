@@ -1599,3 +1599,74 @@ Pendiente según el resultado: si es P2P/ACS, mirar la config de ACS/IOMMU o usa
 la ruta consola/FBMEM; si es coherencia en el blit CPU y el CE funciona, el CE
 es la solución; si el CE va pero lento, optimizar (copia por bandas en el CE,
 DIRTYFB).
+
+## HITO en la RTX: la submisión funciona; el bloqueo es un crash de NVK (userspace)
+
+`/proc/gpudbg` de la RTX lo dice **dos veces**, sin ambigüedad:
+
+```
+--- last client (ctx>=1) EXEC draw submit ---
+ctx=12 pid=1080 OK: 1 push(es) + fence landed, 1 syncobj(s) signaled
+...
+[nouveau-uapi] first CLIENT EXEC OK: ctx=6 pid=1064 -- this client's GPU work completes
+```
+
+La tubería completa — golden context, `CHANNEL_ALLOC`, `NVIF NEW` de las clases
+(CE `0xc5b5`, 2D `0x902d`, 3D `0xc597`, compute `0xc5c0`), `VM_BIND`, `EXEC`,
+valla, syncobj — **ejecuta de punta a punta**. El anillo no es el problema.
+
+### El bloqueo real: NVK derefa un puntero NULL, siempre en el mismo sitio
+
+Justo **después** del primer EXEC, y en **todos** los clientes GL (pids 1063,
+1064, 1075, 1080, 1101), NVK crashea en la misma dirección:
+
+```
+[crash] pid=1064 pc 0x10c50c48 in /usr/lib/libvulkan_nouveau.so + 0x9cc48
+unhandled page fault @ 0x8 (READ | USER): NOT_FOUND
+[crash] pid=1064 ... rsi=0x0 ...
+[crash] pid=1064 code@0x10c50c38 (pc-16): [.. 48 8b 72 08 .. 8b 46 08 ..]
+```
+
+Descodificando: `mov rsi,[rdx+8]` carga un puntero de un array que resulta
+**NULL**, y el `mov eax,[rsi+8]` siguiente falla leyendo `0x8`. Es un recorrido
+de una lista/array de punteros (`rdx` avanza de 8 en 8, comprobando un flag en
+`+8` de cada entrada) con una entrada NULL. El `sys_munmap` de 0x11000 bytes
+justo antes sugiere que es bookkeeping de NVK tras liberar algo.
+
+**`zink: failed to create timeline semaphore` (labwc.log) es el mismo evento
+visto desde zink**: NVK muere justo tras el primer EXEC, así que el compositor
+nunca termina de inicializar y el escritorio no levanta.
+
+### Qué se descarta
+
+- **Aliasing de canal**: `CHANNEL_ALLOC` devuelve `channel=12` tres veces y luego
+  `13` para el mismo pid, pero el asignador coge el id libre más bajo, así que
+  eso es alloc-tras-free (correcto), no ids duplicados.
+- **Regresión del submit** (`7522262`): sólo tocó el EXEC *vacío* (sonda de salud)
+  y el suelo del sync_file; no cambia lo que devuelve un EXEC real con éxito.
+
+Como **NVK de serie NO crashea aquí en Linux real**, nuestra uAPI parcial le
+devuelve algo tras la submisión que le deja un NULL en una lista que luego
+recorre. Es corregible desde el kernel una vez sepamos QUÉ ruta de NVK es.
+
+### Instrumentación para nombrar la ruta (crash handler)
+
+El manejador de fallos de `loader/src/linux.rs` ya resuelve `pc`/`fault-addr` a
+`módulo + offset` y vuelca registros y bytes. Ahora además **escanea la cima de
+la pila** e imprime los qwords que caen en un mapeo de módulo **ejecutable** y
+con nombre — casi todos direcciones de retorno reales — como
+`bt[i] ... in <módulo> + <off>`. Los frame pointers están omitidos en Mesa
+release, así que un paseo por `%rbp` no sirve; el escaneo de pila reconstruye la
+**cadena de llamadas** que entró en `libvulkan_nouveau.so + 0x9cc48`, que un solo
+PC no da. Acotado (24 hits / 0x800 bytes) para no inundar dmesg.
+
+**Siguiente arranque**: el `dmesg` traerá varias líneas `bt[..] in
+libvulkan_nouveau.so + 0x…` sobre el crash → identifican la función/ruta de NVK
+(¿creación de semáforo timeline? ¿teardown de device tras init parcial? ¿reaping
+post-submit?), y con eso el arreglo del lado del kernel deja de ser a ciegas.
+
+**Ruta rápida en paralelo** (símbolos offline sobre el binario del sistema):
+```sh
+addr2line -f -e /usr/lib/libvulkan_nouveau.so 0x9cc48
+nm -D --defined-only /usr/lib/libvulkan_nouveau.so | sort   # export más cercano por debajo de 0x9cc48
+```
