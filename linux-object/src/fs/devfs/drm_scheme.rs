@@ -1374,7 +1374,38 @@ impl INode for DrmDev {
                     // here has touched (virtio-gpu, or NVIDIA without the
                     // flag) never sees a capability bit flip by default.
                     0x13 | 0x14 => {
-                        cap.value = zcore_drivers::display::nouveau_uapi_enabled() as u64
+                        cap.value = zcore_drivers::display::nouveau_uapi_enabled() as u64;
+                        // One-shot per cap, VISIBLE on hardware (klog has no level
+                        // filter, unlike the log::debug! below). NVK probes
+                        // DRM_CAP_SYNCOBJ (0x13) and DRM_CAP_SYNCOBJ_TIMELINE (0x14)
+                        // before it will back a timeline VkSemaphore with a kernel
+                        // syncobj. If the next boot's dmesg shows these as `-> 1`
+                        // but zink still logs "failed to create timeline semaphore"
+                        // with NO `SYNCOBJ_CREATE` line after (see that arm), NVK
+                        // gave up in USERSPACE over a capability beyond the cap —
+                        // the same class as the external-semaphore block, and NOT a
+                        // kernel syncobj bug. `->1` followed by `SYNCOBJ_CREATE`
+                        // lines means the create path is reached and the failure is
+                        // downstream of the syncobj.
+                        static SYNCOBJ_CAP_LOGGED: AtomicBool = AtomicBool::new(false);
+                        static TIMELINE_CAP_LOGGED: AtomicBool = AtomicBool::new(false);
+                        let latch = if cap.capability == 0x14 {
+                            &TIMELINE_CAP_LOGGED
+                        } else {
+                            &SYNCOBJ_CAP_LOGGED
+                        };
+                        if !latch.swap(true, Ordering::Relaxed) {
+                            kernel_hal::klog_info!(
+                                "[drm] GET_CAP {} -> {} (probed by pid {})",
+                                if cap.capability == 0x14 {
+                                    "SYNCOBJ_TIMELINE"
+                                } else {
+                                    "SYNCOBJ"
+                                },
+                                cap.value,
+                                drm::current_pid()
+                            );
+                        }
                     }
                     // Everything else — DRM_CAP_ASYNC_PAGE_FLIP (0x7),
                     // DRM_CAP_PAGE_FLIP_TARGET (0x11) and
@@ -2372,9 +2403,34 @@ impl INode for DrmDev {
                     return Err(FsError::OpNotSupported);
                 }
                 let req = unsafe { &mut *(data as *mut DrmSyncobjCreate) };
-                req.handle = zcore_drivers::scheme::syncobj::create(
+                let handle = zcore_drivers::scheme::syncobj::create(
                     req.flags & DRM_SYNCOBJ_CREATE_SIGNALED != 0,
                 );
+                req.handle = handle;
+                // Bounded probe (first N this boot), VISIBLE on hardware. Answers
+                // the one thing the "failed to create timeline semaphore" spam
+                // cannot: does NVK actually reach the kernel to create the syncobj
+                // a timeline VkSemaphore is backed by? The create itself always
+                // succeeds here, so a `SYNCOBJ_CREATE` line right before zink's
+                // error proves the failure is DOWNSTREAM of the syncobj (NVK
+                // internal / device already wedged), not in it. NO line before the
+                // error means NVK never got here — it bailed in userspace (cf. the
+                // GET_CAP probe above). And the pid + climbing count is the
+                // accumulation signature if compositor respawns are leaking.
+                {
+                    static CREATE_LOG_BUDGET: core::sync::atomic::AtomicU32 =
+                        core::sync::atomic::AtomicU32::new(0);
+                    let n = CREATE_LOG_BUDGET.fetch_add(1, Ordering::Relaxed);
+                    if n < 16 {
+                        kernel_hal::klog_info!(
+                            "[drm] SYNCOBJ_CREATE #{} pid={} -> handle={} flags={:#x}",
+                            n + 1,
+                            drm::current_pid(),
+                            handle,
+                            req.flags
+                        );
+                    }
+                }
                 Ok(0)
             }
 

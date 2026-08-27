@@ -144,7 +144,8 @@ pub(super) fn class_objects_drain_pid(pid: u64) -> alloc::vec::Vec<(u64, u32)> {
 /// froze the desktop/cursor when a hung GL client kept retrying. Once latched,
 /// that context's submits fast-fail (no gate-holding poll) until the process
 /// exits and its context is rebuilt fresh. Context 0 (the compositor) is never
-/// latched. A lock-free bitmask: MAX_CTX (8) fits in the low bits.
+/// latched. A lock-free u32 bitmask: MAX_CTX (32) fits it exactly (bits 0..31),
+// which is why MAX_CTX must never exceed 32.
 static CTX_WEDGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 pub(super) fn ctx_is_wedged(ctx_idx: u32) -> bool {
