@@ -94,8 +94,8 @@ struct Service {
 
 /// Default environment handed to every service (and inherited by their
 /// children). Includes the Wayland session vars that `/usr/local/bin/labwc`
-/// used to inject: init execs the real `/usr/bin/labwc` (no ash wrapper), so
-/// those vars must live here or wlroots falls back to GLES2 / empty GPU enum.
+/// also asserts: init now launches that wrapper too, but keeping the base
+/// variables here preserves the boot session if the wrapper ever gets bypassed.
 const CHILD_ENV: &[&str] = &[
     "PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin",
     "HOME=/root",

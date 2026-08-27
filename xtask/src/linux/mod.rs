@@ -1906,17 +1906,17 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         )
         .unwrap();
 
-        // labwc: real compositor binary (NOT /usr/local/bin/labwc). Session env
-        // lives in eclipse-init CHILD_ENV. Wait for seatd + settled /dev/input
+        // labwc: launch the hardened wrapper so init, shells and login sessions all
+        // take the same renderer/env path. Wait for seatd + settled /dev/input
         // before start — without udevd libinput scans input nodes exactly once.
         fs::write(
             svc_dir.join("labwc.service"),
-            b"# labwc Wayland session (real binary; env from eclipse-init).\n\
+            b"# labwc Wayland session (wrapper; env from eclipse-init + wrapper fallback).\n\
               # wait_socket: seatd readiness (after= only orders the fork).\n\
               # wait_path: /dev/input must be non-empty and settled -> no udev\n\
               # hotplug, so starting between keyboard and mouse enumeration\n\
               # leaves the late device dead for the whole session.\n\
-              exec = /usr/bin/labwc\n\
+              exec = /usr/local/bin/labwc\n\
               type = respawn\n\
               after = seatd\n\
               wait_socket = /run/seatd.sock\n\
