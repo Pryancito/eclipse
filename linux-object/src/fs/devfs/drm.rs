@@ -1078,14 +1078,27 @@ pub enum FlipError {
 }
 
 pub fn page_flip(fb_id: u32, crtc_id: u32, user_data: u64) -> Result<(), FlipError> {
-    // One outstanding flip-complete per CRTC — same rule as Linux. The old
-    // coalesced timer stored a single `Option` and *overwrote* it, so a second
-    // flip (or a WAIT_VBLANK event) silently dropped the first completion.
-    // wlroots then either kept `pageflip_pending` forever or later handled a
-    // stale/mismatched event and `wl_list_remove`'d an already-cleared
-    // listener (SIGSEGV @ 0x8 in labwc).
+    // One outstanding flip-complete per CRTC — same rule as Linux. The
+    // coalesced timer keeps a *queue* (never an overwritten `Option`), so a
+    // second flip / WAIT_VBLANK never silently drops the first completion — that
+    // drop once left wlroots handling a stale event and `wl_list_remove`ing an
+    // already-cleared listener (SIGSEGV @ 0x8 in labwc).
+    //
+    // If a completion is still outstanding, do NOT refuse the flip with EBUSY:
+    // this is a software framebuffer with no hardware flip FIFO, and wlroots
+    // escalates an unexpected page-flip EBUSY into an output teardown — it drops
+    // DRM master and the desktop falls back to the text console ("se dibuja y
+    // desaparece"). Deliver the outstanding completion NOW and accept the flip;
+    // one event per flip is still preserved, only this frame is un-paced.
     if FLIP_EVENT_PENDING.load(Ordering::Acquire) {
-        return Err(FlipError::Busy);
+        flush_pending_flip_completions();
+        if FLIP_EVENT_PENDING.load(Ordering::Acquire) {
+            // Nothing was queued to flush yet the flag is still set: the prior
+            // completion is already on the fd, unread (a narrow set-before-
+            // enqueue race). One occasional EBUSY is safe to retry — unlike the
+            // persistent one that flushing removes.
+            return Err(FlipError::Busy);
+        }
     }
     let flipped = present_now(fb_id, crtc_id);
     if !flipped {
@@ -1159,6 +1172,37 @@ fn arm_coalesced_drm_timer(pending: PendingDrmTimer) {
 fn schedule_flip_event(crtc_id: u32, user_data: u64) {
     FLIP_EVENT_PENDING.store(true, Ordering::Release);
     arm_coalesced_drm_timer(PendingDrmTimer::Flip { crtc_id, user_data });
+}
+
+/// Deliver every queued page-flip completion to the card fd *now* instead of
+/// waiting for the synthetic vblank. Called when a new flip arrives while one
+/// is still outstanding: a software framebuffer has no hardware flip FIFO, so
+/// refusing the new flip with EBUSY is wrong — wlroots escalates an unexpected
+/// page-flip / atomic-commit EBUSY into an output teardown, which drops DRM
+/// master and drops the desktop back to the text console. Flushing preserves
+/// the "one completion outstanding" invariant (we return to zero pending before
+/// accepting the new flip) and still delivers exactly one event per flip — no
+/// dropped or overwritten completion, so no stale `wl_listener` free in labwc.
+/// Pending vblank-wait jobs keep their own pacing and stay queued.
+fn flush_pending_flip_completions() {
+    let flips: Vec<(u32, u64)> = {
+        let mut q = PENDING_DRM_TIMERS.lock();
+        let mut kept = VecDeque::with_capacity(q.len());
+        let mut flips = Vec::new();
+        while let Some(job) = q.pop_front() {
+            match job {
+                PendingDrmTimer::Flip { crtc_id, user_data } => flips.push((crtc_id, user_data)),
+                other => kept.push_back(other),
+            }
+        }
+        *q = kept;
+        flips
+    };
+    // queue_flip_event locks DRM_STATE and clears FLIP_EVENT_PENDING; the
+    // PENDING_DRM_TIMERS guard above is already dropped, so no nested lock.
+    for (crtc_id, user_data) in flips {
+        queue_flip_event(crtc_id, user_data);
+    }
 }
 
 /// Deliver a `DRM_EVENT_VBLANK` (from a `WAIT_VBLANK` that asked for an event)
@@ -1621,11 +1665,17 @@ pub fn atomic_commit(
         return Ok(());
     }
 
-    // Refuse overlapping flip-events *before* mutating scanout state so a
-    // Busy return never leaves the CRTC presenting a buffer whose completion
-    // we then decline to queue (see [`page_flip`]).
+    // A prior flip's completion is still outstanding. Flush it now — *before*
+    // mutating scanout state — rather than refusing the commit with EBUSY:
+    // wlroots turns an unexpected atomic-commit EBUSY into an output teardown
+    // (DROP_MASTER -> the desktop drops to the text console). See [`page_flip`].
+    // Flushing keeps one completion per flip; only a narrow set-before-enqueue
+    // race still returns Busy, which a client safely retries.
     if want_event && FLIP_EVENT_PENDING.load(Ordering::Acquire) {
-        return Err(AtomicError::Busy);
+        flush_pending_flip_completions();
+        if FLIP_EVENT_PENDING.load(Ordering::Acquire) {
+            return Err(AtomicError::Busy);
+        }
     }
 
     // --- Commit phase ---
