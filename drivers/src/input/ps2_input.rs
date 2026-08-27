@@ -168,6 +168,23 @@ impl Scheme for Ps2Input {
                 if is_aux {
                     // Handle mouse data
                     let mut state = self.mouse_state.lock();
+                    // Packet resync. Byte 0 of every PS/2 mouse packet has bit 3
+                    // (the "always one" signature) SET. If we are at the START of a
+                    // packet and this byte does not, the 3-byte stream has slipped --
+                    // a dropped/extra byte from an i8042 output-buffer overflow under
+                    // load, or the 0xAA (BAT) / 0x00 (device id) a real mouse streams
+                    // ~500 ms after its power-on reset, long after our short init
+                    // read timed out. Drop the stray byte and STAY at phase 0 rather
+                    // than latch a SHIFTED packet: a shifted packet decodes dx/dy in
+                    // place of the flags byte, so motion becomes garbage and the
+                    // pointer sticks in place ("raton en estatico") until reboot,
+                    // even though it is still drawn. Skipping mis-first bytes here
+                    // realigns to the next real packet boundary on its own. On an
+                    // already aligned stream (QEMU) byte 0 always has bit 3, so this
+                    // never fires there -- no behaviour change on the working path.
+                    if state.phase == 0 && (code & 0x08) == 0 {
+                        continue;
+                    }
                     let phase = state.phase as usize;
                     state.bytes[phase] = code;
                     state.phase += 1;
@@ -178,7 +195,9 @@ impl Scheme for Ps2Input {
                         let dy_raw = state.bytes[2];
                         state.phase = 0;
 
-                        // Check signature bit (bit 3 of first byte should be 1)
+                        // Signature bit (bit 3 of byte 0) is guaranteed set now (the
+                        // phase-0 resync above rejects any first byte without it), so
+                        // this is belt-and-braces rather than a filter.
                         if (flags & 0x08) != 0 {
                             // Translate relative coordinates
                             let x_neg = (flags & 0x10) != 0;
