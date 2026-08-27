@@ -26,8 +26,7 @@ impl ProcInitInfo {
         // push below). A fixed 0x4000 overran and asserted -> kernel panic on a
         // big argv/envp; total argv+envp is separately capped to E2BIG in
         // sys_execve, so this bound stays modest.
-        let table_entries =
-            1 + self.args.len() + 1 + self.envs.len() + 1 + self.auxv.len() * 2 + 6;
+        let table_entries = 1 + self.args.len() + 1 + self.envs.len() + 1 + self.auxv.len() * 2 + 6;
         let strings: usize = self.args[0].len()
             + 1
             + self.args.iter().map(|s| s.len() + 1).sum::<usize>()

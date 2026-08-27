@@ -87,6 +87,49 @@ speaker-test -D plughw:1 -c 2 -t sine
 `apk add`. No mixer elements are exposed yet (`amixer` shows an empty card);
 HDMI has no analog volume anyway — control levels in the application.
 
+### hw_params negotiation (and how to test it without hardware)
+
+alsa-lib does not hand the kernel a finished configuration. It narrows one
+parameter at a time (`snd_pcm_hw_params_choose`), calling `HW_REFINE` after
+every step and expecting the kernel to derive the dependent parameters — most
+clients, `speaker-test` and `aplay` included, only ever set `period_time` and
+`buffer_time` and let the frame counts fall out. So the refine implements
+Linux-style constraint propagation, iterated to a fixed point:
+
+```
+frame_bits   = sample_bits × channels          (= 32, S16LE stereo)
+period_bytes = period_size × 4
+buffer_bytes = buffer_size × 4
+buffer_size ≈ period_size × periods            (see below)
+period_time  = period_size × 1e6 / rate
+buffer_time  = buffer_size × 1e6 / rate
+```
+
+Two properties of that arithmetic are load-bearing, and both were bugs first:
+
+* **The time↔size directions must be exact inverses.** A size of N frames owns
+  the half-open time cell `[N/rate, (N+1)/rate)`. If one direction rounds a
+  time up to a size and the other rounds that size back to a *different* time,
+  the interval empties and hw_params fails with EINVAL — which is how 0.5 s at
+  11.025 kHz (5512.5 frames) got rejected.
+* **`buffer_size = period_size × periods` is approximate here.** The DMA ring
+  is continuous, not carved into period segments, so a buffer that is not a
+  whole number of periods plays fine. Demanding the exact multiple rejects
+  ordinary requests: 0.5 s at 44.1 kHz is 22050 frames while four 125 ms
+  periods are 22048. The refine carries a period of slack and `install` picks
+  the exactly-coherent triple at the end.
+
+`tools/alsa-hwparams-sim/run.sh` exercises all of this with no hardware and no
+QEMU. It **extracts** the refine/install code from `snd.rs` at run time (so it
+always tests what ships) and drives it with a faithful replay of alsa-lib's
+negotiation across 23 scenarios — every supported rate, low latency, oversized
+buffers, explicit period/periods. Exit code 0 means every scenario negotiated a
+coherent configuration. Run it after touching the refine.
+
+A rejected configuration logs the offending parameter and the full interval
+state (`[snd] hw_params rejected: …`, budgeted to 8 lines a boot), so a bare
+EINVAL in userspace can still be traced to the constraint that caused it.
+
 ## Userspace API: `/dev/dsp` (OSS)
 
 One node per controller in probe order: `/dev/dsp` (usually the PCH),
