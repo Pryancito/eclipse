@@ -44,6 +44,9 @@ static SCANOUT_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 /// One-shot latch for the "framebuffer has no backing" scanout warning.
 static SCANOUT_NULL_LOGGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+/// One-shot latch for the "CE present enabled but pitch mismatch" warning.
+static CE_PITCH_MISMATCH_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Master switch for the per-frame GPU copy-engine present (`ce_present`).
 /// OFF by default: the CE path fires a GPU DMA on EVERY desktop present
@@ -726,13 +729,26 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     // DMA per present destabilized the desktop on real hardware, so the
     // default present is the proven CPU blit.
     let mut blitted_by_ce = false;
-    if rect.is_none() && CE_PRESENT_ENABLED.load(Ordering::Relaxed) && fb.pitch == info.pitch {
-        let size = (info.pitch as u64) * (blit_h as u64);
-        for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-            if d.ce_present(fb.phys_addr, size) {
-                blitted_by_ce = true;
-                break;
+    if rect.is_none() && CE_PRESENT_ENABLED.load(Ordering::Relaxed) {
+        if fb.pitch == info.pitch {
+            let size = (info.pitch as u64) * (blit_h as u64);
+            for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+                if d.ce_present(fb.phys_addr, size) {
+                    blitted_by_ce = true;
+                    break;
+                }
             }
+        } else if !CE_PITCH_MISMATCH_LOGGED.swap(true, Ordering::Relaxed) {
+            // CE is ON but the flat sysmem->VRAM copy needs equal strides, and
+            // the client's fb pitch differs from the scanout pitch. Say so once
+            // -- otherwise "cepresent is set but the CPU is still doing the
+            // copy" is a silent mystery. (A per-row CE copy would lift this, but
+            // that is a wider change than the flat blit.)
+            warn!(
+                "[drm] CE-offload present enabled but NOT firing: fb pitch {} != scanout pitch {} \
+                 (flat CE copy needs equal strides) -- using CPU blit",
+                fb.pitch, info.pitch
+            );
         }
     }
     if !blitted_by_ce {

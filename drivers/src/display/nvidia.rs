@@ -420,6 +420,16 @@ fn rm_core_init_once() -> u32 {
 /// then confirms the desktop is being composited by the copy engine).
 static CE_PRESENT_LOGGED: AtomicBool = AtomicBool::new(false);
 
+/// Latched when a CE-offload present returns a failure status. The CE copy is
+/// synchronous and runs under the RM gate, so a faulting or hung
+/// `ceutilsMemcopy` (a P2P write the GMMU can't map, an ACS-blocked peer DMA)
+/// would repeat every frame and could freeze the whole desktop by holding the
+/// gate. Once latched, `ce_present` stands down immediately and the proven CPU
+/// blit takes over for the rest of the boot -- one loud failure line, then a
+/// stable fallback instead of a wedge. This is what makes `nvidia.cepresent`
+/// safe to switch on for a real-hardware test.
+static CE_PRESENT_WEDGED: AtomicBool = AtomicBool::new(false);
+
 #[derive(Debug, Clone, Copy)]
 struct BootFbInfo {
     phys: u64,
@@ -4148,6 +4158,11 @@ impl DrmScheme for NvidiaGpu {
         if src_sysmem_pa == 0 || size == 0 {
             return false;
         }
+        // Stood down after a confirmed CE failure this boot -- fall straight to
+        // the CPU blit without touching the RM (see CE_PRESENT_WEDGED).
+        if CE_PRESENT_WEDGED.load(Ordering::Relaxed) {
+            return false;
+        }
         let device_instance = match *self.rm_device_instance.lock() {
             Some(d) => d,
             None => return false, // this GPU not state-loaded
@@ -4156,12 +4171,21 @@ impl DrmScheme for NvidiaGpu {
             Some(p) if p != 0 => p,
             _ => return false,
         };
+        // Capture the RM's own `[eclipse-rm-trace] ce_blit*` narration (the
+        // ceutilsMemcopy status, and any Xid/MMU-fault burst the P2P write
+        // triggers) so a failure REPLAYS it through klog instead of vanishing
+        // behind a bare `false`. Time the call too: a synchronous full-frame
+        // copy that runs long is either the bottleneck (efficiency) or a hang
+        // (destabilization) -- the number tells them apart.
+        nvidia_rm_sys::os_interface::capture_begin();
+        let t0 = unsafe { crate::bus::drivers_timer_now_as_micros() };
         let (st, how) = if self.drives_boot_display() {
             // Console GPU: its own CE writes its own VRAM (ADDR_FBMEM). Direct,
             // but only when the console GPU is state-loaded (its bring-up is
             // unreliable), so this rarely fires in practice.
             let bar1 = self.bar1_phys;
             if fb_phys < bar1 {
+                let _ = nvidia_rm_sys::os_interface::capture_take();
                 return false;
             }
             (
@@ -4182,18 +4206,55 @@ impl DrmScheme for NvidiaGpu {
                 "compute/P2P",
             )
         };
+        let elapsed_us =
+            unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(t0);
+        let narration = nvidia_rm_sys::os_interface::capture_take();
         if st == 0 {
             if !CE_PRESENT_LOGGED.swap(true, Ordering::Relaxed) {
-                log::warn!(
-                    "[NVIDIA] CE-offload present ACTIVE ({}): src {:#x} -> FB {:#x} size {:#x}",
+                crate::klog_info!(
+                    "[NVIDIA] CE-offload present ACTIVE ({}): src {:#x} -> FB {:#x} size {:#x} in {}us -- desktop composited by the copy engine, CPU freed",
                     how,
                     src_sysmem_pa,
                     fb_phys,
-                    size
+                    size,
+                    elapsed_us
                 );
+            }
+            // A full-frame P2P copy should be well under a 60 Hz frame (~16 ms).
+            // If it isn't, the copy -- not the CPU -- is now the bottleneck; say
+            // so ONCE so the efficiency win can be judged against real numbers.
+            if elapsed_us > 8_000 {
+                static SLOW_LOGGED: AtomicBool = AtomicBool::new(false);
+                if !SLOW_LOGGED.swap(true, Ordering::Relaxed) {
+                    crate::klog_warn!(
+                        "[NVIDIA] CE-offload present SLOW: {}us for {:#x} bytes ({}) -- the copy is the bottleneck, not the CPU",
+                        elapsed_us,
+                        size,
+                        how
+                    );
+                }
             }
             true
         } else {
+            // Confirmed failure. Name it, replay the RM trace, and LATCH OFF so
+            // the desktop degrades to the CPU blit instead of repeating a
+            // faulting/hung CE op every frame (which, under the RM gate, is what
+            // froze the desktop before). One diagnostic burst, then stable.
+            CE_PRESENT_WEDGED.store(true, Ordering::Relaxed);
+            crate::klog_warn!(
+                "[NVIDIA] CE-offload present FAILED ({}): ceutilsMemcopy status={:#x} (src={:#x} dst_fb={:#x} size={:#x}) in {}us -- latching OFF, CPU blit for the rest of this boot",
+                how,
+                st,
+                src_sysmem_pa,
+                fb_phys,
+                size,
+                elapsed_us
+            );
+            if let Some(text) = narration {
+                for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                    crate::klog_warn!("[NVIDIA] CE rm: {}", line);
+                }
+            }
             false
         }
     }

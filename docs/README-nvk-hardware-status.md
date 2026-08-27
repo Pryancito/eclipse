@@ -1550,3 +1550,52 @@ Nota: el `labwc` lanzado A MANO desde la shell falla distinto
 (`backend/x11/backend.c: Failed to open xcb connection`) porque el shell lleva
 `DISPLAY=:0` y sin `WLR_BACKENDS=drm` wlroots elige el backend X11 anidado —
 no es la ruta de init (que sí fuerza DRM). Un despiste, no el problema.
+
+## CE-offload present, instrumentado (para perseguir la eficiencia con seguridad)
+
+El present por defecto es un blit por CPU que **lee** el buffer renderizado
+(sysmem/GART) por PCIe y lo copia al framebuffer GOP. Dos costes: es lento
+(frame completo, 2× tráfico PCIe) y, si la CPU no ve coherentemente lo que la
+GPU escribió en sysmem, **lee mal** (posible causa del "fallo de lectura").
+
+El **CE-offload** (`nvidia.cepresent`) le da la vuelta: la **misma GPU de
+cómputo que renderizó** usa su motor de copia para leer su propio buffer y
+DMA-earlo (PCIe P2P) al framebuffer de scanout de la consola. La GPU leyendo lo
+que ella misma escribió es coherente → **puede ser corrección + velocidad a la
+vez**. Existía (`eclipse_rm_ce_blit_p2p`) pero "desestabilizaba", así que estaba
+apagado.
+
+La desestabilización tiene causa plausible: `ce_blit_p2p` es **síncrono** y corre
+bajo la compuerta del RM; si el P2P a la BAR1 de la consola falla (ACS bloqueado)
+o el GMMU no mapea ese MMIO peer, `ceutilsMemcopy` cuelga/falla **sujetando la
+compuerta** → se congela el escritorio.
+
+**Instrumentación (`ce_present`, `nvidia.rs`)** para poder probarlo sin brickear
+el arranque:
+- Captura la narración del RM (`[eclipse-rm-trace] ce_blit*`, con el status de
+  `ceutilsMemcopy` y cualquier Xid/MMU-fault) y la **reproduce por klog** en el
+  fallo, en vez de un `false` mudo.
+- **Cronometra** la copia: distingue *lento* (cuello de botella de eficiencia,
+  aviso a >8 ms) de *roto*.
+- **Se auto-desactiva al primer fallo** (`CE_PRESENT_WEDGED`): una línea de
+  diagnóstico y cae al blit CPU el resto del arranque, en vez de repetir una
+  copia que cuelga cada frame. Esto es lo que hace **seguro** encender
+  `nvidia.cepresent` en hardware.
+- El gate del scanout dice **una vez** si el CE está activado pero no dispara
+  por pitch distinto (`fb.pitch != scanout pitch`), en vez de caer al CPU en
+  silencio.
+
+**Cómo probarlo**: arrancar con `nvidia.cepresent` (además de `GL=1`). El log
+dirá una de tres cosas:
+1. `CE-offload present ACTIVE (compute/P2P) ... in Nus` → **funciona**: escritorio
+   compuesto por el CE, CPU liberada (y probablemente arregla la coherencia).
+2. `CE-offload present FAILED (compute/P2P): ceutilsMemcopy status=0x.. ...` +
+   `CE rm: ...` → sabemos exactamente por qué (fault de GMMU en el MMIO peer,
+   P2P bloqueado por ACS, timeout), y cae al blit CPU sin congelar.
+3. `CE-offload present SLOW: Nus ...` → funciona pero la copia es el cuello de
+   botella (cuestión de eficiencia, no de corrección).
+
+Pendiente según el resultado: si es P2P/ACS, mirar la config de ACS/IOMMU o usar
+la ruta consola/FBMEM; si es coherencia en el blit CPU y el CE funciona, el CE
+es la solución; si el CE va pero lento, optimizar (copia por bandas en el CE,
+DIRTYFB).
