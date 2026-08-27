@@ -3,6 +3,7 @@ mod desktop;
 mod image;
 mod nvidia_firmware;
 mod opencv;
+mod phoronix;
 mod test;
 mod xorg;
 
@@ -86,6 +87,7 @@ impl LinuxRootfs {
             Self::write_asound_conf(&dir.join("etc"));
             desktop::install(&dir);
             xorg::install(&dir, &bin.join("apk"), self.0.name());
+            self.install_phoronix();
             return;
         }
         // 准备最小系统需要的资源
@@ -504,6 +506,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         Self::install_base_accounts(&dir);
         self.install_busybox_init(&dir);
         self.install_eclipse_init(&dir, &musl);
+        self.install_phoronix();
     }
 
     /// Instala tests freestanding de multihilo (thr3: repro de la barrier de sysbench).

@@ -84,15 +84,14 @@ static SLEEPING_CPUS: AtomicU64 = AtomicU64::new(0);
 /// became runnable on that CPU while it was busy running a different task.
 ///
 /// Without this, a freshly woken task had to wait for the running thread's full
-/// timeslice (`BASE_TIMESLICE_TICKS` = 5 ticks = 20 ms at 250 Hz) before the
-/// executor would even look at the run queue again — the executor polls a task
-/// until it returns `Pending`, and a CPU-bound user thread only returns
-/// `Pending` when its slice expires. Every interactive wake (a keystroke, a
-/// pipe write, an I/O completion, a `futex` release) therefore paid up to 20 ms
-/// of latency as soon as *anything* else was runnable on that CPU. That is the
-/// single biggest reason the system feels slower than the micro-benchmarks
-/// suggest: the benchmarks measure one task on an otherwise idle machine, where
-/// this path never triggers.
+/// timeslice (20 ms) before the executor would even look at the run queue again
+/// — the executor polls a task until it returns `Pending`, and a CPU-bound user
+/// thread only returns `Pending` when its slice expires. Every interactive wake
+/// (a keystroke, a pipe write, an I/O completion, a `futex` release) therefore
+/// paid up to 20 ms of latency as soon as *anything* else was runnable on that
+/// CPU. That is the single biggest reason the system feels slower than the
+/// micro-benchmarks suggest: the benchmarks measure one task on an otherwise
+/// idle machine, where this path never triggers.
 ///
 /// Linux solves it with `check_preempt_curr` + a reschedule IPI. So do we: the
 /// waker publishes the request here and kicks the target CPU, and the user-trap
@@ -108,6 +107,36 @@ static NEED_RESCHED: AtomicU64 = AtomicU64::new(0);
 /// differs, so does its layout, and a QEMU/TCG run has enough variance to hide
 /// the difference either way. This makes the comparison a boot parameter.
 static WAKEUP_PREEMPT: AtomicBool = AtomicBool::new(true);
+
+/// Per-CPU: the current poll is performing a voluntary `yield_now` self-wake.
+/// `WakerRef::wake_by_ref` reads this to park the task in the yielded lane
+/// instead of the urgent notified lane (see `waker_page`).
+static VOLUNTARY_YIELD: [AtomicBool; MAX_CORE_NUM] = {
+    const FALSE: AtomicBool = AtomicBool::new(false);
+    [FALSE; MAX_CORE_NUM]
+};
+
+/// Mark the current CPU as inside a voluntary yield self-wake.
+pub fn begin_voluntary_yield() {
+    let cpu = crate::arch::cpu_id() as usize;
+    if cpu < MAX_CORE_NUM {
+        VOLUNTARY_YIELD[cpu].store(true, Ordering::Relaxed);
+    }
+}
+
+/// Clear the voluntary-yield marker for the current CPU.
+pub fn end_voluntary_yield() {
+    let cpu = crate::arch::cpu_id() as usize;
+    if cpu < MAX_CORE_NUM {
+        VOLUNTARY_YIELD[cpu].store(false, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub(crate) fn is_voluntary_yield_wake() -> bool {
+    let cpu = crate::arch::cpu_id() as usize;
+    cpu < MAX_CORE_NUM && VOLUNTARY_YIELD[cpu].load(Ordering::Relaxed)
+}
 
 /// Enable/disable wake-up preemption. Called once at boot from the command
 /// line; there is no reason to flip it at runtime.

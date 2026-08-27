@@ -21,7 +21,15 @@ impl Future for YieldFuture {
             Poll::Ready(())
         } else {
             self.flag = true;
+            // Park the self-wake in the scheduler's yielded lane (behind any
+            // external notify) so wake-up preemption actually hands the CPU to
+            // the woken task instead of re-electing this one. See
+            // `executor::begin_voluntary_yield` / `WakerPage::mark_yielded`.
+            #[cfg(target_os = "none")]
+            executor::begin_voluntary_yield();
             cx.waker().wake_by_ref();
+            #[cfg(target_os = "none")]
+            executor::end_voluntary_yield();
             Poll::Pending
         }
     }

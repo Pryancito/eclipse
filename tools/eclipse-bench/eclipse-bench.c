@@ -186,6 +186,7 @@ static double timed_ns_per_op(int (*fn)(void), uint64_t budget_ns) {
 
 static void line(void) {
     printf("----------------------------------------------------------------------\n");
+    fflush(stdout);
 }
 
 // One measured row. `unit` is printed after the value; `hint` is a short note
@@ -205,6 +206,7 @@ static void row(const char *tag, const char *label, double value,
     if (hint && *hint)
         printf(" %s", hint);
     printf("\n");
+    fflush(stdout);
 }
 
 static void hr_bytes(double bps, char *out, size_t n) {
@@ -2019,6 +2021,8 @@ int main(int argc, char **argv) {
             // Where a wake lands: same CPU (context switch, hot cache) against
             // a neighbouring CPU (remote wake, IPI).
             if (ncpu > 1) {
+                printf("  -- pipe RT pinned (affinity) --\n");
+                fflush(stdout);
                 double same = smpk_pipe_rt_pinned(0, 0, ncpu, g_short_ns);
                 double cross = smpk_pipe_rt_pinned(0, 1, ncpu, g_short_ns);
                 row("[kernel]", "pipe RT pinned same-CPU",
@@ -2031,6 +2035,8 @@ int main(int argc, char **argv) {
             }
 
             // Everybody forks at once: the copy-on-write machinery colliding.
+            printf("  -- parallel forks / fairness (can be slow) --\n");
+            fflush(stdout);
             double fk1 = smpk_forks_per_s(1, g_short_ns);
             double fkn = ncpu > 1 ? smpk_forks_per_s(ncpu, g_short_ns) : NA;
             row("[kernel]", "forks/s x1", fk1, "forks/s", "");
@@ -2049,6 +2055,7 @@ int main(int argc, char **argv) {
             printf("  one that punishes a slow IPI/ack path; the fairness row\n");
             printf("  catches a scheduler that posts great aggregates by\n");
             printf("  starving somebody.\n");
+            fflush(stdout);
         }
     }
 

@@ -201,6 +201,19 @@ enum Commands {
     /// ```
     Opencv(ArchArg),
 
+    /// Install the Phoronix Test Suite submodule into the Linux rootfs.
+    ///
+    /// Copies `tools/phoronix-test-suite` into `rootfs/<arch>` via upstream
+    /// `install-sh` (`DESTDIR=rootfs`, prefix `/usr`). The guest needs PHP to
+    /// run tests; this command only lays down the framework.
+    ///
+    /// # Example
+    ///
+    /// ```bash
+    /// cargo phoronix --arch x86_64
+    /// ```
+    Phoronix(ArchArg),
+
     /// 将 libc 测试集拷贝到 rootfs 目录对应位置。Copies libc test files to rootfs directory.
     ///
     /// # Example
@@ -307,6 +320,7 @@ fn main() {
             arg.linux_rootfs().put_musl_libs();
         }
         Opencv(arg) => arg.linux_rootfs().put_opencv(),
+        Phoronix(arg) => arg.linux_rootfs().put_phoronix(),
         Ffmpeg(arg) => arg.linux_rootfs().put_ffmpeg(),
         LibcTest(arg) => arg.linux_rootfs().put_libc_test(),
         OtherTest(arg) => arg.linux_rootfs().put_other_test(),

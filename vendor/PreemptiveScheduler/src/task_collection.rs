@@ -469,6 +469,11 @@ impl TaskCollection {
                 loop {
                     let mut found_key: Option<Key> = None;
                     let mut inner = self.get_mut_inner(priority);
+                    // Pass 1 — urgent external wakes. Must finish before any
+                    // voluntary yield on *any* page is promoted, or a hog that
+                    // just preempted for a sleeper can re-steal the CPU from a
+                    // lower-index page while the sleeper sits notified on a
+                    // higher one.
                     for page_idx in 0..inner.pages.len() {
                         let page = &inner.pages[page_idx];
                         let notified = page.take_notified();
@@ -476,16 +481,7 @@ impl TaskCollection {
                         if notified != 0 {
                             let cpu = crate::arch::cpu_id() as usize;
                             for subpage_idx in BitIter::from(notified) {
-                                // the key corresponding to the task
                                 let key = pack_key(priority, page_idx, subpage_idx);
-                                // Honor CPU affinity: a task may only be polled
-                                // on a CPU allowed by its mask. If the CPU that
-                                // is currently draining this collection (its own
-                                // executor, or a thief during work stealing) is
-                                // not allowed, re-arm the notified bit and skip
-                                // it — an allowed CPU will pick it up on its next
-                                // scan or steal. Leaving the bit set keeps the
-                                // task discoverable instead of losing the wakeup.
                                 let allowed = inner
                                     .slab
                                     .get(unmask_priority(key))
@@ -493,16 +489,6 @@ impl TaskCollection {
                                     .unwrap_or(true);
                                 if !allowed {
                                     inner.pages[page_idx].notify(subpage_idx);
-                                    // Forward the wake to a CPU that MAY run
-                                    // it. Re-arming the bit alone left the task
-                                    // discoverable but told nobody: a pinned
-                                    // task woken from another CPU sat notified
-                                    // in this collection until an allowed CPU's
-                                    // next tick woke it to steal — measured as
-                                    // a 7.4 ms (two-tick) cross-CPU pipe round
-                                    // trip against 60 us same-CPU. One kick
-                                    // through `request_resched`'s existing
-                                    // coalescing turns that into an IPI.
                                     let mask = inner
                                         .slab
                                         .get(unmask_priority(key))
@@ -512,19 +498,6 @@ impl TaskCollection {
                                     continue;
                                 }
                                 found_key = Some(key);
-                                // Mark the task borrowed ATOMICALLY here, under the
-                                // inner lock and before releasing it to be polled.
-                                // `take_notified` cleared this task's notified bit,
-                                // but the executor only set the borrowed bit AFTER
-                                // take_task returned — leaving a window where a wake
-                                // (e.g. a network IRQ) re-notified the task and a
-                                // second CPU's take_task/steal picked up the SAME
-                                // task, polling one future (and its single
-                                // UserContext + coroutine stack) on two CPUs at once
-                                // -> corrupted context -> iret to junk -> #UD/#SS.
-                                // Setting borrowed now makes any racing wake defer
-                                // the task (take_notified re-publishes borrowed bits)
-                                // until this poll releases the borrow.
                                 inner.pages[page_idx].mark_borrowed(subpage_idx, true);
                                 drop(inner);
                                 yield found_key;
@@ -533,10 +506,42 @@ impl TaskCollection {
                         }
                         if dropped != 0 {
                             for subpage_idx in BitIter::from(dropped) {
-                                // the key corresponding to the task
                                 let key = pack_key(priority, page_idx, subpage_idx);
                                 self.task_num.fetch_sub(1, Ordering::Relaxed);
                                 inner.remove(key);
+                            }
+                        }
+                    }
+                    // Pass 2 — voluntary yields, only when nothing urgent remains.
+                    if found_key.is_none() {
+                        for page_idx in 0..inner.pages.len() {
+                            let yielded = inner.pages[page_idx].take_yielded();
+                            if yielded == 0 {
+                                continue;
+                            }
+                            let cpu = crate::arch::cpu_id() as usize;
+                            for subpage_idx in BitIter::from(yielded) {
+                                let key = pack_key(priority, page_idx, subpage_idx);
+                                let allowed = inner
+                                    .slab
+                                    .get(unmask_priority(key))
+                                    .map(|task| task.allowed_on(cpu))
+                                    .unwrap_or(true);
+                                if !allowed {
+                                    inner.pages[page_idx].mark_yielded(subpage_idx);
+                                    let mask = inner
+                                        .slab
+                                        .get(unmask_priority(key))
+                                        .and_then(|task| task.affinity_mask())
+                                        .unwrap_or(u64::MAX);
+                                    crate::runtime::kick_for_affinity(mask, cpu);
+                                    continue;
+                                }
+                                found_key = Some(key);
+                                inner.pages[page_idx].mark_borrowed(subpage_idx, true);
+                                drop(inner);
+                                yield found_key;
+                                inner = self.get_mut_inner(priority);
                             }
                         }
                     }

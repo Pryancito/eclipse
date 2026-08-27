@@ -47,8 +47,9 @@ pub use runtime::{
     current_stack_top_looks_null, current_task_abandonable, fault_sp_abandonable, handle_timeout,
     heap_smash_suspected, irq_on_idle_executor, irq_should_skip_dyn_dispatch,
     irq_should_skip_heavy_work, note_heap_smash_suspected, run_until_idle, runnable_task_count,
-    sched_yield, set_idle_callback, set_resched_ipi_sender, set_wakeup_preempt, spawn,
-    spawn_with_affinity, take_need_resched, wakeup_preempt_enabled, wakeup_preempt_stats,
+    begin_voluntary_yield, end_voluntary_yield, sched_yield, set_idle_callback,
+    set_resched_ipi_sender, set_wakeup_preempt, spawn, spawn_with_affinity,
+    take_need_resched, wakeup_preempt_enabled, wakeup_preempt_stats,
     warm_runtimes, FaultStackAttr, StackAttrHit, StackPtrRegion,
 };
 

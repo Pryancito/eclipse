@@ -132,6 +132,11 @@ fn nice_to_weight(nice: i8) -> u32 {
 }
 
 /// Base timeslice for a nice-0 fair task: 20 ms.
+///
+/// Wake-up preemption + the yielded-lane fix (see `WakerPage::mark_yielded`)
+/// already give the CPU to freshly woken tasks; shortening the slice is not
+/// required for interactivity and would raise preemption churn on workloads
+/// that were already fine (SMP aggregate, pipe bandwidth, desktop).
 const BASE_TIMESLICE_NS: u64 = 20_000_000;
 /// Timeslice for `SCHED_RR` tasks: 100 ms, matching Linux's default RR quantum.
 const RR_TIMESLICE_NS: u64 = 100_000_000;
