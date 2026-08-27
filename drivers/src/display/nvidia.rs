@@ -8524,6 +8524,28 @@ impl NvidiaGpu {
             nv::NR_GETPARAM => {
                 let req = unsafe { &mut *(arg as *mut nv::DrmNouveauGetparam) };
                 let vram_bytes = (self.vram_size_mb as u64) * 1024 * 1024;
+                // One-shot, VISIBLE memory picture NVK builds its heaps from.
+                // FB_SIZE = 0 (VRAM undetected) is the classic cause of the NULL
+                // heap-list walk that crashes NVK right after device creation:
+                // the "failed to create timeline semaphore" is zink hitting a
+                // half-built device whose VRAM heap has no memory. VRAM_BAR_SIZE
+                // is the BAR1 host-visible aperture; rm_attached says whether
+                // these came from the live GSP-RM or a fallback.
+                {
+                    static LOGGED: core::sync::atomic::AtomicBool =
+                        core::sync::atomic::AtomicBool::new(false);
+                    if !LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                        let rm_attached = self.rm_device_instance.lock().is_some();
+                        crate::klog_info!(
+                            "[nouveau-uapi] NVK mem: FB_SIZE={} MiB (vram_size_mb={}) \
+                             VRAM_BAR_SIZE={} bytes rm_attached={}",
+                            vram_bytes / (1024 * 1024),
+                            self.vram_size_mb,
+                            self.info.fb_size as u64,
+                            rm_attached
+                        );
+                    }
+                }
                 req.value = match req.param {
                     nv::NOUVEAU_GETPARAM_PCI_VENDOR => 0x10de,
                     nv::NOUVEAU_GETPARAM_PCI_DEVICE => self.device_id as u64,
