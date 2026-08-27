@@ -1972,7 +1972,10 @@ impl E1000eInterface {
             if link_changed {
                 me.link_up_seen.store(link_up, Ordering::Release);
             }
-            me.watchdog_job_scheduled.store(false, Ordering::Release);
+            // Drop the Guard (clears watchdog_job_scheduled to false) BEFORE
+            // calling schedule_watchdog, so the re-schedule can set the flag
+            // back to true and push a new job without the Guard clobbering it.
+            drop(_g);
             me.schedule_watchdog(false);
         });
     }
