@@ -4,6 +4,8 @@ use core::ptr::NonNull;
 #[cfg(feature = "graphic")]
 use alloc::format;
 
+use acpi::platform::address::AddressSpace;
+use acpi::sdt::Signature;
 use acpi::{AcpiHandler, AcpiTables, PhysicalMapping};
 use spin::Mutex;
 use x86_64::instructions::port::Port;
@@ -34,7 +36,7 @@ impl AcpiHandler for AcpiMapHandler {
         let aligned_end = (physical_address + size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         PhysicalMapping::new(
             physical_address,
-            NonNull::new_unchecked((self.phys_to_virt)(physical_address) as *mut T),
+            unsafe { NonNull::new_unchecked((self.phys_to_virt)(physical_address) as *mut T) },
             size,
             aligned_end - aligned_start,
             self.clone(),
@@ -55,12 +57,17 @@ struct AcpiPowerButton {
 impl AcpiPowerButton {
     fn from_fadt(fadt: &acpi::fadt::Fadt) -> Option<(usize, Self)> {
         let sci = fadt.sci_interrupt as usize;
-        let event_len = fadt.pm1_event_length as u16;
-        let pm1a = fadt.pm1a_event_block as u16;
-        if sci == 0 || pm1a == 0 || event_len < 4 {
+        let pm1a = fadt.pm1a_event_block().ok()?;
+        if sci == 0 || pm1a.address_space != AddressSpace::SystemIo || pm1a.address == 0 || pm1a.bit_width < 32 {
             return None;
         }
-        let pm1b = (fadt.pm1b_event_block != 0).then_some(fadt.pm1b_event_block as u16);
+        let pm1a = pm1a.address as u16;
+        let pm1b = fadt
+            .pm1b_event_block()
+            .ok()
+            .flatten()
+            .filter(|gas| gas.address_space == AddressSpace::SystemIo && gas.address != 0 && gas.bit_width >= 32)
+            .map(|gas| gas.address as u16);
         Some((
             sci,
             Self {
@@ -127,8 +134,12 @@ fn init_acpi_power_button(irq: &Arc<Apic>) {
             return;
         }
     };
-    let fadt = match tables.find_table::<acpi::fadt::Fadt>() {
-        Ok(t) => t,
+    let fadt = match unsafe { tables.get_sdt::<acpi::fadt::Fadt>(Signature::FADT) } {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            crate::klog_warn!("[acpi] power button disabled: no FADT");
+            return;
+        }
         Err(e) => {
             crate::klog_warn!("[acpi] power button disabled: no FADT: {:?}", e);
             return;
