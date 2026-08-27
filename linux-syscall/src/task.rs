@@ -671,6 +671,23 @@ impl Syscall<'_> {
                 error!("execve: envp.read_cstring_array() failed: {:?}", e);
             })?;
         }
+        // Bound argv+envp so a huge argument list -- a glob like `rm dir/*`
+        // expanding to thousands of paths -- fails with E2BIG instead of
+        // overrunning the initial stack image the loader builds. Without this
+        // the stack builder's `assert!` tripped and PANICKED THE KERNEL from an
+        // ordinary userspace command. Matches Linux's "1/4 of the stack" rule:
+        // the user stack is USER_STACK_PAGES (128) * 4 KiB = 512 KiB, so cap the
+        // arg/env bytes (plus one 8-byte table pointer per entry) at 128 KiB.
+        const ARG_MAX: usize = 128 * 1024;
+        let arg_bytes: usize = args.iter().map(|s| s.len() + 1 + 8).sum::<usize>()
+            + envs.iter().map(|s| s.len() + 1 + 8).sum::<usize>();
+        if arg_bytes > ARG_MAX {
+            warn!(
+                "execve: argv+envp too large ({} > {} bytes) for {:?} -> E2BIG",
+                arg_bytes, ARG_MAX, path_str
+            );
+            return Err(LxError::E2BIG);
+        }
         info!(
             "execve: path: {:?}, args: {:?}, envs: {:?}",
             path_str, args, envs

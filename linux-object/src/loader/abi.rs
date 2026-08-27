@@ -21,7 +21,19 @@ impl ProcInitInfo {
     pub fn push_at(&self, stack_top: usize) -> Stack {
         // We will build the stack from top to bottom.
         // The strings and random bytes go first (highest addresses).
-        let mut writer = Stack::new(stack_top);
+        //
+        // Size the buffer to the exact image up front (upper bound on every
+        // push below). A fixed 0x4000 overran and asserted -> kernel panic on a
+        // big argv/envp; total argv+envp is separately capped to E2BIG in
+        // sys_execve, so this bound stays modest.
+        let table_entries =
+            1 + self.args.len() + 1 + self.envs.len() + 1 + self.auxv.len() * 2 + 6;
+        let strings: usize = self.args[0].len()
+            + 1
+            + self.args.iter().map(|s| s.len() + 1).sum::<usize>()
+            + self.envs.iter().map(|s| s.len() + 1).sum::<usize>();
+        let needed = 16 + strings + table_entries * 8 + 32;
+        let mut writer = Stack::new(stack_top, needed.max(0x4000));
 
         // 1. Random bytes for AT_RANDOM (16 bytes)
         let random_bytes = [0u8; 16]; // TODO: use real random
@@ -113,11 +125,19 @@ pub struct Stack {
 }
 
 impl Stack {
-    /// create a stack
-    #[allow(clippy::uninit_vec, unsafe_code)] // FIXME: 这是什么东西？！为什么要这么做？！实在难以理解！！
-    fn new(sp: usize) -> Self {
-        let mut data = Vec::with_capacity(0x4000);
-        unsafe { data.set_len(0x4000) };
+    /// Create a stack image buffer of `capacity` bytes.
+    ///
+    /// `capacity` MUST be an upper bound on everything the caller will push
+    /// (strings + pointer table + alignment): the copy in `push_slice_aligned`
+    /// indexes `data` from its END, so an undersized buffer trips the assert
+    /// there. It used to be a fixed 0x4000 (16 KiB), which a large argv/envp
+    /// (a glob like `rm dir/*` expanding to thousands of paths) overran --
+    /// panicking the whole kernel from an ordinary userspace command. Callers
+    /// now size it to the actual image.
+    #[allow(clippy::uninit_vec, unsafe_code)]
+    fn new(sp: usize, capacity: usize) -> Self {
+        let mut data = Vec::with_capacity(capacity);
+        unsafe { data.set_len(capacity) };
         Stack {
             sp,
             stack_top: sp,
@@ -237,7 +257,15 @@ impl ProcInitInfo {
     /// via [`Stack::write_at`].
     pub fn push_at_freebsd(&self, stack_top: usize, aux: &FreebsdAuxv) -> Stack {
         use fbsd_at::*;
-        let mut w = Stack::new(stack_top);
+        // Size the buffer to the exact image (see push_at). ps_strings(32) +
+        // canary(16) + pagesizes(8) + strings + a 19-entry auxv + tables.
+        let table_entries = 1 + self.args.len() + 1 + self.envs.len() + 1 + 19 * 2 + 2;
+        let strings: usize = aux.execpath.len()
+            + 1
+            + self.args.iter().map(|s| s.len() + 1).sum::<usize>()
+            + self.envs.iter().map(|s| s.len() + 1).sum::<usize>();
+        let needed = 32 + 16 + 8 + strings + table_entries * 8 + 32;
+        let mut w = Stack::new(stack_top, needed.max(0x4000));
 
         // 1. ps_strings placeholder (32 bytes: argvstr, nargv, envstr, nenv).
         w.push_slice(&[0u8; 32]);
