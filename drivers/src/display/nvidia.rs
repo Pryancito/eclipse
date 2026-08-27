@@ -8016,13 +8016,46 @@ impl NvidiaGpu {
                 return None;
             }
         };
-        Some([
+        let classes = [
             nv::CLASS_FERMI_TWOD_A,
             nv::CLASS_KEPLER_INLINE_TO_MEMORY_B,
             eng3d,
             compute,
             copy,
-        ])
+        ];
+        // One-shot, VISIBLE snapshot of every enumeration-fatal value NVK reads
+        // to build its physical device: architecture, chipset/revision (its ONLY
+        // SM source in NVK 26.x), the five engine classes it demands non-zero,
+        // and the GRAPH_UNITS gpc/tpc it sizes shader-local memory from. NVK
+        // crashing INSIDE vkCreateDevice / timeline-semaphore setup with NO
+        // failing ioctl on the console means it accepted all of these and then
+        // dereferenced a NULL built from one of them -- so a wrong value here (a
+        // zero class, an arch mismatch, gpc/tpc reading low) is the prime
+        // suspect, and this makes the whole set readable from one console photo.
+        {
+            static LOGGED: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                let gu = self.nouveau_graph_units();
+                crate::klog_info!(
+                    "[nouveau-uapi] NVK enum: arch={:?} chipset={:#x} rev={:#x} \
+                     classes=[2d={:#x} m2mf={:#x} 3d={:#x} comp={:#x} copy={:#x}] \
+                     graph_units={:#x} (gpc={} tpc={})",
+                    self.nouveau_arch(),
+                    self.nouveau_chipset_id(),
+                    self.nouveau_chip_revision(),
+                    classes[0],
+                    classes[1],
+                    classes[2],
+                    classes[3],
+                    classes[4],
+                    gu,
+                    gu & 0xff,
+                    (gu >> 8) & 0xffff
+                );
+            }
+        }
+        Some(classes)
     }
 
     /// `DRM_NOUVEAU_NVIF` (nr 0x47) -- nouveau's generic object-model ioctl.
