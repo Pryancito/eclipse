@@ -1457,7 +1457,10 @@ impl INode for DrmDev {
                 // so text consoles are no longer gated off screen/input, and
                 // drop its atomic-client negotiation so the next (possibly
                 // legacy-only) client starts with a clean property view.
+                // Also cancel any deferred flip/vblank events — a late timer
+                // would otherwise feed drmHandleEvent with freed user_data.
                 drm::clear_graphics_owner();
+                drm::cancel_pending_events();
                 drm::set_atomic_client(false);
                 Ok(0)
             }
@@ -1656,10 +1659,10 @@ impl INode for DrmDev {
             }
             DRM_IOCTL_MODE_PAGE_FLIP => {
                 let flip = unsafe { *(data as *const DrmModeCrtcPageFlip) };
-                if drm::page_flip(flip.fb_id, flip.crtc_id, flip.user_data) {
-                    Ok(0)
-                } else {
-                    Err(FsError::DeviceError)
+                match drm::page_flip(flip.fb_id, flip.crtc_id, flip.user_data) {
+                    Ok(()) => Ok(0),
+                    Err(drm::FlipError::Busy) => Err(FsError::Busy),
+                    Err(drm::FlipError::Failed) => Err(FsError::DeviceError),
                 }
             }
             DRM_IOCTL_WAIT_VBLANK => {
@@ -2407,6 +2410,7 @@ impl INode for DrmDev {
                         drm::AtomicError::Invalid => FsError::InvalidParam,
                         drm::AtomicError::NotFound => FsError::EntryNotFound,
                         drm::AtomicError::Device => FsError::DeviceError,
+                        drm::AtomicError::Busy => FsError::Busy,
                     })?;
                 Ok(0)
             }

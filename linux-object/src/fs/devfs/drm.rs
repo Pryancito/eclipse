@@ -8,7 +8,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::time::Duration;
 use lock::Mutex;
 
@@ -1068,12 +1068,31 @@ fn restore_rect(
 /// core and a pegged one under emulation.
 const VBLANK_PERIOD: Duration = Duration::from_nanos(16_666_667);
 
-pub fn page_flip(fb_id: u32, crtc_id: u32, user_data: u64) -> bool {
-    let flipped = present_now(fb_id, crtc_id);
-    if flipped {
-        schedule_flip_event(crtc_id, user_data);
+/// Outcome of a legacy/`PAGE_FLIP` or atomic flip-with-event request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlipError {
+    /// A previous flip's completion event has not been posted yet (Linux EBUSY).
+    Busy,
+    /// Present/scanout failed.
+    Failed,
+}
+
+pub fn page_flip(fb_id: u32, crtc_id: u32, user_data: u64) -> Result<(), FlipError> {
+    // One outstanding flip-complete per CRTC — same rule as Linux. The old
+    // coalesced timer stored a single `Option` and *overwrote* it, so a second
+    // flip (or a WAIT_VBLANK event) silently dropped the first completion.
+    // wlroots then either kept `pageflip_pending` forever or later handled a
+    // stale/mismatched event and `wl_list_remove`'d an already-cleared
+    // listener (SIGSEGV @ 0x8 in labwc).
+    if FLIP_EVENT_PENDING.load(Ordering::Acquire) {
+        return Err(FlipError::Busy);
     }
-    flipped
+    let flipped = present_now(fb_id, crtc_id);
+    if !flipped {
+        return Err(FlipError::Failed);
+    }
+    schedule_flip_event(crtc_id, user_data);
+    Ok(())
 }
 
 /// Deliver a page-flip completion at the next synthetic vblank boundary rather
@@ -1083,32 +1102,42 @@ pub fn page_flip(fb_id: u32, crtc_id: u32, user_data: u64) -> bool {
 /// loop runs at most once per [`VBLANK_PERIOD`]. If the previous vblank is
 /// already in the past (compositor was idle, or renders slower than 60 Hz) the
 /// event still fires one period out, never faster.
-/// Coalesced pending DRM completions: at most one `timer_set` arm. Labwc /
-/// lunarbar used to enqueue a fresh Box per flip/vblank, amplifying IRQ
-/// callback churn at desktop bring-up.
+///
+/// Pending DRM completions share one `timer_set` arm (labwc/lunarbar used to
+/// enqueue a fresh Box per flip/vblank), but the jobs themselves live in a
+/// queue — never overwrite — so every successful flip still gets its event.
 #[derive(Clone, Copy)]
 enum PendingDrmTimer {
     Flip { crtc_id: u32, user_data: u64 },
     Vblank { seq: u32, signal: u64 },
 }
 
-static PENDING_DRM_TIMER: Mutex<Option<PendingDrmTimer>> = Mutex::new(None);
-static DRM_TIMER_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+lazy_static::lazy_static! {
+    static ref PENDING_DRM_TIMERS: Mutex<VecDeque<PendingDrmTimer>> =
+        Mutex::new(VecDeque::new());
+}
+static DRM_TIMER_ARMED: AtomicBool = AtomicBool::new(false);
+/// True between [`schedule_flip_event`] and the matching [`queue_flip_event`].
+static FLIP_EVENT_PENDING: AtomicBool = AtomicBool::new(false);
 
 fn deliver_pending_drm_timer() {
     DRM_TIMER_ARMED.store(false, Ordering::Release);
-    let job = PENDING_DRM_TIMER.lock().take();
-    match job {
-        Some(PendingDrmTimer::Flip { crtc_id, user_data }) => {
-            queue_flip_event(crtc_id, user_data);
+    // Everything scheduled for this vblank boundary completes together — the
+    // queue is bounded by the EBUSY gate on flips (≤1 Flip) plus any vblank
+    // waits posted in the same period.
+    let jobs: Vec<PendingDrmTimer> = PENDING_DRM_TIMERS.lock().drain(..).collect();
+    for job in jobs {
+        match job {
+            PendingDrmTimer::Flip { crtc_id, user_data } => {
+                queue_flip_event(crtc_id, user_data);
+            }
+            PendingDrmTimer::Vblank { seq, signal } => {
+                queue_vblank_event(seq, signal);
+            }
         }
-        Some(PendingDrmTimer::Vblank { seq, signal }) => {
-            queue_vblank_event(seq, signal);
-        }
-        None => {}
     }
     // Something scheduled while we delivered — arm one more shot.
-    if PENDING_DRM_TIMER.lock().is_some() {
+    if !PENDING_DRM_TIMERS.lock().is_empty() {
         arm_coalesced_drm_timer_locked();
     }
 }
@@ -1123,11 +1152,12 @@ fn arm_coalesced_drm_timer_locked() {
 }
 
 fn arm_coalesced_drm_timer(pending: PendingDrmTimer) {
-    *PENDING_DRM_TIMER.lock() = Some(pending);
+    PENDING_DRM_TIMERS.lock().push_back(pending);
     arm_coalesced_drm_timer_locked();
 }
 
 fn schedule_flip_event(crtc_id: u32, user_data: u64) {
+    FLIP_EVENT_PENDING.store(true, Ordering::Release);
     arm_coalesced_drm_timer(PendingDrmTimer::Flip { crtc_id, user_data });
 }
 
@@ -1138,6 +1168,18 @@ fn schedule_flip_event(crtc_id: u32, user_data: u64) {
 pub fn schedule_vblank_event(signal: u64) {
     let seq = vblank_seq_now().wrapping_add(1);
     arm_coalesced_drm_timer(PendingDrmTimer::Vblank { seq, signal });
+}
+
+/// Drop any not-yet-posted flip/vblank completions (timer queue + readable
+/// event bytes). Called from `DROP_MASTER` so a compositor teardown cannot
+/// leave a timer that later feeds `drmHandleEvent` with a stale `user_data`.
+pub fn cancel_pending_events() {
+    PENDING_DRM_TIMERS.lock().clear();
+    DRM_TIMER_ARMED.store(false, Ordering::Release);
+    FLIP_EVENT_PENDING.store(false, Ordering::Release);
+    let mut state = DRM_STATE.lock();
+    state.events.clear();
+    state.eventbus.lock().clear(Event::READABLE);
 }
 
 /// Advance the synthetic vblank clock and return the monotonic instant the next
@@ -1294,6 +1336,9 @@ fn queue_flip_event(crtc_id: u32, user_data: u64) {
     const DRM_EVENT_FLIP_COMPLETE: u32 = 2;
     let seq = FLIP_SEQ.fetch_add(1, Ordering::Relaxed);
     push_drm_event(DRM_EVENT_FLIP_COMPLETE, crtc_id, seq, user_data);
+    // Flip is complete from the KMS POV once the event is on the card fd —
+    // a new PAGE_FLIP may be accepted even before userspace reads it.
+    FLIP_EVENT_PENDING.store(false, Ordering::Release);
 }
 
 /// Enqueue a `DRM_EVENT_VBLANK` for a `WAIT_VBLANK` request that asked for an
@@ -1432,7 +1477,8 @@ pub struct AtomicUpdate {
 }
 
 /// Why an atomic check/commit was refused. Mapped to errno by the ioctl
-/// dispatcher (`Invalid` → EINVAL, `NotFound` → ENOENT, `Device` → EIO).
+/// dispatcher (`Invalid` → EINVAL, `NotFound` → ENOENT, `Device` → EIO,
+/// `Busy` → EBUSY).
 pub enum AtomicError {
     /// Malformed value, rect out of bounds, or a modeset without
     /// `DRM_MODE_ATOMIC_ALLOW_MODESET`.
@@ -1441,6 +1487,8 @@ pub enum AtomicError {
     NotFound,
     /// The present itself failed.
     Device,
+    /// A previous flip-complete event is still outstanding.
+    Busy,
 }
 
 /// Validate and (unless `test_only`) apply an atomic update, queueing one
@@ -1573,6 +1621,13 @@ pub fn atomic_commit(
         return Ok(());
     }
 
+    // Refuse overlapping flip-events *before* mutating scanout state so a
+    // Busy return never leaves the CRTC presenting a buffer whose completion
+    // we then decline to queue (see [`page_flip`]).
+    if want_event && FLIP_EVENT_PENDING.load(Ordering::Acquire) {
+        return Err(AtomicError::Busy);
+    }
+
     // --- Commit phase ---
     {
         let mut state = DRM_STATE.lock();
@@ -1642,7 +1697,8 @@ pub fn atomic_commit(
     if want_event {
         // One event per CRTC in the commit; the pipeline has exactly one.
         // Paced to the synthetic vblank (not delivered now) for the same
-        // anti-spin reason as the legacy page-flip path.
+        // anti-spin reason as the legacy page-flip path. Busy was checked
+        // above before present.
         schedule_flip_event(SYNTH_CRTC_ID, user_data);
     }
     Ok(())
