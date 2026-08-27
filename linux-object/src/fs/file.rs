@@ -153,9 +153,7 @@ type SharedVmoMap = alloc::collections::BTreeMap<
 /// back to the Arc pointer: no cross-open dedup, but never a false merge.
 fn cache_key(inode: &Arc<dyn INode>) -> (usize, usize) {
     match inode.metadata() {
-        Ok(md) if md.inode != 0 => {
-            (Arc::as_ptr(&inode.fs()) as *const () as usize, md.inode)
-        }
+        Ok(md) if md.inode != 0 => (Arc::as_ptr(&inode.fs()) as *const () as usize, md.inode),
         _ => (Arc::as_ptr(inode) as *const () as usize, usize::MAX),
     }
 }
@@ -314,7 +312,6 @@ fn inode_cache_vmo(
     registry.insert(key, (vmo.clone(), Arc::downgrade(inode), mark_shared));
     Some(vmo)
 }
-
 
 fn prune_shared_vmos(registry: &mut SharedVmoMap) {
     registry.retain(|_, (vmo, inode_weak, ever_shared)| {
@@ -823,14 +820,9 @@ impl FileLike for File {
                 // a cache too short for the window (file grew) declines. Both
                 // fall back to the private demand-paged snapshot below.
                 if offset.is_multiple_of(PAGE_SIZE) {
-                    if let Some(cache) = inode_cache_vmo(
-                        &inner.inode,
-                        &self.path,
-                        file_size,
-                        offset,
-                        len,
-                        false,
-                    ) {
+                    if let Some(cache) =
+                        inode_cache_vmo(&inner.inode, &self.path, file_size, offset, len, false)
+                    {
                         let vmo = VmObject::new_paged_borrowing(pages(len), cache, offset);
                         vmo.set_name(&self.path);
                         return Ok(vmo);
@@ -891,9 +883,7 @@ impl FileLike for File {
         // anchored to the inode's lifetime (see SHARED_FILE_VMOS) so MAP_SHARED
         // writes survive the writer's munmap — the wl_keyboard keymap depends
         // on this.
-        if let Some(vmo) =
-            inode_cache_vmo(&inner.inode, &self.path, file_size, offset, len, true)
-        {
+        if let Some(vmo) = inode_cache_vmo(&inner.inode, &self.path, file_size, offset, len, true) {
             return Ok((vmo, offset));
         }
         // Mapping reaches past the cache VMO (file grew after creation). Rare;

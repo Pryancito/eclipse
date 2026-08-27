@@ -172,131 +172,132 @@ impl Syscall<'_> {
         // probes its library search path. The closure is a zero-cost wrapper:
         // no allocation, no extra work, just structure.
         let ret: SysResult = (|| {
-        // Pseudo-terminals. Opening `/dev/ptmx` mints a brand-new master (each
-        // open must yield an independent PTY pair, which the generic INode open
-        // path cannot express), and `/dev/pts/N` resolves to the matching slave
-        // from the live PTY registry rather than a static device node.
-        if path == "/dev/ptmx" {
-            let inode = pty::alloc_ptmx();
-            let file = File::new(inode, flags, String::from("/dev/ptmx"));
-            let fd = proc.add_file(file)?;
-            return Ok(fd.into());
-        }
-        if let Some(id) = pty::pts_id_from_path(path) {
-            let inode = pty::open_pts(id).ok_or(LxError::ENXIO)?;
-            let file = File::new(inode, flags, String::from(path));
-            let fd = proc.add_file(file)?;
-            return Ok(fd.into());
-        }
-        // `/dev/tty` is the *controlling terminal* of the calling process, which
-        // for our per-VT shells is that process's own virtual terminal. Resolve
-        // it per-caller instead of through a single shared node: otherwise a
-        // background-VT shell's job-control query — `tcgetpgrp("/dev/tty")` —
-        // returns the *active* VT's foreground pgrp, never equals its own pgrp,
-        // and busybox spins forever on `killpg(0, SIGTTIN)` (a CPU-burning busy
-        // loop on every spare VT — the dominant idle heat once the signal
-        // self-deadlock is fixed).
-        if path == "/dev/tty" {
-            // A process RUNNING ON A PTY (the shell inside foot/alacritty) must
-            // get its own pts back, not the VT. busybox ash opens /dev/tty for
-            // job control, and handing it the VT reads/writes ANOTHER
-            // terminal's foreground pgrp: the first pty shell's tcsetpgrp()
-            // stamped its pid into the VT's global fg_pgrp, and every LATER pty
-            // shell then saw that stale pid from tcgetpgrp(), never matched its
-            // own pgrp, and spun forever in killpg(0, SIGTTIN) without printing
-            // a prompt — foot worked exactly once per boot, then never again.
-            // There is no session/ctty tracking to consult (setsid is a stub),
-            // so use the fds: stdin/stdout/stderr on a pts means the caller's
-            // controlling terminal is that pty.
-            let pts = (0i32..3).find_map(|n| {
-                let f = proc.get_file_like(FileDesc::from(n)).ok()?;
-                let file = f.downcast_ref::<File>()?;
-                let inode = file.inode();
-                let slave = inode.as_any_ref().downcast_ref::<pty::PtySlave>()?;
-                pty::open_pts(slave.pty_id())
-            });
-            if let Some(inode) = pts {
+            // Pseudo-terminals. Opening `/dev/ptmx` mints a brand-new master (each
+            // open must yield an independent PTY pair, which the generic INode open
+            // path cannot express), and `/dev/pts/N` resolves to the matching slave
+            // from the live PTY registry rather than a static device node.
+            if path == "/dev/ptmx" {
+                let inode = pty::alloc_ptmx();
+                let file = File::new(inode, flags, String::from("/dev/ptmx"));
+                let fd = proc.add_file(file)?;
+                return Ok(fd.into());
+            }
+            if let Some(id) = pty::pts_id_from_path(path) {
+                let inode = pty::open_pts(id).ok_or(LxError::ENXIO)?;
+                let file = File::new(inode, flags, String::from(path));
+                let fd = proc.add_file(file)?;
+                return Ok(fd.into());
+            }
+            // `/dev/tty` is the *controlling terminal* of the calling process, which
+            // for our per-VT shells is that process's own virtual terminal. Resolve
+            // it per-caller instead of through a single shared node: otherwise a
+            // background-VT shell's job-control query — `tcgetpgrp("/dev/tty")` —
+            // returns the *active* VT's foreground pgrp, never equals its own pgrp,
+            // and busybox spins forever on `killpg(0, SIGTTIN)` (a CPU-burning busy
+            // loop on every spare VT — the dominant idle heat once the signal
+            // self-deadlock is fixed).
+            if path == "/dev/tty" {
+                // A process RUNNING ON A PTY (the shell inside foot/alacritty) must
+                // get its own pts back, not the VT. busybox ash opens /dev/tty for
+                // job control, and handing it the VT reads/writes ANOTHER
+                // terminal's foreground pgrp: the first pty shell's tcsetpgrp()
+                // stamped its pid into the VT's global fg_pgrp, and every LATER pty
+                // shell then saw that stale pid from tcgetpgrp(), never matched its
+                // own pgrp, and spun forever in killpg(0, SIGTTIN) without printing
+                // a prompt — foot worked exactly once per boot, then never again.
+                // There is no session/ctty tracking to consult (setsid is a stub),
+                // so use the fds: stdin/stdout/stderr on a pts means the caller's
+                // controlling terminal is that pty.
+                let pts = (0i32..3).find_map(|n| {
+                    let f = proc.get_file_like(FileDesc::from(n)).ok()?;
+                    let file = f.downcast_ref::<File>()?;
+                    let inode = file.inode();
+                    let slave = inode.as_any_ref().downcast_ref::<pty::PtySlave>()?;
+                    pty::open_pts(slave.pty_id())
+                });
+                if let Some(inode) = pts {
+                    let file = File::new(inode, flags, String::from("/dev/tty"));
+                    let fd = proc.add_file(file)?;
+                    return Ok(fd.into());
+                }
+                let inode = linux_object::fs::stdio::vt_stdin(proc.vt());
                 let file = File::new(inode, flags, String::from("/dev/tty"));
                 let fd = proc.add_file(file)?;
                 return Ok(fd.into());
             }
-            let inode = linux_object::fs::stdio::vt_stdin(proc.vt());
-            let file = File::new(inode, flags, String::from("/dev/tty"));
-            let fd = proc.add_file(file)?;
-            return Ok(fd.into());
-        }
 
-        let inode = if flags.contains(OpenFlags::CREATE) {
-            let (dir_path, file_name) = split_path(path);
-            // relative to cwd
-            let dir_inode = proc.lookup_inode_at(dir_fd, dir_path, true)?;
-            let dir_metadata = dir_inode.metadata()?;
-            proc.check_access(&dir_metadata, 0o3, true)?;
-            match dir_inode.find(file_name) {
-                Ok(file_inode) => {
-                    if flags.contains(OpenFlags::EXCLUSIVE) {
-                        return Err(LxError::EEXIST);
+            let inode = if flags.contains(OpenFlags::CREATE) {
+                let (dir_path, file_name) = split_path(path);
+                // relative to cwd
+                let dir_inode = proc.lookup_inode_at(dir_fd, dir_path, true)?;
+                let dir_metadata = dir_inode.metadata()?;
+                proc.check_access(&dir_metadata, 0o3, true)?;
+                match dir_inode.find(file_name) {
+                    Ok(file_inode) => {
+                        if flags.contains(OpenFlags::EXCLUSIVE) {
+                            return Err(LxError::EEXIST);
+                        }
+                        let metadata = file_inode.metadata()?;
+                        if flags.writable() || flags.contains(OpenFlags::TRUNCATE) {
+                            proc.check_access(&metadata, 0o2, true)?;
+                        }
+                        if flags.readable() {
+                            proc.check_access(&metadata, 0o4, true)?;
+                        }
+                        file_inode
                     }
-                    let metadata = file_inode.metadata()?;
-                    if flags.writable() || flags.contains(OpenFlags::TRUNCATE) {
-                        proc.check_access(&metadata, 0o2, true)?;
+                    Err(FsError::EntryNotFound) => {
+                        let create_mode = proc.apply_umask(mode as u16);
+                        let inode =
+                            dir_inode.create(file_name, FileType::File, create_mode as u32)?;
+                        linux_object::fs::dcache_invalidate();
+                        proc.initialize_created_metadata(
+                            &inode,
+                            Some(&dir_metadata),
+                            create_mode,
+                            false,
+                        )?;
+                        inode
                     }
-                    if flags.readable() {
-                        proc.check_access(&metadata, 0o4, true)?;
-                    }
-                    file_inode
+                    Err(e) => return Err(LxError::from(e)),
                 }
-                Err(FsError::EntryNotFound) => {
-                    let create_mode = proc.apply_umask(mode as u16);
-                    let inode = dir_inode.create(file_name, FileType::File, create_mode as u32)?;
-                    linux_object::fs::dcache_invalidate();
-                    proc.initialize_created_metadata(
-                        &inode,
-                        Some(&dir_metadata),
-                        create_mode,
-                        false,
-                    )?;
-                    inode
+            } else {
+                let inode = proc.lookup_inode_at(dir_fd, path, true)?;
+                let metadata = inode.metadata()?;
+                if flags.readable() {
+                    proc.check_access(&metadata, 0o4, true)?;
                 }
-                Err(e) => return Err(LxError::from(e)),
-            }
-        } else {
-            let inode = proc.lookup_inode_at(dir_fd, path, true)?;
+                if flags.writable() {
+                    proc.check_access(&metadata, 0o2, true)?;
+                }
+                inode
+            };
             let metadata = inode.metadata()?;
-            if flags.readable() {
-                proc.check_access(&metadata, 0o4, true)?;
+            if metadata.type_ == FileType::Dir && flags.writable() {
+                return Err(LxError::EISDIR);
             }
-            if flags.writable() {
+            if flags.contains(OpenFlags::TRUNCATE) && metadata.type_ == FileType::File {
                 proc.check_access(&metadata, 0o2, true)?;
+                inode.resize(0)?;
             }
-            inode
-        };
-        let metadata = inode.metadata()?;
-        if metadata.type_ == FileType::Dir && flags.writable() {
-            return Err(LxError::EISDIR);
-        }
-        if flags.contains(OpenFlags::TRUNCATE) && metadata.type_ == FileType::File {
-            proc.check_access(&metadata, 0o2, true)?;
-            inode.resize(0)?;
-        }
-        // `/dev/ptmx` is a cloning device: each open allocates a fresh PTY
-        // master (and publishes its slave at `/dev/pts/N`). Prefer the
-        // `fs/pty` registry (absolute opens already special-cased above); the
-        // legacy `devfs::PtmxINode` path remains for any leftover node.
-        let inode = if inode
-            .downcast_ref::<linux_object::fs::pty::PtmxINode>()
-            .is_some()
-        {
-            linux_object::fs::pty::alloc_ptmx()
-        } else if let Some(ptmx) = inode.downcast_ref::<linux_object::fs::devfs::PtmxINode>() {
-            ptmx.open_master().map_err(LxError::from)?
-        } else {
-            inode
-        };
-        let abs_path = proc.get_absolute_path(dir_fd, path)?;
-        let file = File::new(inode, flags, abs_path);
-        let fd = proc.add_file(file)?;
-        Ok(fd.into())
+            // `/dev/ptmx` is a cloning device: each open allocates a fresh PTY
+            // master (and publishes its slave at `/dev/pts/N`). Prefer the
+            // `fs/pty` registry (absolute opens already special-cased above); the
+            // legacy `devfs::PtmxINode` path remains for any leftover node.
+            let inode = if inode
+                .downcast_ref::<linux_object::fs::pty::PtmxINode>()
+                .is_some()
+            {
+                linux_object::fs::pty::alloc_ptmx()
+            } else if let Some(ptmx) = inode.downcast_ref::<linux_object::fs::devfs::PtmxINode>() {
+                ptmx.open_master().map_err(LxError::from)?
+            } else {
+                inode
+            };
+            let abs_path = proc.get_absolute_path(dir_fd, path)?;
+            let file = File::new(inode, flags, abs_path);
+            let fd = proc.add_file(file)?;
+            Ok(fd.into())
         })();
 
         // Boot-time file-access recorder. Gated on a single relaxed atomic that

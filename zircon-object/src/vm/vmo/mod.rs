@@ -943,7 +943,10 @@ mod tests {
         child.read(0, &mut buf).unwrap();
         assert_eq!(buf, [0x11; 4], "dirtied page must be copied to the child");
         child.read(PAGE_SIZE, &mut buf).unwrap();
-        assert_eq!(buf, [0xBB; 4], "clean page must still borrow from the cache");
+        assert_eq!(
+            buf, [0xBB; 4],
+            "clean page must still borrow from the cache"
+        );
         // Writes in the child stay in the child.
         child.write(PAGE_SIZE, &[0x22; 4]).unwrap();
         b.read(PAGE_SIZE, &mut buf).unwrap();

@@ -583,8 +583,7 @@ pub fn kernel_report() -> String {
     }
     // Where a fork's time actually goes, per mapping cloned.
     {
-        let (n, total, create, protect, committed, allocs) =
-            zircon_object::vm::fork_phase_stats();
+        let (n, total, create, protect, committed, allocs) = zircon_object::vm::fork_phase_stats();
         if n > 0 {
             let us = |v: u64| v as f64 / 1000.0 / n as f64;
             let _ = writeln!(

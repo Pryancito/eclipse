@@ -16,8 +16,8 @@
 //! QEMU's live root is not btrfs, so it never reproduced there.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::{env, fs};
 
 use btrfs::device::BlockDevice;
@@ -206,7 +206,13 @@ fn scattered_page_faults_all_verify() {
     ];
     for (i, &off) in offsets.iter().enumerate() {
         assert!(off + page <= file_size);
-        read_and_verify(&mut fs, file, off, page as usize, &format!("fault #{i} @{off:#x}"));
+        read_and_verify(
+            &mut fs,
+            file,
+            off,
+            page as usize,
+            &format!("fault #{i} @{off:#x}"),
+        );
     }
 
     let _ = fs;

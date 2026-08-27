@@ -1093,8 +1093,7 @@ enum PendingDrmTimer {
 }
 
 static PENDING_DRM_TIMER: Mutex<Option<PendingDrmTimer>> = Mutex::new(None);
-static DRM_TIMER_ARMED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static DRM_TIMER_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 fn deliver_pending_drm_timer() {
     DRM_TIMER_ARMED.store(false, Ordering::Release);
@@ -1184,8 +1183,7 @@ pub fn clear_graphics_owner() {
 
 /// One-shot: log the first present so a black-screen bring-up shows whether the
 /// compositor is presenting at all, and via which path.
-static PRESENT_LOGGED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static PRESENT_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// One-shot: log the first VT-gated drop so we can tell "compositor never
 /// presented" (no present log) from "presents are being suppressed because a
 /// text VT is foreground" (this log).
@@ -1486,7 +1484,8 @@ pub fn atomic_commit(
             let Some(data) = get_blob(blob_id) else {
                 log::error!(
                     "[drm] ATOMIC reject (test_only={}): MODE_ID blob {:#x} not found",
-                    test_only, blob_id
+                    test_only,
+                    blob_id
                 );
                 return Err(AtomicError::NotFound);
             };
@@ -1519,7 +1518,9 @@ pub fn atomic_commit(
         log::error!(
             "[drm] ATOMIC reject (test_only={}): mode/active change needs ALLOW_MODESET \
              (mode_change={} active_change={})",
-            test_only, mode_change, active_change
+            test_only,
+            mode_change,
+            active_change
         );
         return Err(AtomicError::Invalid);
     }

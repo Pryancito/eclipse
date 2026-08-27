@@ -52,11 +52,7 @@ const DT_VERDEF: u64 = 0x6fff_fffc;
 const DT_VERSYM: u64 = 0x6fff_fff0;
 
 /// The symbols the kernel and the C library both depend on being present.
-const REQUIRED_SYMBOLS: &[&str] = &[
-    "__vdso_clock_gettime",
-    "__vdso_gettimeofday",
-    "__vdso_time",
-];
+const REQUIRED_SYMBOLS: &[&str] = &["__vdso_clock_gettime", "__vdso_gettimeofday", "__vdso_time"];
 
 fn main() {
     println!("cargo:rerun-if-changed=vdso/vdso.c");

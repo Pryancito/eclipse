@@ -141,9 +141,7 @@ fn convert_pte_to_wc(root: usize, va: usize) -> PteConvert {
     for level in (1..=3).rev() {
         // SAFETY: the physmap covers all page-table frames; entries are u64.
         let entry = unsafe {
-            core::ptr::read_volatile(
-                (phys_to_virt(table_pa) as *const u64).add(idx(level)),
-            )
+            core::ptr::read_volatile((phys_to_virt(table_pa) as *const u64).add(idx(level)))
         };
         if entry & PTE_PRESENT == 0 {
             return PteConvert::NotMapped;

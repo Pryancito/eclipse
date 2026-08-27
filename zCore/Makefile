@@ -64,11 +64,15 @@ boottrace_arg := $(if $(BOOTTRACE),:BOOTTRACE=$(BOOTTRACE))
 #   GL=0              -> renderer=pixman (CPU 2D software; always renders)
 #   GL=sw             -> renderer=gl-sw  (wlroots GLES2 over Mesa llvmpipe;
 #                                         software GL, RENDERS in QEMU, slow)
-#   GL=1              -> renderer=gl + nvidia.nouveau_uapi (hardware GPU renderer
-#                                         on real-HW nouveau; on a machine with
+#   GL=1              -> renderer=gl + nvidia.nouveau_uapi (turns on the NVIDIA
+#                                         nouveau experiment knobs; labwc now
+#                                         defaults to the SAFE software path on
+#                                         real hardware unless the cmdline also
+#                                         opts into `nvidia.wlr_gles2` or
+#                                         `nvidia.wlr_vulkan`. On a machine with
 #                                         no NVIDIA GPU -- QEMU -- userspace
-#                                         degrades itself to the gl-sw stack, so
-#                                         the same image still renders, software)
+#                                         still degrades itself to the gl-sw
+#                                         stack, so the same image renders.)
 #
 # GL=1 also stamps `nvidia.nouveau_uapi` (the nouveau-compatible DRM ioctl
 # surface, off by default because it is untested on real hardware — see
@@ -86,8 +90,10 @@ boottrace_arg := $(if $(BOOTTRACE),:BOOTTRACE=$(BOOTTRACE))
 # software-GL stack as GL=sw (labwc on GLES2/llvmpipe, clients on llvmpipe).
 # Leaving the env unpinned instead put labwc on pixman with hardware-probing
 # clients: glxgears rendered (FPS on the console) into buffers the pixman
-# compositor never composited — no window. Hardware GL on the RTX is the
-# nouveau path (nvidia.rs), forced by `GL=1`.
+# compositor never composited — no window. On real NVIDIA hardware, GL=1 now
+# still keeps labwc on pixman by DEFAULT to avoid the current zink/NVK crash
+# loop; add `nvidia.wlr_gles2` or `nvidia.wlr_vulkan` to the cmdline to try the
+# unstable GPU compositor paths explicitly.
 #
 # NOTE for real hardware: the ESP's rboot.conf cmdline is written from CMDLINE,
 # so a default build stamps `renderer=auto` there. auto resolves per GPU at

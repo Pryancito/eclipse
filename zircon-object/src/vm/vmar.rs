@@ -614,8 +614,13 @@ impl VmAddressRegion {
                 .mappings
                 .remove(&key)
                 .expect("overlapping key must be present");
-            if let Some(new) = map.cut(begin, end) {
-                new_maps.push(new);
+            match map.cut(begin, end) {
+                Ok(Some(new)) => new_maps.push(new),
+                Ok(None) => {}
+                Err(err) => {
+                    inner.mappings.insert(key, map);
+                    return Err(err);
+                }
             }
             if map.size() > 0 {
                 inner.mappings.insert(map.addr(), map);
@@ -1830,6 +1835,14 @@ impl core::fmt::Debug for VmMapping {
 }
 
 impl VmMapping {
+    fn paging_error_as_zx(err: PagingError) -> ZxError {
+        match err {
+            PagingError::NoMemory => ZxError::NO_MEMORY,
+            PagingError::NotMapped => ZxError::NOT_FOUND,
+            PagingError::AlreadyMapped => ZxError::BAD_STATE,
+        }
+    }
+
     fn new(
         addr: VirtAddr,
         size: usize,
@@ -1916,13 +1929,13 @@ impl VmMapping {
         })
     }
 
-    fn unmap(&self) {
+    fn unmap(&self) -> ZxResult {
         let inner = self.inner.lock();
         // TODO inner.vmo_offset unused?
         self.page_table
             .lock()
             .unmap_cont(inner.addr, inner.size)
-            .expect("failed to unmap")
+            .map_err(Self::paging_error_as_zx)
     }
 
     fn fill_in_task_status(&self, task_stats: &mut TaskStatsInfo) {
@@ -1945,9 +1958,9 @@ impl VmMapping {
     /// Cut and unmap regions in `[begin, end)`.
     ///
     /// If it will be split, return another one.
-    fn cut(&self, begin: VirtAddr, end: VirtAddr) -> Option<Arc<Self>> {
+    fn cut(&self, begin: VirtAddr, end: VirtAddr) -> ZxResult<Option<Arc<Self>>> {
         if !self.overlap(begin, end) {
-            return None;
+            return Ok(None);
         }
         let mut inner = self.inner.lock();
         let mut page_table = self.page_table.lock();
@@ -1955,31 +1968,31 @@ impl VmMapping {
             // subset: [xxxxxxxxxx]
             page_table
                 .unmap_cont(inner.addr, inner.size)
-                .expect("failed to unmap");
+                .map_err(Self::paging_error_as_zx)?;
             inner.size = 0;
             inner.flags.clear();
-            None
+            Ok(None)
         } else if inner.addr >= begin && inner.addr < end {
             // prefix: [xxxx------]
             let cut_len = end - inner.addr;
             page_table
                 .unmap_cont(inner.addr, cut_len)
-                .expect("failed to unmap");
+                .map_err(Self::paging_error_as_zx)?;
             inner.addr = end;
             inner.size -= cut_len;
             inner.vmo_offset += cut_len;
             inner.flags.drain(0..pages(cut_len));
-            None
+            Ok(None)
         } else if inner.end_addr() <= end && inner.end_addr() > begin {
             // postfix: [------xxxx]
             let cut_len = inner.end_addr() - begin;
             let new_len = begin - inner.addr;
             page_table
                 .unmap_cont(begin, cut_len)
-                .expect("failed to unmap");
+                .map_err(Self::paging_error_as_zx)?;
             inner.size = new_len;
             inner.flags.truncate(pages(new_len));
-            None
+            Ok(None)
         } else {
             // superset: [---xxxx---]
             let cut_len = end - begin;
@@ -1987,7 +2000,7 @@ impl VmMapping {
             let new_len2 = inner.end_addr() - end;
             page_table
                 .unmap_cont(begin, cut_len)
-                .expect("failed to unmap");
+                .map_err(Self::paging_error_as_zx)?;
             let new_flags_range = (pages(inner.size) - pages(new_len2))..pages(inner.size);
             let new_mapping = Arc::new(VmMapping {
                 permissions: self.permissions,
@@ -2002,7 +2015,7 @@ impl VmMapping {
             });
             inner.size = new_len1;
             inner.flags.truncate(pages(new_len1));
-            Some(new_mapping)
+            Ok(Some(new_mapping))
         }
     }
 
@@ -2640,12 +2653,16 @@ impl VmMappingInner {
 impl Drop for VmMapping {
     fn drop(&mut self) {
         let inner = self.inner.lock();
-        info!(
-            "VmMapping::drop: addr={:#x}, size={:#x}",
-            inner.addr, inner.size
-        );
+        let addr = inner.addr;
+        let size = inner.size;
+        info!("VmMapping::drop: addr={:#x}, size={:#x}", addr, size);
         drop(inner);
-        self.unmap();
+        if let Err(err) = self.unmap() {
+            error!(
+                "VmMapping::drop: unmap failed for addr={:#x}, size={:#x}: {:?}",
+                addr, size, err
+            );
+        }
     }
 }
 
@@ -3064,7 +3081,10 @@ mod tests {
             let a = vmar
                 .map(None, VmObject::new_paged(1), 0, 0x1000, flags)
                 .unwrap();
-            assert!(!addrs.contains(&a), "auto-placement returned an occupied slot");
+            assert!(
+                !addrs.contains(&a),
+                "auto-placement returned an occupied slot"
+            );
             addrs.push(a);
         }
         addrs.sort_unstable();

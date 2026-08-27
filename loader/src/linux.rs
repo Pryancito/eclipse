@@ -505,9 +505,7 @@ fn handle_signal(
                 let a = *w as usize;
                 if let Some(m) = maps.iter().find(|m| a >= m.start && a < m.end) {
                     if m.flags.contains(zircon_object::vm::MMUFlags::EXECUTE) {
-                        frames.push(
-                            resolve(a).unwrap_or_else(|| alloc::format!("{:#x}", a)),
-                        );
+                        frames.push(resolve(a).unwrap_or_else(|| alloc::format!("{:#x}", a)));
                     }
                 }
             }
@@ -878,9 +876,7 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                             };
                             let is_exec = pt
                                 .query(val & !0xfff)
-                                .map(|(_, f, _)| {
-                                    f.contains(zircon_object::vm::MMUFlags::EXECUTE)
-                                })
+                                .map(|(_, f, _)| f.contains(zircon_object::vm::MMUFlags::EXECUTE))
                                 .unwrap_or(false);
                             if !is_exec {
                                 continue;

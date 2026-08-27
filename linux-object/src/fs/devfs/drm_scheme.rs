@@ -2,12 +2,12 @@
 //!
 //! Exposes the DRM subsystem to userspace via IOCTLs and memory mapping.
 
-use core::sync::atomic::{AtomicBool, Ordering};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::any::Any;
 use core::future::Future;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll as TaskPoll};
 
 use crate::sync::{Event, EventBus};
@@ -218,7 +218,8 @@ const fn drm_iowr_core(nr: u32, size: usize) -> u32 {
     (3u32 << 30) | (0x64u32 << 8) | (nr & 0xff) | (((size as u32) & 0x3fff) << 16)
 }
 const DRM_IOCTL_SYNCOBJ_CREATE: u32 = drm_iowr_core(0xBF, core::mem::size_of::<DrmSyncobjCreate>());
-const DRM_IOCTL_SYNCOBJ_DESTROY: u32 = drm_iowr_core(0xC0, core::mem::size_of::<DrmSyncobjDestroy>());
+const DRM_IOCTL_SYNCOBJ_DESTROY: u32 =
+    drm_iowr_core(0xC0, core::mem::size_of::<DrmSyncobjDestroy>());
 // 0xC1/0xC2 (HANDLE_TO_FD/FD_TO_HANDLE): NOT dispatched here -- like
 // PRIME_HANDLE_TO_FD/FD_TO_HANDLE above, they need process fd table access
 // this inode-level `io_control` doesn't have, so `linux-syscall`'s
@@ -1295,7 +1296,11 @@ impl INode for DrmDev {
 
                 let name: &[u8] = if nouveau { b"nouveau\0" } else { b"zcore\0" };
                 let date = b"20260503\0";
-                let desc: &[u8] = if nouveau { b"nouveau\0" } else { b"zCore DRM Driver\0" };
+                let desc: &[u8] = if nouveau {
+                    b"nouveau\0"
+                } else {
+                    b"zCore DRM Driver\0"
+                };
 
                 unsafe {
                     if v.name_len > 0 && !v.name.is_null() {
@@ -1581,7 +1586,10 @@ impl INode for DrmDev {
                     // atomic commit is even attempted.
                     log::error!(
                         "[drm] ADDFB failed: {}x{} handle={:#x} pitch={} (create_fb returned None)",
-                        cmd.width, cmd.height, cmd.handle, cmd.pitch
+                        cmd.width,
+                        cmd.height,
+                        cmd.handle,
+                        cmd.pitch
                     );
                     Err(FsError::DeviceError)
                 }
@@ -1753,8 +1761,12 @@ impl INode for DrmDev {
                         if clip.x2 <= clip.x1 || clip.y2 <= clip.y1 {
                             continue;
                         }
-                        let (x1, y1, x2, y2) =
-                            (clip.x1 as u32, clip.y1 as u32, clip.x2 as u32, clip.y2 as u32);
+                        let (x1, y1, x2, y2) = (
+                            clip.x1 as u32,
+                            clip.y1 as u32,
+                            clip.x2 as u32,
+                            clip.y2 as u32,
+                        );
                         union = Some(match union {
                             Some((ux, uy, uw, uh)) => {
                                 let nx = ux.min(x1);
@@ -2528,10 +2540,22 @@ impl INode for DrmDev {
                 // can read the common fields regardless of which ioctl.
                 let (handles_ptr, points_ptr, timeout_nsec, count_handles, flags) = if timeline {
                     let req = unsafe { &*(data as *const DrmSyncobjTimelineWait) };
-                    (req.handles, req.points, req.timeout_nsec, req.count_handles, req.flags)
+                    (
+                        req.handles,
+                        req.points,
+                        req.timeout_nsec,
+                        req.count_handles,
+                        req.flags,
+                    )
                 } else {
                     let req = unsafe { &*(data as *const DrmSyncobjWait) };
-                    (req.handles, 0, req.timeout_nsec, req.count_handles, req.flags)
+                    (
+                        req.handles,
+                        0,
+                        req.timeout_nsec,
+                        req.count_handles,
+                        req.flags,
+                    )
                 };
                 const MAX_HANDLES: u32 = 64;
                 if count_handles == 0 || count_handles > MAX_HANDLES || handles_ptr == 0 {
@@ -2557,8 +2581,15 @@ impl INode for DrmDev {
                 // an effectively unbounded wait.
                 let deadline_us = (timeout_nsec.max(0) as u64) / 1000;
                 let wait_all = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL != 0;
-                match zcore_drivers::scheme::syncobj::wait(&handles, points.as_deref(), wait_all, deadline_us) {
-                    zcore_drivers::scheme::syncobj::WaitOutcome::Signaled { first_signaled_index } => {
+                match zcore_drivers::scheme::syncobj::wait(
+                    &handles,
+                    points.as_deref(),
+                    wait_all,
+                    deadline_us,
+                ) {
+                    zcore_drivers::scheme::syncobj::WaitOutcome::Signaled {
+                        first_signaled_index,
+                    } => {
                         if timeline {
                             let req = unsafe { &mut *(data as *mut DrmSyncobjTimelineWait) };
                             req.first_signaled = first_signaled_index;

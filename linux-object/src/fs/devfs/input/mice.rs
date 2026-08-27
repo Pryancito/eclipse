@@ -187,8 +187,7 @@ impl INode for MiceDev {
                 if this.subs.is_empty() {
                     for (idx, m) in this.dev.mice.iter().enumerate() {
                         let waker = cx.waker().clone();
-                        if let Some(id) =
-                            m.subscribe(Box::new(move |_| waker.wake_by_ref()), true)
+                        if let Some(id) = m.subscribe(Box::new(move |_| waker.wake_by_ref()), true)
                         {
                             this.subs.push((idx, id));
                         }

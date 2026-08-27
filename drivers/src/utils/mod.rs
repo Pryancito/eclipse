@@ -1,8 +1,8 @@
 //! Event handler and device tree.
 
 pub mod deferred_job;
-pub mod fat_ptr;
 mod event_listener;
+pub mod fat_ptr;
 mod id_allocator;
 mod irq_manager;
 

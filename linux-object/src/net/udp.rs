@@ -181,17 +181,16 @@ impl Socket for UdpSocketState {
             let sets = get_sockets();
             let mut sets = sets.lock();
             let mut socket = sets.get::<UdpSocket>(handle);
-            let copied_len: Result<(usize, IpEndpoint, bool), _> =
-                match socket.peek() {
-                    Ok((buffer, endpoint)) => {
-                        let full_len = buffer.len();
-                        let endpoint = *endpoint;
-                        let n = data.len().min(full_len);
-                        data[..n].copy_from_slice(&buffer[..n]);
-                        Ok((n, endpoint, full_len > n))
-                    }
-                    Err(e) => Err(e),
-                };
+            let copied_len: Result<(usize, IpEndpoint, bool), _> = match socket.peek() {
+                Ok((buffer, endpoint)) => {
+                    let full_len = buffer.len();
+                    let endpoint = *endpoint;
+                    let n = data.len().min(full_len);
+                    data[..n].copy_from_slice(&buffer[..n]);
+                    Ok((n, endpoint, full_len > n))
+                }
+                Err(e) => Err(e),
+            };
             // If connected and the front datagram is from a different peer,
             // discard it (Linux filters at recv) then keep looking.
             if let (Ok((_, endpoint, _)), Some(peer)) = (&copied_len, remote) {

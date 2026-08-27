@@ -924,8 +924,8 @@ fn display_pci_index() -> Option<usize> {
     // Match on the BDF NUMBERS, never on the driver's display name: names
     // render the bus in DECIMAL ("nvidia-gpu-101:0.0") while sysfs paths use
     // HEX ("0000:65:00.0").
-    if let Some((_dom, bus, dev, func)) = crate::fs::devfs::drm::get_primary_driver()
-        .and_then(|d| d.pci_bdf())
+    if let Some((_dom, bus, dev, func)) =
+        crate::fs::devfs::drm::get_primary_driver().and_then(|d| d.pci_bdf())
     {
         let want = alloc::format!("0000:{:02x}:{:02x}.{:x}", bus, dev, func);
         if let Some(idx) = devs.iter().position(|d| d.name == want) {
@@ -1005,7 +1005,9 @@ pub(crate) fn log_drm_pci_backing() {
             d.name,
             d.vendor
         ),
-        None => kernel_hal::klog_info!("[drm-probe] render node has NO PCI backing (idx={:?})", idx),
+        None => {
+            kernel_hal::klog_info!("[drm-probe] render node has NO PCI backing (idx={:?})", idx)
+        }
     }
     // Actively resolve the EXACT sysfs chain libdrm's drmGetDevices2 walks, so
     // one boot tells us whether it resolves at runtime and what it reports --

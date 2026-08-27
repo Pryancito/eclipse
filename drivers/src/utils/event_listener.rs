@@ -163,12 +163,26 @@ mod tests {
         let hits = Arc::new(AtomicUsize::new(0));
         let listener = EventListener::<()>::new();
         let h = hits.clone();
-        let _ = listener.subscribe(Box::new(move |_| { h.fetch_add(1, Ordering::SeqCst); }), false);
+        let _ = listener.subscribe(
+            Box::new(move |_| {
+                h.fetch_add(1, Ordering::SeqCst);
+            }),
+            false,
+        );
         let h2 = hits.clone();
-        let _ = listener.subscribe(Box::new(move |_| { h2.fetch_add(1, Ordering::SeqCst); }), true);
+        let _ = listener.subscribe(
+            Box::new(move |_| {
+                h2.fetch_add(1, Ordering::SeqCst);
+            }),
+            true,
+        );
         listener.trigger(());
         assert_eq!(hits.load(Ordering::SeqCst), 2);
-        assert_eq!(listener.events.lock().len(), 1, "persistent handler remains");
+        assert_eq!(
+            listener.events.lock().len(),
+            1,
+            "persistent handler remains"
+        );
         listener.trigger(());
         assert_eq!(hits.load(Ordering::SeqCst), 3);
     }

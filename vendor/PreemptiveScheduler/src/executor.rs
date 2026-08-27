@@ -344,7 +344,12 @@ static STACK_REG_OVERFLOW: core::sync::atomic::AtomicUsize =
 fn register_stack(alloc_base: usize) {
     for slot in STACK_REG.iter() {
         if slot
-            .compare_exchange(0, alloc_base, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Relaxed)
+            .compare_exchange(
+                0,
+                alloc_base,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Relaxed,
+            )
             .is_ok()
         {
             return;
@@ -357,7 +362,12 @@ fn register_stack(alloc_base: usize) {
 fn unregister_stack(alloc_base: usize) {
     for slot in STACK_REG.iter() {
         if slot
-            .compare_exchange(alloc_base, 0, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Relaxed)
+            .compare_exchange(
+                alloc_base,
+                0,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Relaxed,
+            )
             .is_ok()
         {
             return;
@@ -475,7 +485,10 @@ fn spine_unregister_by_stack(stack_base: usize) {
     for i in 0..SPINE_SLOTS {
         let a = SPINE_ADDR[i].load(Acquire);
         if a != 0 && a != usize::MAX && a >= lo && a < hi {
-            if SPINE_ADDR[i].compare_exchange(a, 0, SeqCst, Relaxed).is_ok() {
+            if SPINE_ADDR[i]
+                .compare_exchange(a, 0, SeqCst, Relaxed)
+                .is_ok()
+            {
                 SPINE_GEN.fetch_add(1, Release);
             }
         }
@@ -652,7 +665,10 @@ fn stack_pool_pop() -> Option<usize> {
 fn stack_pool_push(alloc_base: usize) -> bool {
     use core::sync::atomic::Ordering::{AcqRel, Relaxed};
     for slot in STACK_POOL.iter() {
-        if slot.compare_exchange(0, alloc_base, AcqRel, Relaxed).is_ok() {
+        if slot
+            .compare_exchange(0, alloc_base, AcqRel, Relaxed)
+            .is_ok()
+        {
             return true;
         }
     }
@@ -697,7 +713,9 @@ impl Executor {
                 Some(f) => {
                     let ok_bottom = f(alloc_base, GUARD_SIZE);
                     if !ok_bottom {
-                        note_soft_guard_fallback("bottom install refused (huge PTE / unmap failed)");
+                        note_soft_guard_fallback(
+                            "bottom install refused (huge PTE / unmap failed)",
+                        );
                     }
                     let ok_top = f(top_guard_base, TOP_GUARD_SIZE);
                     if !ok_top {

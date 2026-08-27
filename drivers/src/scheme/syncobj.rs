@@ -213,7 +213,12 @@ pub enum WaitOutcome {
 /// passes. `points`, if given, is per-handle target points
 /// (`SYNCOBJ_TIMELINE_WAIT`); `None` means "target = 1" for every handle
 /// (binary `SYNCOBJ_WAIT`). Spin-polls -- see the module doc for why.
-pub fn wait(handles: &[u32], points: Option<&[u64]>, wait_all: bool, deadline_us: u64) -> WaitOutcome {
+pub fn wait(
+    handles: &[u32],
+    points: Option<&[u64]>,
+    wait_all: bool,
+    deadline_us: u64,
+) -> WaitOutcome {
     let start_us = unsafe { crate::bus::drivers_timer_now_as_micros() };
     let mut stall_logged = false;
     loop {
@@ -257,7 +262,12 @@ pub fn wait(handles: &[u32], points: Option<&[u64]>, wait_all: bool, deadline_us
         // (budgeted per boot) with enough to identify the station.
         if !stall_logged && now_us.saturating_sub(start_us) >= 2_000_000 {
             stall_logged = true;
-            stall_report(handles, points, wait_all, deadline_us.saturating_sub(now_us));
+            stall_report(
+                handles,
+                points,
+                wait_all,
+                deadline_us.saturating_sub(now_us),
+            );
         }
         core::hint::spin_loop();
     }

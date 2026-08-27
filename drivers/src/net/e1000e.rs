@@ -2872,7 +2872,8 @@ mod tx_ring_tests {
         // and confirm the ring recovers.
         hw_complete_tx(&hw, 0);
         assert!(hw.can_send(), "completing the oldest slot frees it up");
-        hw.send(&pkt(0xBB, 32)).expect("ring recovers after completion");
+        hw.send(&pkt(0xBB, 32))
+            .expect("ring recovers after completion");
     }
 
     #[test]

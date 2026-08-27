@@ -420,9 +420,22 @@ fn dump_null_execute_stack_once(tf: &TrapFrame, sp: u64, slot0: u64) {
         "[null-exec] regs: rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x}\n\
          [null-exec]       rbp={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x}\n\
          [null-exec]       r12={:#x} r13={:#x} r14={:#x} r15={:#x} rflags={:#x}\n",
-        tf.rax, tf.rbx, tf.rcx, tf.rdx, tf.rsi, tf.rdi,
-        tf.rbp, tf.r8, tf.r9, tf.r10, tf.r11,
-        tf.r12, tf.r13, tf.r14, tf.r15, tf.rflags,
+        tf.rax,
+        tf.rbx,
+        tf.rcx,
+        tf.rdx,
+        tf.rsi,
+        tf.rdi,
+        tf.rbp,
+        tf.r8,
+        tf.r9,
+        tf.r10,
+        tf.r11,
+        tf.r12,
+        tf.r13,
+        tf.r14,
+        tf.r15,
+        tf.rflags,
     ));
     // The writer's fingerprint is the SHAPE of the zero run, not just the slot
     // that faulted: where it starts and ends, how long it is, and how it is

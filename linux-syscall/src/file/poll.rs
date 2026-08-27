@@ -119,7 +119,9 @@ impl Syscall<'_> {
         }
         impl Drop for PollFuture<'_> {
             fn drop(&mut self) {
-                let wn = self.watch_net; let wi = self.watch_interactive; clear_poll_io(&mut self.timer, &mut self.io_waker, wn, wi);
+                let wn = self.watch_net;
+                let wi = self.watch_interactive;
+                clear_poll_io(&mut self.timer, &mut self.io_waker, wn, wi);
             }
         }
         impl<'a> Future for PollFuture<'a> {
@@ -449,7 +451,9 @@ impl Syscall<'_> {
 
         impl Drop for SelectFuture<'_> {
             fn drop(&mut self) {
-                let wn = self.watch_net; let wi = self.watch_interactive; clear_poll_io(&mut self.timer, &mut self.io_waker, wn, wi);
+                let wn = self.watch_net;
+                let wi = self.watch_interactive;
+                clear_poll_io(&mut self.timer, &mut self.io_waker, wn, wi);
             }
         }
 

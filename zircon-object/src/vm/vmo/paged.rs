@@ -1372,9 +1372,9 @@ impl VMObjectPagedInner {
         }
         let Some(arc_child) = other_child.upgrade() else {
             drop_crumb(4); // sibling dead: early return
-            // The tree stays UNCOLLAPSED: this hidden node keeps its frames
-            // and its dangling child ref. Resolution still walks it, but its
-            // split-tag bookkeeping is now frozen mid-transaction.
+                           // The tree stays UNCOLLAPSED: this hidden node keeps its frames
+                           // and its dangling child ref. Resolution still walks it, but its
+                           // split-tag bookkeeping is now frozen mid-transaction.
             fossil_trap("remove_child: sibling already dead, tree left uncollapsed");
             return;
         };

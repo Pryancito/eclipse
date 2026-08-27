@@ -450,7 +450,10 @@ fn resolve_irelative_x86_64(
     let unmap_scratch = || {
         let _ = vmar.unmap(scratch, PAGE_SIZE);
     };
-    if vmar.write_memory(sp, &SENTINEL_RETURN.to_ne_bytes()).is_err() {
+    if vmar
+        .write_memory(sp, &SENTINEL_RETURN.to_ne_bytes())
+        .is_err()
+    {
         unmap_scratch();
         return Err("IRELATIVE: failed to seed scratch stack");
     }
@@ -489,7 +492,11 @@ fn resolve_irelative_x86_64(
                         resolver_addr,
                         other,
                         entries.len() - resolved.len(),
-                        if entries.len() - resolved.len() == 1 { "y" } else { "ies" }
+                        if entries.len() - resolved.len() == 1 {
+                            "y"
+                        } else {
+                            "ies"
+                        }
                     );
                     aborted = true;
                     break;
