@@ -57,6 +57,14 @@ fn front_job_runs_before_back() {
     });
 
     drain_deferred_jobs_max(2);
-    assert_eq!(first.load(Ordering::SeqCst), 1, "front job should run first");
-    assert_eq!(second.load(Ordering::SeqCst), 2, "back job should run second");
+    assert_eq!(
+        first.load(Ordering::SeqCst),
+        1,
+        "front job should run first"
+    );
+    assert_eq!(
+        second.load(Ordering::SeqCst),
+        2,
+        "back job should run second"
+    );
 }

@@ -308,6 +308,7 @@ dump_registers:
             },
             trap_num: 0,
             error_code: 0,
+            fpstate: Default::default(),
         };
         cx.run_fncall();
         // check restored registers

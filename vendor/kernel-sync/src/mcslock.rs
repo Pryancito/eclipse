@@ -57,7 +57,7 @@ impl<T> MCSLock<T> {
 
 impl<T: ?Sized> MCSLock<T> {
     #[inline(always)]
-    pub fn lock(&self, channel: LockChannel) -> MCSLockGuard<T> {
+    pub fn lock(&self, channel: LockChannel) -> MCSLockGuard<'_, T> {
         while self.locked[channel as usize]
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
@@ -76,7 +76,7 @@ impl<T: ?Sized> MCSLock<T> {
     }
 
     #[inline(always)]
-    pub fn try_lock(&self, channel: LockChannel) -> Option<MCSLockGuard<T>> {
+    pub fn try_lock(&self, channel: LockChannel) -> Option<MCSLockGuard<'_, T>> {
         if self.locked[channel as usize]
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()

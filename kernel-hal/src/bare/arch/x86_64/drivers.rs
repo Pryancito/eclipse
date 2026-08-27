@@ -58,7 +58,11 @@ impl AcpiPowerButton {
     fn from_fadt(fadt: &acpi::fadt::Fadt) -> Option<(usize, Self)> {
         let sci = fadt.sci_interrupt as usize;
         let pm1a = fadt.pm1a_event_block().ok()?;
-        if sci == 0 || pm1a.address_space != AddressSpace::SystemIo || pm1a.address == 0 || pm1a.bit_width < 32 {
+        if sci == 0
+            || pm1a.address_space != AddressSpace::SystemIo
+            || pm1a.address == 0
+            || pm1a.bit_width < 32
+        {
             return None;
         }
         let pm1a = pm1a.address as u16;
@@ -66,7 +70,11 @@ impl AcpiPowerButton {
             .pm1b_event_block()
             .ok()
             .flatten()
-            .filter(|gas| gas.address_space == AddressSpace::SystemIo && gas.address != 0 && gas.bit_width >= 32)
+            .filter(|gas| {
+                gas.address_space == AddressSpace::SystemIo
+                    && gas.address != 0
+                    && gas.bit_width >= 32
+            })
             .map(|gas| gas.address as u16);
         Some((
             sci,
@@ -127,7 +135,14 @@ fn init_acpi_power_button(irq: &Arc<Apic>) {
     if rsdp == 0 {
         return;
     }
-    let tables = match unsafe { AcpiTables::from_rsdp(AcpiMapHandler { phys_to_virt: crate::mem::phys_to_virt }, rsdp) } {
+    let tables = match unsafe {
+        AcpiTables::from_rsdp(
+            AcpiMapHandler {
+                phys_to_virt: crate::mem::phys_to_virt,
+            },
+            rsdp,
+        )
+    } {
         Ok(t) => t,
         Err(e) => {
             crate::klog_warn!("[acpi] power button disabled: ACPI parse failed: {:?}", e);

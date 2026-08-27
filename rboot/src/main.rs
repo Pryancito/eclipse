@@ -8,7 +8,6 @@
 
 #![no_std]
 #![no_main]
-#![feature(abi_efiapi)]
 #![feature(abi_x86_interrupt)]
 
 #[macro_use]

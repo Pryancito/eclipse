@@ -1405,8 +1405,7 @@ impl E1000eHw {
         // write back a stale line onto a neighbour the NIC just stamped.
         let aligned_start = start - (start % RX_DESCS_PER_CACHE_LINE);
         let end = start + count;
-        let aligned_end =
-            (end + RX_DESCS_PER_CACHE_LINE - 1) & !(RX_DESCS_PER_CACHE_LINE - 1);
+        let aligned_end = (end + RX_DESCS_PER_CACHE_LINE - 1) & !(RX_DESCS_PER_CACHE_LINE - 1);
         let aligned_count = (aligned_end - aligned_start).min(NUM_RX);
         self.sync_rx_desc_span_wrapping(
             aligned_start % NUM_RX,
@@ -2403,9 +2402,7 @@ impl phy::TxToken for E1000eTxToken {
         // memset) on every ACK / egress frame.
         let len = len.min(TX_SCRATCH_LEN);
         let mut scratch = MaybeUninit::<[u8; TX_SCRATCH_LEN]>::uninit();
-        let buf = unsafe {
-            core::slice::from_raw_parts_mut(scratch.as_mut_ptr() as *mut u8, len)
-        };
+        let buf = unsafe { core::slice::from_raw_parts_mut(scratch.as_mut_ptr() as *mut u8, len) };
         let result = f(buf)?;
 
         let mut hw = self.0.hw.lock();
@@ -2431,8 +2428,7 @@ impl phy::TxToken for E1000eTxToken {
         loop {
             // Cheap DD poll: UC rings skip dma_sync; WB re-syncs only every
             // TX_SPIN_SYNC_INTERVAL iterations (stale DD=0 is a safe miss).
-            let sync = !hw.tx_ring_coherent
-                && (tries == 0 || tries % TX_SPIN_SYNC_INTERVAL == 0);
+            let sync = !hw.tx_ring_coherent && (tries == 0 || tries % TX_SPIN_SYNC_INTERVAL == 0);
             if hw.tx_dd_at_tail(sync) {
                 match hw.post_tx_frame(buf) {
                     Ok(()) => {
@@ -3243,8 +3239,6 @@ mod tx_ring_tests {
         assert!(hw.can_send());
         assert!(hw.tx_dd_at_tail(false), "UC free slot visible without sync");
     }
-
-
 }
 
 #[cfg(test)]

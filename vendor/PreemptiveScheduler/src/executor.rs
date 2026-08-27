@@ -291,7 +291,7 @@ fn executor_alloc_id() -> usize {
     EXECUTOR_ID.fetch_add(1, Ordering::SeqCst)
 }
 
-fn note_first_executor_created(hard_guard_bottom: bool, hard_guard_top: bool) {
+fn note_first_executor_created(_hard_guard_bottom: bool, _hard_guard_top: bool) {
     use core::sync::atomic::{AtomicBool, Ordering};
     static LOGGED: AtomicBool = AtomicBool::new(false);
     if LOGGED.swap(true, Ordering::SeqCst) {

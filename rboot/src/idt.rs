@@ -26,14 +26,15 @@ pub fn init(mode: ModeInfo, fb_addr: u64) {
     SH.store(sh as usize, Ordering::SeqCst);
 
     unsafe {
-        IDT.page_fault.set_handler_fn(page_fault_handler);
-        IDT.general_protection_fault
+        let idt = &mut *core::ptr::addr_of_mut!(IDT);
+        idt.page_fault.set_handler_fn(page_fault_handler);
+        idt.general_protection_fault
             .set_handler_fn(gp_fault_handler);
         // UEFI firmware may be using interrupts/its own IDT while we're running.
         // Disable interrupts briefly while we load our temporary IDT to avoid
         // taking an interrupt with a half-updated setup.
         x86_64::instructions::interrupts::disable();
-        IDT.load();
+        idt.load();
     }
 }
 

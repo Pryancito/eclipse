@@ -86,7 +86,7 @@ impl<'a> Set<'a> {
     /// # Panics
     /// This function may panic if the handle does not belong to this socket set
     /// or the socket has the wrong type.
-    pub fn get<T: AnySocket<'a>>(&mut self, handle: Handle) -> SocketRef<T> {
+    pub fn get<T: AnySocket<'a>>(&mut self, handle: Handle) -> SocketRef<'_, T> {
         match self.sockets[handle.0].as_mut() {
             Some(item) => T::downcast(SocketRef::new(&mut item.socket))
                 .expect("handle refers to a socket of a wrong type"),

@@ -110,3 +110,6 @@ required-features = ["std", "medium-ethernet", "medium-ip", "phy-tuntap_interfac
 
 [profile.release]
 debug = 2
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

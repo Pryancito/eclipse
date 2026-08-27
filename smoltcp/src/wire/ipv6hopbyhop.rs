@@ -195,7 +195,7 @@ impl<'a> Repr<'a> {
     }
 
     /// Return an `Iterator` for the contained options.
-    pub fn options(&self) -> Ipv6OptionsIterator {
+    pub fn options(&self) -> Ipv6OptionsIterator<'_> {
         Ipv6OptionsIterator::new(self.options, self.buffer_len() - 2)
     }
 }

@@ -421,7 +421,7 @@ pub fn lock_depth() -> i32 {
 pub(crate) fn push_off() {
     let old = intr_get();
     intr_off();
-    let mut cpu = mycpu();
+    let cpu = mycpu();
     if cpu.noff == 0 {
         cpu.interrupt_enable = old;
     }
@@ -429,14 +429,16 @@ pub(crate) fn push_off() {
 }
 
 pub(crate) fn pop_off() {
-    let mut cpu = mycpu();
-    if intr_get() || cpu.noff < 1 {
-        panic!("pop_off");
-    }
-    cpu.noff -= 1;
-    let should_enable = cpu.noff == 0 && cpu.interrupt_enable;
-    drop(cpu);
-    // NOTICE: intr_on() may lead to an immediate inerrupt, so we *MUST* drop(cpu) in advance.
+    let should_enable = {
+        let cpu = mycpu();
+        if intr_get() || cpu.noff < 1 {
+            panic!("pop_off");
+        }
+        cpu.noff -= 1;
+        cpu.noff == 0 && cpu.interrupt_enable
+    };
+    // NOTICE: intr_on() may lead to an immediate interrupt, so the Cpu borrow
+    // above must end before enabling IRQs.
     if should_enable {
         intr_on();
     }

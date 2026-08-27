@@ -86,7 +86,7 @@ impl<T: ?Sized> TicketMutex<T> {
     }
 
     #[track_caller]
-    pub fn lock(&self) -> TicketMutexGuard<T> {
+    pub fn lock(&self) -> TicketMutexGuard<'_, T> {
         push_off();
         let caller = core::panic::Location::caller();
         let mut spins: u64 = 0;
@@ -177,7 +177,7 @@ impl<T: ?Sized> TicketMutex<T> {
 
     #[inline]
     #[track_caller]
-    pub fn try_lock(&self) -> Option<TicketMutexGuard<T>> {
+    pub fn try_lock(&self) -> Option<TicketMutexGuard<'_, T>> {
         push_off();
         let ticket = self
             .next_ticket

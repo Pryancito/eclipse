@@ -37,13 +37,13 @@ impl<T: BlockDevice> BlockCache<T> {
     }
 
     /// Get a buffer for `block_id` with any status
-    fn get_buf(&self, block_id: BlockId) -> MutexGuard<Buf> {
+    fn get_buf(&self, block_id: BlockId) -> MutexGuard<'_, Buf> {
         let (i, buf) = self._get_buf(block_id);
         self.lru.lock().visit(i);
         buf
     }
 
-    fn _get_buf(&self, block_id: BlockId) -> (usize, MutexGuard<Buf>) {
+    fn _get_buf(&self, block_id: BlockId) -> (usize, MutexGuard<'_, Buf>) {
         for (i, buf) in self.bufs.iter().enumerate() {
             if let Some(lock) = buf.try_lock() {
                 match lock.status {
@@ -57,7 +57,7 @@ impl<T: BlockDevice> BlockCache<T> {
     }
 
     /// Get an unused buffer
-    fn get_unused(&self) -> (usize, MutexGuard<Buf>) {
+    fn get_unused(&self) -> (usize, MutexGuard<'_, Buf>) {
         for (i, buf) in self.bufs.iter().enumerate() {
             if let Some(lock) = buf.try_lock() {
                 if let BufStatus::Unused = lock.status {

@@ -1,4 +1,5 @@
 [workspace]
+resolver = "2"
 members = [
     "drivers",
     "nvidia-rm-sys",
@@ -15,7 +16,7 @@ members = [
     "hunter",
 ]
 default-members = ["xtask"]
-exclude = ["zircon-user", "rboot", "vendor/btrfs-rs"]
+exclude = ["zircon-user", "rboot", "vendor/btrfs-rs", "smoltcp"]
 
 [profile.release]
 lto = "fat"

@@ -8,3 +8,7 @@ edition = "2018"
 rcore-fs = { path = "../rcore-fs" }
 spin = "0.9"
 log = "0.4"
+
+[features]
+std = []
+
