@@ -124,9 +124,11 @@ const CHILD_ENV: &[&str] = &[
     "DISPLAY=:0",
     // NOTE: WLR_RENDERER is NOT here — it is appended at spawn time by
     // `build_child_env` so it can honour the `renderer=` boot arg: pixman by
-    // default; `renderer=gl` lets wlroots/Mesa auto-select the GPU path (real
-    // hardware); `renderer=gl-sw` forces wlroots GLES2 over Mesa llvmpipe
-    // (software GL — renders in QEMU where there is no GPU 3D).
+    // default; `renderer=gl` turns on the NVIDIA experiment knobs but still
+    // keeps labwc on the safe software path unless an explicit wlroots
+    // compositor token opts into the unstable GPU renderer; `renderer=gl-sw`
+    // forces wlroots GLES2 over Mesa llvmpipe (software GL — renders in QEMU
+    // where there is no GPU 3D).
     "WLR_BACKENDS=drm,libinput",
     "WLR_DRM_DEVICES=/dev/dri/card0",
     "WLR_LIBINPUT_NO_DEVICES=1",
@@ -668,9 +670,11 @@ enum Renderer {
     /// CPU 2D software (default, and the fallback for any unknown value): the
     /// wlroots pixman renderer. Always composites a frame.
     Pixman,
-    /// wlroots/Mesa auto-select the GPU renderer, no pin. The real-hardware
-    /// nouveau path. In QEMU our virtio-gpu is 2D-only (no virgl), so Mesa finds
-    /// no 3D driver and the desktop stays black — use `gl-sw` there instead.
+    /// Enable the NVIDIA nouveau experiment knobs. On current real hardware the
+    /// default SESSION under this mode is still the safe software path; explicit
+    /// `nvidia.wlr_gles2` / `nvidia.wlr_vulkan` cmdline flags opt into the
+    /// unstable GPU-rendered compositor paths. In QEMU our virtio-gpu is 2D-only
+    /// (no virgl), so this mode degrades to software GL there too.
     Gl,
     /// wlroots GLES2 over Mesa's software rasterizer (llvmpipe). Exercises the
     /// real GL/EGL/GLES2 path with no GPU 3D: it renders in QEMU (on the CPU, so
@@ -700,15 +704,17 @@ fn renderer_mode() -> Renderer {
 /// does the right thing in QEMU and on real hardware without a build flag
 /// (`renderer=auto`, and the default when the cmdline names no renderer).
 ///
-/// Per-GPU choice: NVIDIA (`0x10de`) takes the hardware nouveau/NVK path — but
+/// Per-GPU choice: NVIDIA (`0x10de`) enters the NVIDIA experiment mode — but
 /// ONLY when `nvidia.nouveau_uapi` is also on the cmdline, because that flag is
 /// what turns the kernel's nouveau uAPI on (without it the DRM node identifies
 /// as "zcore" and NVK can never enumerate; NVIDIA without the flag goes to
-/// pixman, the proven software default there). Everything else — notably QEMU's
+/// pixman, the proven software default there). In that experiment mode labwc now
+/// still defaults to software unless `nvidia.wlr_gles2` / `nvidia.wlr_vulkan`
+/// opt into the unstable GPU compositor. Everything else — notably QEMU's
 /// virtio-gpu (`0x1af4`), whose GL is virgl and is not wired into
-/// auto-detection — stays on software GL (llvmpipe), which is safe everywhere and
-/// never leaves a black screen. Only when no GPU is visible do we fall back to
-/// pixman. To use virgl in QEMU, pass `renderer=gl` explicitly.
+/// auto-detection — stays on software GL (llvmpipe), which is safe everywhere
+/// and never leaves a black screen. Only when no GPU is visible do we fall back
+/// to pixman. To use virgl in QEMU, pass `renderer=gl` explicitly.
 fn detect_renderer() -> Renderer {
     match fs::read_to_string("/sys/class/drm/card0/device/vendor") {
         Ok(v) if v.trim().eq_ignore_ascii_case("0x10de") => {
@@ -735,7 +741,8 @@ fn detect_renderer() -> Renderer {
                 .any(|t| t == "nvidia.nouveau_uapi")
             {
                 log(&format!(
-                    "renderer=auto: NVIDIA GPU {} + nvidia.nouveau_uapi -> gl (hardware nouveau/NVK)",
+                    "renderer=auto: NVIDIA GPU {} + nvidia.nouveau_uapi -> gl \
+                     (NVIDIA experiment mode; labwc stays software unless explicitly opted into wlroots GPU rendering)",
                     v.trim()
                 ));
                 Renderer::Gl
@@ -798,45 +805,50 @@ fn build_child_env() -> Vec<CString> {
         }
         Renderer::Gl => {
             if gpu_is_nvidia() {
-                // Compositor renderer: GLES2-on-zink by DEFAULT. Proven on the
-                // RTX -- /proc/gpudbg confirmed a client EXEC completing with
-                // fence + syncobj and zero MMU faults, i.e. zink->NVK submission
-                // works end to end. wlroots' NATIVE Vulkan renderer, by contrast,
-                // needs an external/shareable VkSemaphore (VK_KHR_external_
-                // semaphore) that NVK does not export over this partial syncobj
-                // uAPI -> vkCreateSemaphore ERROR_INVALID_EXTERNAL_HANDLE (NVK
-                // rejects it in userspace: no SYNCOBJ ioctl ever reaches dmesg),
-                // and its retry loop churned throwaway contexts until
-                // CHANNEL_ALLOC hit EBUSY and the desktop never came up. gles2/
-                // zink avoids that path entirely. Opt back into native Vulkan
-                // with `nvidia.wlr_vulkan` on the cmdline once the external-
-                // semaphore capability is wired. Named explicitly (not wlroots
-                // auto-select) so init, /etc/profile and the wrapper agree.
-                // WLR_DRM_NO_MODIFIERS is already in CHILD_ENV (LINEAR scanout).
-                let wlr = if cmdline_has("nvidia.wlr_vulkan") { "vulkan" } else { "gles2" };
-                env.push(CString::new(format!("WLR_RENDERER={wlr}")).unwrap());
-                log(&format!(
-                    "renderer=gl: NVIDIA GPU -> WLR_RENDERER={wlr} (default gles2=zink->NVK; vulkan via nvidia.wlr_vulkan)"
-                ));
-                // On real NVIDIA hardware, pin the OpenGL Gallium driver to zink
-                // (GL-on-Vulkan over NVK). Our nouveau uAPI implements the zink/NVK
-                // submission path (VM_BIND/EXEC) but NOT the classic nvc0 Gallium
-                // path (GEM_PUSHBUF returns EOPNOTSUPP). A GL CLIENT (glxgears,
-                // eglgears, anything the user launches) that Mesa steers to nvc0
-                // therefore fails submission and silently falls back to llvmpipe --
-                // a system-memory buffer that is NOT a nouveau GEM object, so the
-                // compositor's PRIME self-import misses it and NVK's dma-buf import
-                // ENOENTs (the client crashes; the desktop survives). Pinning zink
-                // makes clients take the SAME hardware path the compositor already
-                // uses, so their buffers are real nouveau objects that import
-                // cleanly. GATED to NVIDIA: zink needs a Vulkan driver, and QEMU's
-                // virtio-gpu has none (its GL is virgl), so forcing zink there would
-                // break the QEMU desktop -- leave virtio on its virgl path. Both
-                // vars are set because different Mesa builds honour one or the other
-                // for the "force zink over the native DRI driver" override.
-                env.push(CString::new("GALLIUM_DRIVER=zink").unwrap());
-                env.push(CString::new("MESA_LOADER_DRIVER_OVERRIDE=zink").unwrap());
-                log("renderer=gl: NVIDIA GPU -> pinning GL clients to zink+NVK (GALLIUM_DRIVER=zink)");
+                // Current real-hardware status: labwc's default GPU-rendered path
+                // still crashes inside Mesa/NVK and floods `/tmp/labwc.log` with
+                // "zink: failed to create timeline semaphore", then the compositor
+                // dies during teardown. Keep the kernel nouveau uAPI enabled (for
+                // continued bring-up/debugging) but default the SESSION to the
+                // proven software path so labwc actually reaches the desktop.
+                //
+                // Opt back into the unstable compositor GPU paths explicitly:
+                //   * `nvidia.wlr_gles2`   -> wlroots GLES2 on zink+NVK
+                //   * `nvidia.wlr_vulkan` -> wlroots native Vulkan/NVK
+                //
+                // Absent those flags, use pixman for the compositor and software
+                // GL for clients. That avoids zink/NVK entirely on boot.
+                if cmdline_has("nvidia.wlr_vulkan") || cmdline_has("nvidia.wlr_gles2") {
+                    let wlr = if cmdline_has("nvidia.wlr_vulkan") {
+                        "vulkan"
+                    } else {
+                        "gles2"
+                    };
+                    env.push(CString::new(format!("WLR_RENDERER={wlr}")).unwrap());
+                    log(&format!(
+                        "renderer=gl: NVIDIA GPU -> experimental WLR_RENDERER={wlr} \
+                         (via nvidia.wlr_{})",
+                        if wlr == "vulkan" { "vulkan" } else { "gles2" }
+                    ));
+                    // On real NVIDIA hardware, pin the OpenGL Gallium driver to
+                    // zink (GL-on-Vulkan over NVK) only on the explicit
+                    // experimental path. Our nouveau uAPI implements the zink/NVK
+                    // submission path (VM_BIND/EXEC) but NOT classic nvc0
+                    // GEM_PUSHBUF, so hardware GL clients need the pin whenever we
+                    // intentionally exercise the GPU path.
+                    env.push(CString::new("GALLIUM_DRIVER=zink").unwrap());
+                    env.push(CString::new("MESA_LOADER_DRIVER_OVERRIDE=zink").unwrap());
+                    log(
+                        "renderer=gl: NVIDIA GPU -> pinning GL clients to zink+NVK on explicit experimental path",
+                    );
+                } else {
+                    env.push(CString::new("WLR_RENDERER=pixman").unwrap());
+                    env.push(CString::new("WLR_RENDERER_ALLOW_SOFTWARE=1").unwrap());
+                    env.push(CString::new("LIBGL_ALWAYS_SOFTWARE=1").unwrap());
+                    log(
+                        "renderer=gl: NVIDIA GPU -> defaulting labwc to pixman and clients to software GL; opt into GPU rendering with nvidia.wlr_gles2 or nvidia.wlr_vulkan",
+                    );
+                }
             } else {
                 // `renderer=gl` (GL=1) on a machine with NO NVIDIA GPU -- the
                 // GL=1 image booted under QEMU. The hardware-GL path cannot

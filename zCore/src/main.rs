@@ -299,8 +299,10 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             let envs: alloc::vec::Vec<alloc::string::String> = alloc::vec![
                 // /usr/local/bin first so the Eclipse labwc wrapper (which
                 // selects the renderer by the two-condition GL gate --
-                // hardware GL only on NVIDIA + nvidia.nouveau_uapi, else
-                // pixman) shadows the apk-installed binary.
+                // NVIDIA experiment knobs only on NVIDIA +
+                // nvidia.nouveau_uapi, but with a software-default labwc
+                // session unless explicit wlroots GPU flags are present)
+                // shadows the apk-installed binary.
                 "PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
                 "ENV=/etc/profile".into(),
                 "HOME=/root".into(),
