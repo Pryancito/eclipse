@@ -203,7 +203,24 @@ pub(super) fn init() -> DeviceResult {
     irq.register_device(trap::X86_ISA_IRQ_MOUSE, ps2_input.clone().upcast())?;
     irq.unmask(trap::X86_ISA_IRQ_MOUSE)?;
     drivers::add_device(Device::Input(ps2_input));
-    init_acpi_power_button(&irq);
+    // ACPI power button (SCI) — OPT-IN via `acpi.powerbtn`, default OFF.
+    //
+    // The SCI is a LEVEL-triggered, SHARED ACPI interrupt: on real hardware the
+    // firmware routes General Purpose Events (embedded controller, thermal
+    // zones, lid, ...) to it, not just the power button. This handler only
+    // reads/clears the PM1 power-button status bit; it has no AML interpreter
+    // or GPE dispatcher, so it cannot service or CLEAR any other source. On a
+    // level-triggered line an unhandled GPE keeps the line asserted, so once
+    // unmasked the SCI re-fires forever -> an interrupt storm that starves the
+    // PS/2 mouse (IRQ 12, unmasked just above) and keyboard (IRQ 1): the
+    // pointer froze / stopped drawing on real hardware. QEMU rarely raises
+    // those GPEs, so it only bit bare metal. Until the handler drains the GPE
+    // status blocks (GPE0/GPE1 STS write-1-to-clear) the safe default is to
+    // leave the SCI MASKED — input is never starved. Opt in with `acpi.powerbtn`
+    // once GPE draining lands and can be validated on hardware.
+    if crate::KCONFIG.cmdline.contains("acpi.powerbtn") {
+        init_acpi_power_button(&irq);
+    }
 
     use x2apic::lapic::{TimerDivide, TimerMode};
 
