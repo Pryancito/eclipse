@@ -283,36 +283,251 @@ impl PcmDev {
     }
 
     // ── hw_params refine ────────────────────────────────────────────────────
+    //
+    // alsa-lib does NOT hand the kernel a finished configuration: it negotiates
+    // one parameter at a time (`snd_pcm_hw_params_choose` walks access, format,
+    // …, period_time, period_size, period_bytes, periods, buffer_time,
+    // buffer_size, buffer_bytes), calling HW_REFINE after every single
+    // narrowing and expecting the kernel to derive every *dependent* parameter.
+    // speaker-test, for one, only ever sets period_time/buffer_time and lets
+    // the sizes fall out of them.
+    //
+    // So refining each parameter against a fixed range in isolation is not
+    // enough — it leaves the sizes wide open while the times are pinned, and
+    // the combination alsa-lib then picks is internally inconsistent, which the
+    // final refine rejects (the EINVAL from `snd_pcm_hw_params`). Linux solves
+    // this with constraint rules (`snd_pcm_hw_rule_*`) re-run to a fixed point;
+    // this is the same idea with the relations our fixed S16LE-stereo path has:
+    //
+    //   frame_bits  = sample_bits × channels                     (= 32)
+    //   period_bytes = period_size × frame_bits / 8              (= ps × 4)
+    //   buffer_bytes = buffer_size × frame_bits / 8              (= bs × 4)
+    //   buffer_size  = period_size × periods
+    //   period_time  = period_size × 1e6 / rate                  (µs)
+    //   buffer_time  = buffer_size × 1e6 / rate                  (µs)
+    //
+    // Each relation is propagated in BOTH directions until nothing changes.
 
-    fn clamp_interval(iv: &mut SndInterval, lo: u32, hi: u32, integer: bool) -> bool {
+    /// Interval index inside `SndPcmHwParams::intervals` (biased by 8, the
+    /// first interval parameter id).
+    const IV_SAMPLE_BITS: usize = PAR_SAMPLE_BITS - 8;
+    const IV_FRAME_BITS: usize = PAR_FRAME_BITS - 8;
+    const IV_CHANNELS: usize = PAR_CHANNELS - 8;
+    const IV_RATE: usize = PAR_RATE - 8;
+    const IV_PERIOD_TIME: usize = PAR_PERIOD_TIME - 8;
+    const IV_PERIOD_SIZE: usize = PAR_PERIOD_SIZE - 8;
+    const IV_PERIOD_BYTES: usize = PAR_PERIOD_BYTES - 8;
+    const IV_PERIODS: usize = PAR_PERIODS - 8;
+    const IV_BUFFER_TIME: usize = PAR_BUFFER_TIME - 8;
+    const IV_BUFFER_SIZE: usize = PAR_BUFFER_SIZE - 8;
+    const IV_BUFFER_BYTES: usize = PAR_BUFFER_BYTES - 8;
+    const IV_TICK_TIME: usize = PAR_TICK_TIME - 8;
+
+    /// Every parameter here is integer-valued, so open bounds are folded into
+    /// closed ones up front — the same normalization Linux's
+    /// `snd_interval_refine` does for an INTEGER interval.
+    fn iv_normalize(iv: &mut SndInterval) {
+        if iv.flags & INTERVAL_OPENMIN != 0 {
+            iv.min = iv.min.saturating_add(1);
+            iv.flags &= !INTERVAL_OPENMIN;
+        }
+        if iv.flags & INTERVAL_OPENMAX != 0 {
+            iv.max = iv.max.saturating_sub(1);
+            iv.flags &= !INTERVAL_OPENMAX;
+        }
+        iv.flags |= INTERVAL_INTEGER;
+        if iv.min > iv.max {
+            iv.flags |= INTERVAL_EMPTY;
+        }
+    }
+
+    fn iv_empty(iv: &SndInterval) -> bool {
+        iv.flags & INTERVAL_EMPTY != 0 || iv.min > iv.max
+    }
+
+    /// Intersect `iv` with `[lo, hi]`. Returns whether anything changed, so the
+    /// propagation loop knows when it has reached a fixed point.
+    fn iv_clamp(iv: &mut SndInterval, lo: u64, hi: u64) -> bool {
+        let lo = lo.min(u32::MAX as u64) as u32;
+        let hi = hi.min(u32::MAX as u64) as u32;
+        let mut changed = false;
         if iv.min < lo {
             iv.min = lo;
-            iv.flags &= !INTERVAL_OPENMIN;
+            changed = true;
         }
         if iv.max > hi {
             iv.max = hi;
-            iv.flags &= !INTERVAL_OPENMAX;
-        }
-        if integer {
-            iv.flags |= INTERVAL_INTEGER;
+            changed = true;
         }
         if iv.min > iv.max {
             iv.flags |= INTERVAL_EMPTY;
-            return false;
         }
-        true
+        changed
     }
 
-    fn set_interval(iv: &mut SndInterval, v: u32) -> bool {
-        Self::clamp_interval(iv, v, v, true)
+    fn iv_bounds(iv: &SndInterval) -> (u64, u64) {
+        (iv.min as u64, iv.max as u64)
     }
 
-    /// Constrain a hw_params request to what the hardware path does. Returns
-    /// `false` when any parameter became empty (→ EINVAL, which alsa-lib's
-    /// `*_near` searches use to home in on supported values).
+    /// Human name for a parameter index, for the diagnostic log below.
+    fn iv_name(idx: usize) -> &'static str {
+        match idx {
+            Self::IV_SAMPLE_BITS => "sample_bits",
+            Self::IV_FRAME_BITS => "frame_bits",
+            Self::IV_CHANNELS => "channels",
+            Self::IV_RATE => "rate",
+            Self::IV_PERIOD_TIME => "period_time",
+            Self::IV_PERIOD_SIZE => "period_size",
+            Self::IV_PERIOD_BYTES => "period_bytes",
+            Self::IV_PERIODS => "periods",
+            Self::IV_BUFFER_TIME => "buffer_time",
+            Self::IV_BUFFER_SIZE => "buffer_size",
+            Self::IV_BUFFER_BYTES => "buffer_bytes",
+            Self::IV_TICK_TIME => "tick_time",
+            _ => "?",
+        }
+    }
+
+    /// One propagation sweep. Returns `true` if any interval narrowed.
+    fn propagate(&self, iv: &mut [SndInterval; 12]) -> bool {
+        let mut changed = false;
+        let ring = self.ring_frames();
+
+        // Fixed points of this path: S16LE stereo.
+        changed |= Self::iv_clamp(&mut iv[Self::IV_SAMPLE_BITS], 16, 16);
+        changed |= Self::iv_clamp(&mut iv[Self::IV_CHANNELS], 2, 2);
+        changed |= Self::iv_clamp(&mut iv[Self::IV_FRAME_BITS], 32, 32);
+
+        // Rate: snap to the discrete set the HDA stream format encodes.
+        {
+            let r = &mut iv[Self::IV_RATE];
+            let lo = RATES.iter().copied().find(|&x| x >= r.min);
+            let hi = RATES.iter().rev().copied().find(|&x| x <= r.max);
+            match (lo, hi) {
+                (Some(lo), Some(hi)) if lo <= hi => {
+                    changed |= Self::iv_clamp(r, lo as u64, hi as u64);
+                }
+                _ => {
+                    r.flags |= INTERVAL_EMPTY;
+                }
+            }
+        }
+
+        // Hard bounds of the driver ring. The period ceiling is half the ring
+        // so at least two periods always fit; without it a long period at a
+        // high rate (125 ms at 96 kHz is 12000 frames) is refused outright
+        // instead of merely being deep. The floor stays low enough for the
+        // low-latency configurations clients legitimately ask for — 5 ms at
+        // 48 kHz is 240 frames, so a 256-frame floor would reject it.
+        changed |= Self::iv_clamp(&mut iv[Self::IV_PERIOD_SIZE], 128, (ring / 2).max(128));
+        changed |= Self::iv_clamp(&mut iv[Self::IV_BUFFER_SIZE], 512, ring);
+        changed |= Self::iv_clamp(&mut iv[Self::IV_PERIODS], 1, 1024);
+        changed |= Self::iv_clamp(&mut iv[Self::IV_TICK_TIME], 0, u32::MAX as u64);
+
+        // Every derived bound below is deliberately CONSERVATIVE: the lower
+        // bound floors, the upper bound ceils. Linux does the same
+        // (`snd_interval_div` floors the min and bumps the max on a remainder)
+        // and the reason is not cosmetic — a division whose lower bound ceils
+        // carves out the legal value whenever the operands don't divide
+        // evenly. At 44.1 kHz a 0.5 s buffer is 22050 frames and a 125 ms
+        // period is 5512.5: rounding the derived period_size UP to 5513 while
+        // the reverse rule rounds it DOWN to 5512 empties the interval and the
+        // whole hw_params fails with EINVAL. Exact internal consistency is not
+        // the refine's job — `install` picks the coherent triple at the end.
+
+        // period_bytes = period_size × 4  (both directions)
+        let (ps_lo, ps_hi) = Self::iv_bounds(&iv[Self::IV_PERIOD_SIZE]);
+        changed |= Self::iv_clamp(&mut iv[Self::IV_PERIOD_BYTES], ps_lo * 4, ps_hi * 4);
+        let (pb_lo, pb_hi) = Self::iv_bounds(&iv[Self::IV_PERIOD_BYTES]);
+        changed |= Self::iv_clamp(&mut iv[Self::IV_PERIOD_SIZE], pb_lo / 4, pb_hi.div_ceil(4));
+
+        // buffer_bytes = buffer_size × 4
+        let (bs_lo, bs_hi) = Self::iv_bounds(&iv[Self::IV_BUFFER_SIZE]);
+        changed |= Self::iv_clamp(&mut iv[Self::IV_BUFFER_BYTES], bs_lo * 4, bs_hi * 4);
+        let (bb_lo, bb_hi) = Self::iv_bounds(&iv[Self::IV_BUFFER_BYTES]);
+        changed |= Self::iv_clamp(&mut iv[Self::IV_BUFFER_SIZE], bb_lo / 4, bb_hi.div_ceil(4));
+
+        // buffer_size ≈ period_size × periods.
+        //
+        // Approximately, not exactly: the DMA ring this sits on is continuous
+        // and is not carved into period segments, so a buffer that is not a
+        // whole number of periods is perfectly playable here. Demanding the
+        // exact multiple during refine would reject ordinary requests — 0.5 s
+        // at 44.1 kHz is 22050 frames while four 125 ms periods are 22048 —
+        // so the upper bound carries one period of slack and `install` is what
+        // settles on the exactly-coherent triple.
+        let (ps_lo, ps_hi) = Self::iv_bounds(&iv[Self::IV_PERIOD_SIZE]);
+        let (n_lo, n_hi) = Self::iv_bounds(&iv[Self::IV_PERIODS]);
+        changed |= Self::iv_clamp(
+            &mut iv[Self::IV_BUFFER_SIZE],
+            ps_lo * n_lo,
+            ps_hi * n_hi + ps_hi.saturating_sub(1),
+        );
+        let (bs_lo, bs_hi) = Self::iv_bounds(&iv[Self::IV_BUFFER_SIZE]);
+        if n_hi > 0 && n_lo > 0 {
+            // `n_hi + 1` for the same reason the upper bound above carries
+            // slack: with a non-exact multiple allowed, a period only has to
+            // be small enough that `periods` of them approximately fill the
+            // buffer, not exactly.
+            changed |= Self::iv_clamp(
+                &mut iv[Self::IV_PERIOD_SIZE],
+                bs_lo / (n_hi + 1),
+                bs_hi.div_ceil(n_lo),
+            );
+        }
+        let (ps_lo, ps_hi) = Self::iv_bounds(&iv[Self::IV_PERIOD_SIZE]);
+        if ps_hi > 0 && ps_lo > 0 {
+            changed |= Self::iv_clamp(
+                &mut iv[Self::IV_PERIODS],
+                bs_lo / ps_hi,
+                bs_hi.div_ceil(ps_lo),
+            );
+        }
+
+        // period_time = period_size × 1e6 / rate, and the same for the buffer.
+        //
+        // Time is continuous but sizes are whole frames, so the two directions
+        // must describe the SAME relation or they fight each other: one hands
+        // out a size, the other then rejects the very time it was derived
+        // from. The relation is `size = floor(time × rate / 1e6)`, i.e. a size
+        // of N frames owns the half-open time cell [N/rate, (N+1)/rate):
+        //
+        //   size ← time : [floor(t_lo·r_lo/1e6), floor(t_hi·r_hi/1e6)]
+        //   time ← size : [ceil(N_lo·1e6/r_hi), ceil((N_hi+1)·1e6/r_lo) − 1]
+        //
+        // Getting this asymmetric is what rejected 0.5 s at 11.025 kHz: the
+        // size rule rounded 5512.5 up to 5513, and the time rule then said
+        // 5513 frames is 500045 µs, which no longer contains the 500000 the
+        // client asked for. Linux encodes the same half-open cell with its
+        // open-bound flags.
+        let (r_lo, r_hi) = Self::iv_bounds(&iv[Self::IV_RATE]);
+        let (r_lo, r_hi) = (r_lo.max(1), r_hi.max(1));
+        for (size_idx, time_idx) in [
+            (Self::IV_PERIOD_SIZE, Self::IV_PERIOD_TIME),
+            (Self::IV_BUFFER_SIZE, Self::IV_BUFFER_TIME),
+        ] {
+            let (s_lo, s_hi) = Self::iv_bounds(&iv[size_idx]);
+            changed |= Self::iv_clamp(
+                &mut iv[time_idx],
+                (s_lo * 1_000_000).div_ceil(r_hi),
+                (((s_hi + 1) * 1_000_000).div_ceil(r_lo)).saturating_sub(1),
+            );
+            let (t_lo, t_hi) = Self::iv_bounds(&iv[time_idx]);
+            changed |= Self::iv_clamp(
+                &mut iv[size_idx],
+                t_lo * r_lo / 1_000_000,
+                t_hi * r_hi / 1_000_000,
+            );
+        }
+
+        changed
+    }
+
+    /// Constrain a hw_params request to what the hardware path does, running
+    /// the relations above to a fixed point. Returns `false` when a parameter
+    /// became empty (→ EINVAL, which alsa-lib's `*_near` searches use to home
+    /// in on supported values).
     fn refine(&self, p: &mut SndPcmHwParams) -> bool {
-        let mut ok = true;
-
         p.masks[PAR_ACCESS].bits[0] &= 1 << ACCESS_RW_INTERLEAVED;
         p.masks[PAR_FORMAT].bits[0] &= 1 << FORMAT_S16_LE;
         p.masks[PAR_FORMAT].bits[1] = 0;
@@ -322,116 +537,197 @@ impl PcmDev {
                 *w = 0;
             }
         }
-        ok &= p.masks[PAR_ACCESS].bits[0] != 0;
-        ok &= p.masks[PAR_FORMAT].bits[0] != 0;
-        ok &= p.masks[PAR_SUBFORMAT].bits[0] != 0;
+        let mut ok = p.masks[PAR_ACCESS].bits[0] != 0
+            && p.masks[PAR_FORMAT].bits[0] != 0
+            && p.masks[PAR_SUBFORMAT].bits[0] != 0;
 
-        let iv = &mut p.intervals;
-        ok &= Self::set_interval(&mut iv[PAR_SAMPLE_BITS - 8], 16);
-        ok &= Self::set_interval(&mut iv[PAR_FRAME_BITS - 8], 32);
-        ok &= Self::set_interval(&mut iv[PAR_CHANNELS - 8], 2);
-
-        // Rate: snap the interval to the discrete supported set.
-        {
-            let r = &mut iv[PAR_RATE - 8];
-            let lo = RATES.iter().copied().find(|&x| x >= r.min);
-            let hi = RATES.iter().rev().copied().find(|&x| x <= r.max);
-            match (lo, hi) {
-                (Some(lo), Some(hi)) if lo <= hi => {
-                    ok &= Self::clamp_interval(r, lo, hi, true);
-                }
-                _ => {
-                    r.flags |= INTERVAL_EMPTY;
-                    ok = false;
-                }
+        for iv in p.intervals.iter_mut() {
+            Self::iv_normalize(iv);
+        }
+        // Fixed point: each sweep can only narrow intervals, so this
+        // terminates; the cap is a belt-and-braces bound.
+        for _ in 0..8 {
+            if !self.propagate(&mut p.intervals) {
+                break;
             }
         }
-
-        let ring = self.ring_frames() as u32;
-        ok &= Self::clamp_interval(&mut iv[PAR_PERIOD_SIZE - 8], 64, 8192, true);
-        ok &= Self::clamp_interval(&mut iv[PAR_PERIOD_BYTES - 8], 64 * 4, 8192 * 4, true);
-        ok &= Self::clamp_interval(&mut iv[PAR_PERIODS - 8], 2, 512, true);
-        ok &= Self::clamp_interval(&mut iv[PAR_BUFFER_SIZE - 8], 128, ring, true);
-        ok &= Self::clamp_interval(&mut iv[PAR_BUFFER_BYTES - 8], 128 * 4, ring * 4, true);
-
-        // Times in µs, derived loosely from the rate/size bounds above.
-        let rate_min = iv[PAR_RATE - 8].min.max(1);
-        let rate_max = iv[PAR_RATE - 8].max.max(1);
-        let pt_min = (64u64 * 1_000_000 / rate_max as u64) as u32;
-        let pt_max = (8192u64 * 1_000_000 / rate_min as u64 + 1) as u32;
-        ok &= Self::clamp_interval(&mut iv[PAR_PERIOD_TIME - 8], pt_min.max(1), pt_max, false);
-        let bt_min = (128u64 * 1_000_000 / rate_max as u64) as u32;
-        let bt_max = (ring as u64 * 1_000_000 / rate_min as u64 + 1) as u32;
-        ok &= Self::clamp_interval(&mut iv[PAR_BUFFER_TIME - 8], bt_min.max(1), bt_max, false);
-        ok &= Self::clamp_interval(&mut iv[PAR_TICK_TIME - 8], 0, 1_000_000, false);
+        for (i, iv) in p.intervals.iter().enumerate() {
+            if Self::iv_empty(iv) {
+                if ok {
+                    Self::log_refine_failure(Self::iv_name(i), &p.intervals);
+                }
+                ok = false;
+            }
+        }
 
         p.info = INFO_INTERLEAVED | INFO_BLOCK_TRANSFER;
         p.msbits = 16;
         p.rate_den = 1;
         p.rate_num = 0;
         p.fifo_size = 0;
-        // Report everything as (potentially) changed; alsa-lib re-reads all.
+        // Report every parameter as (potentially) changed; alsa-lib re-reads all.
         p.cmask = 0x000f_ff07;
         ok
     }
 
-    /// Choose concrete values inside the (already refined) request.
+    /// Log the first few refine rejections with the full parameter state. A
+    /// failed hw_params is otherwise a bare EINVAL in userspace with no way to
+    /// tell which constraint bit; budgeted so a client that probes in a loop
+    /// cannot flood the console.
+    fn log_refine_failure(name: &str, iv: &[SndInterval; 12]) {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static BUDGET: AtomicU32 = AtomicU32::new(8);
+        if BUDGET
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+                b.checked_sub(1)
+            })
+            .is_err()
+        {
+            return;
+        }
+        warn!(
+            "[snd] hw_params rejected: '{}' empty — rate {}..{}, period_size {}..{}, \
+             period_time {}..{}, periods {}..{}, buffer_size {}..{}, buffer_time {}..{}",
+            name,
+            iv[Self::IV_RATE].min,
+            iv[Self::IV_RATE].max,
+            iv[Self::IV_PERIOD_SIZE].min,
+            iv[Self::IV_PERIOD_SIZE].max,
+            iv[Self::IV_PERIOD_TIME].min,
+            iv[Self::IV_PERIOD_TIME].max,
+            iv[Self::IV_PERIODS].min,
+            iv[Self::IV_PERIODS].max,
+            iv[Self::IV_BUFFER_SIZE].min,
+            iv[Self::IV_BUFFER_SIZE].max,
+            iv[Self::IV_BUFFER_TIME].min,
+            iv[Self::IV_BUFFER_TIME].max,
+        );
+    }
+
+    /// Choose concrete values inside the (already refined) request, the way
+    /// Linux's `snd_pcm_hw_params` finishes the job: pick each still-open
+    /// parameter, re-propagate so the rest follows, and hand every interval
+    /// back as an exact singleton.
     fn install(&self, p: &mut SndPcmHwParams) -> Result<()> {
         if !self.refine(p) {
             return Err(FsError::InvalidParam);
         }
-        let iv = &p.intervals;
 
-        // Rate: the smallest supported rate inside the refined interval (after
-        // `refine` both ends are supported values).
+        // Rate first: everything time-related depends on it.
         let rate = RATES
             .iter()
             .copied()
-            .find(|&r| r >= iv[PAR_RATE - 8].min && r <= iv[PAR_RATE - 8].max)
+            .find(|&r| {
+                r >= p.intervals[Self::IV_RATE].min && r <= p.intervals[Self::IV_RATE].max
+            })
             .ok_or(FsError::InvalidParam)?;
-
-        let period = iv[PAR_PERIOD_SIZE - 8].min.max(64) as u64;
-        let ring = self.ring_frames();
-        let mut buffer = iv[PAR_BUFFER_SIZE - 8].min.max(128) as u64;
-        // If the client left the buffer wide open, take something comfortable.
-        if iv[PAR_BUFFER_SIZE - 8].max as u64 > buffer * 4 {
-            buffer = (period * 8).clamp(buffer, iv[PAR_BUFFER_SIZE - 8].max as u64);
+        Self::iv_clamp(&mut p.intervals[Self::IV_RATE], rate as u64, rate as u64);
+        for _ in 0..8 {
+            if !self.propagate(&mut p.intervals) {
+                break;
+            }
         }
-        let buffer = buffer.min(ring);
+
+        // Then the period, then the buffer — the order alsa-lib itself uses
+        // (`snd_pcm_hw_params_choose`: first value for the period, last for the
+        // buffer, so a client that left the buffer open gets the deepest one).
+        //
+        // The triple is made EXACTLY coherent here (buffer = period × periods)
+        // instead of by more propagation, because the refine's conservative
+        // rounding can leave the client's requested time and the integer sizes
+        // an odd frame apart — 0.5 s at 44.1 kHz is 22050 frames, which is not
+        // a whole number of 125 ms periods. Deriving the answer and reporting
+        // it back is exactly what Linux does; the client reads the granted
+        // values (they are what `aplay -v` prints) rather than its request.
+        let period = (p.intervals[Self::IV_PERIOD_SIZE].min as u64).max(1);
+        let ring = self.ring_frames();
+        let bs_lo = p.intervals[Self::IV_BUFFER_SIZE].min as u64;
+        let bs_hi = (p.intervals[Self::IV_BUFFER_SIZE].max as u64).min(ring);
+        let n_iv = p.intervals[Self::IV_PERIODS];
+        let mut periods = if n_iv.min == n_iv.max && n_iv.min > 0 {
+            n_iv.min as u64 // the client pinned a period count: honour it
+        } else {
+            (bs_hi / period).max(1)
+        };
+        // Fit period × periods inside the buffer bounds the refine settled on.
+        // Shrink first, then grow only while the result still fits the upper
+        // bound, so the two adjustments cannot oscillate.
+        while periods > 1 && period * periods > bs_hi {
+            periods -= 1;
+        }
+        while period * periods < bs_lo && period * (periods + 1) <= bs_hi.min(ring) {
+            periods += 1;
+        }
+        let buffer = (period * periods).min(ring);
 
         let (actual_rate, _ch) = self
             .audio
             .set_params(rate, 2)
             .map_err(|_| FsError::DeviceError)?;
-
-        let mut st = self.st.lock();
-        st.rate = actual_rate;
-        st.period_size = period;
-        st.buffer_size = buffer;
-        st.appl_ptr = 0;
-        // Same boundary algorithm as Linux + alsa-lib, so both sides agree.
-        let mut boundary = buffer;
-        while boundary < 0x4000_0000_0000_0000u64 {
-            boundary *= 2;
+        if actual_rate != rate {
+            warn!(
+                "[snd] device took {} Hz for a {} Hz request",
+                actual_rate, rate
+            );
         }
-        st.boundary = boundary;
-        st.state = STATE_SETUP;
-        drop(st);
 
-        // Report the concrete configuration back as exact singletons.
+        {
+            let mut st = self.st.lock();
+            st.rate = actual_rate;
+            st.period_size = period;
+            st.buffer_size = buffer;
+            st.appl_ptr = 0;
+            // Same boundary algorithm as Linux and alsa-lib, so both sides
+            // wrap the pointers at the same value.
+            let mut boundary = buffer;
+            while boundary < 0x4000_0000_0000_0000u64 {
+                boundary *= 2;
+            }
+            st.boundary = boundary;
+            st.avail_min = period;
+            st.state = STATE_SETUP;
+        }
+
+        // Hand back exact singletons for everything.
         let iv = &mut p.intervals;
-        let _ = Self::set_interval(&mut iv[PAR_RATE - 8], actual_rate);
-        let _ = Self::set_interval(&mut iv[PAR_PERIOD_SIZE - 8], period as u32);
-        let _ = Self::set_interval(&mut iv[PAR_PERIOD_BYTES - 8], period as u32 * 4);
-        let _ = Self::set_interval(&mut iv[PAR_BUFFER_SIZE - 8], buffer as u32);
-        let _ = Self::set_interval(&mut iv[PAR_BUFFER_BYTES - 8], buffer as u32 * 4);
-        let _ = Self::set_interval(&mut iv[PAR_PERIODS - 8], (buffer / period).max(1) as u32);
-        let pt = (period * 1_000_000 / actual_rate as u64) as u32;
-        let _ = Self::clamp_interval(&mut iv[PAR_PERIOD_TIME - 8], pt, pt + 1, false);
-        let bt = (buffer * 1_000_000 / actual_rate as u64) as u32;
-        let _ = Self::clamp_interval(&mut iv[PAR_BUFFER_TIME - 8], bt, bt + 1, false);
+        for (idx, v) in [
+            (Self::IV_SAMPLE_BITS, 16),
+            (Self::IV_FRAME_BITS, 32),
+            (Self::IV_CHANNELS, 2),
+            (Self::IV_RATE, actual_rate as u64),
+            (Self::IV_PERIOD_SIZE, period),
+            (Self::IV_PERIOD_BYTES, period * 4),
+            (Self::IV_PERIODS, periods),
+            (Self::IV_BUFFER_SIZE, buffer),
+            (Self::IV_BUFFER_BYTES, buffer * 4),
+            (
+                Self::IV_PERIOD_TIME,
+                period * 1_000_000 / actual_rate as u64,
+            ),
+            (
+                Self::IV_BUFFER_TIME,
+                buffer * 1_000_000 / actual_rate as u64,
+            ),
+        ] {
+            let v = v.min(u32::MAX as u64) as u32;
+            iv[idx] = SndInterval {
+                min: v,
+                max: v,
+                flags: INTERVAL_INTEGER,
+            };
+        }
+        iv[Self::IV_TICK_TIME] = SndInterval {
+            min: 0,
+            max: 0,
+            flags: INTERVAL_INTEGER,
+        };
         p.rate_num = actual_rate;
         p.rate_den = 1;
+
+        info!(
+            "[snd] pcmC{}D0p configured: {} Hz, 2ch S16LE, period {} frames, buffer {} frames ({} periods)",
+            self.card, actual_rate, period, buffer, periods
+        );
         Ok(())
     }
 
