@@ -1429,3 +1429,244 @@ use-after-free; una salida limpia cierra cada referencia y libera normal. El
 cierre completo (contabilidad de referencias **por-pid** en `gem_mmap`, que
 también elimina esa fuga) queda como el siguiente trabajo con hardware en el
 bucle.
+
+## HITO en la RTX: el EXEC ejecuta, y el escritorio pasa a GLES2/zink
+
+El primer arranque tras la revisión GL (PR #950) dio el dato que faltaba, en
+`/proc/gpudbg`, en **las dos** GPUs (consola bus 23 y cómputo bus 101):
+
+```
+--- last client (ctx>=1) EXEC draw submit ---
+ctx=7 pid=1029 OK: 1 push(es) + fence landed, 1 syncobj(s) signaled
+--- MMU fault snapshot (read-only) ---
+FAULT_INFO1(0xb83090)=0x00000000 valid=0 ...
+```
+
+Es decir: un cliente **zink→NVK** (ctx 7) sometió trabajo, la GPU lo ejecutó,
+la valla aterrizó, el syncobj se señaló, y **cero fallos de MMU**. La tubería
+de submisión completa — GART, PTEs de `VM_BIND`, fetch de PBDMA, ejecución,
+valla, syncobj — funciona de punta a punta en hardware real. Es el objetivo
+que todo este trabajo perseguía.
+
+### El bloqueo del escritorio ya no es submisión, es el semáforo externo
+
+`labwc.log` mostró el compositor en bucle de crash con dos fallos, ambos del
+**renderizador Vulkan NATIVO de wlroots**:
+
+```
+[render/vulkan/renderer.c:2582] vkCreateSemaphore: ERROR_INVALID_EXTERNAL_HANDLE (-1000072003)
+[render/vulkan/vulkan.c:265]    Could not retrieve physical devices: ERROR_INITIALIZATION_FAILED (-3)
+[render/vulkan/renderer.c:2608] Could not match drm and vulkan device
+```
+
+Dato decisivo: en `dmesg` **no aparece ni un ioctl de SYNCOBJ**. NVK rechaza
+el semáforo **externo/compartible** que wlroots-vulkan pide (`VK_KHR_external_
+semaphore`) **en userspace**, por las capacidades que anuncia sobre esta uAPI
+de syncobj parcial — nunca llega a llamar al kernel. No es un bug de ioctl:
+es que el renderizador Vulkan nativo de wlroots exige un tipo de semáforo que
+NVK no exporta aquí todavía.
+
+### El efecto dominó: `CHANNEL_ALLOC` → `EBUSY`
+
+El fallo del semáforo mete a NVK en un bucle de reintentos que recrea
+**contextos de enumeración de usar-y-tirar** (un `CHANNEL_ALLOC` + 5 `NVIF NEW`
+de clase cada uno). `dmesg` lo captó: pid 1029 en ~100 ms acumuló ~40 objetos
+de clase (0x1ba…0x1e3) y los canales se dispararon hasta el tope
+`MAX_CHANNELS=16` → `CHANNEL_ALLOC (nr=0x42) -> errno 16 (EBUSY)` →
+`vkEnumeratePhysicalDevices -3` → *"could not match drm and vulkan device"*.
+La degradación observada (respawns viejos llegan al semáforo, nuevos ni
+enumeran) es ese agotamiento acumulándose.
+
+### La decisión: GLES2/zink por defecto
+
+Como gpudbg **prueba que zink→NVK ejecuta**, el compositor pasa a **GLES2 sobre
+zink** por defecto — la ruta probada, que además no toca el semáforo externo ni
+el bucle que agota los canales. Se hace en las tres fuentes de entorno a la vez
+(`eclipse-init` `build_child_env`, `/etc/profile`, wrapper de labwc), sobre la
+misma compuerta de dos condiciones (NVIDIA + `nvidia.nouveau_uapi`). El
+renderizador **Vulkan nativo de wlroots** queda como opt-in por cmdline
+**`nvidia.wlr_vulkan`**, para retomarlo cuando se cablee la capacidad de
+semáforo externo de NVK.
+
+Blindaje: `MAX_CHANNELS` sube de 16 a 64 para absorber cualquier ráfaga de
+enumeración (los contextos RM reales siguen acotados por `MAX_CTX`). En la ruta
+GLES2/zink no hay churn, así que es cinturón y tirantes.
+
+### Pendiente (con hardware en el bucle): la fuga de objetos de clase
+
+Los ~40 objetos de clase que acumuló el bucle de reintentos son una **fuga**
+real: NVK no envía `NVIF DEL` por ellos y `CHANNEL_FREE` no reapa los objetos
+de clase del contexto (viven en el canal del ctx, no en el canal de usar-y-tirar
+que se libera). Sólo la salida del proceso los libera. **No se corrige a ciegas
+aquí**: liberar objetos de clase de un contexto vivo en el momento equivocado es
+justo el patrón de **doble-free que corrompió el GSP** en un hito anterior, y no
+puede validarse sin la RTX. En la ruta GLES2/zink el bucle no ocurre (el
+compositor no hace churn de contextos), así que la fuga queda latente. El cierre
+correcto — asociar objetos de clase a su canal/ctx y reaparlos en el free del
+último canal del contexto, sin doble-free — es el siguiente trabajo con hardware.
+
+## GLES2/zink descubre el muro real: agotamiento de contextos (`MAX_CTX`)
+
+El arranque con el compositor en GLES2/zink llegó más lejos (renderizador
+`render/gles2/renderer.c`, no el Vulkan nativo) pero tampoco pintó. El dmesg
+lo dejó claro (grep `SYNCOBJ|errno` — **cero líneas SYNCOBJ**, syncobj queda
+descartado del todo):
+
+```
+EXEC OK (first): fence confirmed, 1 syncobj signaled -- Mesa work is reaching the GPU
+... 47 s después ...
+VM_BIND (nr=0x51) -> errno 5 to userspace
+... y luego en bucle ...
+ctx: no free context slot (max 8) for pid=1085 -- client falls back to software
+CHANNEL_ALLOC owner_pid=1085 -> channel=16 DISCOVERY ONLY (submission ENODEV -> software)
+rm: NVRM: virtmemAllocResources: VA Space alloc failed! Status Code: 0x51 ... RangeLo: 0x3fffff000
+VM_BIND MAP failed: VA=0x3fffff000 -> virt_status=0x1a
+```
+
+La cadena: el compositor **sí ejecuta** temprano (`EXEC OK`), pero los 8 slots
+de `MAX_CTX` se agotan → los clientes nuevos caen a «software» sin contexto
+propio → su `VM_BIND` colisiona en el tope del heap de Mesa (`0x3fffff000`) en
+el VAS compartido → `0x51`/`errno 5`. Y ese fallo de `VM_BIND` es lo que Mesa
+reporta como *"failed to create timeline semaphore"* / `vkCreateDevice failed`
+(el primer buffer que zink reserva). El timeline semaphore era **síntoma**, no
+causa — no hay hueco de capacidad de syncobj.
+
+El hook de salida (`Process::terminate` → `nouveau_release_process`) corre en
+**cada** muerte de proceso, así que un contexto solo se retiene si su proceso
+no termina (un hilo atascado en un busy-poll) o si hay demasiados procesos
+vivos a la vez durante la ráfaga de arranque / solapamiento de respawns del
+crash-loop. `MAX_CTX=8` era demasiado apretado para esa ventana.
+
+**Fix**: `ECLIPSE_MAX_CTX` (C) y `MAX_CTX` (Rust) suben de 8 a **32**. Los
+contextos son perezosos (uno por pid de cliente vivo, liberado a la salida),
+así que es un tope, no una preasignación; una Turing maneja de sobra 32
+canales. El tope se mantiene ≤ 32 porque el latch «wedged» por-contexto es una
+máscara `u32`. Además de dar aire a la ráfaga, limpia el diagnóstico: sin la
+tormenta de agotamiento tapándolo, el próximo log mostrará el fallo REAL del
+primer labwc si aún no pinta (y si es independiente del agotamiento, ahí se
+verá).
+
+Nota: el `labwc` lanzado A MANO desde la shell falla distinto
+(`backend/x11/backend.c: Failed to open xcb connection`) porque el shell lleva
+`DISPLAY=:0` y sin `WLR_BACKENDS=drm` wlroots elige el backend X11 anidado —
+no es la ruta de init (que sí fuerza DRM). Un despiste, no el problema.
+
+## CE-offload present, instrumentado (para perseguir la eficiencia con seguridad)
+
+El present por defecto es un blit por CPU que **lee** el buffer renderizado
+(sysmem/GART) por PCIe y lo copia al framebuffer GOP. Dos costes: es lento
+(frame completo, 2× tráfico PCIe) y, si la CPU no ve coherentemente lo que la
+GPU escribió en sysmem, **lee mal** (posible causa del "fallo de lectura").
+
+El **CE-offload** (`nvidia.cepresent`) le da la vuelta: la **misma GPU de
+cómputo que renderizó** usa su motor de copia para leer su propio buffer y
+DMA-earlo (PCIe P2P) al framebuffer de scanout de la consola. La GPU leyendo lo
+que ella misma escribió es coherente → **puede ser corrección + velocidad a la
+vez**. Existía (`eclipse_rm_ce_blit_p2p`) pero "desestabilizaba", así que estaba
+apagado.
+
+La desestabilización tiene causa plausible: `ce_blit_p2p` es **síncrono** y corre
+bajo la compuerta del RM; si el P2P a la BAR1 de la consola falla (ACS bloqueado)
+o el GMMU no mapea ese MMIO peer, `ceutilsMemcopy` cuelga/falla **sujetando la
+compuerta** → se congela el escritorio.
+
+**Instrumentación (`ce_present`, `nvidia.rs`)** para poder probarlo sin brickear
+el arranque:
+- Captura la narración del RM (`[eclipse-rm-trace] ce_blit*`, con el status de
+  `ceutilsMemcopy` y cualquier Xid/MMU-fault) y la **reproduce por klog** en el
+  fallo, en vez de un `false` mudo.
+- **Cronometra** la copia: distingue *lento* (cuello de botella de eficiencia,
+  aviso a >8 ms) de *roto*.
+- **Se auto-desactiva al primer fallo** (`CE_PRESENT_WEDGED`): una línea de
+  diagnóstico y cae al blit CPU el resto del arranque, en vez de repetir una
+  copia que cuelga cada frame. Esto es lo que hace **seguro** encender
+  `nvidia.cepresent` en hardware.
+- El gate del scanout dice **una vez** si el CE está activado pero no dispara
+  por pitch distinto (`fb.pitch != scanout pitch`), en vez de caer al CPU en
+  silencio.
+
+**Cómo probarlo**: arrancar con `nvidia.cepresent` (además de `GL=1`). El log
+dirá una de tres cosas:
+1. `CE-offload present ACTIVE (compute/P2P) ... in Nus` → **funciona**: escritorio
+   compuesto por el CE, CPU liberada (y probablemente arregla la coherencia).
+2. `CE-offload present FAILED (compute/P2P): ceutilsMemcopy status=0x.. ...` +
+   `CE rm: ...` → sabemos exactamente por qué (fault de GMMU en el MMIO peer,
+   P2P bloqueado por ACS, timeout), y cae al blit CPU sin congelar.
+3. `CE-offload present SLOW: Nus ...` → funciona pero la copia es el cuello de
+   botella (cuestión de eficiencia, no de corrección).
+
+Pendiente según el resultado: si es P2P/ACS, mirar la config de ACS/IOMMU o usar
+la ruta consola/FBMEM; si es coherencia en el blit CPU y el CE funciona, el CE
+es la solución; si el CE va pero lento, optimizar (copia por bandas en el CE,
+DIRTYFB).
+
+## HITO en la RTX: la submisión funciona; el bloqueo es un crash de NVK (userspace)
+
+`/proc/gpudbg` de la RTX lo dice **dos veces**, sin ambigüedad:
+
+```
+--- last client (ctx>=1) EXEC draw submit ---
+ctx=12 pid=1080 OK: 1 push(es) + fence landed, 1 syncobj(s) signaled
+...
+[nouveau-uapi] first CLIENT EXEC OK: ctx=6 pid=1064 -- this client's GPU work completes
+```
+
+La tubería completa — golden context, `CHANNEL_ALLOC`, `NVIF NEW` de las clases
+(CE `0xc5b5`, 2D `0x902d`, 3D `0xc597`, compute `0xc5c0`), `VM_BIND`, `EXEC`,
+valla, syncobj — **ejecuta de punta a punta**. El anillo no es el problema.
+
+### El bloqueo real: NVK derefa un puntero NULL, siempre en el mismo sitio
+
+Justo **después** del primer EXEC, y en **todos** los clientes GL (pids 1063,
+1064, 1075, 1080, 1101), NVK crashea en la misma dirección:
+
+```
+[crash] pid=1064 pc 0x10c50c48 in /usr/lib/libvulkan_nouveau.so + 0x9cc48
+unhandled page fault @ 0x8 (READ | USER): NOT_FOUND
+[crash] pid=1064 ... rsi=0x0 ...
+[crash] pid=1064 code@0x10c50c38 (pc-16): [.. 48 8b 72 08 .. 8b 46 08 ..]
+```
+
+Descodificando: `mov rsi,[rdx+8]` carga un puntero de un array que resulta
+**NULL**, y el `mov eax,[rsi+8]` siguiente falla leyendo `0x8`. Es un recorrido
+de una lista/array de punteros (`rdx` avanza de 8 en 8, comprobando un flag en
+`+8` de cada entrada) con una entrada NULL. El `sys_munmap` de 0x11000 bytes
+justo antes sugiere que es bookkeeping de NVK tras liberar algo.
+
+**`zink: failed to create timeline semaphore` (labwc.log) es el mismo evento
+visto desde zink**: NVK muere justo tras el primer EXEC, así que el compositor
+nunca termina de inicializar y el escritorio no levanta.
+
+### Qué se descarta
+
+- **Aliasing de canal**: `CHANNEL_ALLOC` devuelve `channel=12` tres veces y luego
+  `13` para el mismo pid, pero el asignador coge el id libre más bajo, así que
+  eso es alloc-tras-free (correcto), no ids duplicados.
+- **Regresión del submit** (`7522262`): sólo tocó el EXEC *vacío* (sonda de salud)
+  y el suelo del sync_file; no cambia lo que devuelve un EXEC real con éxito.
+
+Como **NVK de serie NO crashea aquí en Linux real**, nuestra uAPI parcial le
+devuelve algo tras la submisión que le deja un NULL en una lista que luego
+recorre. Es corregible desde el kernel una vez sepamos QUÉ ruta de NVK es.
+
+### Instrumentación para nombrar la ruta (crash handler)
+
+El manejador de fallos de `loader/src/linux.rs` ya resuelve `pc`/`fault-addr` a
+`módulo + offset` y vuelca registros y bytes. Ahora además **escanea la cima de
+la pila** e imprime los qwords que caen en un mapeo de módulo **ejecutable** y
+con nombre — casi todos direcciones de retorno reales — como
+`bt[i] ... in <módulo> + <off>`. Los frame pointers están omitidos en Mesa
+release, así que un paseo por `%rbp` no sirve; el escaneo de pila reconstruye la
+**cadena de llamadas** que entró en `libvulkan_nouveau.so + 0x9cc48`, que un solo
+PC no da. Acotado (24 hits / 0x800 bytes) para no inundar dmesg.
+
+**Siguiente arranque**: el `dmesg` traerá varias líneas `bt[..] in
+libvulkan_nouveau.so + 0x…` sobre el crash → identifican la función/ruta de NVK
+(¿creación de semáforo timeline? ¿teardown de device tras init parcial? ¿reaping
+post-submit?), y con eso el arreglo del lado del kernel deja de ser a ciegas.
+
+**Ruta rápida en paralelo** (símbolos offline sobre el binario del sistema):
+```sh
+addr2line -f -e /usr/lib/libvulkan_nouveau.so 0x9cc48
+nm -D --defined-only /usr/lib/libvulkan_nouveau.so | sort   # export más cercano por debajo de 0x9cc48
+```

@@ -41,6 +41,12 @@ static FLIP_SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// One-shot guard so the first scanout logs (every-frame logging would spam).
 static SCANOUT_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// One-shot latch for the "framebuffer has no backing" scanout warning.
+static SCANOUT_NULL_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+/// One-shot latch for the "CE present enabled but pitch mismatch" warning.
+static CE_PITCH_MISMATCH_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Master switch for the per-frame GPU copy-engine present (`ce_present`).
 /// OFF by default: the CE path fires a GPU DMA on EVERY desktop present
@@ -458,6 +464,30 @@ pub fn get_fb(fb_id: u32) -> Option<DrmFramebuffer> {
         .copied()
 }
 
+/// Resolve a GEM handle to its backing `(phys_addr, size)`, from EITHER
+/// buffer table — the one canonical place that knows both:
+///   * `state.handles` — generic DRM dumb buffers (`CREATE_DUMB`, the
+///     pixman/software path), and
+///   * `gem_mmap` — nouveau-uAPI `GEM_NEW` objects (high-range handles), what
+///     the GL/nouveau renderer scans out.
+///
+/// The present-path consumers of a buffer's physical backing go through here —
+/// `create_fb`/ADDFB2, `scanout` (via the fb it stamped), and the cursor
+/// upload. `get_vmo` (mmap) and `export_handle` (PRIME) do the same two-table
+/// lookup, but `export_handle` must keep the generic path's ORIGINAL `VmObject`
+/// alive (not a fresh `new_physical`), so it can't fold into a `(phys, size)`
+/// return — left as its own thing. Before this existed the lookup was
+/// copy-pasted at each site with subtly different guards, and several swallowed
+/// a miss silently (`?` / a bare `return false`) — so a buffer the present path
+/// could not read left no trace. One resolver, one set of guards, one place to
+/// log a miss. Must be called WITHOUT `DRM_STATE` held.
+pub fn resolve_gem_backing(handle_id: u32) -> Option<(u64, usize)> {
+    if let Some(h) = get_handle(handle_id) {
+        return Some((h.phys_addr, h.size));
+    }
+    zcore_drivers::scheme::gem_mmap::lookup(handle_id).map(|(pa, sz)| (pa, sz as usize))
+}
+
 /// Create a framebuffer from a GEM handle
 pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<u32> {
     // Resolve the backing buffer from EITHER source:
@@ -468,12 +498,18 @@ pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<
     // so ADDFB2 MUST accept those handles or the output swapchain test fails
     // ("create_fb returned None") before any atomic commit — the exact RTX
     // bring-up blocker seen as "Swapchain for output 'HDMI-A-1' failed test".
-    // Same fallback `get_vmo` (mmap) and `export_handle` (PRIME) already use.
-    let (phys_addr, buf_size) = match get_handle(handle_id) {
-        Some(h) => (h.phys_addr, h.size),
+    let (phys_addr, buf_size) = match resolve_gem_backing(handle_id) {
+        Some(v) => v,
         None => {
-            let (pa, sz) = zcore_drivers::scheme::gem_mmap::lookup(handle_id)?;
-            (pa, sz as usize)
+            // Loud, not a silent `?`: an unresolvable ADDFB2 handle is exactly
+            // "the swapchain buffer has no backing the present path can read",
+            // and it used to fail with no kernel-side line at all.
+            warn!(
+                "[drm] create_fb (ADDFB2): handle={:#x} not in dumb table nor nouveau GEM \
+                 -- cannot back a framebuffer (the output's present will fail)",
+                handle_id
+            );
+            return None;
         }
     };
 
@@ -635,6 +671,15 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
         }
     };
     if fb.phys_addr == 0 || fb.size == 0 {
+        // Once: a framebuffer that ADDFB2 registered with no backing (phys 0 /
+        // size 0) can never present. Silent before, so "nothing on screen"
+        // named nothing; now it points straight at the unresolved buffer.
+        if !SCANOUT_NULL_LOGGED.swap(true, Ordering::Relaxed) {
+            warn!(
+                "[drm] scanout: fb={} has no backing (phys={:#x} size={}) -- nothing to present",
+                fb_id, fb.phys_addr, fb.size
+            );
+        }
         return false;
     }
     // Log the first scanout so a console photo confirms pixels are flowing.
@@ -684,13 +729,26 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     // DMA per present destabilized the desktop on real hardware, so the
     // default present is the proven CPU blit.
     let mut blitted_by_ce = false;
-    if rect.is_none() && CE_PRESENT_ENABLED.load(Ordering::Relaxed) && fb.pitch == info.pitch {
-        let size = (info.pitch as u64) * (blit_h as u64);
-        for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-            if d.ce_present(fb.phys_addr, size) {
-                blitted_by_ce = true;
-                break;
+    if rect.is_none() && CE_PRESENT_ENABLED.load(Ordering::Relaxed) {
+        if fb.pitch == info.pitch {
+            let size = (info.pitch as u64) * (blit_h as u64);
+            for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+                if d.ce_present(fb.phys_addr, size) {
+                    blitted_by_ce = true;
+                    break;
+                }
             }
+        } else if !CE_PITCH_MISMATCH_LOGGED.swap(true, Ordering::Relaxed) {
+            // CE is ON but the flat sysmem->VRAM copy needs equal strides, and
+            // the client's fb pitch differs from the scanout pitch. Say so once
+            // -- otherwise "cepresent is set but the CPU is still doing the
+            // copy" is a silent mystery. (A per-row CE copy would lift this, but
+            // that is a wider change than the flat blit.)
+            warn!(
+                "[drm] CE-offload present enabled but NOT firing: fb pitch {} != scanout pitch {} \
+                 (flat CE copy needs equal strides) -- using CPU blit",
+                fb.pitch, info.pitch
+            );
         }
     }
     if !blitted_by_ce {
@@ -782,16 +840,16 @@ pub fn set_cursor_bo(handle_id: u32, w: u32, h: u32) -> bool {
     // `visible` dropped to false, and the pointer vanished / froze in place
     // (its MOVE ioctls still updated x/y, but nothing was ever drawn). Fall
     // back to the same nouveau lookup create_fb (ADDFB2) and the mmap path use.
-    let (phys_addr, size) = match state.handles.iter().find(|(g, _, _)| g.id == handle_id) {
-        Some((g, _, _)) => (g.phys_addr, g.size),
-        None => match zcore_drivers::scheme::gem_mmap::lookup(handle_id) {
-            Some((pa, sz)) => (pa, sz as usize),
-            None => {
-                state.cursor.visible = false;
-                return true;
-            }
-        },
+    // `resolve_gem_backing` takes DRM_STATE itself, so drop our guard first.
+    drop(state);
+    let (phys_addr, size) = match resolve_gem_backing(handle_id) {
+        Some(v) => v,
+        None => {
+            DRM_STATE.lock().cursor.visible = false;
+            return true;
+        }
     };
+    let mut state = DRM_STATE.lock();
     let px = (w as usize).saturating_mul(h as usize);
     if px == 0 || size < px * 4 || phys_addr == 0 {
         state.cursor.visible = false;

@@ -104,11 +104,19 @@ pub(super) fn class_object_insert(token: u64, rm_handle: u32, owner_pid: u64) {
     CLASS_OBJECTS.lock().push((token, rm_handle, owner_pid));
 }
 
-/// Removes and returns the RM handle for `token`, if it was RM-backed.
-pub(super) fn class_object_remove(token: u64) -> Option<u32> {
+/// Removes and returns the RM handle for `token`, if it was RM-backed —
+/// scoped to `owner_pid`. The token is a userspace cookie (mesa passes the
+/// object's heap POINTER), and two processes running the same Mesa code get
+/// deterministic-enough allocators that equal pointer values across processes
+/// are a real possibility. An unscoped removal would let one client's NVIF
+/// DEL free ANOTHER live client's (or the compositor's) engine-class object —
+/// tearing its 3D class out from under a running channel, whose next method
+/// of that class then MMU-faults. Match on (token, pid) so a DEL can only
+/// ever free the caller's own object.
+pub(super) fn class_object_remove(token: u64, owner_pid: u64) -> Option<u32> {
     let mut t = CLASS_OBJECTS.lock();
     t.iter()
-        .position(|(k, _, _)| *k == token)
+        .position(|(k, _, pid)| *k == token && *pid == owner_pid)
         .map(|i| t.remove(i).1)
 }
 
@@ -136,7 +144,8 @@ pub(super) fn class_objects_drain_pid(pid: u64) -> alloc::vec::Vec<(u64, u32)> {
 /// froze the desktop/cursor when a hung GL client kept retrying. Once latched,
 /// that context's submits fast-fail (no gate-holding poll) until the process
 /// exits and its context is rebuilt fresh. Context 0 (the compositor) is never
-/// latched. A lock-free bitmask: MAX_CTX (8) fits in the low bits.
+/// latched. A lock-free u32 bitmask: MAX_CTX (32) fits it exactly (bits 0..31),
+// which is why MAX_CTX must never exceed 32.
 static CTX_WEDGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 pub(super) fn ctx_is_wedged(ctx_idx: u32) -> bool {
@@ -855,15 +864,28 @@ const _: () = {
     assert!(sz::<NvifIoctlV0>() + sz::<NvifIoctlNewV0>() == 56);
 };
 
-/// Ceiling on live nouveau channels per GPU. Only one can ever be RM-backed
-/// (the `step16`+`step17` ladder builds a single GR channel); the rest are
-/// discovery channels, which exist purely so a second client can enumerate.
-pub(super) const MAX_CHANNELS: usize = 16;
+/// Ceiling on live nouveau channels per GPU. Bounds the channel Vec against a
+/// runaway; the number of REAL RM-backed contexts is separately capped by
+/// `MAX_CTX`, so the extra headroom here only ever holds cheap discovery/alias
+/// entries. Raised from 16 after a real-RTX boot: NVK creates throwaway
+/// enumeration contexts (a CHANNEL_ALLOC + 5 NVIF class NEWs each) and, when
+/// wlroots' native-Vulkan renderer retry-loops on its external-semaphore
+/// failure, a single process can allocate channels in a burst faster than it
+/// frees them. At 16 that burst hit the cap -> CHANNEL_ALLOC EBUSY (errno 16)
+/// -> NVK enumerate -3 -> "could not match drm and vulkan device", and the
+/// desktop wedged. The default renderer is GLES2/zink now (which does not
+/// churn), so this is belt-and-braces; 64 absorbs any enumeration burst.
+pub(super) const MAX_CHANNELS: usize = 64;
 
 /// Number of per-process GPU contexts (index 0 = the compositor's singleton;
 /// 1.. = one per GL client). MUST match `ECLIPSE_MAX_CTX` in
-/// `vendor/eclipse_rm_init.c`.
-pub(super) const MAX_CTX: u32 = 8;
+/// `vendor/eclipse_rm_init.c`. Raised from 8 after a real-RTX boot exhausted
+/// the slots: labwc's startup burst plus crash-loop respawn overlap filled all
+/// 8, dropping later clients to the software path where their VM_BIND collided
+/// at the shared top-of-heap VA (0x3fffff000, RM status 0x51). Contexts are
+/// lazy (one per live client pid, freed on process exit), so this is a cap.
+/// Must stay <= 32: the `CTX_WEDGED` latch is a u32 bitmask (ctx_idx < 32).
+pub(super) const MAX_CTX: u32 = 32;
 
 /// How many class slots mesa offers in an `SCLASS` call
 /// (`NOUVEAU_WS_CONTEXT_MAX_CLASSES`).

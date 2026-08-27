@@ -121,8 +121,8 @@ pub fn timeline_signal(handle: u32, point: u64) -> bool {
 }
 
 /// Snapshot of `handle`'s current fence, for
-/// `SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE`: the point it has reached
-/// right now. `None` for an unknown handle.
+/// `SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE`: the point whose arrival
+/// the exported fence stands for. `None` for an unknown handle.
 ///
 /// A real `sync_file` carries the `dma_fence` that was attached to the
 /// syncobj at export time, and becomes signaled when that fence does. Here
@@ -132,9 +132,22 @@ pub fn timeline_signal(handle: u32, point: u64) -> bool {
 /// fence exported after a submit is one whose work has already completed.
 /// The exported snapshot is therefore normally already satisfied, which is
 /// exactly what the importer needs to observe.
+///
+/// The floor at 1 is the UNSIGNALED case: a binary syncobj that has never
+/// been signaled (or was reset) sits at point 0, and a raw snapshot of 0
+/// would make every import "reached" instantly (`src >= 0` is always true)
+/// — the importer's wait would return before the producer ever signaled,
+/// which is a premature-signal bug (a compositor reusing a buffer the
+/// client still scans out, and the corruption points nowhere near sync).
+/// Point 1 is the fence such a syncobj will signal next, so exporting "S
+/// reaches 1" keeps the fd honest: pending until the source signals, and
+/// identical to the raw snapshot for any already-signaled source. (Linux
+/// instead refuses to export a fence-less syncobj with EINVAL; accepting it
+/// as the next-signal fence is the closer fit here, where "attached but
+/// unsignaled" and "no fence" are the same state.)
 pub fn export_snapshot(handle: u32) -> Option<u64> {
     let table = TABLE.lock();
-    effective_point(&table.objects, handle, LINK_DEPTH)
+    effective_point(&table.objects, handle, LINK_DEPTH).map(|p| p.max(1))
 }
 
 /// `SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE`: make `dst` carry the fence
