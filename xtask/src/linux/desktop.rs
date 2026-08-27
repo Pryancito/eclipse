@@ -52,6 +52,59 @@ pub fn install(rootfs: &Path) {
     write_xfce_defaults(rootfs);
     write_fallback_icons(rootfs);
     write_x11_prepare(rootfs);
+    write_xkbmap_wrapper(rootfs);
+}
+
+/// `/usr/local/bin/eclipse-xkbmap`: load the X keyboard map into Xwayland once
+/// the X server is up.
+///
+/// Wayland clients (foot) compile their keymap IN-PROCESS via libxkbcommon and
+/// type fine. Xwayland comes up on this stack WITHOUT a usable keymap loaded
+/// into the X server, so X11 clients (xterm) receive keycodes that map to no
+/// symbol and "type nothing" -- running `setxkbmap` by hand was confirmed to
+/// fix it. This loads the map once at session start; every X11 client then
+/// inherits it.
+///
+/// Launched as a supervised `oneshot` after the compositor (see the
+/// `xkbmap.service` in `install_eclipse_init`). Two things a naive
+/// `setxkbmap us` gets wrong here, both handled below: a supervised service does
+/// NOT inherit labwc's exported DISPLAY and labwc may land Xwayland on `:1`, so
+/// the real display is derived from the socket name rather than trusting
+/// `$DISPLAY`; and `after =` only orders the FORK of labwc, not Xwayland's
+/// readiness, so it waits for the `/tmp/.X11-unix/X*` socket itself.
+fn write_xkbmap_wrapper(rootfs: &Path) {
+    let localbin = rootfs.join("usr/local/bin");
+    let _ = fs::create_dir_all(&localbin);
+    let wrapper = localbin.join("eclipse-xkbmap");
+    fs::write(
+        &wrapper,
+        b"#!/bin/sh\n\
+          # Eclipse OS: apply the X keymap to Xwayland so X11 clients (xterm) can\n\
+          # type. Wayland clients get their keymap in-process; the X server does\n\
+          # not, and comes up without one on this stack. See eclipse-xkbmap doc.\n\
+          log=\"${HOME:-/root}/.eclipse-xkbmap.log\"\n\
+          layout=\"${ECLIPSE_XKB_LAYOUT:-us}\"\n\
+          i=0\n\
+          while [ \"$i\" -lt 60 ]; do\n\
+          \x20 for sock in /tmp/.X11-unix/X*; do\n\
+          \x20   [ -S \"$sock\" ] || continue\n\
+          \x20   n=${sock##*/X}\n\
+          \x20   case \"$n\" in ''|*[!0-9]*) continue ;; esac\n\
+          \x20   if DISPLAY=\":$n\" setxkbmap \"$layout\" 2>>\"$log\"; then\n\
+          \x20     echo \"[$(date '+%H:%M:%S')] setxkbmap $layout on :$n OK\" >>\"$log\"\n\
+          \x20     exit 0\n\
+          \x20   fi\n\
+          \x20 done\n\
+          \x20 i=$((i+1)); sleep 1\n\
+          done\n\
+          echo \"[$(date '+%H:%M:%S')] no Xwayland socket / setxkbmap failed after ${i}s\" >>\"$log\"\n\
+          exit 1\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }
 
 /// Eclipse's xfconf channel defaults, under `/etc/xdg` (the sysconfig layer

@@ -1956,6 +1956,23 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         )
         .unwrap();
 
+        // Load the X keymap into Xwayland once the compositor is up. Wayland
+        // clients compile their own keymap; the X server does not, so without
+        // this X11 clients (xterm) type nothing. `oneshot`: apply once and
+        // exit. The wrapper waits for the /tmp/.X11-unix/X* socket itself, so
+        // `after = labwc` (fork order) + the wayland `wait_socket` gate is
+        // enough. See desktop::write_xkbmap_wrapper.
+        fs::write(
+            svc_dir.join("xkbmap.service"),
+            b"# X keymap for Xwayland (X11 clients get none otherwise). See eclipse-xkbmap.\n\
+              exec = /usr/local/bin/eclipse-xkbmap\n\
+              type = oneshot\n\
+              after = labwc\n\
+              wait_socket = /run/user/0/wayland-0\n\
+              desktop = labwc\n",
+        )
+        .unwrap();
+
         // Xorg session (the framebuffer/fbdev X stack). Selected instead of
         // labwc when the boot picks `desktop=xorg` (e.g. `make qemu`). Runs the
         // eclipse-xorg wrapper, which starts X + the .xinitrc session on VT.
