@@ -80,10 +80,24 @@ const DEFAULT_PACKAGES: &[&str] = &[
     //   - mesa-vulkan-nouveau:  NVK, the Vulkan driver (+ its ICD manifest in
     //                           usr/share/vulkan/icd.d/, which LIVE_TREES must
     //                           also carry -- see there)
+    //   - mesa-vulkan-swrast:   lavapipe, the CPU Vulkan rasterizer (+ its
+    //                           lvp_icd.*.json ICD manifest). THE piece missing
+    //                           behind Xwayland dying on real hardware: when
+    //                           glamor cannot bring up hardware GL it falls back
+    //                           to Zink (GL-on-Vulkan), and Zink needs *a*
+    //                           Vulkan device. With only NVK present and NVK
+    //                           unusable (the "failed to create timeline
+    //                           semaphore" crash), the loader enumerates ZERO
+    //                           working devices, Zink fails, glamor fails, and
+    //                           Xwayland exits ("no GL providers"). lavapipe is
+    //                           a software Vulkan device that always works, so
+    //                           Zink/glamor have a floor to fall back to and the
+    //                           X session survives even when NVK is broken.
     //   - vulkan-tools:         `vulkaninfo`/`vkcube`, so NVK bring-up can be
     //                           checked from a shell without labwc in the way
     "vulkan-loader",
     "mesa-vulkan-nouveau",
+    "mesa-vulkan-swrast",
     "vulkan-tools",
     // OpenGL bring-up probes, the GL counterpart of vulkan-tools: check the
     // nouveau/Zink GL path from a shell before bringing up a compositor.
@@ -959,10 +973,12 @@ const LIVE_TREES: &[&str] = &[
     "lib64",
     "lib/x86_64-linux-gnu",
     "usr/lib", // libX11/xcb/pixman/drm/input/xkbcommon + usr/lib/xorg modules (minus dri) + libvulkan*/NVK
-    // Vulkan ICD manifests (usr/share/vulkan/icd.d/nouveau_icd.*.json). The
-    // loader (`libvulkan.so.1`, from usr/lib above) finds NVK ONLY through this
-    // JSON; without it in the live root, NVK is invisible on the ISO even though
-    // its .so is present -- and Zink (GL-on-Vulkan) then has no Vulkan to run on.
+    // Vulkan ICD manifests (usr/share/vulkan/icd.d/nouveau_icd.*.json for NVK,
+    // lvp_icd.*.json for lavapipe). The loader (`libvulkan.so.1`, from usr/lib
+    // above) finds each driver ONLY through its JSON; without it in the live
+    // root the driver is invisible on the ISO even though its .so is present --
+    // and Zink (GL-on-Vulkan) then has no Vulkan to run on. lavapipe's manifest
+    // is what gives Zink/glamor a software Vulkan floor when NVK is unusable.
     "usr/share/vulkan",
     "usr/libexec",     // Xorg.wrap on some layouts
     "usr/share/X11",   // xkb data, xorg.conf.d defaults, rgb.txt
