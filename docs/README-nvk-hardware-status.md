@@ -1367,6 +1367,42 @@ qué X (glxgears/Xwayland) y Wayland nativo (eglgears_wayland) mueren igual:
 ninguno depende de PRIME ni de sync_file para esto — **todo** submit-sync de
 NVK pega en el mismo número de WAIT roto.
 
+> ### ⚠️ CORRECCIÓN (sesión de hardware real, 2026-08) — la premisa de la ABI estaba INVERTIDA
+>
+> El diagnóstico de arriba acertó en el mecanismo (mismatch de número de ioctl
+> por tamaño de struct) pero se equivocó en la ABI: `deadline_nsec` **SÍ existe**
+> en la ABI real. La feature de *fence deadline* del kernel (2023) **añadió** un
+> `__u64 deadline_nsec` al final de AMBAS structs — verificado en el propio header
+> vendored de Mesa 26.1.6 (`include/drm-uapi/drm.h`):
+> `struct drm_syncobj_wait` mide **40 bytes** (no 32) y
+> `struct drm_syncobj_timeline_wait` **48** (no 40). No estaba "congelada desde 2017".
+>
+> Por eso el "fix" de abajo (quitar `deadline_nsec` → 32/40) resolvió QEMU —cuyo
+> libdrm viejo aún usa 32/40— pero **volvió a romper el hardware real**, que corre
+> el libdrm 2.4.134 de Alpine (structs 40/48). El mismo mismatch, invertido.
+>
+> **Cómo se vio en hardware:** la sonda `vk_drm_syncobj_get_type_from_provider`
+> de NVK crea un syncobj SEÑALADO y hace un `SYNCOBJ_WAIT` binario sobre él;
+> **solo si ese wait devuelve 0** añade `VK_SYNC_FEATURE_CPU_WAIT`. Con nuestro
+> arm clavado a 32 bytes, Mesa emitía `0xC028_64C3` (40) y el wait caía al brazo
+> `_ =>` (log a `debug!`, invisible bajo `LOG=error`) → nouveau lo rechaza → sin
+> CPU_WAIT. El PRIMER `VkSemaphore` de timeline recorría entonces
+> `supported_sync_types` buscando un tipo con `BINARY|CPU_WAIT` (0x11), no lo
+> encontraba y **deref del terminador NULL** = `libvulkan_nouveau.so+0x9cc48`.
+> La traza en hardware lo confirmó: `GET_CAP TIMELINE→1`, `SYNCOBJ_CREATE`
+> (handle=1 `flags=0x1` = SEÑALADO, la sonda), `EXEC OK`… y **ningún `SYNCOBJ_WAIT`**.
+>
+> **Fix definitivo (el que está en el código ahora):** el arm de WAIT acepta
+> AMBOS tamaños — se añaden `DRM_IOCTL_SYNCOBJ_WAIT_DEADLINE` (0xC028_64C3, 40 B)
+> y `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DEADLINE` (0xC030_64CA, 48 B) al `match`,
+> junto a los de 32/40. `deadline_nsec` va DESPUÉS de todos los campos que
+> leemos (`handles..first_signaled`), así que parsear el layout corto sigue
+> siendo correcto para cualquiera de los dos — solo ignoramos la pista opcional.
+> Sirve para QEMU (viejo) y hardware (nuevo) a la vez.
+>
+> El resto de la sección se conserva como registro histórico; los puntos 1-2
+> quedan superados por lo anterior.
+
 ### El fix (verificado en compilación)
 
 1. Se eliminan los dos `deadline_nsec` fantasma → los structs vuelven a 32 y 40
