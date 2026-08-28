@@ -3233,6 +3233,10 @@ impl DrmScheme for NvidiaGpu {
         // The last GL/Vulkan client draw-submit outcome, readable from the
         // terminal that launched the client (`cat /proc/gpudbg`) -- no dmesg.
         s.push_str(&super::nouveau_uapi::format_last_exec());
+        // Per-client GEM/VM_BIND memory summary: distinguishes a compressed PTE
+        // kind mapped uncompressed from plain tiled sysmem when a client renders
+        // structured garbage (e.g. vkcube) rather than crashing.
+        s.push_str(&super::nouveau_uapi::format_client_mem());
 
         s
     }
@@ -7309,6 +7313,14 @@ impl NvidiaGpu {
             );
             // fall through and map it uncompressed, exactly like 0x00/0x06
         }
+        // Feed the /proc/gpudbg memory summary before the sparse/map dispatch,
+        // so every op is counted (including the SPARSE ones refused just below).
+        super::nouveau_uapi::record_vm_bind(
+            op.op == nv::VM_BIND_OP_MAP,
+            op.flags & nv::VM_BIND_SPARSE != 0,
+            pte_kind,
+            pte_kind != PTE_KIND_PITCH && pte_kind != PTE_KIND_GENERIC,
+        );
         // pte_kind is 0x00 / 0x06, or a compressed kind we deliberately map
         // uncompressed (above): fall through and map it like pitch.
         // rm_init::vm_bind_map maps with the RM's default (pitch/generic) kind,
@@ -9977,6 +9989,15 @@ impl NvidiaGpu {
                     tile_mode: req.info.tile_mode,
                     tile_flags: req.info.tile_flags,
                 });
+                // Feed the /proc/gpudbg memory summary. `req.info.domain` is
+                // still the client's REQUEST here (overwritten to the domain
+                // actually used a few lines below); phys_addr.is_some() means a
+                // CPU-mmap-able BAR1 address resolved for it.
+                super::nouveau_uapi::record_gem_new(
+                    req.info.domain,
+                    phys_addr.is_some(),
+                    req.info.tile_flags,
+                );
                 req.info.handle = handle;
                 // Report the domain actually used, not the one requested:
                 // mesa reads this back to decide where the object lives.
