@@ -1056,6 +1056,40 @@ impl Syscall<'_> {
         // since this driver's EXEC only signals its `sig` syncobjs after the
         // GPU fence has landed — and as a recorded dependency otherwise).
         let sync_file = h.flags & SYNC_FILE != 0;
+        // Bounded, LOG=error-visible trace of the export/import ops NVK issues
+        // during physical-device / semaphore init. This is the LAST syncobj path
+        // NOT covered by `drm_scheme.rs`'s `trace_syncobj`: HANDLE_TO_FD /
+        // FD_TO_HANDLE are intercepted HERE (they need the process fd table),
+        // before the inode `io_control` those traces live in. An export->import
+        // round-trip is exactly how Mesa auto-detects a syncobj's EXTERNAL-handle
+        // features, the one detection step we could never see. If the "failed to
+        // create timeline semaphore" crash is PRECEDED by these lines, NVK probed
+        // external sync and its decision is downstream of what we return here; if
+        // it is NOT, NVK reached the crash on GET_CAP + CREATE alone, and the
+        // fault is purely in its own userspace `sync_types` construction (the
+        // kernel side is exhaustively verified correct). `opaque` =
+        // OPAQUE_FD whole-syncobj share; `sync_file` = single-fence transfer.
+        {
+            static SYNCOBJ_FD_TRACE_BUDGET: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let n = SYNCOBJ_FD_TRACE_BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < 32 {
+                kernel_hal::klog_info!(
+                    "[drm] SYNCOBJ_{} #{} pid={} handle={} fd={} flags={:#x} ({})",
+                    if request == SYNCOBJ_HANDLE_TO_FD {
+                        "HANDLE_TO_FD"
+                    } else {
+                        "FD_TO_HANDLE"
+                    },
+                    n + 1,
+                    self.zircon_process().id(),
+                    h.handle,
+                    h.fd,
+                    h.flags,
+                    if sync_file { "sync_file" } else { "opaque" },
+                );
+            }
+        }
         if request == SYNCOBJ_HANDLE_TO_FD && sync_file {
             let Some(point) = kernel_hal::drivers::scheme::syncobj::export_snapshot(h.handle)
             else {
