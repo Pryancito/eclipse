@@ -7258,7 +7258,7 @@ impl NvidiaGpu {
         // for these for sparse Vulkan resources, so a client that hits this is
         // using a feature this milestone does not have, not tripping over a
         // bookkeeping bug.
-        let pte_kind = op.flags & nv::VM_BIND_PTE_KIND_MASK;
+        let pte_kind = nv::vm_bind_pte_kind(op.flags);
         // On the Turing+ architectures this driver supports (Volta and later),
         // the GPU MMU addresses the uncompressed "generic" block-linear kind
         // (0x06, NV_MMU_VER2_PTE_KIND_GENERIC_MEMORY) IDENTICALLY to pitch
@@ -7280,38 +7280,25 @@ impl NvidiaGpu {
         // (Pre-Turing GPUs, which this driver does not claim to support, WOULD
         // need the MMU to do the tiling -- that is the case the old blanket
         // refusal was really guarding against.)
-        const PTE_KIND_PITCH: u32 = 0x00;
-        const PTE_KIND_GENERIC: u32 = 0x06;
-        if pte_kind != PTE_KIND_PITCH && pte_kind != PTE_KIND_GENERIC {
+        let supported_pte_kind = nv::pte_kind_is_supported(pte_kind);
+        if !supported_pte_kind {
             // A compressed (or otherwise non-generic) kind. On Turing+ the PTE
             // kind drives ONLY the L2's compression behaviour -- the
             // block-linear swizzle is done by the ENGINE (block-height
             // methods), not the page table (see the note above) -- and this
-            // driver has no comptag allocator, so we MAP IT AS
-            // GENERIC-UNCOMPRESSED (0x06). The GPU then reads and writes the
-            // surface uncompressed: correct bytes, just without the bandwidth
-            // saving compression would give.
-            //
-            // The old behaviour REFUSED it (EOPNOTSUPP), which left the surface
-            // UNMAPPED. Confirmed on real RTX (dmesg): NVK maps a render target
-            // with kind 0x01, the refusal left its VA unbound, and NVK's first
-            // draw that referenced it froze the channel
-            // (`exec_submit_signaled: ctx1 TIMEOUT ring GPGet=12 GPPut=13`, no
-            // MMU fault, no GR exception -- the PBDMA stalled on the missing
-            // surface). NVK gets ~11 submits deep before the draw that needs it.
-            // An uncompressed mapping is strictly better than a hang: worst
-            // case a surface that truly depended on compression renders wrong,
-            // but the channel keeps running and the frame completes.
+            // driver has no comptag allocator. Mapping it as 0x00/0x06 is NOT
+            // byte-exact: the GPU would interpret compressed bytes as plain
+            // sysmem and present structured garbage. Reject it loudly instead
+            // of silently building a mismatched mapping.
             crate::klog_warn!(
-                "[nouveau-uapi] VM_BIND: PTE kind {:#04x} mapped as generic-uncompressed \
-                 (no comptag support here -- correct bytes, compression stripped) \
+                "[nouveau-uapi] VM_BIND: unsupported compressed PTE kind {:#04x} \
+                 (no comptag support for sysmem-backed BOs; refusing mismatched mapping) \
                  handle={} VA={:#x} range={:#x}",
                 pte_kind,
                 op.handle,
                 op.addr,
                 op.range
             );
-            // fall through and map it uncompressed, exactly like 0x00/0x06
         }
         // Feed the /proc/gpudbg memory summary before the sparse/map dispatch,
         // so every op is counted (including the SPARSE ones refused just below).
@@ -7319,12 +7306,14 @@ impl NvidiaGpu {
             op.op == nv::VM_BIND_OP_MAP,
             op.flags & nv::VM_BIND_SPARSE != 0,
             pte_kind,
-            pte_kind != PTE_KIND_PITCH && pte_kind != PTE_KIND_GENERIC,
+            !supported_pte_kind,
         );
-        // pte_kind is 0x00 / 0x06, or a compressed kind we deliberately map
-        // uncompressed (above): fall through and map it like pitch.
-        // rm_init::vm_bind_map maps with the RM's default (pitch/generic) kind,
-        // which is correct for uncompressed memory on Turing+.
+        if !supported_pte_kind {
+            return Err(nv::EOPNOTSUPP);
+        }
+        // pte_kind is 0x00 / 0x06: rm_init::vm_bind_map maps with the RM's
+        // default (pitch/generic) kind, which is correct for uncompressed
+        // memory on Turing+.
         if op.flags & nv::VM_BIND_SPARSE != 0 {
             crate::klog_warn!(
                 "[nouveau-uapi] VM_BIND: SPARSE regions are not implemented (op={} addr={:#x} \
@@ -8642,8 +8631,8 @@ impl NvidiaGpu {
                     // REQUIRES -- with 0 here the Vulkan renderer refuses to
                     // start at all ("required device extension
                     // VK_EXT_image_drm_format_modifier not found"). A PTE kind
-                    // this driver cannot program is refused explicitly at
-                    // VM_BIND rather than mapped with the wrong layout.
+                    // this driver cannot program is rejected explicitly at
+                    // GEM_NEW/VM_BIND rather than mapped with the wrong layout.
                     nv::NOUVEAU_GETPARAM_HAS_VMA_TILEMODE => 1,
                     // No live usage counter in `NvidiaVramAllocator` yet --
                     // report 0 rather than guessing.
@@ -9877,6 +9866,19 @@ impl NvidiaGpu {
                 if !want_vram && !want_gart {
                     crate::klog_warn!(
                         "[nouveau-uapi] GEM_NEW: neither VRAM nor GART requested (domain={:#x})",
+                        req.info.domain
+                    );
+                    return Err(nv::EOPNOTSUPP);
+                }
+                let pte_kind = nv::gem_pte_kind(req.info.tile_flags);
+                if req.info.tile_flags != 0 && !nv::pte_kind_is_supported(pte_kind) {
+                    crate::klog_warn!(
+                        "[nouveau-uapi] GEM_NEW: unsupported compressed PTE kind {:#04x} \
+                         in tile_flags={:#x} for size={} domain={:#x} \
+                         (sysmem-backed BOs have no comptag support; refusing mismatched layout)",
+                        pte_kind,
+                        req.info.tile_flags,
+                        req.info.size,
                         req.info.domain
                     );
                     return Err(nv::EOPNOTSUPP);
