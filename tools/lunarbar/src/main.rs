@@ -3415,8 +3415,54 @@ fn install_crash_handler() {
     }
 }
 
+/// SIGKILL any OTHER running lunarbar before claiming the panel, so exactly one
+/// two-bar panel is ever on screen.
+///
+/// On this kernel a lunarbar can be left behind: a *contained* fault (the null
+/// fn-ptr `#PF` this binary has hit) kills the faulting thread but leaves the
+/// process alive with its `wlr-layer-shell` surfaces still mapped, while
+/// eclipse-init — seeing the service's pid go away — respawns a fresh one. The
+/// two panels then overlap, which is the "two lunarbars" seen on screen.
+/// eclipse-init starts `respawn` services one at a time, so the only other
+/// lunarbar in the table is that stale predecessor; killing it makes the
+/// compositor drop its surfaces and leaves this instance as the sole panel.
+///
+/// A no-op with nothing to kill. Best-effort throughout: a `/proc` that cannot
+/// be read, or a process that exits between the scan and the signal, just
+/// leaves us as we were.
+fn kill_stale_instances() {
+    let me = std::process::id();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let fname = entry.file_name();
+        let Some(pid) = fname.to_str().and_then(|s| s.parse::<i32>().ok()) else {
+            continue; // non-numeric /proc entry (self, meminfo, ...)
+        };
+        if pid as u32 == me {
+            continue;
+        }
+        // /proc/<pid>/comm is the process name (Linux caps it at 15 chars,
+        // which "lunarbar" fits under). A process that vanished mid-scan just
+        // fails the read and is skipped.
+        if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+            if comm.trim_end() == "lunarbar" {
+                // SAFETY: plain kill(2); pid came from /proc and is not us.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+}
+
 fn main() {
     install_crash_handler();
+    // Exactly one live panel: SIGKILL a stale predecessor before connecting to
+    // the compositor. Skipped for the offline LUNARBAR_DUMP render, which is a
+    // pure file render with no compositor client (and may run concurrently).
+    if std::env::var_os("LUNARBAR_DUMP").is_none() {
+        kill_stale_instances();
+    }
     // Minimum 26: the 15px font plus the h-10 pill height — anything shorter
     // draws glyphs taller than the pills that frame them.
     let height: u32 = std::env::var("LUNARBAR_HEIGHT")
