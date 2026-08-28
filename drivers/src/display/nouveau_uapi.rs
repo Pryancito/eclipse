@@ -213,6 +213,59 @@ pub(super) fn record_client_exec(line: alloc::string::String) {
     *LAST_CLIENT_EXEC.lock() = Some(line);
 }
 
+/// GR-engine hang probe snapshot captured at fence-wait timeout.
+///
+/// Populated once (first timeout) with a BAR0 register snapshot taken at the
+/// exact moment the 1 s fence-wait expired.  The snapshot covers the four
+/// mutually-exclusive failure modes:
+///
+/// * **MMU fault** — latched in `NV_PFB_PRI_MMU_FAULT_INFO1` (0xb83090);
+///   `valid=1` + `reason` identify the access that triggered it.
+/// * **GR engine stalled on a method** — `NV_PGRAPH_STATUS` (0x400700) non-zero
+///   and `NV_PGRAPH_TRAPPED_ADDR` (0x400704) shows the subchannel/method.
+/// * **PBDMA not drained** — `GP_GET != GP_PUT` means the PBDMA never fetched
+///   the client's push; the GPU never even saw the draw commands.
+/// * **FECS/GPCCS ctx-switch hang** — status registers at 0x409c00 / 0x41a000.
+///
+/// The snapshot is preserved until next boot so the terminal user can read it
+/// with `cat /proc/gpudbg` after the client has already exited.
+static LAST_GR_HANG_PROBE: Mutex<Option<alloc::string::String>> = Mutex::new(None);
+
+/// Record the GR-hang BAR0 snapshot (captured at fence-wait timeout). Only the
+/// first timeout per boot is stored; subsequent ones are suppressed because the
+/// ring stays wedged and every later submit repeats identically.
+pub(super) fn record_gr_hang_probe(snapshot: alloc::string::String) {
+    let mut slot = LAST_GR_HANG_PROBE.lock();
+    if slot.is_none() {
+        *slot = Some(snapshot);
+    }
+}
+
+/// `/proc/gpudbg` section: GR-engine hang probe snapshot, or a note that no
+/// fence-wait timeout has occurred this boot.
+fn format_gr_hang_probe() -> alloc::string::String {
+    use core::fmt::Write;
+    let mut s = alloc::string::String::new();
+    let _ = writeln!(
+        s,
+        "[gpudbg] --- GR-engine hang probe (captured at first fence-wait timeout) ---"
+    );
+    match &*LAST_GR_HANG_PROBE.lock() {
+        Some(snap) => {
+            for line in snap.lines() {
+                let _ = writeln!(s, "[gpudbg]  {}", line);
+            }
+        }
+        None => {
+            let _ = writeln!(
+                s,
+                "[gpudbg]  (none this boot -- no fence-wait timeout has occurred)"
+            );
+        }
+    }
+    s
+}
+
 /// `/proc/gpudbg` section: the last client EXEC outcome, or a note that none
 /// has run this boot (which itself is diagnostic -- it means no GL/Vulkan
 /// client ever reached a real draw submit).
@@ -231,6 +284,10 @@ pub(super) fn format_last_exec() -> alloc::string::String {
             );
         }
     }
+    // The GR-hang probe is the most actionable diagnostic when the draw never
+    // completes: it picks between MMU fault / stalled method / PBDMA not
+    // drained / FECS ctx-switch hang -- the four mutually-exclusive root causes.
+    s.push_str(&format_gr_hang_probe());
     // The last ioctl error is the one that actually became DEVICE_LOST when the
     // EXEC itself succeeded. THIS is the line that matters when the EXEC above
     // says OK but the client still died.
