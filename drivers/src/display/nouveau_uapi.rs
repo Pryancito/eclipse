@@ -337,11 +337,14 @@ pub(super) fn record_ioctl_err(pid: u64, request: u32, errno: i32) {
 // this driver's own shortcuts create, and survives the client's exit so the
 // terminal user runs the app, then `cat /proc/gpudbg` reads the verdict:
 //
-//  * Unsupported compressed PTE kind requested. Sysmem-backed BOs in this
-//    driver have no comptag/compression support, so only pitch (0x00) and
-//    generic-uncompressed (0x06) are byte-exact. Any other kind must be
-//    rejected before a mismatched mapping goes live. `vmbind_non_generic > 0`
-//    (and the kind list) flags that this path was hit.
+//  * Compressed PTE kind in play. Sysmem-backed BOs here have no
+//    comptag/compression support, so only pitch (0x00) and generic-uncompressed
+//    (0x06) are byte-exact. GEM_NEW rejects a compressed kind that arrives as an
+//    explicit `tile_flags` at allocation time; but a kind that reaches VM_BIND
+//    is MAPPED UNCOMPRESSED (refusing it there hangs the channel -- see
+//    `vm_bind_op`), which is byte-exact only if NVK did not actually compress.
+//    `vmbind_non_generic > 0` (and the kind list) flags that this path was hit
+//    and is the prime suspect when a surface renders as structured garbage.
 //  * Tiled surface over host sysmem. GEM_NEW backs EVERY object with sysmem
 //    (never true VRAM yet), so a block-linear surface lives in host RAM reached
 //    through the GMMU. `gem_tiled` shows how much tiled memory is in play.
@@ -394,8 +397,8 @@ pub(super) fn record_gem_new(req_domain: u32, cpu_mappable: bool, tile_flags: u3
 
 /// Record one `VM_BIND` op. `is_map` true for MAP (vs UNMAP), `sparse` from the
 /// SPARSE flag, `pte_kind` = `flags & 0xff`, `non_generic` true when the kind
-/// was neither pitch (0x00) nor generic (0x06) and so the op was rejected
-/// rather than mapped with a byte-inexact layout.
+/// was neither pitch (0x00) nor generic (0x06) and so was mapped uncompressed
+/// (refusing it at VM_BIND hangs the channel -- see `vm_bind_op`).
 pub(super) fn record_vm_bind(is_map: bool, sparse: bool, pte_kind: u32, non_generic: bool) {
     if is_map {
         VMBIND_MAP.fetch_add(1, Ordering::Relaxed);
@@ -446,14 +449,15 @@ pub(super) fn format_client_mem() -> alloc::string::String {
         VMBIND_SPARSE.load(Ordering::Relaxed),
         non_generic,
         if non_generic > 0 {
-            " <- unsupported compressed kind requested; rejected to avoid a mismatched mapping"
+            " <- compressed kind reached VM_BIND; mapped UNCOMPRESSED; prime suspect for tiled-surface garbage"
         } else {
             ""
         },
     );
     // Distinct PTE kinds seen. 0x00 (pitch) and 0x06 (generic) are byte-exact
-    // for this driver's sysmem-backed BOs; ANY other value requires comptags we
-    // do not program and is therefore refused.
+    // for this driver's sysmem-backed BOs; ANY other value needs comptags we do
+    // not program -- rejected at GEM_NEW when requested via tile_flags, else
+    // mapped uncompressed at VM_BIND (a hang-free but byte-inexact fallback).
     let mut kinds = alloc::string::String::new();
     for k in 0u32..256 {
         if KINDS_SEEN[(k >> 6) as usize].load(Ordering::Relaxed) & (1u64 << (k & 63)) != 0 {

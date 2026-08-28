@@ -7286,19 +7286,36 @@ impl NvidiaGpu {
             // kind drives ONLY the L2's compression behaviour -- the
             // block-linear swizzle is done by the ENGINE (block-height
             // methods), not the page table (see the note above) -- and this
-            // driver has no comptag allocator. Mapping it as 0x00/0x06 is NOT
-            // byte-exact: the GPU would interpret compressed bytes as plain
-            // sysmem and present structured garbage. Reject it loudly instead
-            // of silently building a mismatched mapping.
+            // driver has no comptag allocator, so we MAP IT AS
+            // GENERIC-UNCOMPRESSED (0x06). The GPU then reads and writes the
+            // surface uncompressed: correct bytes for an uncompressed surface,
+            // just without the bandwidth saving compression would give.
+            //
+            // We do NOT refuse it here, and that is load-bearing. The old
+            // behaviour REFUSED it (EOPNOTSUPP), which left the surface
+            // UNMAPPED. Confirmed on real RTX (dmesg): NVK maps a render target
+            // with kind 0x01, the refusal left its VA unbound, and NVK's first
+            // draw that referenced it froze the channel (`exec_submit_signaled:
+            // ctx1 TIMEOUT ring GPGet=12 GPPut=13`, no MMU fault, no GR
+            // exception -- the PBDMA stalled on the missing surface). NVK gets
+            // ~11 submits deep before the draw that needs it. An uncompressed
+            // mapping is strictly better than a hang: worst case a surface that
+            // truly depended on compression renders wrong, but the channel keeps
+            // running and the frame completes. GEM_NEW already rejects a
+            // compressed kind that arrives as an explicit `tile_flags` at
+            // allocation time (see NR_GEM_NEW), where NVK can still react; this
+            // fall-through covers a kind that reaches us only at VM_BIND, and it
+            // MUST NOT hang the channel. The real fix is comptag/PLC support.
             crate::klog_warn!(
-                "[nouveau-uapi] VM_BIND: unsupported compressed PTE kind {:#04x} \
-                 (no comptag support for sysmem-backed BOs; refusing mismatched mapping) \
-                 handle={} VA={:#x} range={:#x}",
+                "[nouveau-uapi] VM_BIND: PTE kind {:#04x} mapped as generic-uncompressed \
+                 (no comptag support here -- correct bytes for an uncompressed surface, \
+                 compression stripped) handle={} VA={:#x} range={:#x}",
                 pte_kind,
                 op.handle,
                 op.addr,
                 op.range
             );
+            // fall through and map it uncompressed, exactly like 0x00/0x06
         }
         // Feed the /proc/gpudbg memory summary before the sparse/map dispatch,
         // so every op is counted (including the SPARSE ones refused just below).
@@ -7308,12 +7325,10 @@ impl NvidiaGpu {
             pte_kind,
             !supported_pte_kind,
         );
-        if !supported_pte_kind {
-            return Err(nv::EOPNOTSUPP);
-        }
-        // pte_kind is 0x00 / 0x06: rm_init::vm_bind_map maps with the RM's
-        // default (pitch/generic) kind, which is correct for uncompressed
-        // memory on Turing+.
+        // pte_kind is 0x00 / 0x06, or a compressed kind we deliberately map
+        // uncompressed (above): fall through and map it like pitch.
+        // rm_init::vm_bind_map maps with the RM's default (pitch/generic) kind,
+        // which is correct for uncompressed memory on Turing+.
         if op.flags & nv::VM_BIND_SPARSE != 0 {
             crate::klog_warn!(
                 "[nouveau-uapi] VM_BIND: SPARSE regions are not implemented (op={} addr={:#x} \
@@ -8631,8 +8646,9 @@ impl NvidiaGpu {
                     // REQUIRES -- with 0 here the Vulkan renderer refuses to
                     // start at all ("required device extension
                     // VK_EXT_image_drm_format_modifier not found"). A PTE kind
-                    // this driver cannot program is rejected explicitly at
-                    // GEM_NEW/VM_BIND rather than mapped with the wrong layout.
+                    // this driver cannot program is rejected at GEM_NEW when
+                    // requested via tile_flags, else mapped uncompressed at
+                    // VM_BIND (refusing it there hangs the channel).
                     nv::NOUVEAU_GETPARAM_HAS_VMA_TILEMODE => 1,
                     // No live usage counter in `NvidiaVramAllocator` yet --
                     // report 0 rather than guessing.
