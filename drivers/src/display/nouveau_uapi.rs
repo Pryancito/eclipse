@@ -327,6 +327,146 @@ pub(super) fn record_ioctl_err(pid: u64, request: u32, errno: i32) {
     ));
 }
 
+// --- Per-client GEM / VM_BIND memory summary for `/proc/gpudbg` ---
+//
+// A native Vulkan client (vkcube) can now run on NVK without crashing -- the
+// submit completes and WSI presents -- yet its output is visually CORRUPTED
+// (block-structured garbage). That is NOT a sync failure; it is a memory-layout
+// one: the GPU reads/writes the surface with a swizzle or placement that
+// disagrees with what NVK built. This summary discriminates the two suspects
+// this driver's own shortcuts create, and survives the client's exit so the
+// terminal user runs the app, then `cat /proc/gpudbg` reads the verdict:
+//
+//  * Compressed PTE kind mapped uncompressed. `vm_bind_op` maps any
+//    non-{pitch(0x00),generic(0x06)} kind as uncompressed, because comptags are
+//    not programmable here. If NVK actually WROTE a compressed surface, reading
+//    it back uncompressed is garbage. `vmbind_non_generic > 0` (and the kind
+//    list) flags this.
+//  * Tiled surface over host sysmem. GEM_NEW backs EVERY object with sysmem
+//    (never true VRAM yet), so a block-linear surface lives in host RAM reached
+//    through the GMMU. `gem_tiled` shows how much tiled memory is in play.
+//
+// All state is bounded: a handful of atomics plus a 256-bit "kinds seen"
+// bitset, reset only at boot.
+static GEM_TOTAL: AtomicU32 = AtomicU32::new(0);
+static GEM_REQ_VRAM: AtomicU32 = AtomicU32::new(0);
+static GEM_REQ_GART: AtomicU32 = AtomicU32::new(0);
+static GEM_CPU_MAPPABLE: AtomicU32 = AtomicU32::new(0);
+static GEM_TILED: AtomicU32 = AtomicU32::new(0);
+static VMBIND_MAP: AtomicU32 = AtomicU32::new(0);
+static VMBIND_UNMAP: AtomicU32 = AtomicU32::new(0);
+static VMBIND_SPARSE: AtomicU32 = AtomicU32::new(0);
+static VMBIND_NON_GENERIC: AtomicU32 = AtomicU32::new(0);
+/// Bitset over PTE-kind values 0..=255, OR'd from GEM_NEW (`tile_flags >> 8`)
+/// and VM_BIND (`flags & 0xff`). Word `k >> 6`, bit `k & 63`.
+static KINDS_SEEN: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+fn note_kind_seen(kind: u32) {
+    let k = (kind & 0xff) as usize;
+    KINDS_SEEN[k >> 6].fetch_or(1u64 << (k & 63), Ordering::Relaxed);
+}
+
+/// Record one `GEM_NEW`. `req_domain` is the client's requested
+/// NOUVEAU_GEM_DOMAIN_* mask (before we override it to the domain actually
+/// used), `cpu_mappable` true when a BAR1 CPU address resolved, `tile_flags`
+/// the requested tiling (upper bits carry the PTE kind).
+pub(super) fn record_gem_new(req_domain: u32, cpu_mappable: bool, tile_flags: u32) {
+    GEM_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if req_domain & NOUVEAU_GEM_DOMAIN_VRAM != 0 {
+        GEM_REQ_VRAM.fetch_add(1, Ordering::Relaxed);
+    }
+    if req_domain & NOUVEAU_GEM_DOMAIN_GART != 0 {
+        GEM_REQ_GART.fetch_add(1, Ordering::Relaxed);
+    }
+    if cpu_mappable {
+        GEM_CPU_MAPPABLE.fetch_add(1, Ordering::Relaxed);
+    }
+    if tile_flags != 0 {
+        GEM_TILED.fetch_add(1, Ordering::Relaxed);
+        note_kind_seen(tile_flags >> 8);
+    }
+}
+
+/// Record one `VM_BIND` op. `is_map` true for MAP (vs UNMAP), `sparse` from the
+/// SPARSE flag, `pte_kind` = `flags & 0xff`, `non_generic` true when the kind
+/// was neither pitch (0x00) nor generic (0x06) and so was force-mapped
+/// uncompressed.
+pub(super) fn record_vm_bind(is_map: bool, sparse: bool, pte_kind: u32, non_generic: bool) {
+    if is_map {
+        VMBIND_MAP.fetch_add(1, Ordering::Relaxed);
+    } else {
+        VMBIND_UNMAP.fetch_add(1, Ordering::Relaxed);
+    }
+    if sparse {
+        VMBIND_SPARSE.fetch_add(1, Ordering::Relaxed);
+    }
+    if non_generic {
+        VMBIND_NON_GENERIC.fetch_add(1, Ordering::Relaxed);
+    }
+    note_kind_seen(pte_kind);
+}
+
+/// `/proc/gpudbg` section: per-client GEM / VM_BIND memory summary. See the
+/// counters' module comment for how to read it.
+pub(super) fn format_client_mem() -> alloc::string::String {
+    use core::fmt::Write;
+    let mut s = alloc::string::String::new();
+    let _ = writeln!(
+        s,
+        "[gpudbg] --- client GEM / VM_BIND memory summary (this boot) ---"
+    );
+    let gem_total = GEM_TOTAL.load(Ordering::Relaxed);
+    if gem_total == 0 {
+        let _ = writeln!(
+            s,
+            "[gpudbg]  (none this boot -- no GL/Vulkan client has allocated GEM memory yet)"
+        );
+        return s;
+    }
+    let _ = writeln!(
+        s,
+        "[gpudbg]  GEM_NEW: total={} req_vram={} req_gart={} cpu_mappable={} tiled={} (all backed by host sysmem)",
+        gem_total,
+        GEM_REQ_VRAM.load(Ordering::Relaxed),
+        GEM_REQ_GART.load(Ordering::Relaxed),
+        GEM_CPU_MAPPABLE.load(Ordering::Relaxed),
+        GEM_TILED.load(Ordering::Relaxed),
+    );
+    let non_generic = VMBIND_NON_GENERIC.load(Ordering::Relaxed);
+    let _ = writeln!(
+        s,
+        "[gpudbg]  VM_BIND: map={} unmap={} sparse={} non_generic_kind={}{}",
+        VMBIND_MAP.load(Ordering::Relaxed),
+        VMBIND_UNMAP.load(Ordering::Relaxed),
+        VMBIND_SPARSE.load(Ordering::Relaxed),
+        non_generic,
+        if non_generic > 0 {
+            " <- mapped UNCOMPRESSED; prime suspect for tiled-surface garbage"
+        } else {
+            ""
+        },
+    );
+    // Distinct PTE kinds seen. 0x00 (pitch) and 0x06 (generic) are byte-exact
+    // under our uncompressed mapping; ANY other value was force-mapped
+    // uncompressed and is the first thing to suspect for structured garbage.
+    let mut kinds = alloc::string::String::new();
+    for k in 0u32..256 {
+        if KINDS_SEEN[(k >> 6) as usize].load(Ordering::Relaxed) & (1u64 << (k & 63)) != 0 {
+            let _ = write!(kinds, " {:#04x}", k);
+        }
+    }
+    if kinds.is_empty() {
+        kinds.push_str(" (none -- all allocations linear)");
+    }
+    let _ = writeln!(s, "[gpudbg]  PTE kinds seen:{}", kinds);
+    s
+}
+
 // --- Linux errno values used below (matches linux-object's translation) ---
 pub(super) const ENOENT: i32 = 2;
 pub(super) const EIO: i32 = 5;
