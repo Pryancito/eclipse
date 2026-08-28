@@ -1706,3 +1706,54 @@ post-submit?), y con eso el arreglo del lado del kernel deja de ser a ciegas.
 addr2line -f -e /usr/lib/libvulkan_nouveau.so 0x9cc48
 nm -D --defined-only /usr/lib/libvulkan_nouveau.so | sort   # export más cercano por debajo de 0x9cc48
 ```
+
+## Sonda de cuelgue del motor GR (bloqueador #981)
+
+La primera vez que un cliente GL llega a `vkQueueSubmit` y su dibujo 3D real
+no completa, el kernel detecta el timeout de la valla (1 s) y captura un
+**snapshot de registros BAR0** en el mismo instante en que el poll expira.  Ese
+snapshot distingue los cuatro modos de fallo mutuamente excluyentes:
+
+| Indicador en `/proc/gpudbg` | Causa raíz | Próximo paso |
+|---|---|---|
+| `MMU FAULT_INFO1 valid=1` | GPU accedió a una VA sin mapear | revisar `VM_BIND`; la VA del buffer de draw no está en la GMMU |
+| `GR_STATUS != 0` y `TRAPPED_ADDR.method != 0` | Motor GR atascado en un método | golden context / GR init incompleto (subchan/method identifica el comando) |
+| `PBDMA0 drained=false` (GP_GET != GP_PUT) | PBDMA no llegó a cargar el push | runlist o canal no armado |
+| `FECS CTXSW_STATUS != 0` o `GPCCS GPC0_STATUS != 0` | Cuelgue del ctx-switch | imagen de contexto incompleta |
+| todos los anteriores en cero | GR terminó pero la escritura de la valla no llegó a la CPU | WFI / coherencia de caché (caso de `GR-IDLE-NOFENCE`) |
+
+### Cómo leer el probe
+
+Tras el primer timeout, `cat /proc/gpudbg` muestra:
+
+```
+[gpudbg] --- GR-engine hang probe (captured at first fence-wait timeout) ---
+[gpudbg]  ctx=2 pid=1059 fence TIMEOUT after 1000ms
+[gpudbg]  HINT: <raíz probable>
+[gpudbg]  GR_STATUS(0x400700)=0x...   (0=idle)
+[gpudbg]  TRAPPED_ADDR(0x400704)=0x... subchan=N method=0x...
+[gpudbg]  TRAPPED_DATA lo=0x... hi=0x...
+[gpudbg]  PBDMA0 GP_PUT(0x40000)=0x... GP_GET(0x40014)=0x... drained=true/false
+[gpudbg]  MMU FAULT_INFO1(0xb83090)=0x... valid=0/1 reason=0x..
+[gpudbg]    FAULT_ADDR=0x...
+[gpudbg]  FECS CTXSW_STATUS(0x409c00)=0x... HOST_INT(0x409c14)=0x...
+[gpudbg]  GPCCS GPC0_STATUS(0x41a000)=0x...
+```
+
+El campo `HINT:` da la diagnosis más probable directamente. Pega la sección
+completa en el issue #981 para que el maintainer aplique la corrección concreta.
+
+### Registros involucrados (Turing TU102, BAR0)
+
+| Offset | Nombre | Qué indica |
+|---|---|---|
+| `0x400700` | `NV_PGRAPH_STATUS` | `0` = motor GR libre; cualquier bit = activo/atascado |
+| `0x400704` | `NV_PGRAPH_TRAPPED_ADDR` | bits [20:16] = subcana; bits [12:0] = método |
+| `0x400708/c` | `NV_PGRAPH_TRAPPED_DATA` | dato del método atascado |
+| `0x40000` | `NV_PFIFO_PBDMA0_GP_PUT` | escrituras del host al anillo GPFIFO |
+| `0x40014` | `NV_PFIFO_PBDMA0_GP_GET` | lecturas del PBDMA del anillo GPFIFO |
+| `0xb83090` | `NV_PFB_PRI_MMU_FAULT_INFO1` | fallo MMU: bit 31=válido, [4:0]=razón |
+| `0xb83080/84/88` | `NV_PFB_PRI_MMU_FAULT_ADDR/INFO0` | dirección y engine del fallo |
+| `0x409c00` | `FECS_CTXSW_STATUS_FE_0` | estado de la máquina FECS ctx-switch |
+| `0x409c14` | `FECS_HOST_INT_STATUS` | flags de interrupción FECS |
+| `0x41a000` | `GPC0_GPCCS_CTXSW_STATUS` | estado GPCCS (ctx-switch del GPC0) |

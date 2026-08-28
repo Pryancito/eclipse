@@ -9500,6 +9500,108 @@ impl NvidiaGpu {
                         // 0 = landed (NV_OK), 0x65 = timeout -- the same codes the
                         // C inline poll used, so the match arms below are unchanged.
                         r.fence_wait_status = if landed { 0 } else { 0x65 };
+
+                        // GR-engine hang probe: at the exact moment the 1 s poll
+                        // expired, snapshot the BAR0 registers that distinguish
+                        // the four mutually-exclusive failure modes:
+                        //   (a) MMU fault  — latched in 0xb83090 (valid=1)
+                        //   (b) GR method stall — 0x400700 non-zero + 0x400704
+                        //   (c) PBDMA never fetched the push — GP_GET != GP_PUT
+                        //   (d) FECS/GPCCS ctx-switch hang — 0x409c00 / 0x41a000
+                        //
+                        // No RM calls: two prior attempts to involve the RM on
+                        // this path crashed the machine. Pure BAR0 reads only.
+                        // Stored in LAST_GR_HANG_PROBE for /proc/gpudbg; first
+                        // timeout per boot wins (the ring stays wedged after).
+                        if !landed {
+                            let bar0 = self._bar0;
+                            let rd = |off: usize| unsafe {
+                                core::ptr::read_volatile((bar0 + off) as *const u32)
+                            };
+
+                            // NV_PGRAPH_STATUS: overall GR busy/idle.
+                            // 0 = idle; any bit set = a sub-engine is active/stalled.
+                            let gr_status = rd(0x0040_0700);
+                            // NV_PGRAPH_TRAPPED_ADDR: the method that stalled GR.
+                            //   bits [20:16] = subchannel, bits [12:0] = method
+                            let gr_trap_addr = rd(0x0040_0704);
+                            let gr_trap_lo = rd(0x0040_0708);
+                            let gr_trap_hi = rd(0x0040_070c);
+
+                            // PBDMA0 ring pointers (GR runlist is usually PBDMA0).
+                            // GP_GET == GP_PUT means the PBDMA finished fetching;
+                            // GP_GET < GP_PUT means it never fetched the push at all.
+                            let pb0_put = rd(0x0004_0000);
+                            let pb0_get = rd(0x0004_0014);
+
+                            // HUB MMU fault latch (non-replayable, TU102 0xb83080..90).
+                            // valid = bit 31 of INFO1; reason = bits [4:0].
+                            let f_info1 = rd(0x00b8_3090);
+                            let f_addr_lo = rd(0x00b8_3080);
+                            let f_addr_hi = rd(0x00b8_3084);
+                            let f_info0 = rd(0x00b8_3088);
+
+                            // NV_PGRAPH_PRI_FECS_CTXSW_STATUS_FE_0: FECS state machine.
+                            // Non-zero when FECS is mid ctx-switch (save/restore).
+                            let fecs_status = rd(0x0040_9c00);
+                            // NV_PGRAPH_PRI_FECS_HOST_INT_STATUS: FECS interrupt flags.
+                            let fecs_intr = rd(0x0040_9c14);
+
+                            // NV_PGRAPH_PRI_GPC0_GPCCS_CTXSW_STATUS_GPC_0: GPCCS state.
+                            let gpccs_status = rd(0x0041_a000);
+
+                            let drained = pb0_get == pb0_put;
+                            let mmu_valid = (f_info1 >> 31) & 1;
+                            let mmu_reason = f_info1 & 0x1f;
+                            let gr_subchan = (gr_trap_addr >> 16) & 0x1f;
+                            let gr_method = gr_trap_addr & 0x1fff;
+
+                            // Diagnosis hint: one word that names the most likely
+                            // root cause, to guide which fix the maintainer applies.
+                            let hint = if mmu_valid != 0 {
+                                "MMU-FAULT: GPU touched an unmapped VA -- check VM_BIND mappings"
+                            } else if gr_status != 0 && gr_method != 0 {
+                                "GR-STALL: GR engine stuck on a method -- golden-ctx/GR-init incomplete?"
+                            } else if !drained {
+                                "PBDMA-STALL: PBDMA never fetched the push -- runlist/channel not armed?"
+                            } else if fecs_status != 0 || gpccs_status != 0 {
+                                "FECS/GPCCS: ctx-switch hang -- context-image incomplete?"
+                            } else {
+                                "GR-IDLE-NOFENCE: GR finished but fence-semaphore write never arrived -- WFI/coherency?"
+                            };
+
+                            nv::record_gr_hang_probe(alloc::format!(
+                                "ctx={ctx} pid={pid} fence TIMEOUT after {ms}ms\n\
+                                 HINT: {hint}\n\
+                                 GR_STATUS(0x400700)={gr_status:#010x} (0=idle)\n\
+                                 TRAPPED_ADDR(0x400704)={gr_trap_addr:#010x} subchan={gr_subchan} method={gr_method:#06x}\n\
+                                 TRAPPED_DATA lo={gr_trap_lo:#010x} hi={gr_trap_hi:#010x}\n\
+                                 PBDMA0 GP_PUT(0x40000)={pb0_put:#010x} GP_GET(0x40014)={pb0_get:#010x} drained={drained}\n\
+                                 MMU FAULT_INFO1(0xb83090)={f_info1:#010x} valid={mmu_valid} reason={mmu_reason:#04x}\n\
+                                   FAULT_ADDR={f_addr_hi:#010x}_{f_addr_lo:#010x} engine_id={engine_id:#04x}\n\
+                                 FECS CTXSW_STATUS(0x409c00)={fecs_status:#010x} HOST_INT(0x409c14)={fecs_intr:#010x}\n\
+                                 GPCCS GPC0_STATUS(0x41a000)={gpccs_status:#010x}",
+                                ctx = ctx_idx,
+                                pid = owner_pid,
+                                ms = TIMEOUT_MS,
+                                hint = hint,
+                                gr_status = gr_status,
+                                gr_trap_addr = gr_trap_addr,
+                                gr_subchan = gr_subchan,
+                                gr_method = gr_method,
+                                gr_trap_lo = gr_trap_lo,
+                                gr_trap_hi = gr_trap_hi,
+                                pb0_put = pb0_put,
+                                pb0_get = pb0_get,
+                                drained = drained,
+                                f_info1 = f_info1,
+                                mmu_valid = mmu_valid,
+                                mmu_reason = mmu_reason,
+                                f_addr_hi = f_addr_hi,
+                                f_addr_lo = f_addr_lo,
+                                engine_id = f_info0 & 0xff,
+                            ));
+                        }
                     }
                 }
                 let replay_rm = |narration: Option<alloc::string::String>| {
