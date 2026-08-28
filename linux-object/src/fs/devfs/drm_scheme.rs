@@ -437,6 +437,29 @@ fn render_allowed(cmd: u32) -> bool {
     )
 }
 
+/// Bounded, level-filter-free trace of the syncobj ops NVK issues while it
+/// FUNCTIONALLY probes the timeline feature at device init (Mesa's
+/// `vk_drm_syncobj_get_type` auto-detects features rather than trusting the
+/// cap: create → signal/timeline-signal → query/transfer/wait → destroy). If
+/// it decides timeline is unsupported it masks the feature off, NVK's
+/// `sync_types` loses the timeline entry, and the FIRST timeline VkSemaphore
+/// (zink's batch fence, wlroots' render timeline) walks off that array — the
+/// `libvulkan_nouveau.so+0x9cc48` NULL deref. This names the exact op, args and
+/// result that made NVK decide, which no error log catches (every op succeeds).
+fn trace_syncobj(op: &str, pid: u64, handle: u32, point: u64, result: &str) {
+    static BUDGET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 48 {
+        kernel_hal::klog_info!(
+            "[syncobj] {} pid={} handle={:#x} point={} -> {}",
+            op,
+            pid,
+            handle,
+            point,
+            result
+        );
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct DrmVersion {
@@ -2499,6 +2522,14 @@ impl INode for DrmDev {
                         return Err(FsError::EntryNotFound);
                     }
                 }
+                let h0 = unsafe { *(req.handles as *const u32) };
+                trace_syncobj(
+                    if cmd == DRM_IOCTL_SYNCOBJ_RESET { "RESET" } else { "SIGNAL" },
+                    drm::current_pid(),
+                    h0,
+                    0,
+                    "ok",
+                );
                 Ok(0)
             }
 
@@ -2522,6 +2553,9 @@ impl INode for DrmDev {
                         return Err(FsError::EntryNotFound);
                     }
                 }
+                let (h0, p0) =
+                    unsafe { (*(req.handles as *const u32), *(req.points as *const u64)) };
+                trace_syncobj("TIMELINE_SIGNAL", drm::current_pid(), h0, p0, "ok");
                 Ok(0)
             }
 
@@ -2530,12 +2564,20 @@ impl INode for DrmDev {
                     return Err(FsError::OpNotSupported);
                 }
                 let req = unsafe { &*(data as *const DrmSyncobjTransfer) };
-                if zcore_drivers::scheme::syncobj::transfer(
+                let ok = zcore_drivers::scheme::syncobj::transfer(
                     req.dst_handle,
                     req.dst_point,
                     req.src_handle,
                     req.src_point,
-                ) {
+                );
+                trace_syncobj(
+                    "TRANSFER",
+                    drm::current_pid(),
+                    req.dst_handle,
+                    req.dst_point,
+                    if ok { "ok" } else { "ENOENT" },
+                );
+                if ok {
                     Ok(0)
                 } else {
                     Err(FsError::EntryNotFound)
@@ -2559,13 +2601,19 @@ impl INode for DrmDev {
                 // this model has no separate submitted-vs-signaled state
                 // (everything is signaled synchronously), so "current point"
                 // answers both.
+                let mut first_pt = 0u64;
                 for i in 0..req.count_handles as usize {
                     let handle = unsafe { *(req.handles as *const u32).add(i) };
                     let Some(point) = zcore_drivers::scheme::syncobj::query(handle) else {
                         return Err(FsError::EntryNotFound);
                     };
+                    if i == 0 {
+                        first_pt = point;
+                    }
                     unsafe { *(req.points as *mut u64).add(i) = point };
                 }
+                let h0 = unsafe { *(req.handles as *const u32) };
+                trace_syncobj("QUERY", drm::current_pid(), h0, first_pt, "ok");
                 Ok(0)
             }
 
@@ -2619,6 +2667,13 @@ impl INode for DrmDev {
                 // an effectively unbounded wait.
                 let deadline_us = (timeout_nsec.max(0) as u64) / 1000;
                 let wait_all = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL != 0;
+                trace_syncobj(
+                    if timeline { "TIMELINE_WAIT" } else { "WAIT" },
+                    drm::current_pid(),
+                    handles.first().copied().unwrap_or(0),
+                    points.as_ref().and_then(|p| p.first().copied()).unwrap_or(0),
+                    &alloc::format!("timeout_ns={} flags={:#x}", timeout_nsec, flags),
+                );
                 match zcore_drivers::scheme::syncobj::wait(
                     &handles,
                     points.as_deref(),
