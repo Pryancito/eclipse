@@ -1532,6 +1532,45 @@ fn run_bench(n: u32) {
     );
 }
 
+/// SIGKILL any OTHER running lunarbg before claiming the wallpaper, so exactly
+/// one wallpaper client is ever connected.
+///
+/// Same failure mode as lunarbar: a *contained* fault on this kernel kills the
+/// faulting thread but can leave the process alive with its surface still
+/// mapped, while eclipse-init — seeing the service's pid go away — respawns a
+/// fresh one, so two lunarbg processes end up layered on the same output.
+/// eclipse-init starts `respawn` services one at a time, so the only other
+/// lunarbg is ever that stale predecessor; killing it makes the compositor drop
+/// its surface and leaves this instance as the sole wallpaper.
+///
+/// A no-op with nothing to kill, and best-effort throughout (an unreadable
+/// `/proc`, or a process that exits between the scan and the signal, just
+/// leaves us as we were).
+fn kill_stale_instances() {
+    let me = std::process::id();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let fname = entry.file_name();
+        let Some(pid) = fname.to_str().and_then(|s| s.parse::<i32>().ok()) else {
+            continue; // non-numeric /proc entry (self, meminfo, ...)
+        };
+        if pid as u32 == me {
+            continue;
+        }
+        // /proc/<pid>/comm is the process name (Linux caps it at 15 chars,
+        // which "lunarbg" fits under). A process that vanished mid-scan just
+        // fails the read and is skipped.
+        if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+            if comm.trim_end() == "lunarbg" {
+                // SAFETY: plain kill(2); pid came from /proc and is not us.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+}
+
 fn main() {
     install_crash_handler();
     let cli = parse_args();
@@ -1560,6 +1599,11 @@ fn main() {
         run_dump(&spec, t_ms, cli.aspect);
         return;
     }
+
+    // Exactly one live wallpaper: SIGKILL a stale predecessor before connecting.
+    // Placed after the offline dump/bench early-returns above, so those (pure
+    // renders, no compositor client, possibly run concurrently) never kill.
+    kill_stale_instances();
 
     ckpt!("connecting to compositor");
     let conn = match connect_wayland() {
