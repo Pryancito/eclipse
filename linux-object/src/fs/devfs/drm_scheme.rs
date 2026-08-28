@@ -238,6 +238,23 @@ const DRM_IOCTL_SYNCOBJ_TRANSFER: u32 =
     drm_iowr_core(0xCC, core::mem::size_of::<DrmSyncobjTransfer>());
 const DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL: u32 =
     drm_iowr_core(0xCD, core::mem::size_of::<DrmSyncobjTimelineArray>());
+// The 2023 kernel fence-deadline feature APPENDED a `__u64 deadline_nsec` to
+// BOTH wait structs (drm_syncobj_wait 32->40, drm_syncobj_timeline_wait 40->48),
+// used only when DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE is set. Because the ioctl
+// NUMBER encodes the struct size, a newer libdrm (Alpine's 2.4.134, what Mesa
+// 26.1.6 links) sends 0xC028_64C3 / 0xC030_64CA, while an older one (QEMU's)
+// sends 0xC020_64C3 / 0xC028_64CA. We must accept BOTH sizes: the deadline field
+// sits AFTER every field the wait arm reads (handles..first_signaled), so
+// parsing the shorter, pre-deadline layout is correct for either -- we just
+// never read the optional hint. Pinning to only the 32/40 sizes is exactly what
+// silently dropped NVK's `vk_drm_syncobj_get_type` CPU_WAIT probe on real
+// hardware (its wait fell through to the driver, so Mesa never set
+// VK_SYNC_FEATURE_CPU_WAIT and the first timeline VkSemaphore walked off
+// `supported_sync_types` -- the libvulkan_nouveau.so+0x9cc48 NULL deref).
+const DRM_IOCTL_SYNCOBJ_WAIT_DEADLINE: u32 =
+    drm_iowr_core(0xC3, core::mem::size_of::<DrmSyncobjWait>() + 8);
+const DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DEADLINE: u32 =
+    drm_iowr_core(0xCA, core::mem::size_of::<DrmSyncobjTimelineWait>() + 8);
 // 0xCF (EVENTFD): needs the eventfd from the process fd table, so -- like
 // HANDLE_TO_FD/FD_TO_HANDLE above -- it is intercepted in `linux-syscall`'s
 // `sys_ioctl` before reaching this match (see `sys_drm_syncobj_eventfd`).
@@ -2617,11 +2634,15 @@ impl INode for DrmDev {
                 Ok(0)
             }
 
-            DRM_IOCTL_SYNCOBJ_WAIT | DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT => {
+            DRM_IOCTL_SYNCOBJ_WAIT
+            | DRM_IOCTL_SYNCOBJ_WAIT_DEADLINE
+            | DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT
+            | DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DEADLINE => {
                 if !zcore_drivers::display::nouveau_uapi_enabled() {
                     return Err(FsError::OpNotSupported);
                 }
-                let timeline = cmd == DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT;
+                let timeline = cmd == DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT
+                    || cmd == DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DEADLINE;
                 // Both structs share this prefix layout, so a single path
                 // can read the common fields regardless of which ioctl.
                 let (handles_ptr, points_ptr, timeout_nsec, count_handles, flags) = if timeline {
