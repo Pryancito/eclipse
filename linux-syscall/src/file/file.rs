@@ -1003,15 +1003,30 @@ impl Syscall<'_> {
     fn sys_drm_syncobj_fd(&self, request: usize, arg1: usize) -> Result<Option<usize>, LxError> {
         use linux_object::fs::SyncobjHandle;
 
-        const SYNCOBJ_HANDLE_TO_FD: usize = 0xC010_64C1; // DRM_IOWR(0xc1, drm_syncobj_handle)
-        const SYNCOBJ_FD_TO_HANDLE: usize = 0xC010_64C2; // DRM_IOWR(0xc2, drm_syncobj_handle)
-                                                         // Bit 0 on BOTH ioctls: `..._HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE` and
-                                                         // `..._FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE`.
+        // Match by ioctl NR + type only, IGNORING the encoded struct size.
+        // `struct drm_syncobj_handle`'s UABI is append-only: its first 16 bytes
+        // (handle@0, flags@4, fd@8, pad@12) are frozen, but newer kernels grew
+        // the tail, bumping the size the ioctl number encodes -- Mesa now sends
+        // 0xC018_64C1 (size 24) for HANDLE_TO_FD. A size-pinned 0xC010_64C1
+        // silently misses it -> falls through to nouveau dispatch -> ENOSYS ->
+        // the GL client's fence export fails -> its EXEC wait times out ->
+        // VK_ERROR_DEVICE_LOST. We only ever touch the frozen 16-byte prefix
+        // below, so accepting any size is safe. Same bug class and fix as the
+        // deadline-sized SYNCOBJ_WAIT ioctls handled in `drm_scheme.rs`.
+        const SYNCOBJ_HANDLE_TO_FD_NR: usize = 0xc1; // DRM_IOWR(0xc1, drm_syncobj_handle)
+        const SYNCOBJ_FD_TO_HANDLE_NR: usize = 0xc2; // DRM_IOWR(0xc2, drm_syncobj_handle)
+        const DRM_IOCTL_TYPE: usize = 0x64; // 'd'
+                                            // Bit 0 on BOTH ioctls: `..._HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE` and
+                                            // `..._FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE`.
         const SYNC_FILE: u32 = 1 << 0;
 
-        if request != SYNCOBJ_HANDLE_TO_FD && request != SYNCOBJ_FD_TO_HANDLE {
+        let nr = request & 0xff;
+        if (request >> 8) & 0xff != DRM_IOCTL_TYPE
+            || (nr != SYNCOBJ_HANDLE_TO_FD_NR && nr != SYNCOBJ_FD_TO_HANDLE_NR)
+        {
             return Ok(None);
         }
+        let is_handle_to_fd = nr == SYNCOBJ_HANDLE_TO_FD_NR;
         if !kernel_hal::drivers::nouveau_uapi_enabled() {
             return Ok(None);
         }
@@ -1076,7 +1091,7 @@ impl Syscall<'_> {
             if n < 32 {
                 kernel_hal::klog_info!(
                     "[drm] SYNCOBJ_{} #{} pid={} handle={} fd={} flags={:#x} ({})",
-                    if request == SYNCOBJ_HANDLE_TO_FD {
+                    if is_handle_to_fd {
                         "HANDLE_TO_FD"
                     } else {
                         "FD_TO_HANDLE"
@@ -1090,7 +1105,7 @@ impl Syscall<'_> {
                 );
             }
         }
-        if request == SYNCOBJ_HANDLE_TO_FD && sync_file {
+        if is_handle_to_fd && sync_file {
             let Some(point) = kernel_hal::drivers::scheme::syncobj::export_snapshot(h.handle)
             else {
                 warn!(
@@ -1107,7 +1122,7 @@ impl Syscall<'_> {
             }
             return Ok(Some(0));
         }
-        if request == SYNCOBJ_FD_TO_HANDLE && sync_file {
+        if !is_handle_to_fd && sync_file {
             // Both operands come from userspace here: `fd` is the sync_file to
             // import, `handle` the DESTINATION syncobj (which must already
             // exist — Linux does not create one for this variant).
@@ -1131,7 +1146,7 @@ impl Syscall<'_> {
             }
             return Ok(Some(0));
         }
-        if request == SYNCOBJ_HANDLE_TO_FD {
+        if is_handle_to_fd {
             if kernel_hal::drivers::scheme::syncobj::query(h.handle).is_none() {
                 warn!(
                     "[drm] SYNCOBJ_HANDLE_TO_FD EINVAL: handle={} not a live syncobj",
@@ -1346,8 +1361,15 @@ impl Syscall<'_> {
             }
         }
         // SYNCOBJ_HANDLE_TO_FD / SYNCOBJ_FD_TO_HANDLE — same fd-table-access
-        // reasoning and sign-extension caveat as PRIME above.
-        if cmd == 0xC010_64C1 || cmd == 0xC010_64C2 {
+        // reasoning and sign-extension caveat as PRIME above. Match by ioctl NR
+        // (0xc1/0xc2) + type ('d'=0x64) only, IGNORING the encoded struct size:
+        // `struct drm_syncobj_handle` is UABI-frozen only in its first 16 bytes
+        // and newer kernels grew it (Mesa now sends 0xC018_64C1 = size 24),
+        // shifting the ioctl number a size-pinned constant would miss -> the
+        // request would fall through to nouveau dispatch -> ENOSYS -> the GL
+        // client's fence export fails -> VK_ERROR_DEVICE_LOST. `sys_drm_syncobj_fd`
+        // re-validates NR + type before touching the (frozen) 16-byte prefix.
+        if ((cmd >> 8) & 0xff) == 0x64 && matches!(cmd & 0xff, 0xc1 | 0xc2) {
             match self.sys_drm_syncobj_fd(cmd, arg1) {
                 Ok(Some(ret)) => return Ok(ret),
                 Ok(None) => {}
