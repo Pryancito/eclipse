@@ -12,6 +12,28 @@ use alloc::sync::Arc;
 use lock::Mutex;
 use pci::{PCIDevice, BAR};
 
+/// Busy-wait heartbeat for the GPU register/fence poll loops in this driver.
+///
+/// Like the RM's `osSpinLoop` (nvidia-rm-sys/src/os_boundary.rs), this drains
+/// **this CPU's TLB-shootdown queue** at a coarse cadence before spinning, so a
+/// long GPU wait cannot starve a peer CPU's shootdown ack and wedge the whole
+/// machine. Many of these polls run behind a `lock::Mutex` (interrupts off) or
+/// otherwise cannot service the shootdown IPI; without pumping, a CPU doing a
+/// `munmap`/VM_BIND-unmap then spins forever inside `remote_flush_tlb_aspace`
+/// holding the VMAR + page-table locks and every later address-space op convoys
+/// behind it — the on-hardware `DEADLOCK`/`KERNEL STOP` (shootdown starvation,
+/// "Not AB-BA"). `lock::pump()` is cheap (one relaxed load when the queue is
+/// empty) and safe to call under locks; the RM already relies on exactly that.
+#[inline]
+fn gpu_spin() {
+    static SPIN: AtomicUsize = AtomicUsize::new(0);
+    let n = SPIN.fetch_add(1, Ordering::Relaxed) + 1;
+    if n & 511 == 0 {
+        lock::pump();
+    }
+    core::hint::spin_loop();
+}
+
 // --- Registers and Constants (aligned with Nova / open-gpu-kernel-modules) ---
 #[allow(dead_code)]
 mod regs {
@@ -1058,7 +1080,7 @@ impl NvidiaGpu {
             if unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(t0) > 100_000 {
                 break;
             }
-            core::hint::spin_loop();
+            gpu_spin();
         }
         // Set Initiate FLR (Device Control cap+0x08 bit 15).
         let devctl = self.cfg_read16((cap as u16) + 0x08);
@@ -1066,7 +1088,7 @@ impl NvidiaGpu {
         // PCIe requires up to 100 ms before the function is usable again.
         let t1 = unsafe { crate::bus::drivers_timer_now_as_micros() };
         while unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(t1) < 100_000 {
-            core::hint::spin_loop();
+            gpu_spin();
         }
         true
     }
@@ -1239,7 +1261,7 @@ impl NvidiaGpu {
             // ~30ms spin so a live raster visibly advances its counters.
             let t0 = unsafe { crate::bus::drivers_timer_now_as_micros() };
             while unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(t0) < 30_000 {
-                core::hint::spin_loop();
+                gpu_spin();
             }
             for i in 0..4usize {
                 let head = rd(0x612078 + i * 2048);
@@ -1722,7 +1744,7 @@ impl NvidiaGpu {
             let t0 = unsafe { crate::bus::drivers_timer_now_as_micros() };
             while unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(t0) < ms * 1000
             {
-                core::hint::spin_loop();
+                gpu_spin();
             }
         };
         unsafe {
@@ -2239,7 +2261,7 @@ impl NvidiaGpu {
             if wait & 0x0000_000c == 0 {
                 break;
             }
-            core::hint::spin_loop();
+            gpu_spin();
         }
         (before, after, wait)
     }
@@ -2337,7 +2359,7 @@ impl NvidiaGpu {
                 ok = true;
                 break;
             }
-            core::hint::spin_loop();
+            gpu_spin();
         }
         (pre, post, ok)
     }
@@ -2565,7 +2587,7 @@ impl NvidiaGpu {
                 ok = true;
                 break;
             }
-            core::hint::spin_loop();
+            gpu_spin();
         }
         (ok, runl_id)
     }
@@ -5971,7 +5993,7 @@ impl DrmScheme for NvidiaGpu {
                 commit_ok = true;
                 break;
             }
-            core::hint::spin_loop();
+            gpu_spin();
         }
         let _ = writeln!(
             s,
@@ -6195,7 +6217,7 @@ impl DrmScheme for NvidiaGpu {
                 advanced = true;
                 break;
             }
-            core::hint::spin_loop();
+            gpu_spin();
         }
 
         let intr0_post =
@@ -6232,7 +6254,7 @@ impl DrmScheme for NvidiaGpu {
                     advanced = true;
                     break;
                 }
-                core::hint::spin_loop();
+                gpu_spin();
             }
             let _ = writeln!(
                 s,
@@ -6259,7 +6281,7 @@ impl DrmScheme for NvidiaGpu {
                 fetch_busy_iters = i;
                 break;
             }
-            core::hint::spin_loop();
+            gpu_spin();
         }
         let _ = writeln!(
             s,
@@ -6712,7 +6734,7 @@ impl DrmScheme for NvidiaGpu {
         };
         drop(state);
         while unsafe { crate::bus::drivers_timer_now_as_micros() } < target {
-            core::hint::spin_loop();
+            gpu_spin();
         }
         self.kms_state.lock().last_vblank_us = target;
         true
@@ -9511,7 +9533,7 @@ impl NvidiaGpu {
                             if unsafe { crate::bus::drivers_timer_now_as_micros() } >= deadline {
                                 break false;
                             }
-                            core::hint::spin_loop();
+                            gpu_spin();
                         };
                         r.fence_value = unsafe { core::ptr::read_volatile(fence_va) };
                         // 0 = landed (NV_OK), 0x65 = timeout -- the same codes the
