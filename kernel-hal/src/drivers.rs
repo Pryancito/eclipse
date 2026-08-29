@@ -258,36 +258,65 @@ impl From<DeviceError> for crate::HalError {
     }
 }
 
-/// Ring quarantine + poison-trap for freed DMA blocks, shared by
+/// FIFO quarantine + poison-trap for freed DMA blocks, shared by
 /// `virtio_dma_dealloc` and `drivers_dma_dealloc`.
 ///
 /// Freed DMA memory used to go straight back to the frame pool, so a device
 /// descriptor or a userspace `VmObject::new_physical` mapping still pointing at
 /// a just-freed block could write it AFTER `frame_alloc` had already handed the
-/// recycled frames to a fresh coroutine stack — the SMP `[null-exec]` zero-smash
-/// ("all-zeros usable region, no guard hit"). This holds each freed small block
-/// out of circulation for a window (`SLOTS` frees) before returning it, closing
-/// the reuse race, and poisons the first word of every page: nothing
-/// legitimately touches a quarantined (freed) block, so if the poison is gone at
-/// eviction the only thing that could have written it is a stale device/mapping
-/// — caught and named as a one-shot `[dma-uaf]` report instead of a silent
-/// corruption. Oversized blocks skip the ring (returned now) to bound held RAM.
+/// recycled frames to a fresh coroutine stack (or another process's memory) —
+/// the SMP `[null-exec]` zero-smash and the GEM-recycle SIGSEGV that crashes a
+/// wl_shm client (lunarbg) at desktop start on a `killall`+relaunch: the killed
+/// session's teardown drops its VM_BIND / userspace mappings correctly, but a
+/// GPU engine with in-flight work (or a stale ring descriptor) still writes the
+/// physical frames AFTER the mapping is gone — which no mapping-refcount can
+/// see. Holding the freed block out of circulation for a window lets that
+/// in-flight DMA drain onto memory nothing owns yet; the poison in the first
+/// word of every page names a stale writer as a one-shot `[dma-uaf]` report
+/// instead of a silent corruption.
+///
+/// The block that matters most here is a GPU framebuffer/texture — MiB-sized.
+/// The old ring capped entries at 32 pages, so exactly those large GEM buffers
+/// SKIPPED the quarantine and were recycled immediately: the crash's real hole.
+/// This FIFO covers blocks up to `MAX_BLOCK_PAGES` and evicts the oldest once
+/// either the block count or the total held RAM (`BUDGET_PAGES`) is exceeded, so
+/// large buffers are held without letting the held RAM grow unbounded. A single
+/// block larger than `MAX_BLOCK_PAGES` still returns immediately (its own UAF
+/// window is comparatively tiny and holding it would blow the budget alone).
 #[cfg(not(feature = "libos"))]
 fn dma_quarantine_dealloc(paddr: crate::PhysAddr, pages: usize) {
-    use core::sync::atomic::{AtomicUsize, Ordering};
-    const SLOTS: usize = 128;
-    const MAX_PAGES: usize = 32;
+    use lock::Mutex;
+    // Per-block cap (32 MiB) — covers a 4K framebuffer. Total held out of the
+    // pool (64 MiB) and max entries: whichever bound is hit first evicts the
+    // oldest. Sized to outlast in-flight GPU DMA across a kill+relaunch without
+    // starving the frame pool.
+    const MAX_BLOCK_PAGES: usize = 8192; // 32 MiB
+    const BUDGET_PAGES: usize = 16 * 1024; // 64 MiB
+    const MAX_BLOCKS: usize = 1024;
     const POISON: u64 = 0xDEAD_D3AD_F0F0_F0F0;
-    static QUAR_BASE: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
-    static QUAR_PAGES: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
-    static QUAR_IDX: AtomicUsize = AtomicUsize::new(0);
+
+    struct Quar {
+        ring: [(usize, usize); MAX_BLOCKS], // (base_pa, pages); (0,0) = empty
+        head: usize,                        // index of the oldest entry
+        len: usize,
+        held_pages: usize,
+    }
+    static QUAR: Mutex<Quar> = Mutex::new(Quar {
+        ring: [(0, 0); MAX_BLOCKS],
+        head: 0,
+        len: 0,
+        held_pages: 0,
+    });
 
     let free_now = |base: usize, n: usize| {
         for i in 0..n {
             crate::KHANDLER.frame_dealloc(base + i * crate::PAGE_SIZE);
         }
     };
-    if pages == 0 || pages > MAX_PAGES {
+    if pages == 0 {
+        return;
+    }
+    if pages > MAX_BLOCK_PAGES {
         free_now(paddr, pages);
         return;
     }
@@ -298,42 +327,57 @@ fn dma_quarantine_dealloc(paddr: crate::PhysAddr, pages: usize) {
             core::ptr::write_volatile(phys_to_va(paddr + i * crate::PAGE_SIZE) as *mut u64, POISON);
         }
     }
-    // Enqueue this block; the block that was in this slot `SLOTS` frees ago is
-    // now old enough to actually return to the pool.
-    let idx = QUAR_IDX.fetch_add(1, Ordering::Relaxed) % SLOTS;
-    let old_pages = QUAR_PAGES[idx].swap(pages, Ordering::AcqRel);
-    let old_base = QUAR_BASE[idx].swap(paddr, Ordering::AcqRel);
-    if old_base == 0 || old_pages == 0 {
-        return; // slot was empty (still filling the ring)
+    // Make room for the new block (evict the OLDEST until within both bounds),
+    // then enqueue it. Collect the evicted blocks and process them AFTER the
+    // lock is dropped: `frame_dealloc` and the clflush/read loop must not run
+    // under the quarantine lock.
+    let mut evicted: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
+    {
+        let mut q = QUAR.lock();
+        while q.len >= MAX_BLOCKS || (q.held_pages + pages > BUDGET_PAGES && q.len > 0) {
+            let h = q.head;
+            let (base, n) = q.ring[h];
+            q.ring[h] = (0, 0);
+            q.head = (h + 1) % MAX_BLOCKS;
+            q.len -= 1;
+            q.held_pages -= n;
+            evicted.push((base, n));
+        }
+        let tail = (q.head + q.len) % MAX_BLOCKS;
+        q.ring[tail] = (paddr, pages);
+        q.len += 1;
+        q.held_pages += pages;
     }
-    // Verify the evicted block's poison. Flush the sentinel line first so a
-    // (cache-coherent) device DMA that overwrote it is not masked by a stale
-    // cache line still holding the poison this CPU wrote.
-    let mut smashed_page = usize::MAX;
-    let mut smashed_val = 0u64;
-    unsafe {
-        for i in 0..old_pages {
-            let va = phys_to_va(old_base + i * crate::PAGE_SIZE);
-            #[cfg(target_arch = "x86_64")]
-            core::arch::x86_64::_mm_clflush(va as *const u8);
-            let w = core::ptr::read_volatile(va as *const u64);
-            if w != POISON {
-                smashed_page = i;
-                smashed_val = w;
-                break;
+    for (old_base, old_pages) in evicted {
+        // Verify the evicted block's poison. Flush the sentinel line first so a
+        // (cache-coherent) device DMA that overwrote it is not masked by a stale
+        // cache line still holding the poison this CPU wrote.
+        let mut smashed_page = usize::MAX;
+        let mut smashed_val = 0u64;
+        unsafe {
+            for i in 0..old_pages {
+                let va = phys_to_va(old_base + i * crate::PAGE_SIZE);
+                #[cfg(target_arch = "x86_64")]
+                core::arch::x86_64::_mm_clflush(va as *const u8);
+                let w = core::ptr::read_volatile(va as *const u64);
+                if w != POISON {
+                    smashed_page = i;
+                    smashed_val = w;
+                    break;
+                }
             }
         }
+        if smashed_page != usize::MAX {
+            crate::console::serial_write_fmt_spin(format_args!(
+                "\n[dma-uaf] STALE WRITE into a freed DMA block while quarantined: \
+                 paddr={:#x} pages={} page={} word0={:#x} (expected poison {:#x}) — a device \
+                 descriptor or a userspace mapping wrote memory the driver already freed; this is \
+                 the SMP null-exec / GEM-recycle corruptor.\n",
+                old_base, old_pages, smashed_page, smashed_val, POISON,
+            ));
+        }
+        free_now(old_base, old_pages);
     }
-    if smashed_page != usize::MAX {
-        crate::console::serial_write_fmt_spin(format_args!(
-            "\n[dma-uaf] STALE WRITE into a freed DMA block while quarantined: \
-             paddr={:#x} pages={} page={} word0={:#x} (expected poison {:#x}) — a device \
-             descriptor or a userspace mapping wrote memory the driver already freed; this is \
-             the SMP null-exec corruptor.\n",
-            old_base, old_pages, smashed_page, smashed_val, POISON,
-        ));
-    }
-    free_now(old_base, old_pages);
 }
 
 #[cfg(not(feature = "libos"))]
