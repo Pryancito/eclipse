@@ -449,7 +449,7 @@ pub(super) fn format_client_mem() -> alloc::string::String {
         VMBIND_SPARSE.load(Ordering::Relaxed),
         non_generic,
         if non_generic > 0 {
-            " <- compressed kind reached VM_BIND; mapped UNCOMPRESSED; prime suspect for tiled-surface garbage"
+            " <- compressed kind(s) mapped UNCOMPRESSED (byte-inexact for those few surfaces only; NOT the cause of whole-screen garbage when this count is tiny vs map= and the GR-hang probe shows a PBDMA stall with no MMU fault)"
         } else {
             ""
         },
