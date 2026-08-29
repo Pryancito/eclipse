@@ -626,3 +626,36 @@ DMA blocks (hold them out of the pool for a bounded window, like the freed-stack
 quarantine) to shrink the UAF window. Both are behaviour changes on the
 desktop-critical path and should land only after the detector confirms the
 mechanism on real hardware.
+
+### Update: the quarantine now covers large (framebuffer-sized) GEM blocks
+
+Investigation of a reproducible desktop-start crash (`lunarbg` SIGSEGV on a
+`killall labwc` + relaunch) narrowed the residual mechanism and closed the
+biggest hole:
+
+- **Teardown ORDER is already correct**, so a mapping-refcount buys little on
+  the exit path: `Process::terminate` runs `vmar.clear()` (unmaps every
+  userspace `VmObject::new_physical`) BEFORE the process-exit hook that frees a
+  process's GEM memory (`zircon-object` process.rs), and
+  `NvidiaGpu::nouveau_release_process` drains this pid's VM_BIND mappings
+  (step 1) BEFORE releasing its GEM objects (step 2). The userspace and GPU
+  mappings are gone before the frames are freed.
+- **The residual writer is IN-FLIGHT device DMA**: a GPU engine with work still
+  queued (or a stale ring descriptor) writes the physical frames AFTER the
+  mapping was torn down — which no mapping-refcount can observe. Only holding
+  the freed frames out of the pool until that DMA drains stops it.
+- **The hole**: `dma_quarantine_dealloc` capped entries at 32 pages, so exactly
+  the MiB-sized GPU framebuffers/textures that carry that in-flight DMA SKIPPED
+  the quarantine and were recycled immediately — the reused frame landing on the
+  relaunched client's memory. This is also why the poison-trap never fired on
+  them (they never entered the ring) and why no `[dma-uaf]` line appeared.
+
+The quarantine is now a bounded FIFO covering blocks up to `MAX_BLOCK_PAGES`
+(32 MiB) and evicting the oldest once the entry count or total held RAM
+(`BUDGET_PAGES`, 64 MiB) is exceeded, so large buffers are held long enough for
+in-flight DMA to drain without the held RAM growing unbounded. On the next
+hardware crash a `[dma-uaf] STALE WRITE ...` poison line on a framebuffer-sized
+block CONFIRMS this mechanism directly. A full `drm_gem_object`-style frame
+refcount remains the belt-and-braces follow-up for the explicit-free-while-
+mapped edge (a client that frees a GEM without unmapping it first), which
+ordering does not cover.
