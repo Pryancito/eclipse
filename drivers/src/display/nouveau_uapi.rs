@@ -645,11 +645,6 @@ pub(super) const fn vm_bind_pte_kind(flags: u32) -> u32 {
 }
 
 #[inline]
-pub(super) const fn gem_pte_kind(tile_flags: u32) -> u32 {
-    (tile_flags >> 8) & VM_BIND_PTE_KIND_MASK
-}
-
-#[inline]
 pub(super) const fn pte_kind_is_supported(kind: u32) -> bool {
     kind == PTE_KIND_PITCH || kind == PTE_KIND_GENERIC
 }
