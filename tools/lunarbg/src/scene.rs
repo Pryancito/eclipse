@@ -845,10 +845,16 @@ fn add_px_f(buf: &mut [f32], w: usize, h: usize, x: i32, y: i32, c: Rgb) {
 }
 
 fn blend_px_f(buf: &mut [f32], w: usize, x: usize, y: usize, c: Rgb, a: f32) {
+    // Bounds-check like `add_px_f`: today's callers keep x<w and y<h, but an
+    // unclamped coordinate would index past the safe slice and panic (abort).
+    // Guard it so a future caller can't turn a coordinate bug into a crash.
     let i = (y * w + x) * 3;
-    buf[i] = buf[i] * (1.0 - a) + c.0 * a;
-    buf[i + 1] = buf[i + 1] * (1.0 - a) + c.1 * a;
-    buf[i + 2] = buf[i + 2] * (1.0 - a) + c.2 * a;
+    let Some(px) = buf.get_mut(i..i + 3) else {
+        return;
+    };
+    px[0] = px[0] * (1.0 - a) + c.0 * a;
+    px[1] = px[1] * (1.0 - a) + c.1 * a;
+    px[2] = px[2] * (1.0 - a) + c.2 * a;
 }
 
 fn hash2(a: u32, b: u32) -> u32 {

@@ -3382,7 +3382,16 @@ fn connect_wayland() -> Result<Connection, String> {
 /// disposition so the shell still sees the real signal exit code (139).
 fn install_crash_handler() {
     extern "C" fn handler(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
-        let addr = unsafe { (*info).si_addr() } as usize;
+        // A kernel that does not fully honour SA_SIGINFO hands the handler a
+        // null siginfo — and Eclipse OS's sigaction is already known to
+        // mishandle pointers (see the oldact note below). Dereferencing it here
+        // would fault INSIDE this handler, losing the very diagnostic it exists
+        // to print. Report a zero address instead (mirrors lunarbg).
+        let addr = if info.is_null() {
+            0
+        } else {
+            (unsafe { (*info).si_addr() }) as usize
+        };
         let mut buf = *b"lunarbar: FATAL signal 00 fault-addr 0x0000000000000000\n";
         buf[23] = b'0' + ((sig / 10) % 10) as u8;
         buf[24] = b'0' + (sig % 10) as u8;
@@ -3404,7 +3413,11 @@ fn install_crash_handler() {
         let mut sa: libc::sigaction = core::mem::zeroed();
         let mut old: libc::sigaction = core::mem::zeroed();
         sa.sa_sigaction = handler as *const () as usize;
-        sa.sa_flags = libc::SA_SIGINFO;
+        // SA_ONSTACK: keep the Rust runtime's alternate signal stack so a STACK
+        // OVERFLOW can still be reported — on an exhausted stack a normal
+        // handler cannot run at all. Mirrors lunarbg; without it overflows die
+        // silently.
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
         libc::sigemptyset(&mut sa.sa_mask);
         // Pass a real oldact buffer rather than null: some kernels (including
         // Eclipse OS's microkernel) unconditionally dereference the third
