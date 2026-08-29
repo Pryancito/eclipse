@@ -167,6 +167,59 @@ fn scenario_speaker_test(dev: &PcmDev) -> bool {
     }
 }
 
+
+/// The REAL speaker-test path: it does not negotiate by time at all when
+/// neither --period-time nor --buffer-time is given (the hardware run printed
+/// "Periods = 4" with no "Requested ... time" lines). It reads the period-size
+/// minimum, pins `periods`, then asks for buffer = period_size x periods.
+fn scenario_speaker_test_periods(dev: &PcmDev, rate: u32, nperiods: u32) -> bool {
+    println!("\n=== speaker-test REAL path (rate {}, periods {}) ===", rate, nperiods);
+    let mut p = open_params();
+    if !dev.refine(&mut p) { println!("  initial refine FAILED"); return false; }
+    if !set_near(dev, &mut p, PAR_RATE, rate, "rate") { return false; }
+
+    let bs_min = iv(&p, PAR_BUFFER_SIZE).min;
+    let bs_max = iv(&p, PAR_BUFFER_SIZE).max;
+    let ps_min = iv(&p, PAR_PERIOD_SIZE).min;
+    let ps_max = iv(&p, PAR_PERIOD_SIZE).max;
+    println!("  Buffer size range from {} to {}", bs_min, bs_max);
+    println!("  Period size range from {} to {}", ps_min, ps_max);
+    println!("  Periods = {}", nperiods);
+
+    if !set_near(dev, &mut p, PAR_PERIODS, nperiods, "periods") { return false; }
+    // speaker-test then derives the buffer from the period size it has.
+    let period_size = iv(&p, PAR_PERIOD_SIZE).min;
+    let buffer_size = period_size * nperiods;
+    if !set_near(dev, &mut p, PAR_BUFFER_SIZE, buffer_size, "buffer_size") { return false; }
+    show("after periods+buffer", &p);
+
+    if !choose(dev, &mut p) { return false; }
+    match dev.install(&mut p) {
+        Ok(()) => { show("INSTALLED", &p); true }
+        Err(e) => { println!("  HW_PARAMS FAILED: {:?}", e); false }
+    }
+}
+
+
+/// The exact numbers the X299 box reported through `plughw:1`: the plug
+/// plugin rewrites the kernel's period floor of 128 into 132 on the way
+/// down, so the values that actually reach HW_PARAMS are not the ones the
+/// kernel advertised. Pin them literally.
+fn scenario_hardware_plug(dev: &PcmDev) -> bool {
+    println!("\n=== hardware plughw:1 replay (ps 132, periods 4, buffer 528) ===");
+    let mut p = open_params();
+    if !dev.refine(&mut p) { return false; }
+    if !set_near(dev, &mut p, PAR_RATE, 48000, "rate") { return false; }
+    if !set_near(dev, &mut p, PAR_PERIOD_SIZE, 132, "period_size") { return false; }
+    if !set_near(dev, &mut p, PAR_PERIODS, 4, "periods") { return false; }
+    if !set_near(dev, &mut p, PAR_BUFFER_SIZE, 528, "buffer_size") { return false; }
+    if !choose(dev, &mut p) { return false; }
+    match dev.install(&mut p) {
+        Ok(()) => { show("INSTALLED", &p); true }
+        Err(e) => { println!("  HW_PARAMS FAILED: {:?}", e); false }
+    }
+}
+
 fn scenario_aplay(dev: &PcmDev, rate: u32) -> bool {
     println!("\n=== aplay (rate {}, sizes left to the kernel) ===", rate);
     let mut p = open_params();
@@ -241,6 +294,10 @@ fn main() {
     let dev = PcmDev;
     let mut all = true;
     all &= scenario_speaker_test(&dev);
+    all &= scenario_speaker_test_periods(&dev, 48000, 4);
+    all &= scenario_speaker_test_periods(&dev, 44100, 4);
+    all &= scenario_speaker_test_periods(&dev, 48000, 2);
+    all &= scenario_hardware_plug(&dev);
     all &= scenario_aplay(&dev, 48000);
     all &= scenario_aplay(&dev, 44100);
     all &= scenario_explicit_sizes(&dev);

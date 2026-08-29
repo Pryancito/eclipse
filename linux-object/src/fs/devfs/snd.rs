@@ -456,31 +456,41 @@ impl PcmDev {
         // at 44.1 kHz is 22050 frames while four 125 ms periods are 22048 —
         // so the upper bound carries one period of slack and `install` is what
         // settles on the exactly-coherent triple.
+        // The exact relation, with the slack written down once so all three
+        // directions agree: `periods` is how many WHOLE periods fit in the
+        // buffer, i.e.
+        //
+        //     period_size × periods  ≤  buffer_size  ≤  period_size × (periods+1) − 1
+        //
+        // Every bound below is that inequality solved for one unknown. They
+        // have to be mutual inverses or the propagation contradicts itself:
+        // deriving period_size from (buffer 512, periods 2) as 170 while the
+        // reverse rule caps a 170-frame 2-period buffer at 509 empties the
+        // interval, and hw_params fails — which is exactly what a client
+        // asking for two periods used to hit.
         let (ps_lo, ps_hi) = Self::iv_bounds(&iv[Self::IV_PERIOD_SIZE]);
         let (n_lo, n_hi) = Self::iv_bounds(&iv[Self::IV_PERIODS]);
         changed |= Self::iv_clamp(
             &mut iv[Self::IV_BUFFER_SIZE],
             ps_lo * n_lo,
-            ps_hi * n_hi + ps_hi.saturating_sub(1),
+            (ps_hi * (n_hi + 1)).saturating_sub(1),
         );
         let (bs_lo, bs_hi) = Self::iv_bounds(&iv[Self::IV_BUFFER_SIZE]);
-        if n_hi > 0 && n_lo > 0 {
-            // `n_hi + 1` for the same reason the upper bound above carries
-            // slack: with a non-exact multiple allowed, a period only has to
-            // be small enough that `periods` of them approximately fill the
-            // buffer, not exactly.
+        if n_lo > 0 {
+            // ps ≥ (buffer+1)/(periods+1)  and  ps ≤ buffer/periods
             changed |= Self::iv_clamp(
                 &mut iv[Self::IV_PERIOD_SIZE],
-                bs_lo / (n_hi + 1),
-                bs_hi.div_ceil(n_lo),
+                (bs_lo + 1).div_ceil(n_hi + 1),
+                bs_hi / n_lo,
             );
         }
         let (ps_lo, ps_hi) = Self::iv_bounds(&iv[Self::IV_PERIOD_SIZE]);
-        if ps_hi > 0 && ps_lo > 0 {
+        if ps_lo > 0 && ps_hi > 0 {
+            // periods ≥ (buffer+1)/ps − 1  and  periods ≤ buffer/ps
             changed |= Self::iv_clamp(
                 &mut iv[Self::IV_PERIODS],
-                bs_lo / ps_hi,
-                bs_hi.div_ceil(ps_lo),
+                (bs_lo + 1).div_ceil(ps_hi).saturating_sub(1).max(1),
+                bs_hi / ps_lo,
             );
         }
 
@@ -551,13 +561,12 @@ impl PcmDev {
                 break;
             }
         }
-        for (i, iv) in p.intervals.iter().enumerate() {
-            if Self::iv_empty(iv) {
-                if ok {
-                    Self::log_refine_failure(Self::iv_name(i), &p.intervals);
-                }
-                ok = false;
-            }
+        if p.intervals.iter().any(Self::iv_empty) {
+            // Deliberately silent: alsa-lib's `*_near` helpers find a supported
+            // value BY probing until the refine rejects one, so a rejection
+            // here is the normal case, not a fault. Only HW_PARAMS failing is
+            // worth a log line — see `install`.
+            ok = false;
         }
 
         p.info = INFO_INTERLEAVED | INFO_BLOCK_TRANSFER;
@@ -570,11 +579,13 @@ impl PcmDev {
         ok
     }
 
-    /// Log the first few refine rejections with the full parameter state. A
-    /// failed hw_params is otherwise a bare EINVAL in userspace with no way to
-    /// tell which constraint bit; budgeted so a client that probes in a loop
-    /// cannot flood the console.
-    fn log_refine_failure(name: &str, iv: &[SndInterval; 12]) {
+    /// Log a rejected HW_PARAMS with both the client's request and the state
+    /// it refined to. Userspace only sees a bare EINVAL, so without this there
+    /// is no way to tell which constraint bit — and the request side matters
+    /// as much as the result, because a plugin (`plughw`) rewrites the values
+    /// on their way down. Budgeted so a client that retries cannot flood the
+    /// console.
+    fn log_hw_params_failure(name: &str, req: &[SndInterval; 12], iv: &[SndInterval; 12]) {
         use core::sync::atomic::{AtomicU32, Ordering};
         static BUDGET: AtomicU32 = AtomicU32::new(8);
         if BUDGET
@@ -584,7 +595,23 @@ impl PcmDev {
             return;
         }
         warn!(
-            "[snd] hw_params rejected: '{}' empty — rate {}..{}, period_size {}..{}, \
+            "[snd] hw_params REQUESTED: rate {}..{}, period_size {}..{}, \
+             period_time {}..{}, periods {}..{}, buffer_size {}..{}, buffer_time {}..{}",
+            req[Self::IV_RATE].min,
+            req[Self::IV_RATE].max,
+            req[Self::IV_PERIOD_SIZE].min,
+            req[Self::IV_PERIOD_SIZE].max,
+            req[Self::IV_PERIOD_TIME].min,
+            req[Self::IV_PERIOD_TIME].max,
+            req[Self::IV_PERIODS].min,
+            req[Self::IV_PERIODS].max,
+            req[Self::IV_BUFFER_SIZE].min,
+            req[Self::IV_BUFFER_SIZE].max,
+            req[Self::IV_BUFFER_TIME].min,
+            req[Self::IV_BUFFER_TIME].max,
+        );
+        warn!(
+            "[snd] hw_params REJECTED: '{}' empty — rate {}..{}, period_size {}..{}, \
              period_time {}..{}, periods {}..{}, buffer_size {}..{}, buffer_time {}..{}",
             name,
             iv[Self::IV_RATE].min,
@@ -607,7 +634,15 @@ impl PcmDev {
     /// parameter, re-propagate so the rest follows, and hand every interval
     /// back as an exact singleton.
     fn install(&self, p: &mut SndPcmHwParams) -> Result<()> {
+        let requested = p.intervals;
         if !self.refine(p) {
+            let empty = p
+                .intervals
+                .iter()
+                .position(Self::iv_empty)
+                .map(Self::iv_name)
+                .unwrap_or("mask");
+            Self::log_hw_params_failure(empty, &requested, &p.intervals);
             return Err(FsError::InvalidParam);
         }
 
