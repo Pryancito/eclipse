@@ -1278,7 +1278,16 @@ fn write_labwc_wrapper(rootfs: &Path) {
           LOG=/tmp/labwc.log\n\
           : > \"$LOG\" 2>/dev/null || true\n\
           for d in /usr/bin /bin /usr/sbin /sbin; do\n\
-          \x20 if [ -x \"$d/labwc\" ]; then exec \"$d/labwc\" \"$@\" >>\"$LOG\" 2>&1; fi\n\
+          \x20 if [ -x \"$d/labwc\" ]; then\n\
+          \x20 # tty7: land the compositor on the reserved graphics VT even when\n\
+          \x20 # launched by hand from a text VT. eclipse-init --exec-on-graphics-vt\n\
+          \x20 # chvt's to tty7 then execs labwc there (reuses the existing init\n\
+          \x20 # binary, no new tool); plain-exec fallback if it is absent.\n\
+          \x20 if [ -x /sbin/eclipse-init ]; then\n\
+          \x20\x20 exec /sbin/eclipse-init --exec-on-graphics-vt \"$d/labwc\" \"$@\" >>\"$LOG\" 2>&1\n\
+          \x20 fi\n\
+          \x20 exec \"$d/labwc\" \"$@\" >>\"$LOG\" 2>&1\n\
+          \x20 fi\n\
           done\n\
           # NOT INSTALLED -- see the matching note in eclipse-seatd. `>&2` alone\n\
           # goes to /dev/null under init and leaves an empty /tmp/labwc.log, so\n\

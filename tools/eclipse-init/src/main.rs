@@ -151,6 +151,22 @@ fn log(msg: &str) {
 }
 
 fn main() {
+    // Multi-call helper mode (no separate binary): `eclipse-init
+    // --exec-on-graphics-vt CMD [ARGS...]` switches the display to the reserved
+    // graphics VT (tty7), then execs CMD there. The labwc wrapper uses it so a
+    // compositor launched BY HAND from a text VT lands on tty7 too (the boot
+    // path already switches below). The flag is distinctive, so it can never
+    // collide with the kernel's INIT= argv. Runs before ANY PID1 setup -- no
+    // mounts, no signal handlers.
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        if argv.get(1).map(String::as_str) == Some("--exec-on-graphics-vt") {
+            activate_graphics_vt();
+            exec_argv(&argv[2..]);
+            std::process::exit(127); // no command given, or execvp failed
+        }
+    }
+
     log("starting");
 
     mount_pseudo_filesystems();
@@ -186,24 +202,23 @@ fn main() {
     supervise(&mut services);
 }
 
-/// Switch the display to the dedicated graphics VT (`tty7`) so the graphical
-/// session's `libseat` binds it (it takes the active VT). `/dev/tty0` is the
-/// "current VT" control node the VT ioctls act on; `VT_ACTIVATE` makes tty7 the
-/// active VT and `VT_WAITACTIVE` blocks until the switch lands. Best-effort: on a
-/// build without VT support the ioctls fail harmlessly and the session stays on
-/// the current VT. Keep the VT number in sync with the kernel's `GRAPHICS_VT`
-/// (the last of `NUM_VTS`, currently tty7).
-fn switch_to_graphics_vt() {
+/// Make tty7 (the reserved graphics VT) the active display via the VT ioctls on
+/// `/dev/tty0` (the "current VT" control node): `VT_ACTIVATE` makes tty7 active
+/// and `VT_WAITACTIVE` blocks until the switch lands, so the graphical session's
+/// `libseat` binds it (libseat takes the active VT). Best-effort — on a build
+/// without VT support the ioctls fail harmlessly and the session stays on the
+/// current VT. Keep the VT number in sync with the kernel's `GRAPHICS_VT` (the
+/// last of `NUM_VTS`, currently tty7). Returns whether `/dev/tty0` opened.
+fn activate_graphics_vt() -> bool {
     const VT_ACTIVATE: libc::c_ulong = 0x5606;
     const VT_WAITACTIVE: libc::c_ulong = 0x5607;
     const GRAPHICS_VT: libc::c_int = 7; // tty7 == kernel GRAPHICS_VT + 1
     let Ok(path) = CString::new("/dev/tty0") else {
-        return;
+        return false;
     };
     let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
     if fd < 0 {
-        log("note: /dev/tty0 open failed; leaving the session on the current VT");
-        return;
+        return false;
     }
     // SAFETY: `fd` is a valid open tty; both VT ioctls take the VT number BY
     // VALUE (not a pointer), so passing the int directly is correct.
@@ -212,7 +227,42 @@ fn switch_to_graphics_vt() {
         libc::ioctl(fd, VT_WAITACTIVE as _, GRAPHICS_VT);
         libc::close(fd);
     }
-    log(&format!("display switched to graphics VT tty{GRAPHICS_VT}"));
+    true
+}
+
+/// Boot-path wrapper around [`activate_graphics_vt`] that logs the outcome.
+fn switch_to_graphics_vt() {
+    if activate_graphics_vt() {
+        log("display switched to graphics VT tty7");
+    } else {
+        log("note: could not open /dev/tty0; session stays on the current VT");
+    }
+}
+
+/// `execvp` the given `argv` (program name first). Returns ONLY on failure (a
+/// missing program, an interior NUL, or `execvp` erroring). Used by the
+/// `--exec-on-graphics-vt` helper mode.
+fn exec_argv(argv: &[String]) {
+    let Some(prog) = argv.first() else {
+        return;
+    };
+    let Ok(c_prog) = CString::new(prog.as_str()) else {
+        return;
+    };
+    let c_args: Vec<CString> = argv
+        .iter()
+        .filter_map(|a| CString::new(a.as_str()).ok())
+        .collect();
+    if c_args.len() != argv.len() {
+        return; // an argument held an interior NUL -- refuse a truncated argv
+    }
+    let mut ptrs: Vec<*const libc::c_char> = c_args.iter().map(|c| c.as_ptr()).collect();
+    ptrs.push(core::ptr::null());
+    // SAFETY: `c_prog` is a valid C string and `ptrs` is a NULL-terminated argv
+    // of pointers into `c_args`, which outlive the call.
+    unsafe {
+        libc::execvp(c_prog.as_ptr(), ptrs.as_ptr());
+    }
 }
 
 // ---------------------------------------------------------------------------
