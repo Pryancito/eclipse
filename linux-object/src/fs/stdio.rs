@@ -838,11 +838,21 @@ fn handle_key_event(event: &InputEvent) {
         }
     }
 
-    // Si el VT activo tiene el teclado en modo raw/off (p. ej. un servidor X lo
-    // ha tomado con `KDSKBMODE`), no entregamos caracteres "cocidos" al TTY: los
-    // eventos crudos siguen llegando a userspace por `/dev/input/event*`. Las
-    // combinaciones de cambio de VT (Ctrl+Alt+F1..F6) ya se procesaron arriba.
-    if !tty_kbd_cooked(kernel_hal::console::active_vt()) {
+    // No entregamos caracteres "cocidos" al TTY cuando un servidor gráfico posee
+    // el VT activo. Dos casos:
+    //  * K_RAW/K_OFF (`KDSKBMODE`, p. ej. kdrive/X): el teclado ya está en crudo.
+    //  * KD_GRAPHICS con el teclado aún en K_XLATE (labwc/wlroots vía libseat, que
+    //    lee el teclado por evdev y NO cambia el modo del tty). Sin este segundo
+    //    gate el kernel cocina cada tecla en el login-shell que comparte el VT con
+    //    el compositor, de modo que un `vkcube` tecleado en foot se ejecuta DOS
+    //    veces —una por foot vía evdev, otra por el shell del VT— y aparecen dos
+    //    ventanas. Los eventos crudos siguen llegando por `/dev/input/event*`, que
+    //    es de donde los lee el compositor. Los cambios de VT (Ctrl+Alt+Fn) ya se
+    //    procesaron arriba, así que siempre se puede salir de la sesión gráfica.
+    let active = kernel_hal::console::active_vt();
+    if kernel_hal::console::kd_mode_vt(active) == kernel_hal::console::KD_GRAPHICS
+        || !tty_kbd_cooked(active)
+    {
         return;
     }
 
