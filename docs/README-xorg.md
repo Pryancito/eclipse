@@ -135,9 +135,14 @@ mirar `/tmp/Xorg.log` (sección anterior) para el siguiente fallo.
 
 - `VT_OPENQRY` devuelve el VT activo, de modo que X se apropia del terminal
   desde el que se lanzó `startx` (y al salir vuelve a él).
-- El reenganche por señales `VT_PROCESS` (relsig/acqsig) se acepta pero no se
-  emiten señales: cambiar de VT mientras X corre y volver puede requerir que la
-  aplicación repinte.
+- El reenganche por señales `VT_PROCESS` (relsig/acqsig) está implementado al
+  estilo de Linux: al pulsar Ctrl+Alt+Fn el kernel envía `relsig` al dueño del
+  VT gráfico y espera su `VT_RELDISP` antes de conmutar; al volver envía
+  `acqsig` para que el servidor recupere el DRM master y repinte. Si el
+  compositor no coopera (VT_AUTO o cuelga), la conmutación es inmediata o se
+  fuerza pulsando Ctrl+Alt+Fn otra vez, y la supresión de blits del VT gráfico
+  no activo (ver `drm.rs`) mantiene visible la consola de texto como red de
+  seguridad.
 - La aceleración por GPU no está disponible; usa el renderizado por software de
   Mesa (`llvmpipe`/`softpipe`), por eso se instalan `mesa-dri-gallium` y
   `llvm-libs`.

@@ -161,10 +161,12 @@ struct DrmState {
     /// The VT the compositor owns the display on, established on its first
     /// present. While the active VT differs (the user switched to a text
     /// console with Ctrl+Alt+Fn), the compositor's blits are suppressed so the
-    /// text console stays visible, and its input is paused — Eclipse has no
-    /// VT_PROCESS release/acquire signalling, so this is what makes VT
-    /// switching out of the compositor actually work. Cleared on DROP_MASTER
-    /// (compositor exit) so a later text-only session is never gated.
+    /// text console stays visible, and its input is paused. The kernel does
+    /// emit the Linux `VT_PROCESS` relsig/acqsig handshake (see
+    /// `stdio::request_vt_switch`), but this suppression is the safety net that
+    /// keeps VT switching working even when a compositor ignores the handshake
+    /// or hangs. Cleared on DROP_MASTER (compositor exit) so a later text-only
+    /// session is never gated.
     graphics_vt: Option<usize>,
     /// Pending DRM events (page-flip completions) waiting to be `read()` from
     /// the card fd. Each entry is one fully-encoded `struct drm_event_vblank`.
