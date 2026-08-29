@@ -1242,19 +1242,57 @@ impl Syscall<'_> {
         // signaled) is a no-op here, for the same reason as QUERY's
         // LAST_SUBMITTED: this model has no separate submitted-vs-signaled state.
         let _ = req.flags;
-        if kernel_hal::drivers::scheme::syncobj::query(req.handle).is_none() {
-            warn!(
-                "[drm] SYNCOBJ_EVENTFD EINVAL: handle={} not a live syncobj",
-                req.handle
-            );
-            return Err(LxError::EINVAL);
-        }
+        // Resolve both preconditions up front so the trace below can report the
+        // EXACT reason, then apply them in order.
+        let live = kernel_hal::drivers::scheme::syncobj::query(req.handle).is_some();
         // The target must be an eventfd: delivery is a `write` of 1, which for
         // any other FileLike would mean something else entirely.
         let proc = self.linux_process();
-        let ev = proc.get_file_like(FileDesc::from(req.fd as usize))?;
-        if ev.downcast_ref::<linux_object::fs::EventFd>().is_none() {
-            warn!("[drm] SYNCOBJ_EVENTFD EINVAL: fd={} is not an eventfd", req.fd);
+        let ev = proc.get_file_like(FileDesc::from(req.fd as usize));
+        let is_eventfd = ev
+            .as_ref()
+            .ok()
+            .map(|e| e.downcast_ref::<linux_object::fs::EventFd>().is_some())
+            .unwrap_or(false);
+        let outcome = if !live {
+            "EINVAL: handle not a live syncobj"
+        } else if ev.is_err() {
+            "EBADF: fd not in the process fd table"
+        } else if !is_eventfd {
+            "EINVAL: fd is not an eventfd"
+        } else {
+            "OK: waiter armed"
+        };
+        // Bounded, LOG=error-visible (klog) trace of the first 32 arm attempts.
+        // The `einval-hunt` sees SYNCOBJ_EVENTFD return EINVAL but not WHY, and
+        // this is the compositor's explicit-sync WAIT: wlroots arms one per
+        // GPU-client frame to learn when the client's render fence has landed.
+        // If it fails, the compositor never waits on that fence and may sample
+        // the client's dma-buf MID-RENDER -- block-structured garbage on a GPU
+        // client (vkcube) while the compositor's own CPU-blit surfaces stay
+        // clean. Bounded because a per-frame console storm has wedged spinlocks
+        // before (see the EXEC-failure dedup in nouveau_uapi.rs).
+        {
+            static ARM_TRACE_BUDGET: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            if ARM_TRACE_BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 32 {
+                kernel_hal::klog_info!(
+                    "[drm] SYNCOBJ_EVENTFD pid={} handle={} point={} fd={} live_syncobj={} is_eventfd={} -> {}",
+                    self.zircon_process().id(),
+                    req.handle,
+                    req.point,
+                    req.fd,
+                    live,
+                    is_eventfd,
+                    outcome,
+                );
+            }
+        }
+        if !live {
+            return Err(LxError::EINVAL);
+        }
+        let ev = ev?;
+        if !is_eventfd {
             return Err(LxError::EINVAL);
         }
         // The waiter holds this Arc, so the eventfd stays alive until delivered.
