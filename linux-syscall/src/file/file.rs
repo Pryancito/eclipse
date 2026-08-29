@@ -953,7 +953,7 @@ impl Syscall<'_> {
                     // success path ("self-import(nouveau)") is hot and stays at
                     // debug so a working swapchain loop doesn't flood the console.
                     if kind == "generic" {
-                        log::error!(
+                        log::info!(
                             "[drm] PRIME import fd={} phys={:#x} size={} -> generic handle={:#x} (SELF-IMPORT MISS -> GEM_INFO will ENOENT)",
                             h.fd, dmabuf.phys_addr, dmabuf.size, handle_id
                         );
