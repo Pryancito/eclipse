@@ -467,6 +467,13 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 let mut shared_root = None;
                 let mut primary_shell = None;
                 for vt in 0..kernel_hal::console::NUM_VTS {
+                    // The LAST VT (tty7) is reserved for the graphical session:
+                    // no login shell there, so labwc/X11 owns it cleanly and the
+                    // kernel text console never fights the compositor for the
+                    // framebuffer. See `kernel_hal::console::GRAPHICS_VT`.
+                    if vt == kernel_hal::console::GRAPHICS_VT {
+                        continue;
+                    }
                     let pid = (101 + vt) as u64;
                     let proc = zcore_loader::linux::run_shell_on_vt(
                         shell_args.clone(),

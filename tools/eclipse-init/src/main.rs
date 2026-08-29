@@ -164,6 +164,14 @@ fn main() {
     log(&format!("desktop session: {desktop}"));
     services.retain(|_, s| s.desktop.as_deref().map_or(true, |d| d == desktop));
 
+    // Move the display to the dedicated graphics VT (tty7) BEFORE starting the
+    // compositor/X, so its libseat binds that reserved, shell-free VT instead of
+    // sharing tty1 with the boot shell. The kernel then keeps the display on
+    // tty7 once the session sets KD_GRAPHICS and returns to tty1 when it exits.
+    if matches!(desktop.as_str(), "labwc" | "xorg") {
+        switch_to_graphics_vt();
+    }
+
     let order = ordered_names(&services);
 
     for name in &order {
@@ -176,6 +184,35 @@ fn main() {
 
     log("entering supervision loop");
     supervise(&mut services);
+}
+
+/// Switch the display to the dedicated graphics VT (`tty7`) so the graphical
+/// session's `libseat` binds it (it takes the active VT). `/dev/tty0` is the
+/// "current VT" control node the VT ioctls act on; `VT_ACTIVATE` makes tty7 the
+/// active VT and `VT_WAITACTIVE` blocks until the switch lands. Best-effort: on a
+/// build without VT support the ioctls fail harmlessly and the session stays on
+/// the current VT. Keep the VT number in sync with the kernel's `GRAPHICS_VT`
+/// (the last of `NUM_VTS`, currently tty7).
+fn switch_to_graphics_vt() {
+    const VT_ACTIVATE: libc::c_ulong = 0x5606;
+    const VT_WAITACTIVE: libc::c_ulong = 0x5607;
+    const GRAPHICS_VT: libc::c_int = 7; // tty7 == kernel GRAPHICS_VT + 1
+    let Ok(path) = CString::new("/dev/tty0") else {
+        return;
+    };
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+    if fd < 0 {
+        log("note: /dev/tty0 open failed; leaving the session on the current VT");
+        return;
+    }
+    // SAFETY: `fd` is a valid open tty; both VT ioctls take the VT number BY
+    // VALUE (not a pointer), so passing the int directly is correct.
+    unsafe {
+        libc::ioctl(fd, VT_ACTIVATE as _, GRAPHICS_VT);
+        libc::ioctl(fd, VT_WAITACTIVE as _, GRAPHICS_VT);
+        libc::close(fd);
+    }
+    log(&format!("display switched to graphics VT tty{GRAPHICS_VT}"));
 }
 
 // ---------------------------------------------------------------------------

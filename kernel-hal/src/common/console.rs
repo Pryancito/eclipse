@@ -375,8 +375,28 @@ pub fn set_kd_mode_vt(vt: usize, mode: u32) {
         m.store(mode, Ordering::SeqCst);
     }
     #[cfg(feature = "graphic")]
-    if mode == KD_TEXT && vt == active_vt() {
-        redraw_graphic_console_impl();
+    {
+        if mode == KD_GRAPHICS {
+            // A compositor/X server just claimed VT `vt` for graphics. Make the
+            // display FOLLOW it: switch the active VT to `vt` so launching a
+            // desktop lands the user on the graphics VT (tty7) with no manual VT
+            // switch, and the kernel text console stops drawing over the
+            // compositor's framebuffer. `switch_vt_impl` does NOT repaint text on
+            // a KD_GRAPHICS target, so this never scribbles on the compositor.
+            if vt != active_vt() {
+                switch_vt_impl(vt);
+            }
+        } else if mode == KD_TEXT && vt == active_vt() {
+            // This VT is returning to text. If it is the graphics VT releasing
+            // the display (the compositor exited and restored KD_TEXT), fall
+            // back to the primary text console so the user is not stranded on a
+            // now-blank graphics VT; otherwise just repaint this VT.
+            if vt == GRAPHICS_VT {
+                switch_vt_impl(0);
+            } else {
+                redraw_graphic_console_impl();
+            }
+        }
     }
 }
 
@@ -403,7 +423,20 @@ pub fn kd_mode() -> u32 {
 // ---------------------------------------------------------------------------
 
 /// Number of virtual terminals (Linux-style `tty1..ttyN`).
-pub const NUM_VTS: usize = 6;
+///
+/// The LAST VT ([`GRAPHICS_VT`], `tty7` at the default of 7) is reserved for
+/// the graphical session (labwc/X11/whatever): no login shell is spawned on it
+/// (see `zCore/src/main.rs`), and a compositor putting it into `KD_GRAPHICS`
+/// makes the kernel switch the display to it automatically (see `set_kd_mode_vt`).
+/// Keeping graphics on its own VT stops the kernel text console and the
+/// compositor fighting over the framebuffer. If this changes, keep the
+/// `tty7` the userspace launcher targets (`eclipse-init` / the labwc wrapper)
+/// in sync with `GRAPHICS_VT + 1`.
+pub const NUM_VTS: usize = 7;
+
+/// Index of the VT dedicated to the graphical session (`tty7` = index 6). The
+/// last VT, so bumping `NUM_VTS` moves it and its reservation together.
+pub const GRAPHICS_VT: usize = NUM_VTS - 1;
 
 /// Number of virtual terminals available.
 pub fn num_vts() -> usize {
