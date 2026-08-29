@@ -7946,13 +7946,16 @@ impl NvidiaGpu {
                 prime
             );
         }
-        // Record the prime outcome for /proc/gpudbg too: if the golden-context
-        // prime is TIMING OUT, that alone predicts every real draw on this
-        // client will cold-load-hang -> fence-wait timeout -> DEVICE_LOST, and
-        // it is the single most likely root. Seed the last-EXEC slot with it so
-        // `cat /proc/gpudbg` shows the prime verdict even before the client's
-        // first draw overwrites it.
-        nv::record_client_exec(alloc::format!(
+        // Record the prime outcome in the PERSISTENT prime slot: if the
+        // golden-context prime is TIMING OUT, that alone predicts every real
+        // draw on this client will cold-load-hang -> fence-wait timeout ->
+        // DEVICE_LOST, and it is the single most likely root of a FECS
+        // ctx-switch hang. Use `record_prime` (not the last-EXEC slot) so the
+        // verdict survives the client's own draws -- otherwise the failing EXEC
+        // overwrites it before the terminal can `cat /proc/gpudbg`.
+        nv::record_prime(
+            ctx_idx,
+            alloc::format!(
             "ctx={} pid={} PRIME {} (NV_STATUS={:#x}){}",
             ctx_idx,
             owner_pid,

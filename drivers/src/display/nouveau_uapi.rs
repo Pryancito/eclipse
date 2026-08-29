@@ -213,6 +213,52 @@ pub(super) fn record_client_exec(line: alloc::string::String) {
     *LAST_CLIENT_EXEC.lock() = Some(line);
 }
 
+/// Persistent per-context `ctx_prime` (golden-context load) outcomes for
+/// `/proc/gpudbg`. Unlike [`record_client_exec`], this is NOT overwritten by the
+/// client's later EXEC records: the prime verdict (OK / TIMEOUT) is the single
+/// fork for the FECS ctx-switch hang -- golden context never loaded (prime
+/// timed out) vs loaded-but-graphics-incomplete (prime OK yet the 3D draw still
+/// hangs FECS in RESTORE). It must survive until next boot even after the client
+/// has drawn and failed, so `cat /proc/gpudbg` always names it. One entry per
+/// ctx (`1..8`); a later prime of the same ctx replaces its line.
+static LAST_PRIME: Mutex<alloc::vec::Vec<(u32, alloc::string::String)>> =
+    Mutex::new(alloc::vec::Vec::new());
+
+/// Record the `ctx_prime` outcome for `ctx_idx`, replacing any prior entry for
+/// that ctx. Persistent across the client's later draws (see [`LAST_PRIME`]).
+pub(super) fn record_prime(ctx_idx: u32, line: alloc::string::String) {
+    let mut v = LAST_PRIME.lock();
+    if let Some(e) = v.iter_mut().find(|(c, _)| *c == ctx_idx) {
+        e.1 = line;
+    } else {
+        v.push((ctx_idx, line));
+    }
+}
+
+/// `/proc/gpudbg` section: persistent `ctx_prime` golden-context outcomes. This
+/// is the decisive fork for a FECS ctx-switch hang, and survives the client's
+/// draws (which overwrite the last-EXEC slot).
+fn format_prime() -> alloc::string::String {
+    use core::fmt::Write;
+    let mut s = alloc::string::String::new();
+    let _ = writeln!(
+        s,
+        "[gpudbg] --- ctx_prime golden-context outcomes (persistent; NOT overwritten by draws) ---"
+    );
+    let v = LAST_PRIME.lock();
+    if v.is_empty() {
+        let _ = writeln!(
+            s,
+            "[gpudbg]  (none this boot -- no client context has been primed yet)"
+        );
+    } else {
+        for (_c, line) in v.iter() {
+            let _ = writeln!(s, "[gpudbg]  {}", line);
+        }
+    }
+    s
+}
+
 /// GR-engine hang probe snapshot captured at fence-wait timeout.
 ///
 /// Populated once (first timeout) with a BAR0 register snapshot taken at the
@@ -284,6 +330,11 @@ pub(super) fn format_last_exec() -> alloc::string::String {
             );
         }
     }
+    // The persistent prime verdict: for a FECS ctx-switch hang this is THE fork
+    // (golden context never loaded vs loaded-but-graphics-incomplete). Kept
+    // separate from the last-EXEC slot above precisely because the client's draw
+    // overwrites that slot before the terminal can read it.
+    s.push_str(&format_prime());
     // The GR-hang probe is the most actionable diagnostic when the draw never
     // completes: it picks between MMU fault / stalled method / PBDMA not
     // drained / FECS ctx-switch hang -- the four mutually-exclusive root causes.
