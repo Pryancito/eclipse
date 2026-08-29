@@ -9550,6 +9550,23 @@ impl NvidiaGpu {
                             // GP_GET < GP_PUT means it never fetched the push at all.
                             let pb0_put = rd(0x0004_0000);
                             let pb0_get = rd(0x0004_0014);
+                            // PBDMA execution state — decodes WHY GP_GET is stuck,
+                            // the one thing GP_PUT/GP_GET alone cannot tell apart:
+                            //   STATUS(0x40100): the PBDMA channel/exec state machine.
+                            //   GET(0x40018): pushbuffer-level get. If it advanced
+                            //     into the pending segment the host DID fetch the
+                            //     entry and is executing/blocked inside the push
+                            //     (a semaphore-acquire NVK baked in -> explicit-sync).
+                            //   INTR_0(0x40108): pending PBDMA interrupts. A blocked
+                            //     semaphore-acquire that exceeds its timeout raises
+                            //     one here; a channel that was simply never scheduled
+                            //     onto the runlist raises none. So INTR_0!=0 => the
+                            //     push was fetched and blocked (semaphore/PB error);
+                            //     INTR_0==0 with GP_GET frozen => never scheduled
+                            //     (runlist/doorbell), NOT a semaphore block.
+                            let pb0_status = rd(0x0004_0100);
+                            let pb0_pbget = rd(0x0004_0018);
+                            let pb0_intr = rd(0x0004_0108);
 
                             // HUB MMU fault latch (non-replayable, TU102 0xb83080..90).
                             // valid = bit 31 of INFO1; reason = bits [4:0].
@@ -9579,8 +9596,10 @@ impl NvidiaGpu {
                                 "MMU-FAULT: GPU touched an unmapped VA -- check VM_BIND mappings"
                             } else if gr_status != 0 && gr_method != 0 {
                                 "GR-STALL: GR engine stuck on a method -- golden-ctx/GR-init incomplete?"
+                            } else if !drained && pb0_intr != 0 {
+                                "PBDMA-STALL (fetched, then BLOCKED): a PBDMA interrupt is pending -- the host fetched the push and stalled inside it, i.e. a semaphore-acquire NVK baked in never released (explicit-sync), or a PB error. Decode INTR_0/STATUS."
                             } else if !drained {
-                                "PBDMA-STALL: PBDMA never fetched the push -- runlist/channel not armed?"
+                                "PBDMA-STALL (never fetched): GP_GET frozen with no PBDMA interrupt -- the channel is not runlist-resident, so the doorbell/runlist scheduling never ran this push (NOT a semaphore block)."
                             } else if fecs_status != 0 || gpccs_status != 0 {
                                 "FECS/GPCCS: ctx-switch hang -- context-image incomplete?"
                             } else {
@@ -9594,6 +9613,7 @@ impl NvidiaGpu {
                                  TRAPPED_ADDR(0x400704)={gr_trap_addr:#010x} subchan={gr_subchan} method={gr_method:#06x}\n\
                                  TRAPPED_DATA lo={gr_trap_lo:#010x} hi={gr_trap_hi:#010x}\n\
                                  PBDMA0 GP_PUT(0x40000)={pb0_put:#010x} GP_GET(0x40014)={pb0_get:#010x} drained={drained}\n\
+                                 PBDMA0 STATUS(0x40100)={pb0_status:#010x} GET(0x40018)={pb0_pbget:#010x} INTR_0(0x40108)={pb0_intr:#010x}\n\
                                  MMU FAULT_INFO1(0xb83090)={f_info1:#010x} valid={mmu_valid} reason={mmu_reason:#04x}\n\
                                    FAULT_ADDR={f_addr_hi:#010x}_{f_addr_lo:#010x} engine_id={engine_id:#04x}\n\
                                  FECS CTXSW_STATUS(0x409c00)={fecs_status:#010x} HOST_INT(0x409c14)={fecs_intr:#010x}\n\
@@ -9610,6 +9630,9 @@ impl NvidiaGpu {
                                 gr_trap_hi = gr_trap_hi,
                                 pb0_put = pb0_put,
                                 pb0_get = pb0_get,
+                                pb0_status = pb0_status,
+                                pb0_pbget = pb0_pbget,
+                                pb0_intr = pb0_intr,
                                 drained = drained,
                                 f_info1 = f_info1,
                                 mmu_valid = mmu_valid,
