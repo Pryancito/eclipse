@@ -9605,16 +9605,21 @@ impl NvidiaGpu {
                             let pb0_intr = rd(0x0004_0108);
 
                             // NV_PFIFO_CHRAM_CHANNEL(ch_id): per-channel PCCSR register.
-                            // Stride is 8 bytes; STATUS is bits [2:0] of the first word
-                            // (Turing: 0=IDLE, 1=PENDING, 2=CTX_RELOAD, 3=BUSY/ACTIVE,
-                            //  4=PENDING_CTX_RELOAD, 5=PENDING_ACQ, 6=ENG_SEL_PENDING).
-                            // PENDING means on the runlist with work; IDLE means either
-                            // not on the runlist or no GP entries. Reading this at the
-                            // exact timeout moment tells us whether the channel was even
-                            // visible to the host FIFO scheduler at all.
-                            let pccsr_off = 0x0080_0000usize + (ch_id as usize) * 8;
+                            // Stride is 8 bytes.  The FIRST word (+0x0) is the instance
+                            // pointer; the SECOND word (+0x4) carries channel state:
+                            //   bit 0       = ENABLE
+                            //   bits [27:24] = STATUS (0=IDLE, 1=PENDING, 2=CTX_RELOAD,
+                            //                          3=BUSY/ACTIVE, 4=PENDING_CTX_RELOAD,
+                            //                          5=PENDING_ACQ, 6=ENG_SEL_PENDING)
+                            //   bit 28      = BUSY
+                            // Reading at timeout tells us whether the channel was visible
+                            // to the host FIFO scheduler. Matches the existing decode at
+                            // drivers/src/display/nvidia.rs:3164 (PCCSR0(0x800004)).
+                            let pccsr_off = 0x0080_0004usize + (ch_id as usize) * 8;
                             let pccsr_val = rd(pccsr_off);
-                            let pccsr_status = pccsr_val & 0x7;
+                            let pccsr_enable = pccsr_val & 1;
+                            let pccsr_busy   = (pccsr_val >> 28) & 1;
+                            let pccsr_status = (pccsr_val >> 24) & 0xf;
 
                             // HUB MMU fault latch (non-replayable, TU102 0xb83080..90).
                             // valid = bit 31 of INFO1; reason = bits [4:0].
@@ -9625,9 +9630,22 @@ impl NvidiaGpu {
 
                             // NV_PGRAPH_PRI_FECS_CTXSW_STATUS_FE_0: FECS state machine.
                             // Non-zero when FECS is mid ctx-switch (save/restore).
+                            // 0x1 = SAVE_CONTEXT, 0x2 = RESTORE_CONTEXT (loading grctx).
                             let fecs_status = rd(0x0040_9c00);
                             // NV_PGRAPH_PRI_FECS_HOST_INT_STATUS: FECS interrupt flags.
                             let fecs_intr = rd(0x0040_9c14);
+                            // NV_PGRAPH_PRI_FECS_CTXSW_MAILBOX(0/1): last FECS ucode
+                            // message and error detail. Ucode updates MAILBOX0 at each
+                            // step of the context-save/restore microcode; a non-zero
+                            // MAILBOX0 with fecs_status==0x2 (RESTORE) shows exactly
+                            // which grctx step the ucode reached before hanging. These
+                            // are the registers an rc_dump uses to diagnose FECS hangs.
+                            let fecs_mb0 = rd(0x0040_9800);
+                            let fecs_mb1 = rd(0x0040_9804);
+                            // NV_PGRAPH_PRI_FECS_CTXSW_PRIV_ERROR_FE_0: privilege
+                            // error flags set if FECS ucode tried to read an invalid
+                            // register (context-image addresses wrong / buffer too small).
+                            let fecs_priv_err = rd(0x0040_9c10);
 
                             // NV_PGRAPH_PRI_GPC0_GPCCS_CTXSW_STATUS_GPC_0: GPCCS state.
                             let gpccs_status = rd(0x0041_a000);
@@ -9649,7 +9667,7 @@ impl NvidiaGpu {
                             } else if !drained {
                                 "PBDMA-STALL (never fetched): GP_GET frozen with no PBDMA interrupt -- the channel is not runlist-resident, so the doorbell/runlist scheduling never ran this push (NOT a semaphore block)."
                             } else if fecs_status != 0 || gpccs_status != 0 {
-                                "FECS/GPCCS: ctx-switch hang -- context-image incomplete?"
+                                "FECS/GPCCS: ctx-switch hang -- GR context-image incomplete or global ctx buffers not mapped; check ctx_prime outcome and grctx init for this client channel's class object"
                             } else {
                                 "GR-IDLE-NOFENCE: GR finished but fence-semaphore write never arrived -- WFI/coherency?"
                             };
@@ -9673,6 +9691,29 @@ impl NvidiaGpu {
                                 );
                             }
 
+                            // FECS ctx-switch hang: log a targeted klog line so
+                            // dmesg immediately points at grctx/golden-context as
+                            // the root. CTXSW_STATUS==0x2 = RESTORE_CONTEXT: FECS
+                            // ucode is stuck trying to load the client channel's GR
+                            // context image. Most likely causes: ctx_prime timed out
+                            // (golden context was never loaded before NVK's first
+                            // push hit the cold load), or a global-ctx-buffer
+                            // (patch/attribute/pagepool) was not mapped for this ctx.
+                            if fecs_status != 0 || gpccs_status != 0 {
+                                crate::klog_warn!(
+                                    "[nouveau-uapi] EXEC: ctx={} FECS/GPCCS ctx-switch hang \
+                                     (FECS_STATUS={:#010x} GPCCS_STATUS={:#010x} \
+                                     MAILBOX0={:#010x} MAILBOX1={:#010x} PRIV_ERR={:#010x}) -- \
+                                     GR context-image for this client channel is incomplete; \
+                                     check whether ctx_prime timed out at CHANNEL_ALLOC \
+                                     (see /proc/gpudbg last PRIME line for ctx={})",
+                                    ctx_idx,
+                                    fecs_status, gpccs_status,
+                                    fecs_mb0, fecs_mb1, fecs_priv_err,
+                                    ctx_idx
+                                );
+                            }
+
                             nv::record_gr_hang_probe(alloc::format!(
                                 "ctx={ctx} pid={pid} fence TIMEOUT after {ms}ms\n\
                                  HINT: {hint}\n\
@@ -9682,10 +9723,11 @@ impl NvidiaGpu {
                                  TRAPPED_DATA lo={gr_trap_lo:#010x} hi={gr_trap_hi:#010x}\n\
                                  PBDMA0 GP_PUT(0x40000)={pb0_put:#010x} GP_GET(0x40014)={pb0_get:#010x} drained={drained}\n\
                                  PBDMA0 STATUS(0x40100)={pb0_status:#010x} GET(0x40018)={pb0_pbget:#010x} INTR_0(0x40108)={pb0_intr:#010x}\n\
-                                 PCCSR ch{ch_id}(0x{pccsr_off:x})={pccsr_val:#010x} status={pccsr_status} (0=IDLE,1=PENDING,3=ACTIVE)\n\
+                                 PCCSR ch{ch_id}(0x{pccsr_off:x})={pccsr_val:#010x} enable={pccsr_enable} busy={pccsr_busy} status={pccsr_status} (0=IDLE,1=PENDING,3=ACTIVE)\n\
                                  MMU FAULT_INFO1(0xb83090)={f_info1:#010x} valid={mmu_valid} reason={mmu_reason:#04x}\n\
                                    FAULT_ADDR={f_addr_hi:#010x}_{f_addr_lo:#010x} engine_id={engine_id:#04x}\n\
-                                 FECS CTXSW_STATUS(0x409c00)={fecs_status:#010x} HOST_INT(0x409c14)={fecs_intr:#010x}\n\
+                                 FECS CTXSW_STATUS(0x409c00)={fecs_status:#010x} (0=IDLE,1=SAVE,2=RESTORE) HOST_INT(0x409c14)={fecs_intr:#010x}\n\
+                                 FECS MAILBOX0(0x409800)={fecs_mb0:#010x} MAILBOX1(0x409804)={fecs_mb1:#010x} PRIV_ERR(0x409c10)={fecs_priv_err:#010x}\n\
                                  GPCCS GPC0_STATUS(0x41a000)={gpccs_status:#010x}",
                                 ctx = ctx_idx,
                                 pid = owner_pid,
@@ -9708,6 +9750,8 @@ impl NvidiaGpu {
                                 drained = drained,
                                 pccsr_off = pccsr_off,
                                 pccsr_val = pccsr_val,
+                                pccsr_enable = pccsr_enable,
+                                pccsr_busy = pccsr_busy,
                                 pccsr_status = pccsr_status,
                                 f_info1 = f_info1,
                                 mmu_valid = mmu_valid,
@@ -9715,6 +9759,12 @@ impl NvidiaGpu {
                                 f_addr_hi = f_addr_hi,
                                 f_addr_lo = f_addr_lo,
                                 engine_id = f_info0 & 0xff,
+                                fecs_status = fecs_status,
+                                fecs_intr = fecs_intr,
+                                fecs_mb0 = fecs_mb0,
+                                fecs_mb1 = fecs_mb1,
+                                fecs_priv_err = fecs_priv_err,
+                                gpccs_status = gpccs_status,
                             ));
                         }
                     }
