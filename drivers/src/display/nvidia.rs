@@ -9557,6 +9557,20 @@ impl NvidiaGpu {
                             let rd = |off: usize| unsafe {
                                 core::ptr::read_volatile((bar0 + off) as *const u32)
                             };
+                            let wr = |off: usize, v: u32| unsafe {
+                                core::ptr::write_volatile((bar0 + off) as *mut u32, v)
+                            };
+
+                            // work_token encodes runlistId|chId (Turing: bits [19:16]
+                            // = runlistId, bits [11:0] = chId). Capture from exec
+                            // result so the probe names the EXACT channel that timed
+                            // out, not a generic PBDMA0 snapshot that may belong to
+                            // a different concurrent context.
+                            let work_token = r.work_token;
+                            let runlist_id = r.runlist_id;
+                            // Channel ID: low 12 bits of the work-submit token
+                            // (Turing/Ampere kernel_fifo_tu102.c: chId = token & 0xfff).
+                            let ch_id = work_token & 0x0fff;
 
                             // NV_PGRAPH_STATUS: overall GR busy/idle.
                             // 0 = idle; any bit set = a sub-engine is active/stalled.
@@ -9590,6 +9604,23 @@ impl NvidiaGpu {
                             let pb0_pbget = rd(0x0004_0018);
                             let pb0_intr = rd(0x0004_0108);
 
+                            // NV_PFIFO_CHRAM_CHANNEL(ch_id): per-channel PCCSR register.
+                            // Stride is 8 bytes.  The FIRST word (+0x0) is the instance
+                            // pointer; the SECOND word (+0x4) carries channel state:
+                            //   bit 0       = ENABLE
+                            //   bits [27:24] = STATUS (0=IDLE, 1=PENDING, 2=CTX_RELOAD,
+                            //                          3=BUSY/ACTIVE, 4=PENDING_CTX_RELOAD,
+                            //                          5=PENDING_ACQ, 6=ENG_SEL_PENDING)
+                            //   bit 28      = BUSY
+                            // Reading at timeout tells us whether the channel was visible
+                            // to the host FIFO scheduler. Matches the existing decode at
+                            // drivers/src/display/nvidia.rs:3164 (PCCSR0(0x800004)).
+                            let pccsr_off = 0x0080_0004usize + (ch_id as usize) * 8;
+                            let pccsr_val = rd(pccsr_off);
+                            let pccsr_enable = pccsr_val & 1;
+                            let pccsr_busy   = (pccsr_val >> 28) & 1;
+                            let pccsr_status = (pccsr_val >> 24) & 0xf;
+
                             // HUB MMU fault latch (non-replayable, TU102 0xb83080..90).
                             // valid = bit 31 of INFO1; reason = bits [4:0].
                             let f_info1 = rd(0x00b8_3090);
@@ -9599,9 +9630,22 @@ impl NvidiaGpu {
 
                             // NV_PGRAPH_PRI_FECS_CTXSW_STATUS_FE_0: FECS state machine.
                             // Non-zero when FECS is mid ctx-switch (save/restore).
+                            // 0x1 = SAVE_CONTEXT, 0x2 = RESTORE_CONTEXT (loading grctx).
                             let fecs_status = rd(0x0040_9c00);
                             // NV_PGRAPH_PRI_FECS_HOST_INT_STATUS: FECS interrupt flags.
                             let fecs_intr = rd(0x0040_9c14);
+                            // NV_PGRAPH_PRI_FECS_CTXSW_MAILBOX(0/1): last FECS ucode
+                            // message and error detail. Ucode updates MAILBOX0 at each
+                            // step of the context-save/restore microcode; a non-zero
+                            // MAILBOX0 with fecs_status==0x2 (RESTORE) shows exactly
+                            // which grctx step the ucode reached before hanging. These
+                            // are the registers an rc_dump uses to diagnose FECS hangs.
+                            let fecs_mb0 = rd(0x0040_9800);
+                            let fecs_mb1 = rd(0x0040_9804);
+                            // NV_PGRAPH_PRI_FECS_CTXSW_PRIV_ERROR_FE_0: privilege
+                            // error flags set if FECS ucode tried to read an invalid
+                            // register (context-image addresses wrong / buffer too small).
+                            let fecs_priv_err = rd(0x0040_9c10);
 
                             // NV_PGRAPH_PRI_GPC0_GPCCS_CTXSW_STATUS_GPC_0: GPCCS state.
                             let gpccs_status = rd(0x0041_a000);
@@ -9623,27 +9667,75 @@ impl NvidiaGpu {
                             } else if !drained {
                                 "PBDMA-STALL (never fetched): GP_GET frozen with no PBDMA interrupt -- the channel is not runlist-resident, so the doorbell/runlist scheduling never ran this push (NOT a semaphore block)."
                             } else if fecs_status != 0 || gpccs_status != 0 {
-                                "FECS/GPCCS: ctx-switch hang -- context-image incomplete?"
+                                "FECS/GPCCS: ctx-switch hang -- GR context-image incomplete or global ctx buffers not mapped; check ctx_prime outcome and grctx init for this client channel's class object"
                             } else {
                                 "GR-IDLE-NOFENCE: GR finished but fence-semaphore write never arrived -- WFI/coherency?"
                             };
 
+                            // Recovery attempt for the "never fetched, no PBDMA
+                            // interrupt" case: re-ring the doorbell with the exact
+                            // work-submit token the RM issued for THIS submit.
+                            // Rationale: the PBDMA may have missed the original
+                            // doorbell (GSP-to-host signalling is not guaranteed
+                            // lossless at high submission rates on Turing). Writing
+                            // the token to 0xbb0090 a second time is idempotent if
+                            // the channel is already running, and may unblock it if
+                            // the doorbell was lost. Pure BAR0 write; no RM call.
+                            // Only attempted when GP_GET is frozen AND INTR_0 == 0
+                            // (i.e., the push never made it to the PBDMA at all).
+                            if !drained && pb0_intr == 0 && work_token != 0 {
+                                wr(0x00bb_0090, work_token);
+                                crate::klog_warn!(
+                                    "[nouveau-uapi] EXEC: ctx={} PBDMA-stall recovery: re-rang doorbell token={:#010x} runlist={} ch={}",
+                                    ctx_idx, work_token, runlist_id, ch_id
+                                );
+                            }
+
+                            // FECS ctx-switch hang: log a targeted klog line so
+                            // dmesg immediately points at grctx/golden-context as
+                            // the root. CTXSW_STATUS==0x2 = RESTORE_CONTEXT: FECS
+                            // ucode is stuck trying to load the client channel's GR
+                            // context image. Most likely causes: ctx_prime timed out
+                            // (golden context was never loaded before NVK's first
+                            // push hit the cold load), or a global-ctx-buffer
+                            // (patch/attribute/pagepool) was not mapped for this ctx.
+                            if fecs_status != 0 || gpccs_status != 0 {
+                                crate::klog_warn!(
+                                    "[nouveau-uapi] EXEC: ctx={} FECS/GPCCS ctx-switch hang \
+                                     (FECS_STATUS={:#010x} GPCCS_STATUS={:#010x} \
+                                     MAILBOX0={:#010x} MAILBOX1={:#010x} PRIV_ERR={:#010x}) -- \
+                                     GR context-image for this client channel is incomplete; \
+                                     check whether ctx_prime timed out at CHANNEL_ALLOC \
+                                     (see /proc/gpudbg last PRIME line for ctx={})",
+                                    ctx_idx,
+                                    fecs_status, gpccs_status,
+                                    fecs_mb0, fecs_mb1, fecs_priv_err,
+                                    ctx_idx
+                                );
+                            }
+
                             nv::record_gr_hang_probe(alloc::format!(
                                 "ctx={ctx} pid={pid} fence TIMEOUT after {ms}ms\n\
                                  HINT: {hint}\n\
+                                 submit: work_token={work_token:#010x} runlist_id={runlist_id} ch_id={ch_id}\n\
                                  GR_STATUS(0x400700)={gr_status:#010x} (0=idle)\n\
                                  TRAPPED_ADDR(0x400704)={gr_trap_addr:#010x} subchan={gr_subchan} method={gr_method:#06x}\n\
                                  TRAPPED_DATA lo={gr_trap_lo:#010x} hi={gr_trap_hi:#010x}\n\
                                  PBDMA0 GP_PUT(0x40000)={pb0_put:#010x} GP_GET(0x40014)={pb0_get:#010x} drained={drained}\n\
                                  PBDMA0 STATUS(0x40100)={pb0_status:#010x} GET(0x40018)={pb0_pbget:#010x} INTR_0(0x40108)={pb0_intr:#010x}\n\
+                                 PCCSR ch{ch_id}(0x{pccsr_off:x})={pccsr_val:#010x} enable={pccsr_enable} busy={pccsr_busy} status={pccsr_status} (0=IDLE,1=PENDING,3=ACTIVE)\n\
                                  MMU FAULT_INFO1(0xb83090)={f_info1:#010x} valid={mmu_valid} reason={mmu_reason:#04x}\n\
                                    FAULT_ADDR={f_addr_hi:#010x}_{f_addr_lo:#010x} engine_id={engine_id:#04x}\n\
-                                 FECS CTXSW_STATUS(0x409c00)={fecs_status:#010x} HOST_INT(0x409c14)={fecs_intr:#010x}\n\
+                                 FECS CTXSW_STATUS(0x409c00)={fecs_status:#010x} (0=IDLE,1=SAVE,2=RESTORE) HOST_INT(0x409c14)={fecs_intr:#010x}\n\
+                                 FECS MAILBOX0(0x409800)={fecs_mb0:#010x} MAILBOX1(0x409804)={fecs_mb1:#010x} PRIV_ERR(0x409c10)={fecs_priv_err:#010x}\n\
                                  GPCCS GPC0_STATUS(0x41a000)={gpccs_status:#010x}",
                                 ctx = ctx_idx,
                                 pid = owner_pid,
                                 ms = TIMEOUT_MS,
                                 hint = hint,
+                                work_token = work_token,
+                                runlist_id = runlist_id,
+                                ch_id = ch_id,
                                 gr_status = gr_status,
                                 gr_trap_addr = gr_trap_addr,
                                 gr_subchan = gr_subchan,
@@ -9656,12 +9748,23 @@ impl NvidiaGpu {
                                 pb0_pbget = pb0_pbget,
                                 pb0_intr = pb0_intr,
                                 drained = drained,
+                                pccsr_off = pccsr_off,
+                                pccsr_val = pccsr_val,
+                                pccsr_enable = pccsr_enable,
+                                pccsr_busy = pccsr_busy,
+                                pccsr_status = pccsr_status,
                                 f_info1 = f_info1,
                                 mmu_valid = mmu_valid,
                                 mmu_reason = mmu_reason,
                                 f_addr_hi = f_addr_hi,
                                 f_addr_lo = f_addr_lo,
                                 engine_id = f_info0 & 0xff,
+                                fecs_status = fecs_status,
+                                fecs_intr = fecs_intr,
+                                fecs_mb0 = fecs_mb0,
+                                fecs_mb1 = fecs_mb1,
+                                fecs_priv_err = fecs_priv_err,
+                                gpccs_status = gpccs_status,
                             ));
                         }
                     }
@@ -9787,20 +9890,22 @@ impl NvidiaGpu {
                         };
                         if ctx_idx >= 1 {
                             nv::record_client_exec(alloc::format!(
-                                "ctx={} pid={} FAILED at {} | lookup={:#x} map={:#x} token={:#x} submit={:#x} fenceSubmit={:#x} fenceWait={:#x} fence={:#x}/exp={:#x} | {}",
+                                "ctx={} pid={} FAILED at {} | lookup={:#x} map={:#x} token={:#x} submit={:#x} fenceSubmit={:#x} fenceWait={:#x} fence={:#x}/exp={:#x} work_token={:#010x} runlist={} | {}",
                                 ctx_idx, owner_pid, stage,
                                 r.lookup_status, r.map_status, r.token_status, r.submit_status,
                                 r.fence_submit_status, r.fence_wait_status, r.fence_value, fence_payload,
+                                r.work_token, r.runlist_id,
                                 self.ctx_registry_summary()
                             ));
                         }
                         if nv::exec_failure_changed(sig) {
                             replay_rm(rm_narration);
                             crate::klog_warn!(
-                                "[nouveau-uapi] EXEC (signaled) failed: pid={} ctx={} pushes={} waits={} sigs={} | lookup={:#x} map={:#x} token={:#x} submit={:#x} fenceSubmit={:#x} fenceWait={:#x} (fence value={:#x} expected={:#x}; identical repeats suppressed)",
+                                "[nouveau-uapi] EXEC (signaled) failed: pid={} ctx={} pushes={} waits={} sigs={} | lookup={:#x} map={:#x} token={:#x} submit={:#x} fenceSubmit={:#x} fenceWait={:#x} (fence value={:#x} expected={:#x}; work_token={:#010x} runlist={}; identical repeats suppressed)",
                                 owner_pid, ctx_idx, req.push_count, req.wait_count, req.sig_count,
                                 r.lookup_status, r.map_status, r.token_status, r.submit_status,
-                                r.fence_submit_status, r.fence_wait_status, r.fence_value, fence_payload
+                                r.fence_submit_status, r.fence_wait_status, r.fence_value, fence_payload,
+                                r.work_token, r.runlist_id
                             );
                             crate::klog_warn!(
                                 "[nouveau-uapi] ctx registry: {}",
