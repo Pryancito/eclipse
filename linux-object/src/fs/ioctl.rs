@@ -213,6 +213,11 @@ pub const VT_AUTO: u8 = 0x00;
 /// `mode` value: the process handles VT switches via signals.
 pub const VT_PROCESS: u8 = 0x01;
 
+/// `VT_RELDISP` argument: the process acknowledges it has acquired the VT (the
+/// reply to `acqsig` on a switch-*to*). A non-zero, non-`VT_ACKACQ` argument on
+/// a switch-*from* instead completes the release.
+pub const VT_ACKACQ: usize = 0x02;
+
 /// Linux `struct vt_mode` — VT switch signalling configuration.
 #[repr(C)]
 #[derive(Clone, Copy)]

@@ -8,6 +8,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
+use core::convert::TryFrom;
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::AtomicBool;
@@ -103,6 +104,12 @@ struct TtyState {
     /// Software flow control (IXON): output to this VT is paused after a `VSTOP`
     /// (Ctrl-S) and resumed by `VSTART` (Ctrl-Q).
     flow_stopped: AtomicBool,
+    /// The KoID of the process that put this VT into `VT_PROCESS` mode via
+    /// `VT_SETMODE` -- the graphics session (X/Wayland) that owns the VT-switch
+    /// handshake for it. 0 = none (VT_AUTO / a plain text console). Used to
+    /// deliver `relsig` on a switch away and `acqsig` on a switch back,
+    /// Linux-style (see [`request_vt_switch`]).
+    vt_owner: AtomicU64,
 }
 
 lazy_static! {
@@ -114,6 +121,7 @@ lazy_static! {
             kbd_mode: AtomicI32::new(K_XLATE),
             kbd_leds: AtomicU8::new(0),
             flow_stopped: AtomicBool::new(false),
+            vt_owner: AtomicU64::new(0),
         })
         .collect();
 }
@@ -172,6 +180,110 @@ fn medium_raw_vt() -> Option<usize> {
         Some(active)
     } else {
         None
+    }
+}
+
+/// Target VT (0-based) of a deferred `VT_PROCESS` switch, or -1 when none is
+/// pending. Set when we deliver `relsig` to a graphics session and wait for its
+/// `VT_RELDISP` acknowledgement; cleared when the switch completes or is
+/// refused. Lock-free so it is safe to touch from the keyboard input path.
+static VT_SWITCH_PENDING: AtomicI32 = AtomicI32::new(-1);
+
+/// The KoID owning VT `vt` under `VT_PROCESS` (0 if none / VT_AUTO).
+fn vt_owner(vt: usize) -> u64 {
+    TTY_STATES[vt_clamp(vt)].vt_owner.load(Ordering::Relaxed)
+}
+
+/// KoID of the calling process, or 0 if it can't be resolved. Used to record
+/// the owner of a VT when it enters `VT_PROCESS` mode.
+fn current_koid() -> u64 {
+    if let Some(arc) = kernel_hal::thread::get_current_thread() {
+        if let Ok(thread) = arc.downcast::<Thread>() {
+            return thread.proc().id();
+        }
+    }
+    0
+}
+
+/// Map a `vt_mode` signal number (`relsig`/`acqsig`) to a [`Signal`]. Returns
+/// `None` for 0 (no signal) or an out-of-range value.
+fn vt_signal(n: i16) -> Option<crate::signal::Signal> {
+    if !(1..=64).contains(&n) {
+        return None;
+    }
+    crate::signal::Signal::try_from(n as u8).ok()
+}
+
+/// Request a switch to `target` (0-based VT), running the Linux `VT_PROCESS`
+/// release handshake when the current foreground VT is driven by a graphics
+/// session.
+///
+/// Mirrors the kernel's `change_console()`:
+///  * If the current VT is in `VT_PROCESS` mode with a live owner, record the
+///    pending target, send `relsig`, and return *without* switching. The owner
+///    drops DRM master and replies `VT_RELDISP(1)`, which runs
+///    [`complete_vt_switch`]. (`VT_RELDISP(0)` refuses and cancels.)
+///  * Otherwise (VT_AUTO, no owner, or a dead owner) switch immediately.
+///
+/// Escape hatch for a wedged compositor that never answers `relsig`: a second
+/// request while one is still pending forces the switch through at once (e.g.
+/// pressing Ctrl+Alt+Fn again). The `drm.rs` blit suppression on a non-active
+/// graphics VT remains the ultimate safety net once the switch lands.
+fn request_vt_switch(target: usize) {
+    let target = vt_clamp(target);
+    let cur = vt_clamp(kernel_hal::console::active_vt());
+    if cur == target {
+        VT_SWITCH_PENDING.store(-1, Ordering::Relaxed);
+        return;
+    }
+
+    // A prior handshake never completed (uncooperative / hung owner): force it.
+    if VT_SWITCH_PENDING.swap(-1, Ordering::Relaxed) >= 0 {
+        complete_vt_switch(target);
+        return;
+    }
+
+    let mode = *tty_vt_mode(cur).lock();
+    let owner = vt_owner(cur);
+    if mode.mode == VT_PROCESS && owner != 0 {
+        if let Some(sig) = vt_signal(mode.relsig) {
+            match crate::process::send_signal_to_process(owner as usize, sig) {
+                Ok(()) => {
+                    // Defer: the owner will VT_RELDISP once it has released.
+                    VT_SWITCH_PENDING.store(target as i32, Ordering::Relaxed);
+                    return;
+                }
+                Err(_) => {
+                    // Owner is gone; revert to auto and switch straight away.
+                    *tty_vt_mode(cur).lock() = VtMode::auto();
+                    TTY_STATES[cur].vt_owner.store(0, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+    complete_vt_switch(target);
+}
+
+/// Finish a VT switch: activate `target` and, when it is owned by a graphics
+/// session in `VT_PROCESS` mode, deliver `acqsig` so the session re-takes DRM
+/// master and repaints. Mirrors the kernel's `complete_change_console()`.
+fn complete_vt_switch(target: usize) {
+    let target = vt_clamp(target);
+    kernel_hal::console::switch_vt(target);
+    // Re-blit the compositor's last frame if we landed back on its VT (a no-op
+    // for a text target, which the console repaints itself).
+    crate::fs::devfs::drm::represent_if_owner_active();
+
+    let mode = *tty_vt_mode(target).lock();
+    let owner = vt_owner(target);
+    if mode.mode == VT_PROCESS && owner != 0 {
+        if let Some(sig) = vt_signal(mode.acqsig) {
+            if crate::process::send_signal_to_process(owner as usize, sig).is_err() {
+                // Destination owner has died; revert it to auto.
+                *tty_vt_mode(target).lock() = VtMode::auto();
+                TTY_STATES[target].vt_owner.store(0, Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -351,7 +463,19 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             if mode.is_null() {
                 return Err(FsError::InvalidParam);
             }
-            *tty_vt_mode(vt).lock() = unsafe { *mode };
+            let vm = unsafe { *mode };
+            *tty_vt_mode(vt).lock() = vm;
+            // Record (or clear) the graphics session that now owns this VT's
+            // switch handshake. In `VT_PROCESS` the caller becomes the owner we
+            // signal with `relsig`/`acqsig`; `VT_AUTO` relinquishes it.
+            let owner = if vm.mode == VT_PROCESS {
+                current_koid()
+            } else {
+                0
+            };
+            TTY_STATES[vt_clamp(vt)]
+                .vt_owner
+                .store(owner, Ordering::Relaxed);
             Ok(0)
         }
         VT_GETSTATE => {
@@ -369,16 +493,36 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
         }
         VT_ACTIVATE => {
             if data >= 1 && data <= kernel_hal::console::num_vts() {
-                kernel_hal::console::switch_vt(data - 1);
-                crate::fs::devfs::drm::represent_if_owner_active();
+                // Route through the VT_PROCESS handshake: if the current VT is
+                // owned by a graphics session, this defers until it releases.
+                request_vt_switch(data - 1);
             }
             Ok(0)
         }
-        // Switches are synchronous, so the requested VT is already active.
+        // A cooperating switch may still be deferred while the previous owner
+        // releases; our switches otherwise complete synchronously. We don't
+        // block here (no async ioctl context), so report success — the pending
+        // handshake completes shortly via `VT_RELDISP`.
         VT_WAITACTIVE => Ok(0),
-        // No process-driven VT handshake to acknowledge, and our VTs are never
-        // freed; accept the request so X's setup/teardown proceeds.
-        VT_RELDISP | VT_DISALLOCATE => Ok(0),
+        // The graphics session acknowledges a release/acquire request. On a
+        // switch-*from* (a pending switch is waiting): arg 0 refuses and cancels
+        // it, any other value releases and completes it. On a switch-*to*
+        // (`VT_ACKACQ`, nothing pending) it is just an acquire ack — accept it.
+        VT_RELDISP => {
+            let target = VT_SWITCH_PENDING.load(Ordering::Relaxed);
+            if target >= 0 {
+                if data == 0 {
+                    // Refused: abandon the pending switch, stay put.
+                    VT_SWITCH_PENDING.store(-1, Ordering::Relaxed);
+                } else {
+                    VT_SWITCH_PENDING.store(-1, Ordering::Relaxed);
+                    complete_vt_switch(target as usize);
+                }
+            }
+            Ok(0)
+        }
+        // Our VTs are never freed; accept so X's teardown proceeds.
+        VT_DISALLOCATE => Ok(0),
         TIOCSCTTY | TIOCNOTTY => Ok(0),
         // Bytes available to read: the cooked input queue for this VT.
         FIONREAD => {
@@ -642,6 +786,7 @@ fn handle_key_event(event: &InputEvent) {
         && CTRL_DOWN.load(Ordering::SeqCst)
         && LEFT_ALT_DOWN.load(Ordering::SeqCst)
     {
+        // F7 reaches the dedicated graphics VT (tty7); F1..F6 the text consoles.
         let target = match event.code {
             KEY_F1 => Some(0),
             KEY_F2 => Some(1),
@@ -649,15 +794,16 @@ fn handle_key_event(event: &InputEvent) {
             KEY_F4 => Some(3),
             KEY_F5 => Some(4),
             KEY_F6 => Some(5),
+            KEY_F7 => Some(6),
             _ => None,
         };
         if let Some(n) = target {
             if n < kernel_hal::console::num_vts() {
-                kernel_hal::console::switch_vt(n);
-                // If we switched back to the compositor's VT, re-blit its last
-                // frame so it reappears at once (a no-op for a text target,
-                // which the console repaints itself).
-                crate::fs::devfs::drm::represent_if_owner_active();
+                // Route through the VT_PROCESS handshake: when a graphics
+                // session owns the current VT, this sends `relsig` and defers
+                // the switch until the session releases (or a second press
+                // forces it). `request_vt_switch` re-blits on arrival.
+                request_vt_switch(n);
             }
             return;
         }
