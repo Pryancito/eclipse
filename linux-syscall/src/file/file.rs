@@ -1263,7 +1263,9 @@ impl Syscall<'_> {
         } else {
             "OK: waiter armed"
         };
-        // Bounded, LOG=error-visible (klog) trace of the first 32 arm attempts.
+        // Bounded, ERROR-level (always console-visible, same as `einval-hunt`)
+        // trace of the first 32 arm attempts. klog_info did not surface on the
+        // rig's console; the `einval-hunt` error! line does, so match it.
         // The `einval-hunt` sees SYNCOBJ_EVENTFD return EINVAL but not WHY, and
         // this is the compositor's explicit-sync WAIT: wlroots arms one per
         // GPU-client frame to learn when the client's render fence has landed.
@@ -1276,7 +1278,7 @@ impl Syscall<'_> {
             static ARM_TRACE_BUDGET: core::sync::atomic::AtomicU32 =
                 core::sync::atomic::AtomicU32::new(0);
             if ARM_TRACE_BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 32 {
-                kernel_hal::klog_info!(
+                error!(
                     "[drm] SYNCOBJ_EVENTFD pid={} handle={} point={} fd={} live_syncobj={} is_eventfd={} -> {}",
                     self.zircon_process().id(),
                     req.handle,

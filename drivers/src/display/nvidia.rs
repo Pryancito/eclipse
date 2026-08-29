@@ -9886,19 +9886,18 @@ impl NvidiaGpu {
                     );
                     return Err(nv::EOPNOTSUPP);
                 }
-                let pte_kind = nv::gem_pte_kind(req.info.tile_flags);
-                if req.info.tile_flags != 0 && !nv::pte_kind_is_supported(pte_kind) {
-                    crate::klog_warn!(
-                        "[nouveau-uapi] GEM_NEW: unsupported compressed PTE kind {:#04x} \
-                         in tile_flags={:#x} for size={} domain={:#x} \
-                         (sysmem-backed BOs have no comptag support; refusing mismatched layout)",
-                        pte_kind,
-                        req.info.tile_flags,
-                        req.info.size,
-                        req.info.domain
-                    );
-                    return Err(nv::EOPNOTSUPP);
-                }
+                // GEM_NEW does NOT reject a compressed `tile_flags` kind. An
+                // earlier revision did (to give NVK a chance to fall back to an
+                // uncompressed layout at allocation), but the real cause of
+                // GPU-client corruption turned out to be broken explicit-sync
+                // (SYNCOBJ_EVENTFD), NOT compression -- so the reject bought
+                // nothing and risked failing a LIVE GPU client's allocation
+                // (a compositor surface such as lunarbg's wallpaper) that today
+                // renders fine mapped-uncompressed. A compressed kind is still
+                // mapped uncompressed at VM_BIND (the anti-hang fallback); the
+                // real fix for a genuinely-compressed surface is comptag/PLC
+                // support. `record_gem_new` still notes the kind for
+                // /proc/gpudbg.
                 // Back EVERY object with CPU-visible sysmem, even a VRAM/LOCAL
                 // request. NVK asks for a `GART | VRAM` domain for its
                 // DEVICE_LOCAL types (nvkmd_nouveau_mem.c) -- GART is always
