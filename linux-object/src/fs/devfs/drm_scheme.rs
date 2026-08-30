@@ -1505,17 +1505,39 @@ impl INode for DrmDev {
                 Ok(0)
             }
             DRM_IOCTL_DROP_MASTER => {
-                log::debug!(
-                    "[drm] DROP_MASTER (minor={}) — restoring text console",
-                    self.minor
+                // In a seat-managed session (seatd owns tty7 via VT_PROCESS) the
+                // SEAT -- not DRM master -- drives the console KD mode: seatd
+                // already put tty7 into KD_GRAPHICS and will restore text via
+                // its own VT handshake when the session ends. A DROP_MASTER here
+                // is then typically TRANSIENT (wlroots/Xwayland resetting the DRM
+                // backend during renderer fallback -- e.g. "EGL setup failed,
+                // falling back to sw"), not a real relinquish. The old
+                // unconditional set_kd_mode(KD_TEXT) flipped the active graphics
+                // VT (tty7) back to text, which switch_vt_impl(0) reverted to
+                // tty1 -- so the compositor's very first present landed on VT 0
+                // and the desktop never appeared on tty7. Restore text only when
+                // NO seat owns the graphics VT (bare DRM client / QEMU pixman /
+                // Xorg path), where this mechanism is the only one in play.
+                let seat_owned = crate::fs::stdio::graphics_vt_seat_owned();
+                kernel_hal::klog_info!(
+                    "[drm] DROP_MASTER (minor={}) seat_owned={} -- {}",
+                    self.minor,
+                    seat_owned,
+                    if seat_owned {
+                        "seat drives KD mode, NOT restoring text"
+                    } else {
+                        "restoring text console"
+                    }
                 );
-                kernel_hal::console::set_kd_mode(kernel_hal::console::KD_TEXT);
-                // Compositor relinquished the display: forget its VT ownership
-                // so text consoles are no longer gated off screen/input, and
-                // drop its atomic-client negotiation so the next (possibly
-                // legacy-only) client starts with a clean property view.
-                // Also cancel any deferred flip/vblank events — a late timer
-                // would otherwise feed drmHandleEvent with freed user_data.
+                if !seat_owned {
+                    kernel_hal::console::set_kd_mode(kernel_hal::console::KD_TEXT);
+                }
+                // Forget the compositor's DRM VT ownership so text consoles are
+                // no longer gated off screen/input, and drop its atomic-client
+                // negotiation so the next (possibly legacy-only) client starts
+                // with a clean property view. Also cancel any deferred
+                // flip/vblank events — a late timer would otherwise feed
+                // drmHandleEvent with freed user_data.
                 drm::clear_graphics_owner();
                 drm::cancel_pending_events();
                 drm::set_atomic_client(false);

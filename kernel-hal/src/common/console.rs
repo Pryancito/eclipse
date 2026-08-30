@@ -283,7 +283,15 @@ cfg_if! {
                 if n >= v.len() {
                     return;
                 }
-                ACTIVE_VT.store(n, Ordering::SeqCst);
+                let prev = ACTIVE_VT.swap(n, Ordering::SeqCst);
+                // klog (survives LOG=error): ground truth for EVERY active-VT
+                // change, including the internal ones that bypass the VT ioctl
+                // path (set_kd_mode's KD_TEXT-on-graphics-VT revert). A desktop
+                // that lands on the wrong VT shows up here as an unexpected
+                // `-> 0` right after the switch to the graphics VT.
+                if prev != n {
+                    crate::klog_info!("[vt] switch_vt_impl {} -> {}", prev, n);
+                }
                 if kd_mode_vt(n) == KD_TEXT {
                     if let Some(mut g) = v[n].try_lock() {
                         g.repaint();
