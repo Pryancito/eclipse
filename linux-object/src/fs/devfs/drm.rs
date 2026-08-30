@@ -1095,6 +1095,9 @@ pub fn page_flip(fb_id: u32, crtc_id: u32, user_data: u64) -> Result<(), FlipErr
     if FLIP_EVENT_PENDING.load(Ordering::Acquire) {
         flush_pending_flip_completions();
         if FLIP_EVENT_PENDING.load(Ordering::Acquire) {
+            clear_stale_flip_pending();
+        }
+        if FLIP_EVENT_PENDING.load(Ordering::Acquire) {
             // Should not reach here after the atomic set-and-push fix in
             // schedule_flip_event, but keep as a safety net. Returning EBUSY
             // here is a last resort; the alternative (proceeding with
@@ -1216,6 +1219,22 @@ fn flush_pending_flip_completions() {
     // PENDING_DRM_TIMERS guard above is already dropped, so no nested lock.
     for (crtc_id, user_data) in flips {
         queue_flip_event(crtc_id, user_data);
+    }
+}
+
+/// Self-heal a stale "flip pending" latch.
+///
+/// A true pending flag with no queued flip is inconsistent and can make
+/// userspace see a persistent EBUSY, which wlroots escalates into output
+/// teardown. If no queued flip exists, clear the latch and continue.
+fn clear_stale_flip_pending() {
+    let has_queued_flip = {
+        let q = PENDING_DRM_TIMERS.lock();
+        q.iter()
+            .any(|job| matches!(job, PendingDrmTimer::Flip { .. }))
+    };
+    if !has_queued_flip {
+        FLIP_EVENT_PENDING.store(false, Ordering::Release);
     }
 }
 
@@ -1688,6 +1707,9 @@ pub fn atomic_commit(
     // EBUSY is a safety net that should not trigger in normal operation.
     if want_event && FLIP_EVENT_PENDING.load(Ordering::Acquire) {
         flush_pending_flip_completions();
+        if FLIP_EVENT_PENDING.load(Ordering::Acquire) {
+            clear_stale_flip_pending();
+        }
         if FLIP_EVENT_PENDING.load(Ordering::Acquire) {
             return Err(AtomicError::Busy);
         }
