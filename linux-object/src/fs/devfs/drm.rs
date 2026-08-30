@@ -718,6 +718,30 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     if blit_w == 0 || blit_h == 0 {
         return true;
     }
+    // Real-hardware GL/NVK clients render into nouveau GEM_NEW buffers that the
+    // CPU-blit present path then READS back through the kernel physmap alias.
+    // That alias is write-back cached, so without a FromDevice sync it can keep
+    // stale lines from the previous frame and the screen stops repainting or
+    // shows torn/old pixels even though the GPU finished rendering. Imported
+    // dumb buffers stay on the old path: they are CPU-written, not GPU-DMA'd.
+    if zcore_drivers::scheme::gem_mmap::lookup(fb.gem_handle_id).is_some() {
+        let sync_start_px = (blit_y as usize)
+            .saturating_mul(src_stride)
+            .saturating_add(blit_x as usize);
+        let sync_end_px = (blit_y as usize)
+            .saturating_add((blit_h as usize).saturating_sub(1))
+            .saturating_mul(src_stride)
+            .saturating_add(blit_x as usize)
+            .saturating_add(blit_w as usize);
+        if sync_end_px > sync_start_px {
+            let byte_off = sync_start_px.saturating_mul(4).min(fb.size);
+            let byte_len = sync_end_px
+                .saturating_sub(sync_start_px)
+                .saturating_mul(4)
+                .min(fb.size.saturating_sub(byte_off));
+            zcore_drivers::utils::dma_sync::dma_sync_wb_from_device(vaddr + byte_off, byte_len);
+        }
+    }
     // CE-offloaded present: copy the dumb buffer (sysmem) into the scanout FB
     // (the console GPU's VRAM) with the GPU copy engine instead of a CPU
     // memcpy over PCIe. A flat CE copy needs equal strides, so only when the
