@@ -1897,6 +1897,29 @@ NV_STATUS eclipse_rm_step17(NvU32 gpuInstance, EclipseGrChannel *pOut)
         if (pOut->computeStatus != NV_OK) { failed = NV_TRUE; goto done; }
     }
 
+    /* 7b. TURING_A (3D) on the step17 channel too. This is the ctx-0 channel
+     * that FALLBACK clients (no free ctx slot, or a rejected wrong-GPU alloc)
+     * end up submitting on; without a graphics object its first 3D restore
+     * would wedge FECS -- and with it, the RM maps+promotes the GRAPHICS
+     * global ctx buffers for this channel as well (loudly, now that map
+     * failures propagate). Best-effort: a failure is traced but does not fail
+     * step17 (the compositor itself never draws 3D). */
+    {
+        NV_GR_ALLOCATION_PARAMETERS params;
+        NvU32 h3d = 0;
+        NV_STATUS st3d;
+        portMemSet(&params, 0, sizeof(params));
+        params.version = 2;
+        params.size = sizeof(params);
+        st3d = clientGenResourceHandle(pRsClient, &h3d);
+        if (st3d == NV_OK)
+            st3d = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache.hClient,
+                                           pOut->hChannel, h3d,
+                                           TURING_A, &params, sizeof(params));
+        nv_printf(0, "[eclipse-rm-trace] step17: TURING_A(3D) -> 0x%x h3d=0x%x\n",
+                  st3d, h3d);
+    }
+
     /* 8. Put the channel on the runlist. */
     {
         NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS params;
