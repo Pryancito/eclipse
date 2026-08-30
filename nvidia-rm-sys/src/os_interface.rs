@@ -771,7 +771,20 @@ fn log_raw_cstr(str_: *const c_char) {
                     core::sync::atomic::AtomicU64::new(0);
                 LAST_ASSERT_HASH.swap(h, Ordering::Relaxed) != h
             };
-            if LIVE_ECHO.load(Ordering::Relaxed) || xid || assert_fresh {
+            // Also always at ERROR: Eclipse's GR bring-up diagnostics, tagged
+            // "ECLIPSE-GR" (golden-image creation in kernel_graphics.c, global
+            // ctx-buffer mapping in kernel_graphics_context.c). Those fire during
+            // GR StateLoad / the first client's PROMOTE_CTX -- outside any
+            // live_echo or capture window -- so at the default LOG level they
+            // were demoted to DEBUG and dropped, right along with the routine
+            // GSP narration, leaving the FECS-RESTORE-hang investigation blind
+            // (the single line that says whether the GRAPHICS golden image was
+            // created, and whether the global ctx buffers were mapped to the
+            // channel VAS, never reached dmesg). Promote exactly these tagged
+            // lines: they are a handful per boot -- one golden verdict plus four
+            // ctx-buffer map results per client -- not a flood.
+            let eclipse_diag = s.contains("ECLIPSE-GR");
+            if LIVE_ECHO.load(Ordering::Relaxed) || xid || assert_fresh || eclipse_diag {
                 if assert_fresh {
                     log::error!("[nvidia-rm] {} (identical repeats suppressed)", s);
                 } else {

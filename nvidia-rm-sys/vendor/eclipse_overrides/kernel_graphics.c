@@ -484,6 +484,19 @@ _kgraphicsPostSchedulingEnableHandler
     KernelGraphics *pKernelGraphics = GPU_GET_KERNEL_GRAPHICS(pGpu, ((NvU32)(NvUPtr)pGrIndex));
     const KGRAPHICS_STATIC_INFO *pKernelGraphicsStaticInfo = kgraphicsGetStaticInfo(pGpu, pKernelGraphics);
 
+    // ECLIPSE: prove this handler actually runs, and on which client model,
+    // BEFORE any early return below. This is the first "ECLIPSE-GR" line of a
+    // boot, so it doubles as a build-freshness marker: if it is ABSENT from a
+    // repro's dmesg, the tested binary predates the GR-diagnostics work (and
+    // every "the golden image was/wasn't created" conclusion is untrustworthy);
+    // if it is PRESENT, the SKIPPED / DEFERRED / CreateGoldenImageChannel
+    // verdict lines that follow are trustworthy. gspClient=1 is the expected
+    // value on Turing (GSP-RM) -- gspClient=0 would mean the golden image is
+    // created on the GSP side, not here, and this whole path is moot.
+    NV_PRINTF(LEVEL_ERROR,
+              "ECLIPSE-GR golden: handler ENTER (gspClient=%u grIndex=%u)\n",
+              (NvU32)(IS_GSP_CLIENT(pGpu) ? 1u : 0u),
+              (NvU32)(NvUPtr)pGrIndex);
 
     // Nothing to do for non-GSPCLIENT
     if (!IS_GSP_CLIENT(pGpu) && !kgraphicsIsBug4208224WARNeeded_HAL(pGpu, pKernelGraphics))
