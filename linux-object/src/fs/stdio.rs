@@ -769,13 +769,18 @@ lazy_static! {
             .map(|i| Arc::new(Stdin::new(i)))
             .collect();
 
-        // UART input goes to the active VT.
+        // UART input goes to the serial-bound VT (the active VT in text mode,
+        // or tty1 while the desktop holds the graphics VT -- see serial_stdin).
         if let Some(uart) = kernel_hal::drivers::all_uart().first() {
             uart.clone().subscribe(
                 Box::new(move |_| {
                     while let Some(c) = uart.try_recv().unwrap_or(None) {
                         trace!("UART received byte: 0x{:02x}", c);
-                        active_stdin().push(c as char);
+                        // Route serial input to the serial-bound VT, not the raw
+                        // active VT: while the desktop holds the graphics VT the
+                        // active VT is the compositor's, so serial keystrokes
+                        // must reach the text shell (tty1) instead.
+                        serial_stdin().push(c as char);
                     }
                 }),
                 false,
@@ -801,6 +806,13 @@ lazy_static! {
 /// Stdin of the currently active virtual terminal.
 fn active_stdin() -> Arc<Stdin> {
     STDINS[vt_clamp(kernel_hal::console::active_vt())].clone()
+}
+
+/// Stdin of the VT the serial line is bound to (see `console::serial_vt`): the
+/// active VT in text mode, or `tty1` while the desktop holds the graphics VT, so
+/// serial keystrokes reach the text shell instead of the compositor.
+fn serial_stdin() -> Arc<Stdin> {
+    STDINS[vt_clamp(kernel_hal::console::serial_vt())].clone()
 }
 
 /// Stdin of a specific virtual terminal.

@@ -491,10 +491,42 @@ pub fn vt_write_fmt(vt: usize, fmt: Arguments) {
     vt_write_fmt_impl(vt, fmt);
 }
 
+/// The VT the serial line is bound to for a text shell.
+///
+/// Normally the active VT, so the serial log mirrors what is on screen. But
+/// NEVER the graphics VT: once a compositor puts the reserved graphics VT
+/// (`tty7`) into `KD_GRAPHICS` and the display follows it, that VT carries the
+/// desktop's framebuffer, not a text shell -- binding serial to it silences the
+/// line entirely (UART input would go to the compositor, and the only output
+/// mirrored would be the graphics VT's, which never writes text). Fall back to
+/// `tty1` (index 0), which backs `/dev/console`'s shell, so the serial UART
+/// stays a usable text console while the desktop runs on screen. In pure text
+/// mode this is just `active_vt()`, so serial still follows VT switches there.
+pub fn serial_vt() -> usize {
+    #[cfg(feature = "graphic")]
+    {
+        let a = active_vt();
+        // The reserved graphics VT (tty7) is the ONLY VT with no login shell
+        // (see zCore/src/main.rs). Whenever it is foreground -- the desktop is on
+        // screen -- bind serial to tty1's shell instead, independent of KD-mode
+        // timing during compositor start/teardown. Any other (text) VT is the
+        // active terminal itself, so serial still follows VT switches there.
+        if a == GRAPHICS_VT {
+            return 0;
+        }
+        a
+    }
+    #[cfg(not(feature = "graphic"))]
+    {
+        0
+    }
+}
+
 /// Write a string to VT `vt`: always to its graphic console, and to the serial
-/// port when `vt` is the active terminal (so the serial log mirrors the screen).
+/// port when `vt` is the serial-bound terminal (see [`serial_vt`]) -- the active
+/// VT in text mode, or `tty1` while the desktop holds the graphics VT.
 pub fn vt_console_write_str(vt: usize, s: &str) {
-    if vt == active_vt() {
+    if vt == serial_vt() {
         serial_write_str(s);
     }
     vt_write_str(vt, s);
