@@ -72,6 +72,7 @@
 #include "class/cl0040.h"      /* NV01_MEMORY_LOCAL_USER */
 #include "class/cl50a0.h"      /* NV50_MEMORY_VIRTUAL */
 #include "class/clc5c0.h"      /* TURING_COMPUTE_A */
+#include "class/clc597.h"      /* TURING_A (3D) -- graphics golden-context prime */
 #include "alloc/alloc_channel.h" /* NV_CHANNEL_ALLOC_PARAMS */
 #include "ctrl/ctrla06f.h"     /* NVA06F_CTRL_CMD_GPFIFO_SCHEDULE */
 #include "ctrl/ctrl906f.h"     /* NV906F_CTRL_CMD_GET_MMU_FAULT_INFO */
@@ -2423,8 +2424,11 @@ static NvBool g_grLaunchDone = NV_FALSE;
 
 #define ECLIPSE_LAUNCH_HOST_SEM_OFF 0x8000
 #define ECLIPSE_LAUNCH_ENG_SEM_OFF  0x8040
+/* Graphics (3D class) report semaphore used by ctx_prime's second stage. */
+#define ECLIPSE_LAUNCH_GR_SEM_OFF   0x8080
 #define ECLIPSE_LAUNCH_HOST_PAYLOAD 0x0EC11B5E
 #define ECLIPSE_LAUNCH_ENG_PAYLOAD  0x600DC0DE
+#define ECLIPSE_LAUNCH_GR_PAYLOAD   0x3DC0FFEE
 #define ECLIPSE_LAUNCH_POLL_MS      3000
 
 #define ECLIPSE_PUSH_HDR(subch, mthd, count)                       \
@@ -8227,7 +8231,8 @@ NV_STATUS eclipse_rm_ctx_prime(NvU32 gpuInstance, NvU32 ctxIdx)
     NvU64 bufGpuVA;
     NvU32 workToken = 0, runlistId = 0;
     NvBool engLanded = NV_FALSE;
-    NvU32 engVal = 0, i = 0;
+    NvBool grLanded = NV_FALSE;
+    NvU32 engVal = 0, grVal = 0, i = 0;
     const NvU32 primeTimeoutMs = 500;
 
     if (ctxIdx == 0 || ctxIdx >= ECLIPSE_MAX_CTX)
@@ -8323,10 +8328,12 @@ NV_STATUS eclipse_rm_ctx_prime(NvU32 gpuInstance, NvU32 ctxIdx)
         volatile Nvc46fControl *pUserd = (volatile Nvc46fControl *)pUserdCpu;
         NvU64 semHostVA = bufGpuVA + ECLIPSE_LAUNCH_HOST_SEM_OFF;
         NvU64 semEngVA  = bufGpuVA + ECLIPSE_LAUNCH_ENG_SEM_OFF;
+        NvU64 semGrVA   = bufGpuVA + ECLIPSE_LAUNCH_GR_SEM_OFF;
         NvU32 n = 0, put, gpEntry0, gpEntry1;
 
         pb[ECLIPSE_LAUNCH_HOST_SEM_OFF / 4] = 0;
         pb[ECLIPSE_LAUNCH_ENG_SEM_OFF / 4]  = 0;
+        pb[ECLIPSE_LAUNCH_GR_SEM_OFF / 4]   = 0;
 
         pb[n++] = ECLIPSE_PUSH_HDR(0, NVC46F_SEM_ADDR_LO, 5);
         pb[n++] = NvU64_LO32(semHostVA);
@@ -8346,6 +8353,28 @@ NV_STATUS eclipse_rm_ctx_prime(NvU32 gpuInstance, NvU32 ctxIdx)
         pb[n++] = ECLIPSE_LAUNCH_ENG_PAYLOAD;
         pb[n++] = DRF_DEF(C5C0, _SET_REPORT_SEMAPHORE_D, _OPERATION, _RELEASE) |
                   DRF_DEF(C5C0, _SET_REPORT_SEMAPHORE_D, _STRUCTURE_SIZE, _ONE_WORD);
+
+        /* Stage 2: GRAPHICS golden context. A real-RTX dmesg showed a client
+         * whose COMPUTE prime succeeded and whose first 3D draw still hung
+         * FECS mid-RESTORE (CTXSW_STATUS=0x2 MAILBOX0=0x4 PRIV_ERR=0, GR
+         * idle, PBDMA drained): the compute golden context does not exercise
+         * the graphics half of the context image, so Mesa's very first
+         * SET_OBJECT(TURING_A) still triggered the cold graphics ctx-switch
+         * -- and that is where it wedges. Load it HERE instead, on the same
+         * kernel-authored stream, subchannel 0 (the 3D subchannel, exactly
+         * what NVK's first push does), with its own report semaphore so the
+         * poll below proves the GRAPHICS engine context-switched in. If this
+         * stage times out, the failure happens at CHANNEL_ALLOC time under a
+         * bounded, logged, recoverable prime instead of inside the client's
+         * first draw. */
+        pb[n++] = ECLIPSE_PUSH_HDR(0, NVC46F_SET_OBJECT, 1);
+        pb[n++] = TURING_A;
+        pb[n++] = ECLIPSE_PUSH_HDR(0, NVC597_SET_REPORT_SEMAPHORE_A, 4);
+        pb[n++] = DRF_NUM(C597, _SET_REPORT_SEMAPHORE_A, _OFFSET_UPPER, NvU64_HI32(semGrVA));
+        pb[n++] = NvU64_LO32(semGrVA);
+        pb[n++] = ECLIPSE_LAUNCH_GR_PAYLOAD;
+        pb[n++] = DRF_DEF(C597, _SET_REPORT_SEMAPHORE_D, _OPERATION, _RELEASE) |
+                  DRF_DEF(C597, _SET_REPORT_SEMAPHORE_D, _STRUCTURE_SIZE, _ONE_WORD);
 
         put = pUserd->GPPut % ECLIPSE_CHAN_GPFIFO_ENTRIES;
         gpEntry0 = DRF_DEF(906F, _GP_ENTRY0, _NO_CONTEXT_SWITCH, _FALSE) |
@@ -8368,10 +8397,15 @@ NV_STATUS eclipse_rm_ctx_prime(NvU32 gpuInstance, NvU32 ctxIdx)
         if (status != NV_OK) goto prime_report;
     }
 
-    /* 5. Poll the ENGINE semaphore -- it lands only after the compute engine
-     *    context-switched in and loaded the golden context. */
+    /* 5. Poll BOTH engine semaphores. The compute one lands after the compute
+     *    engine context-switched in (compute golden context loaded); the
+     *    graphics one lands only after the 3D class context-switched in too --
+     *    the stage whose absence let Mesa's first draw hit the cold graphics
+     *    ctx-switch and hang FECS mid-RESTORE. Each gets its own full window
+     *    (a cold graphics load is the expensive one). */
     {
         volatile NvU32 *pEngSem = (volatile NvU32 *)(pBufCpu + ECLIPSE_LAUNCH_ENG_SEM_OFF);
+        volatile NvU32 *pGrSem  = (volatile NvU32 *)(pBufCpu + ECLIPSE_LAUNCH_GR_SEM_OFF);
         for (i = 0; i < primeTimeoutMs; i++)
         {
             if (*pEngSem == ECLIPSE_LAUNCH_ENG_PAYLOAD)
@@ -8383,10 +8417,23 @@ NV_STATUS eclipse_rm_ctx_prime(NvU32 gpuInstance, NvU32 ctxIdx)
         }
         engVal = *pEngSem;
         nv_printf(0, "[eclipse-rm-trace] ctx%u: prime eng sem %s (val=%#x expected=%#x @%u ms)\n",
-                  ctxIdx, engLanded ? "OK -- golden context loaded" : "TIMEOUT",
+                  ctxIdx, engLanded ? "OK -- compute golden context loaded" : "TIMEOUT",
                   engVal, ECLIPSE_LAUNCH_ENG_PAYLOAD, i);
+        for (i = 0; i < primeTimeoutMs; i++)
+        {
+            if (*pGrSem == ECLIPSE_LAUNCH_GR_PAYLOAD)
+            {
+                grLanded = NV_TRUE;
+                break;
+            }
+            os_delay_us(1000);
+        }
+        grVal = *pGrSem;
+        nv_printf(0, "[eclipse-rm-trace] ctx%u: prime 3D sem %s (val=%#x expected=%#x @%u ms)\n",
+                  ctxIdx, grLanded ? "OK -- GRAPHICS golden context loaded" : "TIMEOUT",
+                  grVal, ECLIPSE_LAUNCH_GR_PAYLOAD, i);
     }
-    status = engLanded ? NV_OK : NV_ERR_TIMEOUT;
+    status = (engLanded && grLanded) ? NV_OK : NV_ERR_TIMEOUT;
 
 prime_report:
     if (pBufCpu != NULL)
