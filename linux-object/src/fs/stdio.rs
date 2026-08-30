@@ -394,6 +394,16 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             // switching the console to graphics mode, which is exactly the step
             // an X server (TinyX/Xorg) performs to seize the display.
             let mode = data as u32;
+            // Once-per-session VT diagnostic. seatd drives KD_GRAPHICS through
+            // /dev/tty0, which now resolves to the active VT: this line should
+            // show the graphics mode landing on the graphics VT (tty7 == 6),
+            // not VT 0. `active` is the foreground VT at the time of the call.
+            warn!(
+                "[vt] KDSETMODE vt={} mode={:#x} (active={})",
+                vt,
+                mode,
+                kernel_hal::console::active_vt()
+            );
             console::set_kd_mode_vt(vt, mode);
             Ok(0)
         }
@@ -476,6 +486,19 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             TTY_STATES[vt_clamp(vt)]
                 .vt_owner
                 .store(owner, Ordering::Relaxed);
+            // Once-per-session VT diagnostic. This is the load-bearing call: in
+            // VT_PROCESS mode seatd becomes the switch-handshake owner of `vt`.
+            // With /dev/tty0 resolving to the active VT, `vt` must be the
+            // graphics VT (tty7 == 6) so `complete_vt_switch` can deliver acqsig
+            // back to seatd and libseat activates the compositor. owner=0 means
+            // VT_AUTO (relinquished).
+            warn!(
+                "[vt] VT_SETMODE vt={} mode={} owner={:#x} (active={})",
+                vt,
+                vm.mode,
+                owner,
+                kernel_hal::console::active_vt()
+            );
             Ok(0)
         }
         VT_GETSTATE => {
@@ -1965,6 +1988,81 @@ impl INode for Stdin {
             rdev: make_rdev(4, self.vt + 1),
         })
     }
+}
+
+/// `/dev/tty0` and `/dev/console` — Linux's "current VT" control nodes. Unlike a
+/// fixed `/dev/ttyN`, their VT-management ioctls must act on the **active** VT.
+///
+/// This matters for the graphical session. `seatd` (the seat manager `libseat`
+/// talks to) does ALL of its VT management — `VT_SETMODE(VT_PROCESS)`,
+/// `KDSETMODE(KD_GRAPHICS)`, `VT_RELDISP` — through `/dev/tty0`. When that node
+/// was backed by the first VT's stdin (a FIXED `vt = 0`), every one of those
+/// ioctls landed on VT 0 instead of the active graphics VT (`tty7`):
+///
+///  * `VT_SETMODE(VT_PROCESS)` registered the switch-handshake owner on VT 0, so
+///    `complete_vt_switch(tty7)` delivered `acqsig` to `vt_owner(tty7) == 0` —
+///    nobody. `seatd` never learned its session had become active, and `libseat`
+///    kept the compositor PAUSED: `labwc` started and its Wayland clients
+///    connected, but it never presented a frame to DRM (reproduced in QEMU: a
+///    full session bring-up with ZERO `[drm] first present`).
+///  * `KDSETMODE(KD_GRAPHICS)` on VT 0 while `tty7` was active flipped the
+///    display back to the text VT (see `set_kd_mode_vt`), and left the keyboard
+///    cooking gate keyed off the wrong VT's mode.
+///
+/// Routing these two nodes' ioctls through [`active_vt`](kernel_hal::console::active_vt)
+/// makes `seatd`'s VT ops land on the real foreground VT, exactly like Linux's
+/// `/dev/tty0`. Reads and writes still go to the inner (fixed) stdin, so the
+/// boot console is byte-for-byte unchanged — only the ioctl target follows the
+/// active VT.
+struct CurrentVtTty {
+    inner: Arc<Stdin>,
+}
+
+impl INode for CurrentVtTty {
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+        self.inner.read_at(offset, buf)
+    }
+
+    fn write_at(&self, offset: usize, buf: &[u8]) -> Result<usize> {
+        self.inner.write_at(offset, buf)
+    }
+
+    fn poll(&self) -> Result<PollStatus> {
+        self.inner.poll()
+    }
+
+    fn async_poll<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<PollStatus>> + Send + Sync + 'a>> {
+        self.inner.async_poll()
+    }
+
+    fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
+        // THE fix: a "current VT" control node resolves its ioctls to the
+        // active VT, never a fixed one. Before a graphical session switches
+        // away from tty1 this is still VT 0 (active_vt() == 0), so early boot
+        // is unchanged; once the session lands on tty7 seatd's VT_SETMODE /
+        // KDSETMODE / VT_RELDISP correctly target it.
+        tty_ioctl(kernel_hal::console::active_vt(), cmd, data)
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        // Delegate identity to the inner stdin so any `downcast::<Stdin>()`
+        // against `/dev/tty0`/`/dev/console` keeps working as before.
+        self.inner.as_any_ref()
+    }
+
+    fn metadata(&self) -> Result<Metadata> {
+        self.inner.metadata()
+    }
+}
+
+/// The `/dev/tty0` and `/dev/console` control node: I/O backed by the first VT's
+/// stdin, but VT-management ioctls follow the active VT (see [`CurrentVtTty`]).
+pub fn current_vt_tty() -> Arc<dyn INode> {
+    Arc::new(CurrentVtTty {
+        inner: STDINS[0].clone(),
+    })
 }
 
 impl INode for Stdout {
