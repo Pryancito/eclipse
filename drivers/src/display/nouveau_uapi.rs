@@ -235,6 +235,17 @@ pub(super) fn record_prime(ctx_idx: u32, line: alloc::string::String) {
     }
 }
 
+/// The recorded `ctx_prime` line for `ctx_idx`, if any. Used by the GR-hang
+/// probe so a fence-timeout snapshot names, inline, whether the hanging ctx was
+/// ever primed -- the decisive datum when the probe shows a FECS RESTORE hang.
+pub(super) fn prime_line_for(ctx_idx: u32) -> Option<alloc::string::String> {
+    LAST_PRIME
+        .lock()
+        .iter()
+        .find(|(c, _)| *c == ctx_idx)
+        .map(|(_, l)| l.clone())
+}
+
 /// `/proc/gpudbg` section: persistent `ctx_prime` golden-context outcomes. This
 /// is the decisive fork for a FECS ctx-switch hang, and survives the client's
 /// draws (which overwrite the last-EXEC slot).
