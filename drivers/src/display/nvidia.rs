@@ -7929,6 +7929,26 @@ impl NvidiaGpu {
         // processes' ctx_idx_for_pid / EXEC are not stalled behind it.
         drop(map);
 
+        // Persist "prime STARTED" BEFORE the call. A real-RTX repro showed a
+        // fence timeout on a ctx that had NO prime record at all -- which this
+        // code cannot produce unless ctx_prime never returned (blocked inside
+        // the RM while another thread of the same client raced past the
+        // registry map-hit above straight to EXEC on the unprimed channel), or
+        // the record was lost some other way. With this start-marker, a stuck
+        // prime is directly visible in /proc/gpudbg as a line that still says
+        // STARTED; the outcome record below replaces it when the call returns.
+        // `dev` names the RM device instance so a cross-GPU slot collision
+        // (the C-side g_ctxAlloc cache is global, the Rust pid registry is
+        // per-GPU -- this box has TWO RTX cards) is visible too.
+        nv::record_prime(
+            ctx_idx,
+            alloc::format!(
+                "ctx={} pid={} PRIME STARTED on rm-device {} (if this line persists, ctx_prime never returned)",
+                ctx_idx,
+                owner_pid,
+                dev
+            ),
+        );
         // Prime this context's compute golden context up front. On RTX, NVK's
         // very first push otherwise triggers the cold golden-context load, which
         // hangs the PBDMA before it reaches NVK's fence (seen as GPGet=1 GPPut=2,
@@ -7964,7 +7984,7 @@ impl NvidiaGpu {
         nv::record_prime(
             ctx_idx,
             alloc::format!(
-            "ctx={} pid={} PRIME {} (NV_STATUS={:#x}){}",
+            "ctx={} pid={} PRIME {} on rm-device {} (NV_STATUS={:#x}){}",
             ctx_idx,
             owner_pid,
             if prime == 0 {
@@ -7972,6 +7992,7 @@ impl NvidiaGpu {
             } else {
                 "TIMEOUT/FAIL -- first draw will cold-load"
             },
+            dev,
             prime,
             if prime == 0 {
                 ""
@@ -9725,9 +9746,22 @@ impl NvidiaGpu {
                                 );
                             }
 
+                            // Whether THIS ctx was ever primed: the decisive
+                            // datum for a FECS RESTORE hang. "never recorded"
+                            // here means the EXEC ran on a ctx whose build/prime
+                            // path did not complete -- the exact anomaly a real
+                            // RTX repro exhibited (ctx=3 hung with no prime
+                            // line at all).
+                            let prime_state = nv::prime_line_for(ctx_idx)
+                                .unwrap_or_else(|| {
+                                    alloc::string::String::from(
+                                        "NEVER RECORDED -- this ctx reached EXEC without its build/prime completing",
+                                    )
+                                });
                             nv::record_gr_hang_probe(alloc::format!(
                                 "ctx={ctx} pid={pid} fence TIMEOUT after {ms}ms\n\
                                  HINT: {hint}\n\
+                                 prime-state: {prime_state}\n\
                                  submit: work_token={work_token:#010x} runlist_id={runlist_id} ch_id={ch_id}\n\
                                  GR_STATUS(0x400700)={gr_status:#010x} (0=idle)\n\
                                  TRAPPED_ADDR(0x400704)={gr_trap_addr:#010x} subchan={gr_subchan} method={gr_method:#06x}\n\
