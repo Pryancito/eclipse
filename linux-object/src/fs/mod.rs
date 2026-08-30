@@ -595,14 +595,18 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     devfs_root
         .add("tty", stdio::STDIN.clone())
         .expect("failed to mknod /dev/tty");
-    // `/dev/tty0` (current VT) and `/dev/console`: an X server opens `/dev/tty0`
-    // to query/allocate a VT (VT_OPENQRY) and `deallocvt` opens the console to
-    // release it. The VT-management ioctls consult the active VT internally, so
-    // backing both by the first VT's stdin is sufficient.
-    if let Err(e) = devfs_root.add("tty0", stdio::vt_stdin(0)) {
+    // `/dev/tty0` (current VT) and `/dev/console`: an X server / seatd opens
+    // `/dev/tty0` to query/allocate a VT (VT_OPENQRY) and to drive the whole
+    // VT-switch handshake (VT_SETMODE(VT_PROCESS), KDSETMODE, VT_RELDISP).
+    // Those ioctls MUST act on the active VT, not a fixed one, or seatd
+    // registers its handshake owner on VT 0 while the compositor lives on tty7
+    // and libseat never activates the session (labwc runs but never presents).
+    // `current_vt_tty()` backs both nodes by the first VT's stdin for I/O but
+    // routes their ioctls through the active VT — Linux's `/dev/tty0` semantics.
+    if let Err(e) = devfs_root.add("tty0", stdio::current_vt_tty()) {
         warn!("failed to mknod /dev/tty0: {:?}", e);
     }
-    if let Err(e) = devfs_root.add("console", stdio::vt_stdin(0)) {
+    if let Err(e) = devfs_root.add("console", stdio::current_vt_tty()) {
         warn!("failed to mknod /dev/console: {:?}", e);
     }
     // One device node per virtual terminal: /dev/tty1 .. /dev/ttyN.
