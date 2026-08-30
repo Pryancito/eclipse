@@ -102,6 +102,25 @@ fn parse_srcs_mk(nvidia_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         if rel.contains("arch/nvalloc/unix/src/") {
             continue;
         }
+        // Eclipse-patched RM sources. The submodule stays PRISTINE upstream
+        // (NVIDIA remote; local edits there would never reach another clone),
+        // so files Eclipse must modify are copied to vendor/eclipse_overrides/
+        // -- tracked by the main repo -- and compiled INSTEAD of the submodule
+        // copy. Currently: kernel_graphics.c + kernel_graphics_context.c carry
+        // the loud golden-image / global-ctx-buffer-map diagnostics and the
+        // propagate-map-failure fix (FECS-RESTORE hang investigation). The
+        // include search path is identical, so they compile unchanged apart
+        // from the marked ECLIPSE edits.
+        if rel.ends_with("src/kernel/gpu/gr/kernel_graphics.c") {
+            files.push(std::path::PathBuf::from("vendor/eclipse_overrides/kernel_graphics.c"));
+            continue;
+        }
+        if rel.ends_with("src/kernel/gpu/gr/kernel_graphics_context.c") {
+            files.push(std::path::PathBuf::from(
+                "vendor/eclipse_overrides/kernel_graphics_context.c",
+            ));
+            continue;
+        }
         files.push(nvidia_dir.join(rel));
     }
     files
@@ -333,5 +352,7 @@ fn build_first_real_nvidia_file() {
     println!("cargo:rerun-if-changed=vendor/glue.c");
     println!("cargo:rerun-if-changed=vendor/rm_boundary_stubs.c");
     println!("cargo:rerun-if-changed=vendor/eclipse_rm_init.c");
+    println!("cargo:rerun-if-changed=vendor/eclipse_overrides/kernel_graphics.c");
+    println!("cargo:rerun-if-changed=vendor/eclipse_overrides/kernel_graphics_context.c");
     println!("cargo:rerun-if-changed=vendor/eclipse_rm_mem.c");
 }
