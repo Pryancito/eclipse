@@ -194,6 +194,19 @@ fn vt_owner(vt: usize) -> u64 {
     TTY_STATES[vt_clamp(vt)].vt_owner.load(Ordering::Relaxed)
 }
 
+/// True when a graphics session (seatd/libseat) owns the reserved graphics VT
+/// (`tty7`) via `VT_SETMODE(VT_PROCESS)`. In that case the seat -- not the DRM
+/// master mechanism -- drives the console's KD mode and VT switching (seatd
+/// issues `KDSETMODE`/`VT_RELDISP` on the VT), so the DRM `DROP_MASTER`
+/// console-restore must NOT independently flip the graphics VT back to text:
+/// on real hardware a transient `DROP_MASTER` during wlroots/Xwayland renderer
+/// fallback fired `set_kd_mode(KD_TEXT)` on the active graphics VT, which
+/// `switch_vt_impl(0)` reverted to tty1 -- so the compositor's first present
+/// landed on VT 0 and the desktop never showed on tty7.
+pub fn graphics_vt_seat_owned() -> bool {
+    vt_owner(kernel_hal::console::GRAPHICS_VT) != 0
+}
+
 /// KoID of the calling process, or 0 if it can't be resolved. Used to record
 /// the owner of a VT when it enters `VT_PROCESS` mode.
 fn current_koid() -> u64 {
