@@ -1095,10 +1095,10 @@ pub fn page_flip(fb_id: u32, crtc_id: u32, user_data: u64) -> Result<(), FlipErr
     if FLIP_EVENT_PENDING.load(Ordering::Acquire) {
         flush_pending_flip_completions();
         if FLIP_EVENT_PENDING.load(Ordering::Acquire) {
-            // Nothing was queued to flush yet the flag is still set: the prior
-            // completion is already on the fd, unread (a narrow set-before-
-            // enqueue race). One occasional EBUSY is safe to retry — unlike the
-            // persistent one that flushing removes.
+            // Should not reach here after the atomic set-and-push fix in
+            // schedule_flip_event, but keep as a safety net. Returning EBUSY
+            // here is a last resort; the alternative (proceeding with
+            // FLIP_EVENT_PENDING still set) risks a double-delivery.
             return Err(FlipError::Busy);
         }
     }
@@ -1138,8 +1138,8 @@ static FLIP_EVENT_PENDING: AtomicBool = AtomicBool::new(false);
 fn deliver_pending_drm_timer() {
     DRM_TIMER_ARMED.store(false, Ordering::Release);
     // Everything scheduled for this vblank boundary completes together — the
-    // queue is bounded by the EBUSY gate on flips (≤1 Flip) plus any vblank
-    // waits posted in the same period.
+    // queue holds at most one Flip (flush_pending_flip_completions drains any
+    // outstanding one before accepting a new flip) plus any vblank waits.
     let jobs: Vec<PendingDrmTimer> = PENDING_DRM_TIMERS.lock().drain(..).collect();
     for job in jobs {
         match job {
@@ -1172,8 +1172,20 @@ fn arm_coalesced_drm_timer(pending: PendingDrmTimer) {
 }
 
 fn schedule_flip_event(crtc_id: u32, user_data: u64) {
-    FLIP_EVENT_PENDING.store(true, Ordering::Release);
-    arm_coalesced_drm_timer(PendingDrmTimer::Flip { crtc_id, user_data });
+    // Set FLIP_EVENT_PENDING and push the job INSIDE the same lock acquisition
+    // as arm_coalesced_drm_timer, so that flush_pending_flip_completions can
+    // never observe FLIP_EVENT_PENDING = true with an empty queue on SMP. Without
+    // this, a timer-interrupt on one CPU could drain the queue between the store
+    // and the push on another CPU, leaving a second CPU's concurrent page_flip
+    // flush seeing an empty queue yet FLIP_EVENT_PENDING = true -> EBUSY ->
+    // wlroots tears down the output on the very first few frames (real hardware,
+    // where multi-core interleaving makes the race non-negligible).
+    {
+        let mut q = PENDING_DRM_TIMERS.lock();
+        FLIP_EVENT_PENDING.store(true, Ordering::Release);
+        q.push_back(PendingDrmTimer::Flip { crtc_id, user_data });
+    }
+    arm_coalesced_drm_timer_locked();
 }
 
 /// Deliver every queued page-flip completion to the card fd *now* instead of
@@ -1671,8 +1683,9 @@ pub fn atomic_commit(
     // mutating scanout state — rather than refusing the commit with EBUSY:
     // wlroots turns an unexpected atomic-commit EBUSY into an output teardown
     // (DROP_MASTER -> the desktop drops to the text console). See [`page_flip`].
-    // Flushing keeps one completion per flip; only a narrow set-before-enqueue
-    // race still returns Busy, which a client safely retries.
+    // With schedule_flip_event now setting FLIP_EVENT_PENDING inside the queue
+    // lock (atomically with push_back), flush always finds the job; the inner
+    // EBUSY is a safety net that should not trigger in normal operation.
     if want_event && FLIP_EVENT_PENDING.load(Ordering::Acquire) {
         flush_pending_flip_completions();
         if FLIP_EVENT_PENDING.load(Ordering::Acquire) {
