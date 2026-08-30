@@ -27,6 +27,14 @@
 
 #include "rmconfig.h"
 
+/* ECLIPSE: the ECLIPSE-GR diagnostics below print via nv_printf(0, ...) --
+ * Eclipse's synchronous log shim (vendor/glue.c) -- instead of NV_PRINTF,
+ * because on real hardware NV_PRINTF's nvDbg path never reached the kernel
+ * log (an entire FECS-hang investigation ran blind on it), while nv_printf
+ * output is captured and, for lines tagged "ECLIPSE-GR", promoted to the
+ * visible log level by the Rust sink. Same declaration as eclipse_rm_init.c. */
+extern int nv_printf(unsigned int debuglevel, const char *printf_format, ...);
+
 #include "kernel/gpu/gr/kernel_graphics_manager.h"
 #include "kernel/gpu/gr/kernel_graphics.h"
 #include "kernel/gpu/fifo/kernel_channel.h"
@@ -493,7 +501,7 @@ _kgraphicsPostSchedulingEnableHandler
     // verdict lines that follow are trustworthy. gspClient=1 is the expected
     // value on Turing (GSP-RM) -- gspClient=0 would mean the golden image is
     // created on the GSP side, not here, and this whole path is moot.
-    NV_PRINTF(LEVEL_ERROR,
+    nv_printf(0,
               "ECLIPSE-GR golden: handler ENTER (gspClient=%u grIndex=%u)\n",
               (NvU32)(IS_GSP_CLIENT(pGpu) ? 1u : 0u),
               (NvU32)(NvUPtr)pGrIndex);
@@ -512,12 +520,12 @@ _kgraphicsPostSchedulingEnableHandler
     // restore wedge FECS with no fault, so a silent skip here is undebuggable.
     if (pKernelGraphicsStaticInfo == NULL)
     {
-        NV_PRINTF(LEVEL_ERROR, "ECLIPSE-GR golden: SKIPPED (static info NULL)\n");
+        nv_printf(0, "ECLIPSE-GR golden: SKIPPED (static info NULL)\n");
         return NV_ERR_INVALID_STATE;
     }
     if (pKernelGraphicsStaticInfo->floorsweepingMasks.gpcMask == 0x0)
     {
-        NV_PRINTF(LEVEL_ERROR, "ECLIPSE-GR golden: SKIPPED (gpcMask==0)\n");
+        nv_printf(0, "ECLIPSE-GR golden: SKIPPED (gpcMask==0)\n");
         return NV_OK;
     }
 
@@ -536,7 +544,7 @@ _kgraphicsPostSchedulingEnableHandler
         if ((pmaConfig & PMA_QUERY_SCRUB_ENABLED) &&
             !(pmaConfig & PMA_QUERY_SCRUB_VALID))
         {
-            NV_PRINTF(LEVEL_ERROR,
+            nv_printf(0,
                       "ECLIPSE-GR golden: DEFERRED behind PMA scrubber (retry expected)\n");
             return NV_WARN_MORE_PROCESSING_REQUIRED;
         }
@@ -545,7 +553,7 @@ _kgraphicsPostSchedulingEnableHandler
         NV_STATUS goldenStatus = kgraphicsCreateGoldenImageChannel(pGpu, pKernelGraphics);
         // ECLIPSE: THE line that decides the FECS-hang investigation -- 0x0
         // here means the golden image channel really was created this boot.
-        NV_PRINTF(LEVEL_ERROR, "ECLIPSE-GR golden: CreateGoldenImageChannel -> 0x%x\n",
+        nv_printf(0, "ECLIPSE-GR golden: CreateGoldenImageChannel -> 0x%x\n",
                   goldenStatus);
         NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, goldenStatus);
     }
@@ -2352,7 +2360,7 @@ kgraphicsCreateGoldenImageChannel_IMPL
     // creating nothing. Fail loudly instead.
     if (classNum == 0)
     {
-        NV_PRINTF(LEVEL_ERROR, "ECLIPSE-GR golden: FAILED (channel classNum==0)\n");
+        nv_printf(0, "ECLIPSE-GR golden: FAILED (channel classNum==0)\n");
         status = NV_ERR_INVALID_STATE;
         goto cleanup;
     }
@@ -2469,12 +2477,12 @@ kgraphicsCreateGoldenImageChannel_IMPL
     // supported per static info, objectType fell back to COMPUTE above -- a
     // golden image seeded compute-only leaves the GRAPHICS half uninitialized,
     // which is exactly the compute-works/graphics-FECS-hang split seen on TU106.
-    NV_PRINTF(LEVEL_ERROR,
+    nv_printf(0,
               "ECLIPSE-GR golden: seeding with objectType=%u classNum=0x%x (3D=%u)\n",
               objectType, classNum, GR_OBJECT_TYPE_3D);
     if (classNum == 0)
     {
-        NV_PRINTF(LEVEL_ERROR, "ECLIPSE-GR golden: FAILED (object classNum==0)\n");
+        nv_printf(0, "ECLIPSE-GR golden: FAILED (object classNum==0)\n");
         status = NV_ERR_INVALID_STATE;
         goto cleanup;
     }

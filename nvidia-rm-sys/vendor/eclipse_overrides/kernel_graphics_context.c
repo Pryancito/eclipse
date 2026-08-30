@@ -23,6 +23,11 @@
 
 #define NVOC_KERNEL_GRAPHICS_CONTEXT_H_PRIVATE_ACCESS_ALLOWED
 
+/* ECLIPSE: see the matching note in eclipse_overrides/kernel_graphics.c --
+ * the ECLIPSE-GR diagnostics print via Eclipse's nv_printf shim, the only
+ * channel proven to reach the kernel log on real hardware. */
+extern int nv_printf(unsigned int debuglevel, const char *printf_format, ...);
+
 #include "kernel/gpu/gr/kernel_graphics_context.h"
 #include "kernel/gpu/gr/kernel_graphics_manager.h"
 #include "kernel/gpu/gr/kernel_graphics.h"
@@ -1550,7 +1555,7 @@ kgrctxMapGlobalCtxBuffers_IMPL
     if (!pKernelGraphicsContextUnicast->localCtxBuffer.bAllocated &&
         !pGlobalCtxBuffers->bAllocated)
     {
-         NV_PRINTF(LEVEL_ERROR,
+         nv_printf(0,
                    "ECLIPSE-GR map: GLOBAL ctx buffers NOT allocated for this ctx -- 3D restore would wedge FECS\n");
          return NV_ERR_INVALID_STATE;
     }
@@ -1569,7 +1574,7 @@ kgrctxMapGlobalCtxBuffers_IMPL
                                  NV_FALSE);
         if (mapStatus != NV_OK)
         {
-            NV_PRINTF(LEVEL_ERROR, "ECLIPSE-GR map: BUNDLE_CB -> 0x%x\n", mapStatus);
+            nv_printf(0, "ECLIPSE-GR map: BUNDLE_CB -> 0x%x\n", mapStatus);
             return mapStatus;
         }
         mapStatus = kgrctxMapGlobalCtxBuffer(pGpu,
@@ -1581,7 +1586,7 @@ kgrctxMapGlobalCtxBuffers_IMPL
                                  NV_FALSE);
         if (mapStatus != NV_OK)
         {
-            NV_PRINTF(LEVEL_ERROR, "ECLIPSE-GR map: ATTRIBUTE_CB -> 0x%x\n", mapStatus);
+            nv_printf(0, "ECLIPSE-GR map: ATTRIBUTE_CB -> 0x%x\n", mapStatus);
             return mapStatus;
         }
         mapStatus = kgrctxMapGlobalCtxBuffer(pGpu,
@@ -1593,7 +1598,7 @@ kgrctxMapGlobalCtxBuffers_IMPL
                                  NV_FALSE);
         if (mapStatus != NV_OK)
         {
-            NV_PRINTF(LEVEL_ERROR, "ECLIPSE-GR map: PAGEPOOL -> 0x%x\n", mapStatus);
+            nv_printf(0, "ECLIPSE-GR map: PAGEPOOL -> 0x%x\n", mapStatus);
             return mapStatus;
         }
 
@@ -1608,7 +1613,7 @@ kgrctxMapGlobalCtxBuffers_IMPL
                                      NV_FALSE);
             if (mapStatus != NV_OK)
             {
-                NV_PRINTF(LEVEL_ERROR, "ECLIPSE-GR map: RTV_CB -> 0x%x\n", mapStatus);
+                nv_printf(0, "ECLIPSE-GR map: RTV_CB -> 0x%x\n", mapStatus);
                 return mapStatus;
             }
         }

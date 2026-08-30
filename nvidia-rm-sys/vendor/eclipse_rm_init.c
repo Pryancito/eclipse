@@ -7386,7 +7386,7 @@ typedef struct EclipseVmBind
  * memory into it) for a caller-chosen handle/size/address instead of the
  * one hardcoded channel buffer. */
 NV_STATUS eclipse_rm_vm_bind_map(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory, NvU64 size,
-                                  NvU64 requestedVA, NvU64 boOffset,
+                                  NvU64 requestedVA, NvU64 boOffset, NvU32 pteKind,
                                   EclipseVmBind *pOut)
 {
     OBJGPU *pGpu;
@@ -7527,6 +7527,50 @@ NV_STATUS eclipse_rm_vm_bind_map(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory,
                   (unsigned long long)g_vasGrantedBase,
                   (unsigned long long)g_vasGrantedSize);
         if (pOut->virtStatus != NV_OK) { status = NV_OK; goto unlock; }
+    }
+
+    /* 1b. Program the client's requested PTE kind into the memory descriptor,
+     * so the Map below writes it into every PTE -- exactly what Linux nouveau
+     * does (nouveau_uvmm passes the VM_BIND op's kind verbatim down to the
+     * PTE writer). NVK bakes the SAME kind into its texture/RT/ZETA
+     * descriptors, so the PTE view and the engine view must agree. On real
+     * TU106 this was the "compositor renders fine / glxcube+glxgears draw
+     * garbage" split: depth surfaces ask for the UNCOMPRESSED Z kinds
+     * (Z16=0x01, S8Z24=0x03), which the Rust layer misclassified as
+     * "compressed" and silently stripped to the generic kind. A genuinely
+     * COMPRESSIBLE kind (0x8..0xF -- this driver has no comptag allocator) is
+     * converted to its uncompressed pair by the RM's own HAL
+     * (memmgrGetUncompressedKind_TU102): correct bytes, no comptags needed.
+     * PITCH (0) keeps the memdesc default -- nothing to program.
+     *
+     * The memdesc is the GEM object's: the kind sticks for later maps of the
+     * same BO, which matches NVK's model (one surface layout per BO). */
+    if (pteKind != 0)
+    {
+        MemoryManager *pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
+        Memory *pMemory = NULL;
+        NvU32 kind = pteKind;
+        if (memmgrIsKind_HAL(pMemoryManager, FB_IS_KIND_COMPRESSIBLE, kind))
+        {
+            kind = memmgrGetUncompressedKind_HAL(pGpu, pMemoryManager, kind, NV_FALSE);
+        }
+        if (memGetByHandle(pRsClient, hMemory, &pMemory) == NV_OK &&
+            pMemory->pMemDesc != NULL)
+        {
+            memdescSetPteKind(pMemory->pMemDesc, kind);
+            /* "ECLIPSE-GR" tag: promoted to dmesg by the kernel's log sink
+             * even at LOG=error, so a real-hardware boot shows which kinds
+             * were actually programmed (bounded: one line per surface bind
+             * with a non-pitch kind, not per frame). */
+            nv_printf(0, "[eclipse-rm-trace] ECLIPSE-GR kind: 0x%x%s -> hMemory=0x%x (requested 0x%x)\n",
+                      kind, (kind != pteKind) ? " (uncompressed pair)" : "",
+                      hMemory, pteKind);
+        }
+        else
+        {
+            nv_printf(0, "[eclipse-rm-trace] ECLIPSE-GR kind: 0x%x requested but hMemory=0x%x has no memdesc -- default kind\n",
+                      pteKind, hMemory);
+        }
     }
 
     /* 2. Bind the real memory into that range.
