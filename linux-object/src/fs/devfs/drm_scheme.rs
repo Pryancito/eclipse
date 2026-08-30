@@ -2113,13 +2113,19 @@ impl INode for DrmDev {
                         }
                     }
                     conn_res.count_props = props.len() as u32;
-                    log::debug!(
-                        "[drm] GETCONNECTOR id={} connected={} modes={} mode={:?}",
-                        conn_res.connector_id,
-                        conn.connected,
-                        conn_res.count_modes,
-                        drm::display_mode()
-                    );
+                    // klog (budget-shared with the wsi trace) so a black-screen
+                    // bring-up shows, under LOG=error, whether the compositor
+                    // saw a CONNECTED output with a usable mode: connected=false
+                    // or modes=0 makes wlroots skip the output and never present.
+                    if wsi_trace_take() {
+                        kernel_hal::klog_info!(
+                            "[drm] GETCONNECTOR id={} connected={} modes={} mode={:?}",
+                            conn_res.connector_id,
+                            conn.connected,
+                            conn_res.count_modes,
+                            drm::display_mode()
+                        );
+                    }
                     Ok(0)
                 } else {
                     // klog: this refusal makes Mesa's wsi_display bail the whole

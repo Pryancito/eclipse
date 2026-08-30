@@ -1353,7 +1353,9 @@ pub fn present_now_region(fb_id: u32, crtc_id: u32, rect: Option<(u32, u32, u32,
         // console that window was wide enough to strand another CPU on it for
         // >8s, tripping the deadlock detector (see `drm.rs` HOLDER traces).
         let graphics_vt = DRM_STATE.lock().graphics_vt;
-        warn!(
+        // klog (not warn!) so this survives the default LOG=error boot level --
+        // this is THE black-screen bring-up line and it was invisible under it.
+        kernel_hal::klog_info!(
             "[drm] first present: fb_id={} crtc={} active_vt={} graphics_vt={:?} software_kms={}",
             fb_id,
             crtc_id,
@@ -1373,7 +1375,10 @@ pub fn present_now_region(fb_id: u32, crtc_id: u32, rect: Option<(u32, u32, u32,
             None => st.graphics_vt = Some(active),
             Some(owner) if owner != active => {
                 if !PRESENT_VT_DROP_LOGGED.swap(true, Ordering::Relaxed) {
-                    warn!(
+                    // klog so it survives LOG=error: this line means the
+                    // compositor IS presenting, but onto a VT that is not the
+                    // foreground -- the desktop is being suppressed on purpose.
+                    kernel_hal::klog_info!(
                         "[drm] present DROPPED (VT-gated): owner_vt={} active_vt={} -- compositor frames are suppressed because a different VT is foreground",
                         owner, active
                     );
