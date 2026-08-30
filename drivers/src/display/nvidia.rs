@@ -2766,6 +2766,25 @@ impl NvidiaGpu {
         1001 + 100 * instance + bit
     }
 
+    /// Resolve a DRM connector id back to the RM output bit it names.
+    /// `1001` stays as a boot-stable alias for the first supported output so a
+    /// client that started probing before RM topology was cached can finish the
+    /// rest of that probe against the same advertised id.
+    fn rm_connector_bit(
+        instance: u32,
+        id: u32,
+        d: &nvidia_rm_sys::rm_init::GrEdid,
+    ) -> Option<u32> {
+        if id == 1001 {
+            return (0..32u32).find(|&b| d.display_mask & (1u32 << b) != 0);
+        }
+        let bit = id.checked_sub(Self::rm_connector_id(instance, 0))?;
+        if bit >= 32 || d.display_mask & (1u32 << bit) == 0 {
+            return None;
+        }
+        Some(bit)
+    }
+
     /// RM connector type (NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_*) for a
     /// single-bit displayId, from the cached GET_CONNECTOR_DATA sweep.
     fn rm_conn_type(d: &nvidia_rm_sys::rm_init::GrEdid, did: u32) -> Option<u32> {
@@ -6549,10 +6568,7 @@ impl DrmScheme for NvidiaGpu {
 
     fn get_connector_edid(&self, id: u32) -> Option<[u8; 128]> {
         let (instance, d) = self.rm_display_state()?;
-        let bit = id.checked_sub(1001 + 100 * instance)?;
-        if bit >= 32 || d.display_mask & (1u32 << bit) == 0 {
-            return None;
-        }
+        let bit = Self::rm_connector_bit(instance, id, &d)?;
         let did = 1u32 << bit;
         let connected = d.connected_mask & did != 0;
         if connected && d.edid_valid == 1 && d.edid_display_id == did {
@@ -6766,15 +6782,7 @@ impl DrmScheme for NvidiaGpu {
             // When instance == 0 and bit 0 is supported this is the same
             // answer the id arithmetic below would give; the explicit alias
             // also covers masks that start at a higher bit and instances > 0.
-            let bit = if id == 1001 {
-                (0..32u32).find(|&b| d.display_mask & (1u32 << b) != 0)?
-            } else {
-                let b = id.checked_sub(1001 + 100 * instance)?;
-                if b >= 32 || d.display_mask & (1u32 << b) == 0 {
-                    return None;
-                }
-                b
-            };
+            let bit = Self::rm_connector_bit(instance, id, &d)?;
             let did = 1u32 << bit;
             let connected = d.connected_mask & did != 0;
             // EDID bytes 21/22 = max image size in cm; only known for the
