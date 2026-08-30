@@ -1545,6 +1545,7 @@ extern "C" {
         size: u64,
         requested_va: u64,
         bo_offset: u64,
+        pte_kind: NvU32,
         out: *mut VmBind,
     ) -> NV_STATUS;
     fn eclipse_rm_vm_bind_unmap(
@@ -1566,6 +1567,7 @@ pub fn vm_bind_map(
     size: u64,
     requested_va: u64,
     bo_offset: u64,
+    pte_kind: u32,
 ) -> Result<VmBind, NV_STATUS> {
     let _gate = RmGate::lock();
     let mut out = VmBind {
@@ -1582,6 +1584,7 @@ pub fn vm_bind_map(
             size,
             requested_va,
             bo_offset,
+            pte_kind,
             &mut out,
         )
     };

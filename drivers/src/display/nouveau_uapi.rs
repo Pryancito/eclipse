@@ -708,7 +708,13 @@ pub(super) const fn vm_bind_pte_kind(flags: u32) -> u32 {
 
 #[inline]
 pub(super) const fn pte_kind_is_supported(kind: u32) -> bool {
-    kind == PTE_KIND_PITCH || kind == PTE_KIND_GENERIC
+    // The Turing UNCOMPRESSED kind set (tu102 dev_mmu.h): PITCH (0x00), the
+    // Z/S family Z16/S8/S8Z24/ZF32_X24S8/Z24S8 (0x01..0x05) and
+    // GENERIC_MEMORY (0x06). All of these are programmed into the PTEs
+    // verbatim -- none needs comptags. 0x07 is INVALID and 0x08..0x0F are the
+    // COMPRESSIBLE kinds (handled separately: converted to their uncompressed
+    // pair, since this driver has no comptag allocator).
+    kind <= PTE_KIND_GENERIC
 }
 
 // --- DRM_NOUVEAU_SYNC_* (drm_nouveau_sync.flags) ---

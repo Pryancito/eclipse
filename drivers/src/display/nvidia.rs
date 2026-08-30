@@ -7320,41 +7320,50 @@ impl NvidiaGpu {
         // need the MMU to do the tiling -- that is the case the old blanket
         // refusal was really guarding against.)
         let supported_pte_kind = nv::pte_kind_is_supported(pte_kind);
+        // The kind actually handed to the RM map (programmed into the PTEs):
+        //
+        //  * 0x00..=0x06 -- the Turing UNCOMPRESSED kinds (PITCH, the Z/S
+        //    family Z16/S8/S8Z24/ZF32_X24S8/Z24S8, GENERIC_MEMORY) -- are
+        //    programmed VERBATIM, exactly like Linux nouveau (nouveau_uvmm
+        //    passes the VM_BIND op's kind untouched down to the PTE writer).
+        //    NVK bakes the SAME kind into its ZETA/texture descriptors, so
+        //    the PTE and engine views must agree: substituting generic here
+        //    was the "compositor fine / glxgears+vkcube garbage" split on
+        //    real TU106 -- depth surfaces ask for Z16(0x01)/S8Z24(0x03) and
+        //    were silently downgraded, so depth reads went through the wrong
+        //    kind. These kinds have NO comptag requirement; programming them
+        //    costs nothing.
+        //  * 0x08..=0x0F -- the COMPRESSIBLE kinds -- are passed through and
+        //    converted to their uncompressed pair by the RM's own HAL
+        //    (memmgrGetUncompressedKind_TU102) on the C side: correct bytes,
+        //    no comptags needed (this driver has no comptag allocator), and
+        //    the Z/S identity of the kind is PRESERVED (Z16_COMPRESSIBLE ->
+        //    Z16), unlike the old blanket generic downgrade.
+        //  * anything else (0x07 = INVALID, or out of table) -- mapped with
+        //    the RM default (pitch/generic), loudly.
+        //
+        // We never REFUSE a kind, and that is load-bearing: the old refusal
+        // left the surface UNMAPPED and NVK's first draw that referenced it
+        // froze the channel (PBDMA stall, no MMU fault). An imperfect mapping
+        // is strictly better than a hang.
+        let rm_pte_kind = if supported_pte_kind || (0x08..=0x0F).contains(&pte_kind) {
+            pte_kind
+        } else {
+            nv::PTE_KIND_PITCH
+        };
         if !supported_pte_kind {
-            // A compressed (or otherwise non-generic) kind. On Turing+ the PTE
-            // kind drives ONLY the L2's compression behaviour -- the
-            // block-linear swizzle is done by the ENGINE (block-height
-            // methods), not the page table (see the note above) -- and this
-            // driver has no comptag allocator, so we MAP IT AS
-            // GENERIC-UNCOMPRESSED (0x06). The GPU then reads and writes the
-            // surface uncompressed: correct bytes for an uncompressed surface,
-            // just without the bandwidth saving compression would give.
-            //
-            // We do NOT refuse it here, and that is load-bearing. The old
-            // behaviour REFUSED it (EOPNOTSUPP), which left the surface
-            // UNMAPPED. Confirmed on real RTX (dmesg): NVK maps a render target
-            // with kind 0x01, the refusal left its VA unbound, and NVK's first
-            // draw that referenced it froze the channel (`exec_submit_signaled:
-            // ctx1 TIMEOUT ring GPGet=12 GPPut=13`, no MMU fault, no GR
-            // exception -- the PBDMA stalled on the missing surface). NVK gets
-            // ~11 submits deep before the draw that needs it. An uncompressed
-            // mapping is strictly better than a hang: worst case a surface that
-            // truly depended on compression renders wrong, but the channel keeps
-            // running and the frame completes. GEM_NEW already rejects a
-            // compressed kind that arrives as an explicit `tile_flags` at
-            // allocation time (see NR_GEM_NEW), where NVK can still react; this
-            // fall-through covers a kind that reaches us only at VM_BIND, and it
-            // MUST NOT hang the channel. The real fix is comptag/PLC support.
             crate::klog_warn!(
-                "[nouveau-uapi] VM_BIND: PTE kind {:#04x} mapped as generic-uncompressed \
-                 (no comptag support here -- correct bytes for an uncompressed surface, \
-                 compression stripped) handle={} VA={:#x} range={:#x}",
+                "[nouveau-uapi] VM_BIND: PTE kind {:#04x} {} handle={} VA={:#x} range={:#x}",
                 pte_kind,
+                if rm_pte_kind != 0 {
+                    "is compressible -- programming its uncompressed pair (no comptag support here)"
+                } else {
+                    "is not in the Turing kind table -- mapping with the default kind"
+                },
                 op.handle,
                 op.addr,
                 op.range
             );
-            // fall through and map it uncompressed, exactly like 0x00/0x06
         }
         // Feed the /proc/gpudbg memory summary before the sparse/map dispatch,
         // so every op is counted (including the SPARSE ones refused just below).
@@ -7364,10 +7373,11 @@ impl NvidiaGpu {
             pte_kind,
             !supported_pte_kind,
         );
-        // pte_kind is 0x00 / 0x06, or a compressed kind we deliberately map
-        // uncompressed (above): fall through and map it like pitch.
-        // rm_init::vm_bind_map maps with the RM's default (pitch/generic) kind,
-        // which is correct for uncompressed memory on Turing+.
+        // `rm_pte_kind` (an uncompressed kind verbatim, a compressible kind
+        // for the C side to convert to its uncompressed pair, or 0 for the RM
+        // default) is handed to rm_init::vm_bind_map below, which programs it
+        // into the GEM memory's descriptor before the Map so it lands in the
+        // PTEs -- Linux-nouveau-faithful kind handling.
         if op.flags & nv::VM_BIND_SPARSE != 0 {
             crate::klog_warn!(
                 "[nouveau-uapi] VM_BIND: SPARSE regions are not implemented (op={} addr={:#x} \
@@ -7453,6 +7463,7 @@ impl NvidiaGpu {
                     op.range,
                     op.addr,
                     op.bo_offset,
+                    rm_pte_kind,
                 );
                 let rm_narration = nvidia_rm_sys::os_interface::capture_take();
                 let replay_rm = |narration: Option<alloc::string::String>| {
@@ -7673,7 +7684,7 @@ impl NvidiaGpu {
                 return;
             }
         };
-        let bind = match rm::vm_bind_map(device_instance, 0, alloc.h_memory, TEST_SIZE, TEST_VA, 0)
+        let bind = match rm::vm_bind_map(device_instance, 0, alloc.h_memory, TEST_SIZE, TEST_VA, 0, 0)
         {
             Ok(b) if b.map_status == 0 => b,
             _ => {
