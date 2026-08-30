@@ -1362,6 +1362,16 @@ typedef struct EclipseGrAlloc
 
 static EclipseGrAlloc g_grAllocCache;
 static NvBool g_grAllocDone = NV_FALSE;
+/* The gpuInstance that built (and OWNS) the step16 ladder. Every per-client
+ * context cache below (g_ctxAlloc/g_ctxDone) hangs off this one GPU's
+ * client/device handles, but the caches are file-scope GLOBALS while the Rust
+ * side keeps a per-GPU pid->ctx registry. On a dual-card box the second GPU's
+ * ctx_alloc used to cache-hit the FIRST GPU's live context (same idx picked
+ * independently per card): two unrelated clients then shared one GPFIFO ring
+ * and VA space, and one client's exit freed the other's live channel -- a
+ * FECS-hang / GSP-object-DB-corruption factory. Every ctx entry point now
+ * rejects a gpuInstance that is not the ladder owner. */
+static NvU32 g_grAllocGpuInst = 0xFFFFFFFF;
 /* VA space geometry RM actually GRANTED in step16 (the params are IN/OUT).
  * Kept out of EclipseGrAlloc so the Rust FFI struct keeps its ABI; printed on
  * every failed fixed-VA reserve so a single boot log tells an out-of-range
@@ -1596,8 +1606,11 @@ NV_STATUS eclipse_rm_step16(NvU32 gpuInstance, EclipseGrAlloc *pOut)
         }
     }
 
-    /* Full ladder allocated: keep it alive for step-17 and cache the result. */
+    /* Full ladder allocated: keep it alive for step-17 and cache the result.
+     * Record the owning GPU: every ctx_alloc/ctx_prime/ctx_free/exec entry
+     * validates against it (see g_grAllocGpuInst). */
     portMemCopy(&g_grAllocCache, sizeof(g_grAllocCache), pOut, sizeof(*pOut));
+    g_grAllocGpuInst = gpuInstance;
     g_grAllocDone = NV_TRUE;
     status = NV_OK;
     goto unlock;
@@ -2001,6 +2014,16 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
     {
         return NV_ERR_INVALID_ARGUMENT;
     }
+    /* Ladder-owner gate BEFORE the idempotency cache: without it, the second
+     * GPU on a dual-card box cache-hits the first GPU's live context for the
+     * same idx (the Rust registries are per-GPU, so both cards hand out the
+     * same idx range) and two clients silently share a channel/VAS. */
+    if (g_grAllocDone && gpuInstance != g_grAllocGpuInst)
+    {
+        nv_printf(0, "[eclipse-rm-trace] ctx%u: ctx_alloc on gpu%u rejected (ladder owner is gpu%u)\n",
+                  ctxIdx, gpuInstance, g_grAllocGpuInst);
+        return NV_ERR_INVALID_ARGUMENT;
+    }
     if (g_ctxDone[ctxIdx])
     {
         portMemCopy(pOut, sizeof(*pOut), &g_ctxAlloc[ctxIdx], sizeof(g_ctxAlloc[ctxIdx]));
@@ -2288,6 +2311,15 @@ NV_STATUS eclipse_rm_ctx_free(NvU32 gpuInstance, NvU32 ctxIdx)
 
     if (ctxIdx == 0 || ctxIdx >= ECLIPSE_MAX_CTX)
     {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    /* Ladder-owner gate: a free issued through the wrong GPU's device would
+     * destroy a LIVE context out from under its real owner (and corrupt the
+     * shared RM client's handle table). See g_grAllocGpuInst. */
+    if (gpuInstance != g_grAllocGpuInst)
+    {
+        nv_printf(0, "[eclipse-rm-trace] ctx%u: ctx_free on gpu%u rejected (ladder owner is gpu%u)\n",
+                  ctxIdx, gpuInstance, g_grAllocGpuInst);
         return NV_ERR_INVALID_ARGUMENT;
     }
     if (!g_ctxDone[ctxIdx])
@@ -7673,6 +7705,12 @@ NV_STATUS eclipse_rm_exec_submit(NvU32 gpuInstance, NvU32 ctxIdx, NvU64 pushVA, 
     pOut->tokenStatus  = 0xFFFFFFFF;
     pOut->submitStatus = 0xFFFFFFFF;
 
+    /* Ladder-owner gate: submitting through the wrong GPU would ring the
+     * wrong card's doorbell for this channel. See g_grAllocGpuInst. */
+    if (g_grAllocDone && gpuInstance != g_grAllocGpuInst)
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
     chanReady = (ctxIdx == 0) ? g_grChanDone : g_ctxDone[ctxIdx];
     if (!chanReady)
     {
@@ -7909,6 +7947,11 @@ NV_STATUS eclipse_rm_exec_submit_signaled(NvU32 gpuInstance, NvU32 ctxIdx, NvU64
     pOut->fenceSubmitStatus = 0xFFFFFFFF;
     pOut->fenceWaitStatus   = 0xFFFFFFFF;
 
+    /* Ladder-owner gate: see g_grAllocGpuInst / eclipse_rm_exec_submit. */
+    if (g_grAllocDone && gpuInstance != g_grAllocGpuInst)
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
     chanReady = (ctxIdx == 0) ? g_grChanDone : g_ctxDone[ctxIdx];
     if (!chanReady)
     {
@@ -8188,6 +8231,10 @@ NV_STATUS eclipse_rm_ctx_prime(NvU32 gpuInstance, NvU32 ctxIdx)
     const NvU32 primeTimeoutMs = 500;
 
     if (ctxIdx == 0 || ctxIdx >= ECLIPSE_MAX_CTX)
+        return NV_ERR_INVALID_ARGUMENT;
+    /* Ladder-owner gate (see g_grAllocGpuInst): priming through the wrong
+     * GPU would drive another card's doorbell against this channel. */
+    if (gpuInstance != g_grAllocGpuInst)
         return NV_ERR_INVALID_ARGUMENT;
     if (!g_ctxDone[ctxIdx])
         return NV_ERR_INVALID_STATE;
