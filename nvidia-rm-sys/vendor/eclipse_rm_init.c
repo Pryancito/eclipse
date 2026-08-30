@@ -2001,6 +2001,10 @@ typedef struct EclipseCtxAlloc
 
 static EclipseCtxAlloc g_ctxAlloc[ECLIPSE_MAX_CTX];
 static NvBool          g_ctxDone[ECLIPSE_MAX_CTX];
+/* TURING_A (3D) class object per client ctx, allocated in ctx_alloc step 10b.
+ * Kept OUTSIDE EclipseCtxAlloc so the Rust FFI mirror keeps its ABI (the Rust
+ * side never needs the handle). 0 = none. Freed in ctx_free / failure path. */
+static NvU32           g_ctx3dObj[ECLIPSE_MAX_CTX];
 
 NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc *pOut)
 {
@@ -2252,6 +2256,34 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
         if (pOut->computeStatus != NV_OK) { failed = NV_TRUE; goto done; }
     }
 
+    /* 10b. TURING_A (3D) on the channel. Without a graphics class object the
+     * RM never builds the GR engine context for this channel, so any graphics
+     * SET_OBJECT -- ctx_prime's 3D stage, or Mesa's first draw on a channel
+     * whose 0xc597 NVIF NEW came later -- context-switches into nothing and
+     * wedges FECS mid-RESTORE (observed on real TU106: prime went TIMEOUT on
+     * the 3D stage and every client died at vkCreateDevice). Allocating the
+     * object here makes the RM/GSP build the graphics engine context up
+     * front; NVK's own later 0xc597 NVIF NEW coexists fine (multiple objects
+     * of one class on a channel are allowed). The AllocWithHandle status is
+     * traced: the FIRST 3D object of the boot is also where GSP creates its
+     * graphics golden image, so a slow or failing alloc HERE names that. */
+    {
+        NV_GR_ALLOCATION_PARAMETERS params;
+        NvU32 h3d = 0;
+        portMemSet(&params, 0, sizeof(params));
+        params.version = 2;
+        params.size = sizeof(params);
+        status = clientGenResourceHandle(pRsClient, &h3d);
+        if (status != NV_OK) goto unlock;
+        status = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache.hClient,
+                                         pOut->hChannel, h3d,
+                                         TURING_A, &params, sizeof(params));
+        nv_printf(0, "[eclipse-rm-trace] ctx%u: TURING_A(3D) -> 0x%x h3d=0x%x\n",
+                  ctxIdx, status, h3d);
+        if (status != NV_OK) { failed = NV_TRUE; goto done; }
+        g_ctx3dObj[ctxIdx] = h3d;
+    }
+
     /* 11. Put the channel on the runlist. */
     {
         NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS params;
@@ -2273,6 +2305,11 @@ done:
     if (failed)
     {
         /* Free the NEW handles (reverse order); the shared step-16 ladder stays. */
+        if (g_ctx3dObj[ctxIdx] != 0)
+        {
+            pRmApi->Free(pRmApi, g_grAllocCache.hClient, g_ctx3dObj[ctxIdx]);
+            g_ctx3dObj[ctxIdx] = 0;
+        }
         if (pOut->hCompute != 0)  pRmApi->Free(pRmApi, g_grAllocCache.hClient, pOut->hCompute);
         if (pOut->hChannel != 0)  pRmApi->Free(pRmApi, g_grAllocCache.hClient, pOut->hChannel);
         if (pOut->hNotifier != 0) pRmApi->Free(pRmApi, g_grAllocCache.hClient, pOut->hNotifier);
@@ -2355,6 +2392,11 @@ NV_STATUS eclipse_rm_ctx_free(NvU32 gpuInstance, NvU32 ctxIdx)
     /* Reverse dependency order, matching ctx_alloc's failure cleanup: freeing
      * the channel tears down its bound compute object and takes it off the
      * runlist; freeing the VA space drops every VM_BIND mapping still in it. */
+    if (g_ctx3dObj[ctxIdx] != 0)
+    {
+        pRmApi->Free(pRmApi, g_grAllocCache.hClient, g_ctx3dObj[ctxIdx]);
+        g_ctx3dObj[ctxIdx] = 0;
+    }
     if (pCtx->hCompute != 0)  pRmApi->Free(pRmApi, g_grAllocCache.hClient, pCtx->hCompute);
     if (pCtx->hChannel != 0)  pRmApi->Free(pRmApi, g_grAllocCache.hClient, pCtx->hChannel);
     if (pCtx->hNotifier != 0) pRmApi->Free(pRmApi, g_grAllocCache.hClient, pCtx->hNotifier);
