@@ -656,7 +656,16 @@ pub struct NvidiaGpu {
     /// pid->context routing (`ensure_ctx_for_pid`/`ctx_idx_for_pid`); tying it
     /// to the channel list was the bug that let a client's binds land in the
     /// compositor's VAS (MMU fault on the client's first submission).
-    nouveau_pid_ctx: Mutex<Vec<(u64, u32, u32, u32)>>,
+    ///
+    /// The final `bool` is READY: `false` while the owning thread is still in
+    /// `ctx_alloc`/`ctx_prime`. The entry is pushed not-ready up front so a
+    /// concurrent first-touch of the same pid (NVK is multithreaded) reserves
+    /// exactly one slot -- but no caller is handed the ctx until the golden
+    /// context is primed. Before this flag, the entry was published BEFORE the
+    /// prime and a sibling thread could race a graphics EXEC onto the unprimed
+    /// channel: the 3D draw then cold-loaded the GR context and hung FECS in
+    /// RESTORE (idle GR, drained PBDMA, no fault -- the real-RTX signature).
+    nouveau_pid_ctx: Mutex<Vec<(u64, u32, u32, u32, bool)>>,
     /// Driver-private framebuffer objects keyed by driver fb id.
     kms_framebuffers: Mutex<Vec<NvidiaKmsFramebuffer>>,
     /// Driver-side ids for framebuffer objects.
@@ -7839,10 +7848,13 @@ impl NvidiaGpu {
     }
 
     fn ctx_idx_for_pid(&self, owner_pid: u64) -> u32 {
+        // Only READY entries route: a mid-build ctx must not receive class
+        // objects or submissions (callers that can legitimately race a build
+        // go through `ensure_ctx_for_pid`, which waits for readiness).
         self.nouveau_pid_ctx
             .lock()
             .iter()
-            .find(|t| t.0 == owner_pid)
+            .find(|t| t.0 == owner_pid && t.4)
             .map(|t| t.1)
             .unwrap_or(0)
     }
@@ -7878,7 +7890,39 @@ impl NvidiaGpu {
         // lock, drop it, then prime.
         let mut map = self.nouveau_pid_ctx.lock();
         if let Some(t) = map.iter().find(|t| t.0 == owner_pid) {
-            return (t.1, t.2, t.3);
+            if t.4 {
+                return (t.1, t.2, t.3);
+            }
+            // Another thread of this pid is mid-build (entry reserved, not
+            // READY). Wait for it instead of handing out the unprimed ctx --
+            // racing an EXEC onto it cold-loads the GR context and hangs FECS.
+            // Bounded (~3s covers ctx_alloc + the 500ms prime with margin) and
+            // pumping (gpu_spin drains our TLB-shootdown queue) so the wait
+            // can never wedge the machine. On timeout or build failure fall
+            // back to (0,0,0) -- software, same as any other build failure.
+            drop(map);
+            let start = unsafe { crate::bus::drivers_timer_now_as_micros() };
+            loop {
+                {
+                    let m = self.nouveau_pid_ctx.lock();
+                    match m.iter().find(|t| t.0 == owner_pid) {
+                        Some(t) if t.4 => return (t.1, t.2, t.3),
+                        Some(_) => {}
+                        // Build failed (reservation removed) or the pid exited.
+                        None => return (0, 0, 0),
+                    }
+                }
+                if unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(start)
+                    > 3_000_000
+                {
+                    crate::klog_warn!(
+                        "[nouveau-uapi] ctx: pid={} waited >3s for its own in-flight ctx build -- software fallback",
+                        owner_pid
+                    );
+                    return (0, 0, 0);
+                }
+                gpu_spin();
+            }
         }
         let Some(idx) = (1u32..nv::MAX_CTX).find(|i| !map.iter().any(|t| t.1 == *i)) else {
             crate::klog_warn!(
@@ -7888,9 +7932,23 @@ impl NvidiaGpu {
             );
             return (0, 0, 0);
         };
+        // RESERVE the slot + pid up front (not READY): concurrent first-touch
+        // threads of this pid then wait above instead of double-building, and
+        // no other pid can pick this idx. Published as usable only AFTER the
+        // golden-context prime below -- publishing before the prime let a
+        // sibling thread race a graphics EXEC onto the unprimed channel (FECS
+        // RESTORE hang, the real-RTX signature). Release the lock across the
+        // slow RM work; on any failure the reservation is removed.
+        map.push((owner_pid, idx, 0, 0, false));
+        drop(map);
+        let unreserve = || {
+            let mut m = self.nouveau_pid_ctx.lock();
+            if let Some(i) = m.iter().position(|t| t.0 == owner_pid && !t.4) {
+                m.remove(i);
+            }
+        };
         let (ctx_idx, h_vas, h_notifier) = match nvidia_rm_sys::rm_init::ctx_alloc(dev, idx) {
             Ok(c) if c.sched_status == 0 => {
-                map.push((owner_pid, idx, c.h_vas, c.h_notifier));
                 // Fresh channel: clear any stale wedged latch from a prior
                 // tenant of this slot, so this client starts un-wedged.
                 nv::ctx_clear_wedged(idx);
@@ -7913,6 +7971,7 @@ impl NvidiaGpu {
                     c.compute_status,
                     c.sched_status
                 );
+                unreserve();
                 return (0, 0, 0);
             }
             Err(s) => {
@@ -7922,12 +7981,10 @@ impl NvidiaGpu {
                     idx,
                     s
                 );
+                unreserve();
                 return (0, 0, 0);
             }
         };
-        // Registry updated; release the lock BEFORE the (slow) prime so other
-        // processes' ctx_idx_for_pid / EXEC are not stalled behind it.
-        drop(map);
 
         // Persist "prime STARTED" BEFORE the call. A real-RTX repro showed a
         // fence timeout on a ctx that had NO prime record at all -- which this
@@ -8000,6 +8057,22 @@ impl NvidiaGpu {
                 " <== prime failure predicts DEVICE_LOST on first draw"
             }
         ));
+        // Publish READY only now: the golden context is primed (or its prime
+        // verdict recorded), so a sibling thread waking from the wait above --
+        // or any later EXEC -- can no longer land on an unprimed channel. If
+        // the entry is gone the pid exited mid-build (its reservation was
+        // reaped); serve the software fallback rather than resurrecting it.
+        {
+            let mut m = self.nouveau_pid_ctx.lock();
+            match m.iter_mut().find(|t| t.0 == owner_pid) {
+                Some(t) => {
+                    t.2 = h_vas;
+                    t.3 = h_notifier;
+                    t.4 = true;
+                }
+                None => return (0, 0, 0),
+            }
+        }
         (ctx_idx, h_vas, h_notifier)
     }
 
