@@ -270,6 +270,15 @@ fn request_vt_switch(target: usize) {
 fn complete_vt_switch(target: usize) {
     let target = vt_clamp(target);
     kernel_hal::console::switch_vt(target);
+    // klog (survives LOG=error): the display is now on `target`. `owner` != 0
+    // means a graphics session (seatd) will get acqsig below and can activate;
+    // owner == 0 on the graphics VT (tty7 == 6) means nobody is registered to
+    // acquire it -- the compositor stays paused and never presents.
+    kernel_hal::klog_info!(
+        "[vt] switch -> active={} owner={:#x}",
+        target,
+        vt_owner(target)
+    );
     // Re-blit the compositor's last frame if we landed back on its VT (a no-op
     // for a text target, which the console repaints itself).
     crate::fs::devfs::drm::represent_if_owner_active();
@@ -398,7 +407,8 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             // /dev/tty0, which now resolves to the active VT: this line should
             // show the graphics mode landing on the graphics VT (tty7 == 6),
             // not VT 0. `active` is the foreground VT at the time of the call.
-            warn!(
+            // klog (not warn!) so it survives the default LOG=error boot level.
+            kernel_hal::klog_info!(
                 "[vt] KDSETMODE vt={} mode={:#x} (active={})",
                 vt,
                 mode,
@@ -491,8 +501,8 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             // With /dev/tty0 resolving to the active VT, `vt` must be the
             // graphics VT (tty7 == 6) so `complete_vt_switch` can deliver acqsig
             // back to seatd and libseat activates the compositor. owner=0 means
-            // VT_AUTO (relinquished).
-            warn!(
+            // VT_AUTO (relinquished). klog so it survives LOG=error.
+            kernel_hal::klog_info!(
                 "[vt] VT_SETMODE vt={} mode={} owner={:#x} (active={})",
                 vt,
                 vm.mode,
@@ -515,6 +525,16 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             Ok(0)
         }
         VT_ACTIVATE => {
+            // klog (survives LOG=error): eclipse-init switches to tty7 via
+            // VT_ACTIVATE(7). If `num_vts` is 1 here (graphic console not yet
+            // set up) the range check silently drops the switch yet still
+            // returns success -- this line names that case (target vs num_vts).
+            kernel_hal::klog_info!(
+                "[vt] VT_ACTIVATE target={} (num_vts={} active={})",
+                data,
+                kernel_hal::console::num_vts(),
+                kernel_hal::console::active_vt()
+            );
             if data >= 1 && data <= kernel_hal::console::num_vts() {
                 // Route through the VT_PROCESS handshake: if the current VT is
                 // owned by a graphics session, this defers until it releases.
