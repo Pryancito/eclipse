@@ -4308,11 +4308,32 @@ impl DrmScheme for NvidiaGpu {
         }
         let device_instance = match *self.rm_device_instance.lock() {
             Some(d) => d,
-            None => return false, // this GPU not state-loaded
+            None => {
+                // One-shot: this GPU cannot CE-copy because it never
+                // state-loaded. When every GPU declines, cepresent degrades to
+                // the CPU blit; without this line the degradation is silent.
+                static NOT_LOADED_LOGGED: AtomicBool = AtomicBool::new(false);
+                if !NOT_LOADED_LOGGED.swap(true, Ordering::Relaxed) {
+                    crate::klog_info!(
+                        "[NVIDIA] ce_present: GPU {:02x}:{:02x}.0 not state-loaded -- cannot CE-copy",
+                        self.pci_bus,
+                        self.pci_device
+                    );
+                }
+                return false;
+            }
         };
         let fb_phys = match boot_fb_phys() {
             Some(p) if p != 0 => p,
-            _ => return false,
+            _ => {
+                static NO_BOOTFB_LOGGED: AtomicBool = AtomicBool::new(false);
+                if !NO_BOOTFB_LOGGED.swap(true, Ordering::Relaxed) {
+                    crate::klog_warn!(
+                        "[NVIDIA] ce_present: boot framebuffer phys unknown -- cannot CE-copy"
+                    );
+                }
+                return false;
+            }
         };
         // Capture the RM's own `[eclipse-rm-trace] ce_blit*` narration (the
         // ceutilsMemcopy status, and any Xid/MMU-fault burst the P2P write
@@ -4329,6 +4350,14 @@ impl DrmScheme for NvidiaGpu {
             let bar1 = self.bar1_phys;
             if fb_phys < bar1 {
                 let _ = nvidia_rm_sys::os_interface::capture_take();
+                static FB_OUTSIDE_BAR1_LOGGED: AtomicBool = AtomicBool::new(false);
+                if !FB_OUTSIDE_BAR1_LOGGED.swap(true, Ordering::Relaxed) {
+                    crate::klog_warn!(
+                        "[NVIDIA] ce_present: boot FB {:#x} below console BAR1 {:#x} -- cannot CE-copy",
+                        fb_phys,
+                        bar1
+                    );
+                }
                 return false;
             }
             (
