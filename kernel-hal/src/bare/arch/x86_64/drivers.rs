@@ -403,6 +403,18 @@ pub(super) fn init() -> DeviceResult {
 
     boot_progress(88);
 
+    // Re-assert write-combining on the boot framebuffer AFTER the PCI scan.
+    // The early retype in `primary_init` runs before PCI bring-up: on real
+    // hardware the GOP surface lives inside the console GPU's BAR1, whose
+    // physmap alias is not premapped by rboot, so that pass finds NotMapped
+    // and converts nothing -- and the NVIDIA bring-up then `query_or_map`s
+    // the whole BAR1 as UncachedDevice, leaving the scanout pages UC. A UC
+    // blit moves ~42 MB/s (one bus transaction per store), which showed up
+    // as a 99 ms present (7-11 FPS desktop). This second pass retypes those
+    // now-existing 4 KiB PTEs to WC. Idempotent everywhere else (QEMU/VBox
+    // fb pages are already WC from the early pass).
+    super::pat::enable_framebuffer_wc();
+
     #[cfg(feature = "graphic")]
     let graphics_console_note = {
         use alloc::string::String;
