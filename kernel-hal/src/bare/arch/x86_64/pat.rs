@@ -82,7 +82,11 @@ const PHYS_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 
 /// Flip the leaf PTEs covering the framebuffer's physmap alias to PAT
 /// entry 7 (WC). Call on the BSP, after [`init_this_cpu`], before the
-/// graphic console starts pushing frames. Safe to call again (idempotent).
+/// graphic console starts pushing frames. Safe to call again (idempotent) —
+/// and it IS called again after the PCI scan: on real hardware the GOP
+/// surface sits inside the console GPU's BAR1, which is not premapped by
+/// rboot (this pass finds NotMapped) and is later mapped UncachedDevice by
+/// the PCI `query_or_map`, so only a re-run after PCI can retype it.
 ///
 /// Only 4 KiB leaves are converted; a huge-page leaf (which rboot never
 /// creates for the physmap) is left untouched — UC/WB there is slower, not
@@ -112,7 +116,10 @@ pub fn enable_framebuffer_wc() {
         }
     }
     if converted > 0 || skipped_huge > 0 {
-        log::warn!(
+        // klog, not log::warn!: at the default LOG=error boot this line is the
+        // only record of whether the framebuffer is WC or stuck at UC, and it
+        // was being filtered out on exactly the hardware where it mattered.
+        crate::klog_info!(
             "pat: framebuffer {:#x}..{:#x} write-combining ({} PTEs converted{})",
             KCONFIG.fb_addr,
             KCONFIG.fb_addr + KCONFIG.fb_size,
