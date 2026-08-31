@@ -15,6 +15,15 @@ pub fn fb_mapping_diag() -> alloc::string::String {
     super::pat::fb_mapping_diag()
 }
 
+/// One-shot cycles/byte probe of stores to the boot framebuffer through the
+/// calling context's mapping (rewrites the same bytes, visually a no-op) —
+/// see `pat::fb_store_bench_klog`. UC lands ~7000-10000 (x100 cycles/byte),
+/// write-combining ~100-300; a WC PTE with a UC-like number means the
+/// slowness is beyond the MMU (the device side of the BAR).
+pub fn fb_store_bench_klog(tag: &str) {
+    super::pat::fb_store_bench_klog(tag)
+}
+
 /// Retype the boot framebuffer's physmap PTEs in the CURRENT page-table tree
 /// to write-combining (idempotent; no-op when they already are). The boot-time
 /// passes edit the tree current at *that* moment; if a process tree ends up

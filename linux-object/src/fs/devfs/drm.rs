@@ -44,12 +44,20 @@ static SCANOUT_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 /// One-shot latch for the "framebuffer has no backing" scanout warning.
 static SCANOUT_NULL_LOGGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
-/// One-shot latch for the "CE present enabled but pitch mismatch" warning.
-static CE_PITCH_MISMATCH_LOGGED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
 /// One-shot latch for "CE present enabled but every GPU declined the copy".
 static CE_NO_TAKER_LOGGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+/// One-shot latch for the CE staging-buffer allocation failure warning.
+static CE_STAGING_ALLOC_FAILED_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+/// Staging buffer for the pitch-mismatch CE present: `(vaddr, paddr, size,
+/// keepalive VMO)`. The compositor's rows (client pitch) are CPU-repacked into
+/// this sysmem buffer at the scanout pitch — cheap cached WB→WB copies — so
+/// the flat CE copy's equal-stride requirement is met and the slow CPU→BAR1
+/// store path (measured 42 MB/s on real hardware even with a verified-WC
+/// mapping) is bypassed entirely. Allocated once at first use.
+#[allow(clippy::type_complexity)]
+static CE_STAGING: Mutex<Option<(usize, u64, usize, Arc<VmObject>)>> = Mutex::new(None);
 /// Full-frame presents completed, for the rate-limited phase-timing klog.
 static PRESENT_FRAME_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -624,6 +632,72 @@ const BLIT_CHUNK_ROWS: u32 = 128;
 /// Chunking bounds the continuous interrupts-off window to one band — pending
 /// IRQs are serviced promptly between bands — while each individual blit
 /// still runs fully protected, preserving the original crash fix.
+/// Repack the frame into the CE staging buffer at `dst_pitch` and return the
+/// staging `(phys_addr, bytes)` for a flat CE copy. Returns `None` (caller
+/// falls back to the CPU blit) if the staging buffer cannot be allocated.
+///
+/// The row copies are ordinary cached memory writes (~GB/s), and x86 PCIe DMA
+/// snoops the cache, so the CE reads coherent data with no explicit flush.
+fn ce_repack_to_staging(
+    pixels: &[u32],
+    src_stride: usize,
+    dst_pitch: usize,
+    w: u32,
+    h: u32,
+) -> Option<(u64, u64)> {
+    let row_bytes = (w as usize).checked_mul(4)?;
+    if row_bytes > dst_pitch {
+        return None;
+    }
+    let need = dst_pitch.checked_mul(h as usize)?;
+    let cached = {
+        let slot = CE_STAGING.lock();
+        slot.as_ref()
+            .filter(|s| s.2 >= need)
+            .map(|s| (s.0, s.1, s.3.clone()))
+    };
+    let (va, pa, _keepalive) = match cached {
+        Some(s) => s,
+        None => {
+            // Allocate OUTSIDE the IRQ-disabling spinlock: a contiguous
+            // multi-MB allocation (plus zeroing) is far too heavy to run with
+            // interrupts off. A racing double-alloc is harmless (one wins).
+            let vmo = match VmObject::new_contiguous(pages(need), 12) {
+                Ok(v) => v,
+                Err(_) => {
+                    if !CE_STAGING_ALLOC_FAILED_LOGGED.swap(true, Ordering::Relaxed) {
+                        kernel_hal::klog_warn!(
+                            "[drm] CE repack: staging alloc failed ({} bytes) -- CPU blit",
+                            need
+                        );
+                    }
+                    return None;
+                }
+            };
+            let pa = vmo.commit_page(0, MMUFlags::READ).ok()? as u64;
+            let va = phys_to_virt(pa as usize);
+            *CE_STAGING.lock() = Some((va, pa, need, vmo.clone()));
+            (va, pa, vmo)
+        }
+    };
+    for r in 0..h as usize {
+        let s = r.checked_mul(src_stride)?;
+        if s + row_bytes / 4 > pixels.len() {
+            break;
+        }
+        // SAFETY: staging spans `need` bytes and r*dst_pitch + row_bytes <=
+        // need; the source slice bound was checked above.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                pixels[s..].as_ptr() as *const u8,
+                (va + r * dst_pitch) as *mut u8,
+                row_bytes,
+            );
+        }
+    }
+    Some((pa, need as u64))
+}
+
 fn blit_chunked(
     display: &Arc<dyn DisplayScheme>,
     dst_x: u32,
@@ -769,24 +843,32 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
         }
     }
     let t_sync = kernel_hal::timer::timer_now();
-    // CE-offloaded present: copy the dumb buffer (sysmem) into the scanout FB
-    // (the console GPU's VRAM) with the GPU copy engine instead of a CPU
-    // memcpy over PCIe. A flat CE copy needs equal strides, so only when the
-    // dumb-buffer pitch matches the scanout pitch; and only the console GPU
-    // (state-loaded via /proc/gpustep14) accepts it. Any miss -> CPU blit.
-    // Only ever attempted for a full-frame scanout: the CE path always copies
-    // from `fb.phys_addr` (the buffer's start), so it can't honor a rect
-    // offset.
+    // CE-offloaded present: copy the frame (sysmem) into the scanout FB (the
+    // console GPU's VRAM) with a GPU copy engine instead of CPU stores over
+    // PCIe — on real hardware the console GPU's BAR1 serves CPU stores at a
+    // measured 42 MB/s even through a verified write-combining mapping
+    // (~99 ms/frame, the 7-11 FPS desktop), while GPU-initiated writes burst
+    // at PCIe speed. The flat CE copy needs equal strides: when the client's
+    // pitch differs from the scanout pitch, the rows are first CPU-repacked
+    // into a sysmem staging buffer at the scanout pitch (cached writes,
+    // ~GB/s) and the CE copies from there. Only for full-frame scanouts: the
+    // CE always copies from the buffer's start, so it can't honor a rect.
     //
     // OPT-IN: gated on `nvidia.cepresent` (see CE_PRESENT_ENABLED) — the CE
-    // DMA per present destabilized the desktop on real hardware, so the
-    // default present is the proven CPU blit.
+    // DMA per present destabilized the desktop on real hardware once, so the
+    // default present is still the CPU blit (ce_present wedges itself off on
+    // the first confirmed failure).
     let mut blitted_by_ce = false;
     if rect.is_none() && CE_PRESENT_ENABLED.load(Ordering::Relaxed) {
-        if fb.pitch == info.pitch {
-            let size = (info.pitch as u64) * (blit_h as u64);
+        let (ce_src_pa, ce_size) = if fb.pitch == info.pitch {
+            (fb.phys_addr, (info.pitch as u64) * (blit_h as u64))
+        } else {
+            ce_repack_to_staging(pixels, src_stride, info.pitch as usize, blit_w, blit_h)
+                .unwrap_or((0, 0))
+        };
+        if ce_src_pa != 0 && ce_size != 0 {
             for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-                if d.ce_present(fb.phys_addr, size) {
+                if d.ce_present(ce_src_pa, ce_size) {
                     blitted_by_ce = true;
                     break;
                 }
@@ -801,20 +883,6 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
                      (see [NVIDIA] ce_present lines for the reason)"
                 );
             }
-        } else if !CE_PITCH_MISMATCH_LOGGED.swap(true, Ordering::Relaxed) {
-            // CE is ON but the flat sysmem->VRAM copy needs equal strides, and
-            // the client's fb pitch differs from the scanout pitch. Say so once
-            // -- otherwise "cepresent is set but the CPU is still doing the
-            // copy" is a silent mystery. (A per-row CE copy would lift this, but
-            // that is a wider change than the flat blit.) klog, not warn!: the
-            // default LOG=error boot filters warn!, which made this invisible
-            // on exactly the hardware where it matters.
-            kernel_hal::klog_warn!(
-                "[drm] CE-offload present enabled but NOT firing: fb pitch {} != scanout pitch {} \
-                 (flat CE copy needs equal strides) -- using CPU blit",
-                fb.pitch,
-                info.pitch
-            );
         }
     }
     if !blitted_by_ce {
@@ -1637,6 +1705,10 @@ pub fn present_now_region(fb_id: u32, crtc_id: u32, rect: Option<(u32, u32, u32,
                 "[drm] fb map after WC ensure: {}",
                 kernel_hal::x86_64::fb_mapping_diag()
             );
+            // Quantify the raw store throughput through that mapping: with the
+            // PTE verified WC, a UC-like number here pins the 42 MB/s blit on
+            // the device side of the BAR, not on the MMU.
+            kernel_hal::x86_64::fb_store_bench_klog("first-present ctx");
         }
     }
     // Establish / enforce compositor VT ownership. The first present claims the
