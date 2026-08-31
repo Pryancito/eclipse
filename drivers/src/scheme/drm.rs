@@ -265,6 +265,14 @@ pub trait DrmScheme: Scheme {
         false
     }
 
+    /// Whether this driver can offload scanout via the copy engine after boot
+    /// bring-up. On dual-GPU NVIDIA setups this is true for a state-loaded
+    /// compute GPU (P2P into the console framebuffer). Used to auto-enable the
+    /// CE present path when manual `nvidia.cepresent` is absent.
+    fn ce_present_ready(&self) -> bool {
+        false
+    }
+
     /// Automatic boot-time compute-GPU bring-up. Runs the proven state-load
     /// chain (attach -> GSP-RM boot -> RM API client -> gpuStateLoad, i.e. the
     /// `/proc/gpustep5;6;8;9` sequence) on every GPU that does NOT drive the
@@ -282,6 +290,14 @@ pub trait DrmScheme: Scheme {
     /// caller suppresses the driver's own log output around this call, so the
     /// desktop console stays clean. Default: nothing.
     fn auto_bringup_compute(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
+    /// Deferred console-GPU bring-up for `nvidia.hwcursor` (gpustep14 chain).
+    /// Called from a background kernel task AFTER the desktop is up and scanout
+    /// has been paused — never from the boot progress path. Returns one status
+    /// line; empty for non-console / non-NVIDIA drivers.
+    fn deferred_console_bringup_for_hwcursor(&self) -> alloc::string::String {
         alloc::string::String::new()
     }
 

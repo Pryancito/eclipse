@@ -4259,6 +4259,44 @@ impl DrmScheme for NvidiaGpu {
         }
     }
 
+    fn ce_present_ready(&self) -> bool {
+        // Dual-GPU: the compute GPU (not driving GOP) state-loads at boot and
+        // can P2P-copy frames into the console framebuffer. The console GPU
+        // itself is never auto-booted (SEC2 wedge), so it never reports ready.
+        !self.drives_boot_display() && self.rm_device_instance.lock().is_some()
+    }
+
+    fn deferred_console_bringup_for_hwcursor(&self) -> String {
+        if !self.drives_boot_display() {
+            return String::new();
+        }
+        if self.rm_device_instance.lock().is_some() {
+            return alloc::format!(
+                "GPU consola {:02x}:{:02x}.0 {} ya state-loaded — cursor HW listo",
+                self.pci_bus,
+                self.pci_device,
+                self.gpu_model,
+            );
+        }
+        // One-shot: ensure_console_gpu_brought_up runs bringup_step14.
+        self.ensure_console_gpu_brought_up();
+        if self.rm_device_instance.lock().is_some() {
+            alloc::format!(
+                "GPU consola {:02x}:{:02x}.0 {} listo — cursor HW habilitado (diferido)",
+                self.pci_bus,
+                self.pci_device,
+                self.gpu_model,
+            )
+        } else {
+            alloc::format!(
+                "GPU consola {:02x}:{:02x}.0 {} sin RM tras bring-up diferido — cursor software",
+                self.pci_bus,
+                self.pci_device,
+                self.gpu_model,
+            )
+        }
+    }
+
     fn ce_present(&self, src_sysmem_pa: u64, size: u64) -> bool {
         if src_sysmem_pa == 0 || size == 0 {
             return false;
@@ -6689,6 +6727,13 @@ impl DrmScheme for NvidiaGpu {
         if w == 0 || h == 0 || w > 64 || h > 64 {
             return false;
         }
+        // Only the GPU driving the monitor has a display-engine cursor plane.
+        // Do NOT call ensure_console_gpu_brought_up() here: GSP-RM on the
+        // console GPU can wedge the bus, and a cursor ioctl must never hang
+        // the compositor. Need RM already up (`cat /proc/gpustep14`).
+        if !self.drives_boot_display() {
+            return false;
+        }
         let Some(dev) = *self.rm_device_instance.lock() else {
             return false;
         };
@@ -8821,12 +8866,11 @@ impl NvidiaGpu {
             }
 
             nv::NR_CHANNEL_ALLOC => {
-                // [auto-bringup] Bring the console GPU fully up on the first GPU
-                // client, BEFORE taking any DRM lock, so this CHANNEL_ALLOC can
-                // be RM-backed and EXEC stops returning ENODEV — without a manual
-                // `cat /proc/gpustep14` (no disk on the target for the capture,
-                // and the GSP-boot deadlocks that made it manual are fixed).
-                // One-shot; a no-op once attached or already attempted.
+                // [auto-bringup] Only THIS GPU. On dual-GPU boxes card0 is the
+                // compute card: ensure_console_gpu_brought_up is a no-op there
+                // (drives_boot_display == false). Never walk other GPUs here —
+                // that used to start console GSP-RM from the first GL client and
+                // freeze the machine the same way boot-time auto-bringup did.
                 self.ensure_console_gpu_brought_up();
                 let mut chan = self.nouveau_channels.lock();
                 if chan.len() >= nv::MAX_CHANNELS {

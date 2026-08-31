@@ -102,7 +102,7 @@ boottrace_arg := $(if $(BOOTTRACE),:BOOTTRACE=$(BOOTTRACE))
 # two-condition rule as everywhere else); any other GPU -> gl-sw; no GPU ->
 # pixman. Force `GL=1` to try nouveau, or edit the ESP's rboot.conf by hand.
 GL ?= auto
-gl_arg := $(if $(filter 0,$(GL)),:renderer=pixman,$(if $(filter sw,$(GL)),:renderer=gl-sw,$(if $(filter 1,$(GL)),:renderer=gl:nvidia.nouveau_uapi,:renderer=auto)))
+gl_arg := $(if $(filter 0,$(GL)),:renderer=pixman,$(if $(filter sw,$(GL)),:renderer=gl-sw,$(if $(filter 1,$(GL)),:renderer=gl:nvidia.nouveau_uapi:nvidia.cepresent,:renderer=auto)))
 
 ifeq ($(LINUX), 1)
   ifeq ($(ARCH), x86_64)

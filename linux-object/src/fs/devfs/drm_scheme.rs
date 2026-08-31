@@ -1628,8 +1628,20 @@ impl INode for DrmDev {
                 // Bound the result to a sane ceiling (64 MiB — a 4K XRGB frame
                 // is ~33 MiB) and require pitch to fit the u32 written back.
                 const MAX_DUMB_SIZE: u64 = 64 * 1024 * 1024;
-                let pitch64 = (info.width as u64 * bpp as u64 / 8 + 63) & !63;
-                let size64 = pitch64.saturating_mul(info.height as u64);
+                let mut pitch64 = (info.width as u64 * bpp as u64 / 8 + 63) & !63;
+                let mut size64 = pitch64.saturating_mul(info.height as u64);
+                // When the compositor requests a full-screen dumb buffer, align
+                // its pitch with the display scanout pitch so the CE-offload
+                // present path can fire (flat copy needs equal strides). Without
+                // this, wlroots' 64-byte-aligned pitch often differs from the
+                // GOP framebuffer pitch and every frame falls back to the slow
+                // CPU blit (~7-10 FPS on dual RTX).
+                if let Some((dw, dh, dp)) = drm::display_mode() {
+                    if info.width == dw && info.height == dh && dp as u64 >= pitch64 {
+                        pitch64 = dp as u64;
+                        size64 = pitch64.saturating_mul(info.height as u64);
+                    }
+                }
                 if pitch64 == 0
                     || pitch64 > u32::MAX as u64
                     || size64 == 0

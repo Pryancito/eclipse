@@ -392,24 +392,42 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // copy-engine present path (ce_present over PCIe P2P) is ready
             // before the compositor starts -- no manual `cat /proc/gpustep5;6;8;9`.
             // Runs once, synchronously, before any userspace/scanout touches RM.
-            // Kill switch: boot with `nvidia.noautoboot` on the kernel cmdline.
-            if !options.cmdline.contains("nvidia.noautoboot") {
-                auto_bringup_compute_gpus();
+            // Per-frame CE-offloaded present: when a compute GPU was brought up
+            // at boot (dual RTX: render GPU P2P-copies into the console GOP FB),
+            // enable CE present automatically — it replaces the ~7-10 FPS CPU
+            // blit path with a GPU copy-engine transfer. Explicit opt-in via
+            // `nvidia.cepresent` still works; opt-out with `nvidia.nocepresent`.
+            // On failure CE auto-wedges and falls back to CPU blit (see
+            // CE_PRESENT_WEDGED in nvidia.rs).
+            let ce_ready = if !options.cmdline.contains("nvidia.noautoboot") {
+                auto_bringup_compute_gpus()
             } else {
                 klog_info!("Eclipse: NVIDIA compute-GPU auto bring-up disabled (nvidia.noautoboot)");
-            }
-            // Per-frame CE-offloaded present is strictly OPT-IN: it fires a GPU
-            // DMA on every desktop present and, on real hardware, correlated
-            // with random SIGSEGVs (139) in freshly-started Wayland clients
-            // while the CPU blit was rock solid. Boot with `nvidia.cepresent`
-            // to enable it for testing; the default present is the CPU blit
-            // even when the compute GPU was auto-brought-up above (bring-up
-            // stays useful for /proc/gpustep* work and future acceleration).
-            if options.cmdline.contains("nvidia.cepresent") {
+                false
+            };
+            if options.cmdline.contains("nvidia.nocepresent") {
+                klog_info!("Eclipse: present por CPU (CE-offload disabled: nvidia.nocepresent)");
+            } else if options.cmdline.contains("nvidia.cepresent") || ce_ready {
                 linux_object::fs::devfs::drm::set_ce_present_enabled(true);
-                klog_info!("Eclipse: NVIDIA CE-offload present ENABLED (nvidia.cepresent)");
+                klog_info!(
+                    "Eclipse: NVIDIA CE-offload present ENABLED ({})",
+                    if options.cmdline.contains("nvidia.cepresent") {
+                        "nvidia.cepresent"
+                    } else {
+                        "auto: compute GPU ready"
+                    }
+                );
             } else {
-                klog_info!("Eclipse: present por CPU (CE-offload opt-in: nvidia.cepresent)");
+                klog_info!("Eclipse: present por CPU (CE-offload: no compute GPU ready; try nvidia.cepresent)");
+            }
+            // NOTE: do NOT auto-bring-up the CONSOLE GPU on the boot path.
+            // Deferred bring-up for nvidia.hwcursor is scheduled AFTER 100%
+            // (see schedule_deferred_hwcursor_bringup) with scanout paused.
+            if options.cmdline.contains("nvidia.hwcursor") {
+                klog_info!(
+                    "Eclipse: nvidia.hwcursor ON — bring-up diferido tras escritorio \
+                     (scanout pausado); cursor software hasta entonces"
+                );
             }
             // Atomic modesetting uAPI (DRM_CLIENT_CAP_ATOMIC +
             // DRM_IOCTL_MODE_ATOMIC) is OPT-IN while the legacy-KMS path
@@ -519,6 +537,9 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // Keep secondary CPUs idle until root is mounted and init is spawned.
             STARTED.store(true, Ordering::SeqCst);
             kernel_hal::console::early_progress_bar(100);
+            if options.cmdline.contains("nvidia.hwcursor") {
+                schedule_deferred_hwcursor_bringup();
+            }
             utils::wait_for_exit(lifetime_proc)
         } else if #[cfg(feature = "zircon")] {
             let zbi = fs::zbi();
@@ -632,21 +653,34 @@ fn load_nvidia_gsp_firmware(root: &alloc::sync::Arc<dyn rcore_fs::vfs::INode>) {
 /// copy-engine present path (P2P from a compute GPU into the console's scanout
 /// FB) is ready by the time the compositor runs. General over 1, 2, 3+ GPUs:
 /// a single-console-GPU box brings up nothing and falls back to the CPU blit.
+/// Returns true if at least one compute GPU is ready to offload present.
 #[cfg(feature = "linux")]
-fn auto_bringup_compute_gpus() {
+fn auto_bringup_compute_gpus() -> bool {
     let mut summaries = alloc::vec::Vec::new();
+    let mut any_ce_ready = false;
     // Suppress the driver's own (loud, ERROR-level) bring-up narration for the
     // whole ladder; `auto_bringup_compute` returns just one clean status line
     // per compute GPU (empty for the console GPU / non-NVIDIA drivers). The
     // detail is still captured into /proc/gpustep* for debugging.
     logging::with_output_suppressed(|| {
         for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+            if d.ce_present_ready() {
+                any_ce_ready = true;
+            }
             let line = d.auto_bringup_compute();
             if !line.is_empty() {
                 summaries.push(line);
             }
         }
     });
+    // Re-check after bring-up: auto_bringup_compute may have just state-loaded
+    // the compute GPU(s).
+    if !any_ce_ready {
+        any_ce_ready = kernel_hal::drivers::all_drm()
+            .as_vec()
+            .iter()
+            .any(|d| d.ce_present_ready());
+    }
     // Emit only the tidy summary (klog_emit bypasses the level filter).
     if summaries.is_empty() {
         klog_info!("Eclipse: NVIDIA — sin GPU de cómputo; present por CPU");
@@ -655,6 +689,69 @@ fn auto_bringup_compute_gpus() {
             klog_info!("Eclipse: NVIDIA {}", line);
         }
     }
+    any_ce_ready
+}
+
+/// After the progress bar hits 100% and labwc can start: wait for KD_GRAPHICS,
+/// pause scanout (so BAR1 is quiet), run console-GPU gpustep14 once, then
+/// resume. On success the next MODE_CURSOR can take the HW plane; on failure
+/// the software cursor stays for the rest of the boot. Never blocks boot.
+#[cfg(feature = "linux")]
+fn schedule_deferred_hwcursor_bringup() {
+    klog_info!(
+        "Eclipse: nvidia.hwcursor — tarea diferida programada (espera desktop, luego gpustep14)"
+    );
+    kernel_hal::thread::spawn(async {
+        use core::time::Duration;
+        use kernel_hal::console::{kd_mode, KD_GRAPHICS};
+        use kernel_hal::timer::timer_now;
+
+        // Wait up to ~45s for the compositor to claim the VT (first present
+        // sets KD_GRAPHICS). Poll every 500ms so we do not busy-spin.
+        let deadline = timer_now() + Duration::from_secs(45);
+        let mut saw_graphics = false;
+        while timer_now() < deadline {
+            if kd_mode() == KD_GRAPHICS {
+                saw_graphics = true;
+                break;
+            }
+            kernel_hal::thread::sleep_until(timer_now() + Duration::from_millis(500)).await;
+        }
+        if saw_graphics {
+            // Let labwc finish its first few frames before freezing scanout.
+            kernel_hal::thread::sleep_until(timer_now() + Duration::from_secs(3)).await;
+            kernel_hal::klog_info!(
+                "Eclipse: nvidia.hwcursor — desktop en KD_GRAPHICS; pausando scanout e iniciando bring-up consola"
+            );
+        } else {
+            kernel_hal::klog_info!(
+                "Eclipse: nvidia.hwcursor — timeout esperando KD_GRAPHICS; intentando bring-up igual (scanout pausado)"
+            );
+        }
+
+        linux_object::fs::devfs::drm::set_scanout_paused(true);
+        // Brief settle so in-flight blits/CE finish before SEC2.
+        kernel_hal::thread::sleep_until(timer_now() + Duration::from_millis(200)).await;
+
+        let mut any = false;
+        for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+            let line = d.deferred_console_bringup_for_hwcursor();
+            if !line.is_empty() {
+                any = true;
+                kernel_hal::klog_info!("Eclipse: NVIDIA {}", line);
+            }
+        }
+        if !any {
+            kernel_hal::klog_info!(
+                "Eclipse: nvidia.hwcursor — ninguna GPU consola actuó en bring-up diferido"
+            );
+        }
+
+        linux_object::fs::devfs::drm::set_scanout_paused(false);
+        kernel_hal::klog_info!(
+            "Eclipse: nvidia.hwcursor — bring-up diferido terminado; mueve el ratón para activar el plano HW si RM quedó listo"
+        );
+    });
 }
 
 #[cfg(not(feature = "libos"))]

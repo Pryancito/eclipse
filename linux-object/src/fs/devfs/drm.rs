@@ -49,21 +49,37 @@ static CE_PITCH_MISMATCH_LOGGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 /// Master switch for the per-frame GPU copy-engine present (`ce_present`).
-/// OFF by default: the CE path fires a GPU DMA on EVERY desktop present
-/// (sysmem read of the dumb buffer + P2P write into the console GPU's BAR1 +
-/// two GMMU-translated semaphore writes into system RAM per submission), and
-/// on real hardware it correlated with random SIGSEGVs in freshly-started
-/// Wayland clients (lunarbg/lunarbar/foot Done(139)) while the CPU-blit
-/// present was rock solid. Until the CE path is proven stable, the proven CPU
-/// blit is the default and the CE present is strictly opt-in via the
-/// `nvidia.cepresent` kernel cmdline flag (see zCore/src/main.rs).
+/// Enabled automatically when a compute GPU finishes boot bring-up (dual RTX:
+/// P2P copy into the console GOP FB), or explicitly via `nvidia.cepresent`.
+/// Opt out with `nvidia.nocepresent`. On failure the path auto-wedges and
+/// falls back to the CPU blit for the rest of the boot.
 static CE_PRESENT_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// When set, `present_now_region` / CE present no-op so the console GPU's
+/// BAR1 stays quiet during a deferred GSP-RM bring-up (hwcursor path).
+static SCANOUT_PAUSED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 /// Enable/disable the per-frame CE-offloaded present (set once at boot from
 /// the `nvidia.cepresent` cmdline flag).
 pub fn set_ce_present_enabled(on: bool) {
     CE_PRESENT_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// Pause/resume software+CE scanout. Used by deferred console-GPU GSP bring-up
+/// so labwc's frame loop does not write BAR1 during SEC2 STARTCPU.
+pub fn set_scanout_paused(on: bool) {
+    SCANOUT_PAUSED.store(on, Ordering::SeqCst);
+    if on {
+        kernel_hal::klog_info!("[drm] scanout PAUSED (console GSP bring-up window)");
+    } else {
+        kernel_hal::klog_info!("[drm] scanout RESUMED");
+    }
+}
+
+pub fn scanout_paused() -> bool {
+    SCANOUT_PAUSED.load(Ordering::SeqCst)
 }
 
 /// Master switch for the atomic-modesetting uAPI (`DRM_CLIENT_CAP_ATOMIC` +
@@ -268,6 +284,9 @@ struct CursorState {
 }
 
 lazy_static::lazy_static! {
+    /// Reused compose buffer for software-cursor patches (avoids a heap alloc
+    /// on every pointer motion).
+    static ref CURSOR_PATCH: Mutex<Vec<u32>> = Mutex::new(Vec::new());
     static ref DRM_STATE: Mutex<DrmState> = Mutex::new(DrmState {
         drivers: Vec::new(),
         next_handle_id: 1,
@@ -579,14 +598,11 @@ pub fn set_crtc_fb(_crtc_id: u32, fb_id: u32) {
     DRM_STATE.lock().crtc_fb = fb_id;
 }
 
-/// Rows per [`blit_chunked`] band. 32 rows is ~256 KiB at 1920-wide ARGB —
-/// ≲100 µs even at modest write-combining throughput, so the interrupts-off
-/// window per band stays far below a timer tick — while the per-band overhead
-/// (the intr_off/intr_on pair, the blit_from call) stays negligible next to
-/// the copy itself. Each band's copy is short enough that at most one IRQ
-/// nests per between-band window, the same worst case the original whole-blit
-/// intr_off fix was defending against.
-const BLIT_CHUNK_ROWS: u32 = 32;
+/// Rows per [`blit_chunked`] band. 128 rows is ~2 MiB at 1920-wide ARGB —
+/// large enough to amortize the intr_off/intr_on overhead on real hardware
+/// (where WC framebuffer writes are fast) while still keeping each band well
+/// under a timer tick.
+const BLIT_CHUNK_ROWS: u32 = 128;
 
 /// Blit `pixels` (row-major, `src_stride` u32s per row, already offset so
 /// `pixels[0]` is the rectangle's top-left) into `display` at
@@ -972,7 +988,7 @@ pub fn move_cursor(x: i32, y: i32) {
 /// scene, which has no cursor baked in) and composite the new cursor on top.
 /// Only two ~64x64 windows are touched per move.
 pub fn repaint_for_cursor() {
-    if !software_kms_active() {
+    if !software_kms_active() || SCANOUT_PAUSED.load(Ordering::SeqCst) {
         return;
     }
     // Snapshot everything needed under the lock, and record the rect we are
@@ -1028,27 +1044,186 @@ pub fn repaint_for_cursor() {
     // mapped at `vaddr`; read as `fb.size / 4` u32 pixels.
     let pixels = unsafe { core::slice::from_raw_parts(vaddr as *const u32, fb.size / 4) };
     let src_stride = (fb.pitch / 4) as usize;
-    // Erase the old cursor by restoring the scene under it. Grow the restored
-    // rect by one pixel on every side so an antialiased edge from the previous
-    // composite is fully overwritten.
-    if let Some((ox, oy, ow, oh)) = old_rect {
-        restore_rect(
-            &*display,
-            pixels,
-            src_stride,
-            fw,
-            fh,
-            ox - 1,
-            oy - 1,
-            ow + 2,
-            oh + 2,
-        );
+    // Compose in cached sysmem (the CRTC dumb buffer), then one write-only
+    // blit to GOP. Never read the display aperture: that RMW is why the
+    // pointer felt sticky compared to eclipse-old's sw_cursor (tiny dirty
+    // writes). When old and new rects overlap, one union blit covers erase
+    // + draw; otherwise restore then paint.
+    let old_expanded = old_rect.map(|(ox, oy, ow, oh)| (ox - 1, oy - 1, ow + 2, oh + 2));
+    match (old_expanded, new.as_ref()) {
+        (Some((ox, oy, ow, oh)), Some((nx, ny, nw, nh, bmp))) => {
+            let (ux, uy, uw, uh) = union_i32(ox, oy, ow, oh, *nx, *ny, *nw, *nh);
+            if rects_overlap(ox, oy, ow, oh, *nx, *ny, *nw, *nh) {
+                blit_cursor_patch(
+                    &*display,
+                    pixels,
+                    src_stride,
+                    fw,
+                    fh,
+                    ux,
+                    uy,
+                    uw,
+                    uh,
+                    *nx,
+                    *ny,
+                    *nw,
+                    *nh,
+                    bmp,
+                );
+            } else {
+                restore_rect(&*display, pixels, src_stride, fw, fh, ox, oy, ow, oh);
+                blit_cursor_patch(
+                    &*display,
+                    pixels,
+                    src_stride,
+                    fw,
+                    fh,
+                    *nx,
+                    *ny,
+                    *nw,
+                    *nh,
+                    *nx,
+                    *ny,
+                    *nw,
+                    *nh,
+                    bmp,
+                );
+            }
+        }
+        (Some((ox, oy, ow, oh)), None) => {
+            restore_rect(&*display, pixels, src_stride, fw, fh, ox, oy, ow, oh);
+        }
+        (None, Some((nx, ny, nw, nh, bmp))) => {
+            blit_cursor_patch(
+                &*display,
+                pixels,
+                src_stride,
+                fw,
+                fh,
+                *nx,
+                *ny,
+                *nw,
+                *nh,
+                *nx,
+                *ny,
+                *nw,
+                *nh,
+                bmp,
+            );
+        }
+        (None, None) => {}
     }
-    // Composite the cursor at its new position.
-    if let Some((nx, ny, nw, nh, bmp)) = new {
-        display.blit_argb_over(nx, ny, &bmp, nw as usize, nw, nh);
+}
+
+fn rects_overlap(ax: i32, ay: i32, aw: u32, ah: u32, bx: i32, by: i32, bw: u32, bh: u32) -> bool {
+    let ax1 = ax.saturating_add(aw as i32);
+    let ay1 = ay.saturating_add(ah as i32);
+    let bx1 = bx.saturating_add(bw as i32);
+    let by1 = by.saturating_add(bh as i32);
+    ax < bx1 && bx < ax1 && ay < by1 && by < ay1
+}
+
+fn union_i32(
+    ax: i32,
+    ay: i32,
+    aw: u32,
+    ah: u32,
+    bx: i32,
+    by: i32,
+    bw: u32,
+    bh: u32,
+) -> (i32, i32, u32, u32) {
+    let x0 = ax.min(bx);
+    let y0 = ay.min(by);
+    let x1 = ax.saturating_add(aw as i32).max(bx.saturating_add(bw as i32));
+    let y1 = ay.saturating_add(ah as i32).max(by.saturating_add(bh as i32));
+    (
+        x0,
+        y0,
+        x1.saturating_sub(x0).max(0) as u32,
+        y1.saturating_sub(y0).max(0) as u32,
+    )
+}
+
+/// Copy `patch` of the CRTC fb, blend the cursor into it in RAM, blit once.
+fn blit_cursor_patch(
+    display: &dyn DisplayScheme,
+    pixels: &[u32],
+    src_stride: usize,
+    fw: u32,
+    fh: u32,
+    px: i32,
+    py: i32,
+    pw: u32,
+    ph: u32,
+    cx: i32,
+    cy: i32,
+    cw: u32,
+    ch: u32,
+    bmp: &[u32],
+) {
+    if src_stride == 0 || pw == 0 || ph == 0 {
+        return;
     }
-    let _ = display.flush();
+    let x0 = px.max(0);
+    let y0 = py.max(0);
+    let x1 = (px + pw as i32).min(fw as i32);
+    let y1 = (py + ph as i32).min(fh as i32);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let tw = (x1 - x0) as usize;
+    let th = (y1 - y0) as usize;
+    let need = tw.saturating_mul(th);
+    let mut slot = CURSOR_PATCH.lock();
+    if slot.len() < need {
+        slot.resize(need, 0);
+    }
+    let patch = &mut slot[..need];
+    for r in 0..th {
+        let src_y = y0 as usize + r;
+        let src_off = src_y.saturating_mul(src_stride).saturating_add(x0 as usize);
+        let dst_off = r * tw;
+        let n = tw.min(pixels.len().saturating_sub(src_off));
+        if n == 0 {
+            break;
+        }
+        patch[dst_off..dst_off + n].copy_from_slice(&pixels[src_off..src_off + n]);
+        let cr = (y0 + r as i32) - cy;
+        if cr < 0 || cr >= ch as i32 {
+            continue;
+        }
+        let bmp_row = cr as usize * cw as usize;
+        for c in 0..n {
+            let cc = (x0 + c as i32) - cx;
+            if cc < 0 || cc >= cw as i32 {
+                continue;
+            }
+            let si = bmp_row + cc as usize;
+            if si >= bmp.len() {
+                break;
+            }
+            let s = bmp[si];
+            let a = s >> 24;
+            if a == 0 {
+                continue;
+            }
+            let di = dst_off + c;
+            patch[di] = if a == 0xff {
+                s | 0xFF00_0000
+            } else {
+                let d = patch[di];
+                let inv = 255 - a;
+                let (sr, sg, sb) = ((s >> 16) & 0xff, (s >> 8) & 0xff, s & 0xff);
+                let (dr, dg, db) = ((d >> 16) & 0xff, (d >> 8) & 0xff, d & 0xff);
+                let or = (sr + dr * inv / 255).min(0xff);
+                let og = (sg + dg * inv / 255).min(0xff);
+                let ob = (sb + db * inv / 255).min(0xff);
+                0xFF00_0000 | (or << 16) | (og << 8) | ob
+            };
+        }
+    }
+    display.blit_from(x0 as u32, y0 as u32, &patch, tw, tw as u32, th as u32);
 }
 
 /// Restore the `(x, y, w, h)` window of the display from the CRTC framebuffer
@@ -1379,6 +1554,12 @@ pub fn present_now(fb_id: u32, crtc_id: u32) -> bool {
 /// here. Ignored on the hardware-KMS path: a real driver's `page_flip` scans
 /// out via its own GPU DMA, not the CPU blit this exists to shrink.
 pub fn present_now_region(fb_id: u32, crtc_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
+    // Deferred console GSP bring-up: acknowledge the flip to keep the
+    // compositor alive, but do not touch the GOP framebuffer / CE path.
+    if SCANOUT_PAUSED.load(Ordering::SeqCst) {
+        set_crtc_fb(crtc_id, fb_id);
+        return true;
+    }
     if !PRESENT_LOGGED.swap(true, Ordering::Relaxed) {
         // Read `graphics_vt` into a local FIRST: `DRM_STATE.lock()` as a direct
         // argument to `warn!` keeps the MutexGuard temporary alive for the
