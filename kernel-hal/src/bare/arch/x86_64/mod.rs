@@ -85,10 +85,6 @@ pub fn primary_init() {
     // console never pushes a frame through uncached stores. See `pat.rs`.
     pat::init_this_cpu();
     pat::enable_framebuffer_wc();
-    // Detect CPU features used by the DMA-sync path (CLFLUSHOPT). Must run
-    // before the driver stack initialises so `dma_sync_wb_from_device` can
-    // pick the fast path on the very first scanout.
-    zcore_drivers::utils::dma_sync::probe_cpu_features();
     drivers::init().unwrap();
     warn!("[boot] drivers init complete");
     unsafe {
