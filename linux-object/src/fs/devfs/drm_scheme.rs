@@ -1533,14 +1533,26 @@ impl INode for DrmDev {
                     kernel_hal::console::set_kd_mode(kernel_hal::console::KD_TEXT);
                 }
                 // Forget the compositor's DRM VT ownership so text consoles are
-                // no longer gated off screen/input, and drop its atomic-client
-                // negotiation so the next (possibly legacy-only) client starts
-                // with a clean property view. Also cancel any deferred
-                // flip/vblank events — a late timer would otherwise feed
-                // drmHandleEvent with freed user_data.
+                // no longer gated off screen/input (a live compositor's next
+                // present re-claims it).
+                //
+                // Deliberately NOT done here any more (both were Linux-divergent
+                // and both were mutated GLOBALLY by whichever client dropped
+                // master, clobbering the live compositor's state):
+                //  * cancel_pending_events(): pending DRM events belong to the
+                //    drm_file that queued them and survive a master drop in
+                //    Linux. A transient DROP_MASTER from a probing client
+                //    (Xwayland at session bring-up) inside the one-vblank window
+                //    after labwc's first page-flip swallowed labwc's completion
+                //    -- wlroots waited on it forever and the desktop froze on
+                //    its first frame until a VT cycle forced a re-enable. Events
+                //    are now cancelled only when the flip-owning process EXITS
+                //    (drm::cancel_events_for_exit in release_process).
+                //  * set_atomic_client(false): DRM_CLIENT_CAP_ATOMIC is
+                //    per-file in Linux and never revoked by a master drop;
+                //    clearing it globally made the compositor's atomic
+                //    property view flip mid-session.
                 drm::clear_graphics_owner();
-                drm::cancel_pending_events();
-                drm::set_atomic_client(false);
                 Ok(0)
             }
             DRM_IOCTL_SET_VERSION => {
