@@ -32,8 +32,15 @@ use lock::Mutex;
 pub static os_page_size: NvU64 = 4096;
 #[no_mangle]
 pub static os_max_page_size: NvU64 = 4096;
+// NV_PAGE_MASK semantics (kernel-open/nvidia/os-interface.c:53 + usage at
+// :1523-1525): the page-ALIGNMENT mask -- `start & os_page_mask` keeps the
+// page BASE and `start & ~os_page_mask` the in-page offset. The old value
+// 0xFFF was the bitwise COMPLEMENT of the contract: any consumer would have
+// collapsed addresses to their low 12 bits. Latent today (the arch/nvalloc
+// files that read it are not compiled in), but a wrong-typed constant on a
+// live export is a trap for every future vendoring step.
 #[no_mangle]
-pub static os_page_mask: NvU64 = 0xFFF;
+pub static os_page_mask: NvU64 = !0xFFFu64;
 #[no_mangle]
 pub static os_page_shift: NvU8 = 12;
 #[no_mangle]

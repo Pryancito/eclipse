@@ -1198,6 +1198,14 @@ fn arm_coalesced_drm_timer(pending: PendingDrmTimer) {
     arm_coalesced_drm_timer_locked();
 }
 
+/// The pid whose page-flip completion is (or was last) in flight. Flip events
+/// belong to the compositor that submitted the flip -- in Linux they are
+/// per-drm_file and survive DROP_MASTER; only closing the file destroys them.
+/// This tag lets `cancel_events_for_exit` cancel them when THAT process dies
+/// (the freed-user_data hazard) without letting any other client's
+/// DROP_MASTER/exit swallow a live compositor's completion.
+static LAST_FLIP_PID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 fn schedule_flip_event(crtc_id: u32, user_data: u64) {
     // Set FLIP_EVENT_PENDING and push the job INSIDE the same lock acquisition
     // as arm_coalesced_drm_timer, so that flush_pending_flip_completions can
@@ -1207,6 +1215,7 @@ fn schedule_flip_event(crtc_id: u32, user_data: u64) {
     // flush seeing an empty queue yet FLIP_EVENT_PENDING = true -> EBUSY ->
     // wlroots tears down the output on the very first few frames (real hardware,
     // where multi-core interleaving makes the race non-negligible).
+    LAST_FLIP_PID.store(current_pid(), Ordering::Relaxed);
     {
         let mut q = PENDING_DRM_TIMERS.lock();
         FLIP_EVENT_PENDING.store(true, Ordering::Release);
@@ -1272,8 +1281,20 @@ pub fn schedule_vblank_event(signal: u64) {
 }
 
 /// Drop any not-yet-posted flip/vblank completions (timer queue + readable
-/// event bytes). Called from `DROP_MASTER` so a compositor teardown cannot
-/// leave a timer that later feeds `drmHandleEvent` with a stale `user_data`.
+/// event bytes).
+///
+/// NOT called from `DROP_MASTER` any more -- that was Linux-divergent and
+/// broke real-hardware boots: pending DRM events belong to the drm_file that
+/// queued them and SURVIVE a master drop (Linux only destroys them when the
+/// file closes). Eclipse's single global event stream meant a TRANSIENT
+/// DROP_MASTER from a probing client (Xwayland during session bring-up)
+/// landed inside the ~one-vblank window between labwc's page-flip and its
+/// completion, swallowed the flip event, and wlroots then waited on it
+/// forever: the desktop froze on its very first frame until a VT
+/// switch-away/back forced seatd to re-enable the session (fresh modeset +
+/// flip). Cancellation now happens only on the flip owner's EXIT (see
+/// `cancel_events_for_exit`), which is what the freed-user_data safety
+/// actually needs.
 pub fn cancel_pending_events() {
     PENDING_DRM_TIMERS.lock().clear();
     DRM_TIMER_ARMED.store(false, Ordering::Release);
@@ -1281,6 +1302,21 @@ pub fn cancel_pending_events() {
     let mut state = DRM_STATE.lock();
     state.events.clear();
     state.eventbus.lock().clear(Event::READABLE);
+}
+
+/// Cancel pending flip/vblank completions IF `pid` is the process whose flip
+/// is in flight. Called from `release_process` (process exit): a dead
+/// compositor must not leave a timer that later feeds a reader with a stale
+/// `user_data`, but an unrelated DRM client's exit must never swallow a live
+/// compositor's completion.
+pub fn cancel_events_for_exit(pid: u64) {
+    if pid != 0 && LAST_FLIP_PID.load(Ordering::Relaxed) == pid {
+        kernel_hal::klog_info!(
+            "[drm] pid={} exited with its flip completion pending -- cancelling events",
+            pid
+        );
+        cancel_pending_events();
+    }
 }
 
 /// Advance the synthetic vblank clock and return the monotonic instant the next
@@ -1870,6 +1906,12 @@ pub fn release_process(pid: u64) -> usize {
     if pid == 0 {
         return 0;
     }
+    // If this process died with its page-flip completion still pending, drop
+    // those events NOW: a later timer must not feed a reader a dead process's
+    // user_data. (This is the fd-lifetime cancellation Linux does at file
+    // close; DROP_MASTER deliberately no longer cancels events -- see
+    // cancel_pending_events.)
+    cancel_events_for_exit(pid);
     let (doomed, driver) = {
         let mut state = DRM_STATE.lock();
         if !state.handles.iter().any(|(_, _, owner)| *owner == pid) {

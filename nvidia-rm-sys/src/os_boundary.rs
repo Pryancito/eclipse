@@ -221,10 +221,17 @@ pub extern "C" fn osCgroupUnregisterRegion(region: *mut c_void) {
     let _ = region;
 }
 
+/// Real contract (os.h:675): `NvBool osCheckAccess(RsAccessRight accessRight)`
+/// where `RsAccessRight` is `NvU16` passed BY VALUE (rs_access.h:73) -- the
+/// replaced stub typed it as a pointer AND hard-returned NV_FALSE, denying
+/// every access-right check (e.g. RS_ACCESS_PERFMON for the FECS
+/// profiling/bind path) in a kernel that runs fully privileged
+/// (os_is_administrator == NV_TRUE). Linux forwards this to os_check_access,
+/// whose Eclipse implementation (os_interface.rs) grants -- match it.
 #[no_mangle]
-pub extern "C" fn osCheckAccess(accessRight: *mut c_void) -> NvBool {
-    let _ = accessRight;
-    NV_FALSE
+pub extern "C" fn osCheckAccess(access_right: NvU16) -> NvBool {
+    let _ = access_right;
+    NV_TRUE
 }
 
 #[no_mangle]
@@ -1478,17 +1485,20 @@ pub extern "C" fn osGetEgmInfo(
     NV_ERR_NOT_SUPPORTED
 }
 
+/// Real contract (g_os_nvoc.h:748): FOUR parameters -- `osGetFbNumaInfo(OBJGPU
+/// *pGpu, NvU64 *pAddrPhys, NvU64 *pAddrRsvdPhys, NvS32 *pNodeId)`. The
+/// replaced stub inserted a phantom `pSizePhys` in the middle, shifting the
+/// last two parameters one register right (inert only because the stub
+/// discarded everything; memory-corrupting the moment it did not).
 #[no_mangle]
 pub extern "C" fn osGetFbNumaInfo(
     pGpu: *mut c_void,
     pAddrPhys: *mut NvU64,
-    pSizePhys: *mut NvU64,
     pAddrRsvdPhys: *mut NvU64,
     pNodeId: *mut NvS32,
 ) -> NV_STATUS {
     let _ = pGpu;
     let _ = pAddrPhys;
-    let _ = pSizePhys;
     let _ = pAddrRsvdPhys;
     let _ = pNodeId;
     NV_ERR_NOT_SUPPORTED
@@ -1866,22 +1876,40 @@ pub extern "C" fn osLockShouldToggleInterrupts(arg0: *mut c_void) -> NvBool {
 // gpuStateLoad crash on real hardware. Same bug family as the
 // osMapPciMemoryKernel64/Old fix below.
 
+/// `MemoryArea` (nv_memory_area.h): passed BY VALUE to
+/// osMapPciMemoryAreaUser -- 16 bytes, TWO SysV integer registers. The
+/// replaced stub declared a single pointer in its place, shifting every later
+/// parameter by one register.
+#[repr(C)]
+pub struct MemoryArea {
+    pub p_ranges: *mut c_void, // MemoryRange *pRanges
+    pub num_ranges: NvU64,
+}
+
+/// Real contract (g_os_nvoc.h:360): `NV_STATUS
+/// OSMapPciMemoryAreaUser(OS_GPU_INFO *, MemoryArea, NvU32, NvU32, NvP64 *,
+/// NvP64 *)`. The replaced stub also returned `*mut c_void` NULL -- a false
+/// NV_OK that let the discontiguous-BAR1 user-mapping path (mapping_cpu.c)
+/// publish a garbage CPU mapping from the never-written out-params. Same bug
+/// family as the osMapGPU / osMapPciMemoryKernel64 crashes documented above.
+/// Eclipse has no user-level PCI mapping path: fail HONESTLY so callers take
+/// their error path instead of dereferencing stack garbage.
 #[no_mangle]
 pub extern "C" fn osMapPciMemoryAreaUser(
-    arg0: *mut c_void,
-    arg1: *mut c_void,
-    arg2: NvU32,
-    arg3: NvU32,
-    arg4: *mut c_void,
-    arg5: *mut c_void,
-) -> *mut c_void {
-    let _ = arg0;
-    let _ = arg1;
-    let _ = arg2;
-    let _ = arg3;
-    let _ = arg4;
-    let _ = arg5;
-    core::ptr::null_mut()
+    p_os_gpu_info: *mut c_void,
+    mem_area: MemoryArea,
+    protect: NvU32,
+    mode_flag: NvU32,
+    p_address: *mut c_void,
+    p_priv: *mut c_void,
+) -> NV_STATUS {
+    let _ = p_os_gpu_info;
+    let _ = mem_area;
+    let _ = protect;
+    let _ = mode_flag;
+    let _ = p_address;
+    let _ = p_priv;
+    NV_ERR_NOT_SUPPORTED
 }
 
 #[no_mangle]
@@ -1935,24 +1963,32 @@ pub extern "C" fn osMapPciMemoryKernelOld(
     NV_OK
 }
 
+/// Real contract (g_os_nvoc.h:359): `NV_STATUS OSMapPciMemoryUser(OS_GPU_INFO
+/// *, RmPhysAddr, NvU64, NvU32, NvP64 *, NvP64 *, NvU32)`. The replaced stub
+/// returned `*mut c_void` NULL -- a false NV_OK with the address out-params
+/// never written, so the user-level USERD/BAR1 mapping paths
+/// (kernel_channel.c:4443, mem_desc.c:1913, mapping_cpu.c:514) would publish
+/// garbage pointers on "success". Exactly the bug family that crashed
+/// gpuStateLoad via osMapGPU (see the note above). Eclipse has no user-level
+/// PCI mapping: fail honestly.
 #[no_mangle]
 pub extern "C" fn osMapPciMemoryUser(
-    arg0: *mut c_void,
-    arg1: NvU64,
-    arg2: NvU64,
-    arg3: NvU32,
-    arg4: *mut c_void,
-    arg5: *mut c_void,
-    arg6: NvU32,
-) -> *mut c_void {
-    let _ = arg0;
-    let _ = arg1;
-    let _ = arg2;
-    let _ = arg3;
-    let _ = arg4;
-    let _ = arg5;
-    let _ = arg6;
-    core::ptr::null_mut()
+    p_os_gpu_info: *mut c_void,
+    bus_address: NvU64,
+    length: NvU64,
+    protect: NvU32,
+    p_address: *mut c_void,
+    p_priv: *mut c_void,
+    mode_flag: NvU32,
+) -> NV_STATUS {
+    let _ = p_os_gpu_info;
+    let _ = bus_address;
+    let _ = length;
+    let _ = protect;
+    let _ = p_address;
+    let _ = p_priv;
+    let _ = mode_flag;
+    NV_ERR_NOT_SUPPORTED
 }
 
 // osMapSystemMemory: real impl in vendor/eclipse_rm_mem.c.
@@ -1988,22 +2024,30 @@ pub extern "C" fn osModifyGpuSwStatePersistence(arg0: *mut c_void, arg1: NvBool)
     let _ = arg1;
 }
 
+/// Real contract (g_os_nvoc.h:307): `NV_STATUS OSNotifyEvent(OBJGPU *,
+/// PEVENTNOTIFICATION, NvU32, NvU32, NV_STATUS)` -- FIVE parameters, NV_STATUS
+/// return. The auto-stub this replaced declared SIX parameters and a
+/// `*mut c_void` NULL return: on SysV the NULL read back as NV_OK (masking
+/// every delivery "success"), and the callee read a 6th argument register the
+/// C callers (kernel_gsp.c:496, event.c:613, timer.c:475) never set. Eclipse
+/// has no userspace event-delivery infrastructure (everything is polled), so
+/// honestly report NV_OK as a deliberate no-op with the CORRECT ABI -- the
+/// behavior is unchanged, the type lie is gone. Wiring real delivery (GSP
+/// async error events -> a client notifier) is a known follow-up.
 #[no_mangle]
 pub extern "C" fn osNotifyEvent(
-    arg0: *mut c_void,
-    arg1: *mut c_void,
-    arg2: NvU32,
-    arg3: NvU32,
-    arg4: NV_STATUS,
-    arg5: NvBool,
-) -> *mut c_void {
-    let _ = arg0;
-    let _ = arg1;
-    let _ = arg2;
-    let _ = arg3;
-    let _ = arg4;
-    let _ = arg5;
-    core::ptr::null_mut()
+    pGpu: *mut c_void,
+    pNotifyEvent: *mut c_void,
+    notifyIndex: NvU32,
+    info32: NvU32,
+    status: NV_STATUS,
+) -> NV_STATUS {
+    let _ = pGpu;
+    let _ = pNotifyEvent;
+    let _ = notifyIndex;
+    let _ = info32;
+    let _ = status;
+    NV_OK
 }
 
 #[no_mangle]
