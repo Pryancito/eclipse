@@ -183,9 +183,11 @@ unsafe fn nt_copy_row_aligned(dst: *mut u8, src: *const u8, width_bytes: usize) 
 /// Copy `height` rows of `width_bytes` bytes each from `src` to `dst`, using
 /// non-temporal loads for the source on capable CPUs.
 ///
-/// A `MOVNTDQA` load bypasses the cache hierarchy, so stale lines from the
-/// previous frame's blit are never resident — the scanout path can skip
-/// `clflush_span` entirely when this returns `true`.
+/// NOTE: `MOVNTDQA` only bypasses the cache on WC-mapped memory (Intel SDM
+/// vol. 1 §12.10.3); on an ordinary write-back mapping it behaves as a plain
+/// cached load, so it does NOT make a preceding `clflush_span` of a WB source
+/// skippable, and it cannot speed up a present whose bottleneck is the store
+/// side. Kept for a future WC-source path; currently unused by the scanout.
 pub fn nt_blit_rows(
     dst: *mut u8,
     dst_stride: usize,
@@ -200,14 +202,30 @@ pub fn nt_blit_rows(
     #[cfg(target_arch = "x86_64")]
     {
         if HAS_NT_BLIT.load(Ordering::Relaxed) && (src as usize) % 16 == 0 {
-            for r in 0..height {
-                unsafe {
+            // The row copies clobber xmm0, which belongs to the interrupted
+            // USER context: this soft-float kernel never saves vector state on
+            // syscall entry, so without a save/restore the caller returns to
+            // userspace with a corrupted xmm0 (Mesa's SSE code then fails in
+            // ways that look nothing like the real cause).
+            let mut xmm0_save = [0u8; 16];
+            unsafe {
+                core::arch::asm!(
+                    "movdqu [{buf}], xmm0",
+                    buf = in(reg) xmm0_save.as_mut_ptr(),
+                    options(nostack, preserves_flags),
+                );
+                for r in 0..height {
                     nt_copy_row_aligned(
                         dst.add(r * dst_stride),
                         src.add(r * src_stride),
                         width_bytes,
                     );
                 }
+                core::arch::asm!(
+                    "movdqu xmm0, [{buf}]",
+                    buf = in(reg) xmm0_save.as_ptr(),
+                    options(nostack, preserves_flags),
+                );
             }
             return true;
         }
