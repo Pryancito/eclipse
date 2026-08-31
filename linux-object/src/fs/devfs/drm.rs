@@ -16,7 +16,6 @@ use crate::sync::{Event, EventBus};
 use kernel_hal::drivers;
 use kernel_hal::mem::phys_to_virt;
 pub use zcore_drivers::scheme::drm::{DrmCaps, DrmConnector, DrmCrtc, DrmPlane, GemHandle};
-use zcore_drivers::prelude::ColorFormat;
 use zcore_drivers::scheme::{DisplayScheme, DrmScheme};
 use zircon_object::vm::{pages, MMUFlags, VmObject};
 
@@ -734,77 +733,6 @@ fn blit_chunked(
     }
 }
 
-/// Like [`blit_chunked`], but reads the source with `MOVNTDQA` (non-temporal
-/// load) so stale cache lines from the previous frame never need a `clflush`.
-///
-/// Returns `true` when the NT blit completed.  The caller must skip both
-/// `dma_sync_wb_from_device` and [`blit_chunked`] in that case.
-fn nt_blit_chunked(
-    display: &Arc<dyn DisplayScheme>,
-    dst_x: u32,
-    dst_y: u32,
-    src: &[u32],
-    src_stride: usize,
-    width: u32,
-    height: u32,
-) -> bool {
-    if !zcore_drivers::utils::dma_sync::has_nt_blit() {
-        return false;
-    }
-    let info = display.info();
-    if info.format != ColorFormat::ARGB8888 {
-        return false;
-    }
-    let dst_pitch = info.pitch() as usize;
-    let dst_base = info.fb_base_vaddr as *mut u8;
-    let width_bytes = (width as usize) * 4;
-    let src_ptr = src.as_ptr() as *const u8;
-    let src_stride_bytes = src_stride * 4;
-
-    let last_dst_row = (dst_y as usize)
-        .saturating_add(height as usize)
-        .saturating_sub(1);
-    let last_byte = last_dst_row
-        .saturating_mul(dst_pitch)
-        .saturating_add((dst_x as usize) * 4)
-        .saturating_add(width_bytes)
-        .saturating_sub(1);
-    if last_byte >= info.fb_size {
-        return false;
-    }
-
-    let mut row = 0u32;
-    while row < height {
-        let band_h = BLIT_CHUNK_ROWS.min(height - row) as usize;
-        let band_src = unsafe { src_ptr.add(row as usize * src_stride_bytes) };
-        let band_dst = unsafe {
-            dst_base.add((dst_y as usize + row as usize) * dst_pitch + (dst_x as usize) * 4)
-        };
-
-        let irq_on = kernel_hal::interrupt::intr_get();
-        if irq_on {
-            kernel_hal::interrupt::intr_off();
-        }
-        let used_nt = zcore_drivers::utils::dma_sync::nt_blit_rows(
-            band_dst,
-            dst_pitch,
-            band_src,
-            src_stride_bytes,
-            width_bytes,
-            band_h,
-        );
-        if irq_on {
-            kernel_hal::interrupt::intr_on();
-        }
-
-        if !used_nt {
-            return false;
-        }
-        row += band_h as u32;
-    }
-    true
-}
-
 /// Copy a framebuffer's pixels to the hardware display ("scan out").
 ///
 /// Used by the software KMS path (no GPU driver): the dumb buffer is contiguous
@@ -885,10 +813,15 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     if blit_w == 0 || blit_h == 0 {
         return true;
     }
-    let is_gem_buf = zcore_drivers::scheme::gem_mmap::lookup(fb.gem_handle_id).is_some();
     let src_off = (blit_y as usize)
         .saturating_mul(src_stride)
         .saturating_add(blit_x as usize);
+    // Real-hardware GL/NVK clients render into nouveau GEM_NEW buffers that
+    // the CPU present path then READS through the write-back physmap alias —
+    // both the CPU blit and the CE staging repack. Without this FromDevice
+    // sync stale lines from the previous frame stay resident and the screen
+    // stops repainting. (MOVNTDQA does not lift this: non-temporal loads only
+    // bypass the cache on WC memory, not on this WB alias.)
     let t0 = kernel_hal::timer::timer_now();
     if zcore_drivers::scheme::gem_mmap::lookup(fb.gem_handle_id).is_some() {
         let sync_start_px = (blit_y as usize)
@@ -951,12 +884,11 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
             }
         }
     }
-    let mut blit_kind = "cpu";
     if !blitted_by_ce {
-        // GEM/NVK fast path: MOVNTDQA reads bypass the cache — no clflush.
-        let did_nt = is_gem_buf
-            && src_off < pixels.len()
-            && nt_blit_chunked(
+        // Banded blit with IRQs briefly re-enabled between bands — see
+        // [`blit_chunked`]. Honours a DIRTYFB damage rect when present.
+        if src_off < pixels.len() {
+            blit_chunked(
                 &display,
                 blit_x,
                 blit_y,
@@ -965,45 +897,7 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
                 blit_w,
                 blit_h,
             );
-        if did_nt {
-            blit_kind = "nt";
-        } else {
-            if is_gem_buf {
-                let sync_start_px = (blit_y as usize)
-                    .saturating_mul(src_stride)
-                    .saturating_add(blit_x as usize);
-                let sync_end_px = (blit_y as usize)
-                    .saturating_add((blit_h as usize).saturating_sub(1))
-                    .saturating_mul(src_stride)
-                    .saturating_add(blit_x as usize)
-                    .saturating_add(blit_w as usize);
-                if sync_end_px > sync_start_px {
-                    let byte_off = sync_start_px.saturating_mul(4).min(fb.size);
-                    let byte_len = sync_end_px
-                        .saturating_sub(sync_start_px)
-                        .saturating_mul(4)
-                        .min(fb.size.saturating_sub(byte_off));
-                    zcore_drivers::utils::dma_sync::dma_sync_wb_from_device(
-                        vaddr + byte_off,
-                        byte_len,
-                    );
-                }
-            }
-            t_sync = kernel_hal::timer::timer_now();
-            if src_off < pixels.len() {
-                blit_chunked(
-                    &display,
-                    blit_x,
-                    blit_y,
-                    &pixels[src_off..],
-                    src_stride,
-                    blit_w,
-                    blit_h,
-                );
-            }
         }
-    } else {
-        blit_kind = "CE";
     }
     if rect.is_none() {
         let t_blit = kernel_hal::timer::timer_now();
@@ -1013,7 +907,7 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
                 "[drm] present #{}: sync {}us + {} blit {}us ({}x{})",
                 n,
                 t_sync.saturating_sub(t0).as_micros(),
-                blit_kind,
+                if blitted_by_ce { "CE" } else { "cpu" },
                 t_blit.saturating_sub(t_sync).as_micros(),
                 blit_w,
                 blit_h
