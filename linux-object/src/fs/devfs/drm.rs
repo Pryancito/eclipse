@@ -47,6 +47,11 @@ static SCANOUT_NULL_LOGGED: core::sync::atomic::AtomicBool =
 /// One-shot latch for the "CE present enabled but pitch mismatch" warning.
 static CE_PITCH_MISMATCH_LOGGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+/// One-shot latch for "CE present enabled but every GPU declined the copy".
+static CE_NO_TAKER_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+/// Full-frame presents completed, for the rate-limited phase-timing klog.
+static PRESENT_FRAME_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Master switch for the per-frame GPU copy-engine present (`ce_present`).
 /// Enabled automatically when a compute GPU finishes boot bring-up (dual RTX:
@@ -740,6 +745,11 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     // stale lines from the previous frame and the screen stops repainting or
     // shows torn/old pixels even though the GPU finished rendering. Imported
     // dumb buffers stay on the old path: they are CPU-written, not GPU-DMA'd.
+    // Phase timing: at "7-11 FPS" the split between the cache sync and the
+    // copy (CE vs CPU) IS the diagnosis, and none of it was measured. Frames
+    // 1, 2 and every 64th log a one-line breakdown to the klog ring
+    // (full-frame presents only — DIRTYFB rects would spam variable sizes).
+    let t0 = kernel_hal::timer::timer_now();
     if zcore_drivers::scheme::gem_mmap::lookup(fb.gem_handle_id).is_some() {
         let sync_start_px = (blit_y as usize)
             .saturating_mul(src_stride)
@@ -758,6 +768,7 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
             zcore_drivers::utils::dma_sync::dma_sync_wb_from_device(vaddr + byte_off, byte_len);
         }
     }
+    let t_sync = kernel_hal::timer::timer_now();
     // CE-offloaded present: copy the dumb buffer (sysmem) into the scanout FB
     // (the console GPU's VRAM) with the GPU copy engine instead of a CPU
     // memcpy over PCIe. A flat CE copy needs equal strides, so only when the
@@ -780,16 +791,29 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
                     break;
                 }
             }
+            if !blitted_by_ce && !CE_NO_TAKER_LOGGED.swap(true, Ordering::Relaxed) {
+                // Every GPU declined (wedged, not state-loaded, or no boot FB):
+                // cepresent is set but the CPU is still doing the copy, and
+                // until now that degradation was completely silent. The
+                // per-GPU reason is one-shot-logged by `ce_present` itself.
+                kernel_hal::klog_warn!(
+                    "[drm] CE-offload present enabled but NO GPU took the copy -- CPU blit \
+                     (see [NVIDIA] ce_present lines for the reason)"
+                );
+            }
         } else if !CE_PITCH_MISMATCH_LOGGED.swap(true, Ordering::Relaxed) {
             // CE is ON but the flat sysmem->VRAM copy needs equal strides, and
             // the client's fb pitch differs from the scanout pitch. Say so once
             // -- otherwise "cepresent is set but the CPU is still doing the
             // copy" is a silent mystery. (A per-row CE copy would lift this, but
-            // that is a wider change than the flat blit.)
-            warn!(
+            // that is a wider change than the flat blit.) klog, not warn!: the
+            // default LOG=error boot filters warn!, which made this invisible
+            // on exactly the hardware where it matters.
+            kernel_hal::klog_warn!(
                 "[drm] CE-offload present enabled but NOT firing: fb pitch {} != scanout pitch {} \
                  (flat CE copy needs equal strides) -- using CPU blit",
-                fb.pitch, info.pitch
+                fb.pitch,
+                info.pitch
             );
         }
     }
@@ -808,6 +832,21 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
                 src_stride,
                 blit_w,
                 blit_h,
+            );
+        }
+    }
+    if rect.is_none() {
+        let t_blit = kernel_hal::timer::timer_now();
+        let n = PRESENT_FRAME_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 2 || n % 64 == 0 {
+            kernel_hal::klog_info!(
+                "[drm] present #{}: sync {}us + {} blit {}us ({}x{})",
+                n,
+                t_sync.saturating_sub(t0).as_micros(),
+                if blitted_by_ce { "CE" } else { "cpu" },
+                t_blit.saturating_sub(t_sync).as_micros(),
+                blit_w,
+                blit_h
             );
         }
     }
