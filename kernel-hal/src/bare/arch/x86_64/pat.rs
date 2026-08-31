@@ -140,6 +140,41 @@ enum PteConvert {
     NotMapped,
 }
 
+/// One-shot store-throughput probe of the framebuffer mapping, klogged as
+/// cycles/byte (x100). Reads back the first 256 KiB (slow uncached read,
+/// tolerable once), then times rewriting the SAME bytes — screen content is
+/// unchanged. Interpretation is scale-free: UC stores land around 7000-10000
+/// (x100 cycles/byte), write-combining around 100-300. Together with
+/// [`fb_mapping_diag`] this splits "the PTE says WC but the stores still
+/// crawl" (hardware/BAR-side limit) from "the mapping never became WC here".
+pub(crate) fn fb_store_bench_klog(tag: &str) {
+    const LEN: usize = 256 << 10;
+    if KCONFIG.fb_addr == 0 || (KCONFIG.fb_size as usize) < LEN {
+        return;
+    }
+    let va = phys_to_virt(KCONFIG.fb_addr as usize) as *mut u8;
+    let mut saved = alloc::vec![0u8; LEN];
+    // SAFETY: the fb physmap alias is mapped (callers run after the retype
+    // passes); saved is LEN bytes; rewriting identical bytes is visually a
+    // no-op and racing the console blitter at worst repaints a stale tile.
+    unsafe {
+        core::ptr::copy_nonoverlapping(va as *const u8, saved.as_mut_ptr(), LEN);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        let t0 = core::arch::x86_64::_rdtsc();
+        core::ptr::copy_nonoverlapping(saved.as_ptr(), va, LEN);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        let t1 = core::arch::x86_64::_rdtsc();
+        let cycles = t1.wrapping_sub(t0);
+        crate::klog_info!(
+            "pat: fb store bench ({}): {} KiB, {} cycles, {} cycles/byte x100",
+            tag,
+            LEN >> 10,
+            cycles,
+            cycles.saturating_mul(100) / (LEN as u64)
+        );
+    }
+}
+
 /// Diagnostic: walk the CURRENT page table (this CPU's CR3 — i.e. the calling
 /// process's tree, not necessarily the boot tree `enable_framebuffer_wc` last
 /// edited) for the boot framebuffer's physmap vaddr, and name the *effective*
