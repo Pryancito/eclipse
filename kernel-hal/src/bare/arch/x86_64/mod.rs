@@ -85,6 +85,8 @@ pub fn primary_init() {
     // console never pushes a frame through uncached stores. See `pat.rs`.
     pat::init_this_cpu();
     pat::enable_framebuffer_wc();
+    // Before drivers init so the first scanout can use CLFLUSHOPT / MOVNTDQA.
+    zcore_drivers::utils::dma_sync::probe_cpu_features();
     drivers::init().unwrap();
     warn!("[boot] drivers init complete");
     unsafe {
