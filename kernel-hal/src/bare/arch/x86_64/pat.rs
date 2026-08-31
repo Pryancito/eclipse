@@ -140,6 +140,65 @@ enum PteConvert {
     NotMapped,
 }
 
+/// Diagnostic: walk the CURRENT page table (this CPU's CR3 — i.e. the calling
+/// process's tree, not necessarily the boot tree `enable_framebuffer_wc` last
+/// edited) for the boot framebuffer's physmap vaddr, and name the *effective*
+/// memory type the calling context reaches it through: raw leaf PTE, the PAT
+/// index its PWT/PCD/PAT bits select, and what this CPU's IA32_PAT says that
+/// index means. This is the ground truth behind "the blit is still 42 MB/s
+/// after the retype": either the PTE here lacks the WC bits (the trees don't
+/// share), or it has them and the slowness is beyond the mapping.
+pub(crate) fn fb_mapping_diag() -> alloc::string::String {
+    use alloc::format;
+    if KCONFIG.fb_addr == 0 {
+        return alloc::string::String::from("no boot framebuffer");
+    }
+    let root = x86_64::registers::control::Cr3::read()
+        .0
+        .start_address()
+        .as_u64() as usize;
+    let va = phys_to_virt(KCONFIG.fb_addr as usize);
+    let idx = |level: usize| (va >> (12 + 9 * level)) & 0x1ff;
+    let mut table_pa = root;
+    for level in (1..=3).rev() {
+        // SAFETY: the physmap covers all page-table frames; entries are u64.
+        let entry = unsafe {
+            core::ptr::read_volatile((phys_to_virt(table_pa) as *const u64).add(idx(level)))
+        };
+        if entry & PTE_PRESENT == 0 {
+            return format!("cr3={:#x} va={:#x} NOT MAPPED (level {})", root, va, level);
+        }
+        if level < 3 && entry & PTE_HUGE != 0 {
+            return format!(
+                "cr3={:#x} va={:#x} HUGE leaf at level {}: {:#x}",
+                root, va, level, entry
+            );
+        }
+        table_pa = (entry & PHYS_ADDR_MASK) as usize;
+    }
+    // SAFETY: as above; and IA32_PAT exists on every supported CPU.
+    let (pte, pat_msr) = unsafe {
+        let pte = core::ptr::read_volatile((phys_to_virt(table_pa) as *const u64).add(idx(0)));
+        (pte, Msr::new(IA32_PAT).read())
+    };
+    let patidx =
+        (((pte >> 7) & 1) * 4 + ((pte >> 4) & 1) * 2 + ((pte >> 3) & 1)) as usize;
+    let mtype = (pat_msr >> (patidx * 8)) & 0xff;
+    let name = match mtype {
+        0 => "UC",
+        1 => "WC",
+        4 => "WT",
+        5 => "WP",
+        6 => "WB",
+        7 => "UC-",
+        _ => "?",
+    };
+    format!(
+        "cr3={:#x} va={:#x} pte={:#x} patidx={} type={:#x}({}) pat_msr={:#x}",
+        root, va, pte, patidx, mtype, name, pat_msr
+    )
+}
+
 /// Walk the 4-level tree for `va` and set `PAT|PCD|PWT` on its 4 KiB PTE.
 fn convert_pte_to_wc(root: usize, va: usize) -> PteConvert {
     let idx = |level: usize| (va >> (12 + 9 * level)) & 0x1ff;

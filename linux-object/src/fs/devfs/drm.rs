@@ -1619,6 +1619,25 @@ pub fn present_now_region(fb_id: u32, crtc_id: u32, rect: Option<(u32, u32, u32,
             graphics_vt,
             software_kms_active(),
         );
+        // One-shot ground truth for the blit's memory type: how THIS context
+        // (the compositor's page-table tree, on the CPU actually blitting)
+        // maps the boot framebuffer — then retype it to WC in this tree in
+        // case the boot-time passes edited a different one (idempotent when
+        // the trees share PTEs). A UC mapping here is a 42 MB/s blit and a
+        // 7-11 FPS desktop; the two lines say whether the retype ever
+        // reached the mapping the present really writes through.
+        #[cfg(all(target_arch = "x86_64", target_os = "none"))]
+        {
+            kernel_hal::klog_info!(
+                "[drm] fb map at first present: {}",
+                kernel_hal::x86_64::fb_mapping_diag()
+            );
+            kernel_hal::x86_64::ensure_framebuffer_wc();
+            kernel_hal::klog_info!(
+                "[drm] fb map after WC ensure: {}",
+                kernel_hal::x86_64::fb_mapping_diag()
+            );
+        }
     }
     // Establish / enforce compositor VT ownership. The first present claims the
     // active VT; later presents while a *different* VT is foreground (the user
