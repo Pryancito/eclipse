@@ -22,7 +22,7 @@ use config::Resolution;
 use core::arch::asm;
 use log::{warn, LevelFilter};
 use rboot::{BootInfo, GraphicInfo};
-use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
+use uefi::proto::console::gop::{GraphicsOutput, ModeInfo, PixelFormat};
 use uefi::proto::media::file::*;
 use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::proto::unsafe_protocol;
@@ -124,7 +124,11 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
 
     let elf = {
         let mut file = open_file(bs, config.kernel_path);
-        let buf = load_file(bs, &mut file);
+        let buf = load_file_progress(
+            bs,
+            &mut file,
+            Some((graphic_info.mode, graphic_info.fb_addr, 5, 15)),
+        );
         ElfFile::new(buf).expect("failed to parse ELF")
     };
     progress::bar(graphic_info.mode, graphic_info.fb_addr, 15);
@@ -136,9 +140,17 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         ENTRY = elf.header.pt2.entry_point() as usize;
     }
 
+    // The initramfs is by far the largest file rboot touches (the whole
+    // Eclipse rootfs, hundreds of MB): give it the 15..44 stretch of the bar
+    // so a slow medium (VirtualBox's EFI FAT driver reads at ~1-2 MB/s) shows
+    // steady movement instead of sitting "frozen at 15%" for minutes.
     let (initramfs_addr, initramfs_size) = if let Some(path) = config.initramfs {
         let mut file = open_file(bs, path);
-        let buf = load_file(bs, &mut file);
+        let buf = load_file_progress(
+            bs,
+            &mut file,
+            Some((graphic_info.mode, graphic_info.fb_addr, 15, 44)),
+        );
         debug!(
             "initramfs loaded: addr={:#x} size={:#x}",
             buf.as_ptr() as u64,
@@ -148,7 +160,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     } else {
         (0, 0)
     };
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 20);
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 45);
 
     let max_mmap_size = st.boot_services().memory_map_size().map_size;
     let mmap_storage = Box::leak(vec![0u8; max_mmap_size * 2].into_boxed_slice());
@@ -174,7 +186,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
             // highest conventional RAM entry in the memory map we iterated.
             .max(initramfs_addr + initramfs_size)
     };
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 30);
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 46);
 
     let mut page_table = current_page_table();
     unsafe {
@@ -204,13 +216,13 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         &mut page_table,
         &mut UEFIFrameAllocator(bs),
     );
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 40);
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 47);
     debug!("sanity checks before ExitBootServices...");
 
     // Sanity checks while Boot Services are still alive.
     // If these fault on real hardware, the firmware is much more likely to show a dump.
     let stacktop = config.kernel_stack_address + config.kernel_stack_size * 0x1000;
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 42);
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 47);
     unsafe {
         // 1) Confirm the entry virtual address is mapped & readable.
         let entry_va = ENTRY as *const u8;
@@ -219,7 +231,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         let sp_probe = (stacktop - 8) as *mut u64;
         core::ptr::write_volatile(sp_probe, 0);
     }
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 44);
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 48);
     unsafe {
         Cr0::update(|f| f.insert(Cr0Flags::WRITE_PROTECT));
     }
@@ -244,10 +256,10 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
 
     // On some real machines, ExitBootServices can be the point where things go wrong.
     // Update the bar just before attempting it so we can pinpoint the hang visually.
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 45);
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 48);
     debug!("calling ExitBootServices (raw)...");
     let (map_size, desc_size) = exit_boot_services_raw(&mut st, image, mmap_storage);
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 47);
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 49);
     debug!("ExitBootServices ok, collecting memory map...");
 
     // Reinterpret the raw memory map buffer as `MemoryDescriptor` entries.
@@ -348,18 +360,57 @@ fn open_file(bs: &BootServices, path: &str) -> RegularFile {
 }
 
 fn load_file(bs: &BootServices, file: &mut RegularFile) -> &'static mut [u8] {
-    //info!("loading file to memory");
+    load_file_progress(bs, file, None)
+}
+
+/// Load a file in bounded chunks, optionally advancing the boot progress bar
+/// across `(mode, fb_addr, from_pct, to_pct)` proportionally to bytes read.
+///
+/// The single giant `EFI_FILE_PROTOCOL.Read()` this replaces was fine on
+/// OVMF/real firmware but is a trap on VirtualBox's EFI: its FAT driver
+/// serves large reads glacially (minutes for a few hundred MB), and huge
+/// single reads are where its known large-file bugs live -- the boot sat
+/// "frozen" at the 15% mark for the whole initramfs load with no feedback.
+/// Chunking keeps every firmware inside its comfort zone and lets the bar
+/// move, so a slow medium looks slow instead of hung, and a genuine failure
+/// panics with the failing offset instead of silently wedging.
+fn load_file_progress(
+    bs: &BootServices,
+    file: &mut RegularFile,
+    progress: Option<(ModeInfo, u64, u32, u32)>,
+) -> &'static mut [u8] {
+    /// 8 MiB: large enough to stream at full speed on real firmware, small
+    /// enough that even VirtualBox's EFI returns each call promptly.
+    const CHUNK: usize = 8 * 1024 * 1024;
     let mut info_buf = [0u8; 0x100];
     let info = file
         .get_info::<FileInfo>(&mut info_buf)
         .expect("failed to get file info");
-    let pages = info.file_size() as usize / 0x1000 + 1;
+    let file_size = info.file_size() as usize;
+    let pages = file_size / 0x1000 + 1;
     let mem_start = bs
         .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages)
         .expect("failed to allocate pages");
     let buf = unsafe { core::slice::from_raw_parts_mut(mem_start as *mut u8, pages * 0x1000) };
-    let len = file.read(buf).expect("failed to read file");
-    &mut buf[..len]
+    let mut done = 0usize;
+    while done < file_size {
+        let end = (done + CHUNK).min(file_size);
+        let n = match file.read(&mut buf[done..end]) {
+            Ok(n) => n,
+            Err(e) => panic!("failed to read file at offset {:#x}: {:?}", done, e),
+        };
+        if n == 0 {
+            // Firmware reported EOF earlier than FileInfo promised: keep what
+            // we got rather than spinning forever on zero-byte reads.
+            break;
+        }
+        done += n;
+        if let Some((mode, fb_addr, from, to)) = progress {
+            let pct = from + ((to - from) as usize * done / file_size) as u32;
+            progress::bar(mode, fb_addr, pct.min(to));
+        }
+    }
+    &mut buf[..done]
 }
 
 /// Return the handle of the best GOP to use.
