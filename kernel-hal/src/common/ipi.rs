@@ -280,7 +280,19 @@ pub fn tlb_shootdown_ack() {
         .chead
         .compare_exchange(chead, ptail, Ordering::AcqRel, Ordering::Relaxed);
     if !saw_tlb {
-        // Drained only non-TLB reasons — leave SHOOTDOWN_SEQ alone.
+        // Drained only non-TLB reasons. The old behaviour (advance chead,
+        // publish nothing) left a liveness hole: if a TlbShutdown entry is
+        // ever consumed here without being recognized (any decode/race bug,
+        // now or future), the queue reads empty forever after, every later
+        // ack and NMI kick no-ops, and the initiator spins until the 8s
+        // deadlock detector kills the machine — the real-hardware
+        // "shootdown starvation" panics. Consuming entries while publishing
+        // no watermark is exactly the unsound state; make it impossible:
+        // full-flush and publish the consumed index. Cost: one extra full
+        // flush on the rare non-TLB-only drain; safety: a full flush always
+        // over-satisfies whatever the consumed entries asked.
+        crate::vm::flush_tlb(None);
+        SHOOTDOWN_SEQ[me].fetch_max(ptail as u64, Ordering::Release);
         return;
     }
     if precise && !overflow {
@@ -342,9 +354,22 @@ pub fn tlb_shootdown_ack_nmi() {
     if SHOOTDOWN_ACK_ACTIVE[me].load(Ordering::SeqCst) {
         return;
     }
-    // Nothing queued and no overflow: not a CPU anyone is starving on.
     let q = ipi_queue(me);
     if q.chead() == q.ptail() && IPI_QUEUE_OVERFLOW.load(Ordering::Relaxed) & (1u64 << me) == 0 {
+        // Queue empty, no overflow — yet a peer escalated all the way to an
+        // NMI kick, which only happens when it has been starving on THIS
+        // CPU's watermark for ~1M spins. Whatever ate the entry (a drain
+        // that consumed without publishing, a commit/ptail race), returning
+        // here leaves the initiator spinning until the 8s deadlock detector
+        // fires — three real-hardware panics carried exactly this signature
+        // (non-ackers parked in unrelated code, their queues clean, the
+        // HOLDER waiting forever). An NMI-kicked CPU can soundly satisfy any
+        // such waiter regardless of the lost entry: full-flush and publish
+        // the current tail. The flush over-satisfies whatever was asked, and
+        // every waiter's goal is <= the tail it observed at send time <= the
+        // tail published here. NMI-safe: no locks, no allocation.
+        crate::vm::flush_tlb(None);
+        SHOOTDOWN_SEQ[me].fetch_max(q.ptail() as u64, Ordering::Release);
         return;
     }
     tlb_shootdown_ack();
