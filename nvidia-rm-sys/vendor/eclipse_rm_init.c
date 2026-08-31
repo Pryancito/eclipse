@@ -92,6 +92,7 @@
 #include "gpu/mem_mgr/mem_mgr.h"
 #include "gpu/mem_mgr/mem_desc.h"
 #include "gpu/mem_mgr/ce_utils.h"
+#include "ctrl/ctrl0050.h"
 #include "gpu/bus/kern_bus.h"
 
 /*
@@ -5544,8 +5545,8 @@ unlock:
  *      buffer.  CeUtils resolves SYSMEM via the GMMU SYSMEM aperture
  *      (PCIe peer-DMA), no explicit BAR1/BAR2 mapping required.
  *
- * The function is synchronous (flags=0) and returns only after the CE
- * completion semaphore fires.  No additional fence is needed for scanout
+ * The copy is submitted ASYNC and completion-polled with a 100ms deadline
+ * (see eclipse_ce_wait_bounded) so a wedged CE can never hang the machine.  No additional fence is needed for scanout
  * visibility: PCIe write-combine ordering guarantees the display engine
  * sees the updated bytes on its next line-fetch after the semaphore.
  *
@@ -5553,6 +5554,35 @@ unlock:
  * (osFlushCpuWriteCombineBuffer if the dumb-buffer mapping is WC) -- this
  * function calls it internally as a belt-and-suspenders measure.
  */
+/*
+ * eclipse_ce_wait_bounded -- poll a submitted (ASYNC) CE copy to completion
+ * with a hard deadline, servicing interrupts between polls.
+ *
+ * The synchronous ceutilsMemcopy path (flags=0) waits INSIDE the RM with the
+ * API and GPU locks held; when a copy never completes (first observed with
+ * the per-frame P2P present into the un-driven console GPU's BAR1), that
+ * wait never returns, the waiting CPU stops servicing TLB-shootdown IPIs,
+ * and the machine dies in the 8s spinlock-deadlock detector (HOLDER stuck
+ * waiting for a TLB ack from the CPU spinning here).  Submitting ASYNC and
+ * polling ceutilsUpdateProgress ourselves bounds the damage: 100ms deadline
+ * (a healthy full-frame copy is single-digit ms), osDelay(1) between polls
+ * so this CPU keeps taking interrupts, NV_ERR_TIMEOUT on expiry.  The Rust
+ * caller latches CE-present off for the boot on any failure, so a wedged
+ * channel is abandoned rather than re-poked every frame.
+ */
+static NV_STATUS eclipse_ce_wait_bounded(MemoryManager *pMemoryManager, NvU64 submittedWorkId)
+{
+    NvU32 waited_ms = 0;
+    while (ceutilsUpdateProgress(pMemoryManager->pCeUtils) < submittedWorkId)
+    {
+        if (waited_ms >= 100)
+            return NV_ERR_TIMEOUT;
+        osDelay(1);
+        waited_ms++;
+    }
+    return NV_OK;
+}
+
 NV_STATUS eclipse_rm_ce_blit(
     NvU32 gpuInstance,
     NvU64 dstFbVramOffset,
@@ -5647,8 +5677,10 @@ NV_STATUS eclipse_rm_ce_blit(
     params.srcOffset   = 0;
     params.dstOffset   = 0;
     params.length      = size;
-    params.flags       = 0; /* synchronous -- waits on CE completion semaphore */
+    params.flags       = NV0050_CTRL_MEMCOPY_FLAGS_ASYNC; /* bounded poll below */
     status = ceutilsMemcopy(pMemoryManager->pCeUtils, &params);
+    if (status == NV_OK)
+        status = eclipse_ce_wait_bounded(pMemoryManager, params.submittedWorkId);
     nv_printf(0, "[eclipse-rm-trace] ce_blit: ceutilsMemcopy(src_pa=0x%llx dst_vram=0x%llx size=0x%llx) -> 0x%x\n",
               srcSysmemPa, dstFbVramOffset, size, status);
 
@@ -5985,8 +6017,10 @@ NV_STATUS eclipse_rm_ce_blit_p2p(
     params.srcOffset   = 0;
     params.dstOffset   = 0;
     params.length      = size;
-    params.flags       = 0; /* synchronous */
+    params.flags       = NV0050_CTRL_MEMCOPY_FLAGS_ASYNC; /* bounded poll below */
     status = ceutilsMemcopy(pMemoryManager->pCeUtils, &params);
+    if (status == NV_OK)
+        status = eclipse_ce_wait_bounded(pMemoryManager, params.submittedWorkId);
     nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p: ceutilsMemcopy(src=0x%llx dst_host=0x%llx size=0x%llx) -> 0x%x\n",
               srcSysmemPa, dstHostPa, size, status);
 
