@@ -124,6 +124,15 @@ fn clflush_span(vaddr: usize, len: usize) {
         let mut p = vaddr & !(64 - 1);
         let end = vaddr.saturating_add(len);
         if HAS_CLFLUSHOPT.load(Ordering::Relaxed) {
+            // MFENCE on BOTH sides, not a trailing SFENCE: CLFLUSHOPT is
+            // ordered only by store fences, and SFENCE does not order later
+            // LOADS -- without the trailing MFENCE the consumer's reads (the
+            // present blit / CE-staging repack pulling GPU-rendered pixels)
+            // can execute BEFORE the invalidate completes and keep serving
+            // stale lines from the previous frame. The flushes themselves
+            // still overlap between the fences, which is the entire win over
+            // the serializing CLFLUSH path below.
+            core::arch::x86_64::_mm_mfence();
             while p < end {
                 core::arch::asm!(
                     "clflushopt [{p}]",
@@ -132,7 +141,7 @@ fn clflush_span(vaddr: usize, len: usize) {
                 );
                 p += 64;
             }
-            core::arch::x86_64::_mm_sfence();
+            core::arch::x86_64::_mm_mfence();
         } else {
             core::arch::x86_64::_mm_mfence();
             while p < end {
