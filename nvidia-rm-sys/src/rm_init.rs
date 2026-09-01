@@ -1087,6 +1087,7 @@ extern "C" {
         device_instance: NvU32,
         display_mask: NvU32,
         hdmi_mask: NvU32,
+        force: NvBool,
         out: *mut HdmiAudioOut,
     ) -> NV_STATUS;
 }
@@ -1097,15 +1098,25 @@ extern "C" {
 /// (SET_HDMI_ENABLE + SET_AUDIO_ENABLE + HDMI/DP unmute; plus a GCP
 /// un-mute for the TMDS outputs in `hdmi_mask`). Requires the display
 /// query ([`edid`]) to have run first so the RM DispCommon handles exist.
-/// Idempotent per GPU (cached after the first successful ELD push).
+/// Cached after the first successful ELD push unless `force` is set (stream
+/// start re-sends unmute: GOP never enables audio, and a first pass can
+/// land before the head is scanning out).
 pub fn hdmi_audio(
     device_instance: u32,
     display_mask: u32,
     hdmi_mask: u32,
+    force: bool,
 ) -> Result<HdmiAudioOut, NV_STATUS> {
     let mut out = HdmiAudioOut::default();
-    let status =
-        unsafe { eclipse_rm_hdmi_audio(device_instance, display_mask, hdmi_mask, &mut out) };
+    let status = unsafe {
+        eclipse_rm_hdmi_audio(
+            device_instance,
+            display_mask,
+            hdmi_mask,
+            if force { 1 } else { 0 },
+            &mut out,
+        )
+    };
     if status == NV_OK {
         Ok(out)
     } else {

@@ -36,7 +36,11 @@ HDA controller (PCI 04:03) ── codec ── pin ── HDMI/DP or analog jack
 - **HDMI specifics**: digital converter enable, `SET_CVT_CHAN_COUNT`
   (`0x72d`) + HDMI channel slots, CEA audio infoframe through the pin's
   DIP buffer (reindexed every 8 bytes), and the NVIDIA coherent-DMA
-  (snoop) PCI config bits.
+  (snoop) PCI config bits. Path scoring prefers a pin with live
+  presence/ELD so an unconnected GPU connector does not steal card 0
+  from analog. At stream start the HDA driver re-pushes ELD/unmute
+  through RM (`kick_hdmi_audio`) and re-runs pin sense (`SET_PIN_SENSE`
+  then `GET_PIN_SENSE`) because GOP never enables audio packets.
 
 On boot, `eclipse-boot-sound` plays `/usr/share/eclipse/Eclipse_Awakening.mp3`
 once the compositor is up (`mpg123` via ALSA card 0).
@@ -194,6 +198,9 @@ so you can hear the guest. Override with `AUDIODEV=wav` (PCM to
   next `write`.
 - The DP audio path uses the same ELD/enable controls but has not been
   exercised; DP-MST audio (device entries > 0) is not implemented.
-- The HDMI/DP unmute is sent once a connected output's ELD push succeeds;
-  a monitor that is hot-plugged later gets ELD/PD only when something
-  re-runs the display query (`/proc/gpuedid` or a DRM connector rescan).
+- The HDMI/DP unmute is re-sent at every digital stream start (GOP never
+  enables audio packets). A monitor hot-plugged after boot gets ELD/PD when
+  playback starts, or when something re-runs the display query
+  (`/proc/gpuedid` or a DRM connector rescan).
+- ALSA card 0 prefers a *live* HDMI/DP pin (presence/ELD). An NVIDIA function
+  with no monitor does not outrank the PCH analog codec.

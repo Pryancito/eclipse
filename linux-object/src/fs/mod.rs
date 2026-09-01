@@ -633,9 +633,9 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         }
     }
 
-    // Playback devices in "default first" order: HDMI/DP with a live display
-    // outranks analog jacks, so ALSA card 0 (and `/dev/dsp`) is what the
-    // monitor speakers are on. Probe-order remains the tiebreaker.
+    // Playback devices in "default first" order: HDMI/DP with a *live*
+    // display (presence/ELD) outranks analog jacks. An NVIDIA function with
+    // no monitor must not steal card 0 from the PCH analog codec.
     let audio_cards: Vec<_> = {
         let guard = drivers::all_audio().as_vec();
         let mut v: Vec<(i32, usize, _)> = guard

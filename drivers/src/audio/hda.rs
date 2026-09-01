@@ -90,6 +90,7 @@ const VERB_SET_CONN_SELECT: u32 = 0x701;
 const VERB_SET_POWER_STATE: u32 = 0x705;
 const VERB_SET_STREAM_ID: u32 = 0x706;
 const VERB_SET_PIN_CTL: u32 = 0x707;
+const VERB_SET_PIN_SENSE: u32 = 0x709;
 const VERB_GET_PIN_SENSE: u32 = 0xf09;
 const VERB_SET_EAPD: u32 = 0x70c;
 const VERB_SET_DIGI_CVT1: u32 = 0x70d;
@@ -530,16 +531,23 @@ impl HdaInner {
         Ok(None)
     }
 
-    /// Fresh score for a candidate path: prefer digital HDMI/DP pins, then
-    /// jack/display presence, then a valid ELD (on NVIDIA GPUs presence and
-    /// ELD appear only after the display driver pushes the monitor's ELD).
-    fn score_path(&mut self, p: &OutPath) -> (i32, bool) {
+    /// Fresh score for a candidate path: prefer a *live* HDMI/DP pin (presence
+    /// and ELD), then analog jacks. An unconnected NVIDIA pin must not outrank
+    /// the PCH analog codec — that was "wavplay succeeds, monitor silent".
+    /// HDMI codecs typically need `SET_PIN_SENSE` before `GET_PIN_SENSE`
+    /// (Linux `snd_hda_pin_sense`); without the trigger every pin reads PD=0
+    /// and we pick the first widget, which is often a dead connector.
+    fn score_path(&mut self, p: &OutPath) -> (i32, bool, bool) {
+        if p.hdmi_dp {
+            let _ = self.cmd(p.pin, VERB_SET_PIN_SENSE, 0);
+            wait_us(2_000);
+        }
         let sense = self.cmd(p.pin, VERB_GET_PIN_SENSE, 0).unwrap_or(0);
         let present = sense & (1 << 31) != 0;
         let eld_valid = sense & (1 << 30) != 0;
         let mut score = 0;
         if p.hdmi_dp && p.digital {
-            score += 4;
+            score += if present { 4 } else { 1 };
         }
         if present {
             score += 2;
@@ -547,7 +555,7 @@ impl HdaInner {
         if eld_valid {
             score += 1;
         }
-        (score, present)
+        (score, present, eld_valid)
     }
 
     /// Enumerate the AFG's widgets and collect every viable output path
@@ -597,17 +605,35 @@ impl HdaInner {
         Ok(out)
     }
 
+    /// Power up and enable every HDMI/DP pin so presence/ELD can show up
+    /// (NVIDIA codecs often report PD=0 until `PIN_OUT` is set).
+    fn arm_digital_pins(&mut self) {
+        let pins: Vec<u32> = self
+            .candidates
+            .iter()
+            .filter(|p| p.hdmi_dp)
+            .map(|p| p.pin)
+            .collect();
+        for pin in pins.iter().copied() {
+            let _ = self.cmd(pin, VERB_SET_POWER_STATE, 0);
+            let _ = self.cmd(pin, VERB_SET_PIN_CTL, PIN_CTL_OUT_EN);
+        }
+        if !pins.is_empty() {
+            wait_us(1_000);
+        }
+    }
+
     /// Pick the best-scoring path among `self.candidates` right now.
     fn best_candidate(&mut self) -> Option<OutPath> {
         let candidates = self.candidates.clone();
         let mut best: Option<OutPath> = None;
         let mut best_score = -1i32;
         for mut p in candidates {
-            let (score, present) = self.score_path(&p);
+            let (score, present, eld_valid) = self.score_path(&p);
             p.present = present;
             info!(
-                "[hda] path candidate: pin {:#x} -> conv {:#x} (digital={}, hdmi/dp={}, present={}, score={})",
-                p.pin, p.conv, p.digital, p.hdmi_dp, present, score
+                "[hda] path candidate: pin {:#x} -> conv {:#x} (digital={}, hdmi/dp={}, present={}, eld={}, score={})",
+                p.pin, p.conv, p.digital, p.hdmi_dp, present, eld_valid, score
             );
             if score > best_score {
                 best_score = score;
@@ -917,6 +943,7 @@ impl HdaDevice {
 
         inner.afg = afg;
         inner.candidates = inner.collect_candidates(afg)?;
+        inner.arm_digital_pins();
         let path = inner.best_candidate().ok_or(DeviceError::NotSupported)?;
         info!(
             "[hda] {}: using pin {:#x} -> converter {:#x} ({}, {})",
@@ -989,6 +1016,16 @@ impl AudioScheme for HdaDevice {
     }
 
     fn write(&self, pcm: &[u8]) -> DeviceResult<usize> {
+        let kick_hdmi = {
+            let inner = self.inner.lock();
+            !inner.running && inner.digital
+        };
+        if kick_hdmi {
+            // GOP never enables audio packets; re-push ELD/unmute now so the
+            // pin-sense that follows can see a live display. Drop the HDA
+            // lock first — RM takes GPU locks.
+            crate::display::kick_hdmi_audio();
+        }
         let mut inner = self.inner.lock();
         inner.poll_progress();
         if !inner.running {
@@ -1074,7 +1111,7 @@ impl AudioScheme for HdaDevice {
         if let Some(p) = inner.candidates.iter().find(|c| c.pin == pin).cloned() {
             inner.score_path(&p).0
         } else if inner.digital {
-            4
+            1
         } else {
             0
         }

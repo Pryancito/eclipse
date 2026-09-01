@@ -6926,7 +6926,8 @@ static void eclipse_build_eld(const NvU8 *edid, NvU32 edidLen, NvU32 displayId,
 }
 
 NV_STATUS eclipse_rm_hdmi_audio(NvU32 gpuInstance, NvU32 displayMask,
-                                NvU32 hdmiMask, EclipseHdmiAudioOut *pOut)
+                                NvU32 hdmiMask, NvBool force,
+                                EclipseHdmiAudioOut *pOut)
 {
     OBJGPU *pGpu;
     RM_API *pRmApi;
@@ -6941,7 +6942,7 @@ NV_STATUS eclipse_rm_hdmi_audio(NvU32 gpuInstance, NvU32 displayMask,
     if (pOut == NULL || gpuInstance >= NV_MAX_DEVICES)
         return NV_ERR_INVALID_ARGUMENT;
 
-    if (g_hdmiAudioDone[gpuInstance])
+    if (g_hdmiAudioDone[gpuInstance] && !force)
     {
         *pOut = g_hdmiAudioCache[gpuInstance];
         return NV_OK;
