@@ -1514,7 +1514,13 @@ impl Syscall<'_> {
         // terminal" answer (musl's `isatty()` probes devices this way), so it is
         // not logged at all.
         if let Err(e) = &ret {
-            if request != TIOCGWINSZ {
+            // ALSA HW_REFINE EINVAL is the `*_near` search; don't treat it as
+            // an unhandled ioctl (see einval_hunt in lib.rs).
+            let alsa_hw_refine = {
+                let cmd = request as u32;
+                ((cmd >> 8) & 0xff) == b'A' as u32 && (cmd & 0xff) == 0x10
+            };
+            if request != TIOCGWINSZ && !alsa_hw_refine {
                 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
                 static LAST_REQ: AtomicU64 = AtomicU64::new(u64::MAX);
                 static REPEATS: AtomicUsize = AtomicUsize::new(0);

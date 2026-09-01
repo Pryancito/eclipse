@@ -74,17 +74,20 @@ S16LE stereo at the HDA rate set), `SW_PARAMS`, `PREPARE`, `WRITEI_FRAMES`,
 `DRAIN`/`DROP`, `STATUS`, `DELAY` and `SYNC_PTR` (the status/control pages
 are not mmap-able; alsa-lib falls back to `SYNC_PTR` automatically).
 
-`/etc/asound.conf` (written by xtask) routes `default` through the **plug**
-plugin to `hw:0,0`, so alsa-lib converts any format/rate/channel count in
-userspace and the kernel only ever sees S16LE stereo. dmix is not used (it
-needs SysV IPC shared memory), so playback is single-client. Card 0 is the
-preferred playback device (HDMI/DP with a live display outranks analog jacks);
-the remaining controllers follow in PCI probe order:
+`/etc/asound.conf` (written by xtask) sets `default` to **`hw:0,0`** so
+mpg123/`aplay` talk S16LE stereo to the kernel PCM without the `plug` plugin
+(plug's extra conversion path was failing `snd_pcm_hw_params` after
+`set_*_near` had already succeeded). Format conversion is still available as
+`aplay -D plug`. dmix is not used (it needs SysV IPC shared memory), so
+playback is single-client. Card 0 is the preferred playback device (HDMI/DP
+with a live display outranks analog jacks); the remaining controllers follow
+in PCI probe order:
 
 ```sh
 aplay -l                      # list cards
-aplay music.wav               # default = plughw:0 (usually HDMI)
-aplay -D plughw:1 music.wav   # next card (often the PCH analog codec)
+aplay music.wav               # default = hw:0,0 (usually HDMI, S16LE stereo)
+aplay -D plug music.wav       # convert format/rate in userspace
+aplay -D hw:1,0 music.wav     # next card (often the PCH analog codec)
 speaker-test -c 2 -t sine
 amixer set Master 50%
 amixer set Master mute
@@ -161,10 +164,20 @@ wavplay --tone                 # 440 Hz sine, 3 s, /dev/dsp (card 0)
 wavplay --tone 880             # another frequency
 wavplay -d /dev/dsp1 --tone    # next codec (often analog)
 wavplay file.wav               # 16-bit PCM WAV (mono is upmixed)
+aplay -l                       # ALSA cards (needs /usr/share/alsa/alsa.conf)
+aplay music.wav                # default = hw:0,0
 amixer set Master 80%          # software gain on the default card
 ```
 
 `tools/wavplay` is a static musl binary installed into the rootfs by xtask.
+`aplay`/`amixer`/`mpg123` talk to `/dev/snd` through alsa-lib; QEMU boots the
+live initramfs, which must include `usr/share/alsa` (the `hw` plugin lives in
+`alsa.conf`). OSS (`wavplay` → `/dev/dsp`) does not need that file.
+
+`HW_REFINE` returning `EINVAL` during `aplay`/`mpg123` is normal: alsa-lib
+probes unsupported format/period combinations that way. A real failure prints
+`Unable to set hw params` / `cannot set hw params` in the client. Rebuild the
+kernel after changing `snd.rs`, and the rootfs after changing `/etc/asound.conf`.
 
 `make qemu` attaches Intel HD Audio automatically (`-device intel-hda` +
 `hda-output`). The host backend is picked from whatever QEMU supports —

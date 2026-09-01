@@ -764,6 +764,18 @@ impl Syscall<'_> {
 fn einval_hunt(pid: KoID, num: u32, args: &[usize; 6]) {
     use core::sync::atomic::{AtomicU32, Ordering};
     static BUDGET: AtomicU32 = AtomicU32::new(0);
+    // ALSA PCM HW_REFINE (`_IOWR('A', 0x10, snd_pcm_hw_params)`). alsa-lib's
+    // `*_near` helpers find a supported period/rate BY issuing refine until
+    // the kernel returns EINVAL — that is the search, not a fault. Logging
+    // it here drowned the console the moment QEMU grew `/usr/share/alsa`
+    // and `aplay`/`mpg123` actually reached the PCM node (wavplay uses OSS
+    // and never hits this ioctl).
+    if matches!(Sys::try_from(num), Ok(Sys::IOCTL)) {
+        let cmd = args[1] as u32;
+        if ((cmd >> 8) & 0xff) == b'A' as u32 && (cmd & 0xff) == 0x10 {
+            return;
+        }
+    }
     let watched = matches!(
         Sys::try_from(num),
         Ok(Sys::SENDMSG

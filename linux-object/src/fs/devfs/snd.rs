@@ -6,9 +6,9 @@
 //! **RW-interleaved + SYNC_PTR** mode:
 //!
 //! * `SNDRV_PCM_IOCTL_HW_REFINE/HW_PARAMS` constrain to what the driver ring
-//!   does natively — S16LE, stereo, the discrete HDA rate set — and alsa-lib's
-//!   `plug` layer (routed in by the shipped `/etc/asound.conf`) converts
-//!   everything else in userspace.
+//!   does natively — S16LE, stereo, the discrete HDA rate set. `/etc/asound.conf`
+//!   sets `default` to `hw:0,0` so mpg123 talks to this node directly; `plug`
+//!   remains available as `aplay -D plug`.
 //! * Data moves through `SNDRV_PCM_IOCTL_WRITEI_FRAMES`; the status/control
 //!   pages are *not* mmap-able here, which alsa-lib detects and transparently
 //!   falls back to `SNDRV_PCM_IOCTL_SYNC_PTR` — implemented with Linux's exact
@@ -37,7 +37,11 @@ use rcore_fs_devfs::DevFS;
 
 // ── uapi mirror (x86_64) ────────────────────────────────────────────────────
 
-const SNDRV_PCM_VERSION: i32 = 0x0002_000e; // 2.0.14
+// 2.0.4: new hw_params struct (>=2.0.2) without USER_PVERSION (2.0.14),
+// STATUS_EXT (2.0.13) or monotonic-raw (2.0.12). Reporting 2.0.14 made
+// alsa-lib take those paths; mpg123 then died in snd_pcm_hw_params with
+// "cannot set hw params" after every set_*_near had succeeded.
+const SNDRV_PCM_VERSION: i32 = 0x0002_0004;
 const SNDRV_CTL_VERSION: i32 = 0x0002_0007;
 
 // snd_pcm_state_t
@@ -110,6 +114,8 @@ struct SndPcmHwParams {
     fifo_size: u64,
     reserved: [u8; 64],
 }
+
+const _: () = assert!(core::mem::size_of::<SndPcmHwParams>() == 608);
 
 #[repr(C)]
 struct SndPcmSwParams {
@@ -187,6 +193,16 @@ struct SndXferI {
     result: i64,
     buf: u64,
     frames: u64,
+}
+
+/// `struct snd_pcm_channel_info` (x86_64).
+#[repr(C)]
+struct SndPcmChannelInfo {
+    channel: u32,
+    _pad: u32,
+    offset: i64,
+    first: u32,
+    step: u32,
 }
 
 #[repr(C)]
@@ -696,6 +712,27 @@ impl PcmDev {
         ok
     }
 
+    /// Drop period/buffer/time constraints so a later refine can pick any
+    /// legal ring configuration. Rate, channels and the format masks stay.
+    fn relax_size_params(p: &mut SndPcmHwParams) {
+        for idx in [
+            Self::IV_PERIOD_TIME,
+            Self::IV_PERIOD_SIZE,
+            Self::IV_PERIOD_BYTES,
+            Self::IV_PERIODS,
+            Self::IV_BUFFER_TIME,
+            Self::IV_BUFFER_SIZE,
+            Self::IV_BUFFER_BYTES,
+            Self::IV_TICK_TIME,
+        ] {
+            p.intervals[idx] = SndInterval {
+                min: 0,
+                max: u32::MAX,
+                flags: 0,
+            };
+        }
+    }
+
     /// Log a rejected HW_PARAMS with both the client's request and the state
     /// it refined to. Userspace only sees a bare EINVAL, so without this there
     /// is no way to tell which constraint bit — and the request side matters
@@ -753,14 +790,29 @@ impl PcmDev {
     fn install(&self, p: &mut SndPcmHwParams) -> Result<()> {
         let requested = p.intervals;
         if !self.refine(p) {
-            let empty = p
-                .intervals
-                .iter()
-                .position(Self::iv_empty)
-                .map(Self::iv_name)
-                .unwrap_or("mask");
-            Self::log_hw_params_failure(empty, &requested, &p.intervals);
-            return Err(FsError::InvalidParam);
+            // alsa-lib's `snd_pcm_hw_params_choose` ignores its own errors
+            // (`_snd_pcm_hw_params_internal` in pcm_params.c) and still
+            // issues HW_PARAMS with a period/buffer/time triple that our
+            // refine just emptied. mpg123 hits this: it pins buffer_size =
+            // rate*0.5 and period_size = buffer/4, then choose set_first's
+            // period_time and the two disagree by a frame. Recover by
+            // keeping format/rate/channels and letting the sizes fall out.
+            Self::relax_size_params(p);
+            if !self.refine(p) {
+                error!("[snd] hw_params: refine emptied; forcing 48 kHz / 1024 x 4");
+                Self::log_hw_params_failure("forced", &requested, &p.intervals);
+                p.masks[PAR_ACCESS].bits[0] = 1 << ACCESS_RW_INTERLEAVED;
+                p.masks[PAR_FORMAT].bits[0] = 1 << FORMAT_S16_LE;
+                p.masks[PAR_SUBFORMAT].bits[0] = 1 << SUBFORMAT_STD;
+                for iv in p.intervals.iter_mut() {
+                    *iv = SndInterval {
+                        min: 0,
+                        max: u32::MAX,
+                        flags: 0,
+                    };
+                }
+                let _ = self.refine(p);
+            }
         }
 
         // Rate first: everything time-related depends on it.
@@ -768,7 +820,7 @@ impl PcmDev {
             .iter()
             .copied()
             .find(|&r| r >= p.intervals[Self::IV_RATE].min && r <= p.intervals[Self::IV_RATE].max)
-            .ok_or(FsError::InvalidParam)?;
+            .unwrap_or(48_000);
         Self::iv_clamp(&mut p.intervals[Self::IV_RATE], rate as u64, rate as u64);
         for _ in 0..8 {
             if !self.propagate(&mut p.intervals) {
@@ -1019,11 +1071,24 @@ impl INode for PcmDev {
             // TSTAMP / TTSTAMP / USER_PVERSION: accepted, ignored.
             0x02 | 0x03 | 0x04 => Ok(0),
             0x10 => {
-                // HW_REFINE
+                // HW_REFINE. Returning EINVAL is how alsa-lib's `*_near`
+                // helpers search; only an empty result on the initial
+                // `hw_params_any` (wide-open intervals) is a real fault.
                 let p = unsafe { &mut *(data as *mut SndPcmHwParams) };
+                let is_any = p.rmask == !0
+                    && p.intervals[Self::IV_RATE].min == 0
+                    && p.intervals[Self::IV_RATE].max == u32::MAX;
+                let requested = p.intervals;
                 if self.refine(p) {
                     Ok(0)
                 } else {
+                    if is_any {
+                        error!(
+                            "[snd] hw_refine(any) empty — ALSA sees no configs on '{}'",
+                            self.audio.name()
+                        );
+                        Self::log_hw_params_failure("any", &requested, &p.intervals);
+                    }
                     Err(FsError::InvalidParam)
                 }
             }
@@ -1088,6 +1153,18 @@ impl INode for PcmDev {
                     sec: now.as_secs() as i64,
                     nsec: now.subsec_nanos() as i64,
                 };
+                Ok(0)
+            }
+            0x32 => {
+                // CHANNEL_INFO — interleaved S16LE stereo (32 bits per frame).
+                let info = unsafe { &mut *(data as *mut SndPcmChannelInfo) };
+                let ch = info.channel;
+                if ch > 1 {
+                    return Err(FsError::InvalidParam);
+                }
+                info.offset = 0;
+                info.first = ch * 16;
+                info.step = 32;
                 Ok(0)
             }
             0x40 => {

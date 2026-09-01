@@ -220,6 +220,57 @@ fn scenario_hardware_plug(dev: &PcmDev) -> bool {
     }
 }
 
+/// alsa-lib's non-compat `snd_pcm_hw_params_choose` (pcm_params.c): first on
+/// access/format/channels/rate, *last* on buffer_size, first on period_size
+/// then period_time then tick. mpg123 pins buffer and period *before* this.
+fn choose_alsa(dev: &PcmDev, p: &mut SndPcmHwParams) -> bool {
+    for (par, last) in [
+        (PAR_CHANNELS, false),
+        (PAR_RATE, false),
+        (PAR_BUFFER_SIZE, true),
+        (PAR_PERIOD_SIZE, false),
+        (PAR_PERIOD_TIME, false),
+        (PAR_TICK_TIME, false),
+    ] {
+        let cur = iv(p, par);
+        let pick = if last { cur.max } else { cur.min };
+        p.intervals[par - 8] = SndInterval { min: pick, max: pick, flags: INTERVAL_INTEGER };
+        if !dev.refine(p) {
+            println!("  choose_alsa: refine FAILED after fixing par {} to {}", par, pick);
+            return false;
+        }
+    }
+    true
+}
+
+/// mpg123 libout123 alsa.c: buffer_size = rate * 0.5, period = buffer/4, then
+/// snd_pcm_hw_params (refine + choose_alsa + HW_PARAMS).
+fn scenario_mpg123(dev: &PcmDev, rate: u32) -> bool {
+    println!("\n=== mpg123 alsa.c (rate {}, buffer=rate*0.5, period=buffer/4) ===", rate);
+    let mut p = open_params();
+    if !dev.refine(&mut p) { println!("  initial refine FAILED"); return false; }
+    p.masks[PAR_ACCESS].bits[0] = 1 << ACCESS_RW_INTERLEAVED;
+    p.masks[PAR_FORMAT].bits[0] = 1 << FORMAT_S16_LE;
+    if !dev.refine(&mut p) { println!("  access+format refine FAILED"); return false; }
+    if !set_near(dev, &mut p, PAR_CHANNELS, 2, "channels") { return false; }
+    if !set_near(dev, &mut p, PAR_RATE, rate, "rate") { return false; }
+    let buffer_size = (rate as f64 * 0.5) as u32;
+    if !set_near(dev, &mut p, PAR_BUFFER_SIZE, buffer_size, "buffer_size") { return false; }
+    let granted_buf = iv(&p, PAR_BUFFER_SIZE).min;
+    let period_size = granted_buf / 4;
+    if !set_near(dev, &mut p, PAR_PERIOD_SIZE, period_size, "period_size") { return false; }
+    show("after mpg123 set_*_near", &p);
+    // choose may fail (alsa-lib ignores that) — still try HW_PARAMS.
+    let choose_ok = choose_alsa(dev, &mut p);
+    if !choose_ok {
+        println!("  choose_alsa failed (alsa-lib ignores this and still calls HW_PARAMS)");
+    }
+    match dev.install(&mut p) {
+        Ok(()) => { show("INSTALLED", &p); true }
+        Err(e) => { println!("  HW_PARAMS FAILED: {:?}", e); false }
+    }
+}
+
 fn scenario_aplay(dev: &PcmDev, rate: u32) -> bool {
     println!("\n=== aplay (rate {}, sizes left to the kernel) ===", rate);
     let mut p = open_params();
@@ -298,6 +349,8 @@ fn main() {
     all &= scenario_speaker_test_periods(&dev, 44100, 4);
     all &= scenario_speaker_test_periods(&dev, 48000, 2);
     all &= scenario_hardware_plug(&dev);
+    all &= scenario_mpg123(&dev, 44100);
+    all &= scenario_mpg123(&dev, 48000);
     all &= scenario_aplay(&dev, 48000);
     all &= scenario_aplay(&dev, 44100);
     all &= scenario_explicit_sizes(&dev);

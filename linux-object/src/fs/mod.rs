@@ -673,9 +673,8 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
 
     // Native ALSA nodes at `/dev/snd/`: one controlC<card> + pcmC<card>D0p
     // pair per HDA controller, in the same card order as /dev/dsp<N>. This is
-    // what alsa-lib (aplay, SDL, mpg123, …) talks to; /etc/asound.conf routes
-    // "default" through the plug plugin so format conversion happens in
-    // userspace and the kernel PCM only ever sees S16LE stereo.
+    // what alsa-lib (aplay, SDL, mpg123, …) talks to; /etc/asound.conf sets
+    // "default" to hw:0,0 (S16LE stereo). Use `plug` for format conversion.
     {
         use devfs::{CtlDev, PcmDev};
         if !audio_cards.is_empty() {

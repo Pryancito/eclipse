@@ -1745,12 +1745,10 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         executable
     }
 
-    /// `/etc/asound.conf`: route ALSA's "default" through the `plug` plugin to
-    /// the kernel PCM. Eclipse's `/dev/snd/pcmC*D0p` accepts S16LE stereo at
-    /// the HDA rate set only; plug converts any other format/rate/channels in
-    /// userspace. dmix is deliberately not used (it needs SysV IPC shared
-    /// memory), so playback is single-client for now. Written only when the
-    /// user has not customized it (marker line present or file absent).
+    /// `/etc/asound.conf`: `default` is the kernel PCM (`hw:0,0`) so mpg123
+    /// and aplay talk S16LE stereo without the plug plugin. plug is still
+    /// available as `plug` for format conversion (`aplay -D plug x.wav`).
+    /// dmix is deliberately not used (it needs SysV IPC shared memory).
     fn write_asound_conf(etc: &Path) {
         let conf = etc.join("asound.conf");
         if let Ok(existing) = fs::read_to_string(&conf) {
@@ -1762,20 +1760,20 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             &conf,
             b"# eclipse-generated ALSA routing (delete this line to take ownership).\n\
               #\n\
-              # \"default\" -> plug -> hw:0,0. The kernel PCM (/dev/snd/pcmC0D0p) only\n\
-              # takes S16LE stereo at the HDA rate set; plug converts everything else\n\
-              # in userspace. No dmix (needs SysV IPC): one playback client at a time.\n\
+              # Direct hw:0,0. plug's insert_plugins + protocol 2.0.14 paths made\n\
+              # mpg123 fail at snd_pcm_hw_params after set_*_near had succeeded.\n\
+              # Format conversion: `aplay -D plug x.wav`.\n\
               #\n\
-              # Card 0 is the kernel's preferred playback device (HDMI/DP with a\n\
-              # live display outranks analog). `aplay -l` lists the rest; play a\n\
-              # specific card with `aplay -D plughw:N x.wav`.\n\
+              # No dmix (needs SysV IPC): one playback client at a time.\n\
+              # Card 0 is the preferred playback device (HDMI/DP with a live display).\n\
               pcm.!default {\n\
+              \x20   type hw\n\
+              \x20   card 0\n\
+              \x20   device 0\n\
+              }\n\
+              pcm.plug {\n\
               \x20   type plug\n\
-              \x20   slave.pcm {\n\
-              \x20       type hw\n\
-              \x20       card 0\n\
-              \x20       device 0\n\
-              \x20   }\n\
+              \x20   slave.pcm \"hw:0,0\"\n\
               }\n\
               ctl.!default {\n\
               \x20   type hw\n\
@@ -2042,7 +2040,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               sleep 2\n\
               command -v amixer >/dev/null 2>&1 && amixer -q set Master 70% unmute 2>/dev/null\n\
               if command -v mpg123 >/dev/null 2>&1; then\n\
-              \x20 exec mpg123 -q \"$MP3\"\n\
+              \x20 exec mpg123 -q --encoding s16 \"$MP3\"\n\
               fi\n\
               echo 'eclipse-boot-sound: mpg123 not installed' >&2\n\
               exit 0\n",

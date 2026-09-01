@@ -29,7 +29,7 @@ block = block[:i] + '        let actual_rate = rate;\n' + block[j:]
 k = block.index('        info!(\n            "[snd] pcmC{}D0p configured')
 l = block.index('        Ok(())\n    }', k)
 block = block[:k] + block[l:]
-block = (block.replace('warn!(', 'eprintln!(').replace('info!(', 'eprintln!(')
+block = (block.replace('warn!(', 'eprintln!(').replace('info!(', 'eprintln!(').replace('error!(', 'eprintln!(')
               .replace('use core::sync::atomic::{AtomicU32, Ordering};',
                        'use std::sync::atomic::{AtomicU32, Ordering};')
               .replace('|b| {', '|b: u32| {'))

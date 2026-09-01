@@ -237,7 +237,7 @@ const DEFAULT_PACKAGES: &[&str] = &[
     // alsa-lib (libasound + /usr/share/alsa/alsa.conf) is what every app's
     // audio path resolves to; the kernel exposes the native ALSA ABI at
     // /dev/snd/ (linux-object devfs snd.rs) and /etc/asound.conf (written by
-    // xtask) routes "default" through the plug plugin to hw. alsa-utils
+    // xtask) sets "default" to hw:0,0. alsa-utils
     // brings aplay/amixer/speaker-test for testing.
     "alsa-lib",
     "alsa-utils",
@@ -989,6 +989,14 @@ const LIVE_TREES: &[&str] = &[
     // libinput's device-quirks database. Without it X logs "failed to find
     // data files" and libinput falls back to degraded device behavior.
     "usr/share/libinput",
+    // alsa-lib's topology: alsa.conf defines the `hw` plugin that `aplay -l`
+    // and every ALSA client resolve. usr/bin (aplay) and usr/lib (libasound)
+    // are already copied; without this tree QEMU boots with aplay present
+    // and /dev/snd/controlC0 live, then fails with
+    // "Cannot access file /usr/share/alsa/alsa.conf" / "Invalid CTL hw:0".
+    "usr/share/alsa",
+    // Boot chime MP3 + any other Eclipse-owned share files.
+    "usr/share/eclipse",
     "etc/fonts",
     "etc/libinput", // local-overrides.quirks (if present)
     // ── XFCE4 in QEMU ───────────────────────────────────────────────────────
@@ -1166,4 +1174,13 @@ pub(super) fn copy_into_live(full: &Path, live: &Path) {
         "Xorg stack: LIVE root fallback PNG: {}",
         if fallback { "present" } else { "MISSING" }
     );
+    if live.join("usr/share/alsa/alsa.conf").is_file() {
+        println!("Xorg stack: LIVE root /usr/share/alsa/alsa.conf present (aplay/mpg123)");
+    } else {
+        eprintln!(
+            "warning: LIVE root missing /usr/share/alsa/alsa.conf — `aplay -l` will fail \
+             with Invalid CTL hw:0 even if /dev/snd/controlC0 exists. \
+             `alsa-lib` must be in the apk set and usr/share/alsa in LIVE_TREES."
+        );
+    }
 }
