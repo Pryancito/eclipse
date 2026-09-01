@@ -265,6 +265,22 @@ pub trait DrmScheme: Scheme {
         false
     }
 
+    /// Pitched 2D CE-offloaded present: copy `line_count` rows of `row_bytes`
+    /// from `src_sysmem_pa + r * src_pitch` into the console GPU's scanout FB
+    /// at `dst_pitch` stride, using a GPU copy engine over PCIe P2P — without
+    /// any CPU staging repack.  Returns true if the CE 2D copy was performed;
+    /// false to fall back to the repack+flat path.  Default: false.
+    fn ce_present_2d_pitched(
+        &self,
+        _src_sysmem_pa: u64,
+        _src_pitch: u32,
+        _dst_pitch: u32,
+        _row_bytes: u32,
+        _line_count: u32,
+    ) -> bool {
+        false
+    }
+
     /// Whether this driver can offload scanout via the copy engine after boot
     /// bring-up. On dual-GPU NVIDIA setups this is true for a state-loaded
     /// compute GPU (P2P into the console framebuffer). Used to auto-enable the

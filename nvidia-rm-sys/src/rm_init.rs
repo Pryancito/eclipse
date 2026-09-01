@@ -1220,6 +1220,16 @@ extern "C" {
         src_sysmem_pa: NvU64,
         size: NvU64,
     ) -> NV_STATUS;
+
+    fn eclipse_rm_ce_blit_p2p_2d(
+        gpu_instance: NvU32,
+        dst_host_pa: NvU64,
+        dst_pitch: NvU32,
+        src_sysmem_pa: NvU64,
+        src_pitch: NvU32,
+        row_bytes: NvU32,
+        line_count: NvU32,
+    ) -> NV_STATUS;
 }
 
 /// Declares a GPU as the primary/console device to RM, NVIDIA's own way
@@ -1344,6 +1354,38 @@ pub fn ce_blit_p2p(
     // [rpc-lock] See `ce_blit`: gate this RM entry (rpc.c:9834 API-lock).
     let _gate = RmGate::lock();
     unsafe { eclipse_rm_ce_blit_p2p(gpu_instance, dst_host_pa, src_sysmem_pa, size) }
+}
+
+/// Pitched 2D P2P variant of [`ce_blit_p2p`]: copies `line_count` rows of
+/// `row_bytes` bytes from `src_sysmem_pa + r * src_pitch` (cacheable host RAM)
+/// to `dst_host_pa + r * dst_pitch` (peer GPU BAR1) for `r` in 0..line_count.
+///
+/// Eliminates the CPU staging repack when src and dst pitches differ: the CE
+/// reads directly from the compositor's buffer (fast cached DMA) and writes to
+/// the console GPU's BAR1 (fast GPU-initiated PCIe writes).  Each row is
+/// submitted ASYNC; the function waits once (bounded, 100 ms) on the last row.
+pub fn ce_blit_p2p_2d(
+    gpu_instance: u32,
+    dst_host_pa: u64,
+    dst_pitch: u32,
+    src_sysmem_pa: u64,
+    src_pitch: u32,
+    row_bytes: u32,
+    line_count: u32,
+) -> NV_STATUS {
+    // [rpc-lock] See `ce_blit`: gate this RM entry (rpc.c:9834 API-lock).
+    let _gate = RmGate::lock();
+    unsafe {
+        eclipse_rm_ce_blit_p2p_2d(
+            gpu_instance,
+            dst_host_pa,
+            dst_pitch,
+            src_sysmem_pa,
+            src_pitch,
+            row_bytes,
+            line_count,
+        )
+    }
 }
 
 /// Mirror of `EclipseGemAlloc` (vendor/eclipse_rm_init.c).
