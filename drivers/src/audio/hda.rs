@@ -623,6 +623,14 @@ impl HdaInner {
     /// candidate is re-armed: NVIDIA presence/ELD arrive long after probe,
     /// and the digital converter/infoframe need a second pass.
     fn repick_path(&mut self) {
+        // With a single candidate there is nothing to choose between, and
+        // re-probing is not free: `best_candidate` issues a PIN_SENSE verb per
+        // candidate with the device mutex held and a 200 ms timeout each, so a
+        // codec that stops answering turns every underrun-triggered restart
+        // into a multi-second stall plus a log line per pin.
+        if self.candidates.len() < 2 {
+            return;
+        }
         let afg = self.afg;
         let Some(best) = self.best_candidate() else {
             return;
@@ -642,6 +650,33 @@ impl HdaInner {
 
     /// Power up and route the chosen path.
     fn setup_path(&mut self, afg: u32, path: &OutPath) -> DeviceResult {
+        // Do NOT publish the new path until every verb below has succeeded.
+        // Committing first and failing halfway leaves conv_nid/pin_nid naming
+        // a converter whose stream id was cleared and a pin that was never
+        // enabled, while the caller logs "keeping previous path" — the writer
+        // then streams into a dead route and hears silence with no error.
+        let old = (self.conv_nid, self.pin_nid, self.digital);
+        let restore = |me: &mut Self| {
+            me.conv_nid = old.0;
+            me.pin_nid = old.1;
+            me.digital = old.2;
+        };
+        match self.try_setup_path(afg, path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                restore(self);
+                // Put the previous converter back on the stream so the old
+                // route keeps working, exactly as the caller assumes.
+                if self.conv_nid != 0 {
+                    let tag = self.stream_tag;
+                    let _ = self.cmd(self.conv_nid, VERB_SET_STREAM_ID, tag << 4);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn try_setup_path(&mut self, afg: u32, path: &OutPath) -> DeviceResult {
         let old_conv = self.conv_nid;
         if old_conv != 0 && old_conv != path.conv {
             let _ = self.cmd(old_conv, VERB_SET_STREAM_ID, 0);
