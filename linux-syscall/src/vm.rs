@@ -964,13 +964,16 @@ bitflags! {
 impl MmapProt {
     /// convert MmapProt to MMUFlags
     fn to_flags(self) -> MMUFlags {
-        // PROT_NONE (no READ/WRITE/EXEC): empty flags, so the PTE is not
-        // present. Returning USER-only used to stamp PRESENT on x86 and make
-        // the page readable; the old `is_empty() => READ|WRITE` hack made it
-        // writable too.
-        if !self.intersects(MmapProt::READ | MmapProt::WRITE | MmapProt::EXEC) {
-            return MMUFlags::empty();
-        }
+        // PROT_NONE (no READ/WRITE/EXEC): USER only. The arch `From<MMUFlags>`
+        // conversion refuses to stamp PRESENT without R/W/X, so the PTE
+        // stays absent — USER here is a mapping tag, not a hardware bit.
+        //
+        // Empty flags (the previous choice) broke musl's mallocng / pthread
+        // stacks / ld.so: they `mmap(PROT_NONE)` then `mprotect` a slice to
+        // RW. `VmMapping::protect` only copies RXW, so the raised pages had
+        // READ|WRITE but no USER; the #PF error code is WRITE|USER and
+        // `flags.contains(access_flags)` then ACCESS_DENIED — SIGSEGV on
+        // the first store (`init` at 0x473000, `[anon]+0x1000`).
         let mut flags = MMUFlags::USER;
         if self.contains(MmapProt::READ) {
             flags |= MMUFlags::READ;
@@ -1001,6 +1004,11 @@ mod mmap_prot_tests {
         assert!(
             !flags.intersects(MMUFlags::READ | MMUFlags::WRITE | MMUFlags::EXECUTE),
             "PROT_NONE must have no access bits: {:?}",
+            flags
+        );
+        assert!(
+            flags.contains(MMUFlags::USER),
+            "PROT_NONE must keep USER so a later mprotect(RW) can raise access (got {:?})",
             flags
         );
     }

@@ -2125,7 +2125,17 @@ impl VmMapping {
         for i in start_index..end_index {
             let mut new_flags = inner.flags[i];
             new_flags.remove(MMUFlags::RXW);
-            new_flags.insert(flags & MMUFlags::RXW);
+            // Copy USER as well as RXW. `protect` used to take only RXW, so a
+            // PROT_NONE page (no USER stored — or USER-only from mmap) that
+            // was later mprotect'd to RW ended up READ|WRITE without USER.
+            // User-mode #PF error codes include USER, and
+            // `handle_page_fault` requires `flags.contains(access_flags)`,
+            // which then ACCESS_DENIED'd the first store into the raised
+            // slice (musl mallocng / pthread stacks / ld.so).
+            new_flags.insert(flags & (MMUFlags::RXW | MMUFlags::USER));
+            if self.permissions.contains(MMUFlags::USER) {
+                new_flags.insert(MMUFlags::USER);
+            }
             inner.flags[i] = new_flags;
             let va = inner.addr + i * PAGE_SIZE;
             // A frame this VMO does not OWN at this index must never be made
@@ -2330,6 +2340,13 @@ impl VmMapping {
             }
             (offset + inner.vmo_offset, inner.flags[page_idx])
         };
+        // User mappings always carry USER, even if a PROT_NONE mmap stored
+        // empty flags and a later mprotect only copied RXW. The hardware
+        // #PF error code for a ring-3 access includes USER, and the check
+        // below is a subset test of the whole mask.
+        if self.permissions.contains(MMUFlags::USER) {
+            flags.insert(MMUFlags::USER);
+        }
         // error!("page fault: addr = {:x}, access_flag = {:?}, flags = {:?}", vaddr, access_flags, flags);
         if !flags.contains(access_flags) {
             return Err(ZxError::ACCESS_DENIED);
@@ -3286,5 +3303,41 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].start, base + 0x2000);
         assert_eq!(rows[0].end, base + 0x4000);
+    }
+
+    /// musl mallocng / pthread_create / ld.so: `mmap(PROT_NONE)` then
+    /// `mprotect` a slice to RW. The first user store is WRITE|USER; if
+    /// USER was dropped when raising RXW, that store SIGSEGVs.
+    #[test]
+    fn mprotect_after_prot_none_allows_user_write() {
+        let vmar = VmAddressRegion::new_root();
+        let base = vmar.addr();
+        let vmo = VmObject::new_paged(2);
+        // Empty flags = the pre-fix PROT_NONE encoding. `protect` must
+        // still put USER back from the incoming mask / permission ceiling.
+        vmar.map_ext(
+            Some(0),
+            vmo,
+            0,
+            0x2000,
+            MMUFlags::RXW | MMUFlags::USER,
+            MMUFlags::empty(),
+            false,
+            false,
+        )
+        .unwrap();
+        vmar.protect(
+            base + 0x1000,
+            0x1000,
+            MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER,
+        )
+        .unwrap();
+        assert_eq!(
+            vmar.handle_page_fault(base, MMUFlags::WRITE | MMUFlags::USER),
+            Err(ZxError::ACCESS_DENIED),
+            "the still-PROT_NONE guard page must deny WRITE|USER"
+        );
+        vmar.handle_page_fault(base + 0x1000, MMUFlags::WRITE | MMUFlags::USER)
+            .expect("mprotect(RW) slice must accept a user write fault");
     }
 }
