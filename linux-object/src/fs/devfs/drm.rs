@@ -185,6 +185,15 @@ struct DrmState {
     /// address space, so per-process accounting cannot see it either.
     handles: Vec<(GemHandle, Arc<VmObject>, u64)>,
     framebuffers: Vec<DrmFramebuffer>,
+    /// Framebuffers removed by `RMFB`/`CLOSEFB` while a page-flip was in
+    /// flight. Linux keeps a framebuffer alive until it is no longer
+    /// referenced by any DRM object; we approximate that by deferring the
+    /// removal until the next flip-completion event is delivered. This is
+    /// what prevents Mesa/Zink from receiving `GLXBadCurrentWindow` when an
+    /// application exits while a swap is still in flight: the final
+    /// `glXSwapBuffers` finds the drawable still valid, completes cleanly,
+    /// and only then does the backing framebuffer disappear.
+    pending_rmfb: Vec<DrmFramebuffer>,
     /// Framebuffer currently bound to the (synthetic) CRTC, reported by GETCRTC.
     crtc_fb: u32,
     /// The VT the compositor owns the display on, established on its first
@@ -306,6 +315,7 @@ lazy_static::lazy_static! {
         next_fb_id: 1,
         handles: Vec::new(),
         framebuffers: Vec::new(),
+        pending_rmfb: Vec::new(),
         crtc_fb: 0,
         graphics_vt: None,
         events: VecDeque::new(),
@@ -586,18 +596,72 @@ pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<
     Some(fb_id)
 }
 
-/// Remove a framebuffer (DRM_IOCTL_MODE_RMFB).
+/// Remove a framebuffer (DRM_IOCTL_MODE_RMFB / DRM_IOCTL_MODE_CLOSEFB).
+///
+/// If a page-flip is currently in flight (`FLIP_EVENT_PENDING`) the
+/// framebuffer is not freed immediately — it is moved to the
+/// `pending_rmfb` queue and released once the flip-complete event is
+/// delivered in [`queue_flip_event`].  This mirrors Linux's reference-
+/// counted `drm_framebuffer` lifetime: the fb stays alive for as long as
+/// any scanout is using it, so a racing `glXSwapBuffers` finds its
+/// drawable valid and completes without triggering `GLXBadCurrentWindow`.
+///
+/// Any previously deferred fbs whose flip has since completed are also
+/// drained here when no new flip is in flight.
 pub fn rmfb(fb_id: u32) -> bool {
+    // Drain any deferred fbs from a previous flip that has since completed.
+    if !FLIP_EVENT_PENDING.load(Ordering::Acquire) {
+        DRM_STATE.lock().pending_rmfb.clear();
+    }
+
     let mut state = DRM_STATE.lock();
-    if state.crtc_fb == fb_id {
+    let Some(pos) = state.framebuffers.iter().position(|f| f.id == fb_id) else {
+        return false;
+    };
+
+    // If the fb being destroyed is the one currently displayed by the CRTC
+    // and a page-flip is in flight, emit a synthetic flip-complete event
+    // first. This gives Mesa/Zink a chance to handle the surface-gone
+    // notification before the swapchain is torn down, which is what prevents
+    // "MESA: error: zink: swapchain killed" from being followed by an X
+    // protocol error.
+    let crtc_id = SYNTH_CRTC_ID;
+    let is_crtc_fb = state.crtc_fb == fb_id;
+    if is_crtc_fb {
         state.crtc_fb = 0;
     }
-    if let Some(pos) = state.framebuffers.iter().position(|f| f.id == fb_id) {
-        state.framebuffers.remove(pos);
-        true
-    } else {
-        false
+
+    if FLIP_EVENT_PENDING.load(Ordering::Acquire) {
+        // Defer: keep the framebuffer alive until the in-flight swap lands.
+        let fb = state.framebuffers.remove(pos);
+        state.pending_rmfb.push(fb);
+
+        // Emit a synthetic flip-complete event so the compositor / Mesa WSI
+        // gets notified that the surface is going away, giving it a chance to
+        // recreate the swapchain rather than crashing on the next swap.
+        if is_crtc_fb {
+            let seq = FLIP_SEQ.fetch_add(1, Ordering::Relaxed);
+            // Push the event directly; we already hold `state`.
+            let now = kernel_hal::timer::timer_now();
+            const DRM_EVENT_FLIP_COMPLETE: u32 = 2;
+            let mut buf = [0u8; 32];
+            buf[0..4].copy_from_slice(&DRM_EVENT_FLIP_COMPLETE.to_ne_bytes());
+            buf[4..8].copy_from_slice(&32u32.to_ne_bytes());
+            // user_data 0 — we don't know the outstanding flip's user_data here,
+            // and a 0 is harmless (libdrm dispatches by type, not user_data).
+            buf[8..16].copy_from_slice(&0u64.to_ne_bytes());
+            buf[16..20].copy_from_slice(&(now.as_secs() as u32).to_ne_bytes());
+            buf[20..24].copy_from_slice(&now.subsec_micros().to_ne_bytes());
+            buf[24..28].copy_from_slice(&seq.to_ne_bytes());
+            buf[28..32].copy_from_slice(&crtc_id.to_ne_bytes());
+            state.events.push_back(buf.to_vec());
+            state.eventbus.lock().set(Event::READABLE);
+        }
+        return true;
     }
+
+    state.framebuffers.remove(pos);
+    true
 }
 
 /// Native mode of the primary framebuffer display: `(width, height, pitch)`.
@@ -1791,6 +1855,10 @@ fn queue_flip_event(crtc_id: u32, user_data: u64) {
     // Flip is complete from the KMS POV once the event is on the card fd —
     // a new PAGE_FLIP may be accepted even before userspace reads it.
     FLIP_EVENT_PENDING.store(false, Ordering::Release);
+    // Release any framebuffers that were deferred by `rmfb` while this flip
+    // was in flight. Now that the flip has landed they are no longer
+    // referenced by the scanout path and can be safely freed.
+    DRM_STATE.lock().pending_rmfb.clear();
 }
 
 /// Enqueue a `DRM_EVENT_VBLANK` for a `WAIT_VBLANK` request that asked for an
