@@ -607,6 +607,11 @@ impl HdaInner {
 
     /// Power up and enable every HDMI/DP pin so presence/ELD can show up
     /// (NVIDIA codecs often report PD=0 until `PIN_OUT` is set).
+    ///
+    /// On NVIDIA Turing (RTX 2060 SUPER) the firmware can take >1 ms to settle
+    /// presence after `SET_PIN_CTL`.  We wait up to 3 × 5 ms before giving up,
+    /// so that `best_candidate` scores at least one pin as present when the
+    /// monitor is already connected at boot.
     fn arm_digital_pins(&mut self) {
         let pins: Vec<u32> = self
             .candidates
@@ -614,12 +619,26 @@ impl HdaInner {
             .filter(|p| p.hdmi_dp)
             .map(|p| p.pin)
             .collect();
+        if pins.is_empty() {
+            return;
+        }
         for pin in pins.iter().copied() {
             let _ = self.cmd(pin, VERB_SET_POWER_STATE, 0);
             let _ = self.cmd(pin, VERB_SET_PIN_CTL, PIN_CTL_OUT_EN);
         }
-        if !pins.is_empty() {
-            wait_us(1_000);
+        // Wait up to 3 × 5 ms for at least one pin to report presence.
+        // One 5 ms slot is enough on most hardware; extra retries cover slow
+        // NVIDIA GSP firmware responses on multi-GPU boards.
+        for _ in 0..3 {
+            wait_us(5_000);
+            let any_present = pins.iter().any(|&pin| {
+                self.cmd(pin, VERB_GET_PIN_SENSE, 0)
+                    .map(|v| v & (1 << 31) != 0)
+                    .unwrap_or(false)
+            });
+            if any_present {
+                break;
+            }
         }
     }
 
@@ -1187,9 +1206,9 @@ impl PciDriver for HdaDriverPci {
                 let v = am.read8(ops, dev.loc, 0x4e);
                 am.write8(ops, dev.loc, 0x4e, (v & 0xf0) | 0x0f);
                 let v = am.read8(ops, dev.loc, 0x4c);
-                am.write8(ops, dev.loc, 0x4c, v | 0x01);
+                am.write8(ops, dev.loc, 0x4c, v | 0x0f);
                 let v = am.read8(ops, dev.loc, 0x4d);
-                am.write8(ops, dev.loc, 0x4d, v | 0x01);
+                am.write8(ops, dev.loc, 0x4d, v | 0x0f);
             }
         }
 
