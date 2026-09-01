@@ -1,26 +1,24 @@
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Bounded multi-producer single-consumer ring.
 ///
 /// Producers reserve a slot with [`alloc_entry`] (CAS on `phead`), write the
-/// payload, then [`commit_entry`]. Commits may complete out of order: each
-/// finished slot sets a bit in [`ready`]; whoever sees the bit for the current
-/// `ptail` advances the published tail through every contiguous ready run.
+/// payload, then [`commit_entry`], which spins until `ptail == idx` and only
+/// then publishes. Commits may finish out of order at the callers, but the
+/// publish order stays strict — a later index never advances `ptail` past a
+/// still-uncommitted predecessor.
 ///
-/// The old "spin 100 times then abandon" commit left a reserved-never-committed
-/// hole that froze `ptail` forever and forced the IPI path into perpetual
-/// overflow mode — a root cause of TLB-shootdown starvation under SMP.
+/// The old implementation abandoned the commit after 100 spins (`return false`),
+/// leaving a reserved-never-published slot that froze `ptail` forever and
+/// forced the IPI path into perpetual overflow — a root cause of TLB-shootdown
+/// starvation under SMP.
 pub struct MpscQueue<'a, T: Copy> {
     pub size: usize,
     pub chead: AtomicUsize,
     pub phead: AtomicUsize,
     pub ptail: AtomicUsize,
-    /// Bit `(idx % size)` is set once the producer has written slot `idx` and
-    /// is ready for `ptail` to publish past it. Cleared when `ptail` advances
-    /// through that slot. `size` must be ≤ 64.
-    ready: AtomicU64,
     /// Safety:
     ///
     /// Access conflicts are avoided via atomic variables
@@ -34,16 +32,12 @@ unsafe impl<'a, T: Copy> Send for MpscQueue<'a, T> {}
 
 impl<'a, T: Copy> MpscQueue<'a, T> {
     pub fn new(queue: &'a mut [T]) -> Self {
-        assert!(
-            !queue.is_empty() && queue.len() <= 64,
-            "MpscQueue ready-bitmap needs 1..=64 slots"
-        );
+        assert!(!queue.is_empty(), "MpscQueue needs a non-empty buffer");
         Self {
             size: queue.len(),
             chead: AtomicUsize::new(0),
             phead: AtomicUsize::new(0),
             ptail: AtomicUsize::new(0),
-            ready: AtomicU64::new(0),
             queue: UnsafeCell::new(queue),
         }
     }
@@ -67,16 +61,11 @@ impl<'a, T: Copy> MpscQueue<'a, T> {
         self.ptail.load(Ordering::Acquire)
     }
 
-    #[inline]
-    fn ready_bit(idx: usize, size: usize) -> u64 {
-        1u64 << (idx % size)
-    }
-
     pub fn alloc_entry(&self) -> Option<usize> {
         loop {
             let chead = self.chead();
             let phead = self.phead();
-            if phead - chead < self.size {
+            if phead.saturating_sub(chead) < self.size {
                 if self
                     .phead
                     .compare_exchange(phead, phead + 1, Ordering::SeqCst, Ordering::Relaxed)
@@ -91,46 +80,15 @@ impl<'a, T: Copy> MpscQueue<'a, T> {
         }
     }
 
-    /// Mark slot `idx` ready and advance `ptail` through every contiguous ready
-    /// run starting at the current tail.
+    /// Publish slot `idx`. Spins until `ptail == idx`, then advances `ptail`.
     ///
-    /// Always returns `true`. A reserved slot is never left unpublished: even
-    /// if this producer's predecessor has not finished yet, our ready bit stays
-    /// set until that predecessor (or a helper) walks `ptail` through us.
+    /// Always returns `true`. Never abandons a reserved slot — the old
+    /// 100-spin cap left holes that froze `ptail` permanently.
     pub fn commit_entry(&self, idx: usize) -> bool {
-        let size = self.size;
-        let my_bit = Self::ready_bit(idx, size);
-        self.ready.fetch_or(my_bit, Ordering::Release);
-
-        // Help advance the published tail. Any committer may drive this loop;
-        // CAS losers just re-read. Bounded by the ring depth so a torn view
-        // cannot spin forever here.
-        let mut guard = size + 2;
-        while guard > 0 {
-            guard -= 1;
-            let tail = self.ptail.load(Ordering::Acquire);
-            // Everything up to and including `idx` is already published.
-            if tail > idx {
-                return true;
-            }
-            let bit = Self::ready_bit(tail, size);
-            let ready = self.ready.load(Ordering::Acquire);
-            if ready & bit == 0 {
-                // Hole at `tail`: a predecessor still writing. Our bit remains
-                // set; that predecessor's commit (or a later helper) will walk
-                // through us. Never abandon — that froze ptail forever.
-                return true;
-            }
-            if self
-                .ptail
-                .compare_exchange(tail, tail + 1, Ordering::SeqCst, Ordering::Relaxed)
-                .is_ok()
-            {
-                self.ready.fetch_and(!bit, Ordering::Release);
-            }
+        while self.ptail() != idx {
+            core::hint::spin_loop();
         }
-        // Depth exceeded only if the CAS storm was extreme; the ready bit for
-        // `idx` is still set, so the next committer will finish the advance.
+        self.ptail.fetch_add(1, Ordering::SeqCst);
         true
     }
 
@@ -165,18 +123,22 @@ mod tests {
 
     #[test]
     fn out_of_order_commit_publishes_in_index_order() {
-        let mut buf = [0u32; 8];
-        let q = MpscQueue::new(&mut buf);
+        let buf = Box::leak(Box::new([0u32; 8]));
+        let q = Arc::new(MpscQueue::new(buf));
         let a = q.alloc_entry().unwrap();
         let b = q.alloc_entry().unwrap();
         assert_eq!(a, 0);
         assert_eq!(b, 1);
         *q.entry_at(a) = 10;
         *q.entry_at(b) = 20;
-        // Commit B first — ptail must stay 0 until A commits.
-        assert!(q.commit_entry(b));
+        // Commit B in a side thread — it blocks until A publishes slot 0.
+        let q2 = q.clone();
+        let t = thread::spawn(move || {
+            assert!(q2.commit_entry(b));
+        });
         assert_eq!(q.ptail(), 0);
         assert!(q.commit_entry(a));
+        t.join().unwrap();
         assert_eq!(q.ptail(), 2);
         let got = q.consume_entrys();
         assert_eq!(got, vec![(0, 10), (1, 20)]);
@@ -191,7 +153,6 @@ mod tests {
         let stop = Arc::new(core::sync::atomic::AtomicBool::new(false));
         let producers = 8usize;
 
-        // Single dedicated consumer — the real IPI path is single-consumer.
         let q_cons = queue.clone();
         let stop_cons = stop.clone();
         let consumer = thread::spawn(move || {
@@ -199,26 +160,7 @@ mod tests {
                 let _ = q_cons.consume_entrys();
                 thread::yield_now();
             }
-            // Final drain.
-            for _ in 0..64 {
-                if q_cons.chead() == q_cons.phead() && q_cons.ptail() == q_cons.phead() {
-                    break;
-                }
-                let t = q_cons.ptail();
-                if t < q_cons.phead() {
-                    let ready = q_cons.ready.load(Ordering::Acquire);
-                    let bit = MpscQueue::<usize>::ready_bit(t, q_cons.size);
-                    if ready & bit != 0
-                        && q_cons
-                            .ptail
-                            .compare_exchange(t, t + 1, Ordering::SeqCst, Ordering::Relaxed)
-                            .is_ok()
-                    {
-                        q_cons.ready.fetch_and(!bit, Ordering::Release);
-                    }
-                }
-                let _ = q_cons.consume_entrys();
-            }
+            let _ = q_cons.consume_entrys();
         });
 
         let mut handles = Vec::new();
@@ -252,6 +194,5 @@ mod tests {
             "after all producers join, ptail must equal phead (no frozen hole)"
         );
         assert_eq!(queue.chead(), queue.ptail());
-        assert_eq!(queue.ready.load(Ordering::Acquire), 0);
     }
 }
