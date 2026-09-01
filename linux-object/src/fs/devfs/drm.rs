@@ -1429,7 +1429,11 @@ pub fn page_flip(fb_id: u32, crtc_id: u32, user_data: u64) -> Result<(), FlipErr
 #[derive(Clone, Copy)]
 enum PendingDrmTimer {
     Flip { crtc_id: u32, user_data: u64 },
-    Vblank { seq: u32, signal: u64 },
+    // `seq` is intentionally not stored: we recompute it from `vblank_seq_now()`
+    // at delivery time so the event carries the sequence that actually just
+    // completed (the timer fires at the next vblank boundary), rather than a
+    // sequence that was stale by the time the timer fires.
+    Vblank { signal: u64 },
 }
 
 lazy_static::lazy_static! {
@@ -1451,8 +1455,8 @@ fn deliver_pending_drm_timer() {
             PendingDrmTimer::Flip { crtc_id, user_data } => {
                 queue_flip_event(crtc_id, user_data);
             }
-            PendingDrmTimer::Vblank { seq, signal } => {
-                queue_vblank_event(seq, signal);
+            PendingDrmTimer::Vblank { signal } => {
+                queue_vblank_event(vblank_seq_now(), signal);
             }
         }
     }
@@ -1554,8 +1558,7 @@ fn clear_stale_flip_pending() {
 /// reason as [`schedule_flip_event`]. `signal` is the caller's opaque token
 /// echoed back in the event's `user_data`.
 pub fn schedule_vblank_event(signal: u64) {
-    let seq = vblank_seq_now().wrapping_add(1);
-    arm_coalesced_drm_timer(PendingDrmTimer::Vblank { seq, signal });
+    arm_coalesced_drm_timer(PendingDrmTimer::Vblank { signal });
 }
 
 /// Drop any not-yet-posted flip/vblank completions (timer queue + readable

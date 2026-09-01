@@ -1790,7 +1790,6 @@ impl INode for DrmDev {
                         }
                     }
                 }
-                let seq = drm::vblank_seq_now().wrapping_add(1);
                 if typ & _DRM_VBLANK_EVENT != 0 {
                     // Post the event at the next synthetic vblank, not now:
                     // delivering it instantly turns a vblank-paced client loop
@@ -1799,7 +1798,12 @@ impl INode for DrmDev {
                 } else {
                     let now = kernel_hal::timer::timer_now();
                     req.typ = 0; // _DRM_VBLANK_ABSOLUTE
-                    req.sequence = seq;
+                    // Return the *current* completed vblank sequence.  Returning
+                    // vblank_seq_now()+1 (the upcoming vblank) was incorrect: it
+                    // made the X11 Present MSC tracker believe the display was
+                    // always one vblank ahead, so it added an extra ~16.7 ms wait
+                    // per frame, halving the achievable frame rate.
+                    req.sequence = drm::vblank_seq_now();
                     req.val1 = now.as_secs(); // tval_sec
                     req.val2 = now.subsec_micros() as u64; // tval_usec
                 }
