@@ -271,6 +271,46 @@ fn scenario_mpg123(dev: &PcmDev, rate: u32) -> bool {
     }
 }
 
+
+/// A request this device cannot serve must come back as EINVAL. Accepting it
+/// and quietly playing the client's bytes under a different format is worse
+/// than failing: the caller gets wrong audio reported as success.
+fn scenario_impossible_rejected(dev: &PcmDev) -> bool {
+    println!("\n=== impossible request (mono) must be rejected ===");
+    let mut p = open_params();
+    p.intervals[PAR_CHANNELS - 8] = SndInterval { min: 1, max: 1, flags: INTERVAL_INTEGER };
+    match dev.install(&mut p) {
+        Ok(()) => { println!("  BUG: mono silently accepted as {} ch", iv(&p, PAR_CHANNELS).min); false }
+        Err(_) => { println!("  mono correctly rejected (EINVAL)"); true }
+    }
+}
+
+/// A recovered request must keep the latency the client asked for: reopening
+/// the sizes wholesale answers a 20 ms buffer with the full ring.
+fn scenario_recovery_keeps_latency(dev: &PcmDev) -> bool {
+    println!("\n=== recovery keeps the requested latency ===");
+    let mut p = open_params();
+    if !dev.refine(&mut p) { return false; }
+    if !set_near(dev, &mut p, PAR_RATE, 48000, "rate") { return false; }
+    if !set_near(dev, &mut p, PAR_PERIOD_SIZE, 240, "period_size") { return false; }
+    if !set_near(dev, &mut p, PAR_BUFFER_SIZE, 960, "buffer_size") { return false; }
+    // Pin a period_time one microsecond off what 240 frames really are: the
+    // inconsistency alsa-lib's `choose` produces, which sends install down the
+    // recovery path.
+    p.intervals[PAR_PERIOD_TIME - 8] = SndInterval { min: 4999, max: 4999, flags: INTERVAL_INTEGER };
+    match dev.install(&mut p) {
+        Ok(()) => {
+            let bs = iv(&p, PAR_BUFFER_SIZE).min;
+            show("INSTALLED", &p);
+            if bs > 4096 {
+                println!("  BUG: asked for a 960-frame buffer, got {} frames", bs);
+                false
+            } else { true }
+        }
+        Err(e) => { println!("  HW_PARAMS FAILED: {:?}", e); false }
+    }
+}
+
 fn scenario_aplay(dev: &PcmDev, rate: u32) -> bool {
     println!("\n=== aplay (rate {}, sizes left to the kernel) ===", rate);
     let mut p = open_params();
@@ -349,6 +389,8 @@ fn main() {
     all &= scenario_speaker_test_periods(&dev, 44100, 4);
     all &= scenario_speaker_test_periods(&dev, 48000, 2);
     all &= scenario_hardware_plug(&dev);
+    all &= scenario_impossible_rejected(&dev);
+    all &= scenario_recovery_keeps_latency(&dev);
     all &= scenario_mpg123(&dev, 44100);
     all &= scenario_mpg123(&dev, 48000);
     all &= scenario_aplay(&dev, 48000);

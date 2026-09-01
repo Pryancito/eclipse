@@ -714,23 +714,44 @@ impl PcmDev {
 
     /// Drop period/buffer/time constraints so a later refine can pick any
     /// legal ring configuration. Rate, channels and the format masks stay.
-    fn relax_size_params(p: &mut SndPcmHwParams) {
-        for idx in [
-            Self::IV_PERIOD_TIME,
-            Self::IV_PERIOD_SIZE,
-            Self::IV_PERIOD_BYTES,
-            Self::IV_PERIODS,
-            Self::IV_BUFFER_TIME,
-            Self::IV_BUFFER_SIZE,
-            Self::IV_BUFFER_BYTES,
-            Self::IV_TICK_TIME,
-        ] {
+    fn reopen(p: &mut SndPcmHwParams, params: &[usize]) {
+        for &idx in params {
             p.intervals[idx] = SndInterval {
                 min: 0,
                 max: u32::MAX,
                 flags: 0,
             };
         }
+    }
+
+    /// First recovery stage: reopen only the parameters alsa-lib DERIVES,
+    /// keeping period_size/buffer_size — the two the client actually chose and
+    /// the only ones that set its latency. The inconsistency this recovers
+    /// from is a derived one (choose pins a period_time that disagrees with
+    /// the frame count by a frame), so throwing the sizes away too would
+    /// answer a 10 ms buffer request with the full 683 ms ring.
+    fn relax_derived_params(p: &mut SndPcmHwParams) {
+        Self::reopen(
+            p,
+            &[
+                Self::IV_PERIOD_TIME,
+                Self::IV_PERIOD_BYTES,
+                Self::IV_PERIODS,
+                Self::IV_BUFFER_TIME,
+                Self::IV_BUFFER_BYTES,
+                Self::IV_TICK_TIME,
+            ],
+        );
+    }
+
+    /// Second stage: let the sizes go as well. Format, access, channels and
+    /// rate are deliberately NOT touched at any stage — a client asking for
+    /// mono S24_LE has to get EINVAL, because answering `Ok` and then playing
+    /// its bytes as stereo S16LE is worse than failing: it is wrong audio
+    /// reported as success.
+    fn relax_size_params(p: &mut SndPcmHwParams) {
+        Self::relax_derived_params(p);
+        Self::reopen(p, &[Self::IV_PERIOD_SIZE, Self::IV_BUFFER_SIZE]);
     }
 
     /// Log a rejected HW_PARAMS with both the client's request and the state
@@ -797,30 +818,24 @@ impl PcmDev {
             // rate*0.5 and period_size = buffer/4, then choose set_first's
             // period_time and the two disagree by a frame. Recover by
             // keeping format/rate/channels and letting the sizes fall out.
-            Self::relax_size_params(p);
+            // Each stage restarts from the ORIGINAL request: the failed
+            // refine above already narrowed (and emptied) the intervals, so
+            // relaxing what it left behind would be relaxing garbage.
+            p.intervals = requested;
+            Self::relax_derived_params(p);
             if !self.refine(p) {
-                let empty = p
-                    .intervals
-                    .iter()
-                    .position(Self::iv_empty)
-                    .map(Self::iv_name)
-                    .unwrap_or("mask");
-                error!(
-                    "[snd] hw_params: refine emptied ({}); forcing 48 kHz / 1024 x 4",
-                    empty
-                );
-                Self::log_hw_params_failure(empty, &requested, &p.intervals);
-                p.masks[PAR_ACCESS].bits[0] = 1 << ACCESS_RW_INTERLEAVED;
-                p.masks[PAR_FORMAT].bits[0] = 1 << FORMAT_S16_LE;
-                p.masks[PAR_SUBFORMAT].bits[0] = 1 << SUBFORMAT_STD;
-                for iv in p.intervals.iter_mut() {
-                    *iv = SndInterval {
-                        min: 0,
-                        max: u32::MAX,
-                        flags: 0,
-                    };
+                p.intervals = requested;
+                Self::relax_size_params(p);
+                if !self.refine(p) {
+                    let empty = p
+                        .intervals
+                        .iter()
+                        .position(Self::iv_empty)
+                        .map(Self::iv_name)
+                        .unwrap_or("mask");
+                    Self::log_hw_params_failure(empty, &requested, &p.intervals);
+                    return Err(FsError::InvalidParam);
                 }
-                let _ = self.refine(p);
             }
         }
 
