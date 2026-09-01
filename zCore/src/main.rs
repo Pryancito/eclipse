@@ -53,6 +53,9 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     #[cfg(not(feature = "linux"))]
     let (init_proc, shell_proc) = ("N/A", "N/A");
 
+    // First line of every dmesg: which binary this is. See build.rs — real-HW
+    // debugging kept tripping over stale builds masquerading as broken fixes.
+    klog_info!("Eclipse: kernel build {}", env!("ECLIPSE_BUILD_ID"));
     klog_info!(
         "Eclipse: boot options log_level={} init={} shell={}",
         options.log_level,

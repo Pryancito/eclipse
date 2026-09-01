@@ -25,4 +25,34 @@ fn main() {
         "cargo:rustc-env=USER_IMG=zCore/{}.img",
         std::env::var("TARGET").unwrap()
     );
+
+    // Build fingerprint: the git commit this kernel was compiled from, stamped
+    // into the boot klog and the panic banner. Real-hardware debugging kept
+    // tripping over "which binary is actually running?" — a stale build booted
+    // after a fix landed reads exactly like the fix not working. `-dirty`
+    // marks uncommitted changes. Refreshed whenever HEAD moves.
+    let build_id = {
+        let hash = std::process::Command::new("git")
+            .args(["rev-parse", "--short=10", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let dirty = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| !o.stdout.is_empty())
+            .unwrap_or(false);
+        if dirty {
+            format!("{hash}-dirty")
+        } else {
+            hash
+        }
+    };
+    println!("cargo:rustc-env=ECLIPSE_BUILD_ID={build_id}");
+    println!("cargo:rerun-if-changed=../.git/HEAD");
+    println!("cargo:rerun-if-changed=../.git/index");
 }

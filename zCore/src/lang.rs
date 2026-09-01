@@ -132,7 +132,13 @@ fn dl_paint() {
         buf: [0u8; 1024],
         len: 0,
     };
-    let _ = write!(b, "DEADLOCK: spinlock(s) stuck >8s");
+    // The build id pins WHICH binary paniced: a stale build booted after a
+    // fix landed reads exactly like the fix not working.
+    let _ = write!(
+        b,
+        "DEADLOCK: spinlock(s) stuck >8s [build {}]",
+        env!("ECLIPSE_BUILD_ID")
+    );
     // Track whether any HOLDER is itself blocked in a TLB-shootdown ack-wait:
     // that is the "shootdown starvation" signature (convoy behind one CPU that
     // is waiting on a peer that never acks — a non-pumping IRQs-off spinner),
