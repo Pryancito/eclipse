@@ -968,29 +968,68 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     // the first confirmed failure).
     let mut blitted_by_ce = false;
     if rect.is_none() && CE_PRESENT_ENABLED.load(Ordering::Relaxed) {
-        let (ce_src_pa, ce_size) = if fb.pitch == info.pitch {
-            (fb.phys_addr, (info.pitch as u64) * (blit_h as u64))
+        if fb.pitch != info.pitch {
+            // Pitched 2D CE path: the GPU copy engine reads directly from the
+            // source buffer at fb.pitch and writes into the scanout FB at
+            // info.pitch — no CPU staging repack.  On the common dual-RTX case
+            // (client pitch 5504 → GOP scanout pitch 8192) this eliminates the
+            // slow CPU reads from the uncached BAR1-backed source buffer.
+            //
+            // Fallback chain: 2D fails (CE_PRESENT_WEDGED latched) →
+            // repack+flat CE → CPU blit.
+            let row_bytes = (blit_w as usize).saturating_mul(4) as u32;
+            for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+                if d.ce_present_2d_pitched(
+                    fb.phys_addr,
+                    fb.pitch,
+                    info.pitch,
+                    row_bytes,
+                    blit_h,
+                ) {
+                    blitted_by_ce = true;
+                    break;
+                }
+            }
+            // Fallback: repack into staging buffer at scanout pitch, then flat CE.
+            if !blitted_by_ce {
+                let (ce_src_pa, ce_size) = ce_repack_to_staging(
+                    pixels,
+                    fb.phys_addr,
+                    src_stride,
+                    info.pitch as usize,
+                    blit_w,
+                    blit_h,
+                )
+                .unwrap_or((0, 0));
+                if ce_src_pa != 0 && ce_size != 0 {
+                    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+                        if d.ce_present(ce_src_pa, ce_size) {
+                            blitted_by_ce = true;
+                            break;
+                        }
+                    }
+                }
+            }
         } else {
-            ce_repack_to_staging(pixels, fb.phys_addr, src_stride, info.pitch as usize, blit_w, blit_h)
-                .unwrap_or((0, 0))
-        };
-        if ce_src_pa != 0 && ce_size != 0 {
+            // Flat CE path: pitches match, a single flat copy covers the frame.
+            let ce_src_pa = fb.phys_addr;
+            let ce_size = (info.pitch as u64) * (blit_h as u64);
             for d in kernel_hal::drivers::all_drm().as_vec().iter() {
                 if d.ce_present(ce_src_pa, ce_size) {
                     blitted_by_ce = true;
                     break;
                 }
             }
-            if !blitted_by_ce && !CE_NO_TAKER_LOGGED.swap(true, Ordering::Relaxed) {
-                // Every GPU declined (wedged, not state-loaded, or no boot FB):
-                // cepresent is set but the CPU is still doing the copy, and
-                // until now that degradation was completely silent. The
-                // per-GPU reason is one-shot-logged by `ce_present` itself.
-                kernel_hal::klog_warn!(
-                    "[drm] CE-offload present enabled but NO GPU took the copy -- CPU blit \
-                     (see [NVIDIA] ce_present lines for the reason)"
-                );
-            }
+        }
+        if !blitted_by_ce && !CE_NO_TAKER_LOGGED.swap(true, Ordering::Relaxed) {
+            // Every GPU declined (wedged, not state-loaded, or no boot FB):
+            // cepresent is set but the CPU is still doing the copy, and
+            // until now that degradation was completely silent. The
+            // per-GPU reason is one-shot-logged by `ce_present` itself.
+            kernel_hal::klog_warn!(
+                "[drm] CE-offload present enabled but NO GPU took the copy -- CPU blit \
+                 (see [NVIDIA] ce_present lines for the reason)"
+            );
         }
     }
     if !blitted_by_ce {

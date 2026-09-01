@@ -6045,6 +6045,165 @@ unlock:
 }
 
 /*
+ * eclipse_rm_ce_blit_p2p_2d -- pitched 2D variant of eclipse_rm_ce_blit_p2p.
+ *
+ * Copies `lineCount` rows of `rowBytes` bytes from
+ *   srcSysmemPa + r * srcPitch  (cacheable host RAM, compositor dumb buffer)
+ * to
+ *   dstHostPa   + r * dstPitch  (peer GPU BAR1, ADDR_SYSMEM UNCACHED)
+ * for r in [0, lineCount).
+ *
+ * This eliminates the CPU staging repack: the CE reads directly from the
+ * source buffer (fast cached PCIe DMA) and writes to the console GPU's BAR1
+ * (fast GPU-initiated PCIe writes), even when src and dst pitches differ.
+ *
+ * Each row is submitted as a separate ASYNC CE operation; the CE channel is
+ * FIFO, so waiting on the last submitted workId implicitly covers all earlier
+ * rows.  The single bounded wait (100 ms deadline, same as eclipse_rm_ce_blit_p2p)
+ * satisfies the hard rule: no synchronous RM wait, no unbounded poll.
+ */
+NV_STATUS eclipse_rm_ce_blit_p2p_2d(
+    NvU32 gpuInstance,
+    NvU64 dstHostPa,
+    NvU32 dstPitch,
+    NvU64 srcSysmemPa,
+    NvU32 srcPitch,
+    NvU32 rowBytes,
+    NvU32 lineCount)
+{
+    OBJGPU            *pGpu;
+    MemoryManager     *pMemoryManager;
+    NV_STATUS          status;
+    THREAD_STATE_NODE  threadState;
+    GPU_MASK           gpusLockedMask = 0;
+    NvU64              lastWorkId     = 0;
+    NvU32              r;
+
+    if (rowBytes == 0 || lineCount == 0)
+        return NV_ERR_INVALID_ARGUMENT;
+    if (rowBytes > srcPitch || rowBytes > dstPitch)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pGpu = gpumgrGetGpu(gpuInstance);
+    if (pGpu == NULL || !pGpu->gspRmInitialized || !pGpu->bStateLoaded)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
+    }
+
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    status = rmGpuGroupLockAcquire(pGpu->gpuInstance, GPU_LOCK_GRP_SUBDEVICE,
+                                   GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT,
+                                   &gpusLockedMask);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
+    if (pMemoryManager == NULL || pMemoryManager->pCeUtils == NULL)
+    {
+        nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p_2d: pCeUtils missing (gpuStateLoad incomplete?)\n");
+        status = NV_ERR_OBJECT_NOT_FOUND;
+        goto unlock;
+    }
+
+    osFlushCpuWriteCombineBuffer();
+
+    /*
+     * Submit one ASYNC CE copy per row.  Memdescs are "describe" wrappers
+     * (no allocation), so create/destroy inside the loop is cheap.  The CE
+     * channel is strictly FIFO: waiting on the last workId covers all rows.
+     */
+    for (r = 0; r < lineCount; r++)
+    {
+        MEMORY_DESCRIPTOR     *pSrcRow = NULL;
+        MEMORY_DESCRIPTOR     *pDstRow = NULL;
+        CEUTILS_MEMCOPY_PARAMS rp;
+        NvU64 rowSrcPa = srcSysmemPa + (NvU64)r * srcPitch;
+        NvU64 rowDstPa = dstHostPa   + (NvU64)r * dstPitch;
+
+        /* DST: one row of the peer GPU's BAR1, UNCACHED. */
+        status = memdescCreate(&pDstRow, pGpu, rowBytes, 0, NV_TRUE,
+                               ADDR_SYSMEM, NV_MEMORY_UNCACHED, MEMDESC_FLAGS_NONE);
+        if (status != NV_OK)
+        {
+            nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p_2d: DST memdescCreate row %u -> 0x%x\n", r, status);
+            break;
+        }
+        memdescDescribe(pDstRow, ADDR_SYSMEM, rowDstPa, rowBytes);
+
+        /* SRC: one row of the compositor dumb buffer, cacheable host RAM. */
+        status = memdescCreate(&pSrcRow, pGpu, rowBytes, 0, NV_TRUE,
+                               ADDR_SYSMEM, NV_MEMORY_CACHED, MEMDESC_FLAGS_NONE);
+        if (status != NV_OK)
+        {
+            nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p_2d: SRC memdescCreate row %u -> 0x%x\n", r, status);
+            memdescFree(pDstRow);
+            memdescDestroy(pDstRow);
+            break;
+        }
+        memdescDescribe(pSrcRow, ADDR_SYSMEM, rowSrcPa, rowBytes);
+
+        portMemSet(&rp, 0, sizeof(rp));
+        rp.pSrcMemDesc = pSrcRow;
+        rp.pDstMemDesc = pDstRow;
+        rp.srcOffset   = 0;
+        rp.dstOffset   = 0;
+        rp.length      = rowBytes;
+        rp.flags       = NV0050_CTRL_MEMCOPY_FLAGS_ASYNC;
+
+        status = ceutilsMemcopy(pMemoryManager->pCeUtils, &rp);
+        if (status == NV_OK)
+            lastWorkId = rp.submittedWorkId;
+
+        memdescFree(pSrcRow);
+        memdescDestroy(pSrcRow);
+        memdescFree(pDstRow);
+        memdescDestroy(pDstRow);
+
+        if (status != NV_OK)
+        {
+            nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p_2d: ceutilsMemcopy row %u -> 0x%x\n", r, status);
+            break;
+        }
+    }
+
+    /* Single bounded poll for all rows (CE is FIFO: last workId >= all rows). */
+    if (status == NV_OK && lastWorkId != 0)
+        status = eclipse_ce_wait_bounded(pMemoryManager, lastWorkId);
+
+    nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p_2d: %u/%u rows submitted, lastWorkId=%llu -> 0x%x\n",
+              (status == NV_OK) ? lineCount : r, lineCount, lastWorkId, status);
+
+unlock:
+    rmGpuGroupLockRelease(gpusLockedMask, GPUS_LOCK_FLAGS_NONE);
+    rmapiLockRelease();
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
+}
+
+/*
  * Console-GPU identity, NVIDIA's own way (osinit.c RmInitNvDevice, run just
  * BEFORE kgspInitRm on Linux -- osinit.c:1831-1862):
  *

@@ -4430,6 +4430,124 @@ impl DrmScheme for NvidiaGpu {
         }
     }
 
+    /// Pitched 2D CE present: copy `line_count` rows of `row_bytes` bytes from
+    /// `src_sysmem_pa + r * src_pitch` into the console GPU's scanout FB at
+    /// `dst_pitch` stride over PCIe P2P — without any CPU staging repack.
+    /// Uses the same `CE_PRESENT_WEDGED` latch as [`ce_present`].
+    fn ce_present_2d_pitched(
+        &self,
+        src_sysmem_pa: u64,
+        src_pitch: u32,
+        dst_pitch: u32,
+        row_bytes: u32,
+        line_count: u32,
+    ) -> bool {
+        if src_sysmem_pa == 0 || row_bytes == 0 || line_count == 0 {
+            return false;
+        }
+        if CE_PRESENT_WEDGED.load(Ordering::Relaxed) {
+            return false;
+        }
+        let device_instance = match *self.rm_device_instance.lock() {
+            Some(d) => d,
+            None => return false,
+        };
+        let fb_phys = match boot_fb_phys() {
+            Some(p) if p != 0 => p,
+            _ => return false,
+        };
+
+        nvidia_rm_sys::os_interface::capture_begin();
+        let t0 = unsafe { crate::bus::drivers_timer_now_as_micros() };
+
+        let (st, how) = if self.drives_boot_display() {
+            let bar1 = self.bar1_phys;
+            if fb_phys < bar1 {
+                let _ = nvidia_rm_sys::os_interface::capture_take();
+                return false;
+            }
+            (
+                nvidia_rm_sys::rm_init::ce_blit_p2p_2d(
+                    device_instance,
+                    fb_phys,
+                    dst_pitch,
+                    src_sysmem_pa,
+                    src_pitch,
+                    row_bytes,
+                    line_count,
+                ),
+                "console/FBMEM-2D",
+            )
+        } else {
+            (
+                nvidia_rm_sys::rm_init::ce_blit_p2p_2d(
+                    device_instance,
+                    fb_phys,
+                    dst_pitch,
+                    src_sysmem_pa,
+                    src_pitch,
+                    row_bytes,
+                    line_count,
+                ),
+                "compute/P2P-2D",
+            )
+        };
+
+        let elapsed_us = unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(t0);
+        let narration = nvidia_rm_sys::os_interface::capture_take();
+
+        if st == 0 {
+            static CE_2D_P_LOGGED: AtomicBool = AtomicBool::new(false);
+            if !CE_2D_P_LOGGED.swap(true, Ordering::Relaxed) {
+                crate::klog_info!(
+                    "[NVIDIA] CE-offload present ACTIVE ({}): src {:#x} src_pitch={} dst_pitch={} -> FB {:#x} {}x{}rows in {}us",
+                    how,
+                    src_sysmem_pa,
+                    src_pitch,
+                    dst_pitch,
+                    fb_phys,
+                    row_bytes,
+                    line_count,
+                    elapsed_us
+                );
+            }
+            if elapsed_us > 8_000 {
+                static CE_2D_P_SLOW_LOGGED: AtomicBool = AtomicBool::new(false);
+                if !CE_2D_P_SLOW_LOGGED.swap(true, Ordering::Relaxed) {
+                    crate::klog_warn!(
+                        "[NVIDIA] CE-offload present SLOW ({}): {}us for {}x{}B rows (src_pitch={} dst_pitch={})",
+                        how,
+                        elapsed_us,
+                        line_count,
+                        row_bytes,
+                        src_pitch,
+                        dst_pitch
+                    );
+                }
+            }
+            true
+        } else {
+            CE_PRESENT_WEDGED.store(true, Ordering::Relaxed);
+            crate::klog_warn!(
+                "[NVIDIA] CE-offload present 2D FAILED ({}): status={:#x} (src={:#x} src_pitch={} dst_pitch={} {}x{}rows) in {}us -- latching CE OFF",
+                how,
+                st,
+                src_sysmem_pa,
+                src_pitch,
+                dst_pitch,
+                line_count,
+                row_bytes,
+                elapsed_us
+            );
+            if let Some(text) = narration {
+                for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                    crate::klog_warn!("[NVIDIA] CE rm: {}", line);
+                }
+            }
+            false
+        }
+    }
+
     /// `/proc/gpucefill`: CE-offload visual test. On the state-loaded console
     /// GPU, CE-memset the scanout framebuffer to a solid colour via the
     /// persistent CeUtils channel (`eclipse_rm_ce_fill_fb`). If the screen turns
