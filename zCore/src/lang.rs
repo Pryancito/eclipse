@@ -145,6 +145,9 @@ fn dl_paint() {
     // as opposed to a true lock-ordering AB-BA cycle.
     let mut shootdown_head = false;
     let mut nonack_union: u64 = 0;
+    // The last CPU seen publishing a wait mask: whose goals the non-acker
+    // lines below are held to (single-waiter in every capture so far).
+    let mut waiter_cpu: usize = usize::MAX;
     for i in 0..DL_SLOTS {
         let p = DL_FILE_PTR[i].load(Ordering::SeqCst);
         if p == 0 {
@@ -170,6 +173,7 @@ fn dl_paint() {
             if is_holder {
                 shootdown_head = true;
             }
+            waiter_cpu = cpu;
             nonack_union |= mask;
             let _ = write!(b, " [TLB-ack wait, blocked on cpu");
             let mut m = mask;
@@ -198,10 +202,28 @@ fn dl_paint() {
             m &= m - 1;
             let nmi = kernel_hal::kstats::nmi_rip(c);
             let tick = kernel_hal::kstats::cpu_tick_rip(c);
+            // Live protocol state: the watermark this CPU has published, the
+            // goal the waiter holds it to, its queue counters and flags. With
+            // the NMI rescue provably running (nmi_rip fresh), these name the
+            // broken invariant directly: seq<goal with an empty queue and a
+            // clear flag would mean the publish itself is not landing.
+            let seq = kernel_hal::shootdown_seq_of(c);
+            let goal = kernel_hal::shootdown_goal(waiter_cpu, c);
+            let (chead, ptail, phead, ack_active, overflow) =
+                kernel_hal::shootdown_queue_state(c);
             let _ = write!(
                 b,
-                "\nnon-acker cpu{} nmi_rip={:#x} (last_tick={:#x})",
-                c, nmi, tick
+                "\nnon-acker cpu{} nmi_rip={:#x} (last_tick={:#x}) seq={} goal={} q={}/{}/{} fl={}{}",
+                c,
+                nmi,
+                tick,
+                seq,
+                goal,
+                chead,
+                ptail,
+                phead,
+                ack_active as u8,
+                overflow as u8
             );
         }
     }

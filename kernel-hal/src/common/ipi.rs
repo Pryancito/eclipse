@@ -173,6 +173,49 @@ pub fn shootdown_wait_mask(cpu: usize) -> u64 {
     }
 }
 
+/// [diag] Per-(waiter, target) ack goal published by the wait loop while it
+/// spins (0 = not waiting on that target). Together with [`shootdown_seq_of`]
+/// and [`shootdown_queue_state`], the deadlock banner can print the live
+/// protocol state of a starved shootdown — which invariant is broken, not
+/// just where the CPUs are parked.
+#[allow(clippy::declare_interior_mutable_const)]
+const GOAL_ROW: [AtomicU64; MAX_CORE_NUM] = [ZERO_SEQ; MAX_CORE_NUM];
+static SHOOTDOWN_GOAL: [[AtomicU64; MAX_CORE_NUM]; MAX_CORE_NUM] = [GOAL_ROW; MAX_CORE_NUM];
+
+/// [diag] The ack goal `waiter` is holding `target` to, or 0 when idle.
+pub fn shootdown_goal(waiter: usize, target: usize) -> u64 {
+    if waiter < MAX_CORE_NUM && target < MAX_CORE_NUM {
+        SHOOTDOWN_GOAL[waiter][target].load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
+/// [diag] `cpu`'s published shootdown-flush watermark.
+pub fn shootdown_seq_of(cpu: usize) -> u64 {
+    if cpu < MAX_CORE_NUM {
+        SHOOTDOWN_SEQ[cpu].load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
+/// [diag] `cpu`'s IPI-queue counters and in-flight-ack flag:
+/// `(chead, ptail, phead, ack_active, overflow_bit)`.
+pub fn shootdown_queue_state(cpu: usize) -> (usize, usize, usize, bool, bool) {
+    if cpu >= MAX_CORE_NUM {
+        return (0, 0, 0, false, false);
+    }
+    let q = ipi_queue(cpu);
+    (
+        q.chead(),
+        q.ptail(),
+        q.phead(),
+        SHOOTDOWN_ACK_ACTIVE[cpu].load(Ordering::Relaxed),
+        IPI_QUEUE_OVERFLOW.load(Ordering::Relaxed) & (1u64 << cpu) != 0,
+    )
+}
+
 /// Per-CPU "the IPI queue could not take an entry" flags. A sender that fails
 /// to publish its payload (queue full / lost commit race) sets the target's
 /// bit; the target's next ack then falls back to a full TLB flush, so the
@@ -349,30 +392,32 @@ pub fn tlb_shootdown_ack_nmi() {
     if me >= MAX_CORE_NUM {
         return;
     }
-    // A drain is already in flight here (the NMI interrupted a pump/IRQ ack) —
-    // let it finish rather than re-enter and double-consume the queue.
-    if SHOOTDOWN_ACK_ACTIVE[me].load(Ordering::SeqCst) {
-        return;
-    }
     let q = ipi_queue(me);
-    if q.chead() == q.ptail() && IPI_QUEUE_OVERFLOW.load(Ordering::Relaxed) & (1u64 << me) == 0 {
-        // Queue empty, no overflow — yet a peer escalated all the way to an
-        // NMI kick, which only happens when it has been starving on THIS
-        // CPU's watermark for ~1M spins. Whatever ate the entry (a drain
-        // that consumed without publishing, a commit/ptail race), returning
-        // here leaves the initiator spinning until the 8s deadlock detector
-        // fires — three real-hardware panics carried exactly this signature
-        // (non-ackers parked in unrelated code, their queues clean, the
-        // HOLDER waiting forever). An NMI-kicked CPU can soundly satisfy any
-        // such waiter regardless of the lost entry: full-flush and publish
-        // the current tail. The flush over-satisfies whatever was asked, and
-        // every waiter's goal is <= the tail it observed at send time <= the
-        // tail published here. NMI-safe: no locks, no allocation.
-        crate::vm::flush_tlb(None);
-        SHOOTDOWN_SEQ[me].fetch_max(q.ptail() as u64, Ordering::Release);
+    // The single-consumer drain may only run when no other drain is in flight
+    // on this CPU (the NMI may have interrupted a pump/IRQ ack mid-queue).
+    if !SHOOTDOWN_ACK_ACTIVE[me].load(Ordering::SeqCst)
+        && (q.chead() != q.ptail()
+            || IPI_QUEUE_OVERFLOW.load(Ordering::Relaxed) & (1u64 << me) != 0)
+    {
+        tlb_shootdown_ack();
         return;
     }
-    tlb_shootdown_ack();
+    // Every other state — queue looks empty, or a drain is in flight so the
+    // queue must not be touched — gets the unconditional rescue. An NMI kick
+    // only ever fires after a peer starved on THIS CPU's watermark for ~1M
+    // spins, and each previously-allowed silent return here was one more way
+    // for that starvation to persist until the 8s deadlock detector killed
+    // the machine (four real-hardware panics with this signature: non-ackers
+    // parked in unrelated code, queues clean or a drain nominally in flight,
+    // the HOLDER waiting forever). A full local flush over-satisfies every
+    // request enqueued up to this instant, so publishing the current tail
+    // afterwards is sound no matter what ate the entry or what a concurrent
+    // drain is doing (its invlpgs become redundant; fetch_max keeps the
+    // watermark monotone). Every waiter's goal is <= the tail it observed at
+    // send time <= the tail published here, so the starvation ends on this
+    // very NMI. NMI-safe: no locks, no allocation, queue untouched.
+    crate::vm::flush_tlb(None);
+    SHOOTDOWN_SEQ[me].fetch_max(q.ptail() as u64, Ordering::Release);
 }
 
 /// Broadcast an NMI to every other CPU so a wedged target services its pending
@@ -521,10 +566,19 @@ pub fn remote_flush_tlb_aspace(vaddr: Option<usize>, aspace: Option<usize>) {
                 pending |= 1u64 << cpu;
             }
         }
-        // [diag] Publish who we are still blocked on, so the deadlock banner can
-        // show — with no serial, on a real-hardware screen capture — that this
-        // CPU is a shootdown-starvation victim and name the CPU(s) not acking.
+        // [diag] Publish who we are still blocked on — and the exact goal each
+        // pending target is being held to — so the deadlock banner can show,
+        // with no serial, the live protocol state of a starved shootdown
+        // (which invariant broke), not just where the CPUs are parked.
         SHOOTDOWN_WAIT_MASK[me].store(pending, Ordering::Relaxed);
+        for cpu in 0..MAX_CORE_NUM {
+            let g = if pending & (1u64 << cpu) != 0 {
+                goal[cpu]
+            } else {
+                0
+            };
+            SHOOTDOWN_GOAL[me][cpu].store(g, Ordering::Relaxed);
+        }
         if all_acked {
             SHOOTDOWN_WAIT_MASK[me].store(0, Ordering::Relaxed);
             break;
