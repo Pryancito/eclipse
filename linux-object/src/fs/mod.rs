@@ -112,9 +112,7 @@ pub use pipe::Pipe;
 pub use rcore_fs::vfs::{self, PollStatus};
 pub use signalfd::SignalFd;
 pub use stdio::{STDIN, STDOUT};
-pub use syncobj_eventfd::{
-    init as syncobj_eventfd_init, register as register_syncobj_eventfd,
-};
+pub use syncobj_eventfd::{init as syncobj_eventfd_init, register as register_syncobj_eventfd};
 pub use syncobj_file::SyncobjHandle;
 pub use timerfd::TimerFd;
 
@@ -635,12 +633,26 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         }
     }
 
-    // Add OSS PCM playback nodes: `/dev/dsp` for the first HDA controller
-    // (typically the board's onboard codec), `/dev/dsp1`, `/dev/dsp2`, … for
-    // the rest (e.g. NVIDIA GPU HDMI audio functions).
+    // Playback devices in "default first" order: HDMI/DP with a live display
+    // outranks analog jacks, so ALSA card 0 (and `/dev/dsp`) is what the
+    // monitor speakers are on. Probe-order remains the tiebreaker.
+    let audio_cards: Vec<_> = {
+        let guard = drivers::all_audio().as_vec();
+        let mut v: Vec<(i32, usize, _)> = guard
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, a)| (a.default_score(), i, a))
+            .collect();
+        v.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        v.into_iter().map(|(_, _, a)| a).collect()
+    };
+
+    // Add OSS PCM playback nodes: `/dev/dsp` for card 0, `/dev/dsp1`, … for
+    // the rest (typically remaining analog or extra HDMI functions).
     {
         use devfs::DspDev;
-        for (idx, audio) in drivers::all_audio().as_vec().iter().enumerate() {
+        for (idx, audio) in audio_cards.iter().enumerate() {
             let fname = if idx == 0 {
                 "dsp".to_string()
             } else {
@@ -660,11 +672,10 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     // userspace and the kernel PCM only ever sees S16LE stereo.
     {
         use devfs::{CtlDev, PcmDev};
-        let audios = drivers::all_audio().as_vec();
-        if !audios.is_empty() {
+        if !audio_cards.is_empty() {
             match devfs_root.add_dir("snd") {
                 Ok(snd_dir) => {
-                    for (card, audio) in audios.iter().enumerate() {
+                    for (card, audio) in audio_cards.iter().enumerate() {
                         let ctl = format!("controlC{}", card);
                         let pcm = format!("pcmC{}D0p", card);
                         info!(

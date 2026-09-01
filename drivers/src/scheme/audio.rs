@@ -38,4 +38,26 @@ pub trait AudioScheme: Scheme {
 
     /// Stop playback and drop any queued PCM.
     fn reset(&self) -> DeviceResult;
+
+    /// Set stereo playback gain. `left`/`right` are percents in `0..=100`;
+    /// mute flags force silence on that channel regardless of percent.
+    /// HDMI/DP pins have no analog volume, so implementations typically
+    /// scale S16LE in [`write`](AudioScheme::write). Default is a no-op
+    /// (full volume, unmuted).
+    fn set_gain(&self, left: u8, right: u8, mute_left: bool, mute_right: bool) -> DeviceResult {
+        let _ = (left, right, mute_left, mute_right);
+        Ok(())
+    }
+
+    /// Current stereo gain: `(left%, right%, mute_left, mute_right)`.
+    fn gain(&self) -> (u8, u8, bool, bool) {
+        (100, 100, false, false)
+    }
+
+    /// Sort key for ALSA card 0 (the `default` PCM). Higher wins. HDMI/DP
+    /// with a live display should outrank analog jacks so `aplay` and
+    /// `amixer set Master` hit the monitor speakers.
+    fn default_score(&self) -> i32 {
+        0
+    }
 }

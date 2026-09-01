@@ -73,8 +73,7 @@ static CE_PRESENT_ENABLED: core::sync::atomic::AtomicBool =
 
 /// When set, `present_now_region` / CE present no-op so the console GPU's
 /// BAR1 stays quiet during a deferred GSP-RM bring-up (hwcursor path).
-static SCANOUT_PAUSED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static SCANOUT_PAUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Enable/disable the per-frame CE-offloaded present (set once at boot from
 /// the `nvidia.cepresent` cmdline flag).
@@ -979,13 +978,7 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
             // repack+flat CE → CPU blit.
             let row_bytes = (blit_w as usize).saturating_mul(4) as u32;
             for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-                if d.ce_present_2d_pitched(
-                    fb.phys_addr,
-                    fb.pitch,
-                    info.pitch,
-                    row_bytes,
-                    blit_h,
-                ) {
+                if d.ce_present_2d_pitched(fb.phys_addr, fb.pitch, info.pitch, row_bytes, blit_h) {
                     blitted_by_ce = true;
                     break;
                 }
@@ -1306,37 +1299,12 @@ pub fn repaint_for_cursor() {
             let (ux, uy, uw, uh) = union_i32(ox, oy, ow, oh, *nx, *ny, *nw, *nh);
             if rects_overlap(ox, oy, ow, oh, *nx, *ny, *nw, *nh) {
                 blit_cursor_patch(
-                    &*display,
-                    pixels,
-                    src_stride,
-                    fw,
-                    fh,
-                    ux,
-                    uy,
-                    uw,
-                    uh,
-                    *nx,
-                    *ny,
-                    *nw,
-                    *nh,
-                    bmp,
+                    &*display, pixels, src_stride, fw, fh, ux, uy, uw, uh, *nx, *ny, *nw, *nh, bmp,
                 );
             } else {
                 restore_rect(&*display, pixels, src_stride, fw, fh, ox, oy, ow, oh);
                 blit_cursor_patch(
-                    &*display,
-                    pixels,
-                    src_stride,
-                    fw,
-                    fh,
-                    *nx,
-                    *ny,
-                    *nw,
-                    *nh,
-                    *nx,
-                    *ny,
-                    *nw,
-                    *nh,
+                    &*display, pixels, src_stride, fw, fh, *nx, *ny, *nw, *nh, *nx, *ny, *nw, *nh,
                     bmp,
                 );
             }
@@ -1346,20 +1314,7 @@ pub fn repaint_for_cursor() {
         }
         (None, Some((nx, ny, nw, nh, bmp))) => {
             blit_cursor_patch(
-                &*display,
-                pixels,
-                src_stride,
-                fw,
-                fh,
-                *nx,
-                *ny,
-                *nw,
-                *nh,
-                *nx,
-                *ny,
-                *nw,
-                *nh,
-                bmp,
+                &*display, pixels, src_stride, fw, fh, *nx, *ny, *nw, *nh, *nx, *ny, *nw, *nh, bmp,
             );
         }
         (None, None) => {}
@@ -1386,8 +1341,12 @@ fn union_i32(
 ) -> (i32, i32, u32, u32) {
     let x0 = ax.min(bx);
     let y0 = ay.min(by);
-    let x1 = ax.saturating_add(aw as i32).max(bx.saturating_add(bw as i32));
-    let y1 = ay.saturating_add(ah as i32).max(by.saturating_add(bh as i32));
+    let x1 = ax
+        .saturating_add(aw as i32)
+        .max(bx.saturating_add(bw as i32));
+    let y1 = ay
+        .saturating_add(ah as i32)
+        .max(by.saturating_add(bh as i32));
     (
         x0,
         y0,

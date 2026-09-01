@@ -1798,11 +1798,11 @@ impl INode for DrmDev {
                 } else {
                     let now = kernel_hal::timer::timer_now();
                     req.typ = 0; // _DRM_VBLANK_ABSOLUTE
-                    // Return the *current* completed vblank sequence.  Returning
-                    // vblank_seq_now()+1 (the upcoming vblank) was incorrect: it
-                    // made the X11 Present MSC tracker believe the display was
-                    // always one vblank ahead, so it added an extra ~16.7 ms wait
-                    // per frame, halving the achievable frame rate.
+                                 // Return the *current* completed vblank sequence.  Returning
+                                 // vblank_seq_now()+1 (the upcoming vblank) was incorrect: it
+                                 // made the X11 Present MSC tracker believe the display was
+                                 // always one vblank ahead, so it added an extra ~16.7 ms wait
+                                 // per frame, halving the achievable frame rate.
                     req.sequence = drm::vblank_seq_now();
                     req.val1 = now.as_secs(); // tval_sec
                     req.val2 = now.subsec_micros() as u64; // tval_usec
@@ -2597,7 +2597,11 @@ impl INode for DrmDev {
                 }
                 let h0 = unsafe { *(req.handles as *const u32) };
                 trace_syncobj(
-                    if cmd == DRM_IOCTL_SYNCOBJ_RESET { "RESET" } else { "SIGNAL" },
+                    if cmd == DRM_IOCTL_SYNCOBJ_RESET {
+                        "RESET"
+                    } else {
+                        "SIGNAL"
+                    },
                     drm::current_pid(),
                     h0,
                     0,
@@ -2748,7 +2752,10 @@ impl INode for DrmDev {
                     if timeline { "TIMELINE_WAIT" } else { "WAIT" },
                     drm::current_pid(),
                     handles.first().copied().unwrap_or(0),
-                    points.as_ref().and_then(|p| p.first().copied()).unwrap_or(0),
+                    points
+                        .as_ref()
+                        .and_then(|p| p.first().copied())
+                        .unwrap_or(0),
                     &alloc::format!("timeout_ns={} flags={:#x}", timeout_nsec, flags),
                 );
                 match zcore_drivers::scheme::syncobj::wait(

@@ -139,7 +139,8 @@ endif
 
 ################ Internal variables ################
 
-qemu := qemu-system-$(ARCH)
+QEMU ?= qemu-system-$(ARCH)
+qemu := $(QEMU)
 kernel_elf := $(build_path)/zcore
 kernel_img := $(build_path)/zcore.bin
 esp := $(build_path)/esp
@@ -330,6 +331,51 @@ ifeq ($(GRAPHIC), on)
   endif
 else
   qemu_opts += -display none
+endif
+
+# Intel HD Audio: the guest driver matches PCI class 04:03 and needs a codec
+# (`hda-output`) or STATESTS stays 0. Host backend is whatever this QEMU was
+# built with — the /usr/local build only has none/oss/wav, distro QEMU has
+# pipewire/pa/alsa. AUDIO=off keeps the guest codec but silences the host
+# (`none`). AUDIODEV=wav dumps PCM to AUDIOWAV.
+AUDIO ?= on
+AUDIODEV ?=
+AUDIOWAV ?= /tmp/eclipse-qemu.wav
+ifeq ($(ARCH), x86_64)
+  qemu_audiodevs := $(shell $(qemu) -audiodev help 2>/dev/null)
+  ifeq ($(AUDIO),on)
+    ifeq ($(filter pipewire pa alsa,$(qemu_audiodevs)),)
+      ifneq ($(wildcard /usr/bin/qemu-system-$(ARCH)),)
+        distro_audiodevs := $(shell /usr/bin/qemu-system-$(ARCH) -audiodev help 2>/dev/null)
+        ifneq ($(filter pipewire pa alsa,$(distro_audiodevs)),)
+          qemu := /usr/bin/qemu-system-$(ARCH)
+          qemu_audiodevs := $(distro_audiodevs)
+        endif
+      endif
+    endif
+  endif
+  ifeq ($(AUDIODEV),)
+    ifeq ($(AUDIO),off)
+      AUDIODEV := none
+    else ifneq ($(filter pipewire,$(qemu_audiodevs)),)
+      AUDIODEV := pipewire
+    else ifneq ($(filter pa,$(qemu_audiodevs)),)
+      AUDIODEV := pa
+    else ifneq ($(filter alsa,$(qemu_audiodevs)),)
+      AUDIODEV := alsa
+    else
+      AUDIODEV := wav
+    endif
+  endif
+  ifeq ($(AUDIODEV),wav)
+    qemu_opts += -audiodev wav,id=snd0,path=$(AUDIOWAV)
+  else
+    qemu_opts += -audiodev $(AUDIODEV),id=snd0
+  endif
+  qemu_opts += -device intel-hda,id=snd -device hda-output,audiodev=snd0
+  ifneq ($(filter run justrun debug,$(MAKECMDGOALS)),)
+    $(info [qemu] audio backend=$(AUDIODEV) via $(qemu)$(if $(filter wav,$(AUDIODEV)), -> $(AUDIOWAV)))
+  endif
 endif
 
 ifeq ($(ARCH), x86_64)

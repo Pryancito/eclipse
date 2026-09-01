@@ -120,6 +120,26 @@ const BDL_SEGMENT: usize = 16 * 1024;
 /// (the engine prefetches past LPIB into its FIFO).
 const RING_GUARD: usize = 512;
 
+/// Q15 multiplier for a 0..=100 percent. 100% is 1.0 (32768) so a shift-15
+/// multiply is a no-op; mute/0% is silence.
+fn gain_q15(percent: u8, mute: bool) -> i32 {
+    if mute || percent == 0 {
+        0
+    } else if percent >= 100 {
+        32768
+    } else {
+        percent as i32 * 32768 / 100
+    }
+}
+
+fn scale_q15(sample: i16, gain: i32) -> i16 {
+    if gain == 32768 {
+        sample
+    } else {
+        ((sample as i32 * gain) >> 15) as i16
+    }
+}
+
 // ── MMIO helpers ────────────────────────────────────────────────────────────
 fn mmio_r8(bar: usize, off: usize) -> u8 {
     unsafe { read_volatile((bar + off) as *const u8) }
@@ -214,6 +234,13 @@ struct HdaInner {
 
     rate: u32,
     channels: u8,
+
+    /// Software playback gain (HDMI has no analog volume). Applied while
+    /// copying S16LE into the ring so OSS and ALSA share one control.
+    gain_l: u8,
+    gain_r: u8,
+    mute_l: bool,
+    mute_r: bool,
 }
 
 pub struct HdaDevice {
@@ -309,6 +336,39 @@ impl HdaInner {
             left -= chunk;
         }
         self.zero_ptr = p;
+    }
+
+    /// Copy `src` into the ring at `dst` (virtual address), applying the
+    /// current stereo gain. `len` is a whole number of S16LE stereo frames
+    /// (the write path never splits a frame across the ring wrap).
+    fn copy_pcm_scaled(&self, src: &[u8], dst: usize, len: usize) {
+        let gl = gain_q15(self.gain_l, self.mute_l);
+        let gr = gain_q15(self.gain_r, self.mute_r);
+        if gl == 32768 && gr == 32768 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, len);
+            }
+            return;
+        }
+        if gl == 0 && gr == 0 {
+            unsafe { core::ptr::write_bytes(dst as *mut u8, 0, len) };
+            return;
+        }
+        let dstp = dst as *mut u8;
+        let mut i = 0;
+        while i + 4 <= len {
+            let l = i16::from_le_bytes([src[i], src[i + 1]]);
+            let r = i16::from_le_bytes([src[i + 2], src[i + 3]]);
+            let lo = scale_q15(l, gl).to_le_bytes();
+            let ro = scale_q15(r, gr).to_le_bytes();
+            unsafe {
+                *dstp.add(i) = lo[0];
+                *dstp.add(i + 1) = lo[1];
+                *dstp.add(i + 2) = ro[0];
+                *dstp.add(i + 3) = ro[1];
+            }
+            i += 4;
+        }
     }
 
     fn free_bytes(&self) -> usize {
@@ -747,6 +807,10 @@ impl HdaDevice {
             zero_ptr: 0,
             rate: 48000,
             channels: 2,
+            gain_l: 100,
+            gain_r: 100,
+            mute_l: false,
+            mute_r: false,
         };
 
         // ── Codec discovery ────────────────────────────────────────────────
@@ -861,13 +925,7 @@ impl AudioScheme for HdaDevice {
         let mut done = 0;
         while done < n {
             let chunk = (n - done).min(inner.ring_len - p);
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    pcm.as_ptr().add(done),
-                    (inner.ring_va + p) as *mut u8,
-                    chunk,
-                );
-            }
+            inner.copy_pcm_scaled(&pcm[done..done + chunk], inner.ring_va + p, chunk);
             clflush_range(inner.ring_va + p, chunk);
             p = (p + chunk) % inner.ring_len;
             done += chunk;
@@ -906,6 +964,32 @@ impl AudioScheme for HdaDevice {
         unsafe { core::ptr::write_bytes(inner.ring_va as *mut u8, 0, inner.ring_len) };
         clflush_range(inner.ring_va, inner.ring_len);
         Ok(())
+    }
+
+    fn set_gain(&self, left: u8, right: u8, mute_left: bool, mute_right: bool) -> DeviceResult {
+        let mut inner = self.inner.lock();
+        inner.gain_l = left.min(100);
+        inner.gain_r = right.min(100);
+        inner.mute_l = mute_left;
+        inner.mute_r = mute_right;
+        Ok(())
+    }
+
+    fn gain(&self) -> (u8, u8, bool, bool) {
+        let inner = self.inner.lock();
+        (inner.gain_l, inner.gain_r, inner.mute_l, inner.mute_r)
+    }
+
+    fn default_score(&self) -> i32 {
+        let mut inner = self.inner.lock();
+        let pin = inner.pin_nid;
+        if let Some(p) = inner.candidates.iter().find(|c| c.pin == pin).cloned() {
+            inner.score_path(&p).0
+        } else if inner.digital {
+            4
+        } else {
+            0
+        }
     }
 }
 

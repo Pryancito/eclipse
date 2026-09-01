@@ -6,6 +6,9 @@ LOG ?= error
 IFACE ?= eno1
 GRAPHIC ?= on
 ACCEL ?= 1
+# Host audio for `make qemu`. on = pipewire/pa/alsa (or wav if this QEMU
+# has none of those). off = guest still gets intel-hda, host is silent.
+AUDIO ?= on
 # Desktop session for `make qemu`: labwc — the session verified to reach a
 # full desktop in QEMU (X still hangs in its /sys/class/drm platform probe;
 # see the branch history). The kernel cmdline gets `desktop=$(DESKTOP)`, which
@@ -92,7 +95,7 @@ clean-everything: clean
 # 	cd rootfs/x86_64/rt-tests && make
 # 	echo x86 gcc build rt-test,now need manual modificy.
 qemu: image
-	$(MAKE) -C zCore run MODE=release LINUX=1 LOG=$(LOG) GRAPHIC=$(GRAPHIC) ACCEL=$(ACCEL) DESKTOP=$(DESKTOP)
+	$(MAKE) -C zCore run MODE=release LINUX=1 LOG=$(LOG) GRAPHIC=$(GRAPHIC) ACCEL=$(ACCEL) DESKTOP=$(DESKTOP) AUDIO=$(AUDIO)
 
 vbox: image
 	$(MAKE) -C zCore vbox MODE=release LINUX=1 LOG=$(LOG) GRAPHIC=$(GRAPHIC) ACCEL=$(ACCEL) IFACE=$(IFACE)
@@ -101,7 +104,7 @@ vbox: image
 # Useful for testing the I219-V driver on bare metal.
 # Usage: make qemu-macvtap [LOG=warn] [IFACE=eno1]
 qemu-real: image
-	IFACE=$(IFACE) LOG=$(LOG) ACCEL=$(ACCEL) GRAPHIC=$(GRAPHIC) \
+	IFACE=$(IFACE) LOG=$(LOG) ACCEL=$(ACCEL) GRAPHIC=$(GRAPHIC) AUDIO=$(AUDIO) \
 		bash zCore/run-qemu-macvtap.sh
 
 ################ Distribution images ################

@@ -62,7 +62,11 @@ pub fn register(handle: u32, point: u64, ev: Arc<dyn FileLike>) {
         }
     }
     let mut waiters = WAITERS.lock();
-    waiters.push(Waiter { handle, point: target, ev });
+    waiters.push(Waiter {
+        handle,
+        point: target,
+        ev,
+    });
     WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
 }
 

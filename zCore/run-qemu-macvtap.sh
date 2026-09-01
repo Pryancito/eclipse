@@ -67,10 +67,41 @@ else
     QEMU_ARGS+=(-vga virtio)
 fi
 
+# Guest HDA codec (PCI 04:03). Prefer pipewire/pa/alsa; fall back to silent.
+AUDIO="${AUDIO:-on}"
+QEMU_BIN="${QEMU:-qemu-system-x86_64}"
+qemu_audio_help() { "$1" -audiodev help 2>/dev/null || true; }
+pick_audio_backend() {
+    local help="$1"
+    echo "$help" | grep -qx pipewire && { echo pipewire; return; }
+    echo "$help" | grep -qx pa && { echo pa; return; }
+    echo "$help" | grep -qx alsa && { echo alsa; return; }
+    echo none
+}
+AUDIO_HELP=$(qemu_audio_help "$QEMU_BIN")
+AUDIODEV="${AUDIODEV:-}"
+if [ "$AUDIO" = "off" ]; then
+    AUDIODEV="${AUDIODEV:-none}"
+else
+    if [ -z "$AUDIODEV" ]; then
+        AUDIODEV=$(pick_audio_backend "$AUDIO_HELP")
+        if [ "$AUDIODEV" = "none" ] && [ -x /usr/bin/qemu-system-x86_64 ]; then
+            DISTRO_HELP=$(qemu_audio_help /usr/bin/qemu-system-x86_64)
+            DISTRO_DEV=$(pick_audio_backend "$DISTRO_HELP")
+            if [ "$DISTRO_DEV" != "none" ]; then
+                QEMU_BIN=/usr/bin/qemu-system-x86_64
+                AUDIODEV="$DISTRO_DEV"
+            fi
+        fi
+    fi
+fi
+echo "[+] QEMU audio backend=$AUDIODEV via $QEMU_BIN"
+QEMU_ARGS+=(-audiodev "$AUDIODEV,id=snd0" -device intel-hda,id=snd -device hda-output,audiodev=snd0)
+
 # ─── 4. Launch QEMU ────────────────────────────────────────────────────────
 echo "[+] Launching QEMU with macvtap (fd=3 -> $TAPDEV)..."
 exec 3<>"$TAPDEV"
-exec qemu-system-x86_64 "${QEMU_ARGS[@]}"
+exec "$QEMU_BIN" "${QEMU_ARGS[@]}"
 
 # Cleanup (only reached if exec fails, normally unreachable)
 sudo ip link delete "$MACVTAP" 2>/dev/null || true

@@ -13,6 +13,10 @@
 //!   pages are *not* mmap-able here, which alsa-lib detects and transparently
 //!   falls back to `SNDRV_PCM_IOCTL_SYNC_PTR` — implemented with Linux's exact
 //!   flag semantics.
+//! * Mixer: `Master Playback Volume` (INTEGER 0..=100, stereo) and
+//!   `Master Playback Switch` (BOOLEAN mute). HDMI has no analog volume, so
+//!   the HDA driver scales S16LE in `write`; `amixer set Master 50%` and the
+//!   lunarbar slider both land on that path.
 //! * No capture, no mmap data access, no pause/resume: the `info` flags and
 //!   refine masks never advertise them, so clients don't try.
 //!
@@ -214,6 +218,119 @@ struct SndCtlCardInfo {
     mixername: [u8; 80],
     components: [u8; 128],
 }
+
+// ── Mixer uapi (x86_64) ─────────────────────────────────────────────────────
+// Layouts match include/uapi/sound/asound.h. alsa-lib's simple mixer composes
+// "Master" from Playback Volume + Playback Switch with these exact names.
+
+const IFACE_MIXER: i32 = 2;
+const ELEM_BOOLEAN: i32 = 1;
+const ELEM_INTEGER: i32 = 2;
+const ACCESS_READ_WRITE: u32 = 0x1 | 0x2;
+
+const NUMID_VOLUME: u32 = 1;
+const NUMID_SWITCH: u32 = 2;
+const NAME_VOLUME: &str = "Master Playback Volume";
+const NAME_SWITCH: &str = "Master Playback Switch";
+const MIXER_ELEMS: u32 = 2;
+
+#[repr(C)]
+struct SndCtlElemId {
+    numid: u32,
+    iface: i32,
+    device: u32,
+    subdevice: u32,
+    name: [u8; 44],
+    index: u32,
+}
+
+#[repr(C)]
+struct SndCtlElemList {
+    offset: u32,
+    space: u32,
+    used: u32,
+    count: u32,
+    pids: u64,
+    _reserved: [u8; 50],
+}
+
+#[repr(C)]
+struct SndCtlElemInfo {
+    id: SndCtlElemId,
+    type_: i32,
+    access: u32,
+    count: u32,
+    owner: i32,
+    min: i64,
+    max: i64,
+    step: i64,
+    _value_pad: [u8; 128 - 24],
+    _dimen_reserved: [u8; 64],
+}
+
+#[repr(C)]
+struct SndCtlElemValue {
+    id: SndCtlElemId,
+    _indirect: u32,
+    _pad: u32,
+    values: [i64; 2],
+}
+
+#[derive(Clone, Copy)]
+enum MixerElem {
+    Volume,
+    Switch,
+}
+
+fn cstr_name(buf: &[u8; 44]) -> &str {
+    let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    core::str::from_utf8(&buf[..n]).unwrap_or("")
+}
+
+fn fill_elem_id(id: &mut SndCtlElemId, elem: MixerElem) {
+    unsafe {
+        core::ptr::write_bytes(
+            id as *mut SndCtlElemId as *mut u8,
+            0,
+            core::mem::size_of::<SndCtlElemId>(),
+        )
+    };
+    id.iface = IFACE_MIXER;
+    match elem {
+        MixerElem::Volume => {
+            id.numid = NUMID_VOLUME;
+            fill_cstr(&mut id.name, NAME_VOLUME);
+        }
+        MixerElem::Switch => {
+            id.numid = NUMID_SWITCH;
+            fill_cstr(&mut id.name, NAME_SWITCH);
+        }
+    }
+}
+
+fn elem_from_id(id: &SndCtlElemId) -> Option<MixerElem> {
+    match id.numid {
+        NUMID_VOLUME => return Some(MixerElem::Volume),
+        NUMID_SWITCH => return Some(MixerElem::Switch),
+        _ => {}
+    }
+    match cstr_name(&id.name) {
+        NAME_VOLUME => Some(MixerElem::Volume),
+        NAME_SWITCH => Some(MixerElem::Switch),
+        _ => None,
+    }
+}
+
+fn mixer_elem_at(index: u32) -> Option<MixerElem> {
+    match index {
+        0 => Some(MixerElem::Volume),
+        1 => Some(MixerElem::Switch),
+        _ => None,
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<SndCtlElemId>() == 64);
+const _: () = assert!(core::mem::size_of::<SndCtlElemInfo>() == 272);
 
 fn fill_cstr(dst: &mut [u8], s: &str) {
     let n = s.len().min(dst.len() - 1);
@@ -1060,6 +1177,97 @@ impl CtlDev {
             inode_id: DevFS::new_inode_id(),
         }
     }
+
+    fn elem_list(&self, data: usize) -> Result<usize> {
+        let list = unsafe { &mut *(data as *mut SndCtlElemList) };
+        list.count = MIXER_ELEMS;
+        let offset = list.offset;
+        let space = list.space;
+        let mut used = 0u32;
+        if list.pids != 0 && space > 0 {
+            let ids = list.pids as *mut SndCtlElemId;
+            while used < space {
+                let idx = offset.saturating_add(used);
+                let Some(elem) = mixer_elem_at(idx) else {
+                    break;
+                };
+                unsafe { fill_elem_id(&mut *ids.add(used as usize), elem) };
+                used += 1;
+            }
+        }
+        list.used = used;
+        Ok(0)
+    }
+
+    fn elem_info(&self, data: usize) -> Result<usize> {
+        let info = unsafe { &mut *(data as *mut SndCtlElemInfo) };
+        let elem = elem_from_id(&info.id).ok_or(FsError::EntryNotFound)?;
+        unsafe {
+            core::ptr::write_bytes(
+                info as *mut SndCtlElemInfo as *mut u8,
+                0,
+                core::mem::size_of::<SndCtlElemInfo>(),
+            )
+        };
+        fill_elem_id(&mut info.id, elem);
+        info.access = ACCESS_READ_WRITE;
+        info.count = 2;
+        info.owner = -1;
+        match elem {
+            MixerElem::Volume => {
+                info.type_ = ELEM_INTEGER;
+                info.min = 0;
+                info.max = 100;
+                info.step = 1;
+            }
+            MixerElem::Switch => {
+                info.type_ = ELEM_BOOLEAN;
+                info.min = 0;
+                info.max = 1;
+                info.step = 1;
+            }
+        }
+        Ok(0)
+    }
+
+    fn elem_read(&self, data: usize) -> Result<usize> {
+        let val = unsafe { &mut *(data as *mut SndCtlElemValue) };
+        let elem = elem_from_id(&val.id).ok_or(FsError::EntryNotFound)?;
+        fill_elem_id(&mut val.id, elem);
+        let (l, r, mute_l, mute_r) = self.audio.gain();
+        match elem {
+            MixerElem::Volume => {
+                val.values[0] = l as i64;
+                val.values[1] = r as i64;
+            }
+            MixerElem::Switch => {
+                // ALSA switch: 1 = unmuted.
+                val.values[0] = i64::from(!mute_l);
+                val.values[1] = i64::from(!mute_r);
+            }
+        }
+        Ok(0)
+    }
+
+    fn elem_write(&self, data: usize) -> Result<usize> {
+        let val = unsafe { &*(data as *const SndCtlElemValue) };
+        let elem = elem_from_id(&val.id).ok_or(FsError::EntryNotFound)?;
+        let (mut l, mut r, mut mute_l, mut mute_r) = self.audio.gain();
+        match elem {
+            MixerElem::Volume => {
+                l = val.values[0].clamp(0, 100) as u8;
+                r = val.values[1].clamp(0, 100) as u8;
+            }
+            MixerElem::Switch => {
+                mute_l = val.values[0] == 0;
+                mute_r = val.values[1] == 0;
+            }
+        }
+        self.audio
+            .set_gain(l, r, mute_l, mute_r)
+            .map_err(|_| FsError::DeviceError)?;
+        Ok(0)
+    }
 }
 
 impl INode for CtlDev {
@@ -1105,21 +1313,24 @@ impl INode for CtlDev {
                 fill_cstr(&mut info.driver, "eclipse-hda");
                 fill_cstr(&mut info.name, self.audio.name());
                 fill_cstr(&mut info.longname, self.audio.name());
-                fill_cstr(&mut info.mixername, "Eclipse HDA (no mixer)");
+                fill_cstr(&mut info.mixername, "Eclipse Mixer");
                 fill_cstr(&mut info.components, "");
                 Ok(0)
             }
-            0x10 => {
-                // ELEM_LIST: no mixer controls yet.
-                // struct: u32 offset, space, used, count; ptr; reserved.
-                unsafe {
-                    *(data as *mut u32).add(2) = 0; // used
-                    *(data as *mut u32).add(3) = 0; // count
+            0x10 => self.elem_list(data),
+            0x11 => self.elem_info(data),
+            0x12 => self.elem_read(data),
+            0x13 => self.elem_write(data),
+            0x14 | 0x15 => Ok(0), // ELEM_LOCK / ELEM_UNLOCK
+            0x16 => {
+                // SUBSCRIBE_EVENTS: we don't queue notifications yet (poll
+                // never signals), but alsamixer aborts if this ioctl fails.
+                let v = unsafe { &mut *(data as *mut i32) };
+                if *v < 0 {
+                    *v = 0;
                 }
                 Ok(0)
             }
-            // ELEM_INFO / ELEM_READ / ELEM_WRITE: no elements exist.
-            0x11 | 0x12 | 0x13 => Err(FsError::EntryNotFound),
             0x30 => {
                 // PCM_NEXT_DEVICE: single PCM device (0).
                 let v = unsafe { &mut *(data as *mut i32) };

@@ -73,19 +73,26 @@ are not mmap-able; alsa-lib falls back to `SYNC_PTR` automatically).
 plugin to `hw:0,0`, so alsa-lib converts any format/rate/channel count in
 userspace and the kernel only ever sees S16LE stereo. dmix is not used (it
 needs SysV IPC shared memory), so playback is single-client. Card 0 is the
-onboard codec; the NVIDIA HDMI functions are the following cards:
+preferred playback device (HDMI/DP with a live display outranks analog jacks);
+the remaining controllers follow in PCI probe order:
 
 ```sh
 aplay -l                      # list cards
-aplay music.wav               # default = plughw:0
-aplay -D plughw:1 music.wav   # first NVIDIA HDMI codec
-speaker-test -D plughw:1 -c 2 -t sine
+aplay music.wav               # default = plughw:0 (usually HDMI)
+aplay -D plughw:1 music.wav   # next card (often the PCH analog codec)
+speaker-test -c 2 -t sine
+amixer set Master 50%
+amixer set Master mute
 ```
 
 `alsa-lib` and `alsa-utils` are baked into the rootfs package set
 (`xtask/src/linux/xorg.rs`); anything missing can be added at runtime with
-`apk add`. No mixer elements are exposed yet (`amixer` shows an empty card);
-HDMI has no analog volume anyway — control levels in the application.
+`apk add`. Each card exposes a simple **Master** mixer (`amixer set Master 50%`,
+`amixer set Master mute`): HDMI/DP has no analog volume, so the HDA driver
+scales S16LE in software. The lunarbar volume slider talks to that control.
+
+Card 0 is the preferred playback device — HDMI/DP with a live display outranks
+analog jacks — so `aplay` and `amixer` without `-c` hit the monitor speakers.
 
 ### hw_params negotiation (and how to test it without hardware)
 
@@ -132,9 +139,10 @@ EINVAL in userspace can still be traced to the constraint that caused it.
 
 ## Userspace API: `/dev/dsp` (OSS)
 
-One node per controller in probe order: `/dev/dsp` (usually the PCH),
-`/dev/dsp1`, `/dev/dsp2`, … (the GPU HDMI functions). `write(2)` carries
-interleaved S16LE PCM; supported ioctls: `SNDCTL_DSP_SPEED`, `SETFMT`
+One node per controller in the same order as `/dev/snd`: `/dev/dsp` is card 0
+(preferred HDMI/DP when a display is live), `/dev/dsp1`, `/dev/dsp2`, … for
+the rest. `write(2)` carries interleaved S16LE PCM; supported ioctls:
+`SNDCTL_DSP_SPEED`, `SETFMT`
 (S16LE only), `CHANNELS`/`STEREO` (stereo only), `GETBLKSIZE`,
 `SETFRAGMENT` (accepted, ignored), `GETFMTS`, `GETOSPACE`, `SYNC`, `POST`,
 `RESET`. Writes block (bounded spin-retry) when the ring is full; the
@@ -144,21 +152,28 @@ raw 48 kHz S16LE audio.
 ## Testing
 
 ```sh
-wavplay --tone                 # 440 Hz sine, 3 s, /dev/dsp
+wavplay --tone                 # 440 Hz sine, 3 s, /dev/dsp (card 0)
 wavplay --tone 880             # another frequency
-wavplay -d /dev/dsp1 --tone    # first NVIDIA HDMI codec
+wavplay -d /dev/dsp1 --tone    # next codec (often analog)
 wavplay file.wav               # 16-bit PCM WAV (mono is upmixed)
+amixer set Master 80%          # software gain on the default card
 ```
 
 `tools/wavplay` is a static musl binary installed into the rootfs by xtask.
 
-In QEMU add `-device intel-hda -device hda-output -audiodev pa,id=snd0
--device hda-output,audiodev=snd0` (or `-audiodev sdl/alsa`) to hear the
-guest.
+`make qemu` attaches Intel HD Audio automatically (`-device intel-hda` +
+`hda-output`). The host backend is picked from whatever QEMU supports —
+pipewire, then PulseAudio, then ALSA. The `/usr/local` QEMU build in PATH
+often has none of those; in that case the run uses `/usr/bin/qemu-system-x86_64`
+so you can hear the guest. Override with `AUDIODEV=wav` (PCM to
+`/tmp/eclipse-qemu.wav`) or `AUDIO=off` (codec present, host silent).
 
 ## Known limits
 
 - Playback only (no capture), stereo only, S16LE only.
+- Volume is software PCM scaling (no analog AMP programming); already-queued
+  ring contents are not retroactively gained — the new level applies to the
+  next `write`.
 - The DP audio path uses the same ELD/enable controls but has not been
   exercised; DP-MST audio (device entries > 0) is not implemented.
 - The HDMI un-mute GCP is sent once at enable time; a monitor that is

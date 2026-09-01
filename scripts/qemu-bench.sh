@@ -111,6 +111,8 @@ if [ -n "$EXTRA_CMDLINE" ]; then
 fi
 
 # Match zCore/Makefile's qemu_opts for x86_64, minus the graphics and minus KVM.
+# Intel HD Audio is attached with the `none` backend: the guest driver needs a
+# codec to probe, but benches are headless and must not depend on Pulse/PipeWire.
 # `-serial mon:stdio` is the console we drive; the net device is kept because
 # the kernel brings it up during boot either way and removing it would change
 # what we are measuring.
@@ -144,6 +146,7 @@ qemu-system-x86_64 \
     -drive format=raw,if=pflash,readonly=on,file="$OVMF" \
     -drive format=raw,file="$ESP_IMG" \
     -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 \
+    -audiodev none,id=snd0 -device intel-hda,id=snd -device hda-output,audiodev=snd0 \
     $DISK_ARGS \
     -nic none \
     -display none \

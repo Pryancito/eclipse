@@ -1766,10 +1766,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # takes S16LE stereo at the HDA rate set; plug converts everything else\n\
               # in userspace. No dmix (needs SysV IPC): one playback client at a time.\n\
               #\n\
-              # Card order follows PCI probe order: card 0 is usually the onboard\n\
-              # (PCH) codec, the NVIDIA HDMI audio functions come after it. To make\n\
-              # HDMI the default, change both \"card 0\" occurrences below (check\n\
-              # cards with `aplay -l`), or play directly: `aplay -D plughw:1 x.wav`.\n\
+              # Card 0 is the kernel's preferred playback device (HDMI/DP with a\n\
+              # live display outranks analog). `aplay -l` lists the rest; play a\n\
+              # specific card with `aplay -D plughw:N x.wav`.\n\
               pcm.!default {\n\
               \x20   type plug\n\
               \x20   slave.pcm {\n\

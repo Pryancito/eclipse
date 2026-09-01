@@ -4,9 +4,9 @@
 //! can drive: `write(2)` carries interleaved S16LE PCM, a handful of ioctls
 //! negotiate rate/format/channels (`mpg123 -o oss`, `sox -t oss`, ffmpeg's
 //! `-f oss` all speak it, and a plain `cat music.raw > /dev/dsp` works for
-//! 48 kHz stereo, the default). One node is created per HDA device found:
-//! `dsp` (first controller, usually the PCH's analog codec), `dsp1`, `dsp2`…
-//! (the NVIDIA HDMI audio functions on this machine's RTX cards).
+//! 48 kHz stereo, the default). One node is created per HDA device found,
+//! in the same order as `/dev/snd`: `dsp` is ALSA card 0 (HDMI/DP with a
+//! live display outranks analog), `dsp1`, `dsp2`, … for the rest.
 //!
 //! Writes block by spin-retrying against the device ring, the same pattern
 //! the TCP send path uses for a full TX buffer (`FileLike::write` is a
