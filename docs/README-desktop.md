@@ -34,6 +34,7 @@ alguno:
 
 ```sh
 apk add labwc seatd foot wayland-protocols font-dejavu adwaita-icon-theme
+apk add sdl2 sdl3 sdl12-compat sdl2_image sdl2_ttf sdl2_mixer libdecor   # runtime SDL (ver "SDL")
 ```
 
 Desde `cargo xtask image` estos paquetes ya se instalan solos (ver
@@ -95,6 +96,60 @@ Si una app X11 falla con «can't open display» aun con `DISPLAY=:0`, revisa en
 la salida del build la línea `Xorg stack: Xwayland present …`: si dice que
 falta, `apk` no resolvió el paquete `xwayland` (lo más común, sin red al
 construir la imagen) y hay que reconstruir con red o `apk add xwayland` una vez.
+
+## SDL (SDL 1.2 / SDL2 / SDL3)
+
+La sesión trae el runtime de **SDL** (`sdl2`, `sdl3`, `sdl12-compat`,
+`sdl2_image`, `sdl2_ttf`, `sdl2_mixer`, `libdecor`; ver `DEFAULT_PACKAGES` en
+`xtask/src/linux/xorg.rs`) y una **política de entorno** que elige el backend
+de vídeo y el *render driver* de SDL a juego con el renderer del compositor.
+Sin ella, SDL2 tomaba X11 siempre (elige X11 en cuanto `DISPLAY` está fijado, y
+aquí lo está: `:0`), es decir, todo pasaba por Xwayland, y el renderer lo
+decidía Mesa a ciegas.
+
+La política se asierta en los mismos cuatro sitios que la del renderer de
+wlroots, para que una app SDL lanzada desde una shell y otra lanzada por init
+rendericen por la misma pila: el wrapper `/usr/local/bin/labwc`,
+`/etc/profile`, `~/.config/labwc/environment` (solo la mitad estática) y
+`eclipse-init` (`push_sdl_render_env`). Un test de `xtask`
+(`sdl_policy_is_consistent_across_wrapper_profile_and_environment`) comprueba
+que las copias generadas no se desalinean.
+
+| Sesión | `WLR_RENDERER` | `SDL_RENDER_DRIVER` | `SDL_FRAMEBUFFER_ACCELERATION` | Qué hace SDL |
+|---|---|---|---|---|
+| pixman (por defecto) | `pixman` | `software` | `0` | Rasteriza en CPU. **SDL3** presenta por `wl_shm`, sin tocar GL (la misma ruta que foot/lunarbg). **SDL2** no tiene framebuffer shm en Wayland y presenta por EGL, que `LIBGL_ALWAYS_SOFTWARE=1` deja en llvmpipe. |
+| gles2 (`nvidia.wlr_gles2`, o `renderer=gl-sw`/`GL=1` en QEMU) | `gles2` | `opengles2` | `opengles2` | Renderer GLES2 sobre la misma pila GL que el compositor: zink+NVK en hardware, llvmpipe en software. |
+| vulkan (`nvidia.wlr_vulkan`) | `vulkan` | `opengles2` | `opengles2` | Igual que gles2: SDL2 no tiene renderer Vulkan, y GLES2 acaba en zink+NVK. |
+
+Independientes del renderer, en todas las sesiones:
+
+- `SDL_VIDEODRIVER=wayland,x11` (SDL2) y `SDL_VIDEO_DRIVER=wayland,x11`
+  (SDL3): Wayland nativo primero, X11 como respaldo. La lista sirve también a
+  la sesión `desktop=xorg` (sin `WAYLAND_DISPLAY`, SDL cae a X11 solo). La
+  sintaxis con comas exige SDL >= 2.24 (Alpine trae 2.30+).
+- `SDL_AUDIODRIVER=alsa` / `SDL_AUDIO_DRIVER=alsa`: ALSA es la única API de
+  audio de usuario que expone este kernel ([README-audio.md](README-audio.md));
+  el pin evita que SDL sondee antes los sockets de pipewire/pulse.
+- Decoraciones: labwc ofrece decoración de servidor por `xdg-decoration`, que
+  SDL prefiere; `libdecor` queda como respaldo del lado cliente.
+
+Todas las variables se fijan con `:=` en el wrapper, así que un override del
+que lanza gana (p. ej. `SDL_RENDER_DRIVER=opengles2 mi-juego` para forzar la
+ruta GL de un cliente concreto en la sesión pixman).
+
+**Comprobar que funciona** desde un terminal de la sesión (o desde el menú de
+escritorio, entradas «Prueba SDL2 (renderer)» y «Prueba SDL3 (wl_shm)»):
+
+```sh
+eclipse-sdl-probe                    # SDL2 + SDL_Renderer: espera 'video driver in use: wayland'
+eclipse-sdl-probe --sdl3 --surface   #   y "renderer 'software'" en pixman / 'opengles2' en gles2
+```
+
+`eclipse-sdl-probe` (`tools/eclipse-sdl-probe`) abre la libSDL instalada con
+`dlopen`, imprime versión, backends compilados, backend y renderer en uso, y
+mide los fps de una animación sencilla; sale con `SDLPROBE: FAIL ...` y código
+1 si algo falla. Un `video driver in use: x11` con `WAYLAND_DISPLAY` presente
+significa que algo pisó `SDL_VIDEODRIVER`.
 
 ## Atajos de teclado
 

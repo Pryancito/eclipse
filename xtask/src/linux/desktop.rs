@@ -998,6 +998,9 @@ fn write_labwc_menu(rootfs: &Path) {
     <item label="Editor (nano)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal nano</command></action></item>
     <item label="Monitor (top)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal top</command></action></item>
     <separator/>
+    <item label="Prueba SDL2 (renderer)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-sdl-probe --hold</command></action></item>
+    <item label="Prueba SDL3 (wl_shm)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-sdl-probe --sdl3 --surface --hold</command></action></item>
+    <separator/>
     <item label="Recargar labwc"><action name="Reconfigure"/></item>
     <item label="Salir de la sesion"><action name="Exit"/></item>
   </menu>
@@ -1057,7 +1060,18 @@ fn write_labwc_environment(rootfs: &Path) {
           GDK_PIXBUF_MODULE_FILE=/root/.cache/pixbuf-loaders.cache\n\
           # No D-Bus session bus on Eclipse OS: keep GTK's settings out of\n\
           # dconf so apps never try to autolaunch one.\n\
-          GSETTINGS_BACKEND=memory\n",
+          GSETTINGS_BACKEND=memory\n\
+          # SDL (1.2 via sdl12-compat, SDL2, SDL3): native Wayland first, X11\n\
+          # (Xwayland) as fallback, and ALSA audio -- the renderer-independent\n\
+          # half of the SDL policy. The renderer half (SDL_RENDER_DRIVER /\n\
+          # SDL_FRAMEBUFFER_ACCELERATION: software on pixman, opengles2 on the\n\
+          # GL sessions) depends on the boot cmdline, so it is exported by the\n\
+          # labwc wrapper, /etc/profile and eclipse-init instead of this static\n\
+          # file. See docs/README-desktop.md, \"SDL\".\n\
+          SDL_VIDEODRIVER=wayland,x11\n\
+          SDL_VIDEO_DRIVER=wayland,x11\n\
+          SDL_AUDIODRIVER=alsa\n\
+          SDL_AUDIO_DRIVER=alsa\n",
     )
     .unwrap();
 }
@@ -1208,19 +1222,47 @@ fn write_labwc_wrapper(rootfs: &Path) {
           \x20\x20 : \"${WLR_DRM_NO_MODIFIERS:=1}\"; export WLR_DRM_NO_MODIFIERS\n\
           \x20\x20 : \"${GALLIUM_DRIVER:=zink}\"; export GALLIUM_DRIVER\n\
           \x20\x20 : \"${MESA_LOADER_DRIVER_OVERRIDE:=zink}\"; export MESA_LOADER_DRIVER_OVERRIDE\n\
+          \x20\x20 # SDL on the GPU sessions: GLES2 renderer (SDL2 has no Vulkan\n\
+          \x20\x20 # renderer; GLES2 lands on zink+NVK, the same stack as labwc).\n\
+          \x20\x20 : \"${SDL_RENDER_DRIVER:=opengles2}\"; export SDL_RENDER_DRIVER\n\
+          \x20\x20 : \"${SDL_FRAMEBUFFER_ACCELERATION:=opengles2}\"; export SDL_FRAMEBUFFER_ACCELERATION\n\
           \x20 elif grep -q 'nvidia\\.wlr_gles2' /proc/cmdline 2>/dev/null; then\n\
           \x20\x20 : \"${WLR_RENDERER:=gles2}\"; export WLR_RENDERER\n\
           \x20\x20 : \"${WLR_DRM_NO_MODIFIERS:=1}\"; export WLR_DRM_NO_MODIFIERS\n\
           \x20\x20 : \"${GALLIUM_DRIVER:=zink}\"; export GALLIUM_DRIVER\n\
           \x20\x20 : \"${MESA_LOADER_DRIVER_OVERRIDE:=zink}\"; export MESA_LOADER_DRIVER_OVERRIDE\n\
+          \x20\x20 : \"${SDL_RENDER_DRIVER:=opengles2}\"; export SDL_RENDER_DRIVER\n\
+          \x20\x20 : \"${SDL_FRAMEBUFFER_ACCELERATION:=opengles2}\"; export SDL_FRAMEBUFFER_ACCELERATION\n\
           \x20 else\n\
           \x20\x20 : \"${WLR_RENDERER:=pixman}\"; export WLR_RENDERER\n\
           \x20\x20 : \"${WLR_RENDERER_ALLOW_SOFTWARE:=1}\"; export WLR_RENDERER_ALLOW_SOFTWARE\n\
           \x20\x20 : \"${LIBGL_ALWAYS_SOFTWARE:=1}\"; export LIBGL_ALWAYS_SOFTWARE\n\
+          \x20\x20 # SDL on the pixman session: software renderer, and no GL\n\
+          \x20\x20 # behind SDL_GetWindowSurface (SDL3 then blits over wl_shm like\n\
+          \x20\x20 # foot; SDL2 still presents through EGL, which is llvmpipe here).\n\
+          \x20\x20 : \"${SDL_RENDER_DRIVER:=software}\"; export SDL_RENDER_DRIVER\n\
+          \x20\x20 : \"${SDL_FRAMEBUFFER_ACCELERATION:=0}\"; export SDL_FRAMEBUFFER_ACCELERATION\n\
           \x20 fi\n\
           else\n\
           \x20 : \"${WLR_RENDERER:=pixman}\"; export WLR_RENDERER\n\
+          \x20 # `:=` again: an init-launched session already carries the GL=1\n\
+          \x20 # (renderer=gl-sw) pins from build_child_env, and those win here.\n\
+          \x20 : \"${SDL_RENDER_DRIVER:=software}\"; export SDL_RENDER_DRIVER\n\
+          \x20 : \"${SDL_FRAMEBUFFER_ACCELERATION:=0}\"; export SDL_FRAMEBUFFER_ACCELERATION\n\
           fi\n\
+          # SDL video/audio backends, every session (renderer-independent).\n\
+          # Video: prefer the native Wayland backend, fall back to X11 (Xwayland\n\
+          # inside this session, Xorg in desktop=xorg). SDL2 defaults to X11\n\
+          # whenever DISPLAY is set -- which it always is here (DISPLAY=:0 pin)\n\
+          # -- so without this every SDL2 app took the Xwayland detour. The\n\
+          # comma list needs SDL >= 2.24 (Alpine ships 2.30+). SDL3 reads the\n\
+          # underscored names. Audio: ALSA is the only userspace audio API this\n\
+          # kernel exposes (README-audio.md); pinning it skips the pipewire/\n\
+          # pulse socket probes SDL would otherwise try first.\n\
+          : \"${SDL_VIDEODRIVER:=wayland,x11}\"; export SDL_VIDEODRIVER\n\
+          : \"${SDL_VIDEO_DRIVER:=wayland,x11}\"; export SDL_VIDEO_DRIVER\n\
+          : \"${SDL_AUDIODRIVER:=alsa}\"; export SDL_AUDIODRIVER\n\
+          : \"${SDL_AUDIO_DRIVER:=alsa}\"; export SDL_AUDIO_DRIVER\n\
           # Backends: DRM for output + libinput for evdev. Naming them keeps\n\
           # wlroots off the headless/X11 autodetect fallbacks when no parent\n\
           # display exists.\n\
@@ -1327,6 +1369,140 @@ mod tests {
             dir.join("root/.config/labwc/autostart.README").is_file(),
             "breadcrumb README should explain the move to init services"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The SDL policy is asserted in THREE generated files -- the labwc
+    /// wrapper, `/etc/profile` and labwc's `environment` -- plus a fourth copy
+    /// compiled into eclipse-init (`tools/eclipse-init`, `push_sdl_render_env`).
+    /// They must agree, or a shell-launched SDL app and an init-launched one
+    /// would render through different stacks. This pins the two halves:
+    /// renderer-independent backends everywhere, and the render driver per
+    /// compositor renderer in every branch of the two shell copies.
+    #[test]
+    fn sdl_policy_is_consistent_across_wrapper_profile_and_environment() {
+        let dir =
+            std::env::temp_dir().join(format!("eclipse-sdl-policy-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_labwc_wrapper(&dir);
+        write_labwc_environment(&dir);
+        let etc = dir.join("etc");
+        let _ = fs::create_dir_all(&etc);
+        super::super::LinuxRootfs::write_profile(&etc);
+
+        let wrapper = fs::read_to_string(dir.join("usr/local/bin/labwc")).unwrap();
+        let profile = fs::read_to_string(etc.join("profile")).unwrap();
+        let environment = fs::read_to_string(dir.join("root/.config/labwc/environment")).unwrap();
+
+        // Both shell files must at least PARSE: a syntax slip in the wrapper is
+        // "no desktop at boot" with nothing in the log. Skipped where the host
+        // has no `sh` (a non-unix build box).
+        for (rel, what) in [
+            ("usr/local/bin/labwc", "wrapper"),
+            ("etc/profile", "/etc/profile"),
+        ] {
+            if let Ok(status) = std::process::Command::new("sh")
+                .arg("-n")
+                .arg(dir.join(rel))
+                .status()
+            {
+                assert!(status.success(), "{what} does not parse as sh");
+            }
+        }
+
+        // Backend half: SDL2 + SDL3 spellings, Wayland-first with X11 fallback,
+        // ALSA audio. Static, so it must appear in all three files.
+        for (key, val) in [
+            ("SDL_VIDEODRIVER", "wayland,x11"),
+            ("SDL_VIDEO_DRIVER", "wayland,x11"),
+            ("SDL_AUDIODRIVER", "alsa"),
+            ("SDL_AUDIO_DRIVER", "alsa"),
+        ] {
+            assert!(
+                wrapper.contains(&format!(": \"${{{key}:={val}}}\"; export {key}")),
+                "wrapper must default {key}={val}"
+            );
+            assert!(
+                profile.contains(&format!("export {key}={val}")),
+                "/etc/profile must export {key}={val}"
+            );
+            assert!(
+                environment.lines().any(|l| l == format!("{key}={val}")),
+                "labwc environment must set {key}={val}"
+            );
+        }
+
+        // Renderer half: every WLR_RENDERER branch pins a matching SDL render
+        // driver. pixman -> software (+ no GL behind window surfaces); gles2
+        // and vulkan -> opengles2 (SDL2 has no Vulkan renderer).
+        fn branch_pins(
+            text: &str,
+            wlr_line: &str,
+            expect_driver: &str,
+            expect_fb: &str,
+            what: &str,
+        ) {
+            let mut found = 0;
+            for (i, line) in text.lines().enumerate() {
+                if !line.contains(wlr_line) {
+                    continue;
+                }
+                found += 1;
+                // The SDL pins follow within the same branch: before the next
+                // `fi`/`else`/`elif` line.
+                let branch: Vec<&str> = text
+                    .lines()
+                    .skip(i + 1)
+                    .take_while(|l| {
+                        let t = l.trim_start();
+                        !(t.starts_with("fi") || t.starts_with("else") || t.starts_with("elif"))
+                    })
+                    .collect();
+                let joined = branch.join("\n");
+                assert!(
+                    joined.contains(&format!("SDL_RENDER_DRIVER:={expect_driver}"))
+                        || joined.contains(&format!("SDL_RENDER_DRIVER={expect_driver}")),
+                    "{what}: branch `{wlr_line}` must pin SDL_RENDER_DRIVER={expect_driver}:\n{joined}"
+                );
+                assert!(
+                    joined.contains(&format!("SDL_FRAMEBUFFER_ACCELERATION:={expect_fb}"))
+                        || joined.contains(&format!("SDL_FRAMEBUFFER_ACCELERATION={expect_fb}")),
+                    "{what}: branch `{wlr_line}` must pin SDL_FRAMEBUFFER_ACCELERATION={expect_fb}:\n{joined}"
+                );
+            }
+            assert!(found > 0, "{what}: no branch sets `{wlr_line}`");
+        }
+        // The wrapper defaults with `${VAR:=value}`, /etc/profile assigns
+        // with `export VAR=value`; match each file in its own spelling.
+        for (text, what, pixman, gles2, vulkan) in [
+            (
+                &wrapper,
+                "wrapper",
+                "WLR_RENDERER:=pixman",
+                "WLR_RENDERER:=gles2",
+                "WLR_RENDERER:=vulkan",
+            ),
+            (
+                &profile,
+                "/etc/profile",
+                "export WLR_RENDERER=pixman",
+                "export WLR_RENDERER=gles2",
+                "export WLR_RENDERER=vulkan",
+            ),
+        ] {
+            branch_pins(text, pixman, "software", "0", what);
+            branch_pins(text, gles2, "opengles2", "opengles2", what);
+            branch_pins(text, vulkan, "opengles2", "opengles2", what);
+            // Both files have exactly two pixman branches (NVIDIA without a
+            // wlr opt-in flag, and everything else); make sure both were seen.
+            assert_eq!(text.matches(pixman).count(), 2, "{what}: pixman branches");
+        }
+
+        // The menu offers the probe on both draw paths.
+        write_labwc_menu(&dir);
+        let menu = fs::read_to_string(dir.join("root/.config/labwc/menu.xml")).unwrap();
+        assert!(menu.contains("/bin/eclipse-sdl-probe --hold"));
+        assert!(menu.contains("/bin/eclipse-sdl-probe --sdl3 --surface --hold"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

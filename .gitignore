@@ -21,3 +21,4 @@ local-mirror/
 # Benchmark e1000e: entradas generadas/descargadas y artefactos
 prebuilt/
 tools/install-eclipse/install-eclipse
+tools/eclipse-sdl-probe/eclipse-sdl-probe
