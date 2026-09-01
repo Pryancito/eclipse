@@ -216,8 +216,7 @@ pub(crate) fn fb_mapping_diag() -> alloc::string::String {
         let pte = core::ptr::read_volatile((phys_to_virt(table_pa) as *const u64).add(idx(0)));
         (pte, Msr::new(IA32_PAT).read())
     };
-    let patidx =
-        (((pte >> 7) & 1) * 4 + ((pte >> 4) & 1) * 2 + ((pte >> 3) & 1)) as usize;
+    let patidx = (((pte >> 7) & 1) * 4 + ((pte >> 4) & 1) * 2 + ((pte >> 3) & 1)) as usize;
     let mtype = (pat_msr >> (patidx * 8)) & 0xff;
     let name = match mtype {
         0 => "UC",

@@ -23,7 +23,7 @@ use core::time::Duration;
 use kernel_hal::timer::timer_now;
 use lock::Mutex;
 use zircon_object::task::{Process, Task, ROOT_JOB};
-use zircon_object::vm::{VmObject, MMUFlags, PAGE_SIZE};
+use zircon_object::vm::{MMUFlags, VmObject, PAGE_SIZE};
 
 /// Hammer diagnostics go to dmesg *and* serial so QEMU/hardware captures can
 /// see progress without reading `/proc/kmsg` (klog_info alone is ring-buffer only).
@@ -41,10 +41,7 @@ static HOLD: Mutex<()> = Mutex::new(());
 /// Parse `eclipse.tlbhammer=N` from the cmdline. `None` = disabled.
 pub fn parse_tlbhammer(cmdline: &str) -> Option<usize> {
     let rest = cmdline.split("eclipse.tlbhammer=").nth(1)?;
-    let digits: alloc::string::String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
+    let digits: alloc::string::String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     let n: usize = digits.parse().ok()?;
     if n >= 3 {
         Some(n)

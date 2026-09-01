@@ -112,7 +112,9 @@ fn parse_srcs_mk(nvidia_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         // include search path is identical, so they compile unchanged apart
         // from the marked ECLIPSE edits.
         if rel.ends_with("src/kernel/gpu/gr/kernel_graphics.c") {
-            files.push(std::path::PathBuf::from("vendor/eclipse_overrides/kernel_graphics.c"));
+            files.push(std::path::PathBuf::from(
+                "vendor/eclipse_overrides/kernel_graphics.c",
+            ));
             continue;
         }
         if rel.ends_with("src/kernel/gpu/gr/kernel_graphics_context.c") {
