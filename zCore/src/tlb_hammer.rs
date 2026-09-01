@@ -118,9 +118,9 @@ async fn mapper_loop(id: usize) {
                 kernel_hal::remote_flush_tlb(Some(PAGE_SIZE * (2 + id)));
             }
         }
-        // Teardown → VmAddressRegion::clear → per-range shootdowns.
-        proc.exit(0);
-        // Process with no threads terminates immediately on exit.
+        // Teardown → Job::kill → VmAddressRegion::clear → per-range shootdowns
+        // (same path as glxgears ^C / window close).
+        proc.kill();
         rounds = rounds.wrapping_add(1);
         if rounds & 15 == 0 {
             kernel_hal::thread::yield_now().await;

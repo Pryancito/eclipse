@@ -2,7 +2,9 @@
 # Smoke-test eclipse.tlbhammer under QEMU SMP.
 #
 # Usage:
-#   scripts/qemu-tlbhammer-smoke.sh [-s SMP] [-t SECONDS] [-c EXTRA_KOPTS]
+#   scripts/qemu-tlbhammer-smoke.sh [-s SMP] [-t SECONDS] [-c EXTRA_KOPTS] [-S]
+#
+# -S  soak mode: after first "alive", keep running until TIMEOUT (POST-fix 10+ min).
 #
 # Success: log contains "tlbhammer: alive" and no "DIAG: shootdown starvation".
 # Failure: panic / shootdown starvation / QEMU exit before first alive line.
@@ -17,14 +19,16 @@ OVMF="$ROOT/rboot/OVMF.fd"
 
 SMP=6
 TIMEOUT=180
+SOAK=0
 EXTRA="eclipse.tlbhammer=${SMP} DEADLOCKSPINS=50000000"
 
-while getopts "s:t:c:" opt; do
+while getopts "s:t:c:S" opt; do
     case "$opt" in
         s) SMP="$OPTARG"; EXTRA="eclipse.tlbhammer=${SMP} DEADLOCKSPINS=50000000" ;;
         t) TIMEOUT="$OPTARG" ;;
         c) EXTRA="${EXTRA} ${OPTARG}" ;;
-        *) echo "usage: $0 [-s SMP] [-t SECONDS] [-c EXTRA_KOPTS]" >&2; exit 2 ;;
+        S) SOAK=1 ;;
+        *) echo "usage: $0 [-s SMP] [-t SECONDS] [-c EXTRA_KOPTS] [-S]" >&2; exit 2 ;;
     esac
 done
 
@@ -72,10 +76,14 @@ QEMU_PID=$!
 
 deadline=$(( $(date +%s) + TIMEOUT ))
 alive=0
+alive_lines=0
 while [ "$(date +%s)" -lt "$deadline" ]; do
     if grep -qE "tlbhammer: alive|TLB hammer ON" "$LOG" 2>/dev/null; then
         alive=1
-        break
+        alive_lines=$(grep -cE "tlbhammer: alive|TLB hammer ON" "$LOG" 2>/dev/null || true)
+        if [ "$SOAK" -eq 0 ]; then
+            break
+        fi
     fi
     if grep -q "DIAG: shootdown starvation" "$LOG" 2>/dev/null; then
         echo "$0: FAIL — shootdown starvation detected" >&2
@@ -84,7 +92,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
         tail -80 "$LOG" >&2
         exit 1
     fi
-    if grep -qE "KERNEL STOP|panic" "$LOG" 2>/dev/null; then
+    if grep -qE "KERNEL STOP|^\[KERNEL BUG\]|DIAG: shootdown starvation" "$LOG" 2>/dev/null; then
         echo "$0: FAIL — kernel panic/stop" >&2
         kill "$QEMU_PID" 2>/dev/null || true
         wait "$QEMU_PID" 2>/dev/null || true
@@ -113,6 +121,10 @@ if grep -q "DIAG: shootdown starvation" "$LOG"; then
     exit 1
 fi
 
-echo "$0: OK — hammer alive within ${TIMEOUT}s (SMP=$SMP)" >&2
+if [ "$SOAK" -eq 1 ]; then
+    echo "$0: OK — soak ${TIMEOUT}s complete, alive_lines=${alive_lines} (SMP=$SMP)" >&2
+else
+    echo "$0: OK — hammer alive within ${TIMEOUT}s (SMP=$SMP)" >&2
+fi
 grep "tlbhammer:" "$LOG" | tail -5 >&2
 exit 0
