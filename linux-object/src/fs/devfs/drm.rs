@@ -60,6 +60,8 @@ static CE_STAGING_ALLOC_FAILED_LOGGED: core::sync::atomic::AtomicBool =
 static CE_STAGING: Mutex<Option<(usize, u64, usize, Arc<VmObject>)>> = Mutex::new(None);
 /// Full-frame presents completed, for the rate-limited phase-timing klog.
 static PRESENT_FRAME_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// CE staging repacks completed, for the rate-limited repack-timing klog.
+static CE_REPACK_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Master switch for the per-frame GPU copy-engine present (`ce_present`).
 /// Enabled automatically when a compute GPU finishes boot bring-up (dual RTX:
@@ -704,11 +706,13 @@ const BLIT_CHUNK_ROWS: u32 = 128;
 /// snoops the cache, so the CE reads coherent data with no explicit flush.
 fn ce_repack_to_staging(
     pixels: &[u32],
+    src_pa: u64,
     src_stride: usize,
     dst_pitch: usize,
     w: u32,
     h: u32,
 ) -> Option<(u64, u64)> {
+    let t0 = kernel_hal::timer::timer_now();
     let row_bytes = (w as usize).checked_mul(4)?;
     if row_bytes > dst_pitch {
         return None;
@@ -758,6 +762,47 @@ fn ce_repack_to_staging(
                 row_bytes,
             );
         }
+    }
+    // The repack is suspected to be the remaining present cost: the GEM
+    // source's CPU address comes from the RM's AT_CPU resolution (see
+    // nouveau_uapi's NouveauGemObject::phys_addr, "BAR1-relative"), so these
+    // reads may be uncached PCIe reads at ~90 MB/s. Log the measured repack
+    // time on the usual cadence, plus a one-shot timed re-read of the first
+    // 256 KiB of the source: ~25us means cached RAM (repack is NOT the
+    // bottleneck), milliseconds mean uncached BAR reads (the CE must learn
+    // to read the source directly; no CPU path can be fast).
+    let n = CE_REPACK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 2 || n % 64 == 0 {
+        let repack_us = kernel_hal::timer::timer_now()
+            .saturating_sub(t0)
+            .as_micros();
+        let mut probe_us = 0u128;
+        if n == 1 && pixels.len() >= (256 << 10) / 4 {
+            let p0 = kernel_hal::timer::timer_now();
+            let mut sink = 0u64;
+            for px in pixels.iter().take((256 << 10) / 4).step_by(16) {
+                sink = sink.wrapping_add(*px as u64);
+            }
+            probe_us = kernel_hal::timer::timer_now()
+                .saturating_sub(p0)
+                .as_micros();
+            // Keep the probe's reads observable.
+            core::sync::atomic::compiler_fence(Ordering::SeqCst);
+            let _ = sink;
+        }
+        kernel_hal::klog_info!(
+            "[drm] CE repack #{}: {}us src_pa={:#x} ({} rows x {}B){}",
+            n,
+            repack_us,
+            src_pa,
+            h,
+            row_bytes,
+            if n == 1 {
+                alloc::format!(" src read probe 256KiB(step16)={}us", probe_us)
+            } else {
+                alloc::string::String::new()
+            }
+        );
     }
     Some((pa, need as u64))
 }
@@ -926,7 +971,7 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
         let (ce_src_pa, ce_size) = if fb.pitch == info.pitch {
             (fb.phys_addr, (info.pitch as u64) * (blit_h as u64))
         } else {
-            ce_repack_to_staging(pixels, src_stride, info.pitch as usize, blit_w, blit_h)
+            ce_repack_to_staging(pixels, fb.phys_addr, src_stride, info.pitch as usize, blit_w, blit_h)
                 .unwrap_or((0, 0))
         };
         if ce_src_pa != 0 && ce_size != 0 {
