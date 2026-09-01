@@ -9,7 +9,7 @@ cfg_if::cfg_if! {
     if #[cfg(all(target_os = "none", feature = "ticket"))] {
         extern crate alloc;
         mod interrupt;
-        pub use interrupt::{current_cpu_id, lock_depth};
+        pub use interrupt::{current_cpu_id, current_cpu_id_via_apic, lock_depth};
         #[cfg(any(
             target_arch = "x86",
             target_arch = "x86_64",
@@ -32,7 +32,7 @@ cfg_if::cfg_if! {
     } else if #[cfg(target_os = "none")] {
         extern crate alloc;
         mod interrupt;
-        pub use interrupt::{current_cpu_id, lock_depth};
+        pub use interrupt::{current_cpu_id, current_cpu_id_via_apic, lock_depth};
         #[cfg(any(
             target_arch = "x86",
             target_arch = "x86_64",
@@ -89,6 +89,12 @@ cfg_if::cfg_if! {
         /// `cargo test -p linux-object`, which links zcore-drivers) run on one
         /// thread of a hosted OS; per-CPU diagnostics all collapse to slot 0.
         pub fn current_cpu_id() -> u8 {
+            0
+        }
+
+        /// Hosted twin of the APIC-only id resolver (identical on a single
+        /// hosted thread).
+        pub fn current_cpu_id_via_apic() -> u8 {
             0
         }
     }

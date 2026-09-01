@@ -1350,16 +1350,22 @@ impl NvidiaGpu {
                     };
                     let vend = unsafe { PCI_ACCESS.read16(ops, loc, 0x00) };
                     if vend == 0xFFFF {
+                        // Config-space miss still touched 0xcf8/0xcfc under
+                        // PIO_LOCK (IRQ-off). Pump so a shootdown peer is not
+                        // starved across a full bus×dev×func walk.
+                        lock::pump();
                         continue;
                     }
                     let hdr = unsafe { PCI_ACCESS.read8(ops, loc, 0x0E) };
                     if hdr & 0x7F != 0x01 {
+                        lock::pump();
                         continue;
                     }
                     let sec = unsafe { PCI_ACCESS.read8(ops, loc, 0x19) };
                     if sec == self.pci_bus {
                         return Some((bus, dev, func));
                     }
+                    lock::pump();
                 }
             }
         }
@@ -1472,15 +1478,18 @@ impl NvidiaGpu {
                         };
                         let vend = unsafe { PCI_ACCESS.read16(ops, loc, 0x00) };
                         if vend == 0xFFFF {
+                            lock::pump();
                             continue;
                         }
                         let hdr = unsafe { PCI_ACCESS.read8(ops, loc, 0x0E) };
                         if hdr & 0x7F != 0x01 {
+                            lock::pump();
                             continue; // not a PCI-PCI bridge
                         }
                         let sec = unsafe { PCI_ACCESS.read8(ops, loc, 0x19) };
                         let sub = unsafe { PCI_ACCESS.read8(ops, loc, 0x1A) };
                         if !(sec <= self.pci_bus && self.pci_bus <= sub) {
+                            lock::pump();
                             continue;
                         }
                         let bctl = unsafe { PCI_ACCESS.read16(ops, loc, 0x3E) };

@@ -58,6 +58,11 @@ impl FatDisk {
                     block.read_block(block_id, &mut temp).map_err(|_| ())?;
                     buf[done..done + take].copy_from_slice(&temp[block_off..block_off + take]);
                     done += take;
+                    // This I/O runs under `FatMountFs::inner`'s IRQ-off spinlock
+                    // (fatfs DirIter/read). Pump our TLB-shootdown queue between
+                    // blocks so a peer's shootdown cannot starve for the whole
+                    // directory walk — the real-hardware panic signature.
+                    lock::pump();
                 }
                 Ok(done)
             }
@@ -89,6 +94,7 @@ impl FatDisk {
                     temp[block_off..block_off + take].copy_from_slice(&buf[done..done + take]);
                     block.write_block(block_id, &temp).map_err(|_| ())?;
                     done += take;
+                    lock::pump();
                 }
                 Ok(done)
             }

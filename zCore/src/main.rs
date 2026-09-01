@@ -23,6 +23,8 @@ mod fs;
 mod handler;
 mod invariants;
 mod platform;
+#[cfg(all(feature = "linux", not(feature = "libos")))]
+mod tlb_hammer;
 mod utils;
 
 cfg_if! {
@@ -35,6 +37,9 @@ cfg_if! {
 }
 
 static STARTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(all(feature = "linux", not(feature = "libos")))]
+static TLBHAMMER_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 #[cfg(all(not(any(feature = "libos")), feature = "mock-disk"))]
 static MOCK_CORE: AtomicBool = AtomicBool::new(false);
@@ -222,6 +227,12 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             klog_info!("Eclipse: single-core boot forced (smp=off)");
         } else {
             klog_info!("Eclipse: SMP multi-core bring-up enabled (pass `smp=off` to disable)");
+        }
+        // Deterministic TLB-shootdown starvation hammer (see tlb_hammer.rs).
+        #[cfg(all(feature = "linux", not(feature = "libos")))]
+        if let Some(n) = tlb_hammer::parse_tlbhammer(&options.cmdline) {
+            // Stash N in a static; spawn after primary_init / executor is live.
+            TLBHAMMER_N.store(n as u64, Ordering::Relaxed);
         }
     }
     // Deadlock self-report: any CPU spinning >~8s on a kernel spinlock paints
@@ -555,6 +566,13 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             kernel_hal::console::early_progress_bar(100);
             if options.cmdline.contains("nvidia.hwcursor") {
                 schedule_deferred_hwcursor_bringup();
+            }
+            #[cfg(all(feature = "linux", not(feature = "libos")))]
+            {
+                let n = TLBHAMMER_N.load(Ordering::Relaxed);
+                if n > 0 {
+                    tlb_hammer::start(n as usize);
+                }
             }
             utils::wait_for_exit(lifetime_proc)
         } else if #[cfg(feature = "zircon")] {

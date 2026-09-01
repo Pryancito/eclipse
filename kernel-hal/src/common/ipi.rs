@@ -262,6 +262,13 @@ pub fn tlb_shootdown_pump() {
 
 pub fn tlb_shootdown_ack() {
     let me = crate::cpu::cpu_id() as usize;
+    tlb_shootdown_ack_on(me);
+}
+
+/// Drain+ack for a known dense logical CPU id. The NMI path passes an
+/// APIC-resolved id so a transient user GSBASE cannot publish the watermark
+/// into the wrong slot (see [`tlb_shootdown_ack_nmi`]).
+fn tlb_shootdown_ack_on(me: usize) {
     if me >= MAX_CORE_NUM {
         return;
     }
@@ -402,7 +409,19 @@ impl Drop for AckActiveGuard {
 /// flag) so it never double-consumes the single-consumer queue, and no-ops when
 /// nothing is pending. NMIs do not nest, so the flag check is race-free here.
 pub fn tlb_shootdown_ack_nmi() {
-    let me = crate::cpu::cpu_id() as usize;
+    // Never trust GS here: see `lock::current_cpu_id_via_apic`. Publishing the
+    // watermark into the wrong per-CPU slot is indistinguishable from "NMI
+    // ran but SHOOTDOWN_SEQ never moved" — the surviving field hypothesis.
+    let me = {
+        #[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            lock::current_cpu_id_via_apic() as usize
+        }
+        #[cfg(not(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64"))))]
+        {
+            crate::cpu::cpu_id() as usize
+        }
+    };
     if me >= MAX_CORE_NUM {
         return;
     }
@@ -413,7 +432,7 @@ pub fn tlb_shootdown_ack_nmi() {
         && (q.chead() != q.ptail()
             || IPI_QUEUE_OVERFLOW.load(Ordering::Relaxed) & (1u64 << me) != 0)
     {
-        tlb_shootdown_ack();
+        tlb_shootdown_ack_on(me);
         // Reinforcement publish: the drain's watermark is its consumed
         // snapshot, which can trail entries committed while it ran. We were
         // NMI-kicked because a peer is starving on this CPU — leave nothing

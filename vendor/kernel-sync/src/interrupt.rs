@@ -160,7 +160,7 @@ cfg_if::cfg_if! {
             /// hit the direct table; wider (x2APIC) ids scan the registered set,
             /// which is at most `MAX_CORE_NUM` entries and only reached on the
             /// pre-GS fallback path.
-            fn apic_to_logical(apic: u32) -> u8 {
+            pub(super) fn apic_to_logical(apic: u32) -> u8 {
                 if apic < 256 {
                     return APIC_TO_LOGICAL[apic as usize].load(Ordering::Acquire);
                 }
@@ -300,6 +300,26 @@ use interrupts::*;
 /// dense id (hart id / MPIDR affinity).
 pub fn current_cpu_id() -> u8 {
     cpu_id()
+}
+
+/// Dense logical id resolved **only** from the Local APIC ID — never from GS.
+///
+/// Use this from the NMI path. `syscall_return` does `swapgs` then WRMSR of the
+/// user gsbase while CS is still ring 0; an NMI in that window takes the
+/// `__from_kernel` trampoline (no swapgs) and would otherwise read `cpu_id`
+/// out of user GS. A non-zero byte at `logical_cpu_valid`'s offset in that
+/// user mapping looks "valid" and publishes the TLB-shootdown watermark into
+/// the **wrong** `SHOOTDOWN_SEQ` slot — the surviving rival hypothesis for
+/// "NMI ran, nmi_rip fresh, watermark never moved".
+#[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
+pub fn current_cpu_id_via_apic() -> u8 {
+    interrupts::apic_to_logical(interrupts::raw_apic_id())
+}
+
+/// Hosted / non-x86 twin: same as [`current_cpu_id`].
+#[cfg(not(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64"))))]
+pub fn current_cpu_id_via_apic() -> u8 {
+    current_cpu_id()
 }
 
 /// Raw hardware Local APIC ID (x86). Sparse, and up to 32 bits wide in x2APIC

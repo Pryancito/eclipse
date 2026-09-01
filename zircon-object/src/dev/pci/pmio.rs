@@ -29,6 +29,12 @@ if #[cfg(all(target_arch = "x86_64", target_os = "none"))] {
         }
         port_cfg.write((addr & !0x3) | PCI_CONFIG_ENABLE);
         let tmp_val = u32::from_le(port_data.read());
+        // Drop the IRQ-off window before returning; callers that poll config
+        // space in a tight loop (NVIDIA bring-up bridge walks) must also
+        // pump, but a yield here covers single-shot readers that nest under
+        // other spinlocks.
+        drop(_lock);
+        lock::pump();
         Ok((tmp_val >> shift) & (((1u64 << width) - 1) as u32))
     }
     pub fn pmio_config_write_addr(addr: u32, val: u32, width: usize) -> ZxResult {
@@ -49,6 +55,8 @@ if #[cfg(all(target_arch = "x86_64", target_os = "none"))] {
             val
         };
         port_data.write(u32::to_le(tmp_val));
+        drop(_lock);
+        lock::pump();
         Ok(())
     }
 } else {
