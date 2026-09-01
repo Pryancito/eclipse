@@ -109,6 +109,11 @@ impl From<MMUFlags> for PTF {
         if f.is_empty() {
             return PTF::empty();
         }
+        // PROT_NONE / no-access: any non-empty flags used to stamp PRESENT
+        // (USER-only, cache bits, ...). x86 then treated the page as readable.
+        if !f.intersects(MMUFlags::READ | MMUFlags::WRITE | MMUFlags::EXECUTE) {
+            return PTF::empty();
+        }
         let mut flags = PTF::PRESENT;
         if f.contains(MMUFlags::WRITE) {
             flags |= PTF::WRITABLE;

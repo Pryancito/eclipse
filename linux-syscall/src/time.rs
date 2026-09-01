@@ -24,7 +24,7 @@ impl Syscall<'_> {
     /// finds the resolution (precision) of the specified clock clockid, and,
     /// if buffer is non-NULL, stores it in the struct timespec pointed to by buffer
     pub fn sys_clock_gettime(&self, clock: usize, mut buf: UserOutPtr<TimeSpec>) -> SysResult {
-        info!("clock_gettime: id={:?} buf={:?}", clock, buf);
+        trace!("clock_gettime: id={:?} buf={:?}", clock, buf);
         if buf.is_null() {
             return Err(LxError::EINVAL);
         }
@@ -35,7 +35,7 @@ impl Syscall<'_> {
         };
         buf.write(ts)?;
 
-        info!("TimeSpec: {:?}", ts);
+        trace!("clock_gettime: {:?}", ts);
 
         Ok(0)
     }
@@ -45,7 +45,7 @@ impl Syscall<'_> {
     /// glibc/musl and some applications (e.g. Firefox) treat a garbage or
     /// unwritten resolution as a fatal condition, so always fill the struct.
     pub fn sys_clock_getres(&self, clock: usize, mut buf: UserOutPtr<TimeSpec>) -> SysResult {
-        info!("clock_getres: id={:?} buf={:?}", clock, buf);
+        trace!("clock_getres: id={:?} buf={:?}", clock, buf);
         // Reject unknown clocks the same way clock_gettime does.
         match clock {
             0..=7 => {}
@@ -94,7 +94,7 @@ impl Syscall<'_> {
         mut tv: UserOutPtr<TimeVal>,
         tz: UserInPtr<u8>,
     ) -> SysResult {
-        info!("gettimeofday: tv: {:?}, tz: {:?}", tv, tz);
+        trace!("gettimeofday: tv: {:?}, tz: {:?}", tv, tz);
         // don't support tz
         if !tz.is_null() {
             return Err(LxError::EINVAL);
@@ -103,7 +103,7 @@ impl Syscall<'_> {
         let timeval = TimeVal::now();
         tv.write(timeval)?;
 
-        info!("TimeVal: {:?}", timeval);
+        trace!("gettimeofday: {:?}", timeval);
 
         Ok(0)
     }
@@ -111,7 +111,7 @@ impl Syscall<'_> {
     /// get time in seconds
     #[cfg(target_arch = "x86_64")]
     pub fn sys_time(&mut self, mut time: UserOutPtr<u64>) -> SysResult {
-        info!("time: time: {:?}", time);
+        trace!("time: time: {:?}", time);
         if time.is_null() {
             return Err(LxError::EINVAL);
         }

@@ -277,7 +277,11 @@ impl<L: PageTableLevel, PTE: GenericPTE> GenericPageTable for PageTableImpl<L, P
         }
         let paddr = entry.addr();
         entry.clear();
-        crate::vm::flush_tlb(Some(vaddr));
+        // Gathered range ops pay one local flush when the window closes
+        // (`remote_flush_tlb_aspace`); per-page INVLPG here is O(pages).
+        if self.gather == 0 {
+            crate::vm::flush_tlb(Some(vaddr));
+        }
         trace!("PageTable unmap: {:x?} in {:#x?}", vaddr, self.table_phys());
         Ok((paddr, size))
     }
@@ -326,7 +330,9 @@ impl<L: PageTableLevel, PTE: GenericPTE> GenericPageTable for PageTableImpl<L, P
         if let Some(flags) = flags {
             entry.set_flags(flags, size.is_huge());
         }
-        crate::vm::flush_tlb(Some(vaddr));
+        if self.gather == 0 {
+            crate::vm::flush_tlb(Some(vaddr));
+        }
         trace!(
             "PageTable update: {:x?}, flags={:?} in {:#x?}",
             vaddr,

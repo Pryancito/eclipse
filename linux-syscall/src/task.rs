@@ -18,8 +18,8 @@ use linux_object::time::TimeSpec;
 use linux_object::{fs::INodeExt, loader::LinuxElfLoader};
 use zircon_object::object::{KernelObject, KoID, Signal};
 use zircon_object::task::{
-    Status, MAX_NICE, MAX_RT_PRIO, MIN_NICE, MIN_RT_PRIO, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO,
-    SCHED_IDLE, SCHED_NORMAL, SCHED_RR,
+    Status, Thread, MAX_NICE, MAX_RT_PRIO, MIN_NICE, MIN_RT_PRIO, SCHED_BATCH, SCHED_DEADLINE,
+    SCHED_FIFO, SCHED_IDLE, SCHED_NORMAL, SCHED_RR,
 };
 use zircon_object::vm::USER_STACK_PAGES;
 
@@ -711,7 +711,23 @@ impl Syscall<'_> {
             warn!("execve: argv[0] is empty for path {:?}", path_str);
         }
 
-        // TODO: check and kill other threads
+        // POSIX/Linux: execve in a multithreaded process kills every other
+        // thread in the group before the address space is replaced. Leaving
+        // them alive ran the old RIP/stack against the new image.
+        {
+            let proc = self.zircon_process();
+            let me = self.thread.id();
+            for tid in proc.thread_ids() {
+                if tid == me {
+                    continue;
+                }
+                if let Ok(obj) = proc.get_child(tid) {
+                    if let Ok(t) = obj.downcast_arc::<Thread>() {
+                        zircon_object::task::Task::kill(t.as_ref());
+                    }
+                }
+            }
+        }
 
         // Read program file
         let proc = self.linux_process();
@@ -1295,10 +1311,15 @@ impl Syscall<'_> {
         head_ptr: UserOutPtr<UserOutPtr<RobustList>>,
         len_ptr: UserOutPtr<usize>,
     ) -> SysResult {
-        if pid == 0 {
-            return self.thread.get_robust_list(head_ptr, len_ptr);
-        }
-        Ok(0)
+        let thread = if pid == 0 {
+            self.thread.inner()
+        } else if pid < 0 {
+            return Err(LxError::ESRCH);
+        } else {
+            self.find_thread_by_tid(pid as usize)
+                .ok_or(LxError::ESRCH)?
+        };
+        thread.get_robust_list(head_ptr, len_ptr)
     }
 
     /// Set robust list.

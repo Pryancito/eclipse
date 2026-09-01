@@ -964,6 +964,13 @@ bitflags! {
 impl MmapProt {
     /// convert MmapProt to MMUFlags
     fn to_flags(self) -> MMUFlags {
+        // PROT_NONE (no READ/WRITE/EXEC): empty flags, so the PTE is not
+        // present. Returning USER-only used to stamp PRESENT on x86 and make
+        // the page readable; the old `is_empty() => READ|WRITE` hack made it
+        // writable too.
+        if !self.intersects(MmapProt::READ | MmapProt::WRITE | MmapProt::EXEC) {
+            return MMUFlags::empty();
+        }
         let mut flags = MMUFlags::USER;
         if self.contains(MmapProt::READ) {
             flags |= MMUFlags::READ;
@@ -974,11 +981,43 @@ impl MmapProt {
         if self.contains(MmapProt::EXEC) {
             flags |= MMUFlags::EXECUTE;
         }
-        // FIXME: hack for unimplemented mprotect
-        if self.is_empty() {
-            flags |= MMUFlags::READ | MMUFlags::WRITE;
-        }
         flags
+    }
+}
+
+#[cfg(test)]
+mod mmap_prot_tests {
+    use super::*;
+    use zircon_object::vm::MMUFlags;
+
+    #[test]
+    fn prot_none_is_no_access() {
+        let flags = MmapProt::empty().to_flags();
+        assert!(
+            !flags.contains(MMUFlags::READ) && !flags.contains(MMUFlags::WRITE),
+            "PROT_NONE must not install RW (got {:?})",
+            flags
+        );
+        assert!(
+            !flags.intersects(MMUFlags::READ | MMUFlags::WRITE | MMUFlags::EXECUTE),
+            "PROT_NONE must have no access bits: {:?}",
+            flags
+        );
+    }
+
+    #[test]
+    fn prot_read_is_user_readable_not_writable() {
+        let flags = MmapProt::READ.to_flags();
+        assert!(flags.contains(MMUFlags::USER | MMUFlags::READ));
+        assert!(!flags.contains(MMUFlags::WRITE));
+        assert!(!flags.contains(MMUFlags::EXECUTE));
+    }
+
+    #[test]
+    fn prot_rx_does_not_imply_write() {
+        let flags = (MmapProt::READ | MmapProt::EXEC).to_flags();
+        assert!(flags.contains(MMUFlags::USER | MMUFlags::READ | MMUFlags::EXECUTE));
+        assert!(!flags.contains(MMUFlags::WRITE));
     }
 }
 

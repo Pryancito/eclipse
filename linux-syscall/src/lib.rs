@@ -32,7 +32,7 @@ use linux_object::error::{LxError, SysResult};
 use linux_object::fs::FileDesc;
 use linux_object::process::{LinuxProcess, ProcessExt, RLimit};
 use zircon_object::object::{KernelObject, KoID};
-use zircon_object::task::{CurrentThread, Process, Thread, ThreadFn};
+use zircon_object::task::{CurrentThread, Process, ThreadFn};
 use zircon_object::vm::VirtAddr;
 
 use self::consts::SyscallType as Sys;

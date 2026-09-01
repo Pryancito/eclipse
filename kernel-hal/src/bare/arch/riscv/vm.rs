@@ -199,6 +199,9 @@ impl From<MMUFlags> for PTF {
         if f.is_empty() {
             return PTF::empty();
         }
+        if !f.intersects(MMUFlags::READ | MMUFlags::WRITE | MMUFlags::EXECUTE) {
+            return PTF::empty();
+        }
         let mut flags = PTF::VALID;
         if f.contains(MMUFlags::WRITE) {
             flags |= PTF::READABLE | PTF::WRITABLE;

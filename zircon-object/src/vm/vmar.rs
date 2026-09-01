@@ -2004,19 +2004,21 @@ impl VmMapping {
         }
         // Gather so `unmap_cont` does not ack-wait while we hold the page-table
         // spinlock (IRQ off). Flush after the lock is dropped.
-        let owed = {
+        let (owed, result) = {
             let mut pt = self.page_table.lock();
             pt.set_gather(true);
             let r = pt.unmap_cont(addr, size).map_err(Self::paging_error_as_zx);
             let owed = pt.set_gather(false);
-            r?;
-            owed
+            (owed, r)
         };
+        // Flush even if `unmap_cont` failed mid-range: `set_gather(false)`
+        // already took `gather_pending`, and skipping the shootdown would
+        // leave remote TLBs pointing at pages we did unmap.
         if owed {
             let root = self.page_table.lock().table_phys();
             kernel_hal::remote_flush_tlb_aspace(None, Some(root));
         }
-        Ok(())
+        result
     }
 
     fn fill_in_task_status(&self, task_stats: &mut TaskStatsInfo) {
@@ -2314,8 +2316,18 @@ impl VmMapping {
         // `range_change`, which only survives that nesting by using try_lock).
         let (vmo_offset, mut flags) = {
             let inner = self.inner.lock();
+            // Same coverage check as the post-`commit_page` re-validation
+            // below. `cut()` can zero `size` / shrink `flags` while another
+            // CPU is in this fault; indexing first was a TOCTOU panic
+            // (page_idx OOB, or `vaddr - addr` wrapping).
+            if inner.size == 0 || vaddr < inner.addr || vaddr >= inner.end_addr() {
+                return Ok(());
+            }
             let offset = vaddr - inner.addr;
             let page_idx = offset / PAGE_SIZE;
+            if page_idx >= inner.flags.len() {
+                return Ok(());
+            }
             (offset + inner.vmo_offset, inner.flags[page_idx])
         };
         // error!("page fault: addr = {:x}, access_flag = {:?}, flags = {:?}", vaddr, access_flags, flags);
@@ -2930,22 +2942,23 @@ mod tests {
     }
 
     #[test]
-    fn clear_drops_mappings_without_leaving_them_mapped() {
-        let vmar = VmAddressRegion::new_root();
-        let flags = MMUFlags::READ | MMUFlags::WRITE;
-        for i in 0..8 {
-            let vmo = VmObject::new_paged(1);
-            vmar.map_at(i * 0x1000, vmo, 0, 0x1000, flags).unwrap();
-        }
-        assert_eq!(vmar.count(), 8);
-        vmar.clear().unwrap();
-        assert_eq!(vmar.count(), 0);
-        assert_eq!(vmar.used_size(), 0);
-        // Region is still alive: a later map must succeed (process-exit
-        // `clear` keeps the VMAR, unlike `destroy`).
-        let vmo = VmObject::new_paged(1);
-        vmar.map_at(0, vmo, 0, 0x1000, flags).unwrap();
-        assert_eq!(vmar.count(), 1);
+    fn clear_destroys_children_and_keeps_root_alive() {
+        // Sample only allocates sub-VMARs (no VMO mmap), so this is sandbox-safe.
+        let s = Sample::new();
+        s.root.clear().unwrap();
+        assert!(s.child1.is_dead());
+        assert!(s.grandson1.is_dead());
+        assert!(s.grandson2.is_dead());
+        assert!(s.child2.is_dead());
+        assert!(s.root.is_alive());
+        assert_eq!(s.root.count(), 0);
+        assert_eq!(s.root.used_size(), 0);
+        // Process-exit `clear` keeps the VMAR, unlike `destroy`.
+        assert!(s
+            .root
+            .allocate_at(0, 0x1000, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
+            .is_ok());
+        assert_eq!(s.root.count(), 1);
     }
 
     #[test]

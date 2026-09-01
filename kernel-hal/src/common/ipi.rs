@@ -1,7 +1,7 @@
 use crate::{config::MAX_CORE_NUM, utils::mpsc_queue::MpscQueue};
 use alloc::vec::Vec;
 
-const REASON_SIZE: usize = 16;
+const REASON_SIZE: usize = 64;
 
 pub type IpiEntry = usize;
 type IRQueue = MpscQueue<'static, IpiEntry>;
@@ -222,10 +222,30 @@ pub fn shootdown_queue_state(cpu: usize) -> (usize, usize, usize, bool, bool) {
 /// precise per-page path below can never silently skip an invalidation.
 static IPI_QUEUE_OVERFLOW: AtomicU64 = AtomicU64::new(0);
 
+/// Generation bumped by each overflow note, and the generation a drain last
+/// acknowledged. An overflow send does not advance the target queue's `ptail`,
+/// so waiting on `SHOOTDOWN_SEQ >= ptail` can return immediately on a previous
+/// drain's watermark — the initiator then frees frames while the target still
+/// has the stale TLB entry. Waiters that observed a gen bump wait for this
+/// ack instead (the overflow drain always full-flushes).
+static IPI_OVERFLOW_GEN: [AtomicU64; MAX_CORE_NUM] = [ZERO_SEQ; MAX_CORE_NUM];
+static IPI_OVERFLOW_ACK: [AtomicU64; MAX_CORE_NUM] = [ZERO_SEQ; MAX_CORE_NUM];
+
 /// Note that `cpuid`'s IPI queue dropped an entry (called by the arch sender).
 pub fn note_ipi_queue_overflow(cpuid: usize) {
     if cpuid < 64 {
         IPI_QUEUE_OVERFLOW.fetch_or(1u64 << cpuid, Ordering::Release);
+        IPI_OVERFLOW_GEN[cpuid].fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Call `f` once per set bit in `mask` (logical CPU ids 0..63).
+fn for_each_cpu(mask: u64, mut f: impl FnMut(usize)) {
+    let mut bits = mask;
+    while bits != 0 {
+        let cpu = bits.trailing_zeros() as usize;
+        bits &= bits - 1;
+        f(cpu);
     }
 }
 
@@ -296,6 +316,11 @@ fn tlb_shootdown_ack_on(me: usize) {
     // flag-setter's interrupt is still pending and the NEXT ack handles it.
     let overflow =
         IPI_QUEUE_OVERFLOW.fetch_and(!(1u64 << me), Ordering::AcqRel) & (1u64 << me) != 0;
+    let ovf_gen = if overflow {
+        IPI_OVERFLOW_GEN[me].load(Ordering::Acquire)
+    } else {
+        0
+    };
     // Non-allocating bounded drain of this CPU's queue (single consumer).
     let q = ipi_queue(me);
     let mut vpns = [0usize; MAX_PRECISE_SHOOTDOWN];
@@ -356,6 +381,9 @@ fn tlb_shootdown_ack_on(me: usize) {
         // flush on the rare non-TLB-only drain; safety: a full flush always
         // over-satisfies whatever the consumed entries asked.
         crate::vm::flush_tlb(None);
+        if ovf_gen != 0 {
+            IPI_OVERFLOW_ACK[me].fetch_max(ovf_gen, Ordering::Release);
+        }
         SHOOTDOWN_SEQ[me].fetch_max(ptail as u64, Ordering::Release);
         return;
     }
@@ -384,6 +412,9 @@ fn tlb_shootdown_ack_on(me: usize) {
     // because the pump/IRQ/NMI paths race benignly (drains are serialized by
     // SHOOTDOWN_ACK_ACTIVE, but keep the publish monotone regardless).
     SHOOTDOWN_SEQ[me].fetch_max(ptail as u64, Ordering::Release);
+    if ovf_gen != 0 {
+        IPI_OVERFLOW_ACK[me].fetch_max(ovf_gen, Ordering::Release);
+    }
 }
 
 /// Clears [`SHOOTDOWN_ACK_ACTIVE`] on scope exit, covering every early return in
@@ -438,7 +469,9 @@ pub fn tlb_shootdown_ack_nmi() {
         // NMI-kicked because a peer is starving on this CPU — leave nothing
         // to interpretation: one full flush covers everything enqueued up to
         // now, and then the current tail is soundly publishable.
+        let ovf_snap = IPI_OVERFLOW_GEN[me].load(Ordering::Acquire);
         crate::vm::flush_tlb(None);
+        IPI_OVERFLOW_ACK[me].fetch_max(ovf_snap, Ordering::Release);
         SHOOTDOWN_SEQ[me].fetch_max(q.ptail() as u64, Ordering::Release);
         return;
     }
@@ -456,7 +489,11 @@ pub fn tlb_shootdown_ack_nmi() {
     // watermark monotone). Every waiter's goal is <= the tail it observed at
     // send time <= the tail published here, so the starvation ends on this
     // very NMI. NMI-safe: no locks, no allocation, queue untouched.
+    // Snapshot overflow gen BEFORE the flush so a note that races after the
+    // INVLPG is not acknowledged as already done.
+    let ovf_snap = IPI_OVERFLOW_GEN[me].load(Ordering::Acquire);
     crate::vm::flush_tlb(None);
+    IPI_OVERFLOW_ACK[me].fetch_max(ovf_snap, Ordering::Release);
     SHOOTDOWN_SEQ[me].fetch_max(q.ptail() as u64, Ordering::Release);
 }
 
@@ -532,20 +569,21 @@ pub fn remote_flush_tlb_aspace(vaddr: Option<usize>, aspace: Option<usize>) {
         crate::vm::flush_tlb(vaddr);
         return;
     }
+    // Always invalidate locally. Gathered range ops skip per-page INVLPG and
+    // pay here; callers that already flushed a single page just do it twice.
+    crate::vm::flush_tlb(vaddr);
     // Only target CPUs that are actually servicing IPIs — NOT merely online.
     // Waiting on a CPU still spinning for `STARTED` with IRQs off (so it can't
     // ack) would stall the whole init spawn until the budget runs out.
     let mut targets = IPI_READY.load(Ordering::Acquire) & !(1u64 << me);
     if let Some(root) = aspace {
         let root = root & !0xfff;
-        for cpu in 0..MAX_CORE_NUM {
-            if targets & (1u64 << cpu) != 0 {
-                let tok = ACTIVE_VMTOKEN[cpu].load(Ordering::SeqCst);
-                if tok != 0 && tok != root {
-                    targets &= !(1u64 << cpu);
-                }
+        for_each_cpu(targets, |cpu| {
+            let tok = ACTIVE_VMTOKEN[cpu].load(Ordering::Acquire);
+            if tok != 0 && tok != root {
+                targets &= !(1u64 << cpu);
             }
-        }
+        });
     }
     if targets == 0 {
         return; // nobody else is servicing IPIs yet, or nobody has this aspace
@@ -572,19 +610,27 @@ pub fn remote_flush_tlb_aspace(vaddr: Option<usize>, aspace: Option<usize>) {
     // stale mapping it reports — and the drop is loud, because a shootdown we
     // could not deliver does leave that CPU's TLB unflushed.
     let mut goal = [0u64; MAX_CORE_NUM];
-    for cpu in 0..MAX_CORE_NUM {
-        if targets & (1u64 << cpu) != 0 {
-            if crate::interrupt::send_ipi(cpu, reason).is_err() {
-                targets &= !(1u64 << cpu);
-                crate::console::serial_write_fmt_spin(format_args!(
-                    "\n[tlb-shootdown] cpu {} unreachable — skipped (its TLB may be stale)\n",
-                    cpu,
-                ));
-            } else {
-                goal[cpu] = ipi_queue(cpu).ptail() as u64;
+    let mut ovf_goal = [0u64; MAX_CORE_NUM];
+    for_each_cpu(targets, |cpu| {
+        let ovf_before = IPI_OVERFLOW_GEN[cpu].load(Ordering::Acquire);
+        if crate::interrupt::send_ipi(cpu, reason).is_err() {
+            targets &= !(1u64 << cpu);
+            crate::console::serial_write_fmt_spin(format_args!(
+                "\n[tlb-shootdown] cpu {} unreachable — skipped (its TLB may be stale)\n",
+                cpu,
+            ));
+        } else {
+            goal[cpu] = ipi_queue(cpu).ptail() as u64;
+            // Overflow does not advance `ptail`. If this send bumped the
+            // overflow generation, wait for a drain that consumed it — not
+            // merely for `SEQ >= ptail`, which a previous drain may already
+            // satisfy.
+            let ovf_after = IPI_OVERFLOW_GEN[cpu].load(Ordering::Acquire);
+            if ovf_after > ovf_before {
+                ovf_goal[cpu] = ovf_after;
             }
         }
-    }
+    });
     if targets == 0 {
         return;
     }
@@ -598,27 +644,28 @@ pub fn remote_flush_tlb_aspace(vaddr: Option<usize>, aspace: Option<usize>) {
     loop {
         let mut all_acked = true;
         let mut pending = 0u64;
-        for cpu in 0..MAX_CORE_NUM {
-            if targets & (1u64 << cpu) != 0
-                && SHOOTDOWN_SEQ[cpu].load(Ordering::Acquire) < goal[cpu]
-            {
+        for_each_cpu(targets, |cpu| {
+            let seq_ok = SHOOTDOWN_SEQ[cpu].load(Ordering::Acquire) >= goal[cpu];
+            let ovf_ok = ovf_goal[cpu] == 0
+                || IPI_OVERFLOW_ACK[cpu].load(Ordering::Acquire) >= ovf_goal[cpu];
+            if !seq_ok || !ovf_ok {
                 all_acked = false;
                 pending |= 1u64 << cpu;
             }
-        }
+        });
         // [diag] Publish who we are still blocked on — and the exact goal each
         // pending target is being held to — so the deadlock banner can show,
         // with no serial, the live protocol state of a starved shootdown
         // (which invariant broke), not just where the CPUs are parked.
         SHOOTDOWN_WAIT_MASK[me].store(pending, Ordering::Relaxed);
-        for cpu in 0..MAX_CORE_NUM {
+        for_each_cpu(targets, |cpu| {
             let g = if pending & (1u64 << cpu) != 0 {
                 goal[cpu]
             } else {
                 0
             };
             SHOOTDOWN_GOAL[me][cpu].store(g, Ordering::Relaxed);
-        }
+        });
         if all_acked {
             SHOOTDOWN_WAIT_MASK[me].store(0, Ordering::Relaxed);
             break;
@@ -643,11 +690,9 @@ pub fn remote_flush_tlb_aspace(vaddr: Option<usize>, aspace: Option<usize>) {
         // handful of spins — so the common case never re-kicks, and only the
         // CPUs still in `pending` this iteration are poked.
         if spins & ((1 << 16) - 1) == 0 {
-            for cpu in 0..MAX_CORE_NUM {
-                if pending & (1u64 << cpu) != 0 {
-                    let _ = crate::interrupt::send_ipi(cpu, reason);
-                }
-            }
+            for_each_cpu(pending, |cpu| {
+                let _ = crate::interrupt::send_ipi(cpu, reason);
+            });
         }
         // Escalate to NMI when the IPI re-kick has not helped for a while: the
         // target is not merely missing a wakeup but wedged where no maskable

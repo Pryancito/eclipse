@@ -151,11 +151,15 @@ impl ThreadExt for Thread {
 
     fn get_robust_list(
         &self,
-        mut _head_ptr: UserOutPtr<UserOutPtr<RobustList>>,
-        mut _len_ptr: UserOutPtr<usize>,
+        mut head_ptr: UserOutPtr<UserOutPtr<RobustList>>,
+        mut len_ptr: UserOutPtr<usize>,
     ) -> SysResult {
-        _head_ptr = (self.lock_linux().robust_list.as_addr() as *mut RobustList as usize).into();
-        _len_ptr = (&self.lock_linux().robust_list_len as *const usize as usize).into();
+        let linux = self.lock_linux();
+        let head: UserOutPtr<RobustList> = linux.robust_list.as_addr().into();
+        let len = linux.robust_list_len;
+        drop(linux);
+        head_ptr.write(head)?;
+        len_ptr.write(len)?;
         Ok(0)
     }
 

@@ -14,7 +14,7 @@ use linux_object::thread::ThreadExt;
 use linux_object::time::TimeSpec;
 use numeric_enum_macro::numeric_enum;
 use zircon_object::object::KernelObject;
-use zircon_object::task::ROOT_JOB;
+use zircon_object::task::{Thread, ROOT_JOB};
 
 /// The arch-independent 12-byte prefix every `siginfo_t` layout starts with
 /// (`signo`, `errno`, `code`). `rt_sigqueueinfo` reads only this much: the
@@ -186,9 +186,15 @@ impl Syscall<'_> {
                 sig => {
                     let tids = process.thread_ids();
                     for tid in tids {
-                        let thread = process.get_child(tid).unwrap();
-                        let thread: Arc<Thread> = thread.downcast_arc().unwrap();
-                        let mut thread_linux = thread.lock_linux();
+                        let Ok(obj) = process.get_child(tid) else {
+                            continue;
+                        };
+                        let Ok(thread) = obj.downcast_arc::<Thread>() else {
+                            continue;
+                        };
+                        let Some(mut thread_linux) = thread.try_lock_linux() else {
+                            continue;
+                        };
                         if thread_linux.signal_mask.contains(sig) {
                             continue;
                         } else {

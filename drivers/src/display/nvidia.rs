@@ -7196,7 +7196,11 @@ impl DrmScheme for NvidiaGpu {
                     ctx_idx,
                     status
                 );
-                true
+                // Only skip the later RM unmap when ctx_free actually
+                // destroyed the VAS. A failed free leaves the context (and
+                // its VAS) alive; treating it as gone then gem_free's the
+                // backing while RM still has h_virt — UAF in the vendor RM.
+                status == 0
             } else {
                 false
             }
