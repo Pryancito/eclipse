@@ -265,6 +265,20 @@ pub fn tlb_shootdown_ack() {
     if me >= MAX_CORE_NUM {
         return;
     }
+    // Pure-wake peek BEFORE arming the drain flag: an empty queue with no
+    // overflow bit needs no drain at all, so returning here keeps the
+    // ACK_ACTIVE window closed for the overwhelmingly common reschedule-kick
+    // case — every avoided arm is one fewer instant in which an NMI-driven
+    // rescue would have found the flag set. Peek only (the overflow bit is
+    // NOT consumed here); the flagged path below re-checks after consuming.
+    {
+        let q = ipi_queue(me);
+        if q.chead() == q.ptail()
+            && IPI_QUEUE_OVERFLOW.load(Ordering::Acquire) & (1u64 << me) == 0
+        {
+            return;
+        }
+    }
     // Publish that a drain is in flight on this CPU, and clear it on every exit
     // (the guard's Drop), so an NMI-driven ack landing mid-drain skips instead
     // of double-consuming the queue. Set AFTER the range check so `me` is valid.
@@ -400,6 +414,13 @@ pub fn tlb_shootdown_ack_nmi() {
             || IPI_QUEUE_OVERFLOW.load(Ordering::Relaxed) & (1u64 << me) != 0)
     {
         tlb_shootdown_ack();
+        // Reinforcement publish: the drain's watermark is its consumed
+        // snapshot, which can trail entries committed while it ran. We were
+        // NMI-kicked because a peer is starving on this CPU — leave nothing
+        // to interpretation: one full flush covers everything enqueued up to
+        // now, and then the current tail is soundly publishable.
+        crate::vm::flush_tlb(None);
+        SHOOTDOWN_SEQ[me].fetch_max(q.ptail() as u64, Ordering::Release);
         return;
     }
     // Every other state — queue looks empty, or a drain is in flight so the

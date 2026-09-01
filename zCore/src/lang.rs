@@ -195,6 +195,26 @@ fn dl_paint() {
     // RIP: that is the exact non-pumping busy-wait to symbolize with
     // `llvm-addr2line -e zcore`. Do the broadcast ONCE, before the loop.
     if nonack_union != 0 {
+        // Snapshot the protocol state BEFORE the RIP-capture NMI broadcast:
+        // that broadcast runs the unconditional shootdown rescue on every
+        // stuck CPU (flush + publish), so any state read AFTER it shows the
+        // post-rescue world and masks the starvation being diagnosed. The
+        // pre/post seq pair is the discriminator: pre<goal && post>=goal
+        // means the rescue works and the starvation was real; post<goal
+        // means the publish itself is not landing (identity / wrong slot).
+        let mut pre_seq = [0u64; 64];
+        let mut pre_goal = [0u64; 64];
+        let mut pre_q = [(0usize, 0usize, 0usize, false, false); 64];
+        let mut m = nonack_union;
+        while m != 0 {
+            let c = m.trailing_zeros() as usize;
+            m &= m - 1;
+            if c < 64 {
+                pre_seq[c] = kernel_hal::shootdown_seq_of(c);
+                pre_goal[c] = kernel_hal::shootdown_goal(waiter_cpu, c);
+                pre_q[c] = kernel_hal::shootdown_queue_state(c);
+            }
+        }
         kernel_hal::kstats::capture_cpu_rips();
         let mut m = nonack_union;
         while m != 0 {
@@ -202,23 +222,21 @@ fn dl_paint() {
             m &= m - 1;
             let nmi = kernel_hal::kstats::nmi_rip(c);
             let tick = kernel_hal::kstats::cpu_tick_rip(c);
-            // Live protocol state: the watermark this CPU has published, the
-            // goal the waiter holds it to, its queue counters and flags. With
-            // the NMI rescue provably running (nmi_rip fresh), these name the
-            // broken invariant directly: seq<goal with an empty queue and a
-            // clear flag would mean the publish itself is not landing.
-            let seq = kernel_hal::shootdown_seq_of(c);
-            let goal = kernel_hal::shootdown_goal(waiter_cpu, c);
-            let (chead, ptail, phead, ack_active, overflow) =
-                kernel_hal::shootdown_queue_state(c);
+            let post_seq = kernel_hal::shootdown_seq_of(c);
+            let (chead, ptail, phead, ack_active, overflow) = if c < 64 {
+                pre_q[c]
+            } else {
+                (0, 0, 0, false, false)
+            };
             let _ = write!(
                 b,
-                "\nnon-acker cpu{} nmi_rip={:#x} (last_tick={:#x}) seq={} goal={} q={}/{}/{} fl={}{}",
+                "\nnon-acker cpu{} nmi_rip={:#x} (last_tick={:#x}) seq={}->{} goal={} q={}/{}/{} fl={}{}",
                 c,
                 nmi,
                 tick,
-                seq,
-                goal,
+                if c < 64 { pre_seq[c] } else { 0 },
+                post_seq,
+                if c < 64 { pre_goal[c] } else { 0 },
                 chead,
                 ptail,
                 phead,
