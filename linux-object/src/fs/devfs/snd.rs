@@ -799,8 +799,17 @@ impl PcmDev {
             // keeping format/rate/channels and letting the sizes fall out.
             Self::relax_size_params(p);
             if !self.refine(p) {
-                error!("[snd] hw_params: refine emptied; forcing 48 kHz / 1024 x 4");
-                Self::log_hw_params_failure("forced", &requested, &p.intervals);
+                let empty = p
+                    .intervals
+                    .iter()
+                    .position(Self::iv_empty)
+                    .map(Self::iv_name)
+                    .unwrap_or("mask");
+                error!(
+                    "[snd] hw_params: refine emptied ({}); forcing 48 kHz / 1024 x 4",
+                    empty
+                );
+                Self::log_hw_params_failure(empty, &requested, &p.intervals);
                 p.masks[PAR_ACCESS].bits[0] = 1 << ACCESS_RW_INTERLEAVED;
                 p.masks[PAR_FORMAT].bits[0] = 1 << FORMAT_S16_LE;
                 p.masks[PAR_SUBFORMAT].bits[0] = 1 << SUBFORMAT_STD;
