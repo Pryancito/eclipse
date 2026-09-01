@@ -42,15 +42,14 @@ pub use executor::{
 };
 pub use runtime::{
     abandon_current_executor, abandon_current_task, abandon_executor_for_sp,
-    attribute_fault_stack_ptrs, check_current_executor_canary,
+    attribute_fault_stack_ptrs, begin_voluntary_yield, check_current_executor_canary,
     check_current_executor_stack_proximity, current_executor_abandonable,
-    current_stack_top_looks_null, current_task_abandonable, fault_sp_abandonable, handle_timeout,
-    heap_smash_suspected, irq_on_idle_executor, irq_should_skip_dyn_dispatch,
-    irq_should_skip_heavy_work, note_heap_smash_suspected, run_until_idle, runnable_task_count,
-    begin_voluntary_yield, end_voluntary_yield, sched_yield, set_idle_callback,
-    set_resched_ipi_sender, set_wakeup_preempt, spawn, spawn_with_affinity,
-    take_need_resched, wakeup_preempt_enabled, wakeup_preempt_stats,
-    warm_runtimes, FaultStackAttr, StackAttrHit, StackPtrRegion,
+    current_stack_top_looks_null, current_task_abandonable, end_voluntary_yield,
+    fault_sp_abandonable, handle_timeout, heap_smash_suspected, irq_on_idle_executor,
+    irq_should_skip_dyn_dispatch, irq_should_skip_heavy_work, note_heap_smash_suspected,
+    run_until_idle, runnable_task_count, sched_yield, set_idle_callback, set_resched_ipi_sender,
+    set_wakeup_preempt, spawn, spawn_with_affinity, take_need_resched, wakeup_preempt_enabled,
+    wakeup_preempt_stats, warm_runtimes, FaultStackAttr, StackAttrHit, StackPtrRegion,
 };
 
 #[macro_export]

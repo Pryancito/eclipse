@@ -300,8 +300,7 @@ fn tlb_shootdown_ack_on(me: usize) {
     // NOT consumed here); the flagged path below re-checks after consuming.
     {
         let q = ipi_queue(me);
-        if q.chead() == q.ptail()
-            && IPI_QUEUE_OVERFLOW.load(Ordering::Acquire) & (1u64 << me) == 0
+        if q.chead() == q.ptail() && IPI_QUEUE_OVERFLOW.load(Ordering::Acquire) & (1u64 << me) == 0
         {
             return;
         }

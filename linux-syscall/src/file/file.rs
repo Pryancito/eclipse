@@ -1209,7 +1209,11 @@ impl Syscall<'_> {
     /// [`linux_object::fs::register_syncobj_eventfd`]. This is the wait side of
     /// wlroots' `linux-drm-syncobj-v1` explicit sync. Gated on the same
     /// `nvidia.nouveau_uapi` opt-in as the rest of the syncobj ioctls.
-    fn sys_drm_syncobj_eventfd(&self, request: usize, arg1: usize) -> Result<Option<usize>, LxError> {
+    fn sys_drm_syncobj_eventfd(
+        &self,
+        request: usize,
+        arg1: usize,
+    ) -> Result<Option<usize>, LxError> {
         const SYNCOBJ_EVENTFD: usize = 0xC018_64CF; // DRM_IOWR(0xcf, drm_syncobj_eventfd)
         if request != SYNCOBJ_EVENTFD {
             return Ok(None);
@@ -1234,7 +1238,10 @@ impl Syscall<'_> {
         let req = match ptr.read() {
             Ok(r) => r,
             Err(e) => {
-                warn!("[drm] SYNCOBJ_EVENTFD read(args @ {:#x}) EFAULT: {:?}", arg1, e);
+                warn!(
+                    "[drm] SYNCOBJ_EVENTFD read(args @ {:#x}) EFAULT: {:?}",
+                    arg1, e
+                );
                 return Err(e.into());
             }
         };
