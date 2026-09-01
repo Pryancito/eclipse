@@ -399,27 +399,40 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // at boot (dual RTX: render GPU P2P-copies into the console GOP FB),
             // enable CE present automatically — it replaces the ~7-10 FPS CPU
             // blit path with a GPU copy-engine transfer. Explicit opt-in via
-            // `nvidia.cepresent` still works; opt-out with `nvidia.nocepresent`.
-            // On failure CE auto-wedges and falls back to CPU blit (see
-            // CE_PRESENT_WEDGED in nvidia.rs).
+            // `nvidia.cepresent` still works; the wlroots GPU-renderer opts
+            // (`nvidia.wlr_gles2` / `nvidia.wlr_vulkan`) also request it, since
+            // without CE the compositor can render on the secondary RTX yet
+            // still present through the slow CPU scanout path. Opt-out with
+            // `nvidia.nocepresent`. On failure CE auto-wedges and falls back to
+            // CPU blit (see CE_PRESENT_WEDGED in nvidia.rs).
             let ce_ready = if !options.cmdline.contains("nvidia.noautoboot") {
                 auto_bringup_compute_gpus()
             } else {
                 klog_info!("Eclipse: NVIDIA compute-GPU auto bring-up disabled (nvidia.noautoboot)");
                 false
             };
-            if options.cmdline.contains("nvidia.nocepresent") {
+            let cmdline_has = |token: &str| {
+                options
+                    .cmdline
+                    .split([':', ' ', '\t', '\n'])
+                    .any(|t| t == token)
+            };
+            let ce_requested_by = if cmdline_has("nvidia.cepresent") {
+                Some("nvidia.cepresent")
+            } else if cmdline_has("nvidia.wlr_vulkan") {
+                Some("nvidia.wlr_vulkan")
+            } else if cmdline_has("nvidia.wlr_gles2") {
+                Some("nvidia.wlr_gles2")
+            } else if ce_ready {
+                Some("auto: compute GPU ready")
+            } else {
+                None
+            };
+            if cmdline_has("nvidia.nocepresent") {
                 klog_info!("Eclipse: present por CPU (CE-offload disabled: nvidia.nocepresent)");
-            } else if options.cmdline.contains("nvidia.cepresent") || ce_ready {
+            } else if let Some(reason) = ce_requested_by {
                 linux_object::fs::devfs::drm::set_ce_present_enabled(true);
-                klog_info!(
-                    "Eclipse: NVIDIA CE-offload present ENABLED ({})",
-                    if options.cmdline.contains("nvidia.cepresent") {
-                        "nvidia.cepresent"
-                    } else {
-                        "auto: compute GPU ready"
-                    }
-                );
+                klog_info!("Eclipse: NVIDIA CE-offload present ENABLED ({})", reason);
             } else {
                 klog_info!("Eclipse: present por CPU (CE-offload: no compute GPU ready; try nvidia.cepresent)");
             }
