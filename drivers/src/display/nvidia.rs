@@ -2800,7 +2800,21 @@ impl NvidiaGpu {
                 Ok(d) if d.supported_status == 0 && d.connected_mask != 0 => {
                     Self::rm_enable_hdmi_audio(instance, &d, true);
                 }
-                _ => {}
+                Ok(_) => {
+                    // GPU present but no connected outputs — nothing to do.
+                }
+                Err(st) => {
+                    // edid() returns Err when the RM device instance is not yet
+                    // attached (the GPU is still being probed) or when the GPU
+                    // does not exist.  Warn only for instances 0 and 1 to avoid
+                    // log spam for the six non-existent slots.
+                    if instance < 2 {
+                        log::warn!(
+                            "[hdmi-audio] gpu{}: edid query failed NV_STATUS={:#x} — will retry at next stream start",
+                            instance, st
+                        );
+                    }
+                }
             }
         }
     }
