@@ -1567,9 +1567,11 @@ pub fn page_flip(fb_id: u32, crtc_id: u32, user_data: u64) -> Result<(), FlipErr
 /// than immediately. This is the throttle that keeps a Wayland compositor's
 /// frame loop from spinning: it renders a frame, page-flips, then blocks in
 /// `poll()`/`read()` on the card fd until we post the flip event here — so the
-/// loop runs at most once per [`VBLANK_PERIOD`]. If the previous vblank is
-/// already in the past (compositor was idle, or renders slower than 60 Hz) the
-/// event still fires one period out, never faster.
+/// loop runs at most once per [`VBLANK_PERIOD`]. If that slot is already in
+/// the past (present took ≥16.7 ms, or the compositor was idle) the event is
+/// delivered immediately: waiting *another* full period on top of a missed
+/// slot locked the desktop at ~30 Hz. Catch-up still never exceeds 60 Hz,
+/// because a frame that finished on time keeps its remaining wait.
 ///
 /// Pending DRM completions share one `timer_set` arm (labwc/lunarbar used to
 /// enqueue a fresh Box per flip/vblank), but the jobs themselves live in a
@@ -1620,6 +1622,15 @@ fn arm_coalesced_drm_timer_locked() {
         return;
     }
     let deadline = next_vblank_deadline();
+    let now = kernel_hal::timer::timer_now();
+    if deadline <= now {
+        // Missed the 60 Hz slot: post the completion on this thread so the
+        // compositor does not sit idle for another 16.7 ms (see
+        // [`next_vblank_deadline`]). `deliver_pending_drm_timer` clears
+        // `DRM_TIMER_ARMED`.
+        deliver_pending_drm_timer();
+        return;
+    }
     kernel_hal::timer::timer_set(deadline, Box::new(move |_| deliver_pending_drm_timer()));
 }
 
@@ -1749,15 +1760,26 @@ pub fn cancel_events_for_exit(pid: u64) {
 }
 
 /// Advance the synthetic vblank clock and return the monotonic instant the next
-/// completion event may fire at: one [`VBLANK_PERIOD`] past the previous vblank,
-/// but never in the past. This is what paces both page-flip and vblank-wait
-/// event delivery to ~60 Hz.
+/// completion event may fire at: one [`VBLANK_PERIOD`] past the previous vblank.
+///
+/// Cap at 60 Hz when the compositor is on time. When the slot is already in
+/// the past, return `now` (catch-up) instead of `now + VBLANK_PERIOD`: that
+/// extra wait was the ~30 Hz lock. The loop still cannot exceed 60 Hz because
+/// a frame that finished inside the period keeps the remaining wait.
 fn next_vblank_deadline() -> Duration {
     let now = kernel_hal::timer::timer_now();
     let mut st = DRM_STATE.lock();
     let mut next = st.next_vblank + VBLANK_PERIOD;
     if next <= now {
-        next = now + VBLANK_PERIOD;
+        static CATCHUP_LOGGED: AtomicBool = AtomicBool::new(false);
+        if !CATCHUP_LOGGED.swap(true, Ordering::Relaxed) {
+            kernel_hal::klog_info!(
+                "[drm] vblank catch-up: missed 60 Hz slot ({}us since last vblank) -- \
+                 delivering immediately; waiting another 16.7ms here was locking ~30 Hz",
+                now.saturating_sub(st.next_vblank).as_micros()
+            );
+        }
+        next = now;
     }
     st.next_vblank = next;
     next

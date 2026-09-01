@@ -1008,25 +1008,85 @@ impl VmAddressRegion {
 
     /// Destroy but do not remove self from parent.
     fn destroy_internal(&self) -> ZxResult {
-        let mut guard = self.inner.lock();
-        let inner = guard.as_mut().ok_or(ZxError::BAD_STATE)?;
-        for vmar in inner.children.drain(..) {
-            vmar.destroy_internal()?;
-        }
-        inner.mappings.clear();
-        *guard = None;
+        let (children, mappings) = {
+            let mut guard = self.inner.lock();
+            let inner = guard.as_mut().ok_or(ZxError::BAD_STATE)?;
+            let children: Vec<_> = inner.children.drain(..).collect();
+            let mappings = core::mem::take(&mut inner.mappings);
+            *guard = None;
+            (children, mappings)
+        };
+        self.destroy_taken_subtree(children, mappings);
         Ok(())
     }
 
     /// Unmap all mappings and destroy all sub-regions of VMAR.
+    ///
+    /// The VMAR spinlock is an IRQ-off ticket lock. Holding it across
+    /// `mappings.clear()` used to run every `VmMapping::drop` → `unmap_cont` →
+    /// synchronous TLB shootdown with interrupts disabled — the exact convoy
+    /// that panics on glxgears window-close (`DIAG: shootdown starvation`).
+    /// Drain the tree under the lock, then unmap with a single gathered
+    /// shootdown after the lock is gone.
     pub fn clear(&self) -> ZxResult {
-        let mut guard = self.inner.lock();
-        let inner = guard.as_mut().ok_or(ZxError::BAD_STATE)?;
-        for vmar in inner.children.drain(..) {
-            vmar.destroy_internal()?;
-        }
-        inner.mappings.clear();
+        let (children, mappings) = {
+            let mut guard = self.inner.lock();
+            let inner = guard.as_mut().ok_or(ZxError::BAD_STATE)?;
+            let children: Vec<_> = inner.children.drain(..).collect();
+            let mappings = core::mem::take(&mut inner.mappings);
+            (children, mappings)
+        };
+        self.destroy_taken_subtree(children, mappings);
         Ok(())
+    }
+
+    fn destroy_taken_subtree(
+        &self,
+        children: Vec<Arc<VmAddressRegion>>,
+        mappings: BTreeMap<VirtAddr, Arc<VmMapping>>,
+    ) {
+        for vmar in children {
+            let _ = vmar.destroy_internal();
+        }
+        self.unmap_taken_mappings(mappings);
+    }
+
+    /// Unmap `mappings` with one gathered remote TLB flush, without holding
+    /// the VMAR lock. Marks each mapping size=0 so `Drop` does not shoot down
+    /// again. The flush itself runs with no IRQ-off lock held.
+    fn unmap_taken_mappings(&self, mappings: BTreeMap<VirtAddr, Arc<VmMapping>>) {
+        if mappings.is_empty() {
+            return;
+        }
+        let ranges: Vec<(VirtAddr, usize)> = mappings
+            .values()
+            .map(|m| {
+                let inner = m.inner.lock();
+                (inner.addr, inner.size)
+            })
+            .filter(|(_, size)| *size != 0)
+            .collect();
+        let owed = if !ranges.is_empty() {
+            let mut pt = self.page_table.lock();
+            pt.set_gather(true);
+            for (addr, size) in ranges {
+                let _ = pt.unmap_cont(addr, size);
+            }
+            pt.set_gather(false)
+        } else {
+            false
+        };
+        if owed {
+            // `table_phys` takes the lock only to read the root; the ack-wait
+            // below must not run under it (or the VMAR lock).
+            let root = self.page_table.lock().table_phys();
+            kernel_hal::remote_flush_tlb_aspace(None, Some(root));
+        }
+        for m in mappings.values() {
+            let mut inner = m.inner.lock();
+            inner.size = 0;
+        }
+        drop(mappings);
     }
 
     /// Get physical address of the underlying page table.
@@ -1593,9 +1653,14 @@ impl VmAddressRegion {
         // writable entries onto frames the partially-built child already shares
         // is the corruption this whole dance exists to prevent.
         if gather_shootdowns {
-            let mut pg_table = src.page_table.lock();
-            if pg_table.set_gather(false) {
-                pg_table.remote_flush_all();
+            let (owed, root) = {
+                let mut pg_table = src.page_table.lock();
+                let owed = pg_table.set_gather(false);
+                (owed, pg_table.table_phys())
+            };
+            if owed {
+                // Do not hold the page-table lock across the ack-wait.
+                kernel_hal::remote_flush_tlb_aspace(None, Some(root));
             }
         }
         result?;
@@ -1930,12 +1995,28 @@ impl VmMapping {
     }
 
     fn unmap(&self) -> ZxResult {
-        let inner = self.inner.lock();
-        // TODO inner.vmo_offset unused?
-        self.page_table
-            .lock()
-            .unmap_cont(inner.addr, inner.size)
-            .map_err(Self::paging_error_as_zx)
+        let (addr, size) = {
+            let inner = self.inner.lock();
+            (inner.addr, inner.size)
+        };
+        if size == 0 {
+            return Ok(());
+        }
+        // Gather so `unmap_cont` does not ack-wait while we hold the page-table
+        // spinlock (IRQ off). Flush after the lock is dropped.
+        let owed = {
+            let mut pt = self.page_table.lock();
+            pt.set_gather(true);
+            let r = pt.unmap_cont(addr, size).map_err(Self::paging_error_as_zx);
+            let owed = pt.set_gather(false);
+            r?;
+            owed
+        };
+        if owed {
+            let root = self.page_table.lock().table_phys();
+            kernel_hal::remote_flush_tlb_aspace(None, Some(root));
+        }
+        Ok(())
     }
 
     fn fill_in_task_status(&self, task_stats: &mut TaskStatsInfo) {
@@ -2652,11 +2733,16 @@ impl VmMappingInner {
 
 impl Drop for VmMapping {
     fn drop(&mut self) {
-        let inner = self.inner.lock();
-        let addr = inner.addr;
-        let size = inner.size;
-        info!("VmMapping::drop: addr={:#x}, size={:#x}", addr, size);
-        drop(inner);
+        let (addr, size) = {
+            let inner = self.inner.lock();
+            (inner.addr, inner.size)
+        };
+        // `vmar.clear` / `destroy_internal` already unmapped and zeroed `size`
+        // so the batched shootdown is not repeated here under an IRQ-off lock.
+        if size == 0 {
+            return;
+        }
+        trace!("VmMapping::drop: addr={:#x}, size={:#x}", addr, size);
         if let Err(err) = self.unmap() {
             error!(
                 "VmMapping::drop: unmap failed for addr={:#x}, size={:#x}: {:?}",
@@ -2841,6 +2927,25 @@ mod tests {
             .root
             .allocate_at(0, 0x1000, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
             .is_ok());
+    }
+
+    #[test]
+    fn clear_drops_mappings_without_leaving_them_mapped() {
+        let vmar = VmAddressRegion::new_root();
+        let flags = MMUFlags::READ | MMUFlags::WRITE;
+        for i in 0..8 {
+            let vmo = VmObject::new_paged(1);
+            vmar.map_at(i * 0x1000, vmo, 0, 0x1000, flags).unwrap();
+        }
+        assert_eq!(vmar.count(), 8);
+        vmar.clear().unwrap();
+        assert_eq!(vmar.count(), 0);
+        assert_eq!(vmar.used_size(), 0);
+        // Region is still alive: a later map must succeed (process-exit
+        // `clear` keeps the VMAR, unlike `destroy`).
+        let vmo = VmObject::new_paged(1);
+        vmar.map_at(0, vmo, 0, 0x1000, flags).unwrap();
+        assert_eq!(vmar.count(), 1);
     }
 
     #[test]

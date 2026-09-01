@@ -5681,8 +5681,13 @@ NV_STATUS eclipse_rm_ce_blit(
     status = ceutilsMemcopy(pMemoryManager->pCeUtils, &params);
     if (status == NV_OK)
         status = eclipse_ce_wait_bounded(pMemoryManager, params.submittedWorkId);
-    nv_printf(0, "[eclipse-rm-trace] ce_blit: ceutilsMemcopy(src_pa=0x%llx dst_vram=0x%llx size=0x%llx) -> 0x%x\n",
-              srcSysmemPa, dstFbVramOffset, size, status);
+    {
+        static NvU32 s_n = 0;
+        NvU32 n = ++s_n;
+        if (status != NV_OK || n <= 2 || (n % 64U) == 0)
+            nv_printf(0, "[eclipse-rm-trace] ce_blit: ceutilsMemcopy(src_pa=0x%llx dst_vram=0x%llx size=0x%llx) -> 0x%x\n",
+                      srcSysmemPa, dstFbVramOffset, size, status);
+    }
 
 cleanup:
     if (pDstMemDesc != NULL)
@@ -6021,8 +6026,16 @@ NV_STATUS eclipse_rm_ce_blit_p2p(
     status = ceutilsMemcopy(pMemoryManager->pCeUtils, &params);
     if (status == NV_OK)
         status = eclipse_ce_wait_bounded(pMemoryManager, params.submittedWorkId);
-    nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p: ceutilsMemcopy(src=0x%llx dst_host=0x%llx size=0x%llx) -> 0x%x\n",
-              srcSysmemPa, dstHostPa, size, status);
+    /* Per-frame serial traces cost ~10 ms at 115200 baud and themselves
+     * steal the 60 Hz budget. Log the first two plus every 64th; errors
+     * always print (status != NV_OK). */
+    {
+        static NvU32 s_n = 0;
+        NvU32 n = ++s_n;
+        if (status != NV_OK || n <= 2 || (n % 64U) == 0)
+            nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p: ceutilsMemcopy(src=0x%llx dst_host=0x%llx size=0x%llx) -> 0x%x\n",
+                      srcSysmemPa, dstHostPa, size, status);
+    }
 
 cleanup:
     if (pDstMemDesc != NULL)
@@ -6192,8 +6205,15 @@ NV_STATUS eclipse_rm_ce_blit_p2p_2d(
     if (status == NV_OK && lastWorkId != 0)
         status = eclipse_ce_wait_bounded(pMemoryManager, lastWorkId);
 
-    nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p_2d: %u/%u rows submitted, lastWorkId=%llu -> 0x%x\n",
-              (status == NV_OK) ? lineCount : r, lineCount, lastWorkId, status);
+    /* Rate-limit: this ran every present and a ~120-char serial line is
+     * ~10 ms — enough to turn a 60 Hz present into 30 Hz by itself. */
+    {
+        static NvU32 s_n = 0;
+        NvU32 n = ++s_n;
+        if (status != NV_OK || n <= 2 || (n % 64U) == 0)
+            nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p_2d: %u/%u rows submitted, lastWorkId=%llu -> 0x%x\n",
+                      (status == NV_OK) ? lineCount : r, lineCount, lastWorkId, status);
+    }
 
 unlock:
     rmGpuGroupLockRelease(gpusLockedMask, GPUS_LOCK_FLAGS_NONE);

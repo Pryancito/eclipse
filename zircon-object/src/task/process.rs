@@ -465,6 +465,12 @@ impl Process {
 
         // Keep the exited process object around for wait/status, but release
         // userspace mappings as soon as the last thread is gone.
+        //
+        // `vmar.clear` must not run while a GPU client is still mapped AND
+        // holding an IRQ-off lock: that was the glxgears-window-close panic
+        // (HOLDER waits TLB ack for 8s). The clear path itself now drops the
+        // VMAR lock before the shootdown; this call is just the CPU-side unmap
+        // so GEM teardown below cannot free frames still in the page tables.
         let _ = self.vmar.clear();
 
         self.base.signal_set(Signal::PROCESS_TERMINATED);
@@ -483,7 +489,17 @@ impl Process {
         // release handler, and without an equivalent a dumb buffer outlived its
         // creator forever. Registered once at boot; a `fn` pointer read under a
         // short lock, and no hook at all in the libos/test builds.
-        if let Some(hook) = *PROCESS_EXIT_HOOK.lock() {
+        //
+        // Copy the fn out and DROP the lock before calling it. `if let Some(h)
+        // = *PROCESS_EXIT_HOOK.lock() { h(...) }` keeps the IRQ-off guard
+        // alive for the whole body — so nouveau_release_process (RM ctx_free,
+        // gem_free, tens/hundreds of ms) ran with interrupts disabled. That
+        // CPU could not ack TLB shootdowns; a peer in vmar.clear (or the
+        // compositor's next mmap) spun until the 8s deadlock detector killed
+        // the machine. Observed: close glxgears window → Mesa X error → panic
+        // a few seconds later.
+        let hook = *PROCESS_EXIT_HOOK.lock();
+        if let Some(hook) = hook {
             hook(self.base.id);
         }
         let inner = self.inner.lock();

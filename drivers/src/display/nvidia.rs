@@ -6752,7 +6752,7 @@ impl DrmScheme for NvidiaGpu {
         // leak the VA reservation (h_virt) in RM forever.
         self.drain_vm_mappings(&alloc::format!("GEM_CLOSE handle={}", handle), |m| {
             m.gem_handle == handle
-        });
+        }, true);
         let status = match *self.rm_device_instance.lock() {
             Some(device_instance) => Some(nvidia_rm_sys::rm_init::gem_free(
                 device_instance,
@@ -7151,22 +7151,67 @@ impl DrmScheme for NvidiaGpu {
         if pid == 0 {
             return;
         }
-        // Per-process GPU teardown, up-front and OWNER-SCOPED. With per-process
-        // contexts a client's exit must reclaim ONLY its own state, never the
-        // compositor's or another client's. The old path freed EVERY VM_BIND
-        // mapping and EVERY GEM object on any exit (a single-process assumption:
-        // harmless when only the compositor used the GPU, but with GL clients it
-        // pulled the compositor's buffers out from under it the instant a client
-        // closed). This runs before the channel-based returns below because a
-        // client can hold a context + mappings from VM_BIND even if it died
-        // before CHANNEL_ALLOC.
+        // Per-process GPU teardown, OWNER-SCOPED. Stop the GPU before ripping
+        // out VM_BIND / GEM: the old order unmapped and freed buffers while the
+        // channel was still on the runlist, so a dying glxgears (window close
+        // or ^C) left the GPU writing into memory the next shootdown was
+        // tearing down — HOLDER waits TLB ack, 8s panic.
         let device_instance = *self.rm_device_instance.lock();
-        // 1. Drop ONLY this process's VM_BIND mappings (owner-tagged).
-        let dropped_maps = self
-            .drain_vm_mappings(&alloc::format!("process exit pid={}", pid), |m| {
-                m.owner_pid == pid
-            });
-        // 2. Release this process's GEM objects, RESPECTING the PRIME share
+        // 1. Engine-class objects are RM children of the channel. Free them
+        //    while the channel is still alive (child-before-parent). ctx_free
+        //    would reap them; doing it here avoids a double-free of the shared
+        //    handle table. Scope to THIS pid.
+        {
+            use super::nouveau_uapi as nv;
+            let leftovers = nv::class_objects_drain_pid(pid);
+            if !leftovers.is_empty() {
+                if let Some(device_instance) = device_instance {
+                    for (_, h_object) in &leftovers {
+                        lock::pump();
+                        let _ = nvidia_rm_sys::rm_init::class_free(device_instance, *h_object);
+                    }
+                }
+                log::info!(
+                    "[nouveau-uapi] process exit pid={}: freed {} leftover class object(s) before channel",
+                    pid,
+                    leftovers.len()
+                );
+            }
+        }
+        // 2. Take the channel off the runlist (and drop its VAS) BEFORE any
+        //    GEM/VM_BIND teardown. ctx 0 is the compositor singleton and is
+        //    never freed here.
+        let my_ctx = {
+            let mut map = self.nouveau_pid_ctx.lock();
+            map.iter().position(|t| t.0 == pid).map(|i| map.remove(i).1)
+        };
+        let ctx_freed = if let (Some(ctx_idx), Some(device_instance)) = (my_ctx, device_instance) {
+            if ctx_idx >= 1 {
+                lock::pump();
+                let status = nvidia_rm_sys::rm_init::ctx_free(device_instance, ctx_idx);
+                super::nouveau_uapi::ctx_clear_wedged(ctx_idx);
+                log::info!(
+                    "[nouveau-uapi] process exit pid={}: freed CTX {} -> status={:#x}",
+                    pid,
+                    ctx_idx,
+                    status
+                );
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        // 3. Drop local VM_BIND bookkeeping. Skip the RM unmap when ctx_free
+        //    already destroyed the VAS (a second vm_bind_unmap on a stale
+        //    h_virt is a use-after-free in RM).
+        let dropped_maps = self.drain_vm_mappings(
+            &alloc::format!("process exit pid={}", pid),
+            |m| m.owner_pid == pid,
+            !ctx_freed,
+        );
+        // 4. Release this process's GEM objects, RESPECTING the PRIME share
         //    count. A buffer this process created may still be imported by
         //    ANOTHER holder: the compositor self-imports a client's on-screen
         //    buffer to composite it (gem_mmap refcount > 1). The old code freed
@@ -7244,6 +7289,7 @@ impl DrmScheme for NvidiaGpu {
             // Phase 4: free RM memory outside every lock.
             let mut bytes = 0u64;
             for (handle, h_memory, size) in &to_free_mem {
+                lock::pump();
                 if let Some(device_instance) = device_instance {
                     let status = nvidia_rm_sys::rm_init::gem_free(device_instance, *h_memory);
                     if status != 0 {
@@ -7263,59 +7309,6 @@ impl DrmScheme for NvidiaGpu {
             }
             (to_free_mem.len(), bytes)
         };
-        // 2.5. Free this process's RM engine-class objects (3D/2D/copy/inline/
-        //      compute, added via NVIF NEW) BEFORE its channel. They are RM
-        //      CHILDREN of the channel (AllocWithHandle(..., hChannel, ...)), so
-        //      ctx_free below -- which frees the channel -- reaps them
-        //      automatically. The old code freed the channel FIRST and then
-        //      class_free'd these again: a DOUBLE FREE on the shared RM client's
-        //      handle table. A ^C'd client never NVIF-DELs its objects, so it ran
-        //      on every interrupted client, and a few launches later the GSP-RM
-        //      object database was corrupt enough that NEW clients could no
-        //      longer even enumerate the GPU (vkEnumeratePhysicalDevices ->
-        //      INITIALIZATION_FAILED, GBM open -> fd -1). Freeing them here, while
-        //      the channel is still alive, is the correct child-before-parent
-        //      order and leaves nothing for ctx_free to double-reap. Scope to
-        //      THIS pid: another live client's (or the compositor's) class
-        //      objects live on their own channels and must not be touched.
-        {
-            use super::nouveau_uapi as nv;
-            let leftovers = nv::class_objects_drain_pid(pid);
-            if !leftovers.is_empty() {
-                if let Some(device_instance) = device_instance {
-                    for (_, h_object) in &leftovers {
-                        let _ = nvidia_rm_sys::rm_init::class_free(device_instance, *h_object);
-                    }
-                }
-                log::info!(
-                    "[nouveau-uapi] process exit pid={}: freed {} leftover class object(s) before channel",
-                    pid,
-                    leftovers.len()
-                );
-            }
-        }
-        // 3. Free this process's OWN GPU context (VAS + GPFIFO + compute) and
-        //    release its slot, so a re-launched client gets a FRESH context (not a
-        //    wedged cached one) and the MAX_CTX slots don't leak across launches.
-        let my_ctx = {
-            let mut map = self.nouveau_pid_ctx.lock();
-            map.iter().position(|t| t.0 == pid).map(|i| map.remove(i).1)
-        };
-        if let (Some(ctx_idx), Some(device_instance)) = (my_ctx, device_instance) {
-            if ctx_idx >= 1 {
-                let status = nvidia_rm_sys::rm_init::ctx_free(device_instance, ctx_idx);
-                // Clear any wedged latch on this slot: the channel is gone, and
-                // the next client to take this slot gets a fresh one -- it must
-                // not inherit the previous tenant's fast-fail verdict.
-                super::nouveau_uapi::ctx_clear_wedged(ctx_idx);
-                log::info!(
-                    "[nouveau-uapi] process exit pid={}: freed CTX {} -> status={:#x}",
-                    pid,
-                    ctx_idx,
-                    status
-                );
-            }
-        }
         // Channel bookkeeping. Only the RM-backed channel carries real GPU state,
         // so a process that merely enumerated (discovery channels) is reclaimed
         // without the class-object cleanup below.
@@ -7349,8 +7342,8 @@ impl DrmScheme for NvidiaGpu {
             );
             return;
         }
-        // Class objects were already freed in step 2.5 (before the channel), and
-        // ctx_free (step 3) reaped the channel itself -- nothing more to free here.
+        // Class objects and ctx_free already ran (GPU off the runlist, VAS
+        // gone). Only channel bookkeeping remains.
         log::info!(
             "[nouveau-uapi] process exit pid={}: released nouveau channel + {} GEM object(s), {} KiB, {} mapping(s)",
             pid,
@@ -7429,18 +7422,17 @@ impl NvidiaGpu {
     }
 
     /// Drains every `nouveau_vm_mappings` entry for which `matches` returns
-    /// true and `vm_bind_unmap`s each one via RM -- the same real RM call
-    /// VM_BIND's own UNMAP op uses (see `DRM_IOCTL_NOUVEAU_VM_BIND`'s
-    /// `VM_BIND_OP_UNMAP` arm below), just applied in bulk instead of to
-    /// one caller-named mapping. Shared by `nouveau_gem_close` (only
-    /// entries for the handle being closed) and `CHANNEL_FREE` (every
-    /// entry -- this driver models a single VAS, so freeing the one
-    /// channel orphans all of them). `context` is a short label prefixed
-    /// onto each log line so it's clear which caller triggered the drain.
+    /// true. When `rm_unmap` is set, each is `vm_bind_unmap`'d via RM -- the
+    /// same real RM call VM_BIND's own UNMAP op uses. Pass `false` after
+    /// `ctx_free` has already destroyed the VAS (process exit): a second unmap
+    /// on a stale `h_virt` is a use-after-free in RM. `context` is a short
+    /// label prefixed onto each log line so it's clear which caller triggered
+    /// the drain.
     fn drain_vm_mappings(
         &self,
         context: &str,
         mut matches: impl FnMut(&super::nouveau_uapi::NouveauVmMapping) -> bool,
+        rm_unmap: bool,
     ) -> usize {
         let device_instance = *self.rm_device_instance.lock();
         let stale = {
@@ -7457,7 +7449,18 @@ impl NvidiaGpu {
             drained
         };
         let drained_count = stale.len();
+        if !rm_unmap {
+            if drained_count > 0 {
+                log::info!(
+                    "[nouveau-uapi] {}: dropped {} VM_BIND mapping(s) locally (VAS already freed)",
+                    context,
+                    drained_count
+                );
+            }
+            return drained_count;
+        }
         for mapping in stale {
+            lock::pump();
             let Some(device_instance) = device_instance else {
                 log::warn!(
                     "[nouveau-uapi] {}: VA={:#x} (gem_handle={}) leaked -- GPU not attached to RM, can't vm_bind_unmap",
@@ -7604,6 +7607,7 @@ impl NvidiaGpu {
                                 && m.va < op.addr.wrapping_add(op.range)
                                 && op.addr < m.va.wrapping_add(m.size)
                         },
+                        true,
                     );
                     return Ok(());
                 }
@@ -7639,6 +7643,7 @@ impl NvidiaGpu {
                             && m.va < op.addr.wrapping_add(op.range)
                             && op.addr < m.va.wrapping_add(m.size)
                     },
+                    true,
                 );
                 if replaced > 0 {
                     crate::klog_warn!(
@@ -7744,6 +7749,7 @@ impl NvidiaGpu {
                             && m.va < op.addr.wrapping_add(op.range)
                             && op.addr < m.va.wrapping_add(m.size)
                     },
+                    true,
                 );
                 Ok(())
             }
