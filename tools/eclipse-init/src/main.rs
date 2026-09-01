@@ -143,6 +143,21 @@ const CHILD_ENV: &[&str] = &[
     // renderer's dma-buf feedback), which the `DRM_CAP_ADDFB2_MODIFIERS=0` KMS
     // cap alone may not cover. Belt and braces with that cap.
     "WLR_DRM_NO_MODIFIERS=1",
+    // SDL (sdl12-compat / SDL2 / SDL3) backends, the renderer-independent half
+    // of the session's SDL policy (the labwc wrapper and /etc/profile assert
+    // the same). Video: native Wayland first, X11 as fallback -- Xwayland in
+    // the labwc session, Xorg under desktop=xorg, so ONE list serves both.
+    // SDL2 otherwise picks X11 whenever DISPLAY is set, which with the pin
+    // above is always, sending every SDL app through Xwayland. The comma list
+    // needs SDL >= 2.24 (Alpine ships 2.30+); SDL3 reads the underscored
+    // names. Audio: ALSA is the only userspace audio API this kernel exposes;
+    // pinning it skips the pipewire/pulse socket probes SDL tries first. The
+    // renderer half (SDL_RENDER_DRIVER / SDL_FRAMEBUFFER_ACCELERATION) follows
+    // the compositor renderer and is appended by `build_child_env`.
+    "SDL_VIDEODRIVER=wayland,x11",
+    "SDL_VIDEO_DRIVER=wayland,x11",
+    "SDL_AUDIODRIVER=alsa",
+    "SDL_AUDIO_DRIVER=alsa",
 ];
 
 fn log(msg: &str) {
@@ -889,6 +904,7 @@ fn build_child_env() -> Vec<CString> {
         Renderer::Pixman => {
             env.push(CString::new("WLR_RENDERER=pixman").unwrap());
             env.push(CString::new("WLR_RENDERER_ALLOW_SOFTWARE=1").unwrap());
+            push_sdl_render_env(&mut env, SdlRender::Software);
         }
         Renderer::Gl => {
             if gpu_is_nvidia() {
@@ -925,6 +941,7 @@ fn build_child_env() -> Vec<CString> {
                     // intentionally exercise the GPU path.
                     env.push(CString::new("GALLIUM_DRIVER=zink").unwrap());
                     env.push(CString::new("MESA_LOADER_DRIVER_OVERRIDE=zink").unwrap());
+                    push_sdl_render_env(&mut env, SdlRender::Gles2);
                     log(
                         "renderer=gl: NVIDIA GPU -> pinning GL clients to zink+NVK on explicit experimental path",
                     );
@@ -932,6 +949,7 @@ fn build_child_env() -> Vec<CString> {
                     env.push(CString::new("WLR_RENDERER=pixman").unwrap());
                     env.push(CString::new("WLR_RENDERER_ALLOW_SOFTWARE=1").unwrap());
                     env.push(CString::new("LIBGL_ALWAYS_SOFTWARE=1").unwrap());
+                    push_sdl_render_env(&mut env, SdlRender::Software);
                     log(
                         "renderer=gl: NVIDIA GPU -> defaulting labwc to pixman and clients to software GL; opt into GPU rendering with nvidia.wlr_gles2 or nvidia.wlr_vulkan",
                     );
@@ -955,6 +973,7 @@ fn build_child_env() -> Vec<CString> {
                 env.push(CString::new("WLR_RENDERER=gles2").unwrap());
                 env.push(CString::new("WLR_RENDERER_ALLOW_SOFTWARE=1").unwrap());
                 env.push(CString::new("LIBGL_ALWAYS_SOFTWARE=1").unwrap());
+                push_sdl_render_env(&mut env, SdlRender::Gles2);
                 log("renderer=gl: no NVIDIA GPU (QEMU/virtio) -> degrading to software GL (gl-sw stack: labwc GLES2 + llvmpipe clients)");
             }
         }
@@ -969,10 +988,40 @@ fn build_child_env() -> Vec<CString> {
             env.push(CString::new("WLR_RENDERER=gles2").unwrap());
             env.push(CString::new("WLR_RENDERER_ALLOW_SOFTWARE=1").unwrap());
             env.push(CString::new("LIBGL_ALWAYS_SOFTWARE=1").unwrap());
+            push_sdl_render_env(&mut env, SdlRender::Gles2);
             log("renderer=gl-sw: wlroots GLES2 over Mesa llvmpipe (software GL)");
         }
     }
     env
+}
+
+/// Which SDL render path the session's SDL clients (sdl12-compat, SDL2, SDL3)
+/// should take. Follows the compositor renderer chosen above one-to-one.
+#[derive(Clone, Copy)]
+enum SdlRender {
+    /// pixman session: SDL's CPU renderer, and NO GL behind
+    /// `SDL_GetWindowSurface` (`SDL_FRAMEBUFFER_ACCELERATION=0`). SDL3 then
+    /// blits over wl_shm exactly like foot/lunarbg; SDL2's Wayland backend has
+    /// no shm framebuffer and still presents through EGL, which the session's
+    /// `LIBGL_ALWAYS_SOFTWARE` keeps on llvmpipe.
+    Software,
+    /// gles2 / vulkan sessions: SDL's GLES2 renderer, on the same GL stack the
+    /// compositor uses (zink+NVK on real hardware, llvmpipe under gl-sw). SDL2
+    /// has no Vulkan renderer, so the vulkan session maps here as well.
+    Gles2,
+}
+
+/// Append the renderer half of the SDL policy (the backend half is static, in
+/// [`CHILD_ENV`]). Mirrors the labwc wrapper and /etc/profile: the three copies
+/// must stay in step, or a shell-launched SDL app and an init-launched one would
+/// render through different stacks.
+fn push_sdl_render_env(env: &mut Vec<CString>, mode: SdlRender) {
+    let (driver, fb) = match mode {
+        SdlRender::Software => ("software", "0"),
+        SdlRender::Gles2 => ("opengles2", "opengles2"),
+    };
+    env.push(CString::new(format!("SDL_RENDER_DRIVER={driver}")).unwrap());
+    env.push(CString::new(format!("SDL_FRAMEBUFFER_ACCELERATION={fb}")).unwrap());
 }
 
 fn spawn(argv: &[String], log_path: Option<&str>) -> Option<i32> {

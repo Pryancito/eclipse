@@ -243,6 +243,46 @@ const DEFAULT_PACKAGES: &[&str] = &[
     "alsa-utils",
     // Boot chime (`eclipse-boot-sound` plays /usr/share/eclipse/Eclipse_Awakening.mp3).
     "mpg123",
+    // ── SDL (1.2 / 2 / 3) ───────────────────────────────────────────────────
+    // The SDL family is the toolkit most games, emulators and media players
+    // are written against, and none of it was installed: any SDL binary
+    // failed at `SDL_Init` with "No available video device". Runtime only
+    // (no -dev packages: nothing is compiled on the guest). The session's
+    // SDL policy — which video/render driver each session pins — lives in
+    // the labwc wrapper, /etc/profile and eclipse-init (see desktop.rs
+    // `SDL_ENV_*` and docs/README-desktop.md, "SDL").
+    //
+    //   - sdl2:          libSDL2-2.0.so.0. Alpine builds it with the wayland,
+    //                    x11 AND kmsdrm video drivers, so the same library runs
+    //                    natively on labwc (wl_shm/EGL), on Xwayland/Xorg, or
+    //                    straight on /dev/dri without a compositor. (Where the
+    //                    distro ships `sdl2-compat` -- the SDL2 ABI on top of
+    //                    SDL3 -- it `provides` this name, so listing `sdl2`
+    //                    resolves either way.)
+    //   - sdl3:          libSDL3.so.0, the current API. Matters on the pixman
+    //                    session: SDL3's Wayland backend has a native wl_shm
+    //                    window framebuffer, so SDL_FRAMEBUFFER_ACCELERATION=0
+    //                    + the software renderer touch NO GL at all -- the
+    //                    same pure-shm path foot and lunarbg use. SDL2 lacks
+    //                    that and always presents through EGL (llvmpipe here).
+    //   - sdl12-compat:  the SDL 1.2 ABI (libSDL-1.2.so.0) implemented over
+    //                    SDL2, for the long tail of old games/emulators.
+    //   - sdl2_image/ttf/mixer: the companion libs nearly every SDL2 program
+    //                    links (image decoding, TrueType text, audio mixing).
+    //                    sdl2_mixer's output goes through SDL's audio layer,
+    //                    which the session pins to ALSA (the only userspace
+    //                    audio API this kernel exposes, README-audio.md).
+    //   - libdecor:      client-side decorations for Wayland. labwc offers
+    //                    server-side decorations via xdg-decoration, which SDL
+    //                    prefers when present, so this is only the fallback
+    //                    (and what SDL_VIDEO_WAYLAND_PREFER_LIBDECOR=1 uses).
+    "sdl2",
+    "sdl3",
+    "sdl12-compat",
+    "sdl2_image",
+    "sdl2_ttf",
+    "sdl2_mixer",
+    "libdecor",
 ];
 
 /// Whether the build is running as root (euid 0), via `id -u` — no extra crate
