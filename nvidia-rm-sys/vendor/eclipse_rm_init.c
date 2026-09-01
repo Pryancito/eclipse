@@ -59,8 +59,9 @@
 #include "class/cl0080.h"      /* NV01_DEVICE_0 */
 #include "class/cl0073.h"      /* NV04_DISPLAY_COMMON */
 #include "ctrl/ctrl0073/ctrl0073system.h"    /* GET_SUPPORTED / GET_CONNECT_STATE */
-#include "ctrl/ctrl0073/ctrl0073specific.h"  /* GET_EDID_V2 / SET_OD_PACKET */
+#include "ctrl/ctrl0073/ctrl0073specific.h"  /* GET_EDID_V2 / SET_OD_PACKET / SET_HDMI_ENABLE */
 #include "ctrl/ctrl0073/ctrl0073dfp.h"       /* SET_ELD_AUDIO_CAPS / SET_AUDIO_ENABLE */
+#include "ctrl/ctrl0073/ctrl0073dp.h"        /* DP_SET_AUDIO_MUTESTREAM */
 #include "kernel/gpu/disp/kern_disp.h" /* GPU_GET_KERNEL_DISPLAY + kdispGet* handles */
 #include "class/cl2080.h"      /* NV20_SUBDEVICE_0 */
 #include "class/cl2080_notification.h" /* NV2080_ENGINE_TYPE_GRAPHICS */
@@ -92,6 +93,8 @@
 #include "gpu/mem_mgr/mem_mgr.h"
 #include "gpu/mem_mgr/mem_desc.h"
 #include "gpu/mem_mgr/ce_utils.h"
+#include "kernel/gpu/mem_mgr/channel_utils.h" /* NV_PUSH_* + channelWaitForFreeEntry */
+#include "class/clc5b5.h"      /* TURING_DMA_COPY_A: PITCH_IN/OUT, MULTI_LINE */
 #include "ctrl/ctrl0050.h"
 #include "gpu/bus/kern_bus.h"
 
@@ -5565,20 +5568,51 @@ unlock:
  * and the machine dies in the 8s spinlock-deadlock detector (HOLDER stuck
  * waiting for a TLB ack from the CPU spinning here).  Submitting ASYNC and
  * polling ceutilsUpdateProgress ourselves bounds the damage: 100ms deadline
- * (a healthy full-frame copy is single-digit ms), osDelay(1) between polls
- * so this CPU keeps taking interrupts, NV_ERR_TIMEOUT on expiry.  The Rust
- * caller latches CE-present off for the boot on any failure, so a wedged
- * channel is abandoned rather than re-poked every frame.
+ * (a healthy full-frame copy is well under 1 ms of DMA), NV_ERR_TIMEOUT on
+ * expiry.  Never flags=0 sync wait.  The Rust caller latches CE-present off
+ * for the boot on any failure, so a wedged channel is abandoned rather than
+ * re-poked every frame.
+ *
+ * osDelay(1) is 1 ms granularity -- a healthy copy would pay a full millisecond
+ * on the first poll.  Busy-poll with osSpinLoop (interrupt-friendly, pumps
+ * TLB shootdowns) for the first ~500 µs, then osDelay for the remaining
+ * budget up to 100 ms.
  */
 static NV_STATUS eclipse_ce_wait_bounded(MemoryManager *pMemoryManager, NvU64 submittedWorkId)
 {
-    NvU32 waited_ms = 0;
+    NvU64 startUs = osGetTimestamp(); /* microseconds, freq = 1e6 */
+    NvU32 spins = 0;
+    NvBool pastBusy = NV_FALSE;
+
     while (ceutilsUpdateProgress(pMemoryManager->pCeUtils) < submittedWorkId)
     {
-        if (waited_ms >= 100)
+        NvU64 nowUs = osGetTimestamp();
+
+        if (startUs != 0 && nowUs >= startUs + 100000ULL)
             return NV_ERR_TIMEOUT;
-        osDelay(1);
-        waited_ms++;
+
+        if (!pastBusy)
+        {
+            NvBool stillBusy;
+            if (startUs == 0)
+                stillBusy = (spins < 64U);
+            else
+                stillBusy = ((nowUs - startUs) < 500ULL);
+
+            if (stillBusy)
+            {
+                osSpinLoop();
+                spins++;
+                continue;
+            }
+            pastBusy = NV_TRUE;
+        }
+
+        /* 50 µs ticks: a copy that finished at ~600 µs must not wait until 1.5 ms. */
+        osSpinLoop();
+        osDelayUs(50);
+        if (startUs == 0 && ++spins >= 2000U)
+            return NV_ERR_TIMEOUT;
     }
     return NV_OK;
 }
@@ -6058,22 +6092,167 @@ unlock:
 }
 
 /*
+ * eclipse_ce_submit_pitched_2d -- one native Turing CE 2D copy on the
+ * persistent CeUtils channel.
+ *
+ * channelFillCePb hardcodes MULTI_LINE_ENABLE _FALSE and only programs
+ * LINE_LENGTH_IN = size (1D).  CHANNEL_PB_INFO has no pitch fields, and
+ * the open-gpu-kernel-modules submodule must not be patched, so this
+ * Eclipse-local helper pushes TURING_DMA_COPY (C5B5) methods directly:
+ *   PITCH_IN / PITCH_OUT / LINE_LENGTH_IN / LINE_COUNT
+ *   LAUNCH_DMA SRC/DST_MEMORY_LAYOUT=_PITCH, MULTI_LINE_ENABLE=_TRUE
+ *
+ * Pushbuffer packing is tight: CeUtils CE_METHOD_SIZE_PER_BLOCK is 0x64
+ * (25 dwords).  OFFSET_IN through LINE_COUNT are eight consecutive
+ * methods at 0x400..0x41C, pushed as a single INC-8 to fit SET_OBJECT +
+ * apertures + semaphore + LAUNCH_DMA + host sema in that 100-byte slot.
+ *
+ * Completion: CE one-word semaphore (same finishPayloadOffset as
+ * channelFillCePb) plus HOST sema so GPFIFO entries recycle.  Caller
+ * waits with eclipse_ce_wait_bounded -- never flags=0.
+ */
+static NV_STATUS eclipse_ce_submit_pitched_2d(
+    CeUtils *pCeUtils,
+    NvU64    srcPhys,
+    NvU32    srcPitch,
+    NvU64    dstPhys,
+    NvU32    dstPitch,
+    NvU32    rowBytes,
+    NvU32    lineCount,
+    NvU64   *pSubmittedWorkId)
+{
+    OBJCHANNEL    *pChannel;
+    MemoryManager *pMemoryManager;
+    NV_STATUS      status;
+    NvU32          putIndex = 0;
+    NvU32         *pPtr;
+    NvU32         *pStartPtr;
+    NvU32          methodsLength;
+    NvU32          srcPhysMode;
+    NvU32          dstPhysMode;
+    NvU32          launchDma;
+    NvU32          hostSema;
+    NvU64          semaAddr;
+    NvU32          payload;
+    NvBool         bReleaseMapping = NV_FALSE;
+    NvU32          transferFlags;
+
+    if (pCeUtils == NULL || pCeUtils->pChannel == NULL || pSubmittedWorkId == NULL)
+        return NV_ERR_INVALID_STATE;
+
+    pChannel = pCeUtils->pChannel;
+    pMemoryManager = GPU_GET_MEMORY_MANAGER(pChannel->pGpu);
+    if (pMemoryManager == NULL)
+        return NV_ERR_INVALID_STATE;
+
+    status = channelWaitForFreeEntry(pChannel, &putIndex);
+    if (status != NV_OK)
+        return status;
+
+    payload = (NvU32)(pCeUtils->lastSubmittedPayload + 1U);
+    pCeUtils->lastSubmittedPayload = payload;
+
+    transferFlags = (pChannel->bUseBar1 ? TRANSFER_FLAGS_USE_BAR1 : TRANSFER_FLAGS_NONE) |
+                    TRANSFER_FLAGS_SHADOW_ALLOC |
+                    TRANSFER_FLAGS_SHADOW_INIT_MEM;
+
+    if (pChannel->pbCpuVA == NULL)
+    {
+        pChannel->pbCpuVA = memmgrMemDescBeginTransfer(pMemoryManager,
+                                                       pChannel->pChannelBufferMemdesc,
+                                                       transferFlags);
+        bReleaseMapping = NV_TRUE;
+    }
+    if (pChannel->pbCpuVA == NULL)
+        return NV_ERR_GENERIC;
+
+    pPtr = (NvU32 *)((NvU8 *)pChannel->pbCpuVA +
+                     (putIndex * pChannel->methodSizePerBlock));
+    pStartPtr = pPtr;
+
+    NV_PUSH_INC_1U(RM_SUBCHANNEL, NV906F_SET_OBJECT, pChannel->classEngineID);
+
+    /* SRC: compositor dumb buffer (cached sysmem). DST: console BAR1 (uncached). */
+    srcPhysMode = DRF_DEF(C5B5, _SET_SRC_PHYS_MODE, _TARGET, _COHERENT_SYSMEM);
+    dstPhysMode = DRF_DEF(C5B5, _SET_DST_PHYS_MODE, _TARGET, _NONCOHERENT_SYSMEM);
+    NV_PUSH_INC_2U(RM_SUBCHANNEL,
+                   NVC5B5_SET_SRC_PHYS_MODE, srcPhysMode,
+                   NVC5B5_SET_DST_PHYS_MODE, dstPhysMode);
+
+    NV_PUSH_DATA(NV_PUSH_METHOD(_INC_METHOD, RM_SUBCHANNEL, NVC5B5_OFFSET_IN_UPPER, 8));
+    NV_PUSH_DATA(NvU64_HI32(srcPhys));
+    NV_PUSH_DATA(NvU64_LO32(srcPhys));
+    NV_PUSH_DATA(NvU64_HI32(dstPhys));
+    NV_PUSH_DATA(NvU64_LO32(dstPhys));
+    NV_PUSH_DATA(srcPitch);
+    NV_PUSH_DATA(dstPitch);
+    NV_PUSH_DATA(rowBytes);
+    NV_PUSH_DATA(lineCount);
+
+    NV_PUSH_INC_3U(RM_SUBCHANNEL,
+                   NVC5B5_SET_SEMAPHORE_A,
+                   NvU64_HI32(pChannel->pbGpuVA + pChannel->finishPayloadOffset),
+                   NVC5B5_SET_SEMAPHORE_B,
+                   NvU64_LO32(pChannel->pbGpuVA + pChannel->finishPayloadOffset),
+                   NVC5B5_SET_SEMAPHORE_PAYLOAD, payload);
+
+    launchDma =
+        DRF_DEF(C5B5, _LAUNCH_DMA, _DATA_TRANSFER_TYPE, _NON_PIPELINED) |
+        DRF_DEF(C5B5, _LAUNCH_DMA, _FLUSH_ENABLE, _TRUE) |
+        DRF_DEF(C5B5, _LAUNCH_DMA, _SEMAPHORE_TYPE, _RELEASE_ONE_WORD_SEMAPHORE) |
+        DRF_DEF(C5B5, _LAUNCH_DMA, _SRC_MEMORY_LAYOUT, _PITCH) |
+        DRF_DEF(C5B5, _LAUNCH_DMA, _DST_MEMORY_LAYOUT, _PITCH) |
+        DRF_DEF(C5B5, _LAUNCH_DMA, _MULTI_LINE_ENABLE, _TRUE) |
+        DRF_DEF(C5B5, _LAUNCH_DMA, _SRC_TYPE, _PHYSICAL) |
+        DRF_DEF(C5B5, _LAUNCH_DMA, _DST_TYPE, _PHYSICAL);
+    NV_PUSH_INC_1U(RM_SUBCHANNEL, NVC5B5_LAUNCH_DMA, launchDma);
+
+    hostSema = DRF_DEF(906F, _SEMAPHORED, _OPERATION, _RELEASE) |
+               DRF_DEF(906F, _SEMAPHORED, _RELEASE_SIZE, _4BYTE) |
+               DRF_DEF(906F, _SEMAPHORED, _RELEASE_WFI, _DIS);
+    semaAddr = pChannel->pbGpuVA + pChannel->semaOffset;
+    NV_PUSH_INC_4U(RM_SUBCHANNEL,
+                   NV906F_SEMAPHOREA, NvU64_HI32(semaAddr),
+                   NV906F_SEMAPHOREB, NvU64_LO32(semaAddr),
+                   NV906F_SEMAPHOREC, putIndex,
+                   NV906F_SEMAPHORED, hostSema);
+
+    methodsLength = (NvU32)((NvU8 *)pPtr - (NvU8 *)pStartPtr);
+
+    if (bReleaseMapping)
+    {
+        memmgrMemDescEndTransfer(pMemoryManager, pChannel->pChannelBufferMemdesc,
+                                 transferFlags);
+        pChannel->pbCpuVA = NULL;
+    }
+
+    if (methodsLength == 0 || methodsLength > pChannel->methodSizePerBlock)
+        return NV_ERR_INVALID_STATE;
+
+    status = channelFillGpFifo(pChannel, putIndex, methodsLength);
+    if (status != NV_OK)
+        return status;
+
+    pChannel->lastSubmittedEntry = putIndex;
+    *pSubmittedWorkId = payload;
+    return NV_OK;
+}
+
+/*
  * eclipse_rm_ce_blit_p2p_2d -- pitched 2D variant of eclipse_rm_ce_blit_p2p.
  *
  * Copies `lineCount` rows of `rowBytes` bytes from
  *   srcSysmemPa + r * srcPitch  (cacheable host RAM, compositor dumb buffer)
  * to
  *   dstHostPa   + r * dstPitch  (peer GPU BAR1, ADDR_SYSMEM UNCACHED)
- * for r in [0, lineCount).
+ * for r in [0, lineCount) as a SINGLE C5B5 MULTI_LINE CE launch.
  *
  * This eliminates the CPU staging repack: the CE reads directly from the
  * source buffer (fast cached PCIe DMA) and writes to the console GPU's BAR1
  * (fast GPU-initiated PCIe writes), even when src and dst pitches differ.
  *
- * Each row is submitted as a separate ASYNC CE operation; the CE channel is
- * FIFO, so waiting on the last submitted workId implicitly covers all earlier
- * rows.  The single bounded wait (100 ms deadline, same as eclipse_rm_ce_blit_p2p)
- * satisfies the hard rule: no synchronous RM wait, no unbounded poll.
+ * One ASYNC CE launch, then eclipse_ce_wait_bounded (100 ms deadline).
+ * Never a synchronous RM wait, never a per-row ceutilsMemcopy loop.
  */
 NV_STATUS eclipse_rm_ce_blit_p2p_2d(
     NvU32 gpuInstance,
@@ -6090,11 +6269,13 @@ NV_STATUS eclipse_rm_ce_blit_p2p_2d(
     THREAD_STATE_NODE  threadState;
     GPU_MASK           gpusLockedMask = 0;
     NvU64              lastWorkId     = 0;
-    NvU32              r;
 
     if (rowBytes == 0 || lineCount == 0)
         return NV_ERR_INVALID_ARGUMENT;
     if (rowBytes > srcPitch || rowBytes > dstPitch)
+        return NV_ERR_INVALID_ARGUMENT;
+    /* PitchIn/PitchOut are signed 32-bit in the DMA-copy .mfs. */
+    if (srcPitch > 0x7FFFFFFFU || dstPitch > 0x7FFFFFFFU)
         return NV_ERR_INVALID_ARGUMENT;
 
     threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
@@ -6142,67 +6323,12 @@ NV_STATUS eclipse_rm_ce_blit_p2p_2d(
 
     osFlushCpuWriteCombineBuffer();
 
-    /*
-     * Submit one ASYNC CE copy per row.  Memdescs are "describe" wrappers
-     * (no allocation), so create/destroy inside the loop is cheap.  The CE
-     * channel is strictly FIFO: waiting on the last workId covers all rows.
-     */
-    for (r = 0; r < lineCount; r++)
-    {
-        MEMORY_DESCRIPTOR     *pSrcRow = NULL;
-        MEMORY_DESCRIPTOR     *pDstRow = NULL;
-        CEUTILS_MEMCOPY_PARAMS rp;
-        NvU64 rowSrcPa = srcSysmemPa + (NvU64)r * srcPitch;
-        NvU64 rowDstPa = dstHostPa   + (NvU64)r * dstPitch;
-
-        /* DST: one row of the peer GPU's BAR1, UNCACHED. */
-        status = memdescCreate(&pDstRow, pGpu, rowBytes, 0, NV_TRUE,
-                               ADDR_SYSMEM, NV_MEMORY_UNCACHED, MEMDESC_FLAGS_NONE);
-        if (status != NV_OK)
-        {
-            nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p_2d: DST memdescCreate row %u -> 0x%x\n", r, status);
-            break;
-        }
-        memdescDescribe(pDstRow, ADDR_SYSMEM, rowDstPa, rowBytes);
-
-        /* SRC: one row of the compositor dumb buffer, cacheable host RAM. */
-        status = memdescCreate(&pSrcRow, pGpu, rowBytes, 0, NV_TRUE,
-                               ADDR_SYSMEM, NV_MEMORY_CACHED, MEMDESC_FLAGS_NONE);
-        if (status != NV_OK)
-        {
-            nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p_2d: SRC memdescCreate row %u -> 0x%x\n", r, status);
-            memdescFree(pDstRow);
-            memdescDestroy(pDstRow);
-            break;
-        }
-        memdescDescribe(pSrcRow, ADDR_SYSMEM, rowSrcPa, rowBytes);
-
-        portMemSet(&rp, 0, sizeof(rp));
-        rp.pSrcMemDesc = pSrcRow;
-        rp.pDstMemDesc = pDstRow;
-        rp.srcOffset   = 0;
-        rp.dstOffset   = 0;
-        rp.length      = rowBytes;
-        rp.flags       = NV0050_CTRL_MEMCOPY_FLAGS_ASYNC;
-
-        status = ceutilsMemcopy(pMemoryManager->pCeUtils, &rp);
-        if (status == NV_OK)
-            lastWorkId = rp.submittedWorkId;
-
-        memdescFree(pSrcRow);
-        memdescDestroy(pSrcRow);
-        memdescFree(pDstRow);
-        memdescDestroy(pDstRow);
-
-        if (status != NV_OK)
-        {
-            nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p_2d: ceutilsMemcopy row %u -> 0x%x\n", r, status);
-            break;
-        }
-    }
-
-    /* Single bounded poll for all rows (CE is FIFO: last workId >= all rows). */
-    if (status == NV_OK && lastWorkId != 0)
+    status = eclipse_ce_submit_pitched_2d(pMemoryManager->pCeUtils,
+                                          srcSysmemPa, srcPitch,
+                                          dstHostPa, dstPitch,
+                                          rowBytes, lineCount,
+                                          &lastWorkId);
+    if (status == NV_OK)
         status = eclipse_ce_wait_bounded(pMemoryManager, lastWorkId);
 
     /* Rate-limit: this ran every present and a ~120-char serial line is
@@ -6211,8 +6337,8 @@ NV_STATUS eclipse_rm_ce_blit_p2p_2d(
         static NvU32 s_n = 0;
         NvU32 n = ++s_n;
         if (status != NV_OK || n <= 2 || (n % 64U) == 0)
-            nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p_2d: %u/%u rows submitted, lastWorkId=%llu -> 0x%x\n",
-                      (status == NV_OK) ? lineCount : r, lineCount, lastWorkId, status);
+            nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p_2d: 1 launch rowBytes=%u lines=%u srcPitch=%u dstPitch=%u workId=%llu -> 0x%x\n",
+                      rowBytes, lineCount, srcPitch, dstPitch, lastWorkId, status);
     }
 
 unlock:
@@ -6656,13 +6782,15 @@ unlock:
  *   1. GET_EDID_V2 for the display,
  *   2. build the ELD (same nvkms FillELDBuffer layout) from the EDID's
  *      CEA-861 extension (SADs, speaker allocation, monitor name),
- *   3. NV0073_CTRL_CMD_DFP_SET_ELD_AUDIO_CAPS with PD=1, ELDV=1,
+ *   3. HDMI: NV0073_CTRL_CMD_SPECIFIC_SET_HDMI_ENABLE (audio engine),
+ *   4. NV0073_CTRL_CMD_DFP_SET_ELD_AUDIO_CAPS with PD=1, ELDV=1,
  *      deviceEntry 0 (the SST/HDMI default entry, see nvkms
  *      GetAudioDeviceEntry),
- *   4. NV0073_CTRL_CMD_DFP_SET_AUDIO_ENABLE (audio stream packets on),
- *   5. for HDMI (TMDS) outputs, a General Control Packet un-mute via
- *      NV0073_CTRL_CMD_SPECIFIC_SET_OD_PACKET (nvkms EnableHdmiAudio).
- * Steps 4/5 are best-effort: statuses are reported, not fatal.
+ *   5. NV0073_CTRL_CMD_DFP_SET_AUDIO_ENABLE (audio stream packets on),
+ *   6. HDMI: SET_HDMI_AUDIO_MUTESTREAM unmute + GCP un-mute
+ *      (nvkms EnableHdmiAudio / SetHdmiAudioMute); DP: DP_SET_AUDIO_MUTESTREAM
+ *      unmute (nvkms SetDpAudioEnable).
+ * Steps 5/6 are best-effort: statuses are reported, not fatal.
  * =================================================================== */
 typedef struct EclipseHdmiAudioOut
 {
@@ -6888,6 +7016,21 @@ NV_STATUS eclipse_rm_hdmi_audio(NvU32 gpuInstance, NvU32 displayMask,
 
         pOut->attemptedMask |= did;
 
+        /* nvkms HdmiSendEnable: turn on the HDMI audio engine before ELD. */
+        if (isHdmi)
+        {
+            NV0073_CTRL_SPECIFIC_SET_HDMI_ENABLE_PARAMS he;
+            NV_STATUS hst;
+            portMemSet(&he, 0, sizeof(he));
+            he.displayId = did;
+            he.enable = NV0073_CTRL_SPECIFIC_SET_HDMI_ENABLE_TRUE;
+            hst = pRmApi->Control(pRmApi, hDispClient, hDispCommon,
+                                  NV0073_CTRL_CMD_SPECIFIC_SET_HDMI_ENABLE,
+                                  &he, sizeof(he));
+            nv_printf(0, "[eclipse-rm-trace] hdmi-audio: SET_HDMI_ENABLE id=0x%x -> 0x%x\n",
+                      did, hst);
+        }
+
         ep = portMemAllocNonPaged(sizeof(*ep));
         if (ep == NULL)
             continue;
@@ -6936,13 +7079,28 @@ NV_STATUS eclipse_rm_hdmi_audio(NvU32 gpuInstance, NvU32 displayMask,
 
             if (isHdmi)
             {
-                /* GCP audio/video un-mute (nvkms EnableHdmiAudio). */
+                NV0073_CTRL_CMD_SPECIFIC_SET_HDMI_AUDIO_MUTESTREAM_PARAMS hm;
                 NV0073_CTRL_SPECIFIC_SET_OD_PACKET_PARAMS op;
+
+                portMemSet(&hm, 0, sizeof(hm));
+                hm.displayId = did;
+                hm.mute = NV0073_CTRL_SPECIFIC_SET_HDMI_AUDIO_MUTESTREAM_FALSE;
+                st = pRmApi->Control(pRmApi, hDispClient, hDispCommon,
+                                     NV0073_CTRL_CMD_SPECIFIC_SET_HDMI_AUDIO_MUTESTREAM,
+                                     &hm, sizeof(hm));
+                nv_printf(0, "[eclipse-rm-trace] hdmi-audio: SET_HDMI_AUDIO_MUTESTREAM unmute id=0x%x -> 0x%x\n",
+                          did, st);
+
+                /* GCP audio/video un-mute (nvkms EnableHdmiAudio). */
                 portMemSet(&op, 0, sizeof(op));
                 op.displayId = did;
-                op.transmitControl = DRF_DEF(0073_CTRL_SPECIFIC,
-                                             _SET_OD_PACKET_TRANSMIT_CONTROL,
-                                             _ENABLE, _YES);
+                op.transmitControl =
+                    DRF_DEF(0073_CTRL_SPECIFIC, _SET_OD_PACKET_TRANSMIT_CONTROL, _ENABLE, _YES) |
+                    DRF_DEF(0073_CTRL_SPECIFIC, _SET_OD_PACKET_TRANSMIT_CONTROL, _OTHER_FRAME, _DISABLE) |
+                    DRF_DEF(0073_CTRL_SPECIFIC, _SET_OD_PACKET_TRANSMIT_CONTROL, _SINGLE_FRAME, _DISABLE) |
+                    DRF_DEF(0073_CTRL_SPECIFIC, _SET_OD_PACKET_TRANSMIT_CONTROL, _ON_HBLANK, _DISABLE) |
+                    DRF_DEF(0073_CTRL_SPECIFIC, _SET_OD_PACKET_TRANSMIT_CONTROL, _VIDEO_FMT, _SW_CONTROLLED) |
+                    DRF_DEF(0073_CTRL_SPECIFIC, _SET_OD_PACKET_TRANSMIT_CONTROL, _RESERVED_LEGACY_MODE, _NO);
                 op.packetSize = 10;
                 op.aPacket[0] = 0x03; /* pktType_GeneralControl */
                 op.aPacket[3] = 0x10; /* HDMI_GENCTRL_PACKET_MUTE_DISABLE */
@@ -6954,10 +7112,22 @@ NV_STATUS eclipse_rm_hdmi_audio(NvU32 gpuInstance, NvU32 displayMask,
                 nv_printf(0, "[eclipse-rm-trace] hdmi-audio: GCP unmute id=0x%x -> 0x%x\n",
                           did, st);
             }
+            else
+            {
+                NV0073_CTRL_DP_SET_AUDIO_MUTESTREAM_PARAMS dm;
+                portMemSet(&dm, 0, sizeof(dm));
+                dm.displayId = did;
+                dm.mute = NV0073_CTRL_DP_AUDIO_MUTESTREAM_MUTE_DISABLE;
+                st = pRmApi->Control(pRmApi, hDispClient, hDispCommon,
+                                     NV0073_CTRL_CMD_DP_SET_AUDIO_MUTESTREAM,
+                                     &dm, sizeof(dm));
+                nv_printf(0, "[eclipse-rm-trace] hdmi-audio: DP_SET_AUDIO_MUTESTREAM unmute id=0x%x -> 0x%x\n",
+                          did, st);
+            }
         }
         else
         {
-            nv_printf(0, "[eclipse-rm-trace] hdmi-audio: GET_EDID id=0x%x failed — skipping\n", did);
+            nv_printf(0, "[eclipse-rm-trace] hdmi-audio: GET_EDID id=0x%x failed — skipping ELD\n", did);
         }
         portMemFree(ep);
     }

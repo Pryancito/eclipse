@@ -810,41 +810,50 @@ const _: () = {
     assert!(size_of::<DrmSyncobjTransfer>() == 32); // DRM_IOCTL_SYNCOBJ_TRANSFER 0x..20..
 };
 
+/// Pixel clock (kHz) so Mesa/wlroots millihertz lands on `refresh_mhz`:
+/// `refresh_mHz = (clock * 1_000_000 / htotal + vtotal/2) / vtotal`.
+fn clock_khz_for_refresh_mhz(htotal: u32, vtotal: u32, refresh_mhz: u32) -> u32 {
+    if htotal == 0 || vtotal == 0 {
+        return 0;
+    }
+    let target = refresh_mhz as u64 * vtotal as u64 - (vtotal as u64 / 2);
+    let clock = (target.saturating_mul(htotal as u64) + 999_999) / 1_000_000;
+    clock.max(1) as u32
+}
+
 /// Build a `struct drm_mode_modeinfo` (68 bytes) for a simple 60 Hz mode at
 /// `w`x`h`. Timings are nominal — a software framebuffer never programs real CRT
-/// timings — but wlroots needs a populated, "preferred" mode to drive output.
+/// timings — but they must be *valid*: `hdisplay < hsync_start < hsync_end <
+/// htotal` (and the vertical analogue). The previous +10%/+5% blanking put
+/// `hsync_end > htotal` at 1366×768, which is MODE_H_ILLEGAL; compositors that
+/// recompute refresh from the porches then advertised ~55–59 Hz instead of 60.
 fn make_modeinfo(w: u32, h: u32) -> [u8; 68] {
     let mut m = [0u8; 68];
-    let refresh: u32 = 60;
-    // Standard blanking: add 10 % horizontal and 5 % vertical blanking so the
-    // pixel clock matches what wlroots expects (clock ≈ htotal * vtotal * refresh
-    // / 1000 kHz).  Using only the active area gives an unusably low clock and
-    // a calculated refresh of 59.xxx Hz rather than the 59.999 wlroots logs.
-    let htotal = (w * 11 / 10) as u16; // +10 % H blanking
-    let vtotal = (h * 21 / 20) as u16; // +5 % V blanking
-    let clock = (htotal as u64 * vtotal as u64 * refresh as u64 / 1000) as u32; // kHz
+    let hdisplay = w as u16;
+    let vdisplay = h as u16;
+    // Fixed porches, always strictly increasing for any GOP-sized mode.
+    let hsync_start = hdisplay.saturating_add(48);
+    let hsync_end = hsync_start.saturating_add(32);
+    let htotal = hsync_end.saturating_add(80);
+    let vsync_start = vdisplay.saturating_add(3);
+    let vsync_end = vsync_start.saturating_add(6);
+    let vtotal = vsync_end.saturating_add(32);
+    let clock = clock_khz_for_refresh_mhz(htotal as u32, vtotal as u32, 60_000);
     m[0..4].copy_from_slice(&clock.to_ne_bytes());
-    let wh = w as u16;
-    m[4..6].copy_from_slice(&wh.to_ne_bytes()); // hdisplay
-                                                // hsync_start / hsync_end / htotal: use simple 10 % blanking
-    let hsync_start = (w + w / 16) as u16;
-    let hsync_end = (w + w / 8) as u16;
+    m[4..6].copy_from_slice(&hdisplay.to_ne_bytes());
     m[6..8].copy_from_slice(&hsync_start.to_ne_bytes());
     m[8..10].copy_from_slice(&hsync_end.to_ne_bytes());
     m[10..12].copy_from_slice(&htotal.to_ne_bytes());
     // hskew @12..14 = 0
-    let hh = h as u16;
-    m[14..16].copy_from_slice(&hh.to_ne_bytes()); // vdisplay
-                                                  // vsync_start / vsync_end / vtotal: use simple 5 % blanking
-    let vsync_start = (h + h / 40) as u16;
-    let vsync_end = (h + h / 20) as u16;
+    m[14..16].copy_from_slice(&vdisplay.to_ne_bytes());
     m[16..18].copy_from_slice(&vsync_start.to_ne_bytes());
     m[18..20].copy_from_slice(&vsync_end.to_ne_bytes());
     m[20..22].copy_from_slice(&vtotal.to_ne_bytes());
     // vscan @22..24 = 0
-    m[24..28].copy_from_slice(&refresh.to_ne_bytes()); // vrefresh
-                                                       // flags @28..32 = 0
-                                                       // type @32..36: DRM_MODE_TYPE_DRIVER(0x40) | DRM_MODE_TYPE_PREFERRED(0x08)
+    m[24..28].copy_from_slice(&60u32.to_ne_bytes()); // vrefresh (Hz)
+                                                     // flags @28..32: NHSYNC (1<<1) | PVSYNC (1<<3), typical CVT polarity
+    m[28..32].copy_from_slice(&0x0Au32.to_ne_bytes());
+    // type @32..36: DRM_MODE_TYPE_DRIVER(0x40) | DRM_MODE_TYPE_PREFERRED(0x08)
     m[32..36].copy_from_slice(&0x48u32.to_ne_bytes());
     // name @36..68 ("WxH")
     let mut name = [0u8; 32];

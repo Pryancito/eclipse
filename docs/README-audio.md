@@ -33,9 +33,13 @@ HDA controller (PCI 04:03) ── codec ── pin ── HDMI/DP or analog jack
   every stream start** (`repick_path`), because on NVIDIA GPUs presence/ELD
   only appear on the pins after the display driver pushes the monitor's ELD,
   long after this driver's PCI probe.
-- **HDMI specifics**: digital converter enable, channel-count verb, CEA
-  audio infoframe through the pin's DIP buffer, and the NVIDIA coherent-DMA
+- **HDMI specifics**: digital converter enable, `SET_CVT_CHAN_COUNT`
+  (`0x72d`) + HDMI channel slots, CEA audio infoframe through the pin's
+  DIP buffer (reindexed every 8 bytes), and the NVIDIA coherent-DMA
   (snoop) PCI config bits.
+
+On boot, `eclipse-boot-sound` plays `/usr/share/eclipse/Eclipse_Awakening.mp3`
+once the compositor is up (`mpg123` via ALSA card 0).
 
 ## The display side (NVIDIA GPUs)
 
@@ -50,11 +54,12 @@ backed by `eclipse_rm_hdmi_audio` in `nvidia-rm-sys/vendor/eclipse_rm_init.c`):
 1. `GET_EDID_V2` for each connected output;
 2. build the ELD (same layout as nvkms `FillELDBuffer`) from the EDID's
    CEA-861 extension — SADs, speaker allocation, monitor name;
-3. `NV0073_CTRL_CMD_DFP_SET_ELD_AUDIO_CAPS` with PD=1/ELDV=1, device
+3. HDMI: `SET_HDMI_ENABLE` (audio engine, nvkms `HdmiSendEnable`);
+4. `NV0073_CTRL_CMD_DFP_SET_ELD_AUDIO_CAPS` with PD=1/ELDV=1, device
    entry 0 — after this the HDA pin reports present + ELD valid;
-4. `NV0073_CTRL_CMD_DFP_SET_AUDIO_ENABLE` — audio stream packets on;
-5. for HDMI (TMDS) outputs, a General Control Packet un-mute via
-   `NV0073_CTRL_CMD_SPECIFIC_SET_OD_PACKET`.
+5. `NV0073_CTRL_CMD_DFP_SET_AUDIO_ENABLE` — audio stream packets on;
+6. HDMI: `SET_HDMI_AUDIO_MUTESTREAM` unmute + GCP via `SET_OD_PACKET`;
+   DP: `DP_SET_AUDIO_MUTESTREAM` unmute.
 
 Watch for `[hdmi-audio]` lines in dmesg; `[hda]` lines show each codec's
 candidate paths with their live presence/ELD state.
@@ -176,6 +181,6 @@ so you can hear the guest. Override with `AUDIODEV=wav` (PCM to
   next `write`.
 - The DP audio path uses the same ELD/enable controls but has not been
   exercised; DP-MST audio (device entries > 0) is not implemented.
-- The HDMI un-mute GCP is sent once at enable time; a monitor that is
-  hot-plugged later gets ELD/PD only when something re-runs the display
-  query (`/proc/gpuedid` or a DRM connector rescan).
+- The HDMI/DP unmute is sent once a connected output's ELD push succeeds;
+  a monitor that is hot-plugged later gets ELD/PD only when something
+  re-runs the display query (`/proc/gpuedid` or a DRM connector rescan).

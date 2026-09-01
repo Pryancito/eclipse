@@ -31,4 +31,11 @@ impl DisplayScheme for UefiDisplay {
             FrameBuffer::from_raw_parts_mut(self.info.fb_base_vaddr as *mut u8, self.info.fb_size)
         }
     }
+
+    /// GOP lives in the console GPU BAR1 (or a PAT-WC identity map of it).
+    /// NT stores are the CPU blit fallback when the copy engine is wedged.
+    #[inline]
+    fn fb_write_combining(&self) -> bool {
+        true
+    }
 }

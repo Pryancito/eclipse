@@ -150,12 +150,12 @@ pub extern "C" fn os_get_monotonic_tick_resolution_ns() -> NvU64 {
 }
 #[no_mangle]
 pub extern "C" fn os_delay(milliseconds: NvU32) -> NV_STATUS {
-    with_hooks((), |h| h.delay_us(milliseconds.saturating_mul(1000)));
+    crate::hooks::delay_us_or_spin(milliseconds.saturating_mul(1000));
     NV_OK
 }
 #[no_mangle]
 pub extern "C" fn os_delay_us(microseconds: NvU32) -> NV_STATUS {
-    with_hooks((), |h| h.delay_us(microseconds));
+    crate::hooks::delay_us_or_spin(microseconds);
     NV_OK
 }
 /// Real: TSC frequency in Hz, calibrated once against the hook-provided

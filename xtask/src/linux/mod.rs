@@ -1984,9 +1984,81 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         )
         .unwrap();
 
+        // Boot chime: play once after the session is up so NVIDIA HDMI audio
+        // (ELD/SET_HDMI_ENABLE) has had a DRM query. Oneshot wrapper forks
+        // mpg123 and exits so init is not blocked for the length of the track.
+        fs::write(
+            svc_dir.join("boot-sound.service"),
+            b"# Startup MP3 (Eclipse_Awakening). See /usr/local/bin/eclipse-boot-sound.\n\
+              exec = /usr/local/bin/eclipse-boot-sound\n\
+              type = oneshot\n\
+              after = lunarbar\n\
+              wait_socket = /run/user/0/wayland-0\n\
+              desktop = labwc\n\
+              log = /tmp/boot-sound.log\n",
+        )
+        .unwrap();
+        fs::write(
+            svc_dir.join("boot-sound-xorg.service"),
+            b"# Startup MP3 under the Xorg session.\n\
+              exec = /usr/local/bin/eclipse-boot-sound\n\
+              type = oneshot\n\
+              after = xorg\n\
+              desktop = xorg\n\
+              log = /tmp/boot-sound.log\n",
+        )
+        .unwrap();
+
         // The two init wrappers (the labwc one is written by desktop.rs).
         let localbin = rootfs.join("usr").join("local").join("bin");
         let _ = fs::create_dir_all(&localbin);
+        fs::write(
+            localbin.join("eclipse-boot-sound"),
+            b"#!/bin/sh\n\
+              # Detach so the oneshot does not hold up lunarbar/xkbmap.\n\
+              setsid /usr/local/bin/eclipse-boot-sound-play </dev/null >>/tmp/boot-sound.log 2>&1 &\n\
+              exit 0\n",
+        )
+        .unwrap();
+        fs::write(
+            localbin.join("eclipse-boot-sound-play"),
+            b"#!/bin/sh\n\
+              # Wait for a PCM, unmute, play the startup MP3 once.\n\
+              MP3=/usr/share/eclipse/Eclipse_Awakening.mp3\n\
+              [ -f \"$MP3\" ] || { echo \"eclipse-boot-sound: missing $MP3\" >&2; exit 0; }\n\
+              i=0\n\
+              while [ \"$i\" -lt 20 ]; do\n\
+              \x20 if [ -e /dev/snd/pcmC0D0p ] || [ -e /dev/dsp ]; then\n\
+              \x20\x20 break\n\
+              \x20 fi\n\
+              \x20 i=$((i + 1))\n\
+              \x20 sleep 1\n\
+              done\n\
+              if [ ! -e /dev/snd/pcmC0D0p ] && [ ! -e /dev/dsp ]; then\n\
+              \x20 echo 'eclipse-boot-sound: no PCM device' >&2\n\
+              \x20 exit 0\n\
+              fi\n\
+              # Compositor DRM query enables NVIDIA HDMI packets; give it a beat.\n\
+              sleep 2\n\
+              command -v amixer >/dev/null 2>&1 && amixer -q set Master 70% unmute 2>/dev/null\n\
+              if command -v mpg123 >/dev/null 2>&1; then\n\
+              \x20 exec mpg123 -q \"$MP3\"\n\
+              fi\n\
+              echo 'eclipse-boot-sound: mpg123 not installed' >&2\n\
+              exit 0\n",
+        )
+        .unwrap();
+        let share = rootfs.join("usr").join("share").join("eclipse");
+        let _ = fs::create_dir_all(&share);
+        let mp3_src = PROJECT_DIR
+            .join("assets")
+            .join("audio")
+            .join("Eclipse_Awakening.mp3");
+        if mp3_src.is_file() {
+            let _ = fs::copy(&mp3_src, share.join("Eclipse_Awakening.mp3"));
+        } else {
+            eprintln!("warning: assets/audio/Eclipse_Awakening.mp3 missing; boot sound disabled");
+        }
         fs::write(
             localbin.join("eclipse-udhcpc"),
             b"#!/bin/sh\n\
@@ -2193,6 +2265,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                 "eclipse-xorg",
                 "eclipse-lunarbg",
                 "eclipse-lunarbar",
+                "eclipse-boot-sound",
+                "eclipse-boot-sound-play",
             ] {
                 let _ = fs::set_permissions(localbin.join(w), fs::Permissions::from_mode(0o755));
             }
@@ -2206,7 +2280,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let _ = fs::create_dir_all(&eclipse_etc);
         fs::write(eclipse_etc.join("desktop"), b"labwc\n").unwrap();
 
-        println!("Installed eclipse-init as PID 1 with udhcpc, seatd, labwc and xorg services.");
+        println!("Installed eclipse-init as PID 1 with udhcpc, seatd, labwc, xorg and boot-sound services.");
         true
     }
 

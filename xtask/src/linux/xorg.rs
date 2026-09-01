@@ -241,6 +241,8 @@ const DEFAULT_PACKAGES: &[&str] = &[
     // brings aplay/amixer/speaker-test for testing.
     "alsa-lib",
     "alsa-utils",
+    // Boot chime (`eclipse-boot-sound` plays /usr/share/eclipse/Eclipse_Awakening.mp3).
+    "mpg123",
 ];
 
 /// Whether the build is running as root (euid 0), via `id -u` — no extra crate

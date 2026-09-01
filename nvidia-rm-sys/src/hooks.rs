@@ -47,3 +47,24 @@ pub(crate) fn with_hooks<R>(default: R, f: impl FnOnce(&dyn KernelHooks) -> R) -
         None => default,
     }
 }
+
+/// Busy-wait `us` microseconds, pumping TLB shootdowns.
+///
+/// Prefer this (via `osDelayUs` / `osDelayNs`) over `osDelay(1)` for
+/// CE-completion polls: a finished copy otherwise still burns a full
+/// millisecond tick. `us == 0` is a yield-only call (`osSchedule`).
+pub(crate) fn delay_us_or_spin(us: u32) {
+    if us == 0 {
+        lock::pump();
+        return;
+    }
+    if with_hooks(false, |h| {
+        h.delay_us(us);
+        true
+    }) {
+        return;
+    }
+    // No timer hook (early boot / smoketest): still yield so a caller
+    // spinning on CE progress cannot starve TLB shootdowns.
+    lock::pump();
+}

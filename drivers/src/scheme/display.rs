@@ -199,6 +199,16 @@ pub trait DisplayScheme: Scheme {
         AccelCaps::default()
     }
 
+    /// True when the scanout framebuffer is write-combining (UEFI GOP / GPU
+    /// BAR1). The generic [`blit_from`](Self::blit_from) then uses
+    /// `MOVNTDQ` stores. Leave `false` for RAM framebuffers (virtio-gpu,
+    /// QEMU software KMS on a host-shared buffer) so the scalar copy stays
+    /// cache-friendly.
+    #[inline]
+    fn fb_write_combining(&self) -> bool {
+        false
+    }
+
     /// Write pixel color.
     #[inline]
     fn draw_pixel(&self, x: u32, y: u32, color: RgbColor) {
@@ -304,10 +314,10 @@ pub trait DisplayScheme: Scheme {
     /// `src` is row-major with `src_stride` pixels per row; only the top-left
     /// `width` x `height` window is used. This is the workhorse of the
     /// double-buffered console: drawing happens in cached RAM and the dirty
-    /// region is pushed here in bulk. The generic version copies whole rows at a
-    /// time (a single `copy_from_slice` per row for ARGB8888), which is friendly
-    /// to write-combining GPU memory. Drivers may override to use DMA / a copy
-    /// engine.
+    /// region is pushed here in bulk. On a write-combining GOP/BAR1 destination
+    /// the generic path uses `MOVNTDQ` stores (see [`fb_write_combining`]);
+    /// otherwise it copies whole rows with `copy_from_slice`. Drivers may
+    /// override to use DMA / a copy engine.
     fn blit_from(
         &self,
         dst_x: u32,
@@ -328,16 +338,37 @@ pub trait DisplayScheme: Scheme {
         if info.format == ColorFormat::ARGB8888 {
             let mut fb = self.fb();
             let buf: &mut [u8] = &mut fb;
+            let width_bytes = w * 4;
+            let dst_base = dst_y as usize * pitch + dst_x as usize * 4;
+            let last_src = (h - 1).saturating_mul(src_stride).saturating_add(w);
+            let last_dst = dst_base
+                .saturating_add((h - 1).saturating_mul(pitch))
+                .saturating_add(width_bytes);
+            if self.fb_write_combining()
+                && crate::utils::dma_sync::has_nt_blit()
+                && last_src <= src.len()
+                && last_dst <= buf.len()
+                && crate::utils::dma_sync::nt_store_rows(
+                    unsafe { buf.as_mut_ptr().add(dst_base) },
+                    pitch,
+                    src.as_ptr() as *const u8,
+                    src_stride * 4,
+                    width_bytes,
+                    h,
+                )
+            {
+                return;
+            }
             for r in 0..h {
                 let src_off = r * src_stride;
                 if src_off + w > src.len() {
                     break;
                 }
                 let src_bytes = unsafe {
-                    core::slice::from_raw_parts(src[src_off..].as_ptr() as *const u8, w * 4)
+                    core::slice::from_raw_parts(src[src_off..].as_ptr() as *const u8, width_bytes)
                 };
                 let d = (dst_y as usize + r) * pitch + dst_x as usize * 4;
-                let d_end = d + w * 4;
+                let d_end = d + width_bytes;
                 if d_end > buf.len() {
                     break;
                 }

@@ -63,8 +63,13 @@ const REG_RIRBLBASE: usize = 0x50;
 const REG_RIRBUBASE: usize = 0x54;
 const REG_RIRBWP: usize = 0x58; // u16: write pointer, write bit15 to reset
 const REG_RINTCNT: usize = 0x5a; // u16
-const REG_RIRBCTL: usize = 0x5c; // u8: bit1 = DMA run
+const REG_RIRBCTL: usize = 0x5c; // u8: bit0 = IRQ_EN, bit1 = DMA run
+const REG_RIRBSTS: usize = 0x5d; // u8: write-1-to-clear IRQ/overrun
 const REG_RIRBSIZE: usize = 0x5e; // u8
+const RIRBCTL_IRQ_EN: u8 = 1 << 0;
+const RIRBCTL_DMA_EN: u8 = 1 << 1;
+const RIRBSTS_IRQ: u8 = 1 << 0;
+const RIRBSTS_OVERRUN: u8 = 1 << 2;
 const REG_SD_BASE: usize = 0x80; // stream descriptors, 0x20 bytes each
 
 // Stream descriptor register offsets (from the descriptor base).
@@ -92,7 +97,9 @@ const VERB_GET_CONFIG_DEFAULT: u32 = 0xf1c;
 const VERB_SET_DIP_INDEX: u32 = 0x730;
 const VERB_SET_DIP_DATA: u32 = 0x731;
 const VERB_SET_DIP_XMIT: u32 = 0x732;
-const VERB_SET_CVT_CHAN_COUNT: u32 = 0x733;
+/// AC_VERB_SET_CVT_CHAN_COUNT. 0x733 is SET_HDMI_CP_CTRL — do not mix them.
+const VERB_SET_CVT_CHAN_COUNT: u32 = 0x72d;
+const VERB_SET_HDMI_CHAN_SLOT: u32 = 0x734;
 
 // GET_PARAMETER ids.
 const PAR_VENDOR_ID: u32 = 0x00;
@@ -249,9 +256,20 @@ pub struct HdaDevice {
 }
 
 impl HdaInner {
+    /// QEMU's intel-hda pauses CORB DMA once `rirb_count == RINTCNT` and only
+    /// resumes when the guest write-1-clears `RIRBSTS.IRQ`. Hardware does not
+    /// stall that way, but the ack is the documented Linux path either way.
+    /// Without it, the first codec verb succeeds and every later one times out
+    /// — probe fails, `/dev/snd` is never created, `aplay -l` is empty.
+    fn ack_rirb(&self) {
+        mmio_w8(self.bar, REG_RIRBSTS, RIRBSTS_IRQ | RIRBSTS_OVERRUN);
+    }
+
     // ── Codec verb transport (CORB/RIRB, polled) ────────────────────────────
     fn corb_cmd(&mut self, verb: u32) -> DeviceResult<u32> {
         let bar = self.bar;
+        // Unstick a previous RINTCNT stall before ringing the doorbell.
+        self.ack_rirb();
         let wp = (mmio_r16(bar, REG_CORBWP) as usize + 1) % self.corb_entries;
         unsafe { write_volatile((self.corb_va + wp * 4) as *mut u32, verb) };
         clflush_range(self.corb_va + wp * 4, 4);
@@ -269,12 +287,15 @@ impl HdaInner {
                 let ext = unsafe { read_volatile((entry_va + 4) as *const u32) };
                 if ext & (1 << 4) != 0 {
                     // Unsolicited response (jack events) — not ours, keep going.
+                    self.ack_rirb();
                     continue;
                 }
+                self.ack_rirb();
                 return Ok(resp);
             }
             if timer_now_as_micros().wrapping_sub(start) > VERB_TIMEOUT_US {
-                warn!("[hda] verb {:#010x} timed out", verb);
+                error!("[hda] verb {:#010x} timed out", verb);
+                self.ack_rirb();
                 return Err(DeviceError::IoError);
             }
             core::hint::spin_loop();
@@ -415,6 +436,9 @@ impl HdaInner {
         let conv = self.conv_nid;
         self.cmd16(conv, 0x2, fmt as u32)?;
         self.cmd(conv, VERB_SET_STREAM_ID, self.stream_tag << 4)?;
+        if self.digital {
+            self.setup_digital_converter(self.channels);
+        }
 
         fence(Ordering::SeqCst);
         // Tag + RUN.
@@ -595,27 +619,33 @@ impl HdaInner {
 
     /// Re-evaluate the candidate paths and re-route if a better pin has
     /// appeared (e.g. the display driver pushed the monitor's ELD after our
-    /// PCI-probe-time pick). Called with the stream stopped.
+    /// PCI-probe-time pick). Called with the stream stopped. Even a single
+    /// candidate is re-armed: NVIDIA presence/ELD arrive long after probe,
+    /// and the digital converter/infoframe need a second pass.
     fn repick_path(&mut self) {
-        if self.candidates.len() < 2 {
-            return;
-        }
         let afg = self.afg;
-        if let Some(best) = self.best_candidate() {
-            if best.pin != self.pin_nid {
-                info!(
-                    "[hda] re-routing output: pin {:#x} -> pin {:#x}",
-                    self.pin_nid, best.pin
-                );
-                if let Err(e) = self.setup_path(afg, &best) {
-                    warn!("[hda] re-route failed: {:?} — keeping previous path", e);
-                }
+        let Some(best) = self.best_candidate() else {
+            return;
+        };
+        if best.pin != self.pin_nid || best.conv != self.conv_nid {
+            info!(
+                "[hda] re-routing output: pin {:#x} -> pin {:#x}",
+                self.pin_nid, best.pin
+            );
+            if let Err(e) = self.setup_path(afg, &best) {
+                warn!("[hda] re-route failed: {:?} — keeping previous path", e);
             }
+        } else if best.digital {
+            self.setup_digital_converter(self.channels);
         }
     }
 
     /// Power up and route the chosen path.
     fn setup_path(&mut self, afg: u32, path: &OutPath) -> DeviceResult {
+        let old_conv = self.conv_nid;
+        if old_conv != 0 && old_conv != path.conv {
+            let _ = self.cmd(old_conv, VERB_SET_STREAM_ID, 0);
+        }
         self.conv_nid = path.conv;
         self.pin_nid = path.pin;
         self.digital = path.digital;
@@ -647,31 +677,48 @@ impl HdaInner {
         }
 
         if path.digital {
-            // Enable the digital converter and declare 2 channels.
-            self.cmd(path.conv, VERB_SET_DIGI_CVT1, 0x1)?;
-            let _ = self.cmd(path.conv, VERB_SET_CVT_CHAN_COUNT, 1);
-            self.send_audio_infoframe(2);
+            self.setup_digital_converter(2);
         }
         Ok(())
+    }
+
+    /// Digital converter + HDMI channel map + CEA audio infoframe.
+    /// `SET_CVT_CHAN_COUNT` is 0x72d (not 0x733 / CP_CTRL). Slot verbs map
+    /// each PCM channel onto itself, matching Linux `hdmi_setup_stream`.
+    fn setup_digital_converter(&mut self, channels: u8) {
+        let conv = self.conv_nid;
+        let ch = channels.max(1);
+        let _ = self.cmd(conv, VERB_SET_DIGI_CVT1, 0x1);
+        let _ = self.cmd(conv, VERB_SET_CVT_CHAN_COUNT, (ch - 1) as u32);
+        for i in 0..ch {
+            let slot = i as u32;
+            let _ = self.cmd(conv, VERB_SET_HDMI_CHAN_SLOT, (slot << 4) | slot);
+        }
+        self.send_audio_infoframe(ch);
     }
 
     /// Program the pin's Data Island Packet buffer with a CEA audio infoframe
     /// (HDMI sinks want one before they render PCM). Best-effort: some codecs
     /// route infoframes through the graphics driver instead.
+    ///
+    /// Hardware autoincrements only the low 3 bits of the DIP byte index, so
+    /// the index is rewritten every 8 bytes (Linux `hdmi_fill_audio_infoframe`).
     fn send_audio_infoframe(&mut self, channels: u8) {
         let pin = self.pin_nid;
         let mut frame = [0u8; 14];
         frame[0] = 0x84; // CEA audio infoframe
         frame[1] = 0x01; // version
         frame[2] = 0x0a; // payload length
-        frame[4] = channels - 1; // CC, coding type "refer to stream"
-                                 // frame[8] = CA (0 = FL/FR), rest zero.
+        frame[4] = channels.saturating_sub(1); // CC, coding type "refer to stream"
+                                               // frame[8] = CA (0 = FL/FR), rest zero.
         let sum: u32 = frame.iter().map(|&b| b as u32).sum();
         // Checksum: the bytes of the frame plus this one must sum to 0 mod 256.
         frame[3] = ((0x100 - (sum & 0xff)) & 0xff) as u8;
 
-        let _ = self.cmd(pin, VERB_SET_DIP_INDEX, 0);
-        for &b in &frame {
+        for (i, &b) in frame.iter().enumerate() {
+            if i % 8 == 0 {
+                let _ = self.cmd(pin, VERB_SET_DIP_INDEX, i as u32);
+            }
             let _ = self.cmd(pin, VERB_SET_DIP_DATA, b as u32);
         }
         let _ = self.cmd(pin, VERB_SET_DIP_XMIT, 0xc0); // best-effort transmit
@@ -697,7 +744,7 @@ impl HdaDevice {
         let t = timer_now_as_micros();
         while mmio_r32(bar, REG_GCTL) & GCTL_CRST != 0 {
             if timer_now_as_micros().wrapping_sub(t) > 1_000_000 {
-                warn!("[hda] {}: controller reset entry timed out", name);
+                error!("[hda] {}: controller reset entry timed out", name);
                 return Err(DeviceError::IoError);
             }
             core::hint::spin_loop();
@@ -707,7 +754,7 @@ impl HdaDevice {
         let t = timer_now_as_micros();
         while mmio_r32(bar, REG_GCTL) & GCTL_CRST == 0 {
             if timer_now_as_micros().wrapping_sub(t) > 1_000_000 {
-                warn!("[hda] {}: controller reset exit timed out", name);
+                error!("[hda] {}: controller reset exit timed out", name);
                 return Err(DeviceError::IoError);
             }
             core::hint::spin_loop();
@@ -717,7 +764,10 @@ impl HdaDevice {
 
         let statests = mmio_r16(bar, REG_STATESTS);
         if statests == 0 {
-            warn!("[hda] {}: no codec responded after reset", name);
+            error!(
+                "[hda] {}: no codec responded after reset (QEMU needs -device hda-output)",
+                name
+            );
             return Err(DeviceError::NoResources);
         }
         let cad = statests.trailing_zeros();
@@ -759,9 +809,12 @@ impl HdaDevice {
         mmio_w16(bar, REG_CORBWP, 0);
         // RIRB write-pointer reset (self-clearing).
         mmio_w16(bar, REG_RIRBWP, 1 << 15);
+        // One response per interrupt status: we poll and ack RIRBSTS after
+        // every verb. QEMU stops CORB until that ack (see `ack_rirb`).
         mmio_w16(bar, REG_RINTCNT, 1);
+        mmio_w8(bar, REG_RIRBSTS, RIRBSTS_IRQ | RIRBSTS_OVERRUN);
 
-        mmio_w8(bar, REG_RIRBCTL, 0x2); // RIRB DMA run
+        mmio_w8(bar, REG_RIRBCTL, RIRBCTL_DMA_EN | RIRBCTL_IRQ_EN);
         mmio_w8(bar, REG_CORBCTL, 0x2); // CORB DMA run
 
         // ── PCM ring + BDL ─────────────────────────────────────────────────

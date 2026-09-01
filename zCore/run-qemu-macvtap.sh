@@ -96,7 +96,7 @@ else
     fi
 fi
 echo "[+] QEMU audio backend=$AUDIODEV via $QEMU_BIN"
-QEMU_ARGS+=(-audiodev "$AUDIODEV,id=snd0" -device intel-hda,id=snd -device hda-output,audiodev=snd0)
+QEMU_ARGS+=(-audiodev "$AUDIODEV,id=snd0" -device intel-hda,id=snd -device hda-output,bus=snd.0,cad=0,audiodev=snd0)
 
 # ─── 4. Launch QEMU ────────────────────────────────────────────────────────
 echo "[+] Launching QEMU with macvtap (fd=3 -> $TAPDEV)..."

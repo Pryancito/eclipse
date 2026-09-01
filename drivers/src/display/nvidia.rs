@@ -2697,6 +2697,7 @@ impl NvidiaGpu {
         // the `rm_display_snap` field doc for why this is load-bearing for
         // VK_KHR_display.
         if let Some(snap) = *self.rm_display_snap.lock() {
+            Self::rm_enable_hdmi_audio_once(snap.0, &snap.1);
             return Some(snap);
         }
         let instance = (*self.rm_device_instance.lock())?;
@@ -2724,29 +2725,28 @@ impl NvidiaGpu {
         Some(snap)
     }
 
-    /// One-shot per GPU: push each connected display's ELD to the GPU's HDA
-    /// codec and enable audio packet transmission (NV0073 SET_ELD_AUDIO_CAPS
-    /// + SET_AUDIO_ENABLE + GCP un-mute). The UEFI GOP modeset that this
-    /// driver scans out on never enables audio, so without this the HDA
+    /// Per GPU: push each connected display's ELD to the GPU's HDA codec and
+    /// enable audio packet transmission (SET_HDMI_ENABLE + SET_ELD_AUDIO_CAPS
+    /// + SET_AUDIO_ENABLE + HDMI/DP unmute + GCP). The UEFI GOP modeset that
+    /// this driver scans out on never enables audio, so without this the HDA
     /// function's pins stay at PD=0/ELDV=0 and HDMI audio is silent. Runs
-    /// piggybacked on the first successful RM display query, which is when
-    /// the DispCommon handles it needs are known to exist.
+    /// piggybacked on RM display queries once DispCommon handles exist.
+    /// Latched only after a successful ELD push so a first call with
+    /// `connected_mask == 0` or a transient RM failure still retries.
     fn rm_enable_hdmi_audio_once(instance: u32, d: &nvidia_rm_sys::rm_init::GrEdid) {
         use core::sync::atomic::{AtomicU32, Ordering};
-        static ATTEMPTED: AtomicU32 = AtomicU32::new(0);
-        if instance >= 32
-            || ATTEMPTED.fetch_or(1 << instance, Ordering::AcqRel) & (1 << instance) != 0
-        {
+        static DONE: AtomicU32 = AtomicU32::new(0);
+        if instance >= 32 || (DONE.load(Ordering::Acquire) & (1 << instance)) != 0 {
             return;
         }
         if d.connected_mask == 0 {
             log::info!(
-                "[hdmi-audio] gpu{}: no connected outputs — audio not enabled",
+                "[hdmi-audio] gpu{}: no connected outputs — will retry",
                 instance
             );
             return;
         }
-        // TMDS/HDMI outputs get the GCP un-mute on top of the common path.
+        // TMDS/HDMI outputs get SET_HDMI_ENABLE + GCP un-mute on top of ELD.
         let n = (d.conn_type_count as usize).min(d.conn_type_display_id.len());
         let hdmi_mask: u32 = (0..n)
             .filter(|&i| matches!(d.conn_type[i], 0x61 | 0x63))
@@ -2766,10 +2766,13 @@ impl NvidiaGpu {
                     out.sad_count,
                     out.max_freq,
                 );
+                if out.eld_ok_mask != 0 {
+                    DONE.fetch_or(1 << instance, Ordering::AcqRel);
+                }
             }
             Err(st) => {
                 log::warn!(
-                    "[hdmi-audio] gpu{}: enable failed, NV_STATUS={:#x} (audio stays off)",
+                    "[hdmi-audio] gpu{}: enable failed, NV_STATUS={:#x} (will retry)",
                     instance,
                     st
                 );
@@ -2788,11 +2791,7 @@ impl NvidiaGpu {
     /// `1001` stays as a boot-stable alias for the first supported output so a
     /// client that started probing before RM topology was cached can finish the
     /// rest of that probe against the same advertised id.
-    fn rm_connector_bit(
-        instance: u32,
-        id: u32,
-        d: &nvidia_rm_sys::rm_init::GrEdid,
-    ) -> Option<u32> {
+    fn rm_connector_bit(instance: u32, id: u32, d: &nvidia_rm_sys::rm_init::GrEdid) -> Option<u32> {
         if id == 1001 {
             return (0..32u32).find(|&b| d.display_mask & (1u32 << b) != 0);
         }
@@ -2994,6 +2993,12 @@ impl DisplayScheme for NvidiaGpu {
         unsafe {
             FrameBuffer::from_raw_parts_mut(self.info.fb_base_vaddr as *mut u8, self.info.fb_size)
         }
+    }
+
+    /// BAR1 scanout is PAT write-combining after `enable_framebuffer_wc`.
+    #[inline]
+    fn fb_write_combining(&self) -> bool {
+        true
     }
 
     /// The framebuffer is the GPU's own VRAM, mapped through the PCI BAR. The
@@ -6750,9 +6755,11 @@ impl DrmScheme for NvidiaGpu {
         // freeing the backing memory below -- the real nouveau contract
         // expects UNMAP before CLOSE, but a caller that skips it shouldn't
         // leak the VA reservation (h_virt) in RM forever.
-        self.drain_vm_mappings(&alloc::format!("GEM_CLOSE handle={}", handle), |m| {
-            m.gem_handle == handle
-        }, true);
+        self.drain_vm_mappings(
+            &alloc::format!("GEM_CLOSE handle={}", handle),
+            |m| m.gem_handle == handle,
+            true,
+        );
         let status = match *self.rm_device_instance.lock() {
             Some(device_instance) => Some(nvidia_rm_sys::rm_init::gem_free(
                 device_instance,
@@ -7895,17 +7902,17 @@ impl NvidiaGpu {
                 return;
             }
         };
-        let bind = match rm::vm_bind_map(device_instance, 0, alloc.h_memory, TEST_SIZE, TEST_VA, 0, 0)
-        {
-            Ok(b) if b.map_status == 0 => b,
-            _ => {
-                crate::klog_warn!(
-                    "[nouveau-uapi] SELFTEST: VM_BIND of the test page failed -- cannot run"
-                );
-                rm::gem_free(device_instance, alloc.h_memory);
-                return;
-            }
-        };
+        let bind =
+            match rm::vm_bind_map(device_instance, 0, alloc.h_memory, TEST_SIZE, TEST_VA, 0, 0) {
+                Ok(b) if b.map_status == 0 => b,
+                _ => {
+                    crate::klog_warn!(
+                        "[nouveau-uapi] SELFTEST: VM_BIND of the test page failed -- cannot run"
+                    );
+                    rm::gem_free(device_instance, alloc.h_memory);
+                    return;
+                }
+            };
         let base = crate::bus::phys_to_virt(pa as usize);
         let sem_va = TEST_VA + SEM_OFF;
         unsafe {
@@ -8263,22 +8270,23 @@ impl NvidiaGpu {
         nv::record_prime(
             ctx_idx,
             alloc::format!(
-            "ctx={} pid={} PRIME {} on rm-device {} (NV_STATUS={:#x}){}",
-            ctx_idx,
-            owner_pid,
-            if prime == 0 {
-                "OK -- golden context loaded"
-            } else {
-                "TIMEOUT/FAIL -- first draw will cold-load"
-            },
-            dev,
-            prime,
-            if prime == 0 {
-                ""
-            } else {
-                " <== prime failure predicts DEVICE_LOST on first draw"
-            }
-        ));
+                "ctx={} pid={} PRIME {} on rm-device {} (NV_STATUS={:#x}){}",
+                ctx_idx,
+                owner_pid,
+                if prime == 0 {
+                    "OK -- golden context loaded"
+                } else {
+                    "TIMEOUT/FAIL -- first draw will cold-load"
+                },
+                dev,
+                prime,
+                if prime == 0 {
+                    ""
+                } else {
+                    " <== prime failure predicts DEVICE_LOST on first draw"
+                }
+            ),
+        );
         // Publish READY only now: the golden context is primed (or its prime
         // verdict recorded), so a sibling thread waking from the wait above --
         // or any later EXEC -- can no longer land on an unprimed channel. If
@@ -9944,7 +9952,7 @@ impl NvidiaGpu {
                             let pccsr_off = 0x0080_0004usize + (ch_id as usize) * 8;
                             let pccsr_val = rd(pccsr_off);
                             let pccsr_enable = pccsr_val & 1;
-                            let pccsr_busy   = (pccsr_val >> 28) & 1;
+                            let pccsr_busy = (pccsr_val >> 28) & 1;
                             let pccsr_status = (pccsr_val >> 24) & 0xf;
 
                             // HUB MMU fault latch (non-replayable, TU102 0xb83080..90).
@@ -10034,8 +10042,11 @@ impl NvidiaGpu {
                                      check whether ctx_prime timed out at CHANNEL_ALLOC \
                                      (see /proc/gpudbg last PRIME line for ctx={})",
                                     ctx_idx,
-                                    fecs_status, gpccs_status,
-                                    fecs_mb0, fecs_mb1, fecs_priv_err,
+                                    fecs_status,
+                                    gpccs_status,
+                                    fecs_mb0,
+                                    fecs_mb1,
+                                    fecs_priv_err,
                                     ctx_idx
                                 );
                             }

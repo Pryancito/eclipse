@@ -372,7 +372,7 @@ ifeq ($(ARCH), x86_64)
   else
     qemu_opts += -audiodev $(AUDIODEV),id=snd0
   endif
-  qemu_opts += -device intel-hda,id=snd -device hda-output,audiodev=snd0
+  qemu_opts += -device intel-hda,id=snd -device hda-output,bus=snd.0,cad=0,audiodev=snd0
   ifneq ($(filter run justrun debug,$(MAKECMDGOALS)),)
     $(info [qemu] audio backend=$(AUDIODEV) via $(qemu)$(if $(filter wav,$(AUDIODEV)), -> $(AUDIOWAV)))
   endif

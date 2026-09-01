@@ -841,6 +841,76 @@ fn blit_chunked(
     }
 }
 
+/// FromDevice clflush of the CPU-mapped GEM span covering a scanout damage
+/// rect (including pitch padding between the first and last pixel). Needed
+/// only when the CPU will *read* the buffer (CPU blit / CE staging repack).
+fn dma_sync_scanout_src_from_device(
+    vaddr: usize,
+    fb_size: usize,
+    src_stride: usize,
+    blit_x: u32,
+    blit_y: u32,
+    blit_w: u32,
+    blit_h: u32,
+) {
+    let sync_start_px = (blit_y as usize)
+        .saturating_mul(src_stride)
+        .saturating_add(blit_x as usize);
+    let sync_end_px = (blit_y as usize)
+        .saturating_add((blit_h as usize).saturating_sub(1))
+        .saturating_mul(src_stride)
+        .saturating_add(blit_x as usize)
+        .saturating_add(blit_w as usize);
+    if sync_end_px <= sync_start_px {
+        return;
+    }
+    let byte_off = sync_start_px.saturating_mul(4).min(fb_size);
+    let byte_len = sync_end_px
+        .saturating_sub(sync_start_px)
+        .saturating_mul(4)
+        .min(fb_size.saturating_sub(byte_off));
+    zcore_drivers::utils::dma_sync::dma_sync_wb_from_device(vaddr + byte_off, byte_len);
+}
+
+/// FromDevice clflush of one rectangle, row by row, so a 64×64 cursor does not
+/// clflush a megabyte of pitch padding. Used after CE-direct present so
+/// [`blit_cursor_patch`] can read GPU pixels from sysmem without a full-frame
+/// sync.
+fn dma_sync_gem_rect_from_device(
+    vaddr: usize,
+    fb_size: usize,
+    stride_px: usize,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    fb_w: u32,
+    fb_h: u32,
+) {
+    if stride_px == 0 || w == 0 || h == 0 {
+        return;
+    }
+    let x0 = x.max(0) as usize;
+    let y0 = y.max(0) as usize;
+    let x1 = (x + w as i32).min(fb_w as i32).max(0) as usize;
+    let y1 = (y + h as i32).min(fb_h as i32).max(0) as usize;
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let row_bytes = (x1 - x0).saturating_mul(4);
+    for row in y0..y1 {
+        let byte_off = row
+            .saturating_mul(stride_px)
+            .saturating_add(x0)
+            .saturating_mul(4);
+        if byte_off >= fb_size {
+            break;
+        }
+        let len = row_bytes.min(fb_size.saturating_sub(byte_off));
+        zcore_drivers::utils::dma_sync::dma_sync_wb_from_device(vaddr + byte_off, len);
+    }
+}
+
 /// Copy a framebuffer's pixels to the hardware display ("scan out").
 ///
 /// Used by the software KMS path (no GPU driver): the dumb buffer is contiguous
@@ -924,32 +994,11 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     let src_off = (blit_y as usize)
         .saturating_mul(src_stride)
         .saturating_add(blit_x as usize);
-    // Real-hardware GL/NVK clients render into nouveau GEM_NEW buffers that
-    // the CPU present path then READS through the write-back physmap alias —
-    // both the CPU blit and the CE staging repack. Without this FromDevice
-    // sync stale lines from the previous frame stay resident and the screen
-    // stops repainting. (MOVNTDQA does not lift this: non-temporal loads only
-    // bypass the cache on WC memory, not on this WB alias.)
     let t0 = kernel_hal::timer::timer_now();
-    if zcore_drivers::scheme::gem_mmap::lookup(fb.gem_handle_id).is_some() {
-        let sync_start_px = (blit_y as usize)
-            .saturating_mul(src_stride)
-            .saturating_add(blit_x as usize);
-        let sync_end_px = (blit_y as usize)
-            .saturating_add((blit_h as usize).saturating_sub(1))
-            .saturating_mul(src_stride)
-            .saturating_add(blit_x as usize)
-            .saturating_add(blit_w as usize);
-        if sync_end_px > sync_start_px {
-            let byte_off = sync_start_px.saturating_mul(4).min(fb.size);
-            let byte_len = sync_end_px
-                .saturating_sub(sync_start_px)
-                .saturating_mul(4)
-                .min(fb.size.saturating_sub(byte_off));
-            zcore_drivers::utils::dma_sync::dma_sync_wb_from_device(vaddr + byte_off, byte_len);
-        }
-    }
-    let t_sync = kernel_hal::timer::timer_now();
+    let mut sync_elapsed = Duration::ZERO;
+    let mut cpu_src_synced = false;
+    let gem_cpu_mapped = zcore_drivers::scheme::gem_mmap::lookup(fb.gem_handle_id).is_some();
+
     // CE-offloaded present: copy the frame (sysmem) into the scanout FB (the
     // console GPU's VRAM) with a GPU copy engine instead of CPU stores over
     // PCIe — on real hardware the console GPU's BAR1 serves CPU stores at a
@@ -965,6 +1014,17 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     // DMA per present destabilized the desktop on real hardware once, so the
     // default present is still the CPU blit (ce_present wedges itself off on
     // the first confirmed failure).
+    //
+    // Cache sync vs. CE-direct: `dma_sync_wb_from_device` is a clflush of the
+    // whole GEM (~4.2 MB, milliseconds). That exists so a CPU *read* of the
+    // WB physmap alias sees GPU-rendered pixels (CPU blit / CE staging
+    // repack). CE-direct (`ce_present_2d_pitched` or flat `ce_present` from
+    // `fb.phys_addr`) DMAs from physical sysmem itself and does not consult
+    // the CPU cache, so the full FromDevice is wasted. NVK writes the GEM via
+    // the GPU, not CPU-mapped WB stores, so a ToDevice clflush is not needed
+    // either (that would be the same 4.2 MB cost). Skip both; if CE frames
+    // look stale, restore a sync here — the present klog's `sync Xus` is the
+    // tell (should be ~0 on CE-direct).
     let mut blitted_by_ce = false;
     if rect.is_none() && CE_PRESENT_ENABLED.load(Ordering::Relaxed) {
         if fb.pitch != info.pitch {
@@ -975,7 +1035,7 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
             // slow CPU reads from the uncached BAR1-backed source buffer.
             //
             // Fallback chain: 2D fails (CE_PRESENT_WEDGED latched) →
-            // repack+flat CE → CPU blit.
+            // FromDevice + repack+flat CE → CPU blit.
             let row_bytes = (blit_w as usize).saturating_mul(4) as u32;
             for d in kernel_hal::drivers::all_drm().as_vec().iter() {
                 if d.ce_present_2d_pitched(fb.phys_addr, fb.pitch, info.pitch, row_bytes, blit_h) {
@@ -983,8 +1043,17 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
                     break;
                 }
             }
-            // Fallback: repack into staging buffer at scanout pitch, then flat CE.
+            // Fallback: CPU reads the GEM, so FromDevice first, then repack
+            // into staging at scanout pitch and flat CE.
             if !blitted_by_ce {
+                if gem_cpu_mapped {
+                    let ts = kernel_hal::timer::timer_now();
+                    dma_sync_scanout_src_from_device(
+                        vaddr, fb.size, src_stride, blit_x, blit_y, blit_w, blit_h,
+                    );
+                    sync_elapsed = kernel_hal::timer::timer_now().saturating_sub(ts);
+                    cpu_src_synced = true;
+                }
                 let (ce_src_pa, ce_size) = ce_repack_to_staging(
                     pixels,
                     fb.phys_addr,
@@ -1026,6 +1095,18 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
         }
     }
     if !blitted_by_ce {
+        // CPU reads the GEM through the WB physmap alias. Without FromDevice,
+        // stale lines from the previous frame stay resident and the screen
+        // stops repainting. (MOVNTDQA does not lift this: non-temporal loads
+        // only bypass the cache on WC memory, not on this WB alias.)
+        if gem_cpu_mapped && !cpu_src_synced {
+            let ts = kernel_hal::timer::timer_now();
+            dma_sync_scanout_src_from_device(
+                vaddr, fb.size, src_stride, blit_x, blit_y, blit_w, blit_h,
+            );
+            sync_elapsed = kernel_hal::timer::timer_now().saturating_sub(ts);
+            cpu_src_synced = true;
+        }
         // Banded blit with IRQs briefly re-enabled between bands — see
         // [`blit_chunked`]. Honours a DIRTYFB damage rect when present.
         if src_off < pixels.len() {
@@ -1040,25 +1121,14 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
             );
         }
     }
-    if rect.is_none() {
-        let t_blit = kernel_hal::timer::timer_now();
-        let n = PRESENT_FRAME_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= 2 || n % 64 == 0 {
-            kernel_hal::klog_info!(
-                "[drm] present #{}: sync {}us + {} blit {}us ({}x{})",
-                n,
-                t_sync.saturating_sub(t0).as_micros(),
-                if blitted_by_ce { "CE" } else { "cpu" },
-                t_blit.saturating_sub(t_sync).as_micros(),
-                blit_w,
-                blit_h
-            );
-        }
-    }
+    let t_blit = kernel_hal::timer::timer_now();
     // Composite the kernel cursor on top of the just-blitted frame, so a
-    // page-flip never erases the pointer. Snapshot the cursor under the lock,
-    // then blend lock-free (blending reads the slow PCIe framebuffer for
-    // antialiased edges, which must not run with the DRM spinlock held).
+    // page-flip never erases the pointer. Snapshot under the lock, then
+    // compose in cached sysmem and write-only blit to GOP — same pattern as
+    // [`repaint_for_cursor`] / [`blit_cursor_patch`]. Never RMW BAR1 here:
+    // `blit_argb_over` reads the slow PCIe framebuffer for alpha blend
+    // (~64×64 RMW every frame) and that hitch is what this avoids.
+    // Hardware cursor (`c.hw`) still skips software compositing entirely.
     let cursor = {
         let mut state = DRM_STATE.lock();
         let c = &state.cursor;
@@ -1081,7 +1151,49 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
         snap
     };
     if let Some((cx, cy, cw, ch, bmp)) = cursor {
-        display.blit_argb_over(cx, cy, &bmp, cw as usize, cw, ch);
+        // CE-direct skipped the full-frame FromDevice. Invalidate just the
+        // cursor window so the CPU blend sees GPU pixels; counted in cursor
+        // time, not `sync`, so the klog keeps showing ~0us sync on CE.
+        if blitted_by_ce && !cpu_src_synced && gem_cpu_mapped {
+            dma_sync_gem_rect_from_device(
+                vaddr, fb.size, src_stride, cx, cy, cw, ch, fb_width, fb_height,
+            );
+        }
+        blit_cursor_patch(
+            &*display,
+            pixels,
+            src_stride,
+            info.width,
+            info.height,
+            cx,
+            cy,
+            cw,
+            ch,
+            cx,
+            cy,
+            cw,
+            ch,
+            &bmp,
+        );
+    }
+    let t_cursor = kernel_hal::timer::timer_now();
+    if rect.is_none() {
+        let n = PRESENT_FRAME_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 2 || n % 64 == 0 {
+            kernel_hal::klog_info!(
+                "[drm] present #{}: sync {}us + {} blit {}us + cursor {}us ({}x{})",
+                n,
+                sync_elapsed.as_micros(),
+                if blitted_by_ce { "CE" } else { "cpu" },
+                t_blit
+                    .saturating_sub(t0)
+                    .saturating_sub(sync_elapsed)
+                    .as_micros(),
+                t_cursor.saturating_sub(t_blit).as_micros(),
+                blit_w,
+                blit_h
+            );
+        }
     }
     let _ = display.flush();
     // A DRM client owns the framebuffer now: stop the kernel text console from
@@ -1477,7 +1589,12 @@ fn restore_rect(
 /// at, so pacing flip completions to it makes an unthrottled compositor loop
 /// render at 60 fps instead of thousands — the difference between an idle-ish
 /// core and a pegged one under emulation.
-const VBLANK_PERIOD: Duration = Duration::from_nanos(16_666_667);
+///
+/// Must match [`vblank_seq_now`]: `1_000_000_000 / 60` ns, not 16_666_667.
+/// The old pair (period 16_666_667 ns vs sequence `now_ns * 60 / 1e9`) drifted
+/// and compositors that derive nsec/MSC from both clocks reported ~55 Hz.
+const VBLANK_HZ: u64 = 60;
+const VBLANK_PERIOD_NS: u64 = 1_000_000_000 / VBLANK_HZ;
 
 /// Outcome of a legacy/`PAGE_FLIP` or atomic flip-with-event request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1526,7 +1643,7 @@ pub fn page_flip(fb_id: u32, crtc_id: u32, user_data: u64) -> Result<(), FlipErr
 /// than immediately. This is the throttle that keeps a Wayland compositor's
 /// frame loop from spinning: it renders a frame, page-flips, then blocks in
 /// `poll()`/`read()` on the card fd until we post the flip event here — so the
-/// loop runs at most once per [`VBLANK_PERIOD`]. If that slot is already in
+/// loop runs at most once per [`VBLANK_PERIOD_NS`]. If that slot is already in
 /// the past (present took ≥16.7 ms, or the compositor was idle) the event is
 /// delivered immediately: waiting *another* full period on top of a missed
 /// slot locked the desktop at ~30 Hz. Catch-up still never exceeds 60 Hz,
@@ -1719,17 +1836,22 @@ pub fn cancel_events_for_exit(pid: u64) {
 }
 
 /// Advance the synthetic vblank clock and return the monotonic instant the next
-/// completion event may fire at: one [`VBLANK_PERIOD`] past the previous vblank.
+/// completion event may fire at: one [`VBLANK_PERIOD_NS`] past the previous vblank.
 ///
 /// Cap at 60 Hz when the compositor is on time. When the slot is already in
-/// the past, return `now` (catch-up) instead of `now + VBLANK_PERIOD`: that
-/// extra wait was the ~30 Hz lock. The loop still cannot exceed 60 Hz because
-/// a frame that finished inside the period keeps the remaining wait.
+/// the past, return `now` (catch-up) instead of waiting until the *next* grid
+/// boundary: that extra wait was the ~30 Hz lock. Catch-up still never exceeds
+/// 60 Hz, because a frame that finished inside the period keeps the remaining
+/// wait. The completed slot is snapped to the 60 Hz lattice shared with
+/// [`vblank_seq_now`], so a catch-up does not leave the phase sitting 18 ms
+/// off-grid (which locked subsequent on-time frames at ~55 Hz).
 fn next_vblank_deadline() -> Duration {
     let now = kernel_hal::timer::timer_now();
+    let now_ns = u64::try_from(now.as_nanos()).unwrap_or(u64::MAX);
     let mut st = DRM_STATE.lock();
-    let mut next = st.next_vblank + VBLANK_PERIOD;
-    if next <= now {
+    let last_ns = u64::try_from(st.next_vblank.as_nanos()).unwrap_or(0);
+    let next_from_last = last_ns.saturating_add(VBLANK_PERIOD_NS);
+    if next_from_last <= now_ns {
         static CATCHUP_LOGGED: AtomicBool = AtomicBool::new(false);
         if !CATCHUP_LOGGED.swap(true, Ordering::Relaxed) {
             kernel_hal::klog_info!(
@@ -1738,10 +1860,15 @@ fn next_vblank_deadline() -> Duration {
                 now.saturating_sub(st.next_vblank).as_micros()
             );
         }
-        next = now;
+        // Record the 60 Hz cell we just completed, not `now`, so the next
+        // frame waits only the remainder of the current period.
+        let completed = (now_ns / VBLANK_PERIOD_NS) * VBLANK_PERIOD_NS;
+        st.next_vblank = Duration::from_nanos(completed);
+        now
+    } else {
+        st.next_vblank = Duration::from_nanos(next_from_last);
+        Duration::from_nanos(next_from_last)
     }
-    st.next_vblank = next;
-    next
 }
 
 /// Present a framebuffer immediately on `crtc_id` without queuing a DRM flip
@@ -1933,14 +2060,15 @@ pub fn queue_vblank_event(seq: u32, user_data: u64) {
     push_drm_event(DRM_EVENT_VBLANK, SYNTH_CRTC_ID, seq, user_data);
 }
 
-/// Synthetic ~60 Hz vertical-blank counter derived from the monotonic clock.
+/// Synthetic 60 Hz vertical-blank counter derived from the monotonic clock.
 ///
 /// A software framebuffer has no real vblank interrupt, but `WAIT_VBLANK`
 /// callers expect a monotonically increasing sequence; deriving one from time
-/// keeps both absolute and relative queries sane.
+/// keeps both absolute and relative queries sane. Uses the same period as
+/// [`VBLANK_PERIOD_NS`] so MSC and flip pacing cannot disagree.
 pub fn vblank_seq_now() -> u32 {
-    let now = kernel_hal::timer::timer_now();
-    (now.as_nanos() * 60 / 1_000_000_000) as u32
+    let now_ns = u64::try_from(kernel_hal::timer::timer_now().as_nanos()).unwrap_or(0);
+    (now_ns / VBLANK_PERIOD_NS) as u32
 }
 
 /// Pop one pending DRM event into `buf`, returning the number of bytes copied,

@@ -1094,10 +1094,10 @@ extern "C" {
 /// Enable HDMI/DP audio on the connected outputs in `display_mask`: builds an
 /// ELD from each display's EDID, pushes it to the GPU's HDA codec
 /// (SET_ELD_AUDIO_CAPS, PD=1/ELDV=1) and turns on audio packet transmission
-/// (SET_AUDIO_ENABLE; plus a GCP un-mute for the TMDS outputs in
-/// `hdmi_mask`). Requires the display query ([`edid`]) to have run first so
-/// the RM DispCommon handles exist. Idempotent per GPU (cached after the
-/// first successful ELD push).
+/// (SET_HDMI_ENABLE + SET_AUDIO_ENABLE + HDMI/DP unmute; plus a GCP
+/// un-mute for the TMDS outputs in `hdmi_mask`). Requires the display
+/// query ([`edid`]) to have run first so the RM DispCommon handles exist.
+/// Idempotent per GPU (cached after the first successful ELD push).
 pub fn hdmi_audio(
     device_instance: u32,
     display_mask: u32,

@@ -11,9 +11,13 @@ const PIT_REF_HZ: u64 = 1_193_182;
 /// is not used by the kernel timer (we use the LAPIC timer), so there is no
 /// conflict with the system tick.
 ///
+/// Returns Hz, not MHz: truncating to MHz before building the ns multiplier
+/// stretches every timeout (including the synthetic 60 Hz vblank) by the
+/// discarded remainder.
+///
 /// SAFETY: touches the legacy 8254/0x61 ports; must only be called from a
 /// single core early in boot, before any other code uses the PIT.
-unsafe fn calibrate_tsc_mhz_via_pit() -> Option<u16> {
+unsafe fn calibrate_tsc_hz_via_pit() -> Option<u64> {
     use x86_64::instructions::port::Port;
 
     // ~54.9 ms gate window (65535 / 1.193182 MHz). Long enough that IRQ
@@ -57,12 +61,30 @@ unsafe fn calibrate_tsc_mhz_via_pit() -> Option<u16> {
     let cycles = t1.saturating_sub(t0);
     // hz = cycles * PIT_REF_HZ / PIT_COUNT
     let hz = cycles.saturating_mul(PIT_REF_HZ) / PIT_COUNT as u64;
-    let mhz = hz / 1_000_000;
-    if (100..=20_000).contains(&mhz) {
-        Some(mhz as u16)
+    if (100_000_000..=20_000_000_000).contains(&hz) {
+        Some(hz)
     } else {
         None
     }
+}
+
+/// TSC frequency in Hz. PIT-calibrated when possible; never rounded to MHz.
+pub fn tsc_hz() -> u64 {
+    static TSC_HZ: spin::Once<u64> = spin::Once::new();
+    *TSC_HZ.call_once(|| {
+        if let Some(hz) = unsafe { calibrate_tsc_hz_via_pit() } {
+            return hz;
+        }
+        // Fallback chain: CPUID base frequency, then a conservative default.
+        // Both are wrong on modern boxes but avoid div-by-0.
+        const DEFAULT_MHZ: u16 = 2000;
+        let mhz = CpuId::new()
+            .get_processor_frequency_info()
+            .map(|info| info.processor_base_frequency())
+            .filter(|&f| f >= 100)
+            .unwrap_or(DEFAULT_MHZ);
+        mhz as u64 * 1_000_000
+    })
 }
 
 hal_fn_impl! {
@@ -78,26 +100,16 @@ hal_fn_impl! {
         }
 
         fn cpu_frequency() -> u16 {
-            static CPU_FREQ_MHZ: spin::Once<u16> = spin::Once::new();
-            *CPU_FREQ_MHZ.call_once(|| {
-                // Prefer measuring the TSC directly against the PIT: on modern
-                // Intel the TSC runs at the nominal (non-turbo) frequency,
-                // which is NOT the same as CPUID's "base frequency"; on AMD
-                // and on QEMU guests CPUID leaf 0x16 is absent altogether.
-                // Without calibration the kernel clock ran ~1.8× too fast,
-                // collapsing TCP RTOs and inflating uptime on real hardware.
-                if let Some(mhz) = unsafe { calibrate_tsc_mhz_via_pit() } {
-                    return mhz;
-                }
-                // Fallback chain: CPUID base frequency, then a conservative
-                // default. Both are wrong on modern boxes but avoid div-by-0.
-                const DEFAULT: u16 = 2000;
-                CpuId::new()
-                    .get_processor_frequency_info()
-                    .map(|info| info.processor_base_frequency())
-                    .filter(|&f| f >= 100)
-                    .unwrap_or(DEFAULT)
-            })
+            // Prefer measuring the TSC directly against the PIT: on modern
+            // Intel the TSC runs at the nominal (non-turbo) frequency,
+            // which is NOT the same as CPUID's "base frequency"; on AMD
+            // and on QEMU guests CPUID leaf 0x16 is absent altogether.
+            // Without calibration the kernel clock ran ~1.8× too fast,
+            // collapsing TCP RTOs and inflating uptime on real hardware.
+            // Integer MHz is only for callers that still want MHz; the
+            // ns multiplier uses [`tsc_hz`] so the discarded remainder
+            // does not stretch sleeps and vblank pacing.
+            (tsc_hz() / 1_000_000).clamp(100, 20_000) as u16
         }
 
         fn cpu_brand() -> alloc::string::String {

@@ -42,9 +42,13 @@ pub extern "C" fn osGetCurrentProcessFlags() -> NvU32 {
     0
 }
 
+/// Microsecond busy-wait + TLB yield. This is the primitive
+/// `eclipse_ce_wait_bounded` should poll with (e.g. `osDelayUs(10)` or
+/// `osDelayUs(0)` / `osSchedule`) instead of `osDelay(1)`, which cannot
+/// resolve finer than a millisecond even after the CE copy has finished.
 #[no_mangle]
 pub extern "C" fn osDelayUs(microseconds: NvU32) -> NV_STATUS {
-    with_hooks((), |h| h.delay_us(microseconds));
+    crate::hooks::delay_us_or_spin(microseconds);
     NV_OK
 }
 
@@ -92,6 +96,10 @@ pub extern "C" fn osGetTimeoutParams(
 
 #[no_mangle]
 pub extern "C" fn osSchedule() -> NV_STATUS {
+    // Yield-only: drain this CPU's TLB-shootdown queue without sleeping
+    // a millisecond. Safe between CE completion polls when the copy is
+    // already done and `osDelay(1)` would just waste frame time.
+    lock::pump();
     NV_OK
 }
 

@@ -23,9 +23,11 @@ static MONO_NS: AtomicU64 = AtomicU64::new(0);
 static TSC_INVARIANT: AtomicBool = AtomicBool::new(false);
 
 /// Fixed-point multiplier: ns = (tsc * TSC_NS_MULT) >> 32, i.e.
-/// `(1000 << 32) / freq_mhz`. Replaces the per-read 64-bit division and, via
-/// the 128-bit intermediate, fixes the `cycles * 1000` overflow that wrapped
-/// the clock after ~71 days of uptime at 3 GHz. 0 = not yet initialized.
+/// `(1_000_000_000 << 32) / tsc_hz`. Replaces the per-read 64-bit division and,
+/// via the 128-bit intermediate, fixes the `cycles * 1000` overflow that wrapped
+/// the clock after ~71 days of uptime at 3 GHz. Built from Hz, not truncated
+/// MHz, so a 3.312 GHz TSC is not paced as if it were 3.000 GHz. 0 = not yet
+/// initialized.
 static TSC_NS_MULT: AtomicU64 = AtomicU64::new(0);
 
 /// Skew tolerance for the invariant-TSC watchdog. Same-package TSCs agree to
@@ -36,8 +38,9 @@ const TSC_SKEW_TOLERANCE_NS: u64 = 1_000_000;
 
 #[cold]
 fn tsc_ns_mult_init() -> u64 {
-    // cpu_frequency() is Once-cached and never zero (falls back to 2000 MHz).
-    let mult = (1000u64 << 32) / super::cpu::cpu_frequency() as u64;
+    // `tsc_hz()` is Once-cached and never zero (falls back to 2 GHz).
+    let hz = super::cpu::tsc_hz().max(1);
+    let mult = ((1_000_000_000u128 << 32) / hz as u128) as u64;
     TSC_NS_MULT.store(mult, Ordering::Relaxed);
     // Invariant TSC: CPUID leaf 0x8000_0007, EDX bit 8. On such parts the TSC
     // runs at a constant rate and, on a single package, is reset-synchronized
@@ -153,7 +156,7 @@ use zcore_drivers::irq::x86::Apic;
 /// LAPIC timer initial count for the normal full-rate scheduler tick (4 ms at
 /// 250 Hz). Mirrors the value programmed in `drivers.rs` at boot.
 pub fn fast_tick_count() -> u32 {
-    (super::cpu::cpu_frequency() as u64 * 1_000_000 / TICKS_PER_SEC) as u32
+    (super::cpu::tsc_hz() / TICKS_PER_SEC as u64).clamp(1, u32::MAX as u64) as u32
 }
 
 /// Period of the full-rate scheduler tick, in nanoseconds (4 ms at 250 Hz).
@@ -164,12 +167,13 @@ pub const fn fast_tick_ns() -> u64 {
     1_000_000_000 / TICKS_PER_SEC
 }
 
-/// Convert a now-relative nanosecond span to LAPIC timer cycles. `cpu_frequency`
-/// is in MHz (= cycles per microsecond). Clamped to a non-zero `u32`: a count of
-/// 0 stops the timer, and counts above `u32::MAX` are not representable.
+/// Convert a now-relative nanosecond span to LAPIC timer cycles. Uses the
+/// PIT-calibrated TSC Hz (the LAPIC counts CPU cycles on this hardware).
+/// Clamped to a non-zero `u32`: a count of 0 stops the timer, and counts
+/// above `u32::MAX` are not representable.
 pub fn ns_to_tick_count(ns: u64) -> u32 {
-    let cycles = (super::cpu::cpu_frequency() as u64).saturating_mul(ns) / 1000;
-    cycles.clamp(1, u32::MAX as u64) as u32
+    let cycles = (super::cpu::tsc_hz() as u128).saturating_mul(ns as u128) / 1_000_000_000;
+    cycles.clamp(1, u32::MAX as u128) as u32
 }
 
 /// Reprogram this CPU's LAPIC timer initial count (the period, in periodic

@@ -106,6 +106,13 @@ impl<'a> DisplayScheme for VirtIoGpu<'a> {
         }
     }
 
+    /// Host-shared RAM, not a WC BAR. Keep the scalar blit so QEMU
+    /// software-KMS (and VirtualBox) stay cache-friendly.
+    #[inline]
+    fn fb_write_combining(&self) -> bool {
+        false
+    }
+
     /// The framebuffer is host-shared memory: the generic 2D primitives fill /
     /// copy / blit it in bulk in RAM and a single [`flush`](Self::flush) hands
     /// the dirty frame to the host (QEMU / VirtualBox) for display.

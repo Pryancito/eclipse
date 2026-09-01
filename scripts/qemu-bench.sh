@@ -146,7 +146,7 @@ qemu-system-x86_64 \
     -drive format=raw,if=pflash,readonly=on,file="$OVMF" \
     -drive format=raw,file="$ESP_IMG" \
     -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 \
-    -audiodev none,id=snd0 -device intel-hda,id=snd -device hda-output,audiodev=snd0 \
+    -audiodev none,id=snd0 -device intel-hda,id=snd -device hda-output,bus=snd.0,cad=0,audiodev=snd0 \
     $DISK_ARGS \
     -nic none \
     -display none \

@@ -316,27 +316,30 @@ pub extern "C" fn osCxlSetCaching(pGpu: *mut c_void, bEnableCache: NvBool) {
 
 #[no_mangle]
 pub extern "C" fn osDelay(ms: NvU32) -> NV_STATUS {
-    // Bounded spin on the monotonic clock: Eclipse's RM bring-up is
-    // single-threaded and polled, so a busy-wait is the correct primitive
-    // at this layer (there is no scheduler sleep to yield to). Used by RM
-    // retry paths and by the eclipse glue (EXP1c PDISP-restore pacing,
-    // GET_CONNECT_STATE real-detection retry).
-    let start = with_hooks(0u64, |h| h.monotonic_time_ns());
-    if start == 0 {
-        // No clock hook (early boot): degrade to no delay rather than hang.
-        return NV_OK;
-    }
-    let target = start + (ms as u64) * 1_000_000;
-    while with_hooks(0u64, |h| h.monotonic_time_ns()) < target {
-        core::hint::spin_loop();
-    }
+    // Millisecond tick. Eclipse's RM bring-up is single-threaded and
+    // polled, so a busy-wait is the correct primitive (no scheduler
+    // sleep). Routes through `delay_us` so the wait pumps TLB shootdowns
+    // the way `osDelayUs` does. A 1 ms tick is why a *completed* CE copy
+    // still burned ≥1 ms per poll -- `eclipse_ce_wait_bounded` should
+    // call `osDelayUs` / `osDelayNs` / `osSchedule` instead of this.
+    crate::hooks::delay_us_or_spin(ms.saturating_mul(1000));
     NV_OK
 }
 
 #[no_mangle]
-pub extern "C" fn osDelayNs(arg0: NvU32) -> NV_STATUS {
-    let _ = arg0;
-    NV_ERR_NOT_SUPPORTED
+pub extern "C" fn osDelayNs(nanoseconds: NvU32) -> NV_STATUS {
+    // Linux `os.c` rounds up to at least 1 us. Sub-us CE polls still
+    // yield (`osSchedule`) so this CPU acks TLB shootdowns between
+    // `ceutilsUpdateProgress` reads. Previously a stub that returned
+    // `NV_ERR_NOT_SUPPORTED`, so any caller treating the status as
+    // fatal would skip the wait entirely.
+    if nanoseconds == 0 {
+        crate::hooks::delay_us_or_spin(0);
+        return NV_OK;
+    }
+    let us = ((nanoseconds as u64 + 999) / 1000).min(u32::MAX as u64) as NvU32;
+    crate::hooks::delay_us_or_spin(us.max(1));
+    NV_OK
 }
 
 #[no_mangle]

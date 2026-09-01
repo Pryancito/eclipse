@@ -23,9 +23,9 @@ static HAS_NT_BLIT: AtomicBool = AtomicBool::new(false);
 /// Detect and cache CPU features used by this module.
 ///
 /// Call once on the BSP during early boot (before any driver uses
-/// [`dma_sync_wb_from_device`], [`dma_sync_wb_to_device`], or
-/// [`nt_blit_rows`]).  It is safe to call from multiple CPUs — the stores
-/// are idempotent.
+/// [`dma_sync_wb_from_device`], [`dma_sync_wb_to_device`],
+/// [`nt_store_rows`], or [`nt_blit_rows`]).  It is safe to call from
+/// multiple CPUs — the stores are idempotent.
 #[cfg(target_arch = "x86_64")]
 pub fn probe_cpu_features() {
     let r7 = core::arch::x86_64::__cpuid_count(7, 0);
@@ -37,7 +37,7 @@ pub fn probe_cpu_features() {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn probe_cpu_features() {}
 
-/// Returns `true` when [`nt_blit_rows`] will take the non-temporal fast path.
+/// Returns `true` when [`nt_store_rows`] / [`nt_blit_rows`] take the NT path.
 #[inline]
 pub fn has_nt_blit() -> bool {
     HAS_NT_BLIT.load(Ordering::Relaxed)
@@ -123,16 +123,41 @@ fn clflush_span(vaddr: usize, len: usize) {
     unsafe {
         let mut p = vaddr & !(64 - 1);
         let end = vaddr.saturating_add(len);
+        if p >= end {
+            return;
+        }
         if HAS_CLFLUSHOPT.load(Ordering::Relaxed) {
-            // MFENCE on BOTH sides, not a trailing SFENCE: CLFLUSHOPT is
-            // ordered only by store fences, and SFENCE does not order later
-            // LOADS -- without the trailing MFENCE the consumer's reads (the
-            // present blit / CE-staging repack pulling GPU-rendered pixels)
-            // can execute BEFORE the invalidate completes and keep serving
-            // stale lines from the previous frame. The flushes themselves
-            // still overlap between the fences, which is the entire win over
-            // the serializing CLFLUSH path below.
+            // MFENCE on BOTH sides of the *span*, not a trailing SFENCE and
+            // not an MFENCE per line. CLFLUSHOPT is ordered only by store
+            // fences, and SFENCE does not order later LOADS -- without the
+            // trailing MFENCE the consumer's reads (the present blit /
+            // CE-staging repack pulling GPU-rendered pixels) can execute
+            // BEFORE the invalidate completes and keep serving stale lines
+            // from the previous frame. Linux `clflushopt_cache_range` is
+            // the same shape (`mb(); loop; mb();`). The flushes themselves
+            // still overlap between the fences, which is the entire win
+            // over the serializing CLFLUSH path below.
+            //
+            // A 4.2 MB GEM buffer is ~65k lines: one fence each side plus
+            // an 8-line unroll keeps the invalidate concurrent instead of
+            // serializing every 64 B behind an MFENCE (several ms).
             core::arch::x86_64::_mm_mfence();
+            let end8 = end.saturating_sub(511);
+            while p < end8 {
+                core::arch::asm!(
+                    "clflushopt [{p}]",
+                    "clflushopt [{p} + 64]",
+                    "clflushopt [{p} + 128]",
+                    "clflushopt [{p} + 192]",
+                    "clflushopt [{p} + 256]",
+                    "clflushopt [{p} + 320]",
+                    "clflushopt [{p} + 384]",
+                    "clflushopt [{p} + 448]",
+                    p = in(reg) p,
+                    options(nostack, preserves_flags),
+                );
+                p += 512;
+            }
             while p < end {
                 core::arch::asm!(
                     "clflushopt [{p}]",
@@ -143,7 +168,9 @@ fn clflush_span(vaddr: usize, len: usize) {
             }
             core::arch::x86_64::_mm_mfence();
         } else {
-            core::arch::x86_64::_mm_mfence();
+            // CLFLUSH is itself serializing (no per-line fence needed).
+            // One trailing SFENCE keeps later stores ordered; the leading
+            // MFENCE the CLFLUSHOPT path needs would only add latency here.
             while p < end {
                 core::arch::x86_64::_mm_clflush(p as *const u8);
                 p += 64;
@@ -159,6 +186,62 @@ fn clflush_span(vaddr: usize, len: usize) {
 }
 
 // ── Non-temporal blit (MOVNTDQA) ─────────────────────────────────────────────
+
+/// Copy `width_bytes` bytes from `src` to `dst` using `MOVNTDQ` stores.
+///
+/// Head/tail bytes that are not 16-byte-aligned in `dst` use ordinary
+/// copies; the aligned middle is written with non-temporal stores so a
+/// write-combining GOP/BAR1 mapping fills 64-byte PCIe bursts instead of
+/// one transaction per `copy_from_slice` store (~42 MB/s on UC BAR1).
+///
+/// # Safety
+/// `src`/`dst` must be valid for `width_bytes` reads/writes.  Only call
+/// when [`has_nt_blit`] is `true`.  Clobbers `xmm0`.
+#[cfg(target_arch = "x86_64")]
+unsafe fn nt_store_row(dst: *mut u8, src: *const u8, width_bytes: usize) {
+    if width_bytes == 0 {
+        return;
+    }
+    let dst_mis = (dst as usize) & 15;
+    let mut i = 0usize;
+    if dst_mis != 0 {
+        let head = (16 - dst_mis).min(width_bytes);
+        core::ptr::copy_nonoverlapping(src, dst, head);
+        i = head;
+    }
+    let aligned = (width_bytes - i) & !15;
+    let aligned_end = i + aligned;
+    // 64-byte body fills one WC combine buffer per trip.
+    while i + 64 <= aligned_end {
+        core::arch::asm!(
+            "movdqu xmm0, [{src}]",
+            "movntdq [{dst}], xmm0",
+            "movdqu xmm0, [{src} + 16]",
+            "movntdq [{dst} + 16], xmm0",
+            "movdqu xmm0, [{src} + 32]",
+            "movntdq [{dst} + 32], xmm0",
+            "movdqu xmm0, [{src} + 48]",
+            "movntdq [{dst} + 48], xmm0",
+            src = in(reg) src.add(i),
+            dst = in(reg) dst.add(i),
+            options(nostack, preserves_flags),
+        );
+        i += 64;
+    }
+    while i + 16 <= aligned_end {
+        core::arch::asm!(
+            "movdqu xmm0, [{src}]",
+            "movntdq [{dst}], xmm0",
+            src = in(reg) src.add(i),
+            dst = in(reg) dst.add(i),
+            options(nostack, preserves_flags),
+        );
+        i += 16;
+    }
+    if i < width_bytes {
+        core::ptr::copy_nonoverlapping(src.add(i), dst.add(i), width_bytes - i);
+    }
+}
 
 /// Copy `width_bytes` bytes from `src` to `dst` using `MOVNTDQA` for each
 /// 16-byte-aligned source chunk.
@@ -189,6 +272,63 @@ unsafe fn nt_copy_row_aligned(dst: *mut u8, src: *const u8, width_bytes: usize) 
     }
 }
 
+/// Copy `height` rows of `width_bytes` bytes each from `src` to `dst` using
+/// non-temporal **stores** (`MOVNTDQ`).
+///
+/// Call this when the destination is write-combining (UEFI GOP / NVIDIA
+/// BAR1). Regular stores to that aperture are ~42 MB/s; NT stores combine
+/// into 64-byte PCIe writes. A trailing `SFENCE` drains the WC buffers so
+/// scanout / cursor overlay cannot observe a torn last line.
+///
+/// Returns `false` when the CPU lacks the NT-blit feature; the caller must
+/// then use a scalar copy. Does **not** skip a `clflush_span` of a WB
+/// source — NT stores do not make GPU-written WB lines coherent.
+pub fn nt_store_rows(
+    dst: *mut u8,
+    dst_stride: usize,
+    src: *const u8,
+    src_stride: usize,
+    width_bytes: usize,
+    height: usize,
+) -> bool {
+    if height == 0 || width_bytes == 0 {
+        return false;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if !HAS_NT_BLIT.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut xmm0_save = [0u8; 16];
+        unsafe {
+            core::arch::asm!(
+                "movdqu [{buf}], xmm0",
+                buf = in(reg) xmm0_save.as_mut_ptr(),
+                options(nostack, preserves_flags),
+            );
+            for r in 0..height {
+                nt_store_row(
+                    dst.add(r * dst_stride),
+                    src.add(r * src_stride),
+                    width_bytes,
+                );
+            }
+            core::arch::x86_64::_mm_sfence();
+            core::arch::asm!(
+                "movdqu xmm0, [{buf}]",
+                buf = in(reg) xmm0_save.as_ptr(),
+                options(nostack, preserves_flags),
+            );
+        }
+        return true;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (dst, dst_stride, src, src_stride, width_bytes, height);
+        false
+    }
+}
+
 /// Copy `height` rows of `width_bytes` bytes each from `src` to `dst`, using
 /// non-temporal loads for the source on capable CPUs.
 ///
@@ -196,7 +336,8 @@ unsafe fn nt_copy_row_aligned(dst: *mut u8, src: *const u8, width_bytes: usize) 
 /// vol. 1 §12.10.3); on an ordinary write-back mapping it behaves as a plain
 /// cached load, so it does NOT make a preceding `clflush_span` of a WB source
 /// skippable, and it cannot speed up a present whose bottleneck is the store
-/// side. Kept for a future WC-source path; currently unused by the scanout.
+/// side. The scanout CPU fallback uses [`nt_store_rows`] (NT *stores* into
+/// WC GOP/BAR1) instead.
 pub fn nt_blit_rows(
     dst: *mut u8,
     dst_stride: usize,

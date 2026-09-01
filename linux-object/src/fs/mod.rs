@@ -647,6 +647,12 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         v.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         v.into_iter().map(|(_, _, a)| a).collect()
     };
+    if audio_cards.is_empty() {
+        error!(
+            "[audio] no HDA codec probed — /dev/snd will be empty (aplay -l: no soundcards). \
+             In QEMU pass -device intel-hda -device hda-output; on hardware check dmesg for [hda]"
+        );
+    }
 
     // Add OSS PCM playback nodes: `/dev/dsp` for card 0, `/dev/dsp1`, … for
     // the rest (typically remaining analog or extra HDMI functions).
