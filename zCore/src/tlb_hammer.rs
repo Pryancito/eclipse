@@ -25,6 +25,13 @@ use lock::Mutex;
 use zircon_object::task::{Process, Task, ROOT_JOB};
 use zircon_object::vm::{VmObject, MMUFlags, PAGE_SIZE};
 
+/// Hammer diagnostics go to dmesg *and* serial so QEMU/hardware captures can
+/// see progress without reading `/proc/kmsg` (klog_info alone is ring-buffer only).
+fn hammer_log(msg: core::fmt::Arguments) {
+    kernel_hal::console::serial_write_fmt_spin(format_args!("\n{}\n", msg));
+    klog_info!("{}", msg);
+}
+
 /// Shared lock retained IRQ-off by the holder thread. Mappers that briefly
 /// take it serialize behind the long non-pumping burst — amplifying the
 /// convoy the real panics showed (HOLDER waits TLB ack from a CPU stuck in
@@ -53,11 +60,10 @@ pub fn start(n: usize) {
     let online = kernel_hal::online_cpu_count().max(1);
     let n = n.min(online.max(3));
     let mappers = n.saturating_sub(2).max(1);
-    klog_info!(
+    hammer_log(format_args!(
         "Eclipse: TLB hammer ON (eclipse.tlbhammer={}) — {} mappers + 1 irq-off holder + 1 process churn",
-        n,
-        mappers
-    );
+        n, mappers
+    ));
 
     for i in 0..mappers {
         kernel_hal::thread::spawn(async move {
@@ -181,9 +187,9 @@ async fn progress_loop() {
     loop {
         sleep_ms(10_000).await;
         let n = PROGRESS.fetch_add(1, Ordering::Relaxed) + 1;
-        klog_info!(
+        hammer_log(format_args!(
             "tlbhammer: alive {}0s (no shootdown starvation panic)",
             n
-        );
+        ));
     }
 }
