@@ -645,32 +645,59 @@ impl HdaInner {
 
     /// Re-evaluate the candidate paths and re-route if a better pin has
     /// appeared (e.g. the display driver pushed the monitor's ELD after our
-    /// PCI-probe-time pick). Called with the stream stopped. Even a single
-    /// candidate is re-armed: NVIDIA presence/ELD arrive long after probe,
-    /// and the digital converter/infoframe need a second pass.
+    /// PCI-probe-time pick). Called with the stream stopped.
+    ///
+    /// When multiple candidates exist the paths are re-scored. When only one
+    /// candidate exists (or after re-scoring confirms the same path) the
+    /// current path is fully re-armed via [`try_setup_path`]: this re-sends
+    /// AFG/converter/pin `SET_POWER_STATE` (D0), `SET_PIN_CTL`, channel-select
+    /// and all digital-converter verbs. On NVIDIA HDMI hardware the codec can
+    /// enter D3 between PCI probe and the first stream start; without this
+    /// re-arm the firmware acknowledges the verbs in `start_stream` silently
+    /// but produces no audio.
+    ///
+    /// Re-scoring (`best_candidate`) is still skipped for single-candidate
+    /// codecs: it issues a `PIN_SENSE` verb per candidate and a timed-out verb
+    /// adds 200 ms of stall per underrun-triggered restart.
     fn repick_path(&mut self) {
-        // With a single candidate there is nothing to choose between, and
-        // re-probing is not free: `best_candidate` issues a PIN_SENSE verb per
-        // candidate with the device mutex held and a 200 ms timeout each, so a
-        // codec that stops answering turns every underrun-triggered restart
-        // into a multi-second stall plus a log line per pin.
-        if self.candidates.len() < 2 {
-            return;
-        }
         let afg = self.afg;
-        let Some(best) = self.best_candidate() else {
-            return;
-        };
-        if best.pin != self.pin_nid || best.conv != self.conv_nid {
-            info!(
-                "[hda] re-routing output: pin {:#x} -> pin {:#x}",
-                self.pin_nid, best.pin
-            );
-            if let Err(e) = self.setup_path(afg, &best) {
-                warn!("[hda] re-route failed: {:?} — keeping previous path", e);
+
+        // Re-score only when there is something to choose between.
+        if self.candidates.len() >= 2 {
+            let Some(best) = self.best_candidate() else {
+                return;
+            };
+            if best.pin != self.pin_nid || best.conv != self.conv_nid {
+                info!(
+                    "[hda] re-routing output: pin {:#x} -> pin {:#x}",
+                    self.pin_nid, best.pin
+                );
+                if let Err(e) = self.setup_path(afg, &best) {
+                    warn!("[hda] re-route failed: {:?} — keeping previous path", e);
+                }
+                // setup_path already did the full try_setup_path; done.
+                return;
             }
-        } else if best.digital {
-            self.setup_digital_converter(self.channels);
+            // Best candidate is the same pin/converter — fall through to re-arm.
+        }
+
+        // Re-arm the current path regardless of candidate count.  This covers:
+        //   • single-candidate codecs (no re-scoring possible), and
+        //   • multi-candidate codecs where re-scoring confirmed the same path.
+        // try_setup_path brings the AFG, converter, and pin back to D0, re-sends
+        // SET_PIN_CTL + SET_CONN_SELECT, re-enables any output amp, and
+        // re-programs the digital converter — all needed after kick_hdmi_audio().
+        let conv = self.conv_nid;
+        let pin = self.pin_nid;
+        if let Some(curr) = self
+            .candidates
+            .iter()
+            .find(|c| c.pin == pin && c.conv == conv)
+            .cloned()
+        {
+            if let Err(e) = self.try_setup_path(afg, &curr) {
+                warn!("[hda] path re-arm failed: {:?}", e);
+            }
         }
     }
 
