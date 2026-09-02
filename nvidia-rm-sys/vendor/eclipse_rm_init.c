@@ -6433,8 +6433,9 @@ NV_STATUS eclipse_rm_mark_console_gpu(
 /* ===================================================================
  * DRM: real EDID / connector query via the RM's NV04_DISPLAY_COMMON.
  *
- * Allocates NV04_DISPLAY_COMMON (0x0073) under the step-16 device, then
- * asks the GSP-resident display RM: which outputs exist (GET_SUPPORTED
+ * Borrows the RM's internal NV04_DISPLAY_COMMON (0x0073) handle pair --
+ * allocating it on demand on the console GPU -- then asks the GSP-resident
+ * display RM: which outputs exist (GET_SUPPORTED
  * displayMask + which support DDC), which are connected (GET_CONNECT_
  * STATE), and reads the EDID of the first connected one (GET_EDID_V2).
  * Everything is ROUTED through the live RM -- no register bit-banging.
@@ -6511,8 +6512,15 @@ NV_STATUS eclipse_rm_edid(NvU32 gpuInstance, EclipseGrEdid *pOut)
     pOut->edidStatus      = 0xFFFFFFFF;
     pOut->connTypeStatus  = 0xFFFFFFFF;
 
-    if (!g_grAllocDone)
-        return NV_ERR_INVALID_STATE; /* run step16 first */
+    /*
+     * No step-16 gate here: this query never touches the GR ladder's
+     * client/device -- it borrows the RM's own KernelDisplay handle pair
+     * (below). The real precondition is a GSP-booted GPU, checked right
+     * after. Gating on g_grAllocDone made HDMI audio depend on a GL client
+     * having run CHANNEL_ALLOC: on a text console, or under a pixman
+     * compositor, nothing ever runs step16, every edid() came back
+     * NV_ERR_INVALID_STATE, and the monitor's ELD was never pushed.
+     */
 
     threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
     status = gpumgrThreadEnableExpandedGpuVisibility();
@@ -6954,8 +6962,8 @@ NV_STATUS eclipse_rm_hdmi_audio(NvU32 gpuInstance, NvU32 displayMask,
 
     if (displayMask == 0)
         return NV_ERR_INVALID_ARGUMENT;
-    if (!g_grAllocDone)
-        return NV_ERR_INVALID_STATE; /* run step16 first */
+    /* Same as eclipse_rm_edid: no step-16 gate, the display controls use
+     * the RM's internal DispCommon pair and only need a GSP-booted GPU. */
 
     /* Same lock/visibility context as eclipse_rm_edid (which has run by
      * the time our caller invokes this — the DispCommon handles exist). */

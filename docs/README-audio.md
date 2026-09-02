@@ -68,6 +68,18 @@ backed by `eclipse_rm_hdmi_audio` in `nvidia-rm-sys/vendor/eclipse_rm_init.c`):
 Watch for `[hdmi-audio]` lines in dmesg; `[hda]` lines show each codec's
 candidate paths with their live presence/ELD state.
 
+**Precondition: GSP-RM must be up on the GPU the monitor is plugged into.**
+The RM display controls are RPCs served by the GSP, so a GPU that was never
+RM-attached has no path to push an ELD or enable audio packets, whatever its
+HDA codec is doing. Secondary GPUs are brought up at boot; the **console GPU**
+(the one scanning out the GOP framebuffer) is deliberately not — its GSP boot
+can wedge the bus — and only comes up on demand when a GL client opens a GPU
+channel, or via `cat /proc/gpustep14`. On a text console, or under a pixman
+compositor, that means HDMI audio on the monitor GPU needs that step first.
+Nothing else is required: the display query and the audio enable borrow the
+RM's internal DispCommon handles and do not depend on the GR ladder
+(`gpustep16`), which used to gate them and made audio depend on a GL client.
+
 ## Diagnosing silence: `/proc/gpusnd`
 
 A GPU HDA function that accepts a stream proves nothing — the codec drains the
@@ -91,10 +103,20 @@ cat /proc/gpusnd
   never armed; a pin with `present=0 eld=0` has no live display.
 - **Every candidate path** with its live presence/ELD, `<== ACTIVE` marking
   the one in use — this is where a wrong pin choice shows up.
-- **`[hdmi-audio]`**: the last outcome of the RM-side enable, with the ELD /
-  audio-enable / GCP success masks, or a line saying it never ran. If the
-  stream is `ADVANCING` on a pin that reports present+ELD and the monitor is
-  still silent, this line is the remaining suspect.
+- **`[hdmi-audio]`**: one line per NVIDIA GPU from the last stream-start
+  kick, naming the precondition it stopped at — `RM not attached` (GSP never
+  booted on that GPU: bring it up first), `display query FAILED` (with the
+  NV_STATUS decoded), `connected 0 — no monitor on this GPU`, or the enable
+  outcome with the ELD / audio-enable / GCP success masks. If the stream is
+  `ADVANCING` on a pin that reports present+ELD and the monitor is still
+  silent, this block is the remaining suspect.
+
+A first reading from real hardware (dual RTX 2060 SUPER, text console): the
+GPU's stream was `ADVANCING` with `DIGEN=1`, every pin on both GPUs showed
+`present=0 eld_valid=0`, and the enable had found no GPU with a connected
+output — the codec half was fine and the display half had never been asked,
+because the console GPU had no RM instance and the display query on the other
+one was gated on `gpustep16`.
 
 Play something first — most of the state above only exists while a stream is
 running:
@@ -238,5 +260,9 @@ so you can hear the guest. Override with `AUDIODEV=wav` (PCM to
   enables audio packets). A monitor hot-plugged after boot gets ELD/PD when
   playback starts, or when something re-runs the display query
   (`/proc/gpuedid` or a DRM connector rescan).
+- The audio path never boots the console GPU's GSP on its own (a `write(2)`
+  to `/dev/snd` must not be what hangs the machine). Until something else
+  brings it up, `/proc/gpusnd` says `RM not attached` for it and the monitor
+  stays silent.
 - ALSA card 0 prefers a *live* HDMI/DP pin (presence/ELD). An NVIDIA function
   with no monitor does not outrank the PCH analog codec.
