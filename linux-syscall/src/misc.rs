@@ -418,6 +418,30 @@ impl Syscall<'_> {
         // NOTE: do NOT parse `op` as bitflags — command values are an enum
         // (WAIT_BITSET=9 would alias WAKE=1 when bits are truncated).
         let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+        // Priority-inheritance futexes are not implemented. Answer ENOSYS --
+        // and answer it HERE, before `get_futex`, so the reply never depends on
+        // the probe address.
+        //
+        // ENOSYS is not a cop-out, it is the contract userspace decodes. musl's
+        // pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT) probes the kernel
+        // with FUTEX_LOCK_PI on a throwaway word and translates the result:
+        //     if (r == -ENOSYS) return ENOTSUP;   <- the soft "no PI here"
+        //     if (r) return EINVAL;               <- every OTHER errno
+        // so ENOSYS is what makes callers fall back to a plain mutex, and any
+        // other error -- EOPNOTSUPP included -- reaches them as a hard EINVAL.
+        // PulseAudio's pa_mutex_new() asserts `r == 0 || r == ENOTSUP`
+        // (pulsecore/mutex-posix.c:57) and aborts the process on EINVAL.
+        if matches!(
+            cmd,
+            FUTEX_LOCK_PI
+                | FUTEX_UNLOCK_PI
+                | FUTEX_TRYLOCK_PI
+                | FUTEX_WAIT_REQUEUE_PI
+                | FUTEX_CMP_REQUEUE_PI
+                | FUTEX_LOCK_PI2
+        ) {
+            return Err(LxError::ENOSYS);
+        }
         let futex = self
             .linux_process()
             .get_futex(uaddr)
@@ -482,25 +506,6 @@ impl Syscall<'_> {
                     Ok(_) => Ok(0),
                     Err(e) => Err(e.into()),
                 }
-            }
-            FUTEX_LOCK_PI
-            | FUTEX_UNLOCK_PI
-            | FUTEX_TRYLOCK_PI
-            | FUTEX_WAIT_REQUEUE_PI
-            | FUTEX_CMP_REQUEUE_PI
-            | FUTEX_LOCK_PI2 => {
-                // Priority-inheritance futexes are not implemented. Answer
-                // EOPNOTSUPP (ENOTSUP, 95), NOT ENOSYS: musl's
-                // pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT) probes
-                // the kernel once with FUTEX_LOCK_PI on a throwaway word and
-                // returns the kernel's errno to the caller. PulseAudio's
-                // pa_mutex_new() then asserts `r == 0 || r == ENOTSUP`
-                // (pulsecore/mutex-posix.c:57) -- with ENOSYS it aborts, which
-                // is exactly how supertux2 (SDL2 -> pulse) died on the real
-                // machine. ENOTSUP is the documented "protocol unsupported"
-                // answer and makes every such caller fall back to a plain
-                // mutex.
-                Err(LxError::EOPNOTSUPP)
             }
             _ => {
                 warn!("unsupported futex operation: {:#x} (cmd {})", op, cmd);
