@@ -771,33 +771,11 @@ pub fn hdmi_audio_status() -> alloc::string::String {
     match &*HDMI_AUDIO_STATUS.lock() {
         Some(s) => alloc::format!("{}\n", s),
         None => alloc::string::String::from(
-            "[hdmi-audio] never ran — nothing has queried the DRM connector topology yet,\n\
+            "[hdmi-audio] never ran — no RM display query and no digital stream start yet,\n\
              [hdmi-audio]   so the display engine was never told to transmit audio.\n",
         ),
     }
 }
-
-/// Run the HDMI/DP audio enable for every NVIDIA GPU whose RM bring-up has
-/// finished, without waiting for a DRM client to ask for the topology.
-///
-/// The enable used to be reachable only through `rm_display_state`, i.e. only
-/// when something queried connectors. Playing audio on a GPU HDA function with
-/// no DRM consumer around therefore left the display engine silent: the codec
-/// took the stream, the ring drained, every call returned Ok, and nothing came
-/// out of the cable. Idempotent, and cheap once it has succeeded.
-pub fn ensure_hdmi_audio_enabled() {
-    for instance in 0..NV_MAX_PROBE_INSTANCES {
-        if let Ok(d) = nvidia_rm_sys::rm_init::edid(instance) {
-            if d.supported_status == 0 && d.display_mask != 0 {
-                NvidiaGpu::rm_enable_hdmi_audio_once(instance, &d);
-            }
-        }
-    }
-}
-
-/// How many RM device instances `ensure_hdmi_audio_enabled` probes. Boards with
-/// more GPUs than this still get the enable through the DRM path.
-const NV_MAX_PROBE_INSTANCES: u32 = 4;
 
 impl NvidiaGpu {
     fn pitch_pixels(&self) -> usize {
@@ -2777,10 +2755,20 @@ impl NvidiaGpu {
     /// piggybacked on RM display queries once DispCommon handles exist.
     /// Latched only after a successful ELD push so a first call with
     /// `connected_mask == 0` or a transient RM failure still retries.
-    pub(super) fn rm_enable_hdmi_audio_once(instance: u32, d: &nvidia_rm_sys::rm_init::GrEdid) {
+    fn rm_enable_hdmi_audio_once(instance: u32, d: &nvidia_rm_sys::rm_init::GrEdid) {
+        Self::rm_enable_hdmi_audio(instance, d, false);
+    }
+
+    /// Push ELD + unmute HDMI/DP audio packets. `force` re-sends even after a
+    /// successful first pass (stream start: GOP never enables audio, and the
+    /// first DRM query can run before the head is scanning out).
+    fn rm_enable_hdmi_audio(instance: u32, d: &nvidia_rm_sys::rm_init::GrEdid, force: bool) {
         use core::sync::atomic::{AtomicU32, Ordering};
         static DONE: AtomicU32 = AtomicU32::new(0);
-        if instance >= 32 || (DONE.load(Ordering::Acquire) & (1 << instance)) != 0 {
+        if instance >= 32 {
+            return;
+        }
+        if !force && (DONE.load(Ordering::Acquire) & (1 << instance)) != 0 {
             return;
         }
         if d.connected_mask == 0 {
@@ -2795,13 +2783,14 @@ impl NvidiaGpu {
             return;
         }
         // TMDS/HDMI outputs get SET_HDMI_ENABLE + GCP un-mute on top of ELD.
+        // DP / USB-C (DP alt-mode) take the DP unmute path inside RM.
         let n = (d.conn_type_count as usize).min(d.conn_type_display_id.len());
         let hdmi_mask: u32 = (0..n)
             .filter(|&i| matches!(d.conn_type[i], 0x61 | 0x63))
             .map(|i| d.conn_type_display_id[i])
             .fold(0, |m, id| m | id)
             & d.connected_mask;
-        match nvidia_rm_sys::rm_init::hdmi_audio(instance, d.connected_mask, hdmi_mask) {
+        match nvidia_rm_sys::rm_init::hdmi_audio(instance, d.connected_mask, hdmi_mask, force) {
             Ok(out) => {
                 record_hdmi_audio_status(alloc::format!(
                     "[hdmi-audio] gpu{}: displays {:#x} (hdmi {:#x}) — ELD ok {:#x}, audio-enable ok {:#x}, gcp ok {:#x} (sads={}, maxFreq={})",
@@ -2815,7 +2804,7 @@ impl NvidiaGpu {
                     out.max_freq,
                 ));
                 log::warn!(
-                    "[hdmi-audio] gpu{}: displays {:#x} (hdmi {:#x}) — ELD ok {:#x}, audio-enable ok {:#x}, gcp ok {:#x} (sads={}, maxFreq={})",
+                    "[hdmi-audio] gpu{}: displays {:#x} (hdmi {:#x}) — ELD ok {:#x}, audio-enable ok {:#x}, gcp ok {:#x} (sads={}, maxFreq={}){}",
                     instance,
                     out.attempted_mask,
                     hdmi_mask,
@@ -2824,6 +2813,7 @@ impl NvidiaGpu {
                     out.gcp_ok_mask,
                     out.sad_count,
                     out.max_freq,
+                    if force { " [stream]" } else { "" },
                 );
                 if out.eld_ok_mask != 0 {
                     DONE.fetch_or(1 << instance, Ordering::AcqRel);
@@ -2841,6 +2831,44 @@ impl NvidiaGpu {
                     st
                 );
             }
+        }
+    }
+
+    /// Re-push ELD/unmute on every RM GPU that has a connected output.
+    /// The HDA driver calls this at digital stream start.
+    pub(crate) fn kick_hdmi_audio_all() {
+        // Nothing enabled means either no GPU answered or none had a display.
+        // Say so in `/proc/gpusnd`: "the enable never ran" and "it ran and
+        // found nothing" look identical from userspace otherwise.
+        let mut kicked = false;
+        for instance in 0..8u32 {
+            match nvidia_rm_sys::rm_init::edid(instance) {
+                Ok(d) if d.supported_status == 0 && d.connected_mask != 0 => {
+                    kicked = true;
+                    Self::rm_enable_hdmi_audio(instance, &d, true);
+                }
+                Ok(_) => {
+                    // GPU present but no connected outputs — nothing to do.
+                }
+                Err(st) => {
+                    // edid() returns Err when the RM device instance is not yet
+                    // attached (the GPU is still being probed) or when the GPU
+                    // does not exist.  Warn only for instances 0 and 1 to avoid
+                    // log spam for the six non-existent slots.
+                    if instance < 2 {
+                        log::warn!(
+                            "[hdmi-audio] gpu{}: edid query failed NV_STATUS={:#x} — will retry at next stream start",
+                            instance, st
+                        );
+                    }
+                }
+            }
+        }
+        if !kicked {
+            record_hdmi_audio_status(alloc::string::String::from(
+                "[hdmi-audio] stream start: no RM GPU reported a connected output — \
+                 display engine not told to transmit",
+            ));
         }
     }
 

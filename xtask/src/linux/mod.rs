@@ -472,6 +472,19 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             eprintln!("warning: wavplay not built; /dev/dsp has no test client");
         }
 
+        // eclipse-sdl-probe: SDL2/SDL3 smoke test + micro-bench for the desktop
+        // (dlopens the apk-installed libSDL at run time, so it links against
+        // libc only). `eclipse-sdl-probe` / `--sdl3 --surface` from a session
+        // terminal say which video backend and render driver the SDL policy
+        // produced and how fast they present. See tools/eclipse-sdl-probe.
+        let sdl_probe = self.eclipse_sdl_probe(&musl);
+        if sdl_probe.is_file() {
+            let _ = dir::rm(bin.join("eclipse-sdl-probe"));
+            fs::copy(&sdl_probe, bin.join("eclipse-sdl-probe")).unwrap();
+        } else {
+            eprintln!("warning: eclipse-sdl-probe not built; SDL has no smoke test in the image");
+        }
+
         // 拷贝 install-eclipse
         let install_eclipse = self.install_eclipse(&musl);
         if install_eclipse.is_file() {
@@ -743,15 +756,24 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               \x20\x20 export WLR_DRM_NO_MODIFIERS=1\n\
               \x20\x20 export GALLIUM_DRIVER=zink\n\
               \x20\x20 export MESA_LOADER_DRIVER_OVERRIDE=zink\n\
+              \x20\x20 # SDL: GLES2 renderer on the GPU sessions (SDL2 has no Vulkan\n\
+              \x20\x20 # renderer; GLES2 lands on zink+NVK like the compositor).\n\
+              \x20\x20 export SDL_RENDER_DRIVER=opengles2\n\
+              \x20\x20 export SDL_FRAMEBUFFER_ACCELERATION=opengles2\n\
               \x20 elif grep -q 'nvidia\\.wlr_gles2' /proc/cmdline 2>/dev/null; then\n\
               \x20\x20 export WLR_RENDERER=gles2\n\
               \x20\x20 export WLR_DRM_NO_MODIFIERS=1\n\
               \x20\x20 export GALLIUM_DRIVER=zink\n\
               \x20\x20 export MESA_LOADER_DRIVER_OVERRIDE=zink\n\
+              \x20\x20 export SDL_RENDER_DRIVER=opengles2\n\
+              \x20\x20 export SDL_FRAMEBUFFER_ACCELERATION=opengles2\n\
               \x20 else\n\
               \x20\x20 export WLR_RENDERER=pixman\n\
               \x20\x20 export WLR_RENDERER_ALLOW_SOFTWARE=1\n\
               \x20\x20 export LIBGL_ALWAYS_SOFTWARE=1\n\
+              \x20\x20 # SDL on pixman: software renderer, no GL behind window surfaces.\n\
+              \x20\x20 export SDL_RENDER_DRIVER=software\n\
+              \x20\x20 export SDL_FRAMEBUFFER_ACCELERATION=0\n\
               \x20 fi\n\
               elif grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null; then\n\
               \x20 # flag but no NVIDIA (the GL=1 image under QEMU): software GL,\n\
@@ -759,6 +781,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               \x20 export WLR_RENDERER=gles2\n\
               \x20 export WLR_RENDERER_ALLOW_SOFTWARE=1\n\
               \x20 export LIBGL_ALWAYS_SOFTWARE=1\n\
+              \x20 export SDL_RENDER_DRIVER=opengles2\n\
+              \x20 export SDL_FRAMEBUFFER_ACCELERATION=opengles2\n\
               else\n\
               \x20 # no flag -> kernel uAPI off -> pixman compositor, and GL\n\
               \x20 # clients from this shell go llvmpipe (no hardware GL exists\n\
@@ -766,7 +790,22 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               \x20 export WLR_RENDERER=pixman\n\
               \x20 export WLR_RENDERER_ALLOW_SOFTWARE=1\n\
               \x20 export LIBGL_ALWAYS_SOFTWARE=1\n\
+              \x20 export SDL_RENDER_DRIVER=software\n\
+              \x20 export SDL_FRAMEBUFFER_ACCELERATION=0\n\
               fi\n\
+              # SDL (sdl12-compat / SDL2 / SDL3) backends, renderer-independent:\n\
+              # native Wayland first, X11 fallback (Xwayland here, Xorg under\n\
+              # desktop=xorg -- the list makes ONE policy serve both sessions),\n\
+              # and ALSA audio, the only userspace audio API this kernel has.\n\
+              # Without the video pin SDL2 picks X11 whenever DISPLAY is set,\n\
+              # i.e. always (DISPLAY=:0 pin), taking the Xwayland detour. The\n\
+              # comma list needs SDL >= 2.24 (Alpine ships 2.30+); SDL3 reads the\n\
+              # underscored names. Same policy as build_child_env and the labwc\n\
+              # wrapper; the renderer half is in the block above.\n\
+              export SDL_VIDEODRIVER=wayland,x11\n\
+              export SDL_VIDEO_DRIVER=wayland,x11\n\
+              export SDL_AUDIODRIVER=alsa\n\
+              export SDL_AUDIO_DRIVER=alsa\n\
               # wlroots' libinput backend aborts the whole compositor if it\n\
               # enumerates zero input devices ('libinput initialization failed,\n\
               # no input devices'). Without a running udevd to tag devices,\n\
@@ -1361,6 +1400,51 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             eprintln!("warning: failed to compile libeclipse_dns.so");
         }
         lib
+    }
+
+    /// Build eclipse-sdl-probe (tools/eclipse-sdl-probe): the SDL smoke test.
+    /// DYNAMIC on purpose -- a static musl binary cannot `dlopen`, and the
+    /// probe resolves libSDL2/libSDL3 at run time so the host needs no SDL
+    /// headers or libraries. It links against libc (+dl, +m) only, which the
+    /// rootfs's musl loader serves; libeclipse_spawnfix.so is the precedent
+    /// for cross-built dynamic objects running on the Alpine musl there.
+    fn eclipse_sdl_probe(&self, musl: &Path) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join("eclipse-sdl-probe");
+        let executable = dir.join("eclipse-sdl-probe");
+        let source = dir.join("eclipse-sdl-probe.c");
+        if executable.is_file() && source.is_file() {
+            if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
+            {
+                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
+                    if bin_mtime >= src_mtime {
+                        return executable;
+                    }
+                }
+            }
+        }
+
+        println!("Compiling eclipse-sdl-probe...");
+        let musl = musl.canonicalize().unwrap();
+        let arch = self.0.name();
+        let cc = format!("{}/{}-linux-musl-gcc", musl.join("bin").display(), arch);
+        let strip = self.strip(&musl);
+        fs::create_dir_all(&dir).unwrap();
+        let status = Ext::new(&cc)
+            .current_dir(&dir)
+            .arg("-O2")
+            .arg("-Wall")
+            .arg("-o")
+            .arg(&executable)
+            .arg(&source)
+            .arg("-ldl")
+            .arg("-lm")
+            .status();
+        if !status.success() {
+            eprintln!("warning: failed to compile eclipse-sdl-probe");
+            return executable;
+        }
+        Ext::new(strip).arg("-s").arg(&executable).status();
+        executable
     }
 
     /// Build libeclipse_spawnfix.so (LD_PRELOAD for labwc's double-fork spawn).

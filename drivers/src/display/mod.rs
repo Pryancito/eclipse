@@ -15,8 +15,7 @@ mod uefi;
 pub use nouveau_uapi::{enabled as nouveau_uapi_enabled, set_enabled as set_nouveau_uapi_enabled};
 #[cfg(target_arch = "x86_64")]
 pub use nvidia::{
-    boot_edid, ensure_hdmi_audio_enabled, hdmi_audio_status, set_boot_edid, set_boot_fb_info,
-    NvidiaGpu, NvidiaGpuDriverPci,
+    boot_edid, hdmi_audio_status, set_boot_edid, set_boot_fb_info, NvidiaGpu, NvidiaGpuDriverPci,
 };
 
 /// Re-export of `nvidia_rm_sys::os_interface::set_thread_id_provider`, so
@@ -28,6 +27,15 @@ pub fn set_rm_thread_id_provider(f: fn() -> u64) {
     nvidia_rm_sys::os_interface::set_thread_id_provider(f);
 }
 pub use uefi::UefiDisplay;
+
+/// Re-push ELD and unmute HDMI/DP audio on NVIDIA GPUs that have a connected
+/// display. The HDA driver calls this at stream start: firmware GOP never
+/// enables audio packets, so without it `wavplay` succeeds and the monitor
+/// stays silent.
+pub fn kick_hdmi_audio() {
+    #[cfg(target_arch = "x86_64")]
+    nvidia::NvidiaGpu::kick_hdmi_audio_all();
+}
 
 /// The UEFI-captured EDID is only wired up on x86_64 (via the NVIDIA/UEFI
 /// boot path). On other arches there is no boot EDID; readers (procfs

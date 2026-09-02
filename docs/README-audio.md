@@ -36,7 +36,11 @@ HDA controller (PCI 04:03) ── codec ── pin ── HDMI/DP or analog jack
 - **HDMI specifics**: digital converter enable, `SET_CVT_CHAN_COUNT`
   (`0x72d`) + HDMI channel slots, CEA audio infoframe through the pin's
   DIP buffer (reindexed every 8 bytes), and the NVIDIA coherent-DMA
-  (snoop) PCI config bits.
+  (snoop) PCI config bits. Path scoring prefers a pin with live
+  presence/ELD so an unconnected GPU connector does not steal card 0
+  from analog. At stream start the HDA driver re-pushes ELD/unmute
+  through RM (`kick_hdmi_audio`) and re-runs pin sense (`SET_PIN_SENSE`
+  then `GET_PIN_SENSE`) because GOP never enables audio packets.
 
 On boot, `eclipse-boot-sound` plays `/usr/share/eclipse/Eclipse_Awakening.mp3`
 once the compositor is up (`mpg123` via ALSA card 0).
@@ -63,6 +67,42 @@ backed by `eclipse_rm_hdmi_audio` in `nvidia-rm-sys/vendor/eclipse_rm_init.c`):
 
 Watch for `[hdmi-audio]` lines in dmesg; `[hda]` lines show each codec's
 candidate paths with their live presence/ELD state.
+
+## Diagnosing silence: `/proc/gpusnd`
+
+A GPU HDA function that accepts a stream proves nothing — the codec drains the
+ring whether or not the display engine puts audio packets on the cable, so the
+failure mode is *silence with no error anywhere*. `cat /proc/gpusnd` dumps, per
+card, what the hardware is actually doing right now:
+
+```sh
+cat /proc/gpusnd
+```
+
+- **Controller/stream**: GCAP, STATESTS, the codec address, and the output
+  stream descriptor — `SD_CTL` (RUN bit and stream tag), `SD_FMT`, `SD_CBL`,
+  and `SD_LPIB` sampled twice 2 ms apart, reported as `ADVANCING` or
+  `STALLED`. `STALLED` with RUN set means the DMA engine is not fetching:
+  a controller/BDL problem, not a display one.
+- **Active path**, read back *from the codec* rather than from what the driver
+  believes it wrote: the converter's stream id and format, digital-converter
+  enable, power state, and on the pin the OUT_EN bit, presence/ELD-valid from
+  `GET_PIN_SENSE`, and EAPD. A converter whose stream id reads back 0 was
+  never armed; a pin with `present=0 eld=0` has no live display.
+- **Every candidate path** with its live presence/ELD, `<== ACTIVE` marking
+  the one in use — this is where a wrong pin choice shows up.
+- **`[hdmi-audio]`**: the last outcome of the RM-side enable, with the ELD /
+  audio-enable / GCP success masks, or a line saying it never ran. If the
+  stream is `ADVANCING` on a pin that reports present+ELD and the monitor is
+  still silent, this line is the remaining suspect.
+
+Play something first — most of the state above only exists while a stream is
+running:
+
+```sh
+speaker-test -c 2 -t sine &
+cat /proc/gpusnd
+```
 
 ## Userspace API: ALSA (`/dev/snd/*`)
 
@@ -194,6 +234,9 @@ so you can hear the guest. Override with `AUDIODEV=wav` (PCM to
   next `write`.
 - The DP audio path uses the same ELD/enable controls but has not been
   exercised; DP-MST audio (device entries > 0) is not implemented.
-- The HDMI/DP unmute is sent once a connected output's ELD push succeeds;
-  a monitor that is hot-plugged later gets ELD/PD only when something
-  re-runs the display query (`/proc/gpuedid` or a DRM connector rescan).
+- The HDMI/DP unmute is re-sent at every digital stream start (GOP never
+  enables audio packets). A monitor hot-plugged after boot gets ELD/PD when
+  playback starts, or when something re-runs the display query
+  (`/proc/gpuedid` or a DRM connector rescan).
+- ALSA card 0 prefers a *live* HDMI/DP pin (presence/ELD). An NVIDIA function
+  with no monitor does not outrank the PCH analog codec.
