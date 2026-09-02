@@ -64,6 +64,17 @@ const DEFAULT_PACKAGES: &[&str] = &[
     // (Firefox). Heavy (~tens of MiB) but the one that makes GL work headless.
     "mesa-dri-gallium",
     "mesa-gl",
+    // EGL + GLESv2, declared EXPLICITLY rather than relied on transitively.
+    // wlroots' gles2 renderer -- the hardware path the session picks on
+    // NVIDIA (`nvidia.wlr_gles2`, and zink+NVK underneath) -- dlopens
+    // libEGL.so.1 and libGLESv2.so.2, which in Alpine live in these two
+    // packages and NOT in `mesa-gl`. Today they arrive only as a dependency
+    // of labwc/wlroots; if that chain ever changes, EGL init fails and
+    // wlroots silently falls back to the pixman software renderer, which
+    // looks exactly like "the GPU stopped working" (single-digit FPS with
+    // no error). One line here removes that failure mode.
+    "mesa-egl",
+    "mesa-gles",
     // ── Hardware GL on NVIDIA via Zink + NVK (Vulkan) ───────────────────────
     // Since Mesa 25.1 the DEFAULT OpenGL path for NVIDIA GPUs is NO LONGER the
     // classic nvc0 Gallium driver (GEM_PUSHBUF) -- it is Zink (GL-on-Vulkan)
