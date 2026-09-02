@@ -7,9 +7,9 @@ use std::{fs, path::Path};
 const EFI_PARTITION_BYTES: usize = 1024 * 1024 * 1024;
 
 /// FAT32 ESP: siempre [`EFI_PARTITION_BYTES`]. Falla en build si los payloads
-/// no caben (p. ej. zcore.elf + initramfs superan ~252 MiB). The 1 GiB ESP
-/// comfortably absorbs the ~23 MiB NVIDIA GSP firmware now kept in the
-/// bootstrap initramfs (see the build step below).
+/// no caben. The bootstrap initramfs on the ESP is lean (LIVE_KEEP + GSP
+/// firmware only — no desktop/LLVM), so 1 GiB is ample headroom for kernel
+/// updates; it is not a dumping ground for `usr/lib`.
 fn efi_fat_size_for(initramfs_bytes: u64, zcore_bytes: u64, boot_bytes: u64) -> usize {
     let payload = initramfs_bytes + zcore_bytes + boot_bytes;
     const FAT_METADATA_SLACK: u64 = 4 * 1024 * 1024;
@@ -178,26 +178,14 @@ impl super::LinuxRootfs {
                 let _ = fs::remove_file(boot_dir.join(name));
             }
 
-            // Build the minimal live/installer root. Both initramfs images (the
-            // efi-embedded bootstrap and the live image) are built from THIS,
-            // not from the full rootfs: they are loaded into RAM at boot, so the
-            // heavy OS components (TinyX, perf, libLLVM, libc-test, …) must stay
-            // out of them. Those ship only in rootfs.btrfs.gz and run from the
-            // btrfs disk on the installed system (which pivots root onto it).
+            // Minimal root for BOTH initramfs images. The EFI bootstrap is
+            // snapshotted from this *before* the desktop stack is copied in
+            // (see below): the installed system only pivots onto btrfs, so
+            // Mesa/LLVM/fonts must not land in `\EFI\zCore\initramfs.img`.
+            // QEMU/ISO then get the same tree plus `copy_into_live`.
             let live_root = TARGET.join("live-rootfs");
             println!("Building minimal live/installer root...");
             build_live_rootfs(&rootfs_path, &live_root);
-
-            // The X.Org stack baked into the full rootfs (see xorg.rs) lives in
-            // usr/bin + usr/lib, which LIVE_KEEP deliberately omits and the
-            // per-file cap would truncate — so QEMU (which boots this live
-            // initramfs, not the installed btrfs) would have X on disk but not
-            // in RAM. Copy the X-owned trees in uncapped so `startx` works in
-            // QEMU too, INCLUDING usr/lib/dri (the Mesa DRI entries are symlinks
-            // into libraries already copied under usr/lib, so excluding them
-            // saved nothing and broke GL); disable with ECLIPSE_XORG_LIVE=0 for
-            // a lean installer.
-            super::xorg::copy_into_live(&rootfs_path, &live_root);
 
             // The vendored NVIDIA driver reads gsp.bin at boot from the
             // initramfs (zCore/src/main.rs load_nvidia_gsp_firmware, right
@@ -211,9 +199,10 @@ impl super::LinuxRootfs {
             // straight into the live root, uncapped, so it ships in the RAM
             // initramfs; sfs_size_for(dir_size(&live_root)) below then sizes
             // the image to fit. This is the one heavy file deliberately kept
-            // in the initramfs -- the GPU needs its firmware at bring-up time,
-            // not after root pivot. Copy the blob already installed into the
-            // full rootfs (line above) rather than re-fetching it.
+            // in the bootstrap initramfs -- the GPU needs its firmware at
+            // bring-up time, not after root pivot. Copy the blob already
+            // installed into the full rootfs (line above) rather than
+            // re-fetching it.
             {
                 let fw_rel = "lib/firmware/nvidia/gsp/gsp.bin";
                 let fw_src = rootfs_path.join(fw_rel);
@@ -252,16 +241,17 @@ impl super::LinuxRootfs {
             });
             build_config.invoke(os_xtask_utils::Cargo::build);
 
-            // 3. Build the efi-embedded bootstrap initramfs SFS (x86_64.img)
-            // from the minimal root (no payloads). This is the initramfs the
-            // installer writes (inside efi.img) to the target ESP; the installed
-            // system boots it only to pivot root onto the btrfs partition.
+            // 3. Bootstrap initramfs for the installed ESP. Snapshot NOW, while
+            // live_root is still LIVE_KEEP + GSP only — no desktop, no LLVM,
+            // no installer payloads. The installed system boots this only to
+            // pivot onto btrfs. Written to a dedicated file so the later live
+            // SFS can own zCore/x86_64.img (what `make qemu` copies to the ESP).
             let bootstrap_size = sfs_size_for(dir_size(&live_root));
             println!(
-                "Building bootstrap initramfs x86_64.img ({} MiB)...",
+                "Building bootstrap initramfs.img ({} MiB, no desktop stack)...",
                 bootstrap_size / (1024 * 1024)
             );
-            let initramfs_img = PROJECT_DIR.join("zCore").join("x86_64.img");
+            let initramfs_img = TARGET.join("initramfs.img");
             fuse(&live_root, &initramfs_img, bootstrap_size);
 
             let rboot_efi = rboot_dir.join("target/x86_64-unknown-uefi/release/rboot.efi");
@@ -354,6 +344,14 @@ impl super::LinuxRootfs {
                 .unwrap();
             assert!(status.success(), "Failed to compress efi.img");
 
+            // Desktop stack belongs in the QEMU/ISO live initramfs only, never
+            // in the EFI bootstrap just frozen into efi.img. usr/bin + usr/lib
+            // (Mesa, libLLVM ~180 MiB, fonts, icons) are omitted by LIVE_KEEP
+            // and would have been the bulk of initramfs.img. QEMU boots this
+            // live tree without pivoting, so `startx` still needs them here.
+            // Disable with ECLIPSE_XORG_LIVE=0 for a lean live image too.
+            super::xorg::copy_into_live(&rootfs_path, &live_root);
+
             // NOTE: the payloads (efi.img.gz / rootfs.btrfs.gz / home.btrfs.gz)
             // are staged into the minimal live root's `/boot` only *after*
             // rootfs.btrfs is built (step 5c), so the full rootfs used for the
@@ -411,9 +409,9 @@ impl super::LinuxRootfs {
             fs::copy(&target_btrfs_gz, live_boot.join("rootfs.btrfs.gz")).unwrap();
             fs::copy(&target_home_gz, live_boot.join("home.btrfs.gz")).unwrap();
 
-            // 6. Build the final installer-enabled x86_64.img (SFS) for QEMU/ESP
-            // from the minimal live root + payloads. Sized tightly because the
-            // whole image is loaded into RAM at boot.
+            // 6. Build the final installer-enabled x86_64.img (SFS) for QEMU/ISO
+            // from live_root + desktop + payloads. Not written to the installed
+            // ESP — that carries the lean bootstrap from step 3.
             let live_size = live_image_size(dir_size(&live_root));
             println!(
                 "Building final installer-enabled image ({} MiB)...",

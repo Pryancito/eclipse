@@ -1002,13 +1002,15 @@ pub(super) fn install(rootfs: &Path, apk_bin: &Path, arch: &str) {
 // files — so without help X would be present on disk but absent in QEMU.
 //
 // `copy_into_live` copies the X-owned trees into the live root UNCAPPED so
-// `startx` works in QEMU too. It now INCLUDES `usr/lib/dri` (see the note at
+// `startx` works in QEMU too. The installed ESP's bootstrap initramfs is
+// snapshotted *before* this copy (see image.rs), so Mesa/LLVM never land
+// on the EFI partition. It now INCLUDES `usr/lib/dri` (see the note at
 // `copy_into_live` itself): the Mesa 26.x DRI entries are just symlinks into
 // the megadriver libraries already copied uncapped under `usr/lib`, so
 // excluding them saved no space and only broke GL (labwc "virtio_gpu: driver
 // missing", no desktop on the GL path). With them, Mesa loads virtio_gpu_dri.so
 // (QEMU) and nouveau_dri.so (real hardware). Turn the whole thing off with
-// `ECLIPSE_XORG_LIVE=0` to keep the installer initramfs lean.
+// `ECLIPSE_XORG_LIVE=0` to keep the QEMU/ISO live initramfs lean too.
 
 /// X-owned trees copied verbatim (uncapped) from the full rootfs into the live
 /// root. Missing entries are silently skipped, so this is safe whether or not

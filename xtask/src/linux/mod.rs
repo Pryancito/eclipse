@@ -1849,7 +1849,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # Format conversion: `aplay -D plug x.wav`.\n\
               #\n\
               # No dmix (needs SysV IPC): one playback client at a time.\n\
-              # Card 0 is the preferred playback device (HDMI/DP with a live display).\n\
+              # Card 0 is HDMI when the monitor is live (ELD), else the PCH analog\n\
+              # (same preference as PipeWire on Linux: Intel + one HDMI).\n\
               pcm.!default {\n\
               \x20   type hw\n\
               \x20   card 0\n\

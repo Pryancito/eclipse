@@ -94,6 +94,11 @@ pub fn probe_pci_device(
                     info!("[pci] {} inicializado correctamente", drv.name());
                     return ok;
                 }
+                Err(crate::DeviceError::NotSupported) => {
+                    // Matched the class but declined this function (e.g. extra
+                    // NVIDIA HDMI on a GPU with no monitor). Not a failure.
+                    debug!("[pci] driver '{}' skipped (NotSupported)", drv.name());
+                }
                 Err(e) => {
                     warn!("[pci] driver '{}' falló: {:?}", drv.name(), e);
                 }

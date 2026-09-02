@@ -633,12 +633,9 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         }
     }
 
-    // Playback devices in "default first" order: HDMI/DP with a *live*
-    // display (presence/ELD) outranks analog jacks. An NVIDIA function with
-    // no monitor must not steal card 0 from the PCH analog codec.
-    // With two identical GPUs (e.g. 2× RTX 2060 SUPER) both HDA codecs score
-    // the same at probe time because ELD is pushed lazily.  Force a push now
-    // so the GPU with a live display scores above the unconnected one.
+    // Linux-style cards: Intel PCH analog + one NVIDIA HDMI (the monitor
+    // GPU). HDMI only becomes card 0 when the pin has presence/ELD — the
+    // same rule Pulse/PipeWire uses. Push ELD first so a live display wins.
     zcore_drivers::display::kick_hdmi_audio();
     let audio_cards: Vec<_> = {
         let guard = drivers::all_audio().as_vec();

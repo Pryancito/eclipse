@@ -5,8 +5,10 @@ every PCI class-0403 controller:
 
 - the PCH's onboard controller (e.g. `00:1f.3` on X299 boards) with its
   analog codec,
-- the HDA function of NVIDIA GPUs (`xx:00.1`) whose codec carries one
-  HDMI/DP pin+converter pair per physical connector,
+- the HDA function of the NVIDIA GPU that drives the monitor (`xx:00.1`).
+  Extra GPUs on a dual-board (e.g. a second RTX 2060 SUPER with no display)
+  are left unbound, like Linux leaving those HDMI pins without ELD —
+  `aplay -l` shows Intel PCH + one HDMI, not two silent NVIDIA cards.
 - QEMU's `-device intel-hda -device hda-output`, used to exercise the
   driver in emulation.
 
@@ -38,9 +40,9 @@ HDA controller (PCI 04:03) ── codec ── pin ── HDMI/DP or analog jack
   DIP buffer (reindexed every 8 bytes), and the NVIDIA coherent-DMA
   (snoop) PCI config bits. Path scoring prefers a pin with live
   presence/ELD so an unconnected GPU connector does not steal card 0
-  from analog. At stream start the HDA driver re-pushes ELD/unmute
-  through RM (`kick_hdmi_audio`) and re-runs pin sense (`SET_PIN_SENSE`
-  then `GET_PIN_SENSE`) because GOP never enables audio packets.
+  from analog. At stream start the HDA driver re-enables HDMI transmission
+  (`kick_hdmi_audio`) and re-runs pin sense (`SET_PIN_SENSE` then
+  `GET_PIN_SENSE`) because GOP never enables audio packets.
 
 On boot, `eclipse-boot-sound` plays `/usr/share/eclipse/Eclipse_Awakening.mp3`
 once the compositor is up (`mpg123` via ALSA card 0).
@@ -49,36 +51,28 @@ once the compositor is up (`mpg123` via ALSA card 0).
 
 The HDA codec alone is not enough on a GPU: the **display engine** must
 transmit audio packets for the head, and the codec pin only reports
-presence/ELD once someone writes the ELD. Eclipse scans out on the UEFI
-GOP's boot modeset, and firmware never enables audio — so the nvidia DRM
-driver does it through the RM, piggybacked on its first successful display
-query (`rm_enable_hdmi_audio_once` in `drivers/src/display/nvidia.rs`,
-backed by `eclipse_rm_hdmi_audio` in `nvidia-rm-sys/vendor/eclipse_rm_init.c`):
+presence/ELD once someone writes the ELD. That is the same split Linux
+uses (`snd_hda_intel` + `nvidia`/`nouveau`).
 
-1. `GET_EDID_V2` for each connected output;
-2. build the ELD (same layout as nvkms `FillELDBuffer`) from the EDID's
-   CEA-861 extension — SADs, speaker allocation, monitor name;
-3. HDMI: `SET_HDMI_ENABLE` (audio engine, nvkms `HdmiSendEnable`);
-4. `NV0073_CTRL_CMD_DFP_SET_ELD_AUDIO_CAPS` with PD=1/ELDV=1, device
-   entry 0 — after this the HDA pin reports present + ELD valid;
-5. `NV0073_CTRL_CMD_DFP_SET_AUDIO_ENABLE` — audio stream packets on;
-6. HDMI: `SET_HDMI_AUDIO_MUTESTREAM` unmute + GCP via `SET_OD_PACKET`;
-   DP: `DP_SET_AUDIO_MUTESTREAM` unmute.
+Eclipse scans out on the UEFI GOP's boot modeset, and firmware never
+enables audio. The console GPU — the one the monitor is on — is not
+GSP-booted (SEC2 wedges the bus), so HDMI audio is enabled the **nouveau
+way**: BAR0 MMIO on the live GOP modeset (`gf119_sor_hda_eld` /
+`gf119_sor_hda_hpd` + GV100 SF_USER GCP unmute), using the UEFI EDID to
+build the ELD. No GSP, no `cat /proc/gpustep14`. A GPU that already has
+RM attached still uses the nvkms-equivalent RM controls
+(`SET_HDMI_ENABLE`, `SET_ELD_AUDIO_CAPS`, `SET_AUDIO_ENABLE`, unmute).
 
-Watch for `[hdmi-audio]` lines in dmesg; `[hda]` lines show each codec's
-candidate paths with their live presence/ELD state.
+Cards match a typical Linux desktop:
 
-**Precondition: GSP-RM must be up on the GPU the monitor is plugged into.**
-The RM display controls are RPCs served by the GSP, so a GPU that was never
-RM-attached has no path to push an ELD or enable audio packets, whatever its
-HDA codec is doing. Secondary GPUs are brought up at boot; the **console GPU**
-(the one scanning out the GOP framebuffer) is deliberately not — its GSP boot
-can wedge the bus — and only comes up on demand when a GL client opens a GPU
-channel, or via `cat /proc/gpustep14`. On a text console, or under a pixman
-compositor, that means HDMI audio on the monitor GPU needs that step first.
-Nothing else is required: the display query and the audio enable borrow the
-RM's internal DispCommon handles and do not depend on the GR ladder
-(`gpustep16`), which used to gate them and made audio depend on a GL client.
+- **card 0** is HDMI when the monitor pin has presence/ELD (PipeWire's
+  rule); otherwise the PCH analog codec (ALSA's PCI order).
+- **card 1** is the other one. A second NVIDIA HDA with no display is
+  not registered.
+
+Watch for `[hdmi-audio]` lines in dmesg (`GOP ... ELD+PD+GCP unmute`
+on the console GPU); `[hda]` lines show each codec's candidate paths
+with their live presence/ELD state.
 
 ## Diagnosing silence: `/proc/gpusnd`
 
@@ -104,19 +98,10 @@ cat /proc/gpusnd
 - **Every candidate path** with its live presence/ELD, `<== ACTIVE` marking
   the one in use — this is where a wrong pin choice shows up.
 - **`[hdmi-audio]`**: one line per NVIDIA GPU from the last stream-start
-  kick, naming the precondition it stopped at — `RM not attached` (GSP never
-  booted on that GPU: bring it up first), `display query FAILED` (with the
-  NV_STATUS decoded), `connected 0 — no monitor on this GPU`, or the enable
-  outcome with the ELD / audio-enable / GCP success masks. If the stream is
+  kick. The monitor GPU is enabled via the GOP/BAR0 path (or RM, if GSP
+  is up). Extra GPUs with no display are skipped. If the stream is
   `ADVANCING` on a pin that reports present+ELD and the monitor is still
   silent, this block is the remaining suspect.
-
-A first reading from real hardware (dual RTX 2060 SUPER, text console): the
-GPU's stream was `ADVANCING` with `DIGEN=1`, every pin on both GPUs showed
-`present=0 eld_valid=0`, and the enable had found no GPU with a connected
-output — the codec half was fine and the display half had never been asked,
-because the console GPU had no RM instance and the display query on the other
-one was gated on `gpustep16`.
 
 Play something first — most of the state above only exists while a stream is
 running:
@@ -258,11 +243,10 @@ so you can hear the guest. Override with `AUDIODEV=wav` (PCM to
   exercised; DP-MST audio (device entries > 0) is not implemented.
 - The HDMI/DP unmute is re-sent at every digital stream start (GOP never
   enables audio packets). A monitor hot-plugged after boot gets ELD/PD when
-  playback starts, or when something re-runs the display query
-  (`/proc/gpuedid` or a DRM connector rescan).
-- The audio path never boots the console GPU's GSP on its own (a `write(2)`
-  to `/dev/snd` must not be what hangs the machine). Until something else
-  brings it up, `/proc/gpusnd` says `RM not attached` for it and the monitor
-  stays silent.
-- ALSA card 0 prefers a *live* HDMI/DP pin (presence/ELD). An NVIDIA function
-  with no monitor does not outrank the PCH analog codec.
+  playback starts.
+- The audio path never boots the console GPU's GSP (a `write(2)` to
+  `/dev/snd` must not hang the machine). HDMI on that GPU uses the GOP/BAR0
+  path instead; `/proc/gpusnd` shows `GOP ... ELD+PD+GCP unmute`.
+- ALSA card 0 prefers a *live* HDMI/DP pin (presence/ELD). A dead NVIDIA pin
+  does not outrank the PCH analog codec. A second GPU with no monitor is not
+  registered as a sound card.

@@ -784,6 +784,90 @@ pub fn hdmi_audio_status() -> alloc::string::String {
     }
 }
 
+/// Linux-style HDMI topology: one NVIDIA HDA function, the GPU whose BAR1
+/// holds the GOP framebuffer (the monitor). Extra GPUs on a dual-RTX board
+/// stay silent HDMI cards in Linux too unless a display is plugged in; we
+/// simply do not probe them.
+pub fn nvidia_hda_is_monitor_gpu(bus: u8, device: u8) -> bool {
+    let gpus = NVIDIA_GPUS.lock();
+    if let Some(g) = gpus
+        .iter()
+        .find(|g| g.pci_bus == bus && g.pci_device == device)
+    {
+        return g.drives_boot_display();
+    }
+    drop(gpus);
+    sibling_bar1_holds_boot_fb(bus, device)
+}
+
+/// Function 0 of `bus:dev` is the GPU; BAR1 (config 0x18, 64-bit) is the
+/// framebuffer aperture. The GOP scanout physical address sits inside that
+/// window on the console GPU only.
+fn sibling_bar1_holds_boot_fb(bus: u8, device: u8) -> bool {
+    let Some(fb) = boot_fb_phys() else {
+        return false;
+    };
+    if fb == 0 {
+        return false;
+    }
+    let loc = pci::Location {
+        bus,
+        device,
+        function: 0,
+    };
+    let bar1 = unsafe {
+        crate::bus::pci::read_bar_addr(
+            &crate::bus::pci::PortOpsImpl,
+            crate::bus::pci::PCI_ACCESS,
+            loc,
+            0x18,
+        )
+    };
+    if bar1 == 0 {
+        return false;
+    }
+    fb >= bar1 && fb.saturating_sub(bar1) < (512 << 20)
+}
+
+/// Build a 96-byte ELD from a 128-byte base EDID (nvkms FillELDBuffer layout).
+/// CEA SADs live in extension block 1, which the bootloader does not keep;
+/// a basic-audio 2ch LPCM SAD is used so the sink still plays 48 kHz stereo.
+fn build_eld_from_base_edid(edid: &[u8], display_id: u32, is_dp: bool) -> [u8; 96] {
+    let mut eld = [0u8; 96];
+    if edid.len() < 128 {
+        return eld;
+    }
+    let mut mnl = 0u32;
+    const DESC: [usize; 4] = [54, 72, 90, 108];
+    for off in DESC {
+        if edid[off] == 0 && edid[off + 1] == 0 && edid[off + 2] == 0 && edid[off + 3] == 0xFC {
+            eld[20..33].copy_from_slice(&edid[off + 5..off + 18]);
+            mnl = 13;
+            break;
+        }
+    }
+    // LPCM, 2ch, 32/44.1/48 kHz, 16/20/24-bit (HDMI "basic audio").
+    let sad = [0x09u8, 0x07, 0x07];
+    let sad_count = 1u32;
+    let spk_alloc = 0x01u8;
+    eld[0] = 2 << 3;
+    eld[4] = mnl as u8;
+    eld[5] = ((sad_count << 4) | if is_dp { 1 << 2 } else { 0 }) as u8;
+    eld[7] = spk_alloc;
+    eld[8] = display_id as u8;
+    eld[9] = (display_id >> 8) as u8;
+    eld[10] = (display_id >> 16) as u8;
+    eld[11] = (display_id >> 24) as u8;
+    eld[16] = edid[8];
+    eld[17] = edid[9];
+    eld[18] = edid[10];
+    eld[19] = edid[11];
+    let sad_off = 20 + mnl as usize;
+    eld[sad_off..sad_off + 3].copy_from_slice(&sad);
+    eld[2] = ((16 + mnl + sad_count * 3 + 3) / 4) as u8;
+    eld
+}
+
 impl NvidiaGpu {
     fn pitch_pixels(&self) -> usize {
         if let Some(p) = self.pitch_override {
@@ -2849,11 +2933,128 @@ impl NvidiaGpu {
         line
     }
 
-    /// Re-push ELD/unmute on every probed GPU that has a connected output.
-    /// The HDA driver calls this at digital stream start. Walks the probed
-    /// GPUs, not RM instance numbers, and records one line per GPU for
-    /// `/proc/gpusnd`: silence with no error is only diagnosable if this
-    /// says *which* precondition each GPU failed.
+    /// Enable HDMI/DP audio on the GOP modeset without GSP-RM.
+    ///
+    /// Linux nouveau does this with the same BAR0 registers (`gf119_sor_hda_*`
+    /// + GV100 SF_USER GCP unmute) when the display engine is already scanning
+    /// out. The console GPU cannot take a GSP boot (SEC2 wedges the bus), so
+    /// this is the path that makes the monitor speakers work the way they do
+    /// under Linux: ELD into the HDA codec, presence on the live SOR, GCP
+    /// audio unmute. Video timing is left untouched.
+    fn gop_enable_hdmi_audio(&self) -> String {
+        use core::fmt::Write;
+        let bar0 = self._bar0;
+        let rd =
+            |off: usize| -> u32 { unsafe { core::ptr::read_volatile((bar0 + off) as *const u32) } };
+        let wr = |off: usize, v: u32| unsafe {
+            core::ptr::write_volatile((bar0 + off) as *mut u32, v);
+        };
+        let rmw = |off: usize, mask: u32, val: u32| {
+            wr(off, (rd(off) & !mask) | (val & mask));
+        };
+
+        let edid = match boot_edid() {
+            Some((buf, n)) if n >= 128 => buf,
+            _ => {
+                return String::from("[hdmi-audio] GOP path: no UEFI EDID — cannot build an ELD");
+            }
+        };
+
+        // Armed NVDisplay core channel (v03_00): SOR_SET_CONTROL lives at
+        // NVC37D_SOR_SET_CONTROL(i) = 0x300 + i*0x20. GOP has already armed
+        // the live SOR; owner_mask names the head, protocol is TMDS or DP.
+        const ARMED: usize = 0x0068_8000;
+        const ASSY: usize = 0x0068_0000;
+        let mut found: Vec<(u32, u32, bool)> = Vec::new(); // (sor, head, is_hdmi)
+        for base in [ARMED, ASSY] {
+            for sor in 0u32..8 {
+                let ctrl = rd(base + 0x300 + (sor as usize) * 0x20);
+                let owner = ctrl & 0xff;
+                if owner == 0 {
+                    continue;
+                }
+                let head = owner.trailing_zeros();
+                if head > 7 {
+                    continue;
+                }
+                let proto = (ctrl >> 8) & 0xf;
+                let is_hdmi = matches!(proto, 0x1 | 0x2 | 0x5);
+                let is_dp = matches!(proto, 0x8 | 0x9);
+                if !is_hdmi && !is_dp {
+                    continue;
+                }
+                if !found.iter().any(|&(s, _, _)| s == sor) {
+                    found.push((sor, head, is_hdmi));
+                }
+            }
+            if !found.is_empty() {
+                break;
+            }
+        }
+        if found.is_empty() {
+            // Single-monitor GOP almost always uses head 0 / SOR 0 HDMI.
+            found.push((0, 0, true));
+        }
+
+        let mut report = String::new();
+        for (sor, head, is_hdmi) in found.iter().copied() {
+            let eld = build_eld_from_base_edid(&edid, 1u32 << sor, !is_hdmi);
+            let soff = 0x030 * sor as usize + head as usize * 4;
+            let hoff = head as usize * 0x800;
+            for i in 0..96u32 {
+                wr(0x10ec00 + soff, (i << 8) | eld[i as usize] as u32);
+            }
+            // PD + ELDV (nouveau gf119_sor_hda_eld).
+            rmw(0x10ec10 + soff, 0x8000_0002, 0x8000_0002);
+            // HDA device entry = this head (gf119 0x616548 / gv100 0x616528).
+            rmw(0x616548 + hoff, 0x0000_0070, head << 4);
+            rmw(0x616528 + hoff, 0x0000_0070, head << 4);
+            // Presence (gf119_sor_hda_hpd).
+            rmw(0x10ec10 + soff, 0x8000_0001, 0x8000_0001);
+
+            if is_hdmi {
+                // GV100 SF_USER GCP unmute (nouveau r535_sor_hdmi_audio). Head
+                // 0 is offset 0, so the 0x400 stride does not matter for GOP.
+                let hdmi = head as usize * 0x400;
+                rmw(0x6f00c0 + hdmi, 0x1, 0x0);
+                wr(0x6f00cc + hdmi, 0x0000_0010);
+                rmw(0x6f00c0 + hdmi, 0x1, 0x1);
+            } else {
+                rmw(0x616618 + hoff, 0x8000_000d, 0x8000_0001);
+            }
+
+            if !report.is_empty() {
+                report.push('\n');
+            }
+            let _ = write!(
+                report,
+                "[hdmi-audio] GOP {}: SOR{} head{} {} ELD+PD+{}unmute (no GSP, like nouveau)",
+                alloc::format!("{:02x}:{:02x}.0", self.pci_bus, self.pci_device),
+                sor,
+                head,
+                if is_hdmi { "HDMI" } else { "DP" },
+                if is_hdmi { "GCP " } else { "SF " },
+            );
+        }
+        // Give the HDA codec a couple of milliseconds to latch PD/ELDV
+        // before score_path / pin-sense runs.
+        {
+            let t0 = unsafe { crate::bus::drivers_timer_now_as_micros() };
+            while unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(t0) < 2_000 {
+                gpu_spin();
+            }
+        }
+        log::warn!("{}", report);
+        report
+    }
+
+    /// Re-push ELD/unmute on the GPU that drives the monitor — the Linux
+    /// model: one HDMI sink, not every HDA function on the board.
+    ///
+    /// The console GPU has no GSP (SEC2 wedges), so HDMI audio is enabled
+    /// through BAR0 the way nouveau does on a live GOP modeset. A GPU with
+    /// RM attached still uses the RM controls. Extra GPUs with no display
+    /// are skipped (they are not exposed as ALSA cards either).
     pub(crate) fn kick_hdmi_audio_all() {
         use core::fmt::Write;
         let gpus: Vec<Arc<NvidiaGpu>> = NVIDIA_GPUS.lock().clone();
@@ -2862,37 +3063,36 @@ impl NvidiaGpu {
             report.push_str("[hdmi-audio] stream start: no NVIDIA GPU probed");
         }
         for gpu in gpus.iter() {
+            if !gpu.drives_boot_display() {
+                let _ = write!(
+                    report,
+                    "{}[hdmi-audio] {:02x}:{:02x}.0 {}: skipped — no monitor on this GPU \
+                     (Linux also leaves its HDMI pins without ELD)",
+                    if report.is_empty() { "" } else { "\n" },
+                    gpu.pci_bus,
+                    gpu.pci_device,
+                    gpu.gpu_model,
+                );
+                continue;
+            }
             let who = alloc::format!(
-                "{:02x}:{:02x}.0 {}{}",
+                "{:02x}:{:02x}.0 {} [console GPU, drives the monitor]",
                 gpu.pci_bus,
                 gpu.pci_device,
                 gpu.gpu_model,
-                if gpu.drives_boot_display() {
-                    " [console GPU, drives the monitor]"
-                } else {
-                    ""
-                }
             );
             let instance = *gpu.rm_device_instance.lock();
             let Some(instance) = instance else {
-                // The console GPU is never auto-booted (its GSP boot can wedge
-                // the bus), so this is the expected state on a text console
-                // or under a compositor that never opened a GPU channel. No
-                // RM means no ELD push and no audio packets, whatever the
-                // HDA codec is doing. Deliberately NOT booting it from here:
-                // a write(2) to /dev/snd must never be the thing that hangs
-                // the machine.
+                // No GSP: enable audio on the existing GOP modeset. A
+                // write(2) to /dev/snd must never boot GSP (that can hang
+                // the machine); BAR0 ELD/GCP is the Linux-nouveau equivalent.
+                let gop = gpu.gop_enable_hdmi_audio();
                 let _ = write!(
                     report,
-                    "{}[hdmi-audio] {}: RM not attached — GSP never booted on this GPU, \
-                     so nothing can push the ELD or enable audio packets ({})",
+                    "{}[hdmi-audio] {}: RM not attached, GOP HDMI audio path\n{}",
                     if report.is_empty() { "" } else { "\n" },
                     who,
-                    if gpu.drives_boot_display() {
-                        "bring it up first: `cat /proc/gpustep14`, or start a GL client"
-                    } else {
-                        "boot-time bring-up failed; see dmesg [auto-bringup]"
-                    }
+                    gop,
                 );
                 continue;
             };

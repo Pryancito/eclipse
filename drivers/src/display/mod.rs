@@ -15,7 +15,8 @@ mod uefi;
 pub use nouveau_uapi::{enabled as nouveau_uapi_enabled, set_enabled as set_nouveau_uapi_enabled};
 #[cfg(target_arch = "x86_64")]
 pub use nvidia::{
-    boot_edid, hdmi_audio_status, set_boot_edid, set_boot_fb_info, NvidiaGpu, NvidiaGpuDriverPci,
+    boot_edid, hdmi_audio_status, nvidia_hda_is_monitor_gpu, set_boot_edid, set_boot_fb_info,
+    NvidiaGpu, NvidiaGpuDriverPci,
 };
 
 /// Re-export of `nvidia_rm_sys::os_interface::set_thread_id_provider`, so
@@ -28,13 +29,22 @@ pub fn set_rm_thread_id_provider(f: fn() -> u64) {
 }
 pub use uefi::UefiDisplay;
 
-/// Re-push ELD and unmute HDMI/DP audio on NVIDIA GPUs that have a connected
-/// display. The HDA driver calls this at stream start: firmware GOP never
-/// enables audio packets, so without it `wavplay` succeeds and the monitor
-/// stays silent.
+/// Re-push ELD and unmute HDMI/DP audio on the GPU driving the monitor.
+/// The HDA driver calls this at stream start: firmware GOP never enables
+/// audio packets, so without it `wavplay` succeeds and the monitor stays
+/// silent. Matches Linux: one HDMI sink (the live display), not every GPU.
 pub fn kick_hdmi_audio() {
     #[cfg(target_arch = "x86_64")]
     nvidia::NvidiaGpu::kick_hdmi_audio_all();
+}
+
+/// Whether this NVIDIA HDA function (`bus:dev.1`) belongs to the GPU that
+/// scans out the GOP framebuffer. Extra GPUs are left unbound, like Linux
+/// leaving their HDMI pins without ELD. Always `true` off x86_64 (no NVIDIA
+/// driver).
+#[cfg(not(target_arch = "x86_64"))]
+pub fn nvidia_hda_is_monitor_gpu(_bus: u8, _device: u8) -> bool {
+    true
 }
 
 /// The UEFI-captured EDID is only wired up on x86_64 (via the NVIDIA/UEFI

@@ -4,8 +4,9 @@
 //!
 //! * the PCH's onboard controller (00:1f.3 on the X299 board) with an analog
 //!   codec behind it,
-//! * the HDA function of NVIDIA GPUs (`xx:00.1`), whose codec exposes one
-//!   HDMI/DP pin+converter pair per physical connector, and
+//! * the HDA function of the NVIDIA GPU that drives the monitor (`xx:00.1`).
+//!   Extra GPUs on a dual-board are left unbound (Linux-style: Intel PCH +
+//!   one HDMI card), and
 //! * QEMU's `-device intel-hda -device hda-output`, which is how this driver
 //!   is exercised in emulation.
 //!
@@ -558,7 +559,10 @@ impl HdaInner {
         let eld_valid = sense & (1 << 30) != 0;
         let mut score = 0;
         if p.hdmi_dp && p.digital {
-            score += if present { 4 } else { 1 };
+            // Linux Pulse/PipeWire only uses an HDMI sink with ELD/presence.
+            // A dead NVIDIA pin must not outrank the PCH analog codec — that
+            // was card 0 = silent HDMI while `amixer` on Intel worked.
+            score += if present { 4 } else { 0 };
         }
         if present {
             score += 2;
@@ -1328,6 +1332,21 @@ impl PciDriver for HdaDriverPci {
             Some(BAR::Memory(addr, _len, _, _)) => addr,
             _ => return Err(DeviceError::NotSupported),
         };
+
+        // Linux: PCH analog + one HDMI card (the GPU with the monitor).
+        // Dual-GPU boards expose a second `xx:00.1` with no display; probing
+        // it steals card order and kick_hdmi_audio would DDC a headless GPU.
+        if dev.id.vendor_id == 0x10de
+            && !crate::display::nvidia_hda_is_monitor_gpu(dev.loc.bus, dev.loc.device)
+        {
+            info!(
+                "[hda] skipping {:02x}:{:02x}.1 (nvidia-hdmi) — not the monitor GPU; \
+                 keeping Intel PCH + one HDMI like Linux",
+                dev.loc.bus, dev.loc.device
+            );
+            return Err(DeviceError::NotSupported);
+        }
+
         if let Some(m) = mapper {
             m.query_or_map(addr as usize, 0x4000);
         }
