@@ -1306,6 +1306,15 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # (\"error: 'C' is not a UTF-8 locale\"). init-launched sessions never\n\
           # source /etc/profile, so set it here like the rest of the session env.\n\
           : \"${LANG:=C.UTF-8}\"; export LANG\n\
+          # Audio: this image ships ALSA (alsa-lib + the generated\n\
+          # /etc/asound.conf routing default -> hw:0,0); PulseAudio is only ever\n\
+          # present as an SDL dependency, with no daemon to talk to. SDL tries\n\
+          # the pulse backend FIRST, and libpulse's mutex init asks for\n\
+          # PTHREAD_PRIO_INHERIT, which this kernel answers ENOTSUP -- fine now\n\
+          # that the futex path returns 95 instead of ENOSYS, but pointing SDL\n\
+          # straight at the backend that actually works skips a pointless probe\n\
+          # (and its abort on any older kernel).\n\
+          : \"${SDL_AUDIODRIVER:=alsa}\"; export SDL_AUDIODRIVER\n\
           # (The zink+NVK client pin and WLR_DRM_NO_MODIFIERS moved UP into the\n\
           # renderer block above, so the whole hardware-GL stack is chosen by\n\
           # one two-condition gate -- NVIDIA + nvidia.nouveau_uapi -- instead of\n\

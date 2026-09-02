@@ -7942,13 +7942,25 @@ NV_STATUS eclipse_rm_vm_bind_map(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory,
             pMemory->pMemDesc != NULL)
         {
             memdescSetPteKind(pMemory->pMemDesc, kind);
-            /* "ECLIPSE-GR" tag: promoted to dmesg by the kernel's log sink
-             * even at LOG=error, so a real-hardware boot shows which kinds
-             * were actually programmed (bounded: one line per surface bind
-             * with a non-pitch kind, not per frame). */
-            nv_printf(0, "[eclipse-rm-trace] ECLIPSE-GR kind: 0x%x%s -> hMemory=0x%x (requested 0x%x)\n",
-                      kind, (kind != pteKind) ? " (uncompressed pair)" : "",
-                      hMemory, pteKind);
+            /* "ECLIPSE-GR" tag: promoted to a LIVE dmesg/serial line by the
+             * kernel's log sink even at LOG=error. That visibility caught the
+             * PTE-kind bug (#1014) -- but a game binds dozens of surfaces per
+             * second, and each ~150-char live serial line costs ~13 ms at
+             * 115200 baud, flooding the console and stealing frame time. Now
+             * that the kind path is proven, only the informative cases stay:
+             * the first 8 binds (boot-time evidence) and any compressible ->
+             * uncompressed conversion. Plain pass-through binds are silent. */
+            {
+                static NvU32 s_kind_trace = 0;
+                NvU32 n = ++s_kind_trace;
+                if (n <= 8 || kind != pteKind)
+                {
+                    nv_printf(0, "[eclipse-rm-trace] ECLIPSE-GR kind: 0x%x%s -> hMemory=0x%x (requested 0x%x)%s\n",
+                              kind, (kind != pteKind) ? " (uncompressed pair)" : "",
+                              hMemory, pteKind,
+                              (n == 8 && kind == pteKind) ? " [further pass-through binds not traced]" : "");
+                }
+            }
         }
         else
         {
