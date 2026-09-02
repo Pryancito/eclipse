@@ -1088,8 +1088,12 @@ pub fn select_ipv4_for_dst(dst: smoltcp::wire::Ipv4Address) -> smoltcp::wire::Ip
 }
 
 /// Drive iface poll until pending smoltcp egress (ARP + TX) has had time to complete.
+///
+/// Rounds after the first are throttled (`drain_net_tick`), so 128 iterations
+/// were almost always no-ops that still paid several mutex lock/unlock pairs
+/// per `write()`. Four full polls is enough for ARP + the TX doorbell.
 pub fn flush_socket_egress() {
-    drain_net_poll(128);
+    drain_net_poll(4);
 }
 
 fn is_ipv4_on_link(

@@ -69,12 +69,27 @@ impl Drop for TcpInner {
     }
 }
 
+/// Build a TCP socket with delayed ACK disabled.
+///
+/// smoltcp's default is a 10 ms delayed ACK. Combined with a 1-segment window
+/// (slow start after loss, or the previous e1000e `max_burst_size` clamp that
+/// wrapped the advertised window to ~28 KiB) that is exactly 1 MSS / 10 ms =
+/// 1.2 Mbps. Immediate ACKs let the peer's congestion window open at line rate.
+fn new_tcp_socket(
+    rx: TcpSocketBuffer<'static>,
+    tx: TcpSocketBuffer<'static>,
+) -> TcpSocket<'static> {
+    let mut socket = TcpSocket::new(rx, tx);
+    socket.set_ack_delay(None);
+    socket
+}
+
 impl TcpSocketState {
     /// missing documentation
     pub fn new(ipv6: bool) -> LxResult<Self> {
         let rx_buffer = TcpSocketBuffer::new(vec![0; TCP_RECVBUF]);
         let tx_buffer = TcpSocketBuffer::new(vec![0; TCP_SENDBUF]);
-        let socket = TcpSocket::new(rx_buffer, tx_buffer);
+        let socket = new_tcp_socket(rx_buffer, tx_buffer);
         let handle = super::register_smoltcp_socket(socket)?;
 
         Ok(TcpSocketState {
@@ -668,7 +683,7 @@ impl Socket for TcpSocketState {
 
                 let rx_buffer = TcpSocketBuffer::new(super::kernel_vec_zeroed(super::TCP_RECVBUF)?);
                 let tx_buffer = TcpSocketBuffer::new(super::kernel_vec_zeroed(super::TCP_SENDBUF)?);
-                let mut new_listen = TcpSocket::new(rx_buffer, tx_buffer);
+                let mut new_listen = new_tcp_socket(rx_buffer, tx_buffer);
                 new_listen.listen(endpoint).map_err(|_| LxError::ENOBUFS)?;
 
                 let new_listen_handle = {

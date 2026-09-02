@@ -6,14 +6,17 @@
 
 #![allow(unused_imports, dead_code)]
 
-const E1000E_DRIVER_TAG: &str = "e1000e-lk-rx2";
+const E1000E_DRIVER_TAG: &str = "e1000e-lk-rx3";
 const E1000E_WATCHDOG_PERIOD_US: u64 = 2_000_000;
 const E1000E_WATCHDOG_FAST_US: u64 = 50_000;
 const E1000E_WATCHDOG_LOG_US: u64 = 5_000_000;
 const E1000E_LOG_VERBOSE: bool = false;
 const E1000E_ITR_LOW_LATENCY: u32 = 98;
 const E1000E_ITR_BALANCED: u32 = 195;
-const E1000E_ITR_THROUGHPUT: u32 = 512;
+/// ITR register units are 256 ns. 2000 → ~512 µs (~2 k interrupts/s), the
+/// Linux e1000e bulk-transfer ballpark. The previous 512 (~131 µs) still
+/// interrupted too often once a download was in THROUGHPUT mode.
+const E1000E_ITR_THROUGHPUT: u32 = 2000;
 /// Period between full ITR window samples. Shorter than the old 250 ms so
 /// apk/wget bursts climb into THROUGHPUT coalescing sooner without waiting
 /// a quarter-second on BALANCED.
@@ -71,7 +74,7 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU64, Ordering};
 
 use smoltcp::iface::*;
-use smoltcp::phy::{self, DeviceCapabilities};
+use smoltcp::phy::{self, Checksum, DeviceCapabilities};
 use smoltcp::time::Instant;
 use smoltcp::wire::*;
 use smoltcp::Result as SmolResult;
@@ -227,11 +230,29 @@ const TCTL_CT_SHIFT: u32 = 4;
 const TCTL_CT_LINUX: u32 = 15 << TCTL_CT_SHIFT;
 const TCTL_COLD_LINUX: u32 = 63 << 12;
 
-// TXDCTL / RXDCTL
+// TXDCTL / RXDCTL — Linux FLAG2_DMA_BURST (PTHRESH=0x1f, HTHRESH=1, WTHRESH=1,
+// GRAN=descriptors, COUNT_DESC). The previous wthresh/pthresh/hthresh of 1/1/1
+// without GRAN made the NIC DMA one descriptor at a time.
 const TXDCTL_QUEUE_ENABLE: u32 = 1 << 25;
 const RXDCTL_QUEUE_ENABLE: u32 = 1 << 25;
-const TXDCTL_FULL_TX_DESC_WB: u32 = 0x0101_0000;
-const TXDCTL_DMA_BURST: u32 = (1 << 22) | (1 << 8) | 1; // wthresh=1, pthresh=1, hthresh=1
+const TXDCTL_GRAN: u32 = 1 << 24;
+const TXDCTL_COUNT_DESC: u32 = 1 << 22;
+const TXDCTL_WTHRESH_1: u32 = 1 << 16;
+const TXDCTL_HTHRESH_1: u32 = 1 << 8;
+const TXDCTL_PTHRESH_1F: u32 = 0x1f;
+const TXDCTL_DMA_BURST: u32 =
+    TXDCTL_GRAN | TXDCTL_COUNT_DESC | TXDCTL_WTHRESH_1 | TXDCTL_HTHRESH_1 | TXDCTL_PTHRESH_1F;
+const RXDCTL_DMA_BURST: u32 =
+    TXDCTL_GRAN | TXDCTL_WTHRESH_1 | TXDCTL_HTHRESH_1 | TXDCTL_PTHRESH_1F;
+
+// RXCSUM — hardware IP/TCP/UDP checksum offload (legacy descriptors).
+const RXCSUM_IPOFLD: u32 = 1 << 8;
+const RXCSUM_TUOFLD: u32 = 1 << 9;
+
+// Absolute interrupt-delay defaults (1.024 µs units), matching Linux e1000e.
+const RADV_DEFAULT: u32 = 8;
+const TIDV_DEFAULT: u32 = 8;
+const TADV_DEFAULT: u32 = 32;
 
 // RFCTL bits
 const RFCTL_EXTEN: u32 = 1 << 15;
@@ -321,6 +342,10 @@ const RXD_STAT_EOP: u8 = 1 << 1;
 const TX_CMD_EOP: u8 = 1 << 0;
 const TX_CMD_IFCS: u8 = 1 << 1;
 const TX_CMD_RS: u8 = 1 << 3;
+/// Interrupt Delay Enable — without this, TIDV/TADV are ignored and every
+/// RS descriptor fires TXDW immediately.
+const TX_CMD_IDE: u8 = 1 << 7;
+const TX_CMD_POST: u8 = TX_CMD_EOP | TX_CMD_IFCS | TX_CMD_RS | TX_CMD_IDE;
 
 // TX descriptor STATUS bits (written back by hardware when CMD.RS is set)
 const TX_STAT_DD: u8 = 1 << 0;
@@ -339,12 +364,14 @@ const BUF_SIZE: usize = 2048;
 /// covers well past a 9K jumbo frame, should RCTL.LPE / SRRCTL buffer size
 /// ever change from today's single-descriptor (<=1522B) configuration.
 const MAX_RX_FRAME_BYTES: usize = BUF_SIZE * 16;
-const RX_DRAIN_BUDGET: usize = 64;
+const RX_DRAIN_BUDGET: usize = 128;
 /// Soft cap on completed frames staged in [`E1000eHw::rx_ready`] during one
-/// drain. Keeps subsequent `receive()` calls cheap (pop only) without holding
-/// a large backlog that would delay TCP ACKs — smoltcp still gets the first
-/// frame as soon as the drain produces it.
-const RX_READY_CAP: usize = 16;
+/// drain. Sized to match a smoltcp ingress burst so a single RDH snapshot
+/// feeds the whole poll without re-walking the ring every 16 packets.
+const RX_READY_CAP: usize = 64;
+/// Recycled `Vec<u8>` frames so a steady TCP stream does not heap-alloc
+/// ~1500 B on every packet. Capped so an idle NIC does not pin a large pool.
+const RX_FRAME_POOL_CAP: usize = 32;
 /// Descriptors per cache line (64 / 16). Used when batching FromDevice syncs
 /// on a non-coherent (WB) ring so we round the invalidate span up to a line.
 const RX_DESCS_PER_CACHE_LINE: usize = CACHE_LINE_SIZE / 16;
@@ -481,6 +508,8 @@ pub struct E1000eHw {
     tx_desc_dirty_start: Option<usize>,
     /// Contiguous posted slots pending that batched sync (no ring wrap).
     tx_desc_dirty_count: usize,
+    /// Recycled RX frame allocations. See [`RX_FRAME_POOL_CAP`].
+    rx_frame_pool: Vec<Vec<u8>>,
 
     pub stats: NetStats,
     /// Count of received IPv4 frames whose header checksum did not verify —
@@ -543,6 +572,31 @@ impl E1000eHw {
     #[inline]
     fn tx_buf_vaddr(&self, i: usize) -> usize {
         self.tx_buf_pool.vaddr() + i * BUF_SIZE
+    }
+
+    fn take_rx_frame(&mut self, len: usize) -> Vec<u8> {
+        match self.rx_frame_pool.pop() {
+            Some(mut v) => {
+                v.clear();
+                if v.capacity() < len {
+                    v.reserve(len);
+                }
+                v
+            }
+            None => Vec::with_capacity(len),
+        }
+    }
+
+    fn recycle_rx_frame(&mut self, mut buf: Vec<u8>) {
+        if self.rx_frame_pool.len() >= RX_FRAME_POOL_CAP {
+            return;
+        }
+        let cap = buf.capacity();
+        if cap < 64 || cap > BUF_SIZE {
+            return;
+        }
+        buf.clear();
+        self.rx_frame_pool.push(buf);
     }
 
     // -----------------------------------------------------------------------
@@ -1214,9 +1268,10 @@ impl E1000eHw {
             );
         }
 
-        // Timers
-        mmio_write(self.base, E1000E_TIDV, 0);
-        mmio_write(self.base, E1000E_TADV, 0);
+        // Coalesce TX interrupts (Linux e1000e defaults). Requires CMD.IDE
+        // on posted descriptors or these timers are ignored.
+        mmio_write(self.base, E1000E_TIDV, TIDV_DEFAULT);
+        mmio_write(self.base, E1000E_TADV, TADV_DEFAULT);
 
         // Inter-Packet Gap: IPGT=8, IPGR1=8, IPGR2=6 — the 8254x/e1000e
         // datasheet copper default (0x00602008). IPGR2 was previously 12,
@@ -1255,11 +1310,13 @@ impl E1000eHw {
             mmio_write(self.base, E1000E_IOSFPC, iosfpc | 0x0001_0000);
             let _ = mmio_read(self.base, E1000E_IOSFPC);
         } else {
-            mmio_write(
-                self.base,
-                E1000E_TXDCTL,
-                TXDCTL_DMA_BURST | TXDCTL_FULL_TX_DESC_WB,
-            );
+            mmio_write(self.base, E1000E_TXDCTL, TXDCTL_DMA_BURST);
+        }
+
+        // TARC0 bit 0 is required for correct TX arbitration on 82574/ICH.
+        {
+            let tarc = mmio_read(self.base, E1000E_TARC0) | 1;
+            mmio_write(self.base, E1000E_TARC0, tarc);
         }
 
         // TCTL: enable TX
@@ -1269,9 +1326,10 @@ impl E1000eHw {
     }
 
     unsafe fn init_rx(&mut self) {
-        // Timers off
+        // Relative delay off; absolute delay coalesces a burst without
+        // waiting for a later packet that may never arrive.
         mmio_write(self.base, E1000E_RDTR, 0);
-        mmio_write(self.base, E1000E_RADV, 0);
+        mmio_write(self.base, E1000E_RADV, RADV_DEFAULT);
         self.program_itr(E1000E_ITR_BALANCED);
 
         // Program RX ring base, length, head
@@ -1324,17 +1382,27 @@ impl E1000eHw {
             mmio_write(self.base, E1000E_SRRCTL, 2 | (1 << 31));
         }
 
-        // PCH-SPT: must set RXDCTL.QUEUE_ENABLE (bit 25) before RCTL.EN
-        if self.is_pch_spt_or_later() {
-            let rxdctl = mmio_read(self.base, E1000E_RXDCTL) | RXDCTL_QUEUE_ENABLE;
+        // DMA burst thresholds on every part (Linux FLAG2_DMA_BURST). QUEUE_ENABLE
+        // is PCH-SPT+ only — writing it on 82574/QEMU is reserved.
+        {
+            let mut rxdctl = RXDCTL_DMA_BURST;
+            if self.is_pch_spt_or_later() {
+                rxdctl |= RXDCTL_QUEUE_ENABLE;
+            }
             mmio_write(self.base, E1000E_RXDCTL, rxdctl);
-            for _ in 0..100u32 {
-                Self::udelay(100);
-                if mmio_read(self.base, E1000E_RXDCTL) & RXDCTL_QUEUE_ENABLE != 0 {
-                    break;
+            if self.is_pch_spt_or_later() {
+                for _ in 0..100u32 {
+                    Self::udelay(100);
+                    if mmio_read(self.base, E1000E_RXDCTL) & RXDCTL_QUEUE_ENABLE != 0 {
+                        break;
+                    }
                 }
             }
         }
+
+        // Hardware IP + TCP/UDP checksum offload. Legacy descriptors report
+        // IPE/TCPE in the errors byte, which `process_rx_slot` already drops.
+        mmio_write(self.base, E1000E_RXCSUM, RXCSUM_IPOFLD | RXCSUM_TUOFLD);
 
         // Doorbell: give (NUM_RX - 1) descriptors to hardware
         // RDT = last descriptor index hardware can use
@@ -1524,8 +1592,9 @@ impl E1000eHw {
                 }
             }
         } else if eop {
-            // Exact-size alloc: avoids the over-alloc + shrink of a naive grow.
-            let mut pkt = Vec::with_capacity(len);
+            // Recycled Vec when possible: a bulk download otherwise heap-allocs
+            // one ~1500 B buffer per frame.
+            let mut pkt = self.take_rx_frame(len);
             pkt.extend_from_slice(frag);
             Some(pkt)
         } else {
@@ -1770,7 +1839,7 @@ impl E1000eHw {
         }
         compiler_fence(Ordering::SeqCst);
         unsafe {
-            write_volatile(&mut desc.cmd, TX_CMD_EOP | TX_CMD_IFCS | TX_CMD_RS);
+            write_volatile(&mut desc.cmd, TX_CMD_POST);
         }
         // Payload must hit RAM before TDT; buffers are WB+clflush, not UC.
         dma_sync_region(
@@ -2352,6 +2421,7 @@ impl NetScheme for E1000eInterface {
 
 pub struct E1000eRxToken {
     data: Vec<u8>,
+    driver: E1000eDriver,
 }
 pub struct E1000eTxToken(E1000eDriver);
 
@@ -2361,8 +2431,15 @@ impl phy::Device<'_> for E1000eDriver {
 
     fn receive(&mut self) -> Option<(Self::RxToken, Self::TxToken)> {
         let mut hw = self.hw.lock();
-        hw.receive()
-            .map(|pkt| (E1000eRxToken { data: pkt }, E1000eTxToken(self.clone())))
+        hw.receive().map(|pkt| {
+            (
+                E1000eRxToken {
+                    data: pkt,
+                    driver: self.clone(),
+                },
+                E1000eTxToken(self.clone()),
+            )
+        })
     }
     fn transmit(&mut self) -> Option<Self::TxToken> {
         if self.hw.lock().can_send() {
@@ -2374,11 +2451,19 @@ impl phy::Device<'_> for E1000eDriver {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.max_transmission_unit = 1514;
-        caps.max_burst_size = Some(64);
-        // Do NOT mark checksums Ignored/None: RXCSUM is never programmed and
-        // legacy RX descriptors (RFCTL_EXTEN clear) expose no HW csum status.
-        // TX only inserts FCS (IFCS), not IP/TCP/UDP checksums. smoltcp must
-        // keep the default Checksum::Both for both QEMU e1000e and I219.
+        // Do NOT set max_burst_size. smoltcp clamps the TCP window to
+        // `burst * MSS` and then stores it in a u16: with burst=64 that is
+        // 64*1474=94336, which wraps to 28800. Unscaled, that is a ~28 KiB
+        // window — at a 10 ms delayed-ACK / poll RTT, 1 MSS/10 ms = 1.2 Mbps.
+        // We have 256 RX descriptors (~384 KiB of NIC buffering) and a 512 KiB
+        // TCP receive buffer; the clamp was written for a 4-buffer MCU NIC.
+        caps.max_burst_size = None;
+        // RXCSUM IPOFLD|TUOFLD is programmed in init_rx. IPE/TCPE still drop
+        // frames in process_rx_slot. TX still inserts only FCS (IFCS), so
+        // smoltcp must keep computing IP/TCP/UDP checksums on transmit.
+        caps.checksum.ipv4 = Checksum::Tx;
+        caps.checksum.udp = Checksum::Tx;
+        caps.checksum.tcp = Checksum::Tx;
         caps
     }
 }
@@ -2393,7 +2478,11 @@ impl phy::RxToken for E1000eRxToken {
         // `net_defer_packet`). Without a tap this used to allocate+copy every
         // frame into a queue that was immediately discarded on flush.
         super::net_defer_packet(&data);
-        f(&mut data)
+        let result = f(&mut data);
+        if let Some(mut hw) = self.driver.hw.try_lock() {
+            hw.recycle_rx_frame(data);
+        }
+        result
     }
 }
 
@@ -2585,6 +2674,7 @@ pub fn init(
         tx_doorbell_dirty: false,
         tx_desc_dirty_start: None,
         tx_desc_dirty_count: 0,
+        rx_frame_pool: Vec::new(),
         stats: NetStats::default(),
         rx_csum_bad: 0,
         tx_dropped: 0,
@@ -2881,6 +2971,7 @@ mod rx_ring_tests {
             tx_doorbell_dirty: false,
             tx_desc_dirty_start: None,
             tx_desc_dirty_count: 0,
+            rx_frame_pool: Vec::new(),
             stats: NetStats::default(),
             rx_csum_bad: 0,
             tx_dropped: 0,
@@ -3054,6 +3145,22 @@ mod rx_ring_tests {
         // A second flush with nothing new recycled since must be a no-op.
         hw.flush_rx_doorbell();
         assert_eq!(reg_read(hw.base, E1000E_RDT) as usize, 4);
+    }
+
+    #[test]
+    fn rx_frame_pool_reuses_capacity() {
+        let mut hw = make_hw();
+        let mut buf = hw.take_rx_frame(1200);
+        buf.resize(1200, 0xab);
+        hw.recycle_rx_frame(buf);
+        assert_eq!(hw.rx_frame_pool.len(), 1);
+        let reused = hw.take_rx_frame(64);
+        assert!(hw.rx_frame_pool.is_empty());
+        assert!(
+            reused.capacity() >= 1200,
+            "recycled Vec should keep its capacity"
+        );
+        assert!(reused.is_empty());
     }
 
     #[test]
