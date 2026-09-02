@@ -60,4 +60,18 @@ pub trait AudioScheme: Scheme {
     fn default_score(&self) -> i32 {
         0
     }
+
+    /// Human-readable dump of what the device and its codec are actually
+    /// doing, surfaced at `/proc/gpusnd`.
+    ///
+    /// Silence with no error is the hardest audio failure to diagnose: the
+    /// ring drains, the stream reports running and every call returns `Ok`,
+    /// yet nothing reaches the speaker. That can only be told apart by
+    /// reading the state back OUT of the hardware — the pin's presence and
+    /// ELD, the converter's stream id and format, the stream descriptor's
+    /// RUN bit and its position counter — which is what implementations put
+    /// here.
+    fn diagnostics(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
 }

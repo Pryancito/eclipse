@@ -755,6 +755,50 @@ impl NvidiaVramAllocator {
     }
 }
 
+/// Last outcome of the HDMI/DP audio enable, for `/proc/gpusnd`.
+///
+/// On a GPU the HDA codec accepting a stream proves nothing: the display
+/// engine is what puts audio packets on the cable. When playback is silent
+/// with no error anywhere, this line is what says whether that half ever ran.
+static HDMI_AUDIO_STATUS: lock::Mutex<Option<alloc::string::String>> = lock::Mutex::new(None);
+
+fn record_hdmi_audio_status(s: alloc::string::String) {
+    *HDMI_AUDIO_STATUS.lock() = Some(s);
+}
+
+/// What the last HDMI/DP audio enable did, or why it never ran.
+pub fn hdmi_audio_status() -> alloc::string::String {
+    match &*HDMI_AUDIO_STATUS.lock() {
+        Some(s) => alloc::format!("{}\n", s),
+        None => alloc::string::String::from(
+            "[hdmi-audio] never ran — nothing has queried the DRM connector topology yet,\n\
+             [hdmi-audio]   so the display engine was never told to transmit audio.\n",
+        ),
+    }
+}
+
+/// Run the HDMI/DP audio enable for every NVIDIA GPU whose RM bring-up has
+/// finished, without waiting for a DRM client to ask for the topology.
+///
+/// The enable used to be reachable only through `rm_display_state`, i.e. only
+/// when something queried connectors. Playing audio on a GPU HDA function with
+/// no DRM consumer around therefore left the display engine silent: the codec
+/// took the stream, the ring drained, every call returned Ok, and nothing came
+/// out of the cable. Idempotent, and cheap once it has succeeded.
+pub fn ensure_hdmi_audio_enabled() {
+    for instance in 0..NV_MAX_PROBE_INSTANCES {
+        if let Ok(d) = nvidia_rm_sys::rm_init::edid(instance) {
+            if d.supported_status == 0 && d.display_mask != 0 {
+                NvidiaGpu::rm_enable_hdmi_audio_once(instance, &d);
+            }
+        }
+    }
+}
+
+/// How many RM device instances `ensure_hdmi_audio_enabled` probes. Boards with
+/// more GPUs than this still get the enable through the DRM path.
+const NV_MAX_PROBE_INSTANCES: u32 = 4;
+
 impl NvidiaGpu {
     fn pitch_pixels(&self) -> usize {
         if let Some(p) = self.pitch_override {
@@ -2733,13 +2777,17 @@ impl NvidiaGpu {
     /// piggybacked on RM display queries once DispCommon handles exist.
     /// Latched only after a successful ELD push so a first call with
     /// `connected_mask == 0` or a transient RM failure still retries.
-    fn rm_enable_hdmi_audio_once(instance: u32, d: &nvidia_rm_sys::rm_init::GrEdid) {
+    pub(super) fn rm_enable_hdmi_audio_once(instance: u32, d: &nvidia_rm_sys::rm_init::GrEdid) {
         use core::sync::atomic::{AtomicU32, Ordering};
         static DONE: AtomicU32 = AtomicU32::new(0);
         if instance >= 32 || (DONE.load(Ordering::Acquire) & (1 << instance)) != 0 {
             return;
         }
         if d.connected_mask == 0 {
+            record_hdmi_audio_status(alloc::format!(
+                "[hdmi-audio] gpu{}: no connected outputs — will retry",
+                instance
+            ));
             log::info!(
                 "[hdmi-audio] gpu{}: no connected outputs — will retry",
                 instance
@@ -2755,6 +2803,17 @@ impl NvidiaGpu {
             & d.connected_mask;
         match nvidia_rm_sys::rm_init::hdmi_audio(instance, d.connected_mask, hdmi_mask) {
             Ok(out) => {
+                record_hdmi_audio_status(alloc::format!(
+                    "[hdmi-audio] gpu{}: displays {:#x} (hdmi {:#x}) — ELD ok {:#x}, audio-enable ok {:#x}, gcp ok {:#x} (sads={}, maxFreq={})",
+                    instance,
+                    out.attempted_mask,
+                    hdmi_mask,
+                    out.eld_ok_mask,
+                    out.enable_ok_mask,
+                    out.gcp_ok_mask,
+                    out.sad_count,
+                    out.max_freq,
+                ));
                 log::warn!(
                     "[hdmi-audio] gpu{}: displays {:#x} (hdmi {:#x}) — ELD ok {:#x}, audio-enable ok {:#x}, gcp ok {:#x} (sads={}, maxFreq={})",
                     instance,
@@ -2771,6 +2830,11 @@ impl NvidiaGpu {
                 }
             }
             Err(st) => {
+                record_hdmi_audio_status(alloc::format!(
+                    "[hdmi-audio] gpu{}: enable FAILED, NV_STATUS={:#x} (will retry)",
+                    instance,
+                    st
+                ));
                 log::warn!(
                     "[hdmi-audio] gpu{}: enable failed, NV_STATUS={:#x} (will retry)",
                     instance,
