@@ -396,6 +396,12 @@ impl Syscall<'_> {
         const FUTEX_CMP_REQUEUE: u32 = 4;
         const FUTEX_WAIT_BITSET: u32 = 9;
         const FUTEX_WAKE_BITSET: u32 = 10;
+        const FUTEX_LOCK_PI: u32 = 6;
+        const FUTEX_UNLOCK_PI: u32 = 7;
+        const FUTEX_TRYLOCK_PI: u32 = 8;
+        const FUTEX_WAIT_REQUEUE_PI: u32 = 11;
+        const FUTEX_CMP_REQUEUE_PI: u32 = 12;
+        const FUTEX_LOCK_PI2: u32 = 13;
         const FUTEX_PRIVATE_FLAG: u32 = 0x80;
         const FUTEX_CLOCK_REALTIME: u32 = 0x100;
 
@@ -476,6 +482,25 @@ impl Syscall<'_> {
                     Ok(_) => Ok(0),
                     Err(e) => Err(e.into()),
                 }
+            }
+            FUTEX_LOCK_PI
+            | FUTEX_UNLOCK_PI
+            | FUTEX_TRYLOCK_PI
+            | FUTEX_WAIT_REQUEUE_PI
+            | FUTEX_CMP_REQUEUE_PI
+            | FUTEX_LOCK_PI2 => {
+                // Priority-inheritance futexes are not implemented. Answer
+                // EOPNOTSUPP (ENOTSUP, 95), NOT ENOSYS: musl's
+                // pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT) probes
+                // the kernel once with FUTEX_LOCK_PI on a throwaway word and
+                // returns the kernel's errno to the caller. PulseAudio's
+                // pa_mutex_new() then asserts `r == 0 || r == ENOTSUP`
+                // (pulsecore/mutex-posix.c:57) -- with ENOSYS it aborts, which
+                // is exactly how supertux2 (SDL2 -> pulse) died on the real
+                // machine. ENOTSUP is the documented "protocol unsupported"
+                // answer and makes every such caller fall back to a plain
+                // mutex.
+                Err(LxError::EOPNOTSUPP)
             }
             _ => {
                 warn!("unsupported futex operation: {:#x} (cmd {})", op, cmd);
