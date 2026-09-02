@@ -68,6 +68,42 @@ backed by `eclipse_rm_hdmi_audio` in `nvidia-rm-sys/vendor/eclipse_rm_init.c`):
 Watch for `[hdmi-audio]` lines in dmesg; `[hda]` lines show each codec's
 candidate paths with their live presence/ELD state.
 
+## Diagnosing silence: `/proc/gpusnd`
+
+A GPU HDA function that accepts a stream proves nothing — the codec drains the
+ring whether or not the display engine puts audio packets on the cable, so the
+failure mode is *silence with no error anywhere*. `cat /proc/gpusnd` dumps, per
+card, what the hardware is actually doing right now:
+
+```sh
+cat /proc/gpusnd
+```
+
+- **Controller/stream**: GCAP, STATESTS, the codec address, and the output
+  stream descriptor — `SD_CTL` (RUN bit and stream tag), `SD_FMT`, `SD_CBL`,
+  and `SD_LPIB` sampled twice 2 ms apart, reported as `ADVANCING` or
+  `STALLED`. `STALLED` with RUN set means the DMA engine is not fetching:
+  a controller/BDL problem, not a display one.
+- **Active path**, read back *from the codec* rather than from what the driver
+  believes it wrote: the converter's stream id and format, digital-converter
+  enable, power state, and on the pin the OUT_EN bit, presence/ELD-valid from
+  `GET_PIN_SENSE`, and EAPD. A converter whose stream id reads back 0 was
+  never armed; a pin with `present=0 eld=0` has no live display.
+- **Every candidate path** with its live presence/ELD, `<== ACTIVE` marking
+  the one in use — this is where a wrong pin choice shows up.
+- **`[hdmi-audio]`**: the last outcome of the RM-side enable, with the ELD /
+  audio-enable / GCP success masks, or a line saying it never ran. If the
+  stream is `ADVANCING` on a pin that reports present+ELD and the monitor is
+  still silent, this line is the remaining suspect.
+
+Play something first — most of the state above only exists while a stream is
+running:
+
+```sh
+speaker-test -c 2 -t sine &
+cat /proc/gpusnd
+```
+
 ## Userspace API: ALSA (`/dev/snd/*`)
 
 System sound goes through the native ALSA ABI: one `controlC<card>` +

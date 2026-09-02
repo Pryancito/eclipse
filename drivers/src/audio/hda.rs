@@ -95,6 +95,14 @@ const VERB_GET_PIN_SENSE: u32 = 0xf09;
 const VERB_SET_EAPD: u32 = 0x70c;
 const VERB_SET_DIGI_CVT1: u32 = 0x70d;
 const VERB_GET_CONFIG_DEFAULT: u32 = 0xf1c;
+// Read-back verbs, used only by `diagnostics`: silence with no error can only
+// be diagnosed by asking the codec what it actually has programmed.
+const VERB_GET_PIN_CTL: u32 = 0xf07;
+const VERB_GET_STREAM_ID: u32 = 0xf06;
+const VERB_GET_DIGI_CVT: u32 = 0xf0d;
+const VERB_GET_EAPD: u32 = 0xf0c;
+const VERB_GET_POWER_STATE: u32 = 0xf05;
+const VERB_GET_CVT_FORMAT: u32 = 0xa;
 const VERB_SET_DIP_INDEX: u32 = 0x730;
 const VERB_SET_DIP_DATA: u32 = 0x731;
 const VERB_SET_DIP_XMIT: u32 = 0x732;
@@ -253,6 +261,9 @@ struct HdaInner {
 
 pub struct HdaDevice {
     name: String,
+    /// PCI vendor is NVIDIA: this HDA function lives on a GPU, so its audio
+    /// only reaches the cable when the display engine transmits it.
+    is_nvidia: bool,
     inner: Mutex<HdaInner>,
 }
 
@@ -833,7 +844,7 @@ impl HdaInner {
 }
 
 impl HdaDevice {
-    pub fn new(bar: usize, name: String) -> DeviceResult<Self> {
+    pub fn new(bar: usize, name: String, is_nvidia: bool) -> DeviceResult<Self> {
         let gcap = mmio_r16(bar, REG_GCAP);
         let iss = ((gcap >> 8) & 0xf) as usize;
         let oss = ((gcap >> 12) & 0xf) as usize;
@@ -1007,6 +1018,7 @@ impl HdaDevice {
 
         Ok(HdaDevice {
             name,
+            is_nvidia,
             inner: Mutex::new(inner),
         })
     }
@@ -1075,9 +1087,9 @@ impl AudioScheme for HdaDevice {
         let mut inner = self.inner.lock();
         inner.poll_progress();
         if !inner.running {
-            // Stream (re)start: give the codec graph a chance to re-route to a
-            // pin that has gained presence/ELD since the last pick (on NVIDIA
-            // GPUs the display driver pushes the ELD long after PCI probe)...
+            // Give the codec graph a chance to re-route to a pin that has
+            // gained presence/ELD since the last pick (on NVIDIA GPUs the ELD
+            // lands long after PCI probe)...
             inner.repick_path();
             // ...and re-anchor the software pointers: a started stream always
             // begins DMA at ring offset 0.
@@ -1149,6 +1161,130 @@ impl AudioScheme for HdaDevice {
     fn gain(&self) -> (u8, u8, bool, bool) {
         let inner = self.inner.lock();
         (inner.gain_l, inner.gain_r, inner.mute_l, inner.mute_r)
+    }
+
+    fn diagnostics(&self) -> String {
+        use core::fmt::Write as _;
+        let mut out = String::new();
+        let mut inner = self.inner.lock();
+        let bar = inner.bar;
+        let sd = inner.sd_base;
+
+        let _ = writeln!(out, "[gpusnd] === {} ===", self.name);
+        let _ = writeln!(
+            out,
+            "[gpusnd] controller: GCAP {:#06x} STATESTS {:#06x} codec {}",
+            mmio_r16(bar, REG_GCAP),
+            mmio_r16(bar, REG_STATESTS),
+            inner.cad
+        );
+
+        // Stream descriptor, read straight from MMIO. RUN=1 with a moving
+        // LPIB means the DMA engine really is fetching our samples; if that
+        // holds and there is still no sound, the fault is downstream of the
+        // controller (codec routing, or the display engine not transmitting).
+        let ctl = mmio_r32(bar, sd + SD_CTL);
+        let lpib1 = mmio_r32(bar, sd + SD_LPIB);
+        wait_us(2_000);
+        let lpib2 = mmio_r32(bar, sd + SD_LPIB);
+        let _ =
+            writeln!(
+            out,
+            "[gpusnd] stream: CTL {:#010x} (RUN={}, tag={}) FMT {:#06x} CBL {} LPIB {} -> {} ({})",
+            ctl,
+            (ctl >> 1) & 1,
+            (ctl >> 20) & 0xf,
+            mmio_r16(bar, sd + SD_FMT),
+            mmio_r32(bar, sd + SD_CBL),
+            lpib1,
+            lpib2,
+            if lpib1 != lpib2 { "ADVANCING" } else { "STALLED" },
+        );
+        let _ = writeln!(
+            out,
+            "[gpusnd] ring: running={} queued={} wp={} rate={} ch={}",
+            inner.running, inner.queued, inner.wp, inner.rate, inner.channels
+        );
+
+        // The active path, read BACK from the codec rather than from our own
+        // bookkeeping — that is the whole point of this dump.
+        let (conv, pin, digital) = (inner.conv_nid, inner.pin_nid, inner.digital);
+        let _ = writeln!(
+            out,
+            "[gpusnd] active path: converter {:#x} -> pin {:#x} ({})",
+            conv,
+            pin,
+            if digital { "HDMI/DP" } else { "analog" }
+        );
+        if conv != 0 {
+            let sid = inner
+                .cmd(conv, VERB_GET_STREAM_ID, 0)
+                .unwrap_or(0xffff_ffff);
+            let fmt = inner
+                .cmd16(conv, VERB_GET_CVT_FORMAT, 0)
+                .unwrap_or(0xffff_ffff);
+            let dig = inner.cmd(conv, VERB_GET_DIGI_CVT, 0).unwrap_or(0xffff_ffff);
+            let pwr = inner
+                .cmd(conv, VERB_GET_POWER_STATE, 0)
+                .unwrap_or(0xffff_ffff);
+            let _ = writeln!(
+                out,
+                "[gpusnd]   converter: stream_id {:#x} (tag {}) format {:#06x} digi_cvt {:#x} (DIGEN={}) power {:#x}",
+                sid,
+                sid >> 4,
+                fmt,
+                dig,
+                dig & 1,
+                pwr
+            );
+        }
+        if pin != 0 {
+            let ctl = inner.cmd(pin, VERB_GET_PIN_CTL, 0).unwrap_or(0xffff_ffff);
+            let sense = inner.cmd(pin, VERB_GET_PIN_SENSE, 0).unwrap_or(0);
+            let eapd = inner.cmd(pin, VERB_GET_EAPD, 0).unwrap_or(0xffff_ffff);
+            let pwr = inner
+                .cmd(pin, VERB_GET_POWER_STATE, 0)
+                .unwrap_or(0xffff_ffff);
+            let _ = writeln!(
+                out,
+                "[gpusnd]   pin: ctl {:#x} (OUT_EN={}) sense {:#010x} (present={}, eld_valid={}) eapd {:#x} power {:#x}",
+                ctl,
+                (ctl & PIN_CTL_OUT_EN != 0) as u8,
+                sense,
+                (sense & (1 << 31) != 0) as u8,
+                (sense & (1 << 30) != 0) as u8,
+                eapd,
+                pwr
+            );
+        }
+
+        // Every candidate, with live presence/ELD: this says whether the pin
+        // carrying the cable was the one we picked.
+        let candidates = inner.candidates.clone();
+        let _ = writeln!(out, "[gpusnd] candidates ({}):", candidates.len());
+        for c in candidates.iter() {
+            let sense = inner.cmd(c.pin, VERB_GET_PIN_SENSE, 0).unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "[gpusnd]   pin {:#x} -> conv {:#x} digital={} hdmi/dp={} present={} eld_valid={}{}",
+                c.pin,
+                c.conv,
+                c.digital as u8,
+                c.hdmi_dp as u8,
+                (sense & (1 << 31) != 0) as u8,
+                (sense & (1 << 30) != 0) as u8,
+                if c.pin == pin { "  <== ACTIVE" } else { "" },
+            );
+        }
+
+        if self.is_nvidia {
+            let _ = writeln!(
+                out,
+                "[gpusnd] NVIDIA HDA function: audio only reaches the cable if the\n\
+                 [gpusnd]   display engine transmits it — see the [hdmi-audio] state below."
+            );
+        }
+        out
     }
 
     fn default_score(&self) -> i32 {
@@ -1224,7 +1360,7 @@ impl PciDriver for HdaDriverPci {
                 ""
             }
         );
-        let hda = Arc::new(HdaDevice::new(vaddr, name)?);
+        let hda = Arc::new(HdaDevice::new(vaddr, name, dev.id.vendor_id == 0x10de)?);
         Ok(Device::Audio(hda))
     }
 }

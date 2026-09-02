@@ -151,6 +151,15 @@ pub fn all_audio() -> &'static DeviceList<dyn AudioScheme> {
     &DEVICES.audio
 }
 
+/// What the last NVIDIA HDMI/DP audio enable did, or why it never ran (see
+/// `zcore_drivers::display::hdmi_audio_status`). Surfaced at `/proc/gpusnd`,
+/// because on a GPU a healthy-looking codec proves nothing on its own: the
+/// display engine is the half that puts audio on the cable.
+#[cfg(target_arch = "x86_64")]
+pub fn hdmi_audio_status() -> alloc::string::String {
+    zcore_drivers::display::hdmi_audio_status()
+}
+
 /// Enables the nouveau-compatible driver-specific ioctl surface on the
 /// NVIDIA DRM driver (see `zcore_drivers::display::nouveau_uapi` and
 /// `docs/README-nouveau-uapi.md`). No-op where the NVIDIA driver doesn't

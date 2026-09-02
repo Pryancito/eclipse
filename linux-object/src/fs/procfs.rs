@@ -14,7 +14,7 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 49] = [
+const PROC_ROOT_STATIC: [&str; 50] = [
     "net",
     "oops",
     "memhogs",
@@ -60,6 +60,7 @@ const PROC_ROOT_STATIC: [&str; 49] = [
     "gpuinit",
     "gpubench",
     "gpuedid",
+    "gpusnd",
     "gpusurvive",
     "gpucefill",
     "gpucefillp2p",
@@ -443,6 +444,7 @@ impl INode for ProcRootINode {
             "gpuinit" => Ok(PROC_GPUINIT.clone()),
             "gpubench" => Ok(PROC_GPUBENCH.clone()),
             "gpuedid" => Ok(PROC_GPUEDID.clone()),
+            "gpusnd" => Ok(PROC_GPUSND.clone()),
             "gpusurvive" => Ok(PROC_GPUSURVIVE.clone()),
             "gpucefill" => Ok(PROC_GPUCEFILL.clone()),
             "gpucefillp2p" => Ok(PROC_GPUCEFILLP2P.clone()),
@@ -2267,6 +2269,30 @@ fn proc_gpubench_content() -> String {
 
 /// `/proc/gpuedid` — real display query (connectors + EDID) via the RM's
 /// NV04_DISPLAY_COMMON. Read-only; needs /proc/gpuinit first.
+/// `/proc/gpusnd` -- audio pipeline state, read back from the hardware.
+///
+/// Playing to a GPU HDA function can fail in a way that reports success at
+/// every layer: the ring drains, the stream descriptor says RUN, LPIB
+/// advances, and no call returns an error -- yet the cable carries nothing,
+/// because on a GPU the codec is only half the path and the display engine
+/// owns the other half. This dump shows both halves.
+fn proc_gpusnd_content() -> String {
+    let mut s = String::new();
+    let devices = kernel_hal::drivers::all_audio().as_vec();
+    if devices.is_empty() {
+        s.push_str("[gpusnd] no audio devices registered\n");
+        return s;
+    }
+    for (card, d) in devices.iter().enumerate() {
+        s.push_str(&format!("[gpusnd] --- card {} ---\n", card));
+        s.push_str(&d.diagnostics());
+    }
+    // The display side, which no amount of codec state can reveal.
+    #[cfg(target_arch = "x86_64")]
+    s.push_str(&kernel_hal::drivers::hdmi_audio_status());
+    s
+}
+
 fn proc_gpuedid_content() -> String {
     let mut s = String::new();
     // UEFI-captured EDID of the active console panel first: this is the real
@@ -2773,6 +2799,14 @@ lazy_static! {
     static ref PROC_GPUEDID: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 103,
         generate: proc_gpuedid_content,
+    });
+    /// `/proc/gpusnd` -- what every audio device and its codec are actually
+    /// doing, plus whether the GPU display engine was ever told to transmit
+    /// audio. The dump that tells silence-with-no-error apart from a genuinely
+    /// dead stream.
+    static ref PROC_GPUSND: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 141,
+        generate: proc_gpusnd_content,
     });
     /// `/proc/gpusurvive` -- CMOS survival breadcrumb from the previous
     /// console-GPU boot attempt (see proc_gpusurvive_content).

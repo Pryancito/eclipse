@@ -14,7 +14,9 @@ mod uefi;
 #[cfg(target_arch = "x86_64")]
 pub use nouveau_uapi::{enabled as nouveau_uapi_enabled, set_enabled as set_nouveau_uapi_enabled};
 #[cfg(target_arch = "x86_64")]
-pub use nvidia::{boot_edid, set_boot_edid, set_boot_fb_info, NvidiaGpu, NvidiaGpuDriverPci};
+pub use nvidia::{
+    boot_edid, hdmi_audio_status, set_boot_edid, set_boot_fb_info, NvidiaGpu, NvidiaGpuDriverPci,
+};
 
 /// Re-export of `nvidia_rm_sys::os_interface::set_thread_id_provider`, so
 /// `zCore` (which depends on this crate via kernel-hal, not on nvidia-rm-sys

@@ -755,6 +755,28 @@ impl NvidiaVramAllocator {
     }
 }
 
+/// Last outcome of the HDMI/DP audio enable, for `/proc/gpusnd`.
+///
+/// On a GPU the HDA codec accepting a stream proves nothing: the display
+/// engine is what puts audio packets on the cable. When playback is silent
+/// with no error anywhere, this line is what says whether that half ever ran.
+static HDMI_AUDIO_STATUS: lock::Mutex<Option<alloc::string::String>> = lock::Mutex::new(None);
+
+fn record_hdmi_audio_status(s: alloc::string::String) {
+    *HDMI_AUDIO_STATUS.lock() = Some(s);
+}
+
+/// What the last HDMI/DP audio enable did, or why it never ran.
+pub fn hdmi_audio_status() -> alloc::string::String {
+    match &*HDMI_AUDIO_STATUS.lock() {
+        Some(s) => alloc::format!("{}\n", s),
+        None => alloc::string::String::from(
+            "[hdmi-audio] never ran — no RM display query and no digital stream start yet,\n\
+             [hdmi-audio]   so the display engine was never told to transmit audio.\n",
+        ),
+    }
+}
+
 impl NvidiaGpu {
     fn pitch_pixels(&self) -> usize {
         if let Some(p) = self.pitch_override {
@@ -2750,6 +2772,10 @@ impl NvidiaGpu {
             return;
         }
         if d.connected_mask == 0 {
+            record_hdmi_audio_status(alloc::format!(
+                "[hdmi-audio] gpu{}: no connected outputs — will retry",
+                instance
+            ));
             log::info!(
                 "[hdmi-audio] gpu{}: no connected outputs — will retry",
                 instance
@@ -2766,6 +2792,17 @@ impl NvidiaGpu {
             & d.connected_mask;
         match nvidia_rm_sys::rm_init::hdmi_audio(instance, d.connected_mask, hdmi_mask, force) {
             Ok(out) => {
+                record_hdmi_audio_status(alloc::format!(
+                    "[hdmi-audio] gpu{}: displays {:#x} (hdmi {:#x}) — ELD ok {:#x}, audio-enable ok {:#x}, gcp ok {:#x} (sads={}, maxFreq={})",
+                    instance,
+                    out.attempted_mask,
+                    hdmi_mask,
+                    out.eld_ok_mask,
+                    out.enable_ok_mask,
+                    out.gcp_ok_mask,
+                    out.sad_count,
+                    out.max_freq,
+                ));
                 log::warn!(
                     "[hdmi-audio] gpu{}: displays {:#x} (hdmi {:#x}) — ELD ok {:#x}, audio-enable ok {:#x}, gcp ok {:#x} (sads={}, maxFreq={}){}",
                     instance,
@@ -2783,6 +2820,11 @@ impl NvidiaGpu {
                 }
             }
             Err(st) => {
+                record_hdmi_audio_status(alloc::format!(
+                    "[hdmi-audio] gpu{}: enable FAILED, NV_STATUS={:#x} (will retry)",
+                    instance,
+                    st
+                ));
                 log::warn!(
                     "[hdmi-audio] gpu{}: enable failed, NV_STATUS={:#x} (will retry)",
                     instance,
@@ -2795,9 +2837,14 @@ impl NvidiaGpu {
     /// Re-push ELD/unmute on every RM GPU that has a connected output.
     /// The HDA driver calls this at digital stream start.
     pub(crate) fn kick_hdmi_audio_all() {
+        // Nothing enabled means either no GPU answered or none had a display.
+        // Say so in `/proc/gpusnd`: "the enable never ran" and "it ran and
+        // found nothing" look identical from userspace otherwise.
+        let mut kicked = false;
         for instance in 0..8u32 {
             match nvidia_rm_sys::rm_init::edid(instance) {
                 Ok(d) if d.supported_status == 0 && d.connected_mask != 0 => {
+                    kicked = true;
                     Self::rm_enable_hdmi_audio(instance, &d, true);
                 }
                 Ok(_) => {
@@ -2816,6 +2863,12 @@ impl NvidiaGpu {
                     }
                 }
             }
+        }
+        if !kicked {
+            record_hdmi_audio_status(alloc::string::String::from(
+                "[hdmi-audio] stream start: no RM GPU reported a connected output — \
+                 display engine not told to transmit",
+            ));
         }
     }
 
