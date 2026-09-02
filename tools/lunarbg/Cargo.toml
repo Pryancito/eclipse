@@ -27,4 +27,13 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
-strip = true
+# Symbols + line tables, NOT stripped: these binaries crash on REAL
+# HARDWARE where the only artifacts are a kernel line (`pc=0x...`) and a
+# photo of the screen. With `strip = true` and no debug info a fault
+# address is unsymbolizable -- `addr2line` answers `??` and even `nm` has
+# nothing to bracket it with, which is exactly what happened to a lunarbg
+# SIGSEGV. Line tables cost disk in the rootfs image and nothing at
+# runtime (they are not loaded into memory), so keeping them is the
+# right trade for a target with no debugger.
+debug = 1
+strip = false
