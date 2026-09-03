@@ -13,6 +13,9 @@ concurrency:
 env:
   rust_toolchain: nightly-2026-09-01
 
+permissions:
+  contents: read
+
 jobs:
   unit-test:
     name: Unit Test
