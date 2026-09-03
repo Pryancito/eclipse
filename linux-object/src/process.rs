@@ -2001,8 +2001,9 @@ pub fn all_live_processes() -> Vec<Arc<Process>> {
 }
 
 /// Linux PID of the `init` process (the base program). The system's reaper of
-/// last resort for orphaned children.
-const INIT_PID: KoID = 1;
+/// last resort for orphaned children, and the one process a `kill(-1, sig)`
+/// broadcast must never reach.
+pub const INIT_PID: KoID = 1;
 
 /// Live INIT (PID 1) process, or `None` if there is no running init.
 /// True for the Linux magic exe links that must not replace a real
@@ -2156,22 +2157,6 @@ fn reparent_live_children_to_init(dying: &Arc<Process>) {
         }
     }
     adopter.signal_set(Signal::SIGCHLD);
-}
-
-/// Insert `signal` into one unmasked thread of each live process under `ROOT_JOB`.
-pub fn send_signal_to_all_processes(signal: LinuxSignal) -> LxResult<()> {
-    let processes = all_live_processes();
-    let mut any = false;
-    for proc in processes {
-        if send_signal_to_process(proc.id() as usize, signal).is_ok() {
-            any = true;
-        }
-    }
-    if any {
-        Ok(())
-    } else {
-        Err(LxError::ESRCH)
-    }
 }
 
 /// Whether a pending signal actually interrupts a blocking syscall.
