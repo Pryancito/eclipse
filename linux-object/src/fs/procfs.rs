@@ -14,7 +14,7 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 50] = [
+const PROC_ROOT_STATIC: [&str; 51] = [
     "net",
     "oops",
     "memhogs",
@@ -34,6 +34,7 @@ const PROC_ROOT_STATIC: [&str; 50] = [
     "hunter",
     "filesystems",
     "gpudbg",
+    "gpubaseline",
     "gpustep2",
     "gpustep3",
     "gpustep4",
@@ -418,6 +419,7 @@ impl INode for ProcRootINode {
             "hunter" => Ok(PROC_HUNTER.clone()),
             "filesystems" => Ok(PROC_FILESYSTEMS.clone()),
             "gpudbg" => Ok(PROC_GPUDBG.clone()),
+            "gpubaseline" => Ok(PROC_GPUBASELINE.clone()),
             "oops" => Ok(PROC_OOPS.clone()),
             "gpustep2" => Ok(PROC_GPUSTEP2.clone()),
             "gpustep3" => Ok(PROC_GPUSTEP3.clone()),
@@ -1892,6 +1894,40 @@ fn proc_gpudbg_content() -> String {
     s
 }
 
+/// `/proc/gpubaseline` — compact, reproducible integration snapshot focused on
+/// NVIDIA bring-up and DRM identity consistency. Read-only.
+fn proc_gpubaseline_content() -> String {
+    use core::fmt::Write;
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "[gpubaseline] cmdline={}",
+        kernel_hal::boot::cmdline()
+    );
+    let drivers = kernel_hal::drivers::all_drm();
+    if drivers.as_vec().is_empty() {
+        s.push_str("[gpubaseline] no DRM drivers registered\n");
+        return s;
+    }
+    for d in drivers.as_vec().iter() {
+        let status = d.integration_status();
+        if status.is_empty() {
+            let _ = writeln!(
+                s,
+                "[gpubaseline] driver={} integration_status=<not implemented>",
+                d.name()
+            );
+        } else {
+            s.push_str(&status);
+        }
+    }
+    s.push_str(
+        "[gpubaseline] next: capture /proc/gpudbg, /proc/gpuinit, /proc/gpustep15, \
+         /proc/gpustep17, /proc/gpustep23 and dmesg for full triage\n",
+    );
+    s
+}
+
 /// `/proc/gpustep2` — opt-in GPU copy-engine bring-up Step 2 (instance block +
 /// GMMU flush). NOT read-only: each `cat` issues the real GPU writes, but only
 /// on the GPU that does not drive the console. Kept separate from `/proc/gpudbg`
@@ -2649,6 +2685,11 @@ lazy_static! {
     static ref PROC_GPUDBG: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 99,
         generate: proc_gpudbg_content,
+    });
+    /// `/proc/gpubaseline` — compact NVIDIA/DRM integration snapshot.
+    static ref PROC_GPUBASELINE: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 74,
+        generate: proc_gpubaseline_content,
     });
     /// `/proc/bootprofile` — boot-time file-access trace + desktop preload list.
     static ref PROC_BOOTPROFILE: Arc<dyn INode> = Arc::new(ProcSeqINode {

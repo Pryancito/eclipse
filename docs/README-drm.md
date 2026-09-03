@@ -258,6 +258,8 @@ Con `drm.atomic` y la ruta atómica activa se ve además:
   *blit* al framebuffer (ver [`drm.rs`](../linux-object/src/fs/devfs/drm.rs)).
 - `[drm] UNHANDLED ioctl …` indica un ioctl que labwc pide y aún no manejamos
   (el `drm nr` identifica el `DRM_IOCTL_*`).
+- Para capturar una línea base reproducible del estado NVIDIA/DRM usa
+  `nvidia-baseline` (genera evidencia en `/tmp/...`) y revisa `/proc/gpubaseline`.
 
 La consola de texto del kernel cede a gráficos (`KD_GRAPHICS`) solo en el primer
 *scanout* real, no al hacer `SET_MASTER`: así, si labwc se atasca antes de

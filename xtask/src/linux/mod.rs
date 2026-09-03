@@ -86,6 +86,7 @@ impl LinuxRootfs {
             Self::write_asound_conf(&dir.join("etc"));
             desktop::install(&dir);
             xorg::install(&dir, &bin.join("apk"), self.0.name());
+            Self::write_nvidia_baseline_tool(&dir);
             return;
         }
         // 准备最小系统需要的资源
@@ -168,6 +169,7 @@ impl LinuxRootfs {
         // an offline build just warns and ships without it. Uses the apk binary
         // and repositories already staged above.
         xorg::install(&dir, &bin.join("apk"), self.0.name());
+        Self::write_nvidia_baseline_tool(&dir);
         Self::install_ca_certs(&dir);
 
         // /etc/machine-id — prevents dhcp_vendor "No such file or directory".
@@ -532,7 +534,60 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                     use std::os::unix::fs::PermissionsExt;
                     fs::set_permissions(&dst, fs::Permissions::from_mode(0o755)).unwrap();
                 }
+
             }
+        }
+    }
+
+    fn write_nvidia_baseline_tool(rootfs: &Path) {
+        let localbin = rootfs.join("usr/local/bin");
+        let _ = fs::create_dir_all(&localbin);
+        fs::write(
+            localbin.join("nvidia-baseline"),
+            b"#!/bin/sh\n\
+              # Collect a reproducible NVIDIA/DRM integration baseline on real hardware.\n\
+              # Safe mode (default): read-only snapshots only.\n\
+              # Set RUN_GPU_STEPS=1 to also execute bring-up stages (can hang on unstable GPUs).\n\
+              TS=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo unknown)\n\
+              OUT=${1:-/tmp/nvidia-baseline-$TS}\n\
+              mkdir -p \"$OUT\" || exit 1\n\
+              save() {\n\
+              \x20 name=$1; path=$2\n\
+              \x20 if [ -r \"$path\" ]; then\n\
+              \x20 \x20 cat \"$path\" > \"$OUT/$name\" 2>&1 || echo \"read failed: $path\" > \"$OUT/$name\"\n\
+              \x20 else\n\
+              \x20 \x20 echo \"missing: $path\" > \"$OUT/$name\"\n\
+              \x20 fi\n\
+              }\n\
+              save cmdline.txt /proc/cmdline\n\
+              save gpubaseline.txt /proc/gpubaseline\n\
+              save gpudbg.txt /proc/gpudbg\n\
+              save gpuedid.txt /proc/gpuedid\n\
+              save gpusnd.txt /proc/gpusnd\n\
+              save gpusurvive.txt /proc/gpusurvive\n\
+              if [ \"${RUN_GPU_STEPS:-0}\" = \"1\" ]; then\n\
+              \x20 save gpuinit.txt /proc/gpuinit\n\
+              \x20 save gpustep15.txt /proc/gpustep15\n\
+              \x20 save gpustep17.txt /proc/gpustep17\n\
+              \x20 save gpustep23.txt /proc/gpustep23\n\
+              fi\n\
+              dmesg > \"$OUT/dmesg.txt\" 2>&1 || true\n\
+              if command -v vulkaninfo >/dev/null 2>&1; then\n\
+              \x20 vulkaninfo > \"$OUT/vulkaninfo.txt\" 2>&1 || true\n\
+              fi\n\
+              if command -v drmbench >/dev/null 2>&1; then\n\
+              \x20 drmbench /dev/dri/card0 3 > \"$OUT/drmbench.txt\" 2>&1 || true\n\
+              fi\n\
+              echo \"baseline saved in: $OUT\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(
+                localbin.join("nvidia-baseline"),
+                fs::Permissions::from_mode(0o755),
+            );
         }
     }
 

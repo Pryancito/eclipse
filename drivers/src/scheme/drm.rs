@@ -127,6 +127,13 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Consolidated integration status for baseline capture. Intended to be a
+    /// compact, stable summary (role, init state, firmware state, key fallback
+    /// mode) that can be diffed between boots.
+    fn integration_status(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Hand the driver a firmware blob read from the mounted rootfs (e.g.
     /// GSP-RM's `gsp.bin`). Drivers can't read files themselves --
     /// `drivers` sits below `linux-object`/`kernel-hal` in the dependency
