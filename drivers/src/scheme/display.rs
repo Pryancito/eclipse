@@ -2,7 +2,8 @@ use super::Scheme;
 use crate::DeviceResult;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-/// When set, GOP scanout is stored left-right reversed (VirtualBox VMSVGA).
+/// When set, GOP scanout is stored left-right reversed. Opt-in (`FB_MIRROR_X`);
+/// default is left-to-right. Do not use this to compensate for mirrored glyphs.
 static SCANOUT_MIRROR_X: AtomicBool = AtomicBool::new(false);
 
 /// Flip GOP writes on X. Call once at boot if the firmware presents a mirror.
@@ -502,7 +503,7 @@ pub trait DisplayScheme: Scheme {
                 if a == 0 {
                     continue;
                 }
-                let d_off = py as usize * pitch + px as usize * 4;
+                let d_off = py as usize * pitch + map_x(px as u32, info.width) as usize * 4;
                 if d_off + 4 > buf.len() {
                     continue;
                 }

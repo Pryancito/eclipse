@@ -5,6 +5,8 @@
 
 use uefi::proto::console::gop::{ModeInfo, PixelFormat};
 
+use crate::fb;
+
 pub const LOGO_WIDTH: usize = 800;
 pub const LOGO_HEIGHT: usize = 250;
 
@@ -33,9 +35,9 @@ pub fn draw_centered(mode: ModeInfo, fb_addr: u64) {
     // Clear to white (match the asset background expectation).
     unsafe {
         for y in 0..sh {
-            let row = y * stride;
             for x in 0..sw {
-                core::ptr::write_volatile(fb_ptr.add(row + x), 0x00FF_FFFF);
+                let (dx, dy) = fb::map_xy(x, y, sw, sh);
+                core::ptr::write_volatile(fb_ptr.add(dy * stride + dx), 0x00FF_FFFF);
             }
         }
     }
@@ -65,7 +67,8 @@ pub fn draw_centered(mode: ModeInfo, fb_addr: u64) {
                 }
                 // Write as 0x00RRGGBB; UEFI GOP Bgr generally maps this as B,G,R in low bytes.
                 let pixel = (r << 16) | (g << 8) | b;
-                core::ptr::write_volatile(fb_ptr.add(sy * stride + sx), pixel);
+                let (dx, dy) = fb::map_xy(sx, sy, sw, sh);
+                core::ptr::write_volatile(fb_ptr.add(dy * stride + dx), pixel);
             }
         }
     }

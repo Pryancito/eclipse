@@ -312,9 +312,6 @@ pub(super) fn init() -> DeviceResult {
             && height != 0
             && crate::drivers::all_display().first().is_none()
         {
-            if super::cpu::is_virtualbox_hypervisor() {
-                zcore_drivers::scheme::set_scanout_mirror_x(true);
-            }
             let display = Arc::new(UefiDisplay::new(DisplayInfo {
                 width: width as _,
                 height: height as _,

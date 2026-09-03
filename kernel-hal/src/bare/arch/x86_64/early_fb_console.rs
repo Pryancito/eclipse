@@ -9,8 +9,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use crate::KCONFIG;
 
-// 8x8 font (public domain style) for ASCII 0x20..0x7F.
-// Each byte is one row, MSB = leftmost pixel.
+// VGA-style 8x8 font for ASCII 0x20..0x7F (same table as rboot).
+// Each byte is one row. Bit 7 is the leftmost pixel of the cell.
 const FONT8X8: [[u8; 8]; 96] = include!("font8x8_basic.in");
 
 static INITED: AtomicBool = AtomicBool::new(false);
@@ -42,26 +42,43 @@ pub fn prime(fb_vaddr: usize, width: usize, height: usize, stride_pixels: usize)
     FB_WIDTH.store(width as u32, Ordering::SeqCst);
     FB_HEIGHT.store(height as u32, Ordering::SeqCst);
     FB_STRIDE_PIXELS.store(stride_pixels as u32, Ordering::SeqCst);
-    if super::cpu::is_virtualbox_hypervisor() {
-        MIRROR_X.store(true, Ordering::SeqCst);
-        zcore_drivers::scheme::set_scanout_mirror_x(true);
-    }
     INITED.store(true, Ordering::SeqCst);
+}
+
+/// Flip every GOP store on X. Opt-in via `FB_MIRROR_X` on the kernel command
+/// line (odd panels); do not enable this to "un-mirror" glyphs — that is a
+/// font bit-order bug and makes strings start on the right.
+pub fn set_mirror_x(on: bool) {
+    MIRROR_X.store(on, Ordering::SeqCst);
+    zcore_drivers::scheme::set_scanout_mirror_x(on);
+}
+
+/// Colon-separated cmdline flags, matching rboot's `has_cmdline_flag`.
+fn cmdline_flag(cmdline: &str, key: &str) -> bool {
+    for part in cmdline.split(':') {
+        let mut it = part.splitn(2, '=');
+        let k = it.next().unwrap_or("").trim();
+        let v = it.next().unwrap_or("").trim();
+        if k.eq_ignore_ascii_case(key) {
+            return v.is_empty()
+                || v == "1"
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("on");
+        }
+    }
+    false
 }
 
 fn apply_kconfig_fb_flags() {
     let Some(cfg) = KCONFIG.try_get() else {
         return;
     };
-    if cfg.cmdline.contains("FB_ROT180=1")
-        || cfg.cmdline.contains("FB_ROT180=true")
-        || cfg.cmdline.contains("FB_ROT180=on")
-        || cfg.cmdline.contains("FB_ROT180")
-    {
+    if cmdline_flag(cfg.cmdline, "FB_ROT180") {
         ROT180.store(true, Ordering::SeqCst);
     }
-    if cfg.cmdline.contains("FB_MIRROR_X") {
+    if cmdline_flag(cfg.cmdline, "FB_MIRROR_X") {
         MIRROR_X.store(true, Ordering::SeqCst);
+        zcore_drivers::scheme::set_scanout_mirror_x(true);
     }
 }
 
@@ -89,10 +106,6 @@ fn try_init() -> bool {
     // Use the actual GOP stride. Real hardware often pads rows.
     FB_STRIDE_PIXELS.store(stride as u32, Ordering::SeqCst);
     apply_kconfig_fb_flags();
-    if super::cpu::is_virtualbox_hypervisor() {
-        MIRROR_X.store(true, Ordering::SeqCst);
-        zcore_drivers::scheme::set_scanout_mirror_x(true);
-    }
 
     // IMPORTANT: do NOT clear on init.
     // We want the boot progress bar to be continuous from the bootloader (rboot)
@@ -210,12 +223,13 @@ fn draw_char(c: u8) {
     let x0 = col * CHAR_W;
     let y0 = row * CHAR_H;
 
-    // 8x16: draw each font row twice vertically
+    // 8x16: draw each font row twice vertically.
+    // gx = 0 is the left of the cell; bit 7 of the VGA row is that pixel.
     for (gy, bits) in glyph.iter().copied().enumerate() {
-        for gx in 0..8 {
+        for gx in 0..8u32 {
             let on = (bits & (1 << (7 - gx))) != 0;
             if on {
-                let px = x0 + gx as u32;
+                let px = x0 + gx;
                 let py = y0 + (gy as u32) * 2;
                 put_pixel(px, py, 0xFFFF_FFFF);
                 put_pixel(px, py + 1, 0xFFFF_FFFF);
@@ -234,12 +248,13 @@ fn draw_char_at(x0: u32, y0: u32, c: u8, fg: u32, bg: u32) {
     let c = if (0x20..0x80).contains(&c) { c } else { b'?' };
     let glyph = &FONT8X8[(c - 0x20) as usize];
 
-    // 8x16: draw each font row twice vertically
+    // 8x16: draw each font row twice vertically.
+    // gx = 0 is the left of the cell; bit 7 of the VGA row is that pixel.
     for (gy, bits) in glyph.iter().copied().enumerate() {
-        for gx in 0..8 {
+        for gx in 0..8u32 {
             let on = (bits & (1 << (7 - gx))) != 0;
             let color = if on { fg } else { bg };
-            let px = x0 + gx as u32;
+            let px = x0 + gx;
             let py = y0 + (gy as u32) * 2;
             put_pixel(px, py, color);
             put_pixel(px, py + 1, color);

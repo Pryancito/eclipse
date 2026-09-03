@@ -35,6 +35,7 @@ use x86_64::{PhysAddr, VirtAddr};
 use xmas_elf::ElfFile;
 
 mod config;
+mod fb;
 mod idt;
 mod logo;
 mod page_table;
@@ -94,17 +95,6 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     // Snapshot cmdline flags before ExitBootServices: `config` lives on the stack
     // and must not be read after firmware reclaims that memory.
 
-    let (graphic_info, edid, edid_size) = init_graphic(bs, config.resolution);
-    // Boot progress is continuous across rboot (0..50) and kernel (50..100).
-    if has_cmdline_flag(config.cmdline, "FB_ROT180") {
-        progress::set_rot180(true);
-    }
-    // Draw splash logo immediately after GOP init (this also clears screen to white).
-    logo::draw_centered(graphic_info.mode, graphic_info.fb_addr);
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 0);
-    debug!("rboot config: {:#x?}", config);
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 5);
-
     let acpi2_addr = st
         .config_table()
         .iter()
@@ -112,6 +102,20 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         .expect("failed to find ACPI 2 RSDP")
         .address;
     debug!("acpi2 rsdp: {:?}", acpi2_addr);
+
+    let (graphic_info, edid, edid_size) = init_graphic(bs, config.resolution);
+    // Boot progress is continuous across rboot (0..50) and kernel (50..100).
+    if has_cmdline_flag(config.cmdline, "FB_ROT180") {
+        fb::set_rot180(true);
+    }
+    if has_cmdline_flag(config.cmdline, "FB_MIRROR_X") {
+        fb::set_mirror_x(true);
+    }
+    // Draw splash logo immediately after GOP init (this also clears screen to white).
+    logo::draw_centered(graphic_info.mode, graphic_info.fb_addr);
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 0);
+    debug!("rboot config: {:#x?}", config);
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 5);
 
     let smbios_addr = st
         .config_table()

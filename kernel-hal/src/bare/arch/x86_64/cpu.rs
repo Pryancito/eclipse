@@ -207,19 +207,3 @@ hal_fn_impl! {
         }
     }
 }
-
-/// CPUID.40000000H hypervisor brand is `VBoxVBoxVBox` on VirtualBox.
-///
-/// Its VMSVGA EFI GOP presents the linear framebuffer left-right reversed
-/// (panic banner stays right-side up but text reads as a mirror). Used to
-/// enable the early-FB `MIRROR_X` path and the GOP blit flip without a
-/// cmdline flag on real hardware.
-pub(crate) fn is_virtualbox_hypervisor() -> bool {
-    use core::arch::x86_64::__cpuid;
-    if __cpuid(1).ecx & (1 << 31) == 0 {
-        return false;
-    }
-    let r = __cpuid(0x4000_0000);
-    // "VBox" little-endian in EBX/ECX/EDX.
-    r.ebx == 0x786F_4256 && r.ecx == 0x786F_4256 && r.edx == 0x786F_4256
-}

@@ -2,18 +2,12 @@
 //!
 //! Minimal, no_std-friendly: draws a centered progress bar directly into GOP fb.
 
-use core::sync::atomic::{AtomicBool, Ordering};
 use uefi::proto::console::gop::{ModeInfo, PixelFormat};
+
+use crate::fb;
 
 // 8x8 font for ASCII 0x20..0x7F (same data format as kernel-hal).
 const FONT8X8: [[u8; 8]; 96] = include!("font8x8_basic.in");
-
-static ROT180: AtomicBool = AtomicBool::new(false);
-
-/// Rotate all progress drawing by 180 degrees (useful on some real panels/firmware).
-pub fn set_rot180(enable: bool) {
-    ROT180.store(enable, Ordering::SeqCst);
-}
 
 fn pixel_white(fmt: PixelFormat) -> u32 {
     match fmt {
@@ -30,11 +24,7 @@ fn pixel_black(_fmt: PixelFormat) -> u32 {
 }
 
 fn put_pixel(fb: *mut u32, stride: usize, sw: usize, sh: usize, x: usize, y: usize, pixel: u32) {
-    let (mut x, mut y) = (x, y);
-    if ROT180.load(Ordering::SeqCst) {
-        x = sw.saturating_sub(1).saturating_sub(x);
-        y = sh.saturating_sub(1).saturating_sub(y);
-    }
+    let (x, y) = fb::map_xy(x, y, sw, sh);
     unsafe { core::ptr::write_volatile(fb.add(y * stride + x), pixel) };
 }
 
@@ -56,6 +46,7 @@ fn draw_char_8x16(
         if py0 >= sh {
             break;
         }
+        // gx = 0 is the left of the cell; bit 7 of the VGA row is that pixel.
         for gx in 0..8 {
             let px = x + gx;
             if px >= sw {
