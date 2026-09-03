@@ -279,3 +279,120 @@ actualizó para reflejar el nuevo contrato (hay que flushear antes de mirar
 RDT). Los 13 tests existentes (RX, TX, coherency bench) siguen en verde.
 `cargo build -p zcore-drivers` (build `no_std` real) y `cargo clippy`
 limpios.
+
+## Auditoría 2026-09-03 (segunda pasada de bugs)
+
+Nueva lectura completa de `drivers/src/net/e1000e.rs` (3690 líneas, tras el
+commit "mejoras en el driver e1000e y en la velocidad de red"), de nuevo
+comparando con `e1000.rs`, `utils/deferred_job.rs`, `utils/dma_sync.rs`, el
+uso que hace `linux-object/src/net` de la interfaz y el comportamiento
+documentado de Intel/Linux e1000e. **Los 5 hallazgos están corregidos**;
+verificado con `cargo test -p zcore-drivers --lib --features mock e1000e`
+(23 tests, 3 nuevos), `cargo build -p zcore-drivers` (`no_std`) y `cargo
+clippy` limpio para este archivo.
+
+### Alto
+
+#### 14. El anillo TX se llenaba del todo y TDT alcanzaba a TDH: TX muerto para siempre
+`can_send` / `post_tx_frame` (antes `tx_dd_at_tail`)
+
+La corrección #2 pasó a decidir "slot libre" solo por el bit DD del
+descriptor, y el test `tx_fills_the_full_ring_with_no_guard_slot` consagraba
+que se pudieran postear los 256 slots. Pero el NIC no tiene bit de propiedad
+propio: procesa descriptores desde TDH hasta TDT (exclusivo) y **interpreta
+`TDH == TDT` como anillo vacío**. Con 256 en vuelo la cola de software da la
+vuelta hasta la cabeza y el `flush_tx_doorbell` escribe un TDT igual a TDH:
+el hardware no ve trabajo, nunca busca esos descriptores, sus DD nunca
+vuelven y cada `send` posterior espera `TX_SEND_SPIN_LIMIT` y descarta —
+TX inutilizable hasta reiniciar. Requiere que el NIC esté parado mientras el
+software postea una vuelta completa (enlace oscilando durante una subida con
+`link_up` aún en caché, pausa de flow control), cosa que QEMU (TX síncrono)
+no reproduce: solo aparece en hardware real. Linux acota lo pendiente a
+`count - 1` en `e1000_desc_unused` por esta misma razón.
+
+*Corrección:* `tx_can_post` exige DD en `tx_tail` **y** en `tx_tail + 1`
+(slot de guarda), de modo que nunca hay más de `NUM_TX - 1` descriptores en
+vuelo y TDT no puede alcanzar a TDH por detrás. Tests reescritos:
+`tx_keeps_one_guard_slot_so_tdt_never_meets_tdh` comprueba que el envío 256
+se rechaza y que `TDT != TDH`, y los demás tests TX modelan la guarda.
+
+### Medio
+
+#### 15. El offload de checksum RX confiaba a ciegas en el NIC
+`capabilities()` → `Checksum::Tx`, `process_rx_slot`
+
+Al activar `RXCSUM.IPOFLD|TUOFLD` se le dijo a smoltcp que no verifique
+IPv4/TCP/UDP en recepción. Eso solo es válido para tramas que el NIC ha
+validado de verdad, y lo indica por descriptor: `status.IPCS/TCPCS/UDPCS`
+("lo calculé"; el fallo aparece en `errors.IPE/TCPE` y ya se descartaba) e
+`IXSM` ("ignora mi indicación"). El driver nunca miraba esos bits, así que
+cualquier trama que el hardware no validase — TCP/UDP sobre IPv6 en partes
+sin offload IPv6, cualquier cosa marcada IXSM — llegaba a smoltcp **sin
+ninguna comprobación de checksum** y un segmento corrupto se entregaba a
+userspace como datos buenos. Linux toma esta decisión por paquete en
+`e1000_rx_checksum`; las capacidades de smoltcp son estáticas, así que la
+verificación de respaldo tiene que hacerla el driver.
+
+*Corrección:* `rx_csum_needs_sw_check(status)` + `rx_sw_csum_bad(frame,
+status)`: solo cuando faltan los bits (o hay IXSM) se verifica en software
+la cabecera IPv4 y el checksum TCP/UDP (IPv4 e IPv6, saltando extension
+headers comunes); el caso común IPv4 TCP/UDP validado sigue costando una
+comparación de bits. Descarte contado en `rx_dropped` y `rx_csum_bad`.
+Tests: `rx_sw_csum_accepts_good_and_rejects_corrupt_frames`,
+`rx_drops_unvalidated_corrupt_frame_and_keeps_validated_ones`; el mock
+`hw_deliver_with_status` modela qué validó el NIC.
+
+#### 16. Un watchdog evictado de la cola diferida mataba la vigilancia de enlace para siempre
+`schedule_watchdog`
+
+Era la segunda mitad del hallazgo #6, que quedó sin corregir: el `Guard`
+que limpia `watchdog_job_scheduled` se construía **dentro** del closure, así
+que solo se ejecutaba si el job llegaba a correr. `deferred_job.rs` evicta
+(dropea) entradas sin ejecutarlas al llegar a 256; un watchdog evictado
+dejaba el flag en `true` y ningún `schedule_watchdog` volvía a encolar nada:
+sin detección de link up/down ni logs del watchdog hasta reiniciar.
+
+*Corrección:* el guard se crea fuera y se mueve dentro del closure, de
+modo que se dropea (y limpia el flag) tanto si el job corre como si es
+evictado. El mismo patrón se aplica al bottom-half de IRQ con
+`PollPendingGuard`: al dropearse limpia `poll_pending` y rearma IMS, así una
+eviction se recupera al instante en vez de esperar los 500 ms de
+`heal_stuck_poll_pending` (que se mantiene como red de seguridad).
+
+### Bajo
+
+#### 17. `TxToken::consume` giraba 4096 iteraciones con IRQs apagadas si el enlace estaba caído
+Con `link_up == false`, `post_tx_frame` devolvía `NotReady` tras releer
+STATUS por MMIO, y el bucle de espera lo trataba como "anillo lleno":
+4096 lecturas MMIO (varios ms bajo QEMU, ~4 ms en hardware) por cada trama
+que smoltcp intentara enviar, con el lock de `hw` (IRQs off) sostenido.
+*Corrección:* comprobación de enlace antes del bucle; sin enlace se devuelve
+`Exhausted` inmediatamente (sin contar en `tx_dropped`, que significa
+"perdido con enlace arriba").
+
+#### 18. `restart_autoneg` probaba primero la dirección MDIO 1 en partes PCH
+En 82577/8/9, I217/I218/I219 los registros MII estándar están en la
+dirección 2 (Linux `e1000_get_phy_addr_for_hv_page`: páginas < 768 → 2); la
+dirección 1 es el bloque MAC-side/wakeup. Probar la 1 primero "tenía éxito"
+(MDIC_READY sin error), hacía `break`, y el reinicio de autoneg por BMCR
+nunca llegaba al PHY real. *Corrección:* orden `[2, 1]` en `is_pch()`,
+`[1, 2]` en discretas (82574). Sin efecto en QEMU; en I219 real el enlace ya
+subía por SLU/ASDE + LANPHYPC, así que solo debería notarse como un
+reinicio de autoneg efectivo.
+
+### Observaciones sin cambio
+
+- `NetScheme::recv` (usado por `netdev_drain_rx`/`drain_all_nic_rx` en
+  `linux-object/src/net`) saca tramas del anillo **sin pasar por smoltcp**:
+  cualquier segmento TCP que llegue mientras ICMP/AF_PACKET drenan se pierde
+  para los sockets TCP (retransmisión). Es un problema de la capa de red del
+  kernel, no del driver.
+- `E1000E_SRRCTL` (0x280C) es un registro de la familia igb; en 82574/I219 ese
+  offset está reservado en el mapa e1000e. La escritura es inocua en el
+  hardware probado, se deja tal cual.
+- `IMS` se habilita en `reset_and_init` antes de que el vector MSI quede
+  registrado (`pci_finish_msi_registrations`); un LSC temprano se pierde,
+  pero el polling periódico y el watchdog lo cubren.
+- Con el anillo TX en modo write-back (fallback si el remapeo UC falla) el
+  sync ToDevice diferido de descriptores amplía la ventana de false sharing
+  que motivó los anillos UC; el camino de producción (UC) no se ve afectado.
