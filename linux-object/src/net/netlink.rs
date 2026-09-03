@@ -7,7 +7,7 @@ use crate::{
     fs::FileLike,
     net::{
         AddressFamily, Endpoint, Socket, SysResult, ARPHRD_ETHER, ARPHRD_LOOPBACK, IFF_BROADCAST,
-        IFF_CHANGE_ALL, IFF_LOOPBACK, IFF_LOWER_UP, IFF_NOARP, IFF_RUNNING, IFF_UP,
+        IFF_CHANGE_ALL, IFF_LOOPBACK, IFF_LOWER_UP, IFF_MULTICAST, IFF_NOARP, IFF_RUNNING, IFF_UP,
     },
 };
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
@@ -208,7 +208,11 @@ impl Socket for NetlinkSocketState {
                         let ifi_flags = if is_loopback {
                             IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_NOARP | IFF_LOWER_UP
                         } else {
-                            IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_LOWER_UP
+                            let mut flags = IFF_UP | IFF_BROADCAST | IFF_MULTICAST;
+                            if iface.link_carrier_up() {
+                                flags |= IFF_RUNNING | IFF_LOWER_UP;
+                            }
+                            flags
                         };
 
                         let if_info = IfaceInfoMsg {

@@ -182,29 +182,10 @@ impl Syscall<'_> {
                     } else {
                         process.exit(retcode);
                     }
+                    Ok(0)
                 }
-                sig => {
-                    let tids = process.thread_ids();
-                    for tid in tids {
-                        let Ok(obj) = process.get_child(tid) else {
-                            continue;
-                        };
-                        let Ok(thread) = obj.downcast_arc::<Thread>() else {
-                            continue;
-                        };
-                        let Some(mut thread_linux) = thread.try_lock_linux() else {
-                            continue;
-                        };
-                        if thread_linux.signal_mask.contains(sig) {
-                            continue;
-                        } else {
-                            thread_linux.signals.insert(signal);
-                            break;
-                        }
-                    }
-                }
-            };
-            Ok(0)
+                sig => linux_object::process::send_signal_to_process(pid as usize, sig).map(|_| 0),
+            }
         };
         match target {
             SendTarget::Pid(pid) => send_to_pid(pid),

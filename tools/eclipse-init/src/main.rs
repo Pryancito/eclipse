@@ -10,7 +10,11 @@
 //!   * launch the userspace declared in `/etc/eclipse/services/*.service`
 //!     (`oneshot` tasks run to completion in order; `respawn` services are
 //!     supervised and restarted if they exit),
-//!   * shut the system down cleanly on SIGTERM (halt) / SIGINT (reboot).
+//!   * shut the system down cleanly on SIGTERM/SIGUSR1/SIGUSR2 (halt/power
+//!     off) and SIGINT (reboot). busybox `halt`/`poweroff`/`reboot` send
+//!     SIGUSR1/SIGUSR2/SIGTERM respectively; SIGINT is Ctrl-Alt-Del. The
+//!     `/usr/local/bin/reboot` wrapper sends SIGINT so a `reboot` command
+//!     actually reboots instead of following busybox's SIGTERM mapping.
 //!
 //! Design borrowed from runit/s6/dinit (supervision, declarative services,
 //! dependency ordering); implementation is our own so every syscall is under
@@ -33,10 +37,9 @@ const HEALTHY_UPTIME: Duration = Duration::from_secs(2);
 const MIN_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
 
-/// Set by the SIGTERM handler: bring the system down (halt/power off).
+/// Set by the SIGTERM/SIGUSR2 handlers: bring the system down (halt/power off).
 static WANT_HALT: AtomicBool = AtomicBool::new(false);
-/// Set by the SIGINT handler (Ctrl-Alt-Del is delivered to PID 1 as SIGINT):
-/// bring the system down and reboot.
+/// Set by the SIGINT handler (Ctrl-Alt-Del is delivered to PID 1 as SIGINT).
 static WANT_REBOOT: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_sigterm(_sig: libc::c_int) {
@@ -44,6 +47,16 @@ extern "C" fn on_sigterm(_sig: libc::c_int) {
 }
 extern "C" fn on_sigint(_sig: libc::c_int) {
     WANT_REBOOT.store(true, Ordering::SeqCst);
+}
+extern "C" fn on_sigusr1(_sig: libc::c_int) {
+    // busybox `halt` (without -f) signals PID 1 with SIGUSR1.
+    WANT_HALT.store(true, Ordering::SeqCst);
+}
+extern "C" fn on_sigusr2(_sig: libc::c_int) {
+    // busybox `poweroff` (without -f) signals PID 1 with SIGUSR2. Without
+    // this handler PID 1 ignores the signal (Linux never applies the default
+    // terminate action to init) and "Apagar" in lunarbar did nothing.
+    WANT_HALT.store(true, Ordering::SeqCst);
 }
 
 /// How a service is managed.
@@ -193,6 +206,9 @@ fn main() {
     // one, so only the selected compositor/X stack is supervised.
     let desktop = selected_desktop();
     log(&format!("desktop session: {desktop}"));
+    if desktop == "none" {
+        log("console/installer session: compositor services skipped");
+    }
     services.retain(|_, s| s.desktop.as_deref().map_or(true, |d| d == desktop));
 
     // Move the display to the dedicated graphics VT (tty7) BEFORE starting the
@@ -398,6 +414,8 @@ fn clean_runtime_dir(dir: &Path) {
 fn install_signal_handlers() {
     install_handler(libc::SIGTERM, on_sigterm as usize);
     install_handler(libc::SIGINT, on_sigint as usize);
+    install_handler(libc::SIGUSR1, on_sigusr1 as usize);
+    install_handler(libc::SIGUSR2, on_sigusr2 as usize);
     // SIGCHLD is left at its default: the blocking `waitpid` in the supervision
     // loop reaps children directly, so no handler is needed for reaping.
 }
@@ -421,8 +439,10 @@ fn install_handler(sig: libc::c_int, handler: usize) {
 
 /// Which desktop session to start. Resolution order, first hit wins:
 ///   1. a `desktop=<name>` token on the kernel command line (`/proc/cmdline`) —
-///      this is how `make qemu` selects Xorg while the same image, booted on
-///      real hardware with the installed cmdline, gets none and falls through;
+///      this is how `make qemu` selects the session while the same image, booted
+///      on real hardware with the installed cmdline, gets none and falls through;
+///      `desktop=none` (ISO installer) starts no compositor, so the live session
+///      is a console plus `install-eclipse`;
 ///   2. the `/etc/eclipse/desktop` file (first whitespace token) — a persistent
 ///      per-install override the user can edit;
 ///   3. `labwc` — the default Eclipse session.
@@ -1050,6 +1070,8 @@ fn spawn(argv: &[String], log_path: Option<&str>) -> Option<i32> {
             // handlers, and give it its own session/process group.
             libc::signal(libc::SIGTERM, libc::SIG_DFL);
             libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGUSR1, libc::SIG_DFL);
+            libc::signal(libc::SIGUSR2, libc::SIG_DFL);
             libc::setsid();
             // Detach from the console: stdin → /dev/null; stdout/stderr →
             // optional log file or /dev/null so service chatter never hits

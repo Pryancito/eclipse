@@ -16,8 +16,10 @@ use smoltcp::wire::{EthernetAddress, EthernetFrame};
 use zcore_drivers::scheme::NetScheme;
 use zircon_object::object::*;
 
-/// Per-socket RX queue depth (enough for DHCP bursts).
-const PACKET_QUEUE_MAX: usize = 16;
+/// Per-socket RX queue depth. udhcpc stays bound for the lease lifetime and
+/// sees every IPv4 frame; a 16-deep queue overflowed on a noisy LAN and dropped
+/// DHCPOFFER/DHCPACK (and, after bind, TCP segments copied to the tap).
+const PACKET_QUEUE_MAX: usize = 64;
 /// Max concurrent AF_PACKET socket groups (each may queue PACKET_QUEUE_MAX frames).
 const MAX_PACKET_SOCKETS: usize = 12;
 /// Max Ethernet frame size we build on the stack for SOCK_DGRAM TX.
@@ -324,7 +326,10 @@ impl Socket for PacketSocketState {
                     return Err(LxError::EINVAL);
                 }
                 let mut buf = [0u8; ETH_FRAME_MAX];
-                let frame_len = data.len() + 14;
+                // Ethernet minimum without FCS is 60 bytes; some NICs/bridges
+                // drop shorter frames (DHCP DISCOVER is well above this, ARP
+                // and tiny UDP are not).
+                let frame_len = (data.len() + 14).max(60);
                 let mut frame = EthernetFrame::new_unchecked(&mut buf[..frame_len]);
                 frame.set_dst_addr(EthernetAddress::from_bytes(&ll.addr[..6]));
                 frame.set_src_addr(dev.get_mac());
@@ -333,9 +338,15 @@ impl Socket for PacketSocketState {
                 } else {
                     *self.inner.protocol.lock()
                 };
-                let protocol = protocol_raw;
+                // SOCK_DGRAM with protocol 0 / ETH_P_ALL still carries an IP
+                // datagram; ethertype 0x0000 is dropped on the wire.
+                let protocol = if protocol_raw == 0 || protocol_raw == 0x0003 {
+                    0x0800
+                } else {
+                    protocol_raw
+                };
                 frame.set_ethertype(protocol.into());
-                frame.payload_mut().copy_from_slice(data);
+                frame.payload_mut()[..data.len()].copy_from_slice(data);
                 for _ in 0..16 {
                     if dev.send(&buf[..frame_len]).is_ok() {
                         kernel_hal::deferred_job::drain_deferred_jobs();
@@ -351,11 +362,18 @@ impl Socket for PacketSocketState {
 
         // Do not call full poll_ifaces() here — edhcpc blocks inside send() while
         // waiting for DHCPOFFER; a heavy poll (link bringup + full RX drain) looks hung.
+        let mut raw = [0u8; ETH_FRAME_MAX];
+        let send_buf: &[u8] = if data.len() < 60 && data.len() <= ETH_FRAME_MAX {
+            raw[..data.len()].copy_from_slice(data);
+            &raw[..60]
+        } else {
+            data
+        };
         for _ in 0..16 {
-            match dev.send(data) {
-                Ok(n) => {
+            match dev.send(send_buf) {
+                Ok(_) => {
                     kernel_hal::deferred_job::drain_deferred_jobs();
-                    return Ok(n);
+                    return Ok(data.len());
                 }
                 Err(_) => {
                     kernel_hal::deferred_job::drain_deferred_jobs();
@@ -401,19 +419,11 @@ impl Socket for PacketSocketState {
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
         kernel_hal::deferred_job::drain_deferred_jobs();
         let ifindex = *self.inner.ifindex.lock();
-        if ifindex > 0 {
-            if let Ok(net) = crate::net::iface_by_linux_ifindex(ifindex) {
-                crate::net::netdev_drain_rx(net.as_ref());
-            }
-        } else {
-            for net in get_net_device().iter() {
-                if net.get_ifname() != "loopback" {
-                    crate::net::netdev_drain_rx(net.as_ref());
-                }
-            }
-        }
-        // Light NIC poll only — poll_ifaces() runs route/ARP sync + full link bringup
-        // and stalls udhcpc select() while waiting for DHCPOFFER.
+        // Tap via smoltcp Device::receive → net_defer_packet. Do NOT call
+        // `netdev_drain_rx` here: that steals frames from the hardware ring
+        // with `recv()`, so TCP/UDP never see them. udhcpc keeps this socket
+        // open for the lease lifetime (`-f`), which turned every select() into
+        // a black hole for the rest of the stack.
         if ifindex > 0 {
             if let Ok(net) = crate::net::iface_by_linux_ifindex(ifindex) {
                 let _ = net.poll();
@@ -523,5 +533,44 @@ impl FileLike for PacketSocketState {
 
     fn as_socket(&self) -> LxResult<&dyn Socket> {
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ipv4_udp_frame(ip_tot: u16, udp_len: u16, pad: usize) -> alloc::vec::Vec<u8> {
+        let mut f = alloc::vec![0u8; 14 + ip_tot as usize + pad];
+        f[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        f[14] = 0x45; // v4, IHL=5
+        f[16..18].copy_from_slice(&ip_tot.to_be_bytes());
+        f[23] = 17; // UDP
+        f[34..36].copy_from_slice(&udp_len.to_be_bytes());
+        f
+    }
+
+    #[test]
+    fn ipv4_datagram_trims_ethernet_padding_to_udp_length() {
+        // 20 byte IP + 8 byte UDP, plus 18 bytes of Ethernet padding (FCS-like).
+        let frame = ipv4_udp_frame(28, 8, 18);
+        let dgram = ipv4_datagram_from_eth_frame(&frame).expect("ipv4");
+        assert_eq!(dgram.len(), 28);
+    }
+
+    #[test]
+    fn ipv4_datagram_rejects_non_ip() {
+        let mut frame = alloc::vec![0u8; 60];
+        frame[12..14].copy_from_slice(&0x0806u16.to_be_bytes()); // ARP
+        assert!(ipv4_datagram_from_eth_frame(&frame).is_none());
+    }
+
+    #[test]
+    fn eth_l2_header_len_vlan() {
+        let mut frame = alloc::vec![0u8; 18];
+        frame[12..14].copy_from_slice(&0x8100u16.to_be_bytes());
+        frame[16..18].copy_from_slice(&0x0800u16.to_be_bytes());
+        assert_eq!(eth_l2_header_len(&frame), Some((18, 0x0800)));
+        assert_eq!(eth_l2_header_len(&frame[..14]), None);
     }
 }

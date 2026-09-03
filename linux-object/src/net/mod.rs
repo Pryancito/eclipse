@@ -999,18 +999,12 @@ pub fn drain_all_nic_rx() {
     }
 }
 
-/// Pull RX frames from the NIC and feed `push_packet` / `icmp_rx` without smoltcp.
+/// Drive the NIC's smoltcp poll so RX is copied to AF_PACKET (`net_defer_packet`)
+/// and delivered to TCP/UDP. Do not `recv()` from the ring here — that steals
+/// frames from smoltcp and silently drops TCP/DHCP depending on who ran first.
 pub fn netdev_drain_rx(dev: &dyn zcore_drivers::scheme::NetScheme) {
-    // Heap scratch: this runs under epoll/poll `io_wait_tick` on the coroutine
-    // stack. A 2 KiB local there nested under DRM/unix wait frames during
-    // desktop bring-up.
-    let mut buf = alloc::vec![0u8; 2048];
-    for _ in 0..32 {
-        match dev.recv(&mut buf) {
-            Ok(n) if n > 0 => packet::push_packet(&buf[..n]),
-            _ => break,
-        }
-    }
+    kernel_hal::deferred_job::drain_deferred_jobs();
+    let _ = dev.poll();
     kernel_hal::deferred_job::drain_deferred_jobs();
 }
 
@@ -1275,7 +1269,7 @@ pub fn send_ip_ethernet(ip: &[u8]) -> LxResult {
         }
 
         // Broadcast ARP who-has (QEMU gateway answers quickly after DHCP).
-        let mut arp_buf = vec![0u8; 14 + 28];
+        let mut arp_buf = vec![0u8; 60];
         {
             let mut eth = EthernetFrame::new_unchecked(&mut arp_buf);
             eth.set_dst_addr(EthernetAddress::BROADCAST);
@@ -1704,7 +1698,15 @@ pub fn handle_net_ioctl(
                     "down"
                 }
             );
-            // IFF_UP is software state — do not reset I219 PHY/RX on every `ifconfig up`.
+            // Do not reset the PHY (that used to drop RX on every `ifconfig up`).
+            // Poll once on admin-up so a deferred IRQ/link-arm is not left sitting
+            // until the next timer tick — udhcpc's deconfig/bound scripts both
+            // `ip link set up` immediately before DISCOVER.
+            if new_flags & IFF_UP != 0 {
+                if let Ok(iface) = iface_by_name(ifname) {
+                    let _ = iface.poll();
+                }
+            }
             Ok(0)
         }
 

@@ -178,11 +178,11 @@ impl super::LinuxRootfs {
                 let _ = fs::remove_file(boot_dir.join(name));
             }
 
-            // Minimal root for BOTH initramfs images. The EFI bootstrap is
-            // snapshotted from this *before* the desktop stack is copied in
-            // (see below): the installed system only pivots onto btrfs, so
-            // Mesa/LLVM/fonts must not land in `\EFI\zCore\initramfs.img`.
-            // QEMU/ISO then get the same tree plus `copy_into_live`.
+            // Minimal root for the RAM-resident SFS images. The EFI bootstrap
+            // (installed ESP) and the ISO installer initramfs are snapshotted
+            // *before* the desktop stack is copied in: Mesa/LLVM/fonts stay in
+            // `rootfs.btrfs.gz` (and, later, the QEMU live SFS). They must not
+            // land in `\EFI\zCore\initramfs.img` or the ISO El Torito ESP.
             let live_root = TARGET.join("live-rootfs");
             println!("Building minimal live/installer root...");
             build_live_rootfs(&rootfs_path, &live_root);
@@ -344,19 +344,13 @@ impl super::LinuxRootfs {
                 .unwrap();
             assert!(status.success(), "Failed to compress efi.img");
 
-            // Desktop stack belongs in the QEMU/ISO live initramfs only, never
-            // in the EFI bootstrap just frozen into efi.img. usr/bin + usr/lib
-            // (Mesa, libLLVM ~180 MiB, fonts, icons) are omitted by LIVE_KEEP
-            // and would have been the bulk of initramfs.img. QEMU boots this
-            // live tree without pivoting, so `startx` still needs them here.
-            // Disable with ECLIPSE_XORG_LIVE=0 for a lean live image too.
-            super::xorg::copy_into_live(&rootfs_path, &live_root);
-
             // NOTE: the payloads (efi.img.gz / rootfs.btrfs.gz / home.btrfs.gz)
             // are staged into the minimal live root's `/boot` only *after*
             // rootfs.btrfs is built (step 5c), so the full rootfs used for the
             // target root image below stays clean and does not contain the
-            // installer's own payloads.
+            // installer's own payloads. The desktop copy into live_root happens
+            // *after* the ISO installer SFS is fused, so Mesa never lands in
+            // the ISO initramfs.
 
             // 5. Build rootfs.btrfs from the FULL rootfs (the installed system's
             // real root, reached by pivot). Size it to the actual rootfs with
@@ -409,12 +403,32 @@ impl super::LinuxRootfs {
             fs::copy(&target_btrfs_gz, live_boot.join("rootfs.btrfs.gz")).unwrap();
             fs::copy(&target_home_gz, live_boot.join("home.btrfs.gz")).unwrap();
 
-            // 6. Build the final installer-enabled x86_64.img (SFS) for QEMU/ISO
-            // from live_root + desktop + payloads. Not written to the installed
-            // ESP — that carries the lean bootstrap from step 3.
+            // 5d. ISO installer SFS: LIVE_KEEP + GSP + payloads, no desktop.
+            // `make iso` copies this to the El Torito ESP as initramfs.img so
+            // the live session is console + install-eclipse; the desktop is
+            // only inside rootfs.btrfs.gz (written to disk by the installer).
+            let iso_size = live_image_size(dir_size(&live_root));
+            println!(
+                "Building ISO installer initramfs ({} MiB, no desktop stack)...",
+                iso_size / (1024 * 1024)
+            );
+            let iso_initramfs = TARGET.join("iso-initramfs.img");
+            fuse(&live_root, &iso_initramfs, iso_size);
+
+            // Desktop stack belongs in the QEMU live initramfs only, never in
+            // the EFI bootstrap or the ISO installer SFS just frozen above.
+            // usr/bin + usr/lib (Mesa, libLLVM, fonts, icons) are omitted by
+            // LIVE_KEEP; QEMU boots this tree without pivoting, so `startx`
+            // still needs them here. Disable with ECLIPSE_XORG_LIVE=0 for a
+            // lean QEMU image too.
+            super::xorg::copy_into_live(&rootfs_path, &live_root);
+
+            // 6. QEMU live SFS: installer payloads + desktop. Not written to
+            // the installed ESP or the ISO — those carry the lean images from
+            // steps 3 and 5d.
             let live_size = live_image_size(dir_size(&live_root));
             println!(
-                "Building final installer-enabled image ({} MiB)...",
+                "Building QEMU live image ({} MiB)...",
                 live_size / (1024 * 1024)
             );
             let image = PROJECT_DIR

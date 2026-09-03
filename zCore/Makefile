@@ -121,6 +121,9 @@ else ifeq ($(USER), 1)
 else
   user_img := ../prebuilt/zircon/x64/$(ZBI).zbi
 endif
+# Default: the QEMU live SFS (`x86_64.img`, desktop + payloads). `make iso`
+# overrides this with `ignored/target/iso-initramfs.img` (installer only).
+INITRAMFS_IMG ?= $(user_img)
 
 ifeq ($(PLATFORM), libos)
   LIBOS := 1
@@ -525,11 +528,12 @@ ifeq ($(ARCH), x86_64)
 	rm -f $(esp)/EFI/zCore/x86_64.img $(esp)/EFI/zCore/aarch64.img $(esp)/EFI/zCore/riscv64.img
 # The initramfs only exists after `make rootfs`/`make image`. A build-only run
 # (CI compiles the kernel without a rootfs) must still succeed: skip the copy
-# with a notice instead of dying on `cp`.
-	@if [ -f "$(user_img)" ]; then \
-	  cp $(user_img) $(esp)/EFI/zCore/initramfs.img; \
+# with a notice instead of dying on `cp`. `make iso` passes INITRAMFS_IMG to
+# the lean installer SFS so the ISO ESP does not carry Mesa/labwc.
+	@if [ -f "$(INITRAMFS_IMG)" ]; then \
+	  cp $(INITRAMFS_IMG) $(esp)/EFI/zCore/initramfs.img; \
 	else \
-	  echo "initramfs '$(user_img)' not present; skipping (build-only, no rootfs image)"; \
+	  echo "initramfs '$(INITRAMFS_IMG)' not present; skipping (build-only, no rootfs image)"; \
 	fi
 else ifeq ($(ARCH), riscv64)
 	$(OBJCOPY) $(kernel_elf) --strip-all -O binary $@

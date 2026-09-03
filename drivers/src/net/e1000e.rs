@@ -2527,7 +2527,9 @@ impl NetScheme for E1000eInterface {
                 return;
             }
             for slot in addrs.iter_mut() {
-                if slot.address().is_unspecified() && slot.prefix_len() == 0 {
+                if (slot.address().is_unspecified() && slot.prefix_len() == 0)
+                    || (slot.address() == IpAddress::v4(240, 0, 0, 0) && slot.prefix_len() == 32)
+                {
                     *slot = cidr;
                     return;
                 }
@@ -2610,6 +2612,7 @@ impl NetScheme for E1000eInterface {
         match gateway {
             Some(IpAddress::Ipv4(gw)) => {
                 if cidr.prefix_len() == 0 {
+                    let _ = iface.routes_mut().remove_default_ipv4_route();
                     iface
                         .routes_mut()
                         .add_default_ipv4_route(gw)
@@ -2624,6 +2627,7 @@ impl NetScheme for E1000eInterface {
             }
             Some(IpAddress::Ipv6(gw)) => {
                 if cidr.prefix_len() == 0 {
+                    let _ = iface.routes_mut().remove_default_ipv6_route();
                     iface
                         .routes_mut()
                         .add_default_ipv6_route(gw)
@@ -3033,16 +3037,13 @@ pub fn init(
         IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
         IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
     ];
-    let default_v4_gw = Ipv4Address::new(0, 0, 0, 0);
-    // Fresh per-NIC storage, NOT a shared `static mut`: a shared static would
-    // hand out a second live `&'static mut` on every additional e1000e probed
-    // (aliasing UB) and would splice every NIC's routes into the same 4-entry
-    // table. Leaking is fine here — this runs once per NIC for the life of the
-    // kernel, same as the mock test harness's `Box::leak` for its register file.
+    // No dummy default via 0.0.0.0 — smoltcp would ARP 0.0.0.0 for every
+    // off-link dest until DHCP overwrote it, and a full 4-slot table made
+    // `add_default_ipv4_route` return Exhausted so the real gateway never
+    // installed. DHCP/`ip route` fills this in.
     let routes_storage: &'static mut [Option<(IpCidr, Route)>] =
         Box::leak(vec![None; 4].into_boxed_slice());
-    let mut routes = Routes::new(routes_storage);
-    routes.add_default_ipv4_route(default_v4_gw).unwrap();
+    let routes = Routes::new(routes_storage);
     let neighbor_cache = NeighborCache::new(BTreeMap::new());
 
     let iface = InterfaceBuilder::new(driver.clone())
@@ -3065,10 +3066,7 @@ pub fn init(
         poll_pending_set_us: Arc::new(AtomicU64::new(0)),
         link_up_seen,
         watchdog_job_scheduled: Arc::new(AtomicBool::new(false)),
-        routes: Arc::new(Mutex::new(vec![RouteInfo {
-            dst: IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
-            gateway: Some(IpAddress::Ipv4(default_v4_gw)),
-        }])),
+        routes: Arc::new(Mutex::new(vec![])),
         ip_addrs: Arc::new(Mutex::new(ip_addrs)),
     };
 
@@ -3132,18 +3130,7 @@ impl PciDriver for E1000eDriverPci {
         }
 
         let vaddr = crate::net::phys_to_virt(bar0_addr);
-        // Naming by bus alone collides whenever a second NIC (or a second
-        // function of a multi-port card) sits on the same PCI bus at a
-        // different device/function — two interfaces would both be "ethN".
-        // Keep the common single-function-per-bus case as the familiar
-        // "ethN"; disambiguate only when device/function actually vary, which
-        // is guaranteed unique since (bus, device, function) is the PCI
-        // addressing key.
-        let name = if dev.loc.device == 0 && dev.loc.function == 0 {
-            alloc::format!("eth{}", dev.loc.bus)
-        } else {
-            alloc::format!("eth{}d{}f{}", dev.loc.bus, dev.loc.device, dev.loc.function)
-        };
+        let name = crate::net::next_eth_ifname();
 
         unsafe {
             let mut cmd = PCI_ACCESS.read16(&PortOpsImpl, dev.loc, 0x04);

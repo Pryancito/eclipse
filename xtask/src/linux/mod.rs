@@ -1023,6 +1023,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             "wget",
             "traceroute",
             "traceroute6",
+            "reboot",
+            "halt",
+            "poweroff",
         ]
         .into_iter()
         .map(String::from)
@@ -2160,14 +2163,11 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               for i in $(ip -o link show 2>/dev/null | sed 's/^[0-9]*: //; s/[@:].*//' | grep -v '^lo'); do\n\
               \x20 exec udhcpc -i \"$i\" -f -R -s \"$SCRIPTv4\"\n\
               done\n\
-              # No interface: exit FAST (under init's HEALTHY_UPTIME of 2 s) so\n\
-              # init classifies this as crashing and applies exponential backoff\n\
-              # (250 ms -> 8 s). The old `sleep 3` kept uptime above 2 s, which\n\
-              # RESET the backoff every round -- a NIC-less machine re-ran this\n\
-              # ~5-fork pipeline every 3 s forever.\n\
-              echo 'eclipse-udhcpc: no non-loopback interface yet' >&2\n\
-              sleep 1\n\
-              exit 1\n",
+              # `ip` may not have listed anything yet (netlink dump raced the\n\
+              # NIC probe). eth0 is the sequential name the kernel assigns to\n\
+              # the first Ethernet NIC.\n\
+              echo 'eclipse-udhcpc: no interface from ip link; trying eth0' >&2\n\
+              exec udhcpc -i eth0 -f -R -s \"$SCRIPTv4\"\n",
         )
         .unwrap();
         // Persist contained kernel faults. The fault path records them in RAM
@@ -2340,6 +2340,24 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               exec startx -- vt1\n",
         )
         .unwrap();
+        // PATH puts /usr/local/bin first, so these win over busybox applets.
+        // busybox `reboot` signals PID 1 with SIGTERM (eclipse-init: power
+        // off); `poweroff` uses SIGUSR2. Speak eclipse-init's language.
+        fs::write(
+            localbin.join("reboot"),
+            b"#!/bin/sh\nkill -INT 1\n",
+        )
+        .unwrap();
+        fs::write(
+            localbin.join("poweroff"),
+            b"#!/bin/sh\nkill -TERM 1\n",
+        )
+        .unwrap();
+        fs::write(
+            localbin.join("halt"),
+            b"#!/bin/sh\nkill -TERM 1\n",
+        )
+        .unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             for w in [
@@ -2350,6 +2368,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                 "eclipse-lunarbar",
                 "eclipse-boot-sound",
                 "eclipse-boot-sound-play",
+                "reboot",
+                "poweroff",
+                "halt",
             ] {
                 let _ = fs::set_permissions(localbin.join(w), fs::Permissions::from_mode(0o755));
             }

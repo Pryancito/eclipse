@@ -478,6 +478,7 @@ pub async fn wait_child(
     reap: bool,
 ) -> LxResult<(ExitCode, ChildCpu)> {
     loop {
+        check_signals()?;
         {
             let mut inner = proc.linux().inner.lock();
             if let Some(&(code, cpu)) = inner.reaped_children.get(&pid) {
@@ -507,6 +508,7 @@ pub async fn wait_child(
         }
         let child_obj: Arc<dyn KernelObject> = child.clone();
         child_obj.wait_signal(Signal::PROCESS_TERMINATED).await;
+        check_signals()?;
 
         // Check again after wait
         if let Status::Exited(code) = child.status() {
@@ -530,6 +532,9 @@ pub async fn wait_child_any(
     reap: bool,
 ) -> LxResult<(KoID, ExitCode, ChildCpu)> {
     loop {
+        // kill(1, SIGTERM) must interrupt PID 1's blocking waitpid so
+        // eclipse-init can power off without waiting for a child to exit.
+        check_signals()?;
         let mut inner = proc.linux().inner.lock();
         if inner.children.is_empty() && inner.reaped_children.is_empty() {
             return Err(LxError::ECHILD);
@@ -580,6 +585,9 @@ pub async fn wait_child_any(
             trace!("wait_child_any: found exited child after clear, continuing");
             continue;
         }
+        // kill() may have pulsed SIGCHLD and we just cleared it; the Linux
+        // signal is still pending, so notice it before sleeping.
+        check_signals()?;
         trace!("wait_child_any: waiting for SIGCHLD");
         proc_obj.wait_signal(Signal::SIGCHLD).await;
         trace!("wait_child_any: woke up from SIGCHLD");
@@ -2274,19 +2282,24 @@ pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
         for tid in tids {
             if let Ok(thread_obj) = process.get_child(tid) {
                 if let Ok(thread) = thread_obj.downcast_arc::<Thread>() {
-                    // try_lock_linux: this walks another process's threads, which
-                    // may be tearing down concurrently under SMP churn. Skip any
-                    // thread whose extension can no longer be resolved.
-                    let blocked = match thread.try_lock_linux() {
-                        Some(lt) => lt.signal_mask.contains(signal),
-                        None => continue,
-                    };
-                    if !blocked {
-                        if let Some(mut lt) = thread.try_lock_linux() {
+                    // Peek without holding the guard across a move of `thread`.
+                    let delivered = if let Some(mut lt) = thread.try_lock_linux() {
+                        if lt.signal_mask.contains(signal) {
+                            false
+                        } else {
                             lt.signals.insert(signal);
-                            return Ok(());
+                            true
                         }
-                        continue;
+                    } else {
+                        // Lock held (e.g. PID 1 in waitpid): queue below rather
+                        // than dropping the signal — that drop is why lunarbar's
+                        // `kill 1` did nothing.
+                        false
+                    };
+                    if delivered {
+                        // Wake waitpid(-1): PID 1 blocks on this zircon bit.
+                        process.signal_set(Signal::SIGCHLD);
+                        return Ok(());
                     }
                     if first.is_none() {
                         first = Some(thread);
@@ -2300,10 +2313,11 @@ pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
         // The old code dropped it here, which is why a Wayland compositor that
         // blocks SIGINT for its signalfd never saw Ctrl-C.
         if let Some(thread) = first {
-            if let Some(mut lt) = thread.try_lock_linux() {
-                lt.signals.insert(signal);
-            }
+            thread.lock_linux().signals.insert(signal);
         }
+        // Pulse even when every thread had the Linux signal blocked: waitpid
+        // still needs to return so the waiter can notice the pending set.
+        process.signal_set(Signal::SIGCHLD);
         Ok(())
     } else {
         Err(LxError::ESRCH)

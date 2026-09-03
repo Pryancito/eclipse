@@ -907,6 +907,53 @@ impl State {
         }
     }
 
+    /// Ask PID 1 to reboot (`true`) or power off (`false`), then fall back to
+    /// the `reboot(2)` syscall if init does not take the system down.
+    ///
+    /// eclipse-init: SIGINT = reboot, SIGTERM = power off. busybox's own
+    /// `reboot` applet instead sends SIGTERM (which would power off) and
+    /// `poweroff` sends SIGUSR2 (which init used to ignore), so the previous
+    /// `reboot || shutdown -r now` / `poweroff || shutdown -h now` paths did
+    /// the wrong thing or nothing.
+    fn request_power(&self, reboot: bool) {
+        unsafe {
+            let go = || {
+                let sig = if reboot {
+                    libc::SIGINT
+                } else {
+                    libc::SIGTERM
+                };
+                libc::kill(1, sig);
+                let ts = libc::timespec {
+                    tv_sec: 3,
+                    tv_nsec: 0,
+                };
+                libc::nanosleep(&ts, core::ptr::null_mut());
+                let cmd = if reboot {
+                    libc::RB_AUTOBOOT
+                } else {
+                    libc::RB_POWER_OFF
+                };
+                libc::reboot(cmd);
+            };
+            let pid = libc::fork();
+            if pid < 0 {
+                go();
+            } else if pid == 0 {
+                libc::setsid();
+                let pid2 = libc::fork();
+                if pid2 == 0 {
+                    go();
+                    libc::_exit(1);
+                }
+                libc::_exit(0);
+            } else {
+                let mut st = 0;
+                libc::waitpid(pid, &mut st, 0);
+            }
+        }
+    }
+
     // ── Taskbar interaction ─────────────────────────────────────────────────
 
     /// A click on a window button (by toplevel protocol id): left focuses
@@ -1336,11 +1383,11 @@ impl State {
             }
             Some(Action::PowerReboot) => {
                 self.close_popup();
-                self.spawn("reboot || shutdown -r now");
+                self.request_power(true);
             }
             Some(Action::PowerShutdown) => {
                 self.close_popup();
-                self.spawn("poweroff || shutdown -h now");
+                self.request_power(false);
             }
             Some(Action::TaskFocus(tid)) => {
                 self.close_popup();

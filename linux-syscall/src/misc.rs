@@ -598,7 +598,7 @@ impl Syscall<'_> {
             0x4321fedc => {
                 // LINUX_REBOOT_CMD_POWER_OFF
                 warn!("reboot: poweroff...");
-                kernel_hal::cpu::reset();
+                kernel_hal::cpu::power_off();
             }
             0x89abcdef => {
                 // LINUX_REBOOT_CMD_CAD_ON
@@ -611,15 +611,15 @@ impl Syscall<'_> {
             0xcdef0123 => {
                 // LINUX_REBOOT_CMD_HALT
                 warn!("reboot: halt...");
-                kernel_hal::cpu::reset();
+                kernel_hal::cpu::power_off();
             }
             0x456789ab => {
                 // LINUX_REBOOT_CMD_SW_SUSPEND
                 warn!("reboot: sw_suspend unimplemented");
                 Err(LxError::EINVAL)
             }
-            0x01234567 => {
-                // LINUX_REBOOT_CMD_RESTART
+            0x01234567 | 0xa1b2c3d4 => {
+                // LINUX_REBOOT_CMD_RESTART / RESTART2
                 warn!("reboot: restarting...");
                 kernel_hal::cpu::reset();
             }

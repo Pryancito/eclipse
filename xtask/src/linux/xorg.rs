@@ -1002,15 +1002,15 @@ pub(super) fn install(rootfs: &Path, apk_bin: &Path, arch: &str) {
 // files — so without help X would be present on disk but absent in QEMU.
 //
 // `copy_into_live` copies the X-owned trees into the live root UNCAPPED so
-// `startx` works in QEMU too. The installed ESP's bootstrap initramfs is
-// snapshotted *before* this copy (see image.rs), so Mesa/LLVM never land
-// on the EFI partition. It now INCLUDES `usr/lib/dri` (see the note at
-// `copy_into_live` itself): the Mesa 26.x DRI entries are just symlinks into
-// the megadriver libraries already copied uncapped under `usr/lib`, so
-// excluding them saved no space and only broke GL (labwc "virtio_gpu: driver
-// missing", no desktop on the GL path). With them, Mesa loads virtio_gpu_dri.so
-// (QEMU) and nouveau_dri.so (real hardware). Turn the whole thing off with
-// `ECLIPSE_XORG_LIVE=0` to keep the QEMU/ISO live initramfs lean too.
+// `startx` works in QEMU. The installed ESP's bootstrap initramfs and the
+// ISO installer SFS are snapshotted *before* this copy (see image.rs), so
+// Mesa/LLVM never land on the EFI partition or the ISO El Torito ESP. It
+// now INCLUDES `usr/lib/dri` (see the note at `copy_into_live` itself): the
+// Mesa 26.x DRI entries are just symlinks into the megadriver libraries
+// already copied uncapped under `usr/lib`, so excluding them saved no space
+// and only broke GL (labwc "virtio_gpu: driver missing", no desktop on the
+// GL path). With them, Mesa loads virtio_gpu_dri.so (QEMU) and nouveau_dri.so
+// (real hardware). Turn the QEMU copy off with `ECLIPSE_XORG_LIVE=0`.
 
 /// X-owned trees copied verbatim (uncapped) from the full rootfs into the live
 /// root. Missing entries are silently skipped, so this is safe whether or not
@@ -1030,8 +1030,8 @@ const LIVE_TREES: &[&str] = &[
     "usr/lib", // libX11/xcb/pixman/drm/input/xkbcommon + usr/lib/xorg modules (minus dri) + libvulkan*/NVK
     // Vulkan ICD manifests (usr/share/vulkan/icd.d/nouveau_icd.*.json for NVK,
     // lvp_icd.*.json for lavapipe). The loader (`libvulkan.so.1`, from usr/lib
-    // above) finds each driver ONLY through its JSON; without it in the live
-    // root the driver is invisible on the ISO even though its .so is present --
+    // above) finds each driver ONLY through its JSON; without it in the QEMU
+    // live root the driver is invisible even though its .so is present --
     // and Zink (GL-on-Vulkan) then has no Vulkan to run on. lavapipe's manifest
     // is what gives Zink/glamor a software Vulkan floor when NVK is unusable.
     "usr/share/vulkan",
@@ -1140,9 +1140,10 @@ fn tree_size(p: &Path) -> u64 {
     }
 }
 
-/// Copy the X.Org stack from the `full` rootfs into the `live` (QEMU/initramfs)
-/// root so `startx` works in QEMU too. Best-effort; no-op when disabled, when
-/// Xorg was not installed, or per-tree when a source path is absent.
+/// Copy the X.Org stack from the `full` rootfs into the `live` (QEMU) root so
+/// `startx` works in QEMU. Best-effort; no-op when disabled, when Xorg was not
+/// installed, or per-tree when a source path is absent. The ISO installer SFS
+/// is fused before this runs.
 pub(super) fn copy_into_live(full: &Path, live: &Path) {
     // `live_enabled()` (ECLIPSE_XORG_LIVE) is the master switch for staging the
     // desktop into the RAM live root; the Xorg-specific `enabled()` only gates
@@ -1186,15 +1187,15 @@ pub(super) fn copy_into_live(full: &Path, live: &Path) {
     let skip: PathBuf = full.join("usr/lib/__eclipse_include_all__");
 
     println!(
-        "Desktop stack: copying into live/QEMU initramfs (xorg={have_xorg} labwc={have_labwc}, including DRI drivers for GL) ..."
+        "Desktop stack: copying into QEMU live initramfs (xorg={have_xorg} labwc={have_labwc}, including DRI drivers for GL) ..."
     );
     for rel in LIVE_TREES {
         copy_uncapped(&full.join(rel), &live.join(rel), &skip);
     }
     // Carry the apk `world` additions into the live root too. LIVE_TREES omits
     // etc/apk (base config is already present in the live rootfs), so without
-    // this the desktop binaries reach the ISO but `apk world` on the live boot
-    // would not list them. Union full's world into live's, additive.
+    // this the desktop binaries reach the QEMU image but `apk world` on that
+    // live boot would not list them. Union full's world into live's, additive.
     union_apk_world(&full.join("etc/apk/world"), &live.join("etc/apk/world"));
     let mib = tree_size(&live.join("usr")) / (1024 * 1024);
     println!("Xorg stack: live root usr/ is now ~{mib} MiB");

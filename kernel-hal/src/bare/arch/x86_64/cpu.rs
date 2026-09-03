@@ -106,6 +106,19 @@ fn tsc_hz_from_cpuid() -> Option<u64> {
         .map(|mhz| mhz as u64 * 1_000_000)
 }
 
+/// Flush GPUs and block devices before a reboot or power-off. A warm reset
+/// does not power-cycle PCIe, so a GPU with a live GSP-RM / locked WPR2 would
+/// otherwise stall firmware POST; NVMe wants CC.SHN so DRAM-less SSDs persist
+/// their FTL maps.
+fn quiesce_devices() {
+    for d in crate::drivers::all_drm().as_vec().iter() {
+        let _ = d.quiesce_for_reboot();
+    }
+    for d in crate::drivers::all_block().as_vec().iter() {
+        d.quiesce_for_reboot();
+    }
+}
+
 hal_fn_impl! {
     impl mod crate::hal_fn::cpu {
         fn cpu_id() -> u8 {
@@ -160,47 +173,33 @@ hal_fn_impl! {
         }
 
         fn reset() -> ! {
-            info!("resetting/shutting down...");
+            info!("resetting...");
+            quiesce_devices();
             use zcore_drivers::io::{Io, Pmio};
 
-            // Leave any GPU we brought up in a clean (cold) state first. This is
-            // a WARM reset (it does not power-cycle PCIe devices), so a GPU with
-            // a live GSP-RM / locked WPR2 would otherwise cross the reboot dirty
-            // and stall the firmware POST that runs before the OS next boot.
-            // Best-effort and bounded (FLR + 100 ms per brought-up GPU); the
-            // console GPU and non-NVIDIA drivers are no-ops.
-            for d in crate::drivers::all_drm().as_vec().iter() {
-                let _ = d.quiesce_for_reboot();
-            }
-
-            // Flush every block device's volatile write cache and give NVMe
-            // controllers their orderly shutdown (CC.SHN) before the warm
-            // reset: DRAM-less SSDs persist their FTL mapping tables on that
-            // signal. Best-effort and time-bounded per device.
-            for d in crate::drivers::all_block().as_vec().iter() {
-                d.quiesce_for_reboot();
-            }
-
-            // Method 1: PS/2 Controller (Keyboard Controller)
-            // Writing 0xFE to port 0x64 triggers a pulse on the reset line.
+            // Keyboard controller pulse on the reset line.
             Pmio::<u8>::new(0x64).write(0xFE);
-
-            // Method 2: PCI Reset Control Register (standard on many chipsets)
-            // Port 0xCF9. 0x06 = system reset, 0x0E = hard reset.
+            // PCI reset: 0x06 = system reset, 0x0E = hard reset.
             Pmio::<u8>::new(0xCF9).write(0x06);
             Pmio::<u8>::new(0xCF9).write(0x0E);
-
-            // Method 3: QEMU/ACPI Poweroff (fallback for halt/poweroff)
-            Pmio::<u16>::new(0x604).write(0x2000);
-
-            // Method 4: Triple Fault (the "nuclear" option)
-            // Load a zero-length IDT and trigger an interrupt.
+            // Triple fault if the chipset ignored the above.
             unsafe {
                 let idtr: [u16; 5] = [0, 0, 0, 0, 0];
                 core::arch::asm!("lidt [{}]", in(reg) &idtr);
                 core::arch::asm!("int3");
             }
+            loop {
+                super::interrupt::wait_for_interrupt();
+            }
+        }
 
+        fn power_off() -> ! {
+            info!("powering off...");
+            quiesce_devices();
+            super::drivers::enter_s5();
+            // Still alive: park. Do not fall through to a warm reset — the
+            // caller asked to power off, and a reboot here made "Apagar" in
+            // lunarbar look like a restart.
             loop {
                 super::interrupt::wait_for_interrupt();
             }

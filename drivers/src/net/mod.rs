@@ -14,7 +14,19 @@ pub use loopback::{LoopbackDevice, LoopbackInterface};
 
 use crate::scheme::{IrqScheme, Scheme};
 use crate::DeviceResult;
+use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+/// Sequential `ethN` names (Linux-style). PCI slot numbering (`eth{bus}d{dev}f{fn}`)
+/// made the first NIC `eth0d3f0` on QEMU/VirtualBox, so udhcpc/scripts looking
+/// for `eth0` never bound to the real interface.
+static ETH_IFACE_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+pub fn next_eth_ifname() -> String {
+    let n = ETH_IFACE_SEQ.fetch_add(1, Ordering::Relaxed);
+    alloc::format!("eth{}", n)
+}
 
 static MSI_IRQ_HOST: Mutex<Option<Arc<dyn IrqScheme>>> = Mutex::new(None);
 static MSI_PENDING: Mutex<Vec<(usize, Arc<dyn Scheme>)>> = Mutex::new(Vec::new());
@@ -196,7 +208,7 @@ lazy_static::lazy_static! {
     pub static ref DEFERRED_PACKETS: Mutex<alloc::collections::VecDeque<Vec<u8>>> = Mutex::new(alloc::collections::VecDeque::new());
 }
 
-const DEFERRED_PACKET_MAX: usize = 32;
+const DEFERRED_PACKET_MAX: usize = 64;
 
 /// Sets a callback for every received packet (raw).
 pub fn set_packet_callback(callback: fn(&[u8])) {

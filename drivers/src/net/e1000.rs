@@ -224,8 +224,15 @@ impl E1000 {
             mmio_write(base, E1000_RDH, 0);
             mmio_write(base, E1000_RDT, (NUM_DESC - 1) as u32);
 
-            // RCTL: EN | BAM | SECRC | BSIZE=0 (2048 bytes buffer size), BSEX=0
-            mmio_write(base, E1000_RCTL, (1 << 1) | (1 << 15) | (1 << 26));
+            // RCTL: EN | UPE | MPE | BAM | SECRC | BSIZE=0 (2048)
+            // UPE/MPE: DHCP OFFER is often unicast to our MAC, but QEMU/VBox and
+            // some bridges rewrite the dest; without promiscuous the frame never
+            // leaves the NIC. BAM already accepts broadcast DISCOVER replies.
+            mmio_write(
+                base,
+                E1000_RCTL,
+                (1 << 1) | (1 << 3) | (1 << 4) | (1 << 15) | (1 << 26),
+            );
 
             // Clear pending interrupts
             let _icr = mmio_read(base, E1000_ICR);
@@ -719,7 +726,10 @@ impl phy::Device<'_> for E1000Driver {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.max_transmission_unit = 1514;
-        caps.max_burst_size = Some(64);
+        // Do NOT set max_burst_size. smoltcp clamps the TCP window to
+        // `burst * MSS` and stores it in a u16: burst=64 → 64*1474=94336,
+        // which wraps to 28800 and caps throughput at a few Mbps.
+        caps.max_burst_size = None;
         caps
     }
 }
@@ -859,7 +869,7 @@ impl PciDriver for E1000DriverPci {
                 m.query_or_map(addr as usize, 4096 * 8);
             }
             let vaddr = crate::bus::phys_to_virt(addr as usize);
-            let name = alloc::format!("eth{}", dev.loc.bus);
+            let name = crate::net::next_eth_ifname();
             let vector = irq.map(|idx| idx + 32).unwrap_or(0);
             let iface = init(name, vector, vaddr, len as usize, 0)?;
             Ok(Device::Net(Arc::new(iface)))

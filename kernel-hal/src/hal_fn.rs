@@ -50,8 +50,14 @@ hal_fn_def! {
         /// P-state control is active (non-HWP/CPPC parts, or under a hypervisor).
         pub fn pstate_governor_summary() -> Option<(u32, u8, u8)> { None }
 
-        /// Shutdown/reboot the machine.
+        /// Warm-reset the machine (reboot).
         pub fn reset() -> !;
+
+        /// Power the machine off (ACPI S5 / equivalent). Platforms that cannot
+        /// distinguish power-off from reset fall back to [`reset`].
+        pub fn power_off() -> ! {
+            Self::reset()
+        }
     }
 
     /// Physical memory operations.

@@ -119,6 +119,61 @@ impl AcpiPowerButton {
 
 static ACPI_POWER_BUTTON: Mutex<Option<AcpiPowerButton>> = Mutex::new(None);
 
+/// Ask the chipset to enter ACPI S5 (soft power-off). Writes SLP_EN|SLP_TYP
+/// to the FADT PM1 control block, then to well-known hypervisor ports so
+/// QEMU (0x604 / 0xB004) and VirtualBox ICH9 (0x4004) still power off when
+/// the FADT is missing or the AML `_S5` package was never interpreted.
+pub(super) fn enter_s5() {
+    const SLP_EN: u16 = 1 << 13;
+    let mut ports: alloc::vec::Vec<u16> = alloc::vec::Vec::new();
+    if let Some((a, b)) = pm1_control_ports_from_fadt() {
+        ports.push(a);
+        if let Some(b) = b {
+            ports.push(b);
+        }
+    }
+    for p in [0x604u16, 0xB004, 0x4004] {
+        if !ports.contains(&p) {
+            ports.push(p);
+        }
+    }
+    // typ 5 is the common S5 encoding; 0 is what QEMU's DSDT uses.
+    for typ in [5u16, 0, 7, 1] {
+        let val = SLP_EN | (typ << 10);
+        for &port in &ports {
+            unsafe { Port::<u16>::new(port).write(val) };
+        }
+    }
+}
+
+fn pm1_control_ports_from_fadt() -> Option<(u16, Option<u16>)> {
+    let rsdp = super::special::pc_firmware_tables().0 as usize;
+    if rsdp == 0 {
+        return None;
+    }
+    let tables = unsafe {
+        AcpiTables::from_rsdp(
+            AcpiMapHandler {
+                phys_to_virt: crate::mem::phys_to_virt,
+            },
+            rsdp,
+        )
+        .ok()?
+    };
+    let fadt = unsafe { tables.get_sdt::<acpi::fadt::Fadt>(Signature::FADT).ok()?? };
+    let pm1a = fadt.pm1a_control_block().ok()?;
+    if pm1a.address_space != AddressSpace::SystemIo || pm1a.address == 0 {
+        return None;
+    }
+    let pm1b = fadt
+        .pm1b_control_block()
+        .ok()
+        .flatten()
+        .filter(|gas| gas.address_space == AddressSpace::SystemIo && gas.address != 0)
+        .map(|gas| gas.address as u16);
+    Some((pm1a.address as u16, pm1b))
+}
+
 fn acpi_power_button_irq() {
     if ACPI_POWER_BUTTON
         .lock()
@@ -126,7 +181,7 @@ fn acpi_power_button_irq() {
         .is_some_and(|power| power.handle_irq())
     {
         crate::klog_warn!("[acpi] power button pressed; powering off");
-        crate::cpu::reset();
+        crate::cpu::power_off();
     }
 }
 

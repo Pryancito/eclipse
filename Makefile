@@ -110,6 +110,10 @@ qemu-real: image
 ################ Distribution images ################
 #
 # - `make iso`   builds a UEFI-bootable ISO image.
+#   The El Torito ESP carries the *installer* initramfs (busybox +
+#   install-eclipse + gzipped payloads, no desktop). The desktop apk
+#   stack lives only in `/boot/rootfs.btrfs.gz`, which the installer
+#   writes to disk. Live ISO session: console + `install-eclipse`.
 # - `make qcow2` builds a qcow2 disk image that contains the ESP filesystem.
 #
 # Both targets rely on the existing ESP directory produced by `zCore/Makefile`
@@ -128,10 +132,12 @@ DISK_IMG_SIZE_MB ?= 1024
 ISO_OUT := $(DIST_DIR)/eclipse-$(ARCH).iso
 QCOW2_OUT := $(DIST_DIR)/eclipse-$(ARCH).qcow2
 IMG_OUT := $(DIST_DIR)/eclipse-$(ARCH).img
+ISO_INITRAMFS := $(CURDIR)/ignored/target/iso-initramfs.img
 
 iso: image
 ifeq ($(ARCH), x86_64)
-	@$(MAKE) -C zCore build MODE=release LINUX=1 LOG=$(LOG) GRAPHIC=on GL=$(GL) DESKTOP=$(DESKTOP)
+	@test -f "$(ISO_INITRAMFS)" || (echo "falta $(ISO_INITRAMFS). ¿Ha fallado cargo image?"; exit 1)
+	@$(MAKE) -C zCore build MODE=release LINUX=1 LOG=$(LOG) GRAPHIC=on GL=$(GL) DESKTOP=none INITRAMFS_IMG="$(ISO_INITRAMFS)"
 	@mkdir -p "$(DIST_DIR)" "$(BUILD_DIR)" "$(ISO_STAGING)"
 	@test -d "$(ESP_DIR)/EFI" || (echo "ESP no encontrado en $(ESP_DIR). ¿Has compilado zCore para x86_64?"; exit 1)
 	@rm -rf "$(ISO_STAGING)/EFI" && cp -a "$(ESP_DIR)/EFI" "$(ISO_STAGING)/"
@@ -143,8 +149,7 @@ ifeq ($(ARCH), x86_64)
 		"$(ESP_DIR)/EFI/zCore/riscv64.img"
 	@rm -f "$(ESP_IMG)"
 	@esp_mb=$$(du -sm "$(ESP_DIR)/EFI" | cut -f1); esp_mb=$$((esp_mb + 96)); \
-		[ "$$esp_mb" -ge "$(ESP_IMG_SIZE_MB)" ] || esp_mb=$(ESP_IMG_SIZE_MB); \
-		echo "ESP: $$esp_mb MiB"; \
+		echo "ISO ESP: $$esp_mb MiB (sized to installer initramfs; installed efi.img.gz stays $(ESP_IMG_SIZE_MB) MiB)"; \
 		dd if=/dev/zero of="$(ESP_IMG)" bs=1M count=$$esp_mb status=none
 	@mkfs.vfat -F 32 "$(ESP_IMG)" >/dev/null
 	@mmd -i "$(ESP_IMG)" ::/EFI ::/EFI/Boot ::/EFI/zCore >/dev/null
