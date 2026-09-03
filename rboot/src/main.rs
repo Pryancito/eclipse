@@ -8,40 +8,41 @@
 
 #![no_std]
 #![no_main]
-#![feature(abi_x86_interrupt)]
+#![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 
-#[macro_use]
 extern crate alloc;
 
 #[macro_use]
 extern crate log;
 
-use alloc::boxed::Box;
-use alloc::vec::Vec;
 use config::Resolution;
-use core::arch::asm;
-use log::{warn, LevelFilter};
-use rboot::{BootInfo, GraphicInfo};
+use log::LevelFilter;
+use rboot::GraphicInfo;
+use uefi::boot::{self, AllocateType, MemoryType, SearchType};
+use uefi::prelude::*;
 use uefi::proto::console::gop::{GraphicsOutput, ModeInfo, PixelFormat};
 use uefi::proto::media::file::*;
 use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::proto::unsafe_protocol;
-use uefi::table::boot::*;
-use uefi::table::cfg::{ACPI2_GUID, SMBIOS_GUID};
-use uefi::{prelude::*, CStr16};
-use x86_64::registers::control::*;
-use x86_64::structures::paging::*;
-use x86_64::{PhysAddr, VirtAddr};
+use uefi::table::cfg::ConfigTableEntry;
+use uefi::{CStr16, Handle};
 use xmas_elf::ElfFile;
 
+mod arch;
 mod config;
 mod fb;
+#[cfg(target_arch = "x86_64")]
 mod idt;
+mod libc_shim;
 mod logo;
-mod page_table;
 mod progress;
 
 const CONFIG_PATH: &str = "\\EFI\\Boot\\rboot.conf";
+
+/// Kernel locations tried after `kernel_path` (in this order) when the
+/// configured one is missing, so a bare ESP with the image at a conventional
+/// path still boots.
+const KERNEL_FALLBACK_PATHS: &[&str] = &["\\os", "\\EFI\\Boot\\os", "\\EFI\\zCore\\zcore.elf"];
 
 fn parse_log_level_from_cmdline(cmdline: &str) -> Option<LevelFilter> {
     // cmdline format example:
@@ -73,18 +74,25 @@ fn has_cmdline_flag(cmdline: &str, key: &str) -> bool {
     false
 }
 
-#[entry]
-fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
-    // Asegura que `BootServices::image_handle()` sea correcto (lo usa ExitBootServices internamente).
-    unsafe { st.boot_services().set_image_handle(image) };
-    uefi_services::init(&mut st).expect("failed to initialize utilities");
+/// Paint the boot progress bar if a framebuffer is available.
+fn bar(graphic: Option<&GraphicInfo>, progress: u32) {
+    if let Some(g) = graphic {
+        progress::bar(g.mode, g.fb_addr, progress);
+    }
+}
 
-    //info!("bootloader is running");
-    let bs = st.boot_services();
+#[entry]
+fn efi_main() -> Status {
+    uefi::helpers::init().expect("failed to initialize uefi helpers");
+
     let config = {
-        let mut file = open_file(bs, CONFIG_PATH);
-        let buf = load_file(bs, &mut file);
-        config::Config::parse(buf)
+        if let Some(mut file) = try_open_file(CONFIG_PATH) {
+            let buf = load_file(&mut file);
+            config::Config::parse(buf)
+        } else {
+            warn!("{} not found, using default config", CONFIG_PATH);
+            config::Config::parse(b"")
+        }
     };
 
     if let Some(level) = parse_log_level_from_cmdline(config.cmdline) {
@@ -95,15 +103,11 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     // Snapshot cmdline flags before ExitBootServices: `config` lives on the stack
     // and must not be read after firmware reclaims that memory.
 
-    let acpi2_addr = st
-        .config_table()
-        .iter()
-        .find(|entry| entry.guid == ACPI2_GUID)
-        .expect("failed to find ACPI 2 RSDP")
-        .address;
+    let acpi2_addr = find_config_table(ConfigTableEntry::ACPI2_GUID);
     debug!("acpi2 rsdp: {:?}", acpi2_addr);
 
-    let (graphic_info, edid, edid_size) = init_graphic(bs, config.resolution);
+    let (graphic_info, edid, edid_size) = init_graphic(config.resolution);
+    let graphic = graphic_info.as_ref();
     // Boot progress is continuous across rboot (0..50) and kernel (50..100).
     if has_cmdline_flag(config.cmdline, "FB_ROT180") {
         fb::set_rot180(true);
@@ -112,202 +116,262 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         fb::set_mirror_x(true);
     }
     // Draw splash logo immediately after GOP init (this also clears screen to white).
-    logo::draw_centered(graphic_info.mode, graphic_info.fb_addr);
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 0);
+    if let Some(g) = graphic {
+        logo::draw_centered(g.mode, g.fb_addr);
+    }
+    bar(graphic, 0);
     debug!("rboot config: {:#x?}", config);
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 5);
+    bar(graphic, 5);
 
-    let smbios_addr = st
-        .config_table()
-        .iter()
-        .find(|entry| entry.guid == SMBIOS_GUID)
-        .expect("failed to find SMBIOS")
-        .address;
+    let smbios_addr = find_config_table(ConfigTableEntry::SMBIOS_GUID);
     debug!("smbios: {:?}", smbios_addr);
 
     let elf = {
-        let mut file = open_file(bs, config.kernel_path);
-        let buf = load_file_progress(
-            bs,
-            &mut file,
-            Some((graphic_info.mode, graphic_info.fb_addr, 5, 15)),
-        );
+        let mut file = open_kernel_file(config.kernel_path);
+        let buf = load_file_progress(&mut file, graphic.map(|g| (g.mode, g.fb_addr, 5, 15)));
         ElfFile::new(buf).expect("failed to parse ELF")
     };
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 15);
+    bar(graphic, 15);
     debug!(
         "kernel elf loaded: entry={:#x}",
         elf.header.pt2.entry_point()
     );
-    unsafe {
-        ENTRY = elf.header.pt2.entry_point() as usize;
-    }
 
     // The initramfs is by far the largest file rboot touches (the whole
     // Eclipse rootfs, hundreds of MB): give it the 15..44 stretch of the bar
     // so a slow medium (VirtualBox's EFI FAT driver reads at ~1-2 MB/s) shows
     // steady movement instead of sitting "frozen at 15%" for minutes.
-    let (initramfs_addr, initramfs_size) = if let Some(path) = config.initramfs {
-        let mut file = open_file(bs, path);
-        let buf = load_file_progress(
-            bs,
-            &mut file,
-            Some((graphic_info.mode, graphic_info.fb_addr, 15, 44)),
-        );
-        debug!(
-            "initramfs loaded: addr={:#x} size={:#x}",
-            buf.as_ptr() as u64,
-            buf.len()
-        );
-        (buf.as_ptr() as u64, buf.len() as u64)
-    } else {
-        (0, 0)
+    let (initramfs_addr, initramfs_size) = match config.initramfs {
+        Some(path) => match try_open_file(path) {
+            Some(mut file) => {
+                let buf =
+                    load_file_progress(&mut file, graphic.map(|g| (g.mode, g.fb_addr, 15, 44)));
+                debug!(
+                    "initramfs loaded: addr={:#x} size={:#x}",
+                    buf.as_ptr() as u64,
+                    buf.len()
+                );
+                (buf.as_ptr() as u64, buf.len() as u64)
+            }
+            None => {
+                warn!("initramfs {} not found; booting without it", path);
+                (0, 0)
+            }
+        },
+        None => (0, 0),
     };
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 45);
+    bar(graphic, 45);
 
-    let max_mmap_size = st.boot_services().memory_map_size().map_size;
-    let mmap_storage = Box::leak(vec![0u8; max_mmap_size * 2].into_boxed_slice());
-    let max_phys_addr = {
-        let mmap = st
-            .boot_services()
-            .memory_map(mmap_storage)
-            .expect("failed to get memory map");
-        mmap.entries()
-            .map(|m| m.phys_start + m.page_count * 0x1000)
-            .max()
-            .unwrap()
-            .max(0x1_0000_0000) // include IOAPIC MMIO area
-            // Ensure the GOP framebuffer is always within the mapped range.
-            // On most systems the framebuffer is listed in the UEFI memory map,
-            // but on some firmware/GPU combinations the framebuffer BAR can sit
-            // above the highest RAM entry.  Without this the kernel's
-            // phys_to_virt(fb_addr) would translate to an unmapped virtual
-            // address and triple-fault in early_fb_console::try_init().
-            .max(graphic_info.fb_addr + graphic_info.fb_size)
-            // Ensure initramfs is always within the mapped range too. Some firmware
-            // allocates LOADER_DATA at high physical addresses that are above the
-            // highest conventional RAM entry in the memory map we iterated.
-            .max(initramfs_addr + initramfs_size)
-    };
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 46);
+    #[cfg(target_arch = "x86_64")]
+    {
+        use alloc::boxed::Box;
+        use alloc::vec;
+        use alloc::vec::Vec;
+        use rboot::{BootInfo, MemoryDescriptor};
+        use uefi::mem::memory_map::MemoryMap;
+        use x86_64::registers::control::*;
 
-    let mut page_table = current_page_table();
-    unsafe {
-        Cr0::update(|f| f.remove(Cr0Flags::WRITE_PROTECT));
-        // On real hardware UEFI has already set EFER.NXE before we run, so
-        // NO_EXECUTE bits we write into page-table entries are enforced.
-        // Keep NXE enabled while running under firmware page tables. Some
-        // UEFI mappings may already use NX bits and clearing NXE can fault
-        // immediately on real hardware.
-        Efer::update(|f| f.insert(EferFlags::NO_EXECUTE_ENABLE));
-    }
-    debug!("mapping elf segments...");
-    page_table::map_elf(&elf, &mut page_table, &mut UEFIFrameAllocator(bs))
-        .expect("failed to map ELF");
-    debug!("mapping kernel stack...");
-    page_table::map_stack(
-        config.kernel_stack_address,
-        config.kernel_stack_size,
-        &mut page_table,
-        &mut UEFIFrameAllocator(bs),
-    )
-    .expect("failed to map stack");
-    debug!("mapping physical memory...");
-    page_table::map_physical_memory(
-        config.physical_memory_offset,
-        max_phys_addr,
-        &mut page_table,
-        &mut UEFIFrameAllocator(bs),
-    );
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 47);
-    debug!("sanity checks before ExitBootServices...");
+        let entry = elf.header.pt2.entry_point() as usize;
+        let graphic_info = graphic_info.expect("failed to find GraphicsOutput");
+        let graphic = Some(&graphic_info);
 
-    // Sanity checks while Boot Services are still alive.
-    // If these fault on real hardware, the firmware is much more likely to show a dump.
-    let stacktop = config.kernel_stack_address + config.kernel_stack_size * 0x1000;
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 47);
-    unsafe {
-        // 1) Confirm the entry virtual address is mapped & readable.
-        let entry_va = ENTRY as *const u8;
-        let _first_byte = core::ptr::read_volatile(entry_va);
-        // 2) Confirm the stack top page is mapped & writable.
-        let sp_probe = (stacktop - 8) as *mut u64;
-        core::ptr::write_volatile(sp_probe, 0);
-    }
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 48);
-    unsafe {
-        Cr0::update(|f| f.insert(Cr0Flags::WRITE_PROTECT));
-    }
+        let max_phys_addr = {
+            let mmap = boot::memory_map(MemoryType::LOADER_DATA).expect("failed to get memory map");
+            mmap.entries()
+                .map(|m| m.phys_start + m.page_count * 0x1000)
+                .max()
+                .unwrap()
+                .max(0x1_0000_0000) // include IOAPIC MMIO area
+                // Ensure the GOP framebuffer is always within the mapped range.
+                // On most systems the framebuffer is listed in the UEFI memory map,
+                // but on some firmware/GPU combinations the framebuffer BAR can sit
+                // above the highest RAM entry.  Without this the kernel's
+                // phys_to_virt(fb_addr) would translate to an unmapped virtual
+                // address and triple-fault in early_fb_console::try_init().
+                .max(graphic_info.fb_addr + graphic_info.fb_size)
+                // Ensure initramfs is always within the mapped range too. Some firmware
+                // allocates LOADER_DATA at high physical addresses that are above the
+                // highest conventional RAM entry in the memory map we iterated.
+                .max(initramfs_addr + initramfs_size)
+        };
+        bar(graphic, 46);
 
-    //info!("exit boot services");
-
-    let mut memory_map = Vec::with_capacity(256);
-    // Pre-allocate BootInfo on the heap while boot services are still available.
-    // We'll fill it with the real memory map after ExitBootServices.
-    let mut bootinfo_box = Box::new(BootInfo {
-        memory_map: Vec::new(),
-        physical_memory_offset: config.physical_memory_offset,
-        graphic_info,
-        acpi2_rsdp_addr: acpi2_addr as u64,
-        smbios_addr: smbios_addr as u64,
-        initramfs_addr,
-        initramfs_size,
-        cmdline: config.cmdline,
-        edid,
-        edid_size,
-    });
-
-    // On some real machines, ExitBootServices can be the point where things go wrong.
-    // Update the bar just before attempting it so we can pinpoint the hang visually.
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 48);
-    debug!("calling ExitBootServices (raw)...");
-    let (map_size, desc_size) = exit_boot_services_raw(&mut st, image, mmap_storage);
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 49);
-    debug!("ExitBootServices ok, collecting memory map...");
-
-    // Reinterpret the raw memory map buffer as `MemoryDescriptor` entries.
-    // SAFETY: `mmap_storage` is leaked, and UEFI guarantees the memory map layout.
-    let entry_size = desc_size;
-    let len = map_size / entry_size;
-    for i in 0..len {
-        let p = unsafe { mmap_storage.as_ptr().add(i * entry_size) } as *const MemoryDescriptor;
-        // Some firmware leaves unused tail bytes; stop on obviously empty descriptors.
-        let d = unsafe { &*p };
-        if d.page_count == 0 {
-            break;
+        let mut page_table = arch::current_page_table();
+        unsafe {
+            Cr0::update(|f| f.remove(Cr0Flags::WRITE_PROTECT));
+            // On real hardware UEFI has already set EFER.NXE before we run, so
+            // NO_EXECUTE bits we write into page-table entries are enforced.
+            // Keep NXE enabled while running under firmware page tables. Some
+            // UEFI mappings may already use NX bits and clearing NXE can fault
+            // immediately on real hardware.
+            Efer::update(|f| f.insert(EferFlags::NO_EXECUTE_ENABLE));
         }
-        memory_map.push(d);
+        debug!("mapping elf segments...");
+        arch::map_elf(&elf, &mut page_table, &mut arch::UEFIFrameAllocator)
+            .expect("failed to map ELF");
+        debug!("mapping kernel stack...");
+        arch::map_stack(
+            config.kernel_stack_address,
+            config.kernel_stack_size,
+            &mut page_table,
+            &mut arch::UEFIFrameAllocator,
+        )
+        .expect("failed to map stack");
+        debug!("mapping physical memory...");
+        arch::map_physical_memory(
+            config.physical_memory_offset,
+            max_phys_addr,
+            &mut page_table,
+            &mut arch::UEFIFrameAllocator,
+        );
+        bar(graphic, 47);
+        debug!("sanity checks before ExitBootServices...");
+
+        // Sanity checks while Boot Services are still alive.
+        // If these fault on real hardware, the firmware is much more likely to show a dump.
+        let stacktop = config.kernel_stack_address + config.kernel_stack_size * 0x1000;
+        unsafe {
+            // 1) Confirm the entry virtual address is mapped & readable.
+            let entry_va = entry as *const u8;
+            let _first_byte = core::ptr::read_volatile(entry_va);
+            // 2) Confirm the stack top page is mapped & writable.
+            let sp_probe = (stacktop - 8) as *mut u64;
+            core::ptr::write_volatile(sp_probe, 0);
+        }
+        bar(graphic, 48);
+        unsafe {
+            Cr0::update(|f| f.insert(Cr0Flags::WRITE_PROTECT));
+        }
+
+        // Pre-allocate BootInfo (and the memory-map vector's storage) on the
+        // heap while boot services are still available: nothing may allocate
+        // after ExitBootServices, so the map is copied into this fixed
+        // capacity and never grown.
+        const MEMORY_MAP_CAPACITY: usize = 512;
+        let mut bootinfo_box = Box::new(BootInfo {
+            memory_map: Vec::with_capacity(MEMORY_MAP_CAPACITY),
+            physical_memory_offset: config.physical_memory_offset,
+            graphic_info,
+            acpi2_rsdp_addr: acpi2_addr as u64,
+            smbios_addr: smbios_addr as u64,
+            initramfs_addr,
+            initramfs_size,
+            cmdline: config.cmdline,
+            edid,
+            edid_size,
+        });
+        // Firmware buffer for the final memory map: twice the current size,
+        // the map grows with the allocations ExitBootServices itself makes.
+        let mmap_meta = boot::memory_map(MemoryType::LOADER_DATA)
+            .expect("failed to get memory map size")
+            .meta();
+        let mmap_storage = Box::leak(vec![0u8; mmap_meta.map_size * 2].into_boxed_slice());
+
+        // On some real machines, ExitBootServices can be the point where things go wrong.
+        // Update the bar just before attempting it so we can pinpoint the hang visually.
+        bar(graphic, 48);
+        debug!("calling ExitBootServices (raw)...");
+        // The console logger talks to firmware text output: silence it for
+        // good before boot services go away (the progress bar is direct
+        // framebuffer writes and keeps working).
+        log::set_max_level(LevelFilter::Off);
+        let (map_size, desc_size) = exit_boot_services_raw(mmap_storage);
+        bar(graphic, 49);
+
+        // Reinterpret the raw memory map buffer as `MemoryDescriptor` entries.
+        // SAFETY: `mmap_storage` is leaked, and UEFI guarantees the memory map layout.
+        let entry_size = desc_size;
+        let len = map_size / entry_size;
+        for i in 0..len {
+            if bootinfo_box.memory_map.len() == bootinfo_box.memory_map.capacity() {
+                break; // never reallocate after ExitBootServices
+            }
+            let p = unsafe { mmap_storage.as_ptr().add(i * entry_size) } as *const MemoryDescriptor;
+            // Some firmware leaves unused tail bytes; stop on obviously empty descriptors.
+            let d = unsafe { p.read_unaligned() };
+            if d.page_count == 0 {
+                break;
+            }
+            bootinfo_box.memory_map.push(d);
+        }
+        bar(graphic, 49);
+
+        let bootinfo: &'static BootInfo = Box::leak(bootinfo_box);
+        // Hand-off point to the kernel.
+        bar(graphic, 50);
+
+        unsafe {
+            // If we see 51% but not the kernel marker (52%), the hang is inside the
+            // handoff asm / very first instruction fetch. Always install a tiny IDT
+            // so a #PF/#GP paints 99% instead of freezing the last rboot frame.
+            bar(graphic, 51);
+            idt::init(graphic_info.mode, graphic_info.fb_addr);
+            arch::jump_to_entry(entry, bootinfo, stacktop);
+        }
     }
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 49);
 
-    bootinfo_box.memory_map = memory_map;
-    let bootinfo: &'static BootInfo = Box::leak(bootinfo_box);
-    // Hand-off point to the kernel.
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 50);
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = (
+            initramfs_addr,
+            initramfs_size,
+            edid,
+            edid_size,
+            acpi2_addr,
+            smbios_addr,
+        );
+        let entry = arch::load_elf(&elf, config.physical_memory_offset);
+        let memory_map = boot::memory_map(MemoryType::LOADER_DATA)
+            .expect("failed to get memory map for page-table setup");
+        let pt0_paddr = arch::setup_page_tables(&memory_map);
 
-    unsafe {
-        debug!("jumping to kernel entry...");
-        // If we see 51% but not the kernel marker (52%), the hang is inside the
-        // handoff asm / very first instruction fetch. Always install a tiny IDT
-        // so a #PF/#GP paints 99% instead of freezing the last rboot frame.
-        progress::bar(graphic_info.mode, graphic_info.fb_addr, 51);
-        idt::init(graphic_info.mode, graphic_info.fb_addr);
-        jump_to_entry(bootinfo, stacktop);
+        let bootinfo = rboot::Aarch64BootInfo {
+            cmdline: config.cmdline,
+            firmware_type: config.firmware_type,
+            uart_base: config.uart_base,
+            gic_base: config.gic_base,
+            offset: config.physical_memory_offset as usize,
+        };
+
+        let bootinfo_box = alloc::boxed::Box::new(bootinfo);
+        let bootinfo_ptr = alloc::boxed::Box::into_raw(bootinfo_box) as usize;
+
+        info!("kernel entry point: 0x{:x}", entry);
+        info!("exit boot services");
+        bar(graphic, 50);
+        let _ = unsafe { boot::exit_boot_services(None) };
+
+        unsafe {
+            arch::jump_to_kernel(entry, bootinfo_ptr, pt0_paddr);
+        }
     }
 }
 
-fn exit_boot_services_raw(
-    st: &mut SystemTable<Boot>,
-    image: Handle,
-    mmap_storage: &mut [u8],
-) -> (usize, usize) {
-    // Avoid `SystemTable::exit_boot_services` because it resets the machine on failure
-    // without printing the underlying Status.
-    //
-    // Instead, call `GetMemoryMap` and `ExitBootServices` via the raw table pointers
-    // and retry a couple of times.
-    let st_raw = st.as_ptr() as *mut uefi_raw::table::system::SystemTable;
-    let bs_raw = unsafe { &mut *(*st_raw).boot_services };
+/// Physical address of a UEFI configuration table, or null when the firmware
+/// does not provide it (VMs without SMBIOS, for instance): the kernel treats
+/// 0 as "absent" rather than rboot refusing to boot.
+fn find_config_table(guid: uefi::Guid) -> *const core::ffi::c_void {
+    uefi::system::with_config_table(|entries| {
+        entries
+            .iter()
+            .find(|entry| entry.guid == guid)
+            .map(|entry| entry.address)
+    })
+    .unwrap_or(core::ptr::null())
+}
+
+/// Call `GetMemoryMap` + `ExitBootServices` through the raw tables.
+///
+/// `uefi::boot::exit_boot_services` resets the machine on failure without
+/// printing the underlying `Status`; this retries a couple of times and
+/// panics with the status instead. Returns `(map_size, descriptor_size)` of
+/// the final map written into `mmap_storage`.
+#[cfg(target_arch = "x86_64")]
+fn exit_boot_services_raw(mmap_storage: &mut [u8]) -> (usize, usize) {
+    let st_raw = uefi::table::system_table_raw().expect("system table not available");
+    // SAFETY: boot services are still active (this is the call that ends them).
+    let bs_raw = unsafe { &*(*st_raw.as_ptr()).boot_services };
+    let image = boot::image_handle();
 
     let mut last = Status::ABORTED;
     for _ in 0..2 {
@@ -340,29 +404,41 @@ fn exit_boot_services_raw(
     panic!("ExitBootServices failed: {:?}", last);
 }
 
-fn open_file(bs: &BootServices, path: &str) -> RegularFile {
-    //info!("opening file: {}", path);
-    let fs_handle = bs
-        .get_handle_for_protocol::<SimpleFileSystem>()
-        .expect("failed to get FileSystem handle");
-    let mut fs = bs
-        .open_protocol_exclusive::<SimpleFileSystem>(fs_handle)
-        .expect("failed to open FileSystem protocol");
+/// Try to open the regular file at `path` on the boot volume.
+fn try_open_file(path: &str) -> Option<RegularFile> {
+    debug!("trying to open file: {}", path);
+    let fs_handle = boot::get_handle_for_protocol::<SimpleFileSystem>().ok()?;
+    let mut fs = boot::open_protocol_exclusive::<SimpleFileSystem>(fs_handle).ok()?;
     let mut buf = [0u16; 256];
-    let path = CStr16::from_str_with_buf(path, &mut buf).expect("failed to convert path to ucs-2");
-    let mut root = fs.open_volume().expect("failed to open volume");
+    let ucs_path = CStr16::from_str_with_buf(path, &mut buf).ok()?;
+    let mut root = fs.open_volume().ok()?;
     let handle = root
-        .open(path, FileMode::Read, FileAttribute::empty())
-        .expect("failed to open file");
+        .open(ucs_path, FileMode::Read, FileAttribute::empty())
+        .ok()?;
 
-    match handle.into_type().expect("failed to into_type") {
-        FileType::Regular(regular) => regular,
-        _ => panic!("Invalid file type"),
+    match handle.into_type().ok()? {
+        FileType::Regular(regular) => Some(regular),
+        _ => None,
     }
 }
 
-fn load_file(bs: &BootServices, file: &mut RegularFile) -> &'static mut [u8] {
-    load_file_progress(bs, file, None)
+/// Open the kernel image: the configured path first, then the conventional
+/// fallback locations.
+fn open_kernel_file(kernel_path: &str) -> RegularFile {
+    if let Some(file) = try_open_file(kernel_path) {
+        return file;
+    }
+    for path in KERNEL_FALLBACK_PATHS {
+        if let Some(file) = try_open_file(path) {
+            warn!("kernel {} not found; using {}", kernel_path, path);
+            return file;
+        }
+    }
+    panic!("failed to open kernel ELF file: {}", kernel_path);
+}
+
+fn load_file(file: &mut RegularFile) -> &'static mut [u8] {
+    load_file_progress(file, None)
 }
 
 /// Load a file in bounded chunks, optionally advancing the boot progress bar
@@ -377,7 +453,6 @@ fn load_file(bs: &BootServices, file: &mut RegularFile) -> &'static mut [u8] {
 /// move, so a slow medium looks slow instead of hung, and a genuine failure
 /// panics with the failing offset instead of silently wedging.
 fn load_file_progress(
-    bs: &BootServices,
     file: &mut RegularFile,
     progress: Option<(ModeInfo, u64, u32, u32)>,
 ) -> &'static mut [u8] {
@@ -390,10 +465,9 @@ fn load_file_progress(
         .expect("failed to get file info");
     let file_size = info.file_size() as usize;
     let pages = file_size / 0x1000 + 1;
-    let mem_start = bs
-        .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages)
+    let mem_start = boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages)
         .expect("failed to allocate pages");
-    let buf = unsafe { core::slice::from_raw_parts_mut(mem_start as *mut u8, pages * 0x1000) };
+    let buf = unsafe { core::slice::from_raw_parts_mut(mem_start.as_ptr(), pages * 0x1000) };
     let mut done = 0usize;
     while done < file_size {
         let end = (done + CHUNK).min(file_size);
@@ -418,20 +492,18 @@ fn load_file_progress(
 /// Return the handle of the best GOP to use.
 ///
 /// On systems with multiple GPUs (e.g. dual NVIDIA RTX) UEFI exposes one GOP
-/// handle per GPU.  `locate_protocol` returns an arbitrary one which may be
-/// the inactive/secondary card.  We enumerate all handles and prefer the one
-/// with the largest accessible (non-BltOnly) framebuffer, which is
+/// handle per GPU.  `get_handle_for_protocol` returns an arbitrary one which
+/// may be the inactive/secondary card.  We enumerate all handles and prefer
+/// the one with the largest accessible (non-BltOnly) framebuffer, which is
 /// consistently the active/connected display on tested systems.
-fn find_active_gop_handle(bs: &BootServices) -> Option<Handle> {
-    let handles = bs
-        .locate_handle_buffer(SearchType::from_proto::<GraphicsOutput>())
-        .ok()?;
+fn find_active_gop_handle() -> Option<Handle> {
+    let handles = boot::locate_handle_buffer(SearchType::from_proto::<GraphicsOutput>()).ok()?;
 
     let mut best: Option<Handle> = None;
     let mut best_size: usize = 0;
 
     for &h in handles.iter() {
-        if let Ok(mut gop) = bs.open_protocol_exclusive::<GraphicsOutput>(h) {
+        if let Ok(mut gop) = boot::open_protocol_exclusive::<GraphicsOutput>(h) {
             // BltOnly means there is no direct framebuffer.
             if gop.current_mode_info().pixel_format() == PixelFormat::BltOnly {
                 continue;
@@ -445,7 +517,7 @@ fn find_active_gop_handle(bs: &BootServices) -> Option<Handle> {
     }
 
     // If every handle was BltOnly (no direct framebuffer), return None so the
-    // caller can fall back to locate_protocol.
+    // caller can fall back to `get_handle_for_protocol`.
     best
 }
 
@@ -483,16 +555,29 @@ fn mode_fits_auto_cap(w: usize, h: usize) -> bool {
     w > 0 && h > 0 && w.saturating_mul(h) <= AUTO_MAX_PIXELS
 }
 
-fn init_graphic(bs: &BootServices, resolution: Resolution) -> (GraphicInfo, [u8; 128], u32) {
-    let gop_handle = find_active_gop_handle(bs)
-        .or_else(|| bs.get_handle_for_protocol::<GraphicsOutput>().ok())
-        .expect("failed to find GraphicsOutput handle");
-    let mut gop = bs
-        .open_protocol_exclusive::<GraphicsOutput>(gop_handle)
-        .expect("failed to open GraphicsOutput protocol");
+/// Pick and set the graphic mode per `resolution`; return the final mode and
+/// the display's EDID. `None` when the firmware exposes no GOP at all (a
+/// headless aarch64 board, say): x86_64 boot requires one, aarch64 does not.
+fn init_graphic(resolution: Resolution) -> (Option<GraphicInfo>, [u8; 128], u32) {
+    let gop_handle = match find_active_gop_handle()
+        .or_else(|| boot::get_handle_for_protocol::<GraphicsOutput>().ok())
+    {
+        Some(h) => h,
+        None => {
+            warn!("no GraphicsOutput protocol: booting without a framebuffer");
+            return (None, [0u8; 128], 0);
+        }
+    };
+    let mut gop = match boot::open_protocol_exclusive::<GraphicsOutput>(gop_handle) {
+        Ok(gop) => gop,
+        Err(e) => {
+            warn!("failed to open GraphicsOutput protocol: {:?}", e);
+            return (None, [0u8; 128], 0);
+        }
+    };
 
     // EDID first: `Resolution::Auto` picks its target from it.
-    let (edid, edid_size) = read_active_edid(bs, gop_handle);
+    let (edid, edid_size) = read_active_edid(gop_handle);
 
     // What resolution do we want, and how hard should we try?
     // - Exact(w,h): that mode or keep the current one (the old behaviour
@@ -511,13 +596,13 @@ fn init_graphic(bs: &BootServices, resolution: Resolution) -> (GraphicInfo, [u8;
             edid_preferred_resolution(&edid, edid_size).filter(|&(w, h)| mode_fits_auto_cap(w, h))
         }
     };
-    let exact = target.and_then(|want| gop.modes(bs).find(|mode| mode.info().resolution() == want));
+    let exact = target.and_then(|want| gop.modes().find(|mode| mode.info().resolution() == want));
     let chosen = exact.or_else(|| {
         if resolution != Resolution::Auto {
             return None;
         }
         // Largest firmware-offered mode that still fits the cap.
-        gop.modes(bs)
+        gop.modes()
             .filter(|mode| {
                 let (w, h) = mode.info().resolution();
                 mode_fits_auto_cap(w, h)
@@ -529,14 +614,21 @@ fn init_graphic(bs: &BootServices, resolution: Resolution) -> (GraphicInfo, [u8;
             .or_else(|| {
                 // Some VMs only list huge modes: pick the smallest so we
                 // still boot rather than remaining at 8K.
-                gop.modes(bs).min_by_key(|mode| {
+                gop.modes().min_by_key(|mode| {
                     let (w, h) = mode.info().resolution();
                     w.saturating_mul(h)
                 })
             })
     });
     if let Some(mode) = chosen {
-        gop.set_mode(&mode).expect("Failed to set graphics mode");
+        if let Err(e) = gop.set_mode(&mode) {
+            warn!(
+                "failed to set graphic mode {:?}: {:?}; keeping current {:?}",
+                mode.info().resolution(),
+                e,
+                gop.current_mode_info().resolution()
+            );
+        }
     } else if target.is_some() {
         warn!(
             "requested graphic mode {:?} not offered by firmware; keeping current {:?}",
@@ -549,7 +641,7 @@ fn init_graphic(bs: &BootServices, resolution: Resolution) -> (GraphicInfo, [u8;
         fb_addr: gop.frame_buffer().as_mut_ptr() as u64,
         fb_size: gop.frame_buffer().size() as u64,
     };
-    (info, edid, edid_size)
+    (Some(info), edid, edid_size)
 }
 
 /// `EFI_EDID_ACTIVE_PROTOCOL` — the raw EDID of the currently-active display,
@@ -572,15 +664,15 @@ struct EdidDiscoveredProtocol {
     edid: *const u8,
 }
 
-/// Read the active display's EDID (first 128-byte block). Tries the GOP
-/// handle first (where the active-display EDID normally lives), then a global
-/// lookup, then the discovered-EDID protocol. Returns `([0; 128], 0)` when no
-/// EDID is available.
 fn edid_header_ok(b: &[u8]) -> bool {
     b.len() >= 8 && b[0] == 0x00 && b[7] == 0x00 && b[1..7].iter().all(|&x| x == 0xFF)
 }
 
-fn read_active_edid(bs: &BootServices, gop_handle: uefi::Handle) -> ([u8; 128], u32) {
+/// Read the active display's EDID (first 128-byte block). Tries the GOP
+/// handle first (where the active-display EDID normally lives), then a global
+/// lookup, then the discovered-EDID protocol. Returns `([0; 128], 0)` when no
+/// EDID is available.
+fn read_active_edid(gop_handle: Handle) -> ([u8; 128], u32) {
     // Copy one source's bytes into a fresh buffer; returns (buf, len).
     let read_one = |size: u32, ptr: *const u8| -> ([u8; 128], u32) {
         let mut buf = [0u8; 128];
@@ -610,82 +702,35 @@ fn read_active_edid(bs: &BootServices, gop_handle: uefi::Handle) -> ([u8; 128], 
         None
     };
 
-    if let Ok(p) = bs.open_protocol_exclusive::<EdidActiveProtocol>(gop_handle) {
+    if let Ok(p) = boot::open_protocol_exclusive::<EdidActiveProtocol>(gop_handle) {
         let (b, n) = read_one(p.size_of_edid, p.edid);
         if let Some(v) = consider(b, n) {
             return v;
         }
     }
-    if let Ok(h) = bs.get_handle_for_protocol::<EdidActiveProtocol>() {
-        if let Ok(p) = bs.open_protocol_exclusive::<EdidActiveProtocol>(h) {
-            let (b, n) = read_one(p.size_of_edid, p.edid);
-            if let Some(v) = consider(b, n) {
-                return v;
-            }
-        }
-    }
-    if let Ok(p) = bs.open_protocol_exclusive::<EdidDiscoveredProtocol>(gop_handle) {
+    if let Ok(h) = boot::get_handle_for_protocol::<EdidActiveProtocol>()
+        && let Ok(p) = boot::open_protocol_exclusive::<EdidActiveProtocol>(h)
+    {
         let (b, n) = read_one(p.size_of_edid, p.edid);
         if let Some(v) = consider(b, n) {
             return v;
         }
     }
-    if let Ok(h) = bs.get_handle_for_protocol::<EdidDiscoveredProtocol>() {
-        if let Ok(p) = bs.open_protocol_exclusive::<EdidDiscoveredProtocol>(h) {
-            let (b, n) = read_one(p.size_of_edid, p.edid);
-            if let Some(v) = consider(b, n) {
-                return v;
-            }
+    if let Ok(p) = boot::open_protocol_exclusive::<EdidDiscoveredProtocol>(gop_handle) {
+        let (b, n) = read_one(p.size_of_edid, p.edid);
+        if let Some(v) = consider(b, n) {
+            return v;
+        }
+    }
+    if let Ok(h) = boot::get_handle_for_protocol::<EdidDiscoveredProtocol>()
+        && let Ok(p) = boot::open_protocol_exclusive::<EdidDiscoveredProtocol>(h)
+    {
+        let (b, n) = read_one(p.size_of_edid, p.edid);
+        if let Some(v) = consider(b, n) {
+            return v;
         }
     }
     // No source had a valid header; hand back the first non-empty capture (if
     // any) so /proc can dump it for diagnosis.
     first_nonempty.unwrap_or(([0u8; 128], 0))
 }
-
-fn current_page_table() -> OffsetPageTable<'static> {
-    let p4_table_addr = Cr3::read().0.start_address().as_u64();
-    let p4_table = unsafe { &mut *(p4_table_addr as *mut PageTable) };
-    unsafe { OffsetPageTable::new(p4_table, VirtAddr::new(0)) }
-}
-
-struct UEFIFrameAllocator<'a>(&'a BootServices);
-
-unsafe impl FrameAllocator<Size4KiB> for UEFIFrameAllocator<'_> {
-    fn allocate_frame(&mut self) -> Option<PhysFrame> {
-        let addr = self
-            .0
-            .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
-            .ok()?;
-        Some(PhysFrame::containing_address(PhysAddr::new(addr)))
-    }
-}
-
-unsafe fn jump_to_entry(bootinfo: *const BootInfo, stacktop: u64) -> ! {
-    asm!(
-        // Rust/x86_64 assumes DF=0 for string ops.
-        "cld",
-        // After ExitBootServices the firmware IDT/handlers are no longer valid.
-        // Ensure we don't take any interrupt before the kernel installs its own IDT.
-        "cli",
-        // Clean frame pointer for a predictable initial state.
-        "xor rbp, rbp",
-        // NOTE: Avoid touching CET MSRs here. On many real machines, writing
-        // IA32_S_CET/IA32_U_CET without explicit support triggers #GP in firmware
-        // context. If CET/IBT turns out to be required, we should gate it behind
-        // CPUID feature detection.
-        // Set stack and call kernel entry with SysV ABI:
-        // - RDI = bootinfo
-        // - RSP 16-byte aligned before `call`
-        // Use `jmp` with ABI-correct stack alignment (rsp%16==8 at entry).
-        "mov rsp, {stacktop}",
-        "sub rsp, 8",
-        "jmp {entry}",
-        stacktop = in(reg) stacktop,
-        entry   = in(reg) ENTRY,
-        in("rdi") bootinfo,
-        options(noreturn),
-    );
-}
-
-static mut ENTRY: usize = 0;

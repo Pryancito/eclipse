@@ -1,8 +1,63 @@
-//! This file is modified from 'page_table.rs' in 'rust-osdev/bootloader'
+//! x86_64: page-table setup for the kernel image, stack and the physical
+//! memory window, plus the hand-off to the kernel entry.
+//!
+//! The mapping code is modified from 'page_table.rs' in 'rust-osdev/bootloader'.
 
+use rboot::BootInfo;
+use uefi::boot::{self, AllocateType, MemoryType};
+use x86_64::registers::control::*;
 use x86_64::structures::paging::{mapper::*, *};
-use x86_64::{align_up, PhysAddr, VirtAddr};
-use xmas_elf::{program, ElfFile};
+use x86_64::{PhysAddr, VirtAddr, align_up};
+use xmas_elf::{ElfFile, program};
+
+/// Get current page table from CR3
+pub fn current_page_table() -> OffsetPageTable<'static> {
+    let p4_table_addr = Cr3::read().0.start_address().as_u64();
+    let p4_table = unsafe { &mut *(p4_table_addr as *mut PageTable) };
+    unsafe { OffsetPageTable::new(p4_table, VirtAddr::new(0)) }
+}
+
+/// Use `boot::allocate_pages()` as frame allocator
+pub struct UEFIFrameAllocator;
+
+unsafe impl FrameAllocator<Size4KiB> for UEFIFrameAllocator {
+    fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        let addr = boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1).ok()?;
+        Some(PhysFrame::containing_address(PhysAddr::new(
+            addr.as_ptr() as u64
+        )))
+    }
+}
+
+/// Jump to the kernel entry with the SysV ABI: `rdi = bootinfo`, fresh stack.
+pub unsafe fn jump_to_entry(entry: usize, bootinfo: *const BootInfo, stacktop: u64) -> ! {
+    unsafe {
+        core::arch::asm!(
+            // Rust/x86_64 assumes DF=0 for string ops.
+            "cld",
+            // After ExitBootServices the firmware IDT/handlers are no longer valid.
+            // Ensure we don't take any interrupt before the kernel installs its own IDT.
+            "cli",
+            // Clean frame pointer for a predictable initial state.
+            "xor rbp, rbp",
+            // NOTE: Avoid touching CET MSRs here. On many real machines, writing
+            // IA32_S_CET/IA32_U_CET without explicit support triggers #GP in firmware
+            // context. If CET/IBT turns out to be required, we should gate it behind
+            // CPUID feature detection.
+            // Set stack and call kernel entry with SysV ABI:
+            // - RDI = bootinfo
+            // - RSP 16-byte aligned before `call`
+            // Use `jmp` with ABI-correct stack alignment (rsp%16==8 at entry).
+            "mov rsp, {stacktop}",
+            "sub rsp, 8",
+            "jmp {entry}",
+            stacktop = in(reg) stacktop,
+            entry = in(reg) entry,
+            in("rdi") bootinfo,
+            options(noreturn),
+        );
+    }
+}
 
 pub fn map_elf(
     elf: &ElfFile,

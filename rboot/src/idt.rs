@@ -21,9 +21,9 @@ static mut IDT: InterruptDescriptorTable = InterruptDescriptorTable::new();
 pub fn init(mode: ModeInfo, fb_addr: u64) {
     let (sw, sh) = mode.resolution();
     FB_ADDR.store(fb_addr, Ordering::SeqCst);
-    STRIDE.store(mode.stride() as usize, Ordering::SeqCst);
-    SW.store(sw as usize, Ordering::SeqCst);
-    SH.store(sh as usize, Ordering::SeqCst);
+    STRIDE.store(mode.stride(), Ordering::SeqCst);
+    SW.store(sw, Ordering::SeqCst);
+    SH.store(sh, Ordering::SeqCst);
 
     unsafe {
         let idt = &mut *core::ptr::addr_of_mut!(IDT);

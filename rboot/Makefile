@@ -1,5 +1,7 @@
 MODE ?= release
-EFI := target/x86_64-unknown-uefi/$(MODE)/rboot.efi
+# x86_64-unknown-uefi (default) or aarch64-unknown-uefi.
+TARGET ?= x86_64-unknown-uefi
+EFI := target/$(TARGET)/$(MODE)/rboot.efi
 OVMF := OVMF.fd
 ESP := esp
 QEMU_ARGS := -net none -smp cores=4 -nographic
@@ -12,10 +14,10 @@ endif
 .PHONY: build run header asm doc
 
 build:
-	cargo build $(BUILD_ARGS) --target x86_64-unknown-uefi -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem --ignore-rust-version
+	cargo build $(BUILD_ARGS) --target $(TARGET)
 
 clippy:
-	cargo clippy $(BUILD_ARGS) --target x86_64-unknown-uefi -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem
+	cargo clippy $(BUILD_ARGS) --target $(TARGET)
 
 doc:
 	cargo doc

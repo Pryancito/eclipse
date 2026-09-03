@@ -4,15 +4,16 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+pub use uefi::boot::{MemoryAttribute, MemoryDescriptor, MemoryType};
 pub use uefi::proto::console::gop::ModeInfo;
-pub use uefi::table::boot::{MemoryAttribute, MemoryDescriptor, MemoryType};
 
 /// This structure represents the information that the bootloader passes to the kernel.
 #[repr(C)]
 #[derive(Debug)]
 pub struct BootInfo {
-    /// Referencias al buffer del mapa de memoria (vida `'static` vía `Box::leak` en main).
-    pub memory_map: Vec<&'static MemoryDescriptor>,
+    /// The final UEFI memory map (the one `ExitBootServices` was called with),
+    /// copied out of the firmware buffer descriptor by descriptor.
+    pub memory_map: Vec<MemoryDescriptor>,
     /// The offset into the virtual address space where the physical memory is mapped.
     pub physical_memory_offset: u64,
     /// The graphic output information
@@ -42,4 +43,20 @@ pub struct GraphicInfo {
     pub mode: ModeInfo,
     pub fb_addr: u64,
     pub fb_size: u64,
+}
+
+/// AArch64 Boot Info passed to zCore/rCore on AArch64
+#[repr(C)]
+#[derive(Debug)]
+pub struct Aarch64BootInfo {
+    /// Kernel command line
+    pub cmdline: &'static str,
+    /// Firmware type (e.g. "QEMU", "Raspi4")
+    pub firmware_type: &'static str,
+    /// UART base physical address
+    pub uart_base: usize,
+    /// GIC base physical address
+    pub gic_base: usize,
+    /// Physical to virtual mapping offset
+    pub offset: usize,
 }
