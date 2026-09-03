@@ -1,4 +1,7 @@
+mod btrfs_image;
+mod desktop;
 mod image;
+mod nvidia_firmware;
 mod opencv;
 mod test;
 mod xorg;

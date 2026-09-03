@@ -8,7 +8,6 @@ description = "Device drivers of zCore"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-board_malta = []
 graphic = ["rcore-console"]
 mock = ["async-std", "sdl2"]
 virtio = ["virtio-drivers"]
@@ -37,7 +36,7 @@ bitmap-allocator = { git = "https://github.com/rcore-os/bitmap-allocator", rev =
 pci = { git = "https://github.com/elliott10/pci-rs", rev = "8f33774b" }
 virtio-drivers = { git = "https://github.com/rcore-os/virtio-drivers", rev = "2aaf7d6", optional = true }
 rcore-console = { git = "https://github.com/rcore-os/rcore-console", default-features = false, rev = "ca5b1bc", optional = true }
-spin = "0.9"
+lock = { git = "https://github.com/DeathWish5/kernel-sync", rev = "8486b8" }
 isomorphic_drivers = { git = "https://github.com/rcore-os/isomorphic_drivers", rev = "f7cd97a8", features = [
     "log",
 ] }
@@ -70,6 +69,14 @@ acpi = "4.1"
 raw-cpuid = "10.2"
 x2apic = "0.5"
 x86_64 = "0.15.5"
+# The NVIDIA RM shim is x86_64-only (it compiles C objects and links the RM
+# blob for that target); it must not enter the aarch64/riscv64 link.
+nvidia-rm-sys = { path = "../nvidia-rm-sys" }
+
+[[test]]
+name = "deferred_job"
+path = "tests/deferred_job.rs"
+required-features = ["mock"]
 
 [target.'cfg(any(target_arch = "riscv32", target_arch = "riscv64"))'.dependencies]
 riscv = "0.9"

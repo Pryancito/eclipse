@@ -22,8 +22,7 @@ extern crate lazy_static;
 mod macros;
 
 mod common;
-#[path = "config.rs"]
-mod config_common;
+pub mod config;
 mod hal_fn;
 mod kernel_handler;
 mod utils;
@@ -45,11 +44,15 @@ cfg_if! {
     }
 }
 
-pub(crate) use config_common::KCONFIG;
+pub(crate) use config::KCONFIG;
 pub(crate) use kernel_handler::KHANDLER;
 
-pub use common::{addr, console, context, defs::*, ipi::*, user};
-pub use config_common::KernelConfig;
+#[cfg(feature = "graphic")]
+pub use common::boot_logo;
+pub use common::{
+    addr, console, context, defs::*, ipi::*, kstats, oops_log, timer_waker, user, watchpoint,
+};
+pub use config::KernelConfig;
 pub use imp::{
     boot::{primary_init, primary_init_early, secondary_init},
     *,

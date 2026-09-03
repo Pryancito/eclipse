@@ -725,7 +725,10 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                 pid
             );
             let vmar = thread.proc().vmar();
-            vmar.handle_page_fault(vaddr, flags).inspect_err(|err| {
+            let pc = thread
+                .with_context(|ctx| ctx.get_field(UserContextField::InstrPointer))
+                .unwrap_or(0);
+            if let Err(err) = vmar.handle_page_fault(vaddr, flags) {
                 error!(
                     "unhandled page fault @ {:#x}({:?}): {:?}, pid={} proc={} pc={:#x} -> SIGSEGV",
                     vaddr,
@@ -735,7 +738,40 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                     thread.proc().name(),
                     pc,
                 );
-            })
+                force_fault_signal(thread, Signal::SIGSEGV);
+            }
+            Ok(())
+        }
+        TrapReason::UndefinedInstruction => {
+            warn!("undefined instruction from user mode, pid={}", pid);
+            force_fault_signal(thread, Signal::SIGILL);
+            Ok(())
+        }
+        TrapReason::SoftwareBreakpoint | TrapReason::HardwareBreakpoint => {
+            warn!("breakpoint from user mode, pid={}", pid);
+            thread.inner().lock_linux().signals.insert(Signal::SIGTRAP);
+            Ok(())
+        }
+        TrapReason::UnalignedAccess => {
+            warn!("unaligned access from user mode, pid={}", pid);
+            force_fault_signal(thread, Signal::SIGBUS);
+            Ok(())
+        }
+        TrapReason::GernelFault(trap_num) => {
+            let signal = cpu_fault_signal(trap_num);
+            let pc = thread
+                .with_context(|ctx| ctx.get_field(UserContextField::InstrPointer))
+                .unwrap_or(0);
+            warn!(
+                "cpu fault from user mode: trap={:#x} -> {:?}, pid={}, tid={}, pc={:#x}",
+                trap_num,
+                signal,
+                pid,
+                thread.id(),
+                pc
+            );
+            force_fault_signal(thread, signal);
+            Ok(())
         }
         _ => {
             error!(

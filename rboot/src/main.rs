@@ -37,6 +37,7 @@ use xmas_elf::ElfFile;
 mod config;
 mod fb;
 mod idt;
+mod libc_shim;
 mod logo;
 mod page_table;
 mod progress;

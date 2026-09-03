@@ -1,7 +1,17 @@
-//! Define physical frame allocation and dynamic memory allocation.
+//! Physical frame allocation and kernel heap on x86_64 bare metal.
+//!
+//! Two pools on purpose:
+//! - **Kernel heap** (`GlobalAlloc`): fixed BSS buddy pool for `Vec`/strings/smoltcp.
+//! - **Frame allocator** (bitmap): UEFI free RAM for DMA pages and process VM.
+//!
+//! Do not `transfer()` raw UEFI regions into the kernel heap at early boot: the buddy
+//! allocator touches those pages and can hang before the kernel reaches 60% progress.
 
 use bitmap_allocator::BitAlloc;
 use core::ops::Range;
+#[cfg(feature = "mem-debug")]
+use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use kernel_hal::sync::Mutex;
 use kernel_hal::PhysAddr;
 
@@ -463,7 +473,7 @@ cfg_if! {
                             leak_trace_dump(live);
                         }
                     } else {
-                        HOT_LIVE[i].fetch_update(
+                        HOT_LIVE[i].try_update(
                             Ordering::Relaxed,
                             Ordering::Relaxed,
                             |v| Some(v.saturating_sub(1)),
@@ -737,9 +747,46 @@ cfg_if! {
             }
 
             unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-                self.0
-                    .lock()
-                    .dealloc(unsafe { NonNull::new_unchecked(ptr) }, layout)
+                let prof = kernel_hal::kstats::heap_prof_enabled();
+                let t0 = if prof { core::arch::x86_64::_rdtsc() } else { 0 };
+                let sz = layout.size();
+                hot_track(sz, -1);
+                #[cfg(feature = "mem-debug")]
+                {
+                    let cz = ptr.add(sz);
+                    for i in 0..REDZONE {
+                        if core::ptr::read_volatile(cz.add(i)) != CANARY {
+                            panic!(
+                                "[heapcanary] HEAP OVERFLOW: ptr={:#x} size={} align={} clobbered at +{} (val={:#x})",
+                                ptr as usize,
+                                sz,
+                                layout.align(),
+                                i,
+                                core::ptr::read_volatile(cz.add(i))
+                            );
+                        }
+                    }
+                    // Poison the payload before returning it to the buddy so a
+                    // stale reader sees 0xa5a5... instead of plausible data.
+                    core::ptr::write_bytes(ptr, POISON, sz);
+                }
+                HEAP_USED.fetch_sub(sz, Ordering::Relaxed);
+                HEAP_LIVE[bucket_of(sz)].fetch_sub(1, Ordering::Relaxed);
+                let ext = Layout::from_size_align_unchecked(sz + REDZONE, layout.align());
+                // Front cache absorbs the free in O(1); only an out-of-range size
+                // or a cap-overflow reaches the buddy (default build only).
+                #[cfg(not(feature = "mem-debug"))]
+                let to_buddy = !slab::try_free(ptr, ext);
+                #[cfg(feature = "mem-debug")]
+                let to_buddy = true;
+                if to_buddy {
+                    self.0.lock().dealloc(NonNull::new_unchecked(ptr), ext);
+                }
+                kernel_hal::kstats::note_heap_dealloc(if prof {
+                    core::arch::x86_64::_rdtsc().wrapping_sub(t0)
+                } else {
+                    0
+                });
             }
         }
     } else {

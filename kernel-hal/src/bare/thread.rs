@@ -3,13 +3,7 @@
 use alloc::sync::Arc;
 use core::{any::Any, future::Future};
 
-use crate::{config_common::MAX_CORE_NUM, utils::PerCpuCell};
-
-#[allow(clippy::declare_interior_mutable_const)]
-const DEFAULT_THREAD: PerCpuCell<Option<Arc<dyn Any + Send + Sync>>> = PerCpuCell::new(None);
-
-static CURRENT_THREAD: [PerCpuCell<Option<Arc<dyn Any + Send + Sync>>>; MAX_CORE_NUM] =
-    [DEFAULT_THREAD; MAX_CORE_NUM];
+use super::percpu;
 
 hal_fn_impl! {
     impl mod crate::hal_fn::thread {

@@ -23,7 +23,7 @@ V ?=
 USER ?=
 ZBI ?= bringup
 
-SMP ?= 4
+SMP ?= 6
 ACCEL ?=
 IFACE ?= $(shell ip route show | grep default | grep -oE 'dev [^ ]+' | cut -d' ' -f2)
 ifeq ($(IFACE),)
@@ -258,7 +258,7 @@ ifeq ($(ARCH), x86_64)
   qemu_opts += \
 		-machine q35 \
 		-cpu Haswell,+smap,-check,+fsgsbase \
-		-m 1G \
+		-m 4G \
 		-serial mon:stdio \
 		-serial file:/tmp/serial.out \
 		-drive format=raw,if=pflash,readonly=on,file=$(ovmf) \
@@ -498,7 +498,7 @@ clean:
 .PHONY: bootloader
 bootloader:
 ifeq ($(ARCH), x86_64)
-	@cd ../rboot && make build
+	@cd ../rboot && env -u RUSTUP_TOOLCHAIN make build
 endif
 
 $(kernel_img): kernel bootloader

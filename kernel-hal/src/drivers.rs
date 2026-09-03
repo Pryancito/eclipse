@@ -507,6 +507,16 @@ mod drivers_ffi_libos {
         }
         0
     }
+
+    #[no_mangle]
+    extern "C" fn drivers_dma_mark_uncached(_paddr: PhysAddr, _pages: usize) -> i32 {
+        0
+    }
+
+    #[no_mangle]
+    extern "C" fn drivers_dma_verify_uncached(_paddr: PhysAddr, _pages: usize) -> i32 {
+        0
+    }
 }
 
 #[cfg(not(feature = "libos"))]
@@ -580,6 +590,99 @@ mod drivers_ffi {
         // run. (See `dma_quarantine_dealloc`.)
         super::dma_quarantine_dealloc(paddr, pages);
         trace!("dealloc DMA: paddr={:#x}, pages={}", paddr, pages);
+        0
+    }
+
+    /// Remap contiguous DMA pages as uncacheable (UC) in the kernel page tables.
+    /// Descriptor rings and NIC DMA buffers on bare metal must not use WB without snooping.
+    #[unsafe(no_mangle)]
+    extern "C" fn drivers_dma_mark_uncached(paddr: PhysAddr, pages: usize) -> i32 {
+        use crate::hal_fn::vm::flush_tlb;
+        use crate::vm::{GenericPageTable, PageTable};
+        use crate::{CachePolicy, MMUFlags, PAGE_SIZE};
+
+        if paddr == 0 || pages == 0 {
+            return -1;
+        }
+        let vaddr = paddr + KCONFIG.phys_to_virt_offset;
+        let flags = MMUFlags::READ
+            | MMUFlags::WRITE
+            | MMUFlags::from_bits_truncate(CachePolicy::Uncached as usize);
+        let mut pt = PageTable::from_current();
+        for i in 0..pages {
+            let va = vaddr + i * PAGE_SIZE;
+            match pt.query(va) {
+                Ok((_, _, size)) => {
+                    // Refuse to re-flag an entry bigger than the page we were
+                    // asked about: `update` writes the flags of WHATEVER entry
+                    // covers `va`, so on a huge-mapped region it would turn the
+                    // whole 2M/1G window UC — poisoning frames owned by other
+                    // subsystems/processes. (The x86_64 physmap is 4K-mapped by
+                    // rboot, so this only guards future/other-arch layouts.)
+                    if size as usize != PAGE_SIZE {
+                        trace!(
+                            "drivers_dma_mark_uncached: {:#x} covered by a {:?} entry; refusing",
+                            va,
+                            size
+                        );
+                        return -1;
+                    }
+                    // Never pass a paddr here: `update` would `set_addr` the
+                    // entry, and `query` returns the offset-adjusted physical
+                    // address — harmlessly redundant for a 4K entry, but a
+                    // catastrophic repoint should a huge entry ever slip
+                    // through. Flags-only is all this function means.
+                    if let Err(e) = pt.update(va, None, Some(flags)) {
+                        trace!("drivers_dma_mark_uncached: update {:#x} failed {:?}", va, e);
+                        return -1;
+                    }
+                    // WB -> UC transition: flush any cached lines for this page
+                    // (physically tagged, so this alias covers all mappings) so
+                    // no stale dirty line can later evict on top of device DMA.
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        for line in (0..PAGE_SIZE).step_by(64) {
+                            core::arch::x86_64::_mm_clflush((va + line) as *const u8);
+                        }
+                    }
+                }
+                Err(_) => {
+                    if let Err(e) = pt.map_cont(va, PAGE_SIZE, paddr + i * PAGE_SIZE, flags) {
+                        trace!("drivers_dma_mark_uncached: map {:#x} failed {:?}", va, e);
+                        return -1;
+                    }
+                }
+            }
+        }
+        flush_tlb(None);
+        core::mem::forget(pt);
+        0
+    }
+
+    /// Verify contiguous DMA pages are mapped uncacheable (PAT/PCD/PWT set in PTE).
+    #[unsafe(no_mangle)]
+    extern "C" fn drivers_dma_verify_uncached(paddr: PhysAddr, pages: usize) -> i32 {
+        use crate::vm::{GenericPageTable, PageTable};
+        use crate::{CachePolicy, PAGE_SIZE};
+
+        if paddr == 0 || pages == 0 {
+            return -1;
+        }
+        let vaddr = paddr + KCONFIG.phys_to_virt_offset;
+        let pt = PageTable::from_current();
+        for i in 0..pages {
+            let va = vaddr + i * PAGE_SIZE;
+            let Ok((_, flags, _)) = pt.query(va) else {
+                return -1;
+            };
+            let policy = flags.bits() & 3;
+            if policy != CachePolicy::Uncached as usize
+                && policy != CachePolicy::UncachedDevice as usize
+            {
+                return -1;
+            }
+        }
+        core::mem::forget(pt);
         0
     }
 

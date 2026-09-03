@@ -146,8 +146,13 @@ impl Stack {
     /// push slice into stack
     #[allow(unsafe_code)]
     fn push_slice<T: Copy>(&mut self, vs: &[T]) {
+        self.push_slice_aligned(vs, align_of::<T>());
+    }
+
+    #[allow(unsafe_code)]
+    fn push_slice_aligned<T: Copy>(&mut self, vs: &[T], align: usize) {
         self.sp -= size_of_val(vs);
-        self.sp -= self.sp % align_of::<T>();
+        self.sp -= self.sp % align;
         assert!(self.stack_top - self.sp <= self.data.len());
         let offset = self.data.len() - (self.stack_top - self.sp);
         unsafe {

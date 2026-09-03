@@ -161,49 +161,26 @@ impl Syscall<'_> {
         enum SendTarget {
             EveryProcessInGroup,
             EveryProcess,
-            EveryProcessInGroupByPID { _pid: KoID },
+            EveryProcessInGroupByPID(KoID),
             Pid(KoID),
         }
         let target = match pid {
             p if p > 0 => SendTarget::Pid(p as KoID),
             0 => SendTarget::EveryProcessInGroup,
             -1 => SendTarget::EveryProcess,
-            p if p < -1 => SendTarget::EveryProcessInGroupByPID { _pid: (-p) as KoID },
+            p if p < -1 => SendTarget::EveryProcessInGroupByPID((-p) as KoID),
             _ => unimplemented!(),
         };
-        let parent = self.zircon_process().clone();
-        match target {
-            SendTarget::Pid(pid) => {
-                match parent.job().get_child(pid) {
-                    Ok(obj) => {
-                        match signal {
-                            Signal::SIGKILL => {
-                                let current_pid = parent.id();
-                                if current_pid == pid {
-                                    // killing myself
-                                    parent.exit((128 + Signal::SIGKILL as i32) as i64);
-                                } else {
-                                    let process: Arc<Process> = obj.downcast_arc().unwrap();
-                                    process.exit((128 + Signal::SIGKILL as i32) as i64);
-                                }
-                            }
-                            sig => {
-                                let process: Arc<Process> = obj.downcast_arc().unwrap();
-                                let tids = process.thread_ids();
-                                for tid in tids {
-                                    let thread = process.get_child(tid).unwrap();
-                                    let thread: Arc<Thread> = thread.downcast_arc().unwrap();
-                                    let mut thread_linux = thread.lock_linux();
-                                    if thread_linux.signal_mask.contains(sig) {
-                                        continue;
-                                    } else {
-                                        thread_linux.signals.insert(signal);
-                                        break;
-                                    }
-                                }
-                            }
-                        };
-                        Ok(0)
+        let caller = self.zircon_process().clone();
+        let send_to_pid = |pid: KoID| -> SysResult {
+            let process = ROOT_JOB.find_process(pid).ok_or(LxError::ESRCH)?;
+            match signal {
+                Signal::SIGKILL => {
+                    let retcode = (128 + Signal::SIGKILL as i32) as i64;
+                    if caller.id() == process.id() {
+                        caller.exit(retcode);
+                    } else {
+                        process.exit(retcode);
                     }
                     Ok(0)
                 }

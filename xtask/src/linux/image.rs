@@ -1,4 +1,4 @@
-use crate::{commands::wget, Arch, PROJECT_DIR};
+use crate::{commands::wget, Arch, PROJECT_DIR, TARGET};
 use os_xtask_utils::{dir, CommandExt, Qemu, Tar};
 use std::{fs, path::Path};
 
@@ -463,7 +463,7 @@ impl super::LinuxRootfs {
             fs::copy(fw_dir.join("Boot.json"), boot_dir.join("Boot.json")).unwrap();
         }
         // 生成镜像
-        fuse(self.path(), &image);
+        fuse(self.path(), &image, sfs_size_for(dir_size(&self.path())));
         // 扩充一些额外空间，供某些测试使用
         Qemu::img()
             .arg("resize")

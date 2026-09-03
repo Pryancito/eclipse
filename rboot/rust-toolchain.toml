@@ -1,6 +1,8 @@
 [toolchain]
 profile = "minimal"
-# build-std en .cargo/config.toml requiere nightly.
-channel = "nightly-2026-05-01"
+# build-std en .cargo/config.toml requiere nightly. Debe coincidir con el
+# workspace: `cargo xtask` deja RUSTUP_TOOLCHAIN=nightly-2026-09-01 en el
+# entorno, y `x86_64` 0.15.5 exige ese nightly (métodos `Step`).
+channel = "nightly-2026-09-01"
 components = ["rust-src"]
 targets = ["x86_64-unknown-uefi"]

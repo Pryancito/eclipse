@@ -10,8 +10,11 @@ pub struct BootOptions {
     /// Process run as PID 1 / init (`INIT`), e.g. `/sbin/init`. Empty
     /// or a missing binary means the system boots without a PID 1 init.
     #[cfg(feature = "linux")]
-    #[cfg_attr(feature = "zircon", allow(dead_code))]
-    pub root_proc: String,
+    pub init_proc: String,
+    /// Process run on every terminal shell (`SHELL`), with PIDs 101.. — empty
+    /// means no terminal shells (e.g. libos, where `INIT` is the one program).
+    #[cfg(feature = "linux")]
+    pub shell_proc: String,
 }
 
 fn parse_cmdline(cmdline: &str) -> BTreeMap<&str, &str> {

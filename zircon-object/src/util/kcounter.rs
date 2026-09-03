@@ -98,12 +98,6 @@ impl Counter {
     }
 }
 
-impl Default for Counter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Head of the descriptor table.
 #[repr(C)]
 #[derive(Debug)]

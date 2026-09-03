@@ -765,7 +765,7 @@ impl PcmDev {
         use core::sync::atomic::{AtomicU32, Ordering};
         static BUDGET: AtomicU32 = AtomicU32::new(8);
         if BUDGET
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| b.checked_sub(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |b| b.checked_sub(1))
             .is_err()
         {
             return;

@@ -220,6 +220,22 @@ pub trait DisplayScheme: Scheme {
     /// Returns the framebuffer.
     fn fb(&self) -> FrameBuffer<'_>;
 
+    /// 2D acceleration advertised by this display. Defaults to software-only.
+    #[inline]
+    fn accel_caps(&self) -> AccelCaps {
+        AccelCaps::default()
+    }
+
+    /// True when the scanout framebuffer is write-combining (UEFI GOP / GPU
+    /// BAR1). The generic [`blit_from`](Self::blit_from) then uses
+    /// `MOVNTDQ` stores. Leave `false` for RAM framebuffers (virtio-gpu,
+    /// QEMU software KMS on a host-shared buffer) so the scalar copy stays
+    /// cache-friendly.
+    #[inline]
+    fn fb_write_combining(&self) -> bool {
+        false
+    }
+
     /// Write pixel color.
     #[inline]
     fn draw_pixel(&self, x: u32, y: u32, color: RgbColor) {

@@ -60,10 +60,6 @@ fn map_segment(
     let phys_start_addr = kernel_start + file_offset;
     let virt_start_addr = VirtAddr::new(segment.virtual_addr());
 
-    let start_page: Page = Page::containing_address(virt_start_addr);
-    let start_frame = PhysFrame::containing_address(phys_start_addr);
-    let end_frame = PhysFrame::containing_address(phys_start_addr + file_size - 1u64);
-
     let flags = segment.flags();
     let mut page_table_flags = PageTableFlags::PRESENT;
     // Don't force NX on loader-created kernel mappings. Some real-world kernel
@@ -74,20 +70,28 @@ fn map_segment(
         page_table_flags |= PageTableFlags::WRITABLE
     };
 
-    for frame in PhysFrame::range_inclusive(start_frame, end_frame) {
-        let offset = frame - start_frame;
-        let page = start_page + offset;
-        unsafe {
-            match page_table.map_to(page, frame, page_table_flags, frame_allocator) {
-                Ok(flush) => flush.flush(),
-                Err(MapToError::PageAlreadyMapped(_)) => {
-                    // Si el firmware ya mapeó esta página, aceptarlo siempre que
-                    // apunte al mismo frame físico.
-                    if page_table.translate_page(page).ok() != Some(frame) {
-                        return Err(MapToError::PageAlreadyMapped(frame));
+    // A PT_LOAD with FileSiz=0 is a pure BSS/.nobits segment (the 512 MiB
+    // kernel heap). `file_size - 1` would wrap; skip the file-backed loop.
+    if file_size != 0 {
+        let start_page: Page = Page::containing_address(virt_start_addr);
+        let start_frame = PhysFrame::containing_address(phys_start_addr);
+        let end_frame = PhysFrame::containing_address(phys_start_addr + file_size - 1u64);
+
+        for frame in PhysFrame::range_inclusive(start_frame, end_frame) {
+            let offset = frame - start_frame;
+            let page = start_page + offset;
+            unsafe {
+                match page_table.map_to(page, frame, page_table_flags, frame_allocator) {
+                    Ok(flush) => flush.flush(),
+                    Err(MapToError::PageAlreadyMapped(_)) => {
+                        // Si el firmware ya mapeó esta página, aceptarlo siempre que
+                        // apunte al mismo frame físico.
+                        if page_table.translate_page(page).ok() != Some(frame) {
+                            return Err(MapToError::PageAlreadyMapped(frame));
+                        }
                     }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
             }
         }
     }
@@ -96,7 +100,7 @@ fn map_segment(
         // .bss section (or similar), which needs to be zeroed
         let zero_start = virt_start_addr + file_size;
         let zero_end = virt_start_addr + mem_size;
-        if zero_start.as_u64() & 0xfff != 0 {
+        if file_size != 0 && zero_start.as_u64() & 0xfff != 0 {
             // A part of the last mapped frame needs to be zeroed. This is
             // not possible since it could already contains parts of the next
             // segment. Thus, we need to copy it before zeroing.
@@ -108,7 +112,8 @@ fn map_segment(
             type PageArray = [u64; Size4KiB::SIZE as usize / 8];
 
             let last_page = Page::containing_address(virt_start_addr + file_size - 1u64);
-            let last_page_ptr = end_frame.start_address().as_u64() as *mut PageArray;
+            let last_frame = PhysFrame::<Size4KiB>::containing_address(phys_start_addr + file_size - 1u64);
+            let last_page_ptr = last_frame.start_address().as_u64() as *mut PageArray;
             let temp_page_ptr = new_frame.start_address().as_u64() as *mut PageArray;
 
             unsafe {

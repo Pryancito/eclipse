@@ -1,4 +1,5 @@
 use crate::sync::Mutex;
+use alloc::vec::Vec;
 use virtio_drivers::{VirtIOGpu as InnerDriver, VirtIOHeader};
 
 use crate::prelude::{AccelCaps, ColorFormat, DisplayInfo, FrameBuffer};

@@ -189,7 +189,20 @@ impl<T, P: Policy> UserPtr<T, P> {
     /// Returns [`Ok(())`] if it is neither null nor unaligned, and lies in the
     /// user half of the address space.
     pub fn check(&self) -> Result<()> {
-        if !self.0.is_null() && (self.0 as usize).is_multiple_of(core::mem::align_of::<T>()) {
+        self.check_len(1)
+    }
+
+    /// [`check`](Self::check) for a run of `count` elements starting here, so a
+    /// slice that STARTS in the user half cannot run off its top end into the
+    /// kernel.
+    pub fn check_len(&self, count: usize) -> Result<()> {
+        let bytes = count
+            .checked_mul(core::mem::size_of::<T>())
+            .ok_or(Error::InvalidLength)?;
+        if !self.0.is_null()
+            && (self.0 as usize).is_multiple_of(core::mem::align_of::<T>())
+            && in_user_half(self.0 as usize, bytes)
+        {
             Ok(())
         } else {
             Err(Error::InvalidPointer)

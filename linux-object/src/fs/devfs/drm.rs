@@ -1141,7 +1141,7 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
             c.bitmap
                 .as_ref()
                 .filter(|b| !b.is_empty())
-                .map(|b| (c.x, c.y, c.w, c.h, b.clone()))
+                .map(|b| (c.x, c.y, c.w, c.h, Arc::clone(b)))
         } else {
             None
         };
@@ -1274,7 +1274,7 @@ pub fn set_cursor_bo(handle_id: u32, w: u32, h: u32) -> bool {
         let (cx, cy, bmp) = (
             state.cursor.x,
             state.cursor.y,
-            state.cursor.bitmap.as_ref().cloned(),
+            state.cursor.bitmap.clone(),
         );
         drop(state);
         let mut hw_ok = false;
@@ -1371,7 +1371,7 @@ pub fn repaint_for_cursor() {
             c.bitmap
                 .as_ref()
                 .filter(|b| !b.is_empty())
-                .map(|b| (c.x, c.y, c.w, c.h, b.clone()))
+                .map(|b| (c.x, c.y, c.w, c.h, Arc::clone(b)))
         } else {
             None
         };

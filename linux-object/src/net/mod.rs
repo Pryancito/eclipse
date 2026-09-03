@@ -287,9 +287,35 @@ pub use raw::*;
 pub mod packet;
 pub use packet::*;
 
-// missing documentation
-// pub mod icmp;
-// pub use icmp::*;
+/// missing documentation
+pub mod netlink;
+pub use netlink::*;
+pub mod unix;
+pub use unix::*;
+pub mod listen_table;
+pub use listen_table::*;
+
+/// missing documentation
+pub mod icmp;
+pub use icmp::*;
+
+/// IPv4 → MAC cache (fed from RX frames).
+pub mod arp_cache;
+pub use arp_cache::*;
+
+/// IPv6 → MAC cache (fed from RX frames).
+pub mod ndp_cache;
+
+/// ICMP echo replies from `push_packet` (ping RX).
+pub mod icmp_rx;
+
+/// IPv6 Router Advertisement handling (default route + SLAAC), fed from RX.
+pub mod ra;
+
+pub mod dns;
+
+pub mod wait;
+pub use icmp_rx::*;
 
 // pub mod stack;
 

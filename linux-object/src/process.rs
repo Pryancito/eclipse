@@ -16,10 +16,10 @@ use alloc::{
 };
 use core::convert::TryFrom;
 use core::sync::atomic::AtomicI32;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use kernel_hal::sync::{Mutex, MutexGuard};
 use kernel_hal::VirtAddr;
-use rcore_fs::vfs::{FileSystem, INode};
+use rcore_fs::vfs::{FileSystem, FileType, INode, Metadata};
 
 use zircon_object::{
     object::{KernelObject, KoID, Signal},
@@ -387,7 +387,6 @@ impl ProcessExt for Process {
         linux_parent_inner
             .children
             .insert(new_proc.id(), new_proc.clone());
-        new_proc.vmar().fork_from(&parent.vmar())?;
 
         // On termination: reparent this process's own still-live children to
         // INIT, then notify whoever reaps *this* process — its real parent

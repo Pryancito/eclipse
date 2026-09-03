@@ -20,6 +20,7 @@ numeric-enum-macro = "0.2"
 delegate = "0.13"
 zircon-object = { path = "../zircon-object", features = ["elf"] }
 kernel-hal = { path = "../kernel-hal", default-features = false }
+linux-vdso = { path = "../linux-vdso" }
 downcast-rs = { version = "2", default-features = false, features = ["sync"] }
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
 hunter = { path = "../hunter" }
@@ -33,6 +34,8 @@ spin = "0.9"
 rcore-fs-devfs = { git = "https://github.com/rcore-os/rcore-fs", rev = "1a3246b" }
 cfg-if = "1.0"
 zcore-drivers = { path = "../drivers", features = ["virtio"] }
+pci = { git = "https://github.com/elliott10/pci-rs", rev = "8f33774b" }
+lock = { git = "https://github.com/DeathWish5/kernel-sync", rev = "8486b8" }
 smoltcp = { git = "https://github.com/smoltcp-rs/smoltcp", rev = "35e833e3", default-features = false, features = [
     "log",
     "alloc",

@@ -8,8 +8,7 @@ use core::convert::TryFrom;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 
-use crate::sync::Mutex;
-use naive_timer::Timer;
+use lock::Mutex;
 
 /// A pending timer event: its absolute deadline and the callback to run.
 ///

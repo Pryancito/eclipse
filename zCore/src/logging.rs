@@ -1,4 +1,4 @@
-use core::fmt;
+use core::fmt::{self, Write};
 #[cfg(not(feature = "colorless-log"))]
 use log::Level;
 use log::{self, LevelFilter, Log, Metadata, Record};

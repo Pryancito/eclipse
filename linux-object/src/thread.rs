@@ -8,6 +8,7 @@ use alloc::sync::Arc;
 use kernel_hal::context::{UserContext, UserContextField};
 use kernel_hal::sync::{Mutex, MutexGuard};
 use kernel_hal::user::{Out, UserInPtr, UserOutPtr, UserPtr};
+use zircon_object::object::KernelObject;
 use zircon_object::task::{CurrentThread, Process, Thread};
 use zircon_object::ZxResult;
 
