@@ -177,8 +177,8 @@ struct DmaBuf {
 
 impl DmaBuf {
     fn new(len: usize, align: usize) -> DeviceResult<Self> {
-        let pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
-        let ap = (align + PAGE_SIZE - 1) / PAGE_SIZE;
+        let pages = len.div_ceil(PAGE_SIZE);
+        let ap = align.div_ceil(PAGE_SIZE);
         let pages = pages.max(ap);
         let (virt, phys) = unsafe { dma_alloc_pages(pages)? };
         unsafe {
@@ -929,7 +929,7 @@ impl XhciInner {
         if let Some(trb) = self.ev.pop() {
             let etype = (trb.ctrl >> 10) & 0x3f;
             let erdp = self.ev.erdp_phys();
-            self.mmio.write_rt64(0x38, (erdp as u64 & !0xf) | 0x8);
+            self.mmio.write_rt64(0x38, (erdp & !0xf) | 0x8);
 
             if etype == 32 {
                 // TRB_EVT_TRANSFER. Always run the transfer-side handler, even
@@ -983,12 +983,9 @@ impl XhciInner {
                 }
                 Err(_) => {
                     r.advance_dequeue(1);
-                    match r.push(trb_normal(buf_phys, len, true)) {
-                        Ok(_) => {
-                            fence(Ordering::SeqCst);
-                            self.mmio.ring_db(slot, ep);
-                        }
-                        Err(_) => {}
+                    if r.push(trb_normal(buf_phys, len, true)).is_ok() {
+                        fence(Ordering::SeqCst);
+                        self.mmio.ring_db(slot, ep);
                     }
                 }
             }
@@ -1050,7 +1047,6 @@ impl XhciInner {
             None => return false,
         };
 
-        if lis.is_none() {}
         let (ridx, blen, buf_phys) = {
             let h = &self.hids[idx];
             // Re-arm with the buffer at the enqueue head of the round-robin
@@ -1441,7 +1437,7 @@ impl XhciInner {
         m.write_op64(0x30, self.dcbaa.phys as u64);
 
         let crcr = self.cmd.crcr();
-        m.write_op64(0x18, (crcr as u64 & !0x3F) | 1);
+        m.write_op64(0x18, (crcr & !0x3F) | 1);
 
         // Configurar Interrupter 0 del Event Ring.
         // Orden mandatorio por spec xHCI §5.5.2:
@@ -1453,9 +1449,9 @@ impl XhciInner {
         m.write_rt(0x20, 1); // IMAN: limpiar IP (bit 0), IE=0 de momento
         m.write_rt(0x24, 0); // IMOD=0 (máxima respuesta, sin moderación)
         m.write_rt(0x28, 1); // ERSTSZ = 1 segmento
-        m.write_rt64(0x30, self.ev.erst_phys() as u64);
+        m.write_rt64(0x30, self.ev.erst_phys());
         let erdp = self.ev.erdp_phys();
-        m.write_rt64(0x38, (erdp as u64 & !0xf) | 8);
+        m.write_rt64(0x38, (erdp & !0xf) | 8);
 
         if self.msi_vector > 0 {
             m.write_rt(0x20, 3); // IMAN: IE=1, IP=1 (habilitar interrupciones)
@@ -1691,7 +1687,7 @@ impl XhciInner {
         let input_sz = 33 * csz;
         let ic = DmaBuf::new(input_sz, 64)?;
         ic.write_u32(4, 0x03);
-        let s0 = 1 * csz;
+        let s0 = csz;
         // Slot Context DW0 (§6.2.2):
         //   bits [19: 0] Route String = 0 (root hub, no hub entre medias)
         //   bits [23:20] Speed        = PORTSC speed code
@@ -1837,10 +1833,10 @@ impl XhciInner {
         let mut hdr = [0u8; 9];
         sniff.read_into(0, &mut hdr);
         let total = u16::from_le_bytes([hdr[2], hdr[3]]) as usize;
-        if total < 9 || total > 8192 {
+        if !(9..=8192).contains(&total) {
             return Err(DeviceError::InvalidParam);
         }
-        let buf_len = ((total + 63) / 64 * 64).max(64);
+        let buf_len = (total.div_ceil(64) * 64).max(64);
         let cfgb = DmaBuf::new(buf_len, 64)?;
         cfgb.flush(0, buf_len); // evict stale zeros before DMA
         self.ep0_control_in(
@@ -2080,7 +2076,7 @@ impl XhciInner {
         #[cfg(target_arch = "x86_64")]
         {
             let mut addr = v;
-            let end = v + report_len as usize;
+            let end = v + report_len;
             while addr < end {
                 unsafe {
                     _mm_clflush(addr as *const u8);
@@ -2287,7 +2283,7 @@ impl XhciInner {
         let dcbaa = self.dcbaa.phys as u64;
         let erst = self.ev.erst_phys();
         let evseg = self.ev.seg.phys as u64;
-        let crcr = self.cmd.crcr() as u64;
+        let crcr = self.cmd.crcr();
         let scratch = self
             .scratch_tbl
             .as_ref()

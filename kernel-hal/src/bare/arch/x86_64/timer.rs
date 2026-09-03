@@ -156,7 +156,7 @@ use zcore_drivers::irq::x86::Apic;
 /// LAPIC timer initial count for the normal full-rate scheduler tick (4 ms at
 /// 250 Hz). Mirrors the value programmed in `drivers.rs` at boot.
 pub fn fast_tick_count() -> u32 {
-    (super::cpu::tsc_hz() / TICKS_PER_SEC as u64).clamp(1, u32::MAX as u64) as u32
+    (super::cpu::tsc_hz() / TICKS_PER_SEC).clamp(1, u32::MAX as u64) as u32
 }
 
 /// Period of the full-rate scheduler tick, in nanoseconds (4 ms at 250 Hz).

@@ -41,6 +41,7 @@ const MMAP_MIN_ADDR: usize = 0x1_0000;
 /// - [`mmap`](Self::sys_mmap)
 /// - [`mprotect`](Self::sys_mprotect)
 /// - [`munmap`](Self::sys_munmap)
+///
 /// Assert, at the point `mmap` is about to hand `addr` to userspace, that the
 /// range it promises is actually installed in the VMAR.
 ///

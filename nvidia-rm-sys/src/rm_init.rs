@@ -1034,8 +1034,19 @@ pub struct GrEdid {
     pub conn_type: [NvU32; 16],
 }
 
+#[cfg(target_os = "none")]
 extern "C" {
     fn eclipse_rm_edid(device_instance: NvU32, out: *mut GrEdid) -> NV_STATUS;
+}
+
+/// Hosted (libos) builds have no RM C objects to link: `build.rs` only
+/// compiles the NVIDIA sources for `target_os = "none"`. These two entry
+/// points are the only ones reachable from hosted code (procfs `gpuedid`
+/// and the HDA driver's HDMI audio kick), so they get an explicit
+/// "no GPU here" answer instead of an undefined symbol at link time.
+#[cfg(not(target_os = "none"))]
+unsafe fn eclipse_rm_edid(_device_instance: NvU32, _out: *mut GrEdid) -> NV_STATUS {
+    NV_ERR_NOT_SUPPORTED
 }
 
 /// Real display query: which outputs exist, which are connected, and the
@@ -1082,6 +1093,7 @@ pub struct HdmiAudioOut {
     pub max_freq: NvU32,
 }
 
+#[cfg(target_os = "none")]
 extern "C" {
     fn eclipse_rm_hdmi_audio(
         device_instance: NvU32,
@@ -1090,6 +1102,18 @@ extern "C" {
         force: NvBool,
         out: *mut HdmiAudioOut,
     ) -> NV_STATUS;
+}
+
+/// See [`eclipse_rm_edid`]'s hosted stub.
+#[cfg(not(target_os = "none"))]
+unsafe fn eclipse_rm_hdmi_audio(
+    _device_instance: NvU32,
+    _display_mask: NvU32,
+    _hdmi_mask: NvU32,
+    _force: NvBool,
+    _out: *mut HdmiAudioOut,
+) -> NV_STATUS {
+    NV_ERR_NOT_SUPPORTED
 }
 
 /// Enable HDMI/DP audio on the connected outputs in `display_mask`: builds an

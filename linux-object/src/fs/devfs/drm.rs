@@ -772,7 +772,7 @@ fn ce_repack_to_staging(
     // bottleneck), milliseconds mean uncached BAR reads (the CE must learn
     // to read the source directly; no CPU path can be fast).
     let n = CE_REPACK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if n <= 2 || n % 64 == 0 {
+    if n <= 2 || n.is_multiple_of(64) {
         let repack_us = kernel_hal::timer::timer_now()
             .saturating_sub(t0)
             .as_micros();
@@ -877,6 +877,7 @@ fn dma_sync_scanout_src_from_device(
 /// clflush a megabyte of pitch padding. Used after CE-direct present so
 /// [`blit_cursor_patch`] can read GPU pixels from sysmem without a full-frame
 /// sync.
+#[allow(clippy::too_many_arguments)]
 fn dma_sync_gem_rect_from_device(
     vaddr: usize,
     fb_size: usize,
@@ -1180,7 +1181,7 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     let t_cursor = kernel_hal::timer::timer_now();
     if rect.is_none() {
         let n = PRESENT_FRAME_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= 2 || n % 64 == 0 {
+        if n <= 2 || n.is_multiple_of(64) {
             kernel_hal::klog_info!(
                 "[drm] present #{}: sync {}us + {} blit {}us + cursor {}us ({}x{})",
                 n,
@@ -1434,6 +1435,7 @@ pub fn repaint_for_cursor() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rects_overlap(ax: i32, ay: i32, aw: u32, ah: u32, bx: i32, by: i32, bw: u32, bh: u32) -> bool {
     let ax1 = ax.saturating_add(aw as i32);
     let ay1 = ay.saturating_add(ah as i32);
@@ -1442,6 +1444,7 @@ fn rects_overlap(ax: i32, ay: i32, aw: u32, ah: u32, bx: i32, by: i32, bw: u32, 
     ax < bx1 && bx < ax1 && ay < by1 && by < ay1
 }
 
+#[allow(clippy::too_many_arguments)]
 fn union_i32(
     ax: i32,
     ay: i32,
@@ -1469,6 +1472,7 @@ fn union_i32(
 }
 
 /// Copy `patch` of the CRTC fb, blend the cursor into it in RAM, blit once.
+#[allow(clippy::too_many_arguments)]
 fn blit_cursor_patch(
     display: &dyn DisplayScheme,
     pixels: &[u32],
@@ -1546,12 +1550,13 @@ fn blit_cursor_patch(
             };
         }
     }
-    display.blit_from(x0 as u32, y0 as u32, &patch, tw, tw as u32, th as u32);
+    display.blit_from(x0 as u32, y0 as u32, patch, tw, tw as u32, th as u32);
 }
 
 /// Restore the `(x, y, w, h)` window of the display from the CRTC framebuffer
 /// `pixels` (row-major, `src_stride` pixels/row), clipped to the visible
 /// `fw`x`fh` area. Used to erase the old cursor before drawing the new one.
+#[allow(clippy::too_many_arguments)]
 fn restore_rect(
     display: &dyn DisplayScheme,
     pixels: &[u32],

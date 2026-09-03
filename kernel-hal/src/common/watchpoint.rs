@@ -93,7 +93,7 @@ static SPINE_WATCH_OFF: core::sync::atomic::AtomicBool = core::sync::atomic::Ato
 /// and want it live everywhere, and keeping DR1–DR3 free leaves room for a
 /// second probe without reworking this.
 pub fn watch_write(addr: usize, len: usize) -> bool {
-    if addr == 0 || !matches!(len, 1 | 2 | 4 | 8) || addr % len != 0 {
+    if addr == 0 || !matches!(len, 1 | 2 | 4 | 8) || !addr.is_multiple_of(len) {
         return false;
     }
     WP_ADDR.store(addr as u64, Relaxed);
@@ -243,7 +243,7 @@ mod imp {
     /// Frame-pointer backtrace of the writer — the caller chain names the code
     /// path, not just the storing instruction (often an inlined memcpy).
     fn report_writer_chain(tag: &str, rbp: u64) {
-        let plausible = |a: u64| a >= 0xffff_ff00_0000_0000 && a < 0xffff_ff00_1000_0000;
+        let plausible = |a: u64| (0xffff_ff00_0000_0000..0xffff_ff00_1000_0000).contains(&a);
         let mut fp = rbp;
         let mut i = 0usize;
         while i < 12 && plausible(fp) && (fp & 0x7) == 0 {
@@ -279,11 +279,11 @@ mod imp {
         }
 
         let manual = WP_ADDR.load(Relaxed);
-        for slot in 0..4usize {
+        for (slot, armed) in DR_ARMED[cpu].iter().enumerate().take(4) {
             if matched & (1 << slot) == 0 {
                 continue;
             }
-            let addr = DR_ARMED[cpu][slot].load(Relaxed);
+            let addr = armed.load(Relaxed);
             if addr == 0 {
                 continue; // stale DR6 residue for a slot we already disabled
             }
@@ -338,7 +338,7 @@ mod imp {
             let lo = rsp & !0x7;
             for k in 0..24u64 {
                 let a = lo + k * 8;
-                if a < 0xffff_ff00_0000_0000 || a >= 0xffff_ff01_0000_0000 {
+                if !(0xffff_ff00_0000_0000..0xffff_ff01_0000_0000).contains(&a) {
                     break;
                 }
                 let v = unsafe { core::ptr::read_volatile(a as *const u64) };

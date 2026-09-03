@@ -429,7 +429,7 @@ fn union_apk_world(src: &Path, dst: &Path) {
         .collect();
     let before = dst_lines.len();
     for l in src_lines {
-        if !dst_lines.iter().any(|d| *d == l) {
+        if !dst_lines.contains(&l) {
             dst_lines.push(l);
         }
     }

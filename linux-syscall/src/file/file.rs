@@ -66,25 +66,27 @@ impl Syscall<'_> {
             // [diag dd-efault] name the failing layer: is the EFAULT for a
             // >=4 KiB read produced by the file's read (inode/driver) or by
             // the copy-out below?
-            let n = file_like.read(&mut buf[..current_len]).await.map_err(|e| {
-                // ONLY the EFAULT this diag hunts. It used to fire on ANY error,
-                // so every non-blocking read that returns EAGAIN -- what every
-                // event loop (labwc/Xwayland/wayland clients, and the oopslog
-                // poller) does thousands of times a second -- wrote a line
-                // through the UNCONDITIONAL klog. That flooded the slow UART
-                // console, stalled each read on the serial write, and starved
-                // the desktop until the session fell over a few seconds in.
-                if matches!(e, LxError::EFAULT) {
-                    kernel_hal::klog_info!(
-                        "[read-efault] fd={:?} len={:#x} current={:#x}: file_like.read -> {:?}",
-                        fd,
-                        len,
-                        current_len,
-                        e
-                    );
-                }
-                e
-            })?;
+            let n = file_like
+                .read(&mut buf[..current_len])
+                .await
+                .inspect_err(|e| {
+                    // ONLY the EFAULT this diag hunts. It used to fire on ANY error,
+                    // so every non-blocking read that returns EAGAIN -- what every
+                    // event loop (labwc/Xwayland/wayland clients, and the oopslog
+                    // poller) does thousands of times a second -- wrote a line
+                    // through the UNCONDITIONAL klog. That flooded the slow UART
+                    // console, stalled each read on the serial write, and starved
+                    // the desktop until the session fell over a few seconds in.
+                    if matches!(e, LxError::EFAULT) {
+                        kernel_hal::klog_info!(
+                            "[read-efault] fd={:?} len={:#x} current={:#x}: file_like.read -> {:?}",
+                            fd,
+                            len,
+                            current_len,
+                            e
+                        );
+                    }
+                })?;
             if n == 0 {
                 break;
             }
@@ -99,7 +101,7 @@ impl Syscall<'_> {
             // already convert VINTR into SIGINT for the foreground pgrp
             // themselves — so the syscall-level check was pure downside and was
             // removed.
-            base.add(read_len).write_array(&buf[..n]).map_err(|e| {
+            base.add(read_len).write_array(&buf[..n]).inspect_err(|e| {
                 // Unguarded is fine here: write_array only fails on a bad user
                 // address (the EFAULT this diag hunts), never on a benign/hot
                 // EAGAIN, so it cannot flood the way the read path above did.
@@ -110,7 +112,6 @@ impl Syscall<'_> {
                     n,
                     e
                 );
-                e
             })?;
             read_len += n;
             if n < current_len || !is_seekable {

@@ -24,8 +24,10 @@ static BSP_GDT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static BSP_STAR: AtomicU32 = AtomicU32::new(0);
 
 #[cfg(not(feature = "ioport_bitmap"))]
+#[allow(clippy::upper_case_acronyms)]
 type TSS = x86_64::structures::tss::TaskStateSegment;
 #[cfg(feature = "ioport_bitmap")]
+#[allow(clippy::upper_case_acronyms)]
 type TSS = super::ioport::TSSWithPortBitmap;
 
 /// The region pointed to by `GSBASE` on each CPU.

@@ -264,6 +264,7 @@ const MAX_PRECISE_SHOOTDOWN: usize = 8;
 ///    on x86; see `vm.rs`).
 ///  * anything else (overflow flag, full-flush sentinel `vpn == 0`, or too
 ///    many entries) → one full flush, the previous behaviour.
+///
 /// Spin-loop pump: drain this CPU's pending shootdown queue if — and only if —
 /// there is something in it. One queue-pointer compare when idle, so it is
 /// cheap enough to call every few hundred spins from inside a held-IRQs-off

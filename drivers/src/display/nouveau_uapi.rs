@@ -623,10 +623,7 @@ pub(super) fn nouveau_ioctl_name(nr: u32) -> &'static str {
 /// *distinct* ioctl the first time Mesa issues it gives the full vocabulary
 /// (and the submission path) in ~a dozen bounded lines, without flooding the
 /// serial console on every per-draw EXEC.
-static NR_TRACED: [AtomicBool; 256] = {
-    const F: AtomicBool = AtomicBool::new(false);
-    [F; 256]
-};
+static NR_TRACED: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
 
 /// Log this ioctl by name the first time its NR is seen this boot.
 pub(super) fn trace_first_sight(request: u32) {

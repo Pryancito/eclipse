@@ -1792,7 +1792,7 @@ fn proc_memhogs_content() -> String {
             )
         })
         .collect();
-    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    rows.sort_by_key(|r| core::cmp::Reverse(r.0));
 
     let sum_priv: u64 = rows.iter().map(|r| r.0).sum();
     let sum_shared: u64 = rows.iter().map(|r| r.1).sum();
@@ -1849,11 +1849,7 @@ fn proc_memhogs_content() -> String {
         mib((used as u64).saturating_sub(attributed))
     );
     let _ = writeln!(s);
-    let _ = writeln!(
-        s,
-        "{:>8} {:>10} {:>10} {:>10}  {}",
-        "PID", "PRIV_KB", "SHARED_KB", "MAPPED_KB", "NAME"
-    );
+    let _ = writeln!(s, "     PID    PRIV_KB  SHARED_KB  MAPPED_KB  NAME");
     for (priv_b, shared_b, mapped_b, pid, name) in rows.iter().take(40) {
         let _ = writeln!(
             s,

@@ -786,12 +786,17 @@ fn einval_hunt(pid: KoID, num: u32, args: &[usize; 6]) {
             | Sys::READV
             | Sys::WRITE
             | Sys::READ
-            | Sys::POLL
+            | Sys::PPOLL
             | Sys::SETSOCKOPT
             | Sys::GETSOCKOPT
             | Sys::FCNTL
             | Sys::IOCTL)
     );
+    // Legacy `poll` only exists in the x86_64 table (the generic ABI that
+    // riscv64/aarch64 use has `ppoll` alone), so it cannot sit in the
+    // arch-neutral pattern above without breaking those builds.
+    #[cfg(target_arch = "x86_64")]
+    let watched = watched || matches!(Sys::try_from(num), Ok(Sys::POLL));
     if watched && BUDGET.fetch_add(1, Ordering::Relaxed) < 32 {
         log::error!(
             "[einval-hunt] pid={} syscall={} ({:?}) a0={:#x} a1={:#x} a2={:#x} a3={:#x} -> EINVAL",

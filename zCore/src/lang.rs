@@ -155,7 +155,7 @@ fn dl_paint() {
         }
         let l = DL_FILE_LEN[i].load(Ordering::SeqCst);
         let lc = DL_LINE_CPU[i].load(Ordering::SeqCst);
-        let cpu = (lc >> 32) as usize;
+        let cpu = lc >> 32;
         let is_holder = DL_HOLDER[i].load(Ordering::SeqCst) != 0;
         let role = if is_holder { "HOLDER " } else { "" };
         // SAFETY: (p, l) were stored from a live &'static str (either the

@@ -610,9 +610,9 @@ pub fn kernel_report() -> String {
                 out,
                 "heap prof:    alloc {} calls, {} cyc avg; dealloc {} calls, {} cyc avg",
                 ac,
-                if ac > 0 { acy / ac } else { 0 },
+                acy.checked_div(ac).unwrap_or(0),
                 dc,
-                if dc > 0 { dcy / dc } else { 0 },
+                dcy.checked_div(dc).unwrap_or(0),
             );
         }
     }

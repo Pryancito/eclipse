@@ -143,13 +143,8 @@ fn preceded_by_call(ret: u64) -> bool {
         let rm = modrm & 7;
         let sib = mode != 3 && rm == 4; // SIB byte present
         let disp: u64 = match mode {
-            0 => {
-                if rm == 5 {
-                    4 // RIP-relative disp32
-                } else {
-                    0
-                }
-            }
+            0 if rm == 5 => 4, // RIP-relative disp32
+            0 => 0,
             1 => 1,
             2 => 4,
             _ => 0, // register-direct
@@ -398,11 +393,11 @@ fn dump_null_execute_stack_once(tf: &TrapFrame, sp: u64, slot0: u64) {
         return;
     }
     let mut q = [slot0, 0u64, 0u64, 0u64];
-    for i in 1..4 {
+    for (i, slot) in q.iter_mut().enumerate().skip(1) {
         let a = sp + (i * 8) as u64;
-        if a >= 0xffff_ff00_0000_0000 && a < 0xffff_ff01_0000_0000 && (a & 7) == 0 {
+        if (0xffff_ff00_0000_0000..0xffff_ff01_0000_0000).contains(&a) && (a & 7) == 0 {
             // SAFETY: a is 8-aligned in the kernel stack VA window.
-            q[i] = unsafe { core::ptr::read_volatile(a as *const u64) };
+            *slot = unsafe { core::ptr::read_volatile(a as *const u64) };
         }
     }
     crate::console::serial_write_fmt_spin(format_args!(
@@ -447,7 +442,7 @@ fn dump_null_execute_stack_once(tf: &TrapFrame, sp: u64, slot0: u64) {
     // of ONE crash is enough to classify the writer without another boot.
     const SW_LO: u64 = 0xffff_ff00_0000_0000;
     const SW_HI: u64 = 0xffff_ff01_0000_0000;
-    let readable = |a: u64| a >= SW_LO && a < SW_HI && (a & 7) == 0;
+    let readable = |a: u64| (SW_LO..SW_HI).contains(&a) && (a & 7) == 0;
     let read8 = |a: u64| -> Option<u64> {
         // SAFETY: caller-guaranteed 8-aligned address inside the mapped kernel
         // coroutine-stack window; a stray read there cannot fault (the guard
@@ -610,7 +605,7 @@ fn try_recover_null_return_slot(tf: &mut TrapFrame, fault_vaddr: usize, sp: u64)
             ));
             let mut a = lo;
             while a < hi {
-                if a >= 0xffff_ff00_0000_0000 && a < 0xffff_ff01_0000_0000 {
+                if (0xffff_ff00_0000_0000..0xffff_ff01_0000_0000).contains(&a) {
                     // SAFETY: 8-aligned address on this executor's mapped stack
                     // window (same bound as the scan below).
                     let w = unsafe { core::ptr::read_volatile(a as *const u64) };
@@ -680,7 +675,7 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
     // For same-CPL kernel #PF on `call`, CPU-saved RSP points at the return
     // address the CALL pushed before loading the bad RIP.
     let sp = tf.rsp as u64;
-    let plausible_sp = |a: u64| a >= 0xffff_ff00_0000_0000 && a < 0xffff_ff01_0000_0000;
+    let plausible_sp = |a: u64| (0xffff_ff00_0000_0000..0xffff_ff01_0000_0000).contains(&a);
     if !plausible_sp(sp) || (sp & 7) != 0 {
         return false;
     }

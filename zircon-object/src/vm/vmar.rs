@@ -2534,6 +2534,7 @@ impl VmMapping {
     ///   wrong as it was rather than adding a new way to break it.
     /// * **Anything `create_child` rejects** — contiguous, pinned or
     ///   non-cached objects — which it reports as an error.
+    ///
     /// [`try_cow_child`](Self::try_cow_child) with its two halves timed
     /// separately.
     ///
@@ -2561,7 +2562,7 @@ impl VmMapping {
         self.protect_for_cow();
         let t2 = kernel_hal::timer::timer_now().as_nanos() as u64;
         FORK_NS_PROTECT.fetch_add(t2 - t1, Ordering::Relaxed);
-        return Some(child);
+        Some(child)
     }
 
     #[allow(dead_code)]

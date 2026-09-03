@@ -13,7 +13,10 @@ use core::sync::atomic::{fence, AtomicBool, Ordering};
 use super::dma::DmaRegion;
 
 /// Set at boot by [`probe_cpu_features`]; `true` when the CPU supports the
-/// non-serialising `CLFLUSHOPT` instruction (CPUID.7.0.EBX[23]).
+/// non-serialising `CLFLUSHOPT` instruction (CPUID.7.0.EBX[23]). Only the
+/// x86_64 `clflush_span` consults it; other arches never touch it, and with
+/// `#![deny(warnings)]` an unused static fails their clippy.
+#[cfg(target_arch = "x86_64")]
 static HAS_CLFLUSHOPT: AtomicBool = AtomicBool::new(false);
 
 /// Set at boot by [`probe_cpu_features`]; `true` when the CPU supports the
@@ -283,7 +286,12 @@ unsafe fn nt_copy_row_aligned(dst: *mut u8, src: *const u8, width_bytes: usize) 
 /// Returns `false` when the CPU lacks the NT-blit feature; the caller must
 /// then use a scalar copy. Does **not** skip a `clflush_span` of a WB
 /// source — NT stores do not make GPU-written WB lines coherent.
-pub fn nt_store_rows(
+///
+/// # Safety
+/// `src` must be valid for `height` rows of `width_bytes` reads at
+/// `src_stride` spacing and `dst` for the same writes at `dst_stride`; the
+/// two must not overlap.
+pub unsafe fn nt_store_rows(
     dst: *mut u8,
     dst_stride: usize,
     src: *const u8,
@@ -320,7 +328,7 @@ pub fn nt_store_rows(
                 options(nostack, preserves_flags),
             );
         }
-        return true;
+        true
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -338,7 +346,11 @@ pub fn nt_store_rows(
 /// skippable, and it cannot speed up a present whose bottleneck is the store
 /// side. The scanout CPU fallback uses [`nt_store_rows`] (NT *stores* into
 /// WC GOP/BAR1) instead.
-pub fn nt_blit_rows(
+///
+/// # Safety
+/// Same contract as [`nt_store_rows`]: `src`/`dst` valid for `height` rows
+/// at their strides, non-overlapping.
+pub unsafe fn nt_blit_rows(
     dst: *mut u8,
     dst_stride: usize,
     src: *const u8,
@@ -351,7 +363,7 @@ pub fn nt_blit_rows(
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if HAS_NT_BLIT.load(Ordering::Relaxed) && (src as usize) % 16 == 0 {
+        if HAS_NT_BLIT.load(Ordering::Relaxed) && (src as usize).is_multiple_of(16) {
             // The row copies clobber xmm0, which belongs to the interrupted
             // USER context: this soft-float kernel never saves vector state on
             // syscall entry, so without a save/restore the caller returns to

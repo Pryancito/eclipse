@@ -178,19 +178,19 @@ fn apply(router_ll: Ipv6Address, router_lifetime: u16, prefix: Option<PrefixInfo
         }
     } else {
         let mut st = STATE.lock();
-        if st.gateway != Some(router_ll) && st.installed_routes < MAX_RA_ROUTES {
-            if iface
+        if st.gateway != Some(router_ll)
+            && st.installed_routes < MAX_RA_ROUTES
+            && iface
                 .add_route(default_cidr, Some(IpAddress::Ipv6(router_ll)))
                 .is_ok()
-            {
-                st.gateway = Some(router_ll);
-                st.installed_routes += 1;
-                info!(
-                    "[ra] default IPv6 route via {} on {}",
-                    router_ll,
-                    iface.get_ifname()
-                );
-            }
+        {
+            st.gateway = Some(router_ll);
+            st.installed_routes += 1;
+            info!(
+                "[ra] default IPv6 route via {} on {}",
+                router_ll,
+                iface.get_ifname()
+            );
         }
     }
 
