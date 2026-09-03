@@ -21,7 +21,7 @@ lock = { path = "../kernel-sync" }
 
 # Bare-metal mode on x86_64
 [target.'cfg(target_arch = "x86_64")'.dependencies]
-x86_64 = "0.14.8"
+x86_64 = "0.15"
 
 # Bare-metal mode on riscv64
 [target.'cfg(target_arch = "riscv64")'.dependencies]

@@ -17,7 +17,7 @@
   "disable-redzone": true,
   "frame-pointer": "always",
   "code-model": "kernel",
-  "rustc-abi": "x86-softfloat",
+  "rustc-abi": "softfloat",
   "features": "-mmx,-sse,-sse2,+soft-float",
   "panic-strategy": "abort",
   "stack-probes": { "kind": "inline" }

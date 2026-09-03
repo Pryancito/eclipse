@@ -32,8 +32,9 @@ clap_derive = { git = "https://github.com/clap-rs/clap", tag = "v4.4.18" }
 clap_lex = { git = "https://github.com/clap-rs/clap", tag = "v4.4.18" }
 # `idna_adapter` >= 1.2.x usa edition 2024; fijamos a una versión compatible.
 idna_adapter = { git = "https://github.com/hsivonen/idna_adapter", tag = "v1.1.0" }
-# `x86_64` 0.14.x no compila con Rust nightly moderno (cambios en `Step`).
-x86_64 = { git = "https://github.com/rust-osdev/x86_64", tag = "v0.15.4" }
+# `x86_64` < 0.15.5 no compila con nightly >= 2026-07-10 (`Step` exige
+# `forward_overflowing`/`backward_overflowing`); kernel-hal y drivers piden
+# "0.15", que resuelve a 0.15.5 de crates.io.
 # Cargo 1.74 (toolchain nightly-2023-10-01) no soporta crates con edition 2024.
 # `time-core` >= 0.1.8 usa edition 2024; fijamos `time` a una versión anterior.
 time = { git = "https://github.com/time-rs/time", tag = "v0.3.36" }

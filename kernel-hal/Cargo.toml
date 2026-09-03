@@ -85,7 +85,7 @@ sbi-rt = { version = "0.0.2", features = ["legacy"] }
 # For x86_64
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86 = "0.46"
-x86_64 = "0.14"
+x86_64 = "0.15"
 
 # For aarch64
 [target.'cfg(target_arch = "aarch64")'.dependencies]
@@ -97,5 +97,5 @@ cortex-a = "7.2.0"
 uefi = "0.26"
 raw-cpuid = "9.0"
 x86-smpboot = { git = "https://github.com/rcore-os/x86-smpboot", rev = "1069df3" }
-x2apic = "0.4"
+x2apic = "0.5"
 acpi = "4.1"

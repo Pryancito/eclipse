@@ -869,7 +869,7 @@ impl VMObjectTrait for VMObjectPaged {
             return Err(ZxError::BAD_STATE);
         }
         if inner.cache_policy == CachePolicy::Cached && policy != CachePolicy::Cached {
-            for (_, value) in inner.frames.iter() {
+            for value in inner.frames.values() {
                 kernel_hal::mem::frame_flush(value.frame.paddr());
             }
         }
@@ -970,7 +970,7 @@ impl VMObjectTrait for VMObjectPaged {
         let mut inner = self.get_inner_mut();
         if inner.contiguous {
             inner.contiguous = false;
-            for (_index, frame) in inner.frames.iter_mut() {
+            for frame in inner.frames.values_mut() {
                 frame.pin_count -= 1;
             }
         }

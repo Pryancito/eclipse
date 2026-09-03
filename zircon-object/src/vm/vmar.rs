@@ -1011,7 +1011,7 @@ impl VmAddressRegion {
         let (children, mappings) = {
             let mut guard = self.inner.lock();
             let inner = guard.as_mut().ok_or(ZxError::BAD_STATE)?;
-            let children: Vec<_> = inner.children.drain(..).collect();
+            let children: Vec<_> = core::mem::take(&mut inner.children);
             let mappings = core::mem::take(&mut inner.mappings);
             *guard = None;
             (children, mappings)
@@ -1032,7 +1032,7 @@ impl VmAddressRegion {
         let (children, mappings) = {
             let mut guard = self.inner.lock();
             let inner = guard.as_mut().ok_or(ZxError::BAD_STATE)?;
-            let children: Vec<_> = inner.children.drain(..).collect();
+            let children: Vec<_> = core::mem::take(&mut inner.children);
             let mappings = core::mem::take(&mut inner.mappings);
             (children, mappings)
         };

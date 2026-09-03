@@ -66,8 +66,8 @@ sdl2 = { version = "0.34", optional = true }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 acpi = "4.1"
-x2apic = "0.4"
-x86_64 = "0.14"
+x2apic = "0.5"
+x86_64 = "0.15"
 # The NVIDIA RM shim is x86_64-only (it compiles C objects and links the RM
 # blob for that target); it must not enter the aarch64/riscv64 link.
 nvidia-rm-sys = { path = "../nvidia-rm-sys" }

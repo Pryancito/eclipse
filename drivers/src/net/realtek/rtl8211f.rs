@@ -844,11 +844,7 @@ where
 
         let tx_status = read_volatile((self.base + GETH_TX_DMA_STA) as *mut u32) & 0b111;
         // from u-boot
-        if (tx_status != 0b000) && (tx_status != 0b110) {
-            return false;
-        }
-
-        true
+        tx_status == 0b000 || tx_status == 0b110
     }
 
     pub fn geth_send(&mut self, send_buff: &[u8]) -> Result<i32, &str> {
