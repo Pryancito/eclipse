@@ -242,8 +242,7 @@ const TXDCTL_HTHRESH_1: u32 = 1 << 8;
 const TXDCTL_PTHRESH_1F: u32 = 0x1f;
 const TXDCTL_DMA_BURST: u32 =
     TXDCTL_GRAN | TXDCTL_COUNT_DESC | TXDCTL_WTHRESH_1 | TXDCTL_HTHRESH_1 | TXDCTL_PTHRESH_1F;
-const RXDCTL_DMA_BURST: u32 =
-    TXDCTL_GRAN | TXDCTL_WTHRESH_1 | TXDCTL_HTHRESH_1 | TXDCTL_PTHRESH_1F;
+const RXDCTL_DMA_BURST: u32 = TXDCTL_GRAN | TXDCTL_WTHRESH_1 | TXDCTL_HTHRESH_1 | TXDCTL_PTHRESH_1F;
 
 // RXCSUM — hardware IP/TCP/UDP checksum offload (legacy descriptors).
 const RXCSUM_IPOFLD: u32 = 1 << 8;
@@ -337,6 +336,14 @@ const MII_CR_AUTO_NEG_EN: u16 = 0x1000;
 // Legacy RX descriptor status (LK / 8254x §3.2.3.1)
 const RXD_STAT_DD: u8 = 1 << 0;
 const RXD_STAT_EOP: u8 = 1 << 1;
+/// Ignore checksum indication: the NIC did not validate this frame.
+const RXD_STAT_IXSM: u8 = 1 << 2;
+/// UDP checksum was calculated (and, absent `errors.TCPE`, verified).
+const RXD_STAT_UDPCS: u8 = 1 << 4;
+/// TCP (or UDP on parts that fold both) checksum was calculated.
+const RXD_STAT_TCPCS: u8 = 1 << 5;
+/// IPv4 header checksum was calculated.
+const RXD_STAT_IPCS: u8 = 1 << 6;
 
 // TX descriptor CMD bits
 const TX_CMD_EOP: u8 = 1 << 0;
@@ -464,6 +471,146 @@ fn rx_ipv4_hdr_csum_bad(frame: &[u8]) -> bool {
     sum != 0xffff
 }
 
+/// One's-complement accumulate of `data` as big-endian 16-bit words (an odd
+/// trailing byte is zero-padded on the right, per RFC 1071).
+fn csum_add(mut sum: u32, data: &[u8]) -> u32 {
+    let mut i = 0;
+    while i + 1 < data.len() {
+        sum += ((data[i] as u32) << 8) | data[i + 1] as u32;
+        i += 2;
+    }
+    if i < data.len() {
+        sum += (data[i] as u32) << 8;
+    }
+    sum
+}
+
+/// Does the descriptor say the NIC skipped (part of) checksum validation?
+///
+/// With `RXCSUM.IPOFLD|TUOFLD` the driver tells smoltcp not to verify IPv4 /
+/// TCP / UDP checksums on receive (`Checksum::Tx`). That is only sound for
+/// frames the hardware actually validated, which it reports per-descriptor:
+/// `IPCS` / `TCPCS` / `UDPCS` mean "calculated" (a failure then shows up in
+/// `errors.IPE/TCPE` and the frame is dropped), and `IXSM` means "ignore my
+/// checksum indication". Frames without those bits — IPv6 TCP/UDP on parts
+/// without IPv6 offload, anything the NIC flags IXSM — reach smoltcp with
+/// NO checksum verification at all, so a corrupted segment would be accepted
+/// and delivered to userspace as good data. Linux's `e1000_rx_checksum`
+/// makes exactly this per-packet decision; smoltcp's capabilities are static,
+/// so the driver has to do the fallback verification itself.
+#[inline]
+fn rx_csum_needs_sw_check(status: u8) -> bool {
+    status & RXD_STAT_IXSM != 0
+        || status & RXD_STAT_IPCS == 0
+        || status & (RXD_STAT_TCPCS | RXD_STAT_UDPCS) == 0
+}
+
+/// Software fallback for the checksums the NIC did not validate (see
+/// [`rx_csum_needs_sw_check`]). Returns `true` only when the frame is an
+/// IPv4 / IPv6 TCP or UDP packet whose checksum is definitively wrong.
+/// Anything this cannot parse or verify (ARP, ICMP, fragments, unusual IPv6
+/// extension headers, truncated frames) returns `false` and is left to
+/// smoltcp, exactly as before.
+fn rx_sw_csum_bad(frame: &[u8], status: u8) -> bool {
+    if frame.len() < 14 {
+        return false;
+    }
+    let l4_trusted = status & (RXD_STAT_TCPCS | RXD_STAT_UDPCS) != 0 && status & RXD_STAT_IXSM == 0;
+    match u16::from_be_bytes([frame[12], frame[13]]) {
+        0x0800 => {
+            let ip = &frame[14..];
+            if ip.len() < 20 || ip[0] >> 4 != 4 {
+                return false;
+            }
+            if (status & RXD_STAT_IPCS == 0 || status & RXD_STAT_IXSM != 0)
+                && rx_ipv4_hdr_csum_bad(frame)
+            {
+                return true;
+            }
+            if l4_trusted {
+                return false;
+            }
+            let ihl = (ip[0] & 0x0f) as usize * 4;
+            let total_len = u16::from_be_bytes([ip[2], ip[3]]) as usize;
+            if ihl < 20 || total_len < ihl || total_len > ip.len() {
+                return false;
+            }
+            // Fragments carry no verifiable L4 checksum (MF set or offset != 0).
+            if u16::from_be_bytes([ip[6], ip[7]]) & 0x3fff != 0 {
+                return false;
+            }
+            l4_csum_bad(ip[9], &ip[12..16], &ip[16..20], &ip[ihl..total_len], false)
+        }
+        0x86dd => {
+            if l4_trusted {
+                return false;
+            }
+            let ip = &frame[14..];
+            if ip.len() < 40 || ip[0] >> 4 != 6 {
+                return false;
+            }
+            let end = 40 + u16::from_be_bytes([ip[4], ip[5]]) as usize;
+            if end > ip.len() {
+                return false;
+            }
+            let mut next = ip[6];
+            let mut off = 40;
+            loop {
+                match next {
+                    // Hop-by-hop, routing, destination options: skip.
+                    0 | 43 | 60 => {
+                        if off + 8 > end {
+                            return false;
+                        }
+                        next = ip[off];
+                        off += (ip[off + 1] as usize + 1) * 8;
+                        if off > end {
+                            return false;
+                        }
+                    }
+                    6 | 17 => break,
+                    // Fragment / ESP / AH / unknown: cannot verify here.
+                    _ => return false,
+                }
+            }
+            l4_csum_bad(next, &ip[8..24], &ip[24..40], &ip[off..end], true)
+        }
+        _ => false,
+    }
+}
+
+/// TCP/UDP checksum over the pseudo-header + segment. `l4` must be exactly
+/// the L4 segment as bounded by the IP header (IPv4 total length / IPv6
+/// payload length), so Ethernet padding is never summed.
+fn l4_csum_bad(proto: u8, src: &[u8], dst: &[u8], l4: &[u8], ipv6: bool) -> bool {
+    let seg: &[u8] = match proto {
+        6 if l4.len() >= 20 => l4,
+        17 if l4.len() >= 8 => {
+            let udp_len = u16::from_be_bytes([l4[4], l4[5]]) as usize;
+            if udp_len < 8 || udp_len > l4.len() {
+                return false;
+            }
+            // IPv4 UDP may legitimately carry no checksum (0); IPv6 may not.
+            if !ipv6 && l4[6] == 0 && l4[7] == 0 {
+                return false;
+            }
+            &l4[..udp_len]
+        }
+        _ => return false,
+    };
+    let mut sum = csum_add(0, src);
+    sum = csum_add(sum, dst);
+    // Pseudo-header protocol + length. IPv6 spells the length as 32 bits but
+    // its one's-complement contribution is identical for lengths < 64 KiB.
+    sum += proto as u32;
+    sum += seg.len() as u32;
+    sum = csum_add(sum, seg);
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    sum != 0xffff
+}
+
 // ---------------------------------------------------------------------------
 // E1000eHw — hardware state
 // ---------------------------------------------------------------------------
@@ -512,8 +659,10 @@ pub struct E1000eHw {
     rx_frame_pool: Vec<Vec<u8>>,
 
     pub stats: NetStats,
-    /// Count of received IPv4 frames whose header checksum did not verify —
-    /// i.e. corrupted before smoltcp could parse them. Surfaced in the
+    /// Count of received frames dropped by the driver's own checksum check:
+    /// the software fallback for frames the NIC reported it did not validate
+    /// (see [`rx_csum_needs_sw_check`]), plus — under `E1000E_LOG_VERBOSE` —
+    /// IPv4 headers that failed the diagnostic probe. Surfaced in the
     /// watchdog. Per-instance (not a file-level static) so two e1000e NICs
     /// don't conflate each other's diagnostics.
     rx_csum_bad: u64,
@@ -592,7 +741,7 @@ impl E1000eHw {
             return;
         }
         let cap = buf.capacity();
-        if cap < 64 || cap > BUF_SIZE {
+        if !(64..=BUF_SIZE).contains(&cap) {
             return;
         }
         buf.clear();
@@ -955,7 +1104,14 @@ impl E1000eHw {
         if !self.acquire_swflag() {
             return;
         }
-        for phy_addr in [1u8, 2u8] {
+        // On PCH (82577/8/9, I217/I218/I219) the IEEE MII registers live at
+        // MDIO address 2; address 1 is the MAC-side / wakeup register block
+        // (Linux `e1000_get_phy_addr_for_hv_page`: pages < 768 → 2). Trying
+        // address 1 first on those parts "succeeded" (MDIC_READY, no error)
+        // and broke out of the loop, so the BMCR autoneg restart never
+        // reached the real PHY. Discrete 82574 keeps its PHY at address 1.
+        let phy_addrs: [u8; 2] = if self.is_pch() { [2, 1] } else { [1, 2] };
+        for phy_addr in phy_addrs {
             if let Some(bmcr) = self.mdic_read(phy_addr, 0) {
                 if bmcr == 0xFFFF {
                     continue;
@@ -1604,6 +1760,19 @@ impl E1000eHw {
             None
         };
 
+        // The EOP descriptor's status carries the checksum indication for the
+        // whole frame. Only frames the NIC did NOT validate pay for a software
+        // check here; the common validated IPv4 TCP/UDP case is a bit test.
+        let complete = match complete {
+            Some(pkt) if rx_csum_needs_sw_check(rxd.status) && rx_sw_csum_bad(&pkt, rxd.status) => {
+                self.rx_csum_bad += 1;
+                self.stats.rx_dropped += 1;
+                self.recycle_rx_frame(pkt);
+                None
+            }
+            other => other,
+        };
+
         if let Some(ref pkt) = complete {
             self.stats.rx_packets += 1;
             self.stats.rx_bytes += pkt.len() as u64;
@@ -1734,27 +1903,50 @@ impl E1000eHw {
     /// posted descriptor carries CMD.RS (Report Status). `e1000.rs` uses the
     /// same DD-bit check; this mirrors it instead of trusting TDH.
     fn can_send(&self) -> bool {
-        self.tx_dd_at_tail(/* sync */ true)
+        self.tx_can_post(/* sync */ true)
     }
 
-    /// Read DD at `tx_tail`. When `sync` is true and the ring is write-back,
+    /// Can a frame be posted at `tx_tail`? True when the tail slot itself is
+    /// free (DD) AND the slot after it is free too — the latter is the guard
+    /// slot the hardware needs.
+    ///
+    /// The NIC has no ownership bit of its own: it works descriptors from TDH
+    /// up to (but excluding) TDT and treats `TDH == TDT` as an EMPTY ring.
+    /// Deciding "free" purely per-slot by DD let software post all `NUM_TX`
+    /// slots; the tail then wrapped onto the head and the TDT write handed
+    /// the NIC a value equal to TDH. From its side that ring was empty: the
+    /// posted frames were never fetched, their DD bits never came back, and
+    /// every later send spun to the [`TX_SEND_SPIN_LIMIT`] and dropped — TX
+    /// dead for good. It needs the NIC to be stalled while software posts a
+    /// full lap (link flapping under an upload, flow-control pause), which
+    /// QEMU's synchronous TX never does, so it only bit real hardware.
+    /// Linux's `e1000_desc_unused` bounds in-flight descriptors to
+    /// `count - 1` for the same reason. Requiring `tail + 1` to be free
+    /// guarantees at most `NUM_TX - 1` descriptors are ever outstanding, so
+    /// TDT can never catch TDH from behind.
+    #[inline]
+    fn tx_can_post(&self, sync: bool) -> bool {
+        self.tx_dd_at(self.tx_tail, sync) && self.tx_dd_at((self.tx_tail + 1) % NUM_TX, sync)
+    }
+
+    /// Read DD at slot `idx`. When `sync` is true and the ring is write-back,
     /// invalidate the descriptor line first. UC rings skip the sync entirely —
     /// uncached loads already see hardware write-back, so a spin loop can
     /// re-check with a single volatile load and no fence/clflush.
     #[inline]
-    fn tx_dd_at_tail(&self, sync: bool) -> bool {
+    fn tx_dd_at(&self, idx: usize, sync: bool) -> bool {
         if sync && !self.tx_ring_coherent {
             dma_sync_rx_desc_span(
                 &self.tx_ring,
                 self.tx_ring_coherent,
-                self.tx_tail,
+                idx,
                 1,
                 size_of::<TxDesc>(),
                 DmaSyncDir::FromDevice,
             );
         }
         let ring = self.tx_ring.as_ptr::<TxDesc>();
-        let status = unsafe { read_volatile(&(*ring.add(self.tx_tail)).status) };
+        let status = unsafe { read_volatile(&(*ring.add(idx)).status) };
         status & TX_STAT_DD != 0
     }
 
@@ -1801,16 +1993,11 @@ impl E1000eHw {
             return Err(DeviceError::InvalidParam);
         }
 
-        if !self.link_up {
-            let status = unsafe { mmio_read(self.base, E1000E_STATUS) };
-            if status & STATUS_LU != 0 {
-                self.link_up = true;
-            } else {
-                return Err(DeviceError::NotReady);
-            }
+        if !self.link_up_refreshed() {
+            return Err(DeviceError::NotReady);
         }
 
-        if !self.tx_dd_at_tail(/* sync */ true) {
+        if !self.tx_can_post(/* sync */ true) {
             return Err(DeviceError::NotReady);
         }
 
@@ -2007,6 +2194,38 @@ pub struct E1000eInterface {
     pub ip_addrs: Arc<Mutex<Vec<IpCidr>>>,
 }
 
+/// Unmask the NIC interrupt sources the driver services.
+fn ims_rearm_at(base: usize) {
+    unsafe {
+        compiler_fence(Ordering::SeqCst);
+        mmio_write(base, E1000E_IMS, IMS_REARM);
+        let _ = mmio_read(base, E1000E_IMS);
+        fence(Ordering::SeqCst);
+    }
+}
+
+/// Owns the IRQ bottom-half's "poll pending, IMS masked" state. Dropping it
+/// clears `poll_pending` and then re-arms IMS — in that order, so an IRQ that
+/// fires right after the unmask finds the flag clear and queues a fresh
+/// bottom-half instead of taking `handle_irq`'s "already pending" fast path.
+///
+/// It is moved into the deferred closure so the same release happens whether
+/// the job runs to completion or is dropped unexecuted (evicted from the
+/// deferred-job queue under pressure). Without that, an evicted bottom-half
+/// left the NIC interrupt-masked and `poll_pending` stuck until
+/// `heal_stuck_poll_pending` noticed half a second later.
+struct PollPendingGuard {
+    pending: Arc<AtomicBool>,
+    base: usize,
+}
+
+impl Drop for PollPendingGuard {
+    fn drop(&mut self) {
+        self.pending.store(false, Ordering::SeqCst);
+        ims_rearm_at(self.base);
+    }
+}
+
 impl E1000eInterface {
     pub fn schedule_watchdog(&self, fast: bool) {
         let now = timer_now_as_micros();
@@ -2025,14 +2244,22 @@ impl E1000eInterface {
             return;
         }
         let me = self.clone();
-        crate::utils::deferred_job::push_deferred_job(move || {
-            struct Guard(Arc<AtomicBool>);
-            impl Drop for Guard {
-                fn drop(&mut self) {
-                    self.0.store(false, Ordering::Release);
-                }
+        // The guard is created OUTSIDE the closure and moved in, so it is
+        // dropped — and the flag cleared — even when the job never runs.
+        // `deferred_job.rs` caps its queue at 256 and evicts (drops) entries
+        // unexecuted under pressure; a guard built inside the closure body
+        // only ever ran when the body did, so an evicted watchdog left
+        // `watchdog_job_scheduled` true forever and link supervision dead
+        // for the life of the kernel.
+        struct Guard(Arc<AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
             }
-            let _g = Guard(Arc::clone(&me.watchdog_job_scheduled));
+        }
+        let guard = Guard(Arc::clone(&self.watchdog_job_scheduled));
+        crate::utils::deferred_job::push_deferred_job(move || {
+            let _g = guard;
             let (link_changed, link_up) = {
                 let mut hw = me.driver.hw.lock();
                 let changed = unsafe { hw.watchdog_tick() };
@@ -2076,12 +2303,7 @@ impl E1000eInterface {
     }
 
     fn ims_rearm(&self) {
-        unsafe {
-            compiler_fence(Ordering::SeqCst);
-            mmio_write(self.base, E1000E_IMS, IMS_REARM);
-            let _ = mmio_read(self.base, E1000E_IMS);
-            fence(Ordering::SeqCst);
-        }
+        ims_rearm_at(self.base);
     }
 
     /// NIC poll; `irq_icr` carries ICR bits when invoked from the deferred IRQ bottom-half.
@@ -2191,23 +2413,28 @@ impl Scheme for E1000eInterface {
             fence(Ordering::SeqCst);
         }
 
-        let poll_pending = self.poll_pending.clone();
+        let guard = PollPendingGuard {
+            pending: self.poll_pending.clone(),
+            base: self.base,
+        };
         let me = self.clone();
         // Front of the deferred queue: NIC bottom-half must run before a
-        // backlog of lower-urgency jobs can age it out of the 256-cap FIFO
-        // (that eviction is what `heal_stuck_poll_pending` recovers from).
+        // backlog of lower-urgency jobs can age it out of the 256-cap FIFO.
+        // If it is aged out anyway, dropping `guard` with the closure still
+        // clears `poll_pending` and re-arms IMS (see `PollPendingGuard`);
+        // `heal_stuck_poll_pending` remains as the belt-and-braces fallback.
         crate::utils::deferred_job::push_deferred_job_front(move || {
+            let guard = guard;
             if icr & ICR_LSC != 0 {
                 me.schedule_watchdog(true);
             }
             let _ = me.poll_with_irq_hint(icr);
-            // Clear poll_pending BEFORE re-arming IMS so that any IRQ that fires
-            // after ims_rearm() finds poll_pending=false and properly queues a new
-            // deferred job.  With IMS masked throughout the poll, new packets
-            // accumulate in ICR; re-arming causes the NIC to re-assert the IRQ for
-            // those accumulated bits.
-            poll_pending.store(false, Ordering::SeqCst);
-            me.ims_rearm();
+            // Clears poll_pending BEFORE re-arming IMS so that any IRQ that
+            // fires after the unmask finds poll_pending=false and properly
+            // queues a new deferred job. With IMS masked throughout the poll,
+            // new packets accumulate in ICR; re-arming causes the NIC to
+            // re-assert the IRQ for those accumulated bits.
+            drop(guard);
         });
     }
 }
@@ -2527,12 +2754,22 @@ impl phy::TxToken for E1000eTxToken {
         // reach the NIC before we wait on DD, or a full ring never drains.
         hw.flush_tx_doorbell();
 
+        // Link down: nothing will complete, so waiting is pointless. Bail now
+        // rather than spinning the full TX_SEND_SPIN_LIMIT with the hw lock
+        // (IRQs off) held — `post_tx_frame` re-read STATUS by MMIO on every
+        // one of those iterations, several ms per attempted frame under QEMU.
+        // Not counted in `tx_dropped`: that counter means "lost with the link
+        // up", the deadlock signature the watchdog reports.
+        if !hw.link_up_refreshed() {
+            return Err(smoltcp::Error::Exhausted);
+        }
+
         let mut tries = 0usize;
         loop {
             // Cheap DD poll: UC rings skip dma_sync; WB re-syncs only every
             // TX_SPIN_SYNC_INTERVAL iterations (stale DD=0 is a safe miss).
-            let sync = !hw.tx_ring_coherent && (tries == 0 || tries % TX_SPIN_SYNC_INTERVAL == 0);
-            if hw.tx_dd_at_tail(sync) {
+            let sync = !hw.tx_ring_coherent && tries.is_multiple_of(TX_SPIN_SYNC_INTERVAL);
+            if hw.tx_can_post(sync) {
                 match hw.post_tx_frame(buf) {
                     Ok(()) => {
                         // Leave TDT dirty so subsequent tokens in this burst
@@ -2561,6 +2798,17 @@ impl phy::TxToken for E1000eTxToken {
 // ---------------------------------------------------------------------------
 
 impl E1000eHw {
+    /// `link_up`, refreshed from STATUS.LU only while it is still false (a
+    /// link-down transition is the watchdog's job). Shared by the TX paths so
+    /// a frame handed to us with the link down is refused up front instead
+    /// of spinning on a ring that will never drain.
+    fn link_up_refreshed(&mut self) -> bool {
+        unsafe {
+            self.ensure_rx_armed_if_link_up();
+        }
+        self.link_up
+    }
+
     pub unsafe fn ensure_rx_armed_if_link_up(&mut self) {
         // Once link is already known up, this can only ever set link_up=true
         // again — a no-op — so skip the MMIO STATUS read. This runs on every
@@ -3037,6 +3285,174 @@ mod rx_ring_tests {
         reg_write(hw.base, E1000E_RDH, ((slot + 1) % NUM_RX) as u32);
     }
 
+    /// Like `hw_deliver`, but with explicit checksum-indication status bits
+    /// (IXSM / IPCS / TCPCS / UDPCS) or'd in, to model what the NIC did or
+    /// did not validate for this frame.
+    fn hw_deliver_with_status(hw: &E1000eHw, slot: usize, data: &[u8], status: u8) {
+        hw_deliver(hw, slot, data);
+        unsafe {
+            let d = &mut *hw.rx_ring.as_ptr::<RxDesc>().add(slot);
+            d.status |= status;
+        }
+    }
+
+    /// Ethernet + IPv4 + UDP frame with a correct UDP and IP header checksum.
+    fn ipv4_udp_frame(payload: &[u8]) -> Vec<u8> {
+        let mut f = vec![0u8; 14 + 20 + 8 + payload.len()];
+        f[0..6].copy_from_slice(&[0x52, 0x54, 0, 0, 0, 1]);
+        f[6..12].copy_from_slice(&[0x52, 0x54, 0, 0, 0, 2]);
+        f[12..14].copy_from_slice(&[0x08, 0x00]);
+        let ip = &mut f[14..];
+        ip[0] = 0x45;
+        let total = (20 + 8 + payload.len()) as u16;
+        ip[2..4].copy_from_slice(&total.to_be_bytes());
+        ip[8] = 64;
+        ip[9] = 17;
+        ip[12..16].copy_from_slice(&[10, 0, 2, 2]);
+        ip[16..20].copy_from_slice(&[10, 0, 2, 15]);
+        let udp_len = (8 + payload.len()) as u16;
+        ip[20..22].copy_from_slice(&1234u16.to_be_bytes());
+        ip[22..24].copy_from_slice(&5678u16.to_be_bytes());
+        ip[24..26].copy_from_slice(&udp_len.to_be_bytes());
+        ip[28..].copy_from_slice(payload);
+        // UDP checksum
+        let mut sum = csum_add(0, &ip[12..20]);
+        sum += 17 + udp_len as u32;
+        sum = csum_add(sum, &ip[20..]);
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        let mut c = !(sum as u16);
+        if c == 0 {
+            c = 0xffff;
+        }
+        ip[26..28].copy_from_slice(&c.to_be_bytes());
+        // IPv4 header checksum
+        let mut sum = csum_add(0, &ip[..20]);
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        let c = !(sum as u16);
+        ip[10..12].copy_from_slice(&c.to_be_bytes());
+        f
+    }
+
+    /// Ethernet + IPv6 + TCP frame (no options) with a correct TCP checksum.
+    fn ipv6_tcp_frame(payload: &[u8]) -> Vec<u8> {
+        let mut f = vec![0u8; 14 + 40 + 20 + payload.len()];
+        f[0..6].copy_from_slice(&[0x52, 0x54, 0, 0, 0, 1]);
+        f[6..12].copy_from_slice(&[0x52, 0x54, 0, 0, 0, 2]);
+        f[12..14].copy_from_slice(&[0x86, 0xdd]);
+        let ip = &mut f[14..];
+        ip[0] = 0x60;
+        let plen = (20 + payload.len()) as u16;
+        ip[4..6].copy_from_slice(&plen.to_be_bytes());
+        ip[6] = 6;
+        ip[7] = 64;
+        ip[8] = 0xfe;
+        ip[9] = 0x80;
+        ip[23] = 1;
+        ip[24] = 0xfe;
+        ip[25] = 0x80;
+        ip[39] = 2;
+        let tcp = &mut ip[40..];
+        tcp[0..2].copy_from_slice(&443u16.to_be_bytes());
+        tcp[2..4].copy_from_slice(&40000u16.to_be_bytes());
+        tcp[12] = 0x50; // data offset 5
+        tcp[13] = 0x18; // PSH|ACK
+        tcp[14..16].copy_from_slice(&1024u16.to_be_bytes());
+        tcp[20..].copy_from_slice(payload);
+        let mut sum = csum_add(0, &ip[8..40]);
+        sum += 6 + plen as u32;
+        sum = csum_add(sum, &ip[40..]);
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        let c = !(sum as u16);
+        ip[56..58].copy_from_slice(&c.to_be_bytes());
+        f
+    }
+
+    #[test]
+    fn rx_sw_csum_accepts_good_and_rejects_corrupt_frames() {
+        let payload = b"hello e1000e checksum offload";
+        let v4 = ipv4_udp_frame(payload);
+        let v6 = ipv6_tcp_frame(payload);
+        // NIC validated nothing (bare DD|EOP): software must verify.
+        assert!(!rx_sw_csum_bad(&v4, 0), "good IPv4/UDP must pass");
+        assert!(!rx_sw_csum_bad(&v6, 0), "good IPv6/TCP must pass");
+        let mut bad4 = v4.clone();
+        bad4[14 + 28 + 3] ^= 0x40; // UDP payload byte
+        assert!(
+            rx_sw_csum_bad(&bad4, 0),
+            "corrupt IPv4/UDP payload must fail"
+        );
+        let mut bad4h = v4.clone();
+        bad4h[14 + 8] = 1; // TTL: breaks the IP header checksum only
+        assert!(rx_sw_csum_bad(&bad4h, 0), "corrupt IPv4 header must fail");
+        assert!(
+            !rx_sw_csum_bad(&bad4h, RXD_STAT_IPCS | RXD_STAT_UDPCS),
+            "a frame the NIC reports as validated is trusted (errors byte would have dropped it)"
+        );
+        let mut bad6 = v6.clone();
+        bad6[14 + 40 + 20 + 5] ^= 0x01;
+        assert!(
+            rx_sw_csum_bad(&bad6, 0),
+            "corrupt IPv6/TCP payload must fail"
+        );
+        assert!(
+            !rx_sw_csum_bad(&bad6, RXD_STAT_TCPCS),
+            "TCPCS set: the NIC already verified it"
+        );
+        assert!(
+            rx_sw_csum_bad(&bad6, RXD_STAT_TCPCS | RXD_STAT_IXSM),
+            "IXSM overrides TCPCS: the NIC says ignore its indication"
+        );
+        // IPv4 UDP with checksum 0 (no checksum) is legal and must not be dropped.
+        let mut nocsum = v4.clone();
+        nocsum[14 + 26] = 0;
+        nocsum[14 + 27] = 0;
+        assert!(!rx_sw_csum_bad(&nocsum, 0));
+        // Fragments and non-IP frames are never rejected here.
+        let mut frag = v4.clone();
+        frag[14 + 6] = 0x20; // MF (header checksum now stale: say the NIC validated it)
+        assert!(!rx_sw_csum_bad(&frag, RXD_STAT_IPCS));
+        let mut arp = v4.clone();
+        arp[12] = 0x08;
+        arp[13] = 0x06;
+        assert!(!rx_sw_csum_bad(&arp, 0));
+        // Short / truncated frames must not panic.
+        assert!(!rx_sw_csum_bad(&v4[..30], 0));
+        assert!(!rx_sw_csum_bad(&v6[..50], 0));
+        assert!(!rx_sw_csum_bad(&[], 0));
+    }
+
+    #[test]
+    fn rx_drops_unvalidated_corrupt_frame_and_keeps_validated_ones() {
+        let mut hw = make_hw();
+        let good = ipv6_tcp_frame(b"payload-0");
+        let mut corrupt = ipv6_tcp_frame(b"payload-1");
+        corrupt[14 + 40 + 20 + 2] ^= 0x80;
+        // Slot 0: NIC did not validate (no TCPCS) and the frame is corrupt → drop.
+        hw_deliver_with_status(&hw, 0, &corrupt, 0);
+        // Slot 1: same corrupt frame, but the NIC claims it validated it → pass
+        // (on real hardware errors.TCPE would already have dropped it).
+        hw_deliver_with_status(&hw, 1, &corrupt, RXD_STAT_TCPCS);
+        // Slot 2: unvalidated but good → pass.
+        hw_deliver_with_status(&hw, 2, &good, 0);
+        let first = hw.receive().expect("slot 1 frame");
+        assert_eq!(first, corrupt);
+        let second = hw.receive().expect("slot 2 frame");
+        assert_eq!(second, good);
+        assert!(hw.receive().is_none());
+        assert_eq!(hw.stats.rx_packets, 2);
+        assert_eq!(hw.stats.rx_dropped, 1);
+        assert_eq!(hw.rx_csum_bad, 1);
+        // The dropped slot was still recycled: RDT advances past all three.
+        hw.flush_rx_doorbell();
+        assert_eq!(reg_read(hw.base, E1000E_RDT) as usize, 2);
+    }
+
     fn pkt(seed: u8, len: usize) -> Vec<u8> {
         (0..len)
             .map(|i| seed.wrapping_add(i as u8).wrapping_mul(31))
@@ -3271,49 +3687,68 @@ mod tx_ring_tests {
     #[test]
     fn tx_slot_stays_owned_by_hw_until_dd_write_back() {
         let mut hw = make_hw();
-        // Fill a full lap so tx_tail wraps back around to slot 0 — the very
-        // descriptor the first send() below posts into.
-        for i in 0..super::NUM_TX {
+        // Post every slot but the guard, so tx_tail sits on the last free
+        // descriptor and the slot after it (0) is the oldest in flight.
+        for i in 0..super::NUM_TX - 1 {
             hw.send(&pkt(i as u8, 64))
                 .unwrap_or_else(|_| panic!("slot {} should be free on the first lap", i));
         }
-        // tx_tail is back at slot 0. Hardware has not completed its DMA yet:
-        // the descriptor's DD bit is still clear (send() clears it before
-        // posting), so reusing it must be refused — a stale TDH read would
-        // have let this through even though the NIC might still be reading
-        // the buffer.
+        // Hardware has not completed its DMA yet: slot 0's DD bit is still
+        // clear (send() clears it before posting), so the ring is full and a
+        // post must be refused — a stale TDH read would have let this
+        // through even though the NIC might still be reading the buffer.
         assert!(
             !hw.can_send(),
-            "slot 0 must stay owned by hardware until DD is written back"
+            "ring must stay full until slot 0's DD is written back"
         );
         assert!(hw.send(&pkt(0xFF, 64)).is_err());
 
         // Hardware finishes the DMA and writes DD back.
         hw_complete_tx(&hw, 0);
-        assert!(hw.can_send(), "DD write-back must free the slot");
-        hw.send(&pkt(0xEE, 64)).expect("slot reusable after DD");
+        assert!(hw.can_send(), "DD write-back must free a slot");
+        hw.send(&pkt(0xEE, 64)).expect("post possible after DD");
+        // tx_tail wrapped onto slot 0 (free), but slot 1 is still in flight:
+        // it is now the guard, so the ring is full again.
+        assert!(
+            !hw.can_send(),
+            "slot 1 still owned by hardware — guard holds"
+        );
     }
 
     #[test]
-    fn tx_fills_the_full_ring_with_no_guard_slot() {
-        // Unlike the old TDH-arithmetic scheme, DD-bit ownership is decided
-        // per-slot, so there is no head==tail ambiguity requiring a reserved
-        // guard descriptor — the whole ring (NUM_TX, not NUM_TX - 1) can be
-        // posted before hardware needs to complete anything.
+    fn tx_keeps_one_guard_slot_so_tdt_never_meets_tdh() {
+        // The NIC works descriptors from TDH up to (excluding) TDT and reads
+        // TDH == TDT as "ring empty". Per-slot DD ownership alone would let
+        // software post all NUM_TX slots and then write TDT == TDH: the NIC
+        // would see nothing to send, those DD bits would never come back and
+        // TX would be dead for good. At most NUM_TX - 1 may be outstanding.
         let mut hw = make_hw();
-        for i in 0..super::NUM_TX {
+        for i in 0..super::NUM_TX - 1 {
             hw.send(&pkt(i as u8, 32))
                 .unwrap_or_else(|_| panic!("slot {} should be free", i));
         }
-        assert!(!hw.can_send(), "ring is fully posted, no free slots left");
+        assert!(!hw.can_send(), "only the guard slot is left");
         assert!(hw.send(&pkt(0xAA, 32)).is_err());
+        assert_eq!(
+            reg_read(hw.base, super::E1000E_TDT) as usize,
+            super::NUM_TX - 1,
+            "TDT stops one short of wrapping onto TDH"
+        );
+        assert_ne!(
+            reg_read(hw.base, super::E1000E_TDT),
+            reg_read(hw.base, super::E1000E_TDH),
+            "a full ring must never look empty to the NIC"
+        );
 
-        // Complete slot 0 (the oldest, and the next one `tx_tail` wraps to)
-        // and confirm the ring recovers.
+        // Complete slot 0 (the oldest) and confirm the ring recovers: the
+        // guard moves to slot 1.
         hw_complete_tx(&hw, 0);
-        assert!(hw.can_send(), "completing the oldest slot frees it up");
+        assert!(hw.can_send(), "completing the oldest slot frees one up");
         hw.send(&pkt(0xBB, 32))
             .expect("ring recovers after completion");
+        assert!(!hw.can_send());
+        hw_complete_tx(&hw, 1);
+        assert!(hw.can_send());
     }
 
     #[test]
@@ -3322,10 +3757,11 @@ mod tx_ring_tests {
         let total = super::NUM_TX * 3 + 11;
         for i in 0..total {
             let slot = i % super::NUM_TX;
-            // Simulate the NIC keeping up: complete each slot right after
-            // it's posted, before it comes back around the ring.
-            if i >= super::NUM_TX {
-                hw_complete_tx(&hw, slot);
+            // Simulate the NIC keeping up: before posting into `slot`, the
+            // NIC has completed the slot after it (the oldest still in
+            // flight), so the guard requirement is met.
+            if i + 1 >= super::NUM_TX {
+                hw_complete_tx(&hw, (i + 1) % super::NUM_TX);
             }
             hw.send(&pkt(i as u8, 40))
                 .unwrap_or_else(|_| panic!("send {} (slot {}) should succeed", i, slot));
@@ -3359,11 +3795,11 @@ mod tx_ring_tests {
         // requiring a FromDevice sync — the spin path relies on this.
         let mut hw = make_hw();
         hw.tx_ring_coherent = true;
-        assert!(hw.tx_dd_at_tail(false), "init DD visible without sync");
+        assert!(hw.tx_can_post(false), "init DD visible without sync");
         hw.send(&pkt(1, 32)).unwrap();
         // Tail advanced to slot 1, which still has the init-time DD bit.
         assert!(hw.can_send());
-        assert!(hw.tx_dd_at_tail(false), "UC free slot visible without sync");
+        assert!(hw.tx_can_post(false), "UC free slot visible without sync");
     }
 }
 
