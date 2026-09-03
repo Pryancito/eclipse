@@ -864,7 +864,7 @@ fn build_eld_from_base_edid(edid: &[u8], display_id: u32, is_dp: bool) -> [u8; 9
     eld[19] = edid[11];
     let sad_off = 20 + mnl as usize;
     eld[sad_off..sad_off + 3].copy_from_slice(&sad);
-    eld[2] = ((16 + mnl + sad_count * 3 + 3) / 4) as u8;
+    eld[2] = (16 + mnl + sad_count * 3).div_ceil(4) as u8;
     eld
 }
 
@@ -3028,8 +3028,9 @@ impl NvidiaGpu {
             }
             let _ = write!(
                 report,
-                "[hdmi-audio] GOP {}: SOR{} head{} {} ELD+PD+{}unmute (no GSP, like nouveau)",
-                alloc::format!("{:02x}:{:02x}.0", self.pci_bus, self.pci_device),
+                "[hdmi-audio] GOP {:02x}:{:02x}.0: SOR{} head{} {} ELD+PD+{}unmute (no GSP, like nouveau)",
+                self.pci_bus,
+                self.pci_device,
                 sor,
                 head,
                 if is_hdmi { "HDMI" } else { "DP" },
@@ -7127,13 +7128,8 @@ impl DrmScheme for NvidiaGpu {
             |m| m.gem_handle == handle,
             true,
         );
-        let status = match *self.rm_device_instance.lock() {
-            Some(device_instance) => Some(nvidia_rm_sys::rm_init::gem_free(
-                device_instance,
-                obj.h_memory,
-            )),
-            None => None,
-        };
+        let status = (*self.rm_device_instance.lock())
+            .map(|device_instance| nvidia_rm_sys::rm_init::gem_free(device_instance, obj.h_memory));
         log::info!(
             "[nouveau-uapi] GEM_CLOSE handle={} h_memory={:#010x} -> gem_free status={:?}",
             handle,
@@ -9382,7 +9378,8 @@ impl NvidiaGpu {
                     // which only needs a rising clock, so a CPU-derived
                     // monotonic (safe -- no BAR0 read) is an honest stand-in.
                     nv::NOUVEAU_GETPARAM_PTIMER_TIME => {
-                        (unsafe { crate::bus::drivers_timer_now_as_micros() } as u64) * 1000
+                        let now_us = unsafe { crate::bus::drivers_timer_now_as_micros() };
+                        now_us * 1000
                     }
                     // This driver's EXEC ioctl caps at 64 pushbuffers per call.
                     nv::NOUVEAU_GETPARAM_EXEC_PUSH_MAX => 64,
@@ -10537,7 +10534,7 @@ impl NvidiaGpu {
                         // klog line per ctx per boot.
                         static CLIENT_EXEC_OK: core::sync::atomic::AtomicU32 =
                             core::sync::atomic::AtomicU32::new(0);
-                        if ctx_idx >= 1 && ctx_idx < 32 {
+                        if (1..32).contains(&ctx_idx) {
                             let bit = 1u32 << ctx_idx;
                             if CLIENT_EXEC_OK.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
                                 crate::klog_info!(

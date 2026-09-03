@@ -24,9 +24,14 @@ pub use nvidia::{
 /// directly) can hand the RM a REAL per-thread identity at boot -- see the
 /// provider's doc in os_interface.rs for the lock-reentrancy bug a constant
 /// id causes.
+#[cfg(target_arch = "x86_64")]
 pub fn set_rm_thread_id_provider(f: fn() -> u64) {
     nvidia_rm_sys::os_interface::set_thread_id_provider(f);
 }
+/// No RM off x86_64 (`nvidia-rm-sys` is an x86_64-only dependency of this
+/// crate, see Cargo.toml), so there is nobody to hand the provider to.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_rm_thread_id_provider(_f: fn() -> u64) {}
 pub use uefi::UefiDisplay;
 
 /// Re-push ELD and unmute HDMI/DP audio on the GPU driving the monitor.

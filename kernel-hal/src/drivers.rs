@@ -476,6 +476,26 @@ mod drivers_ffi_libos {
             klog_emit(priority, s);
         }
     }
+
+    // `zcore_drivers::utils::dma::DmaRegion` (used by every PCI NIC/storage
+    // driver, all of which are linked even though no PCI bus exists under
+    // libos) references these in its alloc/Drop glue. Back them with the
+    // hosted frame allocator; no UC-remap bookkeeping applies here.
+    use crate::{PhysAddr, KHANDLER};
+    #[no_mangle]
+    extern "C" fn drivers_dma_alloc(pages: usize) -> PhysAddr {
+        KHANDLER
+            .frame_alloc_contiguous(pages, 0)
+            .expect("drivers_dma_alloc (libos): out of contiguous frames")
+    }
+
+    #[no_mangle]
+    extern "C" fn drivers_dma_dealloc(paddr: PhysAddr, pages: usize) -> i32 {
+        for i in 0..pages {
+            KHANDLER.frame_dealloc(paddr + i * crate::PAGE_SIZE);
+        }
+        0
+    }
 }
 
 #[cfg(not(feature = "libos"))]

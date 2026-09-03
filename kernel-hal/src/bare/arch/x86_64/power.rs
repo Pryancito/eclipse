@@ -264,8 +264,9 @@ unsafe fn pci_cfg_read32(bus: u8, dev: u8, func: u8, off: u8) -> u32 {
 unsafe fn amd_smn_read(smn_addr: u32) -> u32 {
     use x86_64::instructions::interrupts;
     use zcore_drivers::io::{Io, Pmio};
-    let index = 0x8000_0000u32 | (0x18 << 11) | (0 << 8) | 0x60;
-    let data = 0x8000_0000u32 | (0x18 << 11) | (0 << 8) | 0x64;
+    // Bus 0, device 0x18, function 0 (the `0 << 8` function field is elided).
+    let index = 0x8000_0000u32 | (0x18 << 11) | 0x60;
+    let data = 0x8000_0000u32 | (0x18 << 11) | 0x64;
     interrupts::without_interrupts(|| {
         // index register (0x60)
         Pmio::<u32>::new(0xCF8).write(index);
@@ -364,7 +365,8 @@ unsafe fn enable_hwp(has_epp: bool) -> (u8, u8, bool) {
     // EPP only exists when CPUID.06H:EAX[10] is set; otherwise bits [31:24] are
     // reserved-zero and IA32_ENERGY_PERF_BIAS provides the bias instead.
     let epp = if has_epp { EPP_PREF } else { 0 };
-    let request = (lowest as u64) | ((max as u64) << 8) | (0u64 << 16) | (epp << 24);
+    // Desired[23:16] = 0 (autonomous) is elided from the OR chain.
+    let request = (lowest as u64) | ((max as u64) << 8) | (epp << 24);
     Msr::new(IA32_HWP_REQUEST).write(request);
 
     (lowest, max, cap)
@@ -390,7 +392,7 @@ unsafe fn enable_amd_cppc() -> (u8, u8, bool) {
 
     // REQUEST: Max[7:0]=max, Min[15:8]=lowest, Desired[23:16]=0 (autonomous),
     // EPP[31:24]. Out-of-range fields are clamped by hardware to [lowest,highest].
-    let request = (max as u64) | ((lowest as u64) << 8) | (0u64 << 16) | (EPP_PREF << 24);
+    let request = (max as u64) | ((lowest as u64) << 8) | (EPP_PREF << 24);
     Msr::new(MSR_AMD_CPPC_REQUEST).write(request);
 
     (lowest, max, cap)
@@ -727,11 +729,11 @@ unsafe fn governor_program_ceiling(mech: u8, lowest: u8, max: u8) {
             } else {
                 0
             };
-            let request = (lowest as u64) | ((max as u64) << 8) | (0u64 << 16) | (epp << 24);
+            let request = (lowest as u64) | ((max as u64) << 8) | (epp << 24);
             Msr::new(IA32_HWP_REQUEST).write(request);
         }
         2 => {
-            let request = (max as u64) | ((lowest as u64) << 8) | (0u64 << 16) | (EPP_PREF << 24);
+            let request = (max as u64) | ((lowest as u64) << 8) | (EPP_PREF << 24);
             Msr::new(MSR_AMD_CPPC_REQUEST).write(request);
         }
         _ => {}

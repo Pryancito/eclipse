@@ -411,14 +411,19 @@ pub trait DisplayScheme: Scheme {
                 && crate::utils::dma_sync::has_nt_blit()
                 && last_src <= src.len()
                 && last_dst <= buf.len()
-                && crate::utils::dma_sync::nt_store_rows(
-                    unsafe { buf.as_mut_ptr().add(dst_base) },
-                    pitch,
-                    src.as_ptr() as *const u8,
-                    src_stride * 4,
-                    width_bytes,
-                    h,
-                )
+                // SAFETY: `last_src`/`last_dst` were bounds-checked against
+                // `src`/`buf` just above, and the framebuffer never aliases
+                // the source pixel buffer.
+                && unsafe {
+                    crate::utils::dma_sync::nt_store_rows(
+                        buf.as_mut_ptr().add(dst_base),
+                        pitch,
+                        src.as_ptr() as *const u8,
+                        src_stride * 4,
+                        width_bytes,
+                        h,
+                    )
+                }
             {
                 return;
             }

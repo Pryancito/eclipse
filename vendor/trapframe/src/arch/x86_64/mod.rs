@@ -71,6 +71,11 @@ fn init_fpu() {
     }
 }
 
+/// Set up the BSP's GDT/TSS, IDT and FPU state and install the trap handlers.
+///
+/// # Safety
+/// Must run once, early, with interrupts disabled, before any trap can be
+/// taken on this CPU; it replaces the descriptor tables the CPU is using.
 #[cfg(any(target_os = "none", target_os = "uefi"))]
 pub unsafe fn init() {
     x86_64::instructions::interrupts::disable();
@@ -80,6 +85,12 @@ pub unsafe fn init() {
     syscall::init();
 }
 
+/// Per-AP counterpart of [`init`]: loads the shared IDT and this CPU's own
+/// GDT/TSS.
+///
+/// # Safety
+/// Same contract as [`init`], and only after `init` has run on the BSP so
+/// the shared IDT exists.
 #[cfg(any(target_os = "none", target_os = "uefi"))]
 pub unsafe fn init_ap() {
     x86_64::instructions::interrupts::disable();

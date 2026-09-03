@@ -817,7 +817,7 @@ fn clock_khz_for_refresh_mhz(htotal: u32, vtotal: u32, refresh_mhz: u32) -> u32 
         return 0;
     }
     let target = refresh_mhz as u64 * vtotal as u64 - (vtotal as u64 / 2);
-    let clock = (target.saturating_mul(htotal as u64) + 999_999) / 1_000_000;
+    let clock = target.saturating_mul(htotal as u64).div_ceil(1_000_000);
     clock.max(1) as u32
 }
 
@@ -1237,10 +1237,7 @@ impl INode for DrmDev {
             // has no level filter, no rate limit and goes straight out the
             // UART -- an unthrottled line here would let a client that retries
             // in a loop flood the serial console and stall the boot.
-            static REFUSAL_LOGGED: [AtomicBool; 256] = {
-                const F: AtomicBool = AtomicBool::new(false);
-                [F; 256]
-            };
+            static REFUSAL_LOGGED: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
             let nr = (cmd & 0xff) as usize;
             if !REFUSAL_LOGGED[nr].swap(true, Ordering::Relaxed) {
                 kernel_hal::klog_info!(
@@ -1311,10 +1308,8 @@ impl INode for DrmDev {
                     // answer it carries (did a client reach VERSION, and which
                     // driver is behind the node) is the same every time, so the
                     // first line per node is the whole diagnostic.
-                    static VERSION_LOGGED: [AtomicBool; 256] = {
-                        const F: AtomicBool = AtomicBool::new(false);
-                        [F; 256]
-                    };
+                    static VERSION_LOGGED: [AtomicBool; 256] =
+                        [const { AtomicBool::new(false) }; 256];
                     let slot = (self.minor & 0xff) as usize;
                     if !VERSION_LOGGED[slot].swap(true, Ordering::Relaxed) {
                         match drm::get_primary_driver() {
@@ -2001,11 +1996,10 @@ impl INode for DrmDev {
                 // linux-object's own CREATE_DUMB/PRIME table first; a miss
                 // there might still be a driver-private handle (e.g.
                 // nouveau-uAPI GEM_NEW) the driver itself keeps track of.
-                if drm::gem_close(handle) {
-                    Ok(0)
-                } else if drm::get_primary_driver()
-                    .map(|d| d.nouveau_gem_close(handle))
-                    .unwrap_or(false)
+                if drm::gem_close(handle)
+                    || drm::get_primary_driver()
+                        .map(|d| d.nouveau_gem_close(handle))
+                        .unwrap_or(false)
                 {
                     Ok(0)
                 } else {

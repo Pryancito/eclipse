@@ -561,7 +561,7 @@ static HELD_LOCKS: [HeldSlot; STASH_CPUS] =
 #[track_caller]
 fn reentry_check(lock_ptr: usize) {
     let held = unsafe { &*HELD_LOCKS[stash_cpu()].0.get() };
-    if !held.iter().any(|&p| p == lock_ptr) {
+    if !held.contains(&lock_ptr) {
         return;
     }
     let loc = core::panic::Location::caller();

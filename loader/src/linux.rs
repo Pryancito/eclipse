@@ -760,7 +760,7 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                     }
                 };
                 describe("pc", pc);
-                describe("fault-addr", vaddr as usize);
+                describe("fault-addr", vaddr);
                 // NOT_FOUND means no VmMapping covers `vaddr`. Show the
                 // neighbours so the next occurrence says WHY: a region that
                 // ends just short of the address (created too small, or cut
@@ -789,12 +789,11 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                             unsafe { core::ptr::read_volatile(kv as *const u8) }
                         })
                     };
-                    if let Some((rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp, r8to11)) = thread
+                    if let Ok((rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp, r8to11)) = thread
                         .with_context(|ctx| {
                             let g = ctx.general();
                             (g.rax, g.rbx, g.rcx, g.rdx, g.rsi, g.rdi, g.rbp, g.rsp, g.r8)
                         })
-                        .ok()
                     {
                         error!(
                             "[crash] pid={} pc={:#x} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x} r8={:#x}",

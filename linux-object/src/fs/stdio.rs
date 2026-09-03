@@ -1919,14 +1919,17 @@ impl INode for Stdin {
                     let vmin = termios.c_cc[VMIN];
                     let vtime = termios.c_cc[VTIME];
                     drop(termios);
-                    if noncanon && vmin == 0 && vtime > 0 && !this.stdin.can_read() {
-                        if this.stdin.vtime_deadline_ns.load(Ordering::Acquire) == 0 {
-                            let now = kernel_hal::timer::timer_now().as_nanos() as u64;
-                            let new_dl = now.saturating_add((vtime as u64) * 100_000_000);
-                            this.stdin
-                                .vtime_deadline_ns
-                                .store(new_dl, Ordering::Release);
-                        }
+                    if noncanon
+                        && vmin == 0
+                        && vtime > 0
+                        && !this.stdin.can_read()
+                        && this.stdin.vtime_deadline_ns.load(Ordering::Acquire) == 0
+                    {
+                        let now = kernel_hal::timer::timer_now().as_nanos() as u64;
+                        let new_dl = now.saturating_add((vtime as u64) * 100_000_000);
+                        this.stdin
+                            .vtime_deadline_ns
+                            .store(new_dl, Ordering::Release);
                     }
                 }
 

@@ -133,7 +133,7 @@ pub(super) const EXT_CANARY: u64 = 0x4558_5443_414e_5259; // "EXTCANRY"
 /// held for every Rust release and this is diagnostic output.
 pub fn vtable_info(vtable: usize) -> Option<(usize, usize, usize)> {
     // Kernel-half, word-aligned, and not obviously a small integer.
-    if vtable < 0xffff_0000_0000_0000 || vtable % core::mem::align_of::<usize>() != 0 {
+    if vtable < 0xffff_0000_0000_0000 || !vtable.is_multiple_of(core::mem::align_of::<usize>()) {
         return None;
     }
     let words = vtable as *const usize;

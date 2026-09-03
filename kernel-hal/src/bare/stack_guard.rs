@@ -385,7 +385,10 @@ fn install(guard_base: usize, guard_size: usize) -> bool {
         }
         false
     };
-    if guard_size == 0 || guard_base % PAGE_SIZE != 0 || guard_size % PAGE_SIZE != 0 {
+    if guard_size == 0
+        || !guard_base.is_multiple_of(PAGE_SIZE)
+        || !guard_size.is_multiple_of(PAGE_SIZE)
+    {
         return refuse("band is not page aligned");
     }
 
@@ -400,7 +403,7 @@ fn install(guard_base: usize, guard_size: usize) -> bool {
     // mapping, and all of them must agree on their flags so `remove` can
     // restore the band from a single recorded value.
     let expect = match pt.query(guard_base) {
-        Ok((_, flags, size)) if size == crate::vm::PageSize::Size4K => flags,
+        Ok((_, flags, crate::vm::PageSize::Size4K)) => flags,
         Ok((_, _, size)) => {
             return refuse(match size {
                 crate::vm::PageSize::Size2M => "band is covered by a 2 MiB PTE",
@@ -598,7 +601,7 @@ fn quar_slot_of(vaddr: usize) -> Option<usize> {
 /// of writable 4 KiB pages or the registry is full; the scheduler then frees the
 /// stack the ordinary way. Same all-or-nothing contract as [`install`].
 pub fn quarantine_protect(usable_base: usize, size: usize) -> bool {
-    if size == 0 || usable_base % PAGE_SIZE != 0 || size % PAGE_SIZE != 0 {
+    if size == 0 || !usable_base.is_multiple_of(PAGE_SIZE) || !size.is_multiple_of(PAGE_SIZE) {
         return false;
     }
     let mut pt = PageTable::from_current();

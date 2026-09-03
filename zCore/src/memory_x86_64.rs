@@ -323,8 +323,8 @@ cfg_if! {
         // must divide evenly by the machine word — otherwise the backing static
         // would silently under-provision the allocator. It must also be
         // page-aligned, since the region is handed to the allocator wholesale.
-        const _: () = assert!(KERNEL_HEAP_SIZE % core::mem::size_of::<usize>() == 0);
-        const _: () = assert!(KERNEL_HEAP_SIZE % 4096 == 0);
+        const _: () = assert!(KERNEL_HEAP_SIZE.is_multiple_of(core::mem::size_of::<usize>()));
+        const _: () = assert!(KERNEL_HEAP_SIZE.is_multiple_of(4096));
 
         #[global_allocator]
         static HEAP_ALLOCATOR: LockedHeap<ORDER> = LockedHeap::<ORDER>::new();
@@ -435,10 +435,7 @@ cfg_if! {
         // alloc/dealloc. `heap_live_histogram` lo vuelca el alloc_error
         // handler sin asignar memoria.
         const HEAP_BUCKETS: usize = 32;
-        static HEAP_LIVE: [AtomicUsize; HEAP_BUCKETS] = {
-            const Z: AtomicUsize = AtomicUsize::new(0);
-            [Z; HEAP_BUCKETS]
-        };
+        static HEAP_LIVE: [AtomicUsize; HEAP_BUCKETS] = [const { AtomicUsize::new(0) }; HEAP_BUCKETS];
 
         #[inline]
         fn bucket_of(size: usize) -> usize {
@@ -458,14 +455,8 @@ cfg_if! {
         // Exact-size tracking for OOM attribution. Track live counts for up to 32
         // distinct allocation sizes across the heap, first-come-first-served.
         const HOT_SLOTS: usize = 32;
-        static HOT_SIZE: [AtomicUsize; HOT_SLOTS] = {
-            const Z: AtomicUsize = AtomicUsize::new(0);
-            [Z; HOT_SLOTS]
-        };
-        static HOT_LIVE: [AtomicUsize; HOT_SLOTS] = {
-            const Z: AtomicUsize = AtomicUsize::new(0);
-            [Z; HOT_SLOTS]
-        };
+        static HOT_SIZE: [AtomicUsize; HOT_SLOTS] = [const { AtomicUsize::new(0) }; HOT_SLOTS];
+        static HOT_LIVE: [AtomicUsize; HOT_SLOTS] = [const { AtomicUsize::new(0) }; HOT_SLOTS];
 
         fn hot_track(size: usize, delta: isize) {
             for i in 0..HOT_SLOTS {
@@ -505,8 +496,8 @@ cfg_if! {
                 "\n[leaktrace] 4096B live={} stack-scan:",
                 live
             ));
-            const TEXT_LO: usize = 0xffffff00_0000_1000;
-            const TEXT_HI: usize = 0xffffff00_0100_0000;
+            const TEXT_LO: usize = 0xffff_ff00_0000_1000;
+            const TEXT_HI: usize = 0xffff_ff00_0100_0000;
             let mut printed = 0;
             let mut p = rsp;
             while printed < 24 && p < rsp + 32 * 1024 {

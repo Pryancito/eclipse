@@ -389,8 +389,8 @@ pub fn cpu_tick_rip(cpu: usize) -> u64 {
 /// was doing at most one tick before the detection — the writer is on one of
 /// them. Symbolize with addr2line.
 pub fn dump_last_tick_rips() {
-    for cpu in 0..MAX_CORE_NUM {
-        let rip = TICK_LAST_RIP_PERCPU[cpu].load(Relaxed);
+    for (cpu, slot) in TICK_LAST_RIP_PERCPU.iter().enumerate() {
+        let rip = slot.load(Relaxed);
         if rip != 0 {
             crate::console::serial_write_fmt_spin(format_args!(
                 "[tick-rips]   cpu{cpu} last_tick_rip={rip:#x}\n"

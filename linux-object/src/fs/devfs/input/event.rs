@@ -4,9 +4,7 @@ use core::{any::Any, future::Future, mem::size_of, pin::Pin};
 
 use lock::Mutex;
 
-use kernel_hal::drivers::prelude::{
-    AbsInfo, CapabilityType, InputCapability, InputEvent, InputEventType,
-};
+use kernel_hal::drivers::prelude::{CapabilityType, InputCapability, InputEvent, InputEventType};
 use kernel_hal::drivers::scheme::InputScheme;
 use rcore_fs::vfs::*;
 use rcore_fs_devfs::DevFS;
@@ -307,7 +305,7 @@ impl INode for EventDev {
             }
             // EVIOCGKEY / EVIOCGLED / EVIOCGSND / EVIOCGSW: report
             // an all-zero state (nothing currently pressed/lit).
-            0x18 | 0x19 | 0x1a | 0x1b => {
+            0x18..=0x1b => {
                 let zeros = [0u8; 256];
                 let mut ptr = kernel_hal::user::UserOutPtr::<u8>::from(data);
                 user_copy(ptr.write_array(&zeros[..size]))?;
@@ -324,7 +322,7 @@ impl INode for EventDev {
             // EVIOCGABS(abs): struct input_absinfo { value, min, max, fuzz, flat, res }.
             0x40..=0x7f => {
                 let axis = (nr - 0x40) as u16;
-                let info = self.input.abs_info(axis).unwrap_or(AbsInfo::default());
+                let info = self.input.abs_info(axis).unwrap_or_default();
                 let words = [
                     info.value,
                     info.minimum,

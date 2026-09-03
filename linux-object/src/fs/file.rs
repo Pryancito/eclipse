@@ -267,7 +267,7 @@ pub fn shared_file_vmo_refs() -> (usize, usize, usize, usize) {
 /// a writer that mmaps, writes, munmaps and closes its fd while the reader's fd
 /// is already open keeps the entry, which is the case the strong ref was added
 /// for in the first place.
-
+///
 /// Get-or-create the per-inode page-cache VMO, covering at least
 /// `offset + len` bytes (grown to the file size). `mark_shared` records that a
 /// MAP_SHARED mapping was handed out, which is what arms eviction-time

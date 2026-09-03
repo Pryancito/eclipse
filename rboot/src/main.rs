@@ -507,8 +507,9 @@ fn init_graphic(bs: &BootServices, resolution: Resolution) -> (GraphicInfo, [u8;
     let target = match resolution {
         Resolution::Keep => None,
         Resolution::Exact(x, y) => Some((x, y)),
-        Resolution::Auto => edid_preferred_resolution(&edid, edid_size)
-            .filter(|&(w, h)| mode_fits_auto_cap(w, h)),
+        Resolution::Auto => {
+            edid_preferred_resolution(&edid, edid_size).filter(|&(w, h)| mode_fits_auto_cap(w, h))
+        }
     };
     let exact = target.and_then(|want| gop.modes(bs).find(|mode| mode.info().resolution() == want));
     let chosen = exact.or_else(|| {

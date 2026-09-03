@@ -334,7 +334,7 @@ fn print_fault_backtrace(access_flags: MMUFlags) {
         // Align with an explicit u64 mask — `rsp0` is u64; `!(0x7usize)` would
         // be a type error against it.
         let sp0 = rsp0 & !0x7u64;
-        let plausible_sp = |a: u64| a >= 0xffff_ff00_0000_0000 && a < 0xffff_ff01_0000_0000;
+        let plausible_sp = |a: u64| (0xffff_ff00_0000_0000..0xffff_ff01_0000_0000).contains(&a);
         if plausible_sp(sp0) && mapped(sp0) {
             let top = unsafe { core::ptr::read_volatile(sp0 as *const u64) };
             let looks_like_rflags =
@@ -412,7 +412,7 @@ fn print_fault_backtrace(access_flags: MMUFlags) {
     //    fixed offsets from it (the stack scan advances by 8 bytes at a time,
     //    at most 4 KiB total) -- addresses that stay local to a known-live
     //    pointer regardless of how wide this bound is.
-    let plausible = |a: u64| a >= 0xffff_ff00_0000_0000 && a < 0xffff_ff01_0000_0000;
+    let plausible = |a: u64| (0xffff_ff00_0000_0000..0xffff_ff01_0000_0000).contains(&a);
     // The frame-pointer walk runs FIRST, and unconditionally.
     //
     // It used to be skipped whenever `[rsp0]` looked like smash residue -- which
@@ -462,7 +462,7 @@ fn print_fault_backtrace(access_flags: MMUFlags) {
     // here. See the top-of-function comment for why this needed widening at
     // all: two real captures showed a live rsp being rejected by the
     // original 256 MiB bound.
-    let plausible_sp = |a: u64| a >= 0xffff_ff00_0000_0000 && a < 0xffff_ff01_0000_0000;
+    let plausible_sp = |a: u64| (0xffff_ff00_0000_0000..0xffff_ff01_0000_0000).contains(&a);
     // [diag] The single most reliable value here, but its interpretation
     // depends on the fault type:
     //   EXECUTE fault (indirect `call` through a null/corrupted fn-ptr):

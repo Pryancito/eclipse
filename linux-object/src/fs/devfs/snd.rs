@@ -609,12 +609,13 @@ impl PcmDev {
             (ps_hi * (n_hi + 1)).saturating_sub(1),
         );
         let (bs_lo, bs_hi) = Self::iv_bounds(&iv[Self::IV_BUFFER_SIZE]);
-        if n_lo > 0 {
-            // ps ≥ (buffer+1)/(periods+1)  and  ps ≤ buffer/periods
+        // ps ≥ (buffer+1)/(periods+1)  and  ps ≤ buffer/periods (only once
+        // the periods interval has a non-zero lower bound to divide by).
+        if let Some(ps_max) = bs_hi.checked_div(n_lo) {
             changed |= Self::iv_clamp(
                 &mut iv[Self::IV_PERIOD_SIZE],
                 (bs_lo + 1).div_ceil(n_hi + 1),
-                bs_hi / n_lo,
+                ps_max,
             );
         }
         let (ps_lo, ps_hi) = Self::iv_bounds(&iv[Self::IV_PERIOD_SIZE]);
@@ -1093,7 +1094,7 @@ impl INode for PcmDev {
                 Ok(0)
             }
             // TSTAMP / TTSTAMP / USER_PVERSION: accepted, ignored.
-            0x02 | 0x03 | 0x04 => Ok(0),
+            0x02..=0x04 => Ok(0),
             0x10 => {
                 // HW_REFINE. Returning EINVAL is how alsa-lib's `*_near`
                 // helpers search; only an empty result on the initial

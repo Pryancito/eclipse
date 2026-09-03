@@ -300,7 +300,7 @@ impl UserContext {
             use core::sync::atomic::{AtomicUsize, Ordering};
             static HB: AtomicUsize = AtomicUsize::new(0);
             let n = HB.fetch_add(1, Ordering::Relaxed);
-            if n % 200_000 == 0 {
+            if n.is_multiple_of(200_000) {
                 warn!("[ctxcheck] heartbeat n={} ({})", n, when);
             }
             const USER_MAX: usize = 0x0000_8000_0000_0000;

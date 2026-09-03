@@ -804,7 +804,7 @@ fn watch_name_if_requested(name: &str) {
     }
     let bytes = packed.to_le_bytes();
     let len = bytes.iter().position(|&c| c == 0).unwrap_or(8);
-    if name.as_bytes().len() < len || &name.as_bytes()[..len] != &bytes[..len] {
+    if name.len() < len || name.as_bytes()[..len] != bytes[..len] {
         return;
     }
     // Watch an 8-byte window, so a String shorter than that is skipped: its
@@ -813,7 +813,7 @@ fn watch_name_if_requested(name: &str) {
     // an unaligned buffer is skipped too — the next matching object is likely
     // to be better placed.
     let addr = name.as_ptr() as usize;
-    if name.len() < 8 || addr % 8 != 0 {
+    if name.len() < 8 || !addr.is_multiple_of(8) {
         return;
     }
     if kernel_hal::watchpoint::watch_write(addr, 8) {

@@ -1762,7 +1762,8 @@ impl LinuxProcess {
     pub fn remove_cloexec_files(&self) {
         // Remove under the lock, DROP outside it — see `close_file` for the
         // re-entrancy deadlock this avoids.
-        let (removed, exec_path): (Vec<(FileDesc, Arc<dyn FileLike>)>, String) = {
+        type RemovedFds = Vec<(FileDesc, Arc<dyn FileLike>)>;
+        let (removed, exec_path): (RemovedFds, String) = {
             let mut inner = self.inner.lock();
             // Per-fd state is authoritative — NOT the flag inside the (possibly
             // fork-shared) `File` objects, which is only a creation-time record.
