@@ -2343,21 +2343,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         // PATH puts /usr/local/bin first, so these win over busybox applets.
         // busybox `reboot` signals PID 1 with SIGTERM (eclipse-init: power
         // off); `poweroff` uses SIGUSR2. Speak eclipse-init's language.
-        fs::write(
-            localbin.join("reboot"),
-            b"#!/bin/sh\nkill -INT 1\n",
-        )
-        .unwrap();
-        fs::write(
-            localbin.join("poweroff"),
-            b"#!/bin/sh\nkill -TERM 1\n",
-        )
-        .unwrap();
-        fs::write(
-            localbin.join("halt"),
-            b"#!/bin/sh\nkill -TERM 1\n",
-        )
-        .unwrap();
+        fs::write(localbin.join("reboot"), b"#!/bin/sh\nkill -INT 1\n").unwrap();
+        fs::write(localbin.join("poweroff"), b"#!/bin/sh\nkill -TERM 1\n").unwrap();
+        fs::write(localbin.join("halt"), b"#!/bin/sh\nkill -TERM 1\n").unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             for w in [
