@@ -348,6 +348,20 @@ pub fn panic_banner(text: &str) {
             }
         }
     }
+
+    // Park the streaming text cursor BELOW the banner body. Until the native
+    // graphic console exists (i.e. during PCI bring-up), every serial line is
+    // mirrored onto this same framebuffer through `write_str`, and the panic
+    // handler's own `panic cpu=… at file:line` / message / `[backtrace]` lines
+    // arrive that way right after the banner. They used to land wherever the
+    // boot log had left the cursor — on a real-hardware capture that was rows
+    // 3-4, exactly over the banner's location and message lines, and the one
+    // photo that came back had both overprinted into an unreadable smear.
+    // Continue on the line after the body instead, and make sure a pending
+    // progress-bar clear does not wipe the banner on that first write.
+    CLEAR_ON_NEXT_TEXT_WRITE.store(false, Ordering::SeqCst);
+    CUR_X.store(0, Ordering::SeqCst);
+    CUR_Y.store(y / CHAR_H + 1, Ordering::SeqCst);
 }
 
 /// Draw a centered boot progress bar (0..=100) on the early framebuffer.

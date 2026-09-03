@@ -985,6 +985,13 @@ impl AhciInterface {
             if pi & (1 << i) != 0 {
                 let pbase = base + 0x100 + (i * 0x80);
                 let dma_paddr = unsafe { drivers_dma_alloc(DMA_PAGES) };
+                if dma_paddr == 0 {
+                    crate::klog_err!(
+                        "[AHCI] port {}: no DMA memory for the command list/FIS block; skipping",
+                        i,
+                    );
+                    continue;
+                }
                 let dma_vaddr = phys_to_virt(dma_paddr);
 
                 // The command list / FIS / command table live in this block. If

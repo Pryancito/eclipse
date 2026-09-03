@@ -139,8 +139,14 @@ pub struct ProviderImpl;
 impl Provider for ProviderImpl {
     const PAGE_SIZE: usize = PAGE_SIZE;
 
+    /// `(0, 0)` when no contiguous DMA memory is available: `drivers_dma_alloc`
+    /// returns 0 on failure and must not be turned into a physmap pointer to
+    /// physical page 0.
     fn alloc_dma(size: usize) -> (usize, usize) {
-        let paddr = unsafe { drivers_dma_alloc(size / PAGE_SIZE) };
+        let paddr = unsafe { drivers_dma_alloc(size.div_ceil(PAGE_SIZE)) };
+        if paddr == 0 {
+            return (0, 0);
+        }
         let vaddr = phys_to_virt(paddr);
         (vaddr, paddr)
     }

@@ -484,9 +484,17 @@ mod drivers_ffi_libos {
     use crate::{PhysAddr, KHANDLER};
     #[no_mangle]
     extern "C" fn drivers_dma_alloc(pages: usize) -> PhysAddr {
+        // 0 on failure, same contract as the bare-metal twin below: the
+        // caller decides whether a missing DMA buffer is fatal for ITS device.
         KHANDLER
             .frame_alloc_contiguous(pages, 0)
-            .expect("drivers_dma_alloc (libos): out of contiguous frames")
+            .unwrap_or_else(|| {
+                log::error!(
+                    "drivers_dma_alloc (libos): no {} contiguous frames available",
+                    pages
+                );
+                0
+            })
     }
 
     #[no_mangle]
@@ -502,14 +510,35 @@ mod drivers_ffi_libos {
 mod drivers_ffi {
     use crate::{PhysAddr, VirtAddr, KCONFIG, KHANDLER, PAGE_SIZE};
 
+    /// Allocate `pages` physically contiguous frames for a device.
+    ///
+    /// Returns the physical base, or **0 when no contiguous run is free** —
+    /// never panics. Every caller (`DmaRegion`, the xHCI/AHCI/NVMe/HDA/NIC
+    /// drivers, the NVIDIA RM's `osAllocPagesInternal` shim) checks for 0 and
+    /// fails only its own device. This used to `panic!`, which turned an
+    /// exhausted or fragmented frame pool into a whole-machine stop; and since
+    /// PCI probes run under the driver registry's `lock::Mutex`
+    /// (`probe_pci_device`), that panic could never be contained by `oops`
+    /// ("the CPU holds 1 kernel lock(s)"). A device without its DMA buffer is
+    /// a device that does not come up; the rest of the system keeps running.
+    ///
+    /// The failure is logged at error level WITH the frame-pool occupancy, so a
+    /// screen photo distinguishes real exhaustion (used ≈ managed) from
+    /// fragmentation (plenty free, no run of `pages` frames).
     #[no_mangle]
     extern "C" fn drivers_dma_alloc(pages: usize) -> PhysAddr {
-        let paddr = KHANDLER.frame_alloc_contiguous(pages, 0).unwrap_or_else(|| {
-            panic!(
-                "drivers_dma_alloc: no hay {} páginas físicas contiguas (RAM insuficiente o fragmentación)",
-                pages
+        let Some(paddr) = KHANDLER.frame_alloc_contiguous(pages, 0) else {
+            let (used, total) = KHANDLER.memory_usage();
+            crate::klog_err!(
+                "drivers_dma_alloc: no hay {} páginas físicas contiguas (RAM insuficiente o \
+                 fragmentación) — frame pool {} MiB used / {} MiB managed; the requesting \
+                 device stays down",
+                pages,
+                used >> 20,
+                total >> 20,
             );
-        });
+            return 0;
+        };
         trace!("alloc DMA: paddr={:#x}, pages={}", paddr, pages);
         paddr
     }

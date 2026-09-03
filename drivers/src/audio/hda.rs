@@ -911,6 +911,16 @@ impl HdaDevice {
 
         let (corb_va, corb_pa) = ProviderImpl::alloc_dma(PAGE_SIZE);
         let (rirb_va, rirb_pa) = ProviderImpl::alloc_dma(PAGE_SIZE);
+        if corb_pa == 0 || rirb_pa == 0 {
+            error!("[hda] {}: no DMA memory for CORB/RIRB", name);
+            if corb_pa != 0 {
+                ProviderImpl::dealloc_dma(corb_va, PAGE_SIZE);
+            }
+            if rirb_pa != 0 {
+                ProviderImpl::dealloc_dma(rirb_va, PAGE_SIZE);
+            }
+            return Err(DeviceError::DmaError);
+        }
         unsafe {
             core::ptr::write_bytes(corb_va as *mut u8, 0, PAGE_SIZE);
             core::ptr::write_bytes(rirb_va as *mut u8, 0, PAGE_SIZE);
@@ -943,6 +953,24 @@ impl HdaDevice {
         let ring_len = RING_PAGES * PAGE_SIZE;
         let (ring_va, ring_pa) = ProviderImpl::alloc_dma(ring_len);
         let (bdl_va, bdl_pa) = ProviderImpl::alloc_dma(PAGE_SIZE);
+        if ring_pa == 0 || bdl_pa == 0 {
+            error!(
+                "[hda] {}: no DMA memory for the PCM ring ({} pages) / BDL",
+                name, RING_PAGES
+            );
+            if ring_pa != 0 {
+                ProviderImpl::dealloc_dma(ring_va, ring_len);
+            }
+            if bdl_pa != 0 {
+                ProviderImpl::dealloc_dma(bdl_va, PAGE_SIZE);
+            }
+            // Stop the CORB/RIRB DMA engines before handing their rings back.
+            mmio_w8(bar, REG_CORBCTL, 0);
+            mmio_w8(bar, REG_RIRBCTL, 0);
+            ProviderImpl::dealloc_dma(corb_va, PAGE_SIZE);
+            ProviderImpl::dealloc_dma(rirb_va, PAGE_SIZE);
+            return Err(DeviceError::DmaError);
+        }
         unsafe { core::ptr::write_bytes(ring_va as *mut u8, 0, ring_len) };
         clflush_range(ring_va, ring_len);
         let n_seg = ring_len / BDL_SEGMENT;

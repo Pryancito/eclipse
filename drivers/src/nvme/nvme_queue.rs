@@ -4,6 +4,7 @@ use volatile::Volatile;
 
 use super::NvmeCommonCommand;
 use super::NvmeCompletion;
+use crate::{DeviceError, DeviceResult};
 
 #[derive(Debug)]
 pub struct NvmeQueue<P: Provider> {
@@ -41,7 +42,9 @@ pub struct NvmeQueue<P: Provider> {
 }
 
 impl<P: Provider> NvmeQueue<P> {
-    pub fn new(qid: usize, q_size: usize) -> Self {
+    /// `Err(DeviceError::DmaError)` when the contiguous DMA pool cannot back
+    /// the queue (`P::alloc_dma` returns `(0, 0)`); nothing is leaked.
+    pub fn new(qid: usize, q_size: usize) -> DeviceResult<Self> {
         // SQ: 64 bytes per entry. CQ: 16 bytes per entry.
         let sq_bytes = q_size * 64;
         let cq_bytes = q_size * 16;
@@ -60,6 +63,26 @@ impl<P: Provider> NvmeQueue<P> {
         let (prp_list_va, prp_list_pa) = P::alloc_dma(P::PAGE_SIZE);
         let (sq_va, sq_pa) = P::alloc_dma(sq_pages * P::PAGE_SIZE);
         let (cq_va, cq_pa) = P::alloc_dma(cq_pages * P::PAGE_SIZE);
+        if data_pa == 0 || prp_list_pa == 0 || sq_pa == 0 || cq_pa == 0 {
+            warn!(
+                "[nvme] queue {}: no contiguous DMA memory (bounce {} pages, sq {} pages, cq {} pages)",
+                qid,
+                data_len / P::PAGE_SIZE,
+                sq_pages,
+                cq_pages
+            );
+            for (va, pa, len) in [
+                (data_va, data_pa, data_len),
+                (prp_list_va, prp_list_pa, P::PAGE_SIZE),
+                (sq_va, sq_pa, sq_pages * P::PAGE_SIZE),
+                (cq_va, cq_pa, cq_pages * P::PAGE_SIZE),
+            ] {
+                if pa != 0 {
+                    P::dealloc_dma(va, len);
+                }
+            }
+            return Err(DeviceError::DmaError);
+        }
 
         trace!(
             "data_va: {:x}, sq_pa: {:x}, cq_pa: {:x}",
@@ -81,7 +104,7 @@ impl<P: Provider> NvmeQueue<P> {
         let complete_queue =
             unsafe { slice::from_raw_parts_mut(cq_va as *mut Volatile<NvmeCompletion>, q_size) };
 
-        NvmeQueue {
+        Ok(NvmeQueue {
             provider: PhantomData,
             sq: submit_queue,
             cq: complete_queue,
@@ -97,7 +120,7 @@ impl<P: Provider> NvmeQueue<P> {
             data_len,
             prp_list_pa,
             prp_list_va,
-        }
+        })
     }
 
     pub fn next_cid(&mut self) -> u16 {
@@ -125,8 +148,14 @@ pub struct ProviderImpl;
 impl Provider for ProviderImpl {
     const PAGE_SIZE: usize = PAGE_SIZE;
 
+    /// `(0, 0)` when no contiguous DMA memory is available: `drivers_dma_alloc`
+    /// returns 0 on failure and must not be turned into a physmap pointer to
+    /// physical page 0.
     fn alloc_dma(size: usize) -> (usize, usize) {
-        let paddr = unsafe { drivers_dma_alloc(size / PAGE_SIZE) };
+        let paddr = unsafe { drivers_dma_alloc(size.div_ceil(PAGE_SIZE)) };
+        if paddr == 0 {
+            return (0, 0);
+        }
         let vaddr = phys_to_virt(paddr);
         (vaddr, paddr)
     }

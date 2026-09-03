@@ -63,7 +63,15 @@ medias. Se rechaza —y la máquina se para, con el motivo en la consola— cuan
 - **La CPU tiene algún cerrojo del kernel cogido** (`lock::lock_depth() != 0`).
   Todo `MutexGuard` de `kernel-sync` enmarca su vida con `push_off`/`pop_off`,
   así que `noff == 0` demuestra que no hay ninguno vivo: nada quedó a medio
-  modificar y ningún cerrojo se quedará cogido para siempre.
+  modificar y ningún cerrojo se quedará cogido para siempre. Un caso que cae
+  aquí sistemáticamente: **cualquier pánico dentro de la sonda PCI de un
+  driver** (`probe_pci_device` recorre el registro de drivers con su
+  `lock::Mutex` cogido, y llama a `init()` de cada uno bajo él), que aparece
+  como `NOT contained (the CPU holds 1 kernel lock(s))`. Por eso una petición
+  de memoria DMA contigua que no se puede atender (`drivers_dma_alloc`)
+  **ya no es un `panic!`**: devuelve 0, deja en la consola la ocupación del
+  pool de marcos (`N MiB used / M MiB managed`, para distinguir RAM agotada de
+  fragmentación) y sólo el dispositivo que la pedía se queda sin inicializar.
 - **El fallo llegó en contexto de interrupción** (`in_timer_callback`). No hay
   proceso al que atribuirlo: el hilo interrumpido es una coincidencia.
 - **No había ninguna corrutina ejecutándose**, la pila que falló no es la suya

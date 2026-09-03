@@ -14,7 +14,12 @@ pub struct IxgbeHalImpl;
 unsafe impl IxgbeHal for IxgbeHalImpl {
     fn dma_alloc(size: usize) -> (IxgbePhysAddr, NonNull<u8>) {
         let (vaddr, paddr) = ProviderImpl::alloc_dma(size);
-        (paddr, NonNull::new(vaddr as *mut u8).unwrap())
+        // `IxgbeHal::dma_alloc` has no failure channel, so an exhausted DMA
+        // pool can only stop this driver here — explicitly, not via a wild
+        // pointer to physical page 0.
+        let ptr = NonNull::new(vaddr as *mut u8)
+            .expect("ixgbe: out of contiguous DMA memory (drivers_dma_alloc returned 0)");
+        (paddr, ptr)
     }
 
     unsafe fn dma_dealloc(paddr: IxgbePhysAddr, vaddr: NonNull<u8>, size: usize) -> i32 {

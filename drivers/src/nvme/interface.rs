@@ -65,10 +65,10 @@ impl NvmeInterface {
         let admin_q_size = mqes.min(32);
         let io_q_size = mqes.min(128);
 
-        let admin_queue = Arc::new(Mutex::new(NvmeQueue::new(0, admin_q_size)));
+        let admin_queue = Arc::new(Mutex::new(NvmeQueue::new(0, admin_q_size)?));
         let io_queues = vec![Arc::new(Mutex::new(NvmeQueue::<ProviderImpl>::new(
             1, io_q_size,
-        )))];
+        )?))];
 
         let mut interface = NvmeInterface {
             name: String::from("nvme"),

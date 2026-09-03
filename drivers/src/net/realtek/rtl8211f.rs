@@ -251,6 +251,13 @@ where
         // dma_desc记得内存清零
         let (send_ring_va, send_ring_pa) = P::alloc_dma(P::PAGE_SIZE);
         let (recv_ring_va, recv_ring_pa) = P::alloc_dma(P::PAGE_SIZE);
+        // `new` has no failure channel; a DMA pool that cannot even back the
+        // two descriptor rings is fatal for this board driver — say so instead
+        // of programming physical page 0 into the MAC.
+        assert!(
+            send_ring_pa != 0 && recv_ring_pa != 0,
+            "rtl8211f: out of contiguous DMA memory for the descriptor rings"
+        );
         let send_ring = unsafe {
             slice::from_raw_parts_mut(
                 send_ring_va as *mut DmaDesc,
@@ -285,6 +292,10 @@ where
         // Set a ring desc buffer for TX
         for i in 0..send_ring.len() {
             let (buffer_page_va, buffer_page_pa) = P::alloc_dma(P::PAGE_SIZE); // 其实buffer申请2K左右就可以
+            assert!(
+                buffer_page_pa != 0,
+                "rtl8211f: out of DMA memory for TX buffers"
+            );
 
             // desc1.all |= (1 << 24) Chain mode
             send_ring[i].desc1 |= 1 << 24;
@@ -305,6 +316,10 @@ where
         // Set a ring desc buffer for RX
         for i in 0..recv_ring.len() {
             let (buffer_page_va, buffer_page_pa) = P::alloc_dma(P::PAGE_SIZE);
+            assert!(
+                buffer_page_pa != 0,
+                "rtl8211f: out of DMA memory for RX buffers"
+            );
 
             recv_ring[i].desc1 |= 1 << 24;
             //recv_ring[i].desc2 = buffer_page_pa as u32;
