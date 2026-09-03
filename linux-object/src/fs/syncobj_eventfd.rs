@@ -61,49 +61,13 @@ pub fn register(handle: u32, point: u64, ev: Arc<dyn FileLike>) {
             return;
         }
     }
-    {
-        let mut waiters = WAITERS.lock();
-        waiters.push(Waiter {
-            handle,
-            point: target,
-            ev,
-        });
-        WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
-    }
-    arm_poller();
-}
-
-/// How often the poller re-checks pending hardware fences while eventfd
-/// waiters are armed. A fence that lands is otherwise only noticed on the
-/// next syncobj ioctl from SOME process, which for a compositor blocked in
-/// `poll()` on the eventfd may be a whole frame away.
-const POLL_INTERVAL: core::time::Duration = core::time::Duration::from_micros(250);
-
-static POLLER_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-
-/// Hardware fences (`syncobj::attach_hw_fence`, the GPU driver's direct-submit
-/// path) are resolved lazily -- nobody is notified when the GPU writes the
-/// landing zone. An eventfd waiter is the one client that does NOT come back
-/// to ask, so while any is armed and a hardware fence is pending, a short
-/// periodic timer polls the fences on their behalf; the signal hook then
-/// delivers the eventfd exactly as an explicit signal would. Idle otherwise.
-fn arm_poller() {
-    if WAITER_COUNT.load(Ordering::Relaxed) == 0
-        || !zcore_drivers::scheme::syncobj::has_pending()
-        || POLLER_ARMED.swap(true, Ordering::AcqRel)
-    {
-        return;
-    }
-    kernel_hal::timer::timer_set(
-        kernel_hal::timer::deadline_after(POLL_INTERVAL),
-        alloc::boxed::Box::new(|_| {
-            POLLER_ARMED.store(false, Ordering::Release);
-            // Resolves landed fences and fires the signal hook (below) for
-            // every point that advanced, which delivers the eventfds.
-            zcore_drivers::scheme::syncobj::poll_pending();
-            arm_poller();
-        }),
-    );
+    let mut waiters = WAITERS.lock();
+    waiters.push(Waiter {
+        handle,
+        point: target,
+        ev,
+    });
+    WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
 }
 
 /// Registered point-advance hook (see [`init`]). Deliver every waiter whose

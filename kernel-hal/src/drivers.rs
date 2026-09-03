@@ -180,17 +180,6 @@ pub fn set_rm_thread_id_provider(_f: fn() -> u64) {}
 #[cfg(not(target_arch = "x86_64"))]
 pub fn set_nouveau_uapi_enabled(_v: bool) {}
 
-/// Whether the nouveau-uAPI `EXEC` ioctl takes the direct-submit path (GP
-/// entries, GPPut and doorbell written by the kernel, fence resolved lazily)
-/// or enters the NVIDIA RM on every submission. Default on; the
-/// `nvidia.exec_rm` cmdline flag turns it off for A/B measurement.
-#[cfg(target_arch = "x86_64")]
-pub fn set_exec_fast_enabled(v: bool) {
-    zcore_drivers::display::set_exec_fast_enabled(v);
-}
-#[cfg(not(target_arch = "x86_64"))]
-pub fn set_exec_fast_enabled(_v: bool) {}
-
 /// Whether the nouveau-compatible ioctl surface is currently enabled --
 /// the read side of [`set_nouveau_uapi_enabled`], needed by
 /// `linux-syscall` (which, unlike `linux-object`, has no direct
