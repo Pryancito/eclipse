@@ -7,7 +7,7 @@ use alloc::sync::Arc;
 use core::any::Any;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::task::{Context, Poll as TaskPoll};
 
 use crate::sync::{Event, EventBus};
@@ -452,6 +452,25 @@ fn render_allowed(cmd: u32) -> bool {
         | 0xD1      // SET_CLIENT_NAME
         | 0xD2      // GEM_CHANGE_HANDLE
     )
+}
+
+/// Opt-in strict render-node policy: when enabled, ioctls outside Linux's
+/// `DRM_RENDER_ALLOW` set are rejected with EACCES on `renderD*`.
+///
+/// Default stays permissive for compatibility with existing software-KMS flows;
+/// set `drm.render_strict` on the kernel cmdline to enforce Linux semantics.
+fn render_node_strict_mode() -> bool {
+    // 0 = uninitialized, 1 = off, 2 = on.
+    static MODE: AtomicU8 = AtomicU8::new(0);
+    match MODE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let strict = kernel_hal::boot::cmdline().contains("drm.render_strict");
+            MODE.store(if strict { 2 } else { 1 }, Ordering::Relaxed);
+            strict
+        }
+    }
 }
 
 /// Bounded, level-filter-free trace of the syncobj ops NVK issues while it
@@ -1214,7 +1233,10 @@ impl INode for DrmDev {
         // EACCES exactly like Linux, so a client probing `renderD128` sees a
         // render node, not a second KMS device.
         if self.minor >= 128 && !render_allowed(cmd) {
-            // OBSERVE, DO NOT ENFORCE (yet).
+            if render_node_strict_mode() {
+                return Err(FsError::NoPermission);
+            }
+            // Default mode: observe, do not enforce.
             //
             // `render_allowed` used to extract the NR as `(cmd >> 8) & 0xff`,
             // which is the ioctl TYPE byte -- 'd' (0x64) for every DRM ioctl,
@@ -1242,7 +1264,7 @@ impl INode for DrmDev {
             if !REFUSAL_LOGGED[nr].swap(true, Ordering::Relaxed) {
                 kernel_hal::klog_info!(
                     "[drm] render node: ioctl {:#010x} (drm nr={:#04x}) is NOT in Linux's \
-                     DRM_RENDER_ALLOW set -- allowed anyway for now, see render_allowed()",
+                     DRM_RENDER_ALLOW set -- allowed anyway (set drm.render_strict to enforce EACCES)",
                     cmd,
                     cmd & 0xff
                 );

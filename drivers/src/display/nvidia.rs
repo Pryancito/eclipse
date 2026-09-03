@@ -417,6 +417,7 @@ static RM_CORE_INIT_ATTEMPTED: core::sync::atomic::AtomicBool =
 /// Distinctive sentinel (not a real NV_STATUS) reported when RM init is
 /// refused because a prior in-boot attempt died partway through.
 const RM_INIT_POISONED: u32 = 0xDEAD_1417;
+const NVIDIA_GSP_FW_EXPECTED_VERSION: &str = "570.144";
 
 fn rm_core_init_once() -> u32 {
     use core::sync::atomic::Ordering;
@@ -3409,6 +3410,64 @@ impl DrmScheme for NvidiaGpu {
 
     fn set_gsp_firmware_status(&self, status: String) {
         *self.gsp_fw_status.lock() = Some(status);
+    }
+
+    fn integration_status(&self) -> String {
+        let role = if self.drives_boot_display() {
+            "console"
+        } else {
+            "compute"
+        };
+        let rm_device_instance = *self.rm_device_instance.lock();
+        let rm_attached = rm_device_instance.is_some();
+        let rm_attach_result = self
+            .rm_attach_result
+            .lock()
+            .clone()
+            .unwrap_or_else(|| String::from("not-run"));
+        let fw_status = self
+            .gsp_fw_status
+            .lock()
+            .clone()
+            .unwrap_or_else(|| String::from("unknown"));
+        let fw_bytes = self.gsp_firmware.lock().as_ref().map(|b| b.len()).unwrap_or(0);
+        let gsp_init_result = self
+            .gsp_init_result
+            .lock()
+            .clone()
+            .unwrap_or_else(|| String::from("not-run"));
+        let state_init_result = self
+            .state_init_result
+            .lock()
+            .clone()
+            .unwrap_or_else(|| String::from("not-run"));
+        let ce_ready = self.ce_present_ready();
+        let ce_wedged = CE_PRESENT_WEDGED.load(Ordering::Relaxed);
+
+        alloc::format!(
+            "[gpu-status] driver={} pci={:04x}:{:02x}:{:02x}.0 role={} model=\"{}\" arch={:?}\n\
+             [gpu-status] rm_attached={} rm_device_instance={:?} rm_attach_result={}\n\
+             [gpu-status] gsp_expected_version={} gsp_blob_bytes={} gsp_fw_status={}\n\
+             [gpu-status] gsp_init_result={} state_init_result={}\n\
+             [gpu-status] ce_present_ready={} ce_present_wedged={}\n",
+            self.name,
+            self.pci_domain,
+            self.pci_bus,
+            self.pci_device,
+            role,
+            self.gpu_model,
+            self.architecture,
+            rm_attached,
+            rm_device_instance,
+            rm_attach_result,
+            NVIDIA_GSP_FW_EXPECTED_VERSION,
+            fw_bytes,
+            fw_status,
+            gsp_init_result,
+            state_init_result,
+            ce_ready,
+            ce_wedged
+        )
     }
 
     /// Read-only GPU state dump (surfaced at `/proc/gpudbg`). Step 1 of the GPU
