@@ -34,6 +34,43 @@ fn gpu_spin() {
     core::hint::spin_loop();
 }
 
+/// Direct-submit state of one GPU context (see `nouveau_uapi::FastCtx` and
+/// `eclipse_rm_exec_fast_prepare`). `Failed` pins the context to the RM
+/// per-submit path for its lifetime instead of retrying the RM on every EXEC.
+enum FastSlot {
+    Unprepared,
+    Ready(super::nouveau_uapi::FastCtx),
+    Failed,
+}
+
+/// x86 store fence: make the GP entries / method stream (cached sysmem
+/// stores) globally visible before the GPPut and doorbell writes that let
+/// the GPU fetch them. Same `osFlushCpuWriteCombineBuffer` the RM path used.
+#[inline]
+fn store_fence() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("sfence", options(nostack, preserves_flags));
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    core::sync::atomic::fence(Ordering::SeqCst);
+}
+
+/// `syncobj`'s fence-timeout upcall: a pending hardware fence did not land in
+/// 1 s. Route it to the GPU whose context buffer holds the landing zone.
+fn nouveau_fence_timeout_hook(
+    ctx_idx: u32,
+    fence_va: usize,
+    payload: u32,
+    handle: u32,
+    point: u64,
+) {
+    let gpus: Vec<Arc<NvidiaGpu>> = NVIDIA_GPUS.lock().clone();
+    for gpu in gpus {
+        gpu.fast_fence_timeout(ctx_idx, fence_va, payload, handle, point);
+    }
+}
+
 // --- Registers and Constants (aligned with Nova / open-gpu-kernel-modules) ---
 #[allow(dead_code)]
 mod regs {
@@ -666,6 +703,8 @@ pub struct NvidiaGpu {
     /// channel: the 3D draw then cold-loaded the GR context and hung FECS in
     /// RESTORE (idle GR, drained PBDMA, no fault -- the real-RTX signature).
     nouveau_pid_ctx: Mutex<Vec<(u64, u32, u32, u32, bool)>>,
+    /// Per-context direct-submit state, indexed by ctx_idx (see `FastSlot`).
+    nouveau_fast: Mutex<Vec<FastSlot>>,
     /// Driver-private framebuffer objects keyed by driver fb id.
     kms_framebuffers: Mutex<Vec<NvidiaKmsFramebuffer>>,
     /// Driver-side ids for framebuffer objects.
@@ -1035,6 +1074,11 @@ impl NvidiaGpu {
             nouveau_gem_next_handle: AtomicU32::new(0x8000_0001),
             nouveau_vm_mappings: Mutex::new(Vec::new()),
             nouveau_pid_ctx: Mutex::new(Vec::new()),
+            nouveau_fast: Mutex::new(
+                (0..super::nouveau_uapi::MAX_CTX)
+                    .map(|_| FastSlot::Unprepared)
+                    .collect(),
+            ),
             kms_framebuffers: Mutex::new(Vec::new()),
             next_kms_fb_id: AtomicU32::new(1),
             kms_state: Mutex::new(NvidiaKmsState {
@@ -3668,6 +3712,9 @@ impl DrmScheme for NvidiaGpu {
         // kind mapped uncompressed from plain tiled sysmem when a client renders
         // structured garbage (e.g. vkcube) rather than crashing.
         s.push_str(&super::nouveau_uapi::format_client_mem());
+        // Where a frame's kernel time goes: per-ioctl counts/latencies, the
+        // direct-submit vs RM split, syncobj spin time, fence latency.
+        s.push_str(&super::nouveau_uapi::format_exec_profile());
 
         s
     }
@@ -7505,7 +7552,14 @@ impl DrmScheme for NvidiaGpu {
                 Ok(0)
             }
             _ => {
+                let t0 = unsafe { crate::bus::drivers_timer_now_as_micros() };
                 let r = self.nouveau_ioctl(request, arg, owner_pid);
+                // Per-NR count/latency for /proc/gpudbg's ioctl profile
+                // (driver-private range only: type byte 'd' = 0x64).
+                if (request >> 8) & 0xff == 0x64 {
+                    let dt = unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(t0);
+                    super::nouveau_uapi::profile_ioctl(request & 0xff, dt);
+                }
                 // Record the LAST client nouveau-ioctl error into /proc/gpudbg.
                 // The EXEC record can say OK while the client still dies with
                 // DEVICE_LOST -- because the errno NVK collapses into
@@ -7561,6 +7615,7 @@ impl DrmScheme for NvidiaGpu {
         };
         let ctx_freed = if let (Some(ctx_idx), Some(device_instance)) = (my_ctx, device_instance) {
             if ctx_idx >= 1 {
+                self.fast_release(device_instance, ctx_idx);
                 lock::pump();
                 let status = nvidia_rm_sys::rm_init::ctx_free(device_instance, ctx_idx);
                 super::nouveau_uapi::ctx_clear_wedged(ctx_idx);
@@ -8390,6 +8445,618 @@ impl NvidiaGpu {
     /// ring that `step17` built, and this milestone has exactly one. Two
     /// clients pushing into the same ring corrupt each other, so submission
     /// stays restricted to the channel's owner even though the VAS is shared.
+    /// GR-engine hang probe: at the moment a fence wait expired, snapshot the
+    /// BAR0 registers that distinguish the four mutually-exclusive failure
+    /// modes:
+    ///   (a) MMU fault  — latched in 0xb83090 (valid=1)
+    ///   (b) GR method stall — 0x400700 non-zero + 0x400704
+    ///   (c) PBDMA never fetched the push — GP_GET != GP_PUT
+    ///   (d) FECS/GPCCS ctx-switch hang — 0x409c00 / 0x41a000
+    ///
+    /// No RM calls: two prior attempts to involve the RM on this path crashed
+    /// the machine. Pure BAR0 reads only. Stored in LAST_GR_HANG_PROBE for
+    /// /proc/gpudbg; first timeout per boot wins (the ring stays wedged
+    /// after). Shared by the RM per-submit path (inline poll timeout) and the
+    /// direct-submit path (`syncobj` fence timeout / ring-full timeout).
+    fn gr_hang_probe(
+        &self,
+        ctx_idx: u32,
+        owner_pid: u64,
+        work_token: u32,
+        runlist_id: u32,
+        timeout_ms: u32,
+    ) {
+        use super::nouveau_uapi as nv;
+        let bar0 = self._bar0;
+        let rd = |off: usize| unsafe { core::ptr::read_volatile((bar0 + off) as *const u32) };
+        let wr =
+            |off: usize, v: u32| unsafe { core::ptr::write_volatile((bar0 + off) as *mut u32, v) };
+
+        // work_token encodes runlistId|chId (Turing: bits [19:16]
+        // = runlistId, bits [11:0] = chId). Capture from exec
+        // result so the probe names the EXACT channel that timed
+        // out, not a generic PBDMA0 snapshot that may belong to
+        // a different concurrent context.
+        // Channel ID: low 12 bits of the work-submit token
+        // (Turing/Ampere kernel_fifo_tu102.c: chId = token & 0xfff).
+        let ch_id = work_token & 0x0fff;
+
+        // NV_PGRAPH_STATUS: overall GR busy/idle.
+        // 0 = idle; any bit set = a sub-engine is active/stalled.
+        let gr_status = rd(0x0040_0700);
+        // NV_PGRAPH_TRAPPED_ADDR: the method that stalled GR.
+        //   bits [20:16] = subchannel, bits [12:0] = method
+        let gr_trap_addr = rd(0x0040_0704);
+        let gr_trap_lo = rd(0x0040_0708);
+        let gr_trap_hi = rd(0x0040_070c);
+
+        // PBDMA0 ring pointers (GR runlist is usually PBDMA0).
+        // GP_GET == GP_PUT means the PBDMA finished fetching;
+        // GP_GET < GP_PUT means it never fetched the push at all.
+        let pb0_put = rd(0x0004_0000);
+        let pb0_get = rd(0x0004_0014);
+        // PBDMA execution state — decodes WHY GP_GET is stuck,
+        // the one thing GP_PUT/GP_GET alone cannot tell apart:
+        //   STATUS(0x40100): the PBDMA channel/exec state machine.
+        //   GET(0x40018): pushbuffer-level get. If it advanced
+        //     into the pending segment the host DID fetch the
+        //     entry and is executing/blocked inside the push
+        //     (a semaphore-acquire NVK baked in -> explicit-sync).
+        //   INTR_0(0x40108): pending PBDMA interrupts. A blocked
+        //     semaphore-acquire that exceeds its timeout raises
+        //     one here; a channel that was simply never scheduled
+        //     onto the runlist raises none. So INTR_0!=0 => the
+        //     push was fetched and blocked (semaphore/PB error);
+        //     INTR_0==0 with GP_GET frozen => never scheduled
+        //     (runlist/doorbell), NOT a semaphore block.
+        let pb0_status = rd(0x0004_0100);
+        let pb0_pbget = rd(0x0004_0018);
+        let pb0_intr = rd(0x0004_0108);
+
+        // NV_PFIFO_CHRAM_CHANNEL(ch_id): per-channel PCCSR register.
+        // Stride is 8 bytes.  The FIRST word (+0x0) is the instance
+        // pointer; the SECOND word (+0x4) carries channel state:
+        //   bit 0       = ENABLE
+        //   bits [27:24] = STATUS (0=IDLE, 1=PENDING, 2=CTX_RELOAD,
+        //                          3=BUSY/ACTIVE, 4=PENDING_CTX_RELOAD,
+        //                          5=PENDING_ACQ, 6=ENG_SEL_PENDING)
+        //   bit 28      = BUSY
+        // Reading at timeout tells us whether the channel was visible
+        // to the host FIFO scheduler. Matches the existing decode at
+        // drivers/src/display/nvidia.rs:3164 (PCCSR0(0x800004)).
+        let pccsr_off = 0x0080_0004usize + (ch_id as usize) * 8;
+        let pccsr_val = rd(pccsr_off);
+        let pccsr_enable = pccsr_val & 1;
+        let pccsr_busy = (pccsr_val >> 28) & 1;
+        let pccsr_status = (pccsr_val >> 24) & 0xf;
+
+        // HUB MMU fault latch (non-replayable, TU102 0xb83080..90).
+        // valid = bit 31 of INFO1; reason = bits [4:0].
+        let f_info1 = rd(0x00b8_3090);
+        let f_addr_lo = rd(0x00b8_3080);
+        let f_addr_hi = rd(0x00b8_3084);
+        let f_info0 = rd(0x00b8_3088);
+
+        // NV_PGRAPH_PRI_FECS_CTXSW_STATUS_FE_0: FECS state machine.
+        // Non-zero when FECS is mid ctx-switch (save/restore).
+        // 0x1 = SAVE_CONTEXT, 0x2 = RESTORE_CONTEXT (loading grctx).
+        let fecs_status = rd(0x0040_9c00);
+        // NV_PGRAPH_PRI_FECS_HOST_INT_STATUS: FECS interrupt flags.
+        let fecs_intr = rd(0x0040_9c14);
+        // NV_PGRAPH_PRI_FECS_CTXSW_MAILBOX(0/1): last FECS ucode
+        // message and error detail. Ucode updates MAILBOX0 at each
+        // step of the context-save/restore microcode; a non-zero
+        // MAILBOX0 with fecs_status==0x2 (RESTORE) shows exactly
+        // which grctx step the ucode reached before hanging. These
+        // are the registers an rc_dump uses to diagnose FECS hangs.
+        let fecs_mb0 = rd(0x0040_9800);
+        let fecs_mb1 = rd(0x0040_9804);
+        // NV_PGRAPH_PRI_FECS_CTXSW_PRIV_ERROR_FE_0: privilege
+        // error flags set if FECS ucode tried to read an invalid
+        // register (context-image addresses wrong / buffer too small).
+        let fecs_priv_err = rd(0x0040_9c10);
+
+        // NV_PGRAPH_PRI_GPC0_GPCCS_CTXSW_STATUS_GPC_0: GPCCS state.
+        let gpccs_status = rd(0x0041_a000);
+
+        let drained = pb0_get == pb0_put;
+        let mmu_valid = (f_info1 >> 31) & 1;
+        let mmu_reason = f_info1 & 0x1f;
+        let gr_subchan = (gr_trap_addr >> 16) & 0x1f;
+        let gr_method = gr_trap_addr & 0x1fff;
+
+        // Diagnosis hint: one word that names the most likely
+        // root cause, to guide which fix the maintainer applies.
+        let hint = if mmu_valid != 0 {
+            "MMU-FAULT: GPU touched an unmapped VA -- check VM_BIND mappings"
+        } else if gr_status != 0 && gr_method != 0 {
+            "GR-STALL: GR engine stuck on a method -- golden-ctx/GR-init incomplete?"
+        } else if !drained && pb0_intr != 0 {
+            "PBDMA-STALL (fetched, then BLOCKED): a PBDMA interrupt is pending -- the host fetched the push and stalled inside it, i.e. a semaphore-acquire NVK baked in never released (explicit-sync), or a PB error. Decode INTR_0/STATUS."
+        } else if !drained {
+            "PBDMA-STALL (never fetched): GP_GET frozen with no PBDMA interrupt -- the channel is not runlist-resident, so the doorbell/runlist scheduling never ran this push (NOT a semaphore block)."
+        } else if fecs_status != 0 || gpccs_status != 0 {
+            "FECS/GPCCS: ctx-switch hang -- GR context-image incomplete or global ctx buffers not mapped; check ctx_prime outcome and grctx init for this client channel's class object"
+        } else {
+            "GR-IDLE-NOFENCE: GR finished but fence-semaphore write never arrived -- WFI/coherency?"
+        };
+
+        // Recovery attempt for the "never fetched, no PBDMA
+        // interrupt" case: re-ring the doorbell with the exact
+        // work-submit token the RM issued for THIS submit.
+        // Rationale: the PBDMA may have missed the original
+        // doorbell (GSP-to-host signalling is not guaranteed
+        // lossless at high submission rates on Turing). Writing
+        // the token to 0xbb0090 a second time is idempotent if
+        // the channel is already running, and may unblock it if
+        // the doorbell was lost. Pure BAR0 write; no RM call.
+        // Only attempted when GP_GET is frozen AND INTR_0 == 0
+        // (i.e., the push never made it to the PBDMA at all).
+        if !drained && pb0_intr == 0 && work_token != 0 {
+            wr(0x00bb_0090, work_token);
+            crate::klog_warn!(
+                "[nouveau-uapi] EXEC: ctx={} PBDMA-stall recovery: re-rang doorbell token={:#010x} runlist={} ch={}",
+                ctx_idx, work_token, runlist_id, ch_id
+            );
+        }
+
+        // FECS ctx-switch hang: log a targeted klog line so
+        // dmesg immediately points at grctx/golden-context as
+        // the root. CTXSW_STATUS==0x2 = RESTORE_CONTEXT: FECS
+        // ucode is stuck trying to load the client channel's GR
+        // context image. Most likely causes: ctx_prime timed out
+        // (golden context was never loaded before NVK's first
+        // push hit the cold load), or a global-ctx-buffer
+        // (patch/attribute/pagepool) was not mapped for this ctx.
+        if fecs_status != 0 || gpccs_status != 0 {
+            crate::klog_warn!(
+                "[nouveau-uapi] EXEC: ctx={} FECS/GPCCS ctx-switch hang \
+                 (FECS_STATUS={:#010x} GPCCS_STATUS={:#010x} \
+                 MAILBOX0={:#010x} MAILBOX1={:#010x} PRIV_ERR={:#010x}) -- \
+                 GR context-image for this client channel is incomplete; \
+                 check whether ctx_prime timed out at CHANNEL_ALLOC \
+                 (see /proc/gpudbg last PRIME line for ctx={})",
+                ctx_idx,
+                fecs_status,
+                gpccs_status,
+                fecs_mb0,
+                fecs_mb1,
+                fecs_priv_err,
+                ctx_idx
+            );
+        }
+
+        // Whether THIS ctx was ever primed: the decisive
+        // datum for a FECS RESTORE hang. "never recorded"
+        // here means the EXEC ran on a ctx whose build/prime
+        // path did not complete -- the exact anomaly a real
+        // RTX repro exhibited (ctx=3 hung with no prime
+        // line at all).
+        let prime_state = nv::prime_line_for(ctx_idx).unwrap_or_else(|| {
+            alloc::string::String::from(
+                "NEVER RECORDED -- this ctx reached EXEC without its build/prime completing",
+            )
+        });
+        nv::record_gr_hang_probe(alloc::format!(
+            "ctx={ctx} pid={pid} fence TIMEOUT after {ms}ms\n\
+             HINT: {hint}\n\
+             prime-state: {prime_state}\n\
+             submit: work_token={work_token:#010x} runlist_id={runlist_id} ch_id={ch_id}\n\
+             GR_STATUS(0x400700)={gr_status:#010x} (0=idle)\n\
+             TRAPPED_ADDR(0x400704)={gr_trap_addr:#010x} subchan={gr_subchan} method={gr_method:#06x}\n\
+             TRAPPED_DATA lo={gr_trap_lo:#010x} hi={gr_trap_hi:#010x}\n\
+             PBDMA0 GP_PUT(0x40000)={pb0_put:#010x} GP_GET(0x40014)={pb0_get:#010x} drained={drained}\n\
+             PBDMA0 STATUS(0x40100)={pb0_status:#010x} GET(0x40018)={pb0_pbget:#010x} INTR_0(0x40108)={pb0_intr:#010x}\n\
+             PCCSR ch{ch_id}(0x{pccsr_off:x})={pccsr_val:#010x} enable={pccsr_enable} busy={pccsr_busy} status={pccsr_status} (0=IDLE,1=PENDING,3=ACTIVE)\n\
+             MMU FAULT_INFO1(0xb83090)={f_info1:#010x} valid={mmu_valid} reason={mmu_reason:#04x}\n\
+               FAULT_ADDR={f_addr_hi:#010x}_{f_addr_lo:#010x} engine_id={engine_id:#04x}\n\
+             FECS CTXSW_STATUS(0x409c00)={fecs_status:#010x} (0=IDLE,1=SAVE,2=RESTORE) HOST_INT(0x409c14)={fecs_intr:#010x}\n\
+             FECS MAILBOX0(0x409800)={fecs_mb0:#010x} MAILBOX1(0x409804)={fecs_mb1:#010x} PRIV_ERR(0x409c10)={fecs_priv_err:#010x}\n\
+             GPCCS GPC0_STATUS(0x41a000)={gpccs_status:#010x}",
+            ctx = ctx_idx,
+            pid = owner_pid,
+            ms = timeout_ms,
+            hint = hint,
+            work_token = work_token,
+            runlist_id = runlist_id,
+            ch_id = ch_id,
+            gr_status = gr_status,
+            gr_trap_addr = gr_trap_addr,
+            gr_subchan = gr_subchan,
+            gr_method = gr_method,
+            gr_trap_lo = gr_trap_lo,
+            gr_trap_hi = gr_trap_hi,
+            pb0_put = pb0_put,
+            pb0_get = pb0_get,
+            pb0_status = pb0_status,
+            pb0_pbget = pb0_pbget,
+            pb0_intr = pb0_intr,
+            drained = drained,
+            pccsr_off = pccsr_off,
+            pccsr_val = pccsr_val,
+            pccsr_enable = pccsr_enable,
+            pccsr_busy = pccsr_busy,
+            pccsr_status = pccsr_status,
+            f_info1 = f_info1,
+            mmu_valid = mmu_valid,
+            mmu_reason = mmu_reason,
+            f_addr_hi = f_addr_hi,
+            f_addr_lo = f_addr_lo,
+            engine_id = f_info0 & 0xff,
+            fecs_status = fecs_status,
+            fecs_intr = fecs_intr,
+            fecs_mb0 = fecs_mb0,
+            fecs_mb1 = fecs_mb1,
+            fecs_priv_err = fecs_priv_err,
+            gpccs_status = gpccs_status,
+        ));
+    }
+
+    /// Whether context `ctx_idx` can take the direct-submit path, preparing
+    /// it on first touch: ONE RM entry (`exec_fast_prepare`) per channel
+    /// lifetime, then EXEC never enters the RM again for it.
+    fn fast_ctx_ready(&self, device_instance: u32, ctx_idx: u32) -> bool {
+        use super::nouveau_uapi as nv;
+        if !nv::exec_fast_enabled() || ctx_idx >= nv::MAX_CTX {
+            return false;
+        }
+        {
+            let slots = self.nouveau_fast.lock();
+            match &slots[ctx_idx as usize] {
+                FastSlot::Ready(_) => return true,
+                FastSlot::Failed => return false,
+                FastSlot::Unprepared => {}
+            }
+        }
+        // Prepare OUTSIDE the slot lock: this enters the RM (RmGate, hundreds
+        // of microseconds) and the slot lock is an IRQ-off spinlock.
+        nvidia_rm_sys::os_interface::capture_begin();
+        let prepared = nvidia_rm_sys::rm_init::exec_fast_prepare(device_instance, ctx_idx);
+        let narration = nvidia_rm_sys::os_interface::capture_take();
+        let replay_rm = |narration: Option<alloc::string::String>| {
+            if let Some(text) = narration {
+                for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                    crate::klog_warn!("[nouveau-uapi] rm: {}", line);
+                }
+            }
+        };
+        let built = match prepared {
+            Ok(f) if f.status == 0 => match nv::check_encodings(&f) {
+                Ok(()) => Some(f),
+                Err((what, ours, theirs)) => {
+                    crate::klog_warn!(
+                        "[nouveau-uapi] ctx{}: direct submit encoder self-check FAILED on {}: kernel={:#010x} RM(DRF)={:#010x} -- refusing the direct path for this context",
+                        ctx_idx, what, ours, theirs
+                    );
+                    None
+                }
+            },
+            Ok(f) => {
+                replay_rm(narration);
+                crate::klog_warn!(
+                    "[nouveau-uapi] ctx{}: exec_fast_prepare stage failed (status={:#x}) -- RM per-submit path for this context",
+                    ctx_idx, f.status
+                );
+                None
+            }
+            Err(status) => {
+                replay_rm(narration);
+                crate::klog_warn!(
+                    "[nouveau-uapi] ctx{}: exec_fast_prepare NV_STATUS={:#x} -- RM per-submit path for this context",
+                    ctx_idx, status
+                );
+                None
+            }
+        };
+        let mut slots = self.nouveau_fast.lock();
+        match built {
+            Some(f) => {
+                let ctx = nv::FastCtx {
+                    userd_gpget: f.userd_cpu as usize + f.userd_gpget_off as usize,
+                    userd_gpput: f.userd_cpu as usize + f.userd_gpput_off as usize,
+                    gpfifo_va: crate::bus::phys_to_virt(f.gpfifo_phys as usize),
+                    fence_pb_va: crate::bus::phys_to_virt(f.fence_pb_phys as usize),
+                    fence_sem_va: crate::bus::phys_to_virt(f.fence_sem_phys as usize),
+                    buf_gpu_va: f.buf_gpu_va,
+                    fence_pb_off: f.fence_pb_off,
+                    fence_sem_off: f.fence_sem_off,
+                    slot_bytes: f.slot_bytes,
+                    entries: f.gpfifo_entries,
+                    work_token: f.work_token,
+                    runlist_id: f.runlist_id,
+                    doorbell_va: self._bar0 + f.doorbell_reg as usize,
+                    next_payload: 1,
+                    submits: 0,
+                    fenced: 0,
+                };
+                // Landing zone starts BELOW every payload; slot page cleared.
+                unsafe {
+                    core::ptr::write_volatile(ctx.fence_sem_va as *mut u32, 0);
+                    core::ptr::write_bytes(
+                        ctx.fence_pb_va as *mut u8,
+                        0,
+                        (ctx.entries as usize) * (ctx.slot_bytes as usize),
+                    );
+                }
+                let (put, get) = unsafe {
+                    (
+                        core::ptr::read_volatile(ctx.userd_gpput as *const u32),
+                        core::ptr::read_volatile(ctx.userd_gpget as *const u32),
+                    )
+                };
+                crate::klog_info!(
+                    "[nouveau-uapi] ctx{}: direct submit ACTIVE (token={:#x} runlist={} doorbell=BAR0+{:#x} ring={} entries GPPut={} GPGet={}) -- EXEC no longer enters the RM nor waits for the GPU; boot with nvidia.exec_rm to compare",
+                    ctx_idx, ctx.work_token, ctx.runlist_id, f.doorbell_reg, ctx.entries, put, get
+                );
+                slots[ctx_idx as usize] = FastSlot::Ready(ctx);
+                true
+            }
+            None => {
+                slots[ctx_idx as usize] = FastSlot::Failed;
+                false
+            }
+        }
+    }
+
+    /// The direct submit itself: `pushes` as consecutive GP entries, then (if
+    /// `with_fence`) one more entry pointing at a per-slot host SEM RELEASE
+    /// stream, GPPut bumped through the persistent USERD window, doorbell
+    /// poked. Returns the `(fence_va, payload)` the syncobj layer polls.
+    /// Waits (bounded, 1 s) for ring space if the channel is behind.
+    fn fast_submit(
+        &self,
+        ctx_idx: u32,
+        pushes: &[super::nouveau_uapi::DrmNouveauExecPush],
+        with_fence: bool,
+    ) -> Result<Option<(usize, u32)>, super::nouveau_uapi::FastSubmitError> {
+        use super::nouveau_uapi as nv;
+        const RING_TIMEOUT_US: u64 = 1_000_000;
+        let needed = pushes.len() as u32 + with_fence as u32;
+        let start = unsafe { crate::bus::drivers_timer_now_as_micros() };
+        let mut waited = false;
+        loop {
+            let (put, get) = {
+                let mut slots = self.nouveau_fast.lock();
+                let FastSlot::Ready(f) = &mut slots[ctx_idx as usize] else {
+                    return Err(nv::FastSubmitError::Gone);
+                };
+                let entries = f.entries;
+                // GPPut is re-read from the USERD rather than cached: the
+                // /proc/gpustepNN self-tests still submit on ctx 0 through the
+                // RM path and move it behind our back.
+                let put =
+                    unsafe { core::ptr::read_volatile(f.userd_gpput as *const u32) } % entries;
+                let get =
+                    unsafe { core::ptr::read_volatile(f.userd_gpget as *const u32) } % entries;
+                let used = (put + entries - get) % entries;
+                if used + needed <= entries - 1 {
+                    let mut slot = put;
+                    for p in pushes {
+                        let gp = (f.gpfifo_va + slot as usize * 8) as *mut u32;
+                        unsafe {
+                            core::ptr::write_volatile(gp, nv::gp_entry0(p.va));
+                            core::ptr::write_volatile(gp.add(1), nv::gp_entry1(p.va, p.va_len));
+                        }
+                        slot = (slot + 1) % entries;
+                    }
+                    let mut fence = None;
+                    if with_fence {
+                        let payload = f.next_payload;
+                        f.next_payload = f.next_payload.wrapping_add(1);
+                        if f.next_payload == 0 {
+                            f.next_payload = 1;
+                        }
+                        let stream_va = f.fence_pb_va + slot as usize * f.slot_bytes as usize;
+                        let stream_gpu_va = f.buf_gpu_va
+                            + f.fence_pb_off as u64
+                            + slot as u64 * f.slot_bytes as u64;
+                        let sem_gpu_va = f.buf_gpu_va + f.fence_sem_off as u64;
+                        let words = nv::sem_release_stream(sem_gpu_va, payload);
+                        for (i, w) in words.iter().enumerate() {
+                            unsafe {
+                                core::ptr::write_volatile((stream_va as *mut u32).add(i), *w)
+                            };
+                        }
+                        let gp = (f.gpfifo_va + slot as usize * 8) as *mut u32;
+                        unsafe {
+                            core::ptr::write_volatile(gp, nv::gp_entry0(stream_gpu_va));
+                            core::ptr::write_volatile(
+                                gp.add(1),
+                                nv::gp_entry1(stream_gpu_va, (words.len() * 4) as u32),
+                            );
+                        }
+                        slot = (slot + 1) % entries;
+                        fence = Some((f.fence_sem_va, payload));
+                        f.fenced += 1;
+                    }
+                    store_fence();
+                    unsafe { core::ptr::write_volatile(f.userd_gpput as *mut u32, slot) };
+                    store_fence();
+                    unsafe { core::ptr::write_volatile(f.doorbell_va as *mut u32, f.work_token) };
+                    f.submits += 1;
+                    if waited {
+                        nv::EXEC_RING_WAIT_US.fetch_add(
+                            unsafe { crate::bus::drivers_timer_now_as_micros() }
+                                .wrapping_sub(start),
+                            Ordering::Relaxed,
+                        );
+                    }
+                    return Ok(fence);
+                }
+                (put, get)
+            };
+            waited = true;
+            if unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(start)
+                >= RING_TIMEOUT_US
+            {
+                return Err(nv::FastSubmitError::RingFull { put, get, needed });
+            }
+            gpu_spin();
+        }
+    }
+
+    /// Token/runlist of a prepared context, for the hang probe.
+    fn fast_token(&self, ctx_idx: u32) -> (u32, u32) {
+        match &self.nouveau_fast.lock()[ctx_idx as usize] {
+            FastSlot::Ready(f) => (f.work_token, f.runlist_id),
+            _ => (0, 0),
+        }
+    }
+
+    /// The EXEC ioctl body on the direct-submit path (waits already honoured
+    /// by the caller). Attaches every `sig` syncobj to the kernel fence of
+    /// the LAST push -- GPFIFO order means one fence covers the batch.
+    fn exec_fast(
+        &self,
+        ctx_idx: u32,
+        owner_pid: u64,
+        req: &super::nouveau_uapi::DrmNouveauExec,
+        pushes: &[super::nouveau_uapi::DrmNouveauExecPush],
+    ) -> Result<usize, i32> {
+        use super::nouveau_uapi as nv;
+        let with_fence = req.sig_count > 0 && req.sig_ptr != 0;
+        match self.fast_submit(ctx_idx, pushes, with_fence) {
+            Ok(fence) => {
+                nv::EXEC_FAST_SUBMITS.fetch_add(1, Ordering::Relaxed);
+                if let Some((fence_va, payload)) = fence {
+                    nv::EXEC_FAST_FENCED.fetch_add(1, Ordering::Relaxed);
+                    let sigs = unsafe {
+                        core::slice::from_raw_parts(
+                            req.sig_ptr as *const nv::DrmNouveauSync,
+                            req.sig_count as usize,
+                        )
+                    };
+                    for sig in sigs {
+                        let timeline = sig.flags & nv::SYNC_TYPE_MASK == nv::SYNC_TIMELINE_SYNCOBJ;
+                        let target = if timeline { sig.timeline_value } else { 1 };
+                        if !crate::scheme::syncobj::attach_hw_fence(
+                            sig.handle, target, fence_va, payload, ctx_idx,
+                        ) {
+                            crate::klog_warn!(
+                                "[nouveau-uapi] EXEC(direct): submitted, but sig syncobj handle={} is unknown (ENOENT)",
+                                sig.handle
+                            );
+                            return Err(nv::ENOENT);
+                        }
+                    }
+                }
+                static FIRST_FAST_OK: AtomicBool = AtomicBool::new(false);
+                if !FIRST_FAST_OK.swap(true, Ordering::Relaxed) {
+                    crate::klog_info!(
+                        "[nouveau-uapi] EXEC OK (first, direct submit): {} push(es) on ctx{} -- fence resolved lazily by syncobj",
+                        req.push_count, ctx_idx
+                    );
+                }
+                static CLIENT_FAST_OK: AtomicU32 = AtomicU32::new(0);
+                if ctx_idx >= 1 && ctx_idx < 32 {
+                    let bit = 1u32 << ctx_idx;
+                    if CLIENT_FAST_OK.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                        crate::klog_info!(
+                            "[nouveau-uapi] first CLIENT EXEC (direct submit): ctx={} pid={}",
+                            ctx_idx,
+                            owner_pid
+                        );
+                    }
+                    nv::record_client_exec(alloc::format!(
+                        "ctx={} pid={} SUBMITTED (direct): {} push(es), {} syncobj(s) attached to fence payload {:?}",
+                        ctx_idx, owner_pid, req.push_count, req.sig_count, fence.map(|f| f.1)
+                    ));
+                }
+                Ok(0)
+            }
+            Err(nv::FastSubmitError::Gone) => {
+                crate::klog_warn!(
+                    "[nouveau-uapi] EXEC(direct): ctx{} lost its direct-submit state mid-call (context freed?) pid={}",
+                    ctx_idx, owner_pid
+                );
+                Err(nv::ENODEV)
+            }
+            Err(nv::FastSubmitError::RingFull { put, get, needed }) => {
+                // GPGet froze for a full second: the channel is wedged, the
+                // same condition the RM path reported as BUSY_RETRY.
+                if ctx_idx >= 1 {
+                    nv::ctx_set_wedged(ctx_idx);
+                }
+                crate::klog_warn!(
+                    "[nouveau-uapi] EXEC(direct): ctx{} ring did not free {} slot(s) in 1s (GPPut={} GPGet={}) -- channel wedged, EIO (NVK: device-lost) pid={} {}",
+                    ctx_idx, needed, put, get, owner_pid, self.ctx_registry_summary()
+                );
+                let (token, runlist) = self.fast_token(ctx_idx);
+                self.gr_hang_probe(ctx_idx, owner_pid, token, runlist, 1000);
+                if ctx_idx >= 1 {
+                    nv::record_client_exec(alloc::format!(
+                        "ctx={} pid={} FAILED (direct): ring full for 1s GPPut={} GPGet={} needed={} | {}",
+                        ctx_idx, owner_pid, put, get, needed, self.ctx_registry_summary()
+                    ));
+                }
+                Err(nv::EIO)
+            }
+        }
+    }
+
+    /// `syncobj` fence-timeout upcall for this GPU: a fence submitted on
+    /// `ctx_idx` never landed. Only acts if the landing zone is ours.
+    fn fast_fence_timeout(
+        &self,
+        ctx_idx: u32,
+        fence_va: usize,
+        payload: u32,
+        handle: u32,
+        point: u64,
+    ) {
+        use super::nouveau_uapi as nv;
+        let (token, runlist) = {
+            let slots = self.nouveau_fast.lock();
+            match slots.get(ctx_idx as usize) {
+                Some(FastSlot::Ready(f)) if f.fence_sem_va == fence_va => {
+                    (f.work_token, f.runlist_id)
+                }
+                _ => return,
+            }
+        };
+        let current = unsafe { core::ptr::read_volatile(fence_va as *const u32) };
+        if ctx_idx >= 1 {
+            nv::ctx_set_wedged(ctx_idx);
+        }
+        crate::klog_warn!(
+            "[nouveau-uapi] fence TIMEOUT (direct submit): ctx{} payload={} never landed in 1s (landing zone={}); syncobj handle={} point={} released so its waiter can fail; {}",
+            ctx_idx, payload, current, handle, point,
+            if ctx_idx >= 1 { "context latched WEDGED (next submit EIO -> device-lost)" } else { "ctx 0 (compositor) is never latched" }
+        );
+        self.gr_hang_probe(ctx_idx, 0, token, runlist, 1000);
+        if ctx_idx >= 1 {
+            nv::record_client_exec(alloc::format!(
+                "ctx={} FAILED (direct): fence payload {} never landed (landing zone={}) | {}",
+                ctx_idx,
+                payload,
+                current,
+                self.ctx_registry_summary()
+            ));
+        }
+    }
+
+    /// Tear down the direct-submit state of `ctx_idx` BEFORE `ctx_free`:
+    /// unmap the USERD window and abandon fences that can never land now
+    /// (their waiters are released, as a killed channel's fences would be).
+    fn fast_release(&self, device_instance: u32, ctx_idx: u32) {
+        let old = {
+            let mut slots = self.nouveau_fast.lock();
+            match slots.get_mut(ctx_idx as usize) {
+                Some(slot) => core::mem::replace(slot, FastSlot::Unprepared),
+                None => return,
+            }
+        };
+        if let FastSlot::Ready(f) = old {
+            let abandoned = crate::scheme::syncobj::abandon_fences(f.fence_sem_va);
+            lock::pump();
+            let status = nvidia_rm_sys::rm_init::exec_fast_release(device_instance, ctx_idx);
+            log::info!(
+                "[nouveau-uapi] ctx{}: direct-submit state released (status={:#x}, {} submits, {} fenced, {} fence(s) abandoned)",
+                ctx_idx, status, f.submits, f.fenced, abandoned
+            );
+        }
+    }
+
     fn nouveau_owns_rm_channel(&self, owner_pid: u64) -> bool {
         self.nouveau_channels
             .lock()
@@ -10069,9 +10736,29 @@ impl NvidiaGpu {
                         })
                         .collect();
                     const WAIT_TIMEOUT_US: u64 = 1_000_000; // 1 s
-                    let deadline_us =
-                        unsafe { crate::bus::drivers_timer_now_as_micros() } + WAIT_TIMEOUT_US;
-                    match crate::scheme::syncobj::wait(&handles, Some(&points), true, deadline_us) {
+                    let wait_start = unsafe { crate::bus::drivers_timer_now_as_micros() };
+                    let deadline_us = wait_start + WAIT_TIMEOUT_US;
+                    // Direct-submit path: a fence pending on the channel we are
+                    // about to submit on is ordered by the GPFIFO itself, so
+                    // the CPU only waits for OTHER channels' fences (see
+                    // `syncobj::wait_ordered`).
+                    let wait_ctx = self.ctx_idx_for_pid(owner_pid);
+                    let outcome = if self.fast_ctx_ready(device_instance, wait_ctx) {
+                        crate::scheme::syncobj::wait_ordered(
+                            &handles,
+                            Some(&points),
+                            deadline_us,
+                            wait_ctx,
+                        )
+                    } else {
+                        crate::scheme::syncobj::wait(&handles, Some(&points), true, deadline_us)
+                    };
+                    nv::EXEC_WAIT_US.fetch_add(
+                        unsafe { crate::bus::drivers_timer_now_as_micros() }
+                            .wrapping_sub(wait_start),
+                        Ordering::Relaxed,
+                    );
+                    match outcome {
                         crate::scheme::syncobj::WaitOutcome::Signaled { .. } => {
                             log::info!(
                                 "[nouveau-uapi] EXEC: all {} wait syncobj(s) reached their target point -- proceeding to submit",
@@ -10169,6 +10856,14 @@ impl NvidiaGpu {
                         );
                     }
                 }
+                // Direct-submit path (default): GP entries + GPPut + doorbell
+                // written by the kernel itself, fence resolved lazily by the
+                // syncobj layer. Falls through to the RM per-submit path only
+                // when the context could not be prepared (or `nvidia.exec_rm`).
+                if self.fast_ctx_ready(device_instance, ctx_idx) {
+                    return self.exec_fast(ctx_idx, owner_pid, req, pushes);
+                }
+                nv::EXEC_LEGACY_SUBMITS.fetch_add(1, Ordering::Relaxed);
                 if req.sig_count == 0 {
                     // No fence needed -- submit every push plainly, in order.
                     for push in pushes {
@@ -10236,6 +10931,11 @@ impl NvidiaGpu {
                             }
                             gpu_spin();
                         };
+                        nv::EXEC_LEGACY_FENCE_US.fetch_add(
+                            unsafe { crate::bus::drivers_timer_now_as_micros() }
+                                .wrapping_sub(start),
+                            Ordering::Relaxed,
+                        );
                         r.fence_value = unsafe { core::ptr::read_volatile(fence_va) };
                         // 0 = landed (NV_OK), 0x65 = timeout -- the same codes the
                         // C inline poll used, so the match arms below are unchanged.
@@ -10254,235 +10954,13 @@ impl NvidiaGpu {
                         // Stored in LAST_GR_HANG_PROBE for /proc/gpudbg; first
                         // timeout per boot wins (the ring stays wedged after).
                         if !landed {
-                            let bar0 = self._bar0;
-                            let rd = |off: usize| unsafe {
-                                core::ptr::read_volatile((bar0 + off) as *const u32)
-                            };
-                            let wr = |off: usize, v: u32| unsafe {
-                                core::ptr::write_volatile((bar0 + off) as *mut u32, v)
-                            };
-
-                            // work_token encodes runlistId|chId (Turing: bits [19:16]
-                            // = runlistId, bits [11:0] = chId). Capture from exec
-                            // result so the probe names the EXACT channel that timed
-                            // out, not a generic PBDMA0 snapshot that may belong to
-                            // a different concurrent context.
-                            let work_token = r.work_token;
-                            let runlist_id = r.runlist_id;
-                            // Channel ID: low 12 bits of the work-submit token
-                            // (Turing/Ampere kernel_fifo_tu102.c: chId = token & 0xfff).
-                            let ch_id = work_token & 0x0fff;
-
-                            // NV_PGRAPH_STATUS: overall GR busy/idle.
-                            // 0 = idle; any bit set = a sub-engine is active/stalled.
-                            let gr_status = rd(0x0040_0700);
-                            // NV_PGRAPH_TRAPPED_ADDR: the method that stalled GR.
-                            //   bits [20:16] = subchannel, bits [12:0] = method
-                            let gr_trap_addr = rd(0x0040_0704);
-                            let gr_trap_lo = rd(0x0040_0708);
-                            let gr_trap_hi = rd(0x0040_070c);
-
-                            // PBDMA0 ring pointers (GR runlist is usually PBDMA0).
-                            // GP_GET == GP_PUT means the PBDMA finished fetching;
-                            // GP_GET < GP_PUT means it never fetched the push at all.
-                            let pb0_put = rd(0x0004_0000);
-                            let pb0_get = rd(0x0004_0014);
-                            // PBDMA execution state — decodes WHY GP_GET is stuck,
-                            // the one thing GP_PUT/GP_GET alone cannot tell apart:
-                            //   STATUS(0x40100): the PBDMA channel/exec state machine.
-                            //   GET(0x40018): pushbuffer-level get. If it advanced
-                            //     into the pending segment the host DID fetch the
-                            //     entry and is executing/blocked inside the push
-                            //     (a semaphore-acquire NVK baked in -> explicit-sync).
-                            //   INTR_0(0x40108): pending PBDMA interrupts. A blocked
-                            //     semaphore-acquire that exceeds its timeout raises
-                            //     one here; a channel that was simply never scheduled
-                            //     onto the runlist raises none. So INTR_0!=0 => the
-                            //     push was fetched and blocked (semaphore/PB error);
-                            //     INTR_0==0 with GP_GET frozen => never scheduled
-                            //     (runlist/doorbell), NOT a semaphore block.
-                            let pb0_status = rd(0x0004_0100);
-                            let pb0_pbget = rd(0x0004_0018);
-                            let pb0_intr = rd(0x0004_0108);
-
-                            // NV_PFIFO_CHRAM_CHANNEL(ch_id): per-channel PCCSR register.
-                            // Stride is 8 bytes.  The FIRST word (+0x0) is the instance
-                            // pointer; the SECOND word (+0x4) carries channel state:
-                            //   bit 0       = ENABLE
-                            //   bits [27:24] = STATUS (0=IDLE, 1=PENDING, 2=CTX_RELOAD,
-                            //                          3=BUSY/ACTIVE, 4=PENDING_CTX_RELOAD,
-                            //                          5=PENDING_ACQ, 6=ENG_SEL_PENDING)
-                            //   bit 28      = BUSY
-                            // Reading at timeout tells us whether the channel was visible
-                            // to the host FIFO scheduler. Matches the existing decode at
-                            // drivers/src/display/nvidia.rs:3164 (PCCSR0(0x800004)).
-                            let pccsr_off = 0x0080_0004usize + (ch_id as usize) * 8;
-                            let pccsr_val = rd(pccsr_off);
-                            let pccsr_enable = pccsr_val & 1;
-                            let pccsr_busy = (pccsr_val >> 28) & 1;
-                            let pccsr_status = (pccsr_val >> 24) & 0xf;
-
-                            // HUB MMU fault latch (non-replayable, TU102 0xb83080..90).
-                            // valid = bit 31 of INFO1; reason = bits [4:0].
-                            let f_info1 = rd(0x00b8_3090);
-                            let f_addr_lo = rd(0x00b8_3080);
-                            let f_addr_hi = rd(0x00b8_3084);
-                            let f_info0 = rd(0x00b8_3088);
-
-                            // NV_PGRAPH_PRI_FECS_CTXSW_STATUS_FE_0: FECS state machine.
-                            // Non-zero when FECS is mid ctx-switch (save/restore).
-                            // 0x1 = SAVE_CONTEXT, 0x2 = RESTORE_CONTEXT (loading grctx).
-                            let fecs_status = rd(0x0040_9c00);
-                            // NV_PGRAPH_PRI_FECS_HOST_INT_STATUS: FECS interrupt flags.
-                            let fecs_intr = rd(0x0040_9c14);
-                            // NV_PGRAPH_PRI_FECS_CTXSW_MAILBOX(0/1): last FECS ucode
-                            // message and error detail. Ucode updates MAILBOX0 at each
-                            // step of the context-save/restore microcode; a non-zero
-                            // MAILBOX0 with fecs_status==0x2 (RESTORE) shows exactly
-                            // which grctx step the ucode reached before hanging. These
-                            // are the registers an rc_dump uses to diagnose FECS hangs.
-                            let fecs_mb0 = rd(0x0040_9800);
-                            let fecs_mb1 = rd(0x0040_9804);
-                            // NV_PGRAPH_PRI_FECS_CTXSW_PRIV_ERROR_FE_0: privilege
-                            // error flags set if FECS ucode tried to read an invalid
-                            // register (context-image addresses wrong / buffer too small).
-                            let fecs_priv_err = rd(0x0040_9c10);
-
-                            // NV_PGRAPH_PRI_GPC0_GPCCS_CTXSW_STATUS_GPC_0: GPCCS state.
-                            let gpccs_status = rd(0x0041_a000);
-
-                            let drained = pb0_get == pb0_put;
-                            let mmu_valid = (f_info1 >> 31) & 1;
-                            let mmu_reason = f_info1 & 0x1f;
-                            let gr_subchan = (gr_trap_addr >> 16) & 0x1f;
-                            let gr_method = gr_trap_addr & 0x1fff;
-
-                            // Diagnosis hint: one word that names the most likely
-                            // root cause, to guide which fix the maintainer applies.
-                            let hint = if mmu_valid != 0 {
-                                "MMU-FAULT: GPU touched an unmapped VA -- check VM_BIND mappings"
-                            } else if gr_status != 0 && gr_method != 0 {
-                                "GR-STALL: GR engine stuck on a method -- golden-ctx/GR-init incomplete?"
-                            } else if !drained && pb0_intr != 0 {
-                                "PBDMA-STALL (fetched, then BLOCKED): a PBDMA interrupt is pending -- the host fetched the push and stalled inside it, i.e. a semaphore-acquire NVK baked in never released (explicit-sync), or a PB error. Decode INTR_0/STATUS."
-                            } else if !drained {
-                                "PBDMA-STALL (never fetched): GP_GET frozen with no PBDMA interrupt -- the channel is not runlist-resident, so the doorbell/runlist scheduling never ran this push (NOT a semaphore block)."
-                            } else if fecs_status != 0 || gpccs_status != 0 {
-                                "FECS/GPCCS: ctx-switch hang -- GR context-image incomplete or global ctx buffers not mapped; check ctx_prime outcome and grctx init for this client channel's class object"
-                            } else {
-                                "GR-IDLE-NOFENCE: GR finished but fence-semaphore write never arrived -- WFI/coherency?"
-                            };
-
-                            // Recovery attempt for the "never fetched, no PBDMA
-                            // interrupt" case: re-ring the doorbell with the exact
-                            // work-submit token the RM issued for THIS submit.
-                            // Rationale: the PBDMA may have missed the original
-                            // doorbell (GSP-to-host signalling is not guaranteed
-                            // lossless at high submission rates on Turing). Writing
-                            // the token to 0xbb0090 a second time is idempotent if
-                            // the channel is already running, and may unblock it if
-                            // the doorbell was lost. Pure BAR0 write; no RM call.
-                            // Only attempted when GP_GET is frozen AND INTR_0 == 0
-                            // (i.e., the push never made it to the PBDMA at all).
-                            if !drained && pb0_intr == 0 && work_token != 0 {
-                                wr(0x00bb_0090, work_token);
-                                crate::klog_warn!(
-                                    "[nouveau-uapi] EXEC: ctx={} PBDMA-stall recovery: re-rang doorbell token={:#010x} runlist={} ch={}",
-                                    ctx_idx, work_token, runlist_id, ch_id
-                                );
-                            }
-
-                            // FECS ctx-switch hang: log a targeted klog line so
-                            // dmesg immediately points at grctx/golden-context as
-                            // the root. CTXSW_STATUS==0x2 = RESTORE_CONTEXT: FECS
-                            // ucode is stuck trying to load the client channel's GR
-                            // context image. Most likely causes: ctx_prime timed out
-                            // (golden context was never loaded before NVK's first
-                            // push hit the cold load), or a global-ctx-buffer
-                            // (patch/attribute/pagepool) was not mapped for this ctx.
-                            if fecs_status != 0 || gpccs_status != 0 {
-                                crate::klog_warn!(
-                                    "[nouveau-uapi] EXEC: ctx={} FECS/GPCCS ctx-switch hang \
-                                     (FECS_STATUS={:#010x} GPCCS_STATUS={:#010x} \
-                                     MAILBOX0={:#010x} MAILBOX1={:#010x} PRIV_ERR={:#010x}) -- \
-                                     GR context-image for this client channel is incomplete; \
-                                     check whether ctx_prime timed out at CHANNEL_ALLOC \
-                                     (see /proc/gpudbg last PRIME line for ctx={})",
-                                    ctx_idx,
-                                    fecs_status,
-                                    gpccs_status,
-                                    fecs_mb0,
-                                    fecs_mb1,
-                                    fecs_priv_err,
-                                    ctx_idx
-                                );
-                            }
-
-                            // Whether THIS ctx was ever primed: the decisive
-                            // datum for a FECS RESTORE hang. "never recorded"
-                            // here means the EXEC ran on a ctx whose build/prime
-                            // path did not complete -- the exact anomaly a real
-                            // RTX repro exhibited (ctx=3 hung with no prime
-                            // line at all).
-                            let prime_state = nv::prime_line_for(ctx_idx)
-                                .unwrap_or_else(|| {
-                                    alloc::string::String::from(
-                                        "NEVER RECORDED -- this ctx reached EXEC without its build/prime completing",
-                                    )
-                                });
-                            nv::record_gr_hang_probe(alloc::format!(
-                                "ctx={ctx} pid={pid} fence TIMEOUT after {ms}ms\n\
-                                 HINT: {hint}\n\
-                                 prime-state: {prime_state}\n\
-                                 submit: work_token={work_token:#010x} runlist_id={runlist_id} ch_id={ch_id}\n\
-                                 GR_STATUS(0x400700)={gr_status:#010x} (0=idle)\n\
-                                 TRAPPED_ADDR(0x400704)={gr_trap_addr:#010x} subchan={gr_subchan} method={gr_method:#06x}\n\
-                                 TRAPPED_DATA lo={gr_trap_lo:#010x} hi={gr_trap_hi:#010x}\n\
-                                 PBDMA0 GP_PUT(0x40000)={pb0_put:#010x} GP_GET(0x40014)={pb0_get:#010x} drained={drained}\n\
-                                 PBDMA0 STATUS(0x40100)={pb0_status:#010x} GET(0x40018)={pb0_pbget:#010x} INTR_0(0x40108)={pb0_intr:#010x}\n\
-                                 PCCSR ch{ch_id}(0x{pccsr_off:x})={pccsr_val:#010x} enable={pccsr_enable} busy={pccsr_busy} status={pccsr_status} (0=IDLE,1=PENDING,3=ACTIVE)\n\
-                                 MMU FAULT_INFO1(0xb83090)={f_info1:#010x} valid={mmu_valid} reason={mmu_reason:#04x}\n\
-                                   FAULT_ADDR={f_addr_hi:#010x}_{f_addr_lo:#010x} engine_id={engine_id:#04x}\n\
-                                 FECS CTXSW_STATUS(0x409c00)={fecs_status:#010x} (0=IDLE,1=SAVE,2=RESTORE) HOST_INT(0x409c14)={fecs_intr:#010x}\n\
-                                 FECS MAILBOX0(0x409800)={fecs_mb0:#010x} MAILBOX1(0x409804)={fecs_mb1:#010x} PRIV_ERR(0x409c10)={fecs_priv_err:#010x}\n\
-                                 GPCCS GPC0_STATUS(0x41a000)={gpccs_status:#010x}",
-                                ctx = ctx_idx,
-                                pid = owner_pid,
-                                ms = TIMEOUT_MS,
-                                hint = hint,
-                                work_token = work_token,
-                                runlist_id = runlist_id,
-                                ch_id = ch_id,
-                                gr_status = gr_status,
-                                gr_trap_addr = gr_trap_addr,
-                                gr_subchan = gr_subchan,
-                                gr_method = gr_method,
-                                gr_trap_lo = gr_trap_lo,
-                                gr_trap_hi = gr_trap_hi,
-                                pb0_put = pb0_put,
-                                pb0_get = pb0_get,
-                                pb0_status = pb0_status,
-                                pb0_pbget = pb0_pbget,
-                                pb0_intr = pb0_intr,
-                                drained = drained,
-                                pccsr_off = pccsr_off,
-                                pccsr_val = pccsr_val,
-                                pccsr_enable = pccsr_enable,
-                                pccsr_busy = pccsr_busy,
-                                pccsr_status = pccsr_status,
-                                f_info1 = f_info1,
-                                mmu_valid = mmu_valid,
-                                mmu_reason = mmu_reason,
-                                f_addr_hi = f_addr_hi,
-                                f_addr_lo = f_addr_lo,
-                                engine_id = f_info0 & 0xff,
-                                fecs_status = fecs_status,
-                                fecs_intr = fecs_intr,
-                                fecs_mb0 = fecs_mb0,
-                                fecs_mb1 = fecs_mb1,
-                                fecs_priv_err = fecs_priv_err,
-                                gpccs_status = gpccs_status,
-                            ));
+                            self.gr_hang_probe(
+                                ctx_idx,
+                                owner_pid,
+                                r.work_token,
+                                r.runlist_id,
+                                TIMEOUT_MS,
+                            );
                         }
                     }
                 }
@@ -11278,6 +11756,7 @@ impl PciDriver for NvidiaGpuDriverPci {
             )?);
             gpu.set_msi_vector(_irq);
             NVIDIA_GPUS.lock().push(gpu.clone());
+            crate::scheme::syncobj::set_fence_timeout_hook(nouveau_fence_timeout_hook);
             Ok(Device::DrmDisplay(gpu.clone(), gpu))
         } else {
             Err(DeviceError::NoResources)
