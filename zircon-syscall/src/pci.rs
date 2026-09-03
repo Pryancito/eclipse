@@ -53,9 +53,9 @@ impl Syscall<'_> {
         write: bool,
     ) -> ZxResult {
         info!(
-                "pci.cfg_pio_rw: handle={:#x}, addr={:x}:{:x}:{:x}, offset={:#x}, width={:#x}, write={:#}",
-                handle, bus, dev, func, offset, width, write
-            );
+            "pci.cfg_pio_rw: handle={:#x}, addr={:x}:{:x}:{:x}, offset={:#x}, width={:#x}, write={:#}",
+            handle, bus, dev, func, offset, width, write
+        );
         cfg_if::cfg_if! {
             if #[cfg(all(target_arch = "x86_64", target_os = "none"))] {
                 use zircon_object::dev::pci::{pio_config_read, pio_config_write};

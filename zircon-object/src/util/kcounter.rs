@@ -98,6 +98,12 @@ impl Counter {
     }
 }
 
+impl Default for Counter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Head of the descriptor table.
 #[repr(C)]
 #[derive(Debug)]
@@ -169,7 +175,7 @@ impl Debug for AllCounters {
     }
 }
 
-extern "C" {
+unsafe extern "C" {
     fn kcounters_desc_vmo_start();
     fn kcounters_desc_start();
     fn kcounters_desc_end();
@@ -178,7 +184,7 @@ extern "C" {
 }
 
 #[used]
-#[cfg_attr(target_os = "none", link_section = ".kcounter.desc.header")]
+#[cfg_attr(target_os = "none", unsafe(link_section = ".kcounter.desc.header"))]
 static DESCRIPTOR_VMO_HEADER: [u64; 2] = [
     KCOUNTER_MAGIC, // magic
     1,              // max_cpus
@@ -190,11 +196,11 @@ static DESCRIPTOR_VMO_HEADER: [u64; 2] = [
 macro_rules! kcounter {
     ($var:ident, $name:expr) => {
         #[used]
-        #[cfg_attr(target_os = "none", link_section = concat!(".bss.kcounter.", $name))]
+        #[cfg_attr(target_os = "none", unsafe(link_section = concat!(".bss.kcounter.", $name)))]
         static $var: $crate::util::kcounter::Counter = {
             use $crate::util::kcounter::{Counter, Descriptor};
             #[used]
-            #[cfg_attr(target_os = "none", link_section = concat!(".kcounter.desc.", $name))]
+            #[cfg_attr(target_os = "none", unsafe(link_section = concat!(".kcounter.desc.", $name)))]
             static DESCRIPTOR: Descriptor = Descriptor::new($name);
             Counter::new()
         };

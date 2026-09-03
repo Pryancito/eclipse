@@ -1,6 +1,7 @@
 #![cfg_attr(not(feature = "libos"), no_std)]
 #![cfg_attr(not(feature = "libos"), feature(alloc_error_handler))]
 #![deny(warnings)]
+#![allow(unexpected_cfgs)]
 #![no_main]
 
 use core::sync::atomic::{AtomicBool, Ordering};

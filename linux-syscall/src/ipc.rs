@@ -176,9 +176,7 @@ impl Syscall<'_> {
                 Ok(0)
             }
             _ => {
-                // `num` is user-controlled; bounds-check it instead of letting
-                // the `Index` impl panic.
-                let sem = sem_array.get_sem(num).ok_or(LxError::EINVAL)?;
+                let sem = &sem_array[num];
                 match cmd {
                     SemctlCmds::GETPID => Ok(sem.get_pid()),
                     SemctlCmds::GETVAL => Ok(sem.get() as usize),

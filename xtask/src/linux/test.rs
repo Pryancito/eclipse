@@ -1,4 +1,4 @@
-﻿use super::join_path_env;
+use super::join_path_env;
 use crate::{commands::wget, Arch};
 use os_xtask_utils::{dir, CommandExt, Ext, Make, Tar};
 use std::{

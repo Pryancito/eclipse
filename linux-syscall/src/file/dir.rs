@@ -441,11 +441,7 @@ impl Syscall<'_> {
 }
 
 #[allow(dead_code)]
-// Bare `packed` (not `C, packed`) is deliberate: adding the C ABI would align
-// the struct size up to 8 bytes, but the getdents64 wire layout needs the tight
-// 19-byte record. The clippy lint that wants an ABI qualifier does not apply.
-#[allow(clippy::repr_packed_without_abi)]
-#[repr(packed)]
+#[repr(Rust, packed)] // Don't use 'C'. Or its size will align up to 8 bytes.
 pub struct LinuxDirent64 {
     /// Inode number
     ino: u64,

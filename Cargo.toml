@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "1"
 members = [
     "drivers",
     "nvidia-rm-sys",
@@ -16,7 +16,15 @@ members = [
     "hunter",
 ]
 default-members = ["xtask"]
-exclude = ["zircon-user", "rboot", "vendor/btrfs-rs", "smoltcp"]
+exclude = [
+    "zircon-user",
+    "rboot",
+    "vendor/preemptive-scheduler",
+    "vendor/region-allocator",
+]
+
+[patch."https://github.com/DeathWish5/PreemptiveScheduler"]
+executor = { path = "vendor/preemptive-scheduler" }
 
 [profile.release]
 lto = "fat"

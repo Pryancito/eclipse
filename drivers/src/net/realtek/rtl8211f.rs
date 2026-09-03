@@ -4,7 +4,7 @@ use super::mii::*;
 use super::utils::*;
 
 use core::marker::PhantomData;
-use core::mem::size_of;
+use core::mem::{size_of, size_of_val};
 
 use super::Provider;
 use super::{phys_to_virt, virt_to_phys};
@@ -159,10 +159,7 @@ const BMCR_RESET: u32 = 0x8000;
 const BMCR_PDOWN: u32 = 0x0800;
 
 #[derive(Debug, Copy, Clone)]
-// DMA descriptor: the tight 16-byte hardware layout is required; the clippy
-// lint that wants a C ABI qualifier does not apply to this MMIO struct.
-#[allow(clippy::repr_packed_without_abi)]
-#[repr(packed)]
+#[repr(C, packed)]
 pub struct DmaDesc {
     // size: 16
     desc0: u32, // Status
@@ -419,11 +416,11 @@ where
 
         flush_cache(
             virt_to_phys(&self.recv_ring[0] as *const DmaDesc as usize) as u64,
-            core::mem::size_of_val(self.recv_ring) as u64,
+            size_of_val(self.recv_ring) as u64,
         );
         flush_cache(
             virt_to_phys(&self.send_ring[0] as *const DmaDesc as usize) as u64,
-            core::mem::size_of_val(self.send_ring) as u64,
+            size_of_val(self.send_ring) as u64,
         );
 
         // phy_start
@@ -844,11 +841,7 @@ where
 
         let tx_status = read_volatile((self.base + GETH_TX_DMA_STA) as *mut u32) & 0b111;
         // from u-boot
-        if (tx_status != 0b000) && (tx_status != 0b110) {
-            return false;
-        }
-
-        true
+        tx_status == 0b000 || tx_status == 0b110
     }
 
     pub fn geth_send(&mut self, send_buff: &[u8]) -> Result<i32, &str> {
@@ -935,7 +928,10 @@ where
             virt_to_phys(&self.send_ring[desc_count] as *const DmaDesc as usize) as u64,
             size_of::<DmaDesc>() as u64,
         );
-        fence_w();
+        flush_cache(
+            virt_to_phys(self.send_buffers[desc_count]) as u64,
+            send_buff.len() as u64,
+        );
 
         info!(
             "######### TX Descriptor DMA: {:#x}",

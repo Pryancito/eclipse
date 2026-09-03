@@ -655,54 +655,20 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         );
     }
 
-    // Add OSS PCM playback nodes: `/dev/dsp` for card 0, `/dev/dsp1`, … for
-    // the rest (typically remaining analog or extra HDMI functions).
-    {
-        use devfs::DspDev;
-        for (idx, audio) in audio_cards.iter().enumerate() {
-            let fname = if idx == 0 {
-                "dsp".to_string()
-            } else {
-                format!("dsp{}", idx)
-            };
-            info!("/dev/{} -> audio device '{}'", fname, audio.name());
-            if let Err(e) = devfs_root.add(&fname, Arc::new(DspDev::new(audio.clone(), idx))) {
-                warn!("failed to mknod /dev/{}: {:?}", fname, e);
+        // Add mouse devices at `/dev/input/mouseX` and `/dev/input/mice`
+        for (id, m) in MiceDev::from_input_devices(&drivers::all_input().as_vec()) {
+            let fname = id.map_or("mice".to_string(), |id| format!("mouse{}", id));
+            if let Err(e) = input_dev.add(&fname, Arc::new(m)) {
+                warn!("failed to mknod /dev/input/{}: {:?}", fname, e);
             }
         }
     }
 
-    // Native ALSA nodes at `/dev/snd/`: one controlC<card> + pcmC<card>D0p
-    // pair per HDA controller, in the same card order as /dev/dsp<N>. This is
-    // what alsa-lib (aplay, SDL, mpg123, …) talks to; /etc/asound.conf sets
-    // "default" to hw:0,0 (S16LE stereo). Use `plug` for format conversion.
-    {
-        use devfs::{CtlDev, PcmDev};
-        if !audio_cards.is_empty() {
-            match devfs_root.add_dir("snd") {
-                Ok(snd_dir) => {
-                    for (card, audio) in audio_cards.iter().enumerate() {
-                        let ctl = format!("controlC{}", card);
-                        let pcm = format!("pcmC{}D0p", card);
-                        info!(
-                            "/dev/snd/{{{},{}}} -> audio device '{}'",
-                            ctl,
-                            pcm,
-                            audio.name()
-                        );
-                        if let Err(e) =
-                            snd_dir.add(&ctl, Arc::new(CtlDev::new(audio.clone(), card)))
-                        {
-                            warn!("failed to mknod /dev/snd/{}: {:?}", ctl, e);
-                        }
-                        if let Err(e) =
-                            snd_dir.add(&pcm, Arc::new(PcmDev::new(audio.clone(), card)))
-                        {
-                            warn!("failed to mknod /dev/snd/{}: {:?}", pcm, e);
-                        }
-                    }
-                }
-                Err(e) => warn!("failed to mkdir /dev/snd: {:?}", e),
+        // Add input event devices at `/dev/input/eventX`
+        for (id, i) in drivers::all_input().as_vec().iter().enumerate() {
+            let fname = format!("event{}", id);
+            if let Err(e) = input_dev.add(&fname, Arc::new(EventDev::new(i.clone(), id))) {
+                warn!("failed to mknod /dev/input/{}: {:?}", fname, e);
             }
         }
     }
@@ -821,7 +787,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     for (i, uart) in drivers::all_uart().as_vec().iter().enumerate() {
         let fname = format!("ttyS{}", i);
         if let Err(e) = devfs_root.add(&fname, Arc::new(devfs::UartDev::new(i, uart.clone()))) {
-            warn!("failed to mknod /dev/{}: {:?}", &fname, e);
+            warn!("failed to mknod /dev/{}: {:?}", fname, e);
         }
     }
 
@@ -1901,13 +1867,26 @@ fn dcache_put(path: &str, inode: &Arc<dyn INode>) {
 
 /// Split a `path` str to `(base_path, file_name)`
 pub fn split_path(path: &str) -> (&str, &str) {
-    let mut split = path.trim_end_matches('/').rsplitn(2, '/');
-    let file_name = split.next().unwrap();
-    let mut dir_path = split.next().unwrap_or(".");
-    if dir_path.is_empty() {
-        dir_path = "/";
+    let path = path.trim_end_matches('/');
+    match path.rsplit_once('/') {
+        Some(("", file_name)) => ("/", file_name),
+        Some((dir_path, file_name)) => (dir_path, file_name),
+        None => (".", path),
     }
-    (dir_path, file_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_path;
+
+    #[test]
+    fn split_paths() {
+        assert_eq!(split_path("file"), (".", "file"));
+        assert_eq!(split_path("dir/file"), ("dir", "file"));
+        assert_eq!(split_path("/file"), ("/", "file"));
+        assert_eq!(split_path("dir/file/"), ("dir", "file"));
+        assert_eq!(split_path("/"), (".", ""));
+    }
 }
 
 /// Max number of symlinks to follow when resolving a single path. Linux uses

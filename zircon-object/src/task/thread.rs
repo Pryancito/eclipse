@@ -12,7 +12,7 @@ use bitflags::bitflags;
 use cfg_if::cfg_if;
 use futures::{channel::oneshot::*, future::FutureExt, pin_mut, select_biased};
 use kernel_hal::context::UserContext;
-use lock::Mutex;
+use kernel_hal::sync::Mutex;
 
 use self::thread_state::ContextAccessState;
 use super::process::EXT_CANARY;

@@ -22,12 +22,18 @@ extern crate lazy_static;
 mod macros;
 
 mod common;
-pub mod config;
+#[path = "config.rs"]
+mod config_common;
 mod hal_fn;
 mod kernel_handler;
 mod utils;
 
 pub mod drivers;
+
+/// Interrupt-safe synchronization primitives shared by kernel subsystems.
+pub mod sync {
+    pub use zcore_drivers::sync::*;
+}
 
 cfg_if! {
     if #[cfg(feature = "libos")] {
@@ -39,15 +45,11 @@ cfg_if! {
     }
 }
 
-pub(crate) use config::KCONFIG;
+pub(crate) use config_common::KCONFIG;
 pub(crate) use kernel_handler::KHANDLER;
 
-#[cfg(feature = "graphic")]
-pub use common::boot_logo;
-pub use common::{
-    addr, console, context, defs::*, ipi::*, kstats, oops_log, timer_waker, user, watchpoint,
-};
-pub use config::KernelConfig;
+pub use common::{addr, console, context, defs::*, ipi::*, user};
+pub use config_common::KernelConfig;
 pub use imp::{
     boot::{primary_init, primary_init_early, secondary_init},
     *,

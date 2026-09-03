@@ -4,16 +4,14 @@ use zircon_object::{object::KernelObject, task::Process};
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct BootOptions {
+    #[cfg_attr(feature = "linux", allow(dead_code))]
     pub cmdline: String,
     pub log_level: String,
     /// Process run as PID 1 / init (`INIT`), e.g. `/sbin/init`. Empty
     /// or a missing binary means the system boots without a PID 1 init.
     #[cfg(feature = "linux")]
-    pub init_proc: String,
-    /// Process run on every terminal shell (`SHELL`), with PIDs 101.. — empty
-    /// means no terminal shells (e.g. libos, where `INIT` is the one program).
-    #[cfg(feature = "linux")]
-    pub shell_proc: String,
+    #[cfg_attr(feature = "zircon", allow(dead_code))]
+    pub root_proc: String,
 }
 
 fn parse_cmdline(cmdline: &str) -> BTreeMap<&str, &str> {
@@ -86,6 +84,7 @@ pub fn boot_options() -> BootOptions {
     }
 }
 
+#[cfg_attr(all(feature = "linux", feature = "zircon"), allow(dead_code))]
 fn check_exit_code(proc: Arc<Process>) -> i32 {
     let code = proc.exit_code().unwrap_or(-1);
     if code != 0 {
@@ -106,6 +105,7 @@ fn check_exit_code(proc: Arc<Process>) -> i32 {
 }
 
 #[cfg(feature = "libos")]
+#[cfg_attr(all(feature = "linux", feature = "zircon"), allow(dead_code))]
 pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
     let exit_code = if let Some(proc) = proc {
         let future = async move {

@@ -32,6 +32,16 @@ const K_COUNTERS: usize = 10;
 const K_FISTINSTRUMENTATIONDATA: usize = 11;
 const K_HANDLECOUNT: usize = 15;
 
+macro_rules! include_bytes_aligned {
+    ($path: expr) => {{
+        #[repr(C, align(16))]
+        struct Aligned<T>(T);
+
+        static DATA: Aligned<[u8; include_bytes!($path).len()]> = Aligned(*include_bytes!($path));
+        &DATA.0
+    }};
+}
+
 macro_rules! boot_library {
     ($name: expr) => {{
         cfg_if::cfg_if! {
@@ -47,11 +57,11 @@ macro_rules! boot_library {
     ($name: expr, $base_dir: expr) => {{
         #[cfg(feature = "libos")]
         {
-            include_bytes!(concat!($base_dir, "/", $name, "-libos.so"))
+            include_bytes_aligned!(concat!($base_dir, "/", $name, "-libos.so"))
         }
         #[cfg(not(feature = "libos"))]
         {
-            include_bytes!(concat!($base_dir, "/", $name, ".so"))
+            include_bytes_aligned!(concat!($base_dir, "/", $name, ".so"))
         }
     }};
 }

@@ -1,0 +1,35 @@
+﻿name: Deploy docs
+
+on:
+  workflow_dispatch:
+
+env:
+  rust_toolchain: nightly-2026-09-01
+
+permissions:
+  contents: write
+
+jobs:
+  doc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.rust_toolchain }}
+
+      - name: Pull prebuilt images
+        run: make zircon-init
+
+      - name: Build docs
+        run: |
+          cargo doc --no-deps --all-features --workspace
+          .github/scripts/add-doc-index.sh
+
+      - name: Deploy to Github Pages
+        if: ${{ github.ref == 'refs/heads/master' }}
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          branch: gh-pages
+          folder: target/doc

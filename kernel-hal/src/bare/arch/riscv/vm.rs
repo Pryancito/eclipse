@@ -4,7 +4,7 @@ use core::fmt::{Debug, Formatter, Result};
 use core::slice;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use lock::Mutex;
+use crate::sync::Mutex;
 use riscv::{asm, register::satp};
 
 use crate::addr::{align_down, align_up};
@@ -78,14 +78,14 @@ fn init_kernel_page_table() -> PagingResult<PageTable> {
         )?;
     }
     cfg_if! {
-    if #[cfg(any(feature = "board-fu740", feature = "board-c910light"))] {
+    if #[cfg(any(feature = "fu740-drivers", feature = "board-c910light"))] {
         extern "C" {
             fn boot_stack();
             fn boot_stack_top();
         }
         map_range(
-            boot_stack as usize,
-            boot_stack_top as usize,
+            boot_stack as *const () as usize,
+            boot_stack_top as *const () as usize,
             MMUFlags::READ | MMUFlags::WRITE,
             )?;
     }}

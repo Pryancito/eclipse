@@ -2,7 +2,6 @@ use super::{
     boot_page_table::BootPageTable,
     consts::{kernel_mem_info, MAX_HART_NUM, STACK_PAGES_PER_HART},
 };
-use core::arch::naked_asm;
 use dtb_walker::{Dtb, DtbObj, HeaderError::*, Property, Str, WalkOperation::*};
 use kernel_hal::KernelConfig;
 
@@ -15,7 +14,7 @@ use kernel_hal::KernelConfig;
 #[no_mangle]
 #[link_section = ".text.entry"]
 unsafe extern "C" fn _start(hartid: usize, device_tree_paddr: usize) -> ! {
-    naked_asm!(
+    core::arch::naked_asm!(
         "call {select_stack}", // 设置启动栈
         "j    {main}",         // 进入 rust
         select_stack = sym select_stack,
@@ -30,7 +29,7 @@ unsafe extern "C" fn _start(hartid: usize, device_tree_paddr: usize) -> ! {
 /// 裸函数。
 #[unsafe(naked)]
 unsafe extern "C" fn secondary_hart_start(hartid: usize) -> ! {
-    naked_asm!(
+    core::arch::naked_asm!(
         "call {select_stack}", // 设置启动栈
         "j    {main}",         // 进入 rust
         select_stack = sym select_stack,
@@ -48,12 +47,12 @@ extern "C" fn primary_rust_main(hartid: usize, device_tree_paddr: usize) -> ! {
         static mut sbss: u64;
         static mut ebss: u64;
     }
-    unsafe { r0::zero_bss(core::ptr::addr_of_mut!(sbss), core::ptr::addr_of_mut!(ebss)) };
+    unsafe { r0::zero_bss(&raw mut sbss, &raw mut ebss) };
     // 使能启动页表
     let sstatus = unsafe {
-        let pt = core::ptr::addr_of_mut!(BOOT_PAGE_TABLE);
-        (*pt).init();
-        (*pt).launch()
+        let page_table = &mut *core::ptr::addr_of_mut!(BOOT_PAGE_TABLE);
+        page_table.init();
+        page_table.launch()
     };
     let mem_info = kernel_mem_info();
     // 检查设备树
@@ -95,7 +94,7 @@ device tree:       {device_tree_paddr:016x}..{:016x}
 
 /// 副核启动。
 extern "C" fn secondary_rust_main() -> ! {
-    let _ = unsafe { (*core::ptr::addr_of_mut!(BOOT_PAGE_TABLE)).launch() };
+    let _ = unsafe { (&*core::ptr::addr_of!(BOOT_PAGE_TABLE)).launch() };
     crate::secondary_main()
 }
 
@@ -111,7 +110,7 @@ unsafe extern "C" fn select_stack(hartid: usize) {
     #[link_section = ".bss.bootstack"]
     static mut BOOT_STACK: [u8; STACK_LEN_TOTAL] = [0u8; STACK_LEN_TOTAL];
 
-    naked_asm!(
+    core::arch::naked_asm!(
         "   mv   tp, a0",
         "   addi t0, a0,  1
             la   sp, {stack}

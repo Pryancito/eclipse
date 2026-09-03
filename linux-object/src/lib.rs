@@ -6,10 +6,6 @@
 #![allow(clippy::upper_case_acronyms)]
 #![allow(clippy::uninit_vec)]
 
-#[cfg(test)]
-#[macro_use]
-extern crate std;
-
 #[macro_use]
 extern crate alloc;
 

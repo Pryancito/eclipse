@@ -63,7 +63,7 @@ impl Device for MockBlock {
         let mut finish: Box<AtomicUsize> = Box::new(AtomicUsize::new(0));
         let ptr = finish.as_mut() as *mut AtomicUsize;
         self.submit_entry(EntryType::Offset(offset), OpCode::Read, buf, ptr);
-        while unsafe { (*ptr).load(Ordering::Acquire) } == 0 {
+        while unsafe { &*ptr.cast::<AtomicUsize>() }.load(Ordering::Acquire) == 0 {
             wait_for_interrupt();
         }
         assert_eq!(finish.load(Ordering::Relaxed), BLKSIZE);
@@ -74,7 +74,7 @@ impl Device for MockBlock {
         let mut finish: Box<AtomicUsize> = Box::new(AtomicUsize::new(0));
         let ptr = finish.as_mut() as *mut AtomicUsize;
         self.submit_entry(EntryType::Offset(offset), OpCode::Write, buf, ptr);
-        while unsafe { (*ptr).load(Ordering::Acquire) } == 0 {
+        while unsafe { &*ptr.cast::<AtomicUsize>() }.load(Ordering::Acquire) == 0 {
             wait_for_interrupt();
         }
         assert_eq!(finish.load(Ordering::Relaxed), BLKSIZE);
@@ -122,7 +122,7 @@ impl Mocking {
                 break;
             }
             let (_, entry) = self.map.pop_first().unwrap();
-            unsafe { (*entry.finish).store(BLKSIZE, Ordering::Release) };
+            unsafe { &*entry.finish.cast::<AtomicUsize>() }.store(BLKSIZE, Ordering::Release);
             let reason = IpiReason::MockBlock { block_info: 0 };
             send_ipi(entry.cpuid, reason.into()).unwrap();
         }
@@ -140,7 +140,7 @@ static mut QUEUE_BUF: [Entry; QUEUE_SIZE] = [ENTRY; QUEUE_SIZE];
 #[allow(unsafe_code)]
 pub fn mocking(initrd: &'static mut [u8]) -> ! {
     SQ.init_by(Arc::new(SubmitQueue::new(unsafe {
-        core::slice::from_raw_parts_mut(core::ptr::addr_of_mut!(QUEUE_BUF).cast(), QUEUE_SIZE)
+        &mut *(&raw mut QUEUE_BUF)
     })));
     let mut mock = Mocking::new(initrd, SQ.clone());
     MOCK_DISK_READY.store(true, Ordering::Release);

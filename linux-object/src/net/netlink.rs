@@ -14,26 +14,8 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use async_trait::async_trait;
 use bitflags::bitflags;
 use core::{mem::size_of, slice};
-use kernel_hal::net::get_net_device;
-use kernel_hal::thread;
-use lock::Mutex;
-use smoltcp::wire::IpCidr;
-use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address};
-use zcore_drivers::scheme::RouteInfo;
-
-/// Bound queued netlink replies (unread sockets must not grow without limit).
-const NETLINK_RX_QUEUE_MAX: usize = 64;
-
-fn push_netlink_rx(queue: &mut Vec<Vec<u8>>, msg: Vec<u8>) {
-    if queue.len() >= NETLINK_RX_QUEUE_MAX {
-        queue.remove(0);
-    }
-    queue.push(msg);
-}
-
-// Needed by `impl_kobject!`
-#[allow(unused_imports)]
-use zircon_object::object::*;
+use kernel_hal::sync::Mutex;
+use kernel_hal::{net::get_net_device, user::*};
 
 pub struct NetlinkSocketState {
     base: zircon_object::object::KObjectBase,
@@ -139,23 +121,70 @@ impl Socket for NetlinkSocketState {
         if data.len() < size_of::<NetlinkMessageHeader>() {
             return Err(LxError::EINVAL);
         }
-        // Cleared once per `write`, so every message in the batch appends to the
-        // same reply stream — as Linux does.
-        self.data.lock().clear();
-        let whole = data;
-        let mut offset = 0usize;
-        let mut handled = 0usize;
-        // `saturating_sub`, NOT `-`: NLMSG_ALIGN rounds the offset UP, so a
-        // final message whose length is not a multiple of 4 leaves
-        // `offset > whole.len()`. Plain subtraction wraps around in `usize` and
-        // the loop spins forever in the kernel — which is exactly what a
-        // `ip addr flush` did before this line was written this way.
-        while whole.len().saturating_sub(offset) >= size_of::<NetlinkMessageHeader>() {
-            // `read_unaligned`: the batch advances by NLMSG_ALIGN(len), so a
-            // later message need not share the buffer's alignment.
-            #[allow(unsafe_code)]
-            let nlmsg_len = unsafe {
-                core::ptr::read_unaligned(whole.as_ptr().add(offset) as *const NetlinkMessageHeader)
+        #[allow(unsafe_code)]
+        let header = unsafe { &*(data.as_ptr() as *const NetlinkMessageHeader) };
+        if header.nlmsg_len as usize > data.len() {
+            return Err(LxError::EINVAL);
+        }
+        let message_type = NetlinkMessageType::from(header.nlmsg_type);
+        let mut buffer = self.data.lock();
+        buffer.clear();
+        match message_type {
+            NetlinkMessageType::GetLink => {
+                let ifaces = get_net_device();
+                for (i, iface) in ifaces.iter().enumerate() {
+                    let mut msg = Vec::new();
+                    let new_header = NetlinkMessageHeader {
+                        nlmsg_len: 0, // to be determined later
+                        nlmsg_type: NetlinkMessageType::NewLink.into(),
+                        nlmsg_flags: NetlinkMessageFlags::MULTI,
+                        nlmsg_seq: header.nlmsg_seq,
+                        nlmsg_pid: header.nlmsg_pid,
+                    };
+                    msg.push_ext(new_header);
+
+                    let if_info = IfaceInfoMsg {
+                        ifi_family: AddressFamily::Unspecified.into(),
+                        ifi_type: 0,
+                        ifi_index: i as u32,
+                        ifi_flags: 0,
+                        ifi_change: 0,
+                    };
+                    msg.align4();
+                    msg.push_ext(if_info);
+
+                    let mut attrs = Vec::new();
+
+                    let mac_addr = iface.get_mac();
+                    let attr = RouteAttr {
+                        rta_len: (mac_addr.as_bytes().len() + size_of::<RouteAttr>()) as u16,
+                        rta_type: RouteAttrTypes::Address.into(),
+                    };
+                    attrs.align4();
+                    attrs.push_ext(attr);
+                    for byte in mac_addr.as_bytes() {
+                        attrs.push(*byte);
+                    }
+
+                    let ifname = iface.get_ifname();
+                    let attr = RouteAttr {
+                        rta_len: (ifname.len() + size_of::<RouteAttr>()) as u16,
+                        rta_type: RouteAttrTypes::Ifname.into(),
+                    };
+                    attrs.align4();
+                    attrs.push_ext(attr);
+                    for byte in ifname.as_bytes() {
+                        attrs.push(*byte);
+                    }
+
+                    msg.align4();
+                    msg.append(&mut attrs);
+
+                    msg.align4();
+                    msg.set_ext(0, msg.len() as u32);
+
+                    buffer.push(msg);
+                }
             }
             .nlmsg_len as usize;
             // Safe: the loop condition above guarantees `offset + 16 <= len`.

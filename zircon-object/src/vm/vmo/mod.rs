@@ -8,9 +8,8 @@ use {
     },
     bitflags::bitflags,
     core::ops::Deref,
-    core::sync::atomic::{AtomicUsize, Ordering},
+    kernel_hal::sync::{Mutex, MutexGuard},
     kernel_hal::CachePolicy,
-    lock::{Mutex, MutexGuard},
 };
 
 mod paged;

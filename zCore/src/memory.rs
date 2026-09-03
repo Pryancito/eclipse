@@ -10,8 +10,8 @@ use core::{
     ptr::NonNull,
 };
 use customizable_buddy::{BuddyAllocator, LinkedListBuddy, UsizeBuddy};
+use kernel_hal::sync::Mutex;
 use kernel_hal::PhysAddr;
-use lock::Mutex;
 
 static TOTAL_MEMORY: AtomicUsize = AtomicUsize::new(0);
 static USED_MEMORY: AtomicUsize = AtomicUsize::new(0);
@@ -77,18 +77,13 @@ unsafe impl GlobalAlloc for LockedHeap {
 /// 初始化分配器，并将一个小的内存块注册到分配器中，用于启动需要的动态内存。
 pub fn init() {
     unsafe {
-        // Use a raw pointer to the static (no `&`/`&mut` to a `static mut`).
-        let base = core::ptr::addr_of_mut!(MEMORY) as *mut u8;
-        log::info!(
-            "MEMORY = {:#x}..{:#x}",
-            base as usize,
-            base as usize + MEMORY_SIZE
-        );
+        let start = core::ptr::addr_of_mut!(MEMORY).cast::<u8>();
+        let len = core::mem::size_of::<[u8; 2 * 1024 * 1024]>();
+        log::info!("MEMORY = {:#?}", start..start.add(len));
         let mut heap = HEAP.0.lock();
-        let ptr = NonNull::new(base).unwrap();
+        let ptr = NonNull::new_unchecked(start);
         heap.init(core::mem::size_of::<usize>().trailing_zeros() as _, ptr);
-        heap.transfer(ptr, MEMORY_SIZE);
-        TOTAL_MEMORY.fetch_add(MEMORY_SIZE, Ordering::Relaxed);
+        heap.transfer(ptr, len);
     }
 }
 
