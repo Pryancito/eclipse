@@ -668,7 +668,10 @@ impl<'a> TcpSocket<'a> {
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
         self.remote_mss = DEFAULT_MSS;
         self.remote_last_ts = None;
-        self.ack_delay = Some(ACK_DELAY_DEFAULT);
+        // Preserve the socket's configured ACK-delay policy across listen/connect
+        // resets. Callers such as linux-object disable delayed ACK on the fresh
+        // socket before opening it; resetting to the default 10 ms here silently
+        // re-enables the 1-MSS/10 ms slow path.
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
 
@@ -3343,6 +3346,14 @@ mod test {
     }
 
     #[test]
+    fn test_connect_preserves_ack_delay_override() {
+        let mut s = TcpSocket::new(SocketBuffer::new(vec![0; 64]), SocketBuffer::new(vec![0; 64]));
+        s.set_ack_delay(None);
+        s.connect(REMOTE_END, LOCAL_END.port).unwrap();
+        assert_eq!(s.ack_delay(), None);
+    }
+
+    #[test]
     fn test_syn_sent_sanity() {
         let mut s = socket();
         s.local_seq_no = LOCAL_SEQ;
@@ -4597,6 +4608,15 @@ mod test {
         s.listen(IpEndpoint::new(IpAddress::default(), LOCAL_PORT))
             .unwrap();
         assert_eq!(s.state, State::Listen);
+    }
+
+    #[test]
+    fn test_listen_preserves_ack_delay_override() {
+        let mut s = TcpSocket::new(SocketBuffer::new(vec![0; 64]), SocketBuffer::new(vec![0; 64]));
+        s.set_ack_delay(None);
+        s.listen(IpEndpoint::new(IpAddress::default(), LOCAL_PORT))
+            .unwrap();
+        assert_eq!(s.ack_delay(), None);
     }
 
     #[test]
