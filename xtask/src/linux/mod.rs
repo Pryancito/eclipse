@@ -806,6 +806,15 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               export SDL_VIDEO_DRIVER=wayland,x11\n\
               export SDL_AUDIODRIVER=alsa\n\
               export SDL_AUDIO_DRIVER=alsa\n\
+              # OpenAL (openal-soft: supertux2, gzdoom): ALSA only, same rule.\n\
+              # Its pulse probe loads libpulse, whose pa_mutex_new() aborts the\n\
+              # process when the kernel's PI-futex probe answer is not 0/ENOTSUP.\n\
+              export ALSOFT_DRIVERS=alsa\n\
+              # No session bus here: pin the address so libdbus never\n\
+              # `autolaunch:`es (dbus-launch + X11 + dbus-daemon behind pipes,\n\
+              # the chain SDL_Init walks first; gzdoom hung there). With no\n\
+              # daemon the connect is refused at once and apps carry on.\n\
+              export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus\n\
               # wlroots' libinput backend aborts the whole compositor if it\n\
               # enumerates zero input devices ('libinput initialization failed,\n\
               # no input devices'). Without a running udevd to tag devices,\n\

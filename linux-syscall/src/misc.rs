@@ -3,6 +3,7 @@ use core::time::Duration;
 use kernel_hal::timer::timer_now;
 use linux_object::time::*;
 use zircon_object::task::ThreadState;
+use zircon_object::ZxError;
 
 impl Syscall<'_> {
     #[cfg(target_arch = "x86_64")]
@@ -418,28 +419,10 @@ impl Syscall<'_> {
         // NOTE: do NOT parse `op` as bitflags — command values are an enum
         // (WAIT_BITSET=9 would alias WAKE=1 when bits are truncated).
         let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
-        // Priority-inheritance futexes are not implemented. Answer ENOSYS --
-        // and answer it HERE, before `get_futex`, so the reply never depends on
-        // the probe address.
-        //
-        // ENOSYS is not a cop-out, it is the contract userspace decodes. musl's
-        // pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT) probes the kernel
-        // with FUTEX_LOCK_PI on a throwaway word and translates the result:
-        //     if (r == -ENOSYS) return ENOTSUP;   <- the soft "no PI here"
-        //     if (r) return EINVAL;               <- every OTHER errno
-        // so ENOSYS is what makes callers fall back to a plain mutex, and any
-        // other error -- EOPNOTSUPP included -- reaches them as a hard EINVAL.
-        // PulseAudio's pa_mutex_new() asserts `r == 0 || r == ENOTSUP`
-        // (pulsecore/mutex-posix.c:57) and aborts the process on EINVAL.
-        if matches!(
-            cmd,
-            FUTEX_LOCK_PI
-                | FUTEX_UNLOCK_PI
-                | FUTEX_TRYLOCK_PI
-                | FUTEX_WAIT_REQUEUE_PI
-                | FUTEX_CMP_REQUEUE_PI
-                | FUTEX_LOCK_PI2
-        ) {
+        // The requeue-PI pair (glibc condvars over PI mutexes) is not
+        // implemented; glibc falls back to plain requeue on ENOSYS. Answer it
+        // HERE, before `get_futex`, so the reply never depends on the address.
+        if matches!(cmd, FUTEX_WAIT_REQUEUE_PI | FUTEX_CMP_REQUEUE_PI) {
             return Err(LxError::ENOSYS);
         }
         let futex = self
@@ -447,6 +430,127 @@ impl Syscall<'_> {
             .get_futex(uaddr)
             .ok_or(LxError::EINVAL)?;
         match cmd {
+            // ── Priority-inheritance lock ops: LOCK_PI / LOCK_PI2 / TRYLOCK_PI ──
+            //
+            // These MUST work, not merely fail politely. musl's
+            // pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT) probes the
+            // kernel once (src/thread/pthread_mutexattr_setprotocol.c):
+            //
+            //     volatile int lk = 0;
+            //     r = -__syscall(SYS_futex, &lk, FUTEX_LOCK_PI, 0, 0);
+            //     a_store(&check_pi_result, r);
+            //     if (r) return r;            <- the kernel errno, VERBATIM
+            //
+            // There is no translation layer: whatever errno the kernel answers
+            // is what the caller sees. PulseAudio's pa_mutex_new() then asserts
+            // `r == 0 || r == ENOTSUP` (pulsecore/mutex-posix.c:57) and aborts
+            // the whole process otherwise -- which is how supertux2 (OpenAL ->
+            // libpulse) died on real hardware with both ENOSYS (#1046) and,
+            // had it been reached, any other non-95 errno. Rather than guess
+            // which errno each libc/library pair tolerates, implement the ops:
+            // an uncontended FUTEX_LOCK_PI on a zero word succeeds (r == 0),
+            // musl then marks the mutex PI (`attr |= 8`) and routes every
+            // contended lock/unlock of it through LOCK_PI/UNLOCK_PI below.
+            //
+            // Lock-word protocol (Linux ABI, shared with musl/glibc):
+            //   bits 0..30  FUTEX_TID_MASK    owner TID, 0 = free
+            //   bit  30     FUTEX_OWNER_DIED  robust-mutex owner death marker
+            //   bit  31     FUTEX_WAITERS     someone is (or was) blocked in
+            //                                 the kernel; unlock must go there
+            // Acquire: CAS `owner==0` -> `tid | preserved flag bits`. Contended:
+            // set FUTEX_WAITERS, sleep on the word (the enqueue re-checks the
+            // value under the queue lock, so an unlock in between turns into
+            // EAGAIN and a retry, never a lost wakeup), loop. No ownership
+            // hand-off (Linux gives the word straight to the top waiter; here
+            // the unlocker leaves `FUTEX_WAITERS` with owner 0 and wakes one,
+            // and whoever gets there first takes it -- musl's fast path refuses
+            // a non-zero word for PI mutexes, so it always comes back here).
+            // Priority boosting itself is not implemented: this kernel has no
+            // thread priorities, so there is nothing to inherit, and the
+            // lock/unlock protocol above is the whole user-visible contract.
+            FUTEX_LOCK_PI | FUTEX_LOCK_PI2 | FUTEX_TRYLOCK_PI => {
+                const FUTEX_WAITERS: i32 = 0x8000_0000_u32 as i32;
+                const FUTEX_OWNER_DIED: i32 = 0x4000_0000;
+                const FUTEX_TID_MASK: i32 = 0x3fff_ffff;
+                let tid = (self.thread.id() as i32) & FUTEX_TID_MASK;
+                // The timeout is ABSOLUTE: CLOCK_REALTIME for LOCK_PI
+                // (always), and for LOCK_PI2 whichever clock
+                // FUTEX_CLOCK_REALTIME selects (monotonic otherwise).
+                // TRYLOCK_PI never sleeps and ignores it.
+                let deadline = if cmd == FUTEX_TRYLOCK_PI {
+                    None
+                } else {
+                    let timeout_addr: UserInPtr<TimeSpec> = val2.into();
+                    timeout_addr.read_if_not_null()?.map(|timeout| {
+                        let now = if cmd == FUTEX_LOCK_PI || op & FUTEX_CLOCK_REALTIME != 0 {
+                            Duration::from(TimeSpec::now())
+                        } else {
+                            Duration::from(TimeSpec::now_monotonic())
+                        };
+                        timer_now() + Duration::from(timeout).saturating_sub(now)
+                    })
+                };
+                loop {
+                    let cur = futex.load();
+                    let owner = cur & FUTEX_TID_MASK;
+                    if owner == 0 {
+                        // Free (possibly with WAITERS / OWNER_DIED still set):
+                        // take it, keeping those flag bits so a later unlock
+                        // still visits the kernel and a robust owner-death
+                        // marker survives to the new owner (EOWNERDEAD).
+                        let new = tid | (cur & (FUTEX_WAITERS | FUTEX_OWNER_DIED));
+                        if futex.compare_exchange(cur, new).is_ok() {
+                            return Ok(0);
+                        }
+                        continue;
+                    }
+                    if owner == tid {
+                        return Err(LxError::EDEADLK);
+                    }
+                    if cmd == FUTEX_TRYLOCK_PI {
+                        return Err(LxError::EAGAIN);
+                    }
+                    // Contended: publish FUTEX_WAITERS so the owner's unlock
+                    // comes through FUTEX_UNLOCK_PI, then sleep on the word.
+                    let contended = cur | FUTEX_WAITERS;
+                    if cur != contended && futex.compare_exchange(cur, contended).is_err() {
+                        continue;
+                    }
+                    let future = futex.wait(contended);
+                    let res = match deadline {
+                        Some(deadline) => {
+                            self.thread
+                                .blocking_run(future, ThreadState::BlockedFutex, deadline, None)
+                                .await
+                        }
+                        None => future.await,
+                    };
+                    match res {
+                        // Woken by UNLOCK_PI, or the word changed under us
+                        // before we were queued: re-read and retry.
+                        Ok(_) | Err(ZxError::BAD_STATE) => continue,
+                        Err(ZxError::TIMED_OUT) => return Err(LxError::ETIMEDOUT),
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+            FUTEX_UNLOCK_PI => {
+                const FUTEX_WAITERS: i32 = 0x8000_0000_u32 as i32;
+                const FUTEX_TID_MASK: i32 = 0x3fff_ffff;
+                let tid = (self.thread.id() as i32) & FUTEX_TID_MASK;
+                if futex.load() & FUTEX_TID_MASK != tid {
+                    // Only the owner may unlock (Linux: EPERM).
+                    return Err(LxError::EPERM);
+                }
+                // Release under the queue lock (see `store_by_waiters`): with
+                // a waiter queued leave `FUTEX_WAITERS` + owner 0 and wake one
+                // of them; with nobody queued clear the word entirely so the
+                // next lock is a pure-userspace CAS again.
+                if futex.store_by_waiters(FUTEX_WAITERS, 0) {
+                    futex.wake(1);
+                }
+                Ok(0)
+            }
             FUTEX_WAIT | FUTEX_WAIT_BITSET => {
                 // Fast-path EAGAIN: the userspace cmpxchg often loses by the
                 // time we get here (the canonical contended-mutex case in

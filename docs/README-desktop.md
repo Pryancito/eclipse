@@ -151,6 +151,55 @@ mide los fps de una animación sencilla; sale con `SDLPROBE: FAIL ...` y código
 1 si algo falla. Un `video driver in use: x11` con `WAYLAND_DISPLAY` presente
 significa que algo pisó `SDL_VIDEODRIVER`.
 
+## Juegos (supertux2, gzdoom/freedoom)
+
+Los dos se instalan desde los repos de Alpine y se lanzan desde un terminal de
+la sesión (o desde el menú si se añade una entrada):
+
+```sh
+apk add supertux gzdoom freedoom     # binarios: supertux2, gzdoom, freedoom1, freedoom2
+supertux2
+freedoom2                            # = gzdoom -iwad freedoom2.wad
+```
+
+Los dos fallaban en hardware real por causas distintas, y ambas están tapadas
+a la vez por el kernel y por la política de entorno de la sesión:
+
+- **supertux2** abortaba con `Assertion 'r == 0 || r == 95' failed at
+  ../src/pulsecore/mutex-posix.c:57, function pa_mutex_new()`. SuperTux (y
+  gzdoom) usan OpenAL; openal-soft prueba primero pipewire y pulse, y cargar
+  libpulse ejecuta `pa_mutex_new()`, que llama a
+  `pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT)`. musl sondea el kernel
+  con `FUTEX_LOCK_PI` y devuelve **tal cual** el errno del kernel (no hay
+  traducción: `if (r) return r;` en `pthread_mutexattr_setprotocol.c`), y
+  PulseAudio solo acepta 0 o `ENOTSUP`. El kernel implementa ahora
+  `FUTEX_LOCK_PI`/`FUTEX_LOCK_PI2`/`FUTEX_TRYLOCK_PI`/`FUTEX_UNLOCK_PI`
+  (`linux-syscall/src/misc.rs`, protocolo de palabra de bloqueo de Linux:
+  TID del dueño, `FUTEX_WAITERS`, `FUTEX_OWNER_DIED`), así que la sonda
+  devuelve 0 y los mutex PI funcionan de verdad. Además la sesión exporta
+  `ALSOFT_DRIVERS=alsa`, de modo que openal-soft ni siquiera carga libpulse:
+  ALSA es la única API de audio de usuario que hay ([README-audio.md](README-audio.md)).
+- **gzdoom** se quedaba colgado justo tras imprimir `GZDoom 4.14.2 - - SDL
+  version / Compiled on ...`: lo siguiente que hace `main()` es `SDL_Init(0)`,
+  y SDL2 (con cualquier máscara de subsistemas) ejecuta antes que nada
+  `SDL_DBus_Init()`, que pide el bus de sesión a libdbus. Sin
+  `DBUS_SESSION_BUS_ADDRESS`, libdbus usa `autolaunch:`: hace fork de
+  `dbus-launch`, que abre `$DISPLAY` (Xwayland) y lanza un `dbus-daemon` más
+  un proceso «niñera» detrás de tuberías, esperando EOF. La sesión exporta
+  ahora `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus` en los mismos
+  cuatro sitios que la política de SDL (wrapper, `/etc/profile`,
+  `~/.config/labwc/environment`, `eclipse-init`): sin demonio el `connect`
+  falla al instante (`ECONNREFUSED`), SDL desactiva D-Bus y el juego sigue.
+  Si algún día hace falta un bus, basta con arrancarlo en esa ruta
+  (`dbus-daemon --session --address=unix:path=$XDG_RUNTIME_DIR/bus --fork`) y
+  todos los clientes nuevos lo usan sin tocar nada más.
+
+gzdoom necesita OpenGL 3.3+ (o Vulkan): en la sesión pixman va por llvmpipe
+(`LIBGL_ALWAYS_SOFTWARE=1`), que sirve pero es lento; en las sesiones
+`nvidia.wlr_gles2`/`nvidia.wlr_vulkan` usa zink+NVK. Con varios IWAD y sin
+`-iwad`, gzdoom abre su selector GTK; los lanzadores `freedoom1`/`freedoom2`
+ya pasan el IWAD.
+
 ## Atajos de teclado
 
 | Atajo | Acción |

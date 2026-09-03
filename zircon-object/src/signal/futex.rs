@@ -37,9 +37,13 @@ impl Futex {
     /// The parameter `value` is the reference to
     /// an userspace `AtomicI32`. This reference is the
     /// information used in kernel to track what futex given threads are
-    /// waiting on. The kernel does not currently modify the value of
-    /// `*value`. It is up to userspace code to correctly atomically modify this
-    /// value across threads in order to build mutexes and so on.
+    /// waiting on. For the Zircon-style wait/wake/requeue API the kernel never
+    /// modifies `*value`: it is up to userspace code to correctly atomically
+    /// modify this value across threads in order to build mutexes and so on.
+    /// The Linux PI-futex helpers ([`load`](Futex::load),
+    /// [`compare_exchange`](Futex::compare_exchange),
+    /// [`store_by_waiters`](Futex::store_by_waiters)) are the exception: there
+    /// the kernel drives the lock word, as `FUTEX_LOCK_PI`/`UNLOCK_PI` require.
     pub fn new(value: &'static AtomicI32) -> Arc<Self> {
         Arc::new(Futex {
             base: KObjectBase::default(),
@@ -157,6 +161,57 @@ impl Futex {
         // the new value in userspace before issuing the wake; we only need
         // happens-before with that store, not full SeqCst.
         self.value.load(Ordering::Acquire) == expected
+    }
+
+    // ------ Kernel-side word updates (Linux PI futexes) ------
+    //
+    // Linux's priority-inheritance futex ops (FUTEX_LOCK_PI / UNLOCK_PI /
+    // TRYLOCK_PI) differ from every other futex command in that the KERNEL
+    // owns the lock word's transitions: it writes the owner TID into the
+    // word on acquisition, sets FUTEX_WAITERS while a thread blocks, and
+    // clears the word on release. The three helpers below are the only
+    // places this object writes the user word; the plain wait/wake API above
+    // never does.
+
+    /// Load the current value of the futex word.
+    pub fn load(&self) -> i32 {
+        self.value.load(Ordering::SeqCst)
+    }
+
+    /// Compare-and-swap the futex word: `current -> new`. On failure the
+    /// value actually found is returned in `Err`.
+    pub fn compare_exchange(&self, current: i32, new: i32) -> Result<i32, i32> {
+        self.value
+            .compare_exchange(current, new, Ordering::SeqCst, Ordering::SeqCst)
+    }
+
+    /// Store `with_waiters` into the futex word if at least one waiter is
+    /// queued, `without_waiters` otherwise, and report which one happened.
+    ///
+    /// The queue check and the store happen under the queue lock, so they are
+    /// atomic with respect to a waiter's check-and-enqueue in
+    /// [`wait`](Futex::wait): either the waiter is already queued (and the
+    /// caller wakes it), or its enqueue-time value check sees the stored
+    /// value and fails with `BAD_STATE` (so it retries). Without this, an
+    /// unlocker could observe an empty queue, a locker enqueue against the
+    /// still-owned word, and the unlocker then clear the word — a lost
+    /// wakeup. This is `FUTEX_UNLOCK_PI`'s release step.
+    ///
+    /// Queued waiters that were already cancelled (tombstoned) still count:
+    /// the worst case is a stale `with_waiters` value that costs the next
+    /// locker one extra kernel round trip, never a lost wakeup.
+    pub fn store_by_waiters(&self, with_waiters: i32, without_waiters: i32) -> bool {
+        let inner = self.inner.lock();
+        let has_waiters = !inner.waiter_queue.is_empty();
+        self.value.store(
+            if has_waiters {
+                with_waiters
+            } else {
+                without_waiters
+            },
+            Ordering::SeqCst,
+        );
+        has_waiters
     }
 
     // ------ Advanced APIs on Zircon ------
@@ -568,5 +623,46 @@ mod tests {
         futex.wake_single_owner();
         assert!(Arc::ptr_eq(&futex.owner().unwrap(), &thread));
         assert_eq!(futex.wake(1), 0);
+    }
+
+    /// The Linux PI-futex word helpers: CAS acquisition, and the unlock-side
+    /// store that must agree with the wait queue under the queue lock.
+    #[async_std::test]
+    async fn pi_word_helpers() {
+        const WAITERS: i32 = 0x8000_0000_u32 as i32;
+        static VALUE: AtomicI32 = AtomicI32::new(0);
+        let futex = Futex::new(&VALUE);
+
+        // Uncontended acquire: 0 -> tid, exactly what musl's
+        // pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT) probe needs.
+        assert_eq!(futex.load(), 0);
+        assert_eq!(futex.compare_exchange(0, 7), Ok(0));
+        assert_eq!(futex.load(), 7);
+        // A stale expectation fails and reports the real value.
+        assert_eq!(futex.compare_exchange(0, 9), Err(7));
+
+        // Unlock with nobody queued clears the word entirely.
+        assert!(!futex.store_by_waiters(WAITERS, 0));
+        assert_eq!(futex.load(), 0);
+
+        // A blocked locker: owner 7 again, waiter publishes FUTEX_WAITERS and
+        // sleeps on the contended value.
+        assert_eq!(futex.compare_exchange(0, 7), Ok(0));
+        assert_eq!(futex.compare_exchange(7, 7 | WAITERS), Ok(7));
+        let waiter = {
+            let futex = futex.clone();
+            async_std::task::spawn(async move { futex.wait(7 | WAITERS).await })
+        };
+        async_std::task::sleep(Duration::from_millis(10)).await;
+        // Unlock with a waiter queued: the word keeps FUTEX_WAITERS with owner
+        // 0 (so the woken locker's CAS takes it and later unlocks still enter
+        // the kernel), and the caller is told to wake somebody.
+        assert!(futex.store_by_waiters(WAITERS, 0));
+        assert_eq!(futex.load(), WAITERS);
+        assert_eq!(futex.wake(1), 1);
+        waiter.await.unwrap();
+        // The woken locker takes the free word, preserving the flag bit.
+        assert_eq!(futex.compare_exchange(WAITERS, 8 | WAITERS), Ok(WAITERS));
+        assert_eq!(futex.load() & 0x3fff_ffff, 8);
     }
 }

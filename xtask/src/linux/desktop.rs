@@ -1071,7 +1071,18 @@ fn write_labwc_environment(rootfs: &Path) {
           SDL_VIDEODRIVER=wayland,x11\n\
           SDL_VIDEO_DRIVER=wayland,x11\n\
           SDL_AUDIODRIVER=alsa\n\
-          SDL_AUDIO_DRIVER=alsa\n",
+          SDL_AUDIO_DRIVER=alsa\n\
+          # OpenAL (openal-soft) likewise: ALSA only. Its pulse probe loads\n\
+          # libpulse, whose pa_mutex_new() aborts the process when the PI-futex\n\
+          # probe answer is not 0/ENOTSUP -- how supertux2 died. See \"Juegos\"\n\
+          # in docs/README-desktop.md.\n\
+          ALSOFT_DRIVERS=alsa\n\
+          # Pin the D-Bus session address so libdbus never `autolaunch:`es\n\
+          # (dbus-launch + X11 + dbus-daemon + babysitter behind pipes -- the\n\
+          # chain SDL_Init walks first and where gzdoom hung). With no daemon\n\
+          # the connect is refused at once and apps carry on bus-less; a\n\
+          # dbus-daemon bound to this path later is picked up automatically.\n\
+          DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus\n",
     )
     .unwrap();
 }
@@ -1263,6 +1274,23 @@ fn write_labwc_wrapper(rootfs: &Path) {
           : \"${SDL_VIDEO_DRIVER:=wayland,x11}\"; export SDL_VIDEO_DRIVER\n\
           : \"${SDL_AUDIODRIVER:=alsa}\"; export SDL_AUDIODRIVER\n\
           : \"${SDL_AUDIO_DRIVER:=alsa}\"; export SDL_AUDIO_DRIVER\n\
+          # OpenAL (openal-soft: supertux2, gzdoom, ...): same rule as SDL.\n\
+          # Its default backend order is pipewire, pulse, alsa; the pulse probe\n\
+          # loads libpulse, whose pa_mutex_new() aborts the process outright if\n\
+          # the kernel's PI-futex answer is not to its liking. Skip straight to\n\
+          # the ALSA backend, the one audio API this kernel has.\n\
+          : \"${ALSOFT_DRIVERS:=alsa}\"; export ALSOFT_DRIVERS\n\
+          # D-Bus: there is no session bus on Eclipse OS. libdbus's default\n\
+          # for an UNSET address is `autolaunch:`, which forks dbus-launch,\n\
+          # which opens $DISPLAY and spawns a dbus-daemon plus a babysitter\n\
+          # behind pipes -- a fork/exec/pipe chain that SDL_Init() (any flags,\n\
+          # via SDL_DBus_Init) walks before it does anything else. gzdoom hung\n\
+          # right there on real hardware. Pin the address to the conventional\n\
+          # user-bus path instead: with no daemon the connect fails at once\n\
+          # (ECONNREFUSED) and apps carry on without a bus, and a\n\
+          # `dbus-daemon --session --address=unix:path=$XDG_RUNTIME_DIR/bus`\n\
+          # started later is picked up by every new client automatically.\n\
+          : \"${DBUS_SESSION_BUS_ADDRESS:=unix:path=/run/user/0/bus}\"; export DBUS_SESSION_BUS_ADDRESS\n\
           # Backends: DRM for output + libinput for evdev. Naming them keeps\n\
           # wlroots off the headless/X11 autodetect fallbacks when no parent\n\
           # display exists.\n\
@@ -1411,12 +1439,16 @@ mod tests {
         }
 
         // Backend half: SDL2 + SDL3 spellings, Wayland-first with X11 fallback,
-        // ALSA audio. Static, so it must appear in all three files.
+        // ALSA audio -- plus the two pins the games needed: OpenAL on ALSA
+        // (libpulse's pa_mutex_new abort) and a D-Bus session address so
+        // SDL_Init never autolaunches dbus-launch. Static, so all three files.
         for (key, val) in [
             ("SDL_VIDEODRIVER", "wayland,x11"),
             ("SDL_VIDEO_DRIVER", "wayland,x11"),
             ("SDL_AUDIODRIVER", "alsa"),
             ("SDL_AUDIO_DRIVER", "alsa"),
+            ("ALSOFT_DRIVERS", "alsa"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/0/bus"),
         ] {
             assert!(
                 wrapper.contains(&format!(": \"${{{key}:={val}}}\"; export {key}")),
