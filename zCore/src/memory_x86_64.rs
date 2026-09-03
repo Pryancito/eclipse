@@ -473,7 +473,7 @@ cfg_if! {
                             leak_trace_dump(live);
                         }
                     } else {
-                        HOT_LIVE[i].fetch_update(
+                        HOT_LIVE[i].try_update(
                             Ordering::Relaxed,
                             Ordering::Relaxed,
                             |v| Some(v.saturating_sub(1)),

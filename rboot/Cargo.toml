@@ -1,18 +1,25 @@
 [package]
 name = "rboot"
-version = "0.1.6"
+version = "0.2.0"
 authors = ["Runji Wang <wangrunji0408@163.com>"]
-edition = "2021"
-description = "The x86_64 UEFI bootloader for rCore"
+edition = "2024"
+description = "The x86_64 / aarch64 UEFI bootloader for rCore, Eclipse OS flavour"
 
 [dependencies]
-uefi = "0.26"
-uefi-services = { version = "0.23", optional = true }
-uefi-raw = "0.5.2"
-log = "=0.4.20"
-xmas-elf = "0.8"
-x86_64 = { git = "https://github.com/rust-osdev/x86_64", tag = "v0.15.4" }
+uefi = { version = "0.40", features = ["alloc"] }
+uefi-raw = "0.13"
+log = "0.4"
+xmas-elf = "0.10"
+
+# x86_64 without `nightly` (its `step_trait` half needs a nightly >= 2026-07-10
+# and is unused here); `abi_x86_interrupt` is what the diagnostic IDT in
+# src/idt.rs needs.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+x86_64 = { version = "0.15.5", default-features = false, features = ["instructions", "abi_x86_interrupt"] }
 
 [features]
-rboot = ["uefi-services"]
-default = ["rboot"]
+default = ["uefi-boot"]
+# The bootloader binary: uefi's allocator, logger and panic handler. zCore
+# depends on this crate with `default-features = false` for the `BootInfo`
+# types only.
+uefi-boot = ["uefi/global_allocator", "uefi/logger", "uefi/panic_handler"]

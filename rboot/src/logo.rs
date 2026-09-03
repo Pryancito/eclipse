@@ -15,9 +15,8 @@ const LOGO_DATA: &[u8] = include_bytes!("logo.raw");
 
 pub fn draw_centered(mode: ModeInfo, fb_addr: u64) {
     let (sw, sh) = mode.resolution();
-    let sw = sw as usize;
-    let sh = sh as usize;
-    let stride = mode.stride() as usize;
+
+    let stride = mode.stride();
 
     // Only handle 32bpp formats we can map to.
     let fmt = mode.pixel_format();

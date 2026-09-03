@@ -1,6 +1,9 @@
 //! Boot progress bar drawing (UEFI GOP framebuffer).
 //!
 //! Minimal, no_std-friendly: draws a centered progress bar directly into GOP fb.
+// Pixel helpers take (fb, stride, sw, sh, x, y, ...) explicitly: a raw
+// framebuffer, no struct to bundle them into without allocation.
+#![allow(clippy::too_many_arguments)]
 
 use uefi::proto::console::gop::{ModeInfo, PixelFormat};
 
@@ -146,9 +149,8 @@ pub fn bar(mode: ModeInfo, fb_addr: u64, progress: u32) {
     }
 
     let (sw, sh) = mode.resolution();
-    let sw = sw as usize;
-    let sh = sh as usize;
-    let stride = mode.stride() as usize;
+
+    let stride = mode.stride();
     let fb = fb_addr as *mut u32;
 
     let progress = (progress.min(100)) as usize;
@@ -216,6 +218,7 @@ pub fn bar(mode: ModeInfo, fb_addr: u64, progress: u32) {
 }
 
 /// Draw the same bar using raw framebuffer parameters.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub fn bar_raw(fb_addr: u64, stride: usize, sw: usize, sh: usize, progress: u32) {
     let fb = fb_addr as *mut u32;
     let progress = (progress.min(100)) as usize;
@@ -280,6 +283,7 @@ pub fn bar_raw(fb_addr: u64, stride: usize, sw: usize, sh: usize, progress: u32)
 }
 
 /// Draw a small fault marker block at top-left, encoding `tag` and `code` as pixels.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub fn fault_block_raw(fb_addr: u64, stride: usize, sw: usize, sh: usize, tag: u32, code: u32) {
     let fb = fb_addr as *mut u32;
     let w = sw.min(64);

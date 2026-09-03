@@ -310,7 +310,7 @@ pub(super) fn init() -> DeviceResult {
         // SAFETY: called once on BSP during primary_init
         let lapic = Apic::local_apic();
         lapic.set_timer_mode(TimerMode::Periodic);
-        lapic.set_timer_divide(TimerDivide::Div256); // indeed it is Div1, the name is confusing.
+        lapic.set_timer_divide(TimerDivide::Div1);
         let cycles = super::cpu::tsc_hz() / super::super::timer::TICKS_PER_SEC;
         lapic.set_timer_initial(cycles.clamp(1, u32::MAX as u64) as u32);
         lapic.disable_timer();

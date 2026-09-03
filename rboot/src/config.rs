@@ -1,5 +1,3 @@
-// TODO: use no_std serde crate to parse
-
 use core::str::FromStr;
 use log::warn;
 
@@ -27,7 +25,7 @@ pub struct Config<'a> {
     pub kernel_stack_address: u64,
     /// The size of the kernel stack, given in number of 4KiB pages
     pub kernel_stack_size: u64,
-    /// The offset into the virtual address space where the physical memory is mapped
+    /// The virtual address offset from which physical memory is mapped
     pub physical_memory_offset: u64,
     /// The path of kernel ELF
     pub kernel_path: &'a str,
@@ -37,9 +35,30 @@ pub struct Config<'a> {
     pub initramfs: Option<&'a str>,
     /// Kernel command line
     pub cmdline: &'a str,
+    /// UART base physical address (aarch64)
+    pub uart_base: usize,
+    /// GIC base physical address (aarch64)
+    pub gic_base: usize,
+    /// Firmware type (aarch64)
+    pub firmware_type: &'a str,
 }
 
-const DEFAULT_CONFIG: Config = Config {
+#[cfg(target_arch = "aarch64")]
+pub const DEFAULT_CONFIG: Config = Config {
+    kernel_stack_address: 0xFFFF_0000_8000_0000,
+    kernel_stack_size: 512,
+    physical_memory_offset: 0xFFFF_0000_0000_0000,
+    kernel_path: "\\os",
+    resolution: Resolution::Keep,
+    initramfs: None,
+    cmdline: "",
+    uart_base: 0x0900_0000,
+    gic_base: 0x0800_0000,
+    firmware_type: "QEMU",
+};
+
+#[cfg(not(target_arch = "aarch64"))]
+pub const DEFAULT_CONFIG: Config = Config {
     kernel_stack_address: 0xFFFF_FF01_0000_0000,
     kernel_stack_size: 512,
     physical_memory_offset: 0xFFFF_8000_0000_0000,
@@ -47,62 +66,73 @@ const DEFAULT_CONFIG: Config = Config {
     resolution: Resolution::Keep,
     initramfs: None,
     cmdline: "",
+    uart_base: 0,
+    gic_base: 0,
+    firmware_type: "PC",
 };
+
+/// Tolerant numeric parsing: `0x`/`0X` prefixed hex or plain decimal. `None`
+/// (keep the default and warn) instead of panicking on a malformed value —
+/// the same never-brick-boot rule as `resolution` below; the old
+/// `&value[2..]` also sliced out of bounds on short values.
+fn parse_num(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        u64::from_str(value).ok()
+    }
+}
 
 impl<'a> Config<'a> {
     pub fn parse(content: &'a [u8]) -> Self {
         let content = core::str::from_utf8(content).expect("failed to parse config as utf8");
         let mut config = DEFAULT_CONFIG;
-        for line in content.split('\n') {
-            let line = line.trim();
-            // skip empty and comment
+        for line in content.lines() {
+            // skip empty and comment lines
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            // parse 'key=value'
+            // parse 'key=value'; lines without '=' are ignored instead of
+            // aborting the boot.
             let mut iter = line.splitn(2, '=');
-            let key = iter.next().expect("failed to parse key");
-            let value = iter.next().expect("failed to parse value");
+            let key = match iter.next() {
+                Some(k) => k.trim(),
+                None => continue,
+            };
+            let value = match iter.next() {
+                Some(v) => v.trim(),
+                None => continue,
+            };
             config.process(key, value);
         }
         config
     }
 
     fn process(&mut self, key: &str, value: &'a str) {
-        // Tolerant numeric parsing: a malformed value keeps the default and
-        // warns instead of panicking (same never-brick-boot rule as
-        // `resolution` below; the old `&value[2..]` also sliced out of bounds
-        // on short values).
-        let r10 = || match u64::from_str(value) {
-            Ok(v) => Some(v),
-            Err(_) => {
+        let num = || {
+            let v = parse_num(value);
+            if v.is_none() {
                 warn!("invalid number for {}: {:?}; keeping default", key, value);
-                None
             }
-        };
-        let r16 = || {
-            let digits = value.strip_prefix("0x").unwrap_or(value);
-            match u64::from_str_radix(digits, 16) {
-                Ok(v) => Some(v),
-                Err(_) => {
-                    warn!("invalid hex for {}: {:?}; keeping default", key, value);
-                    None
-                }
-            }
+            v
         };
         match key {
             "kernel_stack_address" => {
-                if let Some(v) = r16() {
+                if let Some(v) = num() {
                     self.kernel_stack_address = v;
                 }
             }
             "kernel_stack_size" => {
-                if let Some(v) = r10() {
+                if let Some(v) = num() {
                     self.kernel_stack_size = v;
                 }
             }
             "physical_memory_offset" => {
-                if let Some(v) = r16() {
+                if let Some(v) = num() {
                     self.physical_memory_offset = v;
                 }
             }
@@ -132,6 +162,17 @@ impl<'a> Config<'a> {
             }
             "initramfs" => self.initramfs = Some(value),
             "cmdline" => self.cmdline = value,
+            "uart_base" => {
+                if let Some(v) = num() {
+                    self.uart_base = v as usize;
+                }
+            }
+            "gic_base" => {
+                if let Some(v) = num() {
+                    self.gic_base = v as usize;
+                }
+            }
+            "firmware_type" => self.firmware_type = value,
             _ => warn!("undefined config key: {}", key),
         }
     }

@@ -1,6 +1,7 @@
 [toolchain]
 profile = "minimal"
-# build-std en .cargo/config.toml requiere nightly.
-channel = "nightly-2026-05-01"
-components = ["rust-src"]
-targets = ["x86_64-unknown-uefi"]
+# `#![feature(abi_x86_interrupt)]` (src/idt.rs) keeps this on nightly; same
+# channel as the workspace so one toolchain builds everything.
+channel = "nightly-2026-09-01"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-uefi", "aarch64-unknown-uefi"]

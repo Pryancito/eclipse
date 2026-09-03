@@ -145,7 +145,7 @@ pub fn set_force_tsc_invariant(force: bool) {
 // ---------------------------------------------------------------------------
 // Tickless-idle LAPIC timer re-arming
 // ---------------------------------------------------------------------------
-// The LAPIC timer counts raw CPU cycles: boot programs `TimerDivide::Div256`,
+// The LAPIC timer counts raw CPU cycles: boot programs `TimerDivide::Div1`,
 // which on this hardware behaves as divide-by-1 (see `drivers.rs`). So the
 // initial-count register is just `cycles`. We modulate that count to stretch
 // the periodic tick when a CPU goes idle, then restore it on resume.
@@ -201,7 +201,7 @@ pub fn program_periodic_tick() {
     if Apic::local_apic_ready() {
         let lapic = Apic::local_apic();
         lapic.set_timer_mode(TimerMode::Periodic);
-        lapic.set_timer_divide(TimerDivide::Div256); // actually Div1 (crate naming quirk)
+        lapic.set_timer_divide(TimerDivide::Div1);
         lapic.set_timer_initial(fast_tick_count());
     }
 }
