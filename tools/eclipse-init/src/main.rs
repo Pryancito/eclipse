@@ -171,6 +171,19 @@ const CHILD_ENV: &[&str] = &[
     "SDL_VIDEO_DRIVER=wayland,x11",
     "SDL_AUDIODRIVER=alsa",
     "SDL_AUDIO_DRIVER=alsa",
+    // OpenAL (openal-soft: supertux2, gzdoom): ALSA only, same rule as SDL.
+    // Its default probe order starts with pipewire and pulse; loading
+    // libpulse runs pa_mutex_new(), which aborts the whole process when the
+    // kernel's PI-futex probe answer is not 0/ENOTSUP.
+    "ALSOFT_DRIVERS=alsa",
+    // No D-Bus session bus on Eclipse OS. An UNSET address makes libdbus
+    // `autolaunch:` -- fork dbus-launch, which opens $DISPLAY and spawns a
+    // dbus-daemon plus a babysitter behind pipes -- and SDL_Init() walks
+    // that chain (SDL_DBus_Init) before anything else; gzdoom hung there.
+    // Pinned to the conventional user-bus path, the connect is refused at
+    // once when no daemon runs and apps carry on bus-less; a dbus-daemon
+    // bound to this path later is picked up by new clients automatically.
+    "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus",
 ];
 
 fn log(msg: &str) {
