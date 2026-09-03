@@ -486,6 +486,16 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // and open the syncobj ioctl paths -- all of it on the software
             // desktop that is supposed to keep working. Same image, both
             // machines, and each gets only what its hardware can serve.
+            // `nvidia.exec_rm`: make every nouveau-uAPI EXEC go through the RM
+            // (lookup + BAR1 map + inline fence poll per submit) instead of
+            // the direct-submit path. Only for A/B comparison; see
+            // docs/README-nouveau-uapi.md ("Direct submit").
+            if options.cmdline.contains("nvidia.exec_rm") {
+                kernel_hal::drivers::set_exec_fast_enabled(false);
+                klog_info!(
+                    "Eclipse: nvidia.exec_rm -- EXEC direct-submit path DISABLED (RM per-submit path, synchronous fence poll)"
+                );
+            }
             if options.cmdline.contains("nvidia.nouveau_uapi") {
                 let capable = kernel_hal::drivers::all_drm()
                     .as_vec()

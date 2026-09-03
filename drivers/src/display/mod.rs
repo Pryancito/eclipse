@@ -14,6 +14,8 @@ mod uefi;
 #[cfg(target_arch = "x86_64")]
 pub use nouveau_uapi::{enabled as nouveau_uapi_enabled, set_enabled as set_nouveau_uapi_enabled};
 #[cfg(target_arch = "x86_64")]
+pub use nouveau_uapi::{exec_fast_enabled, set_exec_fast_enabled};
+#[cfg(target_arch = "x86_64")]
 pub use nvidia::{
     boot_edid, hdmi_audio_status, nvidia_hda_is_monitor_gpu, set_boot_edid, set_boot_fb_info,
     NvidiaGpu, NvidiaGpuDriverPci,

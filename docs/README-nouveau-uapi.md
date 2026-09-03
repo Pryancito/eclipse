@@ -108,6 +108,102 @@ contenido del caller haya enlazado — algo que esta función genérica no
 puede asumir con seguridad). Una prueba real de finalización de motor
 (el equivalente a un `dma_fence` de verdad) es trabajo de seguimiento.
 
+## Submit directo: `EXEC` sin entrar al RM, con fences pendientes
+
+Medido en la RTX, `glxgears` con `vblank_mode=0` daba ~720 FPS bajo Eclipse
+frente a ~12 000 en Linux con la misma GPU. El coste no estaba en la GPU sino
+en lo que el kernel hacía **en cada** `EXEC`:
+
+1. `eclipse_rm_exec_submit[_signaled]` entraba al RM en cada envío: cerrojos
+   API+GPU, búsqueda del canal y del buffer en el *resource server*, un
+   **mapeo BAR1 nuevo del USERD** (que vive en VRAM) vía
+   `memmgrMemDescBeginTransfer(USE_BAR1)` — es decir, reserva de VA de BAR1,
+   escritura de PTEs de la GMMU y un mapeo MMIO del kernel, deshecho de nuevo
+   en `EndTransfer` — y varias líneas de `nv_printf` capturadas y formateadas.
+2. Después, el ioctl **bloqueaba la CPU** haciendo *polling* del semáforo
+   del fence hasta que la GPU consumía el push: CPU y GPU se serializaban en
+   cada frame, para glxgears, para el blit de Xwayland y para el compositor.
+
+Nada de eso lo hace nouveau en Linux: por envío escribe dos entradas GP en
+el anillo, sube `GPPut` y toca el *doorbell* (desde userspace, incluso), y el
+syncobj se señala cuando aterriza la fence, sin que nadie espere.
+
+### Cómo funciona ahora (por defecto)
+
+- **Preparación, una vez por contexto** (`eclipse_rm_exec_fast_prepare`,
+  `nvidia-rm-sys/vendor/eclipse_rm_init.c`): bajo los mismos cerrojos que
+  usaba cada envío, el RM calcula lo que es **constante** para el canal —
+  el *work-submit token* (función pura de `runlist|chId` en Turing), un
+  **mapeo BAR1 persistente** del USERD (`memdescMapOld`, que se libera en
+  `eclipse_rm_exec_fast_release` justo antes de `ctx_free`), las direcciones
+  físicas de las tres páginas de sysmem que toca un envío (anillo GPFIFO en
+  `0xC000`, 128 *streams* de método `SEM RELEASE` de 32 B en `0xA000..0xB000`,
+  zona de aterrizaje `u32` en `0xB000`) y el offset BAR0 del *doorbell*
+  (`sriovState.virtualRegPhysOffset + NV_VIRTUAL_FUNCTION_DOORBELL`, lo mismo
+  que hace `kfifoUpdateUsermodeDoorbell_TU102`). Devuelve además los valores
+  codificados con las macros DRF del SDK para un push de prueba, y el kernel
+  **comprueba que su propio codificador coincide** antes del primer envío
+  real (si no coincide, ese contexto se queda en la ruta del RM y lo dice).
+- **Envío, desde Rust y sin RM** (`fast_submit`, `drivers/src/display/nvidia.rs`):
+  con un spinlock por driver de unos microsegundos, lee `GPGet`/`GPPut` por la
+  ventana BAR1, escribe una entrada GP por push, un *stream* `SEM RELEASE`
+  en la ranura del anillo que ocupa la fence (así nunca se reescribe un
+  *stream* que el PBDMA no haya consumido: reutilizar la ranura implica que
+  `GPGet` pasó por ella), `sfence`, `GPPut`, `sfence`, *doorbell*. Si el
+  anillo está lleno espera hasta 1 s a que `GPGet` avance y, si no, latchea el
+  contexto como *wedged* y captura la sonda de cuelgue de GR (la misma que
+  antes).
+- **Fence pendiente** (`syncobj::attach_hw_fence`): en vez de esperar, `EXEC`
+  registra «el syncobj S alcanza el punto N cuando `*zona >= payload`» y
+  vuelve. El payload es una secuencia monótona por contexto (empieza en 1;
+  la zona empieza en 0) y la comparación es *wrapping* `>=`, así que varias
+  fences en vuelo comparten una sola zona sin ambigüedad. La resolución es
+  **perezosa**: cada acceso a la tabla de syncobjs (`WAIT`, `QUERY`,
+  `EXPORT`/`IMPORT_SYNC_FILE`, `TRANSFER`, el propio `EXEC`) resuelve primero
+  las fences que ya aterrizaron. Para el único cliente que no vuelve a
+  preguntar — un `SYNCOBJ_EVENTFD` armado (wlroots/Xwayland con *explicit
+  sync*) — `linux-object/src/fs/syncobj_eventfd.rs` arma un temporizador de
+  250 µs mientras haya *waiters* y fences pendientes, y nada más.
+- **Esperas de `EXEC` (`wait_count > 0`)**: una fence pendiente **en el mismo
+  canal** en el que se va a enviar cuenta como satisfecha sin esperar
+  (`syncobj::wait_ordered`), porque el GPFIFO ejecuta en orden — el nuevo
+  envío no puede correr antes de que aterrice. Solo las fences de OTROS
+  canales (otro proceso, un `sync_file` importado) se esperan en CPU.
+- **Timeout**: una fence que no aterriza en 1 s dispara el *hook* de timeout
+  (`nouveau_fence_timeout_hook`), que latchea el contexto *wedged* (nunca el
+  0, el del compositor), captura la sonda de GR y libera al *waiter*
+  señalando el punto — exactamente lo que un canal matado hace en Linux: la
+  espera vuelve, y el siguiente `EXEC` del cliente falla con `EIO` (NVK:
+  *device lost*). Al liberar un contexto (`fast_release`), las fences que ya
+  nunca pueden aterrizar se abandonan señalándolas, para que un compositor
+  que esperase el buffer de un cliente muerto siga adelante.
+
+`EXEC` con `sig_count == 0` sigue sin fence (entradas GP y ya). Un contexto
+cuya preparación falle (o cuyo codificador no pase la auto-comprobación) se
+queda **para siempre** en la ruta del RM, sin reintentar en cada envío.
+
+### Cómo comparar y qué mirar
+
+- `nvidia.exec_rm` en la cmdline desactiva la ruta directa (todo por el RM,
+  con el *poll* síncrono de antes). Sirve para A/B con el mismo binario.
+- `cat /proc/gpudbg` tiene ahora una sección `nouveau ioctl profile`:
+  recuento, tiempo total/medio/máximo **por ioctl** de la uAPI, envíos
+  directos frente a por RM, microsegundos gastados esperando ranura de anillo
+  o syncobjs en CPU, y la latencia envío→aterrizaje de las fences. Es
+  acumulativa: dos lecturas separadas por N segundos de `glxgears` dicen
+  cuántos µs de kernel cuesta cada frame y en qué ioctl.
+- En `dmesg`, `direct submit ACTIVE (token=… doorbell=BAR0+…)` por contexto
+  confirma la ruta; `direct submit encoder self-check FAILED` o
+  `exec_fast_prepare … failed` explican una caída a la ruta del RM.
+
+### Qué NO cambia
+
+La fence sigue siendo un `SEM RELEASE` host con `WFI` deshabilitado tras el
+último push: prueba que PBDMA/HOST consumió la entrada del caller, no que el
+motor terminó (ver «Qué prueba de verdad una señal de `EXEC`»). La espera en
+`SYNCOBJ_WAIT` sigue siendo un *spin* acotado por las razones de siempre —
+pero ahora suele encontrar la fence ya aterrizada.
+
 ## Reclamo al salir el proceso
 
 `linux-object` ya tenía un hook de salida de proceso
@@ -224,7 +320,9 @@ escalera compartida `step16` (client/device/subdevice) se construyen hasta
 
 ## Huecos conocidos y qué se necesita para cerrarlos
 
-- **`EXEC` con `wait_count > 0` espera por CPU, no por hardware**: bloquea
+- **`EXEC` con `wait_count > 0` espera por CPU, no por hardware** (salvo
+  las fences pendientes del mismo canal, que la ruta directa da por
+  ordenadas — ver «Submit directo»): bloquea
   la propia llamada al ioctl (con `crate::scheme::syncobj::wait`,
   `wait_all=true`, timeout fijo de 1 s para el arreglo completo) hasta
   que TODOS los syncobjs de espera señalen, y SOLO ENTONCES somete el

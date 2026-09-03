@@ -1873,3 +1873,79 @@ pub fn exec_submit_async(
         Err(status)
     }
 }
+
+// ---------------------------------------------------------------------
+// Direct-submit fast path (nouveau-uAPI EXEC without an RM entry per
+// submission). See `eclipse_rm_exec_fast_prepare`'s doc in
+// vendor/eclipse_rm_init.c: the RM computes the per-channel CONSTANTS once
+// (work-submit token, a persistent BAR1 mapping of the vidmem USERD, the
+// physical pages of the ring/fence scratch, the doorbell register) and the
+// driver then performs each submit itself -- GP entries, GPPut, doorbell --
+// exactly the three things real nouveau does per submit.
+// ---------------------------------------------------------------------
+
+/// Mirror of `EclipseExecFast` (vendor/eclipse_rm_init.c). Field order and
+/// widths are the ABI; keep both sides identical.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExecFast {
+    pub status: NvU32,
+    pub work_token: NvU32,
+    pub runlist_id: NvU32,
+    pub userd_size: NvU32,
+    pub userd_cpu: u64,
+    pub fence_pb_phys: u64,
+    pub fence_sem_phys: u64,
+    pub gpfifo_phys: u64,
+    pub buf_gpu_va: u64,
+    pub gpfifo_entries: NvU32,
+    pub doorbell_reg: NvU32,
+    pub fence_pb_off: NvU32,
+    pub fence_sem_off: NvU32,
+    pub gpfifo_off: NvU32,
+    pub slot_bytes: NvU32,
+    pub chk_gp_entry0: NvU32,
+    pub chk_gp_entry1: NvU32,
+    pub chk_sem_hdr: NvU32,
+    pub chk_sem_addr_hi: NvU32,
+    pub chk_sem_execute: NvU32,
+    pub userd_gpget_off: NvU32,
+    pub userd_gpput_off: NvU32,
+}
+
+/// The push VA / length the C side encodes into `chk_gp_entry0/1` and
+/// `chk_sem_addr_hi`, so the Rust encoder can be checked against the SDK's
+/// DRF macros at prepare time (`ECLIPSE_FAST_CHK_VA` / `_LEN` in C).
+pub const EXEC_FAST_CHK_VA: u64 = 0x0000_00A5_0001_23F0;
+pub const EXEC_FAST_CHK_LEN: u32 = 0x1F0;
+
+extern "C" {
+    fn eclipse_rm_exec_fast_prepare(
+        gpu_instance: NvU32,
+        ctx_idx: NvU32,
+        out: *mut ExecFast,
+    ) -> NV_STATUS;
+    fn eclipse_rm_exec_fast_release(gpu_instance: NvU32, ctx_idx: NvU32) -> NV_STATUS;
+}
+
+/// Compute (and map) the per-channel constants of context `ctx_idx` for the
+/// direct-submit path. Idempotent: a second call reuses the USERD mapping.
+/// `Err(status)` when the RM call itself failed; `Ok(f)` with `f.status !=
+/// NV_OK` when a stage inside failed (the C trace names it).
+pub fn exec_fast_prepare(device_instance: u32, ctx_idx: u32) -> Result<ExecFast, NV_STATUS> {
+    let _gate = RmGate::lock();
+    let mut out = ExecFast::default();
+    let status = unsafe { eclipse_rm_exec_fast_prepare(device_instance, ctx_idx, &mut out) };
+    if status == NV_OK {
+        Ok(out)
+    } else {
+        Err(status)
+    }
+}
+
+/// Drop the persistent USERD mapping of `ctx_idx`. Call BEFORE [`ctx_free`],
+/// and only once no direct submit can still be touching the window.
+pub fn exec_fast_release(device_instance: u32, ctx_idx: u32) -> NV_STATUS {
+    let _gate = RmGate::lock();
+    unsafe { eclipse_rm_exec_fast_release(device_instance, ctx_idx) }
+}
