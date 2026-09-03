@@ -1203,10 +1203,23 @@ fn supervise(services: &mut BTreeMap<String, Service>) {
 /// Stop everything and ask the kernel to reboot (`reboot == true`) or power
 /// off. Best-effort: SIGTERM to all, a short grace period, SIGKILL, sync, then
 /// the reboot syscall. If the kernel cannot reboot, halt in a pause loop.
+///
+/// `kill(-1, sig)` must not reach PID 1 itself (Linux excludes the caller and
+/// init; the Eclipse kernel now does too). On a kernel that still includes the
+/// caller the SIGKILL broadcast would terminate init right here and reboot(2)
+/// would never run, which is exactly how power off / reboot used to do
+/// nothing. Ignoring our own shutdown signals first at least keeps a stray
+/// SIGTERM/SIGINT from cutting the grace period short.
 fn shutdown(reboot: bool, _services: &mut BTreeMap<String, Service>) {
     log(if reboot { "rebooting" } else { "powering off" });
 
     unsafe {
+        // A second request while shutting down changes nothing; make sure it
+        // cannot interrupt the grace sleep either.
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGUSR1, libc::SIGUSR2] {
+            libc::signal(sig, libc::SIG_IGN);
+        }
+
         // Politely ask every process to terminate, then force it.
         libc::kill(-1, libc::SIGTERM);
         sleep_secs(2);
@@ -1218,9 +1231,13 @@ fn shutdown(reboot: bool, _services: &mut BTreeMap<String, Service>) {
         } else {
             libc::RB_POWER_OFF
         };
+        // A successful reboot(2) never returns.
         libc::reboot(cmd);
         // reboot(2) failed (ENOSYS or denied): nothing left to do but idle.
-        log("reboot syscall returned; halting");
+        log(&format!(
+            "reboot syscall returned (errno {}); halting",
+            errno()
+        ));
         loop {
             libc::pause();
         }
@@ -1236,11 +1253,21 @@ fn errno() -> libc::c_int {
     unsafe { *libc::__errno_location() }
 }
 
+/// Sleep for the full `secs`, resuming after any EINTR (unlike
+/// [`sleep_interruptible`], which deliberately returns early on a signal).
+/// Used for the shutdown grace period, which a signal must not shorten. The
+/// remainder is recomputed from a monotonic clock rather than taken from
+/// nanosleep's `rem`, which the Eclipse kernel does not fill in.
 fn sleep_secs(secs: u64) {
-    let ts = libc::timespec {
-        tv_sec: secs as libc::time_t,
-        tv_nsec: 0,
-    };
-    // SAFETY: valid timespec; null remainder.
-    unsafe { libc::nanosleep(&ts, core::ptr::null_mut()) };
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        sleep_interruptible(left);
+        if errno() != libc::EINTR {
+            return;
+        }
+    }
 }

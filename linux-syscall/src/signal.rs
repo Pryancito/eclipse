@@ -199,20 +199,46 @@ impl Syscall<'_> {
                 // This matches the common shell behavior of setting fg_pgrp = child pid.
                 send_to_pid(pgid)
             }
-            SendTarget::EveryProcess => match signal {
-                Signal::SIGKILL => {
-                    for proc in linux_object::process::all_live_processes() {
-                        let retcode = (128 + Signal::SIGKILL as i32) as i64;
-                        if caller.id() == proc.id() {
-                            caller.exit(retcode);
-                        } else {
-                            proc.exit(retcode);
+            SendTarget::EveryProcess => {
+                // kill(-1, sig) reaches every process EXCEPT the caller and
+                // init (PID 1), as on Linux. The old code included the caller:
+                // eclipse-init's shutdown() does `kill(-1, SIGTERM)`, a grace
+                // sleep, `kill(-1, SIGKILL)` and only then reboot(2) -- so PID 1
+                // killed itself on the SIGKILL broadcast (and cut its own grace
+                // sleep short with the SIGTERM one) and reboot(2) was never
+                // reached: "Apagar"/"Reiniciar" and `poweroff`/`reboot` left a
+                // machine with no processes and no power transition.
+                let skip = |proc: &Arc<zircon_object::task::Process>| {
+                    proc.id() == caller.id() || proc.id() == linux_object::process::INIT_PID
+                };
+                let mut any = false;
+                for proc in linux_object::process::all_live_processes() {
+                    if skip(&proc) {
+                        continue;
+                    }
+                    match signal {
+                        Signal::SIGKILL => {
+                            proc.exit((128 + Signal::SIGKILL as i32) as i64);
+                            any = true;
+                        }
+                        sig => {
+                            if linux_object::process::send_signal_to_process(
+                                proc.id() as usize,
+                                sig,
+                            )
+                            .is_ok()
+                            {
+                                any = true;
+                            }
                         }
                     }
-                    Ok(0)
                 }
-                sig => linux_object::process::send_signal_to_all_processes(sig).map(|_| 0),
-            },
+                if any {
+                    Ok(0)
+                } else {
+                    Err(LxError::ESRCH)
+                }
+            }
         }
     }
 
