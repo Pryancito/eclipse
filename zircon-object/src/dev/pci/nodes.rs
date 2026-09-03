@@ -17,7 +17,7 @@ use alloc::{
     vec::Vec,
 };
 use kernel_hal::interrupt;
-use lock::{Mutex, MutexGuard};
+use kernel_hal::sync::{Mutex, MutexGuard};
 use numeric_enum_macro::numeric_enum;
 use region_alloc::RegionAllocator;
 
@@ -277,10 +277,11 @@ impl SharedLegacyIrqHandler {
 
 numeric_enum! {
     #[repr(u32)]
-    #[derive(Debug, PartialEq, Eq, Copy, Clone)]
+    #[derive(Debug, PartialEq, Eq, Copy, Clone, Default)]
       /// Enumeration which defines the IRQ modes a PCIe device may be operating in.
       pub enum PcieIrqMode {
         /// All IRQs are disabled.  0 total IRQs are supported in this mode.
+        #[default]
         Disabled = 0,
         ///    Devices may support up to 1 legacy IRQ in total.  Exclusive IRQ access
         ///    cannot be guaranteed (the IRQ may be shared with other devices)
@@ -293,15 +294,6 @@ numeric_enum! {
         MsiX = 3,
         #[allow(missing_docs)]
         Count = 4,
-    }
-}
-
-// Kept explicit rather than derived: this default semantically pins "IRQs
-// disabled", independent of the enum's variant ordering.
-#[allow(clippy::derivable_impls)]
-impl Default for PcieIrqMode {
-    fn default() -> Self {
-        PcieIrqMode::Disabled
     }
 }
 

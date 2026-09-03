@@ -266,30 +266,28 @@ pub(super) fn init() -> DeviceResult {
         }
     }
 
-    // PS/2 Keyboard and Mouse initialization and registration
-    let ps2_input = Arc::new(zcore_drivers::input::Ps2Input::new());
-    irq.register_device(trap::X86_ISA_IRQ_KEYBOARD, ps2_input.clone().upcast())?;
-    irq.unmask(trap::X86_ISA_IRQ_KEYBOARD)?;
-    irq.register_device(trap::X86_ISA_IRQ_MOUSE, ps2_input.clone().upcast())?;
-    irq.unmask(trap::X86_ISA_IRQ_MOUSE)?;
-    drivers::add_device(Device::Input(ps2_input));
-    // ACPI power button (SCI) — OPT-IN via `acpi.powerbtn`, default OFF.
-    //
-    // The SCI is a LEVEL-triggered, SHARED ACPI interrupt: on real hardware the
-    // firmware routes General Purpose Events (embedded controller, thermal
-    // zones, lid, ...) to it, not just the power button. This handler only
-    // reads/clears the PM1 power-button status bit; it has no AML interpreter
-    // or GPE dispatcher, so it cannot service or CLEAR any other source. On a
-    // level-triggered line an unhandled GPE keeps the line asserted, so once
-    // unmasked the SCI re-fires forever -> an interrupt storm that starves the
-    // PS/2 mouse (IRQ 12, unmasked just above) and keyboard (IRQ 1): the
-    // pointer froze / stopped drawing on real hardware. QEMU rarely raises
-    // those GPEs, so it only bit bare metal. Until the handler drains the GPE
-    // status blocks (GPE0/GPE1 STS write-1-to-clear) the safe default is to
-    // leave the SCI MASKED — input is never starved. Opt in with `acpi.powerbtn`
-    // once GPE draining lands and can be validated on hardware.
-    if crate::KCONFIG.cmdline.contains("acpi.powerbtn") {
-        init_acpi_power_button(&irq);
+    use x2apic::lapic::{TimerDivide, TimerMode};
+
+    irq.register_local_apic_handler(trap::X86_INT_APIC_TIMER, Box::new(super::trap::super_timer))?;
+
+    // SAFETY: this will be called once and only once for every core
+    Apic::local_apic().set_timer_mode(TimerMode::Periodic);
+    Apic::local_apic().set_timer_divide(TimerDivide::Div1);
+    let cycles =
+        super::cpu::cpu_frequency() as u64 * 1_000_000 / super::super::timer::TICKS_PER_SEC;
+    Apic::local_apic().set_timer_initial(cycles as u32);
+    Apic::local_apic().disable_timer();
+
+    drivers::add_device(Device::Irq(irq));
+
+    #[cfg(not(feature = "no-pci"))]
+    {
+        // PCI scan
+        use zcore_drivers::bus::pci;
+        let pci_devs = pci::init(None)?;
+        for d in pci_devs.into_iter() {
+            drivers::add_device(d);
+        }
     }
 
     use x2apic::lapic::{TimerDivide, TimerMode};

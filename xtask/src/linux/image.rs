@@ -1,5 +1,5 @@
-use crate::{commands::wget, Arch, PROJECT_DIR, TARGET};
-use os_xtask_utils::{dir, CommandExt, Tar};
+use crate::{commands::wget, Arch, PROJECT_DIR};
+use os_xtask_utils::{dir, CommandExt, Qemu, Tar};
 use std::{fs, path::Path};
 
 /// ESP / primera partición (EFI). Debe coincidir con `PART1_SIZE_MIB` en
@@ -445,7 +445,7 @@ impl super::LinuxRootfs {
         let image = inner.join(format!("{arch}.img", arch = self.0.name()));
         // aarch64 还需要下载 firmware
         if let Arch::Aarch64 = self.0 {
-            const URL:&str = "https://github.com/Luchangcheng2333/rayboot/releases/download/2.0.0/aarch64_firmware.tar.gz";
+            const URL: &str = "https://github.com/Luchangcheng2333/rayboot/releases/download/2.0.0/aarch64_firmware.tar.gz";
             let aarch64_tar = self.0.origin().join("Aarch64_firmware.zip");
             wget(URL, &aarch64_tar);
 
@@ -463,7 +463,14 @@ impl super::LinuxRootfs {
             fs::copy(fw_dir.join("Boot.json"), boot_dir.join("Boot.json")).unwrap();
         }
         // 生成镜像
-        fuse(self.path(), &image, 48 * 1024 * 1024);
+        fuse(self.path(), &image);
+        // 扩充一些额外空间，供某些测试使用
+        Qemu::img()
+            .arg("resize")
+            .args(["-f", "raw"])
+            .arg(image)
+            .arg("+5M")
+            .invoke();
     }
 }
 

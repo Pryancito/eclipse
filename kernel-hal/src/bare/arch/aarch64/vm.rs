@@ -1,12 +1,12 @@
 use crate::hal_fn::mem::phys_to_virt;
 use crate::imp::config::*;
+use crate::sync::Mutex;
 use crate::utils::page_table::{GenericPTE, PageTableImpl, PageTableLevel4};
 use crate::MMUFlags;
 use crate::{PhysAddr, VirtAddr, KCONFIG};
 use core::fmt::{Debug, Formatter, Result};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use cortex_a::registers::*;
-use lock::Mutex;
 use tock_registers::interfaces::{Readable, Writeable};
 use zcore_drivers::irq::gic_400::{GICC_SIZE, GICD_SIZE};
 

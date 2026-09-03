@@ -34,52 +34,36 @@ impl LocalApic {
     }
 
     pub unsafe fn get<'a>() -> &'a mut LocalApic {
-        (*core::ptr::addr_of_mut!(LOCAL_APIC))
-            .as_mut()
-            .expect("Local APIC is not initialized by BSP")
+        unsafe {
+            let local_apic = &raw mut LOCAL_APIC;
+            (*local_apic)
+                .as_mut()
+                .expect("Local APIC is not initialized by BSP")
+        }
     }
 
     pub unsafe fn init_bsp(phys_to_virt: Phys2VirtFn) {
-        let base_vaddr = phys_to_virt(xapic_base() as usize);
-        let mut inner = match LocalApicBuilder::new()
-            .timer_vector(consts::X86_INT_APIC_TIMER)
-            .error_vector(consts::X86_INT_APIC_ERROR)
-            .spurious_vector(consts::X86_INT_APIC_SPURIOUS)
-            .set_xapic_base(base_vaddr as u64)
-            .build()
-        {
-            Ok(lapic) => lapic,
-            Err(e) => {
-                // A LAPIC build failure is a critical issue but not necessarily
-                // a hard stop on all hardware — log it and attempt to continue
-                // rather than panicking and leaving the screen frozen at 80%.
-                crate::klog_err!(
-                    "[lapic] LocalApicBuilder::build() failed: {} — continuing without LAPIC",
-                    e
-                );
-                return;
-            }
-        };
-        inner.enable();
+        unsafe {
+            let base_vaddr = phys_to_virt(xapic_base() as usize);
+            let mut inner = LocalApicBuilder::new()
+                .timer_vector(consts::X86_INT_APIC_TIMER)
+                .error_vector(consts::X86_INT_APIC_ERROR)
+                .spurious_vector(consts::X86_INT_APIC_SPURIOUS)
+                .set_xapic_base(base_vaddr as u64)
+                .build()
+                .unwrap_or_else(|err| panic!("{}", err));
+            inner.enable();
 
-        if !inner.is_bsp() {
-            crate::klog_warn!(
-                "[lapic] init_bsp() on non-BSP core (id={:#x}); APIC routing may be incorrect",
-                Self::decode_id(inner.id())
-            );
+            assert!(inner.is_bsp());
+            BSP_ID = Some((inner.id() >> 24) as u8);
+            LOCAL_APIC = Some(LocalApic { inner });
         }
-        let bsp_id = Self::decode_id(inner.id());
-        crate::klog_info!(
-            "[lapic] BSP APIC id {:#x}, mode {}",
-            bsp_id,
-            if x2apic_active() { "x2APIC" } else { "xAPIC" }
-        );
-        BSP_ID = Some(bsp_id);
-        LOCAL_APIC = Some(LocalApic { inner });
     }
 
     pub unsafe fn init_ap() {
-        Self::get().inner.enable();
+        unsafe {
+            Self::get().inner.enable();
+        }
     }
 
     /// Normalise the raw ID-register value into a hardware APIC ID.

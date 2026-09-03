@@ -1,6 +1,6 @@
 use alloc::{boxed::Box, collections::VecDeque, string::String, sync::Arc};
 
-use lock::Mutex;
+use crate::sync::Mutex;
 
 use crate::scheme::{impl_event_scheme, Scheme, UartScheme};
 use crate::utils::EventListener;
@@ -57,9 +57,9 @@ impl Scheme for BufferedUart {
                 }
             }
         }
-        // Notify listeners *after* releasing buf lock to avoid lock-ordering
-        // issues with downstream callbacks.
-        self.listener.trigger(());
+        if !self.buf.lock().is_empty() {
+            self.listener.trigger(());
+        }
     }
 }
 

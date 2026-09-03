@@ -68,9 +68,9 @@ impl Future for SleepFuture {
             timer_waker::kill_timer_waker(&mut this.slot);
             return Poll::Ready(());
         }
-        if this.deadline.as_nanos() >= i64::MAX as u128 {
-            // "Never": the caller relies on some other wake source.
-            return Poll::Pending;
+        if self.deadline.as_nanos() < i64::MAX as u128 {
+            let waker = cx.waker().clone();
+            timer::timer_set(self.deadline, Box::new(move |_| waker.wake_by_ref()));
         }
         let deadline = this.deadline;
         timer_waker::ensure_timer_waker(&mut this.slot, deadline, cx);

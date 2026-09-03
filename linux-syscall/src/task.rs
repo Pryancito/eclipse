@@ -131,13 +131,9 @@ impl Syscall<'_> {
     ///   Each file descriptor in the child refers to the same open file description (see [`Self::sys_open`])
     ///   as the corresponding file descriptor in the parent.
     ///   This means that the two file descriptors share open file status flags and file offset.
-    fn fork_impl(&self, newsp: usize, newtls: usize) -> LxResult<Arc<Process>> {
-        info!("fork: newsp={:#x} newtls={:#x}", newsp, newtls);
-        let new_proc = Process::fork_from(self.zircon_process(), false)?; // old pt NULL here
-        let path = new_proc.linux().execute_path();
-        if !path.is_empty() {
-            new_proc.set_name(comm_from_path(&path));
-        }
+    pub fn sys_fork(&self) -> SysResult {
+        info!("fork:");
+        let new_proc = Process::fork_from(self.zircon_process())?;
         let new_thread = Thread::create_linux(&new_proc)?;
         let mut new_ctx = self.thread.context_cloned()?;
         if newsp != 0 {
@@ -167,11 +163,19 @@ impl Syscall<'_> {
         Ok(new_proc)
     }
 
-    async fn vfork_impl(&self, newsp: usize, newtls: usize) -> LxResult<Arc<Process>> {
-        info!("vfork: newsp={:#x} newtls={:#x}", newsp, newtls);
-        self.zircon_process().vmar().dump();
-        let new_proc = Process::fork_from(self.zircon_process(), true)?;
-        new_proc.vmar().dump();
+    /// `sys_vfork`, just like [`Self::sys_fork`], creates a child process of the calling process
+    /// (see [linux man vfork(2)](https://www.man7.org/linux/man-pages/man2/vfork.2.html)).
+    /// For details, see [`Self::sys_fork`].
+    ///
+    /// `sys_vfork` differs from [`Self::sys_fork`] in that the calling thread is suspended until the child terminates
+    /// (either normally, by calling [`Self::sys_exit`], or abnormally, after delivery of a fatal signal),
+    /// or it makes a call to [`Self::sys_execve`].
+    pub async fn sys_vfork(&self) -> SysResult {
+        info!("vfork:");
+        // A real vfork shares the parent's address space until execve or exit. The VMAR
+        // implementation cannot replace a shared address space on execve, so use a copy
+        // here while retaining vfork's parent-suspension semantics.
+        let new_proc = Process::fork_from(self.zircon_process())?;
         let new_thread = Thread::create_linux(&new_proc)?;
         let mut new_ctx = self.thread.context_cloned()?;
         if newsp != 0 {

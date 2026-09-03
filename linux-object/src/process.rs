@@ -16,10 +16,10 @@ use alloc::{
 };
 use core::convert::TryFrom;
 use core::sync::atomic::AtomicI32;
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashMap;
+use kernel_hal::sync::{Mutex, MutexGuard};
 use kernel_hal::VirtAddr;
-use lock::{Mutex, MutexGuard};
-use rcore_fs::vfs::{FileSystem, FileType, INode, Metadata};
+use rcore_fs::vfs::{FileSystem, INode};
 
 use zircon_object::{
     object::{KernelObject, KoID, Signal},
@@ -50,7 +50,7 @@ pub trait ProcessExt {
     /// teardown churn) must degrade to "skip it", not bring down the kernel.
     fn try_linux(&self) -> Option<&LinuxProcess>;
     /// fork from current linux process
-    fn fork_from(parent: &Arc<Self>, vfork: bool) -> ZxResult<Arc<Self>>;
+    fn fork_from(parent: &Arc<Self>) -> ZxResult<Arc<Self>>;
 }
 
 const ROOT_UID: u32 = 0;
@@ -304,7 +304,7 @@ impl ProcessExt for Process {
     /// [Fork] the process.
     ///
     /// [Fork]: http://man7.org/linux/man-pages/man2/fork.2.html
-    fn fork_from(parent: &Arc<Self>, _vfork: bool) -> ZxResult<Arc<Self>> {
+    fn fork_from(parent: &Arc<Self>) -> ZxResult<Arc<Self>> {
         let linux_parent = parent.linux();
         // mmap_lock, WRITE side: freeze the parent's address-space LAYOUT for
         // the entire fork — snapshot of the mapping list AND the whole copy
@@ -387,6 +387,7 @@ impl ProcessExt for Process {
         linux_parent_inner
             .children
             .insert(new_proc.id(), new_proc.clone());
+        new_proc.vmar().fork_from(&parent.vmar())?;
 
         // On termination: reparent this process's own still-live children to
         // INIT, then notify whoever reaps *this* process — its real parent

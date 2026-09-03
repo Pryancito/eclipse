@@ -1,8 +1,8 @@
 //! LAN driver, only for Realtek currently.
 #![allow(unused)]
 
+use crate::sync::Mutex;
 use alloc::{sync::Arc, vec};
-use lock::Mutex;
 use smoltcp::socket::SocketSet;
 
 pub mod e1000;
@@ -163,19 +163,7 @@ pub fn timer_now_as_micros() -> u64 {
     unsafe { drivers_timer_now_as_micros() }
 }
 
-pub fn intr_on() {
-    unsafe { drivers_intr_on() }
-}
-
-pub fn intr_off() {
-    unsafe { drivers_intr_off() }
-}
-
-pub fn intr_get() -> bool {
-    unsafe { drivers_intr_get() }
-}
-
-extern "C" {
+unsafe extern "C" {
     fn drivers_dma_alloc(pages: usize) -> PhysAddr;
     fn drivers_dma_dealloc(paddr: PhysAddr, pages: usize) -> i32;
     fn drivers_phys_to_virt(paddr: PhysAddr) -> VirtAddr;

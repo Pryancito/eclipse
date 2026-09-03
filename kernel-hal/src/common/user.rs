@@ -189,20 +189,7 @@ impl<T, P: Policy> UserPtr<T, P> {
     /// Returns [`Ok(())`] if it is neither null nor unaligned, and lies in the
     /// user half of the address space.
     pub fn check(&self) -> Result<()> {
-        self.check_len(1)
-    }
-
-    /// [`check`](Self::check) for a run of `count` elements starting here, so a
-    /// slice that STARTS in the user half cannot run off its top end into the
-    /// kernel.
-    pub fn check_len(&self, count: usize) -> Result<()> {
-        let bytes = count
-            .checked_mul(core::mem::size_of::<T>())
-            .ok_or(Error::InvalidLength)?;
-        if !self.0.is_null()
-            && (self.0 as usize).is_multiple_of(core::mem::align_of::<T>())
-            && in_user_half(self.0 as usize, bytes)
-        {
+        if !self.0.is_null() && (self.0 as usize).is_multiple_of(core::mem::align_of::<T>()) {
             Ok(())
         } else {
             Err(Error::InvalidPointer)
@@ -551,14 +538,14 @@ impl<P: Policy> IoVec<P> {
     }
 
     pub fn as_slice(&self) -> Result<&[u8]> {
-        self.as_mut_slice().map(|s| &*s)
+        if !self.ptr.is_null() {
+            Ok(unsafe { core::slice::from_raw_parts(self.ptr.0, self.len) })
+        } else {
+            Err(Error::InvalidVectorAddress)
+        }
     }
 
-    // Deliberate: this hands out a `&mut` view of a raw user-space pointer from
-    // `&self`. Aliasing is the caller's responsibility (user memory, checked
-    // separately), so the standard `mut_from_ref` guard does not apply.
-    #[allow(clippy::mut_from_ref)]
-    pub fn as_mut_slice(&self) -> Result<&mut [u8]> {
+    pub fn as_mut_slice(&mut self) -> Result<&mut [u8]> {
         if !self.ptr.is_null() {
             Ok(unsafe { core::slice::from_raw_parts_mut(self.ptr.0, self.len) })
         } else {

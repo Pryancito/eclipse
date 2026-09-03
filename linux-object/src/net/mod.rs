@@ -287,35 +287,9 @@ pub use raw::*;
 pub mod packet;
 pub use packet::*;
 
-/// missing documentation
-pub mod netlink;
-pub use netlink::*;
-pub mod unix;
-pub use unix::*;
-pub mod listen_table;
-pub use listen_table::*;
-
-/// missing documentation
-pub mod icmp;
-pub use icmp::*;
-
-/// IPv4 → MAC cache (fed from RX frames).
-pub mod arp_cache;
-pub use arp_cache::*;
-
-/// IPv6 → MAC cache (fed from RX frames).
-pub mod ndp_cache;
-
-/// ICMP echo replies from `push_packet` (ping RX).
-pub mod icmp_rx;
-
-/// IPv6 Router Advertisement handling (default route + SLAAC), fed from RX.
-pub mod ra;
-
-pub mod dns;
-
-pub mod wait;
-pub use icmp_rx::*;
+// missing documentation
+// pub mod icmp;
+// pub use icmp::*;
 
 // pub mod stack;
 
@@ -2014,8 +1988,8 @@ pub fn handle_net_ioctl(
 /// Convert C string to Rust string
 pub unsafe fn from_cstr(s: *const u8) -> &'static str {
     use core::{slice, str};
-    let len = (0usize..).find(|&i| *s.add(i) == 0).unwrap();
-    str::from_utf8(slice::from_raw_parts(s, len)).unwrap()
+    let len = (0usize..).find(|&i| unsafe { *s.add(i) == 0 }).unwrap();
+    str::from_utf8(unsafe { slice::from_raw_parts(s, len) }).unwrap()
 }
 
 // ============= Util =============

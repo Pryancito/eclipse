@@ -7,7 +7,9 @@ use core::cmp::Ordering as CmpOrdering;
 use core::convert::TryFrom;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
-use lock::Mutex;
+
+use crate::sync::Mutex;
+use naive_timer::Timer;
 
 /// A pending timer event: its absolute deadline and the callback to run.
 ///

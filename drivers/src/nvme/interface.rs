@@ -11,7 +11,7 @@ use crate::scheme::{BlockScheme, Scheme};
 use crate::{Device, DeviceError, DeviceResult};
 use pci::{PCIDevice, BAR};
 
-use lock::Mutex;
+use crate::sync::Mutex;
 
 use super::nvme_queue::*;
 
@@ -336,16 +336,7 @@ impl NvmeInterface {
         cmd.cns = 0;
         cmd.prp1 = data_pa as u64;
         cmd.nsid = 1;
-        let common_cmd = unsafe { core::mem::transmute(cmd) };
-        Self::submit_sync(
-            bar,
-            stride,
-            &mut admin_queue,
-            common_cmd,
-            Self::ADMIN_TIMEOUT_US,
-            "identify namespace",
-        )?;
-        clflush_range(data_va, 4096);
+        let common_cmd = unsafe { core::mem::transmute::<NvmeIdentify, NvmeCommonCommand>(cmd) };
 
         // Namespace size (LBAs) and current LBA format
         let nsze = unsafe { read_volatile(data_va as *const u64) };
@@ -369,14 +360,142 @@ impl NvmeInterface {
             return Err(DeviceError::NotSupported);
         }
 
-        self.lba_shift = lbads;
-        self.capacity = (nsze as usize) << (lbads - 9);
-        warn!(
-            "[nvme] namespace 1: {} LBAs of {}B, capacity {} sectors (512B)",
-            nsze,
-            1u32 << lbads,
-            self.capacity
-        );
+        //nvme create cq
+        let mut cmd = NvmeCreateCq::new();
+        cmd.opcode = 0x05;
+        cmd.command_id = 0x3;
+        cmd.nsid = 1;
+        cmd.prp1 = admin_queue.cq_pa as u64;
+        cmd.cqid = 1;
+        cmd.qsize = 1023;
+        cmd.cq_flags = NVME_QUEUE_PHYS_CONTIG | NVME_CQ_IRQ_ENABLED;
+
+        // let mut cmd = NvmeCommonCommand::new();
+        // cmd.opcode = 0x05;
+        // cmd.command_id = 0x3;
+        // cmd.nsid = 1;
+        // cmd.prp1 = admin_queue.cq_pa as u64;
+        // cmd.cdw10 = 0x3ff0001;
+        // cmd.cdw11 = 0x3;
+
+        let common_cmd = unsafe { core::mem::transmute::<NvmeCreateCq, NvmeCommonCommand>(cmd) };
+
+        admin_queue.sq[2].write(common_cmd);
+        admin_queue.sq_tail += 1;
+        unsafe { write_volatile(admin_q_db as *mut u32, 3) }
+        loop {
+            let status = admin_queue.cq[2].read();
+            if status.status != 0 {
+                // warn!("nvme cq :{:#x?}", status);
+                unsafe { write_volatile((admin_q_db + 0x4) as *mut u32, 3) }
+                break;
+            }
+        }
+
+        // nvme create sq
+        let mut cmd = NvmeCreateSq::new();
+        cmd.opcode = 0x01;
+        cmd.command_id = 0x4;
+        cmd.nsid = 1;
+        cmd.prp1 = admin_queue.sq_pa as u64;
+        cmd.sqid = 1;
+        cmd.qsize = 1023;
+        cmd.sq_flags = 0x1;
+        cmd.cqid = 0x1;
+
+        // let mut cmd = NvmeCommonCommand::new();
+        // cmd.opcode = 0x01;
+        // cmd.command_id = 0x2018;
+        // cmd.nsid = 1;
+        // cmd.prp1 = admin_queue.sq_pa as u64;
+        // cmd.cdw10 = 0x3ff0001;
+        // cmd.cdw11 = 0x10001;
+
+        let common_cmd = unsafe { core::mem::transmute::<NvmeCreateSq, NvmeCommonCommand>(cmd) };
+
+        // write command to sq
+        admin_queue.sq[3].write(common_cmd);
+        admin_queue.sq_tail += 1;
+
+        // write doorbell register
+        unsafe { write_volatile(admin_q_db as *mut u32, 4) }
+
+        // wait for command complete
+        loop {
+            let status = admin_queue.cq[3].read();
+            if status.status != 0 {
+                // warn!("nvme cq :{:#x?}", status);
+
+                // write doorbell register
+                unsafe { write_volatile((admin_q_db + 0x4) as *mut u32, 4) }
+                break;
+            }
+        }
+    }
+}
+
+impl BlockScheme for NvmeInterface {
+    // 每个NVMe命令中有两个域：PRP1和PRP2，Host就是通过这两个域告诉SSD数据在内存中的位置或者数据需要写入的地址
+    // 首先对prp1进行读写，如果数据还没完，就看数据量是不是在一个page内，在的话，只需要读写prp2内存地址就可以了，数据量大于1个page，就需要读出prp list
+
+    // 由于只读一块, 小于一页, 所以只需要prp1
+    // prp1 = dma_addr
+    // prp2 = 0
+
+    // prp设置
+    // uboot中对应实现 nvme_setup_prps
+    // linux中对应实现 nvme_pci_setup_prps
+
+    // SLBA = start logical block address
+    // length = 1 = 512B
+    // 1 SLBA = 512B
+    fn read_block(&self, block_id: usize, read_buf: &mut [u8]) -> DeviceResult {
+        let io_queue = self.io_queues[0].lock();
+        let db_offset = io_queue.db_offset;
+        let mut admin_queue = self.admin_queue.lock();
+
+        let bar = self.bar;
+
+        let dbs = bar + NVME_REG_DBS;
+        // let db_offset = io_queue.db_offset;
+
+        // 这里dma addr 就是buffer的地址
+        let ptr = read_buf.as_mut_ptr();
+        let addr = virt_to_phys(ptr as usize);
+
+        // build nvme read command
+        let mut cmd = NvmeRWCommand::new_read_command();
+        cmd.nsid = 1;
+        cmd.prp1 = addr as u64;
+        cmd.command_id = 101;
+        cmd.length = 1;
+        cmd.slba = block_id as u64;
+
+        //transfer to common command
+        let common_cmd = unsafe { core::mem::transmute::<NvmeRWCommand, NvmeCommonCommand>(cmd) };
+
+        let tail = admin_queue.sq_tail;
+
+        // write command to sq
+        admin_queue.sq[tail].write(common_cmd);
+        admin_queue.sq_tail += 1;
+
+        // write doorbell register
+        unsafe { write_volatile((dbs + db_offset) as *mut u32, (tail + 1) as u32) }
+
+        // wait for command complete
+        loop {
+            let status = admin_queue.cq[tail].read();
+            if status.status != 0 {
+                // warn!("nvme cq :{:#x?}", status);
+
+                // write doorbell
+                unsafe { write_volatile((dbs + db_offset + 0x4) as *mut u32, (tail + 1) as u32) }
+                break;
+            }
+        }
+
+        // admin_queue.cq_head = admin_queue.sq_tail;
 
         Ok(())
     }
@@ -406,21 +525,18 @@ impl NvmeInterface {
             (result >> 16) + 1
         );
 
-        // Create IO Completion Queue (qid 1). We poll, so no interrupts.
-        let mut cmd = NvmeCreateCq::new();
-        cmd.prp1 = io_queue.cq_pa as u64;
-        cmd.cqid = 1;
-        cmd.qsize = (io_queue.cq.len() - 1) as u16;
-        cmd.cq_flags = NVME_QUEUE_PHYS_CONTIG;
-        let common_cmd = unsafe { core::mem::transmute(cmd) };
-        Self::submit_sync(
-            bar,
-            stride,
-            &mut admin_queue,
-            common_cmd,
-            Self::ADMIN_TIMEOUT_US,
-            "create io completion queue",
-        )?;
+        let addr = virt_to_phys(ptr as usize);
+
+        // build nvme write command
+        let mut cmd = NvmeRWCommand::new_write_command();
+        cmd.nsid = 1;
+        cmd.prp1 = addr as u64;
+        cmd.length = 1;
+        cmd.command_id = 100;
+        cmd.slba = block_id as u64;
+
+        // transmute to common command
+        let common_cmd = unsafe { core::mem::transmute::<NvmeRWCommand, NvmeCommonCommand>(cmd) };
 
         // Create IO Submission Queue (qid 1, bound to CQ 1)
         let mut cmd = NvmeCreateSq::new();

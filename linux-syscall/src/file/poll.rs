@@ -771,7 +771,7 @@ impl FdSet {
             }
             // save the fdset, and clear it
             let origin = BitVec::from_slice(addr.as_slice(len)?).unwrap();
-            let vec0 = vec![0; len];
+            let vec0 = alloc::vec![0; len];
             addr.write_array(&vec0)?;
             let ready = BitVec::from_slice(&vec0).unwrap();
             Ok(FdSet {

@@ -27,9 +27,9 @@ Environments：
 
 ### Developing environment info
 
-- current rustc -- rustc 1.97.0-nightly
-- current rust-toolchain -- nightly-2026-05-01
-- current qemu -- 6.0+
+- current rustc -- rustc 1.100.0-nightly (0dfb098f3 2026-08-31)
+- current rust-toolchain -- nightly-2026-09-01
+- current qemu -- 5.2.0 -> 6.2.0
 
 Clone repo and initialize dependencies:
 

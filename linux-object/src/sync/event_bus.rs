@@ -9,7 +9,7 @@ use core::{
     pin::Pin,
     task::{Context, Poll},
 };
-use lock::Mutex;
+use kernel_hal::sync::Mutex;
 
 const MAX_EVENT_CALLBACKS: usize = 4096;
 

@@ -1,4 +1,4 @@
-use crate::{config::MAX_CORE_NUM, utils::mpsc_queue::MpscQueue};
+use crate::{config_common::MAX_CORE_NUM, utils::mpsc_queue::MpscQueue};
 use alloc::vec::Vec;
 
 const REASON_SIZE: usize = 64;
@@ -6,21 +6,21 @@ const REASON_SIZE: usize = 64;
 pub type IpiEntry = usize;
 type IRQueue = MpscQueue<'static, IpiEntry>;
 
-/// Per-CPU backing storage for the IPI queues, indexed by dense logical CPU id.
-static mut IPI_BUFFERS: [[IpiEntry; REASON_SIZE]; MAX_CORE_NUM] = [[0; REASON_SIZE]; MAX_CORE_NUM];
+unsafe fn reason_buffer(ptr: *mut [IpiEntry; REASON_SIZE]) -> &'static mut [IpiEntry] {
+    unsafe { &mut *ptr }
+}
 
 lazy_static::lazy_static! {
-    /// One IPI queue per CPU, each backed by its slot in `IPI_BUFFERS`.
-    static ref IPI_QUEUE: Vec<IRQueue> = (0..MAX_CORE_NUM)
-        .map(|i| {
-            IRQueue::new(unsafe {
-                core::slice::from_raw_parts_mut(
-                    core::ptr::addr_of_mut!(IPI_BUFFERS[i]).cast::<IpiEntry>(),
-                    REASON_SIZE,
-                )
-            })
-        })
-        .collect();
+    static ref IPI_QUEUE: [IRQueue; MAX_CORE_NUM] = [
+        IRQueue::new(unsafe { reason_buffer(&raw mut IPI_REASON0) }),
+        IRQueue::new(unsafe { reason_buffer(&raw mut IPI_REASON1) }),
+        IRQueue::new(unsafe { reason_buffer(&raw mut IPI_REASON2) }),
+        IRQueue::new(unsafe { reason_buffer(&raw mut IPI_REASON3) }),
+        IRQueue::new(unsafe { reason_buffer(&raw mut IPI_REASON4) }),
+        IRQueue::new(unsafe { reason_buffer(&raw mut IPI_REASON5) }),
+        IRQueue::new(unsafe { reason_buffer(&raw mut IPI_REASON6) }),
+        IRQueue::new(unsafe { reason_buffer(&raw mut IPI_REASON7) }),
+    ];
 }
 
 pub(crate) fn ipi_queue(cpuid: usize) -> &'static IRQueue {
@@ -728,11 +728,11 @@ pub enum IpiReason {
     },
 }
 
-// usize : 64bit
-// |  type reason : 4bit  |   ipi info : 60bit   |
-//
-// MockBlock info : 60bit
-// |  reserved : 60 bit  |
+/// usize : 64bit
+/// |  type reason : 4bit  |   ipi info : 60bit   |
+///
+/// MockBlock info : 60bit
+/// |  reserved : 60 bit  |
 const TYPE_SHIFT: usize = 60;
 const TYPE_INVALID: usize = 0x0;
 const TYPE_MOCK_BLOCK: usize = 0x1;

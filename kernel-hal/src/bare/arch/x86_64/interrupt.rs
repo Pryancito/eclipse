@@ -55,10 +55,7 @@ hal_fn_impl! {
         }
 
         fn handle_irq(vector: usize) {
-            crate::kstats::note_irq(vector);
-            // Cached primary-IRQ reference: every interrupt would otherwise
-            // pay an RwLock read + Arc clone via `all_irq().first_unwrap()`.
-            crate::drivers::primary_irq().handle_irq(vector);
+            all_irq().first_unwrap().handle_irq(vector);
         }
 
         fn msi_alloc_block(requested_irqs: usize) -> HalResult<Range<usize>> {

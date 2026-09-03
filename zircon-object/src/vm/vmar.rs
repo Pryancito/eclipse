@@ -3,11 +3,10 @@ use {
     crate::object::*,
     alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec},
     bitflags::bitflags,
-    core::sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    kernel_hal::sync::Mutex,
     kernel_hal::vm::{
         GenericPageTable, IgnoreNotMappedErr, Page, PageSize, PageTable, PagingError, PagingResult,
     },
-    lock::Mutex,
 };
 
 /// Master switch for copy-on-write `fork` — on by default, disabled with

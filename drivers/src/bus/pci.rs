@@ -119,22 +119,28 @@ use x86_64::instructions::port::Port;
 #[cfg(target_arch = "x86_64")]
 impl PortOps for PortOpsImpl {
     unsafe fn read8(&self, port: u16) -> u8 {
-        Port::new(port).read()
+        unsafe { Port::new(port).read() }
     }
     unsafe fn read16(&self, port: u16) -> u16 {
-        Port::new(port).read()
+        unsafe { Port::new(port).read() }
     }
     unsafe fn read32(&self, port: u32) -> u32 {
-        Port::new(port as u16).read()
+        unsafe { Port::new(port as u16).read() }
     }
     unsafe fn write8(&self, port: u16, val: u8) {
-        Port::new(port).write(val);
+        unsafe {
+            Port::new(port).write(val);
+        }
     }
     unsafe fn write16(&self, port: u16, val: u16) {
-        Port::new(port).write(val);
+        unsafe {
+            Port::new(port).write(val);
+        }
     }
     unsafe fn write32(&self, port: u32, val: u32) {
-        Port::new(port as u16).write(val);
+        unsafe {
+            Port::new(port as u16).write(val);
+        }
     }
 }
 
@@ -144,7 +150,7 @@ const PCI_BASE: usize = 0; //Fix me
 #[cfg(any(target_arch = "mips", target_arch = "riscv64", target_arch = "aarch64"))]
 use super::{phys_to_virt, read, write};
 
-#[cfg(feature = "board_malta")]
+#[cfg(all(feature = "board_malta", target_arch = "mips"))]
 const PCI_BASE: usize = 0xbbe00000;
 
 #[cfg(target_arch = "riscv64")]
@@ -189,108 +195,77 @@ impl PortOps for PortOpsImpl {
 /// Return assigned MSI interrupt number when applicable
 #[allow(dead_code)]
 unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
-    let ops = &PortOpsImpl;
-    //let am = CSpaceAccessMethod::IO;
-    let am = PCI_ACCESS;
+    unsafe {
+        let ops = &PortOpsImpl;
+        //let am = CSpaceAccessMethod::IO;
+        let am = PCI_ACCESS;
 
-    if paddr != 0 {
-        // reveal PCI regs by setting paddr
-        let bar0_raw = am.read32(ops, loc, BAR0);
-        am.write32(ops, loc, BAR0, (paddr & !0xfff) as u32); //Only for 32-bit decoding
-        warn!(
-            "BAR0 set from {:#x} to {:#x}",
-            bar0_raw,
-            am.read32(ops, loc, BAR0)
-        );
-    }
-
-    // 23 and lower are used. Atomic, not `static mut`: device probe can run
-    // concurrently, and a plain `+=` on a `static mut` is a data race (UB).
-    static MSI_IRQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(23);
-
-    let orig = am.read16(ops, loc, PCI_COMMAND);
-    // Always enable MEM space + Bus Mastering so DMA devices (e.g. AHCI) work
-    // regardless of whether MSI is available.
-    am.write16(ops, loc, PCI_COMMAND, orig | 0x7);
-
-    // find MSI cap
-    let mut msi_found = false;
-    let mut cap_ptr = am.read8(ops, loc, PCI_CAP_PTR) as u16;
-    let mut assigned_irq = None;
-    let mut cap_steps = 0usize;
-    let mut prev_cap_ptr = 0u16;
-    while cap_ptr > 0 {
-        if cap_steps >= PCI_MAX_CAP_TRAVERSAL {
+        if paddr != 0 {
+            // reveal PCI regs by setting paddr
+            let bar0_raw = am.read32(ops, loc, BAR0);
+            am.write32(ops, loc, BAR0, (paddr & !0xfff) as u32); //Only for 32-bit decoding
             warn!(
-                "PCI capability chain too long or cyclic at {:?}, aborting traversal",
-                loc
+                "BAR0 set from {:#x} to {:#x}",
+                bar0_raw,
+                am.read32(ops, loc, BAR0)
             );
-            break;
-        }
-        if cap_ptr == prev_cap_ptr {
-            warn!(
-                "PCI capability chain stuck at {:#x} for {:?}, aborting traversal",
-                cap_ptr, loc
-            );
-            break;
-        }
-        if cap_ptr < 0x40 {
-            warn!(
-                "PCI capability pointer out of spec ({:#x}) for {:?}, aborting traversal",
-                cap_ptr, loc
-            );
-            break;
         }
 
-        cap_steps = cap_steps.saturating_add(1);
-        let cap_id = am.read8(ops, loc, cap_ptr);
-        if cap_id == PCI_CAP_ID_MSI {
-            let orig_ctrl = am.read32(ops, loc, cap_ptr + PCI_MSI_CTRL_CAP);
-            // The manual Volume 3 Chapter 10.11 Message Signalled Interrupts
-            // 0 is (usually) the apic id of the bsp.
-            //am.write32(ops, loc, cap_ptr + PCI_MSI_ADDR, 0xfee00000 | (0 << 12));
-            am.write32(ops, loc, cap_ptr + PCI_MSI_ADDR, 0xfee00000);
-            let irq = MSI_IRQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-            assigned_irq = Some(irq as usize);
-            // we offset all our irq numbers by 32
-            if (orig_ctrl >> 16) & (1 << 7) != 0 {
-                // 64bit: the message-address upper dword must be programmed too
-                // (to 0 for the 0xFEE00000 LAPIC window), or the device latches
-                // an undefined high address and MSIs go astray.
-                am.write32(ops, loc, cap_ptr + PCI_MSI_UPPER_ADDR, 0);
-                am.write32(ops, loc, cap_ptr + PCI_MSI_DATA_64, irq + 32);
-            } else {
-                // 32bit
-                am.write32(ops, loc, cap_ptr + PCI_MSI_DATA_32, irq + 32);
+        // 23 and lower are used
+        static mut MSI_IRQ: u32 = 23;
+
+        let _orig = am.read16(ops, loc, PCI_COMMAND);
+        // IO Space | MEM Space | Bus Mastering | Special Cycles | PCI Interrupt Disable
+        // am.write32(ops, loc, PCI_COMMAND, (orig | 0x40f) as u32);
+
+        // find MSI cap
+        let mut msi_found = false;
+        let mut cap_ptr = am.read8(ops, loc, PCI_CAP_PTR) as u16;
+        let mut assigned_irq = None;
+        while cap_ptr > 0 {
+            let cap_id = am.read8(ops, loc, cap_ptr);
+            if cap_id == PCI_CAP_ID_MSI {
+                let orig_ctrl = am.read32(ops, loc, cap_ptr + PCI_MSI_CTRL_CAP);
+                // The manual Volume 3 Chapter 10.11 Message Signalled Interrupts
+                // 0 is (usually) the apic id of the bsp.
+                //am.write32(ops, loc, cap_ptr + PCI_MSI_ADDR, 0xfee00000 | (0 << 12));
+                am.write32(ops, loc, cap_ptr + PCI_MSI_ADDR, 0xfee00000);
+                MSI_IRQ += 1;
+                let irq = MSI_IRQ;
+                assigned_irq = Some(irq as usize);
+                // we offset all our irq numbers by 32
+                if (orig_ctrl >> 16) & (1 << 7) != 0 {
+                    // 64bit
+                    am.write32(ops, loc, cap_ptr + PCI_MSI_DATA_64, irq + 32);
+                } else {
+                    // 32bit
+                    am.write32(ops, loc, cap_ptr + PCI_MSI_DATA_32, irq + 32);
+                }
+
+                // enable MSI interrupt, assuming 64bit for now
+                am.write32(ops, loc, cap_ptr + PCI_MSI_CTRL_CAP, orig_ctrl | 0x10000);
+                debug!(
+                    "MSI control {:#b}, enabling MSI interrupt {}",
+                    orig_ctrl >> 16,
+                    irq
+                );
+                msi_found = true;
             }
-
-            // enable MSI interrupt, assuming 64bit for now
-            am.write32(ops, loc, cap_ptr + PCI_MSI_CTRL_CAP, orig_ctrl | 0x10000);
-            debug!(
-                "MSI control {:#b}, enabling MSI interrupt {}",
-                orig_ctrl >> 16,
-                irq
-            );
-            msi_found = true;
+            debug!("PCI device has cap id {} at {:#X}", cap_id, cap_ptr);
+            cap_ptr = am.read8(ops, loc, cap_ptr + 1) as u16;
         }
-        debug!("PCI device has cap id {} at {:#X}", cap_id, cap_ptr);
-        prev_cap_ptr = cap_ptr;
-        cap_ptr = am.read8(ops, loc, cap_ptr + 1) as u16;
+
+        if !msi_found {
+            // am.write16(ops, loc, PCI_COMMAND, (0x2) as u16);
+            am.write16(ops, loc, PCI_COMMAND, 0x6);
+            am.write32(ops, loc, _PCI_INTERRUPT_LINE, 33);
+            debug!("MSI not found, using PCI interrupt");
+        }
+
+        warn!("pci device enable done");
+
+        assigned_irq
     }
-
-    if !msi_found {
-        am.write32(ops, loc, PCI_INTERRUPT_LINE, 33);
-        debug!("MSI not found, using PCI interrupt");
-    }
-
-    // debug!, not warn!: this fires once per PCI FUNCTION. At the default
-    // LOG=warn every line goes out the 115200-baud UART with a per-byte spin
-    // (~87 µs/byte), and the per-device chatter alone was a visible slice of
-    // boot wall-time on boards with a physical COM port. The line stays in
-    // dmesg via the klog ring at debug level.
-    debug!("pci device enable done");
-
-    assigned_irq
 }
 
 pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> DeviceResult<Device> {

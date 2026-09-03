@@ -16,8 +16,8 @@ pub fn virt_to_phys(vaddr: VirtAddr) -> PhysAddr {
 }
 
 #[allow(unused)]
-extern "C" {
-    pub fn drivers_dma_alloc(pages: usize) -> PhysAddr;
+unsafe extern "C" {
+    fn drivers_dma_alloc(pages: usize) -> PhysAddr;
     fn drivers_dma_dealloc(paddr: PhysAddr, pages: usize) -> i32;
     fn drivers_phys_to_virt(paddr: PhysAddr) -> VirtAddr;
     fn drivers_virt_to_phys(vaddr: VirtAddr) -> PhysAddr;

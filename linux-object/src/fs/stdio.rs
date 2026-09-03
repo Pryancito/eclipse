@@ -16,9 +16,8 @@ use core::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 use kernel_hal::console::{self, ConsoleWinSize};
-use kernel_hal::user::{Error as UserError, UserInPtr, UserOutPtr};
+use kernel_hal::sync::Mutex;
 use lazy_static::lazy_static;
-use lock::Mutex;
 use rcore_fs::vfs::*;
 use zcore_drivers::prelude::{InputEvent, InputEventType};
 use zircon_object::object::KernelObject;
@@ -1681,26 +1680,6 @@ impl Stdin {
     /// specify whether the Stdin buffer is readable
     pub fn can_read(&self) -> bool {
         !self.buf.lock().is_empty()
-    }
-
-    /// Push raw bytes into stdin without echo (TTY query responses for userland).
-    pub fn push_bytes(&self, bytes: &[u8]) {
-        let mut buf = self.buf.lock();
-        for &b in bytes {
-            buf.push_back(b as char);
-        }
-        drop(buf);
-        self.data_ready.store(true, Ordering::Release);
-        if let Some(mut eb) = self.eventbus.try_lock() {
-            self.data_ready.store(false, Ordering::Relaxed);
-            eb.set(Event::READABLE);
-        } else {
-            // EventBus contended: leave `data_ready` set and nudge any waiter so
-            // the bytes don't sit in the buffer until an unrelated event runs
-            // the executor. This matters for kdrive/TinyX, whose only wakeup in
-            // medium-raw mode is the keystroke we just pushed.
-            wake_tty_intr_waiters();
-        }
     }
 }
 

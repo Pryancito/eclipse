@@ -6,6 +6,8 @@
   "target-pointer-width": 64,
   "target-c-int-width": 32,
   "arch": "x86_64",
+  "code-model": "kernel",
+  "rustc-abi": "softfloat",
   "os": "none",
   "executables": true,
   "linker": "rust-lld",

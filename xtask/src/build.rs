@@ -111,9 +111,9 @@ impl BuildConfig {
             .package("zcore")
             .features(false, &self.features)
             .target(INNER.join(format!("{}.json", self.arch.name())))
+            .args(["-Z", "json-target-spec"])
             .args(["-Z", "build-std=core,alloc"])
             .args(["-Z", "build-std-features=compiler-builtins-mem"])
-            .args(["-Z", "json-target-spec"])
             .conditional(!self.debug, |cargo| {
                 cargo.release();
             });

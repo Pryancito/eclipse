@@ -8,11 +8,11 @@ use {
     core::cell::{Ref, RefCell, RefMut, UnsafeCell},
     core::ops::Range,
     core::sync::atomic::*,
+    kernel_hal::sync::{Mutex, MutexGuard},
     kernel_hal::{
         mem::{phys_to_virt, PhysFrame},
         PAGE_SIZE,
     },
-    lock::{Mutex, MutexGuard},
 };
 
 // ---------------------------------------------------------------------------
@@ -429,289 +429,13 @@ impl VMObjectPaged {
     }
 
     /// get the reference to inner by lock the shared lock
-    ///
-    /// Take the family lock, then borrow `inner`.
-    ///
-    /// DROP-ORDER CONTRACT (the source of the twice-recurring "RefCell
-    /// already borrowed" panic at this file's borrow sites): the RefCell
-    /// borrow must die BEFORE the family mutex is released, or another CPU
-    /// can take the mutex and borrow_mut() while our borrow is still alive
-    /// for a few instructions. A `(guard, borrow)` tuple could not enforce
-    /// this: destructuring drops bindings in REVERSE order (borrow first —
-    /// correct) but an intact temporary like `self.get_inner().size` drops
-    /// tuple fields in FORWARD order (guard first — the mutex was released
-    /// while the borrow lived, which is exactly the cross-CPU race that
-    /// kept coming back, last seen as a fork-time panic on real 8-core
-    /// hardware). These guard newtypes make the order structural: struct
-    /// fields drop in declaration order, `inner` is declared before `guard`,
-    /// so the borrow ALWAYS dies before the mutex releases, no matter how a
-    /// call site uses the value.
-    #[track_caller]
-    fn get_inner(&self) -> InnerGuard<'_> {
-        reentry_check(self.lock_ptr());
-        let guard = self.lock.lock();
-        reentry_enter(self.lock_ptr());
-        let drain = StashDrain::open();
-        InnerGuard {
-            inner: self.inner.borrow(),
-            _guard: guard,
-            _drain: drain,
-            _reentry: ReentryPop(self.lock_ptr()),
-        }
+    fn get_inner(&self) -> (MutexGuard<'_, ()>, Ref<'_, VMObjectPagedInner>) {
+        (self.lock.lock(), self.inner.borrow())
     }
 
-    /// Identity of this VMO's family lock, for the re-entrancy tripwire.
-    #[inline]
-    fn lock_ptr(&self) -> usize {
-        Arc::as_ptr(&self.lock) as usize
-    }
-
-    /// Mutable variant of [`get_inner`] — same structural drop-order contract.
-    // `track_caller` on both accessors so the ticket lock's holder snapshot —
-    // and a deadlock banner built from it — records the REAL call site
-    // (`commit_page`, `create_child`, `Drop`…), not this wrapper. Every
-    // family-lock banner to date has read `paged.rs:391` on both the waiter
-    // and the holder line, which names the lobby and not the room.
-    #[track_caller]
-    fn get_inner_mut(&self) -> InnerGuardMut<'_> {
-        reentry_check(self.lock_ptr());
-        let guard = self.lock.lock();
-        reentry_enter(self.lock_ptr());
-        let drain = StashDrain::open();
-        InnerGuardMut {
-            inner: self.inner.borrow_mut(),
-            _guard: guard,
-            _drain: drain,
-            _reentry: ReentryPop(self.lock_ptr()),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Per-cpu deferred-drop stash
-// ---------------------------------------------------------------------------
-//
-// The standing invariant is "no `Arc` of a COW family dies while the family
-// lock is held" — an in-scope death can be the last reference, and the
-// re-entrant `Drop` then re-acquires the non-re-entrant ticket lock on the
-// same cpu: the self-deadlock this file has now produced from three different
-// functions (`remove_child`, `replace_child`, `commit_page_internal`).
-// Threading a `deferred` vector through signatures worked for the first two,
-// but the commit path fans out through closures (`commit_pages_with`,
-// `for_each_page`) where threading is invasive and easy to miss on the next
-// edit.
-//
-// So the guards themselves enforce it. Code under a family guard parks any
-// possibly-last `Arc` in this per-cpu stash; the guard's third field — dropped
-// last, i.e. after the RefCell borrow AND after the lock guard — drains every
-// entry pushed while it was open. Safe without atomics because the family
-// lock's `push_off` keeps IRQs off: nothing else runs on this cpu while
-// entries are pushed, and nested guards drain down to their own watermark, so
-// an inner drain never steals an outer frame's entries.
-// Sized to the kernel's real per-cpu ceiling, not an arbitrary local literal:
-// on bare-metal x86_64, SMP bring-up (`register_cpu`) and every IRQ-off
-// primitive that indexes this array (`mycpu`, via push_off/pop_off) already
-// assert `cpu_id() < MAX_CORE_NUM` before any core can reach this code, so a
-// >16-logical-cpu box (unremarkable on modern desktop/server silicon or a
-// KVM guest with many vCPUs) previously aliased two or more distinct,
-// concurrently-running cores onto the SAME slot -- a data race on a
-// `Vec<Arc<VMObjectPaged>>`'s {ptr,len,cap} triple despite each core
-// believing (correctly, for ITS OWN slot) that IRQs-off made it exclusive.
-// `stash_cpu()`'s `.min(STASH_CPUS - 1)` clamp is deliberately left as-is:
-// with STASH_CPUS == MAX_CORE_NUM it is provably dead code on bare metal,
-// but it remains the only thing stopping libos/test builds -- where
-// cpu_id() is a truncated host thread id, unrelated to MAX_CORE_NUM -- from
-// skipping a stash_defer() a caller depends on to avoid a reentrant-lock
-// deadlock (see the stash mechanism's own doc comment above).
-const STASH_CPUS: usize = kernel_hal::config::MAX_CORE_NUM;
-const STASH_CAP: usize = 128;
-
-struct StashSlot(UnsafeCell<Vec<Arc<VMObjectPaged>>>);
-// SAFETY: each slot is only touched by its own cpu, with IRQs off.
-unsafe impl Sync for StashSlot {}
-
-struct DropStashes([StashSlot; STASH_CPUS]);
-
-static DROP_STASH: DropStashes =
-    DropStashes([const { StashSlot(UnsafeCell::new(Vec::new())) }; STASH_CPUS]);
-
-fn stash_cpu() -> usize {
-    (kernel_hal::cpu::cpu_id() as usize).min(STASH_CPUS - 1)
-}
-
-// ── Re-entrancy tripwire for the family lock ─────────────────────────────────
-//
-// The family lock is a non-reentrant ticket mutex SHARED across a COW family
-// (create_child hands children `lock_ref.clone()`). Calling a *public* method
-// of any family member (`len()`, `commit_page()`, …) while already holding the
-// lock re-acquires it and self-deadlocks — the failure reproduced live at
-// commit_page(:678)/len(:660). Static reading has not pinned which call does
-// it, so this records, per cpu, the lock(s) this cpu holds; the next re-entrant
-// acquisition prints the caller location and a frame-pointer backtrace BEFORE
-// deadlocking on the mutex, naming the exact re-entrant path. Best-effort and
-// diagnostic: per-cpu, cleared on guard drop.
-const REENTRY_DEPTH: usize = 16;
-struct HeldSlot(UnsafeCell<[usize; REENTRY_DEPTH]>);
-// SAFETY: each cpu only ever touches its own slot; the family lock's push_off
-// keeps IRQs off across a held region, so pushes/pops are not preempted.
-unsafe impl Sync for HeldSlot {}
-static HELD_LOCKS: [HeldSlot; STASH_CPUS] =
-    [const { HeldSlot(UnsafeCell::new([0usize; REENTRY_DEPTH])) }; STASH_CPUS];
-
-#[track_caller]
-fn reentry_check(lock_ptr: usize) {
-    let held = unsafe { &*HELD_LOCKS[stash_cpu()].0.get() };
-    if !held.contains(&lock_ptr) {
-        return;
-    }
-    let loc = core::panic::Location::caller();
-    kernel_hal::console::serial_write_fmt_spin(format_args!(
-        "\n[vmo-reentry] SELF-DEADLOCK about to happen: cpu re-acquires family \
-         lock {:#x} it already holds, at {}:{} — call chain:\n",
-        lock_ptr,
-        loc.file(),
-        loc.line(),
-    ));
-    #[cfg(all(target_arch = "x86_64", target_os = "none"))]
-    {
-        let mut rbp: usize;
-        unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp) };
-        for _ in 0..24 {
-            if rbp == 0 || rbp & 0x7 != 0 || rbp < 0xffff_ff00_0000_0000 {
-                break;
-            }
-            let ret = unsafe { core::ptr::read_volatile((rbp + 8) as *const usize) };
-            let next = unsafe { core::ptr::read_volatile(rbp as *const usize) };
-            if ret == 0 {
-                break;
-            }
-            kernel_hal::console::serial_write_fmt_spin(format_args!(
-                "[vmo-reentry]   ret={:#x}\n",
-                ret
-            ));
-            if next <= rbp {
-                break;
-            }
-            rbp = next;
-        }
-        kernel_hal::console::serial_write_str(
-            "[vmo-reentry] symbolize: llvm-addr2line -e <zcore.elf> -fCi <ret ...>\n",
-        );
-    }
-}
-
-fn reentry_enter(lock_ptr: usize) {
-    let held = unsafe { &mut *HELD_LOCKS[stash_cpu()].0.get() };
-    if let Some(slot) = held.iter_mut().find(|p| **p == 0) {
-        *slot = lock_ptr;
-    }
-}
-
-/// Pops one matching `lock_ptr` off this cpu's held-set on drop.
-struct ReentryPop(usize);
-impl Drop for ReentryPop {
-    fn drop(&mut self) {
-        let held = unsafe { &mut *HELD_LOCKS[stash_cpu()].0.get() };
-        if let Some(slot) = held.iter_mut().rev().find(|p| **p == self.0) {
-            *slot = 0;
-        }
-    }
-}
-
-/// Park `arc` until the current family guard releases the lock. MUST be called
-/// with a family guard held (IRQs are then off, making the per-cpu access
-/// exclusive).
-fn stash_defer(arc: Arc<VMObjectPaged>) {
-    // SAFETY: per-cpu, IRQs off under the family lock; see `DropStashes`.
-    let v = unsafe { &mut *DROP_STASH.0[stash_cpu()].0.get() };
-    if v.len() < STASH_CAP {
-        v.push(arc);
-    } else {
-        // Overflow: leaking is recoverable and diagnosable; dropping under the
-        // lock is the deadlock this exists to prevent. Never expected — depth
-        // here is the nesting of COW operations, single digits.
-        error!("vmo drop stash overflow; leaking one Arc");
-        core::mem::forget(arc);
-    }
-}
-
-/// Watermark recorded when a guard opens; dropping it drains every stash entry
-/// pushed since. Declared LAST in the guard structs so it runs after the lock
-/// guard's own drop — the entries die with the family lock released.
-struct StashDrain {
-    mark: usize,
-}
-
-impl StashDrain {
-    fn open() -> Self {
-        // SAFETY: called while constructing a guard, family lock just taken.
-        let v = unsafe { &*DROP_STASH.0[stash_cpu()].0.get() };
-        StashDrain { mark: v.len() }
-    }
-}
-
-impl Drop for StashDrain {
-    fn drop(&mut self) {
-        loop {
-            // SAFETY: IRQs are on again here (the lock guard dropped first),
-            // but only this cpu's own frames push/pop this stash and we pop
-            // one entry at a time, re-reading the length each round: a nested
-            // Drop triggered by the pop pushes and drains at ITS OWN deeper
-            // watermark before returning here.
-            let arc = {
-                let v = unsafe { &mut *DROP_STASH.0[stash_cpu()].0.get() };
-                if v.len() <= self.mark {
-                    break;
-                }
-                v.pop()
-            };
-            drop(arc);
-        }
-    }
-}
-
-/// Shared borrow of a `VMObjectPaged`'s inner state, holding the family lock.
-/// Field order is load-bearing: `inner` (the RefCell borrow) drops first,
-/// `_guard` (the family mutex) last. See `get_inner` for the full contract.
-struct InnerGuard<'a> {
-    inner: Ref<'a, VMObjectPagedInner>,
-    _guard: MutexGuard<'a, ()>,
-    /// Pops this lock off the per-cpu held-set (drops after the mutex releases,
-    /// before the drain — so the drain's Arc drops don't self-report).
-    _reentry: ReentryPop,
-    /// Drops LAST (declaration order): drains the per-cpu deferred-drop stash
-    /// with the family lock already released. See `stash_defer`.
-    _drain: StashDrain,
-}
-
-impl core::ops::Deref for InnerGuard<'_> {
-    type Target = VMObjectPagedInner;
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-/// Exclusive borrow of a `VMObjectPaged`'s inner state, holding the family
-/// lock. Same structural drop-order guarantee as [`InnerGuard`].
-struct InnerGuardMut<'a> {
-    inner: RefMut<'a, VMObjectPagedInner>,
-    _guard: MutexGuard<'a, ()>,
-    /// Pops this lock off the per-cpu held-set. See `InnerGuard::_reentry`.
-    _reentry: ReentryPop,
-    /// Drops LAST: drains the deferred-drop stash after the lock releases.
-    _drain: StashDrain,
-}
-
-impl core::ops::Deref for InnerGuardMut<'_> {
-    type Target = VMObjectPagedInner;
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl core::ops::DerefMut for InnerGuardMut<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
+    /// get the mutable reference to inner by lock the shared lock
+    fn get_inner_mut(&self) -> (MutexGuard<'_, ()>, RefMut<'_, VMObjectPagedInner>) {
+        (self.lock.lock(), self.inner.borrow_mut())
     }
 }
 
@@ -869,7 +593,7 @@ impl VMObjectTrait for VMObjectPaged {
             return Err(ZxError::BAD_STATE);
         }
         if inner.cache_policy == CachePolicy::Cached && policy != CachePolicy::Cached {
-            for (_, value) in inner.frames.iter() {
+            for value in inner.frames.values() {
                 kernel_hal::mem::frame_flush(value.frame.paddr());
             }
         }
@@ -937,29 +661,9 @@ impl VMObjectTrait for VMObjectPaged {
         true
     }
 
-    fn committed_paddr(&self, page_idx: usize) -> Option<PhysAddr> {
-        let inner = self.get_inner();
-        inner.frames.get(&page_idx).map(|s| s.frame.paddr())
-    }
-
-    fn is_demand_paged(&self) -> bool {
-        self.get_inner().source.is_some()
-    }
-
-    fn fork_copy(&self) -> ZxResult<Arc<dyn VMObjectTrait>> {
-        VMObjectPaged::fork_copy(self).map(|v| v as Arc<dyn VMObjectTrait>)
-    }
-
     fn as_mut_buf(&self) -> ZxResult<(MutexGuard<'_, ()>, &mut [u8])> {
-        // This is the one site that hands the family lock OUT to the caller
-        // (the returned slice aliases the contiguous frames, so the lock must
-        // outlive it). Take the lock manually and keep the RefCell borrow as a
-        // statement-scoped temporary: it dies at the end of the second
-        // statement, strictly before the guard leaves this function — the same
-        // borrow-dies-before-mutex-releases contract the guard newtypes enforce.
-        let guard = self.lock.lock();
-        let res = self.inner.borrow_mut().as_mut_buf();
-        res.map(|(addr, size)| {
+        let (guard, mut inner) = self.get_inner_mut();
+        inner.as_mut_buf().map(|(addr, size)| {
             (guard, unsafe {
                 core::slice::from_raw_parts_mut(addr as *mut u8, size)
             })
@@ -970,7 +674,7 @@ impl VMObjectTrait for VMObjectPaged {
         let mut inner = self.get_inner_mut();
         if inner.contiguous {
             inner.contiguous = false;
-            for (_index, frame) in inner.frames.iter_mut() {
+            for frame in inner.frames.values_mut() {
                 frame.pin_count -= 1;
             }
         }
