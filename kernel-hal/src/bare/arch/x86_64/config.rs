@@ -1,7 +1,7 @@
 //! Kernel configuration.
 
-use uefi::proto::console::gop::ModeInfo;
 use uefi::boot::MemoryDescriptor;
+use uefi::proto::console::gop::ModeInfo;
 
 /// Kernel configuration passed by kernel when calls [`crate::primary_init_early()`].
 #[derive(Debug)]
