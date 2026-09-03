@@ -114,6 +114,7 @@ impl KernelHandler for ZcoreKernelHandler {
                     core::hint::spin_loop();
                 }
             }
+            fault_banner("null-range kernel #PF", fault_vaddr, access_flags);
             let in_timer = kernel_hal::timer::in_timer_callback();
             // ONLY the spin serial writer: `console_write_fmt` goes through the
             // graphic console trait object and was observed to #PF again
@@ -263,6 +264,7 @@ fn report_unresolved_kernel_fault(
             core::hint::spin_loop();
         }
     }
+    fault_banner("kernel #PF", fault_vaddr, access_flags);
     kernel_hal::console::serial_write_fmt_spin(format_args!(
         "\n[KERNEL PAGE FAULT] vaddr={:#x} flags={:?} rip={:#x} have_thread={} \
          (unresolved by the user vmar — a kernel-side bug, not a userspace \
@@ -298,6 +300,56 @@ fn report_unresolved_kernel_fault(
 /// the spin/blocking serial writer so this survives even as the panic that
 /// follows re-faults on a corrupted stack. rbp==0 or a scan that leaves the
 /// plausible kernel range simply stops the walk.
+/// Paint the kernel-stop screen for an unresolved kernel page fault BEFORE
+/// the serial diagnostics, so the lines that follow land below it (the early
+/// framebuffer console parks its cursor under the banner).
+///
+/// The reports in this file were serial-only: raw pixel writes cannot re-fault
+/// through a torn console object, but on a monitor-only box the mirrored
+/// serial text was white glyphs over rboot's white splash — a kernel #PF in a
+/// boot-time driver probe was indistinguishable from a hang at 84% with
+/// nothing on the screen but the logo. `panic_banner` is the same lock-free,
+/// allocation-free raster path the panic handler uses; the message is built on
+/// the stack.
+#[cfg(not(feature = "libos"))]
+fn fault_banner(what: &str, fault_vaddr: usize, access_flags: MMUFlags) {
+    use core::fmt::Write;
+    struct Buf {
+        buf: [u8; 256],
+        len: usize,
+    }
+    impl Write for Buf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let n = s.len().min(self.buf.len() - self.len);
+            self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+            self.len += n;
+            Ok(())
+        }
+    }
+    let mut b = Buf {
+        buf: [0u8; 256],
+        len: 0,
+    };
+    let _ = write!(
+        b,
+        "KERNEL STOP cpu={} {} vaddr={:#x} flags={:?} rip={:#x}\ndetails follow below",
+        kernel_hal::cpu::cpu_id(),
+        what,
+        fault_vaddr,
+        access_flags,
+        kernel_hal::kstats::last_fault_rip(),
+    );
+    let text = match core::str::from_utf8(&b.buf[..b.len]) {
+        Ok(s) => s,
+        Err(e) => core::str::from_utf8(&b.buf[..e.valid_up_to()]).unwrap_or(""),
+    };
+    kernel_hal::console::panic_banner(text);
+}
+
+/// Hosted build: no framebuffer to paint.
+#[cfg(feature = "libos")]
+fn fault_banner(_what: &str, _fault_vaddr: usize, _access_flags: MMUFlags) {}
+
 fn print_fault_backtrace(access_flags: MMUFlags) {
     let rbp0 = kernel_hal::kstats::last_fault_rbp();
     let rsp0 = kernel_hal::kstats::last_fault_rsp();

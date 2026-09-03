@@ -225,15 +225,21 @@ fn draw_char(c: u8) {
 
     // 8x16: draw each font row twice vertically.
     // gx = 0 is the left of the cell; bit 7 of the VGA row is that pixel.
+    //
+    // OPAQUE cells: white glyph on a black cell background. Until the first
+    // `clear_black` the framebuffer still holds rboot's splash, which is
+    // WHITE; glyph-only (transparent) drawing put white text on that white
+    // ground and every boot-log line before the graphic console — including
+    // the one that names a driver probe that never returns — was invisible
+    // on real hardware. A photo of a stall at 84% showed nothing but the logo.
     for (gy, bits) in glyph.iter().copied().enumerate() {
         for gx in 0..8u32 {
             let on = (bits & (1 << (7 - gx))) != 0;
-            if on {
-                let px = x0 + gx;
-                let py = y0 + (gy as u32) * 2;
-                put_pixel(px, py, 0xFFFF_FFFF);
-                put_pixel(px, py + 1, 0xFFFF_FFFF);
-            }
+            let color = if on { 0xFFFF_FFFF } else { 0xFF00_0000 };
+            let px = x0 + gx;
+            let py = y0 + (gy as u32) * 2;
+            put_pixel(px, py, color);
+            put_pixel(px, py + 1, color);
         }
     }
 

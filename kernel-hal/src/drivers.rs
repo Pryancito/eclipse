@@ -477,6 +477,18 @@ mod drivers_ffi_libos {
         }
     }
 
+    /// `zcore_drivers::boot_notice!`: straight to the console, no level filter.
+    #[no_mangle]
+    extern "C" fn drivers_console_write(msg: *const u8, len: usize) {
+        if msg.is_null() || len == 0 {
+            return;
+        }
+        let slice = unsafe { core::slice::from_raw_parts(msg, len) };
+        if let Ok(s) = core::str::from_utf8(slice) {
+            crate::console::console_write_str(s);
+        }
+    }
+
     // `zcore_drivers::utils::dma::DmaRegion` (used by every PCI NIC/storage
     // driver, all of which are linked even though no PCI bus exists under
     // libos) references these in its alloc/Drop glue. Back them with the
@@ -528,15 +540,25 @@ mod drivers_ffi {
     #[no_mangle]
     extern "C" fn drivers_dma_alloc(pages: usize) -> PhysAddr {
         let Some(paddr) = KHANDLER.frame_alloc_contiguous(pages, 0) else {
-            let (used, total) = KHANDLER.memory_usage();
-            crate::klog_err!(
-                "drivers_dma_alloc: no hay {} páginas físicas contiguas (RAM insuficiente o \
-                 fragmentación) — frame pool {} MiB used / {} MiB managed; the requesting \
-                 device stays down",
-                pages,
-                used >> 20,
-                total >> 20,
-            );
+            // Rate-limited: a caller that retries per page (the NVIDIA RM walks
+            // its memdescs one by one) would otherwise turn an exhausted pool
+            // into thousands of UART-paced lines, which on hardware looks
+            // exactly like a hang at the point of failure.
+            use core::sync::atomic::{AtomicU32, Ordering};
+            static FAILURES: AtomicU32 = AtomicU32::new(0);
+            let n = FAILURES.fetch_add(1, Ordering::Relaxed);
+            if n < 8 || n.is_power_of_two() {
+                let (used, total) = KHANDLER.memory_usage();
+                crate::klog_err!(
+                    "drivers_dma_alloc: no hay {} páginas físicas contiguas (RAM insuficiente o \
+                     fragmentación) — frame pool {} MiB used / {} MiB managed; the requesting \
+                     device stays down (failure #{})",
+                    pages,
+                    used >> 20,
+                    total >> 20,
+                    n + 1,
+                );
+            }
             return 0;
         };
         trace!("alloc DMA: paddr={:#x}, pages={}", paddr, pages);
@@ -741,6 +763,21 @@ mod drivers_ffi {
         let slice = unsafe { core::slice::from_raw_parts(msg, len) };
         if let Ok(s) = core::str::from_utf8(slice) {
             klog_emit(priority, s);
+        }
+    }
+
+    /// `zcore_drivers::boot_notice!`: straight to the console (serial and the
+    /// on-screen text console, early framebuffer included), bypassing the
+    /// `log` level filter. Non-blocking: every console path underneath is a
+    /// `try_lock` or lock-free, so this is safe from any driver context.
+    #[no_mangle]
+    extern "C" fn drivers_console_write(msg: *const u8, len: usize) {
+        if msg.is_null() || len == 0 {
+            return;
+        }
+        let slice = unsafe { core::slice::from_raw_parts(msg, len) };
+        if let Ok(s) = core::str::from_utf8(slice) {
+            crate::console::console_write_str(s);
         }
     }
 

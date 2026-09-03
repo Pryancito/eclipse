@@ -55,6 +55,19 @@ pub const LOG_INFO: u8 = 6;
 /// Append a vital kernel message to the dmesg ring buffer (syslog priority 0–7).
 /// Always recorded regardless of the `log` crate max level.
 pub fn klog_emit(priority: u8, msg: &str) {
+    // `LOG_ERR` lines also go to the console. The ring is the durable record,
+    // but a kernel-side error at boot (a driver that could not get its DMA
+    // memory, a PCI probe that failed) is worth seeing on the monitor of a
+    // box with no serial — and `klog_err!` used to be dmesg-only, so at the
+    // production `LOG=error` such errors were invisible until the machine
+    // was up enough to run `dmesg`, which a boot stall never is. Every console
+    // path underneath is `try_lock` or lock-free, so this cannot block.
+    if priority <= LOG_ERR {
+        console_write_str(msg);
+        if !msg.ends_with('\n') {
+            console_write_str("\n");
+        }
+    }
     let p = KLOG_EMIT_FN.load(Ordering::SeqCst);
     if p == 0 {
         return;

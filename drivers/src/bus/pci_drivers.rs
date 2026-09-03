@@ -89,6 +89,20 @@ pub fn probe_pci_device(
     let drivers = DRIVERS.lock();
     for drv in drivers.iter() {
         if drv.matched_dev(dev) {
+            // Console AND dmesg (whatever `LOG=`), and BEFORE the call: a probe
+            // that never returns — the 84% stall on real hardware — is then
+            // named by the last line on the screen. Only drivers that actually
+            // match get a line, so this is a handful per boot, not one per PCI
+            // function.
+            crate::boot_notice!(
+                "[pci] {:02x}:{:02x}.{} {:04x}:{:04x} -> driver '{}' init",
+                dev.loc.bus,
+                dev.loc.device,
+                dev.loc.function,
+                dev.id.vendor_id,
+                dev.id.device_id,
+                drv.name(),
+            );
             match drv.init(dev, mapper, irq) {
                 ok @ Ok(_) => {
                     info!("[pci] {} inicializado correctamente", drv.name());
@@ -100,7 +114,11 @@ pub fn probe_pci_device(
                     debug!("[pci] driver '{}' skipped (NotSupported)", drv.name());
                 }
                 Err(e) => {
-                    warn!("[pci] driver '{}' falló: {:?}", drv.name(), e);
+                    // A driver that matched and then failed is worth a line that
+                    // survives LOG=error (klog_err also reaches the console): it
+                    // is the only record that, say, the NVMe controller stayed
+                    // down for want of DMA memory.
+                    crate::klog_err!("[pci] driver '{}' falló: {:?}", drv.name(), e);
                 }
             }
         }

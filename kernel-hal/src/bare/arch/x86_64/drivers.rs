@@ -425,11 +425,28 @@ pub(super) fn init() -> DeviceResult {
         // display layer in the early graphic block above (before this fallible
         // PCI init), so display drivers already have native-resolution info.
 
+        // Frame-pool occupancy on either side of the PCI scan, straight to the
+        // console (no `LOG=` filter): the scan is where every driver takes its
+        // DMA memory, and a stop in here on real hardware — a panic on an
+        // exhausted pool, or a probe that never returns — is diagnosed from a
+        // photo. These two lines say whether RAM was already gone BEFORE any
+        // driver ran, and how much the probes consumed.
+        let frame_pool_note = |when: &str| {
+            let (used, total) = crate::KHANDLER.memory_usage();
+            crate::console::console_write_fmt(format_args!(
+                "[boot] frame pool {}: {} MiB used / {} MiB managed\n",
+                when,
+                used >> 20,
+                total >> 20
+            ));
+        };
+        frame_pool_note("before PCI scan");
         boot_progress(84);
         let pci_devs = pci::init(Some(Arc::new(IoMapperImpl)))?;
         // Do NOT drain deferred jobs here — e1000e PHY/MAC init runs in the idle
         // loop / NIC poll path so boot progress is not blocked at 84% or 87%.
         boot_progress(87);
+        frame_pool_note("after PCI scan");
         for d in pci_devs.into_iter() {
             drivers::add_device(d);
         }

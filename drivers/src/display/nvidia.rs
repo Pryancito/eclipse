@@ -11245,7 +11245,20 @@ impl PciDriver for NvidiaGpuDriverPci {
         super::nvidia_hooks::install(mapper);
 
         if let Some(m) = mapper {
-            m.query_or_map(bar0_addr as usize, bar0_map_len as usize);
+            // A failed mapping (no frames left for the page tables) must end
+            // the probe here: every register read below goes through this
+            // alias, and a #PF inside a PCI probe — under the driver registry's
+            // lock — cannot be contained, so it takes the whole boot down.
+            if m.query_or_map(bar0_addr as usize, bar0_map_len as usize)
+                .is_none()
+            {
+                crate::klog_err!(
+                    "[NVIDIA] could not map BAR0 {:#x} ({:#x} bytes); GPU probe aborted",
+                    bar0_addr,
+                    bar0_map_len
+                );
+                return Err(DeviceError::NoResources);
+            }
         }
         let bar0_vaddr = phys_to_virt(bar0_addr as usize);
 
@@ -11296,7 +11309,16 @@ impl PciDriver for NvidiaGpuDriverPci {
 
         if let Some((fb_addr, fb_len)) = fb_bar {
             if let Some(m) = mapper {
-                m.query_or_map(fb_addr as usize, fb_len as usize);
+                // Same as BAR0: an unmapped VRAM window is later dereferenced
+                // by the scanout/blit paths, so refuse the device instead.
+                if m.query_or_map(fb_addr as usize, fb_len as usize).is_none() {
+                    crate::klog_err!(
+                        "[NVIDIA] could not map BAR1 (VRAM window) {:#x} ({:#x} bytes); GPU probe aborted",
+                        fb_addr,
+                        fb_len
+                    );
+                    return Err(DeviceError::NoResources);
+                }
             }
             let fb_vaddr = phys_to_virt(fb_addr as usize);
 

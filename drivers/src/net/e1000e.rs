@@ -3164,6 +3164,8 @@ mod rx_ring_tests {
     #[no_mangle]
     extern "C" fn drivers_klog_emit(_priority: u8, _msg: *const u8, _len: usize) {}
     #[no_mangle]
+    extern "C" fn drivers_console_write(_msg: *const u8, _len: usize) {}
+    #[no_mangle]
     extern "C" fn drivers_intr_on() {}
     #[no_mangle]
     extern "C" fn drivers_intr_off() {}
