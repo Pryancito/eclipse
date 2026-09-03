@@ -396,3 +396,39 @@ reinicio de autoneg efectivo.
 - Con el anillo TX en modo write-back (fallback si el remapeo UC falla) el
   sync ToDevice diferido de descriptores amplía la ventana de false sharing
   que motivó los anillos UC; el camino de producción (UC) no se ve afectado.
+
+## Seguimiento 2026-09-03: DNS roto en hardware real (I219)
+
+Síntoma reportado: `apk` y `ping <hostname>` fallan por DNS en hardware real;
+las descargas TCP funcionan. DNS va por UDP, y el commit "mejoras en el driver
+e1000e" activó `RXCSUM.TUOFLD` (offload de checksum TCP/UDP en recepción).
+
+#### 19. Descartar por `errors.TCPE/IPE` convierte falsos positivos del NIC en pérdida silenciosa
+`process_rx_slot`
+
+El driver descartaba cualquier descriptor con `errors != 0`, incluyendo `TCPE`
+e `IPE`, que no indican daño en el cable sino el *veredicto* de checksum del
+hardware. Linux (`e1000_rx_checksum`) nunca descarta por esos bits: entrega la
+trama con `CHECKSUM_NONE` y deja que la pila la reverifique, porque el veredicto
+tiene falsos positivos. El caso clásico son los datagramas UDP con checksum 0
+(deshabilitado), legal en IPv4 y habitual en las respuestas DNS de routers
+domésticos. Con el descarte incondicional, cada respuesta así se perdía sin
+rastro: TCP seguía funcionando y `getaddrinfo` agotaba el timeout. QEMU no lo
+reproduce porque su modelo no valida UDP con checksum 0.
+
+*Corrección:* solo CE/SE/SEQ/CXE/RXE (daño de trama) descartan. `TCPE`/`IPE`
+se tratan como `IXSM` y la trama pasa por la verificación software del
+hallazgo #15, que acepta UDP IPv4 con checksum 0 y descarta lo que de verdad
+está corrupto. Nuevo contador `rx_csum_hw_false_positive` (`hw_csum_fp` en la
+línea del watchdog, junto a `rx_drop`) y un aviso la primera vez que ocurre:
+si en hardware real sube, esta era la causa. Test
+`rx_hw_checksum_verdict_is_reverified_not_trusted`.
+
+Otras causas revisadas y descartadas por lectura del camino musl → UDP →
+smoltcp: creación del socket con `SOCK_NONBLOCK`, `bind` efímero, `sendto`
+sin conectar, `poll()` con timeout y `recvfrom` con dirección de origen
+(musl compara los 16 bytes del `sockaddr_in`; `sin_zero` se escribe a cero).
+Quedan pendientes fuera del driver: `netdev_drain_rx` (AF_PACKET/ICMP) sigue
+sacando tramas del anillo sin pasar por smoltcp, y un nameserver IPv6 en
+`resolv.conf` haría que musl enviase a los IPv4 como `::ffff:a.b.c.d`, que el
+kernel rechaza.

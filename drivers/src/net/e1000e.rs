@@ -345,6 +345,13 @@ const RXD_STAT_TCPCS: u8 = 1 << 5;
 /// IPv4 header checksum was calculated.
 const RXD_STAT_IPCS: u8 = 1 << 6;
 
+// Legacy RX descriptor errors byte (8254x §3.2.3.1.3): CE, SE, SEQ, CXE and
+// RXE mean the frame was damaged on the wire and is always dropped. TCPE and
+// IPE are only the NIC's *checksum verdict* — see `process_rx_slot`.
+const RXD_ERR_TCPE: u8 = 1 << 5;
+const RXD_ERR_IPE: u8 = 1 << 6;
+const RXD_ERR_CSUM_VERDICT: u8 = RXD_ERR_TCPE | RXD_ERR_IPE;
+
 // TX descriptor CMD bits
 const TX_CMD_EOP: u8 = 1 << 0;
 const TX_CMD_IFCS: u8 = 1 << 1;
@@ -666,6 +673,11 @@ pub struct E1000eHw {
     /// watchdog. Per-instance (not a file-level static) so two e1000e NICs
     /// don't conflate each other's diagnostics.
     rx_csum_bad: u64,
+    /// Frames the NIC flagged `TCPE`/`IPE` that then PASSED the software
+    /// checksum check — i.e. hardware checksum false positives. Non-zero on
+    /// real hardware is the signature of the "TCP works, DNS/UDP doesn't"
+    /// failure the old unconditional drop produced. Watchdog-visible.
+    rx_csum_hw_false_positive: u64,
     /// Count of outgoing frames smoltcp handed us that we had to DROP because
     /// the TX ring stayed full past [`TX_SEND_SPIN_LIMIT`]. Any non-zero
     /// value means a pure ACK / window-update was lost — the exact cause of
@@ -1708,7 +1720,18 @@ impl E1000eHw {
             return None;
         }
 
-        if rxd.errors != 0 || len == 0 || len > BUF_SIZE {
+        // Only wire-level damage (CRC, symbol, sequence, carrier-extension,
+        // RX data error) is grounds for dropping here. TCPE/IPE are the NIC's
+        // checksum *opinion*, and Linux (`e1000_rx_checksum`) deliberately
+        // never drops on them: it hands the frame up with CHECKSUM_NONE so
+        // the stack re-verifies in software, because the hardware verdict
+        // has false positives — most commonly UDP datagrams carrying a zero
+        // (disabled) checksum, which is legal for IPv4 and what many home
+        // routers emit for DNS replies. Dropping on the raw bit turned every
+        // such reply into a silent loss: TCP kept working on real hardware
+        // while `getaddrinfo` timed out. Frames the NIC flagged are routed
+        // through the software checksum fallback below instead.
+        if rxd.errors & !RXD_ERR_CSUM_VERDICT != 0 || len == 0 || len > BUF_SIZE {
             self.clear_rx_pending();
             self.stats.rx_dropped += 1;
             self.rx_next_to_clean = (head + 1) % NUM_RX;
@@ -1763,14 +1786,35 @@ impl E1000eHw {
         // The EOP descriptor's status carries the checksum indication for the
         // whole frame. Only frames the NIC did NOT validate pay for a software
         // check here; the common validated IPv4 TCP/UDP case is a bit test.
+        // A TCPE/IPE verdict is folded in as IXSM: "ignore what the NIC
+        // said, decide in software".
+        let hw_flagged = rxd.errors & RXD_ERR_CSUM_VERDICT != 0;
+        let csum_status = if hw_flagged {
+            rxd.status | RXD_STAT_IXSM
+        } else {
+            rxd.status
+        };
         let complete = match complete {
-            Some(pkt) if rx_csum_needs_sw_check(rxd.status) && rx_sw_csum_bad(&pkt, rxd.status) => {
+            Some(pkt)
+                if rx_csum_needs_sw_check(csum_status) && rx_sw_csum_bad(&pkt, csum_status) =>
+            {
                 self.rx_csum_bad += 1;
                 self.stats.rx_dropped += 1;
                 self.recycle_rx_frame(pkt);
                 None
             }
-            other => other,
+            other => {
+                if hw_flagged && other.is_some() {
+                    self.rx_csum_hw_false_positive += 1;
+                    if self.rx_csum_hw_false_positive == 1 {
+                        crate::klog_warn!(
+                            "[e1000e] NIC flagged errors={:#04x} on a frame whose checksums verify in software; trusting software (watchdog: hw_csum_fp)\n",
+                            rxd.errors
+                        );
+                    }
+                }
+                other
+            }
         };
 
         if let Some(ref pkt) = complete {
@@ -2104,14 +2148,17 @@ impl E1000eHw {
             let tdh = mmio_read(self.base, E1000E_TDH);
             let tdt = mmio_read(self.base, E1000E_TDT);
             let csum_bad = self.rx_csum_bad;
+            let csum_fp = self.rx_csum_hw_false_positive;
             let tx_dropped = self.tx_dropped;
             crate::klog_info!(
-                "[e1000e] watchdog: link={} GPRC={} MPC={} rx_pkt={} rx_csum_bad={} GPTC={} tx_pkt={} tx_drop={} TDH={} TDT={} itr={}\n",
+                "[e1000e] watchdog: link={} GPRC={} MPC={} rx_pkt={} rx_drop={} rx_csum_bad={} hw_csum_fp={} GPTC={} tx_pkt={} tx_drop={} TDH={} TDT={} itr={}\n",
                 link,
                 gprc,
                 mpc,
                 self.stats.rx_packets,
+                self.stats.rx_dropped,
                 csum_bad,
+                csum_fp,
                 gptc,
                 self.stats.tx_packets,
                 tx_dropped,
@@ -2925,6 +2972,7 @@ pub fn init(
         rx_frame_pool: Vec::new(),
         stats: NetStats::default(),
         rx_csum_bad: 0,
+        rx_csum_hw_false_positive: 0,
         tx_dropped: 0,
         link_up: false,
         link_watchdog_next_us: 0,
@@ -3222,6 +3270,7 @@ mod rx_ring_tests {
             rx_frame_pool: Vec::new(),
             stats: NetStats::default(),
             rx_csum_bad: 0,
+            rx_csum_hw_false_positive: 0,
             tx_dropped: 0,
             link_up: true,
             link_watchdog_next_us: 0,
@@ -3294,6 +3343,60 @@ mod rx_ring_tests {
             let d = &mut *hw.rx_ring.as_ptr::<RxDesc>().add(slot);
             d.status |= status;
         }
+    }
+
+    /// Like `hw_deliver_with_status`, plus an explicit `errors` byte.
+    fn hw_deliver_with_errors(hw: &E1000eHw, slot: usize, data: &[u8], status: u8, errors: u8) {
+        hw_deliver_with_status(hw, slot, data, status);
+        unsafe {
+            let d = &mut *hw.rx_ring.as_ptr::<RxDesc>().add(slot);
+            d.errors = errors;
+        }
+    }
+
+    #[test]
+    fn rx_hw_checksum_verdict_is_reverified_not_trusted() {
+        // Linux never drops on TCPE/IPE: the NIC's checksum verdict has false
+        // positives (UDP with a zero checksum is the classic one), so such
+        // frames go through the software check instead of the bit bin.
+        let mut hw = make_hw();
+        let good = ipv4_udp_frame(b"dns reply the NIC disliked");
+        let mut zero_csum = ipv4_udp_frame(b"router reply, no udp checksum");
+        zero_csum[14 + 26] = 0;
+        zero_csum[14 + 27] = 0;
+        let mut corrupt = ipv4_udp_frame(b"actually corrupt");
+        corrupt[14 + 28 + 4] ^= 0x10;
+        let crc_err = ipv4_udp_frame(b"wire-damaged");
+        // Slot 0: NIC says TCPE, checksums verify in software -> deliver.
+        hw_deliver_with_errors(&hw, 0, &good, RXD_STAT_IPCS | RXD_STAT_UDPCS, RXD_ERR_TCPE);
+        // Slot 1: NIC says TCPE on a zero-checksum UDP datagram -> legal, deliver.
+        hw_deliver_with_errors(&hw, 1, &zero_csum, RXD_STAT_IPCS, RXD_ERR_TCPE);
+        // Slot 2: NIC says TCPE and the payload really is corrupt -> drop.
+        hw_deliver_with_errors(
+            &hw,
+            2,
+            &corrupt,
+            RXD_STAT_IPCS | RXD_STAT_UDPCS,
+            RXD_ERR_TCPE,
+        );
+        // Slot 3: NIC says IPE but the header is fine -> deliver.
+        hw_deliver_with_errors(&hw, 3, &good, RXD_STAT_UDPCS, RXD_ERR_IPE);
+        // Slot 4: CRC error is wire damage -> always dropped, however it sums.
+        hw_deliver_with_errors(&hw, 4, &crc_err, RXD_STAT_IPCS | RXD_STAT_UDPCS, 0x01);
+
+        assert_eq!(hw.receive().expect("slot 0"), good);
+        assert_eq!(hw.receive().expect("slot 1"), zero_csum);
+        assert_eq!(hw.receive().expect("slot 3"), good);
+        assert!(hw.receive().is_none());
+        assert_eq!(hw.stats.rx_packets, 3);
+        assert_eq!(hw.stats.rx_dropped, 2, "corrupt payload + CRC error");
+        assert_eq!(
+            hw.rx_csum_bad, 1,
+            "only the software-confirmed bad checksum"
+        );
+        assert_eq!(hw.rx_csum_hw_false_positive, 3);
+        hw.flush_rx_doorbell();
+        assert_eq!(reg_read(hw.base, E1000E_RDT) as usize, 4);
     }
 
     /// Ethernet + IPv4 + UDP frame with a correct UDP and IP header checksum.
