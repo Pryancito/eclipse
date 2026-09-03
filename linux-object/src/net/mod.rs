@@ -999,12 +999,22 @@ pub fn drain_all_nic_rx() {
     }
 }
 
-/// Drive the NIC's smoltcp poll so RX is copied to AF_PACKET (`net_defer_packet`)
-/// and delivered to TCP/UDP. Do not `recv()` from the ring here — that steals
-/// frames from smoltcp and silently drops TCP/DHCP depending on who ran first.
+/// Copy RX frames from the NIC ring into AF_PACKET (`push_packet`).
+///
+/// This is the v0.5.0 path that made `udhcpc` see DHCPOFFER/DHCPACK. Driving
+/// only `poll()` is not enough: e1000e skips the smoltcp drain when the
+/// socket-set lock is busy, and even a successful poll can drop a DHCP
+/// datagram that has no UDP socket (udhcpc speaks AF_PACKET, not UDP/68).
+/// `io_wait_tick` still runs `poll_ifaces` first so TCP/UDP see frames
+/// before this leftover drain.
 pub fn netdev_drain_rx(dev: &dyn zcore_drivers::scheme::NetScheme) {
-    kernel_hal::deferred_job::drain_deferred_jobs();
-    let _ = dev.poll();
+    let mut buf = alloc::vec![0u8; 2048];
+    for _ in 0..32 {
+        match dev.recv(&mut buf) {
+            Ok(n) if n > 0 => packet::push_packet(&buf[..n]),
+            _ => break,
+        }
+    }
     kernel_hal::deferred_job::drain_deferred_jobs();
 }
 
@@ -1665,17 +1675,16 @@ pub fn handle_net_ioctl(
             #[allow(unsafe_code)]
             let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
             let ifname = ifreq_name(&ifr.ifr_name)?;
-            let mut flags = if ifname == "loopback" {
+            let flags = if ifname == "loopback" {
                 IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_NOARP
             } else {
-                IFF_UP | IFF_BROADCAST | IFF_MULTICAST
+                let _ = iface_by_name(ifname)?;
+                // Do not hide the NIC behind STATUS.LU. udhcpc uses
+                // SIOCGIFFLAGS and waits forever without IFF_RUNNING if the
+                // PHY report lags the actual link (the v0.5.0 netlink path
+                // always advertised RUNNING for the same reason).
+                IFF_UP | IFF_BROADCAST | IFF_MULTICAST | IFF_RUNNING | IFF_LOWER_UP
             };
-            if ifname != "loopback" {
-                let iface = iface_by_name(ifname)?;
-                if iface.link_carrier_up() {
-                    flags |= IFF_RUNNING | IFF_LOWER_UP;
-                }
-            }
             ifr.ifr_ifru = IfReqUnion {
                 flags: flags as i16,
             };

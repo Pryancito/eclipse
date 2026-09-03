@@ -74,7 +74,7 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU64, Ordering};
 
 use smoltcp::iface::*;
-use smoltcp::phy::{self, Checksum, DeviceCapabilities};
+use smoltcp::phy::{self, DeviceCapabilities};
 use smoltcp::time::Instant;
 use smoltcp::wire::*;
 use smoltcp::Result as SmolResult;
@@ -230,28 +230,16 @@ const TCTL_CT_SHIFT: u32 = 4;
 const TCTL_CT_LINUX: u32 = 15 << TCTL_CT_SHIFT;
 const TCTL_COLD_LINUX: u32 = 63 << 12;
 
-// TXDCTL / RXDCTL — Linux FLAG2_DMA_BURST (PTHRESH=0x1f, HTHRESH=1, WTHRESH=1,
-// GRAN=descriptors, COUNT_DESC). The previous wthresh/pthresh/hthresh of 1/1/1
-// without GRAN made the NIC DMA one descriptor at a time.
+// TXDCTL / RXDCTL — v0.5.0 values. Linux FLAG2_DMA_BURST (GRAN + PTHRESH=0x1f)
+// sped up QEMU and some discrete parts, but on PCH/I219 it delayed descriptor
+// write-back enough that DHCP DISCOVER never completed DD before udhcpc
+// retried, and RX DMA burst produced checksum-garbage that the software
+// verifier then dropped. QEMU ignores these fields, which is why DHCP still
+// worked in the VM.
 const TXDCTL_QUEUE_ENABLE: u32 = 1 << 25;
 const RXDCTL_QUEUE_ENABLE: u32 = 1 << 25;
-const TXDCTL_GRAN: u32 = 1 << 24;
-const TXDCTL_COUNT_DESC: u32 = 1 << 22;
-const TXDCTL_WTHRESH_1: u32 = 1 << 16;
-const TXDCTL_HTHRESH_1: u32 = 1 << 8;
-const TXDCTL_PTHRESH_1F: u32 = 0x1f;
-const TXDCTL_DMA_BURST: u32 =
-    TXDCTL_GRAN | TXDCTL_COUNT_DESC | TXDCTL_WTHRESH_1 | TXDCTL_HTHRESH_1 | TXDCTL_PTHRESH_1F;
-const RXDCTL_DMA_BURST: u32 = TXDCTL_GRAN | TXDCTL_WTHRESH_1 | TXDCTL_HTHRESH_1 | TXDCTL_PTHRESH_1F;
-
-// RXCSUM — hardware IP/TCP/UDP checksum offload (legacy descriptors).
-const RXCSUM_IPOFLD: u32 = 1 << 8;
-const RXCSUM_TUOFLD: u32 = 1 << 9;
-
-// Absolute interrupt-delay defaults (1.024 µs units), matching Linux e1000e.
-const RADV_DEFAULT: u32 = 8;
-const TIDV_DEFAULT: u32 = 8;
-const TADV_DEFAULT: u32 = 32;
+const TXDCTL_FULL_TX_DESC_WB: u32 = 0x0101_0000;
+const TXDCTL_DMA_BURST: u32 = (1 << 22) | (1 << 8) | 1; // COUNT_DESC | hthresh=1 | pthresh=1
 
 // RFCTL bits
 const RFCTL_EXTEN: u32 = 1 << 15;
@@ -337,12 +325,16 @@ const MII_CR_AUTO_NEG_EN: u16 = 0x1000;
 const RXD_STAT_DD: u8 = 1 << 0;
 const RXD_STAT_EOP: u8 = 1 << 1;
 /// Ignore checksum indication: the NIC did not validate this frame.
+#[allow(dead_code)]
 const RXD_STAT_IXSM: u8 = 1 << 2;
 /// UDP checksum was calculated (and, absent `errors.TCPE`, verified).
+#[allow(dead_code)]
 const RXD_STAT_UDPCS: u8 = 1 << 4;
 /// TCP (or UDP on parts that fold both) checksum was calculated.
+#[allow(dead_code)]
 const RXD_STAT_TCPCS: u8 = 1 << 5;
 /// IPv4 header checksum was calculated.
+#[allow(dead_code)]
 const RXD_STAT_IPCS: u8 = 1 << 6;
 
 // Legacy RX descriptor errors byte (8254x §3.2.3.1.3): CE, SE, SEQ, CXE and
@@ -458,6 +450,7 @@ unsafe fn mmio_write(base: usize, reg: usize, val: u32) {
 /// True if `frame` is an IPv4 Ethernet frame whose IP *header* checksum is wrong
 /// (the one-complement sum of the header 16-bit words must be 0xffff). Returns
 /// false for non-IPv4 frames (ARP/IPv6) so they are not counted as corrupt.
+#[allow(dead_code)] // unit tests; the RX hot path no longer drops on checksum
 fn rx_ipv4_hdr_csum_bad(frame: &[u8]) -> bool {
     if frame.len() < 14 + 20 || frame[12] != 0x08 || frame[13] != 0x00 {
         return false; // too short or not IPv4 (EtherType != 0x0800)
@@ -480,6 +473,7 @@ fn rx_ipv4_hdr_csum_bad(frame: &[u8]) -> bool {
 
 /// One's-complement accumulate of `data` as big-endian 16-bit words (an odd
 /// trailing byte is zero-padded on the right, per RFC 1071).
+#[allow(dead_code)]
 fn csum_add(mut sum: u32, data: &[u8]) -> u32 {
     let mut i = 0;
     while i + 1 < data.len() {
@@ -505,6 +499,7 @@ fn csum_add(mut sum: u32, data: &[u8]) -> u32 {
 /// and delivered to userspace as good data. Linux's `e1000_rx_checksum`
 /// makes exactly this per-packet decision; smoltcp's capabilities are static,
 /// so the driver has to do the fallback verification itself.
+#[allow(dead_code)]
 #[inline]
 fn rx_csum_needs_sw_check(status: u8) -> bool {
     status & RXD_STAT_IXSM != 0
@@ -518,6 +513,7 @@ fn rx_csum_needs_sw_check(status: u8) -> bool {
 /// Anything this cannot parse or verify (ARP, ICMP, fragments, unusual IPv6
 /// extension headers, truncated frames) returns `false` and is left to
 /// smoltcp, exactly as before.
+#[allow(dead_code)]
 fn rx_sw_csum_bad(frame: &[u8], status: u8) -> bool {
     if frame.len() < 14 {
         return false;
@@ -589,6 +585,7 @@ fn rx_sw_csum_bad(frame: &[u8], status: u8) -> bool {
 /// TCP/UDP checksum over the pseudo-header + segment. `l4` must be exactly
 /// the L4 segment as bounded by the IP header (IPv4 total length / IPv6
 /// payload length), so Ethernet padding is never summed.
+#[allow(dead_code)]
 fn l4_csum_bad(proto: u8, src: &[u8], dst: &[u8], l4: &[u8], ipv6: bool) -> bool {
     let seg: &[u8] = match proto {
         6 if l4.len() >= 20 => l4,
@@ -1436,10 +1433,11 @@ impl E1000eHw {
             );
         }
 
-        // Coalesce TX interrupts (Linux e1000e defaults). Requires CMD.IDE
-        // on posted descriptors or these timers are ignored.
-        mmio_write(self.base, E1000E_TIDV, TIDV_DEFAULT);
-        mmio_write(self.base, E1000E_TADV, TADV_DEFAULT);
+        // Timers off (v0.5.0). Absolute delay coalescing made the first
+        // DHCPOFFER wait for a later packet on real hardware; QEMU injects
+        // the reply immediately so it never showed up in the VM.
+        mmio_write(self.base, E1000E_TIDV, 0);
+        mmio_write(self.base, E1000E_TADV, 0);
 
         // Inter-Packet Gap: IPGT=8, IPGR1=8, IPGR2=6 — the 8254x/e1000e
         // datasheet copper default (0x00602008). IPGR2 was previously 12,
@@ -1478,7 +1476,11 @@ impl E1000eHw {
             mmio_write(self.base, E1000E_IOSFPC, iosfpc | 0x0001_0000);
             let _ = mmio_read(self.base, E1000E_IOSFPC);
         } else {
-            mmio_write(self.base, E1000E_TXDCTL, TXDCTL_DMA_BURST);
+            mmio_write(
+                self.base,
+                E1000E_TXDCTL,
+                TXDCTL_DMA_BURST | TXDCTL_FULL_TX_DESC_WB,
+            );
         }
 
         // TARC0 bit 0 is required for correct TX arbitration on 82574/ICH.
@@ -1494,10 +1496,9 @@ impl E1000eHw {
     }
 
     unsafe fn init_rx(&mut self) {
-        // Relative delay off; absolute delay coalesces a burst without
-        // waiting for a later packet that may never arrive.
+        // Timers off
         mmio_write(self.base, E1000E_RDTR, 0);
-        mmio_write(self.base, E1000E_RADV, RADV_DEFAULT);
+        mmio_write(self.base, E1000E_RADV, 0);
         self.program_itr(E1000E_ITR_BALANCED);
 
         // Program RX ring base, length, head
@@ -1550,27 +1551,31 @@ impl E1000eHw {
             mmio_write(self.base, E1000E_SRRCTL, 2 | (1 << 31));
         }
 
-        // DMA burst thresholds on every part (Linux FLAG2_DMA_BURST). QUEUE_ENABLE
-        // is PCH-SPT+ only — writing it on 82574/QEMU is reserved.
-        {
-            let mut rxdctl = RXDCTL_DMA_BURST;
-            if self.is_pch_spt_or_later() {
-                rxdctl |= RXDCTL_QUEUE_ENABLE;
-            }
+        // PCH-SPT: must set RXDCTL.QUEUE_ENABLE (bit 25) before RCTL.EN.
+        // Do not program Linux FLAG2_DMA_BURST here: on I219 it produced
+        // descriptor write-backs that the software checksum path then
+        // treated as corrupt, dropping DHCPOFFER on real hardware only.
+        if self.is_pch_spt_or_later() {
+            let rxdctl = mmio_read(self.base, E1000E_RXDCTL) | RXDCTL_QUEUE_ENABLE;
             mmio_write(self.base, E1000E_RXDCTL, rxdctl);
-            if self.is_pch_spt_or_later() {
-                for _ in 0..100u32 {
-                    Self::udelay(100);
-                    if mmio_read(self.base, E1000E_RXDCTL) & RXDCTL_QUEUE_ENABLE != 0 {
-                        break;
-                    }
+            for _ in 0..100u32 {
+                Self::udelay(100);
+                if mmio_read(self.base, E1000E_RXDCTL) & RXDCTL_QUEUE_ENABLE != 0 {
+                    break;
                 }
             }
         }
 
-        // Hardware IP + TCP/UDP checksum offload. Legacy descriptors report
-        // IPE/TCPE in the errors byte, which `process_rx_slot` already drops.
-        mmio_write(self.base, E1000E_RXCSUM, RXCSUM_IPOFLD | RXCSUM_TUOFLD);
+        // Explicitly clear leftover RXCSUM from firmware / a previous OS.
+        // CTRL_RST does not always zero it on PCH; a stale IPOFLD|TUOFLD is
+        // exactly the hardware-only DHCP drop (QEMU starts from a clean model).
+        mmio_write(self.base, E1000E_RXCSUM, 0);
+
+        // Do NOT program RXCSUM. v0.5.0 left it off: the NIC then does not
+        // fill IPE/TCPE, and we do not run a software verifier on every
+        // frame. Enabling IPOFLD|TUOFLD + Checksum::Tx made QEMU (which
+        // barely implements offload) keep working while real I219 dropped
+        // UDP/DHCP whose hardware verdict disagreed with our fallback.
 
         // Doorbell: give (NUM_RX - 1) descriptors to hardware
         // RDT = last descriptor index hardware can use
@@ -1720,17 +1725,14 @@ impl E1000eHw {
             return None;
         }
 
-        // Only wire-level damage (CRC, symbol, sequence, carrier-extension,
-        // RX data error) is grounds for dropping here. TCPE/IPE are the NIC's
-        // checksum *opinion*, and Linux (`e1000_rx_checksum`) deliberately
-        // never drops on them: it hands the frame up with CHECKSUM_NONE so
-        // the stack re-verifies in software, because the hardware verdict
-        // has false positives — most commonly UDP datagrams carrying a zero
-        // (disabled) checksum, which is legal for IPv4 and what many home
-        // routers emit for DNS replies. Dropping on the raw bit turned every
-        // such reply into a silent loss: TCP kept working on real hardware
-        // while `getaddrinfo` timed out. Frames the NIC flagged are routed
-        // through the software checksum fallback below instead.
+        // Linux never drops on IPE/TCPE (checksum opinion, often wrong for
+        // UDP checksum 0 / DHCP). Only wire-level damage is fatal. Do not
+        // run a software verifier here: without RXCSUM the IPCS/UDPCS bits
+        // are clear, so every IPv4 frame would be checksummed against a
+        // cache-line that on real hardware is not always coherent with the
+        // DMA write — QEMU is, which is why DHCP lived in the VM and died
+        // on I219. AF_PACKET (udhcpc) must see the frame; smoltcp still
+        // verifies TCP/UDP itself (Checksum::Both).
         if rxd.errors & !RXD_ERR_CSUM_VERDICT != 0 || len == 0 || len > BUF_SIZE {
             self.clear_rx_pending();
             self.stats.rx_dropped += 1;
@@ -1781,40 +1783,6 @@ impl E1000eHw {
             pending.extend_from_slice(frag);
             self.rx_pending = Some(pending);
             None
-        };
-
-        // The EOP descriptor's status carries the checksum indication for the
-        // whole frame. Only frames the NIC did NOT validate pay for a software
-        // check here; the common validated IPv4 TCP/UDP case is a bit test.
-        // A TCPE/IPE verdict is folded in as IXSM: "ignore what the NIC
-        // said, decide in software".
-        let hw_flagged = rxd.errors & RXD_ERR_CSUM_VERDICT != 0;
-        let csum_status = if hw_flagged {
-            rxd.status | RXD_STAT_IXSM
-        } else {
-            rxd.status
-        };
-        let complete = match complete {
-            Some(pkt)
-                if rx_csum_needs_sw_check(csum_status) && rx_sw_csum_bad(&pkt, csum_status) =>
-            {
-                self.rx_csum_bad += 1;
-                self.stats.rx_dropped += 1;
-                self.recycle_rx_frame(pkt);
-                None
-            }
-            other => {
-                if hw_flagged && other.is_some() {
-                    self.rx_csum_hw_false_positive += 1;
-                    if self.rx_csum_hw_false_positive == 1 {
-                        crate::klog_warn!(
-                            "[e1000e] NIC flagged errors={:#04x} on a frame whose checksums verify in software; trusting software (watchdog: hw_csum_fp)\n",
-                            rxd.errors
-                        );
-                    }
-                }
-                other
-            }
         };
 
         if let Some(ref pkt) = complete {
@@ -2736,12 +2704,8 @@ impl phy::Device<'_> for E1000eDriver {
         // We have 256 RX descriptors (~384 KiB of NIC buffering) and a 512 KiB
         // TCP receive buffer; the clamp was written for a 4-buffer MCU NIC.
         caps.max_burst_size = None;
-        // RXCSUM IPOFLD|TUOFLD is programmed in init_rx. IPE/TCPE still drop
-        // frames in process_rx_slot. TX still inserts only FCS (IFCS), so
-        // smoltcp must keep computing IP/TCP/UDP checksums on transmit.
-        caps.checksum.ipv4 = Checksum::Tx;
-        caps.checksum.udp = Checksum::Tx;
-        caps.checksum.tcp = Checksum::Tx;
+        // RXCSUM is not programmed (v0.5.0). TX inserts only FCS (IFCS), so
+        // smoltcp must compute and verify IP/TCP/UDP checksums itself.
         caps
     }
 }
@@ -3342,10 +3306,10 @@ mod rx_ring_tests {
     }
 
     #[test]
-    fn rx_hw_checksum_verdict_is_reverified_not_trusted() {
-        // Linux never drops on TCPE/IPE: the NIC's checksum verdict has false
-        // positives (UDP with a zero checksum is the classic one), so such
-        // frames go through the software check instead of the bit bin.
+    fn rx_ipe_tcpe_are_delivered_crc_is_dropped() {
+        // IPE/TCPE are the NIC's checksum opinion, not wire damage. DHCP/DNS
+        // UDP with checksum 0 is the classic false positive; dropping it is
+        // why real-hardware DHCP died while QEMU (no offload) kept working.
         let mut hw = make_hw();
         let good = ipv4_udp_frame(b"dns reply the NIC disliked");
         let mut zero_csum = ipv4_udp_frame(b"router reply, no udp checksum");
@@ -3354,11 +3318,8 @@ mod rx_ring_tests {
         let mut corrupt = ipv4_udp_frame(b"actually corrupt");
         corrupt[14 + 28 + 4] ^= 0x10;
         let crc_err = ipv4_udp_frame(b"wire-damaged");
-        // Slot 0: NIC says TCPE, checksums verify in software -> deliver.
         hw_deliver_with_errors(&hw, 0, &good, RXD_STAT_IPCS | RXD_STAT_UDPCS, RXD_ERR_TCPE);
-        // Slot 1: NIC says TCPE on a zero-checksum UDP datagram -> legal, deliver.
         hw_deliver_with_errors(&hw, 1, &zero_csum, RXD_STAT_IPCS, RXD_ERR_TCPE);
-        // Slot 2: NIC says TCPE and the payload really is corrupt -> drop.
         hw_deliver_with_errors(
             &hw,
             2,
@@ -3366,22 +3327,16 @@ mod rx_ring_tests {
             RXD_STAT_IPCS | RXD_STAT_UDPCS,
             RXD_ERR_TCPE,
         );
-        // Slot 3: NIC says IPE but the header is fine -> deliver.
         hw_deliver_with_errors(&hw, 3, &good, RXD_STAT_UDPCS, RXD_ERR_IPE);
-        // Slot 4: CRC error is wire damage -> always dropped, however it sums.
         hw_deliver_with_errors(&hw, 4, &crc_err, RXD_STAT_IPCS | RXD_STAT_UDPCS, 0x01);
 
         assert_eq!(hw.receive().expect("slot 0"), good);
         assert_eq!(hw.receive().expect("slot 1"), zero_csum);
+        assert_eq!(hw.receive().expect("slot 2"), corrupt);
         assert_eq!(hw.receive().expect("slot 3"), good);
         assert!(hw.receive().is_none());
-        assert_eq!(hw.stats.rx_packets, 3);
-        assert_eq!(hw.stats.rx_dropped, 2, "corrupt payload + CRC error");
-        assert_eq!(
-            hw.rx_csum_bad, 1,
-            "only the software-confirmed bad checksum"
-        );
-        assert_eq!(hw.rx_csum_hw_false_positive, 3);
+        assert_eq!(hw.stats.rx_packets, 4);
+        assert_eq!(hw.stats.rx_dropped, 1, "only CRC/wire error");
         hw.flush_rx_doorbell();
         assert_eq!(reg_read(hw.base, E1000E_RDT) as usize, 4);
     }
@@ -3518,27 +3473,22 @@ mod rx_ring_tests {
     }
 
     #[test]
-    fn rx_drops_unvalidated_corrupt_frame_and_keeps_validated_ones() {
+    fn rx_does_not_drop_unvalidated_frames() {
+        // process_rx_slot must not software-checksum-drop: udhcpc's AF_PACKET
+        // path needs DHCPOFFER even when the NIC left IPCS/TCPCS clear.
         let mut hw = make_hw();
         let good = ipv6_tcp_frame(b"payload-0");
         let mut corrupt = ipv6_tcp_frame(b"payload-1");
         corrupt[14 + 40 + 20 + 2] ^= 0x80;
-        // Slot 0: NIC did not validate (no TCPCS) and the frame is corrupt → drop.
         hw_deliver_with_status(&hw, 0, &corrupt, 0);
-        // Slot 1: same corrupt frame, but the NIC claims it validated it → pass
-        // (on real hardware errors.TCPE would already have dropped it).
         hw_deliver_with_status(&hw, 1, &corrupt, RXD_STAT_TCPCS);
-        // Slot 2: unvalidated but good → pass.
         hw_deliver_with_status(&hw, 2, &good, 0);
-        let first = hw.receive().expect("slot 1 frame");
-        assert_eq!(first, corrupt);
-        let second = hw.receive().expect("slot 2 frame");
-        assert_eq!(second, good);
+        assert_eq!(hw.receive().expect("slot 0"), corrupt);
+        assert_eq!(hw.receive().expect("slot 1"), corrupt);
+        assert_eq!(hw.receive().expect("slot 2"), good);
         assert!(hw.receive().is_none());
-        assert_eq!(hw.stats.rx_packets, 2);
-        assert_eq!(hw.stats.rx_dropped, 1);
-        assert_eq!(hw.rx_csum_bad, 1);
-        // The dropped slot was still recycled: RDT advances past all three.
+        assert_eq!(hw.stats.rx_packets, 3);
+        assert_eq!(hw.stats.rx_dropped, 0);
         hw.flush_rx_doorbell();
         assert_eq!(reg_read(hw.base, E1000E_RDT) as usize, 2);
     }

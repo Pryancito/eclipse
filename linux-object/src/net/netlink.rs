@@ -208,11 +208,11 @@ impl Socket for NetlinkSocketState {
                         let ifi_flags = if is_loopback {
                             IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_NOARP | IFF_LOWER_UP
                         } else {
-                            let mut flags = IFF_UP | IFF_BROADCAST | IFF_MULTICAST;
-                            if iface.link_carrier_up() {
-                                flags |= IFF_RUNNING | IFF_LOWER_UP;
-                            }
-                            flags
+                            // Always report RUNNING like v0.5.0. Gating on
+                            // STATUS.LU made `ip link` show NO-CARRIER while
+                            // the PHY was still coming up, so udhcpc/`ip`
+                            // skipped the NIC that DHCP needs.
+                            IFF_UP | IFF_BROADCAST | IFF_MULTICAST | IFF_RUNNING | IFF_LOWER_UP
                         };
 
                         let if_info = IfaceInfoMsg {

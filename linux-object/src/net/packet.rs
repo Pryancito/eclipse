@@ -20,10 +20,6 @@ use zircon_object::object::*;
 /// sees every IPv4 frame; a 16-deep queue overflowed on a noisy LAN and dropped
 /// DHCPOFFER/DHCPACK (and, after bind, TCP segments copied to the tap).
 const PACKET_QUEUE_MAX: usize = 64;
-/// Pre-DHCP AF_PACKET compatibility path: before the interface has a usable
-/// IPv4 address, keep a bounded raw-ring drain so userspace DHCP can still
-/// receive OFFER/ACK even when the smoltcp poll path is contended.
-const PRE_DHCP_RAW_DRAIN_BUDGET: usize = 32;
 /// Max concurrent AF_PACKET socket groups (each may queue PACKET_QUEUE_MAX frames).
 const MAX_PACKET_SOCKETS: usize = 12;
 /// Max Ethernet frame size we build on the stack for SOCK_DGRAM TX.
@@ -125,34 +121,13 @@ fn frame_arc(packet: &[u8]) -> Option<PacketFrame> {
     Some(Arc::from(buf.into_boxed_slice()))
 }
 
-fn should_raw_drain_pre_dhcp(protocol: u16, net: &dyn NetScheme) -> bool {
-    matches!(protocol, 0 | 0x0003 | 0x0800) && crate::net::iface_ipv4_cidr(net).is_none()
-}
-
-fn drain_pre_dhcp_raw_rx(net: &(dyn NetScheme + Send + Sync)) {
-    // Heap scratch: this runs under epoll/poll `io_wait_tick` on the coroutine
-    // stack. A 2 KiB local there nested under DRM/unix wait frames during
-    // desktop bring-up.
-    let mut buf = alloc::vec![0u8; 2048];
-    for _ in 0..PRE_DHCP_RAW_DRAIN_BUDGET {
-        match net.recv(&mut buf) {
-            Ok(n) if n > 0 => push_packet(&buf[..n]),
-            _ => break,
-        }
-    }
-}
-
-fn drive_packet_rx(net: &(dyn NetScheme + Send + Sync), protocol: u16) {
-    // `udhcpc` on an unconfigured interface needs the old raw-ring drain from
-    // v0.5.0: a concurrent socket path can transiently hold smoltcp's socket
-    // set, making `net.poll()` skip the drain and leaving DHCPOFFER/DHCPACK in
-    // the NIC ring. Once IPv4 is configured, switch back to `poll()` so the
-    // DHCP socket no longer steals TCP/UDP ingress for the rest of the system.
-    if should_raw_drain_pre_dhcp(protocol, net) {
-        drain_pre_dhcp_raw_rx(net);
-    } else {
-        let _ = net.poll();
-    }
+fn drive_packet_rx(net: &(dyn NetScheme + Send + Sync)) {
+    // Same order as v0.5.0: copy the ring into AF_PACKET, then poll smoltcp
+    // for whatever is left (TCP/UDP). `io_wait_tick` already polled smoltcp
+    // once this wakeup, so TCP still wins the race for in-flight segments;
+    // this leftover drain is what lets udhcpc see DHCP that smoltcp skipped.
+    crate::net::netdev_drain_rx(net);
+    let _ = net.poll();
 }
 
 /// Dispatches a received packet to all registered AF_PACKET sockets.
@@ -272,11 +247,10 @@ impl Socket for PacketSocketState {
             kernel_hal::deferred_job::drain_deferred_jobs();
 
             let ifindex = *self.inner.ifindex.lock();
-            let protocol = *self.inner.protocol.lock();
             {
                 let poll_net = |net: &(dyn NetScheme + Send + Sync)| {
-                    drive_packet_rx(net, protocol);
-                    drive_packet_rx(net, protocol);
+                    drive_packet_rx(net);
+                    drive_packet_rx(net);
                 };
                 if ifindex > 0 {
                     if let Ok(net) = crate::net::iface_by_linux_ifindex(ifindex) {
@@ -454,19 +428,15 @@ impl Socket for PacketSocketState {
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
         kernel_hal::deferred_job::drain_deferred_jobs();
         let ifindex = *self.inner.ifindex.lock();
-        let protocol = *self.inner.protocol.lock();
-        // Tap via smoltcp Device::receive → net_defer_packet. Do NOT call
-        // `recv()` once the interface has an IPv4 address: udhcpc keeps this
-        // socket open for the lease lifetime (`-f`), and stealing ingress
-        // after bind turns every select() into a black hole for TCP/UDP.
+        // Same drain as v0.5.0 (raw ring → AF_PACKET, then smoltcp poll).
         if ifindex > 0 {
             if let Ok(net) = crate::net::iface_by_linux_ifindex(ifindex) {
-                drive_packet_rx(net.as_ref(), protocol);
+                drive_packet_rx(net.as_ref());
             }
         } else {
             for net in get_net_device().iter() {
                 if net.get_ifname() != "loopback" {
-                    drive_packet_rx(net.as_ref(), protocol);
+                    drive_packet_rx(net.as_ref());
                 }
             }
         }
