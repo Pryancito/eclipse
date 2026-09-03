@@ -18,9 +18,13 @@ extern crate log;
 use config::Resolution;
 use log::LevelFilter;
 use rboot::GraphicInfo;
-use uefi::boot::{self, AllocateType, MemoryType, SearchType};
+use uefi::boot::{
+    self, AllocateType, MemoryType, OpenProtocolAttributes, OpenProtocolParams, SearchType,
+};
 use uefi::prelude::*;
 use uefi::proto::console::gop::{GraphicsOutput, ModeInfo, PixelFormat};
+use uefi::proto::device_path::DevicePath;
+use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::media::file::*;
 use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::proto::unsafe_protocol;
@@ -84,6 +88,9 @@ fn bar(graphic: Option<&GraphicInfo>, progress: u32) {
 #[entry]
 fn efi_main() -> Status {
     uefi::helpers::init().expect("failed to initialize uefi helpers");
+    // helpers::init() enables every log level. Stay quiet until rboot.conf
+    // cmdline is parsed (`make qemu` defaults to LOG=error).
+    log::set_max_level(LevelFilter::Warn);
 
     let config = {
         if let Some(mut file) = try_open_file(CONFIG_PATH) {
@@ -404,11 +411,67 @@ fn exit_boot_services_raw(mmap_storage: &mut [u8]) -> (usize, usize) {
     panic!("ExitBootServices failed: {:?}", last);
 }
 
-/// Try to open the regular file at `path` on the boot volume.
-fn try_open_file(path: &str) -> Option<RegularFile> {
-    debug!("trying to open file: {}", path);
-    let fs_handle = boot::get_handle_for_protocol::<SimpleFileSystem>().ok()?;
-    let mut fs = boot::open_protocol_exclusive::<SimpleFileSystem>(fs_handle).ok()?;
+/// Open `SimpleFileSystem` without disconnecting the firmware FAT/ATAPI driver.
+///
+/// `open_protocol_exclusive` calls `DisconnectController` on whoever has the
+/// protocol `ByDriver`. On QEMU q35 the first SFS handle is often the empty
+/// DVD-ROM (`UEFI QEMU DVD-ROM QM00005`); stopping that ATAPI driver takes
+/// down AHCI and the guest triple-faults right after "trying to open file".
+fn open_sfs(handle: Handle) -> Option<boot::ScopedProtocol<SimpleFileSystem>> {
+    // SAFETY: GetProtocol does not take exclusive ownership or disconnect
+    // drivers. The handle is a live boot-services object and the returned
+    // ScopedProtocol is dropped before ExitBootServices.
+    unsafe {
+        boot::open_protocol::<SimpleFileSystem>(
+            OpenProtocolParams {
+                handle,
+                agent: boot::image_handle(),
+                controller: None,
+            },
+            OpenProtocolAttributes::GetProtocol,
+        )
+        .ok()
+    }
+}
+
+/// SimpleFileSystem for the volume that loaded this bootloader, not an
+/// arbitrary first handle (DVD-ROM, PXE, second disk, …).
+fn boot_filesystem() -> Option<boot::ScopedProtocol<SimpleFileSystem>> {
+    // SAFETY: same GetProtocol contract as `open_sfs`.
+    let loaded_image = unsafe {
+        boot::open_protocol::<LoadedImage>(
+            OpenProtocolParams {
+                handle: boot::image_handle(),
+                agent: boot::image_handle(),
+                controller: None,
+            },
+            OpenProtocolAttributes::GetProtocol,
+        )
+        .ok()?
+    };
+    let device_handle = loaded_image.device()?;
+    if let Some(fs) = open_sfs(device_handle) {
+        return Some(fs);
+    }
+
+    // SAFETY: DevicePath on the loaded-image device is firmware-owned for
+    // the life of boot services; we only read it to locate the SFS handle.
+    let device_path = unsafe {
+        boot::open_protocol::<DevicePath>(
+            OpenProtocolParams {
+                handle: device_handle,
+                agent: boot::image_handle(),
+                controller: None,
+            },
+            OpenProtocolAttributes::GetProtocol,
+        )
+        .ok()?
+    };
+    let sfs_handle = boot::locate_device_path::<SimpleFileSystem>(&mut &*device_path).ok()?;
+    open_sfs(sfs_handle)
+}
+
+fn open_regular_file(fs: &mut SimpleFileSystem, path: &str) -> Option<RegularFile> {
     let mut buf = [0u16; 256];
     let ucs_path = CStr16::from_str_with_buf(path, &mut buf).ok()?;
     let mut root = fs.open_volume().ok()?;
@@ -420,6 +483,13 @@ fn try_open_file(path: &str) -> Option<RegularFile> {
         FileType::Regular(regular) => Some(regular),
         _ => None,
     }
+}
+
+/// Try to open the regular file at `path` on the boot volume.
+fn try_open_file(path: &str) -> Option<RegularFile> {
+    debug!("trying to open file: {}", path);
+    let mut fs = boot_filesystem()?;
+    open_regular_file(&mut fs, path)
 }
 
 /// Open the kernel image: the configured path first, then the conventional
