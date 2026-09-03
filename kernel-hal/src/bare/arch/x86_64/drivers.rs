@@ -382,24 +382,33 @@ pub(super) fn init() -> DeviceResult {
     #[cfg(not(feature = "no-pci"))]
     {
         // PCI scan
-        use crate::vm::{GenericPageTable, PageTable};
+        use crate::vm::{GenericPageTable, Page, PageSize, PageTable};
         use crate::{CachePolicy, MMUFlags, PhysAddr, VirtAddr};
         use zcore_drivers::builder::IoMapper;
         use zcore_drivers::bus::pci;
 
         struct IoMapperImpl;
         impl IoMapper for IoMapperImpl {
+            /// Make the physmap alias of `paddr..paddr+size` fully mapped and
+            /// return it. Every page of the range is checked and every hole is
+            /// filled.
+            ///
+            /// This used to test only the FIRST page and return early if it
+            /// was mapped. rboot premaps the physmap up to the end of the GOP
+            /// framebuffer, and on real hardware that framebuffer is the first
+            /// few MiB of the console GPU's VRAM BAR — so BAR1's base page was
+            /// "already mapped", the rest of the BAR never got mapped, and the
+            /// first read past the framebuffer window faulted inside the PCI
+            /// probe (`kernel #PF vaddr=0xffff80dff2000000` = exactly
+            /// `fb_addr + fb_size` on the RTX box), under the driver-registry
+            /// lock, where nothing can contain it. QEMU never showed it: its
+            /// framebuffer BAR is small and premapped end to end.
             fn query_or_map(&self, paddr: PhysAddr, size: usize) -> Option<VirtAddr> {
                 let vaddr = crate::mem::phys_to_virt(paddr);
                 let mut pt = PageTable::from_current();
 
-                if let Ok((paddr_mapped, _, _)) = pt.query(vaddr) {
-                    if paddr_mapped == paddr {
-                        return Some(vaddr);
-                    }
-                }
-
                 let size = (size + 0xfff) & !0xfff;
+                let end = vaddr + size;
                 let flags = MMUFlags::READ
                     | MMUFlags::WRITE
                     | MMUFlags::DEVICE
@@ -408,12 +417,78 @@ pub(super) fn init() -> DeviceResult {
                 // debug!, not warn!: fires for every PCI BAR of every device at
                 // boot; at LOG=warn each line pays the per-byte UART spin.
                 debug!(
-                    "[xhci] Mapeando BAR PCI en PT kernel: {:#x} -> {:#x} (size: {:#x})",
+                    "[pci] mapping BAR in the kernel PT: {:#x} -> {:#x} (size: {:#x})",
                     paddr, vaddr, size
                 );
-                if let Err(e) = pt.map_cont(vaddr, size, paddr, flags) {
-                    crate::klog_err!("[xhci] failed to map PCI BAR: {:?}", e);
-                    return None;
+
+                let mut va = vaddr;
+                while va < end {
+                    match pt.query(va) {
+                        Ok((pa, _, page_size)) => {
+                            // `query` returns the exact translation of `va`
+                            // (huge-page base + offset), so this compares like
+                            // for like.
+                            if pa != paddr + (va - vaddr) {
+                                crate::klog_err!(
+                                    "[pci] BAR {:#x}+{:#x}: physmap {:#x} already maps {:#x}; \
+                                     refusing to alias",
+                                    paddr,
+                                    size,
+                                    va,
+                                    pa
+                                );
+                                return None;
+                            }
+                            // Skip to the end of the page that contains `va`,
+                            // whatever its size.
+                            let ps = page_size as usize;
+                            va = (va & !(ps - 1)) + ps;
+                        }
+                        Err(_) => {
+                            // Hole. The common shape is "everything from here
+                            // to the end" (the part of a BAR past the premapped
+                            // window, or a whole BAR above the physmap's end):
+                            // one `map_cont`. If that trips over a page that IS
+                            // mapped further on, fall back to filling the
+                            // holes page by page.
+                            let pa = paddr + (va - vaddr);
+                            if pt.map_cont(va, end - va, pa, flags).is_ok() {
+                                break;
+                            }
+                            while va < end {
+                                match pt.query(va) {
+                                    Ok((pa, _, page_size)) => {
+                                        if pa != paddr + (va - vaddr) {
+                                            crate::klog_err!(
+                                                "[pci] BAR {:#x}+{:#x}: physmap {:#x} already \
+                                                 maps {:#x}; refusing to alias",
+                                                paddr,
+                                                size,
+                                                va,
+                                                pa
+                                            );
+                                            return None;
+                                        }
+                                        let ps = page_size as usize;
+                                        va = (va & !(ps - 1)) + ps;
+                                    }
+                                    Err(_) => {
+                                        let page = Page::new_aligned(va, PageSize::Size4K);
+                                        if let Err(e) = pt.map(page, paddr + (va - vaddr), flags) {
+                                            crate::klog_err!(
+                                                "[pci] failed to map BAR page {:#x}: {:?}",
+                                                va,
+                                                e
+                                            );
+                                            return None;
+                                        }
+                                        va += PageSize::Size4K as usize;
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
                 }
 
                 core::mem::forget(pt);
