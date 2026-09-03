@@ -1015,13 +1015,15 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                     // the udev `ID_INPUT_KEYBOARD` / `ID_INPUT_MOUSE` properties,
                     // not from the evdev bits alone. With udevd absent we must
                     // synthesise those tags, mirroring udev's `input_id` builtin:
-                    // a keyboard has key events (KEY_ESC), a mouse has REL_X +
-                    // REL_Y + BTN_LEFT. Without them the device is added but
-                    // dead — no pointer, no keyboard.
+                    // a keyboard has KEY_ESC; a pointer has BTN_LEFT plus either
+                    // relative X/Y or absolute X/Y (USB tablet).
                     let keys = dev.capability(CapabilityType::Key);
                     let rel = dev.capability(CapabilityType::RelAxis);
+                    let abs = dev.capability(CapabilityType::AbsAxis);
                     let is_keyboard = keys.contains(1); // KEY_ESC
-                    let is_mouse = rel.contains(0) && rel.contains(1) && keys.contains(0x110); // REL_X,REL_Y,BTN_LEFT
+                    let is_mouse = keys.contains(0x110) // BTN_LEFT
+                        && ((rel.contains(0) && rel.contains(1))
+                            || (abs.contains(0) && abs.contains(1)));
                     let mut body = String::from("I:1\nE:ID_INPUT=1\n");
                     if is_keyboard {
                         body.push_str("E:ID_INPUT_KEYBOARD=1\n");

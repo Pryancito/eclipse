@@ -42,14 +42,16 @@ unsafe fn calibrate_tsc_hz_via_pit() -> Option<u64> {
     gate.write((saved & 0xFC) | 0x01);
 
     // Mode 0: OUT2 (bit 5 of 0x61) stays low until the counter hits zero,
-    // then goes high. Spin-poll with a safety cap so a missing PIT doesn't
-    // hang the kernel — at 1 read per ~hundreds of cycles, 2 billion
-    // iterations covers any plausible CPU running well past the 55 ms window.
-    let mut spins: u64 = 0;
-    while gate.read() & 0x20 == 0 {
-        spins = spins.wrapping_add(1);
-        if spins > 2_000_000_000 {
-            // PIT not counting — restore and bail.
+    // then goes high. Many real laptops/firmware leave PIT channel 2 (the
+    // speaker gate) dead: the old 2e9 `spin_loop` cap froze boot at 51%
+    // for tens of seconds. Bound the wait with TSC (~100 ms at 2 GHz)
+    // so a missing PIT falls through to CPUID immediately.
+    const TSC_TIMEOUT: u64 = 200_000_000;
+    loop {
+        if gate.read() & 0x20 != 0 {
+            break;
+        }
+        if core::arch::x86_64::_rdtsc().wrapping_sub(t0) > TSC_TIMEOUT {
             gate.write(saved);
             return None;
         }
@@ -68,23 +70,40 @@ unsafe fn calibrate_tsc_hz_via_pit() -> Option<u64> {
     }
 }
 
-/// TSC frequency in Hz. PIT-calibrated when possible; never rounded to MHz.
+/// TSC frequency in Hz. CPUID first (instant), then a short PIT measure;
+/// never rounded to MHz. Do not call this from a path that must not stall:
+/// PIT channel 2 is missing on some real machines (see calibrator timeout).
 pub fn tsc_hz() -> u64 {
     static TSC_HZ: spin::Once<u64> = spin::Once::new();
     *TSC_HZ.call_once(|| {
+        if let Some(hz) = tsc_hz_from_cpuid() {
+            return hz;
+        }
         if let Some(hz) = unsafe { calibrate_tsc_hz_via_pit() } {
             return hz;
         }
-        // Fallback chain: CPUID base frequency, then a conservative default.
-        // Both are wrong on modern boxes but avoid div-by-0.
-        const DEFAULT_MHZ: u16 = 2000;
-        let mhz = CpuId::new()
-            .get_processor_frequency_info()
-            .map(|info| info.processor_base_frequency())
-            .filter(|&f| f >= 100)
-            .unwrap_or(DEFAULT_MHZ);
-        mhz as u64 * 1_000_000
+        2_000_000_000
     })
+}
+
+/// CPUID.15H crystal × ratio, then leaf 16H base MHz. Instant, no I/O.
+fn tsc_hz_from_cpuid() -> Option<u64> {
+    use core::arch::x86_64::__cpuid;
+    let max = __cpuid(0).eax;
+    if max >= 0x15 {
+        let r = __cpuid(0x15);
+        if r.eax != 0 && r.ebx != 0 && r.ecx != 0 {
+            let hz = (r.ecx as u64).saturating_mul(r.ebx as u64) / r.eax as u64;
+            if (100_000_000..=20_000_000_000).contains(&hz) {
+                return Some(hz);
+            }
+        }
+    }
+    CpuId::new()
+        .get_processor_frequency_info()
+        .map(|info| info.processor_base_frequency())
+        .filter(|&f| f >= 100)
+        .map(|mhz| mhz as u64 * 1_000_000)
 }
 
 hal_fn_impl! {
@@ -187,4 +206,20 @@ hal_fn_impl! {
             }
         }
     }
+}
+
+/// CPUID.40000000H hypervisor brand is `VBoxVBoxVBox` on VirtualBox.
+///
+/// Its VMSVGA EFI GOP presents the linear framebuffer left-right reversed
+/// (panic banner stays right-side up but text reads as a mirror). Used to
+/// enable the early-FB `MIRROR_X` path and the GOP blit flip without a
+/// cmdline flag on real hardware.
+pub(crate) fn is_virtualbox_hypervisor() -> bool {
+    use core::arch::x86_64::__cpuid;
+    if __cpuid(1).ecx & (1 << 31) == 0 {
+        return false;
+    }
+    let r = __cpuid(0x4000_0000);
+    // "VBox" little-endian in EBX/ECX/EDX.
+    r.ebx == 0x786F_4256 && r.ecx == 0x786F_4256 && r.edx == 0x786F_4256
 }

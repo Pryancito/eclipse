@@ -182,6 +182,11 @@ hal_fn_def! {
     pub mod console {
         pub fn console_write_early(_s: &str) {}
         pub fn console_progress_early(_progress: u32) {}
+        /// Prime the early GOP console from bootloader geometry *before*
+        /// `KCONFIG` exists, so the kernel can paint 52% on entry. Without
+        /// this the bar stays at rboot's 51% through `memory::init` / PIT
+        /// calibration, which looks like a hang on real hardware.
+        pub fn console_progress_prime(_fb_vaddr: usize, _width: usize, _height: usize, _stride_pixels: usize) {}
         /// Last-resort panic banner drawn raw to the framebuffer (no locks, no
         /// alloc). No-op where there is no direct framebuffer access.
         pub fn console_panic_banner(_s: &str) {}

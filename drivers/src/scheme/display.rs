@@ -1,5 +1,30 @@
 use super::Scheme;
 use crate::DeviceResult;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// When set, GOP scanout is stored left-right reversed (VirtualBox VMSVGA).
+static SCANOUT_MIRROR_X: AtomicBool = AtomicBool::new(false);
+
+/// Flip GOP writes on X. Call once at boot if the firmware presents a mirror.
+pub fn set_scanout_mirror_x(on: bool) {
+    SCANOUT_MIRROR_X.store(on, Ordering::SeqCst);
+}
+
+#[inline]
+fn scanout_mirror_x() -> bool {
+    SCANOUT_MIRROR_X.load(Ordering::Relaxed)
+}
+
+/// Map a logical X coordinate onto the scanout when [`set_scanout_mirror_x`]
+/// is active.
+#[inline]
+fn map_x(x: u32, width: u32) -> u32 {
+    if scanout_mirror_x() {
+        width.saturating_sub(1).saturating_sub(x)
+    } else {
+        x
+    }
+}
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,6 +241,7 @@ pub trait DisplayScheme: Scheme {
         if x >= info.width || y >= info.height {
             return;
         }
+        let x = map_x(x, info.width);
         let offset =
             (y as usize * info.pitch() as usize) + (x as usize * info.format.bytes() as usize);
         if offset < info.fb_size {
@@ -242,6 +268,11 @@ pub trait DisplayScheme: Scheme {
         }
 
         if info.format == ColorFormat::ARGB8888 {
+            let (left, right) = if scanout_mirror_x() {
+                (info.width - right, info.width - left)
+            } else {
+                (left, right)
+            };
             let pitch = info.pitch() as usize;
             let px = color.raw_value().to_ne_bytes();
             let mut fb = self.fb();
@@ -284,6 +315,14 @@ pub trait DisplayScheme: Scheme {
         if w == 0 || h == 0 {
             return;
         }
+        let (src_x, dst_x) = if scanout_mirror_x() {
+            (
+                info.width.saturating_sub(src_x + w as u32),
+                info.width.saturating_sub(dst_x + w as u32),
+            )
+        } else {
+            (src_x, dst_x)
+        };
         let pitch = info.pitch() as usize;
         let bpp = info.format.bytes() as usize;
         let row_bytes = w * bpp;
@@ -334,6 +373,29 @@ pub trait DisplayScheme: Scheme {
             return;
         }
         let pitch = info.pitch() as usize;
+
+        if scanout_mirror_x() && info.format == ColorFormat::ARGB8888 {
+            let mut fb = self.fb();
+            let buf: &mut [u8] = &mut fb;
+            let screen_w = info.width as usize;
+            for r in 0..h {
+                let src_off = r * src_stride;
+                if src_off + w > src.len() {
+                    break;
+                }
+                let y = dst_y as usize + r;
+                for c in 0..w {
+                    let px = src[src_off + c].to_le_bytes();
+                    let dx = screen_w - 1 - (dst_x as usize + c);
+                    let d = y * pitch + dx * 4;
+                    if d + 4 > buf.len() {
+                        break;
+                    }
+                    buf[d..d + 4].copy_from_slice(&px);
+                }
+            }
+            return;
+        }
 
         if info.format == ColorFormat::ARGB8888 {
             let mut fb = self.fb();

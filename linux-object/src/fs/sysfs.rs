@@ -1426,7 +1426,8 @@ fn input_id_props(id: usize) -> String {
 
     // Linux input-event-codes: REL_X=0 REL_Y=1; BTN_LEFT=0x110 BTN_TOUCH=0x14a;
     // KEY_ESC=1 KEY_SPACE=57; ABS_X=0.
-    let is_mouse = rel.contains(0) || rel.contains(1) || key.contains(0x110);
+    let is_mouse = rel.contains(0) || rel.contains(1) || key.contains(0x110)
+        || (abs.contains(0) && abs.contains(1) && key.contains(0x110));
     let is_touch = abs.contains(0) && key.contains(0x14a);
     let is_keyboard = key.contains(1) && key.contains(57);
 

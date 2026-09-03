@@ -4,6 +4,14 @@ use rboot::BootInfo;
 #[no_mangle]
 pub extern "C" fn _start(boot_info: &'static BootInfo) -> ! {
     let info = boot_info.graphic_info;
+    // Paint 52% *before* heap / klog / PIT calibration. rboot leaves the bar
+    // at 51%; a stall in `memory::init` used to look like a failed jump.
+    {
+        let (w, h) = info.mode.resolution();
+        let fb_vaddr = (boot_info.physical_memory_offset.wrapping_add(info.fb_addr)) as usize;
+        kernel_hal::console::early_fb_prime(fb_vaddr, w, h, info.mode.stride());
+        kernel_hal::console::early_progress_bar(52);
+    }
 
     let config = KernelConfig {
         cmdline: boot_info.cmdline,

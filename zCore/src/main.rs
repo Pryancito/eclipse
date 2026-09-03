@@ -46,7 +46,9 @@ static MOCK_CORE: AtomicBool = AtomicBool::new(false);
 
 fn primary_main(config: kernel_hal::KernelConfig) {
     logging::init();
+    kernel_hal::console::early_progress_bar(53);
     memory::init();
+    kernel_hal::console::early_progress_bar(54);
     kernel_hal::primary_init_early(config, &handler::ZcoreKernelHandler);
     kernel_hal::console::early_progress_bar(55);
     kernel_hal::console::early_progress_bar(60);

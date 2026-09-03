@@ -37,6 +37,23 @@ hal_fn_impl! {
             }
         }
 
+        fn console_progress_prime(
+            _fb_vaddr: usize,
+            _width: usize,
+            _height: usize,
+            _stride_pixels: usize,
+        ) {
+            #[cfg(feature = "graphic")]
+            {
+                crate::imp::arch::early_fb_console::prime(
+                    _fb_vaddr,
+                    _width,
+                    _height,
+                    _stride_pixels,
+                );
+            }
+        }
+
         fn console_panic_banner(_s: &str) {
             #[cfg(feature = "graphic")]
             {

@@ -32,8 +32,42 @@ static MIRROR_X: AtomicBool = AtomicBool::new(false);
 const CHAR_W: u32 = 8;
 const CHAR_H: u32 = 16;
 
+/// Geometry from rboot, before [`KCONFIG`] is published. Lets `_start` paint
+/// 52% so a stall in `memory::init` is distinguishable from a failed jump.
+pub fn prime(fb_vaddr: usize, width: usize, height: usize, stride_pixels: usize) {
+    if fb_vaddr == 0 || width == 0 || height == 0 || stride_pixels == 0 {
+        return;
+    }
+    FB_BASE.store(fb_vaddr, Ordering::SeqCst);
+    FB_WIDTH.store(width as u32, Ordering::SeqCst);
+    FB_HEIGHT.store(height as u32, Ordering::SeqCst);
+    FB_STRIDE_PIXELS.store(stride_pixels as u32, Ordering::SeqCst);
+    if super::cpu::is_virtualbox_hypervisor() {
+        MIRROR_X.store(true, Ordering::SeqCst);
+        zcore_drivers::scheme::set_scanout_mirror_x(true);
+    }
+    INITED.store(true, Ordering::SeqCst);
+}
+
+fn apply_kconfig_fb_flags() {
+    let Some(cfg) = KCONFIG.try_get() else {
+        return;
+    };
+    if cfg.cmdline.contains("FB_ROT180=1")
+        || cfg.cmdline.contains("FB_ROT180=true")
+        || cfg.cmdline.contains("FB_ROT180=on")
+        || cfg.cmdline.contains("FB_ROT180")
+    {
+        ROT180.store(true, Ordering::SeqCst);
+    }
+    if cfg.cmdline.contains("FB_MIRROR_X") {
+        MIRROR_X.store(true, Ordering::SeqCst);
+    }
+}
+
 fn try_init() -> bool {
     if INITED.load(Ordering::SeqCst) {
+        apply_kconfig_fb_flags();
         return true;
     }
     let cfg = match KCONFIG.try_get() {
@@ -54,15 +88,10 @@ fn try_init() -> bool {
     FB_HEIGHT.store(h as u32, Ordering::SeqCst);
     // Use the actual GOP stride. Real hardware often pads rows.
     FB_STRIDE_PIXELS.store(stride as u32, Ordering::SeqCst);
-    if cfg.cmdline.contains("FB_ROT180=1")
-        || cfg.cmdline.contains("FB_ROT180=true")
-        || cfg.cmdline.contains("FB_ROT180=on")
-        || cfg.cmdline.contains("FB_ROT180")
-    {
-        ROT180.store(true, Ordering::SeqCst);
-    }
-    if cfg.cmdline.contains("FB_MIRROR_X") {
+    apply_kconfig_fb_flags();
+    if super::cpu::is_virtualbox_hypervisor() {
         MIRROR_X.store(true, Ordering::SeqCst);
+        zcore_drivers::scheme::set_scanout_mirror_x(true);
     }
 
     // IMPORTANT: do NOT clear on init.

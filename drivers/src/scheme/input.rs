@@ -135,7 +135,37 @@ impl fmt::Debug for InputCapability {
     }
 }
 
+/// Linux `struct input_absinfo` fields returned by `EVIOCGABS`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AbsInfo {
+    pub value: i32,
+    pub minimum: i32,
+    pub maximum: i32,
+    pub fuzz: i32,
+    pub flat: i32,
+    pub resolution: i32,
+}
+
+impl AbsInfo {
+    pub fn range(minimum: i32, maximum: i32) -> Self {
+        Self {
+            value: 0,
+            minimum,
+            maximum,
+            fuzz: 0,
+            flat: 0,
+            resolution: 0,
+        }
+    }
+}
+
 pub trait InputScheme: Scheme + EventScheme<Event = InputEvent> {
     /// Returns the capability bitmap of the specific kind of event.
     fn capability(&self, cap_type: CapabilityType) -> InputCapability;
+
+    /// Absolute-axis range for `EVIOCGABS`. `None` means the axis is unused.
+    fn abs_info(&self, axis: u16) -> Option<AbsInfo> {
+        let _ = axis;
+        None
+    }
 }

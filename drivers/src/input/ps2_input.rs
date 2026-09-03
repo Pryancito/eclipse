@@ -195,6 +195,18 @@ impl Scheme for Ps2Input {
                         let dy_raw = state.bytes[2];
                         state.phase = 0;
 
+                        // A USB tablet already owns the pointer (absolute).
+                        // Emitting PS/2 relative packets on top makes the
+                        // cursor jump in VirtualBox (`--mouse usbtablet`).
+                        #[cfg(all(
+                            any(feature = "xhci-usb-hid", feature = "legacy-usb-hid"),
+                            not(feature = "mock"),
+                            not(feature = "no-pci")
+                        ))]
+                        if crate::usb::xhci_hid::usb_abs_pointer_active() {
+                            continue;
+                        }
+
                         // Signature bit (bit 3 of byte 0) is guaranteed set now (the
                         // phase-0 resync above rejects any first byte without it), so
                         // this is belt-and-braces rather than a filter.

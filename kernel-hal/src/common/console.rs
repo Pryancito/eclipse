@@ -101,28 +101,47 @@ cfg_if! {
 
         use alloc::vec::Vec;
 
-        static GRAPHIC_VTS: InitOnce<Vec<spin::Mutex<GraphicConsole>>> = InitOnce::new();
+        static GRAPHIC_VTS: InitOnce<Vec<spin::Mutex<Option<GraphicConsole>>>> = InitOnce::new();
         static CONSOLE_WIN_SIZE: InitOnce<ConsoleWinSize> = InitOnce::new();
         static GRAPHIC_DISPLAY: InitOnce<Arc<dyn DisplayScheme>> = InitOnce::new();
         static ACTIVE_VT: AtomicUsize = AtomicUsize::new(0);
         static CLEAR_ON_NEXT_GRAPHIC_WRITE: AtomicBool = AtomicBool::new(false);
 
+        /// Pixels above 4K: extra VTs must not clone the shadow. VirtualBox
+        /// EFI GOP can hand us 8K (~126 MiB/VT); three of those exhaust the
+        /// 512 MiB heap. VT 0 still comes up so boot logs reach the screen.
+        const MAX_CONSOLE_PIXELS: usize = 3840 * 2160;
+
+        fn console_pixels(display: &dyn DisplayScheme) -> usize {
+            let info = display.info();
+            (info.width as usize).saturating_mul(info.height as usize)
+        }
+
         pub(crate) fn init_graphic_console(display: Arc<dyn DisplayScheme>) {
             let info = display.info();
             GRAPHIC_DISPLAY.init_once_by(display.clone());
+            serial_write_fmt_spin(format_args!(
+                "[graphic] GOP {}x{} (~{} MiB shadow/VT)\n",
+                info.width,
+                info.height,
+                (console_pixels(&*display).saturating_mul(4)) >> 20,
+            ));
+            // Eager VT 0 only. Each GraphicConsole shadows the whole GOP FB
+            // (`width×height×4`); allocating all 7 at boot OOMs a 512 MiB
+            // heap when the firmware hands us a huge mode (VirtualBox 8K).
+            // The other VTs are created on first write / switch, and skipped
+            // entirely when the mode is larger than 4K.
+            let cons0 = GraphicConsole::new(display.clone());
+            let winsz = ConsoleWinSize {
+                ws_row: cons0.rows() as u16,
+                ws_col: cons0.columns() as u16,
+                ws_xpixel: info.width as u16,
+                ws_ypixel: info.height as u16,
+            };
             let mut vts = Vec::with_capacity(NUM_VTS);
-            let mut winsz = ConsoleWinSize::default();
-            for i in 0..NUM_VTS {
-                let cons = GraphicConsole::new(display.clone());
-                if i == 0 {
-                    winsz = ConsoleWinSize {
-                        ws_row: cons.rows() as u16,
-                        ws_col: cons.columns() as u16,
-                        ws_xpixel: info.width as u16,
-                        ws_ypixel: info.height as u16,
-                    };
-                }
-                vts.push(spin::Mutex::new(cons));
+            vts.push(spin::Mutex::new(Some(cons0)));
+            for _ in 1..NUM_VTS {
+                vts.push(spin::Mutex::new(None));
             }
             CONSOLE_WIN_SIZE.init_once_by(winsz);
             GRAPHIC_VTS.init_once_by(vts);
@@ -131,8 +150,34 @@ cfg_if! {
             CLEAR_ON_NEXT_GRAPHIC_WRITE.store(true, Ordering::SeqCst);
         }
 
-        fn vt_mutex(n: usize) -> Option<&'static spin::Mutex<GraphicConsole>> {
+        fn vt_mutex(n: usize) -> Option<&'static spin::Mutex<Option<GraphicConsole>>> {
             GRAPHIC_VTS.try_get().and_then(|v| v.get(n))
+        }
+
+        fn instantiate_vt(slot: &mut Option<GraphicConsole>) -> Option<&mut GraphicConsole> {
+            if slot.is_none() {
+                let display = GRAPHIC_DISPLAY.try_get()?;
+                if console_pixels(&**display) > MAX_CONSOLE_PIXELS {
+                    return None;
+                }
+                *slot = Some(GraphicConsole::new(display.clone()));
+            }
+            slot.as_mut()
+        }
+
+        /// Try-lock VT `n`, creating its GraphicConsole on first use.
+        fn with_vt_try<R>(n: usize, f: impl FnOnce(&mut GraphicConsole) -> R) -> Option<R> {
+            let cons = vt_mutex(n)?;
+            let mut g = cons.try_lock()?;
+            let inner = instantiate_vt(&mut g)?;
+            Some(f(inner))
+        }
+
+        /// Timer/IRQ path: never allocate a console from interrupt context.
+        fn with_vt_existing<R>(n: usize, f: impl FnOnce(&mut GraphicConsole) -> R) -> Option<R> {
+            let cons = vt_mutex(n)?;
+            let mut g = cons.try_lock()?;
+            Some(f(g.as_mut()?))
         }
 
         /// Present coalescing for write-driven console output.
@@ -184,13 +229,11 @@ cfg_if! {
             if now.wrapping_sub(last) < PRESENT_MIN_INTERVAL_NS {
                 return;
             }
-            if let Some(cons) = vt_mutex(vt) {
-                if let Some(mut g) = cons.try_lock() {
-                    LAST_PRESENT_NS.store(now, Ordering::Relaxed);
-                    PRESENT_PENDING.store(false, Ordering::Release);
-                    g.present();
-                }
-            }
+            let _ = with_vt_existing(vt, |g| {
+                LAST_PRESENT_NS.store(now, Ordering::Relaxed);
+                PRESENT_PENDING.store(false, Ordering::Release);
+                g.present();
+            });
         }
 
         /// Request a one-shot clear-to-black of the graphic console before the next write.
@@ -217,7 +260,10 @@ cfg_if! {
                         &**display,
                         zcore_drivers::prelude::RgbColor::new(0, 0, 0),
                     );
-                    *g = GraphicConsole::new(display.clone());
+                    // Drop the old shadow before allocating the replacement.
+                    // At huge GOP modes the heap has no room for both.
+                    *g = None;
+                    *g = Some(GraphicConsole::new(display.clone()));
                 } else {
                     CLEAR_ON_NEXT_GRAPHIC_WRITE.store(true, Ordering::SeqCst);
                 }
@@ -232,14 +278,12 @@ cfg_if! {
             if active {
                 maybe_clear_graphic_before_write(vt);
             }
-            if let Some(cons) = vt_mutex(vt) {
-                if let Some(mut g) = cons.try_lock() {
-                    let _ = g.write_str(s);
-                    if active && present_allowed(vt) {
-                        present_throttled(&mut g);
-                    }
+            let _ = with_vt_try(vt, |g| {
+                let _ = g.write_str(s);
+                if active && present_allowed(vt) {
+                    present_throttled(g);
                 }
-            }
+            });
         }
 
         /// Panic-path write: the normal path `try_lock`s and silently DROPS the
@@ -253,8 +297,10 @@ cfg_if! {
             if let Some(cons) = vt_mutex(vt) {
                 for _ in 0..50_000_000u64 {
                     if let Some(mut g) = cons.try_lock() {
-                        let _ = g.write_fmt(fmt);
-                        g.present();
+                        if let Some(inner) = instantiate_vt(&mut g) {
+                            let _ = inner.write_fmt(fmt);
+                            inner.present();
+                        }
                         return;
                     }
                     core::hint::spin_loop();
@@ -267,14 +313,12 @@ cfg_if! {
             if active {
                 maybe_clear_graphic_before_write(vt);
             }
-            if let Some(cons) = vt_mutex(vt) {
-                if let Some(mut g) = cons.try_lock() {
-                    let _ = g.write_fmt(fmt);
-                    if active && present_allowed(vt) {
-                        present_throttled(&mut g);
-                    }
+            let _ = with_vt_try(vt, |g| {
+                let _ = g.write_fmt(fmt);
+                if active && present_allowed(vt) {
+                    present_throttled(g);
                 }
-            }
+            });
         }
 
         /// Make VT `n` the active one and repaint it to the display.
@@ -293,20 +337,18 @@ cfg_if! {
                     crate::klog_info!("[vt] switch_vt_impl {} -> {}", prev, n);
                 }
                 if kd_mode_vt(n) == KD_TEXT {
-                    if let Some(mut g) = v[n].try_lock() {
+                    let _ = with_vt_try(n, |g| {
                         g.repaint();
-                    }
+                    });
                 }
             }
         }
 
         pub(crate) fn scroll_active_vt(direction: i32) {
-            if let Some(cons) = vt_mutex(ACTIVE_VT.load(Ordering::SeqCst)) {
-                if let Some(mut g) = cons.try_lock() {
-                    g.buf_mut().scroll_history(direction);
-                    g.present();
-                }
-            }
+            let _ = with_vt_try(ACTIVE_VT.load(Ordering::SeqCst), |g| {
+                g.buf_mut().scroll_history(direction);
+                g.present();
+            });
         }
 
         pub(crate) fn blink_active_vt(visible: bool) {
@@ -318,11 +360,9 @@ cfg_if! {
             if !present_allowed(vt) {
                 return;
             }
-            if let Some(cons) = vt_mutex(vt) {
-                if let Some(mut g) = cons.try_lock() {
-                    g.set_cursor_blink(visible);
-                }
-            }
+            let _ = with_vt_existing(vt, |g| {
+                g.set_cursor_blink(visible);
+            });
         }
 
         /// Repaint the active VT from its backing buffer.
@@ -330,11 +370,9 @@ cfg_if! {
         /// Used when returning from `KD_GRAPHICS` to `KD_TEXT`: a userspace
         /// graphics server may have overwritten the framebuffer.
         pub(crate) fn redraw_graphic_console_impl() {
-            if let Some(cons) = vt_mutex(ACTIVE_VT.load(Ordering::SeqCst)) {
-                if let Some(mut g) = cons.try_lock() {
-                    g.repaint();
-                }
-            }
+            let _ = with_vt_try(ACTIVE_VT.load(Ordering::SeqCst), |g| {
+                g.repaint();
+            });
         }
     }
 }
@@ -612,6 +650,11 @@ pub fn debug_write_fmt(fmt: Arguments) {
 /// This is intended for very early boot stages before the native graphic driver exists.
 pub fn early_progress_bar(progress: u32) {
     crate::hal_fn::console::console_progress_early(progress);
+}
+
+/// Prime GOP geometry from the bootloader before [`crate::KCONFIG`] exists.
+pub fn early_fb_prime(fb_vaddr: usize, width: usize, height: usize, stride_pixels: usize) {
+    crate::hal_fn::console::console_progress_prime(fb_vaddr, width, height, stride_pixels);
 }
 
 /// Scrolls the graphic console history up (direction > 0) or down (direction < 0).

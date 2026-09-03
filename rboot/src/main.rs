@@ -93,7 +93,6 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
 
     // Snapshot cmdline flags before ExitBootServices: `config` lives on the stack
     // and must not be read after firmware reclaims that memory.
-    let use_rboot_idt = has_cmdline_flag(config.cmdline, "RBOOT_IDT");
 
     let (graphic_info, edid, edid_size) = init_graphic(bs, config.resolution);
     // Boot progress is continuous across rboot (0..50) and kernel (50..100).
@@ -285,11 +284,10 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     unsafe {
         debug!("jumping to kernel entry...");
         // If we see 51% but not the kernel marker (52%), the hang is inside the
-        // handoff asm / very first instruction fetch.
+        // handoff asm / very first instruction fetch. Always install a tiny IDT
+        // so a #PF/#GP paints 99% instead of freezing the last rboot frame.
         progress::bar(graphic_info.mode, graphic_info.fb_addr, 51);
-        if use_rboot_idt {
-            idt::init(graphic_info.mode, graphic_info.fb_addr);
-        }
+        idt::init(graphic_info.mode, graphic_info.fb_addr);
         jump_to_entry(bootinfo, stacktop);
     }
 }
@@ -469,6 +467,18 @@ fn edid_preferred_resolution(edid: &[u8; 128], edid_size: u32) -> Option<(usize,
     Some((h, v))
 }
 
+/// Auto (and oversized EDID) refuse GOP modes larger than this many pixels.
+///
+/// VirtualBox EFI GOP lists VRAM-filling "modes" (8K = 7680×4320) that are
+/// not a real panel. The kernel shadows each VT at `width×height×4` bytes;
+/// seven 8K consoles (~882 MiB) OOM a 512 MiB heap. 4K (3840×2160) is the
+/// largest desktop panel we still fit. `resolution=WxH` is uncapped.
+const AUTO_MAX_PIXELS: usize = 3840 * 2160;
+
+fn mode_fits_auto_cap(w: usize, h: usize) -> bool {
+    w > 0 && h > 0 && w.saturating_mul(h) <= AUTO_MAX_PIXELS
+}
+
 fn init_graphic(bs: &BootServices, resolution: Resolution) -> (GraphicInfo, [u8; 128], u32) {
     let gop_handle = find_active_gop_handle(bs)
         .or_else(|| bs.get_handle_for_protocol::<GraphicsOutput>().ok())
@@ -484,27 +494,41 @@ fn init_graphic(bs: &BootServices, resolution: Resolution) -> (GraphicInfo, [u8;
     // - Exact(w,h): that mode or keep the current one (the old behaviour
     //   panicked with "graphic mode not found", bricking boot over a config
     //   value the firmware happens not to offer).
-    // - Auto: the EDID-preferred timing if the firmware offers it; otherwise
-    //   the largest offered mode (GOP modes are firmware-validated against
-    //   the display, and a TV upscales its own standard timings far better
-    //   than it stretches a small 4:3 mode across a 16:9 panel).
+    // - Auto: the EDID-preferred timing if the firmware offers it *and* it
+    //   fits [`AUTO_MAX_PIXELS`]; otherwise the largest offered mode within
+    //   that cap (GOP modes are firmware-validated against the display, and
+    //   a TV upscales its own standard timings far better than it stretches
+    //   a small 4:3 mode across a 16:9 panel). Uncapped max-by-area is how
+    //   VirtualBox landed on 8K and the kernel OOM'd.
     let target = match resolution {
         Resolution::Keep => None,
         Resolution::Exact(x, y) => Some((x, y)),
-        Resolution::Auto => edid_preferred_resolution(&edid, edid_size),
+        Resolution::Auto => edid_preferred_resolution(&edid, edid_size)
+            .filter(|&(w, h)| mode_fits_auto_cap(w, h)),
     };
     let exact = target.and_then(|want| gop.modes(bs).find(|mode| mode.info().resolution() == want));
     let chosen = exact.or_else(|| {
-        // Auto without an exact EDID match (or Auto with no readable EDID):
-        // largest firmware-offered mode by area.
-        if resolution == Resolution::Auto {
-            gop.modes(bs).max_by_key(|mode| {
-                let (w, h) = mode.info().resolution();
-                w * h
-            })
-        } else {
-            None
+        if resolution != Resolution::Auto {
+            return None;
         }
+        // Largest firmware-offered mode that still fits the cap.
+        gop.modes(bs)
+            .filter(|mode| {
+                let (w, h) = mode.info().resolution();
+                mode_fits_auto_cap(w, h)
+            })
+            .max_by_key(|mode| {
+                let (w, h) = mode.info().resolution();
+                w.saturating_mul(h)
+            })
+            .or_else(|| {
+                // Some VMs only list huge modes: pick the smallest so we
+                // still boot rather than remaining at 8K.
+                gop.modes(bs).min_by_key(|mode| {
+                    let (w, h) = mode.info().resolution();
+                    w.saturating_mul(h)
+                })
+            })
     });
     if let Some(mode) = chosen {
         gop.set_mode(&mode).expect("Failed to set graphics mode");
@@ -627,9 +651,8 @@ unsafe impl FrameAllocator<Size4KiB> for UEFIFrameAllocator<'_> {
         let addr = self
             .0
             .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
-            .expect("failed to allocate frame");
-        let frame = PhysFrame::containing_address(PhysAddr::new(addr));
-        Some(frame)
+            .ok()?;
+        Some(PhysFrame::containing_address(PhysAddr::new(addr)))
     }
 }
 

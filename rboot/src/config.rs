@@ -9,9 +9,12 @@ pub enum Resolution {
     /// Key absent: keep whatever mode the firmware already set.
     Keep,
     /// `resolution=auto`: pick the GOP mode matching the display's
-    /// EDID-preferred timing; fall back to the largest offered mode. This is
-    /// what a fixed value can't do portably — e.g. a 1366x768 TV stretched an
-    /// exact `1024x768` (4:3 on 16:9) while its firmware offered better modes.
+    /// EDID-preferred timing; fall back to the largest offered mode whose
+    /// area is at most 4K (`3840×2160`). Uncapped "largest mode" is unsafe:
+    /// VirtualBox EFI GOP advertises VRAM-filling 8K modes that are not a
+    /// real panel. This is what a fixed value can't do portably — e.g. a
+    /// 1366x768 TV stretched an exact `1024x768` (4:3 on 16:9) while its
+    /// firmware offered better modes.
     Auto,
     /// `resolution=WxH`: request that exact mode (kept if unavailable).
     Exact(usize, usize),

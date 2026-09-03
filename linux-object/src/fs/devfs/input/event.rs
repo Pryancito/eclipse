@@ -4,7 +4,9 @@ use core::{any::Any, future::Future, mem::size_of, pin::Pin};
 
 use lock::Mutex;
 
-use kernel_hal::drivers::prelude::{CapabilityType, InputCapability, InputEvent, InputEventType};
+use kernel_hal::drivers::prelude::{
+    AbsInfo, CapabilityType, InputCapability, InputEvent, InputEventType,
+};
 use kernel_hal::drivers::scheme::InputScheme;
 use rcore_fs::vfs::*;
 use rcore_fs_devfs::DevFS;
@@ -290,9 +292,22 @@ impl INode for EventDev {
                 user_copy(ptr.write(0))?;
                 Ok(1)
             }
-            // EVIOCGPROP / EVIOCGKEY / EVIOCGLED / EVIOCGSND / EVIOCGSW: report
-            // an all-zero state (no properties, nothing currently pressed/lit).
-            0x09 | 0x18 | 0x19 | 0x1a | 0x1b => {
+            // EVIOCGPROP: input properties bitmap. A USB tablet is a pointer
+            // (needs an on-screen cursor), not a direct touchscreen.
+            0x09 => {
+                let mut bits = [0u8; 256];
+                let abs = self.input.capability(CapabilityType::AbsAxis);
+                if abs.contains(0) && abs.contains(1) {
+                    bits[0] |= 1; // INPUT_PROP_POINTER
+                }
+                let n = size.min(bits.len());
+                let mut ptr = kernel_hal::user::UserOutPtr::<u8>::from(data);
+                user_copy(ptr.write_array(&bits[..n]))?;
+                Ok(n)
+            }
+            // EVIOCGKEY / EVIOCGLED / EVIOCGSND / EVIOCGSW: report
+            // an all-zero state (nothing currently pressed/lit).
+            0x18 | 0x19 | 0x1a | 0x1b => {
                 let zeros = [0u8; 256];
                 let mut ptr = kernel_hal::user::UserOutPtr::<u8>::from(data);
                 user_copy(ptr.write_array(&zeros[..size]))?;
@@ -306,13 +321,26 @@ impl INode for EventDev {
                 user_copy(ptr.write_array(&bytes[..n]))?;
                 Ok(n)
             }
-            // EVIOCGABS(abs): struct input_absinfo — zeroed (no absolute axes).
+            // EVIOCGABS(abs): struct input_absinfo { value, min, max, fuzz, flat, res }.
             0x40..=0x7f => {
-                let n = size.min(24);
-                let zeros = [0u8; 256];
+                let axis = (nr - 0x40) as u16;
+                let info = self.input.abs_info(axis).unwrap_or(AbsInfo::default());
+                let words = [
+                    info.value,
+                    info.minimum,
+                    info.maximum,
+                    info.fuzz,
+                    info.flat,
+                    info.resolution,
+                ];
+                let mut bytes = [0u8; 24];
+                for (i, v) in words.iter().enumerate() {
+                    bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                let n = size.min(bytes.len());
                 let mut ptr = kernel_hal::user::UserOutPtr::<u8>::from(data);
-                user_copy(ptr.write_array(&zeros[..n]))?;
-                Ok(0)
+                user_copy(ptr.write_array(&bytes[..n]))?;
+                Ok(n)
             }
             _ => Err(FsError::NotSupported),
         }

@@ -20,8 +20,8 @@ use crate::builder::IoMapper;
 use crate::bus::drivers_timer_now_as_micros;
 use crate::bus::pci_drivers::PciDriver;
 use crate::bus::{phys_to_virt, PAGE_SIZE};
-use crate::input::input_event_codes::{ev::*, key::*, rel::*, syn::*};
-use crate::prelude::{CapabilityType, InputCapability, InputEvent, InputEventType};
+use crate::input::input_event_codes::{abs::*, ev::*, input_prop::*, key::*, rel::*, syn::*};
+use crate::prelude::{AbsInfo, CapabilityType, InputCapability, InputEvent, InputEventType};
 use crate::scheme::{impl_event_scheme, InputScheme, IrqScheme, Scheme};
 use crate::utils::EventListener;
 use crate::{Device, DeviceError, DeviceResult};
@@ -796,8 +796,19 @@ const EP_TYPE_INT_IN: u32 = 7 << 3;
 const HID_PROTO_KEY: u8 = 1;
 const HID_PROTO_MOUSE: u8 = 2;
 const HID_PROTO_TABLET: u8 = 3;
-const TABLET_RANGE: u32 = 32767;
+const TABLET_RANGE: i32 = 32767;
 const NO_MSI_VECTOR: usize = 0;
+
+/// Set when a USB HID tablet (QEMU `usb-tablet`, VirtualBox USB Tablet) is
+/// enumerated. Those devices report *absolute* coordinates; a PS/2 mouse on
+/// the same VM still delivers relative packets and would fight the tablet
+/// (jumps, doubled motion). The PS/2 aux path checks this and stays quiet.
+static USB_ABS_POINTER: AtomicBool = AtomicBool::new(false);
+
+/// True once an absolute USB pointer has been enumerated.
+pub fn usb_abs_pointer_active() -> bool {
+    USB_ABS_POINTER.load(Ordering::Relaxed)
+}
 
 /// Number of TRBs (and report buffers) kept queued on every interrupt-IN HID
 /// endpoint. A single in-flight TRB is fragile: if one transfer-completion
@@ -837,8 +848,6 @@ pub struct XhciInner {
     scratch_tbl: Option<DmaBuf>,
     scratch_pages: Vec<DmaBuf>,
     hids: Vec<HidDev>,
-    pub fb_width: u32,
-    pub fb_height: u32,
     /// Cambios de puerto diferidos para evitar re-entrada recursiva en pop_ev.
     pending_port_changes: Vec<u8>,
     /// HID interrupt endpoints (slot, dci) that completed a transfer with an
@@ -875,9 +884,6 @@ struct HidDev {
     enqueue_idx: usize,
     last_mods: u8,
     last_keys: [u8; 6],
-    tab_x: u16,
-    tab_y: u16,
-    tab_init: bool,
 }
 
 impl XhciInner {
@@ -907,8 +913,6 @@ impl XhciInner {
             scratch_tbl: None,
             scratch_pages: Vec::new(),
             hids: Vec::new(),
-            fb_width: 1024,
-            fb_height: 768,
             pending_port_changes: Vec::new(),
             pending_ep_resets: Vec::new(),
             boot_enum_pending: true,
@@ -1936,13 +1940,18 @@ impl XhciInner {
             _ => 8usize,
         };
 
-        // Forzar protocolo de boot (si el dispositivo lo soporta).
-        // Algunos dispositivos no responden a SET_PROTOCOL → timeout corto (200ms).
-        let _ = self.ep0_control_out0_optional(
-            slot,
-            trb_setup(0x21, HID_REQ_SET_PROTOCOL, 0, iface as u16, 0, 0),
-            true,
-        );
+        // Forzar protocolo de boot solo en teclado/ratón boot HID.
+        // VirtualBox's USB Tablet (and QEMU usb-tablet) use bInterfaceProtocol 0
+        // with an *absolute* report. SET_PROTOCOL(boot=0) can switch them to a
+        // 3-byte relative mouse report while we still parse 6–8 byte absolute
+        // packets — the pointer then jumps at random. Leave report protocol as-is.
+        if real_proto == HID_PROTO_KEY || real_proto == HID_PROTO_MOUSE {
+            let _ = self.ep0_control_out0_optional(
+                slot,
+                trb_setup(0x21, HID_REQ_SET_PROTOCOL, 0, iface as u16, 0, 0),
+                true,
+            );
+        }
         // SET_IDLE es opcional en USB HID spec: si el dispositivo no responde
         // (QEMU emula algunos dispositivos que ignoran SET_IDLE), continuar de todos modos.
         let _ = self.ep0_control_out0_optional(
@@ -2044,10 +2053,10 @@ impl XhciInner {
             enqueue_idx: 0,
             last_mods: 0,
             last_keys: [0; 6],
-            tab_x: 0,
-            tab_y: 0,
-            tab_init: false,
         });
+        if real_proto == HID_PROTO_TABLET {
+            USB_ABS_POINTER.store(true, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -2162,61 +2171,68 @@ impl XhciInner {
                 });
             }
             HID_PROTO_TABLET if h.report_len >= 6 => {
+                // QEMU usb-tablet and VirtualBox USB Tablet share this layout:
+                // [buttons, X16, Y16, wheel?, hwheel?] with X/Y in 0..=32767.
+                // Emit ABS_X/ABS_Y (not REL deltas): converting to relative and
+                // clamping to ±127 made the guest pointer lag, jump, and lose
+                // sync with the host cursor. libinput maps the abs range onto
+                // the output using EVIOCGABS min/max.
                 let btn = tmp[0];
-                let ax = u16::from_le_bytes([tmp[1], tmp[2]]) as u32;
-                let ay = u16::from_le_bytes([tmp[3], tmp[4]]) as u32;
-                let sx = ((ax as u64 * self.fb_width as u64) / (TABLET_RANGE as u64 + 1))
-                    .min(self.fb_width as u64 - 1) as i32;
-                let sy = ((ay as u64 * self.fb_height as u64) / (TABLET_RANGE as u64 + 1))
-                    .min(self.fb_height as u64 - 1) as i32;
-                if !h.tab_init {
-                    h.tab_init = true;
-                    h.tab_x = sx as u16;
-                    h.tab_y = sy as u16;
-                } else {
-                    let dx = (sx - h.tab_x as i32).clamp(-127, 127);
-                    let dy = (sy - h.tab_y as i32).clamp(-127, 127);
-                    h.tab_x = sx as u16;
-                    h.tab_y = sy as u16;
-                    for (mask, code) in [(1u8, BTN_LEFT), (2u8, BTN_RIGHT), (4u8, BTN_MIDDLE)] {
-                        let down = (btn & mask) != 0;
-                        let was = (h.last_mods & mask) != 0;
-                        if down != was {
-                            lis.trigger(InputEvent {
-                                event_type: InputEventType::Key,
-                                code,
-                                value: if down { 1 } else { 0 },
-                            });
-                        }
-                    }
-                    h.last_mods = btn;
-                    if dx != 0 {
+                let ax = u16::from_le_bytes([tmp[1], tmp[2]]) as i32;
+                let ay = u16::from_le_bytes([tmp[3], tmp[4]]) as i32;
+                for (mask, code) in [
+                    (1u8, BTN_LEFT),
+                    (2u8, BTN_RIGHT),
+                    (4u8, BTN_MIDDLE),
+                    (8u8, BTN_SIDE),
+                    (16u8, BTN_EXTRA),
+                ] {
+                    let down = (btn & mask) != 0;
+                    let was = (h.last_mods & mask) != 0;
+                    if down != was {
                         lis.trigger(InputEvent {
-                            event_type: InputEventType::RelAxis,
-                            code: REL_X,
-                            value: dx,
+                            event_type: InputEventType::Key,
+                            code,
+                            value: if down { 1 } else { 0 },
                         });
                     }
-                    if dy != 0 {
-                        lis.trigger(InputEvent {
-                            event_type: InputEventType::RelAxis,
-                            code: REL_Y,
-                            // The tablet already reports screen-space Y (0 = top,
-                            // growing downward), so `dy > 0` means the pointer
-                            // moved down. Emit it as-is: the `/dev/input/mice`
-                            // PS/2 path negates once and kdrive negates again
-                            // (PS/2 treats +Y as up), so the two cancel and the
-                            // pointer follows the motion. Negating here inverts
-                            // the vertical axis under Xfbdev.
-                            value: dy,
-                        });
-                    }
-                    lis.trigger(InputEvent {
-                        event_type: InputEventType::Syn,
-                        code: SYN_REPORT,
-                        value: 0,
-                    });
                 }
+                h.last_mods = btn;
+                lis.trigger(InputEvent {
+                    event_type: InputEventType::AbsAxis,
+                    code: ABS_X,
+                    value: ax,
+                });
+                lis.trigger(InputEvent {
+                    event_type: InputEventType::AbsAxis,
+                    code: ABS_Y,
+                    value: ay,
+                });
+                if n >= 6 {
+                    let w = tmp[5] as i8 as i32;
+                    if w != 0 {
+                        lis.trigger(InputEvent {
+                            event_type: InputEventType::RelAxis,
+                            code: REL_WHEEL,
+                            value: -w,
+                        });
+                    }
+                }
+                if n >= 7 {
+                    let hw = tmp[6] as i8 as i32;
+                    if hw != 0 {
+                        lis.trigger(InputEvent {
+                            event_type: InputEventType::RelAxis,
+                            code: REL_HWHEEL,
+                            value: hw,
+                        });
+                    }
+                }
+                lis.trigger(InputEvent {
+                    event_type: InputEventType::Syn,
+                    code: SYN_REPORT,
+                    value: 0,
+                });
             }
             _ => {}
         }
@@ -2763,6 +2779,14 @@ impl XhciUsbHid {
         set_poll_instance(Some(arc.clone()));
         Ok(arc)
     }
+
+    fn has_tablet(&self) -> bool {
+        self.inner
+            .lock()
+            .as_ref()
+            .map(|xi| xi.hids.iter().any(|h| h.protocol == HID_PROTO_TABLET))
+            .unwrap_or(false)
+    }
 }
 
 impl_event_scheme!(XhciUsbHid, InputEvent);
@@ -2787,8 +2811,14 @@ impl Scheme for XhciUsbHid {
 impl InputScheme for XhciUsbHid {
     fn capability(&self, cap_type: CapabilityType) -> InputCapability {
         let mut cap = InputCapability::empty();
+        let tablet = self.has_tablet();
         match cap_type {
-            CapabilityType::Event => cap.set_all(&[EV_SYN, EV_KEY, EV_REL]),
+            CapabilityType::Event => {
+                cap.set_all(&[EV_SYN, EV_KEY, EV_REL]);
+                if tablet {
+                    cap.set(EV_ABS);
+                }
+            }
             CapabilityType::Key => {
                 // Advertise the full keyboard keycode block plus the mouse
                 // buttons this HID scheme can emit. libinput builds the
@@ -2807,9 +2837,19 @@ impl InputScheme for XhciUsbHid {
                 cap.set_all(&[BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA]);
             }
             CapabilityType::RelAxis => cap.set_all(&[REL_X, REL_Y, REL_WHEEL, REL_HWHEEL]),
+            CapabilityType::AbsAxis if tablet => cap.set_all(&[ABS_X, ABS_Y]),
+            CapabilityType::InputProp if tablet => cap.set(INPUT_PROP_POINTER),
             _ => {}
         }
         cap
+    }
+
+    fn abs_info(&self, axis: u16) -> Option<AbsInfo> {
+        if self.has_tablet() && (axis == ABS_X || axis == ABS_Y) {
+            Some(AbsInfo::range(0, TABLET_RANGE))
+        } else {
+            None
+        }
     }
 }
 
