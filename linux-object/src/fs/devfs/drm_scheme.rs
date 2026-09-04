@@ -477,6 +477,54 @@ fn trace_syncobj(op: &str, pid: u64, handle: u32, point: u64, result: &str) {
     }
 }
 
+/// Driver-private DRM command number (`DRM_COMMAND_BASE + 0x50`) for
+/// `struct drm_eclipse_compute`. Nouveau does not use 0x50. Matched by NR
+/// so the `_IOWR` size encoding does not have to agree bit-for-bit.
+const DRM_ECLIPSE_COMPUTE_NR: u32 = 0x90;
+
+#[repr(C)]
+struct DrmEclipseCompute {
+    op: u32,
+    status: i32,
+    elapsed_ns: u64,
+    grid_threads: u32,
+    reserved: u32,
+    summary: [u8; 512],
+}
+
+fn drm_node_name(minor: u32) -> &'static str {
+    match minor {
+        0 => "card0",
+        1 => "card1",
+        128 => "renderD128",
+        129 => "renderD129",
+        _ => "card?",
+    }
+}
+
+fn eclipse_compute_ioctl(data: usize) -> Result<usize> {
+    let req = unsafe { &mut *(data as *mut DrmEclipseCompute) };
+    let driver = drm::get_compute_driver().or_else(drm::get_primary_driver);
+    let Some(driver) = driver else {
+        req.status = -19; // -ENODEV
+        fill_summary(&mut req.summary, "no compute GPU");
+        return Ok(0);
+    };
+    let result = driver.compute_launch(req.op);
+    req.status = result.status;
+    req.elapsed_ns = result.elapsed_ns;
+    req.grid_threads = result.grid_threads;
+    fill_summary(&mut req.summary, &result.report);
+    Ok(0)
+}
+
+fn fill_summary(dst: &mut [u8; 512], src: &str) {
+    dst.fill(0);
+    let bytes = src.as_bytes();
+    let n = core::cmp::min(bytes.len(), dst.len() - 1);
+    dst[..n].copy_from_slice(&bytes[..n]);
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct DrmVersion {
@@ -1278,13 +1326,13 @@ impl INode for DrmDev {
                 }
             }
         }
+        if (cmd & 0xff) == DRM_ECLIPSE_COMPUTE_NR {
+            return eclipse_compute_ioctl(data);
+        }
         match cmd {
             DRM_IOCTL_VERSION => {
-                let node = if self.minor >= 128 {
-                    "renderD128"
-                } else {
-                    "card0"
-                };
+                let node = drm_node_name(self.minor);
+                let compute_node = drm::is_compute_minor(self.minor);
                 // When the nouveau experiment is on, make this visible at the
                 // default `warn` level and name the primary DRM driver: it tells
                 // us in one boot whether NVK/Mesa even reached VERSION on this
@@ -1312,17 +1360,20 @@ impl INode for DrmDev {
                         [const { AtomicBool::new(false) }; 256];
                     let slot = (self.minor & 0xff) as usize;
                     if !VERSION_LOGGED[slot].swap(true, Ordering::Relaxed) {
+                        let vname = if compute_node { "eclipse-compute" } else { "nouveau" };
                         match drm::get_primary_driver() {
                             Some(d) => kernel_hal::klog_info!(
-                                "[drm] VERSION on /dev/dri/{} (minor={}) -> name=\"nouveau\"; primary_driver={:?} (client reached VERSION — DRM discovery OK; logged once per node)",
+                                "[drm] VERSION on /dev/dri/{} (minor={}) -> name=\"{}\"; primary_driver={:?} (client reached VERSION — DRM discovery OK; logged once per node)",
                                 node,
                                 self.minor,
+                                vname,
                                 d.name()
                             ),
                             None => kernel_hal::klog_info!(
-                                "[drm] VERSION on /dev/dri/{} (minor={}) -> name=\"nouveau\"; primary_driver=<none> (logged once per node)",
+                                "[drm] VERSION on /dev/dri/{} (minor={}) -> name=\"{}\"; primary_driver=<none> (logged once per node)",
                                 node,
-                                self.minor
+                                self.minor,
+                                vname
                             ),
                         }
                     }
@@ -1345,7 +1396,11 @@ impl INode for DrmDev {
                 // "[nouveau-uapi] unhandled ioctl ... GEM_PUSHBUF" line says so.
                 let nouveau = zcore_drivers::display::nouveau_uapi_enabled();
                 let v = unsafe { &mut *(data as *mut DrmVersion) };
-                if nouveau {
+                if compute_node {
+                    v.version_major = 0;
+                    v.version_minor = 1;
+                    v.version_patchlevel = 0;
+                } else if nouveau {
                     v.version_major = 1;
                     v.version_minor = 4;
                     v.version_patchlevel = 0;
@@ -1355,9 +1410,17 @@ impl INode for DrmDev {
                     v.version_patchlevel = 0;
                 }
 
-                let name: &[u8] = if nouveau { b"nouveau\0" } else { b"zcore\0" };
+                let name: &[u8] = if compute_node {
+                    b"eclipse-compute\0"
+                } else if nouveau {
+                    b"nouveau\0"
+                } else {
+                    b"zcore\0"
+                };
                 let date = b"20260503\0";
-                let desc: &[u8] = if nouveau {
+                let desc: &[u8] = if compute_node {
+                    b"Eclipse NVIDIA compute\0"
+                } else if nouveau {
                     b"nouveau\0"
                 } else {
                     b"zCore DRM Driver\0"
@@ -2008,6 +2071,16 @@ impl INode for DrmDev {
             }
             DRM_IOCTL_MODE_GETRESOURCES => {
                 let res = unsafe { &mut *(data as *mut DrmModeCardRes) };
+                if drm::is_compute_minor(self.minor) {
+                    // Headless compute node: not a KMS card. drmIsKMS sees
+                    // zero CRTCs/connectors and leaves this node alone, so
+                    // labwc stays on card0 even without WLR_DRM_DEVICES.
+                    res.count_fbs = 0;
+                    res.count_crtcs = 0;
+                    res.count_connectors = 0;
+                    res.count_encoders = 0;
+                    return Ok(0);
+                }
                 let (fbs, crtcs, connectors) = drm::get_resources();
 
                 if res.fb_id_ptr != 0 && res.count_fbs >= fbs.len() as u32 {

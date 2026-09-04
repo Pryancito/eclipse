@@ -407,9 +407,9 @@ pub(super) fn record_ioctl_err(pid: u64, request: u32, errno: i32) {
 //    `vm_bind_op`), which is byte-exact only if NVK did not actually compress.
 //    `vmbind_non_generic > 0` (and the kind list) flags that this path was hit
 //    and is the prime suspect when a surface renders as structured garbage.
-//  * Tiled surface over host sysmem. GEM_NEW backs EVERY object with sysmem
-//    (never true VRAM yet), so a block-linear surface lives in host RAM reached
-//    through the GMMU. `gem_tiled` shows how much tiled memory is in play.
+//  * Tiled surface over host sysmem. GEM_NEW backs GART (and GART|VRAM) with
+//    sysmem; a VRAM-only request is real LOCAL and is not CPU-mmapable.
+//    `gem_tiled` shows how much tiled memory is in play.
 //
 // All state is bounded: a handful of atomics plus a 256-bit "kinds seen"
 // bitset, reset only at boot.
@@ -418,6 +418,7 @@ static GEM_REQ_VRAM: AtomicU32 = AtomicU32::new(0);
 static GEM_REQ_GART: AtomicU32 = AtomicU32::new(0);
 static GEM_CPU_MAPPABLE: AtomicU32 = AtomicU32::new(0);
 static GEM_TILED: AtomicU32 = AtomicU32::new(0);
+static GEM_VRAM_BACKED: AtomicU32 = AtomicU32::new(0);
 static VMBIND_MAP: AtomicU32 = AtomicU32::new(0);
 static VMBIND_UNMAP: AtomicU32 = AtomicU32::new(0);
 static VMBIND_SPARSE: AtomicU32 = AtomicU32::new(0);
@@ -438,9 +439,15 @@ fn note_kind_seen(kind: u32) {
 
 /// Record one `GEM_NEW`. `req_domain` is the client's requested
 /// NOUVEAU_GEM_DOMAIN_* mask (before we override it to the domain actually
-/// used), `cpu_mappable` true when a BAR1 CPU address resolved, `tile_flags`
-/// the requested tiling (upper bits carry the PTE kind).
-pub(super) fn record_gem_new(req_domain: u32, cpu_mappable: bool, tile_flags: u32) {
+/// used), `cpu_mappable` true when a host PA resolved, `vram_backed` true
+/// when the object is `NV01_MEMORY_LOCAL_USER` (VRAM-only, no CPU map),
+/// `tile_flags` the requested tiling (upper bits carry the PTE kind).
+pub(super) fn record_gem_new(
+    req_domain: u32,
+    cpu_mappable: bool,
+    tile_flags: u32,
+    vram_backed: bool,
+) {
     GEM_TOTAL.fetch_add(1, Ordering::Relaxed);
     if req_domain & NOUVEAU_GEM_DOMAIN_VRAM != 0 {
         GEM_REQ_VRAM.fetch_add(1, Ordering::Relaxed);
@@ -450,6 +457,9 @@ pub(super) fn record_gem_new(req_domain: u32, cpu_mappable: bool, tile_flags: u3
     }
     if cpu_mappable {
         GEM_CPU_MAPPABLE.fetch_add(1, Ordering::Relaxed);
+    }
+    if vram_backed {
+        GEM_VRAM_BACKED.fetch_add(1, Ordering::Relaxed);
     }
     if tile_flags != 0 {
         GEM_TILED.fetch_add(1, Ordering::Relaxed);
@@ -495,12 +505,13 @@ pub(super) fn format_client_mem() -> alloc::string::String {
     }
     let _ = writeln!(
         s,
-        "[gpudbg]  GEM_NEW: total={} req_vram={} req_gart={} cpu_mappable={} tiled={} (all backed by host sysmem)",
+        "[gpudbg]  GEM_NEW: total={} req_vram={} req_gart={} cpu_mappable={} tiled={} vram_backed={}",
         gem_total,
         GEM_REQ_VRAM.load(Ordering::Relaxed),
         GEM_REQ_GART.load(Ordering::Relaxed),
         GEM_CPU_MAPPABLE.load(Ordering::Relaxed),
         GEM_TILED.load(Ordering::Relaxed),
+        GEM_VRAM_BACKED.load(Ordering::Relaxed),
     );
     let non_generic = VMBIND_NON_GENERIC.load(Ordering::Relaxed);
     let _ = writeln!(
@@ -946,9 +957,8 @@ pub(super) struct NouveauChannelState {
 }
 
 /// A GEM object allocated through `GEM_NEW`. Backed by a real RM memory
-/// object (`nvidia_rm_sys::rm_init::gem_alloc`, `NV01_MEMORY_LOCAL_USER`
-/// -- the RM's own VRAM heap, same class `step17` uses for USERD), not a
-/// separate allocator carving up the same physical range out-of-band.
+/// object (`nvidia_rm_sys::rm_init::gem_alloc`): `NV01_MEMORY_SYSTEM` for
+/// GART / GART|VRAM, or `NV01_MEMORY_LOCAL_USER` for VRAM-only.
 pub(super) struct NouveauGemObject {
     /// Handle returned to userspace (nouveau-uAPI wire format). Distinct
     /// from `h_memory`: this is Eclipse's own counter, not an RM handle.
@@ -971,6 +981,9 @@ pub(super) struct NouveauGemObject {
     /// CPU-mmap-able -- see the `GEM_NEW` gap note in
     /// docs/README-nouveau-uapi.md.
     pub phys_addr: Option<u64>,
+    /// Domain actually used (`NOUVEAU_GEM_DOMAIN_GART` or `_VRAM`), so
+    /// `GEM_INFO` reports the backing rather than a hardcoded VRAM lie.
+    pub domain: u32,
     /// Tiling the client asked for at `GEM_NEW`, kept so `GEM_INFO` returns
     /// what was requested. `tile_flags`'s upper bits carry the PTE kind
     /// (`pte_kind << 8`); 0/0 is plain linear.

@@ -1277,17 +1277,17 @@ La cadena de NVK lo permite sin tocar Mesa: un tipo `DEVICE_LOCAL` →
   modelo discreto y anuncia (Maxwell+, o sea toda placa aquí) un tipo
   `DEVICE_LOCAL` puro Y uno `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`.
   wlroots queda satisfecho.
-- **GEM_NEW** ignora el bit VRAM y respalda **todo** con sysmem CPU-visible
-  (`sysmem = true` incondicional). El peligro viejo — anunciar VRAM hacía que
-  el swapchain cayera en VRAM real, gem_map_cpu publicaba el FB OFFSET como
-  dirección de host, y userspace renderizaba sobre RAM baja del kernel (el
-  deadlock de vmar) — desaparece: gem_map_cpu sólo ve ADDR_SYSMEM y publica
-  una PA de host real. Más lento (la GPU lee por PCIe) pero cada byte es
-  alcanzable por el blit de CPU de la presentación.
+- **GEM_NEW** respalda GART y `GART|VRAM` con sysmem CPU-visible. Un pedido
+  **VRAM-only** (sin bit GART) usa `NV01_MEMORY_LOCAL_USER` de verdad y
+  `map_handle=0`: `gem_map_cpu` nunca publica el offset de FBMEM como PA de
+  host. El peligro viejo — anunciar VRAM hacía que el swapchain cayera en
+  VRAM, gem_map_cpu publicaba el FB OFFSET como dirección de host, y
+  userspace renderizaba sobre RAM baja del kernel (el deadlock de vmar) —
+  desaparece para HOST_VISIBLE (sigue en sysmem) y para LOCAL de verdad
+  (sin mmap CPU). El present/scanout sigue en CREATE_DUMB sysmem.
 
-Es lo mejor de ambos mundos: wlroots ve el tipo `DEVICE_LOCAL` que exige, y
-el respaldo sigue siendo sysmem CPU-mapeable de punta a punta. La VRAM real
-para objetos device-local-only vuelve cuando exista un camino BAR1.
+wlroots ve el tipo `DEVICE_LOCAL` que exige. Los objetos device-local-only
+de NVK (heap sin HOST_VISIBLE) pueden aterrizar en VRAM real.
 
 ## Arranque J: swapchain block-linear (PTE kind 0x06) -> forzar scanout LINEAR
 

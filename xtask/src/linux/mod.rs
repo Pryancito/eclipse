@@ -509,6 +509,37 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             fs::copy(&eclipse_bench, &dst).unwrap();
         }
 
+        // ecl-compute: SAXPY / GIOPS on the NVIDIA compute GPU via card1.
+        let ecl_compute = self.ecl_compute(&musl);
+        if ecl_compute.is_file() {
+            let dst = bin.join("ecl-compute");
+            let _ = dir::rm(&dst);
+            fs::copy(&ecl_compute, &dst).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(0o755));
+            }
+        } else {
+            eprintln!("warning: ecl-compute not built; no userspace NVIDIA compute client");
+        }
+
+        // ecl-vkcompute: SAXPY via Vulkan compute (NVK). Dynamic: musl static
+        // cannot dlopen libvulkan.so.1.
+        let ecl_vkcompute = self.ecl_vkcompute(&musl);
+        if ecl_vkcompute.is_file() {
+            let dst = bin.join("ecl-vkcompute");
+            let _ = dir::rm(&dst);
+            fs::copy(&ecl_vkcompute, &dst).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(0o755));
+            }
+        } else {
+            eprintln!("warning: ecl-vkcompute not built; no Vulkan compute canary in the image");
+        }
+
         self.install_thread_tests(&dir);
         // INIT (PID 1): the Eclipse-native Rust init by default; busybox init
         // kept as a resilient fallback. busybox lays down `/sbin/init` -> busybox
@@ -749,7 +780,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # STRIPS arbitrary vars, so re-assert the whole policy here to match\n\
               # build_child_env and the wrapper.\n\
               if grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null && \\\n\
-              \x20\x20 [ \"$(cat /sys/class/drm/card0/device/vendor 2>/dev/null)\" = \"0x10de\" ]; then\n\
+              \x20\x20 [ \"$(tr -d '[:space:]' < /sys/class/drm/card0/device/vendor 2>/dev/null)\" = \"0x10de\" ]; then\n\
               \x20 # NVIDIA + flag -> kernel nouveau uAPI ON, but software session by default.\n\
               \x20 if grep -q 'nvidia\\.wlr_vulkan' /proc/cmdline 2>/dev/null; then\n\
               \x20\x20 export WLR_RENDERER=vulkan\n\
@@ -886,6 +917,11 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               \x20        && export ECLIPSE_TTY_SIZED=1 ;;\n\
               \x20 esac\n\
               \x20 unset __sz __sz_old __rows __cols\n\
+              \x20 # Home the graphic cursor. The probe's \\e[999;999H is also parsed\n\
+              \x20 # by the GOP console; VirtualBox UART is a file so CSI 6n never\n\
+              \x20 # replies and the installer would otherwise look like a hung black\n\
+              \x20 # screen (prompt parked on the last cell of a 2560x1600 mode).\n\
+              \x20 printf '\\033[H'\n\
               fi\n",
         )
         .unwrap();
@@ -1678,6 +1714,124 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             return executable;
         }
 
+        Ext::new(strip).arg("-s").arg(&executable).status();
+        executable
+    }
+
+    /// Cross-compile `ecl-compute` (NVIDIA SAXPY/bench client) as a static musl
+    /// binary for `/bin/ecl-compute`. Best-effort: a missing musl gcc just
+    /// skips the tool.
+    fn ecl_compute(&self, musl: &Path) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join("ecl-compute");
+        let executable = dir.join("ecl-compute");
+        let source = dir.join("ecl-compute.c");
+        if executable.is_file() && source.is_file() {
+            if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
+            {
+                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
+                    if bin_mtime >= src_mtime {
+                        return executable;
+                    }
+                }
+            }
+        }
+
+        println!("Compiling ecl-compute...");
+        let musl = musl.canonicalize().unwrap();
+        let bin = musl.join("bin");
+        let arch = self.0.name();
+        let cc = format!("{}/{}-linux-musl-gcc", bin.display(), arch);
+        let strip = self.strip(&musl);
+
+        fs::create_dir_all(&dir).unwrap();
+        let status = Ext::new(&cc)
+            .current_dir(&dir)
+            .arg("-static")
+            .arg("-O2")
+            .arg("-s")
+            .arg("-o")
+            .arg(&executable)
+            .arg(&source)
+            .status();
+        if !status.success() {
+            println!("Failed to compile ecl-compute");
+            return executable;
+        }
+
+        Ext::new(strip).arg("-s").arg(&executable).status();
+        executable
+    }
+
+    /// Cross-compile `ecl-vkcompute` (Vulkan SAXPY / NAK canary) as a *dynamic*
+    /// musl binary. Static musl cannot `dlopen` libvulkan, same reason as
+    /// `eclipse-sdl-probe`. Best-effort: missing musl gcc skips the tool.
+    fn ecl_vkcompute(&self, musl: &Path) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join("ecl-vkcompute");
+        let executable = dir.join("ecl-vkcompute");
+        let source = dir.join("ecl-vkcompute.c");
+        let spv_h = dir.join("saxpy_spv.h");
+        let gen = dir.join("gen_saxpy_spv.py");
+
+        if gen.is_file() {
+            let regen = match (fs::metadata(&gen), fs::metadata(&spv_h)) {
+                (Ok(g), Ok(h)) => match (g.modified(), h.modified()) {
+                    (Ok(gt), Ok(ht)) => gt > ht,
+                    _ => false,
+                },
+                (Ok(_), Err(_)) => true,
+                _ => false,
+            };
+            if regen {
+                let _ = Ext::new("python3").arg(&gen).current_dir(&dir).status();
+            }
+        }
+
+        let sources_newer = |bin_mtime: std::time::SystemTime| -> bool {
+            for p in [&source, &spv_h] {
+                if let Ok(m) = fs::metadata(p) {
+                    if let Ok(t) = m.modified() {
+                        if t > bin_mtime {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        };
+        if executable.is_file() {
+            if let Ok(bin_meta) = fs::metadata(&executable) {
+                if let Ok(bin_mtime) = bin_meta.modified() {
+                    if !sources_newer(bin_mtime) {
+                        return executable;
+                    }
+                }
+            }
+        }
+
+        println!("Compiling ecl-vkcompute...");
+        let musl = musl.canonicalize().unwrap();
+        let cc = format!(
+            "{}/{}-linux-musl-gcc",
+            musl.join("bin").display(),
+            self.0.name()
+        );
+        let strip = self.strip(&musl);
+        fs::create_dir_all(&dir).unwrap();
+        let status = Ext::new(&cc)
+            .current_dir(&dir)
+            .arg("-O2")
+            .arg("-Wall")
+            .arg("-fPIE")
+            .arg("-pie")
+            .arg("-o")
+            .arg(&executable)
+            .arg(&source)
+            .arg("-ldl")
+            .status();
+        if !status.success() {
+            println!("Failed to compile ecl-vkcompute");
+            return executable;
+        }
         Ext::new(strip).arg("-s").arg(&executable).status();
         executable
     }

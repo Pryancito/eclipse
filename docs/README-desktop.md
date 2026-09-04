@@ -294,3 +294,9 @@ servicios de cada sesión llevan una etiqueta `desktop =` en su
 `*.service` (`/etc/eclipse/services/`): `seatd`/`labwc` son `desktop = labwc`,
 `xorg` es `desktop = xorg`, y los servicios sin etiqueta (p. ej. `udhcpc`)
 arrancan siempre.
+
+`make vbox` arranca la **misma** sesión live que `make qemu` (`desktop=labwc`,
+initramfs con Mesa/labwc). El ISO (`make iso` / `./scripts/vbox-eclipse.sh --iso`)
+es el instalador: cmdline `desktop=none` y SFS sin escritorio, así que
+`eclipse-init` deja la consola y no lanza el compositor. Tras `install-eclipse`,
+`./scripts/vbox-eclipse.sh --disk-only` arranca labwc desde el VDI instalado.

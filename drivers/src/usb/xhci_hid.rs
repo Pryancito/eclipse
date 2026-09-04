@@ -791,13 +791,151 @@ const HID_REQ_SET_PROTOCOL: u8 = 0x0b;
 const HID_REQ_SET_IDLE: u8 = 0x0a;
 const USB_DESC_IFACE: u8 = 0x04;
 const USB_DESC_EP: u8 = 0x05;
+const USB_DESC_HID: u8 = 0x21;
+const USB_DESC_HID_REPORT: u8 = 0x22;
 const EP_TYPE_CONTROL: u32 = 4 << 3;
 const EP_TYPE_INT_IN: u32 = 7 << 3;
 const HID_PROTO_KEY: u8 = 1;
 const HID_PROTO_MOUSE: u8 = 2;
 const HID_PROTO_TABLET: u8 = 3;
 const TABLET_RANGE: i32 = 32767;
+/// VirtualBox USB Tablet (`--mouse usbtablet`).
+const VBOX_USB_TABLET_VID: u16 = 0x80ee;
+const VBOX_USB_TABLET_PID: u16 = 0x0021;
+/// QEMU emulated USB (`usb-kbd` / `usb-mouse` / `usb-tablet`). Product is
+/// usually 0x0001; the tablet is the only one with `bInterfaceProtocol == 0`.
+const QEMU_USB_VID: u16 = 0x0627;
 const NO_MSI_VECTOR: usize = 0;
+
+/// True only for the VM absolute pointers we parse as 16-bit ABS_X/Y.
+///
+/// A real-hardware HID interface with `bInterfaceProtocol == 0` ("None") is
+/// *not* a tablet: it is the extra iface on almost every USB keyboard (media
+/// keys) and many mice (vendor report). Treating those as tablets used to
+/// raise [`USB_ABS_POINTER`], which then silenced the PS/2 aux path *and*
+/// dropped boot-protocol USB mouse reports — keyboard still worked, the
+/// pointer was dead on metal.
+fn is_vm_abs_tablet(vid: u16, pid: u16, proto: u8) -> bool {
+    if proto != 0 {
+        return false;
+    }
+    (vid == VBOX_USB_TABLET_VID && pid == VBOX_USB_TABLET_PID) || vid == QEMU_USB_VID
+}
+
+/// How to drive a protocol-0 HID interface after sniffing its report descriptor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HidClass {
+    Key,
+    Mouse,
+    Tablet,
+    /// Consumer-control / vendor-only: do not bind (avoids fake pointer events).
+    Skip,
+    Unknown,
+}
+
+/// Walk a HID report descriptor looking for Generic Desktop X/Y (relative vs
+/// absolute), a keyboard application collection, or consumer-control.
+fn classify_hid_report(desc: &[u8]) -> HidClass {
+    let mut usage_page: u32 = 0;
+    let mut local_usages: [u32; 8] = [0; 8];
+    let mut n_local: usize = 0;
+    let mut app_page: u32 = 0;
+    let mut app_usage: u32 = 0;
+    let mut saw_rel_x = false;
+    let mut saw_rel_y = false;
+    let mut saw_abs_x = false;
+    let mut saw_abs_y = false;
+    let mut i = 0usize;
+    while i < desc.len() {
+        let prefix = desc[i];
+        i += 1;
+        if prefix == 0xfe {
+            // Long item: [0xFE, size, tag, data…]
+            if i + 2 > desc.len() {
+                break;
+            }
+            let size = desc[i] as usize;
+            i += 2 + size;
+            continue;
+        }
+        let size = match prefix & 3 {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 4,
+            _ => 0,
+        };
+        if i + size > desc.len() {
+            break;
+        }
+        let mut data = 0u32;
+        for b in 0..size {
+            data |= (desc[i + b] as u32) << (8 * b);
+        }
+        i += size;
+        let typ = (prefix >> 2) & 3;
+        let tag = prefix >> 4;
+        match (typ, tag) {
+            (1, 0) => usage_page = data, // Global Usage Page
+            (2, 0) => {
+                // Local Usage
+                if n_local < local_usages.len() {
+                    local_usages[n_local] = data;
+                    n_local += 1;
+                }
+            }
+            (0, 0xa) => {
+                // Collection
+                if data == 0x01 && n_local > 0 {
+                    app_page = usage_page;
+                    app_usage = local_usages[0];
+                }
+                n_local = 0;
+            }
+            (0, 8) => {
+                // Input
+                let relative = (data & 0x4) != 0;
+                for u in local_usages.iter().take(n_local).copied() {
+                    if usage_page == 0x01 {
+                        if u == 0x30 {
+                            if relative {
+                                saw_rel_x = true;
+                            } else {
+                                saw_abs_x = true;
+                            }
+                        }
+                        if u == 0x31 {
+                            if relative {
+                                saw_rel_y = true;
+                            } else {
+                                saw_abs_y = true;
+                            }
+                        }
+                    }
+                }
+                n_local = 0;
+            }
+            (0, _) => n_local = 0, // other Main items clear locals
+            _ => {}
+        }
+    }
+    if saw_rel_x && saw_rel_y {
+        return HidClass::Mouse;
+    }
+    if saw_abs_x && saw_abs_y {
+        return HidClass::Tablet;
+    }
+    if app_page == 0x01 && app_usage == 0x06 {
+        return HidClass::Key;
+    }
+    if app_page == 0x01 && (app_usage == 0x02 || app_usage == 0x01) {
+        return HidClass::Mouse;
+    }
+    if app_page == 0x0c {
+        return HidClass::Skip;
+    }
+    HidClass::Unknown
+}
 
 /// Set when a USB HID tablet (QEMU `usb-tablet`, VirtualBox USB Tablet) is
 /// enumerated. Those devices report *absolute* coordinates; a PS/2 mouse on
@@ -872,6 +1010,11 @@ struct HidDev {
     ring_idx: usize,
     protocol: u8,
     report_len: usize,
+    /// VirtualBox USB Tablet (`80ee:0021`) puts X/Y *after* wheel/hwheel/pad:
+    /// `[buttons, dz, dw, pad, X16, Y16]`. QEMU usb-tablet is
+    /// `[buttons, X16, Y16, wheel]`. Parsing VBox packets as QEMU made the
+    /// guest cursor ignore host mouse integration.
+    vbox_tablet: bool,
     /// Round-robin ring of report buffers, one per pre-queued TRB on this
     /// endpoint (see [`HID_QUEUE_DEPTH`]). The controller fills them in
     /// enqueue order; we drain in the same order.
@@ -1820,12 +1963,19 @@ impl XhciInner {
             let _ = self.wait_cmd_phys(p_upd);
         }
 
-        self.setup_hid_from_config(slot, csz, port)?;
+        self.setup_hid_from_config(slot, csz, port, vid, pid)?;
 
         Ok(())
     }
 
-    fn setup_hid_from_config(&mut self, slot: u8, csz: usize, port: u8) -> DeviceResult<()> {
+    fn setup_hid_from_config(
+        &mut self,
+        slot: u8,
+        csz: usize,
+        port: u8,
+        vid: u16,
+        pid: u16,
+    ) -> DeviceResult<()> {
         let sniff = DmaBuf::new(64, 64)?;
         sniff.flush(0, 64); // evict stale zeros before DMA
         self.ep0_control_in(slot, trb_setup(0x80, 0x06, 0x0200, 0, 9, 3), &sniff, 9)?;
@@ -1863,7 +2013,7 @@ impl XhciInner {
         );
 
         let mut o = 0usize;
-        let mut cur_iface = None;
+        let mut cur_iface: Option<(u8, u8, u8, u16)> = None; // num, proto, subclass, report_desc_len
         while o + 2 <= total {
             let dl = raw[o] as usize;
             let dt = raw[o + 1];
@@ -1873,32 +2023,130 @@ impl XhciInner {
             if dt == USB_DESC_IFACE && dl >= 9 {
                 let iface_num = raw[o + 2];
                 let iclass = raw[o + 5];
-                let _isub = raw[o + 6];
+                let isub = raw[o + 6];
                 let iproto = raw[o + 7];
                 if iclass == USB_CLASS_HID {
-                    cur_iface = Some((iface_num, iproto));
+                    cur_iface = Some((iface_num, iproto, isub, 0));
                 } else {
                     cur_iface = None;
                 }
             }
+            if dt == USB_DESC_HID && dl >= 9 {
+                if let Some((_, _, _, ref mut rlen)) = cur_iface {
+                    // HID class descriptor: first optional descriptor is the report.
+                    if raw[o + 6] == USB_DESC_HID_REPORT {
+                        *rlen = u16::from_le_bytes([raw[o + 7], raw[o + 8]]);
+                    }
+                }
+            }
             if dt == USB_DESC_EP && dl >= 7 {
-                if let Some((iface, proto)) = cur_iface {
+                if let Some((iface, proto, subclass, rlen)) = cur_iface {
                     let addr = raw[o + 2];
                     let attr = raw[o + 3];
                     let mps = u16::from_le_bytes([raw[o + 4], raw[o + 5]]);
                     let interval = raw[o + 6];
                     if (addr & 0x80) != 0 && (attr & 3) == 3 {
                         // Interrupt IN
-                        if let Err(_e) =
-                            self.init_single_hid(slot, csz, port, iface, proto, addr, mps, interval)
-                        {
-                        }
+                        if let Err(_e) = self.init_single_hid(
+                            slot, csz, port, iface, proto, subclass, rlen, addr, mps, interval,
+                            vid, pid,
+                        ) {}
                     }
                 }
             }
             o += dl;
         }
         Ok(())
+    }
+
+    fn classify_hid_iface(
+        &mut self,
+        slot: u8,
+        iface: u8,
+        proto: u8,
+        subclass: u8,
+        report_desc_len: u16,
+        vid: u16,
+        pid: u16,
+    ) -> DeviceResult<u8> {
+        if is_vm_abs_tablet(vid, pid, proto) {
+            return Ok(HID_PROTO_TABLET);
+        }
+        if proto == HID_PROTO_KEY {
+            return Ok(HID_PROTO_KEY);
+        }
+        if proto == HID_PROTO_MOUSE || (proto == 0 && subclass == HID_SUBCLASS_BOOT) {
+            return Ok(HID_PROTO_MOUSE);
+        }
+        // protocol 0: real hardware. Never default this to tablet — that flag
+        // silences PS/2 and boot-protocol USB mice (keyboard still works).
+        let sniffed = if report_desc_len > 0 {
+            self.sniff_hid_report(slot, iface, report_desc_len)
+                .unwrap_or(HidClass::Unknown)
+        } else {
+            HidClass::Unknown
+        };
+        let role = match sniffed {
+            HidClass::Key => HID_PROTO_KEY,
+            HidClass::Mouse => HID_PROTO_MOUSE,
+            HidClass::Tablet => HID_PROTO_TABLET,
+            HidClass::Skip => 0,
+            // Never default protocol-0 to tablet: that flag silences PS/2 and
+            // boot-protocol USB mice (keyboard still works, pointer is dead).
+            HidClass::Unknown => HID_PROTO_MOUSE,
+        };
+        warn!(
+            "[xhci] HID slot={} iface={} bInterfaceProtocol={} subclass={} vid={:04x}:{:04x} sniffed={:?} → proto={}",
+            slot, iface, proto, subclass, vid, pid, sniffed, role
+        );
+        if role == HID_PROTO_MOUSE
+            && self
+                .hids
+                .iter()
+                .any(|h| h.slot_id == slot && h.protocol == HID_PROTO_MOUSE)
+        {
+            // Extra vendor iface on a device that already has a boot mouse.
+            warn!(
+                "[xhci] skip extra proto-0 pointer slot={} iface={}",
+                slot, iface
+            );
+            return Ok(0);
+        }
+        Ok(role)
+    }
+
+    fn sniff_hid_report(&mut self, slot: u8, iface: u8, report_desc_len: u16) -> Option<HidClass> {
+        let len = (report_desc_len as usize).clamp(1, 1024);
+        let buf_len = len.div_ceil(64).max(1) * 64;
+        let buf = DmaBuf::new(buf_len, 64).ok()?;
+        buf.flush(0, buf_len);
+        // GET_DESCRIPTOR(Report) at the interface. Optional: a stall must not
+        // abort enumeration; the caller falls back to "mouse".
+        if self
+            .ep0_control_in(
+                slot,
+                trb_setup(
+                    0x81,
+                    0x06,
+                    (USB_DESC_HID_REPORT as u16) << 8,
+                    iface as u16,
+                    len as u16,
+                    3,
+                ),
+                &buf,
+                len as u32,
+            )
+            .is_err()
+        {
+            return None;
+        }
+        buf.flush(0, buf_len);
+        let mut raw = alloc::vec![0u8; len];
+        buf.read_into(0, &mut raw);
+        if raw.iter().all(|&b| b == 0) {
+            return None;
+        }
+        Some(classify_hid_report(&raw))
     }
 
     fn init_single_hid(
@@ -1908,30 +2156,26 @@ impl XhciInner {
         port: u8,
         iface: u8,
         proto: u8,
+        subclass: u8,
+        report_desc_len: u16,
         ep_addr: u8,
         mps: u16,
         interval: u8,
+        vid: u16,
+        pid: u16,
     ) -> DeviceResult<()> {
-        let mut real_proto = proto;
+        let real_proto =
+            self.classify_hid_iface(slot, iface, proto, subclass, report_desc_len, vid, pid)?;
         if real_proto == 0 {
-            // bInterfaceProtocol 0 = "None" (non-boot HID). In the QEMU target
-            // this is the `usb-tablet`, which reports *absolute* coordinates
-            // (buttons, X16, Y16, wheel). Routing it to HID_PROTO_MOUSE made the
-            // boot-mouse parser read the high byte of the absolute X as a
-            // relative dy (always ≥0), pinning the pointer to the top of the
-            // screen. Treat protocol-less HID pointers as the absolute tablet.
-            // Real boot mice/keyboards report protocol 2/1 and are unaffected.
-            real_proto = HID_PROTO_TABLET;
+            return Ok(());
         }
 
         let report_len = match real_proto {
             HID_PROTO_KEY => 8usize,
             HID_PROTO_MOUSE => 8usize, // Soportar ratones con más botones/ruedas (boot extendido)
-            // Read a full 8-byte report: the QEMU tablet's report is
-            // [buttons, X16, Y16, wheel] (6 bytes), but requesting only 6
-            // overruns the interrupt TRB and stalls the endpoint after the
-            // first report on devices whose wMaxPacketSize is 8 — the pointer
-            // would initialise at the centre and then freeze. 8 fits both.
+            // Read a full 8-byte report: QEMU is 6 bytes [buttons, X16, Y16,
+            // wheel]; VirtualBox is 8 bytes [buttons, dz, dw, pad, X16, Y16].
+            // Requesting only 6 overruns/truncates the VBox packet.
             HID_PROTO_TABLET => 8usize,
             _ => 8usize,
         };
@@ -2037,6 +2281,18 @@ impl XhciInner {
         }
         self.mmio.ring_db(slot, dci as u8);
 
+        // 80ee:0021 is VirtualBox's USB Tablet. QEMU usb-tablet is typically
+        // 0627:0001 and uses a different report layout (see dispatch_hid).
+        let vbox_tablet = real_proto == HID_PROTO_TABLET
+            && vid == VBOX_USB_TABLET_VID
+            && pid == VBOX_USB_TABLET_PID;
+        if vbox_tablet {
+            warn!(
+                "[xhci] VirtualBox USB Tablet on slot={} — abs report [btn,dz,dw,pad,X16,Y16]",
+                slot
+            );
+        }
+
         self.hids.push(HidDev {
             slot_id: slot,
             port_id: port,
@@ -2044,6 +2300,7 @@ impl XhciInner {
             ring_idx: ridx,
             protocol: real_proto,
             report_len,
+            vbox_tablet,
             bufs,
             dispatch_idx: 0,
             enqueue_idx: 0,
@@ -2051,6 +2308,10 @@ impl XhciInner {
             last_keys: [0; 6],
         });
         if real_proto == HID_PROTO_TABLET {
+            warn!(
+                "[xhci] absolute USB pointer slot={} vid={:04x} pid={:04x} — silencing PS/2 aux",
+                slot, vid, pid
+            );
             USB_ABS_POINTER.store(true, Ordering::Relaxed);
         }
         Ok(())
@@ -2101,134 +2362,147 @@ impl XhciInner {
                 h.last_keys = keys;
             }
             HID_PROTO_MOUSE if h.report_len >= 3 => {
-                let btn = tmp[0];
-                let dx = tmp[1] as i8 as i32;
-                let dy = tmp[2] as i8 as i32;
-                for (mask, code) in [
-                    (1u8, BTN_LEFT),
-                    (2u8, BTN_RIGHT),
-                    (4u8, BTN_MIDDLE),
-                    (8u8, BTN_SIDE),
-                    (16u8, BTN_EXTRA),
-                ] {
-                    let down = (btn & mask) != 0;
-                    let was = (h.last_mods & mask) != 0;
-                    if down != was {
-                        lis.trigger(InputEvent {
-                            event_type: InputEventType::Key,
-                            code,
-                            value: if down { 1 } else { 0 },
-                        });
+                if USB_ABS_POINTER.load(Ordering::Relaxed) {
+                    // A USB tablet already owns the pointer; relative HID mouse
+                    // packets would fight it the same way PS/2 aux does.
+                } else {
+                    let btn = tmp[0];
+                    let dx = tmp[1] as i8 as i32;
+                    let dy = tmp[2] as i8 as i32;
+                    for (mask, code) in [
+                        (1u8, BTN_LEFT),
+                        (2u8, BTN_RIGHT),
+                        (4u8, BTN_MIDDLE),
+                        (8u8, BTN_SIDE),
+                        (16u8, BTN_EXTRA),
+                    ] {
+                        let down = (btn & mask) != 0;
+                        let was = (h.last_mods & mask) != 0;
+                        if down != was {
+                            lis.trigger(InputEvent {
+                                event_type: InputEventType::Key,
+                                code,
+                                value: if down { 1 } else { 0 },
+                            });
+                        }
                     }
-                }
-                h.last_mods = btn;
-                if dx != 0 {
-                    lis.trigger(InputEvent {
-                        event_type: InputEventType::RelAxis,
-                        code: REL_X,
-                        value: dx,
-                    });
-                }
-                if dy != 0 {
-                    lis.trigger(InputEvent {
-                        event_type: InputEventType::RelAxis,
-                        code: REL_Y,
-                        // USB HID reports Y as down-positive, exactly the evdev
-                        // REL_Y convention libinput expects — emit as-is. (The
-                        // earlier `-dy` was copied from the PS/2 driver, where
-                        // +Y means up; under libinput it inverted the axis.)
-                        value: dy,
-                    });
-                }
-                if h.report_len >= 4 {
-                    let w = tmp[3] as i8 as i32;
-                    if w != 0 {
+                    h.last_mods = btn;
+                    if dx != 0 {
                         lis.trigger(InputEvent {
                             event_type: InputEventType::RelAxis,
-                            code: REL_WHEEL,
-                            value: -w,
+                            code: REL_X,
+                            value: dx,
                         });
                     }
-                }
-                if h.report_len >= 5 {
-                    let hw = tmp[4] as i8 as i32;
-                    if hw != 0 {
+                    if dy != 0 {
                         lis.trigger(InputEvent {
                             event_type: InputEventType::RelAxis,
-                            code: REL_HWHEEL,
-                            value: hw,
+                            code: REL_Y,
+                            // USB HID reports Y as down-positive, exactly the evdev
+                            // REL_Y convention libinput expects — emit as-is. (The
+                            // earlier `-dy` was copied from the PS/2 driver, where
+                            // +Y means up; under libinput it inverted the axis.)
+                            value: dy,
                         });
                     }
+                    if h.report_len >= 4 {
+                        let w = tmp[3] as i8 as i32;
+                        if w != 0 {
+                            lis.trigger(InputEvent {
+                                event_type: InputEventType::RelAxis,
+                                code: REL_WHEEL,
+                                value: -w,
+                            });
+                        }
+                    }
+                    if h.report_len >= 5 {
+                        let hw = tmp[4] as i8 as i32;
+                        if hw != 0 {
+                            lis.trigger(InputEvent {
+                                event_type: InputEventType::RelAxis,
+                                code: REL_HWHEEL,
+                                value: hw,
+                            });
+                        }
+                    }
+                    lis.trigger(InputEvent {
+                        event_type: InputEventType::Syn,
+                        code: SYN_REPORT,
+                        value: 0,
+                    });
                 }
-                lis.trigger(InputEvent {
-                    event_type: InputEventType::Syn,
-                    code: SYN_REPORT,
-                    value: 0,
-                });
             }
             HID_PROTO_TABLET if h.report_len >= 6 => {
-                // QEMU usb-tablet and VirtualBox USB Tablet share this layout:
-                // [buttons, X16, Y16, wheel?, hwheel?] with X/Y in 0..=32767.
-                // Emit ABS_X/ABS_Y (not REL deltas): converting to relative and
-                // clamping to ±127 made the guest pointer lag, jump, and lose
-                // sync with the host cursor. libinput maps the abs range onto
-                // the output using EVIOCGABS min/max.
-                let btn = tmp[0];
-                let ax = u16::from_le_bytes([tmp[1], tmp[2]]) as i32;
-                let ay = u16::from_le_bytes([tmp[3], tmp[4]]) as i32;
-                for (mask, code) in [
-                    (1u8, BTN_LEFT),
-                    (2u8, BTN_RIGHT),
-                    (4u8, BTN_MIDDLE),
-                    (8u8, BTN_SIDE),
-                    (16u8, BTN_EXTRA),
-                ] {
-                    let down = (btn & mask) != 0;
-                    let was = (h.last_mods & mask) != 0;
-                    if down != was {
-                        lis.trigger(InputEvent {
-                            event_type: InputEventType::Key,
-                            code,
-                            value: if down { 1 } else { 0 },
-                        });
+                // QEMU usb-tablet: [buttons, X16, Y16, wheel] (6–8 bytes).
+                // VirtualBox USB Tablet: [buttons, dz, dw, pad, X16, Y16]
+                // (UsbMouse.cpp USBHIDT_REPORT). X/Y are 0..=32767 in both.
+                // libinput maps that abs range onto the output via EVIOCGABS.
+                if !(h.vbox_tablet && n < 8) {
+                    let btn = tmp[0];
+                    let vbox = h.vbox_tablet;
+                    let (ax, ay, wheel, hwheel) = if vbox {
+                        (
+                            u16::from_le_bytes([tmp[4], tmp[5]]) as i32,
+                            u16::from_le_bytes([tmp[6], tmp[7]]) as i32,
+                            tmp[1] as i8 as i32,
+                            tmp[2] as i8 as i32,
+                        )
+                    } else {
+                        (
+                            u16::from_le_bytes([tmp[1], tmp[2]]) as i32,
+                            u16::from_le_bytes([tmp[3], tmp[4]]) as i32,
+                            if n >= 6 { tmp[5] as i8 as i32 } else { 0 },
+                            if n >= 7 { tmp[6] as i8 as i32 } else { 0 },
+                        )
+                    };
+                    for (mask, code) in [
+                        (1u8, BTN_LEFT),
+                        (2u8, BTN_RIGHT),
+                        (4u8, BTN_MIDDLE),
+                        (8u8, BTN_SIDE),
+                        (16u8, BTN_EXTRA),
+                    ] {
+                        let down = (btn & mask) != 0;
+                        let was = (h.last_mods & mask) != 0;
+                        if down != was {
+                            lis.trigger(InputEvent {
+                                event_type: InputEventType::Key,
+                                code,
+                                value: if down { 1 } else { 0 },
+                            });
+                        }
                     }
-                }
-                h.last_mods = btn;
-                lis.trigger(InputEvent {
-                    event_type: InputEventType::AbsAxis,
-                    code: ABS_X,
-                    value: ax,
-                });
-                lis.trigger(InputEvent {
-                    event_type: InputEventType::AbsAxis,
-                    code: ABS_Y,
-                    value: ay,
-                });
-                if n >= 6 {
-                    let w = tmp[5] as i8 as i32;
-                    if w != 0 {
+                    h.last_mods = btn;
+                    lis.trigger(InputEvent {
+                        event_type: InputEventType::AbsAxis,
+                        code: ABS_X,
+                        value: ax,
+                    });
+                    lis.trigger(InputEvent {
+                        event_type: InputEventType::AbsAxis,
+                        code: ABS_Y,
+                        value: ay,
+                    });
+                    if wheel != 0 {
                         lis.trigger(InputEvent {
                             event_type: InputEventType::RelAxis,
                             code: REL_WHEEL,
-                            value: -w,
+                            value: -wheel,
                         });
                     }
-                }
-                if n >= 7 {
-                    let hw = tmp[6] as i8 as i32;
-                    if hw != 0 {
+                    if hwheel != 0 {
                         lis.trigger(InputEvent {
                             event_type: InputEventType::RelAxis,
                             code: REL_HWHEEL,
-                            value: hw,
+                            value: hwheel,
                         });
                     }
+                    lis.trigger(InputEvent {
+                        event_type: InputEventType::Syn,
+                        code: SYN_REPORT,
+                        value: 0,
+                    });
                 }
-                lis.trigger(InputEvent {
-                    event_type: InputEventType::Syn,
-                    code: SYN_REPORT,
-                    value: 0,
-                });
             }
             _ => {}
         }
@@ -2776,6 +3050,14 @@ impl XhciUsbHid {
         Ok(arc)
     }
 
+    fn has_rel_mouse(&self) -> bool {
+        self.inner
+            .lock()
+            .as_ref()
+            .map(|xi| xi.hids.iter().any(|h| h.protocol == HID_PROTO_MOUSE))
+            .unwrap_or(false)
+    }
+
     fn has_tablet(&self) -> bool {
         self.inner
             .lock()
@@ -2808,9 +3090,13 @@ impl InputScheme for XhciUsbHid {
     fn capability(&self, cap_type: CapabilityType) -> InputCapability {
         let mut cap = InputCapability::empty();
         let tablet = self.has_tablet();
+        let rel_mouse = self.has_rel_mouse();
         match cap_type {
             CapabilityType::Event => {
-                cap.set_all(&[EV_SYN, EV_KEY, EV_REL]);
+                cap.set_all(&[EV_SYN, EV_KEY]);
+                if rel_mouse || tablet {
+                    cap.set(EV_REL);
+                }
                 if tablet {
                     cap.set(EV_ABS);
                 }
@@ -2830,9 +3116,17 @@ impl InputScheme for XhciUsbHid {
                 for code in KEY_ESC..=KEY_MICMUTE {
                     cap.set(code);
                 }
-                cap.set_all(&[BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA]);
+                if rel_mouse || tablet {
+                    cap.set_all(&[BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA]);
+                }
             }
-            CapabilityType::RelAxis => cap.set_all(&[REL_X, REL_Y, REL_WHEEL, REL_HWHEEL]),
+            CapabilityType::RelAxis => {
+                if tablet && !rel_mouse {
+                    cap.set_all(&[REL_WHEEL, REL_HWHEEL]);
+                } else if rel_mouse {
+                    cap.set_all(&[REL_X, REL_Y, REL_WHEEL, REL_HWHEEL]);
+                }
+            }
             CapabilityType::AbsAxis if tablet => cap.set_all(&[ABS_X, ABS_Y]),
             CapabilityType::InputProp if tablet => cap.set(INPUT_PROP_POINTER),
             _ => {}

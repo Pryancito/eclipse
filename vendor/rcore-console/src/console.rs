@@ -291,8 +291,14 @@ impl<T: TextBuffer> Handler for ConsoleInner<T> {
     #[inline]
     fn goto(&mut self, row: usize, col: usize) {
         trace!("Going to: line={}, col={}", row, col);
-        self.cursor.row = min(row, self.buf.height());
-        self.cursor.col = min(col, self.buf.width());
+        // height()/width() are counts, not last valid indices. Clamping to
+        // the count parks the cursor *past* the last cell (`write` then
+        // no-ops), which is what `\e[999;999H` (serial winsize probe) did:
+        // installer GOP looked hung with only the last kernel line visible.
+        let last_row = self.buf.height().saturating_sub(1);
+        let last_col = self.buf.width().saturating_sub(1);
+        self.cursor.row = min(row, last_row);
+        self.cursor.col = min(col, last_col);
     }
 
     #[inline]

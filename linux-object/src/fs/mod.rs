@@ -649,9 +649,13 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         v.into_iter().map(|(_, _, a)| a).collect()
     };
     if audio_cards.is_empty() {
-        error!(
+        // VirtualBox is configured with `--audio-driver none`; QEMU needs
+        // `-device intel-hda -device hda-output`. This is not a boot failure —
+        // do not log at error!: LOG=error paints it in red as the only GOP
+        // line and looks like a hang.
+        warn!(
             "[audio] no HDA codec probed — /dev/snd will be empty (aplay -l: no soundcards). \
-             In QEMU pass -device intel-hda -device hda-output; on hardware check dmesg for [hda]"
+             QEMU: -device intel-hda -device hda-output; VirtualBox: expected with audio-driver none"
         );
     }
 
@@ -800,6 +804,23 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                     warn!("failed to mknod /dev/dri/renderD128: {:?}", e);
                 } else {
                     debug!("[drm] /dev/dri/renderD128 created (render node)");
+                }
+                // Compute-only nodes: same GPU that auto_bringup_compute
+                // state-loads, advertised as driver name "eclipse-compute" so
+                // Mesa/NVK skip them. `ecl-compute` opens card1 (or
+                // renderD129). Created only when a non-console NVIDIA GPU
+                // exists; single-GPU (console-only) boxes stay at card0.
+                if devfs::drm::get_compute_driver().is_some() {
+                    if let Err(e) = dri_dev.add("card1", Arc::new(devfs::DrmDev::new(1))) {
+                        warn!("failed to mknod /dev/dri/card1: {:?}", e);
+                    } else {
+                        debug!("[drm] /dev/dri/card1 created (NVIDIA compute)");
+                    }
+                    if let Err(e) = dri_dev.add("renderD129", Arc::new(devfs::DrmDev::new(129))) {
+                        warn!("failed to mknod /dev/dri/renderD129: {:?}", e);
+                    } else {
+                        debug!("[drm] /dev/dri/renderD129 created (NVIDIA compute render)");
+                    }
                 }
                 // On the NVIDIA/nouveau experiment, dump which PCI device the
                 // render node backs onto: if it is not the RTX (vendor 0x10de),

@@ -17,6 +17,25 @@ struct MouseState {
     bytes: [u8; 3],
 }
 
+fn usb_tablet_owns_pointer() -> bool {
+    #[cfg(all(
+        any(feature = "xhci-usb-hid", feature = "legacy-usb-hid"),
+        not(feature = "mock"),
+        not(feature = "no-pci")
+    ))]
+    {
+        crate::usb::xhci_hid::usb_abs_pointer_active()
+    }
+    #[cfg(not(all(
+        any(feature = "xhci-usb-hid", feature = "legacy-usb-hid"),
+        not(feature = "mock"),
+        not(feature = "no-pci")
+    )))]
+    {
+        false
+    }
+}
+
 fn wait_write() -> bool {
     let mut status_port = Port::<u8>::new(0x64);
     let mut timeout = 100_000;
@@ -198,12 +217,7 @@ impl Scheme for Ps2Input {
                         // A USB tablet already owns the pointer (absolute).
                         // Emitting PS/2 relative packets on top makes the
                         // cursor jump in VirtualBox (`--mouse usbtablet`).
-                        #[cfg(all(
-                            any(feature = "xhci-usb-hid", feature = "legacy-usb-hid"),
-                            not(feature = "mock"),
-                            not(feature = "no-pci")
-                        ))]
-                        if crate::usb::xhci_hid::usb_abs_pointer_active() {
+                        if usb_tablet_owns_pointer() {
                             continue;
                         }
 
@@ -322,18 +336,25 @@ impl Scheme for Ps2Input {
 impl InputScheme for Ps2Input {
     fn capability(&self, cap_type: CapabilityType) -> InputCapability {
         let mut cap = InputCapability::empty();
+        // VirtualBox ICH9 still exposes i8042 even with `--mouse usbtablet`.
+        // If we advertise REL_X/Y + BTN_LEFT, libinput opens a second (silent)
+        // relative pointer that fights the USB tablet. Keyboard bits stay.
+        let tablet = usb_tablet_owns_pointer();
         match cap_type {
             CapabilityType::Event => {
                 cap.set(crate::input::input_event_codes::ev::EV_SYN);
                 cap.set(crate::input::input_event_codes::ev::EV_KEY);
-                cap.set(crate::input::input_event_codes::ev::EV_REL);
+                if !tablet {
+                    cap.set(crate::input::input_event_codes::ev::EV_REL);
+                }
             }
             CapabilityType::Key => {
-                for i in 0..0x120 {
+                let end = if tablet { 0x110 } else { 0x120 };
+                for i in 0..end {
                     cap.set(i);
                 }
             }
-            CapabilityType::RelAxis => {
+            CapabilityType::RelAxis if !tablet => {
                 cap.set(0); // REL_X
                 cap.set(1); // REL_Y
             }

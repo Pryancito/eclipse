@@ -291,16 +291,13 @@ impl INode for EventDev {
                 Ok(1)
             }
             // EVIOCGPROP: input properties bitmap. A USB tablet is a pointer
-            // (needs an on-screen cursor), not a direct touchscreen.
+            // (needs an on-screen cursor), not a direct touchscreen. Use the
+            // scheme's InputProp bits so this cannot drift from capability().
             0x09 => {
-                let mut bits = [0u8; 256];
-                let abs = self.input.capability(CapabilityType::AbsAxis);
-                if abs.contains(0) && abs.contains(1) {
-                    bits[0] |= 1; // INPUT_PROP_POINTER
-                }
-                let n = size.min(bits.len());
+                let bytes = self.input.capability(CapabilityType::InputProp).to_le_bytes();
+                let n = size.min(bytes.len());
                 let mut ptr = kernel_hal::user::UserOutPtr::<u8>::from(data);
-                user_copy(ptr.write_array(&bits[..n]))?;
+                user_copy(ptr.write_array(&bytes[..n]))?;
                 Ok(n)
             }
             // EVIOCGKEY / EVIOCGLED / EVIOCGSND / EVIOCGSW: report

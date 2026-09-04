@@ -548,10 +548,21 @@ image:
 ################ Deprecated ################
 
 VMDISK := $(build_path)/boot.vdi
+VBOX_GOP ?= 1920x1080
 
+# Live VirtualBox session (labwc), same initramfs as `make qemu`. The
+# distribution ISO is `desktop=none` + installer SFS (no Mesa); booting that
+# in VBox skips the compositor on purpose. Recopy the QEMU live image and
+# stamp `desktop=$(DESKTOP)` so a previous `make iso` cannot leave the ESP
+# on the installer cmdline.
 .PHONY: vbox
 vbox: build
-	@bash $(abspath ../scripts/vbox-eclipse.sh)
+	@test -f "$(INITRAMFS_IMG)" || (echo "falta $(INITRAMFS_IMG) — ejecuta make image"; exit 1)
+	@mkdir -p $(esp)/EFI/zCore $(esp)/EFI/Boot
+	@cp "$(INITRAMFS_IMG)" "$(esp)/EFI/zCore/initramfs.img"
+	@$(sed) 's#cmdline=.*#cmdline=$(CMDLINE)#' $(esp)/EFI/Boot/rboot.conf
+	@$(sed) 's#^resolution=.*#resolution=$(VBOX_GOP)#' $(esp)/EFI/Boot/rboot.conf
+	@bash $(abspath ../scripts/vbox-eclipse.sh) --live "$(abspath $(esp))"
 
 $(qemu_disk):
 ifeq ($(ARCH), riscv64)

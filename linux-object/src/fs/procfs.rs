@@ -14,7 +14,7 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 50] = [
+const PROC_ROOT_STATIC: [&str; 51] = [
     "net",
     "oops",
     "memhogs",
@@ -64,6 +64,7 @@ const PROC_ROOT_STATIC: [&str; 50] = [
     "gpusurvive",
     "gpucefill",
     "gpucefillp2p",
+    "gpuroles",
     "bootprofile",
 ];
 
@@ -448,6 +449,7 @@ impl INode for ProcRootINode {
             "gpusurvive" => Ok(PROC_GPUSURVIVE.clone()),
             "gpucefill" => Ok(PROC_GPUCEFILL.clone()),
             "gpucefillp2p" => Ok(PROC_GPUCEFILLP2P.clone()),
+            "gpuroles" => Ok(PROC_GPUROLES.clone()),
             "gpudump" => Ok(PROC_GPUDUMP.clone()),
             "bootprofile" => Ok(PROC_BOOTPROFILE.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
@@ -2437,6 +2439,31 @@ fn proc_gpudump_content() -> String {
     s
 }
 
+/// `/proc/gpuroles` — console vs compute NVIDIA GPUs, the DRM nodes each
+/// owns, and whether GSP-RM is attached. Pin with `nvidia.compute=BB.DD.F`.
+fn proc_gpuroles_content() -> String {
+    let mut s = String::new();
+    let pin = kernel_hal::boot::cmdline();
+    let pinned = pin.split([':', ' ', '\t', '\n']).find(|t| t.starts_with("nvidia.compute="));
+    if let Some(p) = pinned {
+        let _ = writeln!(s, "[gpuroles] cmdline pin: {p}");
+    } else {
+        let _ = writeln!(s, "[gpuroles] cmdline pin: (auto — first non-console NVIDIA GPU)");
+    }
+    let mut n = 0u32;
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        let line = d.gpu_role_line();
+        if !line.is_empty() {
+            n += 1;
+            s.push_str(&line);
+        }
+    }
+    if n == 0 {
+        s.push_str("[gpuroles] no NVIDIA DRM GPUs\n");
+    }
+    s
+}
+
 fn proc_cpuinfo_content() -> String {
     let mut brand = kernel_hal::cpu::cpu_brand();
     if brand.is_empty() {
@@ -2820,6 +2847,11 @@ lazy_static! {
     static ref PROC_GPUCEFILLP2P: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 106,
         generate: proc_gpucefillp2p_content,
+    });
+    /// `/proc/gpuroles` -- console vs compute NVIDIA GPU map.
+    static ref PROC_GPUROLES: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 107,
+        generate: proc_gpuroles_content,
     });
     /// `/proc/gpudump` -- read-only discriminating HW dump, both GPUs (see
     /// proc_gpudump_content).

@@ -5549,10 +5549,14 @@ unlock:
  *      buffer.  CeUtils resolves SYSMEM via the GMMU SYSMEM aperture
  *      (PCIe peer-DMA), no explicit BAR1/BAR2 mapping required.
  *
- * The copy is submitted ASYNC and completion-polled with a 100ms deadline
- * (see eclipse_ce_wait_bounded) so a wedged CE can never hang the machine.  No additional fence is needed for scanout
- * visibility: PCIe write-combine ordering guarantees the display engine
- * sees the updated bytes on its next line-fetch after the semaphore.
+ * The copy is submitted ASYNC. Completion is polled with a 100ms deadline
+ * by eclipse_rm_ce_wait (see eclipse_ce_wait_bounded) AFTER this function
+ * has dropped the RM API and GPU locks -- holding those locks across the
+ * poll starved TLB shootdowns and froze the desktop.  No additional fence
+ * is needed for scanout visibility: PCIe write-combine ordering guarantees
+ * the display engine sees the updated bytes on its next line-fetch after
+ * the semaphore. Memdescs stay alive in g_eclipseCeInflight until
+ * eclipse_rm_ce_release_inflight.
  *
  * Callers must ensure CPU writes to srcSysmemPa are visible before calling
  * (osFlushCpuWriteCombineBuffer if the dumb-buffer mapping is WC) -- this
@@ -5578,6 +5582,10 @@ unlock:
  * on the first poll.  Busy-poll with osSpinLoop (interrupt-friendly, pumps
  * TLB shootdowns) for the first ~500 µs, then osDelay for the remaining
  * budget up to 100 ms.
+ *
+ * MUST be called without the RM API lock or GPU lock. ceutilsUpdateProgress
+ * only reads the channel completion semaphore in sysmem; the locks are not
+ * required and holding them here is what made present freeze the machine.
  */
 static NV_STATUS eclipse_ce_wait_bounded(MemoryManager *pMemoryManager, NvU64 submittedWorkId)
 {
@@ -5618,11 +5626,58 @@ static NV_STATUS eclipse_ce_wait_bounded(MemoryManager *pMemoryManager, NvU64 su
     return NV_OK;
 }
 
+/*
+ * One in-flight CE blit. Present is a single thread, so one slot is enough.
+ * Memdescs are described (they do not own pages) and must stay live until
+ * the CE finishes DMA -- they are freed by eclipse_rm_ce_release_inflight
+ * after eclipse_rm_ce_wait, not by the submit path.
+ */
+typedef struct
+{
+    NvBool             busy;
+    NvU32              gpuInstance;
+    MEMORY_DESCRIPTOR *pSrc;
+    MEMORY_DESCRIPTOR *pDst;
+} ECLIPSE_CE_INFLIGHT;
+
+static ECLIPSE_CE_INFLIGHT g_eclipseCeInflight;
+
+static void eclipse_ce_inflight_free_locked(void)
+{
+    if (g_eclipseCeInflight.pDst != NULL)
+    {
+        memdescFree(g_eclipseCeInflight.pDst);
+        memdescDestroy(g_eclipseCeInflight.pDst);
+        g_eclipseCeInflight.pDst = NULL;
+    }
+    if (g_eclipseCeInflight.pSrc != NULL)
+    {
+        memdescFree(g_eclipseCeInflight.pSrc);
+        memdescDestroy(g_eclipseCeInflight.pSrc);
+        g_eclipseCeInflight.pSrc = NULL;
+    }
+    g_eclipseCeInflight.busy = NV_FALSE;
+}
+
+static void eclipse_ce_stash_locked(
+    NvU32 gpuInstance,
+    MEMORY_DESCRIPTOR *pSrc,
+    MEMORY_DESCRIPTOR *pDst)
+{
+    if (g_eclipseCeInflight.busy)
+        eclipse_ce_inflight_free_locked();
+    g_eclipseCeInflight.gpuInstance = gpuInstance;
+    g_eclipseCeInflight.pSrc = pSrc;
+    g_eclipseCeInflight.pDst = pDst;
+    g_eclipseCeInflight.busy = NV_TRUE;
+}
+
 NV_STATUS eclipse_rm_ce_blit(
     NvU32 gpuInstance,
     NvU64 dstFbVramOffset,
     NvU64 srcSysmemPa,
-    NvU64 size)
+    NvU64 size,
+    NvU64 *pWorkId)
 {
     OBJGPU            *pGpu;
     MemoryManager     *pMemoryManager;
@@ -5633,8 +5688,9 @@ NV_STATUS eclipse_rm_ce_blit(
     THREAD_STATE_NODE  threadState;
     GPU_MASK           gpusLockedMask  = 0;
 
-    if (size == 0)
+    if (size == 0 || pWorkId == NULL)
         return NV_ERR_INVALID_ARGUMENT;
+    *pWorkId = 0;
 
     threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
 
@@ -5712,16 +5768,21 @@ NV_STATUS eclipse_rm_ce_blit(
     params.srcOffset   = 0;
     params.dstOffset   = 0;
     params.length      = size;
-    params.flags       = NV0050_CTRL_MEMCOPY_FLAGS_ASYNC; /* bounded poll below */
+    params.flags       = NV0050_CTRL_MEMCOPY_FLAGS_ASYNC; /* wait outside locks */
     status = ceutilsMemcopy(pMemoryManager->pCeUtils, &params);
     if (status == NV_OK)
-        status = eclipse_ce_wait_bounded(pMemoryManager, params.submittedWorkId);
+    {
+        *pWorkId = params.submittedWorkId;
+        eclipse_ce_stash_locked(gpuInstance, pSrcMemDesc, pDstMemDesc);
+        pSrcMemDesc = NULL;
+        pDstMemDesc = NULL;
+    }
     {
         static NvU32 s_n = 0;
         NvU32 n = ++s_n;
         if (status != NV_OK || n <= 2 || (n % 64U) == 0)
-            nv_printf(0, "[eclipse-rm-trace] ce_blit: ceutilsMemcopy(src_pa=0x%llx dst_vram=0x%llx size=0x%llx) -> 0x%x\n",
-                      srcSysmemPa, dstFbVramOffset, size, status);
+            nv_printf(0, "[eclipse-rm-trace] ce_blit: ceutilsMemcopy(src_pa=0x%llx dst_vram=0x%llx size=0x%llx) -> 0x%x workId=%llu\n",
+                      srcSysmemPa, dstFbVramOffset, size, status, (unsigned long long)*pWorkId);
     }
 
 cleanup:
@@ -5972,7 +6033,8 @@ NV_STATUS eclipse_rm_ce_blit_p2p(
     NvU32 gpuInstance,
     NvU64 dstHostPa,
     NvU64 srcSysmemPa,
-    NvU64 size)
+    NvU64 size,
+    NvU64 *pWorkId)
 {
     OBJGPU            *pGpu;
     MemoryManager     *pMemoryManager;
@@ -5983,8 +6045,9 @@ NV_STATUS eclipse_rm_ce_blit_p2p(
     THREAD_STATE_NODE  threadState;
     GPU_MASK           gpusLockedMask = 0;
 
-    if (size == 0)
+    if (size == 0 || pWorkId == NULL)
         return NV_ERR_INVALID_ARGUMENT;
+    *pWorkId = 0;
 
     threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
 
@@ -6057,10 +6120,15 @@ NV_STATUS eclipse_rm_ce_blit_p2p(
     params.srcOffset   = 0;
     params.dstOffset   = 0;
     params.length      = size;
-    params.flags       = NV0050_CTRL_MEMCOPY_FLAGS_ASYNC; /* bounded poll below */
+    params.flags       = NV0050_CTRL_MEMCOPY_FLAGS_ASYNC; /* wait outside locks */
     status = ceutilsMemcopy(pMemoryManager->pCeUtils, &params);
     if (status == NV_OK)
-        status = eclipse_ce_wait_bounded(pMemoryManager, params.submittedWorkId);
+    {
+        *pWorkId = params.submittedWorkId;
+        eclipse_ce_stash_locked(gpuInstance, pSrcMemDesc, pDstMemDesc);
+        pSrcMemDesc = NULL;
+        pDstMemDesc = NULL;
+    }
     /* Per-frame serial traces cost ~10 ms at 115200 baud and themselves
      * steal the 60 Hz budget. Log the first two plus every 64th; errors
      * always print (status != NV_OK). */
@@ -6068,8 +6136,8 @@ NV_STATUS eclipse_rm_ce_blit_p2p(
         static NvU32 s_n = 0;
         NvU32 n = ++s_n;
         if (status != NV_OK || n <= 2 || (n % 64U) == 0)
-            nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p: ceutilsMemcopy(src=0x%llx dst_host=0x%llx size=0x%llx) -> 0x%x\n",
-                      srcSysmemPa, dstHostPa, size, status);
+            nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p: ceutilsMemcopy(src=0x%llx dst_host=0x%llx size=0x%llx) -> 0x%x workId=%llu\n",
+                      srcSysmemPa, dstHostPa, size, status, (unsigned long long)*pWorkId);
     }
 
 cleanup:
@@ -6252,8 +6320,10 @@ static NV_STATUS eclipse_ce_submit_pitched_2d(
  * source buffer (fast cached PCIe DMA) and writes to the console GPU's BAR1
  * (fast GPU-initiated PCIe writes), even when src and dst pitches differ.
  *
- * One ASYNC CE launch, then eclipse_ce_wait_bounded (100 ms deadline).
- * Never a synchronous RM wait, never a per-row ceutilsMemcopy loop.
+ * One ASYNC CE launch. Caller waits with eclipse_rm_ce_wait (100 ms
+ * deadline) after dropping RM locks -- never a synchronous RM wait, never
+ * a per-row ceutilsMemcopy loop. No memdescs to stash: the 2D path pushes
+ * physical addresses directly.
  */
 NV_STATUS eclipse_rm_ce_blit_p2p_2d(
     NvU32 gpuInstance,
@@ -6262,7 +6332,8 @@ NV_STATUS eclipse_rm_ce_blit_p2p_2d(
     NvU64 srcSysmemPa,
     NvU32 srcPitch,
     NvU32 rowBytes,
-    NvU32 lineCount)
+    NvU32 lineCount,
+    NvU64 *pWorkId)
 {
     OBJGPU            *pGpu;
     MemoryManager     *pMemoryManager;
@@ -6271,6 +6342,9 @@ NV_STATUS eclipse_rm_ce_blit_p2p_2d(
     GPU_MASK           gpusLockedMask = 0;
     NvU64              lastWorkId     = 0;
 
+    if (pWorkId == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+    *pWorkId = 0;
     if (rowBytes == 0 || lineCount == 0)
         return NV_ERR_INVALID_ARGUMENT;
     if (rowBytes > srcPitch || rowBytes > dstPitch)
@@ -6330,7 +6404,7 @@ NV_STATUS eclipse_rm_ce_blit_p2p_2d(
                                           rowBytes, lineCount,
                                           &lastWorkId);
     if (status == NV_OK)
-        status = eclipse_ce_wait_bounded(pMemoryManager, lastWorkId);
+        *pWorkId = lastWorkId;
 
     /* Rate-limit: this ran every present and a ~120-char serial line is
      * ~10 ms — enough to turn a 60 Hz present into 30 Hz by itself. */
@@ -6348,6 +6422,110 @@ unlock:
     gpumgrThreadDisableExpandedGpuVisibility();
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
     return status;
+}
+
+/*
+ * Poll a submitted ASYNC CE copy. NO RM API lock, NO GPU lock -- see
+ * eclipse_ce_wait_bounded. The Rust RmGate must also be dropped around this
+ * call so NVK GEM_NEW can enter the RM while present waits for DMA.
+ */
+NV_STATUS eclipse_rm_ce_wait(NvU32 gpuInstance, NvU64 submittedWorkId)
+{
+    OBJGPU        *pGpu;
+    MemoryManager *pMemoryManager;
+    NV_STATUS      status;
+    THREAD_STATE_NODE threadState;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pGpu = gpumgrGetGpu(gpuInstance);
+    if (pGpu == NULL || !pGpu->gspRmInitialized || !pGpu->bStateLoaded)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
+    }
+
+    pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
+    if (pMemoryManager == NULL || pMemoryManager->pCeUtils == NULL)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return NV_ERR_OBJECT_NOT_FOUND;
+    }
+
+    status = eclipse_ce_wait_bounded(pMemoryManager, submittedWorkId);
+
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
+}
+
+/*
+ * Free memdescs stashed by a successful eclipse_rm_ce_blit / _p2p submit.
+ * Call AFTER eclipse_rm_ce_wait. Takes RM locks (short). No-op if nothing
+ * is in flight (the 2D path has no memdescs).
+ */
+NV_STATUS eclipse_rm_ce_release_inflight(void)
+{
+    OBJGPU           *pGpu;
+    NV_STATUS         status;
+    THREAD_STATE_NODE threadState;
+    GPU_MASK          gpusLockedMask = 0;
+    NvU32             gpuInstance;
+
+    if (!g_eclipseCeInflight.busy)
+        return NV_OK;
+
+    gpuInstance = g_eclipseCeInflight.gpuInstance;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pGpu = gpumgrGetGpu(gpuInstance);
+    if (pGpu == NULL)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return NV_ERR_INVALID_STATE;
+    }
+
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    status = rmGpuGroupLockAcquire(pGpu->gpuInstance, GPU_LOCK_GRP_SUBDEVICE,
+                                   GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT,
+                                   &gpusLockedMask);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    eclipse_ce_inflight_free_locked();
+
+    rmGpuGroupLockRelease(gpusLockedMask, GPUS_LOCK_FLAGS_NONE);
+    rmapiLockRelease();
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return NV_OK;
 }
 
 /*

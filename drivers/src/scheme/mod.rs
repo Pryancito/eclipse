@@ -25,7 +25,9 @@ use alloc::sync::Arc;
 pub use audio::AudioScheme;
 pub use block::BlockScheme;
 pub use display::{set_scanout_mirror_x, DisplayScheme};
-pub use drm::DrmScheme;
+pub use drm::{
+    ComputeLaunchResult, DrmScheme, COMPUTE_OP_BENCH, COMPUTE_OP_INFO, COMPUTE_OP_SAXPY,
+};
 pub use event::EventScheme;
 pub use input::{AbsInfo, InputScheme};
 pub use irq::{IrqHandler, IrqScheme};

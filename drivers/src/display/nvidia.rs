@@ -479,14 +479,14 @@ fn rm_core_init_once() -> u32 {
 /// then confirms the desktop is being composited by the copy engine).
 static CE_PRESENT_LOGGED: AtomicBool = AtomicBool::new(false);
 
-/// Latched when a CE-offload present returns a failure status. The CE copy is
-/// synchronous and runs under the RM gate, so a faulting or hung
-/// `ceutilsMemcopy` (a P2P write the GMMU can't map, an ACS-blocked peer DMA)
-/// would repeat every frame and could freeze the whole desktop by holding the
-/// gate. Once latched, `ce_present` stands down immediately and the proven CPU
-/// blit takes over for the rest of the boot -- one loud failure line, then a
-/// stable fallback instead of a wedge. This is what makes `nvidia.cepresent`
-/// safe to switch on for a real-hardware test.
+/// Latched when a CE-offload present returns a failure status. Submit is
+/// under the RM gate; the completion poll is not. A faulting or hung CE
+/// (a P2P write the GMMU can't map, an ACS-blocked peer DMA, a 100 ms
+/// timeout) would still be a bad per-frame tax. Once latched, `ce_present`
+/// stands down immediately and the proven CPU blit takes over for the rest
+/// of the boot -- one loud failure line, then a stable fallback instead of
+/// a wedge. This is what makes `nvidia.cepresent` safe to switch on for a
+/// real-hardware test.
 static CE_PRESENT_WEDGED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy)]
@@ -3427,6 +3427,24 @@ impl DisplayScheme for NvidiaGpu {
     }
 }
 
+/// Pull `elapsed: N ns` out of a `/proc/gpubench` report. 0 if absent.
+fn parse_gpubench_elapsed_ns(report: &str) -> u64 {
+    for line in report.lines() {
+        let Some(rest) = line.split("elapsed:").nth(1) else {
+            continue;
+        };
+        let digits = rest
+            .trim()
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap_or("");
+        if let Ok(n) = digits.parse() {
+            return n;
+        }
+    }
+    0
+}
+
 impl DrmScheme for NvidiaGpu {
     fn pci_bdf(&self) -> Option<(u32, u8, u8, u8)> {
         // RM only ever drives function 0 of the GPU (see `cfg_loc`).
@@ -3435,6 +3453,115 @@ impl DrmScheme for NvidiaGpu {
 
     fn is_console_gpu(&self) -> bool {
         self.drives_boot_display()
+    }
+
+    fn is_compute_gpu(&self) -> bool {
+        !self.drives_boot_display()
+    }
+
+    fn gpu_role_line(&self) -> String {
+        let role = if self.drives_boot_display() {
+            "console"
+        } else {
+            "compute"
+        };
+        let rm = if self.rm_device_instance.lock().is_some() {
+            "rm=ready"
+        } else {
+            "rm=cold"
+        };
+        let nodes = if self.drives_boot_display() {
+            "(GOP scanout; GSP not auto-booted)"
+        } else {
+            "nodes=/dev/dri/card0,/dev/dri/card1,/dev/dri/renderD128,/dev/dri/renderD129"
+        };
+        alloc::format!(
+            "{:02x}:{:02x}.0 {} role={} {} {}\n",
+            self.pci_bus,
+            self.pci_device,
+            self.gpu_model,
+            role,
+            rm,
+            nodes
+        )
+    }
+
+    fn compute_launch(&self, op: u32) -> crate::scheme::drm::ComputeLaunchResult {
+        use crate::scheme::drm::{
+            ComputeLaunchResult, COMPUTE_OP_BENCH, COMPUTE_OP_INFO, COMPUTE_OP_SAXPY,
+        };
+        if self.drives_boot_display() {
+            return ComputeLaunchResult {
+                status: -19, // -ENODEV: console GPU is not the compute device
+                elapsed_ns: 0,
+                grid_threads: 0,
+                report: alloc::format!(
+                    "GPU {:02x}:{:02x}.0 is the console GPU — compute lives on the secondary\n",
+                    self.pci_bus,
+                    self.pci_device
+                ),
+            };
+        }
+        match op {
+            COMPUTE_OP_INFO => {
+                let ready = self.rm_device_instance.lock().is_some();
+                let nvk_uapi = if super::nouveau_uapi_enabled() {
+                    "on"
+                } else {
+                    "off"
+                };
+                let exec_fast = if super::exec_fast_enabled() {
+                    "on"
+                } else {
+                    "off"
+                };
+                ComputeLaunchResult {
+                    status: if ready { 0 } else { -19 },
+                    elapsed_ns: 0,
+                    grid_threads: 0,
+                    report: alloc::format!(
+                        "{}nouveau_uapi={nvk_uapi}\nexec_fast={exec_fast}\n\
+                         nvk_compute=/dev/dri/card0 (nouveau); this ioctl is eclipse-compute \
+                         (Mesa skips card1)\n",
+                        self.gpu_role_line()
+                    ),
+                }
+            }
+            COMPUTE_OP_SAXPY => {
+                // Channel ladder is idempotent; boot auto-bringup may already
+                // have run it. Doing it here means `ecl-compute saxpy` works
+                // even with `nvidia.noautoboot`.
+                let _ = self.bringup_step16();
+                let _ = self.bringup_step17();
+                let report = self.bringup_step23();
+                let ok = report.contains("LOAD-COMPUTE-STORE PROVEN");
+                ComputeLaunchResult {
+                    status: if ok { 0 } else { 5 },
+                    elapsed_ns: 0,
+                    grid_threads: 32,
+                    report,
+                }
+            }
+            COMPUTE_OP_BENCH => {
+                let _ = self.bringup_step16();
+                let _ = self.bringup_step17();
+                let report = self.bringup_bench();
+                let ok = report.contains("GIOPS");
+                let elapsed_ns = parse_gpubench_elapsed_ns(&report);
+                ComputeLaunchResult {
+                    status: if ok { 0 } else { 5 },
+                    elapsed_ns,
+                    grid_threads: 0,
+                    report,
+                }
+            }
+            _ => ComputeLaunchResult {
+                status: -22, // -EINVAL
+                elapsed_ns: 0,
+                grid_threads: 0,
+                report: alloc::format!("unknown compute op {op}\n"),
+            },
+        }
     }
 
     /// This is the driver that serves the nouveau-compatible ioctls (see
@@ -4647,9 +4774,15 @@ impl DrmScheme for NvidiaGpu {
         let _ = self.bringup_step6();
         let _ = self.bringup_step8();
         let _ = self.bringup_step9();
+        // Compute channel (TSG + GPFIFO + TURING_COMPUTE_A). Idempotent; the
+        // same ladder CHANNEL_ALLOC/NVK reuse. Running it here means
+        // `ecl-compute saxpy` and the first GL client do not pay the ~500 ms
+        // RM alloc on first touch.
+        let _ = self.bringup_step16();
+        let _ = self.bringup_step17();
         if self.rm_device_instance.lock().is_some() {
             alloc::format!(
-                "GPU {:02x}:{:02x}.0 {} listo — aceleración de present activada (compute/P2P)",
+                "GPU {:02x}:{:02x}.0 {} listo — present CE/P2P + canal de cómputo (card1)",
                 self.pci_bus,
                 self.pci_device,
                 self.gpu_model,
@@ -4838,8 +4971,8 @@ impl DrmScheme for NvidiaGpu {
         } else {
             // Confirmed failure. Name it, replay the RM trace, and LATCH OFF so
             // the desktop degrades to the CPU blit instead of repeating a
-            // faulting/hung CE op every frame (which, under the RM gate, is what
-            // froze the desktop before). One diagnostic burst, then stable.
+            // faulting/hung CE op every frame. The wait is outside RmGate now,
+            // but a wedged CE is still abandoned for the rest of the boot.
             CE_PRESENT_WEDGED.store(true, Ordering::Relaxed);
             crate::klog_warn!(
                 "[NVIDIA] CE-offload present FAILED ({}): ceutilsMemcopy status={:#x} (src={:#x} dst_fb={:#x} size={:#x}) in {}us -- latching OFF, CPU blit for the rest of this boot",
@@ -9679,10 +9812,10 @@ impl NvidiaGpu {
                 if body_len - MB < core::mem::size_of::<nv::NvDeviceInfoV0>() {
                     return Err(nv::EINVAL);
                 }
-                // Report the board's REAL VRAM size, but back every
-                // allocation with CPU-visible sysmem (see GEM_NEW's forced
-                // `sysmem = true`). This threads the needle the pure zero-VRAM
-                // model could not:
+                // Report the board's REAL VRAM size. GEM_NEW honours a VRAM-only
+                // request as `NV01_MEMORY_LOCAL_USER`; GART and GART|VRAM stay
+                // CPU-visible sysmem (see GEM_NEW). This threads the needle the
+                // pure zero-VRAM model could not:
                 //
                 //   * Zero-VRAM (ram_user=0) made NVK advertise a SINGLE
                 //     sysmem type HOST_VISIBLE|HOST_COHERENT|HOST_CACHED with
@@ -9702,13 +9835,9 @@ impl NvidiaGpu {
                 // The old danger -- advertising VRAM made the swapchain land
                 // in true VRAM, gem_map_cpu published the FB OFFSET as a host
                 // address, and userspace rendered into LOW KERNEL RAM (the
-                // vmar-teardown deadlock) -- is gone because GEM_NEW no longer
-                // honours the VRAM bit: it allocates sysmem unconditionally, so
-                // gem_map_cpu only ever sees ADDR_SYSMEM and publishes a real
-                // host PA. Slower (the GPU reads render targets over PCIe) but
-                // every byte is CPU-reachable, which is what the CPU-blit
-                // present path needs. A true BAR1 path can reclaim real VRAM
-                // for device-local-only objects later.
+                // vmar-teardown deadlock) -- is gone because GART|VRAM stays
+                // sysmem (HOST_VISIBLE) and VRAM-only LOCAL never publishes a
+                // CPU map. Present/scanout remains CREATE_DUMB sysmem.
                 // Floor a 0 (device-id not in identify_gpu) like GETPARAM_FB_SIZE
                 // does — NVIF device INFO is the OTHER VRAM size NVK reads, and a
                 // 0 here is the same empty-heap NULL walk. See effective_vram_mb.
@@ -11217,8 +11346,8 @@ impl NvidiaGpu {
                 // `nouveau_ws_bo_new_tiled` return NULL and vkCreateDevice die
                 // with VK_ERROR_OUT_OF_DEVICE_MEMORY -- which only became
                 // visible once VM_BIND started working and NVK got far enough
-                // to want host memory. VRAM wins if both bits are set, like
-                // nouveau's own preference order.
+                // to want host memory. If both bits are set we keep GART
+                // (CPU-visible sysmem); VRAM-only is real LOCAL.
                 let want_vram = req.info.domain & nv::NOUVEAU_GEM_DOMAIN_VRAM != 0;
                 let want_gart = req.info.domain & nv::NOUVEAU_GEM_DOMAIN_GART != 0;
                 if !want_vram && !want_gart {
@@ -11240,19 +11369,14 @@ impl NvidiaGpu {
                 // real fix for a genuinely-compressed surface is comptag/PLC
                 // support. `record_gem_new` still notes the kind for
                 // /proc/gpudbg.
-                // Back EVERY object with CPU-visible sysmem, even a VRAM/LOCAL
-                // request. NVK asks for a `GART | VRAM` domain for its
-                // DEVICE_LOCAL types (nvkmd_nouveau_mem.c) -- GART is always
-                // allowed -- so honouring the VRAM bit is optional, and placing
-                // the object in true VRAM would make it un-CPU-mappable
-                // (gem_map_cpu refuses FBMEM) and re-open the "userspace renders
-                // into low kernel RAM" hole. Sysmem keeps it reachable by the
-                // CPU-blit present path and by dma-buf export. The VRAM size is
-                // advertised (NVIF INFO) only so NVK exposes a DEVICE_LOCAL
-                // memory type wlroots requires; the backing store is always
-                // host RAM until a real BAR1 path exists.
-                let sysmem = true;
-                let _ = want_gart;
+                // Honour VRAM-only as true LOCAL (`NV01_MEMORY_LOCAL_USER`).
+                // GART, or GART|VRAM (NVK DEVICE_LOCAL|HOST_VISIBLE maps to
+                // that), stays sysmem so gem_map_cpu can publish a host PA.
+                // VRAM-only is DEVICE_LOCAL without HOST_VISIBLE: map_handle=0,
+                // never publish the FBMEM offset as a CPU address (that hole
+                // let userspace paint into low kernel RAM). Present/scanout
+                // stays on CREATE_DUMB sysmem; no BAR1 path is required here.
+                let sysmem = want_gart || !want_vram;
                 if req.info.size == 0 || req.info.size > u32::MAX as u64 {
                     return Err(nv::EINVAL);
                 }
@@ -11282,52 +11406,46 @@ impl NvidiaGpu {
                             return Err(nv::ENOMEM);
                         }
                     };
-                let handle = self.nouveau_gem_next_handle.fetch_add(1, Ordering::Relaxed);
-                // Real BAR1-relative CPU physical address for this
-                // allocation, if RM will give us one. Failure here doesn't
-                // fail GEM_NEW itself: the object is still valid for
-                // VM_BIND/EXEC, just not CPU-mmap-able, exactly like real
-                // nouveau leaves map_handle absent for some domains.
-                let phys_addr = match nvidia_rm_sys::rm_init::gem_map_cpu(
-                    device_instance,
-                    alloc.h_memory,
-                ) {
-                    // ADDR_FBMEM (2), not 0. `memdescGetAddressSpace` returns
-                    // the aperture the object lives in, and VRAM is ADDR_FBMEM;
-                    // 0 is ADDR_UNKNOWN. Requiring 0 here rejected EVERY valid
-                    // VRAM allocation, so `map_handle` came back 0, mesa's
-                    // `mmap(fd, ..., bo->map_handle)` had nothing to resolve and
-                    // vkCreateDevice died with VK_ERROR_MEMORY_MAP_FAILED. The C
-                    // side already refuses anything that is not ADDR_FBMEM (it
-                    // sets lookup_status = NV_ERR_NOT_SUPPORTED), so this is
-                    // belt-and-braces on a value it has already validated.
-                    // ADDR_FBMEM (2) for VRAM, ADDR_SYSMEM (1) for GART --
-                    // never 0, which is ADDR_UNKNOWN. The C side already
-                    // refuses anything else, and refuses a non-contiguous
-                    // sysmem object (one physical address cannot describe a
-                    // scattered allocation), so this is belt-and-braces on
-                    // values it has validated.
-                    Ok(m)
-                        if m.lookup_status == 0
-                            && (m.address_space == nvidia_rm_sys::rm_init::ADDR_FBMEM
-                                || m.address_space == nvidia_rm_sys::rm_init::ADDR_SYSMEM) =>
-                    {
-                        Some(m.phys_addr)
+                if !sysmem {
+                    static FIRST_VRAM_GEM: AtomicBool = AtomicBool::new(false);
+                    if !FIRST_VRAM_GEM.swap(true, Ordering::Relaxed) {
+                        crate::klog_info!(
+                            "[nouveau-uapi] GEM_NEW: first VRAM-only LOCAL alloc size={} hMemory={:#010x}",
+                            req.info.size,
+                            alloc.h_memory
+                        );
                     }
-                    Ok(m) => {
-                        crate::klog_warn!(
+                }
+                let handle = self.nouveau_gem_next_handle.fetch_add(1, Ordering::Relaxed);
+                // Real host physical address for sysmem/GART objects. VRAM-only
+                // (ADDR_FBMEM) is not CPU-mmap-able: gem_map_cpu refuses FBMEM
+                // because memdescGetPhysAddr(AT_CPU) is a VRAM offset, not BAR1.
+                // Skipping the lookup avoids a NOT_SUPPORTED trace per LOCAL BO.
+                let phys_addr = if sysmem {
+                    match nvidia_rm_sys::rm_init::gem_map_cpu(device_instance, alloc.h_memory) {
+                        Ok(m)
+                            if m.lookup_status == 0
+                                && m.address_space == nvidia_rm_sys::rm_init::ADDR_SYSMEM =>
+                        {
+                            Some(m.phys_addr)
+                        }
+                        Ok(m) => {
+                            crate::klog_warn!(
                             "[nouveau-uapi] GEM_NEW handle={}: gem_map_cpu lookup_status={:#x} address_space={} -- not CPU-mmap-able",
                             handle, m.lookup_status, m.address_space
                         );
-                        None
-                    }
-                    Err(status) => {
-                        crate::klog_warn!(
+                            None
+                        }
+                        Err(status) => {
+                            crate::klog_warn!(
                             "[nouveau-uapi] GEM_NEW handle={}: gem_map_cpu failed, NV_STATUS={:#x} -- not CPU-mmap-able",
                             handle, status
                         );
-                        None
+                            None
+                        }
                     }
+                } else {
+                    None
                 };
                 let map_handle = if let Some(pa) = phys_addr {
                     crate::scheme::gem_mmap::register(handle, pa, req.info.size);
@@ -11335,12 +11453,18 @@ impl NvidiaGpu {
                 } else {
                     0
                 };
+                let used_domain = if sysmem {
+                    nv::NOUVEAU_GEM_DOMAIN_GART
+                } else {
+                    nv::NOUVEAU_GEM_DOMAIN_VRAM
+                };
                 self.nouveau_gem.lock().push(nv::NouveauGemObject {
                     handle,
                     h_memory: alloc.h_memory,
                     owner_pid,
                     size: req.info.size,
                     phys_addr,
+                    domain: used_domain,
                     // Remember what was asked for so GEM_INFO round-trips it.
                     // The allocation itself is linear; a non-zero PTE kind is
                     // programmed (or refused) at VM_BIND time, which is where
@@ -11351,20 +11475,17 @@ impl NvidiaGpu {
                 // Feed the /proc/gpudbg memory summary. `req.info.domain` is
                 // still the client's REQUEST here (overwritten to the domain
                 // actually used a few lines below); phys_addr.is_some() means a
-                // CPU-mmap-able BAR1 address resolved for it.
+                // CPU-mmap-able host PA resolved for it.
                 super::nouveau_uapi::record_gem_new(
                     req.info.domain,
                     phys_addr.is_some(),
                     req.info.tile_flags,
+                    !sysmem,
                 );
                 req.info.handle = handle;
                 // Report the domain actually used, not the one requested:
                 // mesa reads this back to decide where the object lives.
-                req.info.domain = if sysmem {
-                    nv::NOUVEAU_GEM_DOMAIN_GART
-                } else {
-                    nv::NOUVEAU_GEM_DOMAIN_VRAM
-                };
+                req.info.domain = used_domain;
                 // Unbound until VM_BIND MAPs it -- GPU VA and the CPU mmap
                 // offset above are independent in real nouveau too.
                 req.info.offset = 0;
@@ -11386,7 +11507,7 @@ impl NvidiaGpu {
                 // Scoped and dropped before touching nouveau_vm_mappings
                 // below -- same discipline VM_BIND's own MAP op follows,
                 // so the two locks are never held nested in either order.
-                let (size, phys_addr, obj_tile_mode, obj_tile_flags) = {
+                let (size, phys_addr, obj_tile_mode, obj_tile_flags, obj_domain) = {
                     let gem = self.nouveau_gem.lock();
                     let Some(obj) = gem.iter().find(|o| o.handle == req.handle) else {
                         // [dmabuf-diag] error!-visible: NVK runs GEM_INFO on the
@@ -11403,7 +11524,13 @@ impl NvidiaGpu {
                         );
                         return Err(nv::ENOENT);
                     };
-                    (obj.size, obj.phys_addr, obj.tile_mode, obj.tile_flags)
+                    (
+                        obj.size,
+                        obj.phys_addr,
+                        obj.tile_mode,
+                        obj.tile_flags,
+                        obj.domain,
+                    )
                 };
                 // GPU VA, if VM_BIND has mapped this object -- bookkeeping
                 // independent from nouveau_gem, same as VM_BIND itself.
@@ -11422,15 +11549,9 @@ impl NvidiaGpu {
                     offset,
                     map_handle
                 );
-                // VRAM here vs GART from GEM_NEW is deliberate, not an
-                // oversight: GEM_INFO is what NVK runs on a PRIME-imported
-                // handle, and reporting the ADVERTISED memory model (NVIF INFO
-                // claims real VRAM so wlroots finds a DEVICE_LOCAL type) keeps
-                // the imported BO's flags device-local -- consistent with the
-                // types the importer allocates from. The backing is still
-                // CPU-visible sysmem either way (GEM_NEW's forced `sysmem`),
-                // and this exact combination is the one validated on the RTX.
-                req.domain = nv::NOUVEAU_GEM_DOMAIN_VRAM;
+                // Honour the backing: GART objects are HOST_VISIBLE sysmem,
+                // VRAM-only objects are DEVICE_LOCAL without a CPU map.
+                req.domain = obj_domain;
                 req.size = size;
                 req.offset = offset;
                 req.map_handle = map_handle;

@@ -354,6 +354,76 @@ pub fn get_primary_driver() -> Option<Arc<dyn DrmScheme>> {
     DRM_STATE.lock().drivers.first().cloned()
 }
 
+/// DRM minor of the compute-only primary node (`/dev/dri/card1`).
+pub const COMPUTE_CARD_MINOR: u32 = 1;
+/// DRM minor of the compute-only render node (`/dev/dri/renderD129`).
+pub const COMPUTE_RENDER_MINOR: u32 = 129;
+
+pub fn is_compute_minor(minor: u32) -> bool {
+    minor == COMPUTE_CARD_MINOR || minor == COMPUTE_RENDER_MINOR
+}
+
+/// `nvidia.compute=BB.DD.F` on the kernel cmdline (hex, dots — the cmdline
+/// already uses `:` as its token separator, so a PCI BDF with colons cannot
+/// be a single token). Example: `nvidia.compute=65.00.0`.
+fn parse_nvidia_compute_bdf() -> Option<(u8, u8, u8)> {
+    let cmdline = kernel_hal::boot::cmdline();
+    for tok in cmdline.split([':', ' ', '\t', '\n']) {
+        let Some(rest) = tok.strip_prefix("nvidia.compute=") else {
+            continue;
+        };
+        if rest.is_empty() {
+            continue;
+        }
+        let mut parts = rest.split('.');
+        let bus = u8::from_str_radix(parts.next()?, 16).ok()?;
+        let dev = u8::from_str_radix(parts.next()?, 16).ok()?;
+        let func = parts
+            .next()
+            .and_then(|p| u8::from_str_radix(p, 16).ok())
+            .unwrap_or(0);
+        return Some((bus, dev, func));
+    }
+    None
+}
+
+/// The NVIDIA GPU that owns compute (SAXPY, NVK EXEC, CE-present): either
+/// the `nvidia.compute=BB.DD.F` pin, or the first driver with
+/// [`DrmScheme::is_compute_gpu`]. Never the console GPU — its GSP resume
+/// can wedge the bus.
+pub fn get_compute_driver() -> Option<Arc<dyn DrmScheme>> {
+    let drivers = kernel_hal::drivers::all_drm();
+    let list = drivers.as_vec();
+    if let Some((bus, dev, func)) = parse_nvidia_compute_bdf() {
+        if let Some(d) = list.iter().find(|d| {
+            matches!(
+                d.pci_bdf(),
+                Some((_, b, dv, f)) if b == bus && dv == dev && f == func
+            )
+        }) {
+            if d.is_console_gpu() {
+                kernel_hal::klog_info!(
+                    "[drm] nvidia.compute={:02x}.{:02x}.{:x} is the console GPU — ignoring pin \
+                     (GSP on the GOP card can wedge the bus)",
+                    bus,
+                    dev,
+                    func
+                );
+            } else {
+                return Some(d.clone());
+            }
+        } else {
+            kernel_hal::klog_info!(
+                "[drm] nvidia.compute={:02x}.{:02x}.{:x} does not match any DRM GPU",
+                bus,
+                dev,
+                func
+            );
+        }
+    }
+    list.iter().find(|d| d.is_compute_gpu()).cloned()
+}
+
 /// Hard ceiling on live GEM objects. Contiguous dumb buffers are expensive
 /// (up to `MAX_DUMB_SIZE` each) and sit outside process VMAs. Under a QEMU
 /// window-resize / redraw storm the compositor can CREATE_DUMB faster than

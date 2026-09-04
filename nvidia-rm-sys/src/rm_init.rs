@@ -1238,6 +1238,7 @@ extern "C" {
         dst_fb_vram_offset: NvU64,
         src_sysmem_pa: NvU64,
         size: NvU64,
+        work_id: *mut NvU64,
     ) -> NV_STATUS;
 
     fn eclipse_rm_ce_fill_fb(
@@ -1259,6 +1260,7 @@ extern "C" {
         dst_host_pa: NvU64,
         src_sysmem_pa: NvU64,
         size: NvU64,
+        work_id: *mut NvU64,
     ) -> NV_STATUS;
 
     fn eclipse_rm_ce_blit_p2p_2d(
@@ -1269,7 +1271,12 @@ extern "C" {
         src_pitch: NvU32,
         row_bytes: NvU32,
         line_count: NvU32,
+        work_id: *mut NvU64,
     ) -> NV_STATUS;
+
+    fn eclipse_rm_ce_wait(gpu_instance: NvU32, submitted_work_id: NvU64) -> NV_STATUS;
+
+    fn eclipse_rm_ce_release_inflight() -> NV_STATUS;
 }
 
 /// Declares a GPU as the primary/console device to RM, NVIDIA's own way
@@ -1329,28 +1336,58 @@ pub fn step10(device_instance: u32) -> Result<Step10Result, NV_STATUS> {
 /// On TU10x, BAR1 is a linear window onto VRAM from offset 0, so:
 /// `dst_fb_vram_offset = boot_fb_phys_cpu - bar1_phys`.
 ///
-/// The call is synchronous: it returns only after the CE completion semaphore
-/// fires.  The caller should flush any CPU write-combining writes to the dumb
-/// buffer first (the C implementation also calls `osFlushCpuWriteCombineBuffer`
-/// internally as a belt-and-suspenders measure).
+/// Submit is under [`RmGate`]; the completion poll is not. Holding the gate
+/// (and the RM GPU lock) across a 100 ms CE wait starved TLB shootdowns and
+/// blocked NVK `GEM_NEW`. The caller should flush any CPU write-combining
+/// writes to the dumb buffer first (the C implementation also calls
+/// `osFlushCpuWriteCombineBuffer` internally as a belt-and-suspenders measure).
 ///
-/// Returns the raw `NV_STATUS` from `ceutilsMemcopy` (`NV_OK` = `0` on
-/// success).
+/// Returns the raw `NV_STATUS` from `ceutilsMemcopy` / the bounded wait
+/// (`NV_OK` = `0` on success).
 pub fn ce_blit(
     gpu_instance: u32,
     dst_fb_vram_offset: u64,
     src_sysmem_pa: u64,
     size: u64,
 ) -> NV_STATUS {
-    // [rpc-lock] Serialize with every other RM entry, like the memory/exec
-    // paths. A CE present runs from scanout WHILE NVK allocates on another
-    // thread; without this gate the two enter the RM concurrently and trip its
-    // API-lock invariant (`Assertion failed: RPC locking violation @
-    // rpc.c:9834`), which fails the concurrent allocation RPC — seen on the RTX
-    // as `zink: couldn't allocate memory heap=0` / `createImageFromDmaBufs
-    // failed`. See the RM_CALL_GATE rationale at the top of this file.
-    let _gate = RmGate::lock();
-    unsafe { eclipse_rm_ce_blit(gpu_instance, dst_fb_vram_offset, src_sysmem_pa, size) }
+    let mut work_id = 0u64;
+    let submit = {
+        // [rpc-lock] Serialize submit with every other RM entry. A CE present
+        // runs from scanout WHILE NVK allocates on another thread; without this
+        // gate the two enter the RM concurrently and trip its API-lock
+        // invariant (`Assertion failed: RPC locking violation @ rpc.c:9834`).
+        // Wait happens AFTER this gate drops -- see `ce_finish`.
+        let _gate = RmGate::lock();
+        unsafe {
+            eclipse_rm_ce_blit(
+                gpu_instance,
+                dst_fb_vram_offset,
+                src_sysmem_pa,
+                size,
+                &mut work_id,
+            )
+        }
+    };
+    ce_finish(gpu_instance, submit, work_id)
+}
+
+/// Wait for an ASYNC CE submit without `RmGate`, then free stashed memdescs
+/// under the gate (short). `CE_PRESENT_WEDGED` in the display driver still
+/// latches off on any non-`NV_OK` return.
+fn ce_finish(gpu_instance: u32, submit: NV_STATUS, work_id: u64) -> NV_STATUS {
+    if submit != NV_OK {
+        return submit;
+    }
+    let wait = unsafe { eclipse_rm_ce_wait(gpu_instance, work_id) };
+    let release = {
+        let _gate = RmGate::lock();
+        unsafe { eclipse_rm_ce_release_inflight() }
+    };
+    if wait != NV_OK {
+        wait
+    } else {
+        release
+    }
 }
 
 /// CE-memset the GOP scanout framebuffer to a solid colour via the persistent
@@ -1391,9 +1428,15 @@ pub fn ce_blit_p2p(
     src_sysmem_pa: u64,
     size: u64,
 ) -> NV_STATUS {
-    // [rpc-lock] See `ce_blit`: gate this RM entry (rpc.c:9834 API-lock).
-    let _gate = RmGate::lock();
-    unsafe { eclipse_rm_ce_blit_p2p(gpu_instance, dst_host_pa, src_sysmem_pa, size) }
+    // [rpc-lock] Gate submit only; wait is outside -- see `ce_finish`.
+    let mut work_id = 0u64;
+    let submit = {
+        let _gate = RmGate::lock();
+        unsafe {
+            eclipse_rm_ce_blit_p2p(gpu_instance, dst_host_pa, src_sysmem_pa, size, &mut work_id)
+        }
+    };
+    ce_finish(gpu_instance, submit, work_id)
 }
 
 /// Pitched 2D P2P variant of [`ce_blit_p2p`]: copies `line_count` rows of
@@ -1403,7 +1446,8 @@ pub fn ce_blit_p2p(
 /// Eliminates the CPU staging repack when src and dst pitches differ: the CE
 /// reads directly from the compositor's buffer (fast cached DMA) and writes to
 /// the console GPU's BAR1 (fast GPU-initiated PCIe writes).  Each row is
-/// submitted ASYNC; the function waits once (bounded, 100 ms) on the last row.
+/// submitted ASYNC; the function waits once (bounded, 100 ms) on the last row,
+/// with `RmGate` dropped so NVK can allocate during the poll.
 pub fn ce_blit_p2p_2d(
     gpu_instance: u32,
     dst_host_pa: u64,
@@ -1413,19 +1457,24 @@ pub fn ce_blit_p2p_2d(
     row_bytes: u32,
     line_count: u32,
 ) -> NV_STATUS {
-    // [rpc-lock] See `ce_blit`: gate this RM entry (rpc.c:9834 API-lock).
-    let _gate = RmGate::lock();
-    unsafe {
-        eclipse_rm_ce_blit_p2p_2d(
-            gpu_instance,
-            dst_host_pa,
-            dst_pitch,
-            src_sysmem_pa,
-            src_pitch,
-            row_bytes,
-            line_count,
-        )
-    }
+    // [rpc-lock] Gate submit only; wait is outside -- see `ce_finish`.
+    let mut work_id = 0u64;
+    let submit = {
+        let _gate = RmGate::lock();
+        unsafe {
+            eclipse_rm_ce_blit_p2p_2d(
+                gpu_instance,
+                dst_host_pa,
+                dst_pitch,
+                src_sysmem_pa,
+                src_pitch,
+                row_bytes,
+                line_count,
+                &mut work_id,
+            )
+        }
+    };
+    ce_finish(gpu_instance, submit, work_id)
 }
 
 /// Mirror of `EclipseGemAlloc` (vendor/eclipse_rm_init.c).

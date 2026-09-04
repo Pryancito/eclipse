@@ -3,7 +3,41 @@
 //! This trait allows drivers to implement DRM/KMS functionality.
 
 use super::Scheme;
+use alloc::string::String;
 use alloc::vec::Vec;
+
+/// Result of [`DrmScheme::compute_launch`]: a structured stand-in for the
+/// `/proc/gpustep23` / `/proc/gpubench` text so userspace can drive compute
+/// through a DRM ioctl instead of `cat`.
+#[derive(Clone)]
+pub struct ComputeLaunchResult {
+    /// 0 = success; positive = NV_STATUS; negative = negated errno.
+    pub status: i32,
+    /// Wall time of the GPU work, when the op reports one (bench).
+    pub elapsed_ns: u64,
+    /// Threads in the dispatched grid (32 for SAXPY, chip-scale for bench).
+    pub grid_threads: u32,
+    /// Human-readable report (same narration as the corresponding `/proc` node).
+    pub report: String,
+}
+
+impl ComputeLaunchResult {
+    pub fn unsupported() -> Self {
+        Self {
+            status: -38, // -ENOSYS
+            elapsed_ns: 0,
+            grid_threads: 0,
+            report: String::from("compute launch not supported on this driver"),
+        }
+    }
+}
+
+/// [`DrmScheme::compute_launch`] op: GPU identity + RM readiness (no dispatch).
+pub const COMPUTE_OP_INFO: u32 = 0;
+/// Integer SAXPY (`gpustep23`).
+pub const COMPUTE_OP_SAXPY: u32 = 1;
+/// Integer-ALU GIOPS benchmark (`gpubench`).
+pub const COMPUTE_OP_BENCH: u32 = 2;
 
 /// DRM Device capabilities
 #[repr(C)]
@@ -92,6 +126,25 @@ pub trait DrmScheme: Scheme {
     /// so it cannot serve the RM-backed nouveau paths. Default: false.
     fn is_console_gpu(&self) -> bool {
         false
+    }
+
+    /// Whether this GPU is a compute device: GSP-RM is (or will be) auto-booted
+    /// and it can serve SAXPY / NVK / CE-present. Default: not a compute GPU.
+    /// On dual NVIDIA boxes this is every GPU that does **not** drive GOP.
+    fn is_compute_gpu(&self) -> bool {
+        false
+    }
+
+    /// One-line role dump for `/proc/gpuroles`. Empty for non-NVIDIA drivers.
+    fn gpu_role_line(&self) -> String {
+        String::new()
+    }
+
+    /// Userspace compute launch (DRM ioctl `ECLIPSE_COMPUTE`, also `/proc`
+    /// gpustep23/gpubench). `op` is [`COMPUTE_OP_INFO`] / [`COMPUTE_OP_SAXPY`] /
+    /// [`COMPUTE_OP_BENCH`]. Default: not supported.
+    fn compute_launch(&self, _op: u32) -> ComputeLaunchResult {
+        ComputeLaunchResult::unsupported()
     }
 
     /// Whether this driver can own legacy-KMS scanout/presentation for dumb
