@@ -929,14 +929,11 @@ impl State {
         self.render_task_bars();
     }
 
-    /// Ask PID 1 to reboot (`true`) or power off (`false`), then fall back to
-    /// the `reboot(2)` syscall if init does not take the system down.
-    ///
-    /// eclipse-init: SIGINT = reboot, SIGTERM = power off. busybox's own
-    /// `reboot` applet instead sends SIGTERM (which would power off) and
-    /// `poweroff` sends SIGUSR2 (which init used to ignore), so the previous
-    /// `reboot || shutdown -r now` / `poweroff || shutdown -h now` paths did
-    /// the wrong thing or nothing.
+    /// Force reboot or power off, same as busybox `reboot -f` / `poweroff -f`:
+    /// `reboot(2)` immediately. Signalling PID 1 and waiting used to hang
+    /// while init killed the compositor/GPU clients; the syscall path already
+    /// quiesces devices. Still poke init first so a stuck helper is not the
+    /// only actor, then call the syscall ourselves without sleeping.
     fn request_power(&self, reboot: bool) {
         unsafe {
             let go = || {
@@ -946,16 +943,12 @@ impl State {
                     libc::SIGTERM
                 };
                 libc::kill(1, sig);
-                let ts = libc::timespec {
-                    tv_sec: 3,
-                    tv_nsec: 0,
-                };
-                libc::nanosleep(&ts, core::ptr::null_mut());
                 let cmd = if reboot {
                     libc::RB_AUTOBOOT
                 } else {
                     libc::RB_POWER_OFF
                 };
+                libc::sync();
                 libc::reboot(cmd);
             };
             let pid = libc::fork();

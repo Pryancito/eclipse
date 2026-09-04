@@ -10,11 +10,14 @@
 //!   * launch the userspace declared in `/etc/eclipse/services/*.service`
 //!     (`oneshot` tasks run to completion in order; `respawn` services are
 //!     supervised and restarted if they exit),
-//!   * shut the system down cleanly on SIGTERM/SIGUSR1/SIGUSR2 (halt/power
-//!     off) and SIGINT (reboot). busybox `halt`/`poweroff`/`reboot` send
-//!     SIGUSR1/SIGUSR2/SIGTERM respectively; SIGINT is Ctrl-Alt-Del. The
-//!     `/usr/local/bin/reboot` wrapper sends SIGINT so a `reboot` command
-//!     actually reboots instead of following busybox's SIGTERM mapping.
+//!   * shut the system down on SIGTERM/SIGUSR1/SIGUSR2 (halt/power off) and
+//!     SIGINT (reboot). The path is the same as busybox `reboot -f` /
+//!     `poweroff -f`: `sync` then `reboot(2)`. A polite kill-all of the
+//!     session (labwc, GPU clients) before the syscall hung restart on this
+//!     kernel; the syscall itself already quiesces DRM and NVMe. busybox
+//!     `halt`/`poweroff`/`reboot` send SIGUSR1/SIGUSR2/SIGTERM; SIGINT is
+//!     Ctrl-Alt-Del. The `/usr/local/bin/reboot` wrapper execs
+//!     `busybox reboot -f` so a typed `reboot` matches that force path.
 //!
 //! Design borrowed from runit/s6/dinit (supervision, declarative services,
 //! dependency ordering); implementation is our own so every syscall is under
@@ -1232,30 +1235,28 @@ fn supervise(services: &mut BTreeMap<String, Service>) {
     }
 }
 
-/// Stop everything and ask the kernel to reboot (`reboot == true`) or power
-/// off. Best-effort: SIGTERM to all, a short grace period, SIGKILL, sync, then
-/// the reboot syscall. If the kernel cannot reboot, halt in a pause loop.
+/// Ask the kernel to reboot (`reboot == true`) or power off.
 ///
-/// `kill(-1, sig)` must not reach PID 1 itself (Linux excludes the caller and
-/// init; the Eclipse kernel now does too). On a kernel that still includes the
-/// caller the SIGKILL broadcast would terminate init right here and reboot(2)
-/// would never run, which is exactly how power off / reboot used to do
-/// nothing. Ignoring our own shutdown signals first at least keeps a stray
-/// SIGTERM/SIGINT from cutting the grace period short.
+/// This is the busybox `reboot -f` / `poweroff -f` path: `sync` then
+/// `reboot(2)`. We deliberately do **not** `kill(-1, SIGTERM/SIGKILL)` first.
+/// Tearing down labwc and the GPU clients before the syscall is what hung
+/// "Reiniciar" on this kernel; `reboot -f` skipped that and worked. Device
+/// quiesce (GSP-RM / WPR2, NVMe CC.SHN) already happens inside
+/// `kernel_hal::cpu::reset` / `power_off`.
+///
+/// If the kernel cannot reboot, halt in a pause loop.
 fn shutdown(reboot: bool, _services: &mut BTreeMap<String, Service>) {
-    log(if reboot { "rebooting" } else { "powering off" });
+    log(if reboot {
+        "rebooting (force)"
+    } else {
+        "powering off (force)"
+    });
 
     unsafe {
-        // A second request while shutting down changes nothing; make sure it
-        // cannot interrupt the grace sleep either.
         for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGUSR1, libc::SIGUSR2] {
             libc::signal(sig, libc::SIG_IGN);
         }
 
-        // Politely ask every process to terminate, then force it.
-        libc::kill(-1, libc::SIGTERM);
-        sleep_secs(2);
-        libc::kill(-1, libc::SIGKILL);
         libc::sync();
 
         let cmd = if reboot {
@@ -1265,7 +1266,6 @@ fn shutdown(reboot: bool, _services: &mut BTreeMap<String, Service>) {
         };
         // A successful reboot(2) never returns.
         libc::reboot(cmd);
-        // reboot(2) failed (ENOSYS or denied): nothing left to do but idle.
         log(&format!(
             "reboot syscall returned (errno {}); halting",
             errno()
@@ -1283,23 +1283,4 @@ fn shutdown(reboot: bool, _services: &mut BTreeMap<String, Service>) {
 fn errno() -> libc::c_int {
     // SAFETY: __errno_location returns a valid pointer on musl/glibc.
     unsafe { *libc::__errno_location() }
-}
-
-/// Sleep for the full `secs`, resuming after any EINTR (unlike
-/// [`sleep_interruptible`], which deliberately returns early on a signal).
-/// Used for the shutdown grace period, which a signal must not shorten. The
-/// remainder is recomputed from a monotonic clock rather than taken from
-/// nanosleep's `rem`, which the Eclipse kernel does not fill in.
-fn sleep_secs(secs: u64) {
-    let deadline = Instant::now() + Duration::from_secs(secs);
-    loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return;
-        }
-        sleep_interruptible(left);
-        if errno() != libc::EINTR {
-            return;
-        }
-    }
 }

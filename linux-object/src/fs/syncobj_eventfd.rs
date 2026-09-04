@@ -31,6 +31,10 @@ struct Waiter {
     /// Target timeline point (floored at 1: point 0 means the binary "signaled"
     /// state, i.e. the next signal, never "already true on an unsignaled obj").
     point: u64,
+    /// `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE`: fire when a fence covering
+    /// `point` has been *submitted* (EXEC attached a hardware fence), not
+    /// necessarily signaled.
+    wait_available: bool,
     ev: Arc<dyn FileLike>,
 }
 
@@ -53,9 +57,15 @@ fn deliver(ev: &Arc<dyn FileLike>) {
 /// Delivered immediately if the point is already reached; otherwise recorded
 /// and delivered on its own as the syncobj advances. Point 0 means the binary
 /// signaled state (floored to 1), matching the rest of the syncobj layer.
-pub fn register(handle: u32, point: u64, ev: Arc<dyn FileLike>) {
+/// `wait_available` uses the last-submitted point (in-flight EXEC fences).
+pub fn register(handle: u32, point: u64, ev: Arc<dyn FileLike>, wait_available: bool) {
     let target = point.max(1);
-    if let Some(cur) = zcore_drivers::scheme::syncobj::query(handle) {
+    let cur = if wait_available {
+        zcore_drivers::scheme::syncobj::query_submitted(handle)
+    } else {
+        zcore_drivers::scheme::syncobj::query(handle)
+    };
+    if let Some(cur) = cur {
         if cur >= target {
             deliver(&ev);
             return;
@@ -66,6 +76,7 @@ pub fn register(handle: u32, point: u64, ev: Arc<dyn FileLike>) {
         waiters.push(Waiter {
             handle,
             point: target,
+            wait_available,
             ev,
         });
         WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
@@ -121,7 +132,11 @@ fn on_syncobj_signaled(_handle: u32, _point: u64) {
         let mut waiters = WAITERS.lock();
         let mut i = 0;
         while i < waiters.len() {
-            match zcore_drivers::scheme::syncobj::query(waiters[i].handle) {
+            match if waiters[i].wait_available {
+                zcore_drivers::scheme::syncobj::query_submitted(waiters[i].handle)
+            } else {
+                zcore_drivers::scheme::syncobj::query(waiters[i].handle)
+            } {
                 Some(cur) if cur >= waiters[i].point => {
                     fire.push(waiters.swap_remove(i).ev);
                 }

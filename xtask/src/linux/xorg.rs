@@ -28,6 +28,7 @@
 //!   * `ECLIPSE_XORG_PACKAGES="pkg1 pkg2 …"` — replace the default package set
 //!     (e.g. to match a non-Alpine repository whose names differ).
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -366,6 +367,26 @@ fn mk_apk_add(
     }
     if keys.is_dir() {
         cmd.arg("--keys-dir").arg(keys);
+        // Empty keys-dir still yields UNTRUSTED on every APKINDEX and a
+        // 60-package install that commits nothing. --allow-untrusted lets the
+        // build finish from the Alpine CDN; prefer shipping keys (see
+        // tools/apk/keys).
+        let has_pub = fs::read_dir(keys)
+            .ok()
+            .map(|it| {
+                it.flatten().any(|e| {
+                    e.path()
+                        .extension()
+                        .and_then(|x| x.to_str())
+                        == Some("pub")
+                })
+            })
+            .unwrap_or(false);
+        if !has_pub {
+            cmd.arg("--allow-untrusted");
+        }
+    } else {
+        cmd.arg("--allow-untrusted");
     }
     cmd
 }

@@ -1253,10 +1253,11 @@ impl Syscall<'_> {
                 return Err(e.into());
             }
         };
-        // The `WAIT_AVAILABLE` flag (fire when a fence is merely submitted, not
-        // signaled) is a no-op here, for the same reason as QUERY's
-        // LAST_SUBMITTED: this model has no separate submitted-vs-signaled state.
-        let _ = req.flags;
+        // WAIT_AVAILABLE: fire when EXEC has attached a fence covering `point`,
+        // even if the GPU has not written the landing zone yet. Same bit as
+        // SYNCOBJ_WAIT; NVK's WAIT_PENDING / explicit-sync path uses it.
+        const WAIT_AVAILABLE: u32 = 1 << 2;
+        let wait_available = req.flags & WAIT_AVAILABLE != 0;
         // Resolve both preconditions up front so the trace below can report the
         // EXACT reason, then apply them in order.
         let live = kernel_hal::drivers::scheme::syncobj::query(req.handle).is_some();
@@ -1313,7 +1314,7 @@ impl Syscall<'_> {
             return Err(LxError::EINVAL);
         }
         // The waiter holds this Arc, so the eventfd stays alive until delivered.
-        linux_object::fs::register_syncobj_eventfd(req.handle, req.point, ev);
+        linux_object::fs::register_syncobj_eventfd(req.handle, req.point, ev, wait_available);
         Ok(Some(0))
     }
 

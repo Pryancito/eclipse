@@ -111,22 +111,20 @@ impl LinuxRootfs {
             .unwrap();
             fs::write(etc_apk.join("world"), "").unwrap();
 
-            // Alpine repo signatures: without /etc/apk/keys/*.rsa.pub apk reports
-            // "UNTRUSTED signature" and leaves 0 packages after a slow index download.
+            // Alpine repo signatures: without /etc/apk/keys/*.rsa.pub apk-tools
+            // 3 reports "UNTRUSTED signature" on APKINDEX and installs nothing.
+            // `prebuilt/` is gitignored (and invisible in some sandboxes), so
+            // the keys that actually ship live in `tools/apk/keys/` next to
+            // the apk binary. prebuilt is still scanned for extra keys.
             let keys_dst = etc_apk.join("keys");
-            fs::create_dir_all(&keys_dst).unwrap();
-            let keys_src = PROJECT_DIR.join("prebuilt").join("alpine-apk-keys");
-            if keys_src.is_dir() {
-                for entry in fs::read_dir(&keys_src).unwrap().flatten() {
-                    let path = entry.path();
-                    if path.extension().and_then(|e| e.to_str()) == Some("pub") {
-                        fs::copy(&path, keys_dst.join(entry.file_name())).unwrap();
-                    }
-                }
-            } else {
+            let n = Self::install_apk_keys(&keys_dst);
+            if n == 0 {
                 eprintln!(
-                    "warning: missing prebuilt/alpine-apk-keys — apk update will show UNTRUSTED signature"
+                    "warning: no Alpine apk keys found under tools/apk/keys or \
+                     prebuilt/alpine-apk-keys — apk add will use --allow-untrusted"
                 );
+            } else {
+                println!("apk keys: installed {n} key(s) into {}", keys_dst.display());
             }
 
             Self::write_resolv_conf(&etc);
@@ -1135,6 +1133,38 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             );
         }
         prebuilt
+    }
+
+    /// Copy Alpine apk RSA public keys into `dst` (`/etc/apk/keys`).
+    ///
+    /// Search order: in-tree `tools/apk/keys` (always shipped), then
+    /// `prebuilt/alpine-apk-keys` (gitignored extras, e.g. the e1000e bench
+    /// mirror key). Returns how many `.pub` files landed.
+    fn install_apk_keys(dst: &Path) -> usize {
+        fs::create_dir_all(dst).unwrap();
+        for src in [
+            PROJECT_DIR.join("tools").join("apk").join("keys"),
+            PROJECT_DIR.join("prebuilt").join("alpine-apk-keys"),
+        ] {
+            let Ok(entries) = fs::read_dir(&src) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("pub") {
+                    continue;
+                }
+                let _ = fs::copy(&path, dst.join(entry.file_name()));
+            }
+        }
+        fs::read_dir(dst)
+            .ok()
+            .map(|it| {
+                it.flatten()
+                    .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("pub"))
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     /// Instala certificados raíz en el rootfs (requerido para wget https).
@@ -2504,11 +2534,32 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         )
         .unwrap();
         // PATH puts /usr/local/bin first, so these win over busybox applets.
-        // busybox `reboot` signals PID 1 with SIGTERM (eclipse-init: power
-        // off); `poweroff` uses SIGUSR2. Speak eclipse-init's language.
-        fs::write(localbin.join("reboot"), b"#!/bin/sh\nkill -INT 1\n").unwrap();
-        fs::write(localbin.join("poweroff"), b"#!/bin/sh\nkill -TERM 1\n").unwrap();
-        fs::write(localbin.join("halt"), b"#!/bin/sh\nkill -TERM 1\n").unwrap();
+        // Force path: `busybox reboot -f` is sync+reboot(2) and is the reboot
+        // that actually works on this kernel. Signalling PID 1 used to run
+        // eclipse-init's kill-all, which hung the GPU session. eclipse-init
+        // now uses the same force path; the wrapper still execs busybox -f
+        // so a typed `reboot` does not depend on init's event loop.
+        fs::write(
+            localbin.join("reboot"),
+            b"#!/bin/sh\n\
+              if [ -x /bin/busybox ]; then exec /bin/busybox reboot -f; fi\n\
+              kill -INT 1\n",
+        )
+        .unwrap();
+        fs::write(
+            localbin.join("poweroff"),
+            b"#!/bin/sh\n\
+              if [ -x /bin/busybox ]; then exec /bin/busybox poweroff -f; fi\n\
+              kill -TERM 1\n",
+        )
+        .unwrap();
+        fs::write(
+            localbin.join("halt"),
+            b"#!/bin/sh\n\
+              if [ -x /bin/busybox ]; then exec /bin/busybox halt -f; fi\n\
+              kill -TERM 1\n",
+        )
+        .unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             for w in [

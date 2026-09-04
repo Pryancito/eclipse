@@ -325,6 +325,12 @@ pub fn attach_hw_fence(
         resolve_locked(&mut table)
     };
     deferred.run();
+    // The point is *submitted* even if the GPU has not written the landing
+    // zone yet. NVK/`QUERY LAST_SUBMITTED` and `WAIT_AVAILABLE` must see it
+    // the moment EXEC returns; without this, Mesa's timeline walks a NULL
+    // terminator (`libvulkan_nouveau.so+0x9cc48`) because it thinks nothing
+    // was queued after the first EXEC.
+    notify_signal(handle, point);
     true
 }
 
@@ -581,12 +587,39 @@ pub fn reset(handle: u32) -> bool {
 }
 
 /// Current timeline point (`SYNCOBJ_QUERY`), or `None` if `handle` is
-/// unknown.
+/// unknown. Signaled point only — not in-flight hardware fences.
 pub fn query(handle: u32) -> Option<u64> {
+    query_inner(handle, false)
+}
+
+/// Last *submitted* point (`SYNCOBJ_QUERY` + `LAST_SUBMITTED`): the
+/// signaled counter, or the highest pending hardware fence, whichever is
+/// larger. EXEC's fast path attaches a fence and returns without waiting;
+/// NVK then queries this to learn the timeline value of that submit.
+pub fn query_submitted(handle: u32) -> Option<u64> {
+    query_inner(handle, true)
+}
+
+fn query_inner(handle: u32, last_submitted: bool) -> Option<u64> {
     let (r, deferred) = {
         let mut table = TABLE.lock();
         let d = resolve_locked(&mut table);
-        (effective_point(&table.objects, handle, LINK_DEPTH), d)
+        let cur = effective_point(&table.objects, handle, LINK_DEPTH);
+        let out = if last_submitted {
+            cur.map(|p| {
+                let inflight = table
+                    .pending
+                    .iter()
+                    .filter(|f| f.handle == handle)
+                    .map(|f| f.point)
+                    .max()
+                    .unwrap_or(0);
+                p.max(inflight)
+            })
+        } else {
+            cur
+        };
+        (out, d)
     };
     deferred.run();
     r
@@ -616,7 +649,18 @@ pub fn wait(
     wait_all: bool,
     deadline_us: u64,
 ) -> WaitOutcome {
-    wait_inner(handles, points, wait_all, deadline_us, None)
+    wait_inner(handles, points, wait_all, deadline_us, None, false)
+}
+
+/// [`wait`] but `WAIT_AVAILABLE`: a pending hardware fence that covers the
+/// target counts as satisfied (fence submitted, not necessarily signaled).
+pub fn wait_available(
+    handles: &[u32],
+    points: Option<&[u64]>,
+    wait_all: bool,
+    deadline_us: u64,
+) -> WaitOutcome {
+    wait_inner(handles, points, wait_all, deadline_us, None, true)
 }
 
 /// [`wait`] for a GPU driver about to submit on channel `ctx_idx`: a handle
@@ -632,7 +676,7 @@ pub fn wait_ordered(
     deadline_us: u64,
     ctx_idx: u32,
 ) -> WaitOutcome {
-    wait_inner(handles, points, true, deadline_us, Some(ctx_idx))
+    wait_inner(handles, points, true, deadline_us, Some(ctx_idx), false)
 }
 
 fn wait_inner(
@@ -641,6 +685,7 @@ fn wait_inner(
     wait_all: bool,
     deadline_us: u64,
     ordered_ctx: Option<u32>,
+    available_only: bool,
 ) -> WaitOutcome {
     let start_us = now_us();
     let mut stall_logged = false;
@@ -667,6 +712,10 @@ fn wait_inner(
                     return WaitOutcome::Invalid;
                 };
                 let target = points.map(|p| p[i]).unwrap_or(1);
+                let pending_covers = table
+                    .pending
+                    .iter()
+                    .any(|f| f.handle == h && f.point >= target);
                 let ordered = match ordered_ctx {
                     Some(ctx) => table
                         .pending
@@ -674,7 +723,7 @@ fn wait_inner(
                         .any(|f| f.handle == h && f.ctx_idx == ctx && f.point >= target),
                     None => false,
                 };
-                if point >= target || ordered {
+                if point >= target || ordered || (available_only && pending_covers) {
                     signaled_count += 1;
                     if first_signaled.is_none() {
                         first_signaled = Some(i as u32);

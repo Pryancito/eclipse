@@ -306,6 +306,8 @@ struct DrmSyncobjTimelineWait {
     pad: u32,
 }
 const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL: u32 = 1 << 0;
+const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE: u32 = 1 << 2;
+const DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED: u32 = 1 << 0;
 
 /// Throttled visibility for syncobj WAIT failures: they return to Mesa as
 /// bare errnos with no log of their own, which on real hardware left a
@@ -344,7 +346,6 @@ struct DrmSyncobjTimelineArray {
     handles: u64,
     points: u64,
     count_handles: u32,
-    #[allow(dead_code)]
     flags: u32,
 }
 
@@ -2750,14 +2751,23 @@ impl INode for DrmDev {
                 {
                     return Err(FsError::InvalidParam);
                 }
-                // `DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED` is a no-op here:
-                // this model has no separate submitted-vs-signaled state
-                // (everything is signaled synchronously), so "current point"
-                // answers both.
+                let last_submitted =
+                    req.flags & DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED != 0;
+                // LAST_SUBMITTED must include in-flight EXEC fences: the fast
+                // path returns before the GPU writes the landing zone, and NVK
+                // uses this query as the timeline value of that submit. Treating
+                // it as a no-op left the timeline at the previous signaled
+                // point — Mesa then walked `supported_sync_types` off the NULL
+                // terminator (`libvulkan_nouveau.so+0x9cc48`).
                 let mut first_pt = 0u64;
                 for i in 0..req.count_handles as usize {
                     let handle = unsafe { *(req.handles as *const u32).add(i) };
-                    let Some(point) = zcore_drivers::scheme::syncobj::query(handle) else {
+                    let looked_up = if last_submitted {
+                        zcore_drivers::scheme::syncobj::query_submitted(handle)
+                    } else {
+                        zcore_drivers::scheme::syncobj::query(handle)
+                    };
+                    let Some(point) = looked_up else {
                         return Err(FsError::EntryNotFound);
                     };
                     if i == 0 {
@@ -2766,7 +2776,17 @@ impl INode for DrmDev {
                     unsafe { *(req.points as *mut u64).add(i) = point };
                 }
                 let h0 = unsafe { *(req.handles as *const u32) };
-                trace_syncobj("QUERY", drm::current_pid(), h0, first_pt, "ok");
+                trace_syncobj(
+                    if last_submitted {
+                        "QUERY_LAST_SUBMITTED"
+                    } else {
+                        "QUERY"
+                    },
+                    drm::current_pid(),
+                    h0,
+                    first_pt,
+                    "ok",
+                );
                 Ok(0)
             }
 
@@ -2824,6 +2844,7 @@ impl INode for DrmDev {
                 // an effectively unbounded wait.
                 let deadline_us = (timeout_nsec.max(0) as u64) / 1000;
                 let wait_all = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL != 0;
+                let available_only = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE != 0;
                 trace_syncobj(
                     if timeline { "TIMELINE_WAIT" } else { "WAIT" },
                     drm::current_pid(),
@@ -2832,9 +2853,19 @@ impl INode for DrmDev {
                         .as_ref()
                         .and_then(|p| p.first().copied())
                         .unwrap_or(0),
-                    &alloc::format!("timeout_ns={} flags={:#x}", timeout_nsec, flags),
+                    &alloc::format!(
+                        "timeout_ns={} flags={:#x} available={}",
+                        timeout_nsec,
+                        flags,
+                        available_only
+                    ),
                 );
-                match zcore_drivers::scheme::syncobj::wait(
+                let wait_fn = if available_only {
+                    zcore_drivers::scheme::syncobj::wait_available
+                } else {
+                    zcore_drivers::scheme::syncobj::wait
+                };
+                match wait_fn(
                     &handles,
                     points.as_deref(),
                     wait_all,

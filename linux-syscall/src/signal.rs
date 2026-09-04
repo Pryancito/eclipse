@@ -202,12 +202,10 @@ impl Syscall<'_> {
             SendTarget::EveryProcess => {
                 // kill(-1, sig) reaches every process EXCEPT the caller and
                 // init (PID 1), as on Linux. The old code included the caller:
-                // eclipse-init's shutdown() does `kill(-1, SIGTERM)`, a grace
-                // sleep, `kill(-1, SIGKILL)` and only then reboot(2) -- so PID 1
-                // killed itself on the SIGKILL broadcast (and cut its own grace
-                // sleep short with the SIGTERM one) and reboot(2) was never
-                // reached: "Apagar"/"Reiniciar" and `poweroff`/`reboot` left a
-                // machine with no processes and no power transition.
+                // a previous eclipse-init shutdown() did `kill(-1, SIGTERM)`,
+                // a grace sleep, `kill(-1, SIGKILL)` and only then reboot(2),
+                // so PID 1 killed itself and never reached reboot(2). Init no
+                // longer broadcasts; it force-reboots like busybox `reboot -f`.
                 let skip = |proc: &Arc<zircon_object::task::Process>| {
                     proc.id() == caller.id() || proc.id() == linux_object::process::INIT_PID
                 };
