@@ -1,0 +1,12 @@
+#version 450
+// Reference GLSL for tools/ecl-vkcompute/gen_saxpy_spv.py (the ISO embeds
+// the hand-written SPIR-V; this file is the human-readable equivalent).
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0) readonly buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly buffer Y { float y[]; };
+layout(set = 0, binding = 2) buffer Z { float z[]; };
+layout(push_constant) uniform PC { float a; } pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    z[i] = pc.a * x[i] + y[i];
+}
