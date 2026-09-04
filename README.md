@@ -46,6 +46,7 @@ cmdline=LOG=warn:ROOTPROC=/path/to/init?--option?value
 - [Iniciar el Núcleo](#iniciar-el-núcleo)
 - [Configuración del Proceso Inicial (ROOTPROC)](#configuración-del-proceso-inicial-rootproc)
 - [Construcción del Proyecto](#construcción-del-proyecto)
+  - [Programas necesarios](#programas-necesarios)
   - [Comandos de Construcción](#comandos-de-construcción)
   - [Referencia de Comandos](#referencia-de-comandos)
 - [Soporte de Plataformas](#soporte-de-plataformas)
@@ -61,7 +62,64 @@ La construcción del proyecto utiliza el [patrón xtask](https://github.com/matk
 
 Además, se proporciona un [Makefile](Makefile) para compatibilidad con algunos scripts antiguos.
 
-Los entornos de desarrollo probados actualmente incluyen Ubuntu 20.04, Ubuntu 22.04 y Debian 11. 
+Los entornos de desarrollo probados actualmente incluyen Ubuntu 20.04, Ubuntu 22.04 y Debian 11.
+
+### Programas necesarios
+
+El host de compilación es **Linux** (x86_64). Instala estas herramientas **antes** de `cargo rootfs` / `make qemu`: xtask las invoca por nombre (`wget`, `tar`, `make`, …) y sin ellas el build no arranca.
+
+#### Cadena Rust
+
+El archivo [`rust-toolchain.toml`](rust-toolchain.toml) fija `nightly-2026-09-01` y los componentes `rust-src`, `llvm-tools-preview`, `rustfmt` y `clippy`. Con [rustup](https://rustup.rs) instalado, `cargo` descarga esa toolchain sola.
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+# userspace del rootfs (eclipse-init, lunarbar, …):
+rustup target add x86_64-unknown-linux-musl
+```
+
+`PATH` debe incluir `~/.cargo/bin` (`cargo`, `rustc`, `rustup`).
+
+#### Paquetes del sistema
+
+| Programa | Para qué | Paquete Debian/Ubuntu |
+|---|---|---|
+| `git` | clon de busybox y submódulos | `git` |
+| `make` | busybox, rboot, `Makefile` del repo | `make` |
+| `gcc` | tests de hilos y herramientas C del rootfs | `build-essential` |
+| `tar` | extraer el cross musl (`*-linux-musl-cross.tgz`) | `tar` |
+| `wget` o `curl` | apk estático, toolchain musl, `cacert.pem` | `wget` y/o `curl` |
+| `sed` | ajustar `.config` de busybox | `sed` |
+| `python3` | regenerar headers SPIR-V (opcional) | `python3` |
+| `mkfs.vfat` | ESP FAT32 (`cargo image`, `make iso`) | `dosfstools` |
+| `mmd` / `mcopy` | copiar EFI al FAT | `mtools` |
+| `gzip` | comprimir `efi.img` / rootfs / home | `gzip` |
+| `qemu-system-x86_64` | `make qemu` / `cargo qemu` | `qemu-system-x86` |
+| `qemu-img` | `make qcow2` | `qemu-utils` |
+| `xorriso` | `make iso` | `xorriso` |
+
+El cross **musl** (`x86_64-linux-musl-gcc`, `…-strip`) no se instala a mano: `cargo rootfs` lo baja a `ignored/target/x86_64/x86_64-linux-musl-cross/` (hace falta `wget`/`curl` y `tar`).
+
+Instalación típica en Debian/Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install --no-install-recommends \
+  build-essential git make gcc tar wget curl sed python3 \
+  dosfstools mtools gzip qemu-system-x86 qemu-utils xorriso
+```
+
+En Fedora: `dnf install gcc make git tar wget curl python3 dosfstools mtools gzip qemu-system-x86 qemu-img xorriso`. En Arch: `pacman -S base-devel git wget python dosfstools mtools qemu-system-x86 xorriso`.
+
+Comprobar que el host está listo:
+
+```bash
+command -v cargo git make gcc tar wget curl qemu-system-x86_64 mkfs.vfat mcopy gzip
+rustup show
+```
+
+No hace falta `btrfs-progs` en el host: las imágenes btrfs las genera xtask. `cmake` / OpenCV / FFmpeg solo si se usa `cargo opencv` / `cargo ffmpeg`.
 
 ### Comandos de Construcción
 
