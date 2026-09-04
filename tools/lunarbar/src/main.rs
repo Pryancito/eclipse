@@ -13,7 +13,7 @@
 //! blue-black ground (#060a14) with dark-blue accents (#275a9e rule):
 //! - BOTTOM (the classic waybar layout, replicated): ◑ launcher, then one
 //!   rounded button per open window via wlr-foreign-toplevel-management;
-//!   on the right `cpu N%`, `mem N%`, and the bold clock in its violet pill.
+//!   on the right `cpu N%`, `mem N%`, the **ES/US** layout pill, and the bold clock.
 //! - TOP (system info): ☾ eclipse wordmark, uptime and load on the left;
 //!   network ▼/▲ throughput, disk, temperature and battery (auto-hidden when
 //!   absent) with load-tinted mini gauges, and the date pill on the right.
@@ -191,6 +191,8 @@ enum Hover {
     Volume,
     /// Power / Session menu button.
     Power,
+    /// Keyboard layout pill (bottom bar); click cycles es/us.
+    Kbd,
 }
 
 /// Click/hover target for one taskbar button.
@@ -250,6 +252,8 @@ struct Bar {
     vol_hit: (i32, i32),
     /// x-range [x0,x1) of the power button hitbox.
     power_hit: (i32, i32),
+    /// x-range [x0,x1) of the keyboard-layout pill.
+    kbd_hit: (i32, i32),
     /// Click targets for each window button (Task bars).
     task_hits: Vec<TaskHit>,
 }
@@ -415,6 +419,8 @@ struct Metrics {
     temp: Option<u32>,
     batt: Option<(u32, bool)>,
     vol: Option<u32>,
+    /// Console/labwc layout, uppercase (`ES` / `US`), from `/proc/kbd`.
+    kbd: String,
 }
 
 #[derive(Default)]
@@ -485,6 +491,7 @@ impl State {
             // the 1 Hz tick. Primed at startup, updated when the user drags
             // the slider.
             vol: self.vol,
+            kbd: sysinfo::kbd_layout(),
         };
     }
 
@@ -552,6 +559,7 @@ impl State {
                     clock_hit: (0, 0),
                     vol_hit: (0, 0),
                     power_hit: (0, 0),
+                    kbd_hit: (0, 0),
                     task_hits: Vec::new(),
                 };
                 if !fill_guard::try_push_bounded(&mut self.bars, bar, fill_guard::MAX_BARS) {
@@ -732,6 +740,7 @@ impl State {
             bar.clock_hit = (0, 0);
             bar.vol_hit = (0, 0);
             bar.power_hit = (0, 0);
+            bar.kbd_hit = (0, 0);
             bar.hover = Hover::None;
             bar.width = w;
             bar.height = h;
@@ -820,7 +829,7 @@ impl State {
                     bar.busy[i] = false;
                     return;
                 };
-                let (launcher_hit, hits, clock_hit, vol_hit, power_hit) =
+                let (launcher_hit, hits, clock_hit, vol_hit, power_hit, kbd_hit) =
                     draw_task(&mut cv, w, h, &items, &m, hover, &mut self.icons);
                 let bar = &mut self.bars[idx];
                 let data: &mut [u8] = unsafe {
@@ -834,6 +843,7 @@ impl State {
                 bar.clock_hit = clock_hit;
                 bar.vol_hit = vol_hit;
                 bar.power_hit = power_hit;
+                bar.kbd_hit = kbd_hit;
                 bar.task_hits = hits;
                 commit_bar(bar, i);
             }
@@ -905,6 +915,18 @@ impl State {
                 libc::waitpid(pid, &mut st, 0);
             }
         }
+    }
+
+    /// Cycle es/us via `eclipse-kbd toggle` (console + labwc + Xwayland) and
+    /// flip the pill immediately so the bar does not wait for the next 1 Hz tick.
+    fn toggle_kbd(&mut self) {
+        self.spawn("/usr/local/bin/eclipse-kbd toggle");
+        self.metrics.kbd = if self.metrics.kbd.eq_ignore_ascii_case("US") {
+            "ES".into()
+        } else {
+            "US".into()
+        };
+        self.render_task_bars();
     }
 
     /// Ask PID 1 to reboot (`true`) or power off (`false`), then fall back to
@@ -1626,6 +1648,8 @@ impl State {
             Hover::Volume
         } else if x >= bar.power_hit.0 && x < bar.power_hit.1 {
             Hover::Power
+        } else if x >= bar.kbd_hit.0 && x < bar.kbd_hit.1 {
+            Hover::Kbd
         } else if let Some(h) = bar.task_hits.iter().find(|h| x >= h.x0 && x < h.x1) {
             Hover::Task(h.tid)
         } else {
@@ -1926,7 +1950,7 @@ fn commit_bar(bar: &mut Bar, i: usize) {
 /// fallback); buttons shrink to fit the available span instead of dropping
 /// windows, collapsing to icon-only under pressure; hover and minimized
 /// states render distinctly. Returns the launcher hitbox, per-button hitboxes
-/// and the clock-pill hitbox.
+/// and the clock-pill hitbox, volume, power and keyboard-layout pills.
 fn draw_task(
     cv: &mut Canvas,
     w: usize,
@@ -1935,7 +1959,14 @@ fn draw_task(
     m: &Metrics,
     hover: Hover,
     icons: &mut IconCache,
-) -> ((i32, i32), Vec<TaskHit>, (i32, i32), (i32, i32), (i32, i32)) {
+) -> (
+    (i32, i32),
+    Vec<TaskHit>,
+    (i32, i32),
+    (i32, i32),
+    (i32, i32),
+    (i32, i32),
+) {
     cv.clear(BAR_BG);
     // border-top: 2px solid #6b5aa8
     cv.hline(0, 0, w as i32, BAR_RULE, 1.0);
@@ -1960,6 +1991,7 @@ fn draw_task(
     let mut clock_hit = (0, 0);
     let mut vol_hit = (0, 0);
     let mut power_hit = (0, 0);
+    let mut kbd_hit = (0, 0);
 
     {
         // Power button: far right
@@ -1982,6 +2014,18 @@ fn draw_task(
             cv.round_rect(rx, btn_y, pw, btn_h, 6, pill);
             cv.text_bold(&m.clock, rx + 10, ty, TEXT);
             clock_hit = (rx, rx + pw);
+            rx -= 10;
+        }
+
+        // Keyboard layout pill — click cycles es/us.
+        let kbd = if m.kbd.is_empty() { "ES" } else { m.kbd.as_str() };
+        let kw = Canvas::text_width(kbd) + 16;
+        if rx - kw >= left_min {
+            rx -= kw;
+            let pill = if hover == Hover::Kbd { PILL_HOVER } else { PILL };
+            cv.round_rect(rx, btn_y, kw, btn_h, 6, pill);
+            cv.text_bold(kbd, rx + 8, ty, TEXT);
+            kbd_hit = (rx, rx + kw);
             rx -= 10;
         }
 
@@ -2104,7 +2148,7 @@ fn draw_task(
         x += bw + 4;
     }
 
-    (launcher_hit, hits, clock_hit, vol_hit, power_hit)
+    (launcher_hit, hits, clock_hit, vol_hit, power_hit, kbd_hit)
 }
 
 // ── Top bar: system info ─────────────────────────────────────────────────────
@@ -2962,6 +3006,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 let (cx0, cx1) = state.bars[idx].clock_hit;
                 let (vx0, vx1) = state.bars[idx].vol_hit;
                 let (px0, px1) = state.bars[idx].power_hit;
+                let (kx0, kx1) = state.bars[idx].kbd_hit;
                 if button == BTN_LEFT && x >= lx0 && x < lx1 {
                     state.toggle_apps(qh);
                 } else if button == BTN_LEFT && x >= cx0 && x < cx1 {
@@ -2970,6 +3015,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     state.toggle_volume(qh, role == Role::Info);
                 } else if button == BTN_LEFT && x >= px0 && x < px1 {
                     state.toggle_power(qh, role == Role::Info);
+                } else if button == BTN_LEFT && x >= kx0 && x < kx1 {
+                    state.toggle_kbd();
                 } else if role == Role::Task {
                     let hit = state.bars[idx]
                         .task_hits
@@ -3578,6 +3625,7 @@ fn main() {
             temp: sysinfo::temp_c(),
             batt: sysinfo::battery(),
             vol: sysinfo::volume(),
+            kbd: sysinfo::kbd_layout(),
         };
 
         // Top info bar occupies rows [0, bh).

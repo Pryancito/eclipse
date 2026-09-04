@@ -12,6 +12,7 @@ mod flagged_fs;
 pub mod hunter_config;
 mod inotify;
 pub mod ioctl;
+mod kbd_layout;
 mod mount_ops;
 mod mount_state;
 mod perf;

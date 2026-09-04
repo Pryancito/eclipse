@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 use super::ioctl::*;
+use super::kbd_layout::{self, KeyMods};
 use crate::{sync::Event, sync::EventBus};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -698,7 +699,7 @@ pub fn set_active_vt_termios_flush(termios: Termios) {
 static CTRL_C_PENDING: AtomicBool = AtomicBool::new(false);
 static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
 static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
-/// AltGr (Alt derecho) — layout `es` de Linux/XKB.
+/// AltGr (Alt derecho) — third XKB level on the console layout.
 static ALTGR_DOWN: AtomicBool = AtomicBool::new(false);
 /// Alt izquierdo — usado para la conmutación de VT (Ctrl+Alt+F1..F6).
 static LEFT_ALT_DOWN: AtomicBool = AtomicBool::new(false);
@@ -924,8 +925,8 @@ fn handle_key_event(event: &InputEvent) {
         return;
     }
 
-    // Estado de modificadores, equivalente al `shift_state` de la capa keyboard
-    // del kernel de Linux (drivers/tty/vt/keyboard.c).
+    // Modifier snapshot, equivalent to Linux's `shift_state`
+    // (drivers/tty/vt/keyboard.c). Layout tables live in `kbd_layout`.
     let mods = KeyMods {
         shift: SHIFT_DOWN.load(Ordering::SeqCst),
         altgr: ALTGR_DOWN.load(Ordering::SeqCst),
@@ -951,38 +952,6 @@ fn handle_key_event(event: &InputEvent) {
         }
         Some(KeySym::Func(seq)) => stdin.push_bytes(seq),
         None => {}
-    }
-}
-
-/// Estado de modificadores para el layout español (XKB `es`).
-#[derive(Clone, Copy)]
-struct KeyMods {
-    shift: bool,
-    altgr: bool,
-    caps: bool,
-    ctrl: bool,
-}
-
-impl KeyMods {
-    fn letter(self, lower: char) -> char {
-        if self.caps ^ self.shift {
-            lower.to_ascii_uppercase()
-        } else {
-            lower
-        }
-    }
-
-    /// Elige entre cuatro niveles (como XKB: base, Shift, AltGr, Shift+AltGr).
-    fn pick(self, base: char, shifted: char, altgr: char, shift_altgr: char) -> char {
-        if self.altgr && self.shift {
-            shift_altgr
-        } else if self.altgr {
-            altgr
-        } else if self.shift {
-            shifted
-        } else {
-            base
-        }
     }
 }
 
@@ -1024,8 +993,7 @@ fn translate_key(code: u16, mods: KeyMods) -> Option<KeySym> {
         _ => {}
     }
 
-    // Carácter imprimible según el layout español.
-    let c = input_event_to_char_es(code, mods)?;
+    let c = kbd_layout::to_char(code, mods)?;
 
     // Bit de control (KG_CTRL). El kernel toma el carácter de la columna
     // `control` del keymap; para el rango ASCII relevante equivale a estas
@@ -1048,84 +1016,6 @@ fn translate_key(code: u16, mods: KeyMods) -> Option<KeySym> {
     }
 
     Some(KeySym::Char(c))
-}
-
-/// Layout QWERTY español (España), alineado con `symbols/es` de xkeyboard-config.
-fn input_event_to_char_es(code: u16, mods: KeyMods) -> Option<char> {
-    use zcore_drivers::input::input_event_codes::key::*;
-    match code {
-        KEY_A => Some(mods.letter('a')),
-        KEY_B => Some(mods.letter('b')),
-        KEY_C => Some(mods.letter('c')),
-        KEY_D => Some(mods.letter('d')),
-        KEY_E => Some(mods.letter('e')),
-        KEY_F => Some(mods.letter('f')),
-        KEY_G => Some(mods.letter('g')),
-        KEY_H => Some(mods.letter('h')),
-        KEY_I => Some(mods.letter('i')),
-        KEY_J => Some(mods.letter('j')),
-        KEY_K => Some(mods.letter('k')),
-        KEY_L => Some(mods.letter('l')),
-        KEY_M => Some(mods.letter('m')),
-        KEY_N => Some(mods.letter('n')),
-        KEY_O => Some(mods.letter('o')),
-        KEY_P => Some(mods.letter('p')),
-        KEY_Q => Some(mods.letter('q')),
-        KEY_R => Some(mods.letter('r')),
-        KEY_S => Some(mods.letter('s')),
-        KEY_T => Some(mods.letter('t')),
-        KEY_U => Some(mods.letter('u')),
-        KEY_V => Some(mods.letter('v')),
-        KEY_W => Some(mods.letter('w')),
-        KEY_X => Some(mods.letter('x')),
-        KEY_Y => Some(mods.letter('y')),
-        KEY_Z => Some(mods.letter('z')),
-        KEY_1 => Some(mods.pick('1', '!', '|', '|')),
-        KEY_2 => Some(mods.pick('2', '"', '@', '@')),
-        KEY_3 => Some(mods.pick('3', '·', '#', '#')),
-        KEY_4 => Some(mods.pick('4', '$', '~', '~')),
-        KEY_5 => Some(mods.pick('5', '%', '€', '€')),
-        KEY_6 => Some(mods.pick('6', '&', '¬', '¬')),
-        KEY_7 => Some(mods.pick('7', '/', '{', '{')),
-        KEY_8 => Some(mods.pick('8', '(', '[', '[')),
-        KEY_9 => Some(mods.pick('9', ')', ']', ']')),
-        KEY_0 => Some(mods.pick('0', '=', '}', '}')),
-        KEY_MINUS => Some(mods.pick('\'', '?', '\\', '|')),
-        KEY_EQUAL => Some(mods.pick('¡', '¿', '¡', '¿')),
-        KEY_GRAVE => Some(mods.pick('º', 'ª', 'º', 'ª')),
-        KEY_LEFTBRACE => Some(mods.pick('`', '^', '[', '{')),
-        KEY_RIGHTBRACE => Some(mods.pick('+', '*', ']', '}')),
-        KEY_BACKSLASH => Some(mods.pick('\\', '|', '|', '|')),
-        KEY_SEMICOLON => Some(mods.pick('ñ', 'Ñ', '~', '`')),
-        KEY_APOSTROPHE => Some(mods.pick('´', '¨', '{', '}')),
-        KEY_102ND => Some(mods.pick('<', '>', '\\', '|')),
-        KEY_COMMA => Some(mods.pick(',', ';', ',', ';')),
-        KEY_DOT | KEY_KPDOT => Some(mods.pick('.', ':', '.', ':')),
-        KEY_SLASH => Some(mods.pick('-', '_', '-', '_')),
-        // Enter envía CR (0x0d), como una terminal real / la consola de Linux;
-        // el flag de entrada ICRNL lo convierte a NL en modo canónico.
-        KEY_ENTER | KEY_KPENTER => Some('\r'),
-        KEY_SPACE => Some(' '),
-        // Backspace envía DEL (0x7f), igual que la consola de Linux y el
-        // `kbs=\177` de la terminfo xterm; además coincide con c_cc[VERASE].
-        KEY_BACKSPACE => Some('\x7f'),
-        KEY_TAB => Some('\t'),
-        KEY_KP0 => Some('0'),
-        KEY_KP1 => Some('1'),
-        KEY_KP2 => Some('2'),
-        KEY_KP3 => Some('3'),
-        KEY_KP4 => Some('4'),
-        KEY_KP5 => Some('5'),
-        KEY_KP6 => Some('6'),
-        KEY_KP7 => Some('7'),
-        KEY_KP8 => Some('8'),
-        KEY_KP9 => Some('9'),
-        KEY_KPSLASH => Some('/'),
-        KEY_KPASTERISK => Some('*'),
-        KEY_KPMINUS => Some('-'),
-        KEY_KPPLUS => Some('+'),
-        _ => None,
-    }
 }
 
 /// Map a Linux VT keycode (`kb_index` in `struct kbentry`) to evdev `KEY_*`.

@@ -206,12 +206,18 @@ ya pasan el IWAD.
 |---|---|
 | `Super+Enter` / `Alt+Enter` | Abrir terminal (`foot`) |
 | `Super+Espacio` | Menú de escritorio |
+| `Super+K` | Ciclar layout de teclado (`es` / `us`) |
 | `Alt+Tab` | Cambiar de ventana |
 | `Alt+F4` | Cerrar ventana |
 | `Super+↑` | Maximizar / restaurar |
 | `Super+←` / `Super+→` | Anclar a media pantalla |
 | `Super+1..4` | Ir al escritorio N |
 | `Super+Shift+1..4` | Mover ventana al escritorio N |
+
+El layout empieza en `es` (consola, labwc y Xwayland). Se cambia en caliente
+con `eclipse-kbd toggle` (o `es`/`us`), el atajo `Super+K`, la píldora **ES/US**
+del panel, o `echo us > /proc/kbd` más `eclipse-kbd us` para el escritorio.
+Queda en `/etc/eclipse/keyboard`; en el arranque manda `kbd=us` en la cmdline.
 
 ## El panel y la estabilidad del sistema
 

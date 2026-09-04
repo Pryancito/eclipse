@@ -53,6 +53,7 @@ pub fn install(rootfs: &Path) {
     write_fallback_icons(rootfs);
     write_x11_prepare(rootfs);
     write_xkbmap_wrapper(rootfs);
+    write_eclipse_kbd(rootfs);
 }
 
 /// `/usr/local/bin/eclipse-xkbmap`: load the X keyboard map into Xwayland once
@@ -83,7 +84,9 @@ fn write_xkbmap_wrapper(rootfs: &Path) {
           # type. Wayland clients get their keymap in-process; the X server does\n\
           # not, and comes up without one on this stack. See eclipse-xkbmap doc.\n\
           log=\"${HOME:-/root}/.eclipse-xkbmap.log\"\n\
-          layout=\"${ECLIPSE_XKB_LAYOUT:-us}\"\n\
+          layout=\"${ECLIPSE_XKB_LAYOUT:-}\"\n\
+          [ -z \"$layout\" ] && [ -r /proc/kbd ] && layout=$(tr -d '[:space:]' < /proc/kbd)\n\
+          layout=\"${layout:-es}\"\n\
           i=0\n\
           while [ \"$i\" -lt 60 ]; do\n\
           \x20 for sock in /tmp/.X11-unix/X*; do\n\
@@ -105,6 +108,139 @@ fn write_xkbmap_wrapper(rootfs: &Path) {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
     }
+}
+
+/// `/usr/local/bin/eclipse-kbd`: hot-switch the keyboard layout on the text
+/// console (`/proc/kbd`), in labwc (XKB via `environment` + `--reconfigure`)
+/// and in Xwayland (`setxkbmap`). Persist to `/etc/eclipse/keyboard`.
+///
+/// `--boot` is what eclipse-init runs before starting the compositor: apply
+/// cmdline `kbd=` / the persist file without signalling a session that is
+/// not up yet.
+fn write_eclipse_kbd(rootfs: &Path) {
+    let localbin = rootfs.join("usr/local/bin");
+    let _ = fs::create_dir_all(&localbin);
+    let script = localbin.join("eclipse-kbd");
+    fs::write(
+        &script,
+        b"#!/bin/sh\n\
+          # Eclipse OS: hot-switch keyboard layout (console + labwc + Xwayland).\n\
+          # Layouts with an in-kernel console table: es, us. See /proc/kbd.\n\
+          CONF=/etc/eclipse/keyboard\n\
+          ENVF=\"${HOME:-/root}/.config/labwc/environment\"\n\
+          PROC=/proc/kbd\n\
+          LOG=\"${HOME:-/root}/.eclipse-kbd.log\"\n\
+          \n\
+          layout_ok() {\n\
+          \x20 case \"$1\" in es|us) return 0 ;; *) return 1 ;; esac\n\
+          }\n\
+          \n\
+          current() {\n\
+          \x20 if [ -r \"$PROC\" ]; then tr -d '[:space:]' < \"$PROC\"\n\
+          \x20 else echo es\n\
+          \x20 fi\n\
+          }\n\
+          \n\
+          file_layout() {\n\
+          \x20 [ -r \"$CONF\" ] || return\n\
+          \x20 awk '\n\
+          \x20   { sub(/\\r$/, \"\") }\n\
+          \x20   /^[[:space:]]*#/ { next }\n\
+          \x20   /^[[:space:]]*layout[[:space:]]*=/ {\n\
+          \x20     sub(/^[^=]*=/, \"\"); gsub(/[[:space:]]/, \"\"); print; exit\n\
+          \x20   }\n\
+          \x20   { gsub(/[[:space:]]/, \"\"); if ($0 != \"\") { print; exit } }\n\
+          \x20 ' \"$CONF\"\n\
+          }\n\
+          \n\
+          cmdline_layout() {\n\
+          \x20 [ -r /proc/cmdline ] || return\n\
+          \x20 awk '{\n\
+          \x20   n=split($0,a,/[: \\t]/)\n\
+          \x20   for(i=1;i<=n;i++) if(a[i] ~ /^kbd=/){ sub(/^kbd=/,\"\",a[i]); print a[i]; exit }\n\
+          \x20 }' /proc/cmdline\n\
+          }\n\
+          \n\
+          resolve_boot() {\n\
+          \x20 c=$(cmdline_layout)\n\
+          \x20 if layout_ok \"$c\"; then echo \"$c\"; return; fi\n\
+          \x20 f=$(file_layout)\n\
+          \x20 if layout_ok \"$f\"; then echo \"$f\"; return; fi\n\
+          \x20 current\n\
+          }\n\
+          \n\
+          upsert_xkb() {\n\
+          \x20 layout=$1\n\
+          \x20 mkdir -p \"$(dirname \"$ENVF\")\"\n\
+          \x20 if [ -f \"$ENVF\" ]; then\n\
+          \x20   grep -v '^XKB_DEFAULT_LAYOUT=' \"$ENVF\" > \"$ENVF.new\" 2>/dev/null || :\n\
+          \x20   echo \"XKB_DEFAULT_LAYOUT=$layout\" >> \"$ENVF.new\"\n\
+          \x20   mv \"$ENVF.new\" \"$ENVF\"\n\
+          \x20 else\n\
+          \x20   echo \"XKB_DEFAULT_LAYOUT=$layout\" > \"$ENVF\"\n\
+          \x20 fi\n\
+          }\n\
+          \n\
+          apply() {\n\
+          \x20 layout=$1\n\
+          \x20 boot=$2\n\
+          \x20 if [ -w \"$PROC\" ] || [ -e \"$PROC\" ]; then\n\
+          \x20   echo \"$layout\" > \"$PROC\" 2>>\"$LOG\" || echo \"eclipse-kbd: /proc/kbd write failed\" >>\"$LOG\"\n\
+          \x20 fi\n\
+          \x20 mkdir -p /etc/eclipse\n\
+          \x20 echo \"layout=$layout\" > \"$CONF\"\n\
+          \x20 upsert_xkb \"$layout\"\n\
+          \x20 if [ \"$boot\" != boot ]; then\n\
+          \x20   if [ -n \"${LABWC_PID:-}\" ] && kill -0 \"$LABWC_PID\" 2>/dev/null; then\n\
+          \x20     kill -HUP \"$LABWC_PID\" 2>>\"$LOG\" || true\n\
+          \x20   elif [ -x /usr/bin/labwc ]; then\n\
+          \x20     /usr/bin/labwc --reconfigure >>\"$LOG\" 2>&1 || true\n\
+          \x20   fi\n\
+          \x20   if command -v setxkbmap >/dev/null 2>&1; then\n\
+          \x20     for sock in /tmp/.X11-unix/X*; do\n\
+          \x20       [ -S \"$sock\" ] || continue\n\
+          \x20       n=${sock##*/X}\n\
+          \x20       case \"$n\" in ''|*[!0-9]*) continue ;; esac\n\
+          \x20       DISPLAY=\":$n\" setxkbmap \"$layout\" >>\"$LOG\" 2>&1 && break\n\
+          \x20     done\n\
+          \x20   fi\n\
+          \x20 fi\n\
+          \x20 echo \"[$(date '+%H:%M:%S')] layout=$layout boot=$boot\" >>\"$LOG\"\n\
+          }\n\
+          \n\
+          usage() {\n\
+          \x20 echo \"usage: eclipse-kbd [es|us|toggle|--boot]\" >&2\n\
+          \x20 exit 2\n\
+          }\n\
+          \n\
+          case \"${1:-}\" in\n\
+          '' ) current; exit 0 ;;\n\
+          -h|--help) usage ;;\n\
+          --boot)\n\
+          \x20 apply \"$(resolve_boot)\" boot\n\
+          \x20 current\n\
+          \x20 exit 0\n\
+          \x20 ;;\n\
+          toggle)\n\
+          \x20 case \"$(current)\" in us) n=es ;; *) n=us ;; esac\n\
+          \x20 apply \"$n\"\n\
+          \x20 echo \"$n\"\n\
+          \x20 ;;\n\
+          es|us)\n\
+          \x20 apply \"$1\"\n\
+          \x20 echo \"$1\"\n\
+          \x20 ;;\n\
+          *) usage ;;\n\
+          esac\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let etc = rootfs.join("etc/eclipse");
+    let _ = fs::create_dir_all(&etc);
+    fs::write(etc.join("keyboard"), b"layout=es\n").unwrap();
 }
 
 /// Eclipse's xfconf channel defaults, under `/etc/xdg` (the sysconfig layer
@@ -936,6 +1072,8 @@ fn write_labwc_rc(rootfs: &Path) {
     <keybind key="W-S-2"><action name="SendToDesktop"><to>2</to></action></keybind>
     <keybind key="W-S-3"><action name="SendToDesktop"><to>3</to></action></keybind>
     <keybind key="W-S-4"><action name="SendToDesktop"><to>4</to></action></keybind>
+    <!-- Keyboard layout: cycle es/us on console, labwc and Xwayland -->
+    <keybind key="W-K"><action name="Execute"><command>/usr/local/bin/eclipse-kbd toggle</command></action></keybind>
   </keyboard>
   <mouse>
     <!-- Restore labwc's built-in mouse bindings FIRST: move (drag the
@@ -1001,6 +1139,7 @@ fn write_labwc_menu(rootfs: &Path) {
     <item label="Prueba SDL2 (renderer)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-sdl-probe --hold</command></action></item>
     <item label="Prueba SDL3 (wl_shm)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-sdl-probe --sdl3 --surface --hold</command></action></item>
     <separator/>
+    <item label="Teclado (es/us)"><action name="Execute"><command>/usr/local/bin/eclipse-kbd toggle</command></action></item>
     <item label="Recargar labwc"><action name="Reconfigure"/></item>
     <item label="Salir de la sesion"><action name="Exit"/></item>
   </menu>
@@ -1054,6 +1193,10 @@ fn write_labwc_environment(rootfs: &Path) {
           # \"error: 'C' is not a UTF-8 locale\" without it. musl accepts any\n\
           # UTF-8 locale name; glibc userspaces ship C.UTF-8 as a builtin.\n\
           LANG=C.UTF-8\n\
+          # Console + labwc + Xwayland share this layout. eclipse-kbd updates\n\
+          # the line in-place and labwc --reconfigure reloads it (labwc >= 0.7.2).\n\
+          XKB_DEFAULT_LAYOUT=es\n\
+          XKB_DEFAULT_MODEL=pc105\n\
           # Private gdk-pixbuf loader registry, regenerated by autostart on\n\
           # every session start (the apk trigger that creates the system one\n\
           # may never have run). Harmless if the file does not exist yet.\n\
@@ -1397,6 +1540,31 @@ mod tests {
             dir.join("root/.config/labwc/autostart.README").is_file(),
             "breadcrumb README should explain the move to init services"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn eclipse_kbd_script_and_xkb_default() {
+        let dir = std::env::temp_dir().join(format!("eclipse-kbd-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_eclipse_kbd(&dir);
+        write_labwc_environment(&dir);
+        write_labwc_rc(&dir);
+        let script = dir.join("usr/local/bin/eclipse-kbd");
+        assert!(script.is_file());
+        if let Ok(status) = std::process::Command::new("sh").arg("-n").arg(&script).status()
+        {
+            assert!(status.success(), "eclipse-kbd does not parse as sh");
+        }
+        let env = fs::read_to_string(dir.join("root/.config/labwc/environment")).unwrap();
+        assert!(
+            env.lines().any(|l| l == "XKB_DEFAULT_LAYOUT=es"),
+            "labwc environment must default XKB_DEFAULT_LAYOUT=es"
+        );
+        let conf = fs::read_to_string(dir.join("etc/eclipse/keyboard")).unwrap();
+        assert!(conf.contains("layout=es"));
+        let rc = fs::read_to_string(dir.join("root/.config/labwc/rc.xml")).unwrap();
+        assert!(rc.contains("eclipse-kbd toggle"), "W-K keybind missing");
         let _ = fs::remove_dir_all(&dir);
     }
 

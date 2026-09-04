@@ -14,7 +14,7 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 51] = [
+const PROC_ROOT_STATIC: [&str; 52] = [
     "net",
     "oops",
     "memhogs",
@@ -66,6 +66,7 @@ const PROC_ROOT_STATIC: [&str; 51] = [
     "gpucefillp2p",
     "gpuroles",
     "bootprofile",
+    "kbd",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -452,6 +453,7 @@ impl INode for ProcRootINode {
             "gpuroles" => Ok(PROC_GPUROLES.clone()),
             "gpudump" => Ok(PROC_GPUDUMP.clone()),
             "bootprofile" => Ok(PROC_BOOTPROFILE.clone()),
+            "kbd" => Ok(PROC_KBD.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
                 if let Ok(pid) = name.parse::<u64>() {
@@ -1385,6 +1387,19 @@ fn store_domainname(value: &str) -> Result<()> {
     }
     crate::uname::set_domainname(value);
     Ok(())
+}
+
+fn proc_kbd_content() -> String {
+    super::kbd_layout::proc_content()
+}
+
+fn store_kbd(value: &str) -> Result<()> {
+    let v = value.trim();
+    if v.eq_ignore_ascii_case("toggle") {
+        super::kbd_layout::toggle();
+        return Ok(());
+    }
+    super::kbd_layout::set(v)
 }
 
 /// `/proc/self` — target pid is resolved on read, not at `find()` time.
@@ -3006,6 +3021,11 @@ lazy_static! {
         inode: 72,
         generate: proc_net_unix_content,
     });
+    static ref PROC_KBD: Arc<dyn INode> = Arc::new(ProcSysWritableINode {
+        inode: 73,
+        generate: proc_kbd_content,
+        store: store_kbd,
+    });
 }
 
 #[cfg(test)]
@@ -3039,5 +3059,15 @@ mod sysctl_tests {
         // Version nibble is 4; variant nibble is one of 8/9/a/b.
         assert_eq!(s.as_bytes()[14], b'4');
         assert!(matches!(s.as_bytes()[19], b'8' | b'9' | b'a' | b'b'));
+    }
+
+    #[test]
+    fn writable_kbd_rejects_unknown_layout() {
+        let inode = ProcSysWritableINode {
+            inode: 998,
+            generate: proc_kbd_content,
+            store: store_kbd,
+        };
+        assert!(inode.write_at(0, b"de\n").is_err());
     }
 }

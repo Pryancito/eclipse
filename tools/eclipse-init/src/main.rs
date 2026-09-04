@@ -213,6 +213,10 @@ fn main() {
     mount_pseudo_filesystems();
     install_signal_handlers();
 
+    // Align /proc/kbd, /etc/eclipse/keyboard and labwc's XKB_DEFAULT_LAYOUT
+    // before the compositor starts, so the first keymap matches the console.
+    apply_keyboard_layout();
+
     let mut services = load_services(Path::new("/etc/eclipse/services"));
 
     // Pick the desktop session and drop every service tagged for a different
@@ -483,6 +487,21 @@ fn cmdline_desktop() -> Option<String> {
         .find_map(|tok| tok.strip_prefix("desktop="))
         .filter(|d| !d.is_empty())
         .map(String::from)
+}
+
+/// Apply the persisted / cmdline keyboard layout before any compositor starts.
+/// `eclipse-kbd --boot` writes `/proc/kbd` and `XKB_DEFAULT_LAYOUT` but does
+/// not SIGHUP labwc (it is not running yet). Missing script is not fatal: an
+/// image built before this tool still boots, just with the compiled default.
+fn apply_keyboard_layout() {
+    match std::process::Command::new("/usr/local/bin/eclipse-kbd")
+        .arg("--boot")
+        .status()
+    {
+        Ok(st) if st.success() => {}
+        Ok(st) => log(&format!("eclipse-kbd --boot exited {st}")),
+        Err(e) => log(&format!("eclipse-kbd --boot skipped: {e}")),
+    }
 }
 
 // ---------------------------------------------------------------------------

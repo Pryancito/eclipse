@@ -76,6 +76,15 @@ pub fn mem_percent() -> Option<u32> {
     Some(((used * 100) / total).min(100) as u32)
 }
 
+/// Keyboard layout from `/proc/kbd` (`es` / `us`), shown uppercase on the bar.
+pub fn kbd_layout() -> String {
+    std::fs::read_to_string("/proc/kbd")
+        .ok()
+        .map(|s| s.trim().to_ascii_uppercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "ES".into())
+}
+
 /// Wall clock "HH:MM" (24h). Uses libc localtime_r so a set TZ is honoured;
 /// with no TZ, musl returns UTC — fine for a bar clock.
 pub fn clock_hhmm() -> String {
