@@ -961,17 +961,33 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # set WLR_NO_HARDWARE_CURSORS -- letting wlroots use the hardware\n\
               # cursor path avoids re-rendering the whole scene on every pointer\n\
               # move (the whole point of a HW cursor).\n\
-              # Pin wlroots to the console GPU's DRM node (card0 =\n\
-              # nvidia-gpu-23:0.0). This box has TWO nvidia DRM cards (card0 =\n\
-              # console GPU driving the physical monitor via the UEFI GOP\n\
-              # framebuffer; card1 = the compute GPU we run kernels on). Without\n\
-              # this, wlroots may enumerate both and bind a phantom connector on\n\
-              # the compute GPU. Pinning card0 gives labwc a SINGLE logical\n\
-              # output and keeps it off the compute GPU. Physical pixels always\n\
-              # land on the GOP framebuffer via the kernel's software-KMS\n\
-              # scanout regardless, so this is really about presenting one\n\
-              # output, not about which port lights up.\n\
-              export WLR_DRM_DEVICES=/dev/dri/card0\n\
+              # Pin wlroots to the console GPU's DRM node. On real dual-GPU\n\
+              # rigs card indexes may flip across boots, so prefer the card\n\
+              # marked boot_vga=1 (display console GPU), then the first visible\n\
+              # /dev/dri/card* node, then /dev/dri/card0 as a last resort.\n\
+              if [ -z \"${WLR_DRM_DEVICES:-}\" ]; then\n\
+                __eclipse_drm=\"\"\n\
+                for __eclipse_boot in /sys/class/drm/card*/device/boot_vga; do\n\
+                  [ -r \"$__eclipse_boot\" ] || continue\n\
+                  if [ \"$(tr -d '[:space:]' < \"$__eclipse_boot\" 2>/dev/null)\" = \"1\" ]; then\n\
+                    __eclipse_card=\"${__eclipse_boot%/device/boot_vga}\"\n\
+                    __eclipse_card=\"${__eclipse_card##*/}\"\n\
+                    __eclipse_drm=\"/dev/dri/${__eclipse_card}\"\n\
+                    break\n\
+                  fi\n\
+                done\n\
+                if [ -z \"$__eclipse_drm\" ]; then\n\
+                  for __eclipse_node in /dev/dri/card*; do\n\
+                    [ -e \"$__eclipse_node\" ] || continue\n\
+                    __eclipse_drm=\"$__eclipse_node\"\n\
+                    break\n\
+                  done\n\
+                fi\n\
+                : \"${__eclipse_drm:=/dev/dri/card0}\"\n\
+                export WLR_DRM_DEVICES=\"$__eclipse_drm\"\n\
+                unset __eclipse_drm __eclipse_boot __eclipse_card __eclipse_node\n\
+              fi\n\
+              export WLR_DRM_DEVICES\n\
               # Last-resort software-GL override, kept commented. The renderer\n\
               # block above already picks the right stack per the two-condition\n\
               # gate: hardware GL (vulkan+zink) only on NVIDIA+flag, software GL\n\

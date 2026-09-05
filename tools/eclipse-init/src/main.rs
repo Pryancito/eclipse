@@ -163,7 +163,6 @@ const CHILD_ENV: &[&str] = &[
     // forces wlroots GLES2 over Mesa llvmpipe (software GL — renders in QEMU
     // where there is no GPU 3D).
     "WLR_BACKENDS=drm,libinput",
-    "WLR_DRM_DEVICES=/dev/dri/card0",
     "WLR_LIBINPUT_NO_DEVICES=1",
     // Force LINEAR scanout buffers. Our presentation is a CPU blit that reads
     // the framebuffer linearly, so it can only scan out DRM_FORMAT_MOD_LINEAR.
@@ -1111,6 +1110,48 @@ fn cmdline_has(token: &str) -> bool {
         .any(|t| t == token)
 }
 
+/// Choose the DRM node for wlroots.
+///
+/// On real multi-GPU machines the display console GPU is not guaranteed to stay
+/// at `card0`; prefer the card marked `boot_vga=1` and fall back to the first
+/// existing `/dev/dri/card*` node, then `/dev/dri/card0` as a last resort.
+fn default_wlr_drm_device() -> String {
+    let mut cards: Vec<String> = fs::read_dir("/sys/class/drm")
+        .ok()
+        .into_iter()
+        .flat_map(|it| it.filter_map(Result::ok))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| {
+            name.strip_prefix("card")
+                .map(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+                .unwrap_or(false)
+        })
+        .collect();
+    cards.sort();
+
+    for card in &cards {
+        let boot_vga = format!("/sys/class/drm/{card}/device/boot_vga");
+        if fs::read_to_string(&boot_vga)
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false)
+        {
+            let node = format!("/dev/dri/{card}");
+            if Path::new(&node).exists() {
+                return node;
+            }
+        }
+    }
+
+    for card in cards {
+        let node = format!("/dev/dri/{card}");
+        if Path::new(&node).exists() {
+            return node;
+        }
+    }
+
+    "/dev/dri/card0".to_string()
+}
+
 /// Inject `/lib/libeclipse_nvkick.so` at the front of `LD_PRELOAD` so GL/NVK
 /// clients (lunarbar → glxgears) inherit the usermode kick without a login
 /// shell sourcing `/etc/profile`. Does not replace an existing preload list.
@@ -1148,6 +1189,7 @@ fn build_child_env() -> Vec<CString> {
     overlay_locale(&mut env);
     overlay_tz(&mut env);
     prepend_nvkick_preload(&mut env);
+    env.push(CString::new(format!("WLR_DRM_DEVICES={}", default_wlr_drm_device())).unwrap());
     match renderer_mode() {
         Renderer::Pixman => {
             env.push(CString::new("WLR_RENDERER=pixman").unwrap());

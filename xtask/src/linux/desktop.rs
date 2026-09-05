@@ -1770,8 +1770,34 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # udevd and makes wlroots abort with 'Found 0 GPUs, cannot create\n\
           # backend'. With WLR_DRM_DEVICES set, wlroots skips enumeration and\n\
           # opens this node directly (via libseat), which is exactly the KMS\n\
-          # device Eclipse exposes. Colon-separated list; we have one card.\n\
-          : \"${WLR_DRM_DEVICES:=/dev/dri/card0}\"; export WLR_DRM_DEVICES\n\
+          # device Eclipse exposes.\n\
+          #\n\
+          # On real dual-GPU rigs card indexes may flip across boots. Prefer\n\
+          # the card marked boot_vga=1 (the console/display GPU), then fall\n\
+          # back to the first visible card node, then /dev/dri/card0.\n\
+          if [ -z \"${WLR_DRM_DEVICES:-}\" ]; then\n\
+            __eclipse_drm=\"\"\n\
+            for __eclipse_boot in /sys/class/drm/card*/device/boot_vga; do\n\
+              [ -r \"$__eclipse_boot\" ] || continue\n\
+              if [ \"$(tr -d '[:space:]' < \"$__eclipse_boot\" 2>/dev/null)\" = \"1\" ]; then\n\
+                __eclipse_card=\"${__eclipse_boot%/device/boot_vga}\"\n\
+                __eclipse_card=\"${__eclipse_card##*/}\"\n\
+                __eclipse_drm=\"/dev/dri/${__eclipse_card}\"\n\
+                break\n\
+              fi\n\
+            done\n\
+            if [ -z \"$__eclipse_drm\" ]; then\n\
+              for __eclipse_node in /dev/dri/card*; do\n\
+                [ -e \"$__eclipse_node\" ] || continue\n\
+                __eclipse_drm=\"$__eclipse_node\"\n\
+                break\n\
+              done\n\
+            fi\n\
+            : \"${__eclipse_drm:=/dev/dri/card0}\"\n\
+            export WLR_DRM_DEVICES=\"$__eclipse_drm\"\n\
+            unset __eclipse_drm __eclipse_boot __eclipse_card __eclipse_node\n\
+          fi\n\
+          export WLR_DRM_DEVICES\n\
           # wlroots' libinput backend aborts the compositor when it enumerates\n\
           # ZERO input devices ('libinput initialization failed, no input\n\
           # devices' -> 'Failed to initialize backend'). Without udevd, libinput\n\
