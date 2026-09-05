@@ -100,6 +100,11 @@ impl Syscall<'_> {
                 return Err(LxError::EAFNOSUPPORT);
             }
         };
+        if matches!(domain, Domain::AF_INET | Domain::AF_INET6)
+            && self.linux_process().ns().net().blocks_inet()
+        {
+            return Err(LxError::EAFNOSUPPORT);
+        }
         let socket_type_val = _type & SOCKET_TYPE_MASK;
         let socket_type = match SocketType::try_from(socket_type_val) {
             Ok(t) => t,
@@ -288,6 +293,8 @@ impl Syscall<'_> {
                 // single-user root, so report root uid/gid (which is what seatd
                 // checks) and the peer's pid when the socket tracks it.
                 const SO_PEERCRED: usize = 17;
+                const SO_PEERSEC: usize = 31;
+                const SO_PEERGROUPS: usize = 59;
                 if optname == SO_PEERCRED {
                     let file_like = self.linux_process().get_file_like(sockfd.into())?;
                     let pid = file_like
@@ -302,37 +309,47 @@ impl Syscall<'_> {
                     }
                     return write_sockopt_out(optval, optlen, &bytes);
                 }
+                // SO_PEERSEC (31): LSM label of the peer. No SELinux/AppArmor
+                // here; return the conventional unlabeled string so D-Bus does
+                // not treat ENOPROTOOPT as a hard error (and so we stop
+                // ERROR-logging every session-bus connect).
+                if optname == SO_PEERSEC {
+                    return write_sockopt_out(optval, optlen, b"unconfined\0");
+                }
+                // SO_PEERGROUPS (59): supplementary groups of the peer.
+                // Single-user root: just gid 0.
+                if optname == SO_PEERGROUPS {
+                    return write_sockopt_out(optval, optlen, &0u32.to_ne_bytes());
+                }
                 let optname = match SolOptname::try_from(optname) {
                     Ok(optname) => optname,
                     Err(_) => {
-                        error!("invalid optname: {}", optname);
+                        debug!("getsockopt: unsupported SOL_SOCKET optname: {}", optname);
                         return Err(LxError::ENOPROTOOPT);
                     }
                 };
 
-                let file_like = self.linux_process().get_file_like(sockfd.into())?;
-                let (recv_buf_ca, send_buf_ca) = file_like
-                    .clone()
-                    .as_socket()?
-                    .get_buffer_capacity()
-                    .unwrap();
-                debug!(
-                    "sys_getsockopt recv and send buffer capacity: {}, {}. optval: {:?}, optlen: {:?}",
-                    recv_buf_ca,
-                    send_buf_ca,
-                    optval.check(),
-                    optlen.check()
-                );
-
                 match optname {
-                    SolOptname::SNDBUF => {
-                        write_sockopt_out(optval, optlen, &(send_buf_ca as u32).to_ne_bytes())
-                    }
-                    SolOptname::RCVBUF => {
-                        write_sockopt_out(optval, optlen, &(recv_buf_ca as u32).to_ne_bytes())
+                    SolOptname::SNDBUF | SolOptname::RCVBUF => {
+                        // Unix/netlink sockets used to return `None` here; the
+                        // `.unwrap()` paniced the kernel the moment GLib/D-Bus
+                        // did `getsockopt(SO_ERROR)`/`SO_SNDBUF` on AF_UNIX
+                        // (panic banner then #PF'd on the bootloader cmdline).
+                        let file_like = self.linux_process().get_file_like(sockfd.into())?;
+                        let (recv_buf_ca, send_buf_ca) = file_like
+                            .clone()
+                            .as_socket()?
+                            .get_buffer_capacity()
+                            .unwrap_or((212992, 212992));
+                        if matches!(optname, SolOptname::SNDBUF) {
+                            write_sockopt_out(optval, optlen, &(send_buf_ca as u32).to_ne_bytes())
+                        } else {
+                            write_sockopt_out(optval, optlen, &(recv_buf_ca as u32).to_ne_bytes())
+                        }
                     }
                     SolOptname::REUSEADDR => write_sockopt_out(optval, optlen, &1u32.to_ne_bytes()),
                     SolOptname::ERROR => {
+                        let file_like = self.linux_process().get_file_like(sockfd.into())?;
                         let err = file_like.clone().as_socket()?.take_so_error();
                         write_sockopt_out(optval, optlen, &(err as u32).to_ne_bytes())
                     }
@@ -344,7 +361,7 @@ impl Syscall<'_> {
                 let optname = match TcpOptname::try_from(optname) {
                     Ok(optname) => optname,
                     Err(_) => {
-                        error!("invalid optname: {}", optname);
+                        debug!("getsockopt: unsupported IPPROTO_TCP optname: {}", optname);
                         return Err(LxError::ENOPROTOOPT);
                     }
                 };
@@ -356,7 +373,7 @@ impl Syscall<'_> {
                 let optname = match IpOptname::try_from(optname) {
                     Ok(optname) => optname,
                     Err(_) => {
-                        error!("invalid optname: {}", optname);
+                        debug!("getsockopt: unsupported IPPROTO_IP optname: {}", optname);
                         return Err(LxError::ENOPROTOOPT);
                     }
                 };

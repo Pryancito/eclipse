@@ -13,9 +13,9 @@ impl Syscall<'_> {
         flags: usize,
         data: UserInPtr<u8>,
     ) -> SysResult {
-        let source = source.as_c_str()?;
+        let source = if source.is_null() { "" } else { source.as_c_str()? };
         let target = target.as_c_str()?;
-        let fstype = fstype.as_c_str()?;
+        let fstype = if fstype.is_null() { "" } else { fstype.as_c_str()? };
         let data = if data.is_null() { "" } else { data.as_c_str()? };
         info!(
             "mount: source={:?}, target={:?}, fstype={:?}, flags={:#x}",
@@ -30,7 +30,7 @@ impl Syscall<'_> {
     pub fn sys_umount2(&self, target: UserInPtr<u8>, flags: usize) -> SysResult {
         let target = target.as_c_str()?;
         info!("umount2: target={:?}, flags={:#x}", target, flags);
-        umount_fs(target, flags)?;
+        umount_fs(self.linux_process(), target, flags)?;
         linux_object::fs::dcache_invalidate();
         Ok(0)
     }

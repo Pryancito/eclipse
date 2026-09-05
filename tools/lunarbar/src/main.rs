@@ -1443,7 +1443,7 @@ impl State {
                     }
                 }
                 self.spawn(&format!(
-                    "pactl set-sink-volume @DEFAULT_SINK@ {v}% >/dev/null 2>&1 || amixer set Master {v}% >/dev/null 2>&1 || wpctl set-volume @DEFAULT_AUDIO_SINK@ {v}%"
+                    "pactl set-sink-volume @DEFAULT_SINK@ {v}% >/dev/null 2>&1 || amixer set Master {v}% >/dev/null 2>&1"
                 ));
                 self.render_popup();
                 self.render_all();

@@ -56,6 +56,7 @@ pub fn install(rootfs: &Path) {
     write_eclipse_kbd(rootfs);
     write_eclipse_locale(rootfs);
     write_eclipse_tz(rootfs);
+    disable_atspi_autostart(rootfs);
 }
 
 /// `/usr/local/bin/eclipse-xkbmap`: load the X keyboard map into Xwayland once
@@ -1495,6 +1496,9 @@ fn write_labwc_environment(rootfs: &Path) {
           # No D-Bus session bus on Eclipse OS: keep GTK's settings out of\n\
           # dconf so apps never try to autolaunch one.\n\
           GSETTINGS_BACKEND=memory\n\
+          GTK_A11Y=none\n\
+          NO_AT_BRIDGE=1\n\
+          GDK_BACKEND=wayland\n\
           # SDL (1.2 via sdl12-compat, SDL2, SDL3): native Wayland first, X11\n\
           # (Xwayland) as fallback, and ALSA audio -- the renderer-independent\n\
           # half of the SDL policy. The renderer half (SDL_RENDER_DRIVER /\n\
@@ -1565,6 +1569,20 @@ fn write_gtk_settings(rootfs: &Path) {
         )
         .unwrap();
     }
+}
+
+/// D-Bus would otherwise activate `at-spi-bus-launcher` the first time a GTK
+/// app probes accessibility. Without compiled schemas it `g_error()`s (SIGABRT).
+/// Eclipse has no a11y session; point the well-known name at `/bin/true`.
+fn disable_atspi_autostart(rootfs: &Path) {
+    let svc = rootfs.join("usr/share/dbus-1/services/org.a11y.Bus.service");
+    let _ = fs::create_dir_all(svc.parent().unwrap());
+    let _ = fs::write(
+        &svc,
+        b"[D-BUS Service]\n\
+          Name=org.a11y.Bus\n\
+          Exec=/bin/true\n",
+    );
 }
 
 /// foot terminal palette matching the desktop (deep violet background,
@@ -1724,6 +1742,10 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # `dbus-daemon --session --address=unix:path=$XDG_RUNTIME_DIR/bus`\n\
           # started later is picked up by every new client automatically.\n\
           : \"${DBUS_SESSION_BUS_ADDRESS:=unix:path=/run/user/0/bus}\"; export DBUS_SESSION_BUS_ADDRESS\n\
+          : \"${GSETTINGS_BACKEND:=memory}\"; export GSETTINGS_BACKEND\n\
+          : \"${GTK_A11Y:=none}\"; export GTK_A11Y\n\
+          : \"${NO_AT_BRIDGE:=1}\"; export NO_AT_BRIDGE\n\
+          : \"${GDK_BACKEND:=wayland}\"; export GDK_BACKEND\n\
           # Backends: DRM for output + libinput for evdev. Naming them keeps\n\
           # wlroots off the headless/X11 autodetect fallbacks when no parent\n\
           # display exists.\n\
@@ -1962,6 +1984,10 @@ mod tests {
             ("ALSOFT_DRIVERS", "pulse,alsa"),
             ("PULSE_SERVER", "unix:/run/pulse/native"),
             ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/0/bus"),
+            ("GSETTINGS_BACKEND", "memory"),
+            ("GTK_A11Y", "none"),
+            ("NO_AT_BRIDGE", "1"),
+            ("GDK_BACKEND", "wayland"),
         ] {
             assert!(
                 wrapper.contains(&format!(": \"${{{key}:={val}}}\"; export {key}")),

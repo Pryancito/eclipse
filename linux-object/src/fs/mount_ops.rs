@@ -17,7 +17,7 @@ use super::fat_mount::open_fat;
 use super::flagged_fs::wrap_fs;
 use super::mount_state::{
     self, build_options_string, flags_read_only, MNT_DETACH, MNT_FORCE, MS_BIND, MS_MOVE,
-    MS_REMOUNT,
+    MS_PROPAGATION, MS_REMOUNT,
 };
 
 lazy_static! {
@@ -141,6 +141,11 @@ pub fn mount_fs(
 ) -> LxResult<()> {
     let target_norm = normalize_target(target);
 
+    // Propagation-only (bwrap: mount(NULL, "/", NULL, MS_REC|MS_PRIVATE)).
+    if flags & MS_PROPAGATION != 0 && flags & MS_BIND == 0 && flags & MS_MOVE == 0 {
+        return Ok(());
+    }
+
     if flags & MS_REMOUNT != 0 {
         return super::remount_flags(&target_norm, flags, data);
     }
@@ -149,10 +154,32 @@ pub fn mount_fs(
         return mount_move(source, &target_norm);
     }
 
+    let isolated = !proc.ns().mount().is_init();
+    let overlay_key = crate::ns::join_chroot_prefix(&proc.chroot_prefix_text(), &target_norm);
+
     if flags & MS_BIND != 0 {
+        if isolated {
+            let src_inode = proc.lookup_inode(if source.is_empty() { target } else { source })?;
+            proc.ns().mount().bind(&overlay_key, src_inode)?;
+            let opts = build_options_string(flags, data);
+            super::register_mount(
+                source,
+                &target_norm,
+                "none",
+                &opts,
+                Arc::new(mount_state::MountState::new(flags_read_only(flags, data))),
+            );
+            return Ok(());
+        }
         let source_node = resolve_mnode(source)?;
         if !source_node.is_mountpoint() {
-            return Err(LxError::EINVAL);
+            // Directory/file bind on the host ns: overlay so we don't require
+            // the source to already be a mountpoint (what bwrap needs).
+            let src_inode = proc.lookup_inode(if source.is_empty() { target } else { source })?;
+            proc.ns().mount().bind(&overlay_key, src_inode)?;
+            let opts = build_options_string(flags, data);
+            super::register_mount(source, &target_norm, "none", &opts, Arc::new(mount_state::MountState::new(flags_read_only(flags, data))));
+            return Ok(());
         }
         let inner = source_node.mounted_inner_fs().ok_or(LxError::EINVAL)?;
         let mount_node = resolve_mnode(&target_norm)?;
@@ -166,14 +193,16 @@ pub fn mount_fs(
         return Ok(());
     }
 
-    // Pseudo-filesystems the kernel already provides (procfs at /proc, sysfs at
-    // /sys, the writable dev/run/tmp trees). A real mount here is unnecessary
-    // and would shadow the live procfs, so acknowledge the request as a
-    // successful no-op — and record it in /proc/mounts — instead of failing
-    // with ENODEV. This is what lets init's `mount -t proc proc /proc`
-    // (and the other pseudo-fs mounts) succeed quietly rather than logging
-    // "mounting proc on /proc failed: No such device".
+    // Pseudo-filesystems. In an isolated mount ns, tmpfs/ramfs become a real
+    // ramfs overlay (the sandbox root). On the host ns they stay the
+    // historical no-op so init's `mount -t proc /proc` does not shadow live
+    // procfs / EBUSY an already-mounted /tmp.
     if is_virtual_fstype(fstype) {
+        if isolated
+            && (fstype.eq_ignore_ascii_case("tmpfs") || fstype.eq_ignore_ascii_case("ramfs"))
+        {
+            proc.ns().mount().mount_tmpfs(&overlay_key)?;
+        }
         let opts = build_options_string(flags, data);
         let state = Arc::new(mount_state::MountState::new(flags_read_only(flags, data)));
         super::register_mount(source, &target_norm, fstype, &opts, state);
@@ -224,9 +253,16 @@ fn mount_move(source: &str, target: &str) -> LxResult<()> {
 }
 
 /// Unmount a filesystem mounted at `target`.
-pub fn umount_fs(target: &str, flags: usize) -> LxResult<()> {
+pub fn umount_fs(proc: &LinuxProcess, target: &str, flags: usize) -> LxResult<()> {
     let _ = flags & (MNT_FORCE | MNT_DETACH);
     let target_norm = normalize_target(target);
+    if !proc.ns().mount().is_init() {
+        let key = crate::ns::join_chroot_prefix(&proc.chroot_prefix_text(), &target_norm);
+        if proc.ns().mount().umount(&key).is_ok() {
+            super::unregister_mount(&target_norm);
+            return Ok(());
+        }
+    }
     let mount_node = resolve_mnode(&target_norm)?;
     if !mount_node.is_mountpoint() {
         return Err(LxError::EINVAL);

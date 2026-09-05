@@ -380,7 +380,7 @@ pub fn first_weekday_mon0(y: i32, m0: u32) -> u32 {
 
 /// System audio volume percent (0..100). Returns None when no supported
 /// audio subsystem is present; the volume module is hidden in that case.
-/// Setting the volume is handled by spawning pactl/amixer/wpctl from the popup.
+/// Setting the volume is handled by spawning pactl/amixer from the popup.
 ///
 /// Forks a helper once (startup / after the user changes the slider) — never
 /// call this from the 1 Hz tick.
@@ -388,9 +388,8 @@ pub fn volume() -> Option<u32> {
     if let Some(v) = volume_pactl() {
         return Some(v);
     }
-    if let Some(v) = volume_wpctl() {
-        return Some(v);
-    }
+    // Do not probe `wpctl` (WirePlumber): on this kernel it SIGSEGVs at
+    // a NULL+0x10 read (pid logged as proc=wpctl). Pulse + ALSA cover us.
     volume_amixer()
 }
 
@@ -419,24 +418,6 @@ fn volume_pactl() -> Option<u32> {
         }
     }
     None
-}
-
-fn volume_wpctl() -> Option<u32> {
-    let out = std::process::Command::new("wpctl")
-        .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout);
-    // "Volume: 0.50" or "Volume: 0.50 [MUTED]"
-    let frac: f64 = s
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()?;
-    Some((frac * 100.0).round().clamp(0.0, 100.0) as u32)
 }
 
 fn volume_amixer() -> Option<u32> {

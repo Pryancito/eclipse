@@ -20,6 +20,9 @@ las decisiones donde nuestro kernel difiere deliberadamente.
 | `prctl(PR_SET_NO_NEW_PRIVS)` | **Documentation/userspace-api/no_new_privs.rst** | Flag unidireccional, heredado por `fork`/`execve`; con él activo `execve` no honra bits setuid/setgid |
 | `prctl` dumpable / timerslack / THP / capbset / tid_address | prctl(2) | Estado real por proceso/hilo; opciones desconocidas → `EINVAL` (antes *todas* devolvían 0, afirmando p. ej. que seccomp estaba activo) |
 | `personality` | personality(2) | Persona por proceso (PER_LINUX + modificadores como `ADDR_NO_RANDOMIZE`), heredada; consultable con 0xffffffff |
+| `unshare` / `clone(CLONE_NEW*)` / `setns` | namespaces.rst | User (uid_map), mount (overlay bind/tmpfs), uts, net (sin AF_INET), pid/ipc/cgroup (identidad `setns`). `/proc/<pid>/{uid_map,gid_map,setgroups,ns/*}` |
+| `chroot` / `pivot_root` | pivot_root(2) | Root por proceso; `pivot_root` reescribe overlays del mount ns |
+| `seccomp` / `prctl(PR_{GET,SET}_SECCOMP)` | seccomp_filter.rst | Filtro BPF clásico (ALLOW / ERRNO; KILL se traduce a EPERM). `PR_GET_SECCOMP` → 0/1/2 |
 
 ## Señales
 
@@ -61,8 +64,7 @@ las decisiones donde nuestro kernel difiere deliberadamente.
 - **`clone3` → `ENOSYS`**: comportamiento pre-5.3; glibc/musl caen a `clone`
   limpiamente (ver comentario en `linux-syscall/src/lib.rs` con la causa raíz).
 - **`rseq` → `ENOSYS` silencioso**: glibc lo sondea y cae con gracia.
-- **seccomp**: `prctl(PR_GET/SET_SECCOMP)` responde `EINVAL` como un kernel
-  compilado sin `CONFIG_SECCOMP`; el syscall `seccomp` queda en `ENOSYS`.
+- **`open_tree`/`move_mount` → `ENOSYS`**: bwrap cae a `mount(2)`, que sí aísla.
 - **Colas de mensajes**: `msgrcv` despierta por sondeo corto (5 ms) en vez de
   con una cola de waiters; suficiente para las cargas que las usan, y el
   camino queda interrumpible por señales (`EINTR`) como pide msgsnd(2).

@@ -27,6 +27,9 @@ lazy_static! {
 }
 
 const MAX_UNIX_SOCKET_REGISTRY: usize = 1024;
+/// Cap on each end's inbound byte buffer (and the value we report for
+/// `SO_SNDBUF`/`SO_RCVBUF`). Matches the write-side bound below.
+const UNIX_STREAM_BUF_MAX: usize = 4 * 1024 * 1024;
 
 /// Snapshot the bound-socket registry for `/proc/net/unix`:
 /// `(path, strong reference count, is_listening)` per live entry, sorted by
@@ -497,7 +500,6 @@ impl Socket for UnixSocketState {
         // syscall layer already loops on short writes); return EAGAIN when the
         // buffer is completely full. This method is synchronous and never blocked
         // before, so no blocking behavior is lost.
-        const UNIX_STREAM_BUF_MAX: usize = 4 * 1024 * 1024;
         let space = UNIX_STREAM_BUF_MAX.saturating_sub(pi.buffer.len());
         if space == 0 {
             return Err(LxError::EAGAIN);
@@ -648,6 +650,10 @@ impl Socket for UnixSocketState {
 
     fn setsockopt(&self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
         Ok(0)
+    }
+
+    fn get_buffer_capacity(&self) -> Option<(usize, usize)> {
+        Some((UNIX_STREAM_BUF_MAX, UNIX_STREAM_BUF_MAX))
     }
 
     fn peer_pid(&self) -> Option<i32> {

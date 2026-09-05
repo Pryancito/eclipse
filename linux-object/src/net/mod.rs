@@ -2123,9 +2123,11 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
         warn!("ioctl is unimplemented for this socket");
         Ok(0)
     }
-    /// Get Socket recv and send buffer capacity
+    /// Get Socket recv and send buffer capacity.
+    /// Default matches Linux `net.core.wmem_default` so AF_UNIX/netlink
+    /// `getsockopt(SO_SNDBUF)` cannot panic the kernel on `None`.
     fn get_buffer_capacity(&self) -> Option<(usize, usize)> {
-        None
+        Some((212992, 212992))
     }
     /// Get Socket Type
     fn socket_type(&self) -> Option<SocketType> {

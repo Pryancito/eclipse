@@ -481,10 +481,24 @@ impl ProcPidDirINode {
         ROOT_JOB.find_process(self.pid as _)
     }
 
-    fn entries() -> [&'static str; 12] {
+    fn entries() -> [&'static str; 16] {
         [
-            ".", "..", "stat", "cmdline", "status", "perf", "maps", "fd", "comm", "environ",
-            "statm", "exe",
+            ".",
+            "..",
+            "stat",
+            "cmdline",
+            "status",
+            "perf",
+            "maps",
+            "fd",
+            "comm",
+            "environ",
+            "statm",
+            "exe",
+            "ns",
+            "uid_map",
+            "gid_map",
+            "setgroups",
         ]
     }
 }
@@ -588,6 +602,19 @@ impl INode for ProcPidDirINode {
                     FileType::SymLink,
                 )))
             }
+            "ns" => Ok(Arc::new(crate::ns::ProcNsDir::new(self.pid))),
+            "uid_map" => Ok(Arc::new(crate::ns::ProcIdMapFile::new(
+                self.pid,
+                crate::ns::IdMapKind::UidMap,
+            ))),
+            "gid_map" => Ok(Arc::new(crate::ns::ProcIdMapFile::new(
+                self.pid,
+                crate::ns::IdMapKind::GidMap,
+            ))),
+            "setgroups" => Ok(Arc::new(crate::ns::ProcIdMapFile::new(
+                self.pid,
+                crate::ns::IdMapKind::Setgroups,
+            ))),
             _ => Err(FsError::EntryNotFound),
         }
     }

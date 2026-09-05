@@ -71,16 +71,9 @@ pub const fn timer_interrupt_vector() -> usize {
 }
 
 pub fn cmdline() -> alloc::string::String {
-    // `boot_info.cmdline` carries a *physical* pointer (rboot runs identity-mapped,
-    // like `initrd_start`). Reading the `&str` directly only works while rboot's
-    // identity map is still live; once the kernel switches to its own page tables
-    // that low address is unmapped and the read faults (observed as a kernel page
-    // fault on a ~physical address during boot). Read it through the physmap,
-    // which always maps all RAM, so it is valid regardless of the identity map.
-    let s = KCONFIG.cmdline;
-    let virt = phys_to_virt(s.as_ptr() as usize);
-    let bytes = unsafe { core::slice::from_raw_parts(virt as *const u8, s.len()) };
-    alloc::string::String::from_utf8_lossy(bytes).into_owned()
+    // Copied into kernel BSS at `_start` (`snapshot_cmdline`); this is a real
+    // kernel virtual `&str`, not the bootloader's physical pointer.
+    alloc::string::String::from(KCONFIG.cmdline)
 }
 
 pub fn init_ram_disk() -> Option<&'static mut [u8]> {
