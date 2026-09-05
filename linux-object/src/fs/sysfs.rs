@@ -667,8 +667,6 @@ impl INode for SysDevicesPciBusDirINode {
         if let Some((idx, _dev)) = devices.iter().enumerate().find(|(_, d)| d.name == name) {
             log::trace!("SysDevicesPciBusDirINode::find name={} -> found", name);
             pci_dev_inode(idx)
-        } else if name == COMPUTE_ALIAS_BDF && compute_alias_needed() {
-            pci_dev_inode(COMPUTE_ALIAS_INDEX)
         } else {
             log::trace!(
                 "SysDevicesPciBusDirINode::find name={} -> EntryNotFound",
@@ -681,9 +679,6 @@ impl INode for SysDevicesPciBusDirINode {
         let devices = get_pci_devices();
         if id < devices.len() {
             return Ok(devices[id].name.clone());
-        }
-        if compute_alias_needed() && id == devices.len() {
-            return Ok(COMPUTE_ALIAS_BDF.into());
         }
         Err(FsError::EntryNotFound)
     }
@@ -731,11 +726,6 @@ impl INode for SysPciDevicesDirINode {
                 target
             );
             Ok(Arc::new(Pseudo::new(&target, FileType::SymLink)))
-        } else if name == COMPUTE_ALIAS_BDF && compute_alias_needed() {
-            Ok(Arc::new(Pseudo::new(
-                &format!("../../../devices/pci0000:00/{}", COMPUTE_ALIAS_BDF),
-                FileType::SymLink,
-            )))
         } else {
             log::trace!("SysPciDevicesDirINode::find name={} -> EntryNotFound", name);
             Err(FsError::EntryNotFound)
@@ -745,9 +735,6 @@ impl INode for SysPciDevicesDirINode {
         let devices = get_pci_devices();
         if id < devices.len() {
             return Ok(devices[id].name.clone());
-        }
-        if compute_alias_needed() && id == devices.len() {
-            return Ok(COMPUTE_ALIAS_BDF.into());
         }
         Err(FsError::EntryNotFound)
     }
@@ -985,61 +972,47 @@ fn pci_index_for_bdf(bus: u8, dev: u8, func: u8) -> Option<usize> {
     get_pci_devices().iter().position(|d| d.name == want)
 }
 
-/// PCI sysfs index of the compute GPU (`card1` / `renderD129`). None when
-/// there is no non-console NVIDIA GPU.
-fn drm_compute_pci_index() -> Option<usize> {
-    crate::fs::devfs::drm::get_compute_driver()
-        .and_then(|d| d.pci_bdf())
-        .and_then(|(_, bus, dev, func)| pci_index_for_bdf(bus, dev, func))
-}
-
-/// Sentinel PCI sysfs index for the compute-only DRM nodes when they would
-/// otherwise share the compute GPU's BDF with card0/renderD128.
+/// PCI sysfs index of the compute GPU (`card1` / `renderD129`). `None` when
+/// there is no non-console NVIDIA GPU, when it is absent from the PCI scan, or
+/// when it is the SAME device that already backs card0/renderD128.
 ///
+/// That last case is why the compute pair used to need a fake PCI device.
 /// libdrm's `drmGetDevices2` merges every `/dev/dri/card*` + `renderD*` with
-/// the same PCI businfo into one `drmDevice`, last node of each type wins.
-/// card1/renderD129 are named `eclipse-compute` so Mesa/NVK skip them; if they
-/// share the compute GPU's BDF with card0, that last-wins pass replaces
-/// renderD128 (nouveau) with renderD129 and wlroots GLES2 dies with
-/// `Failed to get DRM device: No such device` / `Failed to create GBM device`.
-/// A distinct fake BDF keeps the pairs as two drmDevices. NVK filters the
-/// alias by vendor `0x0000`. Do not point card0 at the console GPU.
-const COMPUTE_ALIAS_INDEX: usize = usize::MAX;
-const COMPUTE_ALIAS_BDF: &str = "0000:ee:00.0";
-
-fn compute_alias_needed() -> bool {
-    matches!(
-        (drm_card0_pci_index(), drm_compute_pci_index()),
-        (Some(a), Some(b)) if a == b
-    )
+/// the same PCI businfo into one `drmDevice`, last node of each type wins, so
+/// card1/renderD129 sharing card0's BDF replaced renderD128 (nouveau) with
+/// renderD129 and wlroots GLES2 died with `Failed to get DRM device: No such
+/// device`. The old answer was a synthetic `0000:ee:00.0` device carrying
+/// vendor `0x0000` (so NVK would skip it) and PCI class `0x038000` — but a
+/// display-class entry in `/sys/bus/pci/devices` is exactly what every PCI GPU
+/// enumerator counts, so `fastfetch` on a 2-GPU board reported a third
+/// "Unknown Device 0000".
+///
+/// There is nothing to alias: when the compute GPU *is* the card0 GPU, the
+/// compute pair is a pure duplicate of card0/renderD128. `ecl-compute` already
+/// falls back to card0, and the `ECLIPSE_COMPUTE` ioctl routes to
+/// `get_compute_driver()` from whichever node it arrives on, so dropping the
+/// duplicate costs no functionality — and the last-wins merge cannot happen at
+/// all when there is only one drmDevice.
+fn drm_compute_pci_index() -> Option<usize> {
+    let idx = crate::fs::devfs::drm::get_compute_driver()
+        .and_then(|d| d.pci_bdf())
+        .and_then(|(_, bus, dev, func)| pci_index_for_bdf(bus, dev, func))?;
+    (drm_card0_pci_index() != Some(idx)).then_some(idx)
 }
 
-fn compute_sysfs_pci_index() -> Option<usize> {
-    let compute = drm_compute_pci_index()?;
-    if drm_card0_pci_index() == Some(compute) {
-        Some(COMPUTE_ALIAS_INDEX)
-    } else {
-        Some(compute)
-    }
+/// Whether the compute-only nodes (`/dev/dri/card1`, `/dev/dri/renderD129`)
+/// should exist: only when a compute GPU distinct from the card0 GPU backs
+/// them. Keeps devfs and sysfs telling userspace the same story — a DRM node
+/// with no sysfs identity is one libdrm cannot describe.
+pub(crate) fn compute_nodes_enabled() -> bool {
+    drm_compute_pci_index().is_some()
 }
 
 fn pci_bdf_name(index: usize) -> Option<String> {
-    if index == COMPUTE_ALIAS_INDEX {
-        return Some(COMPUTE_ALIAS_BDF.into());
-    }
     get_pci_devices().get(index).map(|d| d.name.clone())
 }
 
 fn pci_dev_inode(index: usize) -> Result<Arc<dyn INode>> {
-    if index == COMPUTE_ALIAS_INDEX {
-        return Ok(Arc::new(SysPciDevDirINode {
-            index: COMPUTE_ALIAS_INDEX,
-            name: COMPUTE_ALIAS_BDF.into(),
-            vendor: "0x0000".into(),
-            device: "0x0000".into(),
-            class: "0x038000".into(),
-        }));
-    }
     let devices = get_pci_devices();
     let dev = devices.get(index).ok_or(FsError::EntryNotFound)?;
     Ok(Arc::new(SysPciDevDirINode {
@@ -1061,14 +1034,11 @@ enum DrmPciRole {
 }
 
 fn drm_pci_role(pci_index: usize) -> DrmPciRole {
-    if pci_index == COMPUTE_ALIAS_INDEX {
-        return DrmPciRole::ComputeOnly;
-    }
-    let card0 = drm_card0_pci_index();
-    let compute = drm_compute_pci_index();
-    if card0 == Some(pci_index) {
+    // `drm_compute_pci_index` already returns None when the compute GPU is the
+    // card0 GPU, so a device is never both.
+    if drm_card0_pci_index() == Some(pci_index) {
         DrmPciRole::Primary
-    } else if compute == Some(pci_index) && card0 != compute {
+    } else if drm_compute_pci_index() == Some(pci_index) {
         DrmPciRole::ComputeOnly
     } else {
         DrmPciRole::None
@@ -1148,13 +1118,16 @@ pub(crate) fn log_drm_pci_backing() {
             kernel_hal::klog_info!("[drm-probe] render node has NO PCI backing (idx={:?})", idx)
         }
     }
-    if let Some(alias) = compute_sysfs_pci_index() {
-        kernel_hal::klog_info!(
-            "[drm-probe] compute-only nodes (card1/renderD129) sysfs PCI index={:?} bdf={} (alias={} so they do not merge with card0)",
-            alias,
-            pci_bdf_name(alias).unwrap_or_else(|| "<none>".into()),
-            alias == COMPUTE_ALIAS_INDEX
-        );
+    match drm_compute_pci_index() {
+        Some(compute) => kernel_hal::klog_info!(
+            "[drm-probe] compute-only nodes (card1/renderD129) sysfs PCI index={} bdf={} (own BDF, so they do not merge with card0)",
+            compute,
+            pci_bdf_name(compute).unwrap_or_else(|| "<none>".into())
+        ),
+        None => kernel_hal::klog_info!(
+            "[drm-probe] no compute-only nodes: the compute GPU is the card0 GPU (or has no PCI \
+             entry), so card1/renderD129 would duplicate card0/renderD128 -- ecl-compute uses card0"
+        ),
     }
     // Actively resolve the EXACT sysfs chain libdrm's drmGetDevices2 walks, so
     // one boot tells us whether it resolves at runtime and what it reports --
@@ -1243,14 +1216,14 @@ impl INode for SysClassDrmDirINode {
                 },
                 None => Err(FsError::EntryNotFound),
             },
-            "card1" => match compute_sysfs_pci_index() {
+            "card1" => match drm_compute_pci_index() {
                 Some(idx) => match pci_bdf_name(idx) {
                     Some(bdf) => Ok(drm_devices_symlink("card1", &bdf)),
                     None => Ok(Arc::new(SysDrmNodeINode::card1(idx))),
                 },
                 None => Err(FsError::EntryNotFound),
             },
-            "renderD129" => match compute_sysfs_pci_index() {
+            "renderD129" => match drm_compute_pci_index() {
                 Some(idx) => match pci_bdf_name(idx) {
                     Some(bdf) => Ok(drm_devices_symlink("renderD129", &bdf)),
                     None => Ok(Arc::new(SysDrmNodeINode::render129(idx))),
@@ -1548,9 +1521,9 @@ impl INode for SysDevCharDirINode {
         // DRM nodes: Linux makes these *symlinks* into
         // `/sys/devices/pci.../drm/<name>` so realpath() lands under
         // `/sys/devices` (libudev requires that; a directory here yields
-        // ENODEV from drmGetDevice2). card1/renderD129 use the compute
-        // sysfs index, which is a distinct BDF when they would otherwise
-        // share the compute GPU with card0.
+        // ENODEV from drmGetDevice2). card1/renderD129 exist only when the
+        // compute GPU is a device of its own, so their BDF is never card0's
+        // and drmGetDevices2 cannot merge the two pairs.
         if name == "226:0" {
             if let Some(idx) = drm_card0_pci_index() {
                 return match pci_bdf_name(idx) {
@@ -1568,7 +1541,7 @@ impl INode for SysDevCharDirINode {
             }
         }
         if name == "226:1" {
-            if let Some(idx) = compute_sysfs_pci_index() {
+            if let Some(idx) = drm_compute_pci_index() {
                 return match pci_bdf_name(idx) {
                     Some(bdf) => Ok(drm_devices_symlink("card1", &bdf)),
                     None => Ok(Arc::new(SysDrmNodeINode::card1(idx))),
@@ -1576,7 +1549,7 @@ impl INode for SysDevCharDirINode {
             }
         }
         if name == "226:129" {
-            if let Some(idx) = compute_sysfs_pci_index() {
+            if let Some(idx) = drm_compute_pci_index() {
                 return match pci_bdf_name(idx) {
                     Some(bdf) => Ok(drm_devices_symlink("renderD129", &bdf)),
                     None => Ok(Arc::new(SysDrmNodeINode::render129(idx))),
