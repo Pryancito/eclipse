@@ -1103,7 +1103,7 @@ impl XhciInner {
     /// Procesar cambios de puerto diferidos. Llamar solo desde contextos no-reentrantes
     /// (process_irq_events, poll, enumerate_root_hid tras cada puerto).
     fn drain_pending_port_changes(&mut self) {
-        let ports: Vec<u8> = self.pending_port_changes.drain(..).collect();
+        let ports = core::mem::take(&mut self.pending_port_changes);
         for port_id in ports {
             let _ = self.handle_port_status_change(port_id);
         }
@@ -2432,77 +2432,75 @@ impl XhciInner {
                     });
                 }
             }
-            HID_PROTO_TABLET if h.report_len >= 6 => {
-                // QEMU usb-tablet: [buttons, X16, Y16, wheel] (6–8 bytes).
-                // VirtualBox USB Tablet: [buttons, dz, dw, pad, X16, Y16]
-                // (UsbMouse.cpp USBHIDT_REPORT). X/Y are 0..=32767 in both.
-                // libinput maps that abs range onto the output via EVIOCGABS.
-                if !(h.vbox_tablet && n < 8) {
-                    let btn = tmp[0];
-                    let vbox = h.vbox_tablet;
-                    let (ax, ay, wheel, hwheel) = if vbox {
-                        (
-                            u16::from_le_bytes([tmp[4], tmp[5]]) as i32,
-                            u16::from_le_bytes([tmp[6], tmp[7]]) as i32,
-                            tmp[1] as i8 as i32,
-                            tmp[2] as i8 as i32,
-                        )
-                    } else {
-                        (
-                            u16::from_le_bytes([tmp[1], tmp[2]]) as i32,
-                            u16::from_le_bytes([tmp[3], tmp[4]]) as i32,
-                            if n >= 6 { tmp[5] as i8 as i32 } else { 0 },
-                            if n >= 7 { tmp[6] as i8 as i32 } else { 0 },
-                        )
-                    };
-                    for (mask, code) in [
-                        (1u8, BTN_LEFT),
-                        (2u8, BTN_RIGHT),
-                        (4u8, BTN_MIDDLE),
-                        (8u8, BTN_SIDE),
-                        (16u8, BTN_EXTRA),
-                    ] {
-                        let down = (btn & mask) != 0;
-                        let was = (h.last_mods & mask) != 0;
-                        if down != was {
-                            lis.trigger(InputEvent {
-                                event_type: InputEventType::Key,
-                                code,
-                                value: if down { 1 } else { 0 },
-                            });
-                        }
-                    }
-                    h.last_mods = btn;
-                    lis.trigger(InputEvent {
-                        event_type: InputEventType::AbsAxis,
-                        code: ABS_X,
-                        value: ax,
-                    });
-                    lis.trigger(InputEvent {
-                        event_type: InputEventType::AbsAxis,
-                        code: ABS_Y,
-                        value: ay,
-                    });
-                    if wheel != 0 {
+            // QEMU usb-tablet: [buttons, X16, Y16, wheel] (6–8 bytes).
+            // VirtualBox USB Tablet: [buttons, dz, dw, pad, X16, Y16]
+            // (UsbMouse.cpp USBHIDT_REPORT). X/Y are 0..=32767 in both.
+            // libinput maps that abs range onto the output via EVIOCGABS.
+            HID_PROTO_TABLET if h.report_len >= 6 && !(h.vbox_tablet && n < 8) => {
+                let btn = tmp[0];
+                let vbox = h.vbox_tablet;
+                let (ax, ay, wheel, hwheel) = if vbox {
+                    (
+                        u16::from_le_bytes([tmp[4], tmp[5]]) as i32,
+                        u16::from_le_bytes([tmp[6], tmp[7]]) as i32,
+                        tmp[1] as i8 as i32,
+                        tmp[2] as i8 as i32,
+                    )
+                } else {
+                    (
+                        u16::from_le_bytes([tmp[1], tmp[2]]) as i32,
+                        u16::from_le_bytes([tmp[3], tmp[4]]) as i32,
+                        if n >= 6 { tmp[5] as i8 as i32 } else { 0 },
+                        if n >= 7 { tmp[6] as i8 as i32 } else { 0 },
+                    )
+                };
+                for (mask, code) in [
+                    (1u8, BTN_LEFT),
+                    (2u8, BTN_RIGHT),
+                    (4u8, BTN_MIDDLE),
+                    (8u8, BTN_SIDE),
+                    (16u8, BTN_EXTRA),
+                ] {
+                    let down = (btn & mask) != 0;
+                    let was = (h.last_mods & mask) != 0;
+                    if down != was {
                         lis.trigger(InputEvent {
-                            event_type: InputEventType::RelAxis,
-                            code: REL_WHEEL,
-                            value: -wheel,
+                            event_type: InputEventType::Key,
+                            code,
+                            value: if down { 1 } else { 0 },
                         });
                     }
-                    if hwheel != 0 {
-                        lis.trigger(InputEvent {
-                            event_type: InputEventType::RelAxis,
-                            code: REL_HWHEEL,
-                            value: hwheel,
-                        });
-                    }
+                }
+                h.last_mods = btn;
+                lis.trigger(InputEvent {
+                    event_type: InputEventType::AbsAxis,
+                    code: ABS_X,
+                    value: ax,
+                });
+                lis.trigger(InputEvent {
+                    event_type: InputEventType::AbsAxis,
+                    code: ABS_Y,
+                    value: ay,
+                });
+                if wheel != 0 {
                     lis.trigger(InputEvent {
-                        event_type: InputEventType::Syn,
-                        code: SYN_REPORT,
-                        value: 0,
+                        event_type: InputEventType::RelAxis,
+                        code: REL_WHEEL,
+                        value: -wheel,
                     });
                 }
+                if hwheel != 0 {
+                    lis.trigger(InputEvent {
+                        event_type: InputEventType::RelAxis,
+                        code: REL_HWHEEL,
+                        value: hwheel,
+                    });
+                }
+                lis.trigger(InputEvent {
+                    event_type: InputEventType::Syn,
+                    code: SYN_REPORT,
+                    value: 0,
+                });
             }
             _ => {}
         }
@@ -2593,7 +2591,7 @@ impl XhciInner {
     /// Reset Endpoint / Set TR Dequeue commands (which spin on the event ring)
     /// don't recurse into the drain loop.
     fn drain_pending_ep_resets(&mut self) {
-        let resets: Vec<(u8, u8)> = self.pending_ep_resets.drain(..).collect();
+        let resets = core::mem::take(&mut self.pending_ep_resets);
         for (slot, dci) in resets {
             // Reset the halted endpoint and point its TR dequeue past the failed
             // TRB (already skipped via advance_dequeue), then re-arm one TRB and

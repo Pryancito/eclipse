@@ -491,8 +491,8 @@ impl Syscall<'_> {
                 _ => break,
             };
             if level == SOL_SOCKET_LEVEL && typ == SCM_RIGHTS {
-                for chunk in ctrl[off + CMSG_HDR_LEN..cmsg_end].chunks_exact(4) {
-                    let raw = i32::from_ne_bytes(chunk.try_into().unwrap());
+                for chunk in ctrl[off + CMSG_HDR_LEN..cmsg_end].as_chunks::<4>().0 {
+                    let raw = i32::from_ne_bytes(*chunk);
                     if raw >= 0 {
                         if let Ok(fl) = proc.get_file_like(FileDesc::from(raw as usize)) {
                             fds.push(fl);

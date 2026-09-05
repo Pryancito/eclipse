@@ -1239,7 +1239,7 @@ lazy_static! {
 }
 
 fn proc_sys_boot_id_content() -> String {
-    alloc::format!("{}\n", &*BOOT_ID)
+    alloc::format!("{}\n", *BOOT_ID)
 }
 
 fn proc_sys_uuid_content() -> String {

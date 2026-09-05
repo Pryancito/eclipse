@@ -672,7 +672,7 @@ mod block_byte_tests {
     use alloc::vec::Vec;
     use core::sync::atomic::{AtomicUsize, Ordering};
     use rcore_fs::dev::Device;
-    use std::sync::Mutex;
+    use lock::Mutex;
     use zcore_drivers::scheme::{BlockScheme, Scheme};
     use zcore_drivers::{DeviceError, DeviceResult};
 
@@ -709,7 +709,7 @@ mod block_byte_tests {
                 return Err(DeviceError::InvalidParam);
             }
             let start = block_id * 512;
-            let d = self.sectors.lock().unwrap();
+            let d = self.sectors.lock();
             if start + buf.len() > d.len() {
                 return Err(DeviceError::InvalidParam);
             }
@@ -723,7 +723,7 @@ mod block_byte_tests {
                 return Err(DeviceError::InvalidParam);
             }
             let start = block_id * 512;
-            let mut d = self.sectors.lock().unwrap();
+            let mut d = self.sectors.lock();
             if start + buf.len() > d.len() {
                 return Err(DeviceError::InvalidParam);
             }

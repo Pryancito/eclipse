@@ -1011,7 +1011,7 @@ impl VmAddressRegion {
         let (children, mappings) = {
             let mut guard = self.inner.lock();
             let inner = guard.as_mut().ok_or(ZxError::BAD_STATE)?;
-            let children: Vec<_> = inner.children.drain(..).collect();
+            let children = core::mem::take(&mut inner.children);
             let mappings = core::mem::take(&mut inner.mappings);
             *guard = None;
             (children, mappings)
@@ -1032,7 +1032,7 @@ impl VmAddressRegion {
         let (children, mappings) = {
             let mut guard = self.inner.lock();
             let inner = guard.as_mut().ok_or(ZxError::BAD_STATE)?;
-            let children: Vec<_> = inner.children.drain(..).collect();
+            let children = core::mem::take(&mut inner.children);
             let mappings = core::mem::take(&mut inner.mappings);
             (children, mappings)
         };
@@ -3312,12 +3312,16 @@ mod tests {
     #[test]
     fn mprotect_after_prot_none_allows_user_write() {
         let vmar = VmAddressRegion::new_root();
-        let base = vmar.addr();
+        // Well above Linux's mmap_min_addr: on libos the root VMAR starts at
+        // host address 0, and a mapping there never materialises (the host
+        // refuses it), so the later mprotect fails with ENOMEM.
+        const OFF: usize = 0x10000;
+        let base = vmar.addr() + OFF;
         let vmo = VmObject::new_paged(2);
         // Empty flags = the pre-fix PROT_NONE encoding. `protect` must
         // still put USER back from the incoming mask / permission ceiling.
         vmar.map_ext(
-            Some(0),
+            Some(OFF),
             vmo,
             0,
             0x2000,

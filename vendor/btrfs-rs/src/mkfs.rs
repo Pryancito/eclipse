@@ -318,7 +318,7 @@ pub fn format(dev: &dyn BlockDevice, opts: &MkfsOptions) -> Result<()> {
             BlockGroupItem { used, flags }.encode().to_vec(),
         ));
     }
-    extent_items.sort_by(|a, b| a.0.cmp(&b.0));
+    extent_items.sort_by_key(|item| item.0);
 
     // Dev tree.
     let mut dev_items: Vec<(Key, Vec<u8>)> = Vec::new();
