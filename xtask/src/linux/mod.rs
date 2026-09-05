@@ -879,7 +879,6 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               \x20 # NVIDIA + flag -> kernel nouveau uAPI ON, but software session by default.\n\
               \x20 if grep -q 'nvidia\\.wlr_vulkan' /proc/cmdline 2>/dev/null; then\n\
               \x20\x20 export WLR_RENDERER=vulkan\n\
-              \x20\x20 export WLR_DRM_NO_MODIFIERS=1\n\
               \x20\x20 export GALLIUM_DRIVER=zink\n\
               \x20\x20 export MESA_LOADER_DRIVER_OVERRIDE=zink\n\
               \x20\x20 # SDL: GLES2 renderer on the GPU sessions (SDL2 has no Vulkan\n\
@@ -888,7 +887,6 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               \x20\x20 export SDL_FRAMEBUFFER_ACCELERATION=opengles2\n\
               \x20 elif grep -q 'nvidia\\.wlr_gles2' /proc/cmdline 2>/dev/null; then\n\
               \x20\x20 export WLR_RENDERER=gles2\n\
-              \x20\x20 export WLR_DRM_NO_MODIFIERS=1\n\
               \x20\x20 export GALLIUM_DRIVER=zink\n\
               \x20\x20 export MESA_LOADER_DRIVER_OVERRIDE=zink\n\
               \x20\x20 export SDL_RENDER_DRIVER=opengles2\n\
@@ -919,6 +917,10 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               \x20 export SDL_RENDER_DRIVER=software\n\
               \x20 export SDL_FRAMEBUFFER_ACCELERATION=0\n\
               fi\n\
+              # Force implicit-modifier (linear) scanout buffers regardless of renderer.\n\
+              # Eclipse presents by CPU-reading the framebuffer linearly; tiled\n\
+              # modifiers on dual NVIDIA setups can surface as noisy/ghosted output.\n\
+              export WLR_DRM_NO_MODIFIERS=1\n\
               # SDL (sdl12-compat / SDL2 / SDL3) backends, renderer-independent:\n\
               # native Wayland first, X11 fallback (Xwayland here, Xorg under\n\
               # desktop=xorg -- the list makes ONE policy serve both sessions),\n\
