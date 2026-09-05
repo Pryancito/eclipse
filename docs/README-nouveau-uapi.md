@@ -99,14 +99,17 @@ vea un bit de capacidad cambiar por defecto).
 añade una SEGUNDA entrada GP justo después de la del caller — un único
 `RELEASE` de semáforo host escrito por el kernel en un offset fijo del
 buffer del PROPIO canal (nunca el del caller), con timbre único para
-ambas entradas. Como GPFIFO procesa en orden estricto, una señal que
-aterriza prueba que PBDMA/HOST ya obtuvo y procesó la entrada del
-caller — **no prueba por sí sola que el motor de cómputo/GR terminó de
-ejecutarla** (eso necesitaría un semáforo de dominio de motor, como el
-segundo de `step18`, coordinado con la clase de motor que el propio
-contenido del caller haya enlazado — algo que esta función genérica no
-puede asumir con seguridad). Una prueba real de finalización de motor
-(el equivalente a un `dma_fence` de verdad) es trabajo de seguimiento.
+ambas entradas. El `RELEASE` va con **`RELEASE_WFI_EN`**: el host espera a
+que los motores del canal (GR/CE) queden *idle* antes de escribir el payload,
+así que una señal que aterriza prueba que el motor **terminó de ejecutar** la
+entrada del caller — el equivalente real a un `dma_fence`, sin tener que
+saber qué clase de motor enlazó el contenido del caller. Antes iba con
+`WFI_DIS` y sólo probaba que el PBDMA había *obtenido* la entrada; como todos
+los syncobj de NVK se resuelven contra este payload, Mesa y wlroots
+reutilizaban el staging y muestreaban texturas que la GPU aún estaba
+escribiendo (subidas parciales, «stale tiles», basura en superficies recién
+creadas: el popup del menú de `lunarbar`). Linux nouveau y NVK liberan con
+`WFI_EN` exactamente igual.
 
 ## Submit directo: `EXEC` sin entrar al RM, con fences pendientes
 
@@ -198,11 +201,12 @@ queda **para siempre** en la ruta del RM, sin reintentar en cada envío.
 
 ### Qué NO cambia
 
-La fence sigue siendo un `SEM RELEASE` host con `WFI` deshabilitado tras el
-último push: prueba que PBDMA/HOST consumió la entrada del caller, no que el
-motor terminó (ver «Qué prueba de verdad una señal de `EXEC`»). La espera en
-`SYNCOBJ_WAIT` sigue siendo un *spin* acotado por las razones de siempre —
-pero ahora suele encontrar la fence ya aterrizada.
+La fence sigue siendo un `SEM RELEASE` host tras el último push, ahora con
+`RELEASE_WFI_EN` en las dos rutas (directa y RM): prueba que el motor terminó
+la entrada del caller (ver «Qué prueba de verdad una señal de `EXEC`»). El
+codificador Rust y `chkSemExecute` del C deben coincidir, o el autotest de
+arranque desactiva la ruta directa. La espera en `SYNCOBJ_WAIT` sigue siendo
+un *spin* acotado por las razones de siempre.
 
 ## Reclamo al salir el proceso
 
