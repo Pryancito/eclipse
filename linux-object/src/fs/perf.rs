@@ -485,12 +485,30 @@ impl FileLike for PerfEvent {
         // perf maps the ring buffer at file offset 0: one control page followed
         // by `2^n` data pages. Create it on first mmap and cache it so the
         // sampler and the user mapping share the same physical frames.
-        if offset != 0 || len < 2 * PAGE_SIZE {
+        //
+        // A ONE-page mapping (the control page alone, no data pages) is valid
+        // too: Linux allows it, and it is what programs that only want the
+        // `cap_user_time`/`time_mult` clock calibration do — GZDoom's
+        // `CalculateCPUSpeed` maps exactly 4096 bytes, and then dereferences
+        // the result after checking it against `nullptr` rather than
+        // `MAP_FAILED`. Rejecting the mapping with EINVAL therefore did not
+        // "fail cleanly": it made the game read through `(void*)-1` and die
+        // with SIGSEGV right after `I_Init: Setting up machine state.` on
+        // real hardware. With no data pages the sampler never writes a record
+        // (`data_size == 0`), and the zeroed capabilities word tells the
+        // caller no user-space clock is available, which is the graceful
+        // path.
+        if offset != 0 || len < PAGE_SIZE {
             return Err(LxError::EINVAL);
         }
         let mut inner = self.inner.lock();
+        // Reuse the cached ring only if it is big enough for this mapping; a
+        // control-page-only ring created by an earlier caller must not be
+        // handed to `perf` asking for real data pages.
         if let Some(ring) = inner.ring.as_ref() {
-            return Ok(ring.vmo.clone());
+            if ring.vmo.len() >= pages(len) * PAGE_SIZE {
+                return Ok(ring.vmo.clone());
+            }
         }
         let total_pages = pages(len);
         let data_size = (total_pages - 1) * PAGE_SIZE;

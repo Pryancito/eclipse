@@ -719,6 +719,24 @@ pub struct PtySlave {
 }
 
 impl PtyMaster {
+    /// Pty number of this master (the `N` of its `/dev/pts/N`).
+    pub fn pty_id(&self) -> u32 {
+        self.pty.id
+    }
+
+    /// `TIOCGPTPEER`: open this master's slave end directly, without going
+    /// through `/dev/pts/N` (Linux 4.13+). Same bookkeeping as opening the
+    /// path. `None` once the master is closed.
+    ///
+    /// rustix-openpty (alacritty and every other Rust terminal built on it)
+    /// tries this ioctl FIRST and only falls back to `ptsname()` + `open()`
+    /// on `ENOSYS`/`EPERM`; the generic `ENOTTY` the master answered for an
+    /// unknown request was passed straight up as the program's fatal error
+    /// (`Os { code: 25, message: "Not a tty" }`) on real hardware.
+    pub fn open_peer(&self) -> Option<Arc<dyn INode>> {
+        open_pts(self.pty.id)
+    }
+
     /// Park `waker` on the master-side event bus (see
     /// `FileLike::subscribe_readiness`; reached through `File`'s inode
     /// downcast). Safe to gate a long poll backstop on: every
