@@ -51,16 +51,13 @@ ignoren; labwc sigue en `card0`):
 - `/sys/class/drm/card1`, `renderD129`
 - `/proc/gpuroles` — consola vs cómputo, BDF y si el RM está atado
 
-Estos nodos existen **solo** cuando la GPU de cómputo es un dispositivo PCI
-distinto del que respalda `card0`/`renderD128`. Si coinciden (el caso normal
-con dos NVIDIA: card0 ya va a la GPU no-consola, que es también la de
-cómputo), el par sería un duplicado exacto de card0 y **no** se crea:
-`ecl-compute` cae a `card0` y el ioctl `ECLIPSE_COMPUTE` llega igual a la GPU
-de cómputo desde cualquier nodo. Antes se les daba un BDF PCI sintético
-(`0000:ee:00.0`, vendor `0x0000`, clase `0x038000`) para que libdrm no
-fusionara card1 con card0; esa entrada de clase display hacía que `fastfetch`
-—y cualquier enumerador PCI— contara una **tercera GPU inexistente**
-("Unknown Device 0000") en una caja con dos.
+Cuando la GPU de cómputo es la misma que respalda `card0` (lo normal con dos
+NVIDIA), `card1`/`renderD129` llevan en sysfs un BDF sintético
+(`0000:ee:00.0`, vendor `0x0000`) para que libdrm no los fusione con `card0`.
+Ese alias tiene clase PCI `0x120000` (acelerador de proceso), **no** clase
+display: los enumeradores de GPU (`fastfetch`, `lspci`) cuentan toda entrada
+de clase `0x03` en `/sys/bus/pci/devices`, y con clase display salía una
+tercera GPU inexistente ("Unknown Device 0000").
 
 Pin opcional en cmdline (hex con puntos; `:` ya separa tokens):
 
@@ -79,8 +76,7 @@ ecl-vkcompute             # canario Vulkan: vkCmdDispatch + NAK en card0
 ```
 
 `ecl-compute` habla el ioctl `DRM_COMMAND_BASE+0x50` (`nr=0x90`) sobre el
-nodo `eclipse-compute` (card1 / renderD129) o, si ese par no existe, sobre
-`card0` — el ioctl enruta a `get_compute_driver()` venga por donde venga. Mesa/NVK **no** usan ese nodo:
+nodo `eclipse-compute` (card1 / renderD129). Mesa/NVK **no** usan ese nodo:
 un dispatch Vulkan va a **card0** (`DRM_IOCTL_VERSION` nombre `nouveau`).
 `ecl-vkcompute` es dinámico (`dlopen libvulkan.so.1`); no hay SDK Vulkan en
 el build, el SPIR-V SAXPY está embebido.

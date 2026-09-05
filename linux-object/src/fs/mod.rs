@@ -848,17 +848,9 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                 // Compute-only nodes: same GPU that auto_bringup_compute
                 // state-loads, advertised as driver name "eclipse-compute" so
                 // Mesa/NVK skip them. `ecl-compute` opens card1 (or
-                // renderD129). Created only when a non-console NVIDIA GPU with
-                // its OWN PCI identity backs them: a single-GPU (console-only)
-                // box has no compute GPU, and when the compute GPU is the same
-                // device that already backs card0/renderD128 the pair is a pure
-                // duplicate — `ecl-compute` falls back to card0 and the
-                // ECLIPSE_COMPUTE ioctl reaches `get_compute_driver()` from any
-                // node. Gated on the sysfs view so devfs and sysfs agree: a DRM
-                // node whose sysfs identity does not exist is one libdrm cannot
-                // describe, and faking that identity is what put a phantom
-                // third GPU in every PCI enumerator.
-                if sysfs::compute_nodes_enabled() {
+                // renderD129). Created only when a non-console NVIDIA GPU
+                // exists; single-GPU (console-only) boxes stay at card0.
+                if devfs::drm::get_compute_driver().is_some() {
                     if let Err(e) = dri_dev.add("card1", Arc::new(devfs::DrmDev::new(1))) {
                         warn!("failed to mknod /dev/dri/card1: {:?}", e);
                     } else {
