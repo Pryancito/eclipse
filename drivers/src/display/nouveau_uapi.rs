@@ -1451,9 +1451,22 @@ pub(super) const fn push_hdr(subch: u32, mthd: u32, count: u32) -> u32 {
 }
 
 pub(super) const NVC46F_SEM_ADDR_LO: u32 = 0x5c;
-/// `NVC46F_SEM_EXECUTE`: OPERATION_RELEASE (2:0 = 1), RELEASE_WFI_DIS (bit
-/// 20 = 0), PAYLOAD_SIZE_32BIT (bit 24 = 0), RELEASE_TIMESTAMP_DIS (bit 25 = 0).
-pub(super) const NVC46F_SEM_EXECUTE_RELEASE: u32 = 0x1;
+/// `NVC46F_SEM_EXECUTE`: OPERATION_RELEASE (2:0 = 1), **RELEASE_WFI_EN** (bit
+/// 20 = 1), PAYLOAD_SIZE_32BIT (bit 24 = 0), RELEASE_TIMESTAMP_DIS (bit 25 = 0).
+///
+/// WFI_EN is what turns this from "the PBDMA fetched the caller's push" into
+/// a real completion fence: the host waits for the channel's engines (GR/CE)
+/// to go idle before writing the payload. With WFI_DIS the semaphore landed
+/// as soon as the PBDMA *processed* the method, while the engine was still
+/// executing the pushes in front of it -- and since every NVK syncobj resolves
+/// against this payload, Mesa/wlroots reused staging buffers and sampled
+/// textures the GPU had not finished writing: partial texture uploads, stale
+/// tiles, garbage in freshly allocated surfaces (the lunarbar app-menu popup on
+/// the dual-RTX box). Linux nouveau (`gv100_fence_emit32`) and NVK's own queue
+/// fence both release with WFI_EN; so do we now. Must stay in step with
+/// `chkSemExecute` in `eclipse_rm_exec_fast_prepare` or `check_encodings`
+/// disables the direct-submit path.
+pub(super) const NVC46F_SEM_EXECUTE_RELEASE: u32 = 0x1 | (1 << 20);
 
 /// Build the 6-dword host semaphore RELEASE stream (`sem_va` <- `payload`).
 #[inline]
