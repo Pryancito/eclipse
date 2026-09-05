@@ -1392,18 +1392,32 @@ fn supervise(services: &mut BTreeMap<String, Service>) {
         if let Some(svc) = services.values_mut().find(|s| s.pid == Some(pid)) {
             let uptime = svc.started_at.map(|t| t.elapsed()).unwrap_or_default();
             svc.pid = None;
+            // HOW it ended, not just when: a service that keeps "exiting after
+            // 8 s" reads completely differently as `exit 0`, `exit 1` or
+            // `signal 9`, and this line is the only record on a console-only
+            // box. Uses libc's status decoding so a signal death is named.
+            let how = if libc::WIFEXITED(status) {
+                format!("exit {}", libc::WEXITSTATUS(status))
+            } else if libc::WIFSIGNALED(status) {
+                format!("signal {}", libc::WTERMSIG(status))
+            } else {
+                format!("status {:#x}", status)
+            };
             if uptime >= HEALTHY_UPTIME {
                 // Up long enough to be healthy: restart now, reset the backoff.
                 svc.backoff = MIN_BACKOFF;
-                log(&format!("respawn: {} exited after {:?}, restarting", svc.name, uptime));
+                log(&format!(
+                    "respawn: {} exited after {:?} ({}), restarting",
+                    svc.name, uptime, how
+                ));
             } else {
                 // Exited almost immediately: back off so a broken or
                 // not-yet-ready service cannot pin a CPU.
                 delay = svc.backoff;
                 svc.backoff = (svc.backoff * 2).min(MAX_BACKOFF);
                 log(&format!(
-                    "respawn: {} exited after {:?} (crash), retry in {:?}",
-                    svc.name, uptime, delay
+                    "respawn: {} exited after {:?} ({}, crash), retry in {:?}",
+                    svc.name, uptime, how, delay
                 ));
             }
         }
