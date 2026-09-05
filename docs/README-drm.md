@@ -83,7 +83,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | `DRM_IOCTL_MODE_CLOSEFB` | ✅ | Linux 6.6+: suelta la referencia sin apagar el plano |
 | `DRM_IOCTL_MODE_GETFB` | ✅ | devuelve geometría + handle (cliente master único) |
 | `DRM_IOCTL_MODE_GETFB2` | ✅ | formato `XR24`, plano 0 |
-| `DRM_IOCTL_MODE_DIRTYFB` | ✅ | aceptado; **siempre re-escanea el frame entero** (los clips parciales en el scanout WC dejaban cuadrados/líneas) |
+| `DRM_IOCTL_MODE_DIRTYFB` | ❌ | `ENOSYS` (como Linux sin `fb->dirty`). El present es page-flip / SETCRTC / ATOMIC; los clips WC en GOP/BAR1 dejaban cuadrados/líneas |
 
 ### KMS (modeset legacy)
 
@@ -129,7 +129,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 |---|---|---|
 | `DRM_CAP_DUMB_BUFFER` | 1 | |
 | `DRM_CAP_DUMB_PREFERRED_DEPTH` | 24 | scanout XRGB8888 |
-| `DRM_CAP_DUMB_PREFER_SHADOW` | 1 | el *present* es un blit CPU sobre PCIe: renderizar a *shadow* y copiar es exactamente lo aconsejable |
+| `DRM_CAP_DUMB_PREFER_SHADOW` | 0 | `DIRTYFB` no existe; Xorg no debe elegir ShadowFB |
 | `DRM_CAP_PRIME` | 3 | IMPORT \| EXPORT (dma-buf real) |
 | `DRM_CAP_TIMESTAMP_MONOTONIC` | 1 | |
 | `DRM_CAP_ASYNC_PAGE_FLIP` | 0 | |
