@@ -1028,8 +1028,8 @@ fn dma_sync_gem_rect_from_device(
 ///
 /// Used by the software KMS path (no GPU driver): the dumb buffer is contiguous
 /// physical memory, which we map and blit into the display framebuffer.
-/// Always a full frame: partial DIRTYFB / damage clips on the WC scanout
-/// left squares and lines.
+/// Always a full frame: partial damage clips on the WC scanout left
+/// squares and lines.
 pub fn scanout(fb_id: u32) -> bool {
     let fb = {
         let state = DRM_STATE.lock();

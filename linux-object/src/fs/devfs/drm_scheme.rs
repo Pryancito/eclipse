@@ -185,7 +185,10 @@ const DRM_IOCTL_WAIT_VBLANK: u32 = 0xC018643A;
 // Query an existing framebuffer object.
 const DRM_IOCTL_MODE_GETFB: u32 = 0xC01C64AD;
 const DRM_IOCTL_MODE_GETFB2: u32 = 0xC06864CE;
-// Flush framebuffer damage to the display.
+// Framebuffer damage flush (`drm_mode_fb_dirty_cmd`). No `fb->dirty`
+// callback: WC GOP/BAR1 clips smear pixels, and a full-frame present here
+// was a second blit beside PAGE_FLIP / SETCRTC / ATOMIC. Linux returns
+// ENOSYS when `fb->funcs->dirty` is NULL; we do the same.
 const DRM_IOCTL_MODE_DIRTYFB: u32 = 0xC01864B1;
 // Legacy gamma LUT get/set (`struct drm_mode_crtc_lut`, 32 bytes). The Xorg
 // modesetting driver reads the CRTC's gamma at startup (to restore on exit) and
@@ -772,28 +775,6 @@ struct DrmModeObjSetProperty {
     obj_type: u32,
 }
 
-/// `struct drm_mode_fb_dirty_cmd` (24 bytes).
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct DrmModeFbDirtyCmd {
-    fb_id: u32,
-    flags: u32,
-    color: u32,
-    num_clips: u32,
-    clips_ptr: u64,
-}
-
-/// `struct drm_clip_rect` (8 bytes) — one element of the array `clips_ptr`
-/// points to. `x2`/`y2` are exclusive, i.e. the rect covers `[x1, x2) x [y1, y2)`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct DrmClipRect {
-    x1: u16,
-    y1: u16,
-    x2: u16,
-    y2: u16,
-}
-
 /// `struct drm_set_version` (16 bytes).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -845,8 +826,6 @@ const _: () = {
     assert!(size_of::<DrmWaitVblank>() == 24); // DRM_IOCTL_WAIT_VBLANK   0x..18..
     assert!(size_of::<DrmModeSetPlane>() == 48); // DRM_IOCTL_MODE_SETPLANE 0x..30..
     assert!(size_of::<DrmModeObjSetProperty>() == 24); // OBJ_SETPROPERTY  0x..18..
-    assert!(size_of::<DrmModeFbDirtyCmd>() == 24); // DRM_IOCTL_MODE_DIRTYFB 0x..18..
-    assert!(size_of::<DrmClipRect>() == 8); // drm_clip_rect, via DIRTYFB's clips_ptr
     assert!(size_of::<DrmSetVersion>() == 16); // DRM_IOCTL_SET_VERSION   0x..10..
     assert!(size_of::<DrmModeAtomic>() == 56); // DRM_IOCTL_MODE_ATOMIC   0x..38..
     assert!(size_of::<DrmModeCreateBlob>() == 16); // CREATEPROPBLOB      0x..10..
@@ -1465,10 +1444,10 @@ impl INode for DrmDev {
                     0x1 => cap.value = 1, // DRM_CAP_DUMB_BUFFER
                     // DRM_CAP_DUMB_PREFERRED_DEPTH: XRGB8888 scanout = 24.
                     0x3 => cap.value = 24,
-                    // DRM_CAP_DUMB_PREFER_SHADOW: the dumb buffer lives behind
-                    // a CPU blit over PCIe — clients should render to a shadow
-                    // and copy, exactly what this cap advises.
-                    0x4 => cap.value = 1,
+                    // DRM_CAP_DUMB_PREFER_SHADOW: 0. Advertising 1 makes Xorg
+                    // modesetting pick ShadowFB, which flushes via DIRTYFB.
+                    // We have no dirty callback (ENOSYS); present is page-flip.
+                    0x4 => cap.value = 0,
                     // DRM_CAP_PRIME: IMPORT|EXPORT. wlroots' check_drm_features
                     // *requires* DRM_PRIME_CAP_IMPORT or the whole DRM backend
                     // fails ("PRIME import not supported") — it is mandatory for
@@ -1920,16 +1899,10 @@ impl INode for DrmDev {
                 }
             }
             DRM_IOCTL_MODE_DIRTYFB => {
-                // Accept the ioctl (X modesetting ShadowFB, simple toolkits)
-                // but always present the WHOLE framebuffer. Clip-rect dirty
-                // blits on the WC GOP/BAR1 scanout smeared neighboring pixels
-                // (squares and lines). Cursor patches stay on their own path.
-                // `num_clips` / `clips_ptr` are ignored.
-                let cmd = unsafe { *(data as *const DrmModeFbDirtyCmd) };
-                if !drm::present_now(cmd.fb_id, 1) {
-                    log::debug!("[drm] DIRTYFB fb={} not presented (no-op)", cmd.fb_id);
-                }
-                Ok(0)
+                // Match Linux `drm_mode_dirtyfb_ioctl` with no `fb->funcs->dirty`.
+                // Do not present: a full-frame blit here raced page-flip and
+                // partial clips on WC scanout smeared squares and lines.
+                Err(FsError::NotSupported)
             }
             DRM_IOCTL_MODE_GETGAMMA | DRM_IOCTL_MODE_SETGAMMA => {
                 // No programmable gamma on the software scanout: accept and
