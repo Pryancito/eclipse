@@ -8,6 +8,7 @@ use kernel_hal::drivers::prelude::{CapabilityType, InputCapability, InputEvent, 
 use kernel_hal::drivers::scheme::InputScheme;
 use rcore_fs::vfs::*;
 use rcore_fs_devfs::DevFS;
+use zcore_drivers::input::input_event_codes::syn::SYN_REPORT;
 
 use crate::time::TimeVal;
 
@@ -26,6 +27,14 @@ struct TimedInputEvent {
 
 struct EventDevInner {
     buf: VecDeque<TimedInputEvent>,
+    /// Timestamp shared by every event of the frame being assembled (up to
+    /// and including its `SYN_REPORT`). Linux stamps a whole evdev frame with
+    /// one time; libinput relies on that and treats a timestamp change
+    /// BEFORE the `SYN_REPORT` as a missing frame boundary — stamping each
+    /// event individually produced `kernel bug: event frame missing
+    /// SYN_REPORT, forcing frame` on real hardware whenever a multi-event
+    /// report straddled a clock tick.
+    frame_time: Option<TimeVal>,
 }
 
 /// Event char device, giving access to raw input device events.
@@ -37,12 +46,12 @@ pub struct EventDev {
 }
 
 impl TimedInputEvent {
-    pub fn from(e: &InputEvent) -> Self {
+    /// `time` must be CLOCK_MONOTONIC (libinput sets that via EVIOCSCLOCKID
+    /// and times its filters against it); the wall clock would desync
+    /// libinput's button-debounce/tap/scroll timers.
+    pub fn with_time(e: &InputEvent, time: TimeVal) -> Self {
         TimedInputEvent {
-            // evdev timestamps must be CLOCK_MONOTONIC (libinput sets that via
-            // EVIOCSCLOCKID and times its filters against it); the wall clock
-            // would desync libinput's button-debounce/tap/scroll timers.
-            time: TimeVal::now_monotonic(),
+            time,
             event_type: e.event_type,
             code: e.code,
             value: e.value,
@@ -80,7 +89,13 @@ impl EventDevInner {
         while self.buf.len() >= BUF_CAPACITY {
             self.buf.pop_front();
         }
-        self.buf.push_back(TimedInputEvent::from(e));
+        // One timestamp per frame: taken at the frame's first event, reused
+        // until its SYN_REPORT closes it.
+        let time = *self.frame_time.get_or_insert_with(TimeVal::now_monotonic);
+        self.buf.push_back(TimedInputEvent::with_time(e, time));
+        if e.event_type == InputEventType::Syn && e.code == SYN_REPORT {
+            self.frame_time = None;
+        }
     }
 }
 
@@ -99,6 +114,7 @@ impl EventDev {
     pub fn new(input: Arc<dyn InputScheme>, id: usize) -> Self {
         let inner = Arc::new(Mutex::new(EventDevInner {
             buf: VecDeque::with_capacity(BUF_CAPACITY),
+            frame_time: None,
         }));
         let cloned = inner.clone();
         input.subscribe(

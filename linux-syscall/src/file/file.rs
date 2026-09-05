@@ -1465,6 +1465,27 @@ impl Syscall<'_> {
                 }
             }
         }
+        // `TIOCGPTPEER` on a pty master: open its slave end and return a NEW
+        // fd (Linux 4.13+). Needs the fd table, so it lives here rather than
+        // in the inode's ioctl. `arg1` carries the open flags (O_RDWR |
+        // O_NOCTTY | O_CLOEXEC from rustix-openpty / glibc `openpty`).
+        const TIOCGPTPEER: usize = 0x5441;
+        if cmd == TIOCGPTPEER {
+            if let Some(file) = file_like.downcast_ref::<linux_object::fs::File>() {
+                let inode = file.inode();
+                if let Some(master) = inode
+                    .as_any_ref()
+                    .downcast_ref::<linux_object::fs::pty::PtyMaster>()
+                {
+                    let slave = master.open_peer().ok_or(LxError::ENXIO)?;
+                    let flags = linux_object::fs::OpenFlags::from_bits_truncate(arg1);
+                    let path = alloc::format!("/dev/pts/{}", master.pty_id());
+                    let peer = linux_object::fs::File::new(slave, flags, path);
+                    let fd = proc.add_file(peer)?;
+                    return Ok(fd.into());
+                }
+            }
+        }
         // `TIOCGWINSZ` (get terminal window size).
         const TIOCGWINSZ: usize = 0x5413;
         let ret = match file_like.ioctl(request, arg1, arg2, arg3) {

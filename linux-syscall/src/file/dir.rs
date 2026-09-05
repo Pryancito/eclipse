@@ -68,10 +68,19 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         let inode = proc.lookup_inode_at(dirfd, dir_path, true)?;
         let dir_metadata = inode.metadata()?;
-        proc.check_access(&dir_metadata, 0o3, true)?;
+        // Existence BEFORE write permission, as Linux does (`filename_create`
+        // answers EEXIST from the lookup, before `may_create` ever looks at the
+        // parent's mode). The reverse order made an unprivileged `mkdir` of a
+        // directory that already exists under a root-owned parent fail with
+        // EACCES instead of EEXIST — and PulseAudio's `pa_make_secure_dir`
+        // (`mkdir(); if (errno != EEXIST) fail`) therefore aborted the
+        // system-mode daemon after it dropped to user `pulse`: `Failed to
+        // create secure directory (/var/lib/pulse): Permission denied`, in a
+        // respawn loop, on real hardware.
         if inode.find(file_name).is_ok() {
             return Err(LxError::EEXIST);
         }
+        proc.check_access(&dir_metadata, 0o3, true)?;
         let create_mode = proc.apply_umask(mode as u16);
         let created = inode.create(file_name, FileType::Dir, create_mode as u32)?;
         proc.initialize_created_metadata(&created, Some(&dir_metadata), create_mode, true)?;
