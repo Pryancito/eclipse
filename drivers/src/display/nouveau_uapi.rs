@@ -1521,10 +1521,8 @@ impl IoctlStat {
 }
 
 const PROFILE_SLOTS: usize = 128;
-static IOCTL_PROFILE: [IoctlStat; PROFILE_SLOTS] = {
-    const S: IoctlStat = IoctlStat::new();
-    [S; PROFILE_SLOTS]
-};
+static IOCTL_PROFILE: [IoctlStat; PROFILE_SLOTS] =
+    [const { IoctlStat::new() }; PROFILE_SLOTS];
 
 /// Account one driver ioctl (`nr` = full DRM NR, e.g. `NR_EXEC`) that took
 /// `us` microseconds in the kernel.

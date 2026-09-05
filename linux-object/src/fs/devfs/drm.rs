@@ -1334,6 +1334,15 @@ pub fn set_cursor_bo(handle_id: u32, w: u32, h: u32) -> bool {
         return true;
     }
     let vaddr = phys_to_virt(phys_addr as usize);
+    // The image was written by someone else — the GPU into a nouveau GEM on
+    // the `renderer=gl:nvidia` path, or userspace through a write-combining
+    // mapping of a dumb buffer — and we are about to read it through the
+    // kernel's cached WB alias. Without a FromDevice invalidate the snapshot
+    // below can be lines of a PREVIOUS cursor image, and since it is cached in
+    // `state.cursor.bitmap` the garbled pointer then persists until the next
+    // CURSOR_BO. One clflush of at most 64x64x4 bytes, on image change only —
+    // never on a move.
+    zcore_drivers::utils::dma_sync::dma_sync_wb_from_device(vaddr, px * 4);
     // SAFETY: contiguous physical buffer of `size` bytes, identity-mapped at
     // `vaddr`; we read exactly `px` u32 pixels (<= size/4).
     let src = unsafe { core::slice::from_raw_parts(vaddr as *const u32, px) };
@@ -1604,14 +1613,20 @@ fn blit_cursor_patch(
         slot.resize(need, 0);
     }
     let patch = &mut slot[..need];
+    // Rows actually sourced from the framebuffer. CURSOR_PATCH is scratch
+    // REUSED across moves, so a row the source could not fill still holds the
+    // previous patch's pixels — blitting `th` rows unconditionally would paint
+    // that onto the screen as a stale square. Blit only what was filled.
+    let mut rows = 0usize;
     for r in 0..th {
         let src_y = y0 as usize + r;
         let src_off = src_y.saturating_mul(src_stride).saturating_add(x0 as usize);
         let dst_off = r * tw;
         let n = tw.min(pixels.len().saturating_sub(src_off));
-        if n == 0 {
+        if n < tw {
             break;
         }
+        rows = r + 1;
         patch[dst_off..dst_off + n].copy_from_slice(&pixels[src_off..src_off + n]);
         let cr = (y0 + r as i32) - cy;
         if cr < 0 || cr >= ch as i32 {
@@ -1647,7 +1662,10 @@ fn blit_cursor_patch(
             };
         }
     }
-    display.blit_from(x0 as u32, y0 as u32, patch, tw, tw as u32, th as u32);
+    if rows == 0 {
+        return;
+    }
+    display.blit_from(x0 as u32, y0 as u32, patch, tw, tw as u32, rows as u32);
 }
 
 /// Restore the `(x, y, w, h)` window of the display from the CRTC framebuffer
