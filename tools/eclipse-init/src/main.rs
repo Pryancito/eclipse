@@ -116,7 +116,9 @@ const CHILD_ENV: &[&str] = &[
     "PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin",
     "HOME=/root",
     "TERM=xterm-256color",
-    "LANG=C.UTF-8",
+    "LANG=es_ES.UTF-8",
+    "LANGUAGE=es:en",
+    "TZ=Europe/Madrid",
     "XDG_RUNTIME_DIR=/run/user/0",
     "XDG_CONFIG_HOME=/root/.config",
     "XCURSOR_THEME=Adwaita",
@@ -166,19 +168,19 @@ const CHILD_ENV: &[&str] = &[
     // SDL2 otherwise picks X11 whenever DISPLAY is set, which with the pin
     // above is always, sending every SDL app through Xwayland. The comma list
     // needs SDL >= 2.24 (Alpine ships 2.30+); SDL3 reads the underscored
-    // names. Audio: ALSA is the only userspace audio API this kernel exposes;
-    // pinning it skips the pipewire/pulse socket probes SDL tries first. The
-    // renderer half (SDL_RENDER_DRIVER / SDL_FRAMEBUFFER_ACCELERATION) follows
+    // names. Audio: SDL stays on ALSA; /etc/asound.conf routes that through
+    // PulseAudio so several clients can play at once. Native libpulse clients
+    // use PULSE_SERVER (set below). OpenAL prefers Pulse, then ALSA.
+    // The renderer half (SDL_RENDER_DRIVER / SDL_FRAMEBUFFER_ACCELERATION) follows
     // the compositor renderer and is appended by `build_child_env`.
     "SDL_VIDEODRIVER=wayland,x11",
     "SDL_VIDEO_DRIVER=wayland,x11",
     "SDL_AUDIODRIVER=alsa",
     "SDL_AUDIO_DRIVER=alsa",
-    // OpenAL (openal-soft: supertux2, gzdoom): ALSA only, same rule as SDL.
-    // Its default probe order starts with pipewire and pulse; loading
-    // libpulse runs pa_mutex_new(), which aborts the whole process when the
-    // kernel's PI-futex probe answer is not 0/ENOTSUP.
-    "ALSOFT_DRIVERS=alsa",
+    // OpenAL (openal-soft: supertux2, gzdoom): Pulse first. PI-futexes are
+    // implemented, so pa_mutex_new() no longer aborts when libpulse loads.
+    "ALSOFT_DRIVERS=pulse,alsa",
+    "PULSE_SERVER=unix:/run/pulse/native",
     // No D-Bus session bus on Eclipse OS. An UNSET address makes libdbus
     // `autolaunch:` -- fork dbus-launch, which opens $DISPLAY and spawns a
     // dbus-daemon plus a babysitter behind pipes -- and SDL_Init() walks
@@ -219,6 +221,8 @@ fn main() {
     // Align /proc/kbd, /etc/eclipse/keyboard and labwc's XKB_DEFAULT_LAYOUT
     // before the compositor starts, so the first keymap matches the console.
     apply_keyboard_layout();
+    apply_locale();
+    apply_timezone();
 
     let mut services = load_services(Path::new("/etc/eclipse/services"));
 
@@ -377,6 +381,14 @@ fn mount_pseudo_filesystems() {
             let _ = fs::set_permissions(xdg_run, fs::Permissions::from_mode(0o700));
         }
     }
+    // PulseAudio system-instance socket dir (PULSE_SERVER=unix:/run/pulse/native).
+    // Also the per-user path libpulse looks at if PULSE_SERVER is unset.
+    for d in ["/run/pulse", "/run/user/0/pulse"] {
+        let p = Path::new(d);
+        if !p.exists() {
+            let _ = fs::create_dir_all(p);
+        }
+    }
 }
 
 /// Best-effort removal of stale runtime entries INSIDE `dir` (the directory
@@ -505,6 +517,137 @@ fn apply_keyboard_layout() {
         Ok(st) => log(&format!("eclipse-kbd --boot exited {st}")),
         Err(e) => log(&format!("eclipse-kbd --boot skipped: {e}")),
     }
+}
+
+/// Apply `/etc/eclipse/locale` / cmdline `lang=` before any compositor starts.
+/// Writes LANG/LANGUAGE into labwc's environment and selects `menu.xml`.
+fn apply_locale() {
+    match std::process::Command::new("/usr/local/bin/eclipse-locale")
+        .arg("--boot")
+        .status()
+    {
+        Ok(st) if st.success() => {}
+        Ok(st) => log(&format!("eclipse-locale --boot exited {st}")),
+        Err(e) => log(&format!("eclipse-locale --boot skipped: {e}")),
+    }
+}
+
+/// `es` (default) or `en` from cmdline `lang=` then `/etc/eclipse/locale`.
+fn resolved_ui_lang() -> &'static str {
+    if let Ok(cmdline) = fs::read_to_string("/proc/cmdline") {
+        if let Some(v) = cmdline
+            .split(|c: char| c == ':' || c.is_whitespace())
+            .find_map(|tok| tok.strip_prefix("lang="))
+        {
+            match v.trim() {
+                "en" | "EN" | "en_US" => return "en",
+                "es" | "ES" | "es_ES" => return "es",
+                _ => {}
+            }
+        }
+    }
+    if let Ok(text) = fs::read_to_string("/etc/eclipse/locale") {
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(v) = line.strip_prefix("lang=") {
+                match v.trim() {
+                    "en" | "EN" | "en_US" => return "en",
+                    "es" | "ES" | "es_ES" => return "es",
+                    _ => {}
+                }
+            }
+        }
+    }
+    "es"
+}
+
+fn overlay_locale(env: &mut Vec<CString>) {
+    env.retain(|e| {
+        let s = e.to_str().unwrap_or("");
+        !s.starts_with("LANG=") && !s.starts_with("LANGUAGE=") && !s.starts_with("LC_ALL=")
+    });
+    let (posix, language) = match resolved_ui_lang() {
+        "en" => ("en_US.UTF-8", "en"),
+        _ => ("es_ES.UTF-8", "es:en"),
+    };
+    env.push(CString::new(format!("LANG={posix}")).unwrap());
+    env.push(CString::new(format!("LANGUAGE={language}")).unwrap());
+}
+
+fn apply_timezone() {
+    match std::process::Command::new("/usr/local/bin/eclipse-tz")
+        .arg("--boot")
+        .status()
+    {
+        Ok(st) if st.success() => {}
+        Ok(st) => log(&format!("eclipse-tz --boot exited {st}")),
+        Err(e) => log(&format!("eclipse-tz --boot skipped: {e}")),
+    }
+}
+
+fn tz_for_country(country: &str) -> &'static str {
+    match country {
+        "US" | "us" | "USA" | "usa" => "America/New_York",
+        _ => "Europe/Madrid",
+    }
+}
+
+/// `tz=` on the cmdline wins, then `country=`, then `/etc/eclipse/timezone`.
+fn resolved_tz() -> String {
+    if let Ok(cmdline) = fs::read_to_string("/proc/cmdline") {
+        if let Some(v) = cmdline
+            .split(|c: char| c == ':' || c.is_whitespace())
+            .find_map(|tok| tok.strip_prefix("tz=").map(str::trim))
+        {
+            if !v.is_empty() {
+                return v.to_string();
+            }
+        }
+        if let Some(v) = cmdline
+            .split(|c: char| c == ':' || c.is_whitespace())
+            .find_map(|tok| tok.strip_prefix("country=").map(str::trim))
+        {
+            if !v.is_empty() {
+                return tz_for_country(v).to_string();
+            }
+        }
+    }
+    if let Ok(text) = fs::read_to_string("/etc/eclipse/timezone") {
+        let mut country = None;
+        let mut tz = None;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(v) = line.strip_prefix("tz=") {
+                tz = Some(v.trim().to_string());
+            }
+            if let Some(v) = line.strip_prefix("country=") {
+                country = Some(v.trim().to_string());
+            }
+        }
+        if let Some(z) = tz {
+            if !z.is_empty() {
+                return z;
+            }
+        }
+        if let Some(c) = country {
+            return tz_for_country(&c).to_string();
+        }
+    }
+    "Europe/Madrid".into()
+}
+
+fn overlay_tz(env: &mut Vec<CString>) {
+    env.retain(|e| {
+        let s = e.to_str().unwrap_or("");
+        !s.starts_with("TZ=")
+    });
+    env.push(CString::new(format!("TZ={}", resolved_tz())).unwrap());
 }
 
 // ---------------------------------------------------------------------------
@@ -955,6 +1098,8 @@ fn build_child_env() -> Vec<CString> {
         .iter()
         .map(|e| CString::new(*e).unwrap())
         .collect();
+    overlay_locale(&mut env);
+    overlay_tz(&mut env);
     match renderer_mode() {
         Renderer::Pixman => {
             env.push(CString::new("WLR_RENDERER=pixman").unwrap());

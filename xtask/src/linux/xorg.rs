@@ -143,10 +143,9 @@ const DEFAULT_PACKAGES: &[&str] = &[
     "xrandr",
     "xset",
     // ── XFCE4 desktop ───────────────────────────────────────────────────────
-    // Explicit components rather than the `xfce4` metapackage: the meta drags
-    // in xfce4-pulseaudio-plugin and with it the whole audio stack, useless on
-    // this kernel. `startxfce4` ships in xfce4-session; the `.xinitrc` prefers
-    // it over the bare-WM fallbacks when present.
+    // Explicit components rather than the `xfce4` metapackage: the meta also
+    // pulls extras we do not want. PulseAudio is first-class now, so the panel
+    // plugin is named below; `startxfce4` ships in xfce4-session.
     "xfce4-session",
     "xfwm4",
     "xfce4-panel",
@@ -157,6 +156,10 @@ const DEFAULT_PACKAGES: &[&str] = &[
     "garcon",
     "xfce4-terminal",
     "xfce4-appfinder",
+    // Panel volume applet: talks to the PulseAudio daemon over the native
+    // protocol (`PULSE_SERVER=unix:/run/pulse/native`). Harmless if the
+    // user never adds it to the XFCE panel.
+    "xfce4-pulseaudio-plugin",
     // xfce4-session aborts without a D-Bus session bus; dbus-x11 provides the
     // `dbus-launch` the `.xinitrc` wraps startxfce4 in.
     "dbus",
@@ -223,6 +226,16 @@ const DEFAULT_PACKAGES: &[&str] = &[
     // backend this kernel's /dev/dri/card0 drives via the pixman renderer),
     // wayland-libs, libxkbcommon and pixman. Naming labwc is enough for those.
     "labwc",
+    // musl-locales: named locales (es_ES.UTF-8) so LC_TIME/strftime and
+    // gettext catalogs resolve. Without it LANG=es_ES.UTF-8 is still UTF-8
+    // (musl keys off the name) but month names stay in C.
+    "musl-locales",
+    // Named timezones (Europe/Madrid, America/New_York) for TZ= and
+    // /etc/localtime. Without it musl treats TZ as POSIX and the clock stays UTC.
+    "tzdata",
+    // NTP client (foreground `ntpd -d`). eclipse-ntpd wraps it so a missing
+    // `_ntp` user (apk --no-scripts skips the post-install) does not matter.
+    "openntpd",
     // seatd: the seat manager wlroots opens DRM and input devices through. With
     // no logind/elogind here, libseat otherwise has nothing to talk to. The
     // labwc wrapper prefers libseat's daemonless `builtin` backend (works as
@@ -245,14 +258,19 @@ const DEFAULT_PACKAGES: &[&str] = &[
     // (and any toolkit falling back to X11) fails to map. Pulls libxcb and the
     // XWayland-specific bits of the X stack it needs.
     "xwayland",
-    // ── ALSA userspace ──────────────────────────────────────────────────────
-    // alsa-lib (libasound + /usr/share/alsa/alsa.conf) is what every app's
-    // audio path resolves to; the kernel exposes the native ALSA ABI at
-    // /dev/snd/ (linux-object devfs snd.rs) and /etc/asound.conf (written by
-    // xtask) sets "default" to hw:0,0. alsa-utils
-    // brings aplay/amixer/speaker-test for testing.
+    // ── ALSA + PulseAudio userspace ─────────────────────────────────────────
+    // The kernel PCM is still native ALSA at /dev/snd/ (linux-object snd.rs).
+    // PulseAudio runs as a system daemon on top of hw:0,0 (mmap=0, RW+SYNC_PTR)
+    // so several clients can play at once — dmix needs SysV shm, which we skip.
+    // /etc/asound.conf routes ALSA `default` through the pulse plugin;
+    // libpulse clients use PULSE_SERVER=unix:/run/pulse/native.
     "alsa-lib",
     "alsa-utils",
+    "pulseaudio",
+    "pulseaudio-alsa",
+    "pulseaudio-utils",
+    "libpulse",
+    "alsa-plugins-pulse",
     // Boot chime (`eclipse-boot-sound` plays /usr/share/eclipse/Eclipse_Awakening.mp3).
     "mpg123",
     // ── SDL (1.2 / 2 / 3) ───────────────────────────────────────────────────
@@ -279,11 +297,16 @@ const DEFAULT_PACKAGES: &[&str] = &[
     //                    that and always presents through EGL (llvmpipe here).
     //   - sdl12-compat:  the SDL 1.2 ABI (libSDL-1.2.so.0) implemented over
     //                    SDL2, for the long tail of old games/emulators.
-    //   - sdl2_image/ttf/mixer: the companion libs nearly every SDL2 program
-    //                    links (image decoding, TrueType text, audio mixing).
-    //                    sdl2_mixer's output goes through SDL's audio layer,
-    //                    which the session pins to ALSA (the only userspace
-    //                    audio API this kernel exposes, README-audio.md).
+    //   - sdl2_image/ttf/mixer/net: the companion libs nearly every SDL2
+    //                    program links (image decoding, TrueType text, audio
+    //                    mixing, UDP/TCP). sdl2_mixer's output goes through
+    //                    SDL's audio layer (SDL_AUDIODRIVER=alsa, routed to
+    //                    Pulse by /etc/asound.conf).
+    //   - libpng:        named explicitly so PNG loaders (SDL_image, gdk-pixbuf
+    //                    fallbacks, games) do not depend on a transitive pull.
+    //   - fluidsynth:    software SoundFont synth (libfluidsynth + CLI). MIDI
+    //                    in SDL_mixer / gzdoom / scummvm. Alpine's build also
+    //                    pulls fluidsynth-libs and a GM soundfont.
     //   - libdecor:      client-side decorations for Wayland. labwc offers
     //                    server-side decorations via xdg-decoration, which SDL
     //                    prefers when present, so this is only the fallback
@@ -294,6 +317,9 @@ const DEFAULT_PACKAGES: &[&str] = &[
     "sdl2_image",
     "sdl2_ttf",
     "sdl2_mixer",
+    "sdl2_net",
+    "libpng",
+    "fluidsynth",
     "libdecor",
 ];
 
@@ -1069,6 +1095,12 @@ const LIVE_TREES: &[&str] = &[
     // and /dev/snd/controlC0 live, then fails with
     // "Cannot access file /usr/share/alsa/alsa.conf" / "Invalid CTL hw:0".
     "usr/share/alsa",
+    // PulseAudio mixer paths / profile-sets (module-alsa-card) and locale.
+    // The daemon itself is usr/bin + usr/lib (already copied); without this
+    // tree a QEMU live boot has pulseaudio(1) but no alsa-mixer data.
+    "usr/share/pulseaudio",
+    // IANA tzdata. lunarbar's clock uses localtime_r; musl needs the zone file.
+    "usr/share/zoneinfo",
     // Boot chime MP3 + any other Eclipse-owned share files.
     "usr/share/eclipse",
     "etc/fonts",
@@ -1256,6 +1288,14 @@ pub(super) fn copy_into_live(full: &Path, live: &Path) {
             "warning: LIVE root missing /usr/share/alsa/alsa.conf — `aplay -l` will fail \
              with Invalid CTL hw:0 even if /dev/snd/controlC0 exists. \
              `alsa-lib` must be in the apk set and usr/share/alsa in LIVE_TREES."
+        );
+    }
+    if live.join("usr/bin/pulseaudio").is_file() {
+        println!("Xorg stack: LIVE root /usr/bin/pulseaudio present");
+    } else {
+        eprintln!(
+            "warning: LIVE root missing /usr/bin/pulseaudio — libpulse clients and \
+             ALSA-via-pulse will be silent. `pulseaudio` must be in the apk set."
         );
     }
 }

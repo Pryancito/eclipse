@@ -116,7 +116,11 @@ impl From<DisplayInfo> for FbFixScreeninfo {
             smem_len: info.fb_size as u32,
             fb_type: FbType::PackedPixels,
             visual: FbVisual::TrueColor,
-            line_length: info.width * info.format.bytes() as u32,
+            // Bytes per scanline: the GOP/BAR1 pitch, not width×bpp. Padding
+            // (e.g. 8192 vs 1920×4) is common on NVIDIA; Xorg ShadowFB writes
+            // `row * line_length` and a short stride shears the picture into
+            // leftover squares and lines.
+            line_length: info.pitch(),
             mmio_start: 0,
             mmio_len: 0,
             accel: FB_ACCEL_NONE,

@@ -313,6 +313,45 @@ fn resolve_mount_dir(
     }
 }
 
+/// Walk `rel` from `root`, creating missing directories, and mount a fresh
+/// RamFS on the last component. PulseAudio `--system` chowns `/var/run/pulse`
+/// and `/var/lib/pulse` before dropping to user `pulse`; on a squashfs live
+/// root those paths are EROFS and the daemon exits in ~150 ms (eclipse-init
+/// then reports a crash loop). Userspace `mount -t tmpfs` is a no-op here, so
+/// the kernel has to install the ramfs.
+fn mount_ramfs_at(root: &Arc<MNode>, rel: &str, target: &str) {
+    let mut cur = root.clone();
+    let comps: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+    for (i, comp) in comps.iter().enumerate() {
+        let last = i + 1 == comps.len();
+        cur = match cur.find(true, comp) {
+            Ok(n) => n,
+            Err(_) => match cur.create(comp, FileType::Dir, 0o755) {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!("[boot] mkdir /{rel}: {e:?}");
+                    return;
+                }
+            },
+        };
+        if last {
+            match cur.mount(RamFS::new()) {
+                Ok(_) => {
+                    register_mount(
+                        "tmpfs",
+                        target,
+                        "tmpfs",
+                        "rw,nosuid,nodev",
+                        boot_mount_state(),
+                    );
+                    warn!("[boot] tmpfs on {target}");
+                }
+                Err(e) => warn!("[boot] mount {target} failed: {e:?}"),
+            }
+        }
+    }
+}
+
 pub(crate) fn register_mount(
     source: &str,
     target: &str,
@@ -1085,6 +1124,12 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
             boot_mount_state(),
         );
     }
+
+    // PulseAudio `--system` (change_user) always mkdir+chowns these two
+    // paths. They must be writable ramfs even on a squashfs live root;
+    // `/run` already is, but the compiled-in system paths are under `/var`.
+    mount_ramfs_at(&root, "var/run/pulse", "/var/run/pulse");
+    mount_ramfs_at(&root, "var/lib/pulse", "/var/lib/pulse");
 
     // Ensure /var/run exists. Skip while pivoting onto an installed block
     // root (btrfs/ext2): scanning /var during early boot has stalled some

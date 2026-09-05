@@ -472,6 +472,8 @@ impl Syscall<'_> {
             Sys::CLOCK_GETTIME => self.sys_clock_gettime(a0, a1.into()),
             Sys::CLOCK_SETTIME => self.sys_clock_settime(a0, a1.into()),
             Sys::CLOCK_GETRES => self.sys_clock_getres(a0, a1.into()),
+            Sys::ADJTIMEX => self.sys_adjtimex(a0.into()),
+            Sys::CLOCK_ADJTIME => self.sys_clock_adjtime(a0, a1.into()),
 
             // msg
             Sys::MSGGET => self.sys_msgget(a0, a1),

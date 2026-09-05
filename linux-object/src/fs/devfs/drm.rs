@@ -991,15 +991,11 @@ pub fn scanout(fb_id: u32) -> bool {
     scanout_region(fb_id, None)
 }
 
-/// Like [`scanout`], but when `rect` (`x, y, width, height`, in the
-/// framebuffer's own coordinates) is given, blits only that region instead of
-/// the whole frame.
-///
-/// `DRM_IOCTL_MODE_DIRTYFB` uses this to skip re-copying pixels the client
-/// didn't touch — `None` (page-flip / modeset) always repaints everything, as
-/// does an out-of-range or degenerate `rect` (matches real DIRTYFB semantics:
-/// no usable clip means "everything is dirty").
+/// Like [`scanout`]. `rect` is ignored: partial DIRTYFB / damage blits on the
+/// WC scanout left squares and lines, so KMS present is always a full frame.
+/// The only remaining dirty-rect tracker is the console shadow framebuffer.
 pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
+    let _ = rect;
     let fb = {
         let state = DRM_STATE.lock();
         match state.framebuffers.iter().find(|f| f.id == fb_id) {
@@ -1050,16 +1046,7 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     let src_stride = (fb.pitch / 4) as usize;
     let fb_width = fb.width.min(info.width);
     let fb_height = fb.height.min(info.height);
-    // Clamp the requested damage rect to the framebuffer/display bounds. An
-    // empty result (e.g. a fully off-screen clip) just means no pixels moved.
-    let (blit_x, blit_y, blit_w, blit_h) = match rect {
-        Some((x, y, w, h)) => {
-            let x = x.min(fb_width);
-            let y = y.min(fb_height);
-            (x, y, w.min(fb_width - x), h.min(fb_height - y))
-        }
-        None => (0, 0, fb_width, fb_height),
-    };
+    let (blit_x, blit_y, blit_w, blit_h) = (0, 0, fb_width, fb_height);
     if blit_w == 0 || blit_h == 0 {
         return true;
     }
@@ -1180,7 +1167,7 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
             cpu_src_synced = true;
         }
         // Banded blit with IRQs briefly re-enabled between bands — see
-        // [`blit_chunked`]. Honours a DIRTYFB damage rect when present.
+        // [`blit_chunked`]. Always the full frame (see [`scanout_region`]).
         if src_off < pixels.len() {
             blit_chunked(
                 &display,
@@ -1986,11 +1973,8 @@ pub fn present_now(fb_id: u32, crtc_id: u32) -> bool {
     present_now_region(fb_id, crtc_id, None)
 }
 
-/// Like [`present_now`], but `rect` (`x, y, width, height`) restricts the
-/// software-KMS blit to that region instead of the whole frame — see
-/// [`scanout_region`]. `DRM_IOCTL_MODE_DIRTYFB`'s clip rects flow through
-/// here. Ignored on the hardware-KMS path: a real driver's `page_flip` scans
-/// out via its own GPU DMA, not the CPU blit this exists to shrink.
+/// Like [`present_now`]. `rect` is accepted for ABI compatibility with
+/// DIRTYFB callers and then ignored — see [`scanout_region`].
 pub fn present_now_region(fb_id: u32, crtc_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     // Deferred console GSP bring-up: acknowledge the flip to keep the
     // compositor alive, but do not touch the GOP framebuffer / CE path.

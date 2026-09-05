@@ -83,9 +83,14 @@ impl LinuxRootfs {
             // (this incremental path) picks up changes, not only a from-scratch
             // build.
             Self::write_profile(&dir.join("etc"));
-            Self::write_asound_conf(&dir.join("etc"));
+            Self::write_ntp(&dir);
             desktop::install(&dir);
             xorg::install(&dir, &bin.join("apk"), self.0.name());
+            // After apk so we can see whether the PulseAudio plugin/binary
+            // landed, and so /etc/pulse wins over anything the package dropped.
+            Self::write_asound_conf(&dir);
+            Self::write_pulse_conf(&dir);
+            Self::ensure_pulse_accounts(&dir);
             return;
         }
         // 准备最小系统需要的资源
@@ -156,6 +161,7 @@ impl LinuxRootfs {
             Self::write_hosts(&etc);
         }
         Self::write_profile(&etc);
+        Self::write_ntp(&dir);
         Self::write_passwd(&etc, &dir);
         Self::write_console_configs(&etc, &dir);
         desktop::install(&dir);
@@ -183,7 +189,9 @@ impl LinuxRootfs {
         // /etc/hostname
         fs::write(etc.join("hostname"), b"Eclipse\n").unwrap();
 
-        Self::write_asound_conf(&etc);
+        Self::write_asound_conf(&dir);
+        Self::write_pulse_conf(&dir);
+        Self::ensure_pulse_accounts(&dir);
 
         // /etc/fstab — placeholders sustituidos por install-eclipse (sin mount syscall)
         fs::write(
@@ -611,6 +619,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             }
             Err(_) => fs::write(&group, base).unwrap(),
         }
+        Self::ensure_pulse_accounts(rootfs);
     }
 
     /// Wire up busybox `init` as the PID 1 base program.
@@ -732,6 +741,56 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         .unwrap();
     }
 
+    /// OpenNTPD config + a wrapper that waits for DHCP then runs ntpd in the
+    /// foreground. apk `--no-scripts` never creates the `_ntp` user, so the
+    /// wrapper starts the daemon as root (`-u root`).
+    fn write_ntp(rootfs: &Path) {
+        let etc = rootfs.join("etc");
+        let _ = fs::create_dir_all(&etc);
+        fs::write(
+            etc.join("ntpd.conf"),
+            b"# Eclipse OS: NTP client (OpenNTPD). Servers after DHCP.\n\
+              servers pool.ntp.org\n",
+        )
+        .unwrap();
+        let localbin = rootfs.join("usr/local/bin");
+        let _ = fs::create_dir_all(&localbin);
+        fs::write(
+            localbin.join("eclipse-ntpd"),
+            b"#!/bin/sh\n\
+              # Eclipse OS: wait for a default route, then NTP in foreground.\n\
+              LOG=/tmp/ntpd.log\n\
+              exec >>\"$LOG\" 2>&1\n\
+              i=0\n\
+              while [ \"$i\" -lt 45 ]; do\n\
+              \x20 if ip -4 route show default 2>/dev/null | grep -q .; then break; fi\n\
+              \x20 if ip route 2>/dev/null | grep -q '^default'; then break; fi\n\
+              \x20 sleep 2\n\
+              \x20 i=$((i+1))\n\
+              done\n\
+              if [ -x /usr/sbin/ntpd ]; then\n\
+              \x20 echo \"[eclipse-ntpd] openntpd as root\"\n\
+              \x20 exec /usr/sbin/ntpd -d -s -u root\n\
+              fi\n\
+              if /bin/busybox --list 2>/dev/null | grep -qx ntpd; then\n\
+              \x20 echo \"[eclipse-ntpd] busybox ntpd\"\n\
+              \x20 exec /bin/busybox ntpd -n -N -p pool.ntp.org\n\
+              fi\n\
+              echo \"eclipse-ntpd: no ntpd binary (apk add openntpd)\"\n\
+              sleep 60\n\
+              exit 1\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                localbin.join("eclipse-ntpd"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+    }
+
     fn write_profile(etc: &Path) {
         fs::write(
             etc.join("profile"),
@@ -750,6 +809,25 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               #   LD_PRELOAD=/lib/libeclipse_dns.so some-command\n\
               export HOME=/root\n\
               export TERM=xterm-256color\n\
+              # UI language. /etc/eclipse/locale (lang=es|en); default es.\n\
+              # Never export LC_ALL -- it would freeze LANG for gettext/GTK.\n\
+              _ecl_lang=es\n\
+              if [ -r /etc/eclipse/locale ]; then\n\
+              \x20 _ecl_lang=$(awk -F= '/^[[:space:]]*lang[[:space:]]*=/{gsub(/[[:space:]]/,\"\",$2); print $2; exit}' /etc/eclipse/locale)\n\
+              fi\n\
+              case \"$_ecl_lang\" in\n\
+              \x20 en|EN|en_US) export LANG=en_US.UTF-8 LANGUAGE=en ;;\n\
+              \x20 *) export LANG=es_ES.UTF-8 LANGUAGE=es:en ;;\n\
+              esac\n\
+              unset _ecl_lang\n\
+              # Timezone from /etc/eclipse/timezone (country=ES|US or tz=Area/City).\n\
+              # Default Spain. Independent of keyboard layout.\n\
+              _ecl_tz=Europe/Madrid\n\
+              if [ -r /etc/eclipse/timezone ]; then\n\
+              \x20 _ecl_tz=$(awk -F= '/^[[:space:]]*tz[[:space:]]*=/{gsub(/[[:space:]]/,\"\",$2); print $2; exit}' /etc/eclipse/timezone)\n\
+              fi\n\
+              [ -n \"$_ecl_tz\" ] && export TZ=\"$_ecl_tz\"\n\
+              unset _ecl_tz\n\
               # Default: wlroots/labwc must use the software (pixman) renderer.\n\
               # Otherwise wlroots tries GLES2/EGL then Vulkan, which either fails\n\
               # outright or starts on Mesa llvmpipe and becomes extremely slow\n\
@@ -825,7 +903,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # SDL (sdl12-compat / SDL2 / SDL3) backends, renderer-independent:\n\
               # native Wayland first, X11 fallback (Xwayland here, Xorg under\n\
               # desktop=xorg -- the list makes ONE policy serve both sessions),\n\
-              # and ALSA audio, the only userspace audio API this kernel has.\n\
+              # and ALSA audio (which /etc/asound.conf routes through Pulse).\n\
               # Without the video pin SDL2 picks X11 whenever DISPLAY is set,\n\
               # i.e. always (DISPLAY=:0 pin), taking the Xwayland detour. The\n\
               # comma list needs SDL >= 2.24 (Alpine ships 2.30+); SDL3 reads the\n\
@@ -835,10 +913,11 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               export SDL_VIDEO_DRIVER=wayland,x11\n\
               export SDL_AUDIODRIVER=alsa\n\
               export SDL_AUDIO_DRIVER=alsa\n\
-              # OpenAL (openal-soft: supertux2, gzdoom): ALSA only, same rule.\n\
-              # Its pulse probe loads libpulse, whose pa_mutex_new() aborts the\n\
-              # process when the kernel's PI-futex probe answer is not 0/ENOTSUP.\n\
-              export ALSOFT_DRIVERS=alsa\n\
+              # OpenAL: Pulse first (native libpulse), ALSA fallback (also\n\
+              # routed through Pulse via asound.conf). PI-futexes are implemented,\n\
+              # so pa_mutex_new() no longer aborts.\n\
+              export ALSOFT_DRIVERS=pulse,alsa\n\
+              export PULSE_SERVER=unix:/run/pulse/native\n\
               # No session bus here: pin the address so libdbus never\n\
               # `autolaunch:`es (dbus-launch + X11 + dbus-daemon behind pipes,\n\
               # the chain SDL_Init walks first; gzdoom hung there). With no\n\
@@ -1244,7 +1323,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                   s/.*CONFIG_UDHCPC6.*/CONFIG_UDHCPC6=y/;\
                   s/.*CONFIG_FEATURE_UDHCPC6_RFC3646.*/CONFIG_FEATURE_UDHCPC6_RFC3646=y/;\
                   s/^# CONFIG_INIT is not set$/CONFIG_INIT=y/;\
-                  s/^# CONFIG_FEATURE_USE_INITTAB is not set$/CONFIG_FEATURE_USE_INITTAB=y/",
+                  s/^# CONFIG_FEATURE_USE_INITTAB is not set$/CONFIG_FEATURE_USE_INITTAB=y/;\
+                  s/^# CONFIG_NTPD is not set$/CONFIG_NTPD=y/;\
+                  s/^# CONFIG_FEATURE_NTPD_SERVER is not set$/CONFIG_FEATURE_NTPD_SERVER=n/",
             )
             .arg(".config")
             .invoke();
@@ -2025,29 +2106,68 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         executable
     }
 
-    /// `/etc/asound.conf`: `default` is the kernel PCM (`hw:0,0`) so mpg123
-    /// and aplay talk S16LE stereo without the plug plugin. plug is still
-    /// available as `plug` for format conversion (`aplay -D plug x.wav`).
-    /// dmix is deliberately not used (it needs SysV IPC shared memory).
-    fn write_asound_conf(etc: &Path) {
+    /// `/etc/asound.conf`. When PulseAudio is in the image, ALSA `default`
+    /// goes through the pulse plugin so ALSA-only apps multiplex on the
+    /// daemon. The kernel PCM stays available as `eclipse_hw` / `hw:0,0` for
+    /// the Pulse sink itself and for diagnostics. Without the plugin, `default`
+    /// stays direct `hw:0,0` (the old single-client path).
+    fn write_asound_conf(rootfs: &Path) {
+        let etc = rootfs.join("etc");
+        let _ = fs::create_dir_all(&etc);
         let conf = etc.join("asound.conf");
         if let Ok(existing) = fs::read_to_string(&conf) {
             if !existing.contains("eclipse-generated") {
                 return; // user-customized: leave it alone
             }
         }
-        fs::write(
-            &conf,
+        let pulse_pcm = rootfs
+            .join("usr/lib/alsa-lib/libasound_module_pcm_pulse.so");
+        let have_pulse = rootfs.join("usr/bin/pulseaudio").is_file() && pulse_pcm.is_file();
+        let body = if have_pulse {
             b"# eclipse-generated ALSA routing (delete this line to take ownership).\n\
               #\n\
-              # Direct hw:0,0. plug's insert_plugins + protocol 2.0.14 paths made\n\
-              # mpg123 fail at snd_pcm_hw_params after set_*_near had succeeded.\n\
+              # default -> PulseAudio so aplay/mpg123/SDL-alsa share the HDA PCM.\n\
+              # Pulse itself opens eclipse_hw (type hw) to avoid a plugin loop.\n\
+              # Direct kernel access: `aplay -D eclipse_hw` (fails while Pulse holds it).\n\
               # Format conversion: `aplay -D plug x.wav`.\n\
-              #\n\
-              # No dmix (needs SysV IPC): one playback client at a time.\n\
-              # Card 0 is HDMI when the monitor is live (ELD), else the PCH analog\n\
-              # (same preference as PipeWire on Linux: Intel + one HDMI).\n\
+              pcm.eclipse_hw {\n\
+              \x20   type hw\n\
+              \x20   card 0\n\
+              \x20   device 0\n\
+              }\n\
+              pcm.plug {\n\
+              \x20   type plug\n\
+              \x20   slave.pcm \"eclipse_hw\"\n\
+              }\n\
               pcm.!default {\n\
+              \x20   type pulse\n\
+              \x20   server unix:/run/pulse/native\n\
+              }\n\
+              ctl.!default {\n\
+              \x20   type pulse\n\
+              \x20   server unix:/run/pulse/native\n\
+              }\n\
+              pcm.pulse {\n\
+              \x20   type pulse\n\
+              \x20   server unix:/run/pulse/native\n\
+              }\n\
+              ctl.pulse {\n\
+              \x20   type pulse\n\
+              \x20   server unix:/run/pulse/native\n\
+              }\n"
+                .as_slice()
+        } else {
+            b"# eclipse-generated ALSA routing (delete this line to take ownership).\n\
+              #\n\
+              # Direct hw:0,0. PulseAudio was not in this image, so there is no\n\
+              # mixer daemon; one playback client at a time.\n\
+              # Format conversion: `aplay -D plug x.wav`.\n\
+              pcm.!default {\n\
+              \x20   type hw\n\
+              \x20   card 0\n\
+              \x20   device 0\n\
+              }\n\
+              pcm.eclipse_hw {\n\
               \x20   type hw\n\
               \x20   card 0\n\
               \x20   device 0\n\
@@ -2059,9 +2179,156 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               ctl.!default {\n\
               \x20   type hw\n\
               \x20   card 0\n\
-              }\n",
-        )
-        .unwrap();
+              }\n"
+                .as_slice()
+        };
+        fs::write(&conf, body).unwrap();
+    }
+
+    /// PulseAudio system-instance config. Eclipse runs everything as root, so
+    /// the daemon is `--system` (user-mode PulseAudio refuses uid 0) with a
+    /// `pulse` account for the post-bind drop, and a unix socket at
+    /// `/run/pulse/native`. The ALSA sink is mmap=0: the kernel PCM is
+    /// RW-interleaved + SYNC_PTR only.
+    fn write_pulse_conf(rootfs: &Path) {
+        let pulse = rootfs.join("etc").join("pulse");
+        let _ = fs::create_dir_all(&pulse);
+        let marker = "# eclipse-generated";
+        let write_if_ours = |path: &Path, body: &[u8]| {
+            if let Ok(existing) = fs::read_to_string(path) {
+                if !existing.contains(marker) {
+                    return;
+                }
+            }
+            fs::write(path, body).unwrap();
+        };
+
+        write_if_ours(
+            &pulse.join("daemon.conf"),
+            b"# eclipse-generated PulseAudio daemon (delete this line to take ownership).\n\
+              daemonize = no\n\
+              system-instance = yes\n\
+              exit-idle-time = -1\n\
+              realtime-scheduling = no\n\
+              high-priority = no\n\
+              nice-level = 0\n\
+              flat-volumes = no\n\
+              enable-shm = yes\n\
+              enable-memfd = yes\n\
+              default-sample-format = s16le\n\
+              default-sample-rate = 48000\n\
+              alternate-sample-rate = 44100\n\
+              default-sample-channels = 2\n\
+              default-fragments = 4\n\
+              default-fragment-size-msec = 25\n\
+              resample-method = speex-float-1\n\
+              log-target = stderr\n\
+              log-level = notice\n",
+        );
+        write_if_ours(
+            &pulse.join("client.conf"),
+            b"# eclipse-generated PulseAudio client (delete this line to take ownership).\n\
+              default-server = unix:/run/pulse/native\n\
+              autospawn = no\n\
+              allow-autospawn-for-root = yes\n",
+        );
+        let pa = b"# eclipse-generated PulseAudio startup (delete this line to take ownership).\n\
+              #!/usr/bin/pulseaudio -nF\n\
+              #\n\
+              # System instance over Eclipse's ALSA hw:0,0. No udev, no D-Bus,\n\
+              # no capture: the kernel PCM is playback-only RW-interleaved.\n\
+              # ALSA sinks are .nofail: a missing/busy card must not kill the\n\
+              # daemon (eclipse-init would then crash-loop it). mixer_device=hw\n\
+              # so the sink does not open ctl.default (type pulse) and deadlock.\n\
+              .nofail\n\
+              load-module module-device-restore\n\
+              load-module module-stream-restore\n\
+              load-module module-card-restore\n\
+              load-module module-augment-properties\n\
+              load-module module-alsa-sink device=hw:0,0 mixer_device=hw:0 mmap=0 tsched=0 use_ucm=0 ignore_dB=1 fragments=4 fragment_size=4800 sink_properties=device.description=Eclipse\n\
+              load-module module-alsa-sink device=hw:1,0 mixer_device=hw:1 mmap=0 tsched=0 use_ucm=0 ignore_dB=1 fragments=4 fragment_size=4800 sink_name=analog sink_properties=device.description=Analog\n\
+              .fail\n\
+              load-module module-native-protocol-unix auth-anonymous=1 socket=/run/pulse/native\n\
+              .nofail\n\
+              load-module module-native-protocol-unix auth-anonymous=1 socket=/run/user/0/pulse/native\n\
+              .fail\n\
+              load-module module-always-sink\n\
+              load-module module-intended-roles\n\
+              load-module module-suspend-on-idle timeout=1\n\
+              load-module module-filter-heuristics\n\
+              load-module module-filter-apply\n";
+        write_if_ours(&pulse.join("system.pa"), pa);
+        write_if_ours(&pulse.join("default.pa"), pa);
+        let _ = fs::create_dir_all(rootfs.join("var/lib/pulse"));
+        let _ = fs::create_dir_all(rootfs.join("var/run/pulse"));
+    }
+
+    /// `pulse` / `pulse-access` / `audio` accounts. apk `--no-scripts` never
+    /// runs the PulseAudio post-install, and `--system` drops to user `pulse`
+    /// after binding the socket — without these lines the daemon exits.
+    fn ensure_pulse_accounts(rootfs: &Path) {
+        let etc = rootfs.join("etc");
+        let _ = fs::create_dir_all(&etc);
+        let passwd = etc.join("passwd");
+        match fs::read_to_string(&passwd) {
+            Ok(existing) => {
+                if !existing.lines().any(|l| l.starts_with("pulse:")) {
+                    let mut updated = existing;
+                    if !updated.ends_with('\n') {
+                        updated.push('\n');
+                    }
+                    updated.push_str("pulse:x:51:51:PulseAudio:/var/run/pulse:/bin/false\n");
+                    fs::write(&passwd, updated).unwrap();
+                }
+            }
+            Err(_) => {
+                fs::write(
+                    &passwd,
+                    "root:x:0:0:root:/root:/bin/sh\n\
+                     pulse:x:51:51:PulseAudio:/var/run/pulse:/bin/false\n\
+                     nobody:x:65534:65534:nobody:/:/bin/false\n",
+                )
+                .unwrap();
+            }
+        }
+        let group = etc.join("group");
+        let extras = [
+            ("pulse:", "pulse:x:51:\n"),
+            ("pulse-access:", "pulse-access:x:52:root\n"),
+            ("audio:", "audio:x:29:root,pulse\n"),
+        ];
+        match fs::read_to_string(&group) {
+            Ok(existing) => {
+                let mut updated = existing;
+                let mut changed = false;
+                for (prefix, line) in extras {
+                    if !updated.lines().any(|l| l.starts_with(prefix)) {
+                        if !updated.ends_with('\n') {
+                            updated.push('\n');
+                        }
+                        updated.push_str(line);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    fs::write(&group, updated).unwrap();
+                }
+            }
+            Err(_) => {
+                fs::write(
+                    &group,
+                    "root:x:0:root\n\
+                     audio:x:29:root,pulse\n\
+                     pulse:x:51:\n\
+                     pulse-access:x:52:root\n\
+                     nobody:x:65534:\n",
+                )
+                .unwrap();
+            }
+        }
+        let home = rootfs.join("var/run/pulse");
+        let _ = fs::create_dir_all(&home);
+        let _ = fs::create_dir_all(rootfs.join("var/lib/pulse"));
     }
 
     /// Cross-compile wavplay (`tools/wavplay`, Rust) as a static musl binary
@@ -2168,6 +2435,17 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         )
         .unwrap();
 
+        // NTP: after DHCP so pool.ntp.org resolves. Foreground wrapper.
+        fs::write(
+            svc_dir.join("ntpd.service"),
+            b"# NTP client (foreground). See /usr/local/bin/eclipse-ntpd.\n\
+              exec = /usr/local/bin/eclipse-ntpd\n\
+              type = respawn\n\
+              after = udhcpc\n\
+              log = /tmp/ntpd.log\n",
+        )
+        .unwrap();
+
         // seatd: the seat manager wlroots/labwc open DRM and input devices
         // through. Started before labwc so its socket exists when the
         // compositor connects (init's `after` orders the start; the labwc
@@ -2263,6 +2541,19 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         )
         .unwrap();
 
+        // PulseAudio: system instance over ALSA hw:0,0. Session-agnostic so
+        // both labwc and Xorg get a mixer. wait_path: the HDA PCM node is
+        // created at kernel probe, which can lag the first userspace tick.
+        fs::write(
+            svc_dir.join("pulseaudio.service"),
+            b"# PulseAudio sound server (system instance). See eclipse-pulseaudio.\n\
+              exec = /usr/local/bin/eclipse-pulseaudio\n\
+              type = respawn\n\
+              wait_path = /dev/snd/pcmC0D0p\n\
+              log = /tmp/pulseaudio.log\n",
+        )
+        .unwrap();
+
         // Boot chime: play once after the session is up so NVIDIA HDMI audio
         // (ELD/SET_HDMI_ENABLE) has had a DRM query. Oneshot wrapper forks
         // mpg123 and exits so init is not blocked for the length of the track.
@@ -2271,7 +2562,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             b"# Startup MP3 (Eclipse_Awakening). See /usr/local/bin/eclipse-boot-sound.\n\
               exec = /usr/local/bin/eclipse-boot-sound\n\
               type = oneshot\n\
-              after = lunarbar\n\
+              after = pulseaudio lunarbar\n\
               wait_socket = /run/user/0/wayland-0\n\
               desktop = labwc\n\
               log = /tmp/boot-sound.log\n",
@@ -2282,7 +2573,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             b"# Startup MP3 under the Xorg session.\n\
               exec = /usr/local/bin/eclipse-boot-sound\n\
               type = oneshot\n\
-              after = xorg\n\
+              after = pulseaudio xorg\n\
               desktop = xorg\n\
               log = /tmp/boot-sound.log\n",
         )
@@ -2302,29 +2593,72 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         fs::write(
             localbin.join("eclipse-boot-sound-play"),
             b"#!/bin/sh\n\
-              # Wait for a PCM, unmute, play the startup MP3 once.\n\
+              # Wait for PulseAudio (or a raw PCM), unmute, play the startup MP3 once.\n\
               MP3=/usr/share/eclipse/Eclipse_Awakening.mp3\n\
               [ -f \"$MP3\" ] || { echo \"eclipse-boot-sound: missing $MP3\" >&2; exit 0; }\n\
               i=0\n\
               while [ \"$i\" -lt 20 ]; do\n\
-              \x20 if [ -e /dev/snd/pcmC0D0p ] || [ -e /dev/dsp ]; then\n\
+              \x20 if [ -S /run/pulse/native ] || [ -e /dev/snd/pcmC0D0p ] || [ -e /dev/dsp ]; then\n\
               \x20\x20 break\n\
               \x20 fi\n\
               \x20 i=$((i + 1))\n\
               \x20 sleep 1\n\
               done\n\
-              if [ ! -e /dev/snd/pcmC0D0p ] && [ ! -e /dev/dsp ]; then\n\
+              if [ ! -S /run/pulse/native ] && [ ! -e /dev/snd/pcmC0D0p ] && [ ! -e /dev/dsp ]; then\n\
               \x20 echo 'eclipse-boot-sound: no PCM device' >&2\n\
               \x20 exit 0\n\
               fi\n\
               # Compositor DRM query enables NVIDIA HDMI packets; give it a beat.\n\
               sleep 2\n\
-              command -v amixer >/dev/null 2>&1 && amixer -q set Master 70% unmute 2>/dev/null\n\
+              if command -v pactl >/dev/null 2>&1 && [ -S /run/pulse/native ]; then\n\
+              \x20 pactl set-sink-volume @DEFAULT_SINK@ 70% 2>/dev/null\n\
+              \x20 pactl set-sink-mute @DEFAULT_SINK@ 0 2>/dev/null\n\
+              elif command -v amixer >/dev/null 2>&1; then\n\
+              \x20 amixer -q set Master 70% unmute 2>/dev/null\n\
+              fi\n\
               if command -v mpg123 >/dev/null 2>&1; then\n\
-              \x20 exec mpg123 -q --encoding s16 \"$MP3\"\n\
+              \x20 if [ -S /run/pulse/native ]; then\n\
+              \x20\x20 mpg123 -q -o pulse --encoding s16 --no-gapless \"$MP3\" \\\n\
+              \x20\x20\x20 || mpg123 -q --encoding s16 --no-gapless \"$MP3\"\n\
+              \x20\x20 pactl drain 2>/dev/null || true\n\
+              \x20\x20 pactl suspend-sink @DEFAULT_SINK@ 1 2>/dev/null || true\n\
+              \x20 else\n\
+              \x20\x20 mpg123 -q --encoding s16 --no-gapless \"$MP3\"\n\
+              \x20 fi\n\
+              \x20 exit 0\n\
               fi\n\
               echo 'eclipse-boot-sound: mpg123 not installed' >&2\n\
               exit 0\n",
+        )
+        .unwrap();
+        fs::write(
+            localbin.join("eclipse-pulseaudio"),
+            b"#!/bin/sh\n\
+              # Eclipse OS: PulseAudio system instance. User-mode PulseAudio\n\
+              # refuses uid 0; --system + the `pulse` account (ensure_pulse_accounts)\n\
+              # is the path that actually starts. Foreground: init supervises us.\n\
+              command -v pulseaudio >/dev/null 2>&1 || {\n\
+              \x20 echo 'eclipse-pulseaudio: pulseaudio not installed' >&2\n\
+              \x20 sleep 8\n\
+              \x20 exit 127\n\
+              }\n\
+              if ! grep -q '^pulse:' /etc/passwd 2>/dev/null; then\n\
+              \x20 echo 'eclipse-pulseaudio: no pulse user in /etc/passwd' >&2\n\
+              \x20 sleep 8\n\
+              \x20 exit 1\n\
+              fi\n\
+              mkdir -p /run/pulse /run/user/0/pulse /var/lib/pulse /var/run/pulse\n\
+              chmod 0755 /run/pulse /var/run/pulse 2>/dev/null || true\n\
+              chmod 0700 /var/lib/pulse /run/user/0 /run/user/0/pulse 2>/dev/null || true\n\
+              chown pulse:pulse /run/pulse /var/run/pulse /var/lib/pulse 2>/dev/null || true\n\
+              # init hands every service XDG_RUNTIME_DIR=/run/user/0 (uid 0).\n\
+              # After --system drops to pulse, pa_get_runtime_dir would reject\n\
+              # that directory as 'not owned by us' and exit.\n\
+              unset XDG_RUNTIME_DIR\n\
+              export HOME=/var/run/pulse\n\
+              export PULSE_RUNTIME_PATH=/run/pulse\n\
+              export PULSE_STATE_PATH=/var/lib/pulse\n\
+              exec pulseaudio --system --disallow-exit --exit-idle-time=-1 --daemonize=no --use-pid-file=no --realtime=false --log-target=stderr --log-level=notice\n",
         )
         .unwrap();
         let share = rootfs.join("usr").join("share").join("eclipse");
@@ -2451,7 +2785,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               : \"${XDG_RUNTIME_DIR:=/run/user/0}\"; export XDG_RUNTIME_DIR\n\
               [ -d \"$XDG_RUNTIME_DIR\" ] || { mkdir -p \"$XDG_RUNTIME_DIR\" && chmod 0700 \"$XDG_RUNTIME_DIR\"; }\n\
               export PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin\n\
-              export LANG=\"${LANG:-C.UTF-8}\"\n\
+              export LANG=\"${LANG:-es_ES.UTF-8}\"\n\
+              export TZ=\"${TZ:-Europe/Madrid}\"\n\
               i=0\n\
               while [ \"$i\" -lt 15 ]; do\n\
               \x20 for s in \"$XDG_RUNTIME_DIR\"/wayland-[0-9]*; do\n\
@@ -2570,6 +2905,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                 "eclipse-lunarbar",
                 "eclipse-boot-sound",
                 "eclipse-boot-sound-play",
+                "eclipse-pulseaudio",
                 "reboot",
                 "poweroff",
                 "halt",
@@ -2586,7 +2922,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let _ = fs::create_dir_all(&eclipse_etc);
         fs::write(eclipse_etc.join("desktop"), b"labwc\n").unwrap();
 
-        println!("Installed eclipse-init as PID 1 with udhcpc, seatd, labwc, xorg and boot-sound services.");
+        println!("Installed eclipse-init as PID 1 with udhcpc, seatd, labwc, xorg, pulseaudio and boot-sound services.");
         true
     }
 

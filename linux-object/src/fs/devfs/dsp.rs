@@ -91,6 +91,7 @@ impl INode for DspDev {
             if n > 0 {
                 done += n;
                 deadline = kernel_hal::timer::timer_now() + deadline_step;
+                super::snd::arm_playback_watchdog();
                 continue;
             }
             // Ring full: the device frees space at the PCM byte rate. The
@@ -140,6 +141,7 @@ impl INode for DspDev {
                     kernel_hal::deferred_job::drain_deferred_jobs();
                     core::hint::spin_loop();
                 }
+                let _ = self.audio.reset();
                 Ok(0)
             }
             SNDCTL_DSP_SPEED => {

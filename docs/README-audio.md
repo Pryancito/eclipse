@@ -1,4 +1,4 @@
-# Audio: HD Audio driver, NVIDIA HDMI, and `/dev/dsp`
+# Audio: HD Audio driver, NVIDIA HDMI, PulseAudio, and `/dev/dsp`
 
 Eclipse's audio subsystem is a single Intel HD Audio (HDA) driver that covers
 every PCI class-0403 controller:
@@ -15,9 +15,14 @@ every PCI class-0403 controller:
 ## Architecture
 
 ```
-userspace:  wavplay / mpg123 -o oss / ffmpeg -f oss
+userspace:  pactl / paplay / mpg123 / aplay / SDL / OpenAL
+                 │ libpulse  or  ALSA `type pulse`
+PulseAudio ── /run/pulse/native  (system instance, mmap=0 sink on hw:0,0)
+                 │
+userspace:  wavplay / ffmpeg -f oss
                  │ write(2) + OSS ioctls
 /dev/dsp[N] ─ linux-object/src/fs/devfs/dsp.rs   (OSS node, one per controller)
+/dev/snd/*  ─ linux-object/src/fs/devfs/snd.rs   (ALSA, Pulse's backend)
                  │ AudioScheme
 drivers/src/audio/hda.rs                          (controller + codec + PCM ring)
                  │ CORB/RIRB verbs + stream DMA (all polled, no interrupts)
@@ -111,40 +116,80 @@ speaker-test -c 2 -t sine &
 cat /proc/gpusnd
 ```
 
+## Userspace API: PulseAudio
+
+The session runs a **system-instance** PulseAudio daemon (`pulseaudio --system`)
+on top of ALSA card 0. That is what gives Eclipse several simultaneous playback
+clients: the kernel PCM is single-client (no dmix — it needs SysV IPC), and
+Pulse mixes in userspace.
+
+- Socket: `unix:/run/pulse/native` (`PULSE_SERVER` is set in eclipse-init, the
+  labwc wrapper, `/etc/profile` and labwc `environment`).
+- ALSA `default` is the pulse plugin (`/etc/asound.conf`), so `aplay` / `mpg123`
+  / `SDL_AUDIODRIVER=alsa` go through the daemon too. Direct kernel access is
+  `aplay -D eclipse_hw` (fails while Pulse holds the device).
+- The ALSA sink is `mmap=0 tsched=0`: this kernel's PCM is RW-interleaved +
+`SYNC_PTR` only. Period wakeups come from the poll timer (~4 ms). After a
+track ends, a kernel watchdog keeps reading LPIB so the cyclic DMA ring
+cannot loop the last fragment. `module-suspend-on-idle timeout=1` then
+pauses the sink.
+- OpenAL (`ALSOFT_DRIVERS=pulse,alsa`) talks native libpulse. PI-futexes are
+  implemented, so `pa_mutex_new()` no longer aborts.
+
+```sh
+pactl info
+pactl list sinks short
+pactl set-sink-volume @DEFAULT_SINK@ 50%
+paplay music.wav          # PCM; MP3 still goes through mpg123 → ALSA → Pulse
+speaker-test -c 2 -t sine # ALSA default → Pulse
+```
+
+The daemon is an eclipse-init `respawn` service (`pulseaudio.service` →
+`/usr/local/bin/eclipse-pulseaudio`). Logs: `/tmp/pulseaudio.log`. A ~150 ms
+exit is a startup abort (`--system` could not chown `/var/run/pulse` /
+`/var/lib/pulse`, or `XDG_RUNTIME_DIR` was still `/run/user/0` after the
+drop to user `pulse`); those directories are ramfs and the wrapper unsets
+`XDG_RUNTIME_DIR` before exec.
+
 ## Userspace API: ALSA (`/dev/snd/*`)
 
-System sound goes through the native ALSA ABI: one `controlC<card>` +
-`pcmC<card>D0p` pair per HDA controller (`linux-object/src/fs/devfs/snd.rs`),
-in the same card order as `/dev/dsp<N>`. It implements what alsa-lib's `hw`
-plugin needs in RW-interleaved mode — `HW_REFINE`/`HW_PARAMS` (constrained to
+System sound is mixed by PulseAudio; the kernel side is still the native ALSA
+ABI: one `controlC<card>` + `pcmC<card>D0p` pair per HDA controller
+(`linux-object/src/fs/devfs/snd.rs`), in the same card order as `/dev/dsp<N>`.
+It implements what alsa-lib's `hw` plugin (and Pulse's `module-alsa-sink`)
+needs in RW-interleaved mode — `HW_REFINE`/`HW_PARAMS` (constrained to
 S16LE stereo at the HDA rate set), `SW_PARAMS`, `PREPARE`, `WRITEI_FRAMES`,
-`DRAIN`/`DROP`, `STATUS`, `DELAY` and `SYNC_PTR` (the status/control pages
-are not mmap-able; alsa-lib falls back to `SYNC_PTR` automatically).
+`DRAIN`/`DROP`, `PAUSE` (stops DMA, keeps the ring), `REWIND`/`FORWARD`
+(silence the dropped range), `STATUS`, `DELAY` and `SYNC_PTR` (the
+status/control pages are not mmap-able; alsa-lib falls back to `SYNC_PTR`
+automatically).
 
-`/etc/asound.conf` (written by xtask) sets `default` to **`hw:0,0`** so
-mpg123/`aplay` talk S16LE stereo to the kernel PCM without the `plug` plugin
-(plug's extra conversion path was failing `snd_pcm_hw_params` after
-`set_*_near` had already succeeded). Format conversion is still available as
-`aplay -D plug`. dmix is not used (it needs SysV IPC shared memory), so
-playback is single-client. Card 0 is the preferred playback device (HDMI/DP
+`/etc/asound.conf` (written by xtask) sets `default` to the **PulseAudio
+plugin** when `pulseaudio` and `alsa-plugins-pulse` are in the image, so
+mpg123/`aplay` multiplex through the daemon. The kernel PCM remains
+`eclipse_hw` (`hw:0,0`) for Pulse's own ALSA sink. Format conversion is still
+available as `aplay -D plug`. Without Pulse in the image, `default` is `hw:0,0`
+and playback is single-client. Card 0 is the preferred playback device (HDMI/DP
 with a live display outranks analog jacks); the remaining controllers follow
 in PCI probe order:
 
 ```sh
 aplay -l                      # list cards
-aplay music.wav               # default = hw:0,0 (usually HDMI, S16LE stereo)
-aplay -D plug music.wav       # convert format/rate in userspace
-aplay -D hw:1,0 music.wav     # next card (often the PCH analog codec)
+aplay music.wav               # default = Pulse → hw:0,0 (usually HDMI, S16LE stereo)
+aplay -D plug music.wav       # convert format/rate in userspace (via Pulse)
+aplay -D eclipse_hw music.wav # kernel PCM directly (busy if Pulse is up)
 speaker-test -c 2 -t sine
-amixer set Master 50%
+pactl set-sink-volume @DEFAULT_SINK@ 50%
+amixer set Master 50%         # Pulse ctl, or kernel Master if Pulse is down
 amixer set Master mute
 ```
 
-`alsa-lib` and `alsa-utils` are baked into the rootfs package set
+`alsa-lib`, `alsa-utils`, `pulseaudio`, `pulseaudio-alsa`, `pulseaudio-utils`,
+`libpulse` and `alsa-plugins-pulse` are baked into the rootfs package set
 (`xtask/src/linux/xorg.rs`); anything missing can be added at runtime with
 `apk add`. Each card exposes a simple **Master** mixer (`amixer set Master 50%`,
-`amixer set Master mute`): HDMI/DP has no analog volume, so the HDA driver
-scales S16LE in software. The lunarbar volume slider talks to that control.
+`amixer set Master mute`) on the kernel node; with Pulse running, lunarbar and
+`pactl` adjust the sink volume instead.
 
 Card 0 is the preferred playback device — HDMI/DP with a live display outranks
 analog jacks — so `aplay` and `amixer` without `-c` hit the monitor speakers.
@@ -212,14 +257,18 @@ wavplay --tone 880             # another frequency
 wavplay -d /dev/dsp1 --tone    # next codec (often analog)
 wavplay file.wav               # 16-bit PCM WAV (mono is upmixed)
 aplay -l                       # ALSA cards (needs /usr/share/alsa/alsa.conf)
-aplay music.wav                # default = hw:0,0
-amixer set Master 80%          # software gain on the default card
+aplay music.wav                # default = Pulse → hw:0,0
+pactl info                     # PulseAudio daemon
+pactl set-sink-volume @DEFAULT_SINK@ 80%
+amixer set Master 80%          # Pulse ctl, or kernel Master if Pulse is down
 ```
 
 `tools/wavplay` is a static musl binary installed into the rootfs by xtask.
-`aplay`/`amixer`/`mpg123` talk to `/dev/snd` through alsa-lib; QEMU boots the
-live initramfs, which must include `usr/share/alsa` (the `hw` plugin lives in
-`alsa.conf`). OSS (`wavplay` → `/dev/dsp`) does not need that file.
+`aplay`/`amixer`/`mpg123` talk to `/dev/snd` through alsa-lib (and, with Pulse
+up, through the pulse plugin); QEMU boots the live initramfs, which must
+include `usr/share/alsa` (the `hw` plugin lives in `alsa.conf`) and
+`usr/bin/pulseaudio`. OSS (`wavplay` → `/dev/dsp`) does not need that file
+and bypasses Pulse.
 
 `HW_REFINE` returning `EINVAL` during `aplay`/`mpg123` is normal: alsa-lib
 probes unsupported format/period combinations that way. A real failure prints
@@ -235,10 +284,13 @@ so you can hear the guest. Override with `AUDIODEV=wav` (PCM to
 
 ## Known limits
 
-- Playback only (no capture), stereo only, S16LE only.
+- Playback only (no capture), stereo only, S16LE only at the kernel PCM.
+  PulseAudio resamples other formats in userspace.
+- Several clients can play at once through PulseAudio. Direct `hw:0,0` /
+  `/dev/dsp` is still single-client (no dmix).
 - Volume is software PCM scaling (no analog AMP programming); already-queued
   ring contents are not retroactively gained — the new level applies to the
-  next `write`.
+  next `write`. Pulse sink volume applies to mixed output.
 - The DP audio path uses the same ELD/enable controls but has not been
   exercised; DP-MST audio (device entries > 0) is not implemented.
 - The HDMI/DP unmute is re-sent at every digital stream start (GOP never

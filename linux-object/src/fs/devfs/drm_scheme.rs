@@ -1919,53 +1919,14 @@ impl INode for DrmDev {
                 }
             }
             DRM_IOCTL_MODE_DIRTYFB => {
-                // Flush accumulated damage by re-scanning the framebuffer out.
-                // Clients that keep one persistent FB and signal damage with
-                // DIRTYFB (X's modesetting shadow, simple toolkits) rely on this
-                // to update the screen. When clip rects are given, blit only
-                // their bounding union instead of the whole frame -- DIRTYFB is
-                // typically small, frequent damage (a blinking cursor, a
-                // repainted widget), and re-scanning the full framebuffer for
-                // that was a real chunk of the "feels slow" gap versus Linux.
+                // Accept the ioctl (X modesetting ShadowFB, simple toolkits)
+                // but always present the WHOLE framebuffer. Clip-rect dirty
+                // blits on the WC GOP/BAR1 scanout smeared neighboring pixels
+                // (squares and lines). Scene dirty-tracking lives in one
+                // place: the console `shadow_fb`. Cursor patches stay on
+                // their own path. `num_clips` / `clips_ptr` are ignored.
                 let cmd = unsafe { *(data as *const DrmModeFbDirtyCmd) };
-                // Bounded well above any real client's clip-rect count; an
-                // oversized, zero, or unreadable clip list just means "treat
-                // the whole frame as dirty" (also true DIRTYFB semantics for
-                // num_clips == 0).
-                let rect = if cmd.num_clips > 0 && cmd.num_clips <= 64 && cmd.clips_ptr != 0 {
-                    let mut union: Option<(u32, u32, u32, u32)> = None;
-                    for i in 0..cmd.num_clips as usize {
-                        let clip = unsafe { *(cmd.clips_ptr as *const DrmClipRect).add(i) };
-                        if clip.x2 <= clip.x1 || clip.y2 <= clip.y1 {
-                            continue;
-                        }
-                        let (x1, y1, x2, y2) = (
-                            clip.x1 as u32,
-                            clip.y1 as u32,
-                            clip.x2 as u32,
-                            clip.y2 as u32,
-                        );
-                        union = Some(match union {
-                            Some((ux, uy, uw, uh)) => {
-                                let nx = ux.min(x1);
-                                let ny = uy.min(y1);
-                                let fx = (ux + uw).max(x2);
-                                let fy = (uy + uh).max(y2);
-                                (nx, ny, fx - nx, fy - ny)
-                            }
-                            None => (x1, y1, x2 - x1, y2 - y1),
-                        });
-                    }
-                    union
-                } else {
-                    None
-                };
-                if !drm::present_now_region(cmd.fb_id, 1, rect) {
-                    // Best-effort: a damage flush that can't scan out (e.g. the
-                    // fb id is unknown to the software path) is not fatal — the
-                    // client keeps its shadow and will re-present. Returning EIO
-                    // here made Xorg's modesetting shadow abort its frame loop,
-                    // so swallow it rather than failing every DirtyFB.
+                if !drm::present_now(cmd.fb_id, 1) {
                     log::debug!("[drm] DIRTYFB fb={} not presented (no-op)", cmd.fb_id);
                 }
                 Ok(0)

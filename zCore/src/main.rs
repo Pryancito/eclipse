@@ -313,6 +313,20 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // as a *login* shell — without these in the real environment bash
             // greets with "I can't find my home directory!" and readline (tab
             // completion) misbehaves for lack of `TERM`.
+            // UI language: `lang=en` on the kernel cmdline selects English.
+            // Default Spanish. Do NOT set LC_ALL — it would freeze LANG
+            // for gettext/GTK in every process that inherits this env
+            // (busybox shells on the VTs). musl treats any *.UTF-8 name
+            // as UTF-8, which foot requires.
+            let lang_tag = options
+                .cmdline
+                .split(|c: char| c == ':' || c.is_whitespace())
+                .find_map(|t| t.strip_prefix("lang=").map(str::trim))
+                .unwrap_or("es");
+            let (lang_var, language_var): (&str, &str) = match lang_tag {
+                "en" | "EN" | "en_US" => ("LANG=en_US.UTF-8", "LANGUAGE=en"),
+                _ => ("LANG=es_ES.UTF-8", "LANGUAGE=es:en"),
+            };
             let envs: alloc::vec::Vec<alloc::string::String> = alloc::vec![
                 // /usr/local/bin first so the Eclipse labwc wrapper (which
                 // selects the renderer by the two-condition GL gate --
@@ -326,11 +340,32 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 "TERM=xterm-256color".into(),
                 "USER=root".into(),
                 "LOGNAME=root".into(),
-                // UTF-8 locale so ncurses/readline use Unicode box-drawing and
-                // compute character widths correctly (the console renders the
-                // box-drawing/block code points procedurally).
-                "LANG=C.UTF-8".into(),
-                "LC_ALL=C.UTF-8".into(),
+                lang_var.into(),
+                language_var.into(),
+                {
+                    let mut country = "ES";
+                    let mut tz: Option<&str> = None;
+                    for tok in options
+                        .cmdline
+                        .split(|c: char| c == ':' || c.is_whitespace())
+                    {
+                        if let Some(v) = tok.strip_prefix("tz=").map(str::trim) {
+                            if !v.is_empty() {
+                                tz = Some(v);
+                            }
+                        }
+                        if let Some(v) = tok.strip_prefix("country=").map(str::trim) {
+                            if !v.is_empty() {
+                                country = v;
+                            }
+                        }
+                    }
+                    let zone = tz.unwrap_or(match country {
+                        "US" | "us" | "USA" | "usa" => "America/New_York",
+                        _ => "Europe/Madrid",
+                    });
+                    alloc::format!("TZ={zone}")
+                },
                 // wlroots/labwc configuration. Set in the real environment (not
                 // only /etc/profile) so a compositor launched from a *non-login*
                 // shell — which busybox sh does not source /etc/profile for —

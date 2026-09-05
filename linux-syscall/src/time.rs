@@ -7,7 +7,7 @@ use alloc::collections::BTreeMap;
 use core::convert::TryFrom;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
-use kernel_hal::{user::UserInPtr, user::UserOutPtr};
+use kernel_hal::{user::UserInOutPtr, user::UserInPtr, user::UserOutPtr};
 use lazy_static::lazy_static;
 use linux_object::error::{LxError, SysResult};
 use linux_object::process::ProcessExt;
@@ -19,6 +19,249 @@ use zircon_object::object::{KernelObject, KoID};
 use zircon_object::task::{Thread, ROOT_JOB};
 
 const USEC_PER_TICK: usize = 10000;
+
+/// Linux `struct timex` (x86_64 / LP64): `adjtimex(2)` / `clock_adjtime(2)`.
+/// Layout is 208 bytes (modes u32 + pad + longs + timeval + PPS + TAI + reserved).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Timex {
+    /// Mode selector (`ADJ_*` bits).
+    pub modes: u32,
+    /// Time offset (µs, or ns if `STA_NANO`).
+    pub offset: i64,
+    /// Frequency offset (scaled ppm, 2^-16 ppm units).
+    pub freq: i64,
+    /// Maximum error (µs).
+    pub maxerror: i64,
+    /// Estimated error (µs).
+    pub esterror: i64,
+    /// Clock command/status (`STA_*` bits).
+    pub status: i32,
+    /// PLL time constant.
+    pub constant: i64,
+    /// Clock precision (µs, read-only).
+    pub precision: i64,
+    /// Frequency tolerance (scaled ppm, read-only).
+    pub tolerance: i64,
+    /// Current time (read-only except `ADJ_SETOFFSET`).
+    pub time: TimeValI64,
+    /// µs between clock ticks.
+    pub tick: i64,
+    /// PPS frequency (scaled ppm, read-only).
+    pub ppsfreq: i64,
+    /// PPS jitter (µs, read-only).
+    pub jitter: i64,
+    /// Interval duration (s, shift, read-only).
+    pub shift: i32,
+    /// PPS stability (scaled ppm, read-only).
+    pub stabil: i64,
+    /// Jitter limit exceeded (read-only).
+    pub jitcnt: i64,
+    /// Calibration intervals (read-only).
+    pub calcnt: i64,
+    /// Calibration errors (read-only).
+    pub errcnt: i64,
+    /// Stability limit exceeded (read-only).
+    pub stbcnt: i64,
+    /// TAI offset (seconds).
+    pub tai: i32,
+    /// Padding to Linux's 208-byte `struct timex`.
+    pub reserved: [i32; 11],
+}
+
+/// `struct timeval` with signed fields, as in the kernel `timex.time` member
+/// (so `ADJ_SETOFFSET` can step the clock backwards).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TimeValI64 {
+    /// Seconds.
+    pub sec: i64,
+    /// Microseconds, or nanoseconds if `STA_NANO` / `ADJ_NANO`.
+    pub usec: i64,
+}
+
+// linux/timex.h — modes
+const ADJ_OFFSET: u32 = 0x0001;
+const ADJ_FREQUENCY: u32 = 0x0002;
+const ADJ_MAXERROR: u32 = 0x0004;
+const ADJ_ESTERROR: u32 = 0x0008;
+const ADJ_STATUS: u32 = 0x0010;
+const ADJ_TIMECONST: u32 = 0x0020;
+const ADJ_TAI: u32 = 0x0080;
+const ADJ_SETOFFSET: u32 = 0x0100;
+const ADJ_MICRO: u32 = 0x1000;
+const ADJ_NANO: u32 = 0x2000;
+const ADJ_TICK: u32 = 0x4000;
+const ADJ_OFFSET_SINGLESHOT: u32 = 0x8001;
+const ADJ_OFFSET_SS_READ: u32 = 0xa001;
+
+// linux/timex.h — status
+const STA_UNSYNC: i32 = 0x0040;
+const STA_NANO: i32 = 0x2000;
+
+// linux/timex.h — return codes
+const TIME_OK: usize = 0;
+const TIME_ERROR: usize = 5;
+
+/// NTP PLL knobs persisted across `adjtimex` calls. Frequency is recorded
+/// (so ntpd's read-back matches what it wrote) but not slewed continuously;
+/// offsets and `ADJ_SETOFFSET` step `CLOCK_REALTIME` immediately.
+struct NtpState {
+    freq: i64,
+    maxerror: i64,
+    esterror: i64,
+    status: i32,
+    constant: i64,
+    tick: i64,
+    tai: i32,
+    /// Leftover µs/ns from `adjtime(3)` / `ADJ_OFFSET_SINGLESHOT`. Applied
+    /// immediately, so this reads back as 0 after a set.
+    offset_remain: i64,
+    nano: bool,
+}
+
+impl Default for NtpState {
+    fn default() -> Self {
+        Self {
+            freq: 0,
+            maxerror: 16_000_000, // 16 s, Linux's unsync default
+            esterror: 16_000_000,
+            status: STA_UNSYNC,
+            constant: 7,
+            tick: 10_000, // USER_HZ=100
+            tai: 0,
+            offset_remain: 0,
+            nano: false,
+        }
+    }
+}
+
+lazy_static! {
+    static ref NTP_STATE: Mutex<NtpState> = Mutex::new(NtpState::default());
+}
+
+fn wall_clock_add_ns(delta_ns: i64) {
+    let now = kernel_hal::timer::wall_clock_now();
+    let new = if delta_ns >= 0 {
+        now.saturating_add(Duration::from_nanos(delta_ns as u64))
+    } else {
+        let mag = delta_ns.unsigned_abs();
+        now.saturating_sub(Duration::from_nanos(mag))
+    };
+    kernel_hal::timer::wall_clock_set(new);
+}
+
+/// Apply a userspace `timex` and fill the read-only / current fields in place.
+/// Returns the NTP status code (`TIME_OK` / `TIME_ERROR`), not 0-vs-errno.
+fn adjtimex_apply(tx: &mut Timex) -> Result<usize, LxError> {
+    let modes = tx.modes;
+    if modes == ADJ_OFFSET_SS_READ {
+        let st = NTP_STATE.lock();
+        tx.offset = st.offset_remain;
+        fill_timex_readonly(tx, &st);
+        return Ok(ntp_time_state(&st));
+    }
+
+    let mut st = NTP_STATE.lock();
+
+    if modes & ADJ_NANO != 0 {
+        st.nano = true;
+    } else if modes & ADJ_MICRO != 0 {
+        st.nano = false;
+    }
+
+    if modes & ADJ_TICK != 0 {
+        // Linux rejects ticks outside [900000/USER_HZ, 1100000/USER_HZ].
+        if tx.tick < 9000 || tx.tick > 11000 {
+            return Err(LxError::EINVAL);
+        }
+        st.tick = tx.tick;
+    }
+    if modes & ADJ_FREQUENCY != 0 {
+        st.freq = tx.freq;
+    }
+    if modes & ADJ_MAXERROR != 0 {
+        st.maxerror = tx.maxerror;
+    }
+    if modes & ADJ_ESTERROR != 0 {
+        st.esterror = tx.esterror;
+    }
+    if modes & ADJ_TIMECONST != 0 {
+        st.constant = tx.constant;
+    }
+    if modes & ADJ_TAI != 0 {
+        if tx.tai < 0 {
+            return Err(LxError::EINVAL);
+        }
+        st.tai = tx.tai;
+    }
+    if modes & ADJ_STATUS != 0 {
+        // Userspace may clear STA_UNSYNC once NTP is happy; keep STA_NANO
+        // consistent with the resolution bit we own.
+        st.status = tx.status & !STA_NANO;
+    }
+
+    let singleshot = (modes & ADJ_OFFSET_SINGLESHOT) == ADJ_OFFSET_SINGLESHOT;
+    if modes & ADJ_SETOFFSET != 0 {
+        let nsec = setoffset_ns(&tx.time, st.nano)?;
+        wall_clock_add_ns(nsec);
+    } else if singleshot || modes & ADJ_OFFSET != 0 {
+        let nsec = if st.nano {
+            tx.offset
+        } else {
+            tx.offset.saturating_mul(1_000)
+        };
+        wall_clock_add_ns(nsec);
+        st.offset_remain = 0;
+    }
+
+    if st.nano {
+        st.status |= STA_NANO;
+    } else {
+        st.status &= !STA_NANO;
+    }
+
+    fill_timex_readonly(tx, &st);
+    Ok(ntp_time_state(&st))
+}
+
+fn setoffset_ns(tv: &TimeValI64, nano: bool) -> Result<i64, LxError> {
+    let frac = tv.usec;
+    let limit = if nano { 1_000_000_000 } else { 1_000_000 };
+    if frac <= -limit || frac >= limit {
+        return Err(LxError::EINVAL);
+    }
+    let sec_ns = tv.sec.saturating_mul(1_000_000_000);
+    let frac_ns = if nano { frac } else { frac.saturating_mul(1_000) };
+    Ok(sec_ns.saturating_add(frac_ns))
+}
+
+fn fill_timex_readonly(tx: &mut Timex, st: &NtpState) {
+    tx.freq = st.freq;
+    tx.maxerror = st.maxerror;
+    tx.esterror = st.esterror;
+    tx.status = st.status;
+    tx.constant = st.constant;
+    tx.precision = 1;
+    tx.tolerance = 32_768_000; // Linux MAXFREQ (500 ppm, scaled)
+    tx.tick = st.tick;
+    tx.tai = st.tai;
+    let now = TimeSpec::now();
+    tx.time.sec = now.sec as i64;
+    tx.time.usec = if st.nano {
+        now.nsec as i64
+    } else {
+        (now.nsec / 1_000) as i64
+    };
+}
+
+fn ntp_time_state(st: &NtpState) -> usize {
+    if st.status & STA_UNSYNC != 0 {
+        TIME_ERROR
+    } else {
+        TIME_OK
+    }
+}
 
 impl Syscall<'_> {
     /// finds the resolution (precision) of the specified clock clockid, and,
@@ -86,6 +329,29 @@ impl Syscall<'_> {
         let target = Duration::new(timeval.sec as u64, timeval.usec as u32 * 1_000);
         kernel_hal::timer::wall_clock_set(target);
         Ok(0)
+    }
+
+    /// `adjtimex(2)` — NTP clock discipline. OpenNTPD / busybox ntpd call this
+    /// to step or slew `CLOCK_REALTIME` and to read STA_UNSYNC. A missing
+    /// implementation logged `unknown syscall: ADJTIMEX` and returned ENOSYS,
+    /// so the daemon never synced.
+    pub fn sys_adjtimex(&self, mut tx: UserInOutPtr<Timex>) -> SysResult {
+        if tx.is_null() {
+            return Err(LxError::EINVAL);
+        }
+        let mut timex = tx.read()?;
+        let state = adjtimex_apply(&mut timex)?;
+        tx.write(timex)?;
+        Ok(state)
+    }
+
+    /// `clock_adjtime(2)` — `adjtimex` for a given clock. Only
+    /// `CLOCK_REALTIME` is adjustable here (same as Linux for the system clock).
+    pub fn sys_clock_adjtime(&self, clock: usize, tx: UserInOutPtr<Timex>) -> SysResult {
+        match clock {
+            0 => self.sys_adjtimex(tx), // CLOCK_REALTIME
+            _ => Err(LxError::EINVAL),
+        }
     }
 
     /// get the time with second and microseconds
@@ -729,5 +995,101 @@ mod itimer_tests {
         assert_eq!(itimer_signo(ITIMER_REAL), Signal::SIGALRM as usize);
         assert_eq!(itimer_signo(ITIMER_VIRTUAL), Signal::SIGVTALRM as usize);
         assert_eq!(itimer_signo(ITIMER_PROF), Signal::SIGPROF as usize);
+    }
+}
+
+#[cfg(test)]
+mod adjtimex_tests {
+    use super::*;
+
+    #[test]
+    fn timex_matches_linux_x86_64_layout() {
+        assert_eq!(core::mem::size_of::<Timex>(), 208);
+        assert_eq!(core::mem::align_of::<Timex>(), 8);
+        assert_eq!(core::mem::offset_of!(Timex, offset), 8);
+        assert_eq!(core::mem::offset_of!(Timex, time), 72);
+        assert_eq!(core::mem::offset_of!(Timex, tai), 160);
+    }
+
+    #[test]
+    fn read_reports_unsync_and_fills_tick() {
+        *NTP_STATE.lock() = NtpState::default();
+        let mut tx = Timex::default();
+        let r = adjtimex_apply(&mut tx).unwrap();
+        assert_eq!(r, TIME_ERROR);
+        assert_eq!(tx.tick, 10_000);
+        assert_eq!(tx.status & STA_UNSYNC, STA_UNSYNC);
+        assert!(tx.time.sec >= 0);
+    }
+
+    #[test]
+    fn clearing_unsync_returns_time_ok() {
+        *NTP_STATE.lock() = NtpState::default();
+        let mut tx = Timex {
+            modes: ADJ_STATUS,
+            status: 0,
+            ..Default::default()
+        };
+        let r = adjtimex_apply(&mut tx).unwrap();
+        assert_eq!(r, TIME_OK);
+        assert_eq!(tx.status & STA_UNSYNC, 0);
+    }
+
+    #[test]
+    fn setoffset_rejects_out_of_range_usec() {
+        *NTP_STATE.lock() = NtpState::default();
+        let mut tx = Timex {
+            modes: ADJ_SETOFFSET,
+            time: TimeValI64 {
+                sec: 0,
+                usec: 1_000_000,
+            },
+            ..Default::default()
+        };
+        assert_eq!(adjtimex_apply(&mut tx), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn frequency_roundtrips() {
+        *NTP_STATE.lock() = NtpState::default();
+        let mut tx = Timex {
+            modes: ADJ_FREQUENCY,
+            freq: 65536,
+            ..Default::default()
+        };
+        adjtimex_apply(&mut tx).unwrap();
+        let mut readback = Timex::default();
+        adjtimex_apply(&mut readback).unwrap();
+        assert_eq!(readback.freq, 65536);
+    }
+
+    #[test]
+    fn bad_tick_is_einval() {
+        *NTP_STATE.lock() = NtpState::default();
+        let mut tx = Timex {
+            modes: ADJ_TICK,
+            tick: 1,
+            ..Default::default()
+        };
+        assert_eq!(adjtimex_apply(&mut tx), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn setoffset_ns_micro_and_nano() {
+        let us = TimeValI64 {
+            sec: 1,
+            usec: 500_000,
+        };
+        assert_eq!(setoffset_ns(&us, false).unwrap(), 1_500_000_000);
+        let ns = TimeValI64 {
+            sec: 0,
+            usec: 250,
+        };
+        assert_eq!(setoffset_ns(&ns, true).unwrap(), 250);
+        let neg = TimeValI64 {
+            sec: -1,
+            usec: 0,
+        };
+        assert_eq!(setoffset_ns(&neg, false).unwrap(), -1_000_000_000);
     }
 }

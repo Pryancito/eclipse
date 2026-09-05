@@ -36,8 +36,39 @@ pub trait AudioScheme: Scheme {
     /// Bytes queued but not yet played out.
     fn queued_bytes(&self) -> usize;
 
+    /// True while the DMA engine is fetching the ring. Used by the ALSA
+    /// watchdog timer so an idle Pulse sink cannot leave RUN set (cyclic
+    /// leftover of the last mpg123 buffer looping every ~0.5 s).
+    fn is_playing(&self) -> bool {
+        false
+    }
+
     /// Stop playback and drop any queued PCM.
     fn reset(&self) -> DeviceResult;
+
+    /// Drop the most recently queued `bytes` (ALSA `SNDRV_PCM_IOCTL_REWIND`).
+    /// Returns how many bytes were actually discarded. Default: none.
+    fn rewind(&self, bytes: usize) -> DeviceResult<usize> {
+        let _ = bytes;
+        Ok(0)
+    }
+
+    /// Skip the next `bytes` of queued PCM (ALSA `SNDRV_PCM_IOCTL_FORWARD`).
+    /// Returns how many bytes were discarded. Default: none.
+    fn forward(&self, bytes: usize) -> DeviceResult<usize> {
+        let _ = bytes;
+        Ok(0)
+    }
+
+    /// Pause DMA while keeping queued samples (ALSA `PAUSE` enable).
+    fn pause(&self) -> DeviceResult {
+        Ok(())
+    }
+
+    /// Resume a paused stream without dropping the ring.
+    fn resume(&self) -> DeviceResult {
+        Ok(())
+    }
 
     /// Set stereo playback gain. `left`/`right` are percents in `0..=100`;
     /// mute flags force silence on that channel regardless of percent.

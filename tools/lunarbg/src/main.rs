@@ -819,10 +819,19 @@ impl State {
         // frames ago; render_frame restores that region from the base first.
         scene::render_frame(frame, frames.width, &frames.base, &frames.layout, t_ms);
 
-        let (rx, ry, rw, rh) = frames.layout.region;
         let scale = frames.scale;
         bg.surface.attach(Some(&frames.buffers[i]), 0, 0);
-        damage(&bg.surface, scale, rx as i32, ry as i32, rw as i32, rh as i32);
+        // Full-buffer damage. The logo-region clip left stale tiles around
+        // the moon (double-buffer + partial damage). Scene dirty lives in
+        // the console shadow_fb; clients present whole buffers.
+        damage(
+            &bg.surface,
+            scale,
+            0,
+            0,
+            frames.width as i32,
+            frames.height as i32,
+        );
         // At most ONE outstanding frame callback per surface: while the
         // wallpaper is occluded and the compositor withholds Done events, the
         // 1 Hz keep-alive would otherwise stack a fresh never-firing callback

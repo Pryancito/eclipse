@@ -49,6 +49,7 @@
 
 mod apps;
 mod fill_guard;
+mod i18n;
 mod icons;
 mod par;
 mod draw;
@@ -917,15 +918,18 @@ impl State {
         }
     }
 
-    /// Cycle es/us via `eclipse-kbd toggle` (console + labwc + Xwayland) and
-    /// flip the pill immediately so the bar does not wait for the next 1 Hz tick.
+    /// Cycle es/us: write `/proc/kbd` first (so the 1 Hz tick cannot snap the
+    /// pill back), then persist XKB via `eclipse-kbd es|us` (not `toggle`,
+    /// which races if two clicks overlap).
     fn toggle_kbd(&mut self) {
-        self.spawn("/usr/local/bin/eclipse-kbd toggle");
-        self.metrics.kbd = if self.metrics.kbd.eq_ignore_ascii_case("US") {
-            "ES".into()
+        let next = if self.metrics.kbd.eq_ignore_ascii_case("US") {
+            "es"
         } else {
-            "US".into()
+            "us"
         };
+        sysinfo::set_kbd_layout(next);
+        self.metrics.kbd = next.to_ascii_uppercase();
+        self.spawn(&format!("/usr/local/bin/eclipse-kbd {next}"));
         self.render_task_bars();
     }
 
@@ -1341,21 +1345,9 @@ impl State {
 
         if let Some(buf) = popup.buffers[i].as_ref() {
             popup.surface.attach(Some(buf), 0, 0);
-            // Damage only the panel (+ small pad) when possible — full-screen
-            // damage on every hover was a redraw storm under QEMU resize.
-            let (px, py, pw, ph) = panel;
-            let pad = 8;
-            let dx = (px - pad).max(0);
-            let dy = (py - pad).max(0);
-            let dw = (pw + pad * 2).min(w as i32 - dx).max(1);
-            let dh = (ph + pad * 2).min(h as i32 - dy).max(1);
-            damage(&popup.surface, 1, dx, dy, dw, dh);
-            // Always include the scrim once on first paint by also damaging
-            // the full surface when this is buffer 0 after configure — cheap
-            // enough once; hover path uses the panel rect above.
-            if i == 0 && popup.busy.iter().filter(|b| **b).count() == 1 {
-                damage(&popup.surface, 1, 0, 0, w as i32, h as i32);
-            }
+            // Full-surface damage. Sub-rect dirty on popups left stale tiles
+            // around the panel (same class of artifact as KMS DIRTYFB clips).
+            damage(&popup.surface, 1, 0, 0, w as i32, h as i32);
             popup.surface.commit();
         }
     }
@@ -1451,7 +1443,7 @@ impl State {
                     }
                 }
                 self.spawn(&format!(
-                    "amixer set Master {v}% >/dev/null 2>&1 || wpctl set-volume @DEFAULT_AUDIO_SINK@ {v}%"
+                    "pactl set-sink-volume @DEFAULT_SINK@ {v}% >/dev/null 2>&1 || amixer set Master {v}% >/dev/null 2>&1 || wpctl set-volume @DEFAULT_AUDIO_SINK@ {v}%"
                 ));
                 self.render_popup();
                 self.render_all();
@@ -2351,7 +2343,7 @@ fn draw_apps(
     let icon = 18;
     cv.crescent(px + 12, py + (APPS_HEADER_H - icon) / 2, icon, LAUNCH);
     cv.text_bold(
-        "aplicaciones",
+        i18n::Lang::current().apps_title(),
         px + 12 + icon + 10,
         py + (APPS_HEADER_H - GLYPH_H) / 2,
         TEXT,
@@ -2372,7 +2364,7 @@ fn draw_apps(
     cv.round_rect(sx, sy, sw, sh, 6, PILL);
     let f_y = sy + (sh - GLYPH_H) / 2;
     let caret_x = if filter.is_empty() {
-        cv.text("buscar aplicaciones", sx + 10, f_y, DIM);
+        cv.text(i18n::Lang::current().apps_search(), sx + 10, f_y, DIM);
         sx + 10
     } else {
         // popup_key caps the filter at APPS_FILTER_MAX — exactly what fits
@@ -2484,7 +2476,11 @@ fn draw_calendar(
     let ay = py + (header_h - ts) / 2;
     cv.triangle_h(px + 16, ay, ts, true, LAUNCH);
     cv.triangle_h(px + pw - 16 - ts, ay, ts, false, LAUNCH);
-    let title = format!("{} {}", sysinfo::MONTH_FULL[month as usize % 12], year);
+    let title = format!(
+        "{} {}",
+        i18n::Lang::current().month_full()[month as usize % 12],
+        year
+    );
     let tw = Canvas::text_width(&title);
     cv.text_bold(&title, px + (pw - tw) / 2, py + (header_h - GLYPH_H) / 2, TEXT);
     let hits = vec![
@@ -2492,9 +2488,9 @@ fn draw_calendar(
         (px + pw - 44, py, px + pw - 4, py + header_h, Action::NextMonth),
     ];
 
-    // Weekday header, Monday-first (lu ma mi ju vi sá do).
-    const WKD: [&str; 7] = ["lu", "ma", "mi", "ju", "vi", "sá", "do"];
-    for (i, wd) in WKD.iter().enumerate() {
+    // Weekday header, Monday-first.
+    let wkd = i18n::Lang::current().weekday_mon_first();
+    for (i, wd) in wkd.iter().enumerate() {
         let x = px + pad + i as i32 * cell_w + (cell_w - Canvas::text_width(wd)) / 2;
         cv.text(wd, x, py + header_h + (wkd_h - GLYPH_H) / 2, DIM);
     }
@@ -2548,10 +2544,13 @@ fn draw_power_menu(
     cv.round_rect_a(px, py, pw, ph, 10, BAR_RULE, 0.4);
 
     let items = [
-        ("bloquear", Action::PowerLock),
-        ("cerrar sesión", Action::PowerLogout),
-        ("reiniciar", Action::PowerReboot),
-        ("apagar", Action::PowerShutdown),
+        (i18n::Lang::current().power_lock(), Action::PowerLock),
+        (i18n::Lang::current().power_logout(), Action::PowerLogout),
+        (i18n::Lang::current().power_reboot(), Action::PowerReboot),
+        (
+            i18n::Lang::current().power_shutdown(),
+            Action::PowerShutdown,
+        ),
     ];
 
     let row_h = 34;

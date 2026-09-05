@@ -54,6 +54,8 @@ pub fn install(rootfs: &Path) {
     write_x11_prepare(rootfs);
     write_xkbmap_wrapper(rootfs);
     write_eclipse_kbd(rootfs);
+    write_eclipse_locale(rootfs);
+    write_eclipse_tz(rootfs);
 }
 
 /// `/usr/local/bin/eclipse-xkbmap`: load the X keyboard map into Xwayland once
@@ -184,8 +186,12 @@ fn write_eclipse_kbd(rootfs: &Path) {
           apply() {\n\
           \x20 layout=$1\n\
           \x20 boot=$2\n\
-          \x20 if [ -w \"$PROC\" ] || [ -e \"$PROC\" ]; then\n\
-          \x20   echo \"$layout\" > \"$PROC\" 2>>\"$LOG\" || echo \"eclipse-kbd: /proc/kbd write failed\" >>\"$LOG\"\n\
+          \x20 if [ -e \"$PROC\" ]; then\n\
+          \x20   # conv=notrunc: this kernel used to reject O_TRUNC on /proc, so\n\
+          \x20   # `echo us > /proc/kbd` never reached write(2) and the layout\n\
+          \x20   # stayed es (lunarbar pill snapped back on the next tick).\n\
+          \x20   printf '%s\\n' \"$layout\" | dd of=\"$PROC\" conv=notrunc 2>>\"$LOG\" \\\n\
+          \x20     || echo \"eclipse-kbd: /proc/kbd write failed\" >>\"$LOG\"\n\
           \x20 fi\n\
           \x20 mkdir -p /etc/eclipse\n\
           \x20 echo \"layout=$layout\" > \"$CONF\"\n\
@@ -241,6 +247,270 @@ fn write_eclipse_kbd(rootfs: &Path) {
     let etc = rootfs.join("etc/eclipse");
     let _ = fs::create_dir_all(&etc);
     fs::write(etc.join("keyboard"), b"layout=es\n").unwrap();
+}
+
+/// `/usr/local/bin/eclipse-locale`: persist UI language (`es` / `en`) to
+/// `/etc/eclipse/locale`, export `LANG`/`LANGUAGE` in labwc's environment,
+/// and swap `menu.xml` for the matching translation. `--boot` is what
+/// eclipse-init runs before the compositor (no SIGHUP).
+fn write_eclipse_locale(rootfs: &Path) {
+    let localbin = rootfs.join("usr/local/bin");
+    let _ = fs::create_dir_all(&localbin);
+    let script = localbin.join("eclipse-locale");
+    fs::write(
+        &script,
+        b"#!/bin/sh\n\
+          # Eclipse OS: UI language (not keyboard layout -- see eclipse-kbd).\n\
+          CONF=/etc/eclipse/locale\n\
+          ENVF=\"${HOME:-/root}/.config/labwc/environment\"\n\
+          MENUDIR=\"${HOME:-/root}/.config/labwc\"\n\
+          LOG=\"${HOME:-/root}/.eclipse-locale.log\"\n\
+          \n\
+          lang_ok() {\n\
+          \x20 case \"$1\" in es|en) return 0 ;; *) return 1 ;; esac\n\
+          }\n\
+          \n\
+          posix_for() {\n\
+          \x20 case \"$1\" in en) echo en_US.UTF-8 ;; *) echo es_ES.UTF-8 ;; esac\n\
+          }\n\
+          \n\
+          language_for() {\n\
+          \x20 case \"$1\" in en) echo en ;; *) echo es:en ;; esac\n\
+          }\n\
+          \n\
+          file_lang() {\n\
+          \x20 [ -r \"$CONF\" ] || return\n\
+          \x20 awk '\n\
+          \x20   { sub(/\\r$/, \"\") }\n\
+          \x20   /^[[:space:]]*#/ { next }\n\
+          \x20   /^[[:space:]]*lang[[:space:]]*=/ {\n\
+          \x20     sub(/^[^=]*=/, \"\"); gsub(/[[:space:]]/, \"\"); print; exit\n\
+          \x20   }\n\
+          \x20 ' \"$CONF\"\n\
+          }\n\
+          \n\
+          cmdline_lang() {\n\
+          \x20 [ -r /proc/cmdline ] || return\n\
+          \x20 awk '{\n\
+          \x20   n=split($0,a,/[: \\t]/)\n\
+          \x20   for(i=1;i<=n;i++) if(a[i] ~ /^lang=/){ sub(/^lang=/,\"\",a[i]); print a[i]; exit }\n\
+          \x20 }' /proc/cmdline\n\
+          }\n\
+          \n\
+          current() {\n\
+          \x20 f=$(file_lang)\n\
+          \x20 if lang_ok \"$f\"; then echo \"$f\"; return; fi\n\
+          \x20 echo es\n\
+          }\n\
+          \n\
+          resolve_boot() {\n\
+          \x20 c=$(cmdline_lang)\n\
+          \x20 if lang_ok \"$c\"; then echo \"$c\"; return; fi\n\
+          \x20 current\n\
+          }\n\
+          \n\
+          upsert_env() {\n\
+          \x20 key=$1; val=$2\n\
+          \x20 mkdir -p \"$(dirname \"$ENVF\")\"\n\
+          \x20 if [ -f \"$ENVF\" ]; then\n\
+          \x20   grep -v \"^${key}=\" \"$ENVF\" > \"$ENVF.new\" 2>/dev/null || :\n\
+          \x20   echo \"${key}=$val\" >> \"$ENVF.new\"\n\
+          \x20   mv \"$ENVF.new\" \"$ENVF\"\n\
+          \x20 else\n\
+          \x20   echo \"${key}=$val\" > \"$ENVF\"\n\
+          \x20 fi\n\
+          }\n\
+          \n\
+          apply() {\n\
+          \x20 lang=$1\n\
+          \x20 boot=$2\n\
+          \x20 mkdir -p /etc/eclipse\n\
+          \x20 echo \"lang=$lang\" > \"$CONF\"\n\
+          \x20 upsert_env LANG \"$(posix_for \"$lang\")\"\n\
+          \x20 upsert_env LANGUAGE \"$(language_for \"$lang\")\"\n\
+          \x20 src=\"$MENUDIR/menu.$lang.xml\"\n\
+          \x20 if [ -f \"$src\" ]; then\n\
+          \x20   cp -f \"$src\" \"$MENUDIR/menu.xml\"\n\
+          \x20 fi\n\
+          \x20 if [ \"$boot\" != boot ]; then\n\
+          \x20   if [ -n \"${LABWC_PID:-}\" ] && kill -0 \"$LABWC_PID\" 2>/dev/null; then\n\
+          \x20     kill -HUP \"$LABWC_PID\" 2>>\"$LOG\" || true\n\
+          \x20   elif [ -x /usr/bin/labwc ]; then\n\
+          \x20     /usr/bin/labwc --reconfigure >>\"$LOG\" 2>&1 || true\n\
+          \x20   fi\n\
+          \x20 fi\n\
+          \x20 echo \"[$(date '+%H:%M:%S')] lang=$lang boot=$boot\" >>\"$LOG\"\n\
+          }\n\
+          \n\
+          usage() {\n\
+          \x20 echo \"usage: eclipse-locale [es|en|--boot]\" >&2\n\
+          \x20 exit 2\n\
+          }\n\
+          \n\
+          case \"${1:-}\" in\n\
+          '' ) current; exit 0 ;;\n\
+          -h|--help) usage ;;\n\
+          --boot)\n\
+          \x20 apply \"$(resolve_boot)\" boot\n\
+          \x20 current\n\
+          \x20 exit 0\n\
+          \x20 ;;\n\
+          es|en)\n\
+          \x20 apply \"$1\"\n\
+          \x20 echo \"$1\"\n\
+          \x20 ;;\n\
+          *) usage ;;\n\
+          esac\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let etc = rootfs.join("etc/eclipse");
+    let _ = fs::create_dir_all(&etc);
+    fs::write(etc.join("locale"), b"lang=es\n").unwrap();
+}
+
+/// `/usr/local/bin/eclipse-tz`: persist country/timezone (`ES` → Europe/Madrid,
+/// `US` → America/New_York, or an explicit Olson name). `--boot` is what
+/// eclipse-init runs before services so `TZ` and `/etc/localtime` match.
+/// Independent of keyboard layout (`kbd=`) and UI language (`lang=`).
+fn write_eclipse_tz(rootfs: &Path) {
+    let localbin = rootfs.join("usr/local/bin");
+    let _ = fs::create_dir_all(&localbin);
+    let script = localbin.join("eclipse-tz");
+    fs::write(
+        &script,
+        b"#!/bin/sh\n\
+          # Eclipse OS: country -> timezone. Keyboard layout is eclipse-kbd.\n\
+          CONF=/etc/eclipse/timezone\n\
+          ENVF=\"${HOME:-/root}/.config/labwc/environment\"\n\
+          LOG=\"${HOME:-/root}/.eclipse-tz.log\"\n\
+          ZONEDIR=/usr/share/zoneinfo\n\
+          \n\
+          country_ok() {\n\
+          \x20 case \"$1\" in ES|es|US|us) return 0 ;; *) return 1 ;; esac\n\
+          }\n\
+          \n\
+          tz_for_country() {\n\
+          \x20 case \"$1\" in US|us) echo America/New_York ;; *) echo Europe/Madrid ;; esac\n\
+          }\n\
+          \n\
+          file_val() {\n\
+          \x20 key=$1\n\
+          \x20 [ -r \"$CONF\" ] || return\n\
+          \x20 awk -v k=\"$key\" '\n\
+          \x20   { sub(/\\r$/, \"\") }\n\
+          \x20   /^[[:space:]]*#/ { next }\n\
+          \x20   $0 ~ \"^[[:space:]]*\" k \"[[:space:]]*=\" {\n\
+          \x20     sub(/^[^=]*=/, \"\"); gsub(/^[[:space:]]+|[[:space:]]+$/, \"\"); print; exit\n\
+          \x20   }\n\
+          \x20 ' \"$CONF\"\n\
+          }\n\
+          \n\
+          cmdline_val() {\n\
+          \x20 key=$1\n\
+          \x20 [ -r /proc/cmdline ] || return\n\
+          \x20 awk -v k=\"$key\" '{\n\
+          \x20   n=split($0,a,/[: \\t]/)\n\
+          \x20   p=k \"=\"\n\
+          \x20   for(i=1;i<=n;i++) if(index(a[i],p)==1){ print substr(a[i],length(p)+1); exit }\n\
+          \x20 }' /proc/cmdline\n\
+          }\n\
+          \n\
+          current_tz() {\n\
+          \x20 t=$(file_val tz)\n\
+          \x20 [ -n \"$t\" ] && { echo \"$t\"; return; }\n\
+          \x20 echo Europe/Madrid\n\
+          }\n\
+          \n\
+          current_country() {\n\
+          \x20 c=$(file_val country)\n\
+          \x20 [ -n \"$c\" ] && { echo \"$c\"; return; }\n\
+          \x20 echo ES\n\
+          }\n\
+          \n\
+          resolve_boot() {\n\
+          \x20 t=$(cmdline_val tz)\n\
+          \x20 if [ -n \"$t\" ]; then echo \"$t\"; return; fi\n\
+          \x20 c=$(cmdline_val country)\n\
+          \x20 if country_ok \"$c\"; then tz_for_country \"$c\"; return; fi\n\
+          \x20 c=$(file_val country)\n\
+          \x20 if country_ok \"$c\"; then tz_for_country \"$c\"; return; fi\n\
+          \x20 current_tz\n\
+          }\n\
+          \n\
+          upsert_env() {\n\
+          \x20 key=$1; val=$2\n\
+          \x20 mkdir -p \"$(dirname \"$ENVF\")\"\n\
+          \x20 if [ -f \"$ENVF\" ]; then\n\
+          \x20   grep -v \"^${key}=\" \"$ENVF\" > \"$ENVF.new\" 2>/dev/null || :\n\
+          \x20   echo \"${key}=$val\" >> \"$ENVF.new\"\n\
+          \x20   mv \"$ENVF.new\" \"$ENVF\"\n\
+          \x20 else\n\
+          \x20   echo \"${key}=$val\" > \"$ENVF\"\n\
+          \x20 fi\n\
+          }\n\
+          \n\
+          apply() {\n\
+          \x20 tz=$1\n\
+          \x20 country=$2\n\
+          \x20 mkdir -p /etc/eclipse\n\
+          \x20 echo \"country=$country\" > \"$CONF\"\n\
+          \x20 echo \"tz=$tz\" >> \"$CONF\"\n\
+          \x20 echo \"$tz\" > /etc/timezone\n\
+          \x20 if [ -e \"$ZONEDIR/$tz\" ]; then\n\
+          \x20   ln -sf \"$ZONEDIR/$tz\" /etc/localtime\n\
+          \x20 fi\n\
+          \x20 upsert_env TZ \"$tz\"\n\
+          \x20 echo \"[$(date '+%H:%M:%S')] country=$country tz=$tz\" >>\"$LOG\"\n\
+          }\n\
+          \n\
+          usage() {\n\
+          \x20 echo \"usage: eclipse-tz [ES|US|Area/City|--boot]\" >&2\n\
+          \x20 exit 2\n\
+          }\n\
+          \n\
+          case \"${1:-}\" in\n\
+          '' ) current_country; current_tz; exit 0 ;;\n\
+          -h|--help) usage ;;\n\
+          --boot)\n\
+          \x20 tz=$(resolve_boot)\n\
+          \x20 case \"$tz\" in America/New_York) c=US ;; *) c=ES ;; esac\n\
+          \x20 cc=$(cmdline_val country)\n\
+          \x20 country_ok \"$cc\" && c=$cc\n\
+          \x20 fc=$(file_val country)\n\
+          \x20 [ -z \"$cc\" ] && country_ok \"$fc\" && c=$fc\n\
+          \x20 apply \"$tz\" \"$c\"\n\
+          \x20 echo \"$tz\"\n\
+          \x20 exit 0\n\
+          \x20 ;;\n\
+          ES|es)\n\
+          \x20 apply \"$(tz_for_country ES)\" ES\n\
+          \x20 echo Europe/Madrid\n\
+          \x20 ;;\n\
+          US|us)\n\
+          \x20 apply \"$(tz_for_country US)\" US\n\
+          \x20 echo America/New_York\n\
+          \x20 ;;\n\
+          */*)\n\
+          \x20 apply \"$1\" \"$(current_country)\"\n\
+          \x20 echo \"$1\"\n\
+          \x20 ;;\n\
+          *) usage ;;\n\
+          esac\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let etc = rootfs.join("etc/eclipse");
+    let _ = fs::create_dir_all(&etc);
+    fs::write(etc.join("timezone"), b"country=ES\ntz=Europe/Madrid\n").unwrap();
+    let _ = fs::create_dir_all(rootfs.join("etc"));
+    fs::write(rootfs.join("etc/timezone"), b"Europe/Madrid\n").unwrap();
 }
 
 /// Eclipse's xfconf channel defaults, under `/etc/xdg` (the sysconfig layer
@@ -637,10 +907,10 @@ fn write_terminal_wrapper(rootfs: &Path) {
           # not open\" THIS is the place that must explain why: every attempt\n\
           # is appended to $HOME/.eclipse-terminal.log with the terminal's\n\
           # stderr and exit code.\n\
-          export LANG=\"${LANG:-C.UTF-8}\"\n\
+          export LANG=\"${LANG:-es_ES.UTF-8}\"\n\
           # foot refuses to start without a UTF-8 locale; make sure a broken\n\
           # profile can never hand us a non-UTF-8 LANG.\n\
-          case \"$LANG\" in *UTF-8|*utf8|*UTF8) ;; *) LANG=C.UTF-8 ;; esac\n\
+          case \"$LANG\" in *UTF-8|*utf8|*UTF8) ;; *) LANG=es_ES.UTF-8 ;; esac\n\
           # DISPLAY: INHERITED, no longer stripped. The `unset DISPLAY` that\n\
           # used to sit here worked around an Xwayland that died on spawn:\n\
           # with DISPLAY set, every app that so much as PROBED X11 parked on\n\
@@ -708,8 +978,8 @@ fn write_firefox_wrapper(rootfs: &Path) {
           # WebRender configuration. See write_firefox_wrapper in\n\
           # xtask/src/linux/desktop.rs for the rationale.\n\
           export HOME=\"${HOME:-/root}\"\n\
-          export LANG=\"${LANG:-C.UTF-8}\"\n\
-          case \"$LANG\" in *UTF-8|*utf8|*UTF8) ;; *) LANG=C.UTF-8 ;; esac\n\
+          export LANG=\"${LANG:-es_ES.UTF-8}\"\n\
+          case \"$LANG\" in *UTF-8|*utf8|*UTF8) ;; *) LANG=es_ES.UTF-8 ;; esac\n\
           # DISPLAY: inherited (the strip is gone, same as eclipse-terminal --\n\
           # Xwayland is healthy now). MOZ_ENABLE_WAYLAND below still pins\n\
           # Firefox itself to the Wayland backend; DISPLAY only matters to\n\
@@ -855,7 +1125,7 @@ fn write_xorg_config(rootfs: &Path) {
         &xinitrc,
         b"#!/bin/sh\n\
           # Eclipse OS default X session (fbdev on /dev/fb0 + software ShadowFB).\n\
-          export LANG=\"${LANG:-C.UTF-8}\"\n\
+          export LANG=\"${LANG:-es_ES.UTF-8}\"\n\
           export LIBGL_ALWAYS_SOFTWARE=1\n\
           LOG=\"$HOME/.xinitrc.log\"; exec >\"$LOG\" 2>&1\n\
           echo \"[xinit] session start $(date 2>/dev/null || echo boot)\"\n\
@@ -1126,9 +1396,13 @@ fn assert_xml_comments_parse(xml: &[u8], what: &str) {
 fn write_labwc_menu(rootfs: &Path) {
     let cfg = rootfs.join("root/.config/labwc");
     let _ = fs::create_dir_all(&cfg);
-    fs::write(
-        cfg.join("menu.xml"),
-        br#"<?xml version="1.0" encoding="UTF-8"?>
+    fs::write(cfg.join("menu.es.xml"), MENU_ES).unwrap();
+    fs::write(cfg.join("menu.en.xml"), MENU_EN).unwrap();
+    // Default language is Spanish; eclipse-locale --boot copies the active one.
+    fs::write(cfg.join("menu.xml"), MENU_ES).unwrap();
+}
+
+const MENU_ES: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
 <openbox_menu>
   <menu id="root-menu" label="Eclipse OS">
     <item label="Terminal"><action name="Execute"><command>/usr/local/bin/eclipse-terminal</command></action></item>
@@ -1144,10 +1418,25 @@ fn write_labwc_menu(rootfs: &Path) {
     <item label="Salir de la sesion"><action name="Exit"/></item>
   </menu>
 </openbox_menu>
-"#,
-    )
-    .unwrap();
-}
+"#;
+
+const MENU_EN: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<openbox_menu>
+  <menu id="root-menu" label="Eclipse OS">
+    <item label="Terminal"><action name="Execute"><command>/usr/local/bin/eclipse-terminal</command></action></item>
+    <item label="Firefox"><action name="Execute"><command>/usr/local/bin/eclipse-firefox</command></action></item>
+    <item label="Editor (nano)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal nano</command></action></item>
+    <item label="Monitor (top)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal top</command></action></item>
+    <separator/>
+    <item label="SDL2 test (renderer)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-sdl-probe --hold</command></action></item>
+    <item label="SDL3 test (wl_shm)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-sdl-probe --sdl3 --surface --hold</command></action></item>
+    <separator/>
+    <item label="Keyboard (es/us)"><action name="Execute"><command>/usr/local/bin/eclipse-kbd toggle</command></action></item>
+    <item label="Reload labwc"><action name="Reconfigure"/></item>
+    <item label="Exit session"><action name="Exit"/></item>
+  </menu>
+</openbox_menu>
+"#;
 
 /// labwc sources `~/.config/labwc/environment` itself, so these survive even
 /// when the compositor is launched from a shell that skipped /etc/profile.
@@ -1189,10 +1478,12 @@ fn write_labwc_environment(rootfs: &Path) {
           LUNARBG_ASPECT=16:9\n\
           XCURSOR_SIZE=24\n\
           GTK_THEME=Adwaita:dark\n\
-          # UTF-8 locale: foot refuses box-drawing/unicode and prints\n\
-          # \"error: 'C' is not a UTF-8 locale\" without it. musl accepts any\n\
-          # UTF-8 locale name; glibc userspaces ship C.UTF-8 as a builtin.\n\
-          LANG=C.UTF-8\n\
+          # UI language. eclipse-locale updates LANG/LANGUAGE in-place.\n\
+          # UTF-8 is required: foot refuses a plain C locale. Do not set LC_ALL.\n\
+          LANG=es_ES.UTF-8\n\
+          LANGUAGE=es:en\n\
+          # Wall clock. eclipse-tz updates TZ in-place; default Spain.\n\
+          TZ=Europe/Madrid\n\
           # Console + labwc + Xwayland share this layout. eclipse-kbd updates\n\
           # the line in-place and labwc --reconfigure reloads it (labwc >= 0.7.2).\n\
           XKB_DEFAULT_LAYOUT=es\n\
@@ -1215,11 +1506,11 @@ fn write_labwc_environment(rootfs: &Path) {
           SDL_VIDEO_DRIVER=wayland,x11\n\
           SDL_AUDIODRIVER=alsa\n\
           SDL_AUDIO_DRIVER=alsa\n\
-          # OpenAL (openal-soft) likewise: ALSA only. Its pulse probe loads\n\
-          # libpulse, whose pa_mutex_new() aborts the process when the PI-futex\n\
-          # probe answer is not 0/ENOTSUP -- how supertux2 died. See \"Juegos\"\n\
+          # OpenAL: Pulse first (native libpulse), ALSA fallback. PI-futexes\n\
+          # are implemented, so pa_mutex_new() no longer aborts. See \"Juegos\"\n\
           # in docs/README-desktop.md.\n\
-          ALSOFT_DRIVERS=alsa\n\
+          ALSOFT_DRIVERS=pulse,alsa\n\
+          PULSE_SERVER=unix:/run/pulse/native\n\
           # Pin the D-Bus session address so libdbus never `autolaunch:`es\n\
           # (dbus-launch + X11 + dbus-daemon + babysitter behind pipes -- the\n\
           # chain SDL_Init walks first and where gzdoom hung). With no daemon\n\
@@ -1410,19 +1701,18 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # whenever DISPLAY is set -- which it always is here (DISPLAY=:0 pin)\n\
           # -- so without this every SDL2 app took the Xwayland detour. The\n\
           # comma list needs SDL >= 2.24 (Alpine ships 2.30+). SDL3 reads the\n\
-          # underscored names. Audio: ALSA is the only userspace audio API this\n\
-          # kernel exposes (README-audio.md); pinning it skips the pipewire/\n\
-          # pulse socket probes SDL would otherwise try first.\n\
+          # underscored names. Audio: ALSA, routed through PulseAudio by\n\
+          # /etc/asound.conf so several clients share the HDA PCM.\n\
           : \"${SDL_VIDEODRIVER:=wayland,x11}\"; export SDL_VIDEODRIVER\n\
           : \"${SDL_VIDEO_DRIVER:=wayland,x11}\"; export SDL_VIDEO_DRIVER\n\
           : \"${SDL_AUDIODRIVER:=alsa}\"; export SDL_AUDIODRIVER\n\
           : \"${SDL_AUDIO_DRIVER:=alsa}\"; export SDL_AUDIO_DRIVER\n\
-          # OpenAL (openal-soft: supertux2, gzdoom, ...): same rule as SDL.\n\
-          # Its default backend order is pipewire, pulse, alsa; the pulse probe\n\
-          # loads libpulse, whose pa_mutex_new() aborts the process outright if\n\
-          # the kernel's PI-futex answer is not to its liking. Skip straight to\n\
-          # the ALSA backend, the one audio API this kernel has.\n\
-          : \"${ALSOFT_DRIVERS:=alsa}\"; export ALSOFT_DRIVERS\n\
+          # OpenAL (openal-soft: supertux2, gzdoom, ...): Pulse first, ALSA\n\
+          # fallback. PI-futexes are implemented, so loading libpulse no longer\n\
+          # aborts in pa_mutex_new(). ALSA still works: asound.conf routes it\n\
+          # through Pulse so several clients share the HDA PCM.\n\
+          : \"${ALSOFT_DRIVERS:=pulse,alsa}\"; export ALSOFT_DRIVERS\n\
+          : \"${PULSE_SERVER:=unix:/run/pulse/native}\"; export PULSE_SERVER\n\
           # D-Bus: there is no session bus on Eclipse OS. libdbus's default\n\
           # for an UNSET address is `autolaunch:`, which forks dbus-launch,\n\
           # which opens $DISPLAY and spawns a dbus-daemon plus a babysitter\n\
@@ -1476,7 +1766,9 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # UTF-8 locale: foot refuses to render with a plain 'C' locale\n\
           # (\"error: 'C' is not a UTF-8 locale\"). init-launched sessions never\n\
           # source /etc/profile, so set it here like the rest of the session env.\n\
-          : \"${LANG:=C.UTF-8}\"; export LANG\n\
+          : \"${LANG:=es_ES.UTF-8}\"; export LANG\n\
+          : \"${LANGUAGE:=es:en}\"; export LANGUAGE\n\
+          : \"${TZ:=Europe/Madrid}\"; export TZ\n\
           # (The zink+NVK client pin and WLR_DRM_NO_MODIFIERS moved UP into the\n\
           # renderer block above, so the whole hardware-GL stack is chosen by\n\
           # one two-condition gate -- NVIDIA + nvidia.nouveau_uapi -- instead of\n\
@@ -1568,6 +1860,58 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn eclipse_locale_script_and_lang_default() {
+        let dir = std::env::temp_dir().join(format!("eclipse-locale-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_eclipse_locale(&dir);
+        write_labwc_menu(&dir);
+        write_labwc_environment(&dir);
+        let script = dir.join("usr/local/bin/eclipse-locale");
+        assert!(script.is_file());
+        if let Ok(status) = std::process::Command::new("sh").arg("-n").arg(&script).status()
+        {
+            assert!(status.success(), "eclipse-locale does not parse as sh");
+        }
+        let env = fs::read_to_string(dir.join("root/.config/labwc/environment")).unwrap();
+        assert!(
+            env.lines().any(|l| l == "LANG=es_ES.UTF-8"),
+            "labwc environment must default LANG=es_ES.UTF-8"
+        );
+        assert!(env.lines().any(|l| l == "LANGUAGE=es:en"));
+        let conf = fs::read_to_string(dir.join("etc/eclipse/locale")).unwrap();
+        assert!(conf.contains("lang=es"));
+        let menu = fs::read_to_string(dir.join("root/.config/labwc/menu.xml")).unwrap();
+        assert!(menu.contains("Teclado (es/us)"));
+        let en = fs::read_to_string(dir.join("root/.config/labwc/menu.en.xml")).unwrap();
+        assert!(en.contains("Keyboard (es/us)"));
+        assert!(!en.contains("Teclado (es/us)"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn eclipse_tz_script_and_spain_default() {
+        let dir = std::env::temp_dir().join(format!("eclipse-tz-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_eclipse_tz(&dir);
+        write_labwc_environment(&dir);
+        let script = dir.join("usr/local/bin/eclipse-tz");
+        assert!(script.is_file());
+        if let Ok(status) = std::process::Command::new("sh").arg("-n").arg(&script).status()
+        {
+            assert!(status.success(), "eclipse-tz does not parse as sh");
+        }
+        let env = fs::read_to_string(dir.join("root/.config/labwc/environment")).unwrap();
+        assert!(
+            env.lines().any(|l| l == "TZ=Europe/Madrid"),
+            "labwc environment must default TZ=Europe/Madrid"
+        );
+        let conf = fs::read_to_string(dir.join("etc/eclipse/timezone")).unwrap();
+        assert!(conf.contains("country=ES"));
+        assert!(conf.contains("tz=Europe/Madrid"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// The SDL policy is asserted in THREE generated files -- the labwc
     /// wrapper, `/etc/profile` and labwc's `environment` -- plus a fourth copy
     /// compiled into eclipse-init (`tools/eclipse-init`, `push_sdl_render_env`).
@@ -1607,15 +1951,16 @@ mod tests {
         }
 
         // Backend half: SDL2 + SDL3 spellings, Wayland-first with X11 fallback,
-        // ALSA audio -- plus the two pins the games needed: OpenAL on ALSA
-        // (libpulse's pa_mutex_new abort) and a D-Bus session address so
-        // SDL_Init never autolaunches dbus-launch. Static, so all three files.
+        // ALSA audio (routed through Pulse) -- plus OpenAL on Pulse then ALSA,
+        // PULSE_SERVER for libpulse, and a D-Bus session address so SDL_Init
+        // never autolaunches dbus-launch. Static, so all three files.
         for (key, val) in [
             ("SDL_VIDEODRIVER", "wayland,x11"),
             ("SDL_VIDEO_DRIVER", "wayland,x11"),
             ("SDL_AUDIODRIVER", "alsa"),
             ("SDL_AUDIO_DRIVER", "alsa"),
-            ("ALSOFT_DRIVERS", "alsa"),
+            ("ALSOFT_DRIVERS", "pulse,alsa"),
+            ("PULSE_SERVER", "unix:/run/pulse/native"),
             ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/0/bus"),
         ] {
             assert!(

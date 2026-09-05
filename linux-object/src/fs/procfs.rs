@@ -1337,6 +1337,14 @@ impl INode for ProcSysWritableINode {
         Ok(buf.len())
     }
 
+    fn resize(&self, _len: usize) -> Result<()> {
+        // Linux `/proc` and `/proc/sys` ignore truncate. Shell redirects
+        // (`echo us > /proc/kbd`) open O_TRUNC, which would otherwise fail
+        // with the default `NotSupported` resize and never reach write_at —
+        // lunarbar's ES/US pill then flipped back on the next metrics tick.
+        Ok(())
+    }
+
     fn poll(&self) -> Result<PollStatus> {
         Ok(PollStatus {
             read: true,
@@ -1395,6 +1403,9 @@ fn proc_kbd_content() -> String {
 
 fn store_kbd(value: &str) -> Result<()> {
     let v = value.trim();
+    if v.is_empty() {
+        return Ok(());
+    }
     if v.eq_ignore_ascii_case("toggle") {
         super::kbd_layout::toggle();
         return Ok(());
@@ -3069,5 +3080,19 @@ mod sysctl_tests {
             store: store_kbd,
         };
         assert!(inode.write_at(0, b"de\n").is_err());
+    }
+
+    #[test]
+    fn writable_kbd_truncate_then_echo_us() {
+        let inode = ProcSysWritableINode {
+            inode: 997,
+            generate: proc_kbd_content,
+            store: store_kbd,
+        };
+        assert!(inode.resize(0).is_ok());
+        assert_eq!(inode.write_at(0, b"us\n").unwrap(), 3);
+        assert_eq!(crate::fs::kbd_layout::current_name(), "us");
+        assert!(inode.write_at(0, b"es\n").is_ok());
+        assert_eq!(crate::fs::kbd_layout::current_name(), "es");
     }
 }

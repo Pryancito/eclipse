@@ -85,6 +85,23 @@ pub fn kbd_layout() -> String {
         .unwrap_or_else(|| "ES".into())
 }
 
+/// Write `es` / `us` to `/proc/kbd` without `O_TRUNC`. Shell `echo x > file`
+/// truncates on open; this kernel used to reject that and the pill snapped
+/// back to ES on the next 1 Hz tick.
+pub fn set_kbd_layout(layout: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open("/proc/kbd")
+    else {
+        return;
+    };
+    let _ = f.write_all(layout.as_bytes());
+    let _ = f.write_all(b"\n");
+}
+
 /// Wall clock "HH:MM" (24h). Uses libc localtime_r so a set TZ is honoured;
 /// with no TZ, musl returns UTC — fine for a bar clock.
 pub fn clock_hhmm() -> String {
@@ -305,34 +322,26 @@ pub fn battery() -> Option<(u32, bool)> {
     None
 }
 
-/// Date "wkd dd mon" (lowercase Spanish, e.g. "mar 21 jul") for the top bar's
-/// date pill — the complement of the bottom bar's HH:MM clock. Spanish to
-/// match the rest of the UI ("aplicaciones"); FONT_9X15 is ISO-8859-1 so the
-/// accented "mié"/"sáb" render correctly.
+/// Date "wkd dd mon" for the top bar's date pill. Language follows
+/// [`crate::i18n::Lang::current`] (`es` / `en`). FONT_9X15 is ISO-8859-1
+/// so Spanish accents (`mié`/`sáb`) render; English is ASCII.
 pub fn date_dm() -> String {
-    const WD: [&str; 7] = ["dom", "lun", "mar", "mié", "jue", "vie", "sáb"];
-    const MO: [&str; 12] = [
-        "ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic",
-    ];
+    let lang = crate::i18n::Lang::current();
+    let wd = lang.weekday_sun_first();
+    let mo = lang.month_short();
     unsafe {
         let t = libc::time(std::ptr::null_mut());
         let mut tm: libc::tm = core::mem::zeroed();
         if libc::localtime_r(&t, &mut tm).is_null() {
             return "-- --".into();
         }
-        let wd = WD.get(tm.tm_wday as usize).copied().unwrap_or("");
-        let mo = MO.get(tm.tm_mon as usize).copied().unwrap_or("");
+        let wd = wd.get(tm.tm_wday as usize).copied().unwrap_or("");
+        let mo = mo.get(tm.tm_mon as usize).copied().unwrap_or("");
         format!("{} {:02} {}", wd, tm.tm_mday, mo)
     }
 }
 
 // ── Calendar support (the clock-click popup) ─────────────────────────────────
-
-/// Full Spanish month names for the calendar header.
-pub const MONTH_FULL: [&str; 12] = [
-    "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
-    "septiembre", "octubre", "noviembre", "diciembre",
-];
 
 /// Today's local (year, month 0-11, day 1-31), or None if localtime fails.
 pub fn today() -> Option<(i32, u32, u32)> {
@@ -371,15 +380,45 @@ pub fn first_weekday_mon0(y: i32, m0: u32) -> u32 {
 
 /// System audio volume percent (0..100). Returns None when no supported
 /// audio subsystem is present; the volume module is hidden in that case.
-/// Setting the volume is handled by spawning amixer/wpctl from the popup.
+/// Setting the volume is handled by spawning pactl/amixer/wpctl from the popup.
 ///
 /// Forks a helper once (startup / after the user changes the slider) — never
 /// call this from the 1 Hz tick.
 pub fn volume() -> Option<u32> {
+    if let Some(v) = volume_pactl() {
+        return Some(v);
+    }
     if let Some(v) = volume_wpctl() {
         return Some(v);
     }
     volume_amixer()
+}
+
+fn volume_pactl() -> Option<u32> {
+    let out = std::process::Command::new("pactl")
+        .args(["get-sink-volume", "@DEFAULT_SINK@"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    // "Volume: front-left: 32768 /  50% / -18.06 dB,   front-right: ..."
+    for part in s.split('[') {
+        if let Some(rest) = part.strip_suffix("%]") {
+            if let Ok(v) = rest.parse::<u32>() {
+                return Some(v.min(100));
+            }
+        }
+    }
+    for token in s.split_whitespace() {
+        if let Some(num) = token.strip_suffix('%') {
+            if let Ok(v) = num.parse::<u32>() {
+                return Some(v.min(100));
+            }
+        }
+    }
+    None
 }
 
 fn volume_wpctl() -> Option<u32> {

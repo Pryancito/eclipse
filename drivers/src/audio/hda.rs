@@ -21,7 +21,9 @@
 //!   described by a Buffer Descriptor List once; the hardware loops it
 //!   forever while RUN is set. [`AudioScheme::write`] copies into the ring
 //!   ahead of the DMA position; consumed regions are re-zeroed behind it so
-//!   an underrun plays silence instead of looping stale audio.
+//!   an underrun plays silence instead of looping stale audio. A 4 ms ALSA
+//!   watchdog (`arm_playback_watchdog`) keeps polling LPIB after clients
+//!   cork, so RUN cannot stay set with a leftover fragment.
 //! * **HDMI vs analog is a codec-graph decision.** After the widget walk the
 //!   driver prefers a connected (presence-detect) HDMI/DP pin; analog
 //!   line-out/speaker/HP pins are the fallback. Both paths share the same
@@ -240,6 +242,8 @@ struct HdaInner {
 
     // Software state.
     running: bool,
+    /// Software pause: DMA stopped but the ring still holds queued PCM.
+    paused: bool,
     /// Next byte to write, offset into the ring.
     wp: usize,
     /// Bytes queued and not yet confirmed consumed.
@@ -340,18 +344,28 @@ impl HdaInner {
         if !self.running {
             return;
         }
+        if self.queued == 0 {
+            self.stop_stream();
+            self.silence_ring();
+            return;
+        }
         let lpib = self.lpib();
         let consumed = (lpib as usize + self.ring_len - self.last_lpib as usize) % self.ring_len;
         self.last_lpib = lpib;
         if consumed >= self.queued && consumed > 0 {
-            // The engine ran past everything we queued: underrun. Stop; the
-            // next write restarts the stream. The ring behind the DMA position
-            // is already zeroed, so whatever played out in the gap was silence.
+            // The engine ran past everything we queued: underrun. Stop and
+            // wipe the ring so a looping DMA never replays stale samples.
             self.queued = 0;
             self.stop_stream();
+            self.silence_ring();
             return;
         }
         self.queued -= consumed;
+        if self.queued == 0 {
+            self.stop_stream();
+            self.silence_ring();
+            return;
+        }
 
         // Re-zero what the DMA engine has consumed, staying RING_GUARD behind
         // its current position (it prefetches past LPIB).
@@ -412,7 +426,110 @@ impl HdaInner {
     fn stop_stream(&mut self) {
         let ctl = mmio_r32(self.bar, self.sd_base + SD_CTL);
         mmio_w32(self.bar, self.sd_base + SD_CTL, ctl & !0x2);
+        // Wait for RUN to actually drop: HDMI controllers keep fetching for
+        // a few frames after the bit clears. Silencing the ring before that
+        // races the engine and leaves a looping fragment.
+        let t = timer_now_as_micros();
+        while mmio_r32(self.bar, self.sd_base + SD_CTL) & 0x2 != 0 {
+            if timer_now_as_micros().wrapping_sub(t) > 10_000 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
         self.running = false;
+    }
+
+    fn silence_ring(&mut self) {
+        unsafe { core::ptr::write_bytes(self.ring_va as *mut u8, 0, self.ring_len) };
+        clflush_range(self.ring_va, self.ring_len);
+        self.zero_ptr = 0;
+    }
+
+    fn zero_range(&mut self, start: usize, len: usize) {
+        if len == 0 || self.ring_len == 0 {
+            return;
+        }
+        let mut p = start % self.ring_len;
+        let mut left = len.min(self.ring_len);
+        while left > 0 {
+            let chunk = left.min(self.ring_len - p);
+            unsafe { core::ptr::write_bytes((self.ring_va + p) as *mut u8, 0, chunk) };
+            clflush_range(self.ring_va + p, chunk);
+            p = (p + chunk) % self.ring_len;
+            left -= chunk;
+        }
+    }
+
+    fn frame_bytes(&self) -> usize {
+        (self.channels as usize).max(1) * 2
+    }
+
+    /// Drop the most recently queued `bytes` (whole frames, ≤ queued) and
+    /// silence that tail so a looping DMA cannot replay it.
+    fn rewind_bytes(&mut self, bytes: usize) -> usize {
+        self.poll_progress();
+        let frame = self.frame_bytes();
+        let n = bytes.min(self.queued) / frame * frame;
+        if n == 0 {
+            return 0;
+        }
+        self.wp = (self.wp + self.ring_len - n) % self.ring_len;
+        self.queued -= n;
+        self.zero_range(self.wp, n);
+        if self.queued == 0 {
+            self.stop_stream();
+            self.paused = false;
+            self.silence_ring();
+            self.wp = 0;
+            self.zero_ptr = 0;
+            self.last_lpib = 0;
+        }
+        n
+    }
+
+    /// Skip the next `bytes` of unplayed PCM (silence from the playhead).
+    fn forward_bytes(&mut self, bytes: usize) -> usize {
+        self.poll_progress();
+        let frame = self.frame_bytes();
+        let n = bytes.min(self.queued) / frame * frame;
+        if n == 0 {
+            return 0;
+        }
+        let start = if self.running {
+            self.lpib() as usize % self.ring_len
+        } else {
+            (self.wp + self.ring_len - self.queued) % self.ring_len
+        };
+        self.zero_range(start, n);
+        self.queued -= n;
+        if self.queued == 0 {
+            self.stop_stream();
+            self.paused = false;
+            self.silence_ring();
+            self.wp = 0;
+            self.zero_ptr = 0;
+            self.last_lpib = 0;
+        }
+        n
+    }
+
+    /// Stop DMA but keep the ring so resume continues from the same LPIB.
+    fn pause_stream(&mut self) {
+        self.poll_progress();
+        self.stop_stream();
+        self.paused = true;
+    }
+
+    /// Set RUN without resetting the stream descriptor (LPIB stays put).
+    fn resume_stream(&mut self) -> DeviceResult {
+        self.paused = false;
+        if self.running || self.queued == 0 {
+            return Ok(());
+        }
+        let ctl = mmio_r32(self.bar, self.sd_base + SD_CTL);
+        mmio_w32(self.bar, self.sd_base + SD_CTL, ctl | 0x2);
+        self.running = true;
+        Ok(())
     }
 
     /// Reset + program the stream descriptor and start the DMA engine.
@@ -459,6 +576,7 @@ impl HdaInner {
 
         self.last_lpib = 0;
         self.running = true;
+        self.paused = false;
         Ok(())
     }
 }
@@ -976,6 +1094,7 @@ impl HdaDevice {
             ring_len,
             bdl_pa,
             running: false,
+            paused: false,
             wp: 0,
             queued: 0,
             last_lpib: 0,
@@ -1058,6 +1177,7 @@ impl AudioScheme for HdaDevice {
         let channels = 2u8; // stereo only for now
         let mut inner = self.inner.lock();
         inner.stop_stream();
+        inner.paused = false;
         inner.queued = 0;
         inner.wp = 0;
         inner.zero_ptr = 0;
@@ -1090,7 +1210,7 @@ impl AudioScheme for HdaDevice {
         }
         let mut inner = self.inner.lock();
         inner.poll_progress();
-        if !inner.running {
+        if !inner.running && !inner.paused {
             // Give the codec graph a chance to re-route to a pin that has
             // gained presence/ELD since the last pick (on NVIDIA GPUs the ELD
             // lands long after PCI probe)...
@@ -1119,7 +1239,7 @@ impl AudioScheme for HdaDevice {
         }
         inner.wp = p;
         inner.queued += n;
-        if !inner.running {
+        if !inner.running && !inner.paused {
             inner.start_stream()?;
         }
         Ok(n)
@@ -1142,15 +1262,36 @@ impl AudioScheme for HdaDevice {
         inner.queued
     }
 
+    fn is_playing(&self) -> bool {
+        self.inner.lock().running
+    }
+
     fn reset(&self) -> DeviceResult {
         let mut inner = self.inner.lock();
         inner.stop_stream();
+        inner.paused = false;
         inner.queued = 0;
         inner.wp = 0;
         inner.zero_ptr = 0;
-        unsafe { core::ptr::write_bytes(inner.ring_va as *mut u8, 0, inner.ring_len) };
-        clflush_range(inner.ring_va, inner.ring_len);
+        inner.silence_ring();
         Ok(())
+    }
+
+    fn rewind(&self, bytes: usize) -> DeviceResult<usize> {
+        Ok(self.inner.lock().rewind_bytes(bytes))
+    }
+
+    fn forward(&self, bytes: usize) -> DeviceResult<usize> {
+        Ok(self.inner.lock().forward_bytes(bytes))
+    }
+
+    fn pause(&self) -> DeviceResult {
+        self.inner.lock().pause_stream();
+        Ok(())
+    }
+
+    fn resume(&self) -> DeviceResult {
+        self.inner.lock().resume_stream()
     }
 
     fn set_gain(&self, left: u8, right: u8, mute_left: bool, mute_right: bool) -> DeviceResult {

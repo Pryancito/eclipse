@@ -34,7 +34,7 @@ alguno:
 
 ```sh
 apk add labwc seatd foot wayland-protocols font-dejavu adwaita-icon-theme
-apk add sdl2 sdl3 sdl12-compat sdl2_image sdl2_ttf sdl2_mixer libdecor   # runtime SDL (ver "SDL")
+apk add sdl2 sdl3 sdl12-compat sdl2_image sdl2_ttf sdl2_mixer sdl2_net libpng fluidsynth libdecor   # runtime SDL (ver "SDL")
 ```
 
 Desde `cargo xtask image` estos paquetes ya se instalan solos (ver
@@ -100,7 +100,8 @@ construir la imagen) y hay que reconstruir con red o `apk add xwayland` una vez.
 ## SDL (SDL 1.2 / SDL2 / SDL3)
 
 La sesión trae el runtime de **SDL** (`sdl2`, `sdl3`, `sdl12-compat`,
-`sdl2_image`, `sdl2_ttf`, `sdl2_mixer`, `libdecor`; ver `DEFAULT_PACKAGES` en
+`sdl2_image`, `sdl2_ttf`, `sdl2_mixer`, `sdl2_net`, `libpng`, `fluidsynth`,
+`libdecor`; ver `DEFAULT_PACKAGES` en
 `xtask/src/linux/xorg.rs`) y una **política de entorno** que elige el backend
 de vídeo y el *render driver* de SDL a juego con el renderer del compositor.
 Sin ella, SDL2 tomaba X11 siempre (elige X11 en cuanto `DISPLAY` está fijado, y
@@ -127,9 +128,10 @@ Independientes del renderer, en todas las sesiones:
   (SDL3): Wayland nativo primero, X11 como respaldo. La lista sirve también a
   la sesión `desktop=xorg` (sin `WAYLAND_DISPLAY`, SDL cae a X11 solo). La
   sintaxis con comas exige SDL >= 2.24 (Alpine trae 2.30+).
-- `SDL_AUDIODRIVER=alsa` / `SDL_AUDIO_DRIVER=alsa`: ALSA es la única API de
-  audio de usuario que expone este kernel ([README-audio.md](README-audio.md));
-  el pin evita que SDL sondee antes los sockets de pipewire/pulse.
+- `SDL_AUDIODRIVER=alsa` / `SDL_AUDIO_DRIVER=alsa`: SDL usa ALSA, y
+  `/etc/asound.conf` lo enruta por PulseAudio para que varios clientes
+  compartan el PCM ([README-audio.md](README-audio.md)). `PULSE_SERVER`
+  apunta a `unix:/run/pulse/native` para los que hablan libpulse.
 - Decoraciones: labwc ofrece decoración de servidor por `xdg-decoration`, que
   SDL prefiere; `libdecor` queda como respaldo del lado cliente.
 
@@ -176,9 +178,11 @@ a la vez por el kernel y por la política de entorno de la sesión:
   `FUTEX_LOCK_PI`/`FUTEX_LOCK_PI2`/`FUTEX_TRYLOCK_PI`/`FUTEX_UNLOCK_PI`
   (`linux-syscall/src/misc.rs`, protocolo de palabra de bloqueo de Linux:
   TID del dueño, `FUTEX_WAITERS`, `FUTEX_OWNER_DIED`), así que la sonda
-  devuelve 0 y los mutex PI funcionan de verdad. Además la sesión exporta
-  `ALSOFT_DRIVERS=alsa`, de modo que openal-soft ni siquiera carga libpulse:
-  ALSA es la única API de audio de usuario que hay ([README-audio.md](README-audio.md)).
+  devuelve 0 y los mutex PI funcionan de verdad. La sesión exporta
+  `ALSOFT_DRIVERS=pulse,alsa` y `PULSE_SERVER=unix:/run/pulse/native`:
+  openal-soft usa libpulse contra el demonio de sistema, y si Pulse no
+  está cae a ALSA (que `/etc/asound.conf` también enruta por Pulse).
+  Ver [README-audio.md](README-audio.md).
 - **gzdoom** se quedaba colgado justo tras imprimir `GZDoom 4.14.2 - - SDL
   version / Compiled on ...`: lo siguiente que hace `main()` es `SDL_Init(0)`,
   y SDL2 (con cualquier máscara de subsistemas) ejecuta antes que nada
@@ -218,6 +222,17 @@ El layout empieza en `es` (consola, labwc y Xwayland). Se cambia en caliente
 con `eclipse-kbd toggle` (o `es`/`us`), el atajo `Super+K`, la píldora **ES/US**
 del panel, o `echo us > /proc/kbd` más `eclipse-kbd us` para el escritorio.
 Queda en `/etc/eclipse/keyboard`; en el arranque manda `kbd=us` en la cmdline.
+
+El idioma de la UI es independiente del teclado. Por defecto `es`
+(`LANG=es_ES.UTF-8`, `LANGUAGE=es:en`). `lang=en` en la cmdline o
+`eclipse-locale en` (persistido en `/etc/eclipse/locale`) selecciona inglés
+en labwc, lunarbar, Firefox/GTK (gettext) y el menú. No se exporta `LC_ALL`.
+
+La zona horaria sigue el **país**, no el teclado: por defecto España
+(`TZ=Europe/Madrid`, `/etc/eclipse/timezone`). `country=US` o
+`eclipse-tz US` pasa a `America/New_York`; `tz=Europe/Paris` fija un Olson
+arbitrario. `ntpd` (OpenNTPD, o busybox si está el applet) arranca con el
+sistema tras DHCP y pone el reloj.
 
 ## El panel y la estabilidad del sistema
 

@@ -7,18 +7,22 @@
 //!
 //! * `SNDRV_PCM_IOCTL_HW_REFINE/HW_PARAMS` constrain to what the driver ring
 //!   does natively — S16LE, stereo, the discrete HDA rate set. `/etc/asound.conf`
-//!   sets `default` to `hw:0,0` so mpg123 talks to this node directly; `plug`
-//!   remains available as `aplay -D plug`.
+//!   routes ALSA `default` through PulseAudio (`type pulse`); the kernel node
+//!   stays `hw:0,0` / `eclipse_hw` for the Pulse sink. `plug` remains available
+//!   as `aplay -D plug`.
 //! * Data moves through `SNDRV_PCM_IOCTL_WRITEI_FRAMES`; the status/control
 //!   pages are *not* mmap-able here, which alsa-lib detects and transparently
 //!   falls back to `SNDRV_PCM_IOCTL_SYNC_PTR` — implemented with Linux's exact
-//!   flag semantics.
+//!   flag semantics. PulseAudio's ALSA sink is started with `mmap=0` for the
+//!   same reason.
 //! * Mixer: `Master Playback Volume` (INTEGER 0..=100, stereo) and
 //!   `Master Playback Switch` (BOOLEAN mute). HDMI has no analog volume, so
 //!   the HDA driver scales S16LE in `write`; `amixer set Master 50%` and the
-//!   lunarbar slider both land on that path.
-//! * No capture, no mmap data access, no pause/resume: the `info` flags and
-//!   refine masks never advertise them, so clients don't try.
+//!   lunarbar slider both land on that path (or on `pactl` when Pulse is up).
+//! * No capture, no mmap data access: the `info` flags and refine masks never
+//!   advertise them. `PAUSE` stops DMA (ring kept for resume). `REWIND` /
+//!   `FORWARD` drop queued tail/head and silence that range so PulseAudio
+//!   cannot leave remnants of the last mpg123 track looping in the HDA ring.
 //!
 //! Ioctls are matched on the `_IOC` type+nr bytes only (not the size bits):
 //! the struct layouts here mirror the x86_64 uapi, but matching the full cmd
@@ -27,13 +31,49 @@
 
 #![allow(unsafe_code)]
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::any::Any;
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::time::Duration;
 
 use kernel_hal::drivers::scheme::AudioScheme;
 use lock::Mutex;
 use rcore_fs::vfs::*;
 use rcore_fs_devfs::DevFS;
+
+/// Periodic LPIB poll while HDA DMA is in RUN. PulseAudio corks at end of
+/// mpg123 and stops calling write/poll; without this the cyclic ring keeps
+/// fetching the last fragment (~0.5 s) forever.
+static AUDIO_WATCHDOG_ARMED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn arm_playback_watchdog() {
+    if AUDIO_WATCHDOG_ARMED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let deadline = kernel_hal::timer::timer_now() + Duration::from_millis(4);
+    kernel_hal::timer::timer_set(deadline, Box::new(audio_watchdog_tick));
+}
+
+fn audio_watchdog_tick(_now: Duration) {
+    AUDIO_WATCHDOG_ARMED.store(false, Ordering::Release);
+    let mut playing = false;
+    {
+        let devices = kernel_hal::drivers::all_audio().as_vec();
+        for dev in devices.iter() {
+            let _ = dev.queued_bytes();
+            if dev.is_playing() {
+                playing = true;
+            }
+        }
+    }
+    if playing {
+        arm_playback_watchdog();
+    }
+}
 
 // ── uapi mirror (x86_64) ────────────────────────────────────────────────────
 
@@ -45,10 +85,11 @@ const SNDRV_PCM_VERSION: i32 = 0x0002_0004;
 const SNDRV_CTL_VERSION: i32 = 0x0002_0007;
 
 // snd_pcm_state_t
+const STATE_OPEN: i32 = 0;
 const STATE_SETUP: i32 = 1;
 const STATE_PREPARED: i32 = 2;
 const STATE_RUNNING: i32 = 3;
-const STATE_OPEN: i32 = 0;
+const STATE_PAUSED: i32 = 6;
 
 // snd_pcm_hw_param indexes.
 const PAR_ACCESS: usize = 0;
@@ -72,6 +113,7 @@ const ACCESS_RW_INTERLEAVED: u32 = 3;
 const FORMAT_S16_LE: u32 = 2;
 const SUBFORMAT_STD: u32 = 0;
 
+const INFO_PAUSE: u32 = 0x0000_0020;
 const INFO_INTERLEAVED: u32 = 0x0000_0100;
 const INFO_BLOCK_TRANSFER: u32 = 0x0001_0000;
 
@@ -703,7 +745,7 @@ impl PcmDev {
             ok = false;
         }
 
-        p.info = INFO_INTERLEAVED | INFO_BLOCK_TRANSFER;
+        p.info = INFO_PAUSE | INFO_INTERLEAVED | INFO_BLOCK_TRANSFER;
         p.msbits = 16;
         p.rate_den = 1;
         p.rate_num = 0;
@@ -989,6 +1031,7 @@ impl PcmDev {
                 st.appl_ptr = (st.appl_ptr + n as u64 / BYTES_PER_FRAME) % st.boundary;
                 st.state = STATE_RUNNING;
                 deadline = kernel_hal::timer::timer_now() + deadline_step;
+                arm_playback_watchdog();
                 continue;
             }
             if kernel_hal::timer::timer_now() >= deadline {
@@ -1003,9 +1046,13 @@ impl PcmDev {
     }
 
     fn drain(&self) -> Result<()> {
+        let rate = self.st.lock().rate.max(1) as u64;
         let deadline = kernel_hal::timer::timer_now()
             + core::time::Duration::from_secs(
-                (self.audio.queued_bytes() as u64 / (48_000 * BYTES_PER_FRAME) + 2).min(10),
+                (self.audio.queued_bytes() as u64)
+                    .div_ceil(rate * BYTES_PER_FRAME)
+                    .saturating_add(2)
+                    .min(10),
             );
         while self.audio.queued_bytes() > 0 {
             if kernel_hal::timer::timer_now() >= deadline {
@@ -1014,6 +1061,10 @@ impl PcmDev {
             kernel_hal::deferred_job::drain_deferred_jobs();
             core::hint::spin_loop();
         }
+        // Drain done (or timed out): wipe the ring so leftover PCM cannot
+        // loop. PREPARE/DROP also reset; this covers PulseAudio's end-of-stream
+        // path that only DRAIN'd.
+        let _ = self.audio.reset();
         self.st.lock().state = STATE_SETUP;
         Ok(())
     }
@@ -1051,6 +1102,7 @@ impl INode for PcmDev {
     }
 
     fn poll(&self) -> Result<PollStatus> {
+        let _ = self.audio.queued_bytes();
         let st = self.st.lock();
         let avail = self.avail(&st);
         Ok(PollStatus {
@@ -1152,7 +1204,10 @@ impl INode for PcmDev {
                 unsafe { *(data as *mut i64) = self.queued_frames() as i64 };
                 Ok(0)
             }
-            0x22 => Ok(0), // HWSYNC — queued_bytes() reads live hardware state
+            0x22 => {
+                let _ = self.queued_frames();
+                Ok(0)
+            }
             0x23 => {
                 // SYNC_PTR — Linux flag semantics.
                 let sp = unsafe { &mut *(data as *mut SndPcmSyncPtr) };
@@ -1220,8 +1275,62 @@ impl INode for PcmDev {
                 Ok(0)
             }
             0x44 => self.drain().map(|_| 0),
-            0x47 => Ok(0), // RESUME
+            0x45 => {
+                // PAUSE: arg 1 = pause, 0 = resume. Pulse suspend-on-idle and
+                // stream cork both land here; a no-op left DMA looping the
+                // last buffer (mpg123 remnants).
+                let enable = unsafe { *(data as *const i32) };
+                let state = self.st.lock().state;
+                if enable != 0 {
+                    if state == STATE_RUNNING || state == STATE_PREPARED {
+                        let _ = self.audio.pause();
+                        // Idle cork with nothing left to play: wipe remnants so
+                        // a later RUN cannot loop the last mpg123 period.
+                        if self.audio.queued_bytes() == 0 {
+                            let _ = self.audio.reset();
+                            self.st.lock().state = STATE_SETUP;
+                        } else {
+                            self.st.lock().state = STATE_PAUSED;
+                        }
+                    }
+                } else if state == STATE_PAUSED {
+                    let _ = self.audio.resume();
+                    self.st.lock().state = STATE_RUNNING;
+                }
+                Ok(0)
+            }
+            0x46 => {
+                // REWIND — drop the most recently written frames.
+                let frames = unsafe { *(data as *mut u64) };
+                let bytes = (frames * BYTES_PER_FRAME) as usize;
+                let dropped = self.audio.rewind(bytes).unwrap_or(0);
+                let dropped_frames = dropped as u64 / BYTES_PER_FRAME;
+                if dropped_frames > 0 {
+                    let mut st = self.st.lock();
+                    st.appl_ptr =
+                        (st.appl_ptr + st.boundary - dropped_frames) % st.boundary.max(1);
+                }
+                unsafe { *(data as *mut u64) = dropped_frames };
+                Ok(0)
+            }
+            0x47 => {
+                // RESUME (system-suspend counterpart); treat as unpause.
+                let _ = self.audio.resume();
+                let mut st = self.st.lock();
+                if st.state == STATE_PAUSED {
+                    st.state = STATE_RUNNING;
+                }
+                Ok(0)
+            }
             0x48 => Ok(0), // XRUN
+            0x49 => {
+                // FORWARD — skip unplayed frames from the playhead.
+                let frames = unsafe { *(data as *mut u64) };
+                let bytes = (frames * BYTES_PER_FRAME) as usize;
+                let skipped = self.audio.forward(bytes).unwrap_or(0);
+                unsafe { *(data as *mut u64) = skipped as u64 / BYTES_PER_FRAME };
+                Ok(0)
+            }
             0x50 => {
                 // WRITEI_FRAMES
                 let xfer = unsafe { &mut *(data as *mut SndXferI) };
