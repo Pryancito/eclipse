@@ -655,7 +655,7 @@ struct DrmModeFbCmd2 {
     modifier: [u64; 4],
 }
 
-fn validate_addfb2(cmd: &DrmModeFbCmd2) -> Result<(), &'static str> {
+fn validate_addfb2(cmd: &DrmModeFbCmd2) -> core::result::Result<(), &'static str> {
     if cmd.flags & !DRM_MODE_FB_MODIFIERS != 0 {
         return Err("unsupported flags");
     }
