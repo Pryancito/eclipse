@@ -118,15 +118,10 @@ pub fn dec_ref(handle: u32) -> DecRef {
 }
 
 /// Drops `handle`'s mapping unconditionally, ignoring the share count. Returns
-/// whether one existed. A hard reset primitive: unlike [`dec_ref`], it frees the
-/// entry no matter how many holders remain, so it must NOT be used where another
-/// process may still import the buffer. It is deliberately NOT used by
-/// process-exit teardown any more: that path drops one reference with [`dec_ref`]
-/// and keeps a still-imported buffer alive (see `NvidiaGpu::nouveau_release_process`),
-/// because a client exiting while the compositor still displays its window used
-/// to free the buffer out from under the compositor -> its next GEM_INFO/VM_BIND
-/// on that handle faulted. Kept as a last-resort primitive; currently unused.
-#[allow(dead_code)]
+/// whether one existed. Used by the direct-submit path to unmap the per-context
+/// fence / GPFIFO pages when the channel goes away. Unlike [`dec_ref`], it
+/// frees the entry no matter how many holders remain, so it must NOT be used
+/// where another process may still import a GEM_NEW buffer.
 pub fn unregister(handle: u32) -> bool {
     let mut table = MAPPINGS.lock();
     if let Some(pos) = table.iter().position(|e| e.handle == handle) {

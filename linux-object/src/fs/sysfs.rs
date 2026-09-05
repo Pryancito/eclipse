@@ -922,23 +922,22 @@ fn display_pci_index() -> Option<usize> {
     // not one nouveau ioctl is issued); a non-NVIDIA vendor there makes NVK skip
     // the node entirely and vkEnumeratePhysicalDevices returns 0 GPUs. Prefer
     // the NVIDIA display-class device so the render node advertises the RTX.
-    // The node's identity must describe the SAME GPU that serves its ioctls.
-    // On a multi-GPU box those can disagree: the ioctl target is
-    // `devfs::drm::get_primary_driver()`, while this function used to pick the
-    // first display-class device in PCI scan order. libdrm feeds NVK the sysfs
-    // side (bus info from uevent's PCI_SLOT_NAME, ids from `config`) while
-    // every GETPARAM/NVIF answer comes from the driver side, so a mismatch
-    // reports one card's PCI id with another card's VRAM size and topology.
-    // (Mesa does assert the two device_ids agree, but Alpine builds with
-    // `-Db_ndebug=true`, so that check is compiled out and the inconsistency
-    // is silent.)
+    // The node's identity must describe the SAME GPU that serves its
+    // nouveau ioctls ([`driver_for_nouveau`]): a non-console NVIDIA when
+    // several exist, otherwise the only NVIDIA (even if it drives GOP).
+    // Never "first display-class device in PCI order" — that is often an
+    // iGPU, or the console NVIDIA while EXEC runs on another card.
     //
-    // Match on the BDF NUMBERS, never on the driver's display name: names
-    // render the bus in DECIMAL ("nvidia-gpu-101:0.0") while sysfs paths use
-    // HEX ("0000:65:00.0").
-    if let Some((_dom, bus, dev, func)) =
-        crate::fs::devfs::drm::get_primary_driver().and_then(|d| d.pci_bdf())
-    {
+    // Match on BDF NUMBERS, never the driver's display name: names render
+    // the bus in DECIMAL ("nvidia-gpu-101:0.0") while sysfs paths use HEX.
+    if let Some((_dom, bus, dev, func)) = {
+        let d = if zcore_drivers::display::nouveau_uapi_enabled() {
+            crate::fs::devfs::drm::driver_for_nouveau()
+        } else {
+            crate::fs::devfs::drm::get_primary_driver()
+        };
+        d.and_then(|d| d.pci_bdf())
+    } {
         let want = alloc::format!("0000:{:02x}:{:02x}.{:x}", bus, dev, func);
         if let Some(idx) = devs.iter().position(|d| d.name == want) {
             return Some(idx);
@@ -954,6 +953,11 @@ fn display_pci_index() -> Option<usize> {
             .iter()
             .position(|d| d.class.starts_with("0x03") && d.vendor == "0x10de")
         {
+            kernel_hal::klog_info!(
+                "[drm] card0 sysfs identity: ioctl-target BDF missing from PCI scan, \
+                 falling back to first NVIDIA {} (may be the console GPU on a multi-adapter board)",
+                devs[idx].name
+            );
             return Some(idx);
         }
     }
@@ -1108,12 +1112,29 @@ pub(crate) fn log_drm_pci_backing() {
     // log can now confirm.
     match crate::fs::devfs::drm::get_primary_driver() {
         Some(d) => kernel_hal::klog_info!(
-            "[drm-probe] ioctl target (primary driver) = {:?} pci_bdf={:x?} console_gpu={}",
+            "[drm-probe] KMS/primary driver = {:?} pci_bdf={:x?} console_gpu={}",
             d.name(),
             d.pci_bdf(),
             d.is_console_gpu()
         ),
         None => kernel_hal::klog_info!("[drm-probe] no primary DRM driver registered"),
+    }
+    match crate::fs::devfs::drm::driver_for_nouveau() {
+        Some(d) => kernel_hal::klog_info!(
+            "[drm-probe] NVK ioctl target = {:?} pci_bdf={:x?} console_gpu={}",
+            d.name(),
+            d.pci_bdf(),
+            d.is_console_gpu()
+        ),
+        None => {
+            kernel_hal::klog_info!("[drm-probe] no nouveau-capable GPU (NVK will see 0 devices)")
+        }
+    }
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        let line = d.gpu_role_line();
+        if !line.is_empty() {
+            kernel_hal::klog_info!("[drm-probe] {}", line.trim());
+        }
     }
     let idx = drm_card0_pci_index();
     match idx.and_then(|i| devs.get(i)) {

@@ -178,7 +178,13 @@ pub fn mount_fs(
             let src_inode = proc.lookup_inode(if source.is_empty() { target } else { source })?;
             proc.ns().mount().bind(&overlay_key, src_inode)?;
             let opts = build_options_string(flags, data);
-            super::register_mount(source, &target_norm, "none", &opts, Arc::new(mount_state::MountState::new(flags_read_only(flags, data))));
+            super::register_mount(
+                source,
+                &target_norm,
+                "none",
+                &opts,
+                Arc::new(mount_state::MountState::new(flags_read_only(flags, data))),
+            );
             return Ok(());
         }
         let inner = source_node.mounted_inner_fs().ok_or(LxError::EINVAL)?;

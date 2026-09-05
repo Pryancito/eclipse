@@ -787,11 +787,11 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         // that already knows the DRM subsystem exists.
         fn drm_release_on_exit(pid: zircon_object::object::KoID) {
             let _ = devfs::drm::release_process(pid);
-            // Same reclaim, for driver-private resources the generic GEM
-            // handle table above doesn't know about (currently: NvidiaGpu's
-            // nouveau-uAPI channel + everything VM_BIND'd/GEM_NEW'd into it
-            // -- see `DrmScheme::nouveau_release_process`'s doc).
-            if let Some(driver) = devfs::drm::get_primary_driver() {
+            // Driver-private resources (NVK channels, GEM_NEW, VM_BIND) live
+            // on whichever GPU served that process — console on a 1-GPU box,
+            // a non-console GPU when several are present. Reclaim on every
+            // DRM driver; non-NVIDIA defaults are no-ops.
+            for driver in drivers::all_drm().as_vec().iter() {
                 driver.nouveau_release_process(pid);
             }
         }

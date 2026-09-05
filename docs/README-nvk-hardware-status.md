@@ -52,6 +52,9 @@ mudos.
 5. **`CHIPSET_ID` devolvía el mínimo de la arquitectura** (0x170 = GA100/SM80,
    no GA10x/SM86). Ahora el chip id real de `NV_PMC_BOOT_0`.
 6. **`VRAM_BAR_SIZE` devolvía el tamaño de VRAM** en vez de la apertura BAR1.
+   Hoy se vuelve a reportar igual que `FB_SIZE` **a propósito**: el mmap de
+   NVK va por sysmem/`map_handle`, no por BAR1, y un BAR diminuto (el GOP)
+   dejaba el heap `DEVICE_LOCAL` sin `HOST_VISIBLE` → Zink copy boxes.
 7. **`render_allowed` extraía el NR como `(cmd >> 8) & 0xff`** — eso es el byte
    de *tipo* (`'d'`), no el NR; aceptaba todo por accidente. Corregido.
 8. **Render node en `0o660` root:root.** NVK hace `open(O_RDWR)` antes de

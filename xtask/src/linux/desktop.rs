@@ -844,10 +844,10 @@ fn write_x11_prepare(rootfs: &Path) {
 
 /// `/usr/local/bin/eclipse-terminal`: launch the first terminal that exists.
 /// foot is preferred (pixman/shm, matches this stack); alacritty is the
-/// fallback, forced onto software GL (client-side llvmpipe renders via shm,
-/// which does not touch the DRM GL path that hangs this box). Keybinds, the
-/// desktop menu, the panel launcher and autostart all go through this, so
-/// "a terminal" keeps working no matter which one is installed.
+/// fallback and runs as packaged (wgpu/Vulkan → NVK on the compute GPU).
+/// Keybinds, the desktop menu, the panel launcher and autostart all go
+/// through this, so "a terminal" keeps working no matter which one is
+/// installed.
 /// `eclipse-memwatch [interval]` — one compact `/proc/memhogs` line per tick,
 /// to the console.
 ///
@@ -939,7 +939,7 @@ fn write_terminal_wrapper(rootfs: &Path) {
           fi\n\
           if command -v alacritty >/dev/null 2>&1; then\n\
           \x20 echo \"[$(date '+%H:%M:%S')] alacritty $*\" >>\"$TLOG\"\n\
-          \x20 LIBGL_ALWAYS_SOFTWARE=1 alacritty \"$@\" 2>>\"$TLOG\"\n\
+          \x20 alacritty \"$@\" 2>>\"$TLOG\"\n\
           \x20 rc=$?\n\
           \x20 [ \"$rc\" -eq 0 ] && exit 0\n\
           \x20 echo \"[eclipse-terminal] alacritty exited rc=$rc\" >>\"$TLOG\"\n\
@@ -1659,6 +1659,13 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # pointer without one (apk add adwaita-icon-theme).\n\
           : \"${XCURSOR_THEME:=Adwaita}\"; export XCURSOR_THEME\n\
           : \"${XCURSOR_SIZE:=24}\"; export XCURSOR_SIZE\n\
+          # NVIDIA usermode kick (libeclipse_nvkick): children inherit this so\n\
+          # glxgears/NVK can submit without EXEC ioctl. ECLIPSE_NV_USERMODE=0 off.\n\
+          if [ \"${ECLIPSE_NV_USERMODE:-}\" != \"0\" ] && [ -f /lib/libeclipse_nvkick.so ]; then\n\
+          \x20 case \":${LD_PRELOAD:-}:\" in *:/lib/libeclipse_nvkick.so:*) ;;\n\
+          \x20 *) export LD_PRELOAD=\"/lib/libeclipse_nvkick.so${LD_PRELOAD:+:$LD_PRELOAD}\" ;;\n\
+          \x20 esac\n\
+          fi\n\
           # Do NOT set WLR_NO_HARDWARE_CURSORS: the kernel DRM scheme composites\n\
           # the legacy MODE_CURSOR bitmap over every scanout frame, so wlroots'\n\
           # hardware-cursor path works and avoids re-rendering the whole pixman\n\
@@ -1866,7 +1873,10 @@ mod tests {
         write_labwc_rc(&dir);
         let script = dir.join("usr/local/bin/eclipse-kbd");
         assert!(script.is_file());
-        if let Ok(status) = std::process::Command::new("sh").arg("-n").arg(&script).status()
+        if let Ok(status) = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&script)
+            .status()
         {
             assert!(status.success(), "eclipse-kbd does not parse as sh");
         }
@@ -1891,7 +1901,10 @@ mod tests {
         write_labwc_environment(&dir);
         let script = dir.join("usr/local/bin/eclipse-locale");
         assert!(script.is_file());
-        if let Ok(status) = std::process::Command::new("sh").arg("-n").arg(&script).status()
+        if let Ok(status) = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&script)
+            .status()
         {
             assert!(status.success(), "eclipse-locale does not parse as sh");
         }
@@ -1919,7 +1932,10 @@ mod tests {
         write_labwc_environment(&dir);
         let script = dir.join("usr/local/bin/eclipse-tz");
         assert!(script.is_file());
-        if let Ok(status) = std::process::Command::new("sh").arg("-n").arg(&script).status()
+        if let Ok(status) = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&script)
+            .status()
         {
             assert!(status.success(), "eclipse-tz does not parse as sh");
         }

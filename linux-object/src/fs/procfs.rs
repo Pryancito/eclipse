@@ -2497,11 +2497,16 @@ fn proc_gpudump_content() -> String {
 fn proc_gpuroles_content() -> String {
     let mut s = String::new();
     let pin = kernel_hal::boot::cmdline();
-    let pinned = pin.split([':', ' ', '\t', '\n']).find(|t| t.starts_with("nvidia.compute="));
+    let pinned = pin
+        .split([':', ' ', '\t', '\n'])
+        .find(|t| t.starts_with("nvidia.compute="));
     if let Some(p) = pinned {
         let _ = writeln!(s, "[gpuroles] cmdline pin: {p}");
     } else {
-        let _ = writeln!(s, "[gpuroles] cmdline pin: (auto — first non-console NVIDIA GPU)");
+        let _ = writeln!(
+            s,
+            "[gpuroles] cmdline pin: (auto — first non-console NVIDIA GPU)"
+        );
     }
     let mut n = 0u32;
     for d in kernel_hal::drivers::all_drm().as_vec().iter() {

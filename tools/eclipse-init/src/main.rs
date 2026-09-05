@@ -1111,6 +1111,31 @@ fn cmdline_has(token: &str) -> bool {
         .any(|t| t == token)
 }
 
+/// Inject `/lib/libeclipse_nvkick.so` at the front of `LD_PRELOAD` so GL/NVK
+/// clients (lunarbar → glxgears) inherit the usermode kick without a login
+/// shell sourcing `/etc/profile`. Does not replace an existing preload list.
+fn prepend_nvkick_preload(env: &mut Vec<CString>) {
+    const LIB: &str = "/lib/libeclipse_nvkick.so";
+    if !Path::new(LIB).exists() {
+        return;
+    }
+    if let Some(pos) = env.iter().position(|e| e.to_bytes().starts_with(b"LD_PRELOAD=")) {
+        let cur = env[pos].to_string_lossy();
+        let val = cur.strip_prefix("LD_PRELOAD=").unwrap_or("");
+        if val.split(':').any(|p| p == LIB) {
+            return;
+        }
+        let merged = if val.is_empty() {
+            format!("LD_PRELOAD={LIB}")
+        } else {
+            format!("LD_PRELOAD={LIB}:{val}")
+        };
+        env[pos] = CString::new(merged).unwrap();
+    } else {
+        env.push(CString::new(format!("LD_PRELOAD={LIB}")).unwrap());
+    }
+}
+
 /// The environment handed to every spawned service: the static [`CHILD_ENV`]
 /// base plus the renderer pin. Pixman (CPU software) is the default because with
 /// no working GL driver wlroots' GLES2 path leaves the desktop black — exactly
@@ -1122,6 +1147,7 @@ fn build_child_env() -> Vec<CString> {
         .collect();
     overlay_locale(&mut env);
     overlay_tz(&mut env);
+    prepend_nvkick_preload(&mut env);
     match renderer_mode() {
         Renderer::Pixman => {
             env.push(CString::new("WLR_RENDERER=pixman").unwrap());

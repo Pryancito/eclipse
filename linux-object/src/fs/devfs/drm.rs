@@ -387,24 +387,21 @@ fn parse_nvidia_compute_bdf() -> Option<(u8, u8, u8)> {
     None
 }
 
-/// The NVIDIA GPU that owns compute (SAXPY, NVK EXEC, CE-present): either
-/// the `nvidia.compute=BB.DD.F` pin, or the first driver with
-/// [`DrmScheme::is_compute_gpu`]. Never the console GPU — its GSP resume
-/// can wedge the bus.
+/// The NVIDIA GPU that owns compute (SAXPY, CE-present, the `eclipse-compute`
+/// node): either the `nvidia.compute=BB.DD.F` pin, or the first non-console
+/// GPU. Never the GOP/console GPU — its GSP resume can wedge the bus.
+///
+/// Returns `None` on a 1-GPU box (that GPU *is* the console). `ecl-compute`
+/// then falls back to the primary node; NVK uses [`driver_for_nouveau`],
+/// which *does* accept the console GPU in that case.
 pub fn get_compute_driver() -> Option<Arc<dyn DrmScheme>> {
-    let drivers = kernel_hal::drivers::all_drm();
-    let list = drivers.as_vec();
+    let list = kernel_hal::drivers::all_drm().as_vec();
     if let Some((bus, dev, func)) = parse_nvidia_compute_bdf() {
-        if let Some(d) = list.iter().find(|d| {
-            matches!(
-                d.pci_bdf(),
-                Some((_, b, dv, f)) if b == bus && dv == dev && f == func
-            )
-        }) {
+        if let Some(d) = list.iter().find(|d| pci_fn_eq(d.as_ref(), bus, dev, func)) {
             if d.is_console_gpu() {
                 kernel_hal::klog_info!(
                     "[drm] nvidia.compute={:02x}.{:02x}.{:x} is the console GPU — ignoring pin \
-                     (GSP on the GOP card can wedge the bus)",
+                     (GSP on the GOP card can wedge the bus); NVK will use another GPU if one exists",
                     bus,
                     dev,
                     func
@@ -422,6 +419,49 @@ pub fn get_compute_driver() -> Option<Arc<dyn DrmScheme>> {
         }
     }
     list.iter().find(|d| d.is_compute_gpu()).cloned()
+}
+
+fn pci_fn_eq(d: &dyn DrmScheme, bus: u8, dev: u8, func: u8) -> bool {
+    matches!(d.pci_bdf(), Some((_, b, dv, f)) if b == bus && dv == dev && f == func)
+}
+
+/// GPU that serves nouveau/NVK on `/dev/dri/card0` and `renderD128`.
+///
+/// Same policy on every machine, 1 / 2 / N GPUs:
+///
+/// 1. Only drivers that implement the nouveau uAPI (never virtio/simplefb).
+/// 2. `nvidia.compute=BB.DD.F` if it names a non-console GPU.
+/// 3. Otherwise the first non-console NVIDIA (RM is auto-brought up on
+///    every such GPU at boot, so 2, 3, 4+ extras all come up; Mesa currently
+///    talks to one node, so we pick the first).
+/// 4. If the only NVIDIA *is* the console GPU (typical laptop / 1-card
+///    desktop), use it: CHANNEL_ALLOC brings GSP up on demand.
+///
+/// Scanout stays on the GOP console GPU and does not need this helper.
+pub fn driver_for_nouveau() -> Option<Arc<dyn DrmScheme>> {
+    let capable: Vec<Arc<dyn DrmScheme>> = kernel_hal::drivers::all_drm()
+        .as_vec()
+        .iter()
+        .filter(|d| d.nouveau_uapi_capable())
+        .cloned()
+        .collect();
+    if capable.is_empty() {
+        return None;
+    }
+    if let Some((bus, dev, func)) = parse_nvidia_compute_bdf() {
+        if let Some(d) = capable
+            .iter()
+            .find(|d| pci_fn_eq(d.as_ref(), bus, dev, func))
+        {
+            if !d.is_console_gpu() || capable.len() == 1 {
+                return Some(d.clone());
+            }
+        }
+    }
+    if let Some(d) = capable.iter().find(|d| !d.is_console_gpu()) {
+        return Some(d.clone());
+    }
+    capable.into_iter().next()
 }
 
 /// Hard ceiling on live GEM objects. Contiguous dumb buffers are expensive
@@ -1328,11 +1368,7 @@ pub fn set_cursor_bo(handle_id: u32, w: u32, h: u32) -> bool {
     // pointer during scanout (scanout()/repaint_for_cursor stand down); on
     // any failure the software path set up above simply stays in charge.
     if hw_cursor_wanted() {
-        let (cx, cy, bmp) = (
-            state.cursor.x,
-            state.cursor.y,
-            state.cursor.bitmap.clone(),
-        );
+        let (cx, cy, bmp) = (state.cursor.x, state.cursor.y, state.cursor.bitmap.clone());
         drop(state);
         let mut hw_ok = false;
         if let Some(bmp) = bmp {

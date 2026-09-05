@@ -1307,8 +1307,7 @@ impl INode for PcmDev {
                 let dropped_frames = dropped as u64 / BYTES_PER_FRAME;
                 if dropped_frames > 0 {
                     let mut st = self.st.lock();
-                    st.appl_ptr =
-                        (st.appl_ptr + st.boundary - dropped_frames) % st.boundary.max(1);
+                    st.appl_ptr = (st.appl_ptr + st.boundary - dropped_frames) % st.boundary.max(1);
                 }
                 unsafe { *(data as *mut u64) = dropped_frames };
                 Ok(0)

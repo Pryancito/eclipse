@@ -56,6 +56,13 @@ fn store_fence() {
     core::sync::atomic::fence(Ordering::SeqCst);
 }
 
+fn nouveau_usermode_drain_hook() {
+    let gpus: Vec<Arc<NvidiaGpu>> = NVIDIA_GPUS.lock().clone();
+    for gpu in gpus {
+        gpu.drain_usermode_attaches();
+    }
+}
+
 /// `syncobj`'s fence-timeout upcall: a pending hardware fence did not land in
 /// 1 s. Route it to the GPU whose context buffer holds the landing zone.
 fn nouveau_fence_timeout_hook(
@@ -3471,9 +3478,9 @@ impl DrmScheme for NvidiaGpu {
             "rm=cold"
         };
         let nodes = if self.drives_boot_display() {
-            "(GOP scanout; GSP not auto-booted)"
+            "scanout=GOP (GSP not auto-booted)"
         } else {
-            "nodes=/dev/dri/card0,/dev/dri/card1,/dev/dri/renderD128,/dev/dri/renderD129"
+            "rm-compute"
         };
         alloc::format!(
             "{:02x}:{:02x}.0 {} role={} {} {}\n",
@@ -4782,7 +4789,7 @@ impl DrmScheme for NvidiaGpu {
         let _ = self.bringup_step17();
         if self.rm_device_instance.lock().is_some() {
             alloc::format!(
-                "GPU {:02x}:{:02x}.0 {} listo — present CE/P2P + canal de cómputo (card1)",
+                "GPU {:02x}:{:02x}.0 {} listo — present CE/P2P + canal de cómputo",
                 self.pci_bus,
                 self.pci_device,
                 self.gpu_model,
@@ -7258,6 +7265,14 @@ impl DrmScheme for NvidiaGpu {
     }
 
     fn nouveau_gem_close(&self, handle: u32) -> bool {
+        use super::nouveau_uapi as nv;
+        // Kernel-owned fence / GPFIFO pages live as long as the channel
+        // (Linux: those BOs are tied to the channel, not GEM_CLOSE). A
+        // userspace close of the mmap cookie must not tear the landing
+        // zone out from under SYNCOBJ_WAIT / EXEC.
+        if nv::is_fast_mmap_handle(handle) {
+            return true;
+        }
         // PRIME share-count gate. A swapchain buffer is referenced by more than
         // one holder at once: the compositor's original GEM_NEW owner plus every
         // PRIME self-import NVK/EGL made of the same buffer (each handed back
@@ -8894,6 +8909,10 @@ impl NvidiaGpu {
                     work_token: f.work_token,
                     runlist_id: f.runlist_id,
                     doorbell_va: self._bar0 + f.doorbell_reg as usize,
+                    doorbell_reg: f.doorbell_reg,
+                    userd_base: f.userd_cpu as usize,
+                    userd_gpget_off: f.userd_gpget_off,
+                    userd_gpput_off: f.userd_gpput_off,
                     next_payload: 1,
                     submits: 0,
                     fenced: 0,
@@ -8901,6 +8920,14 @@ impl NvidiaGpu {
                 // Landing zone starts BELOW every payload; slot page cleared.
                 unsafe {
                     core::ptr::write_volatile(ctx.fence_sem_va as *mut u32, 0);
+                    core::ptr::write_volatile(
+                        (ctx.fence_sem_va + nv::USERMODE_ATTACH_PUT) as *mut u32,
+                        0,
+                    );
+                    core::ptr::write_volatile(
+                        (ctx.fence_sem_va + nv::USERMODE_ATTACH_GET) as *mut u32,
+                        0,
+                    );
                     core::ptr::write_bytes(
                         ctx.fence_pb_va as *mut u8,
                         0,
@@ -8914,9 +8941,39 @@ impl NvidiaGpu {
                     )
                 };
                 crate::klog_info!(
-                    "[nouveau-uapi] ctx{}: direct submit ACTIVE (token={:#x} runlist={} doorbell=BAR0+{:#x} ring={} entries GPPut={} GPGet={}) -- EXEC no longer enters the RM nor waits for the GPU; boot with nvidia.exec_rm to compare",
-                    ctx_idx, ctx.work_token, ctx.runlist_id, f.doorbell_reg, ctx.entries, put, get
+                    "[nouveau-uapi] ctx{}: direct submit ACTIVE (token={:#x} runlist={} doorbell=BAR0+{:#x} ring={} entries GPPut={} GPGet={} fence-gem={:#x} gpfifo-gem={:#x} userd-gem={:#x} doorbell-gem={:#x}) -- kernel EXEC writes GPPut+doorbell; libeclipse_nvkick can mmap USERD/doorbell and kick without EXEC",
+                    ctx_idx, ctx.work_token, ctx.runlist_id, f.doorbell_reg, ctx.entries, put, get,
+                    nv::fast_fence_gem(ctx_idx), nv::fast_gpfifo_gem(ctx_idx),
+                    nv::fast_userd_gem(ctx_idx), nv::fast_doorbell_gem(ctx_idx)
                 );
+                crate::scheme::gem_mmap::register(
+                    nv::fast_fence_gem(ctx_idx),
+                    f.fence_sem_phys,
+                    4096,
+                );
+                crate::scheme::gem_mmap::register(
+                    nv::fast_gpfifo_gem(ctx_idx),
+                    f.gpfifo_phys,
+                    4096,
+                );
+                crate::scheme::gem_mmap::register(
+                    nv::fast_fence_pb_gem(ctx_idx),
+                    f.fence_pb_phys,
+                    4096,
+                );
+                let userd_phys = crate::bus::virt_to_phys(f.userd_cpu as usize) as u64;
+                if userd_phys != 0 {
+                    let page = userd_phys & !0xfff;
+                    crate::scheme::gem_mmap::register(nv::fast_userd_gem(ctx_idx), page, 4096);
+                }
+                let db_phys = (self.bar0_phys + f.doorbell_reg as u64) & !0xfff;
+                if db_phys != 0 {
+                    crate::scheme::gem_mmap::register(
+                        nv::fast_doorbell_gem(ctx_idx),
+                        db_phys,
+                        4096,
+                    );
+                }
                 slots[ctx_idx as usize] = FastSlot::Ready(ctx);
                 true
             }
@@ -8931,7 +8988,11 @@ impl NvidiaGpu {
     /// `with_fence`) one more entry pointing at a per-slot host SEM RELEASE
     /// stream, GPPut bumped through the persistent USERD window, doorbell
     /// poked. Returns the `(fence_va, payload)` the syncobj layer polls.
-    /// Waits (bounded, 1 s) for ring space if the channel is behind.
+    ///
+    /// The common path (ring has space) is one short critical section of
+    /// stores. If the ring is full, USERD `GPGet` is polled **without** the
+    /// slot lock -- the same read nouveau userspace does on a mmap'd USERD --
+    /// then the lock is retaken only to write.
     fn fast_submit(
         &self,
         ctx_idx: u32,
@@ -8943,13 +9004,18 @@ impl NvidiaGpu {
         let needed = pushes.len() as u32 + with_fence as u32;
         let start = unsafe { crate::bus::drivers_timer_now_as_micros() };
         let mut waited = false;
+        let mut gpget;
+        let mut gpput;
+        let mut entries;
         loop {
-            let (put, get) = {
+            {
                 let mut slots = self.nouveau_fast.lock();
                 let FastSlot::Ready(f) = &mut slots[ctx_idx as usize] else {
                     return Err(nv::FastSubmitError::Gone);
                 };
-                let entries = f.entries;
+                entries = f.entries;
+                gpget = f.userd_gpget;
+                gpput = f.userd_gpput;
                 // GPPut is re-read from the USERD rather than cached: the
                 // /proc/gpustepNN self-tests still submit on ctx 0 through the
                 // RM path and move it behind our back.
@@ -9012,15 +9078,24 @@ impl NvidiaGpu {
                     }
                     return Ok(fence);
                 }
-                (put, get)
-            };
-            waited = true;
-            if unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(start)
-                >= RING_TIMEOUT_US
-            {
-                return Err(nv::FastSubmitError::RingFull { put, get, needed });
             }
-            gpu_spin();
+            // Ring full: poll GPGet with IRQs on, no slot lock. Linux
+            // userspace does the same on a mmap'd USERD.
+            waited = true;
+            loop {
+                let put = unsafe { core::ptr::read_volatile(gpput as *const u32) } % entries;
+                let get = unsafe { core::ptr::read_volatile(gpget as *const u32) } % entries;
+                let used = (put + entries - get) % entries;
+                if used + needed <= entries - 1 {
+                    break;
+                }
+                if unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(start)
+                    >= RING_TIMEOUT_US
+                {
+                    return Err(nv::FastSubmitError::RingFull { put, get, needed });
+                }
+                gpu_spin();
+            }
         }
     }
 
@@ -9177,12 +9252,79 @@ impl NvidiaGpu {
         };
         if let FastSlot::Ready(f) = old {
             let abandoned = crate::scheme::syncobj::abandon_fences(f.fence_sem_va);
+            crate::scheme::gem_mmap::unregister(super::nouveau_uapi::fast_fence_gem(ctx_idx));
+            crate::scheme::gem_mmap::unregister(super::nouveau_uapi::fast_gpfifo_gem(ctx_idx));
+            crate::scheme::gem_mmap::unregister(super::nouveau_uapi::fast_fence_pb_gem(ctx_idx));
+            crate::scheme::gem_mmap::unregister(super::nouveau_uapi::fast_userd_gem(ctx_idx));
+            crate::scheme::gem_mmap::unregister(super::nouveau_uapi::fast_doorbell_gem(ctx_idx));
             lock::pump();
             let status = nvidia_rm_sys::rm_init::exec_fast_release(device_instance, ctx_idx);
             log::info!(
                 "[nouveau-uapi] ctx{}: direct-submit state released (status={:#x}, {} submits, {} fenced, {} fence(s) abandoned)",
                 ctx_idx, status, f.submits, f.fenced, abandoned
             );
+        }
+    }
+
+    /// Consume attach records written by `libeclipse_nvkick` into the fence
+    /// landing page (GPU only touches the u32 at offset 0). Each record is
+    /// the userspace equivalent of `attach_hw_fence` after a kick that never
+    /// entered EXEC, so a compositor WAIT in the kernel still sees the fence.
+    fn drain_usermode_attaches(&self) {
+        use super::nouveau_uapi as nv;
+        let mut recs: Vec<(u32, u32, u64, u32, usize)> = Vec::new();
+        {
+            let slots = self.nouveau_fast.lock();
+            for (ctx_idx, slot) in slots.iter().enumerate() {
+                let FastSlot::Ready(f) = slot else { continue };
+                let put = unsafe {
+                    core::ptr::read_volatile(
+                        (f.fence_sem_va + nv::USERMODE_ATTACH_PUT) as *const u32,
+                    )
+                };
+                let get = unsafe {
+                    core::ptr::read_volatile(
+                        (f.fence_sem_va + nv::USERMODE_ATTACH_GET) as *const u32,
+                    )
+                };
+                let mut g = get;
+                let mut n = 0u32;
+                while g != put && n < nv::USERMODE_ATTACH_CAP {
+                    let i = g % nv::USERMODE_ATTACH_CAP;
+                    let rec = unsafe {
+                        core::ptr::read_volatile(
+                            (f.fence_sem_va
+                                + nv::USERMODE_ATTACH_REC
+                                + i as usize * core::mem::size_of::<nv::UsermodeAttachRec>())
+                                as *const nv::UsermodeAttachRec,
+                        )
+                    };
+                    if rec.handle != 0 && rec.payload != 0 {
+                        recs.push((
+                            rec.handle,
+                            rec.payload,
+                            rec.point,
+                            ctx_idx as u32,
+                            f.fence_sem_va,
+                        ));
+                    }
+                    g = g.wrapping_add(1);
+                    n += 1;
+                }
+                if g != get {
+                    unsafe {
+                        core::ptr::write_volatile(
+                            (f.fence_sem_va + nv::USERMODE_ATTACH_GET) as *mut u32,
+                            g,
+                        );
+                    }
+                }
+            }
+        }
+        for (handle, payload, point, ctx_idx, fence_va) in recs {
+            nv::USERMODE_ATTACHES.fetch_add(1, Ordering::Relaxed);
+            let _ =
+                crate::scheme::syncobj::attach_hw_fence(handle, point, fence_va, payload, ctx_idx);
         }
     }
 
@@ -9812,32 +9954,13 @@ impl NvidiaGpu {
                 if body_len - MB < core::mem::size_of::<nv::NvDeviceInfoV0>() {
                     return Err(nv::EINVAL);
                 }
-                // Report the board's REAL VRAM size. GEM_NEW honours a VRAM-only
-                // request as `NV01_MEMORY_LOCAL_USER`; GART and GART|VRAM stay
-                // CPU-visible sysmem (see GEM_NEW). This threads the needle the
-                // pure zero-VRAM model could not:
-                //
-                //   * Zero-VRAM (ram_user=0) made NVK advertise a SINGLE
-                //     sysmem type HOST_VISIBLE|HOST_COHERENT|HOST_CACHED with
-                //     NO DEVICE_LOCAL bit (nvk_physical_device.c's iGPU path).
-                //     wlroots' Vulkan renderer asks `find_mem_type(DEVICE_LOCAL)`
-                //     for its render targets and found none -- "Failed to find
-                //     suitable memory type" (render/vulkan/renderer.c), no
-                //     compositor.
-                //   * With `ram_user > 0` NVK advertises the discrete types,
-                //     including (Maxwell+, so every board here) a
-                //     DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT type. wlroots is
-                //     satisfied. And NVK maps a DEVICE_LOCAL type to
-                //     `NVKMD_MEM_LOCAL`, whose nouveau domain is `GART | VRAM`
-                //     (nvkmd_nouveau_mem.c) -- GART is always in the set, so
-                //     the kernel is free to place it in CPU-visible sysmem.
-                //
-                // The old danger -- advertising VRAM made the swapchain land
-                // in true VRAM, gem_map_cpu published the FB OFFSET as a host
-                // address, and userspace rendered into LOW KERNEL RAM (the
-                // vmar-teardown deadlock) -- is gone because GART|VRAM stays
-                // sysmem (HOST_VISIBLE) and VRAM-only LOCAL never publishes a
-                // CPU map. Present/scanout remains CREATE_DUMB sysmem.
+                // Report the board's REAL VRAM size so NVK takes the discrete
+                // memory model (wlroots needs a DEVICE_LOCAL type). GEM_NEW
+                // backs every BO with CPU-visible sysmem and a real map_handle;
+                // GETPARAM VRAM_BAR_SIZE == FB_SIZE so NVK treats that heap as
+                // ReBAR (HOST_VISIBLE DEVICE_LOCAL) and Zink can map textures
+                // instead of accumulating copy boxes. gem_map_cpu still refuses
+                // ADDR_FBMEM, so a VRAM offset can never look like a host PA.
                 // Floor a 0 (device-id not in identify_gpu) like GETPARAM_FB_SIZE
                 // does — NVIF device INFO is the OTHER VRAM size NVK reads, and a
                 // 0 here is the same empty-heap NULL walk. See effective_vram_mb.
@@ -10103,6 +10226,59 @@ impl NvidiaGpu {
             }
         }
         match nr {
+            nv::NR_ECLIPSE_NV_USERMODE => {
+                let req = unsafe { &mut *(arg as *mut nv::DrmEclipseNvUsermode) };
+                let Some(device_instance) = *self.rm_device_instance.lock() else {
+                    return Err(nv::ENODEV);
+                };
+                let ctx_idx = {
+                    let chan = self.nouveau_channels.lock();
+                    match chan.iter().find(|c| c.id == req.channel as i32) {
+                        Some(c) if c.rm_backed && (c.owner_pid == owner_pid || owner_pid == 0) => {
+                            c.ctx_idx
+                        }
+                        Some(_) => return Err(nv::ENODEV),
+                        None => return Err(nv::ENOENT),
+                    }
+                };
+                if !self.fast_ctx_ready(device_instance, ctx_idx) {
+                    return Err(nv::ENODEV);
+                }
+                let slots = self.nouveau_fast.lock();
+                let FastSlot::Ready(f) = &slots[ctx_idx as usize] else {
+                    return Err(nv::ENODEV);
+                };
+                let userd_phys = crate::bus::virt_to_phys(f.userd_base) as u64;
+                let userd_ok =
+                    crate::scheme::gem_mmap::lookup(nv::fast_userd_gem(ctx_idx)).is_some();
+                let db_ok =
+                    crate::scheme::gem_mmap::lookup(nv::fast_doorbell_gem(ctx_idx)).is_some();
+                if !userd_ok || !db_ok || userd_phys == 0 {
+                    crate::klog_warn!(
+                        "[nouveau-uapi] USERMODE ioctl ctx{}: USERD/doorbell mmap not ready (userd_phys={:#x} userd_ok={} db_ok={})",
+                        ctx_idx, userd_phys, userd_ok, db_ok
+                    );
+                    return Err(nv::ENODEV);
+                }
+                req.ctx_idx = ctx_idx;
+                req.work_token = f.work_token;
+                req.entries = f.entries;
+                req.gpget_off = f.userd_gpget_off;
+                req.gpput_off = f.userd_gpput_off;
+                req.doorbell_off = f.doorbell_reg & 0xfff;
+                req.slot_bytes = f.slot_bytes;
+                req.next_payload = f.next_payload;
+                req.userd_base_off = (userd_phys & 0xfff) as u32;
+                req.fence_pb_off = f.fence_pb_off;
+                req.fence_sem_off = f.fence_sem_off;
+                req.buf_gpu_va = f.buf_gpu_va;
+                req.fence_mmap = (nv::fast_fence_gem(ctx_idx) as u64) << 12;
+                req.gpfifo_mmap = (nv::fast_gpfifo_gem(ctx_idx) as u64) << 12;
+                req.fence_pb_mmap = (nv::fast_fence_pb_gem(ctx_idx) as u64) << 12;
+                req.userd_mmap = (nv::fast_userd_gem(ctx_idx) as u64) << 12;
+                req.doorbell_mmap = (nv::fast_doorbell_gem(ctx_idx) as u64) << 12;
+                Ok(0)
+            }
             nv::NR_GETPARAM => {
                 let req = unsafe { &mut *(arg as *mut nv::DrmNouveauGetparam) };
                 // effective_vram_mb() floors a 0 (device-id not in identify_gpu)
@@ -10125,12 +10301,13 @@ impl NvidiaGpu {
                         crate::klog_info!(
                             "[nouveau-uapi] NVK mem: device={:#06x} ({}) FB_SIZE={} MiB \
                              (table vram_size_mb={}, effective={}) VRAM_BAR_SIZE={} bytes \
-                             rm_attached={}",
+                             (ReBAR-equivalent; PCI BAR1 window={}) rm_attached={}",
                             self.device_id,
                             self.gpu_model,
                             vram_bytes / (1024 * 1024),
                             self.vram_size_mb,
                             eff_vram_mb,
+                            vram_bytes,
                             self.info.fb_size as u64,
                             rm_attached
                         );
@@ -10143,12 +10320,27 @@ impl NvidiaGpu {
                     // driver recognizes (Turing+) is PCIe-only.
                     nv::NOUVEAU_GETPARAM_BUS_TYPE => 2,
                     nv::NOUVEAU_GETPARAM_FB_SIZE => vram_bytes,
-                    // The BAR1 *aperture*, which is NOT the VRAM size on a
-                    // non-ReBAR system (typically 256 MiB). NVK compares the
-                    // two to decide whether to expose a second, smaller
-                    // host-visible heap; reporting them equal makes it treat
-                    // ALL VRAM as CPU-mappable and mmap past the aperture.
-                    nv::NOUVEAU_GETPARAM_VRAM_BAR_SIZE => self.info.fb_size as u64,
+                    // Report BAR size == VRAM size (the ReBAR picture).
+                    //
+                    // NVK (`nvk_physical_device.c`) compares VRAM_BAR_SIZE to
+                    // FB_SIZE: if BAR < VRAM it builds a tiny extra
+                    // DEVICE_LOCAL|HOST_VISIBLE heap of that BAR size and
+                    // leaves the main VRAM heap NOT host-visible. Zink then
+                    // puts default textures (Alacritty's glyph atlas) in the
+                    // non-mappable heap, so every glTexSubImage is a
+                    // vkCmdCopyBufferToImage. A hundred glyphs in one batch
+                    // trips `zink: PERF WARNING! > 100 copy boxes`. On Linux
+                    // with ReBAR the VRAM heap itself is HOST_VISIBLE and
+                    // those uploads are map+memcpy — no copy boxes.
+                    //
+                    // Lying "ReBAR" is safe HERE because HOST_VISIBLE
+                    // DEVICE_LOCAL is NVKMD_MEM_LOCAL → GART|VRAM → sysmem
+                    // with a real host PA (`map_handle` ≠ 0). mmap goes
+                    // through gem_mmap, never BAR1, so there is no aperture
+                    // to walk past. (Reporting the GOP `fb_size` — a few MiB
+                    // — was the old value and made the HOST_VISIBLE heap
+                    // useless.)
+                    nv::NOUVEAU_GETPARAM_VRAM_BAR_SIZE => vram_bytes,
                     nv::NOUVEAU_GETPARAM_AGP_SIZE => 0,
                     // The REAL chip id, not the architecture's lower bound:
                     // gallium's nouveau GL still reads this, and a bound value
@@ -10200,11 +10392,11 @@ impl NvidiaGpu {
             }
 
             nv::NR_CHANNEL_ALLOC => {
-                // [auto-bringup] Only THIS GPU. On dual-GPU boxes card0 is the
-                // compute card: ensure_console_gpu_brought_up is a no-op there
-                // (drives_boot_display == false). Never walk other GPUs here —
-                // that used to start console GSP-RM from the first GL client and
-                // freeze the machine the same way boot-time auto-bringup did.
+                // [auto-bringup] Only THIS GPU. `driver_for_nouveau` sends NVK
+                // here: a non-console GPU when several exist (no-op below), or
+                // the sole console GPU on a 1-card box (on-demand GSP). Never
+                // walk other GPUs — bringing up console GSP from a client on a
+                // multi-adapter board wedges the bus.
                 self.ensure_console_gpu_brought_up();
                 let mut chan = self.nouveau_channels.lock();
                 if chan.len() >= nv::MAX_CHANNELS {
@@ -11346,8 +11538,7 @@ impl NvidiaGpu {
                 // `nouveau_ws_bo_new_tiled` return NULL and vkCreateDevice die
                 // with VK_ERROR_OUT_OF_DEVICE_MEMORY -- which only became
                 // visible once VM_BIND started working and NVK got far enough
-                // to want host memory. If both bits are set we keep GART
-                // (CPU-visible sysmem); VRAM-only is real LOCAL.
+                // to want host memory.
                 let want_vram = req.info.domain & nv::NOUVEAU_GEM_DOMAIN_VRAM != 0;
                 let want_gart = req.info.domain & nv::NOUVEAU_GEM_DOMAIN_GART != 0;
                 if !want_vram && !want_gart {
@@ -11369,14 +11560,16 @@ impl NvidiaGpu {
                 // real fix for a genuinely-compressed surface is comptag/PLC
                 // support. `record_gem_new` still notes the kind for
                 // /proc/gpudbg.
-                // Honour VRAM-only as true LOCAL (`NV01_MEMORY_LOCAL_USER`).
-                // GART, or GART|VRAM (NVK DEVICE_LOCAL|HOST_VISIBLE maps to
-                // that), stays sysmem so gem_map_cpu can publish a host PA.
-                // VRAM-only is DEVICE_LOCAL without HOST_VISIBLE: map_handle=0,
-                // never publish the FBMEM offset as a CPU address (that hole
-                // let userspace paint into low kernel RAM). Present/scanout
-                // stays on CREATE_DUMB sysmem; no BAR1 path is required here.
-                let sysmem = want_gart || !want_vram;
+                // Every GEM is CPU-visible sysmem (`NV01_MEMORY_SYSTEM`).
+                // GART and GART|VRAM already were; VRAM-only used to be
+                // true LOCAL (`NV01_MEMORY_LOCAL_USER`) with map_handle=0.
+                // That forced Zink onto staging + vkCmdCopy* for every
+                // texture upload (Alacritty's glyph atlas → `PERF WARNING!
+                // > 100 copy boxes`). Linux with ReBAR maps those images;
+                // we match that by always publishing a host PA.
+                // gem_map_cpu still refuses ADDR_FBMEM, so we never again
+                // hand out a VRAM offset as a CPU address. Present/scanout
+                // stays on CREATE_DUMB sysmem.
                 if req.info.size == 0 || req.info.size > u32::MAX as u64 {
                     return Err(nv::EINVAL);
                 }
@@ -11384,68 +11577,56 @@ impl NvidiaGpu {
                     crate::klog_warn!("[nouveau-uapi] GEM_NEW: GPU not attached to the RM yet");
                     return Err(nv::ENODEV);
                 };
-                let alloc =
-                    match nvidia_rm_sys::rm_init::gem_alloc(device_instance, req.info.size, sysmem)
-                    {
-                        Ok(a) if a.alloc_status == 0 => a,
-                        Ok(a) => {
-                            crate::klog_warn!(
-                            "[nouveau-uapi] GEM_NEW: RM alloc failed ({}), size={} status={:#x}",
-                            if sysmem { "sysmem/GART" } else { "vidmem/VRAM" },
-                            req.info.size,
-                            a.alloc_status
-                        );
-                            return Err(nv::ENOMEM);
-                        }
-                        Err(status) => {
-                            crate::klog_warn!(
-                                "[nouveau-uapi] GEM_NEW: gem_alloc ({}) failed, NV_STATUS={:#x}",
-                                if sysmem { "sysmem/GART" } else { "vidmem/VRAM" },
+                let alloc = match nvidia_rm_sys::rm_init::gem_alloc(
+                    device_instance,
+                    req.info.size,
+                    true,
+                ) {
+                    Ok(a) if a.alloc_status == 0 => a,
+                    Ok(a) => {
+                        crate::klog_warn!(
+                                "[nouveau-uapi] GEM_NEW: RM alloc failed (sysmem/GART), size={} status={:#x}",
+                                req.info.size,
+                                a.alloc_status
+                            );
+                        return Err(nv::ENOMEM);
+                    }
+                    Err(status) => {
+                        crate::klog_warn!(
+                                "[nouveau-uapi] GEM_NEW: gem_alloc (sysmem/GART) failed, NV_STATUS={:#x}",
                                 status
                             );
-                            return Err(nv::ENOMEM);
-                        }
-                    };
-                if !sysmem {
-                    static FIRST_VRAM_GEM: AtomicBool = AtomicBool::new(false);
-                    if !FIRST_VRAM_GEM.swap(true, Ordering::Relaxed) {
-                        crate::klog_info!(
-                            "[nouveau-uapi] GEM_NEW: first VRAM-only LOCAL alloc size={} hMemory={:#010x}",
-                            req.info.size,
-                            alloc.h_memory
-                        );
+                        return Err(nv::ENOMEM);
                     }
-                }
+                };
                 let handle = self.nouveau_gem_next_handle.fetch_add(1, Ordering::Relaxed);
-                // Real host physical address for sysmem/GART objects. VRAM-only
-                // (ADDR_FBMEM) is not CPU-mmap-able: gem_map_cpu refuses FBMEM
-                // because memdescGetPhysAddr(AT_CPU) is a VRAM offset, not BAR1.
-                // Skipping the lookup avoids a NOT_SUPPORTED trace per LOCAL BO.
-                let phys_addr = if sysmem {
-                    match nvidia_rm_sys::rm_init::gem_map_cpu(device_instance, alloc.h_memory) {
-                        Ok(m)
-                            if m.lookup_status == 0
-                                && m.address_space == nvidia_rm_sys::rm_init::ADDR_SYSMEM =>
-                        {
-                            Some(m.phys_addr)
-                        }
-                        Ok(m) => {
-                            crate::klog_warn!(
+                // Host PA for mmap. gem_map_cpu only succeeds for ADDR_SYSMEM
+                // (contiguous); FBMEM is refused so a VRAM offset can never
+                // look like a CPU address.
+                let phys_addr = match nvidia_rm_sys::rm_init::gem_map_cpu(
+                    device_instance,
+                    alloc.h_memory,
+                ) {
+                    Ok(m)
+                        if m.lookup_status == 0
+                            && m.address_space == nvidia_rm_sys::rm_init::ADDR_SYSMEM =>
+                    {
+                        Some(m.phys_addr)
+                    }
+                    Ok(m) => {
+                        crate::klog_warn!(
                             "[nouveau-uapi] GEM_NEW handle={}: gem_map_cpu lookup_status={:#x} address_space={} -- not CPU-mmap-able",
                             handle, m.lookup_status, m.address_space
                         );
-                            None
-                        }
-                        Err(status) => {
-                            crate::klog_warn!(
+                        None
+                    }
+                    Err(status) => {
+                        crate::klog_warn!(
                             "[nouveau-uapi] GEM_NEW handle={}: gem_map_cpu failed, NV_STATUS={:#x} -- not CPU-mmap-able",
                             handle, status
                         );
-                            None
-                        }
+                        None
                     }
-                } else {
-                    None
                 };
                 let map_handle = if let Some(pa) = phys_addr {
                     crate::scheme::gem_mmap::register(handle, pa, req.info.size);
@@ -11453,10 +11634,13 @@ impl NvidiaGpu {
                 } else {
                     0
                 };
-                let used_domain = if sysmem {
-                    nv::NOUVEAU_GEM_DOMAIN_GART
-                } else {
+                // Backing is always sysmem. Echo VRAM for a VRAM-only request
+                // so NVK still treats the BO as DEVICE_LOCAL; mmap is gated
+                // on map_handle, not this bit.
+                let used_domain = if want_vram && !want_gart {
                     nv::NOUVEAU_GEM_DOMAIN_VRAM
+                } else {
+                    nv::NOUVEAU_GEM_DOMAIN_GART
                 };
                 self.nouveau_gem.lock().push(nv::NouveauGemObject {
                     handle,
@@ -11480,7 +11664,7 @@ impl NvidiaGpu {
                     req.info.domain,
                     phys_addr.is_some(),
                     req.info.tile_flags,
-                    !sysmem,
+                    false,
                 );
                 req.info.handle = handle;
                 // Report the domain actually used, not the one requested:
@@ -11494,7 +11678,7 @@ impl NvidiaGpu {
                     "[nouveau-uapi] GEM_NEW handle={} size={} domain={} -> RM hMemory={:#010x} phys_addr={:?} map_handle={:#x}",
                     handle,
                     req.info.size,
-                    if sysmem { "GART" } else { "VRAM" },
+                    if used_domain == nv::NOUVEAU_GEM_DOMAIN_VRAM { "VRAM" } else { "GART" },
                     alloc.h_memory,
                     phys_addr,
                     map_handle
@@ -11510,6 +11694,18 @@ impl NvidiaGpu {
                 let (size, phys_addr, obj_tile_mode, obj_tile_flags, obj_domain) = {
                     let gem = self.nouveau_gem.lock();
                     let Some(obj) = gem.iter().find(|o| o.handle == req.handle) else {
+                        if nv::is_fast_mmap_handle(req.handle) {
+                            if let Some((_phys, size)) = crate::scheme::gem_mmap::lookup(req.handle)
+                            {
+                                req.domain = nv::NOUVEAU_GEM_DOMAIN_GART;
+                                req.size = size;
+                                req.offset = 0;
+                                req.map_handle = (req.handle as u64) << 12;
+                                req.tile_mode = 0;
+                                req.tile_flags = 0;
+                                return Ok(0);
+                            }
+                        }
                         // [dmabuf-diag] error!-visible: NVK runs GEM_INFO on the
                         // handle it got back from PRIME import. If that handle is
                         // not a nouveau GEM object (a dma-buf that came back as a
@@ -11549,8 +11745,9 @@ impl NvidiaGpu {
                     offset,
                     map_handle
                 );
-                // Honour the backing: GART objects are HOST_VISIBLE sysmem,
-                // VRAM-only objects are DEVICE_LOCAL without a CPU map.
+                // Honour the reported domain (VRAM-only requests echo VRAM
+                // even though the backing is sysmem). mmap is gated on
+                // map_handle, which is set whenever a host PA resolved.
                 req.domain = obj_domain;
                 req.size = size;
                 req.offset = offset;
@@ -11573,7 +11770,8 @@ impl NvidiaGpu {
                 // submitted batch touching this buffer has already completed.
                 // If EXEC ever goes asynchronous, this arm must grow a real
                 // wait (per-BO tracking), or CPU reads will race the GPU.
-                if gem.iter().any(|o| o.handle == req.handle) {
+                if gem.iter().any(|o| o.handle == req.handle) || nv::is_fast_mmap_handle(req.handle)
+                {
                     Ok(0)
                 } else {
                     Err(nv::ENOENT)
@@ -11583,7 +11781,8 @@ impl NvidiaGpu {
             nv::NR_GEM_CPU_FINI => {
                 let req = unsafe { &*(arg as *const nv::DrmNouveauGemCpuFini) };
                 let gem = self.nouveau_gem.lock();
-                if gem.iter().any(|o| o.handle == req.handle) {
+                if gem.iter().any(|o| o.handle == req.handle) || nv::is_fast_mmap_handle(req.handle)
+                {
                     Ok(0)
                 } else {
                     Err(nv::ENOENT)
@@ -11875,6 +12074,7 @@ impl PciDriver for NvidiaGpuDriverPci {
             gpu.set_msi_vector(_irq);
             NVIDIA_GPUS.lock().push(gpu.clone());
             crate::scheme::syncobj::set_fence_timeout_hook(nouveau_fence_timeout_hook);
+            crate::scheme::syncobj::set_usermode_drain_hook(nouveau_usermode_drain_hook);
             Ok(Device::DrmDisplay(gpu.clone(), gpu))
         } else {
             Err(DeviceError::NoResources)

@@ -120,17 +120,19 @@ pub trait DrmScheme: Scheme {
         false
     }
 
-    /// Whether this GPU is scanning out the boot console. Such a GPU is
-    /// deliberately excluded from the automatic RM bring-up at boot (its GSP
-    /// resume can wedge the bus while the console renders through its BAR1),
-    /// so it cannot serve the RM-backed nouveau paths. Default: false.
+    /// Whether this GPU is scanning out the boot console (firmware GOP). At
+    /// most one GPU has this role. It is not auto-brought up at boot (GSP
+    /// resume can wedge the bus while BAR1 still paints the console). On a
+    /// 1-GPU machine it is still the NVK device; CHANNEL_ALLOC brings GSP up
+    /// on demand. Default: false.
     fn is_console_gpu(&self) -> bool {
         false
     }
 
     /// Whether this GPU is a compute device: GSP-RM is (or will be) auto-booted
     /// and it can serve SAXPY / NVK / CE-present. Default: not a compute GPU.
-    /// On dual NVIDIA boxes this is every GPU that does **not** drive GOP.
+    /// On any number of NVIDIA GPUs this is every GPU that does **not** drive
+    /// GOP — 0 extras on a laptop, 1+ on a multi-adapter desktop.
     fn is_compute_gpu(&self) -> bool {
         false
     }

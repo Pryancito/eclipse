@@ -83,6 +83,7 @@ impl LinuxRootfs {
             // (this incremental path) picks up changes, not only a from-scratch
             // build.
             Self::write_profile(&dir.join("etc"));
+            self.install_nvkick(&dir, &musl);
             Self::write_ntp(&dir);
             desktop::install(&dir);
             xorg::install(&dir, &bin.join("apk"), self.0.name());
@@ -449,6 +450,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             let _ = dir::rm(lib.join("libeclipse_spawnfix.so"));
             fs::copy(&libeclipse_spawnfix, lib.join("libeclipse_spawnfix.so")).unwrap();
         }
+        self.install_nvkick(&dir, &musl);
 
         // lunarbg: the native wallpaper client (Rust, static musl). Renders
         // the Eclipse night scene procedurally over wlr-layer-shell, replacing
@@ -811,6 +813,14 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # labwc froze within seconds of starting. Keep the system on\n\
               # its proven configuration; opt in per command if needed:\n\
               #   LD_PRELOAD=/lib/libeclipse_dns.so some-command\n\
+              # NVIDIA usermode kick: intercepts DRM EXEC/WAIT so glxgears can\n\
+              # ring the GPU doorbell without a syscall per frame. Disable with\n\
+              #   ECLIPSE_NV_USERMODE=0\n\
+              if [ \"${ECLIPSE_NV_USERMODE:-}\" != \"0\" ] && [ -f /lib/libeclipse_nvkick.so ]; then\n\
+              \x20 case \":${LD_PRELOAD:-}:\" in *:/lib/libeclipse_nvkick.so:*) ;;\n\
+              \x20 *) export LD_PRELOAD=\"/lib/libeclipse_nvkick.so${LD_PRELOAD:+:$LD_PRELOAD}\" ;;\n\
+              \x20 esac\n\
+              fi\n\
               export HOME=/root\n\
               export TERM=xterm-256color\n\
               # UI language. /etc/eclipse/locale (lang=es|en); default es.\n\
@@ -1567,6 +1577,55 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             eprintln!("warning: failed to compile libeclipse_dns.so");
         }
         lib
+    }
+
+    /// Build libeclipse_nvkick.so (LD_PRELOAD: usermode NVIDIA EXEC/WAIT).
+    fn libeclipse_nvkick(&self, musl: &Path) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join("eclipse-nvkick");
+        let lib = dir.join("libeclipse_nvkick.so");
+        let source = dir.join("nvkick.c");
+        if lib.is_file() && source.is_file() {
+            if let (Ok(lib_meta), Ok(src_meta)) = (fs::metadata(&lib), fs::metadata(&source)) {
+                if let (Ok(lib_mtime), Ok(src_mtime)) = (lib_meta.modified(), src_meta.modified()) {
+                    if lib_mtime >= src_mtime {
+                        return lib;
+                    }
+                }
+            }
+        }
+
+        println!("Compiling libeclipse_nvkick.so...");
+        let musl = musl.canonicalize().unwrap();
+        let arch = self.0.name();
+        let cc = format!("{}/{}-linux-musl-gcc", musl.join("bin").display(), arch);
+        fs::create_dir_all(&dir).unwrap();
+        let status = Ext::new(&cc)
+            .current_dir(&dir)
+            .arg("-shared")
+            .arg("-fPIC")
+            .arg("-O2")
+            .arg("-o")
+            .arg(&lib)
+            .arg(&source)
+            .arg("-ldl")
+            .arg("-lpthread")
+            .status();
+        if !status.success() {
+            eprintln!("warning: failed to compile libeclipse_nvkick.so");
+        }
+        lib
+    }
+
+    fn install_nvkick(&self, rootfs: &Path, musl: &Path) {
+        let lib = self.libeclipse_nvkick(musl);
+        if lib.is_file() {
+            let dst = rootfs.join("lib").join("libeclipse_nvkick.so");
+            let _ = fs::create_dir_all(rootfs.join("lib"));
+            let _ = dir::rm(&dst);
+            if let Err(e) = fs::copy(&lib, &dst) {
+                eprintln!("warning: could not install libeclipse_nvkick.so: {e}");
+            }
+        }
     }
 
     /// Build eclipse-sdl-probe (tools/eclipse-sdl-probe): the SDL smoke test.

@@ -440,7 +440,7 @@ fn note_kind_seen(kind: u32) {
 /// Record one `GEM_NEW`. `req_domain` is the client's requested
 /// NOUVEAU_GEM_DOMAIN_* mask (before we override it to the domain actually
 /// used), `cpu_mappable` true when a host PA resolved, `vram_backed` true
-/// when the object is `NV01_MEMORY_LOCAL_USER` (VRAM-only, no CPU map),
+/// when the object is `NV01_MEMORY_LOCAL_USER` (unused: GEM_NEW is sysmem),
 /// `tile_flags` the requested tiling (upper bits carry the PTE kind).
 pub(super) fn record_gem_new(
     req_domain: u32,
@@ -625,6 +625,7 @@ pub(super) fn nouveau_ioctl_name(nr: u32) -> &'static str {
         DRM_NOUVEAU_GEM_CPU_PREP => "GEM_CPU_PREP",
         DRM_NOUVEAU_GEM_CPU_FINI => "GEM_CPU_FINI",
         DRM_NOUVEAU_GEM_INFO => "GEM_INFO",
+        DRM_ECLIPSE_NV_USERMODE => "ECLIPSE_NV_USERMODE",
         _ => "unknown",
     }
 }
@@ -975,14 +976,13 @@ pub(super) struct NouveauGemObject {
     /// out from under it the moment a GL client closed.
     pub owner_pid: u64,
     pub size: u64,
-    /// BAR1-relative CPU physical address (`gem_map_cpu`'s `AT_CPU`
-    /// offset), if resolving one succeeded at `GEM_NEW` time. `None` means
-    /// this object is real (VM_BIND/EXEC both still work) but not
-    /// CPU-mmap-able -- see the `GEM_NEW` gap note in
-    /// docs/README-nouveau-uapi.md.
+    /// Host physical address (`gem_map_cpu` on ADDR_SYSMEM) if resolving one
+    /// succeeded at `GEM_NEW` time. `None` means the object is still valid
+    /// for VM_BIND/EXEC but not CPU-mmap-able.
     pub phys_addr: Option<u64>,
-    /// Domain actually used (`NOUVEAU_GEM_DOMAIN_GART` or `_VRAM`), so
-    /// `GEM_INFO` reports the backing rather than a hardcoded VRAM lie.
+    /// Domain reported to userspace (`NOUVEAU_GEM_DOMAIN_GART` or `_VRAM`).
+    /// Backing is always sysmem; VRAM-only requests still echo `_VRAM` so
+    /// NVK treats the BO as DEVICE_LOCAL. mmap is gated on `map_handle`.
     pub domain: u32,
     /// Tiling the client asked for at `GEM_NEW`, kept so `GEM_INFO` returns
     /// what was requested. `tile_flags`'s upper bits carry the PTE kind
@@ -1180,6 +1180,97 @@ pub(super) const MAX_CHANNELS: usize = 64;
 /// Must stay <= 32: the `CTX_WEDGED` latch is a u32 bitmask (ctx_idx < 32).
 pub(super) const MAX_CTX: u32 = 32;
 
+/// GEM handles for the per-context sysmem pages the direct-submit path
+/// exposes through the same fake-mmap-offset as `GEM_NEW` (`handle << 12`).
+/// High `0xF000_xxxx` so they never collide with `nouveau_gem_next_handle`
+/// (starts at `0x8000_0001`). Userspace can `mmap` the fence landing zone
+/// and the GPFIFO ring the way nouveau on Linux maps those BOs; the kernel
+/// still rings the doorbell on `EXEC` because NVK talks `DRM_NOUVEAU_EXEC`,
+/// not a userspace kick.
+pub(super) const FAST_FENCE_GEM_BASE: u32 = 0xF000_0000;
+pub(super) const FAST_GPFIFO_GEM_BASE: u32 = 0xF000_0100;
+pub(super) const FAST_FENCE_PB_GEM_BASE: u32 = 0xF000_0200;
+pub(super) const FAST_USERD_GEM_BASE: u32 = 0xF000_0300;
+pub(super) const FAST_DOORBELL_GEM_BASE: u32 = 0xF000_0400;
+
+#[inline]
+pub(super) fn fast_fence_gem(ctx_idx: u32) -> u32 {
+    FAST_FENCE_GEM_BASE.wrapping_add(ctx_idx)
+}
+
+#[inline]
+pub(super) fn fast_gpfifo_gem(ctx_idx: u32) -> u32 {
+    FAST_GPFIFO_GEM_BASE.wrapping_add(ctx_idx)
+}
+
+#[inline]
+pub(super) fn fast_fence_pb_gem(ctx_idx: u32) -> u32 {
+    FAST_FENCE_PB_GEM_BASE.wrapping_add(ctx_idx)
+}
+
+#[inline]
+pub(super) fn fast_userd_gem(ctx_idx: u32) -> u32 {
+    FAST_USERD_GEM_BASE.wrapping_add(ctx_idx)
+}
+
+#[inline]
+pub(super) fn fast_doorbell_gem(ctx_idx: u32) -> u32 {
+    FAST_DOORBELL_GEM_BASE.wrapping_add(ctx_idx)
+}
+
+/// Kernel-owned landing zone / GPFIFO / USERD / doorbell pages: userspace may
+/// mmap them for the duration of the channel, but `GEM_CLOSE` must not free them.
+#[inline]
+pub(super) fn is_fast_mmap_handle(handle: u32) -> bool {
+    (FAST_FENCE_GEM_BASE..FAST_FENCE_GEM_BASE.wrapping_add(MAX_CTX)).contains(&handle)
+        || (FAST_GPFIFO_GEM_BASE..FAST_GPFIFO_GEM_BASE.wrapping_add(MAX_CTX)).contains(&handle)
+        || (FAST_FENCE_PB_GEM_BASE..FAST_FENCE_PB_GEM_BASE.wrapping_add(MAX_CTX)).contains(&handle)
+        || (FAST_USERD_GEM_BASE..FAST_USERD_GEM_BASE.wrapping_add(MAX_CTX)).contains(&handle)
+        || (FAST_DOORBELL_GEM_BASE..FAST_DOORBELL_GEM_BASE.wrapping_add(MAX_CTX)).contains(&handle)
+}
+
+/// Offset of the userspace→kernel attach ring inside the fence landing page.
+/// GPU writes only the `u32` at offset 0; the rest of the 4 KiB is CPU-only.
+pub(super) const USERMODE_ATTACH_PUT: usize = 0x40;
+pub(super) const USERMODE_ATTACH_GET: usize = 0x44;
+pub(super) const USERMODE_ATTACH_REC: usize = 0x80;
+pub(super) const USERMODE_ATTACH_CAP: u32 = 32;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct UsermodeAttachRec {
+    pub handle: u32,
+    pub payload: u32,
+    pub point: u64,
+}
+
+/// `DRM_COMMAND_BASE + 0x51` — nouveau does not use 0x51. Eclipse-private
+/// ioctl that publishes mmap offsets + doorbell token so `libeclipse_nvkick.so`
+/// can kick the channel from userspace. Matched by NR.
+pub(super) const DRM_ECLIPSE_NV_USERMODE: u32 = 0x51;
+
+#[repr(C)]
+pub struct DrmEclipseNvUsermode {
+    pub channel: u32,
+    pub ctx_idx: u32,
+    pub work_token: u32,
+    pub entries: u32,
+    pub gpget_off: u32,
+    pub gpput_off: u32,
+    pub doorbell_off: u32,
+    pub slot_bytes: u32,
+    pub next_payload: u32,
+    pub userd_base_off: u32,
+    pub fence_pb_off: u32,
+    pub fence_sem_off: u32,
+    pub buf_gpu_va: u64,
+    pub fence_mmap: u64,
+    pub gpfifo_mmap: u64,
+    pub fence_pb_mmap: u64,
+    pub userd_mmap: u64,
+    pub doorbell_mmap: u64,
+}
+
 /// How many class slots mesa offers in an `SCLASS` call
 /// (`NOUVEAU_WS_CONTEXT_MAX_CLASSES`).
 pub(super) const NVIF_SCLASS_MAX: usize = 16;
@@ -1245,6 +1336,7 @@ pub(super) fn min_payload_for_nr(nr: u32) -> Option<usize> {
         NR_GEM_CPU_PREP => size_of::<DrmNouveauGemCpuPrep>(),
         NR_GEM_CPU_FINI => size_of::<DrmNouveauGemCpuFini>(),
         NR_GEM_INFO => size_of::<DrmNouveauGemInfo>(),
+        NR_ECLIPSE_NV_USERMODE => size_of::<DrmEclipseNvUsermode>(),
         _ => return None,
     })
 }
@@ -1270,6 +1362,7 @@ pub(super) const NR_GEM_PUSHBUF: u32 = DRM_COMMAND_BASE + DRM_NOUVEAU_GEM_PUSHBU
 pub(super) const NR_GEM_CPU_PREP: u32 = DRM_COMMAND_BASE + DRM_NOUVEAU_GEM_CPU_PREP;
 pub(super) const NR_GEM_CPU_FINI: u32 = DRM_COMMAND_BASE + DRM_NOUVEAU_GEM_CPU_FINI;
 pub(super) const NR_GEM_INFO: u32 = DRM_COMMAND_BASE + DRM_NOUVEAU_GEM_INFO;
+pub(super) const NR_ECLIPSE_NV_USERMODE: u32 = DRM_COMMAND_BASE + DRM_ECLIPSE_NV_USERMODE;
 
 // --- Direct-submit fast path (EXEC without an RM entry per submission) ------
 //
@@ -1313,6 +1406,12 @@ pub(super) struct FastCtx {
     pub runlist_id: u32,
     /// BAR0 kernel VA of the usermode doorbell register.
     pub doorbell_va: usize,
+    /// BAR0 byte offset of the doorbell (for the userspace mmap page).
+    pub doorbell_reg: u32,
+    /// USERD kernel VA (start of the Nvc46fControl window).
+    pub userd_base: usize,
+    pub userd_gpget_off: u32,
+    pub userd_gpput_off: u32,
     /// Next fence payload (per-context monotonic, starts at 1; the landing
     /// zone starts at 0 so the wrapping `>=` in `syncobj` is never true early).
     pub next_payload: u32,
@@ -1443,6 +1542,8 @@ pub(super) static EXEC_RING_WAIT_US: AtomicU64 = AtomicU64::new(0);
 pub(super) static EXEC_WAIT_US: AtomicU64 = AtomicU64::new(0);
 /// Microseconds the legacy path spent polling its fence inline.
 pub(super) static EXEC_LEGACY_FENCE_US: AtomicU64 = AtomicU64::new(0);
+/// Attach records drained from the userspace kick ring (libeclipse_nvkick).
+pub(super) static USERMODE_ATTACHES: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn format_exec_profile() -> alloc::string::String {
     use core::fmt::Write;
@@ -1455,13 +1556,18 @@ pub(super) fn format_exec_profile() -> alloc::string::String {
         s,
         "[gpudbg]  EXEC direct-submit: {} (path {}), submits={} fenced={} ring-wait={}us cpu-wait-on-syncobjs={}us | legacy(RM) submits={} inline-fence-poll={}us",
         if exec_fast_enabled() { "ENABLED" } else { "DISABLED (nvidia.exec_rm)" },
-        if exec_fast_enabled() { "GP entries + GPPut + doorbell from the kernel, fence resolved lazily" } else { "RM lookup + BAR1 map + inline fence poll per submit" },
+        if exec_fast_enabled() { "GP entries + GPPut + doorbell from the kernel (USERD polled unlocked); libeclipse_nvkick can kick from userspace; fence resolved by mmap-style u32 poll in SYNCOBJ_WAIT" } else { "RM lookup + BAR1 map + inline fence poll per submit" },
         EXEC_FAST_SUBMITS.load(Ordering::Relaxed),
         EXEC_FAST_FENCED.load(Ordering::Relaxed),
         EXEC_RING_WAIT_US.load(Ordering::Relaxed),
         EXEC_WAIT_US.load(Ordering::Relaxed),
         EXEC_LEGACY_SUBMITS.load(Ordering::Relaxed),
         EXEC_LEGACY_FENCE_US.load(Ordering::Relaxed),
+    );
+    let _ = writeln!(
+        s,
+        "[gpudbg]  usermode-kick attaches={} (libeclipse_nvkick EXEC that never entered the kernel)",
+        USERMODE_ATTACHES.load(Ordering::Relaxed),
     );
     let _ = writeln!(s, "[gpudbg]  {}", crate::scheme::syncobj::stats_line());
     let _ = writeln!(
