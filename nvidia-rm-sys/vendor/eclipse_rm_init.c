@@ -8596,14 +8596,15 @@ typedef struct EclipseExecSignal
  * written before the doorbell rings once (the host FIFO fetches everything
  * up to the new GPPut on one doorbell, same as a real multi-push submit).
  *
- * IMPORTANT, and documented in docs/README-nouveau-uapi.md: because GPFIFO
- * entries are processed strictly in order, a landed fence proves the HOST/
- * PBDMA fetched and processed the caller's entry first -- it does NOT by
- * itself prove the compute/GR ENGINE finished executing it (that would need
- * an engine-domain semaphore, like step18's second one, coordinated with
- * whatever engine class the caller's own content bound -- which this
- * generic function cannot safely assume). A real dma_fence-equivalent
- * engine-completion proof is follow-up work, not this.
+ * The release is issued with RELEASE_WFI_EN (documented in
+ * docs/README-nouveau-uapi.md): the host waits for the channel's engines to
+ * go idle before writing the payload, so a landed fence proves the GR/CE
+ * ENGINE finished executing the caller's entry -- a real dma_fence
+ * equivalent, without having to know which engine class the caller's content
+ * bound. It used to be WFI_DIS, which only proved the PBDMA had *fetched* the
+ * entry; every NVK syncobj resolves against this payload, so Mesa and wlroots
+ * were reusing staging memory and sampling textures the GPU was still
+ * writing (partial uploads, stale tiles, garbage in fresh surfaces).
  */
 NV_STATUS eclipse_rm_exec_submit_signaled(NvU32 gpuInstance, NvU32 ctxIdx, NvU64 pushVA, NvU32 pushLenBytes,
                                            NvU32 fencePayload, NvU32 timeoutMs,
@@ -8781,7 +8782,7 @@ NV_STATUS eclipse_rm_exec_submit_signaled(NvU32 gpuInstance, NvU32 ctxIdx, NvU64
         fencePb[n++] = fencePayload;
         fencePb[n++] = 0; /* PAYLOAD_HI */
         fencePb[n++] = DRF_DEF(C46F, _SEM_EXECUTE, _OPERATION, _RELEASE) |
-                       DRF_DEF(C46F, _SEM_EXECUTE, _RELEASE_WFI, _DIS) |
+                       DRF_DEF(C46F, _SEM_EXECUTE, _RELEASE_WFI, _EN) |
                        DRF_DEF(C46F, _SEM_EXECUTE, _PAYLOAD_SIZE, _32BIT) |
                        DRF_DEF(C46F, _SEM_EXECUTE, _RELEASE_TIMESTAMP, _DIS);
 
@@ -8945,7 +8946,7 @@ typedef struct EclipseExecFast
     NvU32 chkGpEntry1;    /* GP_ENTRY1 for len   = ECLIPSE_FAST_CHK_LEN */
     NvU32 chkSemHdr;      /* ECLIPSE_PUSH_HDR(0, NVC46F_SEM_ADDR_LO, 5) */
     NvU32 chkSemAddrHi;   /* SEM_ADDR_HI for hi32(ECLIPSE_FAST_CHK_VA) */
-    NvU32 chkSemExecute;  /* RELEASE, WFI dis, 32-bit, no timestamp */
+    NvU32 chkSemExecute;  /* RELEASE, WFI EN (engine-completion fence), 32-bit, no timestamp */
     NvU32 userdGpGetOff;  /* offsetof(Nvc46fControl, GPGet) */
     NvU32 userdGpPutOff;  /* offsetof(Nvc46fControl, GPPut) */
 } EclipseExecFast;
@@ -9114,8 +9115,11 @@ NV_STATUS eclipse_rm_exec_fast_prepare(NvU32 gpuInstance, NvU32 ctxIdx, EclipseE
                         DRF_DEF(906F, _GP_ENTRY1, _LEVEL, _MAIN);
     pOut->chkSemHdr = ECLIPSE_PUSH_HDR(0, NVC46F_SEM_ADDR_LO, 5);
     pOut->chkSemAddrHi = DRF_NUM(C46F, _SEM_ADDR_HI, _OFFSET, NvU64_HI32(ECLIPSE_FAST_CHK_VA));
+    /* RELEASE_WFI_EN: the fence must prove the ENGINE finished the caller's
+     * pushes, not merely that the PBDMA fetched them -- see the comment on
+     * eclipse_rm_exec_submit_signaled. The Rust encoder mirrors this value. */
     pOut->chkSemExecute = DRF_DEF(C46F, _SEM_EXECUTE, _OPERATION, _RELEASE) |
-                          DRF_DEF(C46F, _SEM_EXECUTE, _RELEASE_WFI, _DIS) |
+                          DRF_DEF(C46F, _SEM_EXECUTE, _RELEASE_WFI, _EN) |
                           DRF_DEF(C46F, _SEM_EXECUTE, _PAYLOAD_SIZE, _32BIT) |
                           DRF_DEF(C46F, _SEM_EXECUTE, _RELEASE_TIMESTAMP, _DIS);
     pOut->userdGpGetOff = (NvU32)NV_OFFSETOF(Nvc46fControl, GPGet);
