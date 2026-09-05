@@ -1857,8 +1857,7 @@ impl LinuxProcess {
         }
         if dirfd == FileDesc::CWD {
             Ok(self
-                .root_inode()
-                .lookup(&self.current_working_directory())?
+                .cwd_inode()?
                 .lookup_follow(path, follow_max_depth)?)
         } else {
             let file = self.get_file(dirfd)?;

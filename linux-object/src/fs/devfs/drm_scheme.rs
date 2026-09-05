@@ -1923,9 +1923,8 @@ impl INode for DrmDev {
                 // Accept the ioctl (X modesetting ShadowFB, simple toolkits)
                 // but always present the WHOLE framebuffer. Clip-rect dirty
                 // blits on the WC GOP/BAR1 scanout smeared neighboring pixels
-                // (squares and lines). Scene dirty-tracking lives in one
-                // place: the console `shadow_fb`. Cursor patches stay on
-                // their own path. `num_clips` / `clips_ptr` are ignored.
+                // (squares and lines). Cursor patches stay on their own path.
+                // `num_clips` / `clips_ptr` are ignored.
                 let cmd = unsafe { *(data as *const DrmModeFbDirtyCmd) };
                 if !drm::present_now(cmd.fb_id, 1) {
                     log::debug!("[drm] DIRTYFB fb={} not presented (no-op)", cmd.fb_id);

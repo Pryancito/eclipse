@@ -347,6 +347,7 @@ impl ProcessExt for Process {
                 execute_path: linux_parent_inner.execute_path.clone(),
                 cmdline: linux_parent_inner.cmdline.clone(),
                 current_working_directory: linux_parent_inner.current_working_directory.clone(),
+                cwd_inode: linux_parent_inner.cwd_inode.clone(),
                 files: linux_parent_inner.files.clone(),
                 // POSIX fork(2): the child gets its own COPY of each fd's
                 // FD_CLOEXEC flag — later fcntl(F_SETFD) in either process
@@ -685,6 +686,11 @@ struct LinuxProcessInner {
     ///
     /// Omit leading '/'.
     current_working_directory: String,
+    /// Resolved inode for [`Self::current_working_directory`]. Relative lookups
+    /// start here instead of re-walking from `/` on every `open`/`stat`.
+    /// `None` until the first `chdir`/`fchdir` (or process start) fills it;
+    /// a miss falls back to a single walk from the process root.
+    cwd_inode: Option<Arc<dyn INode>>,
     /// file open number limit
     file_limit: RLimit,
     /// Opened files
@@ -858,7 +864,7 @@ impl LinuxProcess {
         files.insert(2.into(), stderr);
 
         LinuxProcess {
-            root_inode,
+            root_inode: root_inode.clone(),
             parent: Weak::default(),
             vt,
             perf: crate::perf::ProcPerf::new(),
@@ -870,6 +876,7 @@ impl LinuxProcess {
             seccomp: Mutex::new(None),
             inner: Mutex::new(LinuxProcessInner {
                 files,
+                cwd_inode: Some(root_inode),
                 ..Default::default()
             }),
         }
@@ -1312,9 +1319,9 @@ impl LinuxProcess {
         };
         self.ns.mount().bind(&put_abs, old_root)?;
         self.ns.mount().rebase(&new_abs);
-        *self.root_override.lock() = Some(new_inode);
+        *self.root_override.lock() = Some(new_inode.clone());
         *self.chroot_prefix.lock() = String::new();
-        self.change_directory("/");
+        self.change_directory("/", Some(new_inode));
         crate::fs::dcache_invalidate();
         Ok(())
     }
@@ -1783,7 +1790,11 @@ impl LinuxProcess {
     }
 
     /// Change working directory.
-    pub fn change_directory(&self, path: &str) {
+    ///
+    /// `inode` is the already-resolved directory. Pass `None` only when the
+    /// caller cannot supply it; the next relative lookup will walk once from
+    /// the process root and fill the cache.
+    pub fn change_directory(&self, path: &str, inode: Option<Arc<dyn INode>>) {
         if path.is_empty() {
             return;
         }
@@ -1803,6 +1814,25 @@ impl LinuxProcess {
             }
         }
         inner.current_working_directory = cwd_vec.join("/");
+        inner.cwd_inode = inode;
+    }
+
+    /// Directory inode of the current working directory.
+    ///
+    /// Relative path walks start here so they do not re-resolve the CWD string
+    /// from `/` on every lookup (slow, and it ignored `chroot`).
+    pub fn cwd_inode(&self) -> LxResult<Arc<dyn INode>> {
+        if let Some(inode) = self.inner.lock().cwd_inode.clone() {
+            return Ok(inode);
+        }
+        let cwd = self.inner.lock().current_working_directory.clone();
+        let inode = if cwd.is_empty() {
+            self.root_inode()
+        } else {
+            self.root_inode().lookup_follow(&cwd, 40)?
+        };
+        self.inner.lock().cwd_inode = Some(inode.clone());
+        Ok(inode)
     }
 
     /// Get execute path.

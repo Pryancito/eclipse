@@ -517,6 +517,28 @@ impl<P: Write> IoVecs<P> {
         }
         Ok(buf_len - buf.len())
     }
+
+    /// Scatter `buf` into the iovec stream starting at byte `offset`.
+    /// Twin of [`IoVecs::read_bytes_at`] so `readv` can iterate a large
+    /// scatter list through a bounded kernel buffer.
+    pub fn write_bytes_at(&mut self, offset: usize, buf: &[u8]) -> Result<usize> {
+        let mut skip = offset;
+        let mut copied = 0usize;
+        for vec in self.vec.iter_mut() {
+            if copied == buf.len() {
+                break;
+            }
+            if skip >= vec.len {
+                skip -= vec.len;
+                continue;
+            }
+            let n = (vec.len - skip).min(buf.len() - copied);
+            vec.ptr.add(skip).write_array(&buf[copied..copied + n])?;
+            copied += n;
+            skip = 0;
+        }
+        Ok(copied)
+    }
 }
 
 impl<P: Policy> Deref for IoVecs<P> {

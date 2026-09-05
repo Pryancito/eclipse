@@ -9,10 +9,11 @@
 //! wl_shm.
 //!
 //! Animation model: the cosmic base (gradient, stars, grid) is rendered once
-//! per size; every animation tick re-renders only the logo region (crescent,
-//! orbiting text, arcs, rings, ticks) into one of two persistent shm buffers
-//! and damages just that rectangle, so the software-rendered compositor
-//! composites a small area per frame, not the whole screen.
+//! per size; every animation tick copies that base into one of two persistent
+//! shm buffers, paints the logo (crescent, orbiting text, arcs, rings, ticks)
+//! on top, and damages the whole surface. Partial logo-region damage left
+//! stale tiles around the moon (double-buffer + compositor clip), so the
+//! wallpaper always presents a complete frame.
 //!
 //! Pacing: a timer sets the TARGET rate (default 24 fps, `--fps`/`LUNARBG_FPS`
 //! 1..=60), but every commit also requests a `wl_surface.frame` callback and
@@ -699,10 +700,11 @@ impl State {
         };
 
         // Seed BOTH buffers with the full base scene. Only buffer 0 used to
-        // get it; buffer 1 stayed zeroed (memfd), and since ticks repaint just
-        // the logo region, every frame shown from buffer 1 had BLACK outside
-        // the logo — on the real monitor the wallpaper alternated between the
-        // full cosmic scene and a dark screen with a floating square.
+        // get it; buffer 1 stayed zeroed (memfd), and since ticks used to
+        // repaint just the logo region, every frame shown from buffer 1 had
+        // BLACK outside the logo — on the real monitor the wallpaper
+        // alternated between the full cosmic scene and a dark screen with a
+        // floating square.
         ckpt!("configure {w}x{h}: first write to mmap'd memfd (buffer 0)");
         let frame0: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(map, frame_size) };
         frame0.copy_from_slice(&base);
@@ -815,15 +817,14 @@ impl State {
         frames.busy[i] = true;
         let frame: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(frames.map.add(i * frame_size), frame_size) };
-        // The buffer alternates, so it carries a stale logo region from two
-        // frames ago; render_frame restores that region from the base first.
+        // The buffer alternates, so it carries a stale logo from two frames
+        // ago; render_frame restores the whole buffer from the base first.
         scene::render_frame(frame, frames.width, &frames.base, &frames.layout, t_ms);
 
         let scale = frames.scale;
         bg.surface.attach(Some(&frames.buffers[i]), 0, 0);
-        // Full-buffer damage. The logo-region clip left stale tiles around
-        // the moon (double-buffer + partial damage). Scene dirty lives in
-        // the console shadow_fb; clients present whole buffers.
+        // Full-buffer damage. Logo-region clips left stale tiles around the
+        // moon (double-buffer + partial damage).
         damage(
             &bg.surface,
             scale,

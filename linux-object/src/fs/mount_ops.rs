@@ -273,6 +273,9 @@ pub fn umount_fs(proc: &LinuxProcess, target: &str, flags: usize) -> LxResult<()
     if !mount_node.is_mountpoint() {
         return Err(LxError::EINVAL);
     }
+    if let Some(fs) = mount_node.mounted_inner_fs() {
+        let _ = fs.sync();
+    }
     mount_node.umount().map_err(LxError::from)?;
     super::unregister_mount(&target_norm);
     Ok(())

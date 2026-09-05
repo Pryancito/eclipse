@@ -72,7 +72,7 @@ static CE_REPACK_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 static CE_PRESENT_ENABLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// When set, `present_now_region` / CE present no-op so the console GPU's
+/// When set, `present_now` / CE present no-op so the console GPU's
 /// BAR1 stays quiet during a deferred GSP-RM bring-up (hwcursor path).
 static SCANOUT_PAUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -952,9 +952,10 @@ fn blit_chunked(
     }
 }
 
-/// FromDevice clflush of the CPU-mapped GEM span covering a scanout damage
-/// rect (including pitch padding between the first and last pixel). Needed
-/// only when the CPU will *read* the buffer (CPU blit / CE staging repack).
+/// FromDevice clflush of the CPU-mapped GEM span covering a scanout
+/// rectangle (including pitch padding between the first and last pixel).
+/// Needed only when the CPU will *read* the buffer (CPU blit / CE staging
+/// repack).
 fn dma_sync_scanout_src_from_device(
     vaddr: usize,
     fb_size: usize,
@@ -1027,15 +1028,9 @@ fn dma_sync_gem_rect_from_device(
 ///
 /// Used by the software KMS path (no GPU driver): the dumb buffer is contiguous
 /// physical memory, which we map and blit into the display framebuffer.
+/// Always a full frame: partial DIRTYFB / damage clips on the WC scanout
+/// left squares and lines.
 pub fn scanout(fb_id: u32) -> bool {
-    scanout_region(fb_id, None)
-}
-
-/// Like [`scanout`]. `rect` is ignored: partial DIRTYFB / damage blits on the
-/// WC scanout left squares and lines, so KMS present is always a full frame.
-/// The only remaining dirty-rect tracker is the console shadow framebuffer.
-pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
-    let _ = rect;
     let fb = {
         let state = DRM_STATE.lock();
         match state.framebuffers.iter().find(|f| f.id == fb_id) {
@@ -1106,8 +1101,8 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     // at PCIe speed. The flat CE copy needs equal strides: when the client's
     // pitch differs from the scanout pitch, the rows are first CPU-repacked
     // into a sysmem staging buffer at the scanout pitch (cached writes,
-    // ~GB/s) and the CE copies from there. Only for full-frame scanouts: the
-    // CE always copies from the buffer's start, so it can't honor a rect.
+    // ~GB/s) and the CE copies from there. Full-frame only: the CE always
+    // copies from the buffer's start.
     //
     // OPT-IN: gated on `nvidia.cepresent` (see CE_PRESENT_ENABLED) — the CE
     // DMA per present destabilized the desktop on real hardware once, so the
@@ -1125,7 +1120,7 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     // look stale, restore a sync here — the present klog's `sync Xus` is the
     // tell (should be ~0 on CE-direct).
     let mut blitted_by_ce = false;
-    if rect.is_none() && CE_PRESENT_ENABLED.load(Ordering::Relaxed) {
+    if CE_PRESENT_ENABLED.load(Ordering::Relaxed) {
         if fb.pitch != info.pitch {
             // Pitched 2D CE path: the GPU copy engine reads directly from the
             // source buffer at fb.pitch and writes into the scanout FB at
@@ -1207,7 +1202,7 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
             cpu_src_synced = true;
         }
         // Banded blit with IRQs briefly re-enabled between bands — see
-        // [`blit_chunked`]. Always the full frame (see [`scanout_region`]).
+        // [`blit_chunked`]. Always the full frame.
         if src_off < pixels.len() {
             blit_chunked(
                 &display,
@@ -1276,23 +1271,21 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
         );
     }
     let t_cursor = kernel_hal::timer::timer_now();
-    if rect.is_none() {
-        let n = PRESENT_FRAME_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= 2 || n.is_multiple_of(64) {
-            kernel_hal::klog_info!(
-                "[drm] present #{}: sync {}us + {} blit {}us + cursor {}us ({}x{})",
-                n,
-                sync_elapsed.as_micros(),
-                if blitted_by_ce { "CE" } else { "cpu" },
-                t_blit
-                    .saturating_sub(t0)
-                    .saturating_sub(sync_elapsed)
-                    .as_micros(),
-                t_cursor.saturating_sub(t_blit).as_micros(),
-                blit_w,
-                blit_h
-            );
-        }
+    let n = PRESENT_FRAME_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 2 || n.is_multiple_of(64) {
+        kernel_hal::klog_info!(
+            "[drm] present #{}: sync {}us + {} blit {}us + cursor {}us ({}x{})",
+            n,
+            sync_elapsed.as_micros(),
+            if blitted_by_ce { "CE" } else { "cpu" },
+            t_blit
+                .saturating_sub(t0)
+                .saturating_sub(sync_elapsed)
+                .as_micros(),
+            t_cursor.saturating_sub(t_blit).as_micros(),
+            blit_w,
+            blit_h
+        );
     }
     let _ = display.flush();
     // A DRM client owns the framebuffer now: stop the kernel text console from
@@ -2006,12 +1999,6 @@ static PRESENT_VT_DROP_LOGGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 pub fn present_now(fb_id: u32, crtc_id: u32) -> bool {
-    present_now_region(fb_id, crtc_id, None)
-}
-
-/// Like [`present_now`]. `rect` is accepted for ABI compatibility with
-/// DIRTYFB callers and then ignored — see [`scanout_region`].
-pub fn present_now_region(fb_id: u32, crtc_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     // Deferred console GSP bring-up: acknowledge the flip to keep the
     // compositor alive, but do not touch the GOP framebuffer / CE path.
     if SCANOUT_PAUSED.load(Ordering::SeqCst) {
@@ -2088,7 +2075,7 @@ pub fn present_now_region(fb_id: u32, crtc_id: u32, rect: Option<(u32, u32, u32,
     }
     let flipped = if software_kms_active() {
         // No usable hardware KMS: blit the dumb buffer to the framebuffer.
-        scanout_region(fb_id, rect)
+        scanout(fb_id)
     } else if let Some(driver) = get_primary_driver() {
         // Translate core fb id to the driver's private fb id when available.
         let driver_fb_id = DRM_STATE
@@ -2100,9 +2087,9 @@ pub fn present_now_region(fb_id: u32, crtc_id: u32, rect: Option<(u32, u32, u32,
             .unwrap_or(fb_id);
         // Hardware driver owns scanout; fall back to a software blit if it
         // declines.
-        driver.page_flip(driver_fb_id) || scanout_region(fb_id, rect)
+        driver.page_flip(driver_fb_id) || scanout(fb_id)
     } else {
-        scanout_region(fb_id, rect)
+        scanout(fb_id)
     };
     if flipped {
         set_crtc_fb(crtc_id, fb_id);

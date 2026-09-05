@@ -281,7 +281,7 @@ pub fn render_base(w: usize, h: usize, monitor_aspect: Option<f32>, scale: u32) 
 
 // ---------------------------------------------------------------- frame
 
-/// Draw one animation frame: restore the logo region from `base`, then paint
+/// Draw one animation frame: restore the whole buffer from `base`, then paint
 /// the animated logo. `t_ms` is a monotonic millisecond clock; the original
 /// compositor advanced `counter` once per ~60 Hz frame, so `counter =
 /// t_ms * 0.06` reproduces its speeds.
@@ -294,23 +294,18 @@ pub fn render_frame(frame: &mut [u8], w: usize, base: &[u8], lay: &Layout, t_ms:
         return;
     }
     let h = frame.len() / stride;
+    frame.copy_from_slice(base);
     let (rx, ry, rw, rh) = lay.region;
-    if rw == 0 || rh == 0 || rx.saturating_add(rw) > w || ry.saturating_add(rh) > h {
-        return;
-    }
-    for row in 0..rh {
-        let off = ((ry + row) * w + rx) * 4;
-        let end = off + rw * 4;
-        if end > frame.len() || end > base.len() {
-            return;
-        }
-        frame[off..end].copy_from_slice(&base[off..end]);
-    }
+    let clip = if rw == 0 || rh == 0 || rx.saturating_add(rw) > w || ry.saturating_add(rh) > h {
+        (0, 0, w, h)
+    } else {
+        (rx, ry, rx + rw, ry + rh)
+    };
 
     let mut pb = PixBuf {
         data: frame,
         w,
-        clip: (rx, ry, rx + rw, ry + rh),
+        clip,
         sx: lay.sx,
         px: lay.px,
     };

@@ -737,6 +737,26 @@ impl Btrfs {
         Err(Error::NotFound)
     }
 
+    /// Parent directory of `ino`. The filesystem root is its own parent
+    /// (`..` from `/` stays `/`).
+    pub fn parent_of(&mut self, ino: u64) -> Result<u64> {
+        if ino == FIRST_FREE_OBJECTID {
+            return Ok(ino);
+        }
+        let mut parent = None;
+        {
+            let mut t = self.tree();
+            t.iter_from(FS_TREE, Key::new(ino, INODE_REF_KEY, 0), |key, _| {
+                if key.objectid != ino || key.item_type != INODE_REF_KEY {
+                    return Ok(false);
+                }
+                parent = Some(key.offset);
+                Ok(false)
+            })?;
+        }
+        parent.ok_or(Error::NotFound)
+    }
+
     pub fn readdir(&mut self, dir: u64) -> Result<Vec<DirEntry>> {
         let inode = self.read_inode(dir)?;
         if inode.kind() != FileKind::Dir {

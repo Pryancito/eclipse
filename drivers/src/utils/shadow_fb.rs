@@ -1,14 +1,16 @@
 //! A double-buffered ("shadow") framebuffer for the graphic console.
 //!
 //! All console drawing happens into a CPU-side ARGB8888 buffer kept in normal,
-//! cached RAM, which is cheap to both read and write. Dirty regions are then
-//! pushed to the real display / GPU framebuffer in bulk via
+//! cached RAM, which is cheap to both read and write. Each present then pushes
+//! the **whole** shadow to the real display / GPU framebuffer via
 //! [`DisplayScheme::blit_from`] followed by a single
 //! [`DisplayScheme::flush`].
 //!
-//! This is the **only** scene dirty-rect tracker in Eclipse OS. KMS/DIRTYFB
-//! and the Wayland clients present full buffers: partial clips on the WC
-//! scanout smeared squares and lines into neighboring pixels.
+//! Partial clips on the WC GOP/BAR1 scanout smeared squares and lines into
+//! neighboring pixels (the same class of artifact that made KMS DIRTYFB and
+//! Wayland sub-rect damage unusable). There is no scene dirty-rect tracker:
+//! a present is always a full-frame blit. A boolean skip flag still avoids
+//! rewriting the aperture when nothing changed.
 //!
 //! This avoids the two patterns that make a naive framebuffer console crawl on
 //! real hardware:
@@ -28,21 +30,20 @@ use lock::Mutex;
 
 use crate::scheme::DisplayScheme;
 
-/// Inclusive-exclusive dirty bounding box in pixels: `[x0, y0, x1, y1)`.
-type DirtyRect = (usize, usize, usize, usize);
+/// Inclusive-exclusive pixel rectangle: `[x, y, w, h)`.
+type CellRect = (usize, usize, usize, usize);
 
 struct ShadowInner {
     /// ARGB8888 pixels, row-major, `width` pixels per row.
     data: Vec<u32>,
-    /// Smallest rectangle covering everything changed since the last present,
-    /// or `None` when the shadow and the real framebuffer are in sync.
-    dirty: Option<DirtyRect>,
-    /// Pixel rectangle `(x, y, w, h)` where the inverted text cursor was last
-    /// drawn directly to the device, so it can be erased on the next present.
-    prev_cursor: Option<DirtyRect>,
+    /// Content changed since the last present.
+    dirty: bool,
+    /// Pixel rectangle `(x, y, w, h)` of the inverted text cursor last sent
+    /// to the device, so a no-op present (same content, same cursor) can skip.
+    prev_cursor: Option<CellRect>,
 }
 
-/// A CPU-side shadow of the display framebuffer with dirty-region tracking.
+/// A CPU-side shadow of the display framebuffer.
 ///
 /// Interior mutability lets the glyph renderer (which only has shared access
 /// through the `DrawTarget`) and the console scroll/fill paths share one
@@ -63,7 +64,7 @@ impl ShadowFramebuffer {
             height,
             inner: Mutex::new(ShadowInner {
                 data: vec![0; width.saturating_mul(height)],
-                dirty: None,
+                dirty: false,
                 prev_cursor: None,
             }),
         })
@@ -81,14 +82,6 @@ impl ShadowFramebuffer {
         self.height
     }
 
-    #[inline]
-    fn mark(inner: &mut ShadowInner, x0: usize, y0: usize, x1: usize, y1: usize) {
-        inner.dirty = Some(match inner.dirty {
-            Some((ax0, ay0, ax1, ay1)) => (ax0.min(x0), ay0.min(y0), ax1.max(x1), ay1.max(y1)),
-            None => (x0, y0, x1, y1),
-        });
-    }
-
     /// Write a batch of `(x, y, argb)` pixels (used by the glyph renderer).
     ///
     /// Taking an iterator lets a whole glyph be rendered under a single lock.
@@ -100,7 +93,7 @@ impl ShadowFramebuffer {
                 continue;
             }
             g.data[y * w + x] = argb;
-            Self::mark(&mut g, x, y, x + 1, y + 1);
+            g.dirty = true;
         }
     }
 
@@ -118,7 +111,7 @@ impl ShadowFramebuffer {
                 *px = argb;
             }
         }
-        Self::mark(&mut g, x, y, x1, y1);
+        g.dirty = true;
     }
 
     /// Copy a rectangle within the shadow buffer (`memmove` semantics), used for
@@ -148,46 +141,37 @@ impl ShadowFramebuffer {
                 g.data.copy_within(s..s + w, d);
             }
         }
-        Self::mark(&mut g, dx, dy, dx + w, dy + h);
+        g.dirty = true;
     }
 
-    /// Clear the whole shadow buffer to `argb` and mark it fully dirty.
+    /// Clear the whole shadow buffer to `argb` and mark it for present.
     pub fn clear(&self, argb: u32) {
         let mut g = self.inner.lock();
         for px in g.data.iter_mut() {
             *px = argb;
         }
-        g.dirty = Some((0, 0, self.width, self.height));
+        g.dirty = true;
     }
 
-    /// Push the dirty region to the real display and flush it.
+    /// Push the whole shadow to the real display and flush it.
     ///
-    /// Does nothing when nothing changed since the last present. The dirty
-    /// sub-rectangle is blitted in one shot via [`DisplayScheme::blit_from`]
-    /// (whose stride argument lets it address a window of the full-width shadow
-    /// without copying), and a single [`DisplayScheme::flush`] follows for
-    /// devices that need it (virtio-gpu).
+    /// Does nothing when nothing changed since the last present. One
+    /// [`DisplayScheme::blit_from`] of the full buffer, then a single
+    /// [`DisplayScheme::flush`] for devices that need it (virtio-gpu).
     pub fn present(&self, display: &dyn DisplayScheme) {
         let mut g = self.inner.lock();
-        let Some((x0, y0, x1, y1)) = g.dirty.take() else {
-            return;
-        };
-        let x0 = x0.min(self.width);
-        let y0 = y0.min(self.height);
-        let x1 = x1.min(self.width);
-        let y1 = y1.min(self.height);
-        if x0 >= x1 || y0 >= y1 {
+        if !g.dirty && g.prev_cursor.is_none() {
             return;
         }
-        let (w, h) = (x1 - x0, y1 - y0);
-        let start = y0 * self.width + x0;
+        g.dirty = false;
+        g.prev_cursor = None;
         display.blit_from(
-            x0 as u32,
-            y0 as u32,
-            &g.data[start..],
+            0,
+            0,
+            &g.data,
             self.width,
-            w as u32,
-            h as u32,
+            self.width as u32,
+            self.height as u32,
         );
         drop(g);
         if display.need_flush() {
@@ -195,14 +179,13 @@ impl ShadowFramebuffer {
         }
     }
 
-    /// Present the dirty region and overlay a blinking text cursor.
+    /// Present the full shadow and overlay a blinking text cursor.
     ///
     /// `cursor` is the cell to highlight `(col, row)` or `None` to hide it;
-    /// `cw`/`ch` are the character cell size in pixels. The cursor is drawn as
-    /// an inverted block straight to the device (never stored in the shadow, so
-    /// it can be erased cleanly) by reading the cell's pixels from the shadow,
-    /// XOR-ing them and blitting them back. Because it is always rebuilt from
-    /// the clean shadow, redrawing the same cell is idempotent.
+    /// `cw`/`ch` are the character cell size in pixels. The cursor is inverted
+    /// in the shadow, the **whole** frame is blitted once (no WC sub-rect),
+    /// then the invert is undone so the shadow stays clean. A present with
+    /// unchanged content and the same cursor cell is a no-op.
     pub fn present_with_cursor(
         &self,
         display: &dyn DisplayScheme,
@@ -212,31 +195,11 @@ impl ShadowFramebuffer {
     ) {
         let mut g = self.inner.lock();
 
-        // 1. Flush the dirty content region.
-        if let Some((x0, y0, x1, y1)) = g.dirty.take() {
-            let x0 = x0.min(self.width);
-            let y0 = y0.min(self.height);
-            let x1 = x1.min(self.width);
-            let y1 = y1.min(self.height);
-            if x0 < x1 && y0 < y1 {
-                let start = y0 * self.width + x0;
-                display.blit_from(
-                    x0 as u32,
-                    y0 as u32,
-                    &g.data[start..],
-                    self.width,
-                    (x1 - x0) as u32,
-                    (y1 - y0) as u32,
-                );
-            }
-        }
-
-        // Pixel rectangle of the requested cursor cell, clamped to the screen.
         let new_rect = cursor.and_then(|(cx, cy)| {
             let x = (cx * cw).min(self.width);
             let y = (cy * ch).min(self.height);
-            let w = cw.min(self.width - x);
-            let h = ch.min(self.height - y);
+            let w = cw.min(self.width.saturating_sub(x));
+            let h = ch.min(self.height.saturating_sub(y));
             if w == 0 || h == 0 {
                 None
             } else {
@@ -244,17 +207,25 @@ impl ShadowFramebuffer {
             }
         });
 
-        // 2. Erase the previously drawn cursor if it has moved or is hidden.
-        if let Some(prev) = g.prev_cursor {
-            if Some(prev) != new_rect {
-                Self::blit_cell(display, &g.data, self.width, prev, false);
-            }
+        if !g.dirty && g.prev_cursor == new_rect {
+            return;
         }
 
-        // 3. Draw the cursor (inverted) at its new position.
         if let Some(rect) = new_rect {
-            Self::blit_cell(display, &g.data, self.width, rect, true);
+            Self::invert_cell(&mut g.data, self.width, rect);
         }
+        display.blit_from(
+            0,
+            0,
+            &g.data,
+            self.width,
+            self.width as u32,
+            self.height as u32,
+        );
+        if let Some(rect) = new_rect {
+            Self::invert_cell(&mut g.data, self.width, rect);
+        }
+        g.dirty = false;
         g.prev_cursor = new_rect;
 
         drop(g);
@@ -263,35 +234,16 @@ impl ShadowFramebuffer {
         }
     }
 
-    /// Blit one character cell from the shadow to the device, optionally
-    /// inverting it (for the cursor). `rect` is `(x, y, w, h)` in pixels.
-    fn blit_cell(
-        display: &dyn DisplayScheme,
-        data: &[u32],
-        width: usize,
-        rect: DirtyRect,
-        invert: bool,
-    ) {
+    fn invert_cell(data: &mut [u32], width: usize, rect: CellRect) {
         let (x, y, w, h) = rect;
-        if invert {
-            let mut tmp = Vec::with_capacity(w * h);
-            for r in 0..h {
-                let base = (y + r) * width + x;
-                for c in 0..w {
-                    tmp.push(data[base + c] ^ 0x00FF_FFFF);
+        for r in 0..h {
+            let base = (y + r).saturating_mul(width).saturating_add(x);
+            for c in 0..w {
+                let i = base + c;
+                if i < data.len() {
+                    data[i] ^= 0x00FF_FFFF;
                 }
             }
-            display.blit_from(x as u32, y as u32, &tmp, w, w as u32, h as u32);
-        } else {
-            let start = y * width + x;
-            display.blit_from(
-                x as u32,
-                y as u32,
-                &data[start..],
-                width,
-                w as u32,
-                h as u32,
-            );
         }
     }
 }

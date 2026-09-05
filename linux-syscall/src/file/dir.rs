@@ -44,7 +44,7 @@ impl Syscall<'_> {
             return Err(LxError::ENOTDIR);
         }
         proc.check_access(&info, 0o1, true)?;
-        proc.change_directory(path);
+        proc.change_directory(path, Some(inode));
         Ok(0)
     }
 
@@ -190,6 +190,10 @@ impl Syscall<'_> {
                 &name,
             );
             if !ok {
+                file.unread_dir_entry();
+                if writer.written_size == 0 {
+                    return Err(LxError::EINVAL);
+                }
                 break;
             }
         }
@@ -409,7 +413,7 @@ impl Syscall<'_> {
             return Err(LxError::ENOTDIR);
         }
         proc.check_access(&info, 0o1, true)?;
-        proc.change_directory(file.path());
+        proc.change_directory(file.path(), Some(file.inode()));
         Ok(0)
     }
 

@@ -512,6 +512,17 @@ impl File {
         Ok(self.read_entry_with_metadata()?.1)
     }
 
+    /// Push the directory cursor back one entry.
+    ///
+    /// `getdents` advances this cursor inside [`read_entry_with_metadata`]
+    /// before it knows whether the dirent fits in the user buffer. If it does
+    /// not, the caller must rewind so the same entry is offered on the next
+    /// call — Linux does not consume a dent that did not fit.
+    pub fn unread_dir_entry(&self) {
+        let mut inner = self.inner.write();
+        inner.offset = inner.offset.saturating_sub(1);
+    }
+
     /// get the next directory entry and its metadata
     pub fn read_entry_with_metadata(&self) -> LxResult<(Metadata, String)> {
         let mut inner = self.inner.write();
