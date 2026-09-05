@@ -444,16 +444,11 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // copy-engine present path (ce_present over PCIe P2P) is ready
             // before the compositor starts -- no manual `cat /proc/gpustep5;6;8;9`.
             // Runs once, synchronously, before any userspace/scanout touches RM.
-            // Per-frame CE-offloaded present: when a compute GPU was brought up
-            // at boot (dual RTX: render GPU P2P-copies into the console GOP FB),
-            // enable CE present automatically — it replaces the ~7-10 FPS CPU
-            // blit path with a GPU copy-engine transfer. Explicit opt-in via
-            // `nvidia.cepresent` still works; the wlroots GPU-renderer opts
-            // (`nvidia.wlr_gles2` / `nvidia.wlr_vulkan`) also request it, since
-            // without CE the compositor can render on the secondary RTX yet
-            // still present through the slow CPU scanout path. Opt-out with
-            // `nvidia.nocepresent`. On failure CE auto-wedges and falls back to
-            // CPU blit (see CE_PRESENT_WEDGED in nvidia.rs).
+            // Per-frame CE-offloaded present: keep it EXPLICIT opt-in via
+            // `nvidia.cepresent` only. This path has shown visual instability on
+            // some real NVIDIA boots, so the stable default remains CPU present
+            // (`nvidia.nocepresent` still forces it). On failure CE auto-wedges
+            // and falls back to CPU blit (see CE_PRESENT_WEDGED in nvidia.rs).
             let ce_ready = if !options.cmdline.contains("nvidia.noautoboot") {
                 auto_bringup_compute_gpus()
             } else {
@@ -468,12 +463,6 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             };
             let ce_requested_by = if cmdline_has("nvidia.cepresent") {
                 Some("nvidia.cepresent")
-            } else if cmdline_has("nvidia.wlr_vulkan") {
-                Some("nvidia.wlr_vulkan")
-            } else if cmdline_has("nvidia.wlr_gles2") {
-                Some("nvidia.wlr_gles2")
-            } else if ce_ready {
-                Some("auto: compute GPU ready")
             } else {
                 None
             };
@@ -483,7 +472,8 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 linux_object::fs::devfs::drm::set_ce_present_enabled(true);
                 klog_info!("Eclipse: NVIDIA CE-offload present ENABLED ({})", reason);
             } else {
-                klog_info!("Eclipse: present por CPU (CE-offload: no compute GPU ready; try nvidia.cepresent)");
+                let _ = ce_ready;
+                klog_info!("Eclipse: present por CPU (CE-offload disabled by default; add nvidia.cepresent to test it)");
             }
             // NOTE: do NOT auto-bring-up the CONSOLE GPU on the boot path.
             // Deferred bring-up for nvidia.hwcursor is scheduled AFTER 100%
