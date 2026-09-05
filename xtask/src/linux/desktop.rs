@@ -1469,6 +1469,11 @@ fn write_labwc_environment(rootfs: &Path) {
           # for its own children. It matters for the window BEFORE Xwayland is\n\
           # up, and for anything reading this file directly.\n\
           DISPLAY=:0\n\
+          # Force implicit-modifier (linear) scanout buffers on every labwc start.\n\
+          # Eclipse presents by CPU-reading the scanout framebuffer linearly; tiled\n\
+          # modifiers on NVIDIA can show up as visual garbage/ghosting instead of a\n\
+          # clean desktop image.\n\
+          WLR_DRM_NO_MODIFIERS=1\n\
           XCURSOR_THEME=Adwaita\n\
           # lunarbg draws its logo round by pre-squeezing for the panel aspect.\n\
           # It auto-detects the panel aspect from wl_output.geometry (the EDID\n\
@@ -1672,6 +1677,10 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # scene on every pointer move. Forcing software cursors used to paper\n\
           # over a missing cursor ioctl and burned a core idle; leave the var\n\
           # unset unless a caller overrides it for debugging.\n\
+          # Force implicit-modifier (linear) scanout buffers regardless of renderer.\n\
+          # Eclipse scans out by CPU-reading the framebuffer linearly; on dual-NVIDIA\n\
+          # setups, tiled modifiers can surface as noisy/ghosted output.\n\
+          : \"${WLR_DRM_NO_MODIFIERS:=1}\"; export WLR_DRM_NO_MODIFIERS\n\
           # Renderer, by the SAME two-condition gate as the kernel,\n\
           # /etc/profile and eclipse-init's build_child_env: hardware GL only\n\
           # when an NVIDIA GPU AND the nvidia.nouveau_uapi flag are both present\n\
@@ -1689,7 +1698,6 @@ fn write_labwc_wrapper(rootfs: &Path) {
           \x20\x20 [ \"$(tr -d '[:space:]' < /sys/class/drm/card0/device/vendor 2>/dev/null)\" = \"0x10de\" ]; then\n\
           \x20 if grep -q 'nvidia\\.wlr_vulkan' /proc/cmdline 2>/dev/null; then\n\
           \x20\x20 : \"${WLR_RENDERER:=vulkan}\"; export WLR_RENDERER\n\
-          \x20\x20 : \"${WLR_DRM_NO_MODIFIERS:=1}\"; export WLR_DRM_NO_MODIFIERS\n\
           \x20\x20 : \"${GALLIUM_DRIVER:=zink}\"; export GALLIUM_DRIVER\n\
           \x20\x20 : \"${MESA_LOADER_DRIVER_OVERRIDE:=zink}\"; export MESA_LOADER_DRIVER_OVERRIDE\n\
           \x20\x20 # SDL on the GPU sessions: GLES2 renderer (SDL2 has no Vulkan\n\
@@ -1698,7 +1706,6 @@ fn write_labwc_wrapper(rootfs: &Path) {
           \x20\x20 : \"${SDL_FRAMEBUFFER_ACCELERATION:=opengles2}\"; export SDL_FRAMEBUFFER_ACCELERATION\n\
           \x20 elif grep -q 'nvidia\\.wlr_gles2' /proc/cmdline 2>/dev/null; then\n\
           \x20\x20 : \"${WLR_RENDERER:=gles2}\"; export WLR_RENDERER\n\
-          \x20\x20 : \"${WLR_DRM_NO_MODIFIERS:=1}\"; export WLR_DRM_NO_MODIFIERS\n\
           \x20\x20 : \"${GALLIUM_DRIVER:=zink}\"; export GALLIUM_DRIVER\n\
           \x20\x20 : \"${MESA_LOADER_DRIVER_OVERRIDE:=zink}\"; export MESA_LOADER_DRIVER_OVERRIDE\n\
           \x20\x20 : \"${SDL_RENDER_DRIVER:=opengles2}\"; export SDL_RENDER_DRIVER\n\
@@ -1993,6 +2000,7 @@ mod tests {
         // PULSE_SERVER for libpulse, and a D-Bus session address so SDL_Init
         // never autolaunches dbus-launch. Static, so all three files.
         for (key, val) in [
+            ("WLR_DRM_NO_MODIFIERS", "1"),
             ("SDL_VIDEODRIVER", "wayland,x11"),
             ("SDL_VIDEO_DRIVER", "wayland,x11"),
             ("SDL_AUDIODRIVER", "alsa"),
