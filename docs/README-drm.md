@@ -134,7 +134,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | `DRM_CAP_TIMESTAMP_MONOTONIC` | 1 | |
 | `DRM_CAP_ASYNC_PAGE_FLIP` | 0 | |
 | `DRM_CAP_CURSOR_WIDTH` / `HEIGHT` | 64 | cursor compuesto por el kernel |
-| `DRM_CAP_ADDFB2_MODIFIERS` | 1 | |
+| `DRM_CAP_ADDFB2_MODIFIERS` | 0 | scanout solo lineal; modifiers tiled se rechazan para evitar basura visual |
 | `DRM_CAP_PAGE_FLIP_TARGET` | 0 | |
 | `DRM_CAP_CRTC_IN_VBLANK_EVENT` | 1 | el evento de flip lleva `crtc_id` |
 | `DRM_CAP_SYNCOBJ` / `SYNCOBJ_TIMELINE` | 0 | |

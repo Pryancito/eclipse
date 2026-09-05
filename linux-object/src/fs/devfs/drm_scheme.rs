@@ -179,6 +179,10 @@ const DRM_IOCTL_MODE_SETPROPERTY: u32 = 0xC01064AB;
 // only visible when the software-cursor path is used).
 const DRM_IOCTL_MODE_CURSOR: u32 = 0xC01C64A3;
 const DRM_IOCTL_MODE_CURSOR2: u32 = 0xC02464BB;
+const DRM_MODE_FB_MODIFIERS: u32 = 1 << 0;
+const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258; // "XR24"
+const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241; // "AR24"
+const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 
 // Core (non-MODE) vblank wait.
 const DRM_IOCTL_WAIT_VBLANK: u32 = 0xC018643A;
@@ -649,6 +653,29 @@ struct DrmModeFbCmd2 {
     pitches: [u32; 4],
     offsets: [u32; 4],
     modifier: [u64; 4],
+}
+
+fn validate_addfb2(cmd: &DrmModeFbCmd2) -> Result<(), &'static str> {
+    if cmd.flags & !DRM_MODE_FB_MODIFIERS != 0 {
+        return Err("unsupported flags");
+    }
+    if !matches!(cmd.pixel_format, DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888) {
+        return Err("unsupported pixel format");
+    }
+    if cmd.offsets[0] != 0 {
+        return Err("non-zero plane-0 offset");
+    }
+    if cmd.handles[1..].iter().any(|&v| v != 0)
+        || cmd.pitches[1..].iter().any(|&v| v != 0)
+        || cmd.offsets[1..].iter().any(|&v| v != 0)
+        || cmd.modifier[1..].iter().any(|&v| v != 0)
+    {
+        return Err("multi-plane framebuffer not supported");
+    }
+    if cmd.modifier[0] != DRM_FORMAT_MOD_LINEAR {
+        return Err("non-linear modifier");
+    }
+    Ok(())
 }
 
 #[repr(C)]
@@ -1750,6 +1777,22 @@ impl INode for DrmDev {
             }
             DRM_IOCTL_MODE_ADDFB2 => {
                 let cmd = unsafe { &mut *(data as *mut DrmModeFbCmd2) };
+                if let Err(why) = validate_addfb2(cmd) {
+                    log::error!(
+                        "[drm] ADDFB2 reject: {}x{} handle={:#x} pitch={} fmt={:#x} flags={:#x} \
+                         offset={} modifier={:#x} ({})",
+                        cmd.width,
+                        cmd.height,
+                        cmd.handles[0],
+                        cmd.pitches[0],
+                        cmd.pixel_format,
+                        cmd.flags,
+                        cmd.offsets[0],
+                        cmd.modifier[0],
+                        why
+                    );
+                    return Err(FsError::InvalidParam);
+                }
                 if let Some(fb_id) =
                     drm::create_fb(cmd.handles[0], cmd.width, cmd.height, cmd.pitches[0])
                 {
@@ -1887,7 +1930,7 @@ impl INode for DrmDev {
                 if let Some(fb) = drm::get_fb(cmd.fb_id) {
                     cmd.width = fb.width;
                     cmd.height = fb.height;
-                    cmd.pixel_format = 0x3432_5258; // DRM_FORMAT_XRGB8888 ("XR24")
+                    cmd.pixel_format = DRM_FORMAT_XRGB8888;
                     cmd.flags = 0;
                     cmd.handles = [fb.gem_handle_id, 0, 0, 0];
                     cmd.pitches = [fb.pitch, 0, 0, 0];
@@ -2278,8 +2321,8 @@ impl INode for DrmDev {
                     // Advertise the formats the software scanout consumes, via
                     // the two-call pattern (count first, then fill).
                     const FORMATS: [u32; 2] = [
-                        0x3432_5258, // DRM_FORMAT_XRGB8888 ("XR24")
-                        0x3432_5241, // DRM_FORMAT_ARGB8888 ("AR24")
+                        DRM_FORMAT_XRGB8888,
+                        DRM_FORMAT_ARGB8888,
                     ];
                     if res.format_type_ptr != 0 && res.count_format_types >= FORMATS.len() as u32 {
                         unsafe {
@@ -2874,5 +2917,54 @@ impl INode for DrmDev {
 
     fn as_any_ref(&self) -> &dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_addfb2() -> DrmModeFbCmd2 {
+        DrmModeFbCmd2 {
+            fb_id: 0,
+            width: 1920,
+            height: 1080,
+            pixel_format: DRM_FORMAT_XRGB8888,
+            flags: 0,
+            handles: [1, 0, 0, 0],
+            pitches: [1920 * 4, 0, 0, 0],
+            offsets: [0; 4],
+            modifier: [DRM_FORMAT_MOD_LINEAR; 4],
+        }
+    }
+
+    #[test]
+    fn addfb2_accepts_linear_single_plane_xrgb8888() {
+        assert!(validate_addfb2(&base_addfb2()).is_ok());
+    }
+
+    #[test]
+    fn addfb2_rejects_non_zero_offset() {
+        let mut cmd = base_addfb2();
+        cmd.offsets[0] = 4096;
+        assert_eq!(validate_addfb2(&cmd), Err("non-zero plane-0 offset"));
+    }
+
+    #[test]
+    fn addfb2_rejects_non_linear_modifier() {
+        let mut cmd = base_addfb2();
+        cmd.flags = DRM_MODE_FB_MODIFIERS;
+        cmd.modifier[0] = 0x10;
+        assert_eq!(validate_addfb2(&cmd), Err("non-linear modifier"));
+    }
+
+    #[test]
+    fn addfb2_rejects_extra_planes() {
+        let mut cmd = base_addfb2();
+        cmd.handles[1] = 2;
+        assert_eq!(
+            validate_addfb2(&cmd),
+            Err("multi-plane framebuffer not supported")
+        );
     }
 }

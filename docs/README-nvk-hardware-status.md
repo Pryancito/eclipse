@@ -1316,7 +1316,8 @@ a wlroots a negociar un swapchain lineal, por dos palancas:
 1. **`DRM_CAP_ADDFB2_MODIFIERS = 0`** (drm_scheme.rs): declara que el KMS no
    soporta modificadores. wlroots restringe el scanout a buffers
    lineales/implícitos.
-2. **`WLR_DRM_NO_MODIFIERS=1`** en el entorno de labwc (eclipse-init): fuerza
+2. **`WLR_DRM_NO_MODIFIERS=1`** en todas las rutas de arranque de labwc
+   (`eclipse-init`, `/etc/profile`, wrapper y `environment`): fuerza
    buffers de modificador implícito (lineal) pase lo que pase, incluso si
    wlroots sacara los modificadores tiled del *renderer* (dma-buf feedback de
    NVK) en vez del plano KMS -- cosa que la cap sola podría no cubrir.
