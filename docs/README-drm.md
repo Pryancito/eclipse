@@ -102,7 +102,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | `DRM_IOCTL_MODE_OBJ_SETPROPERTY` / `SETPROPERTY` | 🟡 | aceptado como no-op (DPMS…; sin estado programable) |
 | `DRM_IOCTL_MODE_GETPROPBLOB` | ✅ | EDID + blobs del almacén de propiedades |
 | `DRM_IOCTL_MODE_CREATEPROPBLOB` / `DESTROYPROPBLOB` | ✅ | almacén de blobs; destruir un blob del kernel da EACCES (Linux: EPERM) |
-| `DRM_IOCTL_MODE_CURSOR` / `CURSOR2` | ✅ | cursor compuesto por el kernel sobre cada frame (`set_cursor_bo`/`move_cursor`) |
+| `DRM_IOCTL_MODE_CURSOR` / `CURSOR2` | ✅ | cursor compuesto por el kernel en cada *scanout* a frame completo (MOVE no parchea el BAR) |
 | `DRM_IOCTL_MODE_ATOMIC` | ✅ | **opt-in** con `drm.atomic` (ver sección siguiente) |
 | `DRM_IOCTL_MODE_GETGAMMA` / `SETGAMMA` | ❌ | sin LUT (`gamma_size=0`) |
 | `DRM_IOCTL_MODE_CREATE_LEASE` … | ❌ | *leases* no soportados |

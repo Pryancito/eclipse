@@ -2019,17 +2019,15 @@ impl INode for DrmDev {
                 const DRM_MODE_CURSOR_BO: u32 = 0x01;
                 const DRM_MODE_CURSOR_MOVE: u32 = 0x02;
                 let cur = unsafe { &*(data as *const DrmModeCursor) };
-                let mut changed = false;
                 if cur.flags & DRM_MODE_CURSOR_BO != 0 {
-                    changed |= drm::set_cursor_bo(cur.handle, cur.width, cur.height);
+                    let _ = drm::set_cursor_bo(cur.handle, cur.width, cur.height);
                 }
                 if cur.flags & DRM_MODE_CURSOR_MOVE != 0 {
                     drm::move_cursor(cur.x, cur.y);
-                    changed = true;
                 }
-                if changed {
-                    drm::repaint_for_cursor();
-                }
+                // Position/image are sampled on the next full `scanout()`.
+                // Per-move 64×64 patches on WC GOP/BAR1 smeared squares and
+                // lines along the pointer trail.
                 Ok(0)
             }
             DRM_IOCTL_GEM_CLOSE => {

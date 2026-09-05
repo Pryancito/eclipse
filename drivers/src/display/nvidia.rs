@@ -4835,6 +4835,16 @@ impl DrmScheme for NvidiaGpu {
         !self.drives_boot_display() && self.rm_device_instance.lock().is_some()
     }
 
+    fn ce_present_available(&self) -> bool {
+        if CE_PRESENT_WEDGED.load(Ordering::Relaxed) {
+            return false;
+        }
+        if self.rm_device_instance.lock().is_none() {
+            return false;
+        }
+        matches!(boot_fb_phys(), Some(p) if p != 0)
+    }
+
     fn deferred_console_bringup_for_hwcursor(&self) -> String {
         if !self.drives_boot_display() {
             return String::new();
@@ -4866,7 +4876,7 @@ impl DrmScheme for NvidiaGpu {
         }
     }
 
-    fn ce_present(&self, src_sysmem_pa: u64, size: u64) -> bool {
+    fn ce_present(&self, src_sysmem_pa: u64, size: u64, src_coherent: bool) -> bool {
         if src_sysmem_pa == 0 || size == 0 {
             return false;
         }
@@ -4935,6 +4945,7 @@ impl DrmScheme for NvidiaGpu {
                     fb_phys - bar1,
                     src_sysmem_pa,
                     size,
+                    src_coherent,
                 ),
                 "console/FBMEM",
             )
@@ -4943,7 +4954,13 @@ impl DrmScheme for NvidiaGpu {
             // host physical address, ADDR_SYSMEM). The reliable path — the
             // compute GPU always boots. Depends on PCIe P2P not being ACS-blocked.
             (
-                nvidia_rm_sys::rm_init::ce_blit_p2p(device_instance, fb_phys, src_sysmem_pa, size),
+                nvidia_rm_sys::rm_init::ce_blit_p2p(
+                    device_instance,
+                    fb_phys,
+                    src_sysmem_pa,
+                    size,
+                    src_coherent,
+                ),
                 "compute/P2P",
             )
         };
@@ -5010,6 +5027,7 @@ impl DrmScheme for NvidiaGpu {
         dst_pitch: u32,
         row_bytes: u32,
         line_count: u32,
+        src_coherent: bool,
     ) -> bool {
         if src_sysmem_pa == 0 || row_bytes == 0 || line_count == 0 {
             return false;
@@ -5044,6 +5062,7 @@ impl DrmScheme for NvidiaGpu {
                     src_pitch,
                     row_bytes,
                     line_count,
+                    src_coherent,
                 ),
                 "console/FBMEM-2D",
             )
@@ -5057,6 +5076,7 @@ impl DrmScheme for NvidiaGpu {
                     src_pitch,
                     row_bytes,
                     line_count,
+                    src_coherent,
                 ),
                 "compute/P2P-2D",
             )

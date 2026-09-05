@@ -287,30 +287,24 @@ struct CursorState {
     w: u32,
     h: u32,
     /// Client cursor pixels (premultiplied ARGB8888, tightly packed). Held in
-    /// an `Arc` so every `scanout()` / cursor move can share the pixels without
-    /// cloning the Vec — a resize/redraw storm was cloning this on every flip
-    /// and amplifying heap churn for ~30–50 min until a null fn-ptr #PF.
+    /// an `Arc` so every `scanout()` can share the pixels without cloning the
+    /// Vec — a resize/redraw storm was cloning this on every flip and amplifying
+    /// heap churn for ~30–50 min until a null fn-ptr #PF.
     bitmap: Option<Arc<[u32]>>,
-    /// The rectangle `(x, y, w, h)` currently composited on the display, or
-    /// `None` if nothing is drawn. A cursor move restores exactly this rect from
-    /// the CRTC framebuffer before compositing the new one — so a move touches
-    /// two ~64x64 windows instead of re-blitting the whole ~16 MB frame. This is
-    /// what makes the pointer cheap enough to feel like a hardware cursor.
-    drawn: Option<(i32, i32, u32, u32)>,
     /// The REAL display-engine cursor plane owns the pointer (the driver's
     /// `hw_cursor_set` accepted the image). While set, the kernel's software
     /// compositing stands down completely: `scanout()` does not blend the
-    /// bitmap and `repaint_for_cursor()` is a no-op — the display hardware
-    /// composites the plane during scanout and a move is one PIO write in the
-    /// driver. Opt-in via the `nvidia.hwcursor` kernel cmdline flag; any
-    /// driver failure falls back to the software path with `hw == false`.
+    /// bitmap — the display hardware composites the plane during scanout and a
+    /// move is one PIO write in the driver. Opt-in via the `nvidia.hwcursor`
+    /// kernel cmdline flag; any driver failure falls back to the software path
+    /// with `hw == false`.
     hw: bool,
 }
 
 lazy_static::lazy_static! {
-    /// Reused compose buffer for software-cursor patches (avoids a heap alloc
-    /// on every pointer motion).
-    static ref CURSOR_PATCH: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    /// Reused compose buffer for the software-cursor strip (full-width rows
+    /// covering the pointer, blitted once per scanout).
+    static ref CURSOR_STRIP: Mutex<Vec<u32>> = Mutex::new(Vec::new());
     static ref DRM_STATE: Mutex<DrmState> = Mutex::new(DrmState {
         drivers: Vec::new(),
         next_handle_id: 1,
@@ -330,7 +324,6 @@ lazy_static::lazy_static! {
             w: 0,
             h: 0,
             bitmap: None,
-            drawn: None,
             hw: false,
         },
         blobs: Vec::new(),
@@ -793,27 +786,44 @@ pub fn set_crtc_fb(_crtc_id: u32, fb_id: u32) {
 /// under a timer tick.
 const BLIT_CHUNK_ROWS: u32 = 128;
 
-/// Blit `pixels` (row-major, `src_stride` u32s per row, already offset so
-/// `pixels[0]` is the rectangle's top-left) into `display` at
-/// `(dst_x, dst_y)`, `width`x`height`, in horizontal bands with interrupts
-/// re-enabled between bands.
-///
-/// IRQs nest on the coroutine stack, so any single blit must run with
-/// interrupts fully off end-to-end — that's what stopped the nested-IRQ
-/// coroutine-stack overflow (`rip=0x3` / `[rsp0]=0x13486`) seen at labwc
-/// bring-up (APIC timer -> xHCI EventListener / DRM timer re-entering
-/// mid-scanout). But holding IF clear for an entire full-frame copy means
-/// every timer tick, keyboard IRQ and xHCI completion queues up behind it,
-/// which was a visible chunk of the "labwc feels slow" gap versus Linux.
-/// Chunking bounds the continuous interrupts-off window to one band — pending
-/// IRQs are serviced promptly between bands — while each individual blit
-/// still runs fully protected, preserving the original crash fix.
+/// Optional FromDevice of a GPU-written GEM covering one scanout band.
+/// The CPU blit / CE staging repack read the WB physmap alias; without this
+/// the cache keeps the previous frame. Row-by-row (see
+/// [`dma_sync_gem_rect_from_device`]) so pitch padding is not clflushed.
+struct GemSrcSync {
+    vaddr: usize,
+    fb_size: usize,
+    fb_w: u32,
+    fb_h: u32,
+    origin_x: u32,
+    origin_y: u32,
+}
+
+fn sync_src_band(sync: &GemSrcSync, src_stride: usize, band_y: u32, w: u32, h: u32) {
+    dma_sync_gem_rect_from_device(
+        sync.vaddr,
+        sync.fb_size,
+        src_stride,
+        sync.origin_x as i32,
+        (sync.origin_y.saturating_add(band_y)) as i32,
+        w,
+        h,
+        sync.fb_w,
+        sync.fb_h,
+    );
+}
+
 /// Repack the frame into the CE staging buffer at `dst_pitch` and return the
 /// staging `(phys_addr, bytes)` for a flat CE copy. Returns `None` (caller
 /// falls back to the CPU blit) if the staging buffer cannot be allocated.
 ///
-/// The row copies are ordinary cached memory writes (~GB/s), and x86 PCIe DMA
-/// snoops the cache, so the CE reads coherent data with no explicit flush.
+/// The row copies are ordinary cached memory writes (~GB/s). Staging is
+/// CPU-written WB sysmem, so the subsequent flat CE copy uses a coherent
+/// (snooped) source and needs no extra flush of the staging buffer.
+///
+/// `src_sync` is the GPU-written GEM the CPU is about to *read*; each band is
+/// invalidated immediately before those rows are copied so a full-frame
+/// padded clflush is not paid up front.
 fn ce_repack_to_staging(
     pixels: &[u32],
     src_pa: u64,
@@ -821,6 +831,8 @@ fn ce_repack_to_staging(
     dst_pitch: usize,
     w: u32,
     h: u32,
+    src_sync: Option<&GemSrcSync>,
+    sync_elapsed: &mut Duration,
 ) -> Option<(u64, u64)> {
     let t0 = kernel_hal::timer::timer_now();
     let row_bytes = (w as usize).checked_mul(4)?;
@@ -858,20 +870,31 @@ fn ce_repack_to_staging(
             (va, pa, vmo)
         }
     };
-    for r in 0..h as usize {
-        let s = r.checked_mul(src_stride)?;
-        if s + row_bytes / 4 > pixels.len() {
-            break;
+    let mut row = 0u32;
+    while row < h {
+        let band_h = BLIT_CHUNK_ROWS.min(h - row);
+        if let Some(sync) = src_sync {
+            let ts = kernel_hal::timer::timer_now();
+            sync_src_band(sync, src_stride, row, w, band_h);
+            *sync_elapsed += kernel_hal::timer::timer_now().saturating_sub(ts);
         }
-        // SAFETY: staging spans `need` bytes and r*dst_pitch + row_bytes <=
-        // need; the source slice bound was checked above.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                pixels[s..].as_ptr() as *const u8,
-                (va + r * dst_pitch) as *mut u8,
-                row_bytes,
-            );
+        for r in 0..band_h as usize {
+            let abs_r = row as usize + r;
+            let s = abs_r.checked_mul(src_stride)?;
+            if s + row_bytes / 4 > pixels.len() {
+                break;
+            }
+            // SAFETY: staging spans `need` bytes and abs_r*dst_pitch +
+            // row_bytes <= need; the source slice bound was checked above.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    pixels[s..].as_ptr() as *const u8,
+                    (va + abs_r * dst_pitch) as *mut u8,
+                    row_bytes,
+                );
+            }
         }
+        row += band_h;
     }
     // The repack is suspected to be the remaining present cost: the GEM
     // source's CPU address comes from the RM's AT_CPU resolution (see
@@ -917,6 +940,25 @@ fn ce_repack_to_staging(
     Some((pa, need as u64))
 }
 
+/// Blit `pixels` (row-major, `src_stride` u32s per row, already offset so
+/// `pixels[0]` is the rectangle's top-left) into `display` at
+/// `(dst_x, dst_y)`, `width`x`height`, in horizontal bands with interrupts
+/// re-enabled between bands.
+///
+/// IRQs nest on the coroutine stack, so any single blit must run with
+/// interrupts fully off end-to-end — that's what stopped the nested-IRQ
+/// coroutine-stack overflow (`rip=0x3` / `[rsp0]=0x13486`) seen at labwc
+/// bring-up (APIC timer -> xHCI EventListener / DRM timer re-entering
+/// mid-scanout). But holding IF clear for an entire full-frame copy means
+/// every timer tick, keyboard IRQ and xHCI completion queues up behind it,
+/// which was a visible chunk of the "labwc feels slow" gap versus Linux.
+/// Chunking bounds the continuous interrupts-off window to one band — pending
+/// IRQs are serviced promptly between bands — while each individual blit
+/// still runs fully protected, preserving the original crash fix.
+///
+/// When `src_sync` is set, each band is FromDevice-invalidated immediately
+/// before the copy so GPU-written pixels are visible without a full-frame
+/// padded clflush. Returns the time spent in those syncs.
 fn blit_chunked(
     display: &Arc<dyn DisplayScheme>,
     dst_x: u32,
@@ -925,10 +967,17 @@ fn blit_chunked(
     src_stride: usize,
     width: u32,
     height: u32,
-) {
+    src_sync: Option<&GemSrcSync>,
+) -> Duration {
+    let mut sync_elapsed = Duration::ZERO;
     let mut row = 0u32;
     while row < height {
         let band_h = BLIT_CHUNK_ROWS.min(height - row);
+        if let Some(sync) = src_sync {
+            let ts = kernel_hal::timer::timer_now();
+            sync_src_band(sync, src_stride, row, width, band_h);
+            sync_elapsed += kernel_hal::timer::timer_now().saturating_sub(ts);
+        }
         let src_off = (row as usize) * src_stride;
         if src_off >= pixels.len() {
             break;
@@ -950,43 +999,12 @@ fn blit_chunked(
         }
         row += band_h;
     }
+    sync_elapsed
 }
 
-/// FromDevice clflush of the CPU-mapped GEM span covering a scanout
-/// rectangle (including pitch padding between the first and last pixel).
-/// Needed only when the CPU will *read* the buffer (CPU blit / CE staging
-/// repack).
-fn dma_sync_scanout_src_from_device(
-    vaddr: usize,
-    fb_size: usize,
-    src_stride: usize,
-    blit_x: u32,
-    blit_y: u32,
-    blit_w: u32,
-    blit_h: u32,
-) {
-    let sync_start_px = (blit_y as usize)
-        .saturating_mul(src_stride)
-        .saturating_add(blit_x as usize);
-    let sync_end_px = (blit_y as usize)
-        .saturating_add((blit_h as usize).saturating_sub(1))
-        .saturating_mul(src_stride)
-        .saturating_add(blit_x as usize)
-        .saturating_add(blit_w as usize);
-    if sync_end_px <= sync_start_px {
-        return;
-    }
-    let byte_off = sync_start_px.saturating_mul(4).min(fb_size);
-    let byte_len = sync_end_px
-        .saturating_sub(sync_start_px)
-        .saturating_mul(4)
-        .min(fb_size.saturating_sub(byte_off));
-    zcore_drivers::utils::dma_sync::dma_sync_wb_from_device(vaddr + byte_off, byte_len);
-}
-
-/// FromDevice clflush of one rectangle, row by row, so a 64×64 cursor does not
+/// FromDevice clflush of one rectangle, row by row, so a cursor strip does not
 /// clflush a megabyte of pitch padding. Used after CE-direct present so
-/// [`blit_cursor_patch`] can read GPU pixels from sysmem without a full-frame
+/// [`blit_cursor_strip`] can read GPU pixels from sysmem without a full-frame
 /// sync.
 #[allow(clippy::too_many_arguments)]
 fn dma_sync_gem_rect_from_device(
@@ -1092,6 +1110,19 @@ pub fn scanout(fb_id: u32) -> bool {
     let mut sync_elapsed = Duration::ZERO;
     let mut cpu_src_synced = false;
     let gem_cpu_mapped = zcore_drivers::scheme::gem_mmap::lookup(fb.gem_handle_id).is_some();
+    // GPU-written nouveau GEM: CE must NOT snoop the kernel WB alias (stale
+    // lines from cursor blend / a previous CPU blit would ghost). CPU-written
+    // dumb buffers keep a coherent source so dirty cache lines are visible
+    // without a ToDevice clflush.
+    let src_coherent = !gem_cpu_mapped;
+    let gem_sync = gem_cpu_mapped.then_some(GemSrcSync {
+        vaddr,
+        fb_size: fb.size,
+        fb_w: fb_width,
+        fb_h: fb_height,
+        origin_x: blit_x,
+        origin_y: blit_y,
+    });
 
     // CE-offloaded present: copy the frame (sysmem) into the scanout FB (the
     // console GPU's VRAM) with a GPU copy engine instead of CPU stores over
@@ -1109,18 +1140,16 @@ pub fn scanout(fb_id: u32) -> bool {
     // default present is still the CPU blit (ce_present wedges itself off on
     // the first confirmed failure).
     //
-    // Cache sync vs. CE-direct: `dma_sync_wb_from_device` is a clflush of the
-    // whole GEM (~4.2 MB, milliseconds). That exists so a CPU *read* of the
-    // WB physmap alias sees GPU-rendered pixels (CPU blit / CE staging
-    // repack). CE-direct (`ce_present_2d_pitched` or flat `ce_present` from
-    // `fb.phys_addr`) DMAs from physical sysmem itself and does not consult
-    // the CPU cache, so the full FromDevice is wasted. NVK writes the GEM via
-    // the GPU, not CPU-mapped WB stores, so a ToDevice clflush is not needed
-    // either (that would be the same 4.2 MB cost). Skip both; if CE frames
-    // look stale, restore a sync here — the present klog's `sync Xus` is the
-    // tell (should be ~0 on CE-direct).
+    // Cache vs. CE-direct: the 2D CE historically used COHERENT_SYSMEM, so
+    // skipping FromDevice let the engine DMA stale WB lines (cursor-shaped
+    // ghosts, leftover previous frame — GPU-dependent). GPU-written GEMs now
+    // take a NONCOHERENT source (DRAM, GPU pixels) and skip the 4.2 MB
+    // clflush; CPU-written dumb buffers stay coherent. FromDevice is only
+    // paid when the CPU actually reads the GEM (repack / CPU blit), band by
+    // band so pitch padding is not flushed and the working set stays hot.
     let mut blitted_by_ce = false;
-    if CE_PRESENT_ENABLED.load(Ordering::Relaxed) {
+    let ce_enabled = CE_PRESENT_ENABLED.load(Ordering::Relaxed);
+    if ce_enabled {
         if fb.pitch != info.pitch {
             // Pitched 2D CE path: the GPU copy engine reads directly from the
             // source buffer at fb.pitch and writes into the scanout FB at
@@ -1128,26 +1157,30 @@ pub fn scanout(fb_id: u32) -> bool {
             // (client pitch 5504 → GOP scanout pitch 8192) this eliminates the
             // slow CPU reads from the uncached BAR1-backed source buffer.
             //
-            // Fallback chain: 2D fails (CE_PRESENT_WEDGED latched) →
-            // FromDevice + repack+flat CE → CPU blit.
+            // Fallback: 2D fail that latches CE_PRESENT_WEDGED must NOT then
+            // CPU-repack the full frame only for flat CE to decline (that was
+            // a double full-frame BAR1 read). Repack only if some GPU can
+            // still take a copy.
             let row_bytes = (blit_w as usize).saturating_mul(4) as u32;
             for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-                if d.ce_present_2d_pitched(fb.phys_addr, fb.pitch, info.pitch, row_bytes, blit_h) {
+                if d.ce_present_2d_pitched(
+                    fb.phys_addr,
+                    fb.pitch,
+                    info.pitch,
+                    row_bytes,
+                    blit_h,
+                    src_coherent,
+                ) {
                     blitted_by_ce = true;
                     break;
                 }
             }
-            // Fallback: CPU reads the GEM, so FromDevice first, then repack
-            // into staging at scanout pitch and flat CE.
-            if !blitted_by_ce {
-                if gem_cpu_mapped {
-                    let ts = kernel_hal::timer::timer_now();
-                    dma_sync_scanout_src_from_device(
-                        vaddr, fb.size, src_stride, blit_x, blit_y, blit_w, blit_h,
-                    );
-                    sync_elapsed = kernel_hal::timer::timer_now().saturating_sub(ts);
-                    cpu_src_synced = true;
-                }
+            if !blitted_by_ce
+                && kernel_hal::drivers::all_drm()
+                    .as_vec()
+                    .iter()
+                    .any(|d| d.ce_present_available())
+            {
                 let (ce_src_pa, ce_size) = ce_repack_to_staging(
                     pixels,
                     fb.phys_addr,
@@ -1155,11 +1188,15 @@ pub fn scanout(fb_id: u32) -> bool {
                     info.pitch as usize,
                     blit_w,
                     blit_h,
+                    gem_sync.as_ref(),
+                    &mut sync_elapsed,
                 )
                 .unwrap_or((0, 0));
+                cpu_src_synced = gem_cpu_mapped;
                 if ce_src_pa != 0 && ce_size != 0 {
                     for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-                        if d.ce_present(ce_src_pa, ce_size) {
+                        // Staging is CPU-written WB; CE must snoop it.
+                        if d.ce_present(ce_src_pa, ce_size, true) {
                             blitted_by_ce = true;
                             break;
                         }
@@ -1171,7 +1208,7 @@ pub fn scanout(fb_id: u32) -> bool {
             let ce_src_pa = fb.phys_addr;
             let ce_size = (info.pitch as u64) * (blit_h as u64);
             for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-                if d.ce_present(ce_src_pa, ce_size) {
+                if d.ce_present(ce_src_pa, ce_size, src_coherent) {
                     blitted_by_ce = true;
                     break;
                 }
@@ -1193,18 +1230,15 @@ pub fn scanout(fb_id: u32) -> bool {
         // stale lines from the previous frame stay resident and the screen
         // stops repainting. (MOVNTDQA does not lift this: non-temporal loads
         // only bypass the cache on WC memory, not on this WB alias.)
-        if gem_cpu_mapped && !cpu_src_synced {
-            let ts = kernel_hal::timer::timer_now();
-            dma_sync_scanout_src_from_device(
-                vaddr, fb.size, src_stride, blit_x, blit_y, blit_w, blit_h,
-            );
-            sync_elapsed = kernel_hal::timer::timer_now().saturating_sub(ts);
-            cpu_src_synced = true;
-        }
-        // Banded blit with IRQs briefly re-enabled between bands — see
-        // [`blit_chunked`]. Always the full frame.
+        // Banded with the blit: invalidate then copy 128 rows so we do not
+        // clflush 4 MB of pitch padding and then miss on every load.
         if src_off < pixels.len() {
-            blit_chunked(
+            let band_sync = if gem_cpu_mapped && !cpu_src_synced {
+                gem_sync.as_ref()
+            } else {
+                None
+            };
+            sync_elapsed += blit_chunked(
                 &display,
                 blit_x,
                 blit_y,
@@ -1212,50 +1246,46 @@ pub fn scanout(fb_id: u32) -> bool {
                 src_stride,
                 blit_w,
                 blit_h,
+                band_sync,
             );
+            if band_sync.is_some() {
+                cpu_src_synced = true;
+            }
         }
     }
     let t_blit = kernel_hal::timer::timer_now();
     // Composite the kernel cursor on top of the just-blitted frame, so a
     // page-flip never erases the pointer. Snapshot under the lock, then
-    // compose in cached sysmem and write-only blit to GOP — same pattern as
-    // [`repaint_for_cursor`] / [`blit_cursor_patch`]. Never RMW BAR1 here:
-    // `blit_argb_over` reads the slow PCIe framebuffer for alpha blend
-    // (~64×64 RMW every frame) and that hitch is what this avoids.
-    // Hardware cursor (`c.hw`) still skips software compositing entirely.
+    // compose in cached sysmem and write-only blit a *full-width* strip to
+    // GOP. Narrow 64×64 patches on WC BAR1 smeared neighboring pixels.
+    // Never RMW BAR1: `blit_argb_over` reads the slow PCIe framebuffer for
+    // alpha blend. Hardware cursor (`c.hw`) skips software compositing.
     let cursor = {
-        let mut state = DRM_STATE.lock();
+        let state = DRM_STATE.lock();
         let c = &state.cursor;
         // `!c.hw`: when the display-engine plane owns the pointer, the
         // hardware composites it over scanout -- blending it here too would
         // draw the cursor twice (and bake a stale copy into the frame).
-        let snap = if !c.hw && c.visible && c.w > 0 && c.h > 0 {
+        if !c.hw && c.visible && c.w > 0 && c.h > 0 {
             c.bitmap
                 .as_ref()
                 .filter(|b| !b.is_empty())
                 .map(|b| (c.x, c.y, c.w, c.h, Arc::clone(b)))
         } else {
             None
-        };
-        // A full scanout repaints the whole frame and composites the cursor at
-        // its current position, so that — not whatever the last partial move
-        // left — is now what's drawn. Keeping `drawn` in step here stops the
-        // next `repaint_for_cursor` from leaving a ghost of the pre-flip cursor.
-        state.cursor.drawn = snap.as_ref().map(|(x, y, w, h, _)| (*x, *y, *w, *h));
-        snap
+        }
     };
     if let Some((cx, cy, cw, ch, bmp)) = cursor {
-        // CE-direct skipped the full-frame FromDevice. Invalidate just the
-        // cursor window so the CPU blend sees GPU pixels; counted in cursor
-        // time, not `sync`, so the klog keeps showing ~0us sync on CE.
+        // CE-direct skipped the full-frame FromDevice (noncoherent source).
+        // Invalidate the full-width rows the strip will read so the CPU blend
+        // sees GPU pixels; counted in cursor time, not `sync`.
         if blitted_by_ce && !cpu_src_synced && gem_cpu_mapped {
             dma_sync_gem_rect_from_device(
-                vaddr, fb.size, src_stride, cx, cy, cw, ch, fb_width, fb_height,
+                vaddr, fb.size, src_stride, 0, cy, fb_width, ch, fb_width, fb_height,
             );
         }
-        blit_cursor_patch(
-            &*display, pixels, src_stride, fb_width, fb_height, cx, cy, cw, ch, cx, cy, cw, ch,
-            &bmp,
+        blit_cursor_strip(
+            &*display, pixels, src_stride, fb_width, fb_height, cx, cy, cw, ch, &bmp,
         );
     }
     let t_cursor = kernel_hal::timer::timer_now();
@@ -1287,8 +1317,8 @@ pub fn scanout(fb_id: u32) -> bool {
 /// `handle_id == 0` (or a zero-sized image) hides the cursor. Otherwise the
 /// client's cursor BO is a tightly-packed premultiplied-ARGB8888 dumb buffer of
 /// `w`x`h` pixels; copy it out so a later GEM_CLOSE / reuse can't tear the image
-/// mid-scanout. Returns true if the cursor state changed enough to warrant a
-/// repaint.
+/// mid-scanout. Returns true if the cursor state changed. The new image is
+/// composited on the next full [`scanout`], not via a dirty-rect patch.
 pub fn set_cursor_bo(handle_id: u32, w: u32, h: u32) -> bool {
     let mut state = DRM_STATE.lock();
     if handle_id == 0 || w == 0 || h == 0 {
@@ -1355,8 +1385,8 @@ pub fn set_cursor_bo(handle_id: u32, w: u32, h: u32) -> bool {
     // image to the driver's cursor plane. Done OUTSIDE the DRM lock -- the
     // upload goes through the RM gate and can take a few ms, and nothing in
     // the driver ever takes DRM_STATE. On success the hardware composites the
-    // pointer during scanout (scanout()/repaint_for_cursor stand down); on
-    // any failure the software path set up above simply stays in charge.
+    // pointer during scanout (`scanout()` stands down); on any failure the
+    // software path set up above simply stays in charge.
     if hw_cursor_wanted() {
         let (cx, cy, bmp) = (state.cursor.x, state.cursor.y, state.cursor.bitmap.clone());
         drop(state);
@@ -1371,13 +1401,7 @@ pub fn set_cursor_bo(handle_id: u32, w: u32, h: u32) -> bool {
                 }
             }
         }
-        let mut state = DRM_STATE.lock();
-        state.cursor.hw = hw_ok;
-        if hw_ok {
-            // Whatever the software compositor last drew is erased by the
-            // next full scanout (which no longer blends); nothing to restore.
-            state.cursor.drawn = None;
-        }
+        DRM_STATE.lock().cursor.hw = hw_ok;
     }
     true
 }
@@ -1418,223 +1442,60 @@ pub fn move_cursor(x: i32, y: i32) {
     }
 }
 
-/// Make a cursor set/move take effect immediately (the legacy cursor ioctls
-/// carry no page-flip of their own) WITHOUT re-blitting the whole frame.
-///
-/// The pointer moves far more often than the scene changes — wlroots issues a
-/// `DRM_MODE_CURSOR_MOVE` per input event — so a full `scanout()` per move was
-/// blitting ~16 MB every time the mouse twitched, which is precisely why the
-/// "software cursor" pegged the CPU on real hardware. Instead, restore just the
-/// rectangle the old cursor occupied from the CRTC framebuffer (the composited
-/// scene, which has no cursor baked in) and composite the new cursor on top.
-/// Only two ~64x64 windows are touched per move.
-pub fn repaint_for_cursor() {
-    if !software_kms_active() || SCANOUT_PAUSED.load(Ordering::SeqCst) {
-        return;
-    }
-    // Snapshot everything needed under the lock, and record the rect we are
-    // about to draw so the *next* move knows what to erase.
-    let (fb_id, old_rect, new) = {
-        let mut st = DRM_STATE.lock();
-        // While a text VT is foreground the compositor's pixels are suppressed;
-        // don't scribble a cursor over the console.
-        if st.graphics_vt != Some(kernel_hal::console::active_vt()) {
-            return;
-        }
-        // Display-engine plane owns the pointer: the hardware composites it
-        // during scanout and the move already went to the driver as one PIO
-        // write -- there is nothing to erase or blend here.
-        if st.cursor.hw {
-            return;
-        }
-        let fb_id = st.crtc_fb;
-        let old_rect = st.cursor.drawn;
-        let c = &st.cursor;
-        let new = if c.visible && c.w > 0 && c.h > 0 {
-            c.bitmap
-                .as_ref()
-                .filter(|b| !b.is_empty())
-                .map(|b| (c.x, c.y, c.w, c.h, Arc::clone(b)))
-        } else {
-            None
-        };
-        st.cursor.drawn = new.as_ref().map(|(x, y, w, h, _)| (*x, *y, *w, *h));
-        (fb_id, old_rect, new)
-    };
-    if fb_id == 0 {
-        return;
-    }
-    let fb = {
-        let state = DRM_STATE.lock();
-        match state.framebuffers.iter().find(|f| f.id == fb_id) {
-            Some(f) => *f,
-            None => return,
-        }
-    };
-    let display = match primary_display() {
-        Some(d) => d,
-        None => return,
-    };
-    if fb.phys_addr == 0 || fb.size == 0 {
-        return;
-    }
-    let info = display.info();
-    // Clip to what the framebuffer actually covers, not merely to the screen.
-    // A client fb narrower or shorter than the display would otherwise have
-    // the patch read past the end of a row -- i.e. the next row's pixels -- and
-    // paint that garbage onto the scanout.
-    let (fw, fh) = (info.width.min(fb.width), info.height.min(fb.height));
-    let vaddr = phys_to_virt(fb.phys_addr as usize);
-    // SAFETY: contiguous physical framebuffer of `fb.size` bytes, identity
-    // mapped at `vaddr`; read as `fb.size / 4` u32 pixels.
-    let pixels = unsafe { core::slice::from_raw_parts(vaddr as *const u32, fb.size / 4) };
-    let src_stride = (fb.pitch / 4) as usize;
-    // Every rectangle below is a CPU *read* of the compositor's scene through
-    // the WB physmap alias of the GEM. On the nouveau/NVK path the GPU writes
-    // that GEM, so the read needs the same FromDevice invalidate `scanout()`
-    // does before its CPU blit: without it the erase paints whichever lines
-    // the cache still holds and the pointer drags stale squares of an older
-    // frame across the screen. Row-by-row over one ~64x64 window, so this is
-    // not the full-frame clflush -- it is the cost `scanout()` already pays per
-    // present, restricted to the two windows a move touches.
-    let gem_cpu_mapped = zcore_drivers::scheme::gem_mmap::lookup(fb.gem_handle_id).is_some();
-    let sync_rect = |x: i32, y: i32, w: u32, h: u32| {
-        if gem_cpu_mapped {
-            dma_sync_gem_rect_from_device(vaddr, fb.size, src_stride, x, y, w, h, fw, fh);
-        }
-    };
-    // Compose in cached sysmem (the CRTC dumb buffer), then one write-only
-    // blit to GOP. Never read the display aperture: that RMW is why the
-    // pointer felt sticky compared to eclipse-old's sw_cursor (tiny dirty
-    // writes). When old and new rects overlap, one union blit covers erase
-    // + draw; otherwise restore then paint.
-    let old_expanded = old_rect.map(|(ox, oy, ow, oh)| (ox - 1, oy - 1, ow + 2, oh + 2));
-    match (old_expanded, new.as_ref()) {
-        (Some((ox, oy, ow, oh)), Some((nx, ny, nw, nh, bmp))) => {
-            let (ux, uy, uw, uh) = union_i32(ox, oy, ow, oh, *nx, *ny, *nw, *nh);
-            if rects_overlap(ox, oy, ow, oh, *nx, *ny, *nw, *nh) {
-                sync_rect(ux, uy, uw, uh);
-                blit_cursor_patch(
-                    &*display, pixels, src_stride, fw, fh, ux, uy, uw, uh, *nx, *ny, *nw, *nh, bmp,
-                );
-            } else {
-                sync_rect(ox, oy, ow, oh);
-                restore_rect(&*display, pixels, src_stride, fw, fh, ox, oy, ow, oh);
-                sync_rect(*nx, *ny, *nw, *nh);
-                blit_cursor_patch(
-                    &*display, pixels, src_stride, fw, fh, *nx, *ny, *nw, *nh, *nx, *ny, *nw, *nh,
-                    bmp,
-                );
-            }
-        }
-        (Some((ox, oy, ow, oh)), None) => {
-            sync_rect(ox, oy, ow, oh);
-            restore_rect(&*display, pixels, src_stride, fw, fh, ox, oy, ow, oh);
-        }
-        (None, Some((nx, ny, nw, nh, bmp))) => {
-            sync_rect(*nx, *ny, *nw, *nh);
-            blit_cursor_patch(
-                &*display, pixels, src_stride, fw, fh, *nx, *ny, *nw, *nh, *nx, *ny, *nw, *nh, bmp,
-            );
-        }
-        (None, None) => {}
-    }
-}
-
+/// Blend the software cursor into a full-width strip of the CRTC framebuffer
+/// and blit those rows once. Narrow 64×64 patches on the WC GOP/BAR1 scanout
+/// smeared neighboring pixels (squares and lines); a full-width strip matches
+/// the scanout's own row writes. Called only from [`scanout`] — MOVE stores
+/// x/y for the next full present instead of dirty-tracking the pointer.
 #[allow(clippy::too_many_arguments)]
-fn rects_overlap(ax: i32, ay: i32, aw: u32, ah: u32, bx: i32, by: i32, bw: u32, bh: u32) -> bool {
-    let ax1 = ax.saturating_add(aw as i32);
-    let ay1 = ay.saturating_add(ah as i32);
-    let bx1 = bx.saturating_add(bw as i32);
-    let by1 = by.saturating_add(bh as i32);
-    ax < bx1 && bx < ax1 && ay < by1 && by < ay1
-}
-
-#[allow(clippy::too_many_arguments)]
-fn union_i32(
-    ax: i32,
-    ay: i32,
-    aw: u32,
-    ah: u32,
-    bx: i32,
-    by: i32,
-    bw: u32,
-    bh: u32,
-) -> (i32, i32, u32, u32) {
-    let x0 = ax.min(bx);
-    let y0 = ay.min(by);
-    let x1 = ax
-        .saturating_add(aw as i32)
-        .max(bx.saturating_add(bw as i32));
-    let y1 = ay
-        .saturating_add(ah as i32)
-        .max(by.saturating_add(bh as i32));
-    (
-        x0,
-        y0,
-        x1.saturating_sub(x0).max(0) as u32,
-        y1.saturating_sub(y0).max(0) as u32,
-    )
-}
-
-/// Copy `patch` of the CRTC fb, blend the cursor into it in RAM, blit once.
-#[allow(clippy::too_many_arguments)]
-fn blit_cursor_patch(
+fn blit_cursor_strip(
     display: &dyn DisplayScheme,
     pixels: &[u32],
     src_stride: usize,
     fw: u32,
     fh: u32,
-    px: i32,
-    py: i32,
-    pw: u32,
-    ph: u32,
     cx: i32,
     cy: i32,
     cw: u32,
     ch: u32,
     bmp: &[u32],
 ) {
-    if src_stride == 0 || pw == 0 || ph == 0 {
+    if src_stride == 0 || fw == 0 || cw == 0 || ch == 0 {
         return;
     }
-    let x0 = px.max(0);
-    let y0 = py.max(0);
-    let x1 = (px + pw as i32).min(fw as i32);
-    let y1 = (py + ph as i32).min(fh as i32);
-    if x1 <= x0 || y1 <= y0 {
+    let y0 = cy.max(0);
+    let y1 = (cy + ch as i32).min(fh as i32);
+    if y1 <= y0 {
         return;
     }
-    let tw = (x1 - x0) as usize;
+    let tw = fw as usize;
     let th = (y1 - y0) as usize;
     let need = tw.saturating_mul(th);
-    let mut slot = CURSOR_PATCH.lock();
+    let mut slot = CURSOR_STRIP.lock();
     if slot.len() < need {
         slot.resize(need, 0);
     }
-    let patch = &mut slot[..need];
-    // Rows actually sourced from the framebuffer. CURSOR_PATCH is scratch
-    // REUSED across moves, so a row the source could not fill still holds the
-    // previous patch's pixels — blitting `th` rows unconditionally would paint
-    // that onto the screen as a stale square. Blit only what was filled.
+    let strip = &mut slot[..need];
+    // Scratch is reused across frames: blit only rows actually filled from
+    // the source, or a short GEM would replay a previous strip as a band.
     let mut rows = 0usize;
     for r in 0..th {
         let src_y = y0 as usize + r;
-        let src_off = src_y.saturating_mul(src_stride).saturating_add(x0 as usize);
+        let src_off = src_y.saturating_mul(src_stride);
         let dst_off = r * tw;
         let n = tw.min(pixels.len().saturating_sub(src_off));
         if n < tw {
             break;
         }
         rows = r + 1;
-        patch[dst_off..dst_off + n].copy_from_slice(&pixels[src_off..src_off + n]);
+        strip[dst_off..dst_off + n].copy_from_slice(&pixels[src_off..src_off + n]);
         let cr = (y0 + r as i32) - cy;
         if cr < 0 || cr >= ch as i32 {
             continue;
         }
         let bmp_row = cr as usize * cw as usize;
         for c in 0..n {
-            let cc = (x0 + c as i32) - cx;
+            let cc = c as i32 - cx;
             if cc < 0 || cc >= cw as i32 {
                 continue;
             }
@@ -1648,10 +1509,10 @@ fn blit_cursor_patch(
                 continue;
             }
             let di = dst_off + c;
-            patch[di] = if a == 0xff {
+            strip[di] = if a == 0xff {
                 s | 0xFF00_0000
             } else {
-                let d = patch[di];
+                let d = strip[di];
                 let inv = 255 - a;
                 let (sr, sg, sb) = ((s >> 16) & 0xff, (s >> 8) & 0xff, s & 0xff);
                 let (dr, dg, db) = ((d >> 16) & 0xff, (d >> 8) & 0xff, d & 0xff);
@@ -1665,41 +1526,7 @@ fn blit_cursor_patch(
     if rows == 0 {
         return;
     }
-    display.blit_from(x0 as u32, y0 as u32, patch, tw, tw as u32, rows as u32);
-}
-
-/// Restore the `(x, y, w, h)` window of the display from the CRTC framebuffer
-/// `pixels` (row-major, `src_stride` pixels/row), clipped to the visible
-/// `fw`x`fh` area. Used to erase the old cursor before drawing the new one.
-#[allow(clippy::too_many_arguments)]
-fn restore_rect(
-    display: &dyn DisplayScheme,
-    pixels: &[u32],
-    src_stride: usize,
-    fw: u32,
-    fh: u32,
-    x: i32,
-    y: i32,
-    w: u32,
-    h: u32,
-) {
-    if src_stride == 0 {
-        return;
-    }
-    let x0 = x.max(0);
-    let y0 = y.max(0);
-    let x1 = (x + w as i32).min(fw as i32);
-    let y1 = (y + h as i32).min(fh as i32);
-    if x1 <= x0 || y1 <= y0 {
-        return;
-    }
-    let cw = (x1 - x0) as u32;
-    let ch = (y1 - y0) as u32;
-    let off = y0 as usize * src_stride + x0 as usize;
-    if off >= pixels.len() {
-        return;
-    }
-    display.blit_from(x0 as u32, y0 as u32, &pixels[off..], src_stride, cw, ch);
+    display.blit_from(0, y0 as u32, strip, tw, tw as u32, rows as u32);
 }
 
 /// Page-flip to `fb_id` and queue a completion event for the card fd.

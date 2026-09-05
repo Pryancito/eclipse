@@ -311,19 +311,23 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
-    /// CE-offloaded present: copy the compositor's dumb buffer (contiguous
+    /// CE-offloaded present: copy the compositor's buffer (contiguous
     /// sysmem at `src_sysmem_pa`, `size` bytes) into this GPU's scanout
     /// framebuffer via the persistent CeUtils channel, replacing the CPU
-    /// `memcpy`-over-PCIe. Returns true if the CE copy was performed (console
-    /// GPU, state-loaded); false to fall back to the CPU blit. Default: false.
-    fn ce_present(&self, _src_sysmem_pa: u64, _size: u64) -> bool {
+    /// `memcpy`-over-PCIe. `src_coherent` is true when the CPU wrote the
+    /// source (dumb buffer / CE staging: CE snoops the cache). False when
+    /// the GPU wrote it (nouveau GEM: CE reads DRAM so stale WB lines from
+    /// cursor blend cannot ghost the frame). Returns true if the CE copy
+    /// was performed; false to fall back to the CPU blit. Default: false.
+    fn ce_present(&self, _src_sysmem_pa: u64, _size: u64, _src_coherent: bool) -> bool {
         false
     }
 
     /// Pitched 2D CE-offloaded present: copy `line_count` rows of `row_bytes`
     /// from `src_sysmem_pa + r * src_pitch` into the console GPU's scanout FB
     /// at `dst_pitch` stride, using a GPU copy engine over PCIe P2P — without
-    /// any CPU staging repack.  Returns true if the CE 2D copy was performed;
+    /// any CPU staging repack. `src_coherent` has the same meaning as in
+    /// [`Self::ce_present`]. Returns true if the CE 2D copy was performed;
     /// false to fall back to the repack+flat path.  Default: false.
     fn ce_present_2d_pitched(
         &self,
@@ -332,6 +336,7 @@ pub trait DrmScheme: Scheme {
         _dst_pitch: u32,
         _row_bytes: u32,
         _line_count: u32,
+        _src_coherent: bool,
     ) -> bool {
         false
     }
@@ -341,6 +346,15 @@ pub trait DrmScheme: Scheme {
     /// compute GPU (P2P into the console framebuffer). Used to auto-enable the
     /// CE present path when manual `nvidia.cepresent` is absent.
     fn ce_present_ready(&self) -> bool {
+        false
+    }
+
+    /// True when a CE present submit would actually run (state-loaded, boot FB
+    /// known, not latched off after a failure). Distinct from
+    /// [`Self::ce_present_ready`]: that is the boot-time "this GPU can be the
+    /// present engine" signal; this is the per-frame "do not pay a CPU repack
+    /// that the CE will immediately decline" check.
+    fn ce_present_available(&self) -> bool {
         false
     }
 
