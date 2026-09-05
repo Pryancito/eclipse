@@ -741,9 +741,14 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         .unwrap();
     }
 
-    /// OpenNTPD config + a wrapper that waits for DHCP then runs ntpd in the
-    /// foreground. apk `--no-scripts` never creates the `_ntp` user, so the
-    /// wrapper starts the daemon as root (`-u root`).
+    /// NTP config + a wrapper that waits for DHCP then runs an NTP client in
+    /// the foreground. busybox `ntpd` first: it needs no privilege-separation
+    /// user and no `chroot(2)` (this kernel has none). OpenNTPD is the
+    /// fallback, run with the only flags OpenNTPD 6 still accepts — the old
+    /// `ntpd -d -s -u root` line was a usage error (`-s` was removed in 6.0,
+    /// `-u` never existed), so the service died in ~10 ms and init respawned
+    /// it every 8 s forever, spamming the console. The `_ntp` account it
+    /// requires is created by `ensure_pulse_accounts`.
     fn write_ntp(rootfs: &Path) {
         let etc = rootfs.join("etc");
         let _ = fs::create_dir_all(&etc);
@@ -768,13 +773,13 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               \x20 sleep 2\n\
               \x20 i=$((i+1))\n\
               done\n\
-              if [ -x /usr/sbin/ntpd ]; then\n\
-              \x20 echo \"[eclipse-ntpd] openntpd as root\"\n\
-              \x20 exec /usr/sbin/ntpd -d -s -u root\n\
-              fi\n\
               if /bin/busybox --list 2>/dev/null | grep -qx ntpd; then\n\
               \x20 echo \"[eclipse-ntpd] busybox ntpd\"\n\
               \x20 exec /bin/busybox ntpd -n -N -p pool.ntp.org\n\
+              fi\n\
+              if [ -x /usr/sbin/ntpd ]; then\n\
+              \x20 echo \"[eclipse-ntpd] openntpd (foreground)\"\n\
+              \x20 exec /usr/sbin/ntpd -d\n\
               fi\n\
               echo \"eclipse-ntpd: no ntpd binary (apk add openntpd)\"\n\
               sleep 60\n\
@@ -2272,12 +2277,23 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let passwd = etc.join("passwd");
         match fs::read_to_string(&passwd) {
             Ok(existing) => {
-                if !existing.lines().any(|l| l.starts_with("pulse:")) {
-                    let mut updated = existing;
-                    if !updated.ends_with('\n') {
-                        updated.push('\n');
+                let mut updated = existing;
+                let mut changed = false;
+                for (prefix, line) in [
+                    ("pulse:", "pulse:x:51:51:PulseAudio:/var/run/pulse:/bin/false\n"),
+                    // OpenNTPD's privilege-separation user (apk --no-scripts
+                    // never runs the package's pre-install that creates it).
+                    ("_ntp:", "_ntp:x:123:123:OpenNTPD:/var/empty:/sbin/nologin\n"),
+                ] {
+                    if !updated.lines().any(|l| l.starts_with(prefix)) {
+                        if !updated.ends_with('\n') {
+                            updated.push('\n');
+                        }
+                        updated.push_str(line);
+                        changed = true;
                     }
-                    updated.push_str("pulse:x:51:51:PulseAudio:/var/run/pulse:/bin/false\n");
+                }
+                if changed {
                     fs::write(&passwd, updated).unwrap();
                 }
             }
@@ -2286,6 +2302,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                     &passwd,
                     "root:x:0:0:root:/root:/bin/sh\n\
                      pulse:x:51:51:PulseAudio:/var/run/pulse:/bin/false\n\
+                     _ntp:x:123:123:OpenNTPD:/var/empty:/sbin/nologin\n\
                      nobody:x:65534:65534:nobody:/:/bin/false\n",
                 )
                 .unwrap();
@@ -2296,6 +2313,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             ("pulse:", "pulse:x:51:\n"),
             ("pulse-access:", "pulse-access:x:52:root\n"),
             ("audio:", "audio:x:29:root,pulse\n"),
+            ("_ntp:", "_ntp:x:123:\n"),
         ];
         match fs::read_to_string(&group) {
             Ok(existing) => {
@@ -2321,6 +2339,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                      audio:x:29:root,pulse\n\
                      pulse:x:51:\n\
                      pulse-access:x:52:root\n\
+                     _ntp:x:123:\n\
                      nobody:x:65534:\n",
                 )
                 .unwrap();
@@ -2329,6 +2348,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let home = rootfs.join("var/run/pulse");
         let _ = fs::create_dir_all(&home);
         let _ = fs::create_dir_all(rootfs.join("var/lib/pulse"));
+        // OpenNTPD's chroot directory (must exist, empty, root-owned).
+        let _ = fs::create_dir_all(rootfs.join("var/empty"));
     }
 
     /// Cross-compile wavplay (`tools/wavplay`, Rust) as a static musl binary
