@@ -67,7 +67,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | ioctl | Estado | Notas |
 |---|---|---|
 | `DRM_IOCTL_MODE_CREATE_DUMB` | ✅ | memoria física contigua vía VMO; *pitch* alineado a 64 B |
-| `DRM_IOCTL_MODE_MAP_DUMB` | ✅ | *offset* = `handle << 12`; `mmap` mapea el VMO físico |
+| `DRM_IOCTL_MODE_MAP_DUMB` | ✅ | *offset* = `handle << 12`; `mmap` mapea el VMO físico **cacheable** (WB). Antes se mapeaba *uncached* mientras el *present* del kernel leía los mismos frames por su alias cacheable: en hardware real la caché del kernel retenía líneas del frame anterior y la pantalla mostraba el frame viejo con tiras de 1 fila × 16 px del nuevo (el "ruido visual" en NVIDIA al abrir menús o mover ventanas, invisible en `grim` y en QEMU). Un único tipo de memoria para ambos alias los hace coherentes; las importaciones PRIME de GEM nouveau (posible VRAM/BAR1) siguen *uncached* |
 | `DRM_IOCTL_MODE_DESTROY_DUMB` | ✅ | |
 | `DRM_IOCTL_GEM_CLOSE` | ✅ | |
 | `DRM_IOCTL_PRIME_HANDLE_TO_FD` / `FD_TO_HANDLE` | ✅ | dma-buf real (fd de proceso); despachado en la capa de syscalls porque necesita la tabla de fds |

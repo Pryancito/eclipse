@@ -106,12 +106,12 @@ impl DrmDev {
         // syscall, so the cookie must be page-aligned; recover the handle by
         // shifting it back down.
         let handle_id = (offset >> 12) as u32;
-        if let Some(handle) = drm::get_handle(handle_id) {
-            let len = len.min(handle.size);
-            Ok(VmObject::new_physical(
-                handle.phys_addr as usize,
-                pages(len),
-            ))
+        // Generic GEM (dumb buffer / PRIME import): `drm::mmap_vmo` maps
+        // DRAM-backed buffers CACHED so the compositor's writes and the
+        // kernel's present reads share one memory type (see its doc for the
+        // stale-cache-line "visual noise" this fixed on real hardware).
+        if let Some(vmo) = drm::mmap_vmo(handle_id, len) {
+            Ok(vmo)
         } else if let Some((phys_addr, size)) = zcore_drivers::scheme::gem_mmap::lookup(handle_id) {
             // Driver-private GEM object (currently: nouveau-uAPI GEM_NEW) --
             // same fake-offset space, different table (see

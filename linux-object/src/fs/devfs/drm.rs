@@ -18,7 +18,7 @@ use kernel_hal::drivers;
 use kernel_hal::mem::phys_to_virt;
 pub use zcore_drivers::scheme::drm::{DrmCaps, DrmConnector, DrmCrtc, DrmPlane, GemHandle};
 use zcore_drivers::scheme::{DisplayScheme, DrmScheme};
-use zircon_object::vm::{pages, MMUFlags, VmObject};
+use zircon_object::vm::{pages, CachePolicy, MMUFlags, VmObject};
 
 /// Synthetic KMS object IDs used when there is no real DRM/KMS driver — only a
 /// dumb framebuffer (`DisplayScheme`, e.g. the UEFI GOP display on bare metal).
@@ -603,6 +603,52 @@ pub fn get_handle(handle_id: u32) -> Option<GemHandle> {
         .map(|(h, _, _)| *h)
 }
 
+/// The `VmObject` a userspace `mmap` of generic GEM `handle_id` (a
+/// `CREATE_DUMB` buffer, or a PRIME import into this table) should map, or
+/// `None` if the handle is not in the generic table. `len` is clamped to the
+/// buffer size.
+///
+/// Physical VMOs default to `Uncached`, so the compositor used to render into
+/// a dumb buffer through a UC/WC mapping while the kernel present read the
+/// SAME frames through its cacheable physmap alias (`scanout`,
+/// `blit_cursor_strip`, the CE repack) -- two aliases with different memory
+/// types. The kernel's cache kept lines of the PREVIOUS frame across
+/// presents, so the screen showed the old frame with only the lines that
+/// happened to be evicted refreshed: 1-row, 16-pixel (one cache line)
+/// slivers of the new content scattered over the previous image -- the
+/// "visual noise" on real NVIDIA hardware whenever a window, menu or the
+/// launcher changed (invisible in `grim`, which reads the compositor's own
+/// buffer, and invisible in QEMU, which does not model cache attributes).
+/// Dumb buffers are ordinary contiguous DRAM, so map them CACHED: one memory
+/// type for both aliases makes them coherent by construction (the CE-present
+/// source is already snooped), and the compositor's pixman read-modify-write
+/// blends stop paying uncached loads.
+///
+/// PRIME imports of driver-private GEMs (a nouveau `GEM_NEW` object, which
+/// can live in VRAM behind BAR1) reach this table with an `Uncached` backing
+/// VMO, and keep it: caching a BAR window is wrong, and the GPU-written path
+/// already invalidates the kernel alias before reading.
+pub fn mmap_vmo(handle_id: u32, len: usize) -> Option<Arc<VmObject>> {
+    let (handle, backing_cached) = {
+        let state = DRM_STATE.lock();
+        let (h, vmo, _) = state.handles.iter().find(|(h, _, _)| h.id == handle_id)?;
+        (*h, vmo.cache_policy() == CachePolicy::Cached)
+    };
+    let len = len.min(handle.size);
+    let vmo = VmObject::new_physical(handle.phys_addr as usize, pages(len));
+    if backing_cached {
+        // Before the first mapping: `set_cache_policy` refuses once mapped.
+        if let Err(e) = vmo.set_cache_policy(CachePolicy::Cached) {
+            warn!(
+                "[drm] mmap of GEM {} (phys={:#x}): cannot mark cacheable ({:?}); \
+                 mapping uncached -- expect stale-line noise on real hardware",
+                handle_id, handle.phys_addr, e
+            );
+        }
+    }
+    Some(vmo)
+}
+
 /// Look up a framebuffer object by id (`DRM_IOCTL_MODE_GETFB`/`GETFB2`).
 pub fn get_fb(fb_id: u32) -> Option<DrmFramebuffer> {
     DRM_STATE
@@ -1113,7 +1159,9 @@ pub fn scanout(fb_id: u32) -> bool {
     // GPU-written nouveau GEM: CE must NOT snoop the kernel WB alias (stale
     // lines from cursor blend / a previous CPU blit would ghost). CPU-written
     // dumb buffers keep a coherent source so dirty cache lines are visible
-    // without a ToDevice clflush.
+    // without a ToDevice clflush -- and, since `mmap_vmo` maps them CACHED
+    // for userspace, the CPU blit below reads the same cache lines the
+    // compositor wrote (no stale previous-frame lines, no FromDevice needed).
     let src_coherent = !gem_cpu_mapped;
     let gem_sync = gem_cpu_mapped.then_some(GemSrcSync {
         vaddr,
@@ -1364,14 +1412,15 @@ pub fn set_cursor_bo(handle_id: u32, w: u32, h: u32) -> bool {
         return true;
     }
     let vaddr = phys_to_virt(phys_addr as usize);
-    // The image was written by someone else — the GPU into a nouveau GEM on
-    // the `renderer=gl:nvidia` path, or userspace through a write-combining
-    // mapping of a dumb buffer — and we are about to read it through the
+    // The image may have been written by the GPU into a nouveau GEM on the
+    // `renderer=gl:nvidia` path, and we are about to read it through the
     // kernel's cached WB alias. Without a FromDevice invalidate the snapshot
     // below can be lines of a PREVIOUS cursor image, and since it is cached in
     // `state.cursor.bitmap` the garbled pointer then persists until the next
-    // CURSOR_BO. One clflush of at most 64x64x4 bytes, on image change only —
-    // never on a move.
+    // CURSOR_BO. (A dumb-buffer cursor BO is CPU-written through a cached
+    // mapping since `mmap_vmo`, so it is coherent with this alias; the flush
+    // is then a harmless no-op.) One clflush of at most 64x64x4 bytes, on
+    // image change only — never on a move.
     zcore_drivers::utils::dma_sync::dma_sync_wb_from_device(vaddr, px * 4);
     // SAFETY: contiguous physical buffer of `size` bytes, identity-mapped at
     // `vaddr`; we read exactly `px` u32 pixels (<= size/4).
