@@ -9024,7 +9024,7 @@ impl NvidiaGpu {
                 let get =
                     unsafe { core::ptr::read_volatile(f.userd_gpget as *const u32) } % entries;
                 let used = (put + entries - get) % entries;
-                if used + needed <= entries - 1 {
+                if used + needed < entries {
                     let mut slot = put;
                     for p in pushes {
                         let gp = (f.gpfifo_va + slot as usize * 8) as *mut u32;
@@ -9086,7 +9086,7 @@ impl NvidiaGpu {
                 let put = unsafe { core::ptr::read_volatile(gpput as *const u32) } % entries;
                 let get = unsafe { core::ptr::read_volatile(gpget as *const u32) } % entries;
                 let used = (put + entries - get) % entries;
-                if used + needed <= entries - 1 {
+                if used + needed < entries {
                     break;
                 }
                 if unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(start)
@@ -9152,7 +9152,7 @@ impl NvidiaGpu {
                     );
                 }
                 static CLIENT_FAST_OK: AtomicU32 = AtomicU32::new(0);
-                if ctx_idx >= 1 && ctx_idx < 32 {
+                if (1..32).contains(&ctx_idx) {
                     let bit = 1u32 << ctx_idx;
                     if CLIENT_FAST_OK.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
                         crate::klog_info!(

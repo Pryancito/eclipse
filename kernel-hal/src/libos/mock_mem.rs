@@ -75,12 +75,23 @@ impl MockMemory {
     }
 
     pub fn mprotect(&self, vaddr: VirtAddr, len: usize, prot: MMUFlags) {
-        unsafe { mman::mprotect(vaddr as _, len, prot.into()) }.unwrap_or_else(|err| {
-            panic!(
+        match unsafe { mman::mprotect(vaddr as _, len, prot.into()) } {
+            Ok(()) => {}
+            // ENOMEM: part of the range is not mapped in the host process. A
+            // VMAR mapping populates lazily (pages appear on first fault), so
+            // `protect()` on a slice nobody touched yet reaches here with
+            // nothing to protect -- on a real page table that is a no-op over
+            // absent PTEs, so it is one here too.
+            Err(nix::errno::Errno::ENOMEM) => trace!(
+                "mprotect: vaddr={:#x} len={:#x} not mapped yet, nothing to protect",
+                vaddr,
+                len
+            ),
+            Err(err) => panic!(
                 "failed to mprotect: vaddr={:#x}, prot={:?}: {:?}",
                 vaddr, prot, err
-            )
-        });
+            ),
+        }
     }
 
     pub fn phys_to_virt(&self, paddr: PhysAddr) -> VirtAddr {

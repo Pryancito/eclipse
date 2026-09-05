@@ -488,7 +488,7 @@ pub const GRAPHICS_VT: usize = NUM_VTS - 1;
 pub fn num_vts() -> usize {
     #[cfg(feature = "graphic")]
     {
-        return GRAPHIC_VTS.try_get().map(|v| v.len()).unwrap_or(1);
+        GRAPHIC_VTS.try_get().map(|v| v.len()).unwrap_or(1)
     }
     #[cfg(not(feature = "graphic"))]
     {
@@ -500,7 +500,7 @@ pub fn num_vts() -> usize {
 pub fn active_vt() -> usize {
     #[cfg(feature = "graphic")]
     {
-        return ACTIVE_VT.load(Ordering::SeqCst);
+        ACTIVE_VT.load(Ordering::SeqCst)
     }
     #[cfg(not(feature = "graphic"))]
     {

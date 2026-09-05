@@ -501,7 +501,11 @@ mod tests {
         // killed but not terminated, since `CurrentThread` not dropped.
         assert!(!root_job.signal().contains(Signal::JOB_TERMINATED));
         assert!(job.signal().contains(Signal::JOB_TERMINATED)); // but the lonely job is terminated
-        assert!(!proc.signal().contains(Signal::PROCESS_TERMINATED));
+        // Linux wait semantics (see `Process::exit`): PROCESS_TERMINATED is
+        // signalled the moment the exit status is published, so a parent's
+        // wait4 wakes on a zombie instead of on its last dying thread. The
+        // thread itself is still only Dying here.
+        assert!(proc.signal().contains(Signal::PROCESS_TERMINATED));
         assert!(!thread.signal().contains(Signal::THREAD_TERMINATED));
 
         // wait for killing...

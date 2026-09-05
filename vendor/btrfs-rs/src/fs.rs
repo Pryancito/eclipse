@@ -718,6 +718,9 @@ impl Btrfs {
             Some(i) => i,
             None => {
                 // Distinguish "no such entry" from "not a directory".
+                // Tree has no Drop impl; this just ends its borrow of `self`
+                // before the &mut self call below.
+                #[allow(clippy::drop_non_drop)]
                 drop(t);
                 let inode = self.read_inode(dir)?;
                 if inode.kind() != FileKind::Dir {
@@ -1456,7 +1459,7 @@ impl Btrfs {
         write_end: u64,
     ) -> Result<u64> {
         let sector = self.vol.sectorsize as u64;
-        let mut target = (end + sector - 1) / sector * sector;
+        let mut target = end.div_ceil(sector) * sector;
         // Current coverage: end of the last extent.
         let mut covered = 0u64;
         let mut inline = None;
@@ -1508,7 +1511,7 @@ impl Btrfs {
             // Inline → regular conversion must not lose data on ENOSPC:
             // reserve the whole replacement up front, and only then drop the
             // inline item.
-            target = target.max((inline_len as u64 + sector - 1) / sector * sector);
+            target = target.max((inline_len as u64).div_ceil(sector) * sector);
             let _ = self.ensure_data_space(target);
             let mut reserved: Vec<(u64, u64)> = Vec::new();
             let mut got_total = 0u64;
@@ -1584,7 +1587,7 @@ impl Btrfs {
         let prealloc = covered.min(MAX_PREALLOC);
         let alloc_target = {
             let want = covered.saturating_add((target - covered).max(prealloc));
-            ((want + sector - 1) / sector * sector).max(target)
+            (want.div_ceil(sector) * sector).max(target)
         };
         let _ = self.ensure_data_space(alloc_target.saturating_sub(covered));
         let mut pos = covered;
@@ -1777,8 +1780,8 @@ impl Btrfs {
             if self.vol.sb.incompat_flags() & INCOMPAT_NO_HOLES == 0 {
                 self.set_nodatasum(ino, &mut inode)?;
                 let sector = self.vol.sectorsize as u64;
-                let start = (inode.size + sector - 1) / sector * sector;
-                let end = (new_size + sector - 1) / sector * sector;
+                let start = inode.size.div_ceil(sector) * sector;
+                let end = new_size.div_ceil(sector) * sector;
                 if end > start {
                     let mut hole = [0u8; FILE_EXTENT_REG_LEN];
                     hole.copy_from_slice(&FileExtent::encode_regular(
@@ -1795,7 +1798,7 @@ impl Btrfs {
         } else {
             self.set_nodatasum(ino, &mut inode)?;
             let sector = self.vol.sectorsize as u64;
-            let keep = (new_size + sector - 1) / sector * sector;
+            let keep = new_size.div_ceil(sector) * sector;
             let extents = self.extents_in_range(ino, 0, u64::MAX)?;
             for (file_off, ext, _) in extents {
                 match ext {
@@ -1928,6 +1931,9 @@ impl Btrfs {
                     &tail,
                 )?;
             }
+            // Tree has no Drop impl; this just ends its borrow of `self`
+            // before the &mut self call below.
+            #[allow(clippy::drop_non_drop)]
             drop(t);
             self.apply_pending()?;
         }

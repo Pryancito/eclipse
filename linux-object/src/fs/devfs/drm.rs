@@ -1254,19 +1254,7 @@ pub fn scanout(fb_id: u32) -> bool {
             );
         }
         blit_cursor_patch(
-            &*display,
-            pixels,
-            src_stride,
-            info.width,
-            info.height,
-            cx,
-            cy,
-            cw,
-            ch,
-            cx,
-            cy,
-            cw,
-            ch,
+            &*display, pixels, src_stride, fb_width, fb_height, cx, cy, cw, ch, cx, cy, cw, ch,
             &bmp,
         );
     }
@@ -1346,6 +1334,15 @@ pub fn set_cursor_bo(handle_id: u32, w: u32, h: u32) -> bool {
         return true;
     }
     let vaddr = phys_to_virt(phys_addr as usize);
+    // The image was written by someone else — the GPU into a nouveau GEM on
+    // the `renderer=gl:nvidia` path, or userspace through a write-combining
+    // mapping of a dumb buffer — and we are about to read it through the
+    // kernel's cached WB alias. Without a FromDevice invalidate the snapshot
+    // below can be lines of a PREVIOUS cursor image, and since it is cached in
+    // `state.cursor.bitmap` the garbled pointer then persists until the next
+    // CURSOR_BO. One clflush of at most 64x64x4 bytes, on image change only —
+    // never on a move.
+    zcore_drivers::utils::dma_sync::dma_sync_wb_from_device(vaddr, px * 4);
     // SAFETY: contiguous physical buffer of `size` bytes, identity-mapped at
     // `vaddr`; we read exactly `px` u32 pixels (<= size/4).
     let src = unsafe { core::slice::from_raw_parts(vaddr as *const u32, px) };
@@ -1482,12 +1479,30 @@ pub fn repaint_for_cursor() {
         return;
     }
     let info = display.info();
-    let (fw, fh) = (info.width, info.height);
+    // Clip to what the framebuffer actually covers, not merely to the screen.
+    // A client fb narrower or shorter than the display would otherwise have
+    // the patch read past the end of a row -- i.e. the next row's pixels -- and
+    // paint that garbage onto the scanout.
+    let (fw, fh) = (info.width.min(fb.width), info.height.min(fb.height));
     let vaddr = phys_to_virt(fb.phys_addr as usize);
     // SAFETY: contiguous physical framebuffer of `fb.size` bytes, identity
     // mapped at `vaddr`; read as `fb.size / 4` u32 pixels.
     let pixels = unsafe { core::slice::from_raw_parts(vaddr as *const u32, fb.size / 4) };
     let src_stride = (fb.pitch / 4) as usize;
+    // Every rectangle below is a CPU *read* of the compositor's scene through
+    // the WB physmap alias of the GEM. On the nouveau/NVK path the GPU writes
+    // that GEM, so the read needs the same FromDevice invalidate `scanout()`
+    // does before its CPU blit: without it the erase paints whichever lines
+    // the cache still holds and the pointer drags stale squares of an older
+    // frame across the screen. Row-by-row over one ~64x64 window, so this is
+    // not the full-frame clflush -- it is the cost `scanout()` already pays per
+    // present, restricted to the two windows a move touches.
+    let gem_cpu_mapped = zcore_drivers::scheme::gem_mmap::lookup(fb.gem_handle_id).is_some();
+    let sync_rect = |x: i32, y: i32, w: u32, h: u32| {
+        if gem_cpu_mapped {
+            dma_sync_gem_rect_from_device(vaddr, fb.size, src_stride, x, y, w, h, fw, fh);
+        }
+    };
     // Compose in cached sysmem (the CRTC dumb buffer), then one write-only
     // blit to GOP. Never read the display aperture: that RMW is why the
     // pointer felt sticky compared to eclipse-old's sw_cursor (tiny dirty
@@ -1498,11 +1513,14 @@ pub fn repaint_for_cursor() {
         (Some((ox, oy, ow, oh)), Some((nx, ny, nw, nh, bmp))) => {
             let (ux, uy, uw, uh) = union_i32(ox, oy, ow, oh, *nx, *ny, *nw, *nh);
             if rects_overlap(ox, oy, ow, oh, *nx, *ny, *nw, *nh) {
+                sync_rect(ux, uy, uw, uh);
                 blit_cursor_patch(
                     &*display, pixels, src_stride, fw, fh, ux, uy, uw, uh, *nx, *ny, *nw, *nh, bmp,
                 );
             } else {
+                sync_rect(ox, oy, ow, oh);
                 restore_rect(&*display, pixels, src_stride, fw, fh, ox, oy, ow, oh);
+                sync_rect(*nx, *ny, *nw, *nh);
                 blit_cursor_patch(
                     &*display, pixels, src_stride, fw, fh, *nx, *ny, *nw, *nh, *nx, *ny, *nw, *nh,
                     bmp,
@@ -1510,9 +1528,11 @@ pub fn repaint_for_cursor() {
             }
         }
         (Some((ox, oy, ow, oh)), None) => {
+            sync_rect(ox, oy, ow, oh);
             restore_rect(&*display, pixels, src_stride, fw, fh, ox, oy, ow, oh);
         }
         (None, Some((nx, ny, nw, nh, bmp))) => {
+            sync_rect(*nx, *ny, *nw, *nh);
             blit_cursor_patch(
                 &*display, pixels, src_stride, fw, fh, *nx, *ny, *nw, *nh, *nx, *ny, *nw, *nh, bmp,
             );
@@ -1593,14 +1613,20 @@ fn blit_cursor_patch(
         slot.resize(need, 0);
     }
     let patch = &mut slot[..need];
+    // Rows actually sourced from the framebuffer. CURSOR_PATCH is scratch
+    // REUSED across moves, so a row the source could not fill still holds the
+    // previous patch's pixels — blitting `th` rows unconditionally would paint
+    // that onto the screen as a stale square. Blit only what was filled.
+    let mut rows = 0usize;
     for r in 0..th {
         let src_y = y0 as usize + r;
         let src_off = src_y.saturating_mul(src_stride).saturating_add(x0 as usize);
         let dst_off = r * tw;
         let n = tw.min(pixels.len().saturating_sub(src_off));
-        if n == 0 {
+        if n < tw {
             break;
         }
+        rows = r + 1;
         patch[dst_off..dst_off + n].copy_from_slice(&pixels[src_off..src_off + n]);
         let cr = (y0 + r as i32) - cy;
         if cr < 0 || cr >= ch as i32 {
@@ -1636,7 +1662,10 @@ fn blit_cursor_patch(
             };
         }
     }
-    display.blit_from(x0 as u32, y0 as u32, patch, tw, tw as u32, th as u32);
+    if rows == 0 {
+        return;
+    }
+    display.blit_from(x0 as u32, y0 as u32, patch, tw, tw as u32, rows as u32);
 }
 
 /// Restore the `(x, y, w, h)` window of the display from the CRTC framebuffer

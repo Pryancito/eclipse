@@ -1165,7 +1165,9 @@ fn push_route_dump_entry(
 /// socket, and treats ANY `NLMSG_ERROR` it finds as a failure — it never
 /// inspects `error`, so a success ACK is indistinguishable from a real one:
 ///
-///     if (h->nlmsg_type == NLMSG_ERROR) { errno = -err->error; return -1; }
+/// ```c
+/// if (h->nlmsg_type == NLMSG_ERROR) { errno = -err->error; return -1; }
+/// ```
 ///
 /// Its flush messages carry NLM_F_REQUEST only, so on Linux nothing comes back,
 /// the peek returns EAGAIN, and the flush succeeds. Here every one of them got
