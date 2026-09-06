@@ -6,9 +6,9 @@
 //! [`DisplayScheme::blit_from`] followed by a single
 //! [`DisplayScheme::flush`].
 //!
-//! This is the **only** scene dirty-rect tracker in Eclipse OS. KMS/DIRTYFB
-//! and the Wayland clients present full buffers: partial clips on the WC
-//! scanout smeared squares and lines into neighboring pixels.
+//! Console dirty-rects live here (cached RAM → GOP). KMS `DIRTYFB` also
+//! honours clip rects, but expands them to 64-byte write-combining lines
+//! so a partial BAR1 store cannot smear neighbouring pixels.
 //!
 //! This avoids the two patterns that make a naive framebuffer console crawl on
 //! real hardware:

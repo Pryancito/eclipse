@@ -991,11 +991,33 @@ pub fn scanout(fb_id: u32) -> bool {
     scanout_region(fb_id, None)
 }
 
-/// Like [`scanout`]. `rect` is ignored: partial DIRTYFB / damage blits on the
-/// WC scanout left squares and lines, so KMS present is always a full frame.
-/// The only remaining dirty-rect tracker is the console shadow framebuffer.
+/// Write-combining GOP/BAR1 combines stores into 64-byte PCIe bursts (16 XRGB
+/// pixels). A blit whose left/right edge sits mid-line flushes a stale combine
+/// buffer into neighbouring pixels — leftover squares and stripes. Expand `x`/`w`
+/// to those 16-pixel boundaries; `limit` is the largest X that is safe to write
+/// (visible width, or the pitch in pixels so the right-edge tail can land in
+/// off-screen padding).
+fn expand_x_for_wc(x: u32, w: u32, limit: u32) -> (u32, u32) {
+    const WC_PX: u32 = 16;
+    if w == 0 || limit == 0 {
+        return (x.min(limit), 0);
+    }
+    let x0 = x - (x % WC_PX);
+    let x1 = x.saturating_add(w).min(limit);
+    let x1 = ((x1.saturating_add(WC_PX - 1) / WC_PX) * WC_PX).min(limit);
+    (x0, x1.saturating_sub(x0))
+}
+
+/// Like [`scanout`], but when `rect` (`x, y, width, height`, in the
+/// framebuffer's own coordinates) is given, blits only that region instead of
+/// the whole frame.
+///
+/// `DRM_IOCTL_MODE_DIRTYFB` uses this so the GOP keeps pixels the client did
+/// not repaint — a software-KMS swapchain often has only the damage boxes
+/// drawn, and copying the rest smears stale tiles onto the screen. `None`
+/// (page-flip / modeset) always repaints everything, as does an out-of-range
+/// or degenerate `rect`. Horizontal edges are expanded to 64-byte WC lines.
 pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
-    let _ = rect;
     let fb = {
         let state = DRM_STATE.lock();
         match state.framebuffers.iter().find(|f| f.id == fb_id) {
@@ -1046,7 +1068,23 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     let src_stride = (fb.pitch / 4) as usize;
     let fb_width = fb.width.min(info.width);
     let fb_height = fb.height.min(info.height);
-    let (blit_x, blit_y, blit_w, blit_h) = (0, 0, fb_width, fb_height);
+    // Pitch in pixels is the WC-safe right limit: writing the padding after
+    // `fb_width` is off-screen but completes the last combine buffer.
+    let pitch_px = src_stride.min((info.pitch() / 4) as usize) as u32;
+    let (blit_x, blit_y, blit_w, blit_h) = match rect {
+        Some((x, y, w, h)) => {
+            let x = x.min(fb_width);
+            let y = y.min(fb_height);
+            let w = w.min(fb_width.saturating_sub(x));
+            let h = h.min(fb_height.saturating_sub(y));
+            let (x, w) = expand_x_for_wc(x, w, pitch_px);
+            (x, y, w, h)
+        }
+        None => {
+            let (x, w) = expand_x_for_wc(0, fb_width, pitch_px);
+            (x, 0, w, fb_height)
+        }
+    };
     if blit_w == 0 || blit_h == 0 {
         return true;
     }
@@ -1167,7 +1205,7 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
             cpu_src_synced = true;
         }
         // Banded blit with IRQs briefly re-enabled between bands — see
-        // [`blit_chunked`]. Always the full frame (see [`scanout_region`]).
+        // [`blit_chunked`]. Honours a DIRTYFB damage rect when present.
         if src_off < pixels.len() {
             blit_chunked(
                 &display,
@@ -1549,14 +1587,21 @@ fn blit_cursor_patch(
     if src_stride == 0 || pw == 0 || ph == 0 {
         return;
     }
-    let x0 = px.max(0);
+    let pitch_px = (src_stride as u32).min(display.info().pitch() / 4).max(fw);
+    let x0 = px.max(0) as u32;
     let y0 = py.max(0);
-    let x1 = (px + pw as i32).min(fw as i32);
+    let x1 = (px + pw as i32).max(0) as u32;
     let y1 = (py + ph as i32).min(fh as i32);
-    if x1 <= x0 || y1 <= y0 {
+    let width = x1.saturating_sub(x0);
+    if y1 <= y0 || width == 0 {
         return;
     }
-    let tw = (x1 - x0) as usize;
+    let (x0, tw_u) = expand_x_for_wc(x0, width, pitch_px);
+    if tw_u == 0 {
+        return;
+    }
+    let x0 = x0 as i32;
+    let tw = tw_u as usize;
     let th = (y1 - y0) as usize;
     let need = tw.saturating_mul(th);
     let mut slot = CURSOR_PATCH.lock();
@@ -1628,14 +1673,23 @@ fn restore_rect(
     if src_stride == 0 {
         return;
     }
-    let x0 = x.max(0);
+    let pitch_px = (src_stride as u32).min(display.info().pitch() / 4).max(fw);
     let y0 = y.max(0);
-    let x1 = (x + w as i32).min(fw as i32);
     let y1 = (y + h as i32).min(fh as i32);
-    if x1 <= x0 || y1 <= y0 {
+    if y1 <= y0 {
         return;
     }
-    let cw = (x1 - x0) as u32;
+    let x0 = x.max(0) as u32;
+    let x1 = (x + w as i32).max(0) as u32;
+    let width = x1.saturating_sub(x0);
+    if width == 0 {
+        return;
+    }
+    let (x0u, cw) = expand_x_for_wc(x0, width, pitch_px);
+    if cw == 0 {
+        return;
+    }
+    let x0 = x0u as i32;
     let ch = (y1 - y0) as u32;
     let off = y0 as usize * src_stride + x0 as usize;
     if off >= pixels.len() {
@@ -1973,8 +2027,11 @@ pub fn present_now(fb_id: u32, crtc_id: u32) -> bool {
     present_now_region(fb_id, crtc_id, None)
 }
 
-/// Like [`present_now`]. `rect` is accepted for ABI compatibility with
-/// DIRTYFB callers and then ignored — see [`scanout_region`].
+/// Like [`present_now`], but `rect` (`x, y, width, height`) restricts the
+/// software-KMS blit to that region instead of the whole frame — see
+/// [`scanout_region`]. `DRM_IOCTL_MODE_DIRTYFB`'s clip rects flow through
+/// here. Ignored on the hardware-KMS path: a real driver's `page_flip` scans
+/// out via its own GPU DMA, not the CPU blit this exists to shrink.
 pub fn present_now_region(fb_id: u32, crtc_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     // Deferred console GSP bring-up: acknowledge the flip to keep the
     // compositor alive, but do not touch the GOP framebuffer / CE path.
