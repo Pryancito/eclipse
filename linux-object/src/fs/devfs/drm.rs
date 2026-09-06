@@ -1151,35 +1151,14 @@ pub fn scanout(fb_id: u32) -> bool {
     let ce_enabled = CE_PRESENT_ENABLED.load(Ordering::Relaxed);
     if ce_enabled {
         if fb.pitch != info.pitch {
-            // Pitched 2D CE path: the GPU copy engine reads directly from the
-            // source buffer at fb.pitch and writes into the scanout FB at
-            // info.pitch — no CPU staging repack.  On the common dual-RTX case
-            // (client pitch 5504 → GOP scanout pitch 8192) this eliminates the
-            // slow CPU reads from the uncached BAR1-backed source buffer.
-            //
-            // Fallback: 2D fail that latches CE_PRESENT_WEDGED must NOT then
-            // CPU-repack the full frame only for flat CE to decline (that was
-            // a double full-frame BAR1 read). Repack only if some GPU can
-            // still take a copy.
-            let row_bytes = (blit_w as usize).saturating_mul(4) as u32;
-            for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-                if d.ce_present_2d_pitched(
-                    fb.phys_addr,
-                    fb.pitch,
-                    info.pitch,
-                    row_bytes,
-                    blit_h,
-                    src_coherent,
-                ) {
-                    blitted_by_ce = true;
-                    break;
-                }
-            }
-            if !blitted_by_ce
-                && kernel_hal::drivers::all_drm()
-                    .as_vec()
-                    .iter()
-                    .any(|d| d.ce_present_available())
+            // Pitched source/scanout copies on dual NVIDIA setups have shown
+            // transient visual corruption (stripes/blocks) despite clean
+            // compositor screenshots. Repack into a linear staging buffer at
+            // the scanout pitch, then issue a flat CE copy as the stable path.
+            if kernel_hal::drivers::all_drm()
+                .as_vec()
+                .iter()
+                .any(|d| d.ce_present_available())
             {
                 let (ce_src_pa, ce_size) = ce_repack_to_staging(
                     pixels,
