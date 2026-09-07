@@ -40,13 +40,19 @@ const HEALTHY_UPTIME: Duration = Duration::from_secs(2);
 const MIN_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
 
-/// Set by the SIGTERM/SIGUSR2 handlers: bring the system down (halt/power off).
+/// Set by the SIGUSR1/SIGUSR2 handlers: bring the system down (halt/power off).
 static WANT_HALT: AtomicBool = AtomicBool::new(false);
-/// Set by the SIGINT handler (Ctrl-Alt-Del is delivered to PID 1 as SIGINT).
+/// Set by the SIGTERM/SIGINT handlers: reboot. busybox `reboot` (without
+/// `-f`) signals PID 1 with SIGTERM; Ctrl-Alt-Del is delivered as SIGINT.
 static WANT_REBOOT: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_sigterm(_sig: libc::c_int) {
-    WANT_HALT.store(true, Ordering::SeqCst);
+    // busybox `reboot` (without -f) signals PID 1 with SIGTERM — see halt.c:
+    // halt/poweroff/reboot → SIGUSR1/SIGUSR2/SIGTERM. This used to request a
+    // HALT, so `/bin/reboot`, `busybox reboot` or any script using the
+    // absolute path powered the machine off instead of rebooting (only the
+    // `/usr/local/bin/reboot` wrapper, which execs `reboot -f`, escaped it).
+    WANT_REBOOT.store(true, Ordering::SeqCst);
 }
 extern "C" fn on_sigint(_sig: libc::c_int) {
     WANT_REBOOT.store(true, Ordering::SeqCst);
@@ -215,8 +221,11 @@ fn main() {
 
     log("starting");
 
-    mount_pseudo_filesystems();
+    // Handlers first: `mount_pseudo_filesystems` wipes /run and /tmp and can
+    // take a while, and a SIGTERM/SIGINT/SIGUSRx arriving before the handlers
+    // exist hits SIG_DFL, which this kernel implements as terminate.
     install_signal_handlers();
+    mount_pseudo_filesystems();
 
     // Align /proc/kbd, /etc/eclipse/keyboard and labwc's XKB_DEFAULT_LAYOUT
     // before the compositor starts, so the first keymap matches the console.
@@ -647,7 +656,12 @@ fn overlay_tz(env: &mut Vec<CString>) {
         let s = e.to_str().unwrap_or("");
         !s.starts_with("TZ=")
     });
-    env.push(CString::new(format!("TZ={}", resolved_tz())).unwrap());
+    // `resolved_tz` comes from /etc/eclipse/timezone or the cmdline; a NUL
+    // byte in it (a zero-filled tail after an unclean power cut) must not
+    // abort PID 1 on the first spawn — just leave TZ unset.
+    if let Ok(tz) = CString::new(format!("TZ={}", resolved_tz())) {
+        env.push(tz);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,10 +1240,12 @@ fn push_sdl_render_env(env: &mut Vec<CString>, mode: SdlRender) {
 
 fn spawn(argv: &[String], log_path: Option<&str>) -> Option<i32> {
     let prog = CString::new(argv[0].as_str()).ok()?;
+    // Same treatment as argv[0]: an interior NUL in an `exec =` argument
+    // (corrupted .service file) fails this spawn instead of aborting init.
     let c_args: Vec<CString> = argv
         .iter()
-        .map(|a| CString::new(a.as_str()).unwrap())
-        .collect();
+        .map(|a| CString::new(a.as_str()).ok())
+        .collect::<Option<Vec<_>>>()?;
     let mut p_args: Vec<*const libc::c_char> = c_args.iter().map(|a| a.as_ptr()).collect();
     p_args.push(core::ptr::null());
 
@@ -1252,6 +1268,11 @@ fn spawn(argv: &[String], log_path: Option<&str>) -> Option<i32> {
             libc::signal(libc::SIGINT, libc::SIG_DFL);
             libc::signal(libc::SIGUSR1, libc::SIG_DFL);
             libc::signal(libc::SIGUSR2, libc::SIG_DFL);
+            // The Rust runtime sets SIGPIPE to SIG_IGN before `main`, and an
+            // ignored disposition survives execve: without this every
+            // supervised daemon and `eclipse-*` wrapper script ran with
+            // SIGPIPE ignored (pipelines got EPIPE instead of terminating).
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
             libc::setsid();
             // Detach from the console: stdin → /dev/null; stdout/stderr →
             // optional log file or /dev/null so service chatter never hits
@@ -1387,9 +1408,15 @@ fn supervise(services: &mut BTreeMap<String, Service>) {
         // Restart pass: any respawn service now without a live pid is restarted
         // through the normal launcher so crash-restarts re-apply wait_socket /
         // wait_path gates exactly like the first boot start.
-        for svc in services.values_mut() {
-            if svc.kind == Kind::Respawn && svc.pid.is_none() {
-                start_service(svc);
+        // Walk in dependency order (`after =`), not BTreeMap alphabetical
+        // order: "labwc" < "seatd", so a crash of both restarted labwc first,
+        // which then parked ~10 s on the seatd socket gate (or launched
+        // against a dead seatd and crashed again) before seatd was retried.
+        for name in ordered_names(&services) {
+            if let Some(svc) = services.get_mut(&name) {
+                if svc.kind == Kind::Respawn && svc.pid.is_none() {
+                    start_service(svc);
+                }
             }
         }
     }

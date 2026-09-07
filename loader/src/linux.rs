@@ -421,6 +421,19 @@ fn handle_signal(
             }
             _ => {}
         }
+        // Linux never applies a default terminate/core action to init: a
+        // signal PID 1 has no handler for is simply discarded. Here it killed
+        // the supervisor (`kill -HUP 1` from a root shell, or any signal that
+        // races init's handler installation at boot), leaving the system
+        // running with no PID 1 — no service restarts, no shutdown path.
+        if thread.proc().id() == linux_object::process::INIT_PID {
+            warn!(
+                "signal {:?} for init (pid 1) has no handler; discarded (Linux semantics)",
+                signal
+            );
+            thread.inner().lock_linux().handling_signal = None;
+            return ctx;
+        }
         let code = 128 + signal as i32;
         // Resolve addresses back to "<file>+<offset>" through the process's own
         // mappings. A bare `pc=0x499f8c` is unusable — the same number means a
