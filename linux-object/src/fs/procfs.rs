@@ -14,7 +14,7 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 52] = [
+const PROC_ROOT_STATIC: [&str; 53] = [
     "net",
     "oops",
     "memhogs",
@@ -65,6 +65,7 @@ const PROC_ROOT_STATIC: [&str; 52] = [
     "gpucefill",
     "gpucefillp2p",
     "gpuroles",
+    "usbhid",
     "bootprofile",
     "kbd",
 ];
@@ -451,6 +452,7 @@ impl INode for ProcRootINode {
             "gpucefill" => Ok(PROC_GPUCEFILL.clone()),
             "gpucefillp2p" => Ok(PROC_GPUCEFILLP2P.clone()),
             "gpuroles" => Ok(PROC_GPUROLES.clone()),
+            "usbhid" => Ok(PROC_USBHID.clone()),
             "gpudump" => Ok(PROC_GPUDUMP.clone()),
             "bootprofile" => Ok(PROC_BOOTPROFILE.clone()),
             "kbd" => Ok(PROC_KBD.clone()),
@@ -2490,6 +2492,29 @@ fn proc_gpuroles_content() -> String {
     s
 }
 
+/// `/proc/usbhid`: per-interface USB HID diagnostics — bInterfaceProtocol,
+/// subclass, VID:PID, the role we bound it as, and the bytes of the last
+/// report seen. On real hardware where no kernel log is reachable, this is how
+/// a "cursor drawn but frozen, keyboard fine" mouse is diagnosed: `cat` it from
+/// a text VT, move the mouse, `cat` it again. `reports=0` on the pointer means
+/// no reports arrive (endpoint/enumeration); a changing `last=[..]` whose bytes
+/// don't look like `[buttons, dx, dy, ...]` means a report-ID/non-boot layout.
+fn proc_usbhid_content() -> String {
+    let mut s = String::new();
+    let mut any = false;
+    for d in kernel_hal::drivers::all_input().as_vec().iter() {
+        let line = d.debug_report();
+        if !line.is_empty() {
+            any = true;
+            s.push_str(&line);
+        }
+    }
+    if !any {
+        s.push_str("[usbhid] no USB HID input devices reporting diagnostics\n");
+    }
+    s
+}
+
 fn proc_cpuinfo_content() -> String {
     let mut brand = kernel_hal::cpu::cpu_brand();
     if brand.is_empty() {
@@ -2878,6 +2903,12 @@ lazy_static! {
     static ref PROC_GPUROLES: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 107,
         generate: proc_gpuroles_content,
+    });
+    /// `/proc/usbhid` -- USB HID pointer/keyboard diagnostics (see
+    /// proc_usbhid_content). `cat` it from a text VT to debug a dead mouse.
+    static ref PROC_USBHID: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 142,
+        generate: proc_usbhid_content,
     });
     /// `/proc/gpudump` -- read-only discriminating HW dump, both GPUs (see
     /// proc_gpudump_content).
