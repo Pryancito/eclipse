@@ -24,12 +24,10 @@ pub struct Apic {
 }
 
 impl Apic {
-    /// Return enabled application processor APIC IDs from the ACPI MADT.
-    pub fn application_processor_ids(
-        acpi_rsdp: usize,
-        phys_to_virt: Phys2VirtFn,
-    ) -> alloc::vec::Vec<u32> {
-        ioapic::application_processor_ids(acpi_rsdp, phys_to_virt)
+    /// APIC id of the boot processor, as an MSI/IOAPIC physical destination
+    /// (8 bits: the legacy, non-remapped format can address no more).
+    pub fn bsp_apic_id() -> u8 {
+        lapic::LocalApic::bsp_id()
     }
 
     /// Construct a new `Apic`.
