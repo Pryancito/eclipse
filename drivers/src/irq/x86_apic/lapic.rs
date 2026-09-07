@@ -137,7 +137,7 @@ impl LocalApic {
     }
 
     pub fn id(&mut self) -> u32 {
-        Self::decode_id(self.inner.id())
+        unsafe { Self::decode_id(self.inner.id()) }
     }
 
     fn icr_dest(dest: u32) -> u32 {

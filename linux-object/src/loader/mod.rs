@@ -366,6 +366,7 @@ impl LinuxElfLoader {
                 stack_flags,
                 false,
                 false,
+                false,
             )?;
             let mut sp = stack_top;
             // The vDSO is a Linux ABI object. A FreeBSD binary gets a
@@ -516,6 +517,7 @@ impl LinuxElfLoader {
             stack_vmo.len(),
             MMUFlags::RXW,
             flags,
+            false,
             false,
             false,
         )?;

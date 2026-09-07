@@ -625,7 +625,6 @@ fn enumerate_aps(acpi_rsdp: usize) -> Option<Vec<u32>> {
     Some(ids)
 }
 
-
 pub(super) fn start() {
     start_application_processors();
 }

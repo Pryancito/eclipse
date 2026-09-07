@@ -32,17 +32,14 @@ hal_fn_def! {
         /// Current CPU ID.
         pub fn cpu_id() -> u8 { 0 }
 
-        /// Number of processors started by the kernel.
-        pub fn cpu_count() -> u32 { 1 }
+        /// Get the number of online CPU cores.
+        pub fn cpu_count() -> u8 { 1 }
 
         /// Current CPU frequency in MHz.
         pub fn cpu_frequency() -> u16 { 3000 }
 
         /// Get the CPU brand/model name.
         pub fn cpu_brand() -> String { String::new() }
-
-        /// Get the number of online CPU cores.
-        pub fn cpu_count() -> u8 { 1 }
 
         /// This CPU's temperature in milli-degrees Celsius, read from the digital
         /// thermal sensor, or `None` when the hardware doesn't expose it.

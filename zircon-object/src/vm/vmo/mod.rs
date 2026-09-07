@@ -359,6 +359,7 @@ impl VmObject {
             kind: account_new(VmoKind::PagedSource, pages * PAGE_SIZE),
             accounted_bytes: pages * PAGE_SIZE,
             share_on_fork: core::sync::atomic::AtomicBool::new(false),
+            unbounded: false,
             trait_: VMObjectPaged::new_with_source(pages, source),
             inner: Mutex::new(VmObjectInner::default()),
             base,
@@ -386,6 +387,7 @@ impl VmObject {
             kind: account_new(VmoKind::PagedSource, pages * PAGE_SIZE),
             accounted_bytes: pages * PAGE_SIZE,
             share_on_fork: core::sync::atomic::AtomicBool::new(false),
+            unbounded: false,
             trait_: VMObjectPaged::new_borrowing(pages, cache, base_offset),
             inner: Mutex::new(VmObjectInner::default()),
             base,
@@ -746,6 +748,7 @@ impl VmObject {
             kind: account_new(VmoKind::Paged, len),
             accounted_bytes: len,
             share_on_fork: core::sync::atomic::AtomicBool::new(false),
+            unbounded: false,
             trait_,
             inner: Mutex::new(VmObjectInner {
                 content_size: self.inner.lock().content_size,

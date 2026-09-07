@@ -302,6 +302,7 @@ pub fn map_into(vmar: &Arc<VmAddressRegion>, stack_bottom: VirtAddr) -> Option<V
         flags,
         false,
         true,
+        false,
     ) {
         Ok(addr) => {
             debug!("vdso: mapeada en {:#x}..{:#x}", addr, addr + vdso.len);

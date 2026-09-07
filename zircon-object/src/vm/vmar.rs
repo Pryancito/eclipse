@@ -452,6 +452,7 @@ impl VmAddressRegion {
             flags,
             overwrite,
             map_range,
+            allow_faults,
             0,
         )
     }
@@ -476,6 +477,7 @@ impl VmAddressRegion {
         flags: MMUFlags,
         overwrite: bool,
         map_range: bool,
+        allow_faults: bool,
         min_offset: usize,
     ) -> ZxResult<VirtAddr> {
         // `len == 0` must be rejected, not just for Linux/Zircon semantics: the

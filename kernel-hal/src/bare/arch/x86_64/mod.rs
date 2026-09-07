@@ -7,7 +7,6 @@ pub(crate) mod power;
 // `vm.rs` consults `pat::pat_wc_ready` when emitting WriteCombining PTEs.
 pub(crate) mod pat;
 mod smp;
-mod tlb;
 mod trap;
 
 pub mod config;
@@ -105,7 +104,6 @@ pub fn primary_init() {
     pat::enable_framebuffer_wc();
     // Before drivers init so the first scanout can use CLFLUSHOPT / MOVNTDQA.
     zcore_drivers::utils::dma_sync::probe_cpu_features();
-    tlb::init();
     drivers::init().unwrap();
     warn!("[boot] drivers init complete");
     unsafe {
@@ -145,7 +143,6 @@ pub fn secondary_init() {
     // redefined entry 7 to WC and retyped the framebuffer PTEs to use it)
     // before this AP touches any WC mapping.
     pat::init_this_cpu();
-    tlb::init();
     zcore_drivers::irq::x86::Apic::init_local_apic_ap();
     // Only now does this AP's own LAPIC agree with the BSP's about how APIC ids
     // are encoded: `init_local_apic_ap` is what switches it into x2APIC mode
