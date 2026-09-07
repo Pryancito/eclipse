@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 use core::fmt::{self, Write};
 #[cfg(not(feature = "colorless-log"))]
 use log::Level;
@@ -136,62 +135,17 @@ pub fn klog_emit(priority: u8, msg: &str) {
 }
 
 /// Initialize logging with the default max log level (WARN).
-=======
-use core::fmt;
-use log::{LevelFilter, Log, Metadata, Record};
-
-#[cfg(feature = "libos")]
-static FLUSH_EACH_RECORD: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// Initialize kernel logging independently of the user console.
->>>>>>> upstream/master
 pub fn init() {
-    #[cfg(feature = "libos")]
-    {
-        let _ = kernel_log_file();
-        FLUSH_EACH_RECORD.store(
-            std::env::var_os("ZCORE_LOG_FLUSH").is_some_and(|value| value == "1"),
-            core::sync::atomic::Ordering::Relaxed,
-        );
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            // A panic can originate while formatting a log record. Avoid
-            // deadlocking on the same mutex in that case.
-            use std::io::Write;
-            if let Ok(mut file) = kernel_log_file().try_lock() {
-                let _ = writeln!(file, "{info}");
-                let _ = file.flush();
-            }
-            previous(info);
-        }));
-    }
     static LOGGER: SimpleLogger = SimpleLogger;
     log::set_logger(&LOGGER).unwrap();
-<<<<<<< HEAD
     log::set_max_level(LevelFilter::Warn);
     // Register the ring-buffer accessors so linux-syscall can read them.
     kernel_hal::console::klog_register(klog_read_all, klog_size, klog_emit);
-=======
-    log::set_max_level(LevelFilter::Info);
->>>>>>> upstream/master
 }
 
+/// Reset max log level.
 pub fn set_max_level(level: &str) {
-    log::set_max_level(level.parse().unwrap_or(LevelFilter::Info));
-}
-
-#[cfg(feature = "libos")]
-fn kernel_log_file() -> &'static std::sync::Mutex<std::io::BufWriter<std::fs::File>> {
-    static FILE: std::sync::OnceLock<std::sync::Mutex<std::io::BufWriter<std::fs::File>>> =
-        std::sync::OnceLock::new();
-    FILE.get_or_init(|| {
-        let path = std::env::var_os("ZCORE_KERNEL_LOG").unwrap_or_else(|| "kernel.log".into());
-        std::sync::Mutex::new(std::io::BufWriter::with_capacity(
-            64 * 1024,
-            std::fs::File::create(path).expect("create kernel log"),
-        ))
-    })
+    log::set_max_level(level.parse().unwrap_or(LevelFilter::Warn));
 }
 
 /// Run `f` with ALL `log`-crate output suppressed (level = Off), restoring the
@@ -235,23 +189,13 @@ macro_rules! klog_err {
 
 #[inline]
 pub fn print(args: fmt::Arguments) {
-    #[cfg(feature = "libos")]
-    {
-        use std::io::Write;
-        let mut file = kernel_log_file().lock().unwrap();
-        let _ = file.write_fmt(args);
-        if FLUSH_EACH_RECORD.load(core::sync::atomic::Ordering::Relaxed) {
-            let _ = file.flush();
-        }
-    }
-    #[cfg(not(feature = "libos"))]
-    kernel_hal::console::debug_write_fmt(args);
+    kernel_hal::console::console_write_fmt(args);
 }
 
 #[allow(dead_code)]
 #[inline]
 pub fn debug_print(args: fmt::Arguments) {
-    print(args);
+    kernel_hal::console::debug_write_fmt(args);
 }
 
 #[macro_export]
@@ -263,7 +207,7 @@ macro_rules! print {
 
 #[macro_export]
 macro_rules! println {
-    () => ($crate::logging::print(core::format_args!("\n")));
+    () => ($crate::print!("\r\n"));
     ($($arg:tt)*) => {
         $crate::logging::print(core::format_args!($($arg)*));
         $crate::print!("\r\n");
@@ -279,25 +223,45 @@ macro_rules! debug_print {
 
 #[macro_export]
 macro_rules! debug_println {
-    () => ($crate::logging::print(core::format_args!("\n")));
+    () => ($crate::print!("\r\n"));
     ($($arg:tt)*) => {
         $crate::logging::debug_print(core::format_args!($($arg)*));
         $crate::debug_print!("\r\n");
     }
 }
 
+#[allow(dead_code)]
+#[repr(u8)]
+enum ColorCode {
+    Black = 30,
+    Red = 31,
+    Green = 32,
+    Yellow = 33,
+    Blue = 34,
+    Magenta = 35,
+    Cyan = 36,
+    White = 37,
+    BrightBlack = 90,
+    BrightRed = 91,
+    BrightGreen = 92,
+    BrightYellow = 93,
+    BrightBlue = 94,
+    BrightMagenta = 95,
+    BrightCyan = 96,
+    BrightWhite = 97,
+}
+
 struct SimpleLogger;
 
 impl Log for SimpleLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= log::max_level()
+    fn enabled(&self, _metadata: &Metadata) -> bool {
+        true
     }
 
     fn log(&self, record: &Record) {
         if !self.enabled(record.metadata()) {
             return;
         }
-<<<<<<< HEAD
         // After a heap/stack smash, a log Record's args can point at freed or
         // scribbled memory; formatting them is what re-faulted in a STORM right
         // here — a READ #PF inside `SimpleLogger::log` on a mangled arg pointer
@@ -351,19 +315,19 @@ impl Log for SimpleLogger {
             }
         };
         #[cfg(feature = "colorless-log")]
-=======
-        let micros = kernel_hal::timer::timer_now().as_micros();
->>>>>>> upstream/master
         print(format_args!(
-            "[{s:>3}.{us:06} {level:<5} cpu={cpu} {target}] {message}\n",
-            s = micros / 1_000_000,
-            us = micros % 1_000_000,
-            level = record.level(),
-            cpu = kernel_hal::cpu::cpu_id(),
-            target = record.target(),
-            message = record.args(),
+            "[{time} {level:<5} {cpu_id} {pid}:{tid} {target}] {}\n",
+            record.args()
         ));
-<<<<<<< HEAD
+        #[cfg(not(feature = "colorless-log"))]
+        print(format_args!(
+            "\u{1b}[{}m[{time} \u{1b}[{}m{level:<5}\u{1b}[m \u{1b}[{}m{cpu_id} {pid}:{tid} {target}]\u{1b}[m \u{1b}[{}m{}\u{1b}[m\n",
+            ColorCode::White as u8,
+            level_color as u8,
+            ColorCode::White as u8,
+            args_color as u8,
+            record.args(),
+        ));
 
         // Also write a plain-text copy into the ring buffer for dmesg.
         {
@@ -444,18 +408,8 @@ impl Log for SimpleLogger {
                     ));
                 }
             }
-=======
-        if record.level() == log::Level::Error {
-            self.flush();
->>>>>>> upstream/master
         }
     }
 
-    fn flush(&self) {
-        #[cfg(feature = "libos")]
-        {
-            use std::io::Write;
-            let _ = kernel_log_file().lock().unwrap().flush();
-        }
-    }
+    fn flush(&self) {}
 }

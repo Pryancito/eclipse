@@ -1,5 +1,4 @@
 mod drivers;
-<<<<<<< HEAD
 #[cfg(feature = "graphic")]
 mod early_fb_console;
 // `bare::timer::timer_tick` reaches `power::thermal_governor_tick` from outside
@@ -8,10 +7,7 @@ pub(crate) mod power;
 // `vm.rs` consults `pat::pat_wc_ready` when emitting WriteCombining PTEs.
 pub(crate) mod pat;
 mod smp;
-=======
-mod smp;
 mod tlb;
->>>>>>> upstream/master
 mod trap;
 
 pub mod config;
@@ -101,48 +97,7 @@ pub fn primary_init_early() {
     drivers::init_early().unwrap();
 }
 
-/// Install the same initial GDT on the BSP and every AP.
-///
-/// trapframe appends descriptors to the current GDT and shares its user segment
-/// selectors across CPUs. Firmware and AP trampoline GDTs have different sizes,
-/// so normalize them before trapframe computes those selectors.
-///
-/// # Safety
-///
-/// Must run after `KCONFIG` and the higher-half physical mapping are ready.
-pub unsafe fn prepare_trapframe() {
-    #[repr(C, packed)]
-    struct DescriptorTablePointer {
-        limit: u16,
-        base: u64,
-    }
-
-    // Set the accessed bits: this table is in read-only kernel memory.
-    static GDT: [u64; 3] = [0, 0x0020_9b00_0000_0000, 0x0000_9300_0000_0000];
-    let gdtr = DescriptorTablePointer {
-        limit: (core::mem::size_of_val(&GDT) - 1) as u16,
-        base: GDT.as_ptr() as u64,
-    };
-    unsafe {
-        core::arch::asm!(
-            "lgdt [{gdtr}]",
-            "push 8",
-            "lea rax, [rip + 2f]",
-            "push rax",
-            "retfq",
-            "2:",
-            "mov ax, 16",
-            "mov ds, ax",
-            "mov es, ax",
-            "mov ss, ax",
-            gdtr = in(reg) &gdtr,
-            out("rax") _,
-        );
-    }
-}
-
 pub fn primary_init() {
-<<<<<<< HEAD
     // Give this CPU a write-combining PAT entry and retype the framebuffer's
     // physmap PTEs to it BEFORE the display drivers come up, so the graphic
     // console never pushes a frame through uncached stores. See `pat.rs`.
@@ -150,27 +105,19 @@ pub fn primary_init() {
     pat::enable_framebuffer_wc();
     // Before drivers init so the first scanout can use CLFLUSHOPT / MOVNTDQA.
     zcore_drivers::utils::dma_sync::probe_cpu_features();
-    drivers::init().unwrap();
-    warn!("[boot] drivers init complete");
-=======
     tlb::init();
     drivers::init().unwrap();
-
->>>>>>> upstream/master
+    warn!("[boot] drivers init complete");
     unsafe {
         // enable global page
         Cr4::update(|f| f.insert(Cr4Flags::PAGE_GLOBAL));
     }
-<<<<<<< HEAD
     // Scale the BSP's P-state and pick its idle C-state before bringing up the
     // APs (each AP runs the same per-CPU setup from `secondary_init`). This is
     // what keeps the CPU from running hot at idle on real hardware.
     power::init();
     smp::start_application_processors();
     warn!("[boot] smp init complete");
-=======
-    smp::start();
->>>>>>> upstream/master
 }
 
 pub fn timer_init() {
@@ -178,7 +125,6 @@ pub fn timer_init() {
 }
 
 pub fn secondary_init() {
-<<<<<<< HEAD
     // Defense in depth: re-assert CR0.WP=1 on this AP. The trampoline already
     // sets it, but this invariant is load-bearing (a WP=0 AP silently writes
     // through read-only user/shared pages from kernel mode — e.g. a
@@ -199,6 +145,7 @@ pub fn secondary_init() {
     // redefined entry 7 to WC and retyped the framebuffer PTEs to use it)
     // before this AP touches any WC mapping.
     pat::init_this_cpu();
+    tlb::init();
     zcore_drivers::irq::x86::Apic::init_local_apic_ap();
     // Only now does this AP's own LAPIC agree with the BSP's about how APIC ids
     // are encoded: `init_local_apic_ap` is what switches it into x2APIC mode
@@ -226,9 +173,4 @@ pub fn ap_trampoline_logical_id() -> u8 {
 /// AP the instant it has latched its logical id out of the slot.
 pub fn ap_signal_slot_consumed() {
     smp::ap_signal_slot_consumed();
-=======
-    tlb::init();
-    zcore_drivers::irq::x86::Apic::init_local_apic_ap();
-    drivers::init_local_timer();
->>>>>>> upstream/master
 }

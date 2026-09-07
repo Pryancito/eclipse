@@ -10,7 +10,6 @@ use core::time::Duration;
 
 use lock::Mutex;
 
-<<<<<<< HEAD
 /// A pending timer event: its absolute deadline and the callback to run.
 ///
 /// Ordered so the [`BinaryHeap`] (a max-heap) yields the *earliest* deadline
@@ -114,9 +113,6 @@ const TICKLESS_IDLE: bool = false;
 /// serviced within this bound. Lowering it trades idle CPU for responsiveness.
 #[allow(dead_code)]
 const IDLE_TICK_CAP_NS: u64 = 50_000_000;
-=======
-pub(super) const TICKS_PER_SEC: u64 = 1_000;
->>>>>>> upstream/master
 
 lazy_static::lazy_static! {
     static ref NAIVE_TIMER: Mutex<TimerHeap> = Mutex::new(TimerHeap::default());

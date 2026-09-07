@@ -500,7 +500,6 @@ impl VmAddressRegion {
         }
         let mut guard = self.inner.lock();
         let inner = guard.as_mut().ok_or(ZxError::BAD_STATE)?;
-<<<<<<< HEAD
         // `determine_offset` refuses an explicit offset whose range is not FREE
         // (`test_map`) and reports INVALID_ARGS. That made `overwrite` dead code
         // for explicit placement: the range being occupied is precisely the case
@@ -526,16 +525,6 @@ impl VmAddressRegion {
                 offset
             }
             _ => self.determine_offset(inner, vmar_offset, len, PAGE_SIZE, min_offset)?,
-=======
-        let offset = if overwrite {
-            let offset = vmar_offset.ok_or(ZxError::INVALID_ARGS)?;
-            if !page_aligned(offset) || offset > self.size || len > self.size - offset {
-                return Err(ZxError::INVALID_ARGS);
-            }
-            offset
-        } else {
-            self.determine_offset(inner, vmar_offset, len, PAGE_SIZE)?
->>>>>>> upstream/master
         };
         let addr = self.addr + offset;
         let mut flags = flags;
@@ -551,7 +540,6 @@ impl VmAddressRegion {
                 return Err(ZxError::NO_MEMORY);
             }
         }
-<<<<<<< HEAD
         // Respect the caller's `map_range`. The historical upstream-zCore
         // workaround here (`map_range || vmo.name() != ""`) force-committed
         // every NAMED vmo at map time — and since every file-backed VMO is
@@ -562,8 +550,6 @@ impl VmAddressRegion {
         // eager mapping (kernel aspace loads via `map()`, the vDSO) already
         // pass `map_range = true` explicitly; faults on file pages resolve
         // through `FrameFiller::fill_page` exactly as the eager path did.
-=======
->>>>>>> upstream/master
         let mapping = VmMapping::new(
             addr,
             len,
@@ -1153,7 +1139,6 @@ impl VmAddressRegion {
         Err(PagingError::NoMemory)
     }
 
-<<<<<<< HEAD
     /// The mapping in THIS region that contains `vaddr`, in O(log n).
     ///
     /// Mappings are keyed by start address and never overlap, so the only
@@ -1207,7 +1192,8 @@ impl VmAddressRegion {
             .filter(|(_, m)| m.end_addr() > begin)
             .map(|(k, _)| *k)
             .collect()
-=======
+    }
+
     /// Get the requested flags of the mapping containing `vaddr`.
     ///
     /// Unlike `get_vaddr_flags`, this does not require a lazily committed page
@@ -1221,11 +1207,7 @@ impl VmAddressRegion {
         if let Some(child) = inner.children.iter().find(|child| child.contains(vaddr)) {
             return child.get_mapping_flags(vaddr);
         }
-        if let Some(mapping) = inner
-            .mappings
-            .iter()
-            .find(|mapping| mapping.contains(vaddr))
-        {
+        if let Some(mapping) = Self::mapping_containing(inner, vaddr) {
             let mapping_inner = mapping.inner.lock();
             let page = (vaddr - mapping_inner.addr) / PAGE_SIZE;
             return mapping_inner
@@ -1261,7 +1243,6 @@ impl VmAddressRegion {
             page = page.checked_add(PAGE_SIZE).ok_or(ZxError::NOT_FOUND)?;
         }
         Ok(())
->>>>>>> upstream/master
     }
 
     /// Determine final address with given input `offset` and `len`.
@@ -2450,7 +2431,6 @@ impl VmMapping {
         }
         let paddr = self.vmo.commit_page(vmo_offset / PAGE_SIZE, access_flags)?;
         // error!("paddr = {:x}", paddr);
-<<<<<<< HEAD
         {
             // RE-CHECK under the mapping lock that this mapping still covers
             // `vaddr`, and covers it at the same VMO offset, before installing
@@ -2501,12 +2481,6 @@ impl VmMapping {
         // 16 pages instead of per page. Best-effort: any error just stops it.
         if !access_flags.contains(MMUFlags::WRITE) {
             self.fault_around(vaddr);
-=======
-        let mut pg_table = self.page_table.lock();
-        let mut res = pg_table.map(Page::new_aligned(vaddr, BASE_PAGE_SIZE), paddr, flags);
-        if let Err(PagingError::AlreadyMapped) = res {
-            res = pg_table.update(vaddr, Some(paddr), Some(flags)).map(|_| ());
->>>>>>> upstream/master
         }
         Ok(())
     }
@@ -2892,18 +2866,12 @@ pub const KERNEL_ASPACE_BASE: u64 = 0x0000_0010_0000_0000;
 /// The size of kernel address space
 #[cfg(target_os = "none")]
 pub const KERNEL_ASPACE_SIZE: u64 = 0x0000_0080_0000_0000;
-<<<<<<< HEAD
 /// Hosted (libos) kernel aspace size.
 #[cfg(not(target_os = "none"))]
 pub const KERNEL_ASPACE_SIZE: u64 = 0x0000_0010_0000_0000;
-/// The base of user address space
-pub const USER_ASPACE_BASE: u64 = 0;
-// pub const USER_ASPACE_BASE: u64 = 0x0000_0000_0100_0000;
-=======
 /// The base of user address space. Keep low addresses unmapped so invalid
 /// userspace pointers cannot alias the first dynamically loaded image.
 pub const USER_ASPACE_BASE: u64 = 0x20_0000;
->>>>>>> upstream/master
 /// The size of user address space
 #[cfg(target_arch = "riscv64")]
 pub const USER_ASPACE_SIZE: u64 = (1u64 << 38) - USER_ASPACE_BASE;

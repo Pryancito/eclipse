@@ -2,18 +2,7 @@
 
 use crate::{MMUFlags, VirtAddr};
 use core::fmt;
-#[cfg(not(any(
-    target_arch = "x86_64",
-    target_arch = "aarch64",
-    target_arch = "riscv64"
-)))]
 use trapframe::UserContext as UserContextInner;
-#[cfg(any(
-    target_arch = "x86_64",
-    target_arch = "aarch64",
-    target_arch = "riscv64"
-))]
-use trapframe::UserContextWithExtensions as UserContextInner;
 
 pub use trapframe::GeneralRegs;
 
@@ -34,7 +23,6 @@ pub enum UserContextField {
     InstrPointer,
     StackPointer,
     ThreadPointer,
-    AbiRegister,
     ReturnValue,
 }
 
@@ -44,8 +32,6 @@ pub enum TrapReason {
     Syscall,
     Interrupt(usize),
     PageFault(VirtAddr, MMUFlags),
-    /// First use of floating-point or SIMD state by a user thread.
-    ExtendedState,
     UndefinedInstruction,
     SoftwareBreakpoint,
     HardwareBreakpoint,
@@ -136,17 +122,10 @@ impl TrapReason {
         }
     }
 
-    #[cfg(all(target_arch = "aarch64", feature = "libos"))]
-    pub fn from(_esr: usize) -> Self {
-        // Hosted AArch64 enters the kernel only through syscall_fn_entry.
-        // Reading ESR_EL1 from the host process would itself raise SIGILL.
-        Self::Syscall
-    }
-
-    #[cfg(all(target_arch = "aarch64", not(feature = "libos")))]
+    #[cfg(target_arch = "aarch64")]
     pub fn from(esr: usize) -> Self {
         // TODO: check if is right
-        use crate::{Info, Kind, Source, Syndrome};
+        use crate::{Fault, Info, Kind, Source, Syndrome};
         use cortex_a::registers::{ESR_EL1, FAR_EL1};
         use tock_registers::interfaces::Readable;
 
@@ -158,19 +137,15 @@ impl TrapReason {
         match info.kind {
             Kind::Synchronous => match Syndrome::from(esr) {
                 Syndrome::Breakpoint => Self::SoftwareBreakpoint,
-                Syndrome::SimdFp | Syndrome::TrappedFpu => Self::ExtendedState,
                 Syndrome::Svc(_) => Self::Syscall,
-                Syndrome::DataAbort { kind: _, level: _ } => {
-                    let access = if esr & (1 << 6) != 0 {
-                        MMUFlags::WRITE
-                    } else {
-                        MMUFlags::READ
-                    };
-                    Self::PageFault(FAR_EL1.get() as _, access | MMUFlags::USER)
-                }
-                Syndrome::InstructionAbort { kind: _, level: _ } => {
-                    Self::PageFault(FAR_EL1.get() as _, MMUFlags::EXECUTE | MMUFlags::USER)
-                }
+                Syndrome::DataAbort { kind: _, level: _ } => Self::PageFault(
+                    FAR_EL1.get() as _,
+                    MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER,
+                ),
+                Syndrome::InstructionAbort {
+                    kind: Fault::Permission,
+                    level: _,
+                } => Self::PageFault(FAR_EL1.get() as _, MMUFlags::EXECUTE | MMUFlags::USER),
                 Syndrome::PCAlignmentFault | Syndrome::SpAlignmentFault => Self::UnalignedAccess,
                 _ => Self::GernelFault(esr as usize),
             },
@@ -196,8 +171,9 @@ impl TrapReason {
 }
 
 /// User context saved on trap.
+#[repr(transparent)]
 #[derive(Clone, Copy)]
-pub struct UserContext(UserContextInner, bool);
+pub struct UserContext(UserContextInner);
 
 /// DEBUG: dirección donde el asm de trap guardó el último `GeneralRegs` (x86_64
 /// bare). Se compara con [`UserContext::dbg_ctx_addr`].
@@ -214,7 +190,7 @@ impl UserContext {
     /// Create an empty user context.
     pub fn new() -> Self {
         let context = UserContextInner::default();
-        Self(context, false)
+        Self(context)
     }
 
     /// Initialize the context for entry into userspace.
@@ -246,21 +222,9 @@ impl UserContext {
                 self.0.general.a0 = args[0];
                 self.0.general.a1 = args[1];
                 self.0.general.a2 = args[2];
-                // SUM = 1, FS = Dirty, VS = Off, SPIE = 1. Vector state is
-                // enabled explicitly only for user programs that require RVV.
+                // SUM = 1, FS = 0b11, SPIE = 1
                 self.0.sstatus = 1 << 18 | 0b11 << 13 | 1 << 5;
             }
-        }
-    }
-
-    /// Enable saving architecture-specific floating-point and vector state.
-    pub fn enable_extended_state(&mut self) {
-        self.1 = true;
-        #[cfg(target_arch = "riscv64")]
-        {
-            // VS = Initial. Hardware changes this to Dirty after vector use,
-            // and trapframe uses VS to decide whether vector state is saved.
-            self.0.sstatus |= 0b01 << 9;
         }
     }
 
@@ -281,37 +245,10 @@ impl UserContext {
 
     /// Switch to user mode.
     pub fn enter_uspace(&mut self) {
-        #[cfg(all(target_arch = "riscv64", not(feature = "libos")))]
-        if self.1 {
-            // trapframe restores FP/vector registers before writing the saved
-            // sstatus. The previous thread may have left FS or VS disabled,
-            // so enable the incoming extensions before executing that restore.
-            let extensions = self.0.sstatus & ((0b11 << 13) | (0b11 << 9));
-            unsafe {
-                core::arch::asm!("csrs sstatus, {extensions}", extensions = in(reg) extensions);
-            }
-        }
-        #[cfg(all(target_arch = "aarch64", not(feature = "libos")))]
-        unsafe {
-            let mut cpacr: usize;
-            core::arch::asm!("mrs {cpacr}, cpacr_el1", cpacr = out(reg) cpacr);
-            // FPEN=01 traps EL0 FP/SIMD access while leaving EL1 enabled.
-            // Once a thread has used FP/SIMD, FPEN=11 lets it run and the
-            // extended trap frame preserves its state across switches.
-            let fpen = if self.1 { 0b11 } else { 0b01 };
-            cpacr = (cpacr & !(0b11 << 20)) | (fpen << 20);
-            core::arch::asm!("msr cpacr_el1, {cpacr}", "isb", cpacr = in(reg) cpacr);
-        }
         cfg_if! {
             if #[cfg(feature = "libos")] {
-                if self.1 {
-                    self.0.run_fncall()
-                } else {
-                    let context: &mut trapframe::UserContext = &mut self.0;
-                    context.run_fncall()
-                }
+                self.0.run_fncall()
             } else {
-<<<<<<< HEAD
                 self.dbg_validate_user_ctx("before enter_uspace");
                 // [rbpfix] Break the physmap-rbp propagation loop. A user thread
                 // intermittently ends up with `rbp` = physmap base (bit 47 set,
@@ -448,14 +385,6 @@ impl UserContext {
                 (g.rsi, g.rdi, g.r8, g.r9, g.r10, g.r11)
             } else {
                 (0, 0, 0, 0, 0, 0)
-=======
-                if self.1 {
-                    self.0.run()
-                } else {
-                    let context: &mut trapframe::UserContext = &mut self.0;
-                    context.run()
-                }
->>>>>>> upstream/master
             }
         }
     }
@@ -487,16 +416,7 @@ impl UserContext {
             if #[cfg(target_arch = "x86_64")] {
                 self.0.trap_num
             } else if #[cfg(target_arch = "aarch64")] {
-                #[cfg(feature = "libos")]
-                {
-                    self.0.trap_num
-                }
-                #[cfg(not(feature = "libos"))]
-                {
-                    use cortex_a::registers::ESR_EL1;
-                    use tock_registers::interfaces::Readable;
-                    ESR_EL1.get() as usize
-                }
+                unimplemented!() // ESR_EL1
             } else if #[cfg(target_arch = "riscv64")] {
                 riscv::register::scause::read().bits()
             } else {
@@ -522,7 +442,6 @@ impl UserContext {
                     UserContextField::InstrPointer => &mut self.0.general.rip,
                     UserContextField::StackPointer => &mut self.0.general.rsp,
                     UserContextField::ThreadPointer => &mut self.0.general.fsbase,
-                    UserContextField::AbiRegister => &mut self.0.general.r15,
                     UserContextField::ReturnValue => &mut self.0.general.rax,
                 }
             } else if #[cfg(target_arch = "aarch64")] {
@@ -530,7 +449,6 @@ impl UserContext {
                     UserContextField::InstrPointer => &mut self.0.elr,
                     UserContextField::StackPointer => &mut self.0.sp,
                     UserContextField::ThreadPointer => &mut self.0.tpidr,
-                    UserContextField::AbiRegister => &mut self.0.general.x18,
                     UserContextField::ReturnValue => &mut self.0.general.x0,
                 }
             } else if #[cfg(target_arch = "riscv64")] {
@@ -538,7 +456,6 @@ impl UserContext {
                     UserContextField::InstrPointer => &mut self.0.sepc,
                     UserContextField::StackPointer => &mut self.0.general.sp,
                     UserContextField::ThreadPointer => &mut self.0.general.tp,
-                    UserContextField::AbiRegister => &mut self.0.general.gp,
                     UserContextField::ReturnValue => &mut self.0.general.a0,
                 }
             } else {
@@ -555,18 +472,6 @@ impl UserContext {
     /// Write a field of the context.
     pub fn set_field(&mut self, which: UserContextField, value: usize) {
         *self.field_ref(which) = value;
-    }
-
-    /// Returns the saved AArch64 process state register.
-    #[cfg(target_arch = "aarch64")]
-    pub fn status_register(&self) -> usize {
-        self.0.spsr
-    }
-
-    /// Updates the saved AArch64 process state register.
-    #[cfg(target_arch = "aarch64")]
-    pub fn set_status_register(&mut self, value: usize) {
-        self.0.spsr = value;
     }
 
     /// Advance the instruction pointer in trap handler on some architecture.

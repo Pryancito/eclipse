@@ -1116,7 +1116,6 @@ pub struct ThreadInfo {
     cpu_affinity_mask: [u64; 8],
 }
 
-<<<<<<< HEAD
 /// Number of threads currently inside the executor's `poll` — i.e. actually
 /// occupying a CPU right now. It is bracketed around [`ThreadSwitchFuture::poll`]
 /// (the single point every scheduled thread is polled through).
@@ -1159,7 +1158,6 @@ pub fn running_thread_count() -> usize {
     RUNNING_THREADS.load(Ordering::Relaxed)
 }
 
-=======
 /// Runtime accounting returned by the current `ZX_INFO_TASK_RUNTIME` topic.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -1187,7 +1185,6 @@ impl From<TaskRuntimeInfo> for TaskRuntimeInfoV1 {
     }
 }
 
->>>>>>> upstream/master
 struct ThreadSwitchFuture {
     thread: Arc<Thread>,
     // Plain spin mutex (NOT `lock::Mutex`): this guard is held across the inner

@@ -188,7 +188,6 @@ pub struct VmObject {
     /// re-account `VMO_BYTES`, so this stays exactly the value that was added.
     accounted_bytes: usize,
     resizable: bool,
-<<<<<<< HEAD
     /// `true` for objects with Linux `MAP_SHARED` semantics: `fork` must hand
     /// the child a mapping over the SAME object, never a copy. Set once when
     /// the mapping is established (anonymous MAP_SHARED, shared file mappings,
@@ -196,9 +195,7 @@ pub struct VmObject {
     /// a field of `inner` because `clone_map` reads it with no other reason to
     /// take the object lock.
     share_on_fork: core::sync::atomic::AtomicBool,
-=======
     unbounded: bool,
->>>>>>> upstream/master
     trait_: Arc<dyn VMObjectTrait>,
     inner: Mutex<VmObjectInner>,
 }

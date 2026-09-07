@@ -71,11 +71,8 @@ cfg_if! {
 }
 
 #[cfg(not(feature = "libos"))]
-<<<<<<< HEAD
-#[allow(dead_code)]
-=======
 #[cfg(feature = "link-user-img")]
->>>>>>> upstream/master
+#[allow(dead_code)]
 pub(crate) fn init_ram_disk() -> Option<&'static mut [u8]> {
     Some(unsafe {
         core::slice::from_raw_parts_mut(core::ptr::addr_of_mut!(USER_IMG.0).cast(), USER_IMG_LEN)

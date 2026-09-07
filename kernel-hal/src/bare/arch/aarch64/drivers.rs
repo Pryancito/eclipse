@@ -19,13 +19,8 @@ pub fn init_early() {
     );
     gic.irq_enable(30);
     gic.irq_enable(33);
-<<<<<<< HEAD
     gic.register_handler(33, Arc::new(handle_uart_irq)).ok();
-    gic.register_handler(30, Arc::new(set_next_trigger)).ok();
-=======
-    gic.register_handler(33, Box::new(handle_uart_irq)).ok();
-    gic.register_handler(30, Box::new(handle_timer_irq)).ok();
->>>>>>> upstream/master
+    gic.register_handler(30, Arc::new(handle_timer_irq)).ok();
     drivers::add_device(Device::Irq(Arc::new(gic)));
     drivers::add_device(Device::Uart(BufferedUart::new(uart)));
 }

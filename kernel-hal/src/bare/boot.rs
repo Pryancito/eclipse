@@ -22,15 +22,7 @@ hal_fn_impl! {
         }
 
         fn primary_init() {
-<<<<<<< HEAD
             crate::klog_info!("Eclipse: primary CPU {} init", crate::cpu::cpu_id());
-=======
-            info!("Primary CPU {} init...", crate::cpu::cpu_id());
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                super::arch::prepare_trapframe();
-            }
->>>>>>> upstream/master
             unsafe { trapframe::init() };
             crate::vm::pin_kernel_vmtoken();
             // Bind this CPU to its PercpuBlock (sets the GS fast-path on x86_64).
@@ -72,7 +64,6 @@ hal_fn_impl! {
         }
 
         fn secondary_init() {
-<<<<<<< HEAD
             #[cfg(target_arch = "x86_64")]
             {
                 let logical = super::arch::ap_trampoline_logical_id();
@@ -98,15 +89,6 @@ hal_fn_impl! {
                 trapframe::init();
             }
             super::percpu::register();
-=======
-            // info!("Secondary CPU {} init...", crate::cpu::cpu_id());
-            // we can't print anything here, see reason: zcore/main.rs::secondary_main()
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                super::arch::prepare_trapframe();
-            }
-            unsafe { trapframe::init() };
->>>>>>> upstream/master
             super::arch::secondary_init();
         }
     }
