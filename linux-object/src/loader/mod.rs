@@ -55,6 +55,16 @@ fn detect_abi(data: &[u8], _elf: &ElfFile) -> Abi {
 /// with the stack.  Linux uses a similar high-address default for the stack.
 const STACK_TOP: usize = USER_ASPACE_BASE as usize + USER_ASPACE_SIZE as usize;
 
+// The image sub-VMARs below are placed with `allocate(None, ..)`, i.e. at the
+// root VMAR's base, and PT_LOAD segments are then mapped at their `p_vaddr`
+// relative to that sub-VMAR. Non-PIE (ET_EXEC) binaries carry absolute vaddrs,
+// so this only works when the root VMAR starts at address 0. Fail the build,
+// not every process at runtime, if that constant ever moves again.
+const _: () = assert!(
+    USER_ASPACE_BASE == 0,
+    "USER_ASPACE_BASE must be 0: the ELF loader maps non-PIE images at their absolute vaddrs"
+);
+
 mod abi;
 
 /// Linux ELF Program Loader.

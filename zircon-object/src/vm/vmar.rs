@@ -2871,9 +2871,20 @@ pub const KERNEL_ASPACE_SIZE: u64 = 0x0000_0080_0000_0000;
 /// Hosted (libos) kernel aspace size.
 #[cfg(not(target_os = "none"))]
 pub const KERNEL_ASPACE_SIZE: u64 = 0x0000_0010_0000_0000;
-/// The base of user address space. Keep low addresses unmapped so invalid
-/// userspace pointers cannot alias the first dynamically loaded image.
-pub const USER_ASPACE_BASE: u64 = 0x20_0000;
+/// The base of user address space.
+///
+/// This MUST stay 0 (upstream moved it to 0x20_0000). The Linux ELF loader
+/// places a program's image sub-VMAR with `allocate(None, ..)`, which lands at
+/// the root VMAR's base, and then maps every PT_LOAD segment at its own
+/// `p_vaddr` relative to that sub-VMAR. A non-PIE (ET_EXEC) binary such as the
+/// static busybox carries absolute vaddrs (0x400000+), so a non-zero base
+/// shifts the whole image while the addresses baked into its code do not
+/// move: every shell died with a SIGSEGV on its first `.data`/`.bss` write
+/// (`page fault @ 0x7d0a00 ... pc=0x750c5d`). The null-page/low-address
+/// protection upstream wanted from a non-zero base is provided here by the
+/// loader's PIE guard sub-VMAR (`PIE_LOAD_BASE`) and by `mmap_min_addr`
+/// (`MMAP_MIN_ADDR` in linux-syscall) instead.
+pub const USER_ASPACE_BASE: u64 = 0;
 /// The size of user address space
 #[cfg(target_arch = "riscv64")]
 pub const USER_ASPACE_SIZE: u64 = (1u64 << 38) - USER_ASPACE_BASE;
@@ -3401,6 +3412,7 @@ mod tests {
             0x2000,
             MMUFlags::RXW | MMUFlags::USER,
             MMUFlags::empty(),
+            false,
             false,
             false,
         )
