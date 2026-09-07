@@ -937,6 +937,188 @@ fn classify_hid_report(desc: &[u8]) -> HidClass {
     HidClass::Unknown
 }
 
+/// Byte layout of a relative-mouse report, extracted from its HID report
+/// descriptor. All offsets are byte offsets from the start of the report,
+/// INCLUDING the leading Report ID byte when `report_id` is `Some`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MouseLayout {
+    report_id: Option<u8>,
+    /// Byte holding the button bitmap (bit0=left, bit1=right, …).
+    buttons_byte: usize,
+    x_byte: usize,
+    x_bytes: usize,
+    y_byte: usize,
+    y_bytes: usize,
+    /// (byte, size) of the vertical wheel, if present.
+    wheel: Option<(usize, usize)>,
+}
+
+/// Read a 1- or 2-byte little-endian signed field from a report buffer,
+/// returning 0 when it would read out of bounds.
+fn read_signed_le(buf: &[u8], off: usize, bytes: usize) -> i32 {
+    match bytes {
+        1 => buf.get(off).map(|&b| b as i8 as i32).unwrap_or(0),
+        2 => {
+            if off + 1 < buf.len() {
+                i16::from_le_bytes([buf[off], buf[off + 1]]) as i32
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Parse a HID report descriptor into the byte layout of its relative-mouse
+/// report. Returns `None` when the descriptor is not a byte-aligned relative
+/// mouse we can parse directly (the caller then falls back to the boot layout).
+///
+/// This is what lets a report-protocol mouse (bInterfaceSubClass 0, so no boot
+/// protocol) work: its report is NOT the fixed boot `[buttons, dx, dy]` — it may
+/// carry a leading Report ID, 16-bit axes, extra buttons, a pan wheel, etc. We
+/// walk Input items tracking the running bit position and record where X (usage
+/// 0x30), Y (0x31), the wheel (0x38) and the button block (usage page 0x09)
+/// land.
+fn mouse_report_layout(desc: &[u8]) -> Option<MouseLayout> {
+    let mut usage_page: u32 = 0;
+    let mut report_size: u32 = 0;
+    let mut report_count: u32 = 0;
+    let mut report_id: Option<u8> = None;
+    let mut local_usages: [u32; 16] = [0; 16];
+    let mut n_local: usize = 0;
+    let mut usage_min: u32 = 0;
+    let mut usage_max: u32 = 0;
+    // Bit position within the report. When a Report ID is declared the first
+    // byte of every report is the ID, so fields start at bit 8.
+    let mut bit_pos: usize = 0;
+
+    let mut buttons_byte: Option<usize> = None;
+    let mut x: Option<(usize, usize)> = None; // (byte, bytes)
+    let mut y: Option<(usize, usize)> = None;
+    let mut wheel: Option<(usize, usize)> = None;
+
+    let mut i = 0usize;
+    while i < desc.len() {
+        let prefix = desc[i];
+        i += 1;
+        if prefix == 0xfe {
+            // Long item: [0xFE, size, tag, data…]
+            if i + 2 > desc.len() {
+                return None;
+            }
+            let size = desc[i] as usize;
+            i += 2 + size;
+            continue;
+        }
+        let size = match prefix & 3 {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            _ => 4,
+        };
+        if i + size > desc.len() {
+            return None;
+        }
+        let mut data = 0u32;
+        for b in 0..size {
+            data |= (desc[i + b] as u32) << (8 * b);
+        }
+        i += size;
+        let typ = (prefix >> 2) & 3;
+        let tag = prefix >> 4;
+        match (typ, tag) {
+            (1, 0) => usage_page = data,   // Global Usage Page
+            (1, 7) => report_size = data,  // Global Report Size
+            (1, 9) => report_count = data, // Global Report Count
+            (1, 8) => {
+                // Global Report ID. More than one distinct report on this
+                // interface is more than we parse here — bail to the fallback.
+                if report_id.is_some() && report_id != Some(data as u8) {
+                    return None;
+                }
+                report_id = Some(data as u8);
+                if bit_pos == 0 {
+                    bit_pos = 8;
+                }
+            }
+            (2, 0) => {
+                if n_local < local_usages.len() {
+                    local_usages[n_local] = data;
+                    n_local += 1;
+                }
+            }
+            (2, 1) => usage_min = data, // Local Usage Minimum
+            (2, 2) => usage_max = data, // Local Usage Maximum
+            (0, 8) => {
+                // Input main item.
+                let constant = (data & 0x1) != 0;
+                let field_bits = report_size as usize;
+                let count = report_count as usize;
+                let width = field_bits.saturating_mul(count);
+                if !constant && field_bits > 0 {
+                    if usage_page == 0x09 {
+                        // Button block: one bit per button, byte aligned.
+                        if bit_pos % 8 == 0 && field_bits == 1 && buttons_byte.is_none() {
+                            buttons_byte = Some(bit_pos / 8);
+                        }
+                    } else if usage_page == 0x01 {
+                        // Generic Desktop: X/Y/Wheel, each `field_bits` wide.
+                        let usages_from_range = usage_max >= usage_min && usage_min != 0;
+                        for j in 0..count {
+                            let usage = if j < n_local {
+                                local_usages[j]
+                            } else if usages_from_range {
+                                (usage_min + j as u32).min(usage_max)
+                            } else {
+                                *local_usages.get(n_local.saturating_sub(1)).unwrap_or(&0)
+                            };
+                            let fbit = bit_pos + j * field_bits;
+                            if fbit % 8 != 0 || field_bits % 8 != 0 {
+                                continue;
+                            }
+                            let byte = fbit / 8;
+                            let bytes = field_bits / 8;
+                            match usage {
+                                0x30 => x.get_or_insert((byte, bytes)),
+                                0x31 => y.get_or_insert((byte, bytes)),
+                                0x38 => wheel.get_or_insert((byte, bytes)),
+                                _ => &mut (0, 0),
+                            };
+                        }
+                    }
+                }
+                bit_pos += width;
+                n_local = 0;
+                usage_min = 0;
+                usage_max = 0;
+            }
+            (0, _) => {
+                // Any other Main item (Collection/Output/Feature/…) clears locals.
+                n_local = 0;
+                usage_min = 0;
+                usage_max = 0;
+            }
+            _ => {}
+        }
+    }
+
+    let (x_byte, x_bytes) = x?;
+    let (y_byte, y_bytes) = y?;
+    let buttons_byte = buttons_byte?;
+    if !(1..=2).contains(&x_bytes) || !(1..=2).contains(&y_bytes) {
+        return None;
+    }
+    Some(MouseLayout {
+        report_id,
+        buttons_byte,
+        x_byte,
+        x_bytes,
+        y_byte,
+        y_bytes,
+        wheel: wheel.filter(|&(_, b)| (1..=2).contains(&b)),
+    })
+}
+
 /// Set when a USB HID tablet (QEMU `usb-tablet`, VirtualBox USB Tablet) is
 /// enumerated. Those devices report *absolute* coordinates; a PS/2 mouse on
 /// the same VM still delivers relative packets and would fight the tablet
@@ -1042,6 +1224,9 @@ struct HidDev {
     /// /proc/usbhid. Empty for boot-protocol devices (no descriptor read).
     report_desc: [u8; 64],
     report_desc_len: usize,
+    /// Parsed relative-mouse report layout, when the descriptor gave one.
+    /// `None` → parse the boot `[buttons, dx, dy, …]` layout.
+    mouse_layout: Option<MouseLayout>,
 }
 
 impl XhciInner {
@@ -2084,6 +2269,7 @@ impl XhciInner {
         vid: u16,
         pid: u16,
         desc_out: &mut ([u8; 64], usize),
+        layout_out: &mut Option<MouseLayout>,
     ) -> DeviceResult<u8> {
         if is_vm_abs_tablet(vid, pid, proto) {
             return Ok(HID_PROTO_TABLET);
@@ -2097,7 +2283,7 @@ impl XhciInner {
         // protocol 0: real hardware. Never default this to tablet — that flag
         // silences PS/2 and boot-protocol USB mice (keyboard still works).
         let sniffed = if report_desc_len > 0 {
-            self.sniff_hid_report(slot, iface, report_desc_len, desc_out)
+            self.sniff_hid_report(slot, iface, report_desc_len, desc_out, layout_out)
                 .unwrap_or(HidClass::Unknown)
         } else {
             HidClass::Unknown
@@ -2137,6 +2323,7 @@ impl XhciInner {
         iface: u8,
         report_desc_len: u16,
         desc_out: &mut ([u8; 64], usize),
+        layout_out: &mut Option<MouseLayout>,
     ) -> Option<HidClass> {
         let len = (report_desc_len as usize).clamp(1, 1024);
         let buf_len = len.div_ceil(64).max(1) * 64;
@@ -2174,7 +2361,11 @@ impl XhciInner {
         let keep = raw.len().min(desc_out.0.len());
         desc_out.0[..keep].copy_from_slice(&raw[..keep]);
         desc_out.1 = keep;
-        Some(classify_hid_report(&raw))
+        let class = classify_hid_report(&raw);
+        if class == HidClass::Mouse {
+            *layout_out = mouse_report_layout(&raw);
+        }
+        Some(class)
     }
 
     fn init_single_hid(
@@ -2193,6 +2384,7 @@ impl XhciInner {
         pid: u16,
     ) -> DeviceResult<()> {
         let mut report_desc: ([u8; 64], usize) = ([0; 64], 0);
+        let mut mouse_layout: Option<MouseLayout> = None;
         let real_proto = self.classify_hid_iface(
             slot,
             iface,
@@ -2202,20 +2394,27 @@ impl XhciInner {
             vid,
             pid,
             &mut report_desc,
+            &mut mouse_layout,
         )?;
         if real_proto == 0 {
             return Ok(());
         }
 
-        let report_len = match real_proto {
-            HID_PROTO_KEY => 8usize,
-            HID_PROTO_MOUSE => 8usize, // Soportar ratones con más botones/ruedas (boot extendido)
-            // Read a full 8-byte report: QEMU is 6 bytes [buttons, X16, Y16,
-            // wheel]; VirtualBox is 8 bytes [buttons, dz, dw, pad, X16, Y16].
-            // Requesting only 6 overruns/truncates the VBox packet.
-            HID_PROTO_TABLET => 8usize,
-            _ => 8usize,
+        // Size the interrupt-IN transfer (and its DMA buffers) to the
+        // endpoint's wMaxPacketSize, never a hardcoded 8. A report-protocol
+        // mouse can send a report larger than 8 bytes (16-bit axes, extra
+        // buttons, a pan wheel); arming only 8 bytes made every such transfer
+        // overrun into a Babble error, which we reset-and-retry forever — the
+        // mouse endpoint delivered zero usable reports (/proc/usbhid reports=0)
+        // even though it was correctly bound. Clamp to a sane window and keep a
+        // floor that covers the boot layouts.
+        let floor = match real_proto {
+            // QEMU is 6 bytes [buttons, X16, Y16, wheel]; VirtualBox is 8 bytes
+            // [buttons, dz, dw, pad, X16, Y16]. Keyboard boot report is 8.
+            HID_PROTO_KEY | HID_PROTO_TABLET => 8usize,
+            _ => 4usize,
         };
+        let report_len = (mps as usize).clamp(floor, 64);
 
         // Forzar protocolo de boot solo en teclado/ratón boot HID.
         // VirtualBox's USB Tablet (and QEMU usb-tablet) use bInterfaceProtocol 0
@@ -2363,6 +2562,7 @@ impl XhciInner {
             report_count: 0,
             report_desc: report_desc.0,
             report_desc_len: report_desc.1,
+            mouse_layout,
         });
         if real_proto == HID_PROTO_TABLET {
             warn!(
@@ -2386,8 +2586,10 @@ impl XhciInner {
         h.dispatch_idx = (dispatch_idx + 1) % HID_QUEUE_DEPTH;
         let buf_phys = h.bufs[dispatch_idx].phys;
         let v = phys_to_virt(buf_phys);
-        let mut tmp = [0u8; 8];
-        let n = report_len.min(tmp.len()).min(8);
+        // Hold the whole report: a report-protocol mouse layout can place fields
+        // past byte 8 (report ID + 16-bit axes + wheel/pan).
+        let mut tmp = [0u8; 64];
+        let n = report_len.min(tmp.len());
         tmp[..n].fill(0);
         // Asegurar consistencia de datos en arquitecturas con caché no coherente o mapeos WB.
         // Se debe invalidar ANTES de copiar los datos para que la CPU lea de la RAM (DMA).
@@ -2413,7 +2615,9 @@ impl XhciInner {
         // Record the raw report for /proc/usbhid before parsing it, so a
         // real-hardware pointer that never moves can be diagnosed from a text
         // VT (its bytes reveal a report-ID prefix or a non-boot layout).
-        h.last_report = tmp;
+        let keep = n.min(h.last_report.len());
+        h.last_report = [0; 8];
+        h.last_report[..keep].copy_from_slice(&tmp[..keep]);
         h.last_report_len = report_len;
         h.report_count = h.report_count.saturating_add(1);
 
@@ -2430,70 +2634,106 @@ impl XhciInner {
                     // A USB tablet already owns the pointer; relative HID mouse
                     // packets would fight it the same way PS/2 aux does.
                 } else {
-                    let btn = tmp[0];
-                    let dx = tmp[1] as i8 as i32;
-                    let dy = tmp[2] as i8 as i32;
-                    for (mask, code) in [
-                        (1u8, BTN_LEFT),
-                        (2u8, BTN_RIGHT),
-                        (4u8, BTN_MIDDLE),
-                        (8u8, BTN_SIDE),
-                        (16u8, BTN_EXTRA),
-                    ] {
-                        let down = (btn & mask) != 0;
-                        let was = (h.last_mods & mask) != 0;
-                        if down != was {
+                    // Decode from the report-descriptor layout when we parsed
+                    // one (report-protocol mice: report ID, 16-bit axes, extra
+                    // buttons, a pan wheel), else the fixed boot layout
+                    // [buttons, dx, dy, wheel, pan].
+                    let parsed = match h.mouse_layout {
+                        Some(ml) => {
+                            // A shared interface can multiplex several report
+                            // IDs; ignore reports whose ID isn't this mouse's.
+                            let id_ok = match ml.report_id {
+                                Some(id) => tmp.first().copied() == Some(id),
+                                None => true,
+                            };
+                            if id_ok {
+                                Some((
+                                    tmp.get(ml.buttons_byte).copied().unwrap_or(0),
+                                    read_signed_le(&tmp, ml.x_byte, ml.x_bytes),
+                                    read_signed_le(&tmp, ml.y_byte, ml.y_bytes),
+                                    ml.wheel
+                                        .map(|(b, sz)| read_signed_le(&tmp, b, sz))
+                                        .unwrap_or(0),
+                                    0i32,
+                                ))
+                            } else {
+                                None
+                            }
+                        }
+                        None => Some((
+                            tmp[0],
+                            tmp[1] as i8 as i32,
+                            tmp[2] as i8 as i32,
+                            if h.report_len >= 4 {
+                                tmp[3] as i8 as i32
+                            } else {
+                                0
+                            },
+                            if h.report_len >= 5 {
+                                tmp[4] as i8 as i32
+                            } else {
+                                0
+                            },
+                        )),
+                    };
+                    if let Some((btn, dx, dy, wheel, hwheel)) = parsed {
+                        for (mask, code) in [
+                            (1u8, BTN_LEFT),
+                            (2u8, BTN_RIGHT),
+                            (4u8, BTN_MIDDLE),
+                            (8u8, BTN_SIDE),
+                            (16u8, BTN_EXTRA),
+                        ] {
+                            let down = (btn & mask) != 0;
+                            let was = (h.last_mods & mask) != 0;
+                            if down != was {
+                                lis.trigger(InputEvent {
+                                    event_type: InputEventType::Key,
+                                    code,
+                                    value: if down { 1 } else { 0 },
+                                });
+                            }
+                        }
+                        h.last_mods = btn;
+                        if dx != 0 {
                             lis.trigger(InputEvent {
-                                event_type: InputEventType::Key,
-                                code,
-                                value: if down { 1 } else { 0 },
+                                event_type: InputEventType::RelAxis,
+                                code: REL_X,
+                                value: dx,
                             });
                         }
-                    }
-                    h.last_mods = btn;
-                    if dx != 0 {
-                        lis.trigger(InputEvent {
-                            event_type: InputEventType::RelAxis,
-                            code: REL_X,
-                            value: dx,
-                        });
-                    }
-                    if dy != 0 {
-                        lis.trigger(InputEvent {
-                            event_type: InputEventType::RelAxis,
-                            code: REL_Y,
-                            // USB HID reports Y as down-positive, exactly the evdev
-                            // REL_Y convention libinput expects — emit as-is. (The
-                            // earlier `-dy` was copied from the PS/2 driver, where
-                            // +Y means up; under libinput it inverted the axis.)
-                            value: dy,
-                        });
-                    }
-                    if h.report_len >= 4 {
-                        let w = tmp[3] as i8 as i32;
-                        if w != 0 {
+                        if dy != 0 {
+                            lis.trigger(InputEvent {
+                                event_type: InputEventType::RelAxis,
+                                code: REL_Y,
+                                // USB HID reports Y as down-positive, exactly the
+                                // evdev REL_Y convention libinput expects — emit
+                                // as-is. (The earlier `-dy` was copied from the
+                                // PS/2 driver, where +Y means up; under libinput
+                                // it inverted the axis.)
+                                value: dy,
+                            });
+                        }
+                        if wheel != 0 {
                             lis.trigger(InputEvent {
                                 event_type: InputEventType::RelAxis,
                                 code: REL_WHEEL,
-                                value: -w,
+                                value: -wheel,
                             });
                         }
-                    }
-                    if h.report_len >= 5 {
-                        let hw = tmp[4] as i8 as i32;
-                        if hw != 0 {
+                        if hwheel != 0 {
                             lis.trigger(InputEvent {
                                 event_type: InputEventType::RelAxis,
                                 code: REL_HWHEEL,
-                                value: hw,
+                                value: hwheel,
                             });
                         }
+                        lis.trigger(InputEvent {
+                            event_type: InputEventType::Syn,
+                            code: SYN_REPORT,
+                            value: 0,
+                        });
                     }
-                    lis.trigger(InputEvent {
-                        event_type: InputEventType::Syn,
-                        code: SYN_REPORT,
-                        value: 0,
-                    });
                 }
             }
             HID_PROTO_TABLET if h.report_len >= 6 && !(h.vbox_tablet && n < 8) => {
@@ -3258,6 +3498,19 @@ impl InputScheme for XhciUsbHid {
                 let _ = write!(s, "{}{:02x}", if i == 0 { "" } else { " " }, b);
             }
             let _ = writeln!(s, "]");
+            if let Some(ml) = h.mouse_layout {
+                let _ = writeln!(
+                    s,
+                    "[usbhid]   layout report_id={:?} buttons@{} x@{}:{} y@{}:{} wheel={:?}",
+                    ml.report_id,
+                    ml.buttons_byte,
+                    ml.x_byte,
+                    ml.x_bytes,
+                    ml.y_byte,
+                    ml.y_bytes,
+                    ml.wheel
+                );
+            }
             let dn = h.report_desc_len.min(h.report_desc.len());
             if dn > 0 {
                 let _ = write!(s, "[usbhid]   report_desc=[");
