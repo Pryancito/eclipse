@@ -120,19 +120,17 @@ pub trait DrmScheme: Scheme {
         false
     }
 
-    /// Whether this GPU is scanning out the boot console (firmware GOP). At
-    /// most one GPU has this role. It is not auto-brought up at boot (GSP
-    /// resume can wedge the bus while BAR1 still paints the console). On a
-    /// 1-GPU machine it is still the NVK device; CHANNEL_ALLOC brings GSP up
-    /// on demand. Default: false.
+    /// Whether this GPU is scanning out the boot console. Such a GPU is
+    /// deliberately excluded from the automatic RM bring-up at boot (its GSP
+    /// resume can wedge the bus while the console renders through its BAR1),
+    /// so it cannot serve the RM-backed nouveau paths. Default: false.
     fn is_console_gpu(&self) -> bool {
         false
     }
 
     /// Whether this GPU is a compute device: GSP-RM is (or will be) auto-booted
     /// and it can serve SAXPY / NVK / CE-present. Default: not a compute GPU.
-    /// On any number of NVIDIA GPUs this is every GPU that does **not** drive
-    /// GOP — 0 extras on a laptop, 1+ on a multi-adapter desktop.
+    /// On dual NVIDIA boxes this is every GPU that does **not** drive GOP.
     fn is_compute_gpu(&self) -> bool {
         false
     }
@@ -314,23 +312,19 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
-    /// CE-offloaded present: copy the compositor's buffer (contiguous
+    /// CE-offloaded present: copy the compositor's dumb buffer (contiguous
     /// sysmem at `src_sysmem_pa`, `size` bytes) into this GPU's scanout
     /// framebuffer via the persistent CeUtils channel, replacing the CPU
-    /// `memcpy`-over-PCIe. `src_coherent` is true when the CPU wrote the
-    /// source (dumb buffer / CE staging: CE snoops the cache). False when
-    /// the GPU wrote it (nouveau GEM: CE reads DRAM so stale WB lines from
-    /// cursor blend cannot ghost the frame). Returns true if the CE copy
-    /// was performed; false to fall back to the CPU blit. Default: false.
-    fn ce_present(&self, _src_sysmem_pa: u64, _size: u64, _src_coherent: bool) -> bool {
+    /// `memcpy`-over-PCIe. Returns true if the CE copy was performed (console
+    /// GPU, state-loaded); false to fall back to the CPU blit. Default: false.
+    fn ce_present(&self, _src_sysmem_pa: u64, _size: u64) -> bool {
         false
     }
 
     /// Pitched 2D CE-offloaded present: copy `line_count` rows of `row_bytes`
     /// from `src_sysmem_pa + r * src_pitch` into the console GPU's scanout FB
     /// at `dst_pitch` stride, using a GPU copy engine over PCIe P2P — without
-    /// any CPU staging repack. `src_coherent` has the same meaning as in
-    /// [`Self::ce_present`]. Returns true if the CE 2D copy was performed;
+    /// any CPU staging repack.  Returns true if the CE 2D copy was performed;
     /// false to fall back to the repack+flat path.  Default: false.
     fn ce_present_2d_pitched(
         &self,
@@ -339,7 +333,6 @@ pub trait DrmScheme: Scheme {
         _dst_pitch: u32,
         _row_bytes: u32,
         _line_count: u32,
-        _src_coherent: bool,
     ) -> bool {
         false
     }
@@ -349,15 +342,6 @@ pub trait DrmScheme: Scheme {
     /// compute GPU (P2P into the console framebuffer). Used to auto-enable the
     /// CE present path when manual `nvidia.cepresent` is absent.
     fn ce_present_ready(&self) -> bool {
-        false
-    }
-
-    /// True when a CE present submit would actually run (state-loaded, boot FB
-    /// known, not latched off after a failure). Distinct from
-    /// [`Self::ce_present_ready`]: that is the boot-time "this GPU can be the
-    /// present engine" signal; this is the per-frame "do not pay a CPU repack
-    /// that the CE will immediately decline" check.
-    fn ce_present_available(&self) -> bool {
         false
     }
 

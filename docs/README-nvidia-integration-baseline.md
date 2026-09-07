@@ -51,14 +51,6 @@ ignoren; labwc sigue en `card0`):
 - `/sys/class/drm/card1`, `renderD129`
 - `/proc/gpuroles` — consola vs cómputo, BDF y si el RM está atado
 
-Cuando la GPU de cómputo es la misma que respalda `card0` (lo normal con dos
-NVIDIA), `card1`/`renderD129` llevan en sysfs un BDF sintético
-(`0000:ee:00.0`, vendor `0x0000`) para que libdrm no los fusione con `card0`.
-Ese alias tiene clase PCI `0x120000` (acelerador de proceso), **no** clase
-display: los enumeradores de GPU (`fastfetch`, `lspci`) cuentan toda entrada
-de clase `0x03` en `/sys/bus/pci/devices`, y con clase display salía una
-tercera GPU inexistente ("Unknown Device 0000").
-
 Pin opcional en cmdline (hex con puntos; `:` ya separa tokens):
 
 ```txt

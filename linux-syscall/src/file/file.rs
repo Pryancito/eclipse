@@ -284,39 +284,25 @@ impl Syscall<'_> {
         let mut iovs = iov_ptr.read_iovecs(iov_count)?;
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
-        let total = iovs.total_len();
-        if total == 0 {
-            return Ok(0);
-        }
-        // Mirror writev: iterate a bounded kernel buffer so a large scatter
-        // list is not truncated at SYSCALL_IO_MAX. Small totals stay alloc-free.
+        let total_len = iovs.total_len().min(super::SYSCALL_IO_MAX);
+        // Mirror the sys_read hybrid buffer: many readv callers (e.g. socket
+        // headers + payload split into two small iovecs) request totals well
+        // under 512 B, so keep those alloc-free.
         const STACK_BUF: usize = 512;
-        let chunk = total.min(super::SYSCALL_IO_MAX);
         let mut stack_buf = [0u8; STACK_BUF];
-        let mut heap_buf: alloc::vec::Vec<u8> = if chunk > STACK_BUF {
-            vec![0u8; chunk]
+        let mut heap_buf: alloc::vec::Vec<u8> = if total_len > STACK_BUF {
+            vec![0u8; total_len]
         } else {
             alloc::vec::Vec::new()
         };
-        let mut read_total = 0usize;
-        while read_total < total {
-            let want = (total - read_total).min(chunk);
-            let buf: &mut [u8] = if chunk > STACK_BUF {
-                &mut heap_buf[..want]
-            } else {
-                &mut stack_buf[..want]
-            };
-            let n = file_like.read(buf).await?;
-            if n == 0 {
-                break;
-            }
-            iovs.write_bytes_at(read_total, &buf[..n])?;
-            read_total += n;
-            if n < want {
-                break;
-            }
-        }
-        Ok(read_total)
+        let buf: &mut [u8] = if total_len > STACK_BUF {
+            &mut heap_buf[..]
+        } else {
+            &mut stack_buf[..total_len]
+        };
+        let len = file_like.read(buf).await?;
+        iovs.write_from_buf(&buf[..len])?;
+        Ok(len)
     }
 
     /// works just like write except that multiple buffers are written out.
@@ -399,28 +385,11 @@ impl Syscall<'_> {
         let mut iovs = iov_ptr.read_iovecs(iov_count)?;
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
-        let total = iovs.total_len();
-        if total == 0 {
-            return Ok(0);
-        }
-        let chunk = total.min(super::SYSCALL_IO_MAX);
-        let mut buf = vec![0u8; chunk];
-        let mut read_total = 0usize;
-        while read_total < total {
-            let want = (total - read_total).min(chunk);
-            let n = file_like
-                .read_at(offset + read_total as u64, &mut buf[..want])
-                .await?;
-            if n == 0 {
-                break;
-            }
-            iovs.write_bytes_at(read_total, &buf[..n])?;
-            read_total += n;
-            if n < want {
-                break;
-            }
-        }
-        Ok(read_total)
+        let total_len = iovs.total_len().min(super::SYSCALL_IO_MAX);
+        let mut buf = vec![0u8; total_len];
+        let len = file_like.read_at(offset, &mut buf).await?;
+        iovs.write_from_buf(&buf[..len])?;
+        Ok(len)
     }
 
     /// write multiple buffers to a file descriptor at a given offset
@@ -663,10 +632,7 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         let in_file = proc.get_file(in_fd)?;
         let out_file = proc.get_file(out_fd)?;
-        if count == 0 {
-            return Ok(0);
-        }
-        let mut buffer = alloc::vec![0u8; count.min(super::SYSCALL_IO_MAX)];
+        let mut buffer = alloc::vec![0u8; 1024];
 
         // for in_offset and out_offset
         // null means update file offset

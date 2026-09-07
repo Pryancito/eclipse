@@ -481,24 +481,10 @@ impl ProcPidDirINode {
         ROOT_JOB.find_process(self.pid as _)
     }
 
-    fn entries() -> [&'static str; 16] {
+    fn entries() -> [&'static str; 12] {
         [
-            ".",
-            "..",
-            "stat",
-            "cmdline",
-            "status",
-            "perf",
-            "maps",
-            "fd",
-            "comm",
-            "environ",
-            "statm",
-            "exe",
-            "ns",
-            "uid_map",
-            "gid_map",
-            "setgroups",
+            ".", "..", "stat", "cmdline", "status", "perf", "maps", "fd", "comm", "environ",
+            "statm", "exe",
         ]
     }
 }
@@ -602,19 +588,6 @@ impl INode for ProcPidDirINode {
                     FileType::SymLink,
                 )))
             }
-            "ns" => Ok(Arc::new(crate::ns::ProcNsDir::new(self.pid))),
-            "uid_map" => Ok(Arc::new(crate::ns::ProcIdMapFile::new(
-                self.pid,
-                crate::ns::IdMapKind::UidMap,
-            ))),
-            "gid_map" => Ok(Arc::new(crate::ns::ProcIdMapFile::new(
-                self.pid,
-                crate::ns::IdMapKind::GidMap,
-            ))),
-            "setgroups" => Ok(Arc::new(crate::ns::ProcIdMapFile::new(
-                self.pid,
-                crate::ns::IdMapKind::Setgroups,
-            ))),
             _ => Err(FsError::EntryNotFound),
         }
     }
@@ -2497,16 +2470,11 @@ fn proc_gpudump_content() -> String {
 fn proc_gpuroles_content() -> String {
     let mut s = String::new();
     let pin = kernel_hal::boot::cmdline();
-    let pinned = pin
-        .split([':', ' ', '\t', '\n'])
-        .find(|t| t.starts_with("nvidia.compute="));
+    let pinned = pin.split([':', ' ', '\t', '\n']).find(|t| t.starts_with("nvidia.compute="));
     if let Some(p) = pinned {
         let _ = writeln!(s, "[gpuroles] cmdline pin: {p}");
     } else {
-        let _ = writeln!(
-            s,
-            "[gpuroles] cmdline pin: (auto — first non-console NVIDIA GPU)"
-        );
+        let _ = writeln!(s, "[gpuroles] cmdline pin: (auto — first non-console NVIDIA GPU)");
     }
     let mut n = 0u32;
     for d in kernel_hal::drivers::all_drm().as_vec().iter() {

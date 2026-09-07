@@ -63,31 +63,8 @@ Equivalente: sobre `master` (`9757fe5`) hacer `git merge 307f7e0` y un push
 normal. En cualquier caso, conviene activar la protección de rama (*block
 force pushes*) en `master`.
 
-**Recuperado en esta rama.** El propietario confirmó que `master` se perdió,
-y que ese `master` es donde tenía «ruidos visuales»; `9757fe5` ("cambios en
-drm.") fue su corrección posterior. La rama fusiona `307f7e0` completo
-(los 20 commits, PRs #1068-#1072 incluidos) con este criterio para los
-conflictos:
-
-- **Diseño de scanout/cursor/DIRTYFB: gana `9757fe5`** (el actual): blits
-  parciales alineados a líneas WC (`expand_x_for_wc`), `DIRTYFB` con la
-  unión de clips, cursor por parches y `DUMB_PREFER_SHADOW = 1`. El
-  `master` perdido había ido por «present siempre a frame completo, DIRTYFB
-  → ENOSYS, cursor en tira de ancho completo»; eso es lo que se descarta.
-- **Del `master` perdido se conserva todo lo ortogonal**: `driver_for_nouveau`
-  (elección de GPU para NVK), validación de `ADDFB2` (formato, offsets,
-  modifier lineal, un solo plano; con tests), `clflush` del cursor BO antes
-  de leerlo, sincronización FromDevice por bandas del GEM escrito por la GPU
-  (`GemSrcSync`) y las banderas de coherencia del CE (`ce_present(…,
-  coherent)`), el fence `RELEASE_WFI_EN`, los cookies mmap del canal de
-  envío directo (`is_fast_mmap_handle`, para `libeclipse_nvkick`),
-  `linux-object/src/{ns,seccomp}.rs`, `i18n.rs`, y todo lo demás de
-  NVIDIA, init, xtask y docs.
-- Del arreglo «cursor patch never blits unfilled scratch» se porta la idea
-  al parche WC (`blit_cursor_patch` solo blitea las filas realmente
-  copiadas).
-
-Los hallazgos siguientes se refieren a `9757fe5`.
+Los hallazgos siguientes se refieren a `9757fe5`. Donde el `master` local
+(`307f7e0`) ya corrige algo, se indica.
 
 ---
 

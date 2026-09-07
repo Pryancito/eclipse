@@ -235,9 +235,9 @@ Usa el siguiente comando para construir la imagen:
 cargo bin -m cr1825 -o z.bin
 ```
 
-## Gestión de Paquetes (APK + Flatpak)
+## Gestión de Paquetes (APK Tools)
 
-El **sistema** (musl, Xorg, labwc, Pulse, el propio `flatpak`) se instala con `apk-tools`. Las **apps de usuario** van por Flatpak (modelo EU OS); ver [docs/README-flatpak.md](docs/README-flatpak.md).
+zCore (Eclipse OS) utiliza `apk-tools` como gestor de paquetes. Para compilarlo y preparar el entorno:
 
 Para instalar las claves de confianza de Alpine:
 ```bash
@@ -253,7 +253,6 @@ apk add -X https://dl-cdn.alpinelinux.org/alpine/v3.24/main -u alpine-keys
 - [DRM / KMS — conformidad con la UAPI de Linux](docs/README-drm.md)
 - [uAPI compatible con nouveau en la GPU NVIDIA (opt-in, `nvidia.nouveau_uapi`)](docs/README-nouveau-uapi.md)
 - [Ejecutar un servidor X (`startx`)](docs/README-xorg.md)
-- [Flatpak (apps de usuario, modelo EU OS)](docs/README-flatpak.md)
 
 ### Compatibilidad de ABI
 - [Compatibilidad con FreeBSD (ABI FreeBSD/amd64)](docs/README-freebsd.md)

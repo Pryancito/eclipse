@@ -196,11 +196,11 @@ impl INode for BlockDev {
     }
 
     fn sync_all(&self) -> Result<()> {
-        self.block.flush().map_err(convert_error)
+        Ok(())
     }
 
     fn sync_data(&self) -> Result<()> {
-        self.block.flush().map_err(convert_error)
+        Ok(())
     }
 }
 

@@ -52,9 +52,6 @@ mudos.
 5. **`CHIPSET_ID` devolvía el mínimo de la arquitectura** (0x170 = GA100/SM80,
    no GA10x/SM86). Ahora el chip id real de `NV_PMC_BOOT_0`.
 6. **`VRAM_BAR_SIZE` devolvía el tamaño de VRAM** en vez de la apertura BAR1.
-   Hoy se vuelve a reportar igual que `FB_SIZE` **a propósito**: el mmap de
-   NVK va por sysmem/`map_handle`, no por BAR1, y un BAR diminuto (el GOP)
-   dejaba el heap `DEVICE_LOCAL` sin `HOST_VISIBLE` → Zink copy boxes.
 7. **`render_allowed` extraía el NR como `(cmd >> 8) & 0xff`** — eso es el byte
    de *tipo* (`'d'`), no el NR; aceptaba todo por accidente. Corregido.
 8. **Render node en `0o660` root:root.** NVK hace `open(O_RDWR)` antes de
@@ -1316,8 +1313,7 @@ a wlroots a negociar un swapchain lineal, por dos palancas:
 1. **`DRM_CAP_ADDFB2_MODIFIERS = 0`** (drm_scheme.rs): declara que el KMS no
    soporta modificadores. wlroots restringe el scanout a buffers
    lineales/implícitos.
-2. **`WLR_DRM_NO_MODIFIERS=1`** en todas las rutas de arranque de labwc
-   (`eclipse-init`, `/etc/profile`, wrapper y `environment`): fuerza
+2. **`WLR_DRM_NO_MODIFIERS=1`** en el entorno de labwc (eclipse-init): fuerza
    buffers de modificador implícito (lineal) pase lo que pase, incluso si
    wlroots sacara los modificadores tiled del *renderer* (dma-buf feedback de
    NVK) en vez del plano KMS -- cosa que la cap sola podría no cubrir.

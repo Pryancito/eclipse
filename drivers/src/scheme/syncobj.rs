@@ -29,14 +29,14 @@
 //! GPU really did write the fence), and CPU and GPU no longer serialise on
 //! every submission.
 //!
-//! [`wait`] is a bounded CPU poll, not a sleep-queue: `linux-object`'s
-//! `io_control` is synchronous, so there is no cheaper block without
-//! scheduler surgery. Hardware fences are polled the way nouveau userspace
-//! reads a mmap'd semaphore: snapshot `fence_va`/`payload`, drop the table
-//! lock, `read_volatile` the landing zone until it wraps `>= payload`, then
-//! re-lock only to resolve. Software-only waits (no pending GPU fence) still
-//! re-check the table on a short slice. A long wait still pegs the ioctl's
-//! CPU core, but it no longer takes an IRQ-off spinlock on every pause.
+//! [`wait`] is a bounded, CPU-spinning poll of that counter, not a real
+//! wait-queue: `linux-object`'s `io_control` (where these ioctls are
+//! dispatched) is a synchronous, non-async function, so there is no
+//! lower-cost way to block here without deeper scheduler surgery. This
+//! matches the spin-poll idiom already used throughout this codebase for
+//! bounded hardware waits (e.g. `nvidia.rs` `gmmu_flush`, `eclipse_rm_init.c`
+//! step18's semaphore poll) -- consistent, but real: a long wait pegs the
+//! CPU core handling the ioctl for its whole duration.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -140,26 +140,9 @@ pub fn set_signal_hook(f: fn(u32, u64)) {
     SIGNAL_HOOK.store(f as usize, Ordering::SeqCst);
 }
 
-/// Register the hang-probe upcall (see [`FENCE_TIMEOUT_HOOK`]). Called once at probe.
+/// Register the fence-timeout upcall (see [`FENCE_TIMEOUT_HOOK`]).
 pub fn set_fence_timeout_hook(f: fn(u32, usize, u32, u32, u64)) {
     FENCE_TIMEOUT_HOOK.store(f as usize, Ordering::SeqCst);
-}
-
-static DRAIN_HOOK: AtomicUsize = AtomicUsize::new(0);
-
-/// Register a drain of userspace attach records (usermode kick) so kernel
-/// WAIT/QUERY see fences submitted without an EXEC ioctl.
-pub fn set_usermode_drain_hook(f: fn()) {
-    DRAIN_HOOK.store(f as usize, Ordering::SeqCst);
-}
-
-#[inline]
-fn drain_usermode() {
-    let p = DRAIN_HOOK.load(Ordering::Relaxed);
-    if p != 0 {
-        let f: fn() = unsafe { core::mem::transmute(p) };
-        f();
-    }
 }
 
 /// Fire the point-advance upcall, if one is registered. Must be called with the
@@ -194,23 +177,6 @@ fn fence_landed(fence_va: usize, payload: u32) -> bool {
     // the driver for exactly this read (`attach_hw_fence`'s contract).
     let v = unsafe { core::ptr::read_volatile(fence_va as *const u32) };
     (v.wrapping_sub(payload) as i32) >= 0
-}
-
-/// Pause between unlocked fence / table re-checks.
-///
-/// Same heartbeat as the GPU driver's `gpu_spin`: drain this CPU's TLB
-/// shootdown queue at a coarse cadence so a long `SYNCOBJ_WAIT` cannot
-/// starve a peer `munmap`. Safe without the table lock (and that is the
-/// point -- the old wait re-took `TABLE` with IRQs off on every
-/// `spin_loop`).
-#[inline]
-fn wait_spin() {
-    static SPIN: AtomicUsize = AtomicUsize::new(0);
-    let n = SPIN.fetch_add(1, Ordering::Relaxed) + 1;
-    if n & 511 == 0 {
-        lock::pump();
-    }
-    core::hint::spin_loop();
 }
 
 // --- Counters for /proc/gpudbg -----------------------------------------------
@@ -311,7 +277,6 @@ fn resolve_locked(table: &mut SyncobjTable) -> Deferred {
 /// Resolve pending hardware fences now. Returns how many are still pending.
 /// Cheap when nothing is pending (one relaxed load, no lock).
 pub fn poll_pending() -> usize {
-    drain_usermode();
     if PENDING_COUNT.load(Ordering::Relaxed) == 0 {
         return 0;
     }
@@ -642,7 +607,6 @@ pub fn query_submitted(handle: u32) -> Option<u64> {
 }
 
 fn query_inner(handle: u32, last_submitted: bool) -> Option<u64> {
-    drain_usermode();
     let (r, deferred) = {
         let mut table = TABLE.lock();
         let d = resolve_locked(&mut table);
@@ -732,7 +696,6 @@ fn wait_inner(
     let start_us = now_us();
     let mut stall_logged = false;
     WAIT_CALLS.fetch_add(1, Ordering::Relaxed);
-    drain_usermode();
     let account = |timed_out: bool| {
         let spent = now_us().wrapping_sub(start_us);
         WAIT_SPIN_US.fetch_add(spent, Ordering::Relaxed);
@@ -741,13 +704,7 @@ fn wait_inner(
             WAIT_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
         }
     };
-    // Snapshotted `(fence_va, payload)` covering each not-yet-signaled
-    // handle. Reused across loop iterations so a WAIT does not allocate
-    // on every table re-check.
-    let mut poll: Vec<(usize, u32)> = Vec::new();
     loop {
-        drain_usermode();
-        poll.clear();
         let mut signaled_count = 0usize;
         let mut first_signaled: Option<u32> = None;
         let deferred = {
@@ -777,14 +734,6 @@ fn wait_inner(
                     if first_signaled.is_none() {
                         first_signaled = Some(i as u32);
                     }
-                } else if let Some(f) = table
-                    .pending
-                    .iter()
-                    .find(|f| f.handle == h && f.point >= target)
-                {
-                    // One covering hardware fence per unsignaled handle:
-                    // enough to poll the landing zone without the table.
-                    poll.push((f.fence_va, f.payload));
                 }
             }
             d
@@ -801,8 +750,8 @@ fn wait_inner(
                 first_signaled_index: first_signaled.unwrap_or(0),
             };
         }
-        let mut now = now_us();
-        if now >= deadline_us {
+        let now_us = now_us();
+        if now_us >= deadline_us {
             account(true);
             return WaitOutcome::Timeout;
         }
@@ -813,46 +762,16 @@ fn wait_inner(
         // creation" reports. Crossing 2 s with the deadline still far away
         // is that situation, not a normal frame wait; say so once per call
         // (budgeted per boot) with enough to identify the station.
-        if !stall_logged && now.saturating_sub(start_us) >= 2_000_000 {
+        if !stall_logged && now_us.saturating_sub(start_us) >= 2_000_000 {
             stall_logged = true;
             stall_report(
                 handles,
                 points,
                 wait_all,
-                deadline_us.saturating_sub(now),
+                deadline_us.saturating_sub(now_us),
             );
         }
-        // Linux-style mapped-fence poll: read the semaphore u32 with no
-        // table lock (nouveau userspace does the same on a mmap'd BO).
-        // Hardware waits stay here until a payload lands or 1 s elapses
-        // (then re-lock to resolve / notice a timeout hook). Software-only
-        // waits have nothing to poll, so they re-check the table after a
-        // few microseconds.
-        let slice_us = if poll.is_empty() { 4 } else { 1_000_000 };
-        let slice_end = now.saturating_add(slice_us).min(deadline_us);
-        while now_us() < slice_end {
-            let hw_done = if poll.is_empty() {
-                false
-            } else if wait_all {
-                poll.iter().all(|&(va, p)| fence_landed(va, p))
-            } else {
-                poll.iter().any(|&(va, p)| fence_landed(va, p))
-            };
-            if hw_done {
-                break;
-            }
-            now = now_us();
-            if !stall_logged && now.saturating_sub(start_us) >= 2_000_000 {
-                stall_logged = true;
-                stall_report(
-                    handles,
-                    points,
-                    wait_all,
-                    deadline_us.saturating_sub(now),
-                );
-            }
-            wait_spin();
-        }
+        core::hint::spin_loop();
     }
 }
 

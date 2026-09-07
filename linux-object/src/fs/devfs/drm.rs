@@ -69,7 +69,7 @@ static CE_REPACK_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 static CE_PRESENT_ENABLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// When set, `present_now` / CE present no-op so the console GPU's
+/// When set, `present_now_region` / CE present no-op so the console GPU's
 /// BAR1 stays quiet during a deferred GSP-RM bring-up (hwcursor path).
 static SCANOUT_PAUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -284,9 +284,9 @@ struct CursorState {
     w: u32,
     h: u32,
     /// Client cursor pixels (premultiplied ARGB8888, tightly packed). Held in
-    /// an `Arc` so every `scanout()` can share the pixels without cloning the
-    /// Vec — a resize/redraw storm was cloning this on every flip and amplifying
-    /// heap churn for ~30–50 min until a null fn-ptr #PF.
+    /// an `Arc` so every `scanout()` / cursor move can share the pixels without
+    /// cloning the Vec — a resize/redraw storm was cloning this on every flip
+    /// and amplifying heap churn for ~30–50 min until a null fn-ptr #PF.
     bitmap: Option<Arc<[u32]>>,
     /// The rectangle `(x, y, w, h)` currently composited on the display, or
     /// `None` if nothing is drawn. A cursor move restores exactly this rect from
@@ -297,10 +297,10 @@ struct CursorState {
     /// The REAL display-engine cursor plane owns the pointer (the driver's
     /// `hw_cursor_set` accepted the image). While set, the kernel's software
     /// compositing stands down completely: `scanout()` does not blend the
-    /// bitmap — the display hardware composites the plane during scanout and a
-    /// move is one PIO write in the driver. Opt-in via the `nvidia.hwcursor`
-    /// kernel cmdline flag; any driver failure falls back to the software path
-    /// with `hw == false`.
+    /// bitmap and `repaint_for_cursor()` is a no-op — the display hardware
+    /// composites the plane during scanout and a move is one PIO write in the
+    /// driver. Opt-in via the `nvidia.hwcursor` kernel cmdline flag; any
+    /// driver failure falls back to the software path with `hw == false`.
     hw: bool,
 }
 
@@ -384,21 +384,24 @@ fn parse_nvidia_compute_bdf() -> Option<(u8, u8, u8)> {
     None
 }
 
-/// The NVIDIA GPU that owns compute (SAXPY, CE-present, the `eclipse-compute`
-/// node): either the `nvidia.compute=BB.DD.F` pin, or the first non-console
-/// GPU. Never the GOP/console GPU — its GSP resume can wedge the bus.
-///
-/// Returns `None` on a 1-GPU box (that GPU *is* the console). `ecl-compute`
-/// then falls back to the primary node; NVK uses [`driver_for_nouveau`],
-/// which *does* accept the console GPU in that case.
+/// The NVIDIA GPU that owns compute (SAXPY, NVK EXEC, CE-present): either
+/// the `nvidia.compute=BB.DD.F` pin, or the first driver with
+/// [`DrmScheme::is_compute_gpu`]. Never the console GPU — its GSP resume
+/// can wedge the bus.
 pub fn get_compute_driver() -> Option<Arc<dyn DrmScheme>> {
-    let list = kernel_hal::drivers::all_drm().as_vec();
+    let drivers = kernel_hal::drivers::all_drm();
+    let list = drivers.as_vec();
     if let Some((bus, dev, func)) = parse_nvidia_compute_bdf() {
-        if let Some(d) = list.iter().find(|d| pci_fn_eq(d.as_ref(), bus, dev, func)) {
+        if let Some(d) = list.iter().find(|d| {
+            matches!(
+                d.pci_bdf(),
+                Some((_, b, dv, f)) if b == bus && dv == dev && f == func
+            )
+        }) {
             if d.is_console_gpu() {
                 kernel_hal::klog_info!(
                     "[drm] nvidia.compute={:02x}.{:02x}.{:x} is the console GPU — ignoring pin \
-                     (GSP on the GOP card can wedge the bus); NVK will use another GPU if one exists",
+                     (GSP on the GOP card can wedge the bus)",
                     bus,
                     dev,
                     func
@@ -416,49 +419,6 @@ pub fn get_compute_driver() -> Option<Arc<dyn DrmScheme>> {
         }
     }
     list.iter().find(|d| d.is_compute_gpu()).cloned()
-}
-
-fn pci_fn_eq(d: &dyn DrmScheme, bus: u8, dev: u8, func: u8) -> bool {
-    matches!(d.pci_bdf(), Some((_, b, dv, f)) if b == bus && dv == dev && f == func)
-}
-
-/// GPU that serves nouveau/NVK on `/dev/dri/card0` and `renderD128`.
-///
-/// Same policy on every machine, 1 / 2 / N GPUs:
-///
-/// 1. Only drivers that implement the nouveau uAPI (never virtio/simplefb).
-/// 2. `nvidia.compute=BB.DD.F` if it names a non-console GPU.
-/// 3. Otherwise the first non-console NVIDIA (RM is auto-brought up on
-///    every such GPU at boot, so 2, 3, 4+ extras all come up; Mesa currently
-///    talks to one node, so we pick the first).
-/// 4. If the only NVIDIA *is* the console GPU (typical laptop / 1-card
-///    desktop), use it: CHANNEL_ALLOC brings GSP up on demand.
-///
-/// Scanout stays on the GOP console GPU and does not need this helper.
-pub fn driver_for_nouveau() -> Option<Arc<dyn DrmScheme>> {
-    let capable: Vec<Arc<dyn DrmScheme>> = kernel_hal::drivers::all_drm()
-        .as_vec()
-        .iter()
-        .filter(|d| d.nouveau_uapi_capable())
-        .cloned()
-        .collect();
-    if capable.is_empty() {
-        return None;
-    }
-    if let Some((bus, dev, func)) = parse_nvidia_compute_bdf() {
-        if let Some(d) = capable
-            .iter()
-            .find(|d| pci_fn_eq(d.as_ref(), bus, dev, func))
-        {
-            if !d.is_console_gpu() || capable.len() == 1 {
-                return Some(d.clone());
-            }
-        }
-    }
-    if let Some(d) = capable.iter().find(|d| !d.is_console_gpu()) {
-        return Some(d.clone());
-    }
-    capable.into_iter().next()
 }
 
 /// Hard ceiling on live GEM objects. Contiguous dumb buffers are expensive
@@ -789,45 +749,27 @@ pub fn set_crtc_fb(_crtc_id: u32, fb_id: u32) {
 /// under a timer tick.
 const BLIT_CHUNK_ROWS: u32 = 128;
 
-/// Optional FromDevice of a GPU-written GEM covering one scanout band.
-/// The CPU blit / CE staging repack read the WB physmap alias; without this
-/// the cache keeps the previous frame. Row-by-row (see
-/// [`dma_sync_gem_rect_from_device`]) so pitch padding is not clflushed.
-struct GemSrcSync {
-    vaddr: usize,
-    fb_size: usize,
-    fb_w: u32,
-    fb_h: u32,
-    origin_x: u32,
-    origin_y: u32,
-}
-
-fn sync_src_band(sync: &GemSrcSync, src_stride: usize, band_y: u32, w: u32, h: u32) {
-    dma_sync_gem_rect_from_device(
-        sync.vaddr,
-        sync.fb_size,
-        src_stride,
-        sync.origin_x as i32,
-        (sync.origin_y.saturating_add(band_y)) as i32,
-        w,
-        h,
-        sync.fb_w,
-        sync.fb_h,
-    );
-}
-
+/// Blit `pixels` (row-major, `src_stride` u32s per row, already offset so
+/// `pixels[0]` is the rectangle's top-left) into `display` at
+/// `(dst_x, dst_y)`, `width`x`height`, in horizontal bands with interrupts
+/// re-enabled between bands.
+///
+/// IRQs nest on the coroutine stack, so any single blit must run with
+/// interrupts fully off end-to-end — that's what stopped the nested-IRQ
+/// coroutine-stack overflow (`rip=0x3` / `[rsp0]=0x13486`) seen at labwc
+/// bring-up (APIC timer -> xHCI EventListener / DRM timer re-entering
+/// mid-scanout). But holding IF clear for an entire full-frame copy means
+/// every timer tick, keyboard IRQ and xHCI completion queues up behind it,
+/// which was a visible chunk of the "labwc feels slow" gap versus Linux.
+/// Chunking bounds the continuous interrupts-off window to one band — pending
+/// IRQs are serviced promptly between bands — while each individual blit
+/// still runs fully protected, preserving the original crash fix.
 /// Repack the frame into the CE staging buffer at `dst_pitch` and return the
 /// staging `(phys_addr, bytes)` for a flat CE copy. Returns `None` (caller
 /// falls back to the CPU blit) if the staging buffer cannot be allocated.
 ///
-/// The row copies are ordinary cached memory writes (~GB/s). Staging is
-/// CPU-written WB sysmem, so the subsequent flat CE copy uses a coherent
-/// (snooped) source and needs no extra flush of the staging buffer.
-///
-/// `src_sync` is the GPU-written GEM the CPU is about to *read*; each band is
-/// invalidated immediately before those rows are copied so a full-frame
-/// padded clflush is not paid up front.
-#[allow(clippy::too_many_arguments)]
+/// The row copies are ordinary cached memory writes (~GB/s), and x86 PCIe DMA
+/// snoops the cache, so the CE reads coherent data with no explicit flush.
 fn ce_repack_to_staging(
     pixels: &[u32],
     src_pa: u64,
@@ -835,8 +777,6 @@ fn ce_repack_to_staging(
     dst_pitch: usize,
     w: u32,
     h: u32,
-    src_sync: Option<&GemSrcSync>,
-    sync_elapsed: &mut Duration,
 ) -> Option<(u64, u64)> {
     let t0 = kernel_hal::timer::timer_now();
     let row_bytes = (w as usize).checked_mul(4)?;
@@ -874,31 +814,20 @@ fn ce_repack_to_staging(
             (va, pa, vmo)
         }
     };
-    let mut row = 0u32;
-    while row < h {
-        let band_h = BLIT_CHUNK_ROWS.min(h - row);
-        if let Some(sync) = src_sync {
-            let ts = kernel_hal::timer::timer_now();
-            sync_src_band(sync, src_stride, row, w, band_h);
-            *sync_elapsed += kernel_hal::timer::timer_now().saturating_sub(ts);
+    for r in 0..h as usize {
+        let s = r.checked_mul(src_stride)?;
+        if s + row_bytes / 4 > pixels.len() {
+            break;
         }
-        for r in 0..band_h as usize {
-            let abs_r = row as usize + r;
-            let s = abs_r.checked_mul(src_stride)?;
-            if s + row_bytes / 4 > pixels.len() {
-                break;
-            }
-            // SAFETY: staging spans `need` bytes and abs_r*dst_pitch +
-            // row_bytes <= need; the source slice bound was checked above.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    pixels[s..].as_ptr() as *const u8,
-                    (va + abs_r * dst_pitch) as *mut u8,
-                    row_bytes,
-                );
-            }
+        // SAFETY: staging spans `need` bytes and r*dst_pitch + row_bytes <=
+        // need; the source slice bound was checked above.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                pixels[s..].as_ptr() as *const u8,
+                (va + r * dst_pitch) as *mut u8,
+                row_bytes,
+            );
         }
-        row += band_h;
     }
     // The repack is suspected to be the remaining present cost: the GEM
     // source's CPU address comes from the RM's AT_CPU resolution (see
@@ -944,26 +873,6 @@ fn ce_repack_to_staging(
     Some((pa, need as u64))
 }
 
-/// Blit `pixels` (row-major, `src_stride` u32s per row, already offset so
-/// `pixels[0]` is the rectangle's top-left) into `display` at
-/// `(dst_x, dst_y)`, `width`x`height`, in horizontal bands with interrupts
-/// re-enabled between bands.
-///
-/// IRQs nest on the coroutine stack, so any single blit must run with
-/// interrupts fully off end-to-end — that's what stopped the nested-IRQ
-/// coroutine-stack overflow (`rip=0x3` / `[rsp0]=0x13486`) seen at labwc
-/// bring-up (APIC timer -> xHCI EventListener / DRM timer re-entering
-/// mid-scanout). But holding IF clear for an entire full-frame copy means
-/// every timer tick, keyboard IRQ and xHCI completion queues up behind it,
-/// which was a visible chunk of the "labwc feels slow" gap versus Linux.
-/// Chunking bounds the continuous interrupts-off window to one band — pending
-/// IRQs are serviced promptly between bands — while each individual blit
-/// still runs fully protected, preserving the original crash fix.
-///
-/// When `src_sync` is set, each band is FromDevice-invalidated immediately
-/// before the copy so GPU-written pixels are visible without a full-frame
-/// padded clflush. Returns the time spent in those syncs.
-#[allow(clippy::too_many_arguments)]
 fn blit_chunked(
     display: &Arc<dyn DisplayScheme>,
     dst_x: u32,
@@ -972,17 +881,10 @@ fn blit_chunked(
     src_stride: usize,
     width: u32,
     height: u32,
-    src_sync: Option<&GemSrcSync>,
-) -> Duration {
-    let mut sync_elapsed = Duration::ZERO;
+) {
     let mut row = 0u32;
     while row < height {
         let band_h = BLIT_CHUNK_ROWS.min(height - row);
-        if let Some(sync) = src_sync {
-            let ts = kernel_hal::timer::timer_now();
-            sync_src_band(sync, src_stride, row, width, band_h);
-            sync_elapsed += kernel_hal::timer::timer_now().saturating_sub(ts);
-        }
         let src_off = (row as usize) * src_stride;
         if src_off >= pixels.len() {
             break;
@@ -1004,10 +906,40 @@ fn blit_chunked(
         }
         row += band_h;
     }
-    sync_elapsed
 }
 
-/// FromDevice clflush of one rectangle, row by row, so a cursor strip does not
+/// FromDevice clflush of the CPU-mapped GEM span covering a scanout damage
+/// rect (including pitch padding between the first and last pixel). Needed
+/// only when the CPU will *read* the buffer (CPU blit / CE staging repack).
+fn dma_sync_scanout_src_from_device(
+    vaddr: usize,
+    fb_size: usize,
+    src_stride: usize,
+    blit_x: u32,
+    blit_y: u32,
+    blit_w: u32,
+    blit_h: u32,
+) {
+    let sync_start_px = (blit_y as usize)
+        .saturating_mul(src_stride)
+        .saturating_add(blit_x as usize);
+    let sync_end_px = (blit_y as usize)
+        .saturating_add((blit_h as usize).saturating_sub(1))
+        .saturating_mul(src_stride)
+        .saturating_add(blit_x as usize)
+        .saturating_add(blit_w as usize);
+    if sync_end_px <= sync_start_px {
+        return;
+    }
+    let byte_off = sync_start_px.saturating_mul(4).min(fb_size);
+    let byte_len = sync_end_px
+        .saturating_sub(sync_start_px)
+        .saturating_mul(4)
+        .min(fb_size.saturating_sub(byte_off));
+    zcore_drivers::utils::dma_sync::dma_sync_wb_from_device(vaddr + byte_off, byte_len);
+}
+
+/// FromDevice clflush of one rectangle, row by row, so a 64×64 cursor does not
 /// clflush a megabyte of pitch padding. Used after CE-direct present so
 /// [`blit_cursor_patch`] can read GPU pixels from sysmem without a full-frame
 /// sync.
@@ -1051,8 +983,6 @@ fn dma_sync_gem_rect_from_device(
 ///
 /// Used by the software KMS path (no GPU driver): the dumb buffer is contiguous
 /// physical memory, which we map and blit into the display framebuffer.
-/// Always a full frame: partial damage clips on the WC scanout left
-/// squares and lines.
 pub fn scanout(fb_id: u32) -> bool {
     scanout_region(fb_id, None)
 }
@@ -1161,19 +1091,6 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     let mut sync_elapsed = Duration::ZERO;
     let mut cpu_src_synced = false;
     let gem_cpu_mapped = zcore_drivers::scheme::gem_mmap::lookup(fb.gem_handle_id).is_some();
-    // GPU-written nouveau GEM: CE must NOT snoop the kernel WB alias (stale
-    // lines from cursor blend / a previous CPU blit would ghost). CPU-written
-    // dumb buffers keep a coherent source so dirty cache lines are visible
-    // without a ToDevice clflush.
-    let src_coherent = !gem_cpu_mapped;
-    let gem_sync = gem_cpu_mapped.then_some(GemSrcSync {
-        vaddr,
-        fb_size: fb.size,
-        fb_w: fb_width,
-        fb_h: fb_height,
-        origin_x: blit_x,
-        origin_y: blit_y,
-    });
 
     // CE-offloaded present: copy the frame (sysmem) into the scanout FB (the
     // console GPU's VRAM) with a GPU copy engine instead of CPU stores over
@@ -1183,24 +1100,26 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     // at PCIe speed. The flat CE copy needs equal strides: when the client's
     // pitch differs from the scanout pitch, the rows are first CPU-repacked
     // into a sysmem staging buffer at the scanout pitch (cached writes,
-    // ~GB/s) and the CE copies from there. Full-frame only: the CE always
-    // copies from the buffer's start.
+    // ~GB/s) and the CE copies from there. Only for full-frame scanouts: the
+    // CE always copies from the buffer's start, so it can't honor a rect.
     //
     // OPT-IN: gated on `nvidia.cepresent` (see CE_PRESENT_ENABLED) — the CE
     // DMA per present destabilized the desktop on real hardware once, so the
     // default present is still the CPU blit (ce_present wedges itself off on
     // the first confirmed failure).
     //
-    // Cache vs. CE-direct: the 2D CE historically used COHERENT_SYSMEM, so
-    // skipping FromDevice let the engine DMA stale WB lines (cursor-shaped
-    // ghosts, leftover previous frame — GPU-dependent). GPU-written GEMs now
-    // take a NONCOHERENT source (DRAM, GPU pixels) and skip the 4.2 MB
-    // clflush; CPU-written dumb buffers stay coherent. FromDevice is only
-    // paid when the CPU actually reads the GEM (repack / CPU blit), band by
-    // band so pitch padding is not flushed and the working set stays hot.
+    // Cache sync vs. CE-direct: `dma_sync_wb_from_device` is a clflush of the
+    // whole GEM (~4.2 MB, milliseconds). That exists so a CPU *read* of the
+    // WB physmap alias sees GPU-rendered pixels (CPU blit / CE staging
+    // repack). CE-direct (`ce_present_2d_pitched` or flat `ce_present` from
+    // `fb.phys_addr`) DMAs from physical sysmem itself and does not consult
+    // the CPU cache, so the full FromDevice is wasted. NVK writes the GEM via
+    // the GPU, not CPU-mapped WB stores, so a ToDevice clflush is not needed
+    // either (that would be the same 4.2 MB cost). Skip both; if CE frames
+    // look stale, restore a sync here — the present klog's `sync Xus` is the
+    // tell (should be ~0 on CE-direct).
     let mut blitted_by_ce = false;
-    let ce_enabled = CE_PRESENT_ENABLED.load(Ordering::Relaxed);
-    if ce_enabled {
+    if rect.is_none() && CE_PRESENT_ENABLED.load(Ordering::Relaxed) {
         if fb.pitch != info.pitch {
             // Pitched 2D CE path: the GPU copy engine reads directly from the
             // source buffer at fb.pitch and writes into the scanout FB at
@@ -1208,30 +1127,26 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
             // (client pitch 5504 → GOP scanout pitch 8192) this eliminates the
             // slow CPU reads from the uncached BAR1-backed source buffer.
             //
-            // Fallback: 2D fail that latches CE_PRESENT_WEDGED must NOT then
-            // CPU-repack the full frame only for flat CE to decline (that was
-            // a double full-frame BAR1 read). Repack only if some GPU can
-            // still take a copy.
+            // Fallback chain: 2D fails (CE_PRESENT_WEDGED latched) →
+            // FromDevice + repack+flat CE → CPU blit.
             let row_bytes = (blit_w as usize).saturating_mul(4) as u32;
             for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-                if d.ce_present_2d_pitched(
-                    fb.phys_addr,
-                    fb.pitch,
-                    info.pitch,
-                    row_bytes,
-                    blit_h,
-                    src_coherent,
-                ) {
+                if d.ce_present_2d_pitched(fb.phys_addr, fb.pitch, info.pitch, row_bytes, blit_h) {
                     blitted_by_ce = true;
                     break;
                 }
             }
-            if !blitted_by_ce
-                && kernel_hal::drivers::all_drm()
-                    .as_vec()
-                    .iter()
-                    .any(|d| d.ce_present_available())
-            {
+            // Fallback: CPU reads the GEM, so FromDevice first, then repack
+            // into staging at scanout pitch and flat CE.
+            if !blitted_by_ce {
+                if gem_cpu_mapped {
+                    let ts = kernel_hal::timer::timer_now();
+                    dma_sync_scanout_src_from_device(
+                        vaddr, fb.size, src_stride, blit_x, blit_y, blit_w, blit_h,
+                    );
+                    sync_elapsed = kernel_hal::timer::timer_now().saturating_sub(ts);
+                    cpu_src_synced = true;
+                }
                 let (ce_src_pa, ce_size) = ce_repack_to_staging(
                     pixels,
                     fb.phys_addr,
@@ -1239,15 +1154,11 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
                     info.pitch as usize,
                     blit_w,
                     blit_h,
-                    gem_sync.as_ref(),
-                    &mut sync_elapsed,
                 )
                 .unwrap_or((0, 0));
-                cpu_src_synced = gem_cpu_mapped;
                 if ce_src_pa != 0 && ce_size != 0 {
                     for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-                        // Staging is CPU-written WB; CE must snoop it.
-                        if d.ce_present(ce_src_pa, ce_size, true) {
+                        if d.ce_present(ce_src_pa, ce_size) {
                             blitted_by_ce = true;
                             break;
                         }
@@ -1259,7 +1170,7 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
             let ce_src_pa = fb.phys_addr;
             let ce_size = (info.pitch as u64) * (blit_h as u64);
             for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-                if d.ce_present(ce_src_pa, ce_size, src_coherent) {
+                if d.ce_present(ce_src_pa, ce_size) {
                     blitted_by_ce = true;
                     break;
                 }
@@ -1281,18 +1192,18 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
         // stale lines from the previous frame stay resident and the screen
         // stops repainting. (MOVNTDQA does not lift this: non-temporal loads
         // only bypass the cache on WC memory, not on this WB alias.)
+        if gem_cpu_mapped && !cpu_src_synced {
+            let ts = kernel_hal::timer::timer_now();
+            dma_sync_scanout_src_from_device(
+                vaddr, fb.size, src_stride, blit_x, blit_y, blit_w, blit_h,
+            );
+            sync_elapsed = kernel_hal::timer::timer_now().saturating_sub(ts);
+            cpu_src_synced = true;
+        }
         // Banded blit with IRQs briefly re-enabled between bands — see
-        // [`blit_chunked`]; when the source is a GPU-written GEM each band is
-        // FromDevice-invalidated just before its copy (`band_sync`), so the
-        // CPU never reads a stale cached line and pitch padding is never
-        // flushed. Honours a DIRTYFB damage rect when present.
+        // [`blit_chunked`]. Honours a DIRTYFB damage rect when present.
         if src_off < pixels.len() {
-            let band_sync = if gem_cpu_mapped && !cpu_src_synced {
-                gem_sync.as_ref()
-            } else {
-                None
-            };
-            sync_elapsed += blit_chunked(
+            blit_chunked(
                 &display,
                 blit_x,
                 blit_y,
@@ -1300,11 +1211,7 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
                 src_stride,
                 blit_w,
                 blit_h,
-                band_sync,
             );
-            if band_sync.is_some() {
-                cpu_src_synced = true;
-            }
         }
     }
     let t_blit = kernel_hal::timer::timer_now();
@@ -1473,15 +1380,6 @@ pub fn set_cursor_bo(handle_id: u32, w: u32, h: u32) -> bool {
         return true;
     }
     let vaddr = phys_to_virt(phys_addr as usize);
-    // The image was written by someone else — the GPU into a nouveau GEM on
-    // the `renderer=gl:nvidia` path, or userspace through a write-combining
-    // mapping of a dumb buffer — and we are about to read it through the
-    // kernel's cached WB alias. Without a FromDevice invalidate the snapshot
-    // below can be lines of a PREVIOUS cursor image, and since it is cached in
-    // `state.cursor.bitmap` the garbled pointer then persists until the next
-    // CURSOR_BO. One clflush of at most 64x64x4 bytes, on image change only —
-    // never on a move.
-    zcore_drivers::utils::dma_sync::dma_sync_wb_from_device(vaddr, px * 4);
     // SAFETY: contiguous physical buffer of `size` bytes, identity-mapped at
     // `vaddr`; we read exactly `px` u32 pixels (<= size/4).
     let src = unsafe { core::slice::from_raw_parts(vaddr as *const u32, px) };
@@ -1496,10 +1394,14 @@ pub fn set_cursor_bo(handle_id: u32, w: u32, h: u32) -> bool {
     // image to the driver's cursor plane. Done OUTSIDE the DRM lock -- the
     // upload goes through the RM gate and can take a few ms, and nothing in
     // the driver ever takes DRM_STATE. On success the hardware composites the
-    // pointer during scanout (`scanout()` stands down); on any failure the
-    // software path set up above simply stays in charge.
+    // pointer during scanout (scanout()/repaint_for_cursor stand down); on
+    // any failure the software path set up above simply stays in charge.
     if hw_cursor_wanted() {
-        let (cx, cy, bmp) = (state.cursor.x, state.cursor.y, state.cursor.bitmap.clone());
+        let (cx, cy, bmp) = (
+            state.cursor.x,
+            state.cursor.y,
+            state.cursor.bitmap.clone(),
+        );
         drop(state);
         let mut hw_ok = false;
         if let Some(bmp) = bmp {
@@ -1738,18 +1640,14 @@ fn blit_cursor_patch(
         slot.resize(need, 0);
     }
     let patch = &mut slot[..need];
-    // Scratch is reused across frames: blit only rows actually filled from
-    // the source, or a short GEM would replay a previous patch as a band.
-    let mut rows = 0usize;
     for r in 0..th {
         let src_y = y0 as usize + r;
         let src_off = src_y.saturating_mul(src_stride).saturating_add(x0 as usize);
         let dst_off = r * tw;
         let n = tw.min(pixels.len().saturating_sub(src_off));
-        if n < tw {
+        if n == 0 {
             break;
         }
-        rows = r + 1;
         patch[dst_off..dst_off + n].copy_from_slice(&pixels[src_off..src_off + n]);
         let cr = (y0 + r as i32) - cy;
         if cr < 0 || cr >= ch as i32 {
@@ -1785,10 +1683,7 @@ fn blit_cursor_patch(
             };
         }
     }
-    if rows == 0 {
-        return;
-    }
-    display.blit_from(x0 as u32, y0 as u32, patch, tw, tw as u32, rows as u32);
+    display.blit_from(x0 as u32, y0 as u32, patch, tw, tw as u32, th as u32);
 }
 
 /// Restore the `(x, y, w, h)` window of the display from the CRTC framebuffer
