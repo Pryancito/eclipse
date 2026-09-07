@@ -93,8 +93,14 @@ impl TimeVal {
 }
 
 impl TimeSpec {
+<<<<<<< HEAD
     /// Build from a kernel `Duration` (seconds since Unix epoch for wall clock).
     pub fn from_duration(time: Duration) -> TimeSpec {
+=======
+    /// create TimeSpec
+    pub fn now() -> TimeSpec {
+        let time = kernel_hal::timer::timer_now_realtime();
+>>>>>>> upstream/master
         TimeSpec {
             sec: time.as_secs() as usize,
             nsec: time.subsec_nanos() as usize,

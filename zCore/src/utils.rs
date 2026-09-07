@@ -136,6 +136,7 @@ pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
         warn!("No process to run, exit!");
         0
     };
+    log::logger().flush();
     std::process::exit(exit_code);
 }
 
@@ -192,6 +193,7 @@ pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
     // could not ack, so a shootdown that waited on it would stall.
     kernel_hal::mark_cpu_ipi_ready(kernel_hal::cpu::cpu_id() as usize);
     loop {
+<<<<<<< HEAD
         // In normal builds `run_until_idle` never returns (idle work happens in
         // the callback above); it only returns under `baremetal-test` when the
         // task queue is empty.
@@ -199,6 +201,14 @@ pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
         if !has_task && cfg!(feature = "baremetal-test") {
             proc.map(check_exit_code);
             kernel_hal::cpu::reset();
+=======
+        executor::run_until_idle();
+        if cfg!(feature = "baremetal-test") {
+            if let Some(proc) = proc.as_ref().filter(|proc| proc.exit_code().is_some()) {
+                check_exit_code(proc.clone());
+                kernel_hal::cpu::reset();
+            }
+>>>>>>> upstream/master
         }
         kernel_hal::interrupt::wait_for_interrupt();
     }

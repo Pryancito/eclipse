@@ -1242,7 +1242,6 @@ dependencies = [
  "uefi",
  "x2apic",
  "x86",
- "x86-smpboot",
  "x86_64",
  "zcore-drivers",
 ]
@@ -2380,7 +2379,12 @@ dependencies = [
 
 [[package]]
 name = "trapframe"
+<<<<<<< HEAD
 version = "0.9.0"
+=======
+version = "0.11.0"
+source = "git+https://github.com/rcore-os/trapframe-rs.git?rev=812bbfeb07f5726a834c7d1175eecdfbe6e1dd44#812bbfeb07f5726a834c7d1175eecdfbe6e1dd44"
+>>>>>>> upstream/master
 dependencies = [
  "raw-cpuid 10.6.0",
  "x86_64",
@@ -2832,14 +2836,6 @@ dependencies = [
  "bit_field",
  "bitflags 1.3.2",
  "raw-cpuid 10.6.0",
-]
-
-[[package]]
-name = "x86-smpboot"
-version = "0.1.0"
-source = "git+https://github.com/rcore-os/x86-smpboot?rev=1069df3#1069df357e1cb212930f02c98b84debb6d17dc80"
-dependencies = [
- "x86",
 ]
 
 [[package]]

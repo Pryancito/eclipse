@@ -9,6 +9,7 @@
 
 use bitmap_allocator::BitAlloc;
 use core::ops::Range;
+<<<<<<< HEAD
 #[cfg(feature = "mem-debug")]
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -23,6 +24,19 @@ type FrameAlloc = bitmap_allocator::BitAlloc16M; // max 64G
 
 const PAGE_BITS: usize = 12;
 const MAX_MANAGED_PADDR_EXCLUSIVE: PhysAddr = 1usize << (PAGE_BITS + 24); // 64GiB
+=======
+#[cfg(not(feature = "libos"))]
+use kernel_hal::mem::phys_to_virt;
+use kernel_hal::sync::Mutex;
+use kernel_hal::PhysAddr;
+
+type FrameAlloc = bitmap_allocator::BitAlloc16M; // 16M frames
+
+// LibOS uses the host page size.  In particular Apple Silicon has 16 KiB
+// pages, so allocating frames in hard-coded 4 KiB units produces file offsets
+// that mmap(2) rejects with EINVAL.
+const PAGE_BITS: usize = kernel_hal::PAGE_SIZE.trailing_zeros() as usize;
+>>>>>>> upstream/master
 
 static FRAME_ALLOCATOR: Mutex<FrameAlloc> = Mutex::new(FrameAlloc::DEFAULT);
 
@@ -90,7 +104,29 @@ fn frame_idx_to_phys_addr(idx: usize) -> PhysAddr {
 pub fn insert_regions(regions: &[Range<PhysAddr>]) {
     debug!("init_frame_allocator regions: {regions:x?}");
     let mut ba = FRAME_ALLOCATOR.lock();
+    #[cfg(not(feature = "libos"))]
+    const DYNAMIC_HEAP_SIZE: usize = 512 * 1024 * 1024;
+    #[cfg(not(feature = "libos"))]
+    const DYNAMIC_HEAP_ALIGN: usize = 256 * 1024 * 1024;
+    #[cfg(not(feature = "libos"))]
+    let heap_region = regions.iter().find_map(|region| {
+        let start = (region.start + DYNAMIC_HEAP_ALIGN - 1) & !(DYNAMIC_HEAP_ALIGN - 1);
+        (start + DYNAMIC_HEAP_SIZE <= region.end).then_some(start..start + DYNAMIC_HEAP_SIZE)
+    });
+    #[cfg(not(feature = "libos"))]
+    if let Some(region) = &heap_region {
+        unsafe {
+            HEAP_ALLOCATOR
+                .lock()
+                .add_to_heap(phys_to_virt(region.start), phys_to_virt(region.end));
+        }
+        info!("Dynamic heap region: {region:#x?}");
+    }
+    #[cfg(feature = "libos")]
+    let heap_region: Option<Range<PhysAddr>> = None;
+
     for region in regions {
+<<<<<<< HEAD
         let mut start = region.start.min(MAX_MANAGED_PADDR_EXCLUSIVE);
         let end = region.end.min(MAX_MANAGED_PADDR_EXCLUSIVE);
         if start < 0x1000 {
@@ -122,6 +158,30 @@ pub fn insert_regions(regions: &[Range<PhysAddr>]) {
                 range_start,
                 range_end,
                 mib
+=======
+        let frame_start = phys_addr_to_frame_idx(region.start);
+        let frame_end = phys_addr_to_frame_idx(region.end - 1) + 1;
+
+        if let Some(heap) = heap_region
+            .as_ref()
+            .filter(|heap| region.start <= heap.start && heap.end <= region.end)
+        {
+            let heap_start = phys_addr_to_frame_idx(heap.start);
+            let heap_end = phys_addr_to_frame_idx(heap.end);
+            if frame_start < heap_start {
+                ba.insert(frame_start..heap_start);
+            }
+            if heap_end < frame_end {
+                ba.insert(heap_end..frame_end);
+            }
+        } else if frame_start < frame_end {
+            ba.insert(frame_start..frame_end);
+        }
+        if frame_start < frame_end {
+            info!(
+                "Frame allocator: add range {:#x?}",
+                frame_idx_to_phys_addr(frame_start)..frame_idx_to_phys_addr(frame_end),
+>>>>>>> upstream/master
             );
         }
     }

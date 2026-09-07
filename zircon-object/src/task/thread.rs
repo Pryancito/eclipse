@@ -700,6 +700,11 @@ impl Thread {
         Ok(report)
     }
 
+    /// Get the thread's version 1 exception report.
+    pub fn get_thread_exception_info_v1(&self) -> ZxResult<ExceptionReportV1> {
+        Ok(self.get_thread_exception_info()?.as_v1())
+    }
+
     /// Get the thread state.
     pub fn state(&self) -> ThreadState {
         self.inner.lock().state()
@@ -739,6 +744,19 @@ impl Thread {
     /// Get the logical CPU core this thread last ran on.
     pub fn last_cpu(&self) -> u32 {
         self.last_cpu.load(Ordering::Relaxed)
+    }
+
+    /// Get scheduler runtime statistics for this thread.
+    pub fn get_runtime_info(&self) -> TaskRuntimeInfo {
+        let runtime = self.get_time();
+        TaskRuntimeInfo {
+            cpu_time: runtime,
+            // zCore does not track run-queue latency separately yet.  Report
+            // elapsed scheduled time so callers can still observe progress.
+            queue_time: runtime,
+            page_fault_time: 0,
+            lock_contention_time: 0,
+        }
     }
 
     /// Set this thread as the first thread of a process.
@@ -1098,6 +1116,7 @@ pub struct ThreadInfo {
     cpu_affinity_mask: [u64; 8],
 }
 
+<<<<<<< HEAD
 /// Number of threads currently inside the executor's `poll` — i.e. actually
 /// occupying a CPU right now. It is bracketed around [`ThreadSwitchFuture::poll`]
 /// (the single point every scheduled thread is polled through).
@@ -1140,6 +1159,35 @@ pub fn running_thread_count() -> usize {
     RUNNING_THREADS.load(Ordering::Relaxed)
 }
 
+=======
+/// Runtime accounting returned by the current `ZX_INFO_TASK_RUNTIME` topic.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct TaskRuntimeInfo {
+    cpu_time: u64,
+    queue_time: u64,
+    page_fault_time: u64,
+    lock_contention_time: u64,
+}
+
+/// Runtime accounting returned by `ZX_INFO_TASK_RUNTIME_V1`.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct TaskRuntimeInfoV1 {
+    cpu_time: u64,
+    queue_time: u64,
+}
+
+impl From<TaskRuntimeInfo> for TaskRuntimeInfoV1 {
+    fn from(info: TaskRuntimeInfo) -> Self {
+        Self {
+            cpu_time: info.cpu_time,
+            queue_time: info.queue_time,
+        }
+    }
+}
+
+>>>>>>> upstream/master
 struct ThreadSwitchFuture {
     thread: Arc<Thread>,
     // Plain spin mutex (NOT `lock::Mutex`): this guard is held across the inner

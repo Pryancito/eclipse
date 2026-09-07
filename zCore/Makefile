@@ -1,8 +1,18 @@
 ################ Arguments ################
 
-ARCH ?= x86_64
+HOST_ARCH := $(shell uname -m)
+ifeq ($(HOST_ARCH),arm64)
+  HOST_ARCH := aarch64
+endif
+
+ifneq ($(filter 1 libos,$(LIBOS) $(PLATFORM)),)
+  ARCH ?= $(HOST_ARCH)
+else
+  ARCH ?= x86_64
+endif
 PLATFORM ?= qemu
 MODE ?= release
+<<<<<<< HEAD
 # warn (not error): the kernel routes its userspace-crash diagnostics through
 # log::warn! — the "unhandled page fault ... -> SIGSEGV" line plus the [crash]
 # dump of registers and the code bytes around the faulting PC (loader/src/
@@ -11,6 +21,10 @@ MODE ?= release
 # `make ... LOG=error` for a quiet build.
 LOG ?= error
 LINUX ?= 1
+=======
+LOG ?= info
+LINUX ?=
+>>>>>>> upstream/master
 MOCK ?=
 LIBOS ?=
 TEST ?=
@@ -23,7 +37,17 @@ V ?=
 USER ?=
 ZBI ?= bringup
 
+<<<<<<< HEAD
 SMP ?= 6
+=======
+ifeq ($(ARCH), x86_64)
+  SMP ?= 4
+else
+  SMP ?= 1
+endif
+BOOT_DISK_READONLY ?= off
+X64_CPU ?= Haswell,+smap,-check,+fsgsbase
+>>>>>>> upstream/master
 ACCEL ?=
 IFACE ?= $(shell ip route show | grep default | grep -oE 'dev [^ ]+' | cut -d' ' -f2)
 ifeq ($(IFACE),)
@@ -119,7 +143,14 @@ ifeq ($(LINUX), 1)
 else ifeq ($(USER), 1)
   user_img := ../zircon-user/target/zcore-user.zbi
 else
-  user_img := ../prebuilt/zircon/x64/$(ZBI).zbi
+  ifeq ($(ARCH), x86_64)
+    zircon_arch := x64
+  else ifeq ($(ARCH), aarch64)
+    zircon_arch := arm64
+  else
+    zircon_arch := $(ARCH)
+  endif
+  user_img := ../prebuilt/zircon/$(zircon_arch)/$(ZBI).zbi
 endif
 # Default: the QEMU live SFS (`x86_64.img`, desktop + payloads). `make iso`
 # overrides this with `ignored/target/iso-initramfs.img` (installer only).
@@ -178,7 +209,7 @@ export ARCH
 export SMP
 export PLATFORM
 export LOG
-export USER_IMG=$(realpath $(user_img))
+export USER_IMG=$(abspath $(user_img))
 
 ################ Cargo features ################
 
@@ -189,8 +220,8 @@ else
 endif
 
 ifeq ($(LIBOS), 1)
-  ifneq ($(ARCH), $(shell uname -m))
-    $(error "ARCH" must be "$(shell uname -m)" for libos mode)
+  ifneq ($(ARCH), $(HOST_ARCH))
+    $(error "ARCH" must be "$(HOST_ARCH)" for libos mode)
   endif
   features += libos
 else
@@ -204,9 +235,7 @@ else
 	features += board-c910light link-user-img
     endif
   else ifeq ($(ARCH), aarch64)
-  	ifeq ($(PLATFORM), raspi4b)
-  	  features += link-user-img
-  	endif
+	features += link-user-img
   endif
 endif
 
@@ -236,6 +265,10 @@ endif
 
 ################ Cargo build args ################
 
+ifeq ($(PLATFORM), qemu)
+  features += qemu-debug-console
+endif
+
 build_args := --features "$(features)"
 
 ifneq ($(LIBOS), 1) # no_std
@@ -252,24 +285,52 @@ endif
 
 ################ QEMU options ################
 
+<<<<<<< HEAD
 qemu_opts := -smp $(SMP) -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0
+=======
+KERNEL_LOG ?= $(abspath ../target/kernel-$(ARCH).log)
+qemu_opts := -smp $(SMP) -no-reboot
+ifeq ($(PLATFORM), qemu)
+  ifeq ($(ARCH), x86_64)
+    qemu_opts += -debugcon file:$(KERNEL_LOG)
+  else
+    qemu_opts += -chardev file,id=kernel-log,path=$(KERNEL_LOG) -semihosting-config enable=on,target=native,chardev=kernel-log
+  endif
+endif
+ifeq ($(BOOT_DISK_READONLY), on)
+  qemu_fat_prefix := fat:
+  qemu_fat_interface := virtio
+else
+  qemu_fat_prefix := fat:rw:
+  qemu_fat_interface := ide
+endif
+>>>>>>> upstream/master
 
 ifeq ($(ARCH), x86_64)
   qemu_opts += \
 		-machine q35 \
+<<<<<<< HEAD
 		-cpu Haswell,+smap,-check,+fsgsbase \
 		-m 4G \
 		-serial mon:stdio \
 		-serial file:/tmp/serial.out \
 		-drive format=raw,if=pflash,readonly=on,file=$(ovmf) \
 		$(x86_esp_drive) \
+=======
+		-cpu $(X64_CPU) \
+		-m 1G \
+		-serial mon:stdio \
+		-serial file:/tmp/serial.out \
+		-drive format=raw,if=pflash,readonly=on,file=$(ovmf) \
+		-drive if=$(qemu_fat_interface),format=raw,readonly=$(BOOT_DISK_READONLY),file=$(qemu_fat_prefix)$(esp) \
+>>>>>>> upstream/master
 		-nic none
 else ifeq ($(ARCH), riscv64)
   qemu_opts += \
 		-machine virt \
+		-cpu rv64,v=true,vext_spec=v1.0 \
 		-bios default \
 		-m 1G \
-		-no-reboot \
 		-serial mon:stdio \
 		-serial file:/tmp/serial.out \
 		-kernel $(kernel_img) \
@@ -282,10 +343,13 @@ else ifeq ($(ARCH), aarch64)
 		-m 1G \
 		-serial mon:stdio \
 		-serial file:/tmp/serial.out \
-		-bios ../ignored/target/aarch64/firmware/QEMU_EFI.fd \
-		-hda fat:rw:disk \
+		-bios ../prebuilt/firmware/aarch64/QEMU_EFI.fd \
+		-drive format=raw,readonly=$(BOOT_DISK_READONLY),file=$(qemu_fat_prefix)disk
+  ifeq ($(LINUX), 1)
+    qemu_opts += \
 		-drive file=aarch64.img,if=none,format=raw,id=x0 \
 		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+  endif
 endif
 
 qemu_opts += \
@@ -423,7 +487,7 @@ debug: build debugrun
 endif
 
 .PHONY: justrun
-justrun: $(qemu_disk)
+justrun: $(if $(filter on,$(DISK)),$(qemu_disk))
 ifeq ($(ARCH), x86_64)
 	$(sed) 's#cmdline=.*#cmdline=$(CMDLINE)#' $(esp)/EFI/Boot/rboot.conf
   ifeq ($(have_vfat),yes)
@@ -474,8 +538,12 @@ kernel:
 	@echo Building zCore kernel
 	SMP=$(SMP) cargo build $(build_args)
 ifeq ($(ARCH), aarch64)
+ifneq ($(LIBOS), 1)
 	@mkdir -p disk/EFI/Boot
+	@cp ../prebuilt/firmware/aarch64/aarch64_uefi.efi disk/EFI/Boot/bootaa64.efi
+	@cp ../prebuilt/firmware/aarch64/Boot.json disk/EFI/Boot/Boot.json
 	@cp ../target/aarch64/$(MODE)/zcore disk/os
+endif
 endif
 
 .PHONY: disasm

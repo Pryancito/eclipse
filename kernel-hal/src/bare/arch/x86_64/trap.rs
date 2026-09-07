@@ -862,6 +862,7 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
 
     match TrapReason::from(tf.trap_num, tf.error_code) {
         TrapReason::HardwareBreakpoint | TrapReason::SoftwareBreakpoint => breakpoint(),
+<<<<<<< HEAD
         TrapReason::PageFault(vaddr, flags) => {
             // [diag] Stash the faulting instruction pointer so the kernel-side
             // page-fault handler can name the exact code that faulted (the
@@ -882,6 +883,16 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                 && try_skip_null_execute_call(tf, vaddr)
             {
                 return;
+=======
+        TrapReason::PageFault(vaddr, flags) => crate::KHANDLER.handle_page_fault(vaddr, flags),
+        TrapReason::Interrupt(vector) => {
+            crate::interrupt::handle_irq(vector);
+            if vector == X86_INT_APIC_TIMER {
+                let current_thread = crate::thread::get_current_thread();
+                crate::thread::set_current_thread(None);
+                executor::handle_timeout();
+                crate::thread::set_current_thread(current_thread);
+>>>>>>> upstream/master
             }
             crate::KHANDLER.handle_page_fault(vaddr, flags)
         }

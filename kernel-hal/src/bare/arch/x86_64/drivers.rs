@@ -266,6 +266,7 @@ pub(super) fn init() -> DeviceResult {
         }
     }
 
+<<<<<<< HEAD
     // PS/2 Keyboard and Mouse initialization and registration
     let ps2_input = Arc::new(zcore_drivers::input::Ps2Input::new());
     irq.register_device(trap::X86_ISA_IRQ_KEYBOARD, ps2_input.clone().upcast())?;
@@ -290,6 +291,21 @@ pub(super) fn init() -> DeviceResult {
     // once GPE draining lands and can be validated on hardware.
     if crate::KCONFIG.cmdline.contains("acpi.powerbtn") {
         init_acpi_power_button(&irq);
+=======
+    irq.register_local_apic_handler(trap::X86_INT_APIC_TIMER, Box::new(super::trap::super_timer))?;
+    init_local_timer();
+
+    drivers::add_device(Device::Irq(irq));
+
+    #[cfg(not(feature = "no-pci"))]
+    {
+        // PCI scan
+        use zcore_drivers::bus::pci;
+        let pci_devs = pci::init(None)?;
+        for d in pci_devs.into_iter() {
+            drivers::add_device(d);
+        }
+>>>>>>> upstream/master
     }
 
     use x2apic::lapic::{TimerDivide, TimerMode};
@@ -516,4 +532,15 @@ pub(super) fn init() -> DeviceResult {
 
     crate::klog_info!("Eclipse: drivers init complete");
     Ok(())
+}
+
+pub(super) fn init_local_timer() {
+    use x2apic::lapic::{TimerDivide, TimerMode};
+    let apic = Apic::local_apic();
+    apic.set_timer_mode(TimerMode::Periodic);
+    apic.set_timer_divide(TimerDivide::Div1);
+    let cycles =
+        super::cpu::cpu_frequency() as u64 * 1_000_000 / super::super::timer::TICKS_PER_SEC;
+    apic.set_timer_initial(cycles as u32);
+    apic.disable_timer();
 }

@@ -4,7 +4,9 @@ use x2apic::lapic::{
 };
 
 use super::{consts, Phys2VirtFn};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
+<<<<<<< HEAD
 static mut LOCAL_APIC: Option<LocalApic> = None;
 static mut BSP_ID: Option<u32> = None;
 
@@ -22,6 +24,19 @@ fn x2apic_active() -> bool {
     const EXTD: u64 = 1 << 10;
     let apic_base = unsafe { x86_64::registers::model_specific::Msr::new(IA32_APIC_BASE).read() };
     apic_base & EXTD != 0
+=======
+// APIC MMIO addresses are CPU-local, but the driver's mutable configuration
+// must also be private to each CPU.
+static mut LOCAL_APICS: [Option<LocalApic>; 256] = [const { None }; 256];
+static APIC_BASE: AtomicUsize = AtomicUsize::new(0);
+static BSP_ID: AtomicU8 = AtomicU8::new(0);
+
+fn cpu_id() -> u8 {
+    raw_cpuid::CpuId::new()
+        .get_feature_info()
+        .unwrap()
+        .initial_local_apic_id()
+>>>>>>> upstream/master
 }
 
 pub struct LocalApic {
@@ -35,7 +50,9 @@ impl LocalApic {
 
     pub unsafe fn get<'a>() -> &'a mut LocalApic {
         unsafe {
-            let local_apic = &raw mut LOCAL_APIC;
+            let local_apic = (&raw mut LOCAL_APICS)
+                .cast::<Option<LocalApic>>()
+                .add(cpu_id() as usize);
             (*local_apic)
                 .as_mut()
                 .expect("Local APIC is not initialized by BSP")
@@ -45,7 +62,20 @@ impl LocalApic {
     pub unsafe fn init_bsp(phys_to_virt: Phys2VirtFn) {
         unsafe {
             let base_vaddr = phys_to_virt(xapic_base() as usize);
+<<<<<<< HEAD
             let mut inner = match LocalApicBuilder::new()
+=======
+            APIC_BASE.store(base_vaddr, Ordering::Release);
+            Self::init_current(base_vaddr);
+            assert!(Self::get().inner.is_bsp());
+            BSP_ID.store(cpu_id(), Ordering::Release);
+        }
+    }
+
+    unsafe fn init_current(base_vaddr: usize) {
+        unsafe {
+            let mut inner = LocalApicBuilder::new()
+>>>>>>> upstream/master
                 .timer_vector(consts::X86_INT_APIC_TIMER)
                 .error_vector(consts::X86_INT_APIC_ERROR)
                 .spurious_vector(consts::X86_INT_APIC_SPURIOUS)
@@ -66,6 +96,7 @@ impl LocalApic {
             };
             inner.enable();
 
+<<<<<<< HEAD
             if !inner.is_bsp() {
                 crate::klog_warn!(
                     "[lapic] init_bsp() on non-BSP core (id={:#x}); APIC routing may be incorrect",
@@ -80,15 +111,22 @@ impl LocalApic {
             );
             BSP_ID = Some(bsp_id);
             LOCAL_APIC = Some(LocalApic { inner });
+=======
+            let slot = (&raw mut LOCAL_APICS)
+                .cast::<Option<LocalApic>>()
+                .add(cpu_id() as usize);
+            slot.write(Some(LocalApic { inner }));
+>>>>>>> upstream/master
         }
     }
 
     pub unsafe fn init_ap() {
         unsafe {
-            Self::get().inner.enable();
+            Self::init_current(APIC_BASE.load(Ordering::Acquire));
         }
     }
 
+<<<<<<< HEAD
     /// Normalise the raw ID-register value into a hardware APIC ID.
     ///
     /// xAPIC keeps the id in bits 31:24 of the MMIO register at offset 0x20;
@@ -149,6 +187,14 @@ impl LocalApic {
     /// way to interrupt a wedged core and capture where it is stuck.
     pub fn send_nmi_all_others(&mut self) {
         unsafe { self.inner.send_nmi_all(IpiAllShorthand::AllExcludingSelf) }
+=======
+    pub fn bsp_id() -> u8 {
+        BSP_ID.load(Ordering::Acquire)
+    }
+
+    pub fn id(&mut self) -> u8 {
+        cpu_id()
+>>>>>>> upstream/master
     }
 
     pub fn eoi(&mut self) {

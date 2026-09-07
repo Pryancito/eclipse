@@ -131,6 +131,10 @@ hal_fn_impl! {
             lock::current_cpu_id()
         }
 
+        fn cpu_count() -> u32 {
+            super::smp::ONLINE.load(core::sync::atomic::Ordering::Acquire).count_ones().max(1)
+        }
+
         fn cpu_frequency() -> u16 {
             // Prefer measuring the TSC directly against the PIT: on modern
             // Intel the TSC runs at the nominal (non-turbo) frequency,
