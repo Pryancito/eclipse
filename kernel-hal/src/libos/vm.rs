@@ -64,7 +64,13 @@ impl GenericPageTable for PageTable {
     ) -> PagingResult<PageSize> {
         debug_assert!(is_aligned(vaddr));
         if let Some(flags) = flags {
-            MOCK_PHYS_MEM.mprotect(vaddr as _, PAGE_SIZE, flags);
+            // A page that was reserved but never faulted in has no host
+            // mapping: report it as a not-present PTE, exactly like the bare
+            // metal page table does, so `VmMapping::protect`'s `.ignore()`
+            // skips it instead of the mock aborting the whole process.
+            if !MOCK_PHYS_MEM.mprotect(vaddr as _, PAGE_SIZE, flags) {
+                return Err(PagingError::NotMapped);
+            }
         }
         Ok(crate::vm::BASE_PAGE_SIZE)
     }

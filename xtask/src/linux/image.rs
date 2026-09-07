@@ -475,8 +475,14 @@ impl super::LinuxRootfs {
 }
 
 /// DEBUG: repackear solo el initramfs SFS desde rootfs/x86_64 sin reconstruir
-/// nada más. `cargo test -p xtask -- --nocapture dbg_repack_initramfs`.
+/// nada más. `cargo test -p xtask -- --ignored --nocapture dbg_repack_initramfs`.
+///
+/// `#[ignore]`: this is a developer helper, not a test. It needs a rootfs
+/// that only `cargo rootfs` produces, so under plain `cargo test` (CI, a
+/// fresh checkout) it failed with "No such file or directory" and turned the
+/// whole workspace test run red.
 #[test]
+#[ignore = "debug helper: needs rootfs/x86_64 built by `cargo rootfs`; run with --ignored"]
 fn dbg_repack_initramfs() {
     let rootfs = PROJECT_DIR.join("rootfs").join("x86_64");
     let image = PROJECT_DIR.join("zCore").join("x86_64.img");
