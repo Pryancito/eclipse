@@ -1000,8 +1000,18 @@ fn drm_compute_pci_index() -> Option<usize> {
 /// `Failed to get DRM device: No such device` / `Failed to create GBM device`.
 /// A distinct fake BDF keeps the pairs as two drmDevices. NVK filters the
 /// alias by vendor `0x0000`. Do not point card0 at the console GPU.
+///
+/// The alias is NOT a display controller. libdrm only needs its `config`
+/// (vendor/device/revision) and the `subsystem` link; it never reads the PCI
+/// class. But userspace GPU inventories do: `fastfetch`, `lspci`-style tools
+/// and anything walking `/sys/bus/pci/devices` count every base-class `0x03`
+/// entry as a GPU, and with the alias advertised as `0x038000` a 2-GPU board
+/// showed a third "Unknown Device 0000". Base class `0x12` ("Processing
+/// accelerators") describes a compute-only node honestly and is skipped by
+/// every GPU enumerator.
 const COMPUTE_ALIAS_INDEX: usize = usize::MAX;
 const COMPUTE_ALIAS_BDF: &str = "0000:ee:00.0";
+const COMPUTE_ALIAS_CLASS: &str = "0x120000";
 
 fn compute_alias_needed() -> bool {
     matches!(
@@ -1033,7 +1043,7 @@ fn pci_dev_inode(index: usize) -> Result<Arc<dyn INode>> {
             name: COMPUTE_ALIAS_BDF.into(),
             vendor: "0x0000".into(),
             device: "0x0000".into(),
-            class: "0x038000".into(),
+            class: COMPUTE_ALIAS_CLASS.into(),
         }));
     }
     let devices = get_pci_devices();
