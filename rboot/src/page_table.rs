@@ -112,7 +112,8 @@ fn map_segment(
             type PageArray = [u64; Size4KiB::SIZE as usize / 8];
 
             let last_page = Page::containing_address(virt_start_addr + file_size - 1u64);
-            let last_frame = PhysFrame::<Size4KiB>::containing_address(phys_start_addr + file_size - 1u64);
+            let last_frame =
+                PhysFrame::<Size4KiB>::containing_address(phys_start_addr + file_size - 1u64);
             let last_page_ptr = last_frame.start_address().as_u64() as *mut PageArray;
             let temp_page_ptr = new_frame.start_address().as_u64() as *mut PageArray;
 

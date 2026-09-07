@@ -232,7 +232,11 @@ fn setoffset_ns(tv: &TimeValI64, nano: bool) -> Result<i64, LxError> {
         return Err(LxError::EINVAL);
     }
     let sec_ns = tv.sec.saturating_mul(1_000_000_000);
-    let frac_ns = if nano { frac } else { frac.saturating_mul(1_000) };
+    let frac_ns = if nano {
+        frac
+    } else {
+        frac.saturating_mul(1_000)
+    };
     Ok(sec_ns.saturating_add(frac_ns))
 }
 
@@ -1081,15 +1085,9 @@ mod adjtimex_tests {
             usec: 500_000,
         };
         assert_eq!(setoffset_ns(&us, false).unwrap(), 1_500_000_000);
-        let ns = TimeValI64 {
-            sec: 0,
-            usec: 250,
-        };
+        let ns = TimeValI64 { sec: 0, usec: 250 };
         assert_eq!(setoffset_ns(&ns, true).unwrap(), 250);
-        let neg = TimeValI64 {
-            sec: -1,
-            usec: 0,
-        };
+        let neg = TimeValI64 { sec: -1, usec: 0 };
         assert_eq!(setoffset_ns(&neg, false).unwrap(), -1_000_000_000);
     }
 }

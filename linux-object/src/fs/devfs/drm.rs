@@ -1406,11 +1406,7 @@ pub fn set_cursor_bo(handle_id: u32, w: u32, h: u32) -> bool {
     // pointer during scanout (scanout()/repaint_for_cursor stand down); on
     // any failure the software path set up above simply stays in charge.
     if hw_cursor_wanted() {
-        let (cx, cy, bmp) = (
-            state.cursor.x,
-            state.cursor.y,
-            state.cursor.bitmap.clone(),
-        );
+        let (cx, cy, bmp) = (state.cursor.x, state.cursor.y, state.cursor.bitmap.clone());
         drop(state);
         let mut hw_ok = false;
         if let Some(bmp) = bmp {

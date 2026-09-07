@@ -400,12 +400,8 @@ fn mk_apk_add(
         let has_pub = fs::read_dir(keys)
             .ok()
             .map(|it| {
-                it.flatten().any(|e| {
-                    e.path()
-                        .extension()
-                        .and_then(|x| x.to_str())
-                        == Some("pub")
-                })
+                it.flatten()
+                    .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("pub"))
             })
             .unwrap_or(false);
         if !has_pub {

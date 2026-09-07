@@ -1844,7 +1844,10 @@ mod tests {
         write_labwc_rc(&dir);
         let script = dir.join("usr/local/bin/eclipse-kbd");
         assert!(script.is_file());
-        if let Ok(status) = std::process::Command::new("sh").arg("-n").arg(&script).status()
+        if let Ok(status) = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&script)
+            .status()
         {
             assert!(status.success(), "eclipse-kbd does not parse as sh");
         }
@@ -1869,7 +1872,10 @@ mod tests {
         write_labwc_environment(&dir);
         let script = dir.join("usr/local/bin/eclipse-locale");
         assert!(script.is_file());
-        if let Ok(status) = std::process::Command::new("sh").arg("-n").arg(&script).status()
+        if let Ok(status) = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&script)
+            .status()
         {
             assert!(status.success(), "eclipse-locale does not parse as sh");
         }
@@ -1897,7 +1903,10 @@ mod tests {
         write_labwc_environment(&dir);
         let script = dir.join("usr/local/bin/eclipse-tz");
         assert!(script.is_file());
-        if let Ok(status) = std::process::Command::new("sh").arg("-n").arg(&script).status()
+        if let Ok(status) = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&script)
+            .status()
         {
             assert!(status.success(), "eclipse-tz does not parse as sh");
         }

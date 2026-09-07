@@ -2127,8 +2127,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                 return; // user-customized: leave it alone
             }
         }
-        let pulse_pcm = rootfs
-            .join("usr/lib/alsa-lib/libasound_module_pcm_pulse.so");
+        let pulse_pcm = rootfs.join("usr/lib/alsa-lib/libasound_module_pcm_pulse.so");
         let have_pulse = rootfs.join("usr/bin/pulseaudio").is_file() && pulse_pcm.is_file();
         let body = if have_pulse {
             b"# eclipse-generated ALSA routing (delete this line to take ownership).\n\
@@ -2162,7 +2161,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               \x20   type pulse\n\
               \x20   server unix:/run/pulse/native\n\
               }\n"
-                .as_slice()
+            .as_slice()
         } else {
             b"# eclipse-generated ALSA routing (delete this line to take ownership).\n\
               #\n\
@@ -2187,7 +2186,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               \x20   type hw\n\
               \x20   card 0\n\
               }\n"
-                .as_slice()
+            .as_slice()
         };
         fs::write(&conf, body).unwrap();
     }
@@ -2282,10 +2281,16 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                 let mut updated = existing;
                 let mut changed = false;
                 for (prefix, line) in [
-                    ("pulse:", "pulse:x:51:51:PulseAudio:/var/run/pulse:/bin/false\n"),
+                    (
+                        "pulse:",
+                        "pulse:x:51:51:PulseAudio:/var/run/pulse:/bin/false\n",
+                    ),
                     // OpenNTPD's privilege-separation user (apk --no-scripts
                     // never runs the package's pre-install that creates it).
-                    ("_ntp:", "_ntp:x:123:123:OpenNTPD:/var/empty:/sbin/nologin\n"),
+                    (
+                        "_ntp:",
+                        "_ntp:x:123:123:OpenNTPD:/var/empty:/sbin/nologin\n",
+                    ),
                 ] {
                     if !updated.lines().any(|l| l.starts_with(prefix)) {
                         if !updated.ends_with('\n') {

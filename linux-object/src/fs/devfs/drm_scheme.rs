@@ -1391,7 +1391,11 @@ impl INode for DrmDev {
                         [const { AtomicBool::new(false) }; 256];
                     let slot = (self.minor & 0xff) as usize;
                     if !VERSION_LOGGED[slot].swap(true, Ordering::Relaxed) {
-                        let vname = if compute_node { "eclipse-compute" } else { "nouveau" };
+                        let vname = if compute_node {
+                            "eclipse-compute"
+                        } else {
+                            "nouveau"
+                        };
                         match drm::get_primary_driver() {
                             Some(d) => kernel_hal::klog_info!(
                                 "[drm] VERSION on /dev/dri/{} (minor={}) -> name=\"{}\"; primary_driver={:?} (client reached VERSION — DRM discovery OK; logged once per node)",
@@ -2861,8 +2865,7 @@ impl INode for DrmDev {
                 {
                     return Err(FsError::InvalidParam);
                 }
-                let last_submitted =
-                    req.flags & DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED != 0;
+                let last_submitted = req.flags & DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED != 0;
                 // LAST_SUBMITTED must include in-flight EXEC fences: the fast
                 // path returns before the GPU writes the landing zone, and NVK
                 // uses this query as the timeline value of that submit. Treating
@@ -2981,12 +2984,7 @@ impl INode for DrmDev {
                 } else {
                     zcore_drivers::scheme::syncobj::wait
                 };
-                match wait_fn(
-                    &handles,
-                    points.as_deref(),
-                    wait_all,
-                    deadline_us,
-                ) {
+                match wait_fn(&handles, points.as_deref(), wait_all, deadline_us) {
                     zcore_drivers::scheme::syncobj::WaitOutcome::Signaled {
                         first_signaled_index,
                     } => {

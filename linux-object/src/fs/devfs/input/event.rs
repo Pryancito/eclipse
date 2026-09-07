@@ -310,7 +310,10 @@ impl INode for EventDev {
             // (needs an on-screen cursor), not a direct touchscreen. Use the
             // scheme's InputProp bits so this cannot drift from capability().
             0x09 => {
-                let bytes = self.input.capability(CapabilityType::InputProp).to_le_bytes();
+                let bytes = self
+                    .input
+                    .capability(CapabilityType::InputProp)
+                    .to_le_bytes();
                 let n = size.min(bytes.len());
                 let mut ptr = kernel_hal::user::UserOutPtr::<u8>::from(data);
                 user_copy(ptr.write_array(&bytes[..n]))?;
