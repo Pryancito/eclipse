@@ -1038,6 +1038,10 @@ struct HidDev {
     last_report_len: usize,
     /// Count of reports seen on this endpoint (0 = never delivered a report).
     report_count: u64,
+    /// First bytes of the HID report descriptor (proto-0 interfaces), for
+    /// /proc/usbhid. Empty for boot-protocol devices (no descriptor read).
+    report_desc: [u8; 64],
+    report_desc_len: usize,
 }
 
 impl XhciInner {
@@ -2079,6 +2083,7 @@ impl XhciInner {
         report_desc_len: u16,
         vid: u16,
         pid: u16,
+        desc_out: &mut ([u8; 64], usize),
     ) -> DeviceResult<u8> {
         if is_vm_abs_tablet(vid, pid, proto) {
             return Ok(HID_PROTO_TABLET);
@@ -2092,7 +2097,7 @@ impl XhciInner {
         // protocol 0: real hardware. Never default this to tablet — that flag
         // silences PS/2 and boot-protocol USB mice (keyboard still works).
         let sniffed = if report_desc_len > 0 {
-            self.sniff_hid_report(slot, iface, report_desc_len)
+            self.sniff_hid_report(slot, iface, report_desc_len, desc_out)
                 .unwrap_or(HidClass::Unknown)
         } else {
             HidClass::Unknown
@@ -2126,7 +2131,13 @@ impl XhciInner {
         Ok(role)
     }
 
-    fn sniff_hid_report(&mut self, slot: u8, iface: u8, report_desc_len: u16) -> Option<HidClass> {
+    fn sniff_hid_report(
+        &mut self,
+        slot: u8,
+        iface: u8,
+        report_desc_len: u16,
+        desc_out: &mut ([u8; 64], usize),
+    ) -> Option<HidClass> {
         let len = (report_desc_len as usize).clamp(1, 1024);
         let buf_len = len.div_ceil(64).max(1) * 64;
         let buf = DmaBuf::new(buf_len, 64).ok()?;
@@ -2157,6 +2168,12 @@ impl XhciInner {
         if raw.iter().all(|&b| b == 0) {
             return None;
         }
+        // Stash the first bytes for /proc/usbhid: the report descriptor is what
+        // tells us the report layout (report-ID prefix, field sizes) when a
+        // report-protocol pointer needs parsing.
+        let keep = raw.len().min(desc_out.0.len());
+        desc_out.0[..keep].copy_from_slice(&raw[..keep]);
+        desc_out.1 = keep;
         Some(classify_hid_report(&raw))
     }
 
@@ -2175,8 +2192,17 @@ impl XhciInner {
         vid: u16,
         pid: u16,
     ) -> DeviceResult<()> {
-        let real_proto =
-            self.classify_hid_iface(slot, iface, proto, subclass, report_desc_len, vid, pid)?;
+        let mut report_desc: ([u8; 64], usize) = ([0; 64], 0);
+        let real_proto = self.classify_hid_iface(
+            slot,
+            iface,
+            proto,
+            subclass,
+            report_desc_len,
+            vid,
+            pid,
+            &mut report_desc,
+        )?;
         if real_proto == 0 {
             return Ok(());
         }
@@ -2196,7 +2222,17 @@ impl XhciInner {
         // with an *absolute* report. SET_PROTOCOL(boot=0) can switch them to a
         // 3-byte relative mouse report while we still parse 6–8 byte absolute
         // packets — the pointer then jumps at random. Leave report protocol as-is.
-        if real_proto == HID_PROTO_KEY || real_proto == HID_PROTO_MOUSE {
+        // SET_PROTOCOL(Boot) is defined ONLY for boot-subclass interfaces
+        // (bInterfaceSubClass == 1). A report-protocol interface (subclass 0)
+        // has no boot protocol to switch to, and forcing it there silenced a
+        // real composite keyboard+mouse's mouse interface completely — the
+        // mouse endpoint delivered zero reports (/proc/usbhid reports=0) while
+        // the boot keyboard on the same device worked. Only force boot where
+        // the interface actually advertises it; a report-protocol mouse stays
+        // in its native protocol and is parsed from its report descriptor.
+        if (real_proto == HID_PROTO_KEY || real_proto == HID_PROTO_MOUSE)
+            && subclass == HID_SUBCLASS_BOOT
+        {
             let _ = self.ep0_control_out0_optional(
                 slot,
                 trb_setup(0x21, HID_REQ_SET_PROTOCOL, 0, iface as u16, 0, 0),
@@ -2325,6 +2361,8 @@ impl XhciInner {
             last_report: [0; 8],
             last_report_len: 0,
             report_count: 0,
+            report_desc: report_desc.0,
+            report_desc_len: report_desc.1,
         });
         if real_proto == HID_PROTO_TABLET {
             warn!(
@@ -3220,6 +3258,14 @@ impl InputScheme for XhciUsbHid {
                 let _ = write!(s, "{}{:02x}", if i == 0 { "" } else { " " }, b);
             }
             let _ = writeln!(s, "]");
+            let dn = h.report_desc_len.min(h.report_desc.len());
+            if dn > 0 {
+                let _ = write!(s, "[usbhid]   report_desc=[");
+                for (i, b) in h.report_desc[..dn].iter().enumerate() {
+                    let _ = write!(s, "{}{:02x}", if i == 0 { "" } else { " " }, b);
+                }
+                let _ = writeln!(s, "]");
+            }
         }
         s
     }
