@@ -168,4 +168,11 @@ pub trait InputScheme: Scheme + EventScheme<Event = InputEvent> {
         let _ = axis;
         None
     }
+
+    /// Human-readable diagnostic dump for `/proc/usbhid`. Empty for devices
+    /// with nothing to report (the default). Used to debug real-hardware
+    /// pointer issues from a text VT when no kernel log is reachable.
+    fn debug_report(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
 }

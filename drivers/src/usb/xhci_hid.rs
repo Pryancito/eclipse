@@ -1027,6 +1027,17 @@ struct HidDev {
     enqueue_idx: usize,
     last_mods: u8,
     last_keys: [u8; 6],
+    /// Diagnostics for `/proc/usbhid` (see `XhciUsbHid::debug_report`).
+    iface: u8,
+    if_proto: u8,
+    subclass: u8,
+    vid: u16,
+    pid: u16,
+    /// Bytes of the most recently dispatched report, and its length.
+    last_report: [u8; 8],
+    last_report_len: usize,
+    /// Count of reports seen on this endpoint (0 = never delivered a report).
+    report_count: u64,
 }
 
 impl XhciInner {
@@ -2306,6 +2317,14 @@ impl XhciInner {
             enqueue_idx: 0,
             last_mods: 0,
             last_keys: [0; 6],
+            iface,
+            if_proto: proto,
+            subclass,
+            vid,
+            pid,
+            last_report: [0; 8],
+            last_report_len: 0,
+            report_count: 0,
         });
         if real_proto == HID_PROTO_TABLET {
             warn!(
@@ -2352,6 +2371,13 @@ impl XhciInner {
         unsafe {
             core::ptr::copy_nonoverlapping(v as *const u8, tmp.as_mut_ptr(), n);
         }
+
+        // Record the raw report for /proc/usbhid before parsing it, so a
+        // real-hardware pointer that never moves can be diagnosed from a text
+        // VT (its bytes reveal a report-ID prefix or a non-boot layout).
+        h.last_report = tmp;
+        h.last_report_len = report_len;
+        h.report_count = h.report_count.saturating_add(1);
 
         match h.protocol {
             HID_PROTO_KEY if h.report_len >= 8 => {
@@ -3089,10 +3115,19 @@ impl InputScheme for XhciUsbHid {
         let mut cap = InputCapability::empty();
         let tablet = self.has_tablet();
         let rel_mouse = self.has_rel_mouse();
+        // Advertise a relative pointer whenever no absolute tablet owns the
+        // pointer, even before a mouse has finished USB enumeration. libinput
+        // reads these capabilities ONCE, when it opens the evdev node, and on
+        // real hardware the compositor can open it before the mouse enumerates.
+        // Gating EV_REL on has_rel_mouse() then left the node a keyboard-only
+        // device for the rest of the session — the cursor was drawn but never
+        // moved while the keyboard worked. QEMU passes `usb-tablet`, so `tablet`
+        // is true there and the absolute path is unchanged.
+        let want_rel = !tablet || rel_mouse;
         match cap_type {
             CapabilityType::Event => {
                 cap.set_all(&[EV_SYN, EV_KEY]);
-                if rel_mouse || tablet {
+                if want_rel {
                     cap.set(EV_REL);
                 }
                 if tablet {
@@ -3114,15 +3149,15 @@ impl InputScheme for XhciUsbHid {
                 for code in KEY_ESC..=KEY_MICMUTE {
                     cap.set(code);
                 }
-                if rel_mouse || tablet {
+                if want_rel || tablet {
                     cap.set_all(&[BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA]);
                 }
             }
             CapabilityType::RelAxis => {
-                if tablet && !rel_mouse {
-                    cap.set_all(&[REL_WHEEL, REL_HWHEEL]);
-                } else if rel_mouse {
+                if want_rel {
                     cap.set_all(&[REL_X, REL_Y, REL_WHEEL, REL_HWHEEL]);
+                } else if tablet {
+                    cap.set_all(&[REL_WHEEL, REL_HWHEEL]);
                 }
             }
             CapabilityType::AbsAxis if tablet => cap.set_all(&[ABS_X, ABS_Y]),
@@ -3138,6 +3173,55 @@ impl InputScheme for XhciUsbHid {
         } else {
             None
         }
+    }
+
+    fn debug_report(&self) -> alloc::string::String {
+        use core::fmt::Write as _;
+        let mut s = alloc::string::String::new();
+        let abs = USB_ABS_POINTER.load(Ordering::Relaxed);
+        let _ = writeln!(
+            s,
+            "[usbhid] abs_pointer={} has_rel_mouse={} has_tablet={}",
+            abs,
+            self.has_rel_mouse(),
+            self.has_tablet()
+        );
+        let guard = self.inner.lock();
+        let Some(xi) = guard.as_ref() else {
+            let _ = writeln!(s, "[usbhid] controller not initialised");
+            return s;
+        };
+        if xi.hids.is_empty() {
+            let _ = writeln!(s, "[usbhid] no HID interfaces bound");
+        }
+        for h in xi.hids.iter() {
+            let role = match h.protocol {
+                HID_PROTO_KEY => "key",
+                HID_PROTO_MOUSE => "mouse(rel)",
+                HID_PROTO_TABLET => "tablet(abs)",
+                _ => "none",
+            };
+            let n = h.last_report_len.min(h.last_report.len());
+            let _ = write!(
+                s,
+                "[usbhid] slot={} iface={} bInterfaceProtocol={} subclass={} {:04x}:{:04x} \
+                 role={} report_len={} reports={} last=[",
+                h.slot_id,
+                h.iface,
+                h.if_proto,
+                h.subclass,
+                h.vid,
+                h.pid,
+                role,
+                h.report_len,
+                h.report_count,
+            );
+            for (i, b) in h.last_report[..n].iter().enumerate() {
+                let _ = write!(s, "{}{:02x}", if i == 0 { "" } else { " " }, b);
+            }
+            let _ = writeln!(s, "]");
+        }
+        s
     }
 }
 
