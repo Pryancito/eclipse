@@ -1384,11 +1384,12 @@ fn supervise(services: &mut BTreeMap<String, Service>) {
                 continue;
             }
         }
-        // Restart pass: any respawn service now without a live pid is respawned.
+        // Restart pass: any respawn service now without a live pid is restarted
+        // through the normal launcher so crash-restarts re-apply wait_socket /
+        // wait_path gates exactly like the first boot start.
         for svc in services.values_mut() {
             if svc.kind == Kind::Respawn && svc.pid.is_none() {
-                svc.pid = spawn(&svc.exec, svc.log.as_deref());
-                svc.started_at = Some(Instant::now());
+                start_service(svc);
             }
         }
     }
