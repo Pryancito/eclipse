@@ -576,9 +576,16 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                         shared_root.clone(),
                         pid,
                     );
-                    if vt == 0 {
-                        shared_root = Some(proc.linux().root_inode().clone());
-                        primary_shell = Some(proc);
+                    if let Some(proc) = proc {
+                        if vt == 0 {
+                            shared_root = Some(proc.linux().root_inode().clone());
+                            primary_shell = Some(proc);
+                        }
+                    } else {
+                        warn!(
+                            "SHELL {:?} failed on vt {}; continuing boot",
+                            shell_args[0], vt
+                        );
                     }
                 }
                 // Optionally run INIT as PID 1 (default /sbin/init -> eclipse-init,
