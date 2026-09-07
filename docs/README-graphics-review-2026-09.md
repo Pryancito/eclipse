@@ -48,20 +48,16 @@ sincronización del cursor BO (`0a5fd93`), el paso de `clippy` limpio
 (`a6addf1`), `linux-object/src/{ns,seccomp}.rs`, `tools/eclipse-nvkick`,
 `docs/README-flatpak.md` y `scripts/vbox-eclipse.sh`.
 
-**Recuperación sugerida** (los commits siguen en GitHub vía `refs/pull/*` y
-en este clon):
-
-```sh
-git fetch origin master
-git checkout -b recover-master 307f7e0          # el master local completo
-git merge 9757fe5                                # re-aplica "cambios en drm."
-# resolver conflictos (drm.rs, drm_scheme.rs, shadow_fb.rs, README-drm.md)
-git push origin recover-master:master            # es fast-forward: el merge desciende de 9757fe5
-```
-
-Equivalente: sobre `master` (`9757fe5`) hacer `git merge 307f7e0` y un push
-normal. En cualquier caso, conviene activar la protección de rama (*block
-force pushes*) en `master`.
+**Decisión del propietario: no recuperar.** Ese `master` es donde tenía
+«ruidos visuales» y `9757fe5` ("cambios en drm.") fue su corrección
+posterior, así que `master` sigue desde `9757fe5` sin los 20 commits. Se hizo
+una fusión de prueba (`bd96d25`, revertida a continuación sin reescribir
+historia) que sirve de referencia: los commits perdidos siguen alcanzables
+desde ella y desde `refs/pull/*` en GitHub. Lo único que se conserva de
+aquel `master` son dos piezas puntuales, traídas a mano antes de la fusión:
+el fence de `EXEC` con `RELEASE_WFI_EN` (#1072, `2f81243`) y
+`tools/lunarbar/src/i18n.rs` (sin él lunarbar no compila). Si tampoco se
+quiere el fence, basta con revertir `2f81243`.
 
 Los hallazgos siguientes se refieren a `9757fe5`. Donde el `master` local
 (`307f7e0`) ya corrige algo, se indica.
