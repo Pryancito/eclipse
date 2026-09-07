@@ -1,12 +1,14 @@
-//! Intel e1000e NIC driver — simplified for I219 (PCH-SPT / 82574L / QEMU e1000)
+//! Intel e1000e NIC driver — I219 (PCH-SPT) / 82574L / QEMU e1000e.
 //!
-//! Based on the Onyx (heatd/Onyx) and LittleKernel e1000 reference drivers.
-//! No AMT open sequence, no BM WUC filter management, no complex MDIO autoneg.
-//! Reset → read MAC → init rings → enable RX/TX → done.
+//! Ring/IRQ/smoltcp path is Eclipse-specific (LittleKernel-style legacy
+//! descriptors). MAC bring-up follows Linux e1000e (`netdev.c` / `mac.c` /
+//! `ich8lan.c`) for reset, 802.3x pause, TARC SPT errata and the i219
+//! descriptor-ring flush. Not ported, on purpose: FLAG2_DMA_BURST, RXCSUM
+//! offload, RFCTL_EXTEN, jumbo/packet-split, AMT, WOL, PTP, MSI-X.
 
 #![allow(unused_imports, dead_code)]
 
-const E1000E_DRIVER_TAG: &str = "e1000e-lk-rx3";
+const E1000E_DRIVER_TAG: &str = "e1000e-linux-fc";
 const E1000E_WATCHDOG_PERIOD_US: u64 = 2_000_000;
 const E1000E_WATCHDOG_FAST_US: u64 = 50_000;
 const E1000E_WATCHDOG_LOG_US: u64 = 5_000_000;
@@ -55,6 +57,31 @@ fn choose_itr(current: u32, rx_delta: u64, rx_burst: u64) -> u32 {
         return E1000E_ITR_LOW_LATENCY;
     }
     E1000E_ITR_BALANCED
+}
+
+/// Host RCTL for a standard-MTU untagged path (Linux `e1000_setup_rctl`
+/// minus jumbo / packet-split / RXALL). `SZ_2048` is bits 16:17 = 0.
+fn linux_rctl_host() -> u32 {
+    RCTL_EN | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_SECRC | RCTL_DPF
+}
+
+/// Pause-timer and FIFO watermarks from Linux `e1000e_reset`.
+///
+/// Returns `(pause_time, refresh_time, high_water, low_water)`. `pba_rx_kb`
+/// is the low 16 bits of PBA (Rx allocation in KB); 0 means "unprogrammed"
+/// and we fall back to the 82574 default of 26 KB.
+fn linux_fc_watermarks(is_pch: bool, pba_rx_kb: u32) -> (u32, u32, u32, u32) {
+    if is_pch {
+        return (0xFFFF, 0xFFFF, PCH_FC_HIGH_WATER, PCH_FC_LOW_WATER);
+    }
+    let pba = if pba_rx_kb == 0 { 26 } else { pba_rx_kb };
+    let rx_fifo = pba << 10;
+    const MAX_FRAME: u32 = 1518 + 4;
+    let hwm = ((rx_fifo * 9) / 10)
+        .min(rx_fifo.saturating_sub(MAX_FRAME))
+        & FCRTH_RTH;
+    let lwm = hwm.saturating_sub(8) & FCRTL_RTL;
+    (FC_PAUSE_TIME, 0, hwm, lwm)
 }
 
 macro_rules! e1000e_vlog {
@@ -109,6 +136,15 @@ const E1000E_PHY_CTRL: usize = 0x00F10 / 4;
 const E1000E_FEXTNVM6: usize = 0x00010 / 4;
 const E1000E_FEXTNVM7: usize = 0x000E4 / 4;
 const E1000E_PBA: usize = 0x01000 / 4;
+const E1000E_FCT: usize = 0x00030 / 4;
+const E1000E_FCAL: usize = 0x00028 / 4;
+const E1000E_FCAH: usize = 0x0002C / 4;
+const E1000E_FCTTV: usize = 0x00170 / 4;
+const E1000E_FCRTL: usize = 0x02160 / 4;
+const E1000E_FCRTH: usize = 0x02168 / 4;
+/// PCH-only refresh timer (Linux `E1000_FCRTV_PCH`).
+const E1000E_FCRTV_PCH: usize = 0x05F40 / 4;
+const E1000E_FEXTNVM11: usize = 0x5BBC / 4;
 const E1000E_ICR: usize = 0x00C0 / 4;
 const E1000E_ITR: usize = 0x00C4 / 4;
 const E1000E_IMS: usize = 0x00D0 / 4;
@@ -136,6 +172,7 @@ const E1000E_TXDCTL1: usize = E1000E_TXDCTL + (0x100 / 4);
 const E1000E_TIDV: usize = 0x03820 / 4;
 const E1000E_TADV: usize = 0x0382C / 4;
 const E1000E_TARC0: usize = 0x03840 / 4;
+const E1000E_TARC1: usize = 0x03940 / 4;
 const E1000E_RAL0: usize = 0x5400 / 4;
 const E1000E_RAH0: usize = 0x5404 / 4;
 const E1000E_MTA_BASE: usize = 0x5200 / 4;
@@ -168,6 +205,8 @@ const CTRL_SLU: u32 = 1 << 6;
 const CTRL_FRCSPD: u32 = 1 << 11;
 const CTRL_FRCDPX: u32 = 1 << 12;
 const CTRL_RST: u32 = 1 << 26;
+const CTRL_RFCE: u32 = 1 << 27;
+const CTRL_TFCE: u32 = 1 << 28;
 const CTRL_PHY_RST: u32 = 1 << 31;
 
 // STATUS register bits
@@ -219,7 +258,9 @@ const RCTL_EN: u32 = 1 << 1;
 const RCTL_SBP: u32 = 1 << 2;
 const RCTL_UPE: u32 = 1 << 3;
 const RCTL_MPE: u32 = 1 << 4;
+const RCTL_LPE: u32 = 1 << 5;
 const RCTL_BAM: u32 = 1 << 15;
+const RCTL_DPF: u32 = 1 << 22;
 const RCTL_SECRC: u32 = 1 << 26;
 
 // TCTL bits
@@ -251,6 +292,27 @@ const MANC_EN_MNG2HOST: u32 = 1 << 21;
 
 // TARC0
 const TARC0_SPEED_MODE: u32 = 1 << 21;
+/// SPT/KBL errata (Linux `e1000_configure_tx`): drop outstanding requests
+/// from 3 to 2 so the Tx hang / buffer overrun does not fire.
+const TARC0_CB_MULTIQ_3_REQ: u32 = 0x3000_0000;
+const TARC0_CB_MULTIQ_2_REQ: u32 = 0x2000_0000;
+const FEXTNVM11_DISABLE_MULR_FIX: u32 = 0x0000_2000;
+/// PCI config word: i219 unit-hang latch (Linux `PCICFG_DESC_RING_STATUS`).
+const PCICFG_DESC_RING_STATUS: u16 = 0xe4;
+const FLUSH_DESC_REQUIRED: u16 = 0x100;
+
+// IEEE 802.3x pause (Linux `e1000e_setup_link` / `e1000e_set_fc_watermarks`).
+const FLOW_CONTROL_ADDRESS_LOW: u32 = 0x00C2_8001;
+const FLOW_CONTROL_ADDRESS_HIGH: u32 = 0x0000_0100;
+const FLOW_CONTROL_TYPE: u32 = 0x8808;
+const FC_PAUSE_TIME: u32 = 0x0680;
+const FCRTH_RTH: u32 = 0x0000_FFF8;
+const FCRTL_RTL: u32 = 0x0000_FFF8;
+const FCRTL_XONE: u32 = 0x8000_0000;
+/// Standard MTU high/low water for pch2lan+ (I217/I218/I219). Jumbo uses a
+/// different pair; we do not advertise jumbo.
+const PCH_FC_HIGH_WATER: u32 = 0x05C20;
+const PCH_FC_LOW_WATER: u32 = 0x05048;
 
 // ULP (Ultra Low Power) disable — i219/PCH-SPT only. On real hardware the ME
 // firmware often leaves the PHY in ULP, so STATUS.LU never asserts. QEMU has no
@@ -1136,6 +1198,95 @@ impl E1000eHw {
     }
 
     // -----------------------------------------------------------------------
+    // IEEE 802.3x pause — port of Linux e1000e_setup_link + force_mac_fc +
+    // e1000e_set_fc_watermarks. Always programs the multicast pause address
+    // (harmless if FC is later disabled). Symmetric RFCE+TFCE: we honour
+    // incoming PAUSE and emit it when the Rx FIFO crosses the high water.
+    // -----------------------------------------------------------------------
+
+    unsafe fn configure_flow_control(&self) {
+        mmio_write(self.base, E1000E_FCT, FLOW_CONTROL_TYPE);
+        mmio_write(self.base, E1000E_FCAH, FLOW_CONTROL_ADDRESS_HIGH);
+        mmio_write(self.base, E1000E_FCAL, FLOW_CONTROL_ADDRESS_LOW);
+
+        let pba_rx = mmio_read(self.base, E1000E_PBA) & 0xFFFF;
+        let (pause, refresh, high, low) = linux_fc_watermarks(self.is_pch(), pba_rx);
+        mmio_write(self.base, E1000E_FCTTV, pause);
+        if self.is_pch() {
+            mmio_write(self.base, E1000E_FCRTV_PCH, refresh);
+        }
+        mmio_write(self.base, E1000E_FCRTL, low | FCRTL_XONE);
+        mmio_write(self.base, E1000E_FCRTH, high);
+
+        let mut ctrl = mmio_read(self.base, E1000E_CTRL);
+        ctrl |= CTRL_RFCE | CTRL_TFCE;
+        mmio_write(self.base, E1000E_CTRL, ctrl);
+        let _ = mmio_read(self.base, E1000E_CTRL);
+    }
+
+    // -----------------------------------------------------------------------
+    // i219: drain leftover rings before CTRL_RST (Linux e1000_flush_desc_rings).
+    // Failure to do this after kexec / a dirty reboot hangs the MAC until a
+    // PCI reset. No-op on discrete/QEMU and when the hang latch is clear.
+    // -----------------------------------------------------------------------
+
+    unsafe fn flush_desc_rings_spt(&mut self) {
+        if !self.is_pch_spt_or_later() {
+            return;
+        }
+        let f11 = mmio_read(self.base, E1000E_FEXTNVM11) | FEXTNVM11_DISABLE_MULR_FIX;
+        mmio_write(self.base, E1000E_FEXTNVM11, f11);
+
+        let hang = PCI_ACCESS.read16(&PortOpsImpl, self.pci_loc, PCICFG_DESC_RING_STATUS);
+        let tdlen = mmio_read(self.base, E1000E_TDLEN);
+        if hang == 0xFFFF || hang & FLUSH_DESC_REQUIRED == 0 || tdlen == 0 {
+            return;
+        }
+        self.flush_tx_ring_dummy();
+        let hang = PCI_ACCESS.read16(&PortOpsImpl, self.pci_loc, PCICFG_DESC_RING_STATUS);
+        if hang & FLUSH_DESC_REQUIRED != 0 {
+            // Momentarily re-enable RX with descriptor-granularity thresholds
+            // so the MAC retires in-flight DMA (Linux e1000_flush_rx_ring).
+            let rctl = mmio_read(self.base, E1000E_RCTL);
+            mmio_write(self.base, E1000E_RCTL, rctl & !RCTL_EN);
+            let _ = mmio_read(self.base, E1000E_STATUS);
+            Self::udelay(150);
+            let mut rxdctl = mmio_read(self.base, E1000E_RXDCTL) & 0xFFFF_C000;
+            rxdctl |= 0x1F | (1 << 8) | (1 << 24);
+            mmio_write(self.base, E1000E_RXDCTL, rxdctl);
+            mmio_write(self.base, E1000E_RCTL, rctl | RCTL_EN);
+            let _ = mmio_read(self.base, E1000E_STATUS);
+            Self::udelay(150);
+            mmio_write(self.base, E1000E_RCTL, rctl & !RCTL_EN);
+        }
+    }
+
+    unsafe fn flush_tx_ring_dummy(&mut self) {
+        let tctl = mmio_read(self.base, E1000E_TCTL);
+        mmio_write(self.base, E1000E_TCTL, tctl | TCTL_EN);
+        let tdt = (mmio_read(self.base, E1000E_TDT) as usize) % NUM_TX;
+        let desc = unsafe { &mut *self.tx_ring.as_ptr::<TxDesc>().add(tdt) };
+        write_volatile(&mut desc.addr, self.tx_ring.paddr() as u64);
+        write_volatile(&mut desc.len, 512);
+        write_volatile(&mut desc.cso, 0);
+        write_volatile(&mut desc.cmd, TX_CMD_IFCS);
+        write_volatile(&mut desc.status, 0);
+        write_volatile(&mut desc.css, 0);
+        write_volatile(&mut desc.special, 0);
+        dma_sync_rx_desc_span(
+            &self.tx_ring,
+            self.tx_ring_coherent,
+            tdt,
+            1,
+            size_of::<TxDesc>(),
+            DmaSyncDir::ToDevice,
+        );
+        fence(Ordering::SeqCst);
+        mmio_write(self.base, E1000E_TDT, ((tdt + 1) % NUM_TX) as u32);
+        Self::udelay(250);
+    }
+
+    // -----------------------------------------------------------------------
     // PHY soft reset — clears all PHY registers to power-on defaults
     // (including any BM WUC filters left by firmware)
     // -----------------------------------------------------------------------
@@ -1241,6 +1392,11 @@ impl E1000eHw {
             Self::udelay(1_000);
         }
 
+        // 3.5 i219: empty leftover descriptor rings before CTRL_RST (Linux
+        // `e1000_flush_desc_rings`). After kexec / a dirty reboot the MAC can
+        // otherwise enter a unit hang that only a PCI reset clears.
+        self.flush_desc_rings_spt();
+
         // 4. Clear WUC/WUFC so PHY WUC filter is disabled at the MAC level too
         mmio_write(self.base, E1000E_WUC, 0);
         mmio_write(self.base, E1000E_WUFC, 0);
@@ -1342,6 +1498,12 @@ impl E1000eHw {
         // 12.7 Kick off auto-negotiation explicitly via the PHY BMCR, in case
         //      SLU+ASDE alone didn't restart it after the ULP/LANPHYPC dance.
         self.restart_autoneg();
+
+        // 12.8 IEEE 802.3x pause (Linux `e1000e_setup_link` + `force_mac_fc`).
+        //      Without watermarks the Rx FIFO silently overflows under load
+        //      (MPC climbs, TCP windows up). Copper PHY autoneg does not
+        //      program CTRL.RFCE/TFCE for us.
+        self.configure_flow_control();
 
         // 13. Read MAC address
         self.read_mac_from_hw();
@@ -1471,7 +1633,7 @@ impl E1000eHw {
                 E1000E_TXDCTL1,
                 mmio_read(self.base, E1000E_TXDCTL),
             );
-            // IOSF PCIe compliance
+            // IOSF PCIe compliance (Linux `E1000_RCTL_RDMTS_HEX` into IOSFPC).
             let iosfpc = mmio_read(self.base, E1000E_IOSFPC);
             mmio_write(self.base, E1000E_IOSFPC, iosfpc | 0x0001_0000);
             let _ = mmio_read(self.base, E1000E_IOSFPC);
@@ -1481,12 +1643,25 @@ impl E1000eHw {
                 E1000E_TXDCTL,
                 TXDCTL_DMA_BURST | TXDCTL_FULL_TX_DESC_WB,
             );
+            // Linux erratum: program queue 1 identically on discrete parts too.
+            mmio_write(
+                self.base,
+                E1000E_TXDCTL1,
+                mmio_read(self.base, E1000E_TXDCTL),
+            );
         }
 
-        // TARC0 bit 0 is required for correct TX arbitration on 82574/ICH.
+        // TARC0 bit 0: unweighted RR (Linux FLAG_TARC_SET_BIT_ZERO, 82574/ICH).
+        // SPT/KBL: also cap outstanding requests at 2 (Tx hang errata).
         {
-            let tarc = mmio_read(self.base, E1000E_TARC0) | 1;
+            let mut tarc = mmio_read(self.base, E1000E_TARC0) | 1;
+            if self.is_pch_spt_or_later() {
+                tarc &= !TARC0_CB_MULTIQ_3_REQ;
+                tarc |= TARC0_CB_MULTIQ_2_REQ;
+            }
             mmio_write(self.base, E1000E_TARC0, tarc);
+            let tarc1 = mmio_read(self.base, E1000E_TARC1) | 1;
+            mmio_write(self.base, E1000E_TARC1, tarc1);
         }
 
         // TCTL: enable TX
@@ -1546,10 +1721,8 @@ impl E1000eHw {
         // No multiqueue
         mmio_write(self.base, E1000E_MRQC, 0);
 
-        // PCH: SRRCTL 2 KB + Drop_En. Discrete/QEMU: RCTL buffer size alone (LK).
-        if self.is_pch() {
-            mmio_write(self.base, E1000E_SRRCTL, 2 | (1 << 31));
-        }
+        // No SRRCTL: that register is igb-family. On 82574/I219 the offset is
+        // reserved (Linux e1000e never programs it for standard MTU).
 
         // PCH-SPT: must set RXDCTL.QUEUE_ENABLE (bit 25) before RCTL.EN.
         // Do not program Linux FLAG2_DMA_BURST here: on I219 it produced
@@ -1585,13 +1758,11 @@ impl E1000eHw {
         // Small settle before enabling RCTL
         Self::udelay(1_000);
 
-        // RCTL: LK-style — EN, promisc, mcast promisc, broadcast, 2048-byte
-        // buffers, strip Ethernet FCS. SECRC (bit 26) is a standard RCTL bit
-        // across the whole 8254x/e1000e family, not a PCH-only feature — gating
-        // it on is_pch() left every non-PCH part (82574L, and QEMU's e1000e
-        // model) delivering 4 extra FCS/garbage bytes on every received frame.
-        // `e1000.rs` sets it unconditionally for the same reason.
-        let rctl = RCTL_EN | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_SECRC;
+        // RCTL: Linux `e1000_setup_rctl` for standard MTU — EN, promisc,
+        // broadcast, strip FCS, discard pause frames (the MAC still honours
+        // them via RFCE; DPF keeps 802.3x PAUSE out of the host ring).
+        // SZ_2048 is the default (bits 16:17 clear, BSEX clear).
+        let rctl = linux_rctl_host();
         mmio_write(self.base, E1000E_RCTL, rctl);
         let _ = mmio_read(self.base, E1000E_RCTL);
 
@@ -4162,5 +4333,84 @@ mod itr_tune_tests {
             choose_itr(E1000E_ITR_LOW_LATENCY, E1000E_ITR_WINDOW_LOW + 1, 0),
             E1000E_ITR_BALANCED
         );
+    }
+}
+
+#[cfg(test)]
+mod linux_port_tests {
+    use super::*;
+
+    #[test]
+    fn rctl_matches_linux_setup_rctl_standard_mtu() {
+        let r = linux_rctl_host();
+        assert_eq!(r & RCTL_EN, RCTL_EN);
+        assert_eq!(r & RCTL_BAM, RCTL_BAM);
+        assert_eq!(r & RCTL_SECRC, RCTL_SECRC);
+        assert_eq!(r & RCTL_DPF, RCTL_DPF);
+        assert_eq!(r & RCTL_SBP, 0, "do not store bad packets");
+        assert_eq!(r & RCTL_LPE, 0, "standard MTU, no long packets");
+        assert_eq!(r & (3 << 16), 0, "SZ_2048 is bits 16:17 = 0");
+    }
+
+    #[test]
+    fn pch_watermarks_match_linux_pch2lan_standard_mtu() {
+        let (pause, refresh, high, low) = linux_fc_watermarks(true, 0);
+        assert_eq!(pause, 0xFFFF);
+        assert_eq!(refresh, 0xFFFF);
+        assert_eq!(high, 0x05C20);
+        assert_eq!(low, 0x05048);
+    }
+
+    #[test]
+    fn discrete_watermarks_from_pba_with_8_byte_granularity() {
+        let (pause, refresh, high, low) = linux_fc_watermarks(false, 0);
+        assert_eq!(pause, FC_PAUSE_TIME);
+        assert_eq!(refresh, 0);
+        assert_eq!(high & !FCRTH_RTH, 0);
+        assert_eq!(low & !FCRTL_RTL, 0);
+        assert_eq!(high.saturating_sub(low), 8);
+        let (h2, _, high2, _) = linux_fc_watermarks(false, 26);
+        assert_eq!((pause, high), (h2, high2));
+    }
+
+    #[test]
+    fn configure_flow_control_programs_ieee_pause_regs() {
+        let hw = super::rx_ring_tests::make_hw();
+        unsafe { hw.configure_flow_control() };
+        fn rd(base: usize, reg: usize) -> u32 {
+            unsafe { core::ptr::read_volatile((base + reg * 4) as *const u32) }
+        }
+        assert_eq!(rd(hw.base, E1000E_FCT), FLOW_CONTROL_TYPE);
+        assert_eq!(rd(hw.base, E1000E_FCAL), FLOW_CONTROL_ADDRESS_LOW);
+        assert_eq!(rd(hw.base, E1000E_FCAH), FLOW_CONTROL_ADDRESS_HIGH);
+        let (pause, _, high, low) = linux_fc_watermarks(false, 0);
+        assert_eq!(rd(hw.base, E1000E_FCTTV), pause);
+        assert_eq!(rd(hw.base, E1000E_FCRTH), high);
+        assert_eq!(rd(hw.base, E1000E_FCRTL), low | FCRTL_XONE);
+        let ctrl = rd(hw.base, E1000E_CTRL);
+        assert_eq!(ctrl & CTRL_RFCE, CTRL_RFCE);
+        assert_eq!(ctrl & CTRL_TFCE, CTRL_TFCE);
+    }
+
+    #[test]
+    fn init_rx_writes_linux_rctl_and_skips_srrctl() {
+        let mut hw = super::rx_ring_tests::make_hw();
+        unsafe { hw.init_rx() };
+        fn rd(base: usize, reg: usize) -> u32 {
+            unsafe { core::ptr::read_volatile((base + reg * 4) as *const u32) }
+        }
+        assert_eq!(rd(hw.base, E1000E_RCTL), linux_rctl_host());
+        assert_eq!(rd(hw.base, E1000E_SRRCTL), 0);
+    }
+
+    #[test]
+    fn init_tx_sets_tarc_bit_zero_on_both_queues() {
+        let mut hw = super::rx_ring_tests::make_hw();
+        unsafe { hw.init_tx() };
+        fn rd(base: usize, reg: usize) -> u32 {
+            unsafe { core::ptr::read_volatile((base + reg * 4) as *const u32) }
+        }
+        assert_eq!(rd(hw.base, E1000E_TARC0) & 1, 1);
+        assert_eq!(rd(hw.base, E1000E_TARC1) & 1, 1);
     }
 }

@@ -1103,7 +1103,7 @@ impl XhciInner {
     /// Procesar cambios de puerto diferidos. Llamar solo desde contextos no-reentrantes
     /// (process_irq_events, poll, enumerate_root_hid tras cada puerto).
     fn drain_pending_port_changes(&mut self) {
-        let ports: Vec<u8> = core::mem::take(&mut self.pending_port_changes);
+        let ports = core::mem::take(&mut self.pending_port_changes);
         for port_id in ports {
             let _ = self.handle_port_status_change(port_id);
         }
@@ -2432,11 +2432,11 @@ impl XhciInner {
                     });
                 }
             }
+            // QEMU usb-tablet: [buttons, X16, Y16, wheel] (6–8 bytes).
+            // VirtualBox USB Tablet: [buttons, dz, dw, pad, X16, Y16]
+            // (UsbMouse.cpp USBHIDT_REPORT). X/Y are 0..=32767 in both.
+            // libinput maps that abs range onto the output via EVIOCGABS.
             HID_PROTO_TABLET if h.report_len >= 6 && !(h.vbox_tablet && n < 8) => {
-                // QEMU usb-tablet: [buttons, X16, Y16, wheel] (6–8 bytes).
-                // VirtualBox USB Tablet: [buttons, dz, dw, pad, X16, Y16]
-                // (UsbMouse.cpp USBHIDT_REPORT). X/Y are 0..=32767 in both.
-                // libinput maps that abs range onto the output via EVIOCGABS.
                 let btn = tmp[0];
                 let vbox = h.vbox_tablet;
                 let (ax, ay, wheel, hwheel) = if vbox {
@@ -2591,7 +2591,7 @@ impl XhciInner {
     /// Reset Endpoint / Set TR Dequeue commands (which spin on the event ring)
     /// don't recurse into the drain loop.
     fn drain_pending_ep_resets(&mut self) {
-        let resets: Vec<(u8, u8)> = core::mem::take(&mut self.pending_ep_resets);
+        let resets = core::mem::take(&mut self.pending_ep_resets);
         for (slot, dci) in resets {
             // Reset the halted endpoint and point its TR dequeue past the failed
             // TRB (already skipped via advance_dequeue), then re-arm one TRB and

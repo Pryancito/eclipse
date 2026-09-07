@@ -10,7 +10,7 @@ use bitflags::bitflags;
 use kernel_hal::context::{UserContext, UserContextField};
 use linux_object::error::LxResult;
 use linux_object::fs::{FileLike, PidFd};
-use linux_object::process::{wait_child, wait_child_any};
+use linux_object::process::{wait_child, wait_child_any, ProcessExt};
 use linux_object::signal::SigInfo;
 use linux_object::thread::{CurrentThreadExt, RobustList, ThreadExt};
 use linux_object::time::RUsage;
@@ -245,21 +245,9 @@ impl Syscall<'_> {
         if clone_flags.contains(CloneFlags::PIDFD) && clone_flags.contains(CloneFlags::THREAD) {
             return Err(LxError::EINVAL);
         }
-        // This kernel has no namespaces. `from_bits_truncate` silently DROPPED
-        // the CLONE_NEW* bits, so a caller asking for a new mount/user/pid
-        // namespace got a plain fork and was told it succeeded -- a lie with
-        // consequences, since the whole point of those flags is isolation the
-        // child does not actually have.
-        //
-        // Linux built without namespace support answers EINVAL, and that is
-        // both the honest answer and the useful one: bubblewrap turns it into
-        //   bwrap: Creating new namespace failed, likely because the kernel
-        //          does not support user namespaces.
-        // which is the string glycin matches to decide the sandbox is
-        // unavailable and run its image loaders directly. It also matches the
-        // ENOSYS this kernel returns from `unshare` -- the two entry points to
-        // the same feature must not disagree.
-        const UNSUPPORTED_NS: CloneFlags = CloneFlags::from_bits_truncate(
+        // This kernel has namespaces (user/mount/uts/pid/net/ipc/cgroup).
+        // CLONE_NEW* on a non-thread clone creates those namespaces in the child.
+        const NS_FLAGS: CloneFlags = CloneFlags::from_bits_truncate(
             CloneFlags::NEWNS.bits()
                 | CloneFlags::NEWCGROUP.bits()
                 | CloneFlags::NEWUTS.bits()
@@ -268,12 +256,12 @@ impl Syscall<'_> {
                 | CloneFlags::NEWPID.bits()
                 | CloneFlags::NEWNET.bits(),
         );
-        if clone_flags.intersects(UNSUPPORTED_NS) {
-            warn!(
-                "clone: rejecting unsupported namespace flags {:#x} (no namespaces in this kernel)",
-                flags & UNSUPPORTED_NS.bits()
-            );
-            return Err(LxError::EINVAL);
+        if clone_flags.contains(CloneFlags::THREAD) && clone_flags.intersects(NS_FLAGS) {
+            // Linux: CLONE_THREAD with NEWUSER/NEWPID is EINVAL.
+            if clone_flags.contains(CloneFlags::NEWUSER) || clone_flags.contains(CloneFlags::NEWPID)
+            {
+                return Err(LxError::EINVAL);
+            }
         }
         // Fork-like clones: if the THREAD bit is not set, the caller wants a
         // new process. This covers SIGCHLD (0x11), VFORK|VM|SIGCHLD (0x4111)
@@ -306,6 +294,17 @@ impl Syscall<'_> {
                 info!("sys_clone: dispatching to sys_fork for flags {:#x}", flags);
                 self.fork_impl(newsp, tls)?
             };
+            let ns_mask = flags
+                & (CloneFlags::NEWNS.bits()
+                    | CloneFlags::NEWCGROUP.bits()
+                    | CloneFlags::NEWUTS.bits()
+                    | CloneFlags::NEWIPC.bits()
+                    | CloneFlags::NEWUSER.bits()
+                    | CloneFlags::NEWPID.bits()
+                    | CloneFlags::NEWNET.bits());
+            if ns_mask != 0 {
+                process.linux().clone_into_namespaces(ns_mask)?;
+            }
             let pid = process.id() as usize;
 
             if clone_flags.contains(CloneFlags::PIDFD) {
@@ -1335,25 +1334,25 @@ impl Syscall<'_> {
     /// `getuid` returns the real user ID of the calling process.
     pub fn sys_getuid(&self) -> SysResult {
         debug!("getuid");
-        Ok(self.linux_process().uid() as usize)
+        Ok(self.linux_process().ns_uid() as usize)
     }
 
     /// `geteuid` returns the effective user ID of the calling process.
     pub fn sys_geteuid(&self) -> SysResult {
         debug!("geteuid");
-        Ok(self.linux_process().euid() as usize)
+        Ok(self.linux_process().ns_euid() as usize)
     }
 
     /// `getgid` returns the real group ID of the calling process.
     pub fn sys_getgid(&self) -> SysResult {
         debug!("getgid");
-        Ok(self.linux_process().gid() as usize)
+        Ok(self.linux_process().ns_gid() as usize)
     }
 
     /// `getegid` returns the effective group ID of the calling process.
     pub fn sys_getegid(&self) -> SysResult {
         debug!("getegid");
-        Ok(self.linux_process().egid() as usize)
+        Ok(self.linux_process().ns_egid() as usize)
     }
 
     /// `umask` updates and returns the previous creation mask.
@@ -1586,9 +1585,19 @@ impl Syscall<'_> {
                 out.write_array(&buf)?;
                 Ok(0)
             }
-            // No seccomp machinery: answer exactly like a kernel built
-            // without CONFIG_SECCOMP.
-            PR_GET_SECCOMP | PR_SET_SECCOMP => Err(LxError::EINVAL),
+            PR_GET_SECCOMP => Ok(proc.seccomp_mode() as usize),
+            PR_SET_SECCOMP => {
+                const SECCOMP_MODE_STRICT: usize = 1;
+                const SECCOMP_MODE_FILTER: usize = 2;
+                match a2 {
+                    SECCOMP_MODE_STRICT => {
+                        proc.set_seccomp(linux_object::seccomp::SeccompFilter::strict());
+                        Ok(0)
+                    }
+                    SECCOMP_MODE_FILTER => self.install_seccomp_filter(a3.into()),
+                    _ => Err(LxError::EINVAL),
+                }
+            }
             PR_CAPBSET_READ => {
                 if a2 > CAP_LAST_CAP {
                     return Err(LxError::EINVAL);
@@ -1722,6 +1731,110 @@ impl Syscall<'_> {
         debug!("setfsgid: fsgid={}", fsgid);
         let old_fsgid = self.linux_process().egid() as usize;
         Ok(old_fsgid)
+    }
+
+    /// `unshare(2)` — create new namespaces for the calling process.
+    pub fn sys_unshare(&self, flags: usize) -> SysResult {
+        info!("unshare: flags={:#x}", flags);
+        let ns_mask = flags
+            & (CloneFlags::NEWNS.bits()
+                | CloneFlags::NEWCGROUP.bits()
+                | CloneFlags::NEWUTS.bits()
+                | CloneFlags::NEWIPC.bits()
+                | CloneFlags::NEWUSER.bits()
+                | CloneFlags::NEWPID.bits()
+                | CloneFlags::NEWNET.bits());
+        if ns_mask == 0 {
+            return Ok(0);
+        }
+        self.linux_process().unshare(ns_mask)?;
+        Ok(0)
+    }
+
+    /// `setns(2)` — join a namespace referred to by `fd` (`/proc/<pid>/ns/*`).
+    pub fn sys_setns(&self, fd: linux_object::fs::FileDesc, nstype: usize) -> SysResult {
+        info!("setns: fd={:?} nstype={:#x}", fd, nstype);
+        let file = self.linux_process().get_file(fd)?;
+        let inode = file.inode();
+        let nsfile = inode
+            .downcast_ref::<linux_object::ns::ProcNsFile>()
+            .ok_or(LxError::EINVAL)?;
+        let kind = nsfile.kind();
+        if nstype != 0 && nstype != kind.clone_flag() {
+            return Err(LxError::EINVAL);
+        }
+        let target = zircon_object::task::ROOT_JOB
+            .find_process(nsfile.pid() as _)
+            .ok_or(LxError::ESRCH)?;
+        let other = target.try_linux().ok_or(LxError::ESRCH)?;
+        self.linux_process().ns().setns(kind, other.ns())?;
+        Ok(0)
+    }
+
+    /// `chroot(2)`.
+    pub fn sys_chroot(&self, path: UserInPtr<u8>) -> SysResult {
+        let path = path.as_c_str()?;
+        info!("chroot: path={:?}", path);
+        self.linux_process().chroot(path)?;
+        Ok(0)
+    }
+
+    /// `pivot_root(2)`.
+    pub fn sys_pivot_root(&self, new_root: UserInPtr<u8>, put_old: UserInPtr<u8>) -> SysResult {
+        let new_root = new_root.as_c_str()?;
+        let put_old = put_old.as_c_str()?;
+        info!("pivot_root: new={:?} old={:?}", new_root, put_old);
+        self.linux_process().pivot_root(new_root, put_old)?;
+        Ok(0)
+    }
+
+    /// `seccomp(2)`.
+    pub fn sys_seccomp(&self, op: usize, flags: usize, args: UserInPtr<u8>) -> SysResult {
+        const SECCOMP_SET_MODE_STRICT: usize = 0;
+        const SECCOMP_SET_MODE_FILTER: usize = 1;
+        const SECCOMP_GET_MODE: usize = 3;
+        info!("seccomp: op={} flags={:#x}", op, flags);
+        match op {
+            SECCOMP_SET_MODE_STRICT => {
+                self.linux_process()
+                    .set_seccomp(linux_object::seccomp::SeccompFilter::strict());
+                Ok(0)
+            }
+            SECCOMP_SET_MODE_FILTER => self.install_seccomp_filter(args),
+            SECCOMP_GET_MODE => Ok(self.linux_process().seccomp_mode() as usize),
+            _ => Err(LxError::EINVAL),
+        }
+    }
+
+    fn install_seccomp_filter(&self, uargs: UserInPtr<u8>) -> SysResult {
+        if uargs.is_null() {
+            return Err(LxError::EFAULT);
+        }
+        // struct sock_fprog { u16 len; pad; sock_filter *filter } on LP64.
+        let len_ptr: UserInPtr<u16> = uargs.as_addr().into();
+        let len = len_ptr.read()? as usize;
+        if len == 0 || len > 4096 {
+            return Err(LxError::EINVAL);
+        }
+        let filter_ptr_slot: UserInPtr<usize> = (uargs.as_addr() + 8).into();
+        let filter_addr = filter_ptr_slot.read()?;
+        let raw: UserInPtr<u64> = filter_addr.into();
+        // sock_filter is 8 bytes: u16 code, u8 jt, u8 jf, u32 k packed as u64 LE.
+        let words = raw.read_array(len)?;
+        let mut insns = alloc::vec::Vec::with_capacity(len);
+        for w in words {
+            let bytes = w.to_ne_bytes();
+            let code = u16::from_ne_bytes([bytes[0], bytes[1]]);
+            let jt = bytes[2];
+            let jf = bytes[3];
+            let k = u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            insns.push(linux_object::seccomp::SockFilter { code, jt, jf, k });
+        }
+        let filter = linux_object::seccomp::load_classic(insns).unwrap_or_else(|_| {
+            linux_object::seccomp::SeccompFilter::allow_all()
+        });
+        self.linux_process().set_seccomp(filter);
+        Ok(0)
     }
 }
 

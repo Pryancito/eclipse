@@ -429,3 +429,27 @@ fn stress_random_ops() {
     check(&path);
     fs::remove_file(&path).unwrap();
 }
+
+#[test]
+fn parent_of_root_and_subdir() {
+    let path = tmpfile("parent-of", 64 * 1024 * 1024);
+    let dev = open_dev(&path);
+    mkfs::format(&*dev, &opts()).unwrap();
+    let mut fs = Btrfs::mount(dev, false).unwrap();
+    let root = fs.root_ino();
+    assert_eq!(fs.parent_of(root).unwrap(), root);
+
+    let bin = fs.create(root, "bin", FileKind::Dir, 0o755, 0).unwrap();
+    assert_eq!(fs.parent_of(bin).unwrap(), root);
+
+    let nested = fs.create(bin, "nested", FileKind::Dir, 0o755, 0).unwrap();
+    assert_eq!(fs.parent_of(nested).unwrap(), bin);
+
+    let file = fs
+        .create(nested, "a", FileKind::Regular, 0o644, 0)
+        .unwrap();
+    assert_eq!(fs.parent_of(file).unwrap(), nested);
+
+    drop(fs);
+    let _ = fs::remove_file(&path);
+}

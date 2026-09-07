@@ -579,7 +579,9 @@ pub fn snapshot() -> KStats {
 #[cfg(test)]
 mod tests {
     //! Host tests for the CPU runtime-statistics counters. On libos
-    //! `cpu::cpu_id()` is always 0, so every per-CPU update lands in slot 0.
+    //! `cpu::cpu_id()` is the calling *thread's* id truncated to a u8 (see
+    //! `libos/cpu.rs`), so a test's per-CPU updates land in the slot of the
+    //! test-runner thread executing it -- never assume slot 0.
     //!
     //! All counters here are process-global monotonic atomics and the test
     //! runner executes tests in parallel, so the assertions are written to be
@@ -632,15 +634,16 @@ mod tests {
         let after = snapshot();
         assert!(after.idle_ns >= before.idle_ns + 4000);
         assert!(after.idle_entries >= before.idle_entries + 4);
-        // The per-CPU breakdown for cpu 0 must have grown too.
-        let entries0 = |s: &KStats| {
+        // The per-CPU breakdown for THIS thread's slot must have grown too.
+        let me = crate::cpu::cpu_id() as u16;
+        let entries_me = |s: &KStats| {
             s.idle_percpu
                 .iter()
-                .find(|(c, _, _)| *c == 0)
+                .find(|(c, _, _)| *c == me)
                 .map(|(_, n, _)| *n)
                 .unwrap_or(0)
         };
-        assert!(entries0(&after) >= entries0(&before) + 4);
+        assert!(entries_me(&after) >= entries_me(&before) + 4);
     }
 
     #[test]
@@ -733,17 +736,18 @@ mod tests {
     #[test]
     fn tick_context_records_user_and_rip() {
         let _g = SERIAL.lock();
-        let total0 = |s: &KStats| {
+        let me = crate::cpu::cpu_id() as u16;
+        let total_me = |s: &KStats| {
             s.tick_percpu
                 .iter()
-                .find(|(c, ..)| *c == 0)
+                .find(|(c, ..)| *c == me)
                 .map(|(_, t, ..)| *t)
                 .unwrap_or(0)
         };
-        let user0 = |s: &KStats| {
+        let user_me = |s: &KStats| {
             s.tick_percpu
                 .iter()
-                .find(|(c, ..)| *c == 0)
+                .find(|(c, ..)| *c == me)
                 .map(|(_, _, u, _)| *u)
                 .unwrap_or(0)
         };
@@ -751,11 +755,11 @@ mod tests {
         note_tick_context(true, 0xdead_beef); // interrupted user mode
         note_tick_context(false, 0xc0ff_ee00); // interrupted kernel mode
         let after = snapshot();
-        // Two more ticks on cpu 0, exactly one of them in user mode.
-        assert!(total0(&after) >= total0(&before) + 2);
-        assert!(user0(&after) >= user0(&before) + 1);
+        // Two more ticks on this thread's slot, exactly one of them in user mode.
+        assert!(total_me(&after) >= total_me(&before) + 2);
+        assert!(user_me(&after) >= user_me(&before) + 1);
         // user ticks are a subset of total ticks.
-        let entry = after.tick_percpu.iter().find(|(c, ..)| *c == 0).unwrap();
+        let entry = after.tick_percpu.iter().find(|(c, ..)| *c == me).unwrap();
         assert!(entry.2 <= entry.1);
         // The last recorded RIP is the most recent call's (kernel-mode one).
         assert_eq!(entry.3, 0xc0ff_ee00);

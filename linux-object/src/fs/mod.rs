@@ -787,11 +787,11 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         // that already knows the DRM subsystem exists.
         fn drm_release_on_exit(pid: zircon_object::object::KoID) {
             let _ = devfs::drm::release_process(pid);
-            // Same reclaim, for driver-private resources the generic GEM
-            // handle table above doesn't know about (currently: NvidiaGpu's
-            // nouveau-uAPI channel + everything VM_BIND'd/GEM_NEW'd into it
-            // -- see `DrmScheme::nouveau_release_process`'s doc).
-            if let Some(driver) = devfs::drm::get_primary_driver() {
+            // Driver-private resources (NVK channels, GEM_NEW, VM_BIND) live
+            // on whichever GPU served that process — console on a 1-GPU box,
+            // a non-console GPU when several are present. Reclaim on every
+            // DRM driver; non-NVIDIA defaults are no-ops.
+            for driver in drivers::all_drm().as_vec().iter() {
                 driver.nouveau_release_process(pid);
             }
         }
@@ -1130,6 +1130,8 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     // `/run` already is, but the compiled-in system paths are under `/var`.
     mount_ramfs_at(&root, "var/run/pulse", "/var/run/pulse");
     mount_ramfs_at(&root, "var/lib/pulse", "/var/lib/pulse");
+    // Flatpak system repo (ostree) must be writable on a squashfs live root.
+    mount_ramfs_at(&root, "var/lib/flatpak", "/var/lib/flatpak");
 
     // Ensure /var/run exists. Skip while pivoting onto an installed block
     // root (btrfs/ext2): scanning /var during early boot has stalled some
@@ -1826,34 +1828,36 @@ impl LinuxProcess {
 
         let follow_max_depth = if follow { FOLLOW_MAX_DEPTH } else { 0 };
         if path.starts_with('/') {
+            if let Some(over) = self.lookup_mount_overlay(path) {
+                return over;
+            }
             if let Some(result) = lookup_virtual_fs(path, follow_max_depth) {
                 return result;
             }
-            // Absolute path on the real filesystem: the base inode is
-            // irrelevant (`lookup_follow` jumps straight to the fs root for a
-            // leading '/'), so skip the CWD walk entirely — it re-resolved the
-            // whole working directory from the root on every lookup only to
-            // throw the result away — and serve repeats from the path cache.
-            // The dynamic linker and xkb/fontconfig setup of a desktop session
-            // do hundreds of absolute open/stat calls over the same library
-            // and data paths per process start; each was a full per-component
-            // VFS walk (two String allocations + a directory scan per
-            // component on SFS) before this.
-            if follow {
+            // Absolute path: look up relative to THIS process's root so
+            // `chroot`/`pivot_root` actually jail the walk. (A leading '/' on
+            // `lookup_follow` jumps to the backing FileSystem root and would
+            // ignore a chroot that is a subdirectory of the same fs.)
+            let jailed = self.root_override_is_set() || !self.ns().mount().is_init();
+            if follow && !jailed {
                 if let Some(inode) = dcache_get(path) {
                     return Ok(inode);
                 }
             }
-            let inode = self.root_inode().lookup_follow(path, follow_max_depth)?;
-            if follow {
+            let rel = path.trim_start_matches('/');
+            let inode = if rel.is_empty() {
+                self.root_inode()
+            } else {
+                self.root_inode().lookup_follow(rel, follow_max_depth)?
+            };
+            if follow && !jailed {
                 dcache_put(path, &inode);
             }
             return Ok(inode);
         }
         if dirfd == FileDesc::CWD {
             Ok(self
-                .root_inode()
-                .lookup(&self.current_working_directory())?
+                .cwd_inode()?
                 .lookup_follow(path, follow_max_depth)?)
         } else {
             let file = self.get_file(dirfd)?;

@@ -1238,6 +1238,7 @@ extern "C" {
         dst_fb_vram_offset: NvU64,
         src_sysmem_pa: NvU64,
         size: NvU64,
+        src_coherent: u8,
         work_id: *mut NvU64,
     ) -> NV_STATUS;
 
@@ -1260,6 +1261,7 @@ extern "C" {
         dst_host_pa: NvU64,
         src_sysmem_pa: NvU64,
         size: NvU64,
+        src_coherent: u8,
         work_id: *mut NvU64,
     ) -> NV_STATUS;
 
@@ -1271,6 +1273,7 @@ extern "C" {
         src_pitch: NvU32,
         row_bytes: NvU32,
         line_count: NvU32,
+        src_coherent: u8,
         work_id: *mut NvU64,
     ) -> NV_STATUS;
 
@@ -1349,6 +1352,7 @@ pub fn ce_blit(
     dst_fb_vram_offset: u64,
     src_sysmem_pa: u64,
     size: u64,
+    src_coherent: bool,
 ) -> NV_STATUS {
     let mut work_id = 0u64;
     let submit = {
@@ -1364,6 +1368,7 @@ pub fn ce_blit(
                 dst_fb_vram_offset,
                 src_sysmem_pa,
                 size,
+                src_coherent as u8,
                 &mut work_id,
             )
         }
@@ -1427,27 +1432,39 @@ pub fn ce_blit_p2p(
     dst_host_pa: u64,
     src_sysmem_pa: u64,
     size: u64,
+    src_coherent: bool,
 ) -> NV_STATUS {
     // [rpc-lock] Gate submit only; wait is outside -- see `ce_finish`.
     let mut work_id = 0u64;
     let submit = {
         let _gate = RmGate::lock();
         unsafe {
-            eclipse_rm_ce_blit_p2p(gpu_instance, dst_host_pa, src_sysmem_pa, size, &mut work_id)
+            eclipse_rm_ce_blit_p2p(
+                gpu_instance,
+                dst_host_pa,
+                src_sysmem_pa,
+                size,
+                src_coherent as u8,
+                &mut work_id,
+            )
         }
     };
     ce_finish(gpu_instance, submit, work_id)
 }
 
 /// Pitched 2D P2P variant of [`ce_blit_p2p`]: copies `line_count` rows of
-/// `row_bytes` bytes from `src_sysmem_pa + r * src_pitch` (cacheable host RAM)
-/// to `dst_host_pa + r * dst_pitch` (peer GPU BAR1) for `r` in 0..line_count.
+/// `row_bytes` bytes from `src_sysmem_pa + r * src_pitch` to
+/// `dst_host_pa + r * dst_pitch` (peer GPU BAR1) for `r` in 0..line_count.
+///
+/// `src_coherent` selects the CE source aperture: true (CPU-written dumb /
+/// staging) snoops the CPU cache; false (GPU-written nouveau GEM) reads DRAM
+/// so stale WB lines cannot ghost the frame.
 ///
 /// Eliminates the CPU staging repack when src and dst pitches differ: the CE
-/// reads directly from the compositor's buffer (fast cached DMA) and writes to
-/// the console GPU's BAR1 (fast GPU-initiated PCIe writes).  Each row is
-/// submitted ASYNC; the function waits once (bounded, 100 ms) on the last row,
-/// with `RmGate` dropped so NVK can allocate during the poll.
+/// reads directly from the compositor's buffer and writes to the console
+/// GPU's BAR1 (fast GPU-initiated PCIe writes). One ASYNC CE launch; the
+/// function waits once (bounded, 100 ms), with `RmGate` dropped so NVK can
+/// allocate during the poll.
 pub fn ce_blit_p2p_2d(
     gpu_instance: u32,
     dst_host_pa: u64,
@@ -1456,6 +1473,7 @@ pub fn ce_blit_p2p_2d(
     src_pitch: u32,
     row_bytes: u32,
     line_count: u32,
+    src_coherent: bool,
 ) -> NV_STATUS {
     // [rpc-lock] Gate submit only; wait is outside -- see `ce_finish`.
     let mut work_id = 0u64;
@@ -1470,6 +1488,7 @@ pub fn ce_blit_p2p_2d(
                 src_pitch,
                 row_bytes,
                 line_count,
+                src_coherent as u8,
                 &mut work_id,
             )
         }

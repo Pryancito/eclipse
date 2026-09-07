@@ -28,6 +28,10 @@ static ROT180: AtomicBool = AtomicBool::new(false);
 /// up — the title bar is still at the top) is corrected with this, not ROT180.
 /// Enable with `FB_MIRROR_X` on the kernel command line.
 static MIRROR_X: AtomicBool = AtomicBool::new(false);
+/// `apply_kconfig_fb_flags` used to re-parse the cmdline on every
+/// `try_init` (including the panic banner). Do it once; KCONFIG may appear
+/// after `prime()`.
+static FLAGS_APPLIED: AtomicBool = AtomicBool::new(false);
 
 const CHAR_W: u32 = 8;
 const CHAR_H: u32 = 16;
@@ -70,6 +74,9 @@ fn cmdline_flag(cmdline: &str, key: &str) -> bool {
 }
 
 fn apply_kconfig_fb_flags() {
+    if FLAGS_APPLIED.load(Ordering::SeqCst) {
+        return;
+    }
     let Some(cfg) = KCONFIG.try_get() else {
         return;
     };
@@ -80,6 +87,7 @@ fn apply_kconfig_fb_flags() {
         MIRROR_X.store(true, Ordering::SeqCst);
         zcore_drivers::scheme::set_scanout_mirror_x(true);
     }
+    FLAGS_APPLIED.store(true, Ordering::SeqCst);
 }
 
 fn try_init() -> bool {

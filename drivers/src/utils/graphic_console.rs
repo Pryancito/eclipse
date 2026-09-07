@@ -28,7 +28,7 @@ fn rgb888_to_argb(color: Rgb888) -> u32 {
 
 /// A `DrawTarget` that renders into a CPU-side [`ShadowFramebuffer`] instead of
 /// writing pixels straight to GPU memory. Glyph rendering therefore touches only
-/// cached RAM; the dirty region is later pushed to the device in bulk.
+/// cached RAM; the full shadow is later pushed to the device in bulk.
 pub struct ShadowDraw {
     shadow: Arc<ShadowFramebuffer>,
     width: u32,
@@ -97,7 +97,7 @@ impl LinearScrollbackBuffer {
         }
     }
 
-    /// Push the dirty region of the shadow buffer to the real display, drawing
+    /// Push the shadow buffer to the real display, drawing
     /// the text cursor when `visible`.
     ///
     /// Called once per batch of writes (per `write_str` / scroll) so a whole
@@ -444,7 +444,7 @@ impl GraphicConsole {
 
     /// Flush all pending console output to the display, showing the cursor.
     ///
-    /// Drawing accumulates in the shadow buffer; this pushes the dirty region to
+    /// Drawing accumulates in the shadow buffer; this pushes the full frame to
     /// the GPU in one bulk transfer. Call it after a batch of writes.
     pub fn present(&mut self) {
         let (row, col) = self.inner.cursor();

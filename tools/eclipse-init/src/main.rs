@@ -23,11 +23,12 @@
 //! dependency ordering); implementation is our own so every syscall is under
 //! our control on the still-maturing kernel. No shell is involved.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::CString;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// A respawn service that exits sooner than this after starting is treated as
@@ -44,6 +45,20 @@ const MAX_BACKOFF: Duration = Duration::from_secs(8);
 static WANT_HALT: AtomicBool = AtomicBool::new(false);
 /// Set by the SIGINT handler (Ctrl-Alt-Del is delivered to PID 1 as SIGINT).
 static WANT_REBOOT: AtomicBool = AtomicBool::new(false);
+/// Unique renderer messages once per boot; every respawn used to reprint them.
+static RENDERER_MSGS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+fn log_renderer_once(msg: &str) {
+    match RENDERER_MSGS.lock() {
+        Ok(mut guard) => {
+            let set = guard.get_or_insert_with(HashSet::new);
+            if set.insert(msg.to_string()) {
+                log(msg);
+            }
+        }
+        Err(_) => log(msg),
+    }
+}
 
 extern "C" fn on_sigterm(_sig: libc::c_int) {
     WANT_HALT.store(true, Ordering::SeqCst);
@@ -189,6 +204,13 @@ const CHILD_ENV: &[&str] = &[
     // once when no daemon runs and apps carry on bus-less; a dbus-daemon
     // bound to this path later is picked up by new clients automatically.
     "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus",
+    // apk does not run glib-compile-schemas; even with a compiled blob, dconf
+    // over D-Bus is a 25 s g_error for GTK portals. Memory backend + no AT-SPI
+    // (we have no a11y session) stops at-spi-bus-launcher / portal-gtk SIGABRT.
+    "GSETTINGS_BACKEND=memory",
+    "GTK_A11Y=none",
+    "NO_AT_BRIDGE=1",
+    "GDK_BACKEND=wayland",
 ];
 
 fn log(msg: &str) {
@@ -1040,14 +1062,14 @@ fn detect_renderer() -> Renderer {
                 .split([':', ' ', '\t', '\n'])
                 .any(|t| t == "nvidia.nouveau_uapi")
             {
-                log(&format!(
+                log_renderer_once(&format!(
                     "renderer=auto: NVIDIA GPU {} + nvidia.nouveau_uapi -> gl \
                      (NVIDIA experiment mode; labwc stays software unless explicitly opted into wlroots GPU rendering)",
                     v.trim()
                 ));
                 Renderer::Gl
             } else {
-                log(&format!(
+                log_renderer_once(&format!(
                     "renderer=auto: NVIDIA GPU {} but nvidia.nouveau_uapi is OFF (kernel uAPI \
                      disabled; DRM node is \"zcore\") -> pixman. Boot with GL=1 (or add \
                      nvidia.nouveau_uapi + renderer=gl to the cmdline) for hardware GL",
@@ -1057,14 +1079,14 @@ fn detect_renderer() -> Renderer {
             }
         }
         Ok(v) if !v.trim().is_empty() => {
-            log(&format!(
+            log_renderer_once(&format!(
                 "renderer=auto: GPU vendor {} -> gl-sw (software GL; pass renderer=gl for virgl)",
                 v.trim()
             ));
             Renderer::GlSw
         }
         _ => {
-            log("renderer=auto: no GPU visible -> pixman");
+            log_renderer_once("renderer=auto: no GPU visible -> pixman");
             Renderer::Pixman
         }
     }
@@ -1089,6 +1111,31 @@ fn cmdline_has(token: &str) -> bool {
         .any(|t| t == token)
 }
 
+/// Inject `/lib/libeclipse_nvkick.so` at the front of `LD_PRELOAD` so GL/NVK
+/// clients (lunarbar → glxgears) inherit the usermode kick without a login
+/// shell sourcing `/etc/profile`. Does not replace an existing preload list.
+fn prepend_nvkick_preload(env: &mut Vec<CString>) {
+    const LIB: &str = "/lib/libeclipse_nvkick.so";
+    if !Path::new(LIB).exists() {
+        return;
+    }
+    if let Some(pos) = env.iter().position(|e| e.to_bytes().starts_with(b"LD_PRELOAD=")) {
+        let cur = env[pos].to_string_lossy();
+        let val = cur.strip_prefix("LD_PRELOAD=").unwrap_or("");
+        if val.split(':').any(|p| p == LIB) {
+            return;
+        }
+        let merged = if val.is_empty() {
+            format!("LD_PRELOAD={LIB}")
+        } else {
+            format!("LD_PRELOAD={LIB}:{val}")
+        };
+        env[pos] = CString::new(merged).unwrap();
+    } else {
+        env.push(CString::new(format!("LD_PRELOAD={LIB}")).unwrap());
+    }
+}
+
 /// The environment handed to every spawned service: the static [`CHILD_ENV`]
 /// base plus the renderer pin. Pixman (CPU software) is the default because with
 /// no working GL driver wlroots' GLES2 path leaves the desktop black — exactly
@@ -1100,6 +1147,7 @@ fn build_child_env() -> Vec<CString> {
         .collect();
     overlay_locale(&mut env);
     overlay_tz(&mut env);
+    prepend_nvkick_preload(&mut env);
     match renderer_mode() {
         Renderer::Pixman => {
             env.push(CString::new("WLR_RENDERER=pixman").unwrap());
@@ -1128,7 +1176,7 @@ fn build_child_env() -> Vec<CString> {
                         "gles2"
                     };
                     env.push(CString::new(format!("WLR_RENDERER={wlr}")).unwrap());
-                    log(&format!(
+                    log_renderer_once(&format!(
                         "renderer=gl: NVIDIA GPU -> experimental WLR_RENDERER={wlr} \
                          (via nvidia.wlr_{})",
                         if wlr == "vulkan" { "vulkan" } else { "gles2" }
@@ -1142,7 +1190,7 @@ fn build_child_env() -> Vec<CString> {
                     env.push(CString::new("GALLIUM_DRIVER=zink").unwrap());
                     env.push(CString::new("MESA_LOADER_DRIVER_OVERRIDE=zink").unwrap());
                     push_sdl_render_env(&mut env, SdlRender::Gles2);
-                    log(
+                    log_renderer_once(
                         "renderer=gl: NVIDIA GPU -> pinning GL clients to zink+NVK on explicit experimental path",
                     );
                 } else {
@@ -1150,7 +1198,7 @@ fn build_child_env() -> Vec<CString> {
                     env.push(CString::new("WLR_RENDERER_ALLOW_SOFTWARE=1").unwrap());
                     env.push(CString::new("LIBGL_ALWAYS_SOFTWARE=1").unwrap());
                     push_sdl_render_env(&mut env, SdlRender::Software);
-                    log(
+                    log_renderer_once(
                         "renderer=gl: NVIDIA GPU -> defaulting labwc to pixman and clients to software GL; opt into GPU rendering with nvidia.wlr_gles2 or nvidia.wlr_vulkan",
                     );
                 }
@@ -1174,7 +1222,7 @@ fn build_child_env() -> Vec<CString> {
                 env.push(CString::new("WLR_RENDERER_ALLOW_SOFTWARE=1").unwrap());
                 env.push(CString::new("LIBGL_ALWAYS_SOFTWARE=1").unwrap());
                 push_sdl_render_env(&mut env, SdlRender::Gles2);
-                log("renderer=gl: no NVIDIA GPU (QEMU/virtio) -> degrading to software GL (gl-sw stack: labwc GLES2 + llvmpipe clients)");
+                log_renderer_once("renderer=gl: no NVIDIA GPU (QEMU/virtio) -> degrading to software GL (gl-sw stack: labwc GLES2 + llvmpipe clients)");
             }
         }
         Renderer::GlSw => {
@@ -1189,7 +1237,7 @@ fn build_child_env() -> Vec<CString> {
             env.push(CString::new("WLR_RENDERER_ALLOW_SOFTWARE=1").unwrap());
             env.push(CString::new("LIBGL_ALWAYS_SOFTWARE=1").unwrap());
             push_sdl_render_env(&mut env, SdlRender::Gles2);
-            log("renderer=gl-sw: wlroots GLES2 over Mesa llvmpipe (software GL)");
+            log_renderer_once("renderer=gl-sw: wlroots GLES2 over Mesa llvmpipe (software GL)");
         }
     }
     env

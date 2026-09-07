@@ -273,6 +273,22 @@ const DEFAULT_PACKAGES: &[&str] = &[
     "alsa-plugins-pulse",
     // Boot chime (`eclipse-boot-sound` plays /usr/share/eclipse/Eclipse_Awakening.mp3).
     "mpg123",
+    // ── Flatpak (EU OS model: OS via apk, apps via Flatpak) ────────────────
+    // The sandbox is bubblewrap; the store is ostree. xdg-dbus-proxy and the
+    // portals are what `--socket=session-bus` / `--filesystem=xdg-documents`
+    // talk to. fuse3 is the document portal's /dev/fuse client (kernel FUSE
+    // is still incomplete, so that portal degrades until /dev/fuse lands).
+    "flatpak",
+    "ostree",
+    "bubblewrap",
+    "xdg-dbus-proxy",
+    "xdg-desktop-portal",
+    "xdg-desktop-portal-gtk",
+    "xdg-desktop-portal-wlr",
+    "xdg-utils",
+    "fuse",
+    "fuse3",
+    "desktop-file-utils",
     // ── SDL (1.2 / 2 / 3) ───────────────────────────────────────────────────
     // The SDL family is the toolkit most games, emulators and media players
     // are written against, and none of it was installed: any SDL binary
@@ -1128,6 +1144,9 @@ const LIVE_TREES: &[&str] = &[
     "usr/share/desktop-directories",
     "etc/xdg",
     "etc/dbus-1",
+    // Flatpak / OSTree (system repo + remotes + portals).
+    "etc/flatpak",
+    "usr/share/flatpak",
 ];
 
 fn live_enabled() -> bool {
@@ -1297,5 +1316,34 @@ pub(super) fn copy_into_live(full: &Path, live: &Path) {
             "warning: LIVE root missing /usr/bin/pulseaudio — libpulse clients and \
              ALSA-via-pulse will be silent. `pulseaudio` must be in the apk set."
         );
+    }
+}
+
+/// Alpine's `apk add --root` does not run post-install triggers, so
+/// `gschemas.compiled` is never generated. GLib then returns a NULL schema
+/// source and `at-spi-bus-launcher` / `xdg-desktop-portal-gtk` `g_error()`
+/// (SIGABRT) — often after a 25 s dconf D-Bus timeout. Compile here with the
+/// host tool; the compiled blob is arch-independent XML tables.
+pub(super) fn compile_glib_schemas(rootfs: &Path) {
+    let dir = rootfs.join("usr/share/glib-2.0/schemas");
+    if !dir.is_dir() {
+        return;
+    }
+    let status = Command::new("glib-compile-schemas").arg(&dir).status();
+    let compiled = dir.join("gschemas.compiled");
+    match status {
+        Ok(s) if s.success() && compiled.is_file() => {
+            println!(
+                "GSettings: compiled {} ({} bytes)",
+                compiled.display(),
+                fs::metadata(&compiled).map(|m| m.len()).unwrap_or(0)
+            );
+        }
+        Ok(s) => eprintln!(
+            "warning: glib-compile-schemas exited {s:?}; GTK/portal GSettings will abort"
+        ),
+        Err(e) => eprintln!(
+            "warning: could not run glib-compile-schemas ({e}); GTK/portal GSettings will abort"
+        ),
     }
 }

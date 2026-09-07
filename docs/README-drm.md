@@ -140,7 +140,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 |---|---|---|
 | `DRM_CAP_DUMB_BUFFER` | 1 | |
 | `DRM_CAP_DUMB_PREFERRED_DEPTH` | 24 | scanout XRGB8888 |
-| `DRM_CAP_DUMB_PREFER_SHADOW` | 1 | el *present* es un blit CPU sobre PCIe: renderizar a *shadow* y copiar es exactamente lo aconsejable |
+| `DRM_CAP_DUMB_PREFER_SHADOW` | 0 | `DIRTYFB` no existe; Xorg no debe elegir ShadowFB |
 | `DRM_CAP_PRIME` | 3 | IMPORT \| EXPORT (dma-buf real) |
 | `DRM_CAP_TIMESTAMP_MONOTONIC` | 1 | |
 | `DRM_CAP_ASYNC_PAGE_FLIP` | 0 | |

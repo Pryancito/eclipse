@@ -5677,6 +5677,7 @@ NV_STATUS eclipse_rm_ce_blit(
     NvU64 dstFbVramOffset,
     NvU64 srcSysmemPa,
     NvU64 size,
+    NvBool srcCoherent,
     NvU64 *pWorkId)
 {
     OBJGPU            *pGpu;
@@ -5747,11 +5748,13 @@ NV_STATUS eclipse_rm_ce_blit(
     }
     memdescDescribe(pDstMemDesc, ADDR_FBMEM, dstFbVramOffset, size);
 
-    /* SRC: the compositor's dumb buffer -- contiguous SYSMEM at srcSysmemPa.
-     * The CE accesses SYSMEM via the GMMU SYSMEM aperture (PCIe peer-DMA);
-     * no explicit BAR mapping is required on the GPU side. */
+    /* SRC: compositor buffer at srcSysmemPa. CACHED/COHERENT snoops the CPU
+     * cache (correct for CPU-written dumb/staging). UNCACHED/NONCOHERENT
+     * reads DRAM so a GPU-written GEM is not polluted by stale WB lines. */
     status = memdescCreate(&pSrcMemDesc, pGpu, size, 0, NV_TRUE,
-                           ADDR_SYSMEM, NV_MEMORY_CACHED, MEMDESC_FLAGS_NONE);
+                           ADDR_SYSMEM,
+                           srcCoherent ? NV_MEMORY_CACHED : NV_MEMORY_UNCACHED,
+                           MEMDESC_FLAGS_NONE);
     if (status != NV_OK)
     {
         nv_printf(0, "[eclipse-rm-trace] ce_blit: SRC memdescCreate -> 0x%x\n", status);
@@ -6034,6 +6037,7 @@ NV_STATUS eclipse_rm_ce_blit_p2p(
     NvU64 dstHostPa,
     NvU64 srcSysmemPa,
     NvU64 size,
+    NvBool srcCoherent,
     NvU64 *pWorkId)
 {
     OBJGPU            *pGpu;
@@ -6102,9 +6106,12 @@ NV_STATUS eclipse_rm_ce_blit_p2p(
     }
     memdescDescribe(pDstMemDesc, ADDR_SYSMEM, dstHostPa, size);
 
-    /* SRC: compositor dumb buffer, cacheable host RAM. */
+    /* SRC: CACHED snoops CPU cache (dumb/staging); UNCACHED reads DRAM
+     * (GPU-written GEM, avoids stale WB ghosting). */
     status = memdescCreate(&pSrcMemDesc, pGpu, size, 0, NV_TRUE,
-                           ADDR_SYSMEM, NV_MEMORY_CACHED, MEMDESC_FLAGS_NONE);
+                           ADDR_SYSMEM,
+                           srcCoherent ? NV_MEMORY_CACHED : NV_MEMORY_UNCACHED,
+                           MEMDESC_FLAGS_NONE);
     if (status != NV_OK)
     {
         nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p: SRC memdescCreate -> 0x%x\n", status);
@@ -6188,6 +6195,7 @@ static NV_STATUS eclipse_ce_submit_pitched_2d(
     NvU32    dstPitch,
     NvU32    rowBytes,
     NvU32    lineCount,
+    NvBool   srcCoherent,
     NvU64   *pSubmittedWorkId)
 {
     OBJCHANNEL    *pChannel;
@@ -6241,8 +6249,13 @@ static NV_STATUS eclipse_ce_submit_pitched_2d(
 
     NV_PUSH_INC_1U(RM_SUBCHANNEL, NV906F_SET_OBJECT, pChannel->classEngineID);
 
-    /* SRC: compositor dumb buffer (cached sysmem). DST: console BAR1 (uncached). */
-    srcPhysMode = DRF_DEF(C5B5, _SET_SRC_PHYS_MODE, _TARGET, _COHERENT_SYSMEM);
+    /* SRC: COHERENT snoops CPU cache (CPU-written dumb/staging). NONCOHERENT
+     * reads DRAM so a GPU-written GEM is not copied from stale WB lines
+     * (cursor blend / previous CPU blit) — that ghosting is why CE-direct
+     * must not snoop a kernel-cached nouveau GEM. DST: console BAR1. */
+    srcPhysMode = srcCoherent
+        ? DRF_DEF(C5B5, _SET_SRC_PHYS_MODE, _TARGET, _COHERENT_SYSMEM)
+        : DRF_DEF(C5B5, _SET_SRC_PHYS_MODE, _TARGET, _NONCOHERENT_SYSMEM);
     dstPhysMode = DRF_DEF(C5B5, _SET_DST_PHYS_MODE, _TARGET, _NONCOHERENT_SYSMEM);
     NV_PUSH_INC_2U(RM_SUBCHANNEL,
                    NVC5B5_SET_SRC_PHYS_MODE, srcPhysMode,
@@ -6311,14 +6324,18 @@ static NV_STATUS eclipse_ce_submit_pitched_2d(
  * eclipse_rm_ce_blit_p2p_2d -- pitched 2D variant of eclipse_rm_ce_blit_p2p.
  *
  * Copies `lineCount` rows of `rowBytes` bytes from
- *   srcSysmemPa + r * srcPitch  (cacheable host RAM, compositor dumb buffer)
+ *   srcSysmemPa + r * srcPitch
  * to
  *   dstHostPa   + r * dstPitch  (peer GPU BAR1, ADDR_SYSMEM UNCACHED)
  * for r in [0, lineCount) as a SINGLE C5B5 MULTI_LINE CE launch.
  *
- * This eliminates the CPU staging repack: the CE reads directly from the
- * source buffer (fast cached PCIe DMA) and writes to the console GPU's BAR1
- * (fast GPU-initiated PCIe writes), even when src and dst pitches differ.
+ * srcCoherent: NV_TRUE  = COHERENT_SYSMEM (CPU-written dumb/staging, snoop)
+ *              NV_FALSE = NONCOHERENT_SYSMEM (GPU-written GEM, DRAM; avoids
+ *              ghosting from stale kernel WB lines).
+ *
+ * This eliminates the CPU staging repack: the CE reads the source buffer
+ * and writes to the console GPU's BAR1 (fast GPU-initiated PCIe writes),
+ * even when src and dst pitches differ.
  *
  * One ASYNC CE launch. Caller waits with eclipse_rm_ce_wait (100 ms
  * deadline) after dropping RM locks -- never a synchronous RM wait, never
@@ -6333,6 +6350,7 @@ NV_STATUS eclipse_rm_ce_blit_p2p_2d(
     NvU32 srcPitch,
     NvU32 rowBytes,
     NvU32 lineCount,
+    NvBool srcCoherent,
     NvU64 *pWorkId)
 {
     OBJGPU            *pGpu;
@@ -6402,6 +6420,7 @@ NV_STATUS eclipse_rm_ce_blit_p2p_2d(
                                           srcSysmemPa, srcPitch,
                                           dstHostPa, dstPitch,
                                           rowBytes, lineCount,
+                                          srcCoherent,
                                           &lastWorkId);
     if (status == NV_OK)
         *pWorkId = lastWorkId;

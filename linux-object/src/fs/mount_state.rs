@@ -12,6 +12,14 @@ pub const MS_BIND: usize = 4096;
 pub const MS_MOVE: usize = 8192;
 #[allow(dead_code)]
 pub const MS_REC: usize = 16384;
+#[allow(dead_code)]
+pub const MS_SILENT: usize = 32768;
+/// mount(2) propagation: MS_PRIVATE / MS_SLAVE / MS_SHARED / MS_UNBINDABLE
+pub const MS_PRIVATE: usize = 1 << 18;
+pub const MS_SLAVE: usize = 1 << 19;
+pub const MS_SHARED: usize = 1 << 20;
+pub const MS_UNBINDABLE: usize = 1 << 21;
+pub const MS_PROPAGATION: usize = MS_PRIVATE | MS_SLAVE | MS_SHARED | MS_UNBINDABLE;
 
 /// umount2(2) flags.
 pub const MNT_FORCE: usize = 1;

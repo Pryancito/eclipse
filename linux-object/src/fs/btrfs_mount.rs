@@ -337,6 +337,14 @@ impl BtrfsMountFs {
     }
 }
 
+impl Drop for BtrfsMountFs {
+    fn drop(&mut self) {
+        let mut fs = self.inner.lock();
+        let _ = self.flush_any(&mut fs);
+        let _ = fs.sync();
+    }
+}
+
 impl FileSystem for BtrfsMountFs {
     fn sync(&self) -> Result<()> {
         let mut fs = self.inner.lock();
@@ -580,7 +588,13 @@ impl INode for BtrfsMountINode {
     fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
         match name {
             "." | "" => Ok(self.fs.inode(self.ino)),
-            ".." => Err(FsError::EntryNotFound),
+            ".." => {
+                let parent = {
+                    let mut fs = self.fs.inner.lock();
+                    fs.parent_of(self.ino).map_err(map_err)?
+                };
+                Ok(self.fs.inode(parent))
+            }
             name => {
                 let ino = {
                     let mut fs = self.fs.inner.lock();
@@ -598,7 +612,15 @@ impl INode for BtrfsMountINode {
     fn get_entry_with_metadata(&self, id: usize) -> Result<(Metadata, String)> {
         match id {
             0 => Ok((self.metadata()?, String::from("."))),
-            1 => Ok((self.metadata()?, String::from(".."))),
+            1 => {
+                let metadata = {
+                    let mut fs = self.fs.inner.lock();
+                    let parent = fs.parent_of(self.ino).map_err(map_err)?;
+                    let st = fs.stat(parent).map_err(map_err)?;
+                    stat_to_metadata(&st)
+                };
+                Ok((metadata, String::from("..")))
+            }
             i => {
                 let entries = self.fs.cached_readdir(self.ino)?;
                 let entry = entries.get(i - 2).ok_or(FsError::EntryNotFound)?;

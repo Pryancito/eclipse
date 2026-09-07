@@ -365,6 +365,7 @@ impl Syscall<'_> {
                 Err(e) => return BsdRet::err(errno::lx_to_freebsd(e)),
             };
             if !writer.try_push(meta.inode as u64, fs::dirent_type(meta.type_), &name) {
+                file.unread_dir_entry();
                 break;
             }
         }

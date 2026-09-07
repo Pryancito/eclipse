@@ -339,10 +339,15 @@ impl ProcessExt for Process {
             perf: crate::perf::ProcPerf::new(),
             itimers: Default::default(),
             aspace_lock: Mutex::new(()),
+            ns: linux_parent.ns.clone(),
+            root_override: Mutex::new(linux_parent.root_override.lock().clone()),
+            chroot_prefix: Mutex::new(linux_parent.chroot_prefix.lock().clone()),
+            seccomp: Mutex::new(linux_parent.seccomp.lock().clone()),
             inner: Mutex::new(LinuxProcessInner {
                 execute_path: linux_parent_inner.execute_path.clone(),
                 cmdline: linux_parent_inner.cmdline.clone(),
                 current_working_directory: linux_parent_inner.current_working_directory.clone(),
+                cwd_inode: linux_parent_inner.cwd_inode.clone(),
                 files: linux_parent_inner.files.clone(),
                 // POSIX fork(2): the child gets its own COPY of each fd's
                 // FD_CLOEXEC flag — later fcntl(F_SETFD) in either process
@@ -363,6 +368,9 @@ impl ProcessExt for Process {
                 ..Default::default()
             }),
         };
+        if let Some(pid_ns) = linux_parent.ns.take_pending_pid_for_child() {
+            new_linux_proc.ns.set_pid_ns(pid_ns);
+        }
         let new_proc = Process::create_with_ext(&parent.job(), "", new_linux_proc)?;
         // Batch the fork's cross-CPU TLB shootdowns into one, but only when
         // the parent has a single thread. That is the condition under which no
@@ -653,6 +661,16 @@ pub struct LinuxProcess {
     /// layout — so a fault on another thread cannot deadlock against a fork
     /// holding this.
     aspace_lock: Mutex<()>,
+    /// Namespaces (user/mount/uts/pid/net/ipc/cgroup). Shared with children
+    /// until `unshare` / `clone(CLONE_NEW*)`.
+    ns: crate::ns::NsProxy,
+    /// `chroot`/`pivot_root` replacement for [`Self::root_inode`].
+    root_override: Mutex<Option<Arc<dyn INode>>>,
+    /// Host path of the chroot (empty after `pivot_root` rebase). Overlay
+    /// lookups prepend this so binds installed before the chroot still hit.
+    chroot_prefix: Mutex<String>,
+    /// Installed seccomp filter (`None` = off).
+    seccomp: Mutex<Option<Arc<crate::seccomp::SeccompFilter>>>,
 }
 
 /// Linux process mut inner data
@@ -668,6 +686,11 @@ struct LinuxProcessInner {
     ///
     /// Omit leading '/'.
     current_working_directory: String,
+    /// Resolved inode for [`Self::current_working_directory`]. Relative lookups
+    /// start here instead of re-walking from `/` on every `open`/`stat`.
+    /// `None` until the first `chdir`/`fchdir` (or process start) fills it;
+    /// a miss falls back to a single walk from the process root.
+    cwd_inode: Option<Arc<dyn INode>>,
     /// file open number limit
     file_limit: RLimit,
     /// Opened files
@@ -841,14 +864,19 @@ impl LinuxProcess {
         files.insert(2.into(), stderr);
 
         LinuxProcess {
-            root_inode,
+            root_inode: root_inode.clone(),
             parent: Weak::default(),
             vt,
             perf: crate::perf::ProcPerf::new(),
             itimers: Default::default(),
             aspace_lock: Mutex::new(()),
+            ns: crate::ns::NsProxy::init(),
+            root_override: Mutex::new(None),
+            chroot_prefix: Mutex::new(String::new()),
+            seccomp: Mutex::new(None),
             inner: Mutex::new(LinuxProcessInner {
                 files,
+                cwd_inode: Some(root_inode),
                 ..Default::default()
             }),
         }
@@ -1202,9 +1230,128 @@ impl LinuxProcess {
         }
     }
 
-    /// Get root INode of the process.
-    pub fn root_inode(&self) -> &Arc<dyn INode> {
-        &self.root_inode
+    /// Get root INode of the process (`chroot`/`pivot_root` aware).
+    pub fn root_inode(&self) -> Arc<dyn INode> {
+        self.root_override
+            .lock()
+            .clone()
+            .unwrap_or_else(|| self.root_inode.clone())
+    }
+
+    pub(crate) fn chroot_prefix_text(&self) -> String {
+        self.chroot_prefix.lock().clone()
+    }
+
+    pub(crate) fn root_override_is_set(&self) -> bool {
+        self.root_override.lock().is_some()
+    }
+
+    /// Namespace proxy for this process.
+    pub fn ns(&self) -> &crate::ns::NsProxy {
+        &self.ns
+    }
+
+    /// Visible uid inside the user namespace (overflowuid if unmapped).
+    pub fn ns_uid(&self) -> u32 {
+        self.ns.user().map_uid_in(self.uid())
+    }
+
+    /// Visible euid inside the user namespace.
+    pub fn ns_euid(&self) -> u32 {
+        self.ns.user().map_uid_in(self.euid())
+    }
+
+    /// Visible gid inside the user namespace.
+    pub fn ns_gid(&self) -> u32 {
+        self.ns.user().map_gid_in(self.gid())
+    }
+
+    /// Visible egid inside the user namespace.
+    pub fn ns_egid(&self) -> u32 {
+        self.ns.user().map_gid_in(self.egid())
+    }
+
+    /// `unshare(2)` flags (`CLONE_NEW*`).
+    pub fn unshare(&self, flags: usize) -> LxResult<()> {
+        self.ns.unshare(flags)
+    }
+
+    /// Apply `clone(CLONE_NEW*)` to this (already forked) child.
+    pub fn clone_into_namespaces(&self, flags: usize) -> LxResult<()> {
+        self.ns.clone_into(flags)
+    }
+
+    /// `chroot(2)`: switch the process root without rewriting the mount table.
+    pub fn chroot(&self, path: &str) -> LxResult<()> {
+        let inode = self.lookup_inode(path)?;
+        let abs = if path.starts_with('/') {
+            crate::ns::join_chroot_prefix(&self.chroot_prefix.lock(), path)
+        } else {
+            crate::ns::join_chroot_prefix(
+                &self.chroot_prefix.lock(),
+                &self.get_absolute_path(FileDesc::CWD, path)?,
+            )
+        };
+        *self.root_override.lock() = Some(inode);
+        *self.chroot_prefix.lock() = abs;
+        Ok(())
+    }
+
+    /// `pivot_root(2)`: make `new_root` `/` and bind the old root at `put_old`.
+    pub fn pivot_root(&self, new_root: &str, put_old: &str) -> LxResult<()> {
+        let new_inode = self.lookup_inode(new_root)?;
+        let old_root = self.root_inode();
+        let put_abs = if put_old.starts_with('/') {
+            crate::ns::join_chroot_prefix(&self.chroot_prefix.lock(), put_old)
+        } else {
+            crate::ns::join_chroot_prefix(
+                &self.chroot_prefix.lock(),
+                &self.get_absolute_path(FileDesc::CWD, put_old)?,
+            )
+        };
+        let new_abs = if new_root.starts_with('/') {
+            crate::ns::join_chroot_prefix(&self.chroot_prefix.lock(), new_root)
+        } else {
+            crate::ns::join_chroot_prefix(
+                &self.chroot_prefix.lock(),
+                &self.get_absolute_path(FileDesc::CWD, new_root)?,
+            )
+        };
+        self.ns.mount().bind(&put_abs, old_root)?;
+        self.ns.mount().rebase(&new_abs);
+        *self.root_override.lock() = Some(new_inode.clone());
+        *self.chroot_prefix.lock() = String::new();
+        self.change_directory("/", Some(new_inode));
+        crate::fs::dcache_invalidate();
+        Ok(())
+    }
+
+    /// Install a seccomp filter.
+    pub fn set_seccomp(&self, filter: Arc<crate::seccomp::SeccompFilter>) {
+        *self.seccomp.lock() = Some(filter);
+    }
+
+    /// `prctl(PR_GET_SECCOMP)`: 0 disabled, 1 strict, 2 filter.
+    pub fn seccomp_mode(&self) -> u32 {
+        self.seccomp
+            .lock()
+            .as_ref()
+            .map(|f| f.mode())
+            .unwrap_or(0)
+    }
+
+    /// Evaluate the installed filter. `Ok` = allow this syscall.
+    pub fn seccomp_check(&self, nr: u32, args: &[usize; 6]) -> LxResult<()> {
+        match self.seccomp.lock().as_ref() {
+            Some(f) => f.check(nr, args),
+            None => Ok(()),
+        }
+    }
+
+    /// Overlay lookup for an absolute userspace path.
+    pub fn lookup_mount_overlay(&self, path: &str) -> Option<LxResult<Arc<dyn INode>>> {
+        let host = crate::ns::join_chroot_prefix(&self.chroot_prefix.lock(), path);
+        self.ns.mount().lookup(&host)
     }
 
     /// Get a snapshot of current credentials.
@@ -1262,7 +1409,7 @@ impl LinuxProcess {
 
     /// Whether the current effective uid is root.
     pub fn is_superuser(&self) -> bool {
-        self.euid() == ROOT_UID
+        self.euid() == ROOT_UID || self.ns_euid() == ROOT_UID
     }
 
     /// Apply umask to file creation mode.
@@ -1643,7 +1790,11 @@ impl LinuxProcess {
     }
 
     /// Change working directory.
-    pub fn change_directory(&self, path: &str) {
+    ///
+    /// `inode` is the already-resolved directory. Pass `None` only when the
+    /// caller cannot supply it; the next relative lookup will walk once from
+    /// the process root and fill the cache.
+    pub fn change_directory(&self, path: &str, inode: Option<Arc<dyn INode>>) {
         if path.is_empty() {
             return;
         }
@@ -1663,6 +1814,25 @@ impl LinuxProcess {
             }
         }
         inner.current_working_directory = cwd_vec.join("/");
+        inner.cwd_inode = inode;
+    }
+
+    /// Directory inode of the current working directory.
+    ///
+    /// Relative path walks start here so they do not re-resolve the CWD string
+    /// from `/` on every lookup (slow, and it ignored `chroot`).
+    pub fn cwd_inode(&self) -> LxResult<Arc<dyn INode>> {
+        if let Some(inode) = self.inner.lock().cwd_inode.clone() {
+            return Ok(inode);
+        }
+        let cwd = self.inner.lock().current_working_directory.clone();
+        let inode = if cwd.is_empty() {
+            self.root_inode()
+        } else {
+            self.root_inode().lookup_follow(&cwd, 40)?
+        };
+        self.inner.lock().cwd_inode = Some(inode.clone());
+        Ok(inode)
     }
 
     /// Get execute path.

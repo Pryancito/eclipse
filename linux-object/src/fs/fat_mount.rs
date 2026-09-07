@@ -23,90 +23,68 @@ fn fnv1a_path(path: &str) -> u64 {
     hash
 }
 
+use alloc::collections::BTreeMap;
 use fatfs::{FileSystem, FsOptions, IoBase, Read, Seek, SeekFrom, Write};
 use lock::Mutex;
+use rcore_fs::dev::Device;
 use rcore_fs::vfs::{
     FileSystem as VfsFileSystem, FileType, FsError, FsInfo, INode, Metadata, PollStatus, Timespec,
 };
 
-use super::block_mount::MountBackend;
+use super::block_mount::{device_from_backend, MountBackend};
+
+fn map_fat_err(e: fatfs::Error<()>) -> FsError {
+    match e {
+        fatfs::Error::NotFound => FsError::EntryNotFound,
+        fatfs::Error::AlreadyExists => FsError::EntryExist,
+        fatfs::Error::NotEnoughSpace => FsError::NoDeviceSpace,
+        fatfs::Error::DirectoryIsNotEmpty => FsError::DirNotEmpty,
+        fatfs::Error::InvalidInput
+        | fatfs::Error::InvalidFileNameLength
+        | fatfs::Error::UnsupportedFileNameCharacter => FsError::InvalidParam,
+        _ => FsError::DeviceError,
+    }
+}
+
+/// Parent of a FAT path stored without a leading slash. Root (`""`) is its
+/// own parent, matching `..` from `/`.
+fn parent_path(path: &str) -> String {
+    match path.rfind('/') {
+        Some(0) | None => String::new(),
+        Some(i) => path[..i].to_string(),
+    }
+}
 
 struct FatDisk {
-    backend: MountBackend,
+    device: Arc<dyn Device>,
     pos: u64,
+    len: u64,
 }
 
 impl FatDisk {
-    fn len(&self) -> u64 {
-        match &self.backend {
-            MountBackend::Block(block) => block.block_count() as u64 * 512,
-            MountBackend::File(file) => file.metadata().map(|m| m.size as u64).unwrap_or(0),
-        }
-    }
-
     fn read_block_bytes(&self, offset: usize, buf: &mut [u8]) -> core::result::Result<usize, ()> {
-        match &self.backend {
-            MountBackend::Block(block) => {
-                let block_size = 512;
-                let mut done = 0;
-                while done < buf.len() {
-                    let abs = offset + done;
-                    let block_id = abs / block_size;
-                    let block_off = abs % block_size;
-                    let take = min(buf.len() - done, block_size - block_off);
-                    let mut temp = [0u8; 512];
-                    block.read_block(block_id, &mut temp).map_err(|_| ())?;
-                    buf[done..done + take].copy_from_slice(&temp[block_off..block_off + take]);
-                    done += take;
-                    // This I/O runs under `FatMountFs::inner`'s IRQ-off spinlock
-                    // (fatfs DirIter/read). Pump our TLB-shootdown queue between
-                    // blocks so a peer's shootdown cannot starve for the whole
-                    // directory walk — the real-hardware panic signature.
-                    lock::pump();
-                }
-                Ok(done)
-            }
-            MountBackend::File(file) => {
-                let len = file.metadata().map(|m| m.size).unwrap_or(0);
-                if offset >= len {
-                    return Ok(0);
-                }
-                let take = min(buf.len(), len - offset);
-                file.read_at(offset, &mut buf[..take]).map_err(|_| ())
-            }
+        if (offset as u64) >= self.len {
+            return Ok(0);
         }
+        let take = min(buf.len(), (self.len - offset as u64) as usize);
+        let n = self
+            .device
+            .read_at(offset, &mut buf[..take])
+            .map_err(|_| ())?;
+        // I/O runs under `FatMountFs::inner`'s IRQ-off spinlock. Pump the
+        // TLB-shootdown queue so a peer cannot starve for the whole transfer.
+        lock::pump();
+        Ok(n)
     }
 
     fn write_block_bytes(&self, offset: usize, buf: &[u8]) -> core::result::Result<usize, ()> {
-        match &self.backend {
-            MountBackend::Block(block) => {
-                let block_size = 512;
-                let mut done = 0;
-                while done < buf.len() {
-                    let abs = offset + done;
-                    let block_id = abs / block_size;
-                    let block_off = abs % block_size;
-                    let take = min(buf.len() - done, block_size - block_off);
-                    let mut temp = [0u8; 512];
-                    if block_off != 0 || take != block_size {
-                        block.read_block(block_id, &mut temp).map_err(|_| ())?;
-                    }
-                    temp[block_off..block_off + take].copy_from_slice(&buf[done..done + take]);
-                    block.write_block(block_id, &temp).map_err(|_| ())?;
-                    done += take;
-                    lock::pump();
-                }
-                Ok(done)
-            }
-            MountBackend::File(file) => {
-                let len = file.metadata().map(|m| m.size).unwrap_or(0);
-                if offset >= len {
-                    return Ok(0);
-                }
-                let take = min(buf.len(), len - offset);
-                file.write_at(offset, &buf[..take]).map_err(|_| ())
-            }
+        if (offset as u64) >= self.len {
+            return Ok(0);
         }
+        let take = min(buf.len(), (self.len - offset as u64) as usize);
+        let n = self.device.write_at(offset, &buf[..take]).map_err(|_| ())?;
+        lock::pump();
+        Ok(n)
     }
 }
 
@@ -130,37 +108,58 @@ impl Write for FatDisk {
     }
 
     fn flush(&mut self) -> core::result::Result<(), Self::Error> {
+        // Do not call `device.sync()` here: fatfs flushes on every `File` drop
+        // (every read/write), and a device flush per op is a large regression.
+        // Durability is `FatMountFs::sync` / inode `sync_all`.
         Ok(())
     }
 }
 
 impl Seek for FatDisk {
     fn seek(&mut self, pos: SeekFrom) -> core::result::Result<u64, Self::Error> {
-        let len = self.len();
         self.pos = match pos {
             SeekFrom::Start(s) => s,
             SeekFrom::Current(off) => (self.pos as i64 + off) as u64,
-            SeekFrom::End(off) => (len as i64 + off) as u64,
+            SeekFrom::End(off) => (self.len as i64 + off) as u64,
         };
         Ok(self.pos)
     }
 }
 
+#[derive(Clone)]
+struct FatDirEntry {
+    name: String,
+    is_dir: bool,
+}
+
 pub struct FatMountFs {
     inner: Mutex<FileSystem<FatDisk>>,
+    device: Arc<dyn Device>,
     this: Mutex<Weak<Self>>,
     /// Identificador de dispositivo único de este montaje (para st_dev).
     dev: u64,
+    dir_cache: Mutex<BTreeMap<String, Arc<Vec<FatDirEntry>>>>,
 }
 
 impl FatMountFs {
     pub fn open(backend: MountBackend) -> rcore_fs::vfs::Result<Arc<Self>> {
-        let disk = FatDisk { backend, pos: 0 };
+        let len = match &backend {
+            MountBackend::Block(block) => block.block_count() as u64 * 512,
+            MountBackend::File(file) => file.metadata().map(|m| m.size as u64).unwrap_or(0),
+        };
+        let device = device_from_backend(&backend)?;
+        let disk = FatDisk {
+            device: device.clone(),
+            pos: 0,
+            len,
+        };
         let fs = FileSystem::new(disk, FsOptions::new()).map_err(|_| FsError::DeviceError)?;
         let arc = Arc::new(Self {
             inner: Mutex::new(fs),
+            device,
             this: Mutex::new(Weak::new()),
             dev: FAT_DEV_COUNTER.fetch_add(1, Ordering::Relaxed),
+            dir_cache: Mutex::new(BTreeMap::new()),
         });
         *arc.this.lock() = Arc::downgrade(&arc);
         Ok(arc)
@@ -169,11 +168,49 @@ impl FatMountFs {
     fn arc(&self) -> Arc<Self> {
         self.this.lock().upgrade().expect("FatMountFs dropped")
     }
+
+    fn invalidate_dir(&self, path: &str) {
+        self.dir_cache.lock().remove(path);
+    }
+
+    fn cached_readdir(&self, path: &str) -> rcore_fs::vfs::Result<Arc<Vec<FatDirEntry>>> {
+        if let Some(entries) = self.dir_cache.lock().get(path) {
+            return Ok(entries.clone());
+        }
+        let entries = {
+            let fs = self.inner.lock();
+            let dir = if path.is_empty() {
+                fs.root_dir()
+            } else {
+                fs.root_dir().open_dir(path).map_err(map_fat_err)?
+            };
+            let mut cached = Vec::new();
+            for entry in dir.iter() {
+                let entry = entry.map_err(|_| FsError::DeviceError)?;
+                let name = entry.file_name();
+                if !name.is_empty() {
+                    cached.push(FatDirEntry {
+                        name,
+                        is_dir: entry.is_dir(),
+                    });
+                }
+            }
+            Arc::new(cached)
+        };
+        self.dir_cache.lock().insert(path.to_string(), entries.clone());
+        Ok(entries)
+    }
+}
+
+impl Drop for FatMountFs {
+    fn drop(&mut self) {
+        let _ = self.device.sync();
+    }
 }
 
 impl VfsFileSystem for FatMountFs {
     fn sync(&self) -> rcore_fs::vfs::Result<()> {
-        Ok(())
+        self.device.sync().map_err(|_| FsError::DeviceError)
     }
 
     fn root_inode(&self) -> Arc<dyn INode> {
@@ -317,30 +354,25 @@ impl INode for FatMountINode {
                 path: self.path.clone(),
                 is_dir: self.is_dir,
             })),
-            ".." => Err(FsError::EntryNotFound),
+            ".." => Ok(Arc::new(FatMountINode {
+                fs: self.fs.clone(),
+                path: parent_path(&self.path),
+                is_dir: true,
+            })),
             name => {
-                let fs = self.fs.inner.lock();
-                let dir = if self.path.is_empty() {
-                    fs.root_dir()
-                } else {
-                    fs.root_dir()
-                        .open_dir(&self.path)
-                        .map_err(|_| FsError::EntryNotFound)?
-                };
-                for entry in dir.iter() {
-                    let entry = entry.map_err(|_| FsError::DeviceError)?;
+                let entries = self.fs.cached_readdir(&self.path)?;
+                for entry in entries.iter() {
                     // FAT es case-insensitive: una entrada 8.3 puede estar
                     // almacenada como "BOOTX64.EFI" y buscarse "BootX64.efi".
                     // Con comparación exacta el lookup fallaba (EntryNotFound)
                     // y open(O_CREAT) intentaba re-crear el fichero existente.
-                    let entry_name = entry.file_name();
-                    if entry_name.eq_ignore_ascii_case(name) {
+                    if entry.name.eq_ignore_ascii_case(name) {
                         return Ok(Arc::new(FatMountINode {
                             fs: self.fs.clone(),
                             // Usar el nombre tal como está en el directorio para
                             // que open_file/open_dir posteriores lo encuentren.
-                            path: self.child_path(&entry_name),
-                            is_dir: entry.is_dir(),
+                            path: self.child_path(&entry.name),
+                            is_dir: entry.is_dir,
                         }));
                     }
                 }
@@ -354,23 +386,11 @@ impl INode for FatMountINode {
             0 => Ok(String::from(".")),
             1 => Ok(String::from("..")),
             i => {
-                let fs = self.fs.inner.lock();
-                let dir = if self.path.is_empty() {
-                    fs.root_dir()
-                } else {
-                    fs.root_dir()
-                        .open_dir(&self.path)
-                        .map_err(|_| FsError::EntryNotFound)?
-                };
-                let mut names = Vec::new();
-                for entry in dir.iter() {
-                    let entry = entry.map_err(|_| FsError::DeviceError)?;
-                    let name = entry.file_name();
-                    if !name.is_empty() {
-                        names.push(name);
-                    }
-                }
-                names.get(i - 2).cloned().ok_or(FsError::EntryNotFound)
+                let entries = self.fs.cached_readdir(&self.path)?;
+                entries
+                    .get(i - 2)
+                    .map(|e| e.name.clone())
+                    .ok_or(FsError::EntryNotFound)
             }
         }
     }
@@ -384,23 +404,26 @@ impl INode for FatMountINode {
         if !self.is_dir {
             return Err(FsError::NotDir);
         }
-        let fs = self.fs.inner.lock();
-        let dir = if self.path.is_empty() {
-            fs.root_dir()
-        } else {
-            fs.root_dir()
-                .open_dir(&self.path)
-                .map_err(|_| FsError::EntryNotFound)?
-        };
-        match type_ {
-            rcore_fs::vfs::FileType::File => {
-                let _ = dir.create_file(name).map_err(|_| FsError::NoDeviceSpace)?;
+        {
+            let fs = self.fs.inner.lock();
+            let dir = if self.path.is_empty() {
+                fs.root_dir()
+            } else {
+                fs.root_dir()
+                    .open_dir(&self.path)
+                    .map_err(|_| FsError::EntryNotFound)?
+            };
+            match type_ {
+                rcore_fs::vfs::FileType::File => {
+                    dir.create_file(name).map_err(map_fat_err)?;
+                }
+                rcore_fs::vfs::FileType::Dir => {
+                    dir.create_dir(name).map_err(map_fat_err)?;
+                }
+                _ => return Err(FsError::NotSupported),
             }
-            rcore_fs::vfs::FileType::Dir => {
-                let _ = dir.create_dir(name).map_err(|_| FsError::NoDeviceSpace)?;
-            }
-            _ => return Err(FsError::NotSupported),
         }
+        self.fs.invalidate_dir(&self.path);
         Ok(Arc::new(FatMountINode {
             fs: self.fs.clone(),
             path: self.child_path(name),
@@ -412,19 +435,19 @@ impl INode for FatMountINode {
         if !self.is_dir {
             return Err(FsError::NotDir);
         }
-        let fs = self.fs.inner.lock();
-        let dir = if self.path.is_empty() {
-            fs.root_dir()
-        } else {
-            fs.root_dir()
-                .open_dir(&self.path)
-                .map_err(|_| FsError::EntryNotFound)?
-        };
-        dir.remove(name).map_err(|e| match e {
-            fatfs::Error::DirectoryIsNotEmpty => FsError::DirNotEmpty,
-            fatfs::Error::NotFound => FsError::EntryNotFound,
-            _ => FsError::DeviceError,
-        })
+        {
+            let fs = self.fs.inner.lock();
+            let dir = if self.path.is_empty() {
+                fs.root_dir()
+            } else {
+                fs.root_dir()
+                    .open_dir(&self.path)
+                    .map_err(|_| FsError::EntryNotFound)?
+            };
+            dir.remove(name).map_err(map_fat_err)?;
+        }
+        self.fs.invalidate_dir(&self.path);
+        Ok(())
     }
 
     fn resize(&self, len: usize) -> rcore_fs::vfs::Result<()> {
@@ -439,22 +462,33 @@ impl INode for FatMountINode {
         let cur = file
             .seek(SeekFrom::End(0))
             .map_err(|_| FsError::DeviceError)? as usize;
-        if len > cur {
-            if len > 0 {
-                file.seek(SeekFrom::Start((len - 1) as u64))
-                    .map_err(|_| FsError::DeviceError)?;
-                file.write(&[0]).map_err(|_| FsError::DeviceError)?;
-            }
-        } else if len < cur {
+        if len < cur {
             file.seek(SeekFrom::Start(len as u64))
                 .map_err(|_| FsError::DeviceError)?;
             file.truncate().map_err(|_| FsError::DeviceError)?;
+        } else if len > cur {
+            // fatfs clamps seek-past-EOF, so a single write at `len-1` only
+            // grows the file by one byte. Extend by writing zeros from EOF.
+            let zeros = [0u8; 512];
+            let mut pos = cur;
+            while pos < len {
+                let n = (len - pos).min(zeros.len());
+                let w = file.write(&zeros[..n]).map_err(map_fat_err)?;
+                if w == 0 {
+                    return Err(FsError::NoDeviceSpace);
+                }
+                pos += w;
+            }
         }
         Ok(())
     }
 
     fn sync_all(&self) -> rcore_fs::vfs::Result<()> {
-        Ok(())
+        self.fs.sync()
+    }
+
+    fn sync_data(&self) -> rcore_fs::vfs::Result<()> {
+        self.fs.sync()
     }
 
     fn fs(&self) -> Arc<dyn VfsFileSystem> {

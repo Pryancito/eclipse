@@ -56,6 +56,7 @@ pub fn install(rootfs: &Path) {
     write_eclipse_kbd(rootfs);
     write_eclipse_locale(rootfs);
     write_eclipse_tz(rootfs);
+    disable_atspi_autostart(rootfs);
 }
 
 /// `/usr/local/bin/eclipse-xkbmap`: load the X keyboard map into Xwayland once
@@ -843,10 +844,10 @@ fn write_x11_prepare(rootfs: &Path) {
 
 /// `/usr/local/bin/eclipse-terminal`: launch the first terminal that exists.
 /// foot is preferred (pixman/shm, matches this stack); alacritty is the
-/// fallback, forced onto software GL (client-side llvmpipe renders via shm,
-/// which does not touch the DRM GL path that hangs this box). Keybinds, the
-/// desktop menu, the panel launcher and autostart all go through this, so
-/// "a terminal" keeps working no matter which one is installed.
+/// fallback and runs as packaged (wgpu/Vulkan → NVK on the compute GPU).
+/// Keybinds, the desktop menu, the panel launcher and autostart all go
+/// through this, so "a terminal" keeps working no matter which one is
+/// installed.
 /// `eclipse-memwatch [interval]` — one compact `/proc/memhogs` line per tick,
 /// to the console.
 ///
@@ -938,7 +939,7 @@ fn write_terminal_wrapper(rootfs: &Path) {
           fi\n\
           if command -v alacritty >/dev/null 2>&1; then\n\
           \x20 echo \"[$(date '+%H:%M:%S')] alacritty $*\" >>\"$TLOG\"\n\
-          \x20 LIBGL_ALWAYS_SOFTWARE=1 alacritty \"$@\" 2>>\"$TLOG\"\n\
+          \x20 alacritty \"$@\" 2>>\"$TLOG\"\n\
           \x20 rc=$?\n\
           \x20 [ \"$rc\" -eq 0 ] && exit 0\n\
           \x20 echo \"[eclipse-terminal] alacritty exited rc=$rc\" >>\"$TLOG\"\n\
@@ -1468,6 +1469,11 @@ fn write_labwc_environment(rootfs: &Path) {
           # for its own children. It matters for the window BEFORE Xwayland is\n\
           # up, and for anything reading this file directly.\n\
           DISPLAY=:0\n\
+          # Force implicit-modifier (linear) scanout buffers on every labwc start.\n\
+          # Eclipse presents by CPU-reading the scanout framebuffer linearly; tiled\n\
+          # modifiers on NVIDIA can show up as visual garbage/ghosting instead of a\n\
+          # clean desktop image.\n\
+          WLR_DRM_NO_MODIFIERS=1\n\
           XCURSOR_THEME=Adwaita\n\
           # lunarbg draws its logo round by pre-squeezing for the panel aspect.\n\
           # It auto-detects the panel aspect from wl_output.geometry (the EDID\n\
@@ -1495,6 +1501,9 @@ fn write_labwc_environment(rootfs: &Path) {
           # No D-Bus session bus on Eclipse OS: keep GTK's settings out of\n\
           # dconf so apps never try to autolaunch one.\n\
           GSETTINGS_BACKEND=memory\n\
+          GTK_A11Y=none\n\
+          NO_AT_BRIDGE=1\n\
+          GDK_BACKEND=wayland\n\
           # SDL (1.2 via sdl12-compat, SDL2, SDL3): native Wayland first, X11\n\
           # (Xwayland) as fallback, and ALSA audio -- the renderer-independent\n\
           # half of the SDL policy. The renderer half (SDL_RENDER_DRIVER /\n\
@@ -1565,6 +1574,20 @@ fn write_gtk_settings(rootfs: &Path) {
         )
         .unwrap();
     }
+}
+
+/// D-Bus would otherwise activate `at-spi-bus-launcher` the first time a GTK
+/// app probes accessibility. Without compiled schemas it `g_error()`s (SIGABRT).
+/// Eclipse has no a11y session; point the well-known name at `/bin/true`.
+fn disable_atspi_autostart(rootfs: &Path) {
+    let svc = rootfs.join("usr/share/dbus-1/services/org.a11y.Bus.service");
+    let _ = fs::create_dir_all(svc.parent().unwrap());
+    let _ = fs::write(
+        &svc,
+        b"[D-BUS Service]\n\
+          Name=org.a11y.Bus\n\
+          Exec=/bin/true\n",
+    );
 }
 
 /// foot terminal palette matching the desktop (deep violet background,
@@ -1641,12 +1664,23 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # pointer without one (apk add adwaita-icon-theme).\n\
           : \"${XCURSOR_THEME:=Adwaita}\"; export XCURSOR_THEME\n\
           : \"${XCURSOR_SIZE:=24}\"; export XCURSOR_SIZE\n\
+          # NVIDIA usermode kick (libeclipse_nvkick): children inherit this so\n\
+          # glxgears/NVK can submit without EXEC ioctl. ECLIPSE_NV_USERMODE=0 off.\n\
+          if [ \"${ECLIPSE_NV_USERMODE:-}\" != \"0\" ] && [ -f /lib/libeclipse_nvkick.so ]; then\n\
+          \x20 case \":${LD_PRELOAD:-}:\" in *:/lib/libeclipse_nvkick.so:*) ;;\n\
+          \x20 *) export LD_PRELOAD=\"/lib/libeclipse_nvkick.so${LD_PRELOAD:+:$LD_PRELOAD}\" ;;\n\
+          \x20 esac\n\
+          fi\n\
           # Do NOT set WLR_NO_HARDWARE_CURSORS: the kernel DRM scheme composites\n\
           # the legacy MODE_CURSOR bitmap over every scanout frame, so wlroots'\n\
           # hardware-cursor path works and avoids re-rendering the whole pixman\n\
           # scene on every pointer move. Forcing software cursors used to paper\n\
           # over a missing cursor ioctl and burned a core idle; leave the var\n\
           # unset unless a caller overrides it for debugging.\n\
+          # Force implicit-modifier (linear) scanout buffers regardless of renderer.\n\
+          # Eclipse scans out by CPU-reading the framebuffer linearly; on dual-NVIDIA\n\
+          # setups, tiled modifiers can surface as noisy/ghosted output.\n\
+          : \"${WLR_DRM_NO_MODIFIERS:=1}\"; export WLR_DRM_NO_MODIFIERS\n\
           # Renderer, by the SAME two-condition gate as the kernel,\n\
           # /etc/profile and eclipse-init's build_child_env: hardware GL only\n\
           # when an NVIDIA GPU AND the nvidia.nouveau_uapi flag are both present\n\
@@ -1664,7 +1698,6 @@ fn write_labwc_wrapper(rootfs: &Path) {
           \x20\x20 [ \"$(tr -d '[:space:]' < /sys/class/drm/card0/device/vendor 2>/dev/null)\" = \"0x10de\" ]; then\n\
           \x20 if grep -q 'nvidia\\.wlr_vulkan' /proc/cmdline 2>/dev/null; then\n\
           \x20\x20 : \"${WLR_RENDERER:=vulkan}\"; export WLR_RENDERER\n\
-          \x20\x20 : \"${WLR_DRM_NO_MODIFIERS:=1}\"; export WLR_DRM_NO_MODIFIERS\n\
           \x20\x20 : \"${GALLIUM_DRIVER:=zink}\"; export GALLIUM_DRIVER\n\
           \x20\x20 : \"${MESA_LOADER_DRIVER_OVERRIDE:=zink}\"; export MESA_LOADER_DRIVER_OVERRIDE\n\
           \x20\x20 # SDL on the GPU sessions: GLES2 renderer (SDL2 has no Vulkan\n\
@@ -1673,7 +1706,6 @@ fn write_labwc_wrapper(rootfs: &Path) {
           \x20\x20 : \"${SDL_FRAMEBUFFER_ACCELERATION:=opengles2}\"; export SDL_FRAMEBUFFER_ACCELERATION\n\
           \x20 elif grep -q 'nvidia\\.wlr_gles2' /proc/cmdline 2>/dev/null; then\n\
           \x20\x20 : \"${WLR_RENDERER:=gles2}\"; export WLR_RENDERER\n\
-          \x20\x20 : \"${WLR_DRM_NO_MODIFIERS:=1}\"; export WLR_DRM_NO_MODIFIERS\n\
           \x20\x20 : \"${GALLIUM_DRIVER:=zink}\"; export GALLIUM_DRIVER\n\
           \x20\x20 : \"${MESA_LOADER_DRIVER_OVERRIDE:=zink}\"; export MESA_LOADER_DRIVER_OVERRIDE\n\
           \x20\x20 : \"${SDL_RENDER_DRIVER:=opengles2}\"; export SDL_RENDER_DRIVER\n\
@@ -1724,6 +1756,10 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # `dbus-daemon --session --address=unix:path=$XDG_RUNTIME_DIR/bus`\n\
           # started later is picked up by every new client automatically.\n\
           : \"${DBUS_SESSION_BUS_ADDRESS:=unix:path=/run/user/0/bus}\"; export DBUS_SESSION_BUS_ADDRESS\n\
+          : \"${GSETTINGS_BACKEND:=memory}\"; export GSETTINGS_BACKEND\n\
+          : \"${GTK_A11Y:=none}\"; export GTK_A11Y\n\
+          : \"${NO_AT_BRIDGE:=1}\"; export NO_AT_BRIDGE\n\
+          : \"${GDK_BACKEND:=wayland}\"; export GDK_BACKEND\n\
           # Backends: DRM for output + libinput for evdev. Naming them keeps\n\
           # wlroots off the headless/X11 autodetect fallbacks when no parent\n\
           # display exists.\n\
@@ -1844,7 +1880,10 @@ mod tests {
         write_labwc_rc(&dir);
         let script = dir.join("usr/local/bin/eclipse-kbd");
         assert!(script.is_file());
-        if let Ok(status) = std::process::Command::new("sh").arg("-n").arg(&script).status()
+        if let Ok(status) = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&script)
+            .status()
         {
             assert!(status.success(), "eclipse-kbd does not parse as sh");
         }
@@ -1869,7 +1908,10 @@ mod tests {
         write_labwc_environment(&dir);
         let script = dir.join("usr/local/bin/eclipse-locale");
         assert!(script.is_file());
-        if let Ok(status) = std::process::Command::new("sh").arg("-n").arg(&script).status()
+        if let Ok(status) = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&script)
+            .status()
         {
             assert!(status.success(), "eclipse-locale does not parse as sh");
         }
@@ -1897,7 +1939,10 @@ mod tests {
         write_labwc_environment(&dir);
         let script = dir.join("usr/local/bin/eclipse-tz");
         assert!(script.is_file());
-        if let Ok(status) = std::process::Command::new("sh").arg("-n").arg(&script).status()
+        if let Ok(status) = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&script)
+            .status()
         {
             assert!(status.success(), "eclipse-tz does not parse as sh");
         }
@@ -1955,6 +2000,7 @@ mod tests {
         // PULSE_SERVER for libpulse, and a D-Bus session address so SDL_Init
         // never autolaunches dbus-launch. Static, so all three files.
         for (key, val) in [
+            ("WLR_DRM_NO_MODIFIERS", "1"),
             ("SDL_VIDEODRIVER", "wayland,x11"),
             ("SDL_VIDEO_DRIVER", "wayland,x11"),
             ("SDL_AUDIODRIVER", "alsa"),
@@ -1962,6 +2008,10 @@ mod tests {
             ("ALSOFT_DRIVERS", "pulse,alsa"),
             ("PULSE_SERVER", "unix:/run/pulse/native"),
             ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/0/bus"),
+            ("GSETTINGS_BACKEND", "memory"),
+            ("GTK_A11Y", "none"),
+            ("NO_AT_BRIDGE", "1"),
+            ("GDK_BACKEND", "wayland"),
         ] {
             assert!(
                 wrapper.contains(&format!(": \"${{{key}:={val}}}\"; export {key}")),

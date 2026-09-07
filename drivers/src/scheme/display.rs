@@ -354,8 +354,8 @@ pub trait DisplayScheme: Scheme {
     ///
     /// `src` is row-major with `src_stride` pixels per row; only the top-left
     /// `width` x `height` window is used. This is the workhorse of the
-    /// double-buffered console: drawing happens in cached RAM and the dirty
-    /// region is pushed here in bulk. On a write-combining GOP/BAR1 destination
+    /// double-buffered console: drawing happens in cached RAM and the full
+    /// shadow is pushed here in bulk. On a write-combining GOP/BAR1 destination
     /// the generic path uses `MOVNTDQ` stores (see [`fb_write_combining`]);
     /// otherwise it copies whole rows with `copy_from_slice`. Drivers may
     /// override to use DMA / a copy engine.

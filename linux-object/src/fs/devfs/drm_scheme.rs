@@ -179,13 +179,17 @@ const DRM_IOCTL_MODE_SETPROPERTY: u32 = 0xC01064AB;
 // only visible when the software-cursor path is used).
 const DRM_IOCTL_MODE_CURSOR: u32 = 0xC01C64A3;
 const DRM_IOCTL_MODE_CURSOR2: u32 = 0xC02464BB;
+const DRM_MODE_FB_MODIFIERS: u32 = 1 << 0;
+const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258; // "XR24"
+const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241; // "AR24"
+const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 
 // Core (non-MODE) vblank wait.
 const DRM_IOCTL_WAIT_VBLANK: u32 = 0xC018643A;
 // Query an existing framebuffer object.
 const DRM_IOCTL_MODE_GETFB: u32 = 0xC01C64AD;
 const DRM_IOCTL_MODE_GETFB2: u32 = 0xC06864CE;
-// Flush framebuffer damage to the display.
+// Flush framebuffer damage to the display (clip union, WC-aligned).
 const DRM_IOCTL_MODE_DIRTYFB: u32 = 0xC01864B1;
 // Legacy gamma LUT get/set (`struct drm_mode_crtc_lut`, 32 bytes). The Xorg
 // modesetting driver reads the CRTC's gamma at startup (to restore on exit) and
@@ -668,6 +672,29 @@ struct DrmModeFbCmd2 {
     pitches: [u32; 4],
     offsets: [u32; 4],
     modifier: [u64; 4],
+}
+
+fn validate_addfb2(cmd: &DrmModeFbCmd2) -> core::result::Result<(), &'static str> {
+    if cmd.flags & !DRM_MODE_FB_MODIFIERS != 0 {
+        return Err("unsupported flags");
+    }
+    if !matches!(cmd.pixel_format, DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888) {
+        return Err("unsupported pixel format");
+    }
+    if cmd.offsets[0] != 0 {
+        return Err("non-zero plane-0 offset");
+    }
+    if cmd.handles[1..].iter().any(|&v| v != 0)
+        || cmd.pitches[1..].iter().any(|&v| v != 0)
+        || cmd.offsets[1..].iter().any(|&v| v != 0)
+        || cmd.modifier[1..].iter().any(|&v| v != 0)
+    {
+        return Err("multi-plane framebuffer not supported");
+    }
+    if cmd.modifier[0] != DRM_FORMAT_MOD_LINEAR {
+        return Err("non-linear modifier");
+    }
+    Ok(())
 }
 
 #[repr(C)]
@@ -1391,22 +1418,23 @@ impl INode for DrmDev {
                         [const { AtomicBool::new(false) }; 256];
                     let slot = (self.minor & 0xff) as usize;
                     if !VERSION_LOGGED[slot].swap(true, Ordering::Relaxed) {
-                        let vname = if compute_node { "eclipse-compute" } else { "nouveau" };
-                        match drm::get_primary_driver() {
-                            Some(d) => kernel_hal::klog_info!(
-                                "[drm] VERSION on /dev/dri/{} (minor={}) -> name=\"{}\"; primary_driver={:?} (client reached VERSION — DRM discovery OK; logged once per node)",
-                                node,
-                                self.minor,
-                                vname,
-                                d.name()
-                            ),
-                            None => kernel_hal::klog_info!(
-                                "[drm] VERSION on /dev/dri/{} (minor={}) -> name=\"{}\"; primary_driver=<none> (logged once per node)",
-                                node,
-                                self.minor,
-                                vname
-                            ),
-                        }
+                        let vname = if compute_node {
+                            "eclipse-compute"
+                        } else {
+                            "nouveau"
+                        };
+                        let primary = drm::get_primary_driver()
+                            .map(|d| alloc::string::String::from(d.name()));
+                        let nvk = drm::driver_for_nouveau()
+                            .map(|d| alloc::string::String::from(d.name()));
+                        kernel_hal::klog_info!(
+                            "[drm] VERSION on /dev/dri/{} (minor={}) -> name=\"{}\"; primary_driver={:?} nvk_driver={:?} (client reached VERSION — DRM discovery OK; logged once per node)",
+                            node,
+                            self.minor,
+                            vname,
+                            primary,
+                            nvk
+                        );
                     }
                 } else {
                     log::debug!(
@@ -1500,7 +1528,8 @@ impl INode for DrmDev {
                     0x3 => cap.value = 24,
                     // DRM_CAP_DUMB_PREFER_SHADOW: the dumb buffer lives behind
                     // a CPU blit over PCIe — clients should render to a shadow
-                    // and copy, exactly what this cap advises.
+                    // and copy, exactly what this cap advises (DIRTYFB honours
+                    // the damage clips, WC-aligned).
                     0x4 => cap.value = 1,
                     // DRM_CAP_PRIME: IMPORT|EXPORT. wlroots' check_drm_features
                     // *requires* DRM_PRIME_CAP_IMPORT or the whole DRM backend
@@ -1804,6 +1833,22 @@ impl INode for DrmDev {
             }
             DRM_IOCTL_MODE_ADDFB2 => {
                 let cmd = unsafe { &mut *(data as *mut DrmModeFbCmd2) };
+                if let Err(why) = validate_addfb2(cmd) {
+                    log::error!(
+                        "[drm] ADDFB2 reject: {}x{} handle={:#x} pitch={} fmt={:#x} flags={:#x} \
+                         offset={} modifier={:#x} ({})",
+                        cmd.width,
+                        cmd.height,
+                        cmd.handles[0],
+                        cmd.pitches[0],
+                        cmd.pixel_format,
+                        cmd.flags,
+                        cmd.offsets[0],
+                        cmd.modifier[0],
+                        why
+                    );
+                    return Err(FsError::InvalidParam);
+                }
                 if let Some(fb_id) =
                     drm::create_fb(cmd.handles[0], cmd.width, cmd.height, cmd.pitches[0])
                 {
@@ -1984,7 +2029,7 @@ impl INode for DrmDev {
                 if let Some(fb) = drm::get_fb(cmd.fb_id) {
                     cmd.width = fb.width;
                     cmd.height = fb.height;
-                    cmd.pixel_format = 0x3432_5258; // DRM_FORMAT_XRGB8888 ("XR24")
+                    cmd.pixel_format = DRM_FORMAT_XRGB8888;
                     cmd.flags = 0;
                     cmd.handles = [fb.gem_handle_id, 0, 0, 0];
                     cmd.pitches = [fb.pitch, 0, 0, 0];
@@ -2145,7 +2190,7 @@ impl INode for DrmDev {
                 // there might still be a driver-private handle (e.g.
                 // nouveau-uAPI GEM_NEW) the driver itself keeps track of.
                 if drm::gem_close(handle)
-                    || drm::get_primary_driver()
+                    || drm::driver_for_nouveau()
                         .map(|d| d.nouveau_gem_close(handle, drm::current_pid()))
                         .unwrap_or(false)
                 {
@@ -2437,8 +2482,8 @@ impl INode for DrmDev {
                     // Advertise the formats the software scanout consumes, via
                     // the two-call pattern (count first, then fill).
                     const FORMATS: [u32; 2] = [
-                        0x3432_5258, // DRM_FORMAT_XRGB8888 ("XR24")
-                        0x3432_5241, // DRM_FORMAT_ARGB8888 ("AR24")
+                        DRM_FORMAT_XRGB8888,
+                        DRM_FORMAT_ARGB8888,
                     ];
                     if res.format_type_ptr != 0 && res.count_format_types >= FORMATS.len() as u32 {
                         ucheck_n::<u32>(res.format_type_ptr as usize, FORMATS.len())?;
@@ -2861,8 +2906,7 @@ impl INode for DrmDev {
                 {
                     return Err(FsError::InvalidParam);
                 }
-                let last_submitted =
-                    req.flags & DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED != 0;
+                let last_submitted = req.flags & DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED != 0;
                 // LAST_SUBMITTED must include in-flight EXEC fences: the fast
                 // path returns before the GPU writes the landing zone, and NVK
                 // uses this query as the timeline value of that submit. Treating
@@ -2981,12 +3025,7 @@ impl INode for DrmDev {
                 } else {
                     zcore_drivers::scheme::syncobj::wait
                 };
-                match wait_fn(
-                    &handles,
-                    points.as_deref(),
-                    wait_all,
-                    deadline_us,
-                ) {
+                match wait_fn(&handles, points.as_deref(), wait_all, deadline_us) {
                     zcore_drivers::scheme::syncobj::WaitOutcome::Signaled {
                         first_signaled_index,
                     } => {
@@ -3034,7 +3073,7 @@ impl INode for DrmDev {
                     size,
                     dir
                 );
-                if let Some(driver) = drm::get_primary_driver() {
+                if let Some(driver) = drm::driver_for_nouveau() {
                     driver
                         .ioctl_owned(cmd, data, drm::current_pid())
                         // Map the driver's errno through instead of folding it
@@ -3062,5 +3101,54 @@ impl INode for DrmDev {
 
     fn as_any_ref(&self) -> &dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_addfb2() -> DrmModeFbCmd2 {
+        DrmModeFbCmd2 {
+            fb_id: 0,
+            width: 1920,
+            height: 1080,
+            pixel_format: DRM_FORMAT_XRGB8888,
+            flags: 0,
+            handles: [1, 0, 0, 0],
+            pitches: [1920 * 4, 0, 0, 0],
+            offsets: [0; 4],
+            modifier: [DRM_FORMAT_MOD_LINEAR; 4],
+        }
+    }
+
+    #[test]
+    fn addfb2_accepts_linear_single_plane_xrgb8888() {
+        assert!(validate_addfb2(&base_addfb2()).is_ok());
+    }
+
+    #[test]
+    fn addfb2_rejects_non_zero_offset() {
+        let mut cmd = base_addfb2();
+        cmd.offsets[0] = 4096;
+        assert_eq!(validate_addfb2(&cmd), Err("non-zero plane-0 offset"));
+    }
+
+    #[test]
+    fn addfb2_rejects_non_linear_modifier() {
+        let mut cmd = base_addfb2();
+        cmd.flags = DRM_MODE_FB_MODIFIERS;
+        cmd.modifier[0] = 0x10;
+        assert_eq!(validate_addfb2(&cmd), Err("non-linear modifier"));
+    }
+
+    #[test]
+    fn addfb2_rejects_extra_planes() {
+        let mut cmd = base_addfb2();
+        cmd.handles[1] = 2;
+        assert_eq!(
+            validate_addfb2(&cmd),
+            Err("multi-plane framebuffer not supported")
+        );
     }
 }

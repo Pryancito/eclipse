@@ -6,9 +6,8 @@
 //! threads faulted with a null-range kernel page fault at offset 0x18 (the
 //! captured source-buffer slice pointer inside the closure struct). All passes
 //! now run serially, which is functionally identical; even a full 1080p
-//! base-scene render completes in well under a second serially, and the
-//! wallpaper only re-renders its small animated logo region each frame, so no
-//! throughput is lost in practice.
+//! base-scene render completes in well under a second serially. Each
+//! animation tick copies the cached base and paints the logo on top.
 
 /// Split `data` — a row-major image buffer of `h` rows, each `row_stride`
 /// elements — into horizontal bands and run `f(y0, band)` on each.

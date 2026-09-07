@@ -672,6 +672,7 @@ mod block_byte_tests {
     use alloc::vec::Vec;
     use core::sync::atomic::{AtomicUsize, Ordering};
     use rcore_fs::dev::Device;
+    use lock::Mutex;
     use zcore_drivers::scheme::{BlockScheme, Scheme};
     use zcore_drivers::{DeviceError, DeviceResult};
 

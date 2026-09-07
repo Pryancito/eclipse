@@ -83,6 +83,7 @@ impl LinuxRootfs {
             // (this incremental path) picks up changes, not only a from-scratch
             // build.
             Self::write_profile(&dir.join("etc"));
+            self.install_nvkick(&dir, &musl);
             Self::write_ntp(&dir);
             desktop::install(&dir);
             xorg::install(&dir, &bin.join("apk"), self.0.name());
@@ -90,7 +91,9 @@ impl LinuxRootfs {
             // landed, and so /etc/pulse wins over anything the package dropped.
             Self::write_asound_conf(&dir);
             Self::write_pulse_conf(&dir);
+            Self::write_flatpak_conf(&dir);
             Self::ensure_pulse_accounts(&dir);
+            xorg::compile_glib_schemas(&dir);
             return;
         }
         // 准备最小系统需要的资源
@@ -172,6 +175,7 @@ impl LinuxRootfs {
         // an offline build just warns and ships without it. Uses the apk binary
         // and repositories already staged above.
         xorg::install(&dir, &bin.join("apk"), self.0.name());
+        xorg::compile_glib_schemas(&dir);
         Self::install_ca_certs(&dir);
 
         // /etc/machine-id — prevents dhcp_vendor "No such file or directory".
@@ -191,6 +195,7 @@ impl LinuxRootfs {
 
         Self::write_asound_conf(&dir);
         Self::write_pulse_conf(&dir);
+        Self::write_flatpak_conf(&dir);
         Self::ensure_pulse_accounts(&dir);
 
         // /etc/fstab — placeholders sustituidos por install-eclipse (sin mount syscall)
@@ -445,6 +450,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             let _ = dir::rm(lib.join("libeclipse_spawnfix.so"));
             fs::copy(&libeclipse_spawnfix, lib.join("libeclipse_spawnfix.so")).unwrap();
         }
+        self.install_nvkick(&dir, &musl);
 
         // lunarbg: the native wallpaper client (Rust, static musl). Renders
         // the Eclipse night scene procedurally over wlr-layer-shell, replacing
@@ -812,6 +818,14 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # labwc froze within seconds of starting. Keep the system on\n\
               # its proven configuration; opt in per command if needed:\n\
               #   LD_PRELOAD=/lib/libeclipse_dns.so some-command\n\
+              # NVIDIA usermode kick: intercepts DRM EXEC/WAIT so glxgears can\n\
+              # ring the GPU doorbell without a syscall per frame. Disable with\n\
+              #   ECLIPSE_NV_USERMODE=0\n\
+              if [ \"${ECLIPSE_NV_USERMODE:-}\" != \"0\" ] && [ -f /lib/libeclipse_nvkick.so ]; then\n\
+              \x20 case \":${LD_PRELOAD:-}:\" in *:/lib/libeclipse_nvkick.so:*) ;;\n\
+              \x20 *) export LD_PRELOAD=\"/lib/libeclipse_nvkick.so${LD_PRELOAD:+:$LD_PRELOAD}\" ;;\n\
+              \x20 esac\n\
+              fi\n\
               export HOME=/root\n\
               export TERM=xterm-256color\n\
               # UI language. /etc/eclipse/locale (lang=es|en); default es.\n\
@@ -865,7 +879,6 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               \x20 # NVIDIA + flag -> kernel nouveau uAPI ON, but software session by default.\n\
               \x20 if grep -q 'nvidia\\.wlr_vulkan' /proc/cmdline 2>/dev/null; then\n\
               \x20\x20 export WLR_RENDERER=vulkan\n\
-              \x20\x20 export WLR_DRM_NO_MODIFIERS=1\n\
               \x20\x20 export GALLIUM_DRIVER=zink\n\
               \x20\x20 export MESA_LOADER_DRIVER_OVERRIDE=zink\n\
               \x20\x20 # SDL: GLES2 renderer on the GPU sessions (SDL2 has no Vulkan\n\
@@ -874,7 +887,6 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               \x20\x20 export SDL_FRAMEBUFFER_ACCELERATION=opengles2\n\
               \x20 elif grep -q 'nvidia\\.wlr_gles2' /proc/cmdline 2>/dev/null; then\n\
               \x20\x20 export WLR_RENDERER=gles2\n\
-              \x20\x20 export WLR_DRM_NO_MODIFIERS=1\n\
               \x20\x20 export GALLIUM_DRIVER=zink\n\
               \x20\x20 export MESA_LOADER_DRIVER_OVERRIDE=zink\n\
               \x20\x20 export SDL_RENDER_DRIVER=opengles2\n\
@@ -905,6 +917,10 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               \x20 export SDL_RENDER_DRIVER=software\n\
               \x20 export SDL_FRAMEBUFFER_ACCELERATION=0\n\
               fi\n\
+              # Force implicit-modifier (linear) scanout buffers regardless of renderer.\n\
+              # Eclipse presents by CPU-reading the framebuffer linearly; tiled\n\
+              # modifiers on dual NVIDIA setups can surface as noisy/ghosted output.\n\
+              export WLR_DRM_NO_MODIFIERS=1\n\
               # SDL (sdl12-compat / SDL2 / SDL3) backends, renderer-independent:\n\
               # native Wayland first, X11 fallback (Xwayland here, Xorg under\n\
               # desktop=xorg -- the list makes ONE policy serve both sessions),\n\
@@ -928,6 +944,10 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # the chain SDL_Init walks first; gzdoom hung there). With no\n\
               # daemon the connect is refused at once and apps carry on.\n\
               export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus\n\
+              export GSETTINGS_BACKEND=memory\n\
+              export GTK_A11Y=none\n\
+              export NO_AT_BRIDGE=1\n\
+              export GDK_BACKEND=wayland\n\
               # wlroots' libinput backend aborts the whole compositor if it\n\
               # enumerates zero input devices ('libinput initialization failed,\n\
               # no input devices'). Without a running udevd to tag devices,\n\
@@ -1564,6 +1584,55 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             eprintln!("warning: failed to compile libeclipse_dns.so");
         }
         lib
+    }
+
+    /// Build libeclipse_nvkick.so (LD_PRELOAD: usermode NVIDIA EXEC/WAIT).
+    fn libeclipse_nvkick(&self, musl: &Path) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join("eclipse-nvkick");
+        let lib = dir.join("libeclipse_nvkick.so");
+        let source = dir.join("nvkick.c");
+        if lib.is_file() && source.is_file() {
+            if let (Ok(lib_meta), Ok(src_meta)) = (fs::metadata(&lib), fs::metadata(&source)) {
+                if let (Ok(lib_mtime), Ok(src_mtime)) = (lib_meta.modified(), src_meta.modified()) {
+                    if lib_mtime >= src_mtime {
+                        return lib;
+                    }
+                }
+            }
+        }
+
+        println!("Compiling libeclipse_nvkick.so...");
+        let musl = musl.canonicalize().unwrap();
+        let arch = self.0.name();
+        let cc = format!("{}/{}-linux-musl-gcc", musl.join("bin").display(), arch);
+        fs::create_dir_all(&dir).unwrap();
+        let status = Ext::new(&cc)
+            .current_dir(&dir)
+            .arg("-shared")
+            .arg("-fPIC")
+            .arg("-O2")
+            .arg("-o")
+            .arg(&lib)
+            .arg(&source)
+            .arg("-ldl")
+            .arg("-lpthread")
+            .status();
+        if !status.success() {
+            eprintln!("warning: failed to compile libeclipse_nvkick.so");
+        }
+        lib
+    }
+
+    fn install_nvkick(&self, rootfs: &Path, musl: &Path) {
+        let lib = self.libeclipse_nvkick(musl);
+        if lib.is_file() {
+            let dst = rootfs.join("lib").join("libeclipse_nvkick.so");
+            let _ = fs::create_dir_all(rootfs.join("lib"));
+            let _ = dir::rm(&dst);
+            if let Err(e) = fs::copy(&lib, &dst) {
+                eprintln!("warning: could not install libeclipse_nvkick.so: {e}");
+            }
+        }
     }
 
     /// Build eclipse-sdl-probe (tools/eclipse-sdl-probe): the SDL smoke test.
@@ -2268,6 +2337,32 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let _ = fs::create_dir_all(rootfs.join("var/run/pulse"));
     }
 
+    /// Flatpak system layout (EU OS model: apps via Flatpak, OS via apk).
+    fn write_flatpak_conf(rootfs: &Path) {
+        let etc = rootfs.join("etc").join("flatpak");
+        let _ = fs::create_dir_all(etc.join("remotes.d"));
+        let _ = fs::create_dir_all(etc.join("installations.d"));
+        let _ = fs::create_dir_all(rootfs.join("var/lib/flatpak"));
+        let _ = fs::create_dir_all(rootfs.join("var/tmp"));
+        let _ = fs::write(
+            etc.join("installations.d").join("eclipse.conf"),
+            b"# eclipse-generated\n\
+              [Installation \"eclipse\"]\n\
+              Path=/var/lib/flatpak\n\
+              DisplayName=Eclipse OS\n",
+        );
+        // Flathub remote descriptor. `eclipse-flatpak-setup` runs
+        // `flatpak remote-add --from` once the network is up.
+        let _ = fs::write(
+            etc.join("remotes.d").join("flathub.flatpakrepo"),
+            b"[Flatpak Repo]\n\
+              Title=Flathub\n\
+              Url=https://dl.flathub.org/repo/\n\
+              Homepage=https://flathub.org/\n\
+              Comment=Apps for Eclipse OS (EU OS model)\n",
+        );
+    }
+
     /// `pulse` / `pulse-access` / `audio` accounts. apk `--no-scripts` never
     /// runs the PulseAudio post-install, and `--system` drops to user `pulse`
     /// after binding the socket — without these lines the daemon exits.
@@ -2575,6 +2670,38 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         )
         .unwrap();
 
+        // Session D-Bus (required by Flatpak, portals, xdg-dbus-proxy).
+        // Bound to the address already pinned in CHILD_ENV so libdbus never
+        // autolaunch:es. Foreground: init supervises.
+        fs::write(
+            svc_dir.join("dbus-session.service"),
+            b"# D-Bus session bus for Flatpak / portals.\n\
+              exec = /usr/local/bin/eclipse-session-bus\n\
+              type = respawn\n\
+              log = /tmp/dbus-session.log\n",
+        )
+        .unwrap();
+        fs::write(
+            svc_dir.join("xdg-desktop-portal.service"),
+            b"# xdg-desktop-portal (Flatpak file/screenshot/etc. portals).\n\
+              exec = /usr/local/bin/eclipse-xdg-portal\n\
+              type = respawn\n\
+              after = dbus-session labwc\n\
+              wait_socket = /run/user/0/bus\n\
+              desktop = labwc\n\
+              log = /tmp/xdg-desktop-portal.log\n",
+        )
+        .unwrap();
+        fs::write(
+            svc_dir.join("flatpak-setup.service"),
+            b"# Add Flathub once the network is up.\n\
+              exec = /usr/local/bin/eclipse-flatpak-setup\n\
+              type = oneshot\n\
+              after = udhcpc dbus-session\n\
+              log = /tmp/flatpak-setup.log\n",
+        )
+        .unwrap();
+
         // Boot chime: play once after the session is up so NVIDIA HDMI audio
         // (ELD/SET_HDMI_ENABLE) has had a DRM query. Oneshot wrapper forks
         // mpg123 and exits so init is not blocked for the length of the track.
@@ -2680,6 +2807,77 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               export PULSE_RUNTIME_PATH=/run/pulse\n\
               export PULSE_STATE_PATH=/var/lib/pulse\n\
               exec pulseaudio --system --disallow-exit --exit-idle-time=-1 --daemonize=no --use-pid-file=no --realtime=false --log-target=stderr --log-level=notice\n",
+        )
+        .unwrap();
+        fs::write(
+            localbin.join("eclipse-session-bus"),
+            b"#!/bin/sh\n\
+              command -v dbus-daemon >/dev/null 2>&1 || { echo 'eclipse-session-bus: dbus-daemon missing' >&2; sleep 8; exit 127; }\n\
+              mkdir -p /run/user/0\n\
+              chmod 0700 /run/user/0 2>/dev/null || true\n\
+              export XDG_RUNTIME_DIR=/run/user/0\n\
+              export GSETTINGS_BACKEND=memory\n\
+              export GTK_A11Y=none\n\
+              export NO_AT_BRIDGE=1\n\
+              export GDK_BACKEND=wayland\n\
+              exec dbus-daemon --session --address=unix:path=/run/user/0/bus --nofork --nopidfile --syslog-only\n",
+        )
+        .unwrap();
+        fs::write(
+            localbin.join("eclipse-xdg-portal"),
+            b"#!/bin/sh\n\
+              export XDG_RUNTIME_DIR=/run/user/0\n\
+              export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus\n\
+              export GSETTINGS_BACKEND=memory\n\
+              export GTK_A11Y=none\n\
+              export NO_AT_BRIDGE=1\n\
+              export GDK_BACKEND=wayland\n\
+              export WAYLAND_DISPLAY=wayland-0\n\
+              export XDG_CURRENT_DESKTOP=wlroots\n\
+              export PATH=\"/usr/libexec:/usr/libexec/xdg-desktop-portal:/usr/bin:/bin:$PATH\"\n\
+              findbin() {\n\
+              \x20 p=`command -v \"$1\" 2>/dev/null` && [ -n \"$p\" ] && echo \"$p\" && return 0\n\
+              \x20 for c in \"/usr/libexec/$1\" \"/usr/libexec/xdg-desktop-portal/$1\"; do\n\
+              \x20   if [ -x \"$c\" ]; then echo \"$c\"; return 0; fi\n\
+              \x20 done\n\
+              \x20 return 1\n\
+              }\n\
+              PORTAL=`findbin xdg-desktop-portal` || PORTAL=\n\
+              if [ -z \"$PORTAL\" ]; then\n\
+              \x20 echo 'eclipse-xdg-portal: xdg-desktop-portal not installed (looked in PATH and /usr/libexec); idle' >&2\n\
+              \x20 exec sleep inf\n\
+              fi\n\
+              i=0\n\
+              while [ ! -S /run/user/0/bus ] && [ \"$i\" -lt 30 ]; do sleep 1; i=$((i+1)); done\n\
+              i=0\n\
+              while [ ! -S /run/user/0/wayland-0 ] && [ ! -S /run/wayland-0 ] && [ \"$i\" -lt 30 ]; do sleep 1; i=$((i+1)); done\n\
+              WLR=`findbin xdg-desktop-portal-wlr` || WLR=\n\
+              GTK=`findbin xdg-desktop-portal-gtk` || GTK=\n\
+              [ -n \"$WLR\" ] && \"$WLR\" >/tmp/xdg-portal-wlr.log 2>&1 &\n\
+              [ -n \"$GTK\" ] && \"$GTK\" >/tmp/xdg-portal-gtk.log 2>&1 &\n\
+              echo \"eclipse-xdg-portal: exec $PORTAL\" >&2\n\
+              exec \"$PORTAL\" --replace\n",
+        )
+        .unwrap();
+        fs::write(
+            localbin.join("eclipse-flatpak-setup"),
+            b"#!/bin/sh\n\
+              command -v flatpak >/dev/null 2>&1 || exit 0\n\
+              mkdir -p /var/lib/flatpak /var/tmp\n\
+              export XDG_RUNTIME_DIR=/run/user/0\n\
+              export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus\n\
+              export GSETTINGS_BACKEND=memory\n\
+              export GTK_A11Y=none\n\
+              export NO_AT_BRIDGE=1\n\
+              export GDK_BACKEND=wayland\n\
+              REPO=/etc/flatpak/remotes.d/flathub.flatpakrepo\n\
+              if [ -f \"$REPO\" ]; then\n\
+              \x20 flatpak remote-add --if-not-exists --system flathub \"$REPO\" || \\\n\
+              \x20   flatpak remote-add --if-not-exists --system flathub https://dl.flathub.org/repo/flathub.flatpakrepo || true\n\
+              else\n\
+              \x20 flatpak remote-add --if-not-exists --system flathub https://dl.flathub.org/repo/flathub.flatpakrepo || true\n\
+              fi\n\
+              exit 0\n",
         )
         .unwrap();
         let share = rootfs.join("usr").join("share").join("eclipse");
@@ -2927,6 +3125,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                 "eclipse-boot-sound",
                 "eclipse-boot-sound-play",
                 "eclipse-pulseaudio",
+                "eclipse-session-bus",
+                "eclipse-xdg-portal",
+                "eclipse-flatpak-setup",
                 "reboot",
                 "poweroff",
                 "halt",

@@ -1165,7 +1165,7 @@ fn push_route_dump_entry(
 /// socket, and treats ANY `NLMSG_ERROR` it finds as a failure — it never
 /// inspects `error`, so a success ACK is indistinguishable from a real one:
 ///
-/// ```text
+/// ```c
 /// if (h->nlmsg_type == NLMSG_ERROR) { errno = -err->error; return -1; }
 /// ```
 ///
