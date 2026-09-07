@@ -2146,7 +2146,7 @@ impl INode for DrmDev {
                 // nouveau-uAPI GEM_NEW) the driver itself keeps track of.
                 if drm::gem_close(handle)
                     || drm::get_primary_driver()
-                        .map(|d| d.nouveau_gem_close(handle))
+                        .map(|d| d.nouveau_gem_close(handle, drm::current_pid()))
                         .unwrap_or(false)
                 {
                     Ok(0)

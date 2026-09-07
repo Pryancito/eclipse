@@ -472,8 +472,22 @@ Corregido en esta rama, sobre `9757fe5` (la fusión con el `master` local
 | F-M11 | `README-drm.md` actualizado (render node, caps, syncobj, vblank, page flip, punteros). |
 | Deuda de CI | Lints `clippy` preexistentes que rompían `deny(warnings)` en `btrfs-rs`, `nvidia.rs`, `nouveau_uapi.rs`, `procfs.rs` y `xhci_hid.rs`; tests de `block_mount` que no compilaban; doctest de `netlink`. |
 
-Pendiente (sin cambiar en esta rama): F-A4/F-A5/F-A6/F-A7 y el resto de
-NVIDIA, F-M6 (activar el filtro del render node requiere probarlo en el
-escritorio software-GL), F-M7 (estado por apertura), F-M8, F-M9, F-M10,
-virtio-gpu, userspace (lunarbg/lunarbar/drmbench), build/sesión y el resto
-de la documentación (`README-desktop.md`, `README-xorg.md`).
+Segundo bloque (misma rama):
+
+| Hallazgo | Cambio |
+|---|---|
+| F-A4 | `cb3e197` (PR #1072, perdido en `master`) aplicado con *cherry-pick*: el fence de `EXEC` libera con `RELEASE_WFI_EN`. |
+| F-A5 | `GEM_CPU_PREP` espera de verdad: encola una entrada sólo-fence tras todo lo que el proceso tiene en su anillo y espera a que aterrice (`cpu_prep_wait`); `NOWAIT` → EBUSY; 1 s → EBUSY. |
+| F-A6 | `FastSlot::Preparing`: el primer hilo reclama la construcción bajo el lock y los demás esperan su veredicto; si el contexto se destruye durante la construcción, el estado se descarta en vez de publicarse. |
+| F-A7 | `gem_mmap` lleva poseedores por pid (`register`/`add_ref`/`dec_ref`/`release_pid`/`holds`); `GEM_INFO`, `VM_BIND MAP`, `CPU_PREP`/`FINI` y `GEM_CLOSE` exigen ser creador o importador (`gem_usable_by`), `CHANNEL_FREE` exige ser dueño del canal, y la salida de un proceso suelta también sus auto-importaciones (cerrada la fuga documentada). En la tabla genérica, `gem_close` y el `mmap` de dumb buffers exigen ser el dueño. |
+| Userspace | `tools/lunarbar/src/i18n.rs` restaurado del `master` perdido (lunarbar vuelve a compilar). lunarbg y lunarbar desmapean los pools shm retirados de inmediato (los `release` de buffers destruidos nunca llegan; `munmap` no afecta al mapeo del compositor). lunarbar: un cambio de escala reasigna el pool (antes escribía fuera del memfd) y ya no deja la barra sin configurar cuando el tamaño lógico no cambia. |
+| Docs | `README-nouveau-uapi.md` (CPU_PREP, poseedores por pid), `README-desktop.md` (sesión real: servicios de init, lunarbar, seatd como demonio) y `README-xorg.md` (config generada: libinput, `AutoAddGPU` off, `ShadowFB`). |
+
+Pendiente (sin cambiar en esta rama): F-M6 (activar el filtro del render
+node requiere probarlo en el escritorio software-GL), F-M7 (estado por
+apertura), F-M8, F-M9, F-M10, F-M12/F-M13 (virtio-gpu), F-M14/F-M15
+(NVIDIA: lock durante `step16/17`, rol pegajoso del compositor), F-M16 a
+F-M18, drmbench (F-M21) y build/sesión (F-M22 a F-M25). Nada de lo hecho
+en NVIDIA ni en userspace se ha probado en hardware: compila (`make clippy
+ARCH=x86_64 LINUX=1`, `cargo check` de las herramientas) y sigue la
+semántica de Linux, pero la validación en la RTX queda para el propietario.

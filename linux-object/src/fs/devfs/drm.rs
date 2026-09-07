@@ -540,7 +540,7 @@ pub fn nouveau_handle_for_phys(phys_addr: u64) -> Option<u32> {
 /// close would free the buffer while the exporter (wlroots) still owns it.
 /// Returns the new share count, or `None` if the handle is not tracked.
 pub fn nouveau_gem_add_ref(handle: u32) -> Option<u32> {
-    zcore_drivers::scheme::gem_mmap::add_ref(handle)
+    zcore_drivers::scheme::gem_mmap::add_ref(handle, current_pid())
 }
 
 /// Import a dma-buf (PRIME): register a new GEM handle over the same backing
@@ -578,12 +578,22 @@ pub fn get_handle(handle_id: u32) -> Option<GemHandle> {
 /// also `Cached`, where the physical one defaulted to `Uncached`, so the
 /// compositor no longer renders into UC memory on real hardware.
 pub fn handle_vmo(handle_id: u32) -> Option<Arc<VmObject>> {
+    let pid = current_pid();
     DRM_STATE
         .lock()
         .handles
         .iter()
-        .find(|(h, _, _)| h.id == handle_id)
+        .find(|(h, _, owner)| h.id == handle_id && owned_by(*owner, pid))
         .map(|(_, vmo, _)| vmo.clone())
+}
+
+/// Whether a process may act on a GEM object owned by `owner`: its own, an
+/// unowned (boot-time) one, or when there is no current thread. Handles are
+/// per-file in Linux; this global table cannot do better than per-pid, but
+/// without it any process could `mmap` or `GEM_CLOSE` another's buffers by
+/// guessing a (small, sequential) handle.
+fn owned_by(owner: u64, pid: u64) -> bool {
+    pid == 0 || owner == 0 || owner == pid
 }
 
 /// Look up a framebuffer object by id (`DRM_IOCTL_MODE_GETFB`/`GETFB2`).
@@ -2688,8 +2698,13 @@ pub fn release_process(pid: u64) -> usize {
 }
 
 pub fn gem_close(handle_id: u32) -> bool {
+    let pid = current_pid();
     let mut state = DRM_STATE.lock();
-    if let Some(pos) = state.handles.iter().position(|(h, _, _)| h.id == handle_id) {
+    if let Some(pos) = state
+        .handles
+        .iter()
+        .position(|(h, _, owner)| h.id == handle_id && owned_by(*owner, pid))
+    {
         let (handle, _, _) = state.handles[pos];
         let driver = state.drivers.first().cloned();
         let _ = state.handles.remove(pos);

@@ -25,9 +25,3 @@ pub const MAX_BUFFER_DIM: u32 = 16384;
 /// frame is ~33 Mpx). Past this the per-frame CPU cost stops being a
 /// wallpaper and starts being a space heater; the output is skipped.
 pub const MAX_BUFFER_PIXELS: usize = 64 * 1024 * 1024;
-
-/// Most retired shm mappings held while waiting for the compositor to
-/// Release their buffers. Holding is deliberate — unmapping early would be a
-/// use-after-free on the compositor's side of the pool — so past this cap we
-/// only log; each entry is at most one pool (~16 MiB at 1080p).
-pub const MAX_RETIRED_MAPS: usize = 8;

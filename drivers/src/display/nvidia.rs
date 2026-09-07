@@ -39,6 +39,15 @@ fn gpu_spin() {
 /// per-submit path for its lifetime instead of retrying the RM on every EXEC.
 enum FastSlot {
     Unprepared,
+    /// A thread is inside `exec_fast_prepare` for this context. Claimed under
+    /// the slot lock BEFORE entering the RM, so a second thread of the same
+    /// process (NVK is multithreaded; labwc runs two Vulkan instances) waits
+    /// for that build instead of running its own and overwriting the first
+    /// `FastCtx` -- which restarted `next_payload` at 1 and zeroed the landing
+    /// zone under fences already attached with higher payloads, so a stale
+    /// fence read as landed when the second stream reached its number, and
+    /// leaked the first USERD mapping.
+    Preparing,
     Ready(super::nouveau_uapi::FastCtx),
     Failed,
 }
@@ -3443,6 +3452,19 @@ fn parse_gpubench_elapsed_ns(report: &str) -> u64 {
         }
     }
     0
+}
+
+/// Whether `pid` may act on GEM object `o`: it created it, or it holds a
+/// PRIME reference to it (`gem_mmap::holds`), or there is no current thread.
+/// Handles come from one global counter, so without this any process could
+/// `GEM_INFO`/`VM_BIND`/`CPU_PREP`/`GEM_CLOSE` the compositor's buffers by
+/// guessing a number -- and map them into its own VAS for the GPU to read
+/// and write. An object with no phys mapping was never exportable, so only
+/// its creator can hold it.
+fn gem_usable_by(o: &super::nouveau_uapi::NouveauGemObject, pid: u64) -> bool {
+    pid == 0
+        || o.owner_pid == pid
+        || (o.phys_addr.is_some() && crate::scheme::gem_mmap::holds(o.handle, pid))
 }
 
 /// `access_ok()` for a user array a nouveau ioctl is about to read directly:
@@ -7269,7 +7291,7 @@ impl DrmScheme for NvidiaGpu {
         false
     }
 
-    fn nouveau_gem_close(&self, handle: u32) -> bool {
+    fn nouveau_gem_close(&self, handle: u32, owner_pid: u64) -> bool {
         // PRIME share-count gate. A swapchain buffer is referenced by more than
         // one holder at once: the compositor's original GEM_NEW owner plus every
         // PRIME self-import NVK/EGL made of the same buffer (each handed back
@@ -7281,7 +7303,15 @@ impl DrmScheme for NvidiaGpu {
         // memory heap=0" / "createImageFromDmaBufs failed"). dec_ref only frees
         // when the LAST holder closes; until then keep the GEM object, its
         // VM_BIND mappings, and its RM memory alive.
-        match crate::scheme::gem_mmap::dec_ref(handle) {
+        match crate::scheme::gem_mmap::dec_ref(handle, owner_pid) {
+            crate::scheme::gem_mmap::DecRef::NotHolder => {
+                log::warn!(
+                    "[nouveau-uapi] GEM_CLOSE handle={} by pid={} -> not a holder, refused",
+                    handle,
+                    owner_pid
+                );
+                return false;
+            }
             crate::scheme::gem_mmap::DecRef::StillReferenced(n) => {
                 log::info!(
                     "[nouveau-uapi] GEM_CLOSE handle={} -> still shared (refcount={}), kept alive",
@@ -7304,8 +7334,12 @@ impl DrmScheme for NvidiaGpu {
         }
         let removed = {
             let mut gem = self.nouveau_gem.lock();
+            // An untracked (never exported) object belongs to its creator
+            // alone; a tracked one just had its last holder verified above.
             gem.iter()
-                .position(|o| o.handle == handle)
+                .position(|o| {
+                    o.handle == handle && (o.phys_addr.is_some() || gem_usable_by(o, owner_pid))
+                })
                 .map(|pos| gem.remove(pos))
         };
         let Some(obj) = removed else {
@@ -7822,30 +7856,29 @@ impl DrmScheme for NvidiaGpu {
         //    reference accounting in gem_mmap. A clean exit closes every
         //    reference and frees normally.
         let (freed_gems, freed_bytes) = {
-            // Phase 1: snapshot this pid's objects. No removal, no gem_mmap touch.
-            let snapshot: Vec<(u32, bool)> = {
-                let gem = self.nouveau_gem.lock();
-                gem.iter()
-                    .filter(|o| o.owner_pid == pid)
-                    .map(|o| (o.handle, o.phys_addr.is_some()))
-                    .collect()
-            };
-            // Phase 2: drop this process's reference to each and decide
-            // free-vs-keep, with NO lock held across the two subsystems. A
-            // no-phys object was never PRIME-registered (cannot be shared) so it
-            // is always this process's alone -> free.
+            // Phase 1+2: drop EVERY reference this pid holds -- its own
+            // creations and every PRIME self-import it never closed (the
+            // per-pid holder list makes those attributable now, so a client
+            // that died mid-frame no longer leaks its imports until reboot).
+            // `release_pid` takes only the gem_mmap lock; the nouveau_gem lock
+            // is taken afterwards, the same order GEM_CLOSE uses.
             let mut to_free: Vec<u32> = Vec::new();
             let mut to_orphan: Vec<u32> = Vec::new();
-            for (handle, has_phys) in &snapshot {
-                let still_shared = *has_phys
-                    && matches!(
-                        crate::scheme::gem_mmap::dec_ref(*handle),
-                        crate::scheme::gem_mmap::DecRef::StillReferenced(_)
-                    );
-                if still_shared {
-                    to_orphan.push(*handle);
+            for (handle, freed) in crate::scheme::gem_mmap::release_pid(pid) {
+                if freed {
+                    to_free.push(handle);
                 } else {
-                    to_free.push(*handle);
+                    to_orphan.push(handle);
+                }
+            }
+            // A no-phys object was never PRIME-registered (cannot be shared),
+            // so it is always its creator's alone -> free.
+            {
+                let gem = self.nouveau_gem.lock();
+                for o in gem.iter() {
+                    if o.owner_pid == pid && o.phys_addr.is_none() && !to_free.contains(&o.handle) {
+                        to_free.push(o.handle);
+                    }
                 }
             }
             // Phase 3: apply under the nouveau_gem lock. Collect h_memory ONLY
@@ -7861,8 +7894,12 @@ impl DrmScheme for NvidiaGpu {
                     }
                 }
                 for handle in &to_orphan {
+                    // Detach the creator only if it was this pid: an import
+                    // this pid held of a LIVE owner's buffer keeps its owner.
                     if let Some(o) = gem.iter_mut().find(|o| o.handle == *handle) {
-                        o.owner_pid = 0;
+                        if o.owner_pid == pid {
+                            o.owner_pid = 0;
+                        }
                     }
                 }
             }
@@ -8193,7 +8230,12 @@ impl NvidiaGpu {
                 }
                 let h_memory = {
                     let gem = self.nouveau_gem.lock();
-                    let Some(obj) = gem.iter().find(|o| o.handle == op.handle) else {
+                    // Only a holder may bind the object into its VAS: binding
+                    // another process's buffer is a GPU read/write of it.
+                    let Some(obj) = gem
+                        .iter()
+                        .find(|o| o.handle == op.handle && gem_usable_by(o, owner_pid))
+                    else {
                         return Err(nv::ENOENT);
                     };
                     obj.h_memory
@@ -8847,13 +8889,36 @@ impl NvidiaGpu {
         if !nv::exec_fast_enabled() || ctx_idx >= nv::MAX_CTX {
             return false;
         }
-        {
-            let slots = self.nouveau_fast.lock();
-            match &slots[ctx_idx as usize] {
-                FastSlot::Ready(_) => return true,
-                FastSlot::Failed => return false,
-                FastSlot::Unprepared => {}
+        const PREPARE_WAIT_US: u64 = 2_000_000;
+        let start = unsafe { crate::bus::drivers_timer_now_as_micros() };
+        loop {
+            {
+                let mut slots = self.nouveau_fast.lock();
+                match &slots[ctx_idx as usize] {
+                    FastSlot::Ready(_) => return true,
+                    FastSlot::Failed => return false,
+                    FastSlot::Preparing => {}
+                    FastSlot::Unprepared => {
+                        // Claim the build; every other caller waits below.
+                        slots[ctx_idx as usize] = FastSlot::Preparing;
+                        break;
+                    }
+                }
             }
+            // Another thread is building this context: wait for its verdict
+            // (the RM prepare is hundreds of microseconds to a few ms) rather
+            // than falling back to the RM path, which would submit on the
+            // same channel behind the direct ring's back.
+            if unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(start)
+                >= PREPARE_WAIT_US
+            {
+                crate::klog_warn!(
+                    "[nouveau-uapi] ctx{}: another thread's exec_fast_prepare did not finish in 2s -- RM per-submit path for this EXEC",
+                    ctx_idx
+                );
+                return false;
+            }
+            gpu_spin();
         }
         // Prepare OUTSIDE the slot lock: this enters the RM (RmGate, hundreds
         // of microseconds) and the slot lock is an IRQ-off spinlock.
@@ -8896,6 +8961,17 @@ impl NvidiaGpu {
             }
         };
         let mut slots = self.nouveau_fast.lock();
+        if !matches!(slots[ctx_idx as usize], FastSlot::Preparing) {
+            // The context was torn down (`fast_release`) while we were in the
+            // RM: our claim is gone, so drop what we built instead of
+            // publishing state for a freed channel.
+            drop(slots);
+            if built.is_some() {
+                lock::pump();
+                let _ = nvidia_rm_sys::rm_init::exec_fast_release(device_instance, ctx_idx);
+            }
+            return false;
+        }
         match built {
             Some(f) => {
                 let ctx = nv::FastCtx {
@@ -9037,6 +9113,82 @@ impl NvidiaGpu {
                 >= RING_TIMEOUT_US
             {
                 return Err(nv::FastSubmitError::RingFull { put, get, needed });
+            }
+            gpu_spin();
+        }
+    }
+
+    /// `GEM_CPU_PREP`: wait until every submission `owner_pid` queued on its
+    /// direct-submit channel has finished executing.
+    ///
+    /// A fence-only GP entry is appended behind the queued work and waited
+    /// for: with `RELEASE_WFI_EN` the host writes its payload only once the
+    /// channel's engines are idle, so it proves completion of everything in
+    /// front of it (including submissions that carried no fence of their
+    /// own). The RM per-submit path is synchronous and needs no wait. `nowait`
+    /// answers EBUSY instead of blocking; a fence that never lands within the
+    /// usual 1 s also answers EBUSY (Linux: a timed-out reservation wait is
+    /// EBUSY too).
+    fn cpu_prep_wait(&self, owner_pid: u64, nowait: bool) -> Result<usize, i32> {
+        use super::nouveau_uapi as nv;
+        const CPU_PREP_TIMEOUT_US: u64 = 1_000_000;
+        // Resolve the channel this pid submits on WITHOUT defaulting to ctx 0:
+        // a client whose own context is not ready yet has queued nothing, and
+        // only the compositor (no per-pid entry, owner of the RM channel)
+        // legitimately submits on ctx 0.
+        let ctx_idx = {
+            let entry = self
+                .nouveau_pid_ctx
+                .lock()
+                .iter()
+                .find(|t| t.0 == owner_pid)
+                .map(|t| (t.1, t.4));
+            match entry {
+                Some((ctx, true)) => ctx,
+                Some((_, false)) => return Ok(0),
+                None if self.nouveau_owns_rm_channel(owner_pid) => 0,
+                None => return Ok(0),
+            }
+        };
+        let queued = match self.nouveau_fast.lock().get(ctx_idx as usize) {
+            Some(FastSlot::Ready(f)) => f.submits > 0,
+            _ => false,
+        };
+        if !queued {
+            return Ok(0);
+        }
+        let (fence_va, payload) = match self.fast_submit(ctx_idx, &[], true) {
+            Ok(Some(fence)) => fence,
+            Ok(None) => return Ok(0),
+            Err(_) => {
+                // Ring full or context gone: fall back to the last fence
+                // that was issued, which covers all but a trailing
+                // unfenced tail.
+                match self.nouveau_fast.lock().get(ctx_idx as usize) {
+                    Some(FastSlot::Ready(f)) if f.fenced > 0 => {
+                        (f.fence_sem_va, f.next_payload.wrapping_sub(1))
+                    }
+                    _ => return Ok(0),
+                }
+            }
+        };
+        let start = unsafe { crate::bus::drivers_timer_now_as_micros() };
+        loop {
+            if crate::scheme::syncobj::hw_fence_landed(fence_va, payload) {
+                return Ok(0);
+            }
+            if nowait {
+                return Err(nv::EBUSY);
+            }
+            if unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(start)
+                >= CPU_PREP_TIMEOUT_US
+            {
+                crate::klog_warn!(
+                    "[nouveau-uapi] CPU_PREP: ctx{} fence payload {} did not land in 1s -> EBUSY",
+                    ctx_idx,
+                    payload
+                );
+                return Err(nv::EBUSY);
             }
             gpu_spin();
         }
@@ -10470,10 +10622,16 @@ impl NvidiaGpu {
                 let req = unsafe { &*(arg as *const nv::DrmNouveauChannelFree) };
                 let was_rm_backed = {
                     let mut chans = self.nouveau_channels.lock();
-                    let Some(pos) = chans.iter().position(|c| c.id == req.channel) else {
+                    // Only the channel's own process may free it: freeing the
+                    // compositor's channel 0 from a client made its next EXEC
+                    // fail EINVAL.
+                    let Some(pos) = chans.iter().position(|c| {
+                        c.id == req.channel && (owner_pid == 0 || c.owner_pid == owner_pid)
+                    }) else {
                         log::warn!(
-                            "[nouveau-uapi] CHANNEL_FREE: no such channel {}",
-                            req.channel
+                            "[nouveau-uapi] CHANNEL_FREE: no such channel {} (for pid={})",
+                            req.channel,
+                            owner_pid
                         );
                         return Err(nv::EINVAL);
                     };
@@ -11481,7 +11639,7 @@ impl NvidiaGpu {
                     None
                 };
                 let map_handle = if let Some(pa) = phys_addr {
-                    crate::scheme::gem_mmap::register(handle, pa, req.info.size);
+                    crate::scheme::gem_mmap::register(handle, pa, req.info.size, owner_pid);
                     (handle as u64) << 12
                 } else {
                     0
@@ -11542,7 +11700,10 @@ impl NvidiaGpu {
                 // so the two locks are never held nested in either order.
                 let (size, phys_addr, obj_tile_mode, obj_tile_flags, obj_domain) = {
                     let gem = self.nouveau_gem.lock();
-                    let Some(obj) = gem.iter().find(|o| o.handle == req.handle) else {
+                    let Some(obj) = gem
+                        .iter()
+                        .find(|o| o.handle == req.handle && gem_usable_by(o, owner_pid))
+                    else {
                         // [dmabuf-diag] error!-visible: NVK runs GEM_INFO on the
                         // handle it got back from PRIME import. If that handle is
                         // not a nouveau GEM object (a dma-buf that came back as a
@@ -11597,26 +11758,32 @@ impl NvidiaGpu {
 
             nv::NR_GEM_CPU_PREP => {
                 let req = unsafe { &*(arg as *const nv::DrmNouveauGemCpuPrep) };
-                let gem = self.nouveau_gem.lock();
-                // Validates the handle and returns: there is no per-BO fence
-                // to wait on here. That is HONEST under this driver's
-                // synchronous submission model -- EXEC blocks until its fence
-                // lands before returning (and before signaling its syncobjs),
-                // so by the time a caller issues CPU_PREP every previously
-                // submitted batch touching this buffer has already completed.
-                // If EXEC ever goes asynchronous, this arm must grow a real
-                // wait (per-BO tracking), or CPU reads will race the GPU.
-                if gem.iter().any(|o| o.handle == req.handle) {
-                    Ok(0)
-                } else {
-                    Err(nv::ENOENT)
+                let known = self
+                    .nouveau_gem
+                    .lock()
+                    .iter()
+                    .any(|o| o.handle == req.handle && gem_usable_by(o, owner_pid));
+                if !known {
+                    return Err(nv::ENOENT);
                 }
+                // Linux waits for the BO's reservation fences (up to 30 s;
+                // `NOWAIT` -> EBUSY if busy). There is no per-BO fence here,
+                // so wait for everything this process queued on its channel
+                // instead -- a superset of the BO's fences. EXEC is
+                // asynchronous on the direct-submit path, so returning
+                // immediately (as this did) let Mesa's `nouveau_ws_bo_wait`
+                // read a buffer the GPU was still writing.
+                const NOUVEAU_GEM_CPU_PREP_NOWAIT: u32 = 0x2;
+                self.cpu_prep_wait(owner_pid, req.flags & NOUVEAU_GEM_CPU_PREP_NOWAIT != 0)
             }
 
             nv::NR_GEM_CPU_FINI => {
                 let req = unsafe { &*(arg as *const nv::DrmNouveauGemCpuFini) };
                 let gem = self.nouveau_gem.lock();
-                if gem.iter().any(|o| o.handle == req.handle) {
+                if gem
+                    .iter()
+                    .any(|o| o.handle == req.handle && gem_usable_by(o, owner_pid))
+                {
                     Ok(0)
                 } else {
                     Err(nv::ENOENT)

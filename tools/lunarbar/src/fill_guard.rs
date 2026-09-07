@@ -15,12 +15,6 @@ pub const MAX_OUTPUTS: usize = 32;
 /// Bar surfaces (two per output: top + bottom).
 pub const MAX_BARS: usize = MAX_OUTPUTS * 2;
 
-/// Soft cap on retired shm mappings awaiting `wl_buffer.Release`. Under a
-/// resize storm we keep more than this only until Releases arrive; past
-/// `MAX_RETIRED_MAPS * 4` the oldest is force-unmapped as a last resort
-/// (logged) so a stuck compositor cannot OOM the panel.
-pub const MAX_RETIRED_MAPS: usize = 16;
-
 /// Maximum edge of a bar/popup/tooltip buffer in pixels (after scale).
 pub const MAX_BUFFER_DIM: u32 = 8192;
 

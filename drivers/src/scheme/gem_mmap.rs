@@ -34,27 +34,30 @@ struct MappedGem {
     handle: u32,
     phys_addr: u64,
     size: u64,
-    /// PRIME share count. A driver-private GEM object can be referenced by
-    /// more than one holder at once: the original `GEM_NEW` owner (the
-    /// compositor's GBM/NVK allocation) plus every PRIME *self-import* of the
-    /// same buffer (`FD_TO_HANDLE` handing back this ORIGINAL handle, see
-    /// `lookup_by_phys`). Real Linux DRM keeps the GEM object alive as long as
-    /// any handle or dma-buf references it; we model that with this count.
-    /// `register` starts it at 1 (the creator), `add_ref` bumps it on each
-    /// self-import, `dec_ref` drops it on each `GEM_CLOSE`, and the object is
-    /// only truly freed when it reaches 0. Without this, NVK importing then
-    /// closing a swapchain buffer that wlroots still owns tore the mapping out
-    /// from under wlroots, so the next self-import missed and fell back to a
-    /// generic handle -> `GEM_INFO` ENOENT -> zink "couldn't allocate memory".
-    refcount: u32,
+    /// Every holder of a reference to this object, BY PID, one entry per
+    /// reference: the `GEM_NEW` creator first, then one entry per PRIME
+    /// *self-import* (`FD_TO_HANDLE` handing back this ORIGINAL handle, see
+    /// `lookup_by_phys`). Real Linux DRM keeps a GEM object alive as long as
+    /// any handle or dma-buf references it, and handles are per `drm_file`;
+    /// this is the closest a global handle namespace gets. Each `GEM_CLOSE`
+    /// drops ONE entry of the closing pid ([`dec_ref`]), a process exit drops
+    /// every entry of that pid ([`release_pid`]), and the object is only truly
+    /// freed when the list is empty. A pid that is not in the list may not
+    /// use, map, bind or close the object ([`holds`]) -- before this the
+    /// count was anonymous, so any process could `GEM_CLOSE` or `VM_BIND` the
+    /// compositor's buffers by guessing a handle, and a client that died
+    /// without closing its own self-imports leaked the buffer until reboot
+    /// (its import references were not attributable to it).
+    holders: Vec<u64>,
 }
 
 /// Outcome of [`dec_ref`], so `GEM_CLOSE` can tell "still shared, keep it" from
 /// "last reference gone, free it" from "not one of ours".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecRef {
-    /// The reference was dropped but others remain; `refcount` is the new
-    /// value (> 0). The GEM object and its backing memory MUST stay alive.
+    /// The reference was dropped but others remain; the value is the number
+    /// of references left (> 0). The GEM object and its backing memory MUST
+    /// stay alive.
     StillReferenced(u32),
     /// The last reference was dropped; the entry has already been removed from
     /// this table. The caller should now free the GEM object / RM memory.
@@ -62,17 +65,20 @@ pub enum DecRef {
     /// `handle` was never registered here (a GEM object with no phys mapping,
     /// or an unknown handle). The caller decides what that means.
     NotTracked,
+    /// `handle` is tracked but the calling pid holds no reference to it: not
+    /// its buffer to close. Nothing was changed.
+    NotHolder,
 }
 
 lazy_static::lazy_static! {
     static ref MAPPINGS: Mutex<Vec<MappedGem>> = Mutex::new(Vec::new());
 }
 
-/// Registers the physical mapping for `handle`, starting its PRIME share count
-/// at 1. If `handle` is already present (re-registration of the same id) only
-/// the physical range is updated -- the existing share count is preserved so a
-/// stray re-register can never resurrect a freed refcount.
-pub fn register(handle: u32, phys_addr: u64, size: u64) {
+/// Registers the physical mapping for `handle`, with `owner_pid` as its first
+/// holder. If `handle` is already present (re-registration of the same id)
+/// only the physical range is updated -- the existing holders are preserved
+/// so a stray re-register can never resurrect a freed reference.
+pub fn register(handle: u32, phys_addr: u64, size: u64, owner_pid: u64) {
     let mut table = MAPPINGS.lock();
     if let Some(e) = table.iter_mut().find(|e| e.handle == handle) {
         e.phys_addr = phys_addr;
@@ -82,39 +88,80 @@ pub fn register(handle: u32, phys_addr: u64, size: u64) {
             handle,
             phys_addr,
             size,
-            refcount: 1,
+            holders: alloc::vec![owner_pid],
         });
     }
 }
 
-/// Adds a PRIME reference to `handle` (a self-import resolved back to this
-/// original nouveau handle). Returns the new share count, or `None` if the
-/// handle is not tracked here. Pairs with [`dec_ref`] on `GEM_CLOSE`.
-pub fn add_ref(handle: u32) -> Option<u32> {
+/// Adds a PRIME reference to `handle` held by `pid` (a self-import resolved
+/// back to this original nouveau handle). Returns the new reference count, or
+/// `None` if the handle is not tracked here. Pairs with [`dec_ref`] on
+/// `GEM_CLOSE`.
+pub fn add_ref(handle: u32, pid: u64) -> Option<u32> {
     let mut table = MAPPINGS.lock();
     table.iter_mut().find(|e| e.handle == handle).map(|e| {
-        e.refcount = e.refcount.saturating_add(1);
-        e.refcount
+        e.holders.push(pid);
+        e.holders.len() as u32
     })
 }
 
-/// Drops one PRIME reference to `handle` (a `GEM_CLOSE`). See [`DecRef`] for the
-/// three outcomes. When the count reaches 0 the entry is removed here BEFORE the
-/// caller frees the backing memory, preserving the "no mmap-able mapping can
-/// outlive the VRAM it points at" invariant `GEM_CLOSE` has always kept.
-pub fn dec_ref(handle: u32) -> DecRef {
+/// Whether `pid` holds a reference to `handle`. Pid 0 (a call with no current
+/// thread -- kernel-internal) and an untracked handle answer `true`: the
+/// caller's own bookkeeping decides those.
+pub fn holds(handle: u32, pid: u64) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    match MAPPINGS.lock().iter().find(|e| e.handle == handle) {
+        Some(e) => e.holders.contains(&pid),
+        None => true,
+    }
+}
+
+/// Drops one reference to `handle` held by `pid` (a `GEM_CLOSE`). See
+/// [`DecRef`] for the outcomes. Pid 0 drops any one reference. When the last
+/// reference goes the entry is removed here BEFORE the caller frees the
+/// backing memory, preserving the "no mmap-able mapping can outlive the VRAM
+/// it points at" invariant `GEM_CLOSE` has always kept.
+pub fn dec_ref(handle: u32, pid: u64) -> DecRef {
     let mut table = MAPPINGS.lock();
     let Some(pos) = table.iter().position(|e| e.handle == handle) else {
         return DecRef::NotTracked;
     };
     let e = &mut table[pos];
-    if e.refcount > 1 {
-        e.refcount -= 1;
-        DecRef::StillReferenced(e.refcount)
-    } else {
+    let Some(i) = e.holders.iter().position(|h| pid == 0 || *h == pid) else {
+        return DecRef::NotHolder;
+    };
+    e.holders.swap_remove(i);
+    if e.holders.is_empty() {
         table.remove(pos);
         DecRef::Freed
+    } else {
+        DecRef::StillReferenced(e.holders.len() as u32)
     }
+}
+
+/// Drops EVERY reference `pid` holds, across all objects (process exit).
+/// Returns each touched handle with `true` when that was its last reference
+/// (entry removed, caller frees the object) or `false` when other holders
+/// remain.
+pub fn release_pid(pid: u64) -> Vec<(u32, bool)> {
+    let mut out = Vec::new();
+    if pid == 0 {
+        return out;
+    }
+    let mut table = MAPPINGS.lock();
+    table.retain_mut(|e| {
+        let before = e.holders.len();
+        e.holders.retain(|h| *h != pid);
+        if e.holders.len() == before {
+            return true;
+        }
+        let freed = e.holders.is_empty();
+        out.push((e.handle, freed));
+        !freed
+    });
+    out
 }
 
 /// Drops `handle`'s mapping unconditionally, ignoring the share count. Returns

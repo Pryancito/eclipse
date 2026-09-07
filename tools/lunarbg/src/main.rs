@@ -236,14 +236,6 @@ struct OutputInfo {
     closed: bool,
 }
 
-/// Old shm mapping held until its generation's busy buffers have all Released.
-struct RetiredMap {
-    ptr: *mut u8,
-    len: usize,
-    generation: u64,
-    pending: u32,
-}
-
 #[derive(Default)]
 struct State {
     compositor: Option<wl_compositor::WlCompositor>,
@@ -263,8 +255,6 @@ struct State {
     generation: u64,
     /// Bumped when a Background is created; pairs with frame-callback udata.
     surface_generation: u64,
-    /// Old shm mappings awaiting Release-counted munmap after a resize.
-    retired_maps: Vec<RetiredMap>,
     /// Socket write buffer was full — skip ticks until a flush succeeds.
     flush_blocked: bool,
 }
@@ -368,63 +358,26 @@ impl State {
         self.generation
     }
 
-    /// Retire an shm mapping until `pending` Releases of `generation` arrive.
-    /// Force-unmap only applies to entries already drained to `pending == 0`.
-    fn retire_map(&mut self, map: *mut u8, map_len: usize, generation: u64, pending: u32) {
+    /// Unmap a retired shm pool mapping right away.
+    ///
+    /// This used to hold the mapping until the compositor had Released every
+    /// buffer of the old generation. Those Releases never arrive: the old
+    /// `wl_buffer`s are destroyed first, and wayland-client discards events
+    /// addressed to a client-destroyed object -- so nothing ever drained the
+    /// count and every scale/mode rebuild leaked a pool (16.6 MiB at 1080p,
+    /// 66 MiB at 4K) for the life of the process. Holding was also
+    /// unnecessary: `munmap` only drops THIS process's view of the memfd; the
+    /// compositor keeps its own mapping of the pool for as long as it needs
+    /// the pixels, so unmapping here cannot pull memory out from under it.
+    fn retire_map(&mut self, map: *mut u8, map_len: usize) {
         if map.is_null() || map_len == 0 {
             return;
         }
-        if pending == 0 {
-            unsafe { libc::munmap(map as *mut libc::c_void, map_len) };
-            return;
-        }
-        self.retired_maps.push(RetiredMap {
-            ptr: map,
-            len: map_len,
-            generation,
-            pending,
-        });
-        self.gc_retired_maps();
+        unsafe { libc::munmap(map as *mut libc::c_void, map_len) };
     }
 
-    fn note_retired_release(&mut self, generation: u64) {
-        if let Some(rm) = self
-            .retired_maps
-            .iter_mut()
-            .find(|r| r.generation == generation && r.pending > 0)
-        {
-            rm.pending -= 1;
-        }
-        self.gc_retired_maps();
-    }
-
-    fn gc_retired_maps(&mut self) {
-        let mut i = 0;
-        while i < self.retired_maps.len() {
-            if self.retired_maps[i].pending == 0 {
-                let rm = self.retired_maps.remove(i);
-                unsafe { libc::munmap(rm.ptr as *mut libc::c_void, rm.len) };
-            } else {
-                i += 1;
-            }
-        }
-        // Soft cap: never force-unmap a map that still has pending Releases.
-        // Drop the oldest zero-pending leftovers first (already handled); if
-        // still over the cap, log — better to hold memory than UAF.
-        if self.retired_maps.len() > fill_guard::MAX_RETIRED_MAPS {
-            eprintln!(
-                "lunarbg: {} retired maps awaiting Release (cap {}); holding to avoid UAF",
-                self.retired_maps.len(),
-                fill_guard::MAX_RETIRED_MAPS
-            );
-        }
-    }
-
-    fn take_frames_for_retire(frames: &mut Frames) -> (u64, u32, *mut u8, usize) {
-        let generation = frames.generation;
-        let pending = frames.busy.iter().filter(|&&b| b).count() as u32;
-        let (ptr, len) = frames.take_map();
-        (generation, pending, ptr, len)
+    fn take_frames_for_retire(frames: &mut Frames) -> (*mut u8, usize) {
+        frames.take_map()
     }
 
     fn bg_index_by_layer(&self, layer_id: u32) -> Option<usize> {
@@ -739,8 +692,8 @@ impl State {
                 skipped: 0,
             });
         }
-        if let Some((gen, pending, p, l)) = old_retire {
-            self.retire_map(p, l, gen, pending);
+        if let Some((p, l)) = old_retire {
+            self.retire_map(p, l);
         }
         let bg = &mut self.backgrounds[idx];
         Self::ack_pending(bg);
@@ -923,9 +876,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                         bg.layer.destroy();
                         bg.surface.destroy();
                         if let Some(mut frames) = bg.frames.take() {
-                            let (gen, pending, p, l) = State::take_frames_for_retire(&mut frames);
+                            let (p, l) = State::take_frames_for_retire(&mut frames);
                             drop(frames);
-                            state.retire_map(p, l, gen, pending);
+                            state.retire_map(p, l);
                         }
                     }
                     if oi.output.version() >= 3 {
@@ -969,9 +922,9 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
                     bg.layer.destroy();
                     bg.surface.destroy();
                     if let Some(mut frames) = bg.frames.take() {
-                        let (gen, pending, p, l) = State::take_frames_for_retire(&mut frames);
+                        let (p, l) = State::take_frames_for_retire(&mut frames);
                         drop(frames);
-                        state.retire_map(p, l, gen, pending);
+                        state.retire_map(p, l);
                     }
                     // Keep claimed + mark closed so ensure_surfaces does not
                     // recreate into a Closed→create→Closed loop.
@@ -1002,8 +955,7 @@ impl Dispatch<wl_buffer::WlBuffer, (u32, usize, u64)> for State {
     ) {
         if let wl_buffer::Event::Release = event {
             let Some(idx) = state.bg_index_by_layer(*layer_id) else {
-                // Background gone — still count toward a retired map.
-                state.note_retired_release(*generation);
+                // Background gone; its pool was unmapped when it was retired.
                 return;
             };
             let mut need_tick = false;
@@ -1023,9 +975,9 @@ impl Dispatch<wl_buffer::WlBuffer, (u32, usize, u64)> for State {
                     stale = true;
                 }
             }
-            if stale {
-                state.note_retired_release(*generation);
-            }
+            // A stale generation's Release needs no bookkeeping: its pool was
+            // unmapped at retire time (see `retire_map`).
+            let _ = stale;
             // Do not enqueue attach/commit while the socket cannot accept writes.
             if need_tick && !state.flush_blocked {
                 state.tick(qh, *layer_id);
@@ -1806,11 +1758,8 @@ fn main() {
             drop(frames);
         }
     }
-    for (gen, pending, p, l) in to_retire {
-        state.retire_map(p, l, gen, pending);
-    }
-    for rm in state.retired_maps.drain(..) {
-        unsafe { libc::munmap(rm.ptr as *mut libc::c_void, rm.len) };
+    for (p, l) in to_retire {
+        state.retire_map(p, l);
     }
     let _ = queue.flush();
 }

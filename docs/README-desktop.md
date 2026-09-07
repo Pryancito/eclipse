@@ -15,13 +15,13 @@ arranque sin pasos manuales.
 | Pieza | Archivo generado | Qué hace |
 |---|---|---|
 | **lunarbg** | `/bin/lunarbg` | Cliente de fondo **animado** de Eclipse OS (`tools/lunarbg`, Rust estático). Recrea el fondo del compositor smithay original de eclipse-old: media luna dorada central, anillo de texto «ECLIPSE-SYSTEM-KERNEL…» orbitando, tres arcos tech girando a velocidades distintas, anillos pulsantes y ticks técnicos, sobre base cósmica con estrellas y rejilla de 48 px. Dibuja proceduralmente a resolución nativa vía wlr-layer-shell + wl_shm (sin imágenes ni gdk-pixbuf), con render por *scanline spans* (~2 ms/frame a 1080p) y solo redibuja/daña la región del logo por frame. La animación apunta a 24 fps (`--fps`/`LUNARBG_FPS=1..60`) pero **cada commit se regula con el frame callback del compositor**: nunca renderiza por delante de lo que éste composita (en stacks lentos degrada sola, y con el fondo tapado cae a 1 Hz). Soporta HiDPI (`wl_output.scale` + `set_buffer_scale`), multi-monitor con aspecto físico por salida, `--output NAME` para pintar salidas concretas, pausa/reanuda con `SIGUSR1` y salida limpia con `SIGTERM`. `--static`/`LUNARBG_STATIC=1` desactiva la animación; debug: `--dump /tmp/out.raw:1920x1080` (+`--dump-ms N`) y `--bench` para cronometrar el renderizador. `lunarbg --help` lista todo. |
-| Wallpaper (respaldo) | `/usr/share/backgrounds/eclipse/eclipse-night.png` | La misma escena, renderizada en build a PNG (encoder propio, sin dependencias). Solo se usa si lunarbg no está y toca recurrir a swaybg. |
+| Wallpaper estático | `/usr/share/backgrounds/eclipse/eclipse-night.png` | La misma escena, renderizada en build a PNG (encoder propio, sin dependencias). Hoy ningún componente de la sesión la usa (swaybg no forma parte de ella); queda como imagen de respaldo para quien quiera un fondo estático. |
 | Tema de ventanas | `/usr/share/themes/Eclipse-Dark/openbox-3/themerc` | Tema openbox-3 oscuro que labwc aplica a bordes de ventana, menús y OSD. |
 | Config labwc | `/root/.config/labwc/rc.xml` | Tema `Eclipse-Dark`, esquinas redondeadas, 4 escritorios y atajos de teclado. |
 | Menú de escritorio | `/root/.config/labwc/menu.xml` | Clic derecho en el fondo: terminal, editor, monitor, recargar y salir. |
 | Entorno de sesión | `/root/.config/labwc/environment` | Cursor Adwaita y `GTK_THEME=Adwaita:dark`. |
-| Autoarranque | `/root/.config/labwc/autostart` | Lanza `swaybg` (wallpaper), `foot` (terminal) y `waybar` (panel, el último). Cada cliente está protegido con `command -v`: si falta, se anota en el log y la sesión sigue. |
-| Panel | `/root/.config/waybar/{config,style.css}` | Barra inferior: lanzador + barra de tareas a la izquierda; CPU, memoria y reloj a la derecha. |
+| **lunarbar** | `/bin/lunarbar` | Panel propio de Eclipse OS (`tools/lunarbar`, Rust estático, wlr-layer-shell + wl_shm, sin GTK ni GL): dos barras por salida con lanzador, barra de tareas, reloj, volumen, teclado y apagado, más popups (menú de aplicaciones) y tooltips. Traducido (`i18n.rs`). |
+| Autoarranque | *(ausente a propósito)* | labwc lanza `sh ~/.config/labwc/autostart` con doble `fork`, y esa `ash` cae con SIGSEGV en este kernel (musl mallocng). En su lugar `eclipse-init` arranca el fondo y el panel como **servicios** (`/etc/eclipse/services/{lunarbg,lunarbar}.service`, con `after = labwc` y `wait_socket` sobre `wayland-0`) a través de los wrappers `/usr/local/bin/eclipse-lunarbg` y `eclipse-lunarbar`, que a su vez esperan al socket `wayland-*`. `~/.config/labwc/autostart.README` lo explica en el sistema instalado. |
 | GTK 3/4 | `/root/.config/gtk-{3.0,4.0}/settings.ini` | Modo oscuro por defecto para aplicaciones GTK. |
 | Terminal | `/root/.config/foot/foot.ini` | Paleta violeta oscura a juego con el escritorio. |
 | Lanzador (shell) | `/usr/local/bin/labwc` | Wrapper endurecido de labwc. Lo usan tanto los shells interactivos (`login` limpia env) como `eclipse-init`, para que ambos pasen por la misma selección de renderer y variables de entorno. |
@@ -40,15 +40,15 @@ apk add sdl2 sdl3 sdl12-compat sdl2_image sdl2_ttf sdl2_mixer sdl2_net libpng fl
 Desde `cargo xtask image` estos paquetes ya se instalan solos (ver
 `DEFAULT_PACKAGES` en `xtask/src/linux/xorg.rs`): `labwc` arrastra su cierre
 de runtime (wlroots, wayland-libs, libinput, pixman, libxkbcommon), `seatd`
-aporta `libseat.so` (el wrapper usa su backend `builtin`, sin demonio, válido
-porque la sesión corre como root) y `foot` es el terminal.
+aporta `libseat.so` y el demonio `seatd`, y `foot` es el terminal.
 
 - `labwc` — el compositor.
-- `seatd` — gestor de asientos; wlroots abre /dev/dri y los nodos de entrada
-  a traves de `libseat` (backend `builtin`, sin demonio).
-- `swaybg` — solo como respaldo del fondo: `lunarbg` (incluido en el rootfs)
-  pinta el fondo sin necesitar swaybg ni gdk-pixbuf.
-- `waybar` — el panel inferior (sin él, no hay barra pero todo funciona).
+- `seatd` — gestor de asientos; corre como **demonio** (servicio de init,
+  socket `/run/seatd.sock`, sobre el que `labwc.service` espera). El wrapper
+  no fija `LIBSEAT_BACKEND=builtin`: la `libseat` de Alpine no compila ese
+  backend.
+- `lunarbg` y `lunarbar` — fondo y panel, incluidos en el rootfs (no son
+  paquetes de Alpine); no hace falta `swaybg` ni `waybar`.
 - `foot` — terminal Wayland.
 - `font-dejavu` — tipografía usada por tema, panel y menús.
 - `adwaita-icon-theme` — tema de cursor e iconos (sin él no se ve el puntero
@@ -236,61 +236,41 @@ sistema tras DHCP y pone el reloj.
 
 ## El panel y la estabilidad del sistema
 
-waybar es una aplicación GTK, y en este hardware la ruta GL/GBM puede colgar
-el sistema completo (ver la nota del wrapper `/usr/local/bin/labwc`). El
-autoarranque lo protege por partida triple:
-
-1. Se lanza con `GDK_GL=disable`, de modo que GTK renderiza por
-   cairo/shm — el mismo camino que swaybg y foot, que funcionan bien aquí.
-2. La configuración solo usa módulos que dependen del socket Wayland y de
-   `/proc` (taskbar, reloj, CPU, memoria). Los módulos `tray` (dbus),
-   `network` (netlink) y `pulseaudio` ejercitan rutas del kernel todavía
-   parciales en Eclipse OS: añádelos de uno en uno solo tras probarlos.
-3. Un candado anti-bucle: antes de lanzar waybar se crea
-   `~/.config/labwc/panel.lock`, que se borra cuando el panel sobrevive
-   15 s. Si la sesión muere con el candado puesto (cuelgue, apagón), el
-   siguiente arranque **salta waybar automáticamente** y lo anota en el
-   log. Para reintentar: `rm ~/.config/labwc/panel.lock`.
+El panel es `lunarbar`, un cliente Wayland nativo (wl_shm, sin GTK, sin GL),
+así que no pasa por la ruta GL/GBM que en este hardware puede colgar el
+sistema (ver la nota del wrapper `/usr/local/bin/labwc`). Lo supervisa
+`eclipse-init`: si muere se relanza con *backoff* exponencial y la línea
+`respawn:` de la consola dice cómo terminó (`exit N` / `signal N`).
 
 ## Diagnóstico
 
-El autoarranque registra todo en `~/.config/labwc/autostart.log`, de modo que
-un escritorio negro se diagnostica **sin reiniciar**:
-
-```sh
-cat ~/.config/labwc/autostart.log
-```
-
-Cada cliente que falte aparece como `MISSING <cliente>` con el `apk add`
-necesario. La línea `wallpaper:` registra el `ls -l` del PNG.
-
-**Fondo liso en vez de la escena nocturna.** Si swaybg registra
-`Failed to load image` / `Couldn't recognize the image file format` con el
-PNG presente en disco, es gdk-pixbuf sin su `loaders.cache`: apk lo genera
-con un *trigger* que puede no haberse ejecutado bajo Eclipse OS, y sin él
-gdk-pixbuf no reconoce **ningún** formato de imagen (swaybg no carga fondos
-y las apps GTK pierden sus iconos). El autoarranque lo detecta y ejecuta
-`gdk-pixbuf-query-loaders --update-cache` automáticamente; además, si
-swaybg muere al cargar la imagen, un vigilante relanza el fondo con color
-sólido a los 2 s para que el escritorio nunca se quede sin fondo.
+- `labwc` escribe en `/tmp/labwc.log` (destino de `labwc.service` y del
+  wrapper).
+- Cada servicio que muere aparece en la consola (`[eclipse-init] respawn:
+  ... exited after ...`), y un cliente ausente lo anuncia su wrapper en el
+  log y en `/dev/console` (`not installed`) antes de esperar 60 s.
+- `lunarbg --dump /tmp/out.raw:1920x1080` y `lunarbg --bench` permiten
+  comprobar el renderizador sin compositor.
 
 Si el sistema se cuelga al arrancar la sesión y necesitas entrar sin
-escritorio: cambia a otra consola virtual (`Ctrl+Alt+F2`) antes de lanzar
-labwc y comenta la línea de waybar en `~/.config/labwc/autostart` (o borra
-`panel.lock` solo cuando quieras reintentar el panel).
+escritorio: cambia a otra consola virtual (`Ctrl+Alt+F2`) y detén el
+compositor (`pkill labwc`; init lo relanzará, así que para dejarlo parado
+borra `/etc/eclipse/services/labwc.service` o arranca con `desktop=xorg`).
 
 ## Personalización
 
-- **Wallpaper**: sustituye `/usr/share/backgrounds/eclipse/eclipse-night.png`
-  o edita la ruta en `~/.config/labwc/autostart`. Para regenerar el original
-  fuera de un build completo:
-  `cargo test -p xtask dump_wallpaper -- --ignored` (lo escribe en el
-  directorio temporal, o en `$ECLIPSE_WALLPAPER_OUT`).
+- **Wallpaper**: `lunarbg` es procedural; `LUNARBG_STATIC=1`/`--static`
+  desactiva la animación y `LUNARBG_FPS`/`--fps` cambia la cadencia (edita
+  el wrapper `/usr/local/bin/eclipse-lunarbg` o la escena en
+  `tools/lunarbg/src/scene.rs`). El PNG de
+  `/usr/share/backgrounds/eclipse/eclipse-night.png` se regenera fuera de
+  un build completo con `cargo test -p xtask dump_wallpaper -- --ignored`.
 - **Colores del tema**: edita
   `/usr/share/themes/Eclipse-Dark/openbox-3/themerc` y ejecuta la acción
   «Recargar labwc» del menú (o `labwc --reconfigure`).
-- **Panel**: `~/.config/waybar/config` y `style.css`; reinicia waybar
-  (`pkill waybar; waybar &`).
+- **Panel**: `lunarbar` no tiene fichero de configuración; los cambios van en
+  `tools/lunarbar/src/` (`draw.rs` para el aspecto, `apps.rs` para el menú)
+  y `pkill lunarbar` lo relanza vía init con el nuevo binario.
 
 Ten en cuenta que los archivos bajo `/root/.config` y `/usr/share` los
 escribe `xtask` al construir el rootfs: los cambios persistentes deben

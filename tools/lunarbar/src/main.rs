@@ -440,8 +440,6 @@ struct State {
     outputs: Vec<OutputInfo>,
     /// Registry name of the seat we bound (first wins; later seats ignored).
     seat_name: Option<u32>,
-    /// Old shm mappings awaiting safe munmap after a resize.
-    retired_maps: Vec<(*mut u8, usize)>,
     bars: Vec<Bar>,
     toplevels: Vec<Toplevel>,
     popup: Option<Popup>,
@@ -570,15 +568,17 @@ impl State {
         }
     }
 
+    /// Unmap a retired shm pool mapping right away. Holding it "until the
+    /// compositor Releases the old buffers" (the previous behaviour, capped at
+    /// 16 pools) waited for events that never arrive -- the old `wl_buffer`s
+    /// are destroyed first and wayland-client drops events for destroyed
+    /// objects -- and was unnecessary: `munmap` only drops this process's
+    /// view of the memfd; the compositor keeps its own mapping of the pool.
     fn retire_map(&mut self, map: *mut u8, map_len: usize) {
         if map.is_null() || map_len == 0 {
             return;
         }
-        self.retired_maps.push((map, map_len));
-        while self.retired_maps.len() > fill_guard::MAX_RETIRED_MAPS {
-            let (p, l) = self.retired_maps.remove(0);
-            unsafe { libc::munmap(p as *mut libc::c_void, l) };
-        }
+        unsafe { libc::munmap(map as *mut libc::c_void, map_len) };
     }
 
     fn clear_pointer_hover(&mut self) {
@@ -663,7 +663,12 @@ impl State {
         };
         let global = self.bars[idx].output_global;
         let scale = self.output_scale(global);
-        self.bars[idx].scale = scale;
+        // `bar.scale` is only updated below, together with the pool that was
+        // allocated for it: `render()` sizes its slice of the mapping from
+        // `bar.scale`, so setting it here and then taking the same-size
+        // early-out (as this did) made a scale change write `scale²` times
+        // past the old pool. A scale change therefore reallocates even when
+        // the logical size did not move.
         // Protocol: 0 means "client decides" — use the last mode size.
         if w == 0 || h == 0 {
             let (mw, mh) = self.output_mode(global);
@@ -676,7 +681,11 @@ impl State {
         }
         w = w.max(1);
         h = h.max(1);
-        if self.bars[idx].configured && self.bars[idx].width == w && self.bars[idx].height == h {
+        if self.bars[idx].configured
+            && self.bars[idx].width == w
+            && self.bars[idx].height == h
+            && self.bars[idx].scale == scale
+        {
             self.render(layer_id);
             return;
         }
@@ -3277,7 +3286,7 @@ impl Dispatch<wl_output::WlOutput, u32> for State {
         event: wl_output::Event,
         global_name: &u32,
         _: &Connection,
-        _: &QueueHandle<State>,
+        qh: &QueueHandle<State>,
     ) {
         match event {
             wl_output::Event::Scale { factor } => {
@@ -3312,19 +3321,22 @@ impl Dispatch<wl_output::WlOutput, u32> for State {
                     .map(|o| o.scale.clamp(1, 8) as u32)
                     .unwrap_or(1);
                 let global = *global_name;
-                for bar in state.bars.iter_mut().filter(|b| b.output_global == global) {
-                    if bar.scale != scale && bar.configured {
-                        bar.scale = scale;
-                        // Force a rebuild on next configure/render path by
-                        // clearing configured so ensure/configure refreshes.
-                        bar.configured = false;
-                    } else {
-                        bar.scale = scale;
-                    }
-                }
-                // Re-request configures by committing; compositors re-send size.
-                for bar in state.bars.iter().filter(|b| b.output_global == global) {
-                    bar.surface.commit();
+                // A configured bar whose output changed scale is reallocated
+                // NOW at its current logical size (`configure` treats a scale
+                // change like a size change). The old approach cleared
+                // `configured` and committed, hoping the compositor would
+                // re-send a configure -- it does not when the logical size is
+                // unchanged (mode and scale changing together), which left
+                // the bar unrendered for good. Unconfigured bars pick the new
+                // scale up on their first configure.
+                let stale: Vec<(u32, u32, u32)> = state
+                    .bars
+                    .iter()
+                    .filter(|b| b.output_global == global && b.configured && b.scale != scale)
+                    .map(|b| (b.layer.id().protocol_id(), b.width, b.height))
+                    .collect();
+                for (layer_id, w, h) in stale {
+                    state.configure(qh, layer_id, w, h);
                 }
             }
             _ => {}

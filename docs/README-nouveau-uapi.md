@@ -64,7 +64,7 @@ Leyenda: ✅ implementado (real, sin hardware nuevo sin probar) · 🟡 parcial 
 | `DRM_IOCTL_NOUVEAU_GET_ZCULL_INFO` | ❌ | `ENOSYS` honesto — Mesa 26.x lo sondea y TOLERA el fallo (`has_zcull_info` queda en false) |
 | `DRM_IOCTL_NOUVEAU_GEM_NEW` | 🟡 | Acepta VRAM y GART, pero **todo se respalda con sysmem CPU-visible** (`NV01_MEMORY_SYSTEM`, `_LOCATION_PCI`, contiguo — el patrón de la pushbuffer de `step17`): VRAM real no es CPU-mapeable sin una ruta BAR1, y publicar un offset de FB como dirección de host hizo a userspace renderizar sobre RAM baja del kernel. `req.info.domain` devuelve el dominio realmente usado (GART), que es lo que Mesa lee de vuelta; NVIF INFO sigue anunciando la VRAM real solo para que NVK exponga un tipo `DEVICE_LOCAL` (wlroots lo exige). **Guardia de layout**: como esos BOs son sysmem sin comptags, `GEM_NEW` solo acepta tile kinds `{0x00,0x06}`; si userspace pide uno comprimido falla temprano con `EOPNOTSUPP`, antes de que `VM_BIND`/present monten una combinación byte-inexacta. **`map_handle` real**: `gem_map_cpu` resuelve la PA de host (`ADDR_SYSMEM`; rechaza sysmem no contiguo) y `(phys_addr, size)` se registra en `drivers/src/scheme/gem_mmap.rs` bajo el handle nouveau (rango alto `0x8000_0001+`, sin colisión con la tabla genérica). Si falla, `map_handle`=0 y el objeto sigue válido para `VM_BIND`/`EXEC` |
 | `DRM_IOCTL_NOUVEAU_GEM_PUSHBUF` | 🟡 | **Corrección de rumbo (importante)**: una investigación de la imagen mostró que el Mesa que se instala es **solo el stack Gallium clásico** (`mesa-dri-gallium` + `mesa-gl`); para Turing eso es el driver **nvc0**, que somete OpenGL por **esta** ioctl (`GEM_PUSHBUF`), NO por la uAPI nueva `VM_BIND`/`EXEC` (esa la usa NVK/Vulkan, que la imagen no trae). Es decir, esta era la ruta a implementar desde el principio para el OpenGL real de la imagen. Hoy se **parsea y vuelca** (canal, `nr_buffers`/`nr_relocs`/`nr_push`, dominios de cada BO, `(bo_index, offset, length)` de cada push — prefijo acotado a 8 por arreglo), y luego devuelve **`EOPNOTSUPP`** honesto. El volcado es la anatomía necesaria para el envío real, que necesita: (a) GEM de dominio **GART** (memoria de sistema mapeada al VAS de GPU; hoy `GEM_NEW` es solo VRAM), (b) la **clase 3D** (`TURING_A` 0xc597) atada al canal (hoy `CHANNEL_ALLOC` solo monta la de cómputo 0xc5c0 vía step16/17), y (c) resolución de **relocs** — todo trabajo de seguimiento validado en hardware, nunca simulado |
-| `DRM_IOCTL_NOUVEAU_GEM_CPU_PREP` / `CPU_FINI` | 🟡 | Validan el handle y retornan. **Honesto bajo el modelo de envío síncrono**: `EXEC` bloquea hasta que su fence aterriza antes de retornar, así que cuando un caller emite `CPU_PREP` todo lote previamente sometido que toque ese buffer ya terminó. Si `EXEC` algún día pasa a asíncrono, este brazo necesita una espera real por BO o las lecturas de CPU competirán con la GPU |
+| `DRM_IOCTL_NOUVEAU_GEM_CPU_PREP` / `CPU_FINI` | 🟡 | `CPU_PREP` valida el handle (y que el proceso sea poseedor) y **espera de verdad**: encola una entrada GP sólo-fence detrás de todo lo que el proceso tiene en su anillo de envío directo y espera a que aterrice (con `RELEASE_WFI_EN` eso prueba que los motores terminaron todo lo anterior). Es un superconjunto de la espera por BO de Linux (no hay fence por buffer). `NOWAIT` → EBUSY si aún corre; 1 s sin aterrizar → EBUSY. La ruta RM por envío es síncrona y no espera. `CPU_FINI` sólo valida |
 | `DRM_IOCTL_NOUVEAU_GEM_INFO` | 🟡 | `size` siempre real. **`map_handle` real** (igual que `GEM_NEW`, mismo mecanismo). **`offset` real** cuando `VM_BIND` ya mapeó el objeto (cruza `nouveau_vm_mappings` por `gem_handle`); sigue en 0 si aún no hay `VM_BIND` |
 
 ## DRM syncobjs (`drm_syncobj`)
@@ -250,12 +250,12 @@ intentar que `drivers` lo averigüe:
   ahora llama también a `driver.nouveau_release_process(pid)` junto al
   `release_process(pid)` genérico que ya tenía.
 
-**Qué NO cubre**: un cliente que **auto-importa su PROPIO** buffer (GBM
-export → re-import EGL/NVK, todas las referencias en el mismo proceso) y
-muere **sin `GEM_CLOSE`** (^C/crash) lo FUGA hasta el reinicio — se suelta
-solo su referencia de creador, no las de importación (no contadas por-pid).
-Nunca un use-after-free; una salida limpia libera todo normal. El cierre
-completo (contabilidad de referencias por-pid en `gem_mmap`) queda como
+**Cubierto también** desde la contabilidad por pid de `gem_mmap`
+(`release_pid`): un cliente que **auto-importa su PROPIO** buffer (GBM
+export → re-import EGL/NVK) y muere **sin `GEM_CLOSE`** (^C/crash) suelta
+todas sus referencias, las de creador y las de importación, así que ya no
+fuga el buffer hasta el reinicio. Antes de eso el detalle siguiente era una
+limitación conocida; se conserva como historia:
 trabajo con hardware en el bucle.
 
 ## Contexto GPU por proceso (multi-contexto)
@@ -391,24 +391,26 @@ escalera compartida `step16` (client/device/subdevice) se construyen hasta
   `gem_mmap::lookup_by_phys`). NVK importa un buffer, lo usa y hace
   `GEM_CLOSE` de ese handle mientras wlroots aún es dueño del mismo handle,
   así que liberar en el PRIMER close arrancaba el objeto de debajo de
-  wlroots. `gem_mmap` lleva ahora un `refcount`: `register` (en `GEM_NEW`)
-  arranca en 1, `add_ref` lo sube en cada self-import
-  (`drm::nouveau_gem_add_ref` desde `sys_drm_prime`), y `dec_ref` lo baja en
-  cada `GEM_CLOSE` (`nouveau_gem_close`). El objeto GEM, sus `VM_BIND` y su
-  `hMemory` en RM sólo se liberan cuando el contador llega a 0 — el ÚLTIMO
-  poseedor. La salida del proceso sigue liberando todo incondicionalmente
-  (`unregister`, sin contador), y el cierre de la fd del dma-buf no toca el
-  contador (sólo suelta su `Arc<VmObject>`). Ver la bitácora de la RTX en
+  wlroots. `gem_mmap` lleva una lista de **poseedores por pid**: `register`
+  (en `GEM_NEW`) apunta al creador, `add_ref` añade al importador en cada
+  self-import (`drm::nouveau_gem_add_ref` desde `sys_drm_prime`), `dec_ref`
+  quita UNA referencia del pid que hace `GEM_CLOSE` (`nouveau_gem_close`;
+  un pid que no es poseedor recibe EINVAL) y `release_pid` quita todas las
+  del proceso que muere. El objeto GEM, sus `VM_BIND` y su `hMemory` en RM
+  sólo se liberan cuando la lista queda vacía — el ÚLTIMO poseedor. Esa
+  misma lista es la que autoriza `GEM_INFO`, `VM_BIND MAP`, `CPU_PREP` y
+  `CPU_FINI` (`gem_usable_by`): un proceso no puede tocar, ni mapear en su
+  VAS, un buffer que no creó ni importó; `CHANNEL_FREE` sólo acepta canales
+  del propio proceso. El cierre de la fd del dma-buf no toca la lista (sólo
+  suelta su `Arc<VmObject>`). Ver la bitácora de la RTX en
   `README-nvk-hardware-status.md` ("El export funcionó...") para el `dmesg`
   que lo destapó (segunda self-importación cayendo a handle genérico →
   `GEM_INFO` ENOENT → zink "heap=0").
-- **`CPU_PREP`/`CPU_FINI` no esperan de verdad**: ahora que `map_handle`
-  puede ser real (ver arriba), un `CPU_PREP` no bloquea hasta que el
-  último `EXEC` sobre ese buffer termine — solo valida que el handle
-  existe. Cerrar esto necesita fencing implícito por-buffer (qué
-  syncobj/fence fue el último en tocar cada `hMemory`), que ni `EXEC` ni
-  `GEM_NEW` llevan hoy — sería una pieza nueva, no una extensión de lo
-  que ya existe.
+- **`CPU_PREP` espera por canal, no por buffer**: no hay fencing implícito
+  por `hMemory` (qué fence fue el último en tocar cada buffer), así que
+  `CPU_PREP` espera a TODO lo que el proceso tiene encolado en su anillo
+  (una entrada sólo-fence al final, ver la tabla). Correcto pero más
+  conservador que Linux; el fencing por buffer sería una pieza nueva.
 - **`CHIPSET_ID` real**: hoy es el mínimo del rango `PMC_BOOT0` de la
   arquitectura ya identificada por PCI ID, no una lectura en vivo de
   `PMC_BOOT0`. Deliberado: cualquier lectura de registro nueva en el

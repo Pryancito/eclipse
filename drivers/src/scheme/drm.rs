@@ -162,7 +162,10 @@ pub trait DrmScheme: Scheme {
     /// to this when `drm::gem_close` reports the handle unknown. Returns
     /// whether `handle` was actually one of this driver's own. Default:
     /// nothing to close (most drivers only ever use the generic table).
-    fn nouveau_gem_close(&self, _handle: u32) -> bool {
+    /// `owner_pid` is the closing process (0 = no current thread): a driver
+    /// that tracks holders per pid refuses to close a buffer the caller does
+    /// not hold.
+    fn nouveau_gem_close(&self, _handle: u32, _owner_pid: u64) -> bool {
         false
     }
 

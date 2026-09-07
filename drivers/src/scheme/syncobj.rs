@@ -164,6 +164,12 @@ fn now_us() -> u64 {
     unsafe { crate::bus::drivers_timer_now_as_micros() }
 }
 
+/// [`fence_landed`] for drivers that wait on a kernel fence outside the
+/// syncobj table (nouveau `GEM_CPU_PREP`).
+pub fn hw_fence_landed(fence_va: usize, payload: u32) -> bool {
+    fence_landed(fence_va, payload)
+}
+
 /// Whether the GPU has written `payload` (or a later one) into `fence_va`.
 #[inline]
 fn fence_landed(fence_va: usize, payload: u32) -> bool {

@@ -27,30 +27,37 @@ El núcleo implementa los dispositivos e `ioctl`s que `Xorg` usa en su rutina
 - **Cambio de VT**: Ctrl+Alt+F1..F6. El modo KD es por-VT, así que al salir del
   VT gráfico de X se sigue viendo una consola de texto normal.
 
-## Configuración de userspace recomendada
+## Configuración de userspace
 
-El núcleo no incluye `udev` ni un KMS/DRM completo, así que conviene forzar el
-driver **`fbdev`** y declarar la entrada **`evdev`** de forma estática en lugar
-de depender del autodescubrimiento de `libinput`/`udev`.
-
-Instala los paquetes (en Alpine):
+`cargo xtask image` instala los paquetes y genera la configuración; nada de
+esto hay que hacerlo a mano en una imagen construida con xtask
+(`xtask/src/linux/desktop.rs`, `write_xorg_config`). Para una instalación
+manual sobre Alpine:
 
 ```sh
-apk add xorg-server xf86-video-fbdev xf86-input-evdev xinit mesa-dri-gallium
+apk add xorg-server xf86-video-fbdev xf86-input-libinput xinit mesa-dri-gallium
 ```
 
-Crea `/etc/X11/xorg.conf.d/10-eclipse.conf` con:
+El fichero generado es `/etc/X11/xorg.conf.d/10-eclipse.conf`:
 
 ```
 Section "ServerFlags"
-    Option "AutoAddDevices" "false"   # no hay udev: añadimos la entrada a mano
+    Option "AutoAddDevices" "true"    # libinput clasifica cada /dev/input/event*
     Option "DontZap"        "false"
+    # No tocar DRM: Xorg moderno sondea /dev/dri/card0 como GPU aunque el
+    # Device sea fbdev, y en este kernel ese sondeo se cuelga ("Platform
+    # probe for /sys/class/drm/card0" en Xorg.0.log; startx expira e init
+    # relanza X cada ~90 s). Sin auto-add/auto-bind de GPU, X se queda en
+    # la ruta fbdev.
+    Option "AutoAddGPU"     "false"
+    Option "AutoBindGPU"    "false"
 EndSection
 
 Section "Device"
     Identifier "fb"
     Driver     "fbdev"
-    Option     "fbdev" "/dev/fb0"
+    Option     "fbdev"    "/dev/fb0"
+    Option     "ShadowFB" "true"
 EndSection
 
 Section "Screen"
@@ -58,29 +65,26 @@ Section "Screen"
     Device     "fb"
 EndSection
 
-Section "InputDevice"
-    Identifier "keyboard"
-    Driver     "evdev"
-    Option     "Device" "/dev/input/event0"
-    Option     "CoreKeyboard"
-EndSection
-
-Section "InputDevice"
-    Identifier "mouse"
-    Driver     "evdev"
-    Option     "Device" "/dev/input/mice"
-    Option     "CorePointer"
+# libinput para todo nodo evdev enumerado. Sin MatchIsKeyboard/MatchIsPointer:
+# dependen de las etiquetas ID_INPUT_* de udev, que este kernel no emite, así
+# que no casarían con nada. libinput clasifica el dispositivo por sus propias
+# capacidades.
+Section "InputClass"
+    Identifier      "eclipse-libinput"
+    MatchDevicePath "/dev/input/event*"
+    Driver          "libinput"
 EndSection
 
 Section "ServerLayout"
     Identifier  "layout"
     Screen      "screen"
-    InputDevice "keyboard"
-    InputDevice "mouse"
 EndSection
 ```
 
-Ajusta los `event0`/`mice` a los nodos reales que aparezcan en `/dev/input/`.
+Se usa `fbdev` sobre `/dev/fb0` y no `modesetting`: el *scanout* es software
+en cualquier caso, así que escribir directamente al framebuffer lineal se
+ahorra el *dumb buffer* + commit KMS por frame. El mapeo de `/dev/fb0` es
+*write-combining*.
 
 ## Probar
 
