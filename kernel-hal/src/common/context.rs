@@ -23,6 +23,7 @@ pub enum UserContextField {
     InstrPointer,
     StackPointer,
     ThreadPointer,
+    AbiRegister,
     ReturnValue,
 }
 
@@ -243,6 +244,8 @@ impl UserContext {
         }
     }
 
+    pub fn enable_extended_state(&mut self) {}
+
     /// Switch to user mode.
     pub fn enter_uspace(&mut self) {
         cfg_if! {
@@ -442,6 +445,7 @@ impl UserContext {
                     UserContextField::InstrPointer => &mut self.0.general.rip,
                     UserContextField::StackPointer => &mut self.0.general.rsp,
                     UserContextField::ThreadPointer => &mut self.0.general.fsbase,
+                    UserContextField::AbiRegister => &mut self.0.general.r10,
                     UserContextField::ReturnValue => &mut self.0.general.rax,
                 }
             } else if #[cfg(target_arch = "aarch64")] {
@@ -449,6 +453,7 @@ impl UserContext {
                     UserContextField::InstrPointer => &mut self.0.elr,
                     UserContextField::StackPointer => &mut self.0.sp,
                     UserContextField::ThreadPointer => &mut self.0.tpidr,
+                    UserContextField::AbiRegister => &mut self.0.general.x18,
                     UserContextField::ReturnValue => &mut self.0.general.x0,
                 }
             } else if #[cfg(target_arch = "riscv64")] {
@@ -456,6 +461,7 @@ impl UserContext {
                     UserContextField::InstrPointer => &mut self.0.sepc,
                     UserContextField::StackPointer => &mut self.0.general.sp,
                     UserContextField::ThreadPointer => &mut self.0.general.tp,
+                    UserContextField::AbiRegister => &mut self.0.general.a7,
                     UserContextField::ReturnValue => &mut self.0.general.a0,
                 }
             } else {

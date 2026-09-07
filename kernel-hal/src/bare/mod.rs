@@ -17,6 +17,8 @@ cfg_if! {
 // Every per-CPU array indexed by the dense logical cpu id (`lock::CPUS`, the
 // scheduler's `GLOBAL_RUNTIME`, our `percpu`) must cover `config::MAX_CORE_NUM`.
 const _: () = assert!(crate::config::MAX_CORE_NUM <= lock::MAX_CORE_NUM);
+#[cfg(feature = "qemu-debug-console")]
+pub(crate) mod debug_console;
 
 pub mod boot;
 pub mod input_poll;

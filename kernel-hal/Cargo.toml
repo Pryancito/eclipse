@@ -28,6 +28,7 @@ uleak-scan = []
 
 # Enable graphical output
 graphic = ["zcore-drivers/graphic"]
+qemu-debug-console = []
 board-c910light = []
 board-fu740 = []
 link-user-img = []

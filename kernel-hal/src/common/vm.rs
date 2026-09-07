@@ -36,6 +36,8 @@ pub enum PageSize {
     Size1G = 0x4000_0000,
 }
 
+pub const BASE_PAGE_SIZE: PageSize = PageSize::Size4K;
+
 /// A 4K, 2M or 1G size page.
 #[derive(Debug, Copy, Clone)]
 pub struct Page {

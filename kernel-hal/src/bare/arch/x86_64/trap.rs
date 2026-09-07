@@ -369,7 +369,7 @@ fn verify_idle_seal(cpu: usize, resume: u64, rip: usize, vector: usize, at_unsea
 /// Usable executor stack with only a shallow nest from `stack_top` (IRQ-sized),
 /// not a deep smash into the low-water zone.
 fn fault_stack_shallow_usable(rsp: usize) -> bool {
-    use ::executor::{StackPtrRegion, STACK_SIZE};
+    use executor::{StackPtrRegion, STACK_SIZE};
     let attr = ::executor::attribute_fault_stack_ptrs(rsp, 0);
     let Some(h) = attr.rsp else {
         // Outside every executor stack but still a plausible kernel SP —

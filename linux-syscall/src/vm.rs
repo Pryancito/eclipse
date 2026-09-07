@@ -251,6 +251,7 @@ impl Syscall<'_> {
                     prot.to_flags(),
                     fixed,
                     false,
+                    false,
                     MMAP_MIN_ADDR,
                 )
                 .inspect_err(|e| {
@@ -336,6 +337,7 @@ impl Syscall<'_> {
                         prot.to_flags(),
                         fixed,
                         false,
+                        false,
                         MMAP_MIN_ADDR,
                     )
                     .inspect_err(|e| {
@@ -352,6 +354,7 @@ impl Syscall<'_> {
                     ceiling,
                     prot.to_flags(),
                     true,
+                    false,
                     false,
                     MMAP_MIN_ADDR,
                 )
@@ -374,6 +377,7 @@ impl Syscall<'_> {
                     ceiling,
                     prot.to_flags(),
                     fixed,
+                    false,
                     false,
                     MMAP_MIN_ADDR,
                 )

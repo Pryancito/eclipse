@@ -32,14 +32,14 @@ hal_fn_def! {
         /// Current CPU ID.
         pub fn cpu_id() -> u8 { 0 }
 
+        /// Get the number of online CPU cores.
+        pub fn cpu_count() -> u8 { 1 }
+
         /// Current CPU frequency in MHz.
         pub fn cpu_frequency() -> u16 { 3000 }
 
         /// Get the CPU brand/model name.
         pub fn cpu_brand() -> String { String::new() }
-
-        /// Get the number of online CPU cores.
-        pub fn cpu_count() -> u8 { 1 }
 
         /// This CPU's temperature in milli-degrees Celsius, read from the digital
         /// thermal sensor, or `None` when the hardware doesn't expose it.
@@ -243,6 +243,9 @@ hal_fn_def! {
         /// Get current time.
         /// TODO: use `Instant` as return type.
         pub fn timer_now() -> Duration;
+
+        /// Get wall-clock time since the Unix epoch.
+        pub fn timer_now_realtime() -> Duration { timer_now() }
 
         /// Converting from now-relative durations to absolute deadlines.
         pub fn deadline_after(dur: Duration) -> Duration {

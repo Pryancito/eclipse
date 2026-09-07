@@ -1300,7 +1300,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let source = REPOS.join("busybox");
         if !source.is_dir() {
             fetch_online!(source, |tmp| {
-                Git::clone("https://git.busybox.net/busybox.git")
+                // The upstream cgit endpoint intermittently drops shallow
+                // clones in CI; use its GitHub mirror instead.
+                Git::clone("https://github.com/vda-linux/busybox_mirror.git")
                     .dir(tmp)
                     .single_branch()
                     .depth(1)
