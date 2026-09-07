@@ -559,6 +559,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 // share its mounted root filesystem (by `Arc`, like `fork`).
                 let mut shared_root = None;
                 let mut primary_shell = None;
+                let mut shell_fallback = None;
                 for vt in 0..kernel_hal::console::NUM_VTS {
                     // The LAST VT (tty7) is reserved for the graphical session:
                     // no login shell there, so labwc/X11 owns it cleanly and the
@@ -577,6 +578,9 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                         pid,
                     );
                     if let Some(proc) = proc {
+                        if shell_fallback.is_none() {
+                            shell_fallback = Some(proc.clone());
+                        }
                         if vt == 0 {
                             shared_root = Some(proc.linux().root_inode().clone());
                             primary_shell = Some(proc);
@@ -596,9 +600,9 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                     envs.clone(),
                     rootfs.clone(),
                     shared_root,
-                    false,
+                    primary_shell.is_none(),
                 );
-                init.or(primary_shell)
+                init.or(primary_shell).or(shell_fallback)
             } else if !init_args.is_empty() {
                 // No shells (e.g. libos): INIT is the single PID 1 program.
                 Some(zcore_loader::linux::run(init_args, envs.clone(), rootfs.clone()))
