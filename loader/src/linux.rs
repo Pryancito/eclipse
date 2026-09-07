@@ -38,8 +38,8 @@ pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) ->
 }
 
 /// Create and run the configured per-terminal SHELL on virtual terminal `vt`
-/// with the fixed Linux `pid` (the reserved 101.. range). The shell binary is
-/// the system default and must exist; a missing shell is fatal.
+/// with the fixed Linux `pid` (the reserved 101.. range). Returns `None` when
+/// the shell cannot be started so boot can continue with other VTs and INIT.
 ///
 /// `shared_root` lets extra per-VT shells reuse the primary shell's mounted
 /// root filesystem (by `Arc`) instead of re-scanning disks. The one-time boot
@@ -51,7 +51,7 @@ pub fn run_shell_on_vt(
     vt: usize,
     shared_root: Option<Arc<dyn INode>>,
     pid: KoID,
-) -> Arc<Process> {
+) -> Option<Arc<Process>> {
     spawn(
         args,
         envs,
@@ -62,7 +62,6 @@ pub fn run_shell_on_vt(
         /* boot_work */ vt == 0,
         /* foreground */ true,
     )
-    .expect("configured SHELL not found")
 }
 
 /// Spawn the INIT process as PID 1 if its binary exists, returning `None`
