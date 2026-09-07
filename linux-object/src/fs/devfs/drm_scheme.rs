@@ -106,12 +106,12 @@ impl DrmDev {
         // syscall, so the cookie must be page-aligned; recover the handle by
         // shifting it back down.
         let handle_id = (offset >> 12) as u32;
-        if let Some(handle) = drm::get_handle(handle_id) {
-            let len = len.min(handle.size);
-            Ok(VmObject::new_physical(
-                handle.phys_addr as usize,
-                pages(len),
-            ))
+        let _ = len;
+        if let Some(vmo) = drm::handle_vmo(handle_id) {
+            // The dumb buffer's OWN (contiguous, cached) VMO: the mapping keeps
+            // the frames alive past DESTROY_DUMB, and the pixels are WB for the
+            // renderer -- see `drm::handle_vmo`.
+            Ok(vmo)
         } else if let Some((phys_addr, size)) = zcore_drivers::scheme::gem_mmap::lookup(handle_id) {
             // Driver-private GEM object (currently: nouveau-uAPI GEM_NEW) --
             // same fake-offset space, different table (see
@@ -500,6 +500,28 @@ fn drm_node_name(minor: u32) -> &'static str {
         128 => "renderD128",
         129 => "renderD129",
         _ => "card?",
+    }
+}
+
+/// `access_ok()` for a nested user pointer an ioctl arm is about to read or
+/// write directly (`fb_id_ptr`, `clips_ptr`, `handles`, blob `data`, ...):
+/// EFAULT unless `[addr, addr + bytes)` lies in the user half. The top-level
+/// argument is checked once in `io_control` from the size the ioctl number
+/// encodes; every pointer *inside* that struct goes through here before the
+/// `unsafe` access, so a client cannot aim the kernel's copy at kernel memory.
+fn ucheck(addr: usize, bytes: usize) -> Result<()> {
+    if kernel_hal::user::user_range_ok(addr, bytes) {
+        Ok(())
+    } else {
+        Err(FsError::BadAddress)
+    }
+}
+
+/// [`ucheck`] for an array of `count` `T`s.
+fn ucheck_n<T>(addr: usize, count: usize) -> Result<()> {
+    match count.checked_mul(core::mem::size_of::<T>()) {
+        Some(bytes) => ucheck(addr, bytes),
+        None => Err(FsError::InvalidParam),
     }
 }
 
@@ -1258,6 +1280,14 @@ impl INode for DrmDev {
 
     #[allow(unsafe_code)]
     fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
+        // `access_ok()` for the ioctl argument itself. Every arm below (and the
+        // driver-private dispatch) casts `data` straight to the request struct;
+        // `_IOC_SIZE(cmd)` is that struct's size, so one range check here covers
+        // them all. A NULL or kernel address is EFAULT like Linux, instead of a
+        // kernel #PF or an arbitrary kernel-memory read/write. Size-less ioctls
+        // (SET_MASTER, DROP_MASTER) never touch `data`.
+        let arg_size = ((cmd >> 16) & 0x3fff) as usize;
+        ucheck(data, arg_size)?;
         // Render nodes only accept DRM_RENDER_ALLOW ioctls (drm-uapi.rst
         // "Render nodes"): modeset, dumb-buffer and master/auth commands get
         // EACCES exactly like Linux, so a client probing `renderD128` sees a
@@ -1430,14 +1460,17 @@ impl INode for DrmDev {
                 unsafe {
                     if v.name_len > 0 && !v.name.is_null() {
                         let len = core::cmp::min(v.name_len, name.len());
+                        ucheck(v.name as usize, len)?;
                         core::ptr::copy_nonoverlapping(name.as_ptr(), v.name, len);
                     }
                     if v.date_len > 0 && !v.date.is_null() {
                         let len = core::cmp::min(v.date_len, date.len());
+                        ucheck(v.date as usize, len)?;
                         core::ptr::copy_nonoverlapping(date.as_ptr(), v.date, len);
                     }
                     if v.desc_len > 0 && !v.desc.is_null() {
                         let len = core::cmp::min(v.desc_len, desc.len());
+                        ucheck(v.desc as usize, len)?;
                         core::ptr::copy_nonoverlapping(desc.as_ptr(), v.desc, len);
                     }
                 }
@@ -1452,6 +1485,7 @@ impl INode for DrmDev {
                 unsafe {
                     if u.unique_len > 0 && !u.unique.is_null() {
                         let len = core::cmp::min(u.unique_len, name.len());
+                        ucheck(u.unique as usize, len)?;
                         core::ptr::copy_nonoverlapping(name.as_ptr(), u.unique, len);
                     }
                 }
@@ -1830,7 +1864,26 @@ impl INode for DrmDev {
             }
             DRM_IOCTL_MODE_PAGE_FLIP => {
                 let flip = unsafe { *(data as *const DrmModeCrtcPageFlip) };
-                match drm::page_flip(flip.fb_id, flip.crtc_id, flip.user_data) {
+                // Linux `drm_mode_page_flip_ioctl`: unknown flags and a
+                // non-zero reserved word are EINVAL; ASYNC is EINVAL while
+                // DRM_CAP_ASYNC_PAGE_FLIP is 0 and the TARGET_* flags while
+                // DRM_CAP_PAGE_FLIP_TARGET is 0; an unknown fb is ENOENT. A
+                // completion event is queued only when the caller asked.
+                const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
+                const DRM_MODE_PAGE_FLIP_ASYNC: u32 = 0x02;
+                const DRM_MODE_PAGE_FLIP_TARGET: u32 = 0x0c;
+                const DRM_MODE_PAGE_FLIP_FLAGS: u32 = 0x0f;
+                if flip.flags & !DRM_MODE_PAGE_FLIP_FLAGS != 0
+                    || flip.reserved != 0
+                    || flip.flags & (DRM_MODE_PAGE_FLIP_ASYNC | DRM_MODE_PAGE_FLIP_TARGET) != 0
+                {
+                    return Err(FsError::InvalidParam);
+                }
+                if drm::get_fb(flip.fb_id).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
+                let want_event = flip.flags & DRM_MODE_PAGE_FLIP_EVENT != 0;
+                match drm::page_flip(flip.fb_id, flip.crtc_id, flip.user_data, want_event) {
                     Ok(()) => Ok(0),
                     Err(drm::FlipError::Busy) => Err(FsError::Busy),
                     Err(drm::FlipError::Failed) => Err(FsError::DeviceError),
@@ -1858,12 +1911,36 @@ impl INode for DrmDev {
                         }
                     }
                 }
-                if typ & _DRM_VBLANK_EVENT != 0 {
-                    // Post the event at the next synthetic vblank, not now:
-                    // delivering it instantly turns a vblank-paced client loop
-                    // into a busy spin (see `schedule_flip_event`).
-                    drm::schedule_vblank_event(signal);
+                // Resolve the requested vblank like `drm_wait_vblank_ioctl`:
+                // `_DRM_VBLANK_RELATIVE` counts from the current sequence,
+                // absolute is taken as is, and `_DRM_VBLANK_NEXTONMISS` moves a
+                // target that already passed to the next vblank. The request
+                // used to be ignored entirely (event at the next vblank, or an
+                // immediate reply), so "+2" or an absolute future MSC came
+                // back early with a smaller sequence than asked.
+                const _DRM_VBLANK_RELATIVE: u32 = 0x1;
+                const _DRM_VBLANK_NEXTONMISS: u32 = 0x1000_0000;
+                let now_seq = drm::vblank_seq_now();
+                let mut target = if typ & _DRM_VBLANK_RELATIVE != 0 {
+                    now_seq.wrapping_add(req.sequence)
                 } else {
+                    req.sequence
+                };
+                let passed = (target.wrapping_sub(now_seq) as i32) <= 0;
+                if passed && typ & _DRM_VBLANK_NEXTONMISS != 0 {
+                    target = now_seq.wrapping_add(1);
+                }
+                if typ & _DRM_VBLANK_EVENT != 0 {
+                    // Post the event when the counter reaches `target`, never
+                    // before the next synthetic vblank: delivering it instantly
+                    // turns a vblank-paced client loop into a busy spin (see
+                    // `schedule_flip_event`).
+                    drm::schedule_vblank_event(signal, target);
+                } else {
+                    // Blocking form: the ioctl path is synchronous and cannot
+                    // sleep (see README-async-ioctl-vblank.md), so a target
+                    // that is still in the future is reported as the current
+                    // sequence rather than waited for -- honest, if early.
                     let now = kernel_hal::timer::timer_now();
                     req.typ = 0; // _DRM_VBLANK_ABSOLUTE
                                  // Return the *current* completed vblank sequence.  Returning
@@ -1871,7 +1948,7 @@ impl INode for DrmDev {
                                  // made the X11 Present MSC tracker believe the display was
                                  // always one vblank ahead, so it added an extra ~16.7 ms wait
                                  // per frame, halving the achievable frame rate.
-                    req.sequence = drm::vblank_seq_now();
+                    req.sequence = now_seq;
                     req.val1 = now.as_secs(); // tval_sec
                     req.val2 = now.subsec_micros() as u64; // tval_usec
                 }
@@ -1931,6 +2008,7 @@ impl INode for DrmDev {
                 // frame is dirty" (true DIRTYFB semantics for num_clips == 0).
                 let cmd = unsafe { *(data as *const DrmModeFbDirtyCmd) };
                 let rect = if cmd.num_clips > 0 && cmd.num_clips <= 64 && cmd.clips_ptr != 0 {
+                    ucheck_n::<DrmClipRect>(cmd.clips_ptr as usize, cmd.num_clips as usize)?;
                     let mut union: Option<(u32, u32, u32, u32)> = None;
                     for i in 0..cmd.num_clips as usize {
                         let clip = unsafe { *(cmd.clips_ptr as *const DrmClipRect).add(i) };
@@ -2042,6 +2120,14 @@ impl INode for DrmDev {
                 let cur = unsafe { &*(data as *const DrmModeCursor) };
                 let mut changed = false;
                 if cur.flags & DRM_MODE_CURSOR_BO != 0 {
+                    // Linux: a cursor larger than DRM_CAP_CURSOR_WIDTH/HEIGHT
+                    // is EINVAL. Nothing else bounds the bitmap the kernel
+                    // copies and composites on every frame.
+                    if cur.handle != 0
+                        && (cur.width > drm::MAX_CURSOR_DIM || cur.height > drm::MAX_CURSOR_DIM)
+                    {
+                        return Err(FsError::InvalidParam);
+                    }
                     changed |= drm::set_cursor_bo(cur.handle, cur.width, cur.height);
                 }
                 if cur.flags & DRM_MODE_CURSOR_MOVE != 0 {
@@ -2083,6 +2169,7 @@ impl INode for DrmDev {
                 let (fbs, crtcs, connectors) = drm::get_resources();
 
                 if res.fb_id_ptr != 0 && res.count_fbs >= fbs.len() as u32 {
+                    ucheck_n::<u32>(res.fb_id_ptr as usize, fbs.len())?;
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             fbs.as_ptr(),
@@ -2092,6 +2179,7 @@ impl INode for DrmDev {
                     }
                 }
                 if res.crtc_id_ptr != 0 && res.count_crtcs >= crtcs.len() as u32 {
+                    ucheck_n::<u32>(res.crtc_id_ptr as usize, crtcs.len())?;
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             crtcs.as_ptr(),
@@ -2101,6 +2189,7 @@ impl INode for DrmDev {
                     }
                 }
                 if res.connector_id_ptr != 0 && res.count_connectors >= connectors.len() as u32 {
+                    ucheck_n::<u32>(res.connector_id_ptr as usize, connectors.len())?;
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             connectors.as_ptr(),
@@ -2123,6 +2212,7 @@ impl INode for DrmDev {
                 // and the hardware CRTC on the hardware path.
                 if !connectors.is_empty() {
                     if res.encoder_id_ptr != 0 && res.count_encoders >= 1 {
+                        ucheck_n::<u32>(res.encoder_id_ptr as usize, 1)?;
                         unsafe {
                             *(res.encoder_id_ptr as *mut u32) = drm::SYNTH_ENCODER_ID;
                         }
@@ -2199,6 +2289,7 @@ impl INode for DrmDev {
                     // Report exactly one encoder. wlroots calls this twice: once
                     // to learn the counts, then again with allocated arrays.
                     if conn_res.encoders_ptr != 0 && conn_res.count_encoders >= 1 {
+                        ucheck_n::<u32>(conn_res.encoders_ptr as usize, 1)?;
                         unsafe {
                             *(conn_res.encoders_ptr as *mut u32) = drm::SYNTH_ENCODER_ID;
                         }
@@ -2209,6 +2300,7 @@ impl INode for DrmDev {
                     if let Some((w, h, _)) = drm::display_mode() {
                         if conn_res.modes_ptr != 0 && conn_res.count_modes >= 1 {
                             let mode = make_modeinfo(w, h);
+                            ucheck(conn_res.modes_ptr as usize, mode.len())?;
                             unsafe {
                                 core::ptr::copy_nonoverlapping(
                                     mode.as_ptr(),
@@ -2230,6 +2322,8 @@ impl INode for DrmDev {
                         && conn_res.prop_values_ptr != 0
                         && conn_res.count_props >= props.len() as u32
                     {
+                        ucheck_n::<u32>(conn_res.props_ptr as usize, props.len())?;
+                        ucheck_n::<u64>(conn_res.prop_values_ptr as usize, props.len())?;
                         for (i, (pid, val)) in props.iter().enumerate() {
                             unsafe {
                                 *(conn_res.props_ptr as *mut u32).add(i) = *pid;
@@ -2322,6 +2416,7 @@ impl INode for DrmDev {
                 let res = unsafe { &mut *(data as *mut DrmModeGetPlaneRes) };
                 let planes = drm::get_planes();
                 if res.plane_id_ptr != 0 && res.count_planes >= planes.len() as u32 {
+                    ucheck_n::<u32>(res.plane_id_ptr as usize, planes.len())?;
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             planes.as_ptr(),
@@ -2346,6 +2441,7 @@ impl INode for DrmDev {
                         0x3432_5241, // DRM_FORMAT_ARGB8888 ("AR24")
                     ];
                     if res.format_type_ptr != 0 && res.count_format_types >= FORMATS.len() as u32 {
+                        ucheck_n::<u32>(res.format_type_ptr as usize, FORMATS.len())?;
                         unsafe {
                             core::ptr::copy_nonoverlapping(
                                 FORMATS.as_ptr(),
@@ -2398,6 +2494,8 @@ impl INode for DrmDev {
                     && res.prop_values_ptr != 0
                     && (res.count_props as usize) >= n
                 {
+                    ucheck_n::<u32>(res.props_ptr as usize, n)?;
+                    ucheck_n::<u64>(res.prop_values_ptr as usize, n)?;
                     for (i, (pid, val)) in props.iter().enumerate() {
                         unsafe {
                             *(res.props_ptr as *mut u32).add(i) = *pid;
@@ -2465,6 +2563,7 @@ impl INode for DrmDev {
                 // 20000+connector ids.
                 if let Some(blob) = drm::get_blob(res.blob_id) {
                     if res.data != 0 && res.length >= blob.len() as u32 {
+                        ucheck(res.data as usize, blob.len())?;
                         unsafe {
                             core::ptr::copy_nonoverlapping(
                                 blob.as_ptr(),
@@ -2480,6 +2579,7 @@ impl INode for DrmDev {
                 if let Some(conn_id) = connector_id {
                     if let Some(edid) = drm::get_connector_edid(conn_id) {
                         if res.data != 0 && res.length >= edid.len() as u32 {
+                            ucheck(res.data as usize, edid.len())?;
                             unsafe {
                                 core::ptr::copy_nonoverlapping(
                                     edid.as_ptr(),
@@ -2504,6 +2604,7 @@ impl INode for DrmDev {
                 if req.data == 0 || req.length == 0 || req.length > 64 * 1024 {
                     return Err(FsError::InvalidParam);
                 }
+                ucheck(req.data as usize, req.length as usize)?;
                 let src = unsafe {
                     core::slice::from_raw_parts(req.data as *const u8, req.length as usize)
                 };
@@ -2556,6 +2657,8 @@ impl INode for DrmDev {
                 if req.count_objs > 64 || req.objs_ptr == 0 || req.count_props_ptr == 0 {
                     return Err(FsError::InvalidParam);
                 }
+                ucheck_n::<u32>(req.objs_ptr as usize, req.count_objs as usize)?;
+                ucheck_n::<u32>(req.count_props_ptr as usize, req.count_objs as usize)?;
                 let mut upd = drm::AtomicUpdate::default();
                 let mut prop_idx = 0usize;
                 for i in 0..req.count_objs as usize {
@@ -2567,6 +2670,12 @@ impl INode for DrmDev {
                     if count_props > 0 && (req.props_ptr == 0 || req.prop_values_ptr == 0) {
                         return Err(FsError::InvalidParam);
                     }
+                    // The property arrays are shared across objects and indexed
+                    // by the running `prop_idx`; check the span this object
+                    // will consume before touching it.
+                    let span = prop_idx + count_props as usize;
+                    ucheck_n::<u32>(req.props_ptr as usize, span)?;
+                    ucheck_n::<u64>(req.prop_values_ptr as usize, span)?;
                     for _ in 0..count_props {
                         let prop_id = unsafe { *(req.props_ptr as *const u32).add(prop_idx) };
                         let value = unsafe { *(req.prop_values_ptr as *const u64).add(prop_idx) };
@@ -2659,6 +2768,7 @@ impl INode for DrmDev {
                 if req.count_handles == 0 || req.count_handles > MAX_HANDLES || req.handles == 0 {
                     return Err(FsError::InvalidParam);
                 }
+                ucheck_n::<u32>(req.handles as usize, req.count_handles as usize)?;
                 let apply = if cmd == DRM_IOCTL_SYNCOBJ_RESET {
                     zcore_drivers::scheme::syncobj::reset
                 } else {
@@ -2698,6 +2808,8 @@ impl INode for DrmDev {
                 {
                     return Err(FsError::InvalidParam);
                 }
+                ucheck_n::<u32>(req.handles as usize, req.count_handles as usize)?;
+                ucheck_n::<u64>(req.points as usize, req.count_handles as usize)?;
                 for i in 0..req.count_handles as usize {
                     let handle = unsafe { *(req.handles as *const u32).add(i) };
                     let point = unsafe { *(req.points as *const u64).add(i) };
@@ -2757,6 +2869,8 @@ impl INode for DrmDev {
                 // it as a no-op left the timeline at the previous signaled
                 // point — Mesa then walked `supported_sync_types` off the NULL
                 // terminator (`libvulkan_nouveau.so+0x9cc48`).
+                ucheck_n::<u32>(req.handles as usize, req.count_handles as usize)?;
+                ucheck_n::<u64>(req.points as usize, req.count_handles as usize)?;
                 let mut first_pt = 0u64;
                 for i in 0..req.count_handles as usize {
                     let handle = unsafe { *(req.handles as *const u32).add(i) };
@@ -2821,6 +2935,10 @@ impl INode for DrmDev {
                 const MAX_HANDLES: u32 = 64;
                 if count_handles == 0 || count_handles > MAX_HANDLES || handles_ptr == 0 {
                     return Err(FsError::InvalidParam);
+                }
+                ucheck_n::<u32>(handles_ptr as usize, count_handles as usize)?;
+                if timeline && points_ptr != 0 {
+                    ucheck_n::<u64>(points_ptr as usize, count_handles as usize)?;
                 }
                 let handles: alloc::vec::Vec<u32> = (0..count_handles as usize)
                     .map(|i| unsafe { *(handles_ptr as *const u32).add(i) })

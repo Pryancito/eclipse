@@ -3445,6 +3445,18 @@ fn parse_gpubench_elapsed_ns(report: &str) -> u64 {
     0
 }
 
+/// `access_ok()` for a user array a nouveau ioctl is about to read directly:
+/// `count` `T`s at `ptr` must lie in the user half (a zero count needs no
+/// pointer at all, matching how the arms treat `*_count == 0`). Without this,
+/// `op_ptr`/`push_ptr`/`wait_ptr`/`sig_ptr` were kernel-side reads at any
+/// address the (0666) render node's caller chose.
+fn user_slice_ok<T>(ptr: u64, count: u32) -> bool {
+    match (count as usize).checked_mul(core::mem::size_of::<T>()) {
+        Some(bytes) => super::nouveau_uapi::user_range_ok(ptr as usize, bytes),
+        None => false,
+    }
+}
+
 impl DrmScheme for NvidiaGpu {
     fn pci_bdf(&self) -> Option<(u32, u8, u8, u8)> {
         // RM only ever drives function 0 of the GPU (see `cfg_loc`).
@@ -7666,6 +7678,9 @@ impl DrmScheme for NvidiaGpu {
             }
             0x10DE0010 => {
                 // Fill Rect (arg is pointer to [u32; 5]: x, y, w, h, color)
+                if !super::nouveau_uapi::user_range_ok(arg, 5 * 4) {
+                    return Err(super::nouveau_uapi::EFAULT);
+                }
                 let p = arg as *const u32;
                 unsafe {
                     self.fill_rect(*p, *p.add(1), *p.add(2), *p.add(3), *p.add(4));
@@ -7674,6 +7689,9 @@ impl DrmScheme for NvidiaGpu {
             }
             0x10DE0011 => {
                 // Blit Rect (arg is pointer to [u32; 6]: sx, sy, dx, dy, w, h)
+                if !super::nouveau_uapi::user_range_ok(arg, 6 * 4) {
+                    return Err(super::nouveau_uapi::EFAULT);
+                }
                 let p = arg as *const u32;
                 unsafe {
                     self.blit_rect(*p, *p.add(1), *p.add(2), *p.add(3), *p.add(4), *p.add(5));
@@ -8958,7 +8976,7 @@ impl NvidiaGpu {
                 let get =
                     unsafe { core::ptr::read_volatile(f.userd_gpget as *const u32) } % entries;
                 let used = (put + entries - get) % entries;
-                if used + needed <= entries - 1 {
+                if used + needed < entries {
                     let mut slot = put;
                     for p in pushes {
                         let gp = (f.gpfifo_va + slot as usize * 8) as *mut u32;
@@ -9049,6 +9067,8 @@ impl NvidiaGpu {
                 nv::EXEC_FAST_SUBMITS.fetch_add(1, Ordering::Relaxed);
                 if let Some((fence_va, payload)) = fence {
                     nv::EXEC_FAST_FENCED.fetch_add(1, Ordering::Relaxed);
+                    // `sig_ptr`/`sig_count` were range-checked by the EXEC arm
+                    // before it dispatched here (see `user_slice_ok`).
                     let sigs = unsafe {
                         core::slice::from_raw_parts(
                             req.sig_ptr as *const nv::DrmNouveauSync,
@@ -9077,7 +9097,7 @@ impl NvidiaGpu {
                     );
                 }
                 static CLIENT_FAST_OK: AtomicU32 = AtomicU32::new(0);
-                if ctx_idx >= 1 && ctx_idx < 32 {
+                if (1..32).contains(&ctx_idx) {
                     let bit = 1u32 << ctx_idx;
                     if CLIENT_FAST_OK.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
                         crate::klog_info!(
@@ -10547,6 +10567,9 @@ impl NvidiaGpu {
                 // nouveau's own VM_BIND jobs behave the same way (each op
                 // is validated/applied as it's processed, not as a single
                 // all-or-nothing transaction).
+                if !user_slice_ok::<nv::DrmNouveauVmBindOp>(req.op_ptr, req.op_count) {
+                    return Err(nv::EFAULT);
+                }
                 let ops = unsafe {
                     core::slice::from_raw_parts(
                         req.op_ptr as *const nv::DrmNouveauVmBindOp,
@@ -10606,6 +10629,16 @@ impl NvidiaGpu {
                         req.sig_count, MAX_EXEC_SYNC
                     );
                     return Err(nv::EOPNOTSUPP);
+                }
+                // `access_ok()` for the three user arrays EXEC walks -- the
+                // waits/signals of the probe path right below, the pushes,
+                // and the signals consumed by both the direct-submit
+                // (`exec_fast`) and the RM path. Checked once, up front.
+                if !user_slice_ok::<nv::DrmNouveauExecPush>(req.push_ptr, req.push_count)
+                    || !user_slice_ok::<nv::DrmNouveauSync>(req.wait_ptr, req.wait_count)
+                    || !user_slice_ok::<nv::DrmNouveauSync>(req.sig_ptr, req.sig_count)
+                {
+                    return Err(nv::EFAULT);
                 }
                 if req.push_count == 0 {
                     // An EXEC with no pushes is nouveau's CHANNEL HEALTH

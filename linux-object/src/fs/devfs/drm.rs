@@ -9,7 +9,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::TryFrom;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use lock::Mutex;
 
@@ -36,9 +36,6 @@ const SYNTH_CONNECTOR_ID: u32 = 2;
 pub const SYNTH_ENCODER_ID: u32 = 3;
 /// Primary plane id exposed to userspace for the synthetic output.
 pub const SYNTH_PLANE_ID: u32 = 4;
-
-/// Sequence counter for delivered page-flip / vblank events.
-static FLIP_SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// One-shot guard so the first scanout logs (every-frame logging would spam).
 static SCANOUT_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -187,15 +184,15 @@ struct DrmState {
     /// address space, so per-process accounting cannot see it either.
     handles: Vec<(GemHandle, Arc<VmObject>, u64)>,
     framebuffers: Vec<DrmFramebuffer>,
-    /// Framebuffers removed by `RMFB`/`CLOSEFB` while a page-flip was in
-    /// flight. Linux keeps a framebuffer alive until it is no longer
-    /// referenced by any DRM object; we approximate that by deferring the
-    /// removal until the next flip-completion event is delivered. This is
-    /// what prevents Mesa/Zink from receiving `GLXBadCurrentWindow` when an
-    /// application exits while a swap is still in flight: the final
-    /// `glXSwapBuffers` finds the drawable still valid, completes cleanly,
-    /// and only then does the backing framebuffer disappear.
-    pending_rmfb: Vec<DrmFramebuffer>,
+    /// The backing VMO of every framebuffer built on a dumb buffer, keyed by
+    /// fb id. This is the framebuffer's *reference* on the GEM object: Linux
+    /// keeps a `drm_gem_object` alive while any framebuffer (or mapping, or
+    /// dma-buf) still refers to it, so `GEM_CLOSE`/`DESTROY_DUMB` on a handle
+    /// that an fb was built on does not free the pixels. Before this existed
+    /// the fb stored only `phys_addr`, and the sequence
+    /// CREATE_DUMB -> ADDFB -> SETCRTC -> DESTROY_DUMB left `scanout()` and
+    /// every cursor move reading frames that had gone back to the allocator.
+    fb_backing: Vec<(u32, Arc<VmObject>)>,
     /// Framebuffer currently bound to the (synthetic) CRTC, reported by GETCRTC.
     crtc_fb: u32,
     /// The VT the compositor owns the display on, established on its first
@@ -317,7 +314,7 @@ lazy_static::lazy_static! {
         next_fb_id: 1,
         handles: Vec::new(),
         framebuffers: Vec::new(),
-        pending_rmfb: Vec::new(),
+        fb_backing: Vec::new(),
         crtc_fb: 0,
         graphics_vt: None,
         events: VecDeque::new(),
@@ -570,6 +567,25 @@ pub fn get_handle(handle_id: u32) -> Option<GemHandle> {
         .map(|(h, _, _)| *h)
 }
 
+/// The owning VMO of a dumb buffer, for `mmap` of its `MAP_DUMB` offset.
+///
+/// The mapping must share THIS object, not a fresh `VmObject::new_physical`
+/// over the same frames: a physical VMO owns nothing, so a client that
+/// `DESTROY_DUMB`ed a buffer it still had mapped kept writing through a
+/// mapping whose frames had already been handed to the next allocation. With
+/// the mapping holding the `Arc`, the frames live until the last mapping goes
+/// -- exactly `drm_gem_object`'s refcount in Linux. The contiguous VMO is
+/// also `Cached`, where the physical one defaulted to `Uncached`, so the
+/// compositor no longer renders into UC memory on real hardware.
+pub fn handle_vmo(handle_id: u32) -> Option<Arc<VmObject>> {
+    DRM_STATE
+        .lock()
+        .handles
+        .iter()
+        .find(|(h, _, _)| h.id == handle_id)
+        .map(|(_, vmo, _)| vmo.clone())
+}
+
 /// Look up a framebuffer object by id (`DRM_IOCTL_MODE_GETFB`/`GETFB2`).
 pub fn get_fb(fb_id: u32) -> Option<DrmFramebuffer> {
     DRM_STATE
@@ -664,75 +680,45 @@ pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<
         size,
     };
 
+    // The fb takes its own reference on a dumb buffer's VMO (see
+    // `fb_backing`); a driver-private GEM object is the driver's to keep.
+    let backing = state
+        .handles
+        .iter()
+        .find(|(h, _, _)| h.id == handle_id)
+        .map(|(_, vmo, _)| vmo.clone());
+    if let Some(vmo) = backing {
+        state.fb_backing.push((fb_id, vmo));
+    }
     state.framebuffers.push(fb);
     Some(fb_id)
 }
 
 /// Remove a framebuffer (DRM_IOCTL_MODE_RMFB / DRM_IOCTL_MODE_CLOSEFB).
 ///
-/// If a page-flip is currently in flight (`FLIP_EVENT_PENDING`) the
-/// framebuffer is not freed immediately — it is moved to the
-/// `pending_rmfb` queue and released once the flip-complete event is
-/// delivered in [`queue_flip_event`].  This mirrors Linux's reference-
-/// counted `drm_framebuffer` lifetime: the fb stays alive for as long as
-/// any scanout is using it, so a racing `glXSwapBuffers` finds its
-/// drawable valid and completes without triggering `GLXBadCurrentWindow`.
+/// Drops the fb object and the reference it held on its dumb buffer (see
+/// `fb_backing`). If the fb was the one bound to the CRTC, the CRTC simply
+/// stops naming it: the software scanout keeps showing the last blitted
+/// frame until the next present, which is CLOSEFB's "close without
+/// disabling" contract and harmless for RMFB.
 ///
-/// Any previously deferred fbs whose flip has since completed are also
-/// drained here when no new flip is in flight.
+/// This used to defer the removal while a page-flip completion was pending
+/// and, for the CRTC fb, push a hand-made `DRM_EVENT_FLIP_COMPLETE` with
+/// `user_data = 0` -- while the real completion stayed queued. Two events for
+/// one flip, and wlroots dereferences `user_data` as its `wlr_drm_page_flip`,
+/// so the zero one was a NULL deref in the compositor. Linux never emits an
+/// event for RMFB; the buffer-lifetime worry it was papering over is now
+/// handled by the fb's own VMO reference.
 pub fn rmfb(fb_id: u32) -> bool {
-    // Drain any deferred fbs from a previous flip that has since completed.
-    if !FLIP_EVENT_PENDING.load(Ordering::Acquire) {
-        DRM_STATE.lock().pending_rmfb.clear();
-    }
-
     let mut state = DRM_STATE.lock();
     let Some(pos) = state.framebuffers.iter().position(|f| f.id == fb_id) else {
         return false;
     };
-
-    // If the fb being destroyed is the one currently displayed by the CRTC
-    // and a page-flip is in flight, emit a synthetic flip-complete event
-    // first. This gives Mesa/Zink a chance to handle the surface-gone
-    // notification before the swapchain is torn down, which is what prevents
-    // "MESA: error: zink: swapchain killed" from being followed by an X
-    // protocol error.
-    let crtc_id = SYNTH_CRTC_ID;
-    let is_crtc_fb = state.crtc_fb == fb_id;
-    if is_crtc_fb {
+    state.framebuffers.remove(pos);
+    state.fb_backing.retain(|(id, _)| *id != fb_id);
+    if state.crtc_fb == fb_id {
         state.crtc_fb = 0;
     }
-
-    if FLIP_EVENT_PENDING.load(Ordering::Acquire) {
-        // Defer: keep the framebuffer alive until the in-flight swap lands.
-        let fb = state.framebuffers.remove(pos);
-        state.pending_rmfb.push(fb);
-
-        // Emit a synthetic flip-complete event so the compositor / Mesa WSI
-        // gets notified that the surface is going away, giving it a chance to
-        // recreate the swapchain rather than crashing on the next swap.
-        if is_crtc_fb {
-            let seq = FLIP_SEQ.fetch_add(1, Ordering::Relaxed);
-            // Push the event directly; we already hold `state`.
-            let now = kernel_hal::timer::timer_now();
-            const DRM_EVENT_FLIP_COMPLETE: u32 = 2;
-            let mut buf = [0u8; 32];
-            buf[0..4].copy_from_slice(&DRM_EVENT_FLIP_COMPLETE.to_ne_bytes());
-            buf[4..8].copy_from_slice(&32u32.to_ne_bytes());
-            // user_data 0 — we don't know the outstanding flip's user_data here,
-            // and a 0 is harmless (libdrm dispatches by type, not user_data).
-            buf[8..16].copy_from_slice(&0u64.to_ne_bytes());
-            buf[16..20].copy_from_slice(&(now.as_secs() as u32).to_ne_bytes());
-            buf[20..24].copy_from_slice(&now.subsec_micros().to_ne_bytes());
-            buf[24..28].copy_from_slice(&seq.to_ne_bytes());
-            buf[28..32].copy_from_slice(&crtc_id.to_ne_bytes());
-            state.events.push_back(buf.to_vec());
-            state.eventbus.lock().set(Event::READABLE);
-        }
-        return true;
-    }
-
-    state.framebuffers.remove(pos);
     true
 }
 
@@ -1295,8 +1281,34 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     let _ = display.flush();
     // A DRM client owns the framebuffer now: stop the kernel text console from
     // drawing over it (like fbcon yielding to KMS). Restored on DROP_MASTER.
-    kernel_hal::console::set_kd_mode(kernel_hal::console::KD_GRAPHICS);
+    claim_graphics_vt();
     true
+}
+
+/// Put the compositor's OWN VT into `KD_GRAPHICS` after a present.
+///
+/// This used to be `set_kd_mode(KD_GRAPHICS)` = "whatever VT is active now".
+/// The VT gate in [`present_now_region`] runs before the blit, but
+/// [`blit_chunked`] re-enables interrupts between bands, so a Ctrl+Alt+Fn
+/// during a 16-100 ms present could complete the switch mid-frame: the
+/// trailing bands landed on the text console, and then THAT VT was stamped
+/// KD_GRAPHICS -- no keyboard echo, no repaint, a dead console until a
+/// userspace KDSETMODE. Now the mode goes to the owner VT only while it is
+/// still the active one; if the display moved away under us, the text VT
+/// keeps its mode and is repainted over the stray bands.
+fn claim_graphics_vt() {
+    use kernel_hal::console::{active_vt, kd_mode_vt, set_kd_mode_vt, KD_GRAPHICS, KD_TEXT};
+    let owner = DRM_STATE.lock().graphics_vt;
+    let active = active_vt();
+    match owner {
+        Some(vt) if vt == active => set_kd_mode_vt(vt, KD_GRAPHICS),
+        Some(_) => {
+            if kd_mode_vt(active) == KD_TEXT {
+                kernel_hal::console::redraw_active_console();
+            }
+        }
+        None => set_kd_mode_vt(active, KD_GRAPHICS),
+    }
 }
 
 /// Set (or hide) the cursor bitmap from a GEM handle (`DRM_MODE_CURSOR_BO`).
@@ -1306,6 +1318,8 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
 /// `w`x`h` pixels; copy it out so a later GEM_CLOSE / reuse can't tear the image
 /// mid-scanout. Returns true if the cursor state changed enough to warrant a
 /// repaint.
+pub const MAX_CURSOR_DIM: u32 = 64;
+
 pub fn set_cursor_bo(handle_id: u32, w: u32, h: u32) -> bool {
     let mut state = DRM_STATE.lock();
     if handle_id == 0 || w == 0 || h == 0 {
@@ -1344,10 +1358,15 @@ pub fn set_cursor_bo(handle_id: u32, w: u32, h: u32) -> bool {
             return true;
         }
     };
-    let mut state = DRM_STATE.lock();
+    // The advertised DRM_CAP_CURSOR_WIDTH/HEIGHT is 64; the ioctl arm rejects
+    // anything larger with EINVAL like Linux, so `px * 4` cannot overflow and
+    // the bitmap is at most 16 KiB. Copy it BEFORE taking `DRM_STATE`: the
+    // lock is an IRQ-disabling spinlock and this used to run a user-sized
+    // memcpy (bounded only by the GEM's 64 MiB) with interrupts off.
     let px = (w as usize).saturating_mul(h as usize);
-    if px == 0 || size < px * 4 || phys_addr == 0 {
-        state.cursor.visible = false;
+    let bytes = px.saturating_mul(4);
+    if px == 0 || w > MAX_CURSOR_DIM || h > MAX_CURSOR_DIM || size < bytes || phys_addr == 0 {
+        DRM_STATE.lock().cursor.visible = false;
         return true;
     }
     let vaddr = phys_to_virt(phys_addr as usize);
@@ -1355,7 +1374,9 @@ pub fn set_cursor_bo(handle_id: u32, w: u32, h: u32) -> bool {
     // `vaddr`; we read exactly `px` u32 pixels (<= size/4).
     let src = unsafe { core::slice::from_raw_parts(vaddr as *const u32, px) };
     // Fresh Arc shared by subsequent scanouts (no per-flip Vec clone).
-    state.cursor.bitmap = Some(Arc::from(src));
+    let bitmap: Arc<[u32]> = Arc::from(src);
+    let mut state = DRM_STATE.lock();
+    state.cursor.bitmap = Some(bitmap);
     state.cursor.w = w;
     state.cursor.h = h;
     state.cursor.visible = true;
@@ -1722,7 +1743,16 @@ pub enum FlipError {
     Failed,
 }
 
-pub fn page_flip(fb_id: u32, crtc_id: u32, user_data: u64) -> Result<(), FlipError> {
+/// `want_event`: the request carried `DRM_MODE_PAGE_FLIP_EVENT`. Without it
+/// Linux queues nothing; this used to queue a completion regardless, so a
+/// client flipping without events (and therefore never reading the fd) grew
+/// the event queue without bound and left the fd permanently readable.
+pub fn page_flip(
+    fb_id: u32,
+    crtc_id: u32,
+    user_data: u64,
+    want_event: bool,
+) -> Result<(), FlipError> {
     // One outstanding flip-complete per CRTC — same rule as Linux. The
     // coalesced timer keeps a *queue* (never an overwritten `Option`), so a
     // second flip / WAIT_VBLANK never silently drops the first completion — that
@@ -1752,7 +1782,9 @@ pub fn page_flip(fb_id: u32, crtc_id: u32, user_data: u64) -> Result<(), FlipErr
     if !flipped {
         return Err(FlipError::Failed);
     }
-    schedule_flip_event(crtc_id, user_data);
+    if want_event {
+        schedule_flip_event(crtc_id, user_data);
+    }
     Ok(())
 }
 
@@ -1775,8 +1807,11 @@ enum PendingDrmTimer {
     // `seq` is intentionally not stored: we recompute it from `vblank_seq_now()`
     // at delivery time so the event carries the sequence that actually just
     // completed (the timer fires at the next vblank boundary), rather than a
-    // sequence that was stale by the time the timer fires.
-    Vblank { signal: u64 },
+    // sequence that was stale by the time the timer fires. `due_seq` is the
+    // vblank the caller asked for (`drm_wait_vblank.request.sequence`,
+    // absolute): the job stays queued, one vblank tick at a time, until the
+    // counter reaches it.
+    Vblank { signal: u64, due_seq: u32 },
 }
 
 lazy_static::lazy_static! {
@@ -1793,13 +1828,21 @@ fn deliver_pending_drm_timer() {
     // queue holds at most one Flip (flush_pending_flip_completions drains any
     // outstanding one before accepting a new flip) plus any vblank waits.
     let jobs: Vec<PendingDrmTimer> = PENDING_DRM_TIMERS.lock().drain(..).collect();
+    let now_seq = vblank_seq_now();
     for job in jobs {
         match job {
             PendingDrmTimer::Flip { crtc_id, user_data } => {
                 queue_flip_event(crtc_id, user_data);
             }
-            PendingDrmTimer::Vblank { signal } => {
-                queue_vblank_event(vblank_seq_now(), signal);
+            PendingDrmTimer::Vblank { signal, due_seq } => {
+                // Not due yet (wrap-safe compare): keep it for a later vblank.
+                if (due_seq.wrapping_sub(now_seq) as i32) > 0 {
+                    PENDING_DRM_TIMERS
+                        .lock()
+                        .push_back(PendingDrmTimer::Vblank { signal, due_seq });
+                } else {
+                    queue_vblank_event(now_seq, signal);
+                }
             }
         }
     }
@@ -1906,11 +1949,12 @@ fn clear_stale_flip_pending() {
 }
 
 /// Deliver a `DRM_EVENT_VBLANK` (from a `WAIT_VBLANK` that asked for an event)
-/// at the next synthetic vblank instead of immediately, for the same anti-spin
-/// reason as [`schedule_flip_event`]. `signal` is the caller's opaque token
-/// echoed back in the event's `user_data`.
-pub fn schedule_vblank_event(signal: u64) {
-    arm_coalesced_drm_timer(PendingDrmTimer::Vblank { signal });
+/// once the synthetic vblank counter reaches `due_seq` -- and never before the
+/// next vblank boundary even if `due_seq` has already passed, for the same
+/// anti-spin reason as [`schedule_flip_event`]. `signal` is the caller's
+/// opaque token echoed back in the event's `user_data`.
+pub fn schedule_vblank_event(signal: u64, due_seq: u32) {
+    arm_coalesced_drm_timer(PendingDrmTimer::Vblank { signal, due_seq });
 }
 
 /// Drop any not-yet-posted flip/vblank completions (timer queue + readable
@@ -2128,7 +2172,7 @@ pub fn present_now_region(fb_id: u32, crtc_id: u32, rect: Option<(u32, u32, u32,
     if flipped {
         set_crtc_fb(crtc_id, fb_id);
         // A DRM client owns the framebuffer now: stop text console drawing.
-        kernel_hal::console::set_kd_mode(kernel_hal::console::KD_GRAPHICS);
+        claim_graphics_vt();
     }
     flipped
 }
@@ -2159,15 +2203,16 @@ fn push_drm_event(ev_type: u32, crtc_id: u32, seq: u32, user_data: u64) {
 /// Enqueue a `DRM_EVENT_FLIP_COMPLETE` for a completed page flip.
 fn queue_flip_event(crtc_id: u32, user_data: u64) {
     const DRM_EVENT_FLIP_COMPLETE: u32 = 2;
-    let seq = FLIP_SEQ.fetch_add(1, Ordering::Relaxed);
+    // Linux stamps a flip completion with the CRTC's vblank counter -- the
+    // same counter WAIT_VBLANK reports. This used to be a private per-flip
+    // count from 0, so a client that read the MSC via WAIT_VBLANK (millions,
+    // time-based) and then got completions in the hundreds saw the MSC run
+    // backwards (Xorg Present's target-MSC scheduling).
+    let seq = vblank_seq_now();
     push_drm_event(DRM_EVENT_FLIP_COMPLETE, crtc_id, seq, user_data);
     // Flip is complete from the KMS POV once the event is on the card fd —
     // a new PAGE_FLIP may be accepted even before userspace reads it.
     FLIP_EVENT_PENDING.store(false, Ordering::Release);
-    // Release any framebuffers that were deferred by `rmfb` while this flip
-    // was in flight. Now that the flip has landed they are no longer
-    // referenced by the scanout path and can be safely freed.
-    DRM_STATE.lock().pending_rmfb.clear();
 }
 
 /// Enqueue a `DRM_EVENT_VBLANK` for a `WAIT_VBLANK` request that asked for an
@@ -2619,6 +2664,8 @@ pub fn release_process(pid: u64) -> usize {
         state
             .framebuffers
             .retain(|fb| !doomed.iter().any(|h| h.id == fb.gem_handle_id));
+        let live_fbs: Vec<u32> = state.framebuffers.iter().map(|fb| fb.id).collect();
+        state.fb_backing.retain(|(id, _)| live_fbs.contains(id));
         if !state.framebuffers.iter().any(|fb| fb.id == state.crtc_fb) {
             state.crtc_fb = 0;
         }
@@ -2945,5 +2992,55 @@ mod release_tests {
             "a framebuffer over a freed handle would scan out released memory"
         );
         assert_eq!(state.crtc_fb, 0, "the CRTC must not point at a dropped fb");
+    }
+
+    /// Linux semantics: closing the handle drops the *handle*, not the
+    /// object. A framebuffer built on it keeps the memory (its own `Arc` on
+    /// the VMO) and stays scannable until RMFB, which then releases it.
+    #[test]
+    fn gem_close_keeps_a_framebuffer_and_its_memory_alive() {
+        plant(9301, 4096, 77_004);
+        let vmo = handle_vmo(9301).expect("planted handle resolves to its VMO");
+        {
+            let mut state = DRM_STATE.lock();
+            state.framebuffers.push(DrmFramebuffer {
+                id: 9399,
+                driver_fb_id: None,
+                gem_handle_id: 9301,
+                width: 1,
+                height: 1,
+                pitch: 4,
+                phys_addr: 0,
+                size: 4096,
+            });
+            state.fb_backing.push((9399, vmo.clone()));
+            state.crtc_fb = 9399;
+        }
+        // Two owners besides the handle table: the test's `vmo` and the fb.
+        assert_eq!(Arc::strong_count(&vmo), 3);
+
+        assert!(gem_close(9301), "the handle existed");
+        assert!(handle_vmo(9301).is_none(), "the handle is gone");
+        {
+            let state = DRM_STATE.lock();
+            assert!(
+                state.framebuffers.iter().any(|fb| fb.id == 9399),
+                "the fb outlives its handle"
+            );
+            assert_eq!(state.crtc_fb, 9399, "and the CRTC still scans it out");
+        }
+        // Only the fb's reference dropped away with the handle table entry.
+        assert_eq!(Arc::strong_count(&vmo), 2);
+
+        assert!(rmfb(9399));
+        assert_eq!(
+            Arc::strong_count(&vmo),
+            1,
+            "RMFB released the fb's reference"
+        );
+        let state = DRM_STATE.lock();
+        assert!(!state.framebuffers.iter().any(|fb| fb.id == 9399));
+        assert!(!state.fb_backing.iter().any(|(id, _)| *id == 9399));
+        assert_eq!(state.crtc_fb, 0, "RMFB of the CRTC fb unbinds it");
     }
 }

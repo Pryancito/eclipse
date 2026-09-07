@@ -446,6 +446,15 @@ pub fn set_kd_mode_vt(vt: usize, mode: u32) {
     }
 }
 
+/// Repaint the active VT from its cell buffer when it is a text console (a
+/// no-op without the graphic console). For a presenter that finds, after its
+/// blit, that the active VT changed under it: its trailing bands landed on
+/// the text console and must be painted over again.
+pub fn redraw_active_console() {
+    #[cfg(feature = "graphic")]
+    redraw_graphic_console_impl();
+}
+
 /// Get the KD mode of a specific VT.
 pub fn kd_mode_vt(vt: usize) -> u32 {
     KD_MODES

@@ -278,6 +278,7 @@ impl From<FsError> for LxError {
             FsError::Interrupted => LxError::EINTR,
             FsError::NoPermission => LxError::EACCES,
             FsError::OpNotSupported => LxError::EOPNOTSUPP,
+            FsError::BadAddress => LxError::EFAULT,
         }
     }
 }

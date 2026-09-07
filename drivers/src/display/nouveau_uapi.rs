@@ -551,6 +551,24 @@ pub(super) const ENOMEM: i32 = 12;
 pub(super) const EBUSY: i32 = 16;
 pub(super) const ENODEV: i32 = 19;
 pub(super) const EINVAL: i32 = 22;
+pub(super) const EFAULT: i32 = 14;
+
+/// `access_ok()` for a raw user `(addr, bytes)` range a nouveau ioctl is about
+/// to dereference: non-null when `bytes > 0`, and entirely below the canonical
+/// user/kernel split (`0x0000_8000_0000_0000` on x86_64, which the Sv39/Sv48
+/// and aarch64 user ranges also sit under). Mirrors
+/// `kernel_hal::user::user_range_ok`; this crate has no `kernel-hal`
+/// dependency, so the (one-line) check is repeated here rather than pulling
+/// one in. The kernel is mapped into every address space, so a kernel address
+/// passed through the (0666) render node used to resolve and turn the
+/// driver's copy into an arbitrary kernel-memory read.
+pub(super) fn user_range_ok(addr: usize, bytes: usize) -> bool {
+    const USER_MAX: usize = 0x0000_8000_0000_0000;
+    if bytes == 0 {
+        return true;
+    }
+    addr != 0 && addr.checked_add(bytes).is_some_and(|end| end <= USER_MAX)
+}
 pub(super) const ENOSYS: i32 = 38;
 pub(super) const EOPNOTSUPP: i32 = 95;
 
@@ -1422,10 +1440,7 @@ impl IoctlStat {
 }
 
 const PROFILE_SLOTS: usize = 128;
-static IOCTL_PROFILE: [IoctlStat; PROFILE_SLOTS] = {
-    const S: IoctlStat = IoctlStat::new();
-    [S; PROFILE_SLOTS]
-};
+static IOCTL_PROFILE: [IoctlStat; PROFILE_SLOTS] = [const { IoctlStat::new() }; PROFILE_SLOTS];
 
 /// Account one driver ioctl (`nr` = full DRM NR, e.g. `NR_EXEC`) that took
 /// `us` microseconds in the kernel.

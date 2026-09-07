@@ -278,7 +278,13 @@ impl FbDev {
             return Err(LxError::ENOMEM);
         }
         let len = len.min(info.fb_size - offset);
-        Ok(VmObject::new_physical(paddr as usize + offset, pages(len)))
+        let vmo = VmObject::new_physical(paddr as usize + offset, pages(len));
+        // The framebuffer is a device aperture (GOP / BAR): write-combining
+        // like Linux's fbdev `fb_pgprotect`, not the physical VMO's default
+        // Uncached, which made every Xorg `fbdev` store a serialized UC write.
+        // (Falls back to UC on a core whose PAT has no WC entry.)
+        let _ = vmo.set_cache_policy(kernel_hal::CachePolicy::WriteCombining);
+        Ok(vmo)
     }
 }
 
@@ -349,13 +355,26 @@ impl INode for FbDev {
 
     #[allow(unsafe_code)]
     fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
+        // The FBIO* numbers are old-style ioctls with no size encoded, so the
+        // `access_ok()` check is per arm: the kernel writes a whole screeninfo
+        // struct through `data`, and a NULL or kernel address must be EFAULT,
+        // not a #PF or a write into kernel memory.
+        fn ucheck<T>(addr: usize) -> Result<()> {
+            if kernel_hal::user::user_range_ok(addr, core::mem::size_of::<T>()) {
+                Ok(())
+            } else {
+                Err(FsError::BadAddress)
+            }
+        }
         match cmd {
             FBIOGET_FSCREENINFO => {
+                ucheck::<FbFixScreeninfo>(data)?;
                 let dst = unsafe { &mut *(data as *mut FbFixScreeninfo) };
                 *dst = self.display.info().into();
                 Ok(0)
             }
             FBIOGET_VSCREENINFO => {
+                ucheck::<FbVarScreeninfo>(data)?;
                 let dst = unsafe { &mut *(data as *mut FbVarScreeninfo) };
                 *dst = self.display.info().into();
                 Ok(0)
@@ -364,6 +383,7 @@ impl INode for FbDev {
             // arbitrary mode change. Accept the request and report back the
             // actual geometry, which is what X's fbdev driver needs to start.
             FBIOPUT_VSCREENINFO => {
+                ucheck::<FbVarScreeninfo>(data)?;
                 let dst = unsafe { &mut *(data as *mut FbVarScreeninfo) };
                 *dst = self.display.info().into();
                 Ok(0)

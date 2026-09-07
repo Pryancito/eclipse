@@ -323,14 +323,15 @@ pub enum FsError {
     DeviceError,
     IOCTLError,
     NoDevice,
-    Again,       // E_AGAIN, when no data is available, never happens in fs
-    TimedOut,    // E_TIME (62), a wait reached its deadline -- e.g. DRM_IOCTL_SYNCOBJ_WAIT
-    SymLoop,     // E_LOOP
-    Busy,        // E_BUSY
-    ReadOnly,     // E_ROFS
-    Interrupted,  // E_INTR
+    Again,          // E_AGAIN, when no data is available, never happens in fs
+    TimedOut,       // E_TIME (62), a wait reached its deadline -- e.g. DRM_IOCTL_SYNCOBJ_WAIT
+    SymLoop,        // E_LOOP
+    Busy,           // E_BUSY
+    ReadOnly,       // E_ROFS
+    Interrupted,    // E_INTR
     NoPermission,   // E_ACCES, e.g. modeset ioctls on a DRM render node
     OpNotSupported, // E_OPNOTSUPP, e.g. an ioctl the device genuinely lacks
+    BadAddress,     // E_FAULT, a user pointer outside the user address range
 }
 
 impl fmt::Display for FsError {

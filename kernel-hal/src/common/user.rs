@@ -136,6 +136,22 @@ fn in_user_half(addr: usize, bytes: usize) -> bool {
     }
 }
 
+/// `access_ok()` for a raw `(addr, bytes)` pair that a device ioctl is about
+/// to dereference directly: non-null when `bytes > 0`, and entirely inside
+/// the user half (see [`in_user_half`]). Device `io_control` handlers receive
+/// the ioctl argument as a bare `usize` and used to cast it straight to a
+/// `&mut T`, which made every ioctl an arbitrary kernel-memory read/write for
+/// a caller that passed a kernel address (and a kernel #PF for a NULL one).
+/// Alignment is deliberately not required here: userspace structs arrive
+/// however libdrm laid them out, and the callers read them with plain loads
+/// on x86_64 where unaligned access is legal.
+pub fn user_range_ok(addr: usize, bytes: usize) -> bool {
+    if bytes == 0 {
+        return true;
+    }
+    addr != 0 && in_user_half(addr, bytes)
+}
+
 // FIXME: this is a workaround for `clear_child_tid`.
 unsafe impl<T, P: Policy> Send for UserPtr<T, P> {}
 unsafe impl<T, P: Policy> Sync for UserPtr<T, P> {}

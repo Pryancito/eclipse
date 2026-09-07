@@ -38,12 +38,23 @@ para Xorg con el driver `fbdev`.
 
 ### Render nodes (`drm-uapi.rst` → *Render nodes*)
 
-Igual que en Linux, `renderD128` **solo** acepta los ioctls marcados
+Linux hace que `renderD128` **solo** acepte los ioctls marcados
 `DRM_RENDER_ALLOW` en `drm_ioctl.c` (`VERSION`, `GET_CAP`, `GEM_CLOSE`,
-`PRIME_*`, `SYNCOBJ_*`, `SET_CLIENT_NAME` y el rango de comandos del driver);
-cualquier ioctl de modeset, *dumb buffers* o master/auth devuelve **EACCES**.
-Así, un cliente que sondee el render node ve un nodo de render de verdad, no un
-segundo dispositivo KMS.
+`PRIME_*`, `SYNCOBJ_*`, `SET_CLIENT_NAME` y el rango de comandos del driver) y
+devuelva **EACCES** a cualquier ioctl de modeset, *dumb buffers* o master/auth.
+Eclipse tiene el filtro escrito (`render_allowed`) pero **todavía solo
+observa**: registra en el klog el ioctl que Linux habría rechazado y lo deja
+pasar, porque activarlo a ciegas rompería el escritorio software-GL que hoy
+arranca por ese nodo. Hasta que se active, `renderD128` se comporta como un
+segundo nodo KMS completo (ver `drm_scheme.rs`, `io_control`).
+
+### Punteros de usuario
+
+Todo argumento de ioctl (y cada puntero anidado: `fb_id_ptr`, `modes_ptr`,
+`clips_ptr`, `handles`, `data` de los blobs, `op_ptr`/`push_ptr` de nouveau…)
+se comprueba contra la mitad de usuario del espacio de direcciones antes de
+tocarlo; una dirección nula o de kernel devuelve **EFAULT**, como `access_ok()`
+en Linux.
 
 ## Cobertura de la UAPI de DRM (`drm-uapi.rst`)
 
@@ -60,13 +71,13 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | `DRM_IOCTL_SET_MASTER` / `DROP_MASTER` | ✅ | conmuta la consola de texto del kernel (KD_GRAPHICS/KD_TEXT) |
 | `DRM_IOCTL_GET_CAP` | ✅ | ver tabla de *caps* |
 | `DRM_IOCTL_SET_CLIENT_CAP` | ✅ | `ATOMIC` según `drm.atomic` (ver sección atómico); `WRITEBACK` solo para clientes atómicos (EINVAL como Linux); resto aceptado |
-| `DRM_IOCTL_WAIT_VBLANK` | ✅ | vblank sintético ~60 Hz; modo evento encola `DRM_EVENT_VBLANK` |
+| `DRM_IOCTL_WAIT_VBLANK` | 🟡 | vblank sintético ~60 Hz. Modo evento: respeta `RELATIVE`/`ABSOLUTE`/`NEXTONMISS` y entrega `DRM_EVENT_VBLANK` cuando el contador alcanza la secuencia pedida (nunca antes del siguiente vblank). Modo bloqueante: devuelve la secuencia actual sin esperar (el ioctl es síncrono; ver `README-async-ioctl-vblank.md`) |
 
 ### GEM / *dumb buffers* / PRIME
 
 | ioctl | Estado | Notas |
 |---|---|---|
-| `DRM_IOCTL_MODE_CREATE_DUMB` | ✅ | memoria física contigua vía VMO; *pitch* alineado a 64 B |
+| `DRM_IOCTL_MODE_CREATE_DUMB` | ✅ | memoria física contigua vía VMO; *pitch* alineado a 64 B. El `mmap` comparte el VMO del buffer (cacheado, WB): el mapeo y cada framebuffer construido sobre el handle mantienen la memoria viva tras `DESTROY_DUMB`, como el refcount de `drm_gem_object` |
 | `DRM_IOCTL_MODE_MAP_DUMB` | ✅ | *offset* = `handle << 12`; `mmap` mapea el VMO físico |
 | `DRM_IOCTL_MODE_DESTROY_DUMB` | ✅ | |
 | `DRM_IOCTL_GEM_CLOSE` | ✅ | |
@@ -96,17 +107,17 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | `DRM_IOCTL_MODE_GETPLANERESOURCES` | ✅ | 1 plano primario |
 | `DRM_IOCTL_MODE_GETPLANE` | ✅ | formatos `XR24`/`AR24` |
 | `DRM_IOCTL_MODE_SETPLANE` | ✅ | equivale a *scanout* del fb (ruta primaria SW) |
-| `DRM_IOCTL_MODE_PAGE_FLIP` | ✅ | *scanout* + `DRM_EVENT_FLIP_COMPLETE` con `crtc_id` |
+| `DRM_IOCTL_MODE_PAGE_FLIP` | ✅ | *scanout*; `DRM_EVENT_FLIP_COMPLETE` (con `crtc_id` y la secuencia de vblank) solo con `PAGE_FLIP_EVENT`; `ASYNC`/`TARGET_*`/flags desconocidos → EINVAL, fb desconocido → ENOENT |
 | `DRM_IOCTL_MODE_OBJ_GETPROPERTIES` | ✅ | tabla de propiedades por objeto; las propiedades `DRM_MODE_PROP_ATOMIC` solo se muestran a clientes atómicos (mismo filtrado que Linux) |
 | `DRM_IOCTL_MODE_GETPROPERTY` | ✅ | metadatos completos: flags, nombre, rangos/enums/tipo de objeto |
 | `DRM_IOCTL_MODE_OBJ_SETPROPERTY` / `SETPROPERTY` | 🟡 | aceptado como no-op (DPMS…; sin estado programable) |
 | `DRM_IOCTL_MODE_GETPROPBLOB` | ✅ | EDID + blobs del almacén de propiedades |
 | `DRM_IOCTL_MODE_CREATEPROPBLOB` / `DESTROYPROPBLOB` | ✅ | almacén de blobs; destruir un blob del kernel da EACCES (Linux: EPERM) |
-| `DRM_IOCTL_MODE_CURSOR` / `CURSOR2` | ✅ | cursor compuesto por el kernel sobre cada frame (`set_cursor_bo`/`move_cursor`) |
+| `DRM_IOCTL_MODE_CURSOR` / `CURSOR2` | ✅ | cursor compuesto por el kernel sobre cada frame (`set_cursor_bo`/`move_cursor`); más de 64×64 → EINVAL (el tamaño anunciado en las *caps*) |
 | `DRM_IOCTL_MODE_ATOMIC` | ✅ | **opt-in** con `drm.atomic` (ver sección siguiente) |
 | `DRM_IOCTL_MODE_GETGAMMA` / `SETGAMMA` | ❌ | sin LUT (`gamma_size=0`) |
 | `DRM_IOCTL_MODE_CREATE_LEASE` … | ❌ | *leases* no soportados |
-| `DRM_IOCTL_SYNCOBJ_*` | ❌ | `DRM_CAP_SYNCOBJ=0` (honesto); solo relevante con aceleración |
+| `DRM_IOCTL_SYNCOBJ_*` | 🟡 | implementados (`CREATE`/`DESTROY`/`WAIT`/`RESET`/`SIGNAL`/`TIMELINE_*`/`QUERY`/`TRANSFER`, `drivers/src/scheme/syncobj.rs`) pero solo activos con `nvidia.nouveau_uapi`; sin él EOPNOTSUPP y `DRM_CAP_SYNCOBJ=0` |
 
 ### Propiedades KMS estándar (`drm-kms.rst` → *KMS Properties*)
 
@@ -134,7 +145,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | `DRM_CAP_TIMESTAMP_MONOTONIC` | 1 | |
 | `DRM_CAP_ASYNC_PAGE_FLIP` | 0 | |
 | `DRM_CAP_CURSOR_WIDTH` / `HEIGHT` | 64 | cursor compuesto por el kernel |
-| `DRM_CAP_ADDFB2_MODIFIERS` | 1 | |
+| `DRM_CAP_ADDFB2_MODIFIERS` | 0 | a propósito: con 1 wlroots probaba *modifiers* con *tiling* que el scanout software no entiende |
 | `DRM_CAP_PAGE_FLIP_TARGET` | 0 | |
 | `DRM_CAP_CRTC_IN_VBLANK_EVENT` | 1 | el evento de flip lleva `crtc_id` |
 | `DRM_CAP_SYNCOBJ` / `SYNCOBJ_TIMELINE` | 0 | |
@@ -183,8 +194,13 @@ rechaza).
   clientes legacy que parseen el *busid*.
 - **Gamma/CTM/HDR**: sin LUTs (`gamma_size=0`, sin `GAMMA_LUT`/`CTM`); el
   *scanout* software no las aplica.
-- **Leases y syncobj**: sin soporte; las *caps* correspondientes se anuncian
-  como 0 para que ningún cliente tome esa ruta.
+- **Leases**: sin soporte; la *cap* se anuncia como 0 para que ningún
+  cliente tome esa ruta. **Syncobj**: solo con la UAPI de nouveau (arriba).
+- **Estado por apertura**: handles GEM, framebuffers, eventos, cursor,
+  master y `DRM_CLIENT_CAP_ATOMIC` son un único estado global compartido por
+  todos los fds y procesos (Linux los lleva por `drm_file`). Un segundo
+  cliente en `card0` (una sonda Vulkan, Xwayland) ve y puede tocar los
+  objetos del compositor.
 - **`drm-usage-stats.rst` (fdinfo)**. No se exponen estadísticas de
   uso/memoria/engine por `fdinfo`.
 - **Render / 3D**. No hay aceleración: se usa el render por software de Mesa
@@ -261,7 +277,9 @@ Con `drm.atomic` y la ruta atómica activa se ve además:
 
 La consola de texto del kernel cede a gráficos (`KD_GRAPHICS`) solo en el primer
 *scanout* real, no al hacer `SET_MASTER`: así, si labwc se atasca antes de
-pintar, el terminal sigue usable y sus logs visibles.
+pintar, el terminal sigue usable y sus logs visibles. El modo se aplica al VT
+que el compositor reclamó en su primer present; si el usuario cambia de VT a
+mitad de un frame, el VT de texto conserva su modo y se repinta.
 
 ## Cómo probar (Xorg)
 

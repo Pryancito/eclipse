@@ -449,3 +449,31 @@ Fix: copiar las filas sucias a un scratch bajo el lock y blitear tras
    `i18n.rs`.
 9. Actualizar `README-drm.md`, `README-desktop.md` y `README-xorg.md` al
    código real.
+
+---
+
+## 7. Estado de corrección (rama `claude/eclipse-os-graphics-review-j4ya9s`)
+
+Corregido en esta rama, sobre `9757fe5` (la fusión con el `master` local
+`307f7e0` de la sección 0 queda pendiente de decisión del propietario):
+
+| Hallazgo | Cambio |
+|---|---|
+| F-C1 | `access_ok()` en todos los `io_control` de DRM/fbdev y en las cuatro rutas de arrays de nouveau: tamaño del argumento desde `_IOC_SIZE(cmd)` + comprobación de cada puntero anidado (`ucheck`/`ucheck_n`, `user_slice_ok`). Nuevo `FsError::BadAddress` → EFAULT y `kernel_hal::user::user_range_ok`. |
+| F-C2, F-A2 | El `mmap` de un dumb buffer comparte el `Arc<VmObject>` contiguo (`drm::handle_vmo`); cada framebuffer guarda su propia referencia (`fb_backing`) que `RMFB` libera. `GEM_CLOSE` ya no deja ni mapeos ni fbs sobre memoria devuelta al allocator. Test `gem_close_keeps_a_framebuffer_and_its_memory_alive`. |
+| F-A1 | Dumb buffers mapeados cacheados (WB) de rebote por lo anterior; `/dev/fb0` pide `WriteCombining`. El mapeo de GEM nouveau sigue como estaba (su `phys_addr` puede ser BAR1). |
+| F-A3 | `rmfb` sin evento sintético ni cola `pending_rmfb`. |
+| F-A8 | `shadow_fb`: el rectángulo sucio y las celdas del cursor se copian bajo el lock y se blitean con él suelto; `blit_lock` (`try_lock`, nunca espera) serializa los presentes. |
+| F-M1 | `PAGE_FLIP` valida `flags`/`reserved`, rechaza ASYNC/TARGET, ENOENT en fb desconocido y solo encola evento con `PAGE_FLIP_EVENT`. |
+| F-M2 | Los `FLIP_COMPLETE` llevan `vblank_seq_now()`. |
+| F-M3 | `WAIT_VBLANK` en modo evento respeta `RELATIVE`/`ABSOLUTE`/`NEXTONMISS` y entrega al alcanzar la secuencia. El bloqueante sigue sin esperar (ioctl síncrono). |
+| F-M4 | Cursor > 64×64 → EINVAL; la copia del bitmap ya no se hace con `DRM_STATE` cogido. |
+| F-M5 | `KD_GRAPHICS` se estampa en el VT dueño solo si sigue activo; si hubo cambio de VT a mitad de frame, se repinta la consola (`redraw_active_console`). |
+| F-M11 | `README-drm.md` actualizado (render node, caps, syncobj, vblank, page flip, punteros). |
+| Deuda de CI | Lints `clippy` preexistentes que rompían `deny(warnings)` en `btrfs-rs`, `nvidia.rs`, `nouveau_uapi.rs`, `procfs.rs` y `xhci_hid.rs`; tests de `block_mount` que no compilaban; doctest de `netlink`. |
+
+Pendiente (sin cambiar en esta rama): F-A4/F-A5/F-A6/F-A7 y el resto de
+NVIDIA, F-M6 (activar el filtro del render node requiere probarlo en el
+escritorio software-GL), F-M7 (estado por apertura), F-M8, F-M9, F-M10,
+virtio-gpu, userspace (lunarbg/lunarbar/drmbench), build/sesión y el resto
+de la documentación (`README-desktop.md`, `README-xorg.md`).

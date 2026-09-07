@@ -105,7 +105,7 @@ impl RangeMap {
         let mut cursor = lo;
         while let Some((&rs, &rl)) = self.map.range(cursor..hi).next() {
             let start = rs.max(lo);
-            let start = (start + align - 1) / align * align;
+            let start = start.div_ceil(align) * align;
             if start + len <= (rs + rl).min(hi) {
                 self.take(start, len).ok()?;
                 return Some(start);
@@ -124,7 +124,7 @@ impl RangeMap {
         for (rs, rl) in self.ranges_overlapping(lo, hi) {
             let s = rs.max(lo);
             let e = (rs + rl).min(hi);
-            if e > s && best.map_or(true, |(_, bl)| e - s > bl) {
+            if e > s && best.is_none_or(|(_, bl)| e - s > bl) {
                 best = Some((s, e - s));
             }
         }
@@ -243,7 +243,7 @@ impl FreeSpace {
                 continue;
             }
             if let Some((s, l)) = self.free.largest_in(bg.start, bg.start + bg.len) {
-                if best.map_or(true, |(_, bl)| l > bl) {
+                if best.is_none_or(|(_, bl)| l > bl) {
                     best = Some((s, l));
                 }
             }
