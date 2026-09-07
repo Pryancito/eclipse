@@ -1680,8 +1680,17 @@ impl INodeExt for dyn INode {
 
     fn read_as_vmo(&self) -> Result<Arc<VmObject>> {
         let size = self.metadata()?.size;
-        let pages = (size + 0xfff) >> 12;
-        let vmo = VmObject::new_paged(pages);
+        // Create the VMO with its content size already set to the file size.
+        // `VmObject::set_content_size` zero-fills the range between the old
+        // and the new content size (Zircon semantics), so calling it AFTER
+        // the file has been copied in -- on a VMO whose content size started
+        // at 0 -- wiped the whole image: every ELF the kernel loaded came back
+        // as zeros, hunter rejected it ("unrecognized executable format"), no
+        // shell or init could start and boot sat at the 100% logo forever.
+        // Setting the size at creation is a pure metadata operation on fresh
+        // (already zero) backing, so the bytes written below are kept.
+        let vmo = VmObject::new_paged_with_options(false, false, size)
+            .map_err(|_| rcore_fs::vfs::FsError::DeviceError)?;
         let mut offset = 0;
         // Heap, not stack: a 16 KiB local here sits on the guard-page-less
         // coroutine stack during every execve ELF load (labwc/lunarbar bring-up
@@ -1698,8 +1707,6 @@ impl INodeExt for dyn INode {
                 .map_err(|_| rcore_fs::vfs::FsError::DeviceError)?;
             offset += read_len;
         }
-        vmo.set_content_size(size)
-            .map_err(|_| rcore_fs::vfs::FsError::DeviceError)?;
         Ok(vmo)
     }
 
@@ -1987,6 +1994,35 @@ mod tests {
         assert_eq!(split_path("/file"), ("/", "file"));
         assert_eq!(split_path("dir/file/"), ("dir", "file"));
         assert_eq!(split_path("/"), (".", ""));
+    }
+
+    /// Regression: `read_as_vmo` must hand back the file's bytes. It used to
+    /// call `VmObject::set_content_size` after copying the file in, and that
+    /// now zero-fills the range between the old (0) and the new content size,
+    /// wiping every ELF image the kernel loaded (boot stuck at the logo with
+    /// no shell or init). Spans several pages plus a partial tail page so both
+    /// the whole-page and partial-page zeroing paths would show a regression.
+    #[test]
+    fn read_as_vmo_keeps_file_bytes() {
+        use super::INodeExt;
+        use rcore_fs::vfs::{FileSystem, FileType};
+        use rcore_fs_ramfs::RamFS;
+
+        let fs = RamFS::new();
+        let file = fs
+            .root_inode()
+            .create("elf", FileType::File, 0o644)
+            .unwrap();
+        let data: alloc::vec::Vec<u8> =
+            (0..(3 * 4096 + 123)).map(|i| (i % 251) as u8 + 1).collect();
+        file.write_at(0, &data).unwrap();
+        assert_eq!(file.metadata().unwrap().size, data.len());
+
+        let vmo = file.read_as_vmo().unwrap();
+        assert_eq!(vmo.content_size(), data.len());
+        let mut back = alloc::vec![0u8; data.len()];
+        vmo.read(0, &mut back).unwrap();
+        assert!(back == data, "read_as_vmo returned different bytes");
     }
 }
 
