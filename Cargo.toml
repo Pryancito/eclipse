@@ -22,6 +22,13 @@ exclude = [
     "vendor/preemptive-scheduler",
     "vendor/PreemptiveScheduler",
     "vendor/region-allocator",
+    # Path-patched vendor crates (see the `[patch]` tables below) that carry no
+    # `[workspace]` table of their own. Without listing them here `cargo fmt
+    # --all` (the CI "Check format" step) aborts in `cargo metadata` with
+    # "current package believes it's in a workspace when it's not".
+    "vendor/kernel-sync",
+    "vendor/trapframe",
+    "smoltcp",
 ]
 
 [patch."https://github.com/DeathWish5/PreemptiveScheduler"]

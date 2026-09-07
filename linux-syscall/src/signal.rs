@@ -179,6 +179,12 @@ impl Syscall<'_> {
                     let retcode = (128 + Signal::SIGKILL as i32) as i64;
                     if caller.id() == process.id() {
                         caller.exit(retcode);
+                    } else if process.id() == linux_object::process::INIT_PID {
+                        // Linux ignores SIGKILL/SIGSTOP sent to init from
+                        // another process. Honouring it here let a root shell
+                        // on vt0 (`kill -9 1`) remove the supervisor, after
+                        // which nothing restarts services or shuts down.
+                        warn!("kill(1, SIGKILL) from pid {} ignored", caller.id());
                     } else {
                         process.exit(retcode);
                     }

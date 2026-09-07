@@ -8,15 +8,30 @@ use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 // APIC MMIO addresses are CPU-local, but the driver's mutable configuration
 // must also be private to each CPU.
-static mut LOCAL_APICS: [Option<LocalApic>; 256] = [const { None }; 256];
+//
+// Slots are indexed by the kernel's DENSE logical cpu id (`lock::current_cpu_id`,
+// read from this CPU's GS-based per-CPU block), not by the CPUID initial APIC
+// id the upstream driver used. That lookup ran `CPUID` twice on EVERY
+// interrupt (the EOI path goes through `get()`): a serialising instruction
+// on bare metal and a VM exit per IRQ under a hypervisor. It also aliased
+// CPUs whose x2APIC ids differ in more than the low 8 bits. The logical id
+// is registered for the BSP and for each AP before their Local APIC is
+// initialised (kernel-hal `boot.rs`), so it is valid at every access here.
+static mut LOCAL_APICS: [Option<LocalApic>; lock::MAX_CORE_NUM] =
+    [const { None }; lock::MAX_CORE_NUM];
 static APIC_BASE: AtomicUsize = AtomicUsize::new(0);
 static BSP_ID: AtomicU8 = AtomicU8::new(0);
 
-fn cpu_id() -> u8 {
-    raw_cpuid::CpuId::new()
-        .get_feature_info()
-        .unwrap()
-        .initial_local_apic_id()
+/// Index of this CPU's slot in [`LOCAL_APICS`].
+fn slot_index() -> usize {
+    let id = lock::current_cpu_id() as usize;
+    assert!(
+        id < lock::MAX_CORE_NUM,
+        "logical cpu id {} exceeds MAX_CORE_NUM {}",
+        id,
+        lock::MAX_CORE_NUM
+    );
+    id
 }
 
 /// `IA32_APIC_BASE` bit 10: the Local APIC is in x2APIC mode.
@@ -48,7 +63,7 @@ impl LocalApic {
         unsafe {
             let local_apic = (&raw mut LOCAL_APICS)
                 .cast::<Option<LocalApic>>()
-                .add(cpu_id() as usize);
+                .add(slot_index());
             (*local_apic)
                 .as_mut()
                 .expect("Local APIC is not initialized for this CPU")
@@ -58,7 +73,12 @@ impl LocalApic {
     pub unsafe fn init_bsp(phys_to_virt: Phys2VirtFn) {
         unsafe {
             let base_vaddr = phys_to_virt(xapic_base() as usize);
-            APIC_BASE.store(base_vaddr, Ordering::Release);
+            // Publish `APIC_BASE` (which is what `is_initialized()` reports)
+            // only once the BSP's Local APIC object actually exists below.
+            // Storing it first meant a failed `build()` left the driver
+            // claiming to be initialised with an empty BSP slot, so the very
+            // next interrupt's EOI hit `get()`'s expect -- a panic behind the
+            // "continuing without LAPIC" log.
             let mut inner = match LocalApicBuilder::new()
                 .timer_vector(consts::X86_INT_APIC_TIMER)
                 .error_vector(consts::X86_INT_APIC_ERROR)
@@ -92,8 +112,9 @@ impl LocalApic {
             BSP_ID.store(bsp_id as u8, Ordering::Release);
             let slot = (&raw mut LOCAL_APICS)
                 .cast::<Option<LocalApic>>()
-                .add(cpu_id() as usize);
+                .add(slot_index());
             slot.write(Some(LocalApic { inner }));
+            APIC_BASE.store(base_vaddr, Ordering::Release);
         }
     }
 
@@ -119,7 +140,7 @@ impl LocalApic {
             inner.enable();
             let slot = (&raw mut LOCAL_APICS)
                 .cast::<Option<LocalApic>>()
-                .add(cpu_id() as usize);
+                .add(slot_index());
             slot.write(Some(LocalApic { inner }));
         }
     }

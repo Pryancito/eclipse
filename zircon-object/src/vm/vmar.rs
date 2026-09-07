@@ -2103,6 +2103,14 @@ impl VmMapping {
         let vmo_pages = self.vmo.len() / PAGE_SIZE;
         let start_idx = start_idx.min(vmo_pages);
         let end_idx = end_idx.min(vmo_pages);
+        // A mapping window lying entirely past the VMO's end has nothing
+        // committed to count. Skipping it also keeps this out of
+        // `committed_pages_in_range`'s `start_idx < pages || start_idx == 0`
+        // assertion, which a clamped `start_idx == vmo_pages` would trip —
+        // turning a `/proc/<pid>/status` read into a kernel panic.
+        if start_idx >= end_idx {
+            return;
+        }
         let committed_pages = self.vmo.committed_pages_in_range(start_idx, end_idx);
         let share_count = self.vmo.share_count();
         if share_count == 1 {

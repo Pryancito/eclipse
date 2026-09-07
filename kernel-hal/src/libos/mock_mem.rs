@@ -68,7 +68,13 @@ impl MockMemory {
             },
         );
         if prot.contains(MMUFlags::EXECUTE) {
-            self.mprotect(vaddr, len, prot);
+            // The range was mapped just above, so a "not mapped" answer here
+            // would be a mock bug, not a lazy page.
+            assert!(
+                self.mprotect(vaddr, len, prot),
+                "mprotect(EXECUTE) right after mmap found no mapping at {:#x}",
+                vaddr
+            );
         }
     }
 
@@ -77,13 +83,24 @@ impl MockMemory {
             .unwrap_or_else(|err| panic!("failed to munmap: vaddr={:#x}: {:?}", vaddr, err));
     }
 
-    pub fn mprotect(&self, vaddr: VirtAddr, len: usize, prot: MMUFlags) {
-        unsafe { mman::mprotect(vaddr as _, len, prot.into()) }.unwrap_or_else(|err| {
-            panic!(
+    /// Change the host protection of `[vaddr, vaddr+len)`.
+    ///
+    /// Returns `false` when the host has no mapping there (`ENOMEM`): the
+    /// guest page was reserved but never faulted in, which on bare metal is
+    /// simply a not-present PTE that `GenericPageTable::update` reports as
+    /// `NotMapped` and callers ignore. Panicking on it made `VmMapping::
+    /// protect` over a lazy `mmap(PROT_NONE)` reservation abort under libos
+    /// while the same code is correct on hardware. Any other failure is a
+    /// genuine mock bug and still panics.
+    pub fn mprotect(&self, vaddr: VirtAddr, len: usize, prot: MMUFlags) -> bool {
+        match unsafe { mman::mprotect(vaddr as _, len, prot.into()) } {
+            Ok(()) => true,
+            Err(nix::errno::Errno::ENOMEM) => false,
+            Err(err) => panic!(
                 "failed to mprotect: vaddr={:#x}, prot={:?}: {:?}",
                 vaddr, prot, err
-            )
-        });
+            ),
+        }
     }
 
     pub fn phys_to_virt(&self, paddr: PhysAddr) -> VirtAddr {

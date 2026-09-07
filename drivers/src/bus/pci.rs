@@ -253,10 +253,18 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
             let cap_id = am.read8(ops, loc, cap_ptr);
             if cap_id == PCI_CAP_ID_MSI {
                 let orig_ctrl = am.read32(ops, loc, cap_ptr + PCI_MSI_CTRL_CAP);
-                // The manual Volume 3 Chapter 10.11 Message Signalled Interrupts
-                // 0 is (usually) the apic id of the bsp.
-                //am.write32(ops, loc, cap_ptr + PCI_MSI_ADDR, 0xfee00000 | (0 << 12));
-                am.write32(ops, loc, cap_ptr + PCI_MSI_ADDR, 0xfee00000);
+                // SDM Vol. 3 §10.11 Message Signalled Interrupts: address
+                // bits 19:12 carry the destination APIC id (physical mode).
+                // This used to be hardcoded to 0 with "0 is (usually) the
+                // apic id of the bsp" -- on firmware that gives the BSP any
+                // other id, every MSI (xHCI keyboard/mouse, e1000e RX) went to
+                // a CPU that may never come up and was silently lost. Route
+                // MSIs to the CPU that actually runs the interrupt handlers.
+                #[cfg(target_arch = "x86_64")]
+                let dest = crate::irq::x86::Apic::bsp_apic_id() as u32;
+                #[cfg(not(target_arch = "x86_64"))]
+                let dest = 0u32;
+                am.write32(ops, loc, cap_ptr + PCI_MSI_ADDR, 0xfee0_0000 | (dest << 12));
                 let irq = MSI_IRQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
                 assigned_irq = Some(irq as usize);
                 // we offset all our irq numbers by 32

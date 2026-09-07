@@ -284,7 +284,10 @@ mod tests {
 
     #[test]
     fn parse_kbd_token() {
-        assert_eq!(parse_cmdline("LOG=error:kbd=us:desktop=labwc"), Some(Layout::Us));
+        assert_eq!(
+            parse_cmdline("LOG=error:kbd=us:desktop=labwc"),
+            Some(Layout::Us)
+        );
         assert_eq!(parse_cmdline("kbd=es ROOT=/dev/vda"), Some(Layout::Es));
         assert_eq!(parse_cmdline("desktop=labwc"), None);
         assert_eq!(parse_cmdline("kbd=de"), None);
@@ -292,11 +295,20 @@ mod tests {
 
     #[test]
     fn tables_es_and_us() {
-        assert_eq!(to_char_for(Layout::Es, KEY_SEMICOLON, mods(false, false)), Some('ñ'));
-        assert_eq!(to_char_for(Layout::Us, KEY_SEMICOLON, mods(false, false)), Some(';'));
+        assert_eq!(
+            to_char_for(Layout::Es, KEY_SEMICOLON, mods(false, false)),
+            Some('ñ')
+        );
+        assert_eq!(
+            to_char_for(Layout::Us, KEY_SEMICOLON, mods(false, false)),
+            Some(';')
+        );
         assert_eq!(to_char_for(Layout::Us, KEY_2, mods(true, false)), Some('@'));
         assert_eq!(to_char_for(Layout::Es, KEY_2, mods(true, false)), Some('"'));
-        assert_eq!(to_char_for(Layout::Es, KEY_A, mods(false, false)), Some('a'));
+        assert_eq!(
+            to_char_for(Layout::Es, KEY_A, mods(false, false)),
+            Some('a')
+        );
     }
 
     #[test]

@@ -498,10 +498,17 @@ mod tests {
         assert!(job.inner.lock().killed);
         assert_eq!(proc.status(), Status::Exited(TASK_RETCODE_SYSCALL_KILL));
         assert_eq!(thread.state(), ThreadState::Dying);
-        // killed but not terminated, since `CurrentThread` not dropped.
+        // Killed but not yet torn down, since `CurrentThread` is not dropped:
+        // the thread is still Dying and the job still holds the process.
         assert!(!root_job.signal().contains(Signal::JOB_TERMINATED));
         assert!(job.signal().contains(Signal::JOB_TERMINATED)); // but the lonely job is terminated
-        assert!(!proc.signal().contains(Signal::PROCESS_TERMINATED));
+
+        // PROCESS_TERMINATED is asserted the moment the exit status is
+        // published (`Process::exit`), not when the last thread finishes
+        // dying: Linux `wait4` semantics — a killed process is waitable as a
+        // zombie right away, even while a thread is parked in a blocking
+        // syscall. See the comment in `Process::exit`.
+        assert!(proc.signal().contains(Signal::PROCESS_TERMINATED));
         assert!(!thread.signal().contains(Signal::THREAD_TERMINATED));
 
         // wait for killing...
