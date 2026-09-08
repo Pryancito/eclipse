@@ -146,7 +146,10 @@ pub trait KernelObject: DowncastSync + Debug {
     /// The `callback` is a function of `Fn(Signal) -> bool`.
     /// It returns a bool indicating whether the handle process is over.
     /// If true, the function will never be called again.
-    fn add_signal_callback(&self, callback: SignalHandler);
+    ///
+    /// Returns `false` when the callback could not be registered (list full)
+    /// and was not satisfied immediately — see `KObjectBase::add_signal_callback`.
+    fn add_signal_callback(&self, callback: SignalHandler) -> bool;
     /// Attempt to find a child of the object with given KoID.
     ///
     /// If the object is a *Process*, the *Threads* it contains may be obtained.
@@ -420,17 +423,27 @@ impl KObjectBase {
     /// The `callback` is a function of `Fn(Signal) -> bool`.
     /// It returns a bool indicating whether the handle process is over.
     /// If true, the function will never be called again.
-    pub fn add_signal_callback(&self, callback: SignalHandler) {
+    ///
+    /// Returns `false` when the callback was neither satisfied immediately nor
+    /// registered because the list is full: the caller must not assume it
+    /// will ever be called.
+    pub fn add_signal_callback(&self, callback: SignalHandler) -> bool {
         let mut inner = self.inner.lock();
         // Check the callback immediately, in case that a signal arrives just before the call of
         // `add_signal_callback` (since lock is acquired inside it) and the callback is not triggered
         // in time.
         if !callback(inner.signal) {
             if inner.signal_callbacks.len() >= MAX_SIGNAL_CALLBACKS {
-                return;
+                log::error!(
+                    "signal callback list full ({} entries) on object {}: a waiter would never be woken",
+                    MAX_SIGNAL_CALLBACKS,
+                    self.id
+                );
+                return false;
             }
             inner.signal_callbacks.push(callback);
         }
+        true
     }
 }
 
@@ -459,7 +472,7 @@ impl dyn KernelObject {
                 }
                 *self.waiter.waker.lock() = Some(cx.waker().clone());
                 if !self.waiter.registered.swap(true, Ordering::AcqRel) {
-                    self.object.add_signal_callback(Box::new({
+                    let registered = self.object.add_signal_callback(Box::new({
                         let signal = self.signal;
                         let waiter = Arc::downgrade(&self.waiter);
                         move |s| {
@@ -478,6 +491,14 @@ impl dyn KernelObject {
                             true
                         }
                     }));
+                    if !registered {
+                        // Refused (callback list full): nothing would ever wake
+                        // this future, and `registered == true` would stop it
+                        // from ever trying again. Rearm on the next poll and
+                        // ask for that poll now instead of sleeping forever.
+                        self.waiter.registered.store(false, Ordering::Release);
+                        cx.waker().wake_by_ref();
+                    }
                 }
                 Poll::Pending
             }
@@ -585,8 +606,8 @@ macro_rules! impl_kobject {
             fn signal_change(&self, clear: Signal, set: Signal) {
                 self.base.signal_change(clear, set);
             }
-            fn add_signal_callback(&self, callback: $crate::object::SignalHandler) {
-                self.base.add_signal_callback(callback);
+            fn add_signal_callback(&self, callback: $crate::object::SignalHandler) -> bool {
+                self.base.add_signal_callback(callback)
             }
             $( $fn )*
         }
