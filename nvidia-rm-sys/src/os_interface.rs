@@ -28,8 +28,10 @@ use lock::Mutex;
 // os-interface.h. 4 KiB pages, no huge pages, no confidential computing,
 // no dma-buf/imex support yet.
 // ---------------------------------------------------------------------
+// os-interface.h: `extern NvU32 os_page_size` -- compiled RM code reads it
+// as a 32-bit load, so the definition must be 32-bit too.
 #[no_mangle]
-pub static os_page_size: NvU64 = 4096;
+pub static os_page_size: NvU32 = 4096;
 #[no_mangle]
 pub static os_max_page_size: NvU64 = 4096;
 // NV_PAGE_MASK semantics (kernel-open/nvidia/os-interface.c:53 + usage at
@@ -209,9 +211,12 @@ pub extern "C" fn os_get_current_process_name(buffer: *mut c_char, length: NvU32
     if buffer.is_null() || length == 0 {
         return;
     }
-    let name = b"eclipse-kernel\0";
-    let n = core::cmp::min(name.len(), length as usize);
-    unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), buffer as *mut u8, n) };
+    let name = b"eclipse-kernel";
+    let n = core::cmp::min(name.len(), length as usize - 1);
+    unsafe {
+        core::ptr::copy_nonoverlapping(name.as_ptr(), buffer as *mut u8, n);
+        *(buffer as *mut u8).add(n) = 0;
+    }
 }
 /// Provider of per-thread identity for the RM (`set_thread_id_provider`).
 /// Stored as a raw fn pointer in an atomic so this leaf crate needs no

@@ -20,16 +20,19 @@ use nvidia_rm_sys::hooks::KernelHooks;
 use pci::{Location, PortOps};
 
 /// Decode a handle packed by `os_pci_init_handle` back into a `Location`.
-/// Falls back to bus=device=function=0 for a handle that was never
-/// properly packed (e.g. NV_STATUS default 0) -- reads/writes against
-/// that location are harmless no-ops from Eclipse's point of view since
-/// real hardware only exists at addresses the PCI scan already found.
-fn decode_handle(handle: usize) -> Location {
-    Location {
+/// `None` for a handle that was never packed (a zeroed/NULL handle from an
+/// RM error path): the old fallback decoded it as 00:00.0, the host bridge,
+/// which is a real device -- config-space writes there are not harmless.
+fn decode_handle(handle: usize) -> Option<Location> {
+    const VALID: usize = 0x8000_0000;
+    if handle & VALID == 0 {
+        return None;
+    }
+    Some(Location {
         bus: ((handle >> 16) & 0xFF) as u8,
         device: ((handle >> 8) & 0xFF) as u8,
         function: (handle & 0xFF) as u8,
-    }
+    })
 }
 
 pub struct EclipseNvrmHooks {
@@ -102,7 +105,11 @@ fn udelay(us: u64) {
 
 impl KernelHooks for EclipseNvrmHooks {
     fn pci_config_read(&self, pci_handle: usize, offset: u32, len: u32) -> u32 {
-        let loc = decode_handle(pci_handle);
+        // An absent device reads as all-ones on PCI; say the same for an
+        // invalid handle.
+        let Some(loc) = decode_handle(pci_handle) else {
+            return 0xFFFF_FFFF;
+        };
         let ops = &PortOpsImpl;
         unsafe {
             match len {
@@ -114,7 +121,9 @@ impl KernelHooks for EclipseNvrmHooks {
     }
 
     fn pci_config_write(&self, pci_handle: usize, offset: u32, len: u32, value: u32) {
-        let loc = decode_handle(pci_handle);
+        let Some(loc) = decode_handle(pci_handle) else {
+            return;
+        };
         let ops = &PortOpsImpl;
         unsafe {
             match len {

@@ -7418,7 +7418,10 @@ impl DrmScheme for NvidiaGpu {
             |m| m.gem_handle == handle,
             true,
         );
-        let status = (*self.rm_device_instance.lock())
+        // Copy the instance out and DROP the guard before the FFI call
+        // (the `.map` form kept the IRQ-off spinlock alive across gem_free).
+        let device_instance = *self.rm_device_instance.lock();
+        let status = device_instance
             .map(|device_instance| nvidia_rm_sys::rm_init::gem_free(device_instance, obj.h_memory));
         log::info!(
             "[nouveau-uapi] GEM_CLOSE handle={} h_memory={:#010x} -> gem_free status={:?}",
@@ -8292,7 +8295,7 @@ impl NvidiaGpu {
                     );
                     return Ok(());
                 }
-                let h_memory = {
+                let (h_memory, obj_size) = {
                     let gem = self.nouveau_gem.lock();
                     // Only a holder may bind the object into its VAS: binding
                     // another process's buffer is a GPU read/write of it.
@@ -8302,8 +8305,26 @@ impl NvidiaGpu {
                     else {
                         return Err(nv::ENOENT);
                     };
-                    obj.h_memory
+                    (obj.h_memory, obj.size)
                 };
+                // Linux nouveau_uvmm: the mapped window must lie inside the
+                // object. The RM's own `offset + length > size` guard wraps
+                // on a huge bo_offset and then indexes the memdesc page array
+                // out of bounds (a kernel fault under the RM locks, or PTEs
+                // onto arbitrary host memory).
+                match op.bo_offset.checked_add(op.range) {
+                    Some(end) if op.range != 0 && end <= obj_size => {}
+                    _ => {
+                        crate::klog_warn!(
+                            "[nouveau-uapi] VM_BIND MAP handle={} bo_offset={:#x}+{:#x} exceeds object size {:#x} -> EINVAL",
+                            op.handle,
+                            op.bo_offset,
+                            op.range,
+                            obj_size
+                        );
+                        return Err(nv::EINVAL);
+                    }
+                }
                 // REPLACE semantics, like Linux's gpuvm: a MAP over an
                 // already-mapped range unmaps the old mapping first instead
                 // of failing. On real hardware the missing half of this bit:
@@ -10594,6 +10615,11 @@ impl NvidiaGpu {
                     );
                     return Ok(0);
                 };
+                // Same rule as the client path above: the channel table sits
+                // on EXEC's hot path and is an IRQ-off lock. step16 + step17 +
+                // the selftest (two 500 ms fence polls) run WITHOUT it; the id
+                // is recomputed after re-locking.
+                drop(chan);
                 nvidia_rm_sys::os_interface::capture_begin();
                 let ladder = nvidia_rm_sys::rm_init::step16(device_instance);
                 let _ = nvidia_rm_sys::os_interface::capture_take();
@@ -10657,6 +10683,17 @@ impl NvidiaGpu {
                 if !SELFTEST_DONE.swap(true, Ordering::Relaxed) {
                     self.nouveau_channel_selftest(device_instance, channel.buf_gpu_va);
                 }
+                let mut chan = self.nouveau_channels.lock();
+                if chan.len() >= nv::MAX_CHANNELS {
+                    log::warn!(
+                        "[nouveau-uapi] CHANNEL_ALLOC: {} channels already live",
+                        chan.len()
+                    );
+                    return Err(nv::EBUSY);
+                }
+                let new_id = (0i32..)
+                    .find(|i| !chan.iter().any(|c| c.id == *i))
+                    .unwrap_or(0);
                 chan.push(nv::NouveauChannelState {
                     id: new_id,
                     h_vas: ladder.h_vas,
