@@ -57,12 +57,15 @@ impl Future for DrmEventWait<'_> {
         }
         if this.sub_id.is_none() {
             let waker = cx.waker().clone();
+            // Keep the subscription for the future's whole life (`Drop`
+            // unsubscribes): a one-shot callback that fired while another
+            // consumer drained the single global queue left `sub_id` set but
+            // nothing registered, and the next poll returned Pending forever.
             this.sub_id = this.bus.lock().subscribe(Box::new(move |ev| {
-                if (ev & Event::READABLE).is_empty() {
-                    return false;
+                if !(ev & Event::READABLE).is_empty() {
+                    waker.wake_by_ref();
                 }
-                waker.wake_by_ref();
-                true
+                false
             }));
         }
         match this.dev.poll() {
@@ -113,6 +116,13 @@ impl DrmDev {
             // renderer -- see `drm::handle_vmo`.
             Ok(vmo)
         } else if let Some((phys_addr, size)) = zcore_drivers::scheme::gem_mmap::lookup(handle_id) {
+            // Only a holder may map it: every other nouveau path (GEM_INFO,
+            // VM_BIND, CPU_PREP, GEM_CLOSE) already gates on the holder list,
+            // and mmap was the one way left to reach another process's
+            // buffer by guessing its sequential handle.
+            if !zcore_drivers::scheme::gem_mmap::holds(handle_id, drm::current_pid()) {
+                return Err(FsError::NoPermission);
+            }
             // Driver-private GEM object (currently: nouveau-uAPI GEM_NEW) --
             // same fake-offset space, different table (see
             // drivers/src/scheme/gem_mmap.rs's module doc for why this
@@ -526,6 +536,10 @@ fn ucheck_n<T>(addr: usize, count: usize) -> Result<()> {
 }
 
 fn eclipse_compute_ioctl(data: usize) -> Result<usize> {
+    // Matched on the NR byte alone, so `_IOC_SIZE` (and with it the caller's
+    // `ucheck`) is whatever the client encoded -- 0 passes `user_range_ok`
+    // for any address. Check the real struct size here.
+    ucheck(data, core::mem::size_of::<DrmEclipseCompute>())?;
     let req = unsafe { &mut *(data as *mut DrmEclipseCompute) };
     let driver = drm::get_compute_driver().or_else(drm::get_primary_driver);
     let Some(driver) = driver else {
@@ -1215,8 +1229,12 @@ impl INode for DrmDev {
         // pending report `Again` so a non-blocking reader gets EAGAIN and an
         // epoll/poll waiter re-checks on the next tick.
         match drm::read_event(buf) {
-            Some(n) => Ok(n),
-            None => Err(FsError::Again),
+            drm::EventRead::Data(n) => Ok(n),
+            drm::EventRead::Empty => Err(FsError::Again),
+            // Linux: a buffer that cannot hold one whole event is EINVAL.
+            // `Again` here would spin: READABLE stays latched while the
+            // queue is non-empty, so a blocking read never parks.
+            drm::EventRead::TooSmall => Err(FsError::InvalidParam),
         }
     }
 
@@ -1846,6 +1864,16 @@ impl INode for DrmDev {
             }
             DRM_IOCTL_MODE_MAP_DUMB => {
                 let map = unsafe { &mut *(data as *mut DrmModeMapDumb) };
+                // Linux: ENOENT for a handle this client does not hold; a fake
+                // offset for it only turned into a confusing mmap EINVAL later.
+                if drm::handle_vmo(map.handle).is_none() {
+                    use zcore_drivers::scheme::gem_mmap;
+                    if gem_mmap::lookup(map.handle).is_none()
+                        || !gem_mmap::holds(map.handle, drm::current_pid())
+                    {
+                        return Err(FsError::EntryNotFound);
+                    }
+                }
                 // Return a page-aligned fake offset (`handle << PAGE_SHIFT`). The
                 // subsequent mmap of the dumb buffer passes this back as the file
                 // offset; musl's `mmap()` rejects a non-page-aligned offset with
@@ -1891,6 +1919,7 @@ impl INode for DrmDev {
                     Ok(()) => Ok(0),
                     Err(drm::FlipError::Busy) => Err(FsError::Busy),
                     Err(drm::FlipError::Failed) => Err(FsError::DeviceError),
+                    Err(drm::FlipError::NoSpace) => Err(FsError::NoDeviceSpace),
                 }
             }
             DRM_IOCTL_WAIT_VBLANK => {
@@ -1939,6 +1968,9 @@ impl INode for DrmDev {
                     // before the next synthetic vblank: delivering it instantly
                     // turns a vblank-paced client loop into a busy spin (see
                     // `schedule_flip_event`).
+                    if !drm::event_space_available() {
+                        return Err(FsError::NoDeviceSpace);
+                    }
                     drm::schedule_vblank_event(signal, target);
                 } else {
                     // Blocking form: the ioctl path is synchronous and cannot
@@ -2534,6 +2566,7 @@ impl INode for DrmDev {
                     && res.enum_blob_ptr != 0
                     && (res.count_enum_blobs as usize) >= spec.enums.len()
                 {
+                    ucheck_n::<DrmModePropertyEnum>(res.enum_blob_ptr as usize, spec.enums.len())?;
                     for (i, (val, nm)) in spec.enums.iter().enumerate() {
                         let mut e = DrmModePropertyEnum {
                             value: *val,
@@ -2551,6 +2584,7 @@ impl INode for DrmDev {
                     && res.values_ptr != 0
                     && (res.count_values as usize) >= spec.values.len()
                 {
+                    ucheck_n::<u64>(res.values_ptr as usize, spec.values.len())?;
                     for (i, v) in spec.values.iter().enumerate() {
                         unsafe {
                             *(res.values_ptr as *mut u64).add(i) = *v;
@@ -2613,6 +2647,9 @@ impl INode for DrmDev {
                     core::slice::from_raw_parts(req.data as *const u8, req.length as usize)
                 };
                 req.blob_id = drm::create_blob(src.to_vec(), true);
+                if req.blob_id == 0 {
+                    return Err(FsError::NoDeviceSpace);
+                }
                 log::debug!(
                     "[drm] CREATEPROPBLOB len={} -> blob={}",
                     req.length,
@@ -2712,6 +2749,7 @@ impl INode for DrmDev {
                         drm::AtomicError::NotFound => FsError::EntryNotFound,
                         drm::AtomicError::Device => FsError::DeviceError,
                         drm::AtomicError::Busy => FsError::Busy,
+                        drm::AtomicError::NoSpace => FsError::NoDeviceSpace,
                     })?;
                 Ok(0)
             }

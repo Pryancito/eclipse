@@ -139,6 +139,7 @@ pub fn attach_gpu(
 /// from bindata already compiled into this crate). `device_instance` is
 /// the value returned by a prior successful `attach_gpu`.
 pub fn init_gsp(device_instance: u32, buf: &[u8]) -> Result<(), NV_STATUS> {
+    let _gate = RmGate::lock();
     let status = unsafe {
         eclipse_rm_init_gsp(
             device_instance,
@@ -601,7 +602,7 @@ pub fn hwcursor_init(device_instance: u32, head: u32) -> (NV_STATUS, HwCursorIni
 /// pixels. Serialized through `RmGate`.
 pub fn hwcursor_image(device_instance: u32, argb: &[u32], w: u32, h: u32) -> NV_STATUS {
     if (w as usize) * (h as usize) > argb.len() {
-        return 0x4; // NV_ERR_INVALID_ARGUMENT
+        return NV_ERR_INVALID_ARGUMENT;
     }
     let _gate = RmGate::lock();
     unsafe { eclipse_rm_hwcursor_image(device_instance, argb.as_ptr(), w, h) }
@@ -666,6 +667,7 @@ pub fn step18(device_instance: u32) -> Result<GrLaunch, NV_STATUS> {
         eng_poll_iters: 0,
         push_dwords: 0,
     };
+    let _gate = RmGate::lock();
     let status = unsafe { eclipse_rm_step18(device_instance, &mut out) };
     if status == NV_OK {
         Ok(out)
@@ -724,6 +726,7 @@ pub fn step19(device_instance: u32) -> Result<GrCompute, NV_STATUS> {
         kernel_va: 0,
         qmd_va: 0,
     };
+    let _gate = RmGate::lock();
     let status = unsafe { eclipse_rm_step19(device_instance, &mut out) };
     if status == NV_OK {
         Ok(out)
@@ -789,6 +792,7 @@ pub fn step20(device_instance: u32) -> Result<GrStore, NV_STATUS> {
         qmd_va: 0,
         dest_va: 0,
     };
+    let _gate = RmGate::lock();
     let status = unsafe { eclipse_rm_step20(device_instance, &mut out) };
     if status == NV_OK {
         Ok(out)
@@ -862,6 +866,7 @@ pub fn step21(device_instance: u32) -> Result<GrThreads, NV_STATUS> {
         fault_addr_lo: 0,
         fault_type: 0,
     };
+    let _gate = RmGate::lock();
     let status = unsafe { eclipse_rm_step21(device_instance, &mut out) };
     if status == NV_OK {
         Ok(out)
@@ -907,6 +912,7 @@ pub fn step22(device_instance: u32) -> Result<GrThreads, NV_STATUS> {
         fault_addr_lo: 0,
         fault_type: 0,
     };
+    let _gate = RmGate::lock();
     let status = unsafe { eclipse_rm_step22(device_instance, &mut out) };
     if status == NV_OK {
         Ok(out)
@@ -944,6 +950,7 @@ pub fn step23(device_instance: u32) -> Result<GrThreads, NV_STATUS> {
         fault_addr_lo: 0,
         fault_type: 0,
     };
+    let _gate = RmGate::lock();
     let status = unsafe { eclipse_rm_step23(device_instance, &mut out) };
     if status == NV_OK {
         Ok(out)
@@ -1001,6 +1008,7 @@ pub fn bench(device_instance: u32) -> Result<GrBench, NV_STATUS> {
         kernel_va: 0,
         qmd_va: 0,
     };
+    let _gate = RmGate::lock();
     let status = unsafe { eclipse_rm_bench(device_instance, &mut out) };
     if status == NV_OK {
         Ok(out)
@@ -1070,6 +1078,7 @@ pub fn edid(device_instance: u32) -> Result<GrEdid, NV_STATUS> {
         conn_type_display_id: [0u32; 16],
         conn_type: [0u32; 16],
     };
+    let _gate = RmGate::lock();
     let status = unsafe { eclipse_rm_edid(device_instance, &mut out) };
     if status == NV_OK {
         Ok(out)
@@ -1132,6 +1141,11 @@ pub fn hdmi_audio(
     force: bool,
 ) -> Result<HdmiAudioOut, NV_STATUS> {
     let mut out = HdmiAudioOut::default();
+    // Called from the HDA driver at every stream start, possibly while an
+    // NVK ioctl is inside the RM on another CPU: without the gate the two
+    // threadStateInit calls collide (os_get_current_thread is constant) and
+    // rmapiLockAcquire returns NV_ERR_INVALID_LOCK_STATE (0x2f).
+    let _gate = RmGate::lock();
     let status = unsafe {
         eclipse_rm_hdmi_audio(
             device_instance,
@@ -1160,6 +1174,7 @@ pub fn intr_table(device_instance: u32) -> Result<alloc::boxed::Box<IntrTable>, 
             vector_non_stall: 0,
         }; 128],
     });
+    let _gate = RmGate::lock();
     let status = unsafe { eclipse_rm_intr_table(device_instance, &mut *out) };
     if status == NV_OK {
         Ok(out)
@@ -1191,6 +1206,7 @@ pub fn state_init(device_instance: u32) -> Result<StateInitResult, NV_STATUS> {
         init_status: 0xFFFF_FFFF,
         load_status: 0xFFFF_FFFF,
     };
+    let _gate = RmGate::lock();
     let status = unsafe { eclipse_rm_state_init(device_instance, &mut out) };
     if status == NV_OK {
         Ok(out)
@@ -1321,6 +1337,7 @@ pub fn step10(device_instance: u32) -> Result<Step10Result, NV_STATUS> {
         first_mismatch_idx: 0,
         first_mismatch_val: 0,
     };
+    let _gate = RmGate::lock();
     let status = unsafe { eclipse_rm_step10(device_instance, &mut out) };
     if status == NV_OK {
         Ok(out)

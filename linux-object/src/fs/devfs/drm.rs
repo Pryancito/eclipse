@@ -240,8 +240,14 @@ struct DrmBlob {
     /// Whether userspace created it (`CREATEPROPBLOB`). Kernel-created blobs
     /// (current mode, EDID) refuse `DESTROYPROPBLOB` with EPERM like Linux.
     user_created: bool,
+    /// Creating pid for user blobs (0 for kernel blobs): Linux frees a
+    /// drm_file's blobs when it closes; here they go at process exit.
+    owner: u64,
     data: Vec<u8>,
 }
+
+/// Per-process cap on user-created property blobs (each up to 64 KiB).
+const MAX_USER_BLOBS_PER_PID: usize = 256;
 
 /// Last-committed atomic state of the synthetic pipeline, echoed back through
 /// `OBJ_GETPROPERTIES` so an atomic compositor's state readback matches what
@@ -662,6 +668,12 @@ pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<
     // reject ADDFB whose dimensions overflow or exceed the buffer.
     let size = (pitch as usize).checked_mul(height as usize)?;
     if size == 0 || size > buf_size {
+        return None;
+    }
+    // Linux framebuffer_check: a row must hold `width` 32-bit pixels. The
+    // CE present copies `width*4` bytes per row at stride `pitch`, so a
+    // narrower pitch read past the buffer's end into adjacent memory.
+    if width == 0 || (width as usize).checked_mul(4)? > pitch as usize {
         return None;
     }
 
@@ -1788,6 +1800,8 @@ pub enum FlipError {
     Busy,
     /// Present/scanout failed.
     Failed,
+    /// The card fd's event queue is full (Linux ENOMEM at event reserve).
+    NoSpace,
 }
 
 /// `want_event`: the request carried `DRM_MODE_PAGE_FLIP_EVENT`. Without it
@@ -1824,6 +1838,11 @@ pub fn page_flip(
             // FLIP_EVENT_PENDING still set) risks a double-delivery.
             return Err(FlipError::Busy);
         }
+    }
+    // Reserve event space BEFORE presenting, like drm_event_reserve_init:
+    // failing after the flip would show the frame and then lose its event.
+    if want_event && !event_space_available() {
+        return Err(FlipError::NoSpace);
     }
     let flipped = present_now(fb_id, crtc_id);
     if !flipped {
@@ -2002,6 +2021,25 @@ fn clear_stale_flip_pending() {
 /// opaque token echoed back in the event's `user_data`.
 pub fn schedule_vblank_event(signal: u64, due_seq: u32) {
     arm_coalesced_drm_timer(PendingDrmTimer::Vblank { signal, due_seq });
+}
+
+/// Upper bound on readable-but-unread events (Linux caps per-file event
+/// space at 4 KiB, i.e. ~128 of these 32-byte events, and answers ENOMEM).
+const MAX_QUEUED_EVENTS: usize = 128;
+/// Upper bound on not-yet-due timer jobs: each `WAIT_VBLANK` with an event
+/// request pushes one, and `deliver_pending_drm_timer` re-walks them all from
+/// timer-IRQ context on every synthetic vblank.
+const MAX_PENDING_TIMERS: usize = 64;
+
+/// Whether a new event request (page-flip completion, vblank event) may be
+/// queued. Without a bound, a client that requests events and never reads
+/// the card fd grows kernel heap without limit and turns the timer path into
+/// O(n) work per tick.
+pub fn event_space_available() -> bool {
+    if DRM_STATE.lock().events.len() >= MAX_QUEUED_EVENTS {
+        return false;
+    }
+    PENDING_DRM_TIMERS.lock().len() < MAX_PENDING_TIMERS
 }
 
 /// Drop any not-yet-posted flip/vblank completions (timer queue + readable
@@ -2280,16 +2318,25 @@ pub fn vblank_seq_now() -> u32 {
     (now_ns / VBLANK_PERIOD_NS) as u32
 }
 
-/// Pop one pending DRM event into `buf`, returning the number of bytes copied,
-/// or `None` if there are no events queued.
-pub fn read_event(buf: &mut [u8]) -> Option<usize> {
+/// Outcome of [`read_event`].
+pub enum EventRead {
+    /// One whole event was copied; the value is its length in bytes.
+    Data(usize),
+    /// Nothing queued.
+    Empty,
+    /// The caller's buffer cannot hold one whole event (Linux: EINVAL). The
+    /// event stays queued.
+    TooSmall,
+}
+
+/// Pop one pending DRM event into `buf`.
+pub fn read_event(buf: &mut [u8]) -> EventRead {
     let mut state = DRM_STATE.lock();
-    let ev = state.events.front()?;
+    let Some(ev) = state.events.front() else {
+        return EventRead::Empty;
+    };
     if buf.len() < ev.len() {
-        // Caller's buffer is too small for a whole event; libdrm always reads
-        // with a large buffer, so just report "nothing yet" rather than
-        // delivering a truncated, unparsable event.
-        return None;
+        return EventRead::TooSmall;
     }
     let n = ev.len();
     buf[..n].copy_from_slice(&ev[..n]);
@@ -2297,7 +2344,7 @@ pub fn read_event(buf: &mut [u8]) -> Option<usize> {
     if state.events.is_empty() {
         state.eventbus.lock().clear(Event::READABLE);
     }
-    Some(n)
+    EventRead::Data(n)
 }
 
 /// Whether any DRM events are queued for reading.
@@ -2313,13 +2360,27 @@ pub fn get_eventbus() -> Arc<Mutex<EventBus>> {
 /// Create a KMS property blob (`DRM_IOCTL_MODE_CREATEPROPBLOB`) and return its
 /// id. `user_created` distinguishes client blobs (destroyable) from
 /// kernel-owned ones (current mode), mirroring Linux's ownership rule.
+/// Returns the new blob id, or 0 when a user blob would exceed the
+/// per-process cap (0 is never a valid blob id).
 pub fn create_blob(data: Vec<u8>, user_created: bool) -> u32 {
+    let owner = if user_created { current_pid() } else { 0 };
     let mut state = DRM_STATE.lock();
+    if user_created
+        && state
+            .blobs
+            .iter()
+            .filter(|b| b.user_created && b.owner == owner)
+            .count()
+            >= MAX_USER_BLOBS_PER_PID
+    {
+        return 0;
+    }
     let id = state.next_blob_id;
     state.next_blob_id += 1;
     state.blobs.push(DrmBlob {
         id,
         user_created,
+        owner,
         data,
     });
     id
@@ -2411,6 +2472,8 @@ pub enum AtomicError {
     Device,
     /// A previous flip-complete event is still outstanding.
     Busy,
+    /// The card fd's event queue is full (Linux ENOMEM at event reserve).
+    NoSpace,
 }
 
 /// Validate and (unless `test_only`) apply an atomic update, queueing one
@@ -2431,6 +2494,10 @@ pub fn atomic_commit(
     let (cur, _) = atomic_snapshot();
 
     // --- Check phase (no state touched) ---
+    if want_event && !test_only && !event_space_available() {
+        log::error!("[drm] ATOMIC reject: event queue full (client never reads the card fd)");
+        return Err(AtomicError::NoSpace);
+    }
     // [swapchain-diag] Every rejection below is logged at error! so it is
     // visible at LOG=error (the default cmdline): a wlroots "Swapchain for
     // output failed test" is exactly one of these Err returns on a TEST_ONLY
@@ -2584,6 +2651,7 @@ pub fn atomic_commit(
                     state.blobs.push(DrmBlob {
                         id,
                         user_created: false,
+                        owner: 0,
                         data,
                     });
                     state.atomic.mode_blob_id = id;
@@ -2694,6 +2762,10 @@ pub fn release_process(pid: u64) -> usize {
     cancel_events_for_exit(pid);
     let (doomed, driver) = {
         let mut state = DRM_STATE.lock();
+        // User property blobs die with their creator (Linux frees them at
+        // drm_file close); a respawning compositor used to leak one MODE_ID
+        // blob per crash.
+        state.blobs.retain(|b| !(b.user_created && b.owner == pid));
         if !state.handles.iter().any(|(_, _, owner)| *owner == pid) {
             return 0;
         }
