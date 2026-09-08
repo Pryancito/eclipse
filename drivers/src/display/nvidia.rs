@@ -466,31 +466,21 @@ const RM_INIT_POISONED: u32 = 0xDEAD_1417;
 
 fn rm_core_init_once() -> u32 {
     use core::sync::atomic::Ordering;
-    if let Some(s) = *RM_CORE_INIT_STATUS.lock() {
+    let mut status = RM_CORE_INIT_STATUS.lock();
+    if let Some(s) = *status {
         return s;
     }
-    // Serialize on the atomic, NOT on the status lock: `lock::Mutex` is an
-    // IRQ-off spinlock, and holding it across `init_core()` would (a) make a
-    // bring-up fault inside RM un-containable (the oops handler halts when a
-    // lock is held) and (b) leave every later caller spinning forever with
-    // interrupts off, which is exactly the "poisoned attempt" this function
-    // promises to report instead. A concurrent second caller now sees
-    // POISONED while the first attempt is still running -- acceptable for a
-    // one-shot bring-up that is only ever driven from /proc reads.
     if RM_CORE_INIT_ATTEMPTED.swap(true, Ordering::SeqCst) {
-        if let Some(s) = *RM_CORE_INIT_STATUS.lock() {
-            return s;
-        }
         log::error!(
             "[NVIDIA] rm_core_init_once: a previous RM init attempt this boot died \
-             mid-initialization (or is still running); refusing to re-enter over \
-             its half-initialized global state. Reboot to retry (status={:#x}).",
+             mid-initialization; refusing to re-enter over its half-initialized \
+             global state. Reboot to retry (status={:#x}).",
             RM_INIT_POISONED
         );
         return RM_INIT_POISONED;
     }
     let s = nvidia_rm_sys::rm_init::init_core();
-    *RM_CORE_INIT_STATUS.lock() = Some(s);
+    *status = Some(s);
     s
 }
 
@@ -611,10 +601,6 @@ pub struct NvidiaGpu {
     pitch_override: Option<u32>,
     _bar0: usize,
     _bar1: usize,
-    /// Byte offset of the GOP scan-out surface inside BAR1 (0 when it
-    /// starts at the aperture base). `info.fb_size` stays the full BAR1
-    /// length (NVK reads it as `VRAM_BAR_SIZE`); `fb()` subtracts this.
-    gop_fb_offset: usize,
     /// Physical base of BAR1 (the VRAM aperture). Used to decide whether this GPU
     /// backs the boot framebuffer (i.e. drives the console) and must therefore be
     /// spared from the risky copy-engine bring-up writes.
@@ -674,7 +660,7 @@ pub struct NvidiaGpu {
     /// via `set_gsp_firmware` once the rootfs is mounted -- this driver runs
     /// during early PCI enumeration, well before any filesystem exists, so
     /// it cannot read the file itself (see DrmScheme::set_gsp_firmware).
-    gsp_firmware: Mutex<Option<Arc<Vec<u8>>>>,
+    gsp_firmware: Mutex<Option<Vec<u8>>>,
     /// Human-readable outcome of the boot-time firmware load (set even when it
     /// failed), so `bringup_step6` can explain a missing blob. See
     /// `DrmScheme::set_gsp_firmware_status`.
@@ -682,10 +668,6 @@ pub struct NvidiaGpu {
     /// Result of the real kgspInitRm attempt, cached the same way as
     /// `rm_attach_result`.
     gsp_init_result: Mutex<Option<String>>,
-    /// Latched by the task that runs `kgspInitRm`; never cleared. A second
-    /// reader arriving while the boot is in flight (or after the booting task
-    /// died mid-way) must not re-run the non-re-runnable RM boot sequence.
-    gsp_boot_in_progress: AtomicBool,
     /// Cached step-9 result (gpuState PreInit/Init/Load). One-shot per boot:
     /// the RM state machine is not re-runnable, so the first outcome is
     /// what /proc/gpustep9 keeps reporting.
@@ -806,13 +788,7 @@ impl NvidiaVramAllocator {
     }
 
     fn free(&mut self, phys_addr: u64, size: usize) {
-        // Sysmem-backed handles (dumb buffers, imports) were never carved
-        // out of this aperture; `saturating_sub` would fold them onto
-        // offset 0 and release VRAM pages owned by someone else.
-        if phys_addr < self.base_phys {
-            return;
-        }
-        let offset = phys_addr - self.base_phys;
+        let offset = phys_addr.saturating_sub(self.base_phys);
         if offset >= self.total_size {
             return;
         }
@@ -887,16 +863,12 @@ fn sibling_bar1_holds_boot_fb(bus: u8, device: u8) -> bool {
         device,
         function: 0,
     };
-    // BAR1 (the 64-bit VRAM aperture) lives at config offset 0x14/0x18;
-    // `read_bar_addr` combines the pair itself when handed the LOW dword.
-    // Passing 0x18 decoded only the high half (0 for a sub-4 GiB BAR1), so
-    // this fallback never matched and the console GPU's HDA codec was skipped.
     let bar1 = unsafe {
         crate::bus::pci::read_bar_addr(
             &crate::bus::pci::PortOpsImpl,
             crate::bus::pci::PCI_ACCESS,
             loc,
-            0x14,
+            0x18,
         )
     };
     if bar1 == 0 {
@@ -1006,8 +978,7 @@ impl NvidiaGpu {
         let mut w = default_width;
         let mut h = default_height;
         let mut pitch_override = None;
-        let mut final_fb_vaddr = fb_vaddr;
-        let mut gop_fb_offset = 0usize;
+        let final_fb_vaddr = fb_vaddr;
 
         // Check if this GPU matches the boot framebuffer (UEFI GOP)
         if let Some(boot_info) = *BOOT_FB_INFO.lock() {
@@ -1031,18 +1002,6 @@ impl NvidiaGpu {
                 w = boot_info.width;
                 h = boot_info.height;
                 pitch_override = Some(boot_info.pitch);
-                // The GOP surface may sit at BAR1+N: the CE present path
-                // already honours that (`fb_phys - bar1`), but the CPU
-                // paths (`fill_rect`/`blit_rect`/`present_kms_fb`) wrote to
-                // offset 0 and were invisible on such firmware.
-                if boot_info.phys > bar1_phys && boot_info.phys - bar1_phys < fb_size as u64 {
-                    gop_fb_offset = (boot_info.phys - bar1_phys) as usize;
-                    final_fb_vaddr = fb_vaddr + gop_fb_offset;
-                    log::info!(
-                        "[NVIDIA] boot framebuffer at BAR1+{:#x}; CPU scan-out base adjusted",
-                        gop_fb_offset
-                    );
-                }
 
                 // If the boot phys is within this aperture, we might need to adjust fb_vaddr
                 // But usually fb_vaddr is the start of the BAR. GOP might be offset.
@@ -1057,9 +1016,7 @@ impl NvidiaGpu {
             }
         }
 
-        // Deferred: a BAR0 read here is exactly the early-init MMIO the note
-        // above forbids. `NvidiaGpu::temperature()` reads it lazily.
-        let temperature: Option<i32> = None;
+        let temperature = read_temperature(bar0);
 
         log::warn!(
             "[NVIDIA] Detected {} ({:?}), VRAM: {} MB, Temp: {:?}°C, Res: {}x{}",
@@ -1092,7 +1049,6 @@ impl NvidiaGpu {
             pitch_override,
             _bar0: bar0,
             _bar1: final_fb_vaddr,
-            gop_fb_offset,
             bar1_phys,
             bar0_phys,
             bar0_len,
@@ -1101,7 +1057,10 @@ impl NvidiaGpu {
             pci_domain,
             pci_bus,
             pci_device,
-            vram_allocator: Mutex::new(Some(NvidiaVramAllocator::new(bar1_phys, fb_size as u64))),
+            vram_allocator: Mutex::new(Some(NvidiaVramAllocator::new(
+                fb_vaddr as u64,
+                fb_size as u64,
+            ))),
             bringup: Mutex::new(None),
             rm_attach_result: Mutex::new(None),
             rm_device_instance: Mutex::new(None),
@@ -1110,7 +1069,6 @@ impl NvidiaGpu {
             gsp_firmware: Mutex::new(None),
             gsp_fw_status: Mutex::new(None),
             gsp_init_result: Mutex::new(None),
-            gsp_boot_in_progress: AtomicBool::new(false),
             state_init_result: Mutex::new(None),
             step10_result: Mutex::new(None),
             imported_handles: Mutex::new(Vec::new()),
@@ -2033,27 +1991,8 @@ impl NvidiaGpu {
         if let Some(cached) = cached {
             cached
         } else if let Some(device_instance) = device_instance {
-            // Clone the Arc and release the lock: `lock::Mutex` is an IRQ-off
-            // spinlock, and the boot below runs for seconds (kgspInitRm, SBR
-            // recovery, retries). Holding it would mask the MSI vector the
-            // boot registers on this CPU, halt the machine on any contained
-            // fault inside RM (oops refuses containment with a lock held),
-            // and spin `set_gsp_firmware` callers IRQ-off for the duration.
-            let fw_bytes = self.gsp_firmware.lock().clone();
-            if let Some(fw_bytes) = fw_bytes {
-                // The cache check above raced with a concurrent reader (two
-                // /proc readers, or auto bring-up plus a /proc read): only
-                // one task may ever run kgspInitRm on a GPU. Latch first,
-                // then re-check the cache for the loser.
-                if self.gsp_boot_in_progress.swap(true, Ordering::SeqCst) {
-                    if let Some(cached) = self.gsp_init_result.lock().clone() {
-                        return cached;
-                    }
-                    return alloc::format!(
-                        "[{}]  --- Real GSP-RM boot: already in progress on another task (or that task died mid-boot); re-read once it completes ---\n",
-                        tag
-                    );
-                }
+            let fw = self.gsp_firmware.lock();
+            if let Some(fw_bytes) = fw.as_ref() {
                 // Snapshot the pre-boot hardware state first (diffable
                 // primary-vs-secondary; survives a wedge via the live echo).
                 let preboot = self.dump_preboot_state(tag);
@@ -2226,7 +2165,7 @@ impl NvidiaGpu {
                 let mut recovery_log = String::new();
                 let mut attempt = 1u32;
                 let computed = loop {
-                    match nvidia_rm_sys::rm_init::init_gsp(device_instance, &fw_bytes) {
+                    match nvidia_rm_sys::rm_init::init_gsp(device_instance, fw_bytes) {
                         Ok(()) => break String::from("kgspInitRm OK"),
                         Err(status) => {
                             let msg = alloc::format!(
@@ -2293,6 +2232,7 @@ impl NvidiaGpu {
                 }
                 nvidia_rm_sys::os_boundary::seq_trace_disarm();
                 let captured = nvidia_rm_sys::os_interface::capture_take();
+                drop(fw);
                 let mut block = String::new();
                 block.push_str(&preboot);
                 block.push_str(&mps_log);
@@ -3472,10 +3412,7 @@ impl DisplayScheme for NvidiaGpu {
     }
     fn fb(&self) -> FrameBuffer<'_> {
         unsafe {
-            FrameBuffer::from_raw_parts_mut(
-                self.info.fb_base_vaddr as *mut u8,
-                self.info.fb_size.saturating_sub(self.gop_fb_offset),
-            )
+            FrameBuffer::from_raw_parts_mut(self.info.fb_base_vaddr as *mut u8, self.info.fb_size)
         }
     }
 
@@ -3672,7 +3609,7 @@ impl DrmScheme for NvidiaGpu {
     /// for the real `kgspInitRm` call made lazily on the first
     /// `/proc/gpudbg` read, same trigger as the RM attach itself.
     fn set_gsp_firmware(&self, bytes: Vec<u8>) {
-        *self.gsp_firmware.lock() = Some(Arc::new(bytes));
+        *self.gsp_firmware.lock() = Some(bytes);
     }
 
     fn set_gsp_firmware_status(&self, status: String) {
@@ -4539,8 +4476,7 @@ impl DrmScheme for NvidiaGpu {
         // vs. the (working) secondary GPU after the console-freeze experiment
         // exonerated CPU pixel writes. Idempotent: plain property/field
         // writes, safe to repeat on a cached re-read.
-        let rm_device_instance = *self.rm_device_instance.lock();
-        if let Some(device_instance) = rm_device_instance {
+        if let Some(device_instance) = *self.rm_device_instance.lock() {
             let (console_size, at_bar1_base) = match *BOOT_FB_INFO.lock() {
                 Some(fb) => (
                     fb.pitch as u64 * fb.height as u64,
@@ -7418,10 +7354,7 @@ impl DrmScheme for NvidiaGpu {
             |m| m.gem_handle == handle,
             true,
         );
-        // Copy the instance out and DROP the guard before the FFI call
-        // (the `.map` form kept the IRQ-off spinlock alive across gem_free).
-        let device_instance = *self.rm_device_instance.lock();
-        let status = device_instance
+        let status = (*self.rm_device_instance.lock())
             .map(|device_instance| nvidia_rm_sys::rm_init::gem_free(device_instance, obj.h_memory));
         log::info!(
             "[nouveau-uapi] GEM_CLOSE handle={} h_memory={:#010x} -> gem_free status={:?}",
@@ -8295,7 +8228,7 @@ impl NvidiaGpu {
                     );
                     return Ok(());
                 }
-                let (h_memory, obj_size) = {
+                let h_memory = {
                     let gem = self.nouveau_gem.lock();
                     // Only a holder may bind the object into its VAS: binding
                     // another process's buffer is a GPU read/write of it.
@@ -8305,26 +8238,8 @@ impl NvidiaGpu {
                     else {
                         return Err(nv::ENOENT);
                     };
-                    (obj.h_memory, obj.size)
+                    obj.h_memory
                 };
-                // Linux nouveau_uvmm: the mapped window must lie inside the
-                // object. The RM's own `offset + length > size` guard wraps
-                // on a huge bo_offset and then indexes the memdesc page array
-                // out of bounds (a kernel fault under the RM locks, or PTEs
-                // onto arbitrary host memory).
-                match op.bo_offset.checked_add(op.range) {
-                    Some(end) if op.range != 0 && end <= obj_size => {}
-                    _ => {
-                        crate::klog_warn!(
-                            "[nouveau-uapi] VM_BIND MAP handle={} bo_offset={:#x}+{:#x} exceeds object size {:#x} -> EINVAL",
-                            op.handle,
-                            op.bo_offset,
-                            op.range,
-                            obj_size
-                        );
-                        return Err(nv::EINVAL);
-                    }
-                }
                 // REPLACE semantics, like Linux's gpuvm: a MAP over an
                 // already-mapped range unmaps the old mapping first instead
                 // of failing. On real hardware the missing half of this bit:
@@ -10249,8 +10164,7 @@ impl NvidiaGpu {
                 // possible, and an unscoped removal would free another live
                 // client's class object (see `class_object_remove`).
                 if let Some(h_object) = nv::class_object_remove(hdr.object, owner_pid) {
-                    let rm_device_instance = *self.rm_device_instance.lock();
-                    if let Some(device_instance) = rm_device_instance {
+                    if let Some(device_instance) = *self.rm_device_instance.lock() {
                         let status = nvidia_rm_sys::rm_init::class_free(device_instance, h_object);
                         if status != 0 {
                             crate::klog_warn!(
@@ -10615,11 +10529,6 @@ impl NvidiaGpu {
                     );
                     return Ok(0);
                 };
-                // Same rule as the client path above: the channel table sits
-                // on EXEC's hot path and is an IRQ-off lock. step16 + step17 +
-                // the selftest (two 500 ms fence polls) run WITHOUT it; the id
-                // is recomputed after re-locking.
-                drop(chan);
                 nvidia_rm_sys::os_interface::capture_begin();
                 let ladder = nvidia_rm_sys::rm_init::step16(device_instance);
                 let _ = nvidia_rm_sys::os_interface::capture_take();
@@ -10683,17 +10592,6 @@ impl NvidiaGpu {
                 if !SELFTEST_DONE.swap(true, Ordering::Relaxed) {
                     self.nouveau_channel_selftest(device_instance, channel.buf_gpu_va);
                 }
-                let mut chan = self.nouveau_channels.lock();
-                if chan.len() >= nv::MAX_CHANNELS {
-                    log::warn!(
-                        "[nouveau-uapi] CHANNEL_ALLOC: {} channels already live",
-                        chan.len()
-                    );
-                    return Err(nv::EBUSY);
-                }
-                let new_id = (0i32..)
-                    .find(|i| !chan.iter().any(|c| c.id == *i))
-                    .unwrap_or(0);
                 chan.push(nv::NouveauChannelState {
                     id: new_id,
                     h_vas: ladder.h_vas,

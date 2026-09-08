@@ -60,19 +60,6 @@ fn deliver(ev: &Arc<dyn FileLike>) {
 /// `wait_available` uses the last-submitted point (in-flight EXEC fences).
 pub fn register(handle: u32, point: u64, ev: Arc<dyn FileLike>, wait_available: bool) {
     let target = point.max(1);
-    // Register FIRST, then check: a signal landing between the check and the
-    // push (the hook only walks registered waiters) was a lost wakeup -- the
-    // compositor parked in poll() on an eventfd nobody would ever write.
-    {
-        let mut waiters = WAITERS.lock();
-        waiters.push(Waiter {
-            handle,
-            point: target,
-            wait_available,
-            ev: ev.clone(),
-        });
-        WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
-    }
     let cur = if wait_available {
         zcore_drivers::scheme::syncobj::query_submitted(handle)
     } else {
@@ -80,24 +67,19 @@ pub fn register(handle: u32, point: u64, ev: Arc<dyn FileLike>, wait_available: 
     };
     if let Some(cur) = cur {
         if cur >= target {
-            // Already reached: deliver ourselves, unless the hook raced us to
-            // it (then the entry is gone and it delivered).
-            let ours = {
-                let mut waiters = WAITERS.lock();
-                let pos = waiters.iter().position(|w| {
-                    w.handle == handle && w.point == target && Arc::ptr_eq(&w.ev, &ev)
-                });
-                if let Some(pos) = pos {
-                    waiters.swap_remove(pos);
-                }
-                WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
-                pos.is_some()
-            };
-            if ours {
-                deliver(&ev);
-            }
+            deliver(&ev);
             return;
         }
+    }
+    {
+        let mut waiters = WAITERS.lock();
+        waiters.push(Waiter {
+            handle,
+            point: target,
+            wait_available,
+            ev,
+        });
+        WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
     }
     arm_poller();
 }
@@ -172,10 +154,6 @@ fn on_syncobj_signaled(_handle: u32, _point: u64) {
     for ev in fire {
         deliver(&ev);
     }
-    // A hardware fence attached AFTER registration (nothing was pending when
-    // `register` armed) is only noticed by the poller; re-arm it now that the
-    // syncobj layer has told us something changed on this object.
-    arm_poller();
 }
 
 /// Wire [`on_syncobj_signaled`] into the syncobj layer's point-advance upcall.
