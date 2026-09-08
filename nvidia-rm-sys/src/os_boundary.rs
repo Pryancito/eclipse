@@ -1438,12 +1438,15 @@ pub extern "C" fn osGetAcpiRsdpFromUefi(pRsdpAddr: *mut NvU32) -> NV_STATUS {
 
 #[no_mangle]
 pub extern "C" fn osGetCpuCount() -> NvU32 {
-    0
+    // Linux os.c delegates to os_get_cpu_count; a 0 here made
+    // pSys->cpuInfo.numLogicalCpus 0.
+    crate::os_interface::os_get_cpu_count()
 }
 
 #[no_mangle]
 pub extern "C" fn osGetCpuFrequency() -> NvU32 {
-    0
+    // MHz (os_init.c: Hz -> MHz), from the calibrated TSC.
+    (crate::os_interface::os_get_cpu_frequency() / 1_000_000) as NvU32
 }
 
 #[no_mangle]
@@ -1526,7 +1529,9 @@ pub extern "C" fn osGetGridCspSupport() -> NvU32 {
 
 #[no_mangle]
 pub extern "C" fn osGetMaxUserVa() -> NvU64 {
-    0
+    // 0 made osGetCpuVaAddrShift compute 65 and shipped maxUserVa=0 to
+    // GSP-RM in SET_GUEST_SYSTEM_INFO; Linux simply delegates.
+    crate::os_interface::os_get_max_user_va()
 }
 
 #[no_mangle]
@@ -1588,7 +1593,7 @@ pub extern "C" fn osGetPageSize() -> NvU64 {
     // kmemsysInitFlushSysmemBuffer_HAL's first sysmem memdescCreate hit on
     // real hardware (kern_mem_sys.c:98). Must match the os_page_size global
     // (os_interface.rs) RM also reads directly.
-    crate::os_interface::os_page_size
+    crate::os_interface::os_page_size as NvU64
 }
 
 #[no_mangle]
@@ -1793,7 +1798,9 @@ pub extern "C" fn osIovaUnmap(pIovaMapping: *mut c_void) {
 
 #[no_mangle]
 pub extern "C" fn osIsAdministrator() -> NvBool {
-    NV_FALSE
+    // Everything here runs in kernel context (os_is_administrator agrees);
+    // NV_FALSE denied the RM's own register-access / profiling checks.
+    crate::os_interface::os_is_administrator()
 }
 
 #[no_mangle]
@@ -1821,7 +1828,7 @@ pub extern "C" fn osIsISR() -> NvBool {
 
 #[no_mangle]
 pub extern "C" fn osIsInitNs() -> NvBool {
-    NV_FALSE
+    crate::os_interface::os_is_init_ns()
 }
 
 #[no_mangle]

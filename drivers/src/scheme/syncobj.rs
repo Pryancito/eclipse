@@ -387,12 +387,67 @@ pub fn create(signaled: bool) -> u32 {
 
 /// Destroys a syncobj. Returns `false` if `handle` is unknown.
 pub fn destroy(handle: u32) -> bool {
-    let mut table = TABLE.lock();
-    let len_before = table.objects.len();
-    table.objects.retain(|o| o.handle != handle);
-    table.pending.retain(|f| f.handle != handle);
-    PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
-    table.objects.len() != len_before
+    let (removed, advanced) = {
+        let mut guard = TABLE.lock();
+        let table = &mut *guard;
+        let len_before = table.objects.len();
+        // A `sync_file` import links `dst` to `(handle, target)`; in Linux the
+        // fence is refcounted independently of the syncobj, so destroying the
+        // source (the standard temp-semaphore lifecycle) never strands the
+        // importer. Resolve every dependent now: already reached -> signal
+        // it; still in flight -> re-home the covering hardware fence on it.
+        let mut advanced = Vec::new();
+        if let Some(src_eff) = effective_point(&table.objects, handle, LINK_DEPTH) {
+            let dependents: Vec<(u32, u64)> = table
+                .objects
+                .iter()
+                .filter_map(|o| match o.linked {
+                    Some((src, target)) if src == handle && o.handle != handle => {
+                        Some((o.handle, target))
+                    }
+                    _ => None,
+                })
+                .collect();
+            for (dst, target) in dependents {
+                let hw = table
+                    .pending
+                    .iter()
+                    .filter(|f| f.handle == handle && f.point >= target)
+                    .min_by_key(|f| f.point)
+                    .copied();
+                let Some(obj) = table.objects.iter_mut().find(|o| o.handle == dst) else {
+                    continue;
+                };
+                obj.linked = None;
+                if src_eff >= target {
+                    if obj.point < 1 {
+                        obj.point = 1;
+                        advanced.push((dst, 1));
+                    }
+                } else if let Some(f) = hw {
+                    if obj.point < 1 {
+                        table.pending.push(PendingFence {
+                            handle: dst,
+                            point: 1,
+                            fence_va: f.fence_va,
+                            payload: f.payload,
+                            ctx_idx: f.ctx_idx,
+                            submitted_us: f.submitted_us,
+                        });
+                    }
+                }
+            }
+        }
+        table.objects.retain(|o| o.handle != handle);
+        table.pending.retain(|f| f.handle != handle);
+        PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
+        (table.objects.len() != len_before, advanced)
+    };
+    // Lock released: wake the waiters of any importer we just signaled.
+    for (dst, p) in advanced {
+        notify_signal(dst, p);
+    }
+    removed
 }
 
 /// Binary signal (point = 1). Returns `false` if `handle` is unknown.
