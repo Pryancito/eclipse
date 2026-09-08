@@ -423,8 +423,17 @@ impl ProcessExt for Process {
                     }
                     if let Some(reaper) = reaper_for(&parent) {
                         if let Some(reaper_lp) = reaper.try_linux() {
-                            reaper.signal_set(Signal::SIGCHLD);
+                            // Record FIRST, then wake. Waking first let a
+                            // blocked `waitpid(-1)` run ahead of the record:
+                            // it found the child `Exited` in `children`,
+                            // reaped it, and this record then re-inserted the
+                            // pid into `reaped_children` as a tombstone — the
+                            // next wait returned the pid a second time, ECHILD
+                            // was never reported, and once the pid was reused
+                            // `waitpid(newpid)` answered immediately with the
+                            // OLD exit status while the new child still ran.
                             reaper_lp.record_child_exit(child.id(), exit_code, child_cpu(&child));
+                            reaper.signal_set(Signal::SIGCHLD);
                         }
                     }
                 }
@@ -493,20 +502,31 @@ pub async fn wait_child(
             let inner = proc.linux().inner.lock();
             inner.children.get(&pid).cloned().ok_or(LxError::ECHILD)?
         };
+        // `Exited` is published at the very start of `Process::exit`, before
+        // the fork-time termination callback (run inside the PROCESS_TERMINATED
+        // signal_set) has moved the child into `reaped_children`. Reaping
+        // straight out of `children` in that window raced the callback, which
+        // then re-inserted the pid as a tombstone (see the callback). So reap
+        // from `children` only once PROCESS_TERMINATED is latched — by then
+        // the callback has run, and normally already removed the child, so
+        // this is the fallback for a callback that could not record. An
+        // `Exited` child without the signal is an exit in flight: wait for it.
+        let child_obj: Arc<dyn KernelObject> = child.clone();
         if let Status::Exited(code) = child.status() {
-            let cpu = child_cpu(&child);
-            if reap {
-                let mut inner = proc.linux().inner.lock();
-                inner.children.remove(&pid);
-                inner.reaped_children.remove(&pid);
-                inner.add_children_cpu(cpu);
+            if child_obj.signal().contains(Signal::PROCESS_TERMINATED) {
+                let cpu = child_cpu(&child);
+                if reap {
+                    let mut inner = proc.linux().inner.lock();
+                    inner.children.remove(&pid);
+                    inner.reaped_children.remove(&pid);
+                    inner.add_children_cpu(cpu);
+                }
+                return Ok(((code as i32) << 8, cpu));
             }
-            return Ok(((code as i32) << 8, cpu));
         }
         if nonblock {
             return Err(LxError::EAGAIN);
         }
-        let child_obj: Arc<dyn KernelObject> = child.clone();
         child_obj.wait_signal(Signal::PROCESS_TERMINATED).await;
         check_signals()?;
 
@@ -547,14 +567,27 @@ pub async fn wait_child_any(
             }
             return Ok((pid, (code as i32) << 8, cpu));
         }
+        // Reap out of `children` only once PROCESS_TERMINATED is latched (see
+        // wait_child): an `Exited` status precedes the termination callback
+        // that records the child, and reaping ahead of it left a tombstone in
+        // `reaped_children`. The callback has normally already moved the child
+        // out of `children` by then, so this is a fallback for one that could
+        // not record; an `Exited` child without the signal is an exit in
+        // flight, and the callback's SIGCHLD will wake us for it.
+        let terminated = |child: &Arc<Process>| {
+            let obj: Arc<dyn KernelObject> = child.clone();
+            obj.signal().contains(Signal::PROCESS_TERMINATED)
+        };
         let mut exited_pid = None;
         trace!("wait_child_any: checking {} children", inner.children.len());
         for (&pid, child) in inner.children.iter() {
             let status = child.status();
             trace!("  child {}: status={:?}", pid, status);
             if let Status::Exited(code) = status {
-                exited_pid = Some((pid, code));
-                break;
+                if terminated(child) {
+                    exited_pid = Some((pid, code));
+                    break;
+                }
             }
         }
         if let Some((pid, code)) = exited_pid {
@@ -572,14 +605,14 @@ pub async fn wait_child_any(
         }
         let proc_obj: Arc<dyn KernelObject> = proc.clone();
         proc_obj.signal_clear(Signal::SIGCHLD);
-        // Check again after clear to avoid race
-        let mut found_exited = false;
-        for child in inner.children.values() {
-            if let Status::Exited(_) = child.status() {
-                found_exited = true;
-                break;
-            }
-        }
+        // Check again after the clear, still under the lock: a child recorded
+        // (and SIGCHLD set) between our first look and the clear would
+        // otherwise be missed until the next exit.
+        let found_exited = !inner.reaped_children.is_empty()
+            || inner
+                .children
+                .values()
+                .any(|child| matches!(child.status(), Status::Exited(_)) && terminated(child));
         drop(inner);
         if found_exited {
             trace!("wait_child_any: found exited child after clear, continuing");
