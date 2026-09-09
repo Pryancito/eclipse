@@ -37,6 +37,7 @@
 #include <sys/timerfd.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <sys/utsname.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -438,6 +439,40 @@ static void test_jit(void) {
   munmap(p, reserve);
 }
 
+// ── The glibc startup gate ──────────────────────────────────────────────────
+// Not every Firefox is built against musl. A distribution .deb is glibc, and
+// glibc parses `uname().release` in `_dl_discover_osversion` before main()
+// runs, calling `__libc_fatal("FATAL: kernel too old")` when the leading
+// version triple is below the minimum it was configured with -- 3.2.0 for
+// Debian and Ubuntu builds. A kernel that reports its own product version
+// there ("0.5.3") fails that test, and NO glibc-linked program can start at
+// all, which is invisible from inside a musl userspace.
+static void test_uname(void) {
+  section("kernel version as glibc reads it");
+  struct utsname u;
+  if (uname(&u) != 0) {
+    fail("uname", "glibc parses release before main() runs", errno);
+    return;
+  }
+  ok("uname", "glibc parses release before main() runs");
+  printf("         sysname=%s release=%s machine=%s\n", u.sysname, u.release, u.machine);
+
+  // Exactly glibc's parse: up to three dot-separated numbers, stopping at the
+  // first character that is neither.
+  int v[3] = { 0, 0, 0 };
+  const char *p = u.release;
+  for (int i = 0; i < 3; i++) {
+    if (*p < '0' || *p > '9') break;
+    while (*p >= '0' && *p <= '9') v[i] = v[i] * 10 + (*p++ - '0');
+    if (*p == '.') p++; else break;
+  }
+  long code = (long)v[0] * 65536 + v[1] * 256 + v[2];
+  check(code >= 3 * 65536 + 2 * 256, "release parses to at least 3.2.0",
+        "below this, glibc aborts every program with \"FATAL: kernel too old\"", 0);
+  if (code < 3 * 65536 + 2 * 256)
+    printf("         \"%s\" parses as %d.%d.%d\n", u.release, v[0], v[1], v[2]);
+}
+
 // ── /proc ───────────────────────────────────────────────────────────────────
 static void test_proc(void) {
   section("/proc entries Firefox reads");
@@ -505,6 +540,7 @@ int main(int argc, char **argv) {
   test_process_launch(self);
   test_runtime();
   test_jit();
+  test_uname();
   test_proc();
 
   printf("\n%d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);

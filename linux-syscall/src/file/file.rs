@@ -1895,6 +1895,52 @@ impl Syscall<'_> {
         Ok(0)
     }
 
+    /// `utimes(2)`: set a file's access and modification times from a pair of
+    /// `struct timeval` (microseconds), the older sibling of `utimensat`.
+    ///
+    /// Not a legacy curiosity: glibc's `utimes` is this syscall (musl's is
+    /// `utimensat`), so on a glibc userspace every archive extractor and
+    /// installer that restores timestamps calls it -- Firefox's font cache
+    /// unpacking hit it and logged "Unable to revert mtime" for every
+    /// directory it touched.
+    pub fn sys_utimes(
+        &mut self,
+        pathname: UserInPtr<u8>,
+        times: UserInPtr<[linux_object::time::TimeVal; 2]>,
+    ) -> SysResult {
+        info!("utimes: pathname={:?}, times={:?}", pathname, times);
+        let path = pathname.as_c_str()?;
+        let inode = self.linux_process().lookup_inode(path)?;
+        let mut metadata = inode.metadata()?;
+        // A null `times` means "now", exactly as in utimensat.
+        let (atime, mtime) = if times.is_null() {
+            let now = TimeSpec::now();
+            (now, now)
+        } else {
+            let t = times.read()?;
+            (
+                TimeSpec {
+                    sec: t[0].sec,
+                    nsec: t[0].usec * 1000,
+                },
+                TimeSpec {
+                    sec: t[1].sec,
+                    nsec: t[1].usec * 1000,
+                },
+            )
+        };
+        metadata.atime = rcore_fs::vfs::Timespec {
+            sec: atime.sec as i64,
+            nsec: atime.nsec as i32,
+        };
+        metadata.mtime = rcore_fs::vfs::Timespec {
+            sec: mtime.sec as i64,
+            nsec: mtime.nsec as i32,
+        };
+        inode.set_metadata(&metadata)?;
+        Ok(0)
+    }
+
     /// change file timestamps with nanosecond precision
     pub fn sys_utimensat(
         &mut self,

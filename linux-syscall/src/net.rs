@@ -311,24 +311,30 @@ impl Syscall<'_> {
                 };
 
                 let file_like = self.linux_process().get_file_like(sockfd.into())?;
-                let (recv_buf_ca, send_buf_ca) = file_like
-                    .clone()
-                    .as_socket()?
-                    .get_buffer_capacity()
-                    .unwrap();
-                debug!(
-                    "sys_getsockopt recv and send buffer capacity: {}, {}. optval: {:?}, optlen: {:?}",
-                    recv_buf_ca,
-                    send_buf_ca,
-                    optval.check(),
-                    optlen.check()
-                );
+                // Only the buffer-size options need the capacities, and only
+                // TCP and UDP report any: the trait default is `None`, so
+                // asking unconditionally and unwrapping panicked the KERNEL on
+                // a plain `getsockopt(SO_SNDBUF)` against a Unix socket --
+                // which is what Firefox does to its own IPC channels.
+                // Linux answers with net.core.{w,r}mem_default for a socket
+                // with no queue of its own, so answer that.
+                const MEM_DEFAULT: usize = 212_992;
+                let buffer_capacity = || {
+                    file_like
+                        .clone()
+                        .as_socket()
+                        .ok()
+                        .and_then(|s| s.get_buffer_capacity())
+                        .unwrap_or((MEM_DEFAULT, MEM_DEFAULT))
+                };
 
                 match optname {
                     SolOptname::SNDBUF => {
+                        let (_, send_buf_ca) = buffer_capacity();
                         write_sockopt_out(optval, optlen, &(send_buf_ca as u32).to_ne_bytes())
                     }
                     SolOptname::RCVBUF => {
+                        let (recv_buf_ca, _) = buffer_capacity();
                         write_sockopt_out(optval, optlen, &(recv_buf_ca as u32).to_ne_bytes())
                     }
                     SolOptname::REUSEADDR => write_sockopt_out(optval, optlen, &1u32.to_ne_bytes()),
