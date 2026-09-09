@@ -1,7 +1,6 @@
 use alloc::sync::Arc;
 use core::ptr::NonNull;
 
-#[cfg(feature = "graphic")]
 use alloc::format;
 
 use acpi::platform::address::AddressSpace;
@@ -248,6 +247,27 @@ fn boot_progress(p: u32) {
 
 pub(super) fn init() -> DeviceResult {
     boot_progress(81);
+    // First thing, before the APs and the tick derive anything from it: the
+    // firmware tables are reachable now, so the provisional TSC frequency can
+    // be measured against the ACPI PM timer.
+    // Both to the boot log (serial, this early) and to the dmesg ring.
+    let verdict = match super::cpu::recalibrate_tsc_hz() {
+        super::cpu::TscRecalibration::Corrected { was, now } => format!(
+            "[tsc] provisional {} Hz was wrong: ACPI PM timer measures {} Hz ({}.{:02}x); corrected",
+            was,
+            now,
+            was * 100 / now.max(1) / 100,
+            was * 100 / now.max(1) % 100
+        ),
+        super::cpu::TscRecalibration::Confirmed { hz, measured } => {
+            format!("[tsc] {} Hz confirmed by ACPI PM timer ({} Hz)", hz, measured)
+        }
+        super::cpu::TscRecalibration::Unavailable => {
+            alloc::string::String::from("[tsc] no ACPI PM timer to check the TSC frequency against")
+        }
+    };
+    log::warn!("{}", verdict);
+    crate::klog_warn!("{}", verdict);
     zcore_drivers::init();
     boot_progress(82);
     Apic::init_local_apic_bsp(crate::mem::phys_to_virt);
