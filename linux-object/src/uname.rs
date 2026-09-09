@@ -16,17 +16,29 @@ pub const OS_TYPE: &str = "Eclipse";
 
 /// `utsname.release` / `/proc/sys/kernel/osrelease` / `uname -r`.
 ///
-/// The format must be Linux's `VERSION.PATCHLEVEL.SUBLEVEL-EXTRAVERSION`:
-/// glibc aborts at startup ("FATAL: kernel too old") when the leading triple
-/// parses below its build-time minimum, Go's runtime refuses pre-2.6.23
-/// kernels, and countless scripts do `uname -r | cut -d. -f1`. The previous
-/// value here was the crate version ("0.1.0-zcore"), which fails all of those
-/// checks; 5.15 matches the LTS kernel whose ABI subset this tree implements.
+/// The format must be Linux's `VERSION.PATCHLEVEL.SUBLEVEL-EXTRAVERSION`, and
+/// the leading triple is not decoration. glibc parses it at startup in
+/// `_dl_discover_osversion` and calls `__libc_fatal("FATAL: kernel too old")`
+/// when it falls below the minimum it was configured with -- 3.2.0 for
+/// Debian/Ubuntu builds. Go's runtime refuses pre-2.6.23 kernels, and
+/// countless scripts do `uname -r | cut -d. -f1`.
+///
+/// This carried Eclipse's own product version ("0.5.3") for a while, which
+/// parses as 0.5.3 and so is below every glibc minimum there has ever been:
+/// no glibc-linked program could start at all, which is a large part of why
+/// this tree only ever ran musl userspace. Eclipse's version belongs in the
+/// EXTRAVERSION, exactly where a distribution puts its own ("6.6.0-18-generic"),
+/// and [`ECLIPSE_VERSION`] keeps it available on its own.
+///
+/// 6.6 is the LTS whose ABI subset this tree implements: above every glibc
+/// minimum in circulation, and consistent with the interfaces already here
+/// that postdate 5.15 (`MFD_NOEXEC_SEAL` is 6.3).
+pub const ECLIPSE_VERSION: &str = "0.5.3";
 #[cfg(target_os = "none")]
-pub const OS_RELEASE: &str = "0.5.3";
+pub const OS_RELEASE: &str = "6.6.0-eclipse-0.5.3";
 /// LibOS builds keep their distinguishing suffix, still in parseable form.
 #[cfg(not(target_os = "none"))]
-pub const OS_RELEASE: &str = "0.5.3-libos";
+pub const OS_RELEASE: &str = "6.6.0-eclipse-0.5.3-libos";
 
 /// Maximum length of a host or domain name, per POSIX HOST_NAME_MAX on Linux
 /// (`sethostname(2)` answers EINVAL above this).
