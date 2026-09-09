@@ -1,103 +1,90 @@
-# Making `WAIT_VBLANK` actually block (async `ioctl`)
+# `WAIT_VBLANK` blocks (resolved) — and the sync-`ioctl` constraint behind it
 
-Handoff for the refactor that lets a DRM `WAIT_VBLANK` wait. Written after the
-investigation that found it, so the next session starts from the constraints
-rather than rediscovering them.
+This started as a handoff for a refactor. The bug is fixed; what remains
+worth reading is *how*, because the constraint that shaped the fix is still
+there for the next ioctl that needs to wait.
 
-## The bug, in one measurement
+## The bug
 
-`drmbench` (see `tools/drmbench/`) on Eclipse, 1920x1080@60:
-
-```
-pageflip_per_sec       = 59.43 flips/s      pageflip_latency_us = 16826   <- correct, 60 Hz
-vblank_interval_ms     = 0.07 ms                                          <- should be 16.67
-```
-
-Same boot, same CRTC. The page-flip path paces itself correctly against the
-synthetic vblank clock; the blocking `WAIT_VBLANK` returns ~200x too early. A
-client that paces frames with `drmWaitVBlank` therefore spins instead of
-sleeping, burning a core. Reproduced across two independent boots.
-
-## Where it is
-
-`linux-object/src/fs/devfs/drm_scheme.rs`, `DRM_IOCTL_WAIT_VBLANK` arm of
-`io_control`. The event branch (`_DRM_VBLANK_EVENT`) is **correct** — it defers
-delivery via `drm::schedule_vblank_event` to the next synthetic vblank. Only the
-**blocking** branch is wrong: it fills the reply and returns immediately.
-
-## Why it was left that way — read before "fixing" it
-
-The comment in that arm records the history: a previous implementation *did*
-block, as a **busy 16.7 ms spin**, and that caused
-
-> severe CPU starvation on a cooperative async runtime — making the system
-> appear frozen
-
-**Do not reintroduce a spin.** Blocking without yielding starves every other
-coroutine on that CPU. That regression has already been paid for once.
-
-## Why it is not a one-liner
-
-Sleeping cooperatively means `kernel_hal::thread::sleep_until`, which is
-`async`. The whole ioctl chain is synchronous:
+`DRM_IOCTL_WAIT_VBLANK`'s blocking form returned immediately instead of
+waiting. Measured with `eclipse-bench --only gfx` on Eclipse under QEMU:
 
 ```
-sys_ioctl  ->  FileLike::ioctl        (linux-object/src/fs/mod.rs:410,  fn)
-           ->  INode::io_control      (drm_scheme.rs:962,               fn)
+vblank interval            0.04 ms      <-- should be 16.7 at 60 Hz
+vblank jitter (stddev)     0.02 ms
 ```
 
-There is no synchronous yield in this kernel, so a sync frame simply cannot give
-the CPU back. The blocking semantics require an async path.
+The event form (`_DRM_VBLANK_EVENT`) was always correct — it defers through
+the timer queue — and page flips were already paced properly at ~60 Hz. Only
+the blocking branch was wrong, so a client pacing frames with `drmWaitVBlank`
+(X's Present, SDL, older toolkits) spun at full CPU instead of sleeping.
 
-## Options
+## Why it could not just sleep
 
-**A. Make the ioctl path async** (recommended). `async fn ioctl` on `FileLike`,
-propagated through `sys_ioctl`. Fixes the general problem — any ioctl that must
-block gets the ability — not just vblank.
+`INode::io_control` is synchronous, and there is no synchronous yield in this
+kernel — a sync frame cannot give the CPU back. An earlier implementation
+"blocked" by busy-spinning the 16.7 ms, which starved every other coroutine on
+that CPU and made the machine look frozen. **Do not reintroduce a spin.**
 
-Cost: `FileLike` is implemented by every file type, so this touches a lot of
-call sites even though most bodies are unchanged (`async fn` with no `.await`).
-The risk is breadth, not depth.
+## What was done
 
-**B. A cooperative sleep callable from sync context.** Narrower, but it has to
-be designed so it cannot reintroduce the starvation above — which is exactly the
-hard part, and why A is preferred.
+Not the broad refactor this document used to recommend (`async fn ioctl` on
+`FileLike`, propagated through every implementor). The wait was put where an
+async context already exists:
 
-## Suggested order for A
+- `sys_ioctl` became `async fn` — the syscall dispatcher was already async, so
+  this is one `.await` at the call site and no change to `FileLike` at all.
+- Before dispatching, it calls `DrmDev::wait_vblank_sleep`, which resolves the
+  target sequence exactly as the sync arm does and sleeps to that vblank's
+  deadline. The synthetic counter is a pure function of the clock
+  (`drm::vblank_deadline_for_seq`), so there is an exact deadline to sleep to
+  and no polling at all.
+- The sync arm then reports the sequence that has genuinely completed, because
+  the sleep preceded it. Its logic did not change.
+- The interception is gated on the fd really being a `DrmDev`, not on the
+  request number alone: sleeping is a side effect and must not be inflictable
+  on an unrelated fd handed that number.
 
-1. Add `async fn ioctl` alongside the existing sync one (default impl forwards
-   to the sync version) so nothing breaks while it lands.
-2. Move `sys_ioctl` to call the async variant.
-3. Override it only in `DrmDevice`, where the blocking `WAIT_VBLANK` branch
-   awaits `sleep_until(next_vblank_deadline())`.
-4. Verify with `drmbench`: `vblank_interval_ms` should read ~16.7 with a small
-   jitter stddev, and `pageflip_per_sec` must stay at ~60 (proving the flip path
-   was not disturbed).
-5. Watch for regressions in the paths that call ioctl from odd contexts (tty,
-   sockets, epoll) — an `.await` newly introduced where a lock is held is the
-   failure mode to look for.
+Two details that turned out to matter:
 
-## Verifying
+- **Sleep in a bounded loop, not once.** A wake-up landing a nanosecond before
+  the lattice boundary leaves the counter one short; the sync arm then reports
+  `target - 1`, the caller's next relative request resolves to a vblank that has
+  just passed and returns instantly, and the frame after it waits a full period.
+  That alternation shows up as jitter — measured 4.69 ms stddev with a single
+  sleep, 1.40 ms with the re-check loop.
+- **Cap the wait at 3 s**, matching Linux's `DRM_WAIT_ON(..., 3 * HZ, ...)`, so
+  an absolute target far in the future cannot park a thread forever.
 
-```sh
-cc -O2 -static -o drmbench tools/drmbench/drmbench.c   # runs on Eclipse and Linux
-drmbench /dev/dri/card0 3
+## Result
+
+```
+                        before      after
+vblank interval         0.04 ms     16.5 ms     (60 Hz = 16.7)
+vblank jitter (stddev)  0.02 ms      1.40 ms
+flip period / vblank    n/a          1.00 x     <-- paced to the refresh
+flip rate               61.4 /s      60.8 /s    <-- flip path undisturbed
 ```
 
-Before: `vblank_interval_ms=0.07`. After: ~16.7 at 60 Hz.
+The residual 1.4 ms of jitter is measured under TCG, where timer wake-ups are
+imprecise; it has not been re-measured under KVM.
 
-## Priority note
+## If another ioctl needs to block
 
-The event path already works, and modern compositors (wlroots/labwc) pace with
-page-flip events, not the blocking ioctl. This is a legacy-path correctness bug,
-worth fixing properly rather than quickly.
+The general refactor is still available and still the cleaner answer if a
+second one appears: `async fn ioctl` on `FileLike` with a default forwarding to
+the sync version, then override per device. It was not done for one ioctl
+because the risk is breadth — `FileLike` is implemented by every file type.
 
-## Other findings from the same benchmark run
+## The other findings from the same run, settled
 
-* `dumb_cycle_per_sec = 54` (~18 ms to create+map+destroy an 8 MiB buffer).
-  Suspect synchronous zeroing on `CREATE_DUMB`, but part of that cost may be
-  emulation of touching 8 MiB — **measure under KVM before calling it a bug**.
-* `SET_CLIENT_CAP(ATOMIC)` returning `EOPNOTSUPP` is **not** a bug: the atomic
-  uAPI is opt-in behind the `drm.atomic` cmdline flag, deliberately mirroring a
-  Linux driver without `DRIVER_ATOMIC`. With `drm.atomic` the path measures
-  6420 commits/s at 156 us/commit.
+* `CREATE+DESTROY_DUMB` was suspected of doing synchronous zeroing. It is, and
+  that is correct (Linux zeroes dumb buffers too). The measurement now says so:
+  1.246 ms for an 800x600x4 buffer, against 1.875 MiB at the measured
+  1471 MiB/s framebuffer write speed = 1.27 ms. It is the zeroing, and it is
+  the same 54x-the-ioctl-floor that Linux pays (57x).
+* Every other row in the section costs the same as Linux or less, relative to
+  this machine's own ioctl floor — so `WAIT_VBLANK` was the one real defect.
+* `SET_CLIENT_CAP(ATOMIC)` returning `EOPNOTSUPP` is not a bug: the atomic uAPI
+  is opt-in behind the `drm.atomic` cmdline flag, deliberately mirroring a Linux
+  driver without `DRIVER_ATOMIC`.

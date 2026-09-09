@@ -1319,7 +1319,7 @@ impl Syscall<'_> {
     }
 
     /// Set parameters of device files.
-    pub fn sys_ioctl(
+    pub async fn sys_ioctl(
         &self,
         fd: FileDesc,
         request: usize,
@@ -1350,6 +1350,28 @@ impl Syscall<'_> {
                 return Err(e);
             }
         };
+        // The one ioctl in the tree that has to BLOCK. `INode::io_control` is
+        // synchronous, so a wait cannot happen inside it -- and the previous
+        // attempt to wait anyway (a 16.7 ms busy spin) starved every other
+        // coroutine on the CPU and looked like the machine freezing. Here we
+        // are in the async syscall dispatcher, so the sleep is a real one; the
+        // ioctl arm below then reports the sequence that genuinely completed.
+        //
+        // Gated on the fd actually being a DRM device, not on the request
+        // number alone: sleeping is a side effect, and it must not be possible
+        // to inflict it on an unrelated fd that happens to be handed this
+        // number.
+        if request as u32 == linux_object::fs::devfs::drm_scheme::WAIT_VBLANK_IOCTL {
+            if let Some(file) = file_like.downcast_ref::<File>() {
+                if let Some(dev) = file
+                    .inode()
+                    .as_any_ref()
+                    .downcast_ref::<linux_object::fs::devfs::DrmDev>()
+                {
+                    dev.wait_vblank_sleep(arg1).await;
+                }
+            }
+        }
         // File ioctls served at the VFS layer, como en Linux (fs/ioctl.c
         // `do_vfs_ioctl`): they apply to EVERY fd kind — pipes, sockets,
         // files, device nodes — so the per-inode handlers never need to know

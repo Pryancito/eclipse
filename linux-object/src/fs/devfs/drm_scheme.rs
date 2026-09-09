@@ -9,6 +9,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll as TaskPoll};
+use core::time::Duration;
 
 use crate::sync::{Event, EventBus};
 use lock::Mutex;
@@ -98,6 +99,72 @@ impl DrmDev {
         }
     }
 
+    /// Sleep until the vblank a blocking `DRM_IOCTL_WAIT_VBLANK` asked for.
+    ///
+    /// Called from `sys_ioctl` (async) *before* the request reaches
+    /// `io_control` (sync), which then reports the sequence that has by then
+    /// genuinely completed. Splitting it this way keeps the whole `FileLike`
+    /// stack synchronous while still giving this one ioctl real blocking
+    /// semantics.
+    ///
+    /// It must not spin: an earlier implementation busy-waited the 16.7 ms and
+    /// starved every other coroutine on the CPU, which looked like the machine
+    /// freezing. The synthetic vblank counter is a pure function of the clock,
+    /// so there is an exact deadline to sleep to and no need to poll at all.
+    ///
+    /// Requests that asked for an event instead of blocking are left alone —
+    /// that path already defers correctly through the timer queue.
+    pub async fn wait_vblank_sleep(&self, data: usize) {
+        // Linux caps this wait at 3 seconds (`DRM_WAIT_ON(..., 3 * HZ, ...)`).
+        // Match it: a target far in the future must not park a thread forever,
+        // and the sync arm reporting the current sequence after the cap is the
+        // same answer Linux's timeout path gives.
+        const MAX_WAIT: Duration = Duration::from_secs(3);
+
+        if ucheck(data, core::mem::size_of::<DrmWaitVblank>()).is_err() {
+            return; // io_control will reject it with EFAULT in a moment
+        }
+        let req = unsafe { *(data as *const DrmWaitVblank) };
+        if req.typ & _DRM_VBLANK_EVENT != 0 {
+            return; // event form: delivered by the timer queue, never blocks
+        }
+        const _DRM_VBLANK_RELATIVE: u32 = 0x1;
+        const _DRM_VBLANK_NEXTONMISS: u32 = 0x1000_0000;
+        // Resolve the target exactly as the sync arm does, or the two would
+        // disagree about which vblank was asked for.
+        let now_seq = drm::vblank_seq_now();
+        let mut target = if req.typ & _DRM_VBLANK_RELATIVE != 0 {
+            now_seq.wrapping_add(req.sequence)
+        } else {
+            req.sequence
+        };
+        if (target.wrapping_sub(now_seq) as i32) <= 0 {
+            if req.typ & _DRM_VBLANK_NEXTONMISS == 0 {
+                return; // already reached: nothing to wait for
+            }
+            target = now_seq.wrapping_add(1);
+        }
+        let cap = kernel_hal::timer::timer_now() + MAX_WAIT;
+        // Re-check after sleeping instead of trusting one deadline. A wake-up
+        // that lands even a nanosecond before the lattice boundary leaves the
+        // counter one short, and the sync arm would then report `target - 1`;
+        // the caller's next relative request resolves to a vblank that has
+        // just passed, returns instantly, and the frame after it waits a full
+        // period. That alternation is not a slow kernel -- it is measured as
+        // jitter, and it is exactly what a client pacing on this ioctl would
+        // see as stutter. The loop is bounded by the same 3 s cap.
+        while (target.wrapping_sub(drm::vblank_seq_now()) as i32) > 0 {
+            let Some(deadline) = drm::vblank_deadline_for_seq(target) else {
+                break;
+            };
+            if deadline >= cap {
+                kernel_hal::thread::sleep_until(cap).await;
+                break;
+            }
+            kernel_hal::thread::sleep_until(deadline).await;
+        }
+    }
+
     /// Returns the [`VmObject`] representing the file with given `offset` and `len`.
     pub fn get_vmo(&self, offset: usize, len: usize) -> Result<Arc<VmObject>> {
         // MAP_DUMB handed userspace a page-aligned fake mmap offset that encodes
@@ -124,6 +191,15 @@ impl DrmDev {
         }
     }
 }
+
+/// `DRM_IOCTL_WAIT_VBLANK`, re-exported for `sys_ioctl`.
+///
+/// The blocking form of this one ioctl has to sleep, and `INode::io_control`
+/// is synchronous — there is no way to yield from inside it. `sys_ioctl` runs
+/// in the async syscall dispatcher, so it does the waiting there (see
+/// [`DrmDev::wait_vblank_sleep`]) and lets the sync arm below fill in the
+/// reply once the requested vblank has actually arrived.
+pub const WAIT_VBLANK_IOCTL: u32 = DRM_IOCTL_WAIT_VBLANK;
 
 // DRM IOCTL numbers (Linux x86_64)
 const DRM_IOCTL_VERSION: u32 = 0xC0406400;
@@ -1941,10 +2017,11 @@ impl INode for DrmDev {
                     // `schedule_flip_event`).
                     drm::schedule_vblank_event(signal, target);
                 } else {
-                    // Blocking form: the ioctl path is synchronous and cannot
-                    // sleep (see README-async-ioctl-vblank.md), so a target
-                    // that is still in the future is reported as the current
-                    // sequence rather than waited for -- honest, if early.
+                    // Blocking form. The wait itself already happened in
+                    // `sys_ioctl` (see `DrmDev::wait_vblank_sleep`): this arm
+                    // is synchronous and cannot sleep, so it only reports the
+                    // sequence that has completed by the time it runs -- which
+                    // is the requested one, because the sleep preceded it.
                     let now = kernel_hal::timer::timer_now();
                     req.typ = 0; // _DRM_VBLANK_ABSOLUTE
                                  // Return the *current* completed vblank sequence.  Returning
