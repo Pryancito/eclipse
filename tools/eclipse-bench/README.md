@@ -48,9 +48,10 @@ it to the rootfs build the same way the other `tools/` binaries are added.
 ./eclipse-bench [--only SECTION] [--quick] [DIR] [DISK_MB] [MEM_MB]
 ```
 
-- `--only SECTION` — run one of `cpu mem syscall vm sched smp disk proc`.
+- `--only SECTION` — run one of `cpu mem syscall vm sched smp disk proc gfx`.
   Useful for before/after on a single change.
 - `--quick` — shorter budgets, roughly 3x faster, noisier.
+- `--drm PATH` — DRM device for the `gfx` section (default `/dev/dri/card0`).
 - `DIR` — directory for the disk tests. **It must be on the filesystem you want
   to measure (the btrfs/ext2 root), not a tmpfs** like `/tmp` or `/run`, or the
   "disk" numbers will just measure RAM. Default: current directory.
@@ -105,10 +106,54 @@ came online.
 commit cost, and the `meta` lines (create / stat / unlink many small files) that
 stress exactly the path that makes `exec`, path lookup and boot slow.
 
+**GRAPHICS / DRM-KMS** `[kernel]` — what a compositor pays per frame, on the
+raw DRM path: no libdrm, no Mesa, no Wayland, so the same binary runs on Eclipse
+and on any Linux without installing anything.
+
+It deliberately does *not* measure a frame rate. Under QEMU both kernels drive
+the **same emulated GPU**, so "how fast is the GPU" has no kernel content at
+all. What differs between two kernels on one virtual GPU is the cost of the
+calls a compositor makes every frame, and that is what these rows are:
+
+- `DRM ioctl floor (GET_CAP)` is the graphics equivalent of the `getpid` row —
+  a DRM ioctl that does essentially nothing. Subtract it from any other row to
+  separate that operation's real work from generic ioctl dispatch.
+- `MODE_GETRESOURCES` / `GETCONNECTOR` / `GETCRTC` are the queries a compositor
+  issues at startup and on every hotplug.
+- `CREATE+DESTROY_DUMB`, `ADDFB2+RMFB`, `MAP_DUMB+mmap+munmap` are the buffer
+  lifecycle: paid on every window resize and every swapchain rebuild.
+- **`mapped fb write`** is the one to watch. It is a plain store loop, but the
+  number is decided by *the cache policy the kernel chose for the mapping*.
+  Write-combining runs at DRAM speed; uncached is 10-50x slower and turns a
+  full-screen repaint from a millisecond into tens of them. Nothing else in the
+  suite can catch that, and it is invisible in a `memcpy` benchmark over
+  ordinary memory — which is why the `fb write / memcpy` ratio exists.
+- `page flip -> event` submits a flip and waits for its completion event. The
+  wait is the point: the event is the frame actually being on screen. A figure
+  near the refresh period means frames are paced; far below it means they are
+  not (tearing, and a compositor that spins).
+- `vblank interval` / `jitter` is the refresh clock as the kernel delivers it.
+  An interval far shorter than any display period means `WAIT_VBLANK` is not
+  waiting at all — it answers with the current sequence and returns. The tool
+  says so explicitly rather than printing what looks like a very fast number:
+  every client that paces itself on it (X's Present, SDL, older toolkits) then
+  spins at full CPU instead of sleeping.
+
+The flip, cursor and atomic rows change what is on the display, so they run only
+if the process can become DRM master. With a compositor running, `SET_MASTER`
+fails and they are reported `n/a` rather than fighting the desktop — stop the
+session, or run from a text console, to measure them.
+
 **PROCESS CREATION** `[kernel]` — `fork + exit` is raw process creation;
 `fork + exec(self)` adds address-space replacement and a static ELF load;
 `fork + exec(sh -c :)` adds path lookup and the dynamic linker, i.e. the cost a
 shell or an init system actually pays per command.
+
+`tools/drmbench` is the deeper standalone probe of the same path (atomic
+commits, cursor throughput, plane properties) and emits `key=value` lines for
+mechanical diffing. The `gfx` section here is the integrated version: fewer
+knobs, but it shares the suite's `[user]`/`[kernel]` tagging and its ratios, so
+graphics costs land next to the syscall and scheduler costs they compete with.
 
 **RATIOS** — each is a kernel cost divided by something measured on the same
 machine in the same run, so hardware speed cancels out. These are the numbers to
@@ -135,6 +180,14 @@ timeslice short in response. That percentage is the kernel-side twin of the
 
 - **Eclipse vs Linux, same machine** — the only comparison that settles an
   argument. Same binary, same `DIR`, diff the output.
+- **Eclipse vs Linux under QEMU** — `scripts/qemu-bench.sh` boots Eclipse and
+  `scripts/qemu-linux-bench.sh` boots a stock Linux kernel under the *same*
+  QEMU machine, and both run this same binary. For the `gfx` section the Linux
+  control also needs a DRM driver bound to the emulated GPU, or it will report
+  "no DRM device" and there is nothing to compare — pass `-g` to that script and
+  it stages the driver stack into the initramfs. Both harnesses already give the
+  guest the same emulated GPU (QEMU's default std VGA on q35). Under TCG (no KVM) absolute figures describe QEMU's emulator, so read
+  the RATIOS section rather than the nanoseconds.
 - **QEMU vs real hardware** — a large gap on the `[user]` CPU lines points at
   frequency scaling; a gap mostly on `DISK` points at I/O.
 - **Before vs after a kernel change** — capture the output, rebuild, capture

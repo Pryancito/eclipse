@@ -21,7 +21,8 @@
 //
 // Options (before the positional arguments):
 //     --only SECTION   run one section: cpu, mem, syscall, vm, sched, smp,
-//                      disk, proc
+//                      disk, proc, gfx
+//     --drm PATH       DRM device for the gfx section (default /dev/dri/card0)
 //     --quick          shorter time budgets (rough numbers, ~3x faster)
 //     --budget MS      per-measurement wall-clock budget (default 200 ms for the
 //                      small probes, 400 ms for the streaming ones)
@@ -81,6 +82,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <sys/auxv.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -1598,6 +1600,496 @@ static const char *find_shell(void) {
 }
 
 // ---------------------------------------------------------------------------
+// GRAPHICS / DRM-KMS  [kernel]
+// ---------------------------------------------------------------------------
+//
+// Everything a compositor asks the kernel for, on the raw DRM path: no libdrm,
+// no Mesa, no Wayland. The ioctl numbers and structures are declared here so
+// the SAME binary runs on Eclipse and on any Linux without installing a thing —
+// which is the whole point, because a benchmark that needs packages one side
+// lacks measures the packaging, not the kernel.
+//
+// Why these numbers and not a frame rate: a GPU benchmark answers "how fast is
+// this GPU", and under QEMU both sides drive the *same* emulated device, so
+// that question has no kernel content at all. What differs between two kernels
+// on one virtual GPU is the cost of the calls a compositor makes every frame —
+// buffer allocation, framebuffer bookkeeping, the mapping's cache policy, the
+// flip submission path and how faithfully flips are paced to the refresh. Those
+// are what this section measures.
+//
+// The modifying probes (flip, cursor, atomic) run only if this process can
+// become DRM master. On a machine with a live compositor SET_MASTER fails and
+// they are reported n/a rather than fighting the desktop for the display.
+
+#define DRM_IOCTL_BASE 'd'
+#define BDRM_IO(nr) _IO(DRM_IOCTL_BASE, nr)
+#define BDRM_IOW(nr, type) _IOW(DRM_IOCTL_BASE, nr, type)
+#define BDRM_IOWR(nr, type) _IOWR(DRM_IOCTL_BASE, nr, type)
+
+struct b_drm_get_cap { uint64_t capability, value; };
+struct b_drm_set_client_cap { uint64_t capability, value; };
+
+struct b_drm_mode_card_res {
+    uint64_t fb_id_ptr, crtc_id_ptr, connector_id_ptr, encoder_id_ptr;
+    uint32_t count_fbs, count_crtcs, count_connectors, count_encoders;
+    uint32_t min_width, max_width, min_height, max_height;
+};
+
+struct b_drm_mode_modeinfo {
+    uint32_t clock;
+    uint16_t hdisplay, hsync_start, hsync_end, htotal, hskew;
+    uint16_t vdisplay, vsync_start, vsync_end, vtotal, vscan;
+    uint32_t vrefresh, flags, type;
+    char name[32];
+};
+
+struct b_drm_mode_get_connector {
+    uint64_t encoders_ptr, modes_ptr, props_ptr, prop_values_ptr;
+    uint32_t count_modes, count_props, count_encoders;
+    uint32_t encoder_id, connector_id, connector_type, connector_type_id;
+    uint32_t connection, mm_width, mm_height, subpixel;
+    uint32_t pad;
+};
+
+struct b_drm_mode_crtc {
+    uint64_t set_connectors_ptr;
+    uint32_t count_connectors, crtc_id, fb_id, x, y, gamma_size, mode_valid;
+    struct b_drm_mode_modeinfo mode;
+};
+
+struct b_drm_mode_create_dumb {
+    uint32_t height, width, bpp, flags, handle, pitch;
+    uint64_t size;
+};
+struct b_drm_mode_map_dumb { uint32_t handle, pad; uint64_t offset; };
+struct b_drm_mode_destroy_dumb { uint32_t handle; };
+
+struct b_drm_mode_fb_cmd2 {
+    uint32_t fb_id, width, height, pixel_format, flags;
+    uint32_t handles[4], pitches[4], offsets[4];
+    uint64_t modifier[4];
+};
+
+struct b_drm_mode_crtc_page_flip {
+    uint32_t crtc_id, fb_id, flags, reserved;
+    uint64_t user_data;
+};
+
+struct b_drm_mode_cursor {
+    uint32_t flags, crtc_id;
+    int32_t x, y;
+    uint32_t width, height, handle;
+};
+
+struct b_drm_event { uint32_t type, length; };
+
+union b_drm_wait_vblank {
+    struct { uint32_t type, sequence; unsigned long signal; } request;
+    struct { uint32_t type, sequence; long tval_sec, tval_usec; } reply;
+};
+
+#define B_DRM_IOCTL_GET_CAP           BDRM_IOWR(0x0c, struct b_drm_get_cap)
+#define B_DRM_IOCTL_SET_CLIENT_CAP    BDRM_IOW(0x0d, struct b_drm_set_client_cap)
+#define B_DRM_IOCTL_SET_MASTER        BDRM_IO(0x1e)
+#define B_DRM_IOCTL_DROP_MASTER       BDRM_IO(0x1f)
+#define B_DRM_IOCTL_WAIT_VBLANK       BDRM_IOWR(0x3a, union b_drm_wait_vblank)
+#define B_DRM_IOCTL_MODE_GETRESOURCES BDRM_IOWR(0xa0, struct b_drm_mode_card_res)
+#define B_DRM_IOCTL_MODE_GETCRTC      BDRM_IOWR(0xa1, struct b_drm_mode_crtc)
+#define B_DRM_IOCTL_MODE_CURSOR       BDRM_IOWR(0xa3, struct b_drm_mode_cursor)
+#define B_DRM_IOCTL_MODE_GETCONNECTOR BDRM_IOWR(0xa7, struct b_drm_mode_get_connector)
+#define B_DRM_IOCTL_MODE_RMFB         BDRM_IOWR(0xaf, unsigned int)
+#define B_DRM_IOCTL_MODE_PAGE_FLIP    BDRM_IOWR(0xb0, struct b_drm_mode_crtc_page_flip)
+#define B_DRM_IOCTL_MODE_CREATE_DUMB  BDRM_IOWR(0xb2, struct b_drm_mode_create_dumb)
+#define B_DRM_IOCTL_MODE_MAP_DUMB     BDRM_IOWR(0xb3, struct b_drm_mode_map_dumb)
+#define B_DRM_IOCTL_MODE_DESTROY_DUMB BDRM_IOWR(0xb4, struct b_drm_mode_destroy_dumb)
+#define B_DRM_IOCTL_MODE_ADDFB2       BDRM_IOWR(0xb8, struct b_drm_mode_fb_cmd2)
+
+#define B_DRM_CAP_DUMB_BUFFER 0x1
+#define B_DRM_MODE_PAGE_FLIP_EVENT 0x01
+#define B_DRM_MODE_CURSOR_MOVE 0x02
+#define B_DRM_VBLANK_RELATIVE 0x1
+#define B_FMT_XRGB8888 0x34325258 /* fourcc 'XR24' */
+
+// State shared by the probes (they must be no-argument functions for
+// timed_ns_per_op, same shape as the syscall probes above).
+static int g_drm = -1;
+static const char *g_drm_path = "/dev/dri/card0";
+static int g_drm_master = 0;
+static uint32_t g_crtc_id, g_conn_id;
+static uint32_t g_gw = 640, g_gh = 480; // measured surface size
+static uint32_t g_dumb_handle, g_dumb_pitch;
+static uint64_t g_dumb_size;
+static uint32_t g_fb_a, g_fb_b;
+static uint32_t g_dumb_b_handle;
+static unsigned char *g_fb_map;
+static uint32_t g_cursor_handle;
+static int g_flip_parity;
+// The framebuffer the CRTC was scanning out before we touched it. The flip
+// probe puts OUR buffer on the display; without putting the original back the
+// benchmark would leave the console showing a scratch buffer.
+static uint32_t g_orig_fb;
+
+static int drm_call(unsigned long req, void *arg) {
+    int r;
+    do { r = ioctl(g_drm, req, arg); } while (r < 0 && errno == EINTR);
+    return r;
+}
+
+// ---- read-only probes: available even when another process is master ----
+
+static int gfx_getcap(void) {
+    struct b_drm_get_cap c;
+    memset(&c, 0, sizeof c);
+    c.capability = B_DRM_CAP_DUMB_BUFFER;
+    return drm_call(B_DRM_IOCTL_GET_CAP, &c) < 0 ? -1 : 0;
+}
+
+static int gfx_getres(void) {
+    struct b_drm_mode_card_res r;
+    memset(&r, 0, sizeof r);
+    // Count-only form: exactly what a compositor issues first, and what it
+    // re-issues on every hotplug.
+    return drm_call(B_DRM_IOCTL_MODE_GETRESOURCES, &r) < 0 ? -1 : 0;
+}
+
+static int gfx_getconnector(void) {
+    struct b_drm_mode_get_connector c;
+    memset(&c, 0, sizeof c);
+    c.connector_id = g_conn_id;
+    return drm_call(B_DRM_IOCTL_MODE_GETCONNECTOR, &c) < 0 ? -1 : 0;
+}
+
+static int gfx_getcrtc(void) {
+    struct b_drm_mode_crtc c;
+    memset(&c, 0, sizeof c);
+    c.crtc_id = g_crtc_id;
+    return drm_call(B_DRM_IOCTL_MODE_GETCRTC, &c) < 0 ? -1 : 0;
+}
+
+// ---- buffer lifecycle ----
+
+static int gfx_dumb_cycle(void) {
+    struct b_drm_mode_create_dumb c;
+    memset(&c, 0, sizeof c);
+    c.width = g_gw; c.height = g_gh; c.bpp = 32;
+    if (drm_call(B_DRM_IOCTL_MODE_CREATE_DUMB, &c) < 0)
+        return -1;
+    struct b_drm_mode_destroy_dumb d;
+    memset(&d, 0, sizeof d);
+    d.handle = c.handle;
+    return drm_call(B_DRM_IOCTL_MODE_DESTROY_DUMB, &d) < 0 ? -1 : 0;
+}
+
+static int gfx_fb_cycle(void) {
+    struct b_drm_mode_fb_cmd2 fb;
+    memset(&fb, 0, sizeof fb);
+    fb.width = g_gw; fb.height = g_gh;
+    fb.pixel_format = B_FMT_XRGB8888;
+    fb.handles[0] = g_dumb_handle;
+    fb.pitches[0] = g_dumb_pitch;
+    if (drm_call(B_DRM_IOCTL_MODE_ADDFB2, &fb) < 0)
+        return -1;
+    unsigned int id = fb.fb_id;
+    return drm_call(B_DRM_IOCTL_MODE_RMFB, &id) < 0 ? -1 : 0;
+}
+
+static int gfx_map_cycle(void) {
+    struct b_drm_mode_map_dumb m;
+    memset(&m, 0, sizeof m);
+    m.handle = g_dumb_handle;
+    if (drm_call(B_DRM_IOCTL_MODE_MAP_DUMB, &m) < 0)
+        return -1;
+    void *p = mmap(NULL, (size_t)g_dumb_size, PROT_READ | PROT_WRITE,
+                   MAP_SHARED, g_drm, (off_t)m.offset);
+    if (p == MAP_FAILED)
+        return -1;
+    munmap(p, (size_t)g_dumb_size);
+    return 0;
+}
+
+// ---- present path (needs DRM master) ----
+
+// One flip, then wait for its completion event. A flip without the wait would
+// measure only how fast the ioctl returns, which is not what a frame costs: the
+// event is the frame actually being on screen, and the wait is where a
+// compositor spends its idle time.
+static int gfx_pageflip(void) {
+    struct b_drm_mode_crtc_page_flip f;
+    memset(&f, 0, sizeof f);
+    f.crtc_id = g_crtc_id;
+    f.fb_id = (g_flip_parity ^= 1) ? g_fb_b : g_fb_a;
+    f.flags = B_DRM_MODE_PAGE_FLIP_EVENT;
+    f.user_data = 0x600df00d;
+    if (drm_call(B_DRM_IOCTL_MODE_PAGE_FLIP, &f) < 0)
+        return -1;
+    // Drain exactly one completion. The event carries a header plus a payload;
+    // a 96-byte read covers both the vblank and the flip-complete forms.
+    unsigned char ev[96];
+    ssize_t n = read(g_drm, ev, sizeof ev);
+    return n > 0 ? 0 : -1;
+}
+
+static int gfx_cursor_move(void) {
+    struct b_drm_mode_cursor c;
+    memset(&c, 0, sizeof c);
+    c.flags = B_DRM_MODE_CURSOR_MOVE;
+    c.crtc_id = g_crtc_id;
+    // Walk the pointer so a driver that early-outs on "same position" is not
+    // measured doing nothing.
+    static int32_t x;
+    x = (x + 7) % 256;
+    c.x = x; c.y = x;
+    return drm_call(B_DRM_IOCTL_MODE_CURSOR, &c) < 0 ? -1 : 0;
+}
+
+// ---- discovery ----
+
+// Find a connected connector with a mode, and the CRTC currently driving it.
+// Returns 0 on success. Nothing here modifies state.
+static int gfx_discover(void) {
+    struct b_drm_mode_card_res res;
+    memset(&res, 0, sizeof res);
+    if (drm_call(B_DRM_IOCTL_MODE_GETRESOURCES, &res) < 0)
+        return -1;
+    if (!res.count_crtcs || !res.count_connectors)
+        return -1;
+
+    uint32_t crtcs[16], conns[16];
+    uint32_t nc = res.count_crtcs > 16 ? 16 : res.count_crtcs;
+    uint32_t nn = res.count_connectors > 16 ? 16 : res.count_connectors;
+    memset(&res, 0, sizeof res);
+    res.crtc_id_ptr = (uint64_t)(uintptr_t)crtcs;
+    res.connector_id_ptr = (uint64_t)(uintptr_t)conns;
+    res.count_crtcs = nc;
+    res.count_connectors = nn;
+    if (drm_call(B_DRM_IOCTL_MODE_GETRESOURCES, &res) < 0)
+        return -1;
+    if (!res.count_crtcs || !res.count_connectors)
+        return -1;
+    if (res.count_crtcs < nc) nc = res.count_crtcs;
+    if (res.count_connectors < nn) nn = res.count_connectors;
+
+    // Prefer a connector that is connected AND has modes; fall back to the
+    // first one so a headless-but-present pipeline still reports ioctl costs.
+    for (uint32_t i = 0; i < nn; i++) {
+        struct b_drm_mode_get_connector gc;
+        struct b_drm_mode_modeinfo modes[32];
+        memset(&gc, 0, sizeof gc);
+        gc.connector_id = conns[i];
+        if (drm_call(B_DRM_IOCTL_MODE_GETCONNECTOR, &gc) < 0)
+            continue;
+        uint32_t want_modes = gc.count_modes > 32 ? 32 : gc.count_modes;
+        memset(&gc, 0, sizeof gc);
+        gc.connector_id = conns[i];
+        gc.count_modes = want_modes;
+        gc.modes_ptr = (uint64_t)(uintptr_t)modes;
+        if (drm_call(B_DRM_IOCTL_MODE_GETCONNECTOR, &gc) < 0)
+            continue;
+        if (!g_conn_id)
+            g_conn_id = conns[i];
+        if (gc.connection == 1 && gc.count_modes) {
+            g_conn_id = conns[i];
+            uint32_t m = gc.count_modes > want_modes ? want_modes : gc.count_modes;
+            if (m) {
+                g_gw = modes[0].hdisplay;
+                g_gh = modes[0].vdisplay;
+            }
+            break;
+        }
+    }
+
+    // The CRTC that already has a mode programmed: flipping onto a live CRTC is
+    // what a compositor does. Setting one up ourselves would be a modeset, which
+    // is disruptive and is deliberately not part of this benchmark.
+    for (uint32_t i = 0; i < nc; i++) {
+        struct b_drm_mode_crtc gc;
+        memset(&gc, 0, sizeof gc);
+        gc.crtc_id = crtcs[i];
+        if (drm_call(B_DRM_IOCTL_MODE_GETCRTC, &gc) < 0)
+            continue;
+        if (!g_crtc_id)
+            g_crtc_id = crtcs[i];
+        if (gc.mode_valid) {
+            g_crtc_id = crtcs[i];
+            g_orig_fb = gc.fb_id;
+            if (gc.mode.hdisplay && gc.mode.vdisplay) {
+                g_gw = gc.mode.hdisplay;
+                g_gh = gc.mode.vdisplay;
+            }
+            return 0;
+        }
+    }
+    return g_crtc_id ? 0 : -1;
+}
+
+// Allocate the working buffers: one mapped dumb buffer plus two framebuffers to
+// flip between. Returns 0 on success.
+static int gfx_alloc(void) {
+    struct b_drm_mode_create_dumb c;
+    memset(&c, 0, sizeof c);
+    c.width = g_gw; c.height = g_gh; c.bpp = 32;
+    if (drm_call(B_DRM_IOCTL_MODE_CREATE_DUMB, &c) < 0)
+        return -1;
+    g_dumb_handle = c.handle;
+    g_dumb_pitch = c.pitch;
+    g_dumb_size = c.size;
+
+    struct b_drm_mode_map_dumb m;
+    memset(&m, 0, sizeof m);
+    m.handle = g_dumb_handle;
+    if (drm_call(B_DRM_IOCTL_MODE_MAP_DUMB, &m) == 0) {
+        void *p = mmap(NULL, (size_t)g_dumb_size, PROT_READ | PROT_WRITE,
+                       MAP_SHARED, g_drm, (off_t)m.offset);
+        if (p != MAP_FAILED)
+            g_fb_map = p;
+    }
+
+    struct b_drm_mode_fb_cmd2 fb;
+    memset(&fb, 0, sizeof fb);
+    fb.width = g_gw; fb.height = g_gh;
+    fb.pixel_format = B_FMT_XRGB8888;
+    fb.handles[0] = g_dumb_handle;
+    fb.pitches[0] = g_dumb_pitch;
+    if (drm_call(B_DRM_IOCTL_MODE_ADDFB2, &fb) == 0)
+        g_fb_a = fb.fb_id;
+
+    // A second buffer so the flip probe alternates, as a double-buffered
+    // compositor does. Flipping the same fb id repeatedly is a path some
+    // drivers short-circuit.
+    memset(&c, 0, sizeof c);
+    c.width = g_gw; c.height = g_gh; c.bpp = 32;
+    if (drm_call(B_DRM_IOCTL_MODE_CREATE_DUMB, &c) == 0) {
+        g_dumb_b_handle = c.handle;
+        memset(&fb, 0, sizeof fb);
+        fb.width = g_gw; fb.height = g_gh;
+        fb.pixel_format = B_FMT_XRGB8888;
+        fb.handles[0] = c.handle;
+        fb.pitches[0] = c.pitch;
+        if (drm_call(B_DRM_IOCTL_MODE_ADDFB2, &fb) == 0)
+            g_fb_b = fb.fb_id;
+    }
+    if (!g_fb_b)
+        g_fb_b = g_fb_a;
+    // Black, not whatever was in the pages: if anything below fails and leaves
+    // one of these on screen, a black display is a far better outcome than a
+    // window into freed memory.
+    if (g_fb_map)
+        memset(g_fb_map, 0, (size_t)g_dumb_size);
+    return g_fb_a ? 0 : -1;
+}
+
+static void gfx_free(void) {
+    if (g_fb_map) { munmap(g_fb_map, (size_t)g_dumb_size); g_fb_map = NULL; }
+    unsigned int id;
+    if (g_fb_b && g_fb_b != g_fb_a) { id = g_fb_b; drm_call(B_DRM_IOCTL_MODE_RMFB, &id); }
+    if (g_fb_a) { id = g_fb_a; drm_call(B_DRM_IOCTL_MODE_RMFB, &id); }
+    struct b_drm_mode_destroy_dumb d;
+    if (g_dumb_b_handle) { memset(&d, 0, sizeof d); d.handle = g_dumb_b_handle;
+                           drm_call(B_DRM_IOCTL_MODE_DESTROY_DUMB, &d); }
+    if (g_cursor_handle) { memset(&d, 0, sizeof d); d.handle = g_cursor_handle;
+                           drm_call(B_DRM_IOCTL_MODE_DESTROY_DUMB, &d); }
+    if (g_dumb_handle) { memset(&d, 0, sizeof d); d.handle = g_dumb_handle;
+                         drm_call(B_DRM_IOCTL_MODE_DESTROY_DUMB, &d); }
+    g_fb_a = g_fb_b = g_dumb_handle = g_dumb_b_handle = g_cursor_handle = 0;
+}
+
+// Sequential stores into the mapped framebuffer, i.e. every pixel a software
+// compositor (pixman, Cairo, a Wayland shm client) ever draws.
+//
+// This is tagged [kernel] even though the loop is a plain store loop, because
+// the number is decided by the *cache policy the kernel chose for the mapping*.
+// Write-combining runs at DRAM speed; uncached is 10-50x slower and turns a
+// full-screen repaint from a millisecond into tens of them. Nothing else in
+// this suite can catch that, and it is invisible in a memcpy benchmark over
+// ordinary anonymous memory.
+static double gfx_fb_write_mibs(uint64_t budget_ns) {
+    if (!g_fb_map || !g_dumb_size)
+        return NA;
+    volatile uint32_t *p = (volatile uint32_t *)g_fb_map;
+    size_t words = (size_t)(g_dumb_size / 4);
+    uint64_t t0 = now_ns(), bytes = 0;
+    uint32_t v = 0x00204060;
+    do {
+        for (size_t i = 0; i < words; i++)
+            p[i] = v;
+        bytes += (uint64_t)words * 4;
+        v += 0x00010101;
+    } while (now_ns() - t0 < budget_ns);
+    double el = (double)(now_ns() - t0) / 1e9;
+    g_sink += v;
+    return el > 0 ? (double)bytes / (1024.0 * 1024.0) / el : NA;
+}
+
+// The same store loop over ordinary anonymous memory. It is the denominator of
+// the `fb write / memcpy` ratio: identical code, identical CPU, the only
+// difference being which mapping it writes into -- so the ratio isolates the
+// cache policy the kernel gave the framebuffer and nothing else.
+static double ref_store_mibs(uint64_t budget_ns, size_t bytes) {
+    if (bytes < (1u << 16))
+        bytes = 1u << 16;
+    unsigned char *buf = malloc(bytes);
+    if (!buf)
+        return NA;
+    memset(buf, 0, bytes); // pre-fault: this is not the page-fault benchmark
+    volatile uint32_t *p = (volatile uint32_t *)buf;
+    size_t words = bytes / 4;
+    uint64_t t0 = now_ns(), total = 0;
+    uint32_t v = 0x00204060;
+    do {
+        for (size_t i = 0; i < words; i++)
+            p[i] = v;
+        total += (uint64_t)words * 4;
+        v += 0x00010101;
+    } while (now_ns() - t0 < budget_ns);
+    double el = (double)(now_ns() - t0) / 1e9;
+    g_sink += v;
+    free(buf);
+    return el > 0 ? (double)total / (1024.0 * 1024.0) / el : NA;
+}
+
+// The refresh clock as the kernel actually delivers it. `mean` is the period;
+// `jitter` is the spread. A compositor paces every frame off this, so a period
+// that is right on average but arrives in bursts still stutters.
+static int gfx_vblank_stats(int n, double *mean_ms, double *jitter_ms,
+                            double *worst_ms) {
+    if (n < 4)
+        n = 4;
+    double *iv = calloc((size_t)n, sizeof *iv);
+    if (!iv)
+        return -1;
+    union b_drm_wait_vblank w;
+    memset(&w, 0, sizeof w);
+    w.request.type = B_DRM_VBLANK_RELATIVE;
+    w.request.sequence = 1;
+    if (drm_call(B_DRM_IOCTL_WAIT_VBLANK, &w) < 0) { free(iv); return -1; }
+    uint64_t prev = now_ns();
+    int got = 0;
+    for (int i = 0; i < n; i++) {
+        memset(&w, 0, sizeof w);
+        w.request.type = B_DRM_VBLANK_RELATIVE;
+        w.request.sequence = 1;
+        if (drm_call(B_DRM_IOCTL_WAIT_VBLANK, &w) < 0)
+            break;
+        uint64_t t = now_ns();
+        iv[got++] = (double)(t - prev) / 1e6;
+        prev = t;
+    }
+    if (got < 2) { free(iv); return -1; }
+    double sum = 0, hi = 0;
+    for (int i = 0; i < got; i++) { sum += iv[i]; if (iv[i] > hi) hi = iv[i]; }
+    double m = sum / got, var = 0;
+    for (int i = 0; i < got; i++) var += (iv[i] - m) * (iv[i] - m);
+    // Integer-free sqrt by Newton iteration: this binary links no libm.
+    double vv = var / got, s = vv > 0 ? vv : 0, r = s > 1 ? s : 1;
+    for (int k = 0; k < 40; k++) r = 0.5 * (r + s / r);
+    *mean_ms = m;
+    *jitter_ms = s > 0 ? r : 0;
+    *worst_ms = hi;
+    free(iv);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -1685,7 +2177,9 @@ int main(int argc, char **argv) {
     const char *only = NULL;
     int argi = 1;
     while (argi < argc && argv[argi][0] == '-' && argv[argi][1] == '-') {
-        if (strcmp(argv[argi], "--only") == 0 && argi + 1 < argc) {
+        if (strcmp(argv[argi], "--drm") == 0 && argi + 1 < argc) {
+            g_drm_path = argv[++argi];
+        } else if (strcmp(argv[argi], "--only") == 0 && argi + 1 < argc) {
             only = argv[++argi];
         } else if (strcmp(argv[argi], "--quick") == 0) {
             g_budget_ns = 150000000ull;
@@ -1706,10 +2200,11 @@ int main(int argc, char **argv) {
             g_max_ns = ms * 1000000ull;
         } else {
             fprintf(stderr,
-                    "usage: %s [--only SECTION] [--quick] [--budget MS] [--max MS]"
+                    "usage: %s [--only SECTION] [--quick] [--drm PATH] [--budget MS] [--max MS]"
                     " [DIR] [DISK_MB] [MEM_MB]\n",
                     argv[0]);
-            fprintf(stderr, "sections: cpu mem syscall vm sched smp disk proc\n");
+            fprintf(stderr,
+                    "sections: cpu mem syscall vm sched smp disk proc gfx\n");
             return 2;
         }
         argi++;
@@ -1745,6 +2240,8 @@ int main(int argc, char **argv) {
     double r;
 
     // Values kept for the RATIOS section.
+    double gfx_ioctl_ns = NA, gfx_flip_us = NA, gfx_vblank_ms = NA;
+    double gfx_fbwrite_mibs = NA, mem_copy_mibs = NA;
     double cpu_chain_mops = NA, getpid_ns = NA, pipe_proc_ns = NA;
     double sleep_idle_us = NA, sleep_load_us = NA;
     double sleep_idle_max_us = NA, sleep_load_max_us = NA;
@@ -1788,6 +2285,7 @@ int main(int argc, char **argv) {
             r = timed_oprate(mem_copy, g_budget_ns);
             hr_bytes(r * (double)g_mem_bytes, hb, sizeof hb);
             printf("  %-8s %-28s %12s\n", "[user]", "memcpy bandwidth", hb);
+            mem_copy_mibs = r * (double)g_mem_bytes / (1024.0 * 1024.0);
             r = timed_oprate(mem_set, g_budget_ns);
             hr_bytes(r * (double)g_mem_bytes, hb, sizeof hb);
             printf("  %-8s %-28s %12s\n", "[user]", "memset bandwidth", hb);
@@ -2279,6 +2777,169 @@ int main(int argc, char **argv) {
         }
     }
 
+    // ---- Graphics ----
+    if (want(only, "gfx")) {
+        line();
+        printf("GRAPHICS / DRM-KMS   <-- what a compositor pays per frame\n");
+        g_drm = open(g_drm_path, O_RDWR | O_CLOEXEC);
+        if (g_drm < 0) {
+            printf("  no DRM device at %s (%s) — section skipped.\n",
+                   g_drm_path, strerror(errno));
+            printf("  Pass --drm PATH if the node is elsewhere. On a Linux\n");
+            printf("  control guest this usually means the kernel has no driver\n");
+            printf("  bound to the emulated GPU: boot it with a DRM driver for\n");
+            printf("  the same virtual device Eclipse is driving, or the two\n");
+            printf("  sides are not running the same workload.\n");
+        } else if (gfx_discover() != 0) {
+            printf("  %s opened, but it exposes no usable CRTC/connector —\n",
+                   g_drm_path);
+            printf("  only the ioctl floor below is meaningful.\n");
+            row("[kernel]", "DRM ioctl floor (GET_CAP)",
+                timed_ns_per_op(gfx_getcap, g_short_ns), "ns", "linux: ~700");
+        } else {
+            printf("  device %s, %ux%u, crtc %u, connector %u\n", g_drm_path,
+                   g_gw, g_gh, g_crtc_id, g_conn_id);
+
+            // The graphics equivalent of the getpid row: a DRM ioctl that does
+            // essentially nothing. Subtract it from any row below to separate
+            // that operation's real work from generic ioctl dispatch.
+            double capns = timed_ns_per_op(gfx_getcap, g_short_ns);
+            row("[kernel]", "DRM ioctl floor (GET_CAP)", capns, "ns",
+                "linux: ~700");
+            gfx_ioctl_ns = capns;
+            row("[kernel]", "MODE_GETRESOURCES",
+                timed_ns_per_op(gfx_getres, g_short_ns), "ns", "linux: ~1200");
+            row("[kernel]", "MODE_GETCONNECTOR",
+                timed_ns_per_op(gfx_getconnector, g_short_ns), "ns",
+                "linux: ~4000 (modes+props)");
+            row("[kernel]", "MODE_GETCRTC",
+                timed_ns_per_op(gfx_getcrtc, g_short_ns), "ns", "linux: ~1000");
+
+            // Buffer lifecycle. A compositor allocates on every window resize
+            // and on every swapchain rebuild, and a client on every surface.
+            row("[kernel]", "CREATE+DESTROY_DUMB",
+                timed_ns_per_op(gfx_dumb_cycle, g_short_ns) / 1000.0, "us",
+                "linux: ~40");
+
+            if (gfx_alloc() != 0) {
+                printf("  (dumb buffer / framebuffer allocation failed — the\n");
+                printf("   present-path rows below cannot run)\n");
+            } else {
+                row("[kernel]", "ADDFB2+RMFB",
+                    timed_ns_per_op(gfx_fb_cycle, g_short_ns) / 1000.0, "us",
+                    "linux: ~20");
+                row("[kernel]", "MAP_DUMB+mmap+munmap",
+                    timed_ns_per_op(gfx_map_cycle, g_short_ns) / 1000.0, "us",
+                    "linux: ~15");
+                // The cache-policy row. See the comment on the function.
+                gfx_fbwrite_mibs = gfx_fb_write_mibs(g_budget_ns);
+                // The ratio below needs an ordinary-memory reference. Measure
+                // one here too, so `--only gfx` -- the mode anyone doing
+                // graphics A/B will use -- is self-sufficient.
+                // Same size as the framebuffer, deliberately: a reference
+                // over a different working set measures the cache hierarchy
+                // instead of the mapping, and the ratio stops meaning what it
+                // claims to.
+                // Same budget as the framebuffer loop as well as the same
+                // size: the two figures are only a ratio if nothing but the
+                // mapping differs between them.
+                mem_copy_mibs =
+                    ref_store_mibs(g_budget_ns, (size_t)g_dumb_size);
+                row("[kernel]", "mapped fb write", gfx_fbwrite_mibs, "MiB/s",
+                    "linux: >2000 (WC); <200 means uncached");
+                if (gfx_fbwrite_mibs > 0) {
+                    double frame_ms =
+                        (double)g_gw * g_gh * 4.0 / (1024.0 * 1024.0)
+                        / gfx_fbwrite_mibs * 1000.0;
+                    row("[kernel]", "full-screen repaint", frame_ms, "ms",
+                        "one CPU pass over the visible surface");
+                }
+
+                // Everything below changes what is on the display, so it runs
+                // only when nothing else owns it.
+                g_drm_master = drm_call(B_DRM_IOCTL_SET_MASTER, NULL) == 0;
+                if (!g_drm_master) {
+                    printf("  -- not DRM master (%s): a compositor owns the\n",
+                           strerror(errno));
+                    printf("     display, so the flip/cursor rows are skipped\n");
+                    printf("     rather than fought over. Stop the desktop (or\n");
+                    printf("     run from a text console) to measure them.\n");
+                    row("[kernel]", "page flip -> event", NA, "us", "");
+                    row("[kernel]", "MODE_CURSOR move", NA, "us", "");
+                } else {
+                    double mean_ms = 0, jit_ms = 0, worst_ms = 0;
+                    if (gfx_vblank_stats(24, &mean_ms, &jit_ms, &worst_ms) == 0) {
+                        // A real vblank wait returns at the refresh, so an
+                        // interval far shorter than any display period means
+                        // the ioctl is not waiting at all -- it is answering
+                        // with the current sequence and returning. That is a
+                        // correctness difference, not a fast kernel: every
+                        // client that paces itself with WAIT_VBLANK (X's
+                        // Present, SDL, older toolkits) spins instead of
+                        // sleeping, burning a core to render frames nobody
+                        // will see. Say so instead of printing a number that
+                        // reads like a win.
+                        int blocks = mean_ms >= 2.0;
+                        row("[kernel]", "vblank interval", mean_ms, "ms",
+                            blocks ? "60 Hz = 16.7"
+                                   : "<-- WAIT_VBLANK returns without waiting");
+                        row("[kernel]", "vblank jitter (stddev)", jit_ms, "ms",
+                            blocks ? "linux: <1" : "(not a wait; see above)");
+                        row("[kernel]", "vblank interval (worst)", worst_ms,
+                            "ms", blocks ? "one late frame is one visible stutter"
+                                         : "");
+                        if (blocks) {
+                            gfx_vblank_ms = mean_ms;
+                        } else {
+                            printf("  WAIT_VBLANK did not block: a client pacing\n");
+                            printf("  itself on it will spin at full CPU instead of\n");
+                            printf("  sleeping until the next frame.\n");
+                        }
+                    } else {
+                        row("[kernel]", "vblank interval", NA, "ms",
+                            "WAIT_VBLANK unsupported");
+                    }
+
+                    // The headline. A flip paced to the refresh SHOULD land on
+                    // the vblank period: a figure far below it means frames are
+                    // not paced (tearing, and a compositor that spins), and far
+                    // above it means the present path itself is slow.
+                    double flip_ns = timed_ns_per_op(gfx_pageflip, g_budget_ns);
+                    gfx_flip_us = flip_ns < 0 ? NA : flip_ns / 1000.0;
+                    row("[kernel]", "page flip -> event", gfx_flip_us, "us",
+                        "60 Hz pacing = 16700");
+                    if (flip_ns > 0)
+                        row("[kernel]", "flip rate", 1e9 / flip_ns, "flips/s",
+                            "60 Hz pacing = 60");
+                    row("[kernel]", "MODE_CURSOR move",
+                        timed_ns_per_op(gfx_cursor_move, g_short_ns) / 1000.0,
+                        "us", "linux: ~30 (pointer rate is ~1 kHz)");
+                    // Hand the display back to whatever was on it. Skipping
+                    // this leaves the console scanning out our scratch buffer,
+                    // which looks exactly like the benchmark broke the machine.
+                    if (g_orig_fb && g_orig_fb != g_fb_a && g_orig_fb != g_fb_b) {
+                        struct b_drm_mode_crtc_page_flip f;
+                        memset(&f, 0, sizeof f);
+                        f.crtc_id = g_crtc_id;
+                        f.fb_id = g_orig_fb;
+                        f.flags = B_DRM_MODE_PAGE_FLIP_EVENT;
+                        if (drm_call(B_DRM_IOCTL_MODE_PAGE_FLIP, &f) == 0) {
+                            unsigned char ev[96];
+                            (void)!read(g_drm, ev, sizeof ev);
+                        }
+                    }
+                    drm_call(B_DRM_IOCTL_DROP_MASTER, NULL);
+                }
+            }
+            gfx_free();
+            printf("  Under QEMU both kernels drive the SAME emulated GPU, so\n");
+            printf("  every difference here is kernel code, not hardware. The\n");
+            printf("  rows that decide how a desktop feels are `mapped fb write`\n");
+            printf("  (a software compositor's whole life) and the flip pacing.\n");
+        }
+        if (g_drm >= 0) { close(g_drm); g_drm = -1; }
+    }
+
     // ---- Ratios ----
     // These are the numbers to quote when someone says "but we are in a VM".
     // Each is a kernel cost divided by something measured on the *same* machine
@@ -2307,6 +2968,27 @@ int main(int argc, char **argv) {
     if (fork_copy_ratio > 0)
         row("", "fork copy ratio", fork_copy_ratio, "x",
             "COW ~0.3, eager copy >=1");
+    // A DRM ioctl is a trap plus a driver dispatch. Dividing by the bare trap
+    // measured on this same machine says how much of it is the graphics stack
+    // rather than the syscall path -- and, unlike the raw nanoseconds, it means
+    // the same thing on an emulated CPU.
+    if (gfx_ioctl_ns > 0 && getpid_ns > 0)
+        row("", "DRM ioctl / syscall", gfx_ioctl_ns / getpid_ns, "x",
+            "linux: ~10-20 native; compressed under an emulator");
+    // 1.0 means flips land exactly on the refresh, which is what a correctly
+    // paced compositor gets. Well below 1 means frames are not being paced to
+    // the display at all; well above 1 means the present path misses vblanks.
+    if (gfx_flip_us > 0 && gfx_vblank_ms > 0)
+        row("", "flip period / vblank", gfx_flip_us / 1000.0 / gfx_vblank_ms,
+            "x", "1.0 = paced to the refresh");
+    // The framebuffer mapping against ordinary anonymous memory, same store
+    // loop and same working-set size, so the only difference is the mapping.
+    // Near 1 means the framebuffer mapping is as fast as ordinary RAM (write
+    // combining); a small fraction means the kernel mapped it uncached and
+    // every repaint pays for it.
+    if (gfx_fbwrite_mibs > 0 && mem_copy_mibs > 0)
+        row("", "fb write / memcpy", gfx_fbwrite_mibs / mem_copy_mibs, "x",
+            "1.0 = write-combined; <0.1 = uncached");
     printf("\n");
     printf("  `wake late loaded/idle` is the headline. A value near 1 means a\n");
     printf("  woken task gets a CPU straight away even when the machine is busy.\n");

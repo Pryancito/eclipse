@@ -16,6 +16,13 @@
 #                               [-k KERNEL] CMD [CMD...]
 #
 #   -k KERNEL   bzImage to boot (default: /boot/vmlinuz, or $LINUX_KERNEL)
+#   -g          stage the DRM driver stack so eclipse-bench's `gfx` section has
+#               a /dev/dri/card0 to measure. Both harnesses give the guest the
+#               SAME emulated GPU (QEMU's default std VGA on q35 — neither
+#               script passes -vga or -nodefaults), but Eclipse binds it from
+#               its own driver while a distro kernel keeps bochs-drm modular,
+#               so without this the Linux side reports "no DRM device" and
+#               there is nothing to compare.
 #
 # The initramfs is built from the busybox that `cargo rootfs` already compiled
 # (ignored/target/x86_64/busybox/busybox) plus the eclipse-bench binary from
@@ -33,7 +40,9 @@ SMP=4
 MEM=4G
 KERNEL="${LINUX_KERNEL:-/boot/vmlinuz}"
 
-while getopts "o:t:s:m:k:d:" opt; do
+GRAPHICS=0
+
+while getopts "o:t:s:m:k:d:g" opt; do
     case "$opt" in
         o) OUTFILE="$OPTARG" ;;
         t) TIMEOUT="$OPTARG" ;;
@@ -41,7 +50,8 @@ while getopts "o:t:s:m:k:d:" opt; do
         m) MEM="$OPTARG" ;;
         k) KERNEL="$OPTARG" ;;
         d) DISK_IMG="$OPTARG" ;;
-        *) echo "usage: $0 [-o OUT] [-t TIMEOUT] [-s SMP] [-m MEM] [-k KERNEL] CMD..." >&2; exit 2 ;;
+        g) GRAPHICS=1 ;;
+        *) echo "usage: $0 [-o OUT] [-t TIMEOUT] [-s SMP] [-m MEM] [-k KERNEL] [-d DISK] [-g] CMD..." >&2; exit 2 ;;
     esac
 done
 shift $((OPTIND - 1))
@@ -98,6 +108,39 @@ if [ -n "${DISK_IMG:-}" ]; then
 "
         fi
     done
+fi
+
+# Same idea for the graphics comparison (-g): the DRM driver for QEMU's std VGA
+# is modular in a distro kernel, so without it the guest has no /dev/dri at all
+# and eclipse-bench's `gfx` section has nothing to measure. `modprobe
+# --show-depends` resolves the dependency ORDER for us, which matters because
+# busybox has insmod but not modprobe.
+if [ "$GRAPHICS" = 1 ]; then
+    KREL="${KREL:-$(ls /lib/modules | head -1)}"
+    mkdir -p "$IRD/lib/modules"
+    stage_mod() {
+        # $1: absolute .ko / .ko.zst path
+        base="$(basename "$1")"; base="${base%.zst}"; base="${base%.ko}"
+        [ -f "$IRD/lib/modules/$base.ko" ] && return 0
+        case "$1" in
+            *.zst) zstd -d -q -c "$1" > "$IRD/lib/modules/$base.ko" || return 1 ;;
+            *)     cp "$1" "$IRD/lib/modules/$base.ko" || return 1 ;;
+        esac
+        MODLINES="${MODLINES}/bin/insmod /lib/modules/$base.ko 2>/dev/null
+"
+    }
+    staged=0
+    for drv in bochs bochs-drm virtio-gpu vmwgfx; do
+        deps="$(modprobe -S "$KREL" -n --show-depends "$drv" 2>/dev/null                 | awk '$1=="insmod"{print $2}')"
+        [ -n "$deps" ] || continue
+        for ko in $deps; do stage_mod "$ko"; done
+        staged=1
+        break
+    done
+    if [ "$staged" = 0 ]; then
+        echo "$0: warning: no DRM driver found for kernel $KREL — the guest will" >&2
+        echo "$0: have no /dev/dri and the gfx section cannot be compared." >&2
+    fi
 fi
 
 cat > "$IRD/init" <<'EOF'
