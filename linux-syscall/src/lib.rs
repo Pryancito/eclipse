@@ -240,7 +240,7 @@ impl Syscall<'_> {
             Sys::FSTAT => self.sys_fstat(a0.into(), a1.into()),
             Sys::NEWFSTATAT => self.sys_fstatat(a0.into(), a1.into(), a2.into(), a3),
             Sys::LSEEK => self.sys_lseek(a0.into(), a1 as i64, a2 as u8),
-            Sys::IOCTL => self.sys_ioctl(a0.into(), a1, a2, a3, a4),
+            Sys::IOCTL => self.sys_ioctl(a0.into(), a1, a2, a3, a4).await,
             Sys::PREAD64 => self.sys_pread(a0.into(), a1.into(), a2, a3 as _).await,
             Sys::PWRITE64 => self.sys_pwrite(a0.into(), a1.into(), a2, a3 as _),
             Sys::READV => self.sys_readv(a0.into(), a1.into(), a2).await,

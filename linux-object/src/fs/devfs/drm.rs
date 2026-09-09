@@ -2280,6 +2280,25 @@ pub fn vblank_seq_now() -> u32 {
     (now_ns / VBLANK_PERIOD_NS) as u32
 }
 
+/// Monotonic deadline at which the synthetic vblank counter reaches `target`,
+/// or `None` if that sequence is already in the past.
+///
+/// The counter is a pure function of the clock ([`vblank_seq_now`]), so the
+/// deadline is exact rather than a poll interval — a caller can sleep straight
+/// to it instead of waking up to re-check. `target` is the 32-bit sequence the
+/// uAPI carries, so the comparison is wrap-safe: a request made across a
+/// wrap-around still resolves to "soon", not "two years from now".
+pub fn vblank_deadline_for_seq(target: u32) -> Option<Duration> {
+    let now_ns = u64::try_from(kernel_hal::timer::timer_now().as_nanos()).unwrap_or(0);
+    let now_seq_full = now_ns / VBLANK_PERIOD_NS;
+    let ahead = target.wrapping_sub(now_seq_full as u32) as i32;
+    if ahead <= 0 {
+        return None;
+    }
+    let full = now_seq_full.saturating_add(ahead as u64);
+    Some(Duration::from_nanos(full.saturating_mul(VBLANK_PERIOD_NS)))
+}
+
 /// Pop one pending DRM event into `buf`, returning the number of bytes copied,
 /// or `None` if there are no events queued.
 pub fn read_event(buf: &mut [u8]) -> Option<usize> {
