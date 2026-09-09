@@ -346,7 +346,14 @@ static int sc_clock_gettime(void) {
 static const char *vdso_presence(void) {
 #ifdef __linux__
     unsigned long base = getauxval(AT_SYSINFO_EHDR);
-    if (!base) return "absent (AT_SYSINFO_EHDR not published)";
+    // Two very different kernels land here: one with no vDSO at all, and one
+    // that built and mapped it but declined to enable it (Eclipse withholds it
+    // unless CPUID vouches for an invariant TSC, which QEMU cannot do under
+    // TCG -- see VDSOFORCE=1). Both make every clock read a syscall, and the
+    // rows below cannot tell them apart, so name the second possibility here
+    // rather than let a harness artifact read as a missing feature.
+    if (!base)
+        return "absent (no AT_SYSINFO_EHDR: none built, or the kernel declined it)";
     // musl resolves the symbol itself and silently falls back if it cannot;
     // reporting the mapping base is enough to separate "no vDSO" from "vDSO
     // present but unused".
