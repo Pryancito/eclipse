@@ -171,6 +171,26 @@ const RING_GUARD: usize = 4096;
 /// millisecond (48 bytes of PCM) is far finer than anything above needs.
 const LPIB_POLL_MIN_US: u64 = 250;
 
+/// Slack allowed on top of what the PCM byte rate makes possible when judging
+/// whether a position read is believable: the controller updates its position
+/// in bursts, and the read itself is not instantaneous. One guard's worth
+/// (21 ms at 48 kHz stereo) is far more than any real burst and far less than
+/// the ring, so a garbage read cannot pass as progress.
+const POS_SLACK: usize = RING_GUARD;
+
+const STOP_HISTORY: usize = 4;
+
+/// One stream stop, as recorded for `/proc/gpusnd`.
+#[derive(Clone, Copy, Default)]
+struct StopEvent {
+    /// `b'U'` underrun, `b'D'` drain, 0 = unused slot.
+    kind: u8,
+    /// Milliseconds after the stream started.
+    at_ms: u64,
+    /// Bytes written to that stream by then.
+    written: usize,
+}
+
 /// Q15 multiplier for a 0..=100 percent. 100% is 1.0 (32768) so a shift-15
 /// multiply is a no-op; mute/0% is silence.
 fn gain_q15(percent: u8, mute: bool) -> i32 {
@@ -310,6 +330,21 @@ struct HdaInner {
     stat_underruns: u64,
     stat_restarts: u64,
     stat_stop_timeouts: u64,
+    /// Position reads rejected as impossible: more progress than the PCM
+    /// byte rate allows in the time since the last accepted read. A stream
+    /// whose position register or buffer occasionally returns garbage --
+    /// a controller behind a GPU, a bus hiccup -- would otherwise have the
+    /// writer overwrite most of a lap of unplayed audio, or be declared
+    /// underrun, on one bad read. The last rejected value is kept.
+    stat_bad_pos: u64,
+    last_bad_pos: u32,
+    /// When the current stream started and how much has been written to it,
+    /// so a stop can be placed within the stream it ended.
+    stream_start_us: u64,
+    stream_written: usize,
+    /// The last few stops, newest last: WHEN in the stream and after how
+    /// much data, which is what tells a stop mid-tone from the tone ending.
+    stops: [StopEvent; STOP_HISTORY],
 
     rate: u32,
     channels: u8,
@@ -436,6 +471,15 @@ impl HdaInner {
         (self.wp + ring - pos % ring) % ring
     }
 
+    fn record_stop(&mut self, kind: u8) {
+        self.stops.copy_within(1.., 0);
+        self.stops[STOP_HISTORY - 1] = StopEvent {
+            kind,
+            at_ms: timer_now_as_micros().wrapping_sub(self.stream_start_us) / 1000,
+            written: self.stream_written,
+        };
+    }
+
     /// Fold DMA progress since the last poll into `queued`, detect underrun,
     /// and re-zero consumed ring space (so an underrun loops silence).
     fn poll_progress(&mut self) {
@@ -444,6 +488,7 @@ impl HdaInner {
         }
         if self.queued == 0 {
             self.stat_drains += 1;
+            self.record_stop(b'D');
             if self.stop_stream() {
                 self.silence_ring();
             }
@@ -454,22 +499,37 @@ impl HdaInner {
         // and below run on every call, so nothing is deferred that could
         // leave the stream running with an empty ring.
         let now_us = timer_now_as_micros();
-        if now_us.wrapping_sub(self.last_poll_us) < LPIB_POLL_MIN_US {
+        let dt_us = now_us.wrapping_sub(self.last_poll_us);
+        if dt_us < LPIB_POLL_MIN_US {
             return;
         }
-        self.last_poll_us = now_us;
         let ring = self.ring_len;
-        let lpib = self.lpib() as usize % ring;
+        // The most the engine can have advanced since the last ACCEPTED read.
+        // `last_poll_us` only moves on an accepted read, so a run of bad
+        // reads keeps widening the budget until a sane one gets through.
+        let rate_bytes = self.rate as u64 * self.frame_bytes() as u64;
+        let max_advance = (dt_us.saturating_mul(rate_bytes) / 1_000_000) as usize + POS_SLACK;
+        let lpib_raw = self.lpib();
+        let lpib = lpib_raw as usize % ring;
         // Underrun is a question about progress, so that one really is a
         // delta: the engine having travelled further than we ever queued means
         // it has lapped the writer and is replaying the ring.
         let consumed = (lpib + ring - self.last_lpib as usize % ring) % ring;
+        if consumed > max_advance {
+            // Impossible progress (a backwards step shows up here too, as
+            // nearly a full lap forward). Garbage: keep everything as it was.
+            self.stat_bad_pos += 1;
+            self.last_bad_pos = lpib_raw;
+            return;
+        }
+        self.last_poll_us = now_us;
         self.last_lpib = lpib as u32;
         if consumed >= self.queued && consumed > 0 {
             // The engine ran past everything we queued: underrun. Stop and
             // wipe the ring so a looping DMA never replays stale samples.
             self.queued = 0;
             self.stat_underruns += 1;
+            self.record_stop(b'U');
             if self.stop_stream() {
                 self.silence_ring();
             }
@@ -483,21 +543,29 @@ impl HdaInner {
         let mut queued = self.queued_at(lpib);
         if let Some(dpib_raw) = self.dma_pos() {
             let dpib = dpib_raw as usize % ring;
-            if dpib != self.last_dpib as usize % ring {
-                // Only believed once seen to move: a controller that takes the
-                // base address and never writes to it would otherwise pin the
-                // depth at a full ring and stall playback outright.
-                self.dpib_trusted = true;
-            }
-            self.last_dpib = dpib as u32;
-            if self.dpib_trusted {
-                queued = queued.max(self.queued_at(dpib));
+            let advanced = (dpib + ring - self.last_dpib as usize % ring) % ring;
+            if advanced > max_advance {
+                // Same test as LPIB, same verdict: this read is not progress.
+                self.stat_bad_pos += 1;
+                self.last_bad_pos = dpib_raw;
+            } else {
+                if advanced > 0 {
+                    // Only believed once seen to move: a controller that takes
+                    // the base address and never writes to it would otherwise
+                    // pin the depth at a full ring and stall playback outright.
+                    self.dpib_trusted = true;
+                }
+                self.last_dpib = dpib as u32;
+                if self.dpib_trusted {
+                    queued = queued.max(self.queued_at(dpib));
+                }
             }
         }
         // A lapped or garbage position must not underflow `free_bytes`.
         self.queued = queued.min(ring - RING_GUARD);
         if self.queued == 0 {
             self.stat_drains += 1;
+            self.record_stop(b'D');
             if self.stop_stream() {
                 self.silence_ring();
             }
@@ -743,7 +811,8 @@ impl HdaInner {
         mmio_w32(bar, sd + SD_CTL, (self.stream_tag << 20) | 0x2);
 
         self.last_lpib = 0;
-        self.last_poll_us = 0;
+        // The plausibility budget starts counting from here, not from 0.
+        self.last_poll_us = timer_now_as_micros();
         // A stream reset restarts the position buffer at 0 too, and the fresh
         // stream has to re-earn trust in it.
         self.last_dpib = 0;
@@ -751,6 +820,8 @@ impl HdaInner {
         self.running = true;
         self.paused = false;
         self.stat_restarts += 1;
+        self.stream_start_us = self.last_poll_us;
+        self.stream_written = 0;
         Ok(())
     }
 }
@@ -1306,6 +1377,11 @@ impl HdaDevice {
             stat_underruns: 0,
             stat_restarts: 0,
             stat_stop_timeouts: 0,
+            stat_bad_pos: 0,
+            last_bad_pos: 0,
+            stream_start_us: 0,
+            stream_written: 0,
+            stops: [StopEvent::default(); STOP_HISTORY],
             rate: 48000,
             channels: 2,
             gain_l: 100,
@@ -1449,6 +1525,7 @@ impl AudioScheme for HdaDevice {
         if !inner.running && !inner.paused {
             inner.start_stream()?;
         }
+        inner.stream_written += n;
         Ok(n)
     }
 
@@ -1580,9 +1657,30 @@ impl AudioScheme for HdaDevice {
         );
         let _ = writeln!(
             out,
-            "[gpusnd] events: {} drains, {} underruns, {} stream restarts, {} stop timeouts",
-            inner.stat_drains, inner.stat_underruns, inner.stat_restarts, inner.stat_stop_timeouts
+            "[gpusnd] events: {} drains, {} underruns, {} stream restarts, {} stop timeouts, {} rejected position reads{}",
+            inner.stat_drains,
+            inner.stat_underruns,
+            inner.stat_restarts,
+            inner.stat_stop_timeouts,
+            inner.stat_bad_pos,
+            if inner.stat_bad_pos > 0 {
+                alloc::format!(" (last {:#x})", inner.last_bad_pos)
+            } else {
+                String::new()
+            }
         );
+        // The last stops, oldest first. wavplay's tone is 576000 B, so a stop
+        // that ends a stream short of that, well before 3000 ms, is a dropout;
+        // one at ~3000 ms with all of it written is the tone ending.
+        for ev in inner.stops.iter().filter(|e| e.kind != 0) {
+            let _ = writeln!(
+                out,
+                "[gpusnd]   stop: {} at {} ms, {} B written to that stream",
+                if ev.kind == b'U' { "underrun" } else { "drain" },
+                ev.at_ms,
+                ev.written
+            );
+        }
         // What is actually IN the ring right now. Read while a tone plays,
         // this separates the two remaining families of dropout: silence found
         // in memory where the tone should be was put there by software (the
