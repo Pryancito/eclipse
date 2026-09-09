@@ -661,7 +661,7 @@ pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<
     // RAM (info leak / fault). Compute in usize with a checked multiply and
     // reject ADDFB whose dimensions overflow or exceed the buffer.
     let size = (pitch as usize).checked_mul(height as usize)?;
-    if size == 0 || size > buf_size {
+    if size == 0 || size > buf_size || (pitch as usize) < (width as usize).saturating_mul(4) {
         return None;
     }
 

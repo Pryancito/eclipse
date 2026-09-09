@@ -453,10 +453,10 @@ fn clean_runtime_dir(dir: &Path) {
 // ---------------------------------------------------------------------------
 
 fn install_signal_handlers() {
-    install_handler(libc::SIGTERM, on_sigterm as usize);
-    install_handler(libc::SIGINT, on_sigint as usize);
-    install_handler(libc::SIGUSR1, on_sigusr1 as usize);
-    install_handler(libc::SIGUSR2, on_sigusr2 as usize);
+    install_handler(libc::SIGTERM, on_sigterm as *const () as usize);
+    install_handler(libc::SIGINT, on_sigint as *const () as usize);
+    install_handler(libc::SIGUSR1, on_sigusr1 as *const () as usize);
+    install_handler(libc::SIGUSR2, on_sigusr2 as *const () as usize);
     // SIGCHLD is left at its default: the blocking `waitpid` in the supervision
     // loop reaps children directly, so no handler is needed for reaping.
 }

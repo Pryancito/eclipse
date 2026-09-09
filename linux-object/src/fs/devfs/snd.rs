@@ -42,6 +42,14 @@ use lock::Mutex;
 use rcore_fs::vfs::*;
 use rcore_fs_devfs::DevFS;
 
+fn ucheck<T>(addr: usize) -> Result<()> {
+    if kernel_hal::user::user_range_ok(addr, core::mem::size_of::<T>()) {
+        Ok(())
+    } else {
+        Err(FsError::BadAddress)
+    }
+}
+
 /// Periodic LPIB poll while HDA DMA is in RUN. PulseAudio corks at end of
 /// mpg123 and stops calling write/poll; without this the cyclic ring keeps
 /// fetching the last fragment (~0.5 s) forever.
@@ -1121,11 +1129,13 @@ impl INode for PcmDev {
         match nr {
             0x00 => {
                 // PVERSION
+                ucheck::<i32>(data)?;
                 unsafe { *(data as *mut i32) = SNDRV_PCM_VERSION };
                 Ok(0)
             }
             0x01 => {
                 // INFO
+                ucheck::<SndPcmInfo>(data)?;
                 let info = unsafe { &mut *(data as *mut SndPcmInfo) };
                 unsafe {
                     core::ptr::write_bytes(
@@ -1151,6 +1161,7 @@ impl INode for PcmDev {
                 // HW_REFINE. Returning EINVAL is how alsa-lib's `*_near`
                 // helpers search; only an empty result on the initial
                 // `hw_params_any` (wide-open intervals) is a real fault.
+                ucheck::<SndPcmHwParams>(data)?;
                 let p = unsafe { &mut *(data as *mut SndPcmHwParams) };
                 let is_any = p.rmask == !0
                     && p.intervals[Self::IV_RATE].min == 0
@@ -1171,6 +1182,7 @@ impl INode for PcmDev {
             }
             0x11 => {
                 // HW_PARAMS
+                ucheck::<SndPcmHwParams>(data)?;
                 let p = unsafe { &mut *(data as *mut SndPcmHwParams) };
                 self.install(p)?;
                 Ok(0)
@@ -1183,6 +1195,7 @@ impl INode for PcmDev {
             }
             0x13 => {
                 // SW_PARAMS
+                ucheck::<SndPcmSwParams>(data)?;
                 let p = unsafe { &mut *(data as *mut SndPcmSwParams) };
                 let mut st = self.st.lock();
                 if p.avail_min > 0 {
@@ -1195,12 +1208,14 @@ impl INode for PcmDev {
             }
             0x20 | 0x24 => {
                 // STATUS / STATUS_EXT
+                ucheck::<SndPcmStatus>(data)?;
                 let s = unsafe { &mut *(data as *mut SndPcmStatus) };
                 self.fill_status(s);
                 Ok(0)
             }
             0x21 => {
                 // DELAY
+                ucheck::<i64>(data)?;
                 unsafe { *(data as *mut i64) = self.queued_frames() as i64 };
                 Ok(0)
             }
@@ -1210,6 +1225,7 @@ impl INode for PcmDev {
             }
             0x23 => {
                 // SYNC_PTR — Linux flag semantics.
+                ucheck::<SndPcmSyncPtr>(data)?;
                 let sp = unsafe { &mut *(data as *mut SndPcmSyncPtr) };
                 let mut st = self.st.lock();
                 if sp.flags & SYNC_PTR_APPL != 0 {
@@ -1237,6 +1253,7 @@ impl INode for PcmDev {
             }
             0x32 => {
                 // CHANNEL_INFO — interleaved S16LE stereo (32 bits per frame).
+                ucheck::<SndPcmChannelInfo>(data)?;
                 let info = unsafe { &mut *(data as *mut SndPcmChannelInfo) };
                 let ch = info.channel;
                 if ch > 1 {
@@ -1279,6 +1296,7 @@ impl INode for PcmDev {
                 // PAUSE: arg 1 = pause, 0 = resume. Pulse suspend-on-idle and
                 // stream cork both land here; a no-op left DMA looping the
                 // last buffer (mpg123 remnants).
+                ucheck::<i32>(data)?;
                 let enable = unsafe { *(data as *const i32) };
                 let state = self.st.lock().state;
                 if enable != 0 {
@@ -1301,6 +1319,7 @@ impl INode for PcmDev {
             }
             0x46 => {
                 // REWIND — drop the most recently written frames.
+                ucheck::<u64>(data)?;
                 let frames = unsafe { *(data as *mut u64) };
                 let bytes = (frames * BYTES_PER_FRAME) as usize;
                 let dropped = self.audio.rewind(bytes).unwrap_or(0);
@@ -1324,6 +1343,7 @@ impl INode for PcmDev {
             0x48 => Ok(0), // XRUN
             0x49 => {
                 // FORWARD — skip unplayed frames from the playhead.
+                ucheck::<u64>(data)?;
                 let frames = unsafe { *(data as *mut u64) };
                 let bytes = (frames * BYTES_PER_FRAME) as usize;
                 let skipped = self.audio.forward(bytes).unwrap_or(0);
@@ -1332,6 +1352,7 @@ impl INode for PcmDev {
             }
             0x50 => {
                 // WRITEI_FRAMES
+                ucheck::<SndXferI>(data)?;
                 let xfer = unsafe { &mut *(data as *mut SndXferI) };
                 self.writei(xfer)?;
                 Ok(0)
@@ -1389,6 +1410,7 @@ impl CtlDev {
     }
 
     fn elem_list(&self, data: usize) -> Result<usize> {
+        ucheck::<SndCtlElemList>(data)?;
         let list = unsafe { &mut *(data as *mut SndCtlElemList) };
         list.count = MIXER_ELEMS;
         let offset = list.offset;
@@ -1410,6 +1432,7 @@ impl CtlDev {
     }
 
     fn elem_info(&self, data: usize) -> Result<usize> {
+        ucheck::<SndCtlElemInfo>(data)?;
         let info = unsafe { &mut *(data as *mut SndCtlElemInfo) };
         let elem = elem_from_id(&info.id).ok_or(FsError::EntryNotFound)?;
         unsafe {
@@ -1441,6 +1464,7 @@ impl CtlDev {
     }
 
     fn elem_read(&self, data: usize) -> Result<usize> {
+        ucheck::<SndCtlElemValue>(data)?;
         let val = unsafe { &mut *(data as *mut SndCtlElemValue) };
         let elem = elem_from_id(&val.id).ok_or(FsError::EntryNotFound)?;
         fill_elem_id(&mut val.id, elem);
@@ -1460,6 +1484,7 @@ impl CtlDev {
     }
 
     fn elem_write(&self, data: usize) -> Result<usize> {
+        ucheck::<SndCtlElemValue>(data)?;
         let val = unsafe { &*(data as *const SndCtlElemValue) };
         let elem = elem_from_id(&val.id).ok_or(FsError::EntryNotFound)?;
         let (mut l, mut r, mut mute_l, mut mute_r) = self.audio.gain();
@@ -1505,11 +1530,13 @@ impl INode for CtlDev {
         }
         match nr {
             0x00 => {
+                ucheck::<i32>(data)?;
                 unsafe { *(data as *mut i32) = SNDRV_CTL_VERSION };
                 Ok(0)
             }
             0x01 => {
                 // CARD_INFO
+                ucheck::<SndCtlCardInfo>(data)?;
                 let info = unsafe { &mut *(data as *mut SndCtlCardInfo) };
                 unsafe {
                     core::ptr::write_bytes(
@@ -1535,6 +1562,7 @@ impl INode for CtlDev {
             0x16 => {
                 // SUBSCRIBE_EVENTS: we don't queue notifications yet (poll
                 // never signals), but alsamixer aborts if this ioctl fails.
+                ucheck::<i32>(data)?;
                 let v = unsafe { &mut *(data as *mut i32) };
                 if *v < 0 {
                     *v = 0;
@@ -1543,12 +1571,14 @@ impl INode for CtlDev {
             }
             0x30 => {
                 // PCM_NEXT_DEVICE: single PCM device (0).
+                ucheck::<i32>(data)?;
                 let v = unsafe { &mut *(data as *mut i32) };
                 *v = if *v < 0 { 0 } else { -1 };
                 Ok(0)
             }
             0x31 => {
                 // PCM_INFO
+                ucheck::<SndPcmInfo>(data)?;
                 let info = unsafe { &mut *(data as *mut SndPcmInfo) };
                 if info.device != 0 || info.stream != 0 {
                     return Err(FsError::EntryNotFound);

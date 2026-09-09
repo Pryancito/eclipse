@@ -48,6 +48,14 @@ struct AudioBufInfo {
 /// oriented; fragments only shape client buffering decisions.
 const FRAG_SIZE: usize = 4096;
 
+fn ucheck<T>(addr: usize) -> Result<()> {
+    if kernel_hal::user::user_range_ok(addr, core::mem::size_of::<T>()) {
+        Ok(())
+    } else {
+        Err(FsError::BadAddress)
+    }
+}
+
 pub struct DspDev {
     audio: Arc<dyn AudioScheme>,
     index: usize,
@@ -145,6 +153,7 @@ impl INode for DspDev {
                 Ok(0)
             }
             SNDCTL_DSP_SPEED => {
+                ucheck::<i32>(data)?;
                 let val = unsafe { &mut *(data as *mut i32) };
                 let (rate, _) = self
                     .audio
@@ -154,28 +163,33 @@ impl INode for DspDev {
                 Ok(0)
             }
             SNDCTL_DSP_SETFMT => {
+                ucheck::<i32>(data)?;
                 let val = unsafe { &mut *(data as *mut i32) };
                 // S16LE is the only format; report it back whatever was asked.
                 *val = AFMT_S16_LE;
                 Ok(0)
             }
             SNDCTL_DSP_GETFMTS => {
+                ucheck::<i32>(data)?;
                 let val = unsafe { &mut *(data as *mut i32) };
                 *val = AFMT_S16_LE;
                 Ok(0)
             }
             SNDCTL_DSP_CHANNELS => {
+                ucheck::<i32>(data)?;
                 let val = unsafe { &mut *(data as *mut i32) };
                 let (_, channels) = self.audio.params();
                 *val = channels as i32;
                 Ok(0)
             }
             SNDCTL_DSP_STEREO => {
+                ucheck::<i32>(data)?;
                 let val = unsafe { &mut *(data as *mut i32) };
                 *val = 1; // stereo
                 Ok(0)
             }
             SNDCTL_DSP_GETBLKSIZE => {
+                ucheck::<i32>(data)?;
                 let val = unsafe { &mut *(data as *mut i32) };
                 *val = FRAG_SIZE as i32;
                 Ok(0)
@@ -185,6 +199,7 @@ impl INode for DspDev {
                 Ok(0)
             }
             SNDCTL_DSP_GETOSPACE => {
+                ucheck::<AudioBufInfo>(data)?;
                 let info = unsafe { &mut *(data as *mut AudioBufInfo) };
                 let free = self.audio.free_bytes();
                 let total = self.audio.buffer_bytes();
