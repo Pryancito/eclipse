@@ -1,6 +1,6 @@
 mod drivers;
 #[cfg(feature = "graphic")]
-mod early_fb_console;
+pub(crate) mod early_fb_console;
 // `bare::timer::timer_tick` reaches `power::thermal_governor_tick` from outside
 // this arch module, so the governor needs crate-wide visibility.
 pub(crate) mod power;

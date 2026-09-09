@@ -139,6 +139,20 @@ const BDL_SEGMENT: usize = 16 * 1024;
 /// (the engine prefetches past LPIB into its FIFO).
 const RING_GUARD: usize = 512;
 
+/// Minimum interval between reads of the stream position register.
+///
+/// `SD_LPIB` is uncached device memory: an uncached PCIe read on real
+/// hardware, and a VM exit under hardware virtualisation. The `/dev/dsp`
+/// write path spin-retries against a full ring, so every one of those
+/// retries used to read it -- measured at 1.5 M reads (and 1.2 M `write`
+/// calls, each taking this IRQ-off lock) for a single 3-second tone, i.e.
+/// ~500 k device reads per second for 192 KiB/s of audio. That is a bus and
+/// exit storm that competes with the very DMA it is watching.
+///
+/// The ring holds 680 ms; resolving the play position to a quarter of a
+/// millisecond (48 bytes of PCM) is far finer than anything above needs.
+const LPIB_POLL_MIN_US: u64 = 250;
+
 /// Q15 multiplier for a 0..=100 percent. 100% is 1.0 (32768) so a shift-15
 /// multiply is a no-op; mute/0% is silence.
 fn gain_q15(percent: u8, mute: bool) -> i32 {
@@ -250,6 +264,9 @@ struct HdaInner {
     queued: usize,
     /// LPIB at the last progress poll.
     last_lpib: u32,
+    /// `timer_now_as_micros()` at the last poll that actually read LPIB.
+    /// Throttles that read to [`LPIB_POLL_MIN_US`].
+    last_poll_us: u64,
     /// Ring offset up to which consumed data has been re-zeroed.
     zero_ptr: usize,
 
@@ -349,6 +366,15 @@ impl HdaInner {
             self.silence_ring();
             return;
         }
+        // Rate-limit the device read (see [`LPIB_POLL_MIN_US`]). Only the
+        // "still playing" path is throttled: the drain/stop decisions above
+        // and below run on every call, so nothing is deferred that could
+        // leave the stream running with an empty ring.
+        let now_us = timer_now_as_micros();
+        if now_us.wrapping_sub(self.last_poll_us) < LPIB_POLL_MIN_US {
+            return;
+        }
+        self.last_poll_us = now_us;
         let lpib = self.lpib();
         let consumed = (lpib as usize + self.ring_len - self.last_lpib as usize) % self.ring_len;
         self.last_lpib = lpib;
@@ -575,6 +601,7 @@ impl HdaInner {
         mmio_w32(bar, sd + SD_CTL, (self.stream_tag << 20) | 0x2);
 
         self.last_lpib = 0;
+        self.last_poll_us = 0;
         self.running = true;
         self.paused = false;
         Ok(())
@@ -1098,6 +1125,7 @@ impl HdaDevice {
             wp: 0,
             queued: 0,
             last_lpib: 0,
+            last_poll_us: 0,
             zero_ptr: 0,
             rate: 48000,
             channels: 2,
