@@ -73,6 +73,13 @@ const RIRBCTL_IRQ_EN: u8 = 1 << 0;
 const RIRBCTL_DMA_EN: u8 = 1 << 1;
 const RIRBSTS_IRQ: u8 = 1 << 0;
 const RIRBSTS_OVERRUN: u8 = 1 << 2;
+/// DMA Position Buffer base (low/high). The controller writes each stream's
+/// current position into host memory here, 8 bytes per stream descriptor,
+/// indexed by descriptor number. Bit 0 of the low register enables it.
+const REG_DPLBASE: usize = 0x70;
+const REG_DPUBASE: usize = 0x74;
+const DPLBASE_ENABLE: u32 = 1 << 0;
+
 const REG_SD_BASE: usize = 0x80; // stream descriptors, 0x20 bytes each
 
 // Stream descriptor register offsets (from the descriptor base).
@@ -135,9 +142,20 @@ const VERB_TIMEOUT_US: u64 = 200_000;
 const RING_PAGES: usize = 32;
 /// The BDL splits the ring into fixed 16 KiB cyclic segments.
 const BDL_SEGMENT: usize = 16 * 1024;
-/// Keep the software write pointer at least this far behind the DMA position
-/// (the engine prefetches past LPIB into its FIFO).
-const RING_GUARD: usize = 512;
+/// Keep the software write pointer at least this far behind the reported play
+/// position.
+///
+/// 512 bytes -- 2.7 ms at 48 kHz stereo -- was too thin to be a safety margin.
+/// It assumed the position register is exact, which is true of QEMU's emulated
+/// controller and famously not true of real ones: Linux carries a whole
+/// `position_fix` quirk table for controllers whose `SD_LPIB` does not track
+/// what has actually been played, and NVIDIA's HDMI audio function is on it.
+/// When the position over-reports, `free_bytes` hands the writer space that is
+/// still going to be played and the next write overwrites it -- heard as a
+/// stream of very short dropouts rather than one obvious gap.
+///
+/// 4 KiB is 21 ms of slack and costs 3% of the ring.
+const RING_GUARD: usize = 4096;
 
 /// Minimum interval between reads of the stream position register.
 ///
@@ -267,6 +285,14 @@ struct HdaInner {
     /// `timer_now_as_micros()` at the last poll that actually read LPIB.
     /// Throttles that read to [`LPIB_POLL_MIN_US`].
     last_poll_us: u64,
+    /// Kernel address of this stream's entry in the DMA position buffer, or 0
+    /// when the controller would not take one. See [`HdaInner::play_pos`].
+    dma_pos_va: usize,
+    /// Position-buffer value at the last poll, and whether it has ever been
+    /// seen to advance. An entry that never moves means the controller is not
+    /// maintaining it, and it must not be allowed to stall playback.
+    last_dpib: u32,
+    dpib_trusted: bool,
     /// Ring offset up to which consumed data has been re-zeroed.
     zero_ptr: usize,
 
@@ -355,6 +381,57 @@ impl HdaInner {
         mmio_r32(self.bar, self.sd_base + SD_LPIB)
     }
 
+    /// This stream's position as the controller reports it in the DMA position
+    /// buffer, or `None` when there is no buffer.
+    ///
+    /// The controller writes this with DMA, so the line has to come from
+    /// memory rather than from a cache that a non-snooping write left stale --
+    /// the same reason every ring write in this driver is flushed.
+    fn dma_pos(&self) -> Option<u32> {
+        if self.dma_pos_va == 0 {
+            return None;
+        }
+        clflush_range(self.dma_pos_va, 8);
+        // SAFETY: `dma_pos_va` addresses this stream's 8-byte entry inside a
+        // page owned for the lifetime of the device.
+        Some(unsafe { core::ptr::read_volatile(self.dma_pos_va as *const u32) })
+    }
+
+    /// Bytes the engine consumed since the last poll, taken as the SMALLER of
+    /// what the two position sources claim.
+    ///
+    /// `SD_LPIB` counts what the link has accepted, which on a number of real
+    /// controllers runs ahead of what has been played -- Linux keeps a
+    /// `position_fix` quirk table for exactly this and defaults to preferring
+    /// the position buffer. Believing the faster of the two would hand the
+    /// writer space that is still going to be played, and the next write would
+    /// overwrite it: a short dropout, repeated, rather than one audible gap.
+    /// Taking the smaller can only ever make the driver think LESS has been
+    /// played, which costs a little ring capacity and can never corrupt the
+    /// stream.
+    ///
+    /// The position buffer is only believed once it has been seen to move: a
+    /// controller that accepts the base address and never writes to it would
+    /// otherwise report zero progress forever and stall playback outright.
+    fn consumed_since_last(&mut self, lpib: u32) -> usize {
+        let ring = self.ring_len;
+        let by_lpib = (lpib as usize + ring - self.last_lpib as usize) % ring;
+        let Some(dpib_raw) = self.dma_pos() else {
+            return by_lpib;
+        };
+        let dpib = dpib_raw as usize % ring;
+        let by_dpib = (dpib + ring - self.last_dpib as usize % ring) % ring;
+        self.last_dpib = dpib as u32;
+        if by_dpib > 0 {
+            self.dpib_trusted = true;
+        }
+        if self.dpib_trusted {
+            by_lpib.min(by_dpib)
+        } else {
+            by_lpib
+        }
+    }
+
     /// Fold DMA progress since the last poll into `queued`, detect underrun,
     /// and re-zero consumed ring space (so an underrun loops silence).
     fn poll_progress(&mut self) {
@@ -376,7 +453,7 @@ impl HdaInner {
         }
         self.last_poll_us = now_us;
         let lpib = self.lpib();
-        let consumed = (lpib as usize + self.ring_len - self.last_lpib as usize) % self.ring_len;
+        let consumed = self.consumed_since_last(lpib);
         self.last_lpib = lpib;
         if consumed >= self.queued && consumed > 0 {
             // The engine ran past everything we queued: underrun. Stop and
@@ -602,6 +679,10 @@ impl HdaInner {
 
         self.last_lpib = 0;
         self.last_poll_us = 0;
+        // A stream reset restarts the position buffer at 0 too, and the fresh
+        // stream has to re-earn trust in it.
+        self.last_dpib = 0;
+        self.dpib_trusted = false;
         self.running = true;
         self.paused = false;
         Ok(())
@@ -1101,6 +1182,31 @@ impl HdaDevice {
         }
         clflush_range(bdl_va, n_seg * 16);
 
+        // ── DMA position buffer ────────────────────────────────────────────
+        // The controller writes each stream's play position here, in host
+        // memory, 8 bytes per stream descriptor. Linux prefers it over
+        // `SD_LPIB` by default (`position_fix=AUTO`) because on many
+        // controllers LPIB does not track what has actually been played --
+        // it is the register whose slop this driver had only 512 bytes of
+        // guard against. Enabling it costs one page and gives `play_pos` a
+        // second opinion to be conservative with.
+        let dma_pos_va = {
+            let (va, pa) = ProviderImpl::alloc_dma(PAGE_SIZE);
+            unsafe { core::ptr::write_bytes(va as *mut u8, 0, PAGE_SIZE) };
+            clflush_range(va, PAGE_SIZE);
+            mmio_w32(bar, REG_DPUBASE, (pa as u64 >> 32) as u32);
+            mmio_w32(bar, REG_DPLBASE, (pa as u32) | DPLBASE_ENABLE);
+            // Read back: a controller that refuses the buffer leaves the
+            // enable bit clear, and trusting an address it never writes to
+            // would freeze playback at position zero.
+            if mmio_r32(bar, REG_DPLBASE) & DPLBASE_ENABLE != 0 {
+                va + (iss * 8)
+            } else {
+                info!("[hda] {}: controller refused the DMA position buffer", name);
+                0
+            }
+        };
+
         let mut inner = HdaInner {
             bar,
             corb_va,
@@ -1126,6 +1232,9 @@ impl HdaDevice {
             queued: 0,
             last_lpib: 0,
             last_poll_us: 0,
+            dma_pos_va,
+            last_dpib: 0,
+            dpib_trusted: false,
             zero_ptr: 0,
             rate: 48000,
             channels: 2,
@@ -1377,6 +1486,24 @@ impl AudioScheme for HdaDevice {
             out,
             "[gpusnd] ring: running={} queued={} wp={} rate={} ch={}",
             inner.running, inner.queued, inner.wp, inner.rate, inner.channels
+        );
+        // Which position source the ring is pacing against. LPIB alone is the
+        // fragile case: on a controller whose LPIB runs ahead of what has been
+        // played, the writer is handed space that is still going to be played
+        // and overwrites it -- heard as a stream of very short dropouts. The
+        // position buffer is the second opinion that prevents that, and this
+        // says whether it is actually being maintained on this hardware.
+        let dpib = inner.dma_pos();
+        let _ = writeln!(
+            out,
+            "[gpusnd] position: LPIB {}{} guard={}B",
+            inner.lpib(),
+            match dpib {
+                Some(p) if inner.dpib_trusted => alloc::format!(" + DMA-pos {} (in use)", p),
+                Some(p) => alloc::format!(" + DMA-pos {} (not advancing yet)", p),
+                None => alloc::string::String::from(" only (controller refused a position buffer)"),
+            },
+            RING_GUARD
         );
 
         // The active path, read BACK from the codec rather than from our own
