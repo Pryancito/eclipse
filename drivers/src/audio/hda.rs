@@ -278,9 +278,11 @@ struct HdaInner {
     paused: bool,
     /// Next byte to write, offset into the ring.
     wp: usize,
-    /// Bytes queued and not yet confirmed consumed.
+    /// Bytes written and not yet played. Derived from the hardware play
+    /// position on every poll (see [`HdaInner::queued_at`]), never accumulated.
     queued: usize,
-    /// LPIB at the last progress poll.
+    /// LPIB at the last progress poll. Only underrun detection reads it: it is
+    /// the one question that needs a delta rather than a position.
     last_lpib: u32,
     /// `timer_now_as_micros()` at the last poll that actually read LPIB.
     /// Throttles that read to [`LPIB_POLL_MIN_US`].
@@ -295,6 +297,19 @@ struct HdaInner {
     dpib_trusted: bool,
     /// Ring offset up to which consumed data has been re-zeroed.
     zero_ptr: usize,
+
+    /// Counters behind the `/proc/gpusnd` "events" line. A tone that plays
+    /// with short repeated dropouts sounds the same whatever produced it;
+    /// these say which of them actually happened on this machine.
+    /// `drains` is the ring running dry with the writer still feeding it,
+    /// `underruns` the engine lapping the writer, `restarts` the full stream
+    /// reset (codec verbs and all) that either one costs on the next write,
+    /// and `stop_timeouts` the engine not acknowledging a cleared RUN bit --
+    /// the case where wiping the ring would race a still-fetching DMA.
+    stat_drains: u64,
+    stat_underruns: u64,
+    stat_restarts: u64,
+    stat_stop_timeouts: u64,
 
     rate: u32,
     channels: u8,
@@ -397,39 +412,28 @@ impl HdaInner {
         Some(unsafe { core::ptr::read_volatile(self.dma_pos_va as *const u32) })
     }
 
-    /// Bytes the engine consumed since the last poll, taken as the SMALLER of
-    /// what the two position sources claim.
+    /// Bytes still in the ring ahead of play position `pos`: the queue depth
+    /// implied by where the engine has got to and where the writer has.
     ///
-    /// `SD_LPIB` counts what the link has accepted, which on a number of real
-    /// controllers runs ahead of what has been played -- Linux keeps a
-    /// `position_fix` quirk table for exactly this and defaults to preferring
-    /// the position buffer. Believing the faster of the two would hand the
-    /// writer space that is still going to be played, and the next write would
-    /// overwrite it: a short dropout, repeated, rather than one audible gap.
-    /// Taking the smaller can only ever make the driver think LESS has been
-    /// played, which costs a little ring capacity and can never corrupt the
-    /// stream.
+    /// Queue depth is a relation between two positions, never a running total.
+    /// Accumulating it -- subtracting a per-poll delta from a counter -- makes
+    /// every error permanent, and one particular way of producing that error
+    /// is what this replaces: taking the SMALLER of what the two position
+    /// sources claimed since the last poll. The two do not advance in
+    /// lockstep on real hardware. `SD_LPIB` moves continuously while the
+    /// controller refreshes the position buffer in bursts, so on every poll
+    /// that falls between two refreshes the buffer reports no progress at all
+    /// and the minimum throws away everything LPIB saw. QEMU updates both in
+    /// lockstep, which is why that never showed there and bit only on real
+    /// hardware: `queued` inflates at a large fraction of the playback rate,
+    /// eats the ring's free space within seconds, starves the writer, and
+    /// comes out as a stream of very short dropouts.
     ///
-    /// The position buffer is only believed once it has been seen to move: a
-    /// controller that accepts the base address and never writes to it would
-    /// otherwise report zero progress forever and stall playback outright.
-    fn consumed_since_last(&mut self, lpib: u32) -> usize {
+    /// Recomputing from positions is self-correcting instead: a poll that
+    /// reads a coarse or stale position is wrong only until the next one.
+    fn queued_at(&self, pos: usize) -> usize {
         let ring = self.ring_len;
-        let by_lpib = (lpib as usize + ring - self.last_lpib as usize) % ring;
-        let Some(dpib_raw) = self.dma_pos() else {
-            return by_lpib;
-        };
-        let dpib = dpib_raw as usize % ring;
-        let by_dpib = (dpib + ring - self.last_dpib as usize % ring) % ring;
-        self.last_dpib = dpib as u32;
-        if by_dpib > 0 {
-            self.dpib_trusted = true;
-        }
-        if self.dpib_trusted {
-            by_lpib.min(by_dpib)
-        } else {
-            by_lpib
-        }
+        (self.wp + ring - pos % ring) % ring
     }
 
     /// Fold DMA progress since the last poll into `queued`, detect underrun,
@@ -439,8 +443,10 @@ impl HdaInner {
             return;
         }
         if self.queued == 0 {
-            self.stop_stream();
-            self.silence_ring();
+            self.stat_drains += 1;
+            if self.stop_stream() {
+                self.silence_ring();
+            }
             return;
         }
         // Rate-limit the device read (see [`LPIB_POLL_MIN_US`]). Only the
@@ -452,27 +458,55 @@ impl HdaInner {
             return;
         }
         self.last_poll_us = now_us;
-        let lpib = self.lpib();
-        let consumed = self.consumed_since_last(lpib);
-        self.last_lpib = lpib;
+        let ring = self.ring_len;
+        let lpib = self.lpib() as usize % ring;
+        // Underrun is a question about progress, so that one really is a
+        // delta: the engine having travelled further than we ever queued means
+        // it has lapped the writer and is replaying the ring.
+        let consumed = (lpib + ring - self.last_lpib as usize % ring) % ring;
+        self.last_lpib = lpib as u32;
         if consumed >= self.queued && consumed > 0 {
             // The engine ran past everything we queued: underrun. Stop and
             // wipe the ring so a looping DMA never replays stale samples.
             self.queued = 0;
-            self.stop_stream();
-            self.silence_ring();
+            self.stat_underruns += 1;
+            if self.stop_stream() {
+                self.silence_ring();
+            }
             return;
         }
-        self.queued -= consumed;
+
+        // Queue depth, taken from the hardware rather than accumulated. Where
+        // the two sources disagree, believe the one reporting LESS played:
+        // over-reporting is what hands the writer space that is still going to
+        // come out of the speakers.
+        let mut queued = self.queued_at(lpib);
+        if let Some(dpib_raw) = self.dma_pos() {
+            let dpib = dpib_raw as usize % ring;
+            if dpib != self.last_dpib as usize % ring {
+                // Only believed once seen to move: a controller that takes the
+                // base address and never writes to it would otherwise pin the
+                // depth at a full ring and stall playback outright.
+                self.dpib_trusted = true;
+            }
+            self.last_dpib = dpib as u32;
+            if self.dpib_trusted {
+                queued = queued.max(self.queued_at(dpib));
+            }
+        }
+        // A lapped or garbage position must not underflow `free_bytes`.
+        self.queued = queued.min(ring - RING_GUARD);
         if self.queued == 0 {
-            self.stop_stream();
-            self.silence_ring();
+            self.stat_drains += 1;
+            if self.stop_stream() {
+                self.silence_ring();
+            }
             return;
         }
 
         // Re-zero what the DMA engine has consumed, staying RING_GUARD behind
         // its current position (it prefetches past LPIB).
-        let safe_end = (lpib as usize + self.ring_len - RING_GUARD) % self.ring_len;
+        let safe_end = (lpib + self.ring_len - RING_GUARD) % self.ring_len;
         let to_zero = (safe_end + self.ring_len - self.zero_ptr) % self.ring_len;
         // Only zero regions that are actually behind the queue tail.
         let behind = (self.wp + self.ring_len - self.zero_ptr) % self.ring_len;
@@ -526,20 +560,29 @@ impl HdaInner {
         self.ring_len - RING_GUARD - self.queued
     }
 
-    fn stop_stream(&mut self) {
+    /// Clear RUN and wait for the engine to acknowledge it. Returns whether it
+    /// did: a caller that is about to rewrite the ring must not do so while
+    /// the engine is still fetching from it.
+    fn stop_stream(&mut self) -> bool {
         let ctl = mmio_r32(self.bar, self.sd_base + SD_CTL);
         mmio_w32(self.bar, self.sd_base + SD_CTL, ctl & !0x2);
         // Wait for RUN to actually drop: HDMI controllers keep fetching for
         // a few frames after the bit clears. Silencing the ring before that
         // races the engine and leaves a looping fragment.
         let t = timer_now_as_micros();
+        let mut stopped = true;
         while mmio_r32(self.bar, self.sd_base + SD_CTL) & 0x2 != 0 {
             if timer_now_as_micros().wrapping_sub(t) > 10_000 {
+                stopped = false;
                 break;
             }
             core::hint::spin_loop();
         }
+        if !stopped {
+            self.stat_stop_timeouts += 1;
+        }
         self.running = false;
+        stopped
     }
 
     fn silence_ring(&mut self) {
@@ -580,9 +623,11 @@ impl HdaInner {
         self.queued -= n;
         self.zero_range(self.wp, n);
         if self.queued == 0 {
-            self.stop_stream();
+            let stopped = self.stop_stream();
             self.paused = false;
-            self.silence_ring();
+            if stopped {
+                self.silence_ring();
+            }
             self.wp = 0;
             self.zero_ptr = 0;
             self.last_lpib = 0;
@@ -606,9 +651,11 @@ impl HdaInner {
         self.zero_range(start, n);
         self.queued -= n;
         if self.queued == 0 {
-            self.stop_stream();
+            let stopped = self.stop_stream();
             self.paused = false;
-            self.silence_ring();
+            if stopped {
+                self.silence_ring();
+            }
             self.wp = 0;
             self.zero_ptr = 0;
             self.last_lpib = 0;
@@ -685,6 +732,7 @@ impl HdaInner {
         self.dpib_trusted = false;
         self.running = true;
         self.paused = false;
+        self.stat_restarts += 1;
         Ok(())
     }
 }
@@ -1236,6 +1284,10 @@ impl HdaDevice {
             last_dpib: 0,
             dpib_trusted: false,
             zero_ptr: 0,
+            stat_drains: 0,
+            stat_underruns: 0,
+            stat_restarts: 0,
+            stat_stop_timeouts: 0,
             rate: 48000,
             channels: 2,
             gain_l: 100,
@@ -1496,14 +1548,22 @@ impl AudioScheme for HdaDevice {
         let dpib = inner.dma_pos();
         let _ = writeln!(
             out,
-            "[gpusnd] position: LPIB {}{} guard={}B",
+            "[gpusnd] position: LPIB {}{} guard={}B queued={}B free={}B of {}B",
             inner.lpib(),
             match dpib {
                 Some(p) if inner.dpib_trusted => alloc::format!(" + DMA-pos {} (in use)", p),
                 Some(p) => alloc::format!(" + DMA-pos {} (not advancing yet)", p),
                 None => alloc::string::String::from(" only (controller refused a position buffer)"),
             },
-            RING_GUARD
+            RING_GUARD,
+            inner.queued,
+            inner.free_bytes(),
+            inner.ring_len
+        );
+        let _ = writeln!(
+            out,
+            "[gpusnd] events: {} drains, {} underruns, {} stream restarts, {} stop timeouts",
+            inner.stat_drains, inner.stat_underruns, inner.stat_restarts, inner.stat_stop_timeouts
         );
 
         // The active path, read BACK from the codec rather than from our own
