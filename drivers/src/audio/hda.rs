@@ -163,7 +163,13 @@ const BDL_SEGMENT: usize = 16 * 1024;
 /// stream of very short dropouts rather than one obvious gap.
 ///
 /// 4 KiB is 21 ms of slack and costs 3% of the ring.
-const RING_GUARD: usize = 4096;
+const RING_GUARD: usize = 8192;
+
+/// Silence kept ahead of the write pointer, so that an engine that runs past
+/// the end of what was written plays silence -- not the previous lap -- for
+/// as long as it takes the next poll to notice and stop it. Half the guard:
+/// it must end short of the estimated play position, never at it.
+const SILENCE_AHEAD: usize = RING_GUARD / 2;
 
 /// Minimum interval between reads of the stream position register.
 ///
@@ -333,8 +339,23 @@ struct HdaInner {
     /// maintaining it, and it must not be allowed to stall playback.
     last_dpib: u32,
     dpib_trusted: bool,
-    /// Ring offset up to which consumed data has been re-zeroed.
+    /// Ring offset up to which the silence ahead of `wp` has been written.
     zero_ptr: usize,
+    /// Bytes the link has taken from the ring since RUN: the smaller of what
+    /// its own clock says and what the controller's position reports. This is
+    /// the play position everything else is derived from.
+    consumed: u64,
+    /// `WALCLK` at the last poll, and link-clock ticks accumulated while
+    /// running (pauses excluded, 32-bit wrap handled by polling often).
+    wall_last: u32,
+    wall_ticks: u64,
+    /// Accepted advance of each reported position since RUN, unwrapped.
+    lpib_total: u64,
+    dpib_total: u64,
+    /// The most the reported position has been seen to run ahead of the
+    /// link clock, in bytes. This is the number that decides whether the
+    /// controller's position can be trusted for pacing on this hardware.
+    stat_lead: u64,
 
     /// Counters behind the `/proc/gpusnd` "events" line. A tone that plays
     /// with short repeated dropouts sounds the same whatever produced it;
@@ -477,28 +498,29 @@ impl HdaInner {
         Some(unsafe { core::ptr::read_volatile(self.dma_pos_va as *const u32) })
     }
 
-    /// Bytes still in the ring ahead of play position `pos`: the queue depth
-    /// implied by where the engine has got to and where the writer has.
+    /// Keep [`SILENCE_AHEAD`] bytes of zeros immediately after the write
+    /// pointer. Incremental: only the bytes newly exposed since the last call
+    /// are written, so the cost is one extra store per byte of audio.
     ///
-    /// Queue depth is a relation between two positions, never a running total.
-    /// Accumulating it -- subtracting a per-poll delta from a counter -- makes
-    /// every error permanent, and one particular way of producing that error
-    /// is what this replaces: taking the SMALLER of what the two position
-    /// sources claimed since the last poll. The two do not advance in
-    /// lockstep on real hardware. `SD_LPIB` moves continuously while the
-    /// controller refreshes the position buffer in bursts, so on every poll
-    /// that falls between two refreshes the buffer reports no progress at all
-    /// and the minimum throws away everything LPIB saw. QEMU updates both in
-    /// lockstep, which is why that never showed there and bit only on real
-    /// hardware: `queued` inflates at a large fraction of the playback rate,
-    /// eats the ring's free space within seconds, starves the writer, and
-    /// comes out as a stream of very short dropouts.
-    ///
-    /// Recomputing from positions is self-correcting instead: a poll that
-    /// reads a coarse or stale position is wrong only until the next one.
-    fn queued_at(&self, pos: usize) -> usize {
+    /// The zone is the start of the free region, i.e. the oldest played data;
+    /// it ends at least `RING_GUARD - SILENCE_AHEAD` short of the estimated
+    /// play position, so a small error in that estimate cannot silence audio
+    /// still to be played -- which is what #1096 removed and this must not
+    /// bring back.
+    fn silence_ahead(&mut self) {
         let ring = self.ring_len;
-        (self.wp + ring - pos % ring) % ring
+        let have = (self.zero_ptr + ring - self.wp) % ring;
+        let (start, len) = if have == SILENCE_AHEAD {
+            return;
+        } else if have < SILENCE_AHEAD {
+            (self.zero_ptr, SILENCE_AHEAD - have)
+        } else {
+            // The writer overtook the zone (a write longer than it): restart
+            // from the write pointer. Never touch anything before it.
+            (self.wp, SILENCE_AHEAD)
+        };
+        self.zero_range(start, len);
+        self.zero_ptr = (self.wp + SILENCE_AHEAD) % ring;
     }
 
     /// Milliseconds since the stream started by the controller's own clock.
@@ -549,7 +571,7 @@ impl HdaInner {
             }
             return;
         }
-        // Rate-limit the device read (see [`LPIB_POLL_MIN_US`]). Only the
+        // Rate-limit the device reads (see [`LPIB_POLL_MIN_US`]). Only the
         // "still playing" path is throttled: the drain/stop decisions above
         // and below run on every call, so nothing is deferred that could
         // leave the stream running with an empty ring.
@@ -559,18 +581,32 @@ impl HdaInner {
             return;
         }
         let ring = self.ring_len;
-        // The most the engine can have advanced since the last ACCEPTED read.
-        // `last_poll_us` only moves on an accepted read, so a run of bad
-        // reads keeps widening the budget until a sane one gets through.
         let rate_bytes = self.rate as u64 * self.frame_bytes() as u64;
+
+        // The link clock is the play position. The link takes exactly the
+        // PCM byte rate per second of its own 24 MHz clock from the moment
+        // RUN is set; the controller's position registers, on the other
+        // hand, report where its DMA engine has got to, and on the hardware
+        // this was written against that ran 15-27 KB ahead of the link and
+        // moved in bursts of several KB -- far more than any guard, and the
+        // writer was handed unplayed audio to overwrite on every burst. The
+        // registers still serve as a cap: the link cannot have played what
+        // the engine has not fetched, so if the engine stalls the clock
+        // estimate cannot run away from it.
+        let wall = mmio_r32(self.bar, REG_WALCLK);
+        self.wall_ticks += wall.wrapping_sub(self.wall_last) as u64;
+        self.wall_last = wall;
+        let by_clock = (self.wall_ticks as u128 * rate_bytes as u128 / WALCLK_HZ as u128) as u64;
+
+        // The most a reported position can have advanced since the last
+        // ACCEPTED read. `last_poll_us` only moves on an accepted read, so a
+        // run of bad reads keeps widening the budget until a sane one gets
+        // through.
         let max_advance = (dt_us.saturating_mul(rate_bytes) / 1_000_000) as usize + POS_SLACK;
         let lpib_raw = self.lpib();
         let lpib = lpib_raw as usize % ring;
-        // Underrun is a question about progress, so that one really is a
-        // delta: the engine having travelled further than we ever queued means
-        // it has lapped the writer and is replaying the ring.
-        let consumed = (lpib + ring - self.last_lpib as usize % ring) % ring;
-        if consumed > max_advance {
+        let advanced = (lpib + ring - self.last_lpib as usize % ring) % ring;
+        if advanced > max_advance {
             // Impossible progress (a backwards step shows up here too, as
             // nearly a full lap forward). Garbage: keep everything as it was.
             self.stat_bad_pos += 1;
@@ -582,29 +618,13 @@ impl HdaInner {
         }
         self.last_poll_us = now_us;
         self.last_lpib = lpib as u32;
+        self.lpib_total += advanced as u64;
         self.poll_stream_errors();
-        if consumed >= self.queued && consumed > 0 {
-            // The engine ran past everything we queued: underrun. Stop and
-            // wipe the ring so a looping DMA never replays stale samples.
-            self.queued = 0;
-            self.stat_underruns += 1;
-            self.record_stop(b'U');
-            if self.stop_stream() {
-                self.silence_ring();
-            }
-            return;
-        }
-
-        // Queue depth, taken from the hardware rather than accumulated. Where
-        // the two sources disagree, believe the one reporting LESS played:
-        // over-reporting is what hands the writer space that is still going to
-        // come out of the speakers.
-        let mut queued = self.queued_at(lpib);
+        let mut reported = self.lpib_total;
         if let Some(dpib_raw) = self.dma_pos() {
             let dpib = dpib_raw as usize % ring;
             let advanced = (dpib + ring - self.last_dpib as usize % ring) % ring;
             if advanced > max_advance {
-                // Same test as LPIB, same verdict: this read is not progress.
                 self.stat_bad_pos += 1;
                 self.last_bad_pos = dpib_raw;
                 self.last_bad_prev = self.last_dpib;
@@ -614,61 +634,40 @@ impl HdaInner {
                 if advanced > 0 {
                     // Only believed once seen to move: a controller that takes
                     // the base address and never writes to it would otherwise
-                    // pin the depth at a full ring and stall playback outright.
+                    // report zero progress forever.
                     self.dpib_trusted = true;
                 }
                 self.last_dpib = dpib as u32;
+                self.dpib_total += advanced as u64;
                 if self.dpib_trusted {
-                    queued = queued.max(self.queued_at(dpib));
+                    reported = reported.min(self.dpib_total);
                 }
             }
         }
-        // A lapped or garbage position must not underflow `free_bytes`.
+        self.stat_lead = self.stat_lead.max(reported.saturating_sub(by_clock));
+
+        // Consumed is the smaller of the two, and never goes backwards.
+        self.consumed = self.consumed.max(by_clock.min(reported));
+        let written = self.stream_written as u64;
+        let queued = written.saturating_sub(self.consumed) as usize;
+        // Never more than the writer is allowed to have in flight, so a
+        // garbage value cannot underflow `free_bytes`.
         self.queued = queued.min(ring - RING_GUARD);
         if self.queued == 0 {
-            self.stat_drains += 1;
-            self.record_stop(b'D');
+            // The link has played everything written. If the engine's own
+            // position also passed the tail, it got there before the writer
+            // did: that is the underrun; otherwise the stream simply ended.
+            if reported > written {
+                self.stat_underruns += 1;
+                self.record_stop(b'U');
+            } else {
+                self.stat_drains += 1;
+                self.record_stop(b'D');
+            }
             if self.stop_stream() {
                 self.silence_ring();
             }
-            return;
         }
-
-        // Re-zero what the engine has consumed, so that a writer that stops
-        // feeding leaves silence, not a stale lap, ahead of the playhead.
-        //
-        // The played span runs forward from `wp` to the play position, and
-        // only the part of it that ends RING_GUARD short of that position is
-        // touched. That is the invariant the previous arithmetic claimed and
-        // did not keep: once `zero_ptr` sat inside the guard, a modular
-        // subtraction wrapped to nearly a full ring and the clamp let through
-        // exactly enough to silence up to `wp + RING_GUARD` -- with a full
-        // ring, that is the playhead minus one poll's lag. Zeros were being
-        // written right at the position the engine was fetching, thousands
-        // of times a second. With a full ring the played span IS the guard,
-        // and nothing here runs.
-        let played = self.ring_len - self.queued;
-        let zeroable = played.saturating_sub(RING_GUARD);
-        let off = (self.zero_ptr + self.ring_len - self.wp) % self.ring_len;
-        if off >= played {
-            // The writer has overtaken the zero pointer: everything from here
-            // on is queued audio. Start again from the oldest played byte.
-            self.zero_ptr = self.wp;
-            return;
-        }
-        if off >= zeroable {
-            return;
-        }
-        let mut p = self.zero_ptr;
-        let mut left = zeroable - off;
-        while left > 0 {
-            let chunk = left.min(self.ring_len - p);
-            unsafe { core::ptr::write_bytes((self.ring_va + p) as *mut u8, 0, chunk) };
-            clflush_range(self.ring_va + p, chunk);
-            p = (p + chunk) % self.ring_len;
-            left -= chunk;
-        }
-        self.zero_ptr = p;
     }
 
     /// Copy `src` into the ring at `dst` (virtual address), applying the
@@ -769,7 +768,11 @@ impl HdaInner {
         }
         self.wp = (self.wp + self.ring_len - n) % self.ring_len;
         self.queued -= n;
+        // The bytes are un-written as far as the play position is concerned.
+        self.stream_written = self.stream_written.saturating_sub(n);
         self.zero_range(self.wp, n);
+        self.zero_ptr = self.wp;
+        self.silence_ahead();
         if self.queued == 0 {
             let stopped = self.stop_stream();
             self.paused = false;
@@ -796,8 +799,10 @@ impl HdaInner {
         } else {
             (self.wp + self.ring_len - self.queued) % self.ring_len
         };
+        // The skipped bytes still occupy the ring and still take their time
+        // to play (as silence); the queue depth is what the link clock says
+        // it is, so it is not adjusted here.
         self.zero_range(start, n);
-        self.queued -= n;
         if self.queued == 0 {
             let stopped = self.stop_stream();
             self.paused = false;
@@ -824,6 +829,9 @@ impl HdaInner {
         if self.running || self.queued == 0 {
             return Ok(());
         }
+        // The link clock kept counting while paused; the stream did not.
+        self.wall_last = mmio_r32(self.bar, REG_WALCLK);
+        self.last_poll_us = timer_now_as_micros();
         let ctl = mmio_r32(self.bar, self.sd_base + SD_CTL);
         mmio_w32(self.bar, self.sd_base + SD_CTL, ctl | 0x2);
         self.running = true;
@@ -893,6 +901,11 @@ impl HdaInner {
         self.stat_restarts += 1;
         self.stream_start_us = self.last_poll_us;
         self.stream_start_wall = mmio_r32(bar, REG_WALCLK);
+        self.wall_last = self.stream_start_wall;
+        self.wall_ticks = 0;
+        self.lpib_total = 0;
+        self.dpib_total = 0;
+        self.consumed = 0;
         self.stream_written = 0;
         Ok(())
     }
@@ -1445,6 +1458,12 @@ impl HdaDevice {
             last_dpib: 0,
             dpib_trusted: false,
             zero_ptr: 0,
+            consumed: 0,
+            wall_last: 0,
+            wall_ticks: 0,
+            lpib_total: 0,
+            dpib_total: 0,
+            stat_lead: 0,
             stat_drains: 0,
             stat_underruns: 0,
             stat_restarts: 0,
@@ -1600,6 +1619,7 @@ impl AudioScheme for HdaDevice {
         }
         inner.wp = p;
         inner.queued += n;
+        inner.silence_ahead();
         if !inner.running && !inner.paused {
             inner.start_stream()?;
         }
@@ -1770,19 +1790,20 @@ impl AudioScheme for HdaDevice {
         if inner.running {
             let kernel_ms = timer_now_as_micros().wrapping_sub(inner.stream_start_us) / 1000;
             let wall_ms = inner.stream_wall_ms();
-            let consumed = inner.stream_written.saturating_sub(inner.queued) as u64;
+            let consumed = inner.consumed;
             let ratio_pct = (kernel_ms * 100).checked_div(wall_ms).unwrap_or(0);
             let engine_rate = (consumed * 1000).checked_div(wall_ms).unwrap_or(0);
             let _ = writeln!(
                 out,
-                "[gpusnd] clocks: stream age {} ms by kernel clock, {} ms by HDA wall clock (kernel/wall = {}.{:02}); engine consumed {} B = {} B/s by wall clock (PCM rate {} B/s)",
+                "[gpusnd] clocks: stream age {} ms by kernel clock, {} ms by HDA wall clock (kernel/wall = {}.{:02}); link consumed {} B = {} B/s by wall clock (PCM rate {} B/s); reported position ran ahead of the link clock by up to {} B",
                 kernel_ms,
                 wall_ms,
                 ratio_pct / 100,
                 ratio_pct % 100,
                 consumed,
                 engine_rate,
-                inner.rate as u64 * inner.frame_bytes() as u64
+                inner.rate as u64 * inner.frame_bytes() as u64,
+                inner.stat_lead
             );
         }
         // The last stops, oldest first. wavplay's tone is 576000 B, so a stop
