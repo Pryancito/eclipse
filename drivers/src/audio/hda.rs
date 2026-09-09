@@ -868,6 +868,15 @@ impl HdaInner {
             self.setup_digital_converter(self.channels);
         }
 
+        // The position buffer entry still holds the previous stream's last
+        // value until the controller writes a new one; read after RUN it
+        // would look like an impossible jump from 0 and be rejected. Clear it.
+        if self.dma_pos_va != 0 {
+            // SAFETY: our own page, this stream's 8-byte entry.
+            unsafe { core::ptr::write_volatile(self.dma_pos_va as *mut u32, 0) };
+            clflush_range(self.dma_pos_va, 8);
+        }
+
         fence(Ordering::SeqCst);
         // Tag + RUN.
         mmio_w32(bar, sd + SD_CTL, (self.stream_tag << 20) | 0x2);
