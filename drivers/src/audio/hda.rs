@@ -146,8 +146,13 @@ const PIN_CTL_OUT_EN: u32 = 0x40;
 /// Time to wait for one codec verb response.
 const VERB_TIMEOUT_US: u64 = 200_000;
 
-/// PCM ring: 32 pages = 128 KiB (683 ms of 48 kHz S16LE stereo).
-const RING_PAGES: usize = 32;
+/// PCM ring: 64 pages = 256 KiB (1.37 s of 48 kHz S16LE stereo).
+///
+/// Sized for the hardware this was written against, whose DMA engine fetches
+/// up to ~96 KB ahead of what the link has played, and for a guard large
+/// enough to absorb the link's start-up latency (below). 128 KiB left the
+/// engine 24 KB from the writer.
+const RING_PAGES: usize = 64;
 /// The BDL splits the ring into fixed 16 KiB cyclic segments.
 const BDL_SEGMENT: usize = 16 * 1024;
 /// Keep the software write pointer at least this far behind the reported play
@@ -163,13 +168,19 @@ const BDL_SEGMENT: usize = 16 * 1024;
 /// stream of very short dropouts rather than one obvious gap.
 ///
 /// 4 KiB is 21 ms of slack and costs 3% of the ring.
-const RING_GUARD: usize = 8192;
+/// 32 KiB is 170 ms: the play position is derived from the link clock
+/// counted from RUN, and the link on an HDMI codec may only begin consuming
+/// some time after that. Until it does the estimate runs ahead of the truth
+/// by that latency, for the life of the stream; the guard is what keeps the
+/// writer behind the real playhead through it.
+const RING_GUARD: usize = 32768;
 
 /// Silence kept ahead of the write pointer, so that an engine that runs past
 /// the end of what was written plays silence -- not the previous lap -- for
-/// as long as it takes the next poll to notice and stop it. Half the guard:
-/// it must end short of the estimated play position, never at it.
-const SILENCE_AHEAD: usize = RING_GUARD / 2;
+/// as long as it takes the next poll to notice and stop it. Much smaller
+/// than the guard: the band must end well short of the estimated play
+/// position, never at it, for the same start-up-latency reason.
+const SILENCE_AHEAD: usize = 8192;
 
 /// Minimum interval between reads of the stream position register.
 ///
@@ -353,9 +364,12 @@ struct HdaInner {
     lpib_total: u64,
     dpib_total: u64,
     /// The most the reported position has been seen to run ahead of the
-    /// link clock, in bytes. This is the number that decides whether the
-    /// controller's position can be trusted for pacing on this hardware.
+    /// link clock, in bytes, and where it stands now. The maximum is the
+    /// engine's prefetch depth (it fills before the link starts); the
+    /// difference between the two is how long the link took to start
+    /// consuming after RUN -- the latency the guard has to cover.
     stat_lead: u64,
+    lead_now: u64,
 
     /// Counters behind the `/proc/gpusnd` "events" line. A tone that plays
     /// with short repeated dropouts sounds the same whatever produced it;
@@ -596,7 +610,11 @@ impl HdaInner {
         let wall = mmio_r32(self.bar, REG_WALCLK);
         self.wall_ticks += wall.wrapping_sub(self.wall_last) as u64;
         self.wall_last = wall;
-        let by_clock = (self.wall_ticks as u128 * rate_bytes as u128 / WALCLK_HZ as u128) as u64;
+        // Whole frames, rounded down: the link takes samples, not bytes.
+        let frame = self.frame_bytes() as u64;
+        let by_clock = (self.wall_ticks as u128 * rate_bytes as u128 / WALCLK_HZ as u128) as u64
+            / frame
+            * frame;
 
         // The most a reported position can have advanced since the last
         // ACCEPTED read. `last_poll_us` only moves on an accepted read, so a
@@ -644,7 +662,8 @@ impl HdaInner {
                 }
             }
         }
-        self.stat_lead = self.stat_lead.max(reported.saturating_sub(by_clock));
+        self.lead_now = reported.saturating_sub(by_clock);
+        self.stat_lead = self.stat_lead.max(self.lead_now);
 
         // Consumed is the smaller of the two, and never goes backwards.
         self.consumed = self.consumed.max(by_clock.min(reported));
@@ -906,6 +925,8 @@ impl HdaInner {
         self.lpib_total = 0;
         self.dpib_total = 0;
         self.consumed = 0;
+        self.stat_lead = 0;
+        self.lead_now = 0;
         self.stream_written = 0;
         Ok(())
     }
@@ -1464,6 +1485,7 @@ impl HdaDevice {
             lpib_total: 0,
             dpib_total: 0,
             stat_lead: 0,
+            lead_now: 0,
             stat_drains: 0,
             stat_underruns: 0,
             stat_restarts: 0,
@@ -1795,7 +1817,7 @@ impl AudioScheme for HdaDevice {
             let engine_rate = (consumed * 1000).checked_div(wall_ms).unwrap_or(0);
             let _ = writeln!(
                 out,
-                "[gpusnd] clocks: stream age {} ms by kernel clock, {} ms by HDA wall clock (kernel/wall = {}.{:02}); link consumed {} B = {} B/s by wall clock (PCM rate {} B/s); reported position ran ahead of the link clock by up to {} B",
+                "[gpusnd] clocks: stream age {} ms by kernel clock, {} ms by HDA wall clock (kernel/wall = {}.{:02}); link consumed {} B = {} B/s by wall clock (PCM rate {} B/s); reported position ran ahead of the link clock by up to {} B, now {} B (link start latency ~{} ms)",
                 kernel_ms,
                 wall_ms,
                 ratio_pct / 100,
@@ -1803,7 +1825,10 @@ impl AudioScheme for HdaDevice {
                 consumed,
                 engine_rate,
                 inner.rate as u64 * inner.frame_bytes() as u64,
-                inner.stat_lead
+                inner.stat_lead,
+                inner.lead_now,
+                (inner.stat_lead - inner.lead_now) * 1000
+                    / (inner.rate as u64 * inner.frame_bytes() as u64).max(1)
             );
         }
         // The last stops, oldest first. wavplay's tone is 576000 B, so a stop
