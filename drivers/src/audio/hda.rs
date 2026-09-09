@@ -504,15 +504,33 @@ impl HdaInner {
             return;
         }
 
-        // Re-zero what the DMA engine has consumed, staying RING_GUARD behind
-        // its current position (it prefetches past LPIB).
-        let safe_end = (lpib + self.ring_len - RING_GUARD) % self.ring_len;
-        let to_zero = (safe_end + self.ring_len - self.zero_ptr) % self.ring_len;
-        // Only zero regions that are actually behind the queue tail.
-        let behind = (self.wp + self.ring_len - self.zero_ptr) % self.ring_len;
-        let n = to_zero.min(behind.saturating_sub(self.queued));
+        // Re-zero what the engine has consumed, so that a writer that stops
+        // feeding leaves silence, not a stale lap, ahead of the playhead.
+        //
+        // The played span runs forward from `wp` to the play position, and
+        // only the part of it that ends RING_GUARD short of that position is
+        // touched. That is the invariant the previous arithmetic claimed and
+        // did not keep: once `zero_ptr` sat inside the guard, a modular
+        // subtraction wrapped to nearly a full ring and the clamp let through
+        // exactly enough to silence up to `wp + RING_GUARD` -- with a full
+        // ring, that is the playhead minus one poll's lag. Zeros were being
+        // written right at the position the engine was fetching, thousands
+        // of times a second. With a full ring the played span IS the guard,
+        // and nothing here runs.
+        let played = self.ring_len - self.queued;
+        let zeroable = played.saturating_sub(RING_GUARD);
+        let off = (self.zero_ptr + self.ring_len - self.wp) % self.ring_len;
+        if off >= played {
+            // The writer has overtaken the zero pointer: everything from here
+            // on is queued audio. Start again from the oldest played byte.
+            self.zero_ptr = self.wp;
+            return;
+        }
+        if off >= zeroable {
+            return;
+        }
         let mut p = self.zero_ptr;
-        let mut left = n;
+        let mut left = zeroable - off;
         while left > 0 {
             let chunk = left.min(self.ring_len - p);
             unsafe { core::ptr::write_bytes((self.ring_va + p) as *mut u8, 0, chunk) };
@@ -1565,6 +1583,74 @@ impl AudioScheme for HdaDevice {
             "[gpusnd] events: {} drains, {} underruns, {} stream restarts, {} stop timeouts",
             inner.stat_drains, inner.stat_underruns, inner.stat_restarts, inner.stat_stop_timeouts
         );
+        // What is actually IN the ring right now. Read while a tone plays,
+        // this separates the two remaining families of dropout: silence found
+        // in memory where the tone should be was put there by software (the
+        // writer or the re-zeroing pass); a ring with the tone intact that
+        // still plays with gaps points at the controller or the HDMI link.
+        // Offsets are given relative to LPIB, so a gap that lies within the
+        // queued span (0..queued ahead of LPIB) is unplayed audio that has
+        // already been damaged; one in the guard just behind LPIB is the
+        // previous lap and harmless.
+        if inner.running {
+            let ring = inner.ring_len;
+            let frame = inner.frame_bytes().max(2);
+            let lpib = inner.lpib() as usize % ring;
+            // The CPU never reads the ring except here; drop any lines a
+            // previous dump left cached so this sees what the engine sees.
+            clflush_range(inner.ring_va, ring);
+            let bytes = unsafe { core::slice::from_raw_parts(inner.ring_va as *const u8, ring) };
+            const QUIET: i16 = 16; // |sample| at or below this is "silence"
+            const MIN_RUN_FRAMES: usize = 48; // 1 ms at 48 kHz
+            let is_quiet = |f: usize| {
+                let b = &bytes[f * frame..(f + 1) * frame];
+                b.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .all(|c| i16::from_le_bytes(*c).unsigned_abs() <= QUIET as u16)
+            };
+            let frames = ring / frame;
+            let mut runs = 0usize;
+            let mut quiet_bytes = 0usize;
+            let mut longest = 0usize;
+            let mut peak: u16 = 0;
+            let mut listed = String::new();
+            let mut f = 0;
+            while f < frames {
+                if is_quiet(f) {
+                    let start = f;
+                    while f < frames && is_quiet(f) {
+                        f += 1;
+                    }
+                    let n = f - start;
+                    if n >= MIN_RUN_FRAMES {
+                        runs += 1;
+                        quiet_bytes += n * frame;
+                        longest = longest.max(n);
+                        if runs <= 8 {
+                            // Offset of the run's start ahead of the playhead.
+                            let ahead = (start * frame + ring - lpib) % ring;
+                            let _ = write!(listed, " [+{}B {}fr]", ahead, n);
+                        }
+                    }
+                } else {
+                    for c in bytes[f * frame..(f + 1) * frame].as_chunks::<2>().0 {
+                        peak = peak.max(i16::from_le_bytes(*c).unsigned_abs());
+                    }
+                    f += 1;
+                }
+            }
+            let _ = writeln!(
+                out,
+                "[gpusnd] ring scan: peak {} quiet runs {} ({} B, longest {} fr){}{}",
+                peak,
+                runs,
+                quiet_bytes,
+                longest,
+                listed,
+                if runs > 8 { " ..." } else { "" }
+            );
+        }
 
         // The active path, read BACK from the codec rather than from our own
         // bookkeeping — that is the whole point of this dump.
