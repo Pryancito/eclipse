@@ -536,6 +536,11 @@ impl Syscall<'_> {
                 self.zircon_process().name(),
             );
         }
+        // File seals: a memfd sealed against shrinking or growing refuses the
+        // resize with EPERM (fcntl(2), F_SEAL_SHRINK / F_SEAL_GROW).
+        if !linux_object::fs::memfd_resize_allowed(&file.inode(), len as u64) {
+            return Err(LxError::EPERM);
+        }
         file.set_len(len as u64)?;
         // Leak telemetry: the desktop OOM is unfreed memfd content, and
         // ftruncate is the call that sizes memfds — every 64th call, log the
@@ -1612,10 +1617,14 @@ impl Syscall<'_> {
     /// - arg – additional parameters based on cmd
     pub async fn sys_fcntl(&self, fd: FileDesc, cmd: usize, arg: usize) -> SysResult {
         info!("fcntl: fd={:?}, cmd={}, arg={}", fd, cmd, arg);
-        // memfd file seals (`F_LINUX_SPECIFIC_BASE + 9/10`). We don't enforce
-        // seals — there is a single trusted address space — but Wayland/wlroots
-        // add `F_SEAL_SHRINK` to keymap memfds and abort if the call fails, so
-        // accept additions as a no-op and report "no seals set".
+        // memfd file seals (`F_LINUX_SPECIFIC_BASE + 9/10`), real ones. These
+        // used to be accepted as no-ops that reported "no seals set", on the
+        // reasoning that there is a single trusted address space. But a seal
+        // the kernel denies having is worse than one it refuses to take:
+        // Firefox seals every shared-memory segment against shrinking and then
+        // refuses to map any segment whose F_GET_SEALS does not report it
+        // (`Platform::IsSafeToMap`), so the no-op answer failed every IPC
+        // buffer and every frame.
         const F_ADD_SEALS: usize = 1033;
         const F_GET_SEALS: usize = 1034;
         const F_SETPIPE_SZ: usize = 1031;
@@ -1630,7 +1639,19 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
         if cmd == F_ADD_SEALS || cmd == F_GET_SEALS {
-            return Ok(0);
+            // Seals exist only on memfds; every other fd answers EINVAL, as
+            // Linux does for a filesystem without sealing support.
+            let inode = file_like
+                .downcast_ref::<File>()
+                .ok_or(LxError::EINVAL)?
+                .inode();
+            return if cmd == F_GET_SEALS {
+                linux_object::fs::memfd_seals(&inode)
+                    .map(|s| s as usize)
+                    .ok_or(LxError::EINVAL)
+            } else {
+                linux_object::fs::memfd_add_seals(&inode, arg as u32).map(|_| 0)
+            };
         }
         if matches!(
             cmd,
