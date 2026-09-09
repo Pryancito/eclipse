@@ -43,17 +43,37 @@ unsafe fn calibrate_tsc_hz_via_pit() -> Option<u64> {
 
     // Mode 0: OUT2 (bit 5 of 0x61) stays low until the counter hits zero,
     // then goes high. Many real laptops/firmware leave PIT channel 2 (the
-    // speaker gate) dead: the old 2e9 `spin_loop` cap froze boot at 51%
-    // for tens of seconds. Bound the wait with TSC (~100 ms at 2 GHz)
-    // so a missing PIT falls through to CPUID immediately.
-    const TSC_TIMEOUT: u64 = 200_000_000;
+    // speaker gate) dead, so the wait must be bounded -- but not by TSC
+    // cycles: the frequency is the very thing being measured. The old
+    // 200 M-cycle cap was "~100 ms at 2 GHz"; at 3.7 GHz it is 54.1 ms,
+    // less than the 54.9 ms the counter takes to reach zero, so every
+    // part above ~3.64 GHz timed out one tick short and fell through to
+    // the 2 GHz guess -- an i9-10900X ran its clock 1.84x fast for it.
+    // A dead PIT is one whose counter does not move: latch and read it
+    // back, and give up only when a read shows no progress since the last
+    // one across a run of reads long enough for any CPU to be sure.
+    const DEAD_READS: u32 = 20_000;
+    let mut last_count: u16 = PIT_COUNT;
+    let mut stale = 0u32;
     loop {
         if gate.read() & 0x20 != 0 {
             break;
         }
-        if core::arch::x86_64::_rdtsc().wrapping_sub(t0) > TSC_TIMEOUT {
-            gate.write(saved);
-            return None;
+        // Latch channel 2 (counter latch command, channel 2, no mode
+        // change) and read the frozen count, low byte then high.
+        cmd.write(0b1000_0000);
+        let lo = data.read() as u16;
+        let hi = data.read() as u16;
+        let count = lo | (hi << 8);
+        if count == last_count {
+            stale += 1;
+            if stale >= DEAD_READS {
+                gate.write(saved);
+                return None;
+            }
+        } else {
+            stale = 0;
+            last_count = count;
         }
         core::hint::spin_loop();
     }
