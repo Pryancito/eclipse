@@ -84,7 +84,15 @@ const REG_SD_BASE: usize = 0x80; // stream descriptors, 0x20 bytes each
 
 // Stream descriptor register offsets (from the descriptor base).
 const SD_CTL: usize = 0x00; // u32 (24-bit): bit0 SRST, bit1 RUN, [23:20] tag
+const SD_STS: usize = 0x03; // u8: bit2 BCIS, bit3 FIFOE, bit4 DESE (write-1-to-clear), bit5 FIFORDY
 const SD_LPIB: usize = 0x04; // u32: link position in cyclic buffer
+const SD_FIFOS: usize = 0x10; // u16: FIFO size in bytes
+const SD_STS_FIFOE: u8 = 1 << 3;
+const SD_STS_DESE: u8 = 1 << 4;
+/// Wall clock counter: 32 bits, counts link BCLK periods at 24 MHz. A time
+/// base independent of the kernel's TSC-derived clock.
+const REG_WALCLK: usize = 0x30;
+const WALCLK_HZ: u64 = 24_000_000;
 const SD_CBL: usize = 0x08; // u32: cyclic buffer length
 const SD_LVI: usize = 0x0c; // u16: last valid BDL index
 const SD_FMT: usize = 0x12; // u16: stream format
@@ -185,8 +193,10 @@ const STOP_HISTORY: usize = 4;
 struct StopEvent {
     /// `b'U'` underrun, `b'D'` drain, 0 = unused slot.
     kind: u8,
-    /// Milliseconds after the stream started.
+    /// Milliseconds after the stream started, by the kernel clock.
     at_ms: u64,
+    /// The same interval by the controller's 24 MHz wall clock.
+    wall_ms: u64,
     /// Bytes written to that stream by then.
     written: usize,
 }
@@ -338,6 +348,16 @@ struct HdaInner {
     /// underrun, on one bad read. The last rejected value is kept.
     stat_bad_pos: u64,
     last_bad_pos: u32,
+    /// The accepted value it was judged against, and the interval.
+    last_bad_prev: u32,
+    last_bad_dt_us: u64,
+    /// `SD_STS` errors seen (and cleared) while polling: FIFOE is the engine
+    /// failing to keep its FIFO fed from memory -- the link then plays
+    /// whatever it has, i.e. gaps -- and DESE a bad buffer descriptor.
+    stat_fifo_err: u64,
+    stat_desc_err: u64,
+    /// `WALCLK` when the current stream started.
+    stream_start_wall: u32,
     /// When the current stream started and how much has been written to it,
     /// so a stop can be placed within the stream it ended.
     stream_start_us: u64,
@@ -471,13 +491,38 @@ impl HdaInner {
         (self.wp + ring - pos % ring) % ring
     }
 
+    /// Milliseconds since the stream started by the controller's own clock.
+    fn stream_wall_ms(&self) -> u64 {
+        let ticks = mmio_r32(self.bar, REG_WALCLK).wrapping_sub(self.stream_start_wall);
+        ticks as u64 * 1000 / WALCLK_HZ
+    }
+
     fn record_stop(&mut self, kind: u8) {
         self.stops.copy_within(1.., 0);
         self.stops[STOP_HISTORY - 1] = StopEvent {
             kind,
             at_ms: timer_now_as_micros().wrapping_sub(self.stream_start_us) / 1000,
+            wall_ms: self.stream_wall_ms(),
             written: self.stream_written,
         };
+    }
+
+    /// Read and clear the stream's sticky error bits, counting them.
+    fn poll_stream_errors(&mut self) {
+        let sts = mmio_r8(self.bar, self.sd_base + SD_STS);
+        if sts & (SD_STS_FIFOE | SD_STS_DESE) != 0 {
+            if sts & SD_STS_FIFOE != 0 {
+                self.stat_fifo_err += 1;
+            }
+            if sts & SD_STS_DESE != 0 {
+                self.stat_desc_err += 1;
+            }
+            mmio_w8(
+                self.bar,
+                self.sd_base + SD_STS,
+                sts & (SD_STS_FIFOE | SD_STS_DESE),
+            );
+        }
     }
 
     /// Fold DMA progress since the last poll into `queued`, detect underrun,
@@ -520,10 +565,13 @@ impl HdaInner {
             // nearly a full lap forward). Garbage: keep everything as it was.
             self.stat_bad_pos += 1;
             self.last_bad_pos = lpib_raw;
+            self.last_bad_prev = self.last_lpib;
+            self.last_bad_dt_us = dt_us;
             return;
         }
         self.last_poll_us = now_us;
         self.last_lpib = lpib as u32;
+        self.poll_stream_errors();
         if consumed >= self.queued && consumed > 0 {
             // The engine ran past everything we queued: underrun. Stop and
             // wipe the ring so a looping DMA never replays stale samples.
@@ -548,6 +596,8 @@ impl HdaInner {
                 // Same test as LPIB, same verdict: this read is not progress.
                 self.stat_bad_pos += 1;
                 self.last_bad_pos = dpib_raw;
+                self.last_bad_prev = self.last_dpib;
+                self.last_bad_dt_us = dt_us;
             } else {
                 if advanced > 0 {
                     // Only believed once seen to move: a controller that takes
@@ -821,6 +871,7 @@ impl HdaInner {
         self.paused = false;
         self.stat_restarts += 1;
         self.stream_start_us = self.last_poll_us;
+        self.stream_start_wall = mmio_r32(bar, REG_WALCLK);
         self.stream_written = 0;
         Ok(())
     }
@@ -1379,6 +1430,11 @@ impl HdaDevice {
             stat_stop_timeouts: 0,
             stat_bad_pos: 0,
             last_bad_pos: 0,
+            last_bad_prev: 0,
+            last_bad_dt_us: 0,
+            stat_fifo_err: 0,
+            stat_desc_err: 0,
+            stream_start_wall: 0,
             stream_start_us: 0,
             stream_written: 0,
             stops: [StopEvent::default(); STOP_HISTORY],
@@ -1664,20 +1720,56 @@ impl AudioScheme for HdaDevice {
             inner.stat_stop_timeouts,
             inner.stat_bad_pos,
             if inner.stat_bad_pos > 0 {
-                alloc::format!(" (last {:#x})", inner.last_bad_pos)
+                alloc::format!(
+                    " (last {:#x} after {:#x}, {} us apart)",
+                    inner.last_bad_pos, inner.last_bad_prev, inner.last_bad_dt_us
+                )
             } else {
                 String::new()
             }
         );
+        let _ = writeln!(
+            out,
+            "[gpusnd] stream errors: {} FIFO underruns (FIFOE), {} descriptor errors (DESE), FIFO size {} B",
+            inner.stat_fifo_err,
+            inner.stat_desc_err,
+            mmio_r16(bar, sd + SD_FIFOS)
+        );
+        // Two clocks against each other. The kernel's is derived from the
+        // TSC; the controller's counts its own 24 MHz link clock. Over a
+        // running stream they must agree, and the engine must consume the
+        // PCM byte rate per wall-clock second. If the kernel clock runs fast
+        // the stream looks slow by it while the engine's rate by the wall
+        // clock is exact; if the engine really is starved, its rate by the
+        // wall clock falls short and FIFOE above says so.
+        if inner.running {
+            let kernel_ms = timer_now_as_micros().wrapping_sub(inner.stream_start_us) / 1000;
+            let wall_ms = inner.stream_wall_ms();
+            let consumed = inner.stream_written.saturating_sub(inner.queued) as u64;
+            let ratio_pct = (kernel_ms * 100).checked_div(wall_ms).unwrap_or(0);
+            let engine_rate = (consumed * 1000).checked_div(wall_ms).unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "[gpusnd] clocks: stream age {} ms by kernel clock, {} ms by HDA wall clock (kernel/wall = {}.{:02}); engine consumed {} B = {} B/s by wall clock (PCM rate {} B/s)",
+                kernel_ms,
+                wall_ms,
+                ratio_pct / 100,
+                ratio_pct % 100,
+                consumed,
+                engine_rate,
+                inner.rate as u64 * inner.frame_bytes() as u64
+            );
+        }
         // The last stops, oldest first. wavplay's tone is 576000 B, so a stop
         // that ends a stream short of that, well before 3000 ms, is a dropout;
         // one at ~3000 ms with all of it written is the tone ending.
         for ev in inner.stops.iter().filter(|e| e.kind != 0) {
             let _ = writeln!(
                 out,
-                "[gpusnd]   stop: {} at {} ms, {} B written to that stream",
+                "[gpusnd]   stop: {} at {} ms by kernel clock / {} ms by HDA wall clock, {} B written to that stream",
                 if ev.kind == b'U' { "underrun" } else { "drain" },
                 ev.at_ms,
+                ev.wall_ms,
                 ev.written
             );
         }
