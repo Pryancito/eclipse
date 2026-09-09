@@ -17,6 +17,12 @@ hal_fn_impl! {
             lock::set_phys_virt_offset(cfg.phys_to_virt_offset as u64);
             KCONFIG.init_once_by(cfg);
             KHANDLER.init_once_by(handler);
+            // Parse the framebuffer cmdline flags NOW, while the bootloader's
+            // command-line string is still mapped: the panic console used to
+            // re-read it on every write, so a late panic double-faulted inside
+            // its own banner and printed nothing.
+            #[cfg(target_arch = "x86_64")]
+            super::arch::early_fb_console::latch_cmdline_flags();
             crate::klog_info!("Eclipse: primary CPU {} init early", crate::cpu::cpu_id());
             super::arch::primary_init_early();
         }

@@ -69,7 +69,19 @@ fn cmdline_flag(cmdline: &str, key: &str) -> bool {
     false
 }
 
-fn apply_kconfig_fb_flags() {
+/// Set once [`latch_cmdline_flags`] has parsed the boot command line. After
+/// that the string is never read again: `KernelConfig::cmdline` borrows the
+/// bootloader's own memory, which is reclaimed once the kernel owns the
+/// physical map, so a later dereference faults. That mattered: every write to
+/// this console re-parsed the cmdline, and since the console is what prints a
+/// panic, ANY late panic turned into a second (unrecoverable) page fault
+/// inside the panic banner -- the machine halted with the real panic message
+/// never printed.
+static FLAGS_LATCHED: AtomicBool = AtomicBool::new(false);
+
+/// Parse the framebuffer flags out of the boot command line. Call exactly
+/// once, early, while `KernelConfig::cmdline` still points at mapped memory.
+pub fn latch_cmdline_flags() {
     let Some(cfg) = KCONFIG.try_get() else {
         return;
     };
@@ -80,11 +92,11 @@ fn apply_kconfig_fb_flags() {
         MIRROR_X.store(true, Ordering::SeqCst);
         zcore_drivers::scheme::set_scanout_mirror_x(true);
     }
+    FLAGS_LATCHED.store(true, Ordering::SeqCst);
 }
 
 fn try_init() -> bool {
     if INITED.load(Ordering::SeqCst) {
-        apply_kconfig_fb_flags();
         return true;
     }
     let cfg = match KCONFIG.try_get() {
@@ -105,7 +117,6 @@ fn try_init() -> bool {
     FB_HEIGHT.store(h as u32, Ordering::SeqCst);
     // Use the actual GOP stride. Real hardware often pads rows.
     FB_STRIDE_PIXELS.store(stride as u32, Ordering::SeqCst);
-    apply_kconfig_fb_flags();
 
     // IMPORTANT: do NOT clear on init.
     // We want the boot progress bar to be continuous from the bootloader (rboot)

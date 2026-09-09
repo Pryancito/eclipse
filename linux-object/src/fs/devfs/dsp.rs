@@ -48,6 +48,9 @@ struct AudioBufInfo {
 /// oriented; fragments only shape client buffering decisions.
 const FRAG_SIZE: usize = 4096;
 
+/// How long [`DspDev::write_at`] waits before re-offering PCM to a full ring.
+const RETRY_BACKOFF: core::time::Duration = core::time::Duration::from_micros(250);
+
 fn ucheck<T>(addr: usize) -> Result<()> {
     if kernel_hal::user::user_range_ok(addr, core::mem::size_of::<T>()) {
         Ok(())
@@ -118,7 +121,20 @@ impl INode for DspDev {
                 };
             }
             kernel_hal::deferred_job::drain_deferred_jobs();
-            core::hint::spin_loop();
+            // Back off before asking again. Every attempt takes the driver's
+            // IRQ-off lock, and (before the driver throttled it) read the
+            // stream position register -- an uncached device read on real
+            // hardware, a VM exit under virtualisation. Retrying at CPU speed
+            // meant ~1.2 M driver calls and ~500 k device reads per second of
+            // audio, which competes with the DMA engine it is waiting on.
+            // The ring drains at the PCM byte rate, so a quarter of a
+            // millisecond (48 bytes at 48 kHz stereo) is a lower bound on
+            // "enough new space to be worth another look" -- and 2700x
+            // shorter than the ring itself.
+            let resume = kernel_hal::timer::timer_now() + RETRY_BACKOFF;
+            while kernel_hal::timer::timer_now() < resume {
+                core::hint::spin_loop();
+            }
         }
         Ok(done)
     }
