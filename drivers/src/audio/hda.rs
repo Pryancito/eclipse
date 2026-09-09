@@ -181,10 +181,18 @@ const LPIB_POLL_MIN_US: u64 = 250;
 
 /// Slack allowed on top of what the PCM byte rate makes possible when judging
 /// whether a position read is believable: the controller updates its position
-/// in bursts, and the read itself is not instantaneous. One guard's worth
-/// (21 ms at 48 kHz stereo) is far more than any real burst and far less than
-/// the ring, so a garbage read cannot pass as progress.
-const POS_SLACK: usize = RING_GUARD;
+/// in bursts, and the read itself is not instantaneous.
+///
+/// One guard (4 KiB) was too tight. The reporter's NVIDIA controller advanced
+/// its position by 6844 bytes between two polls 150 us apart and had every
+/// such update rejected -- 65 in half a second -- which silently reduced the
+/// driver to LPIB alone, and the dropouts got WORSE: on that hardware LPIB is
+/// the source that over-reports and the position buffer the one that does
+/// not, exactly Linux's reason for preferring `POS_FIX_POSBUF`. A legitimate
+/// burst is bounded by the BDL segment the engine is working through; a
+/// garbage read is anywhere in a 128 KiB ring, so one segment (85 ms) still
+/// rejects most of them and the time budget rejects the rest.
+const POS_SLACK: usize = BDL_SEGMENT;
 
 const STOP_HISTORY: usize = 4;
 
@@ -351,6 +359,8 @@ struct HdaInner {
     /// The accepted value it was judged against, and the interval.
     last_bad_prev: u32,
     last_bad_dt_us: u64,
+    /// Which source produced it: `b'L'` LPIB, `b'P'` position buffer.
+    last_bad_src: u8,
     /// `SD_STS` errors seen (and cleared) while polling: FIFOE is the engine
     /// failing to keep its FIFO fed from memory -- the link then plays
     /// whatever it has, i.e. gaps -- and DESE a bad buffer descriptor.
@@ -567,6 +577,7 @@ impl HdaInner {
             self.last_bad_pos = lpib_raw;
             self.last_bad_prev = self.last_lpib;
             self.last_bad_dt_us = dt_us;
+            self.last_bad_src = b'L';
             return;
         }
         self.last_poll_us = now_us;
@@ -598,6 +609,7 @@ impl HdaInner {
                 self.last_bad_pos = dpib_raw;
                 self.last_bad_prev = self.last_dpib;
                 self.last_bad_dt_us = dt_us;
+                self.last_bad_src = b'P';
             } else {
                 if advanced > 0 {
                     // Only believed once seen to move: a controller that takes
@@ -1432,6 +1444,7 @@ impl HdaDevice {
             last_bad_pos: 0,
             last_bad_prev: 0,
             last_bad_dt_us: 0,
+            last_bad_src: 0,
             stat_fifo_err: 0,
             stat_desc_err: 0,
             stream_start_wall: 0,
@@ -1721,8 +1734,11 @@ impl AudioScheme for HdaDevice {
             inner.stat_bad_pos,
             if inner.stat_bad_pos > 0 {
                 alloc::format!(
-                    " (last {:#x} after {:#x}, {} us apart)",
-                    inner.last_bad_pos, inner.last_bad_prev, inner.last_bad_dt_us
+                    " (last {} {:#x} after {:#x}, {} us apart)",
+                    if inner.last_bad_src == b'P' { "DMA-pos" } else { "LPIB" },
+                    inner.last_bad_pos,
+                    inner.last_bad_prev,
+                    inner.last_bad_dt_us
                 )
             } else {
                 String::new()

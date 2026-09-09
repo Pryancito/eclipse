@@ -53,6 +53,26 @@ fn tsc_ns_mult_init() -> u64 {
     mult
 }
 
+/// The TSC frequency was corrected (see `cpu::recalibrate_tsc_hz`): rebuild
+/// the multiplier and let the monotonic floor follow the clock down.
+///
+/// `timer_now` stays `tsc * mult >> 32` with no base, so a smaller multiplier
+/// makes the reading drop once, right here. This runs on the BSP at boot,
+/// before the APs and the tick exist and before anything outside the kernel
+/// can read time; deadlines armed before it simply fire a little later. The
+/// floor is lowered to the new reading so the clamped path does not freeze
+/// until the old reading is overtaken, and the invariant-path watchdog does
+/// not mistake the drop for cross-CPU skew.
+pub(super) fn tsc_hz_changed(hz: u64) {
+    let mult = ((1_000_000_000u128 << 32) / hz.max(1) as u128) as u64;
+    TSC_NS_MULT.store(mult, Ordering::Relaxed);
+    let cycle = unsafe { core::arch::x86_64::_rdtsc() };
+    MONO_NS.store(
+        ((cycle as u128 * mult as u128) >> 32) as u64,
+        Ordering::Relaxed,
+    );
+}
+
 #[inline]
 fn tsc_to_ns(cycle: u64) -> u64 {
     let mut mult = TSC_NS_MULT.load(Ordering::Relaxed);
