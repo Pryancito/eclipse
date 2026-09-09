@@ -146,15 +146,20 @@ const PIN_CTL_OUT_EN: u32 = 0x40;
 /// Time to wait for one codec verb response.
 const VERB_TIMEOUT_US: u64 = 200_000;
 
-/// PCM ring: 64 pages = 256 KiB (1.37 s of 48 kHz S16LE stereo).
+/// PCM ring: 16 pages = 64 KiB (341 ms of 48 kHz S16LE stereo).
 ///
-/// Sized for the hardware this was written against, whose DMA engine fetches
-/// up to ~96 KB ahead of what the link has played, and for a guard large
-/// enough to absorb the link's start-up latency (below). 128 KiB left the
-/// engine 24 KB from the writer.
-const RING_PAGES: usize = 64;
-/// The BDL splits the ring into fixed 16 KiB cyclic segments.
-const BDL_SEGMENT: usize = 16 * 1024;
+/// The ring is the audio latency: `/dev/dsp` blocks the writer only when the
+/// ring is full, so an application always has it filled and every sample it
+/// writes waits a ring's worth of playback before it is heard. 256 KiB was
+/// sized for a DMA engine believed to fetch ~96 KB ahead of the link; that
+/// figure turned out to be an artefact of the emulator it was measured in,
+/// and once the play position came from the link clock rather than from the
+/// position registers the ring stopped having to cover it at all. 341 ms is
+/// still several times what a desktop audio stack runs with, and leaves the
+/// writer -- a userspace loop subject to scheduling -- an ample margin.
+const RING_PAGES: usize = 16;
+/// The BDL splits the ring into fixed 8 KiB cyclic segments (8 entries).
+const BDL_SEGMENT: usize = 8 * 1024;
 /// Keep the software write pointer at least this far behind the reported play
 /// position.
 ///
@@ -168,19 +173,23 @@ const BDL_SEGMENT: usize = 16 * 1024;
 /// stream of very short dropouts rather than one obvious gap.
 ///
 /// 4 KiB is 21 ms of slack and costs 3% of the ring.
-/// 32 KiB is 170 ms: the play position is derived from the link clock
-/// counted from RUN, and the link on an HDMI codec may only begin consuming
-/// some time after that. Until it does the estimate runs ahead of the truth
-/// by that latency, for the life of the stream; the guard is what keeps the
-/// writer behind the real playhead through it.
-const RING_GUARD: usize = 32768;
+/// 16 KiB is 85 ms. The play position is derived from the link clock counted
+/// from RUN, so what the guard has to absorb is that estimate's error: the
+/// link on an HDMI codec may begin consuming some time after RUN, and until
+/// it does the estimate runs ahead of the truth by that latency for the life
+/// of the stream. Measured at ~0-1 ms where it could be measured, and
+/// `/proc/gpusnd` reports it per stream ("link start latency"), so 85 ms is
+/// margin over the observed value by two orders of magnitude -- while a
+/// guard is dead ring, so it is not free.
+const RING_GUARD: usize = 16384;
 
 /// Silence kept ahead of the write pointer, so that an engine that runs past
 /// the end of what was written plays silence -- not the previous lap -- for
 /// as long as it takes the next poll to notice and stop it. Much smaller
 /// than the guard: the band must end well short of the estimated play
-/// position, never at it, for the same start-up-latency reason.
-const SILENCE_AHEAD: usize = 8192;
+/// position, never at it, for the same start-up-latency reason. It ends
+/// 12 KiB (64 ms) short of it.
+const SILENCE_AHEAD: usize = 4096;
 
 /// Minimum interval between reads of the stream position register.
 ///
