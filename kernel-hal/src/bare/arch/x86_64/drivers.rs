@@ -253,11 +253,11 @@ pub(super) fn init() -> DeviceResult {
     // Both to the boot log (serial, this early) and to the dmesg ring.
     let verdict = match super::cpu::recalibrate_tsc_hz() {
         super::cpu::TscRecalibration::Corrected { was, now } => format!(
-            "[tsc] provisional {} Hz was wrong: ACPI PM timer measures {} Hz ({}.{:02}x); corrected",
+            "[tsc] provisional {} Hz was wrong: ACPI PM timer measures {} Hz; the clock was running {}.{:02}x fast; corrected",
             was,
             now,
-            was * 100 / now.max(1) / 100,
-            was * 100 / now.max(1) % 100
+            now * 100 / was.max(1) / 100,
+            now * 100 / was.max(1) % 100
         ),
         super::cpu::TscRecalibration::Confirmed { hz, measured } => {
             format!("[tsc] {} Hz confirmed by ACPI PM timer ({} Hz)", hz, measured)
