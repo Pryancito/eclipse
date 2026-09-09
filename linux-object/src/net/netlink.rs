@@ -688,6 +688,14 @@ zircon_object::impl_kobject!(NetlinkSocketState);
 
 #[async_trait]
 impl FileLike for NetlinkSocketState {
+    /// A socket reports `S_IFSOCK` to `fstat(2)`, as on Linux.
+    fn metadata(&self) -> LxResult<rcore_fs::vfs::Metadata> {
+        Ok(crate::fs::anon_metadata(
+            rcore_fs::vfs::FileType::Socket,
+            self.id() as usize,
+        ))
+    }
+
     fn flags(&self) -> OpenFlags {
         *self.flags.lock()
     }

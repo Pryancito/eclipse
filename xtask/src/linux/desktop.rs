@@ -956,8 +956,18 @@ fn write_terminal_wrapper(rootfs: &Path) {
 }
 
 /// `/usr/local/bin/eclipse-firefox`: launch Firefox in the only configuration
-/// that renders on this GPU-less stack — Wayland, single-process, pure software
-/// WebRender (SWGL). The labwc menu, the `firefox.desktop` the panel launcher
+/// that renders on this GPU-less stack — Wayland and pure software WebRender
+/// (SWGL).
+///
+/// It also asks for a single process, but do not count on getting one. In
+/// `BrowserTabsRemoteAutostart` (`toolkit/xre/nsAppRunner.cpp`) Firefox honours
+/// `MOZ_FORCE_DISABLE_E10S` only when `allowDisablingE10s` holds, and in a
+/// `MOZILLA_OFFICIAL` build that means `xpc::AreNonLocalConnectionsDisabled()`
+/// — false for any browser that can reach the network. Alpine sets
+/// `MOZILLA_OFFICIAL=1` for both `firefox` and `firefox-esr`, so content
+/// processes spawn anyway and the multi-process path (process launch,
+/// `SCM_RIGHTS` fd passing, sealed memfd shared memory) is on the critical
+/// path. `/bin/firefox-probe` checks exactly that path. The labwc menu, the `firefox.desktop` the panel launcher
 /// scans, and any `.desktop` activation all go through this wrapper, so Firefox
 /// always starts the same way regardless of launch path; every attempt is
 /// logged to `$HOME/.eclipse-firefox.log` so "the browser does not open" is
@@ -985,8 +995,9 @@ fn write_firefox_wrapper(rootfs: &Path) {
           # Firefox itself to the Wayland backend; DISPLAY only matters to\n\
           # anything it spawns.\n\
           export MOZ_ENABLE_WAYLAND=1\n\
-          # Single process: no e10s content children, hence no seccomp/namespace\n\
-          # sandbox and no cross-process IPC to exercise on this kernel.\n\
+          # Ask for a single process. A distribution build (MOZILLA_OFFICIAL)\n\
+          # ignores this unless non-local connections are disabled, so expect\n\
+          # content children anyway -- see write_firefox_wrapper.\n\
           export MOZ_FORCE_DISABLE_E10S=1\n\
           export MOZ_DISABLE_CONTENT_SANDBOX=1\n\
           export MOZ_DISABLE_GMP_SANDBOX=1\n\

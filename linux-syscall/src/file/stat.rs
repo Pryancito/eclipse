@@ -27,7 +27,13 @@ impl Syscall<'_> {
     pub fn sys_fstat(&self, fd: FileDesc, mut stat_ptr: UserOutPtr<Stat>) -> SysResult {
         info!("fstat: fd={:?}, stat_ptr={:?}", fd, stat_ptr);
 
-        let meta = self.linux_process().get_file(fd)?.metadata()?;
+        // Every descriptor can be stat'ed, not just the ones backed by an
+        // inode: `get_file_like` covers sockets (S_IFSOCK) and the anonymous
+        // objects (eventfd, epoll, timerfd...) too. Restricting this to
+        // regular files made `fstat` on a socket fail -- and musl implements
+        // `fstat` as `fstatat(fd, "", AT_EMPTY_PATH)`, so it failed for every
+        // caller, Firefox's IPC channel checks among them.
+        let meta = self.linux_process().get_file_like(fd)?.metadata()?;
         stat_ptr.write(meta.into())?;
         Ok(0)
     }
@@ -48,8 +54,23 @@ impl Syscall<'_> {
         );
 
         let follow = !flags.contains(AtFlags::SYMLINK_NOFOLLOW);
-        let inode = self.linux_process().lookup_inode_at(dirfd, path, follow)?;
-        let stat = inode.metadata()?;
+        let proc = self.linux_process();
+        // AT_EMPTY_PATH with an empty path names `dirfd` itself. This is not a
+        // corner case: musl implements `fstat(fd, ...)` exactly this way, so
+        // without it `fstat` fails on every descriptor that is not a regular
+        // file — sockets included, which is what Firefox stats on the handles
+        // it receives over its IPC channels.
+        let stat = if flags.contains(AtFlags::EMPTY_PATH) && path.is_empty() {
+            if dirfd == FileDesc::CWD {
+                proc.root_inode()
+                    .lookup(&proc.current_working_directory())?
+                    .metadata()?
+            } else {
+                proc.get_file_like(dirfd)?.metadata()?
+            }
+        } else {
+            proc.lookup_inode_at(dirfd, path, follow)?.metadata()?
+        };
         stat_ptr.write(stat.into())?;
         Ok(0)
     }
@@ -73,22 +94,24 @@ impl Syscall<'_> {
         let flags = AtFlags::from_bits_truncate(flags);
         let follow = !flags.contains(AtFlags::SYMLINK_NOFOLLOW);
         let proc = self.linux_process();
-        let inode = if flags.contains(AtFlags::EMPTY_PATH)
+        let meta = if flags.contains(AtFlags::EMPTY_PATH)
             && (pathname.is_null() || pathname.as_c_str().map(|s| s.is_empty()).unwrap_or(false))
         {
             if dirfd == FileDesc::CWD {
                 proc.root_inode()
                     .lookup(&proc.current_working_directory())?
+                    .metadata()?
             } else {
-                proc.get_file(dirfd)?.inode()
+                // AT_EMPTY_PATH names the descriptor itself, whatever kind it
+                // is — this is the path musl's `fstat` takes.
+                proc.get_file_like(dirfd)?.metadata()?
             }
         } else {
             let path = pathname.as_c_str()?;
-            proc.lookup_inode_at(dirfd, path, follow)?
+            proc.lookup_inode_at(dirfd, path, follow)?.metadata()?
         };
 
-        let stat = inode.metadata()?;
-        statxbuf.write(stat.into())?;
+        statxbuf.write(meta.into())?;
         Ok(0)
     }
 }

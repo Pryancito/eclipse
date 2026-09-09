@@ -60,6 +60,10 @@ impl LinuxRootfs {
             if eclipse_bench.is_file() {
                 let _ = fs::copy(&eclipse_bench, bin.join("eclipse-bench"));
             }
+            let firefox_probe = self.firefox_probe(&musl);
+            if firefox_probe.is_file() {
+                let _ = fs::copy(&firefox_probe, bin.join("firefox-probe"));
+            }
             self.install_thread_tests(&dir);
             // INIT (PID 1): the Eclipse-native Rust init by default, with busybox
             // init as a resilient fallback. `install_busybox_init` runs first so
@@ -513,6 +517,14 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             let dst = bin.join("eclipse-bench");
             let _ = dir::rm(&dst);
             fs::copy(&eclipse_bench, &dst).unwrap();
+        }
+
+        // firefox-probe: the kernel interfaces Firefox depends on.
+        let firefox_probe = self.firefox_probe(&musl);
+        if firefox_probe.is_file() {
+            let dst = bin.join("firefox-probe");
+            let _ = dir::rm(&dst);
+            fs::copy(&firefox_probe, &dst).unwrap();
         }
 
         // ecl-compute: SAXPY / GIOPS on the NVIDIA compute GPU via card1.
@@ -1829,6 +1841,50 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             .status();
         if !status.success() {
             println!("Failed to compile eclipse-bench");
+            return executable;
+        }
+
+        Ext::new(strip).arg("-s").arg(&executable).status();
+        executable
+    }
+
+    /// Compile `firefox-probe` (static musl) into `/bin/firefox-probe`: the
+    /// kernel-interface checks Firefox depends on, each mirroring a pattern
+    /// from Firefox's own source. Same mtime skip as `eclipse_bench`.
+    fn firefox_probe(&self, musl: &Path) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join("firefox-probe");
+        let executable = dir.join("firefox-probe");
+        let source = dir.join("firefox-probe.c");
+        if executable.is_file() && source.is_file() {
+            if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
+            {
+                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
+                    if bin_mtime >= src_mtime {
+                        return executable;
+                    }
+                }
+            }
+        }
+
+        println!("Compiling firefox-probe...");
+        let musl = musl.canonicalize().unwrap();
+        let bin = musl.join("bin");
+        let arch = self.0.name();
+        let cc = format!("{}/{}-linux-musl-gcc", bin.display(), arch);
+        let strip = self.strip(&musl);
+
+        fs::create_dir_all(&dir).unwrap();
+        let status = Ext::new(&cc)
+            .current_dir(&dir)
+            .arg("-static")
+            .arg("-O2")
+            .arg("-s")
+            .arg("-o")
+            .arg(&executable)
+            .arg(&source)
+            .status();
+        if !status.success() {
+            println!("Failed to compile firefox-probe");
             return executable;
         }
 

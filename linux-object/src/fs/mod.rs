@@ -144,8 +144,86 @@ lazy_static! {
     /// from memfd files that should have been freed on close. `memfd_stats`
     /// prunes dead entries and reports how many inodes are still alive and how
     /// many bytes they pin.
-    static ref MEMFD_LIVE: Mutex<Vec<(usize, alloc::sync::Weak<dyn INode>)>> =
-        Mutex::new(Vec::new());
+    static ref MEMFD_LIVE: Mutex<Vec<MemfdEntry>> = Mutex::new(Vec::new());
+}
+
+/// One live memfd: its creation sequence, a weak ref to its inode, and its
+/// seals.
+///
+/// Seals belong to the file, not to a descriptor: `dup`, `fork` and an fd sent
+/// over `SCM_RIGHTS` must all observe the same set, which is why they live
+/// beside the inode here rather than in the `File`.
+type MemfdEntry = (usize, alloc::sync::Weak<dyn INode>, u32);
+
+/// `fcntl(2)` file seals (`linux/fcntl.h`).
+pub const F_SEAL_SEAL: u32 = 0x0001;
+pub const F_SEAL_SHRINK: u32 = 0x0002;
+pub const F_SEAL_GROW: u32 = 0x0004;
+pub const F_SEAL_WRITE: u32 = 0x0008;
+pub const F_SEAL_FUTURE_WRITE: u32 = 0x0010;
+const F_SEAL_ALL: u32 =
+    F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_FUTURE_WRITE;
+
+fn same_inode(a: &Arc<dyn INode>, b: &Arc<dyn INode>) -> bool {
+    Arc::as_ptr(a) as *const u8 == Arc::as_ptr(b) as *const u8
+}
+
+/// The seals on `inode`, or `None` when it is not a memfd.
+///
+/// `fcntl(F_GET_SEALS)` used to answer a blanket 0 ("no seals") for every fd.
+/// That is not a harmless simplification: Firefox seals every shared-memory
+/// segment against shrinking and then, in `Platform::IsSafeToMap`, REFUSES to
+/// map any segment whose `F_GET_SEALS` does not report `F_SEAL_SHRINK`. A
+/// kernel that accepts the seal and then denies having it fails that check on
+/// every IPC buffer and every frame -- so the answer has to be real.
+pub fn memfd_seals(inode: &Arc<dyn INode>) -> Option<u32> {
+    let live = MEMFD_LIVE.lock();
+    live.iter()
+        .find_map(|(_, w, seals)| w.upgrade().filter(|i| same_inode(i, inode)).map(|_| *seals))
+}
+
+/// Add seals to a memfd, with Linux's rules: unknown bits and non-memfds are
+/// `EINVAL`, and a file already carrying `F_SEAL_SEAL` refuses everything with
+/// `EPERM`.
+pub fn memfd_add_seals(inode: &Arc<dyn INode>, add: u32) -> LxResult {
+    if add & !F_SEAL_ALL != 0 {
+        return Err(LxError::EINVAL);
+    }
+    let mut live = MEMFD_LIVE.lock();
+    for (_, w, seals) in live.iter_mut() {
+        match w.upgrade() {
+            Some(i) if same_inode(&i, inode) => {
+                if *seals & F_SEAL_SEAL != 0 {
+                    return Err(LxError::EPERM);
+                }
+                *seals |= add;
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+    Err(LxError::EINVAL)
+}
+
+/// Whether a resize of `inode` to `new_len` is allowed by its seals.
+/// Non-memfds are unsealed and always allowed.
+pub fn memfd_resize_allowed(inode: &Arc<dyn INode>, new_len: u64) -> bool {
+    let Some(seals) = memfd_seals(inode) else {
+        return true;
+    };
+    let cur = inode.metadata().map(|m| m.size as u64).unwrap_or(0);
+    if new_len < cur && seals & F_SEAL_SHRINK != 0 {
+        return false;
+    }
+    if new_len > cur && seals & F_SEAL_GROW != 0 {
+        return false;
+    }
+    true
+}
+
+/// Whether writes to `inode` are allowed by its seals.
+pub fn memfd_write_allowed(inode: &Arc<dyn INode>) -> bool {
+    memfd_seals(inode).is_none_or(|s| s & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) == 0)
 }
 
 /// (created_total, live_count, live_bytes) for memfd inodes.
@@ -160,10 +238,10 @@ pub fn memfd_stats() -> (usize, usize, usize) {
         Some(guard) => guard,
         None => return (created, 0, 0),
     };
-    live.retain(|(_, w)| w.strong_count() > 0);
+    live.retain(|(_, w, _)| w.strong_count() > 0);
     let mut bytes = 0usize;
     let count = live.len();
-    for (_, w) in live.iter() {
+    for (_, w, _) in live.iter() {
         if let Some(inode) = w.upgrade() {
             if let Ok(m) = inode.metadata() {
                 bytes += m.size;
@@ -183,10 +261,10 @@ pub fn memfd_dump_live(max: usize) {
     };
     let (created, count) = (
         MEMFD_SEQ.load(core::sync::atomic::Ordering::Relaxed),
-        live.iter().filter(|(_, w)| w.strong_count() > 0).count(),
+        live.iter().filter(|(_, w, _)| w.strong_count() > 0).count(),
     );
     warn!("[memfd] created={} live={}", created, count);
-    for (seq, w) in live.iter().rev().take(max) {
+    for (seq, w, _) in live.iter().rev().take(max) {
         if let Some(inode) = w.upgrade() {
             let size = inode.metadata().map(|m| m.size).unwrap_or(0);
             // strong_count includes our temporary upgrade — report without it.
@@ -219,9 +297,12 @@ lazy_static! {
 /// and shm pools.
 pub fn new_memfd(name: &str, flags: usize) -> LxResult<Arc<File>> {
     use rcore_fs::vfs::FileType;
-    /// `MFD_CLOEXEC` (the only flag we act on; `MFD_ALLOW_SEALING` is accepted
-    /// and seals are no-ops, `MFD_HUGETLB` is ignored).
+    /// `memfd_create(2)` flags. `MFD_HUGETLB` is ignored; `MFD_NOEXEC_SEAL`
+    /// implies sealing is available (Linux 6.3) and is otherwise a no-op here,
+    /// since a memfd is never executed.
     const MFD_CLOEXEC: usize = 0x0001;
+    const MFD_ALLOW_SEALING: usize = 0x0002;
+    const MFD_NOEXEC_SEAL: usize = 0x0008;
 
     let root = MEMFD_FS.root_inode();
     let seq = MEMFD_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -235,7 +316,14 @@ pub fn new_memfd(name: &str, flags: usize) -> LxResult<Arc<File>> {
         // under it self-deadlocks the OOM reporter (which takes this lock).
         // Grow by building a bigger buffer OUTSIDE the lock and swapping it in
         // (drain+extend under the lock is a plain memcpy, no allocation).
-        let mut elem = Some((seq, alloc::sync::Arc::downgrade(&inode)));
+        // Linux: a memfd created WITHOUT MFD_ALLOW_SEALING starts out sealed
+        // shut, so no seal can ever be added to it.
+        let initial = if flags & (MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL) != 0 {
+            0
+        } else {
+            F_SEAL_SEAL
+        };
+        let mut elem = Some((seq, alloc::sync::Arc::downgrade(&inode), initial));
         loop {
             let cap = {
                 let mut live = MEMFD_LIVE.lock();
@@ -439,6 +527,34 @@ pub fn poll_events_to_bus_mask(events: PollEvents) -> crate::sync::Event {
     mask
 }
 
+/// `fstat(2)` metadata for a descriptor with no inode behind it.
+///
+/// Linux can stat EVERY descriptor: a socket reports `S_IFSOCK`, and the
+/// anonymous kernel objects (eventfd, epoll, timerfd, signalfd, inotify) report
+/// a regular file on `anon_inodefs`. Answering `EBADF` for those instead is not
+/// a small gap -- musl implements `fstat` as `fstatat(fd, "", AT_EMPTY_PATH)`,
+/// so it makes `fstat` fail on any socket, and Firefox stats the descriptors it
+/// receives over its IPC channels before using them.
+pub fn anon_metadata(type_: FileType, inode: usize) -> rcore_fs::vfs::Metadata {
+    use rcore_fs::vfs::Timespec;
+    rcore_fs::vfs::Metadata {
+        dev: 0,
+        inode,
+        size: 0,
+        blk_size: 0,
+        blocks: 0,
+        atime: Timespec { sec: 0, nsec: 0 },
+        mtime: Timespec { sec: 0, nsec: 0 },
+        ctime: Timespec { sec: 0, nsec: 0 },
+        type_,
+        mode: 0o600,
+        nlinks: 1,
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+    }
+}
+
 #[async_trait]
 /// Generic file interface
 ///
@@ -448,6 +564,13 @@ pub fn poll_events_to_bus_mask(events: PollEvents) -> crate::sync::Event {
 pub trait FileLike: KernelObject + downcast_rs::DowncastSync {
     /// Returns open flags.
     fn flags(&self) -> OpenFlags;
+    /// `fstat(2)` metadata. The default describes an anonymous kernel object,
+    /// which is what `fstat` reports for eventfd/epoll/timerfd/signalfd on
+    /// Linux; descriptors with something better to say (a file's inode, a
+    /// socket's `S_IFSOCK`) override it.
+    fn metadata(&self) -> LxResult<rcore_fs::vfs::Metadata> {
+        Ok(anon_metadata(FileType::File, self.id() as usize))
+    }
     /// Set open flags.
     fn set_flags(&self, f: OpenFlags) -> LxResult;
     /// Duplicate the file.

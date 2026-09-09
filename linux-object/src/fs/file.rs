@@ -428,6 +428,12 @@ impl FileInner {
         if !self.flags.writable() {
             return Err(LxError::EBADF);
         }
+        // A memfd sealed against writes refuses them here, at the one
+        // chokepoint every write(2)/pwrite(2)/writev(2) passes through
+        // (fcntl(2), F_SEAL_WRITE / F_SEAL_FUTURE_WRITE).
+        if !crate::fs::memfd_write_allowed(&self.inode) {
+            return Err(LxError::EPERM);
+        }
         let len = self.inode.write_at(offset as usize, buf)?;
         Ok(len)
     }
@@ -582,6 +588,10 @@ impl FileLike for File {
             path: self.path.clone(),
             inner: RwLock::new(self.inner.read().clone()),
         })
+    }
+
+    fn metadata(&self) -> LxResult<Metadata> {
+        File::metadata(self)
     }
 
     fn seek(&self, pos: SeekFrom) -> LxResult<u64> {
