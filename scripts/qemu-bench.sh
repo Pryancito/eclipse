@@ -23,6 +23,7 @@
 #                Rebuilding between A and B does not qualify as a comparison —
 #                the binary and its layout differ, and TCG run-to-run variance
 #                is large enough to hide the effect either way.
+#   -V           do NOT add VDSOFORCE=1 (it is on by default here; see below).
 #
 # Each CMD is sent as one line to the guest shell. The script waits for the
 # prompt to come back between commands, so a long-running command does not have
@@ -51,14 +52,32 @@ TIMEOUT=1800
 SMP=4
 MEM=4G
 EXTRA_CMDLINE=""
+# VDSOFORCE=1 unless the caller opted out with -V.
+#
+# QEMU cannot advertise an invariant TSC under TCG -- the feature word is not
+# in its TCG-supported set, so `+invtsc` on the command line above is silently
+# dropped -- and Eclipse refuses to hand userspace a vDSO it cannot vouch for.
+# A run without this therefore measures a DISABLED vDSO and reports every
+# clock read as a full syscall, which reads as a 130x deficit against Linux
+# (whose vDSO does not ask CPUID's permission) and is pure harness artifact:
+# with the flag, `clock_gettime` costs ~102 ns here against Linux's ~148 ns on
+# the same emulator. That mistake has already been made and published once.
+#
+# It is sound HERE and only here: this script never uses KVM, and under TCG
+# every vCPU's rdtsc derives from one host clock, so the counter really is
+# synchronized. It is NOT a flag for real hardware that declines to advertise
+# an invariant TSC -- there the counter may genuinely drift between sockets.
+# `-V` drops it, for measuring what an un-forced boot actually does.
+VDSO_FORCE=1
 
-while getopts "o:t:s:m:c:d:" opt; do
+while getopts "o:t:s:m:c:d:V" opt; do
     case "$opt" in
         o) OUTFILE="$OPTARG" ;;
         t) TIMEOUT="$OPTARG" ;;
         s) SMP="$OPTARG" ;;
         m) MEM="$OPTARG" ;;
         c) EXTRA_CMDLINE="$OPTARG" ;;
+        V) VDSO_FORCE=0 ;;
         d) DISK_IMG="$OPTARG" ;;
         *) echo "usage: $0 [-o OUT] [-t TIMEOUT] [-s SMP] [-m MEM] [-c KOPTS] CMD..." >&2; exit 2 ;;
     esac
@@ -102,6 +121,10 @@ mcopy -i "$ESP_IMG" -s "$ESP_DIR/EFI" ::/
 # Append the extra kernel options by rewriting rboot.conf inside the image, so
 # the source ESP directory is left exactly as `make build` produced it and two
 # runs with different options cannot contaminate each other.
+if [ "$VDSO_FORCE" = 1 ]; then
+    EXTRA_CMDLINE="${EXTRA_CMDLINE:+$EXTRA_CMDLINE:}VDSOFORCE=1"
+fi
+
 if [ -n "$EXTRA_CMDLINE" ]; then
     conf="$WORK/rboot.conf"
     cp "$ESP_DIR/EFI/Boot/rboot.conf" "$conf"
