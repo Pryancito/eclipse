@@ -121,7 +121,7 @@ unsafe fn pm_timer_port_from_fadt(rsdp_pa: usize) -> Option<(u16, bool)> {
     }
     let sdt = p2v(sdt_pa);
     let len = rd32(sdt + 4) as usize;
-    if len < 36 || len > 0x10000 {
+    if !(36..=0x10000).contains(&len) {
         return None;
     }
     let entry_size = if wide { 8 } else { 4 };

@@ -322,6 +322,9 @@ static void test_process_launch(const char *self) {
     if (dup3(sv[1], 30, 0) < 0) _exit(70);
     char *argv[] = { (char *)self, (char *)"--child-fd", (char *)"30", NULL };
     execv(self, argv);
+    // stderr is inherited, so say which path failed and why: exit codes alone
+    // cannot tell "the kernel refused the exec" from "the path was wrong".
+    fprintf(stderr, "         execv(\"%s\"): %s\n", self, strerror(errno));
     _exit(71);
   }
   close(sv[1]);
@@ -672,7 +675,18 @@ static int child_main(int fd) {
 }
 
 int main(int argc, char **argv) {
+  // Firefox does not re-exec argv[0]: toolkit/xre resolves its own binary
+  // through /proc/self/exe, because argv[0] is whatever word invoked us and
+  // execv() does no PATH search -- launched as a bare name from PATH, argv[0]
+  // resolves against the cwd and the exec fails. Mirror that, and keep argv[0]
+  // as the fallback for a kernel with no /proc/self/exe.
+  char exe[PATH_MAX];
   const char *self = argv[0];
+  ssize_t exelen = readlink("/proc/self/exe", exe, sizeof exe - 1);
+  if (exelen > 0) {
+    exe[exelen] = '\0';
+    self = exe;
+  }
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "-v")) g_verbose = 1;
     else if (!strcmp(argv[i], "--child-fd") && i + 1 < argc) return child_main(atoi(argv[++i]));

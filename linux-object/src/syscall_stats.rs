@@ -65,6 +65,6 @@ pub fn snapshot() -> alloc::vec::Vec<(u32, u64)> {
             (n > 0).then_some((i as u32, n))
         })
         .collect();
-    v.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    v.sort_unstable_by_key(|a| core::cmp::Reverse(a.1));
     v
 }

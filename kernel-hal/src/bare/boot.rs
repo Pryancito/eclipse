@@ -21,7 +21,8 @@ hal_fn_impl! {
             // command-line string is still mapped: the panic console used to
             // re-read it on every write, so a late panic double-faulted inside
             // its own banner and printed nothing.
-            #[cfg(target_arch = "x86_64")]
+            // The module itself is `graphic`-gated; zircon mode builds without it.
+            #[cfg(all(target_arch = "x86_64", feature = "graphic"))]
             super::arch::early_fb_console::latch_cmdline_flags();
             crate::klog_info!("Eclipse: primary CPU {} init early", crate::cpu::cpu_id());
             super::arch::primary_init_early();
