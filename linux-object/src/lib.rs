@@ -28,6 +28,7 @@ pub mod perf;
 pub mod process;
 pub mod signal;
 pub mod sync;
+pub mod syscall_stats;
 pub mod thread;
 pub mod time;
 pub mod uname;
