@@ -141,6 +141,55 @@ fn proc_state_char(proc: &Process) -> char {
     }
 }
 
+/// `/proc/<pid>/threads`: one line per thread — tid, state, name, and the
+/// syscall it is in.
+///
+/// Linux answers this with `/proc/<pid>/task/<tid>/{comm,status,syscall}`, a
+/// directory per thread; this is the same information in one read, which is
+/// what a hang needs. A process asleep as a whole says nothing about WHY: a
+/// browser parked in `epoll_wait` on its IPC thread and one stuck in a futex
+/// held by a dead peer look identical from `/proc/<pid>/status`. Per thread,
+/// with the name userspace gave it through `prctl(PR_SET_NAME)`, they do not.
+///
+/// Syscall numbers are the raw x86_64 ones (`asm/unistd_64.h`); `-` means the
+/// thread is in user code.
+fn proc_pid_threads(proc: &Process) -> String {
+    use crate::thread::ThreadExt;
+    use core::fmt::Write;
+    let mut out = String::from("# tid state name syscall\n");
+    for tid in proc.thread_ids() {
+        let Ok(obj) = proc.get_child(tid) else {
+            continue;
+        };
+        let Ok(thread) = obj.downcast_arc::<Thread>() else {
+            continue;
+        };
+        let state = match thread.state() {
+            ThreadState::Suspended => 'T',
+            ThreadState::Dying | ThreadState::Dead => 'Z',
+            s if (s as u32) & 0xff == ThreadState::Blocked as u32 => 'S',
+            _ => 'R',
+        };
+        // try_lock: a thread tearing down may hold its own lock, and a /proc
+        // read must never block on it.
+        let name = thread
+            .try_lock_linux()
+            .map(|lt| lt.comm.clone())
+            .filter(|c| !c.is_empty())
+            .map(|c| sanitize_comm(&c))
+            .unwrap_or_else(|| String::from("-"));
+        match thread.current_syscall() {
+            Some(num) => {
+                let _ = writeln!(out, "{} {} {} {}", tid, state, name, num);
+            }
+            None => {
+                let _ = writeln!(out, "{} {} {} -", tid, state, name);
+            }
+        }
+    }
+    out
+}
+
 fn proc_comm(proc: &Process) -> String {
     // A name set through `prctl(PR_SET_NAME)` on the leader thread wins — that
     // is what Linux reports in `/proc/<pid>/comm` — and threads that never set
@@ -503,10 +552,10 @@ impl ProcPidDirINode {
         ROOT_JOB.find_process(self.pid as _)
     }
 
-    fn entries() -> [&'static str; 12] {
+    fn entries() -> [&'static str; 13] {
         [
             ".", "..", "stat", "cmdline", "status", "perf", "maps", "fd", "comm", "environ",
-            "statm", "exe",
+            "statm", "exe", "threads",
         ]
     }
 }
@@ -598,6 +647,10 @@ impl INode for ProcPidDirINode {
             "statm" => Ok(Arc::new(ProcPidFileINode {
                 pid: self.pid,
                 kind: ProcPidFileKind::Statm,
+            })),
+            "threads" => Ok(Arc::new(ProcPidFileINode {
+                pid: self.pid,
+                kind: ProcPidFileKind::Threads,
             })),
             "exe" => {
                 let proc = self.process().ok_or(FsError::EntryNotFound)?;
@@ -1505,6 +1558,7 @@ enum ProcPidFileKind {
     Comm,
     Environ,
     Statm,
+    Threads,
 }
 
 /// `/proc/<pid>/maps` in the format of Documentation/filesystems/proc.rst:
@@ -1576,6 +1630,7 @@ impl ProcPidFileINode {
                 None => Vec::new(),
             },
             ProcPidFileKind::Statm => proc_pid_statm(&proc).into_bytes(),
+            ProcPidFileKind::Threads => proc_pid_threads(&proc).into_bytes(),
         })
     }
 }

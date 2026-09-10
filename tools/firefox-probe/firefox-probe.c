@@ -547,10 +547,49 @@ static void wakeup_case(const char *what, int use_epoll) {
   printf("         child rc=%d (1=setup failed, 2=slept through the write, 3=read failed)\n", rc);
 }
 
+// The other order, and the one a handshake actually takes: the peer wrote
+// BEFORE this side ever asked to watch the socket. `poll` and `epoll` are
+// level-triggered by definition -- they report what is ready now, not what
+// became ready while someone was looking. A kernel that only delivers the
+// transition loses the message that was already sitting there, and both ends
+// then wait to receive from each other forever.
+static void ready_before_watch(const char *what, int use_epoll) {
+  int sv[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+    fail(what, "ipc/chromium: a handshake already in the pipe", errno);
+    return;
+  }
+  // Write FIRST. Only then does the reader come along and ask to watch.
+  if (write(sv[0], "x", 1) != 1) {
+    fail(what, "ipc/chromium", errno);
+    close(sv[0]); close(sv[1]);
+    return;
+  }
+  int ready;
+  if (use_epoll) {
+    int ep = epoll_create1(EPOLL_CLOEXEC);
+    struct epoll_event ev = { .events = EPOLLIN, .data.fd = sv[1] };
+    ready = ep >= 0 && epoll_ctl(ep, EPOLL_CTL_ADD, sv[1], &ev) == 0;
+    if (ready) {
+      struct epoll_event out;
+      ready = epoll_wait(ep, &out, 1, 3000) == 1;
+    }
+    if (ep >= 0) close(ep);
+  } else {
+    struct pollfd p = { .fd = sv[1], .events = POLLIN };
+    ready = poll(&p, 1, 3000) == 1 && (p.revents & POLLIN);
+  }
+  check(ready, what, "ipc/chromium: level-triggered means already-ready counts", 0);
+  close(sv[0]);
+  close(sv[1]);
+}
+
 static void test_wakeups(void) {
   section("cross-process wakeups (parent <-> child IPC)");
   wakeup_case("poll() wakes on a peer's write", 0);
   wakeup_case("epoll_wait() wakes on a peer's write", 1);
+  ready_before_watch("poll() reports data that arrived before the call", 0);
+  ready_before_watch("epoll_wait() reports data that arrived before EPOLL_CTL_ADD", 1);
 }
 
 // ── The glibc startup gate ──────────────────────────────────────────────────

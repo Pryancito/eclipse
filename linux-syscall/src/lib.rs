@@ -232,6 +232,10 @@ impl Syscall<'_> {
         // that process next reached a Linux path" into "THIS syscall did it",
         // which is the difference between a hypothesis and a culprit.
         self.check_ext_intact("before", num);
+        // What this thread is in, for `/proc/<pid>/threads`. Paired with the
+        // clear below, and with the blocked marking the run loop does, so a
+        // sleeping thread can say what it is sleeping in.
+        self.thread.set_current_syscall(Some(num));
         let perf_start = kernel_hal::timer::timer_now();
         let ret = match sys_type {
             Sys::READ => self.sys_read(a0.into(), a1.into(), a2).await,
@@ -623,6 +627,7 @@ impl Syscall<'_> {
         // `checked_sub` (not `-`): an async syscall can migrate CPUs across an
         // await, and with unsynchronised TSCs the end can read before the start,
         // which would panic on a plain `Duration` subtraction.
+        self.thread.set_current_syscall(None);
         self.check_ext_intact("after", num);
         let elapsed_ns = kernel_hal::timer::timer_now()
             .checked_sub(perf_start)
