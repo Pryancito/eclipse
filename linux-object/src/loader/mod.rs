@@ -55,6 +55,24 @@ fn detect_abi(data: &[u8], _elf: &ElfFile) -> Abi {
 /// with the stack.  Linux uses a similar high-address default for the stack.
 const STACK_TOP: usize = USER_ASPACE_BASE as usize + USER_ASPACE_SIZE as usize;
 
+/// Base of the program break, well away from the mmap arena.
+///
+/// The heap used to start immediately after the loaded image, which reads
+/// naturally but does not survive contact with the allocator: sub-VMARs and
+/// anonymous `mmap`s are placed bottom-up by first fit, so the very first
+/// `mmap` the dynamic linker makes takes the range the heap was about to grow
+/// into. Every later `brk` growth then fails -- glibc's first heap extension
+/// on Firefox failed exactly this way (INVALID_ARGS at 0x438000) -- and malloc
+/// silently falls back to mmap for everything.
+///
+/// Linux keeps the two apart by construction: the heap grows up from the image
+/// and the mmap arena grows DOWN from just below the stack. This tree's
+/// allocator is bottom-up, so the equivalent is to start the heap high above
+/// where mmap will be working. 32 TiB leaves the mmap arena the whole bottom of
+/// a 128 TiB address space and the heap ~96 TiB to grow into: neither can
+/// reach the other in any realistic program.
+const HEAP_BASE: usize = 0x0000_2000_0000_0000;
+
 // The image sub-VMARs below are placed with `allocate(None, ..)`, i.e. at the
 // root VMAR's base, and PT_LOAD segments are then mapped at their `p_vaddr`
 // relative to that sub-VMAR. Non-PIE (ET_EXEC) binaries carry absolute vaddrs,
@@ -454,16 +472,15 @@ impl LinuxElfLoader {
             stack_vmo.write(self.stack_pages * PAGE_SIZE - init_stack.len(), &init_stack)?;
             sp -= init_stack.len();
 
-            // Initial brk: right after the interpreter (which is placed after the main
-            // program). Using interp_base + interp_size ensures brk does not overlap
-            // any already-allocated segment.
+            // Initial brk: the dedicated heap base, not the end of the
+            // interpreter -- see [`HEAP_BASE`].
             //
             // NOTE: dynamically-linked FreeBSD binaries reach here and are built
             // with the Linux-style stack above; running them additionally needs
             // the FreeBSD dynamic linker (`/libexec/ld-elf.so.1`), which this
             // tree does not ship — so in practice only *static* FreeBSD binaries
             // (handled in the no-interpreter path below) get a FreeBSD stack.
-            let initial_brk = interp_base + interp_size;
+            let initial_brk = HEAP_BASE;
             return Ok((interp_entry, sp, initial_brk, path, abi));
         }
 
@@ -624,8 +641,10 @@ impl LinuxElfLoader {
             info.auxv, entry, sp
         );
 
-        // Initial brk: right after the loaded image.
-        let initial_brk = base + size;
+        // Initial brk: the same dedicated heap base as the dynamic case. A
+        // static binary has no interpreter mapping its own libraries, but it
+        // still mmaps, and the collision is the same one.
+        let initial_brk = HEAP_BASE;
         Ok((entry, sp, initial_brk, path, abi))
     }
 }

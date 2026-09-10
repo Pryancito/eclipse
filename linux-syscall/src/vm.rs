@@ -17,13 +17,19 @@ use zircon_object::vm::{pages, roundup_pages, MMUFlags, VmObject, PAGE_SIZE};
 ///     reservation is ~1.1 GiB (`MaxCodeBytesPerProcess`), so a 1 GiB cap
 ///     bounced it — and, crucially, the early-return did so *silently*, which is
 ///     why `js::jit::InitProcessExecutableMemory() failed` fired with no mmap
-///     error in the log. 2 GiB clears the reservation with headroom.
+///     error in the log.
+///
+///     2 GiB was not enough either: Firefox 136's SpiderMonkey asks for a
+///     single 16 GiB `PROT_NONE` reservation (its WASM huge-memory region) and
+///     had it bounced. The user address space is `1 << 47`, so 16 GiB is a
+///     rounding error in it; 64 GiB clears that request with room and still
+///     bounds a runaway caller to a small fraction of the space per call.
 ///
 /// Because anonymous mappings are now demand-paged (see `sys_mmap`), a large
 /// reservation costs only address space plus a sparse per-touched-page frame
 /// entry, not committed RAM — so the cap bounds address-space requests, not
 /// physical footprint.
-const MAX_MMAP_LEN: usize = 2 * 1024 * 1024 * 1024;
+const MAX_MMAP_LEN: usize = 64 * 1024 * 1024 * 1024;
 
 /// Linux `vm.mmap_min_addr` (default 64 KiB): floor for kernel-chosen mmap
 /// placement. Without it the VMAR's first-fit search can hand a non-FIXED
@@ -471,29 +477,41 @@ impl Syscall<'_> {
             if size > MAX_MMAP_LEN {
                 return Ok(current_brk);
             }
-            let new_mapped_brk = mapped_brk + size;
-            let vmo = VmObject::new_paged(pages(size));
             let flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
-            // vmar.addr() == 0 for user address spaces, so VMAR offset == absolute VA.
-            match vmar.map_at(mapped_brk, vmo, 0, size, flags) {
-                Ok(_) => {
-                    proc.set_brk(new_brk_aligned);
-                    proc.set_mapped_brk(new_mapped_brk);
-                    info!(
-                        "brk: extended to {:#x}, mapping reserved up to {:#x}",
-                        new_brk_aligned, new_mapped_brk
-                    );
-                    Ok(new_brk_aligned)
-                }
-                Err(e) => {
-                    warn!(
-                        "brk: failed to map {:#x} bytes at {:#x}: {:?}",
-                        size, mapped_brk, e
-                    );
-                    // Return current break on failure (Linux semantics).
-                    Ok(current_brk)
+            // Reserving ahead is only an optimization, so it must never cost a
+            // grow that would otherwise have fit. The rounded-up chunk can run
+            // into whatever the loader placed after the heap -- glibc's first
+            // brk on Firefox asked for a few KiB, got rounded to 1 MiB, and hit
+            // the next mapping -- so on failure fall back to the exact amount
+            // asked for. Linux reserves nothing ahead and never has this
+            // problem; this keeps the batching and its failure mode both.
+            let mut last_err = None;
+            for size in [size, roundup_pages(want)] {
+                let vmo = VmObject::new_paged(pages(size));
+                // vmar.addr() == 0 for user address spaces, so VMAR offset ==
+                // absolute VA.
+                match vmar.map_at(mapped_brk, vmo, 0, size, flags) {
+                    Ok(_) => {
+                        let new_mapped_brk = mapped_brk + size;
+                        proc.set_brk(new_brk_aligned);
+                        proc.set_mapped_brk(new_mapped_brk);
+                        info!(
+                            "brk: extended to {:#x}, mapping reserved up to {:#x}",
+                            new_brk_aligned, new_mapped_brk
+                        );
+                        return Ok(new_brk_aligned);
+                    }
+                    Err(e) => last_err = Some((size, e)),
                 }
             }
+            if let Some((size, e)) = last_err {
+                warn!(
+                    "brk: failed to map {:#x} bytes at {:#x}: {:?}",
+                    size, mapped_brk, e
+                );
+            }
+            // Return current break on failure (Linux semantics).
+            Ok(current_brk)
         } else {
             // Already at requested break (after rounding).
             Ok(current_brk)

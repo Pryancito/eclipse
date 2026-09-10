@@ -428,7 +428,12 @@ impl Socket for UdpSocketState {
         })
     }
     fn setsockopt(&self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
-        warn!("setsockopt is unimplemented");
+        // Accept harmlessly, like TCP's fallthrough and the `Socket` default.
+        // debug, not warn: this is a no-op success, and a client that sets an
+        // option on every send (Firefox's resolver does) turned it into a
+        // steady stream of kernel warnings -- expensive on a serial console
+        // and misleading, since nothing is failing.
+        debug!("udp setsockopt: accepted as a no-op");
         Ok(0)
     }
 
