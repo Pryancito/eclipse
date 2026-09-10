@@ -710,6 +710,51 @@ impl Thread {
         self.inner.lock().state()
     }
 
+    /// Mark this thread blocked in a syscall, or running again.
+    ///
+    /// [`ThreadState::Blocked`] existed but nothing ever set it, so every live
+    /// thread looked `Running` — and `/proc/<pid>/status`, which is the first
+    /// field any hang investigation reads, reported `R (running)` for a task
+    /// asleep in `read`. During one such investigation that turned two
+    /// processes quietly deadlocked on IPC into "both spinning in userspace",
+    /// which is a different bug entirely.
+    ///
+    /// Signal-wise this is a no-op by construction: `change_state` maps
+    /// `Blocked` and `Running` to the same `THREAD_RUNNING` transition, which
+    /// is also what Zircon does — a thread blocked in a syscall is still
+    /// running as far as `zx_object_wait` is concerned, and only
+    /// `ZX_INFO_THREAD` tells the two apart. So this writes the field directly
+    /// rather than going through `change_state`, which would re-publish a
+    /// signal set that is already current — a second lock and a walk of the
+    /// object's waiters on every block and unblock, for no observable effect.
+    ///
+    /// This is the GENERIC marker, and it defers to everything more specific.
+    /// `blocking_run` already records why a thread is waiting — `BlockedFutex`,
+    /// `BlockedChannel`, `BlockedPort` — and asserts on return that nobody
+    /// moved the state under it, so overwriting one of those both loses
+    /// information and trips that assertion (it panicked all four CPUs at
+    /// once). Hence: only `Running` becomes `Blocked`, and only the generic
+    /// `Blocked` goes back to `Running`. Teardown wins for the same reason —
+    /// `Dying`/`Dead`/`New`/`Suspended` are all left exactly as they are, so
+    /// an unblock racing a kill can never resurrect a thread into `Running`
+    /// and strand it in the run loop.
+    ///
+    /// Returns whether it actually changed anything, so the caller knows
+    /// whether it owes an unmark.
+    pub fn set_blocked(&self, blocked: bool) -> bool {
+        let mut inner = self.inner.lock();
+        let (from, to) = if blocked {
+            (ThreadState::Running, ThreadState::Blocked)
+        } else {
+            (ThreadState::Blocked, ThreadState::Running)
+        };
+        if inner.state != from {
+            return false;
+        }
+        inner.state = to;
+        true
+    }
+
     /// Add the parameter to the time this thread has run on cpu.
     ///
     /// Called on every return from user mode, so it stays off `inner`'s lock —
