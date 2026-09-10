@@ -205,6 +205,7 @@ impl Syscall<'_> {
         if let Err(_err) = hunter::check_syscall(pid, num, &args) {
             return -(linux_object::error::LxError::EPERM as isize);
         }
+        linux_object::syscall_stats::record(pid, num);
         let sys_type = Sys::try_from(num);
         debug!(
             "pid: {} syscall: num={} ({:?}), args={:x?}",

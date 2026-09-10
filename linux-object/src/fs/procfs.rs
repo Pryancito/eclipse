@@ -14,12 +14,13 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 53] = [
+const PROC_ROOT_STATIC: [&str; 54] = [
     "net",
     "oops",
     "memhogs",
     "sysvipc",
     "meminfo",
+    "syscalls",
     "cmdline",
     "cpuinfo",
     "swaps",
@@ -115,6 +116,22 @@ fn sanitize_comm(name: &str) -> String {
     s
 }
 
+/// The state letter for `/proc/<pid>/stat` and `/proc/<pid>/status`.
+///
+/// KNOWN LIMITATION: this is always `R` for a live process, even one blocked
+/// in `read`, `poll` or `futex`. Linux reports the thread-group leader's
+/// scheduling state, and neither the process-level [`Status`] (which is
+/// `Running` for everything alive) nor the leader's `ThreadState` can express
+/// it here: a syscall that blocks parks an async future, and the thread object
+/// stays `Running` while it waits. Reporting the truth needs the executor to
+/// mark a thread blocked when its syscall future parks.
+///
+/// It is worth knowing that this field lies, because it is the field every
+/// hang investigation reaches for first: during one, it turned two processes
+/// quietly deadlocked on IPC into "both spinning in userspace", which is a
+/// different bug entirely and cost a full cycle to unwind. `/proc/syscalls`
+/// answers the same question honestly in the meantime -- a process making no
+/// syscalls is not spinning on them.
 fn proc_state_char(status: Status) -> char {
     match status {
         Status::Running => 'R',
@@ -407,6 +424,7 @@ impl INode for ProcRootINode {
             "net" => Ok(PROC_NET_DIR.clone()),
             "sysvipc" => Ok(PROC_SYSVIPC_DIR.clone()),
             "meminfo" => Ok(PROC_MEMINFO.clone()),
+            "syscalls" => Ok(PROC_SYSCALLS.clone()),
             "cmdline" => Ok(PROC_CMDLINE.clone()),
             "memhogs" => Ok(PROC_MEMHOGS.clone()),
             "cpuinfo" => Ok(PROC_CPUINFO.clone()),
@@ -1806,6 +1824,34 @@ fn proc_meminfo_content() -> String {
 /// inside page-fault handling with the faulting VMAR's lock held, and walking
 /// every process takes those same locks — the report would deadlock exactly
 /// when it is needed.
+/// `/proc/syscalls`: how many times each syscall has been made since boot,
+/// busiest first. Numbers are the raw x86_64 ones (`asm/unistd_64.h`); read
+/// this twice around a suspicious interval and subtract to get a profile of
+/// what a process is actually doing when it burns system time in silence.
+fn proc_syscalls_content() -> alloc::string::String {
+    use core::fmt::Write;
+    let mut out = alloc::string::String::from("# syscall calls (x86_64 numbers, busiest first)\n");
+    for (num, calls) in crate::syscall_stats::snapshot() {
+        let _ = writeln!(out, "{:>4} {}", num, calls);
+    }
+    // The last calls made, oldest first. With every process asleep this names
+    // the syscall each one went to sleep in -- the thing a histogram cannot
+    // say and a log will never print.
+    out.push_str("# recent: pid/syscall, oldest first\n");
+    let mut line = alloc::string::String::new();
+    for (i, (pid, num)) in crate::syscall_stats::trace().into_iter().enumerate() {
+        let _ = write!(line, "{}/{} ", pid, num);
+        if i % 12 == 11 {
+            let _ = writeln!(out, "{}", line.trim_end());
+            line.clear();
+        }
+    }
+    if !line.is_empty() {
+        let _ = writeln!(out, "{}", line.trim_end());
+    }
+    out
+}
+
 fn proc_memhogs_content() -> String {
     let (used, total) = kernel_hal::mem::memory_usage();
     let procs = crate::process::all_live_processes();
@@ -2710,6 +2756,10 @@ lazy_static! {
     static ref PROC_MEMINFO: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 11,
         generate: proc_meminfo_content,
+    });
+    static ref PROC_SYSCALLS: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 137,
+        generate: proc_syscalls_content,
     });
     static ref PROC_MEMHOGS: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 109,

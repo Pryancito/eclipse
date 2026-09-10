@@ -38,6 +38,7 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/utsname.h>
+#include <poll.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -439,6 +440,119 @@ static void test_jit(void) {
   munmap(p, reserve);
 }
 
+// ── Shared memory that is actually shared ───────────────────────────────────
+// Passing a memfd to a child proves the descriptor survives; it does not prove
+// the MEMORY is shared. Firefox's IPC rings and its prefs map are polled in
+// userspace: a parent and child that each map the same memfd but see private
+// copies spin forever on a flag that never flips, in state R, making no
+// syscalls at all -- no error, no log, nothing to attach a debugger to.
+static void test_shared_across_processes(void) {
+  section("shared memory across a fork (the IPC ring's real requirement)");
+
+  int fd = memfd("moz-ipc-ring", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+  if (fd < 0) { skip("cross-process shared memory", "no memfd"); return; }
+  const size_t len = 4096;
+  if (ftruncate(fd, (off_t)len) != 0) { fail("ftruncate", "shared ring", errno); close(fd); return; }
+  volatile unsigned *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (p == MAP_FAILED) { fail("mmap the ring", "shared ring", errno); close(fd); return; }
+  p[0] = 0; p[1] = 0;
+
+  pid_t pid = fork();
+  if (pid < 0) { fail("fork", "shared ring", errno); munmap((void *)p, len); close(fd); return; }
+  if (pid == 0) {
+    // Child: map the SAME fd independently, then hand the parent a value and
+    // wait for its reply, exactly as an IPC ring does.
+    volatile unsigned *q = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (q == MAP_FAILED) _exit(80);
+    q[0] = 0xc0ffee;
+    for (int i = 0; i < 20000; i++) {
+      if (q[1] == 0xbeef) _exit(0);
+      struct timespec t = { .tv_sec = 0, .tv_nsec = 1000000 };
+      nanosleep(&t, NULL);
+    }
+    _exit(81);  // parent's write never became visible here
+  }
+
+  int seen = 0;
+  for (int i = 0; i < 20000 && !seen; i++) {
+    if (p[0] == 0xc0ffee) seen = 1;
+    else { struct timespec t = { .tv_sec = 0, .tv_nsec = 1000000 }; nanosleep(&t, NULL); }
+  }
+  check(seen, "a child's write is visible in the parent's mapping",
+        "ipc/chromium: the shared ring both sides poll", 0);
+  p[1] = 0xbeef;
+  int status = 0;
+  waitpid(pid, &status, 0);
+  int rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+  check(rc == 0, "a parent's write is visible in the child's mapping",
+        "ipc/chromium: the shared ring both sides poll", 0);
+  if (rc != 0)
+    printf("         child rc=%d (80=mmap failed, 81=never saw the parent's write)\n", rc);
+  munmap((void *)p, len);
+  close(fd);
+}
+
+// ── Cross-process wakeups ───────────────────────────────────────────────────
+// Firefox's parent and its children talk over an AF_UNIX socketpair and sleep
+// in poll/epoll between messages. A kernel that delivers the bytes but loses
+// the readiness edge deadlocks them both: nothing spins, nothing errors, and
+// every process sits idle forever. That is invisible to a single-process test
+// -- the write has to happen while the reader is ALREADY blocked, which needs
+// two processes and a delay.
+static void wakeup_case(const char *what, int use_epoll) {
+  int sv[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+    fail(what, "ipc/chromium: parent<->child channel", errno);
+    return;
+  }
+  pid_t pid = fork();
+  if (pid < 0) {
+    fail(what, "ipc/chromium", errno);
+    close(sv[0]); close(sv[1]);
+    return;
+  }
+  if (pid == 0) {
+    // Child: block FIRST, then be woken by the parent's write.
+    close(sv[0]);
+    int rc = 1;
+    if (use_epoll) {
+      int ep = epoll_create1(EPOLL_CLOEXEC);
+      struct epoll_event ev = { .events = EPOLLIN, .data.fd = sv[1] };
+      if (ep >= 0 && epoll_ctl(ep, EPOLL_CTL_ADD, sv[1], &ev) == 0) {
+        struct epoll_event out;
+        rc = epoll_wait(ep, &out, 1, 10000) == 1 ? 0 : 2;
+      }
+    } else {
+      struct pollfd p = { .fd = sv[1], .events = POLLIN };
+      rc = poll(&p, 1, 10000) == 1 && (p.revents & POLLIN) ? 0 : 2;
+    }
+    char b;
+    if (rc == 0 && read(sv[1], &b, 1) != 1) rc = 3;
+    _exit(rc);
+  }
+  close(sv[1]);
+  // Give the child time to reach the blocking call, so the write lands on a
+  // sleeping reader -- the case a same-process test can never reach.
+  struct timespec nap = { .tv_sec = 0, .tv_nsec = 300000000 };
+  nanosleep(&nap, NULL);
+  ssize_t w = write(sv[0], "x", 1);
+  int status = 0;
+  waitpid(pid, &status, 0);
+  close(sv[0]);
+  if (w != 1) { fail(what, "ipc/chromium: write to the channel", errno); return; }
+  if (!WIFEXITED(status)) { fail(what, "ipc/chromium", 0); return; }
+  int rc = WEXITSTATUS(status);
+  if (rc == 0) { ok(what, "ipc/chromium: a blocked child must wake on a peer write"); return; }
+  fail(what, "ipc/chromium: a blocked child must wake on a peer write", 0);
+  printf("         child rc=%d (1=setup failed, 2=slept through the write, 3=read failed)\n", rc);
+}
+
+static void test_wakeups(void) {
+  section("cross-process wakeups (parent <-> child IPC)");
+  wakeup_case("poll() wakes on a peer's write", 0);
+  wakeup_case("epoll_wait() wakes on a peer's write", 1);
+}
+
 // ── The glibc startup gate ──────────────────────────────────────────────────
 // Not every Firefox is built against musl. A distribution .deb is glibc, and
 // glibc parses `uname().release` in `_dl_discover_osversion` before main()
@@ -540,6 +654,8 @@ int main(int argc, char **argv) {
   test_process_launch(self);
   test_runtime();
   test_jit();
+  test_shared_across_processes();
+  test_wakeups();
   test_uname();
   test_proc();
 
