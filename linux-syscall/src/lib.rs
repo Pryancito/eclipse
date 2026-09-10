@@ -297,6 +297,9 @@ impl Syscall<'_> {
             Sys::DUP3 => self.sys_dup3(a0.into(), a1.into(), a2),
             Sys::PIPE2 => self.sys_pipe2(a0.into(), a1), // TODO: handle `flags`
             Sys::UTIMENSAT => self.sys_utimensat(a0.into(), a1.into(), a2.into(), a3),
+            // `utimes` is an x86_64-only syscall number; riscv64 and aarch64
+            // give glibc only `utimensat`.
+            #[cfg(target_arch = "x86_64")]
             Sys::UTIMES => self.sys_utimes(a0.into(), a1.into()),
             Sys::COPY_FILE_RANGE => {
                 self.sys_copy_file_range(a0.into(), a1.into(), a2.into(), a3.into(), a4, a5)

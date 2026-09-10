@@ -1903,6 +1903,7 @@ impl Syscall<'_> {
     /// installer that restores timestamps calls it -- Firefox's font cache
     /// unpacking hit it and logged "Unable to revert mtime" for every
     /// directory it touched.
+    #[cfg(target_arch = "x86_64")]
     pub fn sys_utimes(
         &mut self,
         pathname: UserInPtr<u8>,
