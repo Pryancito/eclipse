@@ -204,6 +204,14 @@ pub struct Thread {
     affinity: Arc<AtomicU64>,
     /// Linux-compatible scheduling attributes (policy / nice / RT priority).
     sched: SchedAttr,
+    /// The syscall this thread is executing, plus one; 0 means "in user code".
+    ///
+    /// Together with [`ThreadState::Blocked`] this is what makes a hang
+    /// legible: knowing a thread is asleep is half the answer, and the other
+    /// half is what it went to sleep IN. A plain relaxed store on entry and
+    /// exit, with no lock, so it costs the same on the fast path as the
+    /// accounting already there.
+    current_syscall: AtomicU32,
     /// Nanoseconds this thread has spent executing user code.
     ///
     /// Deliberately **outside** `inner`: it is written once per user-mode exit,
@@ -388,6 +396,7 @@ impl Thread {
             }),
             affinity: Arc::new(AtomicU64::new(u64::MAX)),
             sched: SchedAttr::default(),
+            current_syscall: AtomicU32::new(0),
             time_ns: AtomicU64::new(0),
             sys_time_ns: AtomicU64::new(0),
             last_cpu: AtomicU32::new(0),
@@ -703,6 +712,25 @@ impl Thread {
     /// Get the thread's version 1 exception report.
     pub fn get_thread_exception_info_v1(&self) -> ZxResult<ExceptionReportV1> {
         Ok(self.get_thread_exception_info()?.as_v1())
+    }
+
+    /// Record the syscall this thread is entering, or `None` on the way out.
+    pub fn set_current_syscall(&self, num: Option<u32>) {
+        self.current_syscall.store(
+            num.map_or(0, |n| n.wrapping_add(1)),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// The syscall this thread is currently executing, if any.
+    pub fn current_syscall(&self) -> Option<u32> {
+        match self
+            .current_syscall
+            .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            0 => None,
+            n => Some(n - 1),
+        }
     }
 
     /// Get the thread state.
