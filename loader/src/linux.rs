@@ -314,6 +314,72 @@ fn thread_fn(thread: CurrentThread) -> Pin<Box<dyn Future<Output = ()> + Send + 
 /// - enter user mode
 /// - handle trap/interrupt/syscall according to the return value
 /// - return the context to the user thread
+/// Runs a syscall future, marking the thread [`ThreadState::Blocked`] for as
+/// long as it stays parked.
+///
+/// The state is what `/proc/<pid>/status` and `ZX_INFO_THREAD` report, and
+/// without this every thread looks `Running` — including one asleep in `read`,
+/// which makes a deadlock indistinguishable from a spin.
+///
+/// The fast path costs nothing. A syscall that completes on its first poll —
+/// nearly all of them — never touches the thread's lock; only one that
+/// genuinely parks pays for the two transitions, and it is about to sleep
+/// anyway.
+struct MarkBlocked<'a, F> {
+    fut: F,
+    thread: &'a CurrentThread,
+    /// Whether we have marked the thread blocked and owe it an unmark.
+    marked: bool,
+}
+
+impl<'a, F> MarkBlocked<'a, F> {
+    fn new(thread: &'a CurrentThread, fut: F) -> Self {
+        Self {
+            fut,
+            thread,
+            marked: false,
+        }
+    }
+}
+
+impl<F: Future> Future for MarkBlocked<'_, F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut core::task::Context<'_>) -> core::task::Poll<F::Output> {
+        // SAFETY: structural pinning of `fut`. `self` is pinned, `fut` is
+        // never moved out or replaced, and neither `thread` (a shared
+        // reference) nor `marked` (a bool) requires pinning.
+        let this = unsafe { self.get_unchecked_mut() };
+        if this.marked {
+            // Woken: running again before the inner future observes anything.
+            // A no-op if something more specific (a futex wait, say) owns the
+            // state now — `set_blocked` defers to it.
+            this.thread.set_blocked(false);
+            this.marked = false;
+        }
+        // SAFETY: as above — `fut` lives in a pinned `Self` and stays put.
+        let fut = unsafe { Pin::new_unchecked(&mut this.fut) };
+        let out = fut.poll(cx);
+        if out.is_pending() {
+            // Only own the state if nothing more specific already does.
+            this.marked = this.thread.set_blocked(true);
+        }
+        out
+    }
+}
+
+impl<F> Drop for MarkBlocked<'_, F> {
+    fn drop(&mut self) {
+        // Dropped while parked (a kill, say): do not leave the thread marked
+        // blocked forever. `set_blocked` refuses to disturb a dying thread.
+        if self.marked {
+            self.thread.set_blocked(false);
+        }
+        // `set_blocked` is a no-op unless we still own the generic state, so
+        // a thread torn down mid-wait is never dragged back to `Running`.
+    }
+}
+
 async fn run_user(thread: CurrentThread) {
     kernel_hal::thread::set_current_thread(Some(thread.inner()));
     loop {
@@ -368,7 +434,7 @@ async fn run_user(thread: CurrentThread) {
         );
         trace!("ctx = {:#x?}", ctx);
         // handle trap/interrupt/syscall
-        if let Err(err) = handle_user_trap(&thread, ctx).await {
+        if let Err(err) = MarkBlocked::new(&thread, handle_user_trap(&thread, ctx)).await {
             thread.exit_linux(err as i32);
         }
         if thread.state() == ThreadState::Dying {

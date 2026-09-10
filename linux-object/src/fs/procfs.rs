@@ -9,7 +9,7 @@ use rcore_fs::vfs::{
     FileSystem, FileType, FsError, FsInfo, INode, Metadata, PollStatus, Result, Timespec,
 };
 use zircon_object::object::KernelObject;
-use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
+use zircon_object::task::{Job, Process, Status, Thread, ThreadState, ROOT_JOB};
 
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
@@ -118,25 +118,26 @@ fn sanitize_comm(name: &str) -> String {
 
 /// The state letter for `/proc/<pid>/stat` and `/proc/<pid>/status`.
 ///
-/// KNOWN LIMITATION: this is always `R` for a live process, even one blocked
-/// in `read`, `poll` or `futex`. Linux reports the thread-group leader's
-/// scheduling state, and neither the process-level [`Status`] (which is
-/// `Running` for everything alive) nor the leader's `ThreadState` can express
-/// it here: a syscall that blocks parks an async future, and the thread object
-/// stays `Running` while it waits. Reporting the truth needs the executor to
-/// mark a thread blocked when its syscall future parks.
-///
-/// It is worth knowing that this field lies, because it is the field every
-/// hang investigation reaches for first: during one, it turned two processes
-/// quietly deadlocked on IPC into "both spinning in userspace", which is a
-/// different bug entirely and cost a full cycle to unwind. `/proc/syscalls`
-/// answers the same question honestly in the meantime -- a process making no
-/// syscalls is not spinning on them.
-fn proc_state_char(status: Status) -> char {
-    match status {
-        Status::Running => 'R',
-        Status::Init => 'S',
-        Status::Exited(_) => 'Z',
+/// Linux reports the thread-group leader's scheduling state, and the
+/// distinction that matters is running versus asleep. The process-level
+/// [`Status`] cannot express it — it is `Running` for every live process — so
+/// this asks the leader thread, which the run loop now marks blocked whenever
+/// its syscall future parks.
+fn proc_state_char(proc: &Process) -> char {
+    if let Status::Exited(_) = proc.status() {
+        return 'Z';
+    }
+    match proc_first_thread(proc).map(|t| t.state()) {
+        // Suspended by `zx_task_suspend` — Linux's "stopped by a signal".
+        Some(ThreadState::Suspended) => 'T',
+        Some(ThreadState::Dying) | Some(ThreadState::Dead) => 'Z',
+        // Every blocked flavour (syscall, sleep, futex, port, channel,
+        // exception) is an interruptible sleep here; nothing in this kernel
+        // waits uninterruptibly, so none of them is Linux's `D`.
+        Some(s) if (s as u32) & 0xff == ThreadState::Blocked as u32 => 'S',
+        Some(ThreadState::New) | Some(ThreadState::Running) => 'R',
+        // No leader thread yet: created, not started.
+        _ => 'S',
     }
 }
 
@@ -185,7 +186,7 @@ fn proc_first_thread(proc: &Process) -> Option<Arc<Thread>> {
 fn proc_pid_stat(proc: &Process) -> String {
     let pid = proc.id();
     let comm = proc_comm(proc);
-    let state = proc_state_char(proc.status());
+    let state = proc_state_char(proc);
     let ppid = proc_ppid(proc);
 
     let nthreads = proc.thread_ids().len().max(1) as i64;
@@ -271,10 +272,11 @@ fn proc_pid_status(proc: &Process) -> String {
     let pid = proc.id();
     let name = proc_comm(proc);
     let ppid = proc_ppid(proc);
-    let state = match proc.status() {
-        Status::Running => "R (running)",
-        Status::Init => "S (sleeping)",
-        Status::Exited(_) => "Z (zombie)",
+    let state = match proc_state_char(proc) {
+        'R' => "R (running)",
+        'T' => "T (stopped)",
+        'Z' => "Z (zombie)",
+        _ => "S (sleeping)",
     };
     // VmSize = total mapped address space; VmRSS = committed (resident)
     // bytes, private + shared — the fields `ps`/`top`/OOM-watchers read.
@@ -1057,7 +1059,7 @@ fn proc_perf_tasks_content() -> String {
     for proc in procs {
         let pid = proc.id();
         let comm = proc_comm(&proc);
-        let state = proc_state_char(proc.status());
+        let state = proc_state_char(&proc);
         let nthr = proc.thread_ids().len().max(1);
         let (calls, ns) = proc
             .try_linux()
