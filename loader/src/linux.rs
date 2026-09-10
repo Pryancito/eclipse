@@ -306,14 +306,6 @@ fn thread_fn(thread: CurrentThread) -> Pin<Box<dyn Future<Output = ()> + Send + 
     Box::pin(run_user(thread))
 }
 
-/// The function of a new thread.
-///
-/// loop:
-/// - wait for the thread to be ready
-/// - get user thread context
-/// - enter user mode
-/// - handle trap/interrupt/syscall according to the return value
-/// - return the context to the user thread
 /// Runs a syscall future, marking the thread [`ThreadState::Blocked`] for as
 /// long as it stays parked.
 ///
@@ -380,6 +372,14 @@ impl<F> Drop for MarkBlocked<'_, F> {
     }
 }
 
+/// The function of a new thread.
+///
+/// loop:
+/// - wait for the thread to be ready
+/// - get user thread context
+/// - enter user mode
+/// - handle trap/interrupt/syscall according to the return value
+/// - return the context to the user thread
 async fn run_user(thread: CurrentThread) {
     kernel_hal::thread::set_current_thread(Some(thread.inner()));
     loop {
