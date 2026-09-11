@@ -47,6 +47,17 @@ cfg_if! {
 pub(crate) use config::KCONFIG;
 pub(crate) use kernel_handler::KHANDLER;
 
+/// Whether this HAL runs guest user code natively inside a host process
+/// (`libos`) instead of on the machine itself.
+///
+/// The two differ in what a user context can actually carry: the libos
+/// trap path, for one, saves and restores only the user `fsbase` and
+/// discards `gsbase` outright (`push 0  # ignore gs_base` in
+/// `syscall_fn_entry`), because the host runtime owns `gs`. Callers that
+/// would otherwise promise user code something the HAL cannot deliver ask
+/// here first.
+pub const LIBOS: bool = cfg!(feature = "libos");
+
 #[cfg(feature = "graphic")]
 pub use common::boot_logo;
 pub use common::{

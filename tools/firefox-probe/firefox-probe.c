@@ -443,6 +443,75 @@ static void test_jit(void) {
   munmap(p, reserve);
 }
 
+// ── WASM sandboxes (RLBox) ──────────────────────────────────────────────────
+// Firefox compiles its font, image and media decoders to WASM and runs them
+// under RLBox. wasm2c's fastest bounds check is "segue": the sandbox heap base
+// goes in the GS segment base and every heap access carries a %gs prefix, one
+// segment override instead of an add-and-mask. wasm-rt-impl.c installs it with
+// arch_prctl(ARCH_SET_GS), and there is no fallback if that fails --
+//
+//   wasm_rt_syscall_set_segue_base error: Invalid argument
+//   Redirecting call to abort() to mozalloc_abort
+//
+// which is the whole browser gone at startup on a kernel that answers only
+// ARCH_SET_FS.
+static void test_wasm_sandbox(void) {
+  section("wasm sandbox (RLBox: font, image and media decoders)");
+
+#if defined(__x86_64__)
+  // <asm/prctl.h> is not in musl's headers; these are the UAPI values.
+  const int set_gs = 0x1001, get_gs = 0x1004;
+  const char *why = "wasm-rt-impl.c: wasm_rt_syscall_set_segue_base";
+
+  const size_t len = 64 * 1024;
+  unsigned char *heap = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (heap == MAP_FAILED) {
+    fail("mmap the sandbox heap", why, errno);
+    return;
+  }
+
+  if (syscall(SYS_arch_prctl, set_gs, (unsigned long)heap) != 0) {
+    fail("arch_prctl(ARCH_SET_GS)", why, errno);
+    munmap(heap, len);
+    return;
+  }
+  ok("arch_prctl(ARCH_SET_GS)", why);
+
+  // The base has to survive the trip back out to user mode, and every trap and
+  // syscall after it: the generated code reads through %gs for the life of the
+  // sandbox. Fault a page in and make a syscall before looking.
+  heap[0x40] = 0xa5;
+  (void)getpid();
+  unsigned char seen = 0;
+  __asm__ volatile("movb %%gs:0x40, %0" : "=r"(seen) : : "memory");
+  check(seen == 0xa5, "%gs-relative load reaches the sandbox heap",
+        "wasm2c segue codegen", 0);
+
+  unsigned long got = ~0ul;
+  if (syscall(SYS_arch_prctl, get_gs, &got) != 0) {
+    fail("arch_prctl(ARCH_GET_GS)", why, errno);
+  } else {
+    check(got == (unsigned long)heap, "arch_prctl(ARCH_GET_GS) reports the base", why, 0);
+  }
+
+  // Only reached on a kernel that took ARCH_SET_GS above, so this cannot be
+  // what kills an older one. A base the CPU would refuse must be rejected
+  // here, in the syscall: the kernel writes it with `wrmsr` on the way back to
+  // user mode, and a non-canonical value faults there -- in kernel mode, on
+  // the exit path. Linux answers EPERM.
+  errno = 0;
+  check(syscall(SYS_arch_prctl, set_gs, ~0ul - 0xfff) != 0,
+        "arch_prctl refuses a non-canonical base",
+        "wrmsr would fault in the kernel, not in the sandbox", 0);
+
+  syscall(SYS_arch_prctl, set_gs, 0ul);
+  munmap(heap, len);
+#else
+  skip("arch_prctl(ARCH_SET_GS)", "wasm-rt-impl.c: segue is x86_64-only");
+#endif
+}
+
 // ── Shared memory that is actually shared ───────────────────────────────────
 // Passing a memfd to a child proves the descriptor survives; it does not prove
 // the MEMORY is shared. Firefox's IPC rings and its prefs map are polled in
@@ -707,6 +776,7 @@ int main(int argc, char **argv) {
   test_process_launch(self);
   test_runtime();
   test_jit();
+  test_wasm_sandbox();
   test_shared_across_processes();
   test_wakeups();
   test_uname();
