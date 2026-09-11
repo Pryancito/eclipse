@@ -825,6 +825,11 @@ impl FileLike for UnixSocketState {
         Socket::ioctl(self, request, arg1, arg2, arg3)
     }
 
+    /// What `FIONREAD` reports: bytes sitting in this end's receive queue.
+    fn readable_bytes(&self) -> Option<usize> {
+        Some(self.inner.lock().buffer.len())
+    }
+
     fn as_socket(&self) -> LxResult<&dyn Socket> {
         Ok(self)
     }
