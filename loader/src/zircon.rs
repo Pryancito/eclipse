@@ -128,7 +128,7 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
     };
 
     // vdso
-    let (vdso_vmo, vdso_base) = {
+    let (vdso_vmo, vdso_base, vdso_constants_offset) = {
         let elf = ElfFile::new(vdso).unwrap();
         let vdso_vmo = VmObject::new_paged(vdso.len() / PAGE_SIZE + 1);
         vdso_vmo.write(0, vdso).unwrap();
@@ -143,6 +143,13 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
             .unwrap();
         // userboot needs to be told where this landed: see `proc.start` below.
         let vdso_base = vmar.addr();
+        // `DATA_CONSTANTS` is a local hidden symbol, so it is only in .symtab,
+        // but every vDSO build in prebuilt/zircon carries it. Its vaddr is
+        // also its file offset (this ELF maps p_offset == p_vaddr), which is
+        // what the VMO below is indexed by.
+        let vdso_constants_offset =
+            elf.get_symbol_address("DATA_CONSTANTS")
+                .expect("vDSO has no DATA_CONSTANTS symbol") as usize;
         vmar.map_from_elf(&elf, vdso_vmo.clone()).unwrap();
         #[cfg(feature = "libos")]
         {
@@ -156,7 +163,7 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
             vdso_vmo.write(offset + 8, syscall_entry).unwrap();
             vdso_vmo.write(offset + 16, syscall_entry).unwrap();
         }
-        (vdso_vmo, vdso_base)
+        (vdso_vmo, vdso_base, vdso_constants_offset)
     };
 
     // zbi
@@ -193,11 +200,17 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
     handles[K_ZBI] = Handle::new(zbi_vmo, Rights::DEFAULT_VMO);
 
     // set up handles[K_FIRSTVDSO..K_LASTVDSO + 1]
-    const VDSO_DATA_CONSTANTS: usize = 0x4a50;
     const VDSO_DATA_CONSTANTS_SIZE: usize = 0x78;
     let constants: [u8; VDSO_DATA_CONSTANTS_SIZE] =
         unsafe { core::mem::transmute(kernel_hal::vdso::vdso_constants()) };
-    vdso_vmo.write(VDSO_DATA_CONSTANTS, &constants).unwrap();
+    // Ask the vDSO where its constants live. This used to be hardcoded at
+    // 0x4a50, which was right for an older Fuchsia build; in the current one
+    // `.rodata` starts at 0x6000 and 0x4a50 lands inside `.dynstr`, so the
+    // write silently shredded 120 bytes of the symbol-name table. The one
+    // name that fell in the hole was `zx_port_create`, and userboot died
+    // linking itself against the vDSO because the entry the hash table found
+    // no longer compared equal to the name it was looking for.
+    vdso_vmo.write(vdso_constants_offset, &constants).unwrap();
     vdso_vmo.set_name("vdso/full");
     let vdso_test1 = vdso_vmo.create_child(false, 0, vdso_vmo.len()).unwrap();
     vdso_test1.set_name("vdso/test1");
