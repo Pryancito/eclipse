@@ -21,7 +21,7 @@ use linux_object::{loader::LinuxElfLoader, process::ProcessExt};
 use zircon_object::task::{CurrentThread, Process, Thread, ThreadState};
 use zircon_object::{
     object::{KernelObject, KoID},
-    vm::USER_STACK_PAGES,
+    vm::{VmAddressRegion, USER_STACK_PAGES},
     ZxError, ZxResult,
 };
 
@@ -370,6 +370,29 @@ impl<F> Drop for MarkBlocked<'_, F> {
         // `set_blocked` is a no-op unless we still own the generic state, so
         // a thread torn down mid-wait is never dragged back to `Running`.
     }
+}
+
+/// Where an address lives, for a fault report: the name of the object backing
+/// it plus the offset from that object's start, which is what `addr2line -e`
+/// wants.
+///
+/// A bare `pc` says nothing when every library is mapped at a runtime-chosen
+/// base -- a fault in a stripped `libxul.so` looked exactly like a fault in
+/// the kernel's own idea of nowhere. This is only built on the fatal path,
+/// where the process is already being killed, so walking the mapping list
+/// costs nothing that matters.
+fn describe_addr(vmar: &Arc<VmAddressRegion>, addr: usize) -> String {
+    if addr == 0 {
+        return String::from("null");
+    }
+    for m in vmar.mappings_dump() {
+        if (m.start..m.end).contains(&addr) {
+            let offset = m.vmo_offset + (addr - m.start);
+            let name: &str = if m.name.is_empty() { "anon" } else { &m.name };
+            return alloc::format!("{name}+{offset:#x} @ {:#x}-{:#x}", m.start, m.end);
+        }
+    }
+    String::from("unmapped")
 }
 
 /// The function of a new thread.
@@ -808,13 +831,15 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                 .unwrap_or(0);
             if let Err(err) = vmar.handle_page_fault(vaddr, flags) {
                 error!(
-                    "unhandled page fault @ {:#x}({:?}): {:?}, pid={} proc={} pc={:#x} -> SIGSEGV",
+                    "unhandled page fault @ {:#x}({:?}) [{}]: {:?}, pid={} proc={} pc={:#x} [{}] -> SIGSEGV",
                     vaddr,
                     flags,
+                    describe_addr(&vmar, vaddr),
                     err,
                     pid,
                     thread.proc().name(),
                     pc,
+                    describe_addr(&vmar, pc),
                 );
                 force_fault_signal(thread, Signal::SIGSEGV);
             }
