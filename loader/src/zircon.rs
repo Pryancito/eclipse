@@ -18,7 +18,6 @@ use zircon_object::task::{CurrentThread, ExceptionType, Process, Thread, ThreadS
 use zircon_object::util::elf_loader::{ElfExt, VmarExt};
 use zircon_object::vm::{VmObject, VmarFlags};
 
-
 macro_rules! include_bytes_aligned {
     ($path: expr) => {{
         #[repr(C, align(16))]
