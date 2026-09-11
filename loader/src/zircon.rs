@@ -55,14 +55,7 @@ macro_rules! boot_library {
         }
     }};
     ($name: expr, $base_dir: expr) => {{
-        #[cfg(feature = "libos")]
-        {
-            include_bytes_aligned!(concat!($base_dir, "/", $name, "-libos.so"))
-        }
-        #[cfg(not(feature = "libos"))]
-        {
-            include_bytes_aligned!(concat!($base_dir, "/", $name, ".so"))
-        }
+        include_bytes_aligned!(concat!($base_dir, "/", $name, ".so"))
     }};
 }
 
@@ -102,6 +95,13 @@ fn kcounter_vmos() -> (Arc<VmObject>, Arc<VmObject>) {
 /// Run Zircon `userboot` process from the prebuilt path, and load the ZBI file as the bootfs.
 pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
     let userboot = boot_library!("userboot");
+    // Only the vDSO has a libos build. scripts/gen-prebuilt.sh generates
+    // `libzircon-libos.so` alone and says so outright -- "Userboot and ZBI
+    // artifacts must remain the unmodified upstream builds" -- because the
+    // libos patch reworks the syscall entry the vDSO makes, nothing else.
+    #[cfg(feature = "libos")]
+    let vdso = boot_library!("libzircon-libos");
+    #[cfg(not(feature = "libos"))]
     let vdso = boot_library!("libzircon");
 
     let job = zircon_object::task::ROOT_JOB.clone();
