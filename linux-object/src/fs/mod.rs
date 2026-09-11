@@ -643,6 +643,15 @@ pub trait FileLike: KernelObject + downcast_rs::DowncastSync {
     fn is_char_device(&self) -> bool {
         false
     }
+    /// Bytes immediately readable, for `FIONREAD` (`SIOCINQ`/`TIOCINQ`).
+    ///
+    /// `None` means "I cannot answer", and the request falls through to this
+    /// object's own `ioctl`. Linux answers `FIONREAD` per object kind -- a
+    /// socket reports its receive queue, a pipe its buffer -- rather than
+    /// generically, so this is where each kind says what it has.
+    fn readable_bytes(&self) -> Option<usize> {
+        None
+    }
     /// Returns the [`VmObject`] representing the file with given `offset` and `len`.
     fn get_vmo(&self, _offset: usize, _len: usize) -> LxResult<Arc<VmObject>> {
         Err(LxError::ENOSYS)

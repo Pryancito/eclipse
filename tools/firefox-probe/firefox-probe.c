@@ -27,6 +27,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
@@ -681,6 +682,31 @@ static void test_wayland_proxy(void) {
     char rb[1] = {0};
     check(recv(cfd, rb, 1, 0) == 1 && rb[0] == 'e', "the client reads them",
           "events flow proxy -> client", errno);
+  }
+
+  // FIONREAD on the socket. A proxy asks "how much is queued?" before it
+  // reads, and on a socket that is an ordinary question with an ordinary
+  // answer. Unanswered it used to reach the net ioctl table, miss, and come
+  // back as ENOSYS -> ENOTTY -- "Not a tty" for a socket, which is exactly
+  // the errno Firefox's proxy reported before it declared the socket broken.
+  {
+    char sb[3] = {'a', 'b', 'c'};
+    if (send(cfd, sb, 3, 0) != 3) {
+      fail("send bytes to measure", why, errno);
+    } else {
+      // Give the bytes a moment to land, then ask.
+      struct pollfd wf = {afd, POLLIN, 0};
+      poll(&wf, 1, 2000);
+      int queued = -1;
+      if (ioctl(afd, FIONREAD, &queued) != 0) {
+        fail("ioctl(FIONREAD) on a socket", "a socket is not a tty, but it can be measured", errno);
+      } else {
+        check(queued == 3, "ioctl(FIONREAD) on a socket reports the queued bytes",
+              "a proxy sizes the message before it reads it", 0);
+      }
+      char drain[8];
+      (void)recv(afd, drain, sizeof drain, 0);
+    }
   }
 
   // A closed client must read as EOF (0), not as an error: that is how

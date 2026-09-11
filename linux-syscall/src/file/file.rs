@@ -1397,7 +1397,26 @@ impl Syscall<'_> {
         const FIONBIO: usize = 0x5421;
         const FIOCLEX: usize = 0x5451;
         const FIONCLEX: usize = 0x5450;
+        const FIONREAD: usize = 0x541B;
         match request {
+            // FIONREAD/SIOCINQ: bytes waiting to be read. Legal on sockets and
+            // pipes, and answered per object kind (see `FileLike::
+            // readable_bytes`) -- an object with nothing to say falls through
+            // to its own handler below.
+            //
+            // Unanswered, this reached `handle_net_ioctl`, which has no arm for
+            // it, so a socket got ENOSYS -> the ENOTTY normalisation below ->
+            // "Not a tty" for a perfectly ordinary question about a socket.
+            // That is the errno Firefox's Wayland proxy died on:
+            //   Warning: ProxiedConnection::TransferOrQueue() broken source
+            //            socket : Not a tty
+            FIONREAD => {
+                if let Some(n) = file_like.readable_bytes() {
+                    let mut out: UserOutPtr<i32> = arg1.into();
+                    out.write(n.min(i32::MAX as usize) as i32)?;
+                    return Ok(0);
+                }
+            }
             FIONBIO => {
                 // The argument is a pointer to int: nonzero = O_NONBLOCK on.
                 let on: UserInPtr<i32> = arg1.into();
