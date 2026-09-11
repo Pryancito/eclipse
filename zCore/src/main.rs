@@ -20,6 +20,16 @@ mod lang;
 #[cfg(not(feature = "libos"))]
 mod oops;
 
+/// The AHCI command-wait loop pumps the polled network stack through this
+/// symbol so a slow disk command cannot starve an in-flight download. The
+/// implementation lives in linux-object; a zircon kernel does not link that
+/// crate, and `drivers` declares the symbol unconditionally, so without this
+/// the zircon build fails to link with `undefined symbol: drivers_net_drain`.
+/// There is no network stack to pump in that configuration.
+#[cfg(not(feature = "linux"))]
+#[no_mangle]
+extern "C" fn drivers_net_drain() {}
+
 mod fs;
 mod handler;
 mod invariants;
@@ -162,6 +172,9 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         // — one relaxed atomic load per openat when unset — so this is a
         // measurement build knob, not a permanent cost. The comm runs to the
         // next space/comma (labwc's comm has neither).
+        // The recorder lives in linux-object, which a zircon-only kernel does
+        // not link.
+        #[cfg(feature = "linux")]
         if let Some(rest) = options.cmdline.split("BOOTTRACE=").nth(1) {
             // Stop at any cmdline separator: ':' (the QEMU-style list), a space,
             // or ','. A comm has none of these.
