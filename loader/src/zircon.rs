@@ -168,7 +168,13 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
     // The bootstrap protocol identifies handles by object type and name: the
     // job userboot adopts as its own is the JOB handle named "root".
     job.set_name("root");
-    let proc = Process::create(&job, "userboot").unwrap();
+    let proc = Process::create_with_vmar(
+        &job,
+        "userboot",
+        zircon_object::vm::VmAddressRegion::new_root_zircon(),
+        (),
+    )
+    .unwrap();
     let thread = Thread::create(&proc, "userboot").unwrap();
     let vmar = proc.vmar();
 
