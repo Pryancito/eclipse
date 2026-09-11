@@ -133,11 +133,25 @@ impl VMObjectTrait for VMObjectPhysical {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kernel_hal::mem::PhysFrame;
     use kernel_hal::CachePolicy;
 
     #[test]
     fn read_write() {
-        let vmo = VmObject::new_physical(0x1000, 2);
+        // Own the window instead of naming a fixed address. Under libos the
+        // frame allocator hands out every frame from 0x1000 up, so `0x1000`
+        // was memory another VMO could be committed to at the same time --
+        // this test then wrote its four bytes straight through that VMO's
+        // page. It only bit when the suite ran under enough load for the
+        // allocator to reach frame 1 while another test held it, which is why
+        // it surfaced as an occasional failure elsewhere (the concurrent
+        // append test, losing exactly four bytes).
+        //
+        // Holding the frames for the body of the test makes the range
+        // genuinely exclusive, which is what a physical window models.
+        let frames = PhysFrame::new_contiguous(2, 0);
+        assert_eq!(frames.len(), 2, "could not reserve two contiguous frames");
+        let vmo = VmObject::new_physical(frames[0].paddr(), 2);
         assert_eq!(vmo.cache_policy(), CachePolicy::Uncached);
         super::super::tests::read_write(&vmo);
     }

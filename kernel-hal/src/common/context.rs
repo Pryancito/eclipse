@@ -399,6 +399,23 @@ impl UserContext {
         self.0.error_code
     }
 
+    /// Returns the saved process status register, `spsr_el1`.
+    ///
+    /// `zx_thread_read_state`/`write_state` report and restore AArch64's CPSR
+    /// from it; the inner context's field is private to this wrapper.
+    #[cfg(any(target_arch = "aarch64", doc))]
+    #[doc(cfg(target_arch = "aarch64"))]
+    pub fn status_register(&self) -> usize {
+        self.0.spsr
+    }
+
+    /// Sets the saved process status register, `spsr_el1`.
+    #[cfg(any(target_arch = "aarch64", doc))]
+    #[doc(cfg(target_arch = "aarch64"))]
+    pub fn set_status_register(&mut self, spsr: usize) {
+        self.0.spsr = spsr;
+    }
+
     /// Returns [`TrapReason`] according to the context.
     pub fn trap_reason(&self) -> TrapReason {
         cfg_if! {
