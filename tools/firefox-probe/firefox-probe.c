@@ -512,6 +512,191 @@ static void test_wasm_sandbox(void) {
 #endif
 }
 
+// ── Wayland proxy (how Firefox reaches the compositor) ──────────────────────
+// widget/gtk/WaylandProxy.cpp. Firefox does not hand libwayland the
+// compositor socket directly: it opens its own AF_UNIX listening socket,
+// points WAYLAND_DISPLAY at it, accept()s its own connection and pumps bytes
+// and fds between that and the real compositor. The pump is
+// ProxiedConnection::TransferOrQueue(), which recvmsg()s in a loop with
+// MSG_DONTWAIT and treats ANY result other than EAGAIN/EWOULDBLOCK as a dead
+// socket:
+//
+//   Warning: ProxiedConnection::TransferOrQueue() broken source socket
+//   Error: ProxiedConnection::Process(): Failed to read data from client!
+//   Error: Failed to open Wayland display, fallback to X11.
+//
+// Those three lines are one failure: the proxy died, so GTK found no Wayland
+// display. The checks below are that pump, in order. Note what they add over
+// the socketpair checks above -- a NAMED socket, accept(), and a
+// non-blocking recvmsg on the ACCEPTED fd, none of which a socketpair
+// exercises.
+static void test_wayland_proxy(void) {
+  section("wayland proxy (how Firefox reaches the compositor)");
+
+  const char *why = "widget/gtk/WaylandProxy.cpp";
+
+  // The proxy puts its socket next to the compositor's, in XDG_RUNTIME_DIR.
+  char path[96]; // < sizeof(sockaddr_un.sun_path), so the copies below provably fit
+  const char *dirs[] = {getenv("XDG_RUNTIME_DIR"), "/tmp", "/run", "/"};
+  int lfd = -1;
+  size_t d = 0;
+  for (; d < sizeof dirs / sizeof dirs[0]; d++) {
+    if (!dirs[d] || !*dirs[d]) continue;
+    snprintf(path, sizeof path, "%s/%seclipse-probe-wl-%d",
+             dirs[d], strcmp(dirs[d], "/") ? "" : "", (int)getpid());
+    unlink(path);
+    lfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (lfd < 0) break;
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sun_family = AF_UNIX;
+    strncpy(sa.sun_path, path, sizeof sa.sun_path - 1);
+    if (bind(lfd, (struct sockaddr *)&sa, sizeof sa) == 0) break;
+    close(lfd);
+    lfd = -1;
+  }
+  if (lfd < 0) {
+    fail("bind a named AF_UNIX socket", why, errno);
+    return;
+  }
+  ok("bind a named AF_UNIX socket", why);
+
+  if (listen(lfd, 128) != 0) {
+    fail("listen", why, errno);
+    close(lfd);
+    unlink(path);
+    return;
+  }
+  ok("listen", why);
+
+  int cfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  struct sockaddr_un sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sun_family = AF_UNIX;
+  strncpy(sa.sun_path, path, sizeof sa.sun_path - 1);
+  if (cfd < 0 || connect(cfd, (struct sockaddr *)&sa, sizeof sa) != 0) {
+    fail("connect to the named socket", why, errno);
+    if (cfd >= 0) close(cfd);
+    close(lfd);
+    unlink(path);
+    return;
+  }
+  ok("connect to the named socket", why);
+
+  int afd = accept(lfd, NULL, NULL);
+  if (afd < 0) {
+    fail("accept", why, errno);
+    close(cfd);
+    close(lfd);
+    unlink(path);
+    return;
+  }
+  ok("accept", why);
+
+  // THE check. TransferOrQueue() drains the source with MSG_DONTWAIT until it
+  // sees EAGAIN; that is its ONLY loop exit. Any other errno is "broken source
+  // socket" and the proxy tears itself down -- so an accepted socket with
+  // nothing pending must answer EAGAIN and nothing else.
+  char rbuf[64];
+  struct iovec riov = {rbuf, sizeof rbuf};
+  char cbuf[CMSG_SPACE(sizeof(int))];
+  struct msghdr rmsg;
+  memset(&rmsg, 0, sizeof rmsg);
+  rmsg.msg_iov = &riov;
+  rmsg.msg_iovlen = 1;
+  rmsg.msg_control = cbuf;
+  rmsg.msg_controllen = sizeof cbuf;
+  errno = 0;
+  ssize_t r = recvmsg(afd, &rmsg, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
+  if (r >= 0) {
+    fail("recvmsg(MSG_DONTWAIT) on an idle socket reports EAGAIN", why, 0);
+  } else {
+    check(errno == EAGAIN || errno == EWOULDBLOCK,
+          "recvmsg(MSG_DONTWAIT) on an idle socket reports EAGAIN",
+          "TransferOrQueue() ends its drain loop on EAGAIN and ONLY on EAGAIN",
+          errno);
+  }
+
+  // A byte plus a passed fd, client -> proxy, exactly as a Wayland client
+  // sends a request carrying a buffer fd.
+  int pfd = memfd("proxy-passed", MFD_CLOEXEC);
+  if (pfd < 0) pfd = dup(0);
+  {
+    char sb[1] = {'w'};
+    struct iovec siov = {sb, 1};
+    char scbuf[CMSG_SPACE(sizeof(int))];
+    memset(scbuf, 0, sizeof scbuf);
+    struct msghdr smsg;
+    memset(&smsg, 0, sizeof smsg);
+    smsg.msg_iov = &siov;
+    smsg.msg_iovlen = 1;
+    smsg.msg_control = scbuf;
+    smsg.msg_controllen = sizeof scbuf;
+    struct cmsghdr *c = CMSG_FIRSTHDR(&smsg);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(c), &pfd, sizeof(int));
+    check(sendmsg(cfd, &smsg, 0) == 1, "sendmsg a byte + SCM_RIGHTS to the proxy",
+          why, errno);
+  }
+
+  // The proxy polls both ends rather than blocking on either.
+  struct pollfd pf = {afd, POLLIN, 0};
+  int pr = poll(&pf, 1, 2000);
+  check(pr == 1 && (pf.revents & POLLIN), "poll() reports the proxy socket readable",
+        "ProxiedConnection::Process() waits in poll()", pr < 0 ? errno : 0);
+
+  memset(&rmsg, 0, sizeof rmsg);
+  riov.iov_base = rbuf;
+  riov.iov_len = sizeof rbuf;
+  rmsg.msg_iov = &riov;
+  rmsg.msg_iovlen = 1;
+  rmsg.msg_control = cbuf;
+  rmsg.msg_controllen = sizeof cbuf;
+  r = recvmsg(afd, &rmsg, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
+  if (r != 1 || rbuf[0] != 'w') {
+    fail("recvmsg(MSG_DONTWAIT) returns the queued byte", why, r < 0 ? errno : 0);
+  } else {
+    ok("recvmsg(MSG_DONTWAIT) returns the queued byte", why);
+    struct cmsghdr *c = CMSG_FIRSTHDR(&rmsg);
+    if (!c || c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) {
+      fail("the passed fd arrives with it", "a Wayland buffer fd rides its request", 0);
+    } else {
+      int got = -1;
+      memcpy(&got, CMSG_DATA(c), sizeof(int));
+      struct stat st;
+      check(got >= 0 && fstat(got, &st) == 0, "the passed fd arrives with it",
+            "a Wayland buffer fd rides its request", errno);
+      if (got >= 0) close(got);
+    }
+  }
+
+  // And back the other way: the proxy forwards the compositor's events to the
+  // client over the same accepted socket.
+  {
+    char sb[1] = {'e'};
+    check(send(afd, sb, 1, 0) == 1, "the accepted socket writes back to the client",
+          "events flow proxy -> client", errno);
+    char rb[1] = {0};
+    check(recv(cfd, rb, 1, 0) == 1 && rb[0] == 'e', "the client reads them",
+          "events flow proxy -> client", errno);
+  }
+
+  // A closed client must read as EOF (0), not as an error: that is how
+  // TransferOrQueue() learns the peer is gone instead of calling it broken.
+  close(cfd);
+  errno = 0;
+  r = recv(afd, rbuf, sizeof rbuf, 0);
+  check(r == 0, "a closed peer reads as EOF, not an error",
+        "TransferOrQueue() distinguishes shutdown from failure", r < 0 ? errno : 0);
+
+  close(pfd);
+  close(afd);
+  close(lfd);
+  unlink(path);
+}
+
 // ── Shared memory that is actually shared ───────────────────────────────────
 // Passing a memfd to a child proves the descriptor survives; it does not prove
 // the MEMORY is shared. Firefox's IPC rings and its prefs map are polled in
@@ -777,6 +962,7 @@ int main(int argc, char **argv) {
   test_runtime();
   test_jit();
   test_wasm_sandbox();
+  test_wayland_proxy();
   test_shared_across_processes();
   test_wakeups();
   test_uname();
