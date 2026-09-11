@@ -9,14 +9,69 @@ impl Syscall<'_> {
     #[cfg(target_arch = "x86_64")]
     /// set architecture-specific thread state
     /// for x86_64 currently
+    ///
+    /// `GS` matters as much as `FS` here. wasm2c's *segue* bounds checking --
+    /// what Firefox's RLBox sandboxes compile to -- addresses the sandbox heap
+    /// through `%gs:`, and sets the base with `arch_prctl(ARCH_SET_GS, ..)`.
+    /// It does not fall back when that fails:
+    ///
+    ///     wasm_rt_syscall_set_segue_base error: Invalid argument
+    ///     Redirecting call to abort() to mozalloc_abort
+    ///
+    /// which is how Firefox died here while only `ARCH_SET_FS` was answered.
     pub fn sys_arch_prctl(&mut self, code: i32, addr: usize) -> SysResult {
+        use kernel_hal::context::UserContextField;
+        use zircon_object::vm::{USER_ASPACE_BASE, USER_ASPACE_SIZE};
+
+        const ARCH_SET_GS: i32 = 0x1001;
         const ARCH_SET_FS: i32 = 0x1002;
+        const ARCH_GET_FS: i32 = 0x1003;
+        const ARCH_GET_GS: i32 = 0x1004;
+
+        // Both bases reach the CPU through `wrmsr` on the way back to user
+        // mode, and `wrmsr` to IA32_FS_BASE/IA32_GS_BASE raises #GP when the
+        // value is not canonical -- in kernel mode, on the exit path, where it
+        // is a kernel fault rather than a user one. Linux rejects the same
+        // addresses with EPERM before they can get that far.
+        let settable = |addr: usize| {
+            if addr < (USER_ASPACE_BASE + USER_ASPACE_SIZE) as usize {
+                Ok(())
+            } else {
+                Err(LxError::EPERM)
+            }
+        };
+
         match code {
             ARCH_SET_FS => {
                 info!("sys_arch_prctl: set FSBASE to {:#x}", addr);
-                self.thread.with_context(|ctx| {
-                    ctx.set_field(kernel_hal::context::UserContextField::ThreadPointer, addr)
-                })?;
+                settable(addr)?;
+                self.thread
+                    .with_context(|ctx| ctx.set_field(UserContextField::ThreadPointer, addr))?;
+                Ok(0)
+            }
+            ARCH_SET_GS => {
+                info!("sys_arch_prctl: set GSBASE to {:#x}", addr);
+                // The libos trap path drops the user `gsbase` on the floor --
+                // the host runtime owns `gs` there -- so accepting this would
+                // promise user code a base it will never see. Say no instead.
+                if kernel_hal::LIBOS {
+                    return Err(LxError::EINVAL);
+                }
+                settable(addr)?;
+                self.thread
+                    .with_context(|ctx| ctx.general_mut().gsbase = addr)?;
+                Ok(0)
+            }
+            ARCH_GET_FS => {
+                let base = self
+                    .thread
+                    .with_context(|ctx| ctx.get_field(UserContextField::ThreadPointer))?;
+                UserOutPtr::<usize>::from(addr).write(base)?;
+                Ok(0)
+            }
+            ARCH_GET_GS => {
+                let base = self.thread.with_context(|ctx| ctx.general().gsbase)?;
+                UserOutPtr::<usize>::from(addr).write(base)?;
                 Ok(0)
             }
             _ => Err(LxError::EINVAL),
