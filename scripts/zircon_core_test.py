@@ -80,7 +80,11 @@ class Runner:
         self.log_dir = Path(args.log_dir or ROOT / "target/test-logs" / f"zircon-{args.arch}-{'libos' if args.libos else 'bare'}").resolve()
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.results = []
-        self.make = ["make", "-C", str(ROOT / "zCore"), "MODE=release", "ZBI=core-tests", "TEST=1", "BOOT_DISK_READONLY=on", f"ARCH={args.arch}"]
+        # LINUX=0 is not optional: zCore/Makefile defaults to `LINUX ?= 1`, so
+        # without it `make` builds a Linux-personality kernel and this driver
+        # then hands it a Zircon ZBI. It boots into create_root_fs looking for a
+        # root disk that is not there and aborts before a single test is listed.
+        self.make = ["make", "-C", str(ROOT / "zCore"), "MODE=release", "LINUX=0", "ZBI=core-tests", "TEST=1", "BOOT_DISK_READONLY=on", f"ARCH={args.arch}"]
         for key, value in [("SMP", args.smp), ("X64_CPU", args.x64_cpu), ("qemu", args.qemu)]:
             if value is not None:
                 self.make.append(f"{key}={value}")
