@@ -251,10 +251,12 @@ jobs:
           toolchain: ${{ env.rust_toolchain }}
           components: rust-src, llvm-tools-preview
 
-      - name: Install QEMU
+      - name: Install QEMU and image tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system
+          # mtools/dosfstools assemble the EFI image that `cargo image` builds
+          # for x86_64; the runner has mkfs.vfat but not mmd/mcopy.
+          sudo apt-get install -y qemu-system mtools dosfstools
           qemu-system-${{ matrix.arch }} --version
 
       - name: Prepare rootfs
@@ -304,10 +306,12 @@ jobs:
           toolchain: ${{ env.rust_toolchain }}
           components: rust-src, llvm-tools-preview
 
-      - name: Install QEMU
+      - name: Install QEMU and image tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system
+          # mtools/dosfstools assemble the EFI image that `cargo image` builds
+          # for x86_64; the runner has mkfs.vfat but not mmd/mcopy.
+          sudo apt-get install -y qemu-system mtools dosfstools
           qemu-system-${{ matrix.arch }} --version
 
       - name: Prepare rootfs
