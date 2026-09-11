@@ -88,7 +88,14 @@ jobs:
           mkdir -p target
           cargo metadata --format-version 1 > target/cargo-metadata.json
           trapframe_manifest=$(python3 -c 'import json; print(next(p["manifest_path"] for p in json.load(open("target/cargo-metadata.json"))["packages"] if p["name"] == "trapframe"))')
-          cargo test --manifest-path "$trapframe_manifest" --features fncall-preserve-x18 --release
+          # No --features here: `fncall-preserve-x18` is an upstream trapframe
+          # flag, and vendor/trapframe (this tree's fork) has neither the
+          # feature nor a need for it -- its aarch64 fncall path preserves x18
+          # unconditionally, and the round-trip test in
+          # src/arch/aarch64/fncall.rs asserts it like every other register.
+          # Asking for the feature failed the step in under a second with
+          # "the package 'trapframe' does not contain this feature".
+          cargo test --manifest-path "$trapframe_manifest" --release
 
       - name: Build macOS LibOS and report runtime skip
         if: runner.os == 'macOS'
