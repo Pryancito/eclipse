@@ -1010,13 +1010,21 @@ fn write_firefox_wrapper(rootfs: &Path) {
           export MOZ_ACCELERATED=0\n\
           export MOZ_CRASHREPORTER_DISABLE=1\n\
           FLOG=\"${HOME:-/root}/.eclipse-firefox.log\"\n\
-          if ! command -v firefox >/dev/null 2>&1; then\n\
-          \x20 echo 'eclipse-firefox: firefox not found (apk add firefox-esr)' >&2\n\
+          # `firefox` is what DEFAULT_PACKAGES installs; `firefox-esr` is a\n\
+          # separate Alpine package with its own binary name, so accept either\n\
+          # rather than sending a mirror that carries only ESR back to the\n\
+          # not-found branch.\n\
+          FFBIN=\n\
+          for c in firefox firefox-esr; do\n\
+          \x20 if command -v \"$c\" >/dev/null 2>&1; then FFBIN=$c; break; fi\n\
+          done\n\
+          if [ -z \"$FFBIN\" ]; then\n\
+          \x20 echo 'eclipse-firefox: firefox not found (apk add firefox)' >&2\n\
           \x20 echo 'eclipse-firefox: firefox not found' >>\"$FLOG\"\n\
           \x20 exit 127\n\
           fi\n\
-          echo \"[$(date '+%H:%M:%S')] firefox $* (WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-UNSET} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-UNSET})\" >>\"$FLOG\"\n\
-          exec firefox \"$@\" 2>>\"$FLOG\"\n",
+          echo \"[$(date '+%H:%M:%S')] $FFBIN $* (WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-UNSET} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-UNSET})\" >>\"$FLOG\"\n\
+          exec \"$FFBIN\" \"$@\" 2>>\"$FLOG\"\n",
     )
     .unwrap();
     {

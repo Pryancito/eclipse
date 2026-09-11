@@ -321,6 +321,24 @@ const DEFAULT_PACKAGES: &[&str] = &[
     "libpng",
     "fluidsynth",
     "libdecor",
+    // ── Firefox ─────────────────────────────────────────────────────────────
+    // The browser itself. Everything around it was already here -- the
+    // `eclipse-firefox` wrapper and its `firefox.desktop` override
+    // (desktop.rs), the software-GL stack above, and `/bin/firefox-probe`,
+    // which checks the kernel interfaces it depends on -- but the package was
+    // never installed, so the wrapper's own "firefox not found" branch was the
+    // only thing that ever ran.
+    //
+    // Alpine's `firefox` installs to /usr/lib/firefox/ (libxul.so alone is
+    // ~150 MiB). That reaches the QEMU live image intact: `usr/lib` is one of
+    // LIVE_TREES, which `copy_into_live` copies UNCAPPED, so the 16 MiB
+    // LIVE_FILE_CAP that governs the rest of the live root does not apply.
+    // The live initramfs is a RAM disk, so it does grow by roughly that much.
+    //
+    // `firefox-esr` is the fallback the wrapper also accepts; it is a separate
+    // package with a separate binary name and does NOT `provides` this one,
+    // so a mirror carrying only ESR needs ECLIPSE_XORG_PACKAGES.
+    "firefox",
 ];
 
 /// Whether the build is running as root (euid 0), via `id -u` — no extra crate
