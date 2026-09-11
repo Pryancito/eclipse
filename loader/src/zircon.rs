@@ -9,28 +9,14 @@ use xmas_elf::ElfFile;
 
 use kernel_hal::context::{TrapReason, UserContext, UserContextField};
 use kernel_hal::{MMUFlags, PAGE_SIZE};
-use zircon_object::dev::{Resource, ResourceFlags, ResourceKind};
+use zircon_object::debuglog::DebugLog;
+use zircon_object::dev::{Resource, ResourceFlags, ResourceKind, SystemResource};
 use zircon_object::ipc::{Channel, MessagePacket};
 use zircon_object::kcounter;
 use zircon_object::object::{Handle, KernelObject, Rights};
 use zircon_object::task::{CurrentThread, ExceptionType, Process, Thread, ThreadState};
 use zircon_object::util::elf_loader::{ElfExt, VmarExt};
 use zircon_object::vm::{VmObject, VmarFlags};
-
-// These describe userboot itself
-const K_PROC_SELF: usize = 0;
-const K_VMARROOT_SELF: usize = 1;
-// Essential job and resource handles
-const K_ROOTJOB: usize = 2;
-const K_ROOTRESOURCE: usize = 3;
-// Essential VMO handles
-const K_ZBI: usize = 4;
-const K_FIRSTVDSO: usize = 5;
-const K_CRASHLOG: usize = 8;
-const K_COUNTER_NAMES: usize = 9;
-const K_COUNTERS: usize = 10;
-const K_FISTINSTRUMENTATIONDATA: usize = 11;
-const K_HANDLECOUNT: usize = 15;
 
 macro_rules! include_bytes_aligned {
     ($path: expr) => {{
@@ -92,9 +78,82 @@ fn kcounter_vmos() -> (Arc<VmObject>, Arc<VmObject>) {
     (desc_vmo, arena_vmo)
 }
 
+/// The stack size userboot asks for in its `PT_GNU_STACK` program header,
+/// rounded up to a page. Falls back to Zircon's 256 KiB default.
+fn elf_stack_size(elf: &ElfFile) -> usize {
+    use xmas_elf::program::Type;
+    const DEFAULT_STACK_SIZE: usize = 256 * 1024;
+    const PT_GNU_STACK: u32 = 0x6474_e551;
+    let size = elf
+        .program_iter()
+        .find(|ph| ph.get_type() == Ok(Type::OsSpecific(PT_GNU_STACK)))
+        .map(|ph| ph.mem_size() as usize)
+        .filter(|size| *size != 0)
+        .unwrap_or(DEFAULT_STACK_SIZE);
+    (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+}
+
+/// ZBI container/item header magic and the item types this loader cares about.
+/// See `zircon/system/public/zircon/boot/image.h`.
+const ZBI_TYPE_CMDLINE: u32 = 0x4c44_4d43; // 'CMDL'
+const ZBI_HEADER_SIZE: usize = 32;
+
+/// Iterate the `CMDLINE` items of a ZBI container and call `f` on each.
+fn for_each_zbi_cmdline(zbi: &[u8], mut f: impl FnMut(&str)) {
+    if zbi.len() < ZBI_HEADER_SIZE {
+        return;
+    }
+    let word = |off: usize| {
+        let b = &zbi[off..off + 4];
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize
+    };
+    // The container header's length covers the items that follow it.
+    let end = match word(4).checked_add(ZBI_HEADER_SIZE) {
+        Some(end) if end <= zbi.len() => end,
+        _ => return,
+    };
+    let mut off = ZBI_HEADER_SIZE;
+    while off + ZBI_HEADER_SIZE <= end {
+        let item_type = word(off) as u32;
+        let len = word(off + 4);
+        let payload = off + ZBI_HEADER_SIZE;
+        if payload + len > end {
+            return;
+        }
+        if item_type == ZBI_TYPE_CMDLINE {
+            if let Ok(s) = core::str::from_utf8(&zbi[payload..payload + len]) {
+                f(s.trim_end_matches('\0'));
+            }
+        }
+        off = payload + ((len + 7) & !7);
+    }
+}
+
+/// Does this ZBI ask for the `userboot-test` build via `kernel.select.userboot=`?
+fn zbi_selects_test_userboot(zbi: &[u8]) -> bool {
+    let mut selected = false;
+    for_each_zbi_cmdline(zbi, |cmdline| {
+        for word in cmdline.split_ascii_whitespace() {
+            if let Some(value) = word.strip_prefix("kernel.select.userboot=") {
+                selected = value.starts_with("userboot-test");
+            }
+        }
+    });
+    selected
+}
+
 /// Run Zircon `userboot` process from the prebuilt path, and load the ZBI file as the bootfs.
 pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
-    let userboot = boot_library!("userboot");
+    let zbi = zbi.as_ref();
+    // `kernel.select.userboot=` in the ZBI's own command line picks the
+    // userboot variant. `core-tests.zbi` asks for `userboot-test-rust`, which
+    // is the build that understands `userboot.test.next=` and prints the
+    // `*** Exit status N ***` line `scripts/zircon_core_test.py` greps for.
+    let userboot: &'static [u8] = if zbi_selects_test_userboot(zbi) {
+        boot_library!("userboot-test")
+    } else {
+        boot_library!("userboot")
+    };
     // Only the vDSO has a libos build. scripts/gen-prebuilt.sh generates
     // `libzircon-libos.so` alone and says so outright -- "Userboot and ZBI
     // artifacts must remain the unmodified upstream builds" -- because the
@@ -105,26 +164,38 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
     let vdso = boot_library!("libzircon");
 
     let job = zircon_object::task::ROOT_JOB.clone();
-    let proc = Process::create(&job, "userboot").unwrap();
+    // The bootstrap protocol identifies handles by object type and name: the
+    // job userboot adopts as its own is the JOB handle named "root".
+    job.set_name("root");
+    let proc = Process::create_with_vmar(
+        &job,
+        "userboot",
+        zircon_object::vm::VmAddressRegion::new_root_zircon(),
+        (),
+    )
+    .unwrap();
     let thread = Thread::create(&proc, "userboot").unwrap();
-    let resource = Resource::create(
-        "root",
-        ResourceKind::ROOT,
-        0,
-        0x1_0000_0000,
-        ResourceFlags::empty(),
-    );
     let vmar = proc.vmar();
 
     // userboot
-    let (entry, userboot_size) = {
+    //
+    // The image goes in a child VMAR of its own. userboot's first bootstrap
+    // message carries two VMAR handles and tells them apart by size: the
+    // bigger one (the root VMAR) must wholly contain the smaller one (the
+    // VMAR its own ELF image was loaded into).
+    let (entry, userboot_vmar, userboot_size, stack_size) = {
         let elf = ElfFile::new(userboot).unwrap();
         let size = elf.load_segment_size();
-        let vmar = vmar
+        let child = vmar
             .allocate(None, size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
             .unwrap();
-        vmar.load_from_elf(&elf).unwrap();
-        (vmar.addr() + elf.header.pt2.entry_point() as usize, size)
+        child.load_from_elf(&elf).unwrap();
+        (
+            child.addr() + elf.header.pt2.entry_point() as usize,
+            child,
+            size,
+            elf_stack_size(&elf),
+        )
     };
 
     // vdso
@@ -168,38 +239,12 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
 
     // zbi
     let zbi_vmo = {
-        let vmo = VmObject::new_paged(zbi.as_ref().len() / PAGE_SIZE + 1);
-        vmo.write(0, zbi.as_ref()).unwrap();
+        let vmo = VmObject::new_paged(zbi.len() / PAGE_SIZE + 1);
+        vmo.write(0, zbi).unwrap();
         vmo.set_name("zbi");
         vmo
     };
 
-    // stack
-    const STACK_PAGES: usize = 8;
-    let stack_vmo = VmObject::new_paged(STACK_PAGES);
-    let flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
-    let stack_bottom = vmar
-        .map(None, stack_vmo.clone(), 0, stack_vmo.len(), flags)
-        .unwrap();
-    let sp = if cfg!(target_arch = "x86_64") {
-        // WARN: align stack to 16B, then emulate a 'call' (push rip)
-        stack_bottom + stack_vmo.len() - 8
-    } else {
-        stack_bottom + stack_vmo.len()
-    };
-
-    // channel
-    let (user_channel, kernel_channel) = Channel::create();
-    let handle = Handle::new(user_channel, Rights::DEFAULT_CHANNEL);
-
-    let mut handles = alloc::vec![Handle::new(proc.clone(), Rights::empty()); K_HANDLECOUNT];
-    handles[K_PROC_SELF] = Handle::new(proc.clone(), Rights::DEFAULT_PROCESS);
-    handles[K_VMARROOT_SELF] = Handle::new(proc.vmar(), Rights::DEFAULT_VMAR | Rights::IO);
-    handles[K_ROOTJOB] = Handle::new(job, Rights::DEFAULT_JOB);
-    handles[K_ROOTRESOURCE] = Handle::new(resource, Rights::DEFAULT_RESOURCE);
-    handles[K_ZBI] = Handle::new(zbi_vmo, Rights::DEFAULT_VMO);
-
-    // set up handles[K_FIRSTVDSO..K_LASTVDSO + 1]
     const VDSO_DATA_CONSTANTS_SIZE: usize = 0x78;
     let constants: [u8; VDSO_DATA_CONSTANTS_SIZE] =
         unsafe { core::mem::transmute(kernel_hal::vdso::vdso_constants()) };
@@ -211,52 +256,142 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
     // linking itself against the vDSO because the entry the hash table found
     // no longer compared equal to the name it was looking for.
     vdso_vmo.write(vdso_constants_offset, &constants).unwrap();
-    vdso_vmo.set_name("vdso/full");
+    // Any VMO whose name starts with "vdso/" is a vDSO variant; the first one
+    // is the one userboot maps into the programs it launches.
+    vdso_vmo.set_name("vdso/stable");
     let vdso_test1 = vdso_vmo.create_child(false, 0, vdso_vmo.len()).unwrap();
     vdso_test1.set_name("vdso/test1");
     let vdso_test2 = vdso_vmo.create_child(false, 0, vdso_vmo.len()).unwrap();
     vdso_test2.set_name("vdso/test2");
-    handles[K_FIRSTVDSO] = Handle::new(vdso_vmo, Rights::DEFAULT_VMO | Rights::EXECUTE);
-    handles[K_FIRSTVDSO + 1] = Handle::new(vdso_test1, Rights::DEFAULT_VMO | Rights::EXECUTE);
-    handles[K_FIRSTVDSO + 2] = Handle::new(vdso_test2, Rights::DEFAULT_VMO | Rights::EXECUTE);
 
     // TODO: use correct CrashLogVmo handle
     let crash_log_vmo = VmObject::new_paged(1);
     crash_log_vmo.set_name("crashlog");
-    handles[K_CRASHLOG] = Handle::new(crash_log_vmo, Rights::DEFAULT_VMO);
 
     // kcounter
     let (desc_vmo, arena_vmo) = kcounter_vmos();
-    handles[K_COUNTER_NAMES] = Handle::new(desc_vmo, Rights::DEFAULT_VMO);
-    handles[K_COUNTERS] = Handle::new(arena_vmo, Rights::DEFAULT_VMO);
 
-    // TODO: use correct Instrumentation data handle
-    let instrumentation_data_vmo = VmObject::new_paged(0);
-    instrumentation_data_vmo.set_name("UNIMPLEMENTED_VMO");
-    handles[K_FISTINSTRUMENTATIONDATA] =
-        Handle::new(instrumentation_data_vmo.clone(), Rights::DEFAULT_VMO);
-    handles[K_FISTINSTRUMENTATIONDATA + 1] =
-        Handle::new(instrumentation_data_vmo.clone(), Rights::DEFAULT_VMO);
-    handles[K_FISTINSTRUMENTATIONDATA + 2] =
-        Handle::new(instrumentation_data_vmo.clone(), Rights::DEFAULT_VMO);
-    handles[K_FISTINSTRUMENTATIONDATA + 3] =
-        Handle::new(instrumentation_data_vmo, Rights::DEFAULT_VMO);
+    // Resources. Only the name matters to userboot: it takes the one called
+    // "vmex" as its VMEX capability (used to make bootfs VMOs executable) and
+    // hands the rest on to the programs it starts.
+    let vmex_resource = Resource::create(
+        "vmex",
+        ResourceKind::SYSTEM,
+        SystemResource::Vmex as usize,
+        1,
+        ResourceFlags::empty(),
+    );
+    let mmio_resource = Resource::create(
+        "mmio",
+        ResourceKind::MMIO,
+        0,
+        0x1_0000_0000,
+        ResourceFlags::empty(),
+    );
+    let irq_resource = Resource::create(
+        "irq",
+        ResourceKind::IRQ,
+        0,
+        0x1_0000_0000,
+        ResourceFlags::empty(),
+    );
+    #[cfg(target_arch = "x86_64")]
+    let arch_resource = Resource::create(
+        "io_port",
+        ResourceKind::IOPORT,
+        0,
+        0x1_0000_0000,
+        ResourceFlags::empty(),
+    );
+    #[cfg(not(target_arch = "x86_64"))]
+    let arch_resource = Resource::create(
+        "smc",
+        ResourceKind::SMC,
+        0,
+        0x1_0000_0000,
+        ResourceFlags::empty(),
+    );
+    // No "power" resource: `zx_system_powerctl` is not implemented here, and
+    // userboot only reaches for it when the kernel offers one.
 
-    // check: handle to root proc should be only
-
-    let data = Vec::from(cmdline.replace(':', "\0") + "\0");
-    let msg = MessagePacket { data, handles };
-    kernel_channel.write(msg).unwrap();
-
-    // `_start(zx_handle_t bootstrap, const void* vdso_base)`: the second
-    // argument lands in rsi (x1 on aarch64), and userboot dereferences it
-    // immediately -- `ld::Bootstrap::InitVdso` reads the vDSO's ELF header to
-    // find its program headers. Passing 0, as this did, faults there before
-    // userboot issues a single syscall:
+    // stack
     //
-    //   mov 0x20(%rdx),%r12    <- e_phoff of a null vDSO
-    //
-    // and the process dies with ZX_TASK_RETCODE_EXCEPTION_KILL (-1028).
+    // The size comes from userboot's own `PT_GNU_STACK`: the Rust userboot
+    // asks for 2 MiB, and the 32 KiB this used to hand out is nowhere near
+    // enough for it.
+    let stack_vmo = VmObject::new_paged(stack_size / PAGE_SIZE);
+    stack_vmo.set_name("userboot-initial-stack");
+    let flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
+    let stack_bottom = vmar
+        .map(None, stack_vmo.clone(), 0, stack_vmo.len(), flags)
+        .unwrap();
+    let sp = if cfg!(target_arch = "x86_64") {
+        // WARN: align stack to 16B, then emulate a 'call' (push rip)
+        stack_bottom + stack_vmo.len() - 8
+    } else {
+        stack_bottom + stack_vmo.len()
+    };
+
+    // The kernel log userboot writes its own diagnostics to.
+    let debuglog = DebugLog::create(0);
+
+    // channel
+    let (user_channel, kernel_channel) = Channel::create();
+    let handle = Handle::new(user_channel, Rights::DEFAULT_CHANNEL);
+
+    // Handles describing the userboot process itself. The first bootstrap
+    // message carries exactly these, and no data bytes at all; anything else
+    // makes `_zx_startup_get_handles` panic.
+    let process_capabilities = || {
+        alloc::vec![
+            Handle::new(debuglog.clone(), Rights::DEFAULT_DEBUGLOG),
+            Handle::new(proc.clone(), Rights::DEFAULT_PROCESS),
+            Handle::new(vmar.clone(), Rights::DEFAULT_VMAR | Rights::IO),
+            Handle::new(thread.clone(), Rights::DEFAULT_THREAD),
+            Handle::new(userboot_vmar.clone(), Rights::DEFAULT_VMAR | Rights::IO),
+        ]
+    };
+
+    // Message 1: the process capability message.
+    kernel_channel
+        .write(MessagePacket {
+            data: Vec::new(),
+            handles: process_capabilities(),
+        })
+        .unwrap();
+
+    // Message 2: the system capability message. Also handles only. userboot
+    // sorts these out by object type and name, so the order is immaterial --
+    // except that the first VMO named "vdso/..." is the one it adopts.
+    let mut handles = alloc::vec![
+        Handle::new(zbi_vmo, Rights::DEFAULT_VMO),
+        Handle::new(vdso_vmo, Rights::DEFAULT_VMO | Rights::EXECUTE),
+        Handle::new(vdso_test1, Rights::DEFAULT_VMO | Rights::EXECUTE),
+        Handle::new(vdso_test2, Rights::DEFAULT_VMO | Rights::EXECUTE),
+        Handle::new(crash_log_vmo, Rights::DEFAULT_VMO),
+        Handle::new(desc_vmo, Rights::DEFAULT_VMO),
+        Handle::new(arena_vmo, Rights::DEFAULT_VMO),
+    ];
+    handles.extend(process_capabilities());
+    handles.extend(alloc::vec![
+        Handle::new(job, Rights::DEFAULT_JOB),
+        Handle::new(vmex_resource, Rights::DEFAULT_RESOURCE),
+        Handle::new(mmio_resource, Rights::DEFAULT_RESOURCE),
+        Handle::new(irq_resource, Rights::DEFAULT_RESOURCE),
+        Handle::new(arch_resource, Rights::DEFAULT_RESOURCE),
+    ]);
+    kernel_channel
+        .write(MessagePacket {
+            data: Vec::new(),
+            handles,
+        })
+        .unwrap();
+
+    // The kernel command line no longer travels down the bootstrap channel:
+    // `_zx_startup_get_arguments` returns nothing and userboot reads its
+    // options out of the ZBI's own `CMDLINE` items instead.
+    let _ = cmdline;
+
     proc.start(&thread, entry, sp, Some(handle), vdso_base, thread_fn)
         .expect("failed to start main thread");
     proc

@@ -312,6 +312,31 @@ impl VmAddressRegion {
         };
         #[cfg(not(feature = "aspace-separate"))]
         let (addr, size) = (USER_ASPACE_BASE as usize, USER_ASPACE_SIZE as usize);
+        Self::new_root_at(addr, size)
+    }
+
+    /// Create a new root VMAR for a Zircon process.
+    ///
+    /// The Linux personality needs [`USER_ASPACE_BASE`] to be zero so that a
+    /// non-PIE image can be mapped at the absolute vaddrs baked into its code.
+    /// Zircon user code assumes the opposite: Scudo's Fuchsia backend checks
+    /// `ZX_INFO_VMAR.base != 0` on the root VMAR outright, and a static PIE
+    /// loaded at bias zero gives `elfldltl::Self<>::Memory()` an image span
+    /// whose data pointer is null, which fails every relative relocation. So
+    /// Zircon address spaces start where Zircon's own `USER_ASPACE_BASE` does.
+    pub fn new_root_zircon() -> Arc<Self> {
+        // With `aspace-separate` each process already gets its own non-zero
+        // window out of the host address space.
+        #[cfg(feature = "aspace-separate")]
+        return Self::new_root();
+        #[cfg(not(feature = "aspace-separate"))]
+        Self::new_root_at(
+            ZIRCON_USER_ASPACE_BASE as usize,
+            (USER_ASPACE_SIZE - ZIRCON_USER_ASPACE_BASE) as usize,
+        )
+    }
+
+    fn new_root_at(addr: usize, size: usize) -> Arc<Self> {
         Arc::new(VmAddressRegion {
             flags: VmarFlags::ROOT_FLAGS,
             base: KObjectBase::new(),
@@ -2893,6 +2918,11 @@ pub const KERNEL_ASPACE_SIZE: u64 = 0x0000_0010_0000_0000;
 /// loader's PIE guard sub-VMAR (`PIE_LOAD_BASE`) and by `mmap_min_addr`
 /// (`MMAP_MIN_ADDR` in linux-syscall) instead.
 pub const USER_ASPACE_BASE: u64 = 0;
+/// The base of a Zircon process's user address space.
+///
+/// This is Zircon's own `USER_ASPACE_BASE`. See [`VmAddressRegion::new_root_zircon`]
+/// for why the Zircon personality cannot share the Linux personality's zero base.
+pub const ZIRCON_USER_ASPACE_BASE: u64 = 0x0100_0000;
 /// The size of user address space
 #[cfg(target_arch = "riscv64")]
 pub const USER_ASPACE_SIZE: u64 = (1u64 << 38) - USER_ASPACE_BASE;
