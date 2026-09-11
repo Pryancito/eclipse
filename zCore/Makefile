@@ -357,15 +357,25 @@ ifeq ($(ARCH), x86_64)
       endif
     endif
   endif
+  # A backend this QEMU was BUILT with is not a backend this host can OPEN.
+  # CI runners and headless containers ship the PipeWire client library with no
+  # session behind it, and QEMU then refuses to start at all -- "Could not
+  # create PipeWire context: No such file or directory" -- taking every
+  # QEMU-driven test with it. So require the backend's socket/device to exist,
+  # and otherwise fall back to `wav`, which needs nothing from the host and
+  # still clocks the guest codec.
+  audio_runtime := $(or $(XDG_RUNTIME_DIR),/run/user/$(shell id -u))
+  audio_usable := $(strip \
+    $(if $(wildcard $(audio_runtime)/pipewire-0),pipewire) \
+    $(if $(wildcard $(audio_runtime)/pulse/native),pa) \
+    $(if $(wildcard /dev/snd/pcm*),alsa))
+  # Preference order comes from the text argument, not the pattern list.
+  audio_pick := $(firstword $(filter $(audio_usable),$(filter $(qemu_audiodevs),pipewire pa alsa)))
   ifeq ($(AUDIODEV),)
     ifeq ($(AUDIO),off)
       AUDIODEV := none
-    else ifneq ($(filter pipewire,$(qemu_audiodevs)),)
-      AUDIODEV := pipewire
-    else ifneq ($(filter pa,$(qemu_audiodevs)),)
-      AUDIODEV := pa
-    else ifneq ($(filter alsa,$(qemu_audiodevs)),)
-      AUDIODEV := alsa
+    else ifneq ($(audio_pick),)
+      AUDIODEV := $(audio_pick)
     else
       AUDIODEV := wav
     endif
