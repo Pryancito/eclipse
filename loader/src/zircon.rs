@@ -128,7 +128,7 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
     };
 
     // vdso
-    let vdso_vmo = {
+    let (vdso_vmo, vdso_base) = {
         let elf = ElfFile::new(vdso).unwrap();
         let vdso_vmo = VmObject::new_paged(vdso.len() / PAGE_SIZE + 1);
         vdso_vmo.write(0, vdso).unwrap();
@@ -141,6 +141,8 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
                 PAGE_SIZE,
             )
             .unwrap();
+        // userboot needs to be told where this landed: see `proc.start` below.
+        let vdso_base = vmar.addr();
         vmar.map_from_elf(&elf, vdso_vmo.clone()).unwrap();
         #[cfg(feature = "libos")]
         {
@@ -154,7 +156,7 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
             vdso_vmo.write(offset + 8, syscall_entry).unwrap();
             vdso_vmo.write(offset + 16, syscall_entry).unwrap();
         }
-        vdso_vmo
+        (vdso_vmo, vdso_base)
     };
 
     // zbi
@@ -233,7 +235,16 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
     let msg = MessagePacket { data, handles };
     kernel_channel.write(msg).unwrap();
 
-    proc.start(&thread, entry, sp, Some(handle), 0, thread_fn)
+    // `_start(zx_handle_t bootstrap, const void* vdso_base)`: the second
+    // argument lands in rsi (x1 on aarch64), and userboot dereferences it
+    // immediately -- `ld::Bootstrap::InitVdso` reads the vDSO's ELF header to
+    // find its program headers. Passing 0, as this did, faults there before
+    // userboot issues a single syscall:
+    //
+    //   mov 0x20(%rdx),%r12    <- e_phoff of a null vDSO
+    //
+    // and the process dies with ZX_TASK_RETCODE_EXCEPTION_KILL (-1028).
+    proc.start(&thread, entry, sp, Some(handle), vdso_base, thread_fn)
         .expect("failed to start main thread");
     proc
 }

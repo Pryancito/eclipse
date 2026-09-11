@@ -160,6 +160,26 @@ impl super::LinuxRootfs {
 
         // For x86_64, build the installer images first
         if let Arch::X86_64 = self.0 {
+            // The EFI image is assembled with external tools. Check for them
+            // before the eight minutes of compiling below, because a missing
+            // one surfaces as a bare unwrap on the spawn:
+            //   called `Result::unwrap()` on an `Err` value:
+            //   Os { code: 2, kind: NotFound, message: "No such file or directory" }
+            // naming neither the tool nor the package it comes from. Same
+            // checks, and the same advice, as the `iso` target in the root
+            // Makefile. Only this arch builds an EFI image, which is why
+            // aarch64 and riscv64 never needed them.
+            for (tool, package) in [
+                ("mkfs.vfat", "dosfstools"),
+                ("mmd", "mtools"),
+                ("mcopy", "mtools"),
+            ] {
+                let found = std::env::var_os("PATH").is_some_and(|paths| {
+                    std::env::split_paths(&paths).any(|dir| dir.join(tool).is_file())
+                });
+                assert!(found, "missing `{tool}` (package: {package})");
+            }
+
             let rootfs_path = self.path();
             let boot_dir = rootfs_path.join("boot");
             fs::create_dir_all(&boot_dir).unwrap();
