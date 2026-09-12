@@ -176,6 +176,11 @@ impl Syscall<'_> {
                 // Record our PID so a peer (e.g. seatd) can read it via
                 // SO_PEERCRED when it accepts our connection.
                 s.set_owner_pid(self.zircon_process().id() as i32);
+                // This arm takes EVERY AF_UNIX type, and the implementation is
+                // a byte stream whichever one was asked for. Record the request
+                // anyway: `sendmsg` must not truncate an oversized message on a
+                // socket the user created as a datagram or seqpacket.
+                s.set_socket_type(socket_type);
                 s
             }
             (_, _, _) => {
@@ -544,17 +549,18 @@ impl Syscall<'_> {
         //
         // So gather only the first `SYSCALL_IO_MAX` bytes and report that count;
         // the caller resumes from it (Mozilla IPC, libwayland and stdio all
-        // track a partial-write offset). Datagram sockets get `EMSGSIZE`
-        // instead: a datagram has a message boundary, so silently truncating it
-        // would corrupt the message rather than short-change the writer, and
-        // `EMSGSIZE` is what Linux returns for one too large to send atomically.
+        // track a partial-write offset).
+        //
+        // Only for a socket we KNOW is a stream, though. Anything
+        // message-oriented gets `EMSGSIZE`: a message boundary means a short
+        // write would corrupt the message rather than short-change the writer,
+        // and `EMSGSIZE` is what Linux returns for a message too large to send
+        // atomically. `None` counts as message-oriented on purpose — it means
+        // the socket does not report a type (netlink is one), and guessing
+        // "stream" there would silently split, say, a netlink dump. Erring
+        // toward a clean error beats erring toward silent corruption.
         let data = if total > super::SYSCALL_IO_MAX {
-            if matches!(
-                sock_type,
-                Some(SocketType::SOCK_DGRAM)
-                    | Some(SocketType::SOCK_RAW)
-                    | Some(SocketType::SOCK_RDM)
-            ) {
+            if !matches!(sock_type, Some(SocketType::SOCK_STREAM)) {
                 return Err(LxError::EMSGSIZE);
             }
             let mut buf = alloc::vec![0u8; super::SYSCALL_IO_MAX];
@@ -917,6 +923,15 @@ impl Syscall<'_> {
         let socket1 = Arc::new(UnixSocketState::default());
         let socket2 = Arc::new(UnixSocketState::default());
         UnixSocketState::connect_pair(&socket1, &socket2);
+        // Same as `sys_socket`: keep the requested type so `sendmsg` can tell a
+        // datagram/seqpacket pair from a stream one. `SOCKET_TYPE_MASK` strips
+        // the SOCK_NONBLOCK / SOCK_CLOEXEC bits handled just below; an
+        // unrecognized type leaves the SOCK_STREAM default, which is what this
+        // transport actually is.
+        if let Ok(t) = SocketType::try_from(_type & SOCKET_TYPE_MASK) {
+            socket1.set_socket_type(t);
+            socket2.set_socket_type(t);
+        }
         // The type argument packs SOCK_NONBLOCK / SOCK_CLOEXEC alongside the
         // socket type (same bit values as O_NONBLOCK / O_CLOEXEC, like
         // accept4). These were silently dropped, handing out BLOCKING sockets
