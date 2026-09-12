@@ -1072,18 +1072,27 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                         dump[7], dump[8],
                     ));
                     // And say whether the allocator-aliasing checks could even
-                    // have seen it. `overlapping_live_stack` scans a fixed-size
-                    // registry; stacks that did not fit are counted here, and a
-                    // non-zero count means "no [frame-alias] fired" is a false
-                    // negative rather than a result.
-                    let untracked = ::executor::untracked_live_stacks();
+                    // have seen it. There are TWO fixed-size registries, one per
+                    // check, and each silently loses stacks that do not fit:
+                    // `overlapping_live_stack` backs `[frame-alias]`,
+                    // `alloc_overlaps_live_stack` backs `[heap-alias]`. Either
+                    // one being incomplete makes its check able to miss an
+                    // overlap, so report them separately and only claim coverage
+                    // when both are clean.
+                    let untracked_frame = ::executor::untracked_live_stacks();
+                    let untracked_alloc = ::executor::untracked_alloc_stacks();
+                    let complete = untracked_frame == 0 && untracked_alloc == 0;
                     crate::console::serial_write_fmt_spin(format_args!(
-                        "[df-sp] live-stack registry: {} untracked stack(s) — alias checks are {}\n",
-                        untracked,
-                        if untracked == 0 {
-                            "complete, so no [frame-alias]/[heap-alias] line is a real negative"
+                        "[df-sp] live-stack registries: {} untracked for [frame-alias], {} for \
+                         [heap-alias] — {}\n",
+                        untracked_frame,
+                        untracked_alloc,
+                        if complete {
+                            "coverage is complete, so the absence of a [frame-alias]/[heap-alias] \
+                             line above DOES rule allocator aliasing out"
                         } else {
-                            "INCOMPLETE, so a missing [frame-alias]/[heap-alias] proves nothing"
+                            "coverage is INCOMPLETE, so the absence of a [frame-alias]/[heap-alias] \
+                             line above rules NOTHING out"
                         },
                     ));
                     fault_sp = tf.rax;
