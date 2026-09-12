@@ -989,7 +989,67 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
             // SP it can no longer tell which coroutine stack actually faulted.
             // This is what lets containment abandon that executor from the IST
             // stack instead of halting the machine.
-            crate::kstats::note_fault_regs(tf.rip as u64, tf.rbp as u64, tf.rsp as u64);
+            // [df-sp] A #DF raised inside `__from_user`'s register-push window
+            // is not a mystery, and it is recoverable even though the frame
+            // looks unusable. `syscall_return` stashes the thread's
+            // `GeneralRegs` pointer at [TSS.RSP0] (`push rdi` twice, then
+            // `mov gs:4, rsp`); `__alltraps` reloads it with
+            // `mov rsp, [rsp + 8*8]` and adds 22*8. When that slot has been
+            // zeroed -- or otherwise left invalid -- while the thread ran in
+            // user mode, rsp becomes that value plus 22*8, the first push raises
+            // #PF, and delivering it on the same dead stack escalates to #DF.
+            //
+            // The reported rsp is therefore garbage and `fault_sp_abandonable`
+            // rejects it, which is why such a fault always ended in
+            // "cannot isolate - halting". But inside this exact window `rax`
+            // still holds `gs:4`, i.e. TSS.RSP0 itself: a live address on the
+            // faulting thread's kernel stack. Hand that to the isolation
+            // machinery instead, and the CPU is recovered like any other
+            // contained fault rather than taking the machine down.
+            //
+            // Substituting it cannot retire the wrong executor. `fault_sp` is
+            // never a lookup key: both `fault_sp_abandonable` and
+            // `abandon_executor_for_sp` take `runtime.current_executor` for THIS
+            // cpu and use the sp only as a `stack_contains` guard on it. So if
+            // the stack really had been recycled to another executor -- the very
+            // scenario suspected below -- the guard would be false and the path
+            // declines, leaving the old halt. It fails safe in exactly the case
+            // that would make it dangerous.
+            //
+            // This contains the symptom; it does not explain who zeroed the
+            // slot. The zero is the thing to chase (only another CPU can write
+            // it -- this one was in user mode), and this path names it in the
+            // log so the next occurrence is not read as generic corruption.
+            // `__from_user` adds this to the loaded pointer before the first
+            // push, so subtracting it recovers what was actually in the slot.
+            const FROM_USER_RSP_BIAS: usize = 22 * 8;
+            let mut fault_sp = tf.rsp;
+            if vec == 8 {
+                extern "C" {
+                    fn __from_user_regs_push();
+                    fn __from_user_regs_push_end();
+                }
+                let lo = __from_user_regs_push as *const () as usize;
+                let hi = __from_user_regs_push_end as *const () as usize;
+                // rsp below one page can only be a destroyed stack pointer: the
+                // real one is always a kernel-half address.
+                if (lo..hi).contains(&tf.rip) && tf.rsp < 0x1000 {
+                    // Report the pointer that was actually loaded rather than
+                    // asserting it was null: `add rsp, 22*8` runs regardless, so
+                    // any pointer below a page lands here and a small non-null
+                    // one would send the next reader chasing the wrong thing.
+                    crate::console::serial_write_fmt_spin(format_args!(
+                        "\n[df-sp] #DF inside __alltraps/__from_user: the GeneralRegs pointer at \
+                         [TSS.RSP0] was {:#x}, so rsp became {:#x}. Isolating on the real kernel \
+                         stack {:#x} (rax = gs:4) instead of the wrecked rsp.\n",
+                        tf.rsp.wrapping_sub(FROM_USER_RSP_BIAS),
+                        tf.rsp,
+                        tf.rax,
+                    ));
+                    fault_sp = tf.rax;
+                }
+            }
+            crate::kstats::note_fault_regs(tf.rip as u64, tf.rbp as u64, fault_sp as u64);
             panic!(
                 "\nCPU EXCEPTION on CPU{}: {} (vec={:#x})\n\
                  error_code={:#x}\n{:#x?}",
