@@ -524,10 +524,46 @@ impl Syscall<'_> {
         let iov_ptr: UserInPtr<IoVecIn> = hdr.msg_iov.as_addr().into();
         let iovlen = hdr.msg_iovlen;
         let iovs = iov_ptr.read_iovecs(iovlen)?;
-        if iovs.total_len() > super::SYSCALL_IO_MAX {
-            return Err(LxError::EINVAL);
-        }
-        let data = iovs.read_to_vec()?;
+        let total = iovs.total_len();
+
+        // Resolve the fd before gathering, so the socket's type can decide what
+        // an oversized message means (and so EBADF/ENOTSOCK wins over a size
+        // complaint, as it does on Linux).
+        let file_like = self.linux_process().get_file_like(sockfd.into())?;
+        let sock_type = file_like.as_socket()?.socket_type();
+
+        // A message longer than the bounded kernel buffer is NOT an error on a
+        // stream socket. `sendmsg` may return a short count exactly like
+        // `write`, and rejecting the whole call with `EINVAL` is what the
+        // `sys_writev` doc block above describes killing every GLX client: xcb
+        // saw errno 22, marked the connection dead and exited with "XIO: fatal
+        // IO error 22 (Invalid argument)" right after its window appeared.
+        // Firefox dies the same way, one layer up — its IPC channel treats any
+        // `sendmsg` error as fatal and tears the channel down, so the browser
+        // window opens and then immediately goes away.
+        //
+        // So gather only the first `SYSCALL_IO_MAX` bytes and report that count;
+        // the caller resumes from it (Mozilla IPC, libwayland and stdio all
+        // track a partial-write offset). Datagram sockets get `EMSGSIZE`
+        // instead: a datagram has a message boundary, so silently truncating it
+        // would corrupt the message rather than short-change the writer, and
+        // `EMSGSIZE` is what Linux returns for one too large to send atomically.
+        let data = if total > super::SYSCALL_IO_MAX {
+            if matches!(
+                sock_type,
+                Some(SocketType::SOCK_DGRAM)
+                    | Some(SocketType::SOCK_RAW)
+                    | Some(SocketType::SOCK_RDM)
+            ) {
+                return Err(LxError::EMSGSIZE);
+            }
+            let mut buf = alloc::vec![0u8; super::SYSCALL_IO_MAX];
+            let n = iovs.read_bytes_at(0, &mut buf)?;
+            buf.truncate(n);
+            buf
+        } else {
+            iovs.read_to_vec()?
+        };
 
         // SCM_RIGHTS: resolve any attached fds before queueing the bytes.
         // `msg_controllen` is fully user-controlled; bound it before `read_array`
@@ -553,7 +589,6 @@ impl Syscall<'_> {
             None
         };
 
-        let file_like = self.linux_process().get_file_like(sockfd.into())?;
         let socket_fl = file_like.clone();
         let socket = socket_fl.as_socket()?;
         // Return the actual queued byte count (a TCP short write can queue less
