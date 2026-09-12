@@ -373,14 +373,25 @@ impl<F> Drop for MarkBlocked<'_, F> {
 }
 
 /// Where an address lives, for a fault report: the name of the object backing
-/// it plus the offset from that object's start, which is what `addr2line -e`
-/// wants.
+/// it, the offset *within its mapping*, and the mapping's bounds.
 ///
 /// A bare `pc` says nothing when every library is mapped at a runtime-chosen
 /// base -- a fault in a stripped `libxul.so` looked exactly like a fault in
-/// the kernel's own idea of nowhere. This is only built on the fatal path,
-/// where the process is already being killed, so walking the mapping list
-/// costs nothing that matters.
+/// the kernel's own idea of nowhere.
+///
+/// Read the offset for what it is: a file mapping here is backed by a VMO that
+/// already starts at the mapped file offset (see `get_vmo` in
+/// `linux-object/src/fs/file.rs`), so this counts from the start of THAT
+/// mapping, not from the start of the file. A shared library is mapped one
+/// PT_LOAD at a time, so for a fault in library code it is an offset into that
+/// segment. Turning it into an address `addr2line -e` understands means adding
+/// the segment's own base: match the mapping's size against `readelf -lW` to
+/// find which PT_LOAD it is, then add that header's page-aligned `VirtAddr`.
+/// Claiming otherwise sent a first attempt at this to an address 0x263d000
+/// short, where `addr2line` and `readelf -r` both found nothing.
+///
+/// This is only built on the fatal path, where the process is already being
+/// killed, so walking the mapping list costs nothing that matters.
 fn describe_addr(vmar: &Arc<VmAddressRegion>, addr: usize) -> String {
     if addr == 0 {
         return String::from("null");
@@ -389,7 +400,7 @@ fn describe_addr(vmar: &Arc<VmAddressRegion>, addr: usize) -> String {
         if (m.start..m.end).contains(&addr) {
             let offset = m.vmo_offset + (addr - m.start);
             let name: &str = if m.name.is_empty() { "anon" } else { &m.name };
-            return alloc::format!("{name}+{offset:#x} @ {:#x}-{:#x}", m.start, m.end);
+            return alloc::format!("{name}+{offset:#x} in map {:#x}-{:#x}", m.start, m.end);
         }
     }
     String::from("unmapped")
