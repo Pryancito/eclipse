@@ -166,7 +166,16 @@ impl Syscall<'_> {
             // path with no other trace, and a silently-rejected giant
             // reservation (e.g. a JIT engine's executable pool) otherwise looks
             // like a spontaneous userspace crash with nothing in the kernel log.
-            warn!(
+            //
+            // `error!`, not `warn!`, and the same for every other failure
+            // reported in this file: the shipped command line is
+            // `LOG=error` (zCore/rboot.conf), so a `warn!` here is not a
+            // quieter message -- it is no message. A whole round of chasing
+            // Firefox's startup crash went past a possible allocation failure
+            // for exactly that reason, with the kernel's own best diagnostic
+            // written and switched off. A syscall that fails and takes a
+            // process down is not a warning.
+            error!(
                 "mmap: rejecting len={:#x} (cap={:#x}) prot={:?} flags={:?} fd={:?}",
                 len, MAX_MMAP_LEN, prot, flags, fd
             );
@@ -261,7 +270,7 @@ impl Syscall<'_> {
                     MMAP_MIN_ADDR,
                 )
                 .inspect_err(|e| {
-                    warn!(
+                    error!(
                         "mmap(anon) FAILED: {:?} addr={:#x} len={:#x} prot={:?} flags={:?}",
                         e, addr, len, prot, flags
                     );
@@ -280,7 +289,7 @@ impl Syscall<'_> {
                 let (vmo, off) = file_like
                     .get_vmo_shared(offset as usize, len)
                     .inspect_err(|e| {
-                        warn!(
+                        error!(
                             "mmap(file,shared) get_vmo_shared FAILED: {:?} fd={:?} offset={:#x} len={:#x}",
                             e, fd, offset, len
                         );
@@ -290,7 +299,7 @@ impl Syscall<'_> {
                 (vmo, off)
             } else {
                 let vmo = file_like.get_vmo(offset as usize, len).inspect_err(|e| {
-                    warn!(
+                    error!(
                         "mmap(file) get_vmo FAILED: {:?} fd={:?} offset={:#x} len={:#x}",
                         e, fd, offset, len
                     );
@@ -347,7 +356,7 @@ impl Syscall<'_> {
                         MMAP_MIN_ADDR,
                     )
                     .inspect_err(|e| {
-                        warn!(
+                        error!(
                             "mmap(file) reserve FAILED: {:?} len={:#x} map_len={:#x}",
                             e, len, map_len
                         );
@@ -365,7 +374,7 @@ impl Syscall<'_> {
                     MMAP_MIN_ADDR,
                 )
                 .inspect_err(|e| {
-                    warn!(
+                    error!(
                         "mmap(file) overlay FAILED: {:?} base={:#x} map_len={:#x} vmo_len={:#x}",
                         e,
                         base,
@@ -388,7 +397,7 @@ impl Syscall<'_> {
                     MMAP_MIN_ADDR,
                 )
                 .inspect_err(|e| {
-                    warn!(
+                    error!(
                         "mmap(file) map_ext FAILED: {:?} addr={:#x} len={:#x} vmo_len={:#x} prot={:?} flags={:?} offset={:#x}",
                         e, addr, len, vmo.len(), prot, flags, offset
                     );
@@ -505,7 +514,7 @@ impl Syscall<'_> {
                 }
             }
             if let Some((size, e)) = last_err {
-                warn!(
+                error!(
                     "brk: failed to map {:#x} bytes at {:#x}: {:?}",
                     size, mapped_brk, e
                 );
@@ -584,7 +593,7 @@ impl Syscall<'_> {
             Ok(()) => Ok(0),
             Err(e) => {
                 if hunter::policy::wx_mode() == hunter::Mode::Enforce {
-                    warn!(
+                    error!(
                         "mprotect: addr={:#x} len={:#x} flags={:?} → {:?} (rejected under W^X enforce)",
                         addr, len, flags, e
                     );

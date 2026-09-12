@@ -40,6 +40,7 @@
 #include <sys/uio.h>
 #include <sys/utsname.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -83,6 +84,14 @@
 #endif
 
 static int g_verbose;
+// A switch so the thread-creating section can be left out of a run: that is
+// the controlled experiment for "does a fork after a thread break the child".
+static int g_skip_js;
+// Finer switches: the section does two new things (a big split reservation
+// and a thread), and only one run per boot is possible, so each has to be
+// removable on its own to say which one a later fork trips over.
+static int g_no_jit;
+static int g_no_jsthread;
 static int g_pass, g_fail, g_skip;
 static const char *g_section = "";
 
@@ -723,6 +732,165 @@ static void test_wayland_proxy(void) {
   unlink(path);
 }
 
+// FutexThread::initialize()'s shape: a thread that parks on a condition
+// variable and is woken by another thread. Bounded by a deadline so a broken
+// wake reports a failure instead of hanging the probe.
+static pthread_mutex_t g_js_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_js_cv = PTHREAD_COND_INITIALIZER;
+static int g_js_flag = 0;
+static int g_js_woke = 0;
+static int g_js_timedout = 0;
+
+static void *js_futex_worker(void *arg) {
+  (void)arg;
+  struct timespec deadline;
+  clock_gettime(CLOCK_REALTIME, &deadline);
+  deadline.tv_sec += 5;
+  pthread_mutex_lock(&g_js_mtx);
+  while (!g_js_flag) {
+    if (pthread_cond_timedwait(&g_js_cv, &g_js_mtx, &deadline) == ETIMEDOUT) {
+      g_js_timedout = 1;
+      break;
+    }
+  }
+  g_js_woke = g_js_flag;
+  pthread_mutex_unlock(&g_js_mtx);
+  return NULL;
+}
+
+static void test_js_futex(void) {
+  pthread_t th;
+  if (pthread_create(&th, NULL, js_futex_worker, NULL) != 0) {
+    fail("pthread_create", "FutexThread::initialize needs a thread", errno);
+    return;
+  }
+  ok("pthread_create", "FutexThread::initialize needs a thread");
+  // Let the worker reach the wait, then wake it.
+  struct timespec nap = {0, 100 * 1000 * 1000};
+  nanosleep(&nap, NULL);
+  pthread_mutex_lock(&g_js_mtx);
+  g_js_flag = 1;
+  pthread_cond_signal(&g_js_cv);
+  pthread_mutex_unlock(&g_js_mtx);
+  pthread_join(th, NULL);
+  if (g_js_timedout) {
+    fail("a condvar signal crosses threads", "Atomics.wait / the engine's parking", 0);
+  } else {
+    check(g_js_woke, "a condvar signal crosses threads",
+          "Atomics.wait / the engine's parking", 0);
+  }
+}
+
+// ── JavaScript engine startup (SpiderMonkey JS_Init) ───────────────────────
+// js/src/vm/Initialization.cpp. Firefox's crash on this kernel is not a null
+// dereference at all: it is MOZ_CRASH_UNSAFE(failure) on what JS_Init
+// returned, using Firefox's deliberate `*(nullptr) = __LINE__` idiom. JS_Init
+// hands back the name of the first check that failed, one of eight:
+//
+//   js::wasm::Init()                                  js::jit::InitializeJit()
+//   js::InitDateTimeState()                           ICU4CLibrary::Initialize()
+//   js::CreateHelperThreadsState()                    FutexThread::initialize()
+//   js::SharedImmutableStringsCache::initSingleton()
+//   js::frontend::WellKnownParserAtoms::initSingleton()
+//
+// That string lands in gMozCrashReason, which nothing prints, so the guest
+// never says which. The checks below are instead what those eight need FROM
+// THE KERNEL -- so a failure here names the one to fix, without needing
+// Firefox to tell us.
+static void test_js_init(void) {
+  section("javascript engine startup (SpiderMonkey JS_Init)");
+
+#if defined(__x86_64__)
+  if (g_no_jit) {
+    skip("reserve a 1 GiB PROT_NONE code pool", "--no-jit");
+  } else {
+  // js::jit::InitProcessExecutableMemory: reserve the process's whole code
+  // budget PROT_NONE up front, trim the ends with munmap to align it, then
+  // flip windows inside the reservation between RW and RX as code is emitted.
+  // Note what this adds over the JIT checks above: those mmap a region and
+  // mprotect the WHOLE of it. This splits a reservation with munmap and then
+  // mprotects a window INSIDE what is left -- a mapping the kernel has to
+  // carry per-page permissions for.
+  const size_t pool = (size_t)1024 * 1024 * 1024;
+  const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+  char *res = mmap(NULL, pool, PROT_NONE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (res == MAP_FAILED) {
+    fail("reserve a 1 GiB PROT_NONE code pool", "js::jit::InitProcessExecutableMemory", errno);
+  } else {
+    ok("reserve a 1 GiB PROT_NONE code pool", "js::jit::InitProcessExecutableMemory");
+
+    // Trim a slice off each end, splitting the reservation in three.
+    int trimmed = munmap(res, page) == 0 &&
+                  munmap(res + pool - page, page) == 0;
+    check(trimmed, "munmap trims the ends of a reservation",
+          "how the JIT aligns its pool", errno);
+
+    // A window inside the remainder: writable, then executable, then gone.
+    char *code = res + (16 * page);
+    if (mprotect(code, 64 * 1024, PROT_READ | PROT_WRITE) != 0) {
+      fail("mprotect a window inside the reservation to RW", "the JIT emits code", errno);
+    } else {
+      ok("mprotect a window inside the reservation to RW", "the JIT emits code");
+      // mov $42,%eax ; ret
+      static const unsigned char stub[] = {0xb8, 0x2a, 0x00, 0x00, 0x00, 0xc3};
+      memcpy(code, stub, sizeof stub);
+      if (mprotect(code, 64 * 1024, PROT_READ | PROT_EXEC) != 0) {
+        fail("mprotect that window to RX", "the JIT runs what it emitted", errno);
+      } else {
+        ok("mprotect that window to RX", "the JIT runs what it emitted");
+        int (*fn)(void) = (int (*)(void))code;
+        check(fn() == 42, "call into the reservation's code window",
+              "a JIT that cannot run its output is a dead engine", 0);
+      }
+      check(mprotect(code, 64 * 1024, PROT_NONE) == 0,
+            "hand the window back to PROT_NONE", "the JIT recycles its pool", errno);
+    }
+    munmap(res + page, pool - 2 * page);
+  }
+  }
+#else
+  skip("reserve a PROT_NONE code pool", "the stub below is x86_64 machine code");
+#endif
+
+  // js::InitDateTimeState / DateTimeInfo: the engine resolves the local time
+  // zone at startup and every Date object depends on it.
+  // A missing zone file is a packaging matter, not a kernel one (musl falls
+  // back to UTC and the engine still starts), so say which it is.
+  if (access("/etc/localtime", R_OK) != 0) {
+    fail("/etc/localtime is readable",
+         "js::InitDateTimeState resolves the local zone -- `apk add tzdata`", errno);
+  } else {
+    ok("/etc/localtime is readable", "js::InitDateTimeState resolves the local zone");
+  }
+  tzset();
+  time_t now = time(NULL);
+  struct tm lt;
+  if (!localtime_r(&now, &lt)) {
+    fail("localtime_r", "js::InitDateTimeState", errno);
+  } else {
+    // Any plausible wall clock. A 1970 date here means the engine would
+    // compute every timestamp from a clock that never started.
+    check(lt.tm_year + 1900 >= 2020, "localtime_r returns a plausible year",
+          "js::InitDateTimeState", 0);
+    if (g_verbose) {
+      printf("         local: %04d-%02d-%02d %02d:%02d:%02d\n", lt.tm_year + 1900,
+             lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec);
+    }
+  }
+  struct tm ut;
+  check(gmtime_r(&now, &ut) != NULL, "gmtime_r", "js::InitDateTimeState", errno);
+
+  // FutexThread::initialize: a thread plus the condvar it parks on. The futex
+  // checks above are single-threaded; this is the wake crossing threads,
+  // which is what the engine's Atomics.wait machinery is built on.
+  if (g_no_jsthread) {
+    skip("pthread_create", "--no-jsthread");
+  } else {
+    test_js_futex();
+  }
+}
+
 // ── Shared memory that is actually shared ───────────────────────────────────
 // Passing a memfd to a child proves the descriptor survives; it does not prove
 // the MEMORY is shared. Firefox's IPC rings and its prefs map are polled in
@@ -969,6 +1137,9 @@ int main(int argc, char **argv) {
   }
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "-v")) g_verbose = 1;
+    else if (!strcmp(argv[i], "--skip-js")) g_skip_js = 1;
+    else if (!strcmp(argv[i], "--no-jit")) g_no_jit = 1;
+    else if (!strcmp(argv[i], "--no-jsthread")) g_no_jsthread = 1;
     else if (!strcmp(argv[i], "--child-fd") && i + 1 < argc) return child_main(atoi(argv[++i]));
     else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
       printf("usage: firefox-probe [-v]\n"
@@ -989,6 +1160,7 @@ int main(int argc, char **argv) {
   test_jit();
   test_wasm_sandbox();
   test_wayland_proxy();
+  if (!g_skip_js) test_js_init();
   test_shared_across_processes();
   test_wakeups();
   test_uname();
