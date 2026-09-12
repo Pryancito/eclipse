@@ -1396,7 +1396,15 @@ fn icu_data_layout(root: &Path) -> Option<String> {
 fn audit_icu_data(full: &Path, live: &Path) {
     // Only meaningful once something in the image actually links against ICU.
     // Firefox is the consumer this matters for; skip the noise otherwise.
-    if !full.join("usr/lib/firefox").is_dir() && !live.join("usr/lib/firefox").is_dir() {
+    //
+    // Both install paths: `firefox-esr` is a separate Alpine package with its
+    // own tree, and the `eclipse-firefox` wrapper accepts either. Keying off
+    // `usr/lib/firefox` alone would silently skip the audit on an ESR-only
+    // image -- exactly the build that most needs the warning.
+    let installed = |root: &Path| {
+        root.join("usr/lib/firefox").is_dir() || root.join("usr/lib/firefox-esr").is_dir()
+    };
+    if !installed(full) && !installed(live) {
         return;
     }
     match (icu_data_layout(full), icu_data_layout(live)) {
@@ -1414,7 +1422,7 @@ fn audit_icu_data(full: &Path, live: &Path) {
         }
         (None, None) => {
             eprintln!(
-                "warning: no ICU data blob found in either root, yet usr/lib/firefox is \
+                "warning: no ICU data blob found in either root, yet Firefox is \
                  installed. SpiderMonkey's ICU4CLibrary::Initialize() will fail and \
                  Firefox will abort before opening a window. Add an `icu-data-*` package \
                  to the apk set (Alpine splits ICU into icu-libs and icu-data-en / \
