@@ -851,6 +851,19 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                 {
                     error!("  regs: {}", regs);
                 }
+                // And the instruction itself. Several registers are usually
+                // zero at a fault and only the opcode says which one was being
+                // dereferenced -- with `rax`, `rdx`, `rbp` and `r9` all zero
+                // there is no reading the faulting operand off the dump alone.
+                // The page is mapped executable (we just ran it), so this read
+                // is the same memory the CPU fetched from.
+                if let Ok(bytes) = kernel_hal::user::UserInPtr::<u8>::from(pc).read_array(16) {
+                    let mut hex = String::new();
+                    for b in &bytes {
+                        hex.push_str(&alloc::format!("{b:02x} "));
+                    }
+                    error!("  code: {}", hex.trim_end());
+                }
                 force_fault_signal(thread, Signal::SIGSEGV);
             }
             Ok(())
