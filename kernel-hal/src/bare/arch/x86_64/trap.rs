@@ -989,7 +989,49 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
             // SP it can no longer tell which coroutine stack actually faulted.
             // This is what lets containment abandon that executor from the IST
             // stack instead of halting the machine.
-            crate::kstats::note_fault_regs(tf.rip as u64, tf.rbp as u64, tf.rsp as u64);
+            // [df-sp] A #DF raised inside `__from_user`'s register-push window
+            // is not a mystery, and it is recoverable even though the frame
+            // looks unusable. `syscall_return` stashes the thread's
+            // `GeneralRegs` pointer at [TSS.RSP0] (`push rdi` twice, then
+            // `mov gs:4, rsp`); `__alltraps` reloads it with
+            // `mov rsp, [rsp + 8*8]` and adds 22*8. When that slot has been
+            // zeroed while the thread ran in user mode, rsp becomes 0xb0, the
+            // first push raises #PF, and delivering it on the same dead stack
+            // escalates to #DF.
+            //
+            // The reported rsp is therefore garbage and `fault_sp_abandonable`
+            // rejects it, which is why such a fault always ended in
+            // "cannot isolate - halting". But inside this exact window `rax`
+            // still holds `gs:4`, i.e. TSS.RSP0 itself: a live address on the
+            // faulting thread's kernel stack. Hand that to the isolation
+            // machinery instead, and the CPU is recovered like any other
+            // contained fault rather than taking the machine down.
+            //
+            // This contains the symptom; it does not explain who zeroed the
+            // slot. The zero is the thing to chase (only another CPU can write
+            // it -- this one was in user mode), and this path names it in the
+            // log so the next occurrence is not read as generic corruption.
+            let mut fault_sp = tf.rsp;
+            if vec == 8 {
+                extern "C" {
+                    fn __from_user_regs_push();
+                    fn __from_user_regs_push_end();
+                }
+                let lo = __from_user_regs_push as *const () as usize;
+                let hi = __from_user_regs_push_end as *const () as usize;
+                // rsp below one page can only be a destroyed stack pointer: the
+                // real one is always a kernel-half address.
+                if (lo..hi).contains(&tf.rip) && tf.rsp < 0x1000 {
+                    crate::console::serial_write_fmt_spin(format_args!(
+                        "\n[df-sp] #DF inside __alltraps/__from_user: [TSS.RSP0] held a null \
+                         GeneralRegs pointer, so rsp became {:#x}. Isolating on the real kernel \
+                         stack {:#x} (rax = gs:4) instead of the wrecked rsp.\n",
+                        tf.rsp, tf.rax,
+                    ));
+                    fault_sp = tf.rax;
+                }
+            }
+            crate::kstats::note_fault_regs(tf.rip as u64, tf.rbp as u64, fault_sp as u64);
             panic!(
                 "\nCPU EXCEPTION on CPU{}: {} (vec={:#x})\n\
                  error_code={:#x}\n{:#x?}",
