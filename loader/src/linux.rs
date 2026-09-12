@@ -841,6 +841,16 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                     pc,
                     describe_addr(&vmar, pc),
                 );
+                // The faulting address says WHAT was touched; the registers say
+                // WHICH operand carried it. A write to 0 is a null pointer, and
+                // the register holding 0 here is the one whose value never got
+                // filled in -- knowing it is `rdi` (an argument, a `this`) or
+                // `rax` (a return value that should have been checked) is the
+                // difference between a guess and a direction.
+                if let Ok(regs) = thread.with_context(|ctx| alloc::format!("{:x?}", ctx.general()))
+                {
+                    error!("  regs: {}", regs);
+                }
                 force_fault_signal(thread, Signal::SIGSEGV);
             }
             Ok(())
