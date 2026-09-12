@@ -1115,6 +1115,35 @@ const LIVE_TREES: &[&str] = &[
     "usr/share/pulseaudio",
     // IANA tzdata. lunarbar's clock uses localtime_r; musl needs the zone file.
     "usr/share/zoneinfo",
+    // ICU's locale data, when the build packages it as an archive rather than
+    // linking it into libicudata.so: `icu-data-en`/`icu-data-full` then put the
+    // blob in usr/share/icu/<ver>/icudt<maj>l.dat and only the libraries land
+    // in usr/lib, which LIVE_TREES already copies. That is the same split that
+    // bit alsa.conf and the glycin conf.d above -- every .so present, the data
+    // the .so opens at runtime absent, failing exactly like a missing package.
+    //
+    // Which of the two layouts this rootfs actually has is not something the
+    // build can assume, so `audit_icu_data` below prints it and warns when the
+    // live root ends up with neither. This entry makes the archive layout
+    // survive the copy; it is a no-op for the libicudata.so one.
+    //
+    // The reason to care: SpiderMonkey's JS_Init
+    // (`JS::detail::InitWithFailureDiagnostic`) runs a fixed sequence of
+    // RETURN_IF_FAIL checks, one of which is `ICU4CLibrary::Initialize()` ->
+    // `u_init()`, and with no data blob to open that fails. JS_Init then hands
+    // its caller a diagnostic string and the caller answers with
+    // MOZ_CRASH_UNSAFE: a deliberate store through a null pointer. All the
+    // kernel gets to print is
+    //   unhandled page fault @ 0x0(WRITE | USER) ... proc=firefox
+    //   pc=<libxul.so+0x1b8e250>
+    // with no allocation failure logged before it -- which is the fault the
+    // QEMU runs show. This entry is the hypothesis that missing ICU data is
+    // what produced it, NOT a confirmed fix: the same fault is what every
+    // other check in that sequence produces too.
+    //
+    // Uncapped like the rest of LIVE_TREES: the full blob is ~30 MiB, well
+    // over LIVE_FILE_CAP.
+    "usr/share/icu",
     // Boot chime MP3 + any other Eclipse-owned share files.
     "usr/share/eclipse",
     "etc/fonts",
@@ -1311,5 +1340,86 @@ pub(super) fn copy_into_live(full: &Path, live: &Path) {
             "warning: LIVE root missing /usr/bin/pulseaudio — libpulse clients and \
              ALSA-via-pulse will be silent. `pulseaudio` must be in the apk set."
         );
+    }
+    audit_icu_data(full, live);
+}
+
+/// Whether an ICU data blob is reachable under `root`, and how.
+///
+/// ICU4C can be built two ways and Alpine's choice decides which tree carries
+/// the data: `--with-data-packaging=archive` writes
+/// `usr/share/icu/<ver>/icudt<maj>l.dat`, the default links it into
+/// `usr/lib/libicudata.so.<maj>`. Only the second is covered by the `usr/lib`
+/// entry in [`LIVE_TREES`], so report which layout this build actually has.
+fn icu_data_layout(root: &Path) -> Option<String> {
+    // Archive packaging: usr/share/icu/<ver>/*.dat.
+    if let Ok(rd) = std::fs::read_dir(root.join("usr/share/icu")) {
+        for ver in rd.flatten() {
+            if let Ok(files) = std::fs::read_dir(ver.path()) {
+                for f in files.flatten() {
+                    let name = f.file_name();
+                    let name = name.to_string_lossy();
+                    if name.ends_with(".dat") {
+                        return Some(format!(
+                            "usr/share/icu/{}/{name}",
+                            ver.file_name().to_string_lossy()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    // Shared-library packaging: usr/lib/libicudata.so.<maj>[.<min>].
+    if let Ok(rd) = std::fs::read_dir(root.join("usr/lib")) {
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            // Skip the bare `libicudata.so` dev symlink: it carries no data of
+            // its own and is absent from the -libs package anyway.
+            if name.starts_with("libicudata.so.") {
+                return Some(format!("usr/lib/{name}"));
+            }
+        }
+    }
+    None
+}
+
+/// Report whether SpiderMonkey will find ICU data in the QEMU live root.
+///
+/// Firefox reaching `JS_Init` and dying there is indistinguishable, from the
+/// outside, from Firefox not being installed: the failing check
+/// (`ICU4CLibrary::Initialize()`) reports itself by returning a diagnostic
+/// string that the caller turns into a `MOZ_CRASH_UNSAFE` null store, so all
+/// the kernel ever prints is an unhandled write to address 0. Saying at BUILD
+/// time which ICU layout landed where is much cheaper than reading that fault
+/// afterwards.
+fn audit_icu_data(full: &Path, live: &Path) {
+    // Only meaningful once something in the image actually links against ICU.
+    // Firefox is the consumer this matters for; skip the noise otherwise.
+    if !full.join("usr/lib/firefox").is_dir() && !live.join("usr/lib/firefox").is_dir() {
+        return;
+    }
+    match (icu_data_layout(full), icu_data_layout(live)) {
+        (_, Some(found)) => {
+            println!("Xorg stack: LIVE root ICU data: {found}");
+        }
+        (Some(found), None) => {
+            eprintln!(
+                "warning: LIVE root has NO ICU data but the full rootfs has {found} — the \
+                 copy into the live root dropped it. SpiderMonkey's u_init() then fails, \
+                 JS_Init returns \"ICU4CLibrary::Initialize() failed\" and Firefox aborts \
+                 through MOZ_CRASH (a store to address 0) before opening a window. The \
+                 tree holding that file must be in LIVE_TREES."
+            );
+        }
+        (None, None) => {
+            eprintln!(
+                "warning: no ICU data blob found in either root, yet usr/lib/firefox is \
+                 installed. SpiderMonkey's ICU4CLibrary::Initialize() will fail and \
+                 Firefox will abort before opening a window. Add an `icu-data-*` package \
+                 to the apk set (Alpine splits ICU into icu-libs and icu-data-en / \
+                 icu-data-full)."
+            );
+        }
     }
 }
