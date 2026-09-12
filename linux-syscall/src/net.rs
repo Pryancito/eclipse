@@ -176,6 +176,11 @@ impl Syscall<'_> {
                 // Record our PID so a peer (e.g. seatd) can read it via
                 // SO_PEERCRED when it accepts our connection.
                 s.set_owner_pid(self.zircon_process().id() as i32);
+                // This arm takes EVERY AF_UNIX type, and the implementation is
+                // a byte stream whichever one was asked for. Record the request
+                // anyway: `sendmsg` must not truncate an oversized message on a
+                // socket the user created as a datagram or seqpacket.
+                s.set_socket_type(socket_type);
                 s
             }
             (_, _, _) => {
@@ -524,10 +529,47 @@ impl Syscall<'_> {
         let iov_ptr: UserInPtr<IoVecIn> = hdr.msg_iov.as_addr().into();
         let iovlen = hdr.msg_iovlen;
         let iovs = iov_ptr.read_iovecs(iovlen)?;
-        if iovs.total_len() > super::SYSCALL_IO_MAX {
-            return Err(LxError::EINVAL);
-        }
-        let data = iovs.read_to_vec()?;
+        let total = iovs.total_len();
+
+        // Resolve the fd before gathering, so the socket's type can decide what
+        // an oversized message means (and so EBADF/ENOTSOCK wins over a size
+        // complaint, as it does on Linux).
+        let file_like = self.linux_process().get_file_like(sockfd.into())?;
+        let sock_type = file_like.as_socket()?.socket_type();
+
+        // A message longer than the bounded kernel buffer is NOT an error on a
+        // stream socket. `sendmsg` may return a short count exactly like
+        // `write`, and rejecting the whole call with `EINVAL` is what the
+        // `sys_writev` doc block above describes killing every GLX client: xcb
+        // saw errno 22, marked the connection dead and exited with "XIO: fatal
+        // IO error 22 (Invalid argument)" right after its window appeared.
+        // Firefox dies the same way, one layer up — its IPC channel treats any
+        // `sendmsg` error as fatal and tears the channel down, so the browser
+        // window opens and then immediately goes away.
+        //
+        // So gather only the first `SYSCALL_IO_MAX` bytes and report that count;
+        // the caller resumes from it (Mozilla IPC, libwayland and stdio all
+        // track a partial-write offset).
+        //
+        // Only for a socket we KNOW is a stream, though. Anything
+        // message-oriented gets `EMSGSIZE`: a message boundary means a short
+        // write would corrupt the message rather than short-change the writer,
+        // and `EMSGSIZE` is what Linux returns for a message too large to send
+        // atomically. `None` counts as message-oriented on purpose — it means
+        // the socket does not report a type (netlink is one), and guessing
+        // "stream" there would silently split, say, a netlink dump. Erring
+        // toward a clean error beats erring toward silent corruption.
+        let data = if total > super::SYSCALL_IO_MAX {
+            if !matches!(sock_type, Some(SocketType::SOCK_STREAM)) {
+                return Err(LxError::EMSGSIZE);
+            }
+            let mut buf = alloc::vec![0u8; super::SYSCALL_IO_MAX];
+            let n = iovs.read_bytes_at(0, &mut buf)?;
+            buf.truncate(n);
+            buf
+        } else {
+            iovs.read_to_vec()?
+        };
 
         // SCM_RIGHTS: resolve any attached fds before queueing the bytes.
         // `msg_controllen` is fully user-controlled; bound it before `read_array`
@@ -553,7 +595,6 @@ impl Syscall<'_> {
             None
         };
 
-        let file_like = self.linux_process().get_file_like(sockfd.into())?;
         let socket_fl = file_like.clone();
         let socket = socket_fl.as_socket()?;
         // Return the actual queued byte count (a TCP short write can queue less
@@ -882,6 +923,15 @@ impl Syscall<'_> {
         let socket1 = Arc::new(UnixSocketState::default());
         let socket2 = Arc::new(UnixSocketState::default());
         UnixSocketState::connect_pair(&socket1, &socket2);
+        // Same as `sys_socket`: keep the requested type so `sendmsg` can tell a
+        // datagram/seqpacket pair from a stream one. `SOCKET_TYPE_MASK` strips
+        // the SOCK_NONBLOCK / SOCK_CLOEXEC bits handled just below; an
+        // unrecognized type leaves the SOCK_STREAM default, which is what this
+        // transport actually is.
+        if let Ok(t) = SocketType::try_from(_type & SOCKET_TYPE_MASK) {
+            socket1.set_socket_type(t);
+            socket2.set_socket_type(t);
+        }
         // The type argument packs SOCK_NONBLOCK / SOCK_CLOEXEC alongside the
         // socket type (same bit values as O_NONBLOCK / O_CLOEXEC, like
         // accept4). These were silently dropped, handing out BLOCKING sockets

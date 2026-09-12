@@ -1,7 +1,7 @@
 use crate::fs::{FileLike, OpenFlags, PollEvents, PollStatus};
 use crate::{
     error::{LxError, LxResult},
-    net::{Endpoint, Socket, SysResult},
+    net::{Endpoint, Socket, SocketType, SysResult},
     sync::{Event, EventBus},
 };
 use alloc::{
@@ -61,6 +61,14 @@ pub struct UnixSocketState {
 #[derive(Debug)]
 struct UnixInner {
     flags: OpenFlags,
+    /// The `type` argument this socket was created with. `sys_socket` routes
+    /// EVERY AF_UNIX type here -- `(Domain::AF_UNIX, _, _)` -- but this
+    /// implementation is byte-stream only: `write` appends into the peer's
+    /// `buffer` and `read` drains it, with no message boundaries anywhere. So
+    /// the requested type is recorded rather than implemented, purely so
+    /// callers can tell a datagram/seqpacket socket apart from a stream one
+    /// (`sendmsg` refuses to truncate an oversized message on the former).
+    sock_type: SocketType,
     /// Local bound path (set by bind or inherited on accept)
     path: String,
     /// Weak ref to the connected peer socket's inner state
@@ -103,6 +111,7 @@ impl Default for UnixSocketState {
             base: KObjectBase::new(),
             inner: Arc::new(Mutex::new(UnixInner {
                 flags: OpenFlags::RDWR,
+                sock_type: SocketType::SOCK_STREAM,
                 path: String::new(),
                 peer: None,
                 buffer: VecDeque::new(),
@@ -132,6 +141,11 @@ impl UnixSocketState {
     /// read it via `SO_PEERCRED` (used by seatd to authorize a client).
     pub fn set_owner_pid(&self, pid: i32) {
         self.inner.lock().owner_pid = pid;
+    }
+
+    /// Record the `type` this socket was requested with (see `UnixInner::sock_type`).
+    pub fn set_socket_type(&self, sock_type: SocketType) {
+        self.inner.lock().sock_type = sock_type;
     }
 
     /// Wire two sockets together bidirectionally.
@@ -469,6 +483,15 @@ impl Socket for UnixSocketState {
     // -----------------------------------------------------------------------
     // write — append bytes into the peer's inbound buffer
     // -----------------------------------------------------------------------
+    /// The requested type, so callers can distinguish a message-oriented
+    /// AF_UNIX socket from a stream one. Reported even though the transport is
+    /// a byte stream either way: a caller that must not silently split a
+    /// message needs to know what the user asked for, and the alternative
+    /// (`None`) is indistinguishable from "no idea".
+    fn socket_type(&self) -> Option<SocketType> {
+        Some(self.inner.lock().sock_type)
+    }
+
     fn write(&self, data: &[u8], _sendto_endpoint: Option<Endpoint>) -> SysResult {
         // Resolve the peer and release our own lock BEFORE taking the peer's, so
         // two connected ends writing concurrently can't deadlock: holding
