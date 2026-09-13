@@ -24,36 +24,44 @@ __from_user:
     mov rax, [rsp + 6*8]    # rax = user rsp
     mov gs:12, rax          # store user rsp -> scratch at TSS.sp1
 
-    mov rsp, [rsp + 8*8]    # load rsp = bottom of trap frame
+    # Two sources, and they must not be confused. The hardware frame is on the
+    # stack the CPU switched to, which is TSS.RSP0 for an ordinary ring3 trap
+    # but an IST stack for the vectors idt.rs gives one to (#DF=8, #GP=13) --
+    # reading it from anywhere else is the bug this fixes. The destination
+    # GeneralRegs, on the other hand, is always reached through TSS.RSP0.
+    mov rax, rsp            # preserve entry stack pointer (RSP0 or IST)
+    mov rsp, gs:4           # rsp = TSS.RSP0's VALUE: the address where
+                            # syscall_return pushed rdi (`mov gs:4, rsp`)
+    mov rsp, [rsp]          # rsp = that rdi = bottom of trap frame
     add rsp, 22*8           # rsp = top of trap frame
-    mov rax, gs:4           # rax = kernel stack
+                            # rax still points to the entry frame
 
     # The window below is the one place where a kernel stack pointer that was
-    # already garbage becomes fatal: `mov rsp, [rsp + 8*8]` above installs the
-    # GeneralRegs pointer that `syscall_return` stashed at [TSS.RSP0], and if
-    # that slot was zeroed while the thread ran in user mode, rsp is now 0xb0
-    # and the first push raises #PF -> #DF. The frame the #DF reports then
-    # carries a destroyed rsp, so containment cannot tell which coroutine stack
-    # died and has to halt the machine.
+    # already garbage becomes fatal: if rsp was loaded from the wrong place,
+    # the first push raises #PF -> #DF. The frame the #DF reports then carries
+    # a destroyed rsp, so containment cannot tell which coroutine stack died
+    # and has to halt the machine.
     #
-    # These two labels bound the window in which `rax` provably still holds
-    # TSS.RSP0 -- a valid address inside the faulting thread's kernel stack --
-    # so the #DF handler can hand THAT to the isolation machinery instead of
-    # the wrecked rsp. The window ends at `mov rax, [rax - 8*8]`, which
-    # replaces rax with the user's own rax.
+    # These two labels bound the window in which `rax` still points at the
+    # original entry frame (RSP0 or IST), before it is replaced with user rax.
+    # NOTE for kernel-hal's [df-sp] handler: `rax` here is the ENTRY frame, no
+    # longer `gs:4`. On an RSP0 entry that is still an address inside the
+    # faulting thread's kernel stack, so isolation keeps working; on an IST
+    # entry it is the IST stack, which no executor owns, and containment will
+    # decline rather than abandon the wrong stack.
 .global __from_user_regs_push
 __from_user_regs_push:
     # push trap_num, error_code
-    push [rax - 6*8]        # push error_code
-    push [rax - 7*8]        # push trap_num
+    push [rax + 2*8]        # push error_code from entry frame
+    push [rax + 1*8]        # push trap_num from entry frame
     push rax                # skip gsbase
     push rax                # skip fsbase
     # push general registers
-    push [rax - 3*8]        # push rflags
-    push [rax - 5*8]        # push rip
+    push [rax + 5*8]        # push rflags from entry frame
+    push [rax + 3*8]        # push rip from entry frame
 .global __from_user_regs_push_end
 __from_user_regs_push_end:
-    mov rax, [rax - 8*8]    # pop rax
+    mov rax, [rax]          # restore user rax from entry frame
     jmp trap_syscall_entry
 
 __from_kernel:
