@@ -563,3 +563,54 @@ fn create_then_get_entry() -> Result<()> {
     sfs.sync()?;
     Ok(())
 }
+
+/// Growing past the end of the device must fail with `NoDeviceSpace` and
+/// leave the inode exactly as it was: same size and block count, no phantom
+/// block ids, and every block the failed attempt took handed back. 2000
+/// blocks needs the indirect block, the double-indirect block and one of its
+/// tables, none of which an 8-block file has, so the rollback of all three
+/// is exercised on a 64-block device that cannot hold them.
+#[test]
+fn resize_out_of_space_rolls_back() -> Result<()> {
+    let file = tempfile::tempfile().expect("failed to create file");
+    let sfs = SimpleFileSystem::create(Arc::new(Mutex::new(file)), 64 * BLKSIZE)?;
+    let root = sfs.root_inode();
+    let free0 = sfs.info().bfree;
+
+    let f = root.create("big", FileType::File, 0o644)?;
+    let free_created = sfs.info().bfree;
+    f.resize(8 * BLKSIZE)?;
+    f.write_at(7 * BLKSIZE, &[0x5a; BLKSIZE])?;
+    let free1 = sfs.info().bfree;
+    assert_eq!(free_created - free1, 8);
+
+    // resize(2) past the device
+    let err = f.resize(2000 * BLKSIZE).unwrap_err();
+    assert_eq!(err, FsError::NoDeviceSpace);
+    let meta = f.metadata()?;
+    assert_eq!(meta.size, 8 * BLKSIZE);
+    assert_eq!(meta.blocks, 8);
+    assert_eq!(sfs.info().bfree, free1, "failed growth must give every block back");
+
+    // write(2) past the device (auto-extend goes through the same path)
+    let err = f.write_at(3000 * BLKSIZE, &[1u8; 16]).unwrap_err();
+    assert_eq!(err, FsError::NoDeviceSpace);
+    assert_eq!(f.metadata()?.size, 8 * BLKSIZE);
+    assert_eq!(sfs.info().bfree, free1);
+
+    // the surviving blocks are the real ones
+    let mut buf = [0u8; BLKSIZE];
+    f.read_at(7 * BLKSIZE, &mut buf)?;
+    assert!(buf.iter().all(|&b| b == 0x5a));
+
+    // and the space is usable again: a growth that fits succeeds
+    f.resize(10 * BLKSIZE)?;
+    assert_eq!(sfs.info().bfree, free1 - 2);
+
+    // freeing walks every block id the inode holds; a bogus one would trip
+    // free_block's assert
+    root.unlink("big")?;
+    drop(f);
+    assert_eq!(sfs.info().bfree, free0);
+    Ok(())
+}

@@ -90,6 +90,8 @@ impl LinuxRootfs {
             Self::write_ntp(&dir);
             desktop::install(&dir);
             xorg::install(&dir, &bin.join("apk"), self.0.name());
+            // Needs the firefox package on disk, i.e. after xorg::install.
+            desktop::write_firefox_default_prefs(&dir);
             // After apk so we can see whether the PulseAudio plugin/binary
             // landed, and so /etc/pulse wins over anything the package dropped.
             Self::write_asound_conf(&dir);
@@ -176,6 +178,8 @@ impl LinuxRootfs {
         // an offline build just warns and ships without it. Uses the apk binary
         // and repositories already staged above.
         xorg::install(&dir, &bin.join("apk"), self.0.name());
+        // Needs the firefox package on disk, i.e. after xorg::install.
+        desktop::write_firefox_default_prefs(&dir);
         Self::install_ca_certs(&dir);
 
         // /etc/machine-id — prevents dhcp_vendor "No such file or directory".
