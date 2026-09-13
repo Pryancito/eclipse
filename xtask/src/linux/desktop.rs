@@ -1009,6 +1009,12 @@ fn write_firefox_wrapper(rootfs: &Path) {
           export MOZ_WEBRENDER_SOFTWARE=1\n\
           export MOZ_ACCELERATED=0\n\
           export MOZ_CRASHREPORTER_DISABLE=1\n\
+          # Caches go to /tmp (a ramfs that grows on demand), not to the\n\
+          # root SFS image, which is RAM too but fixed-size and nearly full\n\
+          # at boot on the QEMU live image. Firefox puts startupCache and\n\
+          # (were it enabled) the disk cache under $XDG_CACHE_HOME.\n\
+          export XDG_CACHE_HOME=\"${XDG_CACHE_HOME:-/tmp/xdg-cache}\"\n\
+          mkdir -p \"$XDG_CACHE_HOME\"\n\
           FLOG=\"${HOME:-/root}/.eclipse-firefox.log\"\n\
           # `firefox` is what DEFAULT_PACKAGES installs; `firefox-esr` is a\n\
           # separate Alpine package with its own binary name, so accept either\n\

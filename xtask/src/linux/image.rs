@@ -67,6 +67,19 @@ fn live_image_size(payload_bytes: u64) -> usize {
     padded_image_size(payload_bytes, 1, 8, 16) as usize
 }
 
+/// SFS size for the *QEMU* live image. Same tree as the ISO's plus the whole
+/// desktop (`xorg::copy_into_live`), and -- unlike the installer media -- it is
+/// the root a browser session actually WRITES to: `HOME=/root` is on it, so
+/// Firefox's profile (startup cache, places.sqlite, session store), the
+/// fontconfig caches and the wrapper logs all land here. With the lean 12.5 %
+/// + 16 MiB headroom lunarbar showed `disk 95%` one minute after boot and the
+/// image was full two minutes into Firefox (`unused_blocks: 0`). 256 MiB of
+/// absolute floor covers a profile several times over; it costs that much RAM
+/// once, since the SFS is loaded whole at boot (`-m 4G` on x86_64).
+fn qemu_live_image_size(payload_bytes: u64) -> usize {
+    padded_image_size(payload_bytes, 1, 8, 256) as usize
+}
+
 /// Largest regular file copied into the minimal live root. Acts as a safety net:
 /// a stray huge file (e.g. a `libLLVM.so` dropped into `/lib`) is left out so it
 /// can't bloat the RAM-resident initramfs. Every installer essential (busybox,
@@ -446,7 +459,7 @@ impl super::LinuxRootfs {
             // 6. QEMU live SFS: installer payloads + desktop. Not written to
             // the installed ESP or the ISO — those carry the lean images from
             // steps 3 and 5d.
-            let live_size = live_image_size(dir_size(&live_root));
+            let live_size = qemu_live_image_size(dir_size(&live_root));
             println!(
                 "Building QEMU live image ({} MiB)...",
                 live_size / (1024 * 1024)
