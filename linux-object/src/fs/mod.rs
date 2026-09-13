@@ -155,6 +155,13 @@ lazy_static! {
 /// beside the inode here rather than in the `File`.
 type MemfdEntry = (usize, alloc::sync::Weak<dyn INode>, u32);
 
+/// Hard cap on aggregate live memfd logical bytes. memfd/shmem lives in ramfs
+/// blocks allocated from the kernel heap in this build; once live memfds grow
+/// near the heap ceiling, later allocator failures panic while kernel locks are
+/// held. Rejecting further growth with ENOSPC turns that into a userspace
+/// allocation failure instead of a kernel-wide halt.
+const MEMFD_LIVE_BYTES_CAP: usize = 384 * 1024 * 1024;
+
 /// `fcntl(2)` file seals (`linux/fcntl.h`).
 pub const F_SEAL_SEAL: u32 = 0x0001;
 pub const F_SEAL_SHRINK: u32 = 0x0002;
@@ -224,6 +231,33 @@ pub fn memfd_resize_allowed(inode: &Arc<dyn INode>, new_len: u64) -> bool {
 /// Whether writes to `inode` are allowed by its seals.
 pub fn memfd_write_allowed(inode: &Arc<dyn INode>) -> bool {
     memfd_seals(inode).is_none_or(|s| s & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) == 0)
+}
+
+/// Enforce the global memfd live-bytes cap for a potential resize/growth.
+///
+/// Non-memfd inodes are allowed. Shrinks are always allowed.
+pub fn memfd_grow_allowed(inode: &Arc<dyn INode>, new_len: usize) -> LxResult {
+    if memfd_seals(inode).is_none() {
+        return Ok(());
+    }
+    let mut live = MEMFD_LIVE.lock();
+    live.retain(|(_, w, _)| w.strong_count() > 0);
+    let mut total = 0usize;
+    for (_, w, _) in live.iter() {
+        if let Some(i) = w.upgrade() {
+            let size = i.metadata().map(|m| m.size).unwrap_or(0);
+            if same_inode(&i, inode) {
+                // Caller only invokes this for growth.
+                total = total.saturating_add(new_len);
+            } else {
+                total = total.saturating_add(size);
+            }
+            if total > MEMFD_LIVE_BYTES_CAP {
+                return Err(LxError::ENOSPC);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// (created_total, live_count, live_bytes) for memfd inodes.
@@ -2117,7 +2151,8 @@ pub fn split_path(path: &str) -> (&str, &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::split_path;
+    use super::{new_memfd, split_path, FileLike, MEMFD_LIVE_BYTES_CAP};
+    use crate::error::LxError;
 
     #[test]
     fn split_paths() {
@@ -2155,6 +2190,20 @@ mod tests {
         let mut back = alloc::vec![0u8; data.len()];
         vmo.read(0, &mut back).unwrap();
         assert!(back == data, "read_as_vmo returned different bytes");
+    }
+
+    #[test]
+    fn memfd_growth_is_capped() {
+        let (_, _, live) = super::memfd_stats();
+        let free = MEMFD_LIVE_BYTES_CAP.saturating_sub(live);
+        let f = new_memfd("cap", 0).unwrap();
+        let err = f.set_len((free + 1) as u64).unwrap_err();
+        assert_eq!(err, LxError::ENOSPC);
+        if free > 0 {
+            f.set_len(free as u64).unwrap();
+        }
+        let err = f.write_at(free as u64, &[1]).unwrap_err();
+        assert_eq!(err, LxError::ENOSPC);
     }
 }
 

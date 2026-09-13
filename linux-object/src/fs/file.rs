@@ -1,6 +1,7 @@
 //! File handle for process
 
 use alloc::{boxed::Box, string::String, sync::Arc};
+use core::convert::TryFrom;
 
 use async_trait::async_trait;
 use kernel_hal::sync::RwLock;
@@ -434,7 +435,16 @@ impl FileInner {
         if !crate::fs::memfd_write_allowed(&self.inode) {
             return Err(LxError::EPERM);
         }
-        let len = self.inode.write_at(offset as usize, buf)?;
+        let write_off = usize::try_from(offset).map_err(|_| LxError::EFBIG)?;
+        let cur = self.inode.metadata()?.size as u64;
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(LxError::EFBIG)?;
+        if end > cur {
+            let end = usize::try_from(end).map_err(|_| LxError::EFBIG)?;
+            crate::fs::memfd_grow_allowed(&self.inode, end)?;
+        }
+        let len = self.inode.write_at(write_off, buf)?;
         Ok(len)
     }
 }
@@ -486,7 +496,12 @@ impl File {
         if !inner.flags.writable() {
             return Err(LxError::EBADF);
         }
-        inner.inode.resize(len as usize)?;
+        let len = usize::try_from(len).map_err(|_| LxError::EFBIG)?;
+        let cur = inner.inode.metadata()?.size as u64;
+        if len as u64 > cur {
+            crate::fs::memfd_grow_allowed(&inner.inode, len)?;
+        }
+        inner.inode.resize(len)?;
         Ok(())
     }
 
