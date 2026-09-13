@@ -237,6 +237,9 @@ pub fn memfd_write_allowed(inode: &Arc<dyn INode>) -> bool {
 ///
 /// Non-memfd inodes are allowed. Shrinks are always allowed.
 pub fn memfd_grow_allowed(inode: &Arc<dyn INode>, new_len: usize) -> LxResult {
+    if memfd_seals(inode).is_none() {
+        return Ok(());
+    }
     let mut live = MEMFD_LIVE.lock();
     live.retain(|(_, w, _)| w.strong_count() > 0);
     let mut total = 0usize;
@@ -244,7 +247,8 @@ pub fn memfd_grow_allowed(inode: &Arc<dyn INode>, new_len: usize) -> LxResult {
         if let Some(i) = w.upgrade() {
             let size = i.metadata().map(|m| m.size).unwrap_or(0);
             if same_inode(&i, inode) {
-                total = total.saturating_add(new_len.max(size));
+                // Caller only invokes this for growth.
+                total = total.saturating_add(new_len);
             } else {
                 total = total.saturating_add(size);
             }
@@ -2147,7 +2151,7 @@ pub fn split_path(path: &str) -> (&str, &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{new_memfd, split_path, MEMFD_LIVE_BYTES_CAP};
+    use super::{new_memfd, split_path, FileLike, MEMFD_LIVE_BYTES_CAP};
     use crate::error::LxError;
 
     #[test]
@@ -2190,9 +2194,15 @@ mod tests {
 
     #[test]
     fn memfd_growth_is_capped() {
+        let (_, _, live) = super::memfd_stats();
+        let free = MEMFD_LIVE_BYTES_CAP.saturating_sub(live);
         let f = new_memfd("cap", 0).unwrap();
-        f.set_len(4096).unwrap();
-        let err = f.set_len((MEMFD_LIVE_BYTES_CAP + 1) as u64).unwrap_err();
+        let err = f.set_len((free + 1) as u64).unwrap_err();
+        assert_eq!(err, LxError::ENOSPC);
+        if free > 0 {
+            f.set_len(free as u64).unwrap();
+        }
+        let err = f.write_at(free as u64, &[1]).unwrap_err();
         assert_eq!(err, LxError::ENOSPC);
     }
 }
