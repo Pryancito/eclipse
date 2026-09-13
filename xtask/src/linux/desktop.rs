@@ -2012,7 +2012,8 @@ mod tests {
     /// loader cache -- the two files Firefox chrome text and GTK icons hang on.
     #[test]
     fn gtk_caches_and_firefox_wrappers_parse_and_cover_both_caches() {
-        let dir = std::env::temp_dir().join(format!("eclipse-gtkcaches-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("eclipse-gtkcaches-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         write_gtk_caches_wrapper(&dir);
         write_firefox_wrapper(&dir);
@@ -2020,7 +2021,11 @@ mod tests {
             let path = dir.join("usr/local/bin").join(name);
             let src = fs::read_to_string(&path).unwrap();
             assert!(src.starts_with("#!/bin/sh\n"), "{name}: shebang");
-            let st = std::process::Command::new("sh").arg("-n").arg(&path).status().unwrap();
+            let st = std::process::Command::new("sh")
+                .arg("-n")
+                .arg(&path)
+                .status()
+                .unwrap();
             assert!(st.success(), "{name}: sh -n rejected the script");
         }
         let caches = fs::read_to_string(dir.join("usr/local/bin/eclipse-gtk-caches")).unwrap();

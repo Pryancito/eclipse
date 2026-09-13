@@ -115,6 +115,9 @@ impl ProcessExt for Process {
                     // this process down, so they are not stranded on a dead
                     // parent that will never `wait` for them.
                     reparent_live_children_to_init(&proc);
+                    // Record locks die with the process (same as the
+                    // fork path below; see `record_lock::release_owner`).
+                    crate::fs::record_lock::release_owner(proc.id());
                     // try_linux (not linux): this callback runs from the
                     // object layer on PROCESS_TERMINATED, concurrently with
                     // SMP teardown churn. If the extension can no longer be
