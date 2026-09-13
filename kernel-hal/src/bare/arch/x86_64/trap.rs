@@ -1046,6 +1046,55 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                         tf.rsp,
                         tf.rax,
                     ));
+                    // Which of the two writers did this? `syscall_return`
+                    // pushes nine values and only THEN publishes TSS.RSP0, so
+                    // the slot is the first of a known frame:
+                    //   [+0]=rdi [+8]=rdi(dup) [+16]=rbx [+24]=rbp [+32]=r12
+                    //   [+40]=r13 [+48]=r14 [+56]=r15 [+64]=fsbase
+                    // All nine zero means a bulk blanking -- a zero-filled
+                    // allocation handed out on top of a live stack, which is the
+                    // aliasing `frame_alias_check`/`heap_alias_check` hunt. Only
+                    // the first zero means an 8-byte stray write, a different
+                    // bug that those checks would never catch. Reading upward
+                    // from TSS.RSP0 stays inside the same kernel stack, so this
+                    // is safe even here.
+                    let mut zeros = 0usize;
+                    let mut dump = [0usize; 9];
+                    for (i, w) in dump.iter_mut().enumerate() {
+                        *w = unsafe { core::ptr::read_volatile((tf.rax as *const usize).add(i)) };
+                        if *w == 0 {
+                            zeros += 1;
+                        }
+                    }
+                    crate::console::serial_write_fmt_spin(format_args!(
+                        "[df-sp] syscall_return frame at [TSS.RSP0] ({} of 9 words zero):                          rdi={:#x} rdi={:#x} rbx={:#x} rbp={:#x} r12={:#x} r13={:#x} r14={:#x}                          r15={:#x} fsbase={:#x}\n",
+                        zeros, dump[0], dump[1], dump[2], dump[3], dump[4], dump[5], dump[6],
+                        dump[7], dump[8],
+                    ));
+                    // And say whether the allocator-aliasing checks could even
+                    // have seen it. There are TWO fixed-size registries, one per
+                    // check, and each silently loses stacks that do not fit:
+                    // `overlapping_live_stack` backs `[frame-alias]`,
+                    // `alloc_overlaps_live_stack` backs `[heap-alias]`. Either
+                    // one being incomplete makes its check able to miss an
+                    // overlap, so report them separately and only claim coverage
+                    // when both are clean.
+                    let untracked_frame = ::executor::untracked_live_stacks();
+                    let untracked_alloc = ::executor::untracked_alloc_stacks();
+                    let complete = untracked_frame == 0 && untracked_alloc == 0;
+                    crate::console::serial_write_fmt_spin(format_args!(
+                        "[df-sp] live-stack registries: {} untracked for [frame-alias], {} for \
+                         [heap-alias] — {}\n",
+                        untracked_frame,
+                        untracked_alloc,
+                        if complete {
+                            "coverage is complete, so the absence of a [frame-alias]/[heap-alias] \
+                             line above DOES rule allocator aliasing out"
+                        } else {
+                            "coverage is INCOMPLETE, so the absence of a [frame-alias]/[heap-alias] \
+                             line above rules NOTHING out"
+                        },
+                    ));
                     fault_sp = tf.rax;
                 }
             }

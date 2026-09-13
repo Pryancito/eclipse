@@ -145,8 +145,20 @@ const STACK_REG_SLOTS: usize = 256;
 static STACK_REG_BASE: [core::sync::atomic::AtomicUsize; STACK_REG_SLOTS] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; STACK_REG_SLOTS];
 
+/// Stacks [`stack_reg_insert`] could not record because the table was full.
+///
+/// Monotonic on purpose: a dropped insert may later be balanced by that stack
+/// being freed, but nothing here can tell, so the count never goes down. It
+/// therefore only ever over-reports incompleteness — the safe direction for a
+/// check whose whole value is knowing when a clean result means nothing.
+static STACK_REG_BASE_OVERFLOW: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 /// Record `[alloc_base, alloc_base + ALLOC_SIZE)` as a live stack. `base == 0`
-/// slots are free. Silently no-ops if the table is full (only lowers coverage).
+/// slots are free. Counts, rather than silently drops, an insert that does not
+/// fit: an unrecorded stack makes [`alloc_overlaps_live_stack`] return false
+/// negatives, and a caller that cannot see that would read "no overlap" as
+/// "no aliasing".
 fn stack_reg_insert(alloc_base: usize) {
     use core::sync::atomic::Ordering::AcqRel;
     for slot in STACK_REG_BASE.iter() {
@@ -157,6 +169,13 @@ fn stack_reg_insert(alloc_base: usize) {
             return;
         }
     }
+    STACK_REG_BASE_OVERFLOW.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// [diag] Live stacks missing from the hand-out registry; non-zero means
+/// [`alloc_overlaps_live_stack`] can return false negatives.
+pub fn untracked_alloc_stacks() -> usize {
+    STACK_REG_BASE_OVERFLOW.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Remove a stack recorded by [`stack_reg_insert`].
