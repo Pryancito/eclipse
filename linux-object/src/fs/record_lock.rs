@@ -119,6 +119,21 @@ fn prune_dead(locks: &mut Vec<Held>) {
     locks.retain(|l| owner_alive(l.owner));
 }
 
+/// Release every lock `owner` holds, on any file. Called when the process
+/// terminates, so that a pid recycled onto an unrelated live process can
+/// never resurrect a dead owner's locks: Firefox's profile lock
+/// (`.parentlock`, `F_SETLK`) is exactly that pattern -- one browser exits,
+/// its pid is handed to the next launch's helper, and the lazy "is the
+/// owner alive?" prune above then keeps the stale lock, so the second
+/// browser reports "Firefox is already running".
+pub fn release_owner(owner: KoID) {
+    let mut table = LOCKS.lock();
+    table.retain(|_, locks| {
+        locks.retain(|l| l.owner != owner);
+        !locks.is_empty()
+    });
+}
+
 /// `F_GETLK`: describe the first lock blocking `req`, or `None` when the
 /// request would succeed.
 pub fn getlk(key: FileKey, req: &LockRequest) -> Option<ConflictInfo> {
@@ -230,6 +245,28 @@ mod tests {
         let pieces = subtract(&h, 50, 60);
         assert_eq!(pieces.len(), 1);
         assert_eq!((pieces[0].start, pieces[0].end), (10, 50));
+    }
+
+    #[test]
+    fn release_owner_forgets_every_lock_of_that_owner_only() {
+        let key_a: FileKey = (usize::MAX - 1, 41);
+        let key_b: FileKey = (usize::MAX - 1, 42);
+        {
+            let mut table = LOCKS.lock();
+            table
+                .entry(key_a)
+                .or_default()
+                .extend([held(true, 0, u64::MAX, 7), held(false, 0, 10, 8)]);
+            table.entry(key_b).or_default().push(held(true, 0, 10, 7));
+        }
+        release_owner(7);
+        let table = LOCKS.lock();
+        // key_b held only 7's lock: the whole entry is gone.
+        assert!(!table.contains_key(&key_b));
+        // key_a keeps 8's lock and nothing of 7's.
+        let left = &table[&key_a];
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].owner, 8);
     }
 
     #[test]

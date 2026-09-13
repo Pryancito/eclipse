@@ -92,6 +92,8 @@ impl LinuxRootfs {
             xorg::install(&dir, &bin.join("apk"), self.0.name());
             // Needs the firefox package on disk, i.e. after xorg::install.
             desktop::write_firefox_default_prefs(&dir);
+            // Needs the GTK/gsettings packages on disk, same reason.
+            desktop::compile_gsettings_schemas(&dir);
             // After apk so we can see whether the PulseAudio plugin/binary
             // landed, and so /etc/pulse wins over anything the package dropped.
             Self::write_asound_conf(&dir);
@@ -180,6 +182,8 @@ impl LinuxRootfs {
         xorg::install(&dir, &bin.join("apk"), self.0.name());
         // Needs the firefox package on disk, i.e. after xorg::install.
         desktop::write_firefox_default_prefs(&dir);
+        // Needs the GTK/gsettings packages on disk, same reason.
+        desktop::compile_gsettings_schemas(&dir);
         Self::install_ca_certs(&dir);
 
         // /etc/machine-id — prevents dhcp_vendor "No such file or directory".
@@ -2550,6 +2554,20 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         )
         .unwrap();
 
+        // GTK caches (gschemas.compiled, pixbuf loaders.cache) before the
+        // first GTK client. A oneshot runs to completion before anything
+        // ordered after it forks, so labwc -- and every client it launches --
+        // sees them. See desktop::write_gtk_caches_wrapper for why Firefox's
+        // chrome text depends on this.
+        fs::write(
+            svc_dir.join("gtk-caches.service"),
+            b"# GTK caches for the Wayland session. See /usr/local/bin/eclipse-gtk-caches.\n\
+              exec = /usr/local/bin/eclipse-gtk-caches\n\
+              type = oneshot\n\
+              desktop = labwc\n",
+        )
+        .unwrap();
+
         // labwc: launch the hardened wrapper so init, shells and login sessions all
         // take the same renderer/env path. Wait for seatd + settled /dev/input
         // before start — without udevd libinput scans input nodes exactly once.
@@ -2560,9 +2578,10 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # wait_path: /dev/input must be non-empty and settled -> no udev\n\
               # hotplug, so starting between keyboard and mouse enumeration\n\
               # leaves the late device dead for the whole session.\n\
+              # gtk-caches: oneshot, so it has COMPLETED before this forks.\n\
               exec = /usr/local/bin/labwc\n\
               type = respawn\n\
-              after = seatd\n\
+              after = seatd gtk-caches\n\
               wait_socket = /run/seatd.sock\n\
               wait_path = /dev/input\n\
               desktop = labwc\n\

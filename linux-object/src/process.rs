@@ -115,6 +115,9 @@ impl ProcessExt for Process {
                     // this process down, so they are not stranded on a dead
                     // parent that will never `wait` for them.
                     reparent_live_children_to_init(&proc);
+                    // Record locks die with the process (same as the
+                    // fork path below; see `record_lock::release_owner`).
+                    crate::fs::record_lock::release_owner(proc.id());
                     // try_linux (not linux): this callback runs from the
                     // object layer on PROCESS_TERMINATED, concurrently with
                     // SMP teardown churn. If the extension can no longer be
@@ -402,6 +405,10 @@ impl ProcessExt for Process {
                         _ => 0,
                     };
                     reparent_live_children_to_init(&child);
+                    // POSIX record locks die with the process, eagerly: the
+                    // lazy liveness prune in `record_lock` cannot tell a dead
+                    // owner from a recycled pid (see `release_owner`).
+                    crate::fs::record_lock::release_owner(child.id());
                     // try_linux (not linux): this callback fires from the object
                     // layer on PROCESS_TERMINATED, concurrently with SMP teardown
                     // churn. A process whose extension can no longer be resolved
@@ -792,6 +799,16 @@ impl Default for RLimit {
 pub type ExitCode = i32;
 
 impl LinuxProcess {
+    /// Whether `pid` is a child of this process that has exited and has not
+    /// been collected by `wait*` yet -- a zombie. Its `Process` has already
+    /// left the job (`ROOT_JOB.find_process` misses it), but `kill(2)` must
+    /// still succeed: Linux accepts a signal to a zombie and drops it, and
+    /// callers rely on `kill(pid, 0) == 0` / `kill(pid, SIGKILL) == 0` to
+    /// mean "that pid is still ours to wait for".
+    pub fn is_zombie_child(&self, pid: KoID) -> bool {
+        self.inner.lock().reaped_children.contains_key(&pid)
+    }
+
     /// Drop the live child handle and keep only the exit code (plus the
     /// child's final CPU usage, for the reaper's rusage) for a future `wait`.
     pub fn record_child_exit(&self, child_id: KoID, exit_code: i64, cpu: ChildCpu) {
