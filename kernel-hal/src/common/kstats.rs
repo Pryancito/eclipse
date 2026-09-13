@@ -434,8 +434,16 @@ static FAULT_RSP: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_
 
 /// Index for the per-CPU fault slots; `None` past `MAX_CORE_NUM`, where storing
 /// would be out of bounds and reading would be another cpu's data.
+///
+/// Keyed off the Local APIC id, never GS. `crate::cpu::cpu_id()` resolves the
+/// logical id through the GS-backed per-CPU region, and these slots are read by
+/// `oops` precisely when something has gone wrong in the trap path -- including
+/// the window `lock::current_cpu_id_via_apic` documents, where `syscall_return`
+/// has already swapped in the USER gsbase while CS is still ring 0. Indexing by
+/// a GS-derived id there lands the record in another cpu's slot, which is the
+/// exact cross-cpu mix-up this per-cpu split exists to end.
 fn fault_slot() -> Option<usize> {
-    let cpu = crate::cpu::cpu_id() as usize;
+    let cpu = lock::current_cpu_id_via_apic() as usize;
     (cpu < MAX_CORE_NUM).then_some(cpu)
 }
 

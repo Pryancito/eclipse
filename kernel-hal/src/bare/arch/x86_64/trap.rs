@@ -1086,7 +1086,11 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                     // (`arch_prctl(ARCH_SET_GS)`, added for the wasm2c segue
                     // sandbox), and it is the only workload that reproduces this
                     // fault. Print both halves of the swapgs pair and the cpu id
-                    // so a mismatch is visible rather than inferred.
+                    // so a mismatch is visible rather than inferred. The cpu id
+                    // comes from the APIC, not `cpu_id()`: that one resolves
+                    // through the GS-backed per-CPU region, which is the very
+                    // thing under suspicion here, so it could print another
+                    // cpu's id in exactly the case the line exists to expose.
                     let loaded = tf.rsp.wrapping_sub(FROM_USER_RSP_BIAS);
                     let (gs_base, kernel_gs_base) = unsafe {
                         use x86_64::registers::model_specific::Msr;
@@ -1095,7 +1099,7 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                     crate::console::serial_write_fmt_spin(format_args!(
                         "[df-sp] cpu={} loaded={:#x} vs [gs:4]={:#x} — {}; IA32_GS_BASE={:#x} \
                          IA32_KERNEL_GS_BASE={:#x}\n",
-                        super::cpu::cpu_id(),
+                        lock::current_cpu_id_via_apic(),
                         loaded,
                         dump[0],
                         if loaded == dump[0] {
