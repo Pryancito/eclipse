@@ -516,7 +516,9 @@ impl Syscall<'_> {
         let inode = proc.lookup_inode(path)?;
         let metadata = inode.metadata()?;
         proc.check_access(&metadata, 0o2, true)?;
-        inode.resize(len)?;
+        inode
+            .resize(len)
+            .map_err(|e| linux_object::fs::fs_grow_error(&inode, e))?;
         Ok(0)
     }
 

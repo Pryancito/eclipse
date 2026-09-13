@@ -13,3 +13,8 @@ bitvec = { version = "0.22", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 tempfile = "3.2"
+
+[features]
+# `lib.rs` tests `feature = "std"` for its `no_std` gate; declare it so the
+# path-patched crate does not raise `unexpected_cfgs` on every build.
+std = []

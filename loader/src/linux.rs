@@ -840,7 +840,74 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
             let pc = thread
                 .with_context(|ctx| ctx.get_field(UserContextField::InstrPointer))
                 .unwrap_or(0);
-            if let Err(err) = vmar.handle_page_fault(vaddr, flags) {
+            // [xfault] A user INSTRUCTION-FETCH fault is worth reporting even
+            // when it resolves. Firefox's content process dies at a fixed
+            // address on every boot (`rip == rax == 0x189b2a10`, `err=0x14`:
+            // user, instruction fetch, page NOT present), and the existing
+            // report below only fires when the fault is FATAL -- so if the
+            // kernel commits a page and the crash happens elsewhere, the log
+            // says nothing at all and the trail ends.
+            //
+            // `describe_addr` answers the question that splits the diagnosis in
+            // two: "in map A-B" means the address is inside a mapping with no
+            // page behind it, so the demand path is where to look; "unmapped"
+            // means the JIT jumped outside what it reserved, so munmap/mremap
+            // and the splitting of its reservation are. Printing the outcome
+            // too distinguishes "resolved, crash is elsewhere" from "fatal".
+            //
+            // Bounded to the first few DISTINCT addresses: an exec fault is
+            // rare, but a loop faulting on one address would otherwise flood a
+            // serial console at `error!`.
+            //
+            // Only ANONYMOUS mappings (or a fault that fails) claim a slot. The
+            // first run of this report showed the eight slots gone by t=15s to
+            // pulseaudio demand-paging libogg, libvorbis, libFLAC... -- the
+            // ordinary first touch of a shared library's text, each resolved
+            // -- and Firefox's JIT fault never got a line. File-backed text
+            // faulting in and resolving is the normal case, not the question.
+            let fault_result = vmar.handle_page_fault(vaddr, flags);
+            if flags.contains(kernel_hal::MMUFlags::EXECUTE) {
+                use core::sync::atomic::{AtomicUsize, Ordering};
+                const SLOTS: usize = 8;
+                static SEEN: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
+                // Cheap tests first: `describe_addr` walks and clones the
+                // mapping list, which must not run on every resolved text
+                // fault of every shared library. Once the slots are full,
+                // or the address was seen, nothing below runs at all.
+                let unseen = SEEN.iter().all(|s| s.load(Ordering::Relaxed) != vaddr);
+                let has_slot = SEEN.iter().any(|s| s.load(Ordering::Relaxed) == 0);
+                let at = if fault_result.is_err() || (unseen && has_slot) {
+                    Some(describe_addr(&vmar, vaddr))
+                } else {
+                    None
+                };
+                let interesting = match &at {
+                    Some(at) => fault_result.is_err() || at.starts_with("anon+"),
+                    None => false,
+                };
+                let fresh = interesting
+                    && unseen
+                    && SEEN.iter().any(|s| {
+                        s.compare_exchange(0, vaddr, Ordering::AcqRel, Ordering::Relaxed)
+                            .is_ok()
+                    });
+                if fresh {
+                    let at = at.unwrap_or_default();
+                    error!(
+                        "[xfault] user instruction-fetch fault @ {:#x} [{}] flags={:?} \
+                         resolved={} pid={} proc={} pc={:#x} [{}]",
+                        vaddr,
+                        at,
+                        flags,
+                        fault_result.is_ok(),
+                        pid,
+                        thread.proc().name(),
+                        pc,
+                        describe_addr(&vmar, pc),
+                    );
+                }
+            }
+            if let Err(err) = fault_result {
                 error!(
                     "unhandled page fault @ {:#x}({:?}) [{}]: {:?}, pid={} proc={} pc={:#x} [{}] -> SIGSEGV",
                     vaddr,
