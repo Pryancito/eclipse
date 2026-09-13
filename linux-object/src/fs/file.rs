@@ -434,6 +434,11 @@ impl FileInner {
         if !crate::fs::memfd_write_allowed(&self.inode) {
             return Err(LxError::EPERM);
         }
+        let cur = self.inode.metadata()?.size as u64;
+        let end = offset.saturating_add(buf.len() as u64);
+        if end > cur {
+            crate::fs::memfd_grow_allowed(&self.inode, end as usize)?;
+        }
         let len = self.inode.write_at(offset as usize, buf)?;
         Ok(len)
     }
@@ -485,6 +490,10 @@ impl File {
         let inner = self.inner.write();
         if !inner.flags.writable() {
             return Err(LxError::EBADF);
+        }
+        let cur = inner.inode.metadata()?.size as u64;
+        if len > cur {
+            crate::fs::memfd_grow_allowed(&inner.inode, len as usize)?;
         }
         inner.inode.resize(len as usize)?;
         Ok(())
