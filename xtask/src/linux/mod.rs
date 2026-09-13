@@ -2297,10 +2297,15 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         );
         write_if_ours(
             &pulse.join("client.conf"),
+            // `allow-autospawn-for-root` is not a client.conf key -- libpulse
+            // logs "Unknown lvalue 'allow-autospawn-for-root'" once per line it
+            // reads it, which is every time a client (Firefox) links libpulse,
+            // spamming the terminal. `autospawn = no` already disables spawning
+            // for everyone including root, so the line was redundant as well as
+            // invalid. See the pulse client.conf(5) key list.
             b"# eclipse-generated PulseAudio client (delete this line to take ownership).\n\
               default-server = unix:/run/pulse/native\n\
-              autospawn = no\n\
-              allow-autospawn-for-root = yes\n",
+              autospawn = no\n",
         );
         let pa = b"# eclipse-generated PulseAudio startup (delete this line to take ownership).\n\
               #!/usr/bin/pulseaudio -nF\n\
