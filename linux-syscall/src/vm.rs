@@ -599,8 +599,26 @@ impl Syscall<'_> {
                     );
                     return Err(LxError::EINVAL);
                 }
-                warn!(
-                    "mprotect: addr={:#x} len={:#x} flags={:?} → {:?} (ignored)",
+                // `error!`, not `warn!`: the default cmdline is `LOG=error`
+                // (zCore/rboot.conf), so this was invisible on exactly the
+                // configuration people run. And it is not a cosmetic failure --
+                // swallowing it returns 0 to a caller whose permissions did NOT
+                // change. SpiderMonkey's JIT does mmap(PROT_NONE) -> mprotect(RW)
+                // -> write code -> mprotect(RX) -> call it; told the last step
+                // succeeded, it jumps into a page that is still not executable
+                // and takes a user instruction-fetch fault (`err=0x14`, with
+                // `rip == rax` from the indirect call). Firefox does that at a
+                // fixed address on every boot.
+                //
+                // The error kind is what picks the cause apart: NOT_FOUND means
+                // the range is not fully covered by mappings/children (a hole,
+                // or a split this kernel made that Linux would not have),
+                // ACCESS_DENIED means a mapping's max permissions forbid the
+                // transition. Print it rather than infer it.
+                error!(
+                    "mprotect: addr={:#x} len={:#x} flags={:?} → {:?} — returning success \
+                     WITHOUT changing permissions; a caller that now executes or writes this \
+                     range will fault",
                     addr, len, flags, e
                 );
                 Ok(0)
