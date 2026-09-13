@@ -110,9 +110,15 @@ pub trait INode: Any + Sync + Send {
         Err(FsError::NotSupported)
     }
 
-    /// Get the file system of the INode
+    /// Get the file system of the INode.
+    ///
+    /// Inodes that belong to no file system (ttys, pipes, sockets, procfs
+    /// and sysfs entries, device nodes) get [`no_fs`], a filesystem that owns
+    /// nothing. The old default was `unimplemented!()`, which took the kernel
+    /// down on `fsync(2)` of a terminal, `fstatfs(2)` of a procfs file, and
+    /// on any path that keys a per-inode table by its file system.
     fn fs(&self) -> Arc<dyn FileSystem> {
-        unimplemented!();
+        no_fs()
     }
 
     /// This is used to implement dynamics cast.
@@ -358,6 +364,66 @@ pub trait FileSystem: Sync + Send {
 
     /// Get the file system information
     fn info(&self) -> FsInfo;
+}
+
+/// The file system reported by inodes that have none. One shared instance,
+/// so callers can recognise it with [`is_no_fs`].
+pub fn no_fs() -> Arc<dyn FileSystem> {
+    static NO_FS: spin::Once<Arc<dyn FileSystem>> = spin::Once::new();
+    NO_FS.call_once(|| Arc::new(NoFileSystem)).clone()
+}
+
+/// Whether `fs` is the placeholder returned for inodes without a file system.
+pub fn is_no_fs(fs: &Arc<dyn FileSystem>) -> bool {
+    Arc::ptr_eq(fs, &no_fs())
+}
+
+/// The placeholder file system behind [`no_fs`]: nothing to sync, no space,
+/// an empty root.
+struct NoFileSystem;
+
+impl FileSystem for NoFileSystem {
+    fn sync(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn root_inode(&self) -> Arc<dyn INode> {
+        Arc::new(NoINode)
+    }
+
+    fn info(&self) -> FsInfo {
+        FsInfo {
+            bsize: 4096,
+            frsize: 4096,
+            blocks: 0,
+            bfree: 0,
+            bavail: 0,
+            files: 0,
+            ffree: 0,
+            namemax: 255,
+        }
+    }
+}
+
+/// The root of [`NoFileSystem`]: an empty, unreadable, unwritable inode.
+struct NoINode;
+
+impl INode for NoINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+
+    fn poll(&self) -> Result<PollStatus> {
+        Err(FsError::NotSupported)
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
 }
 
 pub fn make_rdev(major: usize, minor: usize) -> usize {

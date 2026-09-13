@@ -2119,6 +2119,58 @@ pub fn split_path(path: &str) -> (&str, &str) {
 mod tests {
     use super::split_path;
 
+    /// `write(2)` to a terminal took the kernel down: the page-cache lookup
+    /// keyed the inode by `fs()`, whose default was `unimplemented!()`.
+    /// Inodes without a file system (ttys, pipes, procfs) must be looked up
+    /// -- and never found -- without touching one.
+    #[test]
+    fn cache_lookups_survive_an_inode_without_a_filesystem() {
+        use alloc::sync::Arc;
+        use rcore_fs::vfs::{FileType, FsError, INode, Metadata, PollStatus, Timespec};
+
+        struct Tty;
+        impl INode for Tty {
+            fn read_at(&self, _: usize, _: &mut [u8]) -> rcore_fs::vfs::Result<usize> {
+                Err(FsError::NotSupported)
+            }
+            fn write_at(&self, _: usize, buf: &[u8]) -> rcore_fs::vfs::Result<usize> {
+                Ok(buf.len())
+            }
+            fn poll(&self) -> rcore_fs::vfs::Result<PollStatus> {
+                Err(FsError::NotSupported)
+            }
+            fn metadata(&self) -> rcore_fs::vfs::Result<Metadata> {
+                Ok(Metadata {
+                    dev: 1,
+                    inode: 5,
+                    size: 0,
+                    blk_size: 4096,
+                    blocks: 0,
+                    atime: Timespec { sec: 0, nsec: 0 },
+                    mtime: Timespec { sec: 0, nsec: 0 },
+                    ctime: Timespec { sec: 0, nsec: 0 },
+                    type_: FileType::CharDevice,
+                    mode: 0o620,
+                    nlinks: 1,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                })
+            }
+            fn as_any_ref(&self) -> &dyn core::any::Any {
+                self
+            }
+        }
+
+        let tty: Arc<dyn INode> = Arc::new(Tty);
+        assert!(rcore_fs::vfs::is_no_fs(&tty.fs()));
+        let mut buf = [0u8; 16];
+        super::file::cache_overlay_read(&tty, 0, &mut buf);
+        super::file::cache_overlay_write(&tty, 0, b"hello, world");
+        super::file::cache_truncate(&tty, 0);
+        assert_eq!(buf, [0u8; 16]);
+    }
+
     /// The page cache IS the file: what a `MAP_SHARED` mapping stores,
     /// `read(2)` returns; what `write(2)` stores, mappings see; the cache
     /// grows with the file and forgets what truncate removed. These are the
