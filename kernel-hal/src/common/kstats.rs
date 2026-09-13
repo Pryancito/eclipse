@@ -416,39 +416,68 @@ pub fn note_nmi_rip(rip: u64) {
 /// [diag] Most-recent page-fault instruction pointer, stashed by the trap
 /// handler (which has the trap frame) so the kernel page-fault handler --
 /// which only receives vaddr+flags -- can name the exact faulting code in
-/// its panic message. Single global: faults are handled to completion
-/// (panic) before the next, so there's no cross-fault race that matters.
-static FAULT_RIP: AtomicU64 = AtomicU64::new(0);
-static FAULT_RBP: AtomicU64 = AtomicU64::new(0);
-static FAULT_RSP: AtomicU64 = AtomicU64::new(0);
+/// its panic message.
+///
+/// Per-CPU, not global. The single-global version assumed "faults are handled
+/// to completion before the next, so there's no cross-fault race that matters",
+/// which is false with more than one core: EVERY page fault on EVERY cpu stores
+/// here, so an ordinary fault elsewhere overwrites the slot between a panicking
+/// cpu's store and `oops`'s read. That is not only a wrong diagnostic line --
+/// `oops` feeds `last_fault_rsp()` to `fault_sp_abandonable` to decide whether
+/// a fault can be isolated, so a clobbered value turns a containable panic into
+/// "cannot isolate -- halting". Observed exactly that: a #DF stored
+/// 0xffffff002127fa30 and `oops` read back 0xffffff0020e7f1f0, a stack
+/// belonging to another cpu.
+static FAULT_RIP: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+static FAULT_RBP: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+static FAULT_RSP: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+
+/// Index for the per-CPU fault slots; `None` past `MAX_CORE_NUM`, where storing
+/// would be out of bounds and reading would be another cpu's data.
+///
+/// Keyed off the Local APIC id, never GS. `crate::cpu::cpu_id()` resolves the
+/// logical id through the GS-backed per-CPU region, and these slots are read by
+/// `oops` precisely when something has gone wrong in the trap path -- including
+/// the window `lock::current_cpu_id_via_apic` documents, where `syscall_return`
+/// has already swapped in the USER gsbase while CS is still ring 0. Indexing by
+/// a GS-derived id there lands the record in another cpu's slot, which is the
+/// exact cross-cpu mix-up this per-cpu split exists to end.
+fn fault_slot() -> Option<usize> {
+    let cpu = lock::current_cpu_id_via_apic() as usize;
+    (cpu < MAX_CORE_NUM).then_some(cpu)
+}
 
 /// [diag] Record the RIP of the instruction that just page-faulted.
 pub fn note_fault_rip(rip: u64) {
-    FAULT_RIP.store(rip, Relaxed);
+    if let Some(cpu) = fault_slot() {
+        FAULT_RIP[cpu].store(rip, Relaxed);
+    }
 }
 
 /// [diag] Record the frame/stack pointers at the faulting instruction so the
 /// page-fault handler can walk the call chain (e.g. name the caller of a wild
 /// `memset`). Stored alongside the RIP by the arch trap entry.
 pub fn note_fault_regs(rip: u64, rbp: u64, rsp: u64) {
-    FAULT_RIP.store(rip, Relaxed);
-    FAULT_RBP.store(rbp, Relaxed);
-    FAULT_RSP.store(rsp, Relaxed);
+    if let Some(cpu) = fault_slot() {
+        FAULT_RIP[cpu].store(rip, Relaxed);
+        FAULT_RBP[cpu].store(rbp, Relaxed);
+        FAULT_RSP[cpu].store(rsp, Relaxed);
+    }
 }
 
 /// [diag] Read back the last page-fault RIP recorded by `note_fault_rip`.
 pub fn last_fault_rip() -> u64 {
-    FAULT_RIP.load(Relaxed)
+    fault_slot().map_or(0, |cpu| FAULT_RIP[cpu].load(Relaxed))
 }
 
 /// [diag] Read back the frame pointer at the last page fault.
 pub fn last_fault_rbp() -> u64 {
-    FAULT_RBP.load(Relaxed)
+    fault_slot().map_or(0, |cpu| FAULT_RBP[cpu].load(Relaxed))
 }
 
 /// [diag] Read back the stack pointer at the last page fault.
 pub fn last_fault_rsp() -> u64 {
-    FAULT_RSP.load(Relaxed)
+    fault_slot().map_or(0, |cpu| FAULT_RSP[cpu].load(Relaxed))
 }
 
 /// [diag] Broadcast an NMI to all other CPUs and busy-wait briefly so their NMI
