@@ -647,6 +647,9 @@ _class5080DeferredApiV2
             {
                 if ((pEntry->pFunc == NULL) || !_class5080FuncPtrInKernelText(pEntry->pFunc))
                 {
+                    NV_PRINTF(LEVEL_ERROR,
+                              "DeferredApi: rejecting non-text control target cmd=0x%08x pFunc=%p\n",
+                              rmCtrlParams.cmd, pEntry->pFunc);
                     rmStatus = NV_ERR_INVALID_STATE;
                     goto cleanup;
                 }
