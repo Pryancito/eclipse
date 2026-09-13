@@ -2120,16 +2120,21 @@ mod tests {
     use super::split_path;
 
     /// `write(2)` to a terminal took the kernel down: the page-cache lookup
-    /// keyed the inode by `fs()`, whose default was `unimplemented!()`.
-    /// Inodes without a file system (ttys, pipes, sockets) must be looked up
-    /// -- and never found -- without touching one.
+    /// keyed the inode by `fs()`, whose default was `unimplemented!()`; then
+    /// `write(2)` to `/dev/null` did the same, because `rcore-fs-devfs`
+    /// overrides `fs()` with its own `unimplemented!()`. Inodes that are not
+    /// regular files must be looked up -- and never found -- without `fs()`
+    /// being called at all.
     #[test]
     fn cache_lookups_survive_an_inode_without_a_filesystem() {
         use alloc::sync::Arc;
-        use rcore_fs::vfs::{FileType, FsError, INode, Metadata, PollStatus, Timespec};
+        use rcore_fs::vfs::{FileSystem, FileType, FsError, INode, Metadata, PollStatus, Timespec};
 
         struct Tty;
         impl INode for Tty {
+            fn fs(&self) -> Arc<dyn FileSystem> {
+                unimplemented!("a device node's fs() must never be asked")
+            }
             fn read_at(&self, _: usize, _: &mut [u8]) -> rcore_fs::vfs::Result<usize> {
                 Err(FsError::NotSupported)
             }
@@ -2163,7 +2168,6 @@ mod tests {
         }
 
         let tty: Arc<dyn INode> = Arc::new(Tty);
-        assert!(rcore_fs::vfs::is_no_fs(&tty.fs()));
         let mut buf = [0u8; 16];
         super::file::cache_overlay_read(&tty, 0, &mut buf);
         super::file::cache_overlay_write(&tty, 0, b"hello, world");
