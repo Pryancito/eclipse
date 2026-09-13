@@ -155,15 +155,18 @@ type SharedVmoMap = alloc::collections::BTreeMap<
 /// which is why wl_shm masked it. Files whose filesystem reports inode 0 fall
 /// back to the Arc pointer: no cross-open dedup, but never a false merge.
 ///
-/// Inodes without a file system (ttys, pipes, sockets: anything that inherits
-/// the default `fs()`, which returns the `no_fs` placeholder) also fall back
-/// to the Arc pointer. Every
-/// `read(2)`/`write(2)` consults the cache registry through this key, so it
-/// must never assume the inode is a disk file.
+/// Only a regular file can have a page cache, so `fs()` is asked of regular
+/// files only. Every `read(2)`/`write(2)` consults the cache registry through
+/// this key, and the inode behind a tty, a pipe, a socket or `/dev/null` may
+/// not have a file system at all: the vendored default returns the `no_fs`
+/// placeholder (recognised here), but `rcore-fs-devfs` overrides `fs()` with
+/// `unimplemented!()` -- the `write(2)` to `/dev/null` that halted the
+/// desktop. Anything that is not a regular file keys by its Arc pointer and
+/// is never asked.
 fn cache_key(inode: &Arc<dyn INode>) -> (usize, usize) {
     let by_pointer = (Arc::as_ptr(inode) as *const () as usize, usize::MAX);
     match inode.metadata() {
-        Ok(md) if md.inode != 0 => {
+        Ok(md) if md.inode != 0 && md.type_ == FileType::File => {
             let fs = inode.fs();
             if rcore_fs::vfs::is_no_fs(&fs) {
                 by_pointer
