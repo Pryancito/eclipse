@@ -48,7 +48,6 @@ pub fn install(rootfs: &Path) {
     write_terminal_wrapper(rootfs);
     write_firefox_wrapper(rootfs);
     write_firefox_desktop_override(rootfs);
-    write_firefox_default_prefs(rootfs);
     write_xorg_config(rootfs);
     write_xfce_defaults(rootfs);
     write_fallback_icons(rootfs);
@@ -1048,8 +1047,11 @@ fn write_firefox_wrapper(rootfs: &Path) {
 ///
 /// Both package names are covered because `firefox` and `firefox-esr` are
 /// separate Alpine packages with separate install dirs (see the wrapper).
-/// Nothing is written when neither is installed in the rootfs.
-fn write_firefox_default_prefs(rootfs: &Path) {
+/// Nothing is written when neither is installed in the rootfs -- which is
+/// why this is NOT part of [`install`]: on a from-scratch build that runs
+/// before `xorg::install` has fetched the package. The rootfs build calls
+/// this after the package step, on both the fresh and the incremental path.
+pub fn write_firefox_default_prefs(rootfs: &Path) {
     for dir in ["usr/lib/firefox", "usr/lib/firefox-esr"] {
         let app = rootfs.join(dir);
         if !app.is_dir() {

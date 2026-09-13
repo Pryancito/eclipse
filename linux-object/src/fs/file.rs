@@ -434,21 +434,26 @@ impl FileInner {
         if !crate::fs::memfd_write_allowed(&self.inode) {
             return Err(LxError::EPERM);
         }
-        match self.inode.write_at(offset as usize, buf) {
-            Ok(len) => Ok(len),
-            // A regular file that cannot grow is ENOSPC, as on Linux. The
-            // blanket `FsError -> LxError` table says ENOMEM, which is right
-            // for the device nodes that reuse `NoDeviceSpace` for a failed
-            // buffer allocation (DRM CREATE_DUMB) but wrong here: a writer
-            // told "out of memory" backs off and retries, one told "no space
-            // left on device" stops.
-            Err(FsError::NoDeviceSpace)
-                if matches!(self.inode.metadata().map(|m| m.type_), Ok(FileType::File)) =>
-            {
-                Err(LxError::ENOSPC)
-            }
-            Err(e) => Err(e.into()),
+        self.inode
+            .write_at(offset as usize, buf)
+            .map_err(|e| fs_grow_error(&self.inode, e))
+    }
+}
+
+/// Errno for a failed write/resize. A regular file that cannot grow is
+/// ENOSPC, as on Linux. The blanket `FsError -> LxError` table says ENOMEM,
+/// which is right for the device nodes that reuse `NoDeviceSpace` for a
+/// failed buffer allocation (DRM CREATE_DUMB) but wrong for a file: a writer
+/// told "out of memory" backs off and retries, one told "no space left on
+/// device" stops. Shared by write(2)/pwrite(2), ftruncate(2) and truncate(2).
+pub fn fs_grow_error(inode: &Arc<dyn INode>, e: FsError) -> LxError {
+    match e {
+        FsError::NoDeviceSpace
+            if matches!(inode.metadata().map(|m| m.type_), Ok(FileType::File)) =>
+        {
+            LxError::ENOSPC
         }
+        e => e.into(),
     }
 }
 
@@ -458,10 +463,20 @@ impl FileInner {
 /// nothing else in the log answers that. Printed for the first few distinct
 /// paths only; a writer that keeps retrying would otherwise flood the console.
 fn report_enospc(path: &str, offset: u64, len: usize, size: Option<u64>) {
-    use core::sync::atomic::{AtomicUsize, Ordering};
-    static SEEN: AtomicUsize = AtomicUsize::new(0);
-    const LIMIT: usize = 8;
-    if SEEN.fetch_add(1, Ordering::Relaxed) < LIMIT {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    // One slot per distinct path (FNV-1a of the path; 0 = free), so a writer
+    // retrying the same file does not use up the budget of the others.
+    const SLOTS: usize = 8;
+    static SEEN: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    let key = path.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
+    }) | 1;
+    let fresh = SEEN.iter().all(|s| s.load(Ordering::Relaxed) != key)
+        && SEEN.iter().any(|s| {
+            s.compare_exchange(0, key, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        });
+    if fresh {
         error!(
             "[enospc] write of {} bytes at offset {:#x} to {} refused: no space left on device              (file is {} bytes now)",
             len,
@@ -519,7 +534,10 @@ impl File {
         if !inner.flags.writable() {
             return Err(LxError::EBADF);
         }
-        inner.inode.resize(len as usize)?;
+        inner
+            .inode
+            .resize(len as usize)
+            .map_err(|e| fs_grow_error(&inner.inode, e))?;
         Ok(())
     }
 
@@ -676,7 +694,17 @@ impl FileLike for File {
 
     fn write(&self, buf: &[u8]) -> LxResult<usize> {
         let mut inner = self.inner.write();
-        let offset = inner.offset;
+        // The offset `FileInner::write` will actually try (O_APPEND writes at
+        // the current end, not at `inner.offset`).
+        let offset = if inner.flags.is_append() {
+            inner
+                .inode
+                .metadata()
+                .map(|m| m.size as u64)
+                .unwrap_or(inner.offset)
+        } else {
+            inner.offset
+        };
         let r = inner.write(buf);
         if matches!(r, Err(LxError::ENOSPC)) {
             let size = inner.inode.metadata().ok().map(|m| m.size as u64);

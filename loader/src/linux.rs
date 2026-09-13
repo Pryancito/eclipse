@@ -870,15 +870,29 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                 use core::sync::atomic::{AtomicUsize, Ordering};
                 const SLOTS: usize = 8;
                 static SEEN: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
-                let at = describe_addr(&vmar, vaddr);
-                let interesting = fault_result.is_err() || at.starts_with("anon+");
+                // Cheap tests first: `describe_addr` walks and clones the
+                // mapping list, which must not run on every resolved text
+                // fault of every shared library. Once the slots are full,
+                // or the address was seen, nothing below runs at all.
+                let unseen = SEEN.iter().all(|s| s.load(Ordering::Relaxed) != vaddr);
+                let has_slot = SEEN.iter().any(|s| s.load(Ordering::Relaxed) == 0);
+                let at = if fault_result.is_err() || (unseen && has_slot) {
+                    Some(describe_addr(&vmar, vaddr))
+                } else {
+                    None
+                };
+                let interesting = match &at {
+                    Some(at) => fault_result.is_err() || at.starts_with("anon+"),
+                    None => false,
+                };
                 let fresh = interesting
-                    && SEEN.iter().all(|s| s.load(Ordering::Relaxed) != vaddr)
+                    && unseen
                     && SEEN.iter().any(|s| {
                         s.compare_exchange(0, vaddr, Ordering::AcqRel, Ordering::Relaxed)
                             .is_ok()
                     });
                 if fresh {
+                    let at = at.unwrap_or_default();
                     error!(
                         "[xfault] user instruction-fetch fault @ {:#x} [{}] flags={:?} \
                          resolved={} pid={} proc={} pc={:#x} [{}]",
