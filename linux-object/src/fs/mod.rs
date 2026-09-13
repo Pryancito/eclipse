@@ -2121,7 +2121,7 @@ mod tests {
 
     /// `write(2)` to a terminal took the kernel down: the page-cache lookup
     /// keyed the inode by `fs()`, whose default was `unimplemented!()`.
-    /// Inodes without a file system (ttys, pipes, procfs) must be looked up
+    /// Inodes without a file system (ttys, pipes, sockets) must be looked up
     /// -- and never found -- without touching one.
     #[test]
     fn cache_lookups_survive_an_inode_without_a_filesystem() {

@@ -112,11 +112,11 @@ pub trait INode: Any + Sync + Send {
 
     /// Get the file system of the INode.
     ///
-    /// Inodes that belong to no file system (ttys, pipes, sockets, procfs
-    /// and sysfs entries, device nodes) get [`no_fs`], a filesystem that owns
-    /// nothing. The old default was `unimplemented!()`, which took the kernel
-    /// down on `fsync(2)` of a terminal, `fstatfs(2)` of a procfs file, and
-    /// on any path that keys a per-inode table by its file system.
+    /// Inodes that belong to no file system (ttys, pipes, sockets, device
+    /// nodes) get [`no_fs`], a filesystem that owns nothing. The old default
+    /// was `unimplemented!()`, which took the kernel down on `fsync(2)` of a
+    /// terminal and on any path that keys a per-inode table by its file
+    /// system.
     fn fs(&self) -> Arc<dyn FileSystem> {
         no_fs()
     }
