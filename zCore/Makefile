@@ -437,7 +437,14 @@ justrun: $(qemu_disk)
 ifeq ($(ARCH), x86_64)
 	$(sed) 's#cmdline=.*#cmdline=$(CMDLINE)#' $(esp)/EFI/Boot/rboot.conf
   ifeq ($(have_vfat),yes)
-	@esp_mb=$$(du -sm "$(esp)/EFI" | cut -f1); esp_mb=$$((esp_mb + 128)); \
+# Size by APPARENT size: the initramfs SFS is written sparse (xtask `fuse`
+# does `set_len`, and the free blocks -- 256 MiB of them on the QEMU live
+# image -- are never touched), so plain `du` under-reports it by that much
+# while mcopy copies the whole file. Sizing from `du -sm` produced a FAT32
+# image the initramfs did not fit in ("Disk full" from mcopy). The
+# `|| du -sm` fallback keeps non-GNU du (macOS) working as before.
+	@esp_mb=$$(du -sm --apparent-size "$(esp)/EFI" 2>/dev/null | cut -f1 \
+	    || du -sm "$(esp)/EFI" | cut -f1); esp_mb=$$((esp_mb + 128)); \
 	  echo "Building $(esp_img) ($$esp_mb MiB FAT32 — real ESP image; fat:rw dir emulation caps at FAT16 504 MiB)"; \
 	  rm -f "$(esp_img)"; \
 	  dd if=/dev/zero of="$(esp_img)" bs=1M count=$$esp_mb status=none; \
