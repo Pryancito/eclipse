@@ -24,8 +24,15 @@ __from_user:
     mov rax, [rsp + 6*8]    # rax = user rsp
     mov gs:12, rax          # store user rsp -> scratch at TSS.sp1
 
+    # Two sources, and they must not be confused. The hardware frame is on the
+    # stack the CPU switched to, which is TSS.RSP0 for an ordinary ring3 trap
+    # but an IST stack for the vectors idt.rs gives one to (#DF=8, #GP=13) --
+    # reading it from anywhere else is the bug this fixes. The destination
+    # GeneralRegs, on the other hand, is always reached through TSS.RSP0.
     mov rax, rsp            # preserve entry stack pointer (RSP0 or IST)
-    mov rsp, gs:4           # load rsp = bottom of trap frame
+    mov rsp, gs:4           # rsp = TSS.RSP0's VALUE: the address where
+                            # syscall_return pushed rdi (`mov gs:4, rsp`)
+    mov rsp, [rsp]          # rsp = that rdi = bottom of trap frame
     add rsp, 22*8           # rsp = top of trap frame
                             # rax still points to the entry frame
 
@@ -37,6 +44,11 @@ __from_user:
     #
     # These two labels bound the window in which `rax` still points at the
     # original entry frame (RSP0 or IST), before it is replaced with user rax.
+    # NOTE for kernel-hal's [df-sp] handler: `rax` here is the ENTRY frame, no
+    # longer `gs:4`. On an RSP0 entry that is still an address inside the
+    # faulting thread's kernel stack, so isolation keeps working; on an IST
+    # entry it is the IST stack, which no executor owns, and containment will
+    # decline rather than abandon the wrong stack.
 .global __from_user_regs_push
 __from_user_regs_push:
     # push trap_num, error_code

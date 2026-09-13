@@ -990,39 +990,31 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
             // This is what lets containment abandon that executor from the IST
             // stack instead of halting the machine.
             // [df-sp] A #DF raised inside `__from_user`'s register-push window
-            // is not a mystery, and it is recoverable even though the frame
-            // looks unusable. `syscall_return` stashes the thread's
-            // `GeneralRegs` pointer at [TSS.RSP0] (`push rdi` twice, then
-            // `mov gs:4, rsp`); `__alltraps` reloads it with
-            // `mov rsp, [rsp + 8*8]` and adds 22*8. When that slot has been
-            // zeroed -- or otherwise left invalid -- while the thread ran in
-            // user mode, rsp becomes that value plus 22*8, the first push raises
-            // #PF, and delivering it on the same dead stack escalates to #DF.
+            // is recoverable even though the frame looks unusable.
             //
-            // The reported rsp is therefore garbage and `fault_sp_abandonable`
-            // rejects it, which is why such a fault always ended in
-            // "cannot isolate - halting". But inside this exact window `rax`
-            // still holds `gs:4`, i.e. TSS.RSP0 itself: a live address on the
-            // faulting thread's kernel stack. Hand that to the isolation
-            // machinery instead, and the CPU is recovered like any other
-            // contained fault rather than taking the machine down.
+            // That window used to be where issue #1131 detonated: `__from_user`
+            // sourced the hardware trap frame from `[TSS.RSP0]`, which is wrong
+            // for the vectors `idt.rs` gives an IST stack to (#DF=8, #GP=13),
+            // so a ring3 #GP read its frame off the IST stack, built an
+            // unusable rsp, and the first push escalated to #DF. That is fixed
+            // in trap.S; this path stays as the net under it, because a #DF
+            // reported with a destroyed rsp is otherwise uncontainable.
+            //
+            // `fault_sp_abandonable` rejects the destroyed rsp, which is why
+            // such a fault ended in "cannot isolate - halting". Inside this
+            // window `rax` holds the ENTRY frame the CPU switched to. On an
+            // ordinary RSP0 entry that is an address inside the faulting
+            // thread's own kernel stack, so handing it to the isolation
+            // machinery recovers the cpu like any other contained fault.
             //
             // Substituting it cannot retire the wrong executor. `fault_sp` is
             // never a lookup key: both `fault_sp_abandonable` and
             // `abandon_executor_for_sp` take `runtime.current_executor` for THIS
-            // cpu and use the sp only as a `stack_contains` guard on it. So if
-            // the stack really had been recycled to another executor -- the very
-            // scenario suspected below -- the guard would be false and the path
-            // declines, leaving the old halt. It fails safe in exactly the case
-            // that would make it dangerous.
-            //
-            // This contains the symptom; it does not explain who zeroed the
-            // slot. The zero is the thing to chase (only another CPU can write
-            // it -- this one was in user mode), and this path names it in the
-            // log so the next occurrence is not read as generic corruption.
-            // `__from_user` adds this to the loaded pointer before the first
-            // push, so subtracting it recovers what was actually in the slot.
-            const FROM_USER_RSP_BIAS: usize = 22 * 8;
+            // cpu and use the sp only as a `stack_contains` guard on it. An IST
+            // entry therefore declines (no executor owns an IST stack) instead
+            // of abandoning something it should not, and so does a stack that
+            // was recycled to another executor. It fails safe in exactly the
+            // cases that would make it dangerous.
             let mut fault_sp = tf.rsp;
             if vec == 8 {
                 extern "C" {
@@ -1034,162 +1026,12 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                 // rsp below one page can only be a destroyed stack pointer: the
                 // real one is always a kernel-half address.
                 if (lo..hi).contains(&tf.rip) && tf.rsp < 0x1000 {
-                    // Report the pointer that was actually loaded rather than
-                    // asserting it was null: `add rsp, 22*8` runs regardless, so
-                    // any pointer below a page lands here and a small non-null
-                    // one would send the next reader chasing the wrong thing.
                     crate::console::serial_write_fmt_spin(format_args!(
-                        "\n[df-sp] #DF inside __alltraps/__from_user: the GeneralRegs pointer at \
-                         [TSS.RSP0] was {:#x}, so rsp became {:#x}. Isolating on the real kernel \
-                         stack {:#x} (rax = gs:4) instead of the wrecked rsp.\n",
-                        tf.rsp.wrapping_sub(FROM_USER_RSP_BIAS),
-                        tf.rsp,
-                        tf.rax,
-                    ));
-                    // Which of the two writers did this? `syscall_return`
-                    // pushes nine values and only THEN publishes TSS.RSP0, so
-                    // the slot is the first of a known frame:
-                    //   [+0]=rdi [+8]=rdi(dup) [+16]=rbx [+24]=rbp [+32]=r12
-                    //   [+40]=r13 [+48]=r14 [+56]=r15 [+64]=fsbase
-                    // All nine zero means a bulk blanking -- a zero-filled
-                    // allocation handed out on top of a live stack, which is the
-                    // aliasing `frame_alias_check`/`heap_alias_check` hunt. Only
-                    // the first zero means an 8-byte stray write, a different
-                    // bug that those checks would never catch. Reading upward
-                    // from TSS.RSP0 stays inside the same kernel stack, so this
-                    // is safe even here.
-                    let mut zeros = 0usize;
-                    let mut dump = [0usize; 9];
-                    for (i, w) in dump.iter_mut().enumerate() {
-                        *w = unsafe { core::ptr::read_volatile((tf.rax as *const usize).add(i)) };
-                        if *w == 0 {
-                            zeros += 1;
-                        }
-                    }
-                    crate::console::serial_write_fmt_spin(format_args!(
-                        "[df-sp] syscall_return frame at [TSS.RSP0] ({} of 9 words zero):                          rdi={:#x} rdi={:#x} rbx={:#x} rbp={:#x} r12={:#x} r13={:#x} r14={:#x}                          r15={:#x} fsbase={:#x}\n",
-                        zeros, dump[0], dump[1], dump[2], dump[3], dump[4], dump[5], dump[6],
-                        dump[7], dump[8],
-                    ));
-                    // The loaded pointer and `[gs:4]` ought to be the SAME
-                    // memory: `__from_user` reads `[rsp + 8*8]`, which with a
-                    // user trap frame is exactly `[TSS.RSP0]`, and `mov rax,
-                    // gs:4` four instructions later re-reads TSS.RSP0 itself.
-                    // So if the dump above shows a valid GeneralRegs pointer
-                    // while the value actually loaded was garbage, they were
-                    // never the same address -- the stack the CPU switched to is
-                    // not the one `gs:4` names, i.e. GS is not pointing at this
-                    // cpu's region.
-                    //
-                    // That is worth suspecting first because Firefox is the
-                    // first program on this system to install its own GS base
-                    // (`arch_prctl(ARCH_SET_GS)`, added for the wasm2c segue
-                    // sandbox), and it is the only workload that reproduces this
-                    // fault. Print both halves of the swapgs pair and the cpu id
-                    // so a mismatch is visible rather than inferred. The cpu id
-                    // comes from the APIC, not `cpu_id()`: that one resolves
-                    // through the GS-backed per-CPU region, which is the very
-                    // thing under suspicion here, so it could print another
-                    // cpu's id in exactly the case the line exists to expose.
-                    let loaded = tf.rsp.wrapping_sub(FROM_USER_RSP_BIAS);
-                    let (gs_base, kernel_gs_base) = unsafe {
-                        use x86_64::registers::model_specific::Msr;
-                        (Msr::new(0xC000_0101).read(), Msr::new(0xC000_0102).read())
-                    };
-                    crate::console::serial_write_fmt_spin(format_args!(
-                        "[df-sp] cpu={} loaded={:#x} vs [gs:4]={:#x} — {}; IA32_GS_BASE={:#x} \
-                         IA32_KERNEL_GS_BASE={:#x}\n",
-                        lock::current_cpu_id_via_apic(),
-                        loaded,
-                        dump[0],
-                        if loaded == dump[0] {
-                            "same value, so the slot itself was corrupted"
-                        } else {
-                            "DIFFERENT, so [rsp+8*8] and gs:4 are not the same address —                              suspect GS/swapgs, not the slot"
-                        },
-                        gs_base,
-                        kernel_gs_base,
-                    ));
-                    // Settle it. `gs:4` is the RSP0 field of the TSS inside the
-                    // CpuLocalRegion that GS names; the CPU's stack switch uses
-                    // the TSS that TR names. They are the same field only if
-                    // both name the same TSS, and a base that differs from GS's
-                    // is precisely "the stack the CPU switched to is not the one
-                    // gs:4 names". Read TR, decode the 64-bit system-segment
-                    // base out of the GDT, and print both.
-                    //
-                    // Reading `gdt.rs` this SHOULD come back equal: `init_ap`
-                    // copies the BSP's GDT into a private `Vec`, appends only
-                    // this cpu's own `[tss0, tss1]`, leaks that and `lgdt`s it,
-                    // so the TSS sits at the fixed index `BSP_GDT_COUNT` in a
-                    // table no other cpu touches, and `load_tss` uses that same
-                    // constant. No shared table, no index to drift.
-                    //
-                    // Measure it anyway. "TR and GS agree" is the result that
-                    // eliminates the whole segmentation branch, and right now
-                    // that branch rests only on the reading above -- which has
-                    // already been wrong twice while chasing this fault (the
-                    // `arch_prctl(ARCH_SET_GS)` window, and believing `cpu_id()`
-                    // came from the APIC). Better the log says it.
-                    let (tr, tss_base) = unsafe {
-                        let tr: u16;
-                        core::arch::asm!("str {0:x}", out(reg) tr, options(nomem, nostack));
-                        let mut gdtp = [0u8; 10];
-                        core::arch::asm!("sgdt [{}]", in(reg) gdtp.as_mut_ptr(), options(nostack));
-                        let limit = u16::from_le_bytes([gdtp[0], gdtp[1]]) as usize;
-                        let base = u64::from_le_bytes([
-                            gdtp[2], gdtp[3], gdtp[4], gdtp[5], gdtp[6], gdtp[7], gdtp[8], gdtp[9],
-                        ]);
-                        let idx = (tr >> 3) as usize;
-                        // A TSS descriptor is 16 bytes; both halves must be in
-                        // the table or the decode is meaningless.
-                        if base != 0 && (idx + 1) * 8 + 7 <= limit {
-                            let lo = core::ptr::read_volatile((base as *const u64).add(idx));
-                            let hi = core::ptr::read_volatile((base as *const u64).add(idx + 1));
-                            let b = ((lo >> 16) & 0xff_ffff)
-                                | (((lo >> 56) & 0xff) << 24)
-                                | ((hi & 0xffff_ffff) << 32);
-                            (tr, b)
-                        } else {
-                            (tr, 0)
-                        }
-                    };
-                    crate::console::serial_write_fmt_spin(format_args!(
-                        "[df-sp] TR={:#x} -> TSS base {:#x} vs IA32_GS_BASE {:#x} — {}\n",
-                        tr,
-                        tss_base,
-                        gs_base,
-                        if tss_base == 0 {
-                            "TSS base undecodable, ignore this line"
-                        } else if tss_base == gs_base {
-                            "SAME region, so TR is not the problem"
-                        } else {
-                            "DIFFERENT regions — TR and GS name different TSSs,                              so gs:4 was never the RSP0 the CPU switched on"
-                        },
-                    ));
-                    // And say whether the allocator-aliasing checks could even
-                    // have seen it. There are TWO fixed-size registries, one per
-                    // check, and each silently loses stacks that do not fit:
-                    // `overlapping_live_stack` backs `[frame-alias]`,
-                    // `alloc_overlaps_live_stack` backs `[heap-alias]`. Either
-                    // one being incomplete makes its check able to miss an
-                    // overlap, so report them separately and only claim coverage
-                    // when both are clean.
-                    let untracked_frame = ::executor::untracked_live_stacks();
-                    let untracked_alloc = ::executor::untracked_alloc_stacks();
-                    let complete = untracked_frame == 0 && untracked_alloc == 0;
-                    crate::console::serial_write_fmt_spin(format_args!(
-                        "[df-sp] live-stack registries: {} untracked for [frame-alias], {} for \
-                         [heap-alias] — {}\n",
-                        untracked_frame,
-                        untracked_alloc,
-                        if complete {
-                            "coverage is complete, so the absence of a [frame-alias]/[heap-alias] \
-                             line above DOES rule allocator aliasing out"
-                        } else {
-                            "coverage is INCOMPLETE, so the absence of a [frame-alias]/[heap-alias] \
-                             line above rules NOTHING out"
-                        },
+                        "\n[df-sp] #DF inside __alltraps/__from_user with rsp={:#x}. Isolating on \
+                         the entry frame {:#x} (rax) instead of the wrecked rsp. If this fires at \
+                         all, __from_user built an unusable trapframe pointer again — see \
+                         issue #1131.\n",
+                        tf.rsp, tf.rax,
                     ));
                     fault_sp = tf.rax;
                 }
