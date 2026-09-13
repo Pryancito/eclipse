@@ -142,9 +142,15 @@ pub struct VMObjectPaged {
     /// This lock is shared between objects in the same clone tree to avoid deadlock
     lock: Arc<Mutex<()>>,
     inner: RefCell<VMObjectPagedInner>,
-    /// Linux `MAP_SHARED` anonymous memory shared across `fork` (see
-    /// `VMObjectTrait::set_shared`).
+    /// Shared object (see `VMObjectTrait::set_shared`): anonymous memory
+    /// shared across `fork`, or a file/memfd page cache.
     shared: core::sync::atomic::AtomicBool,
+    /// Mappings of BORROWERS of this page cache, each with the cache page
+    /// its page 0 borrows. Their PTEs point at this cache's frames, so a
+    /// decommit here must unmap them too; the cache otherwise knows nothing
+    /// about its borrowers. Leaf lock: taken briefly, never with another
+    /// lock taken inside it.
+    borrower_maps: Mutex<Vec<(Weak<VmMapping>, usize)>>,
 }
 
 /// We always lock the lock before access to the Refcell, so it is actually sync
@@ -427,16 +433,18 @@ impl VMObjectPaged {
             lock: lock_ref.unwrap_or_else(|| Arc::new(Mutex::new(()))),
             inner: RefCell::new(inner),
             shared: core::sync::atomic::AtomicBool::new(false),
+            borrower_maps: Mutex::new(Vec::new()),
         });
         obj.inner.borrow_mut().self_ref = Arc::downgrade(&obj);
         obj
     }
 
     /// A leaf whose pages other mappings or `read(2)` can observe: shared
-    /// across `fork`, or a file/memfd page cache (`source`). Borrowers are
-    /// private and keep their copy-on-read semantics.
-    fn is_shared_leaf(&self, inner: &VMObjectPagedInner) -> bool {
-        self.shared.load(core::sync::atomic::Ordering::Relaxed) || inner.source.is_some()
+    /// across `fork`, or a file/memfd page cache (both marked by
+    /// `set_shared`). Borrowers and private file snapshots keep their
+    /// copy-on-read / zero-page semantics.
+    fn is_shared_leaf(&self, _inner: &VMObjectPagedInner) -> bool {
+        self.shared.load(core::sync::atomic::Ordering::Relaxed)
     }
 
     /// On a shared leaf a read fault must commit a REAL page. The plain path
@@ -852,6 +860,30 @@ impl VMObjectTrait for VMObjectPaged {
         for i in 0..pages {
             inner.decommit(start_page + i);
         }
+        // The frames are gone; no PTE may keep pointing at them. Unmap the
+        // range in every mapping of this object and in every mapping of a
+        // borrower of it (their read-only PTEs are this object's frames).
+        // Same pattern as the copy-on-write notifications above: the mapping
+        // side uses `try_lock` so a mapping busy in its own fault is skipped
+        // and re-resolves through the VMO when it finishes.
+        for map in inner.mappings.iter() {
+            if let Some(map) = map.upgrade() {
+                map.range_change(start_page, pages, RangeChangeOp::Unmap);
+            }
+        }
+        let borrowers: Vec<(Arc<VmMapping>, usize)> = self
+            .borrower_maps
+            .lock()
+            .iter()
+            .filter_map(|(m, base)| m.upgrade().map(|m| (m, *base)))
+            .collect();
+        for (map, base) in borrowers {
+            let s = start_page.max(base);
+            let e = (start_page + pages).max(base);
+            if e > s {
+                map.range_change(s - base, e - s, RangeChangeOp::Unmap);
+            }
+        }
         Ok(())
     }
 
@@ -864,11 +896,29 @@ impl VMObjectTrait for VMObjectPaged {
     }
 
     fn append_mapping(&self, mapping: Weak<VmMapping>) {
-        self.get_inner_mut().mappings.push(mapping);
+        let mut inner = self.get_inner_mut();
+        inner.mappings.push(mapping.clone());
+        // A borrower's mapping holds the cache's frames: let the cache know,
+        // so a decommit there unmaps it. (Order: this leaf's family lock,
+        // then the cache's borrower list -- a leaf lock -- never a family
+        // lock inside another.)
+        if let Some((cache, base, _)) = &inner.cache {
+            cache.register_borrower_mapping(mapping, base / PAGE_SIZE);
+        }
     }
 
     fn is_file_backed(&self) -> bool {
         self.get_inner().source.is_some()
+    }
+
+    fn is_shared(&self) -> bool {
+        self.shared.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn register_borrower_mapping(&self, mapping: Weak<VmMapping>, base_page: usize) {
+        let mut list = self.borrower_maps.lock();
+        list.retain(|(m, _)| m.strong_count() > 0);
+        list.push((mapping, base_page));
     }
 
     fn is_borrower(&self) -> bool {
