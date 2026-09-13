@@ -1071,6 +1071,41 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                         zeros, dump[0], dump[1], dump[2], dump[3], dump[4], dump[5], dump[6],
                         dump[7], dump[8],
                     ));
+                    // The loaded pointer and `[gs:4]` ought to be the SAME
+                    // memory: `__from_user` reads `[rsp + 8*8]`, which with a
+                    // user trap frame is exactly `[TSS.RSP0]`, and `mov rax,
+                    // gs:4` four instructions later re-reads TSS.RSP0 itself.
+                    // So if the dump above shows a valid GeneralRegs pointer
+                    // while the value actually loaded was garbage, they were
+                    // never the same address -- the stack the CPU switched to is
+                    // not the one `gs:4` names, i.e. GS is not pointing at this
+                    // cpu's region.
+                    //
+                    // That is worth suspecting first because Firefox is the
+                    // first program on this system to install its own GS base
+                    // (`arch_prctl(ARCH_SET_GS)`, added for the wasm2c segue
+                    // sandbox), and it is the only workload that reproduces this
+                    // fault. Print both halves of the swapgs pair and the cpu id
+                    // so a mismatch is visible rather than inferred.
+                    let loaded = tf.rsp.wrapping_sub(FROM_USER_RSP_BIAS);
+                    let (gs_base, kernel_gs_base) = unsafe {
+                        use x86_64::registers::model_specific::Msr;
+                        (Msr::new(0xC000_0101).read(), Msr::new(0xC000_0102).read())
+                    };
+                    crate::console::serial_write_fmt_spin(format_args!(
+                        "[df-sp] cpu={} loaded={:#x} vs [gs:4]={:#x} — {}; IA32_GS_BASE={:#x} \
+                         IA32_KERNEL_GS_BASE={:#x}\n",
+                        super::cpu::cpu_id(),
+                        loaded,
+                        dump[0],
+                        if loaded == dump[0] {
+                            "same value, so the slot itself was corrupted"
+                        } else {
+                            "DIFFERENT, so [rsp+8*8] and gs:4 are not the same address —                              suspect GS/swapgs, not the slot"
+                        },
+                        gs_base,
+                        kernel_gs_base,
+                    ));
                     // And say whether the allocator-aliasing checks could even
                     // have seen it. There are TWO fixed-size registries, one per
                     // check, and each silently loses stacks that do not fit:
