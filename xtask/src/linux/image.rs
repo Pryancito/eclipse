@@ -71,11 +71,12 @@ fn live_image_size(payload_bytes: u64) -> usize {
 /// desktop (`xorg::copy_into_live`), and -- unlike the installer media -- it is
 /// the root a browser session actually WRITES to: `HOME=/root` is on it, so
 /// Firefox's profile (startup cache, places.sqlite, session store), the
-/// fontconfig caches and the wrapper logs all land here. With the lean 12.5 %
-/// + 16 MiB headroom lunarbar showed `disk 95%` one minute after boot and the
-/// image was full two minutes into Firefox (`unused_blocks: 0`). 256 MiB of
-/// absolute floor covers a profile several times over; it costs that much RAM
-/// once, since the SFS is loaded whole at boot (`-m 4G` on x86_64).
+/// fontconfig caches and the wrapper logs all land here. With the lean
+/// headroom (12.5 % plus 16 MiB) lunarbar showed `disk 95%` one minute after
+/// boot and the image was full two minutes into Firefox (`unused_blocks: 0`).
+/// 256 MiB of absolute floor covers a profile several times over; it costs
+/// that much RAM once, since the SFS is loaded whole at boot (`-m 4G` on
+/// x86_64).
 fn qemu_live_image_size(payload_bytes: u64) -> usize {
     padded_image_size(payload_bytes, 1, 8, 256) as usize
 }
