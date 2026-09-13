@@ -196,9 +196,28 @@ impl PageFlags {
         out
     }
 
-    /// Replace the flags of every page in `range` with `f(old)`. One rebuild
-    /// of the run list, however many pages the range spans.
-    pub fn update_range(&mut self, range: Range<usize>, mut f: impl FnMut(MMUFlags) -> MMUFlags) {
+    /// Scratch space for [`update_range_in`](Self::update_range_in): two
+    /// vectors with this much capacity make the update allocation-free.
+    pub fn scratch_capacity(&self) -> usize {
+        // A range update splits at most two runs, so the list grows by at
+        // most two.
+        self.runs.len() + 2
+    }
+
+    /// Replace the flags of every page in `range` with `f(old)`: one rebuild
+    /// of the run list, however many pages the range spans. The new list is
+    /// built in `scratch` and swapped in, so with `scratch` allocated up
+    /// front (see [`scratch_capacity`](Self::scratch_capacity)) nothing here
+    /// allocates -- `protect` calls this holding the mapping and page-table
+    /// locks, where an allocation failure would halt the CPU with them held
+    /// (#1136). On return `scratch` holds the previous list; drop it with
+    /// the locks released.
+    pub fn update_range_in(
+        &mut self,
+        range: Range<usize>,
+        mut f: impl FnMut(MMUFlags) -> MMUFlags,
+        scratch: &mut (Vec<usize>, Vec<MMUFlags>),
+    ) {
         assert!(
             range.end <= self.len,
             "page range {range:?} out of range for {} pages",
@@ -207,8 +226,9 @@ impl PageFlags {
         if range.is_empty() {
             return;
         }
-        let mut starts = Vec::with_capacity(self.runs.len() + 2);
-        let mut runs: Vec<MMUFlags> = Vec::with_capacity(self.runs.len() + 2);
+        let (starts, runs) = scratch;
+        starts.clear();
+        runs.clear();
         let mut push = |start: usize, flags: MMUFlags| {
             if runs.last() != Some(&flags) {
                 starts.push(start);
@@ -228,8 +248,16 @@ impl PageFlags {
                 push(s.max(range.end), g);
             }
         }
-        self.starts = starts;
-        self.runs = runs;
+        core::mem::swap(&mut self.starts, starts);
+        core::mem::swap(&mut self.runs, runs);
+    }
+
+    /// [`update_range_in`](Self::update_range_in) with its own scratch.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn update_range(&mut self, range: Range<usize>, f: impl FnMut(MMUFlags) -> MMUFlags) {
+        let cap = self.scratch_capacity();
+        let mut scratch = (Vec::with_capacity(cap), Vec::with_capacity(cap));
+        self.update_range_in(range, f, &mut scratch);
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -352,6 +380,27 @@ mod tests {
         check(&c, &model[..6]);
         check(&tail, &[NONE; 6]);
         assert_eq!(tail.run_count(), 1);
+    }
+
+    /// The scratch sized by `scratch_capacity` never has to grow.
+    #[test]
+    fn update_in_place_does_not_grow_scratch() {
+        let mut pf = PageFlags::uniform(R, 100);
+        for (i, f) in [(10usize, RW), (20, RX), (30, NONE), (40, RW)] {
+            pf.set(i, f);
+        }
+        for range in [0..1, 5..50, 99..100, 0..100, 15..16, 45..46] {
+            let cap = pf.scratch_capacity();
+            let mut scratch = (Vec::with_capacity(cap), Vec::with_capacity(cap));
+            pf.update_range_in(range.clone(), |old| old | MMUFlags::USER, &mut scratch);
+            // the previous list came back in `scratch`; the new one grew by at most 2
+            assert!(pf.run_count() <= cap);
+            assert!(pf.starts.capacity() >= pf.run_count());
+            for i in 0..100 {
+                assert_eq!(pf[i].contains(MMUFlags::USER), range.contains(&i) || false);
+            }
+            pf.update_range(0..100, |old| old - MMUFlags::USER);
+        }
     }
 
     /// Random operations against a plain `Vec<MMUFlags>` model.

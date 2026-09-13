@@ -2255,6 +2255,13 @@ impl VmMapping {
     }
 
     fn protect(&self, flags: MMUFlags, start_index: usize, end_index: usize) {
+        // The run-list rebuild below happens under both locks; give it its
+        // scratch NOW, with no lock held, so it cannot fail there. The old
+        // list comes back in `scratch` and is dropped after the guards.
+        let mut scratch = {
+            let cap = self.inner.lock().flags.scratch_capacity();
+            (Vec::with_capacity(cap), Vec::with_capacity(cap))
+        };
         let mut inner = self.inner.lock();
         let mut pg_table = self.page_table.lock();
         // mmu-gather: defer the cross-CPU shootdown to one flush after the
@@ -2270,15 +2277,19 @@ impl VmMapping {
         //
         // One run-list rebuild for the whole range, not a write per page.
         let user = self.permissions.contains(MMUFlags::USER);
-        inner.flags.update_range(start_index..end_index, |old| {
-            let mut new_flags = old;
-            new_flags.remove(MMUFlags::RXW);
-            new_flags.insert(flags & (MMUFlags::RXW | MMUFlags::USER));
-            if user {
-                new_flags.insert(MMUFlags::USER);
-            }
-            new_flags
-        });
+        inner.flags.update_range_in(
+            start_index..end_index,
+            |old| {
+                let mut new_flags = old;
+                new_flags.remove(MMUFlags::RXW);
+                new_flags.insert(flags & (MMUFlags::RXW | MMUFlags::USER));
+                if user {
+                    new_flags.insert(MMUFlags::USER);
+                }
+                new_flags
+            },
+            &mut scratch,
+        );
         for i in start_index..end_index {
             let new_flags = inner.flags[i];
             let va = inner.addr + i * PAGE_SIZE;
