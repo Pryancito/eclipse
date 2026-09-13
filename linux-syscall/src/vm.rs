@@ -602,8 +602,18 @@ impl Syscall<'_> {
                 // `error!`, not `warn!`: the default cmdline is `LOG=error`
                 // (zCore/rboot.conf), so this was invisible on exactly the
                 // configuration people run. And it is not a cosmetic failure --
-                // swallowing it returns 0 to a caller whose permissions did NOT
-                // change. SpiderMonkey's JIT does mmap(PROT_NONE) -> mprotect(RW)
+                // swallowing it returns 0 to a caller whose permissions are not
+                // what it asked for.
+                //
+                // Not necessarily unchanged, either: `VmAddressRegion::protect`
+                // validates coverage and flags up front, but then applies to
+                // overlapping children in a loop with `?`, so a child failing
+                // mid-way leaves the ones before it already changed. A failure
+                // therefore means the transition is INCOMPLETE -- part of the
+                // range may carry the new permissions and part the old -- which
+                // is harder to reason about than a clean no-op, not easier.
+                //
+                // SpiderMonkey's JIT does mmap(PROT_NONE) -> mprotect(RW)
                 // -> write code -> mprotect(RX) -> call it; told the last step
                 // succeeded, it jumps into a page that is still not executable
                 // and takes a user instruction-fetch fault (`err=0x14`, with
@@ -616,9 +626,9 @@ impl Syscall<'_> {
                 // ACCESS_DENIED means a mapping's max permissions forbid the
                 // transition. Print it rather than infer it.
                 error!(
-                    "mprotect: addr={:#x} len={:#x} flags={:?} → {:?} — returning success \
-                     WITHOUT changing permissions; a caller that now executes or writes this \
-                     range will fault",
+                    "mprotect: addr={:#x} len={:#x} flags={:?} → {:?} — returning success on an \
+                     INCOMPLETE transition; part of the range may still hold the old \
+                     permissions, and a caller that now executes or writes it will fault",
                     addr, len, flags, e
                 );
                 Ok(0)
