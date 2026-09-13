@@ -92,6 +92,37 @@ pub trait VMObjectTrait: Sync + Send {
     /// Remove a mapping from the VMO's mapping list.
     fn remove_mapping(&self, _mapping: Weak<VmMapping>) {}
 
+    /// Whether this object is demand-paged from a file or memfd (it has a
+    /// `FrameFiller` source). Such an object is a shared page cache: other
+    /// mappings and `read(2)` see its pages, so they are never zeroed by one
+    /// mapping's `madvise` and a read fault never maps the global zero page.
+    fn is_file_backed(&self) -> bool {
+        false
+    }
+
+    /// Whether this object borrows clean pages from a file page cache (the
+    /// `MAP_PRIVATE` file-mapping shape).
+    fn is_borrower(&self) -> bool {
+        false
+    }
+
+    /// Mark the object as shared between address spaces (Linux `MAP_SHARED`
+    /// anonymous memory across `fork`, or a file/memfd page cache): a read
+    /// fault must then commit a real page, because a PTE to the global zero
+    /// page in one mapping would never see a later write made through
+    /// another; and `madvise(DONTNEED)` from one mapping must not touch the
+    /// pages.
+    fn set_shared(&self) {}
+
+    /// Whether [`set_shared`](Self::set_shared) was called.
+    fn is_shared(&self) -> bool {
+        false
+    }
+
+    /// A mapping of a borrower of this page cache, with the cache page its
+    /// page 0 borrows. The cache unmaps it when it decommits those pages.
+    fn register_borrower_mapping(&self, _mapping: Weak<VmMapping>, _base_page: usize) {}
+
     /// Complete the VmoInfo.
     fn complete_info(&self, info: &mut VmoInfo);
 
@@ -361,6 +392,30 @@ impl VmObject {
             share_on_fork: core::sync::atomic::AtomicBool::new(false),
             unbounded: false,
             trait_: VMObjectPaged::new_with_source(pages, source),
+            inner: Mutex::new(VmObjectInner::default()),
+            base,
+        })
+    }
+
+    /// The per-inode PAGE CACHE: like [`new_paged_with_source`](Self::new_paged_with_source)
+    /// but resizable, so a file that grows after it was first mapped keeps one
+    /// cache (a later, longer mapping extends it) instead of a private
+    /// snapshot that no other mapper or `read(2)` sees. It only ever grows:
+    /// borrowers capture its length at borrow time and stay within it.
+    pub fn new_paged_cache(pages: usize, source: Arc<dyn FrameFiller>) -> Arc<Self> {
+        let base = KObjectBase::with_signal(Signal::VMO_ZERO_CHILDREN);
+        let trait_ = VMObjectPaged::new_with_source(pages, source);
+        // Every mapper and `read(2)` see these pages: shared semantics
+        // (real page on a read fault, untouched by one mapping's DONTNEED).
+        trait_.set_shared();
+        Arc::new(VmObject {
+            resizable: true,
+            _counter: CountHelper::new(),
+            kind: account_new(VmoKind::PagedSource, pages * PAGE_SIZE),
+            accounted_bytes: pages * PAGE_SIZE,
+            share_on_fork: core::sync::atomic::AtomicBool::new(false),
+            unbounded: false,
+            trait_,
             inner: Mutex::new(VmObjectInner::default()),
             base,
         })
@@ -669,6 +724,33 @@ impl VmObject {
     pub fn set_share_on_fork(&self) {
         self.share_on_fork
             .store(true, core::sync::atomic::Ordering::Relaxed);
+        self.trait_.set_shared();
+    }
+
+    /// Whether other mappings, `read(2)` or a device can observe this
+    /// object's pages: a shared-on-fork object, a file/memfd page cache, or
+    /// physical/contiguous memory (a framebuffer, a GEM buffer).
+    pub fn is_shared_object(&self) -> bool {
+        self.is_share_on_fork()
+            || self.trait_.is_shared()
+            || self.is_physical()
+            || self.is_contiguous()
+    }
+
+    /// Whether this object borrows clean pages from a file page cache.
+    pub fn is_borrower(&self) -> bool {
+        self.trait_.is_borrower()
+    }
+
+    /// Whether this object is demand-paged from a file (a page cache or a
+    /// private snapshot of one).
+    pub fn is_file_backed(&self) -> bool {
+        self.trait_.is_file_backed()
+    }
+
+    /// See [`VMObjectTrait::register_borrower_mapping`].
+    pub fn register_borrower_mapping(&self, mapping: Weak<VmMapping>, base_page: usize) {
+        self.trait_.register_borrower_mapping(mapping, base_page);
     }
 
     /// Whether `fork` must share this object rather than copy it.

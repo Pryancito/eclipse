@@ -519,6 +519,7 @@ impl Syscall<'_> {
         inode
             .resize(len)
             .map_err(|e| linux_object::fs::fs_grow_error(&inode, e))?;
+        linux_object::fs::cache_truncate(&inode, len);
         Ok(0)
     }
 

@@ -2358,9 +2358,23 @@ impl VmMapping {
         };
         // Never zero a shared object (MAP_SHARED / wl_shm): that is another
         // process's live data, not this caller's private scratch.
-        if self.vmo.share_count() > 1 {
-            return;
-        }
+        // What DONTNEED may discard depends on who else can see the pages:
+        //
+        // * a shared object (a file/memfd page cache, or anonymous memory
+        //   shared across fork) is other mappers' data and the file's own
+        //   contents: only this mapping's PTEs go, the pages stay (Linux
+        //   drops the PTEs of a shared file mapping and re-faults the page
+        //   cache). Zeroing it in place wiped a memfd for every mapper as
+        //   soon as one mapping said DONTNEED (`firefox-probe`);
+        // * a MAP_PRIVATE file mapping (a borrower, or a private snapshot)
+        //   drops its private copies and re-reads the file on the next fault;
+        // * only private anonymous memory is zeroed in place, which is what
+        //   mimalloc / mozjemalloc rely on (see `sys_madvise`).
+        //
+        // `share_count` is kept as a second guard for objects mapped more
+        // than once; it only ever grows, so it errs towards "shared".
+        let shared = self.vmo.is_shared_object() || self.vmo.share_count() > 1;
+        let discard = !shared && (self.vmo.is_borrower() || self.vmo.is_file_backed());
         let mut va = round_down_pages(begin.max(map_addr));
         let end = round_down_pages(end);
         while va < end {
@@ -2368,8 +2382,12 @@ impl VmMapping {
             // (1) Zero the frame the VMO currently owns for this page. This
             //     reaches a committed page whose PTE was dropped / turned
             //     PROT_NONE, which a page-table walk cannot see.
-            if let Some(pa) = self.vmo.committed_paddr(vmo_page) {
-                kernel_hal::mem::pmem_zero(pa, PAGE_SIZE);
+            if discard {
+                let _ = self.vmo.decommit(vmo_page * PAGE_SIZE, PAGE_SIZE);
+            } else if !shared {
+                if let Some(pa) = self.vmo.committed_paddr(vmo_page) {
+                    kernel_hal::mem::pmem_zero(pa, PAGE_SIZE);
+                }
             }
             // (2) Drop the PTE — but NOT the frame. The abort actually came from
             //     a STALE TRANSLATION: the page table still maps this VA to a
@@ -2438,14 +2456,19 @@ impl VmMapping {
         // If we are already locked, we are handling page fault/map range
         // In this case we can just ignore the operation since we will update the mapping later
         if let Some(inner) = inner {
-            let start = offset.max(inner.vmo_offset);
-            let end = (inner.vmo_offset + inner.size / PAGE_SIZE).min(offset + len);
+            // `offset`/`len` are VMO PAGES; `vmo_offset` is bytes. Mixing the
+            // two used to clip every mapping with a non-zero file offset out
+            // of the notification, so its PTEs kept pointing at frames the
+            // VMO had already replaced or freed.
+            let vmo_page = inner.vmo_offset / PAGE_SIZE;
+            let start = offset.max(vmo_page);
+            let end = (vmo_page + inner.size / PAGE_SIZE).min(offset + len);
             if !(start..end).is_empty() {
                 let mut pg_table = self.page_table.lock();
                 // mmu-gather: one cross-CPU shootdown for the whole range
                 // (see `protect` above); per-page synchronous shootdowns
                 // livelock when a peer CPU can't ack.
-                for i in (start - inner.vmo_offset)..(end - inner.vmo_offset) {
+                for i in (start - vmo_page)..(end - vmo_page) {
                     match op {
                         RangeChangeOp::RemoveWrite => {
                             let mut new_flag = inner.flags[i];
@@ -3228,6 +3251,65 @@ mod tests {
         unsafe {
             assert_eq!((vmar.addr() as *const u8).read(), 2);
         }
+    }
+
+    /// A decommitted page is gone for every mapper: the object's own mapping
+    /// and a borrower's both re-fault into a fresh zero page afterwards (the
+    /// libOS page table cannot be queried, so the effect is observed through
+    /// the mappings themselves, the way `copy_on_write_update_mapping` does).
+    #[test]
+    fn decommit_unmaps_every_mapping() {
+        let vmar = VmAddressRegion::new_root();
+        let vmo = VmObject::new_paged(2);
+        vmo.test_write(1, 7);
+        vmar.map_at(0, vmo.clone(), 0, 2 * PAGE_SIZE, MMUFlags::RXW)
+            .unwrap();
+        let addr = vmar.addr() + PAGE_SIZE;
+        vmar.handle_page_fault(addr, MMUFlags::READ).unwrap();
+        unsafe {
+            assert_eq!((addr as *const u8).read(), 7);
+        }
+        // A borrower over the same object, mapped and faulted too.
+        let borrower = VmObject::new_paged_borrowing(2, vmo.clone(), 0);
+        vmar.map_at(
+            4 * PAGE_SIZE,
+            borrower.clone(),
+            0,
+            2 * PAGE_SIZE,
+            MMUFlags::READ,
+        )
+        .unwrap();
+        let baddr = vmar.addr() + 5 * PAGE_SIZE;
+        vmar.handle_page_fault(baddr, MMUFlags::READ).unwrap();
+        unsafe {
+            assert_eq!(
+                (baddr as *const u8).read(),
+                7,
+                "the borrower reads the cache's frame"
+            );
+        }
+
+        vmo.decommit(PAGE_SIZE, PAGE_SIZE).unwrap();
+        assert!(vmo.committed_paddr(1).is_none());
+        // Both mappings were told to drop the page; a new fault brings a
+        // fresh zero page, not the freed frame's bytes.
+        vmar.handle_page_fault(addr, MMUFlags::READ).unwrap();
+        unsafe {
+            assert_eq!(
+                (addr as *const u8).read(),
+                0,
+                "own mapping still saw the freed frame"
+            );
+        }
+        vmar.handle_page_fault(baddr, MMUFlags::READ).unwrap();
+        unsafe {
+            assert_eq!(
+                (baddr as *const u8).read(),
+                0,
+                "borrower still saw the freed frame"
+            );
+        }
+        assert_eq!(vmo.test_read(1), 0);
     }
 
     #[test]
