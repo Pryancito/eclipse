@@ -279,6 +279,7 @@ impl Syscall<'_> {
             if flags.contains(OpenFlags::TRUNCATE) && metadata.type_ == FileType::File {
                 proc.check_access(&metadata, 0o2, true)?;
                 inode.resize(0)?;
+                linux_object::fs::cache_truncate(&inode, 0);
             }
             // `/dev/ptmx` is a cloning device: each open allocates a fresh PTY
             // master (and publishes its slave at `/dev/pts/N`). Prefer the

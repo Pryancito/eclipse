@@ -121,9 +121,12 @@ struct FileFrameFiller {
     inode: Arc<dyn INode>,
     /// File offset that VMO offset 0 maps to.
     file_offset: usize,
-    /// Number of readable bytes from `file_offset` within the mapping. Pages
-    /// past this are left zero (the BSS tail of the mapping).
-    source_len: usize,
+    /// Upper bound on the readable bytes from `file_offset` (the mapping
+    /// length for a private snapshot; unbounded for the page cache). The
+    /// readable length itself is the inode's CURRENT size, read at fill time:
+    /// a length frozen at creation left every page a file gained afterwards
+    /// (ftruncate, write past EOF) reading as zero forever.
+    max_len: usize,
 }
 
 /// Per-inode file-VMO registry — the PAGE CACHE. Entry: `(cache VMO, weak
@@ -287,7 +290,13 @@ fn inode_cache_vmo(
     prune_shared_vmos(&mut registry);
     if let Some((vmo, inode_weak, ever_shared)) = registry.get_mut(&key) {
         if offset + len > vmo.len() {
-            return None;
+            // The file grew since the cache was made: grow the cache, so the
+            // new window shares the very same pages as every earlier mapper
+            // and `read(2)`. The old fallback (a private snapshot) was what
+            // made a mapping of a grown memfd read zeros for its head.
+            if vmo.set_len(offset + len).is_err() {
+                return None;
+            }
         }
         if mark_shared {
             *ever_shared = true;
@@ -305,12 +314,92 @@ fn inode_cache_vmo(
     let source: Arc<dyn zircon_object::vm::FrameFiller> = Arc::new(FileFrameFiller {
         inode: inode.clone(),
         file_offset: 0,
-        source_len: file_size,
+        max_len: usize::MAX,
     });
-    let vmo = VmObject::new_paged_with_source(pages(vmo_len), source);
+    let vmo = VmObject::new_paged_cache(pages(vmo_len), source);
     vmo.set_name(path);
     registry.insert(key, (vmo.clone(), Arc::downgrade(inode), mark_shared));
     Some(vmo)
+}
+
+/// The page cache of `inode`, if one exists. Never creates one.
+fn cache_vmo_of(inode: &Arc<dyn INode>) -> Option<Arc<VmObject>> {
+    SHARED_FILE_VMOS
+        .lock()
+        .get(&cache_key(inode))
+        .map(|(vmo, _, _)| vmo.clone())
+}
+
+/// `read(2)`/`pread(2)` on a file with a live page cache: bytes already
+/// faulted into the cache -- and possibly written through a `MAP_SHARED`
+/// mapping -- must be what the read returns. `buf` holds what the inode gave
+/// for `[offset, offset + buf.len())`; every page the cache has committed
+/// overrides it. Uncommitted pages are the inode's, so they are left alone.
+///
+/// Without this, mmap and read were two copies of the file: a store through
+/// a mapping was invisible to `pread` until the cache was evicted
+/// (`firefox-probe`: "pread() sees stores made through a mapping").
+pub(crate) fn cache_overlay_read(inode: &Arc<dyn INode>, offset: usize, buf: &mut [u8]) {
+    if buf.is_empty() {
+        return;
+    }
+    let Some(vmo) = cache_vmo_of(inode) else {
+        return;
+    };
+    let end = offset + buf.len();
+    let last = (end - 1) / PAGE_SIZE;
+    for page in offset / PAGE_SIZE..=last {
+        if page * PAGE_SIZE >= vmo.len() || vmo.committed_paddr(page).is_none() {
+            continue;
+        }
+        let s = (page * PAGE_SIZE).max(offset);
+        let e = ((page + 1) * PAGE_SIZE).min(end);
+        let _ = vmo.read(s, &mut buf[s - offset..e - offset]);
+    }
+}
+
+/// `write(2)`/`pwrite(2)` on a file with a live page cache: the bytes went to
+/// the inode; copy them into every cache page that is already committed, so
+/// mappings that faulted those pages see the write. Pages not yet committed
+/// fill from the inode on their first fault and need nothing.
+pub(crate) fn cache_overlay_write(inode: &Arc<dyn INode>, offset: usize, buf: &[u8]) {
+    if buf.is_empty() {
+        return;
+    }
+    let Some(vmo) = cache_vmo_of(inode) else {
+        return;
+    };
+    let end = offset + buf.len();
+    let last = (end - 1) / PAGE_SIZE;
+    for page in offset / PAGE_SIZE..=last {
+        if page * PAGE_SIZE >= vmo.len() || vmo.committed_paddr(page).is_none() {
+            continue;
+        }
+        let s = (page * PAGE_SIZE).max(offset);
+        let e = ((page + 1) * PAGE_SIZE).min(end);
+        let _ = vmo.write(s, &buf[s - offset..e - offset]);
+    }
+}
+
+/// The file was resized to `new_len` (ftruncate, O_TRUNC, truncate): drop
+/// every cached page past the new end, and zero the tail of the last kept
+/// page, exactly as the inode does. Otherwise the cache kept serving the old
+/// bytes to mappings, and -- worse -- eviction-time writeback copied them
+/// back over a file that had been rewritten in the meantime
+/// (`firefox-probe`: "O_TRUNC rewrite of a once-mapped file survives").
+pub fn cache_truncate(inode: &Arc<dyn INode>, new_len: usize) {
+    let Some(vmo) = cache_vmo_of(inode) else {
+        return;
+    };
+    let keep = new_len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+    if keep < vmo.len() {
+        let _ = vmo.decommit(keep, vmo.len() - keep);
+    }
+    let tail = keep - new_len;
+    if tail > 0 && vmo.committed_paddr(new_len / PAGE_SIZE).is_some() {
+        let zeros = [0u8; PAGE_SIZE];
+        let _ = vmo.write(new_len, &zeros[..tail]);
+    }
 }
 
 fn prune_shared_vmos(registry: &mut SharedVmoMap) {
@@ -383,14 +472,16 @@ fn writeback_shared_vmo(vmo: &Arc<VmObject>, inode: &Arc<dyn INode>) {
 
 impl zircon_object::vm::FrameFiller for FileFrameFiller {
     fn source_len(&self) -> usize {
-        self.source_len
+        let size = self.inode.metadata().map(|m| m.size).unwrap_or(0);
+        size.saturating_sub(self.file_offset).min(self.max_len)
     }
 
     fn fill_page(&self, offset: usize, buf: &mut [u8]) {
-        if offset >= self.source_len {
+        let source_len = self.source_len();
+        if offset >= source_len {
             return;
         }
-        let want = (self.source_len - offset).min(buf.len());
+        let want = (source_len - offset).min(buf.len());
         let file_pos = self.file_offset + offset;
         let mut done = 0;
         while done < want {
@@ -434,9 +525,12 @@ impl FileInner {
         if !crate::fs::memfd_write_allowed(&self.inode) {
             return Err(LxError::EPERM);
         }
-        self.inode
+        let n = self
+            .inode
             .write_at(offset as usize, buf)
-            .map_err(|e| fs_grow_error(&self.inode, e))
+            .map_err(|e| fs_grow_error(&self.inode, e))?;
+        cache_overlay_write(&self.inode, offset as usize, &buf[..n]);
+        Ok(n)
     }
 }
 
@@ -538,6 +632,7 @@ impl File {
             .inode
             .resize(len as usize)
             .map_err(|e| fs_grow_error(&inner.inode, e))?;
+        cache_truncate(&inner.inode, len as usize);
         Ok(())
     }
 
@@ -686,6 +781,7 @@ impl FileLike for File {
         } else {
             inode.read_at(offset as usize, buf)?
         };
+        cache_overlay_read(&inode, offset as usize, &mut buf[..len]);
 
         let mut inner = self.inner.write();
         inner.offset += len as u64;
@@ -727,7 +823,10 @@ impl FileLike for File {
             // block
             loop {
                 match inode.read_at(offset as usize, buf) {
-                    Ok(read_len) => return Ok(read_len),
+                    Ok(read_len) => {
+                        cache_overlay_read(&inode, offset as usize, &mut buf[..read_len]);
+                        return Ok(read_len);
+                    }
                     Err(FsError::Again) => {
                         use super::devfs::DrmDev;
                         if inode.downcast_ref::<DrmDev>().is_some() {
@@ -742,6 +841,7 @@ impl FileLike for File {
             }
         }
         let len = inode.read_at(offset as usize, buf)?;
+        cache_overlay_read(&inode, offset as usize, &mut buf[..len]);
         Ok(len)
     }
 
@@ -925,7 +1025,7 @@ impl FileLike for File {
                 let source: Arc<dyn zircon_object::vm::FrameFiller> = Arc::new(FileFrameFiller {
                     inode: inner.inode.clone(),
                     file_offset: offset,
-                    source_len,
+                    max_len: len,
                 });
                 // Name the VMO after the file it is paged from. The name is what
                 // `/proc/<pid>/maps` shows, and what turns a bare crash address

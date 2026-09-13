@@ -105,7 +105,7 @@ pub fn drm_fd_desc(f: &alloc::sync::Arc<dyn FileLike>) -> Option<alloc::string::
     None
 }
 pub use eventfd::EventFd;
-pub use file::{fs_grow_error, File, OpenFlags, PollEvents, SeekFrom};
+pub use file::{cache_truncate, fs_grow_error, File, OpenFlags, PollEvents, SeekFrom};
 pub use inotify::Inotify;
 pub use perf::{sample_user as perf_sample_user, PerfEvent};
 pub use pidfd::{PidFd, PIDFD_THREAD};
@@ -2118,6 +2118,75 @@ pub fn split_path(path: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::split_path;
+
+    /// The page cache IS the file: what a `MAP_SHARED` mapping stores,
+    /// `read(2)` returns; what `write(2)` stores, mappings see; the cache
+    /// grows with the file and forgets what truncate removed. These are the
+    /// `firefox-probe` "mapping coherence" checks that all failed in the guest.
+    #[async_std::test]
+    async fn page_cache_is_the_file() {
+        use super::{new_memfd, FileLike};
+        use alloc::sync::Arc;
+        let f = new_memfd("coherence", 0).unwrap();
+        f.set_len(3 * 4096).unwrap();
+        let (vmo, off) = f.get_vmo_shared(0, 3 * 4096).unwrap();
+        assert_eq!(off, 0);
+        // A store through the mapping is what pread must return.
+        vmo.write(100, &[0x5a]).unwrap();
+        let mut b = [0u8; 1];
+        assert_eq!(f.read_at(100, &mut b).await.unwrap(), 1);
+        assert_eq!(b[0], 0x5a, "pread must see a mapping store");
+        // Page 1 not yet faulted: the write goes to the inode and the first
+        // fault fills from it.
+        f.write_at(4096, &[0x77]).unwrap();
+        let mut c = [0u8; 1];
+        vmo.read(4096, &mut c).unwrap();
+        assert_eq!(c[0], 0x77);
+        // Now the page is committed: pwrite must land in it.
+        f.write_at(4096, &[0x78]).unwrap();
+        vmo.read(4096, &mut c).unwrap();
+        assert_eq!(
+            c[0], 0x78,
+            "a mapping must see a pwrite into a faulted page"
+        );
+        // Growth keeps ONE cache: a longer mapping extends it.
+        f.set_len(64 * 4096).unwrap();
+        let (vmo2, _) = f.get_vmo_shared(0, 64 * 4096).unwrap();
+        assert!(
+            Arc::ptr_eq(&vmo, &vmo2),
+            "a longer mapping must extend the cache, not snapshot it"
+        );
+        assert!(vmo2.len() >= 64 * 4096);
+        vmo2.read(100, &mut b).unwrap();
+        assert_eq!(b[0], 0x5a);
+        vmo2.write(40 * 4096, &[0x99]).unwrap();
+        assert_eq!(f.read_at(40 * 4096, &mut b).await.unwrap(), 1);
+        assert_eq!(b[0], 0x99, "pread must see a store into the grown tail");
+        // Truncate forgets cached pages; nothing comes back after a regrow.
+        f.set_len(0).unwrap();
+        assert_eq!(vmo.committed_pages_in_range(0, 64), 0);
+        f.set_len(4096).unwrap();
+        vmo.read(100, &mut b).unwrap();
+        assert_eq!(b[0], 0, "nothing comes back from before the truncate");
+    }
+
+    /// A read fault on a shared object commits a real page (so a later write
+    /// through another mapping is seen); a private one still gets the global
+    /// zero frame.
+    #[test]
+    fn shared_object_read_fault_commits_a_page() {
+        use kernel_hal::MMUFlags;
+        use zircon_object::vm::VmObject;
+        let private = VmObject::new_paged(2);
+        let p = private.commit_page(0, MMUFlags::READ).unwrap();
+        assert_eq!(p, kernel_hal::mem::ZERO_FRAME.paddr());
+        assert!(private.committed_paddr(0).is_none());
+        let shared = VmObject::new_paged(2);
+        shared.set_share_on_fork();
+        let q = shared.commit_page(0, MMUFlags::READ).unwrap();
+        assert_ne!(q, kernel_hal::mem::ZERO_FRAME.paddr());
+        assert_eq!(shared.committed_paddr(0), Some(q));
+    }
 
     #[test]
     fn split_paths() {

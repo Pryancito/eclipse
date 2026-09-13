@@ -142,6 +142,9 @@ pub struct VMObjectPaged {
     /// This lock is shared between objects in the same clone tree to avoid deadlock
     lock: Arc<Mutex<()>>,
     inner: RefCell<VMObjectPagedInner>,
+    /// Linux `MAP_SHARED` anonymous memory shared across `fork` (see
+    /// `VMObjectTrait::set_shared`).
+    shared: core::sync::atomic::AtomicBool,
 }
 
 /// We always lock the lock before access to the Refcell, so it is actually sync
@@ -423,9 +426,35 @@ impl VMObjectPaged {
         let obj = Arc::new(VMObjectPaged {
             lock: lock_ref.unwrap_or_else(|| Arc::new(Mutex::new(()))),
             inner: RefCell::new(inner),
+            shared: core::sync::atomic::AtomicBool::new(false),
         });
         obj.inner.borrow_mut().self_ref = Arc::downgrade(&obj);
         obj
+    }
+
+    /// A leaf whose pages other mappings or `read(2)` can observe: shared
+    /// across `fork`, or a file/memfd page cache (`source`). Borrowers are
+    /// private and keep their copy-on-read semantics.
+    fn is_shared_leaf(&self, inner: &VMObjectPagedInner) -> bool {
+        self.shared.load(core::sync::atomic::Ordering::Relaxed) || inner.source.is_some()
+    }
+
+    /// On a shared leaf a read fault must commit a REAL page. The plain path
+    /// hands a read of an uncommitted page the global zero frame without
+    /// recording anything; the PTE then points at the zero frame for good,
+    /// and the first write -- from another mapping, another process after
+    /// `fork`, or `pwrite(2)` -- lands in a fresh frame this mapping never
+    /// sees (`firefox-probe`: "parent sees the child's writes to shared
+    /// anonymous pages it had only READ" and the grown-memfd cases). Asking
+    /// for WRITE on a root leaf allocates and inserts the page (filled from
+    /// the source when inside it) and returns it; it does not change how the
+    /// fault handler maps it.
+    fn shared_commit_flags(&self, inner: &VMObjectPagedInner, flags: MMUFlags) -> MMUFlags {
+        if self.is_shared_leaf(inner) {
+            flags | MMUFlags::WRITE
+        } else {
+            flags
+        }
     }
 
     /// get the reference to inner by lock the shared lock
@@ -782,7 +811,9 @@ impl VMObjectTrait for VMObjectPaged {
     }
 
     fn commit_page(&self, page_idx: usize, flags: MMUFlags) -> ZxResult<PhysAddr> {
-        self.get_inner_mut().commit_page(page_idx, flags)
+        let mut inner = self.get_inner_mut();
+        let flags = self.shared_commit_flags(&inner, flags);
+        inner.commit_page(page_idx, flags)
     }
 
     fn commit_pages_with(
@@ -790,7 +821,15 @@ impl VMObjectTrait for VMObjectPaged {
         f: &mut dyn FnMut(&mut dyn FnMut(usize, MMUFlags) -> ZxResult<PhysAddr>) -> ZxResult,
     ) -> ZxResult {
         let mut inner = self.get_inner_mut();
-        f(&mut |page_idx, flags| inner.commit_page(page_idx, flags))
+        let shared = self.is_shared_leaf(&inner);
+        f(&mut |page_idx, flags| {
+            let flags = if shared {
+                flags | MMUFlags::WRITE
+            } else {
+                flags
+            };
+            inner.commit_page(page_idx, flags)
+        })
     }
 
     fn commit(&self, offset: usize, len: usize) -> ZxResult {
@@ -826,6 +865,19 @@ impl VMObjectTrait for VMObjectPaged {
 
     fn append_mapping(&self, mapping: Weak<VmMapping>) {
         self.get_inner_mut().mappings.push(mapping);
+    }
+
+    fn is_file_backed(&self) -> bool {
+        self.get_inner().source.is_some()
+    }
+
+    fn is_borrower(&self) -> bool {
+        self.get_inner().cache.is_some()
+    }
+
+    fn set_shared(&self) {
+        self.shared
+            .store(true, core::sync::atomic::Ordering::Relaxed);
     }
 
     fn remove_mapping(&self, mapping: Weak<VmMapping>) {

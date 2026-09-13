@@ -2358,9 +2358,23 @@ impl VmMapping {
         };
         // Never zero a shared object (MAP_SHARED / wl_shm): that is another
         // process's live data, not this caller's private scratch.
-        if self.vmo.share_count() > 1 {
-            return;
-        }
+        // What DONTNEED may discard depends on who else can see the pages:
+        //
+        // * a shared object (a file/memfd page cache, or anonymous memory
+        //   shared across fork) is other mappers' data and the file's own
+        //   contents: only this mapping's PTEs go, the pages stay (Linux
+        //   drops the PTEs of a shared file mapping and re-faults the page
+        //   cache). Zeroing it in place wiped a memfd for every mapper as
+        //   soon as one mapping said DONTNEED (`firefox-probe`);
+        // * a MAP_PRIVATE file mapping drops its private copies and borrows
+        //   the clean page again on the next fault;
+        // * only private anonymous memory is zeroed in place, which is what
+        //   mimalloc / mozjemalloc rely on (see `sys_madvise`).
+        //
+        // `share_count` is kept as a second guard for objects mapped more
+        // than once; it only ever grows, so it errs towards "shared".
+        let shared = self.vmo.is_shared_object() || self.vmo.share_count() > 1;
+        let borrower = !shared && self.vmo.is_borrower();
         let mut va = round_down_pages(begin.max(map_addr));
         let end = round_down_pages(end);
         while va < end {
@@ -2368,8 +2382,12 @@ impl VmMapping {
             // (1) Zero the frame the VMO currently owns for this page. This
             //     reaches a committed page whose PTE was dropped / turned
             //     PROT_NONE, which a page-table walk cannot see.
-            if let Some(pa) = self.vmo.committed_paddr(vmo_page) {
-                kernel_hal::mem::pmem_zero(pa, PAGE_SIZE);
+            if borrower {
+                let _ = self.vmo.decommit(vmo_page * PAGE_SIZE, PAGE_SIZE);
+            } else if !shared {
+                if let Some(pa) = self.vmo.committed_paddr(vmo_page) {
+                    kernel_hal::mem::pmem_zero(pa, PAGE_SIZE);
+                }
             }
             // (2) Drop the PTE — but NOT the frame. The abort actually came from
             //     a STALE TRANSLATION: the page table still maps this VA to a
