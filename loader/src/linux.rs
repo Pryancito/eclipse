@@ -858,22 +858,46 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
             // Bounded to the first few DISTINCT addresses: an exec fault is
             // rare, but a loop faulting on one address would otherwise flood a
             // serial console at `error!`.
+            //
+            // Only ANONYMOUS mappings (or a fault that fails) claim a slot. The
+            // first run of this report showed the eight slots gone by t=15s to
+            // pulseaudio demand-paging libogg, libvorbis, libFLAC... -- the
+            // ordinary first touch of a shared library's text, each resolved
+            // -- and Firefox's JIT fault never got a line. File-backed text
+            // faulting in and resolving is the normal case, not the question.
             let fault_result = vmar.handle_page_fault(vaddr, flags);
             if flags.contains(kernel_hal::MMUFlags::EXECUTE) {
                 use core::sync::atomic::{AtomicUsize, Ordering};
                 const SLOTS: usize = 8;
                 static SEEN: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
-                let fresh = SEEN.iter().all(|s| s.load(Ordering::Relaxed) != vaddr)
+                // Cheap tests first: `describe_addr` walks and clones the
+                // mapping list, which must not run on every resolved text
+                // fault of every shared library. Once the slots are full,
+                // or the address was seen, nothing below runs at all.
+                let unseen = SEEN.iter().all(|s| s.load(Ordering::Relaxed) != vaddr);
+                let has_slot = SEEN.iter().any(|s| s.load(Ordering::Relaxed) == 0);
+                let at = if fault_result.is_err() || (unseen && has_slot) {
+                    Some(describe_addr(&vmar, vaddr))
+                } else {
+                    None
+                };
+                let interesting = match &at {
+                    Some(at) => fault_result.is_err() || at.starts_with("anon+"),
+                    None => false,
+                };
+                let fresh = interesting
+                    && unseen
                     && SEEN.iter().any(|s| {
                         s.compare_exchange(0, vaddr, Ordering::AcqRel, Ordering::Relaxed)
                             .is_ok()
                     });
                 if fresh {
+                    let at = at.unwrap_or_default();
                     error!(
                         "[xfault] user instruction-fetch fault @ {:#x} [{}] flags={:?} \
                          resolved={} pid={} proc={} pc={:#x} [{}]",
                         vaddr,
-                        describe_addr(&vmar, vaddr),
+                        at,
                         flags,
                         fault_result.is_ok(),
                         pid,

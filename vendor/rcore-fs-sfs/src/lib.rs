@@ -230,40 +230,91 @@ impl INodeImpl {
                 self.disk_inode.write().size = len as u32;
             }
             Ordering::Greater => {
-                let mut disk_inode = self.disk_inode.write();
-                disk_inode.blocks = blocks;
-                // allocate indirect block if needed
-                if old_blocks < MAX_NBLOCK_DIRECT as u32 && blocks >= MAX_NBLOCK_DIRECT as u32 {
-                    disk_inode.indirect = self.fs.alloc_block().ok_or(FsError::NoDeviceSpace)? as u32;
-                }
-                // allocate double indirect block if needed
-                if blocks >= MAX_NBLOCK_INDIRECT as u32 {
-                    if disk_inode.db_indirect == 0 {
-                        disk_inode.db_indirect =
+                // Growing allocates several things -- an indirect block, a
+                // double-indirect block, its per-slab tables, and the data
+                // blocks -- and any of them can fail with NoDeviceSpace once
+                // the image is full. Upstream panicked there. Returning an
+                // error instead is only correct if the inode is left EXACTLY
+                // as it was: with `blocks` already raised, the slots that got
+                // no id read back as 0 (the superblock) or stale entries, and
+                // the next read/free of them corrupts the image or trips the
+                // free_map assert. So everything allocated is recorded and
+                // undone on failure.
+                let mut new_indirect = false;
+                let mut new_db_indirect = false;
+                let mut new_tables: Vec<u32> = Vec::new();
+                // Data slots [old_blocks, assigned) hold a real block id.
+                let mut assigned = old_blocks;
+                let result: vfs::Result<()> = (|| {
+                    let mut disk_inode = self.disk_inode.write();
+                    disk_inode.blocks = blocks;
+                    // allocate indirect block if needed
+                    if old_blocks < MAX_NBLOCK_DIRECT as u32 && blocks >= MAX_NBLOCK_DIRECT as u32 {
+                        disk_inode.indirect =
                             self.fs.alloc_block().ok_or(FsError::NoDeviceSpace)? as u32;
+                        new_indirect = true;
                     }
-                    let indirect_begin = {
-                        if (old_blocks as usize) < MAX_NBLOCK_INDIRECT {
-                            0
-                        } else {
-                            (old_blocks as usize - MAX_NBLOCK_INDIRECT) / BLK_NENTRY + 1
+                    // allocate double indirect block if needed
+                    if blocks >= MAX_NBLOCK_INDIRECT as u32 {
+                        if disk_inode.db_indirect == 0 {
+                            disk_inode.db_indirect =
+                                self.fs.alloc_block().ok_or(FsError::NoDeviceSpace)? as u32;
+                            new_db_indirect = true;
                         }
-                    };
-                    let indirect_end = (blocks as usize - MAX_NBLOCK_INDIRECT) / BLK_NENTRY + 1;
-                    for i in indirect_begin..indirect_end {
-                        let indirect = self.fs.alloc_block().ok_or(FsError::NoDeviceSpace)? as u32;
-                        self.fs.device.write_block(
-                            disk_inode.db_indirect as usize,
-                            ENTRY_SIZE * i,
-                            indirect.as_buf(),
-                        )?;
+                        let indirect_begin = {
+                            if (old_blocks as usize) < MAX_NBLOCK_INDIRECT {
+                                0
+                            } else {
+                                (old_blocks as usize - MAX_NBLOCK_INDIRECT) / BLK_NENTRY + 1
+                            }
+                        };
+                        let indirect_end = (blocks as usize - MAX_NBLOCK_INDIRECT) / BLK_NENTRY + 1;
+                        for i in indirect_begin..indirect_end {
+                            let indirect =
+                                self.fs.alloc_block().ok_or(FsError::NoDeviceSpace)? as u32;
+                            new_tables.push(indirect);
+                            self.fs.device.write_block(
+                                disk_inode.db_indirect as usize,
+                                ENTRY_SIZE * i,
+                                indirect.as_buf(),
+                            )?;
+                        }
                     }
-                }
-                drop(disk_inode);
-                // allocate extra blocks
-                for i in old_blocks..blocks {
-                    let disk_block_id = self.fs.alloc_block().ok_or(FsError::NoDeviceSpace)?;
-                    self.set_disk_block_id(i as usize, disk_block_id)?;
+                    drop(disk_inode);
+                    // allocate extra blocks
+                    for i in old_blocks..blocks {
+                        let disk_block_id = self.fs.alloc_block().ok_or(FsError::NoDeviceSpace)?;
+                        if let Err(e) = self.set_disk_block_id(i as usize, disk_block_id) {
+                            self.fs.free_block(disk_block_id);
+                            return Err(e);
+                        }
+                        assigned = i + 1;
+                    }
+                    Ok(())
+                })();
+                if let Err(e) = result {
+                    // Undo, in reverse: data blocks first (their ids are only
+                    // reachable while `blocks` is still raised), then the
+                    // tables, then the inode fields.
+                    for i in old_blocks..assigned {
+                        if let Ok(id) = self.get_disk_block_id(i as usize) {
+                            self.fs.free_block(id);
+                        }
+                    }
+                    let mut disk_inode = self.disk_inode.write();
+                    for t in new_tables {
+                        self.fs.free_block(t as usize);
+                    }
+                    if new_db_indirect {
+                        self.fs.free_block(disk_inode.db_indirect as usize);
+                        disk_inode.db_indirect = 0;
+                    }
+                    if new_indirect {
+                        self.fs.free_block(disk_inode.indirect as usize);
+                        disk_inode.indirect = 0;
+                    }
+                    disk_inode.blocks = old_blocks;
+                    return Err(e);
                 }
                 // clean up
                 let mut disk_inode = self.disk_inode.write();

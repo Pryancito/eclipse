@@ -105,7 +105,7 @@ pub fn drm_fd_desc(f: &alloc::sync::Arc<dyn FileLike>) -> Option<alloc::string::
     None
 }
 pub use eventfd::EventFd;
-pub use file::{File, OpenFlags, PollEvents, SeekFrom};
+pub use file::{fs_grow_error, File, OpenFlags, PollEvents, SeekFrom};
 pub use inotify::Inotify;
 pub use perf::{sample_user as perf_sample_user, PerfEvent};
 pub use pidfd::{PidFd, PIDFD_THREAD};

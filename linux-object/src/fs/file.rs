@@ -434,8 +434,56 @@ impl FileInner {
         if !crate::fs::memfd_write_allowed(&self.inode) {
             return Err(LxError::EPERM);
         }
-        let len = self.inode.write_at(offset as usize, buf)?;
-        Ok(len)
+        self.inode
+            .write_at(offset as usize, buf)
+            .map_err(|e| fs_grow_error(&self.inode, e))
+    }
+}
+
+/// Errno for a failed write/resize. A regular file that cannot grow is
+/// ENOSPC, as on Linux. The blanket `FsError -> LxError` table says ENOMEM,
+/// which is right for the device nodes that reuse `NoDeviceSpace` for a
+/// failed buffer allocation (DRM CREATE_DUMB) but wrong for a file: a writer
+/// told "out of memory" backs off and retries, one told "no space left on
+/// device" stops. Shared by write(2)/pwrite(2), ftruncate(2) and truncate(2).
+pub fn fs_grow_error(inode: &Arc<dyn INode>, e: FsError) -> LxError {
+    match e {
+        FsError::NoDeviceSpace
+            if matches!(inode.metadata().map(|m| m.type_), Ok(FileType::File)) =>
+        {
+            LxError::ENOSPC
+        }
+        e => e.into(),
+    }
+}
+
+/// Say which file filled the disk. The root image is an SFS sized with ~40%
+/// headroom over its payload, so when it fills the interesting fact is WHAT
+/// filled it -- a runaway log, a browser cache, a leak in the allocator -- and
+/// nothing else in the log answers that. Printed for the first few distinct
+/// paths only; a writer that keeps retrying would otherwise flood the console.
+fn report_enospc(path: &str, offset: u64, len: usize, size: Option<u64>) {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    // One slot per distinct path (FNV-1a of the path; 0 = free), so a writer
+    // retrying the same file does not use up the budget of the others.
+    const SLOTS: usize = 8;
+    static SEEN: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    let key = path.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
+    }) | 1;
+    let fresh = SEEN.iter().all(|s| s.load(Ordering::Relaxed) != key)
+        && SEEN.iter().any(|s| {
+            s.compare_exchange(0, key, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        });
+    if fresh {
+        error!(
+            "[enospc] write of {} bytes at offset {:#x} to {} refused: no space left on device              (file is {} bytes now)",
+            len,
+            offset,
+            path,
+            size.map_or_else(|| String::from("?"), |s| alloc::format!("{s}")),
+        );
     }
 }
 
@@ -486,7 +534,10 @@ impl File {
         if !inner.flags.writable() {
             return Err(LxError::EBADF);
         }
-        inner.inode.resize(len as usize)?;
+        inner
+            .inode
+            .resize(len as usize)
+            .map_err(|e| fs_grow_error(&inner.inode, e))?;
         Ok(())
     }
 
@@ -642,7 +693,24 @@ impl FileLike for File {
     }
 
     fn write(&self, buf: &[u8]) -> LxResult<usize> {
-        self.inner.write().write(buf)
+        let mut inner = self.inner.write();
+        // The offset `FileInner::write` will actually try (O_APPEND writes at
+        // the current end, not at `inner.offset`).
+        let offset = if inner.flags.is_append() {
+            inner
+                .inode
+                .metadata()
+                .map(|m| m.size as u64)
+                .unwrap_or(inner.offset)
+        } else {
+            inner.offset
+        };
+        let r = inner.write(buf);
+        if matches!(r, Err(LxError::ENOSPC)) {
+            let size = inner.inode.metadata().ok().map(|m| m.size as u64);
+            report_enospc(&self.path, offset, buf.len(), size);
+        }
+        r
     }
 
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> LxResult<usize> {
@@ -678,7 +746,13 @@ impl FileLike for File {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> LxResult<usize> {
-        self.inner.write().write_at(offset, buf)
+        let mut inner = self.inner.write();
+        let r = inner.write_at(offset, buf);
+        if matches!(r, Err(LxError::ENOSPC)) {
+            let size = inner.inode.metadata().ok().map(|m| m.size as u64);
+            report_enospc(&self.path, offset, buf.len(), size);
+        }
+        r
     }
 
     fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {

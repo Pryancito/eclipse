@@ -72,6 +72,14 @@ lock = { path = "vendor/kernel-sync" }
 rcore-fs = { path = "vendor/rcore-fs" }
 rcore-fs-mountfs = { path = "vendor/rcore-fs-mountfs" }
 rcore-fs-ramfs = { path = "vendor/rcore-fs-ramfs" }
+# rcore-fs-sfs was vendored in the same import as the three above (with
+# `alloc_block` returning `None` -> `FsError::NoDeviceSpace` instead of
+# `panic!`), but never listed here, so every build still linked the upstream
+# checkout -- whose `alloc_block` panics the kernel the moment the root SFS
+# image runs out of blocks ("[Dirty] SuperBlock { ..., unused_blocks: 0 }"
+# at rcore-fs-sfs/src/lib.rs:857). A full disk must be ENOSPC to the writer,
+# not a halted CPU.
+rcore-fs-sfs = { path = "vendor/rcore-fs-sfs" }
 
 [patch."https://github.com/rcore-os/rcore-console"]
 rcore-console = { path = "vendor/rcore-console" }
