@@ -1110,6 +1110,52 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                         gs_base,
                         kernel_gs_base,
                     ));
+                    // Settle it. `gs:4` is the RSP0 field of the TSS inside the
+                    // CpuLocalRegion that GS names; the CPU's stack switch uses
+                    // the TSS that TR names. They are the same field only if
+                    // both name the same TSS. Every cpu builds its own region
+                    // and extends a SHARED GDT, so the descriptor index an AP
+                    // loads into TR is arithmetic over a table other cpus are
+                    // also growing -- and a region base that differs from GS's
+                    // is precisely "the stack the CPU switched to is not the one
+                    // gs:4 names". Read TR, decode the 64-bit system-segment
+                    // base out of the GDT, and print both.
+                    let (tr, tss_base) = unsafe {
+                        let tr: u16;
+                        core::arch::asm!("str {0:x}", out(reg) tr, options(nomem, nostack));
+                        let mut gdtp = [0u8; 10];
+                        core::arch::asm!("sgdt [{}]", in(reg) gdtp.as_mut_ptr(), options(nostack));
+                        let limit = u16::from_le_bytes([gdtp[0], gdtp[1]]) as usize;
+                        let base = u64::from_le_bytes([
+                            gdtp[2], gdtp[3], gdtp[4], gdtp[5], gdtp[6], gdtp[7], gdtp[8], gdtp[9],
+                        ]);
+                        let idx = (tr >> 3) as usize;
+                        // A TSS descriptor is 16 bytes; both halves must be in
+                        // the table or the decode is meaningless.
+                        if base != 0 && (idx + 1) * 8 + 7 <= limit {
+                            let lo = core::ptr::read_volatile((base as *const u64).add(idx));
+                            let hi = core::ptr::read_volatile((base as *const u64).add(idx + 1));
+                            let b = ((lo >> 16) & 0xff_ffff)
+                                | (((lo >> 56) & 0xff) << 24)
+                                | ((hi & 0xffff_ffff) << 32);
+                            (tr, b)
+                        } else {
+                            (tr, 0)
+                        }
+                    };
+                    crate::console::serial_write_fmt_spin(format_args!(
+                        "[df-sp] TR={:#x} -> TSS base {:#x} vs IA32_GS_BASE {:#x} — {}\n",
+                        tr,
+                        tss_base,
+                        gs_base,
+                        if tss_base == 0 {
+                            "TSS base undecodable, ignore this line"
+                        } else if tss_base == gs_base {
+                            "SAME region, so TR is not the problem"
+                        } else {
+                            "DIFFERENT regions — TR and GS name different TSSs,                              so gs:4 was never the RSP0 the CPU switched on"
+                        },
+                    ));
                     // And say whether the allocator-aliasing checks could even
                     // have seen it. There are TWO fixed-size registries, one per
                     // check, and each silently loses stacks that do not fit:
