@@ -1,3 +1,4 @@
+use super::page_flags::PageFlags;
 use {
     super::*,
     crate::object::*,
@@ -864,7 +865,7 @@ impl VmAddressRegion {
             // Per-page flags of the moved window, so protection state applied by
             // an earlier mprotect over a sub-range survives the move.
             let first = (old_addr - m.addr) / PAGE_SIZE;
-            let flags: Vec<MMUFlags> = m.flags[first..first + pages(old_len)].to_vec();
+            let flags = m.flags.slice(first..first + pages(old_len));
             (m.addr, m.size, m.vmo_offset, flags)
         };
         let vmo = mapping.vmo.clone();
@@ -903,8 +904,7 @@ impl VmAddressRegion {
                     // The VMO already covers the extension: stretch the mapping.
                     let mut m = mapping.inner.lock();
                     m.size += delta;
-                    m.flags
-                        .extend(core::iter::repeat_n(tail_flag, pages(delta)));
+                    m.flags.extend_repeat(tail_flag, pages(delta));
                 } else {
                     // Anonymous tail, demand-paged: zero on first touch.
                     let tail_vmo = VmObject::new_paged(pages(delta));
@@ -964,7 +964,7 @@ impl VmAddressRegion {
             let extra = window_pages.saturating_sub(moved_flags.len());
             m.flags = moved_flags;
             m.flags.truncate(window_pages);
-            m.flags.extend(core::iter::repeat_n(tail_flag, extra));
+            m.flags.extend_repeat(tail_flag, extra);
         }
         // Install PTEs for the frames that already exist so the caller's
         // immediately-following accesses (memcpy into a realloc'd buffer) do not
@@ -1943,8 +1943,10 @@ pub struct VmMapping {
 
 #[derive(Debug, Clone)]
 struct VmMappingInner {
-    /// The actual flags used in the mapping of each page
-    flags: Vec<MMUFlags>,
+    /// The actual flags used in the mapping of each page, run-length encoded
+    /// (see `page_flags.rs`: a per-page `Vec` cost 8 bytes of heap per 4 KiB
+    /// of address space and was the OOM in #1135).
+    flags: PageFlags,
     addr: VirtAddr,
     size: usize,
     vmo_offset: usize,
@@ -2012,7 +2014,7 @@ impl VmMapping {
     ) -> Arc<Self> {
         let mapping = Arc::new(VmMapping {
             inner: Mutex::new(VmMappingInner {
-                flags: vec![flags; pages(size)],
+                flags: PageFlags::uniform(flags, pages(size)),
                 addr,
                 size,
                 vmo_offset,
@@ -2167,13 +2169,12 @@ impl VmMapping {
         let spare = {
             let inner = self.inner.lock();
             if inner.addr < begin && inner.end_addr() > end {
-                let new_len2 = inner.end_addr() - end;
                 Some(Arc::new(VmMapping {
                     permissions: self.permissions,
                     vmo: self.vmo.clone(),
                     page_table: self.page_table.clone(),
                     inner: Mutex::new(VmMappingInner {
-                        flags: Vec::with_capacity(pages(new_len2)),
+                        flags: PageFlags::with_run_capacity(inner.flags.run_count() + 1),
                         addr: end,
                         size: 0,
                         vmo_offset: 0,
@@ -2202,7 +2203,7 @@ impl VmMapping {
             inner.addr = end;
             inner.size -= cut_len;
             inner.vmo_offset += cut_len;
-            inner.flags.drain(0..pages(cut_len));
+            inner.flags.drain_front(pages(cut_len));
             Ok(None)
         } else if inner.end_addr() <= end && inner.end_addr() > begin {
             // postfix: [------xxxx]
@@ -2228,8 +2229,8 @@ impl VmMapping {
             let new_mapping = spare.ok_or(ZxError::BAD_STATE)?;
             {
                 let mut new_inner = new_mapping.inner.lock();
-                let new_flags_range = (pages(inner.size) - pages(new_len2))..pages(inner.size);
-                new_inner.flags.extend(inner.flags.drain(new_flags_range));
+                let at = pages(inner.size) - pages(new_len2);
+                inner.flags.split_off_into(at, &mut new_inner.flags);
                 new_inner.vmo_offset = inner.vmo_offset + (end - inner.addr);
                 new_inner.size = new_len2;
             }
@@ -2259,21 +2260,27 @@ impl VmMapping {
         // mmu-gather: defer the cross-CPU shootdown to one flush after the
         // loop; a synchronous shootdown per page livelocks large mprotects
         // whenever a peer CPU can't ack promptly.
-        for i in start_index..end_index {
-            let mut new_flags = inner.flags[i];
+        // Copy USER as well as RXW. `protect` used to take only RXW, so a
+        // PROT_NONE page (no USER stored — or USER-only from mmap) that
+        // was later mprotect'd to RW ended up READ|WRITE without USER.
+        // User-mode #PF error codes include USER, and
+        // `handle_page_fault` requires `flags.contains(access_flags)`,
+        // which then ACCESS_DENIED'd the first store into the raised
+        // slice (musl mallocng / pthread stacks / ld.so).
+        //
+        // One run-list rebuild for the whole range, not a write per page.
+        let user = self.permissions.contains(MMUFlags::USER);
+        inner.flags.update_range(start_index..end_index, |old| {
+            let mut new_flags = old;
             new_flags.remove(MMUFlags::RXW);
-            // Copy USER as well as RXW. `protect` used to take only RXW, so a
-            // PROT_NONE page (no USER stored — or USER-only from mmap) that
-            // was later mprotect'd to RW ended up READ|WRITE without USER.
-            // User-mode #PF error codes include USER, and
-            // `handle_page_fault` requires `flags.contains(access_flags)`,
-            // which then ACCESS_DENIED'd the first store into the raised
-            // slice (musl mallocng / pthread stacks / ld.so).
             new_flags.insert(flags & (MMUFlags::RXW | MMUFlags::USER));
-            if self.permissions.contains(MMUFlags::USER) {
+            if user {
                 new_flags.insert(MMUFlags::USER);
             }
-            inner.flags[i] = new_flags;
+            new_flags
+        });
+        for i in start_index..end_index {
+            let new_flags = inner.flags[i];
             let va = inner.addr + i * PAGE_SIZE;
             // A frame this VMO does not OWN at this index must never be made
             // writable in place. Two kinds of PTE point at such frames:

@@ -1,5 +1,6 @@
 //! Objects for Virtual Memory Management.
 
+mod page_flags;
 mod stream;
 mod vmar;
 mod vmo;
