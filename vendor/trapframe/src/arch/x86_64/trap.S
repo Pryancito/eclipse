@@ -24,36 +24,32 @@ __from_user:
     mov rax, [rsp + 6*8]    # rax = user rsp
     mov gs:12, rax          # store user rsp -> scratch at TSS.sp1
 
-    mov rsp, [rsp + 8*8]    # load rsp = bottom of trap frame
+    mov rax, rsp            # preserve entry stack pointer (RSP0 or IST)
+    mov rsp, gs:4           # load rsp = bottom of trap frame
     add rsp, 22*8           # rsp = top of trap frame
-    mov rax, gs:4           # rax = kernel stack
+                            # rax still points to the entry frame
 
     # The window below is the one place where a kernel stack pointer that was
-    # already garbage becomes fatal: `mov rsp, [rsp + 8*8]` above installs the
-    # GeneralRegs pointer that `syscall_return` stashed at [TSS.RSP0], and if
-    # that slot was zeroed while the thread ran in user mode, rsp is now 0xb0
-    # and the first push raises #PF -> #DF. The frame the #DF reports then
-    # carries a destroyed rsp, so containment cannot tell which coroutine stack
-    # died and has to halt the machine.
+    # already garbage becomes fatal: if rsp was loaded from the wrong place,
+    # the first push raises #PF -> #DF. The frame the #DF reports then carries
+    # a destroyed rsp, so containment cannot tell which coroutine stack died
+    # and has to halt the machine.
     #
-    # These two labels bound the window in which `rax` provably still holds
-    # TSS.RSP0 -- a valid address inside the faulting thread's kernel stack --
-    # so the #DF handler can hand THAT to the isolation machinery instead of
-    # the wrecked rsp. The window ends at `mov rax, [rax - 8*8]`, which
-    # replaces rax with the user's own rax.
+    # These two labels bound the window in which `rax` still points at the
+    # original entry frame (RSP0 or IST), before it is replaced with user rax.
 .global __from_user_regs_push
 __from_user_regs_push:
     # push trap_num, error_code
-    push [rax - 6*8]        # push error_code
-    push [rax - 7*8]        # push trap_num
+    push [rax + 2*8]        # push error_code from entry frame
+    push [rax + 1*8]        # push trap_num from entry frame
     push rax                # skip gsbase
     push rax                # skip fsbase
     # push general registers
-    push [rax - 3*8]        # push rflags
-    push [rax - 5*8]        # push rip
+    push [rax + 5*8]        # push rflags from entry frame
+    push [rax + 3*8]        # push rip from entry frame
 .global __from_user_regs_push_end
 __from_user_regs_push_end:
-    mov rax, [rax - 8*8]    # pop rax
+    mov rax, [rax]          # restore user rax from entry frame
     jmp trap_syscall_entry
 
 __from_kernel:
