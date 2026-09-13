@@ -222,6 +222,410 @@ static void test_shared_memory(void) {
   close(fd);
 }
 
+// ── Mapping coherence ───────────────────────────────────────────────────────
+// The parent process builds the shared font list (gfx/thebes/SharedFontList.cpp)
+// in memfd blocks it maps MAP_SHARED and writes through the mapping; content
+// processes map the same fds read-only later. SQLite maps its -shm files
+// MAP_SHARED and grows them with ftruncate after mapping (os_unix.c unixShmMap).
+// FreeType maps font files MAP_PRIVATE and reads tables at arbitrary offsets
+// (ftsystem.c), while WebRender read()s the same files. All of that assumes one
+// coherent view of a file across mmap, read/pread, pwrite, ftruncate and fork.
+// Each check names the sequence; a failure prints the first page that differs.
+static void cpattern(unsigned char *dst, size_t page, unsigned nonce) {
+  for (size_t j = 0; j < 4096; j++) dst[j] = (unsigned char)(page * 7 + j + nonce);
+}
+
+// -1 if page `page` at `base` holds the pattern, else the first bad offset.
+static long cverify(const unsigned char *base, size_t page, unsigned nonce) {
+  const unsigned char *pg = base + page * 4096;
+  for (size_t j = 0; j < 4096; j++)
+    if (pg[j] != (unsigned char)(page * 7 + j + nonce)) return (long)j;
+  return -1;
+}
+
+static void creport(const char *what, const unsigned char *base, size_t page, unsigned nonce) {
+  long off = cverify(base, page, nonce);
+  if (off < 0) return;
+  const unsigned char *pg = base + page * 4096;
+  printf("         %s: page %zu differs at +%ld: got %02x %02x %02x %02x, expected %02x %02x %02x %02x\n",
+         what, page, off, pg[off], pg[off + 1], pg[off + 2], pg[off + 3],
+         (unsigned char)(page * 7 + off + nonce), (unsigned char)(page * 7 + off + 1 + nonce),
+         (unsigned char)(page * 7 + off + 2 + nonce), (unsigned char)(page * 7 + off + 3 + nonce));
+}
+
+// All pages in [from, to) hold the pattern? Reports the first that does not.
+static int cverify_range(const char *what, const unsigned char *base, size_t from, size_t to, unsigned nonce) {
+  for (size_t pg = from; pg < to; pg++)
+    if (cverify(base, pg, nonce) >= 0) { creport(what, base, pg, nonce); return 0; }
+  return 1;
+}
+
+static int cpread_range(const char *what, int fd, size_t from, size_t to, unsigned nonce) {
+  unsigned char buf[4096];
+  for (size_t pg = from; pg < to; pg++) {
+    ssize_t n = pread(fd, buf, sizeof buf, (off_t)(pg * 4096));
+    if (n != (ssize_t)sizeof buf) { printf("         %s: pread page %zu -> %zd\n", what, pg, n); return 0; }
+    if (cverify(buf, 0, (unsigned)(pg * 7 + nonce)) >= 0) {
+      // cverify with page 0 and nonce folded in == the pattern of page pg
+      long off = cverify(buf, 0, (unsigned)(pg * 7 + nonce));
+      printf("         %s: pread page %zu differs at +%ld: got %02x expected %02x\n", what, pg, off,
+             buf[off], (unsigned char)(pg * 7 + off + nonce));
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static void test_mapping_coherence(void) {
+  section("mapping coherence (shared font list, SQLite -shm, font files)");
+  const size_t MiB = 1024 * 1024, PAGES = 256;
+
+  // 1. memfd: store through a mapping, read back every other way.
+  {
+    int fd = memfd("mozilla-fontlist-block", MFD_CLOEXEC);
+    if (fd < 0 || ftruncate(fd, (off_t)MiB) != 0) {
+      fail("memfd for the coherence checks", "SharedFontList.cpp", errno);
+    } else {
+      unsigned char *a = mmap(NULL, MiB, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      if (a == MAP_FAILED) {
+        fail("mmap(MAP_SHARED) of the block", "SharedFontList.cpp", errno);
+      } else {
+        for (size_t pg = 0; pg < PAGES; pg++) cpattern(a + pg * 4096, pg, 1);
+        unsigned char *b = mmap(NULL, MiB, PROT_READ, MAP_SHARED, fd, 0);
+        check(b != MAP_FAILED, "second mapping of the written block", "content process maps the fd", errno);
+        if (b != MAP_FAILED) {
+          check(cverify_range("mapping B", b, 0, PAGES, 1),
+                "mapping created AFTER stores through another mapping sees them (all pages)",
+                "SharedFontList.cpp: content maps blocks the parent already filled", 0);
+          for (size_t pg = 0; pg < PAGES; pg++) cpattern(a + pg * 4096, pg, 2);
+          check(cverify_range("mapping B", b, 0, PAGES, 2),
+                "existing mapping sees LATER stores through the writer's mapping",
+                "SharedFontList.cpp: the parent keeps appending to a block content already maps", 0);
+        }
+        check(cpread_range("pread", fd, 0, PAGES, 2), "pread() sees stores made through a mapping",
+              "mmap and read must be one page cache (file.rs write/read go to the inode, mappings to a VMO)", 0);
+        unsigned char pg5[4096];
+        cpattern(pg5, 5, 3);
+        check(pwrite(fd, pg5, sizeof pg5, 5 * 4096) == (ssize_t)sizeof pg5, "pwrite() into a page every mapping has faulted",
+              "SQLite os_unix.c writes -shm through both paths", errno);
+        check(cverify(a, 5, 3) < 0 && (b == MAP_FAILED || cverify(b, 5, 3) < 0),
+              "mappings see a pwrite() to a page they had already faulted", "one page cache", 0);
+        if (cverify(a, 5, 3) >= 0) creport("mapping A", a, 5, 3);
+        if (b != MAP_FAILED && cverify(b, 5, 3) >= 0) creport("mapping B", b, 5, 3);
+        if (b != MAP_FAILED) munmap(b, MiB);
+        munmap(a, MiB);
+      }
+      close(fd);
+    }
+  }
+
+  // 2. Grow a memfd after mapping it (SQLite -shm; any file that grows).
+  {
+    int fd = memfd("sqlite-shm", MFD_CLOEXEC);
+    if (fd < 0 || ftruncate(fd, 64 * 1024) != 0) {
+      fail("memfd for the growth checks", "os_unix.c unixShmMap", errno);
+    } else {
+      unsigned char *a = mmap(NULL, 64 * 1024, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      if (a == MAP_FAILED) {
+        fail("mmap the 64 KiB head", "os_unix.c", errno);
+      } else {
+        for (size_t pg = 0; pg < 16; pg++) cpattern(a + pg * 4096, pg, 4);
+        check(ftruncate(fd, (off_t)MiB) == 0, "ftruncate(grow) with a mapping alive", "os_unix.c unixShmMap", errno);
+        unsigned char *b = mmap(NULL, MiB, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        check(b != MAP_FAILED, "map the grown file", "os_unix.c", errno);
+        if (b != MAP_FAILED) {
+          check(cverify_range("post-growth mapping", b, 0, 16, 4),
+                "mapping created after growth sees the head written before it",
+                "file.rs: a window past the cache VMO must not become a private snapshot", 0);
+          for (size_t pg = 16; pg < PAGES; pg++) cpattern(b + pg * 4096, pg, 5);
+          unsigned char *c = mmap(NULL, MiB, PROT_READ, MAP_SHARED, fd, 0);
+          if (c != MAP_FAILED) {
+            check(cverify_range("third mapping", c, 16, PAGES, 5) && cverify_range("third mapping", c, 0, 16, 4),
+                  "a later mapping sees writes made through the post-growth mapping", "os_unix.c", 0);
+            munmap(c, MiB);
+          }
+          check(cpread_range("pread", fd, 16, PAGES, 5), "pread() sees the grown tail written through a mapping", "one page cache", 0);
+          check(cverify_range("old head mapping", a, 0, 16, 4), "the pre-growth mapping still reads its bytes", "os_unix.c", 0);
+          // Truncate to zero and regrow: nothing may come back from the dead.
+          check(ftruncate(fd, 0) == 0 && ftruncate(fd, (off_t)MiB) == 0, "ftruncate(0) then regrow", "open(O_TRUNC) rewrite", errno);
+          unsigned char *e = mmap(NULL, MiB, PROT_READ, MAP_SHARED, fd, 0);
+          if (e != MAP_FAILED) {
+            int zero = 1;
+            for (size_t j = 0; j < 4096 && zero; j++) if (e[20 * 4096 + j]) zero = 0;
+            check(zero, "truncate(0)+regrow reads as zeros through a new mapping (not resurrected data)",
+                  "file.rs: resize must invalidate the cache VMO", 0);
+            if (!zero) printf("         page 20 after truncate(0)+regrow: %02x %02x %02x %02x\n", e[20 * 4096], e[20 * 4096 + 1], e[20 * 4096 + 2], e[20 * 4096 + 3]);
+            munmap(e, MiB);
+          }
+          munmap(b, MiB);
+        }
+        munmap(a, 64 * 1024);
+      }
+      close(fd);
+    }
+    // A mapping made BEFORE the file grew must see bytes written past the old EOF.
+    int fd2 = memfd("grow-under-mapping", MFD_CLOEXEC);
+    if (fd2 >= 0 && ftruncate(fd2, 4096) == 0) {
+      unsigned char *d = mmap(NULL, 8192, PROT_READ, MAP_SHARED, fd2, 0);
+      if (d != MAP_FAILED) {
+        volatile unsigned char t = d[0]; (void)t;      // page 0 only: page 1 is past EOF
+        check(ftruncate(fd2, 8192) == 0, "grow under a mapping that reaches past the old EOF", "os_unix.c", errno);
+        unsigned char z = 'Z';
+        check(pwrite(fd2, &z, 1, 4096) == 1, "pwrite past the old EOF", "os_unix.c", errno);
+        check(d[4096] == 'Z', "mapping created before the growth sees the byte written past the old EOF",
+              "paged.rs: a read past the creation-time size must not pin the zero page", 0);
+        if (d[4096] != 'Z') printf("         got %02x, expected 'Z'\n", d[4096]);
+        munmap(d, 8192);
+      }
+      close(fd2);
+    }
+  }
+
+  // 3. A page READ before anyone wrote it must still see the later write.
+  {
+    volatile unsigned *p = mmap(NULL, 64 * 1024, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+      fail("mmap(MAP_SHARED|MAP_ANONYMOUS)", "ipc/chromium", errno);
+    } else {
+      unsigned x = p[0] + p[4096]; (void)x;             // read first: pages 0 and 4
+      pid_t pid = fork();
+      if (pid == 0) { p[0] = 0xc0ffee; p[4096] = 0xbeef; _exit(0); }
+      if (pid > 0) {
+        int st = 0; waitpid(pid, &st, 0);
+        check(p[0] == 0xc0ffee && p[4096] == 0xbeef,
+              "parent sees the child's writes to shared anonymous pages it had only READ before the fork",
+              "vmar.rs: a PTE to the zero frame must be replaced when the page is first written", 0);
+        if (p[0] != 0xc0ffee || p[4096] != 0xbeef) printf("         got %x %x, expected c0ffee beef\n", p[0], p[4096]);
+      } else fail("fork", "process launch", errno);
+      munmap((void *)p, 64 * 1024);
+    }
+    int fd = memfd("read-before-write", MFD_CLOEXEC);
+    if (fd >= 0 && ftruncate(fd, 4096) == 0) {
+      unsigned char *q = mmap(NULL, 8192, PROT_READ, MAP_SHARED, fd, 0);
+      if (q != MAP_FAILED) {
+        volatile unsigned char t = q[0]; (void)t;
+        if (ftruncate(fd, 8192) == 0) {
+          pid_t pid = fork();
+          if (pid == 0) {
+            unsigned char *w = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (w == MAP_FAILED) _exit(2);
+            w[0] = 0x11; cpattern(w + 4096, 1, 6);
+            _exit(0);
+          }
+          int st = 0; waitpid(pid, &st, 0);
+          check(q[0] == 0x11 && cverify(q, 1, 6) < 0,
+                "read-only mapping sees a child's writes, including to a page grown after the mapping",
+                "SharedFontList.cpp: content maps read-only what the parent writes later", 0);
+          if (q[0] != 0x11 || cverify(q, 1, 6) >= 0) { printf("         q[0]=%02x (11)\n", q[0]); creport("RO mapping", q, 1, 6); }
+        }
+        munmap(q, 8192);
+      }
+      close(fd);
+    }
+  }
+
+  // 4. MADV_DONTNEED on a shared file mapping drops PTEs, never the file's bytes.
+  {
+    int fd = memfd("dontneed", MFD_CLOEXEC);
+    if (fd >= 0 && ftruncate(fd, 4096) == 0) {
+      unsigned char *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      if (p != MAP_FAILED) {
+        p[0] = 1;
+        madvise(p, 4096, MADV_DONTNEED);
+        unsigned char *q = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
+        check(p[0] == 1 && (q == MAP_FAILED || q[0] == 1),
+              "MADV_DONTNEED on a MAP_SHARED memfd keeps the shared bytes",
+              "vmar.rs dontneed: zeroing must never reach a shared object", 0);
+        if (p[0] != 1 || (q != MAP_FAILED && q[0] != 1)) printf("         p[0]=%d q[0]=%d (expected 1 1)\n", p[0], q == MAP_FAILED ? -1 : q[0]);
+        if (q != MAP_FAILED) munmap(q, 4096);
+        munmap(p, 4096);
+      }
+      close(fd);
+    }
+  }
+
+  // 5. An O_TRUNC rewrite of a file that was once mapped must win over any
+  //    stale cached page written back later.
+  {
+    const char *dirs[] = { "/tmp", "/root", "." };
+    for (size_t di = 0; di < 3; di++) {
+      char path[256];
+      snprintf(path, sizeof path, "%s/ffprobe-wb-%d", dirs[di], (int)getpid());
+      int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+      if (fd < 0) continue;
+      unsigned char pg[4096];
+      memset(pg, 'A', sizeof pg);
+      if (write(fd, pg, sizeof pg) != (ssize_t)sizeof pg) { close(fd); unlink(path); continue; }
+      unsigned char *m = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
+      if (m != MAP_FAILED) { volatile unsigned char t = m[0]; (void)t; munmap(m, 4096); }
+      close(fd);
+      fd = open(path, O_WRONLY | O_TRUNC);
+      memset(pg, 'B', sizeof pg);
+      if (fd >= 0) { (void)!write(fd, pg, sizeof pg); close(fd); }
+      // Something else mapping another file is what evicts cache entries.
+      int other = open("/proc/self/exe", O_RDONLY);
+      if (other >= 0) {
+        void *om = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, other, 0);
+        if (om != MAP_FAILED) munmap(om, 4096);
+        close(other);
+      }
+      fd = open(path, O_RDONLY);
+      unsigned char first = 0;
+      if (fd >= 0) { (void)!read(fd, &first, 1); close(fd); }
+      char name[128];
+      snprintf(name, sizeof name, "O_TRUNC rewrite of a once-mapped file survives (%s)", dirs[di]);
+      check(first == 'B', name, "file.rs writeback_shared_vmo must not clobber a rewritten inode", 0);
+      if (first != 'B') printf("         first byte after rewrite: %02x, expected 'B'\n", first);
+      unlink(path);
+    }
+  }
+
+  // 6. A file mapped MAP_PRIVATE, read in FreeType's order: every page, any
+  //    order, equal to read()/pread(), in this process and in a child.
+  {
+    const size_t FPAGES = 768;                      // 3 MiB, like a font
+    char path[256];
+    snprintf(path, sizeof path, "/tmp/ffprobe-font-%d", (int)getpid());
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+      skip("synthetic font file", "/tmp not writable");
+    } else {
+      unsigned char pg[4096];
+      int wrote = 1;
+      for (size_t i = 0; i < FPAGES && wrote; i++) { cpattern(pg, i, 9); wrote = write(fd, pg, sizeof pg) == (ssize_t)sizeof pg; }
+      close(fd);
+      fd = open(path, O_RDONLY);
+      if (!wrote || fd < 0) {
+        fail("write the synthetic font file", "ftsystem.c", errno);
+      } else {
+        unsigned char *m = mmap(NULL, FPAGES * 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+        check(m != MAP_FAILED, "mmap(MAP_PRIVATE) of the file", "ftsystem.c FT_Stream_Open", errno);
+        if (m != MAP_FAILED) {
+          // FreeType's order: the table directory at 0 is read via the same
+          // mapping as glyph data deep inside; touch the end first, then the
+          // fault-around edges, then everything.
+          static const size_t order[] = { 767, 17, 16, 15, 1, 0, 300, 299, 301, 100 };
+          int good = 1;
+          for (size_t k = 0; k < sizeof order / sizeof order[0] && good; k++)
+            if (cverify(m, order[k], 9) >= 0) { creport("private mapping", m, order[k], 9); good = 0; }
+          check(good, "MAP_PRIVATE mapping: pages read in non-sequential order match the file",
+                "ftsystem.c: tables live at arbitrary offsets", 0);
+          check(cverify_range("private mapping", m, 0, FPAGES, 9), "MAP_PRIVATE mapping: every page matches the file",
+                "FileFrameFiller must never leave a page short or zero", 0);
+          check(cpread_range("pread", fd, 0, FPAGES, 9), "pread() of every page matches",
+                "WebRender read()s the font the parent maps", 0);
+          unsigned char *m2 = mmap(NULL, FPAGES * 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+          if (m2 != MAP_FAILED) {
+            check(cverify_range("second private mapping", m2, 0, FPAGES, 9), "a second MAP_PRIVATE mapping matches",
+                  "two FT_Face instances of one file", 0);
+            munmap(m2, FPAGES * 4096);
+          }
+          unsigned char *ms = mmap(NULL, FPAGES * 4096, PROT_READ, MAP_SHARED, fd, 0);
+          if (ms != MAP_FAILED) {
+            check(cverify_range("shared mapping", ms, 0, FPAGES, 9), "a MAP_SHARED read-only mapping matches",
+                  "fontconfig maps its caches MAP_SHARED", 0);
+            munmap(ms, FPAGES * 4096);
+          }
+          pid_t pid = fork();
+          if (pid == 0) {
+            unsigned char *mc = mmap(NULL, FPAGES * 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (mc == MAP_FAILED) _exit(2);
+            _exit(cverify_range("child private mapping", mc, 0, FPAGES, 9) ? 0 : 1);
+          }
+          if (pid > 0) {
+            int st = 0; waitpid(pid, &st, 0);
+            check(WIFEXITED(st) && WEXITSTATUS(st) == 0,
+                  "a child's MAP_PRIVATE mapping made after the parent's matches (content-process order)",
+                  "content processes map the fonts the parent already mapped", 0);
+          }
+          munmap(m, FPAGES * 4096);
+        }
+        close(fd);
+      }
+      unlink(path);
+    }
+    // The real fonts, when present: mmap view == read() view, byte for byte.
+    const char *fonts[] = { "/usr/share/fonts/dejavu/DejaVuSans.ttf", "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf" };
+    for (size_t fi = 0; fi < 2; fi++) {
+      int ffd = open(fonts[fi], O_RDONLY);
+      if (ffd < 0) { skip(fonts[fi], "not present"); continue; }
+      struct stat st;
+      if (fstat(ffd, &st) != 0 || st.st_size <= 0) { close(ffd); continue; }
+      size_t size = (size_t)st.st_size;
+      unsigned char *buf = malloc(size);
+      size_t got = 0;
+      while (buf && got < size) {
+        ssize_t n = read(ffd, buf + got, size - got);
+        if (n <= 0) break;
+        got += (size_t)n;
+      }
+      unsigned char *m = mmap(NULL, size, PROT_READ, MAP_PRIVATE, ffd, 0);
+      char name[160];
+      snprintf(name, sizeof name, "%s: mmap view == read() view", fonts[fi]);
+      if (buf && got == size && m != MAP_FAILED) {
+        volatile unsigned char t = m[size - 1]; (void)t;   // end first, like the table directory walk
+        size_t diff = size;
+        for (size_t i = 0; i < size; i++) if (m[i] != buf[i]) { diff = i; break; }
+        check(diff == size, name, "WebRender (read) and FreeType (mmap) must agree on the font", 0);
+        if (diff != size) printf("         first difference at offset %zu (page %zu): mmap %02x read %02x\n", diff, diff / 4096, m[diff], buf[diff]);
+        pid_t pid = fork();
+        if (pid == 0) {
+          unsigned char *mc = mmap(NULL, size, PROT_READ, MAP_PRIVATE, ffd, 0);
+          if (mc == MAP_FAILED) _exit(2);
+          _exit(memcmp(mc, buf, size) == 0 ? 0 : 1);
+        }
+        if (pid > 0) {
+          int cst = 0; waitpid(pid, &cst, 0);
+          snprintf(name, sizeof name, "%s: a child's mapping == read() view", fonts[fi]);
+          check(WIFEXITED(cst) && WEXITSTATUS(cst) == 0, name, "content-process order", 0);
+        }
+      } else {
+        fail(name, "read/mmap of the font failed", errno);
+      }
+      if (m != MAP_FAILED) munmap(m, size);
+      free(buf);
+      close(ffd);
+    }
+  }
+
+  // 7. mremap growth keeps the bytes (mozjemalloc / SQLite grow mappings).
+  {
+    unsigned char *p = mmap(NULL, 64 * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p != MAP_FAILED) {
+      for (size_t pg = 0; pg < 16; pg++) cpattern(p + pg * 4096, pg, 12);
+      unsigned char *q = mremap(p, 64 * 1024, 256 * 1024, MREMAP_MAYMOVE);
+      if (q == MAP_FAILED) {
+        fail("mremap(MREMAP_MAYMOVE) grow of anonymous memory", "sys_mremap", errno);
+        munmap(p, 64 * 1024);
+      } else {
+        check(cverify_range("mremap'd anon", q, 0, 16, 12), "mremap grow keeps anonymous content", "sys_mremap", 0);
+        munmap(q, 256 * 1024);
+      }
+    }
+    int fd = memfd("mremap-shm", MFD_CLOEXEC);
+    if (fd >= 0 && ftruncate(fd, 256 * 1024) == 0) {
+      unsigned char *p2 = mmap(NULL, 64 * 1024, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      if (p2 != MAP_FAILED) {
+        for (size_t pg = 0; pg < 16; pg++) cpattern(p2 + pg * 4096, pg, 13);
+        unsigned char *q2 = mremap(p2, 64 * 1024, 256 * 1024, MREMAP_MAYMOVE);
+        if (q2 == MAP_FAILED) {
+          fail("mremap grow of a MAP_SHARED memfd mapping", "os_unix.c", errno);
+          munmap(p2, 64 * 1024);
+        } else {
+          cpattern(q2 + 40 * 4096, 40, 13);
+          unsigned char *r = mmap(NULL, 256 * 1024, PROT_READ, MAP_SHARED, fd, 0);
+          check(cverify_range("mremap'd shared", q2, 0, 16, 13) &&
+                    (r == MAP_FAILED || (cverify_range("other mapping", r, 0, 16, 13) && cverify_range("other mapping", r, 40, 41, 13))),
+                "mremap grow of a shared mapping keeps the bytes and stays shared", "os_unix.c", 0);
+          if (r != MAP_FAILED) munmap(r, 256 * 1024);
+          munmap(q2, 256 * 1024);
+        }
+      }
+      close(fd);
+    }
+  }
+}
+
 // ── fd passing ──────────────────────────────────────────────────────────────
 // ipc/chromium: every shared-memory handle and every child-process channel
 // crosses as an SCM_RIGHTS control message on a AF_UNIX socketpair.
@@ -1154,6 +1558,7 @@ int main(int argc, char **argv) {
   printf("Each check mirrors a pattern from Firefox's own source.\n");
 
   test_shared_memory();
+  test_mapping_coherence();
   test_fd_passing();
   test_process_launch(self);
   test_runtime();
