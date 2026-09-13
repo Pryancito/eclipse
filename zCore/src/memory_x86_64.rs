@@ -377,6 +377,62 @@ cfg_if! {
             );
         }
 
+        /// Attribution for the OOM in #1135. The heap dump there was five
+        /// blocks in the 64 MiB class and fifty in the 4 MiB class -- ~520 MiB
+        /// of a 512 MiB heap -- and nothing in the log said who made them.
+        /// ramfs cannot have (it stores files as 4 KiB blocks), so "memfd" was
+        /// the wrong owner. This prints the allocating call chain for the
+        /// first few blocks of each large size class at the moment they are
+        /// handed out, which is the only point where the owner is on the
+        /// stack. Bounded per class so a steady large consumer (I/O buffers)
+        /// cannot flood the console. Same no-alloc spin-serial path and
+        /// frame-pointer walk as `report_stack_double_alloc` above.
+        const BIG_ALLOC_MIN: usize = 2 * 1024 * 1024;
+        const BIG_ALLOC_REPORTS_PER_CLASS: usize = 4;
+        static BIG_ALLOC_SEEN: [AtomicUsize; HEAP_BUCKETS] =
+            [const { AtomicUsize::new(0) }; HEAP_BUCKETS];
+
+        #[cold]
+        #[inline(never)]
+        fn report_big_alloc(ptr: usize, sz: usize) {
+            let b = bucket_of(sz);
+            if BIG_ALLOC_SEEN[b].fetch_add(1, Ordering::Relaxed) >= BIG_ALLOC_REPORTS_PER_CLASS {
+                return;
+            }
+            kernel_hal::console::serial_write_fmt_spin(format_args!(
+                "\n[bigalloc] {} KiB heap block at {:#x} (class <={} KiB, {} live in class, \
+                 heap used {} MiB); allocating call chain:\n",
+                sz >> 10,
+                ptr,
+                (1usize << b) >> 10,
+                HEAP_LIVE[b].load(Ordering::Relaxed),
+                HEAP_USED.load(Ordering::Relaxed) >> 20,
+            ));
+            let mut rbp: usize;
+            unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp) };
+            for _ in 0..20 {
+                if rbp == 0 || rbp & 0x7 != 0 || rbp < 0xffff_ff00_0000_0000 {
+                    break;
+                }
+                let ret = unsafe { core::ptr::read_volatile((rbp + 8) as *const usize) };
+                let next = unsafe { core::ptr::read_volatile(rbp as *const usize) };
+                if ret == 0 {
+                    break;
+                }
+                kernel_hal::console::serial_write_fmt_spin(format_args!(
+                    "[bigalloc]   ret={:#x}\n",
+                    ret
+                ));
+                if next <= rbp {
+                    break;
+                }
+                rbp = next;
+            }
+            kernel_hal::console::serial_write_str(
+                "[bigalloc] symbolize: llvm-addr2line -e <zcore.elf> -fCi <ret ...>\n",
+            );
+        }
+
         pub fn heap_total() -> usize {
             KERNEL_HEAP_SIZE
         }
@@ -730,6 +786,9 @@ cfg_if! {
                     HEAP_USED.fetch_add(sz, Ordering::Relaxed);
                     HEAP_LIVE[bucket_of(sz)].fetch_add(1, Ordering::Relaxed);
                     hot_track(sz, 1);
+                    if sz >= BIG_ALLOC_MIN {
+                        report_big_alloc(p as usize, sz);
+                    }
                     #[cfg(feature = "mem-debug")]
                     {
                         let cz = p.add(sz);
