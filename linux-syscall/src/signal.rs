@@ -173,7 +173,19 @@ impl Syscall<'_> {
         };
         let caller = self.zircon_process().clone();
         let send_to_pid = |pid: KoID| -> SysResult {
-            let process = ROOT_JOB.find_process(pid).ok_or(LxError::ESRCH)?;
+            let Some(process) = ROOT_JOB.find_process(pid) else {
+                // A child that exited but was not waited for is gone from the
+                // job yet still a valid target: Linux delivers nothing and
+                // returns 0. Firefox's parent logged "failed to send SIGKILL
+                // to process N" for every content process it had already
+                // seen die, and its profile lock's `kill(pid, 0)` probe
+                // treats ESRCH as "stale lock" but any other answer as
+                // "still running".
+                if self.linux_process().is_zombie_child(pid) {
+                    return Ok(0);
+                }
+                return Err(LxError::ESRCH);
+            };
             match signal {
                 Signal::SIGKILL => {
                     let retcode = (128 + Signal::SIGKILL as i32) as i64;

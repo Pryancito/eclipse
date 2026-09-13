@@ -52,6 +52,7 @@ pub fn install(rootfs: &Path) {
     write_xfce_defaults(rootfs);
     write_fallback_icons(rootfs);
     write_x11_prepare(rootfs);
+    write_gtk_caches_wrapper(rootfs);
     write_xkbmap_wrapper(rootfs);
     write_eclipse_kbd(rootfs);
     write_eclipse_locale(rootfs);
@@ -75,6 +76,124 @@ pub fn install(rootfs: &Path) {
 /// the real display is derived from the socket name rather than trusting
 /// `$DISPLAY`; and `after =` only orders the FORK of labwc, not Xwayland's
 /// readiness, so it waits for the `/tmp/.X11-unix/X*` socket itself.
+/// `/usr/local/bin/eclipse-gtk-caches`: the two GTK caches the Wayland
+/// session must have BEFORE the first GTK client starts, as a boot oneshot
+/// ordered ahead of labwc (`gtk-caches.service`). `eclipse-x11-prepare` does
+/// the same for the Xorg path, but only `.xinitrc` runs it, so the labwc boot
+/// -- the one `make qemu` takes -- came up without either.
+///
+/// * `gschemas.compiled`. Its absence is what blanked every piece of Firefox
+///   chrome text (tabs, URL bar, menus) while page content rendered fine.
+///   GDK's Wayland backend reads its Xft settings through GSettings and,
+///   when `g_settings_schema_source_get_default()` is NULL (no compiled
+///   schemas anywhere), returns from `init_settings()` before ever calling
+///   `_gdk_screen_set_resolution()`; `gdk_screen_get_resolution()` then
+///   stays at its "unset" value of -1. Firefox's GTK LookAndFeel takes
+///   `resolution / 96` as the text scale factor, so the chrome was laid out
+///   at a NEGATIVE scale: glyphs of negative size are not drawn, and the
+///   negative window sizes are the `gtk_widget_set_size_request: assertion
+///   'width >= -1' failed` criticals in the same log. Content processes use
+///   the pref-font DPI path, which clamps `<= 0` to 96, which is why pages
+///   were readable and the browser around them was not.
+/// * gdk-pixbuf `loaders.cache`, at the private path the session environment
+///   points `GDK_PIXBUF_MODULE_FILE` to. The comment there said "regenerated
+///   by autostart on every session start", but labwc's autostart is
+///   intentionally absent (see `write_labwc_autostart`), so it was never
+///   written on this path: "Could not load a pixbuf from icon theme".
+///
+/// Both steps are cheap (a directory of XML, a handful of `.so`) and
+/// idempotent; the schema compile is skipped when the image already ships
+/// the file (see `compile_gsettings_schemas`).
+fn write_gtk_caches_wrapper(rootfs: &Path) {
+    let localbin = rootfs.join("usr/local/bin");
+    let _ = fs::create_dir_all(&localbin);
+    let wrapper = localbin.join("eclipse-gtk-caches");
+    fs::write(
+        &wrapper,
+        b"#!/bin/sh\n\
+          # Eclipse OS: GTK caches the Wayland session needs before its first\n\
+          # GTK client. See write_gtk_caches_wrapper in xtask/src/linux/desktop.rs.\n\
+          log=/tmp/eclipse-gtk-caches.log\n\
+          {\n\
+          echo \"[$(date '+%H:%M:%S')] start\"\n\
+          # GSettings schemas. Without gschemas.compiled GDK/Wayland never sets\n\
+          # the screen resolution and Firefox lays its chrome out at a negative\n\
+          # text scale (blank tabs/URL bar).\n\
+          sd=/usr/share/glib-2.0/schemas\n\
+          if [ -d \"$sd\" ] && [ ! -s \"$sd/gschemas.compiled\" ]; then\n\
+          \x20 if command -v glib-compile-schemas >/dev/null 2>&1; then\n\
+          \x20   glib-compile-schemas \"$sd\" && echo 'gschemas.compiled written'\n\
+          \x20 else\n\
+          \x20   echo 'warning: glib-compile-schemas missing and no gschemas.compiled shipped'\n\
+          \x20 fi\n\
+          else\n\
+          \x20 echo 'gschemas.compiled present'\n\
+          fi\n\
+          # gdk-pixbuf loaders, at the private path GDK_PIXBUF_MODULE_FILE names\n\
+          # in /root/.config/labwc/environment (regenerated every boot: a stale\n\
+          # cache omits loaders installed later).\n\
+          pc=${GDK_PIXBUF_MODULE_FILE:-/root/.cache/pixbuf-loaders.cache}\n\
+          if command -v gdk-pixbuf-query-loaders >/dev/null 2>&1; then\n\
+          \x20 mkdir -p \"$(dirname \"$pc\")\"\n\
+          \x20 gdk-pixbuf-query-loaders > \"$pc.tmp\" 2>>\"$log\" && mv \"$pc.tmp\" \"$pc\" \\\n\
+          \x20   && echo \"pixbuf loaders.cache written to $pc\"\n\
+          fi\n\
+          echo \"[$(date '+%H:%M:%S')] done\"\n\
+          } >>\"$log\" 2>&1\n\
+          exit 0\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// Compile the rootfs's GSettings schemas at image-build time with the
+/// host's `glib-compile-schemas`, so the live image boots with
+/// `gschemas.compiled` already in place (the boot oneshot above is then a
+/// no-op and, on an image without the compiler, the only way to get it).
+/// The package step runs `apk --no-scripts`, which skips the trigger that
+/// would have produced the file. Best effort: no host tool, no file, one
+/// warning. The output is a plain GVDB keyed by the XML content, not by the
+/// host, so a host-compiled file is what the guest would have produced.
+pub fn compile_gsettings_schemas(rootfs: &Path) {
+    let dir = rootfs.join("usr/share/glib-2.0/schemas");
+    if !dir.is_dir() {
+        return;
+    }
+    let has_xml = fs::read_dir(&dir)
+        .map(|rd| {
+            rd.flatten().any(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.ends_with(".gschema.xml") || n.ends_with(".gschema.override")
+            })
+        })
+        .unwrap_or(false);
+    if !has_xml {
+        return;
+    }
+    match std::process::Command::new("glib-compile-schemas")
+        .arg("--targetdir")
+        .arg(&dir)
+        .arg(&dir)
+        .status()
+    {
+        Ok(st) if st.success() => {
+            println!("gschemas.compiled: written into {}", dir.display());
+        }
+        Ok(st) => eprintln!(
+            "warning: glib-compile-schemas failed ({st}); the boot oneshot \
+             eclipse-gtk-caches will retry in the guest"
+        ),
+        Err(e) => eprintln!(
+            "warning: glib-compile-schemas not runnable on the host ({e}); the boot \
+             oneshot eclipse-gtk-caches will compile in the guest if it can"
+        ),
+    }
+}
+
 fn write_xkbmap_wrapper(rootfs: &Path) {
     let localbin = rootfs.join("usr/local/bin");
     let _ = fs::create_dir_all(&localbin);
@@ -1009,6 +1128,11 @@ fn write_firefox_wrapper(rootfs: &Path) {
           export MOZ_WEBRENDER_SOFTWARE=1\n\
           export MOZ_ACCELERATED=0\n\
           export MOZ_CRASHREPORTER_DISABLE=1\n\
+          # No accessibility bus on Eclipse OS: stop GTK/at-spi from probing\n\
+          # for one (two 'Failed to create DBus proxy for org.a11y.Bus' lines\n\
+          # per start, plus a refused connect on every launch).\n\
+          export NO_AT_BRIDGE=1\n\
+          export GTK_A11Y=none\n\
           # Caches go to /tmp (a ramfs that grows on demand), not to the\n\
           # root SFS image, which is RAM too but fixed-size and nearly full\n\
           # at boot on the QEMU live image. Firefox puts startupCache and\n\
@@ -1882,6 +2006,32 @@ fn write_labwc_wrapper(rootfs: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two session wrappers must be valid POSIX shell (`sh -n`), and the
+    /// GTK-caches oneshot must compile schemas and write the private pixbuf
+    /// loader cache -- the two files Firefox chrome text and GTK icons hang on.
+    #[test]
+    fn gtk_caches_and_firefox_wrappers_parse_and_cover_both_caches() {
+        let dir = std::env::temp_dir().join(format!("eclipse-gtkcaches-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_gtk_caches_wrapper(&dir);
+        write_firefox_wrapper(&dir);
+        for name in ["eclipse-gtk-caches", "eclipse-firefox"] {
+            let path = dir.join("usr/local/bin").join(name);
+            let src = fs::read_to_string(&path).unwrap();
+            assert!(src.starts_with("#!/bin/sh\n"), "{name}: shebang");
+            let st = std::process::Command::new("sh").arg("-n").arg(&path).status().unwrap();
+            assert!(st.success(), "{name}: sh -n rejected the script");
+        }
+        let caches = fs::read_to_string(dir.join("usr/local/bin/eclipse-gtk-caches")).unwrap();
+        assert!(caches.contains("glib-compile-schemas \"$sd\""));
+        assert!(caches.contains("gschemas.compiled"));
+        assert!(caches.contains("gdk-pixbuf-query-loaders > \"$pc.tmp\""));
+        assert!(caches.contains("/root/.cache/pixbuf-loaders.cache"));
+        let ff = fs::read_to_string(dir.join("usr/local/bin/eclipse-firefox")).unwrap();
+        assert!(ff.contains("export NO_AT_BRIDGE=1\n"));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// Autostart file is intentionally absent (clients come from init).
     #[test]
