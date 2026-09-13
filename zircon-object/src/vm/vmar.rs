@@ -240,6 +240,8 @@ pub struct VmAddressRegion {
     addr: VirtAddr,
     size: usize,
     parent: Option<Arc<VmAddressRegion>>,
+    /// Lock-order invariant (shared with `VmMapping`): when both are needed,
+    /// always acquire `inner` before `page_table`.
     page_table: Arc<Mutex<dyn GenericPageTable>>,
     /// If inner is None, this region is destroyed, all operations are invalid.
     inner: Mutex<Option<VmarInner>>,
@@ -1099,14 +1101,17 @@ impl VmAddressRegion {
         if mappings.is_empty() {
             return;
         }
-        let ranges: Vec<(VirtAddr, usize)> = mappings
-            .values()
-            .map(|m| {
-                let inner = m.inner.lock();
-                (inner.addr, inner.size)
-            })
-            .filter(|(_, size)| *size != 0)
-            .collect();
+        // Lock order: `inner` -> `page_table`. Gather geometry and mark each
+        // taken mapping empty BEFORE touching the page table so `Drop` does not
+        // try to unmap again.
+        let mut ranges: Vec<(VirtAddr, usize)> = Vec::with_capacity(mappings.len());
+        for m in mappings.values() {
+            let mut inner = m.inner.lock();
+            if inner.size != 0 {
+                ranges.push((inner.addr, inner.size));
+                inner.size = 0;
+            }
+        }
         let owed = if !ranges.is_empty() {
             let mut pt = self.page_table.lock();
             pt.set_gather(true);
@@ -1122,10 +1127,6 @@ impl VmAddressRegion {
             // below must not run under it (or the VMAR lock).
             let root = self.page_table.lock().table_phys();
             kernel_hal::remote_flush_tlb_aspace(None, Some(root));
-        }
-        for m in mappings.values() {
-            let mut inner = m.inner.lock();
-            inner.size = 0;
         }
         drop(mappings);
     }
@@ -1937,6 +1938,8 @@ pub struct VmMapping {
     /// The permission limitation of the vmar
     permissions: MMUFlags,
     vmo: Arc<VmObject>,
+    /// Lock-order invariant (shared with `VmAddressRegion`): when both are
+    /// needed, always acquire `inner` before `page_table`.
     page_table: Arc<Mutex<dyn GenericPageTable>>,
     inner: Mutex<VmMappingInner>,
 }
