@@ -2153,6 +2153,36 @@ impl VmMapping {
         if !self.overlap(begin, end) {
             return Ok(None);
         }
+        // A superset cut splits this mapping in two and needs a fresh
+        // `VmMapping`. Build it BEFORE taking `inner` + `page_table`: that
+        // allocation is the one thing in here that can fail, and failing
+        // under both locks is a panic that halts this CPU with them held.
+        // That is what the "deadlock" in #1136 was -- cpu0 at this site
+        // holding `page_table`, cpu3 waiting for it in `table_phys()`, in a
+        // run whose heap was exhausted (#1135); every `page_table` site in
+        // this file takes `inner` first or nothing, so there is no ordering
+        // cycle to fix. The spare starts with `size = 0`, which makes its
+        // `Drop` a no-op if it is not adopted; the flags come over into
+        // pre-reserved capacity, so nothing allocates under the locks.
+        let spare = {
+            let inner = self.inner.lock();
+            if inner.addr < begin && inner.end_addr() > end {
+                let new_len2 = inner.end_addr() - end;
+                Some(Arc::new(VmMapping {
+                    permissions: self.permissions,
+                    vmo: self.vmo.clone(),
+                    page_table: self.page_table.clone(),
+                    inner: Mutex::new(VmMappingInner {
+                        flags: Vec::with_capacity(pages(new_len2)),
+                        addr: end,
+                        size: 0,
+                        vmo_offset: 0,
+                    }),
+                }))
+            } else {
+                None
+            }
+        };
         let mut inner = self.inner.lock();
         let mut page_table = self.page_table.lock();
         if inner.addr >= begin && inner.end_addr() <= end {
@@ -2192,18 +2222,17 @@ impl VmMapping {
             page_table
                 .unmap_cont(begin, cut_len)
                 .map_err(Self::paging_error_as_zx)?;
-            let new_flags_range = (pages(inner.size) - pages(new_len2))..pages(inner.size);
-            let new_mapping = Arc::new(VmMapping {
-                permissions: self.permissions,
-                vmo: self.vmo.clone(),
-                page_table: self.page_table.clone(),
-                inner: Mutex::new(VmMappingInner {
-                    flags: inner.flags.drain(new_flags_range).collect(),
-                    addr: end,
-                    size: new_len2,
-                    vmo_offset: inner.vmo_offset + (end - inner.addr),
-                }),
-            });
+            // Only this method changes a mapping's geometry and its callers
+            // hold the VMAR lock, so the spare built above is for exactly
+            // this split; a miss is a bug, not a race to retry.
+            let new_mapping = spare.ok_or(ZxError::BAD_STATE)?;
+            {
+                let mut new_inner = new_mapping.inner.lock();
+                let new_flags_range = (pages(inner.size) - pages(new_len2))..pages(inner.size);
+                new_inner.flags.extend(inner.flags.drain(new_flags_range));
+                new_inner.vmo_offset = inner.vmo_offset + (end - inner.addr);
+                new_inner.size = new_len2;
+            }
             inner.size = new_len1;
             inner.flags.truncate(pages(new_len1));
             Ok(Some(new_mapping))
