@@ -48,6 +48,7 @@ pub fn install(rootfs: &Path) {
     write_terminal_wrapper(rootfs);
     write_firefox_wrapper(rootfs);
     write_firefox_desktop_override(rootfs);
+    write_firefox_default_prefs(rootfs);
     write_xorg_config(rootfs);
     write_xfce_defaults(rootfs);
     write_fallback_icons(rootfs);
@@ -1030,6 +1031,43 @@ fn write_firefox_wrapper(rootfs: &Path) {
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// Default prefs shipped next to the Firefox install (`defaults/pref/*.js`
+/// is read for every profile, the same slot `channel-prefs.js` uses).
+///
+/// The QEMU root is an SFS image in RAM, sized with ~40% headroom over its
+/// payload and with no `/home` split; `HOME=/root` lives on it. Firefox's
+/// disk cache defaults to "smart size" -- up to 1 GiB, chosen from the free
+/// space it sees -- and writes it under `~/.cache/mozilla`. A cache on a RAM
+/// disk buys nothing and, on this image, fills the root in a couple of
+/// minutes of browsing: the SFS then reports `unused_blocks: 0`, and until
+/// the vendored `alloc_block` was wired in that was a kernel panic rather
+/// than ENOSPC. Keep the memory cache; turn the disk cache off.
+///
+/// Both package names are covered because `firefox` and `firefox-esr` are
+/// separate Alpine packages with separate install dirs (see the wrapper).
+/// Nothing is written when neither is installed in the rootfs.
+fn write_firefox_default_prefs(rootfs: &Path) {
+    for dir in ["usr/lib/firefox", "usr/lib/firefox-esr"] {
+        let app = rootfs.join(dir);
+        if !app.is_dir() {
+            continue;
+        }
+        let pref_dir = app.join("defaults/pref");
+        let _ = fs::create_dir_all(&pref_dir);
+        fs::write(
+            pref_dir.join("eclipse-os.js"),
+            b"// Eclipse OS defaults -- see write_firefox_default_prefs in\n\
+              // xtask/src/linux/desktop.rs.\n\
+              // The root filesystem is a RAM-backed SFS image with little\n\
+              // headroom: no on-disk cache (the memory cache stays on).\n\
+              pref(\"browser.cache.disk.enable\", false);\n\
+              pref(\"browser.cache.disk.smart_size.enabled\", false);\n\
+              pref(\"browser.cache.disk.capacity\", 0);\n",
+        )
+        .unwrap();
     }
 }
 

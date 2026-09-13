@@ -858,12 +858,22 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
             // Bounded to the first few DISTINCT addresses: an exec fault is
             // rare, but a loop faulting on one address would otherwise flood a
             // serial console at `error!`.
+            //
+            // Only ANONYMOUS mappings (or a fault that fails) claim a slot. The
+            // first run of this report showed the eight slots gone by t=15s to
+            // pulseaudio demand-paging libogg, libvorbis, libFLAC... -- the
+            // ordinary first touch of a shared library's text, each resolved
+            // -- and Firefox's JIT fault never got a line. File-backed text
+            // faulting in and resolving is the normal case, not the question.
             let fault_result = vmar.handle_page_fault(vaddr, flags);
             if flags.contains(kernel_hal::MMUFlags::EXECUTE) {
                 use core::sync::atomic::{AtomicUsize, Ordering};
                 const SLOTS: usize = 8;
                 static SEEN: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
-                let fresh = SEEN.iter().all(|s| s.load(Ordering::Relaxed) != vaddr)
+                let at = describe_addr(&vmar, vaddr);
+                let interesting = fault_result.is_err() || at.starts_with("anon+");
+                let fresh = interesting
+                    && SEEN.iter().all(|s| s.load(Ordering::Relaxed) != vaddr)
                     && SEEN.iter().any(|s| {
                         s.compare_exchange(0, vaddr, Ordering::AcqRel, Ordering::Relaxed)
                             .is_ok()
@@ -873,7 +883,7 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                         "[xfault] user instruction-fetch fault @ {:#x} [{}] flags={:?} \
                          resolved={} pid={} proc={} pc={:#x} [{}]",
                         vaddr,
-                        describe_addr(&vmar, vaddr),
+                        at,
                         flags,
                         fault_result.is_ok(),
                         pid,

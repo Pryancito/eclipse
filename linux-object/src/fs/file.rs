@@ -434,8 +434,41 @@ impl FileInner {
         if !crate::fs::memfd_write_allowed(&self.inode) {
             return Err(LxError::EPERM);
         }
-        let len = self.inode.write_at(offset as usize, buf)?;
-        Ok(len)
+        match self.inode.write_at(offset as usize, buf) {
+            Ok(len) => Ok(len),
+            // A regular file that cannot grow is ENOSPC, as on Linux. The
+            // blanket `FsError -> LxError` table says ENOMEM, which is right
+            // for the device nodes that reuse `NoDeviceSpace` for a failed
+            // buffer allocation (DRM CREATE_DUMB) but wrong here: a writer
+            // told "out of memory" backs off and retries, one told "no space
+            // left on device" stops.
+            Err(FsError::NoDeviceSpace)
+                if matches!(self.inode.metadata().map(|m| m.type_), Ok(FileType::File)) =>
+            {
+                Err(LxError::ENOSPC)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+/// Say which file filled the disk. The root image is an SFS sized with ~40%
+/// headroom over its payload, so when it fills the interesting fact is WHAT
+/// filled it -- a runaway log, a browser cache, a leak in the allocator -- and
+/// nothing else in the log answers that. Printed for the first few distinct
+/// paths only; a writer that keeps retrying would otherwise flood the console.
+fn report_enospc(path: &str, offset: u64, len: usize, size: Option<u64>) {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static SEEN: AtomicUsize = AtomicUsize::new(0);
+    const LIMIT: usize = 8;
+    if SEEN.fetch_add(1, Ordering::Relaxed) < LIMIT {
+        error!(
+            "[enospc] write of {} bytes at offset {:#x} to {} refused: no space left on device              (file is {} bytes now)",
+            len,
+            offset,
+            path,
+            size.map_or_else(|| String::from("?"), |s| alloc::format!("{s}")),
+        );
     }
 }
 
@@ -642,7 +675,14 @@ impl FileLike for File {
     }
 
     fn write(&self, buf: &[u8]) -> LxResult<usize> {
-        self.inner.write().write(buf)
+        let mut inner = self.inner.write();
+        let offset = inner.offset;
+        let r = inner.write(buf);
+        if matches!(r, Err(LxError::ENOSPC)) {
+            let size = inner.inode.metadata().ok().map(|m| m.size as u64);
+            report_enospc(&self.path, offset, buf.len(), size);
+        }
+        r
     }
 
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> LxResult<usize> {
@@ -678,7 +718,13 @@ impl FileLike for File {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> LxResult<usize> {
-        self.inner.write().write_at(offset, buf)
+        let mut inner = self.inner.write();
+        let r = inner.write_at(offset, buf);
+        if matches!(r, Err(LxError::ENOSPC)) {
+            let size = inner.inode.metadata().ok().map(|m| m.size as u64);
+            report_enospc(&self.path, offset, buf.len(), size);
+        }
+        r
     }
 
     fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {

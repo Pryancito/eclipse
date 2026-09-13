@@ -253,39 +253,17 @@ impl UserContext {
                 self.0.run_fncall()
             } else {
                 self.dbg_validate_user_ctx("before enter_uspace");
-                // [rbpfix] Break the physmap-rbp propagation loop. A user thread
-                // intermittently ends up with `rbp` = physmap base (bit 47 set,
-                // sign-extended) OR'd over its real, small frame pointer — i.e.
-                // `phys_to_virt(rbp)`. A hardware data-write watchpoint pinned the
-                // propagation to `trap_syscall_entry`'s `push %rbp`: the corrupt
-                // value is saved into the context on every syscall/interrupt and
-                // restored into the register on every return (`pop rbp`), so once
-                // a thread's rbp is physmap it stays physmap — and the thread
-                // livelocks (re-enters, faults on the bogus frame pointer,
-                // re-enters…), killing multithreaded processes like Firefox.
-                //
-                // A user rbp in the kernel physmap window is always wrong (ring 3
-                // can never legitimately hold it), so mask bits 47-63 off before
-                // entering user mode. That restores the real low frame pointer and
-                // breaks the loop at the one point every return funnels through.
-                // Exactly targeted: legitimate low frame pointers and the System V
-                // outermost-frame `rbp = -1` sentinel are outside the window and
-                // untouched. (The one-time seed that first sets the bit is a rare
-                // register-level event, not a memory write; this makes it benign.)
-                #[cfg(target_arch = "x86_64")]
-                {
-                    const PHYSMAP_BASE: usize = 0xffff_8000_0000_0000;
-                    const PHYSMAP_END: usize = 0xffff_c000_0000_0000;
-                    let rbp = self.0.general.rbp;
-                    if (PHYSMAP_BASE..PHYSMAP_END).contains(&rbp) {
-                        let fixed = rbp & 0x0000_7fff_ffff_ffff;
-                        error!(
-                            "[rbpfix] sanitizing corrupt user rbp {:#x} -> {:#x}",
-                            rbp, fixed
-                        );
-                        self.0.general.rbp = fixed;
-                    }
-                }
+                // There used to be a `[rbpfix]` here that rewrote a user `rbp`
+                // found inside the kernel physmap window (0xffff_8000_...) on
+                // the theory that "ring 3 can never legitimately hold it". It
+                // can. Alpine builds Firefox without frame pointers, so `rbp`
+                // is an ordinary GPR there, and SpiderMonkey's NaN-boxing tag
+                // mask is exactly 0xffff_8000_0000_0000 (`JSVAL_TAG_MASK`).
+                // Every timer/IPI landing in libxul code that held that mask
+                // in `rbp` came back with `rbp = 0`, silently breaking the
+                // Value type tests the code was in the middle of -- that is a
+                // content process crashing "at random" in JS. The kernel never
+                // dereferences a user `rbp`; it must not edit it either.
                 self.0.run();
                 self.dbg_validate_user_ctx("after trap from user");
             }
@@ -309,11 +287,6 @@ impl UserContext {
                 warn!("[ctxcheck] heartbeat n={} ({})", n, when);
             }
             const USER_MAX: usize = 0x0000_8000_0000_0000;
-            // Kernel direct-map ("physmap") window. A *leaked* kernel pointer in
-            // a user general register lands here; that is the corruption we hunt
-            // (see the `[uleak]` scanner in `user.rs`).
-            const PHYSMAP_BASE: usize = 0xffff_8000_0000_0000;
-            const PHYSMAP_END: usize = 0xffff_c000_0000_0000;
             // Do NOT treat a low rip/rsp/rbp as corruption: this loader maps PIE
             // executables (apk and the musl dynamic linker `ld-musl`) at base 0
             // (see `Loader::load_impl`: `app_base` is the start of an empty
@@ -334,13 +307,14 @@ impl UserContext {
             // `rip` and `rsp` are consumed by the CPU on `sysret`/`iret`, so a
             // kernel-half value there is genuinely fatal. `rbp` (and every other
             // GPR) is never dereferenced by the kernel and may legitimately hold
-            // a non-canonical sentinel — e.g. the System V outermost-frame
-            // marker `rbp = -1` (0xffff_ffff_ffff_ffff), which a process exiting
-            // via `exit_group` routinely carries. Flagging `rbp >= USER_MAX`
-            // therefore mis-fired on every such exit. Only treat `rbp` as
-            // corrupt when it is an actual leaked physmap pointer.
-            let rbp_leak = (PHYSMAP_BASE..PHYSMAP_END).contains(&g.rbp);
-            if g.rip >= USER_MAX || g.rsp >= USER_MAX || rbp_leak {
+            // anything: the System V outermost-frame marker `rbp = -1`, or --
+            // in frame-pointer-less code such as Alpine's Firefox -- plain data
+            // like SpiderMonkey's tag mask 0xffff_8000_0000_0000, which sits
+            // exactly at the physmap base. Flagging `rbp` in that window fired
+            // on every interrupt taken inside libxul and was the trigger for
+            // the (since removed) `[rbpfix]` rewrite that zeroed it. So: rip
+            // and rsp only.
+            if g.rip >= USER_MAX || g.rsp >= USER_MAX {
                 error!(
                     "[ctxcheck] {} CORRUPT user ctx cpu={} ctx_addr={:#x}: rip={:#x} rsp={:#x} rbp={:#x} fsbase={:#x} \
                      rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} \
