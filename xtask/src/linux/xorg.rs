@@ -777,9 +777,21 @@ pub(super) fn install(rootfs: &Path, apk_bin: &Path, arch: &str) {
             // time — fontconfig still opens and parses every rejected file to
             // build its cache. The only thing that stops the scan is not listing
             // those directories. So ship a fonts.conf that scans ONLY the
-            // scalable dirs the desktop actually uses (DejaVu for pango/foot,
-            // Adwaita for GTK); the bitmap packages stay on disk for Xorg. The
-            // conf.d rendering defaults are still included.
+            // scalable dirs the desktop actually uses (DejaVu for pango/foot);
+            // the bitmap packages stay on disk for Xorg. The conf.d rendering
+            // defaults are still included.
+            //
+            // Adwaita Sans/Mono (the `adwaita-fonts` variable fonts) are OUT
+            // of the scan and deleted below, and the generic families are
+            // pinned to DejaVu with strong aliases. With Adwaita in the scan,
+            // `fc-match sans-serif` answered AdwaitaSans, and Firefox's chrome
+            // -- which asks GTK for the system font and gets "Sans" -- drew NO
+            // text at all: no tab titles, no URL-bar placeholder, no menu
+            // labels, while page content (Firefox's own default list starts
+            // with DejaVu Sans) rendered fine. Firefox does not rasterize that
+            // variable font on this stack; nothing on the desktop asks for it
+            // by name (labwc, foot, GTK settings all say DejaVu), so the only
+            // way it was ever reached was through the generic alias.
             let fc_confd = rootfs.join("etc/fonts/conf.d");
             let _ = std::fs::create_dir_all(&fc_confd);
             let _ = std::fs::write(
@@ -789,12 +801,18 @@ pub(super) fn install(rootfs: &Path, apk_bin: &Path, arch: &str) {
                   <fontconfig>\n\
                   \x20 <description>Eclipse: scan only the scalable fonts the desktop uses; X11 bitmap fonts stay on disk for Xorg's FontPath but out of the fontconfig scan (see xtask/src/linux/xorg.rs)</description>\n\
                   \x20 <dir>/usr/share/fonts/dejavu</dir>\n\
-                  \x20 <dir>/usr/share/fonts/Adwaita</dir>\n\
                   \x20 <dir>/usr/local/share/fonts</dir>\n\
                   \x20 <dir prefix=\"xdg\">fonts</dir>\n\
                   \x20 <dir>~/.fonts</dir>\n\
                   \x20 <cachedir>/var/cache/fontconfig</cachedir>\n\
                   \x20 <cachedir prefix=\"xdg\">fontconfig</cachedir>\n\
+                  \x20 <!-- Generic families resolve to DejaVu, ahead of anything conf.d prefers. -->\n\
+                  \x20 <alias binding=\"strong\"><family>sans-serif</family><prefer><family>DejaVu Sans</family></prefer></alias>\n\
+                  \x20 <alias binding=\"strong\"><family>serif</family><prefer><family>DejaVu Serif</family></prefer></alias>\n\
+                  \x20 <alias binding=\"strong\"><family>monospace</family><prefer><family>DejaVu Sans Mono</family></prefer></alias>\n\
+                  \x20 <alias binding=\"strong\"><family>system-ui</family><prefer><family>DejaVu Sans</family></prefer></alias>\n\
+                  \x20 <alias binding=\"strong\"><family>Adwaita Sans</family><prefer><family>DejaVu Sans</family></prefer></alias>\n\
+                  \x20 <alias binding=\"strong\"><family>Adwaita Mono</family><prefer><family>DejaVu Sans Mono</family></prefer></alias>\n\
                   \x20 <include ignore_missing=\"yes\">/etc/fonts/conf.d</include>\n\
                   </fontconfig>\n",
             );
@@ -821,6 +839,8 @@ pub(super) fn install(rootfs: &Path, apk_bin: &Path, arch: &str) {
                 "usr/share/fonts/encodings",
                 "usr/share/fonts/Type1",
                 "usr/share/fonts/util",
+                // Variable fonts Firefox's chrome cannot draw; see fonts.conf.
+                "usr/share/fonts/Adwaita",
             ] {
                 let _ = std::fs::remove_dir_all(rootfs.join(bitmap_dir));
             }
