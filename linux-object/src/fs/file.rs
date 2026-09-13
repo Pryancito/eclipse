@@ -154,10 +154,24 @@ type SharedVmoMap = alloc::collections::BTreeMap<
 /// It only ever worked when the SAME fd was inherited or SCM_RIGHTS-passed,
 /// which is why wl_shm masked it. Files whose filesystem reports inode 0 fall
 /// back to the Arc pointer: no cross-open dedup, but never a false merge.
+///
+/// Inodes without a file system (ttys, pipes, sockets: anything that inherits
+/// the default `fs()`, which returns the `no_fs` placeholder) also fall back
+/// to the Arc pointer. Every
+/// `read(2)`/`write(2)` consults the cache registry through this key, so it
+/// must never assume the inode is a disk file.
 fn cache_key(inode: &Arc<dyn INode>) -> (usize, usize) {
+    let by_pointer = (Arc::as_ptr(inode) as *const () as usize, usize::MAX);
     match inode.metadata() {
-        Ok(md) if md.inode != 0 => (Arc::as_ptr(&inode.fs()) as *const () as usize, md.inode),
-        _ => (Arc::as_ptr(inode) as *const () as usize, usize::MAX),
+        Ok(md) if md.inode != 0 => {
+            let fs = inode.fs();
+            if rcore_fs::vfs::is_no_fs(&fs) {
+                by_pointer
+            } else {
+                (Arc::as_ptr(&fs) as *const () as usize, md.inode)
+            }
+        }
+        _ => by_pointer,
     }
 }
 
