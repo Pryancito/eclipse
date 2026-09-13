@@ -64,6 +64,10 @@ impl LinuxRootfs {
             if firefox_probe.is_file() {
                 let _ = fs::copy(&firefox_probe, bin.join("firefox-probe"));
             }
+            let audio_probe = self.audio_probe(&musl);
+            if audio_probe.is_file() {
+                let _ = fs::copy(&audio_probe, bin.join("audio-probe"));
+            }
             self.install_thread_tests(&dir);
             // INIT (PID 1): the Eclipse-native Rust init by default, with busybox
             // init as a resilient fallback. `install_busybox_init` runs first so
@@ -533,6 +537,15 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             let dst = bin.join("firefox-probe");
             let _ = dir::rm(&dst);
             fs::copy(&firefox_probe, &dst).unwrap();
+        }
+
+        // audio-probe: the audio layers Firefox's cubeb rests on, driven the
+        // way alsa-lib / PulseAudio drive them, with an audible tone per layer.
+        let audio_probe = self.audio_probe(&musl);
+        if audio_probe.is_file() {
+            let dst = bin.join("audio-probe");
+            let _ = dir::rm(&dst);
+            fs::copy(&audio_probe, &dst).unwrap();
         }
 
         // ecl-compute: SAXPY / GIOPS on the NVIDIA compute GPU via card1.
@@ -1893,6 +1906,56 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             .status();
         if !status.success() {
             println!("Failed to compile firefox-probe");
+            return executable;
+        }
+
+        Ext::new(strip).arg("-s").arg(&executable).status();
+        executable
+    }
+
+    /// Compile `audio-probe` (static musl) into `/bin/audio-probe`: the sound
+    /// counterpart of `firefox-probe`. It drives `/dev/dsp`, the raw ALSA PCM
+    /// and control ABI of `/dev/snd` and the PulseAudio socket exactly as
+    /// alsa-lib, cubeb and Pulse do, plays a 440 Hz tone through each playback
+    /// layer, and reports which cubeb backend Firefox's `OpenCubeb()` would
+    /// get. `-lm` for the sine (musl folds libm into libc; the flag is inert
+    /// there and required by any other libc). Same mtime skip as
+    /// `firefox_probe`.
+    fn audio_probe(&self, musl: &Path) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join("audio-probe");
+        let executable = dir.join("audio-probe");
+        let source = dir.join("audio-probe.c");
+        if executable.is_file() && source.is_file() {
+            if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
+            {
+                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
+                    if bin_mtime >= src_mtime {
+                        return executable;
+                    }
+                }
+            }
+        }
+
+        println!("Compiling audio-probe...");
+        let musl = musl.canonicalize().unwrap();
+        let bin = musl.join("bin");
+        let arch = self.0.name();
+        let cc = format!("{}/{}-linux-musl-gcc", bin.display(), arch);
+        let strip = self.strip(&musl);
+
+        fs::create_dir_all(&dir).unwrap();
+        let status = Ext::new(&cc)
+            .current_dir(&dir)
+            .arg("-static")
+            .arg("-O2")
+            .arg("-s")
+            .arg("-o")
+            .arg(&executable)
+            .arg(&source)
+            .arg("-lm")
+            .status();
+        if !status.success() {
+            println!("Failed to compile audio-probe");
             return executable;
         }
 
