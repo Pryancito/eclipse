@@ -840,7 +840,50 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
             let pc = thread
                 .with_context(|ctx| ctx.get_field(UserContextField::InstrPointer))
                 .unwrap_or(0);
-            if let Err(err) = vmar.handle_page_fault(vaddr, flags) {
+            // [xfault] A user INSTRUCTION-FETCH fault is worth reporting even
+            // when it resolves. Firefox's content process dies at a fixed
+            // address on every boot (`rip == rax == 0x189b2a10`, `err=0x14`:
+            // user, instruction fetch, page NOT present), and the existing
+            // report below only fires when the fault is FATAL -- so if the
+            // kernel commits a page and the crash happens elsewhere, the log
+            // says nothing at all and the trail ends.
+            //
+            // `describe_addr` answers the question that splits the diagnosis in
+            // two: "in map A-B" means the address is inside a mapping with no
+            // page behind it, so the demand path is where to look; "unmapped"
+            // means the JIT jumped outside what it reserved, so munmap/mremap
+            // and the splitting of its reservation are. Printing the outcome
+            // too distinguishes "resolved, crash is elsewhere" from "fatal".
+            //
+            // Bounded to the first few DISTINCT addresses: an exec fault is
+            // rare, but a loop faulting on one address would otherwise flood a
+            // serial console at `error!`.
+            let fault_result = vmar.handle_page_fault(vaddr, flags);
+            if flags.contains(kernel_hal::MMUFlags::EXECUTE) {
+                use core::sync::atomic::{AtomicUsize, Ordering};
+                const SLOTS: usize = 8;
+                static SEEN: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
+                let fresh = SEEN.iter().all(|s| s.load(Ordering::Relaxed) != vaddr)
+                    && SEEN.iter().any(|s| {
+                        s.compare_exchange(0, vaddr, Ordering::AcqRel, Ordering::Relaxed)
+                            .is_ok()
+                    });
+                if fresh {
+                    error!(
+                        "[xfault] user instruction-fetch fault @ {:#x} [{}] flags={:?} \
+                         resolved={} pid={} proc={} pc={:#x} [{}]",
+                        vaddr,
+                        describe_addr(&vmar, vaddr),
+                        flags,
+                        fault_result.is_ok(),
+                        pid,
+                        thread.proc().name(),
+                        pc,
+                        describe_addr(&vmar, pc),
+                    );
+                }
+            }
+            if let Err(err) = fault_result {
                 error!(
                     "unhandled page fault @ {:#x}({:?}) [{}]: {:?}, pid={} proc={} pc={:#x} [{}] -> SIGSEGV",
                     vaddr,
