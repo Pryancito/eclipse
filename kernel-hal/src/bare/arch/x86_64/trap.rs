@@ -1113,13 +1113,24 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                     // Settle it. `gs:4` is the RSP0 field of the TSS inside the
                     // CpuLocalRegion that GS names; the CPU's stack switch uses
                     // the TSS that TR names. They are the same field only if
-                    // both name the same TSS. Every cpu builds its own region
-                    // and extends a SHARED GDT, so the descriptor index an AP
-                    // loads into TR is arithmetic over a table other cpus are
-                    // also growing -- and a region base that differs from GS's
+                    // both name the same TSS, and a base that differs from GS's
                     // is precisely "the stack the CPU switched to is not the one
                     // gs:4 names". Read TR, decode the 64-bit system-segment
                     // base out of the GDT, and print both.
+                    //
+                    // Reading `gdt.rs` this SHOULD come back equal: `init_ap`
+                    // copies the BSP's GDT into a private `Vec`, appends only
+                    // this cpu's own `[tss0, tss1]`, leaks that and `lgdt`s it,
+                    // so the TSS sits at the fixed index `BSP_GDT_COUNT` in a
+                    // table no other cpu touches, and `load_tss` uses that same
+                    // constant. No shared table, no index to drift.
+                    //
+                    // Measure it anyway. "TR and GS agree" is the result that
+                    // eliminates the whole segmentation branch, and right now
+                    // that branch rests only on the reading above -- which has
+                    // already been wrong twice while chasing this fault (the
+                    // `arch_prctl(ARCH_SET_GS)` window, and believing `cpu_id()`
+                    // came from the APIC). Better the log says it.
                     let (tr, tss_base) = unsafe {
                         let tr: u16;
                         core::arch::asm!("str {0:x}", out(reg) tr, options(nomem, nostack));
