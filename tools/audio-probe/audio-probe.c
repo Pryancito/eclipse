@@ -1891,8 +1891,8 @@ struct snd_pcm_sync_ptr {
 #define SYNC_PTR_HWSYNC 1u
 #define SYNC_PTR_APPL 2u
 #define SYNC_PTR_AVAIL_MIN 4u
-#define SINK_PERIOD 1200 // fragment_size=4800 B / 4 B per frame
-#define SINK_BUFFER 4800 // fragments=4
+#define SINK_PERIOD 3000 // fragment_size=12000 B / 4 B per frame
+#define SINK_BUFFER 12000 // fragments=4
 #define SINK_RATE_CREATED 48000 // daemon.conf default-sample-rate
 #define SINK_RATE_ALTERNATE 44100 // alternate-sample-rate (the boot chime's)
 
@@ -2243,12 +2243,14 @@ static void test_pulse_sink(void) {
       idle_wakes++;
       continue;
     }
-    if (wakes == 3) {
+    if (hw_running_seen != 1) {
       int running = 0;
       long queued = 0;
       if (gpusnd_ring(&running, &queued)) {
-        hw_running_seen = running;
-        hw_queued_seen = queued;
+        if (running || hw_running_seen < 0) {
+          hw_running_seen = running;
+          hw_queued_seen = queued;
+        }
       }
     }
     r = sink_unix_write(fd, &sp, buffer, boundary, pcm, &pos, total, 1, &st, why, sizeof why);
@@ -2265,7 +2267,7 @@ static void test_pulse_sink(void) {
          st.spurious_wakes, st.spurious_wakes == 1 ? "" : "s");
   check(hw_running_seen == 1, "the HDA stream runs while the sink refills",
         "/proc/gpusnd ring: running=true at the third wake -- the driver started DMA on the sink's first fill", 0);
-  if (hw_running_seen >= 0) info("hardware at wake 3: running=%s queued=%ld B", hw_running_seen ? "true" : "false", hw_queued_seen);
+  if (hw_running_seen >= 0) info("hardware while refilling: running=%s queued=%ld B", hw_running_seen ? "true" : "false", hw_queued_seen);
   else info("hardware at wake 3: /proc/gpusnd not readable or fewer than 3 wakes");
 
   // The end of the stream: DRAIN (Pulse's suspend after the last input

@@ -2388,8 +2388,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               load-module module-stream-restore\n\
               load-module module-card-restore\n\
               load-module module-augment-properties\n\
-              load-module module-alsa-sink device=hw:0,0 mmap=0 tsched=0 ignore_dB=1 fragments=4 fragment_size=4800 sink_properties=device.description=Eclipse\n\
-              load-module module-alsa-sink device=hw:1,0 mmap=0 tsched=0 ignore_dB=1 fragments=4 fragment_size=4800 sink_name=analog sink_properties=device.description=Analog\n\
+              load-module module-alsa-sink device=hw:0,0 mmap=0 tsched=0 ignore_dB=1 fragments=4 fragment_size=12000 sink_properties=device.description=Eclipse\n\
+              load-module module-alsa-sink device=hw:1,0 mmap=0 tsched=0 ignore_dB=1 fragments=4 fragment_size=12000 sink_name=analog sink_properties=device.description=Analog\n\
               .fail\n\
               load-module module-native-protocol-unix auth-anonymous=1 socket=/run/pulse/native\n\
               .nofail\n\
@@ -2397,7 +2397,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               .fail\n\
               load-module module-always-sink\n\
               load-module module-intended-roles\n\
-              load-module module-suspend-on-idle timeout=1\n\
+              load-module module-suspend-on-idle timeout=5\n\
               load-module module-filter-heuristics\n\
               load-module module-filter-apply\n";
         write_if_ours(&pulse.join("system.pa"), pa);
@@ -2842,7 +2842,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               fi\n\
               if command -v mpg123 >/dev/null 2>&1; then\n\
               \x20 if [ -S /run/pulse/native ]; then\n\
-              \x20\x20 mpg123 -q -o pulse --encoding s16 --no-gapless \"$MP3\" \\\n\
+              \x20\x20 mpg123 -q -o alsa --encoding s16 --no-gapless \"$MP3\" \\\n\
               \x20\x20\x20 || mpg123 -q --encoding s16 --no-gapless \"$MP3\"\n\
               \x20\x20 pactl drain 2>/dev/null || true\n\
               \x20\x20 pactl suspend-sink @DEFAULT_SINK@ 1 2>/dev/null || true\n\
