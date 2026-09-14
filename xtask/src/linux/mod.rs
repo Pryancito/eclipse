@@ -101,6 +101,7 @@ impl LinuxRootfs {
             // After apk so we can see whether the PulseAudio plugin/binary
             // landed, and so /etc/pulse wins over anything the package dropped.
             Self::write_asound_conf(&dir);
+            Self::ensure_var_run(&dir);
             Self::write_pulse_conf(&dir);
             Self::ensure_pulse_accounts(&dir);
             return;
@@ -206,6 +207,7 @@ impl LinuxRootfs {
         fs::write(etc.join("hostname"), b"Eclipse\n").unwrap();
 
         Self::write_asound_conf(&dir);
+        Self::ensure_var_run(&dir);
         Self::write_pulse_conf(&dir);
         Self::ensure_pulse_accounts(&dir);
 
@@ -2401,6 +2403,50 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let _ = fs::create_dir_all(rootfs.join("var/run/pulse"));
     }
 
+    /// `/var/run` must be the FHS symlink to `/run` (`var/run -> ../run`), as
+    /// on Alpine and every modern distribution. Two separate directories were
+    /// being created instead (`run` here, `var/run/pulse` in
+    /// `write_pulse_conf`), and PulseAudio in `--system` mode puts its socket
+    /// at its compiled-in `/var/run/pulse/native`, ignoring
+    /// `PULSE_RUNTIME_PATH`. Every client -- `client.conf`'s
+    /// `default-server = unix:/run/pulse/native`, Firefox's libpulse, the boot
+    /// chime, `pactl`, `audio-probe` -- looked in `/run/pulse/native`, found
+    /// nothing, and cubeb reported `OpenCubeb() failed to init cubeb` with the
+    /// daemon alive the whole time (`audio-probe` showed the kernel PCM path
+    /// entirely healthy and only the socket missing). With one directory
+    /// behind both paths the socket lands where it is looked for.
+    ///
+    /// Idempotent, and it replaces a real `var/run` directory left by an
+    /// older build (its only content is runtime state). `run` is created
+    /// first so the link never dangles for a `create_dir_all` that goes
+    /// through it. Called on BOTH rootfs paths before `write_pulse_conf`.
+    fn ensure_var_run(rootfs: &Path) {
+        let run = rootfs.join("run");
+        let var = rootfs.join("var");
+        let var_run = var.join("run");
+        let _ = fs::create_dir_all(&run);
+        let _ = fs::create_dir_all(&var);
+        if var_run.is_symlink() {
+            // Only the exact FHS target counts: a link to anywhere else
+            // (`../../tmp`, a dangling target) would still make
+            // `write_pulse_conf` create pulse/ through it, somewhere other
+            // than /run, and the socket mismatch this helper exists to end
+            // would be back under a symlink instead of a directory.
+            if fs::read_link(&var_run)
+                .map(|t| t == Path::new("../run"))
+                .unwrap_or(false)
+            {
+                return;
+            }
+            let _ = fs::remove_file(&var_run);
+        } else if var_run.is_dir() {
+            let _ = fs::remove_dir_all(&var_run);
+        }
+        if let Err(e) = unix::fs::symlink("../run", &var_run) {
+            eprintln!("warning: could not create var/run -> ../run symlink: {e}");
+        }
+    }
+
     /// `pulse` / `pulse-access` / `audio` accounts. apk `--no-scripts` never
     /// runs the PulseAudio post-install, and `--system` drops to user `pulse`
     /// after binding the socket — without these lines the daemon exits.
@@ -3175,4 +3221,63 @@ fn check_so<P: AsRef<Path>>(path: P) -> bool {
     }
     // so 之后全是纯十进制数字
     !seg.any(|it| !it.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+#[cfg(test)]
+mod var_run_tests {
+    use super::*;
+
+    /// `/var/run` must end up as the FHS symlink to `/run` even when an older
+    /// build left it as a real directory holding `pulse/`; creating
+    /// `var/run/pulse` afterwards must land in `run/pulse` (one directory
+    /// behind both paths is the whole point); and a second call is a no-op.
+    #[test]
+    fn ensure_var_run_replaces_a_real_dir_with_the_fhs_symlink() {
+        let dir = std::env::temp_dir().join(format!("eclipse-varrun-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        // An older build: a real var/run with runtime state inside, no run/.
+        fs::create_dir_all(dir.join("var/run/pulse")).unwrap();
+        assert!(!dir.join("run").exists());
+
+        LinuxRootfs::ensure_var_run(&dir);
+
+        let link = dir.join("var/run");
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "var/run must be a symlink, not a directory"
+        );
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new("../run"));
+        assert!(
+            dir.join("run").is_dir(),
+            "run/ must exist so the link never dangles"
+        );
+
+        // What write_pulse_conf does next: through the link, into run/pulse.
+        fs::create_dir_all(dir.join("var/run/pulse")).unwrap();
+        assert!(
+            dir.join("run/pulse").is_dir(),
+            "var/run/pulse must resolve to run/pulse"
+        );
+
+        // Idempotent: the link is kept, not replaced or nested.
+        LinuxRootfs::ensure_var_run(&dir);
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new("../run"));
+        assert!(dir.join("run/pulse").is_dir());
+
+        // A symlink to the WRONG place (or dangling) is not "already done":
+        // it must be replaced by the FHS link, not accepted.
+        fs::remove_file(&link).unwrap();
+        unix::fs::symlink("../../tmp", &link).unwrap();
+        LinuxRootfs::ensure_var_run(&dir);
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new("../run"));
+        fs::remove_file(&link).unwrap();
+        unix::fs::symlink("../nowhere", &link).unwrap();
+        LinuxRootfs::ensure_var_run(&dir);
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new("../run"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
