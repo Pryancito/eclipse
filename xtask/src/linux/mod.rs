@@ -2378,15 +2378,18 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # System instance over Eclipse's ALSA hw:0,0. No udev, no D-Bus,\n\
               # no capture: the kernel PCM is playback-only RW-interleaved.\n\
               # ALSA sinks are .nofail: a missing/busy card must not kill the\n\
-              # daemon (eclipse-init would then crash-loop it). mixer_device=hw\n\
-              # so the sink does not open ctl.default (type pulse) and deadlock.\n\
+              # daemon (eclipse-init would then crash-loop it). Only arguments\n\
+              # module-alsa-sink accepts (src/modules/alsa/module-alsa-sink.c):\n\
+              # one unknown key and pa_modargs rejects the WHOLE line -- that was\n\
+              # mixer_device= and use_ucm= (module-alsa-card keys), which left the\n\
+              # daemon with no sink at all. The mixer is found from the PCM's card.\n\
               .nofail\n\
               load-module module-device-restore\n\
               load-module module-stream-restore\n\
               load-module module-card-restore\n\
               load-module module-augment-properties\n\
-              load-module module-alsa-sink device=hw:0,0 mixer_device=hw:0 mmap=0 tsched=0 use_ucm=0 ignore_dB=1 fragments=4 fragment_size=4800 sink_properties=device.description=Eclipse\n\
-              load-module module-alsa-sink device=hw:1,0 mixer_device=hw:1 mmap=0 tsched=0 use_ucm=0 ignore_dB=1 fragments=4 fragment_size=4800 sink_name=analog sink_properties=device.description=Analog\n\
+              load-module module-alsa-sink device=hw:0,0 mmap=0 tsched=0 ignore_dB=1 fragments=4 fragment_size=4800 sink_properties=device.description=Eclipse\n\
+              load-module module-alsa-sink device=hw:1,0 mmap=0 tsched=0 ignore_dB=1 fragments=4 fragment_size=4800 sink_name=analog sink_properties=device.description=Analog\n\
               .fail\n\
               load-module module-native-protocol-unix auth-anonymous=1 socket=/run/pulse/native\n\
               .nofail\n\
@@ -3226,6 +3229,67 @@ fn check_so<P: AsRef<Path>>(path: P) -> bool {
 #[cfg(test)]
 mod var_run_tests {
     use super::*;
+
+    /// Every `module-alsa-sink` argument the generated system.pa passes must
+    /// be one the module accepts. pa_modargs rejects a load-module line as a
+    /// whole on the first unknown key, and the guest log then reads
+    /// "Failed to parse module arguments" with no sink created -- which is
+    /// how `mixer_device=` / `use_ucm=` (module-alsa-card keys) silenced
+    /// PulseAudio entirely. Catch the next one at build time, not in the
+    /// guest. The list is src/modules/alsa/module-alsa-sink.c's valid_modargs.
+    #[test]
+    fn system_pa_alsa_sink_args_are_all_accepted() {
+        const ACCEPTED: &[&str] = &[
+            "name",
+            "sink_name",
+            "sink_properties",
+            "namereg_fail",
+            "device",
+            "device_id",
+            "format",
+            "rate",
+            "alternate_rate",
+            "channels",
+            "channel_map",
+            "fragments",
+            "fragment_size",
+            "mmap",
+            "tsched",
+            "tsched_buffer_size",
+            "tsched_buffer_watermark",
+            "ignore_dB",
+            "control",
+            "rewind_safeguard",
+            "deferred_volume",
+            "deferred_volume_safety_margin",
+            "deferred_volume_extra_delay",
+            "fixed_latency_range",
+        ];
+        let dir =
+            std::env::temp_dir().join(format!("eclipse-pulseconf-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        LinuxRootfs::write_pulse_conf(&dir);
+        let pa = fs::read_to_string(dir.join("etc/pulse/system.pa")).unwrap();
+        let mut sinks = 0;
+        for line in pa
+            .lines()
+            .filter(|l| l.contains("load-module module-alsa-sink"))
+        {
+            sinks += 1;
+            for arg in line.split_whitespace().skip(2) {
+                let key = arg.split('=').next().unwrap();
+                assert!(
+                    ACCEPTED.contains(&key),
+                    "system.pa passes `{key}` to module-alsa-sink, which does not accept it: {line}"
+                );
+            }
+        }
+        assert!(
+            sinks >= 1,
+            "system.pa must load at least one module-alsa-sink"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// `/var/run` must end up as the FHS symlink to `/run` even when an older
     /// build left it as a real directory holding `pulse/`; creating
