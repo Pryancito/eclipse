@@ -349,28 +349,39 @@ fn reclaim_retired_stack(slot: &mut RetiredStack) {
     if retired.alloc_base == 0 {
         return;
     }
-    let top_guard_base = retired.alloc_base + GUARD_SIZE + STACK_SIZE;
     if retired.protected {
         if let Some(unprotect) = *STACK_QUAR_UNPROTECT.lock() {
             unprotect(retired.alloc_base + GUARD_SIZE, STACK_SIZE);
         }
     }
-    if retired.hard_guard_bottom && retired.hard_guard_top && stack_pool_push(retired.alloc_base) {
+    // Never return a coroutine stack block to the shared buddy arena (`Global`):
+    // it also backs userspace frames, and a retirement that turned out to be one
+    // grace period early — a parked frame a frozen SMP sibling still resumes
+    // onto — would let a stale kernel write corrupt whatever userspace page
+    // reused the block, a silent fault the live-stack registry cannot catch (the
+    // block left the registry at `Drop`). Keep every hard-guarded block in
+    // coroutine-stack land: the fixed pool first, then the overflow retention
+    // list, both with guards installed so reuse is a cheap re-poison.
+    if retired.hard_guard_bottom && retired.hard_guard_top {
+        if !stack_pool_push(retired.alloc_base) {
+            STACK_OVERFLOW.lock().push(retired.alloc_base);
+        }
         *slot = RetiredStack::EMPTY;
         return;
     }
-    if let Some(remove) = *STACK_GUARD_REMOVE.lock() {
-        if retired.hard_guard_bottom {
-            remove(retired.alloc_base, GUARD_SIZE);
-        }
-        if retired.hard_guard_top {
-            remove(top_guard_base, TOP_GUARD_SIZE);
-        }
-    }
-    unsafe {
-        let stack = NonNull::<u8>::new_unchecked(retired.alloc_base as *mut u8);
-        Global.deallocate(stack, ALLOC_LAYOUT);
-    }
+    // A soft-guarded block cannot be pooled — `Executor::new`'s reuse path
+    // assumes hard guards are already installed — and returning it to `Global` is
+    // the exact aliasing above, so leak it instead. This only happens before the
+    // guard hooks are registered (early boot) or when a huge PTE refused the
+    // unmap, never in the steady-state desktop workload, so the leak is bounded
+    // in practice.
+    static SOFT_LEAKED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let n = SOFT_LEAKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    warn!(
+        "[stack-retire] leaking soft-guarded retired stack {:#x} rather than returning it to the \
+         shared arena (leaked {} so far)",
+        retired.alloc_base, n,
+    );
     *slot = RetiredStack::EMPTY;
 }
 
@@ -810,8 +821,25 @@ const STACK_POOL_CAP: usize = 128;
 static STACK_POOL: [core::sync::atomic::AtomicUsize; STACK_POOL_CAP] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; STACK_POOL_CAP];
 
+/// Overflow retention for freed hard-guarded stack blocks when [`STACK_POOL`] is
+/// full. A coroutine stack block must NEVER be returned to the shared buddy
+/// arena (`Global`): that arena also backs userspace VMO frames, so a stack that
+/// reaches it and is later handed to userspace can be corrupted by a stale
+/// SMP-late write to a parked frame the retirement grace period reclaimed one
+/// period too early. The live-stack registry cannot flag that (the block left
+/// the registry at `Drop`), so it surfaces as a silent SIGSEGV in an innocent
+/// process — e.g. the wallpaper renderer faulting in bounds-checked code with a
+/// float-heavy stack and no `[double-alloc]`. Keeping every freed block in
+/// coroutine-stack land (pool first, this list once the pool is full, both with
+/// hard guards still installed) removes that aliasing at the root. Retained
+/// blocks are re-handed by [`stack_pool_pop`], so the cost is bounded by peak
+/// concurrent stacks, not cumulative churn.
+static STACK_OVERFLOW: spin::Mutex<alloc::vec::Vec<usize>> =
+    spin::Mutex::new(alloc::vec::Vec::new());
+
 /// Take a pooled stack block (its `alloc_base`, hard guards already installed),
-/// or `None` if the pool is empty. Lock-free (one atomic swap per slot).
+/// or `None` if the pool is empty. The fixed array is scanned lock-free (one
+/// atomic swap per slot); the overflow retention list is checked last.
 fn stack_pool_pop() -> Option<usize> {
     use core::sync::atomic::Ordering::AcqRel;
     for slot in STACK_POOL.iter() {
@@ -820,7 +848,7 @@ fn stack_pool_pop() -> Option<usize> {
             return Some(base);
         }
     }
-    None
+    STACK_OVERFLOW.lock().pop()
 }
 
 /// Return a hard-guarded stack block to the pool. `false` if the pool is full
