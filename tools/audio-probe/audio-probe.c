@@ -1750,6 +1750,43 @@ static void test_pulse_play(void) {
   }
   info("sink before (pactl list sinks):");
   dump_cmd_matching("timeout 5 pactl list sinks 2>&1", g_sink_keys, 6);
+
+  // A sink parked in SUSPENDED must leave that state before it can play. The
+  // core resumes it when a non-corked input attaches, but that resume runs in
+  // the sink's IO thread; if that thread cannot make progress (starved by a
+  // busy-looping neighbour, say) the sink stays SUSPENDED and the client never
+  // drains. Force the resume explicitly here and see whether the sink leaves
+  // SUSPENDED: if it does, the auto-resume-on-input is the only thing missing
+  // (keeping the sink out of SUSPENDED fixes it); if it does not, the IO thread
+  // itself is stuck and no client will play.
+  {
+    char rc[192];
+    snprintf(rc, sizeof rc, "timeout 5 pactl suspend-sink %s 0 2>&1", sink);
+    int forced = system(rc);
+    (void)forced;
+    struct timespec r = {0, 300000000};
+    nanosleep(&r, NULL);
+    char st[64] = "";
+    FILE *sp = popen("timeout 5 pactl list sinks 2>&1", "r");
+    if (sp) {
+      char line[256];
+      while (fgets(line, sizeof line, sp)) {
+        const char *p2 = line;
+        while (*p2 == ' ' || *p2 == '\t') p2++;
+        if (!strncmp(p2, "State:", 6)) {
+          snprintf(st, sizeof st, "%s", p2 + 7);
+          size_t l = strlen(st);
+          while (l && (st[l - 1] == '\n' || st[l - 1] == ' ')) st[--l] = '\0';
+        }
+      }
+      pclose(sp);
+    }
+    int left_suspended = strstr(st, "SUSPENDED") != NULL;
+    check(!left_suspended, "the sink leaves SUSPENDED when resume is forced",
+          "pactl suspend-sink 0 -> the IO thread reopens the PCM; still SUSPENDED means that thread is stuck, not idle", 0);
+    info("sink state after forced resume: %s", st[0] ? st : "(unknown)");
+  }
+
   long d0 = 0, u0 = 0, r0 = 0;
   int have0 = gpusnd_events(&d0, &u0, &r0);
 
@@ -2200,6 +2237,16 @@ static void test_pulse_sink(void) {
         start_ok ? 0 : se);
   info("after START: state %d appl_ptr %llu hw_ptr %llu avail %ld", sp.s.status.state, (unsigned long long)sp.c.control.appl_ptr,
        (unsigned long long)sp.s.status.hw_ptr, avail);
+  int hw_running_seen = -1;
+  long hw_queued_seen = 0;
+  {
+    int running = 0;
+    long queued = 0;
+    if (gpusnd_ring(&running, &queued)) {
+      hw_running_seen = running;
+      hw_queued_seen = queued;
+    }
+  }
 
   // The refill loop: poll [pcm POLLOUT, timer POLLIN] the way pa_rtpoll does
   // with the timer disabled (tsched=0) -- no timeout in the daemon; here a
@@ -2208,8 +2255,6 @@ static void test_pulse_sink(void) {
   long limit = period_ms * 2 + 100;
   long wakes = 0, timer_wakes = 0, late = 0, max_gap = 0, timed_out = 0, bad_revents = 0, idle_wakes = 0;
   long last = elapsed_ms(&t0);
-  int hw_running_seen = -1;
-  long hw_queued_seen = 0;
   while (r >= 0 && pos < total) {
     struct pollfd pf[2] = {{fd, POLLOUT, 0}, {tfd, POLLIN, 0}};
     int pr = poll(pf, 2, (int)limit);

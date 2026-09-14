@@ -2397,7 +2397,12 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               .fail\n\
               load-module module-always-sink\n\
               load-module module-intended-roles\n\
-              load-module module-suspend-on-idle timeout=5\n\
+              # module-suspend-on-idle removed: on this kernel a suspended sink was\n\
+              # not being resumed when a non-corked input attached (the resume runs\n\
+              # in the sink IO thread, which under the desktop\'s load did not run it),\n\
+              # so every stream played into a SUSPENDED sink and went silent. Keeping\n\
+              # the sink out of SUSPENDED (it stays IDLE with the PCM open) lets a new\n\
+              # stream play without a resume step.\n\
               load-module module-filter-heuristics\n\
               load-module module-filter-apply\n";
         write_if_ours(&pulse.join("system.pa"), pa);
