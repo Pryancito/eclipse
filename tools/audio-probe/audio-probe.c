@@ -23,6 +23,8 @@
 //             module-alsa-sink stand on.
 //   alsa-ctl  /dev/snd/controlC0: CARD_INFO and the "Master" mixer elements
 //             alsa-lib's simple mixer, amixer and Pulse's card probe look up.
+//   daemon    the pulseaudio binary, the `pulse` account, a live process,
+//             and the daemon's own log -- WHY the socket is missing.
 //   pulse     the server socket cubeb-pulse / libpulse connect to first.
 //   verdict   which cubeb backend would initialise from what was measured --
 //             the same choice Firefox's OpenCubeb() makes.
@@ -164,6 +166,76 @@ static void dump_file(const char *path, const char *label) {
     }
   }
   fclose(f);
+}
+
+// Last `n` lines of a log: the daemon's own last words are the diagnosis,
+// so they belong in the same paste as everything else.
+static void dump_tail(const char *path, int n) {
+  FILE *f = fopen(path, "r");
+  if (!f) {
+    info("%s: not readable (%s)", path, strerror(errno));
+    return;
+  }
+  char ring[64][400];
+  int count = 0, head = 0;
+  char line[400];
+  if (n > 64) n = 64;
+  while (fgets(line, sizeof line, f)) {
+    size_t l = strlen(line);
+    if (l && line[l - 1] == '\n') line[l - 1] = '\0';
+    snprintf(ring[head], sizeof ring[head], "%s", line);
+    head = (head + 1) % n;
+    if (count < n) count++;
+  }
+  fclose(f);
+  if (count == 0) {
+    info("%s: empty", path);
+    return;
+  }
+  int start = (head - count + n) % n;
+  info("%s (last %d line%s):", path, count, count == 1 ? "" : "s");
+  for (int i = 0; i < count; i++) info("  %s", ring[(start + i) % n]);
+}
+
+static int file_has_prefix(const char *path, const char *prefix) {
+  FILE *f = fopen(path, "r");
+  if (!f) return 0;
+  char line[512];
+  size_t pl = strlen(prefix);
+  int hit = 0;
+  while (fgets(line, sizeof line, f)) {
+    if (!strncmp(line, prefix, pl)) {
+      hit = 1;
+      break;
+    }
+  }
+  fclose(f);
+  return hit;
+}
+
+// pid of a process whose /proc/<pid>/comm is `name`, or -1.
+static long find_process(const char *name) {
+  DIR *d = opendir("/proc");
+  if (!d) return -1;
+  struct dirent *e;
+  long found = -1;
+  while ((e = readdir(d)) && found < 0) {
+    if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+    // d_name is up to 255 bytes; size the path for it (pid dirs are short,
+    // but the compiler cannot know that, and -Wformat-truncation is right).
+    char path[sizeof "/proc//comm" + 256], comm[64];
+    snprintf(path, sizeof path, "/proc/%s/comm", e->d_name);
+    FILE *f = fopen(path, "r");
+    if (!f) continue;
+    if (fgets(comm, sizeof comm, f)) {
+      size_t l = strlen(comm);
+      if (l && comm[l - 1] == '\n') comm[l - 1] = '\0';
+      if (!strcmp(comm, name)) found = atol(e->d_name);
+    }
+    fclose(f);
+  }
+  closedir(d);
+  return found;
 }
 
 static void test_devices(void) {
@@ -681,6 +753,32 @@ static int unix_connect(const char *path, int *err) {
   return r == 0;
 }
 
+// ── PulseAudio daemon ──────────────────────────────────────────────────────
+//
+// The socket check below says WHETHER the server answers; this says WHY not.
+// eclipse-pulseaudio (init service, type=respawn) exits early with no
+// binary or no `pulse` account, and otherwise runs `pulseaudio --system`
+// whose stderr init captures in /tmp/pulseaudio.log. All of it in one paste.
+
+static void test_daemon(void) {
+  section("daemon");
+  int bin = node_present("/usr/bin/pulseaudio", S_IFREG) || node_present("/bin/pulseaudio", S_IFREG);
+  check(bin, "pulseaudio binary installed", "package pulseaudio; the wrapper exits 127 without it", 0);
+  check(node_present("/usr/bin/pactl", S_IFREG), "pactl installed", "pulseaudio-utils; the boot chime uses it", 0);
+  check(file_has_prefix("/etc/passwd", "pulse:"), "`pulse` user exists", "--system drops to it; the wrapper exits 1 without it", 0);
+  if (file_has_prefix("/etc/group", "pulse:")) info("group pulse present");
+  if (file_has_prefix("/etc/group", "pulse-access:")) info("group pulse-access present");
+  if (file_has_prefix("/etc/group", "audio:")) info("group audio present");
+
+  long pid = find_process("pulseaudio");
+  check(pid > 0, "a pulseaudio process is running", "init respawns eclipse-pulseaudio; none alive = it keeps dying", 0);
+  if (pid > 0) info("pulseaudio pid %ld", pid);
+
+  // The daemon's own last words, and the chime's.
+  dump_tail("/tmp/pulseaudio.log", 40);
+  dump_tail("/tmp/boot-sound.log", 12);
+}
+
 static int g_pulse_ok;
 
 static int is_socket(const char *path) {
@@ -790,6 +888,7 @@ int main(int argc, char **argv) {
   test_oss();
   test_alsa_pcm();
   test_alsa_ctl();
+  test_daemon();
   test_pulse();
 
   section("verdict");
