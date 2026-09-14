@@ -674,9 +674,17 @@ impl HdaInner {
             return;
         }
         self.last_poll_us = now_us;
-        let mut reported = if lpib_ok { self.lpib_total } else { self.dpib_total };
+        let mut reported = if lpib_ok {
+            self.lpib_total
+        } else {
+            self.dpib_total
+        };
         if dpib_ok && self.dpib_trusted {
-            reported = if lpib_ok { reported.min(self.dpib_total) } else { self.dpib_total };
+            reported = if lpib_ok {
+                reported.min(self.dpib_total)
+            } else {
+                self.dpib_total
+            };
         }
         self.lead_now = reported.saturating_sub(by_clock);
         self.stat_lead = self.stat_lead.max(self.lead_now);
