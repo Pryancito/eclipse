@@ -81,6 +81,16 @@ static int g_verbose;
 static int g_no_tone;
 static int g_card;
 static int g_pass, g_fail, g_skip;
+static const char *g_skipped[16];
+static int g_nskipped;
+
+// `--skip NAME` (repeatable): leave a section out, so a run can get past one
+// that takes the machine down and still reach the ones after it.
+static int skipped(const char *name) {
+  for (int i = 0; i < g_nskipped; i++)
+    if (!strcmp(g_skipped[i], name)) return 1;
+  return 0;
+}
 static const char *g_section = "";
 
 static void section(const char *name) {
@@ -1938,16 +1948,27 @@ static int period_timer_open(void) {
   return tfd;
 }
 
+// Step tracing for the calls a machine has died in: one flushed line before
+// each ioctl while g_trace_steps is set, so the console names the last one.
+static int g_trace_steps;
+static void step(const char *what) {
+  if (!g_trace_steps) return;
+  printf("         step: %s\n", what);
+  fflush(stdout);
+}
+
 // snd_pcm_avail() on the SYNC_PTR fallback: hwsync (HWSYNC|APPL|AVAIL_MIN),
 // then avail_update's query (APPL|AVAIL_MIN), then alsa-lib's own arithmetic
 // on the two pointers it got back. -1 with errno in *err on an ioctl error.
 static long sink_avail(int fd, struct snd_pcm_sync_ptr *sp, unsigned buffer, long long boundary, int *err) {
   sp->flags = SYNC_PTR_HWSYNC | SYNC_PTR_APPL | SYNC_PTR_AVAIL_MIN;
+  step("SYNC_PTR(HWSYNC|APPL|AVAIL_MIN) -- snd_pcm_avail hwsync");
   if (ioctl(fd, SNDRV_PCM_IOCTL_SYNC_PTR, sp) != 0) {
     *err = errno;
     return -1;
   }
   sp->flags = SYNC_PTR_APPL | SYNC_PTR_AVAIL_MIN;
+  step("SYNC_PTR(APPL|AVAIL_MIN) -- snd_pcm_avail_update");
   if (ioctl(fd, SNDRV_PCM_IOCTL_SYNC_PTR, sp) != 0) {
     *err = errno;
     return -1;
@@ -1992,11 +2013,17 @@ static int sink_unix_write(int fd, struct snd_pcm_sync_ptr *sp, unsigned buffer,
       size_t frames = total - *pos;
       if (frames > room) frames = room;
       struct snd_xferi x = {0, (uint64_t)(uintptr_t)(pcm + *pos * 2), frames};
+      if (g_trace_steps) {
+        char what[96];
+        snprintf(what, sizeof what, "WRITEI %zu frames on the O_NONBLOCK fd (the driver starts the HDA stream here)", frames);
+        step(what);
+      }
       int r = ioctl(fd, SNDRV_PCM_IOCTL_WRITEI_FRAMES, &x);
       int e = errno;
       if (r == 0) {
         // query_status_and_control_data(): learn the advanced appl_ptr.
         sp->flags = SYNC_PTR_APPL | SYNC_PTR_AVAIL_MIN;
+        step("SYNC_PTR(APPL|AVAIL_MIN) after WRITEI");
         if (ioctl(fd, SNDRV_PCM_IOCTL_SYNC_PTR, sp) != 0) {
           snprintf(why, why_len, "SYNC_PTR after WRITEI failed: %s", strerror(errno));
           return -1;
@@ -2146,6 +2173,9 @@ static void test_pulse_sink(void) {
   struct timespec t0;
   clock_gettime(CLOCK_MONOTONIC, &t0);
 
+  // The first fill and START are where a machine has died with nothing on
+  // the console: say each step before taking it.
+  g_trace_steps = 1;
   int r = sink_unix_write(fd, &sp, buffer, boundary, pcm, &pos, total, 0, &st, why, sizeof why);
   check(r == 1 && pos >= buffer, "first unix_write() fills the buffer (avail, then nonblocking WRITEI of what fits)",
         "the first WRITEI after avail > 0 must write, never EAGAIN (try_recover asserts on it)", 0);
@@ -2157,9 +2187,13 @@ static void test_pulse_sink(void) {
   // into the kernel, which must already hold it), then START.
   unsigned long long appl_before = sp.c.control.appl_ptr;
   sp.flags = SYNC_PTR_AVAIL_MIN;
+  step("SYNC_PTR(AVAIL_MIN) before START");
   int sync_ok = ioctl(fd, SNDRV_PCM_IOCTL_SYNC_PTR, &sp) == 0;
+  step("START");
   int start_ok = sync_ok && ioctl(fd, SNDRV_PCM_IOCTL_START, 0) == 0;
   int se = errno;
+  step("START returned");
+  g_trace_steps = 0;
   avail = sink_avail(fd, &sp, buffer, boundary, &err);
   check(start_ok && sp.s.status.state == PCM_STATE_RUNNING && sp.c.control.appl_ptr == appl_before,
         "START after the first fill -> RUNNING, appl_ptr kept", "snd_pcm_start(): SYNC_PTR(AVAIL_MIN) commits the client's appl_ptr, then START",
@@ -2305,12 +2339,15 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[i], "-v")) g_verbose = 1;
     else if (!strcmp(argv[i], "--no-tone")) g_no_tone = 1;
     else if (!strcmp(argv[i], "--card") && i + 1 < argc) g_card = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--skip") && i + 1 < argc && g_nskipped < 16) g_skipped[g_nskipped++] = argv[++i];
     else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-      printf("usage: audio-probe [-v] [--no-tone] [--card N]\n"
+      printf("usage: audio-probe [-v] [--no-tone] [--card N] [--skip SECTION]...\n"
              "Drives every layer Firefox's audio rests on -- /dev/dsp, the raw ALSA\n"
              "PCM and control ABI, and the PulseAudio socket -- the way each is driven\n"
              "in the field, plays a 440 Hz tone through each playback layer, and says\n"
-             "which cubeb backend Firefox's OpenCubeb() would get.\n");
+             "which cubeb backend Firefox's OpenCubeb() would get.\n"
+             "--skip SECTION leaves one out (devices, wake, oss, alsa-pcm, alsa-timer,\n"
+             "pulse-sink, alsa-ctl, daemon, unix-sock, pulse, pulse-play).\n");
       return 0;
     }
   }
@@ -2319,17 +2356,22 @@ int main(int argc, char **argv) {
   printf("Firefox-shaped audio probe (card %d)\n", g_card);
   printf("Each check mirrors what cubeb, alsa-lib or PulseAudio asks of the kernel.\n");
 
-  test_devices();
-  test_wake();
-  test_oss();
-  test_alsa_pcm();
-  test_alsa_timer();
-  test_pulse_sink();
-  test_alsa_ctl();
-  test_daemon();
-  test_unix_socket();
-  test_pulse();
-  test_pulse_play();
+  struct {
+    const char *name;
+    void (*run)(void);
+  } sections[] = {
+      {"devices", test_devices},     {"wake", test_wake},           {"oss", test_oss},
+      {"alsa-pcm", test_alsa_pcm},   {"alsa-timer", test_alsa_timer}, {"pulse-sink", test_pulse_sink},
+      {"alsa-ctl", test_alsa_ctl},   {"daemon", test_daemon},       {"unix-sock", test_unix_socket},
+      {"pulse", test_pulse},         {"pulse-play", test_pulse_play},
+  };
+  for (size_t i = 0; i < sizeof sections / sizeof sections[0]; i++) {
+    if (skipped(sections[i].name)) {
+      printf("\n[%s] skipped (--skip)\n", sections[i].name);
+      continue;
+    }
+    sections[i].run();
+  }
 
   section("verdict");
   detect_default_pcm();
