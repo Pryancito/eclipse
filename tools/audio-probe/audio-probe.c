@@ -722,6 +722,11 @@ static int pcm_open_prepared(unsigned *period, unsigned *buffer) {
   mask_only(&hp, HWP_SUBFORMAT, SUBFORMAT_STD);
   iv_set(&hp, IV_CHANNELS, 2);
   iv_set(&hp, IV_RATE, TONE_RATE);
+  // Pulse's sink: fragment_size=4800 bytes = 1200 frames = 25 ms at 48 kHz.
+  // The tick test measures wake-up latency against this period; the 128-frame
+  // minimum the kernel would otherwise pick is 2.7 ms, shorter than a line of
+  // serial output, and ticks then land between two consecutive read()s.
+  iv_set(&hp, IV_PERIOD_SIZE, 1200);
   if (ioctl(fd, SNDRV_PCM_IOCTL_HW_PARAMS, &hp) != 0) {
     int e = errno;
     close(fd);
@@ -854,14 +859,19 @@ static void test_alsa_timer(void) {
 
     n = read(tfd, tr, sizeof tr);
     e = errno;
+    // The second read follows immediately: printing first would let another
+    // period elapse (serial output is slow) and turn a drained queue into a
+    // fresh tick.
+    struct snd_timer_tread again[4];
+    ssize_t n2 = read(tfd, again, sizeof again);
+    int e2 = errno;
     check(n >= (ssize_t)sizeof tr[0] && n % (ssize_t)sizeof tr[0] == 0 && tr[0].event == TIMER_EVENT_TICK && tr[0].val >= 1,
           "read() returns a TICK tread record", "32-byte {event, tstamp, val}; alsa-lib reads and discards up to 4", n < 0 ? e : 0);
     if (n > 0) info("%zd byte%s: event %d val %u (ticks elapsed) at %lld.%09lld", n, n == 1 ? "" : "s", tr[0].event,
                     tr[0].val, (long long)tr[0].tstamp.sec, (long long)tr[0].tstamp.nsec);
-    n = read(tfd, tr, sizeof tr);
-    e = errno;
-    check(n < 0 && e == EAGAIN, "read() again -> EAGAIN (queue drained)",
-          "snd_pcm_hw_clear_timer_queue reads once; a queue that never empties would spin Pulse", n < 0 && e != EAGAIN ? e : 0);
+    check(n2 < 0 && e2 == EAGAIN, "read() again -> EAGAIN (queue drained)",
+          "snd_pcm_hw_clear_timer_queue reads once; a queue that never empties would spin Pulse", n2 < 0 && e2 != EAGAIN ? e2 : 0);
+    if (n2 > 0) info("second read() returned %zd bytes (val %u): a period elapsed between the two reads", n2, again[0].val);
 
     struct snd_timer_status ts;
     memset(&ts, 0, sizeof ts);

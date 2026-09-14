@@ -643,6 +643,18 @@ pub trait FileLike: KernelObject + downcast_rs::DowncastSync {
     fn is_char_device(&self) -> bool {
         false
     }
+    /// True if this fd is a terminal: a VT (`/dev/tty*`, `/dev/console`, the
+    /// stdin/stdout of a console shell), the serial UART node or a pty end.
+    ///
+    /// poll/select use it to recognise the one wait they slow down — a shell
+    /// parked in `poll(stdin)` on a *background* VT (see `io_wait_interval`
+    /// in linux-syscall). Every other fd, device nodes included, must keep
+    /// the fast re-scan: PulseAudio's ALSA sink thread polls `[pcm, timer]`
+    /// from a process that is never on the active VT, and demoting that to
+    /// 100 ms underran its 108 ms buffer on every wake.
+    fn is_terminal(&self) -> bool {
+        false
+    }
     /// Bytes immediately readable, for `FIONREAD` (`SIOCINQ`/`TIOCINQ`).
     ///
     /// `None` means "I cannot answer", and the request falls through to this
@@ -2126,6 +2138,80 @@ pub fn split_path(path: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::split_path;
+
+    /// Only terminals are terminals: the poll/select slow tick keys on this,
+    /// and a device node (ALSA pcm/timer, DRM, input) classified as one put
+    /// PulseAudio's sink thread on a 100 ms re-scan.
+    #[test]
+    fn only_terminal_inodes_are_terminals() {
+        use super::{File, FileLike, OpenFlags};
+        use alloc::string::String;
+        use alloc::sync::Arc;
+        use rcore_fs::vfs::{FileType, FsError, INode, Metadata, PollStatus, Timespec};
+
+        struct Plain;
+        impl INode for Plain {
+            fn read_at(&self, _: usize, _: &mut [u8]) -> rcore_fs::vfs::Result<usize> {
+                Err(FsError::NotSupported)
+            }
+            fn write_at(&self, _: usize, buf: &[u8]) -> rcore_fs::vfs::Result<usize> {
+                Ok(buf.len())
+            }
+            fn poll(&self) -> rcore_fs::vfs::Result<PollStatus> {
+                Err(FsError::NotSupported)
+            }
+            fn metadata(&self) -> rcore_fs::vfs::Result<Metadata> {
+                Ok(Metadata {
+                    dev: 1,
+                    inode: 7,
+                    size: 0,
+                    blk_size: 4096,
+                    blocks: 0,
+                    atime: Timespec { sec: 0, nsec: 0 },
+                    mtime: Timespec { sec: 0, nsec: 0 },
+                    ctime: Timespec { sec: 0, nsec: 0 },
+                    type_: FileType::CharDevice,
+                    mode: 0o666,
+                    nlinks: 1,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                })
+            }
+            fn as_any_ref(&self) -> &dyn core::any::Any {
+                self
+            }
+        }
+
+        let dev = File::new(
+            Arc::new(Plain),
+            OpenFlags::RDWR,
+            String::from("/dev/snd/timer"),
+        );
+        assert!(dev.is_char_device());
+        assert!(
+            !dev.is_terminal(),
+            "a char device is not a terminal by itself"
+        );
+        let ptmx = File::new(
+            Arc::new(super::pty::PtmxINode),
+            OpenFlags::RDWR,
+            String::from("/dev/ptmx"),
+        );
+        assert!(!ptmx.is_terminal(), "the cloning node is not a pty end");
+        let tty = File::new(
+            super::stdio::STDOUT.clone(),
+            OpenFlags::WRONLY,
+            String::from("/dev/tty1"),
+        );
+        assert!(tty.is_terminal());
+        let vt = File::new(
+            super::stdio::current_vt_tty(),
+            OpenFlags::RDWR,
+            String::from("/dev/console"),
+        );
+        assert!(vt.is_terminal());
+    }
 
     /// `write(2)` to a terminal took the kernel down: the page-cache lookup
     /// keyed the inode by `fs()`, whose default was `unimplemented!()`; then

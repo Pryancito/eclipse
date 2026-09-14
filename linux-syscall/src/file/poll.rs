@@ -52,9 +52,23 @@ const SLOW_IO_WAIT_TICK: Duration = Duration::from_millis(100);
 /// *no* interactive fd at all (DRM fds, timerfds, pipes, device fds — the shape
 /// of a compositor's startup waits) must NOT be demoted to 100 ms, or every
 /// such roundtrip is gated at a tenth of a second and startup takes minutes.
-fn io_wait_interval(s: &Syscall, watch_net: bool, watch_interactive: bool) -> Duration {
-    let background_interactive =
-        watch_interactive && s.linux_process().vt() != kernel_hal::console::active_vt();
+///
+/// `terminal_only` is that pattern's signature: every fd in the set is a
+/// terminal ([`FileLike::is_terminal`]). `watch_interactive` alone is not —
+/// it is true for any non-socket fd, since it also drives the HID/TTY IRQ
+/// registration — and keying the demotion on it put PulseAudio's ALSA sink
+/// thread (`[pcm, timer]`, in a process that is never on the active VT) on
+/// a 100 ms re-scan: its 108 ms buffer underran on every wake, and the
+/// `[alsa-timer]` probe saw its 2.7 ms period answered in 105 ms.
+fn io_wait_interval(
+    s: &Syscall,
+    watch_net: bool,
+    watch_interactive: bool,
+    terminal_only: bool,
+) -> Duration {
+    let background_interactive = watch_interactive
+        && terminal_only
+        && s.linux_process().vt() != kernel_hal::console::active_vt();
     if !watch_net && background_interactive {
         SLOW_IO_WAIT_TICK
     } else {
@@ -111,6 +125,9 @@ impl Syscall<'_> {
             /// Last watch flags + waker parked in IRQ lists (for Drop cleanup).
             watch_net: bool,
             watch_interactive: bool,
+            /// Every fd in the set is a terminal: the only shape that may be
+            /// demoted to the slow background-VT tick (see `io_wait_interval`).
+            terminal_only: bool,
             io_waker: Option<core::task::Waker>,
             /// Readiness wakers parked on the watched fds' event buses
             /// (pipes, unix sockets, ptys, eventfd/timerfd, DRM). Refreshed
@@ -157,6 +174,15 @@ impl Syscall<'_> {
                 }
                 linux_object::net::io_wait_tick(watch_net, watch_interactive);
                 let proc = this.syscall.linux_process();
+                this.terminal_only = !this.polls.is_empty()
+                    && this.polls.iter().all(|p| {
+                        <FileDesc as Into<i32>>::into(p.fd) < 0
+                            || proc
+                                .get_file_like(p.fd)
+                                .map(|f| f.is_terminal())
+                                .unwrap_or(false)
+                    });
+                let terminal_only = this.terminal_only;
                 let mut events = 0;
                 let mut early_err = None;
 
@@ -279,7 +305,12 @@ impl Syscall<'_> {
                         let tick = if covered {
                             covered_tick
                         } else {
-                            io_wait_interval(this.syscall, watch_net, watch_interactive)
+                            io_wait_interval(
+                                this.syscall,
+                                watch_net,
+                                watch_interactive,
+                                terminal_only,
+                            )
                         };
                         let wake_in = remaining.min(tick);
                         arm_io_wait(cx, watch_net, watch_interactive, &mut this.io_armed);
@@ -290,7 +321,12 @@ impl Syscall<'_> {
                         let tick = if covered {
                             covered_tick
                         } else {
-                            io_wait_interval(this.syscall, watch_net, watch_interactive)
+                            io_wait_interval(
+                                this.syscall,
+                                watch_net,
+                                watch_interactive,
+                                terminal_only,
+                            )
                         };
                         arm_io_wait(cx, watch_net, watch_interactive, &mut this.io_armed);
                         this.io_waker = Some(cx.waker().clone());
@@ -314,6 +350,7 @@ impl Syscall<'_> {
             timer: None,
             watch_net: false,
             watch_interactive: false,
+            terminal_only: false,
             io_waker: None,
             subs: Vec::new(),
         };
@@ -430,6 +467,21 @@ impl Syscall<'_> {
                     || write_fds.contains(FileDesc::from(fd))
                     || err_fds.contains(FileDesc::from(fd)))
         });
+        // Membership is fixed, so the "only terminals" shape is too — the one
+        // shape `io_wait_interval` may demote to the background-VT tick.
+        let terminal_only = {
+            let files = self.linux_process().get_files()?;
+            let mut any = false;
+            let all = (0..nfds).all(|fd| {
+                let fd = FileDesc::from(fd);
+                if !(read_fds.contains(fd) || write_fds.contains(fd) || err_fds.contains(fd)) {
+                    return true;
+                }
+                any = true;
+                files.get(&fd).map(|f| f.is_terminal()).unwrap_or(false)
+            });
+            any && all
+        };
 
         #[must_use = "future does nothing unless polled/`await`-ed"]
         struct SelectFuture<'a> {
@@ -439,6 +491,8 @@ impl Syscall<'_> {
             nfds: usize,
             watch_net: bool,
             watch_interactive: bool,
+            /// See `PollFuture::terminal_only`.
+            terminal_only: bool,
             timeout_msecs: isize,
             begin_time: Duration,
             syscall: &'a Syscall<'a>,
@@ -475,6 +529,7 @@ impl Syscall<'_> {
                 }
                 let watch_net = this.watch_net;
                 let watch_interactive = this.watch_interactive;
+                let terminal_only = this.terminal_only;
                 if this.io_armed {
                     arm_io_wait(cx, watch_net, watch_interactive, &mut this.io_armed);
                 }
@@ -604,7 +659,12 @@ impl Syscall<'_> {
                         let tick = if covered {
                             covered_tick
                         } else {
-                            io_wait_interval(this.syscall, watch_net, watch_interactive)
+                            io_wait_interval(
+                                this.syscall,
+                                watch_net,
+                                watch_interactive,
+                                terminal_only,
+                            )
                         };
                         let wake_in = remaining.min(tick);
                         arm_io_wait(cx, watch_net, watch_interactive, &mut this.io_armed);
@@ -615,7 +675,12 @@ impl Syscall<'_> {
                         let tick = if covered {
                             covered_tick
                         } else {
-                            io_wait_interval(this.syscall, watch_net, watch_interactive)
+                            io_wait_interval(
+                                this.syscall,
+                                watch_net,
+                                watch_interactive,
+                                terminal_only,
+                            )
                         };
                         arm_io_wait(cx, watch_net, watch_interactive, &mut this.io_armed);
                         this.io_waker = Some(cx.waker().clone());
@@ -633,6 +698,7 @@ impl Syscall<'_> {
             nfds,
             watch_net,
             watch_interactive,
+            terminal_only,
             timeout_msecs,
             begin_time,
             syscall: self,

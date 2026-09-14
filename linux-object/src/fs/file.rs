@@ -984,6 +984,24 @@ impl FileLike for File {
             .unwrap_or(false)
     }
 
+    fn is_terminal(&self) -> bool {
+        use super::devfs::UartDev;
+        use super::stdio::{CurrentVtTty, Stdin, Stdout};
+        let inode = self.inner.read().inode.clone();
+        inode.downcast_ref::<Stdin>().is_some()
+            || inode.downcast_ref::<Stdout>().is_some()
+            || inode.downcast_ref::<CurrentVtTty>().is_some()
+            || inode.downcast_ref::<UartDev>().is_some()
+            || inode.downcast_ref::<super::pty::PtyMaster>().is_some()
+            || inode.downcast_ref::<super::pty::PtySlave>().is_some()
+            || inode
+                .downcast_ref::<super::devfs::pty::PtyMaster>()
+                .is_some()
+            || inode
+                .downcast_ref::<super::devfs::pty::PtySlave>()
+                .is_some()
+    }
+
     /// Returns the [`VmObject`] representing the file with given `offset` and `len`.
     fn get_vmo(&self, offset: usize, len: usize) -> LxResult<Arc<VmObject>> {
         let inner = self.inner.read();
