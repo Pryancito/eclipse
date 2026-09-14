@@ -1511,25 +1511,70 @@ static void test_pulse(void) {
 
 static int g_pulse_play_ok = -1; // -1 not run, 0 failed, 1 played to the hardware
 
-// "[gpusnd] events: D drains, U underruns, R stream restarts, ..."
+// /proc/gpusnd holds one block per card ("[gpusnd] --- card N ---"); only
+// card g_card's block is read, so a second HDA device (an HDMI codec on a
+// GPU) cannot lend its events to this verdict. NUL-terminated in place.
+static char *gpusnd_card_block(char *buf) {
+  char head[48];
+  snprintf(head, sizeof head, "[gpusnd] --- card %d ---", g_card);
+  char *start = strstr(buf, head);
+  if (!start) return NULL;
+  char *next = strstr(start + strlen(head), "[gpusnd] --- card ");
+  if (next) *next = '\0';
+  return start;
+}
+
+// "[gpusnd] events: D drains, U underruns, R stream restarts, ..." for g_card.
 static int gpusnd_events(long *drains, long *underruns, long *restarts) {
   static char buf[65536];
   if (read_whole("/proc/gpusnd", buf, sizeof buf) < 0) return 0;
-  const char *p = strstr(buf, "[gpusnd] events:");
+  const char *blk = gpusnd_card_block(buf);
+  if (!blk) return 0;
+  const char *p = strstr(blk, "[gpusnd] events:");
   return p && sscanf(p, "[gpusnd] events: %ld drains, %ld underruns, %ld stream restarts", drains, underruns, restarts) == 3;
 }
 
-// The newest stop event: its kind and how many bytes that stream got.
+// The newest stop event of g_card: its kind and how many bytes that stream got.
 static int gpusnd_last_stop(char *kind, size_t kind_len, long *at_ms, long *written) {
   static char buf[65536];
   if (read_whole("/proc/gpusnd", buf, sizeof buf) < 0) return 0;
+  const char *blk = gpusnd_card_block(buf);
+  if (!blk) return 0;
   const char *last = NULL;
-  for (const char *p = buf; (p = strstr(p, "stop: ")) != NULL; p += 6) last = p;
+  for (const char *p = blk; (p = strstr(p, "stop: ")) != NULL; p += 6) last = p;
   if (!last) return 0;
   char k[32];
   if (sscanf(last, "stop: %31s at %ld ms by kernel clock / %*d ms by HDA wall clock, %ld B written", k, at_ms, written) != 3) return 0;
   snprintf(kind, kind_len, "%s", k);
   return 1;
+}
+
+// The PulseAudio sink that sits on hw:<g_card>,0, by its alsa.card property
+// in `pactl list sinks`; 0 when there is none. pacat is pointed at it so the
+// tone goes through the sink this probe's hardware checks are about, not
+// whatever the server's default is.
+static int pulse_sink_for_card(char *name, size_t len) {
+  FILE *p = popen("timeout 5 pactl list sinks 2>&1", "r");
+  if (!p) return 0;
+  char line[512], cur[128] = "";
+  char want_card[32], want_dev[32];
+  snprintf(want_card, sizeof want_card, "alsa.card = \"%d\"", g_card);
+  snprintf(want_dev, sizeof want_dev, "device.string = \"hw:%d", g_card);
+  int found = 0;
+  while (fgets(line, sizeof line, p)) {
+    const char *s = line;
+    while (*s == ' ' || *s == '\t') s++;
+    if (!strncmp(s, "Name: ", 6)) {
+      snprintf(cur, sizeof cur, "%s", s + 6);
+      size_t l = strlen(cur);
+      while (l && (cur[l - 1] == '\n' || cur[l - 1] == ' ')) cur[--l] = '\0';
+    } else if (!found && cur[0] && (strstr(s, want_card) || strstr(s, want_dev))) {
+      snprintf(name, len, "%s", cur);
+      found = 1;
+    }
+  }
+  pclose(p);
+  return found;
 }
 
 // Lines of a command's output that contain one of the needles, trimmed.
@@ -1568,6 +1613,17 @@ static void test_pulse_play(void) {
     skip("play the tone through PulseAudio", "pacat not installed (pulseaudio-utils)");
     return;
   }
+  if (g_no_tone) {
+    skip("play the tone through PulseAudio", "--no-tone");
+    return;
+  }
+  char sink[128];
+  if (!pulse_sink_for_card(sink, sizeof sink)) {
+    skip("play the tone through PulseAudio", "no PulseAudio sink on this card (pactl list sinks: alsa.card)");
+    info("the server's sinks are not on hw:%d; module-alsa-sink for it did not load (see [daemon])", g_card);
+    return;
+  }
+  info("sink on hw:%d: %s", g_card, sink);
   size_t bytes;
   int16_t *pcm = make_tone(&bytes);
   if (!pcm) {
@@ -1584,7 +1640,11 @@ static void test_pulse_play(void) {
   // libpulse-simple clients (mpg123 -o pulse) and cubeb-pulse set up.
   struct timespec t0;
   clock_gettime(CLOCK_MONOTONIC, &t0);
-  FILE *p = popen("timeout 15 pacat --raw --format=s16le --rate=48000 --channels=2 --latency-msec=100 --client-name=audio-probe 2>&1", "w");
+  char cmd[320];
+  snprintf(cmd, sizeof cmd,
+           "timeout 15 pacat --raw --format=s16le --rate=48000 --channels=2 --latency-msec=100 --client-name=audio-probe --device=%s 2>&1",
+           sink);
+  FILE *p = popen(cmd, "w");
   if (!p) {
     fail("run pacat", "popen", errno);
     free(pcm);
