@@ -179,58 +179,92 @@ static void dump_file(const char *path, const char *label) {
   fclose(f);
 }
 
+// Read a /proc file with as few read() calls as possible. procfs generates
+// its text afresh on every read(2), so a stdio-sized read followed by another
+// at an offset can land in a report whose earlier lines just changed length
+// (rates), cutting or skipping a line -- seen as the tick-gap line vanishing
+// from one of two consecutive reads. Returns the byte count, -1 on error.
+static ssize_t read_whole(const char *path, char *buf, size_t size) {
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) return -1;
+  size_t got = 0;
+  while (got + 1 < size) {
+    ssize_t n = read(fd, buf + got, size - 1 - got);
+    if (n <= 0) break;
+    got += (size_t)n;
+  }
+  close(fd);
+  buf[got] = '\0';
+  return (ssize_t)got;
+}
+
 // Lines of a file containing `needle`, for a kernel counter the section
 // is about (e.g. the tick gaps in /proc/perf/kernel).
 static void dump_matching(const char *path, const char *needle) {
-  FILE *f = fopen(path, "r");
-  if (!f) {
+  static char buf[65536];
+  if (read_whole(path, buf, sizeof buf) < 0) {
     info("%s: not readable (%s)", path, strerror(errno));
     return;
   }
-  char line[512];
   int hits = 0;
-  while (fgets(line, sizeof line, f)) {
-    if (!strstr(line, needle)) continue;
-    size_t l = strlen(line);
-    if (l && line[l - 1] == '\n') line[l - 1] = '\0';
-    info("%s: %s", path, line);
-    hits++;
+  for (char *line = buf; line && *line;) {
+    char *nl = strchr(line, '\n');
+    if (nl) *nl = '\0';
+    if (strstr(line, needle)) {
+      info("%s: %s", path, line);
+      hits++;
+    }
+    line = nl ? nl + 1 : NULL;
   }
-  fclose(f);
   if (!hits) info("%s: no line mentions '%s' (older kernel)", path, needle);
 }
 
-// The kernel's count of late timer-tick gaps (a busy CPU that took more
-// than three tick periods between two ticks; ticks that interrupted an idle
-// halt are not counted), from /proc/perf/kernel; -1 when the kernel does not
-// report it. Read before and after a measurement, the difference says
-// whether the kernel itself saw a busy CPU stand still meanwhile.
-static long tick_gaps_late(void) {
-  FILE *f = fopen("/proc/perf/kernel", "r");
-  if (!f) return -1;
-  char line[512];
-  long n = -1;
-  while (fgets(line, sizeof line, f)) {
-    const char *p = strstr(line, "timer tick gaps:");
-    if (!p) continue;
-    if (sscanf(p, "timer tick gaps: max %*f ms, %ld over", &n) != 1) n = -2;
-    break;
+// The kernel's counts of late timer-tick gaps (a CPU that took more than
+// three tick periods between two ticks), from /proc/perf/kernel, split by
+// whether the tick interrupted a busy CPU or its idle halt. -1 when the
+// kernel does not report them. Read before and after a measurement, the
+// differences say what the kernel itself saw meanwhile.
+struct tick_gaps {
+  long busy, idle;
+};
+
+static struct tick_gaps tick_gaps_late(void) {
+  struct tick_gaps g = {-1, -1};
+  static char buf[65536];
+  if (read_whole("/proc/perf/kernel", buf, sizeof buf) < 0) return g;
+  const char *p = strstr(buf, "timer tick gaps:");
+  if (!p) return g;
+  if (sscanf(p, "timer tick gaps: max %*f ms, %ld over", &g.busy) != 1) g.busy = -2;
+  // "..., N on an idle one": the number just before that phrase.
+  const char *q = strstr(p, " on an idle one");
+  if (q) {
+    const char *d = q;
+    while (d > p && d[-1] >= '0' && d[-1] <= '9') d--;
+    if (d < q) g.idle = atol(d);
   }
-  fclose(f);
-  return n;
+  return g;
 }
 
-// One line on what the kernel's tick saw during a measurement.
-static void report_tick_gaps(const char *during, long before, long after) {
-  if (before < 0 || after < 0) {
-    info("kernel tick-gap counter not readable (before %ld, after %ld; -1 no /proc/perf/kernel line, -2 unparsed)", before, after);
+// What the kernel's tick saw during a measurement. A late gap on a busy CPU
+// is a CPU that stood still with work on it. A late gap on a halted CPU only
+// matters when every CPU was halted and a deadline was due -- the tick of
+// any awake CPU drains the shared timer heap -- so it is reported as such.
+static void report_tick_gaps(const char *during, struct tick_gaps before, struct tick_gaps after) {
+  if (before.busy < 0 || after.busy < 0) {
+    info("kernel tick-gap counter not readable (before %ld, after %ld; -1 no /proc/perf/kernel line, -2 unparsed)", before.busy,
+         after.busy);
     return;
   }
-  if (after > before)
-    info("=> the kernel logged %ld late tick gap%s (>12 ms on a busy CPU) during %s: that CPU stood still -- host preemption of the vCPU or an interrupts-off stretch",
-         after - before, after - before == 1 ? "" : "s", during);
+  long busy = after.busy - before.busy;
+  long idle = (before.idle >= 0 && after.idle >= 0) ? after.idle - before.idle : 0;
+  if (busy > 0)
+    info("=> the kernel logged %ld late tick gap%s (>12 ms on a busy CPU) during %s: that CPU stood still -- host preemption of the vCPU or an interrupts-off stretch%s",
+         busy, busy == 1 ? "" : "s", during, idle > 0 ? " (and late ticks on halted CPUs too)" : "");
+  else if (idle > 0)
+    info("%ld late tick gap%s on halted CPUs during %s, none on a busy one: harmless unless every CPU was asleep with a deadline due", idle,
+         idle == 1 ? "" : "s", during);
   else
-    info("no late tick gaps on a busy CPU during %s: the kernel took its 4 ms ticks on time", during);
+    info("no late tick gaps during %s: the kernel took its 4 ms ticks on time", during);
 }
 
 // Last `n` lines of a log: the daemon's own last words are the diagnosis,
@@ -416,7 +450,7 @@ static int count_over(const long *v, int n, long bound) {
 static void test_wake(void) {
   section("wake");
   int stalls = 0;
-  long gaps_before = tick_gaps_late();
+  struct tick_gaps gaps_before = tick_gaps_late();
   struct timespec prev, cur;
   long maxstep_ns = 0;
   int distinct = 0;
@@ -500,8 +534,8 @@ static void test_wake(void) {
   //    interrupts-off section) -- if it did not, the delay is in the wake path.
   dump_matching("/proc/perf/kernel", "timer tick gaps");
   if (stalls)
-    info("=> %d of %d samples stalled past %d ms with a good median: this thread was not run for that long (host preemption? kernel stall?)",
-         stalls, 2 * WAKE_SAMPLES + n, WAKE_BOUND_US / 1000);
+    info("=> %d of %d samples stalled past %d ms: this thread was not run for that long (host preemption? kernel stall?)", stalls,
+         2 * WAKE_SAMPLES + n, WAKE_BOUND_US / 1000);
   report_tick_gaps("these measurements", gaps_before, tick_gaps_late());
 }
 
@@ -1031,7 +1065,7 @@ static void test_alsa_timer(void) {
     // stall) is reported, not fatal: Pulse's 100 ms buffer absorbs one.
     long bound = period_ms + 20;
     long limit = period_ms * 2 + 100;
-    long gaps_before = tick_gaps_late();
+    struct tick_gaps gaps_before = tick_gaps_late();
     long wake_ms[4];
     unsigned wake_val[4];
     int wakes = 0, timed_out = 0;
