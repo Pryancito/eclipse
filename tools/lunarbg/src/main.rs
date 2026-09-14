@@ -45,7 +45,9 @@ mod fill_guard;
 mod par;
 mod scene;
 
+use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -99,9 +101,11 @@ struct Frames {
     scale: u32,
     layout: scene::Layout,
     base: Vec<u8>,
-    /// mmap of the pool holding BUFFERS frames back to back.
-    map: *mut u8,
-    map_len: usize,
+    /// Safe staging buffer for the animated frame. The final bytes are copied
+    /// into the shared memfd with positioned writes, so the renderer never
+    /// dereferences the shm mapping through a raw pointer on the hot path.
+    staging: Vec<u8>,
+    file: File,
     buffers: [wl_buffer::WlBuffer; BUFFERS],
     busy: [bool; BUFFERS],
     next: usize,
@@ -113,32 +117,10 @@ struct Frames {
     skipped: u32,
 }
 
-impl Frames {
-    /// Detach the mmap so [`Drop`] will not munmap it — the caller retires
-    /// the mapping until the compositor is known to have released the buffers.
-    fn take_map(&mut self) -> (*mut u8, usize) {
-        let out = (self.map, self.map_len);
-        self.map = std::ptr::null_mut();
-        self.map_len = 0;
-        out
-    }
-}
-
 impl Drop for Frames {
     fn drop(&mut self) {
         for b in &self.buffers {
             b.destroy();
-        }
-        // Never munmap here: a forgotten `take_map` with live compositor
-        // references would UAF. Rebuild / Closed / shutdown always retire via
-        // `retire_map`. An unreclaimed map is leaked for the process lifetime.
-        if !self.map.is_null() && self.map_len > 0 {
-            eprintln!(
-                "lunarbg: Frames dropped with unreclaimed mmap ({} bytes); leaking to avoid UAF",
-                self.map_len
-            );
-            self.map = std::ptr::null_mut();
-            self.map_len = 0;
         }
     }
 }
@@ -358,26 +340,16 @@ impl State {
         self.generation
     }
 
-    /// Unmap a retired shm pool mapping right away.
-    ///
-    /// This used to hold the mapping until the compositor had Released every
-    /// buffer of the old generation. Those Releases never arrive: the old
-    /// `wl_buffer`s are destroyed first, and wayland-client discards events
-    /// addressed to a client-destroyed object -- so nothing ever drained the
-    /// count and every scale/mode rebuild leaked a pool (16.6 MiB at 1080p,
-    /// 66 MiB at 4K) for the life of the process. Holding was also
-    /// unnecessary: `munmap` only drops THIS process's view of the memfd; the
-    /// compositor keeps its own mapping of the pool for as long as it needs
-    /// the pixels, so unmapping here cannot pull memory out from under it.
-    fn retire_map(&mut self, map: *mut u8, map_len: usize) {
-        if map.is_null() || map_len == 0 {
-            return;
+    fn write_frame(file: &File, frame: &[u8], offset: usize) -> bool {
+        let Some(offset) = u64::try_from(offset).ok() else {
+            eprintln!("lunarbg: frame offset {offset} does not fit u64");
+            return false;
+        };
+        if let Err(e) = file.write_all_at(frame, offset) {
+            eprintln!("lunarbg: shm write failed at offset {offset}: {e}");
+            return false;
         }
-        unsafe { libc::munmap(map as *mut libc::c_void, map_len) };
-    }
-
-    fn take_frames_for_retire(frames: &mut Frames) -> (*mut u8, usize) {
-        frames.take_map()
+        true
     }
 
     fn bg_index_by_layer(&self, layer_id: u32) -> Option<usize> {
@@ -606,22 +578,6 @@ impl State {
             eprintln!("lunarbg: ftruncate({total}) failed");
             return false;
         }
-        let map = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                total,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                raw,
-                0,
-            )
-        };
-        if map == libc::MAP_FAILED {
-            eprintln!("lunarbg: mmap failed");
-            return false;
-        }
-        let map = map as *mut u8;
-
         let generation = self.next_generation();
         let pool = shm.create_pool(fd.as_fd(), total as i32, qh, ());
         let make = |i: usize| {
@@ -647,33 +603,33 @@ impl State {
             for b in &buffers {
                 b.destroy();
             }
-            unsafe { libc::munmap(map as *mut libc::c_void, total) };
             return false;
         };
+        let file = File::from(fd);
+        let mut staging = base.clone();
 
         // Seed BOTH buffers with the full base scene. Only buffer 0 used to
         // get it; buffer 1 stayed zeroed (memfd), and since ticks repaint just
         // the logo region, every frame shown from buffer 1 had BLACK outside
         // the logo — on the real monitor the wallpaper alternated between the
         // full cosmic scene and a dark screen with a floating square.
-        ckpt!("configure {w}x{h}: first write to mmap'd memfd (buffer 0)");
-        let frame0: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(map, frame_size) };
-        frame0.copy_from_slice(&base);
-        scene::render_frame(frame0, w, &base, &layout, t_ms);
-        let frame1: &mut [u8] =
-            unsafe { std::slice::from_raw_parts_mut(map.add(frame_size), frame_size) };
-        frame1.copy_from_slice(&base);
+        ckpt!("configure {w}x{h}: first write to shared memfd (buffer 0)");
+        scene::render_frame(&mut staging, w, &base, &layout, t_ms);
+        if !Self::write_frame(&file, &staging, 0) || !Self::write_frame(&file, &staging, frame_size)
+        {
+            for b in &buffers {
+                b.destroy();
+            }
+            return false;
+        }
         ckpt!("configure {w}x{h}: buffers seeded; committing surface");
 
         let compositor = self.compositor.clone();
-        let old_retire = {
+        let old = {
             let bg = &mut self.backgrounds[idx];
-            bg.frames.take().map(|mut old| {
-                let r = Self::take_frames_for_retire(&mut old);
-                drop(old); // destroy wl_buffers; map already detached
-                r
-            })
+            bg.frames.take()
         };
+        drop(old);
         {
             let bg = &mut self.backgrounds[idx];
             bg.dirty = false;
@@ -683,17 +639,14 @@ impl State {
                 scale,
                 layout,
                 base,
-                map,
-                map_len: total,
+                staging,
+                file,
                 buffers,
                 busy: [true, false],
                 next: 1,
                 generation,
                 skipped: 0,
             });
-        }
-        if let Some((p, l)) = old_retire {
-            self.retire_map(p, l);
         }
         let bg = &mut self.backgrounds[idx];
         Self::ack_pending(bg);
@@ -763,14 +716,26 @@ impl State {
         else {
             return;
         };
+        let Some(offset) = i.checked_mul(frame_size) else {
+            return;
+        };
         // Mark busy only after size is known — an early return must not strand
         // the slot forever.
         frames.busy[i] = true;
-        let frame: &mut [u8] =
-            unsafe { std::slice::from_raw_parts_mut(frames.map.add(i * frame_size), frame_size) };
         // The buffer alternates, so it carries a stale logo region from two
         // frames ago; render_frame restores that region from the base first.
-        scene::render_frame(frame, frames.width, &frames.base, &frames.layout, t_ms);
+        scene::render_frame(
+            &mut frames.staging,
+            frames.width,
+            &frames.base,
+            &frames.layout,
+            t_ms,
+        );
+        if !Self::write_frame(&frames.file, &frames.staging, offset) {
+            frames.busy[i] = false;
+            bg.dirty = true;
+            return;
+        }
 
         let scale = frames.scale;
         bg.surface.attach(Some(&frames.buffers[i]), 0, 0);
@@ -875,11 +840,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                         let mut bg = state.backgrounds.remove(bpos);
                         bg.layer.destroy();
                         bg.surface.destroy();
-                        if let Some(mut frames) = bg.frames.take() {
-                            let (p, l) = State::take_frames_for_retire(&mut frames);
-                            drop(frames);
-                            state.retire_map(p, l);
-                        }
+                        drop(bg.frames.take());
                     }
                     if oi.output.version() >= 3 {
                         oi.output.release();
@@ -921,11 +882,7 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
                     let out_id = bg.output_id.clone();
                     bg.layer.destroy();
                     bg.surface.destroy();
-                    if let Some(mut frames) = bg.frames.take() {
-                        let (p, l) = State::take_frames_for_retire(&mut frames);
-                        drop(frames);
-                        state.retire_map(p, l);
-                    }
+                    drop(bg.frames.take());
                     // Keep claimed + mark closed so ensure_surfaces does not
                     // recreate into a Closed→create→Closed loop.
                     if let Some(oi) = state.outputs.iter_mut().find(|o| o.output.id() == out_id) {
@@ -1749,17 +1706,10 @@ fn main() {
 
     // SIGTERM/SIGINT or connection loss: tear the surfaces down cleanly.
     ckpt!("shutting down cleanly");
-    let mut to_retire = Vec::new();
     for mut bg in state.backgrounds.drain(..) {
         bg.layer.destroy();
         bg.surface.destroy();
-        if let Some(mut frames) = bg.frames.take() {
-            to_retire.push(State::take_frames_for_retire(&mut frames));
-            drop(frames);
-        }
-    }
-    for (p, l) in to_retire {
-        state.retire_map(p, l);
+        drop(bg.frames.take());
     }
     let _ = queue.flush();
 }
