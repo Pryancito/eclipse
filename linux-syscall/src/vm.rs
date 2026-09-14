@@ -289,23 +289,44 @@ impl Syscall<'_> {
                 let (vmo, off) = file_like
                     .get_vmo_shared(offset as usize, len)
                     .inspect_err(|e| {
-                        // Name the failing fd: a MAP_SHARED that returns ENOSYS
-                        // means the compositor got MAP_FAILED and likely crashed
-                        // next. `File` carries a path (the device/file node);
-                        // anything else has none, which itself pins the kind.
+                        // Name the failing fd. `File` carries a path (the
+                        // device/file node); anything else has none, which
+                        // itself pins the kind.
                         let path = file_like
                             .downcast_ref::<linux_object::fs::File>()
                             .map(|f| f.path().clone())
                             .unwrap_or_else(|| alloc::string::String::from("<non-File FileLike>"));
-                        error!(
-                            "mmap(file,shared) get_vmo_shared FAILED: {:?} proc={} fd={:?} path={} offset={:#x} len={:#x}",
-                            e,
-                            self.zircon_process().name(),
-                            fd,
-                            path,
-                            offset,
-                            len
-                        );
+                        // alsa-lib PROBES the mmap of a PCM's status (0x8000_0000)
+                        // and control (0x8100_0000) pages, and on any failure
+                        // sets `mmap_*_fallbacked` and drives the device through
+                        // SNDRV_PCM_IOCTL_SYNC_PTR instead — which this kernel
+                        // implements and PulseAudio plays through fine. So that
+                        // ENOSYS is an EXPECTED, handled fallback, not a failure:
+                        // log it at info so it stops reading as a compositor
+                        // crash. Every other shared-mmap ENOSYS is still an error.
+                        const PCM_MMAP_STATUS: u64 = 0x8000_0000;
+                        const PCM_MMAP_CONTROL: u64 = 0x8100_0000;
+                        let alsa_syncptr_probe = path.contains("/dev/snd/pcm")
+                            && (offset == PCM_MMAP_STATUS || offset == PCM_MMAP_CONTROL);
+                        if alsa_syncptr_probe {
+                            info!(
+                                "mmap(pcm status/control) unsupported (proc={} fd={:?} path={} offset={:#x}) — alsa-lib falls back to SYNC_PTR, expected",
+                                self.zircon_process().name(),
+                                fd,
+                                path,
+                                offset
+                            );
+                        } else {
+                            error!(
+                                "mmap(file,shared) get_vmo_shared FAILED: {:?} proc={} fd={:?} path={} offset={:#x} len={:#x}",
+                                e,
+                                self.zircon_process().name(),
+                                fd,
+                                path,
+                                offset,
+                                len
+                            );
+                        }
                     })?;
                 // Same rule as anonymous MAP_SHARED: fork must share, not copy.
                 vmo.set_share_on_fork();
