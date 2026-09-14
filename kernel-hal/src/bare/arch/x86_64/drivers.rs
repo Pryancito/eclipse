@@ -312,8 +312,6 @@ pub(super) fn init() -> DeviceResult {
         init_acpi_power_button(&irq);
     }
 
-    use x2apic::lapic::{TimerDivide, TimerMode};
-
     irq.register_local_apic_handler(trap::X86_INT_APIC_TIMER, Arc::new(super::trap::super_timer))?;
     // IPI vector: 0xf3 = X86_INT_LOCAL_APIC_BASE + 3
     irq.register_local_apic_handler(
@@ -327,13 +325,12 @@ pub(super) fn init() -> DeviceResult {
     )?;
 
     if Apic::local_apic_ready() {
-        // SAFETY: called once on BSP during primary_init
-        let lapic = Apic::local_apic();
-        lapic.set_timer_mode(TimerMode::Periodic);
-        lapic.set_timer_divide(TimerDivide::Div1);
-        let cycles = super::cpu::tsc_hz() / super::super::timer::TICKS_PER_SEC;
-        lapic.set_timer_initial(cycles.clamp(1, u32::MAX as u64) as u32);
-        lapic.disable_timer();
+        // Called once on the BSP during primary_init. Measure the rate the
+        // timer counts at before deriving the 250 Hz count from it: it is
+        // the TSC rate on some hardware and a fixed 1 GHz under KVM/QEMU.
+        super::timer::calibrate_lapic_timer();
+        super::timer::program_periodic_tick();
+        Apic::local_apic().disable_timer();
     } else {
         crate::klog_warn!("[drivers] LAPIC unavailable — APIC timer left disabled");
     }

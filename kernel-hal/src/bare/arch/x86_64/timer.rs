@@ -163,20 +163,95 @@ pub fn set_force_tsc_invariant(force: bool) {
 }
 
 // ---------------------------------------------------------------------------
-// Tickless-idle LAPIC timer re-arming
+// LAPIC timer rate and tick programming
 // ---------------------------------------------------------------------------
-// The LAPIC timer counts raw CPU cycles: boot programs `TimerDivide::Div1`,
-// which on this hardware behaves as divide-by-1 (see `drivers.rs`). So the
-// initial-count register is just `cycles`. We modulate that count to stretch
-// the periodic tick when a CPU goes idle, then restore it on resume.
+// Boot programs `TimerDivide::Div1`, so the initial-count register is a count
+// of LAPIC timer clocks. What that clock is depends on the machine: on the
+// hardware this kernel was first tuned on the timer counts core cycles, so
+// the TSC rate was used as the count rate directly. Under KVM the emulated
+// timer counts at a fixed 1 GHz whatever the TSC does, and QEMU's TCG is the
+// same, so on a 4 GHz host the "4 ms" tick took 16 ms — every poll/select
+// re-scan of a bus-less fd (PulseAudio's sink waiting on its PCM among them)
+// was served four times late. The rate is therefore measured at boot
+// (`calibrate_lapic_timer`) and everything below counts in it. We modulate
+// the count to stretch the periodic tick when a CPU goes idle, then restore
+// it on resume.
 
 use super::super::timer::TICKS_PER_SEC;
 use zcore_drivers::irq::x86::Apic;
 
+/// LAPIC timer count rate in Hz as measured by [`calibrate_lapic_timer`];
+/// 0 until then (or if the measurement was implausible), which
+/// [`lapic_hz`] reads as "assume the TSC rate", the historical behaviour.
+static LAPIC_HZ: AtomicU64 = AtomicU64::new(0);
+
+/// The rate the LAPIC timer counts at.
+pub fn lapic_hz() -> u64 {
+    match LAPIC_HZ.load(Ordering::Relaxed) {
+        0 => super::cpu::tsc_hz(),
+        hz => hz,
+    }
+}
+
+/// Measure the LAPIC timer's count rate against the (already calibrated)
+/// TSC: load the maximum count with the interrupt masked — the LVT mask
+/// stops the interrupt, not the countdown — spin a TSC-timed 20 ms, and read
+/// back how far the count got. The same idea as Linux's
+/// `calibrate_APIC_clock`, with the TSC as the reference.
+///
+/// BSP only, at boot, interrupts off, before the periodic tick is programmed
+/// (`program_periodic_tick` then uses the result). Leaves the timer stopped
+/// and masked.
+pub fn calibrate_lapic_timer() {
+    use x2apic::lapic::{TimerDivide, TimerMode};
+    if !Apic::local_apic_ready() {
+        return;
+    }
+    let tsc_hz = super::cpu::tsc_hz().max(1);
+    let lapic = Apic::local_apic();
+    lapic.disable_timer();
+    lapic.set_timer_mode(TimerMode::OneShot);
+    lapic.set_timer_divide(TimerDivide::Div1);
+    lapic.set_timer_initial(u32::MAX);
+    let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+    let c0 = lapic.timer_current();
+    let window = tsc_hz / 50; // 20 ms
+    while unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0) < window {
+        core::hint::spin_loop();
+    }
+    let c1 = lapic.timer_current();
+    let t1 = unsafe { core::arch::x86_64::_rdtsc() };
+    // A zero initial count stops the one-shot countdown.
+    lapic.set_timer_initial(0);
+    let counts = u64::from(c0.wrapping_sub(c1));
+    let cycles = t1.wrapping_sub(t0).max(1);
+    let hz = (counts as u128 * tsc_hz as u128 / cycles as u128) as u64;
+    // Plausible: 1 MHz (a slow crystal) to 50 GHz. A count that never moved
+    // (0) or a wrapped read is left at the TSC-rate assumption.
+    let plausible = counts > 1000 && (1_000_000..=50_000_000_000).contains(&hz);
+    if plausible {
+        LAPIC_HZ.store(hz, Ordering::Relaxed);
+    }
+    // `warn!` (not `klog_warn!`): this belongs next to the `[tsc]` line in
+    // the serial boot log, where a `make qemu` transcript shows it.
+    warn!(
+        "[lapic] timer counts at {} Hz (TSC {} Hz): {} Hz tick = {} counts{}",
+        hz,
+        tsc_hz,
+        TICKS_PER_SEC,
+        fast_tick_count(),
+        if plausible {
+            ""
+        } else {
+            " -- implausible, keeping the TSC rate"
+        }
+    );
+}
+
 /// LAPIC timer initial count for the normal full-rate scheduler tick (4 ms at
-/// 250 Hz). Mirrors the value programmed in `drivers.rs` at boot.
+/// 250 Hz), in the measured count rate.
 pub fn fast_tick_count() -> u32 {
-    (super::cpu::tsc_hz() / TICKS_PER_SEC).clamp(1, u32::MAX as u64) as u32
+    (lapic_hz() / TICKS_PER_SEC).clamp(1, u32::MAX as u64) as u32
 }
 
 /// Period of the full-rate scheduler tick, in nanoseconds (4 ms at 250 Hz).
@@ -187,13 +262,12 @@ pub const fn fast_tick_ns() -> u64 {
     1_000_000_000 / TICKS_PER_SEC
 }
 
-/// Convert a now-relative nanosecond span to LAPIC timer cycles. Uses the
-/// PIT-calibrated TSC Hz (the LAPIC counts CPU cycles on this hardware).
-/// Clamped to a non-zero `u32`: a count of 0 stops the timer, and counts
-/// above `u32::MAX` are not representable.
+/// Convert a now-relative nanosecond span to LAPIC timer counts, in the
+/// measured count rate. Clamped to a non-zero `u32`: a count of 0 stops the
+/// timer, and counts above `u32::MAX` are not representable.
 pub fn ns_to_tick_count(ns: u64) -> u32 {
-    let cycles = (super::cpu::tsc_hz() as u128).saturating_mul(ns as u128) / 1_000_000_000;
-    cycles.clamp(1, u32::MAX as u128) as u32
+    let counts = (lapic_hz() as u128).saturating_mul(ns as u128) / 1_000_000_000;
+    counts.clamp(1, u32::MAX as u128) as u32
 }
 
 /// Reprogram this CPU's LAPIC timer initial count (the period, in periodic

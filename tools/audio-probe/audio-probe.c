@@ -14,6 +14,9 @@
 //   devices   the nodes the kernel created, and /proc/gpusnd (the codec state
 //             read back OUT of the hardware: the only thing that separates
 //             "silent but Ok" from a real fault).
+//   wake      the kernel's timer tick, measured with poll(0 fds, 1 ms) and
+//             nanosleep(1 ms): every bus-less fd wait (pcm, timer) is
+//             re-scanned on it, so it bounds every audio wake-up below.
 //   oss       /dev/dsp: the smallest kernel PCM ABI, a plain write(2). If this
 //             is silent, nothing above it can be heard.
 //   alsa-pcm  /dev/snd/pcmC0D0p driven with the raw SNDRV_PCM_IOCTL_* sequence
@@ -307,6 +310,89 @@ static void test_devices(void) {
   // converter stream id/format, the descriptor's RUN bit and position.
   info("/proc/gpusnd:");
   dump_file("/proc/gpusnd", "/proc/gpusnd");
+}
+
+// ── kernel wake-up granularity ─────────────────────────────────────────────
+//
+// Every wait on an fd without a readiness bus -- the ALSA PCM and timer nodes
+// among them -- is re-scanned by this kernel on its timer tick (250 Hz, 4 ms),
+// so the tick IS the audio wake-up latency: PulseAudio writes its buffer,
+// sleeps in poll(), and runs again only when the tick fires. Measured here
+// with no audio involved at all: poll() with no fds and a 1 ms timeout, and
+// nanosleep(1 ms), both return at the first tick after their deadline. A tick
+// far above 4 ms is a kernel timer bug (the LAPIC count is derived from the
+// TSC rate; QEMU and KVM clock the LAPIC timer at 1 GHz instead), and every
+// audio number below inherits it. Also checks that the clock the probe
+// measures with is fine-grained, so the numbers can be believed.
+
+static long elapsed_us(const struct timespec *t0) {
+  struct timespec t1;
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  return (t1.tv_sec - t0->tv_sec) * 1000000L + (t1.tv_nsec - t0->tv_nsec) / 1000;
+}
+
+static int cmp_long(const void *a, const void *b) {
+  long x = *(const long *)a, y = *(const long *)b;
+  return x < y ? -1 : x > y;
+}
+
+// min / median / max of `n` microsecond samples, printed as ms.
+static void report_us(const char *what, long *v, int n, long *median_out) {
+  qsort(v, n, sizeof v[0], cmp_long);
+  *median_out = v[n / 2];
+  info("%s: min %.1f ms, median %.1f ms, max %.1f ms (%d samples)", what, v[0] / 1000.0, v[n / 2] / 1000.0,
+       v[n - 1] / 1000.0, n);
+}
+
+#define WAKE_SAMPLES 20
+// One 4 ms tick plus a little scheduling slack.
+#define WAKE_BOUND_US 6000
+
+static void test_wake(void) {
+  section("wake");
+  struct timespec prev, cur;
+  long maxstep_ns = 0;
+  int distinct = 0;
+  clock_gettime(CLOCK_MONOTONIC, &prev);
+  for (int i = 0; i < 4000; i++) {
+    clock_gettime(CLOCK_MONOTONIC, &cur);
+    long d = (cur.tv_sec - prev.tv_sec) * 1000000000L + (cur.tv_nsec - prev.tv_nsec);
+    if (d > 0) {
+      distinct++;
+      if (d > maxstep_ns) maxstep_ns = d;
+    }
+    prev = cur;
+  }
+  // Fine-grained means most consecutive reads differ; the largest gap is
+  // reported, not judged: one gap of several ms in a loop of back-to-back
+  // reads is the scheduler holding this thread (a tick's housekeeping), and
+  // that is worth seeing, but it is not a coarse clock.
+  check(distinct > 100, "clock_gettime(CLOCK_MONOTONIC) advances finely",
+        "a coarse clock would report every latency here as 0 or as one step", 0);
+  info("%d advances in 4000 reads, largest gap between two reads %.1f us", distinct, maxstep_ns / 1000.0);
+
+  long v[WAKE_SAMPLES], median;
+  for (int i = 0; i < WAKE_SAMPLES; i++) {
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    poll(NULL, 0, 1);
+    v[i] = elapsed_us(&t0);
+  }
+  report_us("poll(0 fds, 1 ms)", v, WAKE_SAMPLES, &median);
+  check(median <= WAKE_BOUND_US, "poll(0 fds, 1 ms) returns within one 4 ms tick",
+        "sys_poll re-scans bus-less fds (pcm, timer) on this tick: it is the audio wake-up latency", 0);
+  if (median > WAKE_BOUND_US)
+    info("=> the timer tick fires every ~%.0f ms, not 4: Pulse's sink is woken that late into its 100 ms buffer", median / 1000.0);
+
+  for (int i = 0; i < WAKE_SAMPLES; i++) {
+    struct timespec t0, req = {0, 1000000};
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    nanosleep(&req, NULL);
+    v[i] = elapsed_us(&t0);
+  }
+  report_us("nanosleep(1 ms)", v, WAKE_SAMPLES, &median);
+  check(median <= WAKE_BOUND_US, "nanosleep(1 ms) returns within one 4 ms tick",
+        "sleep-paced feeders (cubeb-alsa's refill loop, mpg123 -o oss) rest on this", 0);
 }
 
 // ── OSS: /dev/dsp ──────────────────────────────────────────────────────────
@@ -1262,6 +1348,7 @@ int main(int argc, char **argv) {
   printf("Each check mirrors what cubeb, alsa-lib or PulseAudio asks of the kernel.\n");
 
   test_devices();
+  test_wake();
   test_oss();
   test_alsa_pcm();
   test_alsa_timer();
