@@ -1633,6 +1633,14 @@ impl AudioScheme for HdaDevice {
         let _ = channels;
         let channels = 2u8; // stereo only for now
         let mut inner = self.inner.lock();
+        if inner.rate != rate {
+            // One line per rate switch: the last serial line before a
+            // machine dies at a stream start says which step it reached.
+            warn!(
+                "[hda] set_params: {} Hz -> {} Hz (running={})",
+                inner.rate, rate, inner.running
+            );
+        }
         inner.stop_stream();
         inner.paused = false;
         inner.queued = 0;
@@ -1667,7 +1675,13 @@ impl AudioScheme for HdaDevice {
         }
         let mut inner = self.inner.lock();
         inner.poll_progress();
-        if !inner.running && !inner.paused {
+        let starting = !inner.running && !inner.paused;
+        if starting {
+            warn!(
+                "[hda] stream start: {} B offered at {} Hz, repick + stream reset next",
+                pcm.len(),
+                inner.rate
+            );
             // Give the codec graph a chance to re-route to a pin that has
             // gained presence/ELD since the last pick (on NVIDIA GPUs the ELD
             // lands long after PCI probe)...
@@ -1697,8 +1711,13 @@ impl AudioScheme for HdaDevice {
         inner.wp = p;
         inner.queued += n;
         inner.silence_ahead();
-        if !inner.running && !inner.paused {
+        if starting {
             inner.start_stream()?;
+            warn!(
+                "[hda] stream started: {} B queued, CTL {:#x}",
+                inner.queued,
+                mmio_r32(inner.bar, inner.sd_base + SD_CTL)
+            );
         }
         inner.stream_written += n;
         Ok(n)
