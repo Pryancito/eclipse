@@ -725,7 +725,10 @@ pub fn kernel_report() -> String {
                 alloc_drops, live_drops
             );
         } else {
-            let _ = writeln!(out, "coroutine-stack registry: no overflow (hand-out guard complete)");
+            let _ = writeln!(
+                out,
+                "coroutine-stack registry: no overflow (hand-out guard complete)"
+            );
         }
     }
     let _ = writeln!(out);
