@@ -766,9 +766,16 @@ static void test_daemon(void) {
   check(bin, "pulseaudio binary installed", "package pulseaudio; the wrapper exits 127 without it", 0);
   check(node_present("/usr/bin/pactl", S_IFREG), "pactl installed", "pulseaudio-utils; the boot chime uses it", 0);
   check(file_has_prefix("/etc/passwd", "pulse:"), "`pulse` user exists", "--system drops to it; the wrapper exits 1 without it", 0);
-  if (file_has_prefix("/etc/group", "pulse:")) info("group pulse present");
-  if (file_has_prefix("/etc/group", "pulse-access:")) info("group pulse-access present");
-  if (file_has_prefix("/etc/group", "audio:")) info("group audio present");
+  // Explicit present/missing for every group: a silent branch would make an
+  // absent permission prerequisite indistinguishable from a check that never
+  // ran. `--system` puts the daemon in `pulse`; clients needing the socket
+  // are gated by `pulse-access`; ALSA device nodes by `audio`.
+  static const char *const groups[] = {"pulse", "pulse-access", "audio"};
+  for (size_t i = 0; i < sizeof groups / sizeof groups[0]; i++) {
+    char prefix[32];
+    snprintf(prefix, sizeof prefix, "%s:", groups[i]);
+    info("group %-13s %s", groups[i], file_has_prefix("/etc/group", prefix) ? "present" : "MISSING");
+  }
 
   long pid = find_process("pulseaudio");
   check(pid > 0, "a pulseaudio process is running", "init respawns eclipse-pulseaudio; none alive = it keeps dying", 0);
