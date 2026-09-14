@@ -45,6 +45,8 @@ use lock::Mutex;
 use rcore_fs::vfs::*;
 use rcore_fs_devfs::DevFS;
 
+use crate::fs::OpenFlags;
+
 fn ucheck<T>(addr: usize) -> Result<()> {
     if kernel_hal::user::user_range_ok(addr, core::mem::size_of::<T>()) {
         Ok(())
@@ -1025,9 +1027,17 @@ impl PcmDev {
         Ok(())
     }
 
-    /// Blocking interleaved write: the ALSA equivalent of the OSS node's
-    /// spin-retry (the synchronous INode contract has no waker to park on).
-    fn writei(&self, xfer: &mut SndXferI) -> Result<()> {
+    fn commit_write_progress(&self, bytes: usize) {
+        let mut st = self.st.lock();
+        st.appl_ptr = (st.appl_ptr + bytes as u64 / BYTES_PER_FRAME) % st.boundary.max(1);
+        st.state = STATE_RUNNING;
+        arm_playback_watchdog();
+    }
+
+    /// Interleaved write. Blocking callers keep the old spin-retry behaviour;
+    /// nonblocking callers get Linux-style "write what fits right now, else
+    /// EAGAIN" semantics so alsa-lib/PulseAudio can return to poll().
+    fn writei(&self, xfer: &mut SndXferI, flags: OpenFlags) -> Result<()> {
         {
             let st = self.st.lock();
             if st.state != STATE_PREPARED && st.state != STATE_RUNNING {
@@ -1036,6 +1046,23 @@ impl PcmDev {
         }
         let total_bytes = (xfer.frames * BYTES_PER_FRAME) as usize;
         let src = xfer.buf as *const u8;
+        if flags.non_block() {
+            let st_buffer = self.st.lock().buffer_size;
+            let queued = self.queued_frames();
+            let room_frames = st_buffer.saturating_sub(queued);
+            let chunk = ((room_frames * BYTES_PER_FRAME) as usize).min(total_bytes);
+            if chunk < BYTES_PER_FRAME as usize {
+                return Err(FsError::Again);
+            }
+            let buf = unsafe { core::slice::from_raw_parts(src, chunk) };
+            let n = self.audio.write(buf).map_err(|_| FsError::DeviceError)?;
+            if n == 0 {
+                return Err(FsError::Again);
+            }
+            self.commit_write_progress(n);
+            xfer.result = (n as u64 / BYTES_PER_FRAME) as i64;
+            return Ok(());
+        }
         let mut done = 0usize;
         let deadline_step = core::time::Duration::from_secs(4);
         let mut deadline = kernel_hal::timer::timer_now() + deadline_step;
@@ -1054,11 +1081,8 @@ impl PcmDev {
             };
             if n > 0 {
                 done += n;
-                let mut st = self.st.lock();
-                st.appl_ptr = (st.appl_ptr + n as u64 / BYTES_PER_FRAME) % st.boundary;
-                st.state = STATE_RUNNING;
+                self.commit_write_progress(n);
                 deadline = kernel_hal::timer::timer_now() + deadline_step;
-                arm_playback_watchdog();
                 continue;
             }
             if kernel_hal::timer::timer_now() >= deadline {
@@ -1117,36 +1141,17 @@ impl PcmDev {
             nsec: now.subsec_nanos() as i64,
         };
     }
-}
 
-impl INode for PcmDev {
-    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
-        Err(FsError::NotSupported)
+    pub(crate) fn io_control_with_flags(
+        &self,
+        cmd: u32,
+        data: usize,
+        flags: OpenFlags,
+    ) -> Result<usize> {
+        self.io_control_impl(cmd, data, flags)
     }
 
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
-        Err(FsError::NotSupported)
-    }
-
-    fn poll(&self) -> Result<PollStatus> {
-        let _ = self.audio.queued_bytes();
-        let st = self.st.lock();
-        let avail = self.avail(&st);
-        // Linux reports POLLOUT when `avail >= avail_min`, but it only
-        // re-evaluates that on a period interrupt, so a feeder wakes at most
-        // once per period however small its avail_min (PulseAudio's tsched=0
-        // sink asks for 1). This fd has no interrupt: sys_poll re-scans it
-        // every 4 ms, and reporting every freed frame would wake such a
-        // feeder 250 times a second to write a few frames each. Gating on a
-        // whole period gives it the wake-up cadence it was written for.
-        Ok(PollStatus {
-            read: false,
-            write: avail >= st.avail_min.max(st.period_size),
-            error: false,
-        })
-    }
-
-    fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
+    fn io_control_impl(&self, cmd: u32, data: usize, flags: OpenFlags) -> Result<usize> {
         let ty = (cmd >> 8) & 0xff;
         let nr = cmd & 0xff;
         if ty != b'A' as u32 {
@@ -1383,7 +1388,7 @@ impl INode for PcmDev {
                 // WRITEI_FRAMES
                 ucheck::<SndXferI>(data)?;
                 let xfer = unsafe { &mut *(data as *mut SndXferI) };
-                self.writei(xfer)?;
+                self.writei(xfer, flags)?;
                 Ok(0)
             }
             _ => {
@@ -1391,6 +1396,38 @@ impl INode for PcmDev {
                 Err(FsError::NotSupported)
             }
         }
+    }
+}
+
+impl INode for PcmDev {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+
+    fn poll(&self) -> Result<PollStatus> {
+        let _ = self.audio.queued_bytes();
+        let st = self.st.lock();
+        let avail = self.avail(&st);
+        // Linux reports POLLOUT when `avail >= avail_min`, but it only
+        // re-evaluates that on a period interrupt, so a feeder wakes at most
+        // once per period however small its avail_min (PulseAudio's tsched=0
+        // sink asks for 1). This fd has no interrupt: sys_poll re-scans it
+        // every 4 ms, and reporting every freed frame would wake such a
+        // feeder 250 times a second to write a few frames each. Gating on a
+        // whole period gives it the wake-up cadence it was written for.
+        Ok(PollStatus {
+            read: false,
+            write: avail >= st.avail_min.max(st.period_size),
+            error: false,
+        })
+    }
+
+    fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
+        self.io_control_impl(cmd, data, OpenFlags::empty())
     }
 
     fn metadata(&self) -> Result<Metadata> {
@@ -2025,6 +2062,126 @@ mod timer_tests {
 
     fn ts(sec: i64) -> Timespec {
         Timespec { sec, nsec: 0 }
+    }
+
+    #[cfg(test)]
+    mod pcm_tests {
+        use super::*;
+        use zcore_drivers::DeviceResult;
+
+        struct FakeAudio {
+            cap: usize,
+            queued: Mutex<usize>,
+        }
+
+        impl FakeAudio {
+            fn new(cap: usize) -> Self {
+                Self {
+                    cap,
+                    queued: Mutex::new(0),
+                }
+            }
+        }
+
+        impl zcore_drivers::scheme::Scheme for FakeAudio {
+            fn name(&self) -> &str {
+                "fake-audio"
+            }
+        }
+
+        impl AudioScheme for FakeAudio {
+            fn set_params(&self, rate: u32, channels: u8) -> DeviceResult<(u32, u8)> {
+                Ok((rate, channels))
+            }
+
+            fn params(&self) -> (u32, u8) {
+                (48_000, 2)
+            }
+
+            fn write(&self, pcm: &[u8]) -> DeviceResult<usize> {
+                let mut queued = self.queued.lock();
+                let room = self.cap.saturating_sub(*queued);
+                let n = room.min(pcm.len());
+                *queued += n;
+                Ok(n)
+            }
+
+            fn free_bytes(&self) -> usize {
+                self.cap.saturating_sub(*self.queued.lock())
+            }
+
+            fn buffer_bytes(&self) -> usize {
+                self.cap
+            }
+
+            fn queued_bytes(&self) -> usize {
+                *self.queued.lock()
+            }
+
+            fn is_playing(&self) -> bool {
+                self.queued_bytes() > 0
+            }
+
+            fn reset(&self) -> DeviceResult {
+                *self.queued.lock() = 0;
+                Ok(())
+            }
+
+            fn rewind(&self, bytes: usize) -> DeviceResult<usize> {
+                let mut queued = self.queued.lock();
+                let n = (*queued).min(bytes);
+                *queued -= n;
+                Ok(n)
+            }
+
+            fn forward(&self, bytes: usize) -> DeviceResult<usize> {
+                self.rewind(bytes)
+            }
+        }
+
+        #[test]
+        fn nonblocking_write_returns_partial_frames_and_marks_running() {
+            let audio = Arc::new(FakeAudio::new(4 * BYTES_PER_FRAME as usize));
+            let pcm = PcmDev::new(audio, 0);
+            pcm.st.lock().state = STATE_PREPARED;
+            let samples = [0u8; 8 * BYTES_PER_FRAME as usize];
+            let mut xfer = SndXferI {
+                result: 0,
+                buf: samples.as_ptr() as usize as u64,
+                frames: 8,
+            };
+            pcm.writei(&mut xfer, OpenFlags::NON_BLOCK).unwrap();
+            assert_eq!(xfer.result, 4);
+            let st = pcm.st.lock();
+            assert_eq!(st.state, STATE_RUNNING);
+            assert_eq!(st.appl_ptr, 4);
+            assert_eq!(pcm.queued_frames(), 4);
+        }
+
+        #[test]
+        fn nonblocking_write_returns_eagain_when_the_negotiated_buffer_is_full() {
+            let audio = Arc::new(FakeAudio::new(2 * BYTES_PER_FRAME as usize));
+            let pcm = PcmDev::new(audio.clone(), 0);
+            {
+                let mut st = pcm.st.lock();
+                st.state = STATE_PREPARED;
+                st.buffer_size = 2;
+            }
+            audio.write(&[0u8; 2 * BYTES_PER_FRAME as usize]).unwrap();
+            let before = pcm.st.lock().appl_ptr;
+            let samples = [0u8; BYTES_PER_FRAME as usize];
+            let mut xfer = SndXferI {
+                result: 0,
+                buf: samples.as_ptr() as usize as u64,
+                frames: 1,
+            };
+            assert!(matches!(
+                pcm.writei(&mut xfer, OpenFlags::NON_BLOCK),
+                Err(FsError::Again)
+            ));
+            assert_eq!(xfer.result, 0);
+            assert_eq!(pcm.st.lock().appl_ptr, before);
+        }
     }
 
     fn clock(running: bool, periods: u64) -> PeriodClock {
