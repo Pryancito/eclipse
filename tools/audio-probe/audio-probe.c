@@ -43,6 +43,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -513,6 +514,26 @@ static void test_alsa_pcm(void) {
       }
       int64_t delay = -1;
       if (ioctl(fd, SNDRV_PCM_IOCTL_DELAY, &delay) == 0) info("DELAY: %lld frames still queued", (long long)delay);
+
+      // poll(POLLOUT) is how PulseAudio (tsched=0 -> snd_pcm_wait) and
+      // cubeb-alsa learn there is room for the next period. The ring was just
+      // filled, so this measures the WAKE: the PCM node has no readiness
+      // bus, and the kernel re-scans such an fd every 4 ms (IO_WAIT_TICK_MS),
+      // which is what bounds the latency; a 256 ms ring cannot underrun on
+      // that. A timeout (0) or an error here means poll-driven feeders stall.
+      {
+        struct pollfd pf = {fd, POLLOUT, 0};
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        int pr = poll(&pf, 1, 1000);
+        int perr = errno;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+        check(pr == 1 && (pf.revents & POLLOUT), "poll(POLLOUT) wakes with room in the ring",
+              "snd_pcm_wait(): pulse tsched=0 and cubeb-alsa feed on this", pr < 0 ? perr : 0);
+        info("poll(POLLOUT) returned in %ld ms (bus-less fd: kernel re-scan tick is 4 ms)", ms);
+        if (pr == 1 && ms > 50) info("NOTE: %ld ms is far above the 4 ms tick -- poll-driven feeders would stutter", ms);
+      }
       CHECK_CALL(ioctl(fd, SNDRV_PCM_IOCTL_DRAIN, 0) == 0, "DRAIN", "snd_pcm_drain() waits for the ring to empty");
       free(pcm_buf);
       info("if the tone was audible, the ALSA path cubeb-alsa/Pulse use works");
@@ -662,23 +683,58 @@ static int unix_connect(const char *path, int *err) {
 
 static int g_pulse_ok;
 
+static int is_socket(const char *path) {
+  struct stat st;
+  return stat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFSOCK;
+}
+
 static void test_pulse(void) {
   section("pulse");
-  const char *sock = "/run/pulse/native";
-  const char *fallback = "/run/user/0/pulse/native";
-  struct stat st;
-  int present = stat(sock, &st) == 0 && (st.st_mode & S_IFMT) == S_IFSOCK;
-  check(present, "/run/pulse/native is a socket", "eclipse-pulseaudio --system (PULSE_RUNTIME_PATH=/run/pulse)", errno);
-  int err = 0;
-  int c = present && unix_connect(sock, &err);
-  check(c, "connect() to /run/pulse/native", "pa_context_connect(): a refused connect fails cubeb-pulse", err);
-  if (!c && stat(fallback, &st) == 0) {
-    int e2 = 0;
-    int c2 = unix_connect(fallback, &e2);
-    info("%s: %s", fallback, c2 ? "connects (per-user path, not what client.conf names)" : strerror(e2));
+  // Where the clients look (client.conf: default-server = unix:/run/pulse/native)
+  // versus where a `pulseaudio --system` daemon actually listens: its
+  // compiled-in /var/run/pulse/native. On a rootfs where /var/run is the FHS
+  // symlink to /run those are one file; where it is a separate directory the
+  // daemon is alive and every client still gets ENOENT. Report both, and the
+  // link, so that mismatch is read off the output instead of guessed.
+  const char *want = "/run/pulse/native";
+  const char *sys = "/var/run/pulse/native";
+  const char *user = "/run/user/0/pulse/native";
+
+  char link[256];
+  ssize_t ll = readlink("/var/run", link, sizeof link - 1);
+  if (ll > 0) {
+    link[ll] = '\0';
+    info("/var/run -> %s (symlink)", link);
+  } else {
+    info("/var/run is %s", errno == EINVAL ? "a real directory, NOT a symlink to /run" : strerror(errno));
   }
-  g_pulse_ok = c;
-  if (c) info("a Pulse server is listening; if the ALSA path above is silent, the server's sink is the next suspect (pactl list short sinks)");
+
+  int have_want = is_socket(want), have_sys = is_socket(sys), have_user = is_socket(user);
+  info("%s: %s", want, have_want ? "socket" : "absent");
+  info("%s: %s", sys, have_sys ? "socket" : "absent");
+  if (have_user) info("%s: socket (per-user path, not what client.conf names)", user);
+
+  int err = 0;
+  int c_want = have_want && unix_connect(want, &err);
+  check(c_want, "connect() to /run/pulse/native (what client.conf names)",
+        "pa_context_connect(): this is the connect cubeb-pulse and every libpulse client make", have_want ? err : ENOENT);
+  g_pulse_ok = c_want;
+
+  if (!c_want && have_sys) {
+    int e2 = 0;
+    int c_sys = unix_connect(sys, &e2);
+    if (c_sys) {
+      fail("daemon reachable only at /var/run/pulse/native", "the server is ALIVE but not where client.conf points", 0);
+      info("=> /var/run is not a symlink to /run: pulseaudio --system listens at its compiled-in");
+      info("   /var/run/pulse/native while client.conf, Firefox, the boot chime and pactl use");
+      info("   /run/pulse/native. Fix: make /var/run -> ../run (xtask ensure_var_run).");
+    } else {
+      info("%s exists but connect failed: %s", sys, strerror(e2));
+    }
+  } else if (!c_want) {
+    info("no PulseAudio socket at any path: the daemon is not running -- see /tmp/pulseaudio.log");
+  }
+  if (c_want) info("a Pulse server is listening where clients look; if the ALSA path above is silent, the sink is next (pactl list short sinks)");
   info("server log: /tmp/pulseaudio.log; boot chime: /tmp/boot-sound.log");
 }
 
