@@ -2427,9 +2427,19 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let _ = fs::create_dir_all(&run);
         let _ = fs::create_dir_all(&var);
         if var_run.is_symlink() {
-            return;
-        }
-        if var_run.is_dir() {
+            // Only the exact FHS target counts: a link to anywhere else
+            // (`../../tmp`, a dangling target) would still make
+            // `write_pulse_conf` create pulse/ through it, somewhere other
+            // than /run, and the socket mismatch this helper exists to end
+            // would be back under a symlink instead of a directory.
+            if fs::read_link(&var_run)
+                .map(|t| t == Path::new("../run"))
+                .unwrap_or(false)
+            {
+                return;
+            }
+            let _ = fs::remove_file(&var_run);
+        } else if var_run.is_dir() {
             let _ = fs::remove_dir_all(&var_run);
         }
         if let Err(e) = unix::fs::symlink("../run", &var_run) {
@@ -3256,6 +3266,17 @@ mod var_run_tests {
         LinuxRootfs::ensure_var_run(&dir);
         assert_eq!(fs::read_link(&link).unwrap(), Path::new("../run"));
         assert!(dir.join("run/pulse").is_dir());
+
+        // A symlink to the WRONG place (or dangling) is not "already done":
+        // it must be replaced by the FHS link, not accepted.
+        fs::remove_file(&link).unwrap();
+        unix::fs::symlink("../../tmp", &link).unwrap();
+        LinuxRootfs::ensure_var_run(&dir);
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new("../run"));
+        fs::remove_file(&link).unwrap();
+        unix::fs::symlink("../nowhere", &link).unwrap();
+        LinuxRootfs::ensure_var_run(&dir);
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new("../run"));
 
         let _ = fs::remove_dir_all(&dir);
     }

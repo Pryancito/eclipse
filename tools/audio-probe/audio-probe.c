@@ -738,6 +738,34 @@ static void test_pulse(void) {
   info("server log: /tmp/pulseaudio.log; boot chime: /tmp/boot-sound.log");
 }
 
+// ── ALSA "default" routing ─────────────────────────────────────────────────
+//
+// cubeb-alsa does snd_pcm_open("default"), and alsa-lib resolves that name
+// through /etc/asound.conf. On this image `pcm.!default { type pulse }`
+// routes it into the pulse PLUGIN, so cubeb-alsa is only as alive as the
+// Pulse server -- the raw hw:0 ioctls this probe drives say nothing about it.
+// Read the file so the verdict states which case applies instead of assuming.
+
+static int g_default_is_pulse = -1; // -1 unknown (no asound.conf), 0 no, 1 yes
+
+static void detect_default_pcm(void) {
+  FILE *f = fopen("/etc/asound.conf", "r");
+  if (!f) {
+    g_default_is_pulse = -1;
+    return;
+  }
+  char buf[8192];
+  size_t n = fread(buf, 1, sizeof buf - 1, f);
+  fclose(f);
+  buf[n] = '\0';
+  g_default_is_pulse = 0;
+  const char *d = strstr(buf, "pcm.!default");
+  if (!d) return;
+  const char *close = strchr(d, '}');
+  const char *pulse = strstr(d, "type pulse");
+  if (pulse && (!close || pulse < close)) g_default_is_pulse = 1;
+}
+
 // ── verdict ────────────────────────────────────────────────────────────────
 
 int main(int argc, char **argv) {
@@ -765,13 +793,28 @@ int main(int argc, char **argv) {
   test_pulse();
 
   section("verdict");
+  detect_default_pcm();
   // cubeb's backend order on Linux: pulse (if libpulse loads and the server
   // answers) then alsa. OpenCubeb() fails only when every backend fails.
+  printf("  raw ALSA hw:%d: %s (what this probe drove directly)\n", g_card,
+         g_alsa_pcm_ok ? "works" : "BROKEN above");
   if (g_pulse_ok) printf("  cubeb-pulse: would initialise (server reachable)\n");
   else printf("  cubeb-pulse: would FAIL (no reachable server) -> Firefox falls through to alsa\n");
-  if (g_alsa_pcm_ok) printf("  cubeb-alsa:  would initialise (raw ALSA PCM path works)\n");
-  else printf("  cubeb-alsa:  would FAIL (raw ALSA PCM path broken above)\n");
-  if (!g_pulse_ok && !g_alsa_pcm_ok)
+  // cubeb-alsa opens ALSA "default"; where asound.conf routes that into the
+  // pulse plugin it lives or dies with the server, not with the raw hw path.
+  int alsa_backend_ok;
+  if (g_default_is_pulse == 1) {
+    alsa_backend_ok = g_pulse_ok;
+    if (alsa_backend_ok) printf("  cubeb-alsa:  would initialise (\"default\" -> pulse plugin, server reachable)\n");
+    else printf("  cubeb-alsa:  would FAIL (\"default\" -> pulse plugin in /etc/asound.conf, and no server)\n");
+  } else {
+    alsa_backend_ok = g_alsa_pcm_ok;
+    if (g_default_is_pulse == 0) printf("  cubeb-alsa:  \"default\" is not routed to pulse; it rides the raw hw path -> %s\n",
+                                         alsa_backend_ok ? "would initialise" : "would FAIL");
+    else printf("  cubeb-alsa:  no /etc/asound.conf read; assuming raw hw path -> %s\n",
+                alsa_backend_ok ? "would initialise" : "would FAIL");
+  }
+  if (!g_pulse_ok && !alsa_backend_ok)
     printf("  => this is exactly Firefox's 'OpenCubeb() failed to init cubeb'.\n");
   else
     printf("  => OpenCubeb() should succeed; if Firefox still fails, run it with MOZ_LOG=cubeb:5.\n");
