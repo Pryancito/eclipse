@@ -933,14 +933,26 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                 // zero at a fault and only the opcode says which one was being
                 // dereferenced -- with `rax`, `rdx`, `rbp` and `r9` all zero
                 // there is no reading the faulting operand off the dump alone.
-                // The page is mapped executable (we just ran it), so this read
-                // is the same memory the CPU fetched from.
-                if let Ok(bytes) = kernel_hal::user::UserInPtr::<u8>::from(pc).read_array(16) {
-                    let mut hex = String::new();
-                    for b in &bytes {
-                        hex.push_str(&alloc::format!("{b:02x} "));
+                //
+                // Only safe on a DATA fault: there `pc` is the mapped
+                // instruction that made a bad access, so reading its bytes is
+                // the memory the CPU fetched from. On an INSTRUCTION-FETCH
+                // fault (`EXECUTE` flag) `pc` IS the unmapped address that
+                // faulted -- reading it here re-faults, but from kernel mode,
+                // where `read_array`'s unchecked `copy_from_nonoverlapping`
+                // (no fault fixup) turns a recoverable user SIGSEGV into an
+                // unresolved KERNEL page fault and the isolate/kill cascade.
+                // Every desktop process jumping to one bad address then took
+                // the kernel down through this read. The address is already in
+                // the report above (`pc=... [unmapped]`), so skip the bytes.
+                if !flags.contains(kernel_hal::MMUFlags::EXECUTE) {
+                    if let Ok(bytes) = kernel_hal::user::UserInPtr::<u8>::from(pc).read_array(16) {
+                        let mut hex = String::new();
+                        for b in &bytes {
+                            hex.push_str(&alloc::format!("{b:02x} "));
+                        }
+                        error!("  code: {}", hex.trim_end());
                     }
-                    error!("  code: {}", hex.trim_end());
                 }
                 force_fault_signal(thread, Signal::SIGSEGV);
             }
