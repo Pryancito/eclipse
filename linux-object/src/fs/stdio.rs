@@ -1948,7 +1948,7 @@ impl INode for Stdin {
 /// `/dev/tty0`. Reads and writes still go to the inner (fixed) stdin, so the
 /// boot console is byte-for-byte unchanged — only the ioctl target follows the
 /// active VT.
-struct CurrentVtTty {
+pub struct CurrentVtTty {
     inner: Arc<Stdin>,
 }
 
