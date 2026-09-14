@@ -2358,7 +2358,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               default-fragment-size-msec = 25\n\
               resample-method = speex-float-1\n\
               log-target = stderr\n\
-              log-level = notice\n",
+              log-level = info\n",
         );
         write_if_ours(
             &pulse.join("client.conf"),
@@ -2882,7 +2882,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               export HOME=/var/run/pulse\n\
               export PULSE_RUNTIME_PATH=/run/pulse\n\
               export PULSE_STATE_PATH=/var/lib/pulse\n\
-              exec pulseaudio --system --disallow-exit --exit-idle-time=-1 --daemonize=no --use-pid-file=no --realtime=false --log-target=stderr --log-level=notice\n",
+              # --log-level=info: the sink's 'Trying resume...', 'Resumed successfully...' and\n\
+              # 'Starting playback.' are info-level; audio-probe [pulse-play] reads them from the log.\n\
+              exec pulseaudio --system --disallow-exit --exit-idle-time=-1 --daemonize=no --use-pid-file=no --realtime=false --log-target=stderr --log-level=info\n",
         )
         .unwrap();
         let share = rootfs.join("usr").join("share").join("eclipse");
