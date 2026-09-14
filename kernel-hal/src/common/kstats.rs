@@ -190,6 +190,30 @@ pub fn wakeup_preempt_stats() -> (u64, u64) {
     (0, 0)
 }
 
+/// `(alloc-registry drops, live-registry drops)` for the coroutine-stack
+/// hand-out guard.
+///
+/// The scheduler records every live executor stack so the buddy allocator can
+/// refuse to hand that memory to a `Vec`/`Box`/VMO frame (the `[double-alloc]`
+/// that zeroes a live stack and, via the shared buddy arena, a userspace page —
+/// the lunarbar/lunarbg/labwc `wl_list` NULL-deref crash class). Both counters
+/// are monotonic and rise ONLY when a registry table filled and an insert was
+/// dropped: a non-zero value means the guard has blind spots and the
+/// double-alloc protection is not complete. Zero means the registry never
+/// overflowed, so that path is ruled out and the corruption is elsewhere.
+#[cfg(target_os = "none")]
+pub fn coroutine_stack_registry_drops() -> (usize, usize) {
+    (
+        executor::untracked_alloc_stacks(),
+        executor::untracked_live_stacks(),
+    )
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn coroutine_stack_registry_drops() -> (usize, usize) {
+    (0, 0)
+}
+
 /// Account one idle-callback invocation; `had_work` is whether it found deferred
 /// jobs (and so kept the CPU from halting).
 pub fn note_idle_callback(had_work: bool) {

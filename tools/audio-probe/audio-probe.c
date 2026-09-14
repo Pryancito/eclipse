@@ -548,6 +548,7 @@ static void test_wake(void) {
   //    whole CPU stood still (a KVM vCPU the host descheduled, an
   //    interrupts-off section) -- if it did not, the delay is in the wake path.
   dump_matching("/proc/perf/kernel", "timer tick gaps");
+  dump_matching("/proc/perf/kernel", "coroutine-stack registry");
   if (stalls)
     info("=> %d of %d samples stalled past %d ms: this thread was not run for that long (host preemption? kernel stall?)", stalls,
          2 * WAKE_SAMPLES + n, WAKE_BOUND_US / 1000);

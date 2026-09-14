@@ -711,6 +711,23 @@ pub fn kernel_report() -> String {
             pct
         );
     }
+    // Coroutine-stack hand-out guard health. Non-zero means the live-stack
+    // registry filled and dropped an insert, so the buddy allocator can hand a
+    // live executor stack to a Vec/Box/VMO frame — the [double-alloc] that
+    // zeroes a live stack and (shared buddy arena) a userspace page, i.e. the
+    // lunarbar/lunarbg/labwc wl_list NULL-deref crash. Zero rules that path out.
+    {
+        let (alloc_drops, live_drops) = kernel_hal::kstats::coroutine_stack_registry_drops();
+        if alloc_drops > 0 || live_drops > 0 {
+            let _ = writeln!(
+                out,
+                "coroutine-stack registry OVERFLOWED: {} alloc-guard drops, {} live drops                  — the buddy can hand out a LIVE stack (double-alloc / userspace corruption risk)",
+                alloc_drops, live_drops
+            );
+        } else {
+            let _ = writeln!(out, "coroutine-stack registry: no overflow (hand-out guard complete)");
+        }
+    }
     let _ = writeln!(out);
     if busy_pct > 50.0 {
         let _ = writeln!(
