@@ -37,6 +37,9 @@
 //   pulse     the server socket cubeb-pulse / libpulse connect to first, and
 //             whether a real (module-alsa-sink) sink sits behind it: a server
 //             with only auto_null answers every connect and plays nothing.
+//   pulse-play the tone through the server itself (pacat), with the sink and
+//             stream state from pactl and the HDA stream's account from
+//             /proc/gpusnd: the path mpg123 and Firefox actually take.
 //   verdict   which cubeb backend would initialise from what was measured --
 //             the same choice Firefox's OpenCubeb() makes.
 //
@@ -67,6 +70,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1492,6 +1496,154 @@ static void test_pulse(void) {
   info("server log: /tmp/pulseaudio.log; boot chime: /tmp/boot-sound.log");
 }
 
+// ── PulseAudio playback: the path mpg123 and Firefox actually take ─────────
+//
+// Everything above drives the kernel directly. mpg123 (alsa -> pulse plugin)
+// and Firefox (cubeb-pulse) hand their audio to the PulseAudio server, and
+// it is the server's module-alsa-sink thread that opens hw:0,0 and feeds it
+// for them. A green kernel and a silent mpg123 means that thread is where to
+// look, so play the tone through the server with its own client (pacat) and
+// read what each side saw: the sink's state, volume and mute from pactl,
+// the stream's while it plays, whether pacat returned at all (an mpg123
+// that "never finishes" is a stream that never drains), and /proc/gpusnd's
+// account of the HDA stream the sink ran -- ring fed or not, bytes written,
+// underruns, restarts.
+
+static int g_pulse_play_ok = -1; // -1 not run, 0 failed, 1 played to the hardware
+
+// "[gpusnd] events: D drains, U underruns, R stream restarts, ..."
+static int gpusnd_events(long *drains, long *underruns, long *restarts) {
+  static char buf[65536];
+  if (read_whole("/proc/gpusnd", buf, sizeof buf) < 0) return 0;
+  const char *p = strstr(buf, "[gpusnd] events:");
+  return p && sscanf(p, "[gpusnd] events: %ld drains, %ld underruns, %ld stream restarts", drains, underruns, restarts) == 3;
+}
+
+// The newest stop event: its kind and how many bytes that stream got.
+static int gpusnd_last_stop(char *kind, size_t kind_len, long *at_ms, long *written) {
+  static char buf[65536];
+  if (read_whole("/proc/gpusnd", buf, sizeof buf) < 0) return 0;
+  const char *last = NULL;
+  for (const char *p = buf; (p = strstr(p, "stop: ")) != NULL; p += 6) last = p;
+  if (!last) return 0;
+  char k[32];
+  if (sscanf(last, "stop: %31s at %ld ms by kernel clock / %*d ms by HDA wall clock, %ld B written", k, at_ms, written) != 3) return 0;
+  snprintf(kind, kind_len, "%s", k);
+  return 1;
+}
+
+// Lines of a command's output that contain one of the needles, trimmed.
+static void dump_cmd_matching(const char *cmd, const char *const *needles, int n) {
+  FILE *p = popen(cmd, "r");
+  if (!p) {
+    info("%s: %s", cmd, strerror(errno));
+    return;
+  }
+  char line[512];
+  int hits = 0;
+  while (fgets(line, sizeof line, p)) {
+    size_t l = strlen(line);
+    if (l && line[l - 1] == '\n') line[l - 1] = '\0';
+    const char *s = line;
+    while (*s == ' ' || *s == '\t') s++;
+    for (int i = 0; i < n; i++) {
+      if (strstr(s, needles[i])) {
+        info("  %s", s);
+        hits++;
+        break;
+      }
+    }
+  }
+  pclose(p);
+  if (!hits) info("  (nothing)");
+}
+
+static void test_pulse_play(void) {
+  section("pulse-play");
+  if (g_pulse_sink_ok != 1) {
+    skip("play the tone through PulseAudio", "no ALSA sink loaded (see [pulse])");
+    return;
+  }
+  if (!node_present("/usr/bin/pacat", S_IFREG) && !node_present("/bin/pacat", S_IFREG)) {
+    skip("play the tone through PulseAudio", "pacat not installed (pulseaudio-utils)");
+    return;
+  }
+  size_t bytes;
+  int16_t *pcm = make_tone(&bytes);
+  if (!pcm) {
+    fail("allocate tone", "calloc", errno);
+    return;
+  }
+  static const char *const sink_keys[] = {"State:", "Mute:", "Volume: front-left", "Latency:", "Flags:", "Sample Specification:"};
+  info("sink before (pactl list sinks):");
+  dump_cmd_matching("timeout 5 pactl list sinks 2>&1", sink_keys, 6);
+  long d0 = 0, u0 = 0, r0 = 0;
+  int have0 = gpusnd_events(&d0, &u0, &r0);
+
+  // pacat: raw S16LE stereo 48 kHz from stdin, 100 ms latency, as
+  // libpulse-simple clients (mpg123 -o pulse) and cubeb-pulse set up.
+  struct timespec t0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  FILE *p = popen("timeout 15 pacat --raw --format=s16le --rate=48000 --channels=2 --latency-msec=100 --client-name=audio-probe 2>&1", "w");
+  if (!p) {
+    fail("run pacat", "popen", errno);
+    free(pcm);
+    return;
+  }
+  size_t wrote = fwrite(pcm, 1, bytes, p);
+  fflush(p);
+  // While it plays: the stream as the server sees it, and the ring as the
+  // kernel sees it. 150 ms in, both should be busy.
+  struct timespec nap = {0, 150000000};
+  nanosleep(&nap, NULL);
+  static const char *const input_keys[] = {"Corked:", "Mute:", "Volume: front-left", "Buffer Latency:", "Sink Latency:", "Sample Specification:", "application.name"};
+  info("stream while playing (pactl list sink-inputs):");
+  dump_cmd_matching("timeout 5 pactl list sink-inputs 2>&1", input_keys, 7);
+  info("hardware while playing (/proc/gpusnd):");
+  dump_matching("/proc/gpusnd", "[gpusnd] ring:");
+  dump_matching("/proc/gpusnd", "[gpusnd] stream:");
+  int rc = pclose(p);
+  long ms = elapsed_ms(&t0);
+  int exit_code = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+  check(wrote == bytes && exit_code == 0 && ms < 5000, "pacat plays the tone through the server and returns",
+        "the stream drains and the client exits; an mpg123 that never finishes is a stream that never drains", 0);
+  info("pacat exit %d after %ld ms (tone %d ms + 100 ms latency)%s", exit_code, ms, TONE_MS,
+       exit_code == 124 ? " -- killed by timeout: the stream never drained" : "");
+
+  // Let the sink go idle (module-suspend-on-idle timeout=1) so the kernel
+  // records the stream's end, then read its account.
+  struct timespec settle = {1, 500000000};
+  nanosleep(&settle, NULL);
+  long d1 = 0, u1 = 0, r1 = 0;
+  int have1 = gpusnd_events(&d1, &u1, &r1);
+  if (have0 && have1) {
+    check(r1 > r0 || d1 > d0 || u1 > u0, "the sink thread drove the HDA stream",
+          "/proc/gpusnd recorded a stream start or stop during the play: the server's writes reached hw:0,0", 0);
+    info("events during the play: +%ld drains, +%ld underruns, +%ld restarts", d1 - d0, u1 - u0, r1 - r0);
+  } else {
+    info("/proc/gpusnd not readable: cannot say what reached the hardware");
+  }
+  char kind[32];
+  long at_ms = 0, written = 0;
+  if (gpusnd_last_stop(kind, sizeof kind, &at_ms, &written)) {
+    // The sink resamples 48 kHz to its own rate; expect at least most of it.
+    long expect = (long)bytes * 44100 / 48000 * 8 / 10;
+    check(written >= expect, "the whole tone reached the hardware",
+          "bytes the newest HDA stream got before it stopped, against the tone's size at the sink's rate", 0);
+    info("newest stream: %s at %ld ms, %ld B written (tone is %zu B at 48 kHz)", kind, at_ms, written, bytes);
+    if (written < expect && written > 0)
+      info("=> the sink wrote %ld B and never refilled: its thread stopped feeding hw:0,0 (blocked in a write? never woken?)", written);
+    g_pulse_play_ok = (exit_code == 0 && written >= expect);
+  } else {
+    info("no stream stop recorded: the sink never started an HDA stream, or it is still running");
+    g_pulse_play_ok = 0;
+  }
+  info("sink after:");
+  dump_cmd_matching("timeout 5 pactl list sinks 2>&1", sink_keys, 6);
+  dump_tail("/tmp/pulseaudio.log", 6);
+  free(pcm);
+}
+
 // ── ALSA "default" routing ─────────────────────────────────────────────────
 //
 // cubeb-alsa does snd_pcm_open("default"), and alsa-lib resolves that name
@@ -1549,6 +1701,7 @@ int main(int argc, char **argv) {
   test_daemon();
   test_unix_socket();
   test_pulse();
+  test_pulse_play();
 
   section("verdict");
   detect_default_pcm();
@@ -1556,6 +1709,8 @@ int main(int argc, char **argv) {
   // answers) then alsa. OpenCubeb() fails only when every backend fails.
   printf("  raw ALSA hw:%d: %s (what this probe drove directly)\n", g_card,
          g_alsa_pcm_ok ? "works" : "BROKEN above");
+  if (g_pulse_play_ok == 1) printf("  PulseAudio playback (pacat -> sink -> hw:%d): works -- what mpg123 and Firefox use\n", g_card);
+  else if (g_pulse_play_ok == 0) printf("  PulseAudio playback (pacat -> sink -> hw:%d): BROKEN (see [pulse-play]) -- this is the silence mpg123 and Firefox hit\n", g_card);
   if (g_pulse_ok && g_pulse_sink_ok == 0)
     printf("  cubeb-pulse: would initialise, but the server has NO real sink -> streams play into silence (see [pulse]/[daemon])\n");
   else if (g_pulse_ok) printf("  cubeb-pulse: would initialise (server reachable%s)\n",
