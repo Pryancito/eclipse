@@ -60,6 +60,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1646,6 +1647,70 @@ static void dump_cmd_matching(const char *cmd, const char *const *needles, int n
   if (!hits) info("  (nothing)");
 }
 
+// A child `sh -c cmd` in its own process group with its stdin on a pipe we
+// write. popen(3) would do, but pclose() waits without limit: a pacat whose
+// stream never drains, under a timeout(1) whose SIGTERM never lands, hung
+// the probe here forever -- and SIGPIPE from a pacat that died early killed
+// it silently. main() ignores SIGPIPE; feed_wait() below has a deadline.
+static pid_t feed_start(const char *cmd, int *wfd) {
+  int pfd[2];
+  if (pipe(pfd) != 0) return -1;
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(pfd[0]);
+    close(pfd[1]);
+    return -1;
+  }
+  if (pid == 0) {
+    setpgid(0, 0);
+    dup2(pfd[0], 0);
+    close(pfd[0]);
+    close(pfd[1]);
+    execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+    _exit(127);
+  }
+  close(pfd[0]);
+  *wfd = pfd[1];
+  return pid;
+}
+
+// Wait for the child up to `limit_ms`, calling `progress` every 5 s of
+// waiting; past the limit, kill its whole process group. Returns the exit
+// code, -1 for a signal death, -2 when it had to be killed.
+static int feed_wait(pid_t pid, long limit_ms, void (*progress)(long)) {
+  struct timespec t0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  long next_report = 5000;
+  for (;;) {
+    int rc = 0;
+    pid_t w = waitpid(pid, &rc, WNOHANG);
+    if (w == pid) return WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+    if (w < 0 && errno != EINTR) return -1;
+    long ms = elapsed_ms(&t0);
+    if (ms >= limit_ms) {
+      kill(-pid, SIGKILL);
+      kill(pid, SIGKILL);
+      waitpid(pid, &rc, 0);
+      return -2;
+    }
+    if (ms >= next_report) {
+      if (progress) progress(ms);
+      next_report += 5000;
+    }
+    struct timespec nap = {0, 100000000};
+    nanosleep(&nap, NULL);
+  }
+}
+
+static const char *const g_sink_keys[] = {"State:", "Mute:", "Volume: front-left", "Latency:", "Flags:", "Sample Specification:"};
+
+static void pulse_play_progress(long ms) {
+  info("pacat still running after %ld ms:", ms);
+  dump_cmd_matching("timeout 5 pactl list sinks 2>&1", g_sink_keys, 6);
+  dump_matching("/proc/gpusnd", "[gpusnd] ring:");
+  dump_tail("/tmp/pulseaudio.log", 4);
+}
+
 static void test_pulse_play(void) {
   section("pulse-play");
   if (g_pulse_sink_ok != 1) {
@@ -1673,9 +1738,8 @@ static void test_pulse_play(void) {
     fail("allocate tone", "calloc", errno);
     return;
   }
-  static const char *const sink_keys[] = {"State:", "Mute:", "Volume: front-left", "Latency:", "Flags:", "Sample Specification:"};
   info("sink before (pactl list sinks):");
-  dump_cmd_matching("timeout 5 pactl list sinks 2>&1", sink_keys, 6);
+  dump_cmd_matching("timeout 5 pactl list sinks 2>&1", g_sink_keys, 6);
   long d0 = 0, u0 = 0, r0 = 0;
   int have0 = gpusnd_events(&d0, &u0, &r0);
 
@@ -1687,31 +1751,52 @@ static void test_pulse_play(void) {
   snprintf(cmd, sizeof cmd,
            "timeout 15 pacat --raw --format=s16le --rate=48000 --channels=2 --latency-msec=100 --client-name=audio-probe --device=%s 2>&1",
            sink);
-  FILE *p = popen(cmd, "w");
-  if (!p) {
-    fail("run pacat", "popen", errno);
+  int wfd = -1;
+  pid_t pid = feed_start(cmd, &wfd);
+  if (pid < 0) {
+    fail("run pacat", "fork/pipe", errno);
     free(pcm);
     return;
   }
-  size_t wrote = fwrite(pcm, 1, bytes, p);
-  fflush(p);
-  // While it plays: the stream as the server sees it, and the ring as the
-  // kernel sees it. 150 ms in, both should be busy.
+  size_t wrote = 0;
+  int write_err = 0;
+  while (wrote < bytes) {
+    ssize_t n = write(wfd, (const char *)pcm + wrote, bytes - wrote);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) {
+      write_err = errno;
+      break;
+    }
+    wrote += (size_t)n;
+  }
+  // While it plays: the stream as the server sees it, the sink's state, the
+  // ring as the kernel sees it, and what the daemon logged. 150 ms in, the
+  // stream and the ring should both be busy. All of this comes out BEFORE
+  // the wait below, so a play that hangs still leaves its evidence.
   struct timespec nap = {0, 150000000};
   nanosleep(&nap, NULL);
   static const char *const input_keys[] = {"Corked:", "Mute:", "Volume: front-left", "Buffer Latency:", "Sink Latency:", "Sample Specification:", "application.name"};
   info("stream while playing (pactl list sink-inputs):");
   dump_cmd_matching("timeout 5 pactl list sink-inputs 2>&1", input_keys, 7);
+  info("sink while playing (pactl list sinks):");
+  static const char *const live_keys[] = {"State:", "Latency:"};
+  dump_cmd_matching("timeout 5 pactl list sinks 2>&1", live_keys, 2);
   info("hardware while playing (/proc/gpusnd):");
   dump_matching("/proc/gpusnd", "[gpusnd] ring:");
   dump_matching("/proc/gpusnd", "[gpusnd] stream:");
-  int rc = pclose(p);
+  info("daemon while playing:");
+  dump_tail("/tmp/pulseaudio.log", 8);
+  if (write_err) info("pacat stopped reading its stdin after %zu of %zu bytes: %s", wrote, bytes, strerror(write_err));
+  close(wfd);
+  int exit_code = feed_wait(pid, 20000, pulse_play_progress);
   long ms = elapsed_ms(&t0);
-  int exit_code = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
   check(wrote == bytes && exit_code == 0 && ms < 5000, "pacat plays the tone through the server and returns",
         "the stream drains and the client exits; an mpg123 that never finishes is a stream that never drains", 0);
   info("pacat exit %d after %ld ms (tone %d ms + 100 ms latency)%s", exit_code, ms, TONE_MS,
-       exit_code == 124 ? " -- killed by timeout: the stream never drained" : "");
+       exit_code == 124   ? " -- killed by timeout(1): the stream never drained"
+       : exit_code == -2 ? " -- KILLED by the probe: still alive 5 s past timeout(1)'s SIGTERM (a client the kernel cannot interrupt?)"
+       : exit_code == -1 ? " -- died of a signal"
+                         : "");
 
   // Let the sink go idle (module-suspend-on-idle timeout=1) so the kernel
   // records the stream's end, then read its account.
@@ -1742,9 +1827,447 @@ static void test_pulse_play(void) {
     g_pulse_play_ok = 0;
   }
   info("sink after:");
-  dump_cmd_matching("timeout 5 pactl list sinks 2>&1", sink_keys, 6);
+  dump_cmd_matching("timeout 5 pactl list sinks 2>&1", g_sink_keys, 6);
   dump_tail("/tmp/pulseaudio.log", 6);
   free(pcm);
+}
+
+// ── PulseAudio's sink thread, call for call ────────────────────────────────
+//
+// module-alsa-sink (tsched=0, mmap=0 on this image) never drives the ring the
+// way [alsa-pcm] does. It opens hw:0,0 O_NONBLOCK at the sink's rate with
+// fragments=4 x fragment_size=4800 B (period 1200 frames, buffer 4800),
+// CLOSES it when module-suspend-on-idle suspends the sink, and REOPENS it on
+// the next stream -- at that stream's rate when daemon.conf's alternate rate
+// lets the sink switch (a 48 kHz pacat on a sink parked at 44.1 kHz) --
+// demanding the same period/buffer bytes back ("Resume failed, couldn't
+// restore original fragment settings" otherwise, and the sink stays
+// SUSPENDED: every stream plays into silence and never drains).
+//
+// alsa-lib then talks SYNC_PTR, since this kernel has no mmap of the
+// status/control pages: snd_pcm_avail = SYNC_PTR(HWSYNC|APPL|AVAIL_MIN) then
+// SYNC_PTR(APPL|AVAIL_MIN), avail = hw_ptr + buffer - appl_ptr;
+// snd_pcm_writei = WRITEI_FRAMES then SYNC_PTR(APPL|AVAIL_MIN);
+// snd_pcm_start = SYNC_PTR(AVAIL_MIN) then START. unix_write()
+// (alsa-sink.c) writes whatever avail says fits, and the FIRST writei after
+// an avail > 0 must not answer EAGAIN: try_recover() asserts on it and the
+// daemon aborts. After "Starting playback." the thread sleeps in poll() on
+// [pcm, timer] with NO timeout -- every later refill hangs on the timer's
+// period tick or the PCM's POLLOUT. This section replays exactly that and
+// watches the hardware while it does.
+
+struct snd_pcm_mmap_status_ {
+  int32_t state, pad1;
+  uint64_t hw_ptr;
+  struct snd_timespec_ tstamp;
+  int32_t suspended_state, pad2;
+  struct snd_timespec_ audio_tstamp;
+};
+struct snd_pcm_mmap_control_ {
+  uint64_t appl_ptr, avail_min;
+};
+struct snd_pcm_sync_ptr {
+  uint32_t flags, pad1;
+  union {
+    struct snd_pcm_mmap_status_ status;
+    unsigned char reserved[64];
+  } s;
+  union {
+    struct snd_pcm_mmap_control_ control;
+    unsigned char reserved[64];
+  } c;
+};
+#define SNDRV_PCM_IOCTL_SYNC_PTR _IOC_(IOC_RW, 'A', 0x23, sizeof(struct snd_pcm_sync_ptr))
+#define SYNC_PTR_HWSYNC 1u
+#define SYNC_PTR_APPL 2u
+#define SYNC_PTR_AVAIL_MIN 4u
+#define SINK_PERIOD 1200 // fragment_size=4800 B / 4 B per frame
+#define SINK_BUFFER 4800 // fragments=4
+#define SINK_RATE_CREATED 48000 // daemon.conf default-sample-rate
+#define SINK_RATE_ALTERNATE 44100 // alternate-sample-rate (the boot chime's)
+
+static int g_pulse_sink_path_ok = -1; // -1 not run, 0 broken, 1 the kernel side of the sink works
+
+// pa_alsa_open_by_device_string + pa_alsa_set_hw_params as unsuspend() calls
+// them: O_NONBLOCK, S16LE stereo at `rate`, the sink's period and buffer.
+// Returns the fd or -errno; the granted sizes in frames.
+static int sink_hw_open(unsigned rate, unsigned *period, unsigned *buffer) {
+  char path[64];
+  snprintf(path, sizeof path, "/dev/snd/pcmC%dD0p", g_card);
+  int fd = open(path, O_WRONLY | O_NONBLOCK);
+  if (fd < 0) return -errno;
+  struct snd_pcm_hw_params hp;
+  hw_params_any(&hp);
+  mask_only(&hp, HWP_ACCESS, ACCESS_RW_INTERLEAVED);
+  mask_only(&hp, HWP_FORMAT, FORMAT_S16_LE);
+  mask_only(&hp, HWP_SUBFORMAT, SUBFORMAT_STD);
+  iv_set(&hp, IV_CHANNELS, 2);
+  iv_set(&hp, IV_RATE, rate);
+  iv_set(&hp, IV_PERIOD_SIZE, SINK_PERIOD);
+  iv_set(&hp, IV_BUFFER_SIZE, SINK_BUFFER);
+  if (ioctl(fd, SNDRV_PCM_IOCTL_HW_PARAMS, &hp) != 0) {
+    int e = errno;
+    close(fd);
+    return -e;
+  }
+  *period = hp.intervals[IV_PERIOD_SIZE].min;
+  *buffer = hp.intervals[IV_BUFFER_SIZE].min;
+  return fd;
+}
+
+// The period timer exactly as [alsa-timer] opens it, quietly. fd or -errno.
+static int period_timer_open(void) {
+  int tfd = open("/dev/snd/timer", O_RDONLY | O_NONBLOCK);
+  if (tfd < 0) return -errno;
+  int one = 1;
+  struct snd_timer_select sel;
+  memset(&sel, 0, sizeof sel);
+  sel.id.dev_class = TIMER_CLASS_PCM;
+  sel.id.card = g_card;
+  struct snd_timer_params tp;
+  memset(&tp, 0, sizeof tp);
+  tp.flags = TIMER_PSFLG_AUTO;
+  tp.ticks = 1;
+  tp.filter = (1u << TIMER_EVENT_TICK) | (1u << TIMER_EVENT_MSUSPEND) | (1u << TIMER_EVENT_MRESUME);
+  if (ioctl(tfd, SNDRV_TIMER_IOCTL_TREAD_OLD, &one) != 0 || ioctl(tfd, SNDRV_TIMER_IOCTL_SELECT, &sel) != 0 ||
+      ioctl(tfd, SNDRV_TIMER_IOCTL_PARAMS, &tp) != 0 || ioctl(tfd, SNDRV_TIMER_IOCTL_START, 0) != 0) {
+    int e = errno;
+    close(tfd);
+    return -e;
+  }
+  return tfd;
+}
+
+// snd_pcm_avail() on the SYNC_PTR fallback: hwsync (HWSYNC|APPL|AVAIL_MIN),
+// then avail_update's query (APPL|AVAIL_MIN), then alsa-lib's own arithmetic
+// on the two pointers it got back. -1 with errno in *err on an ioctl error.
+static long sink_avail(int fd, struct snd_pcm_sync_ptr *sp, unsigned buffer, long long boundary, int *err) {
+  sp->flags = SYNC_PTR_HWSYNC | SYNC_PTR_APPL | SYNC_PTR_AVAIL_MIN;
+  if (ioctl(fd, SNDRV_PCM_IOCTL_SYNC_PTR, sp) != 0) {
+    *err = errno;
+    return -1;
+  }
+  sp->flags = SYNC_PTR_APPL | SYNC_PTR_AVAIL_MIN;
+  if (ioctl(fd, SNDRV_PCM_IOCTL_SYNC_PTR, sp) != 0) {
+    *err = errno;
+    return -1;
+  }
+  long long avail = (long long)sp->s.status.hw_ptr + (long long)buffer - (long long)sp->c.control.appl_ptr;
+  if (avail < 0) avail += boundary;
+  else if (avail >= boundary) avail -= boundary;
+  *err = 0;
+  return (long)avail;
+}
+
+struct sink_stats {
+  long writes, short_writes, eagain_later, spurious_wakes, max_write;
+};
+
+// alsa-sink.c unix_write() with tsched=0 (hwbuf_unused = 0): fill what avail
+// says, at most 10 rounds, stop once less than 3% of the buffer is free.
+// Returns 1 when something was written, 0 when not, -1 on what would make
+// the daemon abort or restart the PCM (`why` says which).
+static int sink_unix_write(int fd, struct snd_pcm_sync_ptr *sp, unsigned buffer, long long boundary, const int16_t *pcm,
+                           size_t *pos, size_t total, int polled, struct sink_stats *st, char *why, size_t why_len) {
+  int work_done = 0;
+  for (unsigned j = 0;;) {
+    int err;
+    long n = sink_avail(fd, sp, buffer, boundary, &err);
+    if (n < 0) {
+      snprintf(why, why_len, "snd_pcm_avail: SYNC_PTR failed: %s", strerror(err));
+      return -1;
+    }
+    if (n == 0) {
+      if (polled) st->spurious_wakes++;
+      break;
+    }
+    j++;
+    if (j > 10) break;
+    if (j >= 2 && (unsigned long)n * 100 < (unsigned long)buffer * 3) break;
+    polled = 0;
+    size_t room = (size_t)n;
+    int after_avail = 1;
+    for (;;) {
+      if (*pos >= total) return work_done;
+      size_t frames = total - *pos;
+      if (frames > room) frames = room;
+      struct snd_xferi x = {0, (uint64_t)(uintptr_t)(pcm + *pos * 2), frames};
+      int r = ioctl(fd, SNDRV_PCM_IOCTL_WRITEI_FRAMES, &x);
+      int e = errno;
+      if (r == 0) {
+        // query_status_and_control_data(): learn the advanced appl_ptr.
+        sp->flags = SYNC_PTR_APPL | SYNC_PTR_AVAIL_MIN;
+        if (ioctl(fd, SNDRV_PCM_IOCTL_SYNC_PTR, sp) != 0) {
+          snprintf(why, why_len, "SYNC_PTR after WRITEI failed: %s", strerror(errno));
+          return -1;
+        }
+      } else {
+        if (!after_avail && e == EAGAIN) {
+          st->eagain_later++;
+          break;
+        }
+        if (e == EAGAIN)
+          snprintf(why, why_len,
+                   "WRITEI -> EAGAIN right after avail said %ld frames fit: try_recover() asserts err != -EAGAIN and the daemon ABORTS", n);
+        else
+          snprintf(why, why_len, "WRITEI(%zu frames) failed: %s -> try_recover/snd_pcm_recover, then a PCM restart", frames, strerror(e));
+        return -1;
+      }
+      long got = (long)x.result;
+      if (!after_avail && got == 0) break;
+      if (got <= 0) {
+        snprintf(why, why_len, "WRITEI wrote %ld frames right after avail said %ld fit (pa_assert(frames > 0))", got, n);
+        return -1;
+      }
+      after_avail = 0;
+      st->writes++;
+      if (got < (long)frames) st->short_writes++;
+      if (got > st->max_write) st->max_write = got;
+      *pos += (size_t)got;
+      work_done = 1;
+      if ((size_t)got >= room) break;
+      room -= (size_t)got;
+    }
+    if (*pos >= total) return work_done;
+  }
+  return work_done;
+}
+
+// "[gpusnd] ring: running=<bool> queued=<n> ..." for this card.
+static int gpusnd_ring(int *running, long *queued) {
+  static char buf[65536];
+  if (read_whole("/proc/gpusnd", buf, sizeof buf) < 0) return 0;
+  const char *blk = gpusnd_card_block(buf);
+  if (!blk) return 0;
+  const char *p = strstr(blk, "[gpusnd] ring: running=");
+  char word[8];
+  if (!p || sscanf(p, "[gpusnd] ring: running=%7s queued=%ld", word, queued) != 2) return 0;
+  *running = !strcmp(word, "true");
+  return 1;
+}
+
+static void test_pulse_sink(void) {
+  section("pulse-sink");
+  char pcm_path[64];
+  snprintf(pcm_path, sizeof pcm_path, "/dev/snd/pcmC%dD0p", g_card);
+  if (!node_present(pcm_path, S_IFCHR)) {
+    skip("replay module-alsa-sink", "no ALSA playback node");
+    return;
+  }
+  int fail_at_entry = g_fail;
+
+  // The sink's life: created at 48 kHz, suspended, resumed at the chime's
+  // 44.1 kHz, suspended, resumed at a 48 kHz stream's rate. Each resume is
+  // a fresh open that must hand back the creation-time sizes.
+  unsigned period0 = 0, buffer0 = 0;
+  int fd = sink_hw_open(SINK_RATE_CREATED, &period0, &buffer0);
+  check(fd >= 0, "open O_NONBLOCK + HW_PARAMS 48000 Hz, period 1200, buffer 4800 (sink creation)",
+        "module-alsa-sink device=hw:0,0 mmap=0 tsched=0 fragments=4 fragment_size=4800", fd < 0 ? -fd : 0);
+  if (fd < 0) {
+    g_pulse_sink_path_ok = 0;
+    return;
+  }
+  info("granted at 48000 Hz: period %u frames, buffer %u frames", period0, buffer0);
+  close(fd);
+  const unsigned resume_rates[2] = {SINK_RATE_ALTERNATE, SINK_RATE_CREATED};
+  fd = -1;
+  for (int i = 0; i < 2; i++) {
+    unsigned period = 0, buffer = 0;
+    int f = sink_hw_open(resume_rates[i], &period, &buffer);
+    char name[96];
+    snprintf(name, sizeof name, "reopen at %u Hz grants the same period/buffer (sink resume)", resume_rates[i]);
+    check(f >= 0 && period == period0 && buffer == buffer0, name,
+          "unsuspend(): 'Resume failed, couldn't restore original fragment settings' otherwise, and the sink stays SUSPENDED", f < 0 ? -f : 0);
+    if (f >= 0 && (period != period0 || buffer != buffer0))
+      info("granted at %u Hz: period %u, buffer %u (creation: %u / %u)", resume_rates[i], period, buffer, period0, buffer0);
+    if (f < 0) {
+      g_pulse_sink_path_ok = 0;
+      return;
+    }
+    if (i == 0) close(f);
+    else fd = f;
+  }
+  unsigned period = period0, buffer = buffer0;
+  long period_ms = (long)period * 1000 / SINK_RATE_CREATED;
+
+  // pa_alsa_set_sw_params(avail_min=1, period_event=1): alsa-lib keeps
+  // period_event for itself (the timer below) and sends the rest.
+  // alsa-lib: boundary = buffer_size, doubled while boundary*2 <= LONG_MAX -
+  // buffer_size (unsigned arithmetic there; here the bound is halved instead
+  // so the doubling never overflows a signed value into an endless loop).
+  long long boundary = buffer;
+  while (boundary <= (0x7fffffffffffffffll - (long long)buffer) / 2) boundary *= 2;
+  struct snd_pcm_sw_params sw;
+  memset(&sw, 0, sizeof sw);
+  sw.tstamp_mode = 1;
+  sw.period_step = 1;
+  sw.avail_min = 1;
+  sw.start_threshold = (uint64_t)boundary; // (snd_pcm_uframes_t)-1, clipped
+  sw.stop_threshold = (uint64_t)boundary;
+  sw.boundary = (uint64_t)boundary;
+  CHECK_CALL(ioctl(fd, SNDRV_PCM_IOCTL_SW_PARAMS, &sw) == 0, "SW_PARAMS avail_min 1, start/stop threshold = boundary",
+             "pa_alsa_set_sw_params(): never auto-start, never auto-stop");
+  int tfd = period_timer_open();
+  check(tfd >= 0, "period_event timer bound and started", "snd_pcm_hw_change_timer(): the sink's only wake-up source besides POLLOUT",
+        tfd < 0 ? -tfd : 0);
+  CHECK_CALL(ioctl(fd, SNDRV_PCM_IOCTL_PREPARE, 0) == 0, "PREPARE", "snd_pcm_prepare() in unsuspend()");
+
+  struct snd_pcm_sync_ptr sp;
+  memset(&sp, 0, sizeof sp);
+  sp.flags = SYNC_PTR_APPL | SYNC_PTR_AVAIL_MIN; // prepare's query_status_and_control_data
+  CHECK_CALL(ioctl(fd, SNDRV_PCM_IOCTL_SYNC_PTR, &sp) == 0 && sp.s.status.state == PCM_STATE_PREPARED && sp.c.control.appl_ptr == 0 &&
+                 sp.s.status.hw_ptr == 0,
+             "SYNC_PTR after PREPARE: PREPARED, appl_ptr 0, hw_ptr 0", "alsa-lib's view of the fresh stream");
+  info("SYNC_PTR: state %d appl_ptr %llu hw_ptr %llu avail_min %llu", sp.s.status.state, (unsigned long long)sp.c.control.appl_ptr,
+       (unsigned long long)sp.s.status.hw_ptr, (unsigned long long)sp.c.control.avail_min);
+  int err = 0;
+  long avail = sink_avail(fd, &sp, buffer, boundary, &err);
+  check(avail == (long)buffer, "snd_pcm_avail() after PREPARE = the whole buffer", "hw_ptr + buffer - appl_ptr, as alsa-lib computes it", err);
+  if (avail != (long)buffer) info("avail %ld (buffer %u)", avail, buffer);
+
+  // The stream's data: the tone (or silence with --no-tone), 48 kHz, no
+  // resampling in the way.
+  size_t bytes = 0;
+  int16_t *pcm = g_no_tone ? calloc(TONE_FRAMES * 2, sizeof(int16_t)) : make_tone(&bytes);
+  if (g_no_tone) bytes = (size_t)TONE_FRAMES * 4;
+  if (!pcm) {
+    fail("allocate the stream's data", "calloc", errno);
+    close(tfd);
+    close(fd);
+    return;
+  }
+  size_t total = bytes / 4, pos = 0;
+  struct sink_stats st;
+  memset(&st, 0, sizeof st);
+  char why[256] = "";
+  long d0 = 0, u0 = 0, r0 = 0;
+  int have0 = gpusnd_events(&d0, &u0, &r0);
+  struct tick_gaps gaps_before = tick_gaps_late();
+  struct timespec t0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+
+  int r = sink_unix_write(fd, &sp, buffer, boundary, pcm, &pos, total, 0, &st, why, sizeof why);
+  check(r == 1 && pos >= buffer, "first unix_write() fills the buffer (avail, then nonblocking WRITEI of what fits)",
+        "the first WRITEI after avail > 0 must write, never EAGAIN (try_recover asserts on it)", 0);
+  if (r < 0) info("=> %s", why);
+  info("first fill: %zu of %zu frames in %ld write%s (largest %ld frames)%s", pos, total, st.writes, st.writes == 1 ? "" : "s", st.max_write,
+       st.short_writes ? " -- short writes seen" : "");
+
+  // "Starting playback.": issue_applptr (SYNC_PTR AVAIL_MIN: our appl_ptr
+  // into the kernel, which must already hold it), then START.
+  unsigned long long appl_before = sp.c.control.appl_ptr;
+  sp.flags = SYNC_PTR_AVAIL_MIN;
+  int sync_ok = ioctl(fd, SNDRV_PCM_IOCTL_SYNC_PTR, &sp) == 0;
+  int start_ok = sync_ok && ioctl(fd, SNDRV_PCM_IOCTL_START, 0) == 0;
+  int se = errno;
+  avail = sink_avail(fd, &sp, buffer, boundary, &err);
+  check(start_ok && sp.s.status.state == PCM_STATE_RUNNING && sp.c.control.appl_ptr == appl_before,
+        "START after the first fill -> RUNNING, appl_ptr kept", "snd_pcm_start(): SYNC_PTR(AVAIL_MIN) commits the client's appl_ptr, then START",
+        start_ok ? 0 : se);
+  info("after START: state %d appl_ptr %llu hw_ptr %llu avail %ld", sp.s.status.state, (unsigned long long)sp.c.control.appl_ptr,
+       (unsigned long long)sp.s.status.hw_ptr, avail);
+
+  // The refill loop: poll [pcm POLLOUT, timer POLLIN] the way pa_rtpoll does
+  // with the timer disabled (tsched=0) -- no timeout in the daemon; here a
+  // bound of two periods + the 4 ms tick + a stall allowance, so a wake that
+  // never comes is reported instead of hanging the probe.
+  long limit = period_ms * 2 + 100;
+  long wakes = 0, timer_wakes = 0, late = 0, max_gap = 0, timed_out = 0, bad_revents = 0, idle_wakes = 0;
+  long last = elapsed_ms(&t0);
+  int hw_running_seen = -1;
+  long hw_queued_seen = 0;
+  while (r >= 0 && pos < total) {
+    struct pollfd pf[2] = {{fd, POLLOUT, 0}, {tfd, POLLIN, 0}};
+    int pr = poll(pf, 2, (int)limit);
+    long now = elapsed_ms(&t0);
+    if (pr <= 0) {
+      timed_out = 1;
+      avail = sink_avail(fd, &sp, buffer, boundary, &err);
+      info("=> no wake within %ld ms after %zu of %zu frames (avail now %ld, state %d): Pulse polls with NO timeout, its sink thread would sleep forever",
+           limit, pos, total, avail, sp.s.status.state);
+      break;
+    }
+    long gap = now - last;
+    last = now;
+    wakes++;
+    if (gap > max_gap) max_gap = gap;
+    if (gap > period_ms + 20) late++;
+    unsigned short rev = pf[0].revents;
+    if (pf[1].revents & POLLIN) {
+      // snd_pcm_hw_poll_revents: drain the timer queue, report POLLOUT.
+      struct snd_timer_tread tr[4];
+      if (read(tfd, tr, sizeof tr) < 0 && errno != EAGAIN) bad_revents++;
+      rev |= POLLOUT;
+      timer_wakes++;
+    }
+    if (rev & ~POLLOUT) {
+      bad_revents++;
+      info("=> PCM revents 0x%x at wake %ld: pa_alsa_recover_from_poll() would restart the PCM", rev, wakes);
+      break;
+    }
+    if (!(rev & POLLOUT)) {
+      idle_wakes++;
+      continue;
+    }
+    if (wakes == 3) {
+      int running = 0;
+      long queued = 0;
+      if (gpusnd_ring(&running, &queued)) {
+        hw_running_seen = running;
+        hw_queued_seen = queued;
+      }
+    }
+    r = sink_unix_write(fd, &sp, buffer, boundary, pcm, &pos, total, 1, &st, why, sizeof why);
+    if (r < 0) info("=> at wake %ld (%zu of %zu frames): %s", wakes, pos, total, why);
+  }
+  long play_ms = elapsed_ms(&t0);
+  check(r >= 0 && !timed_out && !bad_revents && pos >= total, "the refill loop writes the whole stream, one wake per period",
+        "poll [pcm, timer] -> snd_pcm_avail -> WRITEI, as the sink thread lives", 0);
+  info("%zu of %zu frames in %ld ms: %ld wakes (%ld from the timer), gap max %ld ms, %ld late (> period %ld ms + 20), %ld with nothing to write, %ld idle",
+       pos, total, play_ms, wakes, timer_wakes, max_gap, late, period_ms, st.spurious_wakes, idle_wakes);
+  info("writes: %ld, short %ld, EAGAIN after a first write %ld, largest %ld frames", st.writes, st.short_writes, st.eagain_later, st.max_write);
+  if (st.spurious_wakes)
+    info("=> %ld wake%s with avail 0: Pulse logs 'ALSA woke us up to write new data to the device, but there was actually nothing to write' once",
+         st.spurious_wakes, st.spurious_wakes == 1 ? "" : "s");
+  check(hw_running_seen == 1, "the HDA stream runs while the sink refills",
+        "/proc/gpusnd ring: running=true at the third wake -- the driver started DMA on the sink's first fill", 0);
+  if (hw_running_seen >= 0) info("hardware at wake 3: running=%s queued=%ld B", hw_running_seen ? "true" : "false", hw_queued_seen);
+  else info("hardware at wake 3: /proc/gpusnd not readable or fewer than 3 wakes");
+
+  // The end of the stream: DRAIN (Pulse's suspend after the last input
+  // goes idle drains too), then what the hardware recorded.
+  CHECK_CALL(ioctl(fd, SNDRV_PCM_IOCTL_DRAIN, 0) == 0, "DRAIN", "waits for the ring to empty, then resets it");
+  // The newest stop is the stream's end: DRAIN polls the ring and the DMA
+  // engine usually passes the tail a few bytes before that poll sees it, so
+  // the driver may label the end "underrun". A stop that holds every byte
+  // the sink wrote IS the end, whatever its label; an underrun with fewer
+  // bytes is a refill that came too late, and the restart that follows it
+  // splits the stream in two.
+  long d1 = 0, u1 = 0, r1 = 0;
+  int have1 = gpusnd_events(&d1, &u1, &r1);
+  char kind[32] = "";
+  long at_ms = 0, written = 0;
+  int have_stop = gpusnd_last_stop(kind, sizeof kind, &at_ms, &written);
+  if (have_stop) {
+    check(written >= (long)bytes, "the whole stream reached the hardware", "the newest HDA stream ended holding every byte the sink wrote", 0);
+    info("newest stream: %s at %ld ms, %ld B written (stream is %zu B)%s", kind, at_ms, written, bytes,
+         !strcmp(kind, "underrun") && written >= (long)bytes ? " -- the engine passed the tail before DRAIN's poll: the end, not a dropout" : "");
+  } else {
+    fail("the whole stream reached the hardware", "no stop recorded in /proc/gpusnd: the stream never started, or never ended", 0);
+  }
+  if (have0 && have1) {
+    int end_only = u1 - u0 == 0 || (u1 - u0 == 1 && have_stop && written >= (long)bytes);
+    check(end_only, "no underrun before the stream's end", "an underrun mid-stream = a refill that came too late (a missed wake), then a restart", 0);
+    info("events: +%ld drains, +%ld underruns, +%ld restarts", d1 - d0, u1 - u0, r1 - r0);
+  }
+  report_tick_gaps("the sink replay", gaps_before, tick_gaps_late());
+  ioctl(tfd, SNDRV_TIMER_IOCTL_STOP, 0);
+  close(tfd);
+  close(fd);
+  free(pcm);
+  g_pulse_sink_path_ok = g_fail == fail_at_entry;
+  if (g_pulse_sink_path_ok)
+    info("the kernel gives module-alsa-sink everything it asks for; if [pulse-play] is still silent, the daemon is where to look (/tmp/pulseaudio.log)");
 }
 
 // ── ALSA "default" routing ─────────────────────────────────────────────────
@@ -1792,6 +2315,7 @@ int main(int argc, char **argv) {
     }
   }
 
+  signal(SIGPIPE, SIG_IGN); // a pacat that dies early must not take the probe with it
   printf("Firefox-shaped audio probe (card %d)\n", g_card);
   printf("Each check mirrors what cubeb, alsa-lib or PulseAudio asks of the kernel.\n");
 
@@ -1800,6 +2324,7 @@ int main(int argc, char **argv) {
   test_oss();
   test_alsa_pcm();
   test_alsa_timer();
+  test_pulse_sink();
   test_alsa_ctl();
   test_daemon();
   test_unix_socket();
@@ -1812,6 +2337,8 @@ int main(int argc, char **argv) {
   // answers) then alsa. OpenCubeb() fails only when every backend fails.
   printf("  raw ALSA hw:%d: %s (what this probe drove directly)\n", g_card,
          g_alsa_pcm_ok ? "works" : "BROKEN above");
+  if (g_pulse_sink_path_ok == 1) printf("  kernel side of module-alsa-sink (resume, avail, nonblocking writei, wakes): works\n");
+  else if (g_pulse_sink_path_ok == 0) printf("  kernel side of module-alsa-sink (resume, avail, nonblocking writei, wakes): BROKEN (see [pulse-sink])\n");
   if (g_pulse_play_ok == 1) printf("  PulseAudio playback (pacat -> sink -> hw:%d): works -- what mpg123 and Firefox use\n", g_card);
   else if (g_pulse_play_ok == 0) printf("  PulseAudio playback (pacat -> sink -> hw:%d): BROKEN (see [pulse-play]) -- this is the silence mpg123 and Firefox hit\n", g_card);
   if (g_pulse_ok && g_pulse_sink_ok == 0)

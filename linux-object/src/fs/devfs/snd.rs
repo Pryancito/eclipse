@@ -1120,6 +1120,39 @@ impl PcmDev {
         Ok(())
     }
 
+    /// SYNC_PTR with Linux flag semantics (snd_pcm_sync_ptr in
+    /// sound/core/pcm_native.c): a SET flag means "do not take my copy, hand
+    /// me yours" (kernel -> user), a CLEAR flag pushes the user's copy into
+    /// the kernel. alsa-lib's SYNC_PTR fallback (no mmap of the
+    /// status/control pages) relies on this: after every WRITEI it sends
+    /// APPL|AVAIL_MIN to learn the advanced appl_ptr, and before START it
+    /// sends AVAIL_MIN alone to commit its own appl_ptr. With the flags read
+    /// the other way round the kernel's appl_ptr was rewound to the client's
+    /// stale copy after each write, and hw_ptr (appl_ptr - queued) wrapped to
+    /// just under the boundary.
+    fn sync_ptr(&self, sp: &mut SndPcmSyncPtr) {
+        let mut st = self.st.lock();
+        if sp.flags & SYNC_PTR_APPL != 0 {
+            sp.control.appl_ptr = st.appl_ptr;
+        } else {
+            st.appl_ptr = sp.control.appl_ptr % st.boundary.max(1);
+        }
+        if sp.flags & SYNC_PTR_AVAIL_MIN != 0 {
+            sp.control.avail_min = st.avail_min;
+        } else if sp.control.avail_min > 0 {
+            st.avail_min = sp.control.avail_min;
+        }
+        let _ = sp.flags & SYNC_PTR_HWSYNC; // hw state is always live
+        sp.status.state = st.state;
+        sp.status.hw_ptr = self.hw_ptr(&st);
+        sp.status.suspended_state = st.state;
+        let now = kernel_hal::timer::timer_now();
+        sp.status.tstamp = Timespec {
+            sec: now.as_secs() as i64,
+            nsec: now.subsec_nanos() as i64,
+        };
+    }
+
     fn fill_status(&self, s: &mut SndPcmStatus) {
         unsafe {
             core::ptr::write_bytes(
@@ -1255,31 +1288,10 @@ impl PcmDev {
                 Ok(0)
             }
             0x23 => {
-                // SYNC_PTR — Linux flag semantics.
+                // SYNC_PTR
                 ucheck::<SndPcmSyncPtr>(data)?;
                 let sp = unsafe { &mut *(data as *mut SndPcmSyncPtr) };
-                let mut st = self.st.lock();
-                if sp.flags & SYNC_PTR_APPL != 0 {
-                    st.appl_ptr = sp.control.appl_ptr % st.boundary.max(1);
-                } else {
-                    sp.control.appl_ptr = st.appl_ptr;
-                }
-                if sp.flags & SYNC_PTR_AVAIL_MIN != 0 {
-                    if sp.control.avail_min > 0 {
-                        st.avail_min = sp.control.avail_min;
-                    }
-                } else {
-                    sp.control.avail_min = st.avail_min;
-                }
-                let _ = sp.flags & SYNC_PTR_HWSYNC; // hw state is always live
-                sp.status.state = st.state;
-                sp.status.hw_ptr = self.hw_ptr(&st);
-                sp.status.suspended_state = st.state;
-                let now = kernel_hal::timer::timer_now();
-                sp.status.tstamp = Timespec {
-                    sec: now.as_secs() as i64,
-                    nsec: now.subsec_nanos() as i64,
-                };
+                self.sync_ptr(sp);
                 Ok(0)
             }
             0x32 => {
@@ -2181,6 +2193,59 @@ mod timer_tests {
             ));
             assert_eq!(xfer.result, 0);
             assert_eq!(pcm.st.lock().appl_ptr, before);
+        }
+
+        /// pcm_hw.c's SYNC_PTR fallback: `query_status_and_control_data`
+        /// (APPL|AVAIL_MIN) after a write must READ the kernel's advanced
+        /// appl_ptr, `issue_applptr` (AVAIL_MIN) before START must WRITE the
+        /// client's, and `issue_avail_min` (APPL) must write avail_min while
+        /// leaving appl_ptr alone -- Linux's flag semantics.
+        #[test]
+        fn sync_ptr_flags_follow_linux() {
+            let audio = Arc::new(FakeAudio::new(64 * BYTES_PER_FRAME as usize));
+            let pcm = PcmDev::new(audio, 0);
+            {
+                let mut st = pcm.st.lock();
+                st.state = STATE_PREPARED;
+                st.buffer_size = 16;
+                st.avail_min = 1;
+            }
+            let samples = [0u8; 8 * BYTES_PER_FRAME as usize];
+            let mut xfer = SndXferI {
+                result: 0,
+                buf: samples.as_ptr() as usize as u64,
+                frames: 8,
+            };
+            pcm.writei(&mut xfer, OpenFlags::NON_BLOCK).unwrap();
+            assert_eq!(xfer.result, 8);
+
+            let mut sp: SndPcmSyncPtr = unsafe { core::mem::zeroed() };
+            // APPL|AVAIL_MIN: kernel -> user for both; the stale zeros in
+            // the client's copy must not reach the kernel.
+            sp.flags = SYNC_PTR_APPL | SYNC_PTR_AVAIL_MIN;
+            pcm.sync_ptr(&mut sp);
+            assert_eq!(sp.control.appl_ptr, 8);
+            assert_eq!(sp.control.avail_min, 1);
+            assert_eq!(sp.status.hw_ptr, 0, "8 written, 8 queued: hw_ptr sits at 0");
+            assert_eq!(pcm.st.lock().appl_ptr, 8);
+
+            // APPL alone (issue_avail_min): avail_min user -> kernel,
+            // appl_ptr kernel -> user.
+            sp.flags = SYNC_PTR_APPL;
+            sp.control.avail_min = 4;
+            sp.control.appl_ptr = 1234;
+            pcm.sync_ptr(&mut sp);
+            assert_eq!(pcm.st.lock().avail_min, 4);
+            assert_eq!(pcm.st.lock().appl_ptr, 8);
+            assert_eq!(sp.control.appl_ptr, 8);
+
+            // AVAIL_MIN alone (issue_applptr): appl_ptr user -> kernel.
+            sp.flags = SYNC_PTR_AVAIL_MIN;
+            sp.control.appl_ptr = 8;
+            sp.control.avail_min = 0;
+            pcm.sync_ptr(&mut sp);
+            assert_eq!(pcm.st.lock().appl_ptr, 8);
+            assert_eq!(sp.control.avail_min, 4);
         }
     }
 
