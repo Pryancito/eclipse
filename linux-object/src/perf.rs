@@ -667,6 +667,29 @@ pub fn kernel_report() -> String {
             per_tick
         );
     }
+    // Tick gaps: the time between consecutive ticks on one busy CPU, which
+    // should never exceed the 4 ms period by much. A gap of tens of ms is a
+    // CPU that did not run -- under KVM a vCPU the host descheduled, on
+    // hardware an interrupts-off section -- and every wait parked on that
+    // CPU's re-scan (audio feeders among them) was served that late. Ticks
+    // that interrupted the idle halt are counted apart: a halted vCPU the
+    // host wakes late harms nobody.
+    let _ = writeln!(
+        out,
+        "timer tick gaps: max {:.1} ms, {} over 12 ms on a busy CPU{}, {} on an idle one",
+        ks.tick_gap_max_ns as f64 / 1e6,
+        ks.tick_gaps_late,
+        if ks.tick_gaps_late > 0 {
+            alloc::format!(
+                " (last {:.1} ms at uptime {:.3} s)",
+                ks.tick_gap_last_late_ns as f64 / 1e6,
+                ks.tick_gap_last_late_at_ns as f64 / 1e9
+            )
+        } else {
+            String::new()
+        },
+        ks.tick_gaps_late_idle
+    );
     // Wake-up preemption: how often a task became runnable on a CPU that was
     // busy with someone else, and how often that actually cut the running
     // thread's timeslice short. Without this the woken task waits out the full

@@ -32,6 +32,50 @@ static IDLE_ENTRIES_PERCPU: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(
 static HID_POLL_TIMER: AtomicU64 = AtomicU64::new(0);
 static HID_POLL_IOWAIT: AtomicU64 = AtomicU64::new(0);
 
+/// [diag] Monotonic ns of the previous tick on each CPU, for gap measurement.
+static TICK_LAST_NS_PERCPU: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+/// [diag] Longest gap between two consecutive ticks on a *busy* CPU, the
+/// count of such gaps beyond three nominal periods, and the last one's size
+/// and time. A busy CPU that did not run for tens of ms — a KVM vCPU the
+/// host descheduled, an interrupts-off section — shows here, and every wait
+/// parked on that CPU's re-scan (audio feeders among them) was served that
+/// late. A tick that interrupts the idle halt is counted apart: a halted
+/// vCPU the host wakes late harms nobody, and on a lightly loaded machine
+/// that is most of them.
+static TICK_GAP_MAX_NS: AtomicU64 = AtomicU64::new(0);
+static TICK_GAPS_LATE: AtomicU64 = AtomicU64::new(0);
+static TICK_GAPS_LATE_IDLE: AtomicU64 = AtomicU64::new(0);
+static TICK_GAP_LAST_LATE_NS: AtomicU64 = AtomicU64::new(0);
+static TICK_GAP_LAST_LATE_AT_NS: AtomicU64 = AtomicU64::new(0);
+
+/// [diag] Account the gap since this CPU's previous tick. `nominal_ns` is
+/// the tick period the timer was programmed for. Called from the tick
+/// interrupt, so the idle flag says whether the tick interrupted a halt.
+pub fn note_tick_gap(now_ns: u64, nominal_ns: u64) {
+    let cpu = crate::cpu::cpu_id() as usize;
+    if cpu >= MAX_CORE_NUM {
+        return;
+    }
+    let last = TICK_LAST_NS_PERCPU[cpu].swap(now_ns, Relaxed);
+    if last == 0 || now_ns <= last {
+        return;
+    }
+    let gap = now_ns - last;
+    let late = gap > nominal_ns.saturating_mul(3);
+    if CPU_IN_IDLE[cpu].load(Relaxed) {
+        if late {
+            TICK_GAPS_LATE_IDLE.fetch_add(1, Relaxed);
+        }
+        return;
+    }
+    TICK_GAP_MAX_NS.fetch_max(gap, Relaxed);
+    if late {
+        TICK_GAPS_LATE.fetch_add(1, Relaxed);
+        TICK_GAP_LAST_LATE_NS.store(gap, Relaxed);
+        TICK_GAP_LAST_LATE_AT_NS.store(now_ns, Relaxed);
+    }
+}
+
 /// [diag] Account one xHCI HID poll issued from the timer tick.
 pub fn note_hid_poll_timer() {
     HID_POLL_TIMER.fetch_add(1, Relaxed);
@@ -554,6 +598,15 @@ pub struct KStats {
     pub hid_poll_timer: u64,
     /// [diag] xHCI HID polls issued from I/O-wait loops.
     pub hid_poll_iowait: u64,
+    /// [diag] Longest gap between two consecutive ticks on a busy CPU (ns).
+    pub tick_gap_max_ns: u64,
+    /// [diag] Tick gaps beyond three nominal periods on a busy CPU, and the
+    /// last one's size (ns) and monotonic time (ns).
+    pub tick_gaps_late: u64,
+    pub tick_gap_last_late_ns: u64,
+    pub tick_gap_last_late_at_ns: u64,
+    /// [diag] Late gaps whose tick interrupted the idle halt (informational).
+    pub tick_gaps_late_idle: u64,
     /// [diag] Per-CPU `(total_ticks, user_ticks, last_rip)` for cores that took
     /// at least one tick, indexed by dense logical CPU id. `user/total` localises
     /// a pegged core's busy time to ring 3 (user thread) vs ring 0 (kernel);
@@ -601,6 +654,11 @@ pub fn snapshot() -> KStats {
         idle_percpu,
         hid_poll_timer: HID_POLL_TIMER.load(Relaxed),
         hid_poll_iowait: HID_POLL_IOWAIT.load(Relaxed),
+        tick_gap_max_ns: TICK_GAP_MAX_NS.load(Relaxed),
+        tick_gaps_late: TICK_GAPS_LATE.load(Relaxed),
+        tick_gap_last_late_ns: TICK_GAP_LAST_LATE_NS.load(Relaxed),
+        tick_gap_last_late_at_ns: TICK_GAP_LAST_LATE_AT_NS.load(Relaxed),
+        tick_gaps_late_idle: TICK_GAPS_LATE_IDLE.load(Relaxed),
         tick_percpu,
     }
 }

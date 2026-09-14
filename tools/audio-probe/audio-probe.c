@@ -179,6 +179,60 @@ static void dump_file(const char *path, const char *label) {
   fclose(f);
 }
 
+// Lines of a file containing `needle`, for a kernel counter the section
+// is about (e.g. the tick gaps in /proc/perf/kernel).
+static void dump_matching(const char *path, const char *needle) {
+  FILE *f = fopen(path, "r");
+  if (!f) {
+    info("%s: not readable (%s)", path, strerror(errno));
+    return;
+  }
+  char line[512];
+  int hits = 0;
+  while (fgets(line, sizeof line, f)) {
+    if (!strstr(line, needle)) continue;
+    size_t l = strlen(line);
+    if (l && line[l - 1] == '\n') line[l - 1] = '\0';
+    info("%s: %s", path, line);
+    hits++;
+  }
+  fclose(f);
+  if (!hits) info("%s: no line mentions '%s' (older kernel)", path, needle);
+}
+
+// The kernel's count of late timer-tick gaps (a busy CPU that took more
+// than three tick periods between two ticks; ticks that interrupted an idle
+// halt are not counted), from /proc/perf/kernel; -1 when the kernel does not
+// report it. Read before and after a measurement, the difference says
+// whether the kernel itself saw a busy CPU stand still meanwhile.
+static long tick_gaps_late(void) {
+  FILE *f = fopen("/proc/perf/kernel", "r");
+  if (!f) return -1;
+  char line[512];
+  long n = -1;
+  while (fgets(line, sizeof line, f)) {
+    const char *p = strstr(line, "timer tick gaps:");
+    if (!p) continue;
+    if (sscanf(p, "timer tick gaps: max %*f ms, %ld over", &n) != 1) n = -2;
+    break;
+  }
+  fclose(f);
+  return n;
+}
+
+// One line on what the kernel's tick saw during a measurement.
+static void report_tick_gaps(const char *during, long before, long after) {
+  if (before < 0 || after < 0) {
+    info("kernel tick-gap counter not readable (before %ld, after %ld; -1 no /proc/perf/kernel line, -2 unparsed)", before, after);
+    return;
+  }
+  if (after > before)
+    info("=> the kernel logged %ld late tick gap%s (>12 ms on a busy CPU) during %s: that CPU stood still -- host preemption of the vCPU or an interrupts-off stretch",
+         after - before, after - before == 1 ? "" : "s", during);
+  else
+    info("no late tick gaps on a busy CPU during %s: the kernel took its 4 ms ticks on time", during);
+}
+
 // Last `n` lines of a log: the daemon's own last words are the diagnosis,
 // so they belong in the same paste as everything else.
 static void dump_tail(const char *path, int n) {
@@ -352,8 +406,17 @@ static void report_us(const char *what, long *v, int n, long *median_out) {
 // when the tick is right, several ms when it is stretched.
 #define TICK_OVERSHOOT_BOUND_US 2000
 
+static int count_over(const long *v, int n, long bound) {
+  int c = 0;
+  for (int i = 0; i < n; i++)
+    if (v[i] > bound) c++;
+  return c;
+}
+
 static void test_wake(void) {
   section("wake");
+  int stalls = 0;
+  long gaps_before = tick_gaps_late();
   struct timespec prev, cur;
   long maxstep_ns = 0;
   int distinct = 0;
@@ -388,6 +451,7 @@ static void test_wake(void) {
   report_us("poll(0 fds, 1 ms)", v, WAKE_SAMPLES, &median);
   check(median <= WAKE_BOUND_US, "poll(0 fds, 1 ms): a 1 ms deadline fires on time",
         "the armed-deadline path (sys_poll arms min(timeout, tick)); mis-scaled by the TSC/LAPIC ratio when the count is wrong", 0);
+  stalls += count_over(v, WAKE_SAMPLES, WAKE_BOUND_US);
 
   for (int i = 0; i < WAKE_SAMPLES; i++) {
     struct timespec t0, req = {0, 1000000};
@@ -398,6 +462,7 @@ static void test_wake(void) {
   report_us("nanosleep(1 ms)", v, WAKE_SAMPLES, &median);
   check(median <= WAKE_BOUND_US, "nanosleep(1 ms) fires on time",
         "sleep-paced feeders (cubeb-alsa's refill loop, mpg123 -o oss) rest on this", 0);
+  stalls += count_over(v, WAKE_SAMPLES, WAKE_BOUND_US);
 
   // 2. The re-scan tick itself. A timeout longer than the tick makes sys_poll
   //    arm min(remaining, 4 ms) pass after pass: the tick until the timeout
@@ -426,6 +491,18 @@ static void test_wake(void) {
   if (median > TICK_OVERSHOOT_BOUND_US)
     info("=> re-scan passes land up to %.1f ms late: the tick is stretched (LAPIC count not calibrated?); Pulse's sink is woken that late",
          worst / 1000.0);
+  stalls += count_over(over, n, WAKE_BOUND_US);
+
+  // 3. The kernel's own view: gaps between consecutive ticks on one CPU. A
+  //    good median with a few samples tens of ms late means this thread was
+  //    not run for that long; if the kernel saw the same gap in its tick, the
+  //    whole CPU stood still (a KVM vCPU the host descheduled, an
+  //    interrupts-off section) -- if it did not, the delay is in the wake path.
+  dump_matching("/proc/perf/kernel", "timer tick gaps");
+  if (stalls)
+    info("=> %d of %d samples stalled past %d ms with a good median: this thread was not run for that long (host preemption? kernel stall?)",
+         stalls, 2 * WAKE_SAMPLES + n, WAKE_BOUND_US / 1000);
+  report_tick_gaps("these measurements", gaps_before, tick_gaps_late());
 }
 
 // ── OSS: /dev/dsp ──────────────────────────────────────────────────────────
@@ -945,52 +1022,101 @@ static void test_alsa_timer(void) {
     check(wr == 0 && st == 0, "WRITEI a buffer of silence, then START", "snd_pcm_writei + snd_pcm_start as alsa-sink.c does",
           wr != 0 ? we : se);
 
-    // alsa-lib's poll_descriptors: [pcm POLLOUT, timer POLLIN]. Within one
-    // period (+ the 4 ms re-scan tick and a little scheduling slack) the
-    // timer must report POLLIN: that is the bound the check enforces. The
-    // poll itself waits longer so a late wake is measured and printed
-    // rather than reported as a bare timeout.
-    struct pollfd pf[2] = {{pfd, POLLOUT, 0}, {tfd, POLLIN, 0}};
-    struct timespec t0;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    // alsa-lib's poll_descriptors: [pcm POLLOUT, timer POLLIN]. Pulse lives
+    // on the cadence of these wakes -- one per period -- so four of them are
+    // taken: the first from START (it includes the stream's ramp-up), then
+    // the intervals between consecutive wakes, each divided by the ticks the
+    // record carries (a stalled wake coalesces two). Judged on the median
+    // per-tick interval, so one stalled wake (a host preemption, a kernel
+    // stall) is reported, not fatal: Pulse's 100 ms buffer absorbs one.
     long bound = period_ms + 20;
     long limit = period_ms * 2 + 100;
-    int pr = poll(pf, 2, (int)limit);
-    int pe = errno;
-    long ms = elapsed_ms(&t0);
-    // Whichever fd woke first, the TIMER must be readable within a period.
-    int timer_in = pf[1].revents & POLLIN;
-    if (pr > 0 && !timer_in) {
-      // The PCM may report POLLOUT slightly before the period boundary the
-      // timer counts; give the timer the rest of the period.
-      struct pollfd pt = {tfd, POLLIN, 0};
-      pr = poll(&pt, 1, (int)(limit - ms > 0 ? limit - ms : 1));
-      pe = errno;
-      ms = elapsed_ms(&t0);
-      timer_in = pr > 0 && (pt.revents & POLLIN);
+    long gaps_before = tick_gaps_late();
+    long wake_ms[4];
+    unsigned wake_val[4];
+    int wakes = 0, timed_out = 0;
+    ssize_t first_n = -1, first_n2 = -1;
+    int first_e = 0, first_e2 = 0;
+    struct snd_timer_tread first_tr = {0, 0, {0, 0}, 0, 0};
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int w = 0; w < 4; w++) {
+      struct pollfd pf[2] = {{pfd, POLLOUT, 0}, {tfd, POLLIN, 0}};
+      long start = elapsed_ms(&t0);
+      int pr = poll(pf, 2, (int)limit);
+      if (pr > 0 && !(pf[1].revents & POLLIN)) {
+        // The PCM reports POLLOUT a little before the period boundary the
+        // timer counts; wait on the timer alone for the rest of the window.
+        struct pollfd pt = {tfd, POLLIN, 0};
+        long left = limit - (elapsed_ms(&t0) - start);
+        pr = poll(&pt, 1, (int)(left > 0 ? left : 1));
+        if (!(pr > 0 && (pt.revents & POLLIN))) pr = 0;
+      }
+      if (pr <= 0) {
+        timed_out = 1;
+        break;
+      }
+      wake_ms[wakes] = elapsed_ms(&t0);
+      n = read(tfd, tr, sizeof tr);
+      e = errno;
+      if (w == 0) {
+        // The second read follows immediately: printing first would let
+        // another period elapse and turn a drained queue into a fresh tick.
+        struct snd_timer_tread again[4];
+        first_n2 = read(tfd, again, sizeof again);
+        first_e2 = errno;
+        first_n = n;
+        first_e = e;
+        if (n > 0) first_tr = tr[0];
+      }
+      wake_val[wakes] = n >= (ssize_t)sizeof tr[0] ? tr[0].val : 0;
+      wakes++;
     }
-    check(pr > 0 && timer_in && ms <= bound, "poll(POLLIN) on the timer wakes within a period",
-          "snd_pcm_hw_poll_revents: POLLIN here becomes POLLOUT for Pulse's unix_write", pr < 0 ? pe : 0);
-    info("timer POLLIN after %ld ms (period %ld ms + 4 ms re-scan tick; bound %ld ms)%s", ms, period_ms, bound,
-         pr == 0 ? " -- TIMED OUT" : "");
-    if (timer_in && ms > bound)
-      info("=> later than one period: Pulse would see late wake-ups (audible as stutter)");
-
-    n = read(tfd, tr, sizeof tr);
-    e = errno;
-    // The second read follows immediately: printing first would let another
-    // period elapse (serial output is slow) and turn a drained queue into a
-    // fresh tick.
-    struct snd_timer_tread again[4];
-    ssize_t n2 = read(tfd, again, sizeof again);
-    int e2 = errno;
-    check(n >= (ssize_t)sizeof tr[0] && n % (ssize_t)sizeof tr[0] == 0 && tr[0].event == TIMER_EVENT_TICK && tr[0].val >= 1,
-          "read() returns a TICK tread record", "32-byte {event, tstamp, val}; alsa-lib reads and discards up to 4", n < 0 ? e : 0);
-    if (n > 0) info("%zd byte%s: event %d val %u (ticks elapsed) at %lld.%09lld", n, n == 1 ? "" : "s", tr[0].event,
-                    tr[0].val, (long long)tr[0].tstamp.sec, (long long)tr[0].tstamp.nsec);
-    check(n2 < 0 && e2 == EAGAIN, "read() again -> EAGAIN (queue drained)",
-          "snd_pcm_hw_clear_timer_queue reads once; a queue that never empties would spin Pulse", n2 < 0 && e2 != EAGAIN ? e2 : 0);
-    if (n2 > 0) info("second read() returned %zd bytes (val %u): a period elapsed between the two reads", n2, again[0].val);
+    long per_tick[3];
+    int intervals = 0, stalled = 0;
+    for (int i = 1; i < wakes; i++) {
+      long dt = wake_ms[i] - wake_ms[i - 1];
+      long v = wake_val[i] ? (long)wake_val[i] : 1;
+      per_tick[intervals++] = dt / v;
+      if (dt > bound * v) stalled++;
+    }
+    long med = 0;
+    if (intervals) {
+      long sorted[3];
+      memcpy(sorted, per_tick, sizeof(long) * intervals);
+      qsort(sorted, intervals, sizeof sorted[0], cmp_long);
+      med = sorted[intervals / 2];
+    }
+    check(wakes == 4 && med <= bound, "poll(POLLIN) on the timer wakes once per period",
+          "snd_pcm_hw_poll_revents: POLLIN here becomes POLLOUT for Pulse's unix_write, one wake per period", 0);
+    if (wakes)
+      info("first timer POLLIN %ld ms after START (period %ld ms + 4 ms tick; %u tick%s in the record)", wake_ms[0], period_ms,
+           wake_val[0], wake_val[0] == 1 ? "" : "s");
+    for (int i = 1; i < wakes; i++) {
+      long dt = wake_ms[i] - wake_ms[i - 1];
+      long v = wake_val[i] ? (long)wake_val[i] : 1;
+      info("wake %d: +%ld ms, %u tick%s -> %ld ms per period%s", i, dt, wake_val[i], wake_val[i] == 1 ? "" : "s", per_tick[i - 1],
+           dt > bound * v ? "  (STALLED)" : "");
+    }
+    if (timed_out) info("=> a wake never came within %ld ms: the timer stopped ticking", limit);
+    else if (med > bound) info("=> later than one period, wake after wake: Pulse would see late wake-ups (audible as stutter)");
+    else if (stalled)
+      info("=> %d of %d wakes stalled (Pulse's 100 ms buffer absorbs one; see [wake] and the tick gaps in /proc/perf/kernel)", stalled,
+           wakes - 1);
+    check(first_n >= (ssize_t)sizeof tr[0] && first_n % (ssize_t)sizeof tr[0] == 0 && first_tr.event == TIMER_EVENT_TICK &&
+              first_tr.val >= 1,
+          "read() returns a TICK tread record", "32-byte {event, tstamp, val}; alsa-lib reads and discards up to 4",
+          first_n < 0 ? first_e : 0);
+    if (first_n > 0)
+      info("%zd byte%s: event %d val %u (ticks elapsed) at %lld.%09lld", first_n, first_n == 1 ? "" : "s", first_tr.event, first_tr.val,
+           (long long)first_tr.tstamp.sec, (long long)first_tr.tstamp.nsec);
+    check(first_n2 < 0 && first_e2 == EAGAIN, "read() again -> EAGAIN (queue drained)",
+          "snd_pcm_hw_clear_timer_queue reads once; a queue that never empties would spin Pulse", first_n2 < 0 && first_e2 != EAGAIN ? first_e2 : 0);
+    if (first_n2 > 0) info("second read() returned %zd bytes: a period elapsed between the two reads", first_n2);
+    report_tick_gaps("the timer test", gaps_before, tick_gaps_late());
+    // The driver's own timing of its position-register reads: under a
+    // hypervisor each is a VM exit, and one that waited on the host shows.
+    dump_matching("/proc/gpusnd", "[gpusnd] position reads");
 
     struct snd_timer_status ts;
     memset(&ts, 0, sizeof ts);
