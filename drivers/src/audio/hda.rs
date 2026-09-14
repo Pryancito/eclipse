@@ -633,21 +633,22 @@ impl HdaInner {
         let lpib_raw = self.lpib();
         let lpib = lpib_raw as usize % ring;
         let advanced = (lpib + ring - self.last_lpib as usize % ring) % ring;
-        if advanced > max_advance {
+        let lpib_ok = if advanced > max_advance {
             // Impossible progress (a backwards step shows up here too, as
-            // nearly a full lap forward). Garbage: keep everything as it was.
+            // nearly a full lap forward). Anomaly recorded.
             self.stat_bad_pos += 1;
             self.last_bad_pos = lpib_raw;
             self.last_bad_prev = self.last_lpib;
             self.last_bad_dt_us = dt_us;
             self.last_bad_src = b'L';
-            return;
-        }
-        self.last_poll_us = now_us;
-        self.last_lpib = lpib as u32;
-        self.lpib_total += advanced as u64;
+            false
+        } else {
+            self.last_lpib = lpib as u32;
+            self.lpib_total += advanced as u64;
+            true
+        };
         self.poll_stream_errors();
-        let mut reported = self.lpib_total;
+        let mut dpib_ok = false;
         if let Some(dpib_raw) = self.dma_pos() {
             let dpib = dpib_raw as usize % ring;
             let advanced = (dpib + ring - self.last_dpib as usize % ring) % ring;
@@ -666,10 +667,16 @@ impl HdaInner {
                 }
                 self.last_dpib = dpib as u32;
                 self.dpib_total += advanced as u64;
-                if self.dpib_trusted {
-                    reported = reported.min(self.dpib_total);
-                }
+                dpib_ok = true;
             }
+        }
+        if !lpib_ok && !dpib_ok {
+            return;
+        }
+        self.last_poll_us = now_us;
+        let mut reported = if lpib_ok { self.lpib_total } else { self.dpib_total };
+        if dpib_ok && self.dpib_trusted {
+            reported = if lpib_ok { reported.min(self.dpib_total) } else { self.dpib_total };
         }
         self.lead_now = reported.saturating_sub(by_clock);
         self.stat_lead = self.stat_lead.max(self.lead_now);
@@ -755,6 +762,17 @@ impl HdaInner {
         }
         if !stopped {
             self.stat_stop_timeouts += 1;
+            // Force stream reset (SRST = bit 0) to halt DMA bus-mastering engine (§3.3.35)
+            let ctl = mmio_r32(self.bar, self.sd_base + SD_CTL);
+            mmio_w32(self.bar, self.sd_base + SD_CTL, (ctl & !0x2) | 0x1);
+            let t_rst = timer_now_as_micros();
+            while mmio_r32(self.bar, self.sd_base + SD_CTL) & 0x1 == 0 {
+                if timer_now_as_micros().wrapping_sub(t_rst) > 1_000 {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+            mmio_w32(self.bar, self.sd_base + SD_CTL, 0);
         }
         self.running = false;
         stopped

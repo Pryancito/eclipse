@@ -54,6 +54,12 @@ fn parse_wav(mut f: File) -> Result<Wav, String> {
         let len = u32::from_le_bytes(ch[4..8].try_into().unwrap()) as usize;
         match id {
             b"fmt " => {
+                if len < 16 {
+                    return Err("corrupt wav: fmt chunk too short".into());
+                }
+                if len > 64 * 1024 * 1024 {
+                    return Err("corrupt wav: fmt chunk excessively large".into());
+                }
                 let mut fmt = vec![0u8; len];
                 f.read_exact(&mut fmt).map_err(|e| e.to_string())?;
                 fmt_tag = u16::from_le_bytes(fmt[0..2].try_into().unwrap());
@@ -62,6 +68,9 @@ fn parse_wav(mut f: File) -> Result<Wav, String> {
                 bits = u16::from_le_bytes(fmt[14..16].try_into().unwrap());
             }
             b"data" => {
+                if len > 256 * 1024 * 1024 {
+                    return Err("wav data chunk too large (>256MB)".into());
+                }
                 data = vec![0u8; len];
                 f.read_exact(&mut data).map_err(|e| e.to_string())?;
                 break;
@@ -193,6 +202,11 @@ fn main() {
             st.extend_from_slice(s);
         }
         pcm = st;
+    } else if dev_ch == 2 {
+        let rem = pcm.len() % 4;
+        if rem > 0 {
+            pcm.truncate(pcm.len() - rem);
+        }
     }
 
     eprintln!(

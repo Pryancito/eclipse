@@ -32,10 +32,13 @@ const SNDCTL_DSP_POST: u32 = 0x0000_5008; // _IO('P', 8)
 const SNDCTL_DSP_SETFRAGMENT: u32 = 0xc004_500a; // _IOWR('P', 10, int)
 const SNDCTL_DSP_GETFMTS: u32 = 0x8004_500b; // _IOR('P', 11, int)
 const SNDCTL_DSP_GETOSPACE: u32 = 0x8010_500c; // _IOR('P', 12, audio_buf_info)
+const SNDCTL_DSP_GETCAPS: u32 = 0x8004_500f; // _IOR('P', 15, int)
 
 const AFMT_S16_LE: i32 = 0x10;
+const DSP_CAP_REALTIME: i32 = 0x0000_0004;
 
 /// `audio_buf_info` for GETOSPACE.
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct AudioBufInfo {
     fragments: i32,
@@ -51,12 +54,23 @@ const FRAG_SIZE: usize = 4096;
 /// How long [`DspDev::write_at`] waits before re-offering PCM to a full ring.
 const RETRY_BACKOFF: core::time::Duration = core::time::Duration::from_micros(250);
 
-fn ucheck<T>(addr: usize) -> Result<()> {
-    if kernel_hal::user::user_range_ok(addr, core::mem::size_of::<T>()) {
-        Ok(())
-    } else {
-        Err(FsError::BadAddress)
+fn uread<T: Copy>(addr: usize) -> Result<T> {
+    if !kernel_hal::user::user_range_ok(addr, core::mem::size_of::<T>())
+        || addr % core::mem::align_of::<T>() != 0
+    {
+        return Err(FsError::BadAddress);
     }
+    Ok(unsafe { core::ptr::read_unaligned(addr as *const T) })
+}
+
+fn uwrite<T: Copy>(addr: usize, val: T) -> Result<()> {
+    if !kernel_hal::user::user_range_ok(addr, core::mem::size_of::<T>())
+        || addr % core::mem::align_of::<T>() != 0
+    {
+        return Err(FsError::BadAddress);
+    }
+    unsafe { core::ptr::write_unaligned(addr as *mut T, val) };
+    Ok(())
 }
 
 pub struct DspDev {
@@ -90,20 +104,29 @@ impl INode for DspDev {
     }
 
     fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
+        let (_, channels) = self.audio.params();
+        let frame = (channels as usize) * 2;
+        let usable_len = (buf.len() / frame) * frame;
+        if usable_len == 0 {
+            return Ok(0);
+        }
+        let write_buf = &buf[..usable_len];
+
         let mut done = 0usize;
         let deadline_step =
             core::time::Duration::from_secs(self.drain_secs(self.audio.buffer_bytes()));
         let mut deadline = kernel_hal::timer::timer_now() + deadline_step;
-        while done < buf.len() {
-            let n = self
-                .audio
-                .write(&buf[done..])
-                .map_err(|_| FsError::DeviceError)?;
-            if n > 0 {
-                done += n;
-                deadline = kernel_hal::timer::timer_now() + deadline_step;
-                super::snd::arm_playback_watchdog();
-                continue;
+        while done < write_buf.len() {
+            match self.audio.write(&write_buf[done..]) {
+                Ok(n) if n > 0 => {
+                    done += n;
+                    deadline = kernel_hal::timer::timer_now() + deadline_step;
+                    super::snd::arm_playback_watchdog();
+                    continue;
+                }
+                Ok(_) => {} // Ring currently full: spin-retry below
+                Err(_) if done > 0 => return Ok(done),
+                Err(_) => return Err(FsError::DeviceError),
             }
             // Ring full: the device frees space at the PCM byte rate. The
             // synchronous INode contract leaves no waker to park on, so
@@ -121,16 +144,6 @@ impl INode for DspDev {
                 };
             }
             kernel_hal::deferred_job::drain_deferred_jobs();
-            // Back off before asking again. Every attempt takes the driver's
-            // IRQ-off lock, and (before the driver throttled it) read the
-            // stream position register -- an uncached device read on real
-            // hardware, a VM exit under virtualisation. Retrying at CPU speed
-            // meant ~1.2 M driver calls and ~500 k device reads per second of
-            // audio, which competes with the DMA engine it is waiting on.
-            // The ring drains at the PCM byte rate, so a quarter of a
-            // millisecond (48 bytes at 48 kHz stereo) is a lower bound on
-            // "enough new space to be worth another look" -- and 2700x
-            // shorter than the ring itself.
             let resume = kernel_hal::timer::timer_now() + RETRY_BACKOFF;
             while kernel_hal::timer::timer_now() < resume {
                 core::hint::spin_loop();
@@ -154,7 +167,7 @@ impl INode for DspDev {
                 self.audio.reset().map_err(|_| FsError::DeviceError)?;
                 Ok(0)
             }
-            SNDCTL_DSP_SYNC | SNDCTL_DSP_POST => {
+            SNDCTL_DSP_SYNC => {
                 // Drain: wait until everything queued has played out.
                 let deadline = kernel_hal::timer::timer_now()
                     + core::time::Duration::from_secs(self.drain_secs(self.audio.queued_bytes()));
@@ -163,66 +176,76 @@ impl INode for DspDev {
                         break;
                     }
                     kernel_hal::deferred_job::drain_deferred_jobs();
-                    core::hint::spin_loop();
+                    let resume = kernel_hal::timer::timer_now() + RETRY_BACKOFF;
+                    while kernel_hal::timer::timer_now() < resume {
+                        core::hint::spin_loop();
+                    }
                 }
                 let _ = self.audio.reset();
                 Ok(0)
             }
+            SNDCTL_DSP_POST => {
+                // Advisory: kick DMA / watchdog if stopped, without blocking or resetting.
+                super::snd::arm_playback_watchdog();
+                Ok(0)
+            }
             SNDCTL_DSP_SPEED => {
-                ucheck::<i32>(data)?;
-                let val = unsafe { &mut *(data as *mut i32) };
+                let req_rate = uread::<i32>(data)?;
+                let (_, channels) = self.audio.params();
                 let (rate, _) = self
                     .audio
-                    .set_params((*val).max(0) as u32, 2)
+                    .set_params(req_rate.max(0) as u32, channels)
                     .map_err(|_| FsError::DeviceError)?;
-                *val = rate as i32;
+                uwrite::<i32>(data, rate as i32)?;
                 Ok(0)
             }
             SNDCTL_DSP_SETFMT => {
-                ucheck::<i32>(data)?;
-                let val = unsafe { &mut *(data as *mut i32) };
+                let _ = uread::<i32>(data)?;
                 // S16LE is the only format; report it back whatever was asked.
-                *val = AFMT_S16_LE;
+                uwrite::<i32>(data, AFMT_S16_LE)?;
                 Ok(0)
             }
             SNDCTL_DSP_GETFMTS => {
-                ucheck::<i32>(data)?;
-                let val = unsafe { &mut *(data as *mut i32) };
-                *val = AFMT_S16_LE;
+                uwrite::<i32>(data, AFMT_S16_LE)?;
                 Ok(0)
             }
             SNDCTL_DSP_CHANNELS => {
-                ucheck::<i32>(data)?;
-                let val = unsafe { &mut *(data as *mut i32) };
-                let (_, channels) = self.audio.params();
-                *val = channels as i32;
+                let req_ch = uread::<i32>(data)?;
+                let (rate, _) = self.audio.params();
+                let (_, channels) = self
+                    .audio
+                    .set_params(rate, req_ch.clamp(1, 2) as u8)
+                    .map_err(|_| FsError::DeviceError)?;
+                uwrite::<i32>(data, channels as i32)?;
                 Ok(0)
             }
             SNDCTL_DSP_STEREO => {
-                ucheck::<i32>(data)?;
-                let val = unsafe { &mut *(data as *mut i32) };
-                *val = 1; // stereo
+                let _ = uread::<i32>(data)?;
+                uwrite::<i32>(data, 1)?; // stereo
                 Ok(0)
             }
             SNDCTL_DSP_GETBLKSIZE => {
-                ucheck::<i32>(data)?;
-                let val = unsafe { &mut *(data as *mut i32) };
-                *val = FRAG_SIZE as i32;
+                uwrite::<i32>(data, FRAG_SIZE as i32)?;
                 Ok(0)
             }
             SNDCTL_DSP_SETFRAGMENT => {
                 // Accepted but the driver keeps its own ring geometry.
                 Ok(0)
             }
+            SNDCTL_DSP_GETCAPS => {
+                uwrite::<i32>(data, DSP_CAP_REALTIME)?;
+                Ok(0)
+            }
             SNDCTL_DSP_GETOSPACE => {
-                ucheck::<AudioBufInfo>(data)?;
-                let info = unsafe { &mut *(data as *mut AudioBufInfo) };
                 let free = self.audio.free_bytes();
                 let total = self.audio.buffer_bytes();
-                info.fragments = (free / FRAG_SIZE) as i32;
-                info.fragstotal = (total / FRAG_SIZE) as i32;
-                info.fragsize = FRAG_SIZE as i32;
-                info.bytes = free as i32;
+                let info = AudioBufInfo {
+                    fragments: (free / FRAG_SIZE) as i32,
+                    fragstotal: (total / FRAG_SIZE) as i32,
+                    fragsize: FRAG_SIZE as i32,
+                    bytes: free as i32,
+                };
+                uwrite::<AudioBufInfo>(data, info)?;
                 Ok(0)
             }
             _ => {

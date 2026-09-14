@@ -1314,6 +1314,7 @@ impl INode for PcmDev {
                 } else if state == STATE_PAUSED {
                     let _ = self.audio.resume();
                     self.st.lock().state = STATE_RUNNING;
+                    arm_playback_watchdog();
                 }
                 Ok(0)
             }
@@ -1338,6 +1339,8 @@ impl INode for PcmDev {
                 if st.state == STATE_PAUSED {
                     st.state = STATE_RUNNING;
                 }
+                drop(st);
+                arm_playback_watchdog();
                 Ok(0)
             }
             0x48 => Ok(0), // XRUN

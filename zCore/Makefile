@@ -258,7 +258,7 @@ ifeq ($(ARCH), x86_64)
   qemu_opts += \
 		-machine q35 \
 		-cpu Haswell,+smap,-check,+fsgsbase \
-		-m 4G \
+		-m 12G \
 		-serial mon:stdio \
 		-serial file:/tmp/serial.out \
 		-drive format=raw,if=pflash,readonly=on,file=$(ovmf) \
