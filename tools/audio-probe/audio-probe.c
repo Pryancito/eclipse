@@ -822,10 +822,14 @@ static void test_alsa_timer(void) {
           wr != 0 ? we : se);
 
     // alsa-lib's poll_descriptors: [pcm POLLOUT, timer POLLIN]. Within one
-    // period (+ the 4 ms re-scan tick) the timer must report POLLIN.
+    // period (+ the 4 ms re-scan tick and a little scheduling slack) the
+    // timer must report POLLIN: that is the bound the check enforces. The
+    // poll itself waits longer so a late wake is measured and printed
+    // rather than reported as a bare timeout.
     struct pollfd pf[2] = {{pfd, POLLOUT, 0}, {tfd, POLLIN, 0}};
     struct timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
+    long bound = period_ms + 20;
     long limit = period_ms * 2 + 100;
     int pr = poll(pf, 2, (int)limit);
     int pe = errno;
@@ -841,12 +845,12 @@ static void test_alsa_timer(void) {
       ms = elapsed_ms(&t0);
       timer_in = pr > 0 && (pt.revents & POLLIN);
     }
-    check(pr > 0 && timer_in, "poll(POLLIN) on the timer wakes within a period",
+    check(pr > 0 && timer_in && ms <= bound, "poll(POLLIN) on the timer wakes within a period",
           "snd_pcm_hw_poll_revents: POLLIN here becomes POLLOUT for Pulse's unix_write", pr < 0 ? pe : 0);
-    info("timer POLLIN after %ld ms (period %ld ms; bus-less fd re-scan tick 4 ms)%s", ms, period_ms,
+    info("timer POLLIN after %ld ms (period %ld ms + 4 ms re-scan tick; bound %ld ms)%s", ms, period_ms, bound,
          pr == 0 ? " -- TIMED OUT" : "");
-    if (timer_in && period_ms && ms > period_ms + 12)
-      info("NOTE: later than one period + tick: Pulse would see late wake-ups (audible as stutter)");
+    if (timer_in && ms > bound)
+      info("=> later than one period: Pulse would see late wake-ups (audible as stutter)");
 
     n = read(tfd, tr, sizeof tr);
     e = errno;

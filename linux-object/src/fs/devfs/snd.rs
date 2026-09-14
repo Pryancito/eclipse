@@ -472,7 +472,9 @@ impl PcmDev {
     /// runs, how many whole periods the hardware pointer has passed, and the
     /// period length in ns (the timer's resolution).
     pub(crate) fn period_clock(&self) -> PeriodClock {
-        let _ = self.audio.queued_bytes();
+        // Lock order everywhere in this file is `st` then the audio driver
+        // (`hw_ptr` -> `queued_frames` refreshes the hardware position);
+        // nothing takes them the other way round.
         let st = self.st.lock();
         let period = st.period_size.max(1);
         PeriodClock {
