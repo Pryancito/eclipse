@@ -794,6 +794,7 @@ pub fn run_until_idle() -> bool {
     // Make this CPU eligible for task placement and work stealing.
     mark_executor_ready(cpu);
     loop {
+        crate::executor::note_cpu_quiescent(cpu);
         let mut runtime = get_current_runtime();
         let runtime_cx = runtime.get_context();
         let executor_cx = runtime.strong_executor.context.get_context();
@@ -832,6 +833,7 @@ pub fn run_until_idle() -> bool {
         if let Some(ex) = runtime.current_executor.take() {
             ex.release_resume();
         }
+        crate::executor::note_cpu_quiescent(cpu);
         report_switch_bounce_if_any();
         if cfg!(feature = "baremetal-test") && runtime.task_num() == 0 {
             return false;
@@ -880,6 +882,7 @@ pub fn run_until_idle() -> bool {
                 if let Some(ex) = runtime.current_executor.take() {
                     ex.release_resume();
                 }
+                crate::executor::note_cpu_quiescent(cpu);
                 report_switch_bounce_if_any();
             }
         }

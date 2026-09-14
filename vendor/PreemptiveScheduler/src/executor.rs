@@ -141,7 +141,7 @@ const GUARD_WORDS: usize = GUARD_SIZE / core::mem::size_of::<u64>();
 // the double-alloc is caught at the moment it is dispensed, with the
 // allocating call chain (the writer's own path) on the stack. Lock-free by
 // construction (atomics only): it is consulted from inside the allocator lock.
-const STACK_REG_SLOTS: usize = 256;
+const STACK_REG_SLOTS: usize = 512;
 static STACK_REG_BASE: [core::sync::atomic::AtomicUsize; STACK_REG_SLOTS] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; STACK_REG_SLOTS];
 
@@ -281,6 +281,41 @@ static QUAR_RING_SLOTS: [core::sync::atomic::AtomicUsize; QUAR_RING] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; QUAR_RING];
 static QUAR_RING_IDX: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// Freed stacks awaiting an SMP grace period before they may be reused or
+/// returned to the heap.
+///
+/// A stack stops being "owned" by its executor before every CPU has
+/// necessarily passed through a scheduler point that proves it is no longer
+/// still executing, or about to resume, on that saved frame. Returning the
+/// block to the pool/heap in that window is the exact `[double-alloc]` /
+/// `[null-exec]` corruption: the next zero-init consumer blanks a frame that
+/// was merely late, not dead. Keep the block off the allocator until every
+/// online CPU has reached the runtime stack once after retirement; only then is
+/// it quiescent enough to recycle.
+const RETIRED_STACKS_CAP: usize = 256;
+
+#[derive(Copy, Clone)]
+struct RetiredStack {
+    alloc_base: usize,
+    hard_guard_bottom: bool,
+    hard_guard_top: bool,
+    protected: bool,
+    pending_cpus: u64,
+}
+
+impl RetiredStack {
+    const EMPTY: Self = Self {
+        alloc_base: 0,
+        hard_guard_bottom: false,
+        hard_guard_top: false,
+        protected: false,
+        pending_cpus: 0,
+    };
+}
+
+static RETIRED_STACKS: spin::Mutex<[RetiredStack; RETIRED_STACKS_CAP]> =
+    spin::Mutex::new([RetiredStack::EMPTY; RETIRED_STACKS_CAP]);
+
 /// Register the quarantine protect/unprotect hooks (kernel-hal, bare-metal).
 ///
 /// # Safety
@@ -297,11 +332,120 @@ pub fn set_stack_quarantine_enabled(on: bool) {
 }
 
 /// Push a just-freed `alloc_base` into the ring; returns the `alloc_base` it
-/// evicted (`0` if the slot was empty), which the caller must unprotect + free.
+/// evicted (`0` if the slot was empty).
+///
+/// Eviction no longer implies "safe to unprotect + free": a stack that has aged
+/// out of the diagnostic ring may still be the one a stale parked frame resumes
+/// on under SMP. Bare-metal therefore treats the evicted block as permanently
+/// retired instead of returning it to the shared buddy arena.
 fn quar_ring_push(alloc_base: usize) -> usize {
     use core::sync::atomic::Ordering;
     let idx = QUAR_RING_IDX.fetch_add(1, Ordering::Relaxed) % QUAR_RING;
     QUAR_RING_SLOTS[idx].swap(alloc_base, Ordering::AcqRel)
+}
+
+fn reclaim_retired_stack(slot: &mut RetiredStack) {
+    let retired = *slot;
+    if retired.alloc_base == 0 {
+        return;
+    }
+    let top_guard_base = retired.alloc_base + GUARD_SIZE + STACK_SIZE;
+    if retired.protected {
+        if let Some(unprotect) = *STACK_QUAR_UNPROTECT.lock() {
+            unprotect(retired.alloc_base + GUARD_SIZE, STACK_SIZE);
+        }
+    }
+    if retired.hard_guard_bottom && retired.hard_guard_top && stack_pool_push(retired.alloc_base) {
+        *slot = RetiredStack::EMPTY;
+        return;
+    }
+    if let Some(remove) = *STACK_GUARD_REMOVE.lock() {
+        if retired.hard_guard_bottom {
+            remove(retired.alloc_base, GUARD_SIZE);
+        }
+        if retired.hard_guard_top {
+            remove(top_guard_base, TOP_GUARD_SIZE);
+        }
+    }
+    unsafe {
+        let stack = NonNull::<u8>::new_unchecked(retired.alloc_base as *mut u8);
+        Global.deallocate(stack, ALLOC_LAYOUT);
+    }
+    *slot = RetiredStack::EMPTY;
+}
+
+fn observe_cpu_quiescent_locked(retired: &mut [RetiredStack; RETIRED_STACKS_CAP], cpu: usize) {
+    if cpu >= 64 {
+        return;
+    }
+    let bit = 1u64 << cpu;
+    for slot in retired.iter_mut() {
+        if slot.alloc_base == 0 || slot.pending_cpus & bit == 0 {
+            continue;
+        }
+        slot.pending_cpus &= !bit;
+        if slot.pending_cpus == 0 {
+            reclaim_retired_stack(slot);
+        }
+    }
+}
+
+pub(crate) fn note_cpu_quiescent(cpu: usize) {
+    let mut retired = RETIRED_STACKS.lock();
+    observe_cpu_quiescent_locked(&mut retired, cpu);
+}
+
+fn retire_stack_after_grace(
+    alloc_base: usize,
+    hard_guard_bottom: bool,
+    hard_guard_top: bool,
+    protected: bool,
+) {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static RETIRED_OVERFLOW: AtomicUsize = AtomicUsize::new(0);
+
+    let cpu = crate::arch::cpu_id() as usize;
+    let mut pending = crate::runtime::executor_ready_mask();
+    if cpu < 64 {
+        pending &= !(1u64 << cpu);
+    }
+
+    let mut retired = RETIRED_STACKS.lock();
+    observe_cpu_quiescent_locked(&mut retired, cpu);
+
+    if pending == 0 {
+        let mut slot = RetiredStack {
+            alloc_base,
+            hard_guard_bottom,
+            hard_guard_top,
+            protected,
+            pending_cpus: 0,
+        };
+        reclaim_retired_stack(&mut slot);
+        return;
+    }
+
+    for slot in retired.iter_mut() {
+        if slot.alloc_base == 0 {
+            *slot = RetiredStack {
+                alloc_base,
+                hard_guard_bottom,
+                hard_guard_top,
+                protected,
+                pending_cpus: pending,
+            };
+            return;
+        }
+    }
+
+    let n = RETIRED_OVERFLOW.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 16 {
+        error!(
+            "[stack-retire] retired-stack table full while parking {:#x} (report {}/16) — \
+             leaking the block instead of returning it to the allocator before quiescence",
+            alloc_base, n
+        );
+    }
 }
 
 fn executor_alloc_id() -> usize {
@@ -351,7 +495,7 @@ fn note_soft_guard_fallback(reason: &'static str) {
 /// much for an allocator hot path — and heavy enough to shift the timing that
 /// reproduces the bug. This registry is plain atomics: registering is one
 /// store, and a check is a handful of relaxed loads.
-const MAX_TRACKED_STACKS: usize = 128;
+const MAX_TRACKED_STACKS: usize = 512;
 static STACK_REG: [core::sync::atomic::AtomicUsize; MAX_TRACKED_STACKS] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; MAX_TRACKED_STACKS];
 /// Live stacks that did not fit `STACK_REG` (the check is then incomplete;
@@ -1256,7 +1400,6 @@ impl Executor {
 impl Drop for Executor {
     fn drop(&mut self) {
         let alloc_base = self.stack_base - GUARD_SIZE;
-        let top_guard_base = self.stack_base + STACK_SIZE;
 
         // [null-exec root guard] Never free or reuse a stack a CPU is still
         // standing on. `resume_owner` is 0 only once control is OFF this
@@ -1274,7 +1417,9 @@ impl Drop for Executor {
         // cost next to heap corruption and an unrecoverable crash loop. The log
         // names the still-standing CPU so the remaining lifetime race can be
         // traced to where an executor is dropped while claimed.
-        let owner = self.resume_owner.load(core::sync::atomic::Ordering::Acquire);
+        let owner = self
+            .resume_owner
+            .load(core::sync::atomic::Ordering::Acquire);
         if owner != 0 {
             use core::sync::atomic::{AtomicUsize, Ordering};
             static LEAKED: AtomicUsize = AtomicUsize::new(0);
@@ -1306,100 +1451,47 @@ impl Drop for Executor {
         // through it (a watched write would misreport the poison loop as the
         // corruptor).
         spine_unregister_by_stack(self.stack_base);
-        // [null-exec isolation] Prefer the write-protected quarantine over the
-        // recycle pool whenever the quarantine hooks are armed (always, on
-        // bare-metal).
-        //
-        // Pool recycle keeps the freed block out of the general heap, which
-        // closes the *heap* reuse window — but it hands the SAME stack straight
-        // to the NEXT executor, which zero-initializes its own stack arrays
-        // (`candidates`, syscall buffers, ...). If any frame of the OLD executor
-        // is still transiently resumable (an SMP park/resume lifetime race), that
-        // zero-init blanks its return slot and the resume `ret`s to 0 — the
-        // recurring `[null-exec]`, seen from whatever function the new executor
-        // happens to run (steal, a syscall path, ...). Freezing the freed stack
-        // write-protected instead means it is NEVER reused while a stale context
-        // might still stand on it, and a genuine dangling write faults as
-        // `[stack-uaf]` with the writer's rip. The block still stays out of the
-        // heap (stronger than the pool, not weaker), bounded by the `QUAR_RING`.
-        // The pool remains the fallback only where quarantine is unavailable.
-        let quar_armed = STACK_QUAR_PROTECT.lock().is_some();
-        if !quar_armed
-            && self.hard_guard_bottom
-            && self.hard_guard_top
-            && stack_pool_push(alloc_base)
-        {
-            return;
-        }
-        if let Some(remove) = *STACK_GUARD_REMOVE.lock() {
-            if self.hard_guard_bottom {
-                remove(alloc_base, GUARD_SIZE);
+        // [null-exec root fix] A dropped executor may still have an SMP-late
+        // parked frame. Neither the pool nor the general heap may see this
+        // block until every online CPU has run on its OWN runtime stack since
+        // retirement. Quarantine remains the diagnostic fast-path: if the
+        // protect hook is available, freeze the usable region now so any stale
+        // writer faults as `[stack-uaf]` during that grace period.
+        let on_this_stack = {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let rsp: usize;
+                // SAFETY: reads RSP only.
+                unsafe {
+                    core::arch::asm!(
+                        "mov {}, rsp",
+                        out(reg) rsp,
+                        options(nomem, nostack, preserves_flags)
+                    );
+                }
+                rsp >= alloc_base && rsp < alloc_base + ALLOC_SIZE
             }
-            if self.hard_guard_top {
-                remove(top_guard_base, TOP_GUARD_SIZE);
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                false
             }
-        }
-
-        // Freed-stack quarantine: hold this stack write-protected instead of
-        // freeing it to the heap, so a dangling pointer that writes into it
-        // faults at the writer (`[stack-uaf]`).  When the protect hook is
-        // registered we ALWAYS quarantine pool-overflow stacks (not just when
-        // STACKQUARANTINE=1) because returning them to the heap is what
-        // reintroduces the SMP [null-exec] window: a zero-init allocation can
-        // reuse the memory and corrupt a running executor's live frames.
-        let quarantine_always = STACK_QUAR_PROTECT.lock().is_some();
-        if quarantine_always || QUARANTINE_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
-            // Never protect the stack we are standing on — a self-drop would
-            // fault on our own next push. A normal executor Drop runs from
-            // another stack, so this only guards against a pathological caller.
-            let on_this_stack = {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    let rsp: usize;
-                    // SAFETY: reads RSP only.
-                    unsafe {
-                        core::arch::asm!(
-                            "mov {}, rsp",
-                            out(reg) rsp,
-                            options(nomem, nostack, preserves_flags)
-                        );
-                    }
-                    rsp >= alloc_base && rsp < alloc_base + ALLOC_SIZE
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                {
-                    false
-                }
-            };
-            let protect = *STACK_QUAR_PROTECT.lock();
-            if !on_this_stack {
-                if let Some(protect) = protect {
-                    // Protect the usable region only (where the smash lands); the
-                    // guard bands were just restored to normal above.
-                    if protect(self.stack_base, STACK_SIZE) {
-                        let evicted = quar_ring_push(alloc_base);
-                        if evicted != 0 {
-                            if let Some(unprotect) = *STACK_QUAR_UNPROTECT.lock() {
-                                unprotect(evicted + GUARD_SIZE, STACK_SIZE);
-                            }
-                            // SAFETY: the evicted allocation is no longer
-                            // protected and no longer referenced by the ring.
-                            unsafe {
-                                let s = NonNull::<u8>::new_unchecked(evicted as *mut u8);
-                                Global.deallocate(s, ALLOC_LAYOUT);
-                            }
-                        }
-                        // This stack stays quarantined; do not free it now.
-                        return;
-                    }
-                }
+        };
+        let protect = *STACK_QUAR_PROTECT.lock();
+        let quarantine_always = protect.is_some();
+        let want_quarantine =
+            quarantine_always || QUARANTINE_ENABLED.load(core::sync::atomic::Ordering::Relaxed);
+        let mut protected = false;
+        if want_quarantine && !on_this_stack {
+            if let Some(protect) = protect {
+                protected = protect(self.stack_base, STACK_SIZE);
             }
         }
-
-        unsafe {
-            let stack = NonNull::<u8>::new_unchecked(alloc_base as *mut u8);
-            Global.deallocate(stack, ALLOC_LAYOUT);
-        }
+        retire_stack_after_grace(
+            alloc_base,
+            self.hard_guard_bottom,
+            self.hard_guard_top,
+            protected,
+        );
     }
 }
 
