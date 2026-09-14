@@ -1257,6 +1257,45 @@ impl Drop for Executor {
     fn drop(&mut self) {
         let alloc_base = self.stack_base - GUARD_SIZE;
         let top_guard_base = self.stack_base + STACK_SIZE;
+
+        // [null-exec root guard] Never free or reuse a stack a CPU is still
+        // standing on. `resume_owner` is 0 only once control is OFF this
+        // executor's stack (its frame parked and `release_resume` called). If
+        // it is non-zero at Drop, some CPU claimed this executor and is
+        // executing on (or switching into) its stack RIGHT NOW — returning that
+        // block to the buddy heap is precisely the `[double-alloc]` that let a
+        // later `Vec`/`Box` land on a live coroutine stack and zero its saved
+        // return slots (the labwc/Wayland `wl_list` NULL-deref crash class).
+        //
+        // The quarantine and recycle pool both assume quiescence here and so
+        // cannot save this case; the only safe action is to LEAK the block —
+        // never write-protect it (that would fault the CPU still on it), never
+        // free it, never recycle it. One stack (~2.6 MiB) leaked is a bounded
+        // cost next to heap corruption and an unrecoverable crash loop. The log
+        // names the still-standing CPU so the remaining lifetime race can be
+        // traced to where an executor is dropped while claimed.
+        let owner = self.resume_owner.load(core::sync::atomic::Ordering::Acquire);
+        if owner != 0 {
+            use core::sync::atomic::{AtomicUsize, Ordering};
+            static LEAKED: AtomicUsize = AtomicUsize::new(0);
+            let n = LEAKED.fetch_add(1, Ordering::Relaxed) + 1;
+            // Drop the tracking entries (bounded registries) but NOT the memory.
+            stack_reg_remove(alloc_base);
+            unregister_stack(alloc_base);
+            spine_unregister_by_stack(self.stack_base);
+            error!(
+                "[null-exec root guard] executor id={} dropped while cpu={} still stands on its \
+                 stack {:#x}..{:#x} — leaking the block instead of freeing it (leaked {} so far); \
+                 this is the free-while-live race, contained",
+                self.id,
+                owner.wrapping_sub(1),
+                self.stack_base,
+                self.stack_base + STACK_SIZE,
+                n,
+            );
+            return;
+        }
+
         // Stop tracking this stack BEFORE it goes back to the heap/pool, so a
         // later legitimate reuse of the freed range is not flagged as a
         // double-alloc.
