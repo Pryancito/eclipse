@@ -289,9 +289,22 @@ impl Syscall<'_> {
                 let (vmo, off) = file_like
                     .get_vmo_shared(offset as usize, len)
                     .inspect_err(|e| {
+                        // Name the failing fd: a MAP_SHARED that returns ENOSYS
+                        // means the compositor got MAP_FAILED and likely crashed
+                        // next. `File` carries a path (the device/file node);
+                        // anything else has none, which itself pins the kind.
+                        let path = file_like
+                            .downcast_ref::<linux_object::fs::File>()
+                            .map(|f| f.path().clone())
+                            .unwrap_or_else(|| alloc::string::String::from("<non-File FileLike>"));
                         error!(
-                            "mmap(file,shared) get_vmo_shared FAILED: {:?} fd={:?} offset={:#x} len={:#x}",
-                            e, fd, offset, len
+                            "mmap(file,shared) get_vmo_shared FAILED: {:?} proc={} fd={:?} path={} offset={:#x} len={:#x}",
+                            e,
+                            self.zircon_process().name(),
+                            fd,
+                            path,
+                            offset,
+                            len
                         );
                     })?;
                 // Same rule as anonymous MAP_SHARED: fork must share, not copy.
