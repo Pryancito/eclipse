@@ -52,7 +52,8 @@ fn purge_dead_registry(map: &mut HashMap<String, Weak<UnixSocketState>>) {
 ///
 /// Supports the full AF_UNIX workflow (as used by many DHCP clients and daemons):
 /// - Server: socket → bind → listen → accept
-/// - Client: socket → connect  (→ ECONNREFUSED if no listener)
+/// - Client: socket → connect  (→ ENOENT if nothing is bound at the path,
+///   ECONNREFUSED if a socket is bound there but not listening — Linux)
 pub struct UnixSocketState {
     base: KObjectBase,
     inner: Arc<Mutex<UnixInner>>,
@@ -193,6 +194,43 @@ impl UnixSocketState {
         }
         map.insert(path, Arc::downgrade(&socket));
         Ok(())
+    }
+
+    /// The listener a `connect()` to `path` must reach, with Linux's errno
+    /// split. Every AF_UNIX `connect()` -- the `sys_connect` fast path and
+    /// the trait method alike -- decides through here, so this is the one
+    /// place the rule lives.
+    ///
+    /// * A **pathname** socket nobody bound is `ENOENT`: on Linux that means
+    ///   "no socket file at this path", and on this kernel `bind()` creates
+    ///   no inode, so a registry miss is exactly that case (a leftover file
+    ///   from a dead process cannot exist here).
+    /// * An **abstract** name (leading NUL) nobody bound is `ECONNREFUSED`:
+    ///   abstract names have no file, and Linux reports "no listener" for
+    ///   them -- which is what libxcb expects when it tries `\0/tmp/.X11-
+    ///   unix/X0` before falling back to the pathname socket.
+    /// * A socket bound there but not listening is `ECONNREFUSED`.
+    ///
+    /// A pathname miss used to be `ECONNREFUSED` too. PulseAudio's
+    /// `pa_unix_socket_is_stale()` treats ECONNREFUSED from connect() as
+    /// "a dead socket file is in the way" and `unlink()`s it -- which then
+    /// failed with ENOENT because there never was a file -- so
+    /// `module-native-protocol-unix` refused to load and the daemon ran
+    /// with no socket at all: every libpulse client, Firefox's cubeb
+    /// included, got ENOENT on /run/pulse/native. With ENOENT here
+    /// `pa_unix_socket_remove_stale()` returns 0 and the module binds.
+    pub fn resolve_listener(path: &String) -> LxResult<Arc<Self>> {
+        let Some(server) = Self::lookup(path) else {
+            return Err(if path.starts_with('\0') {
+                LxError::ECONNREFUSED
+            } else {
+                LxError::ENOENT
+            });
+        };
+        if !server.inner.lock().is_listening {
+            return Err(LxError::ECONNREFUSED);
+        }
+        Ok(server)
     }
 
     /// Look up a registered socket by path.
@@ -539,16 +577,10 @@ impl Socket for UnixSocketState {
     // -----------------------------------------------------------------------
     async fn connect(&self, endpoint: Endpoint) -> SysResult {
         if let Endpoint::Unix(path) = endpoint {
-            // Resolve server
-            let server = match Self::lookup(&path) {
-                Some(s) => s,
-                None => return Err(LxError::ECONNREFUSED),
-            };
-
-            // Check it's listening
-            if !server.inner.lock().is_listening {
-                return Err(LxError::ECONNREFUSED);
-            }
+            // Resolve the listener (ENOENT / ECONNREFUSED as Linux does). The
+            // wiring below looks the server up again by path, so only the
+            // errno decision is needed here.
+            Self::resolve_listener(&path)?;
 
             // We need Arc<Self> to wire both ends.
             // Since connect() only has &self, we look ourselves up via the
@@ -887,6 +919,34 @@ mod tests {
         // The bytes are waiting on the server side; the connection is queued.
         assert_eq!(server_side.inner.lock().buffer.len(), 9);
         assert_eq!(server.inner.lock().accept_queue.len(), 1);
+    }
+
+    /// connect() errno split, as Linux: a PATHNAME nobody bound is ENOENT
+    /// (no socket file exists); an ABSTRACT name nobody bound is
+    /// ECONNREFUSED (no file to speak of, "no listener"); a bound-but-not-
+    /// listening socket is ECONNREFUSED; a listener resolves. The pathname
+    /// ENOENT is what PulseAudio's stale-socket check needs -- ECONNREFUSED
+    /// made it unlink a phantom file and refuse to create /run/pulse/native.
+    #[test]
+    fn connect_resolution_is_enoent_then_econnrefused_then_ok() {
+        let path = String::from("/run/pulse/native-test-resolve");
+        assert!(matches!(
+            UnixSocketState::resolve_listener(&path),
+            Err(LxError::ENOENT)
+        ));
+        let abstract_name = String::from("\0/tmp/.X11-unix/Xtest-resolve");
+        assert!(matches!(
+            UnixSocketState::resolve_listener(&abstract_name),
+            Err(LxError::ECONNREFUSED)
+        ));
+        let s = UnixSocketState::new();
+        UnixSocketState::register(path.clone(), s.clone()).unwrap();
+        assert!(matches!(
+            UnixSocketState::resolve_listener(&path),
+            Err(LxError::ECONNREFUSED)
+        ));
+        s.inner.lock().is_listening = true;
+        assert!(UnixSocketState::resolve_listener(&path).is_ok());
     }
 
     /// A socket with no peer must report `ENOTCONN` on write.

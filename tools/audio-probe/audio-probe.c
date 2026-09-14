@@ -25,6 +25,8 @@
 //             alsa-lib's simple mixer, amixer and Pulse's card probe look up.
 //   daemon    the pulseaudio binary, the `pulse` account, a live process,
 //             and the daemon's own log -- WHY the socket is missing.
+//   unix-sock the AF_UNIX connect() errno split PulseAudio's stale-socket
+//             check depends on: ENOENT for a path nobody bound.
 //   pulse     the server socket cubeb-pulse / libpulse connect to first.
 //   verdict   which cubeb backend would initialise from what was measured --
 //             the same choice Firefox's OpenCubeb() makes.
@@ -786,6 +788,69 @@ static void test_daemon(void) {
   dump_tail("/tmp/boot-sound.log", 12);
 }
 
+// ── AF_UNIX connect() semantics ────────────────────────────────────────────
+//
+// Before binding its socket, module-native-protocol-unix calls
+// pa_unix_socket_remove_stale(): connect() to the path, and if that fails
+// with ECONNREFUSED it concludes a dead socket FILE is in the way and
+// unlink()s it. Linux answers ENOENT for a path that does not exist, so
+// nothing is unlinked and the module binds. A kernel that answers
+// ECONNREFUSED for "nobody bound here" sends Pulse to unlink a phantom file,
+// that fails with ENOENT, the module refuses to load, and there is no socket
+// for any client. That was this kernel (unix.rs connect(): lookup miss ->
+// ECONNREFUSED). Checked here on a path that certainly has no socket.
+
+static int unix_connect_errno(const char *path) {
+  int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (s < 0) return errno;
+  struct sockaddr_un sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sun_family = AF_UNIX;
+  strncpy(sa.sun_path, path, sizeof sa.sun_path - 1);
+  int r = connect(s, (struct sockaddr *)&sa, sizeof sa);
+  int e = r == 0 ? 0 : errno;
+  close(s);
+  return e;
+}
+
+static void test_unix_socket(void) {
+  section("unix-sock");
+  char nobody[96], lpath[96];
+  snprintf(nobody, sizeof nobody, "/tmp/audio-probe-nobody-%ld", (long)getpid());
+  snprintf(lpath, sizeof lpath, "/tmp/audio-probe-listen-%ld", (long)getpid());
+  unlink(nobody);
+  unlink(lpath);
+
+  int e = unix_connect_errno(nobody);
+  check(e == ENOENT, "connect() to a path nobody bound fails with ENOENT",
+        "pa_unix_socket_remove_stale(): ECONNREFUSED here makes Pulse unlink a phantom socket and refuse to bind", e);
+  if (e == ECONNREFUSED) info("=> got ECONNREFUSED: exactly the kernel bug that left PulseAudio with no socket (unix.rs connect)");
+  else if (e != ENOENT) info("connect() errno was %d (%s)", e, strerror(e));
+
+  // A real listener must be reachable: bind + listen, then connect.
+  int ls = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (ls < 0) {
+    fail("socket(AF_UNIX)", "listener", errno);
+    return;
+  }
+  struct sockaddr_un sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sun_family = AF_UNIX;
+  strncpy(sa.sun_path, lpath, sizeof sa.sun_path - 1);
+  CHECK_CALL(bind(ls, (struct sockaddr *)&sa, sizeof sa) == 0, "bind() a listener", "pa_socket_server_new_unix()");
+  CHECK_CALL(listen(ls, 4) == 0, "listen()", "pa_socket_server_new_unix()");
+  e = unix_connect_errno(lpath);
+  check(e == 0, "connect() to the live listener succeeds", "pa_context_connect() once the socket exists", e);
+  close(ls);
+  // After the listener is gone: Linux keeps the socket FILE (ECONNREFUSED);
+  // a kernel with no socket inodes answers ENOENT. Either lets Pulse's
+  // remove_stale() proceed, so this is reported, not judged.
+  e = unix_connect_errno(lpath);
+  info("connect() after the listener closed: %s", e ? strerror(e) : "connected?!");
+  unlink(lpath);
+  unlink(nobody);
+}
+
 static int g_pulse_ok;
 
 static int is_socket(const char *path) {
@@ -896,6 +961,7 @@ int main(int argc, char **argv) {
   test_alsa_pcm();
   test_alsa_ctl();
   test_daemon();
+  test_unix_socket();
   test_pulse();
 
   section("verdict");
