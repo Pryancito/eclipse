@@ -14,6 +14,10 @@
 //   devices   the nodes the kernel created, and /proc/gpusnd (the codec state
 //             read back OUT of the hardware: the only thing that separates
 //             "silent but Ok" from a real fault).
+//   wake      the kernel's timer tick, measured with no audio involved: 1 ms
+//             deadlines (poll, nanosleep) and poll(0 fds, 9..21 ms), whose
+//             overshoot is the 4 ms re-scan tick every bus-less fd wait
+//             (pcm, timer) is served at -- it bounds every wake-up below.
 //   oss       /dev/dsp: the smallest kernel PCM ABI, a plain write(2). If this
 //             is silent, nothing above it can be heard.
 //   alsa-pcm  /dev/snd/pcmC0D0p driven with the raw SNDRV_PCM_IOCTL_* sequence
@@ -307,6 +311,121 @@ static void test_devices(void) {
   // converter stream id/format, the descriptor's RUN bit and position.
   info("/proc/gpusnd:");
   dump_file("/proc/gpusnd", "/proc/gpusnd");
+}
+
+// ── kernel wake-up granularity ─────────────────────────────────────────────
+//
+// Every wait on an fd without a readiness bus -- the ALSA PCM and timer nodes
+// among them -- is re-scanned by this kernel on its timer tick (250 Hz, 4 ms),
+// so the tick IS the audio wake-up latency: PulseAudio writes its buffer,
+// sleeps in poll(), and runs again only when the tick fires. Measured here
+// with no audio involved at all: poll() with no fds and a 1 ms timeout, and
+// nanosleep(1 ms), both return at the first tick after their deadline. A tick
+// far above 4 ms is a kernel timer bug (the LAPIC count is derived from the
+// TSC rate; QEMU and KVM clock the LAPIC timer at 1 GHz instead), and every
+// audio number below inherits it. Also checks that the clock the probe
+// measures with is fine-grained, so the numbers can be believed.
+
+static long elapsed_us(const struct timespec *t0) {
+  struct timespec t1;
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  return (t1.tv_sec - t0->tv_sec) * 1000000L + (t1.tv_nsec - t0->tv_nsec) / 1000;
+}
+
+static int cmp_long(const void *a, const void *b) {
+  long x = *(const long *)a, y = *(const long *)b;
+  return x < y ? -1 : x > y;
+}
+
+// min / median / max of `n` microsecond samples, printed as ms.
+static void report_us(const char *what, long *v, int n, long *median_out) {
+  qsort(v, n, sizeof v[0], cmp_long);
+  *median_out = v[n / 2];
+  info("%s: min %.1f ms, median %.1f ms, max %.1f ms (%d samples)", what, v[0] / 1000.0, v[n / 2] / 1000.0,
+       v[n - 1] / 1000.0, n);
+}
+
+#define WAKE_SAMPLES 20
+// One 4 ms tick plus a little scheduling slack.
+#define WAKE_BOUND_US 6000
+// Median overshoot of a multi-tick poll past its timeout: sub-millisecond
+// when the tick is right, several ms when it is stretched.
+#define TICK_OVERSHOOT_BOUND_US 2000
+
+static void test_wake(void) {
+  section("wake");
+  struct timespec prev, cur;
+  long maxstep_ns = 0;
+  int distinct = 0;
+  clock_gettime(CLOCK_MONOTONIC, &prev);
+  for (int i = 0; i < 4000; i++) {
+    clock_gettime(CLOCK_MONOTONIC, &cur);
+    long d = (cur.tv_sec - prev.tv_sec) * 1000000000L + (cur.tv_nsec - prev.tv_nsec);
+    if (d > 0) {
+      distinct++;
+      if (d > maxstep_ns) maxstep_ns = d;
+    }
+    prev = cur;
+  }
+  // Fine-grained means most consecutive reads differ; the largest gap is
+  // reported, not judged: one gap of several ms in a loop of back-to-back
+  // reads is the scheduler holding this thread (a tick's housekeeping), and
+  // that is worth seeing, but it is not a coarse clock.
+  check(distinct > 100, "clock_gettime(CLOCK_MONOTONIC) advances finely",
+        "a coarse clock would report every latency here as 0 or as one step", 0);
+  info("%d advances in 4000 reads, largest gap between two reads %.1f us", distinct, maxstep_ns / 1000.0);
+
+  // 1. A deadline shorter than the tick is armed on the LAPIC directly, so
+  //    this measures the arm path, not the tick: a mis-scaled LAPIC count
+  //    stretches it by the TSC/LAPIC ratio only.
+  long v[WAKE_SAMPLES], median;
+  for (int i = 0; i < WAKE_SAMPLES; i++) {
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    poll(NULL, 0, 1);
+    v[i] = elapsed_us(&t0);
+  }
+  report_us("poll(0 fds, 1 ms)", v, WAKE_SAMPLES, &median);
+  check(median <= WAKE_BOUND_US, "poll(0 fds, 1 ms): a 1 ms deadline fires on time",
+        "the armed-deadline path (sys_poll arms min(timeout, tick)); mis-scaled by the TSC/LAPIC ratio when the count is wrong", 0);
+
+  for (int i = 0; i < WAKE_SAMPLES; i++) {
+    struct timespec t0, req = {0, 1000000};
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    nanosleep(&req, NULL);
+    v[i] = elapsed_us(&t0);
+  }
+  report_us("nanosleep(1 ms)", v, WAKE_SAMPLES, &median);
+  check(median <= WAKE_BOUND_US, "nanosleep(1 ms) fires on time",
+        "sleep-paced feeders (cubeb-alsa's refill loop, mpg123 -o oss) rest on this", 0);
+
+  // 2. The re-scan tick itself. A timeout longer than the tick makes sys_poll
+  //    arm min(remaining, 4 ms) pass after pass: the tick until the timeout
+  //    is near, then the exact remainder. With a correctly scaled LAPIC the
+  //    overshoot past the timeout is therefore a fraction of a millisecond
+  //    (0.1-0.8 ms measured in QEMU); with the count off by a ratio r every
+  //    pass lands r times late and the overshoot grows to several ms. Four
+  //    timeouts that are not multiples of one another, and the median, so
+  //    neither a lucky landing nor one preempted sample decides it.
+  static const int timeouts_ms[] = {9, 13, 17, 21};
+  long over[4 * 5], worst = 0;
+  int n = 0;
+  for (size_t t = 0; t < sizeof timeouts_ms / sizeof timeouts_ms[0]; t++) {
+    for (int i = 0; i < 5; i++) {
+      struct timespec t0;
+      clock_gettime(CLOCK_MONOTONIC, &t0);
+      poll(NULL, 0, timeouts_ms[t]);
+      long o = elapsed_us(&t0) - timeouts_ms[t] * 1000L;
+      over[n++] = o;
+      if (o > worst) worst = o;
+    }
+  }
+  report_us("poll(0 fds, 9/13/17/21 ms) overshoot past the timeout", over, n, &median);
+  check(median <= TICK_OVERSHOOT_BOUND_US, "poll(0 fds, N > 4 ms) lands on its timeout, tick after tick",
+        "the 4 ms tick every bus-less fd wait (pcm, timer) is re-scanned on: the audio wake-up latency", 0);
+  if (median > TICK_OVERSHOOT_BOUND_US)
+    info("=> re-scan passes land up to %.1f ms late: the tick is stretched (LAPIC count not calibrated?); Pulse's sink is woken that late",
+         worst / 1000.0);
 }
 
 // ── OSS: /dev/dsp ──────────────────────────────────────────────────────────
@@ -1262,6 +1381,7 @@ int main(int argc, char **argv) {
   printf("Each check mirrors what cubeb, alsa-lib or PulseAudio asks of the kernel.\n");
 
   test_devices();
+  test_wake();
   test_oss();
   test_alsa_pcm();
   test_alsa_timer();

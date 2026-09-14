@@ -208,4 +208,11 @@ impl LocalApic {
     pub fn set_timer_initial(&mut self, initial: u32) {
         unsafe { self.inner.set_timer_initial(initial) }
     }
+
+    /// The timer's current count (TMCCT): how far the countdown loaded by
+    /// [`set_timer_initial`](Self::set_timer_initial) has got. Read against
+    /// the TSC at boot to measure the rate the timer actually counts at.
+    pub fn timer_current(&self) -> u32 {
+        unsafe { self.inner.timer_current() }
+    }
 }
