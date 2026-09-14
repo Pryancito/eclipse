@@ -56,7 +56,7 @@ const RETRY_BACKOFF: core::time::Duration = core::time::Duration::from_micros(25
 
 fn uread<T: Copy>(addr: usize) -> Result<T> {
     if !kernel_hal::user::user_range_ok(addr, core::mem::size_of::<T>())
-        || addr % core::mem::align_of::<T>() != 0
+        || !addr.is_multiple_of(core::mem::align_of::<T>())
     {
         return Err(FsError::BadAddress);
     }
@@ -65,7 +65,7 @@ fn uread<T: Copy>(addr: usize) -> Result<T> {
 
 fn uwrite<T: Copy>(addr: usize, val: T) -> Result<()> {
     if !kernel_hal::user::user_range_ok(addr, core::mem::size_of::<T>())
-        || addr % core::mem::align_of::<T>() != 0
+        || !addr.is_multiple_of(core::mem::align_of::<T>())
     {
         return Err(FsError::BadAddress);
     }
