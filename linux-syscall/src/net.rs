@@ -214,24 +214,22 @@ impl Syscall<'_> {
 
         if let Endpoint::Unix(path) = &endpoint {
             if let Ok(client) = file_like.clone().downcast_arc::<UnixSocketState>() {
-                return match UnixSocketState::lookup(path) {
-                    None => Err(LxError::ECONNREFUSED),
-                    Some(server) => {
-                        if !server.is_listening() {
-                            return Err(LxError::ECONNREFUSED);
-                        }
-                        // Establish the connection now: create the server's end,
-                        // wire it to the client, and queue it for accept(). Wiring
-                        // at connect time (rather than in accept) lets the client
-                        // send its first bytes — e.g. the X11 handshake — before
-                        // the server has accepted, instead of getting ENOTCONN.
-                        let server_side = UnixSocketState::new();
-                        server_side.set_path(server.bound_path());
-                        UnixSocketState::connect_pair(&client, &server_side);
-                        server.push_accept(server_side);
-                        Ok(0)
-                    }
-                };
+                // ENOENT / ECONNREFUSED exactly as `UnixSocketState::
+                // resolve_listener` decides (pathname vs abstract, bound
+                // but not listening): this fast path is the one every
+                // AF_UNIX connect(2) takes, so the rule must live in the
+                // shared helper, not be re-derived here.
+                let server = UnixSocketState::resolve_listener(path)?;
+                // Establish the connection now: create the server's end,
+                // wire it to the client, and queue it for accept(). Wiring
+                // at connect time (rather than in accept) lets the client
+                // send its first bytes — e.g. the X11 handshake — before
+                // the server has accepted, instead of getting ENOTCONN.
+                let server_side = UnixSocketState::new();
+                server_side.set_path(server.bound_path());
+                UnixSocketState::connect_pair(&client, &server_side);
+                server.push_accept(server_side);
+                return Ok(0);
             }
         }
 
