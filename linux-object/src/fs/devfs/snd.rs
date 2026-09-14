@@ -32,8 +32,11 @@
 #![allow(unsafe_code)]
 
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::any::Any;
+use core::convert::TryFrom;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 
@@ -463,6 +466,22 @@ impl PcmDev {
 
     fn hw_ptr(&self, st: &PcmState) -> u64 {
         (st.appl_ptr + st.boundary - self.queued_frames()) % st.boundary
+    }
+
+    /// What the ALSA timer bound to this stream samples: whether the stream
+    /// runs, how many whole periods the hardware pointer has passed, and the
+    /// period length in ns (the timer's resolution).
+    pub(crate) fn period_clock(&self) -> PeriodClock {
+        // Lock order everywhere in this file is `st` then the audio driver
+        // (`hw_ptr` -> `queued_frames` refreshes the hardware position);
+        // nothing takes them the other way round.
+        let st = self.st.lock();
+        let period = st.period_size.max(1);
+        PeriodClock {
+            running: st.state == STATE_RUNNING,
+            periods: self.hw_ptr(&st) / period,
+            resolution_ns: period.saturating_mul(1_000_000_000) / u64::from(st.rate.max(1)),
+        }
     }
 
     // ── hw_params refine ────────────────────────────────────────────────────
@@ -1113,9 +1132,16 @@ impl INode for PcmDev {
         let _ = self.audio.queued_bytes();
         let st = self.st.lock();
         let avail = self.avail(&st);
+        // Linux reports POLLOUT when `avail >= avail_min`, but it only
+        // re-evaluates that on a period interrupt, so a feeder wakes at most
+        // once per period however small its avail_min (PulseAudio's tsched=0
+        // sink asks for 1). This fd has no interrupt: sys_poll re-scans it
+        // every 4 ms, and reporting every freed frame would wake such a
+        // feeder 250 times a second to write a few frames each. Gating on a
+        // whole period gives it the wake-up cadence it was written for.
         Ok(PollStatus {
             read: false,
-            write: avail >= st.avail_min,
+            write: avail >= st.avail_min.max(st.period_size),
             error: false,
         })
     }
@@ -1394,6 +1420,866 @@ impl INode for PcmDev {
 
 #[allow(non_upper_case_globals)]
 const Timespec_ZERO: rcore_fs::vfs::Timespec = rcore_fs::vfs::Timespec { sec: 0, nsec: 0 };
+
+// ── ALSA timer: /dev/snd/timer ──────────────────────────────────────────────
+//
+// alsa-lib's `hw` PCM plugin opens this node the moment a client enables
+// `period_event` in its sw_params (pcm_hw.c `snd_pcm_hw_change_timer`).
+// PulseAudio's module-alsa-sink does exactly that for every `tsched=0` sink
+// (alsa-util.c `pa_alsa_set_sw_params`, `period_event = !use_tsched`), so
+// without this node the sink dies at "Unable to set sw params: No such file
+// or directory" — the errno of the open(2), surfaced through the sw_params
+// call. What alsa-lib then does, in order: PVERSION, TREAD=1,
+// SELECT{class PCM, card, device, subdevice<<1|stream}, PARAMS{AUTO,
+// ticks=1, filter=TICK|MSUSPEND|MRESUME}, START. From then on the timer fd
+// sits next to the PCM fd in poll(): POLLIN here is turned into POLLOUT on
+// the PCM by `snd_pcm_hw_poll_revents`, and the queued records are read and
+// discarded (`snd_pcm_hw_clear_timer_queue`).
+//
+// Every open is its own instance (Linux `snd_timer_user`): selection,
+// params, run state and the event queue belong to the fd, so the node is a
+// cloning device like `/dev/ptmx` — the open path swaps in a fresh
+// [`TimerClient`]. A PCM timer ticks once per period **while the stream
+// runs**. This driver has no period interrupt; the PCM exposes a period
+// clock derived from its hardware pointer and the instance samples it on
+// every poll/read (sys_poll re-scans bus-less fds every 4 ms), which yields
+// the same "one tick per elapsed period" a Linux client observes.
+
+const SNDRV_TIMER_VERSION: i32 = 0x0002_0007;
+const TIMER_CLASS_PCM: i32 = 3;
+const TIMER_PSFLG_AUTO: u32 = 1 << 0;
+const TIMER_EVENT_RESOLUTION: i32 = 0;
+const TIMER_EVENT_TICK: i32 = 1;
+const TIMER_EVENT_START: i32 = 2;
+const TIMER_EVENT_STOP: i32 = 3;
+const TIMER_EVENT_CONTINUE: i32 = 4;
+const TIMER_EVENT_PAUSE: i32 = 5;
+const TIMER_QUEUE_DEFAULT: usize = 128;
+/// `/dev/snd/timer` is char 116:33 on Linux.
+const TIMER_MINOR: usize = 33;
+
+/// What a PCM stream hands its timer: see [`PcmDev::period_clock`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PeriodClock {
+    pub running: bool,
+    pub periods: u64,
+    pub resolution_ns: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SndTimerId {
+    dev_class: i32,
+    dev_sclass: i32,
+    card: i32,
+    device: i32,
+    subdevice: i32,
+}
+
+#[repr(C)]
+struct SndTimerSelect {
+    id: SndTimerId,
+    reserved: [u8; 32],
+}
+
+#[repr(C)]
+struct SndTimerInfo {
+    flags: u32,
+    card: i32,
+    id: [u8; 64],
+    name: [u8; 80],
+    reserved0: u64,
+    resolution: u64,
+    reserved: [u8; 64],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SndTimerParams {
+    flags: u32,
+    ticks: u32,
+    queue_size: u32,
+    reserved0: u32,
+    filter: u32,
+    reserved: [u8; 60],
+}
+
+#[repr(C)]
+struct SndTimerStatus {
+    tstamp: Timespec,
+    resolution: u32,
+    lost: u32,
+    overrun: u32,
+    queue: u32,
+    reserved: [u8; 64],
+}
+
+/// `struct snd_timer_read`: what a client without TREAD gets.
+const TIMER_READ_BYTES: usize = 8;
+/// `struct snd_timer_tread` on x86_64: `int event; pad; timespec; u32 val;
+/// pad` — 32 bytes.
+const TIMER_TREAD_BYTES: usize = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TimerEvent {
+    event: i32,
+    tstamp: Timespec,
+    val: u32,
+}
+
+impl PartialEq for Timespec {
+    fn eq(&self, o: &Self) -> bool {
+        self.sec == o.sec && self.nsec == o.nsec
+    }
+}
+impl Eq for Timespec {}
+impl core::fmt::Debug for Timespec {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}.{:09}", self.sec, self.nsec)
+    }
+}
+
+/// One `snd_timer_user` instance: everything an open fd of `/dev/snd/timer`
+/// owns. Pure state machine over [`PeriodClock`] samples, so it is unit
+/// tested without a sound device.
+struct TimerState {
+    tread: bool,
+    /// Card index of the PCM timer bound by SELECT.
+    selected: Option<usize>,
+    running: bool,
+    auto: bool,
+    /// Periods per delivered tick (PARAMS `ticks`, >= 1).
+    ticks: u32,
+    filter: u32,
+    queue_size: usize,
+    queue: VecDeque<TimerEvent>,
+    overrun: u32,
+    /// Period count at the last sample while the stream ran; `None` until
+    /// the first running sample after START (or after the stream stopped),
+    /// so a stream that (re)starts at pointer 0 does not tick backwards.
+    last_periods: Option<u64>,
+    /// Elapsed periods not yet worth a tick (`< ticks`).
+    partial: u32,
+    resolution_ns: u64,
+    /// Timestamp of the last START/STOP/CONTINUE/PAUSE, as STATUS reports it.
+    tstamp: Timespec,
+}
+
+impl TimerState {
+    fn new() -> Self {
+        TimerState {
+            tread: false,
+            selected: None,
+            running: false,
+            auto: false,
+            ticks: 1,
+            filter: 0,
+            queue_size: TIMER_QUEUE_DEFAULT,
+            queue: VecDeque::new(),
+            overrun: 0,
+            last_periods: None,
+            partial: 0,
+            resolution_ns: 0,
+            tstamp: Timespec::default(),
+        }
+    }
+
+    /// Linux `snd_timer_user_ccallback`/`tinterrupt` gate: a TREAD client
+    /// gets exactly the events its filter names; a plain client only ticks.
+    fn push(&mut self, event: i32, tstamp: Timespec, val: u32) {
+        if self.tread {
+            if self.filter & (1u32 << event) == 0 {
+                return;
+            }
+        } else if event != TIMER_EVENT_TICK {
+            return;
+        }
+        if event == TIMER_EVENT_TICK {
+            if let Some(last) = self.queue.back_mut() {
+                if last.event == TIMER_EVENT_TICK {
+                    // Ticks nobody has read yet coalesce (tinterrupt does the
+                    // same), so a slow reader sees one record with the count.
+                    last.tstamp = tstamp;
+                    last.val = last.val.saturating_add(val);
+                    return;
+                }
+            }
+        }
+        if self.queue.len() >= self.queue_size {
+            self.overrun = self.overrun.saturating_add(1);
+            return;
+        }
+        self.queue.push_back(TimerEvent { event, tstamp, val });
+    }
+
+    fn select(&mut self, card: usize) {
+        self.selected = Some(card);
+        self.running = false;
+        self.queue.clear();
+        self.overrun = 0;
+        self.last_periods = None;
+        self.partial = 0;
+    }
+
+    fn params(&mut self, p: &SndTimerParams, now: Timespec) -> Result<()> {
+        if self.selected.is_none() {
+            return Err(FsError::NoDevice);
+        }
+        if p.ticks < 1 {
+            return Err(FsError::InvalidParam);
+        }
+        let queue_size = match p.queue_size {
+            0 => TIMER_QUEUE_DEFAULT,
+            32..=1024 => p.queue_size as usize,
+            _ => return Err(FsError::InvalidParam),
+        };
+        // PARAMS stops a running timer and starts the queue afresh.
+        self.running = false;
+        self.auto = p.flags & TIMER_PSFLG_AUTO != 0;
+        self.ticks = p.ticks;
+        self.filter = p.filter;
+        self.queue_size = queue_size;
+        self.queue.clear();
+        self.overrun = 0;
+        self.partial = 0;
+        if self.resolution_ns > 0 {
+            let res = self.resolution_ns as u32;
+            self.push(TIMER_EVENT_RESOLUTION, now, res);
+        }
+        Ok(())
+    }
+
+    /// START / CONTINUE: `event` names which, for the record a TREAD client
+    /// with that bit in its filter receives. EBUSY when already running, as
+    /// `snd_timer_start1` answers.
+    fn start(&mut self, event: i32, now: Timespec) -> Result<()> {
+        if self.selected.is_none() {
+            return Err(FsError::NoDevice);
+        }
+        if self.running {
+            return Err(FsError::Busy);
+        }
+        self.running = true;
+        self.last_periods = None;
+        self.partial = 0;
+        self.tstamp = now;
+        let res = self.resolution_ns as u32;
+        self.push(event, now, res);
+        Ok(())
+    }
+
+    /// STOP / PAUSE. EBUSY when not running (`snd_timer_stop1`).
+    fn stop(&mut self, event: i32, now: Timespec) -> Result<()> {
+        if self.selected.is_none() {
+            return Err(FsError::NoDevice);
+        }
+        if !self.running {
+            return Err(FsError::Busy);
+        }
+        self.running = false;
+        self.last_periods = None;
+        self.tstamp = now;
+        self.push(event, now, 0);
+        Ok(())
+    }
+
+    /// Fold a fresh reading of the bound stream into the queue: one tick per
+    /// `ticks` periods elapsed while both the timer and the stream run. A
+    /// pointer that went backwards (PREPARE reset it) re-synchronises
+    /// silently, exactly like a stream that was stopped and started again.
+    fn sample(&mut self, clock: PeriodClock, now: Timespec) {
+        self.resolution_ns = clock.resolution_ns;
+        if !self.running {
+            return;
+        }
+        if !clock.running {
+            self.last_periods = None;
+            return;
+        }
+        let elapsed = match self.last_periods {
+            Some(last) if clock.periods >= last => clock.periods - last,
+            _ => 0,
+        };
+        self.last_periods = Some(clock.periods);
+        if elapsed == 0 {
+            return;
+        }
+        let total = u64::from(self.partial).saturating_add(elapsed);
+        let ticks = u64::from(self.ticks.max(1));
+        let events = total / ticks;
+        self.partial = (total % ticks) as u32;
+        if events == 0 {
+            return;
+        }
+        self.push(
+            TIMER_EVENT_TICK,
+            now,
+            events.min(u64::from(u32::MAX)) as u32,
+        );
+        if !self.auto {
+            // One-shot: the first tick ends the run (no AUTO flag).
+            self.running = false;
+            self.last_periods = None;
+        }
+    }
+
+    /// Serialise queued records into `buf` the way `snd_timer_user_read`
+    /// does: whole records only, `struct snd_timer_tread` for a TREAD client
+    /// and `struct snd_timer_read` otherwise. `None` when nothing is queued
+    /// (the caller answers EAGAIN: alsa-lib opens this fd O_NONBLOCK).
+    fn read(&mut self, buf: &mut [u8]) -> Option<usize> {
+        let rec = if self.tread {
+            TIMER_TREAD_BYTES
+        } else {
+            TIMER_READ_BYTES
+        };
+        let mut done = 0;
+        while done + rec <= buf.len() {
+            let Some(ev) = self.queue.pop_front() else {
+                break;
+            };
+            let out = &mut buf[done..done + rec];
+            if self.tread {
+                out[0..4].copy_from_slice(&ev.event.to_ne_bytes());
+                out[4..8].fill(0);
+                out[8..16].copy_from_slice(&ev.tstamp.sec.to_ne_bytes());
+                out[16..24].copy_from_slice(&ev.tstamp.nsec.to_ne_bytes());
+                out[24..28].copy_from_slice(&ev.val.to_ne_bytes());
+                out[28..32].fill(0);
+            } else {
+                let res = self.resolution_ns.min(u64::from(u32::MAX)) as u32;
+                out[0..4].copy_from_slice(&res.to_ne_bytes());
+                out[4..8].copy_from_slice(&ev.val.to_ne_bytes());
+            }
+            done += rec;
+        }
+        if done == 0 {
+            None
+        } else {
+            Some(done)
+        }
+    }
+}
+
+fn now_timespec() -> Timespec {
+    let now = kernel_hal::timer::timer_now();
+    Timespec {
+        sec: now.as_secs() as i64,
+        nsec: i64::from(now.subsec_nanos()),
+    }
+}
+
+fn timer_metadata(inode_id: usize) -> Metadata {
+    Metadata {
+        dev: 1,
+        inode: inode_id,
+        size: 0,
+        blk_size: 0,
+        blocks: 0,
+        atime: Timespec_ZERO,
+        mtime: Timespec_ZERO,
+        ctime: Timespec_ZERO,
+        type_: FileType::CharDevice,
+        mode: 0o666,
+        nlinks: 1,
+        uid: 0,
+        gid: 0,
+        rdev: make_rdev(116, TIMER_MINOR),
+    }
+}
+
+/// The `/dev/snd/timer` node. Resolving it is normal; the open path
+/// downcasts to this type and calls [`TimerDev::open_client`] so every fd
+/// gets its own [`TimerClient`].
+pub struct TimerDev {
+    pcms: Vec<Arc<PcmDev>>,
+    inode_id: usize,
+}
+
+impl TimerDev {
+    /// `pcms[card]` is the playback stream of card `card`.
+    pub fn new(pcms: Vec<Arc<PcmDev>>) -> Self {
+        TimerDev {
+            pcms,
+            inode_id: DevFS::new_inode_id(),
+        }
+    }
+
+    pub fn open_client(&self) -> Arc<dyn INode> {
+        Arc::new(TimerClient {
+            pcms: self.pcms.clone(),
+            inode_id: self.inode_id,
+            st: Mutex::new(TimerState::new()),
+        })
+    }
+}
+
+impl INode for TimerDev {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: false,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(timer_metadata(self.inode_id))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// One open of `/dev/snd/timer`.
+pub struct TimerClient {
+    pcms: Vec<Arc<PcmDev>>,
+    inode_id: usize,
+    st: Mutex<TimerState>,
+}
+
+impl TimerClient {
+    /// Refresh the queue from the bound stream. Held lock: `st`.
+    fn sample(&self, st: &mut TimerState) {
+        if let Some(pcm) = st.selected.and_then(|card| self.pcms.get(card)) {
+            let clock = pcm.period_clock();
+            st.sample(clock, now_timespec());
+        }
+    }
+}
+
+impl INode for TimerClient {
+    fn read_at(&self, _offset: usize, buf: &mut [u8]) -> Result<usize> {
+        let mut st = self.st.lock();
+        self.sample(&mut st);
+        st.read(buf).ok_or(FsError::Again)
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+
+    fn poll(&self) -> Result<PollStatus> {
+        let mut st = self.st.lock();
+        self.sample(&mut st);
+        Ok(PollStatus {
+            read: !st.queue.is_empty(),
+            write: false,
+            error: false,
+        })
+    }
+
+    fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
+        let ty = (cmd >> 8) & 0xff;
+        let nr = cmd & 0xff;
+        if ty != b'T' as u32 {
+            return Err(FsError::NotSupported);
+        }
+        match nr {
+            0x00 => {
+                // PVERSION
+                ucheck::<i32>(data)?;
+                unsafe { *(data as *mut i32) = SNDRV_TIMER_VERSION };
+                Ok(0)
+            }
+            0x02 | 0xa4 => {
+                // TREAD (old) / TREAD64: extended, timestamped records. Only
+                // before SELECT, as Linux insists.
+                ucheck::<i32>(data)?;
+                let on = unsafe { *(data as *const i32) };
+                let mut st = self.st.lock();
+                if st.selected.is_some() {
+                    return Err(FsError::Busy);
+                }
+                st.tread = on != 0;
+                Ok(0)
+            }
+            0x10 => {
+                // SELECT: only the PCM playback timers exist here — class
+                // PCM, device 0, subdevice<<1|stream == 0 (playback of
+                // substream 0) — anything else is ENODEV, like a card that
+                // has no such timer.
+                ucheck::<SndTimerSelect>(data)?;
+                let sel = unsafe { &*(data as *const SndTimerSelect) };
+                let id = sel.id;
+                let card = usize::try_from(id.card).map_err(|_| FsError::NoDevice)?;
+                if id.dev_class != TIMER_CLASS_PCM
+                    || id.device != 0
+                    || id.subdevice != 0
+                    || card >= self.pcms.len()
+                {
+                    return Err(FsError::NoDevice);
+                }
+                let mut st = self.st.lock();
+                st.select(card);
+                st.resolution_ns = self.pcms[card].period_clock().resolution_ns;
+                Ok(0)
+            }
+            0x11 => {
+                // INFO
+                ucheck::<SndTimerInfo>(data)?;
+                let info = unsafe { &mut *(data as *mut SndTimerInfo) };
+                let mut st = self.st.lock();
+                let Some(card) = st.selected else {
+                    return Err(FsError::NoDevice);
+                };
+                self.sample(&mut st);
+                unsafe {
+                    core::ptr::write_bytes(
+                        info as *mut SndTimerInfo as *mut u8,
+                        0,
+                        core::mem::size_of::<SndTimerInfo>(),
+                    )
+                };
+                info.card = card as i32;
+                fill_cstr(&mut info.id, "pcm");
+                fill_cstr(&mut info.name, "PCM playback");
+                info.resolution = st.resolution_ns;
+                Ok(0)
+            }
+            0x12 => {
+                // PARAMS
+                ucheck::<SndTimerParams>(data)?;
+                let p = unsafe { *(data as *const SndTimerParams) };
+                let mut st = self.st.lock();
+                self.sample(&mut st);
+                st.params(&p, now_timespec())?;
+                Ok(0)
+            }
+            0x14 => {
+                // STATUS
+                ucheck::<SndTimerStatus>(data)?;
+                let s = unsafe { &mut *(data as *mut SndTimerStatus) };
+                let mut st = self.st.lock();
+                if st.selected.is_none() {
+                    return Err(FsError::NoDevice);
+                }
+                self.sample(&mut st);
+                unsafe {
+                    core::ptr::write_bytes(
+                        s as *mut SndTimerStatus as *mut u8,
+                        0,
+                        core::mem::size_of::<SndTimerStatus>(),
+                    )
+                };
+                s.tstamp = st.tstamp;
+                s.resolution = st.resolution_ns.min(u64::from(u32::MAX)) as u32;
+                s.overrun = st.overrun;
+                s.queue = st.queue.len() as u32;
+                Ok(0)
+            }
+            // START / STOP / CONTINUE / PAUSE, new (0xa0..) and pre-1.0.9
+            // (0x20..) numbers: alsa-lib picks by the version we report.
+            0xa0 | 0x20 => {
+                let mut st = self.st.lock();
+                self.sample(&mut st);
+                st.start(TIMER_EVENT_START, now_timespec())?;
+                Ok(0)
+            }
+            0xa1 | 0x21 => {
+                let mut st = self.st.lock();
+                self.sample(&mut st);
+                st.stop(TIMER_EVENT_STOP, now_timespec())?;
+                Ok(0)
+            }
+            0xa2 | 0x22 => {
+                let mut st = self.st.lock();
+                self.sample(&mut st);
+                st.start(TIMER_EVENT_CONTINUE, now_timespec())?;
+                Ok(0)
+            }
+            0xa3 | 0x23 => {
+                let mut st = self.st.lock();
+                self.sample(&mut st);
+                st.stop(TIMER_EVENT_PAUSE, now_timespec())?;
+                Ok(0)
+            }
+            _ => {
+                // NEXT_DEVICE / GINFO / GPARAMS / GSTATUS (timer enumeration,
+                // `snd_timer_query`) and the user-driven timers: nothing on
+                // the PCM period path asks for them.
+                debug!("[snd] timer ioctl 'T' nr={:#x} unsupported", nr);
+                Err(FsError::NotSupported)
+            }
+        }
+    }
+
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(timer_metadata(self.inode_id))
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[cfg(test)]
+mod timer_tests {
+    use super::*;
+    use core::convert::TryInto;
+
+    fn ts(sec: i64) -> Timespec {
+        Timespec { sec, nsec: 0 }
+    }
+
+    fn clock(running: bool, periods: u64) -> PeriodClock {
+        PeriodClock {
+            running,
+            periods,
+            resolution_ns: 25_000_000,
+        }
+    }
+
+    /// The exact sequence pcm_hw.c `snd_pcm_hw_change_timer` issues.
+    fn alsa_lib_client() -> TimerState {
+        let mut st = TimerState::new();
+        st.tread = true;
+        st.select(0);
+        st.resolution_ns = 25_000_000;
+        let p = SndTimerParams {
+            flags: TIMER_PSFLG_AUTO,
+            ticks: 1,
+            queue_size: 0,
+            reserved0: 0,
+            filter: (1 << TIMER_EVENT_TICK) | (1 << 17) | (1 << 18),
+            reserved: [0; 60],
+        };
+        st.params(&p, ts(0)).unwrap();
+        st.start(TIMER_EVENT_START, ts(0)).unwrap();
+        st
+    }
+
+    fn read_tread(st: &mut TimerState) -> Vec<(i32, u32)> {
+        let mut buf = [0u8; 4 * TIMER_TREAD_BYTES];
+        let Some(n) = st.read(&mut buf) else {
+            return Vec::new();
+        };
+        assert_eq!(n % TIMER_TREAD_BYTES, 0);
+        buf[..n]
+            .chunks(TIMER_TREAD_BYTES)
+            .map(|r| {
+                (
+                    i32::from_ne_bytes(r[0..4].try_into().unwrap()),
+                    u32::from_ne_bytes(r[24..28].try_into().unwrap()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ticks_once_per_elapsed_period_and_coalesces_unread_ticks() {
+        let mut st = alsa_lib_client();
+        // START itself is filtered out by alsa-lib's TICK|MSUSPEND|MRESUME.
+        assert!(st.queue.is_empty());
+        // Stream not running yet: nothing.
+        st.sample(clock(false, 0), ts(1));
+        assert!(st.read(&mut [0u8; 64]).is_none());
+        // Stream starts at pointer 0: the first sample only synchronises.
+        st.sample(clock(true, 0), ts(2));
+        assert!(st.queue.is_empty());
+        st.sample(clock(true, 1), ts(3));
+        assert_eq!(read_tread(&mut st), alloc::vec![(TIMER_EVENT_TICK, 1)]);
+        // Drained: EAGAIN for alsa-lib's clear_timer_queue.
+        assert!(st.read(&mut [0u8; 64]).is_none());
+        // Two samples nobody read in between become one record with the sum.
+        st.sample(clock(true, 3), ts(4));
+        st.sample(clock(true, 4), ts(5));
+        assert_eq!(read_tread(&mut st), alloc::vec![(TIMER_EVENT_TICK, 3)]);
+        // Still running (AUTO).
+        assert!(st.running);
+    }
+
+    #[test]
+    fn a_pointer_reset_or_a_stopped_stream_resynchronises_without_ticking_backwards() {
+        let mut st = alsa_lib_client();
+        st.sample(clock(true, 5), ts(1));
+        st.sample(clock(true, 7), ts(2));
+        assert_eq!(read_tread(&mut st), alloc::vec![(TIMER_EVENT_TICK, 2)]);
+        // PREPARE reset the pointer: no tick, new baseline.
+        st.sample(clock(true, 0), ts(3));
+        assert!(st.queue.is_empty());
+        st.sample(clock(true, 1), ts(4));
+        assert_eq!(read_tread(&mut st), alloc::vec![(TIMER_EVENT_TICK, 1)]);
+        // The stream stops and later restarts at 0: same rule.
+        st.sample(clock(false, 1), ts(5));
+        st.sample(clock(true, 0), ts(6));
+        assert!(st.queue.is_empty());
+        st.sample(clock(true, 2), ts(7));
+        assert_eq!(read_tread(&mut st), alloc::vec![(TIMER_EVENT_TICK, 2)]);
+    }
+
+    #[test]
+    fn lifecycle_events_follow_the_filter_and_start_stop_answer_ebusy() {
+        let mut st = TimerState::new();
+        st.tread = true;
+        st.select(0);
+        st.resolution_ns = 25_000_000;
+        let p = SndTimerParams {
+            flags: TIMER_PSFLG_AUTO,
+            ticks: 2,
+            queue_size: 64,
+            reserved0: 0,
+            filter: (1 << TIMER_EVENT_TICK) | (1 << TIMER_EVENT_START),
+            reserved: [0; 60],
+        };
+        st.params(&p, ts(0)).unwrap();
+        assert!(matches!(
+            st.stop(TIMER_EVENT_STOP, ts(0)),
+            Err(FsError::Busy)
+        ));
+        st.start(TIMER_EVENT_START, ts(1)).unwrap();
+        assert!(matches!(
+            st.start(TIMER_EVENT_START, ts(1)),
+            Err(FsError::Busy)
+        ));
+        // START is in the filter: one record carrying the resolution.
+        assert_eq!(
+            read_tread(&mut st),
+            alloc::vec![(TIMER_EVENT_START, 25_000_000)]
+        );
+        // ticks=2: one period is not yet a tick, the second is.
+        st.sample(clock(true, 0), ts(2));
+        st.sample(clock(true, 1), ts(3));
+        assert!(st.queue.is_empty());
+        st.sample(clock(true, 2), ts(4));
+        assert_eq!(read_tread(&mut st), alloc::vec![(TIMER_EVENT_TICK, 1)]);
+        // STOP is not in the filter: no record, but the run ends.
+        st.stop(TIMER_EVENT_STOP, ts(5)).unwrap();
+        assert!(st.queue.is_empty());
+        assert!(!st.running);
+        st.sample(clock(true, 9), ts(6));
+        assert!(st.queue.is_empty());
+    }
+
+    #[test]
+    fn one_shot_without_auto_ticks_once_then_stops() {
+        let mut st = TimerState::new();
+        st.tread = true;
+        st.select(0);
+        let p = SndTimerParams {
+            flags: 0,
+            ticks: 1,
+            queue_size: 0,
+            reserved0: 0,
+            filter: 1 << TIMER_EVENT_TICK,
+            reserved: [0; 60],
+        };
+        st.params(&p, ts(0)).unwrap();
+        st.start(TIMER_EVENT_START, ts(0)).unwrap();
+        st.sample(clock(true, 0), ts(1));
+        st.sample(clock(true, 1), ts(2));
+        assert!(!st.running);
+        st.sample(clock(true, 5), ts(3));
+        assert_eq!(read_tread(&mut st), alloc::vec![(TIMER_EVENT_TICK, 1)]);
+    }
+
+    #[test]
+    fn plain_reads_are_eight_byte_records_and_only_ticks() {
+        let mut st = TimerState::new();
+        st.select(0);
+        let p = SndTimerParams {
+            flags: TIMER_PSFLG_AUTO,
+            ticks: 1,
+            queue_size: 0,
+            reserved0: 0,
+            filter: 0xffff_ffff,
+            reserved: [0; 60],
+        };
+        st.params(&p, ts(0)).unwrap();
+        st.start(TIMER_EVENT_START, ts(0)).unwrap();
+        // Not a TREAD client: START produced nothing.
+        assert!(st.queue.is_empty());
+        st.sample(clock(true, 0), ts(1));
+        st.sample(clock(true, 3), ts(2));
+        let mut buf = [0u8; 64];
+        assert_eq!(st.read(&mut buf), Some(TIMER_READ_BYTES));
+        assert_eq!(
+            u32::from_ne_bytes(buf[0..4].try_into().unwrap()),
+            25_000_000
+        );
+        assert_eq!(u32::from_ne_bytes(buf[4..8].try_into().unwrap()), 3);
+        // A buffer too small for one record reads nothing.
+        st.sample(clock(true, 4), ts(3));
+        assert!(st.read(&mut buf[..4]).is_none());
+        assert_eq!(st.read(&mut buf), Some(TIMER_READ_BYTES));
+    }
+
+    #[test]
+    fn params_validates_like_linux_and_a_full_queue_counts_overruns() {
+        let mut st = TimerState::new();
+        st.tread = true;
+        assert!(matches!(
+            st.params(
+                &SndTimerParams {
+                    flags: 0,
+                    ticks: 1,
+                    queue_size: 0,
+                    reserved0: 0,
+                    filter: 0,
+                    reserved: [0; 60]
+                },
+                ts(0)
+            ),
+            Err(FsError::NoDevice)
+        ));
+        st.select(0);
+        assert!(matches!(
+            st.params(
+                &SndTimerParams {
+                    flags: 0,
+                    ticks: 0,
+                    queue_size: 0,
+                    reserved0: 0,
+                    filter: 0,
+                    reserved: [0; 60]
+                },
+                ts(0)
+            ),
+            Err(FsError::InvalidParam)
+        ));
+        assert!(matches!(
+            st.params(
+                &SndTimerParams {
+                    flags: 0,
+                    ticks: 1,
+                    queue_size: 8,
+                    reserved0: 0,
+                    filter: 0,
+                    reserved: [0; 60]
+                },
+                ts(0)
+            ),
+            Err(FsError::InvalidParam)
+        ));
+        let p = SndTimerParams {
+            flags: TIMER_PSFLG_AUTO,
+            ticks: 1,
+            queue_size: 32,
+            reserved0: 0,
+            filter: (1 << TIMER_EVENT_TICK)
+                | (1 << TIMER_EVENT_CONTINUE)
+                | (1 << TIMER_EVENT_PAUSE),
+            reserved: [0; 60],
+        };
+        st.params(&p, ts(0)).unwrap();
+        st.start(TIMER_EVENT_START, ts(0)).unwrap();
+        // Alternating tick / pause / continue never coalesces: fill the queue.
+        st.sample(clock(true, 0), ts(0));
+        for i in 1..=40u64 {
+            st.sample(clock(true, i), ts(i as i64));
+            st.stop(TIMER_EVENT_PAUSE, ts(i as i64)).unwrap();
+            st.start(TIMER_EVENT_CONTINUE, ts(i as i64)).unwrap();
+            st.sample(clock(true, i), ts(i as i64));
+        }
+        assert_eq!(st.queue.len(), 32);
+        assert!(st.overrun > 0);
+    }
+}
 
 // ── Control device node ─────────────────────────────────────────────────────
 

@@ -21,13 +21,18 @@
 //             HW_PARAMS, SW_PARAMS, PREPARE, WRITEI_FRAMES). This is the
 //             surface both cubeb's ALSA backend and PulseAudio's
 //             module-alsa-sink stand on.
+//   alsa-timer /dev/snd/timer: the PCM period timer alsa-lib binds when a
+//             client asks for period_event -- PulseAudio's tsched=0 sink does,
+//             from snd_pcm_sw_params -- and polls beside the PCM fd.
 //   alsa-ctl  /dev/snd/controlC0: CARD_INFO and the "Master" mixer elements
 //             alsa-lib's simple mixer, amixer and Pulse's card probe look up.
 //   daemon    the pulseaudio binary, the `pulse` account, a live process,
 //             and the daemon's own log -- WHY the socket is missing.
 //   unix-sock the AF_UNIX connect() errno split PulseAudio's stale-socket
 //             check depends on: ENOENT for a path nobody bound.
-//   pulse     the server socket cubeb-pulse / libpulse connect to first.
+//   pulse     the server socket cubeb-pulse / libpulse connect to first, and
+//             whether a real (module-alsa-sink) sink sits behind it: a server
+//             with only auto_null answers every connect and plays nothing.
 //   verdict   which cubeb backend would initialise from what was measured --
 //             the same choice Firefox's OpenCubeb() makes.
 //
@@ -213,6 +218,35 @@ static int file_has_prefix(const char *path, const char *prefix) {
   }
   fclose(f);
   return hit;
+}
+
+// mpg123's output drivers (output_*.so) as installed, on one line.
+static void list_mpg123_modules(const char *dir) {
+  DIR *d = opendir(dir);
+  if (!d) {
+    info("%s: %s -- mpg123 has no output modules here (-o pulse/alsa cannot load)", dir, strerror(errno));
+    return;
+  }
+  char line[512] = "";
+  size_t used = 0;
+  struct dirent *e;
+  int count = 0;
+  while ((e = readdir(d))) {
+    if (strncmp(e->d_name, "output_", 7)) continue;
+    const char *name = e->d_name + 7;
+    size_t nl = strlen(name);
+    if (nl > 3 && !strcmp(name + nl - 3, ".so")) nl -= 3;
+    if (used + nl + 2 < sizeof line) {
+      memcpy(line + used, name, nl);
+      used += nl;
+      line[used++] = ' ';
+      line[used] = '\0';
+    }
+    count++;
+  }
+  closedir(d);
+  if (count == 0) info("%s: no output_*.so at all", dir);
+  else info("mpg123 output modules in %s: %s", dir, line);
 }
 
 // pid of a process whose /proc/<pid>/comm is `name`, or -1.
@@ -619,6 +653,228 @@ static void test_alsa_pcm(void) {
   g_alsa_pcm_ok = (g_fail == fail_at_entry);
 }
 
+// ── ALSA timer: /dev/snd/timer ─────────────────────────────────────────────
+//
+// alsa-lib opens this node the moment a client enables period_event in its
+// sw_params (pcm_hw.c snd_pcm_hw_change_timer). PulseAudio's module-alsa-sink
+// does exactly that for every tsched=0 sink (alsa-util.c pa_alsa_set_sw_params,
+// period_event = !use_tsched), so on a kernel without the node the sink dies
+// at "Unable to set sw params: No such file or directory" -- the errno of
+// that open(2), reported through the sw_params call. The SW_PARAMS ioctl in
+// [alsa-pcm] never sees it: period_event lives in alsa-lib, the kernel only
+// sees the timer. Mirrored here call for call: open O_RDONLY|O_NONBLOCK,
+// PVERSION, TREAD, SELECT the PCM's timer, PARAMS (auto, 1 tick, TICK filter),
+// START; then, with the PCM running, the fd must go POLLIN once per period
+// and read() hand back tread records the way snd_pcm_hw_clear_timer_queue
+// drains them. Pulse's thread polls the PCM fd and this one side by side and
+// snd_pcm_hw_poll_revents turns POLLIN here into POLLOUT on the PCM.
+
+struct snd_timer_id {
+  int32_t dev_class, dev_sclass, card, device, subdevice;
+};
+struct snd_timer_select {
+  struct snd_timer_id id;
+  unsigned char reserved[32];
+};
+struct snd_timer_params {
+  uint32_t flags, ticks, queue_size, reserved0, filter;
+  unsigned char reserved[60];
+};
+struct snd_timer_status {
+  struct snd_timespec_ tstamp;
+  uint32_t resolution, lost, overrun, queue;
+  unsigned char reserved[64];
+};
+struct snd_timer_tread {
+  int32_t event;
+  uint32_t pad1;
+  struct snd_timespec_ tstamp;
+  uint32_t val, pad2;
+};
+
+#define SNDRV_TIMER_IOCTL_PVERSION _IOC_(IOC_R, 'T', 0x00, sizeof(int))
+#define SNDRV_TIMER_IOCTL_TREAD_OLD _IOC_(IOC_W, 'T', 0x02, sizeof(int))
+#define SNDRV_TIMER_IOCTL_SELECT _IOC_(IOC_W, 'T', 0x10, sizeof(struct snd_timer_select))
+#define SNDRV_TIMER_IOCTL_PARAMS _IOC_(IOC_W, 'T', 0x12, sizeof(struct snd_timer_params))
+#define SNDRV_TIMER_IOCTL_STATUS _IOC_(IOC_R, 'T', 0x14, sizeof(struct snd_timer_status))
+#define SNDRV_TIMER_IOCTL_START _IOC_(IOC_NONE, 'T', 0xa0, 0)
+#define SNDRV_TIMER_IOCTL_STOP _IOC_(IOC_NONE, 'T', 0xa1, 0)
+#define SNDRV_PCM_IOCTL_START _IOC_(IOC_NONE, 'A', 0x42, 0)
+#define SNDRV_PCM_IOCTL_DROP _IOC_(IOC_NONE, 'A', 0x43, 0)
+#define TIMER_CLASS_PCM 3
+#define TIMER_PSFLG_AUTO 1u
+#define TIMER_EVENT_TICK 1
+#define TIMER_EVENT_MSUSPEND 17
+#define TIMER_EVENT_MRESUME 18
+
+// Quiet counterpart of the [alsa-pcm] sequence: open, S16LE/2ch/48000 with
+// the sizes left to the kernel, Pulse's sw_params (avail_min 1, never
+// auto-start), PREPARE. Returns the fd or -errno; granted sizes in frames.
+static int pcm_open_prepared(unsigned *period, unsigned *buffer) {
+  char path[64];
+  snprintf(path, sizeof path, "/dev/snd/pcmC%dD0p", g_card);
+  int fd = open(path, O_WRONLY);
+  if (fd < 0) return -errno;
+  struct snd_pcm_hw_params hp;
+  hw_params_any(&hp);
+  mask_only(&hp, HWP_ACCESS, ACCESS_RW_INTERLEAVED);
+  mask_only(&hp, HWP_FORMAT, FORMAT_S16_LE);
+  mask_only(&hp, HWP_SUBFORMAT, SUBFORMAT_STD);
+  iv_set(&hp, IV_CHANNELS, 2);
+  iv_set(&hp, IV_RATE, TONE_RATE);
+  if (ioctl(fd, SNDRV_PCM_IOCTL_HW_PARAMS, &hp) != 0) {
+    int e = errno;
+    close(fd);
+    return -e;
+  }
+  *period = hp.intervals[IV_PERIOD_SIZE].min;
+  *buffer = hp.intervals[IV_BUFFER_SIZE].min;
+  struct snd_pcm_sw_params sw;
+  memset(&sw, 0, sizeof sw);
+  sw.avail_min = 1;
+  sw.start_threshold = 0x4000000000000000ull; // (snd_pcm_uframes_t)-1 clipped to boundary
+  sw.stop_threshold = 0x4000000000000000ull;
+  sw.boundary = 0x4000000000000000ull;
+  if (ioctl(fd, SNDRV_PCM_IOCTL_SW_PARAMS, &sw) != 0 || ioctl(fd, SNDRV_PCM_IOCTL_PREPARE, 0) != 0) {
+    int e = errno;
+    close(fd);
+    return -e;
+  }
+  return fd;
+}
+
+static long elapsed_ms(const struct timespec *t0) {
+  struct timespec t1;
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  return (t1.tv_sec - t0->tv_sec) * 1000 + (t1.tv_nsec - t0->tv_nsec) / 1000000;
+}
+
+static void test_alsa_timer(void) {
+  section("alsa-timer");
+  char pcm[64];
+  snprintf(pcm, sizeof pcm, "/dev/snd/pcmC%dD0p", g_card);
+  if (!node_present(pcm, S_IFCHR)) {
+    skip("open /dev/snd/timer", "no ALSA playback node to bind a period timer to");
+    return;
+  }
+  int tfd = open("/dev/snd/timer", O_RDONLY | O_NONBLOCK);
+  int e = errno;
+  check(tfd >= 0, "open(/dev/snd/timer, O_RDONLY|O_NONBLOCK)",
+        "snd_timer_hw_open(): alsa-lib's period_event timer, opened from snd_pcm_sw_params for Pulse's tsched=0 sink", e);
+  if (tfd < 0) {
+    if (e == ENOENT)
+      info("=> exactly module-alsa-sink's 'Unable to set sw params: No such file or directory': no sink, no sound");
+    return;
+  }
+
+  int ver = 0;
+  CHECK_CALL(ioctl(tfd, SNDRV_TIMER_IOCTL_PVERSION, &ver) == 0 && (ver >> 16) == 2, "PVERSION is 2.x",
+             "SNDRV_TIMER_VERSION_MAX gate in snd_timer_hw_open()");
+  info("SNDRV_TIMER_VERSION %d.%d.%d%s", ver >> 16, (ver >> 8) & 0xff, ver & 0xff,
+       ver < 0x20005 ? " (below 2.0.5: alsa-lib would use pause/continue events and poll before read)" : "");
+  int one = 1;
+  CHECK_CALL(ioctl(tfd, SNDRV_TIMER_IOCTL_TREAD_OLD, &one) == 0, "TREAD enables timestamped records",
+             "SND_TIMER_OPEN_TREAD: alsa-lib asks for it first and only falls back without it");
+
+  struct snd_timer_select sel;
+  memset(&sel, 0, sizeof sel);
+  sel.id.dev_class = TIMER_CLASS_PCM;
+  sel.id.card = g_card;
+  sel.id.device = 0;
+  sel.id.subdevice = 0; // (subdevice << 1) | stream, playback = 0
+  CHECK_CALL(ioctl(tfd, SNDRV_TIMER_IOCTL_SELECT, &sel) == 0, "SELECT binds the PCM playback timer",
+             "class PCM, card, device 0, subdevice<<1|stream -- ENODEV here = no timer for this PCM");
+
+  struct snd_timer_params tp;
+  memset(&tp, 0, sizeof tp);
+  tp.flags = TIMER_PSFLG_AUTO;
+  tp.ticks = 1;
+  tp.filter = (1u << TIMER_EVENT_TICK) | (1u << TIMER_EVENT_MSUSPEND) | (1u << TIMER_EVENT_MRESUME);
+  CHECK_CALL(ioctl(tfd, SNDRV_TIMER_IOCTL_PARAMS, &tp) == 0, "PARAMS auto-start, 1 tick, TICK filter",
+             "snd_timer_params() with what snd_pcm_hw_change_timer sets");
+  CHECK_CALL(ioctl(tfd, SNDRV_TIMER_IOCTL_START, 0) == 0, "START", "snd_timer_start()");
+
+  // A PCM timer ticks only while its stream runs: nothing may be queued yet.
+  struct snd_timer_tread tr[4];
+  ssize_t n = read(tfd, tr, sizeof tr);
+  e = errno;
+  check(n < 0 && e == EAGAIN, "read() before the stream runs -> EAGAIN", "a PCM timer ticks only while the PCM runs",
+        n < 0 && e != EAGAIN ? e : 0);
+  if (n >= 0) info("read() returned %zd bytes with no stream running", n);
+
+  // Now run the PCM (silence, one buffer) and expect the tick.
+  unsigned period = 0, buffer = 0;
+  int pfd = pcm_open_prepared(&period, &buffer);
+  check(pfd >= 0, "PCM opened, configured and PREPAREd for the tick test", "same hw_params as [alsa-pcm]", pfd < 0 ? -pfd : 0);
+  if (pfd >= 0) {
+    long period_ms = period ? (long)period * 1000 / TONE_RATE : 0;
+    info("period %u frames = %ld ms, buffer %u frames", period, period_ms, buffer);
+    size_t frames = buffer ? buffer : 4096;
+    int16_t *silence = calloc(frames * 2, sizeof(int16_t));
+    struct snd_xferi x = {0, (uint64_t)(uintptr_t)silence, frames};
+    int wr = silence ? ioctl(pfd, SNDRV_PCM_IOCTL_WRITEI_FRAMES, &x) : -1;
+    int we = errno;
+    // Pulse's sw_params never auto-start: it calls snd_pcm_start after
+    // the first write (alsa-sink.c "Starting playback."). Mirror that.
+    int st = wr == 0 ? ioctl(pfd, SNDRV_PCM_IOCTL_START, 0) : -1;
+    int se = errno;
+    check(wr == 0 && st == 0, "WRITEI a buffer of silence, then START", "snd_pcm_writei + snd_pcm_start as alsa-sink.c does",
+          wr != 0 ? we : se);
+
+    // alsa-lib's poll_descriptors: [pcm POLLOUT, timer POLLIN]. Within one
+    // period (+ the 4 ms re-scan tick and a little scheduling slack) the
+    // timer must report POLLIN: that is the bound the check enforces. The
+    // poll itself waits longer so a late wake is measured and printed
+    // rather than reported as a bare timeout.
+    struct pollfd pf[2] = {{pfd, POLLOUT, 0}, {tfd, POLLIN, 0}};
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    long bound = period_ms + 20;
+    long limit = period_ms * 2 + 100;
+    int pr = poll(pf, 2, (int)limit);
+    int pe = errno;
+    long ms = elapsed_ms(&t0);
+    // Whichever fd woke first, the TIMER must be readable within a period.
+    int timer_in = pf[1].revents & POLLIN;
+    if (pr > 0 && !timer_in) {
+      // The PCM may report POLLOUT slightly before the period boundary the
+      // timer counts; give the timer the rest of the period.
+      struct pollfd pt = {tfd, POLLIN, 0};
+      pr = poll(&pt, 1, (int)(limit - ms > 0 ? limit - ms : 1));
+      pe = errno;
+      ms = elapsed_ms(&t0);
+      timer_in = pr > 0 && (pt.revents & POLLIN);
+    }
+    check(pr > 0 && timer_in && ms <= bound, "poll(POLLIN) on the timer wakes within a period",
+          "snd_pcm_hw_poll_revents: POLLIN here becomes POLLOUT for Pulse's unix_write", pr < 0 ? pe : 0);
+    info("timer POLLIN after %ld ms (period %ld ms + 4 ms re-scan tick; bound %ld ms)%s", ms, period_ms, bound,
+         pr == 0 ? " -- TIMED OUT" : "");
+    if (timer_in && ms > bound)
+      info("=> later than one period: Pulse would see late wake-ups (audible as stutter)");
+
+    n = read(tfd, tr, sizeof tr);
+    e = errno;
+    check(n >= (ssize_t)sizeof tr[0] && n % (ssize_t)sizeof tr[0] == 0 && tr[0].event == TIMER_EVENT_TICK && tr[0].val >= 1,
+          "read() returns a TICK tread record", "32-byte {event, tstamp, val}; alsa-lib reads and discards up to 4", n < 0 ? e : 0);
+    if (n > 0) info("%zd byte%s: event %d val %u (ticks elapsed) at %lld.%09lld", n, n == 1 ? "" : "s", tr[0].event,
+                    tr[0].val, (long long)tr[0].tstamp.sec, (long long)tr[0].tstamp.nsec);
+    n = read(tfd, tr, sizeof tr);
+    e = errno;
+    check(n < 0 && e == EAGAIN, "read() again -> EAGAIN (queue drained)",
+          "snd_pcm_hw_clear_timer_queue reads once; a queue that never empties would spin Pulse", n < 0 && e != EAGAIN ? e : 0);
+
+    struct snd_timer_status ts;
+    memset(&ts, 0, sizeof ts);
+    if (ioctl(tfd, SNDRV_TIMER_IOCTL_STATUS, &ts) == 0)
+      info("STATUS: resolution %u ns (= period), overrun %u, queued %u", ts.resolution, ts.overrun, ts.queue);
+    CHECK_CALL(ioctl(tfd, SNDRV_TIMER_IOCTL_STOP, 0) == 0, "STOP", "snd_timer_stop() on snd_pcm_close");
+    ioctl(pfd, SNDRV_PCM_IOCTL_DROP, 0);
+    free(silence);
+    close(pfd);
+  }
+  close(tfd);
+}
+
 // ── ALSA control: /dev/snd/controlC<card> ──────────────────────────────────
 
 struct snd_ctl_card_info {
@@ -786,6 +1042,10 @@ static void test_daemon(void) {
   // The daemon's own last words, and the chime's.
   dump_tail("/tmp/pulseaudio.log", 40);
   dump_tail("/tmp/boot-sound.log", 12);
+  // The chime is `mpg123 -o pulse`: libout123 dlopen()s output_pulse.so from
+  // here. "Failed to open module pulse" in that log is this directory (or a
+  // library the module links, libpulse-simple) -- not the server.
+  list_mpg123_modules("/usr/lib/mpg123");
 }
 
 // ── AF_UNIX connect() semantics ────────────────────────────────────────────
@@ -852,6 +1112,40 @@ static void test_unix_socket(void) {
 }
 
 static int g_pulse_ok;
+// 1 when the server has a module-alsa-sink sink, 0 when it only has
+// auto_null (module-always-sink) or none, -1 when pactl could not say.
+static int g_pulse_sink_ok = -1;
+
+// A reachable server is not a working one: with module-alsa-sink failed to
+// load, module-always-sink puts up `auto_null`, every stream connects to it
+// and plays into nothing -- mpg123 "plays", Firefox's cubeb initialises,
+// there is no sound. Ask the server the way the boot chime does (pactl).
+static void pulse_sinks(void) {
+  FILE *p = popen("timeout 5 pactl list short sinks 2>&1", "r");
+  if (!p) {
+    info("pactl not runnable: %s", strerror(errno));
+    return;
+  }
+  char line[512];
+  int real = 0, null = 0, other = 0;
+  while (fgets(line, sizeof line, p)) {
+    size_t l = strlen(line);
+    if (l && line[l - 1] == '\n') line[l - 1] = '\0';
+    info("sink: %s", line);
+    if (strstr(line, "module-alsa-sink")) real++;
+    else if (strstr(line, "module-null-sink") || strstr(line, "auto_null")) null++;
+    else other++;
+  }
+  int rc = pclose(p);
+  if (rc != 0 && real + null + other == 0) {
+    info("pactl exited %d with no output", rc);
+    return;
+  }
+  g_pulse_sink_ok = real > 0;
+  check(real > 0, "a module-alsa-sink sink is loaded", "pactl list short sinks; only auto_null = streams play into silence", 0);
+  if (real == 0 && null > 0)
+    info("=> only the null sink: module-alsa-sink failed to load -- the reason is in the [daemon] log above");
+}
 
 static int is_socket(const char *path) {
   struct stat st;
@@ -889,6 +1183,7 @@ static void test_pulse(void) {
   check(c_want, "connect() to /run/pulse/native (what client.conf names)",
         "pa_context_connect(): this is the connect cubeb-pulse and every libpulse client make", have_want ? err : ENOENT);
   g_pulse_ok = c_want;
+  if (c_want) pulse_sinks();
 
   if (!c_want && have_sys) {
     int e2 = 0;
@@ -959,6 +1254,7 @@ int main(int argc, char **argv) {
   test_devices();
   test_oss();
   test_alsa_pcm();
+  test_alsa_timer();
   test_alsa_ctl();
   test_daemon();
   test_unix_socket();
@@ -970,7 +1266,10 @@ int main(int argc, char **argv) {
   // answers) then alsa. OpenCubeb() fails only when every backend fails.
   printf("  raw ALSA hw:%d: %s (what this probe drove directly)\n", g_card,
          g_alsa_pcm_ok ? "works" : "BROKEN above");
-  if (g_pulse_ok) printf("  cubeb-pulse: would initialise (server reachable)\n");
+  if (g_pulse_ok && g_pulse_sink_ok == 0)
+    printf("  cubeb-pulse: would initialise, but the server has NO real sink -> streams play into silence (see [pulse]/[daemon])\n");
+  else if (g_pulse_ok) printf("  cubeb-pulse: would initialise (server reachable%s)\n",
+                              g_pulse_sink_ok == 1 ? ", ALSA sink loaded" : "");
   else printf("  cubeb-pulse: would FAIL (no reachable server) -> Firefox falls through to alsa\n");
   // cubeb-alsa opens ALSA "default"; where asound.conf routes that into the
   // pulse plugin it lives or dies with the server, not with the raw hw path.
