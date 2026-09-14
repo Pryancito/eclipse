@@ -853,10 +853,11 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     // what alsa-lib (aplay, SDL, mpg123, …) talks to; /etc/asound.conf sets
     // "default" to hw:0,0 (S16LE stereo). Use `plug` for format conversion.
     {
-        use devfs::{CtlDev, PcmDev};
+        use devfs::{CtlDev, PcmDev, TimerDev};
         if !audio_cards.is_empty() {
             match devfs_root.add_dir("snd") {
                 Ok(snd_dir) => {
+                    let mut pcms: Vec<Arc<PcmDev>> = Vec::with_capacity(audio_cards.len());
                     for (card, audio) in audio_cards.iter().enumerate() {
                         let ctl = format!("controlC{}", card);
                         let pcm = format!("pcmC{}D0p", card);
@@ -871,11 +872,18 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                         {
                             warn!("failed to mknod /dev/snd/{}: {:?}", ctl, e);
                         }
-                        if let Err(e) =
-                            snd_dir.add(&pcm, Arc::new(PcmDev::new(audio.clone(), card)))
-                        {
+                        let pcm_dev = Arc::new(PcmDev::new(audio.clone(), card));
+                        pcms.push(pcm_dev.clone());
+                        if let Err(e) = snd_dir.add(&pcm, pcm_dev) {
                             warn!("failed to mknod /dev/snd/{}: {:?}", pcm, e);
                         }
+                    }
+                    // `/dev/snd/timer`: the PCM period timers alsa-lib binds
+                    // for `period_event` (PulseAudio's tsched=0 sinks open
+                    // it from snd_pcm_sw_params). One node, one instance per
+                    // open — see `TimerDev`.
+                    if let Err(e) = snd_dir.add("timer", Arc::new(TimerDev::new(pcms))) {
+                        warn!("failed to mknod /dev/snd/timer: {:?}", e);
                     }
                 }
                 Err(e) => warn!("failed to mkdir /dev/snd: {:?}", e),

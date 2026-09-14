@@ -16,5 +16,5 @@ pub use fbdev::FbDev;
 pub use input::{EventDev, MiceDev};
 pub use pty::{PtmxINode, PtsDir};
 pub use random::RandomINode;
-pub use snd::{CtlDev, PcmDev};
+pub use snd::{CtlDev, PcmDev, TimerDev};
 pub use uartdev::UartDev;
