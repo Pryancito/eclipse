@@ -679,6 +679,7 @@ struct snd_pcm_status {
 #define SNDRV_PCM_IOCTL_STATUS _IOC_(IOC_R, 'A', 0x20, sizeof(struct snd_pcm_status))
 #define SNDRV_PCM_IOCTL_DELAY _IOC_(IOC_R, 'A', 0x21, sizeof(int64_t))
 #define SNDRV_PCM_IOCTL_PREPARE _IOC_(IOC_NONE, 'A', 0x40, 0)
+#define SNDRV_PCM_IOCTL_DROP _IOC_(IOC_NONE, 'A', 0x43, 0)
 #define SNDRV_PCM_IOCTL_DRAIN _IOC_(IOC_NONE, 'A', 0x44, 0)
 #define SNDRV_PCM_IOCTL_WRITEI_FRAMES _IOC_(IOC_W, 'A', 0x50, sizeof(struct snd_xferi))
 
@@ -731,6 +732,7 @@ static void mask_only(struct snd_pcm_hw_params *p, int m, unsigned bit) {
 }
 
 static int g_alsa_pcm_ok;
+static int pcm_open_prepared(int oflags, unsigned *period, unsigned *buffer);
 
 static void test_alsa_pcm(void) {
   section("alsa-pcm");
@@ -878,6 +880,47 @@ static void test_alsa_pcm(void) {
     }
   }
   close(fd);
+
+  // 5. PulseAudio opens the hw PCM nonblocking and expects snd_pcm_writei() to
+  //    return what fits right now (or EAGAIN), never spin in-kernel waiting
+  //    for the whole request. A sink thread stuck in one WRITEI_FRAMES call
+  //    never gets back to snd_pcm_avail()/poll() to refill after an underrun.
+  unsigned nb_buffer = 0;
+  int nfd = pcm_open_prepared(O_WRONLY | O_NONBLOCK, &(unsigned){0}, &nb_buffer);
+  check(nfd >= 0, "open/prep O_NONBLOCK PCM for the short-write check",
+        "PulseAudio's module-alsa-sink opens hw:0,0 with SND_PCM_NONBLOCK", nfd < 0 ? -nfd : 0);
+  if (nfd >= 0) {
+    size_t fill_bytes = (size_t)(nb_buffer ? nb_buffer : 4096) * 4;
+    int16_t *silence = calloc(fill_bytes / sizeof *silence, sizeof *silence);
+    if (!silence) {
+      fail("allocate silence buffer", "calloc", errno);
+    } else {
+      struct snd_xferi fill = {0, (uint64_t)(uintptr_t)silence, nb_buffer ? nb_buffer : 4096};
+      int fr = ioctl(nfd, SNDRV_PCM_IOCTL_WRITEI_FRAMES, &fill);
+      int fe = errno;
+      check(fr == 0 && fill.result == (nb_buffer ? (int64_t)nb_buffer : 4096),
+            "nonblocking WRITEI fills one empty buffer", "baseline for the immediate short-write/EAGAIN check", fr != 0 ? fe : 0);
+
+      struct snd_xferi extra = {0, (uint64_t)(uintptr_t)silence, nb_buffer ? nb_buffer : 4096};
+      struct timespec t0;
+      clock_gettime(CLOCK_MONOTONIC, &t0);
+      int er = ioctl(nfd, SNDRV_PCM_IOCTL_WRITEI_FRAMES, &extra);
+      int ee = errno;
+      long ms = elapsed_us(&t0) / 1000;
+      check(ms < 500, "nonblocking WRITEI returns promptly on a full ring",
+            "Pulse's sink thread must get back to snd_pcm_avail()/poll(), not spin in one ioctl for seconds", 0);
+      check((er < 0 && ee == EAGAIN) || (er == 0 && extra.result > 0 && (uint64_t)extra.result < extra.frames),
+            "nonblocking WRITEI returns EAGAIN or a short count when the ring is full",
+            "Linux-style semantics for snd_pcm_writei() on SND_PCM_NONBLOCK fds", er < 0 ? ee : 0);
+      info("second O_NONBLOCK WRITEI returned in %ld ms with %s%lld frame%s", ms,
+           er < 0 ? "errno " : "",
+           er < 0 ? (long long)ee : (long long)extra.result,
+           (er == 0 && extra.result == 1) ? "" : "s");
+      ioctl(nfd, SNDRV_PCM_IOCTL_DROP, 0);
+      free(silence);
+    }
+    close(nfd);
+  }
   // Only a sequence that actually ran and passed counts: a skipped section
   // (node absent) must not read as a working backend.
   g_alsa_pcm_ok = (g_fail == fail_at_entry);
@@ -940,10 +983,10 @@ struct snd_timer_tread {
 // Quiet counterpart of the [alsa-pcm] sequence: open, S16LE/2ch/48000 with
 // the sizes left to the kernel, Pulse's sw_params (avail_min 1, never
 // auto-start), PREPARE. Returns the fd or -errno; granted sizes in frames.
-static int pcm_open_prepared(unsigned *period, unsigned *buffer) {
+static int pcm_open_prepared(int oflags, unsigned *period, unsigned *buffer) {
   char path[64];
   snprintf(path, sizeof path, "/dev/snd/pcmC%dD0p", g_card);
-  int fd = open(path, O_WRONLY);
+  int fd = open(path, oflags);
   if (fd < 0) return -errno;
   struct snd_pcm_hw_params hp;
   hw_params_any(&hp);
@@ -1039,7 +1082,7 @@ static void test_alsa_timer(void) {
 
   // Now run the PCM (silence, one buffer) and expect the tick.
   unsigned period = 0, buffer = 0;
-  int pfd = pcm_open_prepared(&period, &buffer);
+  int pfd = pcm_open_prepared(O_WRONLY, &period, &buffer);
   check(pfd >= 0, "PCM opened, configured and PREPAREd for the tick test", "same hw_params as [alsa-pcm]", pfd < 0 ? -pfd : 0);
   if (pfd >= 0) {
     long period_ms = period ? (long)period * 1000 / TONE_RATE : 0;
