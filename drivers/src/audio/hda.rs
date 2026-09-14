@@ -392,6 +392,14 @@ struct HdaInner {
     stat_underruns: u64,
     stat_restarts: u64,
     stat_stop_timeouts: u64,
+    /// Position-register reads (WALCLK + LPIB per poll) timed: how many, the
+    /// slowest, and how many took over 1 ms. Under a hypervisor each read is
+    /// a VM exit serviced by the emulator's main loop; one that waits behind
+    /// a busy display thread stalls this CPU for as long as it waits, and it
+    /// shows here before it shows as an underrun.
+    stat_pos_reads: u64,
+    stat_pos_read_max_us: u64,
+    stat_pos_reads_slow: u64,
     /// Position reads rejected as impossible: more progress than the PCM
     /// byte rate allows in the time since the last accepted read. A stream
     /// whose position register or buffer occasionally returns garbage --
@@ -616,6 +624,7 @@ impl HdaInner {
         // registers still serve as a cap: the link cannot have played what
         // the engine has not fetched, so if the engine stalls the clock
         // estimate cannot run away from it.
+        let t_read = timer_now_as_micros();
         let wall = mmio_r32(self.bar, REG_WALCLK);
         self.wall_ticks += wall.wrapping_sub(self.wall_last) as u64;
         self.wall_last = wall;
@@ -631,6 +640,14 @@ impl HdaInner {
         // through.
         let max_advance = (dt_us.saturating_mul(rate_bytes) / 1_000_000) as usize + POS_SLACK;
         let lpib_raw = self.lpib();
+        let read_us = timer_now_as_micros().wrapping_sub(t_read);
+        self.stat_pos_reads += 1;
+        if read_us > self.stat_pos_read_max_us {
+            self.stat_pos_read_max_us = read_us;
+        }
+        if read_us > 1000 {
+            self.stat_pos_reads_slow += 1;
+        }
         let lpib = lpib_raw as usize % ring;
         let advanced = (lpib + ring - self.last_lpib as usize % ring) % ring;
         let lpib_ok = if advanced > max_advance {
@@ -1525,6 +1542,9 @@ impl HdaDevice {
             stat_underruns: 0,
             stat_restarts: 0,
             stat_stop_timeouts: 0,
+            stat_pos_reads: 0,
+            stat_pos_read_max_us: 0,
+            stat_pos_reads_slow: 0,
             stat_bad_pos: 0,
             last_bad_pos: 0,
             last_bad_prev: 0,
@@ -1828,6 +1848,18 @@ impl AudioScheme for HdaDevice {
                 )
             } else {
                 String::new()
+            }
+        );
+        let _ = writeln!(
+            out,
+            "[gpusnd] position reads: {}, slowest {} us, {} over 1 ms{}",
+            inner.stat_pos_reads,
+            inner.stat_pos_read_max_us,
+            inner.stat_pos_reads_slow,
+            if inner.stat_pos_reads_slow > 0 {
+                " (VM exits waiting on the host?)"
+            } else {
+                ""
             }
         );
         let _ = writeln!(

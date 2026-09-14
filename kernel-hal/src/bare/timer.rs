@@ -570,6 +570,14 @@ hal_fn_impl! {
 
             let now = timer_now();
 
+            // Gap since this CPU's previous tick: a CPU that did not run for
+            // tens of ms shows up here (see `kstats::note_tick_gap`).
+            #[cfg(target_arch = "x86_64")]
+            crate::kstats::note_tick_gap(
+                duration_to_ns(now),
+                super::arch::timer::fast_tick_ns(),
+            );
+
             // Maintain the cross-CPU monotonic floor (and watch for TSC skew)
             // at tick rate, so `timer_now()`'s invariant-TSC fast path can skip
             // the globally-contended RMW on every clock read.
