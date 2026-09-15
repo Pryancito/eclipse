@@ -114,9 +114,17 @@ pub fn clear_net_rx_waker(waker: &Waker) {
 }
 
 /// [diag] Rate-limit interval (ns) for net-waiter wakeups — coalesce the smoltcp
-/// housekeeping busy-spin to ≤1 kHz without dropping any wake (TX/connect/DHCP
-/// still delivered within the interval; waiters keep their fallback timers).
-const NET_WAKE_MIN_INTERVAL_NS: u64 = 1_000_000;
+/// housekeeping busy-spin without dropping any wake (TX/connect/DHCP still
+/// delivered within the interval; waiters keep their fallback timers).
+///
+/// 250 µs (≤4 kHz), not the old 1 ms: `wake_net_rx_waiters()` only fires when a
+/// poll actually drained RX (`had_rx`), so this throttle is purely capping how
+/// promptly a blocking reader is woken when its bytes land. At 1 ms a reader
+/// whose wake was coalesced away fell back to its (jitter-prone) park timer,
+/// stretching the ACK self-clock — part of the residual ~1.2 Mbps cap. 250 µs
+/// still bounds a wake storm but lets the reader resume within a fraction of an
+/// MSS's arrival time.
+const NET_WAKE_MIN_INTERVAL_NS: u64 = 250_000;
 static LAST_NET_WAKE_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Wake tasks registered for TCP/UDP RX (and any other net progress).
