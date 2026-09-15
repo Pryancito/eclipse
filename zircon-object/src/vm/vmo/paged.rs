@@ -784,49 +784,51 @@ impl core::ops::DerefMut for InnerGuardMut<'_> {
 impl VMObjectTrait for VMObjectPaged {
     fn read(&self, offset: usize, buf: &mut [u8]) -> ZxResult {
         let mut range_changes = Vec::new();
-        let ret = {
+        let ret = (|| {
             let mut inner = self.get_inner_mut();
             if inner.cache_policy != CachePolicy::Cached {
-                return Err(ZxError::BAD_STATE);
+                Err(ZxError::BAD_STATE)
+            } else {
+                inner.for_each_page(
+                    offset,
+                    buf.len(),
+                    MMUFlags::READ,
+                    &mut range_changes,
+                    |paddr, buf_range| {
+                        kernel_hal::mem::pmem_read(paddr, &mut buf[buf_range]);
+                    },
+                )
             }
-            inner.for_each_page(
-                offset,
-                buf.len(),
-                MMUFlags::READ,
-                &mut range_changes,
-                |paddr, buf_range| {
-                    kernel_hal::mem::pmem_read(paddr, &mut buf[buf_range]);
-                },
-            )
-        };
+        })();
         apply_deferred_range_changes(range_changes);
         ret
     }
 
     fn write(&self, offset: usize, buf: &[u8]) -> ZxResult {
         let mut range_changes = Vec::new();
-        let ret = {
+        let ret = (|| {
             let mut inner = self.get_inner_mut();
             if inner.cache_policy != CachePolicy::Cached {
-                return Err(ZxError::BAD_STATE);
+                Err(ZxError::BAD_STATE)
+            } else {
+                inner.for_each_page(
+                    offset,
+                    buf.len(),
+                    MMUFlags::WRITE,
+                    &mut range_changes,
+                    |paddr, buf_range| {
+                        kernel_hal::mem::pmem_write(paddr, &buf[buf_range]);
+                    },
+                )
             }
-            inner.for_each_page(
-                offset,
-                buf.len(),
-                MMUFlags::WRITE,
-                &mut range_changes,
-                |paddr, buf_range| {
-                    kernel_hal::mem::pmem_write(paddr, &buf[buf_range]);
-                },
-            )
-        };
+        })();
         apply_deferred_range_changes(range_changes);
         ret
     }
 
     fn zero(&self, offset: usize, len: usize) -> ZxResult {
         let mut range_changes = Vec::new();
-        let ret = {
+        let ret = (|| {
             let mut inner = self.get_inner_mut();
             if offset + len > inner.size {
                 return Err(ZxError::OUT_OF_RANGE);
@@ -852,7 +854,7 @@ impl VMObjectTrait for VMObjectPaged {
             }
             inner.release_unwanted_pages_in_parent(unwanted);
             Ok(())
-        };
+        })();
         apply_deferred_range_changes(range_changes);
         ret
     }
@@ -911,13 +913,13 @@ impl VMObjectTrait for VMObjectPaged {
         let start_page = offset / PAGE_SIZE;
         let pages = len / PAGE_SIZE;
         let mut range_changes = Vec::new();
-        let ret = {
+        let ret = (|| {
             let mut inner = self.get_inner_mut();
             for i in 0..pages {
                 inner.commit_page(start_page + i, MMUFlags::WRITE, &mut range_changes)?;
             }
             Ok(())
-        };
+        })();
         apply_deferred_range_changes(range_changes);
         ret
     }
@@ -965,12 +967,12 @@ impl VMObjectTrait for VMObjectPaged {
         assert!(page_aligned(offset));
         assert!(page_aligned(len));
         let mut range_changes = Vec::new();
-        let child = {
+        let child = (|| {
             let mut inner = self.get_inner_mut();
-            inner.create_child(offset, len, &self.lock, &mut range_changes)?
-        };
+            inner.create_child(offset, len, &self.lock, &mut range_changes)
+        })();
         apply_deferred_range_changes(range_changes);
-        Ok(child)
+        Ok(child?)
     }
 
     fn append_mapping(&self, mapping: Weak<VmMapping>) {
