@@ -4,12 +4,13 @@ use {
     crate::object::*,
     alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec},
     bitflags::bitflags,
+    core::mem::ManuallyDrop,
     core::sync::atomic::{AtomicBool, AtomicU64, Ordering},
     kernel_hal::vm::{
         GenericPageTable, IgnoreNotMappedErr, Page, PageSize, PageTable, PagingError, PagingResult,
         BASE_PAGE_SIZE,
     },
-    lock::Mutex,
+    lock::{Mutex, MutexGuard},
 };
 
 /// Master switch for copy-on-write `fork` — on by default, disabled with
@@ -1952,6 +1953,60 @@ struct VmMappingInner {
     vmo_offset: usize,
 }
 
+/// A VmMapping lock held by ownership of an `Arc`, so fork can keep alias
+/// mappings quiesced across a VMO-family reshape without holding the family
+/// lock while it waits for a contended mapper.
+pub(super) struct HeldVmMappingLock {
+    inner: ManuallyDrop<MutexGuard<'static, VmMappingInner>>,
+    map: Arc<VmMapping>,
+}
+
+fn apply_range_change_locked(
+    map: &VmMapping,
+    inner: &VmMappingInner,
+    offset: usize,
+    len: usize,
+    op: RangeChangeOp,
+) {
+    let vmo_page = inner.vmo_offset / PAGE_SIZE;
+    let start = offset.max(vmo_page);
+    let end = (vmo_page + inner.size / PAGE_SIZE).min(offset + len);
+    if !(start..end).is_empty() {
+        let mut pg_table = map.page_table.lock();
+        for i in (start - vmo_page)..(end - vmo_page) {
+            match op {
+                RangeChangeOp::RemoveWrite => {
+                    let mut new_flag = inner.flags[i];
+                    new_flag.remove(MMUFlags::WRITE);
+                    pg_table
+                        .update_no_shootdown(inner.addr + i * PAGE_SIZE, None, Some(new_flag))
+                        .ignore()
+                        .unwrap();
+                }
+                RangeChangeOp::Unmap => {
+                    pg_table
+                        .unmap_no_shootdown(inner.addr + i * PAGE_SIZE)
+                        .ignore()
+                        .unwrap();
+                }
+            };
+        }
+        pg_table.remote_flush_all();
+    }
+}
+
+impl HeldVmMappingLock {
+    pub(super) fn range_change(&mut self, offset: usize, len: usize, op: RangeChangeOp) {
+        apply_range_change_locked(&self.map, &self.inner, offset, len, op);
+    }
+}
+
+impl Drop for HeldVmMappingLock {
+    fn drop(&mut self) {
+        unsafe { ManuallyDrop::drop(&mut self.inner) };
+    }
+}
+
 /// Statistics about resources (e.g., memory) used by a task.
 #[repr(C)]
 #[derive(Default)]
@@ -2067,6 +2122,22 @@ impl VmMapping {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn hold_lock(self: &Arc<Self>) -> HeldVmMappingLock {
+        // SAFETY: the guard borrows `self.inner`; the returned struct also owns
+        // a cloned `Arc<Self>`, keeping that allocation (and thus `inner`) alive
+        // until the guard's Drop runs and releases the lock.
+        let inner = unsafe {
+            core::mem::transmute::<
+                MutexGuard<'_, VmMappingInner>,
+                MutexGuard<'static, VmMappingInner>,
+            >(self.inner.lock())
+        };
+        HeldVmMappingLock {
+            inner: ManuallyDrop::new(inner),
+            map: self.clone(),
+        }
     }
 
     fn map(self: &Arc<Self>) -> ZxResult {
@@ -2454,31 +2525,7 @@ impl VmMapping {
     /// mapping lock instead of skipping a contended mapper.
     pub(super) fn range_change_blocking(&self, offset: usize, len: usize, op: RangeChangeOp) {
         let inner = self.inner.lock();
-        let vmo_page = inner.vmo_offset / PAGE_SIZE;
-        let start = offset.max(vmo_page);
-        let end = (vmo_page + inner.size / PAGE_SIZE).min(offset + len);
-        if !(start..end).is_empty() {
-            let mut pg_table = self.page_table.lock();
-            for i in (start - vmo_page)..(end - vmo_page) {
-                match op {
-                    RangeChangeOp::RemoveWrite => {
-                        let mut new_flag = inner.flags[i];
-                        new_flag.remove(MMUFlags::WRITE);
-                        pg_table
-                            .update_no_shootdown(inner.addr + i * PAGE_SIZE, None, Some(new_flag))
-                            .ignore()
-                            .unwrap();
-                    }
-                    RangeChangeOp::Unmap => {
-                        pg_table
-                            .unmap_no_shootdown(inner.addr + i * PAGE_SIZE)
-                            .ignore()
-                            .unwrap();
-                    }
-                };
-            }
-            pg_table.remote_flush_all();
-        }
+        apply_range_change_locked(self, &inner, offset, len, op);
     }
 
     /// Handle page fault happened on this VmMapping.
@@ -2737,13 +2784,14 @@ impl VmMapping {
             return None;
         }
         let child = self.vmo.create_child(false, 0, self.vmo.len()).ok()?;
-        // `create_child` now drains a blocking RemoveWrite pass for every alias
-        // of the parent VMO after dropping the family lock. Re-apply it here on
-        // the mapping being cloned anyway: `clone_map` holds neither this
-        // mapping's `inner` nor the page table, so the pass cannot deadlock,
-        // and keeping the explicit local write-protect preserves the old
-        // belt-and-suspenders guarantee for the exact mapping the fork is
-        // cloning.
+        // `create_child` now write-protects every alias BEFORE it publishes the
+        // hidden-node reshape, holding those alias mapping locks across the
+        // publication so no write fault can sneak a writable PTE back onto the
+        // old tree. Re-apply it here on the mapping being cloned anyway:
+        // `clone_map` holds neither this mapping's `inner` nor the page table,
+        // so the pass cannot deadlock, and keeping the explicit local
+        // write-protect preserves the old belt-and-suspenders guarantee for the
+        // exact mapping the fork is cloning.
         self.protect_for_cow();
         Some(child)
     }

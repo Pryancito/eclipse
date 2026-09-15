@@ -80,6 +80,23 @@ impl DeferredRangeChange {
     }
 }
 
+struct CreateChildWriteProtect {
+    _held: Vec<HeldVmMappingLock>,
+}
+
+impl CreateChildWriteProtect {
+    fn new(mappings: Vec<Arc<VmMapping>>, offset: usize, len: usize) -> Self {
+        let mut held = Vec::with_capacity(mappings.len());
+        for map in mappings {
+            held.push(map.hold_lock());
+        }
+        for map in held.iter_mut() {
+            map.range_change(offset, len, RangeChangeOp::RemoveWrite);
+        }
+        Self { _held: held }
+    }
+}
+
 fn apply_deferred_range_changes(range_changes: Vec<DeferredRangeChange>) {
     for range_change in range_changes {
         range_change.apply();
@@ -966,12 +983,29 @@ impl VMObjectTrait for VMObjectPaged {
     fn create_child(&self, offset: usize, len: usize) -> ZxResult<Arc<dyn VMObjectTrait>> {
         assert!(page_aligned(offset));
         assert!(page_aligned(len));
-        let mut range_changes = Vec::new();
-        let child = (|| {
-            let mut inner = self.get_inner_mut();
-            inner.create_child(offset, len, &self.lock, &mut range_changes)
-        })();
-        apply_deferred_range_changes(range_changes);
+        let (mappings, dead) = {
+            let inner = self.get_inner();
+            inner.validate_create_child()?;
+            let len_before = inner.mappings.len() as u64;
+            MAP_LIST_SCANS.fetch_add(1, Ordering::Relaxed);
+            MAP_LIST_ENTRIES.fetch_add(len_before, Ordering::Relaxed);
+            MAP_LIST_MAX.fetch_max(len_before, Ordering::Relaxed);
+            inner.collect_live_mappings()
+        };
+        if dead != 0 {
+            MAP_LIST_DEAD.fetch_add(dead, Ordering::Relaxed);
+        }
+        // Fork correctness differs from deferred Unmap: the pages are still
+        // live. Take every alias mapping lock outside the family lock, drop
+        // WRITE from its current PTEs, and KEEP those mapping locks held until
+        // the hidden-node reshape below is published. With the PTEs read-only
+        // and the mappings quiesced, no writer can slip a writable re-fault
+        // back in on the old tree during the publication gap.
+        let write_protect = CreateChildWriteProtect::new(mappings, pages(offset), pages(len));
+        let mut inner = self.get_inner_mut();
+        let child = inner.create_child(offset, len, &self.lock);
+        drop(inner);
+        drop(write_protect);
         Ok(child?)
     }
 
@@ -1170,6 +1204,26 @@ enum CommitResult {
 }
 
 impl VMObjectPagedInner {
+    fn validate_create_child(&self) -> ZxResult {
+        // clone contiguous vmo is no longer permitted
+        // https://fuchsia.googlesource.com/fuchsia/+/e6b4c6751bbdc9ed2795e81b8211ea294f139a45
+        if self.is_contiguous() {
+            return Err(ZxError::INVALID_ARGS);
+        }
+        if self.cache_policy != CachePolicy::Cached || self.pin_count != 0 {
+            return Err(ZxError::BAD_STATE);
+        }
+        // A page-cache borrower must never enter the hidden-node tree: the
+        // hidden parent would take over page resolution and knows nothing of
+        // the cache, so the child's clean pages would silently read as zeros.
+        // Refusing here makes COW-fork (`try_cow_child`) fall back to the
+        // eager `fork_copy`, which carries the borrow correctly.
+        if self.cache.is_some() {
+            return Err(ZxError::NOT_SUPPORTED);
+        }
+        Ok(())
+    }
+
     /// Helper function to split range into sub-ranges within pages.
     ///
     /// All covered pages will be committed implicitly.
@@ -1454,6 +1508,19 @@ impl VMObjectPagedInner {
         dead
     }
 
+    fn collect_live_mappings(&self) -> (Vec<Arc<VmMapping>>, u64) {
+        let mut dead = 0;
+        let mut mappings = Vec::with_capacity(self.mappings.len());
+        for map in self.mappings.iter() {
+            if let Some(map) = map.upgrade() {
+                mappings.push(map);
+            } else {
+                dead += 1;
+            }
+        }
+        (mappings, dead)
+    }
+
     fn collect_range_change(
         &self,
         parent_offset: usize,
@@ -1652,24 +1719,8 @@ impl VMObjectPagedInner {
         offset: usize,
         len: usize,
         lock_ref: &Arc<Mutex<()>>,
-        range_changes: &mut Vec<DeferredRangeChange>,
     ) -> ZxResult<Arc<VMObjectPaged>> {
-        // clone contiguous vmo is no longer permitted
-        // https://fuchsia.googlesource.com/fuchsia/+/e6b4c6751bbdc9ed2795e81b8211ea294f139a45
-        if self.is_contiguous() {
-            return Err(ZxError::INVALID_ARGS);
-        }
-        if self.cache_policy != CachePolicy::Cached || self.pin_count != 0 {
-            return Err(ZxError::BAD_STATE);
-        }
-        // A page-cache borrower must never enter the hidden-node tree: the
-        // hidden parent would take over page resolution and knows nothing of
-        // the cache, so the child's clean pages would silently read as zeros.
-        // Refusing here makes COW-fork (`try_cow_child`) fall back to the
-        // eager `fork_copy`, which carries the borrow correctly.
-        if self.cache.is_some() {
-            return Err(ZxError::NOT_SUPPORTED);
-        }
+        self.validate_create_child()?;
         // create child VMO
         let child = VMObjectPaged::wrap(
             VMObjectPagedInner {
@@ -1734,20 +1785,6 @@ impl VMObjectPagedInner {
         self.parent_offset = 0;
         self.parent_limit = self.size;
         child.inner.borrow_mut().parent = Some(hidden);
-        // update mappings, for COW, remove write flags in PageTable
-        let len_before = self.mappings.len() as u64;
-        MAP_LIST_SCANS.fetch_add(1, Ordering::Relaxed);
-        MAP_LIST_ENTRIES.fetch_add(len_before, Ordering::Relaxed);
-        MAP_LIST_MAX.fetch_max(len_before, Ordering::Relaxed);
-        let dead = self.collect_mapping_range_changes(
-            pages(offset),
-            pages(len),
-            RangeChangeOp::RemoveWrite,
-            range_changes,
-        );
-        if dead != 0 {
-            MAP_LIST_DEAD.fetch_add(dead, Ordering::Relaxed);
-        }
         Ok(child)
     }
 
