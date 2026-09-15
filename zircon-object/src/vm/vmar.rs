@@ -4,13 +4,12 @@ use {
     crate::object::*,
     alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec},
     bitflags::bitflags,
-    core::mem::ManuallyDrop,
     core::sync::atomic::{AtomicBool, AtomicU64, Ordering},
     kernel_hal::vm::{
         GenericPageTable, IgnoreNotMappedErr, Page, PageSize, PageTable, PagingError, PagingResult,
         BASE_PAGE_SIZE,
     },
-    lock::{Mutex, MutexGuard},
+    lock::Mutex,
 };
 
 /// Master switch for copy-on-write `fork` — on by default, disabled with
@@ -1953,14 +1952,6 @@ struct VmMappingInner {
     vmo_offset: usize,
 }
 
-/// A VmMapping lock held by ownership of an `Arc`, so fork can keep alias
-/// mappings quiesced across a VMO-family reshape without holding the family
-/// lock while it waits for a contended mapper.
-pub(super) struct HeldVmMappingLock {
-    inner: ManuallyDrop<MutexGuard<'static, VmMappingInner>>,
-    map: Arc<VmMapping>,
-}
-
 fn apply_range_change_locked(
     map: &VmMapping,
     inner: &VmMappingInner,
@@ -1992,18 +1983,6 @@ fn apply_range_change_locked(
             };
         }
         pg_table.remote_flush_all();
-    }
-}
-
-impl HeldVmMappingLock {
-    pub(super) fn range_change(&mut self, offset: usize, len: usize, op: RangeChangeOp) {
-        apply_range_change_locked(&self.map, &self.inner, offset, len, op);
-    }
-}
-
-impl Drop for HeldVmMappingLock {
-    fn drop(&mut self) {
-        unsafe { ManuallyDrop::drop(&mut self.inner) };
     }
 }
 
@@ -2122,22 +2101,6 @@ impl VmMapping {
             }
         }
         Ok(())
-    }
-
-    pub(super) fn hold_lock(self: &Arc<Self>) -> HeldVmMappingLock {
-        // SAFETY: the guard borrows `self.inner`; the returned struct also owns
-        // a cloned `Arc<Self>`, keeping that allocation (and thus `inner`) alive
-        // until the guard's Drop runs and releases the lock.
-        let inner = unsafe {
-            core::mem::transmute::<
-                MutexGuard<'_, VmMappingInner>,
-                MutexGuard<'static, VmMappingInner>,
-            >(self.inner.lock())
-        };
-        HeldVmMappingLock {
-            inner: ManuallyDrop::new(inner),
-            map: self.clone(),
-        }
     }
 
     fn map(self: &Arc<Self>) -> ZxResult {
@@ -2531,6 +2494,11 @@ impl VmMapping {
     /// Handle page fault happened on this VmMapping.
     pub(crate) fn handle_page_fault(&self, vaddr: VirtAddr, access_flags: MMUFlags) -> ZxResult {
         let vaddr = round_down_pages(vaddr);
+        let cow_fault_seq = if access_flags.contains(MMUFlags::WRITE) {
+            self.vmo.cow_fault_seq()
+        } else {
+            0
+        };
         // Resolved BEFORE taking `self.inner`: it acquires the VMO family lock,
         // and the established discipline is to never hold the mapping lock
         // while taking a VMO lock.
@@ -2602,6 +2570,12 @@ impl VmMapping {
                 || (vaddr - inner.addr) + inner.vmo_offset != vmo_offset
             {
                 return Ok(());
+            }
+            if access_flags.contains(MMUFlags::WRITE) {
+                let seq_after = self.vmo.cow_fault_seq();
+                if seq_after != cow_fault_seq || (seq_after & 1) != 0 {
+                    return Ok(());
+                }
             }
             let mut pg_table = self.page_table.lock();
             let mut res = pg_table.map(Page::new_aligned(vaddr, PageSize::Size4K), paddr, flags);
@@ -2784,13 +2758,14 @@ impl VmMapping {
             return None;
         }
         let child = self.vmo.create_child(false, 0, self.vmo.len()).ok()?;
-        // `create_child` now write-protects every alias BEFORE it publishes the
-        // hidden-node reshape, holding those alias mapping locks across the
-        // publication so no write fault can sneak a writable PTE back onto the
-        // old tree. Re-apply it here on the mapping being cloned anyway:
-        // `clone_map` holds neither this mapping's `inner` nor the page table,
-        // so the pass cannot deadlock, and keeping the explicit local
-        // write-protect preserves the old belt-and-suspenders guarantee for the
+        // `create_child` now marks the VMO's fork write-protect window in a
+        // sequence counter before it drops WRITE from every alias mapping and
+        // publishes the hidden-node reshape. Any concurrent write fault that
+        // races that window rechecks the sequence after `commit_page(WRITE)` and
+        // retries instead of installing a writable PTE onto a now-shared frame.
+        // Re-apply the local protect here anyway: `clone_map` holds neither this
+        // mapping's `inner` nor the page table, so the pass cannot deadlock, and
+        // keeping it preserves the old belt-and-suspenders guarantee for the
         // exact mapping the fork is cloning.
         self.protect_for_cow();
         Some(child)
@@ -3329,6 +3304,81 @@ mod tests {
         vmo.test_write(0, 2);
         assert_eq!(vmo.test_read(0), 2);
         assert_eq!(child_vmo.test_read(0), 1);
+    }
+
+    #[test]
+    fn create_child_serializes_publish_window() {
+        use std::{sync::mpsc, time::Duration};
+
+        let vmar = VmAddressRegion::new_root_zircon();
+        let vmo = VmObject::new_paged(1);
+        vmo.test_write(0, 1);
+        vmar.map_at(0, vmo.clone(), 0, PAGE_SIZE, MMUFlags::RXW)
+            .unwrap();
+        vmar.map_at(PAGE_SIZE, vmo.clone(), 0, PAGE_SIZE, MMUFlags::RXW)
+            .unwrap();
+        let alias = vmar.find_mapping(vmar.addr() + PAGE_SIZE).unwrap();
+
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (first_tx, first_rx) = mpsc::channel();
+        let (second_tx, second_rx) = mpsc::channel();
+        let mut first_child = None;
+        let mut second_child = None;
+        std::thread::scope(|s| {
+            let alias = alias.clone();
+            s.spawn(move || {
+                let _guard = alias.inner.lock();
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            locked_rx.recv().unwrap();
+
+            let first_vmo = vmo.clone();
+            s.spawn(move || {
+                first_tx
+                    .send(first_vmo.create_child(false, 0, PAGE_SIZE))
+                    .unwrap();
+            });
+            assert!(
+                first_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                "first create_child should be waiting for the contended alias mapping"
+            );
+
+            let second_vmo = vmo.clone();
+            s.spawn(move || {
+                second_tx
+                    .send(second_vmo.create_child(false, 0, PAGE_SIZE))
+                    .unwrap();
+            });
+            assert!(
+                second_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                "second create_child should wait behind the in-progress publish window"
+            );
+
+            release_tx.send(()).unwrap();
+            first_child = Some(
+                first_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap(),
+            );
+            second_child = Some(
+                second_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap(),
+            );
+        });
+
+        let first_child = first_child.unwrap();
+        let second_child = second_child.unwrap();
+        assert_eq!(first_child.test_read(0), 1);
+        assert_eq!(second_child.test_read(0), 1);
+        vmo.test_write(0, 2);
+        assert_eq!(vmo.test_read(0), 2);
+        assert_eq!(first_child.test_read(0), 1);
+        assert_eq!(second_child.test_read(0), 1);
     }
 
     /// A decommitted page is gone for every mapper: the object's own mapping

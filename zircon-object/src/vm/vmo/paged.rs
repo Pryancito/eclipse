@@ -80,20 +80,34 @@ impl DeferredRangeChange {
     }
 }
 
-struct CreateChildWriteProtect {
-    _held: Vec<HeldVmMappingLock>,
+struct CowFaultSeqGuard<'a> {
+    seq: &'a AtomicU64,
 }
 
-impl CreateChildWriteProtect {
-    fn new(mappings: Vec<Arc<VmMapping>>, offset: usize, len: usize) -> Self {
-        let mut held = Vec::with_capacity(mappings.len());
-        for map in mappings {
-            held.push(map.hold_lock());
+impl<'a> CowFaultSeqGuard<'a> {
+    fn try_begin(seq: &'a AtomicU64) -> Option<Self> {
+        let mut current = seq.load(Ordering::Acquire);
+        loop {
+            if (current & 1) != 0 {
+                return None;
+            }
+            match seq.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self { seq }),
+                Err(next) => current = next,
+            }
         }
-        for map in held.iter_mut() {
-            map.range_change(offset, len, RangeChangeOp::RemoveWrite);
-        }
-        Self { _held: held }
+    }
+}
+
+impl Drop for CowFaultSeqGuard<'_> {
+    fn drop(&mut self) {
+        let prev = self.seq.fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(prev & 1, 1);
     }
 }
 
@@ -197,6 +211,11 @@ pub struct VMObjectPaged {
     /// about its borrowers. Leaf lock: taken briefly, never with another
     /// lock taken inside it.
     borrower_maps: Mutex<Vec<(Weak<VmMapping>, usize)>>,
+    /// Even when quiescent; odd while `create_child` has dropped the family
+    /// lock to write-protect alias PTEs before publishing the hidden-node
+    /// reshape. Write faults that see a change (or an odd value) retry rather
+    /// than installing a writable PTE onto a frame that may have become shared.
+    cow_fault_seq: AtomicU64,
 }
 
 /// We always lock the lock before access to the Refcell, so it is actually sync
@@ -480,6 +499,7 @@ impl VMObjectPaged {
             inner: RefCell::new(inner),
             shared: core::sync::atomic::AtomicBool::new(false),
             borrower_maps: Mutex::new(Vec::new()),
+            cow_fault_seq: AtomicU64::new(0),
         });
         obj.inner.borrow_mut().self_ref = Arc::downgrade(&obj);
         obj
@@ -983,29 +1003,37 @@ impl VMObjectTrait for VMObjectPaged {
     fn create_child(&self, offset: usize, len: usize) -> ZxResult<Arc<dyn VMObjectTrait>> {
         assert!(page_aligned(offset));
         assert!(page_aligned(len));
-        let (mappings, dead) = {
+        let (mappings, dead, cow_fault_guard) = loop {
             let inner = self.get_inner();
             inner.validate_create_child()?;
-            let len_before = inner.mappings.len() as u64;
-            MAP_LIST_SCANS.fetch_add(1, Ordering::Relaxed);
-            MAP_LIST_ENTRIES.fetch_add(len_before, Ordering::Relaxed);
-            MAP_LIST_MAX.fetch_max(len_before, Ordering::Relaxed);
-            inner.collect_live_mappings()
+            if let Some(cow_fault_guard) = CowFaultSeqGuard::try_begin(&self.cow_fault_seq) {
+                let len_before = inner.mappings.len() as u64;
+                MAP_LIST_SCANS.fetch_add(1, Ordering::Relaxed);
+                MAP_LIST_ENTRIES.fetch_add(len_before, Ordering::Relaxed);
+                MAP_LIST_MAX.fetch_max(len_before, Ordering::Relaxed);
+                let (mappings, dead) = inner.collect_live_mappings();
+                break (mappings, dead, cow_fault_guard);
+            }
+            drop(inner);
+            core::hint::spin_loop();
         };
         if dead != 0 {
             MAP_LIST_DEAD.fetch_add(dead, Ordering::Relaxed);
         }
         // Fork correctness differs from deferred Unmap: the pages are still
-        // live. Take every alias mapping lock outside the family lock, drop
-        // WRITE from its current PTEs, and KEEP those mapping locks held until
-        // the hidden-node reshape below is published. With the PTEs read-only
-        // and the mappings quiesced, no writer can slip a writable re-fault
-        // back in on the old tree during the publication gap.
-        let write_protect = CreateChildWriteProtect::new(mappings, pages(offset), pages(len));
+        // live. Mark the VMO's fork window in `cow_fault_seq`, then drop WRITE
+        // from every alias mapping with blocking locks OUTSIDE the family lock.
+        // Any write fault that races this odd sequence retries after
+        // `commit_page(WRITE)` instead of re-installing a writable PTE on the
+        // old tree; once the PTEs are read-only, publishing the hidden-node
+        // reshape below is safe.
+        for map in mappings {
+            map.range_change_blocking(pages(offset), pages(len), RangeChangeOp::RemoveWrite);
+        }
         let mut inner = self.get_inner_mut();
         let child = inner.create_child(offset, len, &self.lock);
         drop(inner);
-        drop(write_protect);
+        drop(cow_fault_guard);
         Ok(child?)
     }
 
@@ -1027,6 +1055,10 @@ impl VMObjectTrait for VMObjectPaged {
 
     fn is_shared(&self) -> bool {
         self.shared.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn cow_fault_seq(&self) -> u64 {
+        self.cow_fault_seq.load(Ordering::Acquire)
     }
 
     fn register_borrower_mapping(&self, mapping: Weak<VmMapping>, base_page: usize) {
