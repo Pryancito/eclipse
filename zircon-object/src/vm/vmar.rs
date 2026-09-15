@@ -2495,6 +2495,37 @@ impl VmMapping {
         }
     }
 
+    /// Guaranteed variant of [`range_change`]: waits for the mapping lock
+    /// instead of skipping on contention.
+    pub(super) fn range_change_blocking(&self, offset: usize, len: usize, op: RangeChangeOp) {
+        let inner = self.inner.lock();
+        let vmo_page = inner.vmo_offset / PAGE_SIZE;
+        let start = offset.max(vmo_page);
+        let end = (vmo_page + inner.size / PAGE_SIZE).min(offset + len);
+        if !(start..end).is_empty() {
+            let mut pg_table = self.page_table.lock();
+            for i in (start - vmo_page)..(end - vmo_page) {
+                match op {
+                    RangeChangeOp::RemoveWrite => {
+                        let mut new_flag = inner.flags[i];
+                        new_flag.remove(MMUFlags::WRITE);
+                        pg_table
+                            .update_no_shootdown(inner.addr + i * PAGE_SIZE, None, Some(new_flag))
+                            .ignore()
+                            .unwrap();
+                    }
+                    RangeChangeOp::Unmap => {
+                        pg_table
+                            .unmap_no_shootdown(inner.addr + i * PAGE_SIZE)
+                            .ignore()
+                            .unwrap();
+                    }
+                };
+            }
+            pg_table.remote_flush_all();
+        }
+    }
+
     /// Handle page fault happened on this VmMapping.
     pub(crate) fn handle_page_fault(&self, vaddr: VirtAddr, access_flags: MMUFlags) -> ZxResult {
         let vaddr = round_down_pages(vaddr);

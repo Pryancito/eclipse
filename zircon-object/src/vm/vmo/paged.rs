@@ -851,25 +851,27 @@ impl VMObjectTrait for VMObjectPaged {
     }
 
     fn decommit(&self, offset: usize, len: usize) -> ZxResult {
-        let mut inner = self.get_inner_mut();
-        if inner.parent.is_some() {
-            return Err(ZxError::NOT_SUPPORTED);
-        }
         let start_page = offset / PAGE_SIZE;
         let pages = len / PAGE_SIZE;
-        for i in 0..pages {
-            inner.decommit(start_page + i);
-        }
-        // The frames are gone; no PTE may keep pointing at them. Unmap the
-        // range in every mapping of this object and in every mapping of a
-        // borrower of it (their read-only PTEs are this object's frames).
-        // Same pattern as the copy-on-write notifications above: the mapping
-        // side uses `try_lock` so a mapping busy in its own fault is skipped
-        // and re-resolves through the VMO when it finishes.
-        for map in inner.mappings.iter() {
-            if let Some(map) = map.upgrade() {
-                map.range_change(start_page, pages, RangeChangeOp::Unmap);
+        let mappings = {
+            let mut inner = self.get_inner_mut();
+            if inner.parent.is_some() {
+                return Err(ZxError::NOT_SUPPORTED);
             }
+            for i in 0..pages {
+                inner.decommit(start_page + i);
+            }
+            inner
+                .mappings
+                .iter()
+                .filter_map(|map| map.upgrade())
+                .collect::<Vec<_>>()
+        };
+        // The frames are gone; no PTE may keep pointing at them. Do the unmap
+        // pass after dropping the VMO family lock so we can take mapping locks
+        // in blocking mode and never skip a stale PTE on contention.
+        for map in mappings {
+            map.range_change_blocking(start_page, pages, RangeChangeOp::Unmap);
         }
         let borrowers: Vec<(Arc<VmMapping>, usize)> = self
             .borrower_maps
@@ -881,7 +883,7 @@ impl VMObjectTrait for VMObjectPaged {
             let s = start_page.max(base);
             let e = (start_page + pages).max(base);
             if e > s {
-                map.range_change(s - base, e - s, RangeChangeOp::Unmap);
+                map.range_change_blocking(s - base, e - s, RangeChangeOp::Unmap);
             }
         }
         Ok(())
