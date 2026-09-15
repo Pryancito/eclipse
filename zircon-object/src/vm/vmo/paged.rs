@@ -57,6 +57,35 @@ static MAP_LIST_ENTRIES: AtomicU64 = AtomicU64::new(0);
 static MAP_LIST_DEAD: AtomicU64 = AtomicU64::new(0);
 static MAP_LIST_MAX: AtomicU64 = AtomicU64::new(0);
 
+struct DeferredRangeChange {
+    map: Arc<VmMapping>,
+    offset: usize,
+    len: usize,
+    op: RangeChangeOp,
+}
+
+impl DeferredRangeChange {
+    fn new(map: Arc<VmMapping>, offset: usize, len: usize, op: RangeChangeOp) -> Self {
+        Self {
+            map,
+            offset,
+            len,
+            op,
+        }
+    }
+
+    fn apply(self) {
+        self.map
+            .range_change_blocking(self.offset, self.len, self.op);
+    }
+}
+
+fn apply_deferred_range_changes(range_changes: Vec<DeferredRangeChange>) {
+    for range_change in range_changes {
+        range_change.apply();
+    }
+}
+
 /// Per-VMO mapping-list census: `(scans, entries walked, dead entries, longest
 /// list seen)`.
 pub fn mapping_list_stats() -> (u64, u64, u64, u64) {
@@ -754,50 +783,78 @@ impl core::ops::DerefMut for InnerGuardMut<'_> {
 
 impl VMObjectTrait for VMObjectPaged {
     fn read(&self, offset: usize, buf: &mut [u8]) -> ZxResult {
-        let mut inner = self.get_inner_mut();
-        if inner.cache_policy != CachePolicy::Cached {
-            return Err(ZxError::BAD_STATE);
-        }
-        inner.for_each_page(offset, buf.len(), MMUFlags::READ, |paddr, buf_range| {
-            kernel_hal::mem::pmem_read(paddr, &mut buf[buf_range]);
-        })
+        let mut range_changes = Vec::new();
+        let ret = {
+            let mut inner = self.get_inner_mut();
+            if inner.cache_policy != CachePolicy::Cached {
+                return Err(ZxError::BAD_STATE);
+            }
+            inner.for_each_page(
+                offset,
+                buf.len(),
+                MMUFlags::READ,
+                &mut range_changes,
+                |paddr, buf_range| {
+                    kernel_hal::mem::pmem_read(paddr, &mut buf[buf_range]);
+                },
+            )
+        };
+        apply_deferred_range_changes(range_changes);
+        ret
     }
 
     fn write(&self, offset: usize, buf: &[u8]) -> ZxResult {
-        let mut inner = self.get_inner_mut();
-        if inner.cache_policy != CachePolicy::Cached {
-            return Err(ZxError::BAD_STATE);
-        }
-        inner.for_each_page(offset, buf.len(), MMUFlags::WRITE, |paddr, buf_range| {
-            kernel_hal::mem::pmem_write(paddr, &buf[buf_range]);
-        })
+        let mut range_changes = Vec::new();
+        let ret = {
+            let mut inner = self.get_inner_mut();
+            if inner.cache_policy != CachePolicy::Cached {
+                return Err(ZxError::BAD_STATE);
+            }
+            inner.for_each_page(
+                offset,
+                buf.len(),
+                MMUFlags::WRITE,
+                &mut range_changes,
+                |paddr, buf_range| {
+                    kernel_hal::mem::pmem_write(paddr, &buf[buf_range]);
+                },
+            )
+        };
+        apply_deferred_range_changes(range_changes);
+        ret
     }
 
     fn zero(&self, offset: usize, len: usize) -> ZxResult {
-        let mut inner = self.get_inner_mut();
-        if offset + len > inner.size {
-            return Err(ZxError::OUT_OF_RANGE);
-        }
-        let iter = BlockIter {
-            begin: offset,
-            end: offset + len,
-            block_size_log2: PAGE_SIZE_LOG2 as u8,
-        };
-        let mut unwanted = VecDeque::new();
-        for block in iter {
-            //let paddr = self.commit_page(block.block, MMUFlags::READ)?;
-            if block.len() == PAGE_SIZE && !inner.is_contiguous() {
-                let _ = inner.commit_page(block.block, MMUFlags::WRITE)?;
-                unwanted.push_back(block.block + inner.parent_offset / PAGE_SIZE);
-                inner.frames.remove(&block.block);
-            } else if inner.committed_pages_in_range(block.block, block.block + 1) != 0 {
-                // check whether this page is initialized, otherwise nothing should be done
-                let paddr = inner.commit_page(block.block, MMUFlags::WRITE)?;
-                kernel_hal::mem::pmem_zero(paddr + block.begin, block.len());
+        let mut range_changes = Vec::new();
+        let ret = {
+            let mut inner = self.get_inner_mut();
+            if offset + len > inner.size {
+                return Err(ZxError::OUT_OF_RANGE);
             }
-        }
-        inner.release_unwanted_pages_in_parent(unwanted);
-        Ok(())
+            let iter = BlockIter {
+                begin: offset,
+                end: offset + len,
+                block_size_log2: PAGE_SIZE_LOG2 as u8,
+            };
+            let mut unwanted = VecDeque::new();
+            for block in iter {
+                //let paddr = self.commit_page(block.block, MMUFlags::READ)?;
+                if block.len() == PAGE_SIZE && !inner.is_contiguous() {
+                    let _ = inner.commit_page(block.block, MMUFlags::WRITE, &mut range_changes)?;
+                    unwanted.push_back(block.block + inner.parent_offset / PAGE_SIZE);
+                    inner.frames.remove(&block.block);
+                } else if inner.committed_pages_in_range(block.block, block.block + 1) != 0 {
+                    // check whether this page is initialized, otherwise nothing should be done
+                    let paddr =
+                        inner.commit_page(block.block, MMUFlags::WRITE, &mut range_changes)?;
+                    kernel_hal::mem::pmem_zero(paddr + block.begin, block.len());
+                }
+            }
+            inner.release_unwanted_pages_in_parent(unwanted);
+            Ok(())
+        };
+        apply_deferred_range_changes(range_changes);
+        ret
     }
 
     fn len(&self) -> usize {
@@ -819,35 +876,50 @@ impl VMObjectTrait for VMObjectPaged {
     }
 
     fn commit_page(&self, page_idx: usize, flags: MMUFlags) -> ZxResult<PhysAddr> {
-        let mut inner = self.get_inner_mut();
-        let flags = self.shared_commit_flags(&inner, flags);
-        inner.commit_page(page_idx, flags)
+        let mut range_changes = Vec::new();
+        let ret = {
+            let mut inner = self.get_inner_mut();
+            let flags = self.shared_commit_flags(&inner, flags);
+            inner.commit_page(page_idx, flags, &mut range_changes)
+        };
+        apply_deferred_range_changes(range_changes);
+        ret
     }
 
     fn commit_pages_with(
         &self,
         f: &mut dyn FnMut(&mut dyn FnMut(usize, MMUFlags) -> ZxResult<PhysAddr>) -> ZxResult,
     ) -> ZxResult {
-        let mut inner = self.get_inner_mut();
-        let shared = self.is_shared_leaf(&inner);
-        f(&mut |page_idx, flags| {
-            let flags = if shared {
-                flags | MMUFlags::WRITE
-            } else {
-                flags
-            };
-            inner.commit_page(page_idx, flags)
-        })
+        let mut range_changes = Vec::new();
+        let ret = {
+            let mut inner = self.get_inner_mut();
+            let shared = self.is_shared_leaf(&inner);
+            f(&mut |page_idx, flags| {
+                let flags = if shared {
+                    flags | MMUFlags::WRITE
+                } else {
+                    flags
+                };
+                inner.commit_page(page_idx, flags, &mut range_changes)
+            })
+        };
+        apply_deferred_range_changes(range_changes);
+        ret
     }
 
     fn commit(&self, offset: usize, len: usize) -> ZxResult {
-        let mut inner = self.get_inner_mut();
         let start_page = offset / PAGE_SIZE;
         let pages = len / PAGE_SIZE;
-        for i in 0..pages {
-            inner.commit_page(start_page + i, MMUFlags::WRITE)?;
-        }
-        Ok(())
+        let mut range_changes = Vec::new();
+        let ret = {
+            let mut inner = self.get_inner_mut();
+            for i in 0..pages {
+                inner.commit_page(start_page + i, MMUFlags::WRITE, &mut range_changes)?;
+            }
+            Ok(())
+        };
+        apply_deferred_range_changes(range_changes);
+        ret
     }
 
     fn decommit(&self, offset: usize, len: usize) -> ZxResult {
@@ -892,8 +964,12 @@ impl VMObjectTrait for VMObjectPaged {
     fn create_child(&self, offset: usize, len: usize) -> ZxResult<Arc<dyn VMObjectTrait>> {
         assert!(page_aligned(offset));
         assert!(page_aligned(len));
-        let mut inner = self.get_inner_mut();
-        let child = inner.create_child(offset, len, &self.lock)?;
+        let mut range_changes = Vec::new();
+        let child = {
+            let mut inner = self.get_inner_mut();
+            inner.create_child(offset, len, &self.lock, &mut range_changes)?
+        };
+        apply_deferred_range_changes(range_changes);
         Ok(child)
     }
 
@@ -1119,6 +1195,7 @@ impl VMObjectPagedInner {
         offset: usize,
         buf_len: usize,
         flags: MMUFlags,
+        range_changes: &mut Vec<DeferredRangeChange>,
         mut f: impl FnMut(PhysAddr, Range<usize>),
     ) -> ZxResult {
         let iter = BlockIter {
@@ -1127,15 +1204,20 @@ impl VMObjectPagedInner {
             block_size_log2: PAGE_SIZE_LOG2 as u8,
         };
         for block in iter {
-            let paddr = self.commit_page(block.block, flags)?;
+            let paddr = self.commit_page(block.block, flags, range_changes)?;
             let buf_range = block.origin_begin() - offset..block.origin_end() - offset;
             f(paddr + block.begin, buf_range);
         }
         Ok(())
     }
 
-    fn commit_page(&mut self, page_idx: usize, flags: MMUFlags) -> ZxResult<PhysAddr> {
-        let ret = match self.commit_page_internal(page_idx, flags, &Weak::new())? {
+    fn commit_page(
+        &mut self,
+        page_idx: usize,
+        flags: MMUFlags,
+        range_changes: &mut Vec<DeferredRangeChange>,
+    ) -> ZxResult<PhysAddr> {
+        let ret = match self.commit_page_internal(page_idx, flags, &Weak::new(), range_changes)? {
             CommitResult::Ref(paddr) => Ok(paddr),
             _ => unreachable!(),
         };
@@ -1151,6 +1233,7 @@ impl VMObjectPagedInner {
         page_idx: usize,
         flags: MMUFlags,
         child: &WeakRef,
+        range_changes: &mut Vec<DeferredRangeChange>,
     ) -> ZxResult<CommitResult> {
         // special case
         let no_parent = self.parent.is_none();
@@ -1232,7 +1315,12 @@ impl VMObjectPagedInner {
                 // recursively find a frame in parent
                 let mut parent = self.parent.as_ref().unwrap().inner.borrow_mut();
                 let parent_idx = page_idx + self.parent_offset / PAGE_SIZE;
-                match parent.commit_page_internal(parent_idx, flags, &self.self_ref)? {
+                match parent.commit_page_internal(
+                    parent_idx,
+                    flags,
+                    &self.self_ref,
+                    range_changes,
+                )? {
                     CommitResult::NewPage(frame) if !self.type_.is_hidden() => {
                         self.frames.insert(page_idx, PageState::new(frame));
                     }
@@ -1249,10 +1337,11 @@ impl VMObjectPagedInner {
                             if let Some(arc_sibling) = sibling.upgrade() {
                                 {
                                     let sibling_inner = arc_sibling.inner.borrow();
-                                    sibling_inner.range_change(
+                                    sibling_inner.collect_range_change(
                                         parent_idx * PAGE_SIZE,
                                         (parent_idx + 1) * PAGE_SIZE,
                                         RangeChangeOp::Unmap,
+                                        range_changes,
                                     );
                                 }
                                 // Possibly-last ref, held under the family
@@ -1302,10 +1391,11 @@ impl VMObjectPagedInner {
                         Some(self.frames.remove(&page_idx).unwrap().take())
                     } else {
                         if need_unmap {
-                            other_inner.range_change(
+                            other_inner.collect_range_change(
                                 page_idx * PAGE_SIZE,
                                 (1 + page_idx) * PAGE_SIZE,
                                 RangeChangeOp::Unmap,
+                                range_changes,
                             );
                         }
                         None
@@ -1322,11 +1412,7 @@ impl VMObjectPagedInner {
             // sibling bookkeeping and fall through to the leaf commit path below.
         }
         if need_unmap {
-            for map in self.mappings.iter() {
-                if let Some(map) = map.upgrade() {
-                    map.range_change(page_idx, 1, RangeChangeOp::Unmap);
-                }
-            }
+            self.collect_mapping_range_changes(page_idx, 1, RangeChangeOp::Unmap, range_changes);
         }
         let frame = self.frames.get_mut(&page_idx).unwrap();
         if frame.tag.is_split() {
@@ -1348,7 +1434,31 @@ impl VMObjectPagedInner {
         self.frames.remove(&page_idx);
     }
 
-    fn range_change(&self, parent_offset: usize, parent_limit: usize, op: RangeChangeOp) {
+    fn collect_mapping_range_changes(
+        &self,
+        offset: usize,
+        len: usize,
+        op: RangeChangeOp,
+        range_changes: &mut Vec<DeferredRangeChange>,
+    ) -> u64 {
+        let mut dead = 0;
+        for map in self.mappings.iter() {
+            if let Some(map) = map.upgrade() {
+                range_changes.push(DeferredRangeChange::new(map, offset, len, op));
+            } else {
+                dead += 1;
+            }
+        }
+        dead
+    }
+
+    fn collect_range_change(
+        &self,
+        parent_offset: usize,
+        parent_limit: usize,
+        op: RangeChangeOp,
+        range_changes: &mut Vec<DeferredRangeChange>,
+    ) {
         let mut start = self.parent_offset.max(parent_offset);
         let mut end = self.parent_limit.min(parent_limit);
         if start >= end {
@@ -1356,15 +1466,19 @@ impl VMObjectPagedInner {
         }
         start -= self.parent_offset;
         end -= self.parent_offset;
-        for map in self.mappings.iter() {
-            if let Some(map) = map.upgrade() {
-                map.range_change(pages(start), pages(end) - pages(start), op);
-            }
-        }
+        self.collect_mapping_range_changes(
+            pages(start),
+            pages(end) - pages(start),
+            op,
+            range_changes,
+        );
         if let VMOType::Hidden { left, right, .. } = &self.type_ {
             for child in &[left, right] {
                 if let Some(child) = child.upgrade() {
-                    child.inner.borrow().range_change(start, end, op);
+                    child
+                        .inner
+                        .borrow()
+                        .collect_range_change(start, end, op, range_changes);
                     // `child` was obtained by upgrading a Weak in `type_`, so it
                     // is a POSSIBLY-LAST strong ref: if a concurrent drop just
                     // released the tree's other strong ref, letting `child` die
@@ -1536,6 +1650,7 @@ impl VMObjectPagedInner {
         offset: usize,
         len: usize,
         lock_ref: &Arc<Mutex<()>>,
+        range_changes: &mut Vec<DeferredRangeChange>,
     ) -> ZxResult<Arc<VMObjectPaged>> {
         // clone contiguous vmo is no longer permitted
         // https://fuchsia.googlesource.com/fuchsia/+/e6b4c6751bbdc9ed2795e81b8211ea294f139a45
@@ -1622,14 +1737,12 @@ impl VMObjectPagedInner {
         MAP_LIST_SCANS.fetch_add(1, Ordering::Relaxed);
         MAP_LIST_ENTRIES.fetch_add(len_before, Ordering::Relaxed);
         MAP_LIST_MAX.fetch_max(len_before, Ordering::Relaxed);
-        let mut dead = 0u64;
-        for map in self.mappings.iter() {
-            if let Some(map) = map.upgrade() {
-                map.range_change(pages(offset), pages(len), RangeChangeOp::RemoveWrite);
-            } else {
-                dead += 1;
-            }
-        }
+        let dead = self.collect_mapping_range_changes(
+            pages(offset),
+            pages(len),
+            RangeChangeOp::RemoveWrite,
+            range_changes,
+        );
         if dead != 0 {
             MAP_LIST_DEAD.fetch_add(dead, Ordering::Relaxed);
         }
@@ -1891,7 +2004,10 @@ impl VMObjectPagedInner {
 
     fn as_mut_buf(&mut self) -> ZxResult<(usize, usize)> {
         if self.contiguous {
-            let addr = phys_to_virt(self.commit_page(0, MMUFlags::WRITE)?) as usize;
+            let mut range_changes = Vec::new();
+            let addr =
+                phys_to_virt(self.commit_page(0, MMUFlags::WRITE, &mut range_changes)?) as usize;
+            debug_assert!(range_changes.is_empty());
             let size = self.size;
             return Ok((addr, size));
         }
