@@ -84,6 +84,32 @@ fn new_tcp_socket(
     socket
 }
 
+/// Fallback park (ms) for a blocking socket wait loop, adaptive on how many
+/// consecutive polls have come back with no data.
+///
+/// TCP is self-clocked: the peer sends the next window only after it sees our
+/// ACK, and we emit that ACK from `drain_net_urgent()` at the top of each loop
+/// iteration. A *fixed* 5 ms park therefore stretches the effective RTT to ≥5 ms
+/// (worse under KVM timer jitter, where the "5 ms" timer routinely fires far
+/// later), and at a 1-segment window (slow start after a slow-start-burst drop)
+/// that is exactly the residual "1 MSS / RTT ≈ 1.2 Mbps" cap — and the stretched
+/// RTT also stops the peer's congestion window from ever recovering.
+///
+/// So park *tight* (1 ms) while a transfer is active: during a real download
+/// `recv_slice` returns data within an iteration or two, so `consecutive_empty`
+/// stays low and the ACK clock runs fast, which both raises throughput and lets
+/// cwnd climb. Only once a connection has sat genuinely idle (many empty polls
+/// in a row — an idle `irssi`, a kept-alive HTTP socket) does it relax back to
+/// 5 ms, preserving the fix that stopped an idle recv from pegging a core.
+#[inline]
+fn adaptive_park_ms(consecutive_empty: u32) -> u64 {
+    match consecutive_empty {
+        0..=7 => 1,
+        8..=31 => 2,
+        _ => 5,
+    }
+}
+
 impl TcpSocketState {
     /// missing documentation
     pub fn new(ipv6: bool) -> LxResult<Self> {
@@ -130,6 +156,7 @@ impl Socket for TcpSocketState {
             flags.contains(OpenFlags::NON_BLOCK)
         );
         let deadline = kernel_hal::timer::timer_now() + core::time::Duration::from_secs(120);
+        let mut empty_polls: u32 = 0;
         loop {
             // Drive the NIC FIRST so any deferred RX is in the socket before
             // recv_slice is called. Use the UNTHROTTLED drain here: this is a
@@ -262,10 +289,14 @@ impl Socket for TcpSocketState {
             // Park until the NIC's RX IRQ wakes us (immediate on data) or a
             // short fallback timer fires, instead of busy-spinning with
             // yield_now — which pegged a core at 100% for any socket blocked in
-            // recv (e.g. an idle irssi). The 5 ms fallback still drives
-            // poll_ifaces if a wake is ever missed, so a stalled wake can never
-            // freeze the op the way a pure timer/IRQ park once did.
-            kernel_hal::net::NetRxOrTimeoutFuture::new(5).await;
+            // recv (e.g. an idle irssi). The fallback still drives poll_ifaces
+            // if a wake is ever missed, so a stalled wake can never freeze the
+            // op the way a pure timer/IRQ park once did. The park is adaptive
+            // (see `adaptive_park_ms`): 1 ms while a transfer is active so the
+            // ACK self-clock isn't stretched (the residual ~1.2 Mbps cap),
+            // relaxing to 5 ms only once the connection has sat idle.
+            empty_polls = empty_polls.saturating_add(1);
+            kernel_hal::net::NetRxOrTimeoutFuture::new(adaptive_park_ms(empty_polls)).await;
         }
     }
     async fn peek(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
@@ -273,6 +304,7 @@ impl Socket for TcpSocketState {
             let inner = self.inner.lock();
             (inner.handle.0, inner.flags)
         };
+        let mut empty_polls: u32 = 0;
         loop {
             kernel_hal::deferred_job::drain_deferred_jobs();
             crate::net::drain_net_tick();
@@ -315,8 +347,9 @@ impl Socket for TcpSocketState {
             if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
-            // Park on the RX IRQ waker with a 5 ms fallback — see read().
-            kernel_hal::net::NetRxOrTimeoutFuture::new(5).await;
+            // Park on the RX IRQ waker with an adaptive fallback — see read().
+            empty_polls = empty_polls.saturating_add(1);
+            kernel_hal::net::NetRxOrTimeoutFuture::new(adaptive_park_ms(empty_polls)).await;
         }
     }
     /// write from buffer
@@ -465,6 +498,7 @@ impl Socket for TcpSocketState {
         }
 
         let deadline = kernel_hal::timer::timer_now() + core::time::Duration::from_secs(30);
+        let mut empty_polls: u32 = 0;
         loop {
             drain_net_poll(4);
             kernel_hal::deferred_job::drain_deferred_jobs();
@@ -503,9 +537,10 @@ impl Socket for TcpSocketState {
                 return Err(LxError::ETIMEDOUT);
             }
 
-            // Park on the RX IRQ waker (5 ms fallback) while the handshake
+            // Park on the RX IRQ waker (adaptive fallback) while the handshake
             // completes, rather than busy-spinning — see read().
-            kernel_hal::net::NetRxOrTimeoutFuture::new(5).await;
+            empty_polls = empty_polls.saturating_add(1);
+            kernel_hal::net::NetRxOrTimeoutFuture::new(adaptive_park_ms(empty_polls)).await;
         }
     }
     /// wait for some event on a file descriptor
