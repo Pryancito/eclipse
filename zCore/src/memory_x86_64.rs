@@ -525,8 +525,15 @@ cfg_if! {
                 if claimed {
                     if delta > 0 {
                         let live = HOT_LIVE[i].fetch_add(1, Ordering::Relaxed) + 1;
-                        if size == 4096 && (live == 50_000 || live == 90_000) {
-                            leak_trace_dump(live);
+                        // Leak hunt: the desktop OOMs (512 MiB heap) with ~2M live
+                        // 8 B and 96 B blocks -- a per-event allocation that is never
+                        // freed. Dump the allocating call chain a few times as each
+                        // suspect class climbs, so the leaking site can be symbolized
+                        // from the printed return addresses. Fires at most 3x/class.
+                        let hunt = matches!(size, 8 | 96)
+                            && matches!(live, 100_000 | 400_000 | 800_000);
+                        if (size == 4096 && (live == 50_000 || live == 90_000)) || hunt {
+                            leak_trace_dump(size, live);
                         }
                     } else {
                         HOT_LIVE[i].try_update(
@@ -545,12 +552,12 @@ cfg_if! {
         /// spin serial writer. Reads stay inside the mapped kernel heap /
         /// physmap, so over-scanning past the coroutine stack top is safe.
         #[cold]
-        fn leak_trace_dump(live: usize) {
+        fn leak_trace_dump(size: usize, live: usize) {
             let mut rsp: usize;
             unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp) };
             kernel_hal::console::serial_write_fmt_spin(format_args!(
-                "\n[leaktrace] 4096B live={} stack-scan:",
-                live
+                "\n[leaktrace] {}B live={} stack-scan:",
+                size, live
             ));
             const TEXT_LO: usize = 0xffff_ff00_0000_1000;
             const TEXT_HI: usize = 0xffff_ff00_0100_0000;
