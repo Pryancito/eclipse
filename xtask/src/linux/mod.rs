@@ -68,6 +68,10 @@ impl LinuxRootfs {
             if audio_probe.is_file() {
                 let _ = fs::copy(&audio_probe, bin.join("audio-probe"));
             }
+            let drm_probe = self.drm_probe(&musl);
+            if drm_probe.is_file() {
+                let _ = fs::copy(&drm_probe, bin.join("drm-probe"));
+            }
             self.install_thread_tests(&dir);
             // INIT (PID 1): the Eclipse-native Rust init by default, with busybox
             // init as a resilient fallback. `install_busybox_init` runs first so
@@ -548,6 +552,15 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             let dst = bin.join("audio-probe");
             let _ = dir::rm(&dst);
             fs::copy(&audio_probe, &dst).unwrap();
+        }
+
+        // drm-probe: the DRM/KMS layers a compositor rests on, driven the way
+        // wlroots/labwc/Mesa-GBM drive them (read-only; --scanout to display).
+        let drm_probe = self.drm_probe(&musl);
+        if drm_probe.is_file() {
+            let dst = bin.join("drm-probe");
+            let _ = dir::rm(&dst);
+            fs::copy(&drm_probe, &dst).unwrap();
         }
 
         // ecl-compute: SAXPY / GIOPS on the NVIDIA compute GPU via card1.
@@ -1958,6 +1971,51 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             .status();
         if !status.success() {
             println!("Failed to compile audio-probe");
+            return executable;
+        }
+
+        Ext::new(strip).arg("-s").arg(&executable).status();
+        executable
+    }
+
+    /// Cross-compile `drm-probe` (tools/drm-probe): the DRM/KMS layers a
+    /// compositor rests on, driven bottom-up the way wlroots/labwc/Mesa-GBM
+    /// drive them. Read-only by default (safe under a running compositor);
+    /// `--scanout` modesets a test pattern onto the display. No libm.
+    fn drm_probe(&self, musl: &Path) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join("drm-probe");
+        let executable = dir.join("drm-probe");
+        let source = dir.join("drm-probe.c");
+        if executable.is_file() && source.is_file() {
+            if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
+            {
+                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
+                    if bin_mtime >= src_mtime {
+                        return executable;
+                    }
+                }
+            }
+        }
+
+        println!("Compiling drm-probe...");
+        let musl = musl.canonicalize().unwrap();
+        let bin = musl.join("bin");
+        let arch = self.0.name();
+        let cc = format!("{}/{}-linux-musl-gcc", bin.display(), arch);
+        let strip = self.strip(&musl);
+
+        fs::create_dir_all(&dir).unwrap();
+        let status = Ext::new(&cc)
+            .current_dir(&dir)
+            .arg("-static")
+            .arg("-O2")
+            .arg("-s")
+            .arg("-o")
+            .arg(&executable)
+            .arg(&source)
+            .status();
+        if !status.success() {
+            println!("Failed to compile drm-probe");
             return executable;
         }
 
