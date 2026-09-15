@@ -2842,6 +2842,16 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               if command -v pactl >/dev/null 2>&1 && [ -S /run/pulse/native ]; then\n\
               \x20 pactl set-sink-volume @DEFAULT_SINK@ 70% 2>/dev/null\n\
               \x20 pactl set-sink-mute @DEFAULT_SINK@ 0 2>/dev/null\n\
+              \x20 # Force every sink OUT of SUSPENDED via the EXPLICIT resume path.\n\
+              \x20 # The kernel PCM's implicit cold resume (run from the sink IO thread\n\
+              \x20 # when a stream attaches) is unreliable under SMP+KVM: it plays silent\n\
+              \x20 # or hangs. The explicit `suspend-sink 0` resume always works, so do it\n\
+              \x20 # once now; with no module-suspend-on-idle loaded the sink then stays\n\
+              \x20 # active for the whole session and every later play (mpg123/paplay/\n\
+              \x20 # Firefox) hits an already-running PCM instead of the broken resume.\n\
+              \x20 for s in $(pactl list short sinks 2>/dev/null | awk '{print $1}'); do\n\
+              \x20\x20 pactl suspend-sink \"$s\" 0 2>/dev/null || true\n\
+              \x20 done\n\
               elif command -v amixer >/dev/null 2>&1; then\n\
               \x20 amixer -q set Master 70% unmute 2>/dev/null\n\
               fi\n\
@@ -2850,7 +2860,12 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               \x20\x20 mpg123 -q -o alsa --encoding s16 --no-gapless \"$MP3\" \\\n\
               \x20\x20\x20 || mpg123 -q --encoding s16 --no-gapless \"$MP3\"\n\
               \x20\x20 pactl drain 2>/dev/null || true\n\
-              \x20\x20 pactl suspend-sink @DEFAULT_SINK@ 1 2>/dev/null || true\n\
+              \x20\x20 # Do NOT suspend the sink here: suspending it (this line used\n\
+              \x20\x20 # to `suspend-sink 1`) left the whole session on the broken\n\
+              \x20\x20 # cold-resume path, so every later mpg123/paplay went silent or\n\
+              \x20\x20 # hung. The stream cork already resets the ring in the kernel\n\
+              \x20\x20 # (PAUSE with an empty queue -> reset), so leaving the sink\n\
+              \x20\x20 # active does not loop the chime fragment.\n\
               \x20 else\n\
               \x20\x20 mpg123 -q --encoding s16 --no-gapless \"$MP3\"\n\
               \x20 fi\n\
