@@ -189,6 +189,12 @@ pub trait VMObjectTrait: Sync + Send {
         Err(ZxError::NOT_SUPPORTED)
     }
 
+    /// Sequence for fork/COW publication windows that must force racing write
+    /// faults to retry before they install a writable PTE.
+    fn cow_fault_seq(&self) -> u64 {
+        0
+    }
+
     /// If contiguous, transmute vmo to a mutable buffer
     fn as_mut_buf(&self) -> ZxResult<(MutexGuard<'_, ()>, &mut [u8])> {
         Err(ZxError::NOT_SUPPORTED)
@@ -804,6 +810,10 @@ impl VmObject {
     /// [`VMObjectTrait::is_physical`]): shared, not copied, on `fork`.
     pub fn is_physical(&self) -> bool {
         self.trait_.is_physical()
+    }
+
+    pub fn cow_fault_seq(&self) -> u64 {
+        self.trait_.cow_fault_seq()
     }
 
     /// Returns true if this object is backed by ordinary RAM (a paged VMO).

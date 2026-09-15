@@ -1952,6 +1952,40 @@ struct VmMappingInner {
     vmo_offset: usize,
 }
 
+fn apply_range_change_locked(
+    map: &VmMapping,
+    inner: &VmMappingInner,
+    offset: usize,
+    len: usize,
+    op: RangeChangeOp,
+) {
+    let vmo_page = inner.vmo_offset / PAGE_SIZE;
+    let start = offset.max(vmo_page);
+    let end = (vmo_page + inner.size / PAGE_SIZE).min(offset + len);
+    if !(start..end).is_empty() {
+        let mut pg_table = map.page_table.lock();
+        for i in (start - vmo_page)..(end - vmo_page) {
+            match op {
+                RangeChangeOp::RemoveWrite => {
+                    let mut new_flag = inner.flags[i];
+                    new_flag.remove(MMUFlags::WRITE);
+                    pg_table
+                        .update_no_shootdown(inner.addr + i * PAGE_SIZE, None, Some(new_flag))
+                        .ignore()
+                        .unwrap();
+                }
+                RangeChangeOp::Unmap => {
+                    pg_table
+                        .unmap_no_shootdown(inner.addr + i * PAGE_SIZE)
+                        .ignore()
+                        .unwrap();
+                }
+            };
+        }
+        pg_table.remote_flush_all();
+    }
+}
+
 /// Statistics about resources (e.g., memory) used by a task.
 #[repr(C)]
 #[derive(Default)]
@@ -2450,89 +2484,24 @@ impl VmMapping {
         Ok(true)
     }
 
-    /// Remove WRITE flag from the mappings for Copy-on-Write.
-    pub(super) fn range_change(&self, offset: usize, len: usize, op: RangeChangeOp) {
-        let inner = self.inner.try_lock();
-        // If we are already locked, we are handling page fault/map range
-        // In this case we can just ignore the operation since we will update the mapping later
-        if let Some(inner) = inner {
-            // `offset`/`len` are VMO PAGES; `vmo_offset` is bytes. Mixing the
-            // two used to clip every mapping with a non-zero file offset out
-            // of the notification, so its PTEs kept pointing at frames the
-            // VMO had already replaced or freed.
-            let vmo_page = inner.vmo_offset / PAGE_SIZE;
-            let start = offset.max(vmo_page);
-            let end = (vmo_page + inner.size / PAGE_SIZE).min(offset + len);
-            if !(start..end).is_empty() {
-                let mut pg_table = self.page_table.lock();
-                // mmu-gather: one cross-CPU shootdown for the whole range
-                // (see `protect` above); per-page synchronous shootdowns
-                // livelock when a peer CPU can't ack.
-                for i in (start - vmo_page)..(end - vmo_page) {
-                    match op {
-                        RangeChangeOp::RemoveWrite => {
-                            let mut new_flag = inner.flags[i];
-                            new_flag.remove(MMUFlags::WRITE);
-                            pg_table
-                                .update_no_shootdown(
-                                    inner.addr + i * PAGE_SIZE,
-                                    None,
-                                    Some(new_flag),
-                                )
-                                .ignore()
-                                .unwrap();
-                        }
-                        RangeChangeOp::Unmap => {
-                            pg_table
-                                .unmap_no_shootdown(inner.addr + i * PAGE_SIZE)
-                                .ignore()
-                                .unwrap();
-                        }
-                    };
-                }
-                pg_table.remote_flush_all();
-            }
-        }
-    }
-
-    /// Guaranteed variant of [`range_change`]: waits for the mapping lock
-    /// instead of skipping on contention.
+    /// Update or unmap this mapping's PTEs for a VMO range, waiting for the
+    /// mapping lock instead of skipping a contended mapper.
     pub(super) fn range_change_blocking(&self, offset: usize, len: usize, op: RangeChangeOp) {
         let inner = self.inner.lock();
-        let vmo_page = inner.vmo_offset / PAGE_SIZE;
-        let start = offset.max(vmo_page);
-        let end = (vmo_page + inner.size / PAGE_SIZE).min(offset + len);
-        if !(start..end).is_empty() {
-            let mut pg_table = self.page_table.lock();
-            for i in (start - vmo_page)..(end - vmo_page) {
-                match op {
-                    RangeChangeOp::RemoveWrite => {
-                        let mut new_flag = inner.flags[i];
-                        new_flag.remove(MMUFlags::WRITE);
-                        pg_table
-                            .update_no_shootdown(inner.addr + i * PAGE_SIZE, None, Some(new_flag))
-                            .ignore()
-                            .unwrap();
-                    }
-                    RangeChangeOp::Unmap => {
-                        pg_table
-                            .unmap_no_shootdown(inner.addr + i * PAGE_SIZE)
-                            .ignore()
-                            .unwrap();
-                    }
-                };
-            }
-            pg_table.remote_flush_all();
-        }
+        apply_range_change_locked(self, &inner, offset, len, op);
     }
 
     /// Handle page fault happened on this VmMapping.
     pub(crate) fn handle_page_fault(&self, vaddr: VirtAddr, access_flags: MMUFlags) -> ZxResult {
         let vaddr = round_down_pages(vaddr);
+        let cow_fault_seq = if access_flags.contains(MMUFlags::WRITE) {
+            self.vmo.cow_fault_seq()
+        } else {
+            0
+        };
         // Resolved BEFORE taking `self.inner`: it acquires the VMO family lock,
         // and the established discipline is to never hold the mapping lock
-        // while taking a VMO lock (the reverse direction exists via
-        // `range_change`, which only survives that nesting by using try_lock).
+        // while taking a VMO lock.
         let (vmo_offset, mut flags) = {
             let inner = self.inner.lock();
             // Same coverage check as the post-`commit_page` re-validation
@@ -2601,6 +2570,12 @@ impl VmMapping {
                 || (vaddr - inner.addr) + inner.vmo_offset != vmo_offset
             {
                 return Ok(());
+            }
+            if access_flags.contains(MMUFlags::WRITE) {
+                let seq_after = self.vmo.cow_fault_seq();
+                if seq_after != cow_fault_seq || (seq_after & 1) != 0 {
+                    return Ok(());
+                }
             }
             let mut pg_table = self.page_table.lock();
             let mut res = pg_table.map(Page::new_aligned(vaddr, PageSize::Size4K), paddr, flags);
@@ -2783,17 +2758,15 @@ impl VmMapping {
             return None;
         }
         let child = self.vmo.create_child(false, 0, self.vmo.len()).ok()?;
-        // `create_child` already asked every mapping of the parent VMO to drop
-        // WRITE, but `VmMapping::range_change` uses `try_lock` and silently
-        // skips a mapping whose lock is held right then — fine for its original
-        // callers (the fault path re-installs the PTE afterwards), NOT fine
-        // here: a missed mapping would leave the parent with writable PTEs onto
-        // frames the child now shares, which is silent cross-process
-        // corruption. A sibling thread of the forking process faulting on this
-        // very mapping is exactly the race. Re-apply it with a blocking lock —
-        // `clone_map` provably holds neither this mapping's `inner` nor the
-        // page table, so blocking here cannot deadlock, and the operation is
-        // idempotent with what `create_child` already did.
+        // `create_child` now marks the VMO's fork write-protect window in a
+        // sequence counter before it drops WRITE from every alias mapping and
+        // publishes the hidden-node reshape. Any concurrent write fault that
+        // races that window rechecks the sequence after `commit_page(WRITE)` and
+        // retries instead of installing a writable PTE onto a now-shared frame.
+        // Re-apply the local protect here anyway: `clone_map` holds neither this
+        // mapping's `inner` nor the page table, so the pass cannot deadlock, and
+        // keeping it preserves the old belt-and-suspenders guarantee for the
+        // exact mapping the fork is cloning.
         self.protect_for_cow();
         Some(child)
     }
@@ -2813,10 +2786,9 @@ impl VmMapping {
         // pre-existing and left alone here.)
         let pages = inner.flags.len();
         // Deliberately unconditional. `create_child` has normally just done
-        // this, but it uses `try_lock` and silently skips a mapping whose lock
-        // is held right then, so this pass is the guarantee rather than an
-        // optimisation — and the thing it guarantees is that no page stays
-        // writable in the parent while the child shares its frame.
+        // this for every alias of the VMO, but keeping this explicit pass on
+        // the mapping being forked preserves the local guarantee that no page
+        // stays writable in the parent while the child shares its frame.
         //
         // Skipping pages whose PTE already reads non-writable (querying first)
         // was tried and reverted: it did not clearly pay for itself, and the one
@@ -3282,6 +3254,131 @@ mod tests {
         unsafe {
             assert_eq!((vmar.addr() as *const u8).read(), 2);
         }
+    }
+
+    #[test]
+    fn create_child_blocks_on_locked_alias_mapping() {
+        use std::{sync::mpsc, time::Duration};
+
+        let vmar = VmAddressRegion::new_root_zircon();
+        let vmo = VmObject::new_paged(1);
+        vmo.test_write(0, 1);
+        vmar.map_at(0, vmo.clone(), 0, PAGE_SIZE, MMUFlags::RXW)
+            .unwrap();
+        vmar.map_at(PAGE_SIZE, vmo.clone(), 0, PAGE_SIZE, MMUFlags::RXW)
+            .unwrap();
+        let base = vmar.addr();
+        let alias = vmar.find_mapping(base + PAGE_SIZE).unwrap();
+
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let mut child_vmo = None;
+        std::thread::scope(|s| {
+            let alias = alias.clone();
+            s.spawn(move || {
+                let _guard = alias.inner.lock();
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            locked_rx.recv().unwrap();
+            let vmo = vmo.clone();
+            s.spawn(move || {
+                done_tx.send(vmo.create_child(false, 0, PAGE_SIZE)).unwrap();
+            });
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                "create_child must wait for the contended alias mapping before dropping WRITE"
+            );
+            release_tx.send(()).unwrap();
+            child_vmo = Some(
+                done_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap(),
+            );
+        });
+
+        let child_vmo = child_vmo.unwrap();
+        assert_eq!(child_vmo.test_read(0), 1);
+        vmo.test_write(0, 2);
+        assert_eq!(vmo.test_read(0), 2);
+        assert_eq!(child_vmo.test_read(0), 1);
+    }
+
+    #[test]
+    fn create_child_serializes_publish_window() {
+        use std::{sync::mpsc, time::Duration};
+
+        let vmar = VmAddressRegion::new_root_zircon();
+        let vmo = VmObject::new_paged(1);
+        vmo.test_write(0, 1);
+        vmar.map_at(0, vmo.clone(), 0, PAGE_SIZE, MMUFlags::RXW)
+            .unwrap();
+        vmar.map_at(PAGE_SIZE, vmo.clone(), 0, PAGE_SIZE, MMUFlags::RXW)
+            .unwrap();
+        let alias = vmar.find_mapping(vmar.addr() + PAGE_SIZE).unwrap();
+
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (first_tx, first_rx) = mpsc::channel();
+        let (second_tx, second_rx) = mpsc::channel();
+        let mut first_child = None;
+        let mut second_child = None;
+        std::thread::scope(|s| {
+            let alias = alias.clone();
+            s.spawn(move || {
+                let _guard = alias.inner.lock();
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            locked_rx.recv().unwrap();
+
+            let first_vmo = vmo.clone();
+            s.spawn(move || {
+                first_tx
+                    .send(first_vmo.create_child(false, 0, PAGE_SIZE))
+                    .unwrap();
+            });
+            assert!(
+                first_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                "first create_child should be waiting for the contended alias mapping"
+            );
+
+            let second_vmo = vmo.clone();
+            s.spawn(move || {
+                second_tx
+                    .send(second_vmo.create_child(false, 0, PAGE_SIZE))
+                    .unwrap();
+            });
+            assert!(
+                second_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                "second create_child should wait behind the in-progress publish window"
+            );
+
+            release_tx.send(()).unwrap();
+            first_child = Some(
+                first_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap(),
+            );
+            second_child = Some(
+                second_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap(),
+            );
+        });
+
+        let first_child = first_child.unwrap();
+        let second_child = second_child.unwrap();
+        assert_eq!(first_child.test_read(0), 1);
+        assert_eq!(second_child.test_read(0), 1);
+        vmo.test_write(0, 2);
+        assert_eq!(vmo.test_read(0), 2);
+        assert_eq!(first_child.test_read(0), 1);
+        assert_eq!(second_child.test_read(0), 1);
     }
 
     /// A decommitted page is gone for every mapper: the object's own mapping
