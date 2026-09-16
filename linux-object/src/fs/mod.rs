@@ -440,6 +440,25 @@ fn mount_ramfs_at(root: &Arc<MNode>, rel: &str, target: &str) {
     }
 }
 
+/// The audio devices in ALSA card order: the order `/dev/snd/controlC<n>` +
+/// `pcmC<n>D0p` and `/dev/dsp<n>` are created in (best `default_score` first,
+/// probe order as the tie-break). Every consumer that labels a device with a
+/// card number must use this, not `all_audio()`'s raw probe order: on a
+/// dual-GPU board the Intel PCH codec probed first while the NVIDIA HDMI codec
+/// with the monitor scored as `hw:0`, and `/proc/gpusnd`'s "card 0" block then
+/// described a different device than `/dev/snd/pcmC0D0p` played to.
+pub(crate) fn audio_cards_alsa_order() -> Vec<Arc<dyn zcore_drivers::scheme::AudioScheme>> {
+    let guard = drivers::all_audio().as_vec();
+    let mut v: Vec<(i32, usize, _)> = guard
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(i, a)| (a.default_score(), i, a))
+        .collect();
+    v.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    v.into_iter().map(|(_, _, a)| a).collect()
+}
+
 pub(crate) fn register_mount(
     source: &str,
     target: &str,
@@ -821,17 +840,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     // GPU). HDMI only becomes card 0 when the pin has presence/ELD — the
     // same rule Pulse/PipeWire uses. Push ELD first so a live display wins.
     zcore_drivers::display::kick_hdmi_audio();
-    let audio_cards: Vec<_> = {
-        let guard = drivers::all_audio().as_vec();
-        let mut v: Vec<(i32, usize, _)> = guard
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(i, a)| (a.default_score(), i, a))
-            .collect();
-        v.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        v.into_iter().map(|(_, _, a)| a).collect()
-    };
+    let audio_cards = audio_cards_alsa_order();
     if audio_cards.is_empty() {
         // VirtualBox is configured with `--audio-driver none`; QEMU needs
         // `-device intel-hda -device hda-output`. This is not a boot failure —

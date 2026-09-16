@@ -2407,7 +2407,9 @@ fn proc_gpubench_content() -> String {
 /// owns the other half. This dump shows both halves.
 fn proc_gpusnd_content() -> String {
     let mut s = String::new();
-    let devices = kernel_hal::drivers::all_audio().as_vec();
+    // ALSA card order (the same order /dev/snd and /dev/dsp<n> use), so
+    // "card N" here is hw:N -- audio-probe reads its verdict from this block.
+    let devices = super::audio_cards_alsa_order();
     if devices.is_empty() {
         s.push_str("[gpusnd] no audio devices registered\n");
         return s;
