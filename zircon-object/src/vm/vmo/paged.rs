@@ -821,7 +821,7 @@ impl core::ops::DerefMut for InnerGuardMut<'_> {
 impl VMObjectTrait for VMObjectPaged {
     fn read(&self, offset: usize, buf: &mut [u8]) -> ZxResult {
         let mut range_changes = Vec::new();
-        let ret = (|| {
+        let ret = {
             let mut inner = self.get_inner_mut();
             if inner.cache_policy != CachePolicy::Cached {
                 Err(ZxError::BAD_STATE)
@@ -836,14 +836,14 @@ impl VMObjectTrait for VMObjectPaged {
                     },
                 )
             }
-        })();
+        };
         apply_deferred_range_changes(range_changes);
         ret
     }
 
     fn write(&self, offset: usize, buf: &[u8]) -> ZxResult {
         let mut range_changes = Vec::new();
-        let ret = (|| {
+        let ret = {
             let mut inner = self.get_inner_mut();
             if inner.cache_policy != CachePolicy::Cached {
                 Err(ZxError::BAD_STATE)
@@ -858,7 +858,7 @@ impl VMObjectTrait for VMObjectPaged {
                     },
                 )
             }
-        })();
+        };
         apply_deferred_range_changes(range_changes);
         ret
     }

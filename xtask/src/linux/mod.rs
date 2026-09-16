@@ -72,6 +72,10 @@ impl LinuxRootfs {
             if drm_probe.is_file() {
                 let _ = fs::copy(&drm_probe, bin.join("drm-probe"));
             }
+            let gfx_probe = self.gfx_probe(&musl);
+            if gfx_probe.is_file() {
+                let _ = fs::copy(&gfx_probe, bin.join("gfx-probe"));
+            }
             self.install_thread_tests(&dir);
             // INIT (PID 1): the Eclipse-native Rust init by default, with busybox
             // init as a resilient fallback. `install_busybox_init` runs first so
@@ -561,6 +565,17 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             let dst = bin.join("drm-probe");
             let _ = dir::rm(&dst);
             fs::copy(&drm_probe, &dst).unwrap();
+        }
+
+        // gfx-probe: drm-probe's userspace companion. dlopens the installed
+        // GBM/EGL/GLES/Vulkan/Wayland libraries and drives each layer of the
+        // stack (GBM alloc, EGL bring-up, an off-screen GL render it reads back,
+        // Vulkan enumeration, a live wl_shm round-trip). See tools/gfx-probe.
+        let gfx_probe = self.gfx_probe(&musl);
+        if gfx_probe.is_file() {
+            let dst = bin.join("gfx-probe");
+            let _ = dir::rm(&dst);
+            fs::copy(&gfx_probe, &dst).unwrap();
         }
 
         // ecl-compute: SAXPY / GIOPS on the NVIDIA compute GPU via card1.
@@ -2019,6 +2034,49 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             return executable;
         }
 
+        Ext::new(strip).arg("-s").arg(&executable).status();
+        executable
+    }
+
+    /// Cross-compile `gfx-probe` (tools/gfx-probe): drm-probe's userspace
+    /// companion. It dlopen()s the installed graphics libraries (GBM, EGL,
+    /// GLESv2, Vulkan, Wayland) at run time, so — like eclipse-sdl-probe — it is
+    /// a DYNAMIC binary linking only libc + libdl; a missing library just turns
+    /// its section to SKIP. Best-effort: a missing musl gcc skips the tool.
+    fn gfx_probe(&self, musl: &Path) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join("gfx-probe");
+        let executable = dir.join("gfx-probe");
+        let source = dir.join("gfx-probe.c");
+        if executable.is_file() && source.is_file() {
+            if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
+            {
+                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
+                    if bin_mtime >= src_mtime {
+                        return executable;
+                    }
+                }
+            }
+        }
+
+        println!("Compiling gfx-probe...");
+        let musl = musl.canonicalize().unwrap();
+        let arch = self.0.name();
+        let cc = format!("{}/{}-linux-musl-gcc", musl.join("bin").display(), arch);
+        let strip = self.strip(&musl);
+        fs::create_dir_all(&dir).unwrap();
+        let status = Ext::new(&cc)
+            .current_dir(&dir)
+            .arg("-O2")
+            .arg("-Wall")
+            .arg("-o")
+            .arg(&executable)
+            .arg(&source)
+            .arg("-ldl")
+            .status();
+        if !status.success() {
+            eprintln!("warning: failed to compile gfx-probe");
+            return executable;
+        }
         Ext::new(strip).arg("-s").arg(&executable).status();
         executable
     }
