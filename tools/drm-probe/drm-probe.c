@@ -320,6 +320,41 @@ static void dump_file(const char *path, const char *label) {
   fclose(f);
 }
 
+// DRM connector type -> name (include/uapi/drm/drm_mode.h DRM_MODE_CONNECTOR_*).
+static const char *connector_type_name(uint32_t t) {
+  static const char *n[] = {"Unknown", "VGA",       "DVI-I",     "DVI-D", "DVI-A",
+                            "Composite", "S-Video", "LVDS",      "Component", "DIN",
+                            "DP",        "HDMI-A",  "HDMI-B",    "TV",    "eDP",
+                            "Virtual",   "DSI",     "DPI",       "Writeback", "SPI",
+                            "USB"};
+  return t < sizeof n / sizeof n[0] ? n[t] : "?";
+}
+
+// Print each connector's sysfs status (what libudev / drmGetDevices2 read).
+static void dump_drm_sysfs_status(int card) {
+  DIR *d = opendir("/sys/class/drm");
+  if (!d) return;
+  char prefix[32];
+  snprintf(prefix, sizeof prefix, "card%d-", card);
+  size_t plen = strlen(prefix);
+  struct dirent *e;
+  while ((e = readdir(d))) {
+    if (strncmp(e->d_name, prefix, plen) != 0) continue;
+    char p[512], status[64] = "";
+    snprintf(p, sizeof p, "/sys/class/drm/%s/status", e->d_name);
+    FILE *f = fopen(p, "r");
+    if (f) {
+      if (fgets(status, sizeof status, f)) {
+        size_t l = strlen(status);
+        if (l && status[l - 1] == '\n') status[l - 1] = '\0';
+      }
+      fclose(f);
+    }
+    info("%s: %s", e->d_name, status[0] ? status : "(no status file)");
+  }
+  closedir(d);
+}
+
 // ── shared state discovered as sections run ──────────────────────────────────
 
 static int g_fd = -1;                     // /dev/dri/cardN
@@ -359,11 +394,7 @@ static void test_nodes(void) {
   snprintf(sysdir, sizeof sysdir, "/sys/class/drm/card%d", g_card);
   if (node_present(sysdir, S_IFDIR)) {
     ok("/sys/class/drm", "sysfs DRM class present (libudev/drmGetDevices2)");
-    if (g_verbose) {
-      char p[128];
-      snprintf(p, sizeof p, "%s-*/status", sysdir);  // best-effort; dirs vary
-      (void)p;
-    }
+    if (g_verbose) dump_drm_sysfs_status(g_card);
   } else {
     skip("/sys/class/drm", "no sysfs card dir (libudev enumeration is blind)");
   }
@@ -527,8 +558,8 @@ static void test_connectors(void) {
     const char *st = conn.connection == DRM_MODE_CONNECTED
                          ? "connected"
                          : (conn.connection == DRM_MODE_DISCONNECTED ? "disconnected" : "unknown");
-    info("connector %u type=%u %s modes=%u encoders=%u", conn.connector_id, conn.connector_type,
-         st, conn.count_modes, conn.count_encoders);
+    info("connector %u %s %s modes=%u encoders=%u", conn.connector_id,
+         connector_type_name(conn.connector_type), st, conn.count_modes, conn.count_encoders);
     if (conn.connection != DRM_MODE_CONNECTED || conn.count_modes == 0) continue;
     any_connected = 1;
 
