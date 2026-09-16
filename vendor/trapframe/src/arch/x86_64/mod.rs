@@ -50,6 +50,28 @@ pub use trap::TrapFrame;
 pub(crate) static XSAVE_MASK: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
+/// Set by the kernel (before `init`) to force the FXSAVE path even on a CPU that
+/// supports XSAVE + AVX. A boot-time escape hatch (e.g. `noavx` on the kernel
+/// command line) for isolating AVX enablement while debugging.
+#[cfg(any(target_os = "none", target_os = "uefi"))]
+static AVX_DISABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Force the plain FXSAVE path (disable XSAVE/AVX enablement in `init_fpu`).
+/// Must be called before `init`/`init_ap` run on any CPU.
+#[cfg(any(target_os = "none", target_os = "uefi"))]
+pub fn set_avx_disabled(disabled: bool) {
+    AVX_DISABLED.store(disabled, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether this CPU enabled XSAVE + AVX for user space (256-bit vector width for
+/// llvmpipe and other AVX code). False when the CPU lacks it or `set_avx_disabled`
+/// forced the FXSAVE path.
+#[cfg(any(target_os = "none", target_os = "uefi"))]
+pub fn xsave_avx_enabled() -> bool {
+    XSAVE_MASK.load(core::sync::atomic::Ordering::Relaxed) != 0
+}
+
 /// Enable x87 + SSE (and AVX, when the CPU has it) on this CPU.
 ///
 /// The BSP inherits a usable FPU state from the firmware; APs arrive from the
@@ -91,7 +113,8 @@ fn init_fpu() {
         let leaf1 = core::arch::x86_64::__cpuid(1);
         let has_xsave = leaf1.ecx & (1 << 26) != 0;
         let has_avx = leaf1.ecx & (1 << 28) != 0;
-        if has_xsave && has_avx {
+        let disabled = AVX_DISABLED.load(core::sync::atomic::Ordering::Relaxed);
+        if !disabled && has_xsave && has_avx {
             use x86_64::registers::xcontrol::{XCr0, XCr0Flags};
             Cr4::update(|cr4| cr4.insert(Cr4Flags::OSXSAVE));
             let flags = XCr0Flags::X87 | XCr0Flags::SSE | XCr0Flags::AVX;
