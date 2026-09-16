@@ -580,7 +580,17 @@ impl INode for BtrfsMountINode {
     fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
         match name {
             "." | "" => Ok(self.fs.inode(self.ino)),
-            ".." => Err(FsError::EntryNotFound),
+            // A relative symlink (`/var/run -> ../run`) is resolved by
+            // `lookup_follow` from its directory, so `..` must work on an
+            // installed root: PulseAudio's `mkdir /var/run/pulse` got ENOENT
+            // here and the daemon never started.
+            ".." => {
+                let parent = {
+                    let mut fs = self.fs.inner.lock();
+                    fs.parent(self.ino).map_err(map_err)?
+                };
+                Ok(self.fs.inode(parent))
+            }
             name => {
                 let ino = {
                     let mut fs = self.fs.inner.lock();

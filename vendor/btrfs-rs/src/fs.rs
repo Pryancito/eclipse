@@ -1045,6 +1045,21 @@ impl Btrfs {
         Ok(buf)
     }
 
+    /// Parent directory of `ino`: the offset of its first INODE_REF item
+    /// (btrfs keys back-references as `(ino, INODE_REF, parent_dir)`). The
+    /// subvolume root refers to itself, so the parent of `/` is `/`.
+    pub fn parent(&mut self, ino: u64) -> Result<u64> {
+        let mut parent = None;
+        let mut t = self.tree();
+        t.iter_from(FS_TREE, Key::new(ino, INODE_REF_KEY, 0), |k, _| {
+            if k.objectid == ino && k.item_type == INODE_REF_KEY {
+                parent = Some(k.offset);
+            }
+            Ok(false)
+        })?;
+        parent.ok_or(Error::NotFound)
+    }
+
     pub fn link(&mut self, dir: u64, name: &str, ino: u64) -> Result<()> {
         let name = check_name(name)?;
         self.prepare_mutation()?;
