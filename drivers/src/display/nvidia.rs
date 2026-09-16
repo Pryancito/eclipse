@@ -7929,13 +7929,15 @@ impl DrmScheme for NvidiaGpu {
         // Channel bookkeeping. Only the RM-backed channel carries real GPU state,
         // so a process that merely enumerated (discovery channels) is reclaimed
         // without the class-object cleanup below.
-        let had_rm_backed = {
+        let (had_rm_backed, released_ctx0) = {
             let mut chans = self.nouveau_channels.lock();
             let before = chans.len();
             let mut rm_backed = false;
+            let mut ctx0 = false;
             chans.retain(|c| {
                 if c.owner_pid == pid {
                     rm_backed |= c.rm_backed;
+                    ctx0 |= c.rm_backed && c.ctx_idx == 0;
                     false
                 } else {
                     true
@@ -7950,7 +7952,7 @@ impl DrmScheme for NvidiaGpu {
                 }
                 return;
             }
-            rm_backed
+            (rm_backed, ctx0)
         };
         if !had_rm_backed {
             log::info!(
@@ -7958,6 +7960,16 @@ impl DrmScheme for NvidiaGpu {
                 pid, dropped_maps, freed_gems
             );
             return;
+        }
+        if released_ctx0 {
+            if let Some(device_instance) = device_instance {
+                self.reset_ctx0_singleton(device_instance, "process exit", pid);
+            } else {
+                crate::klog_warn!(
+                    "[nouveau-uapi] ctx0 reset: process exit pid={} but no RM device instance is attached",
+                    pid
+                );
+            }
         }
         // Class objects and ctx_free already ran (GPU off the runlist, VAS
         // gone). Only channel bookkeeping remains.
@@ -9358,6 +9370,28 @@ impl NvidiaGpu {
         }
     }
 
+    /// Rebuild path for the compositor singleton (ctx 0): release its direct
+    /// submit state and tear down step17's cached channel, so the next
+    /// CHANNEL_ALLOC/step17 recreates a fresh ctx0 channel instead of reusing a
+    /// wedged one across labwc respawns.
+    fn reset_ctx0_singleton(&self, device_instance: u32, reason: &str, owner_pid: u64) {
+        self.fast_release(device_instance, 0);
+        lock::pump();
+        let status = nvidia_rm_sys::rm_init::ctx0_reset(device_instance);
+        if status == 0 {
+            crate::klog_warn!(
+                "[nouveau-uapi] ctx0 reset: {reason} pid={} -> step17 singleton cleared; next compositor CHANNEL_ALLOC rebuilds a fresh channel",
+                owner_pid
+            );
+        } else {
+            crate::klog_warn!(
+                "[nouveau-uapi] ctx0 reset: {reason} pid={} failed, NV_STATUS={:#x} (respawn may reuse a dead channel; #1192 pixman fallback remains the safety net)",
+                owner_pid,
+                status
+            );
+        }
+    }
+
     fn nouveau_owns_rm_channel(&self, owner_pid: u64) -> bool {
         self.nouveau_channels
             .lock()
@@ -10656,7 +10690,10 @@ impl NvidiaGpu {
                 // killed the channel, GPGet froze at 1 and the GPFIFO ring
                 // filled up: the exact RING FULL GPPut=0 GPGet=1 signature.
                 // Mappings are reclaimed where they belong: GEM_CLOSE (per
-                // handle) and process exit (nouveau_release_process).
+                // handle) and process exit (nouveau_release_process). Do NOT
+                // reset ctx0 here: a process may free a throwaway ctx0 channel
+                // while another channel of the SAME process is still actively
+                // using the compositor singleton.
                 let _ = was_rm_backed;
                 Ok(0)
             }

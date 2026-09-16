@@ -2417,6 +2417,16 @@ NV_STATUS eclipse_rm_ctx_free(NvU32 gpuInstance, NvU32 ctxIdx)
     pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
 
     pCtx = &g_ctxAlloc[ctxIdx];
+    /* Deschedule before freeing: on a wedged channel this avoids freeing while
+     * it is still considered runnable on the runlist. */
+    if (pCtx->hChannel != 0)
+    {
+        NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS sched;
+        portMemSet(&sched, 0, sizeof(sched));
+        sched.bEnable = NV_FALSE;
+        (void)pRmApi->Control(pRmApi, g_grAllocCache.hClient, pCtx->hChannel,
+                              NVA06F_CTRL_CMD_GPFIFO_SCHEDULE, &sched, sizeof(sched));
+    }
     /* Reverse dependency order, matching ctx_alloc's failure cleanup: freeing
      * the channel tears down its bound compute object and takes it off the
      * runlist; freeing the VA space drops every VM_BIND mapping still in it. */
@@ -2437,6 +2447,116 @@ NV_STATUS eclipse_rm_ctx_free(NvU32 gpuInstance, NvU32 ctxIdx)
 
     portMemSet(pCtx, 0, sizeof(*pCtx));
     g_ctxDone[ctxIdx] = NV_FALSE;
+
+    rmapiLockRelease();
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return NV_OK;
+}
+
+/*
+ * Tear down and uncache context 0's singleton step17 channel, so a later
+ * step17 call rebuilds a fresh GPFIFO/USERD/VAS binding instead of reusing a
+ * potentially wedged channel across compositor respawns.
+ *
+ * Preconditions:
+ *  - step16 remains alive (shared ladder stays cached in g_grAllocCache)
+ *  - caller already released ctx0's fast USERD map (exec_fast_release ctx0),
+ *    so no submit path still dereferences the old USERD window
+ *
+ * Idempotent: if step17 was never completed (or was already reset), this is a
+ * no-op that returns NV_OK.
+ */
+NV_STATUS eclipse_rm_ctx0_reset(NvU32 gpuInstance)
+{
+    OBJGPU *pGpu;
+    RM_API *pRmApi;
+    NV_STATUS status;
+    THREAD_STATE_NODE threadState;
+
+    if (!g_grChanDone)
+    {
+        return NV_OK;
+    }
+    if (g_grAllocDone && gpuInstance != g_grAllocGpuInst)
+    {
+        nv_printf(0, "[eclipse-rm-trace] ctx0_reset on gpu%u rejected (ladder owner is gpu%u)\n",
+                  gpuInstance, g_grAllocGpuInst);
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    pGpu = gpumgrGetGpu(gpuInstance);
+    if (pGpu == NULL || !pGpu->gspRmInitialized)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
+    }
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
+
+    if (g_grChanCache.hCompute != 0)
+    {
+        status = pRmApi->Free(pRmApi, g_grAllocCache.hClient, g_grChanCache.hCompute);
+        if (status != NV_OK)
+        {
+            nv_printf(0, "[eclipse-rm-trace] ctx0_reset: Free(hCompute=0x%x) -> 0x%x\n",
+                      g_grChanCache.hCompute, status);
+            rmapiLockRelease();
+            gpumgrThreadDisableExpandedGpuVisibility();
+            threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+            return status;
+        }
+    }
+    if (g_grChanCache.hChannel != 0)
+    {
+        NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS sched;
+        NV_STATUS schedStatus;
+        portMemSet(&sched, 0, sizeof(sched));
+        sched.bEnable = NV_FALSE;
+        schedStatus = pRmApi->Control(pRmApi, g_grAllocCache.hClient, g_grChanCache.hChannel,
+                                      NVA06F_CTRL_CMD_GPFIFO_SCHEDULE, &sched, sizeof(sched));
+        if (schedStatus != NV_OK)
+        {
+            nv_printf(0, "[eclipse-rm-trace] ctx0_reset: deschedule(hChannel=0x%x) -> 0x%x\n",
+                      g_grChanCache.hChannel, schedStatus);
+        }
+        status = pRmApi->Free(pRmApi, g_grAllocCache.hClient, g_grChanCache.hChannel);
+        if (status != NV_OK)
+        {
+            nv_printf(0, "[eclipse-rm-trace] ctx0_reset: Free(hChannel=0x%x) -> 0x%x (cache kept)\n",
+                      g_grChanCache.hChannel, status);
+            rmapiLockRelease();
+            gpumgrThreadDisableExpandedGpuVisibility();
+            threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+            return status;
+        }
+    }
+    if (g_grChanCache.hNotifier != 0)
+        pRmApi->Free(pRmApi, g_grAllocCache.hClient, g_grChanCache.hNotifier);
+    if (g_grChanCache.hVirtBuf != 0)
+        pRmApi->Free(pRmApi, g_grAllocCache.hClient, g_grChanCache.hVirtBuf);
+    if (g_grChanCache.hPhysBuf != 0)
+        pRmApi->Free(pRmApi, g_grAllocCache.hClient, g_grChanCache.hPhysBuf);
+    if (g_grChanCache.hUserd != 0)
+        pRmApi->Free(pRmApi, g_grAllocCache.hClient, g_grChanCache.hUserd);
+
+    portMemSet(&g_grChanCache, 0, sizeof(g_grChanCache));
+    g_grChanDone = NV_FALSE;
+    nv_printf(0, "[eclipse-rm-trace] ctx0_reset: step17 channel cache cleared; next step17 rebuilds ctx0\n");
 
     rmapiLockRelease();
     gpumgrThreadDisableExpandedGpuVisibility();
