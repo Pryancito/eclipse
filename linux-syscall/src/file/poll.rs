@@ -150,15 +150,6 @@ impl Syscall<'_> {
                 // Unsubscribe last pass's readiness wakers before re-scanning;
                 // fresh ones are parked below if we wait again.
                 this.subs.clear();
-                if let Err(e) = linux_object::process::check_signals() {
-                    clear_poll_io(
-                        &mut this.timer,
-                        &mut this.io_waker,
-                        this.watch_net,
-                        this.watch_interactive,
-                    );
-                    return Poll::Ready(Err(e));
-                }
                 let watch_net = this
                     .polls
                     .iter()
@@ -245,6 +236,20 @@ impl Syscall<'_> {
                         watch_interactive,
                     );
                     return Poll::Ready(Ok(events));
+                }
+
+                // A signal may interrupt only when we are actually about to
+                // block again. If the caller already has ready fds (or a
+                // timeout of 0 / an expired timeout), Linux returns that result
+                // instead of synthesizing `EINTR`.
+                if let Err(e) = linux_object::process::check_signals() {
+                    clear_poll_io(
+                        &mut this.timer,
+                        &mut this.io_waker,
+                        watch_net,
+                        watch_interactive,
+                    );
+                    return Poll::Ready(Err(e));
                 }
 
                 // Nothing ready and we are about to wait: park a readiness
@@ -525,15 +530,6 @@ impl Syscall<'_> {
                 let this = self.get_mut();
                 // Unsubscribe last pass's readiness wakers before re-scanning.
                 this.subs.clear();
-                if let Err(e) = linux_object::process::check_signals() {
-                    clear_poll_io(
-                        &mut this.timer,
-                        &mut this.io_waker,
-                        this.watch_net,
-                        this.watch_interactive,
-                    );
-                    return Poll::Ready(Err(e));
-                }
                 let watch_net = this.watch_net;
                 let watch_interactive = this.watch_interactive;
                 let terminal_only = this.terminal_only;
@@ -604,6 +600,16 @@ impl Syscall<'_> {
                     this.write_fds.commit();
                     this.err_fds.commit();
                     return Poll::Ready(Ok(events));
+                }
+
+                if let Err(e) = linux_object::process::check_signals() {
+                    clear_poll_io(
+                        &mut this.timer,
+                        &mut this.io_waker,
+                        watch_net,
+                        watch_interactive,
+                    );
+                    return Poll::Ready(Err(e));
                 }
 
                 // Same readiness-subscription scheme as PollFuture: park a
