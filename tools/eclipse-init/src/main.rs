@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 /// A respawn service that exits sooner than this after starting is treated as
@@ -39,6 +39,32 @@ const HEALTHY_UPTIME: Duration = Duration::from_secs(2);
 /// would fork/exec at full speed forever, pinning a CPU.
 const MIN_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
+
+/// Compositor GPU-renderer fallback. `nvidia.wlr_gles2` / `nvidia.wlr_vulkan`
+/// put labwc on the GPU-rendered wlroots path (zink+NVK over the nouveau
+/// uAPI). On real hardware that path can die when a client's EXEC wedges the
+/// GPU channel: the compositor is context 0, a per-boot singleton the kernel
+/// never rebuilds, so every respawn of labwc lands on the SAME wedged channel
+/// and dies again -- the desktop goes black and comes back unstable, in a
+/// loop. Once labwc has exited [`COMPOSITOR_DEGRADE_AFTER`] times this boot
+/// while the GPU renderer was requested, `build_child_env` hands later
+/// respawns `WLR_RENDERER=pixman` (the proven software path) instead, so the
+/// desktop recovers. The first exit still retries the GPU renderer in case it
+/// was transient. Per boot: the next boot tries GPU rendering again.
+static COMPOSITOR_DEGRADED: AtomicBool = AtomicBool::new(false);
+/// How many times labwc has exited this boot with the GPU renderer requested.
+static COMPOSITOR_EXITS: AtomicU32 = AtomicU32::new(0);
+/// Exits of the GPU-rendered compositor tolerated before degrading to pixman.
+const COMPOSITOR_DEGRADE_AFTER: u32 = 2;
+
+/// Whether the cmdline asked for the GPU-rendered wlroots compositor
+/// (`nvidia.wlr_gles2` or `nvidia.wlr_vulkan`).
+fn gpu_compositor_requested() -> bool {
+    let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    cmdline
+        .split([':', ' ', '\t', '\n'])
+        .any(|t| t == "nvidia.wlr_gles2" || t == "nvidia.wlr_vulkan")
+}
 
 /// Set by the SIGUSR1/SIGUSR2 handlers: bring the system down (halt/power off).
 static WANT_HALT: AtomicBool = AtomicBool::new(false);
@@ -1135,7 +1161,13 @@ fn build_child_env() -> Vec<CString> {
                 //
                 // Absent those flags, use pixman for the compositor and software
                 // GL for clients. That avoids zink/NVK entirely on boot.
-                if cmdline_has("nvidia.wlr_vulkan") || cmdline_has("nvidia.wlr_gles2") {
+                // ...unless the compositor already died COMPOSITOR_DEGRADE_AFTER
+                // times this boot on the GPU renderer: then this respawn goes to
+                // pixman so the desktop recovers (see COMPOSITOR_DEGRADED).
+                let degraded = COMPOSITOR_DEGRADED.load(Ordering::Relaxed);
+                if !degraded
+                    && (cmdline_has("nvidia.wlr_vulkan") || cmdline_has("nvidia.wlr_gles2"))
+                {
                     let wlr = if cmdline_has("nvidia.wlr_vulkan") {
                         "vulkan"
                     } else {
@@ -1164,9 +1196,15 @@ fn build_child_env() -> Vec<CString> {
                     env.push(CString::new("WLR_RENDERER_ALLOW_SOFTWARE=1").unwrap());
                     env.push(CString::new("LIBGL_ALWAYS_SOFTWARE=1").unwrap());
                     push_sdl_render_env(&mut env, SdlRender::Software);
-                    log(
-                        "renderer=gl: NVIDIA GPU -> defaulting labwc to pixman and clients to software GL; opt into GPU rendering with nvidia.wlr_gles2 or nvidia.wlr_vulkan",
-                    );
+                    if degraded {
+                        log(
+                            "renderer=gl: NVIDIA GPU -> compositor DEGRADED to pixman for the rest of this boot (labwc kept dying on the GPU renderer; the GPU channel is likely wedged -- see `dmesg | grep nouveau-uapi` and /tmp/labwc.log)",
+                        );
+                    } else {
+                        log(
+                            "renderer=gl: NVIDIA GPU -> defaulting labwc to pixman and clients to software GL; opt into GPU rendering with nvidia.wlr_gles2 or nvidia.wlr_vulkan",
+                        );
+                    }
                 }
             } else {
                 // `renderer=gl` (GL=1) on a machine with NO NVIDIA GPU -- the
@@ -1376,6 +1414,33 @@ fn supervise(services: &mut BTreeMap<String, Service>) {
             } else {
                 format!("status {:#x}", status)
             };
+            // GPU-renderer fallback for the compositor (see COMPOSITOR_DEGRADED):
+            // count labwc's exits while nvidia.wlr_gles2/vulkan is requested and,
+            // past the tolerance, flip later respawns to pixman. Counted on EVERY
+            // exit, not only fast ones: the first labwc instance can live for
+            // minutes (the desktop works until a client wedges the GPU channel)
+            // and the respawns on the dead channel may also linger before dying,
+            // so an uptime-gated "crash" count would never trip.
+            if svc.name == "labwc"
+                && !COMPOSITOR_DEGRADED.load(Ordering::Relaxed)
+                && gpu_compositor_requested()
+            {
+                let n = COMPOSITOR_EXITS.fetch_add(1, Ordering::Relaxed) + 1;
+                if n >= COMPOSITOR_DEGRADE_AFTER {
+                    COMPOSITOR_DEGRADED.store(true, Ordering::Relaxed);
+                    log(&format!(
+                        "respawn: labwc died {n}x this boot on the GPU renderer ({how}); \
+                         degrading the compositor to pixman for the rest of this boot -- \
+                         the GPU channel is likely wedged (a client's EXEC hung it and \
+                         ctx 0 is never rebuilt); see `dmesg | grep nouveau-uapi` and /tmp/labwc.log"
+                    ));
+                } else {
+                    log(&format!(
+                        "respawn: labwc died ({how}) on the GPU renderer; retrying it \
+                         ({n}/{COMPOSITOR_DEGRADE_AFTER} exits before degrading to pixman)"
+                    ));
+                }
+            }
             if uptime >= HEALTHY_UPTIME {
                 // Up long enough to be healthy: restart now, reset the backoff.
                 svc.backoff = MIN_BACKOFF;
