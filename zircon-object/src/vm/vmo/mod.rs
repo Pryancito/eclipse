@@ -232,6 +232,15 @@ pub struct VmObject {
     /// a field of `inner` because `clone_map` reads it with no other reason to
     /// take the object lock.
     share_on_fork: core::sync::atomic::AtomicBool,
+    /// Byte offset into the backing FILE at which this object's contents
+    /// start. A private file mapping bakes the `mmap` offset into its
+    /// demand-paging source and maps the object at `vmo_offset == 0`, so
+    /// without this the mapping alone cannot say which part of the file it
+    /// shows: `/proc/<pid>/maps` and the crash reports' `lib+offset` would
+    /// name the offset within the mapped segment, not within the file, and
+    /// `addr2line` on the host would resolve the wrong function. Zero for
+    /// anonymous objects and for whole-file objects mapped at an offset.
+    file_offset: core::sync::atomic::AtomicUsize,
     unbounded: bool,
     trait_: Arc<dyn VMObjectTrait>,
     inner: Mutex<VmObjectInner>,
@@ -373,6 +382,7 @@ impl VmObject {
             kind: account_new(VmoKind::Paged, pages * PAGE_SIZE),
             accounted_bytes: pages * PAGE_SIZE,
             share_on_fork: core::sync::atomic::AtomicBool::new(false),
+            file_offset: core::sync::atomic::AtomicUsize::new(0),
             trait_: VMObjectPaged::new(pages),
             inner: Mutex::new(VmObjectInner {
                 content_size,
@@ -396,6 +406,7 @@ impl VmObject {
             kind: account_new(VmoKind::PagedSource, pages * PAGE_SIZE),
             accounted_bytes: pages * PAGE_SIZE,
             share_on_fork: core::sync::atomic::AtomicBool::new(false),
+            file_offset: core::sync::atomic::AtomicUsize::new(0),
             unbounded: false,
             trait_: VMObjectPaged::new_with_source(pages, source),
             inner: Mutex::new(VmObjectInner::default()),
@@ -420,6 +431,7 @@ impl VmObject {
             kind: account_new(VmoKind::PagedSource, pages * PAGE_SIZE),
             accounted_bytes: pages * PAGE_SIZE,
             share_on_fork: core::sync::atomic::AtomicBool::new(false),
+            file_offset: core::sync::atomic::AtomicUsize::new(0),
             unbounded: false,
             trait_,
             inner: Mutex::new(VmObjectInner::default()),
@@ -448,6 +460,7 @@ impl VmObject {
             kind: account_new(VmoKind::PagedSource, pages * PAGE_SIZE),
             accounted_bytes: pages * PAGE_SIZE,
             share_on_fork: core::sync::atomic::AtomicBool::new(false),
+            file_offset: core::sync::atomic::AtomicUsize::new(0),
             unbounded: false,
             trait_: VMObjectPaged::new_borrowing(pages, cache, base_offset),
             inner: Mutex::new(VmObjectInner::default()),
@@ -466,6 +479,7 @@ impl VmObject {
             kind: account_new(VmoKind::Physical, pages * PAGE_SIZE),
             accounted_bytes: pages * PAGE_SIZE,
             share_on_fork: core::sync::atomic::AtomicBool::new(false),
+            file_offset: core::sync::atomic::AtomicUsize::new(0),
             trait_: VMObjectPhysical::new(paddr, pages),
             inner: Mutex::new(VmObjectInner::default()),
         })
@@ -506,6 +520,7 @@ impl VmObject {
             kind: account_new(VmoKind::Contiguous, pages * PAGE_SIZE),
             accounted_bytes: pages * PAGE_SIZE,
             share_on_fork: core::sync::atomic::AtomicBool::new(false),
+            file_offset: core::sync::atomic::AtomicUsize::new(0),
             trait_: VMObjectPaged::new_contiguous(pages, align_log2)?,
             inner: Mutex::new(VmObjectInner::default()),
         });
@@ -530,6 +545,7 @@ impl VmObject {
             kind: account_new(VmoKind::Child, len),
             accounted_bytes: len,
             share_on_fork: core::sync::atomic::AtomicBool::new(false),
+            file_offset: core::sync::atomic::AtomicUsize::new(0),
             trait_,
             inner: Mutex::new(VmObjectInner {
                 parent: Arc::downgrade(self),
@@ -570,6 +586,7 @@ impl VmObject {
             kind: account_new(VmoKind::Child, size),
             accounted_bytes: size,
             share_on_fork: core::sync::atomic::AtomicBool::new(false),
+            file_offset: core::sync::atomic::AtomicUsize::new(0),
             trait_: VMObjectSlice::new(self.trait_.clone(), offset, size),
             inner: Mutex::new(VmObjectInner {
                 parent: Arc::downgrade(self),
@@ -733,6 +750,19 @@ impl VmObject {
         self.trait_.set_shared();
     }
 
+    /// Record the file offset this object's contents start at (see the
+    /// field). Set once by the file mapping code right after creation.
+    pub fn set_file_offset(&self, offset: usize) {
+        self.file_offset
+            .store(offset, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Byte offset into the backing file of this object's first byte; zero
+    /// when the object is anonymous or spans the file from its start.
+    pub fn file_offset(&self) -> usize {
+        self.file_offset.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Whether other mappings, `read(2)` or a device can observe this
     /// object's pages: a shared-on-fork object, a file/memfd page cache, or
     /// physical/contiguous memory (a framebuffer, a GEM buffer).
@@ -840,6 +870,7 @@ impl VmObject {
             kind: account_new(VmoKind::Paged, len),
             accounted_bytes: len,
             share_on_fork: core::sync::atomic::AtomicBool::new(false),
+            file_offset: core::sync::atomic::AtomicUsize::new(0),
             unbounded: false,
             trait_,
             inner: Mutex::new(VmObjectInner {

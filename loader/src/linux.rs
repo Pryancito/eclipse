@@ -398,7 +398,7 @@ fn describe_addr(vmar: &Arc<VmAddressRegion>, addr: usize) -> String {
     }
     for m in vmar.mappings_dump() {
         if (m.start..m.end).contains(&addr) {
-            let offset = m.vmo_offset + (addr - m.start);
+            let offset = m.file_offset + (addr - m.start);
             let name: &str = if m.name.is_empty() { "anon" } else { &m.name };
             return alloc::format!("{name}+{offset:#x} in map {:#x}-{:#x}", m.start, m.end);
         }
@@ -407,32 +407,40 @@ fn describe_addr(vmar: &Arc<VmAddressRegion>, addr: usize) -> String {
 }
 
 /// Scan the user stack from `sp` upwards for words that point into an
-/// executable mapping and render each as `stack[+off] = addr [lib+offset]`.
+/// executable page and render each as `stack[+off] = addr [lib+offset]`,
+/// `offset` being the FILE offset (`MappingDump::file_offset`) so it feeds
+/// `addr2line` directly.
 ///
 /// Reads go through the address space's VMOs, so an unmapped `sp` (stack
 /// overflow, corrupted register) yields an empty trace instead of a kernel
-/// fault. The scan is bounded both in bytes looked at and in lines printed so
-/// a report stays a screenful on the serial console.
+/// fault. An unaligned `sp` is a legal state on x86-64 (any `sub rsp` before
+/// the fault) and is aligned down rather than rejected. Executability is
+/// tested on the candidate's own page: a partial `mprotect` leaves mixed
+/// per-page permissions inside one mapping, and the dump row only carries
+/// the first page's. The scan is bounded both in bytes looked at and in
+/// lines printed so a report stays a screenful on the serial console.
 fn user_stack_backtrace(vmar: &Arc<VmAddressRegion>, sp: usize) -> Vec<String> {
     /// Bytes of stack to look at (128 words on a 64-bit target).
     const SCAN_BYTES: usize = 1024;
     /// Cap on rendered frames.
     const MAX_FRAMES: usize = 24;
     let mut out = Vec::new();
-    if sp == 0 || sp & (core::mem::size_of::<usize>() - 1) != 0 {
+    if sp == 0 {
         return out;
     }
+    let word = core::mem::size_of::<usize>();
+    let sp = sp & !(word - 1);
     let mut buf = [0u8; SCAN_BYTES];
     let got = match vmar.read_memory(sp, &mut buf) {
         Ok(n) => n,
         Err(_) => return out,
     };
-    let code_maps: Vec<_> = vmar
-        .mappings_dump()
-        .into_iter()
-        .filter(|m| m.flags.contains(kernel_hal::MMUFlags::EXECUTE))
-        .collect();
-    let word = core::mem::size_of::<usize>();
+    let maps = vmar.mappings_dump();
+    let executable = |addr: usize| -> bool {
+        vmar.find_mapping(addr)
+            .and_then(|m| m.get_flags(addr).ok())
+            .is_some_and(|f| f.contains(kernel_hal::MMUFlags::EXECUTE))
+    };
     for (i, chunk) in buf[..got].chunks_exact(word).enumerate() {
         let mut raw = [0u8; core::mem::size_of::<usize>()];
         raw.copy_from_slice(chunk);
@@ -440,16 +448,20 @@ fn user_stack_backtrace(vmar: &Arc<VmAddressRegion>, sp: usize) -> Vec<String> {
         if addr == 0 {
             continue;
         }
-        if let Some(m) = code_maps.iter().find(|m| (m.start..m.end).contains(&addr)) {
-            let offset = m.vmo_offset + (addr - m.start);
-            let name: &str = if m.name.is_empty() { "anon" } else { &m.name };
-            out.push(alloc::format!(
-                "stack[+{:#x}] = {addr:#x} [{name}+{offset:#x}]",
-                i * word
-            ));
-            if out.len() >= MAX_FRAMES {
-                break;
-            }
+        let Some(m) = maps.iter().find(|m| (m.start..m.end).contains(&addr)) else {
+            continue;
+        };
+        if !executable(addr) {
+            continue;
+        }
+        let offset = m.file_offset + (addr - m.start);
+        let name: &str = if m.name.is_empty() { "anon" } else { &m.name };
+        out.push(alloc::format!(
+            "stack[+{:#x}] = {addr:#x} [{name}+{offset:#x}]",
+            i * word
+        ));
+        if out.len() >= MAX_FRAMES {
+            break;
         }
     }
     out
@@ -593,7 +605,7 @@ fn handle_signal(
         let maps = thread.proc().vmar().mappings_dump();
         let resolve = |addr: usize| -> Option<String> {
             let m = maps.iter().find(|m| addr >= m.start && addr < m.end)?;
-            let off = m.vmo_offset + (addr - m.start);
+            let off = m.file_offset + (addr - m.start);
             Some(if m.name.is_empty() {
                 alloc::format!("<anon:{}>+{:#x}", m.vmo_id, off)
             } else {

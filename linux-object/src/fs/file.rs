@@ -1050,6 +1050,7 @@ impl FileLike for File {
                     {
                         let vmo = VmObject::new_paged_borrowing(pages(len), cache, offset);
                         vmo.set_name(&self.path);
+                        vmo.set_file_offset(offset);
                         return Ok(vmo);
                     }
                 }
@@ -1075,6 +1076,10 @@ impl FileLike for File {
                 // `libglib-2.0.so.0+0x…` can be fed straight to addr2line.
                 let vmo = VmObject::new_paged_with_source(pages(len), source);
                 vmo.set_name(&self.path);
+                // The mapping is created at `vmo_offset == 0` over this window,
+                // so the file offset lives here; `/proc/<pid>/maps` and the
+                // crash reports add it back.
+                vmo.set_file_offset(offset);
                 Ok(vmo)
             }
             FileType::CharDevice => {
