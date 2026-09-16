@@ -199,6 +199,7 @@ static int g_gl_swrast = 0;     // renderer looks like a software rasteriser
 static int g_llvmpipe_bits = 0; // vector width parsed from a llvmpipe RENDERER
 static double g_bench_fps = 0;  // per-frame-synced frame rate from the perf bench
 static int g_tcg = 0;           // running on an emulated CPU (QEMU TCG, no KVM)
+static int g_avx_os_off = 0;    // CPU has AVX2 but the OS never enabled AVX state
 static int g_vk_devs = 0;       // Vulkan physical devices enumerated
 static void *g_wl_display;      // live compositor connection (or NULL)
 static int g_wl_have_compositor, g_wl_have_xdg, g_wl_have_dmabuf, g_wl_have_layer;
@@ -587,6 +588,36 @@ static void report_x86_cpuid(void) {
   if (!avx2)
     info("  -> CPU exposes no AVX2: llvmpipe caps at 128-bit SSE, ~2x slower "
          "than a 256-bit AVX2 host.");
+
+  // AVX being present in CPUID is not enough to USE it: the OS must set
+  // CR4.OSXSAVE and enable the AVX bit in XCR0 (via XSETBV), and it must
+  // save/restore YMM across context switches. LLVM/llvmpipe check exactly this
+  // (OSXSAVE + XGETBV) and silently fall back to 128-bit SSE when the OS has
+  // not opted in -- which looks like "128 bits" even on an AVX2 CPU under KVM.
+  int xsave = (c >> 26) & 1, osxsave = (c >> 27) & 1;
+  int os_sse = 0, os_avx = 0, os_avx512 = 0;
+  if (osxsave) {
+    uint32_t lo, hi;
+    __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));  // read XCR0
+    uint64_t xcr0 = ((uint64_t)hi << 32) | lo;
+    os_sse = (xcr0 >> 1) & 1;
+    os_avx = (xcr0 >> 2) & 1;
+    os_avx512 = (xcr0 >> 5) & 7 ? 1 : 0;  // opmask + ZMM_Hi256 + Hi16_ZMM
+  }
+  info("XSAVE: cpu=%d  CR4.OSXSAVE=%d  XCR0: SSE=%d AVX=%d AVX512=%d", xsave,
+       osxsave, os_sse, os_avx, os_avx512);
+  if (avx2 && !os_avx) {
+    g_avx_os_off = 1;
+    info("  -> CPU HAS AVX2 but the OS has NOT enabled AVX state "
+         "(CR4.OSXSAVE/XCR0). LLVM/llvmpipe fall back to 128-bit SSE -- THIS is "
+         "why the width is 128-bit even on KVM. Kernel fix: set CR4.OSXSAVE + "
+         "XSETBV XCR0 bit2, and save YMM in the context switch.");
+  }
+  check(!(avx2 && !os_avx), "OS enables AVX state (CR4.OSXSAVE/XCR0)",
+        g_avx_os_off ? "AVX2-capable CPU, but the OS left AVX disabled"
+                     : "AVX state is OS-enabled (or no AVX2 to enable)",
+        0);
+
   if (hv) {
     // Hypervisor leaf: vendor string in EBX,ECX,EDX. __get_cpuid rejects leaves
     // above the max standard leaf, so read this one raw.
@@ -1132,6 +1163,9 @@ static void verdict(void) {
   if (g_tcg)
     printf("        CPU is EMULATED (QEMU TCG, no KVM) -- the biggest slowdown; "
            "boot with KVM (make qemu ACCEL=1)\n");
+  if (g_avx_os_off)
+    printf("        AVX2 present but OS-disabled (no CR4.OSXSAVE/XCR0) -- forces "
+           "llvmpipe to 128-bit; a kernel fix would ~2x software GL\n");
   printf("  Vulkan: %s\n",
          g_vk_devs > 0 ? "at least one device (ICD present)"
                        : "no device -- Vulkan clients (Zink, vkcube) fail");
