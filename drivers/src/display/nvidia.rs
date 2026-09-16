@@ -10654,7 +10654,7 @@ impl NvidiaGpu {
 
             nv::NR_CHANNEL_FREE => {
                 let req = unsafe { &*(arg as *const nv::DrmNouveauChannelFree) };
-                let (was_rm_backed, freed_ctx0) = {
+                let was_rm_backed = {
                     let mut chans = self.nouveau_channels.lock();
                     // Only the channel's own process may free it: freeing the
                     // compositor's channel 0 from a client made its next EXEC
@@ -10669,8 +10669,7 @@ impl NvidiaGpu {
                         );
                         return Err(nv::EINVAL);
                     };
-                    let removed = chans.remove(pos);
-                    (removed.rm_backed, removed.rm_backed && removed.ctx_idx == 0)
+                    chans.remove(pos).rm_backed
                 };
                 // CHANNEL_FREE must NOT touch the VM: in the nouveau uAPI,
                 // VM_BIND mappings belong to the DRM FILE's VA space, not to
@@ -10691,17 +10690,10 @@ impl NvidiaGpu {
                 // killed the channel, GPGet froze at 1 and the GPFIFO ring
                 // filled up: the exact RING FULL GPPut=0 GPGet=1 signature.
                 // Mappings are reclaimed where they belong: GEM_CLOSE (per
-                // handle) and process exit (nouveau_release_process).
-                if freed_ctx0 {
-                    if let Some(device_instance) = *self.rm_device_instance.lock() {
-                        self.reset_ctx0_singleton(device_instance, "CHANNEL_FREE", owner_pid);
-                    } else {
-                        crate::klog_warn!(
-                            "[nouveau-uapi] ctx0 reset: CHANNEL_FREE by pid={} but no RM device instance is attached",
-                            owner_pid
-                        );
-                    }
-                }
+                // handle) and process exit (nouveau_release_process). Do NOT
+                // reset ctx0 here: a process may free a throwaway ctx0 channel
+                // while another channel of the SAME process is still actively
+                // using the compositor singleton.
                 let _ = was_rm_backed;
                 Ok(0)
             }

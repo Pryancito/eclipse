@@ -1590,7 +1590,7 @@ no es la ruta de init (que sí fuerza DRM). Un despiste, no el problema.
 ## Recuperación de ctx 0 en respawn del compositor (nuevo)
 
 Se añadió ruta explícita para el caso que faltaba en el bucle de labwc: cuando
-sale el dueño RM-backed de **ctx 0** (por `CHANNEL_FREE` o salida del proceso),
+sale el dueño RM-backed de **ctx 0** (salida del proceso),
 el kernel ahora desmonta el singleton `step17` y limpia su caché (`ctx0_reset`)
 antes del siguiente arranque de labwc. Así el respawn no reutiliza el mismo
 canal muerto.
