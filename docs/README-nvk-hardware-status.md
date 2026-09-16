@@ -1587,6 +1587,25 @@ Nota: el `labwc` lanzado A MANO desde la shell falla distinto
 `DISPLAY=:0` y sin `WLR_BACKENDS=drm` wlroots elige el backend X11 anidado —
 no es la ruta de init (que sí fuerza DRM). Un despiste, no el problema.
 
+## Recuperación de ctx 0 en respawn del compositor (nuevo)
+
+Se añadió ruta explícita para el caso que faltaba en el bucle de labwc: cuando
+sale el dueño RM-backed de **ctx 0** (por `CHANNEL_FREE` o salida del proceso),
+el kernel ahora desmonta el singleton `step17` y limpia su caché (`ctx0_reset`)
+antes del siguiente arranque de labwc. Así el respawn no reutiliza el mismo
+canal muerto.
+
+Validación pendiente obligatoria en RTX (no reproducible en CI/QEMU):
+
+```sh
+# arrancar con la ruta GPU del compositor y trazas visibles
+cmdline=LOG=warn:nvidia.nouveau_uapi:nvidia.wlr_gles2:...
+
+# forzar la caída (Firefox/Halloy) y verificar que el siguiente respawn reconstruye ctx0
+dmesg | grep -iE "nouveau-uapi|ctx0 reset|step17|fence TIMEOUT|ring did not free|NV_STATUS|Assertion" | tail -80
+cat /tmp/labwc.log | tail -40
+```
+
 ## CE-offload present, instrumentado (para perseguir la eficiencia con seguridad)
 
 El present por defecto es un blit por CPU que **lee** el buffer renderizado

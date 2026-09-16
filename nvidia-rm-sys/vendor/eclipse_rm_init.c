@@ -2445,6 +2445,83 @@ NV_STATUS eclipse_rm_ctx_free(NvU32 gpuInstance, NvU32 ctxIdx)
 }
 
 /*
+ * Tear down and uncache context 0's singleton step17 channel, so a later
+ * step17 call rebuilds a fresh GPFIFO/USERD/VAS binding instead of reusing a
+ * potentially wedged channel across compositor respawns.
+ *
+ * Preconditions:
+ *  - step16 remains alive (shared ladder stays cached in g_grAllocCache)
+ *  - caller already released ctx0's fast USERD map (exec_fast_release ctx0),
+ *    so no submit path still dereferences the old USERD window
+ *
+ * Idempotent: if step17 was never completed (or was already reset), this is a
+ * no-op that returns NV_OK.
+ */
+NV_STATUS eclipse_rm_ctx0_reset(NvU32 gpuInstance)
+{
+    OBJGPU *pGpu;
+    RM_API *pRmApi;
+    NV_STATUS status;
+    THREAD_STATE_NODE threadState;
+
+    if (!g_grChanDone)
+    {
+        return NV_OK;
+    }
+    if (g_grAllocDone && gpuInstance != g_grAllocGpuInst)
+    {
+        nv_printf(0, "[eclipse-rm-trace] ctx0_reset on gpu%u rejected (ladder owner is gpu%u)\n",
+                  gpuInstance, g_grAllocGpuInst);
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    pGpu = gpumgrGetGpu(gpuInstance);
+    if (pGpu == NULL || !pGpu->gspRmInitialized)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
+    }
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
+
+    if (g_grChanCache.hCompute != 0)
+        pRmApi->Free(pRmApi, g_grAllocCache.hClient, g_grChanCache.hCompute);
+    if (g_grChanCache.hChannel != 0)
+        pRmApi->Free(pRmApi, g_grAllocCache.hClient, g_grChanCache.hChannel);
+    if (g_grChanCache.hNotifier != 0)
+        pRmApi->Free(pRmApi, g_grAllocCache.hClient, g_grChanCache.hNotifier);
+    if (g_grChanCache.hVirtBuf != 0)
+        pRmApi->Free(pRmApi, g_grAllocCache.hClient, g_grChanCache.hVirtBuf);
+    if (g_grChanCache.hPhysBuf != 0)
+        pRmApi->Free(pRmApi, g_grAllocCache.hClient, g_grChanCache.hPhysBuf);
+    if (g_grChanCache.hUserd != 0)
+        pRmApi->Free(pRmApi, g_grAllocCache.hClient, g_grChanCache.hUserd);
+
+    portMemSet(&g_grChanCache, 0, sizeof(g_grChanCache));
+    g_grChanDone = NV_FALSE;
+    nv_printf(0, "[eclipse-rm-trace] ctx0_reset: step17 channel cache cleared; next step17 rebuilds ctx0\n");
+
+    rmapiLockRelease();
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return NV_OK;
+}
+
+/*
  * Step-18: the first Eclipse-authored GPU execution. Everything before this
  * point allocated and scheduled; nothing ever made the GPU *fetch and run*
  * methods we wrote. This step does, on the live step-17 channel:

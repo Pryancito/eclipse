@@ -496,6 +496,7 @@ pub fn ctx_alloc(device_instance: u32, ctx_idx: u32) -> Result<CtxAlloc, NV_STAT
 
 extern "C" {
     fn eclipse_rm_ctx_free(gpuInstance: NvU32, ctxIdx: NvU32) -> NV_STATUS;
+    fn eclipse_rm_ctx0_reset(gpuInstance: NvU32) -> NV_STATUS;
 }
 
 /// Free a per-process GR context built by [`ctx_alloc`] (channel + compute +
@@ -507,6 +508,14 @@ extern "C" {
 pub fn ctx_free(device_instance: u32, ctx_idx: u32) -> NV_STATUS {
     let _gate = RmGate::lock();
     unsafe { eclipse_rm_ctx_free(device_instance, ctx_idx) }
+}
+
+/// Tear down context 0's singleton step17 channel and clear its cache so the
+/// next [`step17`] call rebuilds a fresh compositor channel. Keeps step16's
+/// shared ladder alive. Serialized through [`RmGate`] like every RM entry.
+pub fn ctx0_reset(device_instance: u32) -> NV_STATUS {
+    let _gate = RmGate::lock();
+    unsafe { eclipse_rm_ctx0_reset(device_instance) }
 }
 
 extern "C" {
