@@ -461,13 +461,27 @@ impl PcmDev {
         self.audio.queued_bytes() as u64 / BYTES_PER_FRAME
     }
 
+    /// Frames still queued as THIS stream's ring sees them: never more than
+    /// its negotiated buffer. `queued_bytes` is per device, so another writer
+    /// on the same card (a second PCM open, `/dev/dsp`) can push it past this
+    /// stream's `buffer_size`. Reporting that put `hw_ptr` behind
+    /// `appl_ptr - buffer_size`, and alsa-lib's avail (`hw_ptr + buffer -
+    /// appl_ptr`, mod boundary) wrapped to ~boundary: PulseAudio then wrote
+    /// into room the kernel did not have, got EAGAIN right after
+    /// `snd_pcm_avail()`, and `try_recover()` asserted (`err != -11`),
+    /// aborting the daemon -- seen on real hardware with audio-probe and the
+    /// daemon's own sink both on hw:0,0.
+    fn queued_capped(&self, st: &PcmState) -> u64 {
+        self.queued_frames().min(st.buffer_size)
+    }
+
     /// Frames the client may write within its negotiated buffer.
     fn avail(&self, st: &PcmState) -> u64 {
-        st.buffer_size.saturating_sub(self.queued_frames())
+        st.buffer_size.saturating_sub(self.queued_capped(st))
     }
 
     fn hw_ptr(&self, st: &PcmState) -> u64 {
-        (st.appl_ptr + st.boundary - self.queued_frames()) % st.boundary
+        (st.appl_ptr + st.boundary - self.queued_capped(st)) % st.boundary
     }
 
     /// What the ALSA timer bound to this stream samples: whether the stream
@@ -1050,8 +1064,18 @@ impl PcmDev {
             let st_buffer = self.st.lock().buffer_size;
             let queued = self.queued_frames();
             let room_frames = st_buffer.saturating_sub(queued);
-            let chunk = ((room_frames * BYTES_PER_FRAME) as usize).min(total_bytes);
-            if chunk < BYTES_PER_FRAME as usize {
+            let frame = BYTES_PER_FRAME as usize;
+            let mut chunk = ((room_frames * BYTES_PER_FRAME) as usize).min(total_bytes);
+            if chunk < frame {
+                // A nonblocking client only writes after its avail said there
+                // was room; another writer on the same device may have taken
+                // it since. Let the ring's slack beyond this stream's buffer
+                // absorb the write instead of answering EAGAIN, which
+                // PulseAudio's try_recover() treats as fatal right after
+                // snd_pcm_avail(). EAGAIN only when the ring itself is full.
+                chunk = (self.audio.free_bytes() / frame * frame).min(total_bytes);
+            }
+            if chunk < frame {
                 return Err(FsError::Again);
             }
             let buf = unsafe { core::slice::from_raw_parts(src, chunk) };

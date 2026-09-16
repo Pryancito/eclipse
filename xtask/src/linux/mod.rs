@@ -2506,10 +2506,16 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               load-module module-augment-properties\n\
               load-module module-alsa-sink device=hw:0,0 mmap=0 tsched=0 ignore_dB=1 fragments=4 fragment_size=12000 sink_properties=device.description=Eclipse\n\
               load-module module-alsa-sink device=hw:1,0 mmap=0 tsched=0 ignore_dB=1 fragments=4 fragment_size=12000 sink_name=analog sink_properties=device.description=Analog\n\
+              # auth-cookie-enabled=0: with auth-anonymous the cookie is never\n\
+              # consulted, but the module still loads-or-creates one under\n\
+              # $XDG_CONFIG_HOME/pulse (or ~/.config/pulse) and FAILS TO LOAD when it\n\
+              # cannot -- the system instance runs as `pulse`, which cannot write\n\
+              # there, so no socket existed and every libpulse client fell through\n\
+              # (Firefox: 'OpenCubeb() failed to init cubeb').\n\
               .fail\n\
-              load-module module-native-protocol-unix auth-anonymous=1 socket=/run/pulse/native\n\
+              load-module module-native-protocol-unix auth-anonymous=1 auth-cookie-enabled=0 socket=/run/pulse/native\n\
               .nofail\n\
-              load-module module-native-protocol-unix auth-anonymous=1 socket=/run/user/0/pulse/native\n\
+              load-module module-native-protocol-unix auth-anonymous=1 auth-cookie-enabled=0 socket=/run/user/0/pulse/native\n\
               .fail\n\
               load-module module-always-sink\n\
               load-module module-intended-roles\n\
@@ -3015,6 +3021,10 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # After --system drops to pulse, pa_get_runtime_dir would reject\n\
               # that directory as 'not owned by us' and exit.\n\
               unset XDG_RUNTIME_DIR\n\
+              # Same for XDG_CONFIG_HOME=/root/.config: after the drop to `pulse`\n\
+              # nothing under /root is reachable; let config/cookie paths derive\n\
+              # from HOME below (writable by pulse).\n\
+              unset XDG_CONFIG_HOME\n\
               export HOME=/var/run/pulse\n\
               export PULSE_RUNTIME_PATH=/run/pulse\n\
               export PULSE_STATE_PATH=/var/lib/pulse\n\
