@@ -1930,10 +1930,33 @@ fn effective_pgid(proc: &Arc<Process>) -> KoID {
 pub fn send_signal_to_pgrp(pgid: usize, signal: LinuxSignal) -> LxResult<()> {
     let pgid = pgid as KoID;
     let mut any = false;
-    for proc in all_live_processes() {
-        if effective_pgid(&proc) == pgid
-            && send_signal_to_process(proc.id() as usize, signal).is_ok()
-        {
+    let members: Vec<Arc<Process>> = all_live_processes()
+        .into_iter()
+        .filter(|p| effective_pgid(p) == pgid)
+        .collect();
+    if signal_trace_worthy(signal) {
+        // The group model here is "pgid == some ancestor's pid" and pids are
+        // recycled fast, so a stale pgrp number can name a process that never
+        // belonged to the job. Say exactly who a group signal fans out to.
+        let (spid, sname) = current_process_pid_name();
+        let mut list = String::new();
+        for p in &members {
+            if !list.is_empty() {
+                list.push_str(", ");
+            }
+            list.push_str(&alloc::format!("{} ({})", p.id(), p.name()));
+        }
+        zcore_drivers::klog_warn!(
+            "[signal] {:?} to pgrp {} from pid {} ({}) -> [{}]",
+            signal,
+            pgid,
+            spid,
+            sname,
+            list
+        );
+    }
+    for proc in members {
+        if send_signal_to_process(proc.id() as usize, signal).is_ok() {
             any = true;
         }
     }
@@ -2275,9 +2298,74 @@ pub fn check_signals() -> LxResult<()> {
 }
 
 /// Send a signal to a process by its KoID.
+/// Signals worth a kernel log line when delivered: the ones that end or
+/// stop a process. The periodic ones (SIGCHLD, SIGALRM, SIGWINCH, SIGIO, ...)
+/// would only drown the ring.
+fn signal_trace_worthy(signal: LinuxSignal) -> bool {
+    matches!(
+        signal,
+        LinuxSignal::SIGHUP
+            | LinuxSignal::SIGINT
+            | LinuxSignal::SIGQUIT
+            | LinuxSignal::SIGILL
+            | LinuxSignal::SIGABRT
+            | LinuxSignal::SIGBUS
+            | LinuxSignal::SIGFPE
+            | LinuxSignal::SIGKILL
+            | LinuxSignal::SIGUSR1
+            | LinuxSignal::SIGUSR2
+            | LinuxSignal::SIGSEGV
+            | LinuxSignal::SIGPIPE
+            | LinuxSignal::SIGTERM
+            | LinuxSignal::SIGSTOP
+            | LinuxSignal::SIGTSTP
+    )
+}
+
+/// The calling process's pid and name for signal traces; `(0, "kernel")`
+/// when there is no user thread on this CPU (a pty master dropped from a
+/// kernel context, a timer).
+pub fn current_process_pid_name() -> (u64, String) {
+    if let Some(arc) = kernel_hal::thread::get_current_thread() {
+        if let Ok(thread) = arc.downcast::<Thread>() {
+            let proc = thread.proc();
+            return (proc.id(), proc.name());
+        }
+    }
+    (0, String::from("kernel"))
+}
+
+/// Trace for `kill(pid, SIGKILL)`, which ends the target directly instead of
+/// going through [`send_signal_to_process`] and would otherwise leave no
+/// record of who sent it.
+pub fn trace_direct_kill(target: &Arc<Process>, sender: &Arc<Process>) {
+    zcore_drivers::klog_warn!(
+        "[signal] SIGKILL -> pid {} ({}) from pid {} ({}) [kill()]",
+        target.id(),
+        target.name(),
+        sender.id(),
+        sender.name()
+    );
+}
+
 pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
     use crate::thread::ThreadExt;
     if let Some(process) = ROOT_JOB.find_process(pid as KoID) {
+        if signal_trace_worthy(signal) {
+            // Who signals whom: a process that exits on a handled SIGTERM/
+            // SIGINT/SIGHUP leaves no other trace (the `[exit]` line only
+            // covers default-disposition deaths), and "labwc/foot vanished
+            // 25 ms after a job started" was otherwise unexplainable.
+            let (spid, sname) = current_process_pid_name();
+            zcore_drivers::klog_warn!(
+                "[signal] {:?} -> pid {} ({}) from pid {} ({})",
+                signal,
+                process.id(),
+                process.name(),
+                spid,
+                sname
+            );
+        }
         let tids = process.thread_ids();
         // Prefer a thread that has the signal *unblocked* — it can act on it
         // right away — and deliver there.
