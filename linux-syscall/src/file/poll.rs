@@ -355,7 +355,14 @@ impl Syscall<'_> {
             subs: Vec::new(),
         };
         let result = future.await;
-        ufds.write_array(&polls)?;
+        if let Err(e) = &result {
+            linux_object::process::trace_wait_error("poll", *e);
+        }
+        if let Err(e) = ufds.write_array(&polls) {
+            let e: LxError = e.into();
+            linux_object::process::trace_wait_error("poll/write", e);
+            return Err(e);
+        }
         info!("return ufds: {:?}", polls);
         result
     }
@@ -772,15 +779,31 @@ impl Syscall<'_> {
         // keeps the epoll object itself alive for the whole wait; `wait`
         // likewise holds each watched file by Arc, so the future carries no
         // reference that outlives what it points at.
-        let epoll = self
+        let epoll = match self
             .linux_process()
-            .get_file_like(epfd)?
-            .downcast_arc::<Epoll>()
-            .map_err(|_| LxError::EBADF)?;
+            .get_file_like(epfd)
+            .and_then(|f| f.downcast_arc::<Epoll>().map_err(|_| LxError::EBADF))
+        {
+            Ok(e) => e,
+            Err(e) => {
+                linux_object::process::trace_wait_error("epoll_wait/epfd", e);
+                return Err(e);
+            }
+        };
 
         // TODO: handle timeout
-        let res_events = epoll.wait(maxevents, timeout).await?;
-        events.write_array(&res_events)?;
+        let res_events = match epoll.wait(maxevents, timeout).await {
+            Ok(v) => v,
+            Err(e) => {
+                linux_object::process::trace_wait_error("epoll_wait", e);
+                return Err(e);
+            }
+        };
+        if let Err(e) = events.write_array(&res_events) {
+            let e: LxError = e.into();
+            linux_object::process::trace_wait_error("epoll_wait/write", e);
+            return Err(e);
+        }
         Ok(res_events.len())
     }
 
