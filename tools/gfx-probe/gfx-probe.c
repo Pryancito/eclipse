@@ -65,6 +65,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 // ── EGL / GL / Vulkan / Wayland ABI constants (no headers required) ──────────
@@ -110,6 +111,16 @@
 #define GL_RENDERBUFFER 0x8D41
 #define GL_COLOR_ATTACHMENT0 0x8CE0
 #define GL_FRAMEBUFFER_COMPLETE 0x8CD5
+// GL enums the perf micro-bench needs
+#define GL_FLOAT 0x1406
+#define GL_FALSE 0
+#define GL_TRIANGLES 0x0004
+#define GL_ARRAY_BUFFER 0x8892
+#define GL_STATIC_DRAW 0x88E4
+#define GL_VERTEX_SHADER 0x8B31
+#define GL_FRAGMENT_SHADER 0x8B30
+#define GL_COMPILE_STATUS 0x8B81
+#define GL_LINK_STATUS 0x8B82
 
 // GBM
 #define GBM_FORMAT_XRGB8888 0x34325258u  // 'XR24'
@@ -131,7 +142,7 @@
 
 // ── report framework (mirrors drm-probe / audio-probe) ───────────────────────
 
-static int g_verbose, g_card;
+static int g_verbose, g_card, g_bench;
 static int g_pass, g_fail, g_skip;
 static const char *g_skipped[16];
 static int g_nskipped;
@@ -185,6 +196,8 @@ static void *g_egl_dpy, *g_egl_ctx, *g_egl_cfg, *g_egl_surf;
 static char g_gl_renderer[128] = "";
 static int g_gl_rendered = 0;   // FBO clear+readback matched
 static int g_gl_swrast = 0;     // renderer looks like a software rasteriser
+static int g_llvmpipe_bits = 0; // vector width parsed from a llvmpipe RENDERER
+static double g_bench_fps = 0;  // per-frame-synced frame rate from the perf bench
 static int g_vk_devs = 0;       // Vulkan physical devices enumerated
 static void *g_wl_display;      // live compositor connection (or NULL)
 static int g_wl_have_compositor, g_wl_have_xdg, g_wl_have_dmabuf, g_wl_have_layer;
@@ -448,6 +461,14 @@ static void test_gl(void) {
     if (strstr(g_gl_renderer, "llvmpipe") || strstr(g_gl_renderer, "softpipe") ||
         strstr(g_gl_renderer, "swrast") || strstr(g_gl_renderer, "SWR"))
       g_gl_swrast = 1;
+    // llvmpipe reports its SIMD width, e.g. "llvmpipe (LLVM 22.1.3, 256 bits)":
+    // 256 = AVX2, 128 = SSE only. On the same CPU, 128-bit is ~2x slower.
+    const char *bits = strstr(g_gl_renderer, " bits");
+    if (bits) {
+      const char *p = bits;
+      while (p > g_gl_renderer && (p[-1] == ' ' || (p[-1] >= '0' && p[-1] <= '9'))) p--;
+      g_llvmpipe_bits = atoi(p);
+    }
   }
   if (vendor) info("GL_VENDOR: %s", vendor);
   if (version) info("GL_VERSION: %s", version);
@@ -504,6 +525,251 @@ static void test_gl(void) {
   check(g_gl_rendered, "glClear + glReadPixels == blue",
         "the GL driver truly rasterised (drm-probe's tone, drawn and read back)",
         0);
+}
+
+// ── perf: WHY is glxgears slow? the factors that govern a software GL ────────
+//
+// glxgears at 1,400 fps here vs 12,000 on a Linux host, with GL_RENDERER =
+// llvmpipe on both, is not a "missing GPU" problem -- it is the *same software
+// rasteriser* running slower. Three things set llvmpipe's speed, and this
+// section measures each in the guest so the ratio can be attributed:
+//
+//   1. SIMD width   llvmpipe JITs to the widest vector the CPU advertises.
+//                   256-bit (AVX2) does ~2x the pixels per instruction of
+//                   128-bit (SSE). The RENDERER string already told us which.
+//   2. worker cores llvmpipe splits the framebuffer across threads, ~linearly.
+//                   Half the online CPUs is ~half the fill rate.
+//   3. present cost glxgears also calls glXSwapBuffers every frame, which under
+//                   Xwayland copies the result through wl_shm to the compositor
+//                   to virtio-gpu -- a per-frame cost this section isolates by
+//                   measuring pure render (no window) two ways: batched, and
+//                   with a glFinish per "frame" (the swap-like sync).
+//
+// If the batched render rate here is high but glxgears is low, the bottleneck
+// is the present path, not the rasteriser; if this section is itself slow, it
+// is the CPU/SIMD/thread factors above. Opt-in (--bench): it spins the CPU.
+
+static double now_ms(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (double)t.tv_sec * 1000.0 + (double)t.tv_nsec / 1.0e6;
+}
+
+// Whole-token search in a space-padded /proc/cpuinfo flags line ("avx" must not
+// match inside "avx2"/"avx512f").
+static int has_flag(const char *padded, const char *tok) {
+  char needle[32];
+  snprintf(needle, sizeof needle, " %s ", tok);
+  return strstr(padded, needle) != NULL;
+}
+
+static void report_cpu(void) {
+  long onln = sysconf(_SC_NPROCESSORS_ONLN);
+  long conf = sysconf(_SC_NPROCESSORS_CONF);
+  info("CPUs: %ld online / %ld configured  (llvmpipe fill scales ~linearly)",
+       onln, conf);
+  const char *lp = getenv("LP_NUM_THREADS");
+  if (lp) info("LP_NUM_THREADS=%s  (caps llvmpipe worker threads)", lp);
+  const char *gd = getenv("GALLIUM_DRIVER");
+  if (gd) info("GALLIUM_DRIVER=%s", gd);
+
+  FILE *f = fopen("/proc/cpuinfo", "r");
+  if (f) {
+    char line[8192], flags[8192] = "";
+    while (fgets(line, sizeof line, f)) {
+      if (!strncmp(line, "flags", 5) || !strncmp(line, "Features", 8)) {
+        char *c = strchr(line, ':');
+        if (c) snprintf(flags, sizeof flags, " %s ", c + 1);
+        // squash the trailing newline that landed inside the padding
+        for (char *p = flags; *p; p++)
+          if (*p == '\n') *p = ' ';
+        break;
+      }
+    }
+    fclose(f);
+    if (flags[0]) {
+      info("CPU SIMD: sse4_2=%d avx=%d avx2=%d fma=%d f16c=%d avx512f=%d",
+           has_flag(flags, "sse4_2"), has_flag(flags, "avx"),
+           has_flag(flags, "avx2"), has_flag(flags, "fma"),
+           has_flag(flags, "f16c"), has_flag(flags, "avx512f"));
+      if (!has_flag(flags, "avx2"))
+        info("  -> no AVX2: llvmpipe is capped at 128-bit SSE. An AVX2 host runs "
+             "256-bit, ~2x faster. This is likely half of the glxgears gap.");
+    }
+  }
+
+  if (g_llvmpipe_bits)
+    check(g_llvmpipe_bits >= 256, "llvmpipe SIMD width >= 256-bit (AVX2)",
+          g_llvmpipe_bits == 128
+              ? "128-bit (SSE) -- ~2x slower than a 256-bit AVX2 host"
+              : "vector width from GL_RENDERER",
+          0);
+}
+
+// Compile a GLES2 shader; returns 0 on failure.
+static unsigned make_shader(unsigned type, const char *src,
+                            unsigned (*glCreateShader)(unsigned),
+                            void (*glShaderSource)(unsigned, int, const char *const *, const int *),
+                            void (*glCompileShader)(unsigned),
+                            void (*glGetShaderiv)(unsigned, unsigned, int *)) {
+  unsigned s = glCreateShader(type);
+  if (!s) return 0;
+  glShaderSource(s, 1, &src, NULL);
+  glCompileShader(s);
+  int ok = 0;
+  if (glGetShaderiv) glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+  return ok ? s : 0;
+}
+
+static void test_perf(void) {
+  section("perf");
+  report_cpu();
+  if (!g_bench) {
+    skip("perf bench", "pass --bench to run the on-CPU render throughput test");
+    return;
+  }
+  if (!g_egl_ctx || !g_gl_rendered) {
+    skip("perf bench", "no working GL context (gl section did not render)");
+    return;
+  }
+
+  // Resolve the GLES2 draw path.
+  unsigned (*glCreateShader)(unsigned) = gl_sym("glCreateShader");
+  void (*glShaderSource)(unsigned, int, const char *const *, const int *) =
+      gl_sym("glShaderSource");
+  void (*glCompileShader)(unsigned) = gl_sym("glCompileShader");
+  void (*glGetShaderiv)(unsigned, unsigned, int *) = gl_sym("glGetShaderiv");
+  unsigned (*glCreateProgram)(void) = gl_sym("glCreateProgram");
+  void (*glAttachShader)(unsigned, unsigned) = gl_sym("glAttachShader");
+  void (*glLinkProgram)(unsigned) = gl_sym("glLinkProgram");
+  void (*glGetProgramiv)(unsigned, unsigned, int *) = gl_sym("glGetProgramiv");
+  void (*glUseProgram)(unsigned) = gl_sym("glUseProgram");
+  int (*glGetAttribLocation)(unsigned, const char *) = gl_sym("glGetAttribLocation");
+  void (*glGenBuffers)(int, unsigned *) = gl_sym("glGenBuffers");
+  void (*glBindBuffer)(unsigned, unsigned) = gl_sym("glBindBuffer");
+  void (*glBufferData)(unsigned, long, const void *, unsigned) = gl_sym("glBufferData");
+  void (*glVertexAttribPointer)(unsigned, int, unsigned, unsigned char, int, const void *) =
+      gl_sym("glVertexAttribPointer");
+  void (*glEnableVertexAttribArray)(unsigned) = gl_sym("glEnableVertexAttribArray");
+  void (*glDrawArrays)(unsigned, int, int) = gl_sym("glDrawArrays");
+  void (*glViewport)(int, int, int, int) = gl_sym("glViewport");
+  void (*glClear)(unsigned) = gl_sym("glClear");
+  void (*glClearColor)(float, float, float, float) = gl_sym("glClearColor");
+  void (*glFinish)(void) = gl_sym("glFinish");
+  void (*glGenFramebuffers)(int, unsigned *) = gl_sym("glGenFramebuffers");
+  void (*glBindFramebuffer)(unsigned, unsigned) = gl_sym("glBindFramebuffer");
+  void (*glGenRenderbuffers)(int, unsigned *) = gl_sym("glGenRenderbuffers");
+  void (*glBindRenderbuffer)(unsigned, unsigned) = gl_sym("glBindRenderbuffer");
+  void (*glRenderbufferStorage)(unsigned, unsigned, int, int) = gl_sym("glRenderbufferStorage");
+  void (*glFramebufferRenderbuffer)(unsigned, unsigned, unsigned, unsigned) =
+      gl_sym("glFramebufferRenderbuffer");
+  if (!glCreateShader || !glCreateProgram || !glGenBuffers || !glDrawArrays ||
+      !glViewport || !glClear || !glFinish || !glGenFramebuffers) {
+    skip("perf bench", "GLES2 draw entry points unavailable");
+    return;
+  }
+
+  // A 512x512 off-screen target -- a small window, like glxgears' default.
+  const int W = 512, H = 512;
+  unsigned fbo = 0, rbo = 0;
+  glGenFramebuffers(1, &fbo);
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+  glGenRenderbuffers(1, &rbo);
+  glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+  glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, W, H);
+  glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rbo);
+  glViewport(0, 0, W, H);
+
+  static const char *VS =
+      "attribute vec2 pos;\n"
+      "void main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n";
+  static const char *FS =
+      "precision mediump float;\n"
+      "void main(){ gl_FragColor = vec4(0.30, 0.60, 0.90, 1.0); }\n";
+  unsigned vs = make_shader(GL_VERTEX_SHADER, VS, glCreateShader, glShaderSource,
+                            glCompileShader, glGetShaderiv);
+  unsigned fs = make_shader(GL_FRAGMENT_SHADER, FS, glCreateShader, glShaderSource,
+                            glCompileShader, glGetShaderiv);
+  if (!vs || !fs) {
+    fail("compile shaders", "the GLES2 compiler rejected a trivial shader", 0);
+    return;
+  }
+  unsigned prog = glCreateProgram();
+  glAttachShader(prog, vs);
+  glAttachShader(prog, fs);
+  glLinkProgram(prog);
+  int linked = 0;
+  if (glGetProgramiv) glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+  check(linked, "link program", "a minimal GLES2 pipeline", 0);
+  if (!linked) return;
+  glUseProgram(prog);
+
+  // A batch of small triangles spread over the viewport: geometry setup + fill,
+  // the same mix a spinning gear presents.
+  const int NTRI = 4000;
+  float *verts = malloc((size_t)NTRI * 3 * 2 * sizeof(float));
+  if (!verts) {
+    skip("perf bench", "out of memory building the vertex batch");
+    return;
+  }
+  for (int i = 0; i < NTRI; i++) {
+    // deterministic pseudo-random placement in clip space [-1,1]
+    unsigned r = (unsigned)(i * 2654435761u);
+    float cx = ((float)((r >> 3) & 1023) / 1023.0f) * 2.0f - 1.0f;
+    float cy = ((float)((r >> 13) & 1023) / 1023.0f) * 2.0f - 1.0f;
+    float s = 0.06f;
+    float *v = &verts[i * 6];
+    v[0] = cx;     v[1] = cy + s;
+    v[2] = cx - s; v[3] = cy - s;
+    v[4] = cx + s; v[5] = cy - s;
+  }
+  unsigned vbo = 0;
+  glGenBuffers(1, &vbo);
+  glBindBuffer(GL_ARRAY_BUFFER, vbo);
+  glBufferData(GL_ARRAY_BUFFER, (long)NTRI * 3 * 2 * sizeof(float), verts, GL_STATIC_DRAW);
+  int loc = glGetAttribLocation ? glGetAttribLocation(prog, "pos") : 0;
+  if (loc < 0) loc = 0;
+  glVertexAttribPointer((unsigned)loc, 2, GL_FLOAT, GL_FALSE, 0, NULL);
+  glEnableVertexAttribArray((unsigned)loc);
+  free(verts);
+
+  if (glClearColor) glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+  const int verts_total = NTRI * 3;
+
+  // (a) batched: draw many frames, one glFinish at the end -> raw raster rate,
+  //     what llvmpipe can push when not stalled on per-frame sync.
+  int frames = 0;
+  double t0 = now_ms(), budget = 400.0;
+  while (frames < 100000) {
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_TRIANGLES, 0, verts_total);
+    frames++;
+    if ((frames & 15) == 0 && now_ms() - t0 >= budget) break;
+  }
+  glFinish();
+  double batched = (double)frames * 1000.0 / (now_ms() - t0);
+
+  // (b) synced: a glFinish after each frame -> the per-frame sync a swap forces.
+  int f2 = 0;
+  double t1 = now_ms();
+  while (f2 < 100000) {
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_TRIANGLES, 0, verts_total);
+    glFinish();
+    f2++;
+    if (now_ms() - t1 >= budget) break;
+  }
+  double synced = (double)f2 * 1000.0 / (now_ms() - t1);
+  g_bench_fps = synced;
+
+  double mtris = batched * (double)NTRI / 1.0e6;
+  info("render %dx%d, %d tris/frame:", W, H, NTRI);
+  info("  batched (finish/run):  %8.0f fps   %6.1f Mtri/s", batched, mtris);
+  info("  synced  (finish/frame):%8.0f fps   (the glXSwapBuffers-style stall)", synced);
+  if (synced > 0 && batched / synced > 1.5)
+    info("  -> per-frame sync costs %.0f%%: glxgears' swap adds this on top.",
+         (batched / synced - 1.0) * 100.0);
+  ok("render throughput measured", "an in-guest number to compare with the host");
 }
 
 // ── vulkan: which ICDs did the loader find? ──────────────────────────────────
@@ -805,6 +1071,12 @@ static void verdict(void) {
                               : "renders on a hardware driver")
                : "does NOT render -- GL clients see a black/empty window");
   if (g_gl_renderer[0]) printf("        renderer: %s\n", g_gl_renderer);
+  if (g_gl_swrast && g_llvmpipe_bits)
+    printf("        llvmpipe SIMD: %d-bit%s\n", g_llvmpipe_bits,
+           g_llvmpipe_bits < 256 ? "  (no AVX2 -> ~2x slower than a 256-bit host)" : "");
+  if (g_bench_fps > 0)
+    printf("        render bench: %.0f fps synced (see [perf] for the glxgears gap)\n",
+           g_bench_fps);
   printf("  Vulkan: %s\n",
          g_vk_devs > 0 ? "at least one device (ICD present)"
                        : "no device -- Vulkan clients (Zink, vkcube) fail");
@@ -823,19 +1095,22 @@ static void verdict(void) {
 int main(int argc, char **argv) {
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "-v")) g_verbose = 1;
+    else if (!strcmp(argv[i], "--bench")) g_bench = 1;
     else if (!strcmp(argv[i], "--card") && i + 1 < argc) g_card = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--skip") && i + 1 < argc && g_nskipped < 16)
       g_skipped[g_nskipped++] = argv[++i];
     else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-      printf("usage: gfx-probe [-v] [--card N] [--skip SECTION]...\n"
+      printf("usage: gfx-probe [-v] [--bench] [--card N] [--skip SECTION]...\n"
              "Drives every userspace graphics layer a GL/Vulkan/Wayland client rests\n"
              "on -- GBM buffer allocation, EGL bring-up, an off-screen GL render it\n"
              "reads back, Vulkan device enumeration, and a live Wayland/wl_shm round-\n"
              "trip -- and says whether the desktop's graphics path actually works.\n"
              "The companion to drm-probe: drm-probe drives the kernel, this drives Mesa.\n"
              "Opens no window; all libraries are dlopen'd, so a missing one just SKIPs.\n"
+             "--bench   run the perf section's on-CPU render throughput bench and the\n"
+             "          llvmpipe SIMD/thread report -- WHY software GL (glxgears) is slow.\n"
              "--card N  use /dev/dri/renderD(128+N) for the GBM device.\n"
-             "--skip SECTION leaves one out (libs, gbm, egl, gl, vulkan, wayland, shm).\n");
+             "--skip SECTION leaves one out (libs, gbm, egl, gl, perf, vulkan, wayland, shm).\n");
       return 0;
     }
   }
@@ -848,8 +1123,8 @@ int main(int argc, char **argv) {
     void (*run)(void);
   } sections[] = {
       {"libs", test_libs},     {"gbm", test_gbm},         {"egl", test_egl},
-      {"gl", test_gl},         {"vulkan", test_vulkan},   {"wayland", test_wayland},
-      {"shm", test_shm},
+      {"gl", test_gl},         {"perf", test_perf},       {"vulkan", test_vulkan},
+      {"wayland", test_wayland}, {"shm", test_shm},
   };
   for (size_t i = 0; i < sizeof sections / sizeof sections[0]; i++) {
     if (skipped(sections[i].name)) {
