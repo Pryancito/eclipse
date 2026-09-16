@@ -406,6 +406,55 @@ fn describe_addr(vmar: &Arc<VmAddressRegion>, addr: usize) -> String {
     String::from("unmapped")
 }
 
+/// Scan the user stack from `sp` upwards for words that point into an
+/// executable mapping and render each as `stack[+off] = addr [lib+offset]`.
+///
+/// Reads go through the address space's VMOs, so an unmapped `sp` (stack
+/// overflow, corrupted register) yields an empty trace instead of a kernel
+/// fault. The scan is bounded both in bytes looked at and in lines printed so
+/// a report stays a screenful on the serial console.
+fn user_stack_backtrace(vmar: &Arc<VmAddressRegion>, sp: usize) -> Vec<String> {
+    /// Bytes of stack to look at (128 words on a 64-bit target).
+    const SCAN_BYTES: usize = 1024;
+    /// Cap on rendered frames.
+    const MAX_FRAMES: usize = 24;
+    let mut out = Vec::new();
+    if sp == 0 || sp & (core::mem::size_of::<usize>() - 1) != 0 {
+        return out;
+    }
+    let mut buf = [0u8; SCAN_BYTES];
+    let got = match vmar.read_memory(sp, &mut buf) {
+        Ok(n) => n,
+        Err(_) => return out,
+    };
+    let code_maps: Vec<_> = vmar
+        .mappings_dump()
+        .into_iter()
+        .filter(|m| m.flags.contains(kernel_hal::MMUFlags::EXECUTE))
+        .collect();
+    let word = core::mem::size_of::<usize>();
+    for (i, chunk) in buf[..got].chunks_exact(word).enumerate() {
+        let mut raw = [0u8; core::mem::size_of::<usize>()];
+        raw.copy_from_slice(chunk);
+        let addr = usize::from_ne_bytes(raw);
+        if addr == 0 {
+            continue;
+        }
+        if let Some(m) = code_maps.iter().find(|m| (m.start..m.end).contains(&addr)) {
+            let offset = m.vmo_offset + (addr - m.start);
+            let name: &str = if m.name.is_empty() { "anon" } else { &m.name };
+            out.push(alloc::format!(
+                "stack[+{:#x}] = {addr:#x} [{name}+{offset:#x}]",
+                i * word
+            ));
+            if out.len() >= MAX_FRAMES {
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// The function of a new thread.
 ///
 /// loop:
@@ -887,6 +936,27 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                         }
                         error!("  code: {}", hex.trim_end());
                     }
+                }
+                // Finally, WHO got here. `pc` names the function that faulted
+                // (`wl_list_remove`, `memcpy`, ...) but those are leaves called
+                // from hundreds of places; the caller is what points at the
+                // bug. Scan the live stack above `sp` for words that land in an
+                // executable mapping and print them as `lib+offset`: a poor
+                // man's backtrace that needs no frame pointers and no DWARF
+                // (`addr2line -e <lib> <offset>` / `nm -D` on the user side
+                // turns each into a function). Stale return addresses from
+                // earlier calls show up too, so read it as a set of candidate
+                // callers, innermost first, not as an exact chain.
+                //
+                // Read through the VMO (`read_memory`), never by dereferencing
+                // the user pointer: an unmapped or not-yet-committed stack page
+                // would otherwise re-fault from kernel mode with no fixup, the
+                // same cascade the `code:` read above guards against.
+                let sp = thread
+                    .with_context(|ctx| ctx.get_field(UserContextField::StackPointer))
+                    .unwrap_or(0);
+                for line in user_stack_backtrace(&vmar, sp) {
+                    error!("  {}", line);
                 }
                 force_fault_signal(thread, Signal::SIGSEGV);
             }
