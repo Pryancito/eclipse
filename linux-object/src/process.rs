@@ -2348,6 +2348,16 @@ pub fn trace_direct_kill(target: &Arc<Process>, sender: &Arc<Process>) {
     );
 }
 
+/// Trace an error returned by a blocking wait (`poll`, `ppoll`, `epoll_wait`).
+/// libwayland treats ANY `epoll_wait` failure, EINTR included, as fatal and
+/// a compositor then leaves `wl_display_run` without a word; foot logs
+/// "failed to poll" and exits the same way. Knowing the errno and the victim
+/// is the only way to tell such an exit from a deliberate one.
+pub fn trace_wait_error(call: &str, err: crate::error::LxError) {
+    let (pid, name) = current_process_pid_name();
+    zcore_drivers::klog_warn!("[wait] {}() -> {:?} for pid {} ({})", call, err, pid, name);
+}
+
 pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
     use crate::thread::ThreadExt;
     if let Some(process) = ROOT_JOB.find_process(pid as KoID) {
