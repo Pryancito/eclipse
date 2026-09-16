@@ -1094,6 +1094,21 @@ impl HdaInner {
         (score, present, eld_valid)
     }
 
+    /// Does the active pin already carry a live sink (PD=1 and ELDV=1)? On
+    /// HDMI/DP those bits are set from the display side (the GOP/RM ELD push
+    /// in `kick_hdmi_audio`), so a live pin means the display engine already
+    /// transmits audio and the stream-start kick has nothing left to do.
+    fn active_pin_live(&mut self) -> bool {
+        let pin = self.pin_nid;
+        let hdmi_dp = self.candidates.iter().any(|c| c.pin == pin && c.hdmi_dp);
+        if hdmi_dp {
+            let _ = self.cmd(pin, VERB_SET_PIN_SENSE, 0);
+            wait_us(2_000);
+        }
+        let sense = self.cmd(pin, VERB_GET_PIN_SENSE, 0).unwrap_or(0);
+        sense & (1 << 31) != 0 && sense & (1 << 30) != 0
+    }
+
     /// Enumerate the AFG's widgets and collect every viable output path
     /// (output-capable pin with a physical connector, reachable converter).
     fn collect_candidates(&mut self, afg: u32) -> DeviceResult<Vec<OutPath>> {
@@ -1664,13 +1679,16 @@ impl AudioScheme for HdaDevice {
 
     fn write(&self, pcm: &[u8]) -> DeviceResult<usize> {
         let kick_hdmi = {
-            let inner = self.inner.lock();
-            !inner.running && inner.digital
+            let mut inner = self.inner.lock();
+            !inner.running && inner.digital && !inner.active_pin_live()
         };
         if kick_hdmi {
             // GOP never enables audio packets; re-push ELD/unmute now so the
             // pin-sense that follows can see a live display. Drop the HDA
-            // lock first — RM takes GPU locks.
+            // lock first — RM takes GPU locks. Skipped when the active pin
+            // already reports PD=1/ELDV=1: the display side has done its
+            // part, and re-poking the scanout GPU's display engine on every
+            // stream start is not something a running desktop should see.
             crate::display::kick_hdmi_audio();
         }
         let mut inner = self.inner.lock();
