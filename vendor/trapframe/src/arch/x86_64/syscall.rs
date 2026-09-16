@@ -73,16 +73,42 @@ impl UserContext {
     /// ```
     pub fn run(&mut self) {
         unsafe {
-            // Restore this thread's user FPU/SSE state immediately before entering
+            // Restore this thread's user FPU state immediately before entering
             // user mode, and save it immediately after the trap returns. The
-            // syscall_return / syscall_entry asm paths use no SSE, and this Rust
-            // wrapper has no float work, so XMM cannot be clobbered in between.
-            // `fpstate` is 16-aligned (FXSAVE requirement).
+            // syscall_return / syscall_entry asm paths use no SSE/AVX, and this
+            // Rust wrapper has no float work, so the vector registers cannot be
+            // clobbered in between. `fpstate` is 64-aligned (XSAVE requirement,
+            // and satisfies FXSAVE's 16).
+            //
+            // When the CPU has XSAVE + AVX (see `init_fpu`), use XSAVE/XRSTOR so
+            // the AVX YMM upper halves are preserved too — a preempted user AVX
+            // computation would otherwise resume with clobbered YMM. EDX:EAX is
+            // the XCR0 feature mask; XSAVE/XRSTOR only touch components that mask
+            // AND XCR0 both select, so it is always safe. Older CPUs (mask == 0)
+            // keep the FXSAVE/FXRSTOR path.
+            let mask = super::XSAVE_MASK.load(core::sync::atomic::Ordering::Relaxed);
             let fp = core::ptr::addr_of_mut!(self.fpstate) as *mut u8;
-            core::arch::asm!("fxrstor [{}]", in(reg) fp, options(readonly, nostack, preserves_flags));
-            syscall_return(self);
-            let fp = core::ptr::addr_of_mut!(self.fpstate) as *mut u8;
-            core::arch::asm!("fxsave [{}]", in(reg) fp, options(nostack, preserves_flags));
+            if mask != 0 {
+                core::arch::asm!(
+                    "xrstor [{}]",
+                    in(reg) fp,
+                    in("eax") mask, in("edx") 0u32,
+                    options(readonly, nostack, preserves_flags),
+                );
+                syscall_return(self);
+                let fp = core::ptr::addr_of_mut!(self.fpstate) as *mut u8;
+                core::arch::asm!(
+                    "xsave [{}]",
+                    in(reg) fp,
+                    in("eax") mask, in("edx") 0u32,
+                    options(nostack, preserves_flags),
+                );
+            } else {
+                core::arch::asm!("fxrstor [{}]", in(reg) fp, options(readonly, nostack, preserves_flags));
+                syscall_return(self);
+                let fp = core::ptr::addr_of_mut!(self.fpstate) as *mut u8;
+                core::arch::asm!("fxsave [{}]", in(reg) fp, options(nostack, preserves_flags));
+            }
         }
     }
 }
