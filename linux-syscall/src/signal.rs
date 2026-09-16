@@ -189,6 +189,10 @@ impl Syscall<'_> {
             match signal {
                 Signal::SIGKILL => {
                     let retcode = (128 + Signal::SIGKILL as i32) as i64;
+                    // Same trace as send_signal_to_process: this path ends the
+                    // target directly, so it would otherwise leave no record
+                    // of who sent the SIGKILL.
+                    linux_object::process::trace_direct_kill(&process, &caller);
                     if caller.id() == process.id() {
                         caller.exit(retcode);
                     } else if process.id() == linux_object::process::INIT_PID {
