@@ -42,11 +42,26 @@ pub use trap::TrapFrame;
 /// [TSS]: https://wiki.osdev.org/Task_State_Segment
 /// [`syscall`]: https://www.felixcloutier.com/x86/syscall
 ///
-/// Enable x87 + SSE on this CPU.
+/// Non-zero once this CPU has enabled XSAVE + AVX state (CR4.OSXSAVE + XCR0);
+/// the value is the XCR0 feature mask (low dword) that [`UserContext::run`]
+/// hands to XSAVE/XRSTOR. Zero means the CPU has no XSAVE/AVX and the plain
+/// FXSAVE/FXRSTOR path is used. Every CPU runs `init_fpu`, so all agree.
+#[cfg(any(target_os = "none", target_os = "uefi"))]
+pub(crate) static XSAVE_MASK: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Enable x87 + SSE (and AVX, when the CPU has it) on this CPU.
 ///
 /// The BSP inherits a usable FPU state from the firmware; APs arrive from the
 /// INIT/SIPI trampoline with CR0.TS set, so the first SSE instruction in Rust
 /// kernel code raises #NM → unhandled trap in `trap_handler`.
+///
+/// AVX needs one more step: the CPU advertising AVX in CPUID is not enough to
+/// USE it — the OS must set CR4.OSXSAVE, enable the AVX bit in XCR0 (XSETBV),
+/// and save/restore the YMM registers across the user/kernel boundary (see
+/// `run`). Without it, LLVM/Mesa (llvmpipe) detect AVX as unusable and fall
+/// back to 128-bit SSE. We enable x87+SSE+AVX here (not AVX-512, to keep the
+/// XSAVE area small) and switch `run` to XSAVE/XRSTOR.
 #[cfg(any(target_os = "none", target_os = "uefi"))]
 fn init_fpu() {
     use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
@@ -68,6 +83,21 @@ fn init_fpu() {
             mxcsr = in(reg) &mxcsr,
             options(nostack, preserves_flags),
         );
+
+        // Enable XSAVE + AVX for user space when the CPU supports both. Order
+        // matters: CR4.OSXSAVE must be set before XSETBV (XCr0::write), which
+        // reads XCR0 first. Runs on the BSP and every AP, so every CPU ends up
+        // with the same XCR0 and the same XSAVE_MASK.
+        let leaf1 = core::arch::x86_64::__cpuid(1);
+        let has_xsave = leaf1.ecx & (1 << 26) != 0;
+        let has_avx = leaf1.ecx & (1 << 28) != 0;
+        if has_xsave && has_avx {
+            use x86_64::registers::xcontrol::{XCr0, XCr0Flags};
+            Cr4::update(|cr4| cr4.insert(Cr4Flags::OSXSAVE));
+            let flags = XCr0Flags::X87 | XCr0Flags::SSE | XCr0Flags::AVX;
+            XCr0::write(flags);
+            XSAVE_MASK.store(flags.bits() as u32, core::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -119,10 +149,16 @@ pub struct UserContext {
     pub fpstate: FpState,
 }
 
-/// 512-byte 16-aligned FXSAVE/FXRSTOR area (see `UserContext::fpstate`).
+/// Extended-state save area for this thread (see `UserContext::fpstate`).
+///
+/// 1024 bytes, 64-byte aligned: XSAVE requires 64-byte alignment, and 1024
+/// covers the legacy x87/SSE region (512) + the XSAVE header (64) + the AVX
+/// YMM_Hi component (256) with headroom. AVX-512 is intentionally not enabled
+/// (see `init_fpu`), so its far larger area is not needed. The FXSAVE fallback
+/// path (CPUs without XSAVE/AVX) uses only the first 512 bytes.
 #[derive(Clone, Copy, Eq, PartialEq)]
-#[repr(C, align(16))]
-pub struct FpState([u8; 512]);
+#[repr(C, align(64))]
+pub struct FpState([u8; 1024]);
 
 impl core::fmt::Debug for FpState {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -132,13 +168,17 @@ impl core::fmt::Debug for FpState {
 
 impl Default for FpState {
     fn default() -> Self {
-        let mut s = [0u8; 512];
+        let mut s = [0u8; 1024];
+        // Legacy area (read by FXRSTOR, and the legacy half of the XSAVE area):
         // FCW = 0x037F (default x87 control word).
         s[0] = 0x7F;
         s[1] = 0x03;
         // MXCSR = 0x1F80 (default; all SSE exceptions masked) at offset 24.
         s[24] = 0x80;
         s[25] = 0x1F;
+        // The XSAVE header (bytes 512..576) stays zero: XSTATE_BV = 0 (every
+        // component in its init state) and XCOMP_BV = 0 (standard, non-compacted
+        // format). A fresh thread's first XRSTOR then loads init x87/SSE/AVX.
         FpState(s)
     }
 }
