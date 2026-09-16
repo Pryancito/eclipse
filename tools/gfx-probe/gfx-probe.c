@@ -198,6 +198,7 @@ static int g_gl_rendered = 0;   // FBO clear+readback matched
 static int g_gl_swrast = 0;     // renderer looks like a software rasteriser
 static int g_llvmpipe_bits = 0; // vector width parsed from a llvmpipe RENDERER
 static double g_bench_fps = 0;  // per-frame-synced frame rate from the perf bench
+static int g_tcg = 0;           // running on an emulated CPU (QEMU TCG, no KVM)
 static int g_vk_devs = 0;       // Vulkan physical devices enumerated
 static void *g_wl_display;      // live compositor connection (or NULL)
 static int g_wl_have_compositor, g_wl_have_xdg, g_wl_have_dmabuf, g_wl_have_layer;
@@ -563,6 +564,54 @@ static int has_flag(const char *padded, const char *tok) {
   return strstr(padded, needle) != NULL;
 }
 
+// On x86, ask the CPU directly -- particularly useful here: Eclipse's
+// /proc/cpuinfo carries no "flags" line, and only the CPU can tell us whether
+// it is emulated.
+// Reports the hypervisor vendor (QEMU TCG = an EMULATED cpu, KVM = native) and
+// the SIMD width llvmpipe will JIT to, both from CPUID.
+#if defined(__x86_64__) || defined(__i386__)
+#include <cpuid.h>
+static void report_x86_cpuid(void) {
+  unsigned a, b, c, d;
+  if (!__get_cpuid(1, &a, &b, &c, &d)) return;
+  int sse42 = (c >> 20) & 1, avx = (c >> 28) & 1, fma = (c >> 12) & 1;
+  int hv = (int)((c >> 31) & 1);
+  int avx2 = 0, avx512f = 0;
+  unsigned a7, b7, c7, d7;
+  if (__get_cpuid_count(7, 0, &a7, &b7, &c7, &d7)) {
+    avx2 = (b7 >> 5) & 1;
+    avx512f = (b7 >> 16) & 1;
+  }
+  info("CPU SIMD (cpuid): sse4_2=%d avx=%d avx2=%d fma=%d avx512f=%d",
+       sse42, avx, avx2, fma, avx512f);
+  if (!avx2)
+    info("  -> CPU exposes no AVX2: llvmpipe caps at 128-bit SSE, ~2x slower "
+         "than a 256-bit AVX2 host.");
+  if (hv) {
+    // Hypervisor leaf: vendor string in EBX,ECX,EDX. __get_cpuid rejects leaves
+    // above the max standard leaf, so read this one raw.
+    unsigned r0, rb, rc, rd;
+    __cpuid(0x40000000u, r0, rb, rc, rd);
+    char v[13];
+    memcpy(v, &rb, 4);
+    memcpy(v + 4, &rc, 4);
+    memcpy(v + 8, &rd, 4);
+    v[12] = 0;
+    g_tcg = !strncmp(v, "TCGTCGTCGTCG", 12);
+    int kvm = !strncmp(v, "KVMKVMKVM", 9);
+    info("hypervisor: %s%s", v[0] ? v : "(present, no vendor)",
+         g_tcg ? "  (QEMU TCG = EMULATED CPU)" : kvm ? "  (KVM = native speed)" : "");
+    if (g_tcg)
+      info("  -> the CPU is EMULATED (no KVM): software GL runs at emulation "
+           "speed -- the dominant slowdown. Boot with KVM: `make qemu ACCEL=1`.");
+  } else {
+    info("hypervisor bit clear (bare metal, or hidden by the VMM)");
+  }
+}
+#else
+static void report_x86_cpuid(void) {}
+#endif
+
 static void report_cpu(void) {
   long onln = sysconf(_SC_NPROCESSORS_ONLN);
   long conf = sysconf(_SC_NPROCESSORS_CONF);
@@ -572,6 +621,9 @@ static void report_cpu(void) {
   if (lp) info("LP_NUM_THREADS=%s  (caps llvmpipe worker threads)", lp);
   const char *gd = getenv("GALLIUM_DRIVER");
   if (gd) info("GALLIUM_DRIVER=%s", gd);
+
+  // Authoritative on x86 (and works when /proc/cpuinfo is bare).
+  report_x86_cpuid();
 
   FILE *f = fopen("/proc/cpuinfo", "r");
   if (f) {
@@ -1077,6 +1129,9 @@ static void verdict(void) {
   if (g_bench_fps > 0)
     printf("        render bench: %.0f fps synced (see [perf] for the glxgears gap)\n",
            g_bench_fps);
+  if (g_tcg)
+    printf("        CPU is EMULATED (QEMU TCG, no KVM) -- the biggest slowdown; "
+           "boot with KVM (make qemu ACCEL=1)\n");
   printf("  Vulkan: %s\n",
          g_vk_devs > 0 ? "at least one device (ICD present)"
                        : "no device -- Vulkan clients (Zink, vkcube) fail");
