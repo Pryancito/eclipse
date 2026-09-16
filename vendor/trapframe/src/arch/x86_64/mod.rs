@@ -47,15 +47,13 @@ pub use trap::TrapFrame;
 /// hands to XSAVE/XRSTOR. Zero means the CPU has no XSAVE/AVX and the plain
 /// FXSAVE/FXRSTOR path is used. Every CPU runs `init_fpu`, so all agree.
 #[cfg(any(target_os = "none", target_os = "uefi"))]
-pub(crate) static XSAVE_MASK: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+pub(crate) static XSAVE_MASK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Set by the kernel (before `init`) to force the FXSAVE path even on a CPU that
 /// supports XSAVE + AVX. A boot-time escape hatch (e.g. `noavx` on the kernel
 /// command line) for isolating AVX enablement while debugging.
 #[cfg(any(target_os = "none", target_os = "uefi"))]
-static AVX_DISABLED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static AVX_DISABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Force the plain FXSAVE path (disable XSAVE/AVX enablement in `init_fpu`).
 /// Must be called before `init`/`init_ap` run on any CPU.
