@@ -8,6 +8,24 @@ use super::memory;
 
 pub struct ZcoreKernelHandler;
 
+/// One line naming any logical cpu id that GS reported and SMP bring-up never
+/// registered (see `lock::bogus_cpu_id_events`). Silent when there were none,
+/// which is the expected state; allocation- and lock-free either way, so it is
+/// safe from the fault path.
+fn report_bogus_cpu_id_events() {
+    let (last, count) = lock::bogus_cpu_id_events();
+    if count == 0 {
+        return;
+    }
+    kernel_hal::console::serial_write_fmt_spin(format_args!(
+        "[cpuid-bogus] GS reported logical cpu {} ({} time(s)) naming no CPU that \
+         SMP bring-up registered — this CPU ran with a GS that lied about who it \
+         is, so push_off/pop_off nested on a foreign per-CPU slot. Suspect every \
+         IRQ-off critical section in that window.\n",
+        last, count,
+    ));
+}
+
 /// Set while we are already diagnosing a kernel #PF (null-range OR an address
 /// the user vmar can't resolve). A second fault during `format_args!` / a
 /// console write / `panic!` (heap/vtable already smashed, or the graphic
@@ -204,6 +222,13 @@ impl KernelHandler for ZcoreKernelHandler {
                 kernel_hal::kstats::last_fault_rip(),
                 in_timer,
             ));
+            // Did this CPU run with a GS that lied about who it is? A bogus
+            // logical id makes `push_off`/`pop_off` nest on a FOREIGN per-CPU
+            // slot, so interrupts come back on inside someone's critical
+            // section — which manufactures exactly the wild writes and
+            // re-entrant acquires this fault is the tail end of. Printed here
+            // because a crash log is the only place anyone will look for it.
+            report_bogus_cpu_id_events();
             // Name the interrupted thread via serial only (never graphic fmt).
             //
             // `name()` returns a String, i.e. it ALLOCATES -- and this fault may

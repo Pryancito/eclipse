@@ -80,6 +80,22 @@ cfg_if::cfg_if! {
                 [const { AtomicU32::new(0) }; MAX_CORE_NUM];
             static APIC_ID_VALID: AtomicU64 = AtomicU64::new(0);
 
+            /// Last logical cpu id read out of GS that names no registered CPU,
+            /// and how many times that has happened. Written by [`cpu_id`] on
+            /// the rejection path and read by the kernel's fault/panic
+            /// reporters -- see [`crate::bogus_cpu_id_events`].
+            static BOGUS_GS_CPU_ID: AtomicU32 = AtomicU32::new(u32::MAX);
+            static BOGUS_GS_CPU_ID_COUNT: AtomicU32 = AtomicU32::new(0);
+
+            /// `(last bogus id, count)`; count 0 means GS has always agreed with
+            /// the registered set.
+            pub(super) fn bogus_gs_cpu_id_events() -> (u32, u32) {
+                (
+                    BOGUS_GS_CPU_ID.load(Ordering::Relaxed),
+                    BOGUS_GS_CPU_ID_COUNT.load(Ordering::Relaxed),
+                )
+            }
+
             /// `phys + offset` virtual mapping for the LAPIC MMIO page (set by HAL at boot).
             static PHYS_VIRT_OFFSET: AtomicU64 = AtomicU64::new(0);
 
@@ -235,7 +251,37 @@ cfg_if::cfg_if! {
                 #[cfg(target_arch = "x86_64")]
                 {
                     if trapframe::logical_cpu_id_valid() {
-                        return trapframe::read_logical_cpu_id();
+                        let id = trapframe::read_logical_cpu_id();
+                        // Cross-check GS against the ids SMP bring-up actually
+                        // registered. GS is the fast path, but it is also a
+                        // *corruptible* one: a `swapgs` imbalance on a fault
+                        // path, or a wild write into the per-CPU area, makes it
+                        // name a CPU that does not exist. A 6-vCPU guest
+                        // reported `panic cpu=48`, and 48 < MAX_CORE_NUM, so
+                        // `mycpu()`'s bounds assert waved it through -- which is
+                        // far worse than a panic: `push_off`/`pop_off` then
+                        // nest their IRQ-disable depth on a FOREIGN per-CPU
+                        // slot, so this CPU re-enables interrupts inside
+                        // somebody's critical section (or trips `pop_off`'s
+                        // underflow panic). Every "impossible" re-entrancy in
+                        // this hunt is downstream of that.
+                        //
+                        // The registered set is authoritative and free to
+                        // consult: one relaxed load of a line that is read-only
+                        // in the steady state. `valid == 0` is the pre-SMP
+                        // window, where GS is all we have.
+                        let valid = APIC_ID_VALID.load(Ordering::Relaxed);
+                        if valid == 0
+                            || ((id as usize) < MAX_CORE_NUM && valid & (1u64 << id) != 0)
+                        {
+                            return id;
+                        }
+                        // Bogus. Record it -- no printing from here, since every
+                        // console writer takes a lock and would re-enter this
+                        // very function -- and resolve the id from the hardware
+                        // LAPIC instead, which no memory corruption can reach.
+                        BOGUS_GS_CPU_ID.store(id as u32, Ordering::Relaxed);
+                        BOGUS_GS_CPU_ID_COUNT.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 apic_to_logical(raw_apic_id())
@@ -320,6 +366,29 @@ pub fn current_cpu_id_via_apic() -> u8 {
 #[cfg(not(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64"))))]
 pub fn current_cpu_id_via_apic() -> u8 {
     current_cpu_id()
+}
+
+/// `(last bogus id, count)` for logical cpu ids read out of GS that name no
+/// CPU SMP bring-up ever registered — see [`current_cpu_id`].
+#[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
+pub fn bogus_cpu_id_events() -> (u32, u32) {
+    interrupts::bogus_gs_cpu_id_events()
+}
+
+/// `(last bogus id, count)` for logical cpu ids read out of GS that name no
+/// CPU SMP bring-up ever registered — see [`current_cpu_id`].
+///
+/// A non-zero count is not a warning, it is a diagnosis: this CPU ran with a
+/// GS that was lying about who it is, so every `push_off`/`pop_off` in that
+/// window nested its IRQ-disable depth on a foreign per-CPU slot. The kernel's
+/// fault and panic reporters print it, because it explains classes of damage
+/// (locks released with interrupts on, re-entrant acquires, scribbled per-CPU
+/// state) that otherwise look impossible from the backtrace alone.
+///
+/// Reading it is allocation- and lock-free, so it is safe from a fault path.
+#[cfg(not(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64"))))]
+pub fn bogus_cpu_id_events() -> (u32, u32) {
+    (u32::MAX, 0)
 }
 
 /// Raw hardware Local APIC ID (x86). Sparse, and up to 32 bits wide in x2APIC

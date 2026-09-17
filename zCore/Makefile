@@ -503,6 +503,25 @@ disasm: build
 header:
 	$(OBJDUMP) -x $(kernel_elf) | less
 
+# Resolve kernel addresses from a crash log against THIS tree's kernel.
+#
+#   make sym ADDRS="0xffffff0000349212 0xffffff0000051648 ..."
+#
+# Kernel backtraces (`[kfault-bt]`, `[heap-reentrant]`, `[oops]`, panic RIPs)
+# print raw addresses, and they are only meaningful against the exact ELF that
+# produced them -- two builds of the same commit on different machines do NOT
+# share a .text layout, so a log symbolized against somebody else's kernel is
+# worse than no symbols at all. Run this where the crashing kernel was built
+# and paste the output next to the log.
+.PHONY: sym
+sym:
+	@test -n "$(ADDRS)" || { echo 'usage: make sym ADDRS="0xffffff0000349212 0x..."'; exit 2; }
+	@test -f $(kernel_elf) || { echo "no kernel at $(kernel_elf) -- run make build first"; exit 2; }
+	@for a in $(ADDRS); do \
+	  echo "=== $$a"; \
+	  llvm-addr2line -e $(kernel_elf) -fCi $$a 2>/dev/null || addr2line -e $(kernel_elf) -fCi $$a; \
+	done
+
 .PHONY: clippy
 clippy:
 	SMP=$(SMP) cargo clippy $(build_args)
