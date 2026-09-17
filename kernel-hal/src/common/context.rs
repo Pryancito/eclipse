@@ -264,6 +264,38 @@ impl UserContext {
                 // Value type tests the code was in the middle of -- that is a
                 // content process crashing "at random" in JS. The kernel never
                 // dereferences a user `rbp`; it must not edit it either.
+                //
+                // NMIs are the kernel's own business and must never reach the
+                // thread: swallow them here and re-enter, exactly as the
+                // kernel-mode `trap_handler` records and returns. The kernel
+                // sends NMIs to its peers as a "where are you stuck?" probe and
+                // to kick a CPU that is starving a TLB shootdown
+                // (`nmi_kick_pending_targets`), and vector 2 is not in the
+                // maskable-interrupt range, so `TrapReason::from` classified it
+                // as `GernelFault(2)` -- which the Linux path turns into
+                // SIGSEGV. Every user process running on another core when the
+                // kernel broadcast an NMI died on the spot, at whatever
+                // instruction it happened to be executing: lunarbg killed
+                // mid-`subss` (a register-only SSE op that cannot fault),
+                // labwc, the bar and PulseAudio going down together in the same
+                // second, with a fault report naming innocent code.
+                #[cfg(target_arch = "x86_64")]
+                loop {
+                    self.0.run();
+                    if self.0.trap_num != 2 {
+                        break;
+                    }
+                    // Same two jobs as the kernel-mode handler: record where
+                    // this CPU was (a user RIP is a true answer to "stuck
+                    // where?" -- it says the CPU is in userspace, not wedged in
+                    // the kernel), then service a shootdown the peer escalated
+                    // to an NMI because no maskable IPI could land. Both are
+                    // NMI-safe: no locks, no allocation, nothing printed.
+                    crate::kstats::note_nmi_rip(self.0.general.rip as u64);
+                    crate::common::ipi::tlb_shootdown_ack_nmi();
+                    self.dbg_validate_user_ctx("after NMI from user");
+                }
+                #[cfg(not(target_arch = "x86_64"))]
                 self.0.run();
                 self.dbg_validate_user_ctx("after trap from user");
             }
