@@ -29,7 +29,7 @@ KSYM_MAGIC = 0x4D59534B  # "KSYM"
 KSYM_VERSION = 1
 HEADER_LEN = 32
 # Keep names readable without letting one monomorphized generic eat kilobytes.
-MAX_NAME = 80
+MAX_NAME = 96
 
 
 def warn(msg):
@@ -84,6 +84,26 @@ MARKERS = {
 }
 
 
+def shorten(name):
+    """Trim a long symbol from the MIDDLE, never the end.
+
+    Rust trait-impl symbols put the informative part last: cutting at a fixed
+    prefix length produced
+
+        <zcore::handler::ZcoreKernelHandler as kernel_hal::kernel_handler::KernelHandler
+
+    in a crash report -- 80 characters that name the type and the trait and not
+    the method, which is the one thing the reader needs. Keeping both ends costs
+    nothing and answers the question.
+    """
+    if len(name) <= MAX_NAME:
+        return name
+    # Bias toward the tail: the method name lives there.
+    keep_tail = (MAX_NAME * 2) // 3
+    keep_head = MAX_NAME - keep_tail - 2
+    return name[:keep_head] + ".." + name[-keep_tail:]
+
+
 def collect(nm, elf):
     """`[(addr, name)]` for every function symbol, address-sorted and deduped."""
     out = subprocess.run(
@@ -110,7 +130,7 @@ def collect(nm, elf):
         name = name.strip()
         if addr == 0 or not name or name in MARKERS:
             continue
-        syms.append((addr, size, name[:MAX_NAME]))
+        syms.append((addr, size, shorten(name)))
     # Address first, then sized symbols before sizeless ones: at a shared
     # address the real function wins over an alias or a stray label.
     syms.sort(key=lambda s: (s[0], 0 if s[1] else 1))
