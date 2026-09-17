@@ -399,17 +399,20 @@ cfg_if! {
                     break;
                 }
                 kernel_hal::console::serial_write_fmt_spin(format_args!(
-                    "[heap-reentrant]   ret={:#x}\n",
-                    ret
+                    "[heap-reentrant]   ret={}\n",
+                    kernel_hal::ksyms::Addr(ret as u64)
                 ));
                 if next <= rbp {
                     break;
                 }
                 rbp = next;
             }
-            kernel_hal::console::serial_write_str(
-                "[heap-reentrant] symbolize: llvm-addr2line -e <zcore.elf> -fCi <ret ...>\n",
-            );
+            if !kernel_hal::ksyms::available() {
+                kernel_hal::console::serial_write_str(
+                    "[heap-reentrant] no in-kernel symbol table — symbolize with \
+                     `make sym ADDRS=\"...\"` where this kernel was built\n",
+                );
+            }
         }
 
         /// One-shot report that the buddy allocator just dispensed a block
@@ -447,17 +450,20 @@ cfg_if! {
                     break;
                 }
                 kernel_hal::console::serial_write_fmt_spin(format_args!(
-                    "[double-alloc]   ret={:#x}\n",
-                    ret
+                    "[double-alloc]   ret={}\n",
+                    kernel_hal::ksyms::Addr(ret as u64)
                 ));
                 if next <= rbp {
                     break;
                 }
                 rbp = next;
             }
-            kernel_hal::console::serial_write_str(
-                "[double-alloc] symbolize: llvm-addr2line -e <zcore.elf> -fCi <ret ...>\n",
-            );
+            if !kernel_hal::ksyms::available() {
+                kernel_hal::console::serial_write_str(
+                    "[double-alloc] no in-kernel symbol table — symbolize with \
+                     `make sym ADDRS=\"...\"` where this kernel was built\n",
+                );
+            }
         }
 
         /// Attribution for the OOM in #1135. The heap dump there was five
@@ -503,17 +509,20 @@ cfg_if! {
                     break;
                 }
                 kernel_hal::console::serial_write_fmt_spin(format_args!(
-                    "[bigalloc]   ret={:#x}\n",
-                    ret
+                    "[bigalloc]   ret={}\n",
+                    kernel_hal::ksyms::Addr(ret as u64)
                 ));
                 if next <= rbp {
                     break;
                 }
                 rbp = next;
             }
-            kernel_hal::console::serial_write_str(
-                "[bigalloc] symbolize: llvm-addr2line -e <zcore.elf> -fCi <ret ...>\n",
-            );
+            if !kernel_hal::ksyms::available() {
+                kernel_hal::console::serial_write_str(
+                    "[bigalloc] no in-kernel symbol table — symbolize with \
+                     `make sym ADDRS=\"...\"` where this kernel was built\n",
+                );
+            }
         }
 
         pub fn heap_total() -> usize {

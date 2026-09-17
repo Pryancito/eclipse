@@ -490,6 +490,13 @@ endif
 kernel:
 	@echo Building zCore kernel
 	SMP=$(SMP) cargo build $(build_args)
+# Patch the in-kernel symbol table into the freshly linked image, so crash
+# reports name functions instead of printing bare addresses that only mean
+# something against this exact ELF. Best-effort by design: a missing tool or a
+# kernel without the `.ksyms` reservation warns and leaves the image alone.
+ifneq ($(PLATFORM), libos)
+	@python3 ../tools/gen_ksyms.py $(kernel_elf) || true
+endif
 ifeq ($(ARCH), aarch64)
 	@mkdir -p disk/EFI/Boot
 	@cp ../target/aarch64/$(MODE)/zcore disk/os

@@ -12,6 +12,7 @@ pub mod console;
 pub mod context;
 pub mod ipi;
 pub mod kstats;
+pub mod ksyms;
 pub mod oops_log;
 pub mod timer_waker;
 pub mod user;

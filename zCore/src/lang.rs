@@ -458,8 +458,14 @@ fn panic(info: &PanicInfo) -> ! {
             if ret == 0 {
                 break;
             }
-            kernel_hal::console::serial_write_fmt_spin(format_args!("  ret={:#x}\n", ret));
-            kernel_hal::console::graphic_console_write_fmt_spin(format_args!("  ret={:#x}\n", ret));
+            kernel_hal::console::serial_write_fmt_spin(format_args!(
+                "  ret={}\n",
+                kernel_hal::ksyms::Addr(ret as u64)
+            ));
+            kernel_hal::console::graphic_console_write_fmt_spin(format_args!(
+                "  ret={}\n",
+                kernel_hal::ksyms::Addr(ret as u64)
+            ));
             if next <= rbp {
                 break; // stack grows down; a non-increasing frame is corrupt
             }
