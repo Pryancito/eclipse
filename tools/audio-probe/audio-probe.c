@@ -382,6 +382,63 @@ static void list_mpg123_modules(const char *dir) {
   else info("mpg123 output modules in %s: %s", dir, line);
 }
 
+// A bare `mpg123 x.mp3` must not land on OSS. mpg123 1.3x has no config file
+// at all (the binary carries no rcfile option and no mpg123.conf path), so
+// with no -o on the command line libout123 walks its built-in driver list and
+// takes the first module that both LOADS and OPENS -- and this rootfs ships
+// output_oss.so, so /dev/dsp is a candidate: the raw HDA ring, no mixing and
+// no daemon, which plays silent while PulseAudio holds the PCM. The image
+// pins the default with a /usr/local/bin/mpg123 wrapper (xtask linux/mod.rs)
+// that prepends `-o alsa`; mpg123 lets the last -o win, so an explicit one
+// still decides. Check that the wrapper exists, that PATH resolves to it, and
+// that the module it names is the ALSA (-> pulse plugin) one.
+static void check_mpg123_default(void) {
+  static const char *const wrapper = "/usr/local/bin/mpg123";
+  if (access("/usr/bin/mpg123", X_OK) && access(wrapper, X_OK)) {
+    info("no mpg123 installed -- skipping the default output module check");
+    return;
+  }
+  int err = access(wrapper, X_OK) ? errno : 0;
+  check(err == 0, "/usr/local/bin/mpg123 wrapper installed",
+        "without it a bare `mpg123` takes libout123's first working driver, which can be OSS", err);
+
+  // What PATH actually resolves -- the wrapper only wins if it comes first.
+  const char *path = getenv("PATH");
+  char first[256] = "";
+  for (const char *p = path ? path : ""; *p;) {
+    const char *sep = strchr(p, ':');
+    size_t n = sep ? (size_t)(sep - p) : strlen(p);
+    char cand[256];
+    if (n && n + sizeof "/mpg123" <= sizeof cand) {
+      snprintf(cand, sizeof cand, "%.*s/mpg123", (int)n, p);
+      if (access(cand, X_OK) == 0) {
+        snprintf(first, sizeof first, "%s", cand);
+        break;
+      }
+    }
+    if (!sep) break;
+    p = sep + 1;
+  }
+  if (first[0]) info("PATH resolves mpg123 to %s", first);
+  check(!strcmp(first, wrapper), "a bare `mpg123` runs the wrapper",
+        "PATH must put /usr/local/bin before /usr/bin (/etc/profile, eclipse-init)", 0);
+
+  // The module the wrapper names, as written. OSS is only acceptable behind
+  // ALSA in the list (`-o alsa,oss`), never as the first choice.
+  FILE *f = fopen(wrapper, "r");
+  if (!f) return;
+  char line[512];
+  int alsa_first = 0;
+  while (fgets(line, sizeof line, f)) {
+    if (line[0] == '#' || !strstr(line, "-o ")) continue;
+    const char *a = strstr(line, "alsa"), *o = strstr(line, "oss");
+    if (a && (!o || a < o)) alsa_first = 1;
+  }
+  fclose(f);
+  check(alsa_first, "the wrapper defaults to the ALSA output module",
+        "ALSA `default` is the pulse plugin; OSS writes the unmixed ring and plays silent under the daemon", 0);
+}
+
 // pid of a process whose /proc/<pid>/comm is `name`, or -1.
 static long find_process(const char *name) {
   DIR *d = opendir("/proc");
@@ -1420,6 +1477,7 @@ static void test_daemon(void) {
   // here. "Failed to open module pulse" in that log is this directory (or a
   // library the module links, libpulse-simple) -- not the server.
   list_mpg123_modules("/usr/lib/mpg123");
+  check_mpg123_default();
 }
 
 // ── AF_UNIX connect() semantics ────────────────────────────────────────────

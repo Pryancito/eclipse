@@ -131,8 +131,17 @@ Pulse mixes in userspace.
 - The ALSA sink is `mmap=0 tsched=0`: this kernel's PCM is RW-interleaved +
 `SYNC_PTR` only. Period wakeups come from the poll timer (~4 ms). After a
 track ends, a kernel watchdog keeps reading LPIB so the cyclic DMA ring
-cannot loop the last fragment. `module-suspend-on-idle timeout=1` then
-pauses the sink.
+cannot loop the last fragment. `module-suspend-on-idle` is deliberately NOT
+loaded: a suspended sink was not being resumed when a new stream attached
+(the resume runs in the sink IO thread), so every later play went silent.
+The sink stays IDLE with the PCM open instead.
+- `mpg123` defaults to `-o alsa` through the `/usr/local/bin/mpg123` wrapper.
+  mpg123 1.3x has no config file, so without it libout123 walks its built-in
+  driver list and takes the first module that loads AND opens -- and the OSS
+  one (`/dev/dsp`, the unmixed HDA ring) is in that list, which plays silent
+  while the daemon holds the PCM. The last `-o` wins, so an explicit
+  `-o pulse` / `-o oss` still decides; `MPG123_DEFAULT_OUTPUT` moves the
+  default. `audio-probe` checks all of this in its `[daemon]` section.
 - OpenAL (`ALSOFT_DRIVERS=pulse,alsa`) talks native libpulse. PI-futexes are
   implemented, so `pa_mutex_new()` no longer aborts.
 
