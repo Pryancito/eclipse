@@ -241,8 +241,29 @@ impl TextBuffer for LinearScrollbackBuffer {
         // equality here guarantees the pixels are already correct. Cursor
         // tracking below still runs — position advances even over unchanged
         // cells.
-        let unchanged = self.buf[row][col] == cell;
-        self.buf[row][col] = cell;
+        //
+        // Bound by the BUFFER's own dimensions, not the console's. `width()`
+        // and `height()` come from the display (`self.inner`), while `buf` is
+        // resized separately, so the two can disagree — and when they do, this
+        // line panics:
+        //
+        //   panic at drivers/src/utils/graphic_console.rs:244:38
+        //   index out of bounds: the len is 0 but the index is 0
+        //
+        // That is fatal in a way an ordinary bounds check is not, because the
+        // panic handler prints THROUGH this path: `rust_begin_unwind` ->
+        // `graphic_console_write_fmt_spin` -> rcore-console -> here. A panic
+        // here is therefore a panic inside the panic handler, which is exactly
+        // why the KERNEL STOP screen came up blank — the report that would have
+        // named the original fault never got rendered.
+        //
+        // Dropping the cell is the right failure: the console is mid-resize or
+        // not yet built, and losing a character beats losing the crash report.
+        let Some(slot) = self.buf.get_mut(row).and_then(|r| r.get_mut(col)) else {
+            return;
+        };
+        let unchanged = *slot == cell;
+        *slot = cell;
 
         if self.scrollback_offset.is_none() {
             if !unchanged {

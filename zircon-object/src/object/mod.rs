@@ -105,7 +105,7 @@ use {
         task::{Context, Poll},
     },
     downcast_rs::{impl_downcast, DowncastSync},
-    kernel_hal::sync::Mutex,
+    kernel_hal::sync::{HeldByCurrentCpu, Mutex},
 };
 
 pub use {super::*, clock::*, counter::*, handle::*, rights::*, signal::*};
@@ -383,7 +383,25 @@ impl KObjectBase {
     }
 
     /// Get object's name.
+    ///
+    /// Never blocks on a lock this CPU already holds. `signal_change` keeps
+    /// `inner` locked while it invokes the callbacks, so a callback — or
+    /// anything it reaches, such as file teardown on `PROCESS_TERMINATED` —
+    /// that asks this same object for its name would spin forever with
+    /// interrupts off. The detector named it with holder and waiter on the
+    /// same line:
+    ///
+    ///     cpu=3 at zircon-object/src/object/mod.rs:387
+    ///     HOLDER cpu=3 at zircon-object/src/object/mod.rs:387
+    ///
+    /// [`Self::try_name`] exists for callers that can handle the absence, and
+    /// the known call sites use it. This is the backstop for the ones that
+    /// cannot: a placeholder in a diagnostic is a blemish, a wedged CPU is the
+    /// machine.
     pub fn name(&self) -> String {
+        if self.inner.held_by_current_cpu() {
+            return String::from("<name: object lock held by this CPU>");
+        }
         self.inner.lock().name.clone()
     }
 

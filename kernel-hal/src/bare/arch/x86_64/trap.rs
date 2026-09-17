@@ -846,7 +846,19 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
 /// Reads only mapped kernel `.text` (the faulting RIP is by definition in it),
 /// prints through the spin writer and allocates nothing.
 fn report_ud_shape(rip: u64) {
-    if rip < 0xffff_ff00_0001_0000 + 8 {
+    // A RIP outside kernel .text is the loudest case of all and used to print
+    // nothing: `#UD at RIP=0x21` means execution branched through a null or
+    // scribbled function pointer and the CPU decoded whatever lives at address
+    // 0x21 — the same corrupt-pointer family as the null-range #PFs, not an
+    // instruction problem. Reading bytes there is not safe, so say it and stop.
+    if !(0xffff_ff00_0001_0000 + 8..0xffff_ff00_0100_0000).contains(&rip) {
+        crate::console::serial_write_fmt_spin(format_args!(
+            "[#UD] RIP {:#x} is outside kernel .text — execution branched \
+             through a corrupt function pointer and is decoding whatever is at \
+             that address. Same family as the null-range #PFs, not a bad \
+             instruction.\n",
+            rip,
+        ));
         return;
     }
     let byte = |a: u64| -> u8 {
