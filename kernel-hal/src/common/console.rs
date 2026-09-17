@@ -686,25 +686,21 @@ impl EmergencyGraphicWriter {
 }
 
 impl Write for EmergencyGraphicWriter {
-    fn write_str(&mut self, mut s: &str) -> Result {
-        while !s.is_empty() {
-            if self.len == self.buf.len() {
-                self.flush();
-            }
-            let cap = self.buf.len() - self.len;
-            let take = if s.len() <= cap {
-                s.len()
-            } else {
-                let mut end = cap;
-                while !s.is_char_boundary(end) {
-                    end -= 1;
-                }
-                end
-            };
-            self.buf[self.len..self.len + take].copy_from_slice(&s.as_bytes()[..take]);
-            self.len += take;
-            s = &s[take..];
+    fn write_str(&mut self, s: &str) -> Result {
+        for ch in s.chars() {
+            self.write_char(ch)?;
         }
+        Ok(())
+    }
+
+    fn write_char(&mut self, ch: char) -> Result {
+        let mut tmp = [0u8; 4];
+        let enc = ch.encode_utf8(&mut tmp).as_bytes();
+        if self.buf.len() - self.len < enc.len() {
+            self.flush();
+        }
+        self.buf[self.len..self.len + enc.len()].copy_from_slice(enc);
+        self.len += enc.len();
         Ok(())
     }
 }
