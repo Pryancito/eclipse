@@ -1023,6 +1023,7 @@ impl VmAddressRegion {
                     end: m.end_addr(),
                     flags,
                     vmo_offset: m.vmo_offset,
+                    file_offset: m.vmo_offset + map.vmo.file_offset(),
                     shared: map.vmo.share_count() > 1,
                     vmo_id: map.vmo.id(),
                     name: map.vmo.name(),
@@ -1924,6 +1925,13 @@ pub struct MappingDump {
     pub flags: MMUFlags,
     /// Byte offset into the backing VMO.
     pub vmo_offset: usize,
+    /// Byte offset into the backing FILE of the first mapped byte: the
+    /// `offset` column of `/proc/<pid>/maps`, and what makes `name+offset`
+    /// in a crash report a file offset `addr2line` understands. A private
+    /// file mapping keeps its `mmap` offset in the VMO rather than in
+    /// `vmo_offset` (see `VmObject::file_offset`), so the two differ there.
+    /// Equal to `vmo_offset` for anonymous memory.
+    pub file_offset: usize,
     /// Whether the backing VMO is shared with other mappers (MAP_SHARED-like).
     pub shared: bool,
     /// Koid of the backing VMO — stands in for the inode column.

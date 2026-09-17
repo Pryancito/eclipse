@@ -1590,7 +1590,7 @@ fn proc_pid_maps(proc: &Arc<Process>) -> String {
         let _ = writeln!(
             s,
             "{:08x}-{:08x} {}{}{}{} {:08x} 00:00 {:<10} {}",
-            m.start, m.end, r, w, x, p, m.vmo_offset, m.vmo_id, m.name
+            m.start, m.end, r, w, x, p, m.file_offset, m.vmo_id, m.name
         );
     }
     s
