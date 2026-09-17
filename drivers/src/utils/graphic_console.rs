@@ -161,7 +161,60 @@ impl LinearScrollbackBuffer {
         self.redraw();
     }
 
+    /// Make `buf` match the display before anything indexes it.
+    ///
+    /// `width()` and `height()` come from the display (`self.inner`); `buf` is
+    /// a separately-sized `Vec<Vec<Cell>>`. Nothing keeps the two in step, and
+    /// every raw `self.buf[r][c]` in this file is bounded by the display's
+    /// dimensions — so any disagreement is a panic, in the one place where a
+    /// panic is unsurvivable: the panic handler prints THROUGH here
+    /// (`rust_begin_unwind` -> `graphic_console_write_fmt_spin` ->
+    /// rcore-console -> `TextBuffer`). Two of them landed in successive boots,
+    /// at lines 244 and 205, and both times the KERNEL STOP screen came up with
+    /// a banner and nothing under it: the report naming the original fault was
+    /// lost to a panic inside the panic handler.
+    ///
+    /// Resizing is better than dropping the write: a console that repairs
+    /// itself keeps printing the crash report, which is the entire reason this
+    /// path exists. Reports once so a silent mismatch cannot hide.
+    fn ensure_dims(&mut self) {
+        let (h, w) = (self.inner.height(), self.inner.width());
+        if self.buf.len() == h && self.buf.iter().all(|r| r.len() == w) {
+            return;
+        }
+        Self::report_dims_mismatch(
+            self.buf.len(),
+            h,
+            self.buf.first().map_or(0, |r| r.len()),
+            w,
+        );
+        self.buf.resize_with(h, || vec![Cell::default(); w]);
+        for row in self.buf.iter_mut() {
+            row.resize(w, Cell::default());
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn report_dims_mismatch(rows: usize, h: usize, cols: usize, w: usize) {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        static REPORTED: AtomicBool = AtomicBool::new(false);
+        if REPORTED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        log::warn!(
+            "[gcon] scrollback buffer is {}x{} but the display is {}x{} — \
+             resizing. Every raw index in this file is bounded by the display, \
+             so a mismatch would panic inside the panic handler.",
+            rows,
+            cols,
+            h,
+            w,
+        );
+    }
+
     pub fn redraw(&mut self) {
+        self.ensure_dims();
         let height = self.height();
         let width = self.width();
 
@@ -177,17 +230,17 @@ impl LinearScrollbackBuffer {
                         self.inner.write(r, col, bg_cell);
                     }
                 } else if index < history_len as isize {
-                    let line = &self.history[index as usize];
+                    let blank = Cell::default();
+                    let line = self.history.get(index as usize);
                     for col in 0..width {
-                        let cell = line[col];
+                        let cell = line.and_then(|l| l.get(col)).copied().unwrap_or(blank);
                         self.inner.write(r, col, cell);
                     }
                 } else {
                     let active_row = (index - history_len as isize) as usize;
-                    if active_row < height {
-                        let line = &self.buf[active_row];
+                    if let Some(line) = self.buf.get(active_row).filter(|_| active_row < height) {
                         for col in 0..width {
-                            let cell = line[col];
+                            let cell = line.get(col).copied().unwrap_or_default();
                             self.inner.write(r, col, cell);
                         }
                     } else {
@@ -200,9 +253,9 @@ impl LinearScrollbackBuffer {
             }
         } else {
             for r in 0..height {
-                let line = &self.buf[r];
+                let line = self.buf.get(r);
                 for col in 0..width {
-                    let cell = line[col];
+                    let cell = line.and_then(|l| l.get(col)).copied().unwrap_or_default();
                     self.inner.write(r, col, cell);
                 }
             }
@@ -223,11 +276,18 @@ impl TextBuffer for LinearScrollbackBuffer {
 
     #[inline]
     fn read(&self, row: usize, col: usize) -> Cell {
-        self.buf[row][col]
+        // `&self`, so it cannot repair the way `ensure_dims` does; answer with
+        // a blank rather than panic on the console's own print path.
+        self.buf
+            .get(row)
+            .and_then(|r| r.get(col))
+            .copied()
+            .unwrap_or_default()
     }
 
     #[inline]
     fn write(&mut self, row: usize, col: usize, cell: Cell) {
+        self.ensure_dims();
         let height = self.height();
         let width = self.width();
         if row >= height || col >= width {
@@ -280,6 +340,7 @@ impl TextBuffer for LinearScrollbackBuffer {
     }
 
     fn new_line(&mut self, cell: Cell) {
+        self.ensure_dims();
         let height = self.height();
         let width = self.width();
         if height == 0 {
@@ -361,6 +422,7 @@ impl TextBuffer for LinearScrollbackBuffer {
     /// one bulk `copy_rect` (cached RAM) instead of re-rendering every glyph —
     /// the fast path for full-screen TUIs (irssi/htop) that scroll a window.
     fn scroll_region_up(&mut self, top: usize, bottom: usize, n: usize, blank: Cell) {
+        self.ensure_dims();
         let height = self.height();
         let width = self.width();
         if top > bottom || bottom >= height || n == 0 {
@@ -410,6 +472,7 @@ impl TextBuffer for LinearScrollbackBuffer {
 
     /// Scroll a sub-region down by `n` lines (bulk pixel copy + clear the top).
     fn scroll_region_down(&mut self, top: usize, bottom: usize, n: usize, blank: Cell) {
+        self.ensure_dims();
         let height = self.height();
         let width = self.width();
         if top > bottom || bottom >= height || n == 0 {
