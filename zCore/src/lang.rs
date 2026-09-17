@@ -326,6 +326,12 @@ fn panic(info: &PanicInfo) -> ! {
     // RefCell → nested panic → abort() → ud2 → triple fault → QEMU reset.
     kernel_hal::interrupt::intr_off();
 
+    // Before any console output at all: tell the graphic console to stop
+    // trusting its cell cache. Three boots in a row died as a panic INSIDE this
+    // handler, on the console path, because the fault being reported had
+    // already corrupted the buffer the console was about to resize and repaint.
+    kernel_hal::console::note_panicking();
+
     // FIRST, before anything that touches a lock: rasterize the panic straight
     // onto the framebuffer (red band, raw pixel writes, no locks, no alloc).
     // Everything below can be silently dropped or deadlock when another CPU —
