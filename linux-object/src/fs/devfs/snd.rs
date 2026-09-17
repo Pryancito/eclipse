@@ -446,8 +446,9 @@ pub struct PcmDev {
     audio: Arc<dyn AudioScheme>,
     card: usize,
     inode_id: usize,
-    st: Mutex<PcmState>,
-    opened: AtomicBool,
+    st: Arc<Mutex<PcmState>>,
+    opened: Arc<AtomicBool>,
+    release_opened_on_drop: bool,
 }
 
 impl PcmDev {
@@ -456,7 +457,7 @@ impl PcmDev {
             audio,
             card,
             inode_id: DevFS::new_inode_id(),
-            st: Mutex::new(PcmState {
+            st: Arc::new(Mutex::new(PcmState {
                 state: STATE_OPEN,
                 rate: 48000,
                 buffer_size: 16384,
@@ -465,15 +466,16 @@ impl PcmDev {
                 appl_ptr: 0,
                 avail_min: 1024,
                 stalled_since: None,
-            }),
-            opened: AtomicBool::new(false),
+            })),
+            opened: Arc::new(AtomicBool::new(false)),
+            release_opened_on_drop: false,
         }
     }
 
     /// `hw:card,0` is a single-client PCM: the one process that owns it keeps
     /// the shared runtime state and timer view until close, and everyone else
     /// gets `EBUSY` as on Linux.
-    pub fn open_client(self: &Arc<Self>) -> Result<Arc<dyn INode>> {
+    pub fn open_client(&self) -> Result<Arc<dyn INode>> {
         if self
             .opened
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -481,55 +483,18 @@ impl PcmDev {
         {
             return Err(FsError::Busy);
         }
-        Ok(Arc::new(PcmClient { pcm: self.clone() }))
+        Ok(Arc::new(PcmDev {
+            audio: self.audio.clone(),
+            card: self.card,
+            inode_id: self.inode_id,
+            st: self.st.clone(),
+            opened: self.opened.clone(),
+            release_opened_on_drop: true,
+        }))
     }
 
     fn ring_frames(&self) -> u64 {
         self.audio.buffer_bytes() as u64 / BYTES_PER_FRAME
-    }
-
-    /// One open of `/dev/snd/pcmC*D0p`. The underlying [`PcmDev`] keeps the ALSA
-    /// runtime state; this wrapper only owns the exclusive-open lease.
-    pub struct PcmClient {
-        pcm: Arc<PcmDev>,
-    }
-
-    impl Drop for PcmClient {
-        fn drop(&mut self) {
-            self.pcm.opened.store(false, Ordering::Release);
-        }
-    }
-
-    impl PcmClient {
-        pub(crate) fn io_control_with_flags(&self, cmd: u32, data: usize, flags: OpenFlags) -> Result<usize> {
-            self.pcm.io_control_with_flags(cmd, data, flags)
-        }
-    }
-
-    impl INode for PcmClient {
-        fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
-            self.pcm.read_at(offset, buf)
-        }
-
-        fn write_at(&self, offset: usize, buf: &[u8]) -> Result<usize> {
-            self.pcm.write_at(offset, buf)
-        }
-
-        fn poll(&self) -> Result<PollStatus> {
-            self.pcm.poll()
-        }
-
-        fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
-            self.pcm.io_control(cmd, data)
-        }
-
-        fn metadata(&self) -> Result<Metadata> {
-            self.pcm.metadata()
-        }
-
-        fn as_any_ref(&self) -> &dyn Any {
-            self
-        }
     }
 
     fn queued_frames(&self) -> u64 {
@@ -1580,6 +1545,14 @@ impl PcmDev {
                 debug!("[snd] pcm ioctl 'A' nr={:#x} unsupported", nr);
                 Err(FsError::NotSupported)
             }
+        }
+    }
+}
+
+impl Drop for PcmDev {
+    fn drop(&mut self) {
+        if self.release_opened_on_drop {
+            self.opened.store(false, Ordering::Release);
         }
     }
 }

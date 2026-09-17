@@ -292,7 +292,7 @@ impl Syscall<'_> {
                 linux_object::fs::pty::alloc_ptmx()
             } else if let Some(ptmx) = inode.downcast_ref::<linux_object::fs::devfs::PtmxINode>() {
                 ptmx.open_master().map_err(LxError::from)?
-            } else if let Ok(pcm) = inode.clone().downcast_arc::<linux_object::fs::devfs::PcmDev>() {
+            } else if let Some(pcm) = inode.downcast_ref::<linux_object::fs::devfs::PcmDev>() {
                 // Raw ALSA hw PCMs are single-client: while one fd owns
                 // `/dev/snd/pcmC*D0p`, the next open must fail with EBUSY.
                 pcm.open_client().map_err(LxError::from)?
