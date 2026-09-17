@@ -86,6 +86,33 @@ impl ShadowFramebuffer {
         self.height
     }
 
+    /// The shadow lock, or `None` when **this CPU already holds it**.
+    ///
+    /// Every drawing entry point goes through here instead of `inner.lock()`.
+    /// The lock is an IRQ-disabling ticket mutex, so no interrupt can re-enter
+    /// it — but a *fault or panic taken mid-draw* can, and does: the panic
+    /// handler prints to the graphic console, and instantiating or clearing a
+    /// VT comes straight back in here. A ticket mutex is not re-entrant, so
+    /// that second acquire waits, with interrupts off, for a release only this
+    /// CPU could perform. The detector caught it exactly:
+    ///
+    ///     cpu=1 at drivers/src/utils/shadow_fb.rs:161   <- clear, waiting
+    ///     HOLDER cpu=1 at drivers/src/utils/shadow_fb.rs:102 <- put_pixels, holding
+    ///
+    /// one CPU, both ends, while three other cores were busy panicking. Two of
+    /// those panics were contained and the system would have survived; this is
+    /// what killed it.
+    ///
+    /// Declining costs some console pixels on a path that is already printing a
+    /// crash. Blocking costs the machine, and the crash report with it.
+    #[inline]
+    fn lock_inner(&self) -> Option<lock::MutexGuard<'_, ShadowInner>> {
+        if self.inner.held_by_current_cpu() {
+            return None;
+        }
+        Some(self.inner.lock())
+    }
+
     #[inline]
     fn mark(inner: &mut ShadowInner, x0: usize, y0: usize, x1: usize, y1: usize) {
         inner.dirty = Some(match inner.dirty {
@@ -99,7 +126,9 @@ impl ShadowFramebuffer {
     /// Taking an iterator lets a whole glyph be rendered under a single lock.
     pub fn put_pixels(&self, pixels: impl Iterator<Item = (usize, usize, u32)>) {
         let (w, h) = (self.width, self.height);
-        let mut g = self.inner.lock();
+        let Some(mut g) = self.lock_inner() else {
+            return;
+        };
         for (x, y, argb) in pixels {
             if x >= w || y >= h {
                 continue;
@@ -117,7 +146,9 @@ impl ShadowFramebuffer {
             return;
         }
         let width = self.width;
-        let mut g = self.inner.lock();
+        let Some(mut g) = self.lock_inner() else {
+            return;
+        };
         for yy in y..y1 {
             for px in &mut g.data[yy * width + x..yy * width + x1] {
                 *px = argb;
@@ -139,7 +170,9 @@ impl ShadowFramebuffer {
             return;
         }
         let width = self.width;
-        let mut g = self.inner.lock();
+        let Some(mut g) = self.lock_inner() else {
+            return;
+        };
         if dy <= sy {
             for r in 0..h {
                 let s = (sy + r) * width + sx;
@@ -158,7 +191,9 @@ impl ShadowFramebuffer {
 
     /// Clear the whole shadow buffer to `argb` and mark it fully dirty.
     pub fn clear(&self, argb: u32) {
-        let mut g = self.inner.lock();
+        let Some(mut g) = self.lock_inner() else {
+            return;
+        };
         for px in g.data.iter_mut() {
             *px = argb;
         }
@@ -188,7 +223,7 @@ impl ShadowFramebuffer {
             return;
         };
         let snap = {
-            let mut g = self.inner.lock();
+            let mut g = self.lock_inner()?;
             self.take_dirty(&mut g)
         };
         let Some(((x, y, w, h), pixels)) = snap else {
@@ -235,7 +270,9 @@ impl ShadowFramebuffer {
         });
 
         let (dirty, erase, draw) = {
-            let mut g = self.inner.lock();
+            let Some(mut g) = self.lock_inner() else {
+                return;
+            };
             // 1. The dirty content region.
             let dirty = self.take_dirty(&mut g);
             // 2. The previously drawn cursor, if it moved or is hidden.
