@@ -264,6 +264,20 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     // slower in absolute terms than single-threaded.
     #[cfg(not(feature = "libos"))]
     lock::set_spin_pump(kernel_hal::tlb_shootdown_pump);
+    // Arm the hardware write-watch on the IPI ring's `size` word before any
+    // userspace runs. See `kernel_hal::arm_queue_watch`: that word is set once
+    // at construction and never written again, so it needs no noise filtering
+    // — any store into it is the corruption this hunt is chasing, and the trap
+    // carries the writer's `rip`, which no post-mortem has been able to give.
+    #[cfg(not(feature = "libos"))]
+    if kernel_hal::arm_queue_watch() {
+        // Direct serial, not `info!`: a crash hunt runs at LOG=error, and
+        // "was the probe actually armed?" must be answerable from the same
+        // paste as the hit it is waiting for.
+        kernel_hal::console::serial_write_str(
+            "[ipi-watch] armed: any write to the IPI ring integrity word names its writer\n",
+        );
+    }
     // Second hook: alongside the stuck WAITERS, paint the acquire site of the
     // lock's current HOLDER (snapshotted from the lock by kernel-sync). The
     // waiters in the banner are usually innocent readers; the HOLDER line is

@@ -27,6 +27,38 @@ pub(crate) fn ipi_queue(cpuid: usize) -> &'static IRQueue {
     &IPI_QUEUE[cpuid]
 }
 
+/// Arm the hardware write-watch on an IPI ring's `size` word, so the next
+/// store into it traps with the writer's `rip`.
+///
+/// This word is the best probe in the kernel for the corruption this hunt is
+/// chasing, for one reason: **its correct value is a compile-time constant**.
+/// `size` is set once in `MpscQueue::new` to `REASON_SIZE` and never written
+/// again, so unlike a name buffer or a stack slot there is no legitimate store
+/// to filter out. Any hit is the bug.
+///
+/// It is also the probe that fires most: `entry_at` has caught this word
+/// wrong on most recent boots, and what it holds is telling —
+///
+///     len=0xffffff00218688e0  size=0xffffff00006567c1   (two kernel pointers)
+///     len=18446742974756925680  size=18446742974756926704  (a pair 1024 apart)
+///     len=6  size=0
+///
+/// — foreign data, not a single stray byte. A `Vec` that is allocated once by
+/// a `lazy_static` and never freed cannot be written by its owner, so either
+/// something writes wild, or the allocator handed this block out twice. The
+/// two look identical in a post-mortem and completely different in a trap:
+/// the `rip` says whether the writer thought it owned the memory.
+///
+/// Costs nothing until it fires (the CPU checks DR0 in hardware), reports
+/// through the existing `[watchpoint]` path, and self-disarms after a few hits
+/// so it cannot storm the console.
+pub fn arm_queue_watch() -> bool {
+    // `&...size`, not the struct address: `MpscQueue` is `repr(Rust)` and the
+    // compiler is free to put `size` anywhere in it.
+    let addr = &IPI_QUEUE[0].size as *const usize as usize;
+    crate::watchpoint::watch_write(addr, 8)
+}
+
 pub(crate) fn ipi_reason() -> Vec<usize> {
     let cpu_id = crate::cpu::cpu_id() as usize;
     let queue = ipi_queue(cpu_id);
