@@ -35,6 +35,18 @@ SECTIONS {
     PROVIDE_HIDDEN(kcounters_desc_end = .);
   } :rodata
 
+  /* Reserved, zero-filled slot for the in-kernel symbol table. The post-link
+     step (tools/gen_ksyms.py, driven from the Makefile) patches the real table
+     in with `llvm-objcopy --update-section`. The reservation never changes
+     size, so nothing in the image shifts and one link is still enough. It must
+     be PROGBITS and inside a PT_LOAD for rboot to load it -- see zCore/src/ksyms.rs. */
+  .ksyms ALIGN(4K):
+  {
+    PROVIDE_HIDDEN(ksyms_start = .);
+    KEEP(*(.ksyms))
+    PROVIDE_HIDDEN(ksyms_end = .);
+  }
+
   .data ALIGN(4K):
   {
     *(.data .data.*)

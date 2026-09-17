@@ -214,12 +214,12 @@ impl KernelHandler for ZcoreKernelHandler {
             // (null vtable) while diagnosing — the
             // "re-entrant null-range while diagnosing" loop.
             kernel_hal::console::serial_write_fmt_spin(format_args!(
-                "\n[KERNEL BUG] null-range #PF vaddr={:#x} flags={:?} rip={:#x} \
+                "\n[KERNEL BUG] null-range #PF vaddr={:#x} flags={:?} rip={} \
                  (kernel-context fault — not a userspace SIGSEGV; \
                  in_timer_callback={}; not retriable)\n",
                 fault_vaddr,
                 access_flags,
-                kernel_hal::kstats::last_fault_rip(),
+                kernel_hal::ksyms::Addr(kernel_hal::kstats::last_fault_rip()),
                 in_timer,
             ));
             // Did this CPU run with a GS that lied about who it is? A bogus
@@ -395,10 +395,13 @@ fn report_unresolved_kernel_fault(
         }
     }
     kernel_hal::console::serial_write_fmt_spin(format_args!(
-        "\n[KERNEL PAGE FAULT] vaddr={:#x} flags={:?} rip={:#x} have_thread={} \
+        "\n[KERNEL PAGE FAULT] vaddr={:#x} flags={:?} rip={} have_thread={} \
          (unresolved by the user vmar — a kernel-side bug, not a userspace \
          SIGSEGV; serial-only so a torn graphic console cannot re-fault us)\n",
-        fault_vaddr, access_flags, rip, have_thread,
+        fault_vaddr,
+        access_flags,
+        kernel_hal::ksyms::Addr(rip),
+        have_thread,
     ));
     print_fault_backtrace(access_flags);
     // Release the latch before containment: a successful `try_contain` retires
@@ -526,6 +529,21 @@ fn print_fault_backtrace(access_flags: MMUFlags) {
             }
         }
     }
+    // Say it once when the addresses below have no names: an unpatched kernel
+    // (built without `tools/gen_ksyms.py`) is indistinguishable from a
+    // backtrace whose frames all fall outside the table, and only one of those
+    // is worth investigating.
+    if !kernel_hal::ksyms::available() {
+        use core::sync::atomic::{AtomicBool, Ordering as O};
+        static NOTED: AtomicBool = AtomicBool::new(false);
+        if !NOTED.swap(true, O::Relaxed) {
+            kernel_hal::console::serial_write_str(
+                "[kfault-bt] (no in-kernel symbol table in this build — addresses \
+                 are bare; symbolize with `make sym ADDRS=\"...\"` where this \
+                 kernel was built)\n",
+            );
+        }
+    }
     kernel_hal::console::serial_write_fmt_spin(format_args!(
         "[kfault-bt] rbp={:#x} rsp={:#x} walking frames:\n",
         rbp0, rsp0,
@@ -563,14 +581,18 @@ fn print_fault_backtrace(access_flags: MMUFlags) {
         let ret = unsafe { core::ptr::read_volatile((rbp + 8) as *const u64) };
         if ret < 0x1000 {
             kernel_hal::console::serial_write_fmt_spin(format_args!(
-                "[kfault-bt]   #{:02} ret={:#x} (rbp={:#x}) — abort walk (corrupt frame)\n",
-                i, ret, rbp,
+                "[kfault-bt]   #{:02} ret={} (rbp={:#x}) — abort walk (corrupt frame)\n",
+                i,
+                kernel_hal::ksyms::Addr(ret),
+                rbp,
             ));
             break;
         }
         kernel_hal::console::serial_write_fmt_spin(format_args!(
-            "[kfault-bt]   #{:02} ret={:#x} (rbp={:#x})\n",
-            i, ret, rbp,
+            "[kfault-bt]   #{:02} ret={} (rbp={:#x})\n",
+            i,
+            kernel_hal::ksyms::Addr(ret),
+            rbp,
         ));
         if saved_rbp <= rbp {
             break; // frame pointers must strictly increase up the stack
@@ -710,8 +732,9 @@ fn report_soft_smash_stack_attr(rsp: usize, rbp: usize) {
                 let v = unsafe { core::ptr::read_volatile(a as *const u64) };
                 if (TEXT_LO..TEXT_HI).contains(&v) {
                     kernel_hal::console::serial_write_fmt_spin(format_args!(
-                        "[kchain]   @{:#x} ret={:#x}\n",
-                        a, v,
+                        "[kchain]   @{:#x} ret={}\n",
+                        a,
+                        kernel_hal::ksyms::Addr(v),
                     ));
                     printed += 1;
                 }
