@@ -386,6 +386,21 @@ fn panic(info: &PanicInfo) -> ! {
     // monitor (no serial capture), a serial-only panic is invisible and reads
     // as a silent freeze. graphic_console_write_fmt is a best-effort try_lock
     // that no-ops if the VT lock is held, so it can't deadlock the panic path.
+    // A panic that names a cpu the machine does not have is not a typo in the
+    // report — it means GS was lying, and everything this CPU did with
+    // `push_off`/`pop_off` since then landed on a foreign per-CPU slot. Say so
+    // next to the panic instead of leaving "cpu=48 on a 6-vCPU guest" to be
+    // squinted at.
+    {
+        let (last, count) = lock::bogus_cpu_id_events();
+        if count > 0 {
+            kernel_hal::console::serial_write_fmt_spin(format_args!(
+                "\n[cpuid-bogus] GS reported logical cpu {} ({} time(s)) naming no \
+                 registered CPU — push_off/pop_off nested on a foreign per-CPU slot\n",
+                last, count,
+            ));
+        }
+    }
     if let Some(loc) = info.location() {
         kernel_hal::console::serial_write_fmt_spin(format_args!(
             "\n\npanic cpu={} at {}:{}:{}\n",

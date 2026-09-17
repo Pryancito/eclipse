@@ -9,7 +9,7 @@ cfg_if::cfg_if! {
     if #[cfg(all(target_os = "none", feature = "ticket"))] {
         extern crate alloc;
         mod interrupt;
-        pub use interrupt::{current_cpu_id, current_cpu_id_via_apic, lock_depth};
+        pub use interrupt::{bogus_cpu_id_events, current_cpu_id, current_cpu_id_via_apic, lock_depth};
         #[cfg(any(
             target_arch = "x86",
             target_arch = "x86_64",
@@ -32,7 +32,7 @@ cfg_if::cfg_if! {
     } else if #[cfg(target_os = "none")] {
         extern crate alloc;
         mod interrupt;
-        pub use interrupt::{current_cpu_id, current_cpu_id_via_apic, lock_depth};
+        pub use interrupt::{bogus_cpu_id_events, current_cpu_id, current_cpu_id_via_apic, lock_depth};
         #[cfg(any(
             target_arch = "x86",
             target_arch = "x86_64",
@@ -96,6 +96,11 @@ cfg_if::cfg_if! {
         /// hosted thread).
         pub fn current_cpu_id_via_apic() -> u8 {
             0
+        }
+
+        /// Hosted twin: GS plays no part, so there is nothing to disagree with.
+        pub fn bogus_cpu_id_events() -> (u32, u32) {
+            (u32::MAX, 0)
         }
     }
 }
