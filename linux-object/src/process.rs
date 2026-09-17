@@ -5,7 +5,7 @@ use crate::{
     fs::{File, FileDesc, FileLike, OpenFlags},
     ipc::*,
     net::SOCKET_FD,
-    signal::{Signal as LinuxSignal, SignalAction},
+    signal::{Signal as LinuxSignal, SignalAction, Sigset},
 };
 use alloc::{
     boxed::Box,
@@ -2199,6 +2199,22 @@ fn reparent_live_children_to_init(dying: &Arc<Process>) {
     adopter.signal_set(Signal::SIGCHLD);
 }
 
+/// Whether a signal with its *default* disposition interrupts a blocking
+/// syscall.
+fn signal_default_action_interrupts(sig: LinuxSignal) -> bool {
+    !matches!(
+        sig,
+        LinuxSignal::SIGCHLD
+            | LinuxSignal::SIGURG
+            | LinuxSignal::SIGWINCH
+            | LinuxSignal::SIGCONT
+            | LinuxSignal::SIGSTOP
+            | LinuxSignal::SIGTSTP
+            | LinuxSignal::SIGTTIN
+            | LinuxSignal::SIGTTOU
+    )
+}
+
 /// Whether a pending signal actually interrupts a blocking syscall.
 ///
 /// Linux only interrupts a syscall for a signal that will run a handler or
@@ -2221,17 +2237,7 @@ fn signal_interrupts_syscall(proc_linux: &LinuxProcess, sig: LinuxSignal) -> boo
         return false;
     }
     if handler == SIG_DFL {
-        return !matches!(
-            sig,
-            LinuxSignal::SIGCHLD
-                | LinuxSignal::SIGURG
-                | LinuxSignal::SIGWINCH
-                | LinuxSignal::SIGCONT
-                | LinuxSignal::SIGSTOP
-                | LinuxSignal::SIGTSTP
-                | LinuxSignal::SIGTTIN
-                | LinuxSignal::SIGTTOU
-        );
+        return signal_default_action_interrupts(sig);
     }
     // A caught signal (custom handler) interrupts the syscall.
     true
@@ -2285,10 +2291,24 @@ pub fn check_signals() -> LxResult<()> {
                     None => return Ok(()),
                 };
                 let mut rest = pending;
+                let mut discard = Sigset::empty();
                 while let Some(sig) = rest.find_first_signal() {
                     rest.remove(sig);
                     if signal_interrupts_syscall(proc_linux, sig) {
                         return Err(LxError::EINTR);
+                    }
+                    // Linux discards an unblocked signal whose disposition is
+                    // ignore (or whose default action this kernel maps to
+                    // ignore) instead of leaving it pending forever. A thread
+                    // parked in poll/epoll_wait may stay inside blocking
+                    // syscalls for minutes; if we merely "skip" such signals
+                    // here, every unrelated wake re-scans the same stale
+                    // pending bit.
+                    discard.insert(sig);
+                }
+                if discard.is_not_empty() {
+                    if let Some(mut linux_thread) = thread.try_lock_linux() {
+                        linux_thread.signals.remove_set(&discard);
                     }
                 }
             }
@@ -2356,6 +2376,47 @@ pub fn trace_direct_kill(target: &Arc<Process>, sender: &Arc<Process>) {
 pub fn trace_wait_error(call: &str, err: crate::error::LxError) {
     let (pid, name) = current_process_pid_name();
     zcore_drivers::klog_warn!("[wait] {}() -> {:?} for pid {} ({})", call, err, pid, name);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::signal_default_action_interrupts;
+    use crate::signal::Signal as LinuxSignal;
+
+    #[test]
+    fn default_ignored_and_stop_signals_do_not_interrupt_waits() {
+        for sig in [
+            LinuxSignal::SIGCHLD,
+            LinuxSignal::SIGURG,
+            LinuxSignal::SIGWINCH,
+            LinuxSignal::SIGCONT,
+            LinuxSignal::SIGSTOP,
+            LinuxSignal::SIGTSTP,
+            LinuxSignal::SIGTTIN,
+            LinuxSignal::SIGTTOU,
+        ] {
+            assert!(
+                !signal_default_action_interrupts(sig),
+                "{:?} should not interrupt",
+                sig
+            );
+        }
+    }
+
+    #[test]
+    fn default_terminating_signals_interrupt_waits() {
+        for sig in [
+            LinuxSignal::SIGHUP,
+            LinuxSignal::SIGINT,
+            LinuxSignal::SIGTERM,
+        ] {
+            assert!(
+                signal_default_action_interrupts(sig),
+                "{:?} should interrupt",
+                sig
+            );
+        }
+    }
 }
 
 pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {

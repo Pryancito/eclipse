@@ -1,18 +1,78 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <sys/epoll.h>
+#include <sys/wait.h>
 #include <poll.h>
 #include <assert.h>
 #include <time.h>
 #include <string.h>
+#include <signal.h>
 
-int main(int argc, char **argv)
+static void hammer_short_waits(void)
 {
-    int i;
+    struct timespec req = { .tv_sec = 0, .tv_nsec = 1000000 };
+    for (int i = 0; i < 200; i++) {
+        assert(poll(NULL, 0, 1) == 0);
+        assert(nanosleep(&req, NULL) == 0);
+    }
+}
+
+static void test_wait_survives_short_deadline_hammer(void)
+{
+    int pipefd[2];
+    assert(pipe(pipefd) == 0);
+
+    pid_t waiter = fork();
+    assert(waiter >= 0);
+    if (waiter == 0) {
+        int ep = epoll_create1(0);
+        struct epoll_event ev, out;
+        char c;
+        signal(SIGCHLD, SIG_IGN);
+        assert(ep >= 0);
+        memset(&ev, 0, sizeof(ev));
+        ev.events = EPOLLIN;
+        ev.data.fd = pipefd[0];
+        assert(epoll_ctl(ep, EPOLL_CTL_ADD, pipefd[0], &ev) == 0);
+        /* Leave behind an ignored SIGCHLD while a neighbouring process hammers
+         * poll(0,1ms)/nanosleep(1ms): epoll_wait must stay blocked until the
+         * pipe becomes readable, never fail or return spuriously. */
+        pid_t helper = fork();
+        assert(helper >= 0);
+        if (helper == 0)
+            _exit(0);
+        assert(epoll_wait(ep, &out, 1, 5000) == 1);
+        assert(out.data.fd == pipefd[0]);
+        assert((out.events & EPOLLIN) != 0);
+        assert(read(pipefd[0], &c, 1) == 1);
+        assert(c == '!');
+        _exit(0);
+    }
+
+    pid_t hammer = fork();
+    assert(hammer >= 0);
+    if (hammer == 0) {
+        hammer_short_waits();
+        _exit(0);
+    }
+
+    int status;
+    assert(waitpid(hammer, &status, 0) == hammer);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    assert(waitpid(waiter, &status, WNOHANG) == 0);
+    assert(write(pipefd[1], "!", 1) == 1);
+    assert(waitpid(waiter, &status, 0) == waiter);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    close(pipefd[0]);
+    close(pipefd[1]);
+}
+
+int main(void)
+{
     int ret;
-    int fd;
-    unsigned char keys_val;
     struct pollfd fds[2];
     int pipefd[2];
     struct timespec ts;
@@ -50,5 +110,6 @@ int main(int argc, char **argv)
 
     close(pipefd[0]);
     close(pipefd[1]);
+    test_wait_survives_short_deadline_hammer();
     return 0;
 }

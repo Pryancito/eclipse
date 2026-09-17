@@ -260,7 +260,6 @@ impl Epoll {
     pub async fn wait(&self, maxevents: usize, timeout_msecs: isize) -> LxResult<Vec<EpollEvent>> {
         let begin_time = kernel_hal::timer::timer_now();
         loop {
-            crate::process::check_signals()?;
             // Snapshot the interest list, keeping each watched file's OWN
             // `Arc<dyn FileLike>`. Two reasons this is the handle to poll,
             // rather than re-resolving the fd number through the process:
@@ -337,6 +336,11 @@ impl Epoll {
                     return Ok(Vec::new());
                 }
             }
+
+            // A blocking wait may be interrupted by a deliverable signal, but a
+            // signal must not hide events that are already ready, nor turn a
+            // non-blocking/expired wait into `EINTR`.
+            crate::process::check_signals()?;
 
             // Park a readiness waker on every watched fd that can carry one, so
             // a pipe write / unix-socket send / timerfd expiry wakes this task
