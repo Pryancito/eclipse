@@ -1551,9 +1551,33 @@ impl PcmDev {
 
 impl Drop for PcmDev {
     fn drop(&mut self) {
-        if self.release_opened_on_drop {
-            self.opened.store(false, Ordering::Release);
+        // Only a client handle releases the device; the registry node that
+        // `new` built owns nothing.
+        if !self.release_opened_on_drop {
+            return;
         }
+        // Closing a PCM DROPS it, as on Linux: the stream stops and whatever
+        // was queued is discarded. Releasing only the open flag left the
+        // hardware running with a full ring, and that starved every other
+        // client on the card for as long as the machine stayed up:
+        //
+        //   [gpusnd] ring: running=true queued=48000 ... free=1152B of 65536B
+        //
+        // with PulseAudio's sink IDLE and its fd already closed by
+        // module-suspend-on-idle. `/dev/dsp` is a second front end onto that
+        // same ring, so it reported `0/12 fragments` free forever and
+        // `mpg123 -o oss` blocked without ever playing a sample. A re-open of
+        // hw:0,0 fared no better: the flag was free but the ring was not.
+        //
+        // Same two steps as the DROP ioctl, in the same order.
+        let _ = self.audio.reset();
+        {
+            let mut st = self.st.lock();
+            st.state = STATE_SETUP;
+            st.appl_ptr = 0;
+            st.stalled_since = None;
+        }
+        self.opened.store(false, Ordering::Release);
     }
 }
 
@@ -2459,6 +2483,28 @@ mod timer_tests {
             assert!(matches!(pcm.open_client(), Err(FsError::Busy)));
             drop(first);
             assert!(pcm.open_client().is_ok());
+        }
+
+        #[test]
+        fn closing_the_pcm_releases_the_hardware_not_just_the_flag() {
+            // Releasing only the open flag left the stream running with a full
+            // ring, and `/dev/dsp` — a second front end onto that same ring —
+            // then reported no free space forever, so `mpg123 -o oss` blocked
+            // without playing a sample. Closing a PCM drops it, as on Linux.
+            let audio = Arc::new(FakeAudio::new(8 * BYTES_PER_FRAME as usize));
+            let pcm = Arc::new(PcmDev::new(audio.clone(), 0));
+            let client = pcm.open_client().unwrap();
+            let samples = [0u8; 4 * BYTES_PER_FRAME as usize];
+            audio.write(&samples).unwrap();
+            assert!(audio.queued_bytes() > 0, "the ring should hold the write");
+            drop(client);
+            assert_eq!(
+                audio.queued_bytes(),
+                0,
+                "closing the PCM must discard what was queued, or the next \
+                 client finds a device with no room"
+            );
+            assert!(!audio.is_playing(), "closing the PCM must stop the stream");
         }
 
         /// pcm_hw.c's SYNC_PTR fallback: `query_status_and_control_data`
