@@ -155,6 +155,45 @@ impl<T: ?Sized> SpinMutex<T> {
         unsafe { &mut *self.data.get() }
     }
 
+    /// Whether this lock is held **right now, by this very CPU**.
+    ///
+    /// A spin mutex is not re-entrant and holds interrupts off for the whole
+    /// critical section, so the only way one CPU can come back round to a lock
+    /// it already owns is a fault (or NMI) taken inside the critical section.
+    /// That is not contention — it is a wedge: the acquire spins forever on a
+    /// release that only this CPU could perform, with IRQs off, and the
+    /// machine stops. The kernel heap hit exactly that:
+    ///
+    ///     cpu=5 at zCore/src/memory_x86_64.rs:791      <- alloc, waiting
+    ///     HOLDER cpu=5 at zCore/src/memory_x86_64.rs:874 <- dealloc, holding
+    ///
+    /// Callers that can survive a refusal (the global allocator) ask here
+    /// *before* taking a ticket — once a ticket is drawn there is no way back
+    /// out, since abandoning it would strand `next_serving` and wedge the lock
+    /// for every other CPU as well.
+    ///
+    /// Exact for the case it exists to catch, with no false positives:
+    ///
+    ///  * no false negatives — while we hold the lock nobody else can write
+    ///    the holder record, so it still names us;
+    ///  * no false positives — `holder_file` is cleared before the lock is
+    ///    handed over and published with `Release` after the cpu/line pair, so
+    ///    an `Acquire` load that sees a non-zero pointer also sees that same
+    ///    holder's cpu id, never a stale one of ours.
+    ///
+    /// Costs one relaxed-ish load when the lock is free (the overwhelmingly
+    /// common case); the cpu id is read only when someone actually holds it,
+    /// and on x86_64 that is the same GS-relative read `push_off` already does
+    /// on every acquire.
+    #[inline]
+    pub fn held_by_current_cpu(&self) -> bool {
+        if self.holder_file.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let lc = self.holder_line_cpu.load(Ordering::Relaxed);
+        (lc >> 32) as u32 == crate::interrupt::current_cpu_id() as u32
+    }
+
     #[inline(always)]
     pub fn is_locked(&self) -> bool {
         self.locked.load(Ordering::Relaxed)

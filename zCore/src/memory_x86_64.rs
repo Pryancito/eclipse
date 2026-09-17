@@ -354,6 +354,64 @@ cfg_if! {
             }
         }
 
+        /// The heap lock was found held **by this very CPU** at the moment we
+        /// were about to block on it.
+        ///
+        /// The heap mutex disables interrupts for its whole critical section,
+        /// so no IRQ can re-enter it; the only way back round to it on one CPU
+        /// is a fault (#PF, NMI) taken *inside* `alloc`/`dealloc`, on a path
+        /// that then allocates. A ticket mutex is not re-entrant, so blocking
+        /// there waits, with IRQs off, for a release only this CPU could
+        /// perform — the machine stops dead. That is the shape behind every
+        /// "OS freezes, serial included" report in this hunt:
+        ///
+        ///     cpu=5 at zCore/src/memory_x86_64.rs:791        <- alloc, waiting
+        ///     HOLDER cpu=5 at zCore/src/memory_x86_64.rs:874 <- dealloc, holding
+        ///
+        /// Refusing costs an allocation failure (or a leaked block on the free
+        /// side); blocking costs the machine. Print the re-entrant call chain
+        /// while we are still standing on it — those frames ARE the fault-path
+        /// code that must be made allocation-free — then let the caller bail.
+        #[cold]
+        #[inline(never)]
+        fn report_heap_reentrancy(what: &str, sz: usize) {
+            use core::sync::atomic::{AtomicU32, Ordering};
+            static REPORTED: AtomicU32 = AtomicU32::new(0);
+            if REPORTED.fetch_add(1, Ordering::Relaxed) >= 4 {
+                return;
+            }
+            kernel_hal::console::serial_write_fmt_spin(format_args!(
+                "\n[heap-reentrant] {} size={:#x} while THIS cpu already holds the \
+                 heap lock — a fault was taken inside the allocator and the fault \
+                 path allocated. Refusing instead of wedging the machine. The \
+                 re-entrant call chain below is the code that must not allocate:\n",
+                what, sz,
+            ));
+            let mut rbp: usize;
+            unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp) };
+            for _ in 0..24 {
+                if rbp == 0 || rbp & 0x7 != 0 || rbp < 0xffff_ff00_0000_0000 {
+                    break;
+                }
+                let ret = unsafe { core::ptr::read_volatile((rbp + 8) as *const usize) };
+                let next = unsafe { core::ptr::read_volatile(rbp as *const usize) };
+                if ret == 0 {
+                    break;
+                }
+                kernel_hal::console::serial_write_fmt_spin(format_args!(
+                    "[heap-reentrant]   ret={:#x}\n",
+                    ret
+                ));
+                if next <= rbp {
+                    break;
+                }
+                rbp = next;
+            }
+            kernel_hal::console::serial_write_str(
+                "[heap-reentrant] symbolize: llvm-addr2line -e <zcore.elf> -fCi <ret ...>\n",
+            );
+        }
+
         /// One-shot report that the buddy allocator just dispensed a block
         /// overlapping a live coroutine stack — the double-alloc every
         /// null-range crash has been chasing. Runs inside `alloc`, on the
@@ -787,22 +845,33 @@ cfg_if! {
                 let p = {
                     let cached = slab::try_alloc(ext);
                     if cached.is_null() {
-                        self.0
-                            .lock()
-                            .alloc(ext)
-                            .ok()
-                            .map_or(core::ptr::null_mut::<u8>(), |a| a.as_ptr())
+                        // See `report_heap_reentrancy`: asked BEFORE a ticket is
+                        // drawn, because a drawn ticket can never be given back.
+                        if self.0.held_by_current_cpu() {
+                            report_heap_reentrancy("alloc", sz);
+                            core::ptr::null_mut::<u8>()
+                        } else {
+                            self.0
+                                .lock()
+                                .alloc(ext)
+                                .ok()
+                                .map_or(core::ptr::null_mut::<u8>(), |a| a.as_ptr())
+                        }
                     } else {
                         cached
                     }
                 };
                 #[cfg(feature = "mem-debug")]
-                let p = self
-                    .0
-                    .lock()
-                    .alloc(ext)
-                    .ok()
-                    .map_or(core::ptr::null_mut::<u8>(), |a| a.as_ptr());
+                let p = if self.0.held_by_current_cpu() {
+                    report_heap_reentrancy("alloc", sz);
+                    core::ptr::null_mut::<u8>()
+                } else {
+                    self.0
+                        .lock()
+                        .alloc(ext)
+                        .ok()
+                        .map_or(core::ptr::null_mut::<u8>(), |a| a.as_ptr())
+                };
                 if !p.is_null() {
                     // [diag] Double-alloc tripwire. Every crash zeroes a live
                     // coroutine stack; if the buddy hands out a block that
@@ -871,7 +940,17 @@ cfg_if! {
                 #[cfg(feature = "mem-debug")]
                 let to_buddy = true;
                 if to_buddy {
-                    self.0.lock().dealloc(NonNull::new_unchecked(ptr), ext);
+                    // Same refusal as `alloc`, with the only outcome a free can
+                    // have: the block is leaked. A leaked block is recoverable
+                    // (and this path runs only after a fault inside the
+                    // allocator, i.e. once the kernel is already reporting a
+                    // bug); a wedged CPU holding the heap lock with IRQs off is
+                    // not.
+                    if self.0.held_by_current_cpu() {
+                        report_heap_reentrancy("dealloc (block leaked)", sz);
+                    } else {
+                        self.0.lock().dealloc(NonNull::new_unchecked(ptr), ext);
+                    }
                 }
                 kernel_hal::kstats::note_heap_dealloc(if prof {
                     core::arch::x86_64::_rdtsc().wrapping_sub(t0)
