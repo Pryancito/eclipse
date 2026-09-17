@@ -352,6 +352,35 @@ impl KernelHandler for ZcoreKernelHandler {
     fn memory_usage(&self) -> (usize, usize) {
         memory::stats()
     }
+
+    /// See [`KernelHandler::check_user_range`]: does the current process map
+    /// anything over `[vaddr, vaddr + len)`?
+    ///
+    /// Deliberately conservative — it answers `false` ONLY when it has a vmar
+    /// in hand and that vmar definitively has no mapping covering the range.
+    /// No current thread, a `len` that overflows, a downcast that fails: all
+    /// answer `true` and leave behaviour exactly as it was. A false `false`
+    /// would turn a working syscall into a spurious EFAULT, which is worse
+    /// than the fault this is here to prevent.
+    ///
+    /// Checks the first and last byte's pages rather than walking the whole
+    /// range: a mapping is page-granular and contiguous, so a range that
+    /// starts and ends inside one cannot have a hole that a syscall-sized
+    /// access would reach. This runs on every user-pointer access, so the cost
+    /// has to stay at two lookups.
+    fn check_user_range(&self, vaddr: usize, len: usize) -> bool {
+        let Some(end) = vaddr.checked_add(len.saturating_sub(1)) else {
+            return true;
+        };
+        let Some(thread) = kernel_hal::thread::get_current_thread() else {
+            return true;
+        };
+        let Ok(thread) = thread.downcast::<Thread>() else {
+            return true;
+        };
+        let vmar = thread.proc().vmar();
+        vmar.find_mapping(vaddr).is_some() && (end == vaddr || vmar.find_mapping(end).is_some())
+    }
 }
 
 /// Report a kernel page fault the faulting thread's user vmar could not

@@ -480,6 +480,19 @@ impl Syscall<'_> {
         if matches!(cmd, FUTEX_WAIT_REQUEUE_PI | FUTEX_CMP_REQUEUE_PI) {
             return Err(LxError::ENOSYS);
         }
+        // Validate the futex word EVERY call, not just when the `Futex` is
+        // created. `get_futex` caches an `&AtomicI32` made from this address
+        // and keeps it in the process for good, so a check at insert time says
+        // nothing about whether the mapping is still there now — and every op
+        // below dereferences it. An unmapped futex word used to take the
+        // machine down rather than answer EFAULT:
+        //
+        //     [KERNEL PAGE FAULT] vaddr=0x7125048a65 rip=<sys_futex...>
+        //         (unresolved by the user vmar)
+        //
+        // reproducible to the byte across boots, from PulseAudio.
+        let word: UserInPtr<i32> = uaddr.into();
+        word.check()?;
         let futex = self
             .linux_process()
             .get_futex(uaddr)
