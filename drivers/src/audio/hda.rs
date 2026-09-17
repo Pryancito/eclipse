@@ -40,7 +40,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{fence, AtomicU64, Ordering};
 
 use lock::Mutex;
 use pci::{PCIDevice, BAR};
@@ -480,6 +480,41 @@ pub struct HdaDevice {
     /// only reaches the cable when the display engine transmits it.
     is_nvidia: bool,
     inner: Mutex<HdaInner>,
+    /// Where the position registers live. Copied out of `HdaInner` because
+    /// [`Self::sample_position`] reads them WITHOUT taking the lock; both are
+    /// fixed once the controller is probed.
+    bar: usize,
+    sd_base: usize,
+    /// Throttle for the unlocked sample, mirroring `HdaInner::last_poll_us`.
+    /// Claimed by CAS so concurrent callers take one read between them rather
+    /// than one each.
+    pos_sample_us: AtomicU64,
+}
+
+/// One read of the controller's position registers, taken as a unit.
+///
+/// Exists so the reads can happen OUTSIDE the device lock. `free_bytes`,
+/// `queued_bytes` and `write` used to call `poll_progress` with `inner` held,
+/// and `poll_progress` then read WALCLK, LPIB and SD_STS from MMIO. That lock
+/// is an IRQ-disabling ticket mutex, and under a hypervisor each register read
+/// is a VM exit: the driver's own counters measured **89 ms** for the slowest,
+/// with 952 of 21579 reads over 1 ms. Every one of those was that long with
+/// interrupts off on one CPU and every other CPU spinning on the same lock —
+/// which is what `/proc/perf/kernel` was reporting as timer tick gaps up to
+/// 2 s, and what the stream underruns and restarts were downstream of.
+///
+/// The registers are read-only status; nothing else reads them under the lock
+/// for consistency, and the write-1-to-clear of SD_STS stays locked. Two CPUs
+/// sampling at once is harmless — `poll_progress_with` validates every advance
+/// and rejects an implausible one, so a stale or out-of-order sample looks
+/// like a backwards step and is dropped.
+#[derive(Clone, Copy)]
+struct PosSample {
+    now_us: u64,
+    wall: u32,
+    lpib: u32,
+    sts: u8,
+    read_us: u64,
 }
 
 impl HdaInner {
@@ -649,8 +684,7 @@ impl HdaInner {
     }
 
     /// Read and clear the stream's sticky error bits, counting them.
-    fn poll_stream_errors(&mut self) {
-        let sts = mmio_r8(self.bar, self.sd_base + SD_STS);
+    fn poll_stream_errors(&mut self, sts: u8) {
         if sts & (SD_STS_FIFOE | SD_STS_DESE) != 0 {
             if sts & SD_STS_FIFOE != 0 {
                 self.stat_fifo_err += 1;
@@ -668,7 +702,38 @@ impl HdaInner {
 
     /// Fold DMA progress since the last poll into `queued`, detect underrun,
     /// and re-zero consumed ring space (so an underrun loops silence).
+    /// Read the position registers with the caller's lock held.
+    ///
+    /// Only the rare control paths (rewind, forward, pause) use this; the hot
+    /// accessors sample outside the lock. See [`PosSample`].
+    fn sample_inline(&self) -> PosSample {
+        let now_us = timer_now_as_micros();
+        let wall = mmio_r32(self.bar, REG_WALCLK);
+        let lpib = self.lpib();
+        let sts = mmio_r8(self.bar, self.sd_base + SD_STS);
+        PosSample {
+            now_us,
+            wall,
+            lpib,
+            sts,
+            read_us: timer_now_as_micros().wrapping_sub(now_us),
+        }
+    }
+
     fn poll_progress(&mut self) {
+        let due = self.running
+            && self.queued != 0
+            && timer_now_as_micros().wrapping_sub(self.last_poll_us) >= LPIB_POLL_MIN_US;
+        let sample = due.then(|| self.sample_inline());
+        self.poll_progress_with(sample);
+    }
+
+    /// Advance the play accounting from an already-taken [`PosSample`].
+    ///
+    /// `None` means no read was due (or the caller lost the sampling race):
+    /// the drain/stop decisions still run, because nothing may defer a stream
+    /// left running on an empty ring.
+    fn poll_progress_with(&mut self, sample: Option<PosSample>) {
         if !self.running {
             return;
         }
@@ -684,7 +749,10 @@ impl HdaInner {
         // "still playing" path is throttled: the drain/stop decisions above
         // and below run on every call, so nothing is deferred that could
         // leave the stream running with an empty ring.
-        let now_us = timer_now_as_micros();
+        let Some(s) = sample else {
+            return;
+        };
+        let now_us = s.now_us;
         let dt_us = now_us.wrapping_sub(self.last_poll_us);
         if dt_us < LPIB_POLL_MIN_US {
             return;
@@ -702,8 +770,7 @@ impl HdaInner {
         // registers still serve as a cap: the link cannot have played what
         // the engine has not fetched, so if the engine stalls the clock
         // estimate cannot run away from it.
-        let t_read = timer_now_as_micros();
-        let wall = mmio_r32(self.bar, REG_WALCLK);
+        let wall = s.wall;
         self.wall_ticks += wall.wrapping_sub(self.wall_last) as u64;
         self.wall_last = wall;
         // Whole frames, rounded down: the link takes samples, not bytes.
@@ -717,8 +784,8 @@ impl HdaInner {
         // run of bad reads keeps widening the budget until a sane one gets
         // through.
         let max_advance = (dt_us.saturating_mul(rate_bytes) / 1_000_000) as usize + POS_SLACK;
-        let lpib_raw = self.lpib();
-        let read_us = timer_now_as_micros().wrapping_sub(t_read);
+        let lpib_raw = s.lpib;
+        let read_us = s.read_us;
         self.stat_pos_reads += 1;
         if read_us > self.stat_pos_read_max_us {
             self.stat_pos_read_max_us = read_us;
@@ -742,7 +809,7 @@ impl HdaInner {
             self.lpib_total += advanced as u64;
             true
         };
-        self.poll_stream_errors();
+        self.poll_stream_errors(s.sts);
         let mut dpib_ok = false;
         if let Some(dpib_raw) = self.dma_pos() {
             let dpib = dpib_raw as usize % ring;
@@ -1462,6 +1529,38 @@ impl HdaInner {
 }
 
 impl HdaDevice {
+    /// Read the controller's position registers **without the device lock**.
+    ///
+    /// See [`PosSample`] for why: these reads cost up to 89 ms under a
+    /// hypervisor, and holding an IRQ-disabling lock across them stalled the
+    /// whole machine. `None` means no read was due, or a peer claimed this
+    /// window — either way the caller proceeds with its accounting unchanged.
+    fn sample_position(&self) -> Option<PosSample> {
+        let now_us = timer_now_as_micros();
+        let last = self.pos_sample_us.load(Ordering::Relaxed);
+        if now_us.wrapping_sub(last) < LPIB_POLL_MIN_US {
+            return None;
+        }
+        if self
+            .pos_sample_us
+            .compare_exchange(last, now_us, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return None;
+        }
+        let t0 = timer_now_as_micros();
+        let wall = mmio_r32(self.bar, REG_WALCLK);
+        let lpib = mmio_r32(self.bar, self.sd_base + SD_LPIB);
+        let sts = mmio_r8(self.bar, self.sd_base + SD_STS);
+        Some(PosSample {
+            now_us,
+            wall,
+            lpib,
+            sts,
+            read_us: timer_now_as_micros().wrapping_sub(t0),
+        })
+    }
+
     pub fn new(bar: usize, name: String, is_nvidia: bool) -> DeviceResult<Self> {
         let gcap = mmio_r16(bar, REG_GCAP);
         let iss = ((gcap >> 8) & 0xf) as usize;
@@ -1692,6 +1791,11 @@ impl HdaDevice {
         Ok(HdaDevice {
             name,
             is_nvidia,
+            // Copied before `inner` moves into the mutex: `sample_position`
+            // needs them without taking it.
+            bar: inner.bar,
+            sd_base: inner.sd_base,
+            pos_sample_us: AtomicU64::new(0),
             inner: Mutex::new(inner),
         })
     }
@@ -1769,8 +1873,9 @@ impl AudioScheme for HdaDevice {
             // stream start is not something a running desktop should see.
             crate::display::kick_hdmi_audio();
         }
+        let sample = self.sample_position();
         let mut inner = self.inner.lock();
-        inner.poll_progress();
+        inner.poll_progress_with(sample);
         let starting = !inner.running && !inner.paused;
         if starting {
             warn!(
@@ -1820,8 +1925,9 @@ impl AudioScheme for HdaDevice {
     }
 
     fn free_bytes(&self) -> usize {
+        let sample = self.sample_position();
         let mut inner = self.inner.lock();
-        inner.poll_progress();
+        inner.poll_progress_with(sample);
         inner.free_bytes()
     }
 
@@ -1831,8 +1937,9 @@ impl AudioScheme for HdaDevice {
     }
 
     fn queued_bytes(&self) -> usize {
+        let sample = self.sample_position();
         let mut inner = self.inner.lock();
-        inner.poll_progress();
+        inner.poll_progress_with(sample);
         inner.queued
     }
 
