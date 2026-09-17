@@ -615,7 +615,8 @@ pub fn remote_flush_tlb_aspace(vaddr: Option<usize>, aspace: Option<usize>) {
         let ovf_before = IPI_OVERFLOW_GEN[cpu].load(Ordering::Acquire);
         if crate::interrupt::send_ipi(cpu, reason).is_err() {
             targets &= !(1u64 << cpu);
-            crate::console::serial_write_fmt_spin(format_args!(
+            // try_lock, NOT the spinning writer: see the wait loop below.
+            crate::console::serial_write_fmt(format_args!(
                 "\n[tlb-shootdown] cpu {} unreachable — skipped (its TLB may be stale)\n",
                 cpu,
             ));
@@ -706,7 +707,21 @@ pub fn remote_flush_tlb_aspace(vaddr: Option<usize>, aspace: Option<usize>) {
         }
         if spins >= SPIN_WARN && !warned {
             warned = true;
-            crate::console::serial_write_fmt_spin(format_args!(
+            // try_lock, NOT `serial_write_fmt_spin`. This runs from a hot wait
+            // loop with interrupts off, and the spinning writer takes the
+            // console lock unconditionally -- its contract ("caller must
+            // disable interrupts") only rules out re-entry on the SAME CPU,
+            // not a cross-CPU cycle. Here that cycle is reachable and fatal:
+            // any other CPU holding the console lock while it waits on this
+            // shootdown (or on a lock whose holder does) closes it, and this
+            // CPU then spins inside the console lock forever -- with the lock
+            // HELD, so the 8s deadlock detector, which prints through the same
+            // writer, can never report it either. That is a silent full-machine
+            // freeze: no serial, no screen, nothing, caused purely by the
+            // diagnostic. A diagnostic must never be able to kill the machine
+            // it is diagnosing, so losing this one line to a busy lock is the
+            // right trade -- the detector's report is the one that matters.
+            crate::console::serial_write_fmt(format_args!(
                 "\n[tlb-shootdown] slow ack wait spins={} targets={:#x} me={}\n",
                 spins, targets, me,
             ));
