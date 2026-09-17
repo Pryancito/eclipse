@@ -329,6 +329,31 @@ cfg_if! {
         #[global_allocator]
         static HEAP_ALLOCATOR: LockedHeap<ORDER> = LockedHeap::<ORDER>::new();
 
+        /// Whether this CPU may allocate right now.
+        ///
+        /// For fault and panic paths ONLY. A kernel fault taken INSIDE the
+        /// allocator leaves the heap lock held by this very CPU, and the
+        /// ticket mutex is not reentrant: anything on the fault path that
+        /// allocates (a `String` from `Thread::name`, a formatted `Vec`) then
+        /// waits forever for a lock it already owns. The deadlock detector
+        /// named it exactly:
+        ///
+        ///     cpu=5 at memory_x86_64.rs:766     <- alloc, waiting
+        ///     HOLDER cpu=5 at memory_x86_64.rs:849  <- dealloc, holding
+        ///
+        /// one CPU, both ends. `try_lock` fails in precisely that case (and
+        /// while a peer holds it, where allocating is merely slow, not fatal),
+        /// so a `false` here means "print only what needs no heap".
+        pub fn heap_available() -> bool {
+            match HEAP_ALLOCATOR.try_lock() {
+                Some(guard) => {
+                    drop(guard);
+                    true
+                }
+                None => false,
+            }
+        }
+
         /// One-shot report that the buddy allocator just dispensed a block
         /// overlapping a live coroutine stack — the double-alloc every
         /// null-range crash has been chasing. Runs inside `alloc`, on the

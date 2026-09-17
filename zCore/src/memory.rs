@@ -218,6 +218,16 @@ pub fn heap_used() -> usize {
     USED_MEMORY.load(Ordering::Relaxed)
 }
 
+/// Whether this CPU may allocate right now — fault/panic paths only.
+///
+/// This build does not own the global allocator's lock (x86_64 does, in
+/// `memory_x86_64.rs`, where the answer is a real `try_lock`), so there is no
+/// self-deadlock to avoid and the answer is always yes.
+#[allow(dead_code)]
+pub fn heap_available() -> bool {
+    true
+}
+
 /// Total bytes managed by the heap (mirrors `memory_x86_64::heap_total`).
 #[allow(dead_code)]
 pub fn heap_total() -> usize {

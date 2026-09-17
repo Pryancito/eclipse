@@ -205,20 +205,43 @@ impl KernelHandler for ZcoreKernelHandler {
                 in_timer,
             ));
             // Name the interrupted thread via serial only (never graphic fmt).
+            //
+            // `name()` returns a String, i.e. it ALLOCATES -- and this fault may
+            // well have been taken inside the allocator itself, with the heap
+            // lock held by this very CPU. The ticket mutex is not reentrant, so
+            // asking for a name there wedges the CPU on a lock it already owns,
+            // which the detector reported as
+            //   cpu=5 at memory_x86_64.rs:766 / HOLDER cpu=5 at ...:849
+            // (alloc waiting, dealloc holding, one CPU) right after this very
+            // line printed. So: names only when the heap is provably free,
+            // ids -- which need no heap -- otherwise.
             if let Some(thread) = kernel_hal::thread::get_current_thread() {
                 if let Ok(thread) = thread.downcast::<Thread>() {
-                    kernel_hal::console::serial_write_fmt_spin(format_args!(
-                        "[diag] interrupted thread (coincidental if IRQ/timer): \
-                         {:?} \"{}\" in process \"{}\"{}\n",
-                        thread.id(),
-                        thread.name(),
-                        thread.proc().name(),
-                        if in_timer {
-                            " — KERNEL BUG in timer callback, not this process"
-                        } else {
-                            ""
-                        },
-                    ));
+                    let in_timer_note = if in_timer {
+                        " — KERNEL BUG in timer callback, not this process"
+                    } else {
+                        ""
+                    };
+                    if crate::memory::heap_available() {
+                        kernel_hal::console::serial_write_fmt_spin(format_args!(
+                            "[diag] interrupted thread (coincidental if IRQ/timer): \
+                             {:?} \"{}\" in process \"{}\"{}\n",
+                            thread.id(),
+                            thread.name(),
+                            thread.proc().name(),
+                            in_timer_note,
+                        ));
+                    } else {
+                        kernel_hal::console::serial_write_fmt_spin(format_args!(
+                            "[diag] interrupted thread (coincidental if IRQ/timer): \
+                             {:?} in process koid {} (names omitted: the heap lock \
+                             is held — the fault is very likely INSIDE the \
+                             allocator){}\n",
+                            thread.id(),
+                            thread.proc().id(),
+                            in_timer_note,
+                        ));
+                    }
                 }
             } else {
                 kernel_hal::console::serial_write_str(
