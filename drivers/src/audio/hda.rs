@@ -146,6 +146,41 @@ const PIN_CTL_OUT_EN: u32 = 0x40;
 /// Time to wait for one codec verb response.
 const VERB_TIMEOUT_US: u64 = 200_000;
 
+/// Wall-clock ceiling for ALL codec reads of one `/proc/gpusnd` dump. Half a
+/// single verb timeout: the dump is a diagnostic, and no diagnostic is worth
+/// holding the device lock (interrupts off) for longer than that.
+const DIAG_CODEC_BUDGET_US: u64 = 100_000;
+
+/// Shared state for the codec reads of one diagnostics dump: a deadline, and a
+/// latch set by the first codec that fails to answer. See
+/// [`HdaInner::diag_cmd`].
+struct DiagBudget {
+    deadline_us: u64,
+    dead: bool,
+}
+
+impl DiagBudget {
+    fn new() -> Self {
+        Self {
+            deadline_us: timer_now_as_micros().wrapping_add(DIAG_CODEC_BUDGET_US),
+            dead: false,
+        }
+    }
+
+    /// True once no further verb may be issued. Latches `dead` on timeout too,
+    /// so the report can say the reads were cut short.
+    fn spent(&mut self, _inner: &HdaInner) -> bool {
+        if self.dead {
+            return true;
+        }
+        if timer_now_as_micros() >= self.deadline_us {
+            self.dead = true;
+            return true;
+        }
+        false
+    }
+}
+
 /// PCM ring: 16 pages = 64 KiB (341 ms of 48 kHz S16LE stereo).
 ///
 /// The ring is the audio latency: `/dev/dsp` blocks the writer only when the
@@ -506,6 +541,49 @@ impl HdaInner {
 
     fn param(&mut self, nid: u32, par: u32) -> DeviceResult<u32> {
         self.cmd(nid, VERB_GET_PARAMETER, par)
+    }
+
+    /// Diagnostics-only codec read, under a shared budget.
+    ///
+    /// `corb_cmd` waits up to `VERB_TIMEOUT_US` (200 ms) for a response, and
+    /// the `/proc/gpusnd` dump issues a dozen-plus verbs -- all of them with
+    /// the device lock held, which on this kernel means INTERRUPTS OFF. A
+    /// codec that stopped answering therefore turned one `cat /proc/gpusnd`
+    /// into seconds of IRQ-off time: the reader wedged, every other CPU that
+    /// touched audio piled up behind the same ticket (PulseAudio writes every
+    /// few ms), and the serial console went with them, while an unrelated
+    /// compositor on another core kept running -- exactly the "everything but
+    /// labwc is dead" freeze.
+    ///
+    /// A codec that missed one verb will miss the rest, so the first failure
+    /// disables the remainder: the worst case is one timeout for the whole
+    /// dump instead of one per verb. The deadline bounds the healthy-but-slow
+    /// case as well.
+    fn diag_cmd(&mut self, nid: u32, verb: u32, budget: &mut DiagBudget) -> Option<u32> {
+        if budget.spent(self) {
+            return None;
+        }
+        match self.cmd(nid, verb, 0) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                budget.dead = true;
+                None
+            }
+        }
+    }
+
+    /// 16-bit-payload variant of [`HdaInner::diag_cmd`].
+    fn diag_cmd16(&mut self, nid: u32, verb: u32, budget: &mut DiagBudget) -> Option<u32> {
+        if budget.spent(self) {
+            return None;
+        }
+        match self.cmd16(nid, verb, 0) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                budget.dead = true;
+                None
+            }
+        }
     }
 
     // ── Playback ring bookkeeping ───────────────────────────────────────────
@@ -1807,27 +1885,46 @@ impl AudioScheme for HdaDevice {
     fn diagnostics(&self) -> String {
         use core::fmt::Write as _;
         let mut out = String::new();
+
+        // Sample the stream descriptor BEFORE taking the device lock. These
+        // are plain MMIO register reads -- the lock protects the driver's own
+        // state, not the controller's registers -- and the 2 ms between the
+        // two LPIB samples used to be spent holding it. The lock disables
+        // interrupts, so every `cat /proc/gpusnd` cost the machine a
+        // guaranteed 2 ms of IRQ-off time on that CPU, on top of whatever the
+        // codec reads below added.
+        let (bar, sd, cad) = {
+            let inner = self.inner.lock();
+            (inner.bar, inner.sd_base, inner.cad)
+        };
+        let gcap = mmio_r16(bar, REG_GCAP);
+        let statests = mmio_r16(bar, REG_STATESTS);
+        // RUN=1 with a moving LPIB means the DMA engine really is fetching our
+        // samples; if that holds and there is still no sound, the fault is
+        // downstream of the controller (codec routing, or the display engine
+        // not transmitting).
+        let ctl = mmio_r32(bar, sd + SD_CTL);
+        let lpib1 = mmio_r32(bar, sd + SD_LPIB);
+        wait_us(2_000);
+        let lpib2 = mmio_r32(bar, sd + SD_LPIB);
+
+        // Bracket the locked section. `/proc/gpusnd` is the last thing on
+        // screen in the freeze this budget is meant to bound, and these two
+        // lines settle whether the machine died inside the dump: an "enter"
+        // with no "done" means it did. Cheap (twice per read of a debug file)
+        // and visible at the default LOG=error.
+        crate::klog_warn!("[gpusnd] diagnostics: enter ({})", self.name);
+        let t0 = timer_now_as_micros();
+
+        let mut budget = DiagBudget::new();
         let mut inner = self.inner.lock();
-        let bar = inner.bar;
-        let sd = inner.sd_base;
 
         let _ = writeln!(out, "[gpusnd] === {} ===", self.name);
         let _ = writeln!(
             out,
             "[gpusnd] controller: GCAP {:#06x} STATESTS {:#06x} codec {}",
-            mmio_r16(bar, REG_GCAP),
-            mmio_r16(bar, REG_STATESTS),
-            inner.cad
+            gcap, statests, cad
         );
-
-        // Stream descriptor, read straight from MMIO. RUN=1 with a moving
-        // LPIB means the DMA engine really is fetching our samples; if that
-        // holds and there is still no sound, the fault is downstream of the
-        // controller (codec routing, or the display engine not transmitting).
-        let ctl = mmio_r32(bar, sd + SD_CTL);
-        let lpib1 = mmio_r32(bar, sd + SD_LPIB);
-        wait_us(2_000);
-        let lpib2 = mmio_r32(bar, sd + SD_LPIB);
         let _ =
             writeln!(
             out,
@@ -2029,14 +2126,16 @@ impl AudioScheme for HdaDevice {
         );
         if conv != 0 {
             let sid = inner
-                .cmd(conv, VERB_GET_STREAM_ID, 0)
+                .diag_cmd(conv, VERB_GET_STREAM_ID, &mut budget)
                 .unwrap_or(0xffff_ffff);
             let fmt = inner
-                .cmd16(conv, VERB_GET_CVT_FORMAT, 0)
+                .diag_cmd16(conv, VERB_GET_CVT_FORMAT, &mut budget)
                 .unwrap_or(0xffff_ffff);
-            let dig = inner.cmd(conv, VERB_GET_DIGI_CVT, 0).unwrap_or(0xffff_ffff);
+            let dig = inner
+                .diag_cmd(conv, VERB_GET_DIGI_CVT, &mut budget)
+                .unwrap_or(0xffff_ffff);
             let pwr = inner
-                .cmd(conv, VERB_GET_POWER_STATE, 0)
+                .diag_cmd(conv, VERB_GET_POWER_STATE, &mut budget)
                 .unwrap_or(0xffff_ffff);
             let _ = writeln!(
                 out,
@@ -2050,11 +2149,17 @@ impl AudioScheme for HdaDevice {
             );
         }
         if pin != 0 {
-            let ctl = inner.cmd(pin, VERB_GET_PIN_CTL, 0).unwrap_or(0xffff_ffff);
-            let sense = inner.cmd(pin, VERB_GET_PIN_SENSE, 0).unwrap_or(0);
-            let eapd = inner.cmd(pin, VERB_GET_EAPD, 0).unwrap_or(0xffff_ffff);
+            let ctl = inner
+                .diag_cmd(pin, VERB_GET_PIN_CTL, &mut budget)
+                .unwrap_or(0xffff_ffff);
+            let sense = inner
+                .diag_cmd(pin, VERB_GET_PIN_SENSE, &mut budget)
+                .unwrap_or(0);
+            let eapd = inner
+                .diag_cmd(pin, VERB_GET_EAPD, &mut budget)
+                .unwrap_or(0xffff_ffff);
             let pwr = inner
-                .cmd(pin, VERB_GET_POWER_STATE, 0)
+                .diag_cmd(pin, VERB_GET_POWER_STATE, &mut budget)
                 .unwrap_or(0xffff_ffff);
             let _ = writeln!(
                 out,
@@ -2069,12 +2174,23 @@ impl AudioScheme for HdaDevice {
             );
         }
 
+        if budget.dead {
+            let _ = writeln!(
+                out,
+                "[gpusnd] NOTE: codec reads cut short (no response, or over the {} ms budget) — \
+                 values above shown as ffffffff/0 were not read",
+                DIAG_CODEC_BUDGET_US / 1000
+            );
+        }
+
         // Every candidate, with live presence/ELD: this says whether the pin
         // carrying the cable was the one we picked.
         let candidates = inner.candidates.clone();
         let _ = writeln!(out, "[gpusnd] candidates ({}):", candidates.len());
         for c in candidates.iter() {
-            let sense = inner.cmd(c.pin, VERB_GET_PIN_SENSE, 0).unwrap_or(0);
+            let sense = inner
+                .diag_cmd(c.pin, VERB_GET_PIN_SENSE, &mut budget)
+                .unwrap_or(0);
             let _ = writeln!(
                 out,
                 "[gpusnd]   pin {:#x} -> conv {:#x} digital={} hdmi/dp={} present={} eld_valid={}{}",
@@ -2095,6 +2211,17 @@ impl AudioScheme for HdaDevice {
                  [gpusnd]   display engine transmits it — see the [hdmi-audio] state below."
             );
         }
+        drop(inner);
+        crate::klog_warn!(
+            "[gpusnd] diagnostics: done ({}) in {} us{}",
+            self.name,
+            timer_now_as_micros().wrapping_sub(t0),
+            if budget.dead {
+                " (codec reads cut short)"
+            } else {
+                ""
+            }
+        );
         out
     }
 
