@@ -113,6 +113,32 @@ static void skip(const char *name, const char *why) {
   if (g_verbose) printf("  [skip] %s  (%s)\n", name, why);
 }
 
+// Whether an EBUSY opening hw:<card>,0 is the kernel being RIGHT.
+//
+// The PCM is exclusive (one client at a time), as on Linux, so a running
+// PulseAudio holding the sink makes every direct open of the same device fail
+// with EBUSY -- which is exactly what a real system does and what alsa-lib
+// expects. These checks predate that exclusivity and read it as a fault; they
+// now skip, and say who has the device.
+static int g_pcm_held_by_daemon;
+static long find_process(const char *name);
+
+static int pcm_held_by_daemon(int err) {
+  int held = err == EBUSY && find_process("pulseaudio") > 0;
+  if (held) g_pcm_held_by_daemon = 1;
+  return held;
+}
+
+// `check`, but an EBUSY from a daemon-held PCM skips instead of failing.
+static void check_pcm_open(int good, const char *name, const char *why, int err) {
+  if (!good && pcm_held_by_daemon(err)) {
+    skip(name, "PulseAudio holds hw:0,0 (the PCM is exclusive, as on Linux)");
+    return;
+  }
+  if (good) ok(name, why);
+  else fail(name, why, err);
+}
+
 static void check(int good, const char *name, const char *why, int err) {
   if (good) ok(name, why);
   else fail(name, why, err);
@@ -761,7 +787,7 @@ static void test_alsa_pcm(void) {
 
   int fail_at_entry = g_fail;
   int fd = open(pcm, O_WRONLY);
-  check(fd >= 0, "open(O_WRONLY)", "snd_pcm_open(SND_PCM_STREAM_PLAYBACK)", errno);
+  check_pcm_open(fd >= 0, "open(O_WRONLY)", "snd_pcm_open(SND_PCM_STREAM_PLAYBACK)", errno);
   if (fd < 0) return;
 
   int ver = 0;
@@ -1099,7 +1125,7 @@ static void test_alsa_timer(void) {
   // Now run the PCM (silence, one buffer) and expect the tick.
   unsigned period = 0, buffer = 0;
   int pfd = pcm_open_prepared(O_WRONLY, &period, &buffer);
-  check(pfd >= 0, "PCM opened, configured and PREPAREd for the tick test", "same hw_params as [alsa-pcm]", pfd < 0 ? -pfd : 0);
+  check_pcm_open(pfd >= 0, "PCM opened, configured and PREPAREd for the tick test", "same hw_params as [alsa-pcm]", pfd < 0 ? -pfd : 0);
   if (pfd >= 0) {
     long period_ms = period ? (long)period * 1000 / TONE_RATE : 0;
     info("period %u frames = %ld ms, buffer %u frames", period, period_ms, buffer);
@@ -1589,6 +1615,23 @@ static int gpusnd_events(long *drains, long *underruns, long *restarts) {
   return p && sscanf(p, "[gpusnd] events: %ld drains, %ld underruns, %ld stream restarts", drains, underruns, restarts) == 3;
 }
 
+// Bytes the HDA link has actually consumed on g_card, by its own wall clock.
+//
+// This is the only DIRECT measure of "audio reached the hardware" the driver
+// exports, and unlike the stop-event record it is monotonic and does not need
+// the stream to end. Both matter now: module-alsa-sink keeps hw:0,0 open
+// across plays when suspend-on-idle does not fire, so a play can leave no stop
+// event at all -- and `gpusnd_last_stop` then reports some earlier stream's
+// numbers as if they were this play's.
+static int gpusnd_link_consumed(long *bytes) {
+  static char buf[65536];
+  if (read_whole("/proc/gpusnd", buf, sizeof buf) < 0) return 0;
+  const char *blk = gpusnd_card_block(buf);
+  if (!blk) return 0;
+  const char *p = strstr(blk, "link consumed ");
+  return p && sscanf(p, "link consumed %ld B", bytes) == 1;
+}
+
 // The newest stop event of g_card: its kind and how many bytes that stream got.
 static int gpusnd_last_stop(char *kind, size_t kind_len, long *at_ms, long *written) {
   static char buf[65536];
@@ -1790,6 +1833,8 @@ static void test_pulse_play(void) {
 
   long d0 = 0, u0 = 0, r0 = 0;
   int have0 = gpusnd_events(&d0, &u0, &r0);
+  long link0 = 0;
+  int have_link0 = gpusnd_link_consumed(&link0);
 
   // pacat: raw S16LE stereo 48 kHz from stdin, 100 ms latency, as
   // libpulse-simple clients (mpg123 -o pulse) and cubeb-pulse set up.
@@ -1852,28 +1897,47 @@ static void test_pulse_play(void) {
   nanosleep(&settle, NULL);
   long d1 = 0, u1 = 0, r1 = 0;
   int have1 = gpusnd_events(&d1, &u1, &r1);
-  if (have0 && have1) {
-    check(r1 > r0 || d1 > d0 || u1 > u0, "the sink thread drove the HDA stream",
-          "/proc/gpusnd recorded a stream start or stop during the play: the server's writes reached hw:0,0", 0);
-    info("events during the play: +%ld drains, +%ld underruns, +%ld restarts", d1 - d0, u1 - u0, r1 - r0);
+  long link1 = 0;
+  int have_link1 = gpusnd_link_consumed(&link1);
+
+  // What reached the hardware, measured on the link's own clock.
+  //
+  // This used to ask for a stream start/stop during the play (`+restarts`) and
+  // then read the newest stop event's byte count. Both assumed module-alsa-sink
+  // CLOSES hw:0,0 between plays, which it only does when suspend-on-idle fires.
+  // When the sink keeps the device open -- the normal case here -- a clean play
+  // produces no stop event at all, so the first check failed on a play that
+  // went perfectly and the second reported some EARLIER stream's numbers as if
+  // they were this play's ("underrun at 57 ms, 9676 B" for a tone that played
+  // fine). The link-consumed counter is monotonic and needs no stream boundary,
+  // so it answers the question directly instead of by proxy.
+  //
+  // The sink resamples 48 kHz to its own rate; expect at least most of it.
+  long expect = (long)bytes * 44100 / 48000 * 8 / 10;
+  if (have_link0 && have_link1) {
+    long moved = link1 - link0;
+    check(moved >= expect, "the tone reached the HDA link",
+          "bytes the link consumed during the play, against the tone's size at the sink's rate", 0);
+    info("link consumed %ld B during the play (tone is %zu B at 48 kHz, expected >= %ld B)", moved, bytes, expect);
+    if (moved < expect)
+      info("=> the link consumed %ld B of %ld: the sink stopped feeding hw:0,0 (blocked in a write? never woken?)", moved, expect);
+    g_pulse_play_ok = (exit_code == 0 && moved >= expect);
   } else {
-    info("/proc/gpusnd not readable: cannot say what reached the hardware");
+    info("/proc/gpusnd has no link-consumed counter: cannot say what reached the hardware");
+    g_pulse_play_ok = 0;
+  }
+  if (have0 && have1) {
+    // Glitch accounting, not a pass condition: zero of everything is the good
+    // outcome, and demanding a restart is what made a clean play read as a
+    // failure.
+    info("glitches during the play: +%ld drains, +%ld underruns, +%ld restarts", d1 - d0, u1 - u0, r1 - r0);
+    check(u1 == u0 && r1 == r0, "the play caused no underrun or stream restart",
+          "an underrun or a restart mid-play is an audible glitch even when the bytes arrive", 0);
   }
   char kind[32];
   long at_ms = 0, written = 0;
-  if (gpusnd_last_stop(kind, sizeof kind, &at_ms, &written)) {
-    // The sink resamples 48 kHz to its own rate; expect at least most of it.
-    long expect = (long)bytes * 44100 / 48000 * 8 / 10;
-    check(written >= expect, "the whole tone reached the hardware",
-          "bytes the newest HDA stream got before it stopped, against the tone's size at the sink's rate", 0);
-    info("newest stream: %s at %ld ms, %ld B written (tone is %zu B at 48 kHz)", kind, at_ms, written, bytes);
-    if (written < expect && written > 0)
-      info("=> the sink wrote %ld B and never refilled: its thread stopped feeding hw:0,0 (blocked in a write? never woken?)", written);
-    g_pulse_play_ok = (exit_code == 0 && written >= expect);
-  } else {
-    info("no stream stop recorded: the sink never started an HDA stream, or it is still running");
-    g_pulse_play_ok = 0;
-  }
+  if (gpusnd_last_stop(kind, sizeof kind, &at_ms, &written))
+    info("newest recorded stream stop: %s at %ld ms, %ld B written (may predate this play)", kind, at_ms, written);
   info("sink after:");
   dump_cmd_matching("timeout 5 pactl list sinks 2>&1", g_sink_keys, 6);
   dump_tail("/tmp/pulseaudio.log", 6);
@@ -2126,10 +2190,12 @@ static void test_pulse_sink(void) {
   // a fresh open that must hand back the creation-time sizes.
   unsigned period0 = 0, buffer0 = 0;
   int fd = sink_hw_open(SINK_RATE_CREATED, &period0, &buffer0);
-  check(fd >= 0, "open O_NONBLOCK + HW_PARAMS 48000 Hz, period 1200, buffer 4800 (sink creation)",
-        "module-alsa-sink device=hw:0,0 mmap=0 tsched=0 fragments=4 fragment_size=4800", fd < 0 ? -fd : 0);
+  check_pcm_open(fd >= 0, "open O_NONBLOCK + HW_PARAMS 48000 Hz, period 1200, buffer 4800 (sink creation)",
+                 "module-alsa-sink device=hw:0,0 mmap=0 tsched=0 fragments=4 fragment_size=4800", fd < 0 ? -fd : 0);
   if (fd < 0) {
-    g_pulse_sink_path_ok = 0;
+    // Held by the running daemon is not a broken path — it IS the sink this
+    // section is about, already doing its job on the device.
+    g_pulse_sink_path_ok = pcm_held_by_daemon(-fd);
     return;
   }
   info("granted at 48000 Hz: period %u frames, buffer %u frames", period0, buffer0);
@@ -2425,9 +2491,17 @@ int main(int argc, char **argv) {
   detect_default_pcm();
   // cubeb's backend order on Linux: pulse (if libpulse loads and the server
   // answers) then alsa. OpenCubeb() fails only when every backend fails.
-  printf("  raw ALSA hw:%d: %s (what this probe drove directly)\n", g_card,
-         g_alsa_pcm_ok ? "works" : "BROKEN above");
-  if (g_pulse_sink_path_ok == 1) printf("  kernel side of module-alsa-sink (resume, avail, nonblocking writei, wakes): works\n");
+  // A section that skipped because the daemon holds hw:0,0 tested nothing —
+  // saying "works" there would be a louder lie than saying "BROKEN".
+  if (g_pcm_held_by_daemon)
+    printf("  raw ALSA hw:%d: NOT EXERCISED -- PulseAudio holds the PCM (exclusive, as on Linux); stop it to test hw:%d directly\n",
+           g_card, g_card);
+  else
+    printf("  raw ALSA hw:%d: %s (what this probe drove directly)\n", g_card,
+           g_alsa_pcm_ok ? "works" : "BROKEN above");
+  if (g_pcm_held_by_daemon)
+    printf("  kernel side of module-alsa-sink (resume, avail, nonblocking writei, wakes): NOT EXERCISED -- the live sink holds hw:%d,0\n", g_card);
+  else if (g_pulse_sink_path_ok == 1) printf("  kernel side of module-alsa-sink (resume, avail, nonblocking writei, wakes): works\n");
   else if (g_pulse_sink_path_ok == 0) printf("  kernel side of module-alsa-sink (resume, avail, nonblocking writei, wakes): BROKEN (see [pulse-sink])\n");
   if (g_pulse_play_ok == 1) printf("  PulseAudio playback (pacat -> sink -> hw:%d): works -- what mpg123 and Firefox use\n", g_card);
   else if (g_pulse_play_ok == 0) printf("  PulseAudio playback (pacat -> sink -> hw:%d): BROKEN (see [pulse-play]) -- this is the silence mpg123 and Firefox hit\n", g_card);
