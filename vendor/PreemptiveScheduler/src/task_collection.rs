@@ -442,23 +442,48 @@ impl TaskCollection {
         &self,
         generator: &mut Pin<Box<dyn Coroutine<Yield = Option<Key>, Return = ()>>>,
     ) -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
-        match generator.as_mut().resume(()) {
-            CoroutineState::Yielded(key) => {
-                if let Some(key) = key {
+        // A yielded key can already be dead by the time we look it up: the
+        // generator publishes it from the page bitmap, and only THEN do we take
+        // the collection lock, so a concurrent `remove_task` on another CPU fits
+        // in between. That is not a rare race -- it is exactly what oops
+        // containment does ("kernel coroutine retired") -- and the `unwrap()`
+        // that used to be here turned every one of those into
+        //
+        //   panic at task_collection.rs:450: called `Option::unwrap()` on a
+        //   `None` value
+        //
+        // inside the executor, on a CPU already holding scheduler locks. So a
+        // fault the kernel had just successfully CONTAINED took the machine
+        // down anyway, one line after it reported "contained ... the rest of
+        // the system carries on".
+        //
+        // A dead key means "this slot is gone", so skip it and ask the
+        // generator for the next one. `remove` clears the page bit before
+        // dropping the slab entry, so a removed key is not yielded again and
+        // the retry terminates; the bound is belt-and-braces against a bitmap
+        // that disagrees with the slab.
+        const MAX_STALE_KEYS: usize = 64;
+        for _ in 0..MAX_STALE_KEYS {
+            match generator.as_mut().resume(()) {
+                CoroutineState::Yielded(Some(key)) => {
                     let (priority, _page_idx, _subpage_idx) = unpack_key(key);
                     let mut inner = self.get_mut_inner(priority);
-                    let task = inner.slab.get(unmask_priority(key)).unwrap().clone();
+                    let Some(task) = inner.slab.get(unmask_priority(key)) else {
+                        drop(inner);
+                        continue;
+                    };
+                    let task = task.clone();
                     // The task's shared waker doubles as the borrow/drop handle,
                     // so the hot path no longer builds fresh `WakerRef`s (and an
                     // `Arc::new`) on every single poll.
                     let waker = task.waker().clone();
-                    Some((key, task, waker))
-                } else {
-                    None
+                    return Some((key, task, waker));
                 }
+                CoroutineState::Yielded(None) => return None,
+                _ => panic!("unexpected value from resume"),
             }
-            _ => panic!("unexpected value from resume"),
         }
+        None
     }
 
     pub fn generator(self: Arc<Self>) -> impl Coroutine<Yield = Option<Key>, Return = ()> {
