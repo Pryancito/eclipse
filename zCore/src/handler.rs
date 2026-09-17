@@ -238,8 +238,8 @@ impl KernelHandler for ZcoreKernelHandler {
             // which the detector reported as
             //   cpu=5 at memory_x86_64.rs:766 / HOLDER cpu=5 at ...:849
             // (alloc waiting, dealloc holding, one CPU) right after this very
-            // line printed. So: names only when the heap is provably free,
-            // ids -- which need no heap -- otherwise.
+            // line printed. So: ids only here; names belong to post-mortem
+            // userspace logs, not the fault path.
             if let Some(thread) = kernel_hal::thread::get_current_thread() {
                 if let Ok(thread) = thread.downcast::<Thread>() {
                     let in_timer_note = if in_timer {
