@@ -60,6 +60,13 @@ hal_fn_impl! {
                 crate::imp::arch::early_fb_console::panic_banner(_s);
             }
         }
+
+        fn console_panic_write_str(_s: &str) {
+            #[cfg(feature = "graphic")]
+            {
+                crate::imp::arch::early_fb_console::write_str(_s);
+            }
+        }
     }
 }
 

@@ -193,6 +193,9 @@ hal_fn_def! {
         /// this the bar stays at rboot's 51% through `memory::init` / PIT
         /// calibration, which looks like a hang on real hardware.
         pub fn console_progress_prime(_fb_vaddr: usize, _width: usize, _height: usize, _stride_pixels: usize) {}
+        /// Last-resort panic text appended raw to the framebuffer (no locks, no
+        /// alloc). No-op where there is no direct framebuffer access.
+        pub fn console_panic_write_str(_s: &str) {}
         /// Last-resort panic banner drawn raw to the framebuffer (no locks, no
         /// alloc). No-op where there is no direct framebuffer access.
         pub fn console_panic_banner(_s: &str) {}

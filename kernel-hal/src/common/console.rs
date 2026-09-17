@@ -289,28 +289,6 @@ cfg_if! {
             });
         }
 
-        /// Panic-path write: the normal path `try_lock`s and silently DROPS the
-        /// write when another CPU holds the VT console lock (it is mid-print of
-        /// its own line). A panic message must not be droppable — that exact
-        /// race produced a screen frozen mid-line with the real panic visible
-        /// only on serial. Spin (bounded) for the lock instead: a live holder
-        /// releases within microseconds; the bound keeps a wedged holder from
-        /// turning the panic handler itself into a hang.
-        pub(crate) fn vt_write_fmt_spin_impl(vt: usize, fmt: Arguments) {
-            if let Some(cons) = vt_mutex(vt) {
-                for _ in 0..50_000_000u64 {
-                    if let Some(mut g) = cons.try_lock() {
-                        if let Some(inner) = instantiate_vt(&mut g) {
-                            let _ = inner.write_fmt(fmt);
-                            inner.present();
-                        }
-                        return;
-                    }
-                    core::hint::spin_loop();
-                }
-            }
-        }
-
         pub(crate) fn vt_write_fmt_impl(vt: usize, fmt: Arguments) {
             let active = vt == ACTIVE_VT.load(Ordering::SeqCst);
             if active {
@@ -690,13 +668,61 @@ pub fn graphic_console_write_fmt(fmt: Arguments) {
     vt_write_fmt_impl(active_vt(), fmt);
 }
 
-/// Panic-path graphic write: bounded-spins for the VT console lock instead of
-/// silently dropping the message when another CPU is mid-print (see
-/// `vt_write_fmt_spin_impl`). Use ONLY from the panic handler.
+struct EmergencyGraphicWriter {
+    buf: [u8; 512],
+    len: usize,
+}
+
+impl EmergencyGraphicWriter {
+    fn flush(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+        if let Ok(s) = core::str::from_utf8(&self.buf[..self.len]) {
+            crate::hal_fn::console::console_panic_write_str(s);
+        }
+        self.len = 0;
+    }
+}
+
+impl Write for EmergencyGraphicWriter {
+    fn write_str(&mut self, mut s: &str) -> Result {
+        while !s.is_empty() {
+            if self.len == self.buf.len() {
+                self.flush();
+            }
+            let cap = self.buf.len() - self.len;
+            let take = if s.len() <= cap {
+                s.len()
+            } else {
+                let mut end = cap;
+                while !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                end
+            };
+            self.buf[self.len..self.len + take].copy_from_slice(&s.as_bytes()[..take]);
+            self.len += take;
+            s = &s[take..];
+        }
+        Ok(())
+    }
+}
+
+/// Panic/fault-path graphic write: bypass the VT console and append straight to
+/// the early framebuffer text renderer, so the report never dispatches through
+/// the `DisplayScheme` trait object that may already be corrupted.
 #[allow(unused_variables)]
 pub fn graphic_console_write_fmt_spin(fmt: Arguments) {
     #[cfg(feature = "graphic")]
-    vt_write_fmt_spin_impl(active_vt(), fmt);
+    {
+        let mut w = EmergencyGraphicWriter {
+            buf: [0; 512],
+            len: 0,
+        };
+        let _ = w.write_fmt(fmt);
+        w.flush();
+    }
 }
 
 /// Tell the graphic console that a panic is in progress, so it stops trusting
