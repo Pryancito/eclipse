@@ -103,11 +103,21 @@ async fn mapper_loop(id: usize) {
         let vmo = VmObject::new_paged(1);
         match vmar.map(None, vmo, 0, PAGE_SIZE, MMUFlags::READ | MMUFlags::WRITE) {
             Ok(va) => {
-                // Fault the page in so a remote CPU that steals this aspace
-                // (or shares kernel mappings) can hold a stale TLB entry.
-                unsafe {
-                    core::ptr::write_volatile(va as *mut u8, (id as u8).wrapping_add(1));
-                }
+                // Commit the page so a remote CPU that steals this aspace (or
+                // shares kernel mappings) can hold a stale TLB entry.
+                //
+                // Through the VMAR, never by dereferencing `va`: that address
+                // belongs to the NEW process's address space, while this
+                // kernel thread runs on a different CR3. The old
+                // `write_volatile(va as *mut u8)` therefore stored through an
+                // address that is unmapped here, and the hammer's own first
+                // round took a kernel-context `null-range #PF` at
+                // `tlb_hammer::mapper_loop` -- the containment path then
+                // retired the coroutine, so the harness killed its own mapper
+                // instead of stressing anything. `write_memory` commits the
+                // same page through the VMO, which is what the shootdowns
+                // below are about.
+                let _ = vmar.write_memory(va, &[(id as u8).wrapping_add(1)]);
                 let _ = vmar.unmap(va, PAGE_SIZE);
             }
             Err(_) => {
