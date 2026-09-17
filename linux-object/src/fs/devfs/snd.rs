@@ -447,6 +447,7 @@ pub struct PcmDev {
     card: usize,
     inode_id: usize,
     st: Mutex<PcmState>,
+    opened: AtomicBool,
 }
 
 impl PcmDev {
@@ -465,11 +466,70 @@ impl PcmDev {
                 avail_min: 1024,
                 stalled_since: None,
             }),
+            opened: AtomicBool::new(false),
         }
+    }
+
+    /// `hw:card,0` is a single-client PCM: the one process that owns it keeps
+    /// the shared runtime state and timer view until close, and everyone else
+    /// gets `EBUSY` as on Linux.
+    pub fn open_client(self: &Arc<Self>) -> Result<Arc<dyn INode>> {
+        if self
+            .opened
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(FsError::Busy);
+        }
+        Ok(Arc::new(PcmClient { pcm: self.clone() }))
     }
 
     fn ring_frames(&self) -> u64 {
         self.audio.buffer_bytes() as u64 / BYTES_PER_FRAME
+    }
+
+    /// One open of `/dev/snd/pcmC*D0p`. The underlying [`PcmDev`] keeps the ALSA
+    /// runtime state; this wrapper only owns the exclusive-open lease.
+    pub struct PcmClient {
+        pcm: Arc<PcmDev>,
+    }
+
+    impl Drop for PcmClient {
+        fn drop(&mut self) {
+            self.pcm.opened.store(false, Ordering::Release);
+        }
+    }
+
+    impl PcmClient {
+        pub(crate) fn io_control_with_flags(&self, cmd: u32, data: usize, flags: OpenFlags) -> Result<usize> {
+            self.pcm.io_control_with_flags(cmd, data, flags)
+        }
+    }
+
+    impl INode for PcmClient {
+        fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+            self.pcm.read_at(offset, buf)
+        }
+
+        fn write_at(&self, offset: usize, buf: &[u8]) -> Result<usize> {
+            self.pcm.write_at(offset, buf)
+        }
+
+        fn poll(&self) -> Result<PollStatus> {
+            self.pcm.poll()
+        }
+
+        fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
+            self.pcm.io_control(cmd, data)
+        }
+
+        fn metadata(&self) -> Result<Metadata> {
+            self.pcm.metadata()
+        }
+
+        fn as_any_ref(&self) -> &dyn Any {
+            self
+        }
     }
 
     fn queued_frames(&self) -> u64 {
@@ -2416,6 +2476,16 @@ mod timer_tests {
             ));
             assert_eq!(xfer.result, 0);
             assert_eq!(pcm.st.lock().appl_ptr, before);
+        }
+
+        #[test]
+        fn pcm_open_is_exclusive_until_the_client_drops() {
+            let audio = Arc::new(FakeAudio::new(4 * BYTES_PER_FRAME as usize));
+            let pcm = Arc::new(PcmDev::new(audio, 0));
+            let first = pcm.open_client().unwrap();
+            assert!(matches!(pcm.open_client(), Err(FsError::Busy)));
+            drop(first);
+            assert!(pcm.open_client().is_ok());
         }
 
         /// pcm_hw.c's SYNC_PTR fallback: `query_status_and_control_data`

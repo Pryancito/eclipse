@@ -969,8 +969,10 @@ impl FileLike for File {
     fn ioctl(&self, request: usize, arg1: usize, _arg2: usize, _arg3: usize) -> LxResult<usize> {
         // ioctl syscall
         let inner = self.inner.read();
-        use super::devfs::PcmDev;
+        use super::devfs::{PcmClient, PcmDev};
         if let Some(pcm) = inner.inode.downcast_ref::<PcmDev>() {
+            pcm.io_control_with_flags(request as u32, arg1, inner.flags)?;
+        } else if let Some(pcm) = inner.inode.downcast_ref::<PcmClient>() {
             pcm.io_control_with_flags(request as u32, arg1, inner.flags)?;
         } else {
             inner.inode.io_control(request as u32, arg1)?;

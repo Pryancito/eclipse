@@ -292,6 +292,10 @@ impl Syscall<'_> {
                 linux_object::fs::pty::alloc_ptmx()
             } else if let Some(ptmx) = inode.downcast_ref::<linux_object::fs::devfs::PtmxINode>() {
                 ptmx.open_master().map_err(LxError::from)?
+            } else if let Ok(pcm) = inode.clone().downcast_arc::<linux_object::fs::devfs::PcmDev>() {
+                // Raw ALSA hw PCMs are single-client: while one fd owns
+                // `/dev/snd/pcmC*D0p`, the next open must fail with EBUSY.
+                pcm.open_client().map_err(LxError::from)?
             } else if let Some(timer) = inode.downcast_ref::<linux_object::fs::devfs::TimerDev>() {
                 // `/dev/snd/timer` too: every open is its own ALSA timer
                 // instance (selection, params, event queue), as on Linux.
