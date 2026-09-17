@@ -446,7 +446,9 @@ pub struct PcmDev {
     audio: Arc<dyn AudioScheme>,
     card: usize,
     inode_id: usize,
-    st: Mutex<PcmState>,
+    st: Arc<Mutex<PcmState>>,
+    opened: Arc<AtomicBool>,
+    release_opened_on_drop: bool,
 }
 
 impl PcmDev {
@@ -455,7 +457,7 @@ impl PcmDev {
             audio,
             card,
             inode_id: DevFS::new_inode_id(),
-            st: Mutex::new(PcmState {
+            st: Arc::new(Mutex::new(PcmState {
                 state: STATE_OPEN,
                 rate: 48000,
                 buffer_size: 16384,
@@ -464,8 +466,31 @@ impl PcmDev {
                 appl_ptr: 0,
                 avail_min: 1024,
                 stalled_since: None,
-            }),
+            })),
+            opened: Arc::new(AtomicBool::new(false)),
+            release_opened_on_drop: false,
         }
+    }
+
+    /// `hw:card,0` is a single-client PCM: the one process that owns it keeps
+    /// the shared runtime state and timer view until close, and everyone else
+    /// gets `EBUSY` as on Linux.
+    pub fn open_client(&self) -> Result<Arc<dyn INode>> {
+        if self
+            .opened
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(FsError::Busy);
+        }
+        Ok(Arc::new(PcmDev {
+            audio: self.audio.clone(),
+            card: self.card,
+            inode_id: self.inode_id,
+            st: self.st.clone(),
+            opened: self.opened.clone(),
+            release_opened_on_drop: true,
+        }))
     }
 
     fn ring_frames(&self) -> u64 {
@@ -1524,6 +1549,14 @@ impl PcmDev {
     }
 }
 
+impl Drop for PcmDev {
+    fn drop(&mut self) {
+        if self.release_opened_on_drop {
+            self.opened.store(false, Ordering::Release);
+        }
+    }
+}
+
 impl INode for PcmDev {
     fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
         Err(FsError::NotSupported)
@@ -1544,9 +1577,31 @@ impl INode for PcmDev {
         // every 4 ms, and reporting every freed frame would wake such a
         // feeder 250 times a second to write a few frames each. Gating on a
         // whole period gives it the wake-up cadence it was written for.
+        // Gate on what `writei` will ACTUALLY accept, not just on this
+        // stream's notional buffer.
+        //
+        // `avail` is `buffer_size - queued`, per stream. The device ring is a
+        // single shared resource, and this card really does get two PCM
+        // streams open at once (a live log shows `PCM_WRITEI_FRAMES` on fd=15
+        // and fd=16 from one process). So one stream's `avail` can promise
+        // room that the other stream's data is already occupying, `writei`
+        // answers EAGAIN, and alsa-lib — which was told there was space —
+        // asserts and aborts the daemon:
+        //
+        //     [alsa-hunt] pid=1031 ioctl PCM_WRITEI_FRAMES -> EAGAIN (11)
+        //     [exit] pid=1031 (pulseaudio) killed by signal SIGABRT (6)
+        //     [crash-bt] ... /usr/lib/libasound.so.2+0x323f3 ...
+        //
+        // Reporting the minimum of the two keeps poll() honest: a feeder is
+        // woken only when the write it is about to make can land. It cannot
+        // help a client that writes without polling, and it does not fix the
+        // underlying single-ring-for-two-streams design, but it removes the
+        // case where the kernel invites a write it is going to refuse.
+        let ring_free = self.audio.free_bytes() as u64 / BYTES_PER_FRAME;
+        let writable = avail.min(ring_free);
         Ok(PollStatus {
             read: false,
-            write: avail >= st.avail_min.max(st.period_size),
+            write: writable >= st.avail_min.max(st.period_size),
             error: false,
         })
     }
@@ -2394,6 +2449,16 @@ mod timer_tests {
             ));
             assert_eq!(xfer.result, 0);
             assert_eq!(pcm.st.lock().appl_ptr, before);
+        }
+
+        #[test]
+        fn pcm_open_is_exclusive_until_the_client_drops() {
+            let audio = Arc::new(FakeAudio::new(4 * BYTES_PER_FRAME as usize));
+            let pcm = Arc::new(PcmDev::new(audio, 0));
+            let first = pcm.open_client().unwrap();
+            assert!(matches!(pcm.open_client(), Err(FsError::Busy)));
+            drop(first);
+            assert!(pcm.open_client().is_ok());
         }
 
         /// pcm_hw.c's SYNC_PTR fallback: `query_status_and_control_data`

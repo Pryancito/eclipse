@@ -7,8 +7,11 @@
 
 use super::*;
 use alloc::string::String;
+use alloc::sync::Arc;
+use linux_object::error::LxResult;
 use linux_object::fs::{SignalFd, TimerFd};
 use linux_object::time::TimeSpec;
+use rcore_fs::vfs::INode;
 
 /// `struct itimerspec` for `timerfd_settime`/`timerfd_gettime`.
 #[repr(C)]
@@ -35,6 +38,29 @@ impl ITimerSpec {
             it_value: ts(value_ns),
         }
     }
+}
+
+fn prepare_open_inode(inode: Arc<dyn INode>) -> LxResult<Arc<dyn INode>> {
+    Ok(
+        if inode
+            .downcast_ref::<linux_object::fs::pty::PtmxINode>()
+            .is_some()
+        {
+            linux_object::fs::pty::alloc_ptmx()
+        } else if let Some(ptmx) = inode.downcast_ref::<linux_object::fs::devfs::PtmxINode>() {
+            ptmx.open_master().map_err(LxError::from)?
+        } else if let Some(pcm) = inode.downcast_ref::<linux_object::fs::devfs::PcmDev>() {
+            // Raw ALSA hw PCMs are single-client: while one fd owns
+            // `/dev/snd/pcmC*D0p`, the next open must fail with EBUSY.
+            pcm.open_client().map_err(LxError::from)?
+        } else if let Some(timer) = inode.downcast_ref::<linux_object::fs::devfs::TimerDev>() {
+            // `/dev/snd/timer` too: every open is its own ALSA timer
+            // instance (selection, params, event queue), as on Linux.
+            timer.open_client()
+        } else {
+            inode
+        },
+    )
 }
 
 impl Syscall<'_> {
@@ -285,20 +311,7 @@ impl Syscall<'_> {
             // master (and publishes its slave at `/dev/pts/N`). Prefer the
             // `fs/pty` registry (absolute opens already special-cased above); the
             // legacy `devfs::PtmxINode` path remains for any leftover node.
-            let inode = if inode
-                .downcast_ref::<linux_object::fs::pty::PtmxINode>()
-                .is_some()
-            {
-                linux_object::fs::pty::alloc_ptmx()
-            } else if let Some(ptmx) = inode.downcast_ref::<linux_object::fs::devfs::PtmxINode>() {
-                ptmx.open_master().map_err(LxError::from)?
-            } else if let Some(timer) = inode.downcast_ref::<linux_object::fs::devfs::TimerDev>() {
-                // `/dev/snd/timer` too: every open is its own ALSA timer
-                // instance (selection, params, event queue), as on Linux.
-                timer.open_client()
-            } else {
-                inode
-            };
+            let inode = prepare_open_inode(inode)?;
             let abs_path = proc.get_absolute_path(dir_fd, path)?;
             let file = File::new(inode, flags, abs_path);
             let fd = proc.add_file(file)?;
@@ -348,6 +361,7 @@ impl Syscall<'_> {
                 );
             }
         }
+
         proc.close_file(fd)?;
         Ok(0)
     }
@@ -602,5 +616,80 @@ impl Syscall<'_> {
         let event = PerfEvent::new(&attr_bytes, pid, cpu, OpenFlags::from_bits_truncate(flags));
         let fd = self.linux_process().add_file(event)?;
         Ok(fd.into())
+    }
+}
+
+#[cfg(test)]
+mod open_inode_tests {
+    use super::*;
+    use kernel_hal::sync::Mutex;
+    use linux_object::fs::devfs::PcmDev;
+    use zcore_drivers::{scheme::AudioScheme, DeviceResult};
+
+    struct FakeAudio {
+        queued: Mutex<usize>,
+        cap: usize,
+    }
+
+    impl FakeAudio {
+        fn new(cap: usize) -> Self {
+            Self {
+                queued: Mutex::new(0),
+                cap,
+            }
+        }
+    }
+
+    impl zcore_drivers::scheme::Scheme for FakeAudio {
+        fn name(&self) -> &str {
+            "fake-audio"
+        }
+    }
+
+    impl AudioScheme for FakeAudio {
+        fn set_params(&self, rate: u32, channels: u8) -> DeviceResult<(u32, u8)> {
+            Ok((rate, channels))
+        }
+
+        fn params(&self) -> (u32, u8) {
+            (48_000, 2)
+        }
+
+        fn write(&self, pcm: &[u8]) -> DeviceResult<usize> {
+            let mut queued = self.queued.lock();
+            let n = self.cap.saturating_sub(*queued).min(pcm.len());
+            *queued += n;
+            Ok(n)
+        }
+
+        fn free_bytes(&self) -> usize {
+            self.cap.saturating_sub(*self.queued.lock())
+        }
+
+        fn buffer_bytes(&self) -> usize {
+            self.cap
+        }
+
+        fn queued_bytes(&self) -> usize {
+            *self.queued.lock()
+        }
+
+        fn reset(&self) -> DeviceResult {
+            *self.queued.lock() = 0;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pcm_inode_open_and_close_enforce_exclusivity() {
+        let inode: Arc<dyn INode> = Arc::new(PcmDev::new(Arc::new(FakeAudio::new(4096)), 0));
+        let first = prepare_open_inode(inode.clone()).unwrap();
+        let file = File::new(first, OpenFlags::RDONLY, String::from("/dev/snd/pcmC0D0p"));
+        assert!(matches!(
+            prepare_open_inode(inode.clone()),
+            Err(LxError::EBUSY)
+        ));
+        drop(file);
+        assert!(prepare_open_inode(inode).is_ok());
     }
 }
