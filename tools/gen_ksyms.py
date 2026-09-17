@@ -62,34 +62,60 @@ def section_size(objcopy_readelf, elf):
     return None
 
 
+# Linker-script markers: zero-length labels that sit at a section boundary, not
+# functions. They must never enter the table. `_copy_user_end` is the reason:
+# the `.text.copy_user` region is declared but empty, so the label lands on the
+# image base, and `MAX_SYM_SPAN` then let it claim every low address --
+# including the 0x...06 stack-bottom sentinel that ends every coroutine
+# backtrace, which printed as a confident `<_copy_user_end+0x6>` frame in every
+# crash report this hunt produced.
+MARKERS = {
+    "stext",
+    "etext",
+    "_copy_user_start",
+    "_copy_user_end",
+    "ksyms_start",
+    "ksyms_end",
+    "kcounters_desc_start",
+    "kcounters_desc_end",
+    "kcounters_desc_vmo_start",
+    "kcounters_arena_start",
+    "kcounters_arena_end",
+}
+
+
 def collect(nm, elf):
     """`[(addr, name)]` for every function symbol, address-sorted and deduped."""
     out = subprocess.run(
-        [nm, "--defined-only", "--demangle", "--numeric-sort", elf],
+        [nm, "--defined-only", "--demangle", "--print-size", "--numeric-sort", elf],
         capture_output=True,
         text=True,
         check=True,
     ).stdout
     syms = []
     for line in out.splitlines():
-        parts = line.split(" ", 2)
-        if len(parts) < 3 or parts[1].lower() != "t":
+        parts = line.split(" ", 3)
+        # With --print-size: "addr size type name"; sizeless symbols (hand
+        # written assembly, markers) print "addr type name" instead.
+        if len(parts) >= 4 and len(parts[1]) > 1 and parts[2].lower() == "t":
+            addr_s, size_s, name = parts[0], parts[1], parts[3]
+        elif len(parts) >= 3 and parts[1].lower() == "t":
+            addr_s, size_s, name = parts[0], "0", " ".join(parts[2:])
+        else:
             continue
         try:
-            addr = int(parts[0], 16)
+            addr, size = int(addr_s, 16), int(size_s, 16)
         except ValueError:
             continue
-        if addr == 0:
+        name = name.strip()
+        if addr == 0 or not name or name in MARKERS:
             continue
-        name = parts[2].strip()
-        if not name:
-            continue
-        syms.append((addr, name[:MAX_NAME]))
-    syms.sort(key=lambda s: s[0])
-    # One entry per address: the first name wins, so a symbol and its `.cold`
-    # or local alias do not both occupy a slot.
+        syms.append((addr, size, name[:MAX_NAME]))
+    # Address first, then sized symbols before sizeless ones: at a shared
+    # address the real function wins over an alias or a stray label.
+    syms.sort(key=lambda s: (s[0], 0 if s[1] else 1))
     deduped = []
-    for addr, name in syms:
+    for addr, _size, name in syms:
         if deduped and deduped[-1][0] == addr:
             continue
         deduped.append((addr, name))

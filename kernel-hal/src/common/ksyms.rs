@@ -199,7 +199,17 @@ pub fn lookup(addr: u64) -> Option<(&'static str, u64)> {
         }
     }
     let off = addr - entry_addr(base, lo);
-    if off > MAX_SYM_SPAN {
+    // A symbol reaches at most to the next one. Without that bound a label at
+    // a section boundary claims everything after it: `_copy_user_end` sits on
+    // the image base (the `.text.copy_user` region is declared but empty) and
+    // was naming low addresses in every backtrace this hunt produced.
+    // `MAX_SYM_SPAN` only backstops the very last entry.
+    let span = if lo + 1 < count {
+        entry_addr(base, lo + 1).saturating_sub(entry_addr(base, lo))
+    } else {
+        MAX_SYM_SPAN
+    };
+    if off >= span.min(MAX_SYM_SPAN) {
         return None;
     }
     let name_off = u32_at(HEADER_LEN + lo * 8 + 4) as usize;
