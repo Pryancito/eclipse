@@ -102,6 +102,17 @@ const STATE_OPEN: i32 = 0;
 const STATE_SETUP: i32 = 1;
 const STATE_PREPARED: i32 = 2;
 const STATE_RUNNING: i32 = 3;
+/// `SNDRV_PCM_STATE_XRUN`. Reached when the ring stops draining for longer
+/// than a whole buffer: the device is not consuming, so no amount of polling
+/// will make room. Linux reports that as an underrun, `writei` answers EPIPE,
+/// and every client recovers by re-preparing the stream. Without it a stalled
+/// device produces EAGAIN forever, which is not a recovery path — it is how
+/// PulseAudio ended up aborting inside libasound.
+const STATE_XRUN: i32 = 4;
+/// Shortest stall that counts as an underrun, however small the negotiated
+/// buffer. A 64-frame buffer at 48 kHz is 1.3 ms; declaring XRUN that fast
+/// would turn ordinary scheduling jitter into a stream reset.
+const BUFFER_STALL_FLOOR: core::time::Duration = core::time::Duration::from_millis(200);
 const STATE_PAUSED: i32 = 6;
 
 // snd_pcm_hw_param indexes.
@@ -426,6 +437,9 @@ struct PcmState {
     boundary: u64,
     appl_ptr: u64,
     avail_min: u64,
+    /// When the ring first refused a write for want of room, or `None` while
+    /// it is still draining. See [`STATE_XRUN`].
+    stalled_since: Option<core::time::Duration>,
 }
 
 pub struct PcmDev {
@@ -449,6 +463,7 @@ impl PcmDev {
                 boundary: 0x4000_0000_0000_0000,
                 appl_ptr: 0,
                 avail_min: 1024,
+                stalled_since: None,
             }),
         }
     }
@@ -1045,7 +1060,52 @@ impl PcmDev {
         let mut st = self.st.lock();
         st.appl_ptr = (st.appl_ptr + bytes as u64 / BYTES_PER_FRAME) % st.boundary.max(1);
         st.state = STATE_RUNNING;
+        st.stalled_since = None;
         arm_playback_watchdog();
+    }
+
+    /// Answer a write that found no room: `EAGAIN` while the ring is still
+    /// draining, `EPIPE` once it has clearly stopped.
+    ///
+    /// `EAGAIN` means "not right now, poll and retry", and a client acts on it
+    /// by going back to `poll()`. That is the correct answer only if the room
+    /// is going to appear. When the device stops consuming — the HDA engine
+    /// halted, the DMA position frozen — it never does, and the client spins
+    /// against a full ring with nothing to recover from. PulseAudio's ALSA
+    /// sink ends that spin by aborting inside libasound:
+    ///
+    ///     [alsa-hunt] pid=1029 ioctl PCM_WRITEI_FRAMES -> EAGAIN (11)
+    ///     [exit] pid=1029 (pulseaudio) killed by signal SIGABRT (6)
+    ///
+    /// Linux calls a ring that stopped draining an underrun: the state goes to
+    /// `XRUN`, `writei` answers `EPIPE`, and the client re-prepares the stream.
+    /// That is a recovery path; an endless `EAGAIN` is not. A whole buffer's
+    /// worth of time with zero progress is well past any scheduling hiccup —
+    /// one period would be the normal refill cadence — so that is the line.
+    fn no_room(&self, total_bytes: usize) -> Result<()> {
+        let now = kernel_hal::timer::timer_now();
+        let mut st = self.st.lock();
+        let since = *st.stalled_since.get_or_insert(now);
+        // buffer_size frames at `rate` Hz, floored so a bogus rate cannot make
+        // the timeout infinite.
+        let buffer_us = st.buffer_size.saturating_mul(1_000_000) / st.rate.max(1) as u64;
+        let limit = core::time::Duration::from_micros(buffer_us).max(BUFFER_STALL_FLOOR);
+        if now.saturating_sub(since) < limit {
+            return Err(FsError::Again);
+        }
+        st.state = STATE_XRUN;
+        st.stalled_since = None;
+        let queued = self.audio.queued_bytes();
+        let free = self.audio.free_bytes();
+        let playing = self.audio.is_playing();
+        drop(st);
+        error!(
+            "[snd] pcmC{}D0p: ring stopped draining for {:?} with {} bytes queued, \
+             {} free, is_playing={} — reporting XRUN/EPIPE so the client can \
+             re-prepare instead of spinning on EAGAIN (wanted {} bytes)",
+            self.card, limit, queued, free, playing, total_bytes,
+        );
+        Err(FsError::Broken)
     }
 
     /// Interleaved write. Blocking callers keep the old spin-retry behaviour;
@@ -1067,6 +1127,13 @@ impl PcmDev {
             //      [einval-hunt] pid=1028 syscall=16 (IOCTL) a1=0x40184150 -> EINVAL
             //    (0x40184150 = _IOW('A', 0x50, 24) = WRITEI_FRAMES), and then
             //    an abort inside libasound.
+            // An underrun is not "this fd is unusable": Linux answers EPIPE and
+            // every client recovers with `snd_pcm_prepare()`. Reporting EBADFD
+            // here would tell PulseAudio the stream is dead when it is merely
+            // stalled.
+            if st.state == STATE_XRUN {
+                return Err(FsError::Broken);
+            }
             if st.state != STATE_PREPARED && st.state != STATE_RUNNING && st.state != STATE_PAUSED {
                 // Name the state: the errno alone cannot say whether the
                 // stream was never prepared (SETUP), already torn down (OPEN)
@@ -1096,12 +1163,12 @@ impl PcmDev {
                 chunk = (self.audio.free_bytes() / frame * frame).min(total_bytes);
             }
             if chunk < frame {
-                return Err(FsError::Again);
+                return self.no_room(total_bytes);
             }
             let buf = unsafe { core::slice::from_raw_parts(src, chunk) };
             let n = self.audio.write(buf).map_err(|_| FsError::DeviceError)?;
             if n == 0 {
-                return Err(FsError::Again);
+                return self.no_room(total_bytes);
             }
             self.commit_write_progress(n);
             xfer.result = (n as u64 / BYTES_PER_FRAME) as i64;
@@ -1352,9 +1419,11 @@ impl PcmDev {
                 Ok(0)
             }
             0x40 => {
-                // PREPARE
+                // PREPARE — also the recovery path out of XRUN, so the stall
+                // clock starts over with the freshly reset ring.
                 let _ = self.audio.reset();
                 let mut st = self.st.lock();
+                st.stalled_since = None;
                 st.appl_ptr = 0;
                 st.state = STATE_PREPARED;
                 Ok(0)
@@ -2229,6 +2298,56 @@ mod timer_tests {
             };
             pcm.writei(&mut xfer, OpenFlags::NON_BLOCK).unwrap();
             assert_eq!(xfer.result, 2);
+        }
+
+        #[test]
+        fn write_after_an_underrun_is_epipe_not_ebadfd() {
+            // EBADFD says "this fd is unusable" and a client has nothing to do
+            // about it. EPIPE says "the stream broke", which is what
+            // `snd_pcm_prepare()` recovers from -- the difference between
+            // PulseAudio restarting the stream and PulseAudio aborting.
+            let audio = Arc::new(FakeAudio::new(4 * BYTES_PER_FRAME as usize));
+            let pcm = PcmDev::new(audio, 0);
+            pcm.st.lock().state = STATE_XRUN;
+            let samples = [0u8; BYTES_PER_FRAME as usize];
+            let mut xfer = SndXferI {
+                result: 0,
+                buf: samples.as_ptr() as usize as u64,
+                frames: 1,
+            };
+            assert!(matches!(
+                pcm.writei(&mut xfer, OpenFlags::NON_BLOCK),
+                Err(FsError::Broken)
+            ));
+        }
+
+        #[test]
+        fn a_full_ring_is_eagain_before_it_is_an_underrun() {
+            // The stall clock starts on the first refusal, so an ordinary full
+            // ring must still read as "poll and retry". Only a ring that stays
+            // full past a whole buffer becomes an XRUN -- otherwise every
+            // scheduling hiccup would reset the stream.
+            let audio = Arc::new(FakeAudio::new(BYTES_PER_FRAME as usize));
+            let pcm = PcmDev::new(audio, 0);
+            {
+                let mut st = pcm.st.lock();
+                st.state = STATE_RUNNING;
+                st.buffer_size = 1;
+            }
+            let samples = [0u8; BYTES_PER_FRAME as usize];
+            let mut xfer = SndXferI {
+                result: 0,
+                buf: samples.as_ptr() as usize as u64,
+                frames: 1,
+            };
+            // Fill it, then the next write finds no room.
+            pcm.writei(&mut xfer, OpenFlags::NON_BLOCK).unwrap();
+            assert!(matches!(
+                pcm.writei(&mut xfer, OpenFlags::NON_BLOCK),
+                Err(FsError::Again)
+            ));
+            assert!(pcm.st.lock().stalled_since.is_some());
+            assert_eq!(pcm.st.lock().state, STATE_RUNNING);
         }
 
         #[test]

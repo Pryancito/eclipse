@@ -285,6 +285,7 @@ impl From<FsError> for LxError {
             FsError::OpNotSupported => LxError::EOPNOTSUPP,
             FsError::BadAddress => LxError::EFAULT,
             FsError::BadState => LxError::EBADFD,
+            FsError::Broken => LxError::EPIPE,
         }
     }
 }
