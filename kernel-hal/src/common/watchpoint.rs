@@ -251,7 +251,10 @@ mod imp {
             // frame is [saved_rbp, return_addr].
             let saved = unsafe { core::ptr::read_volatile(fp as *const u64) };
             let ret = unsafe { core::ptr::read_volatile((fp + 8) as *const u64) };
-            crate::console::serial_write_fmt_spin(format_args!("[{tag}]   #{i:02} ret={ret:#x}\n"));
+            crate::console::serial_write_fmt_spin(format_args!(
+                "[{tag}]   #{i:02} ret={}\n",
+                crate::ksyms::Addr(ret)
+            ));
             if saved <= fp {
                 break; // frame pointers must strictly increase up the stack
             }
@@ -295,10 +298,16 @@ mod imp {
                 // Spin/blocking serial writer: this must survive even if the
                 // machine is already in the corrupted state that motivated
                 // the watch.
+                // The value it was overwritten WITH is half the evidence: a
+                // pointer says the writer thought it owned this memory (the
+                // allocator handed the block out twice), a small integer or
+                // ASCII says it was aiming somewhere else entirely.
+                // SAFETY: the watched word is mapped — it is being watched.
+                let new_val = unsafe { core::ptr::read_volatile(addr as *const u64) };
                 crate::console::serial_write_fmt_spin(format_args!(
-                    "\n[watchpoint] HIT #{n} on {len}B at {addr:#x} — WRITTEN BY rip={rip:#x} \
-                     (cpu{cpu} rsp={rsp:#x} rbp={rbp:#x})\n\
-                     [watchpoint] symbolize with: llvm-addr2line -e <zcore.elf> -fC {rip:#x}\n",
+                    "\n[watchpoint] HIT #{n} on {len}B at {addr:#x} — now holds {new_val:#018x}\n\
+                     [watchpoint] WRITTEN BY {} (cpu{cpu} rsp={rsp:#x} rbp={rbp:#x})\n",
+                    crate::ksyms::Addr(rip),
                 ));
                 report_writer_chain("watchpoint", rbp);
                 // Bounded catch: a handful of hits is enough to name the
@@ -329,8 +338,8 @@ mod imp {
             crate::console::serial_write_fmt_spin(format_args!(
                 "\n[spine-writer] HIT #{n}: executor id={exec_id} spine slot {addr:#x} \
                  OVERWRITTEN with {new_val:#x}\n\
-                 [spine-writer] writer: cpu{cpu} rip={rip:#x} rsp={rsp:#x} rbp={rbp:#x}\n\
-                 [spine-writer] symbolize with: llvm-addr2line -e <zcore.elf> -fCi {rip:#x}\n",
+                 [spine-writer] writer: cpu{cpu} {} rsp={rsp:#x} rbp={rbp:#x}\n",
+                crate::ksyms::Addr(rip),
             ));
             report_writer_chain("spine-writer", rbp);
             // The writer's locals name its buffer: dump a window around its
