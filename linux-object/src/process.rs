@@ -213,7 +213,13 @@ impl ProcessExt for Process {
                          fat data={:#x} vtable={:#x}, at birth data={:#x} vtable={:#x}, \
                          canaries lo={:#x} hi={:#x}",
                         self.id(),
-                        self.name(),
+                        // try_name: this diagnostic can be reached from inside
+                        // the object layer's own signal callback (file teardown
+                        // re-enters process accessors), where `name()` would
+                        // wait on the lock that callback holds -- a deadlock
+                        // that prints nothing, which is strictly worse than a
+                        // corruption report missing one name.
+                        trace_name(self),
                         fat[0],
                         fat[1],
                         born_data,
@@ -234,7 +240,7 @@ impl ProcessExt for Process {
                      this means the ext was CORRUPTED, not that a kernel-internal \
                      process leaked in",
                     self.id(),
-                    self.name(),
+                    trace_name(self),
                     self.status(),
                     fat[0],
                     fat[1],

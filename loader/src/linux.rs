@@ -406,6 +406,17 @@ fn describe_addr(vmar: &Arc<VmAddressRegion>, addr: usize) -> String {
     String::from("unmapped")
 }
 
+/// Whether `addr` lies on a mapped, executable user page.
+///
+/// Per PAGE, not per mapping row: a partial `mprotect` leaves mixed
+/// permissions inside one mapping and `MappingDump` only carries the first
+/// page's flags.
+fn addr_is_executable(vmar: &Arc<VmAddressRegion>, addr: usize) -> bool {
+    vmar.find_mapping(addr)
+        .and_then(|m| m.get_flags(addr).ok())
+        .is_some_and(|f| f.contains(kernel_hal::MMUFlags::EXECUTE))
+}
+
 /// Scan the user stack from `sp` upwards for words that point into an
 /// executable page and render each as `stack[+off] = addr [lib+offset]`,
 /// `offset` being the FILE offset (`MappingDump::file_offset`) so it feeds
@@ -436,11 +447,7 @@ fn user_stack_backtrace(vmar: &Arc<VmAddressRegion>, sp: usize) -> Vec<String> {
         Err(_) => return out,
     };
     let maps = vmar.mappings_dump();
-    let executable = |addr: usize| -> bool {
-        vmar.find_mapping(addr)
-            .and_then(|m| m.get_flags(addr).ok())
-            .is_some_and(|f| f.contains(kernel_hal::MMUFlags::EXECUTE))
-    };
+    let executable = |addr: usize| addr_is_executable(vmar, addr);
     for (i, chunk) in buf[..got].chunks_exact(word).enumerate() {
         let mut raw = [0u8; core::mem::size_of::<usize>()];
         raw.copy_from_slice(chunk);
@@ -731,13 +738,14 @@ fn handle_signal(
 /// Shared by the page-fault (SIGSEGV) and CPU-exception (#GP, #DE, ...)
 /// paths so a `movaps` on a misaligned stack or a non-canonical pointer --
 /// which raise #GP, not a page fault -- get the same forensics instead of a
-/// bare `[exit] killed by signal SIGSEGV`. `read_code` is false when `pc`
-/// itself is the unmapped address (an instruction-fetch fault).
+/// bare `[exit] killed by signal SIGSEGV`. `pc_is_data_fault` is false when
+/// `pc` may itself be the bad address (an instruction-fetch fault, or a #GP
+/// raised after a jump to a non-canonical RIP).
 fn dump_user_fault_context(
     thread: &CurrentThread,
     vmar: &Arc<VmAddressRegion>,
     pc: usize,
-    read_code: bool,
+    pc_is_data_fault: bool,
 ) {
     // The faulting address says WHAT was touched; the registers say
     // WHICH operand carried it. A write to 0 is a null pointer, and
@@ -753,18 +761,25 @@ fn dump_user_fault_context(
     // dereferenced -- with `rax`, `rdx`, `rbp` and `r9` all zero
     // there is no reading the faulting operand off the dump alone.
     //
-    // Only safe on a DATA fault: there `pc` is the mapped
-    // instruction that made a bad access, so reading its bytes is
-    // the memory the CPU fetched from. On an INSTRUCTION-FETCH
-    // fault (`EXECUTE` flag) `pc` IS the unmapped address that
-    // faulted -- reading it here re-faults, but from kernel mode,
-    // where `read_array`'s unchecked `copy_from_nonoverlapping`
-    // (no fault fixup) turns a recoverable user SIGSEGV into an
-    // unresolved KERNEL page fault and the isolate/kill cascade.
-    // Every desktop process jumping to one bad address then took
-    // the kernel down through this read. The address is already in
-    // the report above (`pc=... [unmapped]`), so skip the bytes.
-    if read_code {
+    // Only safe when `pc` is known-good memory: reading it is an
+    // unchecked `copy_from_nonoverlapping` with NO fault fixup, so a
+    // `pc` that is itself the bad address turns a recoverable user
+    // SIGSEGV into an unresolved KERNEL page fault and the
+    // isolate/kill cascade. Every desktop process jumping to one bad
+    // address once took the kernel down through this read.
+    //
+    // Two independent guards, because either alone is insufficient:
+    //  * `pc_is_data_fault` -- on an INSTRUCTION-FETCH page fault
+    //    (`EXECUTE` flag) `pc` IS the unmapped address that faulted.
+    //  * the mapping test -- a CPU exception carries no fault address
+    //    and no access flags at all, so a #GP raised after a jump to a
+    //    non-canonical or unmapped RIP reaches here with the caller
+    //    unable to tell. `UserInPtr`'s own check is a bounds check, not
+    //    a mapping check (and under `libos` it accepts every address),
+    //    so the page must be confirmed mapped and executable here.
+    // The address is in the report above (`pc=... [unmapped]`) either
+    // way, so skipping the bytes loses nothing.
+    if pc_is_data_fault && addr_is_executable(vmar, pc) {
         if let Ok(bytes) = kernel_hal::user::UserInPtr::<u8>::from(pc).read_array(16) {
             let mut hex = String::new();
             for b in &bytes {

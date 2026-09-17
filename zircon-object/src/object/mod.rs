@@ -131,8 +131,15 @@ pub trait KernelObject: DowncastSync + Debug {
     fn name(&self) -> alloc::string::String;
     /// Get object's name without blocking on the object lock (`None` when
     /// it is held); see [`KObjectBase::try_name`].
+    ///
+    /// The default answers `None` rather than falling back to `name()`: an
+    /// implementation that does not go through `impl_kobject!` would
+    /// otherwise silently reintroduce the self-deadlock this method exists
+    /// to prevent (a diagnostic run from inside a signal callback waiting on
+    /// the lock its own CPU holds). Losing a name in a trace is the cheaper
+    /// failure; override this to provide one.
     fn try_name(&self) -> Option<alloc::string::String> {
-        Some(self.name())
+        None
     }
     /// Set object's name.
     fn set_name(&self, name: &str);
