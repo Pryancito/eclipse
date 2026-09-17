@@ -1544,9 +1544,31 @@ impl INode for PcmDev {
         // every 4 ms, and reporting every freed frame would wake such a
         // feeder 250 times a second to write a few frames each. Gating on a
         // whole period gives it the wake-up cadence it was written for.
+        // Gate on what `writei` will ACTUALLY accept, not just on this
+        // stream's notional buffer.
+        //
+        // `avail` is `buffer_size - queued`, per stream. The device ring is a
+        // single shared resource, and this card really does get two PCM
+        // streams open at once (a live log shows `PCM_WRITEI_FRAMES` on fd=15
+        // and fd=16 from one process). So one stream's `avail` can promise
+        // room that the other stream's data is already occupying, `writei`
+        // answers EAGAIN, and alsa-lib — which was told there was space —
+        // asserts and aborts the daemon:
+        //
+        //     [alsa-hunt] pid=1031 ioctl PCM_WRITEI_FRAMES -> EAGAIN (11)
+        //     [exit] pid=1031 (pulseaudio) killed by signal SIGABRT (6)
+        //     [crash-bt] ... /usr/lib/libasound.so.2+0x323f3 ...
+        //
+        // Reporting the minimum of the two keeps poll() honest: a feeder is
+        // woken only when the write it is about to make can land. It cannot
+        // help a client that writes without polling, and it does not fix the
+        // underlying single-ring-for-two-streams design, but it removes the
+        // case where the kernel invites a write it is going to refuse.
+        let ring_free = self.audio.free_bytes() as u64 / BYTES_PER_FRAME;
+        let writable = avail.min(ring_free);
         Ok(PollStatus {
             read: false,
-            write: avail >= st.avail_min.max(st.period_size),
+            write: writable >= st.avail_min.max(st.period_size),
             error: false,
         })
     }
