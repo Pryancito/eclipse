@@ -827,6 +827,60 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
     tf.rip = timer_cb_fault_recover as *const () as usize;
     true
 }
+/// Say what a kernel `#UD` actually is, before the panic prints a register dump
+/// nobody can interpret.
+///
+/// rustc plants a bare `ud2` after every call to a `-> !` function as a safety
+/// net that should be unreachable. Landing on one therefore does not mean the
+/// CPU met a bad instruction — it means **a function that must never return
+/// did**, which on this kernel is either a stale coroutine resume (a `ret` onto
+/// the address a `call panic_fmt` left behind) or a corrupted return address.
+/// That is a completely different bug from decoding garbage as code, and the
+/// two were indistinguishable from the panic text:
+///
+///     CPU EXCEPTION on CPU0: Invalid Opcode (#UD) at RIP=0xffffff000001b62f
+///
+/// which turned out to be exactly that `ud2`, inside `handle_page_fault`, one
+/// instruction past its `call core::panicking::panic_fmt`.
+///
+/// Reads only mapped kernel `.text` (the faulting RIP is by definition in it),
+/// prints through the spin writer and allocates nothing.
+fn report_ud_shape(rip: u64) {
+    if rip < 0xffff_ff00_0001_0000 + 8 {
+        return;
+    }
+    let byte = |a: u64| -> u8 {
+        // SAFETY: within [rip - 8, rip + 2), inside mapped kernel .text.
+        unsafe { core::ptr::read_volatile(a as *const u8) }
+    };
+    if byte(rip) != 0x0f || byte(rip + 1) != 0x0b {
+        // Not a `ud2` at all: genuinely undecodable bytes, i.e. execution has
+        // wandered off into data.
+        crate::console::serial_write_fmt_spin(format_args!(
+            "[#UD] {} is not a `ud2` ({:#04x} {:#04x}) — execution left .text \
+             and is decoding data as code\n",
+            crate::ksyms::Addr(rip),
+            byte(rip),
+            byte(rip + 1),
+        ));
+        return;
+    }
+    if !preceded_by_call(rip) {
+        crate::console::serial_write_fmt_spin(format_args!(
+            "[#UD] {} is a compiler `ud2` not preceded by a CALL — reached by a \
+             jump or a corrupted branch, not by a returning callee\n",
+            crate::ksyms::Addr(rip),
+        ));
+        return;
+    }
+    crate::console::serial_write_fmt_spin(format_args!(
+        "[#UD] {} is the `ud2` rustc plants after a `-> !` call: the callee \
+         RETURNED. Not a bad instruction — either a stale coroutine resume (a \
+         `ret` onto the address that CALL pushed) or a corrupted return \
+         address. The function named above is where it was supposed to diverge.\n",
+        crate::ksyms::Addr(rip),
+    ));
+}
 
 #[no_mangle]
 pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
@@ -1047,12 +1101,15 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                 tf
             );
         }
-        TrapReason::UndefinedInstruction => panic!(
-            "\nCPU EXCEPTION on CPU{}: Invalid Opcode (#UD) at RIP={:#x}\n{:#x?}",
-            super::cpu::cpu_id(),
-            tf.rip,
-            tf
-        ),
+        TrapReason::UndefinedInstruction => {
+            report_ud_shape(tf.rip as u64);
+            panic!(
+                "\nCPU EXCEPTION on CPU{}: Invalid Opcode (#UD) at RIP={}\n{:#x?}",
+                super::cpu::cpu_id(),
+                crate::ksyms::Addr(tf.rip as u64),
+                tf
+            )
+        }
         TrapReason::UnalignedAccess => panic!(
             "\nCPU EXCEPTION on CPU{}: Alignment Check (#AC) at RIP={:#x}\n{:#x?}",
             super::cpu::cpu_id(),
