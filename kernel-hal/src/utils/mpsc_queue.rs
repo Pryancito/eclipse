@@ -5,7 +5,11 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 /// Scratch slot handed out when a queue's backing slice has been corrupted to
 /// zero length. Never read for anything meaningful — it exists so `entry_at`
 /// has something in-bounds to return on a path where panicking is fatal.
-static mut FALLBACK_SLOT: [u8; 64] = [0; 64];
+const FALLBACK_SLOT_LEN: usize = 64;
+const FALLBACK_SLOT_ALIGN: usize = 16;
+#[repr(C, align(16))]
+struct FallbackSlot([u8; FALLBACK_SLOT_LEN]);
+static mut FALLBACK_SLOT: FallbackSlot = FallbackSlot([0; FALLBACK_SLOT_LEN]);
 
 /// One line naming a queue whose `size` and backing-slice length disagree.
 /// Budgeted, allocation-free and lock-free: it runs on the IPI drain path with
@@ -57,6 +61,13 @@ unsafe impl<'a, T: Copy> Send for MpscQueue<'a, T> {}
 impl<'a, T: Copy> MpscQueue<'a, T> {
     pub fn new(queue: &'a mut [T]) -> Self {
         assert!(!queue.is_empty(), "MpscQueue needs a non-empty buffer");
+        // `entry_at` hands back `FALLBACK_SLOT` when the ring is found
+        // corrupted, so it must be able to hold a `T`.
+        assert!(
+            core::mem::size_of::<T>() <= FALLBACK_SLOT_LEN
+                && core::mem::align_of::<T>() <= FALLBACK_SLOT_ALIGN,
+            "MpscQueue entry does not fit the corruption fallback slot"
+        );
         Self {
             size: queue.len(),
             chead: AtomicUsize::new(0),
@@ -66,36 +77,41 @@ impl<'a, T: Copy> MpscQueue<'a, T> {
         }
     }
 
-    /// The slot `idx` maps to, wrapped by the **backing slice's own length**.
+    /// The slot `idx` maps to, or a scratch slot when the ring is no longer
+    /// trustworthy.
     ///
-    /// Not by `self.size`, though the two are equal by construction. This is
-    /// the TLB-shootdown drain path: `tlb_shootdown_ack_on` reaches it from
-    /// `TicketMutex::lock`'s spin pump, i.e. from inside every contended lock
-    /// acquire in the kernel, with that lock's interrupts already off. A panic
-    /// there can never be contained by `oops` — it is guaranteed to be holding
-    /// a lock — so it takes the machine down and buries whatever caused it.
+    /// This is the TLB-shootdown drain path: `tlb_shootdown_ack_on` reaches it
+    /// from `TicketMutex::lock`'s spin pump, i.e. from inside every contended
+    /// lock acquire in the kernel, with that lock's interrupts already off. A
+    /// panic there can never be contained by `oops` — it is guaranteed to be
+    /// holding a lock — so it takes the machine down and buries whatever
+    /// caused it. Hence no indexing that can panic, and no dereference of a
+    /// pointer the queue cannot vouch for.
     ///
-    /// And it did: `index out of bounds: the len is 1 but the index is 10`,
-    /// from `queue[idx % self.size]`, which can only mean `size` and the
-    /// slice's length disagree. Both are set once in `new` from the same
-    /// slice, so a disagreement is a wild write into the queue's own fat
-    /// pointer, not a logic error here. Wrapping by the length the slice
-    /// actually has keeps the corruption reportable instead of fatal: the
-    /// access stays in bounds (the constructor rejects an empty buffer), and
-    /// [`report_size_mismatch`] names it once on the way through.
+    /// `size` and the backing slice's length are both set once in `new` from
+    /// one slice, so a disagreement is never a logic error here: it means a
+    /// wild write has landed on the queue's own fat pointer. Both observed
+    /// values were kernel addresses —
+    ///
+    ///     len=0xffffff00218688e0 (a coroutine stack)  size=0xffffff00006567c1
+    ///
+    /// — so *neither* bound may be used. An earlier version wrapped by `len`,
+    /// which stops the panic but is worse than it: the slice claims that
+    /// length, so `queue[idx % len]` reads and writes wherever the corrupted
+    /// data pointer happens to aim. Hand back a scratch slot instead and say
+    /// so once: the drain then no-ops on a dead queue rather than spreading
+    /// the corruption it just detected.
     #[allow(clippy::mut_from_ref)]
     #[allow(unsafe_code)]
     pub fn entry_at(&self, idx: usize) -> &mut T {
         let queue = unsafe { &mut *self.queue.get() };
         let len = queue.len();
-        if len != self.size {
+        if len != self.size || idx % len.max(1) >= len {
             report_size_mismatch(len, self.size);
-            if len == 0 {
-                // Nothing sound to hand back; leak a slot rather than panic on
-                // a path that cannot survive one. `new` rejects an empty
-                // buffer, so reaching here at all means the pointer is gone.
-                return unsafe { &mut *(&raw mut FALLBACK_SLOT).cast::<T>() };
-            }
+            // SAFETY: `FALLBACK_SLOT` is a static byte array at least as large
+            // as any `T` this queue is instantiated with (asserted in `new`),
+            // and it is only ever reached on a queue already known corrupt.
+            return unsafe { &mut *(&raw mut FALLBACK_SLOT).cast::<T>() };
         }
         &mut queue[idx % len]
     }
