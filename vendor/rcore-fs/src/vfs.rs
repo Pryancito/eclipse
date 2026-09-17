@@ -343,6 +343,11 @@ pub enum FsError {
     /// "bad arguments" -- ALSA clients act on the difference (see
     /// `SndPcm::writei`).
     BadState,
+    /// E_PIPE (32): the stream broke under the caller -- an ALSA underrun or
+    /// overrun. Distinct from `Again`, which means "not right now, poll and
+    /// retry": clients recover from `E_PIPE` by re-preparing the stream, and
+    /// have nothing to do about an `Again` that will never clear.
+    Broken,
 }
 
 impl fmt::Display for FsError {
