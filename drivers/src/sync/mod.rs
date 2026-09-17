@@ -9,5 +9,6 @@
 //! counter; mixing a second copy would desync IRQ state.
 
 pub use lock::{
-    Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard,
+    HeldByCurrentCpu, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockUpgradableGuard,
+    RwLockWriteGuard,
 };

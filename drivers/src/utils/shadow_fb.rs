@@ -24,7 +24,7 @@
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use lock::Mutex;
+use lock::{HeldByCurrentCpu, Mutex};
 
 use crate::scheme::DisplayScheme;
 
@@ -223,7 +223,9 @@ impl ShadowFramebuffer {
             return;
         };
         let snap = {
-            let mut g = self.lock_inner()?;
+            let Some(mut g) = self.lock_inner() else {
+                return;
+            };
             self.take_dirty(&mut g)
         };
         let Some(((x, y, w, h), pixels)) = snap else {

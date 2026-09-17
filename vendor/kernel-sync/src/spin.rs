@@ -185,8 +185,12 @@ impl<T: ?Sized> SpinMutex<T> {
     /// common case); the cpu id is read only when someone actually holds it,
     /// and on x86_64 that is the same GS-relative read `push_off` already does
     /// on every acquire.
+    ///
+    /// Not public: callers go through [`crate::HeldByCurrentCpu`], which is
+    /// implemented on every target so a re-entrancy guard reads the same on
+    /// bare metal and on a hosted test build.
     #[inline]
-    pub fn held_by_current_cpu(&self) -> bool {
+    pub(crate) fn holder_is_current_cpu(&self) -> bool {
         if self.holder_file.load(Ordering::Acquire) == 0 {
             return false;
         }

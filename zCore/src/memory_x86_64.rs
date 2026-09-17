@@ -14,6 +14,7 @@ use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use kernel_hal::sync::Mutex;
 use kernel_hal::PhysAddr;
+use lock::HeldByCurrentCpu;
 
 static TOTAL_MEMORY: AtomicUsize = AtomicUsize::new(0);
 static HEAP_USED: AtomicUsize = AtomicUsize::new(0);
