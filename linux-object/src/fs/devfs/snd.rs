@@ -1054,8 +1054,28 @@ impl PcmDev {
     fn writei(&self, xfer: &mut SndXferI, flags: OpenFlags) -> Result<()> {
         {
             let st = self.st.lock();
-            if st.state != STATE_PREPARED && st.state != STATE_RUNNING {
-                return Err(FsError::InvalidParam);
+            // Linux (`__snd_pcm_lib_xfer`) accepts PREPARED, RUNNING *and*
+            // PAUSED, and answers every other state with EBADFD -- never
+            // EINVAL. Both halves of that matter to a client:
+            //
+            //  * PAUSED was rejected here, so a client that pauses and keeps
+            //    filling the buffer (what PulseAudio's ALSA sink does while a
+            //    stream is corked) got an error where Linux takes the data.
+            //  * EINVAL means "bad arguments" and alsa-lib treats it as a
+            //    caller bug rather than a stream-state problem, which is how a
+            //    plain state mismatch reached PulseAudio as a fatal error:
+            //      [einval-hunt] pid=1028 syscall=16 (IOCTL) a1=0x40184150 -> EINVAL
+            //    (0x40184150 = _IOW('A', 0x50, 24) = WRITEI_FRAMES), and then
+            //    an abort inside libasound.
+            if st.state != STATE_PREPARED && st.state != STATE_RUNNING && st.state != STATE_PAUSED {
+                // Name the state: the errno alone cannot say whether the
+                // stream was never prepared (SETUP), already torn down (OPEN)
+                // or something else.
+                warn!(
+                    "[snd] pcmC{}D0p: writei in state {} (need prepared/running/paused) -> EBADFD",
+                    self.card, st.state
+                );
+                return Err(FsError::BadState);
             }
         }
         let total_bytes = (xfer.frames * BYTES_PER_FRAME) as usize;
@@ -2192,6 +2212,44 @@ mod timer_tests {
             assert_eq!(st.state, STATE_RUNNING);
             assert_eq!(st.appl_ptr, 4);
             assert_eq!(pcm.queued_frames(), 4);
+        }
+
+        #[test]
+        fn nonblocking_write_is_accepted_while_paused() {
+            // Linux's `__snd_pcm_lib_xfer` takes PAUSED alongside PREPARED and
+            // RUNNING: a corked PulseAudio sink keeps filling the buffer.
+            let audio = Arc::new(FakeAudio::new(4 * BYTES_PER_FRAME as usize));
+            let pcm = PcmDev::new(audio, 0);
+            pcm.st.lock().state = STATE_PAUSED;
+            let samples = [0u8; 2 * BYTES_PER_FRAME as usize];
+            let mut xfer = SndXferI {
+                result: 0,
+                buf: samples.as_ptr() as usize as u64,
+                frames: 2,
+            };
+            pcm.writei(&mut xfer, OpenFlags::NON_BLOCK).unwrap();
+            assert_eq!(xfer.result, 2);
+        }
+
+        #[test]
+        fn write_in_an_unusable_state_is_ebadfd_not_einval() {
+            // EINVAL means "bad arguments"; alsa-lib treats it as a caller bug
+            // and PulseAudio aborts. A state mismatch is EBADFD in Linux.
+            for state in [STATE_OPEN, STATE_SETUP] {
+                let audio = Arc::new(FakeAudio::new(4 * BYTES_PER_FRAME as usize));
+                let pcm = PcmDev::new(audio, 0);
+                pcm.st.lock().state = state;
+                let samples = [0u8; BYTES_PER_FRAME as usize];
+                let mut xfer = SndXferI {
+                    result: 0,
+                    buf: samples.as_ptr() as usize as u64,
+                    frames: 1,
+                };
+                assert!(matches!(
+                    pcm.writei(&mut xfer, OpenFlags::NON_BLOCK),
+                    Err(FsError::BadState)
+                ));
+            }
         }
 
         #[test]
