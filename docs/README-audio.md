@@ -135,13 +135,15 @@ cannot loop the last fragment. `module-suspend-on-idle` is deliberately NOT
 loaded: a suspended sink was not being resumed when a new stream attached
 (the resume runs in the sink IO thread), so every later play went silent.
 The sink stays IDLE with the PCM open instead.
-- `mpg123` defaults to `-o alsa` through the `/usr/local/bin/mpg123` wrapper.
-  mpg123 1.3x has no config file, so without it libout123 walks its built-in
-  driver list and takes the first module that loads AND opens -- and the OSS
-  one (`/dev/dsp`, the unmixed HDA ring) is in that list, which plays silent
-  while the daemon holds the PCM. The last `-o` wins, so an explicit
-  `-o pulse` / `-o oss` still decides; `MPG123_DEFAULT_OUTPUT` moves the
-  default. `audio-probe` checks all of this in its `[daemon]` section.
+- A bare `mpg123 file.mp3` reaches the daemon because `/dev/dsp` refuses it.
+  mpg123 1.3x has no config file at all, so with no `-o` libout123 walks its
+  built-in driver list and takes the first module that both loads AND opens --
+  and the OSS one is in that list. `/dev/dsp` shares the native PCM's
+  single-client claim, so while PulseAudio holds `hw:0,0` the OSS open returns
+  `EBUSY` and libout123 moves on to its ALSA module, `/etc/asound.conf`, the
+  pulse plugin and the daemon. (Before that claim existed, OSS won the list,
+  put a second writer into Pulse's ring and played silent.) `audio-probe`
+  checks it in `[daemon]`, and `[oss]` skips while the daemon has the card.
 - OpenAL (`ALSOFT_DRIVERS=pulse,alsa`) talks native libpulse. PI-futexes are
   implemented, so `pa_mutex_new()` no longer aborts.
 
@@ -258,6 +260,16 @@ the rest. `write(2)` carries interleaved S16LE PCM; supported ioctls:
 default format is 48 kHz stereo, so `cat music.raw > /dev/dsp` works for
 raw 48 kHz S16LE audio.
 
+`/dev/dsp<N>` and `/dev/snd/pcmC<N>D0p` are two front ends onto the SAME
+hardware ring, and the ring has no mixer, so they share one single-client
+claim: whichever opens second gets `EBUSY`, as on Linux (one substream behind
+both nodes). With PulseAudio running — it keeps `hw:0,0` open, since
+`module-suspend-on-idle` is not loaded — every OSS client therefore gets
+`EBUSY` and should play through the daemon instead (`mpg123 file.mp3`,
+`paplay`). Stop `pulseaudio` to use `/dev/dsp` or `wavplay` directly. Two
+writers on one ring is the failure this refusal prevents: the second one
+interleaves into the first one's frames and both come out wrong or silent.
+
 ## Testing
 
 ```sh
@@ -295,8 +307,9 @@ so you can hear the guest. Override with `AUDIODEV=wav` (PCM to
 
 - Playback only (no capture), stereo only, S16LE only at the kernel PCM.
   PulseAudio resamples other formats in userspace.
-- Several clients can play at once through PulseAudio. Direct `hw:0,0` /
-  `/dev/dsp` is still single-client (no dmix).
+- Several clients can play at once through PulseAudio. Direct `hw:0,0` and
+  `/dev/dsp` are single-client (no dmix) and share ONE claim between them, so
+  while the daemon holds the card both answer `EBUSY`.
 - Volume is software PCM scaling (no analog AMP programming); already-queued
   ring contents are not retroactively gained — the new level applies to the
   next `write`. Pulse sink volume applies to mixed output.

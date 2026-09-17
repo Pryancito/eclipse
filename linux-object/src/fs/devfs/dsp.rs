@@ -15,10 +15,13 @@
 
 use alloc::sync::Arc;
 use core::any::Any;
+use core::sync::atomic::Ordering;
 
 use kernel_hal::drivers::scheme::AudioScheme;
 use rcore_fs::vfs::*;
 use rcore_fs_devfs::DevFS;
+
+use super::snd::{new_audio_claim, AudioClaim};
 
 // OSS ioctl numbers (Linux _IOC encoding of <sys/soundcard.h>).
 const SNDCTL_DSP_RESET: u32 = 0x0000_5000; // _IO('P', 0)
@@ -77,15 +80,58 @@ pub struct DspDev {
     audio: Arc<dyn AudioScheme>,
     index: usize,
     inode_id: usize,
+    /// Shared with `/dev/snd/pcmC<index>D0p`: one writer per device ring.
+    opened: AudioClaim,
+    /// Set on the per-open handle [`open_client`](DspDev::open_client) hands
+    /// out; the registry node that [`new`](DspDev::new) built owns nothing.
+    release_opened_on_drop: bool,
 }
 
 impl DspDev {
+    /// An OSS node with a claim of its own — exclusive against other opens of
+    /// itself only. `/dev/dsp` proper is built with [`DspDev::with_claim`] so
+    /// it is also exclusive against the native PCM on the same card.
     pub fn new(audio: Arc<dyn AudioScheme>, index: usize) -> Self {
+        Self::with_claim(audio, index, new_audio_claim())
+    }
+
+    /// An OSS node sharing `opened` with the other front ends onto the same
+    /// device (see [`AudioClaim`]).
+    pub fn with_claim(audio: Arc<dyn AudioScheme>, index: usize, opened: AudioClaim) -> Self {
         DspDev {
             audio,
             index,
             inode_id: DevFS::new_inode_id(),
+            opened,
+            release_opened_on_drop: false,
         }
+    }
+
+    /// `open(2)` on `/dev/dsp<N>`: take the device or fail with `EBUSY`.
+    ///
+    /// The OSS node and the native PCM are two front ends onto ONE hardware
+    /// ring with no mixing, so the second one has to be refused — Linux
+    /// refuses it too. The refusal is also what fixes a bare `mpg123
+    /// file.mp3`: libout123 walks its built-in driver list and takes the
+    /// first module that loads AND opens, so an `EBUSY` here sends it on to
+    /// the ALSA module, `/etc/asound.conf`, the pulse plugin and a daemon
+    /// that mixes. Answering the open instead put a second writer into
+    /// PulseAudio's ring, and OSS playback came out silent.
+    pub fn open_client(&self) -> Result<Arc<dyn INode>> {
+        if self
+            .opened
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(FsError::Busy);
+        }
+        Ok(Arc::new(DspDev {
+            audio: self.audio.clone(),
+            index: self.index,
+            inode_id: self.inode_id,
+            opened: self.opened.clone(),
+            release_opened_on_drop: true,
+        }))
     }
 
     /// Seconds it takes the device to drain `bytes` at the current format,
@@ -94,6 +140,20 @@ impl DspDev {
         let (rate, channels) = self.audio.params();
         let bps = (rate as u64) * (channels as u64) * 2;
         (bytes as u64).div_ceil(bps.max(1)) + 1
+    }
+}
+
+impl Drop for DspDev {
+    fn drop(&mut self) {
+        if !self.release_opened_on_drop {
+            return;
+        }
+        // Close does NOT reset the stream: OSS `close(2)` drains by default
+        // (`SNDCTL_DSP_SYNC` is the explicit form) and the ring plays out on
+        // its own at the PCM byte rate. Dropping it here would cut the tail
+        // off a `cat music.raw > /dev/dsp`. Releasing the claim is enough —
+        // the next opener, PCM or OSS, resets on PREPARE / SETFMT anyway.
+        self.opened.store(false, Ordering::Release);
     }
 }
 
