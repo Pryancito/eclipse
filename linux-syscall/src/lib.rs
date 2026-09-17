@@ -779,6 +779,17 @@ impl Syscall<'_> {
 /// Decode an ALSA ioctl command into a readable name, or `None` when it is not
 /// one. `_IO*('A'|'U'|'T', nr, ...)`: PCM, control and timer respectively.
 fn alsa_ioctl_name(cmd: u32) -> Option<&'static str> {
+    // Require a real `_IOC` encoding first. The TTY family uses flat legacy
+    // numbers (TCGETS 0x5401 .. TIOCGWINSZ 0x5413) whose second byte is also
+    // 0x54 = b'T', so a plain type match reads every `isatty()` probe on a
+    // non-tty fd as an ALSA timer call and reports its (entirely normal)
+    // ENOTTY. That flooded the boot console. A real ALSA ioctl always carries
+    // a direction and a payload size; the legacy TTY numbers carry neither.
+    let dir = (cmd >> 30) & 3;
+    let size = (cmd >> 16) & 0x3fff;
+    if dir == 0 || size == 0 {
+        return None;
+    }
     let ty = ((cmd >> 8) & 0xff) as u8;
     let nr = (cmd & 0xff) as u8;
     Some(match (ty, nr) {
@@ -835,6 +846,10 @@ fn alsa_hunt(pid: KoID, num: u32, args: &[usize; 6], err: LxError) {
         return;
     };
     if name == "PCM_HW_REFINE" && matches!(err, LxError::EINVAL) {
+        return;
+    }
+    // ENOTTY is "this fd is not that kind of device" -- a probe, not a fault.
+    if matches!(err, LxError::ENOTTY) {
         return;
     }
     if BUDGET.fetch_add(1, Ordering::Relaxed) < 64 {
