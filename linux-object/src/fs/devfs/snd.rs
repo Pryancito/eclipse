@@ -442,17 +442,47 @@ struct PcmState {
     stalled_since: Option<core::time::Duration>,
 }
 
+/// The single-client claim on one audio device, shared by every front end
+/// onto it: the native ALSA PCM at `/dev/snd/pcmC<card>D0p` and the OSS node
+/// at `/dev/dsp<card>`. Both drive the SAME hardware ring, and the ring has
+/// no mixer — two writers interleave into each other's frames, which is why a
+/// second front end has to be refused rather than served. Linux does the same
+/// thing with one substream behind both its ALSA and OSS-emulation nodes: the
+/// second opener gets `EBUSY`.
+///
+/// That refusal is what makes clients recover on their own. `mpg123` with no
+/// `-o` walks libout123's built-in driver list and takes the first module
+/// that both loads AND opens, OSS included; an `EBUSY` from `/dev/dsp` moves
+/// it on to the next one (ALSA -> the pulse plugin -> the daemon that DOES
+/// mix). Answering the open and then playing into a ring PulseAudio owns is
+/// what made a bare `mpg123 file.mp3` silent.
+pub type AudioClaim = Arc<AtomicBool>;
+
+/// An unheld claim, for one audio device.
+pub fn new_audio_claim() -> AudioClaim {
+    Arc::new(AtomicBool::new(false))
+}
+
 pub struct PcmDev {
     audio: Arc<dyn AudioScheme>,
     card: usize,
     inode_id: usize,
     st: Arc<Mutex<PcmState>>,
-    opened: Arc<AtomicBool>,
+    opened: AudioClaim,
     release_opened_on_drop: bool,
 }
 
 impl PcmDev {
+    /// A PCM node with a claim of its own: exclusive against other opens of
+    /// itself, but not against `/dev/dsp<card>`. Tests and any single-front-end
+    /// setup use this; `/dev/snd` proper is built with [`PcmDev::with_claim`].
     pub fn new(audio: Arc<dyn AudioScheme>, card: usize) -> Self {
+        Self::with_claim(audio, card, new_audio_claim())
+    }
+
+    /// A PCM node sharing `opened` with the other front ends onto the same
+    /// device (see [`AudioClaim`]).
+    pub fn with_claim(audio: Arc<dyn AudioScheme>, card: usize, opened: AudioClaim) -> Self {
         PcmDev {
             audio,
             card,
@@ -467,14 +497,15 @@ impl PcmDev {
                 avail_min: 1024,
                 stalled_since: None,
             })),
-            opened: Arc::new(AtomicBool::new(false)),
+            opened,
             release_opened_on_drop: false,
         }
     }
 
     /// `hw:card,0` is a single-client PCM: the one process that owns it keeps
     /// the shared runtime state and timer view until close, and everyone else
-    /// gets `EBUSY` as on Linux.
+    /// gets `EBUSY` as on Linux — `/dev/dsp<card>`, which shares the claim,
+    /// included.
     pub fn open_client(&self) -> Result<Arc<dyn INode>> {
         if self
             .opened
@@ -2271,6 +2302,7 @@ mod timer_tests {
     #[cfg(test)]
     mod pcm_tests {
         use super::*;
+        use crate::fs::devfs::DspDev;
         use zcore_drivers::DeviceResult;
 
         struct FakeAudio {
@@ -2483,6 +2515,47 @@ mod timer_tests {
             assert!(matches!(pcm.open_client(), Err(FsError::Busy)));
             drop(first);
             assert!(pcm.open_client().is_ok());
+        }
+
+        /// `/dev/dsp<N>` and `/dev/snd/pcmC<N>D0p` are two front ends onto one
+        /// unmixed ring, so whichever opens second must get `EBUSY` — in both
+        /// directions. That refusal is what sends a bare `mpg123 file.mp3`
+        /// from libout123's OSS module on to its ALSA one (and the daemon that
+        /// mixes) instead of putting a second writer into PulseAudio's ring.
+        #[test]
+        fn the_oss_node_and_the_pcm_are_exclusive_against_each_other() {
+            let audio = Arc::new(FakeAudio::new(4 * BYTES_PER_FRAME as usize));
+            let claim = new_audio_claim();
+            let pcm = Arc::new(PcmDev::with_claim(audio.clone(), 0, claim.clone()));
+            let dsp = Arc::new(DspDev::with_claim(audio, 0, claim));
+
+            let pcm_client = pcm.open_client().unwrap();
+            assert!(
+                matches!(dsp.open_client(), Err(FsError::Busy)),
+                "/dev/dsp must be EBUSY while the native PCM is open"
+            );
+            drop(pcm_client);
+
+            let dsp_client = dsp.open_client().unwrap();
+            assert!(
+                matches!(pcm.open_client(), Err(FsError::Busy)),
+                "the native PCM must be EBUSY while /dev/dsp is open"
+            );
+            drop(dsp_client);
+
+            assert!(pcm.open_client().is_ok(), "closing /dev/dsp frees the card");
+        }
+
+        /// A node built with its own claim (no sharing) stays exclusive
+        /// against itself: two `cat > /dev/dsp` at once still interleave.
+        #[test]
+        fn oss_open_is_exclusive_until_the_client_drops() {
+            let audio = Arc::new(FakeAudio::new(4 * BYTES_PER_FRAME as usize));
+            let dsp = Arc::new(DspDev::new(audio, 0));
+            let first = dsp.open_client().unwrap();
+            assert!(matches!(dsp.open_client(), Err(FsError::Busy)));
+            drop(first);
+            assert!(dsp.open_client().is_ok());
         }
 
         #[test]

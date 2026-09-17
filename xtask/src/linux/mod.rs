@@ -2979,10 +2979,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               fi\n\
               if command -v mpg123 >/dev/null 2>&1; then\n\
               \x20 if [ -S /run/pulse/native ]; then\n\
-              \x20\x20 # Both invocations name their modules: /usr/local/bin/mpg123\n\
-              \x20\x20 # defaults to -o alsa and the LAST -o wins, so a bare\n\
-              \x20\x20 # `mpg123` here would retry the same module. The fallback\n\
-              \x20\x20 # spells out libout123's driver list instead.\n\
+              \x20\x20 # Both invocations name their modules. With no -o at all,\n\
+              \x20\x20 # libout123 walks its built-in list and takes the first\n\
+              \x20\x20 # driver that opens, which is not necessarily this one.\n\
               \x20\x20 mpg123 -q -o alsa --encoding s16 --no-gapless \"$MP3\" \\\n\
               \x20\x20\x20 || mpg123 -q -o pulse,alsa,oss --encoding s16 --no-gapless \"$MP3\"\n\
               \x20\x20 pactl drain 2>/dev/null || true\n\
@@ -3273,39 +3272,6 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               kill -TERM 1\n",
         )
         .unwrap();
-        // mpg123 with an explicit default output module. mpg123 1.3x has NO
-        // config file (the binary carries no rcfile option and no
-        // mpg123.conf path), so the default output module can only be set on
-        // the command line. With none, libout123 walks its built-in driver
-        // list and takes the first module that both LOADS and OPENS -- and
-        // this rootfs ships output_oss.so, so a bare `mpg123 x.mp3` can land
-        // on /dev/dsp. The OSS shim writes straight into the shared HDA ring
-        // with no mixing and no daemon, so it plays silent whenever
-        // PulseAudio holds the PCM (i.e. always: no module-suspend-on-idle is
-        // loaded). `mpg123 -o alsa` is the path that works -- ALSA `default`
-        // is the pulse plugin -- so that is the default here.
-        fs::write(
-            localbin.join("mpg123"),
-            b"#!/bin/sh\n\
-              # Default mpg123 to ALSA, which /etc/asound.conf routes through\n\
-              # PulseAudio. Without it libout123 picks the first driver of its\n\
-              # built-in list that opens, which can be OSS (/dev/dsp): the raw\n\
-              # HDA ring, no mixing, silent while the daemon holds the PCM.\n\
-              #\n\
-              # mpg123 lets the LAST -o win, so an explicit -o/--output\n\
-              # anywhere on the command line (a cluster like -qo pulse\n\
-              # included) still decides. MPG123_DEFAULT_OUTPUT moves the\n\
-              # default (e.g. `oss`, or `pulse,alsa` once output_pulse.so is\n\
-              # installed) without editing this file.\n\
-              real=/usr/bin/mpg123\n\
-              [ -x \"$real\" ] || real=/usr/bin/mpg123.bin\n\
-              if [ ! -x \"$real\" ]; then\n\
-              \x20 echo 'mpg123: not installed (apk add mpg123)' >&2\n\
-              \x20 exit 127\n\
-              fi\n\
-              exec \"$real\" -o \"${MPG123_DEFAULT_OUTPUT:-alsa}\" \"$@\"\n",
-        )
-        .unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             for w in [
@@ -3320,7 +3286,6 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                 "reboot",
                 "poweroff",
                 "halt",
-                "mpg123",
             ] {
                 let _ = fs::set_permissions(localbin.join(w), fs::Permissions::from_mode(0o755));
             }

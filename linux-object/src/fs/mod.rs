@@ -852,6 +852,15 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         );
     }
 
+    // One single-client claim per audio device, shared below by BOTH front
+    // ends onto it: `/dev/dsp<N>` and `/dev/snd/pcmC<N>D0p`. They drive the
+    // same unmixed hardware ring, so the second opener must get EBUSY (as on
+    // Linux, where one substream sits behind both nodes).
+    let audio_claims: Vec<devfs::AudioClaim> = audio_cards
+        .iter()
+        .map(|_| devfs::new_audio_claim())
+        .collect();
+
     // Add OSS PCM playback nodes: `/dev/dsp` for card 0, `/dev/dsp1`, … for
     // the rest (typically remaining analog or extra HDMI functions).
     {
@@ -863,7 +872,8 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                 format!("dsp{}", idx)
             };
             info!("/dev/{} -> audio device '{}'", fname, audio.name());
-            if let Err(e) = devfs_root.add(&fname, Arc::new(DspDev::new(audio.clone(), idx))) {
+            let dsp = DspDev::with_claim(audio.clone(), idx, audio_claims[idx].clone());
+            if let Err(e) = devfs_root.add(&fname, Arc::new(dsp)) {
                 warn!("failed to mknod /dev/{}: {:?}", fname, e);
             }
         }
@@ -893,7 +903,11 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                         {
                             warn!("failed to mknod /dev/snd/{}: {:?}", ctl, e);
                         }
-                        let pcm_dev = Arc::new(PcmDev::new(audio.clone(), card));
+                        let pcm_dev = Arc::new(PcmDev::with_claim(
+                            audio.clone(),
+                            card,
+                            audio_claims[card].clone(),
+                        ));
                         pcms.push(pcm_dev.clone());
                         if let Err(e) = snd_dir.add(&pcm, pcm_dev) {
                             warn!("failed to mknod /dev/snd/{}: {:?}", pcm, e);

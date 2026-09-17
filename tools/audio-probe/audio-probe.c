@@ -382,61 +382,37 @@ static void list_mpg123_modules(const char *dir) {
   else info("mpg123 output modules in %s: %s", dir, line);
 }
 
-// A bare `mpg123 x.mp3` must not land on OSS. mpg123 1.3x has no config file
-// at all (the binary carries no rcfile option and no mpg123.conf path), so
-// with no -o on the command line libout123 walks its built-in driver list and
-// takes the first module that both LOADS and OPENS -- and this rootfs ships
-// output_oss.so, so /dev/dsp is a candidate: the raw HDA ring, no mixing and
-// no daemon, which plays silent while PulseAudio holds the PCM. The image
-// pins the default with a /usr/local/bin/mpg123 wrapper (xtask linux/mod.rs)
-// that prepends `-o alsa`; mpg123 lets the last -o win, so an explicit one
-// still decides. Check that the wrapper exists, that PATH resolves to it, and
-// that the module it names is the ALSA (-> pulse plugin) one.
-static void check_mpg123_default(void) {
-  static const char *const wrapper = "/usr/local/bin/mpg123";
-  if (access("/usr/bin/mpg123", X_OK) && access(wrapper, X_OK)) {
-    info("no mpg123 installed -- skipping the default output module check");
+// A bare `mpg123 x.mp3` must not land on the unmixed ring.
+//
+// mpg123 1.3x has no config file at all (the binary carries no rcfile option
+// and no mpg123.conf path), so with no `-o` on the command line libout123
+// walks its built-in driver list and takes the first module that both LOADS
+// and OPENS -- and the OSS one is in that list. What settles it is the
+// kernel: /dev/dsp shares the native PCM's single-client claim (dsp.rs
+// `open_client`), so while PulseAudio holds hw:0,0 the OSS open fails with
+// EBUSY and libout123 moves on to its ALSA module, /etc/asound.conf, the
+// pulse plugin and the daemon that actually mixes. Answering that open is
+// what made a bare mpg123 silent: a second writer in PulseAudio's ring.
+static void check_oss_yields_to_the_daemon(void) {
+  char dsp[64];
+  if (g_card == 0) snprintf(dsp, sizeof dsp, "/dev/dsp");
+  else snprintf(dsp, sizeof dsp, "/dev/dsp%d", g_card);
+  if (!node_present(dsp, S_IFCHR)) {
+    info("no %s node -- libout123's OSS module has nothing to open here", dsp);
     return;
   }
-  int err = access(wrapper, X_OK) ? errno : 0;
-  check(err == 0, "/usr/local/bin/mpg123 wrapper installed",
-        "without it a bare `mpg123` takes libout123's first working driver, which can be OSS", err);
-
-  // What PATH actually resolves -- the wrapper only wins if it comes first.
-  const char *path = getenv("PATH");
-  char first[256] = "";
-  for (const char *p = path ? path : ""; *p;) {
-    const char *sep = strchr(p, ':');
-    size_t n = sep ? (size_t)(sep - p) : strlen(p);
-    char cand[256];
-    if (n && n + sizeof "/mpg123" <= sizeof cand) {
-      snprintf(cand, sizeof cand, "%.*s/mpg123", (int)n, p);
-      if (access(cand, X_OK) == 0) {
-        snprintf(first, sizeof first, "%s", cand);
-        break;
-      }
-    }
-    if (!sep) break;
-    p = sep + 1;
+  if (find_process("pulseaudio") <= 0) {
+    skip("/dev/dsp yields to the daemon", "no pulseaudio process holds the PCM");
+    return;
   }
-  if (first[0]) info("PATH resolves mpg123 to %s", first);
-  check(!strcmp(first, wrapper), "a bare `mpg123` runs the wrapper",
-        "PATH must put /usr/local/bin before /usr/bin (/etc/profile, eclipse-init)", 0);
-
-  // The module the wrapper names, as written. OSS is only acceptable behind
-  // ALSA in the list (`-o alsa,oss`), never as the first choice.
-  FILE *f = fopen(wrapper, "r");
-  if (!f) return;
-  char line[512];
-  int alsa_first = 0;
-  while (fgets(line, sizeof line, f)) {
-    if (line[0] == '#' || !strstr(line, "-o ")) continue;
-    const char *a = strstr(line, "alsa"), *o = strstr(line, "oss");
-    if (a && (!o || a < o)) alsa_first = 1;
+  int fd = open(dsp, O_WRONLY);
+  int err = fd < 0 ? errno : 0;
+  check(fd < 0 && err == EBUSY, "/dev/dsp is EBUSY while PulseAudio holds the PCM",
+        "one writer per unmixed ring; the EBUSY is what sends a bare mpg123 from OSS to ALSA -> pulse", err);
+  if (fd >= 0) {
+    info("=> a bare `mpg123` can open the ring behind the daemon: its OSS module wins the driver list and plays silent");
+    close(fd);
   }
-  fclose(f);
-  check(alsa_first, "the wrapper defaults to the ALSA output module",
-        "ALSA `default` is the pulse plugin; OSS writes the unmixed ring and plays silent under the daemon", 0);
 }
 
 // pid of a process whose /proc/<pid>/comm is `name`, or -1.
@@ -668,8 +644,33 @@ static void test_oss(void) {
   }
 
   int fd = open(dsp, O_WRONLY);
+  if (fd < 0 && pcm_held_by_daemon(errno)) {
+    // /dev/dsp and /dev/snd/pcmC<card>D0p are two front ends onto ONE unmixed
+    // ring, so the kernel refuses the second opener. An EBUSY here while
+    // PulseAudio holds the PCM is the kernel being right -- and it is what
+    // makes a bare `mpg123` (OSS is in libout123's driver list) fall through
+    // to the ALSA module and the daemon. Everything below needs the device.
+    skip("open(O_WRONLY)", "PulseAudio holds the card (OSS shares the PCM's single-client claim)");
+    info("play through the daemon instead: mpg123 file.mp3, or `-o oss` with pulseaudio stopped");
+    return;
+  }
   check(fd >= 0, "open(O_WRONLY)", "mpg123 -o oss, sox -t oss", errno);
   if (fd < 0) return;
+
+  // The claim is shared in BOTH directions: while this fd owns the OSS node,
+  // the native PCM must answer EBUSY. Only meaningful here, where the open
+  // above succeeded (so nothing else holds the card).
+  {
+    char pcm[64];
+    snprintf(pcm, sizeof pcm, "/dev/snd/pcmC%dD0p", g_card);
+    if (node_present(pcm, S_IFCHR)) {
+      int p = open(pcm, O_WRONLY | O_NONBLOCK);
+      int err = p < 0 ? errno : 0;
+      check(p < 0 && err == EBUSY, "the native PCM is EBUSY while /dev/dsp is open",
+            "one writer per ring: the OSS node and hw:0,0 share one single-client claim", err);
+      if (p >= 0) close(p);
+    }
+  }
 
   int fmt = AFMT_S16_LE;
   CHECK_CALL(ioctl(fd, SNDCTL_DSP_SETFMT, &fmt) == 0 && fmt == AFMT_S16_LE,
@@ -1477,7 +1478,7 @@ static void test_daemon(void) {
   // here. "Failed to open module pulse" in that log is this directory (or a
   // library the module links, libpulse-simple) -- not the server.
   list_mpg123_modules("/usr/lib/mpg123");
-  check_mpg123_default();
+  check_oss_yields_to_the_daemon();
 }
 
 // ── AF_UNIX connect() semantics ────────────────────────────────────────────
@@ -2552,8 +2553,8 @@ int main(int argc, char **argv) {
   // A section that skipped because the daemon holds hw:0,0 tested nothing —
   // saying "works" there would be a louder lie than saying "BROKEN".
   if (g_pcm_held_by_daemon)
-    printf("  raw ALSA hw:%d: NOT EXERCISED -- PulseAudio holds the PCM (exclusive, as on Linux); stop it to test hw:%d directly\n",
-           g_card, g_card);
+    printf("  raw ALSA hw:%d and /dev/dsp: NOT EXERCISED -- PulseAudio holds the PCM, and both front ends share one claim (as on Linux); stop it to drive them directly\n",
+           g_card);
   else
     printf("  raw ALSA hw:%d: %s (what this probe drove directly)\n", g_card,
            g_alsa_pcm_ok ? "works" : "BROKEN above");
