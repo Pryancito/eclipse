@@ -3406,15 +3406,35 @@ pub fn set_poll_instance(dev: Option<Arc<XhciUsbHid>>) {
 }
 
 /// Respaldo periódico: drena transferencias HID sin depender de MSI (alineado al driver de referencia).
+///
+/// Never blocks on a lock. This is a *backup* drain for lost IRQs — MSI is the
+/// real delivery path and the next tick is at most a millisecond away — so a
+/// skipped poll costs nothing, while waiting for a contended lock closed a
+/// genuine AB-BA cycle against the graphic console:
+///
+///     cpu=3 at drivers/src/usb/xhci_hid.rs:3417      <- holds the shadow fb,
+///     cpu=2 at drivers/src/utils/shadow_fb.rs:113       wants the xHCI lock
+///     HOLDER cpu=3 at :113
+///
+/// The console reaches the input subsystem while holding the framebuffer lock
+/// (io-wait ticks poll HID); the HID path draws the cursor, which takes the
+/// framebuffer lock. Two orders, one cycle. `try_lock` here breaks it at the
+/// only point where blocking buys nothing at all.
 pub fn poll() {
-    let instances = POLL_INSTANCES.lock().clone();
+    let Some(instances) = POLL_INSTANCES.try_lock().map(|g| g.clone()) else {
+        return;
+    };
     for d in instances {
         // Fast path per controller: once we have latched this specific
         // controller as dead, skip its locks/MMIO forever.
         if d.halted.load(Ordering::Relaxed) {
             continue;
         }
-        let mut g = d.inner.lock();
+        let Some(mut g) = d.inner.try_lock() else {
+            // Busy: an MSI handler or another poll is already draining this
+            // controller, or a peer holds it while wanting a lock we hold.
+            continue;
+        };
         if let Some(xi) = &mut *g {
             if xi.boot_enum_pending {
                 xi.boot_enum_pending = false;
