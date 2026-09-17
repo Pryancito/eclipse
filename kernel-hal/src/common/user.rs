@@ -219,6 +219,14 @@ impl<T, P: Policy> UserPtr<T, P> {
             && (self.0 as usize).is_multiple_of(core::mem::align_of::<T>())
             && in_user_half(self.0 as usize, bytes)
         {
+            // Being in the user half says nothing about anything being mapped
+            // there, and this pointer is about to be dereferenced with no fault
+            // fixup behind it. Ask the address space. See
+            // `KernelHandler::check_user_range` for why an unmapped range here
+            // used to kill the machine rather than return EFAULT.
+            if !crate::KHANDLER.check_user_range(self.0 as usize, bytes) {
+                return Err(Error::InvalidPointer);
+            }
             Ok(())
         } else {
             Err(Error::InvalidPointer)
