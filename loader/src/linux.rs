@@ -726,6 +726,76 @@ fn handle_signal(
     ctx
 }
 
+/// The part of a user-fault report that does not depend on the fault kind:
+/// registers, the faulting instruction's bytes and a user-stack backtrace.
+/// Shared by the page-fault (SIGSEGV) and CPU-exception (#GP, #DE, ...)
+/// paths so a `movaps` on a misaligned stack or a non-canonical pointer --
+/// which raise #GP, not a page fault -- get the same forensics instead of a
+/// bare `[exit] killed by signal SIGSEGV`. `read_code` is false when `pc`
+/// itself is the unmapped address (an instruction-fetch fault).
+fn dump_user_fault_context(
+    thread: &CurrentThread,
+    vmar: &Arc<VmAddressRegion>,
+    pc: usize,
+    read_code: bool,
+) {
+    // The faulting address says WHAT was touched; the registers say
+    // WHICH operand carried it. A write to 0 is a null pointer, and
+    // the register holding 0 here is the one whose value never got
+    // filled in -- knowing it is `rdi` (an argument, a `this`) or
+    // `rax` (a return value that should have been checked) is the
+    // difference between a guess and a direction.
+    if let Ok(regs) = thread.with_context(|ctx| alloc::format!("{:x?}", ctx.general())) {
+        error!("  regs: {}", regs);
+    }
+    // And the instruction itself. Several registers are usually
+    // zero at a fault and only the opcode says which one was being
+    // dereferenced -- with `rax`, `rdx`, `rbp` and `r9` all zero
+    // there is no reading the faulting operand off the dump alone.
+    //
+    // Only safe on a DATA fault: there `pc` is the mapped
+    // instruction that made a bad access, so reading its bytes is
+    // the memory the CPU fetched from. On an INSTRUCTION-FETCH
+    // fault (`EXECUTE` flag) `pc` IS the unmapped address that
+    // faulted -- reading it here re-faults, but from kernel mode,
+    // where `read_array`'s unchecked `copy_from_nonoverlapping`
+    // (no fault fixup) turns a recoverable user SIGSEGV into an
+    // unresolved KERNEL page fault and the isolate/kill cascade.
+    // Every desktop process jumping to one bad address then took
+    // the kernel down through this read. The address is already in
+    // the report above (`pc=... [unmapped]`), so skip the bytes.
+    if read_code {
+        if let Ok(bytes) = kernel_hal::user::UserInPtr::<u8>::from(pc).read_array(16) {
+            let mut hex = String::new();
+            for b in &bytes {
+                hex.push_str(&alloc::format!("{b:02x} "));
+            }
+            error!("  code: {}", hex.trim_end());
+        }
+    }
+    // Finally, WHO got here. `pc` names the function that faulted
+    // (`wl_list_remove`, `memcpy`, ...) but those are leaves called
+    // from hundreds of places; the caller is what points at the
+    // bug. Scan the live stack above `sp` for words that land in an
+    // executable mapping and print them as `lib+offset`: a poor
+    // man's backtrace that needs no frame pointers and no DWARF
+    // (`addr2line -e <lib> <offset>` / `nm -D` on the user side
+    // turns each into a function). Stale return addresses from
+    // earlier calls show up too, so read it as a set of candidate
+    // callers, innermost first, not as an exact chain.
+    //
+    // Read through the VMO (`read_memory`), never by dereferencing
+    // the user pointer: an unmapped or not-yet-committed stack page
+    // would otherwise re-fault from kernel mode with no fixup, the
+    // same cascade the `code:` read above guards against.
+    let sp = thread
+        .with_context(|ctx| ctx.get_field(UserContextField::StackPointer))
+        .unwrap_or(0);
+    for line in user_stack_backtrace(vmar, sp) {
+        error!("  {}", line);
+    }
+}
+
 /// Deliver a *synchronous* fault signal (SIGSEGV / SIGBUS / SIGILL / SIGFPE).
 ///
 /// A faulting instruction is re-executed when the thread returns to user mode.
@@ -914,62 +984,12 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                     pc,
                     describe_addr(&vmar, pc),
                 );
-                // The faulting address says WHAT was touched; the registers say
-                // WHICH operand carried it. A write to 0 is a null pointer, and
-                // the register holding 0 here is the one whose value never got
-                // filled in -- knowing it is `rdi` (an argument, a `this`) or
-                // `rax` (a return value that should have been checked) is the
-                // difference between a guess and a direction.
-                if let Ok(regs) = thread.with_context(|ctx| alloc::format!("{:x?}", ctx.general()))
-                {
-                    error!("  regs: {}", regs);
-                }
-                // And the instruction itself. Several registers are usually
-                // zero at a fault and only the opcode says which one was being
-                // dereferenced -- with `rax`, `rdx`, `rbp` and `r9` all zero
-                // there is no reading the faulting operand off the dump alone.
-                //
-                // Only safe on a DATA fault: there `pc` is the mapped
-                // instruction that made a bad access, so reading its bytes is
-                // the memory the CPU fetched from. On an INSTRUCTION-FETCH
-                // fault (`EXECUTE` flag) `pc` IS the unmapped address that
-                // faulted -- reading it here re-faults, but from kernel mode,
-                // where `read_array`'s unchecked `copy_from_nonoverlapping`
-                // (no fault fixup) turns a recoverable user SIGSEGV into an
-                // unresolved KERNEL page fault and the isolate/kill cascade.
-                // Every desktop process jumping to one bad address then took
-                // the kernel down through this read. The address is already in
-                // the report above (`pc=... [unmapped]`), so skip the bytes.
-                if !flags.contains(kernel_hal::MMUFlags::EXECUTE) {
-                    if let Ok(bytes) = kernel_hal::user::UserInPtr::<u8>::from(pc).read_array(16) {
-                        let mut hex = String::new();
-                        for b in &bytes {
-                            hex.push_str(&alloc::format!("{b:02x} "));
-                        }
-                        error!("  code: {}", hex.trim_end());
-                    }
-                }
-                // Finally, WHO got here. `pc` names the function that faulted
-                // (`wl_list_remove`, `memcpy`, ...) but those are leaves called
-                // from hundreds of places; the caller is what points at the
-                // bug. Scan the live stack above `sp` for words that land in an
-                // executable mapping and print them as `lib+offset`: a poor
-                // man's backtrace that needs no frame pointers and no DWARF
-                // (`addr2line -e <lib> <offset>` / `nm -D` on the user side
-                // turns each into a function). Stale return addresses from
-                // earlier calls show up too, so read it as a set of candidate
-                // callers, innermost first, not as an exact chain.
-                //
-                // Read through the VMO (`read_memory`), never by dereferencing
-                // the user pointer: an unmapped or not-yet-committed stack page
-                // would otherwise re-fault from kernel mode with no fixup, the
-                // same cascade the `code:` read above guards against.
-                let sp = thread
-                    .with_context(|ctx| ctx.get_field(UserContextField::StackPointer))
-                    .unwrap_or(0);
-                for line in user_stack_backtrace(&vmar, sp) {
-                    error!("  {}", line);
-                }
+                dump_user_fault_context(
+                    thread,
+                    &vmar,
+                    pc,
+                    !flags.contains(kernel_hal::MMUFlags::EXECUTE),
+                );
                 force_fault_signal(thread, Signal::SIGSEGV);
             }
             Ok(())
@@ -994,14 +1014,23 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
             let pc = thread
                 .with_context(|ctx| ctx.get_field(UserContextField::InstrPointer))
                 .unwrap_or(0);
-            warn!(
-                "cpu fault from user mode: trap={:#x} -> {:?}, pid={}, tid={}, pc={:#x}",
+            // error!, not warn!: at the default LOG=error a #GP (misaligned
+            // SSE access, non-canonical pointer) or #DE left only the `[exit]
+            // killed by signal SIGSEGV` line, with no fault address, no
+            // registers and no caller -- indistinguishable from a page fault
+            // and unresolvable without the report the page-fault path prints.
+            let vmar = thread.proc().vmar();
+            error!(
+                "cpu fault from user mode: trap={:#x} -> {:?}, pid={} proc={} tid={} pc={:#x} [{}]",
                 trap_num,
                 signal,
                 pid,
+                thread.proc().name(),
                 thread.id(),
-                pc
+                pc,
+                describe_addr(&vmar, pc),
             );
+            dump_user_fault_context(thread, &vmar, pc, true);
             force_fault_signal(thread, signal);
             Ok(())
         }

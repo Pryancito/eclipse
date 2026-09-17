@@ -129,6 +129,11 @@ pub trait KernelObject: DowncastSync + Debug {
     fn type_name(&self) -> &str;
     /// Get object's name.
     fn name(&self) -> alloc::string::String;
+    /// Get object's name without blocking on the object lock (`None` when
+    /// it is held); see [`KObjectBase::try_name`].
+    fn try_name(&self) -> Option<alloc::string::String> {
+        Some(self.name())
+    }
     /// Set object's name.
     fn set_name(&self, name: &str);
     /// Get the signal status.
@@ -375,6 +380,18 @@ impl KObjectBase {
         self.inner.lock().name.clone()
     }
 
+    /// Get object's name without waiting for the object lock: `None` when
+    /// it is held. For diagnostics that may run INSIDE a signal callback:
+    /// `signal_change` keeps `inner` locked while it invokes the callbacks,
+    /// so a callback (or anything it calls, such as file teardown on
+    /// PROCESS_TERMINATED) that asks this same object for its `name()`
+    /// spins on a lock its own CPU holds. Observed as the process-exit path
+    /// deadlocking in the `[signal] SIGHUP` trace of a pty master dropped by
+    /// the exiting process's own termination callback.
+    pub fn try_name(&self) -> Option<String> {
+        self.inner.try_lock().map(|inner| inner.name.clone())
+    }
+
     /// Set object's name.
     pub fn set_name(&self, name: &str) {
         let mut inner = self.inner.lock();
@@ -569,6 +586,9 @@ macro_rules! impl_kobject {
             }
             fn name(&self) -> alloc::string::String {
                 self.base.name()
+            }
+            fn try_name(&self) -> Option<alloc::string::String> {
+                self.base.try_name()
             }
             fn set_name(&self, name: &str){
                 self.base.set_name(name)

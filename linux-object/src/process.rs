@@ -1944,7 +1944,7 @@ pub fn send_signal_to_pgrp(pgid: usize, signal: LinuxSignal) -> LxResult<()> {
             if !list.is_empty() {
                 list.push_str(", ");
             }
-            list.push_str(&alloc::format!("{} ({})", p.id(), p.name()));
+            list.push_str(&alloc::format!("{} ({})", p.id(), trace_name(p)));
         }
         zcore_drivers::klog_warn!(
             "[signal] {:?} to pgrp {} from pid {} ({}) -> [{}]",
@@ -2349,10 +2349,24 @@ pub fn current_process_pid_name() -> (u64, String) {
     if let Some(arc) = kernel_hal::thread::get_current_thread() {
         if let Ok(thread) = arc.downcast::<Thread>() {
             let proc = thread.proc();
-            return (proc.id(), proc.name());
+            return (proc.id(), trace_name(proc));
         }
     }
     (0, String::from("kernel"))
+}
+
+/// A process name for the `[signal]`/`[wait]` traces that never blocks.
+///
+/// These traces run from arbitrary contexts, including INSIDE the object
+/// layer's PROCESS_TERMINATED callback: `Process::exit` fires it with the
+/// process's own `KObjectBase` lock held, the callback drops the file table,
+/// dropping a pty master sends SIGHUP to the foreground group, and the trace
+/// then asked the exiting process for its `name()` -- the same lock, on the
+/// same CPU. That was a hard deadlock at every exit of a terminal that still
+/// owned its pty (`[DEADLOCK] cpu=N at object/mod.rs name() / HOLDER
+/// signal_change()`). `try_name` yields `?` instead of waiting.
+fn trace_name(proc: &Process) -> String {
+    proc.try_name().unwrap_or_else(|| String::from("?"))
 }
 
 /// Trace for `kill(pid, SIGKILL)`, which ends the target directly instead of
@@ -2362,9 +2376,9 @@ pub fn trace_direct_kill(target: &Arc<Process>, sender: &Arc<Process>) {
     zcore_drivers::klog_warn!(
         "[signal] SIGKILL -> pid {} ({}) from pid {} ({}) [kill()]",
         target.id(),
-        target.name(),
+        trace_name(target),
         sender.id(),
-        sender.name()
+        trace_name(sender)
     );
 }
 
@@ -2432,7 +2446,7 @@ pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
                 "[signal] {:?} -> pid {} ({}) from pid {} ({})",
                 signal,
                 process.id(),
-                process.name(),
+                trace_name(&process),
                 spid,
                 sname
             );
