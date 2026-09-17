@@ -2,6 +2,30 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+/// Scratch slot handed out when a queue's backing slice has been corrupted to
+/// zero length. Never read for anything meaningful — it exists so `entry_at`
+/// has something in-bounds to return on a path where panicking is fatal.
+static mut FALLBACK_SLOT: [u8; 64] = [0; 64];
+
+/// One line naming a queue whose `size` and backing-slice length disagree.
+/// Budgeted, allocation-free and lock-free: it runs on the IPI drain path with
+/// interrupts already off.
+#[cold]
+#[inline(never)]
+fn report_size_mismatch(len: usize, size: usize) {
+    use core::sync::atomic::AtomicU32;
+    static REPORTED: AtomicU32 = AtomicU32::new(0);
+    if REPORTED.fetch_add(1, Ordering::Relaxed) >= 4 {
+        return;
+    }
+    crate::console::serial_write_fmt_spin(format_args!(
+        "\n[mpsc] CORRUPTED QUEUE: backing slice len={} but size={} — the ring's \
+         fat pointer has been overwritten. Wrapping by the real length so the \
+         IPI drain does not panic with locks held.\n",
+        len, size,
+    ));
+}
+
 /// Bounded multi-producer single-consumer ring.
 ///
 /// Producers reserve a slot with [`alloc_entry`] (CAS on `phead`), write the
@@ -42,11 +66,38 @@ impl<'a, T: Copy> MpscQueue<'a, T> {
         }
     }
 
+    /// The slot `idx` maps to, wrapped by the **backing slice's own length**.
+    ///
+    /// Not by `self.size`, though the two are equal by construction. This is
+    /// the TLB-shootdown drain path: `tlb_shootdown_ack_on` reaches it from
+    /// `TicketMutex::lock`'s spin pump, i.e. from inside every contended lock
+    /// acquire in the kernel, with that lock's interrupts already off. A panic
+    /// there can never be contained by `oops` — it is guaranteed to be holding
+    /// a lock — so it takes the machine down and buries whatever caused it.
+    ///
+    /// And it did: `index out of bounds: the len is 1 but the index is 10`,
+    /// from `queue[idx % self.size]`, which can only mean `size` and the
+    /// slice's length disagree. Both are set once in `new` from the same
+    /// slice, so a disagreement is a wild write into the queue's own fat
+    /// pointer, not a logic error here. Wrapping by the length the slice
+    /// actually has keeps the corruption reportable instead of fatal: the
+    /// access stays in bounds (the constructor rejects an empty buffer), and
+    /// [`report_size_mismatch`] names it once on the way through.
     #[allow(clippy::mut_from_ref)]
     #[allow(unsafe_code)]
     pub fn entry_at(&self, idx: usize) -> &mut T {
         let queue = unsafe { &mut *self.queue.get() };
-        &mut queue[idx % self.size]
+        let len = queue.len();
+        if len != self.size {
+            report_size_mismatch(len, self.size);
+            if len == 0 {
+                // Nothing sound to hand back; leak a slot rather than panic on
+                // a path that cannot survive one. `new` rejects an empty
+                // buffer, so reaching here at all means the pointer is gone.
+                return unsafe { &mut *(&raw mut FALLBACK_SLOT).cast::<T>() };
+            }
+        }
+        &mut queue[idx % len]
     }
 
     pub fn chead(&self) -> usize {

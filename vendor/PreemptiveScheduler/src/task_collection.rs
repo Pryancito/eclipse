@@ -251,6 +251,39 @@ pub struct TaskCollection {
     generator: Option<Mutex<Pin<Box<dyn Coroutine<Yield = Option<Key>, Return = ()>>>>>,
 }
 
+/// One line naming a collection whose generator field is gone.
+///
+/// `new` fills that field before the `Arc` is published and nothing ever
+/// clears it, so `None` cannot be a logic error — it means the
+/// `TaskCollection` itself has been overwritten. The `unwrap()` that used to
+/// stand in both takers turned that into
+///
+///   panic at task_collection.rs:340: called `Option::unwrap()` on a `None`
+///   value
+///
+/// inside the executor, on a CPU already holding scheduler locks — which
+/// `oops` can never contain, so it took the machine down and buried the
+/// corruption that caused it. Seen alongside two other cores panicking on the
+/// same boot, both of which WERE contained and survived.
+///
+/// A collection with no generator simply has no tasks to hand out, so the
+/// takers report "nothing ready", the executor parks, and the evidence reaches
+/// the log instead of the floor. One-shot: a parked queue is re-polled forever.
+#[cold]
+#[inline(never)]
+fn report_missing_generator(cpu_id: u8) {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if REPORTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    error!(
+        "[sched] CORRUPTED TaskCollection: cpu {} has no task generator — the \
+         collection has been overwritten. Parking this queue instead of \
+         panicking inside the executor.",
+        cpu_id,
+    );
+}
+
 impl TaskCollection {
     pub fn new(cpu_id: u8) -> Arc<Self> {
         let mut task_collection = Arc::new(TaskCollection {
@@ -332,12 +365,22 @@ impl TaskCollection {
     /// here while holding the victim's runtime lock deadlocks against the
     /// victim's timer IRQ (see `steal_task_from_other_cpu`).
     pub fn try_take_task(&self) -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
-        let mut generator = self.generator.as_ref().unwrap().try_lock()?;
+        // See `report_missing_generator`: never `unwrap` here.
+        let Some(generator) = self.generator.as_ref() else {
+            report_missing_generator(self.cpu_id);
+            return None;
+        };
+        let mut generator = generator.try_lock()?;
         self.resume_generator(&mut generator)
     }
 
     pub fn take_task(&self) -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
-        let mut generator = crate::diag::diag_lock(self.generator.as_ref().unwrap());
+        // See `report_missing_generator`: never `unwrap` here.
+        let Some(generator) = self.generator.as_ref() else {
+            report_missing_generator(self.cpu_id);
+            return None;
+        };
+        let mut generator = crate::diag::diag_lock(generator);
         self.resume_generator(&mut generator)
     }
 
