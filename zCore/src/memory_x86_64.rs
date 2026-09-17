@@ -345,6 +345,14 @@ cfg_if! {
         /// one CPU, both ends. `try_lock` fails in precisely that case (and
         /// while a peer holds it, where allocating is merely slow, not fatal),
         /// so a `false` here means "print only what needs no heap".
+        ///
+        /// No caller at the moment: the fault reporter stopped printing object
+        /// names altogether rather than gating on this, which is strictly safer
+        /// (it cannot allocate even when the heap happens to be free). Kept
+        /// because the question is the right one for the next reporter to ask,
+        /// and its non-x86 twin in `memory.rs` is kept the same way — without
+        /// the attribute this breaks the build, since the crate denies warnings.
+        #[allow(dead_code)]
         pub fn heap_available() -> bool {
             match HEAP_ALLOCATOR.try_lock() {
                 Some(guard) => {
