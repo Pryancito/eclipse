@@ -673,6 +673,17 @@ impl Syscall<'_> {
         if let Err(LxError::EINVAL) = ret {
             einval_hunt(pid, num, &args);
         }
+        // [alsa-hunt] PulseAudio keeps dying on an abort inside libasound:
+        //   [exit] pid=N (pulseaudio) killed by signal SIGABRT
+        //   [crash-bt] ... libasound.so.2+0x323f3 ... libalsa-util.so+0x26bc9
+        // i.e. an assert() in alsa-lib, not a pa_assert. alsa-lib asserts on
+        // kernel answers it considers impossible, so the failing ioctl and its
+        // errno are the whole question -- and the EINVAL hunter above cannot
+        // see it, because the abort survives with no EINVAL in the log at all.
+        // Name every failing sound ioctl, with the command decoded.
+        if let Err(err) = ret {
+            alsa_hunt(pid, num, &args, err);
+        }
         match ret {
             Ok(value) => value as isize,
             Err(err) => -(err as isize),
@@ -762,6 +773,80 @@ impl Syscall<'_> {
     /// get linux process
     fn linux_process(&self) -> &LinuxProcess {
         self.zircon_process().linux()
+    }
+}
+
+/// Decode an ALSA ioctl command into a readable name, or `None` when it is not
+/// one. `_IO*('A'|'U'|'T', nr, ...)`: PCM, control and timer respectively.
+fn alsa_ioctl_name(cmd: u32) -> Option<&'static str> {
+    let ty = ((cmd >> 8) & 0xff) as u8;
+    let nr = (cmd & 0xff) as u8;
+    Some(match (ty, nr) {
+        (b'A', 0x00) => "PCM_PVERSION",
+        (b'A', 0x01) => "PCM_INFO",
+        (b'A', 0x10) => "PCM_HW_REFINE",
+        (b'A', 0x11) => "PCM_HW_PARAMS",
+        (b'A', 0x12) => "PCM_HW_FREE",
+        (b'A', 0x13) => "PCM_SW_PARAMS",
+        (b'A', 0x20) => "PCM_STATUS",
+        (b'A', 0x21) => "PCM_DELAY",
+        (b'A', 0x22) => "PCM_HWSYNC",
+        (b'A', 0x23) => "PCM_SYNC_PTR",
+        (b'A', 0x24) => "PCM_STATUS_EXT",
+        (b'A', 0x40) => "PCM_PREPARE",
+        (b'A', 0x41) => "PCM_RESET",
+        (b'A', 0x42) => "PCM_START",
+        (b'A', 0x43) => "PCM_DROP",
+        (b'A', 0x44) => "PCM_DRAIN",
+        (b'A', 0x45) => "PCM_PAUSE",
+        (b'A', 0x46) => "PCM_REWIND",
+        (b'A', 0x47) => "PCM_RESUME",
+        (b'A', 0x48) => "PCM_XRUN",
+        (b'A', 0x49) => "PCM_FORWARD",
+        (b'A', 0x50) => "PCM_WRITEI_FRAMES",
+        (b'A', 0x51) => "PCM_READI_FRAMES",
+        (b'A', 0x52) => "PCM_WRITEN_FRAMES",
+        (b'A', 0x53) => "PCM_READN_FRAMES",
+        (b'A', 0x60) => "PCM_LINK",
+        (b'A', 0x61) => "PCM_UNLINK",
+        (b'A', _) => "PCM_?",
+        (b'U', _) => "CTL_?",
+        (b'T', _) => "TIMER_?",
+        _ => return None,
+    })
+}
+
+/// [alsa-hunt] One budgeted `error!` line per FAILING sound ioctl, naming the
+/// command and the errno.
+///
+/// alsa-lib asserts (and aborts the process) on kernel answers it considers
+/// impossible, so when PulseAudio dies inside libasound the question is always
+/// "which ioctl returned what". `HW_REFINE` returning `EINVAL` is excluded: the
+/// `*_near` helpers find a supported rate/period BY refining until the kernel
+/// says no, so that one is a search, not a fault.
+fn alsa_hunt(pid: KoID, num: u32, args: &[usize; 6], err: LxError) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static BUDGET: AtomicU32 = AtomicU32::new(0);
+    if !matches!(Sys::try_from(num), Ok(Sys::IOCTL)) {
+        return;
+    }
+    let cmd = args[1] as u32;
+    let Some(name) = alsa_ioctl_name(cmd) else {
+        return;
+    };
+    if name == "PCM_HW_REFINE" && matches!(err, LxError::EINVAL) {
+        return;
+    }
+    if BUDGET.fetch_add(1, Ordering::Relaxed) < 64 {
+        log::error!(
+            "[alsa-hunt] pid={} ioctl {} ({:#x}) fd={} -> {:?} ({})",
+            pid,
+            name,
+            cmd,
+            args[0],
+            err,
+            err as isize,
+        );
     }
 }
 
