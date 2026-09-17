@@ -105,6 +105,10 @@ pub enum LxError {
     /// Mesa checks for explicitly (`errno == ETIME` -> `VK_TIMEOUT`); any other
     /// errno there is treated as a lost device.
     ETIME = 62,
+    /// File descriptor in bad state -- the fd is valid, the object behind it
+    /// is not in a state that allows the operation. ALSA returns it from
+    /// `writei`/`readi` on a stream that is neither prepared nor running.
+    EBADFD = 77,
     /// Socket operation on non-socket
     ENOTSOCK = 88,
     /// Protocol not available
@@ -186,6 +190,7 @@ impl fmt::Display for LxError {
             EIDRM => "Identifier removed",
             ENODATA => "No data available",
             ETIME => "Timer expired",
+            EBADFD => "File descriptor in bad state",
             ENOTSOCK => "Socket operation on non-socket",
             ENOPROTOOPT => "Protocol not available",
             EOPNOTSUPP => "Operation not supported",
@@ -279,6 +284,7 @@ impl From<FsError> for LxError {
             FsError::NoPermission => LxError::EACCES,
             FsError::OpNotSupported => LxError::EOPNOTSUPP,
             FsError::BadAddress => LxError::EFAULT,
+            FsError::BadState => LxError::EBADFD,
         }
     }
 }

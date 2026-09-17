@@ -338,6 +338,11 @@ pub enum FsError {
     NoPermission,   // E_ACCES, e.g. modeset ioctls on a DRM render node
     OpNotSupported, // E_OPNOTSUPP, e.g. an ioctl the device genuinely lacks
     BadAddress,     // E_FAULT, a user pointer outside the user address range
+    /// E_BADFD (77): the file descriptor is valid but the object behind it is
+    /// in a state that does not allow this operation. NOT E_INVAL, which means
+    /// "bad arguments" -- ALSA clients act on the difference (see
+    /// `SndPcm::writei`).
+    BadState,
 }
 
 impl fmt::Display for FsError {
