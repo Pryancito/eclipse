@@ -104,3 +104,42 @@ cfg_if::cfg_if! {
         }
     }
 }
+
+/// Whether a lock is held **right now, by this very CPU**.
+///
+/// A trait so callers read the same on every target. On bare metal it forwards
+/// to the mutex's inherent check (see `ticket::TicketMutex::held_by_current_cpu`),
+/// which is what lets the heap allocator and the shadow framebuffer refuse a
+/// re-entrant acquire instead of wedging the machine. On a hosted build there
+/// is no "this CPU" — `lock::Mutex` is plain `spin::Mutex` there — so the
+/// answer is a constant `false` and each guard compiles away to nothing.
+pub trait HeldByCurrentCpu {
+    /// `true` only when this CPU is already inside this lock's critical
+    /// section, i.e. when acquiring it again would spin forever.
+    fn held_by_current_cpu(&self) -> bool;
+}
+
+cfg_if::cfg_if! {
+    if #[cfg(all(target_os = "none", feature = "ticket"))] {
+        impl<T: ?Sized> HeldByCurrentCpu for Mutex<T> {
+            #[inline]
+            fn held_by_current_cpu(&self) -> bool {
+                ticket::TicketMutex::holder_is_current_cpu(self)
+            }
+        }
+    } else if #[cfg(target_os = "none")] {
+        impl<T: ?Sized> HeldByCurrentCpu for Mutex<T> {
+            #[inline]
+            fn held_by_current_cpu(&self) -> bool {
+                spin::SpinMutex::holder_is_current_cpu(self)
+            }
+        }
+    } else {
+        impl<T: ?Sized> HeldByCurrentCpu for Mutex<T> {
+            #[inline]
+            fn held_by_current_cpu(&self) -> bool {
+                false
+            }
+        }
+    }
+}
