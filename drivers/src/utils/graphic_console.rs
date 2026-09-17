@@ -60,6 +60,33 @@ impl OriginDimensions for ShadowDraw {
     }
 }
 
+/// Set once the kernel is dying, so the console stops trusting its own cache.
+///
+/// Three boots in a row ended as a panic INSIDE the panic handler, each time
+/// on this path: `rust_begin_unwind` -> the console -> a `buf` that the fault
+/// being reported had already corrupted. Bounds checks fixed the panics
+/// (#1219, #1220) but not the premise — `ensure_dims` then *resized* a `Vec`
+/// whose pointer was garbage, and wrote through it:
+///
+///     [KERNEL PAGE FAULT] vaddr=0xffffff00002184fd flags=WRITE
+///         rip=<LinearScrollbackBuffer::ensure_dims+0x3f0>
+///
+/// A console cannot defend against its own memory being scribbled. So once a
+/// panic starts it stops trying: no resizing, no repainting from the cache,
+/// and every cell goes straight to the glyph renderer. The report reaches the
+/// screen through the one path that needs nothing but the framebuffer.
+static PANICKING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Tell the graphic console a panic is in progress. See [`PANICKING`].
+pub fn note_panicking() {
+    PANICKING.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn panicking() -> bool {
+    PANICKING.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct LinearScrollbackBuffer {
     buf: Vec<Vec<Cell>>,
     history: VecDeque<Vec<Cell>>,
@@ -178,6 +205,13 @@ impl LinearScrollbackBuffer {
     /// itself keeps printing the crash report, which is the entire reason this
     /// path exists. Reports once so a silent mismatch cannot hide.
     fn ensure_dims(&mut self) {
+        if panicking() {
+            // Resizing means writing through `buf`'s pointer, and the fault
+            // being reported may be exactly what corrupted it. `write` draws
+            // straight to the glyphs when a cell is missing, so standing down
+            // costs the cache, not the report.
+            return;
+        }
         let (h, w) = (self.inner.height(), self.inner.width());
         if self.buf.len() == h && self.buf.iter().all(|r| r.len() == w) {
             return;
@@ -214,6 +248,12 @@ impl LinearScrollbackBuffer {
     }
 
     pub fn redraw(&mut self) {
+        if panicking() {
+            // A repaint replays the whole cell cache, which is the least
+            // trustworthy thing in the kernel at this moment. The panic text
+            // is being written cell by cell anyway.
+            return;
+        }
         self.ensure_dims();
         let height = self.height();
         let width = self.width();
@@ -319,11 +359,18 @@ impl TextBuffer for LinearScrollbackBuffer {
         //
         // Dropping the cell is the right failure: the console is mid-resize or
         // not yet built, and losing a character beats losing the crash report.
-        let Some(slot) = self.buf.get_mut(row).and_then(|r| r.get_mut(col)) else {
-            return;
+        let unchanged = match self.buf.get_mut(row).and_then(|r| r.get_mut(col)) {
+            Some(slot) => {
+                let same = *slot == cell;
+                *slot = cell;
+                same
+            }
+            // No cache slot (buffer short, or standing down mid-panic): draw
+            // unconditionally rather than drop the character. Returning here
+            // would have silenced the crash report, which is the one thing
+            // this path exists to deliver.
+            None => false,
         };
-        let unchanged = *slot == cell;
-        *slot = cell;
 
         if self.scrollback_offset.is_none() {
             if !unchanged {

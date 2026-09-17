@@ -24,6 +24,6 @@ pub use fat_ptr::{
 };
 
 #[cfg(feature = "graphic")]
-pub use graphic_console::GraphicConsole;
+pub use graphic_console::{note_panicking, GraphicConsole};
 #[cfg(feature = "graphic")]
 pub use shadow_fb::ShadowFramebuffer;

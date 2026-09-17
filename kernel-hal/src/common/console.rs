@@ -699,6 +699,18 @@ pub fn graphic_console_write_fmt_spin(fmt: Arguments) {
     vt_write_fmt_spin_impl(active_vt(), fmt);
 }
 
+/// Tell the graphic console that a panic is in progress, so it stops trusting
+/// its own cell cache: no resizing, no repainting, every glyph drawn straight
+/// to the framebuffer. See `zcore_drivers::utils::note_panicking`.
+///
+/// Call this FIRST in the panic handler — before any console output — because
+/// what it protects against is the console dying while reporting the fault
+/// that corrupted it.
+pub fn note_panicking() {
+    #[cfg(feature = "graphic")]
+    zcore_drivers::utils::note_panicking();
+}
+
 /// Absolute last-resort panic output: rasterize `s` onto a red band at the top
 /// of the framebuffer with raw pixel writes — no locks, no RefCell, no
 /// allocation. Works even when every console lock is wedged (e.g. a panic
