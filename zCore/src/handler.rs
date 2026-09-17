@@ -247,26 +247,15 @@ impl KernelHandler for ZcoreKernelHandler {
                     } else {
                         ""
                     };
-                    if crate::memory::heap_available() {
-                        kernel_hal::console::serial_write_fmt_spin(format_args!(
-                            "[diag] interrupted thread (coincidental if IRQ/timer): \
-                             {:?} \"{}\" in process \"{}\"{}\n",
-                            thread.id(),
-                            thread.name(),
-                            thread.proc().name(),
-                            in_timer_note,
-                        ));
-                    } else {
-                        kernel_hal::console::serial_write_fmt_spin(format_args!(
-                            "[diag] interrupted thread (coincidental if IRQ/timer): \
-                             {:?} in process koid {} (names omitted: the heap lock \
-                             is held — the fault is very likely INSIDE the \
-                             allocator){}\n",
-                            thread.id(),
-                            thread.proc().id(),
-                            in_timer_note,
-                        ));
-                    }
+                    kernel_hal::console::serial_write_fmt_spin(format_args!(
+                        "[diag] interrupted thread (coincidental if IRQ/timer): \
+                         {:?} in process koid {} (names omitted on the fault path: \
+                         object names allocate Strings, and this fault may have been \
+                         taken inside the allocator){}\n",
+                        thread.id(),
+                        thread.proc().id(),
+                        in_timer_note,
+                    ));
                 }
             } else {
                 kernel_hal::console::serial_write_str(
