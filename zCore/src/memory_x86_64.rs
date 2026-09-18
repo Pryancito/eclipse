@@ -626,7 +626,7 @@ cfg_if! {
             if reported >= HEAP_PRESSURE_LEVELS.len() {
                 return;
             }
-            let pct = used / (KERNEL_HEAP_SIZE / 100).max(1);
+            let pct = used / (HEAP_TOTAL.load(Ordering::Relaxed) / 100).max(1);
             if pct >= HEAP_PRESSURE_LEVELS[reported] {
                 report_heap_pressure(reported, used, pct);
             }
@@ -646,7 +646,7 @@ cfg_if! {
                 "\n[heap-pressure] {}% of the kernel heap in use ({} of {} MiB). Live by size class:\n",
                 pct,
                 used >> 20,
-                KERNEL_HEAP_SIZE >> 20,
+                HEAP_TOTAL.load(Ordering::Relaxed) >> 20,
             ));
             for (i, count) in HEAP_LIVE.iter().enumerate() {
                 let live = count.load(Ordering::Relaxed);
@@ -721,8 +721,148 @@ cfg_if! {
             }
         }
 
+        /// Bytes the heap manages RIGHT NOW: the static arena plus every
+        /// chunk [`try_grow_heap`] has taken from physical RAM.
+        static HEAP_TOTAL: AtomicUsize = AtomicUsize::new(KERNEL_HEAP_SIZE);
+
         pub fn heap_total() -> usize {
-            KERNEL_HEAP_SIZE
+            HEAP_TOTAL.load(Ordering::Relaxed)
+        }
+
+        // ── Elastic heap ────────────────────────────────────────────────────
+        //
+        // The arena is a fixed `static mut HEAP: [usize; _]` in .bss, and
+        // running it out ends the machine. That ceiling is arbitrary: the box
+        // has GiBs of RAM the frame allocator is managing, while a desktop
+        // client can put more than 512 MiB into the heap on its own — memfd
+        // and tmpfs file content lives here, and one browser's shm pools
+        // already carry 534 MiB of (sparse) logical size.
+        //
+        // So when the heap gets tight, take physical frames and hand them to
+        // the buddy (`add_to_heap`, which is address-agnostic — the free
+        // lists are intrusive and hold absolute addresses). The heap becomes
+        // bounded by RAM instead of by a constant, and every consumer
+        // benefits, not just the one that happened to trip it.
+        const HEAP_GROW_AT_PCT: usize = 70;
+        /// Tried in order: see the fallback in `grow_heap_once`.
+        const HEAP_GROW_CHUNKS: [usize; 3] =
+            [32 * 1024 * 1024, 8 * 1024 * 1024, 2 * 1024 * 1024];
+        const HEAP_MAX_TOTAL: usize = 2 * 1024 * 1024 * 1024;
+        /// Never take the machine's last quarter of RAM for the kernel heap:
+        /// user pages must still be commitable, or we trade an OOM here for a
+        /// worse one in the page-fault path.
+        const HEAP_LEAVE_FREE_PCT: usize = 25;
+
+        /// Set for the duration of a growth attempt. Growth runs from INSIDE
+        /// `alloc`, and `frame_alloc`'s failure path logs (which allocates),
+        /// so without this flag a failed growth would recurse into itself.
+        static HEAP_GROWING: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        static HEAP_GROW_REFUSED: AtomicUsize = AtomicUsize::new(0);
+
+        /// Grow the heap when it passes [`HEAP_GROW_AT_PCT`]. One relaxed
+        /// compare on the alloc path; everything else is `#[cold]`.
+        #[inline]
+        fn try_grow_heap(used: usize) {
+            let total = HEAP_TOTAL.load(Ordering::Relaxed);
+            if used < total / 100 * HEAP_GROW_AT_PCT {
+                return;
+            }
+            if HEAP_GROWING.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            grow_heap_once(used, total);
+            HEAP_GROWING.store(false, Ordering::Release);
+        }
+
+        #[cold]
+        #[inline(never)]
+        fn grow_heap_once(used: usize, total: usize) {
+            if total >= HEAP_MAX_TOTAL {
+                if HEAP_GROW_REFUSED.fetch_add(1, Ordering::Relaxed) == 0 {
+                    emit(format_args!(
+                        "\n[heap-grow] REFUSED: already at the {} MiB ceiling ({} MiB in use)\n",
+                        total >> 20,
+                        used >> 20,
+                    ));
+                }
+                return;
+            }
+            // The heap lock is free at the call site (the allocation that
+            // brought us here has already released it), but an IRQ can land
+            // here on a CPU that holds it. Asking is exact and costs nothing.
+            if HEAP_ALLOCATOR.0.held_by_current_cpu() {
+                return;
+            }
+            // Leave the machine room to commit user pages.
+            let ram = TOTAL_MEMORY.load(Ordering::Relaxed);
+            let ram_used = FRAMES_USED.load(Ordering::Relaxed);
+            let reserve = ram / 100 * HEAP_LEAVE_FREE_PCT;
+            if ram == 0 || ram_used + HEAP_GROW_CHUNKS[HEAP_GROW_CHUNKS.len() - 1] + reserve > ram
+            {
+                if HEAP_GROW_REFUSED.fetch_add(1, Ordering::Relaxed) == 0 {
+                    emit(format_args!(
+                        "\n[heap-grow] REFUSED: {} MiB of {} MiB RAM already committed; \
+                         the heap stays at {} MiB\n",
+                        ram_used >> 20,
+                        ram >> 20,
+                        total >> 20,
+                    ));
+                }
+                return;
+            }
+            // A fragmented machine can have GiBs free and no 32 MiB run left:
+            // the second growth on the very first test boot was refused for
+            // exactly that. Step down instead of giving up.
+            let mut got = None;
+            for chunk in HEAP_GROW_CHUNKS {
+                if ram_used + chunk + reserve > ram {
+                    continue;
+                }
+                // align_log2 is in FRAMES, not bytes: 21 would demand an 8 GiB
+                // alignment and fail on any real machine (the first test boot
+                // only succeeded because the run happened to land on 8 GiB).
+                // The buddy needs no more than usize alignment.
+                if let Some(pa) = frame_alloc(chunk >> PAGE_BITS, 0) {
+                    got = Some((pa, chunk));
+                    break;
+                }
+            }
+            let Some((pa, chunk)) = got else {
+                if HEAP_GROW_REFUSED.fetch_add(1, Ordering::Relaxed) == 0 {
+                    emit(format_args!(
+                        "\n[heap-grow] REFUSED: no contiguous run of frames left, down to {} MiB\n",
+                        HEAP_GROW_CHUNKS[HEAP_GROW_CHUNKS.len() - 1] >> 20,
+                    ));
+                }
+                return;
+            };
+            let va = kernel_hal::mem::phys_to_virt(pa);
+            // SAFETY: these frames were just allocated to us, are inside the
+            // kernel's linear map, and overlap nothing the heap manages.
+            unsafe {
+                HEAP_ALLOCATOR.0.lock().add_to_heap(va, va + chunk);
+            }
+            let new_total = HEAP_TOTAL.fetch_add(chunk, Ordering::Relaxed) + chunk;
+            // The vtable-liveness ceiling (`set_vtable_max`) is deliberately
+            // LEFT ALONE here. It rests on "the image links .rodata below
+            // .bss, so no real vtable is at or above the static heap base" —
+            // and a grown region lives in the linear map (0xffff_8000_…),
+            // BELOW the kernel image (0xffff_ff00_…). Lowering the bound to it
+            // would classify every genuine vtable in the image as
+            // heap-resident, and `dyn_fat_ptr_live` would then refuse every
+            // dyn dispatch in the system. The cost is that the heuristic does
+            // not cover blocks in grown regions; refusing to dispatch anything
+            // is not a trade. (Caught on the first forced-growth boot: the
+            // region landed at 0xffff_8002_0000_0000.)
+            emit(format_args!(
+                "\n[heap-grow] +{} MiB from physical RAM at {:#x} (heap {} -> {} MiB, {} MiB in use)\n",
+                chunk >> 20,
+                va,
+                total >> 20,
+                new_total >> 20,
+                used >> 20,
+            ));
         }
 
         pub fn init() {
@@ -1092,6 +1232,7 @@ cfg_if! {
                     let used = HEAP_USED.fetch_add(sz, Ordering::Relaxed) + sz;
                     HEAP_LIVE[bucket_of(sz)].fetch_add(1, Ordering::Relaxed);
                     hot_track(sz, 1);
+                    try_grow_heap(used);
                     note_heap_pressure(used);
                     if sz >= BIG_ALLOC_MIN {
                         track_big_alloc(p as usize, sz);
