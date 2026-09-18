@@ -1630,7 +1630,22 @@ static void test_pulse(void) {
       info("%s exists but connect failed: %s", sys, strerror(e2));
     }
   } else if (!c_want) {
-    info("no PulseAudio socket at any path: the daemon is not running -- see /tmp/pulseaudio.log");
+    // "No socket" has two very different causes, and saying "not running"
+    // for both sent this probe's reader down the wrong path once already: a
+    // LIVE daemon with no socket is startup stopping before
+    // module-native-protocol-unix -- it still owns the cards it did open, so
+    // /dev/dsp is EBUSY and hw:N,0 is taken while every client is refused.
+    long pa_pid = find_process("pulseaudio");
+    if (pa_pid > 0) {
+      fail("a live pulseaudio owns the card but listens nowhere",
+           "startup never reached module-native-protocol-unix: clients get ECONNREFUSED while the PCM stays held", 0);
+      info("=> pid %ld is alive and %s does not exist.", pa_pid, want);
+      info("   system.pa loads the socket BEFORE the ALSA sinks for exactly this reason; a sink whose");
+      info("   load wedges then costs one card, not the whole daemon. Read /tmp/pulseaudio.log: the last");
+      info("   module it logged is the one that did not come back.");
+    } else {
+      info("no PulseAudio socket at any path and no daemon process: it is not running -- see /tmp/pulseaudio.log");
+    }
   }
   if (c_want) info("a Pulse server is listening where clients look; if the ALSA path above is silent, the sink is next (pactl list short sinks)");
   info("server log: /tmp/pulseaudio.log; boot chime: /tmp/boot-sound.log");

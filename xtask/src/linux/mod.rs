@@ -2491,31 +2491,44 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let pa = b"# eclipse-generated PulseAudio startup (delete this line to take ownership).\n\
               #!/usr/bin/pulseaudio -nF\n\
               #\n\
-              # System instance over Eclipse's ALSA hw:0,0. No udev, no D-Bus,\n\
+              # System instance over Eclipse's ALSA cards. No udev, no D-Bus,\n\
               # no capture: the kernel PCM is playback-only RW-interleaved.\n\
-              # ALSA sinks are .nofail: a missing/busy card must not kill the\n\
-              # daemon (eclipse-init would then crash-loop it). Only arguments\n\
-              # module-alsa-sink accepts (src/modules/alsa/module-alsa-sink.c):\n\
-              # one unknown key and pa_modargs rejects the WHOLE line -- that was\n\
-              # mixer_device= and use_ucm= (module-alsa-card keys), which left the\n\
-              # daemon with no sink at all. The mixer is found from the PCM's card.\n\
-              .nofail\n\
-              load-module module-device-restore\n\
-              load-module module-stream-restore\n\
-              load-module module-card-restore\n\
-              load-module module-augment-properties\n\
-              load-module module-alsa-sink device=hw:0,0 mmap=0 tsched=0 ignore_dB=1 fragments=4 fragment_size=12000 sink_properties=device.description=Eclipse\n\
-              load-module module-alsa-sink device=hw:1,0 mmap=0 tsched=0 ignore_dB=1 fragments=4 fragment_size=12000 sink_name=analog sink_properties=device.description=Analog\n\
+              #\n\
+              # THE SOCKET IS LOADED BEFORE THE CARDS. module-alsa-sink touches\n\
+              # hardware, and a card that wedges its load leaves the daemon alive,\n\
+              # holding that PCM, with module-native-protocol-unix never reached --\n\
+              # so /run/pulse/native never appears, every client gets\n\
+              # 'Connection refused' (ALSA `default` is the pulse plugin) and\n\
+              # /dev/dsp is EBUSY because the daemon does own the card. Observed\n\
+              # exactly like that: `pgrep pulseaudio` alive, `ls /run/pulse/native`\n\
+              # ENOENT. With the socket first, a wedged card costs one sink, not the\n\
+              # whole daemon: `pactl list sinks` still answers and names the card\n\
+              # that did not come up. The restore modules stay ahead of it -- they\n\
+              # are pure state and must be in place before a client connects.\n\
+              #\n\
               # auth-cookie-enabled=0: with auth-anonymous the cookie is never\n\
               # consulted, but the module still loads-or-creates one under\n\
               # $XDG_CONFIG_HOME/pulse (or ~/.config/pulse) and FAILS TO LOAD when it\n\
               # cannot -- the system instance runs as `pulse`, which cannot write\n\
               # there, so no socket existed and every libpulse client fell through\n\
               # (Firefox: 'OpenCubeb() failed to init cubeb').\n\
+              .nofail\n\
+              load-module module-device-restore\n\
+              load-module module-stream-restore\n\
+              load-module module-card-restore\n\
+              load-module module-augment-properties\n\
               .fail\n\
               load-module module-native-protocol-unix auth-anonymous=1 auth-cookie-enabled=0 socket=/run/pulse/native\n\
               .nofail\n\
               load-module module-native-protocol-unix auth-anonymous=1 auth-cookie-enabled=0 socket=/run/user/0/pulse/native\n\
+              # ALSA sinks are .nofail: a missing/busy card must not kill the\n\
+              # daemon (eclipse-init would then crash-loop it). Only arguments\n\
+              # module-alsa-sink accepts (src/modules/alsa/module-alsa-sink.c):\n\
+              # one unknown key and pa_modargs rejects the WHOLE line -- that was\n\
+              # mixer_device= and use_ucm= (module-alsa-card keys), which left the\n\
+              # daemon with no sink at all. The mixer is found from the PCM's card.\n\
+              load-module module-alsa-sink device=hw:0,0 mmap=0 tsched=0 ignore_dB=1 fragments=4 fragment_size=12000 sink_properties=device.description=Eclipse\n\
+              load-module module-alsa-sink device=hw:1,0 mmap=0 tsched=0 ignore_dB=1 fragments=4 fragment_size=12000 sink_name=analog sink_properties=device.description=Analog\n\
               .fail\n\
               load-module module-always-sink\n\
               load-module module-intended-roles\n\
