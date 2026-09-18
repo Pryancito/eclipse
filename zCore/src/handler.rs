@@ -384,6 +384,47 @@ impl KernelHandler for ZcoreKernelHandler {
                 );
             }
         }
+        // The 4 KiB class is where ramfs file pages and memfd (wl_shm pool)
+        // backing live, and those are the ones that grow with a desktop
+        // session. Name them here as the OOM report does, so a reader does
+        // not have to guess what 4096B x N means.
+        #[cfg(feature = "linux")]
+        {
+            let (created, live, bytes) = linux_object::fs::memfd_stats();
+            let _ = writeln!(
+                s,
+                "memfd: created={} live={} live_bytes={} MiB",
+                created,
+                live,
+                bytes >> 20
+            );
+        }
+        // WHO holds the big blocks. The size-class histogram says "7 blocks of
+        // <=8 MiB"; this says which code asked for them, which is the question
+        // a leak hunt actually has. Live ≥2 MiB blocks, biggest first.
+        let (big, missed) = memory::heap_big_blocks();
+        if big.iter().any(|(sz, _)| *sz > 0) {
+            let _ = writeln!(s, "live blocks >= 2 MiB, by allocating call site:");
+            for (sz, site) in big.iter() {
+                if *sz == 0 {
+                    continue;
+                }
+                let _ = write!(s, "  {:>5} KiB <-", sz >> 10);
+                for f in site.iter() {
+                    if *f != 0 {
+                        let _ = write!(s, " {}", kernel_hal::ksyms::Addr(*f as u64));
+                    }
+                }
+                let _ = writeln!(s);
+            }
+            if missed > 0 {
+                let _ = writeln!(
+                    s,
+                    "  ({} more were not tracked: the table holds 128 live blocks)",
+                    missed
+                );
+            }
+        }
         let _ = writeln!(s, "hot exact sizes:");
         for (size, live) in memory::heap_hot_sizes() {
             if size != 0 && live > 0 {
