@@ -330,6 +330,7 @@ cfg_if! {
         #[global_allocator]
         static HEAP_ALLOCATOR: LockedHeap<ORDER> = LockedHeap::<ORDER>::new();
 
+<<<<<<< HEAD
         /// Whether this CPU may allocate right now.
         ///
         /// For fault and panic paths ONLY. A kernel fault taken INSIDE the
@@ -363,6 +364,8 @@ cfg_if! {
             }
         }
 
+=======
+>>>>>>> a5728235 (solucinado un bug en la compilacion.)
         /// The heap lock was found held **by this very CPU** at the moment we
         /// were about to block on it.
         ///
