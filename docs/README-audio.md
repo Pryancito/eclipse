@@ -155,6 +155,15 @@ paplay music.wav          # PCM; MP3 still goes through mpg123 → ALSA → Puls
 speaker-test -c 2 -t sine # ALSA default → Pulse
 ```
 
+`system.pa` loads `module-native-protocol-unix` **before** the ALSA sinks.
+`module-alsa-sink` touches hardware, and a card whose load wedges leaves the
+daemon alive, owning that PCM, with the socket module never reached: every
+client gets `Connection refused` (ALSA `default` is the pulse plugin) while
+`/dev/dsp` answers `EBUSY` because the daemon really does hold the card. With
+the socket first, that costs one sink instead of the whole daemon, and
+`pactl list sinks` still names the card that did not come up. `audio-probe`
+reports a live daemon with no socket as its own failure.
+
 The daemon is an eclipse-init `respawn` service (`pulseaudio.service` →
 `/usr/local/bin/eclipse-pulseaudio`). Logs: `/tmp/pulseaudio.log`. A ~150 ms
 exit is a startup abort (`--system` could not chown `/var/run/pulse` /
