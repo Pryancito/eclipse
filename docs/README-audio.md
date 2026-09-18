@@ -155,6 +155,17 @@ paplay music.wav          # PCM; MP3 still goes through mpg123 → ALSA → Puls
 speaker-test -c 2 -t sine # ALSA default → Pulse
 ```
 
+`module-native-protocol-unix` **must** carry `auth-cookie-enabled=0`. Without
+it the module loads-or-creates a cookie under a path the `pulse` account
+cannot write, fails to initialise, and the daemon runs on with **no socket**:
+alive, owning the cards, refusing every client (`Connection refused` from the
+pulse plugin, `EBUSY` from `/dev/dsp`). xtask only rewrites configs carrying
+its `# eclipse-generated` marker, so an older `system.pa` used to survive
+every rebuild in that state; it now moves such a file aside (`system.pa.bak`),
+always ships the canonical script as `/etc/pulse/system.pa.eclipse`, and
+`eclipse-pulseaudio` starts from that copy (`pulseaudio -n --file=`) whenever
+the config in place lacks the key. `audio-probe` checks the line directly.
+
 `system.pa` loads `module-native-protocol-unix` **before** the ALSA sinks.
 `module-alsa-sink` touches hardware, and a card whose load wedges leaves the
 daemon alive, owning that PCM, with the socket module never reached: every
