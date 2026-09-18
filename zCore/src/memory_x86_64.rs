@@ -609,6 +609,74 @@ cfg_if! {
             (out, BIG_TRACK_MISSED.load(Ordering::Relaxed))
         }
 
+        /// Heap pressure watermarks, in percent of `KERNEL_HEAP_SIZE`.
+        ///
+        /// The heap filling up used to be silent until the machine died in
+        /// `alloc_error`, with the attribution printed only at the funeral. A
+        /// march from 20% to 100% takes minutes of desktop use; say so while
+        /// there is still a machine to say it on, once per level crossed
+        /// upward, with the same by-size-class attribution.
+        const HEAP_PRESSURE_LEVELS: [usize; 4] = [60, 75, 85, 95];
+        static HEAP_PRESSURE_REPORTED: AtomicUsize = AtomicUsize::new(0);
+
+        /// One compare on the alloc path; the report itself is `#[cold]`.
+        #[inline]
+        fn note_heap_pressure(used: usize) {
+            let reported = HEAP_PRESSURE_REPORTED.load(Ordering::Relaxed);
+            if reported >= HEAP_PRESSURE_LEVELS.len() {
+                return;
+            }
+            let pct = used / (KERNEL_HEAP_SIZE / 100).max(1);
+            if pct >= HEAP_PRESSURE_LEVELS[reported] {
+                report_heap_pressure(reported, used, pct);
+            }
+        }
+
+        #[cold]
+        #[inline(never)]
+        fn report_heap_pressure(level: usize, used: usize, pct: usize) {
+            // Claim the level: whoever wins prints, everyone else moves on.
+            if HEAP_PRESSURE_REPORTED
+                .compare_exchange(level, level + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+            {
+                return;
+            }
+            emit(format_args!(
+                "\n[heap-pressure] {}% of the kernel heap in use ({} of {} MiB). Live by size class:\n",
+                pct,
+                used >> 20,
+                KERNEL_HEAP_SIZE >> 20,
+            ));
+            for (i, count) in HEAP_LIVE.iter().enumerate() {
+                let live = count.load(Ordering::Relaxed);
+                let size = 1usize << i;
+                // Only classes that could matter: a MiB or more if every
+                // block sat at the class bound.
+                if live > 0 && (live * size) >> 20 > 0 {
+                    emit(format_args!(
+                        "[heap-pressure]   <={:>9}B x {:<8} (<= {} MiB)\n",
+                        size,
+                        live,
+                        (live * size) >> 20,
+                    ));
+                }
+            }
+            #[cfg(feature = "linux")]
+            {
+                let (created, live, bytes) = linux_object::fs::memfd_stats();
+                emit(format_args!(
+                    "[heap-pressure]   memfd created={} live={} live_bytes={} MiB\n",
+                    created,
+                    live,
+                    bytes >> 20,
+                ));
+            }
+            emit(format_args!(
+                "[heap-pressure] `cat /proc/kheap` names the holders of every block >= 2 MiB\n"
+            ));
+        }
+
         #[cold]
         #[inline(never)]
         fn report_big_alloc(ptr: usize, sz: usize) {
@@ -1021,9 +1089,10 @@ cfg_if! {
                     {
                         report_stack_double_alloc(p as usize, sz, base);
                     }
-                    HEAP_USED.fetch_add(sz, Ordering::Relaxed);
+                    let used = HEAP_USED.fetch_add(sz, Ordering::Relaxed) + sz;
                     HEAP_LIVE[bucket_of(sz)].fetch_add(1, Ordering::Relaxed);
                     hot_track(sz, 1);
+                    note_heap_pressure(used);
                     if sz >= BIG_ALLOC_MIN {
                         track_big_alloc(p as usize, sz);
                         report_big_alloc(p as usize, sz);
