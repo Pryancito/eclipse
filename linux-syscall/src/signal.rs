@@ -124,9 +124,9 @@ impl Syscall<'_> {
             return Ok(0);
         }
         let ss = ss.read()?;
-        // check stack size when not disable
+        // check stack size when enabling (not when disabling)
         const MIN_SIGSTACK_SIZE: usize = 2048;
-        if ss.flags.contains(SignalStackFlags::DISABLE) && ss.size < MIN_SIGSTACK_SIZE {
+        if !ss.flags.contains(SignalStackFlags::DISABLE) && ss.size < MIN_SIGSTACK_SIZE {
             return Err(LxError::ENOMEM);
         }
         // only allow SS_AUTODISARM and SS_DISABLE
@@ -274,13 +274,16 @@ impl Syscall<'_> {
         let parent = self.zircon_process().clone();
         match parent.get_child(tid as u64) {
             Ok(obj) => {
-                let thread: Arc<Thread> = obj.downcast_arc().unwrap();
+                let thread: Arc<Thread> = match obj.downcast_arc() {
+                    Ok(t) => t,
+                    Err(_) => return Err(LxError::ESRCH),
+                };
                 let mut thread_linux = thread.lock_linux();
                 thread_linux.signals.insert(signal);
                 drop(thread_linux);
                 Ok(0)
             }
-            Err(_) => Err(LxError::EINVAL),
+            Err(_) => Err(LxError::ESRCH),
         }
     }
 
@@ -306,13 +309,16 @@ impl Syscall<'_> {
             .map(|proc| proc.get_child(tid as u64))
         {
             Ok(Ok(obj)) => {
-                let thread: Arc<Thread> = obj.downcast_arc().unwrap();
+                let thread: Arc<Thread> = match obj.downcast_arc() {
+                    Ok(t) => t,
+                    Err(_) => return Err(LxError::ESRCH),
+                };
                 let mut thread_linux = thread.lock_linux();
                 thread_linux.signals.insert(signal);
                 drop(thread_linux);
                 Ok(0)
             }
-            _ => Err(LxError::EINVAL),
+            _ => Err(LxError::ESRCH),
         }
     }
 
@@ -322,7 +328,10 @@ impl Syscall<'_> {
             "sigreturn: thread {} returns from handling the signal",
             self.thread.id()
         );
-        let (old_ctx, siginfo_ptr, uctx_ptr) = self.thread.fetch_backup_context().unwrap();
+        let (old_ctx, siginfo_ptr, uctx_ptr) = match self.thread.fetch_backup_context() {
+            Some(v) => v,
+            None => return Err(LxError::EINVAL),
+        };
         self.thread
             .with_context(|ctx| {
                 self.thread.lock_linux().restore_after_handle_signal(
@@ -332,7 +341,7 @@ impl Syscall<'_> {
                     uctx_ptr,
                 )
             })
-            .unwrap();
+            .map_err(|_| LxError::EINVAL)?;
         // sigreturn has no return value of its own: the generic syscall-return
         // path writes our result into rax AFTER the context restore above, so
         // returning a fixed 0 would clobber the interrupted syscall's restored
@@ -343,7 +352,7 @@ impl Syscall<'_> {
         let rax = self
             .thread
             .with_context(|ctx| ctx.get_field(kernel_hal::context::UserContextField::ReturnValue))
-            .unwrap();
+            .map_err(|_| LxError::EINVAL)?;
         Ok(rax)
     }
 

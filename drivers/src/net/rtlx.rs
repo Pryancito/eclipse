@@ -1,4 +1,5 @@
 use crate::sync::Mutex;
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -391,8 +392,10 @@ pub fn rtlx_init<F: Fn(usize, usize) -> Option<usize>>(
         IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
     ];
     let default_gateway = Ipv4Address::new(192, 168, 0, 1);
-    static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 4] = [None; 4];
-    let mut routes = unsafe { Routes::new(&mut ROUTES_STORAGE[..]) };
+    // Per-NIC storage — avoid the shared `static mut` aliasing bug fixed in e1000e.
+    let routes_storage: &'static mut [Option<(IpCidr, Route)>] =
+        Box::leak(vec![None; 4].into_boxed_slice());
+    let mut routes = Routes::new(routes_storage);
     routes.add_default_ipv4_route(default_gateway).unwrap();
     let neighbor_cache = NeighborCache::new(BTreeMap::new());
     let iface = InterfaceBuilder::new(net_driver.clone())

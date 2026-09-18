@@ -263,6 +263,7 @@ impl INode for FatMountINode {
             read: true,
             write: !self.is_dir,
             error: false,
+        hangup: false,
         })
     }
 

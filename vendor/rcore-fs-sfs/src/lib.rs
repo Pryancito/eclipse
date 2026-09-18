@@ -497,6 +497,7 @@ impl vfs::INode for INodeImpl {
             read: true,
             write: true,
             error: false,
+        hangup: false,
         })
     }
     /// the size returned here is logical size(entry num for directory), not the disk space used.

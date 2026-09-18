@@ -57,6 +57,7 @@ impl INode for RandomINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
 

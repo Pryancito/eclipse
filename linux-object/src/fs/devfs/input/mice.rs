@@ -139,6 +139,7 @@ impl INode for MiceDev {
             read: self.can_read(),
             write: false,
             error: false,
+        hangup: false,
         })
     }
 

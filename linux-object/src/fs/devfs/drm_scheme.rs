@@ -1310,6 +1310,7 @@ impl INode for DrmDev {
             // once the UserContext/#DF path at labwc bring-up is solid.
             write: true,
             error: false,
+        hangup: false,
         })
     }
 

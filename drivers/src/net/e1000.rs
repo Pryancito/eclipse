@@ -1,6 +1,7 @@
 //! Intel PRO/1000 Network Adapter i.e. e1000 network driver
 //! Datasheet: <https://www.intel.ca/content/dam/doc/datasheet/82574l-gbe-controller-datasheet.pdf>
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::string::String;
@@ -820,8 +821,11 @@ pub fn init(
         IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
         IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
     ];
-    static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 4] = [None; 4];
-    let routes = unsafe { Routes::new(&mut ROUTES_STORAGE[..]) };
+    // Per-NIC storage (same pattern as e1000e): a shared `static mut` would
+    // alias if two e1000 probes ran, corrupting both route tables.
+    let routes_storage: &'static mut [Option<(IpCidr, Route)>] =
+        Box::leak(vec![None; 4].into_boxed_slice());
+    let routes = Routes::new(routes_storage);
     let neighbor_cache = NeighborCache::new(BTreeMap::new());
 
     let iface = InterfaceBuilder::new(net_driver.clone())

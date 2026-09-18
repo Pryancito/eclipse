@@ -167,6 +167,7 @@ impl INode for EventDev {
             read: self.can_read(),
             write: false,
             error: false,
+        hangup: false,
         })
     }
 

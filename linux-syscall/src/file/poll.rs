@@ -195,14 +195,21 @@ impl Syscall<'_> {
                         };
                         if status.error {
                             poll.revents |= PE::ERR;
-                            events += 1;
                         }
                         if status.read && poll.events.contains(PE::IN) {
                             poll.revents |= PE::IN;
-                            events += 1;
                         }
                         if status.write && poll.events.contains(PE::OUT) {
                             poll.revents |= PE::OUT;
+                        }
+                        // POLLHUP/POLLERR are return-only: always report when set,
+                        // even if the caller did not list them in `events`.
+                        if status.hangup {
+                            poll.revents |= PE::HUP;
+                        }
+                        // Linux poll(2): return value is the number of fds with
+                        // nonzero revents, not the number of event bits set.
+                        if !poll.revents.is_empty() {
                             events += 1;
                         }
                     } else if <FileDesc as Into<i32>>::into(poll.fd) < 0 {

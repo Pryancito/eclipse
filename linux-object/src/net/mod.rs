@@ -1918,10 +1918,12 @@ pub fn handle_net_ioctl(
                 let prefix_len = prefix_len_from_netmask(genmask).unwrap_or(0);
                 let cidr = IpCidr::Ipv4(Ipv4Cidr::new(dst_addr, prefix_len));
 
+                let ifname_owned;
                 let ifname = if !rt.rt_dev.is_null() {
                     #[allow(unsafe_code)]
-                    unsafe {
-                        from_cstr(rt.rt_dev)
+                    {
+                        ifname_owned = unsafe { copy_ifname(rt.rt_dev)? };
+                        ifname_owned.as_str()
                     }
                 } else {
                     "eth0" // default to eth0 if not specified
@@ -1978,10 +1980,12 @@ pub fn handle_net_ioctl(
                 let prefix_len = prefix_len_from_netmask(genmask).unwrap_or(0);
                 let cidr = IpCidr::Ipv4(Ipv4Cidr::new(dst_addr, prefix_len));
 
+                let ifname_owned;
                 let ifname = if !rt.rt_dev.is_null() {
                     #[allow(unsafe_code)]
-                    unsafe {
-                        from_cstr(rt.rt_dev)
+                    {
+                        ifname_owned = unsafe { copy_ifname(rt.rt_dev)? };
+                        ifname_owned.as_str()
                     }
                 } else {
                     "eth0" // default to eth0 if not specified
@@ -2010,13 +2014,53 @@ pub fn handle_net_ioctl(
 // ============= Util =============
 
 #[allow(unsafe_code)]
+/// Copy a C interface name from a user pointer into an owned string.
+///
+/// Bounded to Linux `IFNAMSIZ` (16, including the NUL). Never walks past that
+/// limit and never panics on bad UTF-8 or a missing terminator — those become
+/// `EINVAL` / `EFAULT` instead of taking the machine down.
+///
 /// # Safety
-/// Convert C string to Rust string
+/// `s` must be readable for at most `IFNAMSIZ` bytes in the caller's address
+/// space (or be null, which returns `EFAULT`). Callers still owe a proper
+/// `copy_from_user`; this only removes the unbounded/`unwrap` hazards.
+pub unsafe fn copy_ifname(s: *const u8) -> Result<alloc::string::String, LxError> {
+    const IFNAMSIZ: usize = 16;
+    if s.is_null() {
+        return Err(LxError::EFAULT);
+    }
+    let mut buf = [0u8; IFNAMSIZ];
+    let mut len = 0;
+    while len < IFNAMSIZ {
+        let b = unsafe { core::ptr::read(s.add(len)) };
+        if b == 0 {
+            break;
+        }
+        buf[len] = b;
+        len += 1;
+    }
+    if len == 0 || len == IFNAMSIZ {
+        // empty, or no NUL within IFNAMSIZ
+        return Err(LxError::EINVAL);
+    }
+    core::str::from_utf8(&buf[..len])
+        .map(|s| alloc::string::String::from(s))
+        .map_err(|_| LxError::EINVAL)
+}
+
+#[allow(unsafe_code)]
+/// # Safety
+/// Convert C string to Rust string. Prefer [`copy_ifname`] for user pointers.
+#[deprecated(note = "use copy_ifname for user-supplied pointers")]
 pub unsafe fn from_cstr(s: *const u8) -> &'static str {
     use core::{slice, str};
-    let len = (0usize..).find(|&i| unsafe { *s.add(i) == 0 }).unwrap();
-    str::from_utf8(unsafe { slice::from_raw_parts(s, len) }).unwrap()
+    let len = (0usize..IFNAMSIZ_LEGACY)
+        .find(|&i| unsafe { *s.add(i) == 0 })
+        .unwrap_or(IFNAMSIZ_LEGACY);
+    str::from_utf8(unsafe { slice::from_raw_parts(s, len) }).unwrap_or("")
 }
+
+const IFNAMSIZ_LEGACY: usize = 16;
 
 // ============= Util =============
 

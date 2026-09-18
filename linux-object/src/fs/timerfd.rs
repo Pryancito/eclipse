@@ -159,6 +159,7 @@ impl FileLike for TimerFd {
             read: self.inner.count.load(SeqCst) > 0,
             write: false,
             error: false,
+        hangup: false,
         })
     }
 

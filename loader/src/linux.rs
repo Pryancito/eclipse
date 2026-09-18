@@ -508,6 +508,21 @@ async fn run_user(thread: CurrentThread) {
         if thread.state() == ThreadState::Dying {
             break;
         }
+        // Job-control stop: do not re-enter uspace until SIGCONT (or death).
+        if thread
+            .proc()
+            .try_linux()
+            .map(|lp| lp.is_job_stopped())
+            .unwrap_or(false)
+        {
+            linux_object::process::wait_while_job_stopped(&thread.proc()).await;
+            if thread.state() == ThreadState::Dying {
+                break;
+            }
+            // Drop into the next loop iteration so a pending SIGCONT handler
+            // (or another signal) is considered before enter_uspace.
+            continue;
+        }
 
         // run
         trace!(
@@ -557,28 +572,48 @@ fn handle_signal(
     let action = thread.proc().linux().signal_action(signal);
     // Handle default/ignore actions without entering a handler.
     if action.handler == SIG_IGN {
+        // SIGCONT still resumes a stopped process even when ignored.
+        if signal == Signal::SIGCONT {
+            let proc = thread.proc();
+            if let Some(lp) = proc.try_linux() {
+                lp.job_continue(&proc);
+            }
+        }
         thread.inner().lock_linux().handling_signal = None;
         return ctx;
+    }
+    if signal == Signal::SIGSTOP
+        || (action.handler == SIG_DFL
+            && matches!(
+                signal,
+                Signal::SIGTSTP | Signal::SIGTTIN | Signal::SIGTTOU
+            ))
+    {
+        let proc = thread.proc();
+        if let Some(lp) = proc.try_linux() {
+            lp.job_stop(&proc, signal as u8);
+        }
+        thread.inner().lock_linux().handling_signal = None;
+        return ctx;
+    }
+    if signal == Signal::SIGCONT {
+        let proc = thread.proc();
+        if let Some(lp) = proc.try_linux() {
+            lp.job_continue(&proc);
+        }
+        if action.handler == SIG_DFL {
+            thread.inner().lock_linux().handling_signal = None;
+            return ctx;
+        }
+        // Custom handler: fall through after resuming.
     }
     if action.handler == SIG_DFL {
         // Per-signal default disposition. Linux's default for the job-control and
         // a few status signals is NOT to terminate: SIGCHLD/SIGURG/SIGWINCH are
-        // ignored, and SIGTSTP/SIGTTIN/SIGTTOU/SIGSTOP stop the process while
-        // SIGCONT resumes it. This kernel has no job-control stop state, so it
-        // approximates all of those as "ignore" — crucially this stops an
-        // interactive `sh` from being *killed* by the SIGTTIN it sends itself
-        // during job-control setup (the cause of the per-VT shells dying and the
-        // terminal never reaching a usable prompt). Everything else still
+        // ignored. Stop/continue are handled above. Everything else still
         // terminates, as before.
         match signal {
-            Signal::SIGCHLD
-            | Signal::SIGURG
-            | Signal::SIGWINCH
-            | Signal::SIGCONT
-            | Signal::SIGSTOP
-            | Signal::SIGTSTP
-            | Signal::SIGTTIN
-            | Signal::SIGTTOU => {
+            Signal::SIGCHLD | Signal::SIGURG | Signal::SIGWINCH => {
                 trace!(
                     "default-ignore signal {:?} for pid={}",
                     signal,

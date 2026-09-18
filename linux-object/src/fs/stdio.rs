@@ -1760,6 +1760,7 @@ impl INode for Stdin {
             // VT nodes are RDWR (`/dev/ttyN`); Linux always reports POLLOUT.
             write: true,
             error: false,
+        hangup: false,
         })
     }
 
@@ -1831,6 +1832,7 @@ impl INode for Stdin {
                         read: true,
                         write: true,
                         error: false,
+                    hangup: false,
                     }));
                 }
 
@@ -1876,6 +1878,7 @@ impl INode for Stdin {
                         read: true,
                         write: true,
                         error: false,
+                    hangup: false,
                     }))
                 } else {
                     Poll::Pending
@@ -2015,6 +2018,7 @@ impl INode for Stdout {
             read: false,
             write: true,
             error: false,
+        hangup: false,
         })
     }
 

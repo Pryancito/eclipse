@@ -234,10 +234,18 @@ impl INode for Pipe {
     /// monitoring events and determine whether the pipe is readable or writeable
     /// if the write end is not close and the buffer is empty, the read end will be block
     fn poll(&self) -> Result<PollStatus> {
+        let data = self.data.lock();
+        let hangup = match self.direction {
+            PipeEnd::Read => data.write_cnt == 0,
+            PipeEnd::Write => data.read_cnt == 0,
+        };
         Ok(PollStatus {
-            read: self.can_read(),
-            write: self.can_write(),
-            error: false,
+            read: matches!(self.direction, PipeEnd::Read)
+                && (!data.buf.is_empty() || hangup),
+            write: matches!(self.direction, PipeEnd::Write) && data.read_cnt > 0,
+            // Linux: POLLERR on the write end when no readers remain.
+            error: matches!(self.direction, PipeEnd::Write) && hangup,
+            hangup,
         })
     }
 
@@ -278,9 +286,16 @@ impl INode for Pipe {
                 // later pipe write wakes a freed task (UAF → delayed PAGE FAULT).
                 let this = self.get_mut();
                 let mut data = this.pipe.data.lock();
+                let hangup = match this.pipe.direction {
+                    PipeEnd::Read => data.write_cnt == 0,
+                    PipeEnd::Write => data.read_cnt == 0,
+                };
                 let ready = match this.pipe.direction {
-                    PipeEnd::Read => !data.buf.is_empty() || data.write_cnt == 0,
-                    PipeEnd::Write => data.read_cnt > 0,
+                    // Readable data, or EOF/hangup when writers are gone.
+                    PipeEnd::Read => !data.buf.is_empty() || hangup,
+                    // Writable while readers remain; hangup when they are gone
+                    // (must wake POLLHUP/POLLERR interest, not spin Pending).
+                    PipeEnd::Write => data.read_cnt > 0 || hangup,
                 };
                 if ready {
                     if let Some(id) = this.sub_id.take() {

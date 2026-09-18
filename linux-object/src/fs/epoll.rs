@@ -194,6 +194,7 @@ impl Epoll {
                 if (status.read && interest.contains(PollEvents::IN))
                     || (status.write && interest.contains(PollEvents::OUT))
                     || status.error
+                    || status.hangup
                 {
                     return true;
                 }
@@ -243,6 +244,7 @@ impl FileLike for Epoll {
             read: self.any_ready(),
             write: false,
             error: false,
+        hangup: false,
         })
     }
 
@@ -251,6 +253,7 @@ impl FileLike for Epoll {
             read: self.any_ready(),
             write: false,
             error: false,
+        hangup: false,
         })
     }
 }
@@ -313,6 +316,9 @@ impl Epoll {
                 }
                 if status.error {
                     ready_events |= PollEvents::ERR.bits() as u32;
+                }
+                if status.hangup {
+                    ready_events |= PollEvents::HUP.bits() as u32;
                 }
 
                 if ready_events != 0 {

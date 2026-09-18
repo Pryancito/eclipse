@@ -43,6 +43,7 @@ impl INode for Pseudo {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {

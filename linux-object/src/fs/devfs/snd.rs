@@ -1658,6 +1658,7 @@ impl INode for PcmDev {
             read: false,
             write: writable >= st.avail_min.max(st.period_size),
             error: false,
+        hangup: false,
         })
     }
 
@@ -2098,6 +2099,7 @@ impl INode for TimerDev {
             read: false,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -2143,6 +2145,7 @@ impl INode for TimerClient {
             read: !st.queue.is_empty(),
             write: false,
             error: false,
+        hangup: false,
         })
     }
 
@@ -3015,6 +3018,7 @@ impl INode for CtlDev {
             read: false,
             write: false,
             error: false,
+        hangup: false,
         })
     }
 

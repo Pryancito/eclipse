@@ -124,6 +124,7 @@ impl FileLike for SignalFd {
             read: self.pending_matched().is_not_empty(),
             write: false,
             error: false,
+        hangup: false,
         })
     }
 

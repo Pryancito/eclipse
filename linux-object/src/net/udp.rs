@@ -510,7 +510,7 @@ impl FileLike for UdpSocketState {
 
     fn poll(&self, events: PollEvents) -> LxResult<PollStatus> {
         let (read, write, error) = Socket::poll(self, events);
-        Ok(PollStatus { read, write, error })
+        Ok(PollStatus { read, write, error, hangup: false })
     }
 
     async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
@@ -522,7 +522,7 @@ impl FileLike for UdpSocketState {
             kernel_hal::net::NetRxOrTimeoutFuture::new(5).await;
             (read, write, error) = Socket::poll(self, events);
         }
-        Ok(PollStatus { read, write, error })
+        Ok(PollStatus { read, write, error, hangup: false })
     }
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> LxResult<usize> {

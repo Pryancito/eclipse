@@ -98,6 +98,7 @@ impl FileLike for SyncobjHandle {
             read: false,
             write: false,
             error: false,
+        hangup: false,
         })
     }
 
@@ -106,6 +107,7 @@ impl FileLike for SyncobjHandle {
             read: false,
             write: false,
             error: false,
+        hangup: false,
         })
     }
 }

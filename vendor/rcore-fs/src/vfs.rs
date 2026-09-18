@@ -211,6 +211,9 @@ pub struct PollStatus {
     pub read: bool,
     pub write: bool,
     pub error: bool,
+    /// Peer hangup / connection closed (Linux POLLHUP). Always reportable
+    /// regardless of the events interest mask.
+    pub hangup: bool,
 }
 
 #[derive(Debug)]

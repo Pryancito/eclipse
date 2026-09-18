@@ -127,6 +127,7 @@ impl INode for SysRootINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
 
@@ -186,6 +187,7 @@ impl INode for SysClassINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
 
@@ -240,6 +242,7 @@ impl INode for SysBlockDirINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
 
@@ -302,6 +305,7 @@ impl INode for SysBlockDevINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
 
@@ -356,6 +360,7 @@ impl INode for SysBusDirINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -398,6 +403,7 @@ impl INode for SysBusPciDirINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -440,6 +446,7 @@ impl INode for SysDevicesDirINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -483,6 +490,7 @@ impl INode for SysDevicesSystemDirINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -526,6 +534,7 @@ impl INode for SysDevicesSystemNodeDirINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -574,6 +583,7 @@ impl INode for SysDevicesSystemNode0DirINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -644,6 +654,7 @@ impl INode for SysDevicesPciBusDirINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -703,6 +714,7 @@ impl INode for SysPciDevicesDirINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -773,6 +785,7 @@ impl INode for SysPciDevDirINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -1203,6 +1216,7 @@ impl INode for SysClassDrmDirINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -1317,6 +1331,7 @@ impl INode for SysDrmNodeINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -1402,6 +1417,7 @@ impl INode for SysDrmDeviceDrmDirINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -1474,6 +1490,7 @@ impl INode for SysDevDirINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -1516,6 +1533,7 @@ impl INode for SysDevCharDirINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -1706,6 +1724,7 @@ impl INode for SysClassInputDirINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -1764,6 +1783,7 @@ impl INode for SysInputEventINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -1824,6 +1844,7 @@ impl INode for SysClassNetDirINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -1879,6 +1900,7 @@ impl INode for SysNetIfaceINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -1947,6 +1969,7 @@ impl INode for SysClassPowerSupplyDirINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -2077,6 +2100,7 @@ impl INode for ThermalAttrINode {
             read: true,
             write: true,
             error: false,
+        hangup: false,
         })
     }
 
@@ -2133,6 +2157,7 @@ impl INode for SysClassThermalDirINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -2193,6 +2218,7 @@ impl INode for SysThermalZoneDirINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -2256,6 +2282,7 @@ impl INode for SysThermalCoolingDirINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -2428,6 +2455,7 @@ impl INode for PmAttrINode {
             read: true,
             write: true,
             error: false,
+        hangup: false,
         })
     }
 
@@ -2479,6 +2507,7 @@ impl INode for SysPowerDirINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -2527,6 +2556,7 @@ impl INode for SysDevicesSystemCpuDirINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -2597,6 +2627,7 @@ impl INode for SysCpuNDirINode {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {

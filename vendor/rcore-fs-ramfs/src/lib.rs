@@ -260,6 +260,7 @@ impl INode for LockedINode {
             read: true,
             write: true,
             error: false,
+        hangup: false,
         })
     }
 

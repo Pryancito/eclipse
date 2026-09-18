@@ -128,6 +128,7 @@ impl INode for BlockDev {
             read: true,
             write: true,
             error: false,
+        hangup: false,
         })
     }
 

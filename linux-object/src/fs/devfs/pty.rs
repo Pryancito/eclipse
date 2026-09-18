@@ -249,6 +249,7 @@ impl INode for PtsDir {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
     fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
@@ -322,6 +323,7 @@ impl INode for PtmxINode {
             read: false,
             write: true,
             error: false,
+        hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -392,6 +394,7 @@ impl INode for PtyMaster {
             read: !g.output.is_empty(),
             write: true,
             error: false,
+        hangup: false,
         })
     }
 
@@ -464,6 +467,7 @@ impl INode for PtySlave {
             read: !g.input.is_empty() || !g.master_open,
             write: true,
             error: false,
+        hangup: false,
         })
     }
 
@@ -610,6 +614,7 @@ impl<'a> Future for PtyReadFuture<'a> {
                 read: true,
                 write: true,
                 error: false,
+            hangup: false,
             }));
         }
         if this.armed {

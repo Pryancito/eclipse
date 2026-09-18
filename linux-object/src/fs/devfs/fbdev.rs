@@ -331,6 +331,7 @@ impl INode for FbDev {
             read: true,
             write: false,
             error: false,
+        hangup: false,
         })
     }
 

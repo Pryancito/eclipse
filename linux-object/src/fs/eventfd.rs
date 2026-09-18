@@ -128,6 +128,7 @@ impl FileLike for EventFd {
             read: counter > 0,
             write: counter < u64::MAX - 1,
             error: false,
+        hangup: false,
         })
     }
 

@@ -10,7 +10,9 @@ use bitflags::bitflags;
 use kernel_hal::context::{UserContext, UserContextField};
 use linux_object::error::LxResult;
 use linux_object::fs::{FileLike, PidFd};
-use linux_object::process::{wait_child, wait_child_any};
+use linux_object::process::{
+    wait_child_any_interest, wait_child_interest, WaitInterest,
+};
 use linux_object::signal::SigInfo;
 use linux_object::thread::{CurrentThreadExt, RobustList, ThreadExt};
 use linux_object::time::RUsage;
@@ -478,6 +480,7 @@ impl Syscall<'_> {
         enum WaitTarget {
             AnyChild,
             AnyChildInGroup,
+            Pgid(KoID),
             Pid(KoID),
         }
         bitflags! {
@@ -493,16 +496,19 @@ impl Syscall<'_> {
             -1 => WaitTarget::AnyChild,
             0 => WaitTarget::AnyChildInGroup,
             p if p > 0 => WaitTarget::Pid(p as KoID),
-            // pid < -1 means "any child in process group |pid|". Process groups
-            // are not tracked here, so fall back to waiting on any child rather
-            // than panicking the kernel on user-controlled input.
-            _ => WaitTarget::AnyChildInGroup,
+            // pid < -1: any child in process group |pid|.
+            p => WaitTarget::Pgid((-p) as KoID),
         };
         let flags = WaitFlags::from_bits_truncate(options);
         let nohang = flags.contains(WaitFlags::NOHANG);
         // Consume (reap) the child's exit status unless WNOWAIT was requested,
         // which only peeks at it and leaves the zombie for a later wait.
         let reap = !flags.contains(WaitFlags::NOWAIT);
+        let interest = WaitInterest {
+            exited: true,
+            stopped: flags.contains(WaitFlags::STOPPED),
+            continued: flags.contains(WaitFlags::CONTINUED),
+        };
         // Hot path (shells, fork+exec, sysbench worker reaping): keep at debug
         // so a default `LOG=warn` boot doesn't pay a synchronous serial write
         // on every wait.
@@ -511,10 +517,32 @@ impl Syscall<'_> {
             target, wstatus, flags,
         );
         let result = match target {
-            WaitTarget::AnyChild | WaitTarget::AnyChildInGroup => {
-                wait_child_any(self.zircon_process(), nohang, reap).await
+            WaitTarget::AnyChild => {
+                wait_child_any_interest(self.zircon_process(), nohang, reap, interest, None).await
             }
-            WaitTarget::Pid(pid) => wait_child(self.zircon_process(), pid, nohang, reap)
+            WaitTarget::AnyChildInGroup => {
+                let pgid = linux_object::process::get_process_pgid(self.zircon_process().id())
+                    .unwrap_or(self.zircon_process().id());
+                wait_child_any_interest(
+                    self.zircon_process(),
+                    nohang,
+                    reap,
+                    interest,
+                    Some(pgid),
+                )
+                .await
+            }
+            WaitTarget::Pgid(pgid) => {
+                wait_child_any_interest(
+                    self.zircon_process(),
+                    nohang,
+                    reap,
+                    interest,
+                    Some(pgid),
+                )
+                .await
+            }
+            WaitTarget::Pid(pid) => wait_child_interest(self.zircon_process(), pid, nohang, reap, interest)
                 .await
                 .map(|(code, cpu)| (pid, code, cpu)),
         };
@@ -581,6 +609,11 @@ impl Syscall<'_> {
         let opts = WaitIdOptions::from_bits_truncate(options);
         let nohang = opts.contains(WaitIdOptions::WNOHANG);
         let reap = !opts.contains(WaitIdOptions::WNOWAIT);
+        let interest = WaitInterest {
+            exited: opts.contains(WaitIdOptions::WEXITED),
+            stopped: opts.contains(WaitIdOptions::WSTOPPED),
+            continued: opts.contains(WaitIdOptions::WCONTINUED),
+        };
         let caller = self.zircon_process();
 
         let res = match idtype {
@@ -588,7 +621,7 @@ impl Syscall<'_> {
                 if id == 0 {
                     return Err(LxError::EINVAL);
                 }
-                match wait_child(caller, id as KoID, nohang, reap).await {
+                match wait_child_interest(caller, id as KoID, nohang, reap, interest).await {
                     Ok((code, _cpu)) => Ok((id as KoID, code)),
                     Err(LxError::EAGAIN) if nohang => Ok((0, 0)),
                     Err(e) => Err(e),
@@ -606,26 +639,39 @@ impl Syscall<'_> {
                 {
                     return Err(LxError::EAGAIN);
                 }
-                match wait_child(caller, target.id(), nohang, reap).await {
+                match wait_child_interest(caller, target.id(), nohang, reap, interest).await {
                     Ok((code, _cpu)) => Ok((target.id(), code)),
                     Err(LxError::EAGAIN) if nohang => Ok((0, 0)),
                     Err(e) => Err(e),
                 }
             }
-            P_ALL => match wait_child_any(caller, nohang, reap).await {
+            P_ALL => match wait_child_any_interest(caller, nohang, reap, interest, None).await {
                 Ok((pid, code, _cpu)) => Ok((pid, code)),
                 Err(LxError::EAGAIN) if nohang => Ok((0, 0)),
                 Err(e) => Err(e),
             },
-            P_PGID => return Err(LxError::ENOSYS),
+            P_PGID => {
+                let pgid = if id == 0 {
+                    linux_object::process::get_process_pgid(caller.id())
+                        .unwrap_or(caller.id())
+                } else {
+                    id as KoID
+                };
+                match wait_child_any_interest(caller, nohang, reap, interest, Some(pgid)).await {
+                    Ok((pid, code, _cpu)) => Ok((pid, code)),
+                    Err(LxError::EAGAIN) if nohang => Ok((0, 0)),
+                    Err(e) => Err(e),
+                }
+            }
             _ => return Err(LxError::EINVAL),
         };
 
         let (child_pid, status) = res?;
 
-        if opts.contains(WaitIdOptions::WEXITED) || options == 0 {
-            let exit_status = status >> 8;
-            write_sigchld_info(infop, child_pid, exit_status)?;
+        if child_pid != 0 {
+            // `si_status` is the exit code, stop signal, or continued marker —
+            // extract from the wait status word the same way shells do.
+            write_sigchld_info(infop, child_pid, status >> 8)?;
         }
         Ok(0)
     }

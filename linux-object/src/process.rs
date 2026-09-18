@@ -454,8 +454,8 @@ impl ProcessExt for Process {
 ///
 /// A state change is considered to be:
 /// - the child terminated.
-/// - the child was stopped by a signal. TODO
-/// - the child was resumed by a signal. TODO
+/// - the child was stopped by a signal (`WSTOPPED` / `WUNTRACED`).
+/// - the child was resumed by a signal (`WCONTINUED`).
 ///
 /// CPU usage a child had accumulated by the time it exited: what `wait4(2)`
 /// reports through its rusage out-parameter and what the parent adds to its
@@ -468,6 +468,37 @@ pub struct ChildCpu {
     /// Kernel nanoseconds from the per-process syscall accounting.
     pub stime_ns: u64,
 }
+
+/// Which child state changes a `wait*` call is interested in.
+#[derive(Debug, Clone, Copy)]
+pub struct WaitInterest {
+    /// Child terminated (always true for classic `wait4`).
+    pub exited: bool,
+    /// Child stopped by a signal.
+    pub stopped: bool,
+    /// Stopped child resumed by `SIGCONT`.
+    pub continued: bool,
+}
+
+impl WaitInterest {
+    /// Classic `wait4` / `waitpid` without `WUNTRACED`/`WCONTINUED`.
+    pub const EXITED_ONLY: Self = Self {
+        exited: true,
+        stopped: false,
+        continued: false,
+    };
+}
+
+/// `wait` status word for a stopped child: `WIFSTOPPED` / `WSTOPSIG`.
+pub fn wait_status_stopped(sig: u8) -> i32 {
+    ((sig as i32) << 8) | 0x7f
+}
+
+/// `wait` status word for a continued child: `WIFCONTINUED`.
+pub const WAIT_STATUS_CONTINUED: i32 = 0xffff;
+
+/// Zircon user signal used to wake threads parked in a job-control stop.
+const JOB_CONTINUE_SIGNAL: Signal = Signal::USER_SIGNAL_1;
 
 /// A reaped child's zombie record as carried through reparenting: its pid and
 /// the `(exit_code, cpu_usage)` pair kept until the reaper collects it.
@@ -490,51 +521,72 @@ pub async fn wait_child(
     nonblock: bool,
     reap: bool,
 ) -> LxResult<(ExitCode, ChildCpu)> {
+    wait_child_interest(proc, pid, nonblock, reap, WaitInterest::EXITED_ONLY).await
+}
+
+pub async fn wait_child_interest(
+    proc: &Arc<Process>,
+    pid: KoID,
+    nonblock: bool,
+    reap: bool,
+    interest: WaitInterest,
+) -> LxResult<(ExitCode, ChildCpu)> {
     loop {
         check_signals()?;
         {
             let mut inner = proc.linux().inner.lock();
-            if let Some(&(code, cpu)) = inner.reaped_children.get(&pid) {
-                if reap {
-                    inner.reaped_children.remove(&pid);
-                    inner.add_children_cpu(cpu);
+            if interest.exited {
+                if let Some(&(code, cpu)) = inner.reaped_children.get(&pid) {
+                    if reap {
+                        inner.reaped_children.remove(&pid);
+                        inner.add_children_cpu(cpu);
+                    }
+                    return Ok(((code as i32) << 8, cpu));
                 }
-                return Ok(((code as i32) << 8, cpu));
             }
         }
         let child = {
             let inner = proc.linux().inner.lock();
             inner.children.get(&pid).cloned().ok_or(LxError::ECHILD)?
         };
-        if let Status::Exited(code) = child.status() {
-            let cpu = child_cpu(&child);
-            if reap {
-                let mut inner = proc.linux().inner.lock();
-                inner.children.remove(&pid);
-                inner.reaped_children.remove(&pid);
-                inner.add_children_cpu(cpu);
+        if interest.exited {
+            if let Status::Exited(code) = child.status() {
+                let cpu = child_cpu(&child);
+                if reap {
+                    let mut inner = proc.linux().inner.lock();
+                    inner.children.remove(&pid);
+                    inner.reaped_children.remove(&pid);
+                    inner.add_children_cpu(cpu);
+                }
+                return Ok(((code as i32) << 8, cpu));
             }
-            return Ok(((code as i32) << 8, cpu));
+        }
+        if let Some(status) = child.try_linux().and_then(|lp| lp.take_wait_notification(interest)) {
+            return Ok((status, ChildCpu::default()));
         }
         if nonblock {
             return Err(LxError::EAGAIN);
         }
-        let child_obj: Arc<dyn KernelObject> = child.clone();
-        child_obj.wait_signal(Signal::PROCESS_TERMINATED).await;
-        check_signals()?;
-
-        // Check again after wait
-        if let Status::Exited(code) = child.status() {
-            let cpu = child_cpu(&child);
-            if reap {
-                let mut inner = proc.linux().inner.lock();
-                inner.children.remove(&pid);
-                inner.reaped_children.remove(&pid);
-                inner.add_children_cpu(cpu);
+        // Exit, stop and continue all pulse SIGCHLD on the parent.
+        let proc_obj: Arc<dyn KernelObject> = proc.clone();
+        proc_obj.signal_clear(Signal::SIGCHLD);
+        if interest.exited {
+            if let Status::Exited(code) = child.status() {
+                let cpu = child_cpu(&child);
+                if reap {
+                    let mut inner = proc.linux().inner.lock();
+                    inner.children.remove(&pid);
+                    inner.reaped_children.remove(&pid);
+                    inner.add_children_cpu(cpu);
+                }
+                return Ok(((code as i32) << 8, cpu));
             }
-            return Ok(((code as i32) << 8, cpu));
         }
-        continue;
+        if let Some(status) = child.try_linux().and_then(|lp| lp.take_wait_notification(interest)) {
+            return Ok((status, ChildCpu::default()));
+        }
+        check_signals()?;
+        proc_obj.wait_signal(Signal::SIGCHLD).await;
     }
 }
 
@@ -544,67 +596,93 @@ pub async fn wait_child_any(
     nonblock: bool,
     reap: bool,
 ) -> LxResult<(KoID, ExitCode, ChildCpu)> {
+    wait_child_any_interest(proc, nonblock, reap, WaitInterest::EXITED_ONLY, None).await
+}
+
+pub async fn wait_child_any_interest(
+    proc: &Arc<Process>,
+    nonblock: bool,
+    reap: bool,
+    interest: WaitInterest,
+    pgid: Option<KoID>,
+) -> LxResult<(KoID, ExitCode, ChildCpu)> {
     loop {
-        // kill(1, SIGTERM) must interrupt PID 1's blocking waitpid so
-        // eclipse-init can power off without waiting for a child to exit.
         check_signals()?;
-        let mut inner = proc.linux().inner.lock();
-        if inner.children.is_empty() && inner.reaped_children.is_empty() {
-            return Err(LxError::ECHILD);
+        if let Some(result) = scan_waitable_children(proc, reap, interest, pgid) {
+            return result;
         }
-        if let Some((pid, (code, cpu))) = inner.reaped_children.iter().next().map(|(&p, &c)| (p, c))
         {
-            if reap {
-                inner.reaped_children.remove(&pid);
-                inner.add_children_cpu(cpu);
+            let inner = proc.linux().inner.lock();
+            let has_candidate = if let Some(want) = pgid {
+                inner
+                    .children
+                    .iter()
+                    .any(|(_, c)| effective_pgid(c) == want)
+            } else {
+                !inner.children.is_empty() || !inner.reaped_children.is_empty()
+            };
+            if !has_candidate {
+                return Err(LxError::ECHILD);
             }
-            return Ok((pid, (code as i32) << 8, cpu));
-        }
-        let mut exited_pid = None;
-        trace!("wait_child_any: checking {} children", inner.children.len());
-        for (&pid, child) in inner.children.iter() {
-            let status = child.status();
-            trace!("  child {}: status={:?}", pid, status);
-            if let Status::Exited(code) = status {
-                exited_pid = Some((pid, code));
-                break;
-            }
-        }
-        if let Some((pid, code)) = exited_pid {
-            trace!("wait_child_any: reaping child {}", pid);
-            let cpu = inner.children.get(&pid).map(child_cpu).unwrap_or_default();
-            if reap {
-                inner.children.remove(&pid);
-                inner.reaped_children.remove(&pid);
-                inner.add_children_cpu(cpu);
-            }
-            return Ok((pid, (code as i32) << 8, cpu));
         }
         if nonblock {
             return Err(LxError::EAGAIN);
         }
         let proc_obj: Arc<dyn KernelObject> = proc.clone();
         proc_obj.signal_clear(Signal::SIGCHLD);
-        // Check again after clear to avoid race
-        let mut found_exited = false;
-        for child in inner.children.values() {
-            if let Status::Exited(_) = child.status() {
-                found_exited = true;
-                break;
-            }
+        if let Some(result) = scan_waitable_children(proc, reap, interest, pgid) {
+            return result;
         }
-        drop(inner);
-        if found_exited {
-            trace!("wait_child_any: found exited child after clear, continuing");
-            continue;
-        }
-        // kill() may have pulsed SIGCHLD and we just cleared it; the Linux
-        // signal is still pending, so notice it before sleeping.
         check_signals()?;
         trace!("wait_child_any: waiting for SIGCHLD");
         proc_obj.wait_signal(Signal::SIGCHLD).await;
         trace!("wait_child_any: woke up from SIGCHLD");
     }
+}
+
+fn scan_waitable_children(
+    proc: &Arc<Process>,
+    reap: bool,
+    interest: WaitInterest,
+    pgid: Option<KoID>,
+) -> Option<LxResult<(KoID, ExitCode, ChildCpu)>> {
+    let mut inner = proc.linux().inner.lock();
+    if interest.exited && pgid.is_none() {
+        if let Some((pid, (code, cpu))) = inner.reaped_children.iter().next().map(|(&p, &c)| (p, c))
+        {
+            if reap {
+                inner.reaped_children.remove(&pid);
+                inner.add_children_cpu(cpu);
+            }
+            return Some(Ok((pid, (code as i32) << 8, cpu)));
+        }
+    }
+    let kids: Vec<(KoID, Arc<Process>)> = inner
+        .children
+        .iter()
+        .filter(|(_, c)| pgid.map(|want| effective_pgid(c) == want).unwrap_or(true))
+        .map(|(&pid, c)| (pid, c.clone()))
+        .collect();
+    drop(inner);
+
+    for (pid, child) in kids {
+        if interest.exited {
+            if let Status::Exited(code) = child.status() {
+                let cpu = child_cpu(&child);
+                if reap {
+                    let mut inner = proc.linux().inner.lock();
+                    inner.children.remove(&pid);
+                    inner.reaped_children.remove(&pid);
+                    inner.add_children_cpu(cpu);
+                }
+                return Some(Ok((pid, (code as i32) << 8, cpu)));
+            }
+        }
+        if let Some(status) = child.try_linux().and_then(|lp| lp.take_wait_notification(interest)) {
+            return Some(Ok((pid, status, ChildCpu::default())));
+        }
+    }
+    None
 }
 
 /// System-call personality of a process: which operating system's ABI its
@@ -725,6 +803,15 @@ struct LinuxProcessInner {
     /// parent's *effective* sid (children stay in the parent's session);
     /// `setsid` starts a fresh session with `sid == pgid == pid`.
     sid: u64,
+    /// Job-control stop: the process is stopped (SIGSTOP/SIGTSTP/…).
+    /// Cleared by SIGCONT. Threads park in `run_user` while this is set.
+    job_stopped: bool,
+    /// Signal that caused the current stop (for `WIFSTOPPED` status).
+    job_stop_sig: u8,
+    /// Stop notification not yet collected by a `wait*` with `WSTOPPED`.
+    job_stop_pending: bool,
+    /// Continue notification not yet collected by a `wait*` with `WCONTINUED`.
+    job_continued_pending: bool,
     /// Signal delivered to this process when its parent terminates
     /// (`prctl(PR_SET_PDEATHSIG)`); `0` = none. Deliberately NOT copied on
     /// `fork` — prctl(2): "the value is cleared for the child of a fork".
@@ -922,6 +1009,63 @@ impl LinuxProcess {
         let mut inner = self.inner.lock();
         inner.sid = pid;
         inner.pgid = pid;
+    }
+
+    /// True while this process is job-control stopped.
+    pub fn is_job_stopped(&self) -> bool {
+        self.inner.lock().job_stopped
+    }
+
+    /// Enter a job-control stop caused by `sig`. Notifies the parent with
+    /// `SIGCHLD` so a `wait*` with `WSTOPPED` can collect it. Idempotent if
+    /// already stopped.
+    pub fn job_stop(&self, proc: &Arc<Process>, sig: u8) {
+        {
+            let mut inner = self.inner.lock();
+            if inner.job_stopped {
+                return;
+            }
+            inner.job_stopped = true;
+            inner.job_stop_sig = sig;
+            inner.job_stop_pending = true;
+            inner.job_continued_pending = false;
+        }
+        notify_parent_child_state(proc);
+    }
+
+    /// Leave a job-control stop (`SIGCONT`). Wakes parked threads and notifies
+    /// the parent for `WCONTINUED`. Returns whether the process was stopped.
+    pub fn job_continue(&self, proc: &Arc<Process>) -> bool {
+        let was_stopped = {
+            let mut inner = self.inner.lock();
+            let was = inner.job_stopped;
+            inner.job_stopped = false;
+            if was {
+                inner.job_continued_pending = true;
+                inner.job_stop_pending = false;
+            }
+            was
+        };
+        proc.signal_set(JOB_CONTINUE_SIGNAL);
+        if was_stopped {
+            notify_parent_child_state(proc);
+        }
+        was_stopped
+    }
+
+    /// Consume a pending stop/continue notification for `wait*` if `interest`
+    /// asks for it. Does not change `job_stopped` itself.
+    pub fn take_wait_notification(&self, interest: WaitInterest) -> Option<ExitCode> {
+        let mut inner = self.inner.lock();
+        if interest.stopped && inner.job_stop_pending {
+            inner.job_stop_pending = false;
+            return Some(wait_status_stopped(inner.job_stop_sig));
+        }
+        if interest.continued && inner.job_continued_pending {
+            inner.job_continued_pending = false;
+            return Some(WAIT_STATUS_CONTINUED);
+        }
+        None
     }
 
     /// Parent-death signal (`prctl(PR_SET_PDEATHSIG)`); `0` = none.
@@ -1973,6 +2117,37 @@ pub fn send_signal_to_pgrp(pgid: usize, signal: LinuxSignal) -> LxResult<()> {
     }
 }
 
+/// Pulse the parent's zircon `SIGCHLD` so a blocking `wait*` wakes for a
+/// stop/continue (exit already does the same from the terminate callback).
+fn notify_parent_child_state(child: &Arc<Process>) {
+    let parent = child.try_linux().and_then(|lp| lp.parent());
+    let parent = match parent {
+        Some(p) => p,
+        None => match ROOT_JOB.find_process(INIT_PID) {
+            Some(p) => p,
+            None => return,
+        },
+    };
+    parent.signal_set(Signal::SIGCHLD);
+}
+
+/// Park the current task until this process leaves a job-control stop (or dies).
+pub async fn wait_while_job_stopped(proc: &Arc<Process>) {
+    loop {
+        let stopped = proc.try_linux().map(|lp| lp.is_job_stopped()).unwrap_or(false);
+        if !stopped || matches!(proc.status(), Status::Exited(_)) {
+            return;
+        }
+        proc.signal_clear(JOB_CONTINUE_SIGNAL);
+        let stopped = proc.try_linux().map(|lp| lp.is_job_stopped()).unwrap_or(false);
+        if !stopped || matches!(proc.status(), Status::Exited(_)) {
+            return;
+        }
+        let obj: Arc<dyn KernelObject> = proc.clone();
+        obj.wait_signal(JOB_CONTINUE_SIGNAL).await;
+    }
+}
+
 /// `setpgid`: set process `pid`'s group to `pgid`. Permissive (no session/leader
 /// checks): enough for a shell to put a job into its own group.
 pub fn set_process_pgid(pid: KoID, pgid: KoID) -> LxResult<()> {
@@ -2226,9 +2401,9 @@ fn signal_default_action_interrupts(sig: LinuxSignal) -> bool {
 /// Linux only interrupts a syscall for a signal that will run a handler or
 /// terminate the process. A signal whose disposition is *ignore* — `SIG_IGN`,
 /// or `SIG_DFL` for a signal whose default action is ignore/stop (SIGCHLD,
-/// SIGURG, SIGWINCH, SIGCONT, and the job-control stops this kernel maps to
-/// ignore in `handle_signal`) — is discarded and must NOT wake a blocking
-/// syscall with `EINTR`.
+/// SIGURG, SIGWINCH, SIGCONT, and the job-control stops) — is discarded (or
+/// stops the process without EINTR) and must NOT wake a blocking syscall with
+/// `EINTR`.
 ///
 /// Returning `EINTR` for these was the bug behind a compositor's libinput
 /// dispatch failing with "Interrupted system call": every time an autostart

@@ -5,6 +5,7 @@ use smoltcp::{
     wire::{IpAddress, IpCidr},
 };
 
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -41,8 +42,9 @@ pub fn init() {
     ];
 
     // Loopback does not require any default route/gateway
-    static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 4] = [None; 4];
-    let routes = unsafe { Routes::new(&mut ROUTES_STORAGE[..]) };
+    let routes_storage: &'static mut [Option<(IpCidr, Route)>] =
+        Box::leak(vec![None; 4].into_boxed_slice());
+    let routes = Routes::new(routes_storage);
 
     let ip_addrs_clone = ip_addrs.clone();
     // 设置 主要 设置 iface
