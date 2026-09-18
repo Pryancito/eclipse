@@ -50,7 +50,7 @@ impl Syscall<'_> {
         const STACK_BUF: usize = 512;
         let mut stack_buf = [0u8; STACK_BUF];
         let mut heap_buf: alloc::vec::Vec<u8> = if chunk_size > STACK_BUF {
-            vec![0u8; chunk_size]
+            crate::try_zeroed_buf(chunk_size)?
         } else {
             alloc::vec::Vec::new()
         };
@@ -225,7 +225,7 @@ impl Syscall<'_> {
         const STACK_BUF: usize = 512;
         let mut stack_buf = [0u8; STACK_BUF];
         let mut heap_buf: alloc::vec::Vec<u8> = if chunk_size > STACK_BUF {
-            vec![0u8; chunk_size]
+            crate::try_zeroed_buf(chunk_size)?
         } else {
             alloc::vec::Vec::new()
         };

@@ -14,10 +14,11 @@ use zircon_object::task::{Job, Process, Status, Thread, ThreadState, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 54] = [
+const PROC_ROOT_STATIC: [&str; 55] = [
     "net",
     "oops",
     "memhogs",
+    "kheap",
     "sysvipc",
     "meminfo",
     "syscalls",
@@ -478,6 +479,7 @@ impl INode for ProcRootINode {
             "syscalls" => Ok(PROC_SYSCALLS.clone()),
             "cmdline" => Ok(PROC_CMDLINE.clone()),
             "memhogs" => Ok(PROC_MEMHOGS.clone()),
+            "kheap" => Ok(PROC_KHEAP.clone()),
             "cpuinfo" => Ok(PROC_CPUINFO.clone()),
             "swaps" => Ok(PROC_SWAPS.clone()),
             "uptime" => Ok(PROC_UPTIME.clone()),
@@ -1854,7 +1856,30 @@ fn proc_meminfo_content() -> String {
     let _ = writeln!(s, "MemAvailable: {:>10} kB", free / 1024);
     let _ = writeln!(s, "Buffers:               0 kB");
     let _ = writeln!(s, "Cached:                0 kB");
+    // The kernel heap is a FIXED arena, separate from the frames above, and
+    // running it out kills the machine (`alloc_error` -> panic). It appeared
+    // in no /proc file, so its growth could only be seen as the crash. Not a
+    // Linux meminfo field name: KernelHeap* says what it is.
+    let (kheap_used, kheap_total) = kernel_hal::mem::kernel_heap_usage();
+    if kheap_total > 0 {
+        let _ = writeln!(s, "KernelHeapTotal: {:>10} kB", kheap_total / 1024);
+        let _ = writeln!(s, "KernelHeapUsed:  {:>10} kB", kheap_used / 1024);
+        let _ = writeln!(
+            s,
+            "KernelHeapFree:  {:>10} kB",
+            kheap_total.saturating_sub(kheap_used) / 1024
+        );
+    }
     s
+}
+
+/// `/proc/kheap` — where the kernel heap went, live, by size class.
+///
+/// The counterpart of `/proc/memhogs` for the fixed kernel arena. Read it
+/// twice while the desktop runs: the size class that grew between the reads is
+/// the leak, and seeing that beats reading it off the OOM panic afterwards.
+fn proc_kheap_content() -> String {
+    kernel_hal::mem::kernel_heap_report()
 }
 
 /// `/proc/memhogs` — where the physical RAM actually went.
@@ -2823,6 +2848,10 @@ lazy_static! {
     static ref PROC_MEMHOGS: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 109,
         generate: proc_memhogs_content,
+    });
+    static ref PROC_KHEAP: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 111,
+        generate: proc_kheap_content,
     });
     static ref PROC_CPUINFO: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 12,

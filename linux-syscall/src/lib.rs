@@ -83,6 +83,27 @@ mod perf_accounting {
 /// exhaust or fragment it after long network sessions.
 pub(crate) const SYSCALL_IO_MAX: usize = 64 * 1024;
 
+/// A zeroed kernel buffer of `n` bytes that answers `ENOMEM` instead of
+/// panicking the machine.
+///
+/// `vec![0u8; n]` is an infallible allocation: when the fixed kernel heap
+/// cannot satisfy it, Rust calls `alloc_error`, which panics — so one
+/// process's ordinary read took the whole kernel down:
+///
+///     [PANIC] cpu=10 ... memory allocation of 24576 bytes failed
+///       <linux_syscall::Syscall>::sys_read::{closure#0}
+///
+/// A user-sized allocation must never be able to do that; Linux returns
+/// ENOMEM for exactly this case. `try_reserve_exact` fails instead of
+/// aborting, and the `resize` that follows cannot reallocate because the
+/// capacity is already there.
+pub(crate) fn try_zeroed_buf(n: usize) -> linux_object::error::LxResult<alloc::vec::Vec<u8>> {
+    let mut buf = alloc::vec::Vec::new();
+    buf.try_reserve_exact(n).map_err(|_| LxError::ENOMEM)?;
+    buf.resize(n, 0);
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod abi;
 /// FreeBSD/amd64 system-call personality (ELF `ELFOSABI_FREEBSD` binaries).

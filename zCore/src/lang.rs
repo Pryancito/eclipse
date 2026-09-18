@@ -6,28 +6,52 @@ use core::panic::PanicInfo;
 #[alloc_error_handler]
 fn alloc_error(layout: Layout) -> ! {
     // The heap is exhausted here, so we must NOT allocate: klog_*! use
-    // `alloc::format!` and would recursively fail. Use the spin serial writer
-    // (the same no-alloc path the panic handler uses) so the used/total numbers
+    // `alloc::format!` and would recursively fail. Use the spin writers (the
+    // same no-alloc path the panic handler uses) so the used/total numbers
     // actually reach the console — they pinpoint whether this is a leak.
+    //
+    // BOTH consoles. A serial-only report is invisible on a box with just a
+    // monitor, which is where this fires: one photographed OOM showed the
+    // panic banner and the backtrace with NONE of the attribution below,
+    // because all of it went to a serial line nobody was capturing.
+    // `graphic_console_write_fmt_spin` is best-effort try_lock and allocates
+    // nothing, so it cannot deadlock or recurse here.
+    fn emit(args: core::fmt::Arguments<'_>) {
+        kernel_hal::console::serial_write_fmt_spin(args);
+        kernel_hal::console::graphic_console_write_fmt_spin(args);
+    }
+
     let heap_used = crate::memory::heap_used();
     let heap_total = crate::memory::heap_total();
-    kernel_hal::console::serial_write_fmt_spin(format_args!(
+    emit(format_args!(
         "\nkernel OOM: alloc {} bytes failed (used {} / total {} MiB)\n",
         layout.size(),
         heap_used / 1024 / 1024,
         heap_total / 1024 / 1024,
     ));
+    // A refusal from the heap re-entrancy guard reaches this handler as a null
+    // pointer, i.e. as an allocation failure indistinguishable from a real
+    // one. Say which it was: a guard event count that moved means the heap may
+    // be fine and the fault is a fault path that allocates.
+    let reentrancy = crate::memory::heap_reentrancy_events();
+    if reentrancy > 0 {
+        emit(format_args!(
+            "heap re-entrancy guard has refused {} allocation(s) — if this OOM is one of \
+             them the heap is not out of memory; see [heap-reentrant] above\n",
+            reentrancy,
+        ));
+    }
     // Attribution: live allocations per size class, so the OOM report says
     // WHICH class holds the heap (each line: class upper bound, live count,
     // total bytes if every allocation were at the bound).
     #[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
     {
         let hist = crate::memory::heap_live_histogram();
-        kernel_hal::console::serial_write_fmt_spin(format_args!("heap live by size class:\n"));
+        emit(format_args!("heap live by size class:\n"));
         for (i, count) in hist.iter().enumerate() {
             if *count > 0 {
                 let size = 1usize << i;
-                kernel_hal::console::serial_write_fmt_spin(format_args!(
+                emit(format_args!(
                     "  <={:>10}B x {:<8} (~{} MiB)\n",
                     size,
                     count,
@@ -40,17 +64,17 @@ fn alloc_error(layout: Layout) -> ! {
         #[cfg(feature = "linux")]
         {
             let (created, live, bytes) = linux_object::fs::memfd_stats();
-            kernel_hal::console::serial_write_fmt_spin(format_args!(
+            emit(format_args!(
                 "memfd: created={} live={} live_bytes={} MiB\n",
                 created,
                 live,
                 bytes >> 20,
             ));
         }
-        kernel_hal::console::serial_write_fmt_spin(format_args!("hot exact sizes:\n"));
+        emit(format_args!("hot exact sizes:\n"));
         for (size, live) in crate::memory::heap_hot_sizes() {
             if size != 0 && live > 0 {
-                kernel_hal::console::serial_write_fmt_spin(format_args!(
+                emit(format_args!(
                     "  {}B x {} (~{} MiB)\n",
                     size,
                     live,
