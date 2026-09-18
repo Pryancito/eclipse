@@ -2454,6 +2454,46 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             fs::write(path, body).unwrap();
         };
 
+        // A config written before the marker existed is frozen here FOREVER:
+        // `write_if_ours` reads it as someone else's file and every later fix
+        // to this generator stops at the disk. On hardware that kept a
+        // `system.pa` whose module-native-protocol-unix line has no
+        // `auth-cookie-enabled=0`:
+        //
+        //   E: module.c: Failed to load module "module-native-protocol-unix"
+        //      (argument: "auth-anonymous=1 socket=/run/pulse/native"):
+        //      initialization failed.
+        //
+        // Without that key the module loads-or-creates a cookie under a path
+        // the `pulse` account cannot write, fails, and the daemon runs on with
+        // NO socket: `pgrep pulseaudio` alive, /run/pulse/native absent, every
+        // client (ALSA `default` is the pulse plugin) refused, and /dev/dsp
+        // EBUSY because the daemon really does hold the cards. Nothing can
+        // play, and no rebuild ever fixed it.
+        //
+        // A file that cannot start the daemon is not a config anyone chose to
+        // own. Move such a file aside — only when it is recognisably a
+        // descendant of this generator, by our own socket path — and let this
+        // generation write a working one. The original stays as .bak.
+        {
+            let system_pa = pulse.join("system.pa");
+            if let Ok(existing) = fs::read_to_string(&system_pa) {
+                let ours_by_descent = existing.contains("socket=/run/pulse/native");
+                let cannot_bind = existing.contains("module-native-protocol-unix")
+                    && !existing.contains("auth-cookie-enabled=0");
+                if !existing.contains(marker) && ours_by_descent && cannot_bind {
+                    let bak = pulse.join("system.pa.bak");
+                    let _ = fs::write(&bak, existing.as_bytes());
+                    let _ = fs::remove_file(&system_pa);
+                    println!(
+                        "PulseAudio: /etc/pulse/system.pa predates the eclipse-generated marker \
+                         and its module-native-protocol-unix has no auth-cookie-enabled=0, so the \
+                         daemon could never bind /run/pulse/native. Replaced it (kept as system.pa.bak)."
+                    );
+                }
+            }
+        }
+
         write_if_ours(
             &pulse.join("daemon.conf"),
             b"# eclipse-generated PulseAudio daemon (delete this line to take ownership).\n\
@@ -2541,6 +2581,12 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               load-module module-filter-heuristics\n\
               load-module module-filter-apply\n";
         write_if_ours(&pulse.join("system.pa"), pa);
+        // The same script at a path that is ALWAYS ours, whatever the user has
+        // done to system.pa. `eclipse-pulseaudio` falls back to it (pulseaudio
+        // -n --file=) when the config in place cannot bind the socket, so an
+        // installed system that never re-runs this generator still gets a
+        // daemon clients can reach. See the unfreeze note above.
+        fs::write(pulse.join("system.pa.eclipse"), pa).unwrap();
         write_if_ours(&pulse.join("default.pa"), pa);
         let _ = fs::create_dir_all(rootfs.join("var/lib/pulse"));
         let _ = fs::create_dir_all(rootfs.join("var/run/pulse"));
@@ -3048,7 +3094,21 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               export PULSE_STATE_PATH=/var/lib/pulse\n\
               # --log-level=info: the sink's 'Trying resume...', 'Resumed successfully...' and\n\
               # 'Starting playback.' are info-level; audio-probe [pulse-play] reads them from the log.\n\
-              exec pulseaudio --system --disallow-exit --exit-idle-time=-1 --daemonize=no --use-pid-file=no --realtime=false --log-target=stderr --log-level=info\n",
+              # A system.pa whose module-native-protocol-unix has no\n\
+              # auth-cookie-enabled=0 CANNOT bind /run/pulse/native: the module\n\
+              # loads-or-creates a cookie under a path `pulse` cannot write and\n\
+              # fails to initialise, leaving a daemon that is alive, owns the\n\
+              # cards and listens nowhere (every client: Connection refused).\n\
+              # xtask keeps its own copy of the working script next to it; use\n\
+              # that one rather than start a daemon nobody can reach.\n\
+              PA_SCRIPT=\n\
+              if ! grep -q 'auth-cookie-enabled=0' /etc/pulse/system.pa 2>/dev/null \\\n\
+              \x20\x20 && [ -r /etc/pulse/system.pa.eclipse ]; then\n\
+              \x20 echo 'eclipse-pulseaudio: /etc/pulse/system.pa cannot bind the socket; using /etc/pulse/system.pa.eclipse' >&2\n\
+              \x20 PA_SCRIPT='-n --file=/etc/pulse/system.pa.eclipse'\n\
+              fi\n\
+              # shellcheck disable=SC2086 -- PA_SCRIPT is two words or none.\n\
+              exec pulseaudio --system --disallow-exit --exit-idle-time=-1 --daemonize=no --use-pid-file=no --realtime=false --log-target=stderr --log-level=info $PA_SCRIPT\n",
         )
         .unwrap();
         let share = rootfs.join("usr").join("share").join("eclipse");

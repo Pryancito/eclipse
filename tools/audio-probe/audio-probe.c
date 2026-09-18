@@ -382,6 +382,45 @@ static void list_mpg123_modules(const char *dir) {
   else info("mpg123 output modules in %s: %s", dir, line);
 }
 
+// The one line that decides whether the daemon can bind its socket at all.
+//
+// `module-native-protocol-unix` without `auth-cookie-enabled=0` loads-or-
+// creates an authentication cookie under a path the `pulse` account cannot
+// write; when that fails the module does not initialise and the daemon runs
+// on with NO socket -- alive, owning the cards, refusing every client. It is
+// a one-word difference in a file that survives rebuilds (xtask only rewrites
+// configs carrying its marker), so read it here rather than infer it from a
+// connect that failed.
+static void check_pulse_socket_config(void) {
+  static const char *const pa = "/etc/pulse/system.pa";
+  FILE *f = fopen(pa, "r");
+  if (!f) {
+    info("%s: %s -- the daemon falls back to its built-in script (cookie-enabled: no socket here)", pa, strerror(errno));
+    return;
+  }
+  char line[1024];
+  int have_module = 0, have_key = 0, marker = 0;
+  while (fgets(line, sizeof line, f)) {
+    if (strstr(line, "eclipse-generated")) marker = 1;
+    if (line[0] == '#' || !strstr(line, "module-native-protocol-unix")) continue;
+    have_module = 1;
+    if (strstr(line, "auth-cookie-enabled=0")) have_key = 1;
+  }
+  fclose(f);
+  if (!have_module) {
+    fail("system.pa loads module-native-protocol-unix", "no socket module, no socket, no clients", 0);
+    return;
+  }
+  check(have_key, "system.pa passes auth-cookie-enabled=0 to module-native-protocol-unix",
+        "without it the module cannot write its cookie, fails to initialise, and the daemon listens nowhere", 0);
+  if (!have_key) {
+    info("=> this is the config that leaves a LIVE daemon with no socket. Look for");
+    info("   'Failed to load module \"module-native-protocol-unix\" ... initialization failed' in the log above.");
+    info("   %s is %s; eclipse-pulseaudio falls back to /etc/pulse/system.pa.eclipse when it is readable.",
+         pa, marker ? "eclipse-generated (a rebuild will fix it)" : "NOT marked eclipse-generated, so rebuilds leave it alone");
+  }
+}
+
 // A bare `mpg123 x.mp3` must not land on the unmixed ring.
 //
 // mpg123 1.3x has no config file at all (the binary carries no rcfile option
@@ -1478,6 +1517,7 @@ static void test_daemon(void) {
   // here. "Failed to open module pulse" in that log is this directory (or a
   // library the module links, libpulse-simple) -- not the server.
   list_mpg123_modules("/usr/lib/mpg123");
+  check_pulse_socket_config();
   check_oss_yields_to_the_daemon();
 }
 
