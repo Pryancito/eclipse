@@ -55,5 +55,13 @@ hal_fn_impl! {
         fn memory_usage() -> (usize, usize) {
             crate::KHANDLER.memory_usage()
         }
+
+        fn kernel_heap_usage() -> (usize, usize) {
+            crate::KHANDLER.kernel_heap_usage()
+        }
+
+        fn kernel_heap_report() -> alloc::string::String {
+            crate::KHANDLER.kernel_heap_report()
+        }
     }
 }

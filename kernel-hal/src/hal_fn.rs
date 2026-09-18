@@ -90,6 +90,17 @@ hal_fn_def! {
         pub fn memory_usage() -> (usize, usize) {
             (0, 0)
         }
+
+        /// Kernel heap usage: (used_bytes, total_bytes). Frames are
+        /// `memory_usage`; this is the fixed arena whose exhaustion panics.
+        pub fn kernel_heap_usage() -> (usize, usize) {
+            (0, 0)
+        }
+
+        /// Live kernel-heap attribution by size class, rendered on demand.
+        pub fn kernel_heap_report() -> alloc::string::String {
+            alloc::string::String::new()
+        }
     }
 
     /// Virtual memory operations.

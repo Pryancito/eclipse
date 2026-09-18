@@ -27,6 +27,27 @@ pub trait KernelHandler: Send + Sync + 'static {
         (0, 0)
     }
 
+    /// Kernel HEAP usage: `(used_bytes, total_bytes)`.
+    ///
+    /// Distinct from [`memory_usage`](KernelHandler::memory_usage), which is
+    /// physical frames. The heap is a fixed arena, and exhausting it kills the
+    /// machine through `alloc_error` — on hardware:
+    ///
+    ///     [PANIC] cpu=10 ... memory allocation of 24576 bytes failed
+    ///
+    /// Nothing in `/proc` showed that number, so the growth could only be seen
+    /// as the crash. `/proc/meminfo` and `/proc/kheap` report it now.
+    fn kernel_heap_usage(&self) -> (usize, usize) {
+        (0, 0)
+    }
+
+    /// Where the kernel heap went: the same live-by-size-class attribution the
+    /// OOM handler prints, on demand. Read it twice while the desktop runs —
+    /// the class that grows between reads is the leak.
+    fn kernel_heap_report(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Whether `[vaddr, vaddr + len)` is covered by a mapping in the CURRENT
     /// process's address space.
     ///

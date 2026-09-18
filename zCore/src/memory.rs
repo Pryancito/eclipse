@@ -233,3 +233,10 @@ pub fn heap_available() -> bool {
 pub fn heap_total() -> usize {
     TOTAL_MEMORY.load(Ordering::Relaxed)
 }
+
+/// Allocations refused by the heap re-entrancy guard (mirrors
+/// `memory_x86_64::heap_reentrancy_events`). This build has no such guard.
+#[allow(dead_code)]
+pub fn heap_reentrancy_events() -> u32 {
+    0
+}

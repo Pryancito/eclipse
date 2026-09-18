@@ -66,7 +66,7 @@ impl Syscall<'_> {
             return Ok(0);
         }
         let len = len.min(super::SYSCALL_IO_MAX);
-        let mut buf = vec![0u8; len];
+        let mut buf = crate::try_zeroed_buf(len)?;
 
         // SPLICE_F_NONBLOCK: the pipe side must not wait. `File::read` already
         // branches on the fd's NON_BLOCK flag, so borrow the recvmsg trick and

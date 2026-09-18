@@ -342,6 +342,57 @@ impl KernelHandler for ZcoreKernelHandler {
         memory::stats()
     }
 
+    /// The fixed kernel heap, the arena whose exhaustion ends the machine:
+    ///
+    ///     [PANIC] cpu=10 ... memory allocation of 24576 bytes failed
+    ///       <linux_syscall::Syscall>::sys_read::{closure#0}
+    ///
+    /// Nothing in `/proc` carried this number, so its growth could only be
+    /// observed as that crash. `/proc/meminfo` reports it now.
+    fn kernel_heap_usage(&self) -> (usize, usize) {
+        (memory::heap_used(), memory::heap_total())
+    }
+
+    /// `/proc/kheap`: where the heap went, by size class, live right now —
+    /// the same attribution the OOM handler prints, readable before the OOM.
+    /// Read it twice a few minutes apart: the class that grew is the leak.
+    #[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
+    fn kernel_heap_report(&self) -> alloc::string::String {
+        use core::fmt::Write;
+        let mut s = alloc::string::String::with_capacity(1024);
+        let (used, total) = (memory::heap_used(), memory::heap_total());
+        let _ = writeln!(
+            s,
+            "KernelHeapUsed:  {:>10} kB\nKernelHeapTotal: {:>10} kB",
+            used / 1024,
+            total / 1024
+        );
+        let refused = memory::heap_reentrancy_events();
+        if refused > 0 {
+            let _ = writeln!(s, "ReentrancyRefusals: {}", refused);
+        }
+        let _ = writeln!(s, "live by size class:");
+        for (i, count) in memory::heap_live_histogram().iter().enumerate() {
+            if *count > 0 {
+                let size = 1usize << i;
+                let _ = writeln!(
+                    s,
+                    "  <={:>10}B x {:<8} (<= {} MiB)",
+                    size,
+                    count,
+                    (count * size) >> 20
+                );
+            }
+        }
+        let _ = writeln!(s, "hot exact sizes:");
+        for (size, live) in memory::heap_hot_sizes() {
+            if size != 0 && live > 0 {
+                let _ = writeln!(s, "  {}B x {} ({} MiB)", size, live, (size * live) >> 20);
+            }
+        }
+        s
+    }
+
     /// See [`KernelHandler::check_user_range`]: does the current process map
     /// anything over `[vaddr, vaddr + len)`?
     ///

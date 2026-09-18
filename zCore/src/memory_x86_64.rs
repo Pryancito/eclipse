@@ -381,15 +381,37 @@ cfg_if! {
         /// side); blocking costs the machine. Print the re-entrant call chain
         /// while we are still standing on it — those frames ARE the fault-path
         /// code that must be made allocation-free — then let the caller bail.
+        /// How many allocations this guard has refused, all time. The refusal
+        /// hands the caller a null pointer, so it surfaces later as
+        /// `alloc_error` ("memory allocation of N bytes failed") — which reads
+        /// exactly like a genuine out-of-memory. The OOM report prints this
+        /// count so the two can be told apart at a glance.
+        static HEAP_REENTRANCY_EVENTS: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+
+        /// Allocations refused by the re-entrancy guard so far.
+        pub fn heap_reentrancy_events() -> u32 {
+            HEAP_REENTRANCY_EVENTS.load(core::sync::atomic::Ordering::Relaxed)
+        }
+
+        /// Both consoles: on a box with only a monitor, a serial-only report
+        /// is invisible exactly when it is needed. `graphic_console_write_fmt_spin`
+        /// is best-effort try_lock, so it cannot deadlock this path.
+        fn emit(args: core::fmt::Arguments<'_>) {
+            kernel_hal::console::serial_write_fmt_spin(args);
+            kernel_hal::console::graphic_console_write_fmt_spin(args);
+        }
+
         #[cold]
         #[inline(never)]
         fn report_heap_reentrancy(what: &str, sz: usize) {
             use core::sync::atomic::{AtomicU32, Ordering};
             static REPORTED: AtomicU32 = AtomicU32::new(0);
+            HEAP_REENTRANCY_EVENTS.fetch_add(1, Ordering::Relaxed);
             if REPORTED.fetch_add(1, Ordering::Relaxed) >= 4 {
                 return;
             }
-            kernel_hal::console::serial_write_fmt_spin(format_args!(
+            emit(format_args!(
                 "\n[heap-reentrant] {} size={:#x} while THIS cpu already holds the \
                  heap lock — a fault was taken inside the allocator and the fault \
                  path allocated. Refusing instead of wedging the machine. The \
@@ -407,7 +429,7 @@ cfg_if! {
                 if ret == 0 {
                     break;
                 }
-                kernel_hal::console::serial_write_fmt_spin(format_args!(
+                emit(format_args!(
                     "[heap-reentrant]   ret={}\n",
                     kernel_hal::ksyms::Addr(ret as u64)
                 ));
@@ -417,10 +439,10 @@ cfg_if! {
                 rbp = next;
             }
             if !kernel_hal::ksyms::available() {
-                kernel_hal::console::serial_write_str(
+                emit(format_args!(
                     "[heap-reentrant] no in-kernel symbol table — symbolize with \
-                     `make sym ADDRS=\"...\"` where this kernel was built\n",
-                );
+                     `make sym ADDRS=\"...\"` where this kernel was built\n"
+                ));
             }
         }
 
