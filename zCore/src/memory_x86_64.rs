@@ -512,6 +512,103 @@ cfg_if! {
         static BIG_ALLOC_SEEN: [AtomicUsize; HEAP_BUCKETS] =
             [const { AtomicUsize::new(0) }; HEAP_BUCKETS];
 
+        /// Live big blocks, with the call site that asked for each.
+        ///
+        /// `report_big_alloc` prints the first few per class as they are handed
+        /// out, which answers "who allocated this one" but not "who is holding
+        /// 400 MiB right now" — and a leak is the second question. This table
+        /// keeps the live ≥2 MiB blocks and their allocating frames, so
+        /// `/proc/kheap` can name the holders while the machine still runs.
+        ///
+        /// Costs nothing on the hot path: only allocations already ≥2 MiB touch
+        /// it, and the walk is the same frame-pointer chain the reporters use.
+        const BIG_TRACK_SLOTS: usize = 128;
+        const BIG_TRACK_FRAMES: usize = 3;
+
+        struct BigSlot {
+            ptr: AtomicUsize,
+            size: AtomicUsize,
+            site: [AtomicUsize; BIG_TRACK_FRAMES],
+        }
+
+        static BIG_TRACK: [BigSlot; BIG_TRACK_SLOTS] = [const {
+            BigSlot {
+                ptr: AtomicUsize::new(0),
+                size: AtomicUsize::new(0),
+                site: [const { AtomicUsize::new(0) }; BIG_TRACK_FRAMES],
+            }
+        }; BIG_TRACK_SLOTS];
+
+        /// Big blocks that found no free slot: the table is a sample, and a
+        /// non-zero count here says so instead of quietly under-reporting.
+        static BIG_TRACK_MISSED: AtomicUsize = AtomicUsize::new(0);
+
+        /// Record a live big block and the frames that asked for it.
+        fn track_big_alloc(ptr: usize, sz: usize) {
+            let mut site = [0usize; BIG_TRACK_FRAMES];
+            let mut rbp: usize;
+            unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp) };
+            for slot in site.iter_mut() {
+                if rbp == 0 || rbp & 0x7 != 0 || rbp < 0xffff_ff00_0000_0000 {
+                    break;
+                }
+                let ret = unsafe { core::ptr::read_volatile((rbp + 8) as *const usize) };
+                let next = unsafe { core::ptr::read_volatile(rbp as *const usize) };
+                if ret == 0 {
+                    break;
+                }
+                *slot = ret;
+                if next <= rbp {
+                    break;
+                }
+                rbp = next;
+            }
+            for e in BIG_TRACK.iter() {
+                if e.ptr
+                    .compare_exchange(0, ptr, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    e.size.store(sz, Ordering::Relaxed);
+                    for (i, f) in site.iter().enumerate() {
+                        e.site[i].store(*f, Ordering::Relaxed);
+                    }
+                    return;
+                }
+            }
+            BIG_TRACK_MISSED.fetch_add(1, Ordering::Relaxed);
+        }
+
+        /// Drop a big block from the table when it is freed.
+        fn untrack_big_alloc(ptr: usize) {
+            for e in BIG_TRACK.iter() {
+                if e.ptr.load(Ordering::Relaxed) == ptr
+                    && e.ptr
+                        .compare_exchange(ptr, 0, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    e.size.store(0, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
+
+        /// The live big blocks, biggest first: `(size, [call frames])`.
+        /// Entries with size 0 are empty slots.
+        pub fn heap_big_blocks() -> ([(usize, [usize; BIG_TRACK_FRAMES]); BIG_TRACK_SLOTS], usize) {
+            let mut out = [(0usize, [0usize; BIG_TRACK_FRAMES]); BIG_TRACK_SLOTS];
+            for (o, e) in out.iter_mut().zip(BIG_TRACK.iter()) {
+                if e.ptr.load(Ordering::Relaxed) == 0 {
+                    continue;
+                }
+                o.0 = e.size.load(Ordering::Relaxed);
+                for (i, f) in o.1.iter_mut().enumerate() {
+                    *f = e.site[i].load(Ordering::Relaxed);
+                }
+            }
+            out.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            (out, BIG_TRACK_MISSED.load(Ordering::Relaxed))
+        }
+
         #[cold]
         #[inline(never)]
         fn report_big_alloc(ptr: usize, sz: usize) {
@@ -519,7 +616,7 @@ cfg_if! {
             if BIG_ALLOC_SEEN[b].fetch_add(1, Ordering::Relaxed) >= BIG_ALLOC_REPORTS_PER_CLASS {
                 return;
             }
-            kernel_hal::console::serial_write_fmt_spin(format_args!(
+            emit(format_args!(
                 "\n[bigalloc] {} KiB heap block at {:#x} (class <={} KiB, {} live in class, \
                  heap used {} MiB); allocating call chain:\n",
                 sz >> 10,
@@ -539,7 +636,7 @@ cfg_if! {
                 if ret == 0 {
                     break;
                 }
-                kernel_hal::console::serial_write_fmt_spin(format_args!(
+                emit(format_args!(
                     "[bigalloc]   ret={}\n",
                     kernel_hal::ksyms::Addr(ret as u64)
                 ));
@@ -549,10 +646,10 @@ cfg_if! {
                 rbp = next;
             }
             if !kernel_hal::ksyms::available() {
-                kernel_hal::console::serial_write_str(
+                emit(format_args!(
                     "[bigalloc] no in-kernel symbol table — symbolize with \
-                     `make sym ADDRS=\"...\"` where this kernel was built\n",
-                );
+                     `make sym ADDRS=\"...\"` where this kernel was built\n"
+                ));
             }
         }
 
@@ -928,6 +1025,7 @@ cfg_if! {
                     HEAP_LIVE[bucket_of(sz)].fetch_add(1, Ordering::Relaxed);
                     hot_track(sz, 1);
                     if sz >= BIG_ALLOC_MIN {
+                        track_big_alloc(p as usize, sz);
                         report_big_alloc(p as usize, sz);
                     }
                     #[cfg(feature = "mem-debug")]
@@ -972,6 +1070,9 @@ cfg_if! {
                 }
                 HEAP_USED.fetch_sub(sz, Ordering::Relaxed);
                 HEAP_LIVE[bucket_of(sz)].fetch_sub(1, Ordering::Relaxed);
+                if sz >= BIG_ALLOC_MIN {
+                    untrack_big_alloc(ptr as usize);
+                }
                 let ext = Layout::from_size_align_unchecked(sz + REDZONE, layout.align());
                 // Front cache absorbs the free in O(1); only an out-of-range size
                 // or a cap-overflow reaches the buddy (default build only).
