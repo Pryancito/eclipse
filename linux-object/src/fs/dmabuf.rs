@@ -96,7 +96,7 @@ impl FileLike for DmaBuf {
             read: true,
             write: true,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
 
@@ -105,7 +105,7 @@ impl FileLike for DmaBuf {
             read: true,
             write: true,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
 

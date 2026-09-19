@@ -80,6 +80,15 @@ rcore-fs-ramfs = { path = "vendor/rcore-fs-ramfs" }
 # at rcore-fs-sfs/src/lib.rs:857). A full disk must be ENOSPC to the writer,
 # not a halted CPU.
 rcore-fs-sfs = { path = "vendor/rcore-fs-sfs" }
+# Same story again, and the reason the x86_64 kernel and `cargo xtask` both
+# stopped building: c48e2bb added a `hangup` field to vendor/rcore-fs's
+# PollStatus (Linux POLLHUP), but these two were still resolving to the
+# upstream git checkout, whose `poll()` builds PollStatus with a struct
+# literal and therefore fails E0063. -devfs is a direct dependency of
+# linux-object (11 use sites); -sefs comes in transitively through
+# rcore-fs-fuse, which xtask needs to build the rootfs image.
+rcore-fs-devfs = { path = "vendor/rcore-fs-devfs" }
+rcore-fs-sefs = { path = "vendor/rcore-fs-sefs" }
 
 [patch."https://github.com/rcore-os/rcore-console"]
 rcore-console = { path = "vendor/rcore-console" }

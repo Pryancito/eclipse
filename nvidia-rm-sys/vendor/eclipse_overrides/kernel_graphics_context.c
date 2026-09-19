@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -2353,21 +2353,6 @@ kgrctxUnmapCtxZcullBuffer_IMPL
 }
 
 /**
- * @brief unmap the memory for the setup context buffer
- */
-void
-kgrctxUnmapCtxSetupBuffer_IMPL
-(
-    OBJGPU *pGpu,
-    KernelGraphicsContext *pKernelGraphicsContext,
-    KernelGraphics *pKernelGraphics,
-    OBJVASPACE *pVAS
-)
-{
-    // TODO Bug 4153224: fill in function
-}
-
-/**
  * @brief unmap the memory for the preemption context buffers
  */
 void
@@ -2676,7 +2661,10 @@ kgrctxShouldManageCtxBuffers_PHYSICAL
     NvU32 gfid
 )
 {
-    return !gpuIsClientRmAllocatedCtxBufferEnabled(pGpu) || (gpuIsSriovEnabled(pGpu) && IS_GFID_PF(gfid));
+    if (gpuIsSriovEnabled(pGpu) && !RMCFG_FEATURE_PLATFORM_GSP)
+        return !gpuIsClientRmAllocatedCtxBufferEnabled(pGpu) || IS_GFID_PF(gfid);
+    else
+        return !gpuIsClientRmAllocatedCtxBufferEnabled(pGpu);
 }
 
 /**
@@ -2874,20 +2862,6 @@ kgrctxFreeZcullBuffer_IMPL
     memdescDestroy(pMemDesc);
     pKernelGraphicsContextUnicast->zcullCtxswBuffer.pMemDesc = NULL;
 }
-
-/**
- * @brief free the memory for the setup context buffer
- */
-void
-kgrctxFreeSetupBuffer_IMPL
-(
-    OBJGPU *pGpu,
-    KernelGraphicsContext *pKernelGraphicsContext
-)
-{
-    // TODO Bug 4153224: fill in function
-}
-
 
 /**
  * @brief free the memory for the preemption context buffers
@@ -3359,7 +3333,7 @@ kgrctxGetRegisterAccessMapId_IMPL
 {
     // Using cached privilege because this function is called at a raised IRQL.
     if (kchannelCheckIsAdmin(pKernelChannel)
-        && !hypervisorIsVgxHyper() && IS_GFID_PF(kchannelGetGfid(pKernelChannel)))
+        && !(hypervisorIsVgxHyper() || (RMCFG_FEATURE_PLATFORM_GSP && IS_VGPU_GSP_PLUGIN_OFFLOAD_ENABLED(pGpu))) && IS_GFID_PF(kchannelGetGfid(pKernelChannel)))
     {
         return GR_GLOBALCTX_BUFFER_UNRESTRICTED_PRIV_ACCESS_MAP;
     }

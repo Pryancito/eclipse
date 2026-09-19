@@ -2169,16 +2169,17 @@ pub extern "C" fn osQueueSystemWorkItem(arg0: *mut c_void, arg1: *mut c_void) ->
     NV_ERR_NOT_SUPPORTED
 }
 
-// 570.144 replaced the bare osQueueWorkItem entry point with
-// osQueueWorkItemWithFlags(OBJGPU *, OSWorkItemFunction, void *, NvU32 flags)
-// -- osQueueWorkItem is now a static inline in g_os_nvoc.h that forwards to it,
-// so the linker needs the *WithFlags* symbol. Deferred work items require an OS
+// 570.144 had split this into osQueueWorkItem (a static inline forwarding
+// shim) plus osQueueWorkItemWithFlags (the real symbol). 580.178.04 folded the
+// two back together: osQueueWorkItem itself now takes the flags argument and
+// is the symbol the linker wants, and osQueueWorkItemWithFlags is gone. The
+// parameter list is otherwise unchanged. Deferred work items require an OS
 // worker-thread pool Eclipse's RM host does not run; returning NOT_SUPPORTED
-// matches the prior 610 behaviour (the old osQueueWorkItem stub also refused),
-// and callers (mem_mapper.c, gpuRefreshRecoveryAction, vgpu_events.c) treat a
-// failed queue as "not available" rather than fatal.
+// matches the prior behaviour, and callers (mem_mapper.c,
+// gpuRefreshRecoveryAction, vgpu_events.c) treat a failed queue as "not
+// available" rather than fatal.
 #[no_mangle]
-pub extern "C" fn osQueueWorkItemWithFlags(
+pub extern "C" fn osQueueWorkItem(
     pGpu: *mut c_void,
     pFunction: *mut c_void,
     pParams: *mut c_void,

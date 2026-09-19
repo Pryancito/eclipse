@@ -340,7 +340,8 @@ impl Syscall<'_> {
                     .await
             }
             Sys::PPOLL => {
-                self.sys_ppoll(a0.into(), a1, a2.into(), a3.into(), a4).await
+                self.sys_ppoll(a0.into(), a1, a2.into(), a3.into(), a4)
+                    .await
             }
             Sys::EPOLL_CREATE1 => self.sys_epoll_create1(a0),
             Sys::EPOLL_CTL => self.sys_epoll_ctl(a0.into(), a1 as i32, a2.into(), a3.into()),

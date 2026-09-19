@@ -14,7 +14,6 @@ use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use kernel_hal::sync::Mutex;
 use kernel_hal::PhysAddr;
-use lock::HeldByCurrentCpu;
 
 static TOTAL_MEMORY: AtomicUsize = AtomicUsize::new(0);
 static HEAP_USED: AtomicUsize = AtomicUsize::new(0);
@@ -303,6 +302,11 @@ pub fn heap_used() -> usize {
 cfg_if! {
     if #[cfg(not(feature = "libos"))] {
         use buddy_system_allocator::Heap;
+        // Only the bare-metal build has an impl of this trait (kernel-sync
+        // gates it on target_os = "none"), and its one call site is inside
+        // this same block, so importing it at file scope made the libos
+        // build fail #![deny(warnings)] with an unused import.
+        use lock::HeldByCurrentCpu;
         use core::{
             alloc::{GlobalAlloc, Layout},
             ops::Deref,

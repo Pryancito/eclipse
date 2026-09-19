@@ -644,11 +644,7 @@ pub struct HwFlipInit {
 }
 
 extern "C" {
-    fn eclipse_rm_hwflip_init(
-        gpuInstance: NvU32,
-        head: NvU32,
-        out: *mut HwFlipInit,
-    ) -> NV_STATUS;
+    fn eclipse_rm_hwflip_init(gpuInstance: NvU32, head: NvU32, out: *mut HwFlipInit) -> NV_STATUS;
     fn eclipse_rm_hwflip_surface(
         gpuInstance: NvU32,
         hMemory: NvU32,

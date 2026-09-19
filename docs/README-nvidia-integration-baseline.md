@@ -11,6 +11,39 @@ gráfica (arranque de GPU, GSP-RM, KMS/DRM, render node y userspace).
 - Firmware GSP en rootfs: `/lib/firmware/nvidia/gsp/gsp.bin`
 - Arrancar con logs visibles (`LOG=warn` o `LOG=error`).
 
+### La versión del firmware GSP debe coincidir EXACTAMENTE
+
+`_kgspFwContainerVerifyVersion` (kernel_gsp.c) compara la sección
+`.fwversion` de `gsp.bin` con el `NV_VERSION_STRING` del RM vendorizado y
+devuelve `NV_ERR_INVALID_DATA` si difieren en un solo byte. No hay
+compatibilidad entre versiones cercanas: la ABI de GSP-RM no es estable.
+
+`xtask` ya no lleva la versión escrita a mano: la lee de
+`nvidia-rm-sys/vendor/open-gpu-kernel-modules/version.mk`, así que al
+re-pinchar el submódulo el firmware le sigue solo. Busca la imagen en este
+orden: caché local (`ignored/nvidia-gsp-cache`), `ECLIPSE_GSP_BIN`,
+linux-firmware, y por último el extractor oficial de NVIDIA.
+
+Ojo: `linux-firmware` **solo publica las versiones que soporta Nouveau**
+(535.113.01 y 570.144, ni en el repo de NVIDIA ni en el de kernel.org hay
+más). Para cualquier otra versión hay que generarla con el script que el
+propio submódulo trae:
+
+```sh
+nvidia-rm-sys/vendor/open-gpu-kernel-modules/nouveau/extract-firmware-nouveau.py \
+  -i nvidia-rm-sys/vendor/open-gpu-kernel-modules -o /tmp/gspfw -d
+export ECLIPSE_GSP_BIN=/tmp/gspfw/nvidia/tu102/gsp/gsp-<version>.bin
+```
+
+`-d` descarga el `.run` que toca desde `download.nvidia.com` (varios cientos
+de MB) y extrae `gsp_tu10x.bin`. NVIDIA documenta este uso en
+`nouveau/extract-firmware-nouveau.txt`.
+
+Solo se instala la imagen de Turing (`gsp_tu10x.bin`, que cubre
+TU102/TU104/TU106/TU116/TU117). Ampere en adelante necesita la otra imagen
+del mismo instalador (`gsp_ga10x.bin`) y que el kernel elija entre las dos
+por familia de chip; hoy `zCore` lee una sola ruta.
+
 ## 2) Captura rápida (recomendada)
 
 En hardware real:

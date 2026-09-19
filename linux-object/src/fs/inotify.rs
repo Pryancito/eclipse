@@ -131,7 +131,7 @@ impl FileLike for Inotify {
             read: false,
             write: false,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
 

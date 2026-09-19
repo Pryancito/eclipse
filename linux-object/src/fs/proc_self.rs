@@ -24,7 +24,7 @@ impl INode for ProcSelfFdDir {
             read: true,
             write: false,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {

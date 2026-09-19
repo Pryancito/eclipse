@@ -10,9 +10,7 @@ use bitflags::bitflags;
 use kernel_hal::context::{UserContext, UserContextField};
 use linux_object::error::LxResult;
 use linux_object::fs::{FileLike, PidFd};
-use linux_object::process::{
-    wait_child_any_interest, wait_child_interest, WaitInterest,
-};
+use linux_object::process::{wait_child_any_interest, wait_child_interest, WaitInterest};
 use linux_object::signal::SigInfo;
 use linux_object::thread::{CurrentThreadExt, RobustList, ThreadExt};
 use linux_object::time::RUsage;
@@ -523,28 +521,18 @@ impl Syscall<'_> {
             WaitTarget::AnyChildInGroup => {
                 let pgid = linux_object::process::get_process_pgid(self.zircon_process().id())
                     .unwrap_or(self.zircon_process().id());
-                wait_child_any_interest(
-                    self.zircon_process(),
-                    nohang,
-                    reap,
-                    interest,
-                    Some(pgid),
-                )
-                .await
+                wait_child_any_interest(self.zircon_process(), nohang, reap, interest, Some(pgid))
+                    .await
             }
             WaitTarget::Pgid(pgid) => {
-                wait_child_any_interest(
-                    self.zircon_process(),
-                    nohang,
-                    reap,
-                    interest,
-                    Some(pgid),
-                )
-                .await
+                wait_child_any_interest(self.zircon_process(), nohang, reap, interest, Some(pgid))
+                    .await
             }
-            WaitTarget::Pid(pid) => wait_child_interest(self.zircon_process(), pid, nohang, reap, interest)
-                .await
-                .map(|(code, cpu)| (pid, code, cpu)),
+            WaitTarget::Pid(pid) => {
+                wait_child_interest(self.zircon_process(), pid, nohang, reap, interest)
+                    .await
+                    .map(|(code, cpu)| (pid, code, cpu))
+            }
         };
         let (pid, code, cpu) = match result {
             Ok(tuple) => tuple,
@@ -652,8 +640,7 @@ impl Syscall<'_> {
             },
             P_PGID => {
                 let pgid = if id == 0 {
-                    linux_object::process::get_process_pgid(caller.id())
-                        .unwrap_or(caller.id())
+                    linux_object::process::get_process_pgid(caller.id()).unwrap_or(caller.id())
                 } else {
                     id as KoID
                 };

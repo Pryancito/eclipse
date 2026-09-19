@@ -199,7 +199,11 @@ pub fn dma_pin_user(paddr: usize, pages: usize) {
         return;
     }
     let mut st = USER_PIN.lock();
-    if let Some(e) = st.pins.iter_mut().find(|e| e.base == paddr && e.pages == pages) {
+    if let Some(e) = st
+        .pins
+        .iter_mut()
+        .find(|e| e.base == paddr && e.pages == pages)
+    {
         e.refs = e.refs.saturating_add(1);
         return;
     }
@@ -219,7 +223,11 @@ pub fn dma_unpin_user(paddr: usize, pages: usize) {
     let mut released: Vec<(usize, usize)> = Vec::new();
     {
         let mut st = USER_PIN.lock();
-        if let Some(pos) = st.pins.iter().position(|e| e.base == paddr && e.pages == pages) {
+        if let Some(pos) = st
+            .pins
+            .iter()
+            .position(|e| e.base == paddr && e.pages == pages)
+        {
             let e = &mut st.pins[pos];
             e.refs = e.refs.saturating_sub(1);
             if e.refs == 0 {
@@ -266,17 +274,10 @@ pub fn dma_hold_until_unpin(paddr: usize, pages: usize) {
         return;
     }
     let mut st = USER_PIN.lock();
-    if st
-        .held
-        .iter()
-        .any(|h| h.base == paddr && h.pages == pages)
-    {
+    if st.held.iter().any(|h| h.base == paddr && h.pages == pages) {
         return;
     }
-    st.held.push(HeldFree {
-        base: paddr,
-        pages,
-    });
+    st.held.push(HeldFree { base: paddr, pages });
 }
 
 /// Mark or clear every physical frame backing the usable stack `[usable_base,

@@ -7604,13 +7604,8 @@ impl DrmScheme for NvidiaGpu {
             return false;
         }
         static HWFLIP_TRIED: AtomicBool = AtomicBool::new(false);
-        let ok = self.ce_present_2d_pitched(
-            fb.phys_addr,
-            fb.pitch,
-            dst_pitch,
-            row_bytes,
-            fb.height,
-        );
+        let ok =
+            self.ce_present_2d_pitched(fb.phys_addr, fb.pitch, dst_pitch, row_bytes, fb.height);
         if ok {
             let now = unsafe { crate::bus::drivers_timer_now_as_micros() };
             let mut state = self.kms_state.lock();
@@ -9387,13 +9382,11 @@ impl NvidiaGpu {
                 // that was issued, which covers all but a trailing
                 // unfenced tail.
                 match self.nouveau_fast.lock().get(ctx_idx as usize) {
-                    Some(FastSlot::Ready(f)) if f.fenced > 0 => {
-                        (
-                            f.fence_sem_va,
-                            f.buf_gpu_va + f.fence_sem_off as u64,
-                            f.next_payload.wrapping_sub(1),
-                        )
-                    }
+                    Some(FastSlot::Ready(f)) if f.fenced > 0 => (
+                        f.fence_sem_va,
+                        f.buf_gpu_va + f.fence_sem_off as u64,
+                        f.next_payload.wrapping_sub(1),
+                    ),
                     _ => return Ok(0),
                 }
             }
@@ -9437,7 +9430,11 @@ impl NvidiaGpu {
         handles: &[u32],
         points: &[u64],
         ctx_idx: u32,
-    ) -> (alloc::vec::Vec<(u64, u32)>, alloc::vec::Vec<u32>, alloc::vec::Vec<u64>) {
+    ) -> (
+        alloc::vec::Vec<(u64, u32)>,
+        alloc::vec::Vec<u32>,
+        alloc::vec::Vec<u64>,
+    ) {
         let sem_gpu_va = match self.nouveau_fast.lock().get(ctx_idx as usize) {
             Some(FastSlot::Ready(f)) => Some(f.buf_gpu_va + f.fence_sem_off as u64),
             _ => None,
@@ -10048,7 +10045,9 @@ impl NvidiaGpu {
             ctx_idx,
             alloc::format!(
                 "ctx={} pid={} PRIME OK -- compute+GRAPHICS golden context loaded on rm-device {}",
-                ctx_idx, owner_pid, dev
+                ctx_idx,
+                owner_pid,
+                dev
             ),
         );
         // Publish READY only now: both golden contexts are primed, so a
@@ -10355,12 +10354,7 @@ impl NvidiaGpu {
                             new.oclass as u32,
                         ) {
                             Ok((h_object, 0)) => {
-                                nv::class_object_insert(
-                                    hdr.token,
-                                    new.object,
-                                    h_object,
-                                    owner_pid,
-                                );
+                                nv::class_object_insert(hdr.token, new.object, h_object, owner_pid);
                                 crate::klog_info!(
                                     "[nouveau-uapi] NVIF NEW oclass={:#06x} pid={} -> RM object \
                                      {:#010x} on CTX {} channel token={} (engine context will be built)",
@@ -10829,8 +10823,7 @@ impl NvidiaGpu {
                 let other_holds_ctx0 = if sticky != 0 {
                     sticky != owner_pid
                 } else {
-                    chan.iter()
-                        .any(|c| c.rm_backed && c.owner_pid != owner_pid)
+                    chan.iter().any(|c| c.rm_backed && c.owner_pid != owner_pid)
                 };
                 drop(chan);
                 if other_holds_ctx0 {
@@ -11034,10 +11027,8 @@ impl NvidiaGpu {
                         let leftovers =
                             nv::class_objects_drain_channel(channel_id as u64, owner_pid);
                         for (_token, h_object) in leftovers.iter() {
-                            let status = nvidia_rm_sys::rm_init::class_free(
-                                device_instance,
-                                *h_object,
-                            );
+                            let status =
+                                nvidia_rm_sys::rm_init::class_free(device_instance, *h_object);
                             if status != 0 {
                                 log::warn!(
                                     "[nouveau-uapi] CHANNEL_FREE channel={}: class_free \
@@ -11303,8 +11294,7 @@ impl NvidiaGpu {
                                     for sig in sigs {
                                         let timeline = sig.flags & nv::SYNC_TYPE_MASK
                                             == nv::SYNC_TIMELINE_SYNCOBJ;
-                                        let target =
-                                            if timeline { sig.timeline_value } else { 1 };
+                                        let target = if timeline { sig.timeline_value } else { 1 };
                                         if !crate::scheme::syncobj::attach_hw_fence(
                                             sig.handle,
                                             target,
@@ -11518,7 +11508,8 @@ impl NvidiaGpu {
                         self.partition_exec_waits(&handles, &points, wait_ctx);
                     // Only emit ACQUIRE when the direct-submit path will run;
                     // otherwise reunite into a full CPU wait.
-                    let use_hw = !acquires.is_empty() && self.fast_ctx_ready(device_instance, wait_ctx);
+                    let use_hw =
+                        !acquires.is_empty() && self.fast_ctx_ready(device_instance, wait_ctx);
                     if use_hw {
                         hw_acquires = acquires;
                     }
@@ -11532,12 +11523,7 @@ impl NvidiaGpu {
                             first_signaled_index: 0,
                         }
                     } else {
-                        crate::scheme::syncobj::wait(
-                            &wait_h,
-                            Some(&wait_p),
-                            true,
-                            deadline_us,
-                        )
+                        crate::scheme::syncobj::wait(&wait_h, Some(&wait_p), true, deadline_us)
                     };
                     nv::EXEC_WAIT_US.fetch_add(
                         unsafe { crate::bus::drivers_timer_now_as_micros() }
@@ -12152,7 +12138,8 @@ impl NvidiaGpu {
                 // VRAM FBMEM offset (AT_GPU) for future CE/scanout; never
                 // published as a host PA (see gem_map_cpu FBMEM refusal).
                 let vram_offset = if !sysmem {
-                    match nvidia_rm_sys::rm_init::gem_fbmem_offset(device_instance, alloc.h_memory) {
+                    match nvidia_rm_sys::rm_init::gem_fbmem_offset(device_instance, alloc.h_memory)
+                    {
                         Ok(off) => Some(off),
                         Err(_status) => {
                             // TODO: if AT_GPU lookup fails on some boards,

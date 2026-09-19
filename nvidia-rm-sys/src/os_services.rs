@@ -57,6 +57,18 @@ pub extern "C" fn osGetMonotonicTimeNs() -> NvU64 {
     with_hooks(0, |h| h.monotonic_time_ns())
 }
 
+/// 580.178.04 retired `osGetTickResolution` in favour of this one, and
+/// `timeoutSet` (gpu_timeout.c) uses it exactly the same way the old hook was
+/// used: added to the requested timeout to pad the deadline out to the next
+/// tick, so that a timeout started near the end of a tick does not fire early.
+/// It is never a divisor, so any small non-zero value is safe. Same value as
+/// the `osGetTickResolution` it replaces -- Linux's fallback for a
+/// microsecond-granularity clock, NSEC_PER_USEC.
+#[no_mangle]
+pub extern "C" fn osGetMonotonicTickResolutionNs() -> NvU64 {
+    1_000
+}
+
 // GPU_TIMEOUT_FLAGS_OSTIMER = NVBIT(3) (gpu_timeout.h). This MUST be set:
 // the RM's timeout engine (_checkTimeout, gpu_timeout.c) starts every check
 // at status = NV_OK and only ever returns NV_ERR_TIMEOUT from inside a branch

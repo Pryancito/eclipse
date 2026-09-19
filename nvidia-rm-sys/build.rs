@@ -236,13 +236,15 @@ fn build_first_real_nvidia_file() {
         // libspdm (real, BSD-3-Clause-licensed DMTF SPDM reference
         // implementation NVIDIA vendors for Confidential-Computing
         // attestation) -- include paths transcribed from
-        // src/nvidia/src/libraries/libspdm/nvidia/openspdm.mk. The 570.144
-        // release vendors libspdm 3.1.1 (not 3.5.0), and 3.1.1 has no
-        // os_stub/cryptlib_null directory, so that entry is dropped.
-        nvidia.join("src/libraries/libspdm/3.1.1/include"),
-        nvidia.join("src/libraries/libspdm/3.1.1/include/hal"),
-        nvidia.join("src/libraries/libspdm/3.1.1/os_stub/include"),
-        nvidia.join("src/libraries/libspdm/3.1.1/os_stub"),
+        // src/nvidia/src/libraries/libspdm/nvidia/openspdm.mk. The 580.178.04
+        // release vendors libspdm 3.5.0 (570.144 vendored 3.1.1). openspdm.mk
+        // lists an os_stub/cryptlib_null include for both, but that directory
+        // is in neither tree -- checked on the pinned submodule -- so the entry
+        // stays dropped, same as it was for 3.1.1.
+        nvidia.join("src/libraries/libspdm/3.5.0/include"),
+        nvidia.join("src/libraries/libspdm/3.5.0/include/hal"),
+        nvidia.join("src/libraries/libspdm/3.5.0/os_stub/include"),
+        nvidia.join("src/libraries/libspdm/3.5.0/os_stub"),
         nvidia.join("src/libraries/libspdm/nvidia"),
         // GSP message-queue library (msgq.h) -- src/common/shared/msgq is
         // compiled into the RM core (msgq_utils.c etc.) and its public
@@ -309,13 +311,13 @@ fn build_first_real_nvidia_file() {
         "PORT_MODULE_string=1",
         "PORT_MODULE_sync=1",
         "PORT_MODULE_thread=1",
-        // 570.144 has NO nvport `time` module: its srcs.mk compiles no
-        // time_generic.c and src/nvidia/inc/libraries/nvport/time.h does not
+        // 580.178.04 still has NO nvport `time` module: its srcs.mk compiles
+        // no time_generic.c and src/nvidia/inc/libraries/nvport/time.h does not
         // exist. nvport.h only pulls in "nvport/time.h" under
-        // PORT_IS_MODULE_SUPPORTED(time), so this MUST be 0 for 570.144 --
-        // forcing it to 1 (as 610.43.02's Makefile did) made nvport.h include
-        // a nonexistent header ("fatal error: nvport/time.h"). RM 570 uses the
-        // os-interface time hooks, not an nvport time module.
+        // PORT_IS_MODULE_SUPPORTED(time), so this MUST stay 0 -- forcing it to
+        // 1 (as 610.43.02's Makefile did) made nvport.h include a nonexistent
+        // header ("fatal error: nvport/time.h"). The module first appears in
+        // 610.x; RM 580 still uses the os-interface time hooks instead.
         "PORT_MODULE_time=0",
         "PORT_MODULE_util=1",
         "PORT_MODULE_example=0",

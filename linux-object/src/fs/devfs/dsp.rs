@@ -217,7 +217,7 @@ impl INode for DspDev {
             read: false,
             write: self.audio.free_bytes() > 0,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
 

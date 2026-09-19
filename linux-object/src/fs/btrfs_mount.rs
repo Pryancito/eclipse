@@ -543,7 +543,7 @@ impl INode for BtrfsMountINode {
             read: true,
             write: st.kind != FileKind::Dir,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
 

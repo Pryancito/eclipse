@@ -93,7 +93,7 @@ impl INode for UartDev {
             read: self.can_recv()?,
             write: true,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
 

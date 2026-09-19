@@ -1801,7 +1801,6 @@ dependencies = [
 [[package]]
 name = "rcore-fs-devfs"
 version = "0.1.0"
-source = "git+https://github.com/rcore-os/rcore-fs?rev=1a3246b#1a3246b1d3754f414817d72a6217fc7b6076ff30"
 dependencies = [
  "rcore-fs",
  "spin 0.9.4",
@@ -1855,7 +1854,6 @@ dependencies = [
 [[package]]
 name = "rcore-fs-sefs"
 version = "0.1.0"
-source = "git+https://github.com/rcore-os/rcore-fs?rev=1a3246b#1a3246b1d3754f414817d72a6217fc7b6076ff30"
 dependencies = [
  "bitvec",
  "log",

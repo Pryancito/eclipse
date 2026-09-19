@@ -891,7 +891,7 @@ impl FileLike for File {
                     read: meta.size > 0,
                     write: true,
                     error: false,
-                hangup: false,
+                    hangup: false,
                 });
             }
         }
@@ -931,7 +931,7 @@ impl FileLike for File {
                     read: meta.size > 0,
                     write: true,
                     error: false,
-                hangup: false,
+                    hangup: false,
                 });
             }
         }

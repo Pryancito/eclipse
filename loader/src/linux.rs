@@ -584,10 +584,7 @@ fn handle_signal(
     }
     if signal == Signal::SIGSTOP
         || (action.handler == SIG_DFL
-            && matches!(
-                signal,
-                Signal::SIGTSTP | Signal::SIGTTIN | Signal::SIGTTOU
-            ))
+            && matches!(signal, Signal::SIGTSTP | Signal::SIGTTIN | Signal::SIGTTOU))
     {
         let proc = thread.proc();
         if let Some(lp) = proc.try_linux() {
