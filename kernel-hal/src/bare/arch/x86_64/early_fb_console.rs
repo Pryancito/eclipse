@@ -226,27 +226,18 @@ fn draw_char(c: u8) {
         CUR_X.store(0, Ordering::SeqCst);
         return;
     }
-    let c = if (0x20..0x80).contains(&c) { c } else { b'?' };
-    let glyph = &FONT8X8[(c - 0x20) as usize];
-
     let col = CUR_X.load(Ordering::SeqCst);
     let row = CUR_Y.load(Ordering::SeqCst);
     let x0 = col * CHAR_W;
     let y0 = row * CHAR_H;
 
-    // 8x16: draw each font row twice vertically.
-    // gx = 0 is the left of the cell; bit 7 of the VGA row is that pixel.
-    for (gy, bits) in glyph.iter().copied().enumerate() {
-        for gx in 0..8u32 {
-            let on = (bits & (1 << (7 - gx))) != 0;
-            if on {
-                let px = x0 + gx;
-                let py = y0 + (gy as u32) * 2;
-                put_pixel(px, py, 0xFFFF_FFFF);
-                put_pixel(px, py + 1, 0xFFFF_FFFF);
-            }
-        }
-    }
+    // Paint the whole cell, background included -- see `draw_char_at`, which
+    // has always done so. Writing only the lit pixels composited each glyph
+    // over whatever was already there: the pre-VT boot log landed on top of
+    // the boot logo, and `console_panic_write_str` painted the panic report
+    // over the compositor's last frame, illegible against it. A panic report
+    // that cannot be read is the one message that always has to be.
+    draw_char_at(x0, y0, c, 0xFFFF_FFFF, 0x0000_0000);
 
     CUR_X.fetch_add(1, Ordering::SeqCst);
     let max_cols = FB_WIDTH.load(Ordering::SeqCst) / CHAR_W;

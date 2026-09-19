@@ -326,7 +326,15 @@ cfg_if! {
         }
 
         pub(crate) fn scroll_active_vt(direction: i32) {
-            let _ = with_vt_try(ACTIVE_VT.load(Ordering::SeqCst), |g| {
+            let vt = ACTIVE_VT.load(Ordering::SeqCst);
+            // Userspace owns the framebuffer in KD_GRAPHICS: scrolling the
+            // shadow buffer is fine, presenting it is not -- that paints the
+            // text console over the compositor. Every other present in this
+            // file is gated this way; this one was the hole.
+            if !present_allowed(vt) {
+                return;
+            }
+            let _ = with_vt_try(vt, |g| {
                 g.buf_mut().scroll_history(direction);
                 g.present();
             });

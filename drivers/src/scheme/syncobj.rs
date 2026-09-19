@@ -313,6 +313,20 @@ pub fn has_pending() -> bool {
 /// Resolves immediately if the fence already landed (a fast GPU). Like a
 /// direct signal, this REPLACES an imported `sync_file` fence the object
 /// carried. Returns `false` for an unknown handle.
+///
+/// `binary` distinguishes the two `drm_syncobj` flavours, and it matters:
+///
+/// * A **timeline** syncobj is a monotonic counter, so a fence for a point at
+///   or below the one already reached is moot and is dropped.
+/// * A **binary** syncobj is a single fence *slot*, and every signal REPLACES
+///   what it held — `drm_syncobj_replace_fence` in Linux. Its point is always
+///   1, so dropping "already past that point" was dropping the fence of every
+///   submit after the first: the object kept reading signaled while the GPU
+///   was still writing, and the next waiter sailed straight through. That is
+///   the normal `VkSemaphore` pattern (signal, wait, signal again, wait), so
+///   a binary re-signal here un-signals the object back to 0 and re-arms it
+///   on the new fence. A timeline that has genuinely passed 1 is left alone:
+///   only a slot still in binary range can be rewound.
 pub fn attach_hw_fence(
     handle: u32,
     point: u64,
@@ -320,6 +334,7 @@ pub fn attach_hw_fence(
     fence_gpu_va: u64,
     payload: u32,
     ctx_idx: u32,
+    binary: bool,
 ) -> bool {
     if fence_landed(fence_va, payload) {
         return timeline_signal(handle, point);
@@ -330,9 +345,20 @@ pub fn attach_hw_fence(
             return false;
         };
         obj.linked = None;
-        if point <= obj.point {
+        let cur = obj.point;
+        if binary {
+            // Replace the slot's fence: rewind the point so waiters block
+            // until THIS submit lands. A timeline past 1 is left alone.
+            if cur <= 1 {
+                obj.point = 0;
+            }
+        } else if point <= cur {
             // Already past that point: nothing to wait for.
             return true;
+        }
+        if binary {
+            // ...and drop the fence the slot carried; it is superseded.
+            table.pending.retain(|f| f.handle != handle);
         }
         table.pending.push(PendingFence {
             handle,
@@ -962,4 +988,86 @@ pub fn describe(handles: &[u32], points: Option<&[u64]>) -> alloc::string::Strin
         }
     }
     list
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fence landing zone the test drives by hand, standing in for the
+    /// sysmem word the GPU's host-semaphore RELEASE writes.
+    struct Landing(alloc::boxed::Box<u32>);
+
+    impl Landing {
+        fn new() -> Self {
+            Self(alloc::boxed::Box::new(0))
+        }
+        fn va(&self) -> usize {
+            &*self.0 as *const u32 as usize
+        }
+        fn land(&mut self, payload: u32) {
+            *self.0 = payload;
+        }
+    }
+
+    /// The bug this guards: a binary syncobj is a fence SLOT, not a counter.
+    /// Signalling it a second time used to hit `point <= obj.point` (its point
+    /// is always 1) and drop the new fence on the floor, leaving the object
+    /// reading "signaled" while the GPU was still writing — so the next waiter
+    /// went straight through and sampled a half-written buffer.
+    #[test]
+    fn a_second_binary_signal_rearms_the_syncobj_on_the_new_fence() {
+        let h = create(false);
+        let mut first = Landing::new();
+        let mut second = Landing::new();
+
+        // First submit signals it; the fence lands; the object is signaled.
+        assert!(attach_hw_fence(h, 1, first.va(), 0, 1, 0, true));
+        assert_eq!(query(h), Some(0), "unsignaled until the fence lands");
+        first.land(1);
+        assert_eq!(query(h), Some(1), "signaled once the GPU wrote the fence");
+
+        // Second submit signals the SAME handle. The object must go back to
+        // unsignaled and wait for THIS fence, not report the old one.
+        assert!(attach_hw_fence(h, 1, second.va(), 0, 1, 0, true));
+        assert_eq!(
+            query(h),
+            Some(0),
+            "a re-signalled binary syncobj must not still read as signaled"
+        );
+        // ...while LAST_SUBMITTED and WAIT_AVAILABLE still see the submit, and
+        // EXEC can still find the fence to turn into a GPU-side ACQUIRE.
+        assert_eq!(query_submitted(h), Some(1));
+        assert_eq!(
+            pending_hw_fence(h, 1).map(|f| f.0),
+            Some(second.va()),
+            "the pending fence must be the new one"
+        );
+
+        second.land(1);
+        assert_eq!(query(h), Some(1));
+
+        destroy(h);
+    }
+
+    /// The timeline flavour keeps its monotonic-counter semantics: a fence for
+    /// a point already reached is genuinely moot and stays dropped.
+    #[test]
+    fn a_timeline_fence_at_or_below_the_current_point_is_still_dropped() {
+        let h = create(false);
+        let mut fence = Landing::new();
+
+        assert!(attach_hw_fence(h, 5, fence.va(), 0, 1, 0, false));
+        fence.land(1);
+        assert_eq!(query(h), Some(5));
+
+        // Point 3 is behind the timeline: nothing to wait for, and the object
+        // must not be rewound.
+        let stale = Landing::new();
+        assert!(attach_hw_fence(h, 3, stale.va(), 0, 7, 0, false));
+        assert_eq!(query(h), Some(5));
+        assert!(pending_hw_fence(h, 3).is_none());
+
+        destroy(h);
+    }
 }

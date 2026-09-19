@@ -74,22 +74,17 @@ pub fn nouveau_uapi_enabled() -> bool {
     false
 }
 
-/// The NVC57E window ISO surface flip and the copy-engine `page_flip` are
-/// both NVIDIA paths, so like the uAPI above they do not exist off x86_64 and
-/// their opt-in flags can only ever read false there. Stubs rather than
-/// callers full of `cfg`: `create_fb` asks whether a driver-private fb is
-/// wanted, and on a UEFI-display-only arch the answer is simply no.
-///
-/// These two were the only flag readers in the x86_64-gated re-export block
-/// with no counterpart here, which is why `linux-object` stopped compiling
-/// for aarch64 and riscv64 the moment `create_fb` began consulting them.
+/// The CE page-flip (`nvidia.hwflip`) and NVC57E surface-flip
+/// (`nvidia.surfaceflip`) opt-ins live in the NVIDIA driver, which only
+/// exists on x86_64. Off x86_64 there is no hardware flip path at all, so
+/// both read `false` and callers stay on the software-KMS blit. Mirrors the
+/// `kernel_hal::drivers` wrappers of the same names.
 #[cfg(not(target_arch = "x86_64"))]
-pub fn surfaceflip_enabled() -> bool {
+pub fn hwflip_enabled() -> bool {
     false
 }
 
-/// See [`surfaceflip_enabled`].
 #[cfg(not(target_arch = "x86_64"))]
-pub fn hwflip_enabled() -> bool {
+pub fn surfaceflip_enabled() -> bool {
     false
 }
