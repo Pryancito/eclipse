@@ -13,6 +13,7 @@ ffmpeg = "xtask ffmpeg"
 libc-test = "xtask libc-test"
 other-test = "xtask other-test"
 image = "xtask image"
+nvidia-firmware = "xtask nvidia-firmware"
 
 linux-libos = "xtask linux-libos"
 
