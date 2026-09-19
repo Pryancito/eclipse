@@ -86,18 +86,75 @@ fn pinned_rm_version() -> Option<String> {
     None
 }
 
-/// Necessary-condition check on a candidate image: the RM compares the ELF's
-/// `.fwversion` section against its own version string, and that section's
-/// content is exactly that string, so a blob for the right version must
-/// contain those bytes somewhere. Cheap enough to run on every candidate, and
-/// it catches the one mistake that otherwise only shows up as a GSP that
-/// refuses to boot on real hardware.
+/// Reads an ELF64 little-endian section's contents by name, or `None` if the
+/// file is not such an ELF or has no section with that name. Deliberately a
+/// hand-rolled reader rather than a new dependency: this needs one section out
+/// of one well-formed file, and every offset it trusts is bounds-checked.
+fn elf64_section<'a>(bytes: &'a [u8], want: &str) -> Option<&'a [u8]> {
+    let at_u16 = |off: usize| -> Option<usize> {
+        let b = bytes.get(off..off + 2)?;
+        Some(u16::from_le_bytes([b[0], b[1]]) as usize)
+    };
+    let at_u32 = |off: usize| -> Option<usize> {
+        let b = bytes.get(off..off + 4)?;
+        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    };
+    let at_u64 = |off: usize| -> Option<usize> {
+        let b = bytes.get(off..off + 8)?;
+        Some(u64::from_le_bytes(b.try_into().ok()?) as usize)
+    };
+
+    // e_ident: magic, then EI_CLASS == 2 (64-bit) and EI_DATA == 1 (LE).
+    if bytes.get(..4)? != b"\x7fELF" || *bytes.get(4)? != 2 || *bytes.get(5)? != 1 {
+        return None;
+    }
+    let e_shoff = at_u64(0x28)?;
+    let e_shentsize = at_u16(0x3A)?;
+    let e_shnum = at_u16(0x3C)?;
+    let e_shstrndx = at_u16(0x3E)?;
+    if e_shentsize < 0x40 || e_shstrndx >= e_shnum {
+        return None;
+    }
+    let shdr = |i: usize| -> Option<(usize, usize, usize)> {
+        let base = e_shoff.checked_add(i.checked_mul(e_shentsize)?)?;
+        Some((at_u32(base)?, at_u64(base + 0x18)?, at_u64(base + 0x20)?))
+    };
+
+    // The section-name string table, then a linear scan for `want`.
+    let (_, strtab_off, strtab_size) = shdr(e_shstrndx)?;
+    let strtab = bytes.get(strtab_off..strtab_off.checked_add(strtab_size)?)?;
+    for i in 0..e_shnum {
+        let (sh_name, sh_offset, sh_size) = shdr(i)?;
+        let name = strtab.get(sh_name..)?;
+        let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
+        if name == want.as_bytes() {
+            return bytes.get(sh_offset..sh_offset.checked_add(sh_size)?);
+        }
+    }
+    None
+}
+
+/// Mirrors what `_kgspFwContainerVerifyVersion` (kernel_gsp.c) does at runtime:
+/// pull the `.fwversion` section out of the container and require it to be
+/// exactly the version string plus its NUL terminator. Running the real check
+/// at build time is the point -- a mismatched image otherwise only shows up as
+/// a GSP that refuses to boot on real hardware.
+///
+/// Searching the whole blob for the version bytes would not do: an image for
+/// another version can carry this one's string in some other section or in
+/// metadata and would sail through.
 fn looks_like_version(image: &Path, version: &str) -> bool {
     let Ok(bytes) = fs::read(image) else {
         return false;
     };
-    let needle = version.as_bytes();
-    bytes.windows(needle.len()).any(|w| w == needle)
+    let Some(section) = elf64_section(&bytes, ".fwversion") else {
+        return false;
+    };
+    // fwversionSize == strlen(NV_VERSION_STRING) + 1, and the bytes before the
+    // terminator must match -- the same two conditions the RM applies.
+    section.len() == version.len() + 1
+        && section.last() == Some(&0)
+        && &section[..version.len()] == version.as_bytes()
 }
 
 /// Downloads linux-firmware's copy, if it has one for this version.
@@ -263,14 +320,84 @@ mod tests {
         );
     }
 
-    #[test]
-    fn version_check_rejects_a_mismatched_image() {
+    /// Builds the smallest ELF64 that the reader accepts: a header, a
+    /// `.fwversion` section holding `fwversion`, a `.shstrtab`, and `filler`
+    /// appended after everything so a test can plant bytes that are in the
+    /// file but NOT in `.fwversion`.
+    fn fake_gsp_elf(fwversion: &[u8], filler: &[u8]) -> Vec<u8> {
+        const EHDR: usize = 64;
+        const SHENT: usize = 64;
+        let shstrtab: &[u8] = b"\0.fwversion\0.shstrtab\0";
+
+        let fw_off = EHDR;
+        let str_off = fw_off + fwversion.len();
+        let sh_off = str_off + shstrtab.len();
+
+        let mut v = vec![0u8; EHDR];
+        v[..4].copy_from_slice(b"\x7fELF");
+        v[4] = 2; // ELFCLASS64
+        v[5] = 1; // ELFDATA2LSB
+        v[0x28..0x30].copy_from_slice(&(sh_off as u64).to_le_bytes()); // e_shoff
+        v[0x3A..0x3C].copy_from_slice(&(SHENT as u16).to_le_bytes()); // e_shentsize
+        v[0x3C..0x3E].copy_from_slice(&3u16.to_le_bytes()); // e_shnum
+        v[0x3E..0x40].copy_from_slice(&2u16.to_le_bytes()); // e_shstrndx
+        v.extend_from_slice(fwversion);
+        v.extend_from_slice(shstrtab);
+
+        let mut shdr = |name: u32, off: usize, size: usize| {
+            let mut h = vec![0u8; SHENT];
+            h[0..4].copy_from_slice(&name.to_le_bytes());
+            h[0x18..0x20].copy_from_slice(&(off as u64).to_le_bytes());
+            h[0x20..0x28].copy_from_slice(&(size as u64).to_le_bytes());
+            v.extend_from_slice(&h);
+        };
+        shdr(0, 0, 0); // SHN_UNDEF
+        shdr(1, fw_off, fwversion.len()); // ".fwversion"
+        shdr(12, str_off, shstrtab.len()); // ".shstrtab"
+        v.extend_from_slice(filler);
+        v
+    }
+
+    fn scratch(name: &str, bytes: &[u8]) -> PathBuf {
         let dir = std::env::temp_dir().join("eclipse-gsp-version-check");
         fs::create_dir_all(&dir).unwrap();
-        let f = dir.join("fake.bin");
-        fs::write(&f, b"\x7fELF....570.144\0....").unwrap();
-        assert!(looks_like_version(&f, "570.144"));
+        let f = dir.join(name);
+        fs::write(&f, bytes).unwrap();
+        f
+    }
+
+    #[test]
+    fn version_check_reads_the_fwversion_section() {
+        let f = scratch("good.bin", &fake_gsp_elf(b"580.178.04\0", b""));
+        assert!(looks_like_version(&f, "580.178.04"));
+        assert!(!looks_like_version(&f, "570.144"));
+    }
+
+    /// The reason this reads the section instead of searching the file: an
+    /// image built for another version can carry the string we want somewhere
+    /// else entirely -- in a log section, a path, some metadata -- and a
+    /// whole-blob search would accept it and install a firmware the RM then
+    /// rejects at boot with NV_ERR_INVALID_DATA.
+    #[test]
+    fn version_check_ignores_the_string_outside_fwversion() {
+        let f = scratch(
+            "decoy.bin",
+            &fake_gsp_elf(b"570.144\0", b"built from 580.178.04 sources"),
+        );
         assert!(!looks_like_version(&f, "580.178.04"));
-        let _ = fs::remove_dir_all(&dir);
+        assert!(looks_like_version(&f, "570.144"));
+    }
+
+    /// A prefix must not pass: the RM requires the length to match too.
+    #[test]
+    fn version_check_rejects_a_prefix() {
+        let f = scratch("prefix.bin", &fake_gsp_elf(b"580.178.04\0", b""));
+        assert!(!looks_like_version(&f, "580.178"));
+    }
+
+    #[test]
+    fn version_check_rejects_a_non_elf() {
+        let f = scratch("notelf.bin", b"580.178.04\0 but not an ELF at all");
+        assert!(!looks_like_version(&f, "580.178.04"));
     }
 }
