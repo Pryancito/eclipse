@@ -2687,7 +2687,8 @@ fn damage_rect_from_blob(blob_id: u32, fb_w: u32, fb_h: u32) -> Option<(u32, u32
     }
     let mut union: Option<(u32, u32, u32, u32)> = None;
     for chunk in data.as_chunks::<DRM_MODE_RECT_SIZE>().0 {
-        let rd = |o: usize| i32::from_ne_bytes([chunk[o], chunk[o + 1], chunk[o + 2], chunk[o + 3]]);
+        let rd =
+            |o: usize| i32::from_ne_bytes([chunk[o], chunk[o + 1], chunk[o + 2], chunk[o + 3]]);
         let (x1, y1, x2, y2) = (rd(0), rd(4), rd(8), rd(12));
         if x2 <= x1 || y2 <= y1 {
             continue;
