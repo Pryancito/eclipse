@@ -1331,19 +1331,7 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
         // way (see its `(fw, fh)`); this call site did not, even though the
         // cache invalidate right above it already used the clipped pair.
         blit_cursor_patch(
-            &*display,
-            pixels,
-            src_stride,
-            fb_width,
-            fb_height,
-            cx,
-            cy,
-            cw,
-            ch,
-            cx,
-            cy,
-            cw,
-            ch,
+            &*display, pixels, src_stride, fb_width, fb_height, cx, cy, cw, ch, cx, cy, cw, ch,
             &bmp,
         );
     }
