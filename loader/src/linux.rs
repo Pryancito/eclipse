@@ -515,7 +515,7 @@ async fn run_user(thread: CurrentThread) {
             .map(|lp| lp.is_job_stopped())
             .unwrap_or(false)
         {
-            linux_object::process::wait_while_job_stopped(&thread.proc()).await;
+            linux_object::process::wait_while_job_stopped(thread.proc()).await;
             if thread.state() == ThreadState::Dying {
                 break;
             }
@@ -576,7 +576,7 @@ fn handle_signal(
         if signal == Signal::SIGCONT {
             let proc = thread.proc();
             if let Some(lp) = proc.try_linux() {
-                lp.job_continue(&proc);
+                lp.job_continue(proc);
             }
         }
         thread.inner().lock_linux().handling_signal = None;
@@ -588,7 +588,7 @@ fn handle_signal(
     {
         let proc = thread.proc();
         if let Some(lp) = proc.try_linux() {
-            lp.job_stop(&proc, signal as u8);
+            lp.job_stop(proc, signal as u8);
         }
         thread.inner().lock_linux().handling_signal = None;
         return ctx;
@@ -596,7 +596,7 @@ fn handle_signal(
     if signal == Signal::SIGCONT {
         let proc = thread.proc();
         if let Some(lp) = proc.try_linux() {
-            lp.job_continue(&proc);
+            lp.job_continue(proc);
         }
         if action.handler == SIG_DFL {
             thread.inner().lock_linux().handling_signal = None;

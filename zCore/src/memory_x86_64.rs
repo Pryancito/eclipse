@@ -609,7 +609,7 @@ cfg_if! {
                     *f = e.site[i].load(Ordering::Relaxed);
                 }
             }
-            out.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            out.sort_unstable_by_key(|a| core::cmp::Reverse(a.0));
             (out, BIG_TRACK_MISSED.load(Ordering::Relaxed))
         }
 
