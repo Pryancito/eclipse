@@ -630,6 +630,82 @@ pub fn hwcursor_hide(device_instance: u32) -> NV_STATUS {
     unsafe { eclipse_rm_hwcursor_hide(device_instance) }
 }
 
+/// Per-stage NV_STATUS for NVC57E window ISO surface-flip bring-up.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct HwFlipInit {
+    pub core_ensure_status: NvU32,
+    pub win_pb_mem_status: NvU32,
+    pub win_pb_dma_status: NvU32,
+    pub win_chan_status: NvU32,
+    pub win_map_status: NvU32,
+    pub owner_status: NvU32,
+    pub window_idx: NvU32,
+}
+
+extern "C" {
+    fn eclipse_rm_hwflip_init(
+        gpuInstance: NvU32,
+        head: NvU32,
+        out: *mut HwFlipInit,
+    ) -> NV_STATUS;
+    fn eclipse_rm_hwflip_surface(
+        gpuInstance: NvU32,
+        hMemory: NvU32,
+        fbmemOffset: NvU64,
+        width: NvU32,
+        height: NvU32,
+        pitchBytes: NvU32,
+    ) -> NV_STATUS;
+    fn eclipse_rm_hwflip_ready() -> NvBool;
+}
+
+/// Bring up NVC57E window ISO flip (reuses/creates NVC570+NVC57D via hwcursor).
+/// Opt-in `nvidia.surfaceflip`. Serialized through `RmGate`.
+pub fn hwflip_init(device_instance: u32, head: u32) -> (NV_STATUS, HwFlipInit) {
+    let _gate = RmGate::lock();
+    let mut out = HwFlipInit {
+        core_ensure_status: 0xFFFF_FFFF,
+        win_pb_mem_status: 0xFFFF_FFFF,
+        win_pb_dma_status: 0xFFFF_FFFF,
+        win_chan_status: 0xFFFF_FFFF,
+        win_map_status: 0xFFFF_FFFF,
+        owner_status: 0xFFFF_FFFF,
+        window_idx: 0,
+    };
+    let status = unsafe { eclipse_rm_hwflip_init(device_instance, head, &mut out) };
+    (status, out)
+}
+
+/// Flip the window ISO surface to GEM VRAM `h_memory`.
+/// `fbmem_offset` is the **plane offset within the BO/ctxdma** in bytes
+/// (typically 0), in 256-byte units at the HW — not an absolute AT_GPU address.
+pub fn hwflip_surface(
+    device_instance: u32,
+    h_memory: u32,
+    fbmem_offset: u64,
+    width: u32,
+    height: u32,
+    pitch_bytes: u32,
+) -> NV_STATUS {
+    let _gate = RmGate::lock();
+    unsafe {
+        eclipse_rm_hwflip_surface(
+            device_instance,
+            h_memory,
+            fbmem_offset,
+            width,
+            height,
+            pitch_bytes,
+        )
+    }
+}
+
+/// Whether the NVC57E surface-flip ladder is ready.
+pub fn hwflip_ready() -> bool {
+    unsafe { eclipse_rm_hwflip_ready() != 0 }
+}
+
 /// Mirror of `EclipseGrLaunch` (vendor/eclipse_rm_init.c): per-stage
 /// NV_STATUS (`0xFFFFFFFF` = not reached) for step-18, the first
 /// Eclipse-authored pushbuffer submission (host + compute-engine
@@ -2006,4 +2082,61 @@ pub fn exec_fast_prepare(device_instance: u32, ctx_idx: u32) -> Result<ExecFast,
 pub fn exec_fast_release(device_instance: u32, ctx_idx: u32) -> NV_STATUS {
     let _gate = RmGate::lock();
     unsafe { eclipse_rm_exec_fast_release(device_instance, ctx_idx) }
+}
+
+extern "C" {
+    fn eclipse_rm_map_peer_fence(
+        gpu_instance: NvU32,
+        consumer_ctx: NvU32,
+        producer_ctx: NvU32,
+        producer_fence_gpu_va: NvU64,
+        p_consumer_va: *mut NvU64,
+    ) -> NV_STATUS;
+    fn eclipse_rm_gem_fbmem_offset(
+        gpu_instance: NvU32,
+        h_memory: NvU32,
+        p_offset: *mut NvU64,
+    ) -> NV_STATUS;
+}
+
+/// Map a producer fence semaphore into the consumer VAS for HW ACQUIRE.
+/// Same-ctx returns the producer VA unchanged. Cross-ctx maps the producer's
+/// channel sysmem (`hPhysBuf`) into the consumer VAS (cached until either
+/// context is freed). Returns `None` only on RM failure (caller falls back
+/// to a CPU wait).
+pub fn map_peer_fence_sem(
+    device_instance: u32,
+    consumer_ctx: u32,
+    producer_ctx: u32,
+    producer_fence_gpu_va: u64,
+) -> Option<u64> {
+    let _gate = RmGate::lock();
+    let mut consumer_va: NvU64 = 0;
+    let status = unsafe {
+        eclipse_rm_map_peer_fence(
+            device_instance,
+            consumer_ctx,
+            producer_ctx,
+            producer_fence_gpu_va,
+            &mut consumer_va,
+        )
+    };
+    if status == NV_OK && consumer_va != 0 {
+        Some(consumer_va)
+    } else {
+        None
+    }
+}
+
+/// FBMEM (VRAM) offset of a GEM object via `memdescGetPhysAddr(..., AT_GPU, 0)`.
+/// Only meaningful for `NV01_MEMORY_LOCAL_USER` allocations.
+pub fn gem_fbmem_offset(device_instance: u32, h_memory: u32) -> Result<u64, NV_STATUS> {
+    let _gate = RmGate::lock();
+    let mut offset: NvU64 = 0;
+    let status = unsafe { eclipse_rm_gem_fbmem_offset(device_instance, h_memory, &mut offset) };
+    if status == NV_OK {
+        Ok(offset)
+    } else {
+        Err(status)
+    }
 }

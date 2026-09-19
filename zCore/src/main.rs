@@ -521,6 +521,21 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                      (scanout pausado); cursor software hasta entonces"
                 );
             }
+            // Opt-in CE present on DRM page_flip (GOP via copy-engine). Default
+            // off; does not claim hardware KMS. Pair with CE present / dual-GPU
+            // bring-up for best results.
+            if options.cmdline.contains("nvidia.hwflip") {
+                kernel_hal::drivers::set_hwflip_enabled(true);
+                klog_info!(
+                    "Eclipse: nvidia.hwflip ON — page_flip intentará CE present al GOP"
+                );
+            }
+            if options.cmdline.contains("nvidia.surfaceflip") {
+                kernel_hal::drivers::set_surfaceflip_enabled(true);
+                klog_info!(
+                    "Eclipse: nvidia.surfaceflip ON — page_flip intentará NVC57E ISO (VRAM)"
+                );
+            }
             // Atomic modesetting uAPI (DRM_CLIENT_CAP_ATOMIC +
             // DRM_IOCTL_MODE_ATOMIC) is OPT-IN while the legacy-KMS path
             // remains the one proven on real hardware — same rollout nouveau
@@ -574,6 +589,13 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                         "Eclipse: nvidia.nouveau_uapi pedido pero NO hay ninguna GPU NVIDIA registrada -- uAPI nouveau DESACTIVADA (el nodo DRM sigue identificandose como \"zcore\")"
                     );
                 }
+            }
+            // On-demand console GSP bring-up (default OFF: use /proc/gpustep14).
+            if options.cmdline.contains("nvidia.console_gsp") {
+                kernel_hal::drivers::set_console_gsp_enabled(true);
+                klog_info!(
+                    "Eclipse: nvidia.console_gsp -- console GPU GSP on-demand bring-up ENABLED"
+                );
             }
             kernel_hal::console::early_progress_bar(95);
 

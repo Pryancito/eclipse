@@ -66,7 +66,7 @@ fn store_fence() {
 }
 
 /// `syncobj`'s fence-timeout upcall: a pending hardware fence did not land in
-/// 1 s. Route it to the GPU whose context buffer holds the landing zone.
+/// 10 s. Route it to the GPU whose context buffer holds the landing zone.
 fn nouveau_fence_timeout_hook(
     ctx_idx: u32,
     fence_va: usize,
@@ -579,6 +579,10 @@ struct NvidiaKmsFramebuffer {
     pitch: u32,
     phys_addr: u64,
     size: usize,
+    /// RM `NV01_MEMORY_*` handle for ISO ctxdma (0 = unknown / dumb-only).
+    h_memory: u32,
+    /// FBMEM offset (`AT_GPU`) for VRAM BOs; `None` for sysmem.
+    vram_offset: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -824,6 +828,18 @@ static HDMI_AUDIO_STATUS: lock::Mutex<Option<alloc::string::String>> = lock::Mut
 /// (the console GPU, which is never auto-booted) is precisely the one that
 /// needs naming in `/proc/gpusnd`.
 static NVIDIA_GPUS: lock::Mutex<Vec<Arc<NvidiaGpu>>> = lock::Mutex::new(Vec::new());
+
+/// Live bytes across every entry in every GPU's `nouveau_gem` table.
+/// Updated on `GEM_NEW` / `GEM_CLOSE` / process-exit free. Quotas in the
+/// `GEM_NEW` arm consult this before calling `gem_alloc`.
+static NOUVEAU_GEM_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Hard cap on a single `GEM_NEW` allocation.
+const GEM_NEW_MAX_SINGLE: u64 = 256 * 1024 * 1024; // 256 MiB
+/// Cap on live `nouveau_gem` bytes owned by one pid.
+const GEM_NEW_MAX_PER_PID: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+/// Soft global ceiling; actual cap is `min(this, vram_bytes * 2)`.
+const GEM_NEW_MAX_GLOBAL: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
 
 fn record_hdmi_audio_status(s: alloc::string::String) {
     *HDMI_AUDIO_STATUS.lock() = Some(s);
@@ -7282,22 +7298,10 @@ impl DrmScheme for NvidiaGpu {
     }
 
     fn has_hardware_kms(&self) -> bool {
-        // This driver does NOT have a working hardware-KMS presentation path on
-        // this hardware. `page_flip` is a no-op (see below) because a real
-        // display modeset/scanout on these GPUs wedges (the isochronous-scanout
-        // dead-end documented in the display bring-up work). Claiming hardware
-        // KMS here is actively harmful:
-        //   * it disables `software_kms_active()` (linux-object drm.rs), so the
-        //     dumb-buffer -> UEFI-GOP-framebuffer scanout blit — the ONLY path
-        //     that actually lights up the panel — never runs (black screen);
-        //   * it makes wlroots treat the node as a real KMS GPU and take the
-        //     GLES2/GBM path, which hangs the whole OS at GL FBO creation on
-        //     this stub (no usable GL/GBM). pixman + software scanout is the
-        //     only combination that works here.
-        // Return false so the software-KMS path drives the output. The KMS
-        // framebuffer machinery above (create_fb/present_kms_fb) is left in
-        // place, dormant, for the day a real modeset path exists.
-        false
+        // Claim hardware KMS only when NVC57E surface-flip is opted in AND the
+        // ladder is READY. Until then software scanout (GOP blit) must remain
+        // the path that lights the panel.
+        super::nouveau_uapi::surfaceflip_enabled() && nvidia_rm_sys::rm_init::hwflip_ready()
     }
 
     fn nouveau_gem_close(&self, handle: u32, owner_pid: u64) -> bool {
@@ -7363,6 +7367,7 @@ impl DrmScheme for NvidiaGpu {
             |m| m.gem_handle == handle,
             true,
         );
+        NOUVEAU_GEM_BYTES.fetch_sub(obj.size, Ordering::Relaxed);
         let status = (*self.rm_device_instance.lock())
             .map(|device_instance| nvidia_rm_sys::rm_init::gem_free(device_instance, obj.h_memory));
         log::info!(
@@ -7437,14 +7442,38 @@ impl DrmScheme for NvidiaGpu {
     }
 
     fn create_fb(&self, handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<u32> {
-        let handle = self.imported_handle(handle_id)?;
         if width == 0 || height == 0 || pitch == 0 {
             return None;
         }
         let size = (pitch as usize).checked_mul(height as usize)?;
-        if size == 0 || size > handle.size {
+        if size == 0 {
             return None;
         }
+
+        // Prefer nouveau GEM (VRAM/sysmem from GEM_NEW); fall back to PRIME
+        // imported handles (dumb/generic).
+        let (phys_addr, buf_size, h_memory, vram_offset) = {
+            let gem = self.nouveau_gem.lock();
+            if let Some(obj) = gem.iter().find(|o| o.handle == handle_id) {
+                if size > obj.size as usize {
+                    return None;
+                }
+                (
+                    obj.phys_addr.unwrap_or(0),
+                    obj.size as usize,
+                    obj.h_memory,
+                    obj.vram_offset,
+                )
+            } else {
+                drop(gem);
+                let handle = self.imported_handle(handle_id)?;
+                if size > handle.size {
+                    return None;
+                }
+                (handle.phys_addr, handle.size, 0u32, None)
+            }
+        };
+
         let fb_id = self.next_kms_fb_id.fetch_add(1, Ordering::Relaxed);
         self.kms_framebuffers.lock().push(NvidiaKmsFramebuffer {
             id: fb_id,
@@ -7452,20 +7481,159 @@ impl DrmScheme for NvidiaGpu {
             width,
             height,
             pitch,
-            phys_addr: handle.phys_addr,
-            size,
+            phys_addr,
+            size: buf_size.min(size),
+            h_memory,
+            vram_offset,
         });
         Some(fb_id)
     }
 
-    fn page_flip(&self, _fb_id: u32) -> bool {
-        // This stub cannot perform a real hardware page-flip / scanout for
-        // wlroots' dumb-buffer + pixman path. Returning `true` here would be a
-        // lie: it short-circuits the DRM layer's `driver.page_flip(fb) ||
-        // scanout(fb)` fallback (drm.rs) and the framebuffer never gets the
-        // blit, leaving the screen black. Return `false` so the software
-        // scanout path always runs when this driver is the primary one.
-        false
+    fn page_flip(&self, fb_id: u32) -> bool {
+        let Some(fb) = self.kms_fb(fb_id) else {
+            return false;
+        };
+
+        // 1) NVC57E ISO surface flip (opt-in nvidia.surfaceflip) when we have
+        //    a VRAM GEM. Bring the ladder up lazily on first flip.
+        if super::nouveau_uapi::surfaceflip_enabled() {
+            // Need a VRAM GEM (vram_offset populated at GEM_NEW); ISO ctxdma
+            // covers the BO from 0, so plane origin passed to RM is 0.
+            if fb.vram_offset.is_some() && fb.h_memory != 0 {
+                if self.drives_boot_display() {
+                    if let Some(dev) = *self.rm_device_instance.lock() {
+                        use core::sync::atomic::AtomicU8;
+                        static SF_STATE: AtomicU8 = AtomicU8::new(0); // 0 untried, 1 ready, 2 fail
+                        let mut state = SF_STATE.load(Ordering::Acquire);
+                        if state == 0 {
+                            let (st, info) = nvidia_rm_sys::rm_init::hwflip_init(dev, 0);
+                            if st == 0 && nvidia_rm_sys::rm_init::hwflip_ready() {
+                                crate::klog_info!(
+                                    "[NVIDIA] surfaceflip: READY win={} core=0x{:x} chan=0x{:x} owner=0x{:x}",
+                                    info.window_idx,
+                                    info.core_ensure_status,
+                                    info.win_chan_status,
+                                    info.owner_status
+                                );
+                                SF_STATE.store(1, Ordering::Release);
+                                state = 1;
+                            } else {
+                                crate::klog_info!(
+                                    "[NVIDIA] surfaceflip: init failed st=0x{:x} core=0x{:x} chan=0x{:x} owner=0x{:x} -- CE/software fallback",
+                                    st,
+                                    info.core_ensure_status,
+                                    info.win_chan_status,
+                                    info.owner_status
+                                );
+                                SF_STATE.store(2, Ordering::Release);
+                                state = 2;
+                            }
+                        }
+                        if state == 1 {
+                            // Plane offset within the GEM/ctxdma (0 = whole BO).
+                            // Never pass absolute AT_GPU `vram_offset` here —
+                            // that programmed the FE past the buffer and tore
+                            // the desktop into diagonal snow.
+                            let st = nvidia_rm_sys::rm_init::hwflip_surface(
+                                dev,
+                                fb.h_memory,
+                                0,
+                                fb.width,
+                                fb.height,
+                                fb.pitch,
+                            );
+                            if st == 0 {
+                                let now = unsafe { crate::bus::drivers_timer_now_as_micros() };
+                                let mut kms = self.kms_state.lock();
+                                kms.crtc_fb = fb.id;
+                                kms.plane_fb = fb.id;
+                                kms.last_vblank_us = now;
+                                static SF_FLIP_LOG: AtomicBool = AtomicBool::new(false);
+                                if !SF_FLIP_LOG.swap(true, Ordering::Relaxed) {
+                                    crate::klog_info!(
+                                        "[NVIDIA] surfaceflip: OK fb={} hMem={:#x} {}x{} pitch={} (plane off=0)",
+                                        fb_id,
+                                        fb.h_memory,
+                                        fb.width,
+                                        fb.height,
+                                        fb.pitch
+                                    );
+                                }
+                                return true;
+                            }
+                            static SF_FAIL_LOG: AtomicBool = AtomicBool::new(false);
+                            if !SF_FAIL_LOG.swap(true, Ordering::Relaxed) {
+                                crate::klog_info!(
+                                    "[NVIDIA] surfaceflip: flip failed st=0x{:x} fb={} -- fallback",
+                                    st,
+                                    fb_id
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2) Opt-in CE present into the GOP (`nvidia.hwflip`).
+        //
+        // NEVER use a flat `ce_present(pa, size)` here: client pitch often
+        // differs from the UEFI GOP pitch (e.g. 5504 vs 8192). A flat copy
+        // ignores row stride and paints the classic diagonal-snow desktop.
+        // Match `scanout_region`'s pitched path, and only accept sysmem
+        // sources — VRAM GEM `phys_addr` is not a CE sysmem PA.
+        if !super::nouveau_uapi::hwflip_enabled() {
+            return false;
+        }
+        if fb.phys_addr == 0 || fb.width == 0 || fb.height == 0 || fb.pitch == 0 {
+            return false;
+        }
+        if fb.vram_offset.is_some() {
+            static VRAM_REFUSE: AtomicBool = AtomicBool::new(false);
+            if !VRAM_REFUSE.swap(true, Ordering::Relaxed) {
+                crate::klog_info!(
+                    "[NVIDIA] hwflip: refusing VRAM GEM fb={} (CE needs sysmem PA) -- software/cepresent fallback",
+                    fb_id
+                );
+            }
+            return false;
+        }
+        let dst_pitch = self.info.pitch;
+        let row_bytes = fb.width.saturating_mul(4);
+        if row_bytes == 0 || row_bytes > fb.pitch || dst_pitch == 0 {
+            return false;
+        }
+        static HWFLIP_TRIED: AtomicBool = AtomicBool::new(false);
+        let ok = self.ce_present_2d_pitched(
+            fb.phys_addr,
+            fb.pitch,
+            dst_pitch,
+            row_bytes,
+            fb.height,
+        );
+        if ok {
+            let now = unsafe { crate::bus::drivers_timer_now_as_micros() };
+            let mut state = self.kms_state.lock();
+            state.crtc_fb = fb.id;
+            state.plane_fb = fb.id;
+            state.last_vblank_us = now;
+            if !HWFLIP_TRIED.swap(true, Ordering::Relaxed) {
+                crate::klog_info!(
+                    "[NVIDIA] hwflip: CE 2D pitched OK fb={} {}x{} src_pitch={} dst_pitch={} -> GOP",
+                    fb_id,
+                    fb.width,
+                    fb.height,
+                    fb.pitch,
+                    dst_pitch
+                );
+            }
+        } else if !HWFLIP_TRIED.swap(true, Ordering::Relaxed) {
+            crate::klog_info!(
+                "[NVIDIA] hwflip: CE 2D pitched failed for fb={} -- software scanout fallback",
+                fb_id
+            );
+        }
+        ok
     }
 
     fn set_cursor(&self, _crtc_id: u32, _x: i32, _y: i32, _handle: u32, flags: u32) -> bool {
@@ -7927,6 +8095,9 @@ impl DrmScheme for NvidiaGpu {
                 }
                 bytes += size;
             }
+            if bytes != 0 {
+                NOUVEAU_GEM_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+            }
             if !to_orphan.is_empty() {
                 log::info!(
                     "[nouveau-uapi] process exit pid={}: freed {} GEM object(s), kept {} still-imported by another holder (PRIME refcount > 0)",
@@ -8008,10 +8179,10 @@ impl NvidiaGpu {
     /// (see step14's stage-1.5 note: 2/3 boots survived without it vs 0/9 with
     /// it), and predates the GSP-boot TLB-shootdown deadlock fixes (NMI-ack).
     /// The target also has no disk to capture a manual `cat`, so automating this
-    /// is the only path to a working console GPU there. It stays gated behind
-    /// `nvidia.nouveau_uapi` (this whole impl is), so dropping that one cmdline
-    /// token is the escape hatch back to a plain bootable shell if a GSP boot
-    /// ever wedges here.
+    /// is the only path to a working console GPU there. Default **OFF** —
+    /// enable with `nvidia.console_gsp` (safer boots keep manual
+    /// `/proc/gpustep14`). The whole nouveau-uAPI surface is still gated by
+    /// `nvidia.nouveau_uapi`.
     ///
     /// Strictly one-shot: the console GSP boot must never be attempted twice (a
     /// second STARTCPU on a half-booted GSP is precisely how it wedges). If the
@@ -8025,6 +8196,10 @@ impl NvidiaGpu {
         // `auto_bringup_compute`; only the console GPU is skipped there, so it is
         // the one that still needs this on-demand path.
         if !self.drives_boot_display() {
+            return;
+        }
+        // Default OFF: safer boot. Opt in with `nvidia.console_gsp`.
+        if !super::nouveau_uapi::console_gsp_enabled() {
             return;
         }
         // Already up — the steady-state fast path (brief lock, no boot).
@@ -9042,20 +9217,23 @@ impl NvidiaGpu {
         }
     }
 
-    /// The direct submit itself: `pushes` as consecutive GP entries, then (if
-    /// `with_fence`) one more entry pointing at a per-slot host SEM RELEASE
-    /// stream, GPPut bumped through the persistent USERD window, doorbell
-    /// poked. Returns the `(fence_va, payload)` the syncobj layer polls.
-    /// Waits (bounded, 1 s) for ring space if the channel is behind.
+    /// The direct submit itself: optional host SEM ACQUIRE streams first
+    /// (`acquires`: `(sem_gpu_va, payload)`), then `pushes` as consecutive GP
+    /// entries, then (if `with_fence`) one more entry pointing at a per-slot
+    /// host SEM RELEASE stream, GPPut bumped through the persistent USERD
+    /// window, doorbell poked. Returns `(fence_va_cpu, fence_gpu_va, payload)`
+    /// for the syncobj layer. Waits (bounded, 10 s) for ring space if the
+    /// channel is behind.
     fn fast_submit(
         &self,
         ctx_idx: u32,
         pushes: &[super::nouveau_uapi::DrmNouveauExecPush],
         with_fence: bool,
-    ) -> Result<Option<(usize, u32)>, super::nouveau_uapi::FastSubmitError> {
+        acquires: &[(u64, u32)],
+    ) -> Result<Option<(usize, u64, u32)>, super::nouveau_uapi::FastSubmitError> {
         use super::nouveau_uapi as nv;
-        const RING_TIMEOUT_US: u64 = 1_000_000;
-        let needed = pushes.len() as u32 + with_fence as u32;
+        const RING_TIMEOUT_US: u64 = 10_000_000;
+        let needed = pushes.len() as u32 + with_fence as u32 + acquires.len() as u32;
         let start = unsafe { crate::bus::drivers_timer_now_as_micros() };
         let mut waited = false;
         loop {
@@ -9075,6 +9253,29 @@ impl NvidiaGpu {
                 let used = (put + entries - get) % entries;
                 if used + needed < entries {
                     let mut slot = put;
+                    // Same-ctx wait fences: GPU ACQUIRE before user pushes so
+                    // the channel stalls in hardware instead of the CPU spinning.
+                    for &(sem_gpu_va, payload) in acquires {
+                        let stream_va = f.fence_pb_va + slot as usize * f.slot_bytes as usize;
+                        let stream_gpu_va = f.buf_gpu_va
+                            + f.fence_pb_off as u64
+                            + slot as u64 * f.slot_bytes as u64;
+                        let words = nv::sem_acquire_stream(sem_gpu_va, payload);
+                        for (i, w) in words.iter().enumerate() {
+                            unsafe {
+                                core::ptr::write_volatile((stream_va as *mut u32).add(i), *w)
+                            };
+                        }
+                        let gp = (f.gpfifo_va + slot as usize * 8) as *mut u32;
+                        unsafe {
+                            core::ptr::write_volatile(gp, nv::gp_entry0(stream_gpu_va));
+                            core::ptr::write_volatile(
+                                gp.add(1),
+                                nv::gp_entry1(stream_gpu_va, (words.len() * 4) as u32),
+                            );
+                        }
+                        slot = (slot + 1) % entries;
+                    }
                     for p in pushes {
                         let gp = (f.gpfifo_va + slot as usize * 8) as *mut u32;
                         unsafe {
@@ -9110,7 +9311,7 @@ impl NvidiaGpu {
                             );
                         }
                         slot = (slot + 1) % entries;
-                        fence = Some((f.fence_sem_va, payload));
+                        fence = Some((f.fence_sem_va, sem_gpu_va, payload));
                         f.fenced += 1;
                     }
                     store_fence();
@@ -9148,11 +9349,11 @@ impl NvidiaGpu {
     /// front of it (including submissions that carried no fence of their
     /// own). The RM per-submit path is synchronous and needs no wait. `nowait`
     /// answers EBUSY instead of blocking; a fence that never lands within the
-    /// usual 1 s also answers EBUSY (Linux: a timed-out reservation wait is
+    /// usual 10 s also answers EBUSY (Linux: a timed-out reservation wait is
     /// EBUSY too).
     fn cpu_prep_wait(&self, owner_pid: u64, nowait: bool) -> Result<usize, i32> {
         use super::nouveau_uapi as nv;
-        const CPU_PREP_TIMEOUT_US: u64 = 1_000_000;
+        const CPU_PREP_TIMEOUT_US: u64 = 10_000_000;
         // Resolve the channel this pid submits on WITHOUT defaulting to ctx 0:
         // a client whose own context is not ready yet has queued nothing, and
         // only the compositor (no per-pid entry, owner of the RM channel)
@@ -9178,7 +9379,7 @@ impl NvidiaGpu {
         if !queued {
             return Ok(0);
         }
-        let (fence_va, payload) = match self.fast_submit(ctx_idx, &[], true) {
+        let (fence_va, _fence_gpu_va, payload) = match self.fast_submit(ctx_idx, &[], true, &[]) {
             Ok(Some(fence)) => fence,
             Ok(None) => return Ok(0),
             Err(_) => {
@@ -9187,7 +9388,11 @@ impl NvidiaGpu {
                 // unfenced tail.
                 match self.nouveau_fast.lock().get(ctx_idx as usize) {
                     Some(FastSlot::Ready(f)) if f.fenced > 0 => {
-                        (f.fence_sem_va, f.next_payload.wrapping_sub(1))
+                        (
+                            f.fence_sem_va,
+                            f.buf_gpu_va + f.fence_sem_off as u64,
+                            f.next_payload.wrapping_sub(1),
+                        )
                     }
                     _ => return Ok(0),
                 }
@@ -9223,22 +9428,104 @@ impl NvidiaGpu {
         }
     }
 
+    /// Split EXEC waits into same-ctx HW ACQUIREs `(sem_gpu_va, payload)` and
+    /// CPU-wait lists. Same-ctx uses this channel's local fence semaphore VA.
+    /// Cross-ctx tries [`Self::map_peer_fence_sem`] when the producer published
+    /// a `fence_gpu_va`; on failure falls back to CPU wait.
+    fn partition_exec_waits(
+        &self,
+        handles: &[u32],
+        points: &[u64],
+        ctx_idx: u32,
+    ) -> (alloc::vec::Vec<(u64, u32)>, alloc::vec::Vec<u32>, alloc::vec::Vec<u64>) {
+        let sem_gpu_va = match self.nouveau_fast.lock().get(ctx_idx as usize) {
+            Some(FastSlot::Ready(f)) => Some(f.buf_gpu_va + f.fence_sem_off as u64),
+            _ => None,
+        };
+        let mut acquires = alloc::vec::Vec::new();
+        let mut cpu_h = alloc::vec::Vec::new();
+        let mut cpu_p = alloc::vec::Vec::new();
+        for (i, &h) in handles.iter().enumerate() {
+            let point = points.get(i).copied().unwrap_or(1);
+            match crate::scheme::syncobj::pending_hw_fence(h, point) {
+                Some((_fence_va, _fence_gpu_va, payload, fence_ctx)) if fence_ctx == ctx_idx => {
+                    if let Some(va) = sem_gpu_va {
+                        acquires.push((va, payload));
+                    } else {
+                        cpu_h.push(h);
+                        cpu_p.push(point);
+                    }
+                }
+                Some((_fence_va, fence_gpu_va, payload, fence_ctx)) if fence_gpu_va != 0 => {
+                    if let Some(local_va) =
+                        self.map_peer_fence_sem(ctx_idx, fence_ctx, fence_gpu_va)
+                    {
+                        acquires.push((local_va, payload));
+                    } else {
+                        cpu_h.push(h);
+                        cpu_p.push(point);
+                    }
+                }
+                Some(_) | None => {
+                    cpu_h.push(h);
+                    cpu_p.push(point);
+                }
+            }
+        }
+        (acquires, cpu_h, cpu_p)
+    }
+
+    /// Map a producer's fence semaphore GPU VA into the consumer channel's
+    /// VAS. Cached in `PEER_FENCE_MAP`. Best-effort via RM; returns `None`
+    /// (CPU wait) when peer mapping is unsupported.
+    fn map_peer_fence_sem(
+        &self,
+        consumer_ctx: u32,
+        producer_ctx: u32,
+        fence_gpu_va_producer: u64,
+    ) -> Option<u64> {
+        use alloc::collections::BTreeMap;
+        lazy_static::lazy_static! {
+            static ref PEER_FENCE_MAP: Mutex<BTreeMap<(u32, u32), u64>> =
+                Mutex::new(BTreeMap::new());
+        }
+        {
+            let map = PEER_FENCE_MAP.lock();
+            if let Some(&va) = map.get(&(consumer_ctx, producer_ctx)) {
+                return Some(va);
+            }
+        }
+        let device = (*self.rm_device_instance.lock())?;
+        let local = nvidia_rm_sys::rm_init::map_peer_fence_sem(
+            device,
+            consumer_ctx,
+            producer_ctx,
+            fence_gpu_va_producer,
+        )?;
+        PEER_FENCE_MAP
+            .lock()
+            .insert((consumer_ctx, producer_ctx), local);
+        Some(local)
+    }
+
     /// The EXEC ioctl body on the direct-submit path (waits already honoured
-    /// by the caller). Attaches every `sig` syncobj to the kernel fence of
-    /// the LAST push -- GPFIFO order means one fence covers the batch.
+    /// by the caller — CPU waits done, same-ctx HW acquires passed in).
+    /// Attaches every `sig` syncobj to the kernel fence of the LAST push --
+    /// GPFIFO order means one fence covers the batch.
     fn exec_fast(
         &self,
         ctx_idx: u32,
         owner_pid: u64,
         req: &super::nouveau_uapi::DrmNouveauExec,
         pushes: &[super::nouveau_uapi::DrmNouveauExecPush],
+        acquires: &[(u64, u32)],
     ) -> Result<usize, i32> {
         use super::nouveau_uapi as nv;
         let with_fence = req.sig_count > 0 && req.sig_ptr != 0;
-        match self.fast_submit(ctx_idx, pushes, with_fence) {
+        match self.fast_submit(ctx_idx, pushes, with_fence, acquires) {
             Ok(fence) => {
                 nv::EXEC_FAST_SUBMITS.fetch_add(1, Ordering::Relaxed);
-                if let Some((fence_va, payload)) = fence {
+                if let Some((fence_va, fence_gpu_va, payload)) = fence {
                     nv::EXEC_FAST_FENCED.fetch_add(1, Ordering::Relaxed);
                     // `sig_ptr`/`sig_count` were range-checked by the EXEC arm
                     // before it dispatched here (see `user_slice_ok`).
@@ -9252,7 +9539,12 @@ impl NvidiaGpu {
                         let timeline = sig.flags & nv::SYNC_TYPE_MASK == nv::SYNC_TIMELINE_SYNCOBJ;
                         let target = if timeline { sig.timeline_value } else { 1 };
                         if !crate::scheme::syncobj::attach_hw_fence(
-                            sig.handle, target, fence_va, payload, ctx_idx,
+                            sig.handle,
+                            target,
+                            fence_va,
+                            fence_gpu_va,
+                            payload,
+                            ctx_idx,
                         ) {
                             crate::klog_warn!(
                                 "[nouveau-uapi] EXEC(direct): submitted, but sig syncobj handle={} is unknown (ENOENT)",
@@ -9281,7 +9573,7 @@ impl NvidiaGpu {
                     }
                     nv::record_client_exec(alloc::format!(
                         "ctx={} pid={} SUBMITTED (direct): {} push(es), {} syncobj(s) attached to fence payload {:?}",
-                        ctx_idx, owner_pid, req.push_count, req.sig_count, fence.map(|f| f.1)
+                        ctx_idx, owner_pid, req.push_count, req.sig_count, fence.map(|f| f.2)
                     ));
                 }
                 Ok(0)
@@ -9722,63 +10014,48 @@ impl NvidiaGpu {
                 dev
             ),
         );
-        // Prime this context's compute golden context up front. On RTX, NVK's
-        // very first push otherwise triggers the cold golden-context load, which
-        // hangs the PBDMA before it reaches NVK's fence (seen as GPGet=1 GPPut=2,
-        // no MMU fault, no GR exception) -> fence timeout -> vkCreateDevice EIO.
-        // Running step-18's minimal SET_OBJECT + engine-sem stream here loads the
-        // golden context while the client is still in device setup (its first
-        // VM_BIND/CHANNEL_ALLOC), long before it submits any real EXEC on this
-        // channel -- so nothing races the ring. Keep the context regardless of
-        // the result: a prime timeout is diagnostic, not fatal (worst case the
-        // client hits the same cold load it would have without priming).
+        // Prime compute + GRAPHICS golden contexts up front. Soft-fail used to
+        // publish READY anyway; the client's first SET_OBJECT(TURING_A) then
+        // cold-loaded GR and hung FECS mid-RESTORE. A failed prime now tears
+        // the reservation down so the client falls back to software instead of
+        // a wedged first draw.
         let prime = nvidia_rm_sys::rm_init::ctx_prime(dev, ctx_idx);
         if prime == 0 {
             crate::klog_warn!(
-                "[nouveau-uapi] ctx: pid={} CTX {} golden context primed OK (NVK's first push runs warm)",
+                "[nouveau-uapi] ctx: pid={} CTX {} golden context primed OK (compute+GRAPHICS)",
                 owner_pid,
                 ctx_idx
             );
         } else {
             crate::klog_warn!(
-                "[nouveau-uapi] ctx: pid={} CTX {} prime NV_STATUS={:#x} -- keeping context (NVK's first push may cold-load)",
+                "[nouveau-uapi] ctx: pid={} CTX {} prime NV_STATUS={:#x} -- rejecting context (software fallback; avoids FECS RESTORE hang on first 3D draw)",
                 owner_pid,
                 ctx_idx,
                 prime
             );
+            nv::record_prime(
+                ctx_idx,
+                alloc::format!(
+                    "ctx={} pid={} PRIME FAIL on rm-device {} (NV_STATUS={:#x}) -- context discarded <== predicts FECS hang if kept",
+                    ctx_idx, owner_pid, dev, prime
+                ),
+            );
+            let _ = nvidia_rm_sys::rm_init::ctx_free(dev, ctx_idx);
+            unreserve();
+            return (0, 0, 0);
         }
-        // Record the prime outcome in the PERSISTENT prime slot: if the
-        // golden-context prime is TIMING OUT, that alone predicts every real
-        // draw on this client will cold-load-hang -> fence-wait timeout ->
-        // DEVICE_LOST, and it is the single most likely root of a FECS
-        // ctx-switch hang. Use `record_prime` (not the last-EXEC slot) so the
-        // verdict survives the client's own draws -- otherwise the failing EXEC
-        // overwrites it before the terminal can `cat /proc/gpudbg`.
         nv::record_prime(
             ctx_idx,
             alloc::format!(
-                "ctx={} pid={} PRIME {} on rm-device {} (NV_STATUS={:#x}){}",
-                ctx_idx,
-                owner_pid,
-                if prime == 0 {
-                    "OK -- golden context loaded"
-                } else {
-                    "TIMEOUT/FAIL -- first draw will cold-load"
-                },
-                dev,
-                prime,
-                if prime == 0 {
-                    ""
-                } else {
-                    " <== prime failure predicts DEVICE_LOST on first draw"
-                }
+                "ctx={} pid={} PRIME OK -- compute+GRAPHICS golden context loaded on rm-device {}",
+                ctx_idx, owner_pid, dev
             ),
         );
-        // Publish READY only now: the golden context is primed (or its prime
-        // verdict recorded), so a sibling thread waking from the wait above --
-        // or any later EXEC -- can no longer land on an unprimed channel. If
-        // the entry is gone the pid exited mid-build (its reservation was
-        // reaped); serve the software fallback rather than resurrecting it.
+        // Publish READY only now: both golden contexts are primed, so a
+        // sibling thread waking from the wait above -- or any later EXEC --
+        // can no longer land on an unprimed channel. If the entry is gone the
+        // pid exited mid-build (its reservation was reaped); serve the
+        // software fallback rather than resurrecting it.
         {
             let mut m = self.nouveau_pid_ctx.lock();
             match m.iter_mut().find(|t| t.0 == owner_pid) {
@@ -10078,14 +10355,20 @@ impl NvidiaGpu {
                             new.oclass as u32,
                         ) {
                             Ok((h_object, 0)) => {
-                                nv::class_object_insert(new.object, h_object, owner_pid);
+                                nv::class_object_insert(
+                                    hdr.token,
+                                    new.object,
+                                    h_object,
+                                    owner_pid,
+                                );
                                 crate::klog_info!(
                                     "[nouveau-uapi] NVIF NEW oclass={:#06x} pid={} -> RM object \
-                                     {:#010x} on CTX {} channel (engine context will be built)",
+                                     {:#010x} on CTX {} channel token={} (engine context will be built)",
                                     new.oclass,
                                     owner_pid,
                                     h_object,
-                                    ctx_idx
+                                    ctx_idx,
+                                    hdr.token
                                 );
                             }
                             Ok((_, alloc_status)) => {
@@ -10708,7 +10991,7 @@ impl NvidiaGpu {
 
             nv::NR_CHANNEL_FREE => {
                 let req = unsafe { &*(arg as *const nv::DrmNouveauChannelFree) };
-                let was_rm_backed = {
+                let (was_rm_backed, channel_id) = {
                     let mut chans = self.nouveau_channels.lock();
                     // Only the channel's own process may free it: freeing the
                     // compositor's channel 0 from a client made its next EXEC
@@ -10723,7 +11006,8 @@ impl NvidiaGpu {
                         );
                         return Err(nv::EINVAL);
                     };
-                    chans.remove(pos).rm_backed
+                    let c = chans.remove(pos);
+                    (c.rm_backed, c.id)
                 };
                 // CHANNEL_FREE must NOT touch the VM: in the nouveau uAPI,
                 // VM_BIND mappings belong to the DRM FILE's VA space, not to
@@ -10738,17 +11022,42 @@ impl NvidiaGpu {
                 // labwc runs TWO Vulkan instances in one process -- so the
                 // second instance's enumeration-time CHANNEL_FREE landed
                 // AFTER the first instance had bound its buffers, wiped the
-                // whole VAS, and the next EXEC touched unmapped VAs. The GPU
-                // answered with an MMU fault -- robust-channel recovery
-                // (notifier info32=0x1f, ROBUST_CHANNEL_FIFO_ERROR_MMU_ERR_FLT)
-                // killed the channel, GPGet froze at 1 and the GPFIFO ring
-                // filled up: the exact RING FULL GPPut=0 GPGet=1 signature.
-                // Mappings are reclaimed where they belong: GEM_CLOSE (per
-                // handle) and process exit (nouveau_release_process). Do NOT
-                // reset ctx0 here: a process may free a throwaway ctx0 channel
-                // while another channel of the SAME process is still actively
-                // using the compositor singleton.
-                let _ = was_rm_backed;
+                // whole VAS, and the next EXEC touched unmapped VAs.
+                //
+                // Class objects ARE per-channel (NVIF NEW keyed by channel
+                // token). Reap any that Mesa left behind without DEL -- the
+                // throwaway-enumeration leak -- without touching another
+                // live channel's classes. Do NOT ctx_free / reset ctx0 here:
+                // VAS is shared across channels of the same pid.
+                if was_rm_backed {
+                    if let Some(device_instance) = *self.rm_device_instance.lock() {
+                        let leftovers =
+                            nv::class_objects_drain_channel(channel_id as u64, owner_pid);
+                        for (_token, h_object) in leftovers.iter() {
+                            let status = nvidia_rm_sys::rm_init::class_free(
+                                device_instance,
+                                *h_object,
+                            );
+                            if status != 0 {
+                                log::warn!(
+                                    "[nouveau-uapi] CHANNEL_FREE channel={}: class_free \
+                                     h={:#010x} -> NV_STATUS={:#x}",
+                                    channel_id,
+                                    h_object,
+                                    status
+                                );
+                            }
+                        }
+                        if !leftovers.is_empty() {
+                            log::info!(
+                                "[nouveau-uapi] CHANNEL_FREE channel={}: reaped {} class \
+                                 object(s) left without NVIF DEL",
+                                channel_id,
+                                leftovers.len()
+                            );
+                        }
+                    }
+                }
                 Ok(0)
             }
 
@@ -10938,9 +11247,82 @@ impl NvidiaGpu {
                                 }
                             })
                             .collect();
-                        const WAIT_TIMEOUT_US: u64 = 1_000_000; // 1 s, like the real path
+                        const WAIT_TIMEOUT_US: u64 = 10_000_000; // 10 s (Linux-like; was 1 s / F-M16)
                         let deadline_us =
                             unsafe { crate::bus::drivers_timer_now_as_micros() } + WAIT_TIMEOUT_US;
+                        // Empty EXEC has no user pushes to hang a GPU ACQUIRE
+                        // on; prefer same-ctx HW ACQUIRE only when a fast ctx
+                        // can submit acquire(+fence) before signaling. Else
+                        // CPU-wait the full set (10 s), including same-ctx
+                        // pending fences — never premature-signal.
+                        let ctx_idx = self.ctx_idx_for_pid(owner_pid);
+                        let (acquires, cpu_h, cpu_p) =
+                            self.partition_exec_waits(&handles, &points, ctx_idx);
+                        let device_instance = *self.rm_device_instance.lock();
+                        let with_fence = req.sig_count > 0 && req.sig_ptr != 0;
+                        // Only HW-acquire when we also fence+attach sigs; an
+                        // empty wait-only EXEC must still CPU-block until the
+                        // fences land (ioctl contract).
+                        let used_hw = with_fence
+                            && !acquires.is_empty()
+                            && device_instance
+                                .map(|d| self.fast_ctx_ready(d, ctx_idx))
+                                .unwrap_or(false);
+                        if used_hw {
+                            if !cpu_h.is_empty() {
+                                match crate::scheme::syncobj::wait(
+                                    &cpu_h,
+                                    Some(&cpu_p),
+                                    true,
+                                    deadline_us,
+                                ) {
+                                    crate::scheme::syncobj::WaitOutcome::Signaled { .. } => {}
+                                    crate::scheme::syncobj::WaitOutcome::Timeout => {
+                                        crate::klog_warn!(
+                                            "[nouveau-uapi] EXEC(empty): {} wait syncobj(s) still unsignaled after {}us -- not signaling its sig list (EIO) pid={}:{}",
+                                            req.wait_count,
+                                            WAIT_TIMEOUT_US,
+                                            owner_pid,
+                                            crate::scheme::syncobj::describe(&handles, Some(&points))
+                                        );
+                                        return Err(nv::EIO);
+                                    }
+                                    crate::scheme::syncobj::WaitOutcome::Invalid => {
+                                        return Err(nv::ENOENT);
+                                    }
+                                }
+                            }
+                            match self.fast_submit(ctx_idx, &[], with_fence, &acquires) {
+                                Ok(Some((fence_va, fence_gpu_va, payload))) => {
+                                    let sigs = unsafe {
+                                        core::slice::from_raw_parts(
+                                            req.sig_ptr as *const nv::DrmNouveauSync,
+                                            req.sig_count as usize,
+                                        )
+                                    };
+                                    for sig in sigs {
+                                        let timeline = sig.flags & nv::SYNC_TYPE_MASK
+                                            == nv::SYNC_TIMELINE_SYNCOBJ;
+                                        let target =
+                                            if timeline { sig.timeline_value } else { 1 };
+                                        if !crate::scheme::syncobj::attach_hw_fence(
+                                            sig.handle,
+                                            target,
+                                            fence_va,
+                                            fence_gpu_va,
+                                            payload,
+                                            ctx_idx,
+                                        ) {
+                                            return Err(nv::ENOENT);
+                                        }
+                                    }
+                                    return Ok(0);
+                                }
+                                _ => {
+                                    // Fall through to full CPU wait below.
+                                }
+                            }
+                        }
                         match crate::scheme::syncobj::wait(
                             &handles,
                             Some(&points),
@@ -11101,20 +11483,13 @@ impl NvidiaGpu {
                     return Err(nv::ENODEV);
                 };
 
-                // wait_count: block THIS CALL (CPU-side) until ALL wait
-                // syncobjs are signaled, before submitting anything. This is
-                // NOT what real nouveau does -- real hardware makes the
-                // GPU's own channel execute a semaphore-ACQUIRE method
-                // before the caller's pushbuffer, so the CPU submit call
-                // returns immediately and independent submissions can
-                // overlap. Here the ioctl itself blocks first and only then
-                // submits, so from a single synchronous caller's point of
-                // view the observable contract is the same ("this EXEC does
-                // not start executing before every wait fence is signaled")
-                // but concurrent/overlapping submissions do not behave like
-                // real hardware scheduling. Bounded by a fixed timeout
-                // (never an indefinite kernel-side wait); nothing is
-                // submitted if not all of them are satisfied in time.
+                // wait_count: prefer same-ctx HW ACQUIRE (GPU stalls on the
+                // channel semaphore) over CPU spin. Cross-ctx / non-pending
+                // waits still block THIS CALL (CPU-side, 10 s) before submit.
+                // Real nouveau puts ACQUIRE in the GPFIFO so the ioctl returns
+                // immediately; we do that for same-ctx pending fences and keep
+                // a CPU wait for everything else.
+                let mut hw_acquires: alloc::vec::Vec<(u64, u32)> = alloc::vec::Vec::new();
                 if req.wait_count > 0 {
                     let waits = unsafe {
                         core::slice::from_raw_parts(
@@ -11135,23 +11510,34 @@ impl NvidiaGpu {
                             }
                         })
                         .collect();
-                    const WAIT_TIMEOUT_US: u64 = 1_000_000; // 1 s
+                    const WAIT_TIMEOUT_US: u64 = 10_000_000; // 10 s (Linux-like; was 1 s / F-M16)
                     let wait_start = unsafe { crate::bus::drivers_timer_now_as_micros() };
                     let deadline_us = wait_start + WAIT_TIMEOUT_US;
-                    // Direct-submit path: a fence pending on the channel we are
-                    // about to submit on is ordered by the GPFIFO itself, so
-                    // the CPU only waits for OTHER channels' fences (see
-                    // `syncobj::wait_ordered`).
                     let wait_ctx = self.ctx_idx_for_pid(owner_pid);
-                    let outcome = if self.fast_ctx_ready(device_instance, wait_ctx) {
-                        crate::scheme::syncobj::wait_ordered(
-                            &handles,
-                            Some(&points),
-                            deadline_us,
-                            wait_ctx,
-                        )
+                    let (acquires, cpu_h, cpu_p) =
+                        self.partition_exec_waits(&handles, &points, wait_ctx);
+                    // Only emit ACQUIRE when the direct-submit path will run;
+                    // otherwise reunite into a full CPU wait.
+                    let use_hw = !acquires.is_empty() && self.fast_ctx_ready(device_instance, wait_ctx);
+                    if use_hw {
+                        hw_acquires = acquires;
+                    }
+                    let (wait_h, wait_p): (Vec<u32>, Vec<u64>) = if use_hw {
+                        (cpu_h, cpu_p)
                     } else {
-                        crate::scheme::syncobj::wait(&handles, Some(&points), true, deadline_us)
+                        (handles.clone(), points.clone())
+                    };
+                    let outcome = if wait_h.is_empty() {
+                        crate::scheme::syncobj::WaitOutcome::Signaled {
+                            first_signaled_index: 0,
+                        }
+                    } else {
+                        crate::scheme::syncobj::wait(
+                            &wait_h,
+                            Some(&wait_p),
+                            true,
+                            deadline_us,
+                        )
                     };
                     nv::EXEC_WAIT_US.fetch_add(
                         unsafe { crate::bus::drivers_timer_now_as_micros() }
@@ -11161,8 +11547,10 @@ impl NvidiaGpu {
                     match outcome {
                         crate::scheme::syncobj::WaitOutcome::Signaled { .. } => {
                             log::info!(
-                                "[nouveau-uapi] EXEC: all {} wait syncobj(s) reached their target point -- proceeding to submit",
-                                req.wait_count
+                                "[nouveau-uapi] EXEC: {} wait(s) ok ({} hw-acquire, {} cpu) -- proceeding to submit",
+                                req.wait_count,
+                                hw_acquires.len(),
+                                wait_h.len()
                             );
                         }
                         crate::scheme::syncobj::WaitOutcome::Timeout => {
@@ -11172,11 +11560,12 @@ impl NvidiaGpu {
                             // death that used to leave dmesg spotless.
                             //
                             // Name the fences, not just how many. The generic
-                            // stall reporter in `syncobj` only fires past 2 s,
-                            // which this 1 s deadline never reaches, so a count
-                            // was all anyone ever got -- and "which fence never
-                            // arrived, and who was supposed to signal it" is the
-                            // whole question on this path.
+                            // stall reporter in `syncobj` only fires past 2 s;
+                            // this 10 s deadline does reach it, but the
+                            // reporter is budgeted per boot, so always name
+                            // the fences here -- "which fence never arrived,
+                            // and who was supposed to signal it" is the whole
+                            // question on this path.
                             crate::klog_warn!(
                                 "[nouveau-uapi] EXEC: {} wait syncobj(s) still unsignaled after {}us -- NOT submitting (EIO -> NVK device-lost) pid={} ctx={}:{} (handle:target/current)",
                                 req.wait_count,
@@ -11255,7 +11644,7 @@ impl NvidiaGpu {
                 // syncobj layer. Falls through to the RM per-submit path only
                 // when the context could not be prepared (or `nvidia.exec_rm`).
                 if self.fast_ctx_ready(device_instance, ctx_idx) {
-                    return self.exec_fast(ctx_idx, owner_pid, req, pushes);
+                    return self.exec_fast(ctx_idx, owner_pid, req, pushes, &hw_acquires);
                 }
                 nv::EXEC_LEGACY_SUBMITS.fetch_add(1, Ordering::Relaxed);
                 if req.sig_count == 0 {
@@ -11648,6 +12037,51 @@ impl NvidiaGpu {
                 if req.info.size == 0 || req.info.size > u32::MAX as u64 {
                     return Err(nv::EINVAL);
                 }
+                // Quotas before gem_alloc: one BO, per-pid live, and global live.
+                if req.info.size > GEM_NEW_MAX_SINGLE {
+                    crate::klog_warn!(
+                        "[nouveau-uapi] GEM_NEW: size={} exceeds single-alloc cap {} MiB (pid={})",
+                        req.info.size,
+                        GEM_NEW_MAX_SINGLE / (1024 * 1024),
+                        owner_pid
+                    );
+                    return Err(nv::ENOMEM);
+                }
+                let vram_bytes = (self.effective_vram_mb() as u64).saturating_mul(1024 * 1024);
+                let global_cap = if vram_bytes == 0 {
+                    GEM_NEW_MAX_GLOBAL
+                } else {
+                    GEM_NEW_MAX_GLOBAL.min(vram_bytes.saturating_mul(2))
+                };
+                {
+                    let gem = self.nouveau_gem.lock();
+                    let pid_live: u64 = gem
+                        .iter()
+                        .filter(|o| o.owner_pid == owner_pid)
+                        .map(|o| o.size)
+                        .sum();
+                    if pid_live.saturating_add(req.info.size) > GEM_NEW_MAX_PER_PID {
+                        crate::klog_warn!(
+                            "[nouveau-uapi] GEM_NEW: per-pid quota hit (pid={} live={} + {} > {} GiB)",
+                            owner_pid,
+                            pid_live,
+                            req.info.size,
+                            GEM_NEW_MAX_PER_PID / (1024 * 1024 * 1024)
+                        );
+                        return Err(nv::ENOMEM);
+                    }
+                    let global_live = NOUVEAU_GEM_BYTES.load(Ordering::Relaxed);
+                    if global_live.saturating_add(req.info.size) > global_cap {
+                        crate::klog_warn!(
+                            "[nouveau-uapi] GEM_NEW: global quota hit (live={} + {} > cap={} MiB, vram={} MiB)",
+                            global_live,
+                            req.info.size,
+                            global_cap / (1024 * 1024),
+                            self.effective_vram_mb()
+                        );
+                        return Err(nv::ENOMEM);
+                    }
+                }
                 let Some(device_instance) = *self.rm_device_instance.lock() else {
                     crate::klog_warn!("[nouveau-uapi] GEM_NEW: GPU not attached to the RM yet");
                     return Err(nv::ENODEV);
@@ -11715,6 +12149,21 @@ impl NvidiaGpu {
                 } else {
                     None
                 };
+                // VRAM FBMEM offset (AT_GPU) for future CE/scanout; never
+                // published as a host PA (see gem_map_cpu FBMEM refusal).
+                let vram_offset = if !sysmem {
+                    match nvidia_rm_sys::rm_init::gem_fbmem_offset(device_instance, alloc.h_memory) {
+                        Ok(off) => Some(off),
+                        Err(_status) => {
+                            // TODO: if AT_GPU lookup fails on some boards,
+                            // leave None and keep VRAM GEM usable for
+                            // VM_BIND/EXEC without scanout-by-offset.
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 let map_handle = if let Some(pa) = phys_addr {
                     crate::scheme::gem_mmap::register(handle, pa, req.info.size, owner_pid);
                     (handle as u64) << 12
@@ -11732,6 +12181,7 @@ impl NvidiaGpu {
                     owner_pid,
                     size: req.info.size,
                     phys_addr,
+                    vram_offset,
                     domain: used_domain,
                     // Remember what was asked for so GEM_INFO round-trips it.
                     // The allocation itself is linear; a non-zero PTE kind is
@@ -11740,6 +12190,7 @@ impl NvidiaGpu {
                     tile_mode: req.info.tile_mode,
                     tile_flags: req.info.tile_flags,
                 });
+                NOUVEAU_GEM_BYTES.fetch_add(req.info.size, Ordering::Relaxed);
                 // Feed the /proc/gpudbg memory summary. `req.info.domain` is
                 // still the client's REQUEST here (overwritten to the domain
                 // actually used a few lines below); phys_addr.is_some() means a

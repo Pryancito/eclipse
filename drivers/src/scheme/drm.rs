@@ -153,6 +153,13 @@ pub trait DrmScheme: Scheme {
         false
     }
 
+    /// Whether this driver delivers real hardware vblank interrupts.
+    /// Stub default: false — software-KMS pacing stays on the synthetic
+    /// timer. NVIDIA (and other HW KMS paths) are not wired yet.
+    fn has_hw_vblank(&self) -> bool {
+        false
+    }
+
     /// Close a GEM handle this driver allocated OUTSIDE the generic
     /// `CREATE_DUMB`/PRIME handle table -- `linux-object`'s own
     /// `drm::gem_close` only knows about that table. A driver with its own

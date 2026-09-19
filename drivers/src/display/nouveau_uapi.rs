@@ -58,6 +58,45 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+/// Opt-in for on-demand console-GPU GSP bring-up (`ensure_console_gpu_brought_up`).
+/// Default **off**: safer boot (manual `cat /proc/gpustep14`). Enable with
+/// `nvidia.console_gsp` on the kernel cmdline.
+static CONSOLE_GSP: AtomicBool = AtomicBool::new(false);
+
+pub fn set_console_gsp_enabled(v: bool) {
+    CONSOLE_GSP.store(v, Ordering::Relaxed);
+}
+
+pub fn console_gsp_enabled() -> bool {
+    CONSOLE_GSP.load(Ordering::Relaxed)
+}
+
+/// Opt-in CE present via `page_flip` (`nvidia.hwflip`). Default **off**: keep
+/// software scanout until the CE path is proven for KMS flips. Does NOT
+/// claim hardware KMS (`has_hardware_kms` stays false).
+static HWFLIP: AtomicBool = AtomicBool::new(false);
+
+pub fn set_hwflip_enabled(v: bool) {
+    HWFLIP.store(v, Ordering::Relaxed);
+}
+
+pub fn hwflip_enabled() -> bool {
+    HWFLIP.load(Ordering::Relaxed)
+}
+
+/// Opt-in NVC57E window ISO surface flip (`nvidia.surfaceflip`). When the
+/// ladder is READY, [`super::nvidia::NvidiaGpu::has_hardware_kms`] can claim
+/// true so `present_now` prefers `page_flip` over the GOP blit.
+static SURFACEFLIP: AtomicBool = AtomicBool::new(false);
+
+pub fn set_surfaceflip_enabled(v: bool) {
+    SURFACEFLIP.store(v, Ordering::Relaxed);
+}
+
+pub fn surfaceflip_enabled() -> bool {
+    SURFACEFLIP.load(Ordering::Relaxed)
+}
+
 static FENCE_PAYLOAD_COUNTER: AtomicU32 = AtomicU32::new(1);
 
 /// A fresh, never-zero value to write into `eclipse_rm_exec_submit_signaled`'s
@@ -89,35 +128,59 @@ pub(super) fn chan_notifier_pa_cached() -> Option<u64> {
 }
 
 /// NVIF subchannel objects that are backed by REAL RM class objects on a
-/// process's RM channel, keyed by the NVIF object token
-/// (`nvif_ioctl_new_v0.object`, the pointer-sized cookie userspace passes back
-/// in DEL). Entries are `(nvif_object_token, rm_handle, owner_pid)`. The
-/// `owner_pid` scopes crash cleanup: with per-process contexts each client's
-/// class objects live on ITS OWN channel, so a client's exit must free only its
-/// own objects -- draining globally (as this once did) would rip the
-/// compositor's and other clients' 3D/copy classes out from under live
-/// channels.
-static CLASS_OBJECTS: lock::Mutex<alloc::vec::Vec<(u64, u32, u64)>> =
+/// process's RM channel, keyed by `(channel_token, nvif_object_token, rm_handle,
+/// owner_pid)`. The channel token is the id CHANNEL_ALLOC handed back (and
+/// mesa echoes as NVIF `token`); draining by channel on `CHANNEL_FREE` reaps
+/// the throwaway-enumeration leak (NEW without DEL) without touching another
+/// live channel's classes.
+static CLASS_OBJECTS: lock::Mutex<alloc::vec::Vec<(u64, u64, u32, u64)>> =
     lock::Mutex::new(alloc::vec::Vec::new());
 
-pub(super) fn class_object_insert(token: u64, rm_handle: u32, owner_pid: u64) {
-    CLASS_OBJECTS.lock().push((token, rm_handle, owner_pid));
+pub(super) fn class_object_insert(
+    channel_token: u64,
+    object_token: u64,
+    rm_handle: u32,
+    owner_pid: u64,
+) {
+    CLASS_OBJECTS
+        .lock()
+        .push((channel_token, object_token, rm_handle, owner_pid));
 }
 
-/// Removes and returns the RM handle for `token`, if it was RM-backed —
+/// Removes and returns the RM handle for `object_token`, if it was RM-backed —
 /// scoped to `owner_pid`. The token is a userspace cookie (mesa passes the
 /// object's heap POINTER), and two processes running the same Mesa code get
 /// deterministic-enough allocators that equal pointer values across processes
 /// are a real possibility. An unscoped removal would let one client's NVIF
 /// DEL free ANOTHER live client's (or the compositor's) engine-class object —
 /// tearing its 3D class out from under a running channel, whose next method
-/// of that class then MMU-faults. Match on (token, pid) so a DEL can only
-/// ever free the caller's own object.
-pub(super) fn class_object_remove(token: u64, owner_pid: u64) -> Option<u32> {
+/// of that class then MMU-faults. Match on (object_token, pid) so a DEL can
+/// only ever free the caller's own object.
+pub(super) fn class_object_remove(object_token: u64, owner_pid: u64) -> Option<u32> {
     let mut t = CLASS_OBJECTS.lock();
     t.iter()
-        .position(|(k, _, pid)| *k == token && *pid == owner_pid)
-        .map(|i| t.remove(i).1)
+        .position(|(_, obj, _, pid)| *obj == object_token && *pid == owner_pid)
+        .map(|i| t.remove(i).2)
+}
+
+/// Drains class objects bound to `channel_token` for `owner_pid` (a
+/// `CHANNEL_FREE` of that channel). Other channels' objects stay.
+pub(super) fn class_objects_drain_channel(
+    channel_token: u64,
+    owner_pid: u64,
+) -> alloc::vec::Vec<(u64, u32)> {
+    let mut t = CLASS_OBJECTS.lock();
+    let mut out = alloc::vec::Vec::new();
+    let mut i = 0;
+    while i < t.len() {
+        if t[i].0 == channel_token && t[i].3 == owner_pid {
+            let (_ch, token, h, _) = t.remove(i);
+            out.push((token, h));
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Drains the class objects owned by `pid` (that process's exit / teardown),
@@ -127,8 +190,8 @@ pub(super) fn class_objects_drain_pid(pid: u64) -> alloc::vec::Vec<(u64, u32)> {
     let mut out = alloc::vec::Vec::new();
     let mut i = 0;
     while i < t.len() {
-        if t[i].2 == pid {
-            let (token, h, _) = t.remove(i);
+        if t[i].3 == pid {
+            let (_ch, token, h, _) = t.remove(i);
             out.push((token, h));
         } else {
             i += 1;
@@ -999,6 +1062,10 @@ pub(super) struct NouveauGemObject {
     /// CPU-mmap-able -- see the `GEM_NEW` gap note in
     /// docs/README-nouveau-uapi.md.
     pub phys_addr: Option<u64>,
+    /// FBMEM (VRAM) offset from `gem_fbmem_offset` / `memdescGetPhysAddr
+    /// AT_GPU`, when this is a VRAM-only object. Consumed by NVC57E
+    /// surfaceflip / CE present bookkeeping.
+    pub vram_offset: Option<u64>,
     /// Domain actually used (`NOUVEAU_GEM_DOMAIN_GART` or `_VRAM`), so
     /// `GEM_INFO` reports the backing rather than a hardcoded VRAM lie.
     pub domain: u32,
@@ -1387,6 +1454,12 @@ pub(super) const NVC46F_SEM_ADDR_LO: u32 = 0x5c;
 /// disables the direct-submit path.
 pub(super) const NVC46F_SEM_EXECUTE_RELEASE: u32 = 0x1 | (1 << 20);
 
+/// `NVC46F_SEM_EXECUTE`: OPERATION_ACQ_CIRC_GEQ (2:0 = 3). Circular GEQ
+/// matches [`crate::scheme::syncobj`]'s wrapping `fence_landed` compare, so a
+/// payload that wrapped past `u32::MAX` still unblocks the acquire. Strict
+/// GEQ (`0x2`) would hang across wrap. PAYLOAD_SIZE_32BIT, no WFI/timestamp.
+pub(super) const NVC46F_SEM_EXECUTE_ACQUIRE: u32 = 0x3;
+
 /// Build the 6-dword host semaphore RELEASE stream (`sem_va` <- `payload`).
 #[inline]
 pub(super) fn sem_release_stream(sem_va: u64, payload: u32) -> [u32; 6] {
@@ -1397,6 +1470,20 @@ pub(super) fn sem_release_stream(sem_va: u64, payload: u32) -> [u32; 6] {
         payload,
         0,
         NVC46F_SEM_EXECUTE_RELEASE,
+    ]
+}
+
+/// Build the 6-dword host semaphore ACQUIRE stream (wait until `*sem_va`
+/// circularly >= `payload`). Same layout as [`sem_release_stream`].
+#[inline]
+pub(super) fn sem_acquire_stream(sem_gpu_va: u64, payload: u32) -> [u32; 6] {
+    [
+        push_hdr(0, NVC46F_SEM_ADDR_LO, 5),
+        sem_gpu_va as u32,
+        ((sem_gpu_va >> 32) as u32) & 0xff,
+        payload,
+        0,
+        NVC46F_SEM_EXECUTE_ACQUIRE,
     ]
 }
 

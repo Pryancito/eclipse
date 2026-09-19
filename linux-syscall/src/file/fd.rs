@@ -64,6 +64,10 @@ fn prepare_open_inode(inode: Arc<dyn INode>) -> LxResult<Arc<dyn INode>> {
             // `/dev/snd/timer` too: every open is its own ALSA timer
             // instance (selection, params, event queue), as on Linux.
             timer.open_client()
+        } else if let Some(drm) = inode.downcast_ref::<linux_object::fs::devfs::DrmDev>() {
+            // `/dev/dri/card*` / `renderD*`: per-open ATOMIC_CLIENT + event
+            // queue (F-M7). GEM handles remain global for now.
+            drm.open_client()
         } else {
             inode
         },

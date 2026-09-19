@@ -88,6 +88,9 @@ impl Future for DrmEventWait<'_> {
 pub struct DrmDev {
     inode_id: usize,
     minor: u32,
+    /// Per-open caps + event queue (Linux `drm_file`). Shared across `dup` of
+    /// the same fd; fresh on each `open_client`.
+    file: Arc<drm::DrmFileState>,
 }
 
 impl DrmDev {
@@ -96,7 +99,23 @@ impl DrmDev {
         Self {
             inode_id: DevFS::new_inode_id(),
             minor,
+            // Registry placeholder; real opens go through [`Self::open_client`].
+            file: drm::DrmFileState::new(),
         }
+    }
+
+    /// `open(2)` on `/dev/dri/card*` / `renderD*`: a fresh per-fd DRM file
+    /// state (ATOMIC_CLIENT + event queue), like Linux's `drm_open_helper`.
+    pub fn open_client(&self) -> Arc<dyn INode> {
+        Arc::new(DrmDev {
+            inode_id: self.inode_id,
+            minor: self.minor,
+            file: drm::DrmFileState::new(),
+        })
+    }
+
+    pub fn file_state(&self) -> &Arc<drm::DrmFileState> {
+        &self.file
     }
 
     /// Sleep until the vblank a blocking `DRM_IOCTL_WAIT_VBLANK` asked for.
@@ -165,6 +184,99 @@ impl DrmDev {
         }
     }
 
+    /// Sleep until a blocking `SYNCOBJ_WAIT` / `TIMELINE_WAIT` would succeed
+    /// (or its absolute deadline passes).
+    ///
+    /// Same split as [`wait_vblank_sleep`]: `io_control` is sync and used to
+    /// spin-poll the whole timeout, pegging a core. Here we are in the async
+    /// syscall path, so we poll pending fences, probe with
+    /// [`zcore_drivers::scheme::syncobj::wait_ready`], and sleep ~1 ms (or
+    /// until the deadline) between probes. The sync arm then finishes the
+    /// ioctl (usually on the first iteration).
+    pub async fn syncobj_wait_sleep(&self, cmd: u32, data: usize) {
+        if !zcore_drivers::display::nouveau_uapi_enabled() {
+            return;
+        }
+        let timeline = cmd == DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT
+            || cmd == DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DEADLINE;
+        // Deadline-sized ioctls carry a trailing hint we never read; the
+        // prefix matches the classic structs.
+        let prefix = if timeline {
+            core::mem::size_of::<DrmSyncobjTimelineWait>()
+        } else {
+            core::mem::size_of::<DrmSyncobjWait>()
+        };
+        if ucheck(data, prefix).is_err() {
+            return;
+        }
+        let (handles_ptr, points_ptr, timeout_nsec, count_handles, flags) = if timeline {
+            let req = unsafe { *(data as *const DrmSyncobjTimelineWait) };
+            (
+                req.handles,
+                req.points,
+                req.timeout_nsec,
+                req.count_handles,
+                req.flags,
+            )
+        } else {
+            let req = unsafe { *(data as *const DrmSyncobjWait) };
+            (req.handles, 0u64, req.timeout_nsec, req.count_handles, req.flags)
+        };
+        const MAX_HANDLES: u32 = 64;
+        if count_handles == 0 || count_handles > MAX_HANDLES || handles_ptr == 0 {
+            return;
+        }
+        if ucheck_n::<u32>(handles_ptr as usize, count_handles as usize).is_err() {
+            return;
+        }
+        if timeline && points_ptr != 0 {
+            if ucheck_n::<u64>(points_ptr as usize, count_handles as usize).is_err() {
+                return;
+            }
+        }
+        let handles: alloc::vec::Vec<u32> = (0..count_handles as usize)
+            .map(|i| unsafe { *(handles_ptr as *const u32).add(i) })
+            .collect();
+        let points: Option<alloc::vec::Vec<u64>> = if timeline && points_ptr != 0 {
+            Some(
+                (0..count_handles as usize)
+                    .map(|i| unsafe { *(points_ptr as *const u64).add(i) })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        let deadline_us = (timeout_nsec.max(0) as u64) / 1000;
+        let wait_all = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL != 0;
+        let available_only = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE != 0;
+        let ready_fn = if available_only {
+            zcore_drivers::scheme::syncobj::wait_available_ready
+        } else {
+            zcore_drivers::scheme::syncobj::wait_ready
+        };
+        loop {
+            let _ = zcore_drivers::scheme::syncobj::poll_pending();
+            match ready_fn(&handles, points.as_deref(), wait_all, deadline_us) {
+                Some(_) => return,
+                None => {
+                    let now = kernel_hal::timer::timer_now();
+                    // Absolute CLOCK_MONOTONIC deadline in Duration form.
+                    let abs = core::time::Duration::from_micros(deadline_us);
+                    let tick = core::time::Duration::from_millis(1);
+                    let next = now + tick;
+                    let wake = if abs < next { abs } else { next };
+                    // If the absolute deadline is already behind `timer_now`,
+                    // wait_ready should have returned Timeout; still avoid an
+                    // unbounded sleep if the clocks disagree slightly.
+                    if wake <= now {
+                        return;
+                    }
+                    kernel_hal::thread::sleep_until(wake).await;
+                }
+            }
+        }
+    }
+
     /// Returns the [`VmObject`] representing the file with given `offset` and `len`.
     pub fn get_vmo(&self, offset: usize, len: usize) -> Result<Arc<VmObject>> {
         // MAP_DUMB handed userspace a page-aligned fake mmap offset that encodes
@@ -204,6 +316,19 @@ impl DrmDev {
 /// [`DrmDev::wait_vblank_sleep`]) and lets the sync arm below fill in the
 /// reply once the requested vblank has actually arrived.
 pub const WAIT_VBLANK_IOCTL: u32 = DRM_IOCTL_WAIT_VBLANK;
+
+/// True for any of the four `SYNCOBJ_WAIT` / `TIMELINE_WAIT` ioctl numbers
+/// (classic + deadline-sized). Used by `sys_ioctl` to run
+/// [`DrmDev::syncobj_wait_sleep`] before `io_control`.
+pub fn is_syncobj_wait_ioctl(cmd: u32) -> bool {
+    matches!(
+        cmd,
+        DRM_IOCTL_SYNCOBJ_WAIT
+            | DRM_IOCTL_SYNCOBJ_WAIT_DEADLINE
+            | DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT
+            | DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DEADLINE
+    )
+}
 
 // DRM IOCTL numbers (Linux x86_64)
 const DRM_IOCTL_VERSION: u32 = 0xC0406400;
@@ -364,6 +489,7 @@ struct DrmSyncobjDestroy {
 // eglgears_wayland) dying at its first submit-sync while the EXEC itself
 // succeeded. The size guards below now pin these two.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct DrmSyncobjWait {
     handles: u64,
     timeout_nsec: i64,
@@ -375,6 +501,7 @@ struct DrmSyncobjWait {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct DrmSyncobjTimelineWait {
     handles: u64,
     points: u64,
@@ -473,6 +600,10 @@ const PROP_SRC_W: u32 = 23;
 const PROP_SRC_H: u32 = 24;
 const PROP_ACTIVE: u32 = 25;
 const PROP_MODE_ID: u32 = 26;
+/// Plane explicit in-fence (`drm_mode_create_standard_properties`).
+const PROP_IN_FENCE_FD: u32 = 27;
+/// CRTC out-fence pointer (`*mut i32` sync_file fd writeback).
+const PROP_OUT_FENCE_PTR: u32 = 28;
 
 // Property flags (`drm_mode.h`).
 const DRM_MODE_PROP_RANGE: u32 = 1 << 1;
@@ -1163,6 +1294,18 @@ fn prop_spec(prop_id: u32) -> Option<PropSpec> {
             values: &[],
             enums: &[],
         },
+        PROP_IN_FENCE_FD => PropSpec {
+            name: "IN_FENCE_FD",
+            flags: DRM_MODE_PROP_SIGNED_RANGE | DRM_MODE_PROP_ATOMIC,
+            values: &[I32_MIN_U64, I32_MAX_U64],
+            enums: &[],
+        },
+        PROP_OUT_FENCE_PTR => PropSpec {
+            name: "OUT_FENCE_PTR",
+            flags: DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC,
+            values: &[0, u64::MAX],
+            enums: &[],
+        },
         _ => return None,
     })
 }
@@ -1170,7 +1313,7 @@ fn prop_spec(prop_id: u32) -> Option<PropSpec> {
 /// `(prop_id, value)` pairs attached to the synthetic connector. Atomic
 /// properties (CRTC_ID) are only listed for clients that negotiated
 /// `DRM_CLIENT_CAP_ATOMIC`, mirroring Linux's atomic-property filtering.
-fn connector_props(connector_id: u32) -> alloc::vec::Vec<(u32, u64)> {
+fn connector_props(connector_id: u32, atomic: bool) -> alloc::vec::Vec<(u32, u64)> {
     let mut props = alloc::vec::Vec::new();
     // The software scanout is always lit: DPMS "On", link "Good", a desktop
     // display.
@@ -1180,7 +1323,7 @@ fn connector_props(connector_id: u32) -> alloc::vec::Vec<(u32, u64)> {
     if drm::get_connector_edid(connector_id).is_some() {
         props.push((PROP_EDID, (20000 + connector_id) as u64));
     }
-    if drm::atomic_client() {
+    if atomic {
         let (st, _) = drm::atomic_snapshot();
         let crtc = if st.active { drm::SYNTH_CRTC_ID } else { 0 };
         props.push((PROP_CRTC_ID, crtc as u64));
@@ -1189,22 +1332,24 @@ fn connector_props(connector_id: u32) -> alloc::vec::Vec<(u32, u64)> {
 }
 
 /// `(prop_id, value)` pairs attached to the synthetic CRTC (atomic-only).
-fn crtc_props() -> alloc::vec::Vec<(u32, u64)> {
+fn crtc_props(atomic: bool) -> alloc::vec::Vec<(u32, u64)> {
     let mut props = alloc::vec::Vec::new();
-    if drm::atomic_client() {
+    if atomic {
         let (st, _) = drm::atomic_snapshot();
         props.push((PROP_ACTIVE, st.active as u64));
         props.push((PROP_MODE_ID, st.mode_blob_id as u64));
+        // Write-only for commits; readback is always 0 like Linux.
+        props.push((PROP_OUT_FENCE_PTR, 0));
     }
     props
 }
 
 /// `(prop_id, value)` pairs attached to a plane: `type` for everyone, plus
 /// the atomic plane state for atomic clients.
-fn plane_props(plane: &drm::DrmPlane) -> alloc::vec::Vec<(u32, u64)> {
+fn plane_props(plane: &drm::DrmPlane, atomic: bool) -> alloc::vec::Vec<(u32, u64)> {
     let mut props = alloc::vec::Vec::new();
     props.push((PROP_TYPE, plane.plane_type as u64));
-    if drm::atomic_client() {
+    if atomic {
         let (st, crtc_fb) = drm::atomic_snapshot();
         let crtc = if crtc_fb != 0 { plane.crtc_id } else { 0 };
         props.push((PROP_FB_ID, crtc_fb as u64));
@@ -1217,6 +1362,8 @@ fn plane_props(plane: &drm::DrmPlane) -> alloc::vec::Vec<(u32, u64)> {
         props.push((PROP_SRC_Y, st.src_y as u64));
         props.push((PROP_SRC_W, st.src_w as u64));
         props.push((PROP_SRC_H, st.src_h as u64));
+        // Default "no in-fence" sentinel.
+        props.push((PROP_IN_FENCE_FD, (-1i32) as u64));
     }
     props
 }
@@ -1238,6 +1385,18 @@ fn atomic_stage(upd: &mut drm::AtomicUpdate, obj_id: u32, prop_id: u32, value: u
             PROP_SRC_Y => upd.src_y = Some(value as u32),
             PROP_SRC_W => upd.src_w = Some(value as u32),
             PROP_SRC_H => upd.src_h = Some(value as u32),
+            // IN_FENCE_FD: -1 = none (ignore); >= 0 accepted as a no-op so
+            // explicit-sync compositors do not fail the commit. Real wait on
+            // the sync_file is not wired yet.
+            PROP_IN_FENCE_FD => {
+                let fd = value as i32;
+                if fd < -1 {
+                    return Err(FsError::InvalidParam);
+                }
+                if fd >= 0 {
+                    upd.in_fence_fd = Some(fd);
+                }
+            }
             // "type" is immutable.
             PROP_TYPE => return Err(FsError::InvalidParam),
             _ => return Err(FsError::EntryNotFound),
@@ -1251,6 +1410,14 @@ fn atomic_stage(upd: &mut drm::AtomicUpdate, obj_id: u32, prop_id: u32, value: u
                 upd.active = Some(value != 0);
             }
             PROP_MODE_ID => upd.mode_blob = Some(value as u32),
+            // OUT_FENCE_PTR: userspace pointer that must receive an i32 fd.
+            // NULL is ignored; non-null is staged for writeback after commit.
+            PROP_OUT_FENCE_PTR => {
+                if value != 0 {
+                    ucheck(value as usize, core::mem::size_of::<i32>())?;
+                }
+                upd.out_fence_ptr = Some(value);
+            }
             _ => return Err(FsError::EntryNotFound),
         }
     } else if drm::get_connector(obj_id).is_some() {
@@ -1262,6 +1429,49 @@ fn atomic_stage(upd: &mut drm::AtomicUpdate, obj_id: u32, prop_id: u32, value: u
         }
     } else {
         return Err(FsError::EntryNotFound);
+    }
+    Ok(())
+}
+
+/// Install a already-signaled sync_file into the caller's fd table, or `None`
+/// if the process/context cannot allocate one. Used as an OUT_FENCE_PTR stub:
+/// real out-fences need HW flip completion; a signaled fd keeps clients from
+/// waiting forever or SIGBUS-ing on an uninitialized pointer.
+fn try_signaled_out_fence_fd() -> Option<i32> {
+    use crate::fs::SyncobjHandle;
+    use crate::process::ProcessExt;
+    use zircon_object::task::Thread;
+
+    let thread = kernel_hal::thread::get_current_thread()?.downcast::<Thread>().ok()?;
+    let linux = thread.proc().try_linux()?;
+    let handle = zcore_drivers::scheme::syncobj::create(true);
+    let file = SyncobjHandle::new_sync_file(handle, 1);
+    match linux.add_file(file) {
+        Ok(fd) => Some(i32::from(fd)),
+        Err(_) => {
+            let _ = zcore_drivers::scheme::syncobj::destroy(handle);
+            None
+        }
+    }
+}
+
+/// Write OUT_FENCE_PTR: TEST_ONLY / missing syncobj path → `-1`; otherwise a
+/// signaled sync_file fd. Comment in callers: real out-fences need HW flip
+/// completion.
+fn write_out_fence_ptr(ptr: u64, test_only: bool) -> Result<()> {
+    if ptr == 0 {
+        return Ok(());
+    }
+    ucheck(ptr as usize, core::mem::size_of::<i32>())?;
+    // Real out-fences need HW flip completion; until then prefer an
+    // already-signaled sync_file so explicit-sync clients can proceed, else -1.
+    let fd = if test_only {
+        -1
+    } else {
+        try_signaled_out_fence_fd().unwrap_or(-1)
+    };
+    unsafe {
+        *(ptr as *mut i32) = fd;
     }
     Ok(())
 }
@@ -1294,7 +1504,7 @@ impl INode for DrmDev {
         // Deliver queued DRM events (page-flip completions). When none are
         // pending report `Again` so a non-blocking reader gets EAGAIN and an
         // epoll/poll waiter re-checks on the next tick.
-        match drm::read_event(buf) {
+        match self.file.read_event(buf) {
             Some(n) => Ok(n),
             None => Err(FsError::Again),
         }
@@ -1306,7 +1516,7 @@ impl INode for DrmDev {
 
     fn poll(&self) -> Result<PollStatus> {
         Ok(PollStatus {
-            read: drm::has_events(),
+            read: self.file.has_events(),
             // Keep write=true for now: reporting write=false made labwc's
             // DRM epoll actually park and exposed a #DF at session start
             // (heap corruption while the card fd stopped looking always-
@@ -1324,7 +1534,7 @@ impl INode for DrmDev {
         // Lightweight waiter: do not nest an `async move { loop { ... } }`
         // state machine. Poll/epoll already use sync `poll()`; this path is
         // for blocking reads and any leftover async_poll callers.
-        let bus = drm::get_eventbus();
+        let bus = self.file.eventbus();
         Box::pin(DrmEventWait {
             dev: self,
             bus,
@@ -1785,14 +1995,14 @@ impl INode for DrmDev {
                             return Err(FsError::InvalidParam);
                         }
                         // Setting atomic also implies universal planes.
-                        drm::set_atomic_client(value != 0);
+                        self.file.set_atomic_client(value != 0);
                         log::debug!("[drm] SET_CLIENT_CAP ATOMIC={} -> accepted", value);
                         Ok(0)
                     }
                     DRM_CLIENT_CAP_WRITEBACK_CONNECTORS => {
                         // Linux: atomic clients only. There are no writeback
                         // connectors to expose, so accepting is a no-op.
-                        if !drm::atomic_client() || value > 1 {
+                        if !self.file.atomic_client() || value > 1 {
                             log::debug!("[drm] SET_CLIENT_CAP WRITEBACK -> EINVAL");
                             return Err(FsError::InvalidParam);
                         }
@@ -1942,6 +2152,9 @@ impl INode for DrmDev {
             DRM_IOCTL_MODE_SETCRTC => {
                 // struct drm_mode_crtc has the same layout as DrmModeGetCrtc.
                 let req = unsafe { &mut *(data as *mut DrmModeGetCrtc) };
+                if req.mode_valid != 0 {
+                    drm::set_vblank_period_from_modeinfo(&req.mode);
+                }
                 if req.fb_id != 0 && !drm::present_now(req.fb_id, req.crtc_id) {
                     return Err(FsError::DeviceError);
                 }
@@ -1968,7 +2181,13 @@ impl INode for DrmDev {
                     return Err(FsError::EntryNotFound);
                 }
                 let want_event = flip.flags & DRM_MODE_PAGE_FLIP_EVENT != 0;
-                match drm::page_flip(flip.fb_id, flip.crtc_id, flip.user_data, want_event) {
+                match drm::page_flip(
+                    flip.fb_id,
+                    flip.crtc_id,
+                    flip.user_data,
+                    want_event,
+                    &self.file,
+                ) {
                     Ok(()) => Ok(0),
                     Err(drm::FlipError::Busy) => Err(FsError::Busy),
                     Err(drm::FlipError::Failed) => Err(FsError::DeviceError),
@@ -2020,7 +2239,7 @@ impl INode for DrmDev {
                     // before the next synthetic vblank: delivering it instantly
                     // turns a vblank-paced client loop into a busy spin (see
                     // `schedule_flip_event`).
-                    drm::schedule_vblank_event(signal, target);
+                    drm::schedule_vblank_event(signal, target, &self.file);
                 } else {
                     // Blocking form. The wait itself already happened in
                     // `sys_ioctl` (see `DrmDev::wait_vblank_sleep`): this arm
@@ -2405,7 +2624,7 @@ impl INode for DrmDev {
                     // Standard connector properties (DPMS, link-status,
                     // non-desktop, EDID, and CRTC_ID for atomic clients), via
                     // the usual two-call count/fill pattern.
-                    let props = connector_props(conn_res.connector_id);
+                    let props = connector_props(conn_res.connector_id, self.file.atomic_client());
                     if !props.is_empty()
                         && conn_res.props_ptr != 0
                         && conn_res.prop_values_ptr != 0
@@ -2560,13 +2779,14 @@ impl INode for DrmDev {
                 // properties (FB_ID, CRTC_ID, ACTIVE, MODE_ID, rects) only
                 // appear for atomic clients, like Linux's atomic filtering;
                 // legacy clients keep seeing exactly the pre-atomic set.
+                let atomic = self.file.atomic_client();
                 let props: alloc::vec::Vec<(u32, u64)> = if let Some(p) = drm::get_plane(res.obj_id)
                 {
-                    plane_props(&p)
+                    plane_props(&p, atomic)
                 } else if drm::get_crtc(res.obj_id).is_some() {
-                    crtc_props()
+                    crtc_props(atomic)
                 } else if drm::get_connector(res.obj_id).is_some() {
-                    connector_props(res.obj_id)
+                    connector_props(res.obj_id, atomic)
                 } else {
                     // Encoders exist but carry no properties; anything
                     // else is unknown. Keep the historical empty-list
@@ -2721,7 +2941,7 @@ impl INode for DrmDev {
                 // DRM_CLIENT_CAP_ATOMIC (EINVAL otherwise), flags must be
                 // known, reserved must be 0, TEST_ONLY cannot carry a flip
                 // event, and async flips are refused when unsupported.
-                if !drm::atomic_client() {
+                if !self.file.atomic_client() {
                     return Err(FsError::InvalidParam);
                 }
                 if req.flags & !DRM_MODE_ATOMIC_FLAGS != 0 || req.reserved != 0 {
@@ -2791,13 +3011,30 @@ impl INode for DrmDev {
                     upd.mode_blob,
                     upd.active
                 );
-                drm::atomic_commit(&upd, test_only, allow_modeset, want_event, req.user_data)
-                    .map_err(|e| match e {
-                        drm::AtomicError::Invalid => FsError::InvalidParam,
-                        drm::AtomicError::NotFound => FsError::EntryNotFound,
-                        drm::AtomicError::Device => FsError::DeviceError,
-                        drm::AtomicError::Busy => FsError::Busy,
-                    })?;
+                let commit = drm::atomic_commit(
+                    &upd,
+                    test_only,
+                    allow_modeset,
+                    want_event,
+                    req.user_data,
+                    &self.file,
+                );
+                // OUT_FENCE_PTR writeback: Linux writes -1 on TEST_ONLY/failure
+                // and a sync_file fd on success. Real out-fences need HW flip
+                // completion; we install a signaled stub when possible.
+                if let Some(ptr) = upd.out_fence_ptr {
+                    if commit.is_err() || test_only {
+                        let _ = write_out_fence_ptr(ptr, true);
+                    } else if let Err(e) = write_out_fence_ptr(ptr, false) {
+                        return Err(e);
+                    }
+                }
+                commit.map_err(|e| match e {
+                    drm::AtomicError::Invalid => FsError::InvalidParam,
+                    drm::AtomicError::NotFound => FsError::EntryNotFound,
+                    drm::AtomicError::Device => FsError::DeviceError,
+                    drm::AtomicError::Busy => FsError::Busy,
+                })?;
                 Ok(0)
             }
             DRM_IOCTL_SYNCOBJ_CREATE => {

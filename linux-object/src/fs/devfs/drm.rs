@@ -5,11 +5,11 @@
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::TryFrom;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use lock::Mutex;
 
@@ -104,16 +104,6 @@ pub fn scanout_paused() -> bool {
 /// compositors fall back to legacy KMS.
 static ATOMIC_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Whether the current DRM client negotiated `DRM_CLIENT_CAP_ATOMIC`.
-///
-/// Linux tracks this per `drm_file`; Eclipse's DRM model is single-client
-/// (one implicit master), so one global flag mirrors it. Cleared on
-/// DROP_MASTER so a later legacy-only compositor session starts clean.
-/// Gates the visibility of DRM_MODE_PROP_ATOMIC properties in
-/// OBJ_GETPROPERTIES/GETCONNECTOR, exactly like Linux hides atomic
-/// properties from non-atomic clients.
-static ATOMIC_CLIENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-
 /// Enable the atomic uAPI (set once at boot from the `drm.atomic` flag).
 pub fn set_atomic_enabled(on: bool) {
     ATOMIC_ENABLED.store(on, Ordering::Relaxed);
@@ -124,14 +114,74 @@ pub fn atomic_enabled() -> bool {
     ATOMIC_ENABLED.load(Ordering::Relaxed)
 }
 
-/// Record whether the (single) DRM client negotiated the atomic cap.
-pub fn set_atomic_client(on: bool) {
-    ATOMIC_CLIENT.store(on, Ordering::Relaxed);
+/// Per-open DRM file state (Linux `struct drm_file`).
+///
+/// `ATOMIC_CLIENT` and the readable event queue belong to the fd that
+/// negotiated / queued them. GEM handles stay global for now (full F-M7
+/// isolation is a larger change). Each `open(/dev/dri/card*)` gets a fresh
+/// [`DrmFileState`] via [`super::drm_scheme::DrmDev::open_client`].
+pub struct DrmFileState {
+    atomic_client: AtomicBool,
+    events: Mutex<VecDeque<Vec<u8>>>,
+    eventbus: Arc<Mutex<EventBus>>,
 }
 
-/// Whether the current DRM client is an atomic client.
-pub fn atomic_client() -> bool {
-    ATOMIC_CLIENT.load(Ordering::Relaxed)
+impl DrmFileState {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            atomic_client: AtomicBool::new(false),
+            events: Mutex::new(VecDeque::new()),
+            eventbus: EventBus::new(),
+        })
+    }
+
+    pub fn set_atomic_client(&self, on: bool) {
+        self.atomic_client.store(on, Ordering::Relaxed);
+    }
+
+    pub fn atomic_client(&self) -> bool {
+        self.atomic_client.load(Ordering::Relaxed)
+    }
+
+    pub fn eventbus(&self) -> Arc<Mutex<EventBus>> {
+        self.eventbus.clone()
+    }
+
+    pub fn has_events(&self) -> bool {
+        !self.events.lock().is_empty()
+    }
+
+    /// Pop one pending DRM event into `buf`, or `None` if the queue is empty /
+    /// the caller's buffer is too small for a whole event.
+    pub fn read_event(&self, buf: &mut [u8]) -> Option<usize> {
+        let mut events = self.events.lock();
+        let ev = events.front()?;
+        if buf.len() < ev.len() {
+            return None;
+        }
+        let n = ev.len();
+        buf[..n].copy_from_slice(&ev[..n]);
+        events.pop_front();
+        if events.is_empty() {
+            self.eventbus.lock().clear(Event::READABLE);
+        }
+        Some(n)
+    }
+
+    fn push_event(&self, bytes: Vec<u8>) {
+        let mut events = self.events.lock();
+        events.push_back(bytes);
+        self.eventbus.lock().set(Event::READABLE);
+    }
+}
+
+impl Drop for DrmFileState {
+    fn drop(&mut self) {
+        // Linux destroys pending events when the drm_file closes. Timer jobs
+        // hold only a Weak to us; drain any that still name this file so a
+        // later tick does not clear FLIP_EVENT_PENDING for a stranger's flip.
+        cancel_pending_timers_for_file(self as *const DrmFileState);
+    }
 }
 
 /// Return the primary framebuffer display, if any.
@@ -205,10 +255,6 @@ struct DrmState {
     /// or hangs. Cleared on DROP_MASTER (compositor exit) so a later text-only
     /// session is never gated.
     graphics_vt: Option<usize>,
-    /// Pending DRM events (page-flip completions) waiting to be `read()` from
-    /// the card fd. Each entry is one fully-encoded `struct drm_event_vblank`.
-    events: VecDeque<Vec<u8>>,
-    eventbus: Arc<Mutex<EventBus>>,
     /// Monotonic time the next synthetic vblank / page-flip completion is
     /// allowed to fire. A software framebuffer has no real vblank, so a
     /// `DRM_IOCTL_MODE_PAGE_FLIP` used to complete *instantly*: the compositor's
@@ -216,6 +262,8 @@ struct DrmState {
     /// and re-rendered (and full-screen-blitted) as fast as the CPU allowed —
     /// pegging a host core under QEMU. Deferring the flip-complete event to this
     /// deadline paces the loop to ~60 Hz, which is what a real vblank would do.
+    ///
+    /// Pending readable DRM events live on [`DrmFileState`] (per open), not here.
     next_vblank: Duration,
     /// Kernel-composited hardware cursor (legacy `DRM_IOCTL_MODE_CURSOR`). The
     /// bitmap is a copy of the client's cursor BO (premultiplied ARGB8888,
@@ -317,8 +365,6 @@ lazy_static::lazy_static! {
         fb_backing: Vec::new(),
         crtc_fb: 0,
         graphics_vt: None,
-        events: VecDeque::new(),
-        eventbus: EventBus::new(),
         next_vblank: Duration::ZERO,
         cursor: CursorState {
             visible: false,
@@ -688,14 +734,16 @@ pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<
         return None;
     }
 
-    // Only a hardware-KMS driver needs its own framebuffer object. On the
-    // software-KMS path the fb is scanned out purely via the display's
-    // `blit_from`, so a `driver.create_fb` (a GSP RPC on the NVIDIA driver) is
-    // both useless and leaked — RMFB has no driver-side destroy path.
-    let driver_fb_id = if software_kms_active() {
-        None
-    } else {
+    // Create a driver-private fb when hardware/CE/surface flip may need it.
+    // Under pure software KMS (no surfaceflip) skip it to avoid leaking
+    // driver fbs with no destroy path.
+    let want_driver_fb = !software_kms_active()
+        || zcore_drivers::display::surfaceflip_enabled()
+        || zcore_drivers::display::hwflip_enabled();
+    let driver_fb_id = if want_driver_fb {
         get_primary_driver().and_then(|driver| driver.create_fb(handle_id, width, height, pitch))
+    } else {
+        None
     };
 
     let mut state = DRM_STATE.lock();
@@ -1793,16 +1841,55 @@ fn restore_rect(
 ///
 /// `crtc_id`/`user_data` come from the page-flip request and are echoed back in
 /// the `drm_event_vblank` so libdrm's event loop can match the flip.
-/// Synthetic vblank period. 60 Hz is the rate every KMS mode we advertise runs
-/// at, so pacing flip completions to it makes an unthrottled compositor loop
-/// render at 60 fps instead of thousands — the difference between an idle-ish
-/// core and a pegged one under emulation.
+/// Fallback synthetic vblank rate when no CRTC mode is active. Pacing flip
+/// completions to the active mode's refresh (or this fallback) keeps an
+/// unthrottled compositor loop from spinning.
 ///
-/// Must match [`vblank_seq_now`]: `1_000_000_000 / 60` ns, not 16_666_667.
-/// The old pair (period 16_666_667 ns vs sequence `now_ns * 60 / 1e9`) drifted
-/// and compositors that derive nsec/MSC from both clocks reported ~55 Hz.
-const VBLANK_HZ: u64 = 60;
-const VBLANK_PERIOD_NS: u64 = 1_000_000_000 / VBLANK_HZ;
+/// Period and [`vblank_seq_now`] must always use the same divisor: the old
+/// pair (period 16_666_667 ns vs sequence `now_ns * 60 / 1e9`) drifted and
+/// compositors that derive nsec/MSC from both clocks reported ~55 Hz.
+const FALLBACK_VBLANK_HZ: u64 = 60;
+
+/// Nanoseconds per synthetic vblank. Updated from the active CRTC mode
+/// ([`set_vblank_period_from_modeinfo`]); starts at 60 Hz.
+static VBLANK_PERIOD_NS: AtomicU64 = AtomicU64::new(1_000_000_000 / FALLBACK_VBLANK_HZ);
+
+/// Current synthetic vblank period in nanoseconds (at least 1).
+#[inline]
+fn vblank_period_ns() -> u64 {
+    VBLANK_PERIOD_NS.load(Ordering::Relaxed).max(1)
+}
+
+/// Refresh rate (Hz) from a `drm_mode_modeinfo` blob: prefer `vrefresh`, else
+/// `clock_kHz * 1000 / (htotal * vtotal)`. `None` if the blob is unusable.
+pub fn refresh_hz_from_modeinfo(data: &[u8]) -> Option<u64> {
+    if data.len() < 28 {
+        return None;
+    }
+    let vrefresh = u32::from_ne_bytes([data[24], data[25], data[26], data[27]]) as u64;
+    if vrefresh > 0 {
+        return Some(vrefresh);
+    }
+    let clock_khz = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]) as u64;
+    let htotal = u16::from_ne_bytes([data[10], data[11]]) as u64;
+    let vtotal = u16::from_ne_bytes([data[20], data[21]]) as u64;
+    if clock_khz == 0 || htotal == 0 || vtotal == 0 {
+        return None;
+    }
+    Some((clock_khz * 1000) / (htotal * vtotal))
+}
+
+/// Set the synthetic vblank period from a `drm_mode_modeinfo` (68 bytes).
+/// Falls back to [`FALLBACK_VBLANK_HZ`] when the mode has no usable refresh.
+pub fn set_vblank_period_from_modeinfo(data: &[u8]) {
+    let hz = refresh_hz_from_modeinfo(data).unwrap_or(FALLBACK_VBLANK_HZ).max(1);
+    VBLANK_PERIOD_NS.store(1_000_000_000 / hz, Ordering::Relaxed);
+}
+
+/// Reset synthetic vblank pacing to the 60 Hz fallback (no active mode).
+pub fn reset_vblank_period() {
+    VBLANK_PERIOD_NS.store(1_000_000_000 / FALLBACK_VBLANK_HZ, Ordering::Relaxed);
+}
 
 /// Outcome of a legacy/`PAGE_FLIP` or atomic flip-with-event request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1822,6 +1909,7 @@ pub fn page_flip(
     crtc_id: u32,
     user_data: u64,
     want_event: bool,
+    file: &Arc<DrmFileState>,
 ) -> Result<(), FlipError> {
     // One outstanding flip-complete per CRTC — same rule as Linux. The
     // coalesced timer keeps a *queue* (never an overwritten `Option`), so a
@@ -1853,7 +1941,7 @@ pub fn page_flip(
         return Err(FlipError::Failed);
     }
     if want_event {
-        schedule_flip_event(crtc_id, user_data);
+        schedule_flip_event(crtc_id, user_data, file);
     }
     Ok(())
 }
@@ -1862,18 +1950,23 @@ pub fn page_flip(
 /// than immediately. This is the throttle that keeps a Wayland compositor's
 /// frame loop from spinning: it renders a frame, page-flips, then blocks in
 /// `poll()`/`read()` on the card fd until we post the flip event here — so the
-/// loop runs at most once per [`VBLANK_PERIOD_NS`]. If that slot is already in
-/// the past (present took ≥16.7 ms, or the compositor was idle) the event is
-/// delivered immediately: waiting *another* full period on top of a missed
-/// slot locked the desktop at ~30 Hz. Catch-up still never exceeds 60 Hz,
-/// because a frame that finished on time keeps its remaining wait.
+/// loop runs at most once per [`vblank_period_ns`]. If that slot is already in
+/// the past (present took ≥ one period, or the compositor was idle) the event
+/// is delivered immediately: waiting *another* full period on top of a missed
+/// slot locked the desktop at half rate. Catch-up still never exceeds the
+/// active refresh, because a frame that finished on time keeps its remaining
+/// wait.
 ///
 /// Pending DRM completions share one `timer_set` arm (labwc/lunarbar used to
 /// enqueue a fresh Box per flip/vblank), but the jobs themselves live in a
 /// queue — never overwrite — so every successful flip still gets its event.
-#[derive(Clone, Copy)]
 enum PendingDrmTimer {
-    Flip { crtc_id: u32, user_data: u64 },
+    Flip {
+        crtc_id: u32,
+        user_data: u64,
+        /// Deliver onto this open's event queue (Weak so close can Drop).
+        file: Weak<DrmFileState>,
+    },
     // `seq` is intentionally not stored: we recompute it from `vblank_seq_now()`
     // at delivery time so the event carries the sequence that actually just
     // completed (the timer fires at the next vblank boundary), rather than a
@@ -1881,7 +1974,11 @@ enum PendingDrmTimer {
     // vblank the caller asked for (`drm_wait_vblank.request.sequence`,
     // absolute): the job stays queued, one vblank tick at a time, until the
     // counter reaches it.
-    Vblank { signal: u64, due_seq: u32 },
+    Vblank {
+        signal: u64,
+        due_seq: u32,
+        file: Weak<DrmFileState>,
+    },
 }
 
 lazy_static::lazy_static! {
@@ -1901,17 +1998,32 @@ fn deliver_pending_drm_timer() {
     let now_seq = vblank_seq_now();
     for job in jobs {
         match job {
-            PendingDrmTimer::Flip { crtc_id, user_data } => {
-                queue_flip_event(crtc_id, user_data);
+            PendingDrmTimer::Flip {
+                crtc_id,
+                user_data,
+                file,
+            } => {
+                if let Some(file) = file.upgrade() {
+                    queue_flip_event(&file, crtc_id, user_data);
+                } else {
+                    // drm_file closed before delivery — drop the event.
+                    FLIP_EVENT_PENDING.store(false, Ordering::Release);
+                }
             }
-            PendingDrmTimer::Vblank { signal, due_seq } => {
+            PendingDrmTimer::Vblank {
+                signal,
+                due_seq,
+                file,
+            } => {
                 // Not due yet (wrap-safe compare): keep it for a later vblank.
                 if (due_seq.wrapping_sub(now_seq) as i32) > 0 {
-                    PENDING_DRM_TIMERS
-                        .lock()
-                        .push_back(PendingDrmTimer::Vblank { signal, due_seq });
-                } else {
-                    queue_vblank_event(now_seq, signal);
+                    PENDING_DRM_TIMERS.lock().push_back(PendingDrmTimer::Vblank {
+                        signal,
+                        due_seq,
+                        file,
+                    });
+                } else if let Some(file) = file.upgrade() {
+                    queue_vblank_event(&file, now_seq, signal);
                 }
             }
         }
@@ -1953,7 +2065,7 @@ fn arm_coalesced_drm_timer(pending: PendingDrmTimer) {
 /// DROP_MASTER/exit swallow a live compositor's completion.
 static LAST_FLIP_PID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-fn schedule_flip_event(crtc_id: u32, user_data: u64) {
+fn schedule_flip_event(crtc_id: u32, user_data: u64, file: &Arc<DrmFileState>) {
     // Set FLIP_EVENT_PENDING and push the job INSIDE the same lock acquisition
     // as arm_coalesced_drm_timer, so that flush_pending_flip_completions can
     // never observe FLIP_EVENT_PENDING = true with an empty queue on SMP. Without
@@ -1966,7 +2078,11 @@ fn schedule_flip_event(crtc_id: u32, user_data: u64) {
     {
         let mut q = PENDING_DRM_TIMERS.lock();
         FLIP_EVENT_PENDING.store(true, Ordering::Release);
-        q.push_back(PendingDrmTimer::Flip { crtc_id, user_data });
+        q.push_back(PendingDrmTimer::Flip {
+            crtc_id,
+            user_data,
+            file: Arc::downgrade(file),
+        });
     }
     arm_coalesced_drm_timer_locked();
 }
@@ -1982,23 +2098,31 @@ fn schedule_flip_event(crtc_id: u32, user_data: u64) {
 /// dropped or overwritten completion, so no stale `wl_listener` free in labwc.
 /// Pending vblank-wait jobs keep their own pacing and stay queued.
 fn flush_pending_flip_completions() {
-    let flips: Vec<(u32, u64)> = {
+    let flips: Vec<(u32, u64, Weak<DrmFileState>)> = {
         let mut q = PENDING_DRM_TIMERS.lock();
         let mut kept = VecDeque::with_capacity(q.len());
         let mut flips = Vec::new();
         while let Some(job) = q.pop_front() {
             match job {
-                PendingDrmTimer::Flip { crtc_id, user_data } => flips.push((crtc_id, user_data)),
+                PendingDrmTimer::Flip {
+                    crtc_id,
+                    user_data,
+                    file,
+                } => flips.push((crtc_id, user_data, file)),
                 other => kept.push_back(other),
             }
         }
         *q = kept;
         flips
     };
-    // queue_flip_event locks DRM_STATE and clears FLIP_EVENT_PENDING; the
-    // PENDING_DRM_TIMERS guard above is already dropped, so no nested lock.
-    for (crtc_id, user_data) in flips {
-        queue_flip_event(crtc_id, user_data);
+    // queue_flip_event locks the file's event queue and clears FLIP_EVENT_PENDING;
+    // the PENDING_DRM_TIMERS guard above is already dropped, so no nested lock.
+    for (crtc_id, user_data, file) in flips {
+        if let Some(file) = file.upgrade() {
+            queue_flip_event(&file, crtc_id, user_data);
+        } else {
+            FLIP_EVENT_PENDING.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -2023,15 +2147,19 @@ fn clear_stale_flip_pending() {
 /// next vblank boundary even if `due_seq` has already passed, for the same
 /// anti-spin reason as [`schedule_flip_event`]. `signal` is the caller's
 /// opaque token echoed back in the event's `user_data`.
-pub fn schedule_vblank_event(signal: u64, due_seq: u32) {
-    arm_coalesced_drm_timer(PendingDrmTimer::Vblank { signal, due_seq });
+pub fn schedule_vblank_event(signal: u64, due_seq: u32, file: &Arc<DrmFileState>) {
+    arm_coalesced_drm_timer(PendingDrmTimer::Vblank {
+        signal,
+        due_seq,
+        file: Arc::downgrade(file),
+    });
 }
 
-/// Drop any not-yet-posted flip/vblank completions (timer queue + readable
-/// event bytes).
+/// Drop not-yet-posted flip/vblank timer jobs (device-wide).
 ///
-/// NOT called from `DROP_MASTER` any more -- that was Linux-divergent and
-/// broke real-hardware boots: pending DRM events belong to the drm_file that
+/// Readable event bytes live on each [`DrmFileState`] and are cleared when that
+/// file drops. NOT called from `DROP_MASTER` any more -- that was Linux-divergent
+/// and broke real-hardware boots: pending DRM events belong to the drm_file that
 /// queued them and SURVIVE a master drop (Linux only destroys them when the
 /// file closes). Eclipse's single global event stream meant a TRANSIENT
 /// DROP_MASTER from a probing client (Xwayland during session bring-up)
@@ -2039,16 +2167,37 @@ pub fn schedule_vblank_event(signal: u64, due_seq: u32) {
 /// completion, swallowed the flip event, and wlroots then waited on it
 /// forever: the desktop froze on its very first frame until a VT
 /// switch-away/back forced seatd to re-enable the session (fresh modeset +
-/// flip). Cancellation now happens only on the flip owner's EXIT (see
-/// `cancel_events_for_exit`), which is what the freed-user_data safety
-/// actually needs.
+/// flip). Cancellation now happens on file close ([`DrmFileState`]'s Drop) and
+/// on the flip owner's EXIT (see `cancel_events_for_exit`).
 pub fn cancel_pending_events() {
     PENDING_DRM_TIMERS.lock().clear();
     DRM_TIMER_ARMED.store(false, Ordering::Release);
     FLIP_EVENT_PENDING.store(false, Ordering::Release);
-    let mut state = DRM_STATE.lock();
-    state.events.clear();
-    state.eventbus.lock().clear(Event::READABLE);
+}
+
+/// Drain timer jobs that target a closing drm_file (by raw pointer identity).
+fn cancel_pending_timers_for_file(file_ptr: *const DrmFileState) {
+    let mut cleared_flip = false;
+    {
+        let mut q = PENDING_DRM_TIMERS.lock();
+        q.retain(|job| {
+            let job_ptr = match job {
+                PendingDrmTimer::Flip { file, .. } => file.as_ptr(),
+                PendingDrmTimer::Vblank { file, .. } => file.as_ptr(),
+            };
+            if core::ptr::eq(job_ptr, file_ptr) {
+                if matches!(job, PendingDrmTimer::Flip { .. }) {
+                    cleared_flip = true;
+                }
+                false
+            } else {
+                true
+            }
+        });
+    }
+    if cleared_flip {
+        FLIP_EVENT_PENDING.store(false, Ordering::Release);
+    }
 }
 
 /// Cancel pending flip/vblank completions IF `pid` is the process whose flip
@@ -2067,33 +2216,34 @@ pub fn cancel_events_for_exit(pid: u64) {
 }
 
 /// Advance the synthetic vblank clock and return the monotonic instant the next
-/// completion event may fire at: one [`VBLANK_PERIOD_NS`] past the previous vblank.
+/// completion event may fire at: one [`vblank_period_ns`] past the previous vblank.
 ///
-/// Cap at 60 Hz when the compositor is on time. When the slot is already in
-/// the past, return `now` (catch-up) instead of waiting until the *next* grid
-/// boundary: that extra wait was the ~30 Hz lock. Catch-up still never exceeds
-/// 60 Hz, because a frame that finished inside the period keeps the remaining
-/// wait. The completed slot is snapped to the 60 Hz lattice shared with
-/// [`vblank_seq_now`], so a catch-up does not leave the phase sitting 18 ms
-/// off-grid (which locked subsequent on-time frames at ~55 Hz).
+/// Cap at the active refresh when the compositor is on time. When the slot is
+/// already in the past, return `now` (catch-up) instead of waiting until the
+/// *next* grid boundary: that extra wait was the half-rate lock. Catch-up still
+/// never exceeds the active refresh, because a frame that finished inside the
+/// period keeps the remaining wait. The completed slot is snapped to the
+/// lattice shared with [`vblank_seq_now`], so a catch-up does not leave the
+/// phase sitting off-grid.
 fn next_vblank_deadline() -> Duration {
     let now = kernel_hal::timer::timer_now();
     let now_ns = u64::try_from(now.as_nanos()).unwrap_or(u64::MAX);
+    let period = vblank_period_ns();
     let mut st = DRM_STATE.lock();
     let last_ns = u64::try_from(st.next_vblank.as_nanos()).unwrap_or(0);
-    let next_from_last = last_ns.saturating_add(VBLANK_PERIOD_NS);
+    let next_from_last = last_ns.saturating_add(period);
     if next_from_last <= now_ns {
         static CATCHUP_LOGGED: AtomicBool = AtomicBool::new(false);
         if !CATCHUP_LOGGED.swap(true, Ordering::Relaxed) {
             kernel_hal::klog_info!(
-                "[drm] vblank catch-up: missed 60 Hz slot ({}us since last vblank) -- \
-                 delivering immediately; waiting another 16.7ms here was locking ~30 Hz",
+                "[drm] vblank catch-up: missed refresh slot ({}us since last vblank) -- \
+                 delivering immediately; waiting another full period here was locking half rate",
                 now.saturating_sub(st.next_vblank).as_micros()
             );
         }
-        // Record the 60 Hz cell we just completed, not `now`, so the next
+        // Record the period cell we just completed, not `now`, so the next
         // frame waits only the remainder of the current period.
-        let completed = (now_ns / VBLANK_PERIOD_NS) * VBLANK_PERIOD_NS;
+        let completed = (now_ns / period) * period;
         st.next_vblank = Duration::from_nanos(completed);
         now
     } else {
@@ -2221,23 +2371,20 @@ pub fn present_now_region(fb_id: u32, crtc_id: u32, rect: Option<(u32, u32, u32,
             _ => {}
         }
     }
-    let flipped = if software_kms_active() {
-        // No usable hardware KMS: blit the dumb buffer to the framebuffer.
-        scanout_region(fb_id, rect)
-    } else if let Some(driver) = get_primary_driver() {
-        // Translate core fb id to the driver's private fb id when available.
-        let driver_fb_id = DRM_STATE
-            .lock()
-            .framebuffers
-            .iter()
-            .find(|f| f.id == fb_id)
-            .and_then(|f| f.driver_fb_id)
-            .unwrap_or(fb_id);
-        // Hardware driver owns scanout; fall back to a software blit if it
-        // declines.
-        driver.page_flip(driver_fb_id) || scanout_region(fb_id, rect)
-    } else {
-        scanout_region(fb_id, rect)
+    let flipped = {
+        // Prefer a driver page_flip (NVC57E surfaceflip / CE hwflip) when the
+        // driver accepted the fb; fall back to GOP blit so a failed HW flip
+        // never blacks the panel.
+        let hw = get_primary_driver().and_then(|driver| {
+            let driver_fb_id = DRM_STATE
+                .lock()
+                .framebuffers
+                .iter()
+                .find(|f| f.id == fb_id)
+                .and_then(|f| f.driver_fb_id)?;
+            Some(driver.page_flip(driver_fb_id)).filter(|&ok| ok)
+        });
+        hw.unwrap_or(false) || scanout_region(fb_id, rect)
     };
     if flipped {
         set_crtc_fb(crtc_id, fb_id);
@@ -2247,12 +2394,12 @@ pub fn present_now_region(fb_id: u32, crtc_id: u32, rect: Option<(u32, u32, u32,
     flipped
 }
 
-/// Encode and enqueue a `struct drm_event_vblank` for the card fd.
+/// Encode and enqueue a `struct drm_event_vblank` for the given card fd.
 ///
 /// Shared by page-flip completions (`DRM_EVENT_FLIP_COMPLETE`) and vblank waits
 /// (`DRM_EVENT_VBLANK`), which use the identical 32-byte wire layout — only the
 /// `type` field distinguishes them for libdrm's event dispatcher.
-fn push_drm_event(ev_type: u32, crtc_id: u32, seq: u32, user_data: u64) {
+fn push_drm_event(file: &DrmFileState, ev_type: u32, crtc_id: u32, seq: u32, user_data: u64) {
     let now = kernel_hal::timer::timer_now();
     // struct drm_event_vblank { u32 type; u32 length; u64 user_data;
     //   u32 tv_sec; u32 tv_usec; u32 sequence; u32 crtc_id; }  (32 bytes)
@@ -2265,13 +2412,11 @@ fn push_drm_event(ev_type: u32, crtc_id: u32, seq: u32, user_data: u64) {
     buf[20..24].copy_from_slice(&now.subsec_micros().to_ne_bytes());
     buf[24..28].copy_from_slice(&seq.to_ne_bytes());
     buf[28..32].copy_from_slice(&crtc_id.to_ne_bytes());
-    let mut state = DRM_STATE.lock();
-    state.events.push_back(buf.to_vec());
-    state.eventbus.lock().set(Event::READABLE);
+    file.push_event(buf.to_vec());
 }
 
 /// Enqueue a `DRM_EVENT_FLIP_COMPLETE` for a completed page flip.
-fn queue_flip_event(crtc_id: u32, user_data: u64) {
+fn queue_flip_event(file: &DrmFileState, crtc_id: u32, user_data: u64) {
     const DRM_EVENT_FLIP_COMPLETE: u32 = 2;
     // Linux stamps a flip completion with the CRTC's vblank counter -- the
     // same counter WAIT_VBLANK reports. This used to be a private per-flip
@@ -2279,7 +2424,7 @@ fn queue_flip_event(crtc_id: u32, user_data: u64) {
     // time-based) and then got completions in the hundreds saw the MSC run
     // backwards (Xorg Present's target-MSC scheduling).
     let seq = vblank_seq_now();
-    push_drm_event(DRM_EVENT_FLIP_COMPLETE, crtc_id, seq, user_data);
+    push_drm_event(file, DRM_EVENT_FLIP_COMPLETE, crtc_id, seq, user_data);
     // Flip is complete from the KMS POV once the event is on the card fd —
     // a new PAGE_FLIP may be accepted even before userspace reads it.
     FLIP_EVENT_PENDING.store(false, Ordering::Release);
@@ -2287,20 +2432,21 @@ fn queue_flip_event(crtc_id: u32, user_data: u64) {
 
 /// Enqueue a `DRM_EVENT_VBLANK` for a `WAIT_VBLANK` request that asked for an
 /// event (`_DRM_VBLANK_EVENT`) instead of blocking.
-pub fn queue_vblank_event(seq: u32, user_data: u64) {
+pub fn queue_vblank_event(file: &DrmFileState, seq: u32, user_data: u64) {
     const DRM_EVENT_VBLANK: u32 = 1;
-    push_drm_event(DRM_EVENT_VBLANK, SYNTH_CRTC_ID, seq, user_data);
+    push_drm_event(file, DRM_EVENT_VBLANK, SYNTH_CRTC_ID, seq, user_data);
 }
 
-/// Synthetic 60 Hz vertical-blank counter derived from the monotonic clock.
+/// Synthetic vertical-blank counter derived from the monotonic clock and the
+/// active CRTC mode's refresh ([`vblank_period_ns`]).
 ///
 /// A software framebuffer has no real vblank interrupt, but `WAIT_VBLANK`
 /// callers expect a monotonically increasing sequence; deriving one from time
 /// keeps both absolute and relative queries sane. Uses the same period as
-/// [`VBLANK_PERIOD_NS`] so MSC and flip pacing cannot disagree.
+/// flip pacing so MSC and flip completions cannot disagree.
 pub fn vblank_seq_now() -> u32 {
     let now_ns = u64::try_from(kernel_hal::timer::timer_now().as_nanos()).unwrap_or(0);
-    (now_ns / VBLANK_PERIOD_NS) as u32
+    (now_ns / vblank_period_ns()) as u32
 }
 
 /// Monotonic deadline at which the synthetic vblank counter reaches `target`,
@@ -2313,43 +2459,14 @@ pub fn vblank_seq_now() -> u32 {
 /// wrap-around still resolves to "soon", not "two years from now".
 pub fn vblank_deadline_for_seq(target: u32) -> Option<Duration> {
     let now_ns = u64::try_from(kernel_hal::timer::timer_now().as_nanos()).unwrap_or(0);
-    let now_seq_full = now_ns / VBLANK_PERIOD_NS;
+    let period = vblank_period_ns();
+    let now_seq_full = now_ns / period;
     let ahead = target.wrapping_sub(now_seq_full as u32) as i32;
     if ahead <= 0 {
         return None;
     }
     let full = now_seq_full.saturating_add(ahead as u64);
-    Some(Duration::from_nanos(full.saturating_mul(VBLANK_PERIOD_NS)))
-}
-
-/// Pop one pending DRM event into `buf`, returning the number of bytes copied,
-/// or `None` if there are no events queued.
-pub fn read_event(buf: &mut [u8]) -> Option<usize> {
-    let mut state = DRM_STATE.lock();
-    let ev = state.events.front()?;
-    if buf.len() < ev.len() {
-        // Caller's buffer is too small for a whole event; libdrm always reads
-        // with a large buffer, so just report "nothing yet" rather than
-        // delivering a truncated, unparsable event.
-        return None;
-    }
-    let n = ev.len();
-    buf[..n].copy_from_slice(&ev[..n]);
-    state.events.pop_front();
-    if state.events.is_empty() {
-        state.eventbus.lock().clear(Event::READABLE);
-    }
-    Some(n)
-}
-
-/// Whether any DRM events are queued for reading.
-pub fn has_events() -> bool {
-    !DRM_STATE.lock().events.is_empty()
-}
-
-/// Expose the DRM event bus
-pub fn get_eventbus() -> Arc<Mutex<EventBus>> {
-    DRM_STATE.lock().eventbus.clone()
+    Some(Duration::from_nanos(full.saturating_mul(period)))
 }
 
 /// Create a KMS property blob (`DRM_IOCTL_MODE_CREATEPROPBLOB`) and return its
@@ -2432,10 +2549,17 @@ pub struct AtomicUpdate {
     pub src_w: Option<u32>,
     /// Plane "SRC_H" (16.16).
     pub src_h: Option<u32>,
+    /// Plane "IN_FENCE_FD" (`-1` = none). Staged for acceptance only; the
+    /// software pipeline does not wait on in-fences yet.
+    pub in_fence_fd: Option<i32>,
     /// CRTC "ACTIVE".
     pub active: Option<bool>,
     /// CRTC "MODE_ID" blob id (`Some(0)` clears the mode).
     pub mode_blob: Option<u32>,
+    /// CRTC "OUT_FENCE_PTR": userspace `*mut i32` to receive a sync_file fd.
+    /// Real out-fences need HW flip completion; we write a signaled stub fd
+    /// (or `-1`) so clients do not SIGBUS on an uninitialized pointer.
+    pub out_fence_ptr: Option<u64>,
     /// Connector "CRTC_ID" (`Some(0)` detaches the connector).
     pub connector_crtc_id: Option<u32>,
 }
@@ -2469,6 +2593,7 @@ pub fn atomic_commit(
     allow_modeset: bool,
     want_event: bool,
     user_data: u64,
+    file: &Arc<DrmFileState>,
 ) -> Result<(), AtomicError> {
     let (cur, _) = atomic_snapshot();
 
@@ -2608,6 +2733,7 @@ pub fn atomic_commit(
         if let Some(blob_id) = upd.mode_blob {
             if blob_id == 0 {
                 state.atomic.mode_blob_id = 0;
+                reset_vblank_period();
             } else if let Some(data) = state
                 .blobs
                 .iter()
@@ -2617,6 +2743,7 @@ pub fn atomic_commit(
                 // Copy the client's mode into a kernel-owned blob: the client
                 // may DESTROYPROPBLOB its own right after the commit (wlroots
                 // does), and MODE_ID readback must survive that.
+                set_vblank_period_from_modeinfo(&data);
                 let cur_id = state.atomic.mode_blob_id;
                 if let Some(existing) = state.blobs.iter_mut().find(|b| b.id == cur_id) {
                     existing.data = data;
@@ -2673,7 +2800,7 @@ pub fn atomic_commit(
         // Paced to the synthetic vblank (not delivered now) for the same
         // anti-spin reason as the legacy page-flip path. Busy was checked
         // above before present.
-        schedule_flip_event(SYNTH_CRTC_ID, user_data);
+        schedule_flip_event(SYNTH_CRTC_ID, user_data, file);
     }
     Ok(())
 }

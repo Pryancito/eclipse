@@ -29,14 +29,14 @@
 //! GPU really did write the fence), and CPU and GPU no longer serialise on
 //! every submission.
 //!
-//! [`wait`] is a bounded, CPU-spinning poll of that counter, not a real
-//! wait-queue: `linux-object`'s `io_control` (where these ioctls are
-//! dispatched) is a synchronous, non-async function, so there is no
-//! lower-cost way to block here without deeper scheduler surgery. This
-//! matches the spin-poll idiom already used throughout this codebase for
-//! bounded hardware waits (e.g. `nvidia.rs` `gmmu_flush`, `eclipse_rm_init.c`
-//! step18's semaphore poll) -- consistent, but real: a long wait pegs the
-//! CPU core handling the ioctl for its whole duration.
+//! [`wait`] is a bounded poll of that counter. Prefer the async sleep loop in
+//! `sys_ioctl` ([`wait_ready`] + `poll_pending`) before the sync `io_control`
+//! arm runs: that path yields the CPU. The spin inside [`wait`] remains as a
+//! short fallback when the condition is already met (or when a caller bypasses
+//! the async pre-wait). Long ago this module doc claimed spin-poll was the
+//! only option because `io_control` is synchronous; that is still true for the
+//! inode path itself, but `sys_ioctl` now sleeps first for
+//! `SYNCOBJ_WAIT`/`TIMELINE_WAIT` the same way it does for `WAIT_VBLANK`.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -45,6 +45,13 @@ use lock::Mutex;
 struct Syncobj {
     handle: u32,
     point: u64,
+    /// Live references: the creating handle starts at 1; each
+    /// `SYNCOBJ_HANDLE_TO_FD` export (and each `dup` of that fd) bumps it.
+    /// [`destroy`] only removes the object when this drops to zero, so an
+    /// exported fd keeps the syncobj alive past `SYNCOBJ_DESTROY` — matching
+    /// real DRM (and fixing the stale-handle window the old no-refcount
+    /// table left for Mesa fence export).
+    refs: u32,
     /// A pending `sync_file` import (see [`import_snapshot`]): this object
     /// also counts as signaled — binary point 1 — once `src` reaches
     /// `target`. `None` for the normal case, and cleared whenever the object
@@ -59,11 +66,16 @@ struct Syncobj {
 /// own scratch buffer, see `eclipse_rm_exec_fast_prepare`); `payload` is a
 /// per-context monotonic sequence, so landing is a wrapping `>=`, which
 /// stays correct when several fences share one landing zone.
+/// `fence_gpu_va` is the same semaphore in the *producer* channel's GPU VA
+/// space (`buf_gpu_va + fence_sem_off`); 0 means unknown (CPU wait only for
+/// cross-ctx ACQUIRE scaffolding).
 #[derive(Clone, Copy)]
 struct PendingFence {
     handle: u32,
     point: u64,
     fence_va: usize,
+    /// Producer-ctx GPU VA of the fence semaphore; 0 = unknown.
+    fence_gpu_va: u64,
     payload: u32,
     /// GPU context (channel) the fence was submitted on: lets a submit on
     /// the SAME channel treat the fence as already ordered before it
@@ -117,7 +129,7 @@ static PENDING_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// old synchronous poll used, so the behaviour on a GPU hang is unchanged:
 /// the context is latched wedged (via the timeout hook) and the waiter is
 /// released instead of parking forever.
-const FENCE_TIMEOUT_US: u64 = 1_000_000;
+const FENCE_TIMEOUT_US: u64 = 10_000_000;
 
 /// Optional upcall fired whenever a syncobj point advances, so an upper layer
 /// (linux-object) can service `SYNCOBJ_EVENTFD` registrations — deliver an
@@ -296,6 +308,8 @@ pub fn has_pending() -> bool {
 
 /// Make `handle` reach `point` once the GPU writes `>= payload` into the u32
 /// at `fence_va` (a kernel mapping of pinned sysmem that outlives the fence).
+/// `fence_gpu_va` is the producer channel's GPU VA of that semaphore
+/// (`buf_gpu_va + fence_sem_off`); pass 0 if unknown.
 /// Resolves immediately if the fence already landed (a fast GPU). Like a
 /// direct signal, this REPLACES an imported `sync_file` fence the object
 /// carried. Returns `false` for an unknown handle.
@@ -303,6 +317,7 @@ pub fn attach_hw_fence(
     handle: u32,
     point: u64,
     fence_va: usize,
+    fence_gpu_va: u64,
     payload: u32,
     ctx_idx: u32,
 ) -> bool {
@@ -323,6 +338,7 @@ pub fn attach_hw_fence(
             handle,
             point,
             fence_va,
+            fence_gpu_va,
             payload,
             ctx_idx,
             submitted_us: now_us(),
@@ -380,19 +396,70 @@ pub fn create(signaled: bool) -> u32 {
     TABLE.lock().objects.push(Syncobj {
         handle,
         point: if signaled { 1 } else { 0 },
+        refs: 1,
         linked: None,
     });
     handle
 }
 
-/// Destroys a syncobj. Returns `false` if `handle` is unknown.
+/// Adds one reference to `handle` (an fd export / `dup`). Returns `false` if
+/// the handle is unknown.
+pub fn add_ref(handle: u32) -> bool {
+    let mut table = TABLE.lock();
+    let Some(obj) = table.objects.iter_mut().find(|o| o.handle == handle) else {
+        return false;
+    };
+    obj.refs = obj.refs.saturating_add(1);
+    true
+}
+
+/// Drops one reference to `handle`. If other refs remain the object stays;
+/// only the last reference removes it (and its pending fences). Returns
+/// `false` if `handle` is unknown.
 pub fn destroy(handle: u32) -> bool {
     let mut table = TABLE.lock();
-    let len_before = table.objects.len();
-    table.objects.retain(|o| o.handle != handle);
+    let Some(pos) = table.objects.iter().position(|o| o.handle == handle) else {
+        return false;
+    };
+    if table.objects[pos].refs > 1 {
+        table.objects[pos].refs -= 1;
+        return true;
+    }
+    table.objects.swap_remove(pos);
     table.pending.retain(|f| f.handle != handle);
     PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
-    table.objects.len() != len_before
+    true
+}
+
+/// If `handle` has an unresolved HW fence that will deliver at least `point`,
+/// return `(fence_va_cpu, fence_gpu_va, payload, ctx_idx)`. Used by EXEC to
+/// emit a GPU ACQUIRE instead of spinning on the CPU. `fence_gpu_va` is 0
+/// when the producer did not publish one.
+pub fn pending_hw_fence(handle: u32, point: u64) -> Option<(usize, u64, u32, u32)> {
+    let (r, deferred) = {
+        let mut table = TABLE.lock();
+        let d = resolve_locked(&mut table);
+        // Binary waits (point 0/1): the highest pending fence on this handle.
+        // Timeline: the lowest pending fence that covers `point`.
+        let found = if point <= 1 {
+            table
+                .pending
+                .iter()
+                .filter(|f| f.handle == handle)
+                .max_by_key(|f| f.point)
+                .map(|f| (f.fence_va, f.fence_gpu_va, f.payload, f.ctx_idx))
+        } else {
+            table
+                .pending
+                .iter()
+                .filter(|f| f.handle == handle && f.point >= point)
+                .min_by_key(|f| f.point)
+                .map(|f| (f.fence_va, f.fence_gpu_va, f.payload, f.ctx_idx))
+        };
+        (found, d)
+    };
+    deferred.run();
+    r
 }
 
 /// Binary signal (point = 1). Returns `false` if `handle` is unknown.
@@ -556,6 +623,7 @@ pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
                     handle: dst,
                     point,
                     fence_va: f.fence_va,
+                    fence_gpu_va: f.fence_gpu_va,
                     payload: f.payload,
                     ctx_idx: f.ctx_idx,
                     submitted_us: f.submitted_us,
@@ -648,7 +716,9 @@ pub enum WaitOutcome {
 /// (absolute microseconds, same clock as [`crate::bus::drivers_timer_now_as_micros`])
 /// passes. `points`, if given, is per-handle target points
 /// (`SYNCOBJ_TIMELINE_WAIT`); `None` means "target = 1" for every handle
-/// (binary `SYNCOBJ_WAIT`). Spin-polls -- see the module doc for why.
+/// (binary `SYNCOBJ_WAIT`). After the async pre-wait in `sys_ioctl`, this
+/// normally returns on the first iteration; the loop is the fallback when
+/// called without that sleep (e.g. EXEC's CPU wait path).
 pub fn wait(
     handles: &[u32],
     points: Option<&[u64]>,
@@ -683,6 +753,81 @@ pub fn wait_ordered(
     ctx_idx: u32,
 ) -> WaitOutcome {
     wait_inner(handles, points, true, deadline_us, Some(ctx_idx), false)
+}
+
+/// Non-blocking probe for the async sleep loop in `sys_ioctl` (mirrors
+/// `WAIT_VBLANK`'s pre-`io_control` sleep). Call [`poll_pending`] first, then
+/// this. Returns:
+/// - `Some(Ok(first_signaled_index))` if the wait condition is already met
+/// - `Some(Err(WaitOutcome::Timeout))` if past `deadline_us` and still unmet
+/// - `Some(Err(WaitOutcome::Invalid))` if a handle is unknown
+/// - `None` if the caller should sleep (~1 ms or until the deadline) and retry
+pub fn wait_ready(
+    handles: &[u32],
+    points: Option<&[u64]>,
+    wait_all: bool,
+    deadline_us: u64,
+) -> Option<core::result::Result<u32, WaitOutcome>> {
+    wait_ready_inner(handles, points, wait_all, deadline_us, false)
+}
+
+/// [`wait_ready`] with `WAIT_AVAILABLE`: a pending hardware fence covering the
+/// target counts as satisfied.
+pub fn wait_available_ready(
+    handles: &[u32],
+    points: Option<&[u64]>,
+    wait_all: bool,
+    deadline_us: u64,
+) -> Option<core::result::Result<u32, WaitOutcome>> {
+    wait_ready_inner(handles, points, wait_all, deadline_us, true)
+}
+
+fn wait_ready_inner(
+    handles: &[u32],
+    points: Option<&[u64]>,
+    wait_all: bool,
+    deadline_us: u64,
+    available_only: bool,
+) -> Option<core::result::Result<u32, WaitOutcome>> {
+    let mut signaled_count = 0usize;
+    let mut first_signaled: Option<u32> = None;
+    let deferred = {
+        let mut table = TABLE.lock();
+        let d = resolve_locked(&mut table);
+        for (i, &h) in handles.iter().enumerate() {
+            let Some(point) = effective_point(&table.objects, h, LINK_DEPTH) else {
+                drop(table);
+                d.run();
+                return Some(Err(WaitOutcome::Invalid));
+            };
+            let target = points.map(|p| p[i]).unwrap_or(1);
+            let pending_covers = available_only
+                && table
+                    .pending
+                    .iter()
+                    .any(|f| f.handle == h && f.point >= target);
+            if point >= target || pending_covers {
+                signaled_count += 1;
+                if first_signaled.is_none() {
+                    first_signaled = Some(i as u32);
+                }
+            }
+        }
+        d
+    };
+    deferred.run();
+    let done = if wait_all {
+        signaled_count == handles.len()
+    } else {
+        signaled_count > 0 && !handles.is_empty()
+    };
+    if done {
+        return Some(Ok(first_signaled.unwrap_or(0)));
+    }
+    if now_us() >= deadline_us {
+        return Some(Err(WaitOutcome::Timeout));
+    }
+    None
 }
 
 fn wait_inner(
@@ -802,8 +947,8 @@ fn stall_report(handles: &[u32], points: Option<&[u64]>, wait_all: bool, remaini
 /// does not exist (`+N` = a hardware fence for point N is still in flight).
 /// The one line that turns "a wait timed out" into "THIS fence never
 /// arrived", so every caller that gives up on a wait should print it — the
-/// stall reporter above, and the driver's own `EXEC` timeout, whose 1 s
-/// deadline expires long before this reporter's 2 s threshold and used to
+/// stall reporter above, and the driver's own `EXEC` timeout, whose 10 s
+/// deadline expires long after this reporter's 2 s threshold and used to
 /// report nothing but a count.
 pub fn describe(handles: &[u32], points: Option<&[u64]>) -> alloc::string::String {
     let mut list = alloc::string::String::new();

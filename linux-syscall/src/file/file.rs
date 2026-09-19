@@ -1130,7 +1130,18 @@ impl Syscall<'_> {
                 );
                 return Err(LxError::EINVAL);
             };
-            let new_fd = proc.add_file(SyncobjHandle::new_sync_file(h.handle, point))?;
+            // Fd holds a syncobj ref so SYNCOBJ_DESTROY cannot free it while
+            // the sync_file is still live (Drop on SyncobjHandle dec_refs).
+            if !kernel_hal::drivers::scheme::syncobj::add_ref(h.handle) {
+                return Err(LxError::EINVAL);
+            }
+            let new_fd = match proc.add_file(SyncobjHandle::new_sync_file(h.handle, point)) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    let _ = kernel_hal::drivers::scheme::syncobj::destroy(h.handle);
+                    return Err(e);
+                }
+            };
             h.fd = i32::from(new_fd);
             if let Err(e) = ptr.write(h) {
                 warn!("[drm] SYNCOBJ export sync_file write-back EFAULT: {:?}", e);
@@ -1170,11 +1181,17 @@ impl Syscall<'_> {
                 );
                 return Err(LxError::EINVAL);
             }
+            // Fd holds a syncobj ref so SYNCOBJ_DESTROY cannot free it while
+            // the exported fd is still live (Drop on SyncobjHandle dec_refs).
+            if !kernel_hal::drivers::scheme::syncobj::add_ref(h.handle) {
+                return Err(LxError::EINVAL);
+            }
             let file = SyncobjHandle::new(h.handle);
             let new_fd = match proc.add_file(file) {
                 Ok(fd) => fd,
                 Err(e) => {
                     warn!("[drm] SYNCOBJ_HANDLE_TO_FD add_file {:?}", e);
+                    let _ = kernel_hal::drivers::scheme::syncobj::destroy(h.handle);
                     return Err(e);
                 }
             };
@@ -1377,6 +1394,24 @@ impl Syscall<'_> {
                     .downcast_ref::<linux_object::fs::devfs::DrmDev>()
                 {
                     dev.wait_vblank_sleep(arg1).await;
+                }
+            }
+        }
+        // Same async-sleep-before-sync-io_control pattern for SYNCOBJ_WAIT /
+        // TIMELINE_WAIT (classic + deadline-sized). Without this the sync arm
+        // spin-polls the whole timeout and pegs a core — the same starvation
+        // WAIT_VBLANK used to cause.
+        {
+            let syncobj_cmd = request as u32;
+            if linux_object::fs::devfs::drm_scheme::is_syncobj_wait_ioctl(syncobj_cmd) {
+                if let Some(file) = file_like.downcast_ref::<File>() {
+                    if let Some(dev) = file
+                        .inode()
+                        .as_any_ref()
+                        .downcast_ref::<linux_object::fs::devfs::DrmDev>()
+                    {
+                        dev.syncobj_wait_sleep(syncobj_cmd, arg1).await;
+                    }
                 }
             }
         }

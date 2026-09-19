@@ -106,15 +106,17 @@ pub fn add_ref(handle: u32, pid: u64) -> Option<u32> {
 }
 
 /// Whether `pid` holds a reference to `handle`. Pid 0 (a call with no current
-/// thread -- kernel-internal) and an untracked handle answer `true`: the
-/// caller's own bookkeeping decides those.
+/// thread -- kernel-internal) answers `true`. An untracked **nouveau-range**
+/// handle (`>= 0x8000_0000`) answers `false` so a guess cannot map/bind/close
+/// someone else's GEM; untracked low-range (dumb/generic) handles still
+/// answer `true` so `linux-object`'s own table remains authoritative there.
 pub fn holds(handle: u32, pid: u64) -> bool {
     if pid == 0 {
         return true;
     }
     match MAPPINGS.lock().iter().find(|e| e.handle == handle) {
         Some(e) => e.holders.contains(&pid),
-        None => true,
+        None => handle < 0x8000_0000,
     }
 }
 
@@ -191,6 +193,14 @@ pub fn lookup(handle: u32) -> Option<(u64, u64)> {
         .iter()
         .find(|e| e.handle == handle)
         .map(|e| (e.phys_addr, e.size))
+}
+
+/// Like [`lookup`], but only if [`holds`] says `pid` may use `handle`.
+pub fn lookup_for(handle: u32, pid: u64) -> Option<(u64, u64)> {
+    if !holds(handle, pid) {
+        return None;
+    }
+    lookup(handle)
 }
 
 /// Reverse lookup: which driver-private GEM handle owns the object whose

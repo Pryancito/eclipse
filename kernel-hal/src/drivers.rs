@@ -169,6 +169,23 @@ pub fn set_nouveau_uapi_enabled(v: bool) {
     zcore_drivers::display::set_nouveau_uapi_enabled(v);
 }
 
+/// Enables on-demand console-GPU GSP bring-up (`nvidia.console_gsp`). Default off.
+#[cfg(target_arch = "x86_64")]
+pub fn set_console_gsp_enabled(v: bool) {
+    zcore_drivers::display::set_console_gsp_enabled(v);
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_console_gsp_enabled(_v: bool) {}
+
+#[cfg(target_arch = "x86_64")]
+pub fn console_gsp_enabled() -> bool {
+    zcore_drivers::display::console_gsp_enabled()
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn console_gsp_enabled() -> bool {
+    false
+}
+
 /// Hands the NVIDIA RM a provider of real per-thread identity (see
 /// `zcore_drivers::display::set_rm_thread_id_provider`). No-op off x86_64.
 #[cfg(target_arch = "x86_64")]
@@ -190,6 +207,40 @@ pub fn set_exec_fast_enabled(v: bool) {
 }
 #[cfg(not(target_arch = "x86_64"))]
 pub fn set_exec_fast_enabled(_v: bool) {}
+
+/// Opt-in CE present on DRM `page_flip` (`nvidia.hwflip`). Default off.
+#[cfg(target_arch = "x86_64")]
+pub fn set_hwflip_enabled(v: bool) {
+    zcore_drivers::display::set_hwflip_enabled(v);
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_hwflip_enabled(_v: bool) {}
+
+#[cfg(target_arch = "x86_64")]
+pub fn hwflip_enabled() -> bool {
+    zcore_drivers::display::hwflip_enabled()
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn hwflip_enabled() -> bool {
+    false
+}
+
+/// Opt-in NVC57E ISO surface flip (`nvidia.surfaceflip`). Default off.
+#[cfg(target_arch = "x86_64")]
+pub fn set_surfaceflip_enabled(v: bool) {
+    zcore_drivers::display::set_surfaceflip_enabled(v);
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_surfaceflip_enabled(_v: bool) {}
+
+#[cfg(target_arch = "x86_64")]
+pub fn surfaceflip_enabled() -> bool {
+    zcore_drivers::display::surfaceflip_enabled()
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn surfaceflip_enabled() -> bool {
+    false
+}
 
 /// Whether the nouveau-compatible ioctl surface is currently enabled --
 /// the read side of [`set_nouveau_uapi_enabled`], needed by

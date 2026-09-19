@@ -324,44 +324,22 @@ escalera compartida `step16` (client/device/subdevice) se construyen hasta
 
 ## Huecos conocidos y qué se necesita para cerrarlos
 
-- **`EXEC` con `wait_count > 0` espera por CPU, no por hardware** (salvo
-  las fences pendientes del mismo canal, que la ruta directa da por
-  ordenadas — ver «Submit directo»): bloquea
-  la propia llamada al ioctl (con `crate::scheme::syncobj::wait`,
-  `wait_all=true`, timeout fijo de 1 s para el arreglo completo) hasta
-  que TODOS los syncobjs de espera señalen, y SOLO ENTONCES somete el
-  *pushbuffer* del caller. El contrato observable para un
-  caller síncrono es el mismo que el real ("este `EXEC` no empieza a
-  ejecutar antes de que la fence de espera señale"), pero el mecanismo
-  interno es distinto: el nouveau real hace que el propio canal de
-  hardware ejecute un método `ACQUIRE` de semáforo antes del contenido
-  del caller, de modo que la llamada de envío vuelve de inmediato y
-  varios envíos dependientes pueden solaparse en el tiempo. Aquí NO
-  pueden solaparse — cada `EXEC` con espera ocupa el hilo que hizo el
-  ioctl hasta que su propia espera se resuelve. Un `ACQUIRE` real de
-  hardware sería una pieza nueva de RM (un método más en el *pushbuffer*
-  del canal, antes del contenido del caller) — no hecha aquí.
+- **`EXEC` con `wait_count > 0`**: same-ctx usa **ACQUIRE HW** en el
+  pushbuffer (`sem_acquire_stream` + GP entry antes de los pushes del
+  cliente). Cross-ctx sigue en espera CPU (10 s). Un ACQUIRE real entre
+  canales distintos necesitaría la VA GPU del semáforo del otro ctx.
 - **`SYNCOBJ_WAIT`/`TIMELINE_WAIT` por sondeo, no cola de espera real**:
   ver la tabla de arriba — ocupa un core de CPU durante la espera.
-- **`HANDLE_TO_FD`/`FD_TO_HANDLE` sin refcounting real**: la tabla de
-  syncobjs no lleva conteo de referencias — `SYNCOBJ_DESTROY` borra la
-  entrada sin importar cuántos fds exportados sigan vivos. En DRM real,
-  un fd exportado mantiene vivo el objeto del kernel más allá de un
-  `SYNCOBJ_DESTROY` sobre el handle que lo exportó; aquí, tras destruir
-  el handle, un `SYNCOBJ_FD_TO_HANDLE` posterior sobre un fd ya
-  exportado devuelve un número de handle que simplemente ya no está en
-  la tabla — el mismo error "handle desconocido" que ya da `WAIT`/
-  `SIGNAL`/`QUERY` para cualquier otro handle inválido. No es un
-  cuelgue ni un crash, pero es una vida útil más corta que la real.
-- **`sync_file` modelado como par (syncobj, punto)**, no como el objeto
-  POSIX de otro subsistema: no hay `poll()` sobre el fd ni fusión de
-  varias fences en una (`sync_file` real permite ambas cosas). Sirve
-  para lo que lo usa Mesa — exportar la fence recién completada e
-  importarla en otro syncobj — y descansa en que la submisión aquí es
-  síncrona: cuando `EXEC` retorna, el trabajo ya terminó, así que la
-  fence exportada ya está satisfecha. Un `sync_file` importado a mano
-  antes de que su fuente avance sí queda registrado como dependencia y
-  se resuelve solo.
+- **Syncobj refcount**: `CREATE` arranca en refs=1; `HANDLE_TO_FD` hace
+  `add_ref`; `DESTROY`/cierre del fd decrementa; el objeto sólo muere al
+  llegar a 0 (antes un DESTROY mataba fds exportados).
+- **Consola GPU GSP**: el auto-bringup on-demand está **opt-in** con
+  `nvidia.console_gsp` (además de `nvidia.nouveau_uapi`). Sin él, hace
+  falta `cat /proc/gpustep14` a mano.
+- **Prime GRAPHICS**: `ctx_prime` exige compute+3D; un fallo **descarta** el
+  contexto (software fallback) en vez de publicar READY y colgar FECS en el
+  primer draw. `step18` también prima GRAPHICS en ctx0. Timeout de prime =
+  3 s.
 - **`VM_BIND` con `op_count` > 1 no es atómico**: cada op se aplica en
   orden con su propia llamada real a RM; si `op[i]` falla, `op[0..i]`
   ya se aplicaron y quedan así, y `op[i+1..]` nunca corren. Coincide

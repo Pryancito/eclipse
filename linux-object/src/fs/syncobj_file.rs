@@ -8,15 +8,12 @@
 //! unlike a real dma-buf, which carries actual backing memory, "export"
 //! here doesn't move or copy any state: the handle number is already
 //! globally valid, and this file just carries it across the fd boundary.
-//! "Import" hands back that same handle number. Closing the exported fd
-//! does NOT destroy the underlying syncobj -- `SYNCOBJ_DESTROY` is still
-//! the only way to remove one, consistent with the syncobj table having no
-//! refcounting at all (a real DRM syncobj fd keeps the kernel object alive
-//! past a `SYNCOBJ_DESTROY` on the handle that exported it; here, once the
-//! handle is destroyed, an already-exported fd holds a stale handle number
-//! that reads back the same "unknown handle" errors `WAIT`/`SIGNAL`/`QUERY`
-//! already give for any other bad handle -- not a crash, just a known,
-//! documented simplification).
+//! "Import" hands back that same handle number.
+//!
+//! Each exported fd holds a reference on the syncobj (`add_ref` at export /
+//! `dup`, [`destroy`](zcore_drivers::scheme::syncobj::destroy) on Drop), so
+//! `SYNCOBJ_DESTROY` on the creating handle does not free an object that still
+//! has live fds — matching real DRM.
 
 use super::*;
 use zircon_object::object::*;
@@ -60,6 +57,13 @@ impl SyncobjHandle {
     }
 }
 
+impl Drop for SyncobjHandle {
+    fn drop(&mut self) {
+        // Last fd reference: drop the syncobj table ref taken at export/dup.
+        let _ = zcore_drivers::scheme::syncobj::destroy(self.handle);
+    }
+}
+
 #[async_trait]
 impl FileLike for SyncobjHandle {
     fn flags(&self) -> OpenFlags {
@@ -71,6 +75,8 @@ impl FileLike for SyncobjHandle {
     }
 
     fn dup(&self) -> Arc<dyn FileLike> {
+        // Another fd reference — bump the syncobj refcount to match Drop.
+        let _ = zcore_drivers::scheme::syncobj::add_ref(self.handle);
         Arc::new(Self {
             base: KObjectBase::new(),
             handle: self.handle,
@@ -107,7 +113,7 @@ impl FileLike for SyncobjHandle {
             read: false,
             write: false,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
 }

@@ -785,8 +785,8 @@ impl FileLike for File {
                         // future — deep enough under page-flip storms to
                         // contribute to coroutine stack overflow at labwc start.
                         use super::devfs::DrmDev;
-                        if inode.downcast_ref::<DrmDev>().is_some() {
-                            let bus = super::devfs::drm::get_eventbus();
+                        if let Some(drmdev) = inode.downcast_ref::<DrmDev>() {
+                            let bus = drmdev.file_state().eventbus();
                             crate::sync::wait_for_event(bus, crate::sync::Event::READABLE).await;
                         } else {
                             inode.async_poll().await?;
@@ -846,8 +846,8 @@ impl FileLike for File {
                     }
                     Err(FsError::Again) => {
                         use super::devfs::DrmDev;
-                        if inode.downcast_ref::<DrmDev>().is_some() {
-                            let bus = super::devfs::drm::get_eventbus();
+                        if let Some(drmdev) = inode.downcast_ref::<DrmDev>() {
+                            let bus = drmdev.file_state().eventbus();
                             crate::sync::wait_for_event(bus, crate::sync::Event::READABLE).await;
                         } else {
                             inode.async_poll().await?;
@@ -947,8 +947,8 @@ impl FileLike for File {
         // DRM card fd: park on the shared DRM event bus (same detection the
         // blocking-read path uses above).
         use super::devfs::DrmDev;
-        if inode.downcast_ref::<DrmDev>().is_some() {
-            let bus = super::devfs::drm::get_eventbus();
+        if let Some(drmdev) = inode.downcast_ref::<DrmDev>() {
+            let bus = drmdev.file_state().eventbus();
             let mask = super::poll_events_to_bus_mask(events);
             return Some(crate::sync::subscribe_readiness_on(&bus, mask, waker));
         }
