@@ -1316,6 +1316,39 @@ impl NvidiaGpu {
             .copied()
     }
 
+    /// Drop every KMS framebuffer built on `handle_id`, and unlatch it from
+    /// the CRTC and the plane if it was still scanning out.
+    ///
+    /// This must run BEFORE the backing memory goes back to its allocator.
+    /// A `NvidiaKmsFramebuffer` caches `phys_addr`/`h_memory` at `create_fb`
+    /// time, and `present_kms_fb`/`page_flip` read them with no further
+    /// lookup, so an fb left behind scans out whatever the allocator hands
+    /// the next caller.
+    ///
+    /// Returns the ids it removed, for logging.
+    fn drop_kms_fbs_for_handle(&self, handle_id: u32) -> Vec<u32> {
+        let removed_ids: Vec<u32> = {
+            let mut fbs = self.kms_framebuffers.lock();
+            let ids: Vec<u32> = fbs
+                .iter()
+                .filter(|fb| fb.handle_id == handle_id)
+                .map(|fb| fb.id)
+                .collect();
+            fbs.retain(|fb| fb.handle_id != handle_id);
+            ids
+        };
+        if !removed_ids.is_empty() {
+            let mut state = self.kms_state.lock();
+            if removed_ids.iter().any(|id| *id == state.crtc_fb) {
+                state.crtc_fb = 0;
+            }
+            if removed_ids.iter().any(|id| *id == state.plane_fb) {
+                state.plane_fb = 0;
+            }
+        }
+        removed_ids
+    }
+
     fn kms_fb(&self, fb_id: u32) -> Option<NvidiaKmsFramebuffer> {
         self.kms_framebuffers
             .lock()
@@ -7410,6 +7443,22 @@ impl DrmScheme for NvidiaGpu {
         let Some(obj) = removed else {
             return false;
         };
+        // Drop any KMS framebuffer built on this handle BEFORE `gem_free`
+        // below hands its VRAM back. `create_fb` accepts a nouveau GEM object
+        // as fb backing and caches its `phys_addr`/`h_memory`, but only the
+        // PRIME path (`free_buffer`) used to clear those fbs again -- so a
+        // compositor doing the normal ADDFB -> GEM_CLOSE dance on a nouveau
+        // buffer left an fb pointing into freed VRAM, and the next present or
+        // flip scanned out whatever had since been allocated there.
+        let dropped_fbs = self.drop_kms_fbs_for_handle(handle);
+        if !dropped_fbs.is_empty() {
+            log::info!(
+                "[nouveau-uapi] GEM_CLOSE handle={} dropped {} KMS fb(s): {:?}",
+                handle,
+                dropped_fbs.len(),
+                dropped_fbs
+            );
+        }
         // Drain any VM_BIND mappings still referencing this handle BEFORE
         // freeing the backing memory below -- the real nouveau contract
         // expects UNMAP before CLOSE, but a caller that skips it shouldn't
@@ -7469,25 +7518,7 @@ impl DrmScheme for NvidiaGpu {
 
     fn free_buffer(&self, handle: GemHandle) {
         self.imported_handles.lock().retain(|h| h.id != handle.id);
-        let removed_ids: Vec<u32> = {
-            let mut fbs = self.kms_framebuffers.lock();
-            let ids: Vec<u32> = fbs
-                .iter()
-                .filter(|fb| fb.handle_id == handle.id)
-                .map(|fb| fb.id)
-                .collect();
-            fbs.retain(|fb| fb.handle_id != handle.id);
-            ids
-        };
-        if !removed_ids.is_empty() {
-            let mut state = self.kms_state.lock();
-            if removed_ids.iter().any(|id| *id == state.crtc_fb) {
-                state.crtc_fb = 0;
-            }
-            if removed_ids.iter().any(|id| *id == state.plane_fb) {
-                state.plane_fb = 0;
-            }
-        }
+        self.drop_kms_fbs_for_handle(handle.id);
         if let Some(ref mut a) = *self.vram_allocator.lock() {
             a.free(handle.phys_addr, handle.size);
         }
@@ -8126,6 +8157,25 @@ impl DrmScheme for NvidiaGpu {
                 }
             }
             // Phase 4: free RM memory outside every lock.
+            //
+            // Drop each handle's KMS framebuffers first, for the reason spelled
+            // out in `nouveau_gem_close`: an fb caches the backing
+            // `phys_addr`/`h_memory`, so one left behind scans out VRAM that
+            // `gem_free` has already returned to the allocator. This path is
+            // the likelier way to hit that -- a client killed or crashed
+            // mid-session never issues the GEM_CLOSE that would have cleaned up.
+            for (handle, _, _) in &to_free_mem {
+                let dropped = self.drop_kms_fbs_for_handle(*handle);
+                if !dropped.is_empty() {
+                    log::info!(
+                        "[nouveau-uapi] process exit pid={}: handle={} dropped {} KMS fb(s): {:?}",
+                        pid,
+                        handle,
+                        dropped.len(),
+                        dropped
+                    );
+                }
+            }
             let mut bytes = 0u64;
             for (handle, h_memory, size) in &to_free_mem {
                 lock::pump();
