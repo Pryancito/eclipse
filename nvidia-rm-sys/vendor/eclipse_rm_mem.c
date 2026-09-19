@@ -175,10 +175,11 @@ NV_STATUS osMapSystemMemory(
     return NV_OK;
 }
 
+/* 580.178.04 dropped the ProcessId argument (same change as memdescUnmap):
+ * it was only ever meaningful for user-space mappings. */
 void osUnmapSystemMemory(
     MEMORY_DESCRIPTOR *pMemDesc,
     NvBool             Kernel,
-    NvU32              ProcessId,
     NvP64              pAddress,
     NvP64              pPrivate
 )
@@ -188,7 +189,6 @@ void osUnmapSystemMemory(
      * osFreePagesInternal). */
     (void) pMemDesc;
     (void) Kernel;
-    (void) ProcessId;
     (void) pAddress;
     (void) pPrivate;
 }
