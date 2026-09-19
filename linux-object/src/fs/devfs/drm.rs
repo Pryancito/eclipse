@@ -491,13 +491,201 @@ pub fn get_primary_driver() -> Option<Arc<dyn DrmScheme>> {
     DRM_STATE.lock().drivers.first().cloned()
 }
 
-/// DRM minor of the compute-only primary node (`/dev/dri/card1`).
-pub const COMPUTE_CARD_MINOR: u32 = 1;
-/// DRM minor of the compute-only render node (`/dev/dri/renderD129`).
-pub const COMPUTE_RENDER_MINOR: u32 = 129;
+/// Base minor of the render-node range, as Linux allocates them: primary
+/// nodes are `card0..card63`, render nodes `renderD128..renderD191`.
+pub const RENDER_MINOR_BASE: u32 = 128;
+/// How many GPUs get a node pair. This is Linux's primary-minor range
+/// (`card0..card63`), which is stricter than the point where the two ranges
+/// would actually collide (`card128` would be `renderD128`'s minor). Staying
+/// inside the convention keeps `/dev/dri` names meaning to userspace what they
+/// mean on Linux, and leaves the render range untouched with 64 to spare.
+pub const MAX_GPU_NODES: u32 = 64;
 
+/// The node name Linux would give this minor: `card{n}` below the render base,
+/// `renderD{n}` at or above it.
+///
+/// Derived, not a lookup table. The four names this used to `match` on were
+/// the whole vocabulary — a third GPU's node came out as the literal `card?`.
+pub fn node_name(minor: u32) -> alloc::string::String {
+    if minor >= RENDER_MINOR_BASE {
+        alloc::format!("renderD{}", minor)
+    } else {
+        alloc::format!("card{}", minor)
+    }
+}
+
+/// Which pair of `/dev/dri` minors belongs to the GPU at a given index.
+///
+/// Separate from [`GpuNode`] because the layout is a property of the index
+/// alone: sysfs asks "what minor would GPU 2 have" without holding a driver,
+/// and the arithmetic is testable on its own.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NodeMinors {
+    index: u32,
+}
+
+impl NodeMinors {
+    /// The node pair for the GPU at `index` (0 = the primary GPU).
+    pub const fn new(index: u32) -> Self {
+        Self { index }
+    }
+    /// Minor of the primary node (`card{index}`).
+    pub const fn card(&self) -> u32 {
+        self.index
+    }
+    /// Minor of the render node (`renderD{128 + index}`).
+    pub const fn render(&self) -> u32 {
+        RENDER_MINOR_BASE + self.index
+    }
+    /// True when `minor` is either of this pair.
+    pub const fn owns(&self, minor: u32) -> bool {
+        minor == self.card() || minor == self.render()
+    }
+}
+
+/// One GPU and the pair of `/dev/dri` nodes that belong to it.
+///
+/// Index 0 is the GPU behind `card0` / `renderD128`: the one that scans out
+/// the console, which is what every KMS client must land on. Index 1 and up
+/// are the compute GPUs, in a **stable** order (see [`build_gpu_nodes`]), so
+/// `card1` names the same physical card across reboots.
+#[derive(Clone)]
+pub struct GpuNode {
+    /// 0 for the console/primary GPU, 1.. for each compute GPU.
+    pub index: u32,
+    /// The driver that serves both of this GPU's nodes.
+    pub driver: Arc<dyn DrmScheme>,
+}
+
+impl GpuNode {
+    /// The minors this GPU's two nodes use.
+    pub fn minors(&self) -> NodeMinors {
+        NodeMinors::new(self.index)
+    }
+    /// Minor of this GPU's primary node (`card{n}`).
+    pub fn card_minor(&self) -> u32 {
+        self.minors().card()
+    }
+    /// Minor of this GPU's render node (`renderD{128 + n}`).
+    pub fn render_minor(&self) -> u32 {
+        self.minors().render()
+    }
+    /// True when `minor` is either of this GPU's two nodes.
+    pub fn owns_minor(&self, minor: u32) -> bool {
+        self.minors().owns(minor)
+    }
+}
+
+static GPU_NODES: Mutex<Vec<GpuNode>> = Mutex::new(Vec::new());
+
+/// Work out which GPU owns which `/dev/dri` node, once, at filesystem setup.
+///
+/// The order is deliberate, because it is what userspace sees, and the first
+/// two entries are deliberately **exactly what this box already had** before
+/// the table existed:
+///
+/// * Index 0 is [`get_primary_driver`] -- the node every KMS client opens.
+///   Note this is NOT necessarily the console GPU: `register_driver` does
+///   `insert(0)`, so on a dual-card box the primary is whichever card was
+///   probed last, which is the compute one. Pointing `card0` at the console
+///   GPU instead would be a policy change, and a breaking one today: the
+///   console GPU is cold unless `nvidia.console_gpu` brought it up, so every
+///   nouveau ioctl on `card0` would start answering `ENODEV`.
+/// * Index 1 is [`get_compute_driver`], honouring an explicit
+///   `nvidia.compute=BB.DD.F` pin. On a two-card box that is the same driver
+///   as index 0, which is exactly the situation today: `card1` is a headless
+///   compute view of the same card, and `/sys/class/drm` gives it a distinct
+///   fake BDF so libdrm does not merge the two node pairs.
+/// * Indices 2.. are the remaining compute GPUs **sorted by PCI BDF**. Sorting
+///   rather than taking registration order is the point: that list is the
+///   reverse of the PCI probe order, so which card became `card2` would be an
+///   accident that could differ between boots. A BDF sort is stable, so a node
+///   names the same card every time.
+///
+/// Only the first [`MAX_GPU_NODES`] GPUs get nodes: past that, `card{n}` would
+/// collide with the render range and two GPUs would answer to one minor.
+pub fn build_gpu_nodes() {
+    let Some(primary) = get_primary_driver() else {
+        *GPU_NODES.lock() = Vec::new();
+        return;
+    };
+    let mut nodes = vec![GpuNode {
+        index: 0,
+        driver: primary,
+    }];
+
+    if let Some(compute) = get_compute_driver() {
+        nodes.push(GpuNode {
+            index: 1,
+            driver: compute,
+        });
+    }
+
+    // Everything else that can compute and is not already spoken for.
+    let drivers = kernel_hal::drivers::all_drm();
+    let list = drivers.as_vec();
+    let mut rest: Vec<Arc<dyn DrmScheme>> = list
+        .iter()
+        .filter(|d| d.is_compute_gpu() && !nodes.iter().any(|n| Arc::ptr_eq(&n.driver, d)))
+        .cloned()
+        .collect();
+    rest.sort_by_key(|d| d.pci_bdf());
+
+    for driver in rest {
+        let index = nodes.len() as u32;
+        if index >= MAX_GPU_NODES {
+            kernel_hal::klog_warn!(
+                "[drm] more than {} GPUs registered -- the extra ones get no /dev/dri node \
+                 (card{} would collide with the renderD range)",
+                MAX_GPU_NODES,
+                index
+            );
+            break;
+        }
+        nodes.push(GpuNode { index, driver });
+    }
+
+    for n in &nodes {
+        kernel_hal::klog_info!(
+            "[drm] /dev/dri/{} + /dev/dri/{} -> {:?} pci_bdf={:x?} console={}",
+            node_name(n.card_minor()),
+            node_name(n.render_minor()),
+            n.driver.name(),
+            n.driver.pci_bdf(),
+            n.driver.is_console_gpu(),
+        );
+    }
+    *GPU_NODES.lock() = nodes;
+}
+
+/// Every GPU that has a `/dev/dri` node pair, index order.
+pub fn gpu_nodes() -> Vec<GpuNode> {
+    GPU_NODES.lock().clone()
+}
+
+/// The driver that owns `minor`, or `None` when no node has that minor.
+///
+/// This is what makes a node mean a GPU. Before the table existed every ioctl
+/// on every node went to `get_primary_driver()` regardless of which node it
+/// arrived on, so `card1` was the compute GPU only in its sysfs identity and
+/// in `ECLIPSE_COMPUTE` -- every nouveau ioctl on it was served by a different
+/// card than the one userspace had identified.
+pub fn driver_for_minor(minor: u32) -> Option<Arc<dyn DrmScheme>> {
+    GPU_NODES
+        .lock()
+        .iter()
+        .find(|n| n.owns_minor(minor))
+        .map(|n| n.driver.clone())
+}
+
+/// Whether `minor` is one of the compute-only nodes (index 1 and up). Those
+/// advertise themselves as `eclipse-compute` and report no CRTCs, so Mesa and
+/// wlroots leave them alone and stay on `card0`.
 pub fn is_compute_minor(minor: u32) -> bool {
-    minor == COMPUTE_CARD_MINOR || minor == COMPUTE_RENDER_MINOR
+    GPU_NODES
+        .lock()
+        .iter()
+        .any(|n| n.index > 0 && n.owns_minor(minor))
 }
 
 /// `nvidia.compute=BB.DD.F` on the kernel cmdline (hex, dots — the cmdline
@@ -3542,5 +3730,84 @@ mod damage_tests {
             damage_rect_from_clips(&b, 1920, 1080),
             Some((40, 50, 20, 30))
         );
+    }
+}
+
+/// The node naming and minor arithmetic, which is what `/dev/dri`,
+/// `/sys/class/drm` and `/sys/dev/char` all derive their entries from.
+/// Building the table itself needs registered drivers, so it is not testable
+/// here; this covers the part that used to be four hand-written names and is
+/// now shared arithmetic.
+#[cfg(test)]
+mod node_tests {
+    use super::*;
+
+    #[test]
+    fn the_first_gpu_keeps_card0_and_render128() {
+        let n = NodeMinors::new(0);
+        assert_eq!(n.card(), 0);
+        assert_eq!(n.render(), 128);
+    }
+
+    #[test]
+    fn names_are_derived_for_any_index() {
+        // The four the old `match` knew, plus the third GPU that used to come
+        // out as the literal string "card?".
+        assert_eq!(node_name(0), "card0");
+        assert_eq!(node_name(1), "card1");
+        assert_eq!(node_name(2), "card2");
+        assert_eq!(node_name(128), "renderD128");
+        assert_eq!(node_name(129), "renderD129");
+        assert_eq!(node_name(130), "renderD130");
+    }
+
+    #[test]
+    fn a_gpu_owns_exactly_its_own_two_minors() {
+        let n = NodeMinors::new(2);
+        assert_eq!(n.card(), 2);
+        assert_eq!(n.render(), 130);
+        assert!(n.owns(2));
+        assert!(n.owns(130));
+        // Not its neighbours', which is the whole point of the table.
+        assert!(!n.owns(1));
+        assert!(!n.owns(3));
+        assert!(!n.owns(129));
+        assert!(!n.owns(131));
+    }
+
+    #[test]
+    fn no_two_gpus_can_claim_one_minor_below_the_cap() {
+        // Every minor under the cap is claimed by at most one GPU. This is
+        // what `build_gpu_nodes` stops at, so assert it rather than trusting
+        // the constant to have been chosen correctly.
+        for i in 0..MAX_GPU_NODES {
+            for j in 0..MAX_GPU_NODES {
+                if i == j {
+                    continue;
+                }
+                let a = NodeMinors::new(i);
+                let b = NodeMinors::new(j);
+                assert!(!b.owns(a.card()), "card{} also belongs to GPU {}", i, j);
+                assert!(
+                    !b.owns(a.render()),
+                    "renderD{} also belongs to GPU {}",
+                    a.render(),
+                    j
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_cap_stays_inside_the_primary_minor_range() {
+        // `card{n}` only stops being a primary node name at RENDER_MINOR_BASE,
+        // where it would name a render node instead and two GPUs would answer
+        // to one minor. The cap is deliberately well short of that, at Linux's
+        // own card0..card63 range.
+        assert!(MAX_GPU_NODES <= RENDER_MINOR_BASE);
+        assert!(NodeMinors::new(MAX_GPU_NODES - 1).card() < RENDER_MINOR_BASE);
+        // And past RENDER_MINOR_BASE is where it really breaks, which is why
+        // the cap exists at all.
+        assert!(NodeMinors::new(0).owns(NodeMinors::new(RENDER_MINOR_BASE).card()));
     }
 }
