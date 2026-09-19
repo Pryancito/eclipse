@@ -1043,10 +1043,12 @@ pub(super) struct NouveauChannelState {
 pub(super) struct NouveauGemObject {
     /// Handle returned to userspace (nouveau-uAPI wire format). Distinct
     /// from `h_memory`: this is Eclipse's own counter, not an RM handle.
-    /// Starts at `0x8000_0001` (see `NvidiaGpu::new`'s
-    /// `nouveau_gem_next_handle` init) so it can never collide with
-    /// `linux-object`'s own `DRM_STATE` handle ids -- both are decoded
-    /// from the same fake-mmap-offset space by `DrmDev::get_vmo`.
+    /// Drawn from this GPU's own slice of the high half of the `u32` range
+    /// (`crate::scheme::gem_mmap::alloc_handle_slice`), so it can collide
+    /// neither with `linux-object`'s own `DRM_STATE` handle ids -- both are
+    /// decoded from the same fake-mmap-offset space by `DrmDev::get_vmo` --
+    /// nor with another GPU's handles, which share the same global
+    /// `gem_mmap` / `NOUVEAU_CPU_VMOS` tables.
     pub handle: u32,
     /// The real RM memory object handle backing this allocation.
     pub h_memory: u32,

@@ -336,9 +336,17 @@ escalera compartida `step16` (client/device/subdevice) se construyen hasta
 - **Consola GPU GSP**: el auto-bringup on-demand está **opt-in** con
   `nvidia.console_gsp` (además de `nvidia.nouveau_uapi`). Sin él, hace
   falta `cat /proc/gpustep14` a mano.
-- **`nvidia.console_gpu`**: implica `nvidia.console_gsp` y además programa el
-  bring-up diferido de la GPU de consola (esperar a KD_GRAPHICS, pausar el
-  scanout, `gpustep14`, reanudar) aunque nunca aparezca ningún cliente GPU.
+- **`nvidia.console_gpu`**: programa el bring-up diferido de la GPU de consola
+  (esperar a KD_GRAPHICS, pausar el scanout, `gpustep14`, reanudar) aunque
+  nunca aparezca ningún cliente GPU. Abre el mismo gate que
+  `nvidia.console_gsp`, pero **desde dentro de la tarea diferida y con el
+  scanout ya pausado**, no al arrancar: ese gate es también el que deja que el
+  `CHANNEL_ALLOC` del primer cliente GPU lance `bringup_step14`, y ese cliente
+  puede aparecer en cuanto arranca el escritorio, con el scanout vivo — justo
+  la ventana que este camino existe para evitar. Si quieres además el
+  bring-up on-demand al primer cliente, pasa los dos flags. La pausa del
+  scanout lleva watchdog (90 s): si `gpustep14` se cuelga o aborta, el scanout
+  se reanuda solo en vez de dejar el escritorio congelado para siempre.
   No toca la ruta de arranque: si el SEC2 STARTCPU se cuelga, se cuelga con el
   escritorio ya en pantalla, no a mitad del boot. Si la GPU sube, el present
   pasa a su propio copy engine — copia dentro de la misma tarjeta, sin P2P por

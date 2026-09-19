@@ -601,13 +601,20 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 }
             }
             // On-demand console GSP bring-up (default OFF: use /proc/gpustep14).
-            // `nvidia.console_gpu` implies it: that flag's whole point is to
-            // get the console GPU state-loaded, and `ensure_console_gpu_brought_up`
-            // refuses without this gate, so requiring both flags would only be
-            // a way to ask for the feature and silently not get it.
-            if options.cmdline.contains("nvidia.console_gsp")
-                || options.cmdline.contains("nvidia.console_gpu")
-            {
+            //
+            // ONLY `nvidia.console_gsp` opens the gate here. `nvidia.console_gpu`
+            // needs the same gate -- `ensure_console_gpu_brought_up` refuses
+            // without it -- but it must NOT be opened this early: the gate is
+            // also what lets the FIRST GPU client's `CHANNEL_ALLOC` run
+            // `bringup_step14`, and that client can arrive as soon as the
+            // desktop starts, well before the deferred task reaches
+            // `set_scanout_paused(true)`. That is precisely the SEC2 STARTCPU
+            // window with live scanout that the deferred path exists to avoid,
+            // so `nvidia.console_gpu` opens the gate from inside the task
+            // instead, once the pause is in place (see
+            // `schedule_deferred_console_bringup`). Passing both flags is still
+            // the way to ask for on-demand bring-up at the first client.
+            if options.cmdline.contains("nvidia.console_gsp") {
                 kernel_hal::drivers::set_console_gsp_enabled(true);
                 klog_info!(
                     "Eclipse: nvidia.console_gsp -- console GPU GSP on-demand bring-up ENABLED"
@@ -700,6 +707,9 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 schedule_deferred_console_bringup(
                     reason,
                     !options.cmdline.contains("nvidia.nocepresent"),
+                    // `nvidia.console_gpu` deliberately left the console-GSP
+                    // gate shut at boot; the task opens it under the pause.
+                    want_console_gpu && !options.cmdline.contains("nvidia.console_gsp"),
                 );
             }
             #[cfg(all(feature = "linux", not(feature = "libos")))]
@@ -882,8 +892,18 @@ fn auto_bringup_compute_gpus() -> bool {
 /// `may_enable_ce` is false when the operator passed `nvidia.nocepresent`; the
 /// bring-up still runs (the cursor plane is a separate win) but the present
 /// path is left alone.
+///
+/// `open_console_gsp` is true for `nvidia.console_gpu` alone, which leaves the
+/// console-GSP gate shut at boot on purpose: that gate is shared with the
+/// first-GPU-client bring-up in `CHANNEL_ALLOC`, so opening it at boot would
+/// let a client start SEC2 STARTCPU with scanout live -- exactly what this task
+/// exists to avoid. The task opens it itself, after the pause is in place.
 #[cfg(feature = "linux")]
-fn schedule_deferred_console_bringup(reason: &'static str, may_enable_ce: bool) {
+fn schedule_deferred_console_bringup(
+    reason: &'static str,
+    may_enable_ce: bool,
+    open_console_gsp: bool,
+) {
     klog_info!(
         "Eclipse: {} — tarea diferida programada (espera desktop, luego gpustep14)",
         reason
@@ -918,9 +938,27 @@ fn schedule_deferred_console_bringup(reason: &'static str, may_enable_ce: bool) 
             );
         }
 
-        linux_object::fs::devfs::drm::set_scanout_paused(true);
+        // Watchdogged: `bringup_step14` drives the SEC2 STARTCPU path, which is
+        // the one known way this hardware wedges, and a latched pause freezes
+        // the desktop forever (flips keep being acknowledged, nothing is
+        // drawn). The pause lifts by itself if we never get back here.
+        linux_object::fs::devfs::drm::set_scanout_paused_for(
+            linux_object::fs::devfs::drm::SCANOUT_PAUSE_MAX,
+        );
         // Brief settle so in-flight blits/CE finish before SEC2.
         kernel_hal::thread::sleep_until(timer_now() + Duration::from_millis(200)).await;
+
+        // Only now: the gate that `ensure_console_gpu_brought_up` checks is the
+        // same one a GPU client's CHANNEL_ALLOC uses, so it stays shut until
+        // scanout is parked. From here on a first client racing us is harmless:
+        // the bring-up is one-shot and the pause is already ours.
+        if open_console_gsp {
+            kernel_hal::drivers::set_console_gsp_enabled(true);
+            kernel_hal::klog_info!(
+                "Eclipse: {} — gate console-GSP abierto con el scanout ya pausado",
+                reason
+            );
+        }
 
         // Every registered driver is asked; the method self-guards to the GPU
         // that drives the boot display and returns an empty line otherwise, so
