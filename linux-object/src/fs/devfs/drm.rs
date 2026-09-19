@@ -389,13 +389,76 @@ lazy_static::lazy_static! {
         Mutex::new(alloc::collections::BTreeMap::new());
 }
 
+/// `nvidia.gem_uc` on the cmdline: keep the old uncached mapping for nouveau
+/// GEM objects. Escape hatch for [`nouveau_cpu_vmo`] -- see the note there on
+/// why WB is the coherent choice on x86 and what would falsify it.
+static GEM_MAP_UNCACHED: AtomicBool = AtomicBool::new(false);
+
+/// Read the `nvidia.gem_uc` cmdline token once and latch it.
+pub fn init_gem_cache_policy() {
+    let uc = kernel_hal::boot::cmdline()
+        .split([':', ' ', '\t', '\n'])
+        .any(|t| t == "nvidia.gem_uc");
+    GEM_MAP_UNCACHED.store(uc, Ordering::Relaxed);
+    if uc {
+        kernel_hal::klog_info!(
+            "[drm] nvidia.gem_uc -- nouveau GEM CPU mappings forced UNCACHED (slow; diagnostic only)"
+        );
+    }
+}
+
 /// Shared physical VMO for a nouveau GEM handle's CPU mmap / PRIME export.
+///
+/// The mapping is **cached (WB)**, not uncached. `VmObject::new_physical`
+/// starts every physical VMO at `CachePolicy::Uncached`
+/// (`zircon-object/src/vm/vmo/physical.rs`), and this path never overrode it,
+/// so every CPU touch of an NVK/zink staging buffer, pushbuffer or swapchain
+/// image was a serialized UC transaction -- roughly eight bytes per round
+/// trip to RAM, with no combining and no caching.
+///
+/// Uncached was never right here, because **only sysmem reaches this
+/// function**: `GEM_NEW` publishes a `phys_addr` exclusively when
+/// `gem_map_cpu` reports `ADDR_SYSMEM`, and refuses to publish one for an
+/// `ADDR_FBMEM` (VRAM) object at all, since a VRAM offset is not a host
+/// physical address. So every handle that gets here is ordinary host RAM
+/// behind GART -- the same class of memory the dumb-buffer path already
+/// maps `Cached` for exactly this reason (see `handle_vmo` below: "the
+/// compositor no longer renders into UC memory on real hardware").
+///
+/// WB also *removes* an aliasing hazard rather than adding one: the kernel
+/// already reaches these same frames through the WB physmap alias (that is
+/// what `dma_sync_scanout_src_from_device`'s clflush is maintaining), so a UC
+/// user mapping and a WB kernel mapping of one page were conflicting memory
+/// types. Now both ends agree.
+///
+/// Coherence against GPU DMA rests on x86 PCIe reads being snooped, which is
+/// the architectural default and what Linux's nouveau relies on for GART
+/// objects. The one thing that would falsify it is the GPU issuing No-Snoop
+/// TLPs for these reads; the symptom would be the GPU consuming stale bytes
+/// (garbage or a frame behind) rather than anything crashing. `nvidia.gem_uc`
+/// restores the old behaviour in place for a boot, so that hypothesis can be
+/// tested on hardware without a rebuild.
 pub fn nouveau_cpu_vmo(handle: u32, phys_addr: u64, size: usize) -> Arc<VmObject> {
     let mut map = NOUVEAU_CPU_VMOS.lock();
     if let Some(v) = map.get(&handle) {
         return v.clone();
     }
     let vmo = VmObject::new_physical(phys_addr as usize, pages(size));
+    if !GEM_MAP_UNCACHED.load(Ordering::Relaxed) {
+        // Must happen before the VMO is handed out: `set_cache_policy`
+        // refuses once a mapping exists. Nothing can have mapped it yet --
+        // it was constructed on the line above and is still unpublished.
+        if let Err(e) = vmo.set_cache_policy(kernel_hal::CachePolicy::Cached) {
+            static CACHE_POLICY_FAILED: AtomicBool = AtomicBool::new(false);
+            if !CACHE_POLICY_FAILED.swap(true, Ordering::Relaxed) {
+                kernel_hal::klog_warn!(
+                    "[drm] nouveau GEM mmap: set_cache_policy(Cached) failed ({:?}) -- \
+                     falling back to UNCACHED; CPU access to GEM objects will be slow",
+                    e
+                );
+            }
+        }
+    }
     map.insert(handle, vmo.clone());
     vmo
 }

@@ -466,6 +466,10 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // (`kernel_hal::drivers::set_rm_thread_id_provider` stays for
             // the day the gate is lifted and RM concurrency is done right.)
             load_nvidia_gsp_firmware(&rootfs.root_inode());
+            // Latch the nouveau GEM CPU-mapping cache policy before any GEM
+            // object can be created (the first mmap fixes a VMO's policy for
+            // its whole life).
+            linux_object::fs::devfs::drm::init_gem_cache_policy();
             // Auto bring-up every COMPUTE GPU (any NVIDIA GPU not driving the
             // boot display) now that the GSP firmware is available, so the
             // copy-engine present path (ce_present over PCIe P2P) is ready
