@@ -1231,11 +1231,15 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     // PCIe — on real hardware the console GPU's BAR1 serves CPU stores at a
     // measured 42 MB/s even through a verified write-combining mapping
     // (~99 ms/frame, the 7-11 FPS desktop), while GPU-initiated writes burst
-    // at PCIe speed. The flat CE copy needs equal strides: when the client's
-    // pitch differs from the scanout pitch, the rows are first CPU-repacked
-    // into a sysmem staging buffer at the scanout pitch (cached writes,
-    // ~GB/s) and the CE copies from there. Only for full-frame scanouts: the
-    // CE always copies from the buffer's start, so it can't honor a rect.
+    // at PCIe speed.
+    //
+    // A damage rect takes the pitched 2D path, which walks rows at a stride
+    // and now also takes a destination offset, so the engine can write just
+    // the damaged region. This used to be full-frame only (`rect.is_none()`),
+    // which inverted the economics of the whole present path: the cheap case
+    // — a small damage box — was handed to the CPU, and the expensive one to
+    // the GPU. The flat copy still needs a full frame, because it copies from
+    // the buffer's start with no stride at all.
     //
     // OPT-IN: gated on `nvidia.cepresent` (see CE_PRESENT_ENABLED) — the CE
     // DMA per present destabilized the desktop on real hardware once, so the
@@ -1253,8 +1257,19 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     // look stale, restore a sync here — the present klog's `sync Xus` is the
     // tell (should be ~0 on CE-direct).
     let mut blitted_by_ce = false;
-    if rect.is_none() && CE_PRESENT_ENABLED.load(Ordering::Relaxed) {
-        if fb.pitch != info.pitch {
+    if CE_PRESENT_ENABLED.load(Ordering::Relaxed) {
+        // Byte offsets of the damaged region in each buffer. Both are zero for
+        // a full-frame present, which is exactly the old behaviour.
+        let src_byte_off = (blit_y as u64)
+            .saturating_mul(fb.pitch as u64)
+            .saturating_add((blit_x as u64).saturating_mul(4));
+        let dst_byte_off = (blit_y as u64)
+            .saturating_mul(info.pitch as u64)
+            .saturating_add((blit_x as u64).saturating_mul(4));
+        // The flat path has no stride and no destination offset, so it can
+        // only serve a full frame with matching pitches.
+        let flat_ok = rect.is_none() && fb.pitch == info.pitch;
+        if !flat_ok {
             // Pitched 2D CE path: the GPU copy engine reads directly from the
             // source buffer at fb.pitch and writes into the scanout FB at
             // info.pitch — no CPU staging repack.  On the common dual-RTX case
@@ -1264,15 +1279,30 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
             // Fallback chain: 2D fails (CE_PRESENT_WEDGED latched) →
             // FromDevice + repack+flat CE → CPU blit.
             let row_bytes = (blit_w as usize).saturating_mul(4) as u32;
+            let src_pa = fb.phys_addr.saturating_add(src_byte_off);
             for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-                if d.ce_present_2d_pitched(fb.phys_addr, fb.pitch, info.pitch, row_bytes, blit_h) {
+                if d.ce_present_2d_pitched(
+                    src_pa,
+                    fb.pitch,
+                    dst_byte_off,
+                    info.pitch,
+                    row_bytes,
+                    blit_h,
+                ) {
                     blitted_by_ce = true;
                     break;
                 }
             }
             // Fallback: CPU reads the GEM, so FromDevice first, then repack
             // into staging at scanout pitch and flat CE.
-            if !blitted_by_ce {
+            //
+            // Full frames only. The repack lands the rows at the start of the
+            // staging buffer and the flat CE copies them to the start of the
+            // scanout FB, so with a damage rect it would paint the damaged
+            // region in the top-left corner of the screen. A rect that cannot
+            // take the 2D path falls through to the CPU blit, which does
+            // honour it.
+            if !blitted_by_ce && rect.is_none() {
                 if gem_cpu_mapped {
                     let ts = kernel_hal::timer::timer_now();
                     dma_sync_scanout_src_from_device(

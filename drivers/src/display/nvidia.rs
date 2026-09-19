@@ -5053,12 +5053,15 @@ impl DrmScheme for NvidiaGpu {
 
     /// Pitched 2D CE present: copy `line_count` rows of `row_bytes` bytes from
     /// `src_sysmem_pa + r * src_pitch` into the console GPU's scanout FB at
-    /// `dst_pitch` stride over PCIe P2P — without any CPU staging repack.
+    /// `dst_byte_offset + r * dst_pitch` over PCIe P2P — without any CPU
+    /// staging repack. `dst_byte_offset` is non-zero when the caller is
+    /// presenting a damage rectangle rather than a whole frame.
     /// Uses the same `CE_PRESENT_WEDGED` latch as [`ce_present`].
     fn ce_present_2d_pitched(
         &self,
         src_sysmem_pa: u64,
         src_pitch: u32,
+        dst_byte_offset: u64,
         dst_pitch: u32,
         row_bytes: u32,
         line_count: u32,
@@ -5077,6 +5080,32 @@ impl DrmScheme for NvidiaGpu {
             Some(p) if p != 0 => p,
             _ => return false,
         };
+        // The destination the engine actually writes: the scanout base biased
+        // into the damaged region. Checked for overflow rather than wrapped --
+        // a bad offset here would have the CE DMA into whatever follows the
+        // framebuffer.
+        //
+        // The last row needs `row_bytes`, not a whole `dst_pitch`: charging it
+        // a full stride would reject every damage rect touching the bottom row
+        // at a non-zero x, since `(y + h) * pitch + x * 4` overshoots a
+        // framebuffer that is exactly `pitch * height` bytes.
+        let last_row_start = (dst_pitch as u64).saturating_mul(line_count.saturating_sub(1) as u64);
+        let dst_end = dst_byte_offset
+            .saturating_add(last_row_start)
+            .saturating_add(row_bytes as u64);
+        let Some(dst_phys) = fb_phys.checked_add(dst_byte_offset) else {
+            return false;
+        };
+        if dst_end > self.info.fb_size as u64 {
+            static CE_2D_OOB: AtomicBool = AtomicBool::new(false);
+            if !CE_2D_OOB.swap(true, Ordering::Relaxed) {
+                crate::klog_warn!(
+                    "[NVIDIA] CE-offload present 2D: dst offset {:#x} + {} rows (pitch {}, {} B/row) ends at {:#x}, past FB size {:#x} -- declining",
+                    dst_byte_offset, line_count, dst_pitch, row_bytes, dst_end, self.info.fb_size
+                );
+            }
+            return false;
+        }
 
         nvidia_rm_sys::os_interface::capture_begin();
         let t0 = unsafe { crate::bus::drivers_timer_now_as_micros() };
@@ -5090,7 +5119,7 @@ impl DrmScheme for NvidiaGpu {
             (
                 nvidia_rm_sys::rm_init::ce_blit_p2p_2d(
                     device_instance,
-                    fb_phys,
+                    dst_phys,
                     dst_pitch,
                     src_sysmem_pa,
                     src_pitch,
@@ -5103,7 +5132,7 @@ impl DrmScheme for NvidiaGpu {
             (
                 nvidia_rm_sys::rm_init::ce_blit_p2p_2d(
                     device_instance,
-                    fb_phys,
+                    dst_phys,
                     dst_pitch,
                     src_sysmem_pa,
                     src_pitch,
@@ -7603,7 +7632,7 @@ impl DrmScheme for NvidiaGpu {
         }
         static HWFLIP_TRIED: AtomicBool = AtomicBool::new(false);
         let ok =
-            self.ce_present_2d_pitched(fb.phys_addr, fb.pitch, dst_pitch, row_bytes, fb.height);
+            self.ce_present_2d_pitched(fb.phys_addr, fb.pitch, 0, dst_pitch, row_bytes, fb.height);
         if ok {
             let now = unsafe { crate::bus::drivers_timer_now_as_micros() };
             let mut state = self.kms_state.lock();
