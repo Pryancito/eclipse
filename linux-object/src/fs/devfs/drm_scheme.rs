@@ -611,6 +611,11 @@ const PROP_MODE_ID: u32 = 26;
 const PROP_IN_FENCE_FD: u32 = 27;
 /// CRTC out-fence pointer (`*mut i32` sync_file fd writeback).
 const PROP_OUT_FENCE_PTR: u32 = 28;
+/// Plane damage clips: a blob of `drm_mode_rect`, the region of the
+/// framebuffer that actually changed since the last commit. Without this
+/// property a compositor has no way to tell the kernel what it repainted, so
+/// every commit had to be treated as a full-frame present.
+const PROP_FB_DAMAGE_CLIPS: u32 = 29;
 
 // Property flags (`drm_mode.h`).
 const DRM_MODE_PROP_RANGE: u32 = 1 << 1;
@@ -1313,6 +1318,12 @@ fn prop_spec(prop_id: u32) -> Option<PropSpec> {
             values: &[0, u64::MAX],
             enums: &[],
         },
+        PROP_FB_DAMAGE_CLIPS => PropSpec {
+            name: "FB_DAMAGE_CLIPS",
+            flags: DRM_MODE_PROP_BLOB | DRM_MODE_PROP_ATOMIC,
+            values: &[],
+            enums: &[],
+        },
         _ => return None,
     })
 }
@@ -1371,6 +1382,10 @@ fn plane_props(plane: &drm::DrmPlane, atomic: bool) -> alloc::vec::Vec<(u32, u64
         props.push((PROP_SRC_H, st.src_h as u64));
         // Default "no in-fence" sentinel.
         props.push((PROP_IN_FENCE_FD, (-1i32) as u64));
+        // Damage is per-commit state, never latched: Linux resets
+        // FB_DAMAGE_CLIPS to 0 after each atomic commit, and 0 means "the
+        // whole plane changed". Reading it back always returns 0.
+        props.push((PROP_FB_DAMAGE_CLIPS, 0));
     }
     props
 }
@@ -1404,6 +1419,7 @@ fn atomic_stage(upd: &mut drm::AtomicUpdate, obj_id: u32, prop_id: u32, value: u
                     upd.in_fence_fd = Some(fd);
                 }
             }
+            PROP_FB_DAMAGE_CLIPS => upd.damage_clips = Some(value as u32),
             // "type" is immutable.
             PROP_TYPE => return Err(FsError::InvalidParam),
             _ => return Err(FsError::EntryNotFound),

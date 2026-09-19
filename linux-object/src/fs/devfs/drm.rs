@@ -2629,6 +2629,60 @@ pub struct AtomicUpdate {
     pub out_fence_ptr: Option<u64>,
     /// Connector "CRTC_ID" (`Some(0)` detaches the connector).
     pub connector_crtc_id: Option<u32>,
+    /// Plane "FB_DAMAGE_CLIPS": blob id holding an array of `drm_mode_rect`,
+    /// the region the client actually repainted. `Some(0)` or absent means
+    /// the whole plane is damaged, as in Linux.
+    pub damage_clips: Option<u32>,
+}
+
+/// One `struct drm_mode_rect` (`drm_mode.h`): an inclusive-exclusive damage
+/// rectangle in framebuffer pixels. Signed, because the uAPI is.
+const DRM_MODE_RECT_SIZE: usize = 16;
+
+/// Resolve an `FB_DAMAGE_CLIPS` blob into one bounding rectangle clamped to
+/// the framebuffer, or `None` for "present the whole frame".
+///
+/// `None` is returned for every case Linux also treats as full damage: no
+/// property in the commit, a zero blob id, a blob that is not a whole number
+/// of `drm_mode_rect`s, and an empty or degenerate clip list. A damage hint
+/// that cannot be trusted must widen to the full frame, never narrow -- the
+/// failure mode of guessing small is stale tiles left on screen.
+fn damage_rect_from_blob(blob_id: u32, fb_w: u32, fb_h: u32) -> Option<(u32, u32, u32, u32)> {
+    if blob_id == 0 || fb_w == 0 || fb_h == 0 {
+        return None;
+    }
+    let data = get_blob(blob_id)?;
+    if data.is_empty() || data.len() % DRM_MODE_RECT_SIZE != 0 {
+        return None;
+    }
+    let mut union: Option<(u32, u32, u32, u32)> = None;
+    for chunk in data.as_chunks::<DRM_MODE_RECT_SIZE>().0 {
+        let rd = |o: usize| i32::from_ne_bytes([chunk[o], chunk[o + 1], chunk[o + 2], chunk[o + 3]]);
+        let (x1, y1, x2, y2) = (rd(0), rd(4), rd(8), rd(12));
+        if x2 <= x1 || y2 <= y1 {
+            continue;
+        }
+        // Clamp into the framebuffer. A clip reaching outside it is not a
+        // reason to refuse the commit (Linux does not), just to trim.
+        let x1 = x1.max(0) as u32;
+        let y1 = y1.max(0) as u32;
+        let x2 = (x2.max(0) as u32).min(fb_w);
+        let y2 = (y2.max(0) as u32).min(fb_h);
+        if x2 <= x1 || y2 <= y1 {
+            continue;
+        }
+        union = Some(match union {
+            Some((ux, uy, uw, uh)) => {
+                let nx = ux.min(x1);
+                let ny = uy.min(y1);
+                let fx = (ux + uw).max(x2);
+                let fy = (uy + uh).max(y2);
+                (nx, ny, fx - nx, fy - ny)
+            }
+            None => (x1, y1, x2 - x1, y2 - y1),
+        });
+    }
+    union
 }
 
 /// Why an atomic check/commit was refused. Mapped to errno by the ioctl
@@ -2858,7 +2912,18 @@ pub fn atomic_commit(
 
     match upd.plane_fb_id {
         Some(0) => set_crtc_fb(SYNTH_CRTC_ID, 0),
-        Some(fb_id) if !present_now(fb_id, SYNTH_CRTC_ID) => return Err(AtomicError::Device),
+        Some(fb_id) => {
+            // Honour FB_DAMAGE_CLIPS. Without it every commit presented the
+            // whole framebuffer no matter how little changed -- 8.3 MB of CPU
+            // stores at 1080p for a moved cursor or a blinking caret.
+            let rect = upd.damage_clips.and_then(|blob_id| {
+                let fb = get_fb(fb_id)?;
+                damage_rect_from_blob(blob_id, fb.width, fb.height)
+            });
+            if !present_now_region(fb_id, SYNTH_CRTC_ID, rect) {
+                return Err(AtomicError::Device);
+            }
+        }
         _ => {}
     }
 
