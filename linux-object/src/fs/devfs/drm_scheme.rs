@@ -235,10 +235,11 @@ impl DrmDev {
         if ucheck_n::<u32>(handles_ptr as usize, count_handles as usize).is_err() {
             return;
         }
-        if timeline && points_ptr != 0 {
-            if ucheck_n::<u64>(points_ptr as usize, count_handles as usize).is_err() {
-                return;
-            }
+        if timeline
+            && points_ptr != 0
+            && ucheck_n::<u64>(points_ptr as usize, count_handles as usize).is_err()
+        {
+            return;
         }
         let handles: alloc::vec::Vec<u32> = (0..count_handles as usize)
             .map(|i| unsafe { *(handles_ptr as *const u32).add(i) })
@@ -3033,8 +3034,8 @@ impl INode for DrmDev {
                 if let Some(ptr) = upd.out_fence_ptr {
                     if commit.is_err() || test_only {
                         let _ = write_out_fence_ptr(ptr, true);
-                    } else if let Err(e) = write_out_fence_ptr(ptr, false) {
-                        return Err(e);
+                    } else {
+                        write_out_fence_ptr(ptr, false)?;
                     }
                 }
                 commit.map_err(|e| match e {

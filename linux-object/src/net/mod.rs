@@ -2044,7 +2044,7 @@ pub unsafe fn copy_ifname(s: *const u8) -> Result<alloc::string::String, LxError
         return Err(LxError::EINVAL);
     }
     core::str::from_utf8(&buf[..len])
-        .map(|s| alloc::string::String::from(s))
+        .map(alloc::string::String::from)
         .map_err(|_| LxError::EINVAL)
 }
 

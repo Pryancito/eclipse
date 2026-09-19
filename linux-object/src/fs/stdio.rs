@@ -895,8 +895,19 @@ fn handle_key_event(event: &InputEvent) {
         return;
     }
 
-    // Shift+PageUp / Shift+PageDown scrollback on the active VT.
-    if SHIFT_DOWN.load(Ordering::SeqCst) {
+    // Shift+PageUp / Shift+PageDown scrollback on the active VT -- but only
+    // while the kernel still owns the framebuffer. This block sits ABOVE the
+    // KD_GRAPHICS gate further down, so with labwc holding the VT (it reads
+    // the keyboard through evdev and never changes the tty's keyboard mode,
+    // which is exactly why that gate exists) a Shift+PageUp typed inside a
+    // terminal used to repaint the whole text console over the compositor.
+    // Linux's scrollback is a text-console function and does nothing in
+    // graphics mode either; the keystroke still reaches the terminal through
+    // /dev/input/event*.
+    if SHIFT_DOWN.load(Ordering::SeqCst)
+        && kernel_hal::console::kd_mode_vt(kernel_hal::console::active_vt())
+            == kernel_hal::console::KD_TEXT
+    {
         if event.code == KEY_PAGEUP {
             kernel_hal::console::scroll_graphic_console(1);
             return;

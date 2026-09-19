@@ -9540,6 +9540,7 @@ impl NvidiaGpu {
                             fence_gpu_va,
                             payload,
                             ctx_idx,
+                            !timeline,
                         ) {
                             crate::klog_warn!(
                                 "[nouveau-uapi] EXEC(direct): submitted, but sig syncobj handle={} is unknown (ENOENT)",
@@ -11300,6 +11301,7 @@ impl NvidiaGpu {
                                             fence_gpu_va,
                                             payload,
                                             ctx_idx,
+                                            !timeline,
                                         ) {
                                             return Err(nv::ENOENT);
                                         }

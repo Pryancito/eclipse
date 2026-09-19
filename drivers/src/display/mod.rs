@@ -73,3 +73,18 @@ pub fn boot_edid() -> Option<([u8; 128], u32)> {
 pub fn nouveau_uapi_enabled() -> bool {
     false
 }
+
+/// The CE page-flip (`nvidia.hwflip`) and NVC57E surface-flip
+/// (`nvidia.surfaceflip`) opt-ins live in the NVIDIA driver, which only
+/// exists on x86_64. Off x86_64 there is no hardware flip path at all, so
+/// both read `false` and callers stay on the software-KMS blit. Mirrors the
+/// `kernel_hal::drivers` wrappers of the same names.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn hwflip_enabled() -> bool {
+    false
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn surfaceflip_enabled() -> bool {
+    false
+}

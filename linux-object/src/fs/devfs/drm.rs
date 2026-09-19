@@ -1323,20 +1323,15 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
                 vaddr, fb.size, src_stride, cx, cy, cw, ch, fb_width, fb_height,
             );
         }
+        // Clip to what the framebuffer covers (`fb_width`/`fb_height`), not to
+        // the screen: a client fb narrower or shorter than the display would
+        // otherwise have the patch read past the end of a row -- the next
+        // row's pixels -- and paint that onto the scanout as a shifted square
+        // trailing the pointer. `repaint_for_cursor` has always clipped this
+        // way (see its `(fw, fh)`); this call site did not, even though the
+        // cache invalidate right above it already used the clipped pair.
         blit_cursor_patch(
-            &*display,
-            pixels,
-            src_stride,
-            info.width,
-            info.height,
-            cx,
-            cy,
-            cw,
-            ch,
-            cx,
-            cy,
-            cw,
-            ch,
+            &*display, pixels, src_stride, fb_width, fb_height, cx, cy, cw, ch, cx, cy, cw, ch,
             &bmp,
         );
     }
