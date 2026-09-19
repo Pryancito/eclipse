@@ -690,9 +690,17 @@ pub struct NvidiaGpu {
     /// from `imported_handles` (which tracks buffers the generic DRM core
     /// allocated via `CREATE_DUMB`).
     nouveau_gem: Mutex<Vec<super::nouveau_uapi::NouveauGemObject>>,
-    /// Next handle to hand out from `GEM_NEW`. Starts at 1 (0 is never a
-    /// valid GEM handle, matching Linux DRM convention).
+    /// Next handle to hand out from `GEM_NEW`, within this GPU's private
+    /// slice of the driver-private handle range (see
+    /// [`crate::scheme::gem_mmap::alloc_handle_slice`]). Per-GPU rather than
+    /// global because the registries these ids key into -- `gem_mmap`'s
+    /// physical-address table and `linux-object`'s `NOUVEAU_CPU_VMOS` -- have
+    /// no GPU in their key, so two cards counting from the same base would
+    /// alias each other's buffers.
     nouveau_gem_next_handle: AtomicU32,
+    /// One past the last handle this GPU may hand out. `GEM_NEW` refuses
+    /// instead of walking into the next card's slice.
+    nouveau_gem_handle_end: u32,
     /// Active `VM_BIND` GPU-VA mappings, so `UNMAP` can find the RM handle
     /// to tear down.
     nouveau_vm_mappings: Mutex<Vec<super::nouveau_uapi::NouveauVmMapping>>,
@@ -1063,6 +1071,11 @@ impl NvidiaGpu {
             fb_size,
         };
 
+        // One disjoint slice of the driver-private GEM handle range per GPU;
+        // the tables these handles key into are global and have no GPU in
+        // their key (see drivers/src/scheme/gem_mmap.rs).
+        let gem_handle_slice = crate::scheme::gem_mmap::alloc_handle_slice();
+
         Ok(Self {
             name,
             info,
@@ -1102,9 +1115,11 @@ impl NvidiaGpu {
             // handle ids (CREATE_DUMB/PRIME, sequential starting at 1) --
             // both id spaces are decoded from the same fake-mmap-offset
             // bits by DrmDev::get_vmo, so a collision would resolve a
-            // mmap() to the wrong physical range. See
-            // drivers/src/scheme/gem_mmap.rs's module doc.
-            nouveau_gem_next_handle: AtomicU32::new(0x8000_0001),
+            // mmap() to the wrong physical range. Within that half, each
+            // GPU takes its own slice, because the registries keyed by
+            // these ids are global. See drivers/src/scheme/gem_mmap.rs.
+            nouveau_gem_next_handle: AtomicU32::new(gem_handle_slice.base()),
+            nouveau_gem_handle_end: gem_handle_slice.end(),
             nouveau_vm_mappings: Mutex::new(Vec::new()),
             nouveau_pid_ctx: Mutex::new(Vec::new()),
             nouveau_fast: Mutex::new(
@@ -8210,11 +8225,13 @@ impl NvidiaGpu {
     /// it), and predates the GSP-boot TLB-shootdown deadlock fixes (NMI-ack).
     /// The target also has no disk to capture a manual `cat`, so automating this
     /// is the only path to a working console GPU there. Default **OFF** —
-    /// enable with `nvidia.console_gsp`, or with `nvidia.console_gpu`, which
-    /// implies it and additionally schedules the deferred bring-up so the
-    /// console GPU comes up even when no GPU client ever appears (safer boots
-    /// keep manual `/proc/gpustep14`). The whole nouveau-uAPI surface is still
-    /// gated by `nvidia.nouveau_uapi`.
+    /// enable with `nvidia.console_gsp` (safer boots keep manual
+    /// `/proc/gpustep14`). `nvidia.console_gpu` schedules the deferred
+    /// bring-up instead, so the console GPU comes up even when no GPU client
+    /// ever appears; it opens this same gate, but only from inside that task
+    /// and only once scanout is paused, because a gate opened at boot lets the
+    /// first client run the whole bring-up with the display live. The whole
+    /// nouveau-uAPI surface is still gated by `nvidia.nouveau_uapi`.
     ///
     /// Strictly one-shot: the console GSP boot must never be attempted twice (a
     /// second STARTCPU on a half-booted GSP is precisely how it wedges). If the
@@ -8223,6 +8240,32 @@ impl NvidiaGpu {
     /// later ioctl. Callers MUST invoke this with no DRM lock held — the boot
     /// takes RM/PCI paths, and `bringup_step14` is a `DrmScheme` trait method on
     /// `self` (in scope here), never the `nouveau_channels`/VM-state locks.
+    /// Reserve the next `GEM_NEW` handle from this GPU's private slice of the
+    /// driver-private handle range, or `None` once the slice is used up.
+    ///
+    /// A CAS loop rather than `fetch_add`, because the bound must hold
+    /// exactly: `fetch_add` past the end would hand out an id belonging to
+    /// the next GPU, and the registries these ids key into (`gem_mmap`,
+    /// `NOUVEAU_CPU_VMOS`) are global, so that id would resolve to the other
+    /// card's memory.
+    fn next_gem_handle(&self) -> Option<u32> {
+        let mut cur = self.nouveau_gem_next_handle.load(Ordering::Relaxed);
+        loop {
+            if cur >= self.nouveau_gem_handle_end {
+                return None;
+            }
+            match self.nouveau_gem_next_handle.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(cur),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
     fn ensure_console_gpu_brought_up(&self) {
         // Secondary GPUs are already state-loaded at boot by
         // `auto_bringup_compute`; only the console GPU is skipped there, so it is
@@ -12111,6 +12154,16 @@ impl NvidiaGpu {
                     crate::klog_warn!("[nouveau-uapi] GEM_NEW: GPU not attached to the RM yet");
                     return Err(nv::ENODEV);
                 };
+                // Reserved BEFORE the RM allocation so an exhausted slice
+                // costs nothing to unwind. Burning one id on a later failure
+                // is free: the slice holds 32Mi of them.
+                let Some(handle) = self.next_gem_handle() else {
+                    crate::klog_warn!(
+                        "[nouveau-uapi] GEM_NEW: this GPU's GEM handle slice is exhausted -- \
+                         refusing rather than handing out another card's handle"
+                    );
+                    return Err(nv::ENOMEM);
+                };
                 let alloc =
                     match nvidia_rm_sys::rm_init::gem_alloc(device_instance, req.info.size, sysmem)
                     {
@@ -12143,7 +12196,6 @@ impl NvidiaGpu {
                         );
                     }
                 }
-                let handle = self.nouveau_gem_next_handle.fetch_add(1, Ordering::Relaxed);
                 // Real host physical address for sysmem/GART objects. VRAM-only
                 // (ADDR_FBMEM) is not CPU-mmap-able: gem_map_cpu refuses FBMEM
                 // because memdescGetPhysAddr(AT_CPU) is a VRAM offset, not BAR1.

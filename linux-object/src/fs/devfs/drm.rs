@@ -74,6 +74,18 @@ static CE_PRESENT_ENABLED: core::sync::atomic::AtomicBool =
 /// BAR1 stays quiet during a deferred GSP-RM bring-up (hwcursor path).
 static SCANOUT_PAUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Nanoseconds-since-boot after which a pause set by [`set_scanout_paused_for`]
+/// expires by itself. `0` means "no watchdog" (a plain [`set_scanout_paused`]).
+static SCANOUT_PAUSE_DEADLINE_NS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// How long a deferred console-GPU bring-up may hold scanout paused before the
+/// watchdog resumes it anyway. Generous, because a real GSP boot + state-load
+/// on cold hardware is tens of seconds and cutting one short would put
+/// labwc's BAR1 traffic right back into the SEC2 window this exists to keep
+/// quiet. Bounded, because the alternative is a permanently frozen desktop.
+pub const SCANOUT_PAUSE_MAX: core::time::Duration = core::time::Duration::from_secs(90);
+
 /// Enable/disable the per-frame CE-offloaded present. Set at boot from the
 /// cmdline flags, and again after a deferred console-GPU bring-up, which can
 /// make a GPU able to present that was not able to when boot decided.
@@ -89,7 +101,12 @@ pub fn ce_present_enabled() -> bool {
 
 /// Pause/resume software+CE scanout. Used by deferred console-GPU GSP bring-up
 /// so labwc's frame loop does not write BAR1 during SEC2 STARTCPU.
+///
+/// Prefer [`set_scanout_paused_for`] when what follows the pause is a call into
+/// the hardware that can fail to return: this variant latches until someone
+/// calls it again with `false`, and nobody else will.
 pub fn set_scanout_paused(on: bool) {
+    SCANOUT_PAUSE_DEADLINE_NS.store(0, Ordering::SeqCst);
     SCANOUT_PAUSED.store(on, Ordering::SeqCst);
     if on {
         kernel_hal::klog_info!("[drm] scanout PAUSED (console GSP bring-up window)");
@@ -98,8 +115,49 @@ pub fn set_scanout_paused(on: bool) {
     }
 }
 
+/// Pause scanout with a watchdog: the pause lifts by itself after `max`, even
+/// if the code that set it never runs again.
+///
+/// The caller of the deferred console bring-up parks scanout around
+/// `bringup_step14`, which drives the SEC2 STARTCPU path -- the one known way
+/// this hardware wedges. A wedge (or a panic) there never reaches the matching
+/// `set_scanout_paused(false)`, and a latched pause is not a quiet
+/// degradation: `present_now_region` keeps *acknowledging* every flip while
+/// touching nothing, so the compositor runs happily and the screen is frozen
+/// forever. Expiring on a clock read, rather than from a second task, is what
+/// makes the recovery independent of any thread surviving.
+pub fn set_scanout_paused_for(max: core::time::Duration) {
+    let deadline = kernel_hal::timer::timer_now() + max;
+    SCANOUT_PAUSE_DEADLINE_NS.store(deadline.as_nanos() as u64, Ordering::SeqCst);
+    SCANOUT_PAUSED.store(true, Ordering::SeqCst);
+    kernel_hal::klog_info!(
+        "[drm] scanout PAUSED (console GSP bring-up window, watchdog {}s)",
+        max.as_secs()
+    );
+}
+
+/// Whether scanout is currently paused, expiring a watchdogged pause whose
+/// deadline has passed. Every reader goes through here so the expiry happens
+/// on the frame that needs the answer.
 pub fn scanout_paused() -> bool {
-    SCANOUT_PAUSED.load(Ordering::SeqCst)
+    if !SCANOUT_PAUSED.load(Ordering::SeqCst) {
+        return false;
+    }
+    let deadline = SCANOUT_PAUSE_DEADLINE_NS.load(Ordering::SeqCst);
+    if deadline == 0 || (kernel_hal::timer::timer_now().as_nanos() as u64) < deadline {
+        return true;
+    }
+    // Deadline passed: resume, once. Whoever loses the race just sees a
+    // resumed scanout, which is the point.
+    SCANOUT_PAUSE_DEADLINE_NS.store(0, Ordering::SeqCst);
+    if SCANOUT_PAUSED.swap(false, Ordering::SeqCst) {
+        kernel_hal::klog_warn!(
+            "[drm] scanout watchdog: la ventana de bring-up de la GPU de consola expiro sin \
+             reanudar (bring-up colgado o abortado) -- se reanuda el scanout para no dejar \
+             el escritorio congelado"
+        );
+    }
+    false
 }
 
 /// Master switch for the atomic-modesetting uAPI (`DRM_CLIENT_CAP_ATOMIC` +
@@ -1850,7 +1908,7 @@ pub fn move_cursor(x: i32, y: i32) {
 /// scene, which has no cursor baked in) and composite the new cursor on top.
 /// Only two ~64x64 windows are touched per move.
 pub fn repaint_for_cursor() {
-    if !software_kms_active() || SCANOUT_PAUSED.load(Ordering::SeqCst) {
+    if !software_kms_active() || scanout_paused() {
         return;
     }
     // Snapshot everything needed under the lock, and record the rect we are
@@ -2605,7 +2663,7 @@ pub fn present_now(fb_id: u32, crtc_id: u32) -> bool {
 pub fn present_now_region(fb_id: u32, crtc_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     // Deferred console GSP bring-up: acknowledge the flip to keep the
     // compositor alive, but do not touch the GOP framebuffer / CE path.
-    if SCANOUT_PAUSED.load(Ordering::SeqCst) {
+    if scanout_paused() {
         set_crtc_fb(crtc_id, fb_id);
         return true;
     }

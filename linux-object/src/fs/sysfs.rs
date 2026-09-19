@@ -1101,16 +1101,22 @@ fn drm_node_pci_index(minor: u32) -> Option<usize> {
 ///
 /// This replaces a fixed `Primary` / `ComputeOnly` role: with N cards a PCI
 /// device is simply whichever node pairs resolve onto it.
+///
+/// Enumerated from [`drm_class_entries`], NOT from the `/dev/dri` GPU table.
+/// The table is built from the registered DRM drivers, and `card0` exists
+/// without one: a UEFI GOP framebuffer has a display but no DRM driver and no
+/// PCI GPU node, which is the ordinary QEMU case and the software-KMS path
+/// labwc drives. Reading the table here made `/sys/devices/pci.../drm`
+/// disappear on exactly those machines, which dangles the
+/// `/sys/class/drm/card0` symlink, so `drmGetDevices2` identifies no device
+/// and the compositor finds no card to open -- a desktop that never appears.
+/// [`drm_class_entries`] already treats `card0`/`renderD128` as existing
+/// whenever [`drm_card0_pci_index`] resolves, which is the pre-table rule.
 fn drm_nodes_for_pci_index(pci_index: usize) -> Vec<u32> {
-    let mut out = Vec::new();
-    for node in crate::fs::devfs::drm::gpu_nodes() {
-        for minor in [node.card_minor(), node.render_minor()] {
-            if drm_node_pci_index(minor) == Some(pci_index) {
-                out.push(minor);
-            }
-        }
-    }
-    out
+    drm_class_entries()
+        .into_iter()
+        .filter(|m| drm_node_pci_index(*m) == Some(pci_index))
+        .collect()
 }
 
 /// The DRM minors that have a sysfs node, in listing order: `card0`,
@@ -1118,6 +1124,10 @@ fn drm_nodes_for_pci_index(pci_index: usize) -> Vec<u32> {
 ///
 /// `/sys/class/drm` and `/sys/dev/char` both enumerate from this, so the two
 /// listings cannot go out of step, and neither can drift from `/dev/dri`.
+/// `card0` and `renderD128` are listed whenever [`drm_card0_pci_index`]
+/// resolves, with no GPU table involved: `/dev/dri/card0` is created on the
+/// same condition (a display OR a DRM driver), so a framebuffer-only machine
+/// has the node and must have its sysfs identity too.
 fn drm_class_entries() -> Vec<u32> {
     if drm_card0_pci_index().is_none() {
         return Vec::new();

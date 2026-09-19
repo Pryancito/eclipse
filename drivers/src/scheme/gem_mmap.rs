@@ -23,12 +23,93 @@
 //! `linux-object`'s counter); callers must. Convention: `linux-object`'s
 //! `DRM_STATE.next_handle_id` starts at 1 and grows sequentially, so
 //! driver-private handles registered here use the high half of the `u32`
-//! range instead (see `nouveau_uapi.rs`'s `nouveau_gem_next_handle`
-//! starting at `0x8000_0001`). Collision is only possible after billions
-//! of `CREATE_DUMB` allocations in a single boot, not a real constraint.
+//! range instead. Collision with that table is only possible after
+//! billions of `CREATE_DUMB` allocations in a single boot, not a real
+//! constraint.
+//!
+//! The *other* collision is between GPUs, and it is very real: this table
+//! (and `linux-object`'s `NOUVEAU_CPU_VMOS`) is keyed by a bare `u32`, with
+//! no GPU in the key, while every `NvidiaGpu` runs its own `GEM_NEW`
+//! counter. Two cards handing out the same first handle used to alias each
+//! other here, so a `mmap`/PRIME on one node could resolve to the other
+//! card's physical range and a `GEM_CLOSE` could free the wrong object.
+//! [`alloc_handle_slice`] fixes that at the source: each GPU reserves a
+//! disjoint slice of the driver-private half at construction and never
+//! hands out an id outside it, which makes the global key unique again.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 use lock::Mutex;
+
+/// First id of the driver-private handle range: the high half of `u32`,
+/// disjoint from `linux-object`'s own sequential-from-1 handle ids.
+pub const DRIVER_HANDLE_BASE: u32 = 0x8000_0000;
+
+/// Handles reserved for one GPU (32Mi). A single boot cannot plausibly run
+/// through that many `GEM_NEW`s on one card, and it still leaves room for
+/// [`HANDLE_SLICES`] cards.
+pub const HANDLES_PER_GPU: u32 = 0x0200_0000;
+
+/// How many GPUs can hold a private slice (64, matching the `/dev/dri` node
+/// table's cap). Past that, [`alloc_handle_slice`] refuses rather than
+/// wrapping onto another card's ids.
+pub const HANDLE_SLICES: u32 = DRIVER_HANDLE_BASE / HANDLES_PER_GPU;
+
+/// Next free slice, in registration order. Boot-time only in practice (one
+/// `fetch_add` per `NvidiaGpu::new`).
+static NEXT_SLICE: AtomicU32 = AtomicU32::new(0);
+
+/// A GPU's private, half-open range of driver-private GEM handle ids.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HandleSlice {
+    base: u32,
+    end: u32,
+}
+
+impl HandleSlice {
+    /// First id this GPU may hand out. `base` itself is skipped for slice 0
+    /// so that handle `0x8000_0000` is never used -- historically the
+    /// counter started at `0x8000_0001`.
+    pub const fn base(&self) -> u32 {
+        self.base
+    }
+    /// One past the last id this GPU may hand out.
+    pub const fn end(&self) -> u32 {
+        self.end
+    }
+    /// An empty slice: every id is out of range, so `GEM_NEW` fails cleanly
+    /// instead of aliasing another GPU. Handed out once the slices run out.
+    pub const fn exhausted() -> Self {
+        Self {
+            base: u32::MAX,
+            end: u32::MAX,
+        }
+    }
+    pub const fn contains(&self, handle: u32) -> bool {
+        handle >= self.base && handle < self.end
+    }
+}
+
+/// Reserve the next per-GPU slice of the driver-private handle range. Called
+/// once per GPU, from `NvidiaGpu::new`.
+pub fn alloc_handle_slice() -> HandleSlice {
+    let slot = NEXT_SLICE.fetch_add(1, Ordering::Relaxed);
+    if slot >= HANDLE_SLICES {
+        crate::klog_warn!(
+            "[gem] more than {} GPUs asked for a GEM handle slice -- GEM_NEW on this one will \
+             fail rather than alias another card's handles",
+            HANDLE_SLICES
+        );
+        return HandleSlice::exhausted();
+    }
+    let base = DRIVER_HANDLE_BASE + slot * HANDLES_PER_GPU;
+    HandleSlice {
+        // Skip id `0x8000_0000` on the first slice only, so the very first
+        // handle stays `0x8000_0001` as it has always been.
+        base: if slot == 0 { base + 1 } else { base },
+        end: base + HANDLES_PER_GPU,
+    }
+}
 
 struct MappedGem {
     handle: u32,
@@ -216,4 +297,52 @@ pub fn lookup_by_phys(phys_addr: u64) -> Option<(u32, u64)> {
         .iter()
         .find(|e| e.phys_addr == phys_addr)
         .map(|e| (e.handle, e.size))
+}
+
+#[cfg(test)]
+mod handle_slice_tests {
+    use super::*;
+
+    /// The property the whole thing exists for: two GPUs never see the same
+    /// id. `MAPPINGS` and `linux-object`'s `NOUVEAU_CPU_VMOS` are keyed by a
+    /// bare `u32`, so an overlap here is a buffer resolving to the wrong
+    /// card's memory.
+    #[test]
+    fn consecutive_slices_are_disjoint() {
+        let a = alloc_handle_slice();
+        let b = alloc_handle_slice();
+
+        assert!(a.base() >= DRIVER_HANDLE_BASE);
+        assert!(a.base() < a.end());
+        // Other tests share the counter, so b may be further along than the
+        // next slot -- never before it.
+        assert!(a.end() <= b.base());
+
+        assert!(a.contains(a.base()));
+        assert!(a.contains(a.end() - 1));
+        assert!(!a.contains(a.end()));
+        assert!(!a.contains(b.base()));
+        assert!(!b.contains(a.end() - 1));
+    }
+
+    /// Past the last slice the answer is "no handles", not "someone else's
+    /// handles": `GEM_NEW` fails cleanly instead of aliasing another GPU.
+    #[test]
+    fn the_exhausted_slice_holds_nothing() {
+        let s = HandleSlice::exhausted();
+        assert!(!s.contains(0));
+        assert!(!s.contains(DRIVER_HANDLE_BASE));
+        assert!(!s.contains(u32::MAX));
+    }
+
+    /// The slices tile the driver-private half exactly: no id in
+    /// `DRIVER_HANDLE_BASE..=u32::MAX` belongs to no slice, and the last
+    /// slice ends exactly at the top of `u32` rather than wrapping to 0.
+    #[test]
+    fn the_slices_tile_the_driver_private_half() {
+        assert_eq!(HANDLE_SLICES * HANDLES_PER_GPU, DRIVER_HANDLE_BASE);
+        let last_end =
+            (DRIVER_HANDLE_BASE as u64) + (HANDLE_SLICES as u64) * (HANDLES_PER_GPU as u64);
+        assert_eq!(last_end, (u32::MAX as u64) + 1);
+    }
 }
