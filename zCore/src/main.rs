@@ -517,12 +517,18 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 klog_info!("Eclipse: present por CPU (CE-offload: no compute GPU ready; try nvidia.cepresent)");
             }
             // NOTE: do NOT auto-bring-up the CONSOLE GPU on the boot path.
-            // Deferred bring-up for nvidia.hwcursor is scheduled AFTER 100%
-            // (see schedule_deferred_hwcursor_bringup) with scanout paused.
+            // Deferred bring-up is scheduled AFTER 100% (see
+            // schedule_deferred_console_bringup) with scanout paused.
             if options.cmdline.contains("nvidia.hwcursor") {
                 klog_info!(
                     "Eclipse: nvidia.hwcursor ON — bring-up diferido tras escritorio \
                      (scanout pausado); cursor software hasta entonces"
+                );
+            }
+            if options.cmdline.contains("nvidia.console_gpu") {
+                klog_info!(
+                    "Eclipse: nvidia.console_gpu ON — bring-up diferido de la GPU de consola \
+                     tras escritorio; si sube, el present pasa a su propio copy engine"
                 );
             }
             // Opt-in CE present on DRM page_flip (GOP via copy-engine). Default
@@ -595,7 +601,13 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 }
             }
             // On-demand console GSP bring-up (default OFF: use /proc/gpustep14).
-            if options.cmdline.contains("nvidia.console_gsp") {
+            // `nvidia.console_gpu` implies it: that flag's whole point is to
+            // get the console GPU state-loaded, and `ensure_console_gpu_brought_up`
+            // refuses without this gate, so requiring both flags would only be
+            // a way to ask for the feature and silently not get it.
+            if options.cmdline.contains("nvidia.console_gsp")
+                || options.cmdline.contains("nvidia.console_gpu")
+            {
                 kernel_hal::drivers::set_console_gsp_enabled(true);
                 klog_info!(
                     "Eclipse: nvidia.console_gsp -- console GPU GSP on-demand bring-up ENABLED"
@@ -676,8 +688,19 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // Keep secondary CPUs idle until root is mounted and init is spawned.
             STARTED.store(true, Ordering::SeqCst);
             kernel_hal::console::early_progress_bar(100);
-            if options.cmdline.contains("nvidia.hwcursor") {
-                schedule_deferred_hwcursor_bringup();
+            // Either flag wants the console GPU up; the task runs once and
+            // serves both (hardware cursor plane and/or local CE present).
+            let want_console_gpu = options.cmdline.contains("nvidia.console_gpu");
+            if options.cmdline.contains("nvidia.hwcursor") || want_console_gpu {
+                let reason = if want_console_gpu {
+                    "nvidia.console_gpu"
+                } else {
+                    "nvidia.hwcursor"
+                };
+                schedule_deferred_console_bringup(
+                    reason,
+                    !options.cmdline.contains("nvidia.nocepresent"),
+                );
             }
             #[cfg(all(feature = "linux", not(feature = "libos")))]
             {
@@ -840,14 +863,32 @@ fn auto_bringup_compute_gpus() -> bool {
 
 /// After the progress bar hits 100% and labwc can start: wait for KD_GRAPHICS,
 /// pause scanout (so BAR1 is quiet), run console-GPU gpustep14 once, then
-/// resume. On success the next MODE_CURSOR can take the HW plane; on failure
-/// the software cursor stays for the rest of the boot. Never blocks boot.
+/// resume. Never blocks boot, and never runs on the boot progress path — a
+/// wedged SEC2 STARTCPU store there would hang the machine with nothing on
+/// screen, whereas here the desktop is already up and the worst case is that
+/// the console GPU stays cold.
+///
+/// Two flags land here and the task serves both (`reason` only names which one
+/// asked, for the log):
+///
+/// * `nvidia.hwcursor` — on success the next `MODE_CURSOR` can take the
+///   hardware plane; on failure the software cursor stays.
+/// * `nvidia.console_gpu` — on success the console GPU can present its own
+///   framebuffer with its own copy engine. On a single-GPU box this is the
+///   only route to any GPU-accelerated present at all: there is no second card
+///   to P2P from, so `auto_bringup_compute_gpus` brings up nothing and every
+///   frame is a CPU blit.
+///
+/// `may_enable_ce` is false when the operator passed `nvidia.nocepresent`; the
+/// bring-up still runs (the cursor plane is a separate win) but the present
+/// path is left alone.
 #[cfg(feature = "linux")]
-fn schedule_deferred_hwcursor_bringup() {
+fn schedule_deferred_console_bringup(reason: &'static str, may_enable_ce: bool) {
     klog_info!(
-        "Eclipse: nvidia.hwcursor — tarea diferida programada (espera desktop, luego gpustep14)"
+        "Eclipse: {} — tarea diferida programada (espera desktop, luego gpustep14)",
+        reason
     );
-    kernel_hal::thread::spawn(async {
+    kernel_hal::thread::spawn(async move {
         use core::time::Duration;
         use kernel_hal::console::{kd_mode, KD_GRAPHICS};
         use kernel_hal::timer::timer_now;
@@ -867,11 +908,13 @@ fn schedule_deferred_hwcursor_bringup() {
             // Let labwc finish its first few frames before freezing scanout.
             kernel_hal::thread::sleep_until(timer_now() + Duration::from_secs(3)).await;
             kernel_hal::klog_info!(
-                "Eclipse: nvidia.hwcursor — desktop en KD_GRAPHICS; pausando scanout e iniciando bring-up consola"
+                "Eclipse: {} — desktop en KD_GRAPHICS; pausando scanout e iniciando bring-up consola",
+                reason
             );
         } else {
             kernel_hal::klog_info!(
-                "Eclipse: nvidia.hwcursor — timeout esperando KD_GRAPHICS; intentando bring-up igual (scanout pausado)"
+                "Eclipse: {} — timeout esperando KD_GRAPHICS; intentando bring-up igual (scanout pausado)",
+                reason
             );
         }
 
@@ -879,9 +922,12 @@ fn schedule_deferred_hwcursor_bringup() {
         // Brief settle so in-flight blits/CE finish before SEC2.
         kernel_hal::thread::sleep_until(timer_now() + Duration::from_millis(200)).await;
 
+        // Every registered driver is asked; the method self-guards to the GPU
+        // that drives the boot display and returns an empty line otherwise, so
+        // this is correct for 1, 2 or N cards without counting them here.
         let mut any = false;
         for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-            let line = d.deferred_console_bringup_for_hwcursor();
+            let line = d.deferred_console_bringup();
             if !line.is_empty() {
                 any = true;
                 kernel_hal::klog_info!("Eclipse: NVIDIA {}", line);
@@ -889,14 +935,41 @@ fn schedule_deferred_hwcursor_bringup() {
         }
         if !any {
             kernel_hal::klog_info!(
-                "Eclipse: nvidia.hwcursor — ninguna GPU consola actuó en bring-up diferido"
+                "Eclipse: {} — ninguna GPU consola actuó en bring-up diferido",
+                reason
             );
         }
 
         linux_object::fs::devfs::drm::set_scanout_paused(false);
-        kernel_hal::klog_info!(
-            "Eclipse: nvidia.hwcursor — bring-up diferido terminado; mueve el ratón para activar el plano HW si RM quedó listo"
-        );
+
+        // The boot-time CE decision was taken before this GPU existed as a
+        // presenter, so re-take it now. On a single-GPU box this is the moment
+        // present stops being a CPU blit; on a dual-GPU box CE is normally
+        // already on and this is a no-op. Only ever turns CE ON: an operator
+        // who asked for `nvidia.nocepresent`, or a CE path that wedged itself
+        // off earlier, is not overridden from here.
+        if may_enable_ce && !linux_object::fs::devfs::drm::ce_present_enabled() {
+            let now_ready = kernel_hal::drivers::all_drm()
+                .as_vec()
+                .iter()
+                .any(|d| d.ce_present_ready());
+            if now_ready {
+                linux_object::fs::devfs::drm::set_ce_present_enabled(true);
+                kernel_hal::klog_info!(
+                    "Eclipse: NVIDIA CE-offload present ENABLED (auto: GPU lista tras bring-up diferido)"
+                );
+            }
+        }
+
+        // Only the hwcursor request has a "now move the mouse" follow-up; a
+        // console_gpu request has nothing for the operator to do.
+        if reason == "nvidia.hwcursor" {
+            kernel_hal::klog_info!(
+                "Eclipse: nvidia.hwcursor — bring-up diferido terminado; mueve el ratón para activar el plano HW si RM quedó listo"
+            );
+        } else {
+            kernel_hal::klog_info!("Eclipse: {} — bring-up diferido terminado", reason);
+        }
     });
 }
 

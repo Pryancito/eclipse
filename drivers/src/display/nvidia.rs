@@ -4881,19 +4881,27 @@ impl DrmScheme for NvidiaGpu {
     }
 
     fn ce_present_ready(&self) -> bool {
-        // Dual-GPU: the compute GPU (not driving GOP) state-loads at boot and
-        // can P2P-copy frames into the console framebuffer. The console GPU
-        // itself is never auto-booted (SEC2 wedge), so it never reports ready.
-        !self.drives_boot_display() && self.rm_device_instance.lock().is_some()
+        // State-loaded is the whole condition. It used to also require
+        // `!drives_boot_display()`, because the console GPU was never brought
+        // up at all — but that made the predicate encode a bring-up policy
+        // rather than a capability, so a console GPU brought up by
+        // `nvidia.console_gpu` (or a manual `/proc/gpustep14`) still reported
+        // "not ready" and the desktop kept presenting with the CPU.
+        //
+        // A state-loaded console GPU is in fact the BEST CE presenter of the
+        // two: `ce_present` already has the console/FBMEM branch, and it
+        // writes its own framebuffer, so the copy never crosses PCIe and
+        // never depends on P2P surviving ACS/IOMMU.
+        self.rm_device_instance.lock().is_some()
     }
 
-    fn deferred_console_bringup_for_hwcursor(&self) -> String {
+    fn deferred_console_bringup(&self) -> String {
         if !self.drives_boot_display() {
             return String::new();
         }
         if self.rm_device_instance.lock().is_some() {
             return alloc::format!(
-                "GPU consola {:02x}:{:02x}.0 {} ya state-loaded — cursor HW listo",
+                "GPU consola {:02x}:{:02x}.0 {} ya state-loaded",
                 self.pci_bus,
                 self.pci_device,
                 self.gpu_model,
@@ -4903,14 +4911,14 @@ impl DrmScheme for NvidiaGpu {
         self.ensure_console_gpu_brought_up();
         if self.rm_device_instance.lock().is_some() {
             alloc::format!(
-                "GPU consola {:02x}:{:02x}.0 {} listo — cursor HW habilitado (diferido)",
+                "GPU consola {:02x}:{:02x}.0 {} lista (bring-up diferido) — present CE local y cursor HW",
                 self.pci_bus,
                 self.pci_device,
                 self.gpu_model,
             )
         } else {
             alloc::format!(
-                "GPU consola {:02x}:{:02x}.0 {} sin RM tras bring-up diferido — cursor software",
+                "GPU consola {:02x}:{:02x}.0 {} sin RM tras bring-up diferido — se sigue con present por CPU y cursor software",
                 self.pci_bus,
                 self.pci_device,
                 self.gpu_model,
@@ -8202,9 +8210,11 @@ impl NvidiaGpu {
     /// it), and predates the GSP-boot TLB-shootdown deadlock fixes (NMI-ack).
     /// The target also has no disk to capture a manual `cat`, so automating this
     /// is the only path to a working console GPU there. Default **OFF** —
-    /// enable with `nvidia.console_gsp` (safer boots keep manual
-    /// `/proc/gpustep14`). The whole nouveau-uAPI surface is still gated by
-    /// `nvidia.nouveau_uapi`.
+    /// enable with `nvidia.console_gsp`, or with `nvidia.console_gpu`, which
+    /// implies it and additionally schedules the deferred bring-up so the
+    /// console GPU comes up even when no GPU client ever appears (safer boots
+    /// keep manual `/proc/gpustep14`). The whole nouveau-uAPI surface is still
+    /// gated by `nvidia.nouveau_uapi`.
     ///
     /// Strictly one-shot: the console GSP boot must never be attempted twice (a
     /// second STARTCPU on a half-booted GSP is precisely how it wedges). If the

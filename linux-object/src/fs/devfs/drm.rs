@@ -62,10 +62,11 @@ static PRESENT_FRAME_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::
 static CE_REPACK_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Master switch for the per-frame GPU copy-engine present (`ce_present`).
-/// Enabled automatically when a compute GPU finishes boot bring-up (dual RTX:
-/// P2P copy into the console GOP FB), or explicitly via `nvidia.cepresent`.
-/// Opt out with `nvidia.nocepresent`. On failure the path auto-wedges and
-/// falls back to the CPU blit for the rest of the boot.
+/// Enabled automatically when a GPU finishes bring-up -- a compute GPU at boot
+/// (dual RTX: P2P copy into the console GOP FB), or the console GPU itself
+/// after the deferred `nvidia.console_gpu` bring-up -- or explicitly via
+/// `nvidia.cepresent`. Opt out with `nvidia.nocepresent`. On failure the path
+/// auto-wedges and falls back to the CPU blit for the rest of the boot.
 static CE_PRESENT_ENABLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -73,10 +74,17 @@ static CE_PRESENT_ENABLED: core::sync::atomic::AtomicBool =
 /// BAR1 stays quiet during a deferred GSP-RM bring-up (hwcursor path).
 static SCANOUT_PAUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Enable/disable the per-frame CE-offloaded present (set once at boot from
-/// the `nvidia.cepresent` cmdline flag).
+/// Enable/disable the per-frame CE-offloaded present. Set at boot from the
+/// cmdline flags, and again after a deferred console-GPU bring-up, which can
+/// make a GPU able to present that was not able to when boot decided.
 pub fn set_ce_present_enabled(on: bool) {
     CE_PRESENT_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// Whether the CE present path is currently on, so the deferred bring-up can
+/// tell "boot already enabled this" from "boot found nothing ready".
+pub fn ce_present_enabled() -> bool {
+    CE_PRESENT_ENABLED.load(Ordering::Relaxed)
 }
 
 /// Pause/resume software+CE scanout. Used by deferred console-GPU GSP bring-up
@@ -1042,6 +1050,37 @@ fn blit_chunked(
     }
 }
 
+/// Offers the frame to each registered DRM driver until one takes it, best CE
+/// presenter first: the console GPU, then everyone else. Returns whether any
+/// driver took it.
+///
+/// The order matters because the two copies are not equivalent. A console GPU
+/// writes its OWN framebuffer, so the copy stays inside the card. A compute
+/// GPU writes the console card's BAR1 across PCIe peer-to-peer, which is
+/// slower and only works while ACS/IOMMU let P2P through. Registration order
+/// picked neither on purpose: `register_driver` does `insert(0)`, so the list
+/// is simply the reverse of the PCI probe order and whichever card happened to
+/// be probed last won.
+///
+/// This changes nothing unless a console GPU is actually state-loaded, which
+/// only happens with `nvidia.console_gpu` or a manual `/proc/gpustep14` -- a
+/// cold console GPU declines every CE call regardless of where it sits in the
+/// list. It is also written for any number of cards: N compute GPUs keep their
+/// relative order behind the console one.
+///
+/// Two filtered passes over the device list rather than a sorted copy, because
+/// this runs on the per-frame present path and must not allocate. The read
+/// guard is held across the calls, exactly as the plain
+/// `for d in all_drm().as_vec().iter()` loops it replaced did.
+fn ce_try_in_order(
+    mut try_one: impl FnMut(&Arc<dyn zcore_drivers::scheme::DrmScheme>) -> bool,
+) -> bool {
+    let all = kernel_hal::drivers::all_drm();
+    let all = all.as_vec();
+    all.iter().filter(|d| d.is_console_gpu()).any(&mut try_one)
+        || all.iter().filter(|d| !d.is_console_gpu()).any(&mut try_one)
+}
+
 /// FromDevice clflush of the CPU-mapped GEM span covering a scanout damage
 /// rect (including pitch padding between the first and last pixel). Needed
 /// only when the CPU will *read* the buffer (CPU blit / CE staging repack).
@@ -1280,19 +1319,16 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
             // FromDevice + repack+flat CE → CPU blit.
             let row_bytes = (blit_w as usize).saturating_mul(4) as u32;
             let src_pa = fb.phys_addr.saturating_add(src_byte_off);
-            for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-                if d.ce_present_2d_pitched(
+            blitted_by_ce = ce_try_in_order(|d| {
+                d.ce_present_2d_pitched(
                     src_pa,
                     fb.pitch,
                     dst_byte_off,
                     info.pitch,
                     row_bytes,
                     blit_h,
-                ) {
-                    blitted_by_ce = true;
-                    break;
-                }
-            }
+                )
+            });
             // Fallback: CPU reads the GEM, so FromDevice first, then repack
             // into staging at scanout pitch and flat CE.
             //
@@ -1321,24 +1357,14 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
                 )
                 .unwrap_or((0, 0));
                 if ce_src_pa != 0 && ce_size != 0 {
-                    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-                        if d.ce_present(ce_src_pa, ce_size) {
-                            blitted_by_ce = true;
-                            break;
-                        }
-                    }
+                    blitted_by_ce = ce_try_in_order(|d| d.ce_present(ce_src_pa, ce_size));
                 }
             }
         } else {
             // Flat CE path: pitches match, a single flat copy covers the frame.
             let ce_src_pa = fb.phys_addr;
             let ce_size = (info.pitch as u64) * (blit_h as u64);
-            for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-                if d.ce_present(ce_src_pa, ce_size) {
-                    blitted_by_ce = true;
-                    break;
-                }
-            }
+            blitted_by_ce = ce_try_in_order(|d| d.ce_present(ce_src_pa, ce_size));
         }
         if !blitted_by_ce && !CE_NO_TAKER_LOGGED.swap(true, Ordering::Relaxed) {
             // Every GPU declined (wedged, not state-loaded, or no boot FB):
