@@ -7,7 +7,7 @@ use alloc::sync::Arc;
 use core::any::Any;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::task::{Context, Poll as TaskPoll};
 use core::time::Duration;
 
@@ -294,6 +294,157 @@ impl DrmDev {
         }
     }
 
+    /// Wait for a commit's `IN_FENCE_FD` before the sync arm presents.
+    ///
+    /// An explicit-sync client hands the plane a fence meaning "my rendering
+    /// into this buffer has landed". We accepted that property and then
+    /// scanned the buffer out regardless, so a commit that arrived before the
+    /// GPU finished put a half-drawn frame on screen -- the tearing and torn
+    /// rectangles a compositor is using explicit sync precisely to avoid.
+    ///
+    /// Same split as [`Self::syncobj_wait_sleep`], and for the same reason:
+    /// `io_control` is synchronous and `syncobj::wait` spin-polls, so waiting
+    /// there would peg a core for the whole timeout. Here we are in the async
+    /// syscall path and can really sleep.
+    ///
+    /// Every early return leaves the commit behaving exactly as before this
+    /// existed: a malformed request, an fd that is not a fence, or a TEST_ONLY
+    /// probe simply does not wait, and the sync arm reports on it as usual.
+    pub async fn atomic_in_fence_sleep(&self, data: usize) {
+        let Some((handle, point)) = self.atomic_in_fence(data) else {
+            return;
+        };
+        // Bounded on purpose. Linux waits on an in-fence indefinitely, but a
+        // fence that never signals must not freeze the desktop: presenting a
+        // frame early is a visible glitch, presenting nothing ever is a hang.
+        // 100 ms is several frames at any refresh rate we drive, so a fence
+        // that misses it is broken rather than slow -- and the cost of being
+        // wrong is a stutter, not a freeze.
+        const IN_FENCE_TIMEOUT_US: u64 = 100_000;
+        let now = kernel_hal::timer::timer_now();
+        let deadline_us = now.as_micros() as u64 + IN_FENCE_TIMEOUT_US;
+        let handles = [handle];
+        let points = [point];
+        loop {
+            let _ = zcore_drivers::scheme::syncobj::poll_pending();
+            match zcore_drivers::scheme::syncobj::wait_ready(
+                &handles,
+                Some(&points),
+                true,
+                deadline_us,
+            ) {
+                Some(Ok(_)) => return,
+                Some(Err(outcome)) => {
+                    if matches!(
+                        outcome,
+                        zcore_drivers::scheme::syncobj::WaitOutcome::Timeout
+                    ) {
+                        // Budgeted, not per-frame. A fence that never signals
+                        // times out on EVERY commit, and klog writes
+                        // synchronously to the UART -- an uncapped warning here
+                        // would be one line per frame forever, which is how
+                        // input has been starved on this kernel before.
+                        static TIMEOUT_REPORTS: AtomicU32 = AtomicU32::new(0);
+                        const MAX_TIMEOUT_REPORTS: u32 = 8;
+                        let n = TIMEOUT_REPORTS.fetch_add(1, Ordering::Relaxed);
+                        if n < MAX_TIMEOUT_REPORTS {
+                            log::warn!(
+                                "[drm] ATOMIC IN_FENCE_FD: syncobj handle={} point={} did not \
+                                 signal within {} us; presenting anyway (frame may tear){}",
+                                handle,
+                                point,
+                                IN_FENCE_TIMEOUT_US,
+                                if n + 1 == MAX_TIMEOUT_REPORTS {
+                                    " -- further in-fence timeouts will not be reported"
+                                } else {
+                                    ""
+                                }
+                            );
+                        }
+                    }
+                    return;
+                }
+                None => {
+                    let now = kernel_hal::timer::timer_now();
+                    let abs = core::time::Duration::from_micros(deadline_us);
+                    let next = now + core::time::Duration::from_millis(1);
+                    let wake = if abs < next { abs } else { next };
+                    if wake <= now {
+                        return;
+                    }
+                    kernel_hal::thread::sleep_until(wake).await;
+                }
+            }
+        }
+    }
+
+    /// The fence a pending atomic commit is waiting on, as `(syncobj handle,
+    /// point)`, or `None` when there is nothing to wait for.
+    ///
+    /// Re-walks the request's property arrays looking for `IN_FENCE_FD`. That
+    /// duplicates the sync arm's walk, but this runs before it and must not
+    /// disturb it: every check here is read-only and every failure is a
+    /// `None` that simply skips the wait.
+    fn atomic_in_fence(&self, data: usize) -> Option<(u32, u64)> {
+        use crate::fs::{FileDesc, SyncobjHandle};
+        use crate::process::ProcessExt;
+        use zircon_object::task::Thread;
+
+        if !self.file.atomic_client() {
+            return None;
+        }
+        if ucheck(data, core::mem::size_of::<DrmModeAtomic>()).is_err() {
+            return None;
+        }
+        let req = unsafe { *(data as *const DrmModeAtomic) };
+        // A TEST_ONLY probe presents nothing, so it has nothing to wait for --
+        // and wlroots test-commits its swapchain constantly.
+        if req.flags & DRM_MODE_ATOMIC_TEST_ONLY != 0 {
+            return None;
+        }
+        if req.count_objs == 0 || req.count_objs > 64 || req.count_props_ptr == 0 {
+            return None;
+        }
+        ucheck_n::<u32>(req.count_props_ptr as usize, req.count_objs as usize).ok()?;
+        let mut prop_idx = 0usize;
+        let mut fd: Option<i32> = None;
+        for i in 0..req.count_objs as usize {
+            let count_props = unsafe { *(req.count_props_ptr as *const u32).add(i) };
+            if count_props > 64 {
+                return None;
+            }
+            if count_props > 0 && (req.props_ptr == 0 || req.prop_values_ptr == 0) {
+                return None;
+            }
+            let span = prop_idx + count_props as usize;
+            ucheck_n::<u32>(req.props_ptr as usize, span).ok()?;
+            ucheck_n::<u64>(req.prop_values_ptr as usize, span).ok()?;
+            for _ in 0..count_props {
+                let prop_id = unsafe { *(req.props_ptr as *const u32).add(prop_idx) };
+                let value = unsafe { *(req.prop_values_ptr as *const u64).add(prop_idx) };
+                prop_idx += 1;
+                // Last one wins, matching the sync arm's staging.
+                if prop_id == PROP_IN_FENCE_FD && (value as i32) >= 0 {
+                    fd = Some(value as i32);
+                }
+            }
+        }
+        let fd = fd?;
+        let thread = kernel_hal::thread::get_current_thread()?
+            .downcast::<Thread>()
+            .ok()?;
+        let linux = thread.proc().try_linux()?;
+        let file = linux.get_file_like(FileDesc::from(fd as usize)).ok()?;
+        let sync = file.downcast_ref::<SyncobjHandle>()?;
+        // A sync_file fd names one fence ("handle reaches point"); a plain
+        // syncobj fd names whatever its object currently carries.
+        let point = match sync.sync_file_point {
+            Some(p) => p,
+            None => zcore_drivers::scheme::syncobj::export_snapshot(sync.handle)?,
+        };
+        Some((sync.handle, point))
+    }
+
     /// Returns the [`VmObject`] representing the file with given `offset` and `len`.
     pub fn get_vmo(&self, offset: usize, len: usize) -> Result<Arc<VmObject>> {
         // MAP_DUMB handed userspace a page-aligned fake mmap offset that encodes
@@ -333,6 +484,12 @@ impl DrmDev {
 /// [`DrmDev::wait_vblank_sleep`]) and lets the sync arm below fill in the
 /// reply once the requested vblank has actually arrived.
 pub const WAIT_VBLANK_IOCTL: u32 = DRM_IOCTL_WAIT_VBLANK;
+
+/// The atomic-commit ioctl. Used by `sys_ioctl` to run
+/// [`DrmDev::atomic_in_fence_sleep`] before `io_control`, so a commit
+/// carrying an `IN_FENCE_FD` waits for the client's rendering to land before
+/// the sync arm scans that buffer out.
+pub const ATOMIC_IOCTL: u32 = DRM_IOCTL_MODE_ATOMIC;
 
 /// True for any of the four `SYNCOBJ_WAIT` / `TIMELINE_WAIT` ioctl numbers
 /// (classic + deadline-sized). Used by `sys_ioctl` to run
@@ -1416,9 +1573,10 @@ fn atomic_stage(upd: &mut drm::AtomicUpdate, obj_id: u32, prop_id: u32, value: u
             PROP_SRC_Y => upd.src_y = Some(value as u32),
             PROP_SRC_W => upd.src_w = Some(value as u32),
             PROP_SRC_H => upd.src_h = Some(value as u32),
-            // IN_FENCE_FD: -1 = none (ignore); >= 0 accepted as a no-op so
-            // explicit-sync compositors do not fail the commit. Real wait on
-            // the sync_file is not wired yet.
+            // IN_FENCE_FD: -1 = none (ignore). A real fd is waited for before
+            // the commit presents -- see `DrmDev::atomic_in_fence_sleep`, which
+            // runs in the async syscall path ahead of this sync arm. Staging it
+            // here is still what makes the commit accept the property.
             PROP_IN_FENCE_FD => {
                 let fd = value as i32;
                 if fd < -1 {

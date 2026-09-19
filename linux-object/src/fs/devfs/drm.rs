@@ -2913,8 +2913,11 @@ pub struct AtomicUpdate {
     pub src_w: Option<u32>,
     /// Plane "SRC_H" (16.16).
     pub src_h: Option<u32>,
-    /// Plane "IN_FENCE_FD" (`-1` = none). Staged for acceptance only; the
-    /// software pipeline does not wait on in-fences yet.
+    /// Plane "IN_FENCE_FD" (`-1` = none). The wait happens before the commit
+    /// reaches here, in `DrmDev::atomic_in_fence_sleep`: `atomic_commit` is
+    /// synchronous and has no process context to resolve the fd against, so
+    /// the async syscall path resolves and waits, and this field records that
+    /// the property was accepted.
     pub in_fence_fd: Option<i32>,
     /// CRTC "ACTIVE".
     pub active: Option<bool>,
