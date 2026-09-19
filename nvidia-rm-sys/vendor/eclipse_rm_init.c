@@ -120,64 +120,6 @@ extern int nv_printf(unsigned int debuglevel, const char *printf_format, ...);
 #define ECLIPSE_TRACE(msg) nv_printf(0, "[eclipse-rm-trace] " msg "\n")
 
 /*
- * 615.71.09 replaced RM_API's long-argument dma Map/Unmap entry points with
- * the same struct-based parameter blocks the NvRmMapMemoryDma() user ABI has
- * always used (NVOS46_PARAMETERS / NVOS47_PARAMETERS), so `eclipseRmApiMapDma(pRmApi,
- * hClient, hDevice, ...)` no longer compiles. These two shims keep the old
- * call shape at the ~7 call sites below rather than open-coding a parameter
- * block at each one.
- *
- * Faithful to 570.144's rmapiMapWithSecInfo (mapping.c): that version
- * portMemSet its RS_INTER_MAP_PARAMS to 0 and then filled exactly the fields
- * below, so leaving 615's two new inputs (flags2, kindOverride) zeroed
- * reproduces the pre-bump behaviour bit for bit. dmaOffset stays in/out for
- * the same reason it was a NvU64* before: with DMA_OFFSET_FIXED_TRUE (the
- * vm_bind path) it is an INPUT, everywhere else an output.
- */
-static NV_STATUS eclipseRmApiMapDma(RM_API *pRmApi, NvHandle hClient, NvHandle hDevice,
-                                    NvHandle hMemCtx, NvHandle hMemory, NvU64 offset,
-                                    NvU64 length, NvU32 flags, NvU64 *pDmaOffset)
-{
-    NVOS46_PARAMETERS parms;
-    NV_STATUS status;
-
-    portMemSet(&parms, 0, sizeof(parms));
-    parms.hClient = hClient;
-    parms.hDevice = hDevice;
-    parms.hDma    = hMemCtx;
-    parms.hMemory = hMemory;
-    parms.offset  = offset;
-    parms.length  = length;
-    parms.flags   = flags;
-    parms.dmaOffset = (pDmaOffset != NULL) ? *pDmaOffset : 0;
-
-    status = pRmApi->Map(pRmApi, &parms);
-
-    if (pDmaOffset != NULL)
-    {
-        *pDmaOffset = parms.dmaOffset;
-    }
-    return status;
-}
-
-static NV_STATUS eclipseRmApiUnmapDma(RM_API *pRmApi, NvHandle hClient, NvHandle hDevice,
-                                      NvHandle hMemCtx, NvU32 flags, NvU64 dmaOffset,
-                                      NvU64 size)
-{
-    NVOS47_PARAMETERS parms;
-
-    portMemSet(&parms, 0, sizeof(parms));
-    parms.hClient = hClient;
-    parms.hDevice = hDevice;
-    parms.hDma    = hMemCtx;
-    parms.flags   = flags;
-    parms.dmaOffset = dmaOffset;
-    parms.size    = size;
-
-    return pRmApi->Unmap(pRmApi, &parms);
-}
-
-/*
  * Eclipse's implementation of the osRmInitRm platform hook, called from
  * the real sysConstruct_IMPL (system.c) during OBJSYS construction --
  * the portable subset of what Linux's osinit.c version does: register
@@ -900,17 +842,9 @@ NV_STATUS eclipse_rm_get_gsp_info(NvU32 gpuInstance, EclipseGspInfo *pInfo)
     portMemCopy(pInfo->gpuShortNameString, sizeof(pInfo->gpuShortNameString) - 1,
                 pGSCI->gpuShortNameString, sizeof(pInfo->gpuShortNameString) - 1);
     pInfo->fbLength       = pGSCI->fb_length;
-    /* 615.71.09 removed fb_bus_width / fb_ram_type / l2_cache_size from
-     * GspStaticConfigInfo: on a bare-metal GSP client those three are no
-     * longer pushed up with the static config and have to be asked for with
-     * NV2080_CTRL_CMD_FB_GET_INFO_V2 (indices _BUS_WIDTH / _RAM_TYPE /
-     * _L2CACHE_SIZE), which is an RPC to GSP. This function is deliberately a
-     * lock-free snapshot of already-resident state, so it reports them as 0
-     * rather than issuing an RPC here. Bus width is still reported for real by
-     * step-8, which already runs that exact control under the right locks. */
-    pInfo->fbBusWidth     = 0;
-    pInfo->fbRamType      = 0;
-    pInfo->l2CacheSize    = 0;
+    pInfo->fbBusWidth     = pGSCI->fb_bus_width;
+    pInfo->fbRamType      = pGSCI->fb_ram_type;
+    pInfo->l2CacheSize    = pGSCI->l2_cache_size;
     pInfo->bVbiosValid    = pGSCI->bVbiosValid ? 1 : 0;
     pInfo->vbiosSubVendor = pGSCI->vbiosSubVendor;
     pInfo->vbiosSubDevice = pGSCI->vbiosSubDevice;
@@ -1890,7 +1824,7 @@ NV_STATUS eclipse_rm_step17(NvU32 gpuInstance, EclipseGrChannel *pOut)
 
     /* 4. Map physical into virtual: the buffer's GPU VA. */
     {
-        pOut->mapStatus = eclipseRmApiMapDma(pRmApi, g_grAllocCache.hClient,
+        pOut->mapStatus = pRmApi->Map(pRmApi, g_grAllocCache.hClient,
                                       g_grAllocCache.hDevice,
                                       pOut->hVirtBuf, pOut->hPhysBuf,
                                       0, ECLIPSE_CHAN_BUF_SIZE,
@@ -2288,7 +2222,7 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
 
     /* 7. Map physical into virtual: the channel buffer's GPU VA. */
     {
-        pOut->mapStatus = eclipseRmApiMapDma(pRmApi, g_grAllocCache.hClient, g_grAllocCache.hDevice,
+        pOut->mapStatus = pRmApi->Map(pRmApi, g_grAllocCache.hClient, g_grAllocCache.hDevice,
                                       pOut->hVirtBuf, pOut->hPhysBuf, 0, ECLIPSE_CHAN_BUF_SIZE,
                                       NV04_MAP_MEMORY_FLAGS_NONE, &pOut->bufGpuVA);
         nv_printf(0, "[eclipse-rm-trace] ctx%u: Map -> 0x%x GPU VA=0x%llx\n",
@@ -4702,7 +4636,7 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
                                              NV50_MEMORY_VIRTUAL, &mp, sizeof(mp));
         }
         if (as == NV_OK)
-            as = eclipseRmApiMapDma(pAlloc, g_grAllocCache.hClient, g_grAllocCache.hDevice,
+            as = pAlloc->Map(pAlloc, g_grAllocCache.hClient, g_grAllocCache.hDevice,
                              hVirt, hPhys, 0, ECLIPSE_SAXPY_CACHEABLE_SIZE,
                              NV04_MAP_MEMORY_FLAGS_NONE, &g_saxpyCacheableVA);
         nv_printf(0, "[eclipse-rm-trace] step23: cacheable buf alloc -> 0x%x hPhys=0x%x VA=0x%llx\n",
@@ -8487,7 +8421,7 @@ NV_STATUS eclipse_rm_vm_bind_map(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory,
          * 0, which maps the WRONG PAGES for any suballocated bind (every
          * observed bind so far had bo_offset=0, so this had not bitten yet
          * -- but it would have, silently, as corrupted rendering). */
-        pOut->mapStatus = eclipseRmApiMapDma(pRmApi, g_grAllocCache.hClient,
+        pOut->mapStatus = pRmApi->Map(pRmApi, g_grAllocCache.hClient,
                                       g_grAllocCache.hDevice,
                                       pOut->hVirt, hMemory,
                                       boOffset, size,
@@ -8500,7 +8434,7 @@ NV_STATUS eclipse_rm_vm_bind_map(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory,
         if (pOut->mapStatus != NV_OK)
         {
             pOut->actualVA = requestedVA;
-            pOut->mapStatus = eclipseRmApiMapDma(pRmApi, g_grAllocCache.hClient,
+            pOut->mapStatus = pRmApi->Map(pRmApi, g_grAllocCache.hClient,
                                           g_grAllocCache.hDevice,
                                           pOut->hVirt, hMemory,
                                           boOffset, size,
@@ -8524,7 +8458,7 @@ NV_STATUS eclipse_rm_vm_bind_map(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory,
                          "0x%llx but 0x%llx was requested\n",
                       (unsigned long long)pOut->actualVA,
                       (unsigned long long)requestedVA);
-            eclipseRmApiUnmapDma(pRmApi, g_grAllocCache.hClient, g_grAllocCache.hDevice,
+            pRmApi->Unmap(pRmApi, g_grAllocCache.hClient, g_grAllocCache.hDevice,
                           pOut->hVirt, NV04_MAP_MEMORY_FLAGS_NONE, pOut->actualVA, size);
             pOut->mapStatus = NV_ERR_INVALID_ADDRESS;
         }
@@ -8588,7 +8522,7 @@ NV_STATUS eclipse_rm_vm_bind_unmap(NvU32 gpuInstance, NvU32 hVirt, NvU64 size, N
     }
     pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
 
-    status = eclipseRmApiUnmapDma(pRmApi, g_grAllocCache.hClient, g_grAllocCache.hDevice,
+    status = pRmApi->Unmap(pRmApi, g_grAllocCache.hClient, g_grAllocCache.hDevice,
                            hVirt, NV04_MAP_MEMORY_FLAGS_NONE, va, size);
     nv_printf(0, "[eclipse-rm-trace] vm_bind_unmap: Unmap -> 0x%x\n", status);
     /* Free the virtual allocation UNCONDITIONALLY. Freeing an
@@ -9451,9 +9385,7 @@ NV_STATUS eclipse_rm_exec_fast_release(NvU32 gpuInstance, NvU32 ctxIdx)
         threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
         return status;
     }
-    /* 615.71.09 dropped memdescUnmap's ProcessId argument (it was only ever
-     * meaningful for user mappings; this one is Kernel == NV_TRUE). */
-    memdescUnmap(g_fastMap[ctxIdx].pUserdMemDesc, NV_TRUE,
+    memdescUnmap(g_fastMap[ctxIdx].pUserdMemDesc, NV_TRUE, 0,
                  NV_PTR_TO_NvP64(g_fastMap[ctxIdx].pUserdCpu),
                  NV_PTR_TO_NvP64(g_fastMap[ctxIdx].pUserdPriv));
     nv_printf(0, "[eclipse-rm-trace] exec_fast_release ctx%u: USERD unmapped\n", ctxIdx);
@@ -10383,7 +10315,7 @@ NV_STATUS eclipse_rm_map_peer_fence(
             goto unlock;
     }
 
-    status = eclipseRmApiMapDma(pRmApi, g_grAllocCache.hClient, g_grAllocCache.hDevice,
+    status = pRmApi->Map(pRmApi, g_grAllocCache.hClient, g_grAllocCache.hDevice,
                          hVirt, hPhys, 0, ECLIPSE_CHAN_BUF_SIZE,
                          NV04_MAP_MEMORY_FLAGS_NONE, &mapVa);
     if (status != NV_OK)

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -1160,13 +1160,11 @@ kgrctxAllocMainCtxBuffer_IMPL
         pCtxBufPool = pKernelChannel->pKernelChannelGroupApi->pKernelChannelGroup->pCtxBufPool;
     }
 
-    NV_STATUS status;
-    NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR,
+    NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
         memdescCreate(&pGrCtxBufferMemDesc, pGpu, ctxSize,
                       RM_PAGE_SIZE, bIsContiguous, ADDR_UNKNOWN,
                       pAttr->cpuAttr,
-                      allocFlags | MEMDESC_FLAGS_OWNED_BY_CURRENT_DEVICE),
-                    failed);
+                      allocFlags | MEMDESC_FLAGS_OWNED_BY_CURRENT_DEVICE));
 
     if (kgraphicsIsOverrideContextBuffersToGpuCached(pGpu, pKernelGraphics))
         memdescSetGpuCacheAttrib(pGrCtxBufferMemDesc, NV_MEMORY_CACHED);
@@ -1175,31 +1173,21 @@ kgrctxAllocMainCtxBuffer_IMPL
     // Force page size to 4KB, we can change this later when RM access method
     // support 64k pages
     //
-    NV_ASSERT_OK_OR_GOTO(status,
-        memmgrSetMemDescPageSize_HAL(pGpu, pMemoryManager, pGrCtxBufferMemDesc, AT_GPU, RM_ATTR_PAGE_SIZE_4KB),
-        failed);
+    NV_ASSERT_OK_OR_RETURN(
+        memmgrSetMemDescPageSize_HAL(pGpu, pMemoryManager, pGrCtxBufferMemDesc, AT_GPU, RM_ATTR_PAGE_SIZE_4KB));
 
-    NV_ASSERT_OK_OR_GOTO(status, memdescSetCtxBufPool(pGrCtxBufferMemDesc, pCtxBufPool), failed);
+    NV_ASSERT_OK_OR_RETURN(memdescSetCtxBufPool(pGrCtxBufferMemDesc, pCtxBufPool));
 
-    // Overwrite the ptekind of the main grctx buffer if the required regkey is specified
-    kgraphicsSetContextBufferPteKind(pGpu, pKernelGraphics, &pGrCtxBufferMemDesc, GR_CTX_BUFFER_MAIN, NV_FALSE, memmgrGetPteKindGenericMemoryCompressible_HAL(pGpu, pMemoryManager));
-
+    NV_STATUS status;
     memdescTagAllocList(status, NV_FB_ALLOC_RM_INTERNAL_OWNER_CONTEXT_BUFFER, pGrCtxBufferMemDesc, pAttr->pAllocList);
-    NV_ASSERT_OK_OR_GOTO(status, status, failed);
+    NV_ASSERT_OK_OR_RETURN(status);
 
-    NV_ASSERT_OK_OR_GOTO(status,
+    NV_ASSERT_OK_OR_RETURN(
         kchannelSetEngineContextMemDesc(pGpu, pKernelChannel,
                                         ENG_GR(kgraphicsGetInstance(pGpu, pKernelGraphics)),
-                                        pGrCtxBufferMemDesc),
-                    failed);
+                                        pGrCtxBufferMemDesc));
     pKernelGraphicsContextUnicast->pMainCtxBuffer = pGrCtxBufferMemDesc;
     return NV_OK;
-
-failed:
-    memdescFree(pGrCtxBufferMemDesc);
-    memdescDestroy(pGrCtxBufferMemDesc);
-    pGrCtxBufferMemDesc = NULL;
-    return status;
 }
 
 /*!
@@ -1296,8 +1284,6 @@ kgrctxAllocPmBuffer_IMPL
     CTX_BUF_POOL_INFO               *pCtxBufPool;
     MEMORY_DESCRIPTOR              **ppMemDesc;
     const GR_BUFFER_ATTR            *pAttr = kgraphicsGetContextBufferAttr(pGpu, pKernelGraphics, GR_CTX_BUFFER_PM);
-    const NV_ADDRESS_SPACE          *pAllocList = pAttr->pAllocList;
-    NvU32                           cpuAttr = pAttr->cpuAttr;
 
     NV_ASSERT(!gpumgrGetBcEnabledStatus(pGpu));
 
@@ -1318,16 +1304,6 @@ kgrctxAllocPmBuffer_IMPL
         pCtxBufPool = pKernelChannel->pKernelChannelGroupApi->pKernelChannelGroup->pCtxBufPool;
     }
 
-    // Handle VF - must use FB on the guest subheap
-    if (IS_GFID_VF(kchannelGetGfid(pKernelChannel)))
-    {
-        if (pAllocList[0] != ADDR_FBMEM)
-            NV_PRINTF(LEVEL_WARNING, "Forcing pm ctx to FB for SR-IOV guest\n");
-        pAllocList = ADDRLIST_FBMEM_ONLY;
-        cpuAttr = NV_MEMORY_UNCACHED;
-        flags |= MEMDESC_FLAGS_OWNED_BY_CURRENT_DEVICE;
-    }
-
     //
     // For SRIOV Heavy, the PM ctxsw buffer allocation will be redirected to
     // host RM subheap. Subheap is used by host RM to allocate memory
@@ -1345,7 +1321,7 @@ kgrctxAllocPmBuffer_IMPL
                       RM_PAGE_SIZE,
                       NV_TRUE,
                       ADDR_UNKNOWN,
-                      cpuAttr,
+                      pAttr->cpuAttr,
                       flags));
 
     if (kgraphicsIsOverrideContextBuffersToGpuCached(pGpu, pKernelGraphics))
@@ -1362,7 +1338,7 @@ kgrctxAllocPmBuffer_IMPL
     NV_ASSERT_OK_OR_GOTO(status, memdescSetCtxBufPool(*ppMemDesc, pCtxBufPool), error);
 
     memdescTagAllocList(status, NV_FB_ALLOC_RM_INTERNAL_OWNER_UNNAMED_TAG_118, 
-                        (*ppMemDesc), pAllocList);
+                        (*ppMemDesc), pAttr->pAllocList);
     NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR,
         status,
         error);
@@ -2377,6 +2353,21 @@ kgrctxUnmapCtxZcullBuffer_IMPL
 }
 
 /**
+ * @brief unmap the memory for the setup context buffer
+ */
+void
+kgrctxUnmapCtxSetupBuffer_IMPL
+(
+    OBJGPU *pGpu,
+    KernelGraphicsContext *pKernelGraphicsContext,
+    KernelGraphics *pKernelGraphics,
+    OBJVASPACE *pVAS
+)
+{
+    // TODO Bug 4153224: fill in function
+}
+
+/**
  * @brief unmap the memory for the preemption context buffers
  */
 void
@@ -2685,10 +2676,7 @@ kgrctxShouldManageCtxBuffers_PHYSICAL
     NvU32 gfid
 )
 {
-    if (gpuIsSriovEnabled(pGpu) && !RMCFG_FEATURE_PLATFORM_GSP)
-        return !gpuIsClientRmAllocatedCtxBufferEnabled(pGpu) || IS_GFID_PF(gfid);
-    else
-        return !gpuIsClientRmAllocatedCtxBufferEnabled(pGpu);
+    return !gpuIsClientRmAllocatedCtxBufferEnabled(pGpu) || (gpuIsSriovEnabled(pGpu) && IS_GFID_PF(gfid));
 }
 
 /**
@@ -2888,6 +2876,20 @@ kgrctxFreeZcullBuffer_IMPL
 }
 
 /**
+ * @brief free the memory for the setup context buffer
+ */
+void
+kgrctxFreeSetupBuffer_IMPL
+(
+    OBJGPU *pGpu,
+    KernelGraphicsContext *pKernelGraphicsContext
+)
+{
+    // TODO Bug 4153224: fill in function
+}
+
+
+/**
  * @brief free the memory for the preemption context buffers
  */
 void
@@ -2926,9 +2928,12 @@ kgrctxFreeCtxPreemptionBuffers_IMPL
     memdescDestroy(pKernelGraphicsContextUnicast->rtvCbCtxswBuffer.pMemDesc);
     pKernelGraphicsContextUnicast->rtvCbCtxswBuffer.pMemDesc = NULL;
 
-    memdescFree(pKernelGraphicsContextUnicast->setupCtxswBuffer.pMemDesc);
-    memdescDestroy(pKernelGraphicsContextUnicast->setupCtxswBuffer.pMemDesc);
-    pKernelGraphicsContextUnicast->setupCtxswBuffer.pMemDesc = NULL;
+    if (pKernelGraphicsContextUnicast->setupCtxswBuffer.pMemDesc != NULL)
+    {
+        memdescFree(pKernelGraphicsContextUnicast->setupCtxswBuffer.pMemDesc);
+        memdescDestroy(pKernelGraphicsContextUnicast->setupCtxswBuffer.pMemDesc);
+        pKernelGraphicsContextUnicast->setupCtxswBuffer.pMemDesc = NULL;
+    }
 }
 
 /*!
@@ -3354,7 +3359,7 @@ kgrctxGetRegisterAccessMapId_IMPL
 {
     // Using cached privilege because this function is called at a raised IRQL.
     if (kchannelCheckIsAdmin(pKernelChannel)
-        && !(hypervisorIsVgxHyper() || (RMCFG_FEATURE_PLATFORM_GSP && IS_VGPU_GSP_PLUGIN_OFFLOAD_ENABLED(pGpu))) && IS_GFID_PF(kchannelGetGfid(pKernelChannel)))
+        && !hypervisorIsVgxHyper() && IS_GFID_PF(kchannelGetGfid(pKernelChannel)))
     {
         return GR_GLOBALCTX_BUFFER_UNRESTRICTED_PRIV_ACCESS_MAP;
     }
@@ -3516,40 +3521,6 @@ kgrctxCtrlProgramVidmemPromote_IMPL
 
     return gpuresInternalControlForward_IMPL(staticCast(pKernelGraphicsContext, GpuResource),
                                              NV0090_CTRL_CMD_INTERNAL_PROGRAM_VIDMEM_PROMOTE,
-                                             pParams,
-                                             sizeof(*pParams));
-}
-
-NV_STATUS
-kgrctxCtrlProgramSysmemPromote_IMPL
-(
-    KernelGraphicsContext *pKernelGraphicsContext,
-    NV0090_CTRL_PROGRAM_SYSMEM_PROMOTE_PARAMS *pParams
-)
-{
-    OBJGPU *pGpu = GPU_RES_GET_GPU(pKernelGraphicsContext);
-
-    NV_ASSERT_OR_RETURN(rmapiLockIsOwner() && rmGpuLockIsOwner(), NV_ERR_INVALID_LOCK_STATE);
-
-    if (IS_VIRTUAL(pGpu) || IS_GSP_CLIENT(pGpu))
-    {
-        CALL_CONTEXT *pCallContext = resservGetTlsCallContext();
-        RmCtrlParams *pRmCtrlParams = pCallContext->pControlParams;
-        NV_STATUS status = NV_OK;
-
-        NV_RM_RPC_CONTROL(pGpu,
-                          pRmCtrlParams->hClient,
-                          pRmCtrlParams->hObject,
-                          pRmCtrlParams->cmd,
-                          pRmCtrlParams->pParams,
-                          pRmCtrlParams->paramsSize,
-                          status);
-
-        return status;
-    }
-
-    return gpuresInternalControlForward_IMPL(staticCast(pKernelGraphicsContext, GpuResource),
-                                             NV0090_CTRL_CMD_INTERNAL_PROGRAM_SYSMEM_PROMOTE,
                                              pParams,
                                              sizeof(*pParams));
 }
@@ -3797,3 +3768,4 @@ void shrkgrctxDetach_IMPL
     }
     SLI_LOOP_END;
 }
+

@@ -236,20 +236,19 @@ fn build_first_real_nvidia_file() {
         // libspdm (real, BSD-3-Clause-licensed DMTF SPDM reference
         // implementation NVIDIA vendors for Confidential-Computing
         // attestation) -- include paths transcribed from
-        // src/nvidia/src/libraries/libspdm/nvidia/openspdm.mk. The 615.71.09
-        // release vendors libspdm 3.5.0 (570.144 vendored 3.1.1, which had no
-        // os_stub/cryptlib_null directory -- 3.5.0 does, and openspdm.mk lists
-        // it, so it is back on the -I list).
-        nvidia.join("src/libraries/libspdm/3.5.0/include"),
-        nvidia.join("src/libraries/libspdm/3.5.0/include/hal"),
-        nvidia.join("src/libraries/libspdm/3.5.0/os_stub/include"),
-        nvidia.join("src/libraries/libspdm/3.5.0/os_stub"),
-        nvidia.join("src/libraries/libspdm/3.5.0/os_stub/cryptlib_null"),
+        // src/nvidia/src/libraries/libspdm/nvidia/openspdm.mk. The 570.144
+        // release vendors libspdm 3.1.1 (not 3.5.0), and 3.1.1 has no
+        // os_stub/cryptlib_null directory, so that entry is dropped.
+        nvidia.join("src/libraries/libspdm/3.1.1/include"),
+        nvidia.join("src/libraries/libspdm/3.1.1/include/hal"),
+        nvidia.join("src/libraries/libspdm/3.1.1/os_stub/include"),
+        nvidia.join("src/libraries/libspdm/3.1.1/os_stub"),
         nvidia.join("src/libraries/libspdm/nvidia"),
-        // NOTE: 615.71.09 moved the GSP message-queue library out of
-        // src/common/shared/msgq into src/nvidia/{inc,src}/libraries/msgq, so
-        // its header is already covered by the inc/libraries entry above and
-        // src/nvidia/Makefile dropped its own -I for it too.
+        // GSP message-queue library (msgq.h) -- src/common/shared/msgq is
+        // compiled into the RM core (msgq_utils.c etc.) and its public
+        // header lives under inc/, which src/nvidia/Makefile pulls in when
+        // it recurses; the standalone build needs it on the -I list.
+        common.join("shared/msgq/inc"),
     ];
 
     let mut build = cc::Build::new();
@@ -317,7 +316,7 @@ fn build_first_real_nvidia_file() {
         // forcing it to 1 (as 610.43.02's Makefile did) made nvport.h include
         // a nonexistent header ("fatal error: nvport/time.h"). RM 570 uses the
         // os-interface time hooks, not an nvport time module.
-        "PORT_MODULE_time=1",
+        "PORT_MODULE_time=0",
         "PORT_MODULE_util=1",
         "PORT_MODULE_example=0",
         "PORT_MODULE_mmio=0",
