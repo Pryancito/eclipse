@@ -336,6 +336,16 @@ escalera compartida `step16` (client/device/subdevice) se construyen hasta
 - **Consola GPU GSP**: el auto-bringup on-demand está **opt-in** con
   `nvidia.console_gsp` (además de `nvidia.nouveau_uapi`). Sin él, hace
   falta `cat /proc/gpustep14` a mano.
+- **`nvidia.console_gpu`**: implica `nvidia.console_gsp` y además programa el
+  bring-up diferido de la GPU de consola (esperar a KD_GRAPHICS, pausar el
+  scanout, `gpustep14`, reanudar) aunque nunca aparezca ningún cliente GPU.
+  No toca la ruta de arranque: si el SEC2 STARTCPU se cuelga, se cuelga con el
+  escritorio ya en pantalla, no a mitad del boot. Si la GPU sube, el present
+  pasa a su propio copy engine — copia dentro de la misma tarjeta, sin P2P por
+  PCIe — y se reevalúa `CE_PRESENT_ENABLED` en ese momento (salvo
+  `nvidia.nocepresent`). Es la única vía a algo de aceleración en una caja de
+  **una sola GPU**: sin segunda tarjeta no hay de dónde hacer P2P, así que una
+  GPU de consola fría significa blit por CPU y nada más.
 - **Prime GRAPHICS**: `ctx_prime` exige compute+3D; un fallo **descarta** el
   contexto (software fallback) en vez de publicar READY y colgar FECS en el
   primer draw. `step18` también prima GRAPHICS en ctx0. Timeout de prime =

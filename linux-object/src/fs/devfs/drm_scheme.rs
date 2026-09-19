@@ -104,6 +104,16 @@ impl DrmDev {
         }
     }
 
+    /// The GPU this node names, for the driver-private ioctls.
+    ///
+    /// Every node used to answer with `get_primary_driver()`, so `card1` was
+    /// the compute GPU in its sysfs identity but served its nouveau ioctls
+    /// from a different card. The fallback keeps a node with no table entry
+    /// working exactly as it did.
+    fn driver(&self) -> Option<Arc<dyn zcore_drivers::scheme::DrmScheme>> {
+        drm::driver_for_minor(self.minor).or_else(drm::get_primary_driver)
+    }
+
     /// `open(2)` on `/dev/dri/card*` / `renderD*`: a fresh per-fd DRM file
     /// state (ATOMIC_CLIENT + event queue), like Linux's `drm_open_helper`.
     pub fn open_client(&self) -> Arc<dyn INode> {
@@ -611,6 +621,11 @@ const PROP_MODE_ID: u32 = 26;
 const PROP_IN_FENCE_FD: u32 = 27;
 /// CRTC out-fence pointer (`*mut i32` sync_file fd writeback).
 const PROP_OUT_FENCE_PTR: u32 = 28;
+/// Plane damage clips: a blob of `drm_mode_rect`, the region of the
+/// framebuffer that actually changed since the last commit. Without this
+/// property a compositor has no way to tell the kernel what it repainted, so
+/// every commit had to be treated as a full-frame present.
+const PROP_FB_DAMAGE_CLIPS: u32 = 29;
 
 // Property flags (`drm_mode.h`).
 const DRM_MODE_PROP_RANGE: u32 = 1 << 1;
@@ -711,14 +726,8 @@ struct DrmEclipseCompute {
     summary: [u8; 512],
 }
 
-fn drm_node_name(minor: u32) -> &'static str {
-    match minor {
-        0 => "card0",
-        1 => "card1",
-        128 => "renderD128",
-        129 => "renderD129",
-        _ => "card?",
-    }
+fn drm_node_name(minor: u32) -> alloc::string::String {
+    drm::node_name(minor)
 }
 
 /// `access_ok()` for a nested user pointer an ioctl arm is about to read or
@@ -743,9 +752,14 @@ fn ucheck_n<T>(addr: usize, count: usize) -> Result<()> {
     }
 }
 
-fn eclipse_compute_ioctl(data: usize) -> Result<usize> {
+fn eclipse_compute_ioctl(minor: u32, data: usize) -> Result<usize> {
     let req = unsafe { &mut *(data as *mut DrmEclipseCompute) };
-    let driver = drm::get_compute_driver().or_else(drm::get_primary_driver);
+    // The node decides the GPU: `ecl-compute` on card2 must launch on the card
+    // card2 names, not on whichever one happens to be "the" compute GPU. Falls
+    // back to the old global choice for a node with no table entry.
+    let driver = drm::driver_for_minor(minor)
+        .or_else(drm::get_compute_driver)
+        .or_else(drm::get_primary_driver);
     let Some(driver) = driver else {
         req.status = -19; // -ENODEV
         fill_summary(&mut req.summary, "no compute GPU");
@@ -1313,6 +1327,12 @@ fn prop_spec(prop_id: u32) -> Option<PropSpec> {
             values: &[0, u64::MAX],
             enums: &[],
         },
+        PROP_FB_DAMAGE_CLIPS => PropSpec {
+            name: "FB_DAMAGE_CLIPS",
+            flags: DRM_MODE_PROP_BLOB | DRM_MODE_PROP_ATOMIC,
+            values: &[],
+            enums: &[],
+        },
         _ => return None,
     })
 }
@@ -1371,6 +1391,10 @@ fn plane_props(plane: &drm::DrmPlane, atomic: bool) -> alloc::vec::Vec<(u32, u64
         props.push((PROP_SRC_H, st.src_h as u64));
         // Default "no in-fence" sentinel.
         props.push((PROP_IN_FENCE_FD, (-1i32) as u64));
+        // Damage is per-commit state, never latched: Linux resets
+        // FB_DAMAGE_CLIPS to 0 after each atomic commit, and 0 means "the
+        // whole plane changed". Reading it back always returns 0.
+        props.push((PROP_FB_DAMAGE_CLIPS, 0));
     }
     props
 }
@@ -1404,6 +1428,7 @@ fn atomic_stage(upd: &mut drm::AtomicUpdate, obj_id: u32, prop_id: u32, value: u
                     upd.in_fence_fd = Some(fd);
                 }
             }
+            PROP_FB_DAMAGE_CLIPS => upd.damage_clips = Some(value as u32),
             // "type" is immutable.
             PROP_TYPE => return Err(FsError::InvalidParam),
             _ => return Err(FsError::EntryNotFound),
@@ -1658,7 +1683,7 @@ impl INode for DrmDev {
             }
         }
         if (cmd & 0xff) == DRM_ECLIPSE_COMPUTE_NR {
-            return eclipse_compute_ioctl(data);
+            return eclipse_compute_ioctl(self.minor, data);
         }
         match cmd {
             DRM_IOCTL_VERSION => {
@@ -1696,16 +1721,17 @@ impl INode for DrmDev {
                         } else {
                             "nouveau"
                         };
-                        match drm::get_primary_driver() {
+                        match self.driver() {
                             Some(d) => kernel_hal::klog_info!(
-                                "[drm] VERSION on /dev/dri/{} (minor={}) -> name=\"{}\"; primary_driver={:?} (client reached VERSION — DRM discovery OK; logged once per node)",
+                                "[drm] VERSION on /dev/dri/{} (minor={}) -> name=\"{}\"; driver={:?} pci_bdf={:x?} (client reached VERSION — DRM discovery OK; logged once per node)",
                                 node,
                                 self.minor,
                                 vname,
-                                d.name()
+                                d.name(),
+                                d.pci_bdf()
                             ),
                             None => kernel_hal::klog_info!(
-                                "[drm] VERSION on /dev/dri/{} (minor={}) -> name=\"{}\"; primary_driver=<none> (logged once per node)",
+                                "[drm] VERSION on /dev/dri/{} (minor={}) -> name=\"{}\"; driver=<none> (logged once per node)",
                                 node,
                                 self.minor,
                                 vname
@@ -2459,7 +2485,8 @@ impl INode for DrmDev {
                 // there might still be a driver-private handle (e.g.
                 // nouveau-uAPI GEM_NEW) the driver itself keeps track of.
                 if drm::gem_close(handle)
-                    || drm::get_primary_driver()
+                    || self
+                        .driver()
                         .map(|d| d.nouveau_gem_close(handle, drm::current_pid()))
                         .unwrap_or(false)
                 {
@@ -3363,7 +3390,7 @@ impl INode for DrmDev {
                     size,
                     dir
                 );
-                if let Some(driver) = drm::get_primary_driver() {
+                if let Some(driver) = self.driver() {
                     driver
                         .ioctl_owned(cmd, data, drm::current_pid())
                         // Map the driver's errno through instead of folding it

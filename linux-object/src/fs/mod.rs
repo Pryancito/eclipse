@@ -1006,6 +1006,12 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         // (renderD128) is still created for software GL, and the labwc/Wayland
         // session (which genuinely drives KMS) does not set desktop=xorg and
         // keeps card0.
+        //
+        // Decide which GPU owns which node before creating any of them: the
+        // devfs nodes below and the `/sys/class/drm` identities read the same
+        // table, so they cannot drift apart. Unconditional, so sysfs is never
+        // consulted against an empty table.
+        devfs::drm::build_gpu_nodes();
         if have_drm || have_display {
             if let Ok(dri_dev) = devfs_root.add_dir("dri") {
                 if let Err(e) = dri_dev.add("card0", Arc::new(devfs::DrmDev::new(0))) {
@@ -1020,21 +1026,22 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                 } else {
                     debug!("[drm] /dev/dri/renderD128 created (render node)");
                 }
-                // Compute-only nodes: same GPU that auto_bringup_compute
-                // state-loads, advertised as driver name "eclipse-compute" so
-                // Mesa/NVK skip them. `ecl-compute` opens card1 (or
-                // renderD129). Created only when a non-console NVIDIA GPU
-                // exists; single-GPU (console-only) boxes stay at card0.
-                if devfs::drm::get_compute_driver().is_some() {
-                    if let Err(e) = dri_dev.add("card1", Arc::new(devfs::DrmDev::new(1))) {
-                        warn!("failed to mknod /dev/dri/card1: {:?}", e);
-                    } else {
-                        debug!("[drm] /dev/dri/card1 created (NVIDIA compute)");
-                    }
-                    if let Err(e) = dri_dev.add("renderD129", Arc::new(devfs::DrmDev::new(129))) {
-                        warn!("failed to mknod /dev/dri/renderD129: {:?}", e);
-                    } else {
-                        debug!("[drm] /dev/dri/renderD129 created (NVIDIA compute render)");
+                // Compute-only nodes, one pair per compute GPU: the same GPUs
+                // auto_bringup_compute state-loads, advertised as driver name
+                // "eclipse-compute" so Mesa/NVK skip them. `ecl-compute` opens
+                // card1 (or renderD129). A single-GPU (console-only) box has
+                // no entry past index 0 and stays at card0, exactly as before;
+                // a box with three or more cards now gets card2/renderD130 and
+                // up instead of the kernel knowing about GPUs userspace has no
+                // way to open.
+                for node in devfs::drm::gpu_nodes().iter().skip(1) {
+                    for minor in [node.card_minor(), node.render_minor()] {
+                        let name = devfs::drm::node_name(minor);
+                        if let Err(e) = dri_dev.add(&name, Arc::new(devfs::DrmDev::new(minor))) {
+                            warn!("failed to mknod /dev/dri/{}: {:?}", name, e);
+                        } else {
+                            debug!("[drm] /dev/dri/{} created (NVIDIA compute)", name);
+                        }
                     }
                 }
                 // On the NVIDIA/nouveau experiment, dump which PCI device the

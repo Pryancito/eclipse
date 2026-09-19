@@ -121,9 +121,12 @@ pub trait DrmScheme: Scheme {
     }
 
     /// Whether this GPU is scanning out the boot console. Such a GPU is
-    /// deliberately excluded from the automatic RM bring-up at boot (its GSP
-    /// resume can wedge the bus while the console renders through its BAR1),
-    /// so it cannot serve the RM-backed nouveau paths. Default: false.
+    /// deliberately excluded from the automatic RM bring-up on the BOOT path
+    /// (its GSP resume can wedge the bus while the console renders through its
+    /// BAR1), so by default it cannot serve the RM-backed nouveau paths. It
+    /// can be brought up later, once the desktop is up and scanout is paused,
+    /// via `nvidia.console_gpu` — see `deferred_console_bringup`. Default:
+    /// false, which is also the right answer for non-NVIDIA drivers.
     fn is_console_gpu(&self) -> bool {
         false
     }
@@ -330,13 +333,19 @@ pub trait DrmScheme: Scheme {
 
     /// Pitched 2D CE-offloaded present: copy `line_count` rows of `row_bytes`
     /// from `src_sysmem_pa + r * src_pitch` into the console GPU's scanout FB
-    /// at `dst_pitch` stride, using a GPU copy engine over PCIe P2P — without
-    /// any CPU staging repack.  Returns true if the CE 2D copy was performed;
-    /// false to fall back to the repack+flat path.  Default: false.
+    /// at `dst_byte_offset + r * dst_pitch`, using a GPU copy engine over PCIe
+    /// P2P — without any CPU staging repack.  Returns true if the CE 2D copy
+    /// was performed; false to fall back to the repack+flat path.
+    ///
+    /// `dst_byte_offset` is what lets this serve a damage rectangle: the
+    /// caller biases `src_sysmem_pa` into the source buffer and passes the
+    /// matching offset into the scanout framebuffer, so the engine writes only
+    /// the region that changed.  0 is a full-frame present.  Default: false.
     fn ce_present_2d_pitched(
         &self,
         _src_sysmem_pa: u64,
         _src_pitch: u32,
+        _dst_byte_offset: u64,
         _dst_pitch: u32,
         _row_bytes: u32,
         _line_count: u32,
@@ -344,10 +353,15 @@ pub trait DrmScheme: Scheme {
         false
     }
 
-    /// Whether this driver can offload scanout via the copy engine after boot
-    /// bring-up. On dual-GPU NVIDIA setups this is true for a state-loaded
-    /// compute GPU (P2P into the console framebuffer). Used to auto-enable the
-    /// CE present path when manual `nvidia.cepresent` is absent.
+    /// Whether this driver can offload scanout via the copy engine. True for
+    /// any NVIDIA GPU that is state-loaded: a compute GPU copies into the
+    /// console framebuffer over PCIe P2P, and a console GPU (brought up by
+    /// `nvidia.console_gpu` or a manual `/proc/gpustep14`) copies into its own
+    /// framebuffer, which needs no P2P at all. Used to auto-enable the CE
+    /// present path when manual `nvidia.cepresent` is absent.
+    ///
+    /// This is re-read after the deferred console bring-up, not only at boot,
+    /// so a console GPU that comes up late still switches present off the CPU.
     fn ce_present_ready(&self) -> bool {
         false
     }
@@ -372,11 +386,21 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
-    /// Deferred console-GPU bring-up for `nvidia.hwcursor` (gpustep14 chain).
-    /// Called from a background kernel task AFTER the desktop is up and scanout
-    /// has been paused — never from the boot progress path. Returns one status
-    /// line; empty for non-console / non-NVIDIA drivers.
-    fn deferred_console_bringup_for_hwcursor(&self) -> alloc::string::String {
+    /// Deferred console-GPU bring-up (the gpustep14 chain). Called from a
+    /// background kernel task AFTER the desktop is up and scanout has been
+    /// paused — never from the boot progress path, where a wedged SEC2
+    /// STARTCPU store would take the machine down before anything is on
+    /// screen. Returns one status line; empty for non-console / non-NVIDIA
+    /// drivers, so the caller can simply loop over every registered driver.
+    ///
+    /// Two cmdline flags reach here: `nvidia.hwcursor`, which wants the
+    /// console GPU up only so `MODE_CURSOR` can take the hardware plane, and
+    /// `nvidia.console_gpu`, which wants it up so the console GPU can present
+    /// its OWN framebuffer with its own copy engine. The latter is the only
+    /// path to any GPU acceleration at all on a single-GPU box: with no second
+    /// card there is nothing to P2P from, so a cold console GPU means the CPU
+    /// blit and nothing else.
+    fn deferred_console_bringup(&self) -> alloc::string::String {
         alloc::string::String::new()
     }
 

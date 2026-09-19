@@ -2638,6 +2638,25 @@ fn proc_gpuroles_content() -> String {
     if n == 0 {
         s.push_str("[gpuroles] no NVIDIA DRM GPUs\n");
     }
+    // Which GPU actually answers each /dev/dri node. This is the map that
+    // decides where an ioctl lands, so it is the thing to read when a client
+    // has opened a node and is talking to a card it did not expect.
+    let nodes = crate::fs::devfs::drm::gpu_nodes();
+    if nodes.is_empty() {
+        s.push_str("[gpuroles] no /dev/dri nodes\n");
+    } else {
+        for node in nodes {
+            let _ = writeln!(
+                s,
+                "[gpuroles] /dev/dri/{} + /dev/dri/{} -> {} pci_bdf={:x?} console={}",
+                crate::fs::devfs::drm::node_name(node.card_minor()),
+                crate::fs::devfs::drm::node_name(node.render_minor()),
+                node.driver.name(),
+                node.driver.pci_bdf(),
+                node.driver.is_console_gpu(),
+            );
+        }
+    }
     s
 }
 

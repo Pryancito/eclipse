@@ -62,10 +62,11 @@ static PRESENT_FRAME_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::
 static CE_REPACK_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Master switch for the per-frame GPU copy-engine present (`ce_present`).
-/// Enabled automatically when a compute GPU finishes boot bring-up (dual RTX:
-/// P2P copy into the console GOP FB), or explicitly via `nvidia.cepresent`.
-/// Opt out with `nvidia.nocepresent`. On failure the path auto-wedges and
-/// falls back to the CPU blit for the rest of the boot.
+/// Enabled automatically when a GPU finishes bring-up -- a compute GPU at boot
+/// (dual RTX: P2P copy into the console GOP FB), or the console GPU itself
+/// after the deferred `nvidia.console_gpu` bring-up -- or explicitly via
+/// `nvidia.cepresent`. Opt out with `nvidia.nocepresent`. On failure the path
+/// auto-wedges and falls back to the CPU blit for the rest of the boot.
 static CE_PRESENT_ENABLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -73,10 +74,17 @@ static CE_PRESENT_ENABLED: core::sync::atomic::AtomicBool =
 /// BAR1 stays quiet during a deferred GSP-RM bring-up (hwcursor path).
 static SCANOUT_PAUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Enable/disable the per-frame CE-offloaded present (set once at boot from
-/// the `nvidia.cepresent` cmdline flag).
+/// Enable/disable the per-frame CE-offloaded present. Set at boot from the
+/// cmdline flags, and again after a deferred console-GPU bring-up, which can
+/// make a GPU able to present that was not able to when boot decided.
 pub fn set_ce_present_enabled(on: bool) {
     CE_PRESENT_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// Whether the CE present path is currently on, so the deferred bring-up can
+/// tell "boot already enabled this" from "boot found nothing ready".
+pub fn ce_present_enabled() -> bool {
+    CE_PRESENT_ENABLED.load(Ordering::Relaxed)
 }
 
 /// Pause/resume software+CE scanout. Used by deferred console-GPU GSP bring-up
@@ -389,13 +397,76 @@ lazy_static::lazy_static! {
         Mutex::new(alloc::collections::BTreeMap::new());
 }
 
+/// `nvidia.gem_uc` on the cmdline: keep the old uncached mapping for nouveau
+/// GEM objects. Escape hatch for [`nouveau_cpu_vmo`] -- see the note there on
+/// why WB is the coherent choice on x86 and what would falsify it.
+static GEM_MAP_UNCACHED: AtomicBool = AtomicBool::new(false);
+
+/// Read the `nvidia.gem_uc` cmdline token once and latch it.
+pub fn init_gem_cache_policy() {
+    let uc = kernel_hal::boot::cmdline()
+        .split([':', ' ', '\t', '\n'])
+        .any(|t| t == "nvidia.gem_uc");
+    GEM_MAP_UNCACHED.store(uc, Ordering::Relaxed);
+    if uc {
+        kernel_hal::klog_info!(
+            "[drm] nvidia.gem_uc -- nouveau GEM CPU mappings forced UNCACHED (slow; diagnostic only)"
+        );
+    }
+}
+
 /// Shared physical VMO for a nouveau GEM handle's CPU mmap / PRIME export.
+///
+/// The mapping is **cached (WB)**, not uncached. `VmObject::new_physical`
+/// starts every physical VMO at `CachePolicy::Uncached`
+/// (`zircon-object/src/vm/vmo/physical.rs`), and this path never overrode it,
+/// so every CPU touch of an NVK/zink staging buffer, pushbuffer or swapchain
+/// image was a serialized UC transaction -- roughly eight bytes per round
+/// trip to RAM, with no combining and no caching.
+///
+/// Uncached was never right here, because **only sysmem reaches this
+/// function**: `GEM_NEW` publishes a `phys_addr` exclusively when
+/// `gem_map_cpu` reports `ADDR_SYSMEM`, and refuses to publish one for an
+/// `ADDR_FBMEM` (VRAM) object at all, since a VRAM offset is not a host
+/// physical address. So every handle that gets here is ordinary host RAM
+/// behind GART -- the same class of memory the dumb-buffer path already
+/// maps `Cached` for exactly this reason (see `handle_vmo` below: "the
+/// compositor no longer renders into UC memory on real hardware").
+///
+/// WB also *removes* an aliasing hazard rather than adding one: the kernel
+/// already reaches these same frames through the WB physmap alias (that is
+/// what `dma_sync_scanout_src_from_device`'s clflush is maintaining), so a UC
+/// user mapping and a WB kernel mapping of one page were conflicting memory
+/// types. Now both ends agree.
+///
+/// Coherence against GPU DMA rests on x86 PCIe reads being snooped, which is
+/// the architectural default and what Linux's nouveau relies on for GART
+/// objects. The one thing that would falsify it is the GPU issuing No-Snoop
+/// TLPs for these reads; the symptom would be the GPU consuming stale bytes
+/// (garbage or a frame behind) rather than anything crashing. `nvidia.gem_uc`
+/// restores the old behaviour in place for a boot, so that hypothesis can be
+/// tested on hardware without a rebuild.
 pub fn nouveau_cpu_vmo(handle: u32, phys_addr: u64, size: usize) -> Arc<VmObject> {
     let mut map = NOUVEAU_CPU_VMOS.lock();
     if let Some(v) = map.get(&handle) {
         return v.clone();
     }
     let vmo = VmObject::new_physical(phys_addr as usize, pages(size));
+    if !GEM_MAP_UNCACHED.load(Ordering::Relaxed) {
+        // Must happen before the VMO is handed out: `set_cache_policy`
+        // refuses once a mapping exists. Nothing can have mapped it yet --
+        // it was constructed on the line above and is still unpublished.
+        if let Err(e) = vmo.set_cache_policy(kernel_hal::CachePolicy::Cached) {
+            static CACHE_POLICY_FAILED: AtomicBool = AtomicBool::new(false);
+            if !CACHE_POLICY_FAILED.swap(true, Ordering::Relaxed) {
+                kernel_hal::klog_warn!(
+                    "[drm] nouveau GEM mmap: set_cache_policy(Cached) failed ({:?}) -- \
+                     falling back to UNCACHED; CPU access to GEM objects will be slow",
+                    e
+                );
+            }
+        }
+    }
     map.insert(handle, vmo.clone());
     vmo
 }
@@ -420,13 +491,201 @@ pub fn get_primary_driver() -> Option<Arc<dyn DrmScheme>> {
     DRM_STATE.lock().drivers.first().cloned()
 }
 
-/// DRM minor of the compute-only primary node (`/dev/dri/card1`).
-pub const COMPUTE_CARD_MINOR: u32 = 1;
-/// DRM minor of the compute-only render node (`/dev/dri/renderD129`).
-pub const COMPUTE_RENDER_MINOR: u32 = 129;
+/// Base minor of the render-node range, as Linux allocates them: primary
+/// nodes are `card0..card63`, render nodes `renderD128..renderD191`.
+pub const RENDER_MINOR_BASE: u32 = 128;
+/// How many GPUs get a node pair. This is Linux's primary-minor range
+/// (`card0..card63`), which is stricter than the point where the two ranges
+/// would actually collide (`card128` would be `renderD128`'s minor). Staying
+/// inside the convention keeps `/dev/dri` names meaning to userspace what they
+/// mean on Linux, and leaves the render range untouched with 64 to spare.
+pub const MAX_GPU_NODES: u32 = 64;
 
+/// The node name Linux would give this minor: `card{n}` below the render base,
+/// `renderD{n}` at or above it.
+///
+/// Derived, not a lookup table. The four names this used to `match` on were
+/// the whole vocabulary — a third GPU's node came out as the literal `card?`.
+pub fn node_name(minor: u32) -> alloc::string::String {
+    if minor >= RENDER_MINOR_BASE {
+        alloc::format!("renderD{}", minor)
+    } else {
+        alloc::format!("card{}", minor)
+    }
+}
+
+/// Which pair of `/dev/dri` minors belongs to the GPU at a given index.
+///
+/// Separate from [`GpuNode`] because the layout is a property of the index
+/// alone: sysfs asks "what minor would GPU 2 have" without holding a driver,
+/// and the arithmetic is testable on its own.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NodeMinors {
+    index: u32,
+}
+
+impl NodeMinors {
+    /// The node pair for the GPU at `index` (0 = the primary GPU).
+    pub const fn new(index: u32) -> Self {
+        Self { index }
+    }
+    /// Minor of the primary node (`card{index}`).
+    pub const fn card(&self) -> u32 {
+        self.index
+    }
+    /// Minor of the render node (`renderD{128 + index}`).
+    pub const fn render(&self) -> u32 {
+        RENDER_MINOR_BASE + self.index
+    }
+    /// True when `minor` is either of this pair.
+    pub const fn owns(&self, minor: u32) -> bool {
+        minor == self.card() || minor == self.render()
+    }
+}
+
+/// One GPU and the pair of `/dev/dri` nodes that belong to it.
+///
+/// Index 0 is the GPU behind `card0` / `renderD128`: the one that scans out
+/// the console, which is what every KMS client must land on. Index 1 and up
+/// are the compute GPUs, in a **stable** order (see [`build_gpu_nodes`]), so
+/// `card1` names the same physical card across reboots.
+#[derive(Clone)]
+pub struct GpuNode {
+    /// 0 for the console/primary GPU, 1.. for each compute GPU.
+    pub index: u32,
+    /// The driver that serves both of this GPU's nodes.
+    pub driver: Arc<dyn DrmScheme>,
+}
+
+impl GpuNode {
+    /// The minors this GPU's two nodes use.
+    pub fn minors(&self) -> NodeMinors {
+        NodeMinors::new(self.index)
+    }
+    /// Minor of this GPU's primary node (`card{n}`).
+    pub fn card_minor(&self) -> u32 {
+        self.minors().card()
+    }
+    /// Minor of this GPU's render node (`renderD{128 + n}`).
+    pub fn render_minor(&self) -> u32 {
+        self.minors().render()
+    }
+    /// True when `minor` is either of this GPU's two nodes.
+    pub fn owns_minor(&self, minor: u32) -> bool {
+        self.minors().owns(minor)
+    }
+}
+
+static GPU_NODES: Mutex<Vec<GpuNode>> = Mutex::new(Vec::new());
+
+/// Work out which GPU owns which `/dev/dri` node, once, at filesystem setup.
+///
+/// The order is deliberate, because it is what userspace sees, and the first
+/// two entries are deliberately **exactly what this box already had** before
+/// the table existed:
+///
+/// * Index 0 is [`get_primary_driver`] -- the node every KMS client opens.
+///   Note this is NOT necessarily the console GPU: `register_driver` does
+///   `insert(0)`, so on a dual-card box the primary is whichever card was
+///   probed last, which is the compute one. Pointing `card0` at the console
+///   GPU instead would be a policy change, and a breaking one today: the
+///   console GPU is cold unless `nvidia.console_gpu` brought it up, so every
+///   nouveau ioctl on `card0` would start answering `ENODEV`.
+/// * Index 1 is [`get_compute_driver`], honouring an explicit
+///   `nvidia.compute=BB.DD.F` pin. On a two-card box that is the same driver
+///   as index 0, which is exactly the situation today: `card1` is a headless
+///   compute view of the same card, and `/sys/class/drm` gives it a distinct
+///   fake BDF so libdrm does not merge the two node pairs.
+/// * Indices 2.. are the remaining compute GPUs **sorted by PCI BDF**. Sorting
+///   rather than taking registration order is the point: that list is the
+///   reverse of the PCI probe order, so which card became `card2` would be an
+///   accident that could differ between boots. A BDF sort is stable, so a node
+///   names the same card every time.
+///
+/// Only the first [`MAX_GPU_NODES`] GPUs get nodes: past that, `card{n}` would
+/// collide with the render range and two GPUs would answer to one minor.
+pub fn build_gpu_nodes() {
+    let Some(primary) = get_primary_driver() else {
+        *GPU_NODES.lock() = Vec::new();
+        return;
+    };
+    let mut nodes = vec![GpuNode {
+        index: 0,
+        driver: primary,
+    }];
+
+    if let Some(compute) = get_compute_driver() {
+        nodes.push(GpuNode {
+            index: 1,
+            driver: compute,
+        });
+    }
+
+    // Everything else that can compute and is not already spoken for.
+    let drivers = kernel_hal::drivers::all_drm();
+    let list = drivers.as_vec();
+    let mut rest: Vec<Arc<dyn DrmScheme>> = list
+        .iter()
+        .filter(|d| d.is_compute_gpu() && !nodes.iter().any(|n| Arc::ptr_eq(&n.driver, d)))
+        .cloned()
+        .collect();
+    rest.sort_by_key(|d| d.pci_bdf());
+
+    for driver in rest {
+        let index = nodes.len() as u32;
+        if index >= MAX_GPU_NODES {
+            kernel_hal::klog_warn!(
+                "[drm] more than {} GPUs registered -- the extra ones get no /dev/dri node \
+                 (card{} would collide with the renderD range)",
+                MAX_GPU_NODES,
+                index
+            );
+            break;
+        }
+        nodes.push(GpuNode { index, driver });
+    }
+
+    for n in &nodes {
+        kernel_hal::klog_info!(
+            "[drm] /dev/dri/{} + /dev/dri/{} -> {:?} pci_bdf={:x?} console={}",
+            node_name(n.card_minor()),
+            node_name(n.render_minor()),
+            n.driver.name(),
+            n.driver.pci_bdf(),
+            n.driver.is_console_gpu(),
+        );
+    }
+    *GPU_NODES.lock() = nodes;
+}
+
+/// Every GPU that has a `/dev/dri` node pair, index order.
+pub fn gpu_nodes() -> Vec<GpuNode> {
+    GPU_NODES.lock().clone()
+}
+
+/// The driver that owns `minor`, or `None` when no node has that minor.
+///
+/// This is what makes a node mean a GPU. Before the table existed every ioctl
+/// on every node went to `get_primary_driver()` regardless of which node it
+/// arrived on, so `card1` was the compute GPU only in its sysfs identity and
+/// in `ECLIPSE_COMPUTE` -- every nouveau ioctl on it was served by a different
+/// card than the one userspace had identified.
+pub fn driver_for_minor(minor: u32) -> Option<Arc<dyn DrmScheme>> {
+    GPU_NODES
+        .lock()
+        .iter()
+        .find(|n| n.owns_minor(minor))
+        .map(|n| n.driver.clone())
+}
+
+/// Whether `minor` is one of the compute-only nodes (index 1 and up). Those
+/// advertise themselves as `eclipse-compute` and report no CRTCs, so Mesa and
+/// wlroots leave them alone and stay on `card0`.
 pub fn is_compute_minor(minor: u32) -> bool {
-    minor == COMPUTE_CARD_MINOR || minor == COMPUTE_RENDER_MINOR
+    GPU_NODES
+        .lock()
+        .iter()
+        .any(|n| n.index > 0 && n.owns_minor(minor))
 }
 
 /// `nvidia.compute=BB.DD.F` on the kernel cmdline (hex, dots — the cmdline
@@ -979,6 +1238,37 @@ fn blit_chunked(
     }
 }
 
+/// Offers the frame to each registered DRM driver until one takes it, best CE
+/// presenter first: the console GPU, then everyone else. Returns whether any
+/// driver took it.
+///
+/// The order matters because the two copies are not equivalent. A console GPU
+/// writes its OWN framebuffer, so the copy stays inside the card. A compute
+/// GPU writes the console card's BAR1 across PCIe peer-to-peer, which is
+/// slower and only works while ACS/IOMMU let P2P through. Registration order
+/// picked neither on purpose: `register_driver` does `insert(0)`, so the list
+/// is simply the reverse of the PCI probe order and whichever card happened to
+/// be probed last won.
+///
+/// This changes nothing unless a console GPU is actually state-loaded, which
+/// only happens with `nvidia.console_gpu` or a manual `/proc/gpustep14` -- a
+/// cold console GPU declines every CE call regardless of where it sits in the
+/// list. It is also written for any number of cards: N compute GPUs keep their
+/// relative order behind the console one.
+///
+/// Two filtered passes over the device list rather than a sorted copy, because
+/// this runs on the per-frame present path and must not allocate. The read
+/// guard is held across the calls, exactly as the plain
+/// `for d in all_drm().as_vec().iter()` loops it replaced did.
+fn ce_try_in_order(
+    mut try_one: impl FnMut(&Arc<dyn zcore_drivers::scheme::DrmScheme>) -> bool,
+) -> bool {
+    let all = kernel_hal::drivers::all_drm();
+    let all = all.as_vec();
+    all.iter().filter(|d| d.is_console_gpu()).any(&mut try_one)
+        || all.iter().filter(|d| !d.is_console_gpu()).any(&mut try_one)
+}
+
 /// FromDevice clflush of the CPU-mapped GEM span covering a scanout damage
 /// rect (including pitch padding between the first and last pixel). Needed
 /// only when the CPU will *read* the buffer (CPU blit / CE staging repack).
@@ -1168,11 +1458,15 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     // PCIe — on real hardware the console GPU's BAR1 serves CPU stores at a
     // measured 42 MB/s even through a verified write-combining mapping
     // (~99 ms/frame, the 7-11 FPS desktop), while GPU-initiated writes burst
-    // at PCIe speed. The flat CE copy needs equal strides: when the client's
-    // pitch differs from the scanout pitch, the rows are first CPU-repacked
-    // into a sysmem staging buffer at the scanout pitch (cached writes,
-    // ~GB/s) and the CE copies from there. Only for full-frame scanouts: the
-    // CE always copies from the buffer's start, so it can't honor a rect.
+    // at PCIe speed.
+    //
+    // A damage rect takes the pitched 2D path, which walks rows at a stride
+    // and now also takes a destination offset, so the engine can write just
+    // the damaged region. This used to be full-frame only (`rect.is_none()`),
+    // which inverted the economics of the whole present path: the cheap case
+    // — a small damage box — was handed to the CPU, and the expensive one to
+    // the GPU. The flat copy still needs a full frame, because it copies from
+    // the buffer's start with no stride at all.
     //
     // OPT-IN: gated on `nvidia.cepresent` (see CE_PRESENT_ENABLED) — the CE
     // DMA per present destabilized the desktop on real hardware once, so the
@@ -1190,8 +1484,19 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     // look stale, restore a sync here — the present klog's `sync Xus` is the
     // tell (should be ~0 on CE-direct).
     let mut blitted_by_ce = false;
-    if rect.is_none() && CE_PRESENT_ENABLED.load(Ordering::Relaxed) {
-        if fb.pitch != info.pitch {
+    if CE_PRESENT_ENABLED.load(Ordering::Relaxed) {
+        // Byte offsets of the damaged region in each buffer. Both are zero for
+        // a full-frame present, which is exactly the old behaviour.
+        let src_byte_off = (blit_y as u64)
+            .saturating_mul(fb.pitch as u64)
+            .saturating_add((blit_x as u64).saturating_mul(4));
+        let dst_byte_off = (blit_y as u64)
+            .saturating_mul(info.pitch as u64)
+            .saturating_add((blit_x as u64).saturating_mul(4));
+        // The flat path has no stride and no destination offset, so it can
+        // only serve a full frame with matching pitches.
+        let flat_ok = rect.is_none() && fb.pitch == info.pitch;
+        if !flat_ok {
             // Pitched 2D CE path: the GPU copy engine reads directly from the
             // source buffer at fb.pitch and writes into the scanout FB at
             // info.pitch — no CPU staging repack.  On the common dual-RTX case
@@ -1201,15 +1506,27 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
             // Fallback chain: 2D fails (CE_PRESENT_WEDGED latched) →
             // FromDevice + repack+flat CE → CPU blit.
             let row_bytes = (blit_w as usize).saturating_mul(4) as u32;
-            for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-                if d.ce_present_2d_pitched(fb.phys_addr, fb.pitch, info.pitch, row_bytes, blit_h) {
-                    blitted_by_ce = true;
-                    break;
-                }
-            }
+            let src_pa = fb.phys_addr.saturating_add(src_byte_off);
+            blitted_by_ce = ce_try_in_order(|d| {
+                d.ce_present_2d_pitched(
+                    src_pa,
+                    fb.pitch,
+                    dst_byte_off,
+                    info.pitch,
+                    row_bytes,
+                    blit_h,
+                )
+            });
             // Fallback: CPU reads the GEM, so FromDevice first, then repack
             // into staging at scanout pitch and flat CE.
-            if !blitted_by_ce {
+            //
+            // Full frames only. The repack lands the rows at the start of the
+            // staging buffer and the flat CE copies them to the start of the
+            // scanout FB, so with a damage rect it would paint the damaged
+            // region in the top-left corner of the screen. A rect that cannot
+            // take the 2D path falls through to the CPU blit, which does
+            // honour it.
+            if !blitted_by_ce && rect.is_none() {
                 if gem_cpu_mapped {
                     let ts = kernel_hal::timer::timer_now();
                     dma_sync_scanout_src_from_device(
@@ -1228,24 +1545,14 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
                 )
                 .unwrap_or((0, 0));
                 if ce_src_pa != 0 && ce_size != 0 {
-                    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-                        if d.ce_present(ce_src_pa, ce_size) {
-                            blitted_by_ce = true;
-                            break;
-                        }
-                    }
+                    blitted_by_ce = ce_try_in_order(|d| d.ce_present(ce_src_pa, ce_size));
                 }
             }
         } else {
             // Flat CE path: pitches match, a single flat copy covers the frame.
             let ce_src_pa = fb.phys_addr;
             let ce_size = (info.pitch as u64) * (blit_h as u64);
-            for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-                if d.ce_present(ce_src_pa, ce_size) {
-                    blitted_by_ce = true;
-                    break;
-                }
-            }
+            blitted_by_ce = ce_try_in_order(|d| d.ce_present(ce_src_pa, ce_size));
         }
         if !blitted_by_ce && !CE_NO_TAKER_LOGGED.swap(true, Ordering::Relaxed) {
             // Every GPU declined (wedged, not state-loaded, or no boot FB):
@@ -2561,6 +2868,69 @@ pub struct AtomicUpdate {
     pub out_fence_ptr: Option<u64>,
     /// Connector "CRTC_ID" (`Some(0)` detaches the connector).
     pub connector_crtc_id: Option<u32>,
+    /// Plane "FB_DAMAGE_CLIPS": blob id holding an array of `drm_mode_rect`,
+    /// the region the client actually repainted. `Some(0)` or absent means
+    /// the whole plane is damaged, as in Linux.
+    pub damage_clips: Option<u32>,
+}
+
+/// One `struct drm_mode_rect` (`drm_mode.h`): an inclusive-exclusive damage
+/// rectangle in framebuffer pixels. Signed, because the uAPI is.
+const DRM_MODE_RECT_SIZE: usize = 16;
+
+/// Resolve an `FB_DAMAGE_CLIPS` blob into one bounding rectangle clamped to
+/// the framebuffer, or `None` for "present the whole frame".
+///
+/// `None` is returned for every case Linux also treats as full damage: no
+/// property in the commit, a zero blob id, a blob that is not a whole number
+/// of `drm_mode_rect`s, and an empty or degenerate clip list. A damage hint
+/// that cannot be trusted must widen to the full frame, never narrow -- the
+/// failure mode of guessing small is stale tiles left on screen.
+fn damage_rect_from_blob(blob_id: u32, fb_w: u32, fb_h: u32) -> Option<(u32, u32, u32, u32)> {
+    if blob_id == 0 {
+        return None;
+    }
+    damage_rect_from_clips(&get_blob(blob_id)?, fb_w, fb_h)
+}
+
+/// The parsing half of [`damage_rect_from_blob`], split out so it can be
+/// tested without a live blob table.
+fn damage_rect_from_clips(data: &[u8], fb_w: u32, fb_h: u32) -> Option<(u32, u32, u32, u32)> {
+    if fb_w == 0 || fb_h == 0 {
+        return None;
+    }
+    if data.is_empty() || !data.len().is_multiple_of(DRM_MODE_RECT_SIZE) {
+        return None;
+    }
+    let mut union: Option<(u32, u32, u32, u32)> = None;
+    for chunk in data.as_chunks::<DRM_MODE_RECT_SIZE>().0 {
+        let rd =
+            |o: usize| i32::from_ne_bytes([chunk[o], chunk[o + 1], chunk[o + 2], chunk[o + 3]]);
+        let (x1, y1, x2, y2) = (rd(0), rd(4), rd(8), rd(12));
+        if x2 <= x1 || y2 <= y1 {
+            continue;
+        }
+        // Clamp into the framebuffer. A clip reaching outside it is not a
+        // reason to refuse the commit (Linux does not), just to trim.
+        let x1 = x1.max(0) as u32;
+        let y1 = y1.max(0) as u32;
+        let x2 = (x2.max(0) as u32).min(fb_w);
+        let y2 = (y2.max(0) as u32).min(fb_h);
+        if x2 <= x1 || y2 <= y1 {
+            continue;
+        }
+        union = Some(match union {
+            Some((ux, uy, uw, uh)) => {
+                let nx = ux.min(x1);
+                let ny = uy.min(y1);
+                let fx = (ux + uw).max(x2);
+                let fy = (uy + uh).max(y2);
+                (nx, ny, fx - nx, fy - ny)
+            }
+            None => (x1, y1, x2 - x1, y2 - y1),
+        });
+    }
+    union
 }
 
 /// Why an atomic check/commit was refused. Mapped to errno by the ioctl
@@ -2790,7 +3160,18 @@ pub fn atomic_commit(
 
     match upd.plane_fb_id {
         Some(0) => set_crtc_fb(SYNTH_CRTC_ID, 0),
-        Some(fb_id) if !present_now(fb_id, SYNTH_CRTC_ID) => return Err(AtomicError::Device),
+        Some(fb_id) => {
+            // Honour FB_DAMAGE_CLIPS. Without it every commit presented the
+            // whole framebuffer no matter how little changed -- 8.3 MB of CPU
+            // stores at 1080p for a moved cursor or a blinking caret.
+            let rect = upd.damage_clips.and_then(|blob_id| {
+                let fb = get_fb(fb_id)?;
+                damage_rect_from_blob(blob_id, fb.width, fb.height)
+            });
+            if !present_now_region(fb_id, SYNTH_CRTC_ID, rect) {
+                return Err(AtomicError::Device);
+            }
+        }
         _ => {}
     }
 
@@ -3262,5 +3643,166 @@ mod release_tests {
         assert!(!state.framebuffers.iter().any(|fb| fb.id == 9399));
         assert!(!state.fb_backing.iter().any(|(id, _)| *id == 9399));
         assert_eq!(state.crtc_fb, 0, "RMFB of the CRTC fb unbinds it");
+    }
+}
+
+#[cfg(test)]
+mod damage_tests {
+    use super::damage_rect_from_clips;
+
+    /// Build a `drm_mode_rect` blob from `(x1, y1, x2, y2)` tuples.
+    fn clips(rects: &[(i32, i32, i32, i32)]) -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec::Vec::new();
+        for (x1, y1, x2, y2) in rects {
+            for n in [x1, y1, x2, y2] {
+                v.extend_from_slice(&n.to_ne_bytes());
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn single_clip_becomes_that_rect() {
+        let b = clips(&[(10, 20, 30, 50)]);
+        assert_eq!(
+            damage_rect_from_clips(&b, 1920, 1080),
+            Some((10, 20, 20, 30))
+        );
+    }
+
+    #[test]
+    fn several_clips_union_into_their_bounding_box() {
+        let b = clips(&[(10, 10, 20, 20), (100, 200, 110, 210)]);
+        assert_eq!(
+            damage_rect_from_clips(&b, 1920, 1080),
+            Some((10, 10, 100, 200))
+        );
+    }
+
+    /// A clip reaching past the framebuffer is trimmed, not refused -- Linux
+    /// does the same.
+    #[test]
+    fn clips_are_clamped_to_the_framebuffer() {
+        let b = clips(&[(1900, 1070, 4000, 4000)]);
+        assert_eq!(
+            damage_rect_from_clips(&b, 1920, 1080),
+            Some((1900, 1070, 20, 10))
+        );
+    }
+
+    /// Negative origins are part of the uAPI (the fields are signed); clamp
+    /// rather than wrap into a huge unsigned rect.
+    #[test]
+    fn negative_origin_clamps_to_zero() {
+        let b = clips(&[(-50, -50, 10, 10)]);
+        assert_eq!(damage_rect_from_clips(&b, 1920, 1080), Some((0, 0, 10, 10)));
+    }
+
+    /// Every "cannot be trusted" case must widen to the whole frame (None),
+    /// never narrow: guessing small leaves stale tiles on screen.
+    #[test]
+    fn untrustworthy_input_means_full_damage() {
+        // Empty list.
+        assert_eq!(damage_rect_from_clips(&[], 1920, 1080), None);
+        // Not a whole number of drm_mode_rects.
+        assert_eq!(damage_rect_from_clips(&[0u8; 20], 1920, 1080), None);
+        // Degenerate (x2 <= x1) and inverted rects contribute nothing.
+        let b = clips(&[(10, 10, 10, 20), (30, 40, 20, 30)]);
+        assert_eq!(damage_rect_from_clips(&b, 1920, 1080), None);
+        // Entirely off-screen, so nothing survives the clamp.
+        let b = clips(&[(5000, 5000, 6000, 6000)]);
+        assert_eq!(damage_rect_from_clips(&b, 1920, 1080), None);
+        // A framebuffer with no area.
+        let b = clips(&[(0, 0, 10, 10)]);
+        assert_eq!(damage_rect_from_clips(&b, 0, 1080), None);
+    }
+
+    /// A degenerate clip next to a good one must not poison the union.
+    #[test]
+    fn degenerate_clips_are_skipped_not_fatal() {
+        let b = clips(&[(10, 10, 10, 10), (40, 50, 60, 80)]);
+        assert_eq!(
+            damage_rect_from_clips(&b, 1920, 1080),
+            Some((40, 50, 20, 30))
+        );
+    }
+}
+
+/// The node naming and minor arithmetic, which is what `/dev/dri`,
+/// `/sys/class/drm` and `/sys/dev/char` all derive their entries from.
+/// Building the table itself needs registered drivers, so it is not testable
+/// here; this covers the part that used to be four hand-written names and is
+/// now shared arithmetic.
+#[cfg(test)]
+mod node_tests {
+    use super::*;
+
+    #[test]
+    fn the_first_gpu_keeps_card0_and_render128() {
+        let n = NodeMinors::new(0);
+        assert_eq!(n.card(), 0);
+        assert_eq!(n.render(), 128);
+    }
+
+    #[test]
+    fn names_are_derived_for_any_index() {
+        // The four the old `match` knew, plus the third GPU that used to come
+        // out as the literal string "card?".
+        assert_eq!(node_name(0), "card0");
+        assert_eq!(node_name(1), "card1");
+        assert_eq!(node_name(2), "card2");
+        assert_eq!(node_name(128), "renderD128");
+        assert_eq!(node_name(129), "renderD129");
+        assert_eq!(node_name(130), "renderD130");
+    }
+
+    #[test]
+    fn a_gpu_owns_exactly_its_own_two_minors() {
+        let n = NodeMinors::new(2);
+        assert_eq!(n.card(), 2);
+        assert_eq!(n.render(), 130);
+        assert!(n.owns(2));
+        assert!(n.owns(130));
+        // Not its neighbours', which is the whole point of the table.
+        assert!(!n.owns(1));
+        assert!(!n.owns(3));
+        assert!(!n.owns(129));
+        assert!(!n.owns(131));
+    }
+
+    #[test]
+    fn no_two_gpus_can_claim_one_minor_below_the_cap() {
+        // Every minor under the cap is claimed by at most one GPU. This is
+        // what `build_gpu_nodes` stops at, so assert it rather than trusting
+        // the constant to have been chosen correctly.
+        for i in 0..MAX_GPU_NODES {
+            for j in 0..MAX_GPU_NODES {
+                if i == j {
+                    continue;
+                }
+                let a = NodeMinors::new(i);
+                let b = NodeMinors::new(j);
+                assert!(!b.owns(a.card()), "card{} also belongs to GPU {}", i, j);
+                assert!(
+                    !b.owns(a.render()),
+                    "renderD{} also belongs to GPU {}",
+                    a.render(),
+                    j
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_cap_stays_inside_the_primary_minor_range() {
+        // `card{n}` only stops being a primary node name at RENDER_MINOR_BASE,
+        // where it would name a render node instead and two GPUs would answer
+        // to one minor. The cap is deliberately well short of that, at Linux's
+        // own card0..card63 range.
+        assert!(MAX_GPU_NODES <= RENDER_MINOR_BASE);
+        assert!(NodeMinors::new(MAX_GPU_NODES - 1).card() < RENDER_MINOR_BASE);
+        // And past RENDER_MINOR_BASE is where it really breaks, which is why
+        // the cap exists at all.
+        assert!(NodeMinors::new(0).owns(NodeMinors::new(RENDER_MINOR_BASE).card()));
     }
 }

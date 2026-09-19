@@ -864,7 +864,7 @@ impl INode for SysPciDevDirINode {
             // device that actually backs a DRM node exposes the directory —
             // advertising card0 on every PCI function (host bridge, console
             // GPU, ...) makes libdrm merge the wrong render node.
-            "drm" if drm_pci_role(self.index) != DrmPciRole::None => {
+            "drm" if !drm_nodes_for_pci_index(self.index).is_empty() => {
                 Ok(Arc::new(SysDrmDeviceDrmDirINode {
                     pci_index: self.index,
                 }))
@@ -885,7 +885,7 @@ impl INode for SysPciDevDirINode {
             "subsystem_vendor",
             "subsystem_device",
         ];
-        if drm_pci_role(self.index) != DrmPciRole::None {
+        if !drm_nodes_for_pci_index(self.index).is_empty() {
             entries.push("drm");
         }
         if id >= entries.len() {
@@ -994,14 +994,6 @@ fn pci_index_for_bdf(bus: u8, dev: u8, func: u8) -> Option<usize> {
     get_pci_devices().iter().position(|d| d.name == want)
 }
 
-/// PCI sysfs index of the compute GPU (`card1` / `renderD129`). None when
-/// there is no non-console NVIDIA GPU.
-fn drm_compute_pci_index() -> Option<usize> {
-    crate::fs::devfs::drm::get_compute_driver()
-        .and_then(|d| d.pci_bdf())
-        .and_then(|(_, bus, dev, func)| pci_index_for_bdf(bus, dev, func))
-}
-
 /// Sentinel PCI sysfs index for the compute-only DRM nodes when they would
 /// otherwise share the compute GPU's BDF with card0/renderD128.
 ///
@@ -1026,20 +1018,14 @@ const COMPUTE_ALIAS_INDEX: usize = usize::MAX;
 const COMPUTE_ALIAS_BDF: &str = "0000:ee:00.0";
 const COMPUTE_ALIAS_CLASS: &str = "0x120000";
 
+/// Whether the fake PCI device has to appear in `/sys/bus/pci/devices`.
+///
+/// Derived from the node table rather than recomputed: it must be true
+/// exactly when some node's `device` symlink points at the alias, or that
+/// symlink dangles and libdrm fails to identify the node. Asking
+/// [`drm_nodes_for_pci_index`] is the same question the symlinks answer.
 fn compute_alias_needed() -> bool {
-    matches!(
-        (drm_card0_pci_index(), drm_compute_pci_index()),
-        (Some(a), Some(b)) if a == b
-    )
-}
-
-fn compute_sysfs_pci_index() -> Option<usize> {
-    let compute = drm_compute_pci_index()?;
-    if drm_card0_pci_index() == Some(compute) {
-        Some(COMPUTE_ALIAS_INDEX)
-    } else {
-        Some(compute)
-    }
+    !drm_nodes_for_pci_index(COMPUTE_ALIAS_INDEX).is_empty()
 }
 
 fn pci_bdf_name(index: usize) -> Option<String> {
@@ -1070,27 +1056,93 @@ fn pci_dev_inode(index: usize) -> Result<Arc<dyn INode>> {
     }))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DrmPciRole {
-    None,
-    /// card0 + renderD128 (KMS / nouveau / NVK).
-    Primary,
-    /// card1 + renderD129 (eclipse-compute). Distinct BDF from Primary.
-    ComputeOnly,
+/// Parse a DRM node name back into its minor: `card{n}` -> n, `renderD{n}`
+/// -> n. Anything else is not a DRM node.
+///
+/// Accepts a name only if it is the one [`crate::fs::devfs::drm::node_name`]
+/// would produce for that minor, so a lookup of `card007` or `renderD0129`
+/// does not silently resolve to a node that is not spelled that way anywhere
+/// else in the tree.
+fn drm_minor_from_name(name: &str) -> Option<u32> {
+    let digits = name
+        .strip_prefix("renderD")
+        .or_else(|| name.strip_prefix("card"))?;
+    let minor = digits.parse::<u32>().ok()?;
+    (crate::fs::devfs::drm::node_name(minor) == name).then_some(minor)
 }
 
-fn drm_pci_role(pci_index: usize) -> DrmPciRole {
-    if pci_index == COMPUTE_ALIAS_INDEX {
-        return DrmPciRole::ComputeOnly;
+/// The sysfs PCI index that backs a DRM node, or `None` when that minor has
+/// no node.
+///
+/// `card0`/`renderD128` keep their own resolution ([`drm_card0_pci_index`],
+/// which prefers the primary driver's BDF and falls back to the display-class
+/// scan), because that is the node whose identity NVK filters on. Every other
+/// node resolves through the `/dev/dri` table, so a node's sysfs identity and
+/// the GPU serving its ioctls can no longer name different cards.
+fn drm_node_pci_index(minor: u32) -> Option<usize> {
+    if minor == 0 || minor == crate::fs::devfs::drm::RENDER_MINOR_BASE {
+        return drm_card0_pci_index();
     }
-    let card0 = drm_card0_pci_index();
-    let compute = drm_compute_pci_index();
-    if card0 == Some(pci_index) {
-        DrmPciRole::Primary
-    } else if compute == Some(pci_index) && card0 != compute {
-        DrmPciRole::ComputeOnly
+    let driver = crate::fs::devfs::drm::driver_for_minor(minor)?;
+    let (_, bus, dev, func) = driver.pci_bdf()?;
+    let idx = pci_index_for_bdf(bus, dev, func)?;
+    // Only a node that would share card0's PCI device needs the alias; the
+    // GPUs at index 2 and up are distinct cards with distinct BDFs, so they
+    // keep their real one and libdrm sees them as separate devices already.
+    if drm_card0_pci_index() == Some(idx) {
+        Some(COMPUTE_ALIAS_INDEX)
     } else {
-        DrmPciRole::None
+        Some(idx)
+    }
+}
+
+/// The DRM node minors whose sysfs identity lives under this PCI device, in
+/// `card` then `renderD` order per GPU.
+///
+/// This replaces a fixed `Primary` / `ComputeOnly` role: with N cards a PCI
+/// device is simply whichever node pairs resolve onto it.
+fn drm_nodes_for_pci_index(pci_index: usize) -> Vec<u32> {
+    let mut out = Vec::new();
+    for node in crate::fs::devfs::drm::gpu_nodes() {
+        for minor in [node.card_minor(), node.render_minor()] {
+            if drm_node_pci_index(minor) == Some(pci_index) {
+                out.push(minor);
+            }
+        }
+    }
+    out
+}
+
+/// The DRM minors that have a sysfs node, in listing order: `card0`,
+/// `renderD128`, then each further GPU's `card{n}` and `renderD{128+n}`.
+///
+/// `/sys/class/drm` and `/sys/dev/char` both enumerate from this, so the two
+/// listings cannot go out of step, and neither can drift from `/dev/dri`.
+fn drm_class_entries() -> Vec<u32> {
+    if drm_card0_pci_index().is_none() {
+        return Vec::new();
+    }
+    let mut out = vec![0, crate::fs::devfs::drm::RENDER_MINOR_BASE];
+    for node in crate::fs::devfs::drm::gpu_nodes().iter().skip(1) {
+        if drm_node_pci_index(node.card_minor()).is_some() {
+            out.push(node.card_minor());
+            out.push(node.render_minor());
+        }
+    }
+    out
+}
+
+/// The sysfs inode for a DRM node, as a symlink into `/sys/devices` when the
+/// PCI device has a BDF name (what libudev insists on) and as the node
+/// directory itself otherwise.
+fn drm_node_inode(minor: u32) -> Result<Arc<dyn INode>> {
+    let idx = drm_node_pci_index(minor).ok_or(FsError::EntryNotFound)?;
+    match pci_bdf_name(idx) {
+        Some(bdf) => Ok(drm_devices_symlink(
+            &crate::fs::devfs::drm::node_name(minor),
+            &bdf,
+        )),
+        None => Ok(Arc::new(SysDrmNodeINode::new(idx, minor))),
     }
 }
 
@@ -1150,12 +1202,26 @@ pub(crate) fn log_drm_pci_backing() {
             kernel_hal::klog_info!("[drm-probe] render node has NO PCI backing (idx={:?})", idx)
         }
     }
-    if let Some(alias) = compute_sysfs_pci_index() {
+    // One line per compute-only node pair: which sysfs PCI device backs it,
+    // and whether that is the fake BDF that keeps libdrm from merging it into
+    // card0's device. With three or more cards there is more than one pair, so
+    // this enumerates rather than describing "the" compute node.
+    for node in crate::fs::devfs::drm::gpu_nodes().iter().skip(1) {
+        let Some(idx) = drm_node_pci_index(node.card_minor()) else {
+            kernel_hal::klog_info!(
+                "[drm-probe] {} / {} have NO sysfs PCI backing -- libdrm cannot identify them",
+                crate::fs::devfs::drm::node_name(node.card_minor()),
+                crate::fs::devfs::drm::node_name(node.render_minor()),
+            );
+            continue;
+        };
         kernel_hal::klog_info!(
-            "[drm-probe] compute-only nodes (card1/renderD129) sysfs PCI index={:?} bdf={} (alias={} so they do not merge with card0)",
-            alias,
-            pci_bdf_name(alias).unwrap_or_else(|| "<none>".into()),
-            alias == COMPUTE_ALIAS_INDEX
+            "[drm-probe] compute-only nodes {} / {} sysfs PCI index={:?} bdf={} (alias={} so they do not merge with card0)",
+            crate::fs::devfs::drm::node_name(node.card_minor()),
+            crate::fs::devfs::drm::node_name(node.render_minor()),
+            idx,
+            pci_bdf_name(idx).unwrap_or_else(|| "<none>".into()),
+            idx == COMPUTE_ALIAS_INDEX
         );
     }
     // Actively resolve the EXACT sysfs chain libdrm's drmGetDevices2 walks, so
@@ -1232,87 +1298,39 @@ impl INode for SysClassDrmDirINode {
         match name {
             "." => Ok(Arc::new(SysClassDrmDirINode)),
             ".." => Ok(Arc::new(SysClassINode)),
-            "card0" => match drm_card0_pci_index() {
-                Some(idx) => match pci_bdf_name(idx) {
-                    Some(bdf) => Ok(drm_devices_symlink("card0", &bdf)),
-                    None => Ok(Arc::new(SysDrmNodeINode::card(idx))),
-                },
-                None => Err(FsError::EntryNotFound),
-            },
-            "renderD128" => match drm_card0_pci_index() {
-                Some(idx) => match pci_bdf_name(idx) {
-                    Some(bdf) => Ok(drm_devices_symlink("renderD128", &bdf)),
-                    None => Ok(Arc::new(SysDrmNodeINode::render(idx))),
-                },
-                None => Err(FsError::EntryNotFound),
-            },
-            "card1" => match compute_sysfs_pci_index() {
-                Some(idx) => match pci_bdf_name(idx) {
-                    Some(bdf) => Ok(drm_devices_symlink("card1", &bdf)),
-                    None => Ok(Arc::new(SysDrmNodeINode::card1(idx))),
-                },
-                None => Err(FsError::EntryNotFound),
-            },
-            "renderD129" => match compute_sysfs_pci_index() {
-                Some(idx) => match pci_bdf_name(idx) {
-                    Some(bdf) => Ok(drm_devices_symlink("renderD129", &bdf)),
-                    None => Ok(Arc::new(SysDrmNodeINode::render129(idx))),
-                },
-                None => Err(FsError::EntryNotFound),
-            },
-            _ => Err(FsError::EntryNotFound),
+            _ => drm_node_inode(drm_minor_from_name(name).ok_or(FsError::EntryNotFound)?),
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
         if drm_card0_pci_index().is_none() {
             return Err(FsError::EntryNotFound);
         }
-        match id {
-            0 => Ok("card0".into()),
-            1 => Ok("renderD128".into()),
-            2 if drm_compute_pci_index().is_some() => Ok("card1".into()),
-            3 if drm_compute_pci_index().is_some() => Ok("renderD129".into()),
-            _ => Err(FsError::EntryNotFound),
-        }
+        // card0, renderD128, then each further GPU's pair -- the same order
+        // and the same set as `/dev/dri`, because both read one table.
+        drm_class_entries()
+            .get(id)
+            .map(|m| crate::fs::devfs::drm::node_name(*m))
+            .ok_or(FsError::EntryNotFound)
     }
 }
 
-/// A DRM device node in sysfs: the primary node `card0` (minor 0) or the render
-/// node `renderD128` (minor 128). Both share the same backing PCI device.
+/// A DRM device node in sysfs: a primary node `card{n}` or a render node
+/// `renderD{128+n}`. Both of a GPU's nodes share its backing PCI device.
 struct SysDrmNodeINode {
     pci_index: usize,
     minor: u32,
-    devname: &'static str,
 }
 
 impl SysDrmNodeINode {
-    fn card(pci_index: usize) -> Self {
-        Self {
-            pci_index,
-            minor: 0,
-            devname: "card0",
-        }
+    fn new(pci_index: usize, minor: u32) -> Self {
+        Self { pci_index, minor }
     }
-    fn render(pci_index: usize) -> Self {
-        Self {
-            pci_index,
-            minor: 128,
-            devname: "renderD128",
-        }
-    }
-    fn card1(pci_index: usize) -> Self {
-        Self {
-            pci_index,
-            minor: 1,
-            devname: "card1",
-        }
-    }
-    fn render129(pci_index: usize) -> Self {
-        Self {
-            pci_index,
-            minor: 129,
-            devname: "renderD129",
-        }
+    /// `dri/<devname>`, derived from the minor rather than carried alongside
+    /// it: a name and a minor stored separately are two things that can
+    /// disagree, and `uevent`'s DEVNAME is exactly where that would be
+    /// invisible.
+    fn devname(&self) -> String {
+        crate::fs::devfs::drm::node_name(self.minor)
     }
     fn entries() -> [&'static str; 4] {
         ["dev", "uevent", "device", "subsystem"]
@@ -1345,11 +1363,7 @@ impl INode for SysDrmNodeINode {
     }
     fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
         match name {
-            "." => Ok(Arc::new(SysDrmNodeINode {
-                pci_index: self.pci_index,
-                minor: self.minor,
-                devname: self.devname,
-            })),
+            "." => Ok(Arc::new(SysDrmNodeINode::new(self.pci_index, self.minor))),
             // Canonical node lives at /sys/devices/pci0000:00/<BDF>/drm/<name>.
             // Parent walks (libdrm/udev) must see the BDF-named PCI directory.
             ".." => Ok(Arc::new(SysDrmDeviceDrmDirINode {
@@ -1364,7 +1378,8 @@ impl INode for SysDrmNodeINode {
             "uevent" => Ok(Arc::new(Pseudo::new(
                 &format!(
                     "MAJOR=226\nMINOR={}\nDEVNAME=dri/{}\n",
-                    self.minor, self.devname
+                    self.minor,
+                    self.devname()
                 ),
                 FileType::File,
             ))),
@@ -1435,35 +1450,20 @@ impl INode for SysDrmDeviceDrmDirINode {
                 pci_index: self.pci_index,
             })),
             ".." => pci_dev_inode(self.pci_index),
-            "card0" if drm_pci_role(self.pci_index) == DrmPciRole::Primary => {
-                Ok(Arc::new(SysDrmNodeINode::card(self.pci_index)))
+            _ => {
+                let minor = drm_minor_from_name(name).ok_or(FsError::EntryNotFound)?;
+                if drm_node_pci_index(minor) != Some(self.pci_index) {
+                    return Err(FsError::EntryNotFound);
+                }
+                Ok(Arc::new(SysDrmNodeINode::new(self.pci_index, minor)))
             }
-            "renderD128" if drm_pci_role(self.pci_index) == DrmPciRole::Primary => {
-                Ok(Arc::new(SysDrmNodeINode::render(self.pci_index)))
-            }
-            "card1" if drm_pci_role(self.pci_index) == DrmPciRole::ComputeOnly => {
-                Ok(Arc::new(SysDrmNodeINode::card1(self.pci_index)))
-            }
-            "renderD129" if drm_pci_role(self.pci_index) == DrmPciRole::ComputeOnly => {
-                Ok(Arc::new(SysDrmNodeINode::render129(self.pci_index)))
-            }
-            _ => Err(FsError::EntryNotFound),
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        match drm_pci_role(self.pci_index) {
-            DrmPciRole::Primary => match id {
-                0 => Ok("card0".into()),
-                1 => Ok("renderD128".into()),
-                _ => Err(FsError::EntryNotFound),
-            },
-            DrmPciRole::ComputeOnly => match id {
-                0 => Ok("card1".into()),
-                1 => Ok("renderD129".into()),
-                _ => Err(FsError::EntryNotFound),
-            },
-            DrmPciRole::None => Err(FsError::EntryNotFound),
-        }
+        drm_nodes_for_pci_index(self.pci_index)
+            .get(id)
+            .map(|m| crate::fs::devfs::drm::node_name(*m))
+            .ok_or(FsError::EntryNotFound)
     }
 }
 
@@ -1555,39 +1555,19 @@ impl INode for SysDevCharDirINode {
         // DRM nodes: Linux makes these *symlinks* into
         // `/sys/devices/pci.../drm/<name>` so realpath() lands under
         // `/sys/devices` (libudev requires that; a directory here yields
-        // ENODEV from drmGetDevice2). card1/renderD129 use the compute
-        // sysfs index, which is a distinct BDF when they would otherwise
-        // share the compute GPU with card0.
-        if name == "226:0" {
-            if let Some(idx) = drm_card0_pci_index() {
-                return match pci_bdf_name(idx) {
-                    Some(bdf) => Ok(drm_devices_symlink("card0", &bdf)),
-                    None => Ok(Arc::new(SysDrmNodeINode::card(idx))),
-                };
-            }
-        }
-        if name == "226:128" {
-            if let Some(idx) = drm_card0_pci_index() {
-                return match pci_bdf_name(idx) {
-                    Some(bdf) => Ok(drm_devices_symlink("renderD128", &bdf)),
-                    None => Ok(Arc::new(SysDrmNodeINode::render(idx))),
-                };
-            }
-        }
-        if name == "226:1" {
-            if let Some(idx) = compute_sysfs_pci_index() {
-                return match pci_bdf_name(idx) {
-                    Some(bdf) => Ok(drm_devices_symlink("card1", &bdf)),
-                    None => Ok(Arc::new(SysDrmNodeINode::card1(idx))),
-                };
-            }
-        }
-        if name == "226:129" {
-            if let Some(idx) = compute_sysfs_pci_index() {
-                return match pci_bdf_name(idx) {
-                    Some(bdf) => Ok(drm_devices_symlink("renderD129", &bdf)),
-                    None => Ok(Arc::new(SysDrmNodeINode::render129(idx))),
-                };
+        // ENODEV from drmGetDevice2). A compute node that would otherwise
+        // share card0's PCI device gets a distinct alias BDF instead, so
+        // libdrm does not merge the two pairs into one device.
+        //
+        // Every DRM minor with a node resolves here, not just the four that
+        // used to be spelled out, so a third GPU's `226:2` / `226:130` is
+        // reachable the same way.
+        if let Some(minor) = name
+            .strip_prefix("226:")
+            .and_then(|m| m.parse::<u32>().ok())
+        {
+            if drm_node_pci_index(minor).is_some() {
+                return drm_node_inode(minor);
             }
         }
         // evdev: 13:<64+N> -> a *symlink* to /sys/class/input/eventN.
@@ -1617,35 +1597,13 @@ impl INode for SysDevCharDirINode {
         Err(FsError::EntryNotFound)
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        // 226:0 (card0) and 226:128 (renderD128) first, then compute
-        // 226:1 / 226:129, then evdev 13:64..
-        let have_card = drm_card0_pci_index().is_some();
-        let have_compute = drm_compute_pci_index().is_some();
-        let mut drm_n = 0usize;
-        if have_card {
-            drm_n += 2;
+        // Every DRM node first, in the same order `/sys/class/drm` lists them
+        // (226:0, 226:128, then each further GPU's pair), then evdev 13:64..
+        let drm = drm_class_entries();
+        if let Some(minor) = drm.get(id) {
+            return Ok(format!("226:{}", minor));
         }
-        if have_compute {
-            drm_n += 2;
-        }
-        if have_card {
-            if id == 0 {
-                return Ok("226:0".into());
-            }
-            if id == 1 {
-                return Ok("226:128".into());
-            }
-        }
-        if have_compute {
-            let base = if have_card { 2 } else { 0 };
-            if id == base {
-                return Ok("226:1".into());
-            }
-            if id == base + 1 {
-                return Ok("226:129".into());
-            }
-        }
-        let ev = id - drm_n;
+        let ev = id - drm.len();
         if ev < input_event_count() {
             return Ok(format!("13:{}", EVDEV_EVENT_MINOR_BASE + ev));
         }
@@ -2728,4 +2686,55 @@ pub(crate) fn lookup_path(path: &str, follow_times: usize) -> Result<Arc<dyn INo
 
 lazy_static! {
     static ref SYS_ROOT: Arc<dyn INode> = Arc::new(SysRootINode);
+}
+
+/// Node-name parsing. `/sys/class/drm`, `/sys/dev/char` and each PCI device's
+/// `drm/` directory all resolve a lookup through this, so a name it accepts
+/// that `/dev/dri` never emits is a path that exists in one tree and not the
+/// other.
+#[cfg(test)]
+mod drm_name_tests {
+    use super::*;
+
+    #[test]
+    fn card_and_render_names_round_trip() {
+        for minor in [0u32, 1, 2, 63, 128, 129, 130, 191] {
+            let name = crate::fs::devfs::drm::node_name(minor);
+            assert_eq!(
+                drm_minor_from_name(&name),
+                Some(minor),
+                "{name} did not round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_the_tree_never_emits_is_rejected() {
+        // Non-canonical spellings of a real minor: these would otherwise
+        // resolve to a node that is listed under a different name.
+        assert_eq!(drm_minor_from_name("card007"), None);
+        assert_eq!(drm_minor_from_name("renderD0129"), None);
+        // A render minor spelled as a card and vice versa.
+        assert_eq!(drm_minor_from_name("card128"), None);
+        assert_eq!(drm_minor_from_name("renderD1"), None);
+        // Not DRM nodes at all.
+        assert_eq!(drm_minor_from_name("card"), None);
+        assert_eq!(drm_minor_from_name("cardX"), None);
+        assert_eq!(drm_minor_from_name("controlD64"), None);
+        assert_eq!(drm_minor_from_name(""), None);
+        assert_eq!(drm_minor_from_name("."), None);
+        assert_eq!(drm_minor_from_name(".."), None);
+    }
+
+    #[test]
+    fn an_out_of_range_minor_does_not_overflow() {
+        // u32::MAX parses; it must simply not be a node, not panic.
+        assert_eq!(drm_minor_from_name("card4294967296"), None);
+        assert_eq!(
+            drm_minor_from_name("renderD4294967295"),
+            Some(u32::MAX),
+            "it parses as a render minor; whether a node exists is the table's call"
+        );
+        assert!(drm_node_pci_index(u32::MAX).is_none());
+    }
 }
