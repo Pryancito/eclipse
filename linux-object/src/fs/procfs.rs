@@ -440,7 +440,7 @@ impl INode for ProcRootINode {
             read: true,
             write: false,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
 
@@ -577,7 +577,7 @@ impl INode for ProcPidDirINode {
             read: true,
             write: false,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
 
@@ -702,7 +702,7 @@ impl INode for ProcNetDirINode {
             read: true,
             write: false,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
 
@@ -779,7 +779,7 @@ impl INode for ProcSysvipcDirINode {
             read: true,
             write: false,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -824,7 +824,7 @@ impl INode for ProcSysDirINode {
             read: true,
             write: false,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -875,7 +875,7 @@ impl INode for ProcSysKernelDirINode {
             read: true,
             write: false,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -946,7 +946,7 @@ impl INode for ProcSysKernelRandomDirINode {
             read: true,
             write: false,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -993,7 +993,7 @@ impl INode for ProcSysVmDirINode {
             read: true,
             write: false,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -1040,7 +1040,7 @@ impl INode for ProcSysFsDirINode {
             read: true,
             write: false,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -1158,7 +1158,7 @@ impl INode for ProcPerfDirINode {
             read: true,
             write: false,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {
@@ -1369,7 +1369,7 @@ impl INode for ProcSeqINode {
             read: true,
             write: false,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
 
@@ -1438,7 +1438,7 @@ impl INode for ProcSysWritableINode {
             read: true,
             write: true,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
 
@@ -1528,7 +1528,7 @@ impl INode for ProcSelfSymINode {
             read: true,
             write: false,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
 
@@ -1670,7 +1670,7 @@ impl INode for ProcPidFileINode {
             read: true,
             write: false,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
 

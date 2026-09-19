@@ -240,8 +240,7 @@ impl INode for Pipe {
             PipeEnd::Write => data.read_cnt == 0,
         };
         Ok(PollStatus {
-            read: matches!(self.direction, PipeEnd::Read)
-                && (!data.buf.is_empty() || hangup),
+            read: matches!(self.direction, PipeEnd::Read) && (!data.buf.is_empty() || hangup),
             write: matches!(self.direction, PipeEnd::Write) && data.read_cnt > 0,
             // Linux: POLLERR on the write end when no readers remain.
             error: matches!(self.direction, PipeEnd::Write) && hangup,

@@ -90,7 +90,7 @@ impl FileLike for PidFd {
             read: exited && events.contains(PollEvents::IN),
             write: false,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
 

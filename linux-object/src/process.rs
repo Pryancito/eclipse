@@ -561,7 +561,10 @@ pub async fn wait_child_interest(
                 return Ok(((code as i32) << 8, cpu));
             }
         }
-        if let Some(status) = child.try_linux().and_then(|lp| lp.take_wait_notification(interest)) {
+        if let Some(status) = child
+            .try_linux()
+            .and_then(|lp| lp.take_wait_notification(interest))
+        {
             return Ok((status, ChildCpu::default()));
         }
         if nonblock {
@@ -582,7 +585,10 @@ pub async fn wait_child_interest(
                 return Ok(((code as i32) << 8, cpu));
             }
         }
-        if let Some(status) = child.try_linux().and_then(|lp| lp.take_wait_notification(interest)) {
+        if let Some(status) = child
+            .try_linux()
+            .and_then(|lp| lp.take_wait_notification(interest))
+        {
             return Ok((status, ChildCpu::default()));
         }
         check_signals()?;
@@ -678,7 +684,10 @@ fn scan_waitable_children(
                 return Some(Ok((pid, (code as i32) << 8, cpu)));
             }
         }
-        if let Some(status) = child.try_linux().and_then(|lp| lp.take_wait_notification(interest)) {
+        if let Some(status) = child
+            .try_linux()
+            .and_then(|lp| lp.take_wait_notification(interest))
+        {
             return Some(Ok((pid, status, ChildCpu::default())));
         }
     }
@@ -2134,12 +2143,18 @@ fn notify_parent_child_state(child: &Arc<Process>) {
 /// Park the current task until this process leaves a job-control stop (or dies).
 pub async fn wait_while_job_stopped(proc: &Arc<Process>) {
     loop {
-        let stopped = proc.try_linux().map(|lp| lp.is_job_stopped()).unwrap_or(false);
+        let stopped = proc
+            .try_linux()
+            .map(|lp| lp.is_job_stopped())
+            .unwrap_or(false);
         if !stopped || matches!(proc.status(), Status::Exited(_)) {
             return;
         }
         proc.signal_clear(JOB_CONTINUE_SIGNAL);
-        let stopped = proc.try_linux().map(|lp| lp.is_job_stopped()).unwrap_or(false);
+        let stopped = proc
+            .try_linux()
+            .map(|lp| lp.is_job_stopped())
+            .unwrap_or(false);
         if !stopped || matches!(proc.status(), Status::Exited(_)) {
             return;
         }

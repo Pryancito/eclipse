@@ -1882,7 +1882,9 @@ pub fn refresh_hz_from_modeinfo(data: &[u8]) -> Option<u64> {
 /// Set the synthetic vblank period from a `drm_mode_modeinfo` (68 bytes).
 /// Falls back to [`FALLBACK_VBLANK_HZ`] when the mode has no usable refresh.
 pub fn set_vblank_period_from_modeinfo(data: &[u8]) {
-    let hz = refresh_hz_from_modeinfo(data).unwrap_or(FALLBACK_VBLANK_HZ).max(1);
+    let hz = refresh_hz_from_modeinfo(data)
+        .unwrap_or(FALLBACK_VBLANK_HZ)
+        .max(1);
     VBLANK_PERIOD_NS.store(1_000_000_000 / hz, Ordering::Relaxed);
 }
 
@@ -2017,11 +2019,13 @@ fn deliver_pending_drm_timer() {
             } => {
                 // Not due yet (wrap-safe compare): keep it for a later vblank.
                 if (due_seq.wrapping_sub(now_seq) as i32) > 0 {
-                    PENDING_DRM_TIMERS.lock().push_back(PendingDrmTimer::Vblank {
-                        signal,
-                        due_seq,
-                        file,
-                    });
+                    PENDING_DRM_TIMERS
+                        .lock()
+                        .push_back(PendingDrmTimer::Vblank {
+                            signal,
+                            due_seq,
+                            file,
+                        });
                 } else if let Some(file) = file.upgrade() {
                     queue_vblank_event(&file, now_seq, signal);
                 }

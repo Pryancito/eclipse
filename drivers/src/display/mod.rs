@@ -12,12 +12,12 @@ mod nvidia_hooks;
 mod uefi;
 
 #[cfg(target_arch = "x86_64")]
-pub use nouveau_uapi::{enabled as nouveau_uapi_enabled, set_enabled as set_nouveau_uapi_enabled};
-#[cfg(target_arch = "x86_64")]
 pub use nouveau_uapi::{
-    console_gsp_enabled, set_console_gsp_enabled, exec_fast_enabled, set_exec_fast_enabled,
-    hwflip_enabled, set_hwflip_enabled, surfaceflip_enabled, set_surfaceflip_enabled,
+    console_gsp_enabled, exec_fast_enabled, hwflip_enabled, set_console_gsp_enabled,
+    set_exec_fast_enabled, set_hwflip_enabled, set_surfaceflip_enabled, surfaceflip_enabled,
 };
+#[cfg(target_arch = "x86_64")]
+pub use nouveau_uapi::{enabled as nouveau_uapi_enabled, set_enabled as set_nouveau_uapi_enabled};
 #[cfg(target_arch = "x86_64")]
 pub use nvidia::{
     boot_edid, hdmi_audio_status, nvidia_hda_is_monitor_gpu, set_boot_edid, set_boot_fb_info,

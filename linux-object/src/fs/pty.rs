@@ -829,7 +829,7 @@ impl Future for PtyReadFuture<'_> {
             read: true,
             write: true,
             error: false,
-        hangup: false,
+            hangup: false,
         });
         if (this.check)(this.pty) {
             if let Some(id) = this.sub_id.take() {
@@ -883,7 +883,7 @@ impl INode for PtyMaster {
             read: self.pty.master_readable(),
             write: true,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
     fn async_poll<'a>(
@@ -914,7 +914,7 @@ impl INode for PtySlave {
             read: self.pty.slave_readable(),
             write: true,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
     fn async_poll<'a>(
@@ -968,7 +968,7 @@ impl INode for PtmxINode {
             read: false,
             write: true,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
     fn metadata(&self) -> Result<Metadata> {

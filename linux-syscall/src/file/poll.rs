@@ -442,7 +442,9 @@ impl Syscall<'_> {
             (UserInPtr::from(arg.ss), arg.ss_len)
         };
         let mut guard = self.install_temp_sigmask(sigmask, sigsetsize)?;
-        let result = self.select_core(nfds, read, write, err, timeout_msecs).await;
+        let result = self
+            .select_core(nfds, read, write, err, timeout_msecs)
+            .await;
         if matches!(result, Err(LxError::EINTR)) {
             if let Some(g) = guard.as_mut() {
                 g.keep_for_signal();

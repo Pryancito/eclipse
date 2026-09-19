@@ -453,7 +453,12 @@ impl Future for UnixPollWait<'_> {
             return Poll::Pending;
         }
         let (read, write, error) = Socket::poll(this.sock, this.events);
-        Poll::Ready(Ok(PollStatus { read, write, error, hangup: false }))
+        Poll::Ready(Ok(PollStatus {
+            read,
+            write,
+            error,
+            hangup: false,
+        }))
     }
 }
 
@@ -838,7 +843,12 @@ impl FileLike for UnixSocketState {
 
     fn poll(&self, events: PollEvents) -> LxResult<PollStatus> {
         let (read, write, error) = Socket::poll(self, events);
-        Ok(PollStatus { read, write, error, hangup: false })
+        Ok(PollStatus {
+            read,
+            write,
+            error,
+            hangup: false,
+        })
     }
 
     fn subscribe_readiness(

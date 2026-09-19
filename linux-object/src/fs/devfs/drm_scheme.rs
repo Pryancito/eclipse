@@ -220,7 +220,13 @@ impl DrmDev {
             )
         } else {
             let req = unsafe { *(data as *const DrmSyncobjWait) };
-            (req.handles, 0u64, req.timeout_nsec, req.count_handles, req.flags)
+            (
+                req.handles,
+                0u64,
+                req.timeout_nsec,
+                req.count_handles,
+                req.flags,
+            )
         };
         const MAX_HANDLES: u32 = 64;
         if count_handles == 0 || count_handles > MAX_HANDLES || handles_ptr == 0 {
@@ -1442,7 +1448,9 @@ fn try_signaled_out_fence_fd() -> Option<i32> {
     use crate::process::ProcessExt;
     use zircon_object::task::Thread;
 
-    let thread = kernel_hal::thread::get_current_thread()?.downcast::<Thread>().ok()?;
+    let thread = kernel_hal::thread::get_current_thread()?
+        .downcast::<Thread>()
+        .ok()?;
     let linux = thread.proc().try_linux()?;
     let handle = zcore_drivers::scheme::syncobj::create(true);
     let file = SyncobjHandle::new_sync_file(handle, 1);
@@ -1524,7 +1532,7 @@ impl INode for DrmDev {
             // once the UserContext/#DF path at labwc bring-up is solid.
             write: true,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
 

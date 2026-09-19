@@ -244,7 +244,7 @@ impl FileLike for Epoll {
             read: self.any_ready(),
             write: false,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
 
@@ -253,7 +253,7 @@ impl FileLike for Epoll {
             read: self.any_ready(),
             write: false,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
 }

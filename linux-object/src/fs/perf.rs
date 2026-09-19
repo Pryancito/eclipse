@@ -417,7 +417,7 @@ impl FileLike for PerfEvent {
             read: self.has_data(),
             write: false,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
 
@@ -428,7 +428,7 @@ impl FileLike for PerfEvent {
                     read: true,
                     write: false,
                     error: false,
-                hangup: false,
+                    hangup: false,
                 });
             }
             let bus = self.eventbus.clone();
