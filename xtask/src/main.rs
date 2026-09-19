@@ -227,6 +227,20 @@ enum Commands {
     /// cargo image --arch riscv64
     /// ```
     Image(ArchArg),
+    /// 提取 NVIDIA GSP-RM 固件。Extracts the NVIDIA GSP-RM firmware.
+    ///
+    /// 版本取自被固定的子模块，因此不会与内核中的 RM 不一致。
+    ///
+    /// The version comes from the pinned submodule's own `version.mk`, so it
+    /// cannot disagree with the RM linked into the kernel -- which matters,
+    /// because `kgspInitRm` refuses any image whose `.fwversion` is not an
+    /// exact match.
+    ///
+    /// Looks in the cache, then `$ECLIPSE_GSP_BIN`, then linux-firmware, then
+    /// runs NVIDIA's own `extract-firmware-nouveau.py`, which downloads the
+    /// matching `.run` installer (a few hundred MB) and pulls `gsp_tu10x.bin`
+    /// out of it.
+    NvidiaFirmware(NvidiaFirmwareArgs),
 
     /// Build an SFS image from a directory (temporary helper for testing).
     MkSfs(MkSfsArg),
@@ -256,6 +270,16 @@ enum Commands {
     /// cargo linux-libos --args /bin/busybox
     /// ```
     LinuxLibos(LinuxLibosArg),
+}
+
+#[derive(Args)]
+struct NvidiaFirmwareArgs {
+    /// 复制到此路径。Also copy the image to this path.
+    #[clap(long)]
+    out: Option<String>,
+    /// 忽略缓存重新获取。Re-fetch even if the cache already has it.
+    #[clap(long)]
+    force: bool,
 }
 
 #[derive(Args)]
@@ -311,6 +335,11 @@ fn main() {
         LibcTest(arg) => arg.linux_rootfs().put_libc_test(),
         OtherTest(arg) => arg.linux_rootfs().put_other_test(),
         Image(arg) => arg.linux_rootfs().image(),
+        NvidiaFirmware(arg) => {
+            if !linux::nvidia_firmware::make(arg.out.map(PathBuf::from), arg.force) {
+                std::process::exit(1);
+            }
+        }
         MkSfs(arg) => {
             use rcore_fs::vfs::FileSystem;
             use rcore_fs_fuse::zip::zip_dir;

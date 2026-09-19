@@ -7499,76 +7499,74 @@ impl DrmScheme for NvidiaGpu {
         if super::nouveau_uapi::surfaceflip_enabled() {
             // Need a VRAM GEM (vram_offset populated at GEM_NEW); ISO ctxdma
             // covers the BO from 0, so plane origin passed to RM is 0.
-            if fb.vram_offset.is_some() && fb.h_memory != 0 {
-                if self.drives_boot_display() {
-                    if let Some(dev) = *self.rm_device_instance.lock() {
-                        use core::sync::atomic::AtomicU8;
-                        static SF_STATE: AtomicU8 = AtomicU8::new(0); // 0 untried, 1 ready, 2 fail
-                        let mut state = SF_STATE.load(Ordering::Acquire);
-                        if state == 0 {
-                            let (st, info) = nvidia_rm_sys::rm_init::hwflip_init(dev, 0);
-                            if st == 0 && nvidia_rm_sys::rm_init::hwflip_ready() {
-                                crate::klog_info!(
-                                    "[NVIDIA] surfaceflip: READY win={} core=0x{:x} chan=0x{:x} owner=0x{:x}",
-                                    info.window_idx,
-                                    info.core_ensure_status,
-                                    info.win_chan_status,
-                                    info.owner_status
-                                );
-                                SF_STATE.store(1, Ordering::Release);
-                                state = 1;
-                            } else {
-                                crate::klog_info!(
-                                    "[NVIDIA] surfaceflip: init failed st=0x{:x} core=0x{:x} chan=0x{:x} owner=0x{:x} -- CE/software fallback",
-                                    st,
-                                    info.core_ensure_status,
-                                    info.win_chan_status,
-                                    info.owner_status
-                                );
-                                SF_STATE.store(2, Ordering::Release);
-                                state = 2;
-                            }
-                        }
-                        if state == 1 {
-                            // Plane offset within the GEM/ctxdma (0 = whole BO).
-                            // Never pass absolute AT_GPU `vram_offset` here —
-                            // that programmed the FE past the buffer and tore
-                            // the desktop into diagonal snow.
-                            let st = nvidia_rm_sys::rm_init::hwflip_surface(
-                                dev,
-                                fb.h_memory,
-                                0,
-                                fb.width,
-                                fb.height,
-                                fb.pitch,
+            if fb.vram_offset.is_some() && fb.h_memory != 0 && self.drives_boot_display() {
+                if let Some(dev) = *self.rm_device_instance.lock() {
+                    use core::sync::atomic::AtomicU8;
+                    static SF_STATE: AtomicU8 = AtomicU8::new(0); // 0 untried, 1 ready, 2 fail
+                    let mut state = SF_STATE.load(Ordering::Acquire);
+                    if state == 0 {
+                        let (st, info) = nvidia_rm_sys::rm_init::hwflip_init(dev, 0);
+                        if st == 0 && nvidia_rm_sys::rm_init::hwflip_ready() {
+                            crate::klog_info!(
+                                "[NVIDIA] surfaceflip: READY win={} core=0x{:x} chan=0x{:x} owner=0x{:x}",
+                                info.window_idx,
+                                info.core_ensure_status,
+                                info.win_chan_status,
+                                info.owner_status
                             );
-                            if st == 0 {
-                                let now = unsafe { crate::bus::drivers_timer_now_as_micros() };
-                                let mut kms = self.kms_state.lock();
-                                kms.crtc_fb = fb.id;
-                                kms.plane_fb = fb.id;
-                                kms.last_vblank_us = now;
-                                static SF_FLIP_LOG: AtomicBool = AtomicBool::new(false);
-                                if !SF_FLIP_LOG.swap(true, Ordering::Relaxed) {
-                                    crate::klog_info!(
-                                        "[NVIDIA] surfaceflip: OK fb={} hMem={:#x} {}x{} pitch={} (plane off=0)",
-                                        fb_id,
-                                        fb.h_memory,
-                                        fb.width,
-                                        fb.height,
-                                        fb.pitch
-                                    );
-                                }
-                                return true;
-                            }
-                            static SF_FAIL_LOG: AtomicBool = AtomicBool::new(false);
-                            if !SF_FAIL_LOG.swap(true, Ordering::Relaxed) {
+                            SF_STATE.store(1, Ordering::Release);
+                            state = 1;
+                        } else {
+                            crate::klog_info!(
+                                "[NVIDIA] surfaceflip: init failed st=0x{:x} core=0x{:x} chan=0x{:x} owner=0x{:x} -- CE/software fallback",
+                                st,
+                                info.core_ensure_status,
+                                info.win_chan_status,
+                                info.owner_status
+                            );
+                            SF_STATE.store(2, Ordering::Release);
+                            state = 2;
+                        }
+                    }
+                    if state == 1 {
+                        // Plane offset within the GEM/ctxdma (0 = whole BO).
+                        // Never pass absolute AT_GPU `vram_offset` here —
+                        // that programmed the FE past the buffer and tore
+                        // the desktop into diagonal snow.
+                        let st = nvidia_rm_sys::rm_init::hwflip_surface(
+                            dev,
+                            fb.h_memory,
+                            0,
+                            fb.width,
+                            fb.height,
+                            fb.pitch,
+                        );
+                        if st == 0 {
+                            let now = unsafe { crate::bus::drivers_timer_now_as_micros() };
+                            let mut kms = self.kms_state.lock();
+                            kms.crtc_fb = fb.id;
+                            kms.plane_fb = fb.id;
+                            kms.last_vblank_us = now;
+                            static SF_FLIP_LOG: AtomicBool = AtomicBool::new(false);
+                            if !SF_FLIP_LOG.swap(true, Ordering::Relaxed) {
                                 crate::klog_info!(
-                                    "[NVIDIA] surfaceflip: flip failed st=0x{:x} fb={} -- fallback",
-                                    st,
-                                    fb_id
+                                    "[NVIDIA] surfaceflip: OK fb={} hMem={:#x} {}x{} pitch={} (plane off=0)",
+                                    fb_id,
+                                    fb.h_memory,
+                                    fb.width,
+                                    fb.height,
+                                    fb.pitch
                                 );
                             }
+                            return true;
+                        }
+                        static SF_FAIL_LOG: AtomicBool = AtomicBool::new(false);
+                        if !SF_FAIL_LOG.swap(true, Ordering::Relaxed) {
+                            crate::klog_info!(
+                                "[NVIDIA] surfaceflip: flip failed st=0x{:x} fb={} -- fallback",
+                                st,
+                                fb_id
+                            );
                         }
                     }
                 }
@@ -12137,17 +12135,11 @@ impl NvidiaGpu {
                 };
                 // VRAM FBMEM offset (AT_GPU) for future CE/scanout; never
                 // published as a host PA (see gem_map_cpu FBMEM refusal).
+                // TODO: if AT_GPU lookup fails on some boards, this stays
+                // None and the VRAM GEM remains usable for VM_BIND/EXEC
+                // without scanout-by-offset.
                 let vram_offset = if !sysmem {
-                    match nvidia_rm_sys::rm_init::gem_fbmem_offset(device_instance, alloc.h_memory)
-                    {
-                        Ok(off) => Some(off),
-                        Err(_status) => {
-                            // TODO: if AT_GPU lookup fails on some boards,
-                            // leave None and keep VRAM GEM usable for
-                            // VM_BIND/EXEC without scanout-by-offset.
-                            None
-                        }
-                    }
+                    nvidia_rm_sys::rm_init::gem_fbmem_offset(device_instance, alloc.h_memory).ok()
                 } else {
                     None
                 };

@@ -178,18 +178,77 @@ fn try_linux_firmware(version: &str, out: &Path) -> bool {
     false
 }
 
+/// Hands back the extractor to run, preferring `origin/main`'s copy over the
+/// one checked out at the pinned tag.
+///
+/// This is not gratuitous: NVIDIA says to do it, and 580.178.04 is exactly why.
+/// From `nouveau/extract-firmware-nouveau.txt`: "Unfortunately, [checking out
+/// a version tag] has the side-effect of also checking out an outdated version
+/// of the script. To ensure that the latest version is used: git checkout main
+/// -- nouveau/extract-firmware-nouveau.py".
+///
+/// Concretely, the script shipped at the 580.178.04 tag cannot read its own
+/// tree: it looks for `<sym>_image_prod_data` while the generated bindata
+/// declares `<sym>_BINDATA_LABEL_IMAGE_PROD_data`, and dies with "array
+/// kgspBinArchiveBooterLoadUcode_TU102_image_prod_data not found". The copy on
+/// `main` tries both spellings -- its own comment dates the rename to r575 --
+/// so it handles the pinned tree and older ones alike.
+///
+/// Falls back to the checked-out copy when the fetch fails (no network, or a
+/// submodule clone without that ref), since for a pre-r575 pin it is correct.
+fn newest_extract_script(work: &Path) -> Option<PathBuf> {
+    const REL: &str = "nouveau/extract-firmware-nouveau.py";
+    let in_tree = submodule_dir().join(REL);
+
+    let fetched = (|| {
+        let ok = Command::new("git")
+            .args(["fetch", "--depth", "1", "origin", "main"])
+            .current_dir(submodule_dir())
+            .status()
+            .ok()?
+            .success();
+        if !ok {
+            return None;
+        }
+        let out = Command::new("git")
+            .args(["show", &format!("FETCH_HEAD:{REL}")])
+            .current_dir(submodule_dir())
+            .output()
+            .ok()?;
+        if !out.status.success() || out.stdout.is_empty() {
+            return None;
+        }
+        let path = work.join("extract-firmware-nouveau.py");
+        fs::write(&path, &out.stdout).ok()?;
+        Some(path)
+    })();
+
+    match fetched {
+        Some(path) => {
+            println!("  using origin/main's extractor (the tag ships an older one)");
+            Some(path)
+        }
+        None if in_tree.is_file() => {
+            println!(
+                "  could not fetch origin/main's extractor; falling back to the one at the \
+                 pinned tag, which may not understand its own bindata naming"
+            );
+            Some(in_tree)
+        }
+        None => {
+            println!(
+                "  {} is missing (submodule not checked out?)",
+                in_tree.display()
+            );
+            None
+        }
+    }
+}
+
 /// Runs NVIDIA's own extractor, which downloads the matching `.run` installer
 /// and pulls `gsp_tu10x.bin` out of it. Needs real network access to
 /// `download.nvidia.com` and a few hundred MB of scratch space.
 fn try_extract_script(version: &str, out: &Path) -> bool {
-    let script = submodule_dir().join("nouveau/extract-firmware-nouveau.py");
-    if !script.is_file() {
-        println!(
-            "  {} is missing (submodule not checked out?)",
-            script.display()
-        );
-        return false;
-    }
     let Some(work) = out.parent().map(|p| p.join("extract")) else {
         return false;
     };
@@ -197,6 +256,9 @@ fn try_extract_script(version: &str, out: &Path) -> bool {
     if fs::create_dir_all(&work).is_err() {
         return false;
     }
+    let Some(script) = newest_extract_script(&work) else {
+        return false;
+    };
     println!("Extracting GSP-RM {version} from NVIDIA's .run installer (this downloads a few hundred MB)...");
     let status = Command::new("python3")
         .arg(&script)
@@ -218,28 +280,15 @@ fn try_extract_script(version: &str, out: &Path) -> bool {
     ok
 }
 
-/// Best-effort: a missing or failed image just means the real GPU driver finds
-/// no firmware at runtime and reports that (same as upstream `nvidia.ko`
-/// without `/lib/firmware/nvidia` installed) -- it must never fail the whole
-/// OS image build, since GSP firmware is irrelevant to every non-NVIDIA-GPU
-/// build and boot path.
-pub(super) fn install(rootfs: &Path) {
-    let dest_dir = rootfs.join("lib/firmware/nvidia/gsp");
-    let dst = dest_dir.join("gsp.bin");
-    if dst.is_file() {
-        return;
-    }
-    let Some(version) = pinned_rm_version() else {
-        eprintln!(
-            "warning: could not read NVIDIA_VERSION from the open-gpu-kernel-modules \
-             submodule; skipping GSP firmware"
-        );
-        return;
-    };
-    if let Err(e) = fs::create_dir_all(&dest_dir) {
-        eprintln!("warning: could not create {dest_dir:?}: {e}; skipping NVIDIA GSP firmware");
-        return;
-    }
+/// Puts the image for the pinned RM version in the cache and hands back its
+/// path, or `None` with an explanation already printed. Every caller wants the
+/// same chain, cheapest source first, so it lives here rather than in
+/// `install` -- `cargo nvidia-firmware` runs exactly this and nothing else.
+///
+/// `force` re-fetches even when the cache already has the file, for the case
+/// where a cached image is suspect.
+pub(crate) fn obtain(force: bool) -> Option<PathBuf> {
+    let version = pinned_rm_version()?;
 
     // Persistent cache, so a second build -- or an offline one -- does not
     // re-download a few hundred megabytes. Same convention as the apk cache.
@@ -247,6 +296,10 @@ pub(super) fn install(rootfs: &Path) {
     let cached = cache_dir.join(format!("gsp-{version}.bin"));
     if let Err(e) = fs::create_dir_all(&cache_dir) {
         eprintln!("warning: could not create {cache_dir:?}: {e}");
+    }
+    if force && cached.is_file() {
+        println!("Discarding cached {}", cached.display());
+        let _ = fs::remove_file(&cached);
     }
 
     if !cached.is_file() {
@@ -279,21 +332,79 @@ pub(super) fn install(rootfs: &Path) {
             "warning: no GSP-RM firmware for {version} could be obtained, so the NVIDIA GPU \
              will not initialise.\n\
              \n\
-             linux-firmware only publishes the versions Nouveau supports. To produce the \
-             matching image yourself:\n    \
-             nvidia-rm-sys/vendor/open-gpu-kernel-modules/nouveau/extract-firmware-nouveau.py \
-             -i nvidia-rm-sys/vendor/open-gpu-kernel-modules -o <dir> -d\n\
-             then point ECLIPSE_GSP_BIN at <dir>/nvidia/tu102/gsp/gsp-{version}.bin and \
-             re-run this build."
+             Extracting it needs to reach download.nvidia.com for the matching .run \
+             installer. If this machine cannot, run this where it can:\n    \
+             cargo nvidia-firmware --out gsp-{version}.bin\n\
+             bring that file over, and then here:\n    \
+             ECLIPSE_GSP_BIN=gsp-{version}.bin cargo nvidia-firmware"
         );
+        return None;
+    }
+    Some(cached)
+}
+
+/// `cargo nvidia-firmware`: obtain the image and report where it is, without
+/// building a rootfs. Unlike `install`, this is the user asking for the
+/// firmware on purpose, so an unobtainable image is an error, not a warning.
+pub(crate) fn make(out: Option<PathBuf>, force: bool) -> bool {
+    let Some(version) = pinned_rm_version() else {
+        eprintln!(
+            "error: could not read NVIDIA_VERSION from \
+             nvidia-rm-sys/vendor/open-gpu-kernel-modules/version.mk -- is the submodule \
+             checked out? (git submodule update --init --recursive)"
+        );
+        return false;
+    };
+    println!("GSP-RM firmware for the pinned RM version {version}");
+    let Some(cached) = obtain(force) else {
+        return false;
+    };
+    println!("  {}", cached.display());
+    if let Some(out) = out {
+        if let Some(parent) = out.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    eprintln!("error: could not create {}: {e}", parent.display());
+                    return false;
+                }
+            }
+        }
+        if let Err(e) = fs::copy(&cached, &out) {
+            eprintln!("error: could not copy to {}: {e}", out.display());
+            return false;
+        }
+        println!("  copied to {}", out.display());
+    }
+    true
+}
+
+/// Best-effort: a missing or failed image just means the real GPU driver finds
+/// no firmware at runtime and reports that (same as upstream `nvidia.ko`
+/// without `/lib/firmware/nvidia` installed) -- it must never fail the whole
+/// OS image build, since GSP firmware is irrelevant to every non-NVIDIA-GPU
+/// build and boot path.
+pub(super) fn install(rootfs: &Path) {
+    let dest_dir = rootfs.join("lib/firmware/nvidia/gsp");
+    let dst = dest_dir.join("gsp.bin");
+    if dst.is_file() {
         return;
     }
+    if let Err(e) = fs::create_dir_all(&dest_dir) {
+        eprintln!("warning: could not create {dest_dir:?}: {e}; skipping NVIDIA GSP firmware");
+        return;
+    }
+    let Some(cached) = obtain(false) else {
+        return;
+    };
     if let Err(e) = fs::copy(&cached, &dst) {
         eprintln!("warning: could not install {cached:?} -> {dst:?}: {e}");
         let _ = fs::remove_file(&dst);
         return;
     }
-    println!("Installed GSP-RM firmware {version} into the rootfs");
+    println!(
+        "Installed GSP-RM firmware into the rootfs from {}",
+        cached.display()
+    );
 }
 
 #[cfg(test)]

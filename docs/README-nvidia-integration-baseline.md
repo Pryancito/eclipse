@@ -26,18 +26,34 @@ linux-firmware, y por último el extractor oficial de NVIDIA.
 
 Ojo: `linux-firmware` **solo publica las versiones que soporta Nouveau**
 (535.113.01 y 570.144, ni en el repo de NVIDIA ni en el de kernel.org hay
-más). Para cualquier otra versión hay que generarla con el script que el
-propio submódulo trae:
+más). Para cualquier otra versión hay que generarla, y de eso se encarga:
 
 ```sh
-nvidia-rm-sys/vendor/open-gpu-kernel-modules/nouveau/extract-firmware-nouveau.py \
-  -i nvidia-rm-sys/vendor/open-gpu-kernel-modules -o /tmp/gspfw -d
-export ECLIPSE_GSP_BIN=/tmp/gspfw/nvidia/tu102/gsp/gsp-<version>.bin
+cargo nvidia-firmware              # la deja en ignored/nvidia-gsp-cache/
+cargo nvidia-firmware --out x.bin  # y además la copia ahí
+cargo nvidia-firmware --force      # ignora la caché y la vuelve a obtener
 ```
 
-`-d` descarga el `.run` que toca desde `download.nvidia.com` (varios cientos
-de MB) y extrae `gsp_tu10x.bin`. NVIDIA documenta este uso en
+Por dentro ejecuta el `nouveau/extract-firmware-nouveau.py` de NVIDIA, que
+descarga el `.run` que toca desde `download.nvidia.com` (varios cientos de
+MB) y extrae `gsp_tu10x.bin`. NVIDIA documenta este uso en
 `nouveau/extract-firmware-nouveau.txt`.
+
+Usa el script de `origin/main`, no el del tag fijado, porque NVIDIA avisa de
+que el tag trae una copia desfasada — y 580.178.04 es justo un caso: su
+script busca `<sym>_image_prod_data` mientras que su propio bindata declara
+`<sym>_BINDATA_LABEL_IMAGE_PROD_data`, y muere con «array
+kgspBinArchiveBooterLoadUcode_TU102_image_prod_data not found».
+
+Si la máquina no llega a `download.nvidia.com`, genera el fichero donde sí
+llegue y tráelo:
+
+```sh
+# en una máquina con salida
+cargo nvidia-firmware --out gsp-<version>.bin
+# aquí
+ECLIPSE_GSP_BIN=gsp-<version>.bin cargo nvidia-firmware
+```
 
 Solo se instala la imagen de Turing (`gsp_tu10x.bin`, que cubre
 TU102/TU104/TU106/TU116/TU117). Ampere en adelante necesita la otra imagen
