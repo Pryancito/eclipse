@@ -325,8 +325,10 @@ pub fn has_pending() -> bool {
 ///   was still writing, and the next waiter sailed straight through. That is
 ///   the normal `VkSemaphore` pattern (signal, wait, signal again, wait), so
 ///   a binary re-signal here un-signals the object back to 0 and re-arms it
-///   on the new fence. A timeline that has genuinely passed 1 is left alone:
-///   only a slot still in binary range can be rewound.
+///   on the new fence. Only a slot still in binary range is rewound: a handle
+///   userspace has already driven past 1 as a timeline takes the timeline
+///   branch instead, fence and all, so a stray binary signal cannot un-signal
+///   it or discard the timeline fences still in flight on it.
 pub fn attach_hw_fence(
     handle: u32,
     point: u64,
@@ -346,19 +348,21 @@ pub fn attach_hw_fence(
         };
         obj.linked = None;
         let cur = obj.point;
-        if binary {
+        if binary && cur <= 1 {
             // Replace the slot's fence: rewind the point so waiters block
-            // until THIS submit lands. A timeline past 1 is left alone.
-            if cur <= 1 {
-                obj.point = 0;
-            }
+            // until THIS submit lands, and drop the fence the slot carried,
+            // which this one supersedes.
+            obj.point = 0;
+            table.pending.retain(|f| f.handle != handle);
         } else if point <= cur {
             // Already past that point: nothing to wait for.
+            //
+            // This also catches a *binary* signal on a handle userspace has
+            // already driven past 1 as a timeline, which is not a slot in
+            // binary range any more. Rewinding it would un-signal a genuine
+            // timeline, and purging its pending fences would strand a waiter
+            // on a point with nothing left to land and signal it.
             return true;
-        }
-        if binary {
-            // ...and drop the fence the slot carried; it is superseded.
-            table.pending.retain(|f| f.handle != handle);
         }
         table.pending.push(PendingFence {
             handle,
@@ -1067,6 +1071,48 @@ mod tests {
         assert!(attach_hw_fence(h, 3, stale.va(), 0, 7, 0, false));
         assert_eq!(query(h), Some(5));
         assert!(pending_hw_fence(h, 3).is_none());
+
+        destroy(h);
+    }
+
+    /// A binary signal on a handle userspace has already driven past 1 as a
+    /// timeline must take the timeline branch, not the slot-replacement one.
+    /// Rewinding is wrong there (it would un-signal a real timeline), and so
+    /// is purging the handle's pending fences: the first cut of the binary
+    /// fix dropped them unconditionally, which threw away a timeline fence
+    /// still in flight. Nothing was then left to signal its point when the
+    /// GPU landed it, so `pending_hw_fence` returned `None`, `query` stayed
+    /// below the point, and a waiter on it hung.
+    #[test]
+    fn a_binary_signal_does_not_strand_a_timeline_fence_in_flight() {
+        let h = create(false);
+        let mut reached = Landing::new();
+        let inflight = Landing::new();
+
+        // Drive the handle to 5 as a timeline.
+        assert!(attach_hw_fence(h, 5, reached.va(), 0, 1, 0, false));
+        reached.land(1);
+        assert_eq!(query(h), Some(5));
+
+        // Point 7 is submitted and still in flight.
+        assert!(attach_hw_fence(h, 7, inflight.va(), 0, 3, 0, false));
+        assert_eq!(query_submitted(h), Some(7));
+
+        // A stray binary signal arrives on the same handle.
+        let stray = Landing::new();
+        assert!(attach_hw_fence(h, 1, stray.va(), 0, 1, 0, true));
+
+        assert_eq!(
+            query(h),
+            Some(5),
+            "a binary signal must not rewind a handle already past binary range"
+        );
+        assert_eq!(
+            pending_hw_fence(h, 7).map(|f| f.0),
+            Some(inflight.va()),
+            "the in-flight timeline fence must survive the binary signal"
+        );
+        assert_eq!(query_submitted(h), Some(7));
 
         destroy(h);
     }
