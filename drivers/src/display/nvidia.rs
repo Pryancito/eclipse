@@ -1,6 +1,6 @@
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::bus::pci_drivers::PciDriver;
 use crate::prelude::{AccelCaps, ColorFormat, DisplayInfo, FrameBuffer};
@@ -720,6 +720,14 @@ pub struct NvidiaGpu {
     next_kms_fb_id: AtomicU32,
     /// Current KMS state exposed by GETCRTC/GETPLANE and used by wait_vblank.
     kms_state: Mutex<NvidiaKmsState>,
+    /// Sticky owner of the compositor singleton (GPU context 0 / step16+17
+    /// ladder). `0` = unclaimed. Set when a process successfully takes the
+    /// ctx-0 `CHANNEL_ALLOC` path; cleared only on that process's exit /
+    /// `reset_ctx0_singleton`. Inferring the role from "who currently has an
+    /// rm_backed ctx-0 channel" let a client steal ctx 0 after the compositor
+    /// freed a throwaway channel or crashed mid-session (VM_BIND → client VAS,
+    /// EXEC → ctx 0 → MMU fault / FECS RESTORE hang).
+    ctx0_owner: AtomicU64,
     /// MSI interrupt vector assigned by the PCI scan (`irq + 32`), or
     /// `usize::MAX` if this GPU has no MSI. Used only by the console-GPU GSP
     /// boot to bring the GPU's MSI delivery online across the SEC2-resume
@@ -1096,6 +1104,7 @@ impl NvidiaGpu {
                 last_vblank_us: 0,
             }),
             msi_vector: AtomicUsize::new(usize::MAX),
+            ctx0_owner: AtomicU64::new(0),
         })
     }
 
@@ -9375,6 +9384,7 @@ impl NvidiaGpu {
     /// CHANNEL_ALLOC/step17 recreates a fresh ctx0 channel instead of reusing a
     /// wedged one across labwc respawns.
     fn reset_ctx0_singleton(&self, device_instance: u32, reason: &str, owner_pid: u64) {
+        self.ctx0_release(owner_pid);
         self.fast_release(device_instance, 0);
         lock::pump();
         let status = nvidia_rm_sys::rm_init::ctx0_reset(device_instance);
@@ -9390,6 +9400,114 @@ impl NvidiaGpu {
                 status
             );
         }
+    }
+
+    /// Sticky compositor (ctx 0) ownership — see `ctx0_owner` field docs.
+    fn ctx0_is_owner(&self, pid: u64) -> bool {
+        let cur = self.ctx0_owner.load(Ordering::Acquire);
+        cur != 0 && cur == pid
+    }
+
+    /// Claim ctx 0 for `pid`, or confirm it already owns it. Returns `false`
+    /// when another process holds the sticky role.
+    fn ctx0_try_claim(&self, pid: u64) -> bool {
+        match self
+            .ctx0_owner
+            .compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => true,
+            Err(cur) => cur == pid,
+        }
+    }
+
+    /// Drop sticky ctx-0 ownership when `pid` is the current owner.
+    fn ctx0_release(&self, pid: u64) {
+        let _ = self
+            .ctx0_owner
+            .compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed);
+    }
+
+    /// `CHANNEL_ALLOC` for a GL/Vulkan client (not the sticky ctx-0 owner).
+    fn channel_alloc_client(&self, owner_pid: u64, arg: usize) -> Result<usize, i32> {
+        use super::nouveau_uapi as nv;
+        let (ctx_idx, h_vas_out, notif_out) = self.ensure_ctx_for_pid(owner_pid, false);
+        let ok = ctx_idx != 0;
+        let mut chan = self.nouveau_channels.lock();
+        if chan.len() >= nv::MAX_CHANNELS {
+            log::warn!(
+                "[nouveau-uapi] CHANNEL_ALLOC: {} channels already live",
+                chan.len()
+            );
+            return Err(nv::EBUSY);
+        }
+        let new_id = (0i32..)
+            .find(|i| !chan.iter().any(|c| c.id == *i))
+            .unwrap_or(0);
+        chan.push(nv::NouveauChannelState {
+            id: new_id,
+            h_vas: h_vas_out,
+            notifier_handle: notif_out,
+            rm_backed: ok,
+            ctx_idx,
+            owner_pid,
+        });
+        drop(chan);
+        let req = unsafe { &mut *(arg as *mut nv::DrmNouveauChannelAlloc) };
+        req.channel = new_id;
+        req.notifier_handle = notif_out;
+        req.pushbuf_domains = nv::NOUVEAU_GEM_DOMAIN_VRAM;
+        req.nr_subchan = 0;
+        crate::klog_warn!(
+            "[nouveau-uapi] CHANNEL_ALLOC owner_pid={} -> channel={} {}",
+            owner_pid,
+            new_id,
+            if ok {
+                alloc::format!("CTX {} (hVas={:#x})", ctx_idx, h_vas_out)
+            } else {
+                alloc::string::String::from(
+                    "DISCOVERY ONLY (no own context; submission ENODEV -> software)",
+                )
+            }
+        );
+        Ok(0)
+    }
+
+    /// Software-only discovery channel when the RM is not attached yet.
+    fn channel_alloc_discovery(&self, owner_pid: u64, arg: usize) -> Result<usize, i32> {
+        use super::nouveau_uapi as nv;
+        let mut chan = self.nouveau_channels.lock();
+        if chan.len() >= nv::MAX_CHANNELS {
+            log::warn!(
+                "[nouveau-uapi] CHANNEL_ALLOC: {} channels already live",
+                chan.len()
+            );
+            return Err(nv::EBUSY);
+        }
+        let new_id = (0i32..)
+            .find(|i| !chan.iter().any(|c| c.id == *i))
+            .unwrap_or(0);
+        chan.push(nv::NouveauChannelState {
+            id: new_id,
+            h_vas: 0,
+            notifier_handle: 0,
+            rm_backed: false,
+            ctx_idx: 0,
+            owner_pid,
+        });
+        drop(chan);
+        let req = unsafe { &mut *(arg as *mut nv::DrmNouveauChannelAlloc) };
+        req.channel = new_id;
+        req.notifier_handle = 0;
+        req.pushbuf_domains = nv::NOUVEAU_GEM_DOMAIN_VRAM;
+        req.nr_subchan = 0;
+        crate::klog_warn!(
+            "[nouveau-uapi] CHANNEL_ALLOC owner_pid={} -> channel={} DISCOVERY ONLY \
+             (GPU not attached to the RM; class enumeration works, but GEM/VM_BIND/\
+             EXEC will return ENODEV until `cat /proc/gpustep14` runs)",
+            owner_pid,
+            new_id
+        );
+        Ok(0)
     }
 
     fn nouveau_owns_rm_channel(&self, owner_pid: u64) -> bool {
@@ -10412,7 +10530,7 @@ impl NvidiaGpu {
                 // that used to start console GSP-RM from the first GL client and
                 // freeze the machine the same way boot-time auto-bringup did.
                 self.ensure_console_gpu_brought_up();
-                let mut chan = self.nouveau_channels.lock();
+                let chan = self.nouveau_channels.lock();
                 if chan.len() >= nv::MAX_CHANNELS {
                     log::warn!(
                         "[nouveau-uapi] CHANNEL_ALLOC: {} channels already live",
@@ -10420,45 +10538,19 @@ impl NvidiaGpu {
                     );
                     return Err(nv::EBUSY);
                 }
-                // Lowest free id.
-                let new_id = (0i32..)
-                    .find(|i| !chan.iter().any(|c| c.id == *i))
-                    .unwrap_or(0);
-                // Only ONE channel can be RM-backed: step16+step17 build a
-                // single GR channel on the hardware. A second concurrent
-                // client (typically `vulkaninfo` run beside a compositor that
-                // already holds the real one) gets a discovery channel so it
-                // can still enumerate -- mesa allocates a throwaway channel
-                // during vkEnumeratePhysicalDevices purely to ask SCLASS which
-                // engine classes exist. Returning EBUSY there would cost it
-                // every GPU.
-                // The RM backing is exclusive PER PROCESS, not per channel.
-                //
-                // There is exactly one GR channel in hardware, built once per
-                // boot: step16/step17 are idempotent and a later call returns
-                // the SAME cached allocation, not a new one. So two channels
-                // belonging to the same client are two names for one piece of
-                // hardware, and backing both costs nothing.
-                //
-                // Treating it as first-channel-wins broke the sequence NVK
-                // actually performs. `nouveau_ws_device_new` creates a
-                // THROWAWAY context just to read the engine classes
-                // (`nouveau_device.c`: context_create -> read cls_* ->
-                // context_destroy), and only then does `vkCreateDevice` create
-                // the real one. Whenever that first channel was still live --
-                // and labwc runs TWO vkCreateDevice attempts in one process,
-                // zink's and wlroots' native Vulkan renderer's -- the real
-                // channel came back as DISCOVERY and every EXEC on it was
-                // refused:
-                //
-                //   EXEC: channel=1 belongs to pid=NNNN but is a DISCOVERY
-                //         channel (no GR channel/GPFIFO behind it)
-                //
-                // Another PROCESS still gets a discovery channel: two clients
-                // sharing one GPFIFO would trample each other's submissions.
-                let rm_owner = chan.iter().find(|c| c.rm_backed).map(|c| c.owner_pid);
-                let rm_taken = matches!(rm_owner, Some(pid) if pid != owner_pid);
-                if rm_taken {
+                // Sticky ctx-0 owner wins over "who currently has an rm_backed
+                // channel": a throwaway CHANNEL_FREE must not let a client take
+                // the compositor ladder (F-M15). Fall back to the live table
+                // only while nobody has claimed yet (first boot claimer).
+                let sticky = self.ctx0_owner.load(Ordering::Acquire);
+                let other_holds_ctx0 = if sticky != 0 {
+                    sticky != owner_pid
+                } else {
+                    chan.iter()
+                        .any(|c| c.rm_backed && c.owner_pid != owner_pid)
+                };
+                drop(chan);
+                if other_holds_ctx0 {
                     // The compositor holds context 0. This is a GL CLIENT: give it
                     // its OWN GPU context (own VAS + GPFIFO channel), built on its
                     // first GPU touch and reused here. NVK usually issues VM_BIND
@@ -10479,51 +10571,8 @@ impl NvidiaGpu {
                     // ownership check), taken with IRQs off (lock::Mutex). Held
                     // here, every EXEC in the system -- the COMPOSITOR's included
                     // -- span-blocked behind a starting GL client for the whole
-                    // prime (a frozen frame and cursor per client launch). Same
-                    // rule ensure_ctx_for_pid already applies to its own registry
-                    // lock. The id is recomputed after re-locking, since another
-                    // CHANNEL_ALLOC may have raced while the lock was out.
-                    drop(chan);
-                    let (ctx_idx, h_vas_out, notif_out) = self.ensure_ctx_for_pid(owner_pid, false);
-                    let ok = ctx_idx != 0;
-                    let mut chan = self.nouveau_channels.lock();
-                    if chan.len() >= nv::MAX_CHANNELS {
-                        log::warn!(
-                            "[nouveau-uapi] CHANNEL_ALLOC: {} channels already live",
-                            chan.len()
-                        );
-                        return Err(nv::EBUSY);
-                    }
-                    let new_id = (0i32..)
-                        .find(|i| !chan.iter().any(|c| c.id == *i))
-                        .unwrap_or(0);
-                    chan.push(nv::NouveauChannelState {
-                        id: new_id,
-                        h_vas: h_vas_out,
-                        notifier_handle: notif_out,
-                        rm_backed: ok,
-                        ctx_idx,
-                        owner_pid,
-                    });
-                    drop(chan);
-                    let req = unsafe { &mut *(arg as *mut nv::DrmNouveauChannelAlloc) };
-                    req.channel = new_id;
-                    req.notifier_handle = notif_out;
-                    req.pushbuf_domains = nv::NOUVEAU_GEM_DOMAIN_VRAM;
-                    req.nr_subchan = 0;
-                    crate::klog_warn!(
-                        "[nouveau-uapi] CHANNEL_ALLOC owner_pid={} -> channel={} {}",
-                        owner_pid,
-                        new_id,
-                        if ok {
-                            alloc::format!("CTX {} (hVas={:#x})", ctx_idx, h_vas_out)
-                        } else {
-                            alloc::string::String::from(
-                                "DISCOVERY ONLY (no own context; submission ENODEV -> software)",
-                            )
-                        }
-                    );
-                    return Ok(0);
+                    // prime (a frozen frame and cursor per client launch).
+                    return self.channel_alloc_client(owner_pid, arg);
                 }
                 let Some(device_instance) = *self.rm_device_instance.lock() else {
                     // No RM yet. NVK allocates a channel during *enumeration*
@@ -10540,29 +10589,10 @@ impl NvidiaGpu {
                     // the ladder boots GSP-RM and does real bring-up that can
                     // hang the machine, so it stays an explicit operator action
                     // (`cat /proc/gpustep14`).
-                    chan.push(nv::NouveauChannelState {
-                        id: new_id,
-                        h_vas: 0,
-                        notifier_handle: 0,
-                        rm_backed: false,
-                        ctx_idx: 0,
-                        owner_pid,
-                    });
-                    drop(chan);
-                    let req = unsafe { &mut *(arg as *mut nv::DrmNouveauChannelAlloc) };
-                    req.channel = new_id;
-                    req.notifier_handle = 0;
-                    req.pushbuf_domains = nv::NOUVEAU_GEM_DOMAIN_VRAM;
-                    req.nr_subchan = 0;
-                    crate::klog_warn!(
-                        "[nouveau-uapi] CHANNEL_ALLOC owner_pid={} -> channel={} DISCOVERY ONLY \
-                         (GPU not attached to the RM; class enumeration works, but GEM/VM_BIND/\
-                         EXEC will return ENODEV until `cat /proc/gpustep14` runs)",
-                        owner_pid,
-                        new_id
-                    );
-                    return Ok(0);
+                    return self.channel_alloc_discovery(owner_pid, arg);
                 };
+                // F-M14: step16/17 + selftest take ~1-2 s of RM work. Never hold
+                // `nouveau_channels` (IRQ-off spinlock, EXEC hot path) across it.
                 nvidia_rm_sys::os_interface::capture_begin();
                 let ladder = nvidia_rm_sys::rm_init::step16(device_instance);
                 let _ = nvidia_rm_sys::os_interface::capture_take();
@@ -10626,13 +10656,37 @@ impl NvidiaGpu {
                 if !SELFTEST_DONE.swap(true, Ordering::Relaxed) {
                     self.nouveau_channel_selftest(device_instance, channel.buf_gpu_va);
                 }
+                // Two processes can race the unclaimed path; only the CAS winner
+                // keeps ctx 0. The loser becomes a normal client context.
+                if !self.ctx0_try_claim(owner_pid) {
+                    crate::klog_warn!(
+                        "[nouveau-uapi] CHANNEL_ALLOC owner_pid={} lost ctx0 race to pid={} -- client context",
+                        owner_pid,
+                        self.ctx0_owner.load(Ordering::Acquire)
+                    );
+                    return self.channel_alloc_client(owner_pid, arg);
+                }
+                let mut chan = self.nouveau_channels.lock();
+                if chan.len() >= nv::MAX_CHANNELS {
+                    // Sticky claim already taken; release so a later compositor
+                    // can retry (table full is transient under discovery churn).
+                    self.ctx0_release(owner_pid);
+                    log::warn!(
+                        "[nouveau-uapi] CHANNEL_ALLOC: {} channels already live",
+                        chan.len()
+                    );
+                    return Err(nv::EBUSY);
+                }
+                let new_id = (0i32..)
+                    .find(|i| !chan.iter().any(|c| c.id == *i))
+                    .unwrap_or(0);
                 chan.push(nv::NouveauChannelState {
                     id: new_id,
                     h_vas: ladder.h_vas,
                     notifier_handle: channel.h_notifier,
                     rm_backed: true,
-                    // The compositor (first RM-backed process) is context 0 --
-                    // the singleton step16/step17 ladder.
+                    // The sticky compositor owner is context 0 -- the singleton
+                    // step16/step17 ladder.
                     ctx_idx: 0,
                     owner_pid,
                 });
@@ -10643,7 +10697,7 @@ impl NvidiaGpu {
                 req.pushbuf_domains = nv::NOUVEAU_GEM_DOMAIN_VRAM;
                 req.nr_subchan = 0;
                 log::info!(
-                    "[nouveau-uapi] CHANNEL_ALLOC owner_pid={} -> channel={} (reused the existing step16+step17 bring-up ladder; hVas={:#010x} hNotifier={:#010x})",
+                    "[nouveau-uapi] CHANNEL_ALLOC owner_pid={} -> channel={} ctx0 sticky (hVas={:#010x} hNotifier={:#010x})",
                     owner_pid,
                     new_id,
                     ladder.h_vas,
@@ -10771,18 +10825,10 @@ impl NvidiaGpu {
                         req.op_count as usize,
                     )
                 };
-                // Route the bind into THIS process's own VA space (context 0 =
-                // compositor singleton; >= 1 = a GL client's own VAS). Assigned
-                // on first touch: NVK issues VM_BIND during device creation,
-                // BEFORE its CHANNEL_ALLOC, so this is usually where a client's
-                // context gets built -- doing it here (not only at CHANNEL_ALLOC)
-                // is what keeps a client's binds in the SAME VA space its channel
-                // later executes in.
-                let is_compositor = self
-                    .nouveau_channels
-                    .lock()
-                    .iter()
-                    .any(|c| c.rm_backed && c.ctx_idx == 0 && c.owner_pid == owner_pid);
+                // Sticky ctx-0 owner (F-M15): do not re-infer from live channels —
+                // a throwaway CHANNEL_FREE must not rebuild a client context for
+                // the compositor or hand ctx 0's VAS to a stranger.
+                let is_compositor = self.ctx0_is_owner(owner_pid);
                 let (ctx_idx, _, _) = self.ensure_ctx_for_pid(owner_pid, is_compositor);
                 for (i, op) in ops.iter().enumerate() {
                     if let Err(e) = self.vm_bind_op(device_instance, ctx_idx, owner_pid, op) {
@@ -11193,13 +11239,7 @@ impl NvidiaGpu {
                 // fail. They may not: they may execute against the wrong VA
                 // space. Either way it is worth one line, because from the app
                 // it is indistinguishable from every other device-lost.
-                if ctx_idx == 0
-                    && !self
-                        .nouveau_channels
-                        .lock()
-                        .iter()
-                        .any(|c| c.rm_backed && c.ctx_idx == 0 && c.owner_pid == owner_pid)
-                {
+                if ctx_idx == 0 && !self.ctx0_is_owner(owner_pid) {
                     use core::sync::atomic::{AtomicU32, Ordering};
                     static NO_CTX_REPORTS: AtomicU32 = AtomicU32::new(0);
                     if NO_CTX_REPORTS.fetch_add(1, Ordering::Relaxed) < 8 {

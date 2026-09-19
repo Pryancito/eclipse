@@ -471,6 +471,11 @@ impl VmObject {
     /// Create a new VMO representing a piece of contiguous physical memory.
     pub fn new_physical(paddr: PhysAddr, pages: usize) -> Arc<Self> {
         Self::warn_if_phys_aliases_stack(paddr, pages);
+        // Pin DMA/GEM frames for this VMO's lifetime so a concurrent
+        // `drivers_dma_dealloc` (GEM_CLOSE while still mmap'd) cannot recycle
+        // them into the frame pool under a live userspace mapping.
+        #[cfg(not(feature = "libos"))]
+        kernel_hal::stack_guard::dma_pin_user(paddr, pages);
         Arc::new(VmObject {
             base: KObjectBase::with_signal(Signal::VMO_ZERO_CHILDREN),
             resizable: false,
@@ -901,6 +906,16 @@ impl Drop for VmObject {
         // `commit_page_internal`), and `len()` there is a single-CPU self-
         // deadlock on the non-reentrant ticket lock. See `accounted_bytes`.
         VMO_BYTES[i].fetch_sub(self.accounted_bytes, Ordering::Relaxed);
+        // Release the DMA-user pin taken in `new_physical`. Use the STORED
+        // page count (`accounted_bytes`), never `trait_.len()`, for the same
+        // lock-reentry reason as the accounting subtract above.
+        #[cfg(not(feature = "libos"))]
+        if self.kind == VmoKind::Physical {
+            if let Some(paddr) = self.trait_.committed_paddr(0) {
+                let pages = self.accounted_bytes / PAGE_SIZE;
+                kernel_hal::stack_guard::dma_unpin_user(paddr, pages);
+            }
+        }
         // Every `Arc<VmObject>` upgraded in here may turn out to be the LAST
         // strong reference to its object. Letting one of those go out of scope
         // inside a critical section runs its destructor INLINE, on this CPU,

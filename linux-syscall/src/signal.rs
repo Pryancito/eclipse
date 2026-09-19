@@ -575,4 +575,76 @@ impl Syscall<'_> {
             kernel_hal::thread::sleep_until(next).await;
         }
     }
+
+    /// Install a temporary blocked-signal mask for wait syscalls that take a
+    /// sigmask (`ppoll`, `pselect6`, `epoll_pwait`).
+    ///
+    /// Returns `None` when `sigmask` is null (no change). On a normal return the
+    /// guard restores the previous mask; on `EINTR` the caller must call
+    /// [`TempSigmaskGuard::keep_for_signal`] so the temporary mask stays in
+    /// effect until `handle_signal` claims `saved_sigmask` for the frame
+    /// (same contract as `rt_sigsuspend`).
+    pub(crate) fn install_temp_sigmask(
+        &self,
+        sigmask: UserInPtr<Sigset>,
+        sigsetsize: usize,
+    ) -> Result<Option<TempSigmaskGuard>, LxError> {
+        if sigmask.is_null() {
+            return Ok(None);
+        }
+        if sigsetsize != core::mem::size_of::<Sigset>() {
+            return Err(LxError::EINVAL);
+        }
+        let mut newmask = sigmask.read()?;
+        // SIGKILL and SIGSTOP can never be blocked.
+        newmask.remove(Signal::SIGKILL);
+        newmask.remove(Signal::SIGSTOP);
+        let thread = alloc::sync::Arc::clone(self.thread);
+        let old = {
+            let mut lt = thread.lock_linux();
+            let old = lt.signal_mask;
+            lt.signal_mask = newmask;
+            lt.saved_sigmask = Some(old);
+            old
+        };
+        Ok(Some(TempSigmaskGuard {
+            thread,
+            old,
+            restore: true,
+        }))
+    }
+}
+
+/// RAII restore for [`Syscall::install_temp_sigmask`].
+///
+/// Holds an owned `Arc<Thread>` so it does not borrow `Syscall` across the
+/// subsequent `&mut self` wait call.
+pub(crate) struct TempSigmaskGuard {
+    thread: alloc::sync::Arc<Thread>,
+    old: Sigset,
+    restore: bool,
+}
+
+impl TempSigmaskGuard {
+    /// Leave the temporary mask in place after `EINTR` so a pending signal can
+    /// still be delivered under it; `saved_sigmask` then restores `old` via
+    /// `sigreturn`.
+    pub(crate) fn keep_for_signal(&mut self) {
+        self.restore = false;
+    }
+}
+
+impl Drop for TempSigmaskGuard {
+    fn drop(&mut self) {
+        if !self.restore {
+            return;
+        }
+        let mut thread = self.thread.lock_linux();
+        // If a signal already claimed `saved_sigmask` for its frame, leave the
+        // mask alone — `sigreturn` will reinstate `old`.
+        if thread.saved_sigmask.is_some() {
+            thread.signal_mask = self.old;
+            thread.saved_sigmask = None;
+        }
+    }
 }

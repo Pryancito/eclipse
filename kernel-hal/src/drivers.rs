@@ -278,6 +278,13 @@ impl From<DeviceError> for crate::HalError {
     }
 }
 
+/// Re-enter the quarantine after a userspace pin that was holding a free has
+/// dropped. Called from `stack_guard::dma_unpin_user`.
+#[cfg(not(feature = "libos"))]
+pub(crate) fn dma_quarantine_release_held(paddr: crate::PhysAddr, pages: usize) {
+    dma_quarantine_dealloc(paddr, pages);
+}
+
 /// FIFO quarantine + poison-trap for freed DMA blocks, shared by
 /// `virtio_dma_dealloc` and `drivers_dma_dealloc`.
 ///
@@ -338,6 +345,13 @@ fn dma_quarantine_dealloc(paddr: crate::PhysAddr, pages: usize) {
     }
     if pages > MAX_BLOCK_PAGES {
         free_now(paddr, pages);
+        return;
+    }
+    // Userspace still maps this range through a physical VMO (nouveau GEM
+    // CPU-mmap). Hold the free until the last pin drops — returning to the
+    // pool now is the free-while-mapped UAF.
+    if crate::stack_guard::dma_user_pinned(paddr, pages) {
+        crate::stack_guard::dma_hold_until_unpin(paddr, pages);
         return;
     }
     let phys_to_va = |pa: usize| pa + crate::KCONFIG.phys_to_virt_offset;

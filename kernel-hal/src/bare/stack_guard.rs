@@ -146,6 +146,139 @@ pub fn paddr_recently_freed_dma(paddr: usize) -> Option<u64> {
     None
 }
 
+// ── Userspace pin of DMA frames (GEM CPU-mmap) ───────────────────────────────
+//
+// A `VmObject::new_physical` over a DMA/GEM block does not own the frames: the
+// driver frees them via `drivers_dma_dealloc` when the GEM handle closes. If
+// userspace still has the range mapped (or a GPU ring still points at it), the
+// free recycles the frames into a live coroutine stack / another client's
+// buffer — the residual DMA-UAF documented in README-crash-repro.md.
+//
+// Every physical VMO pins its range for the VMO's lifetime. A DMA free that
+// overlaps a pin is held out of the frame pool until the last pin drops, then
+// runs through the normal quarantine. Refcounted so shared Arc clones pin once
+// per VMO object (each `new_physical` / Drop pair), not per mapping.
+
+use alloc::vec::Vec;
+use lock::Mutex;
+
+struct UserPin {
+    base: usize,
+    pages: usize,
+    refs: usize,
+}
+
+struct HeldFree {
+    base: usize,
+    pages: usize,
+}
+
+struct UserPinState {
+    pins: Vec<UserPin>,
+    held: Vec<HeldFree>,
+}
+
+static USER_PIN: Mutex<UserPinState> = Mutex::new(UserPinState {
+    pins: Vec::new(),
+    held: Vec::new(),
+});
+
+fn ranges_overlap(a: usize, an: usize, b: usize, bn: usize) -> bool {
+    if an == 0 || bn == 0 {
+        return false;
+    }
+    let a1 = a.saturating_add(an.saturating_mul(PAGE_SIZE));
+    let b1 = b.saturating_add(bn.saturating_mul(PAGE_SIZE));
+    a < b1 && b < a1
+}
+
+/// Pin `[paddr, paddr+pages*PAGE)` against returning to the frame pool.
+/// Called from `VmObject::new_physical`.
+pub fn dma_pin_user(paddr: usize, pages: usize) {
+    if pages == 0 || paddr == 0 {
+        return;
+    }
+    let mut st = USER_PIN.lock();
+    if let Some(e) = st.pins.iter_mut().find(|e| e.base == paddr && e.pages == pages) {
+        e.refs = e.refs.saturating_add(1);
+        return;
+    }
+    st.pins.push(UserPin {
+        base: paddr,
+        pages,
+        refs: 1,
+    });
+}
+
+/// Drop one pin. When the last pin on a range goes away, any DMA free that was
+/// waiting on it is released into the quarantine.
+pub fn dma_unpin_user(paddr: usize, pages: usize) {
+    if pages == 0 || paddr == 0 {
+        return;
+    }
+    let mut released: Vec<(usize, usize)> = Vec::new();
+    {
+        let mut st = USER_PIN.lock();
+        if let Some(pos) = st.pins.iter().position(|e| e.base == paddr && e.pages == pages) {
+            let e = &mut st.pins[pos];
+            e.refs = e.refs.saturating_sub(1);
+            if e.refs == 0 {
+                st.pins.swap_remove(pos);
+            }
+        }
+        // Free any held block that no longer overlaps a live pin.
+        let mut i = 0;
+        while i < st.held.len() {
+            let h = &st.held[i];
+            let still = st
+                .pins
+                .iter()
+                .any(|p| ranges_overlap(h.base, h.pages, p.base, p.pages));
+            if still {
+                i += 1;
+            } else {
+                let h = st.held.swap_remove(i);
+                released.push((h.base, h.pages));
+            }
+        }
+    }
+    for (base, n) in released {
+        // Re-enter the quarantine path now that userspace no longer maps it.
+        crate::drivers::dma_quarantine_release_held(base, n);
+    }
+}
+
+/// True if any userspace pin overlaps `[paddr, paddr+pages*PAGE)`.
+pub fn dma_user_pinned(paddr: usize, pages: usize) -> bool {
+    if pages == 0 {
+        return false;
+    }
+    USER_PIN
+        .lock()
+        .pins
+        .iter()
+        .any(|p| ranges_overlap(paddr, pages, p.base, p.pages))
+}
+
+/// Park a DMA free until every overlapping userspace pin is gone.
+pub fn dma_hold_until_unpin(paddr: usize, pages: usize) {
+    if pages == 0 {
+        return;
+    }
+    let mut st = USER_PIN.lock();
+    if st
+        .held
+        .iter()
+        .any(|h| h.base == paddr && h.pages == pages)
+    {
+        return;
+    }
+    st.held.push(HeldFree {
+        base: paddr,
+        pages,
+    });
+}
+
 /// Mark or clear every physical frame backing the usable stack `[usable_base,
 /// usable_base + STACK_SIZE)` in the stack-frame bitset, by querying the live
 /// page table for each page's physical address.

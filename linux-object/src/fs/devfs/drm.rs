@@ -334,6 +334,29 @@ lazy_static::lazy_static! {
         next_blob_id: 30000,
         atomic: AtomicKmsState::default(),
     });
+    /// Shared CPU-mmap VMOs for nouveau-uAPI GEM handles. Without this,
+    /// every `get_vmo`/`export_handle` built a fresh `new_physical` over the
+    /// same frames — GEM_CLOSE could free while an older Arc still mapped
+    /// them. One Arc per handle, cloned to every mmap, matches dumb-buffer
+    /// semantics (`handle_vmo`).
+    static ref NOUVEAU_CPU_VMOS: Mutex<alloc::collections::BTreeMap<u32, Arc<VmObject>>> =
+        Mutex::new(alloc::collections::BTreeMap::new());
+}
+
+/// Shared physical VMO for a nouveau GEM handle's CPU mmap / PRIME export.
+pub fn nouveau_cpu_vmo(handle: u32, phys_addr: u64, size: usize) -> Arc<VmObject> {
+    let mut map = NOUVEAU_CPU_VMOS.lock();
+    if let Some(v) = map.get(&handle) {
+        return v.clone();
+    }
+    let vmo = VmObject::new_physical(phys_addr as usize, pages(size));
+    map.insert(handle, vmo.clone());
+    vmo
+}
+
+/// Drop the cached CPU VMO for a handle (best-effort; live Arc clones keep the pin).
+pub fn nouveau_cpu_vmo_forget(handle: u32) {
+    NOUVEAU_CPU_VMOS.lock().remove(&handle);
 }
 
 /// Register a new DRM driver
@@ -520,7 +543,7 @@ pub fn export_handle(handle_id: u32) -> Option<(u64, usize, Arc<VmObject>)> {
     // rendering itself already worked. The physical range registered at
     // GEM_NEW time is exactly what a dma-buf needs.
     let (phys_addr, size) = zcore_drivers::scheme::gem_mmap::lookup(handle_id)?;
-    let vmo = VmObject::new_physical(phys_addr as usize, pages(size as usize));
+    let vmo = nouveau_cpu_vmo(handle_id, phys_addr, size as usize);
     Some((phys_addr, size as usize, vmo))
 }
 

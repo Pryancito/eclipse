@@ -14,7 +14,7 @@ use core::time::Duration;
 use crate::sync::{Event, EventBus};
 use lock::Mutex;
 use rcore_fs::vfs::*;
-use zircon_object::vm::{pages, VmObject};
+use zircon_object::vm::VmObject;
 
 use super::drm;
 
@@ -184,8 +184,12 @@ impl DrmDev {
             // same fake-offset space, different table (see
             // drivers/src/scheme/gem_mmap.rs's module doc for why this
             // driver-owned state can't live in `drm::get_handle`'s table).
-            let len = (len as u64).min(size) as usize;
-            Ok(VmObject::new_physical(phys_addr as usize, pages(len)))
+            // Share ONE physical VMO per handle so GEM_CLOSE cannot free the
+            // frames while an older mmap Arc is still live (see `nouveau_cpu_vmo`).
+            // Always size the VMO to the full GEM; the caller's `len` only
+            // bounds the mapping, not the shared object.
+            let _ = len;
+            Ok(drm::nouveau_cpu_vmo(handle_id, phys_addr, size as usize))
         } else {
             Err(FsError::InvalidParam)
         }
@@ -2231,6 +2235,9 @@ impl INode for DrmDev {
                         .map(|d| d.nouveau_gem_close(handle, drm::current_pid()))
                         .unwrap_or(false)
                 {
+                    // Drop the shared CPU-map cache entry; any live mmap Arc
+                    // keeps its pin until munmap/Drop.
+                    drm::nouveau_cpu_vmo_forget(handle);
                     Ok(0)
                 } else {
                     Err(FsError::InvalidParam)

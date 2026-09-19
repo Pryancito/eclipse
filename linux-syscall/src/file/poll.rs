@@ -12,6 +12,7 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 use kernel_hal::timer;
 use linux_object::fs::{FileDesc, PollEvents};
+use linux_object::signal::Sigset;
 use linux_object::time::*;
 
 /// Monotonic time since boot — must match `timer::timer_set` deadlines (not wall clock).
@@ -387,6 +388,8 @@ impl Syscall<'_> {
         ufds: UserInOutPtr<PollFd>,
         nfds: usize,
         timeout: UserInPtr<TimeSpec>,
+        sigmask: UserInPtr<Sigset>,
+        sigsetsize: usize,
     ) -> SysResult {
         let timeout_msecs = if timeout.is_null() {
             -1
@@ -396,7 +399,14 @@ impl Syscall<'_> {
             timeout.to_msec() as isize
         };
 
-        self.sys_poll(ufds, nfds, timeout_msecs).await
+        let mut guard = self.install_temp_sigmask(sigmask, sigsetsize)?;
+        let result = self.sys_poll(ufds, nfds, timeout_msecs).await;
+        if matches!(result, Err(LxError::EINTR)) {
+            if let Some(g) = guard.as_mut() {
+                g.keep_for_signal();
+            }
+        }
+        result
     }
 
     /// similar to select, but have sigmask argument
@@ -407,7 +417,7 @@ impl Syscall<'_> {
         write: UserInOutPtr<u32>,
         err: UserInOutPtr<u32>,
         timeout: UserInPtr<TimeSpec>,
-        _sigset: usize,
+        sigset_arg: usize,
     ) -> SysResult {
         // pselect6's timeout is a `timespec` (NANOseconds). It was previously
         // parsed as select(2)'s `timeval` (MICROseconds), inflating every
@@ -419,8 +429,26 @@ impl Syscall<'_> {
         } else {
             timeout.read()?.to_msec() as isize
         };
-        self.select_core(nfds, read, write, err, timeout_msecs)
-            .await
+        // 6th arg is a pointer to `{ const sigset_t *ss; size_t ss_len; }`.
+        let (sigmask, sigsetsize) = if sigset_arg == 0 {
+            (UserInPtr::<Sigset>::from(0), 0)
+        } else {
+            #[repr(C)]
+            struct PSelectSigsetArg {
+                ss: usize,
+                ss_len: usize,
+            }
+            let arg: PSelectSigsetArg = UserInPtr::from(sigset_arg).read()?;
+            (UserInPtr::from(arg.ss), arg.ss_len)
+        };
+        let mut guard = self.install_temp_sigmask(sigmask, sigsetsize)?;
+        let result = self.select_core(nfds, read, write, err, timeout_msecs).await;
+        if matches!(result, Err(LxError::EINTR)) {
+            if let Some(g) = guard.as_mut() {
+                g.keep_for_signal();
+            }
+        }
+        result
     }
 
     /// allow a program to monitor multiple file descriptors,
@@ -778,7 +806,8 @@ impl Syscall<'_> {
         mut events: UserOutPtr<EpollEvent>,
         maxevents: usize,
         timeout: isize,
-        _sigmask: usize,
+        sigmask: UserInPtr<Sigset>,
+        sigsetsize: usize,
     ) -> SysResult {
         log::trace!(
             "epoll_pwait: epfd={:?}, maxevents={}, timeout={}",
@@ -786,6 +815,7 @@ impl Syscall<'_> {
             maxevents,
             timeout
         );
+        let mut guard = self.install_temp_sigmask(sigmask, sigsetsize)?;
         // Resolve the epoll object to an owned Arc (not a borrow of a local):
         // `wait` awaits, and a stale net/timer waker re-polling this future
         // after teardown must not dereference a freed process/file. The Arc
@@ -805,19 +835,27 @@ impl Syscall<'_> {
         };
 
         // TODO: handle timeout
-        let res_events = match epoll.wait(maxevents, timeout).await {
-            Ok(v) => v,
+        let result = match epoll.wait(maxevents, timeout).await {
+            Ok(v) => {
+                if let Err(e) = events.write_array(&v) {
+                    let e: LxError = e.into();
+                    linux_object::process::trace_wait_error("epoll_wait/write", e);
+                    Err(e)
+                } else {
+                    Ok(v.len())
+                }
+            }
             Err(e) => {
                 linux_object::process::trace_wait_error("epoll_wait", e);
-                return Err(e);
+                Err(e)
             }
         };
-        if let Err(e) = events.write_array(&res_events) {
-            let e: LxError = e.into();
-            linux_object::process::trace_wait_error("epoll_wait/write", e);
-            return Err(e);
+        if matches!(result, Err(LxError::EINTR)) {
+            if let Some(g) = guard.as_mut() {
+                g.keep_for_signal();
+            }
         }
-        Ok(res_events.len())
+        result
     }
 
     /// wait for an I/O event on an epoll file descriptor
@@ -828,7 +866,7 @@ impl Syscall<'_> {
         maxevents: usize,
         timeout: isize,
     ) -> SysResult {
-        self.sys_epoll_pwait(epfd, events, maxevents, timeout, 0)
+        self.sys_epoll_pwait(epfd, events, maxevents, timeout, 0.into(), 0)
             .await
     }
 }
