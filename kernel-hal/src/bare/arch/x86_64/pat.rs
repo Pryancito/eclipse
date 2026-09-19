@@ -23,8 +23,10 @@
 //!   (`rboot/src/page_table.rs`, `Mapper<Size4KiB>`), and every process page
 //!   table shares the kernel-half PDPTs by PML4E cloning
 //!   (`pt_clone_kernel_space`), so a single in-place edit propagates to every
-//!   address space. The range was UC/WB-but-only-written before, so no cache
-//!   flush is needed beyond `invlpg`.
+//!   address space. `invlpg` alone is NOT enough: the range was WB and was
+//!   written (the boot logo, the early framebuffer console), so it holds dirty
+//!   lines whose later eviction would land on top of the new write-combining
+//!   stores — see the `clflush_range` call in [`enable_framebuffer_wc`].
 //!
 //! New mappings that ask for [`CachePolicy::WriteCombining`] get the PAT bit
 //! from `X86PTE::set_flags` in `vm.rs` once [`pat_wc_ready`] reports true.
@@ -103,17 +105,51 @@ pub fn enable_framebuffer_wc() {
     let pages = (KCONFIG.fb_size as usize).div_ceil(4096);
     let mut converted = 0usize;
     let mut skipped_huge = 0usize;
+    // Write back and invalidate every page we retype, the way Linux's
+    // `set_memory_wc` follows its TLB flush with `clflush_cache_range`.
+    //
+    // This used to be skipped, on the reasoning that the range had only ever
+    // been *written* through the WB alias, so nothing needed pulling back.
+    // That has it backwards: a write-back range that was written and not read
+    // is precisely the one holding DIRTY lines. rboot's logo,
+    // `early_fb_console::prime` and every early klog line store into this
+    // physmap alias before we get here, and those lines sit in L1/L2 until
+    // something evicts them. Retyping only the PTE leaves them there, and the
+    // eviction — whenever it comes, seconds or minutes later — writes that
+    // stale pixel data back ON TOP of whatever the write-combining stores
+    // have since drawn. The symptom is rectangles of boot-logo or boot-text
+    // debris reappearing over a live console or desktop at random moments.
+    // (The SDM also leaves the effective type undefined for a page touched
+    // under two memory types with no flush between them.)
+    //
+    // Flushing commits those pending writes at a defined point, before the
+    // first WC store, and leaves the range clean. Per converted PAGE, not
+    // over `first..last`: this pass legitimately finds unmapped holes (the
+    // post-PCI re-run is documented to), and `CLFLUSH` on an unmapped address
+    // faults like any other access.
+    let mut fenced = false;
     for i in 0..pages {
         let va = va_base + i * 4096;
         match convert_pte_to_wc(root, va) {
             PteConvert::Converted => {
                 tlb::flush(x86_64::VirtAddr::new(va as u64));
+                if !fenced {
+                    // SAFETY: plain fence, no memory operand.
+                    unsafe { core::arch::x86_64::_mm_mfence() };
+                    fenced = true;
+                }
+                clflush_page(va);
                 converted += 1;
             }
             PteConvert::AlreadyWc => {}
             PteConvert::HugeLeaf => skipped_huge += 1,
             PteConvert::NotMapped => {}
         }
+    }
+    if fenced {
+        // Order every flush ahead of the write-combining stores to come.
+        // SAFETY: plain fence, no memory operand.
+        unsafe { core::arch::x86_64::_mm_mfence() };
     }
     if converted > 0 || skipped_huge > 0 {
         // klog, not log::warn!: at the default LOG=error boot this line is the
@@ -130,6 +166,24 @@ pub fn enable_framebuffer_wc() {
                 ""
             },
         );
+    }
+}
+
+/// Write back and invalidate the cache lines of the 4 KiB page at `va`.
+///
+/// Caller brackets the whole run with `MFENCE` (see [`enable_framebuffer_wc`]).
+/// Plain `CLFLUSH` rather than `CLFLUSHOPT`: this runs once per boot over a
+/// few megabytes, and `CLFLUSH` is self-serialising, so the extra fencing the
+/// optimised form needs buys nothing here.
+fn clflush_page(va: usize) {
+    const LINE: usize = 64;
+    // SAFETY: `va` is a page the caller just converted in the live page table,
+    // so it is mapped. `CLFLUSH` touches only the cache line containing the
+    // address and faults on nothing an ordinary read of it would not.
+    unsafe {
+        for off in (0..4096).step_by(LINE) {
+            core::arch::x86_64::_mm_clflush((va + off) as *const u8);
+        }
     }
 }
 
