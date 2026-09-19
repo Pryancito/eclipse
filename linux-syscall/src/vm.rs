@@ -282,6 +282,19 @@ impl Syscall<'_> {
             Ok(addr)
         } else {
             let file_like = self.linux_process().get_file_like(fd)?;
+            // Name the failing fd. `File` carries a path (the device/file
+            // node); anything else has none, which itself pins the kind.
+            // Resolved up here because BOTH mapping kinds need it to be
+            // diagnosable -- the private branch used to log neither the path
+            // nor the process, which turned a real failure into a wall of
+            // "get_vmo FAILED: ENOSYS fd=FileDesc(4)" that named nothing you
+            // could act on (observed on real hardware during apk triggers).
+            let path = || {
+                file_like
+                    .downcast_ref::<linux_object::fs::File>()
+                    .map(|f| f.path().clone())
+                    .unwrap_or_else(|| alloc::string::String::from("<non-File FileLike>"))
+            };
             // MAP_SHARED must hand every mapper of the file the SAME VmObject
             // (stores propagate between processes — the wl_shm pixel path);
             // MAP_PRIVATE keeps the per-call demand-paged snapshot.
@@ -289,13 +302,7 @@ impl Syscall<'_> {
                 let (vmo, off) = file_like
                     .get_vmo_shared(offset as usize, len)
                     .inspect_err(|e| {
-                        // Name the failing fd. `File` carries a path (the
-                        // device/file node); anything else has none, which
-                        // itself pins the kind.
-                        let path = file_like
-                            .downcast_ref::<linux_object::fs::File>()
-                            .map(|f| f.path().clone())
-                            .unwrap_or_else(|| alloc::string::String::from("<non-File FileLike>"));
+                        let path = path();
                         // alsa-lib PROBES the mmap of a PCM's status (0x8000_0000)
                         // and control (0x8100_0000) pages, and on any failure
                         // sets `mmap_*_fallbacked` and drives the device through
@@ -334,8 +341,13 @@ impl Syscall<'_> {
             } else {
                 let vmo = file_like.get_vmo(offset as usize, len).inspect_err(|e| {
                     error!(
-                        "mmap(file) get_vmo FAILED: {:?} fd={:?} offset={:#x} len={:#x}",
-                        e, fd, offset, len
+                        "mmap(file) get_vmo FAILED: {:?} proc={} fd={:?} path={} offset={:#x} len={:#x}",
+                        e,
+                        self.zircon_process().name(),
+                        fd,
+                        path(),
+                        offset,
+                        len
                     );
                 })?;
                 (vmo, 0)

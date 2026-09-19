@@ -1086,10 +1086,20 @@ impl FileLike for File {
             }
             FileType::CharDevice => {
                 use super::devfs::{DrmDev, FbDev};
+                use rcore_fs_devfs::special::ZeroINode;
                 if let Some(fbdev) = inner.inode.downcast_ref::<FbDev>() {
                     fbdev.get_vmo(offset, len)
                 } else if let Some(drmdev) = inner.inode.downcast_ref::<DrmDev>() {
                     drmdev.get_vmo(offset, len).map_err(Into::into)
+                } else if inner.inode.downcast_ref::<ZeroINode>().is_some() {
+                    // mmap(/dev/zero) is the pre-MAP_ANONYMOUS way to ask for
+                    // zeroed memory, and plenty of userspace still does it --
+                    // it showed up as a flood of "get_vmo FAILED: ENOSYS"
+                    // during apk triggers on real hardware. Linux backs such a
+                    // mapping with ordinary anonymous zero pages, which is
+                    // exactly a fresh paged VMO; `offset` carries no meaning
+                    // for this device, so it is ignored as Linux ignores it.
+                    Ok(VmObject::new_paged(pages(len)))
                 } else {
                     Err(LxError::ENOSYS)
                 }
