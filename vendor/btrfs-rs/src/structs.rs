@@ -1008,6 +1008,9 @@ impl Superblock {
     pub fn compat_ro_flags(&self) -> u64 {
         get_u64(&self.raw, sb::OFF_COMPAT_RO_FLAGS)
     }
+    pub fn set_compat_ro_flags(&mut self, v: u64) {
+        put_u64(&mut self.raw, sb::OFF_COMPAT_RO_FLAGS, v)
+    }
     pub fn incompat_flags(&self) -> u64 {
         get_u64(&self.raw, sb::OFF_INCOMPAT_FLAGS)
     }
