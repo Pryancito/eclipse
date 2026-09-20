@@ -2047,6 +2047,26 @@ impl core::fmt::Debug for VmMapping {
     }
 }
 
+/// Test seam fired inside `handle_page_fault`, in the one window this file
+/// cannot otherwise be stopped in: after `commit_page` has handed back a
+/// physical frame and before the mapping lock is retaken to publish it. A
+/// `decommit` racing exactly there is what issue #1263 is about, and it is
+/// unreachable from a test otherwise -- every other way of stalling the fault
+/// holds a lock that `decommit`'s own unmap pass needs, so the two serialize
+/// and the window never opens. Compiled only for this crate's tests; the
+/// non-test build has an empty inlined body.
+#[cfg(test)]
+fn fault_publish_hook(vaddr: VirtAddr) {
+    let hook = tests::FAULT_PUBLISH_HOOK.lock().clone();
+    if let Some(hook) = hook {
+        hook(vaddr);
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn fault_publish_hook(_vaddr: VirtAddr) {}
+
 impl VmMapping {
     fn paging_error_as_zx(err: PagingError) -> ZxError {
         match err {
@@ -2562,6 +2582,19 @@ impl VmMapping {
         } else {
             0
         };
+        // Snapshot the decommit generation BEFORE committing. `cow_fault_seq`
+        // guards write faults against fork; this guards faults of EITHER kind
+        // against a `decommit` landing between the `commit_page` below and the
+        // PTE install further down. Three callers reach it: `dontneed`
+        // (madvise(MADV_DONTNEED) over a file mapping, which mozjemalloc and
+        // mimalloc issue continuously), `cache_truncate` (truncate(2) on a
+        // mapped file, which decommits the shared page cache out from under
+        // every borrower), and ZX_VMO_OP_DECOMMIT. Decommit frees
+        // the frames and then unmaps every PTE that points at them -- which
+        // cannot reach this fault's PTE, since it does not exist yet -- so
+        // without this the fault publishes a mapping onto a frame the
+        // allocator has already given to somebody else.
+        let decommit_seq = self.vmo.decommit_snapshot();
         // Resolved BEFORE taking `self.inner`: it acquires the VMO family lock,
         // and the established discipline is to never hold the mapping lock
         // while taking a VMO lock.
@@ -2599,6 +2632,7 @@ impl VmMapping {
         }
         let paddr = self.vmo.commit_page(vmo_offset / PAGE_SIZE, access_flags)?;
         // error!("paddr = {:x}", paddr);
+        fault_publish_hook(vaddr);
         {
             // RE-CHECK under the mapping lock that this mapping still covers
             // `vaddr`, and covers it at the same VMO offset, before installing
@@ -2640,6 +2674,15 @@ impl VmMapping {
                     return Ok(());
                 }
             }
+            // `paddr` may belong to a decommitted range by now. Checked under
+            // the mapping lock so the two orderings are both covered: a
+            // decommit that already ran shows up as a changed generation, and
+            // one that starts after this check blocks on this very lock in its
+            // unmap pass (`range_change_blocking`) and so tears the PTE down
+            // again as soon as it is installed.
+            if !self.vmo.decommit_seq_intact(decommit_seq) {
+                return Ok(());
+            }
             let mut pg_table = self.page_table.lock();
             let mut res = pg_table.map(Page::new_aligned(vaddr, PageSize::Size4K), paddr, flags);
             if let Err(PagingError::AlreadyMapped) = res {
@@ -2676,6 +2719,9 @@ impl VmMapping {
         const FAULT_AROUND_PAGES: usize = 16;
         let mut targets = [(0usize, 0usize, MMUFlags::empty()); FAULT_AROUND_PAGES - 1];
         let mut n = 0;
+        // Same window as the primary page, same guard: these commits also run
+        // with no mapping lock held.
+        let decommit_seq = self.vmo.decommit_snapshot();
         let (snap_addr, snap_vmo_offset) = {
             let inner = self.inner.lock();
             if inner.size == 0 || vaddr < inner.addr || vaddr >= inner.end_addr() {
@@ -2720,6 +2766,9 @@ impl VmMapping {
         // Same re-validation as the primary page: a concurrent unmap /
         // MAP_FIXED may have cut or moved this mapping while we committed.
         if inner.size == 0 || inner.addr != snap_addr || inner.vmo_offset != snap_vmo_offset {
+            return;
+        }
+        if !self.vmo.decommit_seq_intact(decommit_seq) {
             return;
         }
         let mut pg_table = self.page_table.lock();
@@ -3070,6 +3119,24 @@ pub const USER_STACK_PAGES: usize = 128;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Set by a test to stop a page fault in the window between `commit_page`
+    /// and the PTE install; see `fault_publish_hook`. Global, and the test
+    /// binary runs its tests in parallel threads, so every hook here filters
+    /// on the faulting address — other tests' VMARs live elsewhere and pass
+    /// straight through.
+    #[allow(clippy::type_complexity)]
+    pub(super) static FAULT_PUBLISH_HOOK: Mutex<Option<Arc<dyn Fn(VirtAddr) + Send + Sync>>> =
+        Mutex::new(None);
+
+    /// Clears [`FAULT_PUBLISH_HOOK`] however the test ends, panic included.
+    struct FaultPublishHookGuard;
+
+    impl Drop for FaultPublishHookGuard {
+        fn drop(&mut self) {
+            *FAULT_PUBLISH_HOOK.lock() = None;
+        }
+    }
 
     #[test]
     fn create_child() {
@@ -3501,6 +3568,147 @@ mod tests {
             );
         }
         assert_eq!(vmo.test_read(1), 0);
+    }
+
+    /// Regression test for issue #1263.
+    ///
+    /// A fault resolves its frame with `commit_page` and publishes it later,
+    /// with no VMO lock held in between. `decommit` frees the frames and then
+    /// unmaps every PTE that points at them — every PTE that *exists*, which
+    /// does not include the one this fault is still carrying. Before the
+    /// decommit generation, the fault came back and mapped the freed frame
+    /// anyway, leaving userspace writing into memory the allocator had already
+    /// handed to somebody else.
+    ///
+    /// The window is only reachable through `fault_publish_hook`: anything
+    /// else that could stall the fault holds a lock `decommit`'s unmap pass
+    /// needs, so the two would serialize and the race would never happen.
+    #[test]
+    fn page_fault_never_publishes_a_decommitted_frame() {
+        use std::{
+            sync::{mpsc, Mutex as StdMutex},
+            time::Duration,
+        };
+
+        let vmar = VmAddressRegion::new_root();
+        let vmo = VmObject::new_paged(1);
+        vmo.test_write(0, 7);
+        vmar.map_at(0, vmo.clone(), 0, PAGE_SIZE, MMUFlags::RXW)
+            .unwrap();
+        let addr = vmar.addr();
+        let mapping = vmar.find_mapping(addr).unwrap();
+
+        let (reached_tx, reached_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let reached_tx = StdMutex::new(reached_tx);
+        let release_rx = StdMutex::new(release_rx);
+        let fired = AtomicBool::new(false);
+        *FAULT_PUBLISH_HOOK.lock() = Some(Arc::new(move |va: VirtAddr| {
+            // Once, and only for this test's mapping.
+            if va != addr || fired.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            reached_tx.lock().unwrap().send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        }));
+        let _hook_guard = FaultPublishHookGuard;
+
+        std::thread::scope(|s| {
+            let vmar = vmar.clone();
+            s.spawn(move || {
+                vmar.handle_page_fault(addr, MMUFlags::READ).unwrap();
+            });
+            // The fault now holds a frame it has not published yet.
+            reached_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            vmo.decommit(0, PAGE_SIZE).unwrap();
+            assert!(vmo.committed_paddr(0).is_none());
+            release_tx.send(()).unwrap();
+        });
+
+        // The libOS page table cannot be queried, but `update` reports a page
+        // with no host mapping as `NotMapped`, which answers the only question
+        // here: did the fault install a PTE after all?
+        let published = mapping
+            .page_table
+            .lock()
+            .update(addr, None, Some(MMUFlags::READ))
+            .is_ok();
+        assert!(
+            !published,
+            "the fault published a PTE onto a frame `decommit` had already freed"
+        );
+    }
+
+    /// The decommit window stays open until the last stale PTE is gone, not
+    /// just until the frames are released: a fault that starts while the unmap
+    /// pass is still running must not trust its snapshot either.
+    #[test]
+    fn decommit_window_stays_open_through_the_unmap_pass() {
+        use std::{sync::mpsc, time::Duration, time::Instant};
+
+        let vmar = VmAddressRegion::new_root();
+        let vmo = VmObject::new_paged(1);
+        vmo.test_write(0, 7);
+        vmar.map_at(0, vmo.clone(), 0, PAGE_SIZE, MMUFlags::RXW)
+            .unwrap();
+        let mapping = vmar.find_mapping(vmar.addr()).unwrap();
+        assert!(vmo.decommit_snapshot().is_some(), "quiescent to start with");
+
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::scope(|s| {
+            let mapping = mapping.clone();
+            s.spawn(move || {
+                let _guard = mapping.inner.lock();
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            locked_rx.recv().unwrap();
+
+            let decommitter = vmo.clone();
+            s.spawn(move || {
+                done_tx.send(decommitter.decommit(0, PAGE_SIZE)).unwrap();
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while vmo.decommit_snapshot().is_some() {
+                assert!(Instant::now() < deadline, "decommit never opened a window");
+                std::thread::yield_now();
+            }
+            // Blocked in the unmap pass on the mapping lock above, so the
+            // window is open with the frames already gone.
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                "decommit should be waiting for the contended mapping"
+            );
+            assert!(vmo.decommit_snapshot().is_none());
+            release_tx.send(()).unwrap();
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+        });
+        assert!(
+            vmo.decommit_snapshot().is_some(),
+            "the window must close once the unmap pass is done"
+        );
+    }
+
+    /// A borrower's faults publish the page cache's frames, so a decommit on
+    /// the cache has to invalidate them — the borrower's own counters never
+    /// move.
+    #[test]
+    fn borrower_watches_the_cache_decommit_generation() {
+        let cache = VmObject::new_paged(1);
+        cache.test_write(0, 7);
+        let borrower = VmObject::new_paged_borrowing(1, cache.clone(), 0);
+        let snapshot = borrower.decommit_snapshot();
+        assert!(borrower.decommit_seq_intact(snapshot));
+        cache.decommit(0, PAGE_SIZE).unwrap();
+        assert!(
+            !borrower.decommit_seq_intact(snapshot),
+            "a decommit on the page cache left a borrower's in-flight fault believing its frame"
+        );
     }
 
     #[test]

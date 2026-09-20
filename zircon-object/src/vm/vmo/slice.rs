@@ -74,6 +74,13 @@ impl VMObjectTrait for VMObjectSlice {
         self.parent.decommit(offset + self.offset, len)
     }
 
+    fn decommit_seq(&self) -> (u64, u64) {
+        // A slice's pages ARE the parent's pages, and `decommit` above frees
+        // them through the parent, so the parent's generation is the one a
+        // fault through this slice has to watch.
+        self.parent.decommit_seq()
+    }
+
     fn create_child(&self, _offset: usize, _len: usize) -> ZxResult<Arc<dyn VMObjectTrait>> {
         Err(ZxError::NOT_SUPPORTED)
     }
