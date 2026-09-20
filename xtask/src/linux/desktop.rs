@@ -1524,6 +1524,213 @@ fn write_freedoom_wrapper(rootfs: &Path) {
     }
 }
 
+/// The Freedoom IWADs, fetched straight from the upstream release when the
+/// Alpine package did not make it into the image.
+///
+/// `freedoom` is in Alpine community and sits in `DEFAULT_PACKAGES`, but the
+/// apk stage is best-effort by design: no network, a stale cached index, or a
+/// mirror that has moved on all end with the package quietly absent. The first
+/// anyone hears of it is `eclipse-freedoom` reporting "no IWAD found" -- on a
+/// machine that, by then, has no mirror in reach to fix it with. That is
+/// exactly what happened on the first build that shipped the launcher.
+///
+/// The wads ARE the game: an engine without them has nothing to launch. They
+/// are BSD-licensed and redistributable, and upstream publishes both in one
+/// zip at a stable URL, so fetch them directly rather than ship a launcher
+/// that cannot launch.
+///
+/// Best-effort in turn, cheapest first: wads already in the rootfs win (from
+/// the apk package, or dropped there by hand), then the cached zip, then the
+/// download. The zip is checked against the SHA-512 that Alpine's own APKBUILD
+/// pins for the very same file, and a mismatch is discarded rather than
+/// unpacked. No network, no unzip and a bad hash each warn and leave the image
+/// exactly as it was. `ECLIPSE_FREEDOOM_FETCH=0` skips all of it.
+pub fn ensure_freedoom_iwads(rootfs: &Path) {
+    const VERSION: &str = "0.13.0";
+    const URL: &str =
+        "https://github.com/freedoom/freedoom/releases/download/v0.13.0/freedoom-0.13.0.zip";
+    /// From `community/freedoom/APKBUILD` in aports 3.24-stable, for this same
+    /// release zip -- an independent pin, not one taken from the download.
+    const SHA512: &str = "ff71b279900751cb606286ab36d0990febdeb78fee2a9c6adf31491e977e8e045a0d5f30ff6b729d4962c98a30f3138d74f03d25c3569dd3b3e29167601014b9";
+    const WADS: [&str; 2] = ["freedoom1.wad", "freedoom2.wad"];
+
+    if matches!(
+        std::env::var("ECLIPSE_FREEDOOM_FETCH")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "off" | "no" | "false"
+    ) {
+        println!("Freedoom: fetch disabled by ECLIPSE_FREEDOOM_FETCH");
+        return;
+    }
+
+    // The same search path `eclipse-freedoom` walks, so "present" here means
+    // the launcher will find it.
+    let search = [
+        "usr/share/doom",
+        "usr/share/games/doom",
+        "usr/share/freedoom",
+        "root/.local/share/doom",
+    ];
+    let found = |wad: &str| {
+        search
+            .iter()
+            .map(|d| rootfs.join(d).join(wad))
+            .find(|p| p.is_file())
+    };
+    if let (Some(one), Some(two)) = (found(WADS[0]), found(WADS[1])) {
+        println!(
+            "Freedoom: IWADs already in the rootfs ({}, {})",
+            one.display(),
+            two.display()
+        );
+        return;
+    }
+
+    let cache = crate::PROJECT_DIR.join("ignored").join("freedoom");
+    let _ = fs::create_dir_all(&cache);
+    let zip = cache.join(format!("freedoom-{VERSION}.zip"));
+
+    if zip.is_file() && sha512_of(&zip).as_deref() != Some(SHA512) {
+        eprintln!("warning: Freedoom: cached zip does not match its hash; refetching");
+        let _ = fs::remove_file(&zip);
+    }
+    if !zip.is_file() {
+        // `-O` to a temporary name so an interrupted transfer never leaves a
+        // truncated file that looks cached.
+        let part = cache.join(format!("freedoom-{VERSION}.zip.part"));
+        let _ = fs::remove_file(&part);
+        println!("Freedoom: fetching the IWADs from {URL}");
+        let ok = std::process::Command::new("wget")
+            .arg("-q")
+            .arg("-O")
+            .arg(&part)
+            .arg(URL)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok || fs::rename(&part, &zip).is_err() {
+            let _ = fs::remove_file(&part);
+            eprintln!(
+                "warning: Freedoom: could not download {URL} -- shipping without the \
+                 IWADs. The launcher will say so; `apk add freedoom` on the running \
+                 system, or drop a .wad into /usr/share/games/doom, fixes it."
+            );
+            return;
+        }
+    }
+    match sha512_of(&zip).as_deref() {
+        Some(SHA512) => {}
+        Some(other) => {
+            eprintln!(
+                "warning: Freedoom: {} has sha512 {other}, expected {SHA512} -- \
+                 discarding it rather than unpacking it",
+                zip.display()
+            );
+            let _ = fs::remove_file(&zip);
+            return;
+        }
+        None => {
+            eprintln!(
+                "warning: Freedoom: no sha512sum/shasum on this host, so the download \
+                 cannot be verified -- not unpacking it"
+            );
+            return;
+        }
+    }
+
+    let dest = rootfs.join("usr/share/games/doom");
+    if fs::create_dir_all(&dest).is_err() {
+        eprintln!("warning: Freedoom: cannot create {}", dest.display());
+        return;
+    }
+    // `-j` junks the `freedoom-<version>/` prefix so the wads land directly in
+    // the directory the launcher searches.
+    let unzipped = std::process::Command::new("unzip")
+        .arg("-o")
+        .arg("-j")
+        .arg(&zip)
+        .args(WADS.iter().map(|w| format!("freedoom-{VERSION}/{w}")))
+        .arg("-d")
+        .arg(&dest)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !unzipped {
+        // No unzip(1) on this host. python3 is a build dependency already
+        // (the test harness uses it) and its zipfile module is in the stdlib.
+        let script = format!(
+            "import sys, zipfile\n\
+             z = zipfile.ZipFile(sys.argv[1])\n\
+             for w in sys.argv[3:]:\n\
+             \x20   data = z.read('freedoom-{VERSION}/' + w)\n\
+             \x20   open(sys.argv[2] + '/' + w, 'wb').write(data)\n"
+        );
+        let ok = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(&script)
+            .arg(&zip)
+            .arg(&dest)
+            .args(WADS)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!(
+                "warning: Freedoom: neither `unzip` nor `python3` could unpack {} -- \
+                 shipping without the IWADs",
+                zip.display()
+            );
+            return;
+        }
+    }
+    let sizes: Vec<String> = WADS
+        .iter()
+        .map(|w| {
+            let p = dest.join(w);
+            match fs::metadata(&p) {
+                Ok(m) => format!("{w} {} MiB", m.len() / (1024 * 1024)),
+                Err(_) => format!("{w} MISSING"),
+            }
+        })
+        .collect();
+    println!(
+        "Freedoom: installed into /usr/share/games/doom ({})",
+        sizes.join(", ")
+    );
+}
+
+/// SHA-512 of a file, as lowercase hex, using whichever of the two standard
+/// host tools exists. `None` means neither is available (or the file could not
+/// be read), which callers must treat as "unverified", never as "matches".
+fn sha512_of(path: &Path) -> Option<String> {
+    let parse = |out: std::process::Output| -> Option<String> {
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .map(|s| s.to_ascii_lowercase())
+    };
+    std::process::Command::new("sha512sum")
+        .arg(path)
+        .output()
+        .ok()
+        .and_then(parse)
+        .or_else(|| {
+            std::process::Command::new("shasum")
+                .arg("-a")
+                .arg("512")
+                .arg(path)
+                .output()
+                .ok()
+                .and_then(parse)
+        })
+}
+
 /// Launcher entries for both Freedoom phases, so the panel's application menu
 /// lists them and both run through the wrapper rather than through GZDoom's
 /// own `freedoom1`/`freedoom2` scripts (which do not pick a renderer).
@@ -2565,6 +2772,34 @@ mod tests {
         assert!(caches.contains("/root/.cache/pixbuf-loaders.cache"));
         let ff = fs::read_to_string(dir.join("usr/local/bin/eclipse-firefox")).unwrap();
         assert!(ff.contains("export NO_AT_BRIDGE=1\n"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Wads already in the rootfs -- put there by the `freedoom` package, or
+    /// by hand -- must short-circuit the fetch. Getting this wrong means every
+    /// image build re-downloads and re-unpacks 57 MiB it already had, and
+    /// overwrites a wad the user deliberately dropped in.
+    #[test]
+    fn freedoom_fetch_leaves_existing_iwads_alone() {
+        let dir = std::env::temp_dir().join(format!("eclipse-iwad-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        // The layout Alpine's own package produces: prefix=/usr, waddir=
+        // /share/games/doom (freedoom's Makefile).
+        let wads = dir.join("usr/share/games/doom");
+        fs::create_dir_all(&wads).unwrap();
+        for w in ["freedoom1.wad", "freedoom2.wad"] {
+            fs::write(wads.join(w), b"not really a wad").unwrap();
+        }
+
+        ensure_freedoom_iwads(&dir);
+
+        for w in ["freedoom1.wad", "freedoom2.wad"] {
+            assert_eq!(
+                fs::read(wads.join(w)).unwrap(),
+                b"not really a wad",
+                "{w} was overwritten although it was already present"
+            );
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

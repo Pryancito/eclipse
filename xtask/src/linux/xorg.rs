@@ -395,6 +395,7 @@ fn mk_apk_add(
     cache: &Path,
     keys: &Path,
     initdb: bool,
+    update_cache: bool,
 ) -> Command {
     let mut cmd = Command::new(apk_bin);
     cmd.arg("add").arg("--root").arg(stage);
@@ -417,6 +418,17 @@ fn mk_apk_add(
         // Post-install scripts would need to chroot into the target; skip them
         // (font caches regenerate on first use).
         .arg("--no-scripts");
+    // ... but a cached index also goes STALE, and a stale one is worse than no
+    // index: it still lists every package name, so resolution succeeds and the
+    // FETCH is what 404s, because the mirror has since moved on to newer
+    // versions. A name added to DEFAULT_PACKAGES after the last online build
+    // then never installs, however many times the image is rebuilt on a
+    // perfectly good network -- which is how `freedoom` shipped absent. So the
+    // caller asks for a refresh first and falls back to the cached index only
+    // when that fails, which is the offline case the comment above is about.
+    if update_cache {
+        cmd.arg("--update-cache");
+    }
     // apk 3.x refuses to create a database as a non-root user without
     // --usermode, and refuses --usermode AS root ("--usermode not allowed as
     // root"). The build normally runs as an unprivileged user (`make` on the
@@ -586,12 +598,28 @@ pub(super) fn install(rootfs: &Path, apk_bin: &Path, arch: &str) {
     let _ = std::fs::remove_dir_all(&stage);
     let _ = std::fs::create_dir_all(&stage);
 
-    let mut cmd = mk_apk_add(apk_bin, &stage, arch, &repos, &cache, &keys, true);
+    let mut cmd = mk_apk_add(apk_bin, &stage, arch, &repos, &cache, &keys, true, true);
     for p in &packages {
         cmd.arg(p);
     }
 
     let mut outcome = cmd.status();
+    // A refreshed index is the normal case; a refresh that fails means no
+    // network, so fall back to whatever the cache already holds before
+    // concluding anything about the packages themselves.
+    if !matches!(&outcome, Ok(s) if s.success()) {
+        eprintln!(
+            "warning: `apk add` with a refreshed index failed; retrying off the \
+             cached index (this is the offline path)"
+        );
+        let _ = std::fs::remove_dir_all(&stage);
+        let _ = std::fs::create_dir_all(&stage);
+        let mut cached = mk_apk_add(apk_bin, &stage, arch, &repos, &cache, &keys, true, false);
+        for p in &packages {
+            cached.arg(p);
+        }
+        outcome = cached.status();
+    }
     // `apk add` is ONE transaction: a single unresolvable name aborts all of
     // it, and the failure branch below only warns and skips the merge — so the
     // rootfs silently keeps whatever a PREVIOUS build left there. That reads as
@@ -614,7 +642,7 @@ pub(super) fn install(rootfs: &Path, apk_bin: &Path, arch: &str) {
         let mut first = true;
         let mut any_ok = false;
         for p in &packages {
-            let mut c = mk_apk_add(apk_bin, &stage, arch, &repos, &cache, &keys, first);
+            let mut c = mk_apk_add(apk_bin, &stage, arch, &repos, &cache, &keys, first, false);
             c.arg(p);
             match c.status() {
                 Ok(s) if s.success() => {

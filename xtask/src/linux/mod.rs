@@ -106,6 +106,9 @@ impl LinuxRootfs {
             desktop::write_firefox_default_prefs(&dir);
             // Needs the GTK/gsettings packages on disk, same reason.
             desktop::compile_gsettings_schemas(&dir);
+            // After apk too: it only downloads the IWADs when the `freedoom`
+            // package did not land, which is not known until apk has run.
+            desktop::ensure_freedoom_iwads(&dir);
             // After apk so we can see whether the PulseAudio plugin/binary
             // landed, and so /etc/pulse wins over anything the package dropped.
             Self::write_asound_conf(&dir);
@@ -197,6 +200,9 @@ impl LinuxRootfs {
         desktop::write_firefox_default_prefs(&dir);
         // Needs the GTK/gsettings packages on disk, same reason.
         desktop::compile_gsettings_schemas(&dir);
+        // After apk too: it only downloads the IWADs when the `freedoom`
+        // package did not land, which is not known until apk has run.
+        desktop::ensure_freedoom_iwads(&dir);
         Self::install_ca_certs(&dir);
 
         // /etc/machine-id — prevents dhcp_vendor "No such file or directory".
@@ -1270,6 +1276,34 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             if !link.exists() && !link.is_symlink() {
                 #[cfg(unix)]
                 let _ = std::os::unix::fs::symlink("busybox", &link);
+            }
+        }
+
+        // `/usr/bin/env`, which is NOT one of the applet links above because
+        // those all live in /bin.
+        //
+        // `#!/usr/bin/env <cmd>` is the single most common shebang there is --
+        // it is how a script finds an interpreter through $PATH instead of
+        // hardcoding its location -- and Eclipse had no /usr/bin/env at all,
+        // only /bin/env. Every such script therefore failed to exec, and
+        // (until the loader stopped tearing the address space down before it
+        // could fail) took the calling process with it:
+        //
+        //   shebang: lookup interp "usr/bin/env" failed: EntryNotFound
+        //   execve: LinuxElfLoader::load failed: ENOENT
+        //   unhandled page fault ... -> SIGSEGV
+        //
+        // Alpine has no such split -- there /bin IS /usr/bin -- so nothing in
+        // the apk closure supplies it either. A relative symlink to busybox,
+        // which dispatches on argv[0], is the whole fix; apk may later install
+        // a real coreutils `env` over it, which is equally fine.
+        #[cfg(unix)]
+        if let Some(rootfs) = bin.parent() {
+            let usr_bin = rootfs.join("usr/bin");
+            let _ = fs::create_dir_all(&usr_bin);
+            let link = usr_bin.join("env");
+            if !link.exists() && !link.is_symlink() {
+                let _ = std::os::unix::fs::symlink("../../bin/busybox", &link);
             }
         }
     }
@@ -3653,6 +3687,41 @@ fn check_so<P: AsRef<Path>>(path: P) -> bool {
 #[cfg(test)]
 mod var_run_tests {
     use super::*;
+
+    /// `#!/usr/bin/env <cmd>` is the most common shebang in existence, and
+    /// Eclipse shipped with no `/usr/bin/env` -- only `/bin/env` -- so every
+    /// script using it failed to exec. The link must be relative (the rootfs is
+    /// assembled on the host and mounted at a different root in the guest) and
+    /// must point at busybox, which dispatches on argv[0].
+    #[test]
+    fn usr_bin_env_is_linked_to_busybox() {
+        let dir =
+            std::env::temp_dir().join(format!("eclipse-usrbinenv-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        LinuxRootfs::ensure_busybox_applets(&bin);
+
+        let link = dir.join("usr/bin/env");
+        assert!(
+            link.is_symlink(),
+            "no /usr/bin/env: every `#!/usr/bin/env ...` script fails to exec"
+        );
+        let target = fs::read_link(&link).unwrap();
+        assert!(
+            target.is_relative(),
+            "/usr/bin/env must not point at a host-absolute path: {target:?}"
+        );
+        // Resolved from /usr/bin, the target must name the rootfs's busybox.
+        assert_eq!(
+            dir.join("usr/bin").join(&target),
+            dir.join("usr/bin/../../bin/busybox"),
+            "the link must resolve to /bin/busybox inside the rootfs, not {target:?}"
+        );
+        // And the applet it shadows in /bin is still there.
+        assert!(bin.join("env").is_symlink());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// The session-bus wrapper must be valid POSIX shell, must prefer Alpine's
     /// dbus-daemon over Eclipse's own daemon, must bind the SAME address every
