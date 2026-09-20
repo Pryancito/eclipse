@@ -284,11 +284,13 @@ pub struct AuxPacket {
 /// Decode a PS/2 aux packet. `bytes` holds `proto.packet_len()` valid bytes.
 ///
 /// The wheel sign conventions are Linux's, verbatim (`psmouse_process_byte`):
-/// IntelliMouse's 8-bit Z is negated into `REL_WHEEL`, while the Explorer's
-/// 4- and 6-bit fields are plain two's complement and are NOT. The asymmetry
-/// is real and deliberate in the kernel; copying it is the point, because
-/// these are the numbers every Linux desktop's scroll direction was
-/// calibrated against.
+/// every PS/2 wheel field is NEGATED into `REL_WHEEL`/`REL_HWHEEL`, because
+/// a PS/2 mouse counts Z positive toward the user while evdev counts
+/// `REL_WHEEL` positive away from it. Linux spells the Explorer's cases as
+/// `-sign_extend32(packet[3], 3)` and `-sign_extend32(packet[3], 5)`; the
+/// bit arithmetic below is those expressions with the negation folded in.
+/// Copying the kernel is the point: these are the numbers every Linux
+/// desktop's scroll direction was calibrated against.
 pub fn decode_aux_packet(proto: Ps2MouseProto, bytes: &[u8; 4]) -> AuxPacket {
     let flags = bytes[0];
     let dx = if flags & 0x10 != 0 {
@@ -318,10 +320,13 @@ pub fn decode_aux_packet(proto: Ps2MouseProto, bytes: &[u8; 4]) -> AuxPacket {
             match z & 0xC0 {
                 // Explorer 4.0 tilts the wheel: bits 0..5 are a 6-bit signed
                 // delta, and bits 6/7 say which axis it belongs to.
-                0x80 => pkt.wheel = -(((z & 32) as i32) - ((z & 31) as i32)),
-                0x40 => pkt.hwheel = -(((z & 32) as i32) - ((z & 31) as i32)),
+                // `(z & 32) - (z & 31)` is `-sign_extend32(z, 5)`, negation
+                // included; bits 6/7 fall outside the field and drop out.
+                0x80 => pkt.wheel = ((z & 32) as i32) - ((z & 31) as i32),
+                0x40 => pkt.hwheel = ((z & 32) as i32) - ((z & 31) as i32),
                 _ => {
-                    pkt.wheel = -(((z & 8) as i32) - ((z & 7) as i32));
+                    // Likewise `-sign_extend32(z, 3)` over the low nibble.
+                    pkt.wheel = ((z & 8) as i32) - ((z & 7) as i32);
                     pkt.buttons |= ((z >> 4) & 1) << 3; // BTN_SIDE
                     pkt.buttons |= ((z >> 5) & 1) << 4; // BTN_EXTRA
                 }
@@ -597,11 +602,18 @@ mod tests {
 
     #[test]
     fn explorer_wheel_and_extra_buttons() {
-        // 4-bit wheel: 0x01 is one detent, 0x0f is one the other way.
+        // 4-bit wheel, negated like every other PS/2 wheel field:
+        // `-sign_extend32(0x01, 3)` is -1 and `-sign_extend32(0x0f, 3)` is +1.
         let a = decode_aux_packet(Ps2MouseProto::Imex, &pkt([0x08, 0, 0, 0x01]));
-        assert_eq!(a.wheel, 1);
+        assert_eq!(a.wheel, -1);
         let b = decode_aux_packet(Ps2MouseProto::Imex, &pkt([0x08, 0, 0, 0x0f]));
-        assert_eq!(b.wheel, -1);
+        assert_eq!(b.wheel, 1);
+        // Both protocols agree on direction for the same physical motion:
+        // one detent of IntelliMouse z=0x01 is also -1.
+        assert_eq!(
+            decode_aux_packet(Ps2MouseProto::Imps, &pkt([0x08, 0, 0, 0x01])).wheel,
+            a.wheel
+        );
         // Buttons 4 and 5 ride in bits 4 and 5 of the same byte.
         let c = decode_aux_packet(Ps2MouseProto::Imex, &pkt([0x08, 0, 0, 0x10]));
         assert_eq!(c.buttons, 1 << 3);
@@ -611,16 +623,17 @@ mod tests {
 
     #[test]
     fn explorer_4_tilt_is_horizontal() {
-        // 0x40 selects the horizontal axis, 6-bit signed payload in bits 0..5.
-        let right = decode_aux_packet(Ps2MouseProto::Imex, &pkt([0x08, 0, 0, 0x40 | 0x01]));
-        assert_eq!(right.hwheel, 1);
-        assert_eq!(right.wheel, 0);
-        let left = decode_aux_packet(Ps2MouseProto::Imex, &pkt([0x08, 0, 0, 0x40 | 0x3f]));
-        assert_eq!(left.hwheel, -1);
+        // 0x40 selects the horizontal axis, 6-bit signed payload in bits 0..5,
+        // negated: `-sign_extend32(0x41, 5)` is -1.
+        let a = decode_aux_packet(Ps2MouseProto::Imex, &pkt([0x08, 0, 0, 0x40 | 0x01]));
+        assert_eq!(a.hwheel, -1);
+        assert_eq!(a.wheel, 0);
+        let b = decode_aux_packet(Ps2MouseProto::Imex, &pkt([0x08, 0, 0, 0x40 | 0x3f]));
+        assert_eq!(b.hwheel, 1);
         // 0x80 is the vertical one, and must not set any extra button even
         // though bits 4 and 5 of the payload are inside its 6-bit field.
         let vert = decode_aux_packet(Ps2MouseProto::Imex, &pkt([0x08, 0, 0, 0x80 | 0x3f]));
-        assert_eq!(vert.wheel, -1);
+        assert_eq!(vert.wheel, 1);
         assert_eq!(vert.buttons, 0);
     }
 
