@@ -944,6 +944,74 @@ pub fn nouveau_gem_add_ref(handle: u32) -> Option<u32> {
     zcore_drivers::scheme::gem_mmap::add_ref(handle, current_pid())
 }
 
+/// The holder id a KMS framebuffer's own reference on a nouveau GEM object is
+/// recorded under.
+///
+/// `gem_mmap` attributes every reference to a pid, so that a process exit can
+/// drop exactly what that process held and nothing else. A framebuffer is not
+/// a process: it outlives the `GEM_CLOSE` that drops the client's handle, and
+/// it must survive the owner's exit sweep for as long as the fb object itself
+/// exists. `u64::MAX` is never a real pid, so this entry belongs to no
+/// process, is never taken by `release_pid`, and is dropped only when the
+/// framebuffer is.
+const KMS_FB_HOLDER: u64 = u64::MAX;
+
+/// Take the framebuffer's reference on a nouveau GEM object.
+///
+/// This is Linux's contract, and the bug it fixes is the whole reason the
+/// desktop never came up on the GL/Vulkan path. wlroots creates a scanout
+/// buffer with `GEM_NEW`, calls `ADDFB2` on the handle, and then CLOSES the
+/// handle immediately -- the normal, required dance, because on Linux a
+/// `drm_framebuffer` holds its own reference on the GEM object and the buffer
+/// stays alive until `RMFB`. Here nothing held that reference: the close was
+/// the last one, `nouveau_gem_close` handed the VRAM back to the RM, and
+/// `retire_framebuffers_for_handle` retired the framebuffer that had just been
+/// created. Every `SETCRTC` on it then answered `ENOENT` -- the
+/// "connector HDMI-A-1: Failed to set CRTC: No such file or directory" storm,
+/// at frame rate, for the life of the session.
+///
+/// A dumb buffer has held this reference all along, as an `Arc<VmObject>` in
+/// `fb_backing`; a nouveau GEM object has no `VmObject` to take one on, so the
+/// reference goes in `gem_mmap` instead. Low-range (dumb/generic) handles are
+/// not tracked there and are left alone.
+fn fb_take_gem_ref(handle_id: u32) {
+    if handle_id < zcore_drivers::scheme::gem_mmap::DRIVER_HANDLE_BASE {
+        return;
+    }
+    zcore_drivers::scheme::gem_mmap::add_ref(handle_id, KMS_FB_HOLDER);
+}
+
+/// Release the reference [`fb_take_gem_ref`] took, freeing the GEM object when
+/// it was the last one.
+///
+/// Routed through the driver's own `GEM_CLOSE` rather than a bare `dec_ref`,
+/// because dropping the LAST reference has to do everything a client's close
+/// does -- drain the VM_BIND mappings and give the memory back to the RM --
+/// not merely forget the mapping. When other holders remain (the client still
+/// has its handle open) nothing is freed and this is just one holder letting
+/// go.
+fn fb_drop_gem_ref(handle_id: u32) {
+    if handle_id < zcore_drivers::scheme::gem_mmap::DRIVER_HANDLE_BASE {
+        return;
+    }
+    if zcore_drivers::scheme::gem_mmap::lookup(handle_id).is_none() {
+        // Already gone (the object was freed under us and the fb is being
+        // retired in the same breath -- see `retire_framebuffers_for_handle`).
+        return;
+    }
+    match get_primary_driver() {
+        Some(driver) => {
+            driver.nouveau_gem_close(handle_id, KMS_FB_HOLDER);
+        }
+        // No driver to hand the memory back to. Still give up the reference,
+        // or the table keeps a holder that nothing can ever release and the
+        // object stays "alive" forever.
+        None => {
+            zcore_drivers::scheme::gem_mmap::dec_ref(handle_id, KMS_FB_HOLDER);
+        }
+    }
+}
+
 /// Import a dma-buf (PRIME): register a new GEM handle over the same backing
 /// frames and return its id. The `VmObject` keeps the memory alive.
 pub fn import_dmabuf(phys_addr: u64, size: usize, vmo: Arc<VmObject>) -> u32 {
@@ -1095,6 +1163,10 @@ pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<
         None
     };
 
+    // Before `DRM_STATE`: this takes `gem_mmap`'s lock, and no other path
+    // nests the two in this order.
+    fb_take_gem_ref(handle_id);
+
     let mut state = DRM_STATE.lock();
     let fb_id = state.next_fb_id;
     state.next_fb_id += 1;
@@ -1110,8 +1182,9 @@ pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<
         size,
     };
 
-    // The fb takes its own reference on a dumb buffer's VMO (see
-    // `fb_backing`); a driver-private GEM object is the driver's to keep.
+    // A dumb buffer's reference is its VMO `Arc` (see `fb_backing`); a nouveau
+    // GEM object's is the `gem_mmap` holder taken just above. Either way the
+    // framebuffer now owns one, exactly as a `drm_framebuffer` does.
     let backing = state
         .handles
         .iter()
@@ -1159,10 +1232,33 @@ pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<
 /// re-present blitted whatever had been allocated there since -- persistent
 /// garbage on the panel, not a single bad frame.
 ///
-/// The normal wlroots teardown (RMFB, then close the handle) is unaffected:
-/// the fb is already gone by the time this runs.
+/// This is now a SAFETY NET, not the normal path. It used to fire on every
+/// `ADDFB2` -> `GEM_CLOSE` a GL/Vulkan compositor performs -- which is the
+/// normal dance, not a teardown: wlroots closes the buffer handle immediately
+/// after `ADDFB2` because on Linux the framebuffer holds its own reference and
+/// the buffer lives until `RMFB`. Retiring the fb there destroyed the
+/// compositor's scanout buffer seconds after it was created, and every
+/// `SETCRTC` on it answered `ENOENT` for the rest of the session. The fb now
+/// takes that reference itself (`fb_take_gem_ref`), so a client's close is
+/// never the last one while an fb exists and this cannot be reached from it.
+/// What remains is the case it was written for: the object really was freed
+/// (by a path that did not go through [`rmfb`]), and an fb left pointing into
+/// freed VRAM would be scanned out.
 pub fn retire_framebuffers_for_handle(handle_id: u32) -> usize {
     if handle_id < zcore_drivers::scheme::gem_mmap::DRIVER_HANDLE_BASE {
+        return 0;
+    }
+    // Only when the GEM object is REALLY gone. `nouveau_gem_close` answers
+    // `true` for "this close was handled", which includes the ordinary case of
+    // one holder letting go of a buffer others still reference -- so the
+    // GEM_CLOSE arm calls this on every close, not only on the last one.
+    // Retiring there destroyed live framebuffers: a compositor closing its
+    // buffer handle right after `ADDFB2` (the normal dance -- the fb holds the
+    // reference, see `fb_take_gem_ref`) lost the framebuffer it had just made.
+    // `gem_mmap`'s entry is removed by `dec_ref` the moment the last reference
+    // goes and before the RM free, so "still tracked" means "still alive" and
+    // the fb over it is still valid.
+    if zcore_drivers::scheme::gem_mmap::lookup(handle_id).is_some() {
         return 0;
     }
     let mut state = DRM_STATE.lock();
@@ -1198,16 +1294,25 @@ pub fn retire_framebuffers_for_handle(handle_id: u32) -> usize {
 }
 
 pub fn rmfb(fb_id: u32) -> bool {
-    let mut state = DRM_STATE.lock();
-    let Some(pos) = state.framebuffers.iter().position(|f| f.id == fb_id) else {
-        return false;
+    let handle_id = {
+        let mut state = DRM_STATE.lock();
+        let Some(pos) = state.framebuffers.iter().position(|f| f.id == fb_id) else {
+            return false;
+        };
+        let fb = state.framebuffers.remove(pos);
+        state.fb_backing.retain(|(id, _)| *id != fb_id);
+        if state.crtc_fb == fb_id {
+            state.crtc_fb = 0;
+        }
+        note_fb_retired(&mut state, fb_id, FbRetired::Removed);
+        fb.gem_handle_id
     };
-    state.framebuffers.remove(pos);
-    state.fb_backing.retain(|(id, _)| *id != fb_id);
-    if state.crtc_fb == fb_id {
-        state.crtc_fb = 0;
-    }
-    note_fb_retired(&mut state, fb_id, FbRetired::Removed);
+    // Outside the lock, and only once the fb is really gone: this is the fb's
+    // half of the GEM object's lifetime. For a dumb buffer the `fb_backing`
+    // `Arc` above was it; for a nouveau object it is this, and if the client
+    // has already closed its own handle then dropping it here is what finally
+    // returns the memory to the RM -- the `RMFB` that Linux frees on too.
+    fb_drop_gem_ref(handle_id);
     true
 }
 
@@ -1547,7 +1652,7 @@ fn dma_sync_gem_rect_from_device(
 /// compositor keeps re-presenting, and small enough to stay a fixed cost.
 const FB_RETIRE_HISTORY: usize = 16;
 
-/// What took a framebuffer away. See [`DrmState::fb_retirements`].
+/// What took a framebuffer away. See `DrmState::fb_retirements`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FbRetired {
     /// The client asked, with `RMFB`/`CLOSEFB`. Its own doing.
@@ -1579,7 +1684,7 @@ fn note_fb_retired(state: &mut DrmState, fb_id: u32, why: FbRetired) {
     state.fb_retirements.push_back((fb_id, why));
 }
 
-/// What took `fb_id` away, if it is one of the last [`FB_RETIRE_HISTORY`] to
+/// What took `fb_id` away, if it is one of the last `FB_RETIRE_HISTORY` to
 /// go. `None` means it was never a framebuffer of ours (or went long ago).
 pub fn fb_retired_reason(fb_id: u32) -> Option<FbRetired> {
     DRM_STATE
@@ -3594,21 +3699,21 @@ pub fn release_process(pid: u64) -> usize {
     {
         let mut state = DRM_STATE.lock();
         let before = state.framebuffers.len();
-        let taken: Vec<u32> = state
+        let taken: Vec<(u32, u32)> = state
             .framebuffers
             .iter()
             .filter(|fb| {
                 fb.gem_handle_id >= zcore_drivers::scheme::gem_mmap::DRIVER_HANDLE_BASE
                     && zcore_drivers::scheme::gem_mmap::holds(fb.gem_handle_id, pid)
             })
-            .map(|fb| fb.id)
+            .map(|fb| (fb.id, fb.gem_handle_id))
             .collect();
         state.framebuffers.retain(|fb| {
             fb.gem_handle_id < zcore_drivers::scheme::gem_mmap::DRIVER_HANDLE_BASE
                 || !zcore_drivers::scheme::gem_mmap::holds(fb.gem_handle_id, pid)
         });
-        for fb_id in taken {
-            note_fb_retired(&mut state, fb_id, FbRetired::ProcessExited);
+        for (fb_id, _) in &taken {
+            note_fb_retired(&mut state, *fb_id, FbRetired::ProcessExited);
         }
         if state.framebuffers.len() != before {
             let live: Vec<u32> = state.framebuffers.iter().map(|fb| fb.id).collect();
@@ -3616,6 +3721,15 @@ pub fn release_process(pid: u64) -> usize {
             if !state.framebuffers.iter().any(|fb| fb.id == state.crtc_fb) {
                 state.crtc_fb = 0;
             }
+        }
+        drop(state);
+        // Outside the lock: these framebuffers are gone, so the references they
+        // held go with them. Otherwise a compositor that crashed would leak
+        // every scanout buffer it ever had -- `release_pid`, which runs next in
+        // `nouveau_release_process`, drops only what the PID itself held, and
+        // the fb's reference belongs to no pid at all.
+        for (_, handle_id) in taken {
+            fb_drop_gem_ref(handle_id);
         }
     }
     let (doomed, driver) = {
@@ -4682,12 +4796,18 @@ mod nouveau_fb_lifetime_tests {
     /// never appears, so the fb (and `crtc_fb` pointing at it) survived the
     /// close and the next repaint blitted freed GEM memory. Persistent garbage
     /// on the panel, because the scanout keeps reading that address.
+    ///
+    /// "Freed" is now the precondition, not merely "somebody called close":
+    /// `gem_mmap` drops its entry when the last reference goes and before the
+    /// RM free, so an absent entry is what "the memory is gone" means here.
     #[test]
     fn closing_a_nouveau_handle_retires_the_framebuffer_over_it() {
         let handle = gem_mmap::DRIVER_HANDLE_BASE + 0x55;
         plant_nouveau_fb(9501, handle, 0);
         assert!(fb_exists(9501));
 
+        // The last reference is gone and the object with it.
+        gem_mmap::unregister(handle);
         assert_eq!(retire_framebuffers_for_handle(handle), 1);
         assert!(!fb_exists(9501), "the fb outlived the memory it points at");
         assert_eq!(
@@ -4697,6 +4817,41 @@ mod nouveau_fb_lifetime_tests {
         );
         // Idempotent: a second close finds nothing left to retire.
         assert_eq!(retire_framebuffers_for_handle(handle), 0);
+    }
+
+    /// The other half, and the one that cost a desktop. A `GEM_CLOSE` that is
+    /// NOT the last reference must leave the framebuffer alone.
+    ///
+    /// `nouveau_gem_close` answers `true` for "this close was handled", which
+    /// includes one holder letting go of a buffer others still reference -- so
+    /// the `GEM_CLOSE` arm calls `retire_framebuffers_for_handle` on every
+    /// close, not just the final one. wlroots closes its buffer handle
+    /// immediately after `ADDFB2`, because on Linux the framebuffer holds its
+    /// own reference; here that close retired the scanout buffer seconds after
+    /// it was created, and every `SETCRTC` on it answered `ENOENT` for the rest
+    /// of the session -- the "Failed to set CRTC: No such file or directory"
+    /// storm, at frame rate.
+    #[test]
+    fn a_close_that_is_not_the_last_reference_leaves_the_framebuffer_alone() {
+        let handle = gem_mmap::DRIVER_HANDLE_BASE + 0x56;
+        plant_nouveau_fb(9505, handle, 0);
+        // Still registered: other references remain, so the memory is alive.
+        assert!(gem_mmap::lookup(handle).is_some());
+
+        assert_eq!(
+            retire_framebuffers_for_handle(handle),
+            0,
+            "a live GEM object's framebuffer must survive a close"
+        );
+        assert!(fb_exists(9505), "the scanout buffer was destroyed under it");
+        assert_eq!(
+            DRM_STATE.lock().crtc_fb,
+            9505,
+            "and the CRTC still scans it out"
+        );
+
+        DRM_STATE.lock().framebuffers.retain(|fb| fb.id != 9505);
+        DRM_STATE.lock().crtc_fb = 0;
         gem_mmap::unregister(handle);
     }
 
@@ -4866,9 +5021,11 @@ mod present_error_tests {
                 size: 4096,
             });
         }
+        // The object is really gone (last reference dropped) -- the only
+        // condition under which a framebuffer is retired behind its owner.
+        zcore_drivers::scheme::gem_mmap::unregister(handle);
         assert_eq!(retire_framebuffers_for_handle(handle), 1);
         assert_eq!(fb_retired_reason(9604), Some(FbRetired::HandleClosed));
-        zcore_drivers::scheme::gem_mmap::unregister(handle);
 
         // The client's own RMFB reads differently, because it is a different
         // answer: nothing was taken from anyone.
@@ -4911,5 +5068,140 @@ mod present_error_tests {
                 assert_ne!(a.as_str(), b.as_str(), "{:?} and {:?} read alike", a, b);
             }
         }
+    }
+}
+
+/// The lifetime contract a KMS framebuffer keeps over a nouveau GEM object,
+/// and the bug that made the GL/Vulkan desktop impossible.
+///
+/// A compositor using the GL/Vulkan renderer allocates its scanout buffer with
+/// `GEM_NEW`, calls `ADDFB2` on the handle, and then CLOSES the handle right
+/// away. That is not teardown -- it is the normal, required dance, because on
+/// Linux a `drm_framebuffer` holds its own reference on the GEM object and the
+/// buffer lives until `RMFB`. Closing the handle is how a client avoids
+/// leaking handles for every buffer it ever scans out.
+///
+/// Nothing here held that reference. The close was therefore the LAST one:
+/// `nouveau_gem_close` handed the VRAM back to the RM and retired the
+/// framebuffer that had just been created. Every `SETCRTC` on it answered
+/// `ENOENT` from then on -- the wall of
+/// `connector HDMI-A-1: Failed to set CRTC: No such file or directory` at
+/// frame rate, for the whole session, with the desktop never appearing.
+///
+/// The dumb-buffer half of this contract is
+/// `gem_close_keeps_a_framebuffer_and_its_memory_alive`, which has always
+/// passed because an `Arc<VmObject>` in `fb_backing` was the reference. These
+/// are its nouveau counterpart.
+#[cfg(test)]
+mod nouveau_fb_gem_reference_tests {
+    use super::*;
+    use zcore_drivers::scheme::gem_mmap::{self, DecRef};
+
+    const CLIENT: u64 = 88_201;
+
+    /// Register a nouveau GEM object the way `GEM_NEW` does: one holder, its
+    /// creator.
+    fn gem_new(handle: u32, pid: u64) {
+        gem_mmap::register(handle, 0x40_0000, 4096, pid);
+    }
+
+    /// The regression, end to end and in the compositor's own order:
+    /// `ADDFB2`, then `GEM_CLOSE`. The close must NOT be the last reference,
+    /// because the framebuffer holds one.
+    #[test]
+    fn addfb2_then_gem_close_leaves_the_framebuffer_backed() {
+        let handle = gem_mmap::DRIVER_HANDLE_BASE + 0x81;
+        gem_new(handle, CLIENT);
+
+        let fb_id = create_fb(handle, 1, 1, 4).expect("ADDFB2 over a nouveau GEM object");
+
+        // The client lets go of its handle, exactly as wlroots does the
+        // instant ADDFB2 returns. Before the fb took a reference this was the
+        // last one: the memory went back to the RM and the fb went with it.
+        assert_eq!(
+            gem_mmap::dec_ref(handle, CLIENT),
+            DecRef::StillReferenced(1),
+            "the framebuffer's own reference must outlive the client's handle",
+        );
+        assert!(
+            gem_mmap::lookup(handle).is_some(),
+            "the GEM object must still be alive for the fb to scan out",
+        );
+
+        // And the framebuffer is still there to be presented -- this is the
+        // ENOENT storm, reduced to one assertion.
+        assert_ne!(
+            present_now_checked(fb_id, 1, None),
+            Err(PresentError::NoSuchFb),
+            "SETCRTC would have answered ENOENT for the rest of the session",
+        );
+
+        // RMFB is what finally releases it, as on Linux.
+        assert!(rmfb(fb_id));
+        assert!(
+            gem_mmap::lookup(handle).is_none(),
+            "RMFB dropped the last reference, so the object is freed",
+        );
+    }
+
+    /// The reference is the framebuffer's, not the creating process's: it has
+    /// to survive that process's exit sweep, or a buffer still being scanned
+    /// out is freed under the compositor.
+    #[test]
+    fn the_framebuffers_reference_belongs_to_no_process() {
+        let handle = gem_mmap::DRIVER_HANDLE_BASE + 0x82;
+        gem_new(handle, CLIENT);
+        let fb_id = create_fb(handle, 1, 1, 4).expect("ADDFB2 over a nouveau GEM object");
+
+        // Everything the client held goes; the fb's reference is not the
+        // client's to give up.
+        gem_mmap::release_pid(CLIENT);
+        assert!(
+            gem_mmap::lookup(handle).is_some(),
+            "a process exit must not free memory a framebuffer still names",
+        );
+
+        assert!(rmfb(fb_id));
+        assert!(gem_mmap::lookup(handle).is_none());
+    }
+
+    /// Two framebuffers over one buffer take two references, and it takes both
+    /// `RMFB`s to free it. A compositor really does this -- one fb per
+    /// modifier/format it tests a buffer with.
+    #[test]
+    fn each_framebuffer_takes_its_own_reference() {
+        let handle = gem_mmap::DRIVER_HANDLE_BASE + 0x83;
+        gem_new(handle, CLIENT);
+        let a = create_fb(handle, 1, 1, 4).expect("first ADDFB2");
+        let b = create_fb(handle, 1, 1, 4).expect("second ADDFB2");
+        assert_ne!(a, b);
+
+        assert_eq!(
+            gem_mmap::dec_ref(handle, CLIENT),
+            DecRef::StillReferenced(2)
+        );
+        assert!(rmfb(a));
+        assert!(
+            gem_mmap::lookup(handle).is_some(),
+            "the second framebuffer still names this memory",
+        );
+        assert!(rmfb(b));
+        assert!(gem_mmap::lookup(handle).is_none());
+    }
+
+    /// A dumb buffer is not tracked in `gem_mmap` at all, and must not be
+    /// touched by any of this: its reference is the `Arc<VmObject>` in
+    /// `fb_backing`, and `gem_close_keeps_a_framebuffer_and_its_memory_alive`
+    /// owns that half of the contract.
+    #[test]
+    fn a_dumb_buffer_framebuffer_takes_no_gem_reference() {
+        let low = 4242; // below DRIVER_HANDLE_BASE: a CREATE_DUMB handle
+        assert!(gem_mmap::lookup(low).is_none());
+        fb_take_gem_ref(low);
+        assert!(
+            gem_mmap::lookup(low).is_none(),
+            "a dumb handle must never appear in the nouveau table",
+        );
+        fb_drop_gem_ref(low); // and dropping one that was never taken is safe
     }
 }

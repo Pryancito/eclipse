@@ -2186,6 +2186,16 @@ impl INode for DrmDev {
                 // fails to init), the kernel text console stays usable and its
                 // logs visible instead of freezing on a black screen.
                 log::debug!("[drm] SET_MASTER (minor={})", self.minor);
+                // A new compositor session gets a fresh present-failure trace
+                // budget. The budget is what keeps a failing present from
+                // flooding the console, but as a per-BOOT count it was useless
+                // on a rig that stays up for days: the machine that produced
+                // the `Failed to set CRTC` log had been up 21 hours and had
+                // started labwc several times, so the eight lines that would
+                // have named the cause were spent on a session long gone. One
+                // compositor session is the right unit -- it is exactly one
+                // attempt at bringing the desktop up.
+                PRESENT_FAIL_TRACED.store(0, Ordering::Relaxed);
                 Ok(0)
             }
             DRM_IOCTL_DROP_MASTER => {
@@ -2572,7 +2582,13 @@ impl INode for DrmDev {
                     cmd.handle = fb.gem_handle_id;
                     Ok(0)
                 } else {
-                    Err(FsError::InvalidParam)
+                    // ENOENT, like `drm_mode_getfb`'s framebuffer lookup. This
+                    // answered EINVAL, which reached the boot log only as a
+                    // bare `[einval-hunt] ... a1=0xc01c64ad -> EINVAL` with
+                    // nothing to say the fb id was the problem -- the same
+                    // unknown-fb id that `SETCRTC` was failing on, wearing a
+                    // different errno.
+                    Err(FsError::EntryNotFound)
                 }
             }
             DRM_IOCTL_MODE_GETFB2 => {
@@ -2588,7 +2604,9 @@ impl INode for DrmDev {
                     cmd.modifier = [0; 4];
                     Ok(0)
                 } else {
-                    Err(FsError::InvalidParam)
+                    // ENOENT, like `drm_mode_getfb2_ioctl`. Same reasoning as
+                    // GETFB above.
+                    Err(FsError::EntryNotFound)
                 }
             }
             DRM_IOCTL_MODE_DIRTYFB => {
