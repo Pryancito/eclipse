@@ -5,11 +5,12 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Look {
     /// Windows 11 dark: one bottom taskbar with its buttons CENTRED,
-    /// `#202020` ground, `#0078d4` accent. What the image ships.
+    /// `#202020` ground, `#0078d4` accent.
     Win11,
     /// KDE Breeze Dark: one bottom panel, grey ground, `#3daee9` accent.
     Kde,
-    /// Eclipse's original: two bars, blue-black ground, blue accent.
+    /// Eclipse's own: two bars, blue-black ground, blue accent. The default,
+    /// and what the image ships.
     Eclipse,
 }
 
@@ -24,7 +25,7 @@ impl Look {
     }
 
     /// `$ECLIPSE_LOOK` (a launcher override) wins, then `/etc/eclipse/look`,
-    /// else Windows 11 — which is what the image ships.
+    /// else Eclipse's own look — which is what the image ships.
     pub fn current() -> Self {
         if let Some(l) = std::env::var("ECLIPSE_LOOK").ok().and_then(|v| Self::from_name(&v)) {
             return l;
@@ -32,7 +33,7 @@ impl Look {
         if let Some(l) = file_look() {
             return l;
         }
-        Look::Win11
+        Look::Eclipse
     }
 }
 

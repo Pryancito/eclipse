@@ -738,9 +738,9 @@ pub(super) fn write_fallback_icons(rootfs: &Path) {
     println!("Desktop: installed PNG content for fallback icon names under hicolor");
 }
 
-/// `/usr/local/bin/eclipse-look`: switch the desktop look between `win11`
-/// (Windows 11 dark, what the image ships), `kde` (KDE Breeze Dark) and
-/// `eclipse` (the violet original), persisted in
+/// `/usr/local/bin/eclipse-look`: switch the desktop look between `eclipse`
+/// (the violet original, what the image ships), `kde` (KDE Breeze Dark) and
+/// `win11` (Windows 11 dark), persisted in
 /// `/etc/eclipse/look` like `eclipse-kbd`/`eclipse-locale`/`eclipse-tz` do
 /// with their own settings. `--boot` is what eclipse-init runs before the
 /// compositor starts; `look=` on the kernel cmdline wins over the file.
@@ -798,7 +798,7 @@ fn write_eclipse_look(rootfs: &Path) {
           current() {\n\
           \x20 f=$(file_look)\n\
           \x20 if look_ok \"$f\"; then echo \"$f\"; return; fi\n\
-          \x20 echo win11\n\
+          \x20 echo eclipse\n\
           }\n\
           \n\
           resolve_boot() {\n\
@@ -864,7 +864,7 @@ fn write_eclipse_look(rootfs: &Path) {
     }
     let etc = rootfs.join("etc/eclipse");
     let _ = fs::create_dir_all(&etc);
-    fs::write(etc.join("look"), b"look=win11\n").unwrap();
+    fs::write(etc.join("look"), b"look=eclipse\n").unwrap();
 }
 
 /// The three launchers KDE's keyboard habits need, none of which has a KDE
@@ -1797,9 +1797,9 @@ fn write_labwc_rc(rootfs: &Path) {
        nothing else pins it (see write_labwc_environment). -->
   <core><gap>0</gap><xwaylandPersistence>yes</xwaylandPersistence></core>
   <theme>
-    <!-- Switched in place by `eclipse-look` (Win11-Dark / Breeze-Dark /
-         Eclipse-Dark). -->
-    <name>Win11-Dark</name>
+    <!-- Switched in place by `eclipse-look` (Eclipse-Dark / Breeze-Dark /
+         Win11-Dark). -->
+    <name>Eclipse-Dark</name>
     <cornerRadius>8</cornerRadius>
     <font place="ActiveWindow"><name>DejaVu Sans</name><size>10</size><weight>bold</weight></font>
     <font place="InactiveWindow"><name>DejaVu Sans</name><size>10</size></font>
@@ -2101,7 +2101,7 @@ fn write_foot_config(rootfs: &Path) {
     fs::write(dir.join("foot.eclipse.ini"), foot_ini(FOOT_ECLIPSE)).unwrap();
     fs::write(dir.join("foot.kde.ini"), foot_ini(FOOT_BREEZE)).unwrap();
     fs::write(dir.join("foot.win11.ini"), foot_ini(FOOT_CAMPBELL)).unwrap();
-    fs::write(dir.join("foot.ini"), foot_ini(FOOT_CAMPBELL)).unwrap();
+    fs::write(dir.join("foot.ini"), foot_ini(FOOT_ECLIPSE)).unwrap();
 }
 
 /// Eclipse's own violet palette.
@@ -2514,7 +2514,7 @@ mod tests {
         // and must name a theme that exists.
         let rc = fs::read_to_string(dir.join("root/.config/labwc/rc.xml")).unwrap();
         assert!(
-            rc.contains("<name>Win11-Dark</name>"),
+            rc.contains("<name>Eclipse-Dark</name>"),
             "rc.xml must name the shipped theme verbatim for eclipse-look to swap it"
         );
 
@@ -2546,7 +2546,7 @@ mod tests {
             assert!(status.success(), "eclipse-look does not parse as sh");
         }
         let conf = fs::read_to_string(dir.join("etc/eclipse/look")).unwrap();
-        assert!(conf.contains("look=win11"), "the image ships the Windows 11 look");
+        assert!(conf.contains("look=eclipse"), "the image ships Eclipse's own look");
         // Every look eclipse-look accepts must have a theme that exists, or
         // switching to it leaves labwc on its built-in defaults.
         let script = fs::read_to_string(dir.join("usr/local/bin/eclipse-look")).unwrap();
@@ -2574,9 +2574,9 @@ mod tests {
         // Both palettes present, and foot.ini a copy of the active one.
         let kde = fs::read_to_string(dir.join("root/.config/foot/foot.kde.ini")).unwrap();
         let win = fs::read_to_string(dir.join("root/.config/foot/foot.win11.ini")).unwrap();
+        let ecl = fs::read_to_string(dir.join("root/.config/foot/foot.eclipse.ini")).unwrap();
         let active = fs::read_to_string(dir.join("root/.config/foot/foot.ini")).unwrap();
-        assert!(dir.join("root/.config/foot/foot.eclipse.ini").is_file());
-        assert_eq!(win, active, "foot.ini must start as the shipped look");
+        assert_eq!(ecl, active, "foot.ini must start as the shipped look");
         assert!(kde.contains("background=232629"), "KDE terminal palette is Breeze");
         assert!(win.contains("background=0c0c0c"), "Windows terminal palette is Campbell");
         let _ = fs::remove_dir_all(&dir);
