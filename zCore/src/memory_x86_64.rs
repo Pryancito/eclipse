@@ -501,31 +501,17 @@ cfg_if! {
             }
         }
 
-        /// Attribution for the OOM in #1135. The heap dump there was five
-        /// blocks in the 64 MiB class and fifty in the 4 MiB class -- ~520 MiB
-        /// of a 512 MiB heap -- and nothing in the log said who made them.
-        /// ramfs cannot have (it stores files as 4 KiB blocks), so "memfd" was
-        /// the wrong owner. This prints the allocating call chain for the
-        /// first few blocks of each large size class at the moment they are
-        /// handed out, which is the only point where the owner is on the
-        /// stack. Bounded per class so a steady large consumer (I/O buffers)
-        /// cannot flood the console. Same no-alloc spin-serial path and
-        /// frame-pointer walk as `report_stack_double_alloc` above.
-        const BIG_ALLOC_MIN: usize = 2 * 1024 * 1024;
-        const BIG_ALLOC_REPORTS_PER_CLASS: usize = 4;
-        static BIG_ALLOC_SEEN: [AtomicUsize; HEAP_BUCKETS] =
-            [const { AtomicUsize::new(0) }; HEAP_BUCKETS];
-
-        /// Live big blocks, with the call site that asked for each.
+        /// Live big blocks (≥2 MiB), with the call site that asked for each.
         ///
-        /// `report_big_alloc` prints the first few per class as they are handed
-        /// out, which answers "who allocated this one" but not "who is holding
-        /// 400 MiB right now" — and a leak is the second question. This table
-        /// keeps the live ≥2 MiB blocks and their allocating frames, so
-        /// `/proc/kheap` can name the holders while the machine still runs.
+        /// Attribution for the OOM in #1135: the heap dump was five blocks in
+        /// the 64 MiB class and fifty in the 4 MiB class — ~520 MiB of a
+        /// 512 MiB heap — and nothing said who held them. This table keeps the
+        /// live large blocks and their allocating frames so `/proc/kheap` can
+        /// name the holders while the machine still runs.
         ///
         /// Costs nothing on the hot path: only allocations already ≥2 MiB touch
         /// it, and the walk is the same frame-pointer chain the reporters use.
+        const BIG_ALLOC_MIN: usize = 2 * 1024 * 1024;
         const BIG_TRACK_SLOTS: usize = 128;
         const BIG_TRACK_FRAMES: usize = 3;
 
@@ -679,50 +665,6 @@ cfg_if! {
             emit(format_args!(
                 "[heap-pressure] `cat /proc/kheap` names the holders of every block >= 2 MiB\n"
             ));
-        }
-
-        #[cold]
-        #[inline(never)]
-        fn report_big_alloc(ptr: usize, sz: usize) {
-            let b = bucket_of(sz);
-            if BIG_ALLOC_SEEN[b].fetch_add(1, Ordering::Relaxed) >= BIG_ALLOC_REPORTS_PER_CLASS {
-                return;
-            }
-            emit(format_args!(
-                "\n[bigalloc] {} KiB heap block at {:#x} (class <={} KiB, {} live in class, \
-                 heap used {} MiB); allocating call chain:\n",
-                sz >> 10,
-                ptr,
-                (1usize << b) >> 10,
-                HEAP_LIVE[b].load(Ordering::Relaxed),
-                HEAP_USED.load(Ordering::Relaxed) >> 20,
-            ));
-            let mut rbp: usize;
-            unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp) };
-            for _ in 0..20 {
-                if rbp == 0 || rbp & 0x7 != 0 || rbp < 0xffff_ff00_0000_0000 {
-                    break;
-                }
-                let ret = unsafe { core::ptr::read_volatile((rbp + 8) as *const usize) };
-                let next = unsafe { core::ptr::read_volatile(rbp as *const usize) };
-                if ret == 0 {
-                    break;
-                }
-                emit(format_args!(
-                    "[bigalloc]   ret={}\n",
-                    kernel_hal::ksyms::Addr(ret as u64)
-                ));
-                if next <= rbp {
-                    break;
-                }
-                rbp = next;
-            }
-            if !kernel_hal::ksyms::available() {
-                emit(format_args!(
-                    "[bigalloc] no in-kernel symbol table — symbolize with \
-                     `make sym ADDRS=\"...\"` where this kernel was built\n"
-                ));
-            }
         }
 
         /// Bytes the heap manages RIGHT NOW: the static arena plus every
@@ -1240,7 +1182,6 @@ cfg_if! {
                     note_heap_pressure(used);
                     if sz >= BIG_ALLOC_MIN {
                         track_big_alloc(p as usize, sz);
-                        report_big_alloc(p as usize, sz);
                     }
                     #[cfg(feature = "mem-debug")]
                     {

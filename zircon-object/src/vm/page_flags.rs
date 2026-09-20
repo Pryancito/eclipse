@@ -5,8 +5,8 @@
 //! was ever mapped there. Firefox reserves address space by the gigabyte (its
 //! JIT and wasm reservations are `mmap(PROT_NONE)` of 1-16 GiB), so a single
 //! such `mmap` cost 2-32 MiB of heap and a browser session held ~350 MiB of
-//! them -- the "5 x 64 MiB and 63 x 4 MiB blocks" of the OOM in #1135, named
-//! by the `[bigalloc]` tripwire as `VmMapping::new` -> `vec![flags; pages]`.
+//! them -- the "5 x 64 MiB and 63 x 4 MiB blocks" of the OOM in #1135, from
+//! `VmMapping::new` -> `vec![flags; pages]`.
 //!
 //! Protection is uniform over a mapping except where a partial `mprotect`
 //! changed a sub-range, so the flags are stored as runs: a mapping with a
