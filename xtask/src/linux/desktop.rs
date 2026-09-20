@@ -2575,7 +2575,8 @@ mod tests {
     /// actually run.
     #[test]
     fn freedoom_wrapper_parses_and_always_picks_an_iwad() {
-        let dir = std::env::temp_dir().join(format!("eclipse-freedoom-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("eclipse-freedoom-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         write_freedoom_wrapper(&dir);
         write_freedoom_desktop_entries(&dir);
@@ -2607,8 +2608,14 @@ mod tests {
             src.find("chocolate-doom").unwrap() < src.find("gzdoom").unwrap(),
             "the software engines must be tried before gzdoom"
         );
-        assert!(src.contains("LIBGL_ALWAYS_SOFTWARE=1"), "pixman needs llvmpipe");
-        assert!(src.contains("/tmp/freedoom.log"), "failures must be readable later");
+        assert!(
+            src.contains("LIBGL_ALWAYS_SOFTWARE=1"),
+            "pixman needs llvmpipe"
+        );
+        assert!(
+            src.contains("/tmp/freedoom.log"),
+            "failures must be readable later"
+        );
 
         for (file, phase) in [("freedoom1.desktop", "1"), ("freedoom2.desktop", "2")] {
             let entry =
@@ -2721,16 +2728,18 @@ mod tests {
         write_kde_helpers(&dir);
 
         // Both themes ship, so `eclipse-look` can switch either way.
-        let breeze = fs::read_to_string(
-            dir.join("usr/share/themes/Breeze-Dark/openbox-3/themerc"),
-        )
-        .unwrap();
-        assert!(breeze.contains("#3daee9"), "Breeze-Dark must use KDE's accent");
-        let win11 = fs::read_to_string(
-            dir.join("usr/share/themes/Win11-Dark/openbox-3/themerc"),
-        )
-        .unwrap();
-        assert!(win11.contains("#0078d4"), "Win11-Dark must use Windows' accent");
+        let breeze =
+            fs::read_to_string(dir.join("usr/share/themes/Breeze-Dark/openbox-3/themerc")).unwrap();
+        assert!(
+            breeze.contains("#3daee9"),
+            "Breeze-Dark must use KDE's accent"
+        );
+        let win11 =
+            fs::read_to_string(dir.join("usr/share/themes/Win11-Dark/openbox-3/themerc")).unwrap();
+        assert!(
+            win11.contains("#0078d4"),
+            "Win11-Dark must use Windows' accent"
+        );
         assert!(dir
             .join("usr/share/themes/Eclipse-Dark/openbox-3/themerc")
             .is_file());
@@ -2750,28 +2759,39 @@ mod tests {
             "/usr/local/bin/eclipse-files",
             "/usr/local/bin/eclipse-showdesktop",
         ] {
-            assert!(
-                rc.contains(cmd),
-                "rc.xml should bind a key to {cmd}"
-            );
+            assert!(rc.contains(cmd), "rc.xml should bind a key to {cmd}");
             let path = dir.join(cmd.trim_start_matches('/'));
             assert!(path.is_file(), "{cmd} is bound but not installed");
-            if let Ok(status) = std::process::Command::new("sh").arg("-n").arg(&path).status() {
+            if let Ok(status) = std::process::Command::new("sh")
+                .arg("-n")
+                .arg(&path)
+                .status()
+            {
                 assert!(status.success(), "{cmd} does not parse as sh");
             }
         }
 
         // KDE's own keys.
         for key in ["A-space", "A-F2", "C-A-T", "W-E", "W-D", "C-F1"] {
-            assert!(rc.contains(&format!("key=\"{key}\"")), "rc.xml missing {key}");
+            assert!(
+                rc.contains(&format!("key=\"{key}\"")),
+                "rc.xml missing {key}"
+            );
         }
 
         let script = dir.join("usr/local/bin/eclipse-look");
-        if let Ok(status) = std::process::Command::new("sh").arg("-n").arg(&script).status() {
+        if let Ok(status) = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&script)
+            .status()
+        {
             assert!(status.success(), "eclipse-look does not parse as sh");
         }
         let conf = fs::read_to_string(dir.join("etc/eclipse/look")).unwrap();
-        assert!(conf.contains("look=eclipse"), "the image ships Eclipse's own look");
+        assert!(
+            conf.contains("look=eclipse"),
+            "the image ships Eclipse's own look"
+        );
         // Every look eclipse-look accepts must have a theme that exists, or
         // switching to it leaves labwc on its built-in defaults.
         let script = fs::read_to_string(dir.join("usr/local/bin/eclipse-look")).unwrap();
@@ -2802,8 +2822,14 @@ mod tests {
         let ecl = fs::read_to_string(dir.join("root/.config/foot/foot.eclipse.ini")).unwrap();
         let active = fs::read_to_string(dir.join("root/.config/foot/foot.ini")).unwrap();
         assert_eq!(ecl, active, "foot.ini must start as the shipped look");
-        assert!(kde.contains("background=232629"), "KDE terminal palette is Breeze");
-        assert!(win.contains("background=0c0c0c"), "Windows terminal palette is Campbell");
+        assert!(
+            kde.contains("background=232629"),
+            "KDE terminal palette is Breeze"
+        );
+        assert!(
+            win.contains("background=0c0c0c"),
+            "Windows terminal palette is Campbell"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2820,7 +2846,9 @@ mod tests {
         write_labwc_wrapper(&dir);
         let env = fs::read_to_string(dir.join("root/.config/labwc/environment")).unwrap();
         assert!(env.lines().any(|l| l == "QT_QPA_PLATFORM=wayland;xcb"));
-        assert!(env.lines().any(|l| l == "XDG_CURRENT_DESKTOP=labwc:wlroots"));
+        assert!(env
+            .lines()
+            .any(|l| l == "XDG_CURRENT_DESKTOP=labwc:wlroots"));
         // Mentioned in a comment saying why it is absent, never as a setting.
         assert!(
             !env.lines().any(|l| {
@@ -2829,9 +2857,7 @@ mod tests {
             }),
             "no plasma-integration plugin exists here; setting the theme only warns"
         );
-        assert!(!env
-            .lines()
-            .any(|l| l.trim() == "XDG_CURRENT_DESKTOP=KDE"));
+        assert!(!env.lines().any(|l| l.trim() == "XDG_CURRENT_DESKTOP=KDE"));
         let wrapper = fs::read_to_string(dir.join("usr/local/bin/labwc")).unwrap();
         assert!(
             wrapper.contains("QT_QUICK_BACKEND:=software"),

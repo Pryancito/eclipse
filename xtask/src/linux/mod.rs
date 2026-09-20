@@ -2401,10 +2401,16 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             .join(triple)
             .join("release")
             .join("eclipse-dbusd");
-        let newest_src = ["src/main.rs", "src/bus.rs", "src/message.rs", "src/client.rs", "Cargo.toml"]
-            .iter()
-            .filter_map(|rel| fs::metadata(dir.join(rel)).ok()?.modified().ok())
-            .max();
+        let newest_src = [
+            "src/main.rs",
+            "src/bus.rs",
+            "src/message.rs",
+            "src/client.rs",
+            "Cargo.toml",
+        ]
+        .iter()
+        .filter_map(|rel| fs::metadata(dir.join(rel)).ok()?.modified().ok())
+        .max();
         if let (Ok(bin_meta), Some(src_mtime)) = (fs::metadata(&executable), newest_src) {
             if let Ok(bin_mtime) = bin_meta.modified() {
                 if bin_mtime >= src_mtime {
@@ -2469,11 +2475,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         .max();
         // BOTH must exist and be current: a tree built before lunarrun existed
         // has an up-to-date lunarbar and no runner at all.
-        if let (Ok(bin_meta), Ok(run_meta), Some(src_mtime)) = (
-            fs::metadata(&executable),
-            fs::metadata(&runner),
-            newest_src,
-        ) {
+        if let (Ok(bin_meta), Ok(run_meta), Some(src_mtime)) =
+            (fs::metadata(&executable), fs::metadata(&runner), newest_src)
+        {
             if let (Ok(bin_mtime), Ok(run_mtime)) = (bin_meta.modified(), run_meta.modified()) {
                 if bin_mtime >= src_mtime && run_mtime >= src_mtime {
                     return (executable, runner);
@@ -3658,7 +3662,8 @@ mod var_run_tests {
     /// a service's stdio to /dev/null.
     #[test]
     fn dbus_wrapper_parses_and_prefers_dbus_daemon() {
-        let dir = std::env::temp_dir().join(format!("eclipse-dbuswrap-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("eclipse-dbuswrap-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         LinuxRootfs::write_dbus_wrapper(&dir);
@@ -3679,17 +3684,26 @@ mod var_run_tests {
         );
         // Both daemons must be launched in the FOREGROUND: init supervises
         // them, and a daemon that forks away is one init would respawn forever.
-        assert!(src.contains("--nofork"), "dbus-daemon must stay in the foreground");
+        assert!(
+            src.contains("--nofork"),
+            "dbus-daemon must stay in the foreground"
+        );
         assert!(!src.contains("--fork"), "no forking daemon under init");
         // The address every session exports, and nothing else.
         assert_eq!(
             src.matches("unix:path=$BUS").count(),
-            3,
-            "both daemons plus the log line use the one address"
+            4,
+            "each daemon's log line and its --address use the one address"
         );
         assert!(src.contains("BUS=\"$XDG_RUNTIME_DIR/bus\""));
-        assert!(src.contains("/etc/machine-id"), "dbus validates the machine id");
-        assert!(src.contains("> /dev/console"), "a missing daemon must be findable");
+        assert!(
+            src.contains("/etc/machine-id"),
+            "dbus validates the machine id"
+        );
+        assert!(
+            src.contains("> /dev/console"),
+            "a missing daemon must be findable"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
