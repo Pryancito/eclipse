@@ -20,7 +20,14 @@ use super::dma::DmaRegion;
 static HAS_CLFLUSHOPT: AtomicBool = AtomicBool::new(false);
 
 /// Set at boot by [`probe_cpu_features`]; `true` when the CPU supports the
-/// `MOVNTDQA` non-temporal load (SSE4.1, CPUID.1.ECX[19]).
+/// `MOVNTDQA` non-temporal LOAD (SSE4.1, CPUID.1.ECX[19]).
+///
+/// This gates [`nt_blit_rows`] only. It used to gate [`nt_store_rows`] as well,
+/// which was wrong in a way that cost throughput silently: that path emits
+/// `MOVDQU`/`MOVNTDQ`, both **SSE2**, and SSE2 is architecturally guaranteed on
+/// every x86_64 part. A CPU without SSE4.1 was therefore pushed onto the scalar
+/// aperture path (the documented ~42 MB/s) for no reason at all. See
+/// [`has_nt_store`].
 static HAS_NT_BLIT: AtomicBool = AtomicBool::new(false);
 
 /// Detect and cache CPU features used by this module.
@@ -40,10 +47,52 @@ pub fn probe_cpu_features() {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn probe_cpu_features() {}
 
-/// Returns `true` when [`nt_store_rows`] / [`nt_blit_rows`] take the NT path.
+/// Returns `true` when [`nt_blit_rows`] takes its non-temporal **load** path
+/// (`MOVNTDQA`, SSE4.1). Not a precondition for [`nt_store_rows`] -- see
+/// [`has_nt_store`].
 #[inline]
 pub fn has_nt_blit() -> bool {
     HAS_NT_BLIT.load(Ordering::Relaxed)
+}
+
+/// Returns `true` when [`nt_store_rows`] takes its non-temporal **store** path.
+///
+/// Unconditionally true on x86_64 and false everywhere else: the path emits
+/// only `MOVDQU` and `MOVNTDQ`, which are SSE2, and the x86_64 ABI guarantees
+/// SSE2. No CPUID probe is needed, and none is consulted -- which is the point,
+/// because this used to read the SSE4.1 bit and quietly disable itself.
+#[inline]
+pub const fn has_nt_store() -> bool {
+    cfg!(target_arch = "x86_64")
+}
+
+/// Drain the CPU's write-combining store buffers (`SFENCE` on x86).
+///
+/// Every ordinary store into a write-combining aperture -- the GOP surface or
+/// BAR1 -- sits in a combine buffer until the CPU decides to flush it, and the
+/// CPU is under no obligation to do that before the scanout engine reads the
+/// same bytes. The non-temporal path already ends with an `SFENCE` "so scanout /
+/// cursor overlay cannot observe a torn last line"; the scalar paths
+/// (`fill_rect`, `copy_rect`, `blit_argb_over`, and `blit_from`'s
+/// `copy_from_slice` fallback) had no barrier of any kind, and
+/// `DisplayScheme::need_flush` is `false` for both write-combining backends, so
+/// nothing downstream supplied one either. The last line of a blit could
+/// therefore reach the panel a frame late, or half-written.
+///
+/// Cheap enough to call once per primitive: `SFENCE` orders stores already
+/// issued and does not wait on memory.
+#[inline]
+pub fn wc_store_drain() {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a plain fence with no memory operand.
+    unsafe {
+        core::arch::x86_64::_mm_sfence()
+    };
+    // Other arches: the compiler fence keeps the preceding stores from being
+    // sunk past the caller's "the frame is on screen now" point. The bare-metal
+    // targets here have no write-combining framebuffer aperture to drain.
+    #[cfg(not(target_arch = "x86_64"))]
+    fence(Ordering::Release);
 }
 
 /// Direction of a DMA cache sync (device ↔ CPU).
@@ -304,9 +353,7 @@ pub unsafe fn nt_store_rows(
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if !HAS_NT_BLIT.load(Ordering::Relaxed) {
-            return false;
-        }
+        // No CPUID gate: `MOVDQU`/`MOVNTDQ` are SSE2, guaranteed on x86_64.
         let mut xmm0_save = [0u8; 16];
         unsafe {
             core::arch::asm!(
@@ -395,4 +442,81 @@ pub unsafe fn nt_blit_rows(
     #[cfg(not(target_arch = "x86_64"))]
     let _ = (dst, dst_stride, src, src_stride, width_bytes, height);
     false
+}
+
+/// Tests for the CPU-feature gating of the non-temporal paths and for the
+/// write-combining drain. Both are about the framebuffer aperture: what reaches
+/// it, and when the CPU is obliged to let it go.
+#[cfg(test)]
+mod wc_tests {
+    use super::*;
+
+    /// The regression this guards. `nt_store_rows` emits `MOVDQU` and `MOVNTDQ`
+    /// -- both SSE2, which the x86_64 ABI guarantees -- but it was gated on
+    /// `HAS_NT_BLIT`, probed from the **SSE4.1** bit CPUID.1.ECX[19]. On a
+    /// machine without SSE4.1 every framebuffer blit silently fell back to the
+    /// scalar aperture path (the documented ~42 MB/s), for no reason. Worse, the
+    /// flag starts out `false`, so the fast path was also unavailable to anything
+    /// running before `probe_cpu_features()`.
+    ///
+    /// The store path must therefore not consult any probe at all. Asserted
+    /// without calling `probe_cpu_features` first, which is the case that used
+    /// to fail regardless of the host CPU.
+    #[test]
+    fn the_non_temporal_store_path_needs_no_cpuid_probe() {
+        assert_eq!(
+            has_nt_store(),
+            cfg!(target_arch = "x86_64"),
+            "MOVNTDQ is SSE2; on x86_64 it is always available"
+        );
+        // It is a `const fn` precisely so it cannot grow a runtime probe.
+        const _: bool = has_nt_store();
+    }
+
+    /// And the load path keeps its probe, because `MOVNTDQA` really is SSE4.1.
+    /// The two must not be the same flag again.
+    #[test]
+    fn the_non_temporal_load_path_still_depends_on_the_probe() {
+        HAS_NT_BLIT.store(false, Ordering::Relaxed);
+        assert!(!has_nt_blit(), "unprobed means no non-temporal loads");
+        HAS_NT_BLIT.store(true, Ordering::Relaxed);
+        assert!(has_nt_blit());
+        // Restore whatever the real probe would say on this host.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let r1 = core::arch::x86_64::__cpuid(1);
+            HAS_NT_BLIT.store(r1.ecx & (1 << 19) != 0, Ordering::Relaxed);
+        }
+    }
+
+    /// `nt_store_rows` copies correctly with no probe having run -- the
+    /// behavioural half of the first test.
+    #[test]
+    fn non_temporal_stores_copy_every_row_without_a_probe() {
+        const W: usize = 64; // bytes, four whole WC lines
+        const H: usize = 4;
+        let src: alloc::vec::Vec<u8> = (0..W * H).map(|n| (n % 251) as u8).collect();
+        let mut dst = alloc::vec![0u8; W * H];
+        // SAFETY: both buffers hold `H` rows of `W` bytes at stride `W`, and
+        // they do not overlap.
+        let took_nt = unsafe { nt_store_rows(dst.as_mut_ptr(), W, src.as_ptr(), W, W, H) };
+        assert_eq!(took_nt, cfg!(target_arch = "x86_64"));
+        if took_nt {
+            assert_eq!(dst, src, "every row must land, byte for byte");
+        }
+    }
+
+    /// The drain has no observable result to assert -- an `SFENCE` returns
+    /// nothing and orders stores already issued. What can be pinned is that it
+    /// is callable from anywhere, cheaply and repeatedly, with nothing to
+    /// initialise: that is what lets every 2D primitive end with one, which is
+    /// the actual fix (the scalar paths had no barrier at all, and
+    /// `need_flush()` is false for both write-combining backends so nothing
+    /// above supplied one either).
+    #[test]
+    fn the_write_combining_drain_is_always_callable() {
+        for _ in 0..3 {
+            wc_store_drain();
+        }
+    }
 }
