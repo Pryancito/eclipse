@@ -2195,18 +2195,16 @@ fn draw_task(
 
     let x0 = launcher_hit.1;
     let avail = (rx - 8) - x0;
-    if n > 0 {
-        if natural > avail {
-            // Force equal widths so every window keeps a hitbox — never drop
-            // buttons with `break` (that contradicted "shrink to fit").
-            let each = if avail > gaps {
-                ((avail - gaps) / n).max(1)
-            } else {
-                1
-            };
-            for bw in widths.iter_mut() {
-                *bw = each;
-            }
+    if n > 0 && natural > avail {
+        // Force equal widths so every window keeps a hitbox — never drop
+        // buttons with `break` (that contradicted "shrink to fit").
+        let each = if avail > gaps {
+            ((avail - gaps) / n).max(1)
+        } else {
+            1
+        };
+        for bw in widths.iter_mut() {
+            *bw = each;
         }
     }
     let mut x = x0;
@@ -2464,7 +2462,13 @@ fn draw_apps(
     cv.fill_rect_a(0, 0, ow as i32, oh as i32, (0, 0, 0), 0.35);
 
     let pw = APPS_PW;
-    let px = 8;
+    // Pinned to the left edge, under the launcher — except in the Windows 11
+    // look, where the launcher itself is centred and so is its menu.
+    let px = if centered_tasks() {
+        ((ow as i32 - pw) / 2).max(8)
+    } else {
+        8
+    };
     let rows_fit = apps_rows_fit(oh as i32, bar_h);
     let shown = visible.len().clamp(1, rows_fit) as i32; // >=1: empty-state row
     let ph = APPS_HEADER_H + APPS_SEARCH_H + shown * APPS_ROW_H + APPS_PAD;
