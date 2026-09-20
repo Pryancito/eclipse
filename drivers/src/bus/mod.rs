@@ -15,6 +15,15 @@ pub fn virt_to_phys(vaddr: VirtAddr) -> PhysAddr {
     unsafe { drivers_virt_to_phys(vaddr) }
 }
 
+/// Return `pages` DMA pages starting at `paddr` to the kernel allocator.
+///
+/// # Safety
+/// The caller must guarantee no device is still reading from or writing to
+/// this memory, and that nothing else holds a pointer into it.
+pub unsafe fn dma_dealloc(paddr: PhysAddr, pages: usize) -> i32 {
+    unsafe { drivers_dma_dealloc(paddr, pages) }
+}
+
 #[allow(unused)]
 unsafe extern "C" {
     pub fn drivers_dma_alloc(pages: usize) -> PhysAddr;

@@ -60,7 +60,16 @@ const PORTSC_CHANGE_BITS: u32 =
 // PORTSC bits que son RW1C pero NO son "change" flags — escribir 1 los borra.
 // PED (bit 1) es RW1C: escribir 1 deshabilita el puerto. Siempre hay que enmascararlo
 // cuando modificamos PORTSC para no tirar accidentalmente la habilitación del puerto.
-const PORTSC_RW1C_AND_RO_MASK: u32 = PORTSC_CHANGE_BITS | (1 << 1); // incluye PED
+// Bits que NUNCA hay que reescribir desde una muestra de PORTSC:
+//   PED  (1)  RW1C: escribir 1 deshabilita el puerto.
+//   PR   (4)  RW1S: escribir 1 reasserta un reset de puerto.
+//   WPR  (31) RW1S: igual, con warm reset (USB3).
+// Reescribir un `sc` muestreado segundos antes podia, por tanto, relanzar un
+// reset de puerto en mitad de la vida del dispositivo.
+const PORTSC_RW1C_AND_RO_MASK: u32 = PORTSC_CHANGE_BITS | (1 << 1) | (1 << 4) | (1u32 << 31); // PED, PR, WPR
+/// Reintentos consecutivos de enumeracion por puerto antes de rendirse hasta
+/// el siguiente CSC.
+const PORT_ENUM_MAX_RETRIES: u8 = 3;
 const XHCI_MAX_XECP_TRAVERSAL: usize = 256;
 const XHCI_WAIT_SPIN_FACTOR: u64 = 50_000;
 
@@ -226,6 +235,17 @@ impl DmaBuf {
         (self.phys + off) as u64
     }
 
+    /// Give up ownership without freeing.
+    ///
+    /// Used on every error path where a command or a control transfer did not
+    /// complete: the controller may still be mid-DMA into this buffer, and
+    /// handing those pages back to the kernel allocator would let it scribble
+    /// over whatever is allocated there next. Leaking a few pages beats a
+    /// corruption that surfaces somewhere else entirely.
+    fn leak(self) {
+        core::mem::forget(self);
+    }
+
     fn flush(&self, off: usize, len: usize) {
         #[cfg(target_arch = "x86_64")]
         {
@@ -242,6 +262,29 @@ impl DmaBuf {
             }
         }
         let _ = (off, len);
+    }
+}
+
+impl Drop for DmaBuf {
+    /// Return the pages to the kernel.
+    ///
+    /// Until this existed the driver never freed a single DMA page: every
+    /// enumeration attempt leaked its input contexts and descriptor buffers
+    /// (a dozen pages a go, and a failed port is retried), and unplugging a
+    /// device leaked its whole device context, its transfer rings and its
+    /// report buffers. Plugging a mouse in and out was a slow memory leak with
+    /// no ceiling.
+    ///
+    /// Everything the controller can still be looking at is handed away with
+    /// [`DmaBuf::leak`] instead, so reaching here means the hardware is done
+    /// with these pages.
+    fn drop(&mut self) {
+        if self.phys == 0 || self.len == 0 {
+            return;
+        }
+        unsafe {
+            crate::bus::dma_dealloc(self.phys, self.len / PAGE_SIZE);
+        }
     }
 }
 
@@ -524,6 +567,17 @@ fn trb_evaluate_context(input_ctx: u64, slot: u8) -> Trb {
     }
 }
 
+/// Stop Endpoint (xHCI 1.2 section 4.6.9). Tells the controller to stop
+/// processing this endpoint's transfer ring, so the ring's pages can be
+/// released without the hardware still walking them.
+fn trb_stop_endpoint(slot: u8, dci: u8) -> Trb {
+    Trb {
+        p: 0,
+        status: 0,
+        ctrl: (15u32 << 10) | ((dci as u32) << 16) | ((slot as u32) << 24),
+    }
+}
+
 fn trb_reset_endpoint(slot: u8, dci: u8) -> Trb {
     Trb {
         p: 0,
@@ -746,6 +800,11 @@ impl XferRing {
             self.cycle = !self.cycle;
         }
         Ok(phys)
+    }
+
+    /// Abandon this ring's pages without freeing them; see [`DmaBuf::leak`].
+    fn leak(self) {
+        self.buf.leak();
     }
 
     fn advance_dequeue(&mut self, n: usize) {
@@ -1553,6 +1612,12 @@ pub struct XhciInner {
     hids: Vec<HidDev>,
     /// Cambios de puerto diferidos para evitar re-entrada recursiva en pop_ev.
     pending_port_changes: Vec<u8>,
+    /// Intentos consecutivos de enumeracion fallidos por puerto (indexado por
+    /// `port_id`). Acota el reintento que abre `handle_port_status_change`
+    /// cuando el puerto sigue conectado sin slot: sin esta cota, un puerto con
+    /// un dispositivo que no enumera nunca se reintentaria en cada tick,
+    /// varios segundos cada vez.
+    port_enum_fails: Vec<u8>,
     /// HID interrupt endpoints (slot, dci) that completed a transfer with an
     /// error (Stall/Babble/…) and need a Reset Endpoint + re-arm. Deferred for
     /// the same reason as `pending_port_changes`: the recovery issues commands
@@ -1676,6 +1741,7 @@ impl XhciInner {
             scratch_pages: Vec::new(),
             hids: Vec::new(),
             pending_port_changes: Vec::new(),
+            port_enum_fails: alloc::vec![0u8; max_ports as usize + 2],
             pending_ep_resets: Vec::new(),
             boot_enum_pending: true,
             halt_attempts: 0,
@@ -2602,7 +2668,16 @@ impl XhciInner {
         dev.flush(0, dev_sz);
         self.dcbaa.write_u64(slot as usize * 8, dev.sub_phys(0));
         self.dcbaa.flush(slot as usize * 8, 8);
-        self.dev_ctx[slot as usize] = Some(dev);
+        // If this slot somehow still carries a context (a retry that got the
+        // same slot back without a Disable Slot in between), the controller
+        // may still be reading it: abandon those pages rather than free them.
+        if let Some(old) = self.dev_ctx[slot as usize].replace(dev) {
+            warn!(
+                "[xhci] slot={} reused with a live device context; leaking it",
+                slot
+            );
+            old.leak();
+        }
 
         let input_sz = 33 * csz;
         let ic = DmaBuf::new(input_sz, 64)?;
@@ -2661,14 +2736,20 @@ impl XhciInner {
             ic.read_u64(ep0 + 8)
         );
 
-        self.xfer_rings[ri] = Some(ep0_ring);
+        if let Some(old) = self.xfer_rings[ri].replace(ep0_ring) {
+            old.leak();
+        }
 
         let p2 = self.cmd.push(trb_address_device(ic.sub_phys(0), slot))?;
         self.mmio.ring_db(0, 0);
-        self.wait_cmd_phys(p2)?;
-        // ic must stay alive until after wait_cmd_phys: xHC reads it asynchronously via DMA.
-        // Rust would drop it here after the semicolon, which is correct (after wait completes).
-        let _ = &ic; // force ic to live until this point
+        // `ic` must outlive the wait: the controller reads it by DMA. If the
+        // command never completes we do not know when it stops, so the pages
+        // are abandoned rather than returned to the allocator.
+        if let Err(e) = self.wait_cmd_phys(p2) {
+            ic.leak();
+            return Err(e);
+        }
+        drop(ic);
 
         warn!(
             "[xhci] Address Device completado slot={} USBSTS={:#010x}",
@@ -2696,7 +2777,14 @@ impl XhciInner {
                 .map(|r| r.buf.phys)
                 .unwrap_or(0)
         );
-        self.ep0_control_in(slot, trb_setup(0x80, 0x06, 0x0100, 0, 18, 3), &desc, 18)?;
+        if let Err(e) =
+            self.ep0_control_in(slot, trb_setup(0x80, 0x06, 0x0100, 0, 18, 3), &desc, 18)
+        {
+            // Same reasoning as `ic` above: a control transfer that did not
+            // complete leaves the controller free to write here later.
+            desc.leak();
+            return Err(e);
+        }
 
         // Invalidar caché del buffer de descriptor para ver los datos escritos por DMA.
         desc.flush(0, 64);
@@ -2748,6 +2836,7 @@ impl XhciInner {
                      EP0 stays at {}",
                     slot, real_mps, mps
                 );
+                ic_upd.leak();
             }
         }
 
@@ -2766,7 +2855,11 @@ impl XhciInner {
     ) -> DeviceResult<()> {
         let sniff = DmaBuf::new(64, 64)?;
         sniff.flush(0, 64); // evict stale zeros before DMA
-        self.ep0_control_in(slot, trb_setup(0x80, 0x06, 0x0200, 0, 9, 3), &sniff, 9)?;
+        if let Err(e) = self.ep0_control_in(slot, trb_setup(0x80, 0x06, 0x0200, 0, 9, 3), &sniff, 9)
+        {
+            sniff.leak();
+            return Err(e);
+        }
         sniff.flush(0, 64); // invalidate so CPU reads fresh DMA data
         let mut hdr = [0u8; 9];
         sniff.read_into(0, &mut hdr);
@@ -2777,12 +2870,15 @@ impl XhciInner {
         let buf_len = (total.div_ceil(64) * 64).max(64);
         let cfgb = DmaBuf::new(buf_len, 64)?;
         cfgb.flush(0, buf_len); // evict stale zeros before DMA
-        self.ep0_control_in(
+        if let Err(e) = self.ep0_control_in(
             slot,
             trb_setup(0x80, 0x06, 0x0200, 0, total as u16, 3),
             &cfgb,
             total as u32,
-        )?;
+        ) {
+            cfgb.leak();
+            return Err(e);
+        }
         cfgb.flush(0, buf_len); // invalidate so CPU reads fresh DMA data
 
         let mut raw = alloc::vec![0u8; total];
@@ -2942,6 +3038,7 @@ impl XhciInner {
             )
             .is_err()
         {
+            buf.leak();
             return None;
         }
         buf.flush(0, buf_len);
@@ -3110,14 +3207,21 @@ impl XhciInner {
             ((mps as u32) << 16) | ((report_len as u32) & 0xffff),
         );
         let ridx = Self::ri(slot, dci as u8);
-        self.xfer_rings[ridx] = Some(ir);
+        if let Some(old) = self.xfer_rings[ridx].replace(ir) {
+            old.leak();
+        }
 
+        // Flush before the doorbell, not after: the controller reads the input
+        // context by DMA the moment the command ring is rung.
+        cfg.flush(0, 33 * csz);
         let p = self
             .cmd
             .push(trb_configure_endpoint(cfg.sub_phys(0), slot))?;
-        cfg.flush(0, 33 * csz);
         self.mmio.ring_db(0, 0);
-        self.wait_cmd_phys(p)?;
+        if let Err(e) = self.wait_cmd_phys(p) {
+            cfg.leak();
+            return Err(e);
+        }
 
         // Allocate one report buffer per pre-queued TRB so the controller can
         // race ahead by HID_QUEUE_DEPTH transfers without overwriting a buffer
@@ -3583,15 +3687,26 @@ impl XhciInner {
         }
     }
 
-    fn process_irq_events(&mut self, lis: Option<&EventListener<InputEvent>>) {
+    /// Drain the event ring and deliver whatever reports it carries.
+    ///
+    /// `may_enumerate` is true only from the timer/io-wait `poll()` path.
+    /// Enumerating a port is a multi-second job -- port reset, settle delays,
+    /// a handful of EP0 control transfers each with a five-second budget --
+    /// and running it from `handle_irq` did all of that with interrupts
+    /// disabled: plugging a device in froze the machine for as long as it
+    /// took, and a device that did not answer froze it for much longer. The
+    /// port is queued in `pending_port_changes` either way; `poll()` picks it
+    /// up on the next tick, which is where the deferred boot enumeration
+    /// already runs.
+    fn process_irq_events(&mut self, lis: Option<&EventListener<InputEvent>>, may_enumerate: bool) {
         for _ in 0..512 {
             if self.pop_ev(lis).is_none() {
                 break;
             }
         }
-        // En modo poll/IRQ, procesar los cambios de puerto diferidos ahora que
-        // no estamos en medio de enumeración.
-        self.drain_pending_port_changes();
+        if may_enumerate {
+            self.drain_pending_port_changes();
+        }
         // Recover any HID endpoint that stalled during the drain above.
         self.drain_pending_ep_resets();
     }
@@ -3699,6 +3814,18 @@ impl XhciInner {
     fn handle_port_status_change(&mut self, port_id: u8) -> DeviceResult<()> {
         let off = 0x400 + (port_id as usize - 1) * 0x10;
         let sc = self.mmio.read_op(off);
+        // Acknowledge the change bits we are about to act on FIRST, and only
+        // those. Enumeration below takes seconds; the old code sampled PORTSC,
+        // enumerated, and then wrote every change bit back as acknowledged --
+        // including the CSC of an unplug that happened while it ran. That
+        // unplug was then lost for good: the slot stayed allocated, its HID
+        // interfaces stayed in the list, and nothing ever rescanned CCS, so
+        // the port was dead until reboot.
+        let acked = sc & PORTSC_CHANGE_BITS;
+        if acked != 0 {
+            self.mmio
+                .write_op(off, (sc & !PORTSC_RW1C_AND_RO_MASK) | acked);
+        }
         if (sc & (1 << 17)) != 0 {
             let ccs = (sc & 1) != 0;
             info!("[xhci] puerto {}: CSC, CCS={}", port_id, ccs);
@@ -3710,9 +3837,42 @@ impl XhciInner {
                 self.cleanup_port(port_id)?;
             }
         }
-        // Limpiar RW1C sin apagar el puerto (PP) ni tocar bits RW como PED.
-        self.mmio
-            .write_op(off, (sc & !PORTSC_RW1C_AND_RO_MASK) | PORTSC_CHANGE_BITS);
+        // Whatever the port looks like NOW is what counts. A device unplugged
+        // during enumeration leaves CCS clear here (and usually a fresh CSC);
+        // one plugged back in leaves CCS set with no slot behind it. Requeue
+        // the port in either case rather than deciding from the stale sample.
+        let now = self.mmio.read_op(off);
+        let ccs_now = (now & 1) != 0;
+        let has_slot = (1..=self.max_slots).any(|s| self.slot_port[s as usize] == port_id);
+        let fails = self
+            .port_enum_fails
+            .get_mut(port_id as usize)
+            .map(|f| {
+                if ccs_now == has_slot {
+                    *f = 0;
+                } else {
+                    *f = f.saturating_add(1);
+                }
+                *f
+            })
+            .unwrap_or(PORT_ENUM_MAX_RETRIES);
+        let disagrees = ccs_now != has_slot && fails < PORT_ENUM_MAX_RETRIES;
+        if (now & PORTSC_CHANGE_BITS) != 0 || disagrees {
+            if !self.pending_port_changes.contains(&port_id) {
+                self.pending_port_changes.push(port_id);
+            }
+            info!(
+                "[xhci] puerto {}: estado cambiado durante la enumeracion (CCS={}, slot={}), \
+                 se reexamina",
+                port_id, ccs_now, has_slot
+            );
+        } else if ccs_now != has_slot {
+            warn!(
+                "[xhci] puerto {}: CCS={} sin slot tras {} intentos; se deja quieto hasta el \
+                 proximo CSC",
+                port_id, ccs_now, fails
+            );
+        }
         Ok(())
     }
 
@@ -3729,17 +3889,64 @@ impl XhciInner {
                 "[xhci] desconexión en puerto {}, liberando slot {}",
                 port_id, slot
             );
-            let _ = self.exec_cmd(trb_disable_slot(slot));
-            self.dev_ctx[slot as usize] = None;
+            // Stop every endpoint this slot still has a ring for, so the
+            // controller is no longer walking those TRBs. Best effort: the
+            // device is already gone, and a Stop Endpoint on an endpoint that
+            // is not running answers Context State Error.
+            for ep in 1..32u8 {
+                let ri = Self::ri(slot, ep);
+                if self.xfer_rings.get(ri).is_some_and(|o| o.is_some()) {
+                    let _ = self.exec_cmd(trb_stop_endpoint(slot, ep));
+                }
+            }
+            // Take the slot out of the DCBAA BEFORE the contexts go away. The
+            // old code never did this: entry N kept pointing at a device
+            // context that was then dropped, so the controller was left with a
+            // live pointer into freed memory.
+            self.dcbaa.write_u64(slot as usize * 8, 0);
+            self.dcbaa.flush(slot as usize * 8, 8);
+            // Only a successful Disable Slot guarantees the controller has let
+            // go of this slot's contexts and rings. If it fails, the pages are
+            // abandoned instead of handed back to the allocator.
+            let disabled = self.exec_cmd(trb_disable_slot(slot)).is_ok();
+            if !disabled {
+                warn!(
+                    "[xhci] slot={} Disable Slot failed; leaking its contexts and rings \
+                     rather than handing the controller freed memory",
+                    slot
+                );
+            }
+            if let Some(dev) = self.dev_ctx[slot as usize].take() {
+                if disabled {
+                    drop(dev);
+                } else {
+                    dev.leak();
+                }
+            }
             self.slot_port[slot as usize] = 0;
             self.slot_speed[slot as usize] = 0;
             for ep in 1..32 {
                 let ri = Self::ri(slot, ep);
                 if ri < self.xfer_rings.len() {
-                    self.xfer_rings[ri] = None;
+                    if let Some(ring) = self.xfer_rings[ri].take() {
+                        if disabled {
+                            drop(ring);
+                        } else {
+                            ring.leak();
+                        }
+                    }
                 }
             }
-            self.hids.retain(|h| h.slot_id != slot);
+            if disabled {
+                self.hids.retain(|h| h.slot_id != slot);
+            } else {
+                for h in self.hids.iter_mut().filter(|h| h.slot_id == slot) {
+                    for b in h.bufs.drain(..) {
+                        b.leak();
+                    }
+                }
+                self.hids.retain(|h| h.slot_id != slot);
+            }
             // The device that was silencing every relative pointer may be the
             // one that just left.
             self.refresh_abs_pointer();
@@ -4017,6 +4224,12 @@ pub struct XhciUsbHid {
     inner: Mutex<Option<XhciInner>>,
     pub msi_vector: usize,
     halted: AtomicBool,
+    /// Lock-free summaries of `inner.hids`, refreshed by whoever already holds
+    /// the lock (the IRQ drain, every `poll()` tick and the boot enumeration).
+    /// Per controller, not global, because each `XhciUsbHid` is its own evdev
+    /// device. See `has_rel_mouse`.
+    has_rel_mouse_flag: AtomicBool,
+    has_tablet_flag: AtomicBool,
 }
 
 /// Lista global para drenar event rings desde el timer (QEMU / IRQ perdidos).
@@ -4125,7 +4338,8 @@ pub fn poll() {
                 // budget so the next halt (if any) gets its own fresh shot.
                 xi.halt_attempts = 0;
             }
-            xi.process_irq_events(Some(&d.listener));
+            xi.process_irq_events(Some(&d.listener), true);
+            d.refresh_role_flags(xi);
         }
     }
 }
@@ -4157,30 +4371,47 @@ impl XhciUsbHid {
         // draining and any later recovery.
         inner.enumerate_root_hid();
         inner.boot_enum_pending = false;
+        let has_rel_mouse_flag =
+            AtomicBool::new(inner.hids.iter().any(|h| h.protocol == HID_PROTO_MOUSE));
+        let has_tablet_flag =
+            AtomicBool::new(inner.hids.iter().any(|h| h.protocol == HID_PROTO_TABLET));
         let arc = Arc::new(Self {
             listener: EventListener::new(),
             inner: Mutex::new(Some(inner)),
             msi_vector,
             halted: AtomicBool::new(false),
+            has_rel_mouse_flag,
+            has_tablet_flag,
         });
         set_poll_instance(Some(arc.clone()));
         Ok(arc)
     }
 
+    /// Both of these are read by `capability()` and `abs_info()` from thread
+    /// context, and `capability()` is on the path the console takes while it
+    /// holds the framebuffer lock. Taking the xHCI lock there is what put this
+    /// driver in a lock cycle with `shadow_fb` (see the note on `poll()`), and
+    /// what the interrupt handler could then spin against. They are plain
+    /// summaries of `hids`, so they live in atomics that the bind and unbind
+    /// paths refresh, and reading them takes no lock at all.
     fn has_rel_mouse(&self) -> bool {
-        self.inner
-            .lock()
-            .as_ref()
-            .map(|xi| xi.hids.iter().any(|h| h.protocol == HID_PROTO_MOUSE))
-            .unwrap_or(false)
+        self.has_rel_mouse_flag.load(Ordering::Relaxed)
     }
 
     fn has_tablet(&self) -> bool {
-        self.inner
-            .lock()
-            .as_ref()
-            .map(|xi| xi.hids.iter().any(|h| h.protocol == HID_PROTO_TABLET))
-            .unwrap_or(false)
+        self.has_tablet_flag.load(Ordering::Relaxed)
+    }
+
+    /// Republish the two summaries from a state the caller already holds.
+    fn refresh_role_flags(&self, xi: &XhciInner) {
+        self.has_rel_mouse_flag.store(
+            xi.hids.iter().any(|h| h.protocol == HID_PROTO_MOUSE),
+            Ordering::Relaxed,
+        );
+        self.has_tablet_flag.store(
+            xi.hids.iter().any(|h| h.protocol == HID_PROTO_TABLET),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -4195,10 +4426,21 @@ impl Scheme for XhciUsbHid {
         if vector != self.msi_vector {
             return;
         }
-        let mut g = self.inner.lock();
+        // `try_lock`, never `lock`. This runs in interrupt context: if a
+        // thread on this same CPU is inside `debug_report()` (a `cat
+        // /proc/usbhid`) or any other holder when the MSI arrives, a blocking
+        // acquire here spins forever against a holder that cannot run until we
+        // return. `poll()` already took this route for the same reason, and it
+        // is the path that picks up whatever this turn leaves undrained: the
+        // events stay on the ring, and the io-wait tick acks and drains them.
+        let Some(mut g) = self.inner.try_lock() else {
+            return;
+        };
         if let Some(ref mut xi) = *g {
             xi.mmio.ack_host_interrupt();
-            xi.process_irq_events(Some(&self.listener));
+            // No enumeration from interrupt context -- see `process_irq_events`.
+            xi.process_irq_events(Some(&self.listener), false);
+            self.refresh_role_flags(xi);
         }
     }
 }
@@ -4287,7 +4529,13 @@ impl InputScheme for XhciUsbHid {
             self.has_rel_mouse(),
             self.has_tablet()
         );
-        let guard = self.inner.lock();
+        // `try_lock`: /proc/usbhid is a diagnostic, and blocking here is how a
+        // `cat` ends up holding the controller lock while an interrupt waits
+        // on it.
+        let Some(guard) = self.inner.try_lock() else {
+            let _ = writeln!(s, "[usbhid] controller busy (draining events)");
+            return s;
+        };
         let Some(xi) = guard.as_ref() else {
             let _ = writeln!(s, "[usbhid] controller not initialised");
             return s;
