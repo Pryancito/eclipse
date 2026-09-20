@@ -286,6 +286,7 @@ impl From<FsError> for LxError {
             FsError::BadAddress => LxError::EFAULT,
             FsError::BadState => LxError::EBADFD,
             FsError::Broken => LxError::EPIPE,
+            FsError::NoSuchDeviceOrAddress => LxError::ENXIO,
         }
     }
 }

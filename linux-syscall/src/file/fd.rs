@@ -322,6 +322,16 @@ impl Syscall<'_> {
             // master (and publishes its slave at `/dev/pts/N`). Prefer the
             // `fs/pty` registry (absolute opens already special-cased above); the
             // legacy `devfs::PtmxINode` path remains for any leftover node.
+            // `/dev/dsp` opened without write access asks for a capture
+            // stream, and there is none: Linux's OSS emulation answers
+            // EINVAL when neither direction the open asked for exists.
+            if inode
+                .downcast_ref::<linux_object::fs::devfs::DspDev>()
+                .is_some()
+                && !flags.writable()
+            {
+                return Err(LxError::EINVAL);
+            }
             let inode = prepare_open_inode(inode)?;
             let abs_path = proc.get_absolute_path(dir_fd, path)?;
             let file = File::new(inode, flags, abs_path);

@@ -70,6 +70,21 @@ pub trait AudioScheme: Scheme {
         Ok(())
     }
 
+    /// Hold the stream start back: while `hold` is set, [`write`] queues PCM
+    /// without starting the DMA engine, and clearing it starts the engine if
+    /// anything is queued (a hold set on a running stream changes nothing).
+    ///
+    /// This is what an OSS client does with `SNDCTL_DSP_SETTRIGGER` -- clear
+    /// `PCM_ENABLE_OUTPUT`, fill the buffer, set it -- and what ALSA's
+    /// `start_threshold` describes: the first write must not be what starts
+    /// the audio. Default: not supported, every write starts the stream.
+    ///
+    /// [`write`]: AudioScheme::write
+    fn set_start_hold(&self, hold: bool) -> DeviceResult {
+        let _ = hold;
+        Ok(())
+    }
+
     /// Set stereo playback gain. `left`/`right` are percents in `0..=100`;
     /// mute flags force silence on that channel regardless of percent.
     /// HDMI/DP pins have no analog volume, so implementations typically
