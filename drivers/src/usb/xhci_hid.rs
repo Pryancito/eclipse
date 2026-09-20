@@ -425,6 +425,32 @@ const TRB_EVT_PORT_STATUS: u32 = 34 << 10;
 const TRB_CC_SUCCESS: u32 = 1;
 const TRB_CC_SHORT: u32 = 13;
 
+/// The Interval field of an interrupt Endpoint Context, from the endpoint
+/// descriptor's `bInterval` and the device's xHCI speed id.
+///
+/// xHCI always expresses Interval as an exponent M of 125 µs, but USB does not
+/// say `bInterval` the same way at every speed, and the legal range of M
+/// differs too (xHCI 1.2 table 6-12). Linux does this in
+/// `xhci_get_endpoint_interval()`:
+///
+/// * High/Super speed: `bInterval` is already an exponent N of 125 µs with the
+///   period `2^(N-1)`, so M = N - 1, clamped to 0..=15.
+/// * Full/Low speed: `bInterval` is a count of 1 ms FRAMES, and one frame is
+///   eight 125 µs microframes, so M = log2(bInterval × 8), clamped to 3..=10.
+///   Passing the frame count through unchanged -- what this used to do -- asks
+///   a 10 ms mouse for one report every 2^10 × 125 µs = 128 ms, twelve times
+///   too slow, and a 1 ms or 2 ms endpoint lands on M = 1 or 2, outside the
+///   legal range, which a strict controller answers with Parameter Error.
+fn xhci_endpoint_interval(speed: u8, b_interval: u8) -> u32 {
+    if speed >= 3 {
+        (b_interval.clamp(1, 16) - 1) as u32
+    } else {
+        let microframes = (b_interval.max(1) as u32) * 8;
+        // floor(log2(microframes)), i.e. Linux's fls() - 1.
+        (31 - microframes.leading_zeros()).clamp(3, 10)
+    }
+}
+
 /// Does this transfer-event completion code leave the endpoint in the Halted
 /// state, so that it needs Reset Endpoint + Set TR Dequeue Pointer before it
 /// will run again?
@@ -1996,9 +2022,18 @@ impl XhciInner {
             for i in 0..sb as usize {
                 let pg = DmaBuf::new(PAGE_SIZE, PAGE_SIZE)?;
                 tbl.write_u64(i * 8, pg.sub_phys(0));
+                // The page was CPU-zeroed by DmaBuf::new and the controller
+                // DMAs into it from the moment RS=1; evict those dirty lines
+                // now, or a later writeback lands on controller-owned state.
+                pg.flush(0, PAGE_SIZE);
                 self.scratch_pages.push(pg);
             }
+            tbl.flush(0, sb as usize * 8);
             self.dcbaa.write_u64(0, tbl.sub_phys(0));
+            // Every per-slot DCBAA write is flushed; entry 0 -- the scratchpad
+            // array pointer, and the first thing the controller reads once
+            // DCBAAP is programmed below -- was the one that was not.
+            self.dcbaa.flush(0, 8);
             self.scratch_tbl = Some(tbl);
         }
 
@@ -2240,7 +2275,16 @@ impl XhciInner {
         let cmd_trb_phys = self.cmd.push(trb_enable_slot())?;
         self.mmio.ring_db(0, 0); // Doorbell 0: Comando
         let slot = self.wait_cmd_phys_slot(cmd_trb_phys)?;
-        if slot == 0 {
+        if slot == 0 || slot as usize > self.max_slots as usize {
+            // `slot` comes straight out of a Command Completion event. Only
+            // zero was rejected, so a controller (or a stale/replayed event)
+            // naming a slot above Max Slots panicked the kernel on the indexes
+            // below -- `slot_speed`, `slot_port` and `dev_ctx` are all sized
+            // max_slots + 1. `handle_hid_transfer_side` already bounds it.
+            error!(
+                "[xhci] slot id {} out of range (max {})",
+                slot, self.max_slots
+            );
             return Err(DeviceError::IoError);
         }
         self.slot_speed[slot as usize] = speed;
@@ -2721,18 +2765,10 @@ impl XhciInner {
 
         let ep_off = csz + csz + (dci - 1) * csz;
 
-        // Endpoint Context DW0: set Interval from the USB endpoint descriptor.
-        // For HS/SS (speed >= 3): USB bInterval is the exponent N where the period is
-        // 2^(N-1) × 125 µs, but xHCI Interval is M where the period is 2^M × 125 µs.
-        // Therefore xhci_interval = bInterval - 1 (per xHCI spec §6.2.3.6).
-        // For FS/LS: bInterval is in frames (1 ms each); the field must be at least 1.
+        // Endpoint Context DW0. Interval is bits 23:16 (xHCI 1.2 table 6-9);
+        // bits 31:24 are Max ESIT Payload Hi, RsvdZ unless LEC=1.
         let speed = self.slot_speed[slot as usize];
-        let xhci_interval = if speed >= 3 {
-            interval.saturating_sub(1).min(15)
-        } else {
-            interval.min(15).max(1)
-        };
-        cfg.write_u32(ep_off, (xhci_interval as u32) << 24);
+        cfg.write_u32(ep_off, xhci_endpoint_interval(speed, interval) << 16);
 
         // Endpoint Context DW1: Error Count field (bits 2:1) = 3 (value 3 << 1 = 0b110),
         // EP Type, Max Packet Size.  Error Count = 3 allows up to 3 retries after failure.
@@ -2765,7 +2801,16 @@ impl XhciInner {
         // we haven't dispatched yet. See HID_QUEUE_DEPTH docs for the why.
         let mut bufs = Vec::with_capacity(HID_QUEUE_DEPTH);
         for _ in 0..HID_QUEUE_DEPTH {
-            bufs.push(DmaBuf::new(report_len, 64)?);
+            let b = DmaBuf::new(report_len, 64)?;
+            // Evict the zeroing `DmaBuf::new` just did before the controller
+            // starts DMA-ing reports into this buffer. Every other DMA-in
+            // buffer here is flushed for exactly this reason (the descriptor
+            // and config-sniff buffers, and the whole event-ring segment);
+            // these four were the only ones that were not, so the first
+            // `clflush`-then-read in `dispatch_hid` could write the dirty
+            // zeros back over the report that had just landed.
+            b.flush(0, report_len);
+            bufs.push(b);
         }
         {
             let ring = self
@@ -2841,19 +2886,47 @@ impl XhciInner {
             );
         }
         if real_proto == HID_PROTO_TABLET {
-            // Not a warning: latching this silences EVERY relative pointer on
-            // the machine (the PS/2 aux and any USB mouse), for the whole
-            // session. On a VM with `usb-tablet` that is what we want; on real
-            // hardware an interface misread as absolute takes the user's mouse
-            // with it, and there is no other clue that it happened.
-            error!(
-                "[xhci] absolute USB pointer slot={} vid={:04x} pid={:04x} — from now on every \
-                 RELATIVE pointer (PS/2 aux and USB mice) is silenced",
+            warn!(
+                "[xhci] absolute USB pointer slot={} vid={:04x} pid={:04x}",
                 slot, vid, pid
             );
-            USB_ABS_POINTER.store(true, Ordering::Relaxed);
         }
+        self.refresh_abs_pointer();
         Ok(())
+    }
+
+    /// Recompute [`USB_ABS_POINTER`] from the interfaces that are bound right
+    /// now.
+    ///
+    /// This used to be a write-once latch set the moment any interface was
+    /// classified as absolute, and it is the single switch that silences every
+    /// RELATIVE pointer on the machine -- `dispatch_hid` drops USB mouse
+    /// reports while it is set, and the PS/2 aux path reads it through
+    /// `usb_abs_pointer_active()`. Two consequences of latching it, both of
+    /// which end with a user who has no pointer at all:
+    ///
+    /// * Unplugging the tablet left it set with nothing absolute remaining, so
+    ///   a USB mouse plugged in afterwards enumerated fine, counted up its
+    ///   reports in `/proc/usbhid`, and delivered nothing.
+    /// * Only a VM's absolute tablet has the double-pointer problem this
+    ///   exists to solve. A real digitiser, touchscreen or gamepad also
+    ///   declares absolute X/Y, and on real hardware that took the user's
+    ///   mouse down with it. So only the recognised VM tablets count.
+    fn refresh_abs_pointer(&self) {
+        let abs = self
+            .hids
+            .iter()
+            .any(|h| h.protocol == HID_PROTO_TABLET && is_vm_abs_tablet(h.vid, h.pid, h.if_proto));
+        if USB_ABS_POINTER.swap(abs, Ordering::Relaxed) != abs {
+            warn!(
+                "[xhci] relative pointers (PS/2 aux and USB mice) are now {}",
+                if abs {
+                    "SILENCED by a VM tablet"
+                } else {
+                    "live"
+                }
+            );
+        }
     }
 
     /// Decode and deliver the report in `bufs[dispatch_idx]`. The caller
@@ -2886,7 +2959,10 @@ impl XhciInner {
                 addr += 64;
             }
             unsafe {
-                _mm_lfence();
+                // CLFLUSH is ordered by MFENCE, not LFENCE (Intel SDM, CLFLUSH):
+                // an LFENCE here does not guarantee the invalidate completed
+                // before the loads below, which is the whole point of the flush.
+                _mm_mfence();
             }
         }
 
@@ -3287,6 +3363,9 @@ impl XhciInner {
                 }
             }
             self.hids.retain(|h| h.slot_id != slot);
+            // The device that was silencing every relative pointer may be the
+            // one that just left.
+            self.refresh_abs_pointer();
         }
         Ok(())
     }
@@ -4043,6 +4122,46 @@ mod tests {
             events,
             alloc::vec![(EV_REL, REL_HWHEEL, 1), (EV_REL, REL_HWHEEL_HI_RES, 120),]
         );
+    }
+
+    #[test]
+    fn endpoint_interval_uses_the_xhci_exponent_at_every_speed() {
+        // High speed (id 3): bInterval is already an exponent, M = N - 1.
+        assert_eq!(xhci_endpoint_interval(3, 1), 0);
+        assert_eq!(xhci_endpoint_interval(3, 8), 7);
+        assert_eq!(xhci_endpoint_interval(3, 16), 15);
+        // Out-of-range values clamp rather than wrap.
+        assert_eq!(xhci_endpoint_interval(3, 0), 0);
+        assert_eq!(xhci_endpoint_interval(3, 255), 15);
+
+        // Full/low speed (ids 1 and 2): bInterval counts 1 ms frames and the
+        // field wants log2 of the microframe count, never the frame count.
+        assert_eq!(xhci_endpoint_interval(2, 1), 3); // 1 ms  -> 8 microframes
+        assert_eq!(xhci_endpoint_interval(2, 2), 4); // 2 ms  -> 16
+        assert_eq!(xhci_endpoint_interval(1, 8), 6); // 8 ms  -> 64
+        assert_eq!(xhci_endpoint_interval(1, 10), 6); // 10 ms -> 80, floor(log2)=6
+                                                      // And it stays inside the legal 3..=10 whatever the device asks for.
+        for b in 1..=255u8 {
+            let m = xhci_endpoint_interval(1, b);
+            assert!((3..=10).contains(&m), "bInterval {} gave {}", b, m);
+        }
+    }
+
+    #[test]
+    fn the_interval_never_reaches_max_esit_payload_hi() {
+        // DW0 bits 31:24 are Max ESIT Payload Hi and RsvdZ for us; the old code
+        // shifted by 24 and put the interval there, leaving Interval itself 0.
+        // (Interval 0 IS legal at high speed -- bInterval 1 -- so the only
+        // invariant to assert is that nothing lands above bit 23.)
+        for speed in [1u8, 2, 3, 4] {
+            for b in 1..=255u8 {
+                let dw0 = xhci_endpoint_interval(speed, b) << 16;
+                assert_eq!(dw0 & 0xff00_0000, 0, "speed {} bInterval {}", speed, b);
+            }
+        }
+        // A full-speed endpoint always lands in the legal 3..=10, so its
+        // Interval field is never zero.
+        assert_ne!(xhci_endpoint_interval(2, 10) << 16 & 0x00ff_0000, 0);
     }
 
     #[test]
