@@ -807,6 +807,14 @@ impl BlockScheme for NvmeInterface {
         self.capacity
     }
 
+    // The namespace's real LBA size, as chosen by its current LBA format
+    // (Identify Namespace LBAF[FLBAS].LBADS). Reads and writes above translate
+    // 512-byte `block_id`s onto it, but the partition tables on the disk are
+    // laid out in *these* units, so the scanner needs the true value.
+    fn logical_block_size(&self) -> usize {
+        1usize << self.lba_shift
+    }
+
     /// Flush the write cache, then perform the NVMe orderly shutdown (CC.SHN =
     /// normal) and wait — bounded — for CSTS.SHST to report completion. The
     /// spec expects hosts to do this before any reset; on a DRAM-less
