@@ -2642,12 +2642,23 @@ impl INode for DrmDev {
                 // linux-object's own CREATE_DUMB/PRIME table first; a miss
                 // there might still be a driver-private handle (e.g.
                 // nouveau-uAPI GEM_NEW) the driver itself keeps track of.
-                if drm::gem_close(handle)
-                    || self
+                // A nouveau GEM object's memory goes back to the RM inside
+                // `nouveau_gem_close`, and nothing here holds a reference to
+                // it, so any framebuffer still built on it has to be retired in
+                // the same breath -- otherwise `crtc_fb` keeps pointing at
+                // memory that now belongs to someone else. Dumb buffers are
+                // deliberately NOT retired: their fb holds an `Arc` on the VMO
+                // and outlives the handle, exactly as Linux does.
+                let generic_closed = drm::gem_close(handle);
+                let driver_closed = !generic_closed
+                    && self
                         .driver()
                         .map(|d| d.nouveau_gem_close(handle, drm::current_pid()))
-                        .unwrap_or(false)
-                {
+                        .unwrap_or(false);
+                if driver_closed {
+                    drm::retire_framebuffers_for_handle(handle);
+                }
+                if generic_closed || driver_closed {
                     // Drop the shared CPU-map cache entry; any live mmap Arc
                     // keeps its pin until munmap/Drop.
                     drm::nouveau_cpu_vmo_forget(handle);
