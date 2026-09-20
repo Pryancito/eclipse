@@ -99,8 +99,24 @@ const PAL_ECLIPSE: Palette = Palette {
     border: (0x27, 0x5a, 0x9e),
 };
 
+/// Windows 11 dark: flyout `#2b2b2b` over a `#202020` ground, accent
+/// `#0078d4`, secondary text `#c5c5c5`. Drawn, not copied: no Microsoft font,
+/// icon or image is involved.
+const PAL_WIN11: Palette = Palette {
+    scrim: (0x10, 0x10, 0x10),
+    scrim_a: 0.40,
+    panel: (0x2b, 0x2b, 0x2b),
+    field: (0x1c, 0x1c, 0x1c),
+    text: (0xff, 0xff, 0xff),
+    dim: (0xc5, 0xc5, 0xc5),
+    accent: (0x00, 0x78, 0xd4),
+    sel: (0x00, 0x78, 0xd4),
+    border: (0x3d, 0x3d, 0x3d),
+};
+
 fn palette(look: Look) -> &'static Palette {
     match look {
+        Look::Win11 => &PAL_WIN11,
         Look::Kde => &PAL_KDE,
         Look::Eclipse => &PAL_ECLIPSE,
     }
@@ -267,6 +283,7 @@ struct State {
     configured: bool,
 
     pal: &'static Palette,
+    look: Look,
     lang: Lang,
     items: Vec<Item>,
     hits: Vec<usize>,
@@ -576,14 +593,22 @@ fn draw_overlay(
     let shown = st.rows().min(MAX_ROWS).max(1);
     let ph = PAD + FIELD_H + PAD + shown as i32 * ROW_H + FOOT_H + PAD;
     let px = (w as i32 - pw) / 2;
-    // Upper third, like KRunner, but never off a short screen.
-    let py = ((h as i32) / 5).min(h as i32 - ph - 24).max(24);
+    // Where the panel sits is the look's, not the layout's: Windows 11 opens
+    // Start just above the taskbar, KRunner sits in the upper third. Both are
+    // clamped so a short screen cannot push the panel off.
+    let py = match st.look {
+        Look::Win11 => (h as i32 - ph - 64).max(24),
+        _ => ((h as i32) / 5).min(h as i32 - ph - 24).max(24),
+    };
 
     // 1px accent-tinted border under the panel, drawn as a slightly larger
     // rounded rect: with no compositor shadows a borderless panel floats
     // shapelessly over the scrim.
     cv.round_rect_a(px - 1, py - 1, pw + 2, ph + 2, 9, p.border, 0.9);
-    cv.round_rect_a(px, py, pw, ph, 8, p.panel, 0.97);
+    // Windows 11's flyouts are acrylic; with no blur available in labwc, flat
+    // translucency is the honest approximation (see lunarbar's bar_alpha).
+    let panel_a = if st.look == Look::Win11 { 0.92 } else { 0.97 };
+    cv.round_rect_a(px, py, pw, ph, 8, p.panel, panel_a);
 
     // ── search field ──
     let fx = px + PAD;
@@ -1037,6 +1062,7 @@ fn new_state(toggle_desktop: bool) -> State {
         generation: 0,
         configured: false,
         pal: palette(Look::current()),
+        look: Look::current(),
         lang: Lang::current(),
         items,
         hits: Vec::new(),

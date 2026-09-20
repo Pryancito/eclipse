@@ -738,8 +738,9 @@ pub(super) fn write_fallback_icons(rootfs: &Path) {
     println!("Desktop: installed PNG content for fallback icon names under hicolor");
 }
 
-/// `/usr/local/bin/eclipse-look`: switch the desktop look between `kde`
-/// (KDE Breeze Dark) and `eclipse` (the violet original), persisted in
+/// `/usr/local/bin/eclipse-look`: switch the desktop look between `win11`
+/// (Windows 11 dark, what the image ships), `kde` (KDE Breeze Dark) and
+/// `eclipse` (the violet original), persisted in
 /// `/etc/eclipse/look` like `eclipse-kbd`/`eclipse-locale`/`eclipse-tz` do
 /// with their own settings. `--boot` is what eclipse-init runs before the
 /// compositor starts; `look=` on the kernel cmdline wins over the file.
@@ -764,11 +765,15 @@ fn write_eclipse_look(rootfs: &Path) {
           LOG=\"${HOME:-/root}/.eclipse-look.log\"\n\
           \n\
           look_ok() {\n\
-          \x20 case \"$1\" in kde|eclipse) return 0 ;; *) return 1 ;; esac\n\
+          \x20 case \"$1\" in win11|kde|eclipse) return 0 ;; *) return 1 ;; esac\n\
           }\n\
           \n\
           theme_for() {\n\
-          \x20 case \"$1\" in kde) echo Breeze-Dark ;; *) echo Eclipse-Dark ;; esac\n\
+          \x20 case \"$1\" in\n\
+          \x20 win11) echo Win11-Dark ;;\n\
+          \x20 kde) echo Breeze-Dark ;;\n\
+          \x20 *) echo Eclipse-Dark ;;\n\
+          \x20 esac\n\
           }\n\
           \n\
           file_look() {\n\
@@ -793,7 +798,7 @@ fn write_eclipse_look(rootfs: &Path) {
           current() {\n\
           \x20 f=$(file_look)\n\
           \x20 if look_ok \"$f\"; then echo \"$f\"; return; fi\n\
-          \x20 echo kde\n\
+          \x20 echo win11\n\
           }\n\
           \n\
           resolve_boot() {\n\
@@ -811,7 +816,8 @@ fn write_eclipse_look(rootfs: &Path) {
           # labwc theme, rewritten in place. Only the <name> element inside\n\
           # <theme> carries either string, so this cannot hit anything else.\n\
           \x20 if [ -f \"$RC\" ]; then\n\
-          \x20   sed -e \"s|<name>Breeze-Dark</name>|<name>$theme</name>|\" \\\n\
+          \x20   sed -e \"s|<name>Win11-Dark</name>|<name>$theme</name>|\" \\\n\
+          \x20       -e \"s|<name>Breeze-Dark</name>|<name>$theme</name>|\" \\\n\
           \x20       -e \"s|<name>Eclipse-Dark</name>|<name>$theme</name>|\" \\\n\
           \x20       \"$RC\" > \"$RC.new\" 2>/dev/null && mv \"$RC.new\" \"$RC\"\n\
           \x20 fi\n\
@@ -832,7 +838,7 @@ fn write_eclipse_look(rootfs: &Path) {
           }\n\
           \n\
           usage() {\n\
-          \x20 echo \"usage: eclipse-look [kde|eclipse|--boot]\" >&2\n\
+          \x20 echo \"usage: eclipse-look [win11|kde|eclipse|--boot]\" >&2\n\
           \x20 exit 2\n\
           }\n\
           \n\
@@ -844,7 +850,7 @@ fn write_eclipse_look(rootfs: &Path) {
           \x20 current\n\
           \x20 exit 0\n\
           \x20 ;;\n\
-          kde|eclipse)\n\
+          win11|kde|eclipse)\n\
           \x20 apply \"$1\"\n\
           \x20 echo \"$1\"\n\
           \x20 ;;\n\
@@ -858,7 +864,7 @@ fn write_eclipse_look(rootfs: &Path) {
     }
     let etc = rootfs.join("etc/eclipse");
     let _ = fs::create_dir_all(&etc);
-    fs::write(etc.join("look"), b"look=kde\n").unwrap();
+    fs::write(etc.join("look"), b"look=win11\n").unwrap();
 }
 
 /// The three launchers KDE's keyboard habits need, none of which has a KDE
@@ -1643,6 +1649,7 @@ fn write_wallpaper(rootfs: &Path) {
 /// `write_labwc_environment`). `eclipse-look` switches between the two.
 fn write_theme(rootfs: &Path) {
     write_breeze_theme(rootfs);
+    write_win11_theme(rootfs);
     let dir = rootfs.join("usr/share/themes/Eclipse-Dark/openbox-3");
     let _ = fs::create_dir_all(&dir);
     fs::write(
@@ -1676,6 +1683,54 @@ fn write_theme(rootfs: &Path) {
           osd.bg.color: #191430\n\
           osd.border.color: #6b5aa8\n\
           osd.label.text.color: #e8e4f8\n",
+    )
+    .unwrap();
+}
+
+/// Windows 11 dark, as an openbox-3 themerc: titlebar `#202020` active /
+/// `#2b2b2b` inactive, white text over `#9a9a9a`, accent `#0078d4` on the
+/// active border and on menu selection. Everything is drawn from colours —
+/// no Microsoft font, icon or wallpaper is shipped, and none is needed for
+/// the resemblance.
+///
+/// What this cannot reproduce: acrylic and Mica, the translucent BLUR behind
+/// Windows' surfaces. labwc cannot blur what is behind a surface, so the
+/// panel and the launcher use flat translucency instead (see `bar_alpha` in
+/// tools/lunarbar). Window frames stay opaque: openbox themes have no alpha.
+fn write_win11_theme(rootfs: &Path) {
+    let dir = rootfs.join("usr/share/themes/Win11-Dark/openbox-3");
+    let _ = fs::create_dir_all(&dir);
+    fs::write(
+        dir.join("themerc"),
+        b"# Eclipse OS - Windows 11 dark colours for labwc/openbox.\n\
+          border.width: 1\n\
+          padding.width: 10\n\
+          padding.height: 7\n\
+          \n\
+          window.active.border.color: #0078d4\n\
+          window.inactive.border.color: #2b2b2b\n\
+          window.active.title.bg.color: #202020\n\
+          window.inactive.title.bg.color: #2b2b2b\n\
+          window.active.label.text.color: #ffffff\n\
+          window.inactive.label.text.color: #9a9a9a\n\
+          window.active.button.unpressed.image.color: #ffffff\n\
+          window.active.button.pressed.image.color: #0078d4\n\
+          window.active.button.hover.image.color: #ffffff\n\
+          window.inactive.button.unpressed.image.color: #9a9a9a\n\
+          \n\
+          menu.title.bg.color: #202020\n\
+          menu.title.text.color: #ffffff\n\
+          menu.items.bg.color: #2b2b2b\n\
+          menu.items.text.color: #ffffff\n\
+          menu.items.disabled.text.color: #7a7a7a\n\
+          menu.items.active.bg.color: #0078d4\n\
+          menu.items.active.text.color: #ffffff\n\
+          menu.separator.color: #3d3d3d\n\
+          menu.separator.padding.height: 4\n\
+          \n\
+          osd.bg.color: #2b2b2b\n\
+          osd.border.color: #0078d4\n\
+          osd.label.text.color: #ffffff\n",
     )
     .unwrap();
 }
@@ -1742,8 +1797,9 @@ fn write_labwc_rc(rootfs: &Path) {
        nothing else pins it (see write_labwc_environment). -->
   <core><gap>0</gap><xwaylandPersistence>yes</xwaylandPersistence></core>
   <theme>
-    <!-- Switched in place by `eclipse-look` (Breeze-Dark / Eclipse-Dark). -->
-    <name>Breeze-Dark</name>
+    <!-- Switched in place by `eclipse-look` (Win11-Dark / Breeze-Dark /
+         Eclipse-Dark). -->
+    <name>Win11-Dark</name>
     <cornerRadius>8</cornerRadius>
     <font place="ActiveWindow"><name>DejaVu Sans</name><size>10</size><weight>bold</weight></font>
     <font place="InactiveWindow"><name>DejaVu Sans</name><size>10</size></font>
@@ -2044,7 +2100,8 @@ fn write_foot_config(rootfs: &Path) {
     // (a running foot keeps its colours until restarted).
     fs::write(dir.join("foot.eclipse.ini"), foot_ini(FOOT_ECLIPSE)).unwrap();
     fs::write(dir.join("foot.kde.ini"), foot_ini(FOOT_BREEZE)).unwrap();
-    fs::write(dir.join("foot.ini"), foot_ini(FOOT_BREEZE)).unwrap();
+    fs::write(dir.join("foot.win11.ini"), foot_ini(FOOT_CAMPBELL)).unwrap();
+    fs::write(dir.join("foot.ini"), foot_ini(FOOT_CAMPBELL)).unwrap();
 }
 
 /// Eclipse's own violet palette.
@@ -2063,6 +2120,14 @@ regular0=232629\nregular1=ed1515\nregular2=11d116\nregular3=f67400\n\
 regular4=1d99f3\nregular5=9b59b6\nregular6=1abc9c\nregular7=fcfcfc\n\
 bright0=7f8c8d\nbright1=c0392b\nbright2=1cdc9a\nbright3=fdbc4b\n\
 bright4=3daee9\nbright5=8e44ad\nbright6=16a085\nbright7=ffffff\n";
+
+/// Campbell, the palette Windows Terminal ships with.
+const FOOT_CAMPBELL: &str = "\
+background=0c0c0c\nforeground=cccccc\n\
+regular0=0c0c0c\nregular1=c50f1f\nregular2=13a10e\nregular3=c19c00\n\
+regular4=0037da\nregular5=881798\nregular6=3a96dd\nregular7=cccccc\n\
+bright0=767676\nbright1=e74856\nbright2=16c60c\nbright3=f9f1a5\n\
+bright4=3b78ff\nbright5=b4009e\nbright6=61d6d6\nbright7=f2f2f2\n";
 
 fn foot_ini(colors: &str) -> String {
     format!(
@@ -2417,6 +2482,136 @@ mod tests {
         let en = fs::read_to_string(dir.join("root/.config/labwc/menu.en.xml")).unwrap();
         assert!(en.contains("Keyboard (es/us)"));
         assert!(!en.contains("Teclado (es/us)"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kde_look_is_wired_through_theme_rc_and_foot() {
+        let dir = std::env::temp_dir().join(format!("eclipse-look-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_theme(&dir);
+        write_labwc_rc(&dir);
+        write_foot_config(&dir);
+        write_eclipse_look(&dir);
+        write_kde_helpers(&dir);
+
+        // Both themes ship, so `eclipse-look` can switch either way.
+        let breeze = fs::read_to_string(
+            dir.join("usr/share/themes/Breeze-Dark/openbox-3/themerc"),
+        )
+        .unwrap();
+        assert!(breeze.contains("#3daee9"), "Breeze-Dark must use KDE's accent");
+        let win11 = fs::read_to_string(
+            dir.join("usr/share/themes/Win11-Dark/openbox-3/themerc"),
+        )
+        .unwrap();
+        assert!(win11.contains("#0078d4"), "Win11-Dark must use Windows' accent");
+        assert!(dir
+            .join("usr/share/themes/Eclipse-Dark/openbox-3/themerc")
+            .is_file());
+
+        // The theme name must be on a line eclipse-look's sed can rewrite,
+        // and must name a theme that exists.
+        let rc = fs::read_to_string(dir.join("root/.config/labwc/rc.xml")).unwrap();
+        assert!(
+            rc.contains("<name>Win11-Dark</name>"),
+            "rc.xml must name the shipped theme verbatim for eclipse-look to swap it"
+        );
+
+        // Every command a keybind runs has to exist, or the key silently does
+        // nothing -- the failure mode that is hardest to notice on hardware.
+        for cmd in [
+            "/usr/local/bin/eclipse-run",
+            "/usr/local/bin/eclipse-files",
+            "/usr/local/bin/eclipse-showdesktop",
+        ] {
+            assert!(
+                rc.contains(cmd),
+                "rc.xml should bind a key to {cmd}"
+            );
+            let path = dir.join(cmd.trim_start_matches('/'));
+            assert!(path.is_file(), "{cmd} is bound but not installed");
+            if let Ok(status) = std::process::Command::new("sh").arg("-n").arg(&path).status() {
+                assert!(status.success(), "{cmd} does not parse as sh");
+            }
+        }
+
+        // KDE's own keys.
+        for key in ["A-space", "A-F2", "C-A-T", "W-E", "W-D", "C-F1"] {
+            assert!(rc.contains(&format!("key=\"{key}\"")), "rc.xml missing {key}");
+        }
+
+        let script = dir.join("usr/local/bin/eclipse-look");
+        if let Ok(status) = std::process::Command::new("sh").arg("-n").arg(&script).status() {
+            assert!(status.success(), "eclipse-look does not parse as sh");
+        }
+        let conf = fs::read_to_string(dir.join("etc/eclipse/look")).unwrap();
+        assert!(conf.contains("look=win11"), "the image ships the Windows 11 look");
+        // Every look eclipse-look accepts must have a theme that exists, or
+        // switching to it leaves labwc on its built-in defaults.
+        let script = fs::read_to_string(dir.join("usr/local/bin/eclipse-look")).unwrap();
+        for (name, theme) in [
+            ("win11", "Win11-Dark"),
+            ("kde", "Breeze-Dark"),
+            ("eclipse", "Eclipse-Dark"),
+        ] {
+            assert!(script.contains(theme), "eclipse-look does not know {theme}");
+            assert!(script.contains(name), "eclipse-look does not accept {name}");
+            assert!(dir
+                .join("usr/share/themes")
+                .join(theme)
+                .join("openbox-3/themerc")
+                .is_file());
+            assert!(
+                dir.join("root/.config/foot")
+                    .join(format!("foot.{name}.ini"))
+                    .is_file()
+                    || name == "win11" && dir.join("root/.config/foot/foot.win11.ini").is_file(),
+                "no foot palette for the {name} look"
+            );
+        }
+
+        // Both palettes present, and foot.ini a copy of the active one.
+        let kde = fs::read_to_string(dir.join("root/.config/foot/foot.kde.ini")).unwrap();
+        let win = fs::read_to_string(dir.join("root/.config/foot/foot.win11.ini")).unwrap();
+        let active = fs::read_to_string(dir.join("root/.config/foot/foot.ini")).unwrap();
+        assert!(dir.join("root/.config/foot/foot.eclipse.ini").is_file());
+        assert_eq!(win, active, "foot.ini must start as the shipped look");
+        assert!(kde.contains("background=232629"), "KDE terminal palette is Breeze");
+        assert!(win.contains("background=0c0c0c"), "Windows terminal palette is Campbell");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The Qt policy is split between the static session environment and the
+    /// wrapper (the renderer-dependent half), exactly like SDL's. What must
+    /// NOT appear is as load-bearing as what must: `QT_QPA_PLATFORMTHEME=kde`
+    /// and `XDG_CURRENT_DESKTOP=KDE` are the two lines every "KDE on labwc"
+    /// recipe recommends, and both point at pieces this image does not have.
+    #[test]
+    fn qt_policy_is_present_without_claiming_to_be_kde() {
+        let dir = std::env::temp_dir().join(format!("eclipse-qt-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_labwc_environment(&dir);
+        write_labwc_wrapper(&dir);
+        let env = fs::read_to_string(dir.join("root/.config/labwc/environment")).unwrap();
+        assert!(env.lines().any(|l| l == "QT_QPA_PLATFORM=wayland;xcb"));
+        assert!(env.lines().any(|l| l == "XDG_CURRENT_DESKTOP=labwc:wlroots"));
+        // Mentioned in a comment saying why it is absent, never as a setting.
+        assert!(
+            !env.lines().any(|l| {
+                let l = l.trim();
+                !l.starts_with('#') && l.starts_with("QT_QPA_PLATFORMTHEME=")
+            }),
+            "no plasma-integration plugin exists here; setting the theme only warns"
+        );
+        assert!(!env
+            .lines()
+            .any(|l| l.trim() == "XDG_CURRENT_DESKTOP=KDE"));
+        let wrapper = fs::read_to_string(dir.join("usr/local/bin/labwc")).unwrap();
+        assert!(
+            wrapper.contains("QT_QUICK_BACKEND:=software"),
+            "Qt Quick must fall back to its software raster on the pixman session"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

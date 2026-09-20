@@ -144,6 +144,25 @@ const PAL_KDE: Pal = Pal {
     menu_hover: (0x3d, 0xae, 0xe9),
 };
 
+/// Windows 11 dark: taskbar `#202020`, flyouts `#2b2b2b`, accent `#0078d4`,
+/// text white over secondary `#c5c5c5`, critical `#e81123`. Drawn rather than
+/// copied: no Microsoft font, icon or image is shipped or needed.
+const PAL_WIN11: Pal = Pal {
+    bar_bg: (0x20, 0x20, 0x20),
+    rule: (0x3d, 0x3d, 0x3d),
+    text: (0xff, 0xff, 0xff),
+    muted: (0xc5, 0xc5, 0xc5),
+    dim: (0x7a, 0x7a, 0x7a),
+    warn: (0xe8, 0x11, 0x23),
+    accent: (0x00, 0x78, 0xd4),
+    pill: (0x2b, 0x2b, 0x2b),
+    pill_hover: (0x3a, 0x3a, 0x3a),
+    btn_active: (0x2d, 0x2d, 0x2d),
+    white: (0xff, 0xff, 0xff),
+    menu_panel: (0x2b, 0x2b, 0x2b),
+    menu_hover: (0x3a, 0x3a, 0x3a),
+};
+
 /// The look, resolved once. Every draw reads it through `pal()`; it cannot
 /// change without restarting the panel, which is exactly what `eclipse-look`
 /// does (eclipse-init respawns it immediately).
@@ -155,15 +174,49 @@ fn look() -> Look {
 
 fn pal() -> &'static Pal {
     match look() {
+        Look::Win11 => &PAL_WIN11,
         Look::Kde => &PAL_KDE,
         Look::Eclipse => &PAL_ECLIPSE,
     }
 }
 
-/// KDE's panel is a single bottom bar; Eclipse's is a top info bar plus a
-/// bottom taskbar. The one flag both layout decisions hang off.
+/// KDE and Windows both have a single bottom bar; Eclipse's layout is a top
+/// info bar plus a bottom taskbar. The one flag both layout decisions hang off.
 fn single_bar() -> bool {
-    look() == Look::Kde
+    matches!(look(), Look::Kde | Look::Win11)
+}
+
+/// Windows 11 centres its taskbar buttons, Start included. That one detail is
+/// most of what makes a screenshot read as Windows 11 rather than as any other
+/// dark bar.
+fn centered_tasks() -> bool {
+    look() == Look::Win11
+}
+
+/// Bar opacity. Windows 11's taskbar is translucent (acrylic); labwc cannot
+/// blur what is behind a surface, so this is flat translucency — the closest
+/// honest approximation, and it does make the wallpaper read through the bar.
+/// Anything below 1.0 puts the bar on an ARGB buffer, see `configure`.
+fn bar_alpha() -> f32 {
+    match look() {
+        Look::Win11 => 0.85,
+        _ => 1.0,
+    }
+}
+
+fn translucent() -> bool {
+    bar_alpha() < 1.0
+}
+
+/// Fill a fresh bar canvas with the ground colour, honouring `bar_alpha()`.
+/// `Canvas::clear` is unconditionally opaque, which would silently defeat the
+/// ARGB buffer.
+fn clear_bar(cv: &mut Canvas, w: usize, h: usize) {
+    if translucent() {
+        cv.fill_rect_a(0, 0, w as i32, h as i32, pal().bar_bg, bar_alpha());
+    } else {
+        cv.clear(pal().bar_bg);
+    }
 }
 
 const BUFFERS: usize = 2;
@@ -757,7 +810,11 @@ impl State {
                 bw as i32,
                 bh as i32,
                 stride as i32,
-                wl_shm::Format::Xrgb8888,
+                if translucent() {
+                    wl_shm::Format::Argb8888
+                } else {
+                    wl_shm::Format::Xrgb8888
+                },
                 qh,
                 (layer_id, i, generation),
             )
@@ -831,7 +888,7 @@ impl State {
                 let data: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(bar.map.add(i * frame_size), frame_size)
                 };
-                if !cv.blit_xrgb_scaled(data, scale) {
+                if !blit_bar(&cv, data, scale) {
                     bar.busy[i] = false;
                     return;
                 }
@@ -875,7 +932,7 @@ impl State {
                 let data: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(bar.map.add(i * frame_size), frame_size)
                 };
-                if !cv.blit_xrgb_scaled(data, scale) {
+                if !blit_bar(&cv, data, scale) {
                     bar.busy[i] = false;
                     return;
                 }
@@ -1908,6 +1965,39 @@ impl State {
 /// instead of writing into shm the compositor may be reading, which both
 /// tears and corrupts the busy[] accounting via the stale Release that would
 /// follow a double-attach.
+/// Compose a bar frame onto the preview's wallpaper fill. An opaque look
+/// overwrites it; a translucent one must be BLENDED, or the preview would show
+/// premultiplied colours over the wallpaper and read far darker than the bar
+/// actually looks on screen.
+fn blit_preview(cv: &Canvas, dst: &mut [u8], w: usize, h: usize) {
+    if !translucent() {
+        let _ = cv.blit_xrgb(dst);
+        return;
+    }
+    let mut src = vec![0u8; w * h * 4];
+    if !cv.blit_argb(&mut src) {
+        return;
+    }
+    // Both buffers are B,G,R,X/A; src is premultiplied, so this is `src + dst
+    // * (1 - a)`, the same operation the compositor performs.
+    for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+        let inv = 255 - s[3] as u32;
+        for c in 0..3 {
+            d[c] = (s[c] as u32 + d[c] as u32 * inv / 255).min(255) as u8;
+        }
+        d[3] = 0xff;
+    }
+}
+
+/// Blit a finished bar frame in whichever format its buffers were created in.
+fn blit_bar(cv: &Canvas, dst: &mut [u8], scale: u32) -> bool {
+    if translucent() {
+        cv.blit_argb_scaled(dst, scale)
+    } else {
+        cv.blit_xrgb_scaled(dst, scale)
+    }
+}
+
 fn pick_buffer(bar: &mut Bar) -> Option<usize> {
     let i = if !bar.busy[bar.next] {
         bar.next
@@ -1956,7 +2046,7 @@ fn draw_task(
     (i32, i32),
     (i32, i32),
 ) {
-    cv.clear(pal().bar_bg);
+    clear_bar(cv, w, h);
     // border-top: 2px solid #6b5aa8
     cv.hline(0, 0, w as i32, pal().rule, 1.0);
     cv.hline(0, 1, w as i32, pal().rule, 1.0);
@@ -1965,17 +2055,16 @@ fn draw_task(
     let btn_h = (h as i32 - 10).max(1); // waybar: margin 3px + 2px border
     let btn_y = ((h as i32 - btn_h) / 2 + 1).max(0);
 
-    // ── left: ◑ launcher (padding 0 10px, like #custom-launcher) ──
+    // ── launcher geometry (padding 0 10px, like #custom-launcher). Where it
+    // is drawn depends on the look: pinned left, or the first item of the
+    // centred group Windows 11 puts in the middle of the bar. Both need the
+    // right side measured first, so only the size is computed here. ──
     let d = (h as i32 * 18) / 34; // ≈18px glyph in a 34px bar
     let ly = (h as i32 - d) / 2;
-    let launcher_hit = (0, 10 + d + 10);
-    if hover == Hover::Launcher {
-        cv.round_rect_a(2, btn_y, launcher_hit.1 - 4, btn_h, 6, pal().menu_hover, 0.45);
-    }
-    cv.disc_half(10, ly, d, pal().accent);
+    let launcher_w = 10 + d + 10;
 
     // ── right side first, so the taskbar knows where to stop ──
-    let left_min = launcher_hit.1 + 8;
+    let left_min = launcher_w + 8;
     let mut rx = w as i32 - 4;
     let mut clock_hit = (0, 0);
     let mut vol_hit = (0, 0);
@@ -2077,8 +2166,6 @@ fn draw_task(
 
     // ── taskbar window buttons ──
     let mut hits = Vec::new();
-    let x0 = launcher_hit.1;
-    let avail = (rx - 8) - x0;
     let n = items.len() as i32;
     let is = (btn_h - 6).clamp(12, 24);
     let icon_pad = is + 6;
@@ -2086,9 +2173,29 @@ fn draw_task(
         .iter()
         .map(|it| Canvas::text_width(&it.label) + 16 + icon_pad)
         .collect();
+    let gaps = if n > 0 { 4 * (n - 1) } else { 0 };
+    let natural: i32 = widths.iter().sum::<i32>() + gaps;
+    // Windows 11 centres Start and the window buttons as one group between
+    // the left edge and the tray. When they do not fit, it falls back to the
+    // left-pinned layout every other look uses, rather than overlapping.
+    let group = launcher_w + natural;
+    // Centred on the SCREEN, not on the space left of the tray: Windows 11
+    // puts the group in the middle of the bar and lets the tray sit where it
+    // sits. Clamped so a wide group slides left instead of running under it.
+    let lx = if centered_tasks() && group <= (rx - 8) {
+        (((w as i32 - group) / 2).max(0)).min((rx - 8 - group).max(0))
+    } else {
+        0
+    };
+    let launcher_hit = (lx, lx + launcher_w);
+    if hover == Hover::Launcher {
+        cv.round_rect_a(lx + 2, btn_y, launcher_w - 4, btn_h, 6, pal().menu_hover, 0.45);
+    }
+    cv.disc_half(lx + 10, ly, d, pal().accent);
+
+    let x0 = launcher_hit.1;
+    let avail = (rx - 8) - x0;
     if n > 0 {
-        let gaps = 4 * (n - 1);
-        let natural: i32 = widths.iter().sum::<i32>() + gaps;
         if natural > avail {
             // Force equal widths so every window keeps a hitbox — never drop
             // buttons with `break` (that contradicted "shrink to fit").
@@ -2217,7 +2324,7 @@ fn net_module(cv: &mut Canvas, right: i32, min_x: i32, ty: i32, h: i32, n: &NetR
 }
 
 fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover: Hover) -> ((i32, i32), (i32, i32), (i32, i32)) {
-    cv.clear(pal().bar_bg);
+    clear_bar(cv, w, h);
     cv.hline(0, h as i32 - 1, w as i32, pal().rule, 1.0);
     cv.hline(0, h as i32 - 2, w as i32, pal().rule, 1.0);
 
@@ -3589,7 +3696,11 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|h| (26..=64).contains(h))
-        .unwrap_or(if single_bar() { 44 } else { 34 });
+        .unwrap_or(match look() {
+            Look::Win11 => 48, // Windows 11's taskbar height
+            Look::Kde => 44,   // Plasma's default panel height
+            Look::Eclipse => 34, // what the waybar config this replaces used
+        });
     let terminal = std::env::var("LUNARBAR_TERMINAL")
         .unwrap_or_else(|_| "/usr/local/bin/eclipse-terminal".into());
 
@@ -3646,7 +3757,7 @@ fn main() {
         if !single_bar() {
             let mut cv = Canvas::new(w, bh);
             draw_info(&mut cv, w, bh, &m, Hover::None);
-            let _ = cv.blit_xrgb(&mut buf[..w * bh * 4]);
+            blit_preview(&cv, &mut buf[..w * bh * 4], w, bh);
         }
         // Bottom taskbar occupies rows [full_h-bh, full_h) with sample windows
         // (one accented to exercise the ISO-8859-1 font, one minimized, one
@@ -3676,7 +3787,7 @@ fn main() {
             // Hover the 4th sample (tid 4 — mk numbers them from 1), so the
             // preview exercises the hover highlight on a truncated button.
             draw_task(&mut cv, w, bh, &sample, &m, Hover::Task(4), &mut ic);
-            let _ = cv.blit_xrgb(&mut buf[off..off + w * bh * 4]);
+            blit_preview(&cv, &mut buf[off..off + w * bh * 4], w, bh);
         }
 
         // Optional: composite open launcher menu (LUNARBAR_DUMP_MENU=1),
