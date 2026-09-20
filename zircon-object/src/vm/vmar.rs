@@ -2428,34 +2428,78 @@ impl VmMapping {
         // than once; it only ever grows, so it errs towards "shared".
         let shared = self.vmo.is_shared_object() || self.vmo.share_count() > 1;
         let discard = !shared && (self.vmo.is_borrower() || self.vmo.is_file_backed());
-        let mut va = round_down_pages(begin.max(map_addr));
+        let start = round_down_pages(begin.max(map_addr));
         let end = round_down_pages(end);
-        while va < end {
-            let vmo_page = vmo_offset_pages + (va - map_addr) / PAGE_SIZE;
-            // (1) Zero the frame the VMO currently owns for this page. This
-            //     reaches a committed page whose PTE was dropped / turned
-            //     PROT_NONE, which a page-table walk cannot see.
-            if discard {
-                let _ = self.vmo.decommit(vmo_page * PAGE_SIZE, PAGE_SIZE);
-            } else if !shared {
+        if start >= end {
+            return;
+        }
+        // (1) Drop the PTEs for the whole range — but NOT the frames — with ONE
+        //     cross-CPU shootdown at the end (mmu-gather), exactly as
+        //     `unmap_cont` does.
+        //
+        //     This loop used to call `GenericPageTable::unmap`, the *shooting*
+        //     variant, once per 4 KiB page, and to take the page-table lock
+        //     once per page as well. `unmap`'s own doc-comment says what that
+        //     costs: "Range operations use `unmap_no_shootdown` in a loop plus
+        //     one `remote_flush_all` instead — a synchronous shootdown per page
+        //     is O(pages x ack-wait) and livelocks when a peer can't ack." Each
+        //     shootdown is an IPI to every CPU running this address space plus
+        //     a spin-wait for every one of their acks, so the cost is
+        //     O(pages x CPUs): invisible next to QEMU's handful of vCPUs and
+        //     brutal on a real desktop. mozjemalloc purges with
+        //     `MADV_DONTNEED` continuously, so a browser pays it continuously.
+        //
+        //     The PTEs go first, and the frames are only touched in (2), after
+        //     the flush. That ordering is also what makes the `discard` branch
+        //     below safe to batch: a frame handed back to the allocator can no
+        //     longer be reached through a stale TLB entry on another CPU,
+        //     because there are none left by then. (The old code decommitted a
+        //     page *before* unmapping it, so it had that window open per page.)
+        //
+        //     Dropping the PTE rather than only zeroing is the fix for the
+        //     original abort: the page table could still map this VA to a frame
+        //     the VMO no longer tracks (`committed_paddr == None`), so zeroing
+        //     through the VMO missed it and the old bytes kept being served.
+        //     Unmapping forces the next touch to re-resolve through the VMO.
+        {
+            let mut pg = self.page_table.lock();
+            let mut va = start;
+            let mut any_unmapped = false;
+            while va < end {
+                if pg.unmap_no_shootdown(va).is_ok() {
+                    any_unmapped = true;
+                }
+                va += PAGE_SIZE;
+            }
+            if any_unmapped {
+                pg.remote_flush_all();
+            }
+        }
+        // (2) Now make the pages read back as zero. This reaches a committed
+        //     page whose PTE was dropped / turned PROT_NONE, which a page-table
+        //     walk cannot see. We deliberately do NOT free frames outside the
+        //     `discard` branch (the decommit-everything variant did, and
+        //     freeing one the allocator still used turned the abort into a
+        //     SIGSEGV).
+        let first_vmo_page = vmo_offset_pages + (start - map_addr) / PAGE_SIZE;
+        if discard {
+            // ONE call for the whole range, not one per page. `decommit` runs
+            // its own `RangeChangeOp::Unmap` pass over every mapping of the
+            // VMO and ends it with a single `remote_flush_all`
+            // (`apply_range_change_locked`), so a per-page call meant a
+            // per-page cross-CPU shootdown by a second route. The range is
+            // contiguous in the VMO by construction — `vmo_page` advanced by
+            // exactly one per page — so this covers the same pages.
+            let _ = self.vmo.decommit(first_vmo_page * PAGE_SIZE, end - start);
+        } else if !shared {
+            let mut va = start;
+            while va < end {
+                let vmo_page = first_vmo_page + (va - start) / PAGE_SIZE;
                 if let Some(pa) = self.vmo.committed_paddr(vmo_page) {
                     kernel_hal::mem::pmem_zero(pa, PAGE_SIZE);
                 }
+                va += PAGE_SIZE;
             }
-            // (2) Drop the PTE — but NOT the frame. The abort actually came from
-            //     a STALE TRANSLATION: the page table still maps this VA to a
-            //     frame the VMO no longer tracks (committed_paddr == None), so
-            //     zeroing through the VMO missed it and the old bytes kept being
-            //     served. Unmapping forces the next touch to re-resolve through
-            //     the VMO — a fresh demand-zero page, or the frame just zeroed in
-            //     (1). We deliberately do NOT free any frame (the decommit
-            //     variant did, and freeing one the allocator still used turned
-            //     the abort into a SIGSEGV).
-            {
-                let mut pg = self.page_table.lock();
-                let _ = pg.unmap(va);
-            }
-            va += PAGE_SIZE;
         }
     }
 
