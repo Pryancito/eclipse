@@ -113,10 +113,19 @@ impl<'a> phy::TxToken for LoopbackTxToken<'a> {
     where
         F: FnOnce(&mut [u8]) -> Result<R>,
     {
+        // Refuse, do NOT clamp. `TxToken::consume` must hand the closure a
+        // slice of exactly `len`; shortening it makes smoltcp's own
+        // `emit_payload` `copy_from_slice` a longer payload into a shorter
+        // buffer and panic inside the kernel. Reachable from userspace: the
+        // loopback runs `Medium::Ip`, `UDP_SENDBUF` is 64 KiB, and this
+        // smoltcp has no egress MTU clamp — a single 64 KiB `sendto` to
+        // 127.0.0.1 asks for `len = 65536 + 28`.
         const MAX_TX_COPY: usize = 65536;
-        let len = len.min(MAX_TX_COPY);
+        if len > MAX_TX_COPY {
+            return Err(smoltcp::Error::Exhausted);
+        }
         let mut buffer = alloc::vec![0u8; len];
-        let result = f(&mut buffer);
+        let result = f(&mut buffer)?;
 
         let mut stats = self.stats.lock();
         stats.tx_packets += 1;
@@ -133,7 +142,7 @@ impl<'a> phy::TxToken for LoopbackTxToken<'a> {
             self.queue.pop_front();
         }
         self.queue.push_back(buffer);
-        result
+        Ok(result)
     }
 }
 
@@ -156,7 +165,12 @@ impl Scheme for LoopbackInterface {
 
 impl NetScheme for LoopbackInterface {
     fn recv(&self, _buf: &mut [u8]) -> DeviceResult<usize> {
-        unimplemented!()
+        // The loopback has no hardware RX ring; frames are delivered through
+        // `poll`. `netdev_drain_rx` skips this device by comparing its name
+        // against the literal "loopback", so `unimplemented!()` here turned a
+        // future rename (to the Linux-conventional "lo", say) into a kernel
+        // panic on a routine RX drain.
+        Err(DeviceError::NotSupported)
     }
     fn send(&self, buf: &[u8]) -> DeviceResult<usize> {
         let mut iface = self.iface.lock();

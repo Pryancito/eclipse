@@ -870,6 +870,20 @@ where
             );
             return Err("tx frame too large");
         }
+        // Reject a zero-length (or sub-Ethernet) frame too: the descriptor
+        // fill loop below is `while len != 0`, so with len == 0 it never runs.
+        // The descriptor keeps the previous frame's length bits, OWN is set
+        // anyway, the doorbell is rung, and `tx_dirty` is never advanced — so
+        // `tx_complete` computes zero occupancy and never reclaims the slot.
+        // The ring desynchronises permanently. Reachable from
+        // `NetScheme::send` with an empty buffer (a 0-byte raw-socket write).
+        if (len as usize) < 14 {
+            error!(
+                "[rtl8211f] TX frame {} bytes is shorter than an Ethernet header; dropping",
+                len
+            );
+            return Err("tx frame too short");
+        }
 
         // send buffer长度需要注意下, 应该2k左右
         let target = unsafe {
