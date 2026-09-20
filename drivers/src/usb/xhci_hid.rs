@@ -425,6 +425,48 @@ const TRB_EVT_PORT_STATUS: u32 = 34 << 10;
 const TRB_CC_SUCCESS: u32 = 1;
 const TRB_CC_SHORT: u32 = 13;
 
+/// The Interval field of an interrupt Endpoint Context, from the endpoint
+/// descriptor's `bInterval` and the device's xHCI speed id.
+///
+/// xHCI always expresses Interval as an exponent M of 125 µs, but USB does not
+/// say `bInterval` the same way at every speed, and the legal range of M
+/// differs too (xHCI 1.2 table 6-12). Linux does this in
+/// `xhci_get_endpoint_interval()`:
+///
+/// * High/Super speed: `bInterval` is already an exponent N of 125 µs with the
+///   period `2^(N-1)`, so M = N - 1, clamped to 0..=15.
+/// * Full/Low speed: `bInterval` is a count of 1 ms FRAMES, and one frame is
+///   eight 125 µs microframes, so M = log2(bInterval × 8), clamped to 3..=10.
+///   Passing the frame count through unchanged -- what this used to do -- asks
+///   a 10 ms mouse for one report every 2^10 × 125 µs = 128 ms, twelve times
+///   too slow, and a 1 ms or 2 ms endpoint lands on M = 1 or 2, outside the
+///   legal range, which a strict controller answers with Parameter Error.
+fn xhci_endpoint_interval(speed: u8, b_interval: u8) -> u32 {
+    if speed >= 3 {
+        (b_interval.clamp(1, 16) - 1) as u32
+    } else {
+        let microframes = (b_interval.max(1) as u32) * 8;
+        // floor(log2(microframes)), i.e. Linux's fls() - 1.
+        (31 - microframes.leading_zeros()).clamp(3, 10)
+    }
+}
+
+/// Does this transfer-event completion code leave the endpoint in the Halted
+/// state, so that it needs Reset Endpoint + Set TR Dequeue Pointer before it
+/// will run again?
+///
+/// xHCI 1.2 table 6-90. The codes below are the ones that reach a transfer
+/// event WITHOUT halting the endpoint, so they must not trigger a reset:
+/// Ring Underrun/Overrun (isoch), Event Ring Full, Missed Service Error (the
+/// host skipped a service interval -- routine on a busy bus), and the four
+/// Stopped codes, which are the answer to a Stop Endpoint command. Anything
+/// else -- Stall, Babble, Transaction Error, Data Buffer Error, TRB Error, or
+/// a code we do not know -- is treated as halting, because the recovery is
+/// harmless on an endpoint that did not need it and mandatory on one that did.
+fn cc_halts_endpoint(cc: u32) -> bool {
+    !matches!(cc, 14 | 15 | 21 | 23 | 24 | 25 | 26 | 27 | 28)
+}
+
 fn trb_link(phys: u64, cycle: bool) -> Trb {
     let mut c = TRB_LINK | (1 << 1);
     if cycle {
@@ -1013,6 +1055,50 @@ fn read_signed_bits(buf: &[u8], off: usize, len: usize) -> i32 {
     }
 }
 
+/// One wheel detent in the high-resolution scroll units both Linux and Windows
+/// agreed on: `REL_WHEEL_HI_RES` counts 120 per notch, so a wheel that can
+/// report fractions of a notch has somewhere to put them.
+const HI_RES_PER_DETENT: i32 = 120;
+
+/// Emit the scroll axes of one HID report the way `hidinput_handle_scroll`
+/// does: the low-resolution axis carries the raw field value and the
+/// high-resolution one carries 120 times it.
+///
+/// Two things here were wrong before and both are visible as "the wheel does
+/// not work":
+///
+/// * The sign. A HID `Wheel` (Generic Desktop usage 0x38) is positive when the
+///   wheel turns away from the user, which is exactly `REL_WHEEL` positive;
+///   `hid-input.c` passes the value straight through. We were negating it, so
+///   every scroll went the wrong way — and a desktop that scrolls backwards is
+///   reported as one that does not scroll. (The negation is correct for the
+///   PS/2 IntelliMouse byte, where it came from; USB is not PS/2.)
+/// * The missing high-resolution axis. Linux has emitted `REL_WHEEL_HI_RES`
+///   for every HID mouse since 5.0 and libinput's wheel state machine works in
+///   those units, synthesising them from the low-resolution axis only when the
+///   device does not advertise them. Emitting both is what a real mouse looks
+///   like.
+fn emit_scroll(lis: &EventListener<InputEvent>, wheel: i32, hwheel: i32) {
+    for (value, lo, hi) in [
+        (wheel, REL_WHEEL, REL_WHEEL_HI_RES),
+        (hwheel, REL_HWHEEL, REL_HWHEEL_HI_RES),
+    ] {
+        if value == 0 {
+            continue;
+        }
+        lis.trigger(InputEvent {
+            event_type: InputEventType::RelAxis,
+            code: lo,
+            value,
+        });
+        lis.trigger(InputEvent {
+            event_type: InputEventType::RelAxis,
+            code: hi,
+            value: value.saturating_mul(HI_RES_PER_DETENT),
+        });
+    }
+}
+
 /// Full 32-bit HID usage: usage page in the high half, usage id in the low.
 const USAGE_GD_X: u32 = 0x0001_0030;
 const USAGE_GD_Y: u32 = 0x0001_0031;
@@ -1478,27 +1564,62 @@ impl XhciInner {
         }
 
         if cc != TRB_CC_SUCCESS && cc != TRB_CC_SHORT {
-            // Transfer error. Stall (0x0d) halts the endpoint outright; Babble /
-            // Transaction Error can too. Doing nothing (the old behaviour) left
-            // the endpoint dead until the user unplugged and replugged the
-            // device. Skip the failed TRB and queue a deferred Reset Endpoint +
-            // re-arm (commands must not run nested inside this event drain).
+            // A failed transfer. Skip its TRB, re-arm one in its place, and --
+            // only when the completion code actually leaves the endpoint
+            // Halted -- queue a deferred Reset Endpoint (commands must not run
+            // nested inside this event drain).
             if let Some(idx) = self
                 .hids
                 .iter()
                 .position(|h| h.slot_id == i as u8 && h.ep_dci == dci)
             {
-                let ridx = self.hids[idx].ring_idx;
+                let (ridx, blen, buf_phys) = {
+                    let h = &mut self.hids[idx];
+                    // No report was dispatched for this transfer, so the
+                    // dispatch head moves with the enqueue head below and the
+                    // two stay in lockstep.
+                    h.dispatch_idx = (h.dispatch_idx + 1) % HID_QUEUE_DEPTH;
+                    (
+                        h.ring_idx,
+                        h.report_len as u16,
+                        h.bufs[h.enqueue_idx].sub_phys(0),
+                    )
+                };
                 if let Some(r) = self.xfer_rings.get_mut(ridx).and_then(|o| o.as_mut()) {
                     r.advance_dequeue(1);
                 }
-                // No report dispatched for the errored transfer: advance the
-                // dispatch head too, keeping it in lockstep with the enqueue
-                // head (which the deferred re-arm advances).
-                self.hids[idx].dispatch_idx = (self.hids[idx].dispatch_idx + 1) % HID_QUEUE_DEPTH;
-                let key = (i as u8, dci);
-                if !self.pending_ep_resets.contains(&key) {
-                    self.pending_ep_resets.push(key);
+                // Re-arm HERE, once per failed transfer, rather than once per
+                // deferred reset. The deferred list is deduplicated by
+                // (slot, dci), so a burst of N failures on one endpoint used to
+                // put back a single TRB: the ring lost N-1 of its
+                // HID_QUEUE_DEPTH slots every burst and the two heads drifted
+                // apart by N-1 for good -- reports then came out of the wrong
+                // buffer, and after a few bursts the ring ran empty and the
+                // device went silent until it was unplugged. Pushing onto a
+                // halted endpoint is harmless: the TRB simply waits there, and
+                // `deq_phys()` below is unaffected because the dequeue head
+                // does not move on a push.
+                self.resubmit_hid_normal_trb(ridx, buf_phys, blen, i as u8, dci);
+                if let Some(h) = self.hids.get_mut(idx) {
+                    h.enqueue_idx = (h.enqueue_idx + 1) % HID_QUEUE_DEPTH;
+                }
+                if cc_halts_endpoint(cc) {
+                    let key = (i as u8, dci);
+                    if !self.pending_ep_resets.contains(&key) {
+                        self.pending_ep_resets.push(key);
+                    }
+                } else {
+                    // Missed Service Error is the one a real xHCI actually
+                    // produces on a busy bus, and it does NOT halt anything:
+                    // the host skipped one service interval. Resetting a
+                    // RUNNING endpoint answers Context State Error, so the old
+                    // unconditional reset turned a dropped report into a failed
+                    // recovery -- which is also why this never showed up under
+                    // QEMU, where the code is never emitted.
+                    warn!(
+                        "[xhci] slot={} dci={} transfer cc={} (endpoint not halted); TRB skipped",
+                        i, dci, cc
+                    );
                 }
             }
             return false;
@@ -1901,9 +2022,18 @@ impl XhciInner {
             for i in 0..sb as usize {
                 let pg = DmaBuf::new(PAGE_SIZE, PAGE_SIZE)?;
                 tbl.write_u64(i * 8, pg.sub_phys(0));
+                // The page was CPU-zeroed by DmaBuf::new and the controller
+                // DMAs into it from the moment RS=1; evict those dirty lines
+                // now, or a later writeback lands on controller-owned state.
+                pg.flush(0, PAGE_SIZE);
                 self.scratch_pages.push(pg);
             }
+            tbl.flush(0, sb as usize * 8);
             self.dcbaa.write_u64(0, tbl.sub_phys(0));
+            // Every per-slot DCBAA write is flushed; entry 0 -- the scratchpad
+            // array pointer, and the first thing the controller reads once
+            // DCBAAP is programmed below -- was the one that was not.
+            self.dcbaa.flush(0, 8);
             self.scratch_tbl = Some(tbl);
         }
 
@@ -2145,7 +2275,16 @@ impl XhciInner {
         let cmd_trb_phys = self.cmd.push(trb_enable_slot())?;
         self.mmio.ring_db(0, 0); // Doorbell 0: Comando
         let slot = self.wait_cmd_phys_slot(cmd_trb_phys)?;
-        if slot == 0 {
+        if slot == 0 || slot as usize > self.max_slots as usize {
+            // `slot` comes straight out of a Command Completion event. Only
+            // zero was rejected, so a controller (or a stale/replayed event)
+            // naming a slot above Max Slots panicked the kernel on the indexes
+            // below -- `slot_speed`, `slot_port` and `dev_ctx` are all sized
+            // max_slots + 1. `handle_hid_transfer_side` already bounds it.
+            error!(
+                "[xhci] slot id {} out of range (max {})",
+                slot, self.max_slots
+            );
             return Err(DeviceError::IoError);
         }
         self.slot_speed[slot as usize] = speed;
@@ -2626,18 +2765,10 @@ impl XhciInner {
 
         let ep_off = csz + csz + (dci - 1) * csz;
 
-        // Endpoint Context DW0: set Interval from the USB endpoint descriptor.
-        // For HS/SS (speed >= 3): USB bInterval is the exponent N where the period is
-        // 2^(N-1) × 125 µs, but xHCI Interval is M where the period is 2^M × 125 µs.
-        // Therefore xhci_interval = bInterval - 1 (per xHCI spec §6.2.3.6).
-        // For FS/LS: bInterval is in frames (1 ms each); the field must be at least 1.
+        // Endpoint Context DW0. Interval is bits 23:16 (xHCI 1.2 table 6-9);
+        // bits 31:24 are Max ESIT Payload Hi, RsvdZ unless LEC=1.
         let speed = self.slot_speed[slot as usize];
-        let xhci_interval = if speed >= 3 {
-            interval.saturating_sub(1).min(15)
-        } else {
-            interval.min(15).max(1)
-        };
-        cfg.write_u32(ep_off, (xhci_interval as u32) << 24);
+        cfg.write_u32(ep_off, xhci_endpoint_interval(speed, interval) << 16);
 
         // Endpoint Context DW1: Error Count field (bits 2:1) = 3 (value 3 << 1 = 0b110),
         // EP Type, Max Packet Size.  Error Count = 3 allows up to 3 retries after failure.
@@ -2670,7 +2801,16 @@ impl XhciInner {
         // we haven't dispatched yet. See HID_QUEUE_DEPTH docs for the why.
         let mut bufs = Vec::with_capacity(HID_QUEUE_DEPTH);
         for _ in 0..HID_QUEUE_DEPTH {
-            bufs.push(DmaBuf::new(report_len, 64)?);
+            let b = DmaBuf::new(report_len, 64)?;
+            // Evict the zeroing `DmaBuf::new` just did before the controller
+            // starts DMA-ing reports into this buffer. Every other DMA-in
+            // buffer here is flushed for exactly this reason (the descriptor
+            // and config-sniff buffers, and the whole event-ring segment);
+            // these four were the only ones that were not, so the first
+            // `clflush`-then-read in `dispatch_hid` could write the dirty
+            // zeros back over the report that had just landed.
+            b.flush(0, report_len);
+            bufs.push(b);
         }
         {
             let ring = self
@@ -2722,14 +2862,71 @@ impl XhciInner {
             report_desc_len: report_desc.1,
             mouse_layout: parsed.mouse,
         });
-        if real_proto == HID_PROTO_TABLET {
-            warn!(
-                "[xhci] absolute USB pointer slot={} vid={:04x} pid={:04x} — silencing PS/2 aux",
+        // Two ways a pointer can be bound and still deliver nothing, both
+        // reported at ERROR level because that is the only level a rig booted
+        // with `LOG=error` prints -- and a dead mouse is exactly when the
+        // console is the only diagnostic left. /proc/usbhid has the detail;
+        // these lines are what says to go look.
+        if real_proto == HID_PROTO_MOUSE
+            && parsed.mouse.is_none()
+            && subclass != HID_SUBCLASS_BOOT
+            && proto == 0
+        {
+            error!(
+                "[xhci] mouse slot={} vid={:04x} pid={:04x} iface={} bound but its report \
+                 descriptor did not parse: NO pointer events will be delivered. \
+                 Paste `cat /proc/usbhid` to get its report_desc.",
+                slot, vid, pid, iface
+            );
+        } else if real_proto == HID_PROTO_MOUSE && parsed.mouse.is_some_and(|m| m.wheel.is_none()) {
+            info!(
+                "[xhci] mouse slot={} vid={:04x} pid={:04x} has no wheel field in its report \
+                 descriptor",
                 slot, vid, pid
             );
-            USB_ABS_POINTER.store(true, Ordering::Relaxed);
         }
+        if real_proto == HID_PROTO_TABLET {
+            warn!(
+                "[xhci] absolute USB pointer slot={} vid={:04x} pid={:04x}",
+                slot, vid, pid
+            );
+        }
+        self.refresh_abs_pointer();
         Ok(())
+    }
+
+    /// Recompute [`USB_ABS_POINTER`] from the interfaces that are bound right
+    /// now.
+    ///
+    /// This used to be a write-once latch set the moment any interface was
+    /// classified as absolute, and it is the single switch that silences every
+    /// RELATIVE pointer on the machine -- `dispatch_hid` drops USB mouse
+    /// reports while it is set, and the PS/2 aux path reads it through
+    /// `usb_abs_pointer_active()`. Two consequences of latching it, both of
+    /// which end with a user who has no pointer at all:
+    ///
+    /// * Unplugging the tablet left it set with nothing absolute remaining, so
+    ///   a USB mouse plugged in afterwards enumerated fine, counted up its
+    ///   reports in `/proc/usbhid`, and delivered nothing.
+    /// * Only a VM's absolute tablet has the double-pointer problem this
+    ///   exists to solve. A real digitiser, touchscreen or gamepad also
+    ///   declares absolute X/Y, and on real hardware that took the user's
+    ///   mouse down with it. So only the recognised VM tablets count.
+    fn refresh_abs_pointer(&self) {
+        let abs = self
+            .hids
+            .iter()
+            .any(|h| h.protocol == HID_PROTO_TABLET && is_vm_abs_tablet(h.vid, h.pid, h.if_proto));
+        if USB_ABS_POINTER.swap(abs, Ordering::Relaxed) != abs {
+            warn!(
+                "[xhci] relative pointers (PS/2 aux and USB mice) are now {}",
+                if abs {
+                    "SILENCED by a VM tablet"
+                } else {
+                    "live"
+                }
+            );
+        }
     }
 
     /// Decode and deliver the report in `bufs[dispatch_idx]`. The caller
@@ -2762,7 +2959,10 @@ impl XhciInner {
                 addr += 64;
             }
             unsafe {
-                _mm_lfence();
+                // CLFLUSH is ordered by MFENCE, not LFENCE (Intel SDM, CLFLUSH):
+                // an LFENCE here does not guarantee the invalidate completed
+                // before the loads below, which is the whole point of the flush.
+                _mm_mfence();
             }
         }
 
@@ -2880,20 +3080,7 @@ impl XhciInner {
                                 value: dy,
                             });
                         }
-                        if wheel != 0 {
-                            lis.trigger(InputEvent {
-                                event_type: InputEventType::RelAxis,
-                                code: REL_WHEEL,
-                                value: -wheel,
-                            });
-                        }
-                        if hwheel != 0 {
-                            lis.trigger(InputEvent {
-                                event_type: InputEventType::RelAxis,
-                                code: REL_HWHEEL,
-                                value: hwheel,
-                            });
-                        }
+                        emit_scroll(lis, wheel, hwheel);
                         lis.trigger(InputEvent {
                             event_type: InputEventType::Syn,
                             code: SYN_REPORT,
@@ -2952,20 +3139,7 @@ impl XhciInner {
                     code: ABS_Y,
                     value: ay,
                 });
-                if wheel != 0 {
-                    lis.trigger(InputEvent {
-                        event_type: InputEventType::RelAxis,
-                        code: REL_WHEEL,
-                        value: -wheel,
-                    });
-                }
-                if hwheel != 0 {
-                    lis.trigger(InputEvent {
-                        event_type: InputEventType::RelAxis,
-                        code: REL_HWHEEL,
-                        value: hwheel,
-                    });
-                }
+                emit_scroll(lis, wheel, hwheel);
                 lis.trigger(InputEvent {
                     event_type: InputEventType::Syn,
                     code: SYN_REPORT,
@@ -3069,23 +3243,17 @@ impl XhciInner {
             if self.reset_endpoint_and_dequeue(slot, dci).is_err() {
                 continue;
             }
+            // The replacement TRBs went onto the ring as each failure was
+            // handled, so there is nothing to re-arm here: the endpoint only
+            // needs its doorbell rung to start consuming them again.
             if let Some(idx) = self
                 .hids
                 .iter()
                 .position(|h| h.slot_id == slot && h.ep_dci == dci)
             {
-                let (ridx, blen, buf_phys) = {
-                    let h = &self.hids[idx];
-                    (
-                        h.ring_idx,
-                        h.report_len as u16,
-                        h.bufs[h.enqueue_idx].sub_phys(0),
-                    )
-                };
-                self.resubmit_hid_normal_trb(ridx, buf_phys, blen, slot, dci);
-                if let Some(h) = self.hids.get_mut(idx) {
-                    h.enqueue_idx = (h.enqueue_idx + 1) % HID_QUEUE_DEPTH;
-                }
+                let _ = idx;
+                fence(Ordering::SeqCst);
+                self.mmio.ring_db(slot, dci);
                 warn!(
                     "[xhci] recovered HID endpoint slot={} dci={} after a transfer error",
                     slot, dci
@@ -3195,6 +3363,9 @@ impl XhciInner {
                 }
             }
             self.hids.retain(|h| h.slot_id != slot);
+            // The device that was silencing every relative pointer may be the
+            // one that just left.
+            self.refresh_abs_pointer();
         }
         Ok(())
     }
@@ -3618,10 +3789,18 @@ impl InputScheme for XhciUsbHid {
                 }
             }
             CapabilityType::RelAxis => {
+                // The hi-res axes go in alongside the low-res ones because
+                // `emit_scroll` emits both. Advertising one without the other
+                // is the one combination that breaks scrolling outright:
+                // libinput only synthesises hi-res events for a device that
+                // does NOT claim the axis, so a claimed-but-silent
+                // REL_WHEEL_HI_RES would leave its wheel state machine with
+                // nothing to integrate.
                 if want_rel {
-                    cap.set_all(&[REL_X, REL_Y, REL_WHEEL, REL_HWHEEL]);
-                } else if tablet {
-                    cap.set_all(&[REL_WHEEL, REL_HWHEEL]);
+                    cap.set_all(&[REL_X, REL_Y]);
+                }
+                if want_rel || tablet {
+                    cap.set_all(&[REL_WHEEL, REL_HWHEEL, REL_WHEEL_HI_RES, REL_HWHEEL_HI_RES]);
                 }
             }
             CapabilityType::AbsAxis if tablet => cap.set_all(&[ABS_X, ABS_Y]),
@@ -3790,5 +3969,203 @@ impl PciDriver for XhciDriverPci {
             #[cfg(not(feature = "legacy-usb-hid"))]
             Err(DeviceError::NotSupported)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync::Mutex;
+    use alloc::{boxed::Box, vec::Vec};
+
+    /// The report descriptor of a garden-variety 5-button wheel mouse: a
+    /// 5-bit button block with 3 bits of padding, 12-bit relative X/Y, an
+    /// 8-bit wheel and an 8-bit Consumer "AC Pan". No report ID. This is the
+    /// shape almost every USB mouse on a desk actually ships, and it is NOT
+    /// the boot layout, so nothing works unless the descriptor parses.
+    const MOUSE_5BTN_12BIT: &[u8] = &[
+        0x05, 0x01, // Usage Page (Generic Desktop)
+        0x09, 0x02, // Usage (Mouse)
+        0xA1, 0x01, // Collection (Application)
+        0x09, 0x01, //   Usage (Pointer)
+        0xA1, 0x00, //   Collection (Physical)
+        0x05, 0x09, //     Usage Page (Button)
+        0x19, 0x01, //     Usage Minimum (1)
+        0x29, 0x05, //     Usage Maximum (5)
+        0x15, 0x00, //     Logical Minimum (0)
+        0x25, 0x01, //     Logical Maximum (1)
+        0x95, 0x05, //     Report Count (5)
+        0x75, 0x01, //     Report Size (1)
+        0x81, 0x02, //     Input (Data,Var,Abs)
+        0x95, 0x01, //     Report Count (1)
+        0x75, 0x03, //     Report Size (3)
+        0x81, 0x01, //     Input (Const)            <- padding
+        0x05, 0x01, //     Usage Page (Generic Desktop)
+        0x09, 0x30, //     Usage (X)
+        0x09, 0x31, //     Usage (Y)
+        0x16, 0x01, 0xF8, // Logical Minimum (-2047)
+        0x26, 0xFF, 0x07, // Logical Maximum (2047)
+        0x75, 0x0C, //     Report Size (12)
+        0x95, 0x02, //     Report Count (2)
+        0x81, 0x06, //     Input (Data,Var,Rel)
+        0x15, 0x81, //     Logical Minimum (-127)
+        0x25, 0x7F, //     Logical Maximum (127)
+        0x75, 0x08, //     Report Size (8)
+        0x95, 0x01, //     Report Count (1)
+        0x09, 0x38, //     Usage (Wheel)
+        0x81, 0x06, //     Input (Data,Var,Rel)
+        0x05, 0x0C, //     Usage Page (Consumer)
+        0x0A, 0x38, 0x02, // Usage (AC Pan)
+        0x95, 0x01, //     Report Count (1)
+        0x81, 0x06, //     Input (Data,Var,Rel)
+        0xC0, //         End Collection
+        0xC0, //       End Collection
+    ];
+
+    /// The boot-shaped descriptor, with a report ID in front and a consumer
+    /// report sharing the interface — the multi-report case.
+    const MOUSE_WITH_REPORT_IDS: &[u8] = &[
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, //
+        0x85, 0x01, //   Report ID (1)
+        0x09, 0x01, 0xA1, 0x00, //
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x03, //
+        0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02, //
+        0x95, 0x01, 0x75, 0x05, 0x81, 0x01, //   padding
+        0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, //   X, Y, Wheel
+        0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06, //
+        0xC0, 0xC0, //
+        0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, //   Consumer Control
+        0x85, 0x02, //   Report ID (2)
+        0x19, 0x00, 0x2A, 0x3C, 0x02, //
+        0x15, 0x00, 0x26, 0x3C, 0x02, 0x95, 0x01, 0x75, 0x10, 0x81, 0x00, //
+        0xC0,
+    ];
+
+    fn capture(f: impl FnOnce(&EventListener<InputEvent>)) -> Vec<(u16, u16, i32)> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let lis = EventListener::<InputEvent>::new();
+        let sink = seen.clone();
+        lis.subscribe(
+            Box::new(move |e: &InputEvent| {
+                sink.lock().push((e.event_type as u16, e.code, e.value))
+            }),
+            false,
+        );
+        f(&lis);
+        let out = seen.lock().clone();
+        out
+    }
+
+    #[test]
+    fn a_plain_wheel_mouse_descriptor_yields_every_field() {
+        let info = parse_hid_descriptor(MOUSE_5BTN_12BIT);
+        let ml = info.mouse.expect("a mouse layout");
+        assert_eq!(ml.report_id, None);
+        assert_eq!(ml.buttons, BitField { off: 0, len: 5 });
+        assert_eq!(ml.x, BitField { off: 8, len: 12 });
+        assert_eq!(ml.y, BitField { off: 20, len: 12 });
+        assert_eq!(ml.wheel, Some(BitField { off: 32, len: 8 }));
+        assert_eq!(ml.hwheel, Some(BitField { off: 40, len: 8 }));
+        assert_eq!(ml.report_bytes, 6);
+        assert_eq!(info.max_report_bytes, 6);
+        assert_eq!(classify_hid_report(MOUSE_5BTN_12BIT), HidClass::Mouse);
+    }
+
+    #[test]
+    fn a_report_id_mouse_keeps_its_wheel_and_sizes_the_other_report() {
+        let info = parse_hid_descriptor(MOUSE_WITH_REPORT_IDS);
+        let ml = info.mouse.expect("a mouse layout");
+        assert_eq!(ml.report_id, Some(1));
+        // Fields start after the report-ID byte.
+        assert_eq!(ml.buttons, BitField { off: 8, len: 3 });
+        assert_eq!(ml.x, BitField { off: 16, len: 8 });
+        assert_eq!(ml.y, BitField { off: 24, len: 8 });
+        assert_eq!(ml.wheel, Some(BitField { off: 32, len: 8 }));
+        assert_eq!(ml.report_bytes, 5);
+        // The consumer report (ID byte + 16 bits) must be counted too, or the
+        // interrupt TD is armed too short and the endpoint babbles.
+        assert_eq!(info.max_report_bytes, 5);
+    }
+
+    #[test]
+    fn twelve_bit_axes_sign_extend() {
+        // buttons=0b00001 (left), X = -1 (0xFFF), Y = +1.
+        let report = [0x01, 0xFF, 0x1F, 0x00, 0x00, 0x00];
+        let ml = parse_hid_descriptor(MOUSE_5BTN_12BIT).mouse.unwrap();
+        assert_eq!(read_bits(&report, ml.buttons.off, ml.buttons.len), 1);
+        assert_eq!(read_signed_bits(&report, ml.x.off, ml.x.len), -1);
+        assert_eq!(read_signed_bits(&report, ml.y.off, ml.y.len), 1);
+    }
+
+    #[test]
+    fn scroll_keeps_the_hid_sign_and_carries_the_hi_res_axis() {
+        // HID Wheel is positive away from the user, and so is REL_WHEEL:
+        // the value must reach evdev unchanged, with 120 per detent on the
+        // high-resolution axis beside it.
+        let events = capture(|lis| emit_scroll(lis, 1, 0));
+        assert_eq!(
+            events,
+            alloc::vec![(EV_REL, REL_WHEEL, 1), (EV_REL, REL_WHEEL_HI_RES, 120),]
+        );
+
+        let down = capture(|lis| emit_scroll(lis, -2, 0));
+        assert_eq!(
+            down,
+            alloc::vec![(EV_REL, REL_WHEEL, -2), (EV_REL, REL_WHEEL_HI_RES, -240),]
+        );
+    }
+
+    #[test]
+    fn horizontal_scroll_uses_its_own_axes() {
+        let events = capture(|lis| emit_scroll(lis, 0, 1));
+        assert_eq!(
+            events,
+            alloc::vec![(EV_REL, REL_HWHEEL, 1), (EV_REL, REL_HWHEEL_HI_RES, 120),]
+        );
+    }
+
+    #[test]
+    fn endpoint_interval_uses_the_xhci_exponent_at_every_speed() {
+        // High speed (id 3): bInterval is already an exponent, M = N - 1.
+        assert_eq!(xhci_endpoint_interval(3, 1), 0);
+        assert_eq!(xhci_endpoint_interval(3, 8), 7);
+        assert_eq!(xhci_endpoint_interval(3, 16), 15);
+        // Out-of-range values clamp rather than wrap.
+        assert_eq!(xhci_endpoint_interval(3, 0), 0);
+        assert_eq!(xhci_endpoint_interval(3, 255), 15);
+
+        // Full/low speed (ids 1 and 2): bInterval counts 1 ms frames and the
+        // field wants log2 of the microframe count, never the frame count.
+        assert_eq!(xhci_endpoint_interval(2, 1), 3); // 1 ms  -> 8 microframes
+        assert_eq!(xhci_endpoint_interval(2, 2), 4); // 2 ms  -> 16
+        assert_eq!(xhci_endpoint_interval(1, 8), 6); // 8 ms  -> 64
+        assert_eq!(xhci_endpoint_interval(1, 10), 6); // 10 ms -> 80, floor(log2)=6
+                                                      // And it stays inside the legal 3..=10 whatever the device asks for.
+        for b in 1..=255u8 {
+            let m = xhci_endpoint_interval(1, b);
+            assert!((3..=10).contains(&m), "bInterval {} gave {}", b, m);
+        }
+    }
+
+    #[test]
+    fn the_interval_never_reaches_max_esit_payload_hi() {
+        // DW0 bits 31:24 are Max ESIT Payload Hi and RsvdZ for us; the old code
+        // shifted by 24 and put the interval there, leaving Interval itself 0.
+        // (Interval 0 IS legal at high speed -- bInterval 1 -- so the only
+        // invariant to assert is that nothing lands above bit 23.)
+        for speed in [1u8, 2, 3, 4] {
+            for b in 1..=255u8 {
+                let dw0 = xhci_endpoint_interval(speed, b) << 16;
+                assert_eq!(dw0 & 0xff00_0000, 0, "speed {} bInterval {}", speed, b);
+            }
+        }
+        // A full-speed endpoint always lands in the legal 3..=10, so its
+        // Interval field is never zero.
+        assert_ne!(xhci_endpoint_interval(2, 10) << 16 & 0x00ff_0000, 0);
+    }
+
+    #[test]
+    fn a_still_wheel_emits_nothing() {
+        assert!(capture(|lis| emit_scroll(lis, 0, 0)).is_empty());
     }
 }
