@@ -1013,6 +1013,50 @@ fn read_signed_bits(buf: &[u8], off: usize, len: usize) -> i32 {
     }
 }
 
+/// One wheel detent in the high-resolution scroll units both Linux and Windows
+/// agreed on: `REL_WHEEL_HI_RES` counts 120 per notch, so a wheel that can
+/// report fractions of a notch has somewhere to put them.
+const HI_RES_PER_DETENT: i32 = 120;
+
+/// Emit the scroll axes of one HID report the way `hidinput_handle_scroll`
+/// does: the low-resolution axis carries the raw field value and the
+/// high-resolution one carries 120 times it.
+///
+/// Two things here were wrong before and both are visible as "the wheel does
+/// not work":
+///
+/// * The sign. A HID `Wheel` (Generic Desktop usage 0x38) is positive when the
+///   wheel turns away from the user, which is exactly `REL_WHEEL` positive;
+///   `hid-input.c` passes the value straight through. We were negating it, so
+///   every scroll went the wrong way — and a desktop that scrolls backwards is
+///   reported as one that does not scroll. (The negation is correct for the
+///   PS/2 IntelliMouse byte, where it came from; USB is not PS/2.)
+/// * The missing high-resolution axis. Linux has emitted `REL_WHEEL_HI_RES`
+///   for every HID mouse since 5.0 and libinput's wheel state machine works in
+///   those units, synthesising them from the low-resolution axis only when the
+///   device does not advertise them. Emitting both is what a real mouse looks
+///   like.
+fn emit_scroll(lis: &EventListener<InputEvent>, wheel: i32, hwheel: i32) {
+    for (value, lo, hi) in [
+        (wheel, REL_WHEEL, REL_WHEEL_HI_RES),
+        (hwheel, REL_HWHEEL, REL_HWHEEL_HI_RES),
+    ] {
+        if value == 0 {
+            continue;
+        }
+        lis.trigger(InputEvent {
+            event_type: InputEventType::RelAxis,
+            code: lo,
+            value,
+        });
+        lis.trigger(InputEvent {
+            event_type: InputEventType::RelAxis,
+            code: hi,
+            value: value.saturating_mul(HI_RES_PER_DETENT),
+        });
+    }
+}
+
 /// Full 32-bit HID usage: usage page in the high half, usage id in the low.
 const USAGE_GD_X: u32 = 0x0001_0030;
 const USAGE_GD_Y: u32 = 0x0001_0031;
@@ -2880,20 +2924,7 @@ impl XhciInner {
                                 value: dy,
                             });
                         }
-                        if wheel != 0 {
-                            lis.trigger(InputEvent {
-                                event_type: InputEventType::RelAxis,
-                                code: REL_WHEEL,
-                                value: -wheel,
-                            });
-                        }
-                        if hwheel != 0 {
-                            lis.trigger(InputEvent {
-                                event_type: InputEventType::RelAxis,
-                                code: REL_HWHEEL,
-                                value: hwheel,
-                            });
-                        }
+                        emit_scroll(lis, wheel, hwheel);
                         lis.trigger(InputEvent {
                             event_type: InputEventType::Syn,
                             code: SYN_REPORT,
@@ -2952,20 +2983,7 @@ impl XhciInner {
                     code: ABS_Y,
                     value: ay,
                 });
-                if wheel != 0 {
-                    lis.trigger(InputEvent {
-                        event_type: InputEventType::RelAxis,
-                        code: REL_WHEEL,
-                        value: -wheel,
-                    });
-                }
-                if hwheel != 0 {
-                    lis.trigger(InputEvent {
-                        event_type: InputEventType::RelAxis,
-                        code: REL_HWHEEL,
-                        value: hwheel,
-                    });
-                }
+                emit_scroll(lis, wheel, hwheel);
                 lis.trigger(InputEvent {
                     event_type: InputEventType::Syn,
                     code: SYN_REPORT,
@@ -3618,10 +3636,18 @@ impl InputScheme for XhciUsbHid {
                 }
             }
             CapabilityType::RelAxis => {
+                // The hi-res axes go in alongside the low-res ones because
+                // `emit_scroll` emits both. Advertising one without the other
+                // is the one combination that breaks scrolling outright:
+                // libinput only synthesises hi-res events for a device that
+                // does NOT claim the axis, so a claimed-but-silent
+                // REL_WHEEL_HI_RES would leave its wheel state machine with
+                // nothing to integrate.
                 if want_rel {
-                    cap.set_all(&[REL_X, REL_Y, REL_WHEEL, REL_HWHEEL]);
-                } else if tablet {
-                    cap.set_all(&[REL_WHEEL, REL_HWHEEL]);
+                    cap.set_all(&[REL_X, REL_Y]);
+                }
+                if want_rel || tablet {
+                    cap.set_all(&[REL_WHEEL, REL_HWHEEL, REL_WHEEL_HI_RES, REL_HWHEEL_HI_RES]);
                 }
             }
             CapabilityType::AbsAxis if tablet => cap.set_all(&[ABS_X, ABS_Y]),
@@ -3790,5 +3816,163 @@ impl PciDriver for XhciDriverPci {
             #[cfg(not(feature = "legacy-usb-hid"))]
             Err(DeviceError::NotSupported)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync::Mutex;
+    use alloc::{boxed::Box, vec::Vec};
+
+    /// The report descriptor of a garden-variety 5-button wheel mouse: a
+    /// 5-bit button block with 3 bits of padding, 12-bit relative X/Y, an
+    /// 8-bit wheel and an 8-bit Consumer "AC Pan". No report ID. This is the
+    /// shape almost every USB mouse on a desk actually ships, and it is NOT
+    /// the boot layout, so nothing works unless the descriptor parses.
+    const MOUSE_5BTN_12BIT: &[u8] = &[
+        0x05, 0x01, // Usage Page (Generic Desktop)
+        0x09, 0x02, // Usage (Mouse)
+        0xA1, 0x01, // Collection (Application)
+        0x09, 0x01, //   Usage (Pointer)
+        0xA1, 0x00, //   Collection (Physical)
+        0x05, 0x09, //     Usage Page (Button)
+        0x19, 0x01, //     Usage Minimum (1)
+        0x29, 0x05, //     Usage Maximum (5)
+        0x15, 0x00, //     Logical Minimum (0)
+        0x25, 0x01, //     Logical Maximum (1)
+        0x95, 0x05, //     Report Count (5)
+        0x75, 0x01, //     Report Size (1)
+        0x81, 0x02, //     Input (Data,Var,Abs)
+        0x95, 0x01, //     Report Count (1)
+        0x75, 0x03, //     Report Size (3)
+        0x81, 0x01, //     Input (Const)            <- padding
+        0x05, 0x01, //     Usage Page (Generic Desktop)
+        0x09, 0x30, //     Usage (X)
+        0x09, 0x31, //     Usage (Y)
+        0x16, 0x01, 0xF8, // Logical Minimum (-2047)
+        0x26, 0xFF, 0x07, // Logical Maximum (2047)
+        0x75, 0x0C, //     Report Size (12)
+        0x95, 0x02, //     Report Count (2)
+        0x81, 0x06, //     Input (Data,Var,Rel)
+        0x15, 0x81, //     Logical Minimum (-127)
+        0x25, 0x7F, //     Logical Maximum (127)
+        0x75, 0x08, //     Report Size (8)
+        0x95, 0x01, //     Report Count (1)
+        0x09, 0x38, //     Usage (Wheel)
+        0x81, 0x06, //     Input (Data,Var,Rel)
+        0x05, 0x0C, //     Usage Page (Consumer)
+        0x0A, 0x38, 0x02, // Usage (AC Pan)
+        0x95, 0x01, //     Report Count (1)
+        0x81, 0x06, //     Input (Data,Var,Rel)
+        0xC0, //         End Collection
+        0xC0, //       End Collection
+    ];
+
+    /// The boot-shaped descriptor, with a report ID in front and a consumer
+    /// report sharing the interface — the multi-report case.
+    const MOUSE_WITH_REPORT_IDS: &[u8] = &[
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, //
+        0x85, 0x01, //   Report ID (1)
+        0x09, 0x01, 0xA1, 0x00, //
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x03, //
+        0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02, //
+        0x95, 0x01, 0x75, 0x05, 0x81, 0x01, //   padding
+        0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, //   X, Y, Wheel
+        0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06, //
+        0xC0, 0xC0, //
+        0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, //   Consumer Control
+        0x85, 0x02, //   Report ID (2)
+        0x19, 0x00, 0x2A, 0x3C, 0x02, //
+        0x15, 0x00, 0x26, 0x3C, 0x02, 0x95, 0x01, 0x75, 0x10, 0x81, 0x00, //
+        0xC0,
+    ];
+
+    fn capture(f: impl FnOnce(&EventListener<InputEvent>)) -> Vec<(u16, u16, i32)> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let lis = EventListener::<InputEvent>::new();
+        let sink = seen.clone();
+        lis.subscribe(
+            Box::new(move |e: &InputEvent| {
+                sink.lock().push((e.event_type as u16, e.code, e.value))
+            }),
+            false,
+        );
+        f(&lis);
+        let out = seen.lock().clone();
+        out
+    }
+
+    #[test]
+    fn a_plain_wheel_mouse_descriptor_yields_every_field() {
+        let info = parse_hid_descriptor(MOUSE_5BTN_12BIT);
+        let ml = info.mouse.expect("a mouse layout");
+        assert_eq!(ml.report_id, None);
+        assert_eq!(ml.buttons, BitField { off: 0, len: 5 });
+        assert_eq!(ml.x, BitField { off: 8, len: 12 });
+        assert_eq!(ml.y, BitField { off: 20, len: 12 });
+        assert_eq!(ml.wheel, Some(BitField { off: 32, len: 8 }));
+        assert_eq!(ml.hwheel, Some(BitField { off: 40, len: 8 }));
+        assert_eq!(ml.report_bytes, 6);
+        assert_eq!(info.max_report_bytes, 6);
+        assert_eq!(classify_hid_report(MOUSE_5BTN_12BIT), HidClass::Mouse);
+    }
+
+    #[test]
+    fn a_report_id_mouse_keeps_its_wheel_and_sizes_the_other_report() {
+        let info = parse_hid_descriptor(MOUSE_WITH_REPORT_IDS);
+        let ml = info.mouse.expect("a mouse layout");
+        assert_eq!(ml.report_id, Some(1));
+        // Fields start after the report-ID byte.
+        assert_eq!(ml.buttons, BitField { off: 8, len: 3 });
+        assert_eq!(ml.x, BitField { off: 16, len: 8 });
+        assert_eq!(ml.y, BitField { off: 24, len: 8 });
+        assert_eq!(ml.wheel, Some(BitField { off: 32, len: 8 }));
+        assert_eq!(ml.report_bytes, 5);
+        // The consumer report (ID byte + 16 bits) must be counted too, or the
+        // interrupt TD is armed too short and the endpoint babbles.
+        assert_eq!(info.max_report_bytes, 5);
+    }
+
+    #[test]
+    fn twelve_bit_axes_sign_extend() {
+        // buttons=0b00001 (left), X = -1 (0xFFF), Y = +1.
+        let report = [0x01, 0xFF, 0x1F, 0x00, 0x00, 0x00];
+        let ml = parse_hid_descriptor(MOUSE_5BTN_12BIT).mouse.unwrap();
+        assert_eq!(read_bits(&report, ml.buttons.off, ml.buttons.len), 1);
+        assert_eq!(read_signed_bits(&report, ml.x.off, ml.x.len), -1);
+        assert_eq!(read_signed_bits(&report, ml.y.off, ml.y.len), 1);
+    }
+
+    #[test]
+    fn scroll_keeps_the_hid_sign_and_carries_the_hi_res_axis() {
+        // HID Wheel is positive away from the user, and so is REL_WHEEL:
+        // the value must reach evdev unchanged, with 120 per detent on the
+        // high-resolution axis beside it.
+        let events = capture(|lis| emit_scroll(lis, 1, 0));
+        assert_eq!(
+            events,
+            alloc::vec![(EV_REL, REL_WHEEL, 1), (EV_REL, REL_WHEEL_HI_RES, 120),]
+        );
+
+        let down = capture(|lis| emit_scroll(lis, -2, 0));
+        assert_eq!(
+            down,
+            alloc::vec![(EV_REL, REL_WHEEL, -2), (EV_REL, REL_WHEEL_HI_RES, -240),]
+        );
+    }
+
+    #[test]
+    fn horizontal_scroll_uses_its_own_axes() {
+        let events = capture(|lis| emit_scroll(lis, 0, 1));
+        assert_eq!(
+            events,
+            alloc::vec![(EV_REL, REL_HWHEEL, 1), (EV_REL, REL_HWHEEL_HI_RES, 120),]
+        );
+    }
+
+    #[test]
+    fn a_still_wheel_emits_nothing() {
+        assert!(capture(|lis| emit_scroll(lis, 0, 0)).is_empty());
     }
 }
