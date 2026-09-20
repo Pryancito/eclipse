@@ -689,8 +689,19 @@ pub fn snapshot() -> KStats {
 
 #[cfg(test)]
 mod tests {
-    //! Host tests for the CPU runtime-statistics counters. On libos
-    //! `cpu::cpu_id()` is always 0, so every per-CPU update lands in slot 0.
+    //! Host tests for the CPU runtime-statistics counters.
+    //!
+    //! **Which slot a `note_*` lands in is not knowable here.** These tests
+    //! used to assume `cpu::cpu_id()` is 0 on the host and assert on
+    //! `*_percpu` entry 0; it is not, in either host configuration, so both
+    //! per-CPU tests failed the moment the suite was actually run. Under
+    //! `libos` the id is the host *thread* id truncated to `u8`
+    //! (`libos/cpu.rs`), which differs per test thread; on a bare-metal build
+    //! compiled for the host it is `lock::current_cpu_id()`, i.e. whichever
+    //! physical core the OS scheduler happened to pick — and the thread may
+    //! migrate between two consecutive calls. So every per-CPU assertion here
+    //! sums over all slots, which is migration-proof, and the slot-indexed
+    //! reads go through [`current_slot`].
     //!
     //! All counters here are process-global monotonic atomics and the test
     //! runner executes tests in parallel, so the assertions are written to be
@@ -702,6 +713,26 @@ mod tests {
     use spin::Mutex;
 
     static SERIAL: Mutex<()> = Mutex::new(());
+
+    /// The per-CPU slot the calling thread's `note_*` calls land in, or `None`
+    /// when this host's id is past the table (the `note_*` helpers check the
+    /// bound instead of indexing blindly, so those updates are dropped).
+    fn current_slot() -> Option<usize> {
+        let cpu = crate::cpu::cpu_id() as usize;
+        (cpu < MAX_CORE_NUM).then_some(cpu)
+    }
+
+    /// Total per-CPU idle entries summed over every slot.
+    fn idle_entries_all(s: &KStats) -> u64 {
+        s.idle_percpu.iter().map(|(_, n, _)| *n).sum()
+    }
+
+    /// `(total ticks, user ticks)` summed over every per-CPU slot.
+    fn ticks_all(s: &KStats) -> (u64, u64) {
+        s.tick_percpu
+            .iter()
+            .fold((0, 0), |(t, u), (_, tt, uu, _)| (t + tt, u + uu))
+    }
 
     fn irq_count(snap: &KStats, vector: u16) -> u64 {
         snap.irqs
@@ -736,6 +767,7 @@ mod tests {
 
     #[test]
     fn idle_accounting_is_monotonic() {
+        let in_range = current_slot().is_some();
         let before = snapshot();
         for _ in 0..4 {
             note_idle(1000);
@@ -743,15 +775,15 @@ mod tests {
         let after = snapshot();
         assert!(after.idle_ns >= before.idle_ns + 4000);
         assert!(after.idle_entries >= before.idle_entries + 4);
-        // The per-CPU breakdown for cpu 0 must have grown too.
-        let entries0 = |s: &KStats| {
-            s.idle_percpu
-                .iter()
-                .find(|(c, _, _)| *c == 0)
-                .map(|(_, n, _)| *n)
-                .unwrap_or(0)
-        };
-        assert!(entries0(&after) >= entries0(&before) + 4);
+        // The per-CPU breakdown must have grown by the same four entries --
+        // summed over all slots, because the calling thread may migrate
+        // between two `note_idle` calls and land in two different ones.
+        if in_range {
+            assert!(idle_entries_all(&after) >= idle_entries_all(&before) + 4);
+        }
+        // Whatever the slot, the per-CPU breakdown can never claim more idle
+        // naps than the global counter did.
+        assert!(idle_entries_all(&after) <= after.idle_entries);
     }
 
     #[test]
@@ -831,44 +863,44 @@ mod tests {
     #[test]
     fn cpu_idle_flag_roundtrip() {
         let _g = SERIAL.lock();
-        // Only cpu 0 is ever marked on libos, and SERIAL keeps the other
-        // flag-touching test out, so the count is exact here.
+        // SERIAL keeps the other flag-touching test out, but the slot this
+        // thread marks is whichever `cpu_id()` names right now, so assert on
+        // the delta rather than on an absolute count of one.
         set_cpu_idle(false);
-        assert_eq!(cpus_idle_now(), 0);
+        let base = cpus_idle_now();
         set_cpu_idle(true);
-        assert_eq!(cpus_idle_now(), 1);
+        assert_eq!(cpus_idle_now(), base + 1);
         set_cpu_idle(false);
-        assert_eq!(cpus_idle_now(), 0);
+        assert_eq!(cpus_idle_now(), base);
     }
 
     #[test]
     fn tick_context_records_user_and_rip() {
         let _g = SERIAL.lock();
-        let total0 = |s: &KStats| {
-            s.tick_percpu
-                .iter()
-                .find(|(c, ..)| *c == 0)
-                .map(|(_, t, ..)| *t)
-                .unwrap_or(0)
-        };
-        let user0 = |s: &KStats| {
-            s.tick_percpu
-                .iter()
-                .find(|(c, ..)| *c == 0)
-                .map(|(_, _, u, _)| *u)
-                .unwrap_or(0)
+        let Some(_slot) = current_slot() else {
+            // Out-of-range ids are checked, not indexed: nothing to observe.
+            let before = snapshot();
+            note_tick_context(true, 0xdead_beef);
+            assert_eq!(ticks_all(&snapshot()), ticks_all(&before));
+            return;
         };
         let before = snapshot();
         note_tick_context(true, 0xdead_beef); // interrupted user mode
         note_tick_context(false, 0xc0ff_ee00); // interrupted kernel mode
         let after = snapshot();
-        // Two more ticks on cpu 0, exactly one of them in user mode.
-        assert!(total0(&after) >= total0(&before) + 2);
-        assert!(user0(&after) >= user0(&before) + 1);
-        // user ticks are a subset of total ticks.
-        let entry = after.tick_percpu.iter().find(|(c, ..)| *c == 0).unwrap();
-        assert!(entry.2 <= entry.1);
-        // The last recorded RIP is the most recent call's (kernel-mode one).
-        assert_eq!(entry.3, 0xc0ff_ee00);
+        // Two more ticks, exactly one of them in user mode. Summed over all
+        // slots: the two calls may have run on two different CPUs.
+        let (t0, u0) = ticks_all(&before);
+        let (t1, u1) = ticks_all(&after);
+        assert!(t1 >= t0 + 2);
+        assert!(u1 >= u0 + 1);
+        // User ticks are a subset of total ticks, in every slot.
+        assert!(after.tick_percpu.iter().all(|(_, t, u, _)| u <= t));
+        // The last recorded RIP is the most recent call's (kernel-mode one),
+        // in whichever slot that call landed.
+        assert!(after
+            .tick_percpu
+            .iter()
+            .any(|(_, _, _, rip)| *rip == 0xc0ff_ee00));
     }
 }
