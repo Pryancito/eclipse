@@ -57,6 +57,8 @@ pub fn install(rootfs: &Path) {
     write_eclipse_kbd(rootfs);
     write_eclipse_locale(rootfs);
     write_eclipse_tz(rootfs);
+    write_eclipse_look(rootfs);
+    write_kde_helpers(rootfs);
 }
 
 /// `/usr/local/bin/eclipse-xkbmap`: load the X keyboard map into Xwayland once
@@ -734,6 +736,192 @@ pub(super) fn write_fallback_icons(rootfs: &Path) {
         }
     }
     println!("Desktop: installed PNG content for fallback icon names under hicolor");
+}
+
+/// `/usr/local/bin/eclipse-look`: switch the desktop look between `kde`
+/// (KDE Breeze Dark) and `eclipse` (the violet original), persisted in
+/// `/etc/eclipse/look` like `eclipse-kbd`/`eclipse-locale`/`eclipse-tz` do
+/// with their own settings. `--boot` is what eclipse-init runs before the
+/// compositor starts; `look=` on the kernel cmdline wins over the file.
+///
+/// What it actually switches, since Plasma itself cannot run here (no session
+/// D-Bus, no Qt, no KF6):
+///   * the labwc window theme, by rewriting `<name>` in `rc.xml` in place;
+///   * the foot palette, by copying `foot.kde.ini` / `foot.eclipse.ini`;
+///   * the panel, which reads `/etc/eclipse/look` itself on start -- so the
+///     switch restarts lunarbar (eclipse-init respawns it at once).
+fn write_eclipse_look(rootfs: &Path) {
+    let localbin = rootfs.join("usr/local/bin");
+    let _ = fs::create_dir_all(&localbin);
+    let script = localbin.join("eclipse-look");
+    fs::write(
+        &script,
+        b"#!/bin/sh\n\
+          # Eclipse OS: desktop look (kde = KDE Breeze Dark, eclipse = violet).\n\
+          CONF=/etc/eclipse/look\n\
+          CFG=\"${HOME:-/root}/.config\"\n\
+          RC=\"$CFG/labwc/rc.xml\"\n\
+          LOG=\"${HOME:-/root}/.eclipse-look.log\"\n\
+          \n\
+          look_ok() {\n\
+          \x20 case \"$1\" in kde|eclipse) return 0 ;; *) return 1 ;; esac\n\
+          }\n\
+          \n\
+          theme_for() {\n\
+          \x20 case \"$1\" in kde) echo Breeze-Dark ;; *) echo Eclipse-Dark ;; esac\n\
+          }\n\
+          \n\
+          file_look() {\n\
+          \x20 [ -r \"$CONF\" ] || return\n\
+          \x20 awk '\n\
+          \x20   { sub(/\\r$/, \"\") }\n\
+          \x20   /^[[:space:]]*#/ { next }\n\
+          \x20   /^[[:space:]]*look[[:space:]]*=/ {\n\
+          \x20     sub(/^[^=]*=/, \"\"); gsub(/[[:space:]]/, \"\"); print; exit\n\
+          \x20   }\n\
+          \x20 ' \"$CONF\"\n\
+          }\n\
+          \n\
+          cmdline_look() {\n\
+          \x20 [ -r /proc/cmdline ] || return\n\
+          \x20 awk '{\n\
+          \x20   n=split($0,a,/[: \\t]/)\n\
+          \x20   for(i=1;i<=n;i++) if(a[i] ~ /^look=/){ sub(/^look=/,\"\",a[i]); print a[i]; exit }\n\
+          \x20 }' /proc/cmdline\n\
+          }\n\
+          \n\
+          current() {\n\
+          \x20 f=$(file_look)\n\
+          \x20 if look_ok \"$f\"; then echo \"$f\"; return; fi\n\
+          \x20 echo kde\n\
+          }\n\
+          \n\
+          resolve_boot() {\n\
+          \x20 c=$(cmdline_look)\n\
+          \x20 if look_ok \"$c\"; then echo \"$c\"; return; fi\n\
+          \x20 current\n\
+          }\n\
+          \n\
+          apply() {\n\
+          \x20 look=$1\n\
+          \x20 boot=$2\n\
+          \x20 theme=$(theme_for \"$look\")\n\
+          \x20 mkdir -p /etc/eclipse\n\
+          \x20 echo \"look=$look\" > \"$CONF\"\n\
+          # labwc theme, rewritten in place. Only the <name> element inside\n\
+          # <theme> carries either string, so this cannot hit anything else.\n\
+          \x20 if [ -f \"$RC\" ]; then\n\
+          \x20   sed -e \"s|<name>Breeze-Dark</name>|<name>$theme</name>|\" \\\n\
+          \x20       -e \"s|<name>Eclipse-Dark</name>|<name>$theme</name>|\" \\\n\
+          \x20       \"$RC\" > \"$RC.new\" 2>/dev/null && mv \"$RC.new\" \"$RC\"\n\
+          \x20 fi\n\
+          # foot palette for new terminals (a running foot keeps its colours).\n\
+          \x20 src=\"$CFG/foot/foot.$look.ini\"\n\
+          \x20 [ -f \"$src\" ] && cp -f \"$src\" \"$CFG/foot/foot.ini\"\n\
+          \x20 if [ \"$boot\" != boot ]; then\n\
+          \x20   if [ -n \"${LABWC_PID:-}\" ] && kill -0 \"$LABWC_PID\" 2>/dev/null; then\n\
+          \x20     kill -HUP \"$LABWC_PID\" 2>>\"$LOG\" || true\n\
+          \x20   elif [ -x /usr/bin/labwc ]; then\n\
+          \x20     /usr/bin/labwc --reconfigure >>\"$LOG\" 2>&1 || true\n\
+          \x20   fi\n\
+          # The panel reads /etc/eclipse/look once at start; eclipse-init\n\
+          # respawns it with the new look immediately.\n\
+          \x20   pkill -x lunarbar 2>/dev/null || true\n\
+          \x20 fi\n\
+          \x20 echo \"[$(date '+%H:%M:%S')] look=$look theme=$theme boot=$boot\" >>\"$LOG\"\n\
+          }\n\
+          \n\
+          usage() {\n\
+          \x20 echo \"usage: eclipse-look [kde|eclipse|--boot]\" >&2\n\
+          \x20 exit 2\n\
+          }\n\
+          \n\
+          case \"${1:-}\" in\n\
+          '' ) current; exit 0 ;;\n\
+          -h|--help) usage ;;\n\
+          --boot)\n\
+          \x20 apply \"$(resolve_boot)\" boot\n\
+          \x20 current\n\
+          \x20 exit 0\n\
+          \x20 ;;\n\
+          kde|eclipse)\n\
+          \x20 apply \"$1\"\n\
+          \x20 echo \"$1\"\n\
+          \x20 ;;\n\
+          *) usage ;;\n\
+          esac\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let etc = rootfs.join("etc/eclipse");
+    let _ = fs::create_dir_all(&etc);
+    fs::write(etc.join("look"), b"look=kde\n").unwrap();
+}
+
+/// The three launchers KDE's keyboard habits need, none of which has a KDE
+/// binary behind it here:
+///   * `eclipse-run`   -- Alt+Space / Alt+F2 / Ctrl+Alt+Del: `lunarrun`, the
+///     native KRunner stand-in (krunner itself is a D-Bus service).
+///   * `eclipse-files` -- Super+E: no Dolphin (no Qt/KF6 in the image), so the
+///     best TUI file manager installed, else a shell in $HOME.
+///   * `eclipse-showdesktop` -- Super+D: minimise/restore every window through
+///     wlr-foreign-toplevel-management (`lunarrun --toggle-desktop`), which
+///     works on every labwc release regardless of its action list.
+fn write_kde_helpers(rootfs: &Path) {
+    let localbin = rootfs.join("usr/local/bin");
+    let _ = fs::create_dir_all(&localbin);
+    use std::os::unix::fs::PermissionsExt;
+
+    let run = localbin.join("eclipse-run");
+    fs::write(
+        &run,
+        b"#!/bin/sh\n\
+          # Eclipse OS: KRunner-style launcher (lunarrun). Bound to Alt+Space,\n\
+          # Alt+F2 and Ctrl+Alt+Del in rc.xml. Toggling: a second press while\n\
+          # one is open closes it instead of stacking overlays.\n\
+          LOG=/tmp/lunarrun.log\n\
+          if pkill -x lunarrun 2>/dev/null; then exit 0; fi\n\
+          command -v lunarrun >/dev/null 2>&1 || {\n\
+          \x20 echo \"[$(date '+%H:%M:%S')] lunarrun missing\" >>\"$LOG\"; exit 127\n\
+          }\n\
+          exec lunarrun >>\"$LOG\" 2>&1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let show = localbin.join("eclipse-showdesktop");
+    fs::write(
+        &show,
+        b"#!/bin/sh\n\
+          # Eclipse OS: KDE's Super+D. Minimises every window, or restores\n\
+          # them when they are all minimised already.\n\
+          command -v lunarrun >/dev/null 2>&1 || exit 127\n\
+          exec lunarrun --toggle-desktop >>/tmp/lunarrun.log 2>&1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&show, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let files = localbin.join("eclipse-files");
+    fs::write(
+        &files,
+        b"#!/bin/sh\n\
+          # Eclipse OS: KDE's Super+E (file manager). Dolphin needs Qt + KF6,\n\
+          # neither of which is in this image, so run the best file manager\n\
+          # that IS installed inside a terminal; failing that, a shell in the\n\
+          # home directory, which is what the key is really for.\n\
+          DIR=\"${1:-${HOME:-/root}}\"\n\
+          for fm in mc nnn lf ranger vifm; do\n\
+          \x20 if command -v \"$fm\" >/dev/null 2>&1; then\n\
+          \x20   exec /usr/local/bin/eclipse-terminal \"$fm\" \"$DIR\"\n\
+          \x20 fi\n\
+          done\n\
+          exec /usr/local/bin/eclipse-terminal sh -c \"cd '$DIR' && exec sh\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&files, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 fn write_x11_prepare(rootfs: &Path) {
@@ -1446,7 +1634,15 @@ fn write_wallpaper(rootfs: &Path) {
 /// Openbox-3 `themerc` consumed by labwc for window decorations, menus and
 /// OSDs. Palette: deep purple night (matches the wallpaper), lavender text,
 /// violet accents.
+/// Two openbox-3 themes for labwc: Eclipse's own violet `Eclipse-Dark`, and
+/// `Breeze-Dark`, a transcription of KDE's Breeze Dark colour scheme
+/// (window `#31363b`, view `#1b1e20`, accent `#3daee9`, text `#fcfcfc`) so a
+/// labwc session can *look* like Plasma without any of Plasma running --
+/// `plasmashell`, `kded` and `krunner` are D-Bus clients top to bottom and
+/// Eclipse has no session bus at all (see `DBUS_SESSION_BUS_ADDRESS` in
+/// `write_labwc_environment`). `eclipse-look` switches between the two.
 fn write_theme(rootfs: &Path) {
+    write_breeze_theme(rootfs);
     let dir = rootfs.join("usr/share/themes/Eclipse-Dark/openbox-3");
     let _ = fs::create_dir_all(&dir);
     fs::write(
@@ -1484,6 +1680,50 @@ fn write_theme(rootfs: &Path) {
     .unwrap();
 }
 
+/// KDE Breeze Dark, as an openbox-3 themerc. Colours taken from Breeze's own
+/// scheme: titlebar `#31363b` active / `#2a2e32` inactive, text `#fcfcfc`,
+/// inactive text `#7f8c8d`, selection/accent `#3daee9`, separators `#4d4d4d`.
+/// The active border uses the accent instead of Breeze's near-invisible grey:
+/// with no window shadows on this stack, a grey-on-grey border left the
+/// focused window unidentifiable.
+fn write_breeze_theme(rootfs: &Path) {
+    let dir = rootfs.join("usr/share/themes/Breeze-Dark/openbox-3");
+    let _ = fs::create_dir_all(&dir);
+    fs::write(
+        dir.join("themerc"),
+        b"# Eclipse OS - KDE Breeze Dark colours for labwc/openbox.\n\
+          border.width: 1\n\
+          padding.width: 8\n\
+          padding.height: 6\n\
+          \n\
+          window.active.border.color: #3daee9\n\
+          window.inactive.border.color: #31363b\n\
+          window.active.title.bg.color: #31363b\n\
+          window.inactive.title.bg.color: #2a2e32\n\
+          window.active.label.text.color: #fcfcfc\n\
+          window.inactive.label.text.color: #7f8c8d\n\
+          window.active.button.unpressed.image.color: #fcfcfc\n\
+          window.active.button.pressed.image.color: #3daee9\n\
+          window.active.button.hover.image.color: #3daee9\n\
+          window.inactive.button.unpressed.image.color: #7f8c8d\n\
+          \n\
+          menu.title.bg.color: #31363b\n\
+          menu.title.text.color: #fcfcfc\n\
+          menu.items.bg.color: #2a2e32\n\
+          menu.items.text.color: #fcfcfc\n\
+          menu.items.disabled.text.color: #7f8c8d\n\
+          menu.items.active.bg.color: #3daee9\n\
+          menu.items.active.text.color: #fcfcfc\n\
+          menu.separator.color: #4d4d4d\n\
+          menu.separator.padding.height: 4\n\
+          \n\
+          osd.bg.color: #31363b\n\
+          osd.border.color: #3daee9\n\
+          osd.label.text.color: #fcfcfc\n",
+    )
+    .unwrap();
+}
+
 /// labwc main config: theme, fonts, four workspaces and enough keybinds to
 /// drive the desktop from the keyboard (terminal, menu, tiling, workspaces).
 fn write_labwc_rc(rootfs: &Path) {
@@ -1502,7 +1742,8 @@ fn write_labwc_rc(rootfs: &Path) {
        nothing else pins it (see write_labwc_environment). -->
   <core><gap>0</gap><xwaylandPersistence>yes</xwaylandPersistence></core>
   <theme>
-    <name>Eclipse-Dark</name>
+    <!-- Switched in place by `eclipse-look` (Breeze-Dark / Eclipse-Dark). -->
+    <name>Breeze-Dark</name>
     <cornerRadius>8</cornerRadius>
     <font place="ActiveWindow"><name>DejaVu Sans</name><size>10</size><weight>bold</weight></font>
     <font place="InactiveWindow"><name>DejaVu Sans</name><size>10</size></font>
@@ -1514,15 +1755,37 @@ fn write_labwc_rc(rootfs: &Path) {
     <!-- Terminals -->
     <keybind key="W-Return"><action name="Execute"><command>/usr/local/bin/eclipse-terminal</command></action></keybind>
     <keybind key="A-Return"><action name="Execute"><command>/usr/local/bin/eclipse-terminal</command></action></keybind>
+    <keybind key="C-A-T"><action name="Execute"><command>/usr/local/bin/eclipse-terminal</command></action></keybind>
+    <!-- KRunner-style launcher: lunarrun, a native wlr-layer-shell overlay
+         (Plasma's krunner is a D-Bus service and cannot run here). Bound on
+         KDE's three habits: Alt+Space, Alt+F2 and Ctrl+Alt+Del. -->
+    <keybind key="A-space"><action name="Execute"><command>/usr/local/bin/eclipse-run</command></action></keybind>
+    <keybind key="A-F2"><action name="Execute"><command>/usr/local/bin/eclipse-run</command></action></keybind>
+    <keybind key="C-A-Delete"><action name="Execute"><command>/usr/local/bin/eclipse-run</command></action></keybind>
+    <!-- Super+E: KDE's file manager key. No Dolphin here (Qt/KF6 are not in
+         the image), so eclipse-files opens the best text file manager
+         installed, or a shell in $HOME. -->
+    <keybind key="W-E"><action name="Execute"><command>/usr/local/bin/eclipse-files</command></action></keybind>
+    <!-- Super+D: show desktop. labwc has no such action on every release, so
+         this minimises (or restores) every window through
+         wlr-foreign-toplevel-management instead, which is version-proof. -->
+    <keybind key="W-D"><action name="Execute"><command>/usr/local/bin/eclipse-showdesktop</command></action></keybind>
     <!-- Desktop menu also on a key, in case the mouse is missing -->
     <keybind key="W-space"><action name="ShowMenu"><menu>root-menu</menu></action></keybind>
     <!-- Window management -->
     <keybind key="A-F4"><action name="Close"/></keybind>
     <keybind key="A-Tab"><action name="NextWindow"/></keybind>
+    <keybind key="A-S-Tab"><action name="PreviousWindow"/></keybind>
+    <keybind key="W-Down"><action name="Iconify"/></keybind>
     <keybind key="W-Up"><action name="ToggleMaximize"/></keybind>
     <keybind key="W-Left"><action name="SnapToEdge"><direction>left</direction></action></keybind>
     <keybind key="W-Right"><action name="SnapToEdge"><direction>right</direction></action></keybind>
     <!-- Workspaces -->
+    <!-- Ctrl+F1..F4 are KDE's desktop keys; Super+1..4 stay as Eclipse had them. -->
+    <keybind key="C-F1"><action name="GoToDesktop"><to>1</to></action></keybind>
+    <keybind key="C-F2"><action name="GoToDesktop"><to>2</to></action></keybind>
+    <keybind key="C-F3"><action name="GoToDesktop"><to>3</to></action></keybind>
+    <keybind key="C-F4"><action name="GoToDesktop"><to>4</to></action></keybind>
     <keybind key="W-1"><action name="GoToDesktop"><to>1</to></action></keybind>
     <keybind key="W-2"><action name="GoToDesktop"><to>2</to></action></keybind>
     <keybind key="W-3"><action name="GoToDesktop"><to>3</to></action></keybind>
@@ -1705,7 +1968,21 @@ fn write_labwc_environment(rootfs: &Path) {
           # chain SDL_Init walks first and where gzdoom hung). With no daemon\n\
           # the connect is refused at once and apps carry on bus-less; a\n\
           # dbus-daemon bound to this path later is picked up automatically.\n\
-          DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus\n",
+          DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus\n\
+          # Qt, for the KDE look: native Wayland first, Xwayland as fallback.\n\
+          # The renderer-dependent half (QT_QUICK_BACKEND=software on pixman)\n\
+          # is exported by the labwc wrapper, like SDL's. NOT set here:\n\
+          # QT_QPA_PLATFORMTHEME=kde and XDG_CURRENT_DESKTOP=KDE, which the\n\
+          # usual \"KDE on labwc\" recipes recommend -- the first needs the\n\
+          # plasma-integration plugin and the second makes portals and GTK\n\
+          # look for a KDE session that is not there. Neither exists in this\n\
+          # image, so both only produce warnings and wrong lookups.\n\
+          QT_QPA_PLATFORM=wayland;xcb\n\
+          QT_AUTO_SCREEN_SCALE_FACTOR=1\n\
+          # Desktop identity, for .desktop OnlyShowIn/NotShowIn filtering and\n\
+          # any app that asks: this IS a wlroots session, whatever it looks like.\n\
+          XDG_CURRENT_DESKTOP=labwc:wlroots\n\
+          XDG_SESSION_DESKTOP=labwc\n",
     )
     .unwrap();
 }
@@ -1761,43 +2038,51 @@ fn write_gtk_settings(rootfs: &Path) {
 fn write_foot_config(rootfs: &Path) {
     let dir = rootfs.join("root/.config/foot");
     let _ = fs::create_dir_all(&dir);
-    fs::write(
-        dir.join("foot.ini"),
-        b"# Eclipse OS - foot terminal theme.\n\
-          # Name a real monospace family first: the bare 'monospace' alias\n\
-          # can resolve to a non-mono font (DejaVuMathTeXGyre) on a minimal\n\
-          # fontconfig, which foot warns about on every start.\n\
-          font=DejaVu Sans Mono:size=10,monospace:size=10\n\
-          pad=6x6\n\
-          # Single render worker. foot defaults to one render thread PER CPU\n\
-          # (logs \"using N rendering threads\"); on a 20-core box that is 20\n\
-          # threads hammering the render mutex/semaphores at once, which\n\
-          # SEGFAULTs foot (terminal exits rc=139) on Eclipse's young SMP;\n\
-          # the crash never reproduces in a 2-CPU VM. One worker trades a\n\
-          # little redraw speed for a terminal that actually starts.\n\
-          workers=1\n\
-          \n\
-          [colors-dark]\n\
-          background=120f1c\n\
-          foreground=e0dcf4\n\
-          regular0=1d1930\n\
-          regular1=e07a7a\n\
-          regular2=8fd18a\n\
-          regular3=e0c07a\n\
-          regular4=8a9fe0\n\
-          regular5=b98ae0\n\
-          regular6=7ac9d1\n\
-          regular7=c9c4e4\n\
-          bright0=3a3357\n\
-          bright1=f09a9a\n\
-          bright2=aef0a8\n\
-          bright3=f0d89a\n\
-          bright4=a8bef0\n\
-          bright5=d1a8f0\n\
-          bright6=9ae0e8\n\
-          bright7=f0eefc\n",
+    // Both palettes ship; `eclipse-look` copies the active one over foot.ini
+    // (a running foot keeps its colours until restarted).
+    fs::write(dir.join("foot.eclipse.ini"), foot_ini(FOOT_ECLIPSE)).unwrap();
+    fs::write(dir.join("foot.kde.ini"), foot_ini(FOOT_BREEZE)).unwrap();
+    fs::write(dir.join("foot.ini"), foot_ini(FOOT_BREEZE)).unwrap();
+}
+
+/// Eclipse's own violet palette.
+const FOOT_ECLIPSE: &str = "\
+background=120f1c\nforeground=e0dcf4\n\
+regular0=1d1930\nregular1=e07a7a\nregular2=8fd18a\nregular3=e0c07a\n\
+regular4=8a9fe0\nregular5=b98ae0\nregular6=7ac9d1\nregular7=c9c4e4\n\
+bright0=3a3357\nbright1=f09a9a\nbright2=aef0a8\nbright3=f0d89a\n\
+bright4=a8bef0\nbright5=d1a8f0\nbright6=9ae0e8\nbright7=f0eefc\n";
+
+/// KDE's own Konsole "Breeze" palette, so a terminal in the KDE look matches
+/// the rest of the session.
+const FOOT_BREEZE: &str = "\
+background=232629\nforeground=fcfcfc\n\
+regular0=232629\nregular1=ed1515\nregular2=11d116\nregular3=f67400\n\
+regular4=1d99f3\nregular5=9b59b6\nregular6=1abc9c\nregular7=fcfcfc\n\
+bright0=7f8c8d\nbright1=c0392b\nbright2=1cdc9a\nbright3=fdbc4b\n\
+bright4=3daee9\nbright5=8e44ad\nbright6=16a085\nbright7=ffffff\n";
+
+fn foot_ini(colors: &str) -> String {
+    format!(
+        "# Eclipse OS - foot terminal theme (written by xtask; pick the look\n\
+         # with `eclipse-look kde|eclipse`, which copies foot.kde.ini or\n\
+         # foot.eclipse.ini over this file).\n\
+         # Name a real monospace family first: the bare 'monospace' alias\n\
+         # can resolve to a non-mono font (DejaVuMathTeXGyre) on a minimal\n\
+         # fontconfig, which foot warns about on every start.\n\
+         font=DejaVu Sans Mono:size=10,monospace:size=10\n\
+         pad=6x6\n\
+         # Single render worker. foot defaults to one render thread PER CPU\n\
+         # (logs \"using N rendering threads\"); on a 20-core box that is 20\n\
+         # threads hammering the render mutex/semaphores at once, which\n\
+         # SEGFAULTs foot (terminal exits rc=139) on Eclipse's young SMP;\n\
+         # the crash never reproduces in a 2-CPU VM. One worker trades a\n\
+         # little redraw speed for a terminal that actually starts.\n\
+         workers=1\n\
+         \n\
+         [colors-dark]\n\
+         {colors}"
     )
-    .unwrap();
 }
 
 /// Bulletproof `labwc` launcher. wlroots picks its renderer from
@@ -1902,6 +2187,24 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # through Pulse so several clients share the HDA PCM.\n\
           : \"${ALSOFT_DRIVERS:=pulse,alsa}\"; export ALSOFT_DRIVERS\n\
           : \"${PULSE_SERVER:=unix:/run/pulse/native}\"; export PULSE_SERVER\n\
+          # Qt 5/6 policy, for the KDE look. Nothing Qt is installed today\n\
+          # (no Qt, no KF6, and no way to run Plasma itself: plasmashell,\n\
+          # kded and krunner are D-Bus services and there is no session bus\n\
+          # -- see the DBUS_SESSION_BUS_ADDRESS note below). These make a Qt\n\
+          # app behave the day one IS installed, and cost nothing until then.\n\
+          # Native Wayland first, Xwayland as fallback, exactly like SDL.\n\
+          # QT_QPA_PLATFORMTHEME is deliberately NOT set to `kde`: that plugin\n\
+          # lives in plasma-integration/KF6 and, absent, makes every Qt app\n\
+          # warn about a missing platform theme at startup.\n\
+          : \"${QT_QPA_PLATFORM:=wayland;xcb}\"; export QT_QPA_PLATFORM\n\
+          : \"${QT_AUTO_SCREEN_SCALE_FACTOR:=1}\"; export QT_AUTO_SCREEN_SCALE_FACTOR\n\
+          # Qt Quick (all of Plasma's UI, and any QML app) needs GL. On the\n\
+          # pixman session the only GL is llvmpipe, where Qt Quick's own\n\
+          # software rasterizer is both faster and safer, so derive the backend\n\
+          # from the renderer picked above rather than hardcoding it.\n\
+          if [ \"${WLR_RENDERER:-}\" = pixman ]; then\n\
+          \x20 : \"${QT_QUICK_BACKEND:=software}\"; export QT_QUICK_BACKEND\n\
+          fi\n\
           # D-Bus: there is no session bus on Eclipse OS. libdbus's default\n\
           # for an UNSET address is `autolaunch:`, which forks dbus-launch,\n\
           # which opens $DISPLAY and spawns a dbus-daemon plus a babysitter\n\
