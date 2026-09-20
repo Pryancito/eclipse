@@ -8,7 +8,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 #[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::{_mm_clflush, _mm_lfence, _mm_mfence};
+use core::arch::x86_64::{_mm_clflush, _mm_mfence};
 use core::hint::spin_loop;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, AtomicBool, Ordering};
@@ -511,6 +511,19 @@ fn trb_configure_endpoint(input_ctx: u64, slot: u8) -> Trb {
     }
 }
 
+/// Evaluate Context (xHCI 1.2 section 4.6.7). This is the command that changes
+/// fields of an ALREADY configured context -- EP0's Max Packet Size among
+/// them. Configure Endpoint is for adding and dropping endpoints, and on a
+/// controller that enforces the distinction it answers Context State Error
+/// here, leaving EP0 at the guessed packet size.
+fn trb_evaluate_context(input_ctx: u64, slot: u8) -> Trb {
+    Trb {
+        p: input_ctx,
+        status: 0,
+        ctrl: (13u32 << 10) | ((slot as u32) << 24),
+    }
+}
+
 fn trb_reset_endpoint(slot: u8, dci: u8) -> Trb {
     Trb {
         p: 0,
@@ -636,11 +649,19 @@ impl CmdRing {
         self.buf.flush(off, 16);
         self.enq += 1;
         if self.enq >= self.cap {
+            // The Link TRB's Cycle bit is published with the producer cycle
+            // state of the pass that just ended, and ONLY here. There used to
+            // be a second `sync_link_cycle_bit()` halfway through each pass:
+            // by then `self.cycle` had already been toggled, so it stamped the
+            // NEXT pass's cycle onto the Link TRB while a consumer still
+            // working through the tail of the current pass had not reached it
+            // yet. That consumer then found a Link TRB whose Cycle bit did not
+            // match its own state, stopped there, and the ring was dead for
+            // good -- no more transfers, no more events, nothing to recover
+            // from. (xHCI 1.2 section 4.9.2.2.)
             self.enq = 0;
             self.sync_link_cycle_bit();
             self.cycle = !self.cycle;
-        } else if self.cap >= 4 && self.enq == self.cap / 2 {
-            self.sync_link_cycle_bit();
         }
         Ok(phys)
     }
@@ -719,11 +740,10 @@ impl XferRing {
         self.buf.flush(off, 16);
         self.enq += 1;
         if self.enq >= self.cap {
+            // Only at the wrap -- see the note on the command ring's `push`.
             self.enq = 0;
             self.sync_link_cycle_bit();
             self.cycle = !self.cycle;
-        } else if self.cap >= 4 && self.enq == self.cap / 2 {
-            self.sync_link_cycle_bit();
         }
         Ok(phys)
     }
@@ -819,7 +839,11 @@ impl EventRing {
             // Cada TRB = 16 bytes. Una línea de caché = 64 bytes = 4 TRBs.
             // clflush invalida toda la línea, así que un solo flush es suficiente.
             _mm_clflush((self.seg.virt + off) as *const u8);
-            _mm_lfence();
+            // MFENCE, not LFENCE: CLFLUSH is ordered with respect to MFENCE
+            // only (Intel SDM, CLFLUSH). An LFENCE here does not guarantee the
+            // invalidate has completed before the load below, which is the
+            // whole point of the flush.
+            _mm_mfence();
         }
         let c = self.seg.read_u32(off + 12);
         if (c & 1) == (self.cycle as u32) {
@@ -1533,7 +1557,10 @@ pub struct XhciInner {
     /// error (Stall/Babble/…) and need a Reset Endpoint + re-arm. Deferred for
     /// the same reason as `pending_port_changes`: the recovery issues commands
     /// and waits on the event ring, which must not run nested inside `pop_ev`.
-    pending_ep_resets: Vec<(u8, u8)>,
+    /// `(slot, dci, stalled)` for endpoints that errored during an event
+    /// drain. `stalled` means the completion code was Stall Error, so the
+    /// DEVICE also has to be told to clear its halt.
+    pending_ep_resets: Vec<(u8, u8, bool)>,
     /// HID enumeration deferred from PCI probe so boot can pass 80% quickly.
     boot_enum_pending: bool,
     /// Number of consecutive soft-recovery attempts since the controller last
@@ -1595,6 +1622,30 @@ struct HidDev {
     /// Parsed keyboard report layout. [`BOOT_KEY_LAYOUT`] for a boot-protocol
     /// keyboard (no report descriptor is read for those).
     key_layout: Option<KeyLayout>,
+}
+
+/// `bEndpointAddress` of the endpoint a Device Context Index names.
+/// DCI = 2*N for an OUT endpoint, 2*N+1 for an IN one; DCI 1 is EP0.
+fn ep_addr_from_dci(dci: u8) -> u16 {
+    let ep_num = (dci >> 1) as u16;
+    if dci & 1 == 1 {
+        ep_num | 0x80
+    } else {
+        ep_num
+    }
+}
+
+/// Does this Transfer Event belong to the control transfer whose three TRBs
+/// sit at `setup` / `data` / `status`?
+///
+/// VirtualBox sometimes reports `ev.p` as the TRB AFTER the completed one, so
+/// each address is accepted at itself and one slot past it. A zero address
+/// means that stage is absent (a control transfer with no data stage) and
+/// matches nothing.
+fn ep0_event_belongs(setup: u64, data: u64, status: u64, p: u64) -> bool {
+    [setup, data, status]
+        .iter()
+        .any(|&t| t != 0 && (p == t || p == t.wrapping_add(16)))
 }
 
 impl XhciInner {
@@ -1762,9 +1813,16 @@ impl XhciInner {
                     h.enqueue_idx = (h.enqueue_idx + 1) % HID_QUEUE_DEPTH;
                 }
                 if cc_halts_endpoint(cc) {
-                    let key = (i as u8, dci);
-                    if !self.pending_ep_resets.contains(&key) {
-                        self.pending_ep_resets.push(key);
+                    // CC 6 is Stall Error (CC 5 is TRB Error).
+                    let stalled = cc == 6;
+                    if let Some(e) = self
+                        .pending_ep_resets
+                        .iter_mut()
+                        .find(|(s, d, _)| *s == i as u8 && *d == dci)
+                    {
+                        e.2 |= stalled;
+                    } else {
+                        self.pending_ep_resets.push((i as u8, dci, stalled));
                     }
                 } else {
                     // Missed Service Error is the one a real xHCI actually
@@ -1948,6 +2006,25 @@ impl XhciInner {
         self.wait_cmd_phys(p)
     }
 
+    /// Clear the device's own ENDPOINT_HALT feature (USB 2.0 section 9.4.1).
+    ///
+    /// Reset Endpoint and Set TR Dequeue Pointer un-halt the HOST side only.
+    /// The device keeps its halt feature set and its data toggle where it was,
+    /// so it STALLs the very next transaction and we reset again: an endless
+    /// error -> reset -> error loop with no reports coming out, which is what a
+    /// stalled mouse looks like from userspace. `usb_clear_halt()` in Linux
+    /// does exactly this control request and then resets the host side.
+    fn clear_endpoint_halt(&mut self, slot: u8, dci: u8) -> DeviceResult<()> {
+        let addr = ep_addr_from_dci(dci);
+        self.ep0_control_out0_optional(
+            slot,
+            // bmRequestType 0x02 (host->device, standard, endpoint),
+            // bRequest 1 (CLEAR_FEATURE), wValue 0 (ENDPOINT_HALT).
+            trb_setup(0x02, 0x01, 0x0000, addr, 0, 0),
+            true,
+        )
+    }
+
     fn reset_endpoint_and_dequeue(&mut self, slot: u8, dci: u8) -> DeviceResult<()> {
         info!(
             "[xhci] reset_endpoint_and_dequeue slot={} dci={}",
@@ -1992,11 +2069,16 @@ impl XhciInner {
             "[xhci] EP0 slot={} speed={} esperando: setup={:#x} data={:#x} status={:#x}",
             slot, speed, setup_phys, data_phys, status_phys
         );
-        // Calcular el rango del anillo EP0 para este slot para hacer matching flexible.
-        // VirtualBox a veces reporta ev.p apuntando al TRB siguiente al completado,
-        // así que comprobamos si p cae en la ventana [setup_phys, status_phys+16).
-        let lo = setup_phys.min(data_phys).min(status_phys);
-        let hi = setup_phys.max(data_phys).max(status_phys) + 16;
+        // Which event belongs to THIS control transfer. VirtualBox sometimes
+        // reports `ev.p` as the TRB after the completed one, so each of our
+        // three TRBs is accepted at its own address and one slot past it.
+        //
+        // The old test was "anywhere in [min, max+16)", a window that spans
+        // the whole EP0 ring the moment a transfer straddles the ring wrap
+        // (status_phys below setup_phys) -- and then the answer to some
+        // OTHER request could satisfy this wait, which is how a device ends up
+        // configured from a descriptor it never sent.
+
         let start = timer_now_us();
         let mut spins = 0u64;
         let mut ev_count = 0u32;
@@ -2014,11 +2096,9 @@ impl XhciInner {
                     );
                     // Matching flexible: dirección exacta (QEMU) o dentro del rango de la
                     // transferencia de control EP0 (VirtualBox puede reportar TRB+N).
-                    let in_range = ev.p == setup_phys
-                        || ev.p == data_phys
-                        || ev.p == status_phys
-                        || (ev.p >= lo && ev.p < hi);
-                    if ev_slot == slot && in_range {
+                    if ev_slot == slot
+                        && ep0_event_belongs(setup_phys, data_phys, status_phys, ev.p)
+                    {
                         let i = Self::ri(slot, 1);
                         if let Some(r) = self.xfer_rings.get_mut(i).and_then(|o| o.as_mut()) {
                             r.advance_dequeue(n_trb);
@@ -2031,10 +2111,14 @@ impl XhciInner {
                             return Ok(());
                         }
                         if cc == 6 {
+                            // Stall Error: the device refused the request.
+                            // Callers treat a stalled optional request as
+                            // "unsupported", which is what a STALL means.
                             info!(
                                 "[xhci] EP0 slot={} STALL (CC=6). Clearing halt, returning OK.",
                                 slot
                             );
+                            let _ = self.clear_endpoint_halt(slot, 1);
                             let _ = self.reset_endpoint_and_dequeue(slot, 1);
                             return Ok(());
                         }
@@ -2071,6 +2155,15 @@ impl XhciInner {
         );
         let sts = self.mmio.read_op(4);
         error!("[xhci] USBSTS={:#010x}", sts);
+        // Step the software dequeue past the TDs that never completed. Without
+        // this, `reset_endpoint_and_dequeue` points the controller's TR
+        // Dequeue Pointer back at the Setup TRB of the request that just timed
+        // out, so the next doorbell replays it -- and its late answer then
+        // satisfies the wait belonging to whatever request came after.
+        let ri = Self::ri(slot, 1);
+        if let Some(r) = self.xfer_rings.get_mut(ri).and_then(|o| o.as_mut()) {
+            r.advance_dequeue(n_trb);
+        }
         let _ = self.reset_endpoint_and_dequeue(slot, 1);
         Err(DeviceError::IoError)
     }
@@ -2621,8 +2714,11 @@ impl XhciInner {
         let real_mps = raw_desc[7] as u32;
         if real_mps != mps && real_mps >= 8 {
             let ic_upd = DmaBuf::new(input_sz, 64)?;
-            ic_upd.write_u32(4, 0x03); // Add Slot (A0) and EP0 (A1)
-                                       // Copiar contexto actual
+            // Add EP0 (A1) only, like `xhci_check_maxpacket` in Linux: with A0
+            // clear the Slot Context is not evaluated, so we cannot disturb
+            // the device address the controller just assigned.
+            ic_upd.write_u32(4, 0x02);
+            // Copiar contexto actual
             if let Some(dev_ctx) = self.dev_ctx[slot as usize].as_ref() {
                 // Invalidar caché antes de leer datos escritos por el controlador via DMA.
                 dev_ctx.flush(0, dev_sz);
@@ -2639,12 +2735,20 @@ impl XhciInner {
             let ep0_dw1 = ic_upd.read_u32(ep0 + 4);
             ic_upd.write_u32(ep0 + 4, (ep0_dw1 & 0x0000FFFF) | (real_mps << 16));
 
+            // Flush BEFORE the doorbell: the controller reads the input
+            // context by DMA as soon as it is rung.
+            ic_upd.flush(0, input_sz);
             let p_upd = self
                 .cmd
-                .push(trb_configure_endpoint(ic_upd.sub_phys(0), slot))?;
-            ic_upd.flush(0, input_sz);
+                .push(trb_evaluate_context(ic_upd.sub_phys(0), slot))?;
             self.mmio.ring_db(0, 0);
-            let _ = self.wait_cmd_phys(p_upd);
+            if self.wait_cmd_phys(p_upd).is_err() {
+                warn!(
+                    "[xhci] slot={} Evaluate Context for bMaxPacketSize0={} failed; \
+                     EP0 stays at {}",
+                    slot, real_mps, mps
+                );
+            }
         }
 
         self.setup_hid_from_config(slot, csz, port, vid, pid)?;
@@ -2812,7 +2916,11 @@ impl XhciInner {
         desc_out: &mut ([u8; 64], usize),
         parsed_out: &mut HidDescInfo,
     ) -> Option<HidClass> {
-        let len = (report_desc_len as usize).clamp(1, 1024);
+        // `HID_MAX_DESCRIPTOR_SIZE` in Linux. A 1024-byte ceiling truncated
+        // the descriptor of any keyboard with a full media/macro section, and
+        // a truncated descriptor parses into a layout that does not match the
+        // reports the device actually sends.
+        let len = (report_desc_len as usize).clamp(1, 4096);
         let buf_len = len.div_ceil(64).max(1) * 64;
         let buf = DmaBuf::new(buf_len, 64).ok()?;
         buf.flush(0, buf_len);
@@ -3493,8 +3601,19 @@ impl XhciInner {
     /// Reset Endpoint / Set TR Dequeue commands (which spin on the event ring)
     /// don't recurse into the drain loop.
     fn drain_pending_ep_resets(&mut self) {
-        let resets: Vec<(u8, u8)> = core::mem::take(&mut self.pending_ep_resets);
-        for (slot, dci) in resets {
+        let resets: Vec<(u8, u8, bool)> = core::mem::take(&mut self.pending_ep_resets);
+        for (slot, dci, stalled) in resets {
+            // A STALL is the device's halt, not just the host's: clear it on
+            // the device first, exactly as `usb_clear_halt()` does, or the
+            // endpoint stalls again on the next transaction and we loop here
+            // forever.
+            if stalled && self.clear_endpoint_halt(slot, dci).is_err() {
+                warn!(
+                    "[xhci] slot={} dci={} ClearFeature(ENDPOINT_HALT) failed; \
+                     resetting the host side anyway",
+                    slot, dci
+                );
+            }
             // Reset the halted endpoint and point its TR dequeue past the failed
             // TRB (already skipped via advance_dequeue), then re-arm one TRB and
             // ring the doorbell so interrupt transfers resume.
@@ -4670,5 +4789,45 @@ mod tests {
         );
         tmp[3..].fill(0);
         assert_eq!(read_signed_bits(&tmp, ml.wheel.unwrap().off, 8), 0);
+    }
+
+    #[test]
+    fn a_control_event_only_answers_its_own_transfer() {
+        // Three TRBs, contiguous, plus VirtualBox's off-by-one on each.
+        let (setup, data, status) = (0x1000, 0x1010, 0x1020);
+        for p in [setup, data, status, 0x1030] {
+            assert!(ep0_event_belongs(setup, data, status, p), "{:#x}", p);
+        }
+        // The TRB before the Setup stage, and anything past the transfer,
+        // belong to some other request. The old "[min, max+16)" window let a
+        // wrapped transfer (status below setup) span the whole ring.
+        for p in [0xff0u64, 0x1040, 0x2000] {
+            assert!(!ep0_event_belongs(setup, data, status, p), "{:#x}", p);
+        }
+        // No data stage: a zero address matches nothing, not address zero.
+        assert!(!ep0_event_belongs(setup, 0, status, 0));
+        assert!(ep0_event_belongs(setup, 0, status, status));
+    }
+
+    #[test]
+    fn a_dci_names_the_endpoint_clear_feature_has_to_address() {
+        assert_eq!(ep_addr_from_dci(1), 0x80, "EP0 IN");
+        assert_eq!(
+            ep_addr_from_dci(3),
+            0x81,
+            "EP1 IN, where HID reports come from"
+        );
+        assert_eq!(ep_addr_from_dci(2), 0x01, "EP1 OUT");
+        assert_eq!(ep_addr_from_dci(9), 0x84);
+    }
+
+    #[test]
+    fn a_missed_service_error_does_not_halt_the_endpoint() {
+        // The one a real xHCI produces on a busy bus, and the reason a mouse
+        // went quiet on metal but never under QEMU.
+        assert!(!cc_halts_endpoint(23));
+        // Stall Error and Babble do halt it.
+        assert!(cc_halts_endpoint(6));
+        assert!(cc_halts_endpoint(3));
     }
 }
