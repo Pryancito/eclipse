@@ -1283,6 +1283,13 @@ impl Syscall<'_> {
         // SYNCOBJ_WAIT; NVK's WAIT_PENDING / explicit-sync path uses it.
         const WAIT_AVAILABLE: u32 = 1 << 2;
         let wait_available = req.flags & WAIT_AVAILABLE != 0;
+        // Argument validation first, exactly where `drm_syncobj_eventfd_ioctl`
+        // does it: an unknown flag bit or a non-zero pad is EINVAL before the
+        // handle is ever looked up. WAIT_AVAILABLE is the only flag core DRM
+        // defines for this ioctl.
+        if req.flags & !WAIT_AVAILABLE != 0 || req.pad != 0 {
+            return Err(LxError::EINVAL);
+        }
         // Resolve both preconditions up front so the trace below can report the
         // EXACT reason, then apply them in order.
         let live = kernel_hal::drivers::scheme::syncobj::query(req.handle).is_some();
@@ -1296,7 +1303,7 @@ impl Syscall<'_> {
             .map(|e| e.downcast_ref::<linux_object::fs::EventFd>().is_some())
             .unwrap_or(false);
         let outcome = if !live {
-            "EINVAL: handle not a live syncobj"
+            "ENOENT: handle not a live syncobj"
         } else if ev.is_err() {
             "EBADF: fd not in the process fd table"
         } else if !is_eventfd {
@@ -1307,8 +1314,8 @@ impl Syscall<'_> {
         // Bounded, ERROR-level (always console-visible, same as `einval-hunt`)
         // trace of the first 32 arm attempts. klog_info did not surface on the
         // rig's console; the `einval-hunt` error! line does, so match it.
-        // The `einval-hunt` sees SYNCOBJ_EVENTFD return EINVAL but not WHY, and
-        // this is the compositor's explicit-sync WAIT: wlroots arms one per
+        // The `einval-hunt` sees SYNCOBJ_EVENTFD fail but not WHY, and this is
+        // the compositor's explicit-sync WAIT: wlroots arms one per
         // GPU-client frame to learn when the client's render fence has landed.
         // If it fails, the compositor never waits on that fence and may sample
         // the client's dma-buf MID-RENDER -- block-structured garbage on a GPU
@@ -1332,7 +1339,20 @@ impl Syscall<'_> {
             }
         }
         if !live {
-            return Err(LxError::EINVAL);
+            // ENOENT, not EINVAL. `drm_syncobj_eventfd_ioctl` returns `-ENOENT`
+            // when `drm_syncobj_find` misses, and wlroots does not just tolerate
+            // that errno -- it DEPENDS on it. Its support probe calls this ioctl
+            // with a deliberately impossible request, `{handle = 0, flags = 0,
+            // point = 0, fd = -1}`, and concludes the kernel implements
+            // SYNCOBJ_EVENTFD only if the failure is exactly ENOENT (a kernel
+            // without the ioctl answers EINVAL/ENOTTY). Answering EINVAL made
+            // us look like that older kernel, so wlroots switched
+            // `linux-drm-syncobj-v1` off and every GPU client fell back to
+            // implicit sync. The probe is visible in the boot log as the
+            // `handle=0 point=0 fd=-1` arm attempt, which is why it is worth
+            // saying out loud that a handle of 0 here is not a bug in the
+            // caller -- it is the caller asking us a question.
+            return Err(LxError::ENOENT);
         }
         let ev = ev?;
         if !is_eventfd {

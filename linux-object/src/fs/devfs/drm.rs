@@ -311,6 +311,20 @@ struct DrmState {
     fb_backing: Vec<(u32, Arc<VmObject>)>,
     /// Framebuffer currently bound to the (synthetic) CRTC, reported by GETCRTC.
     crtc_fb: u32,
+    /// The last few framebuffer ids that went away, and what took them —
+    /// newest last, capped at [`FB_RETIRE_HISTORY`].
+    ///
+    /// Purely diagnostic, and it answers the one question a
+    /// `PresentError::NoSuchFb` on the console cannot answer by itself: did
+    /// the client scan out an id it never had, or one the kernel took from it?
+    /// Those two have opposite fixes, and only the second is our bug.
+    /// `retire_framebuffers_for_handle` and the process-exit sweep both drop a
+    /// framebuffer while its owner may still hold the id -- Linux never does,
+    /// because there a `drm_framebuffer` holds its own reference on the GEM
+    /// object, and a nouveau-backed fb here holds nothing. `RMFB` is recorded
+    /// too: "the client removed it itself and then presented it" is a real
+    /// answer, and a different one.
+    fb_retirements: VecDeque<(u32, FbRetired)>,
     /// The VT the compositor owns the display on, established on its first
     /// present. While the active VT differs (the user switched to a text
     /// console with Ctrl+Alt+Fn), the compositor's blits are suppressed so the
@@ -430,6 +444,7 @@ lazy_static::lazy_static! {
         framebuffers: Vec::new(),
         fb_backing: Vec::new(),
         crtc_fb: 0,
+        fb_retirements: VecDeque::new(),
         graphics_vt: None,
         next_vblank: Duration::ZERO,
         cursor: CursorState {
@@ -1152,12 +1167,21 @@ pub fn retire_framebuffers_for_handle(handle_id: u32) -> usize {
     }
     let mut state = DRM_STATE.lock();
     let before = state.framebuffers.len();
+    let taken: Vec<u32> = state
+        .framebuffers
+        .iter()
+        .filter(|fb| fb.gem_handle_id == handle_id)
+        .map(|fb| fb.id)
+        .collect();
     state
         .framebuffers
         .retain(|fb| fb.gem_handle_id != handle_id);
     let dropped = before - state.framebuffers.len();
     if dropped == 0 {
         return 0;
+    }
+    for fb_id in taken {
+        note_fb_retired(&mut state, fb_id, FbRetired::HandleClosed);
     }
     let live: Vec<u32> = state.framebuffers.iter().map(|fb| fb.id).collect();
     state.fb_backing.retain(|(id, _)| live.contains(id));
@@ -1183,6 +1207,7 @@ pub fn rmfb(fb_id: u32) -> bool {
     if state.crtc_fb == fb_id {
         state.crtc_fb = 0;
     }
+    note_fb_retired(&mut state, fb_id, FbRetired::Removed);
     true
 }
 
@@ -1195,6 +1220,11 @@ pub fn display_mode() -> Option<(u32, u32, u32)> {
 /// Bind a framebuffer to a CRTC (the value reported back by GETCRTC).
 pub fn set_crtc_fb(_crtc_id: u32, fb_id: u32) {
     DRM_STATE.lock().crtc_fb = fb_id;
+}
+
+/// The framebuffer [`set_crtc_fb`] last bound — what `GETCRTC` reports.
+pub fn crtc_fb() -> u32 {
+    DRM_STATE.lock().crtc_fb
 }
 
 /// Rows per [`blit_chunked`] band. 128 rows is ~2 MiB at 1920-wide ARGB —
@@ -1511,6 +1541,97 @@ fn dma_sync_gem_rect_from_device(
     }
 }
 
+/// How many retired framebuffer ids [`DrmState::fb_retirements`] remembers.
+/// A double-buffered swapchain retires two per recreate, so sixteen covers
+/// several recreates -- far enough back to still cover the id a stuck
+/// compositor keeps re-presenting, and small enough to stay a fixed cost.
+const FB_RETIRE_HISTORY: usize = 16;
+
+/// What took a framebuffer away. See [`DrmState::fb_retirements`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FbRetired {
+    /// The client asked, with `RMFB`/`CLOSEFB`. Its own doing.
+    Removed,
+    /// `GEM_CLOSE` on the nouveau handle underneath it took it with the
+    /// memory (see [`retire_framebuffers_for_handle`]). The client was never
+    /// told, and on Linux this would not have happened at all.
+    HandleClosed,
+    /// The owning process exited and the sweep in [`release_process`] took it.
+    ProcessExited,
+}
+
+impl FbRetired {
+    /// Short text for the console line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FbRetired::Removed => "RMFB/CLOSEFB by the client",
+            FbRetired::HandleClosed => "GEM_CLOSE of the nouveau handle under it",
+            FbRetired::ProcessExited => "the owning process exited",
+        }
+    }
+}
+
+/// Remember that `fb_id` is gone, and why. Caller holds the `DRM_STATE` lock.
+fn note_fb_retired(state: &mut DrmState, fb_id: u32, why: FbRetired) {
+    if state.fb_retirements.len() >= FB_RETIRE_HISTORY {
+        state.fb_retirements.pop_front();
+    }
+    state.fb_retirements.push_back((fb_id, why));
+}
+
+/// What took `fb_id` away, if it is one of the last [`FB_RETIRE_HISTORY`] to
+/// go. `None` means it was never a framebuffer of ours (or went long ago).
+pub fn fb_retired_reason(fb_id: u32) -> Option<FbRetired> {
+    DRM_STATE
+        .lock()
+        .fb_retirements
+        .iter()
+        .rev()
+        .find(|(id, _)| *id == fb_id)
+        .map(|(_, why)| *why)
+}
+
+/// Why a present could not put the caller's pixels on the screen.
+///
+/// The present path used to answer a bare `false`, and every ioctl arm turned
+/// that into `EIO`. Two things went wrong with that. wlroots' legacy backend
+/// treats a failed `drmModeSetCrtc` as a failure of the *output*, so it retries
+/// the whole modeset on the next frame and never advances to page-flipping:
+/// one unpresentable frame cost the entire desktop, at the 8 Hz storm of
+/// "connector HDMI-A-1: Failed to set CRTC: I/O error" the compositor log
+/// shows. And `EIO` named none of the causes below, while the kernel side of
+/// each one is a `warn!` that a rig booted at `LOG=error` never prints -- so
+/// the console said nothing at all about which it was.
+///
+/// Both halves need the reason: the arms answer with the errno Linux answers
+/// with (a bad fb id is `ENOENT`, not `EIO`), and say on the console which of
+/// these happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentError {
+    /// No framebuffer object carries this id. Linux's `drm_mode_setcrtc` and
+    /// `drm_mode_setplane` both answer `ENOENT` here ("Unknown FB ID"), and a
+    /// client that lost its fb behind its back -- see
+    /// [`retire_framebuffers_for_handle`] -- needs to be told *that*, not
+    /// "I/O error".
+    NoSuchFb,
+    /// No display scheme is registered to blit into.
+    NoDisplay,
+    /// The fb exists but describes no memory (`phys_addr`/`size` of 0), so
+    /// there is nothing to copy from.
+    NoBacking,
+}
+
+impl PresentError {
+    /// Short, stable text for the console line — the tag a bug report greps for.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PresentError::NoSuchFb => "no such fb id",
+            PresentError::NoDisplay => "no display to blit into",
+            PresentError::NoBacking => "fb has no backing memory",
+        }
+    }
+}
+
 /// Copy a framebuffer's pixels to the hardware display ("scan out").
 ///
 /// Used by the software KMS path (no GPU driver): the dumb buffer is contiguous
@@ -1546,23 +1667,30 @@ fn expand_x_for_wc(x: u32, w: u32, limit: u32) -> (u32, u32) {
 /// (page-flip / modeset) always repaints everything, as does an out-of-range
 /// or degenerate `rect`. Horizontal edges are expanded to 64-byte WC lines.
 pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
+    scanout_region_checked(fb_id, rect).is_ok()
+}
+
+/// [`scanout_region`], but naming the reason it could not put pixels on the
+/// screen instead of collapsing every one of them to `false`. See
+/// [`PresentError`] for why the ioctl arms need the distinction.
+pub fn scanout_region_checked(
+    fb_id: u32,
+    rect: Option<(u32, u32, u32, u32)>,
+) -> Result<(), PresentError> {
     let fb = {
         let state = DRM_STATE.lock();
         match state.framebuffers.iter().find(|f| f.id == fb_id) {
             Some(f) => *f,
             None => {
                 warn!("[drm] scanout: fb_id={} not found", fb_id);
-                return false;
+                return Err(PresentError::NoSuchFb);
             }
         }
     };
-    let display = match primary_display() {
-        Some(d) => d,
-        None => {
-            warn!("[drm] scanout: no display -- software_kms inactive, nothing to blit to");
-            return false;
-        }
-    };
+    // Before the display, because this one is the framebuffer's OWN defect and
+    // holds whether or not anything is plugged in: a fb with no backing can
+    // never present, on any display. Checking the display first reported the
+    // environment when the buffer was the problem.
     if fb.phys_addr == 0 || fb.size == 0 {
         // Once: a framebuffer that ADDFB2 registered with no backing (phys 0 /
         // size 0) can never present. Silent before, so "nothing on screen"
@@ -1573,8 +1701,15 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
                 fb_id, fb.phys_addr, fb.size
             );
         }
-        return false;
+        return Err(PresentError::NoBacking);
     }
+    let display = match primary_display() {
+        Some(d) => d,
+        None => {
+            warn!("[drm] scanout: no display -- software_kms inactive, nothing to blit to");
+            return Err(PresentError::NoDisplay);
+        }
+    };
     // Log the first scanout so a console photo confirms pixels are flowing.
     if !SCANOUT_LOGGED.swap(true, Ordering::Relaxed) {
         warn!(
@@ -1614,7 +1749,7 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
         }
     };
     if blit_w == 0 || blit_h == 0 {
-        return true;
+        return Ok(());
     }
     let src_off = (blit_y as usize)
         .saturating_mul(src_stride)
@@ -1837,7 +1972,7 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     // A DRM client owns the framebuffer now: stop the kernel text console from
     // drawing over it (like fbcon yielding to KMS). Restored on DROP_MASTER.
     claim_graphics_vt();
-    true
+    Ok(())
 }
 
 /// Put the compositor's OWN VT into `KD_GRAPHICS` after a present.
@@ -2790,11 +2925,22 @@ pub fn present_now(fb_id: u32, crtc_id: u32) -> bool {
 /// here. Ignored on the hardware-KMS path: a real driver's `page_flip` scans
 /// out via its own GPU DMA, not the CPU blit this exists to shrink.
 pub fn present_now_region(fb_id: u32, crtc_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
+    present_now_checked(fb_id, crtc_id, rect).is_ok()
+}
+
+/// [`present_now_region`], but naming the reason on failure — see
+/// [`PresentError`]. `SETCRTC`/`SETPLANE` use this so a modeset is not failed
+/// with `EIO` over a frame that merely could not be copied.
+pub fn present_now_checked(
+    fb_id: u32,
+    crtc_id: u32,
+    rect: Option<(u32, u32, u32, u32)>,
+) -> Result<(), PresentError> {
     // Deferred console GSP bring-up: acknowledge the flip to keep the
     // compositor alive, but do not touch the GOP framebuffer / CE path.
     if scanout_paused() {
         set_crtc_fb(crtc_id, fb_id);
-        return true;
+        return Ok(());
     }
     if !PRESENT_LOGGED.swap(true, Ordering::Relaxed) {
         // Read `graphics_vt` into a local FIRST: `DRM_STATE.lock()` as a direct
@@ -2859,32 +3005,30 @@ pub fn present_now_region(fb_id: u32, crtc_id: u32, rect: Option<(u32, u32, u32,
                         owner, active
                     );
                 }
-                return true;
+                return Ok(());
             }
             _ => {}
         }
     }
-    let flipped = {
-        // Prefer a driver page_flip (NVC57E surfaceflip / CE hwflip) when the
-        // driver accepted the fb; fall back to GOP blit so a failed HW flip
-        // never blacks the panel.
-        let hw = get_primary_driver().and_then(|driver| {
-            let driver_fb_id = DRM_STATE
-                .lock()
-                .framebuffers
-                .iter()
-                .find(|f| f.id == fb_id)
-                .and_then(|f| f.driver_fb_id)?;
-            Some(driver.page_flip(driver_fb_id)).filter(|&ok| ok)
-        });
-        hw.unwrap_or(false) || scanout_region(fb_id, rect)
-    };
-    if flipped {
-        set_crtc_fb(crtc_id, fb_id);
-        // A DRM client owns the framebuffer now: stop text console drawing.
-        claim_graphics_vt();
+    // Prefer a driver page_flip (NVC57E surfaceflip / CE hwflip) when the
+    // driver accepted the fb; fall back to GOP blit so a failed HW flip
+    // never blacks the panel.
+    let hw = get_primary_driver().and_then(|driver| {
+        let driver_fb_id = DRM_STATE
+            .lock()
+            .framebuffers
+            .iter()
+            .find(|f| f.id == fb_id)
+            .and_then(|f| f.driver_fb_id)?;
+        Some(driver.page_flip(driver_fb_id)).filter(|&ok| ok)
+    });
+    if !hw.unwrap_or(false) {
+        scanout_region_checked(fb_id, rect)?;
     }
-    flipped
+    set_crtc_fb(crtc_id, fb_id);
+    // A DRM client owns the framebuffer now: stop text console drawing.
+    claim_graphics_vt();
+    Ok(())
 }
 
 /// Encode and enqueue a `struct drm_event_vblank` for the given card fd.
@@ -3450,10 +3594,22 @@ pub fn release_process(pid: u64) -> usize {
     {
         let mut state = DRM_STATE.lock();
         let before = state.framebuffers.len();
+        let taken: Vec<u32> = state
+            .framebuffers
+            .iter()
+            .filter(|fb| {
+                fb.gem_handle_id >= zcore_drivers::scheme::gem_mmap::DRIVER_HANDLE_BASE
+                    && zcore_drivers::scheme::gem_mmap::holds(fb.gem_handle_id, pid)
+            })
+            .map(|fb| fb.id)
+            .collect();
         state.framebuffers.retain(|fb| {
             fb.gem_handle_id < zcore_drivers::scheme::gem_mmap::DRIVER_HANDLE_BASE
                 || !zcore_drivers::scheme::gem_mmap::holds(fb.gem_handle_id, pid)
         });
+        for fb_id in taken {
+            note_fb_retired(&mut state, fb_id, FbRetired::ProcessExited);
+        }
         if state.framebuffers.len() != before {
             let live: Vec<u32> = state.framebuffers.iter().map(|fb| fb.id).collect();
             state.fb_backing.retain(|(id, _)| live.contains(id));
@@ -4593,5 +4749,167 @@ mod nouveau_fb_lifetime_tests {
         assert_eq!(DRM_STATE.lock().crtc_fb, 0);
         gem_mmap::unregister(mine);
         gem_mmap::unregister(theirs);
+    }
+}
+
+/// What a present that puts no pixels on the screen reports back.
+///
+/// The compositor log that prompted these was a wall of
+/// `[backend/drm/legacy.c:123] connector HDMI-A-1: Failed to set CRTC: I/O
+/// error` at ~8 Hz — wlroots' legacy backend retrying a modeset that the
+/// kernel kept answering `EIO`, never advancing to page-flips, while the
+/// kernel side printed nothing at all (every reason in here is a `warn!`,
+/// and the rig boots at `LOG=error`). `EIO` also named none of the causes,
+/// so the photo of the screen could not be turned into a diagnosis.
+///
+/// These pin the distinction the ioctl arms now depend on: which reason it
+/// was, and — for the arms — whether it is the caller's fault.
+#[cfg(test)]
+mod present_error_tests {
+    use super::*;
+
+    /// Plant a framebuffer directly in the table, bypassing `create_fb` (which
+    /// refuses a fb with no backing — the point here is to build the state a
+    /// live system can reach anyway, e.g. a driver fb whose GEM went away).
+    fn plant_fb(fb_id: u32, phys_addr: u64, size: usize) {
+        let mut state = DRM_STATE.lock();
+        state.framebuffers.retain(|fb| fb.id != fb_id);
+        state.framebuffers.push(DrmFramebuffer {
+            id: fb_id,
+            driver_fb_id: None,
+            gem_handle_id: 0,
+            width: 1,
+            height: 1,
+            pitch: 4,
+            phys_addr,
+            size,
+        });
+    }
+
+    fn drop_fb(fb_id: u32) {
+        DRM_STATE.lock().framebuffers.retain(|fb| fb.id != fb_id);
+    }
+
+    /// An fb id nothing answers to is the one failure that IS the caller's
+    /// fault, and it has to be distinguishable from the rest: it is the only
+    /// reason the ioctl arms still fail on, and they answer `ENOENT` for it
+    /// (Linux's "Unknown FB ID"), not `EIO`.
+    ///
+    /// This is not a hypothetical id: `retire_framebuffers_for_handle` drops a
+    /// nouveau-backed fb the instant its GEM handle closes, so a compositor
+    /// that still holds the id from `ADDFB2` lands here through no fault of
+    /// its scanout path.
+    #[test]
+    fn an_unknown_fb_id_is_reported_as_no_such_fb() {
+        drop_fb(9601);
+        assert_eq!(
+            scanout_region_checked(9601, None),
+            Err(PresentError::NoSuchFb)
+        );
+        assert_eq!(
+            present_now_checked(9601, 1, None),
+            Err(PresentError::NoSuchFb),
+            "the reason must survive the page-flip/scanout fallback chain"
+        );
+    }
+
+    /// A framebuffer that describes no memory is the framebuffer's own defect,
+    /// so it is reported as such whether or not a display is attached — the
+    /// backing check runs first for exactly this reason. Getting `NoDisplay`
+    /// here would send the reader looking at the wrong half of the system.
+    #[test]
+    fn a_framebuffer_with_no_backing_is_reported_as_no_backing() {
+        plant_fb(9602, 0, 4096);
+        assert_eq!(
+            scanout_region_checked(9602, None),
+            Err(PresentError::NoBacking)
+        );
+        // Zero size, same verdict: there is nothing to copy either way.
+        plant_fb(9602, 0x1_0000, 0);
+        assert_eq!(
+            scanout_region_checked(9602, None),
+            Err(PresentError::NoBacking)
+        );
+        drop_fb(9602);
+    }
+
+    /// The `bool` wrappers the rest of the tree still calls must keep behaving
+    /// exactly as they did — the reason is additive, not a change of contract.
+    #[test]
+    fn the_bool_wrappers_still_report_failure_the_old_way() {
+        drop_fb(9603);
+        assert!(!scanout_region(9603, None));
+        assert!(!present_now(9603, 1));
+        assert!(!present_now_region(9603, 1, Some((0, 0, 1, 1))));
+    }
+
+    /// The fork a `NoSuchFb` on the console cannot resolve on its own: a
+    /// framebuffer the client removed itself, versus one the kernel took out
+    /// from under it when the nouveau GEM handle closed. On Linux only the
+    /// first can happen -- a `drm_framebuffer` there holds its own reference
+    /// on the GEM object -- so the second is our bug to fix, and the log line
+    /// has to say which one the compositor hit.
+    #[test]
+    fn a_retired_fb_id_remembers_what_took_it() {
+        let handle = zcore_drivers::scheme::gem_mmap::DRIVER_HANDLE_BASE + 0x71;
+        zcore_drivers::scheme::gem_mmap::register(handle, 0x2_0000, 4096, 0);
+        {
+            let mut state = DRM_STATE.lock();
+            state.framebuffers.push(DrmFramebuffer {
+                id: 9604,
+                driver_fb_id: None,
+                gem_handle_id: handle,
+                width: 1,
+                height: 1,
+                pitch: 4,
+                phys_addr: 0x2_0000,
+                size: 4096,
+            });
+        }
+        assert_eq!(retire_framebuffers_for_handle(handle), 1);
+        assert_eq!(fb_retired_reason(9604), Some(FbRetired::HandleClosed));
+        zcore_drivers::scheme::gem_mmap::unregister(handle);
+
+        // The client's own RMFB reads differently, because it is a different
+        // answer: nothing was taken from anyone.
+        plant_fb(9605, 0x3_0000, 4096);
+        assert!(rmfb(9605));
+        assert_eq!(fb_retired_reason(9605), Some(FbRetired::Removed));
+
+        // An id that was never a framebuffer of ours has no story to tell.
+        assert_eq!(fb_retired_reason(9699), None);
+    }
+
+    /// The history is a fixed cost: a compositor that recreates its swapchain
+    /// all session long retires framebuffers forever, and this must not grow
+    /// with it.
+    #[test]
+    fn the_retirement_history_is_bounded() {
+        for i in 0..(FB_RETIRE_HISTORY as u32 * 4) {
+            plant_fb(9700 + i, 0x3_0000, 4096);
+            assert!(rmfb(9700 + i));
+        }
+        assert!(DRM_STATE.lock().fb_retirements.len() <= FB_RETIRE_HISTORY);
+        // And it is the NEWEST that are kept -- the id a stuck compositor is
+        // still re-presenting is the one that has to be explainable.
+        let newest = 9700 + (FB_RETIRE_HISTORY as u32 * 4) - 1;
+        assert_eq!(fb_retired_reason(newest), Some(FbRetired::Removed));
+    }
+
+    /// Each reason prints as itself: these strings are what a boot log carries
+    /// and what a bug report gets grepped for.
+    #[test]
+    fn every_reason_has_its_own_console_text() {
+        let all = [
+            PresentError::NoSuchFb,
+            PresentError::NoDisplay,
+            PresentError::NoBacking,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            assert!(!a.as_str().is_empty());
+            for b in &all[i + 1..] {
+                assert_ne!(a.as_str(), b.as_str(), "{:?} and {:?} read alike", a, b);
+            }
+        }
     }
 }
