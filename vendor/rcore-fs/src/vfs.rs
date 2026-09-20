@@ -351,6 +351,9 @@ pub enum FsError {
     /// retry": clients recover from `E_PIPE` by re-preparing the stream, and
     /// have nothing to do about an `Again` that will never clear.
     Broken,
+    /// E_NXIO (6): the node exists but has no device behind it for this
+    /// operation -- `read(2)` on a playback-only `/dev/dsp`, as on Linux.
+    NoSuchDeviceOrAddress,
 }
 
 impl fmt::Display for FsError {

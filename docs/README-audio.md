@@ -272,13 +272,59 @@ EINVAL in userspace can still be traced to the constraint that caused it.
 
 One node per controller in the same order as `/dev/snd`: `/dev/dsp` is card 0
 (preferred HDMI/DP when a display is live), `/dev/dsp1`, `/dev/dsp2`, … for
-the rest. `write(2)` carries interleaved S16LE PCM; supported ioctls:
-`SNDCTL_DSP_SPEED`, `SETFMT`
-(S16LE only), `CHANNELS`/`STEREO` (stereo only), `GETBLKSIZE`,
-`SETFRAGMENT` (accepted, ignored), `GETFMTS`, `GETOSPACE`, `SYNC`, `POST`,
-`RESET`. Writes block (bounded spin-retry) when the ring is full; the
-default format is 48 kHz stereo, so `cat music.raw > /dev/dsp` works for
-raw 48 kHz S16LE audio.
+the rest, each with a `/dev/audio<N>` twin (Sun defaults: µ-law, 8 kHz,
+mono) and a `/dev/mixer<N>`. The node follows Linux's `snd-pcm-oss`
+(`sound/core/oss/pcm_oss.c`), so a program written for a Linux `/dev/dsp`
+behaves the same here:
+
+- **Formats** (`SNDCTL_DSP_SETFMT`/`GETFMTS`): µ-law, A-law, U8, S8,
+  S16 LE/BE, U16 LE/BE, S24 packed / in 32 bits (LE/BE), S32 LE/BE, float.
+  The ring carries S16LE stereo; the node converts on the way in and
+  duplicates mono onto both channels. An unknown format is answered with
+  `AFMT_U8`, as on Linux.
+- **Rate** (`SPEED`, `SOUND_PCM_READ_RATE`): clamped to 1000..192000 and
+  snapped to the nearest rate the HDA stream format encodes (8000, 11025,
+  16000, 22050, 32000, 44100, 48000, 88200, 96000, 176400, 192000); the ioctl
+  hands back the rate in effect. Linux would resample to the exact request;
+  every real client reads the granted value back.
+- **Fragments** (`SETFRAGMENT`, `SUBDIVIDE`, `GETBLKSIZE`, `GETOSPACE`,
+  `GETOPTR`, `GETODELAY`): Linux's `snd_pcm_oss_period_size` algorithm with
+  the ring as the slave constraint. By default a 48 kHz S16LE stereo client
+  gets 8 fragments of 4096 bytes; `SETFRAGMENT` (once per open, as on Linux)
+  picks the size and count, and a write never queues past
+  `fragments × fragsize`, so the latency a client asks for is the latency it
+  gets. `GETOSPACE.bytes`, `GETODELAY` and `GETOPTR` are in the client's
+  bytes.
+- **Triggers** (`SETTRIGGER`/`GETTRIGGER`, `DSP_CAP_TRIGGER`): clearing
+  `PCM_ENABLE_OUTPUT` drops what is queued and holds the stream; writes then
+  fill the buffer and nothing plays until the bit is set again (the "fill,
+  then start" idiom). The hold is a driver primitive
+  (`AudioScheme::set_start_hold`) and dies with the fd.
+- **Writes**: whole frames go to the device, a trailing partial frame is
+  kept for the next write. Blocking writes retry against the ring (bounded);
+  with `O_NONBLOCK` or after `SNDCTL_DSP_NONBLOCK` a write returns what fit
+  or `EAGAIN`. Underruns never surface: the driver restarts the stream on
+  the next write, exactly as Linux's emulation re-prepares on `EPIPE`.
+  `poll(2)` reports writable while the stream is stopped or once a whole
+  fragment fits.
+- **The rest**: `SYNC` (drain, then the next write re-prepares), `POST`,
+  `RESET`, `GETCAPS` (revision 1, `REALTIME`, `TRIGGER`; no mmap, no
+  duplex), `OSS_GETVERSION` (3.8.1a), `SOUND_PCM_READ_BITS/CHANNELS`,
+  `SETSYNCRO`/`PROFILE` (accepted), `SETDUPLEX` and the `FILTER` pair
+  (`EIO`), `GETISPACE`/`GETIPTR`/`MAPINBUF`/`MAPOUTBUF` (`EINVAL`).
+  Anything else, including a stray `TCGETS`, is `EINVAL` as on Linux.
+  `read(2)` is `ENXIO`; an `O_RDONLY` open is `EINVAL` (no capture).
+
+The one deliberate difference: a fresh `/dev/dsp` is 48 kHz S16LE stereo
+rather than Linux's 8 kHz U8 mono, so `cat music.raw > /dev/dsp` plays a
+modern raw file. Only `cat` can tell; `/dev/audio` keeps the µ-law defaults.
+
+`/dev/mixer<N>` follows `snd-mixer-oss`: `SOUND_MIXER_READ/WRITE_VOLUME` and
+`_PCM` both drive the card's one gain (`Master`; HDMI/DP has no analog
+volume, the driver scales S16LE), a channel written as 0 is muted,
+`DEVMASK`/`STEREODEVS` list those two, `RECSRC`/`RECMASK`/`CAPS` are 0 and
+`SOUND_MIXER_INFO` names the card. `aumix`, `ossmix` and mpv's OSS volume
+control land here.
 
 `/dev/dsp<N>` and `/dev/snd/pcmC<N>D0p` are two front ends onto the SAME
 hardware ring, and the ring has no mixer, so they share one single-client

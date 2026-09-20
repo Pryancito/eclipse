@@ -405,6 +405,9 @@ struct HdaInner {
     running: bool,
     /// Software pause: DMA stopped but the ring still holds queued PCM.
     paused: bool,
+    /// Start hold (`AudioScheme::set_start_hold`): writes queue into the
+    /// ring but the engine is not started until the hold is released.
+    hold_start: bool,
     /// The stream descriptor was force-reset (`SRST`) because the engine
     /// would not acknowledge a cleared `RUN`, so its programming -- BDL
     /// address, cyclic length, format and above all the stream tag -- is
@@ -1182,7 +1185,9 @@ impl HdaInner {
         self.consumed = 0;
         self.stat_lead = 0;
         self.lead_now = 0;
-        self.stream_written = 0;
+        // `stream_written` is NOT reset here: the write path zeroes it when
+        // it re-anchors an empty ring, and a ring filled under a start hold
+        // already holds bytes that this start is about to play.
         Ok(())
     }
 }
@@ -1795,6 +1800,7 @@ impl HdaDevice {
             stream_start_wall: 0,
             stream_start_us: 0,
             stream_written: 0,
+            hold_start: false,
             stops: [StopEvent::default(); STOP_HISTORY],
             rate: 48000,
             channels: 2,
@@ -1925,8 +1931,13 @@ impl AudioScheme for HdaDevice {
         }
         let mut inner = self.inner.lock();
         inner.poll_progress();
-        let starting = !inner.running && !inner.paused;
-        if starting {
+        // A stream with nothing in flight: the next start begins at ring
+        // offset 0. Under a start hold the ring fills across several writes
+        // before the engine runs, so "fresh" is an empty ring, not merely a
+        // stopped engine -- re-anchoring the pointers on the second held
+        // write would drop the first one.
+        let fresh = !inner.running && !inner.paused && inner.queued == 0;
+        if fresh {
             warn!(
                 "[hda] stream start: {} B offered at {} Hz, repick + stream reset next",
                 pcm.len(),
@@ -1941,7 +1952,9 @@ impl AudioScheme for HdaDevice {
             inner.wp = 0;
             inner.zero_ptr = 0;
             inner.queued = 0;
+            inner.stream_written = 0;
         }
+        let starting = !inner.running && !inner.paused && !inner.hold_start;
         let free = inner.free_bytes();
         // Whole frames only, so channels never swap on a partial write.
         let frame = inner.channels as usize * 2;
@@ -1960,6 +1973,7 @@ impl AudioScheme for HdaDevice {
         }
         inner.wp = p;
         inner.queued += n;
+        inner.stream_written += n;
         inner.silence_ahead();
         if starting {
             inner.start_stream()?;
@@ -1969,7 +1983,6 @@ impl AudioScheme for HdaDevice {
                 mmio_r32(inner.bar, inner.sd_base + SD_CTL)
             );
         }
-        inner.stream_written += n;
         Ok(n)
     }
 
@@ -2020,6 +2033,23 @@ impl AudioScheme for HdaDevice {
 
     fn resume(&self) -> DeviceResult {
         self.inner.lock().resume_stream()
+    }
+
+    fn set_start_hold(&self, hold: bool) -> DeviceResult {
+        let mut inner = self.inner.lock();
+        inner.hold_start = hold;
+        if hold || inner.running || inner.paused || inner.queued == 0 {
+            return Ok(());
+        }
+        // Released with a primed ring: start it now, exactly as the write
+        // that filled it would have.
+        inner.start_stream()?;
+        warn!(
+            "[hda] stream started on trigger: {} B queued, CTL {:#x}",
+            inner.queued,
+            mmio_r32(inner.bar, inner.sd_base + SD_CTL)
+        );
+        Ok(())
     }
 
     fn set_gain(&self, left: u8, right: u8, mute_left: bool, mute_right: bool) -> DeviceResult {
