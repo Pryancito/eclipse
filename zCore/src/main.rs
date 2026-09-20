@@ -719,6 +719,13 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                     tlb_hammer::start(n as usize);
                 }
             }
+            // Under `baremetal-test` the run ends when the lifetime process
+            // does, not when this CPU happens to run out of work; see
+            // `utils::reset_when_process_exits`.
+            #[cfg(all(feature = "baremetal-test", not(feature = "libos")))]
+            if let Some(proc) = lifetime_proc.clone() {
+                utils::reset_when_process_exits(proc);
+            }
             utils::wait_for_exit(lifetime_proc)
         } else if #[cfg(feature = "zircon")] {
             let zbi = fs::zbi();
