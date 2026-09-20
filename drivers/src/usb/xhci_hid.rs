@@ -2766,9 +2766,38 @@ impl XhciInner {
             report_desc_len: report_desc.1,
             mouse_layout: parsed.mouse,
         });
+        // Two ways a pointer can be bound and still deliver nothing, both
+        // reported at ERROR level because that is the only level a rig booted
+        // with `LOG=error` prints -- and a dead mouse is exactly when the
+        // console is the only diagnostic left. /proc/usbhid has the detail;
+        // these lines are what says to go look.
+        if real_proto == HID_PROTO_MOUSE
+            && parsed.mouse.is_none()
+            && subclass != HID_SUBCLASS_BOOT
+            && proto == 0
+        {
+            error!(
+                "[xhci] mouse slot={} vid={:04x} pid={:04x} iface={} bound but its report \
+                 descriptor did not parse: NO pointer events will be delivered. \
+                 Paste `cat /proc/usbhid` to get its report_desc.",
+                slot, vid, pid, iface
+            );
+        } else if real_proto == HID_PROTO_MOUSE && parsed.mouse.is_some_and(|m| m.wheel.is_none()) {
+            info!(
+                "[xhci] mouse slot={} vid={:04x} pid={:04x} has no wheel field in its report \
+                 descriptor",
+                slot, vid, pid
+            );
+        }
         if real_proto == HID_PROTO_TABLET {
-            warn!(
-                "[xhci] absolute USB pointer slot={} vid={:04x} pid={:04x} — silencing PS/2 aux",
+            // Not a warning: latching this silences EVERY relative pointer on
+            // the machine (the PS/2 aux and any USB mouse), for the whole
+            // session. On a VM with `usb-tablet` that is what we want; on real
+            // hardware an interface misread as absolute takes the user's mouse
+            // with it, and there is no other clue that it happened.
+            error!(
+                "[xhci] absolute USB pointer slot={} vid={:04x} pid={:04x} — from now on every \
+                 RELATIVE pointer (PS/2 aux and USB mice) is silenced",
                 slot, vid, pid
             );
             USB_ABS_POINTER.store(true, Ordering::Relaxed);
