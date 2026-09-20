@@ -991,6 +991,12 @@ impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for State {
             _ => {}
         }
     }
+
+    // The toplevel event carries a new object, so wayland-client needs to be
+    // told what to build for it. Without this it panics on the first window.
+    wayland_client::event_created_child!(State, ZwlrForeignToplevelManagerV1, [
+        zwlr_foreign_toplevel_manager_v1::EVT_TOPLEVEL_OPCODE => (ZwlrForeignToplevelHandleV1, ()),
+    ]);
 }
 
 impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
