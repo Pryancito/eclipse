@@ -495,14 +495,29 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         }
 
         // lunarrun: the KRunner stand-in (Alt+Space / Alt+F2) and KDE's
-        // Super+D, from the same package. krunner itself is a D-Bus service
-        // and there is no session bus here; this speaks wlr-layer-shell and
+        // Super+D, from the same package. There IS a session bus now
+        // (`dbus.service`), but krunner still needs Qt, KF6 and the rest of
+        // Plasma; this speaks wlr-layer-shell and
         // wlr-foreign-toplevel-management instead.
         if lunarrun.is_file() {
             let _ = dir::rm(bin.join("lunarrun"));
             fs::copy(&lunarrun, bin.join("lunarrun")).unwrap();
         } else {
             eprintln!("warning: lunarrun not built; Alt+Space will do nothing");
+        }
+
+        // eclipse-dbusd: Eclipse's own D-Bus session bus (Rust, static musl).
+        // The `eclipse-dbus` wrapper prefers Alpine's dbus-daemon when the
+        // image has it and falls back to this, so an image built with no
+        // package mirror in reach still gets a session bus -- which is what
+        // SDL_Init(), GtkApplication and every RequestName-based single-
+        // instance check need before they will run at all.
+        let dbusd = self.eclipse_dbusd();
+        if dbusd.is_file() {
+            let _ = dir::rm(bin.join("eclipse-dbusd"));
+            fs::copy(&dbusd, bin.join("eclipse-dbusd")).unwrap();
+        } else {
+            eprintln!("warning: eclipse-dbusd not built; the session bus needs the dbus package");
         }
 
         // wavplay: minimal OSS player for the HDA audio driver (`/dev/dsp*`).
@@ -2318,6 +2333,112 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         executable
     }
 
+    /// The session bus, in the foreground so eclipse-init supervises it.
+    ///
+    /// Two implementations, in this order: Alpine's dbus-daemon when the
+    /// image has it (DEFAULT_PACKAGES installs `dbus`), and Eclipse's own
+    /// eclipse-dbusd otherwise. The fallback is not a toy -- it is what
+    /// makes the bus exist on an image built with no package mirror in
+    /// reach, and it is the one that can be tested against this kernel in
+    /// QEMU. Both take the same argv, so the choice is a `command -v`.
+    fn write_dbus_wrapper(localbin: &Path) {
+        fs::write(
+            localbin.join("eclipse-dbus"),
+            b"#!/bin/sh\n\
+              # Eclipse OS: D-Bus session bus for eclipse-init.\n\
+              : \"${XDG_RUNTIME_DIR:=/run/user/0}\"; export XDG_RUNTIME_DIR\n\
+              BUS=\"$XDG_RUNTIME_DIR/bus\"\n\
+              [ -d \"$XDG_RUNTIME_DIR\" ] || { mkdir -p \"$XDG_RUNTIME_DIR\" && chmod 0700 \"$XDG_RUNTIME_DIR\"; }\n\
+              # dbus validates /etc/machine-id and refuses to start on anything\n\
+              # that is not 32 lowercase hex digits; /var/lib/dbus/machine-id is\n\
+              # where its own code looks first.\n\
+              [ -s /etc/machine-id ] || dbus-uuidgen > /etc/machine-id 2>/dev/null\n\
+              mkdir -p /var/lib/dbus 2>/dev/null\n\
+              [ -s /var/lib/dbus/machine-id ] || cp /etc/machine-id /var/lib/dbus/machine-id 2>/dev/null\n\
+              # A socket left over from an earlier run of THIS boot makes bind()\n\
+              # fail with EADDRINUSE even though nothing is listening. Only\n\
+              # eclipse-init starts the bus, and it has already reaped the\n\
+              # previous daemon before respawning this wrapper, so a socket\n\
+              # found here is always stale.\n\
+              rm -f \"$BUS\"\n\
+              for d in /usr/bin /bin /usr/sbin /sbin; do\n\
+              \x20 if [ -x \"$d/dbus-daemon\" ]; then\n\
+              \x20 \x20 echo \"eclipse-dbus: $d/dbus-daemon on unix:path=$BUS\" > /dev/console 2>/dev/null\n\
+              \x20 \x20 exec \"$d/dbus-daemon\" --session --nofork --nopidfile \\\n\
+              \x20 \x20 \x20 --address=\"unix:path=$BUS\"\n\
+              \x20 fi\n\
+              done\n\
+              for d in /usr/local/bin /usr/bin /bin; do\n\
+              \x20 if [ -x \"$d/eclipse-dbusd\" ]; then\n\
+              \x20 \x20 echo \"eclipse-dbus: $d/eclipse-dbusd on unix:path=$BUS\" > /dev/console 2>/dev/null\n\
+              \x20 \x20 exec \"$d/eclipse-dbusd\" --session \\\n\
+              \x20 \x20 \x20 --address=\"unix:path=$BUS\"\n\
+              \x20 fi\n\
+              done\n\
+              # Neither: say so where it can be found. Without a bus, SDL and\n\
+              # GTK still run (the address is pinned, so connect() fails fast\n\
+              # with ECONNREFUSED instead of forking dbus-launch), but anything\n\
+              # that needs a NAME on the bus will not.\n\
+              MSG='eclipse-dbus: no dbus-daemon and no eclipse-dbusd -- there is\n\
+              no session bus. Fix: apk add dbus, or rebuild the image so\n\
+              /usr/local/bin/eclipse-dbusd is installed.'\n\
+              echo \"$MSG\" > /dev/console 2>/dev/null || true\n\
+              echo \"$MSG\" >&2\n\
+              sleep 60\n\
+              exit 127\n",
+        )
+        .unwrap();
+    }
+
+    /// Cross-compile `tools/eclipse-dbusd` (Rust) as a static, non-PIE musl
+    /// binary and return its path. Best-effort, like every other tool here: a
+    /// failed build just means the image relies on Alpine's `dbus-daemon`.
+    fn eclipse_dbusd(&self) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join("eclipse-dbusd");
+        let triple = self.musl_rust_triple();
+        let executable = dir
+            .join("target")
+            .join(triple)
+            .join("release")
+            .join("eclipse-dbusd");
+        let newest_src = [
+            "src/main.rs",
+            "src/bus.rs",
+            "src/message.rs",
+            "src/client.rs",
+            "Cargo.toml",
+        ]
+        .iter()
+        .filter_map(|rel| fs::metadata(dir.join(rel)).ok()?.modified().ok())
+        .max();
+        if let (Ok(bin_meta), Some(src_mtime)) = (fs::metadata(&executable), newest_src) {
+            if let Ok(bin_mtime) = bin_meta.modified() {
+                if bin_mtime >= src_mtime {
+                    return executable;
+                }
+            }
+        }
+
+        println!("Compiling eclipse-dbusd (Rust, {triple})...");
+        let _ = Ext::new("rustup")
+            .arg("target")
+            .arg("add")
+            .arg(triple)
+            .status();
+        let status = Ext::new("cargo")
+            .current_dir(&dir)
+            .arg("build")
+            .arg("--release")
+            .arg("--target")
+            .arg(triple)
+            .env("RUSTFLAGS", "-C relocation-model=static")
+            .status();
+        if !status.success() {
+            eprintln!("warning: eclipse-dbusd build failed; only dbus-daemon can serve the bus");
+        }
+        executable
+    }
+
     /// Cross-compile the `tools/lunarbar` package (Rust) as static musl
     /// binaries and return both: the panel and `lunarrun`, the KRunner-style
     /// launcher behind Alt+Space and Super+D. One cargo invocation builds the
@@ -2354,11 +2475,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         .max();
         // BOTH must exist and be current: a tree built before lunarrun existed
         // has an up-to-date lunarbar and no runner at all.
-        if let (Ok(bin_meta), Ok(run_meta), Some(src_mtime)) = (
-            fs::metadata(&executable),
-            fs::metadata(&runner),
-            newest_src,
-        ) {
+        if let (Ok(bin_meta), Ok(run_meta), Some(src_mtime)) =
+            (fs::metadata(&executable), fs::metadata(&runner), newest_src)
+        {
             if let (Ok(bin_mtime), Ok(run_mtime)) = (bin_meta.modified(), run_meta.modified()) {
                 if bin_mtime >= src_mtime && run_mtime >= src_mtime {
                     return (executable, runner);
@@ -2839,6 +2958,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # exec  = /usr/sbin/mydaemon --foreground   (required; argv, space-split)\n\
               # type  = respawn                            (respawn | oneshot; default oneshot)\n\
               # after = othersvc                           (optional; space-separated deps)\n\
+              # cmdline = dbus.selftest                     (optional; start only when\n\
+              #                                              this token is on the\n\
+              #                                              kernel command line)\n\
               # wait_socket = /run/other.sock              (optional; block each start,\n\
               #                                             bounded, until this unix\n\
               #                                             socket exists)\n\
@@ -2891,6 +3013,44 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         )
         .unwrap();
 
+        // D-Bus session bus. NOT desktop-restricted: it is the first thing
+        // SDL_Init() looks for (SDL_DBus_Init), the thing GtkApplication exits
+        // without, and the thing every "am I already running?" check is built
+        // on, so an Xorg session and a labwc session both want it. Ordered
+        // ahead of the sessions but with no `wait_socket =`: a bus that is not
+        // there must cost the boot nothing, and no service started at boot
+        // talks to it -- the clients that do (SDL games, GTK apps) start
+        // minutes later, long after the daemon has bound its socket.
+        fs::write(
+            svc_dir.join("dbus.service"),
+            b"# D-Bus session bus. See /usr/local/bin/eclipse-dbus.\n\
+              # Address: unix:path=/run/user/0/bus, the same one eclipse-init,\n\
+              # /etc/profile, the labwc environment and the SDL wrapper all\n\
+              # export as DBUS_SESSION_BUS_ADDRESS.\n\
+              exec = /usr/local/bin/eclipse-dbus\n\
+              type = respawn\n\
+              log = /tmp/dbus.log\n",
+        )
+        .unwrap();
+
+        // Session-bus probe, opt-in. `cmdline = dbus.selftest` keeps it out of
+        // a normal boot entirely; a boot with `dbus.selftest` on the kernel
+        // command line runs the same checks the desktop menu offers and prints
+        // DBUSPROBE: PASS/FAIL to the console. It is the only way to verify
+        // the bus (and the unix-socket/SO_PEERCRED/poll paths under it) on a
+        // machine with no desktop installed -- QEMU, for instance.
+        fs::write(
+            svc_dir.join("dbus-selftest.service"),
+            b"# Session-bus probe. Boot with `dbus.selftest` on the cmdline.\n\
+              exec = /bin/eclipse-dbusd --selftest\n\
+              type = oneshot\n\
+              after = dbus\n\
+              cmdline = dbus.selftest\n\
+              wait_socket = /run/user/0/bus\n\
+              log = /dev/console\n",
+        )
+        .unwrap();
+
         // GTK caches (gschemas.compiled, pixbuf loaders.cache) before the
         // first GTK client. A oneshot runs to completion before anything
         // ordered after it forks, so labwc -- and every client it launches --
@@ -2918,7 +3078,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # gtk-caches: oneshot, so it has COMPLETED before this forks.\n\
               exec = /usr/local/bin/labwc\n\
               type = respawn\n\
-              after = seatd gtk-caches\n\
+              after = seatd gtk-caches dbus\n\
               wait_socket = /run/seatd.sock\n\
               wait_path = /dev/input\n\
               desktop = labwc\n\
@@ -2981,6 +3141,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             b"# Xorg session (fbdev on /dev/fb0). See /usr/local/bin/eclipse-xorg.\n\
               exec = /usr/local/bin/eclipse-xorg\n\
               type = respawn\n\
+              after = dbus\n\
               desktop = xorg\n",
         )
         .unwrap();
@@ -3219,6 +3380,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         )
         .unwrap();
 
+        Self::write_dbus_wrapper(&localbin);
+
         fs::write(
             localbin.join("eclipse-seatd"),
             b"#!/bin/sh\n\
@@ -3383,6 +3546,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             use std::os::unix::fs::PermissionsExt;
             for w in [
                 "eclipse-udhcpc",
+                "eclipse-dbus",
                 "eclipse-seatd",
                 "eclipse-xorg",
                 "eclipse-lunarbg",
@@ -3406,7 +3570,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let _ = fs::create_dir_all(&eclipse_etc);
         fs::write(eclipse_etc.join("desktop"), b"labwc\n").unwrap();
 
-        println!("Installed eclipse-init as PID 1 with udhcpc, seatd, labwc, xorg, pulseaudio and boot-sound services.");
+        println!("Installed eclipse-init as PID 1 with udhcpc, dbus, seatd, labwc, xorg, pulseaudio and boot-sound services.");
         true
     }
 
@@ -3489,6 +3653,59 @@ fn check_so<P: AsRef<Path>>(path: P) -> bool {
 #[cfg(test)]
 mod var_run_tests {
     use super::*;
+
+    /// The session-bus wrapper must be valid POSIX shell, must prefer Alpine's
+    /// dbus-daemon over Eclipse's own daemon, must bind the SAME address every
+    /// session already exports (`unix:path=/run/user/0/bus`) -- a wrapper that
+    /// binds anywhere else is a bus no client will ever find -- and must say
+    /// something findable when neither daemon is installed, because init wires
+    /// a service's stdio to /dev/null.
+    #[test]
+    fn dbus_wrapper_parses_and_prefers_dbus_daemon() {
+        let dir =
+            std::env::temp_dir().join(format!("eclipse-dbuswrap-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        LinuxRootfs::write_dbus_wrapper(&dir);
+
+        let path = dir.join("eclipse-dbus");
+        let src = fs::read_to_string(&path).unwrap();
+        assert!(src.starts_with("#!/bin/sh\n"), "shebang");
+        let st = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(st.success(), "sh -n rejected eclipse-dbus");
+
+        assert!(
+            src.find("dbus-daemon").unwrap() < src.find("eclipse-dbusd").unwrap(),
+            "Alpine's dbus-daemon must be tried first"
+        );
+        // Both daemons must be launched in the FOREGROUND: init supervises
+        // them, and a daemon that forks away is one init would respawn forever.
+        assert!(
+            src.contains("--nofork"),
+            "dbus-daemon must stay in the foreground"
+        );
+        assert!(!src.contains("--fork"), "no forking daemon under init");
+        // The address every session exports, and nothing else.
+        assert_eq!(
+            src.matches("unix:path=$BUS").count(),
+            4,
+            "each daemon's log line and its --address use the one address"
+        );
+        assert!(src.contains("BUS=\"$XDG_RUNTIME_DIR/bus\""));
+        assert!(
+            src.contains("/etc/machine-id"),
+            "dbus validates the machine id"
+        );
+        assert!(
+            src.contains("> /dev/console"),
+            "a missing daemon must be findable"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// Every `module-alsa-sink` argument the generated system.pa passes must
     /// be one the module accepts. pa_modargs rejects a load-module line as a

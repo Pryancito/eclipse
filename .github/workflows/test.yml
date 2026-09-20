@@ -35,6 +35,14 @@ jobs:
           cargo test -p zircon-object --lib --features libos,aspace-separate
           cargo test -p zircon-syscall --features libos,zircon-object/aspace-separate
           cargo test --manifest-path vendor/preemptive-scheduler/Cargo.toml --lib
+          # `default-members = ["xtask"]` in the workspace manifest means the
+          # bare `cargo test` above builds ONLY xtask, so these two crates'
+          # unit tests -- the DRM/KMS present path, the NVIDIA decode helpers,
+          # the syncobj table, the e1000e rings -- never ran here at all.
+          # Named explicitly, and single-threaded because several of them drive
+          # process-wide driver state (DRM_STATE, the CE staging buffer).
+          cargo test -p zcore-drivers --lib -- --test-threads=1
+          cargo test -p linux-object --lib -- --test-threads=1
 
   zircon-core-test-libos:
     name: Zircon Core Test Libos (${{ matrix.name }})

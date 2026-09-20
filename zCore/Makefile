@@ -114,12 +114,25 @@ else
   CMDLINE ?= LOG=$(LOG):TERM=xterm-256color:console.shell=true:virtcon.disable=true$(desktop_arg)$(boottrace_arg)$(gl_arg)
 endif
 
+# `prebuilt/zircon/` names its directories the Fuchsia way (x64, arm64,
+# riscv64), not the way this tree spells architectures. The ZBI used to be
+# taken from `x64/` for EVERY arch, so a riscv64 or aarch64 zircon build was
+# handed an x86_64 ZBI -- the same mismatch `scripts/zircon_core_test.py`
+# guards against for LINUX=1. `loader/src/zircon.rs` picks userboot and the
+# vDSO per `target_arch` from these same directories, so both must agree.
+zbi_dir := x64
+ifeq ($(ARCH), aarch64)
+  zbi_dir := arm64
+else ifeq ($(ARCH), riscv64)
+  zbi_dir := riscv64
+endif
+
 ifeq ($(LINUX), 1)
   user_img := $(ARCH).img
 else ifeq ($(USER), 1)
   user_img := ../zircon-user/target/zcore-user.zbi
 else
-  user_img := ../prebuilt/zircon/x64/$(ZBI).zbi
+  user_img := ../prebuilt/zircon/$(zbi_dir)/$(ZBI).zbi
 endif
 # Default: the QEMU live SFS (`x86_64.img`, desktop + payloads). `make iso`
 # overrides this with `ignored/target/iso-initramfs.img` (installer only).
@@ -188,9 +201,21 @@ else
   features := zircon
 endif
 
+# `uname -m` spells 64-bit ARM `arm64` on Darwin and `aarch64` on Linux; this
+# tree spells it `aarch64` everywhere (target names, `prebuilt/zircon/arm64`,
+# `zCore/src/platform/aarch64`). Normalise the HOST spelling before comparing,
+# so an Apple-silicon host accepts the same `ARCH=aarch64` a Linux arm host
+# does. Without this, CI's `Zircon Core Test Libos (aarch64 macOS)` job died in
+# the `$(error)` below on every run: its step only wanted to build and record a
+# SKIP, but `shell: /bin/bash -e` aborts the step at the failing `make`.
+host_arch := $(shell uname -m)
+ifeq ($(host_arch), arm64)
+  host_arch := aarch64
+endif
+
 ifeq ($(LIBOS), 1)
-  ifneq ($(ARCH), $(shell uname -m))
-    $(error "ARCH" must be "$(shell uname -m)" for libos mode)
+  ifneq ($(ARCH), $(host_arch))
+    $(error "ARCH" must be "$(host_arch)" for libos mode)
   endif
   features += libos
 else
@@ -443,14 +468,30 @@ ifeq ($(ARCH), x86_64)
 # while mcopy copies the whole file. Sizing from `du -sm` produced a FAT32
 # image the initramfs did not fit in ("Disk full" from mcopy). The
 # `|| du -sm` fallback keeps non-GNU du (macOS) working as before.
-	@esp_mb=$$(du -sm --apparent-size "$(esp)/EFI" 2>/dev/null | cut -f1 \
+# Rebuild the image only when it is missing or something OTHER than the
+# cmdline changed. `rboot.conf` is excluded from the staleness test on purpose:
+# the `$(sed)` above rewrites it on EVERY `justrun`, so testing it made every
+# run a full rebuild. That cost is not small -- the QEMU live image is ~1.8 GiB,
+# so each run did a 1.8 GiB `dd`, a `mkfs.vfat` and an `mcopy` of the whole
+# tree. `scripts/linux_libc_test.py` and `tests/linux_other_test.py` call
+# `justrun` once PER TEST CASE under a 10 s budget, which that rebuild ate whole
+# before QEMU was ever launched: `Linux Libc Test Baremetal (x86_64)` timed out
+# on all 410 cases and `Linux Other Test Baremetal (x86_64)` on all 10, in both
+# cases with zero guest output. The one-file `mcopy` below then carries the new
+# cmdline into the existing image, which is all that actually changed.
+	@if [ ! -f "$(esp_img)" ] || [ -n "$$(find "$(esp)/EFI" -newer "$(esp_img)" \
+	      ! -name rboot.conf -print -quit 2>/dev/null)" ]; then \
+	  esp_mb=$$(du -sm --apparent-size "$(esp)/EFI" 2>/dev/null | cut -f1 \
 	    || du -sm "$(esp)/EFI" | cut -f1); esp_mb=$$((esp_mb + 128)); \
 	  echo "Building $(esp_img) ($$esp_mb MiB FAT32 — real ESP image; fat:rw dir emulation caps at FAT16 504 MiB)"; \
 	  rm -f "$(esp_img)"; \
 	  dd if=/dev/zero of="$(esp_img)" bs=1M count=$$esp_mb status=none; \
 	  mkfs.vfat -F 32 "$(esp_img)" >/dev/null; \
 	  mmd -i "$(esp_img)" ::/EFI ::/EFI/Boot ::/EFI/zCore; \
-	  mcopy -i "$(esp_img)" -s "$(esp)/EFI" ::/
+	  mcopy -i "$(esp_img)" -s "$(esp)/EFI" ::/; \
+	else \
+	  mcopy -i "$(esp_img)" -o "$(esp)/EFI/Boot/rboot.conf" ::/EFI/Boot/rboot.conf; \
+	fi
   endif
 endif
 ifeq ($(ARCH), aarch64)

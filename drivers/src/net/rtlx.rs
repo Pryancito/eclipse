@@ -16,6 +16,10 @@ use smoltcp::Result;
 use super::realtek::rtl8211f::{self, RTL8211F};
 use super::{timer_now_as_micros, ProviderImpl, PAGE_SIZE};
 
+/// Stack scratch for [`RTLxTxToken::consume`]; covers the advertised MTU
+/// (1514) with headroom. Oversized requests are refused, never clipped.
+const TX_SCRATCH_LEN: usize = 1536;
+
 use crate::net::get_sockets;
 use crate::scheme::{NetScheme, RouteInfo, Scheme};
 use crate::{DeviceError, DeviceResult};
@@ -61,7 +65,15 @@ impl Scheme for RTLxInterface {
                 }
             }
             self.driver.0.lock().int_enable();
-            //return true;
+            drop(sockets);
+            // Drain the AF_PACKET tap queue and wake blocked socket readers.
+            // `RTLxRxToken::consume` calls `net_defer_packet` for every frame,
+            // but nothing on this driver ever flushed that queue, so an
+            // AF_PACKET consumer (the DHCP client) received nothing at all on
+            // riscv64 and blocked readers only woke on the fallback park
+            // timer. Both e1000 drivers do this after every poll.
+            super::net_flush_deferred_packets();
+            super::wake_net_rx_waiters();
         }
     }
 }
@@ -236,9 +248,15 @@ impl NetScheme for RTLxInterface {
         // Release the SOCKETS guard promptly so interrupts (disabled by the
         // lock) are re-enabled as soon as the critical section ends.
         drop(sockets);
+        // Same as `handle_irq`: flush the AF_PACKET tap queue and wake RX
+        // waiters now that the smoltcp locks are released.
+        super::net_flush_deferred_packets();
         match result {
             Ok(b) => {
                 debug!("nic poll, is changed ?: {}", b);
+                if b {
+                    super::wake_net_rx_waiters();
+                }
                 Ok(())
             }
             Err(err) => {
@@ -329,7 +347,14 @@ impl phy::TxToken for RTLxTxToken {
     where
         F: FnOnce(&mut [u8]) -> Result<R>,
     {
-        let mut buffer = [0u8; 1536];
+        // `len` comes from the IP layer, which this smoltcp never clamps to
+        // the device MTU (and it has no fragmentation), so indexing a fixed
+        // stack array with it panics the kernel on any oversized datagram —
+        // a single UDP `sendto` is enough. Refuse instead.
+        let mut buffer = [0u8; TX_SCRATCH_LEN];
+        if len > TX_SCRATCH_LEN {
+            return Err(smoltcp::Error::Exhausted);
+        }
         let result = f(&mut buffer[..len]);
         if result.is_ok() {
             // Re-check ownership under the SAME lock as the send: transmit()
@@ -357,9 +382,21 @@ pub fn rtlx_init<F: Fn(usize, usize) -> Option<usize>>(
     //启动前请为D1插上网线
     warn!("Please plug in the Ethernet cable");
 
-    rtl8211f.open().unwrap();
+    // Propagate instead of `unwrap()`. Both of these fail on conditions that
+    // are not the kernel's fault and must not take the whole boot down: a GMAC
+    // that does not come out of soft reset (clock/power not up yet), and a
+    // master/slave resolution failure, which is decided by the link partner's
+    // PHY. Returning an error leaves the board booting without networking.
+    rtl8211f.open().map_err(|e| {
+        warn!("rtlx: GMAC open failed: {}", e);
+        DeviceError::IoError
+    })?;
     rtl8211f.set_rx_mode();
-    rtl8211f.adjust_link().unwrap();
+    if let Err(e) = rtl8211f.adjust_link() {
+        // Not fatal: the link watchdog / a later cable insertion can still
+        // bring it up, and a NIC with no carrier is better than no boot.
+        warn!("rtlx: link negotiation failed: {}", e);
+    }
 
     let net_driver = RTLxDriver(Arc::new(Mutex::new(rtl8211f)));
 

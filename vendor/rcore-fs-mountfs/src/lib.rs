@@ -94,7 +94,30 @@ impl MNode {
         // sprays tiny values (0x01/0x87/…). Flag the inode fat pointer (data +
         // vtable) if either half is not a plausible kernel pointer — that is the
         // exact word (`0x87`) the recorded #PF dereferenced.
-        let bad_kptr = |w: u64| w < 0xffff_8000_0000_0000;
+        //
+        // "Plausible" is measured against `self`, not against a hardcoded
+        // higher-half base: we are inside `self`'s own method, so its address is
+        // by construction a live node in whatever address space this kernel runs
+        // in. On bare metal that is the higher half and the test below is the
+        // original one. Under libos the kernel is an ordinary Linux process and
+        // every pointer is a low userspace address (`0x55f2…` in the CI log), so
+        // the fixed floor called all of them garbage: `check_poison` guards
+        // `read_at`, `write_at`, `metadata`, `find` and `get_entry`, so EVERY
+        // MountFS operation returned `DeviceError`. The dynamic loader could not
+        // resolve `PT_INTERP` and all 302 cases of the `Linux Libc Test Libos`
+        // job failed at spawn, each logging "(poison ok) … *INODE-PTR-GARBAGE*"
+        // — the canary intact, which is exactly what a false positive looks like.
+        const HIGHER_HALF: u64 = 0xffff_8000_0000_0000;
+        let self_addr = self as *const Self as u64;
+        let bad_kptr = |w: u64| {
+            if self_addr >= HIGHER_HALF {
+                w < HIGHER_HALF
+            } else {
+                // libos: no higher half to anchor on. The wild write this guard
+                // exists for sprays tiny values, and those stay caught.
+                w < 0x1000
+            }
+        };
         let poison_bad = w0 != MNODE_POISON;
         let inode_bad = bad_kptr(w1) || bad_kptr(w2);
         if poison_bad || inode_bad {

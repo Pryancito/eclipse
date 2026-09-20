@@ -50,12 +50,12 @@ Microsoft: todo está dibujado con colores propios.
 
 Plasma no puede correr aquí, y conviene saber por qué antes de intentarlo:
 `plasmashell`, `kded`, `krunner` y el agente de polkit-kde son servicios de
-**D-Bus** de arriba abajo, y esta imagen no tiene bus de sesión a propósito
-(`DBUS_SESSION_BUS_ADDRESS` apunta a un socket sin demonio para que libdbus
-falle al instante en vez de lanzar la cadena `autolaunch:`, que es donde se
-colgaba gzdoom). Tampoco hay Qt ni KF6 en la imagen, ni polkit, ni logind
-(se usa seatd). Lo que sí se recrea es la experiencia: tema, atajos, panel y
-lanzador, con las piezas nativas de Eclipse.
+**D-Bus** de arriba abajo. Eso ya no es el impedimento — ahora hay un bus de
+sesión de verdad escuchando en `DBUS_SESSION_BUS_ADDRESS`, ver
+[README-dbus.md](README-dbus.md) — pero sigue sin haber Qt ni KF6 en la
+imagen, ni polkit, ni logind (se usa seatd). Lo que sí se recrea es la
+experiencia: tema, atajos, panel y lanzador, con las piezas nativas de
+Eclipse.
 
 Las variables de Qt (`QT_QPA_PLATFORM=wayland;xcb`,
 `QT_AUTO_SCREEN_SCALE_FACTOR`, y `QT_QUICK_BACKEND=software` en la sesión
@@ -214,19 +214,45 @@ mide los fps de una animación sencilla; sale con `SDLPROBE: FAIL ...` y código
 1 si algo falla. Un `video driver in use: x11` con `WAYLAND_DISPLAY` presente
 significa que algo pisó `SDL_VIDEODRIVER`.
 
-## Juegos (supertux2, gzdoom/freedoom)
+## Juegos (freedoom, supertux2)
 
-Los dos se instalan desde los repos de Alpine y se lanzan desde un terminal de
-la sesión (o desde el menú si se añade una entrada):
+**Freedoom viene instalado.** Los dos IWAD (`freedoom1.wad`, `freedoom2.wad`) y
+el motor `gzdoom` están en el conjunto de paquetes por defecto
+(`xtask/src/linux/xorg.rs`), porque un Eclipse recién instalado no tiene mirror
+a mano justo cuando a uno le apetece ver si el escritorio mueve un juego.
+
+Se lanza desde el menú del escritorio («Freedoom (Fase 1)» / «(Fase 2)»), desde
+el menú de aplicaciones del panel, o a mano:
 
 ```sh
-apk add supertux gzdoom freedoom     # binarios: supertux2, gzdoom, freedoom1, freedoom2
-supertux2
-freedoom2                            # = gzdoom -iwad freedoom2.wad
+eclipse-freedoom          # Fase 2 (por defecto)
+eclipse-freedoom 1        # Fase 1
+eclipse-freedoom /ruta/doom2.wad   # cualquier otro IWAD
 ```
 
-Los dos fallaban en hardware real por causas distintas, y ambas están tapadas
-a la vez por el kernel y por la política de entorno de la sesión:
+`eclipse-freedoom` (`xtask/src/linux/desktop.rs`) resuelve tres cosas:
+
+- **Pasa siempre `-iwad`.** Con varios IWAD y sin esa opción, gzdoom abre un
+  diálogo GTK para preguntar a cuál jugar; es lo primero que vería el usuario.
+- **Elige renderizador.** gzdoom necesita OpenGL 3.3+ o Vulkan. En la sesión
+  pixman no hay driver GL, así que el wrapper fuerza `LIBGL_ALWAYS_SOFTWARE=1`
+  (llvmpipe: sirve, pero es lento); en las sesiones `nvidia.wlr_gles2` /
+  `nvidia.wlr_vulkan` (`WLR_RENDERER` = `gles2`/`vulkan`) no toca el entorno,
+  para que use zink+NVK.
+- **Deja rastro.** Todo va a `/tmp/freedoom.log`, porque un juego lanzado desde
+  el panel escribe en un terminal que no mira nadie.
+
+Si hay instalado un motor por software (`chocolate-doom`, `crispy-doom`,
+`prboom-plus`), el wrapper lo prefiere a gzdoom: en este stack, cuyo mejor GL es
+llvmpipe, es el que va a velocidad completa.
+
+```sh
+apk add chocolate-doom    # opcional; eclipse-freedoom lo usará solo
+apk add supertux          # binario: supertux2
+```
+
+Los dos juegos fallaban en hardware real por causas distintas, y ambas están
+resueltas:
 
 - **supertux2** abortaba con `Assertion 'r == 0 || r == 95' failed at
   ../src/pulsecore/mutex-posix.c:57, function pa_mutex_new()`. SuperTux (y
@@ -251,19 +277,12 @@ a la vez por el kernel y por la política de entorno de la sesión:
   `DBUS_SESSION_BUS_ADDRESS`, libdbus usa `autolaunch:`: hace fork de
   `dbus-launch`, que abre `$DISPLAY` (Xwayland) y lanza un `dbus-daemon` más
   un proceso «niñera» detrás de tuberías, esperando EOF. La sesión exporta
-  ahora `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus` en los mismos
+  `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus` en los mismos
   cuatro sitios que la política de SDL (wrapper, `/etc/profile`,
-  `~/.config/labwc/environment`, `eclipse-init`): sin demonio el `connect`
-  falla al instante (`ECONNREFUSED`), SDL desactiva D-Bus y el juego sigue.
-  Si algún día hace falta un bus, basta con arrancarlo en esa ruta
-  (`dbus-daemon --session --address=unix:path=$XDG_RUNTIME_DIR/bus --fork`) y
-  todos los clientes nuevos lo usan sin tocar nada más.
-
-gzdoom necesita OpenGL 3.3+ (o Vulkan): en la sesión pixman va por llvmpipe
-(`LIBGL_ALWAYS_SOFTWARE=1`), que sirve pero es lento; en las sesiones
-`nvidia.wlr_gles2`/`nvidia.wlr_vulkan` usa zink+NVK. Con varios IWAD y sin
-`-iwad`, gzdoom abre su selector GTK; los lanzadores `freedoom1`/`freedoom2`
-ya pasan el IWAD.
+  `~/.config/labwc/environment`, `eclipse-init`), y **ahora hay un demonio
+  escuchando en esa ruta**: `dbus.service` lo arranca en el arranque, así que
+  SDL ya no solo deja de colgarse — tiene bus. Ver
+  [README-dbus.md](README-dbus.md).
 
 ## Atajos de teclado
 
