@@ -196,7 +196,20 @@ pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
         // the callback above); it only returns under `baremetal-test` when the
         // task queue is empty.
         let has_task = executor::run_until_idle();
-        if !has_task && cfg!(feature = "baremetal-test") {
+        // `run_until_idle` decides "idle" from THIS CPU's own run queue --
+        // `Runtime::task_num()` reads the per-CPU task collection of
+        // `get_current_runtime()`. An AP's queue is empty the moment it comes
+        // online, before the BSP has placed or a steal has moved any work onto
+        // it, so letting every CPU end the run here reset the whole machine a
+        // few ms after the APs entered the executor: the guest listed no tests
+        // and QEMU exited 0, which is how `Zircon Core Test Baremetal (x86_64)`
+        // failed its `--smp 2` and `--smp 4` port-stress runs.
+        //
+        // Only the CPU carrying the root process may call the run over; `proc`
+        // is `Some` exactly there (`secondary_main()` passes `None`). The
+        // others fall through to `wait_for_interrupt()` and idle, which is what
+        // an AP with nothing to run should do anyway.
+        if !has_task && cfg!(feature = "baremetal-test") && proc.is_some() {
             proc.map(check_exit_code);
             kernel_hal::cpu::reset();
         }
