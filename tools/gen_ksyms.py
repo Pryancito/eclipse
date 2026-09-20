@@ -11,7 +11,7 @@ those are only meaningful against the exact ELF that produced them. Two builds
 of one commit on different machines do not share a `.text` layout, so a log
 symbolized against the wrong kernel names the wrong functions -- confidently.
 
-Usage: gen_ksyms.py <kernel.elf> [--cap BYTES] [--nm TOOL] [--objcopy TOOL]
+Usage: gen_ksyms.py <kernel.elf> [--nm TOOL] [--objcopy TOOL]
 
 Exits 0 with a warning, leaving the kernel untouched, if the tools are missing
 or the section is absent: a kernel without the table still boots and still
@@ -19,7 +19,7 @@ reports, it just prints bare addresses like it always did.
 """
 
 import argparse
-import re
+from pathlib import Path
 import struct
 import subprocess
 import sys
@@ -44,21 +44,88 @@ def tool_ok(name):
         return False
 
 
-def section_size(objcopy_readelf, elf):
-    """Size of `.ksyms`, or None when the kernel has no reservation."""
+def rustlib_bins():
+    """Directories where `rustup component add llvm-tools-preview` puts llvm-nm.
+
+    rustup installs them under the sysroot and deliberately does NOT put that
+    directory on PATH, so every CI job that asked for the component still
+    failed `tool_ok("llvm-nm")` and shipped its kernel without a symbol table.
+    That is why kernel crash dumps in CI print bare addresses -- "[kfault-bt]
+    (no in-kernel symbol table in this build ...)" -- exactly when a backtrace
+    would have been most useful.
+    """
     try:
-        out = subprocess.run(
-            [objcopy_readelf, "-S", "--wide", elf], capture_output=True, text=True, check=True
-        ).stdout
+        result = subprocess.run(
+            ["rustc", "--print", "sysroot"], capture_output=True, check=True, text=True
+        )
     except (OSError, subprocess.CalledProcessError):
+        return []
+    return sorted(Path(result.stdout.strip(), "lib", "rustlib").glob("*/bin"))
+
+
+def resolve_tool(name):
+    """`name` if it runs as given, else the same tool inside the rustup sysroot.
+
+    An explicit path or an already-working PATH lookup always wins, so this
+    only ever adds a fallback.
+    """
+    if tool_ok(name):
+        return name
+    for directory in rustlib_bins():
+        candidate = str(directory / name)
+        if tool_ok(candidate):
+            return candidate
+    return None
+
+
+SHT_PROGBITS = 1
+
+
+def section_size(elf):
+    """Size of `.ksyms`, or None when the kernel has no reservation.
+
+    Read straight out of the ELF rather than shelling out to readelf. The
+    rustup `llvm-tools-preview` component -- the only copy of these tools many
+    CI machines have -- ships llvm-nm and llvm-objcopy but no llvm-readelf, so
+    a readelf fallback would still come up empty exactly where it is needed.
+    """
+    try:
+        data = Path(elf).read_bytes()
+    except OSError as e:
+        warn(f"cannot read {elf} ({e})")
         return None
-    for line in out.splitlines():
-        m = re.search(r"\.ksyms\s+(\w+)\s+([0-9a-f]+)\s+([0-9a-f]+)\s+([0-9a-f]+)", line)
-        if m:
-            if m.group(1) != "PROGBITS":
-                warn(f".ksyms is {m.group(1)}, not PROGBITS -- cannot patch it")
-                return None
-            return int(m.group(4), 16)
+    if data[:4] != b"\x7fELF":
+        warn(f"{elf} is not an ELF file")
+        return None
+    elf64 = data[4] == 2
+    endian = "<" if data[5] == 1 else ">"
+    # Section header: name, type, flags, addr, offset, size, ... -- the fields
+    # we want sit at the same indices in both widths, only the widths differ.
+    shdr = endian + ("IIQQQQ" if elf64 else "IIIIII")
+    NAME, TYPE, OFFSET, SIZE = 0, 1, 4, 5
+    if elf64:
+        (shoff,) = struct.unpack_from(endian + "Q", data, 0x28)
+        shentsize, shnum, shstrndx = struct.unpack_from(endian + "HHH", data, 0x3A)
+    else:
+        (shoff,) = struct.unpack_from(endian + "I", data, 0x20)
+        shentsize, shnum, shstrndx = struct.unpack_from(endian + "HHH", data, 0x32)
+
+    def header(i):
+        return struct.unpack_from(shdr, data, shoff + i * shentsize)
+
+    if shnum == 0 or shstrndx >= shnum:
+        warn(f"{elf} has no section headers -- nothing to patch")
+        return None
+    names = header(shstrndx)[OFFSET]
+    for i in range(shnum):
+        h = header(i)
+        start = names + h[NAME]
+        if data[start : data.index(b"\0", start)] != b".ksyms":
+            continue
+        if h[TYPE] != SHT_PROGBITS:
+            warn(f".ksyms is section type {h[TYPE]}, not PROGBITS -- cannot patch it")
+            return None
+        return h[SIZE]
     return None
 
 
@@ -82,6 +149,23 @@ MARKERS = {
     "kcounters_arena_start",
     "kcounters_arena_end",
 }
+
+
+def is_noise(name):
+    """True for assembler bookkeeping that is not a function.
+
+    `.L*` are compiler-local labels -- `.L0`, `.Lpcrel_hi7` -- and `$x`/`$d`
+    are the ARM/RISC-V mapping symbols that mark code/data transitions. They
+    sit at real addresses **inside** functions, so a lookup for an address in
+    `trap_handler` resolved to the nearest one and printed `<.Lpcrel_hi7+0x4>`
+    instead of the function name. They also dominated the table by count:
+    17183 of the 19066 local text symbols in a riscv64 release kernel, and
+    122922 of 124805 with the LLVM 18 nm on a Debian host, so most of the
+    2 MiB reservation went to them instead of to functions. Dropping them also
+    makes the table reproducible: both nm versions now emit the same 1894
+    entries, byte for byte.
+    """
+    return name.startswith(".L") or (len(name) == 2 and name[0] == "$")
 
 
 def shorten(name):
@@ -128,7 +212,7 @@ def collect(nm, elf):
         except ValueError:
             continue
         name = name.strip()
-        if addr == 0 or not name or name in MARKERS:
+        if addr == 0 or not name or name in MARKERS or is_noise(name):
             continue
         syms.append((addr, size, shorten(name)))
     # Address first, then sized symbols before sizeless ones: at a shared
@@ -196,23 +280,26 @@ def main():
     ap.add_argument("elf")
     ap.add_argument("--nm", default="llvm-nm")
     ap.add_argument("--objcopy", default="llvm-objcopy")
-    ap.add_argument("--readelf", default="llvm-readelf")
     args = ap.parse_args()
 
-    for tool in (args.nm, args.objcopy, args.readelf):
-        if not tool_ok(tool):
-            warn(f"{tool} not found -- kernel left without a symbol table")
+    nm, objcopy = (resolve_tool(tool) for tool in (args.nm, args.objcopy))
+    for requested, resolved in ((args.nm, nm), (args.objcopy, objcopy)):
+        if resolved is None:
+            warn(
+                f"{requested} not found on PATH or in the rustup sysroot"
+                " -- kernel left without a symbol table"
+            )
             return 0
 
-    cap = section_size(args.readelf, args.elf)
+    cap = section_size(args.elf)
     if cap is None:
         warn("no .ksyms section in this kernel -- nothing to patch")
         return 0
 
     try:
-        syms = collect(args.nm, args.elf)
+        syms = collect(nm, args.elf)
     except subprocess.CalledProcessError as e:
-        warn(f"{args.nm} failed ({e}) -- kernel left without a symbol table")
+        warn(f"{nm} failed ({e}) -- kernel left without a symbol table")
         return 0
     if not syms:
         warn("no function symbols found -- is the ELF fully stripped?")
@@ -228,10 +315,10 @@ def main():
         path = f.name
     try:
         subprocess.run(
-            [args.objcopy, f"--update-section=.ksyms={path}", args.elf], check=True
+            [objcopy, f"--update-section=.ksyms={path}", args.elf], check=True
         )
     except (OSError, subprocess.CalledProcessError) as e:
-        warn(f"{args.objcopy} --update-section failed ({e}) -- kernel left unpatched")
+        warn(f"{objcopy} --update-section failed ({e}) -- kernel left unpatched")
         return 0
     print(f"[ksyms] {count} symbols patched into {args.elf} ({cap} bytes reserved)")
     return 0
