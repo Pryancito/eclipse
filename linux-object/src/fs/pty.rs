@@ -249,7 +249,9 @@ impl Pty {
                     let iexten = lflag & IEXTEN != 0;
                     if iexten && cc[VWERASE] != 0 && c == cc[VWERASE] {
                         // Word erase: drop trailing blanks, then the word.
-                        let echo = lflag & (ECHO | ECHOE) != 0;
+                        // ECHO alone gates it: with `stty -echo` nothing at all
+                        // may reach the terminal (see VERASE below).
+                        let echo = lflag & ECHO != 0;
                         while matches!(inner.canon.back(), Some(&b' ') | Some(&b'\t')) {
                             inner.canon.pop_back();
                             if echo {
@@ -288,8 +290,20 @@ impl Pty {
                             wake_master = true;
                         }
                     } else if cc[VERASE] != 0 && c == cc[VERASE] {
-                        if inner.canon.pop_back().is_some() && lflag & (ECHO | ECHOE) != 0 {
-                            inner.output.extend(b"\x08 \x08");
+                        // ECHO decides WHETHER to echo, ECHOE only decides HOW.
+                        // Testing `ECHO | ECHOE` made a backspace visible under
+                        // `stty -echo` -- ECHOE stays set in the default termios,
+                        // so a password prompt echoed a rubout for every
+                        // correction, painting over the prompt and telling an
+                        // onlooker the secret was being edited. Linux's n_tty
+                        // and this kernel's own console (`stdio.rs`) both gate
+                        // on ECHO first.
+                        if inner.canon.pop_back().is_some() && lflag & ECHO != 0 {
+                            if lflag & ECHOE != 0 {
+                                inner.output.extend(b"\x08 \x08");
+                            } else {
+                                inner.output.push_back(cc[VERASE]);
+                            }
                             wake_master = true;
                         }
                     } else if cc[VKILL] != 0 && c == cc[VKILL] {
@@ -976,5 +990,540 @@ impl INode for PtmxINode {
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Host tests for the pseudo-terminal pair.
+    //!
+    //! Every terminal emulator, `ssh` session and `tmux` pane runs through
+    //! this. It is a second, independent implementation of the line discipline
+    //! (the console's lives in `stdio.rs`), so the two can drift apart, and a
+    //! regression here is invisible until someone is typing into a shell.
+    //!
+    //! Unlike the console's, this one's echo **is** observable: it goes into
+    //! the same queue the master reads, so these tests check what the terminal
+    //! would actually display as well as what the program would read.
+    //!
+    //! A `Pty` owns all its state, so each test builds its own pair and
+    //! nothing is shared — no serialisation needed.
+
+    use super::*;
+    use alloc::string::String;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    /// A fresh pair with one slave open, as `alloc_ptmx` + `open_pts` would
+    /// leave it, but without registering in the global `PTYS` map.
+    fn pty() -> Pty {
+        let p = Pty {
+            id: 0,
+            inner: Mutex::new(PtyInner {
+                input: VecDeque::new(),
+                canon: VecDeque::new(),
+                lnext: false,
+                modem: 0,
+                stopped: false,
+                eof_pending: false,
+                output: VecDeque::new(),
+                termios: Termios::default_tty(),
+                winsize: ConsoleWinSize {
+                    ws_row: 24,
+                    ws_col: 80,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                },
+            }),
+            master_bus: Arc::new(Mutex::new(EventBus::default())),
+            slave_bus: Arc::new(Mutex::new(EventBus::default())),
+            fg_pgrp: AtomicI32::new(0),
+            slave_open: AtomicI32::new(1),
+            slave_ever_open: AtomicBool::new(true),
+            master_closed: AtomicBool::new(false),
+            locked: AtomicBool::new(false),
+        };
+        p
+    }
+
+    fn set_flags(p: &Pty, f: impl FnOnce(&mut Termios)) {
+        f(&mut p.inner.lock().termios);
+    }
+
+    /// Everything the program would read right now, one `read` at a time (so
+    /// canonical mode's one-line-per-read rule shows up).
+    fn slave_reads(p: &Pty) -> Vec<String> {
+        let mut out = Vec::new();
+        loop {
+            let mut buf = [0u8; 64];
+            match p.slave_read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.push(String::from_utf8_lossy(&buf[..n]).into_owned()),
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    /// Everything the terminal would display right now.
+    fn master_drain(p: &Pty) -> String {
+        let mut out = String::new();
+        loop {
+            let mut buf = [0u8; 128];
+            match p.master_read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.push_str(&String::from_utf8_lossy(&buf[..n])),
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    const DEL: u8 = 0x7f;
+    const CTRL_C: u8 = 3;
+    const CTRL_D: u8 = 4;
+    const CTRL_O: u8 = 15;
+    const CTRL_Q: u8 = 17;
+    const CTRL_R: u8 = 18;
+    const CTRL_S: u8 = 19;
+    const CTRL_U: u8 = 21;
+    const CTRL_V: u8 = 22;
+    const CTRL_W: u8 = 23;
+
+    // ---- echo_byte, on its own -----------------------------------------
+
+    #[test]
+    fn echo_byte_renders_each_class_of_character() {
+        let d = Termios::default_tty();
+        let mut out = VecDeque::new();
+        // ECHO off: nothing written, and the caller is told so.
+        assert!(!echo_byte(&mut out, b'a', 0, d.c_oflag));
+        assert!(out.is_empty());
+
+        // Newline becomes CRLF only when OPOST|ONLCR are both on.
+        let mut out = VecDeque::new();
+        assert!(echo_byte(&mut out, b'\n', ECHO, OPOST | ONLCR));
+        assert_eq!(Vec::from(out), b"\r\n");
+        let mut out = VecDeque::new();
+        echo_byte(&mut out, b'\n', ECHO, 0);
+        assert_eq!(Vec::from(out), b"\n");
+
+        // Backspace and DEL both erase visually.
+        for c in [0x08u8, DEL] {
+            let mut out = VecDeque::new();
+            echo_byte(&mut out, c, ECHO, 0);
+            assert_eq!(Vec::from(out), b"\x08 \x08");
+        }
+
+        // Tab and CR go out as themselves, never as ^I / ^M.
+        let mut out = VecDeque::new();
+        echo_byte(&mut out, b'\t', ECHO | ECHOCTL, 0);
+        echo_byte(&mut out, b'\r', ECHO | ECHOCTL, 0);
+        assert_eq!(Vec::from(out), b"\t\r");
+
+        // Other control characters: caret notation under ECHOCTL, raw without.
+        let mut out = VecDeque::new();
+        echo_byte(&mut out, CTRL_C, ECHO | ECHOCTL, 0);
+        assert_eq!(Vec::from(out), b"^C");
+        let mut out = VecDeque::new();
+        echo_byte(&mut out, CTRL_C, ECHO, 0);
+        assert_eq!(Vec::from(out), [CTRL_C]);
+    }
+
+    // ---- canonical input ------------------------------------------------
+
+    #[test]
+    fn a_canonical_line_reaches_the_program_only_on_its_newline() {
+        let p = pty();
+        p.master_write(b"hola");
+        // Still being edited: nothing for the program to read yet.
+        assert!(!p.slave_readable());
+        // But it is already echoed to the terminal.
+        assert_eq!(master_drain(&p), "hola");
+        p.master_write(b"\n");
+        assert_eq!(slave_reads(&p), vec!["hola\n"]);
+        assert_eq!(master_drain(&p), "\r\n");
+    }
+
+    #[test]
+    fn a_canonical_read_stops_at_the_end_of_one_line() {
+        let p = pty();
+        p.master_write(b"una\ndos\n");
+        // Two lines queued, but each read returns exactly one -- what a shell
+        // depends on to not swallow the next command.
+        assert_eq!(slave_reads(&p), vec!["una\n", "dos\n"]);
+    }
+
+    #[test]
+    fn a_raw_read_takes_everything_queued() {
+        let p = pty();
+        set_flags(&p, |t| t.c_lflag &= !ICANON);
+        p.master_write(b"una\ndos\n");
+        assert_eq!(slave_reads(&p), vec!["una\ndos\n"]);
+    }
+
+    #[test]
+    fn icrnl_completes_a_line_but_inlcr_and_igncr_do_not() {
+        let p = pty();
+        p.master_write(b"ab\r");
+        assert_eq!(slave_reads(&p), vec!["ab\n"]);
+
+        let p = pty();
+        set_flags(&p, |t| t.c_iflag = IGNCR);
+        p.master_write(b"ab\r");
+        assert!(!p.slave_readable());
+
+        let p = pty();
+        set_flags(&p, |t| t.c_iflag = INLCR);
+        p.master_write(b"ab\n");
+        // '\n' became '\r', which is not an end of line.
+        assert!(!p.slave_readable());
+    }
+
+    #[test]
+    fn veol_terminates_a_line_and_a_zero_control_char_is_disabled() {
+        let p = pty();
+        set_flags(&p, |t| t.c_cc[VEOL] = b';');
+        p.master_write(b"uno;");
+        assert_eq!(slave_reads(&p), vec!["uno;"]);
+
+        // VEOL back at its default of 0 must not make NUL an end of line.
+        let p = pty();
+        p.master_write(b"dos\0");
+        assert!(!p.slave_readable());
+    }
+
+    // ---- line editing ---------------------------------------------------
+
+    #[test]
+    fn verase_removes_one_character_and_echoes_the_rubout() {
+        let p = pty();
+        p.master_write(b"abc");
+        assert_eq!(master_drain(&p), "abc");
+        p.master_write(&[DEL]);
+        assert_eq!(master_drain(&p), "\x08 \x08");
+        p.master_write(b"\n");
+        assert_eq!(slave_reads(&p), vec!["ab\n"]);
+    }
+
+    #[test]
+    fn verase_on_an_empty_line_erases_nothing_and_echoes_nothing() {
+        let p = pty();
+        p.master_write(&[DEL, DEL]);
+        // No rubout for a character that was never there, or the terminal
+        // would eat the prompt.
+        assert_eq!(master_drain(&p), "");
+        assert!(!p.slave_readable());
+    }
+
+    #[test]
+    fn with_echo_off_nothing_at_all_reaches_the_terminal() {
+        // `stty -echo`, which is what a password prompt does. ECHOE stays set,
+        // because it is in the default termios and nothing clears it.
+        let p = pty();
+        set_flags(&p, |t| t.c_lflag &= !ECHO);
+        assert!(p.inner.lock().termios.c_lflag & ECHOE != 0);
+        p.master_write(b"secreto");
+        assert_eq!(master_drain(&p), "");
+        // A correction must be silent too: a rubout here paints over the
+        // prompt and tells an onlooker the secret is being edited.
+        p.master_write(&[DEL]);
+        assert_eq!(master_drain(&p), "");
+        p.master_write(&[CTRL_W]);
+        assert_eq!(master_drain(&p), "");
+        // The program still gets what was typed.
+        p.master_write(b"\n");
+        assert_eq!(slave_reads(&p), vec!["\n"]);
+    }
+
+    #[test]
+    fn without_echoe_an_erase_echoes_the_erase_character_itself() {
+        // ECHO decides whether to echo; ECHOE only decides how.
+        let p = pty();
+        set_flags(&p, |t| t.c_lflag &= !ECHOE);
+        p.master_write(b"ab");
+        let _ = master_drain(&p);
+        p.master_write(&[DEL]);
+        assert_eq!(master_drain(&p), "\x7f");
+    }
+
+    #[test]
+    fn vkill_clears_the_line_and_rubs_out_every_character() {
+        let p = pty();
+        p.master_write(b"abcd");
+        let _ = master_drain(&p);
+        p.master_write(&[CTRL_U]);
+        assert_eq!(master_drain(&p), "\x08 \x08".repeat(4));
+        p.master_write(b"\n");
+        assert_eq!(slave_reads(&p), vec!["\n"]);
+    }
+
+    #[test]
+    fn vwerase_drops_trailing_blanks_then_one_word() {
+        let p = pty();
+        p.master_write(b"foo bar  ");
+        let _ = master_drain(&p);
+        p.master_write(&[CTRL_W]);
+        // Two blanks plus the three letters of "bar".
+        assert_eq!(master_drain(&p), "\x08 \x08".repeat(5));
+        p.master_write(b"\n");
+        assert_eq!(slave_reads(&p), vec!["foo \n"]);
+    }
+
+    #[test]
+    fn vreprint_redraws_the_pending_line_without_changing_it() {
+        let p = pty();
+        p.master_write(b"intacta");
+        let _ = master_drain(&p);
+        p.master_write(&[CTRL_R]);
+        // ECHOCTL is off in the default termios, so the "^R" marker is not
+        // drawn -- only the fresh line and the pending text.
+        assert_eq!(master_drain(&p), "\r\nintacta");
+        p.master_write(b"\n");
+        assert_eq!(slave_reads(&p), vec!["intacta\n"]);
+
+        // With ECHOCTL the marker is drawn first.
+        let p = pty();
+        set_flags(&p, |t| t.c_lflag |= ECHOCTL);
+        p.master_write(b"intacta");
+        let _ = master_drain(&p);
+        p.master_write(&[CTRL_R]);
+        assert_eq!(master_drain(&p), "^R\r\nintacta");
+    }
+
+    #[test]
+    fn vlnext_quotes_the_next_byte_even_an_interrupt() {
+        let p = pty();
+        p.master_write(&[CTRL_V]);
+        p.master_write(&[CTRL_C]);
+        p.master_write(b"\n");
+        // The Ctrl-C is data, not a signal, and it is echoed as ^C rather than
+        // acting as one.
+        assert_eq!(slave_reads(&p), vec!["\x03\n"]);
+
+        // The latch is one-shot: the SECOND Ctrl-C is a signal again, so it
+        // flushes the line the first one was quoted into.
+        let p = pty();
+        p.master_write(&[CTRL_V, CTRL_C]);
+        assert_eq!(p.inner.lock().canon.len(), 1);
+        let _ = master_drain(&p);
+        p.master_write(&[CTRL_C]);
+        assert!(p.inner.lock().canon.is_empty());
+        assert_eq!(master_drain(&p), "^C\r\n");
+    }
+
+    #[test]
+    fn vlnext_survives_a_write_boundary() {
+        // Ctrl-V and the byte it quotes routinely arrive in separate writes
+        // from a terminal, which is why the latch lives in `PtyInner`.
+        let p = pty();
+        p.master_write(&[CTRL_V]);
+        assert!(p.inner.lock().lnext);
+        p.master_write(&[CTRL_C]);
+        p.master_write(b"\n");
+        assert_eq!(slave_reads(&p), vec!["\x03\n"]);
+    }
+
+    #[test]
+    fn the_extended_editing_bytes_need_iexten() {
+        let p = pty();
+        set_flags(&p, |t| t.c_lflag &= !IEXTEN);
+        p.master_write(b"ab cd");
+        p.master_write(&[CTRL_W]);
+        p.master_write(b"\n");
+        // Ctrl-W is ordinary input without IEXTEN.
+        assert_eq!(slave_reads(&p), vec!["ab cd\x17\n"]);
+    }
+
+    // ---- end of file ----------------------------------------------------
+
+    #[test]
+    fn veof_delivers_a_partial_line_and_only_ends_the_file_on_an_empty_one() {
+        let p = pty();
+        p.master_write(b"abc");
+        p.master_write(&[CTRL_D]);
+        // The partial line arrives with no newline...
+        let mut buf = [0u8; 64];
+        assert_eq!(p.slave_read(&mut buf).unwrap(), 3);
+        assert_eq!(&buf[..3], b"abc");
+        // ...and this is NOT end of file: the program must keep reading, so
+        // the next read blocks rather than returning 0.
+        assert!(!p.inner.lock().eof_pending);
+        assert!(p.slave_read(&mut buf).is_err());
+
+        // Ctrl-D at the start of a line IS end of file, exactly once.
+        p.master_write(&[CTRL_D]);
+        assert!(p.inner.lock().eof_pending);
+        assert_eq!(p.slave_read(&mut buf).unwrap(), 0);
+        assert!(p.slave_read(&mut buf).is_err());
+    }
+
+    #[test]
+    fn an_interrupt_clears_a_pending_eof() {
+        let p = pty();
+        p.master_write(&[CTRL_D]);
+        assert!(p.inner.lock().eof_pending);
+        p.master_write(&[CTRL_C]);
+        // Otherwise the next read returns 0 and the shell exits on a Ctrl-C.
+        assert!(!p.inner.lock().eof_pending);
+    }
+
+    // ---- signals --------------------------------------------------------
+
+    #[test]
+    fn an_interrupt_flushes_the_pending_input_and_echoes_its_label() {
+        let p = pty();
+        p.master_write(b"a medio escribir");
+        let _ = master_drain(&p);
+        p.master_write(&[CTRL_C]);
+        assert!(!p.slave_readable());
+        assert_eq!(master_drain(&p), "^C\r\n");
+    }
+
+    #[test]
+    fn noflsh_keeps_the_pending_input_across_an_interrupt() {
+        let p = pty();
+        set_flags(&p, |t| t.c_lflag |= NOFLSH);
+        p.master_write(b"abc");
+        p.master_write(&[CTRL_C]);
+        p.master_write(b"\n");
+        assert_eq!(slave_reads(&p), vec!["abc\n"]);
+    }
+
+    #[test]
+    fn without_isig_an_interrupt_byte_is_ordinary_input() {
+        let p = pty();
+        set_flags(&p, |t| t.c_lflag &= !ISIG);
+        p.master_write(&[b'a', CTRL_C, b'\n']);
+        assert_eq!(slave_reads(&p), vec!["a\x03\n"]);
+    }
+
+    // ---- flow control ---------------------------------------------------
+
+    #[test]
+    fn ctrl_s_holds_program_output_back_from_the_terminal() {
+        let p = pty();
+        p.slave_write(b"antes\n");
+        p.master_write(&[CTRL_S]);
+        // The program's output is queued but must not reach the terminal.
+        assert_eq!(master_drain(&p), "");
+        assert!(!p.master_readable());
+        p.master_write(&[CTRL_Q]);
+        assert_eq!(master_drain(&p), "antes\r\n");
+        // Neither control byte may reach the program.
+        assert!(!p.slave_readable());
+    }
+
+    #[test]
+    fn ixany_lets_any_byte_resume_and_still_delivers_it() {
+        let p = pty();
+        set_flags(&p, |t| t.c_iflag |= IXANY);
+        p.slave_write(b"x");
+        p.master_write(&[CTRL_S]);
+        assert_eq!(master_drain(&p), "");
+        p.master_write(b"z\n");
+        // Output flows again, and 'z' was input, not just a resume trigger.
+        assert!(master_drain(&p).starts_with('x'));
+        assert_eq!(slave_reads(&p), vec!["z\n"]);
+    }
+
+    #[test]
+    fn without_ixany_an_ordinary_byte_does_not_resume_output() {
+        let p = pty();
+        p.slave_write(b"x");
+        p.master_write(&[CTRL_S]);
+        p.master_write(b"z\n");
+        assert_eq!(master_drain(&p), "");
+        assert!(p.inner.lock().stopped);
+    }
+
+    #[test]
+    fn an_interrupt_lifts_an_output_freeze() {
+        let p = pty();
+        p.slave_write(b"x");
+        p.master_write(&[CTRL_S]);
+        assert!(p.inner.lock().stopped);
+        // Otherwise the signalled program stays blocked behind the Ctrl-S.
+        p.master_write(&[CTRL_C]);
+        assert!(!p.inner.lock().stopped);
+        assert_eq!(master_drain(&p), "x^C\r\n");
+    }
+
+    #[test]
+    fn vdiscard_is_swallowed_under_iexten() {
+        let p = pty();
+        p.master_write(&[b'a', CTRL_O, b'\n']);
+        assert_eq!(slave_reads(&p), vec!["a\n"]);
+        let p = pty();
+        set_flags(&p, |t| t.c_lflag &= !IEXTEN);
+        p.master_write(&[b'a', CTRL_O, b'\n']);
+        assert_eq!(slave_reads(&p), vec!["a\x0f\n"]);
+    }
+
+    // ---- output post-processing ----------------------------------------
+
+    #[test]
+    fn slave_write_expands_newlines_only_under_opost_and_onlcr() {
+        let p = pty();
+        p.slave_write(b"uno\ndos\n");
+        assert_eq!(master_drain(&p), "uno\r\ndos\r\n");
+
+        let p = pty();
+        set_flags(&p, |t| t.c_oflag = 0);
+        p.slave_write(b"uno\ndos\n");
+        assert_eq!(master_drain(&p), "uno\ndos\n");
+
+        // An empty write is a no-op, not a wake.
+        let p = pty();
+        assert_eq!(p.slave_write(b""), 0);
+        assert!(!p.master_readable());
+    }
+
+    // ---- hangup ---------------------------------------------------------
+
+    #[test]
+    fn an_empty_queue_is_eagain_until_the_far_end_hangs_up() {
+        let p = pty();
+        let mut buf = [0u8; 8];
+        // Both ends open, nothing queued: try again, not end of file.
+        assert!(p.master_read(&mut buf).is_err());
+        assert!(p.slave_read(&mut buf).is_err());
+
+        // Slave closes: the master now reads EOF.
+        p.slave_open.store(0, Ordering::Relaxed);
+        assert_eq!(p.master_read(&mut buf).unwrap(), 0);
+        assert!(p.master_readable());
+
+        // Master closes: the slave reads EOF.
+        let p = pty();
+        p.master_closed.store(true, Ordering::Relaxed);
+        assert_eq!(p.slave_read(&mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn output_already_queued_survives_the_slave_hanging_up() {
+        let p = pty();
+        p.slave_write(b"ultimas palabras\n");
+        p.slave_open.store(0, Ordering::Relaxed);
+        // The terminal must still get what the program printed before exiting,
+        // and only then see EOF.
+        let mut buf = [0u8; 128];
+        let n = p.master_read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"ultimas palabras\r\n");
+        assert_eq!(p.master_read(&mut buf).unwrap(), 0);
+    }
+
+    // ---- path parsing ---------------------------------------------------
+
+    #[test]
+    fn pts_paths_parse_only_when_they_name_a_number() {
+        assert_eq!(pts_id_from_path("/dev/pts/0"), Some(0));
+        assert_eq!(pts_id_from_path("/dev/pts/42"), Some(42));
+        assert_eq!(pts_id_from_path("/dev/pts/"), None);
+        assert_eq!(pts_id_from_path("/dev/pts/ptmx"), None);
+        assert_eq!(pts_id_from_path("/dev/pts/-1"), None);
+        assert_eq!(pts_id_from_path("/dev/pts/1/2"), None);
+        assert_eq!(pts_id_from_path("/dev/tty0"), None);
+        assert_eq!(pts_id_from_path("pts/0"), None);
     }
 }
