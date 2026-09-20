@@ -135,6 +135,10 @@ const MAX_ROWS: usize = 8;
 /// Filter length cap: far past what fits, and bounds the per-key rescan.
 const MAX_FILTER: usize = 64;
 
+/// State value from wlr-foreign-toplevel-management-unstable-v1 (the `state`
+/// array carries u32 enum values). Same table lunarbar reads.
+const TOPLEVEL_STATE_MINIMIZED: u32 = 1;
+
 // ── items ────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -304,7 +308,6 @@ struct State {
 
     /// `--toggle-desktop`: toplevels seen, and whether each is minimised.
     toplevels: Vec<(ZwlrForeignToplevelHandleV1, bool)>,
-    listed: bool,
     done: bool,
 }
 
@@ -985,7 +988,6 @@ impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for State {
                     st.toplevels.push((toplevel, false));
                 }
             }
-            zwlr_foreign_toplevel_manager_v1::Event::Finished => st.listed = true,
             _ => {}
         }
     }
@@ -1002,10 +1004,10 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
     ) {
         match event {
             zwlr_foreign_toplevel_handle_v1::Event::State { state } => {
-                // The array is a packed list of u32 state enums; 1 = minimized.
-                let minimized = state
-                    .chunks_exact(4)
-                    .any(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]) == 1);
+                // The array is a packed list of u32 state enums.
+                let minimized = state.chunks_exact(4).any(|c| {
+                    u32::from_ne_bytes([c[0], c[1], c[2], c[3]]) == TOPLEVEL_STATE_MINIMIZED
+                });
                 let id = handle.id().protocol_id();
                 if let Some(slot) = st
                     .toplevels
@@ -1077,7 +1079,6 @@ fn new_state(toggle_desktop: bool) -> State {
         row0_y: 0,
         scroll_acc: 0.0,
         toplevels: Vec::new(),
-        listed: false,
         done: false,
     };
     st.hits = matches(&st.items, "");
