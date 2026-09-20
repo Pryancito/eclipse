@@ -491,6 +491,100 @@ pub const WAIT_VBLANK_IOCTL: u32 = DRM_IOCTL_WAIT_VBLANK;
 /// the sync arm scans that buffer out.
 pub const ATOMIC_IOCTL: u32 = DRM_IOCTL_MODE_ATOMIC;
 
+/// How many `SETCRTC`/`SETPLANE` presents that put no pixels on the screen get
+/// a console line before the trace goes quiet. Eight covers both buffers of a
+/// double-buffered swapchain several times over — enough to tell a one-off from
+/// a steady state — while staying far short of a per-frame flood. A storm on
+/// this path is not hypothetical: the compositor log that prompted this retried
+/// its modeset at ~8 Hz for minutes, and a console flood on a slow serial line
+/// has wedged spinlocks here before (see the EXEC dedup in `nouveau_uapi.rs`).
+const PRESENT_FAIL_TRACE_BUDGET: u32 = 8;
+static PRESENT_FAIL_TRACED: AtomicU32 = AtomicU32::new(0);
+
+/// Decide what a failed present means for the ioctl that asked for it, and say
+/// so on the console.
+///
+/// A modeset is a *configuration* operation: `drm_mode_setcrtc` binds a fb to a
+/// CRTC and programs a mode, and Linux fails it for a bad argument, never
+/// because a frame could not be copied. Answering `EIO` because the blit did
+/// not happen conflated the two, and wlroots' legacy backend reads that as the
+/// output being broken — it retries the whole modeset next frame, forever,
+/// never advancing to page-flips. The compositor log fills with
+///
+/// ```text
+/// [backend/drm/legacy.c:123] connector HDMI-A-1: Failed to set CRTC: I/O error
+/// ```
+///
+/// at frame rate while the kernel says nothing, because every reason inside the
+/// present path is a `warn!` and the rig boots at `LOG=error`. A single
+/// unpresentable frame took down the whole desktop.
+///
+/// So: a bad fb id keeps failing the ioctl, with the `ENOENT` Linux uses for it
+/// ("Unknown FB ID") rather than `EIO` — that one is a real client error, and
+/// the errno points at fb lifetime instead of at the bus. Everything else is
+/// reported and swallowed: the CRTC takes the binding it was asked for, the
+/// compositor keeps running, and the next present gets another chance. That is
+/// the same call `DIRTYFB` already makes a few arms down, for the same reason.
+fn present_failed(
+    op: &str,
+    fb_id: u32,
+    crtc_id: u32,
+    err: drm::PresentError,
+) -> core::result::Result<(), FsError> {
+    let n = PRESENT_FAIL_TRACED.fetch_add(1, Ordering::Relaxed);
+    if n < PRESENT_FAIL_TRACE_BUDGET {
+        // error!, not warn!: the rig boots at LOG=error, and this line is the
+        // one that says why the screen is black. The reasons underneath are
+        // warn!/klog and were invisible there.
+        //
+        // For a missing fb, say whether the id was one WE took away. A
+        // nouveau-backed fb dies with its GEM handle (Linux's never does,
+        // because there the fb holds its own reference), so "the client is
+        // presenting an id it never had" and "the client is presenting the id
+        // we pulled out from under it" both arrive here looking identical --
+        // and they have opposite fixes.
+        let taken_by = match err {
+            drm::PresentError::NoSuchFb => drm::fb_retired_reason(fb_id),
+            _ => None,
+        };
+        log::error!(
+            "[drm] {} fb={} crtc={} did not present: {}{}{}{}",
+            op,
+            fb_id,
+            crtc_id,
+            err.as_str(),
+            match taken_by {
+                Some(why) => alloc::format!(" (this fb was retired by {})", why.as_str()),
+                None => alloc::string::String::new(),
+            },
+            match err {
+                drm::PresentError::NoSuchFb => " -> ENOENT to caller",
+                _ => " -> reported OK to caller (the modeset stands; only this frame is lost)",
+            },
+            if n + 1 == PRESENT_FAIL_TRACE_BUDGET {
+                " [further present failures not traced]"
+            } else {
+                ""
+            },
+        );
+    }
+    match err {
+        drm::PresentError::NoSuchFb => Err(FsError::EntryNotFound),
+        drm::PresentError::NoDisplay | drm::PresentError::NoBacking => {
+            // We are about to answer 0, so the CRTC really is configured with
+            // this fb and `GETCRTC` has to say so. `present_now_checked` binds
+            // it on every path that succeeds and returns before binding on the
+            // ones that do not, which would otherwise leave the readback
+            // naming the previous frame's fb. Safe for both reasons that get
+            // here: every consumer of `crtc_fb` -- `repaint_for_cursor` and
+            // the next present -- re-checks the display and the fb's backing
+            // before it touches a pixel.
+            drm::set_crtc_fb(crtc_id, fb_id);
+            Ok(())
+        }
+    }
+}
+
 /// True for any of the four `SYNCOBJ_WAIT` / `TIMELINE_WAIT` ioctl numbers
 /// (classic + deadline-sized). Used by `sys_ioctl` to run
 /// [`DrmDev::syncobj_wait_sleep`] before `io_control`.
@@ -2348,8 +2442,10 @@ impl INode for DrmDev {
                 if req.mode_valid != 0 {
                     drm::set_vblank_period_from_modeinfo(&req.mode);
                 }
-                if req.fb_id != 0 && !drm::present_now(req.fb_id, req.crtc_id) {
-                    return Err(FsError::DeviceError);
+                if req.fb_id != 0 {
+                    if let Err(e) = drm::present_now_checked(req.fb_id, req.crtc_id, None) {
+                        present_failed("SETCRTC", req.fb_id, req.crtc_id, e)?;
+                    }
                 }
                 Ok(0)
             }
@@ -2456,8 +2552,10 @@ impl INode for DrmDev {
                 // Primary-plane update: present immediately on the target CRTC.
                 // fb_id == 0 disables the plane, which we treat as a no-op.
                 let req = unsafe { *(data as *const DrmModeSetPlane) };
-                if req.fb_id != 0 && !drm::present_now(req.fb_id, req.crtc_id) {
-                    return Err(FsError::DeviceError);
+                if req.fb_id != 0 {
+                    if let Err(e) = drm::present_now_checked(req.fb_id, req.crtc_id, None) {
+                        present_failed("SETPLANE", req.fb_id, req.crtc_id, e)?;
+                    }
                 }
                 Ok(0)
             }
@@ -3587,5 +3685,81 @@ impl INode for DrmDev {
 
     fn as_any_ref(&self) -> &dyn Any {
         self
+    }
+}
+
+/// What a failed present costs the ioctl that asked for it.
+///
+/// The bug these guard: `SETCRTC` answered `EIO` whenever the present path
+/// returned false, and wlroots' legacy backend reads a failed
+/// `drmModeSetCrtc` as the *output* being broken. It retried the modeset every
+/// frame and never reached page-flipping — an 8 Hz storm of
+/// `connector HDMI-A-1: Failed to set CRTC: I/O error` for as long as the
+/// session lasted, and a desktop that never appeared, because one frame could
+/// not be copied.
+#[cfg(test)]
+mod present_failure_policy_tests {
+    use super::*;
+    use crate::fs::LxError;
+
+    /// Linux fails `drm_mode_setcrtc` for a fb id it cannot look up, and does
+    /// it with `ENOENT` ("Unknown FB ID"). Keep failing that one — it is a real
+    /// client error — but with the errno that points at fb lifetime instead of
+    /// at the bus.
+    #[test]
+    fn an_unknown_fb_id_still_fails_the_ioctl_but_as_enoent() {
+        assert_eq!(
+            present_failed("SETCRTC", 7, 1, drm::PresentError::NoSuchFb),
+            Err(FsError::EntryNotFound),
+        );
+        assert_eq!(
+            LxError::from(FsError::EntryNotFound),
+            LxError::ENOENT,
+            "EntryNotFound is the arm's way of spelling ENOENT",
+        );
+    }
+
+    /// Everything else is a frame that could not be copied, not a modeset that
+    /// could not be programmed. Report it and carry on: the CRTC keeps its
+    /// binding, the compositor keeps running, and the next present gets another
+    /// chance — instead of the output being written off for good.
+    #[test]
+    fn a_frame_that_could_not_be_copied_does_not_fail_the_modeset() {
+        for reason in [drm::PresentError::NoDisplay, drm::PresentError::NoBacking] {
+            drm::set_crtc_fb(1, 0);
+            assert_eq!(
+                present_failed("SETCRTC", 7, 1, reason),
+                Ok(()),
+                "{:?} must not take the whole output down",
+                reason,
+            );
+            // Answering 0 means the modeset happened, so the readback has to
+            // agree: a caller that asks GETCRTC which fb is on the CRTC must
+            // be told the one it just set, not the one before it.
+            assert_eq!(
+                drm::crtc_fb(),
+                7,
+                "{:?} left GETCRTC naming a different fb than SETCRTC accepted",
+                reason,
+            );
+        }
+    }
+
+    /// The console trace is bounded. A per-frame line on this path is exactly
+    /// the flood that has wedged spinlocks on a slow serial console before, and
+    /// the failure it reports is a steady state, not a one-off.
+    #[test]
+    fn the_console_trace_is_bounded_however_long_the_storm_runs() {
+        PRESENT_FAIL_TRACED.store(0, Ordering::Relaxed);
+        for _ in 0..10_000 {
+            let _ = present_failed("SETCRTC", 7, 1, drm::PresentError::NoDisplay);
+        }
+        let traced = PRESENT_FAIL_TRACED
+            .load(Ordering::Relaxed)
+            .min(PRESENT_FAIL_TRACE_BUDGET);
+        assert_eq!(
+            traced, PRESENT_FAIL_TRACE_BUDGET,
+            "the budget is spent exactly once, not per call",
+        );
     }
 }
