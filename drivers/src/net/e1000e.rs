@@ -71,7 +71,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::{size_of, MaybeUninit};
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use smoltcp::iface::*;
 use smoltcp::phy::{self, DeviceCapabilities};
@@ -147,6 +147,11 @@ const E1000E_GPRC: usize = 0x04074 / 4;
 const E1000E_GPTC: usize = 0x04080 / 4;
 const E1000E_GORCL: usize = 0x04088 / 4;
 const E1000E_GORCH: usize = 0x0408C / 4;
+const E1000E_GOTCL: usize = 0x04090 / 4;
+const E1000E_GOTCH: usize = 0x04094 / 4;
+/// Receive No Buffers Count — frames the MAC had to hold because the driver
+/// had not returned descriptors fast enough.
+const E1000E_RNBC: usize = 0x040A0 / 4;
 const E1000E_MPC: usize = 0x04010 / 4;
 const E1000E_WUC: usize = 0x05800 / 4;
 const E1000E_WUFC: usize = 0x05808 / 4;
@@ -173,6 +178,18 @@ const CTRL_PHY_RST: u32 = 1 << 31;
 // STATUS register bits
 const STATUS_LU: u32 = 1 << 1;
 const STATUS_FD: u32 = 1 << 0;
+/// STATUS[7:6] — negotiated link speed (00 = 10, 01 = 100, 1x = 1000 Mb/s).
+const STATUS_SPEED_MASK: u32 = 0x0000_00C0;
+const STATUS_SPEED_SHIFT: u32 = 6;
+
+/// Negotiated link speed in Mb/s, decoded from a STATUS snapshot.
+fn status_speed_mbps(status: u32) -> u32 {
+    match (status & STATUS_SPEED_MASK) >> STATUS_SPEED_SHIFT {
+        0 => 10,
+        1 => 100,
+        _ => 1000,
+    }
+}
 
 // CTRL_EXT bits
 const CTRL_EXT_RO_DIS: u32 = 1 << 17; // PCIe Relaxed Ordering Disable
@@ -320,6 +337,27 @@ const CTRL_EXT_LPCD: u32 = 0x0000_0004; // CTRL_EXT bit 2 (link phy config done)
 // MII BMCR (PHY register 0) — IEEE standard autoneg bits
 const MII_CR_RESTART_AUTO_NEG: u16 = 0x0200;
 const MII_CR_AUTO_NEG_EN: u16 = 0x1000;
+
+// IEEE 802.3 MII registers used for auto-negotiation advertisement.
+const MII_BMSR: u32 = 0x01;
+const MII_ADVERTISE: u32 = 0x04;
+const MII_CTRL1000: u32 = 0x09;
+const MII_ESTATUS: u32 = 0x0F;
+/// BMSR bit 8: register 15 (ESTATUS) is implemented.
+const BMSR_ESTATEN: u16 = 0x0100;
+/// ESTATUS bits 12/13: the PHY can do 1000BASE-T half / full duplex.
+const ESTATUS_1000_THALF: u16 = 0x1000;
+const ESTATUS_1000_TFULL: u16 = 0x2000;
+/// ADVERTISE bits 5..8: 10/100, half and full duplex.
+const ADVERTISE_10HALF: u16 = 0x0020;
+const ADVERTISE_10FULL: u16 = 0x0040;
+const ADVERTISE_100HALF: u16 = 0x0080;
+const ADVERTISE_100FULL: u16 = 0x0100;
+const ADVERTISE_ALL_10_100: u16 =
+    ADVERTISE_10HALF | ADVERTISE_10FULL | ADVERTISE_100HALF | ADVERTISE_100FULL;
+/// CTRL1000 bits 8/9: advertise 1000BASE-T half / full duplex.
+const ADVERTISE_1000HALF: u16 = 0x0100;
+const ADVERTISE_1000FULL: u16 = 0x0200;
 
 // Legacy RX descriptor status (LK / 8254x §3.2.3.1)
 const RXD_STAT_DD: u8 = 1 << 0;
@@ -634,6 +672,14 @@ pub struct E1000eHw {
     rx_next_to_clean: usize,
     /// Multi-descriptor frame being reassembled (LK `rx_pending_pkt_`).
     rx_pending: Option<Vec<u8>>,
+    /// Set when reassembly of a multi-descriptor frame was abandoned part way
+    /// through (oversized, bad descriptor). The remaining fragments of that
+    /// frame are still queued in the ring and must be swallowed up to and
+    /// including the one carrying EOP. Without this the very next fragment —
+    /// the middle or the tail of a frame we already gave up on — starts a
+    /// *new* reassembly and, if it happens to carry EOP, is handed to smoltcp
+    /// and to any AF_PACKET tap as though it were a complete Ethernet frame.
+    rx_discard_until_eop: bool,
     /// Completed frames staged by a prior drain so back-to-back
     /// [`receive`](Self::receive) calls (smoltcp burst) only pop — no RDH
     /// re-read, no per-slot descriptor sync.
@@ -688,6 +734,10 @@ pub struct E1000eHw {
     itr_setting: u32,
     itr_last_rx_packets: u64,
     itr_tune_next_us: u64,
+    /// Timestamp of the last watchdog throughput sample, so the rate is
+    /// computed over the interval that actually elapsed rather than the
+    /// nominal log period.
+    throughput_last_us: u64,
 }
 
 impl E1000eHw {
@@ -1125,6 +1175,7 @@ impl E1000eHw {
                 if bmcr == 0xFFFF {
                     continue;
                 }
+                self.widen_autoneg_advertisement(phy_addr);
                 let v = bmcr | MII_CR_AUTO_NEG_EN | MII_CR_RESTART_AUTO_NEG;
                 if self.mdic_write(phy_addr, 0, v) {
                     crate::klog_warn!("[e1000e] restart autoneg on phy_addr={}\n", phy_addr);
@@ -1133,6 +1184,70 @@ impl E1000eHw {
             }
         }
         self.release_swflag();
+    }
+
+    /// Make sure the PHY advertises everything it is capable of before
+    /// auto-negotiation is restarted.
+    ///
+    /// Restarting autoneg only re-runs the exchange; it does not touch what is
+    /// being offered. Firmware, a previous OS, or the ULP/LPLU exit sequence
+    /// can leave `ADVERTISE` / `CTRL1000` with gigabit (or full duplex) turned
+    /// off, and the link then negotiates 100 Mb/s — or half duplex — on a
+    /// gigabit switch, with nothing in the log saying why. Linux programs the
+    /// full advertisement in `e1000_phy_setup_autoneg` before every restart.
+    ///
+    /// Bits are only ever ADDED here, never cleared, so this can widen a
+    /// negotiation but never narrow one.
+    unsafe fn widen_autoneg_advertisement(&self, phy_addr: u8) {
+        if let Some(adv) = self.mdic_read(phy_addr, MII_ADVERTISE) {
+            if adv != 0xFFFF && adv & ADVERTISE_ALL_10_100 != ADVERTISE_ALL_10_100 {
+                let want = adv | ADVERTISE_ALL_10_100;
+                if self.mdic_write(phy_addr, MII_ADVERTISE, want) {
+                    crate::klog_warn!(
+                        "[e1000e] widened 10/100 autoneg advertisement {:#06x} -> {:#06x}\n",
+                        adv,
+                        want
+                    );
+                }
+            }
+        }
+
+        // Gigabit lives in CTRL1000 and only exists when BMSR says ESTATUS is
+        // implemented and ESTATUS reports 1000BASE-T.
+        let Some(bmsr) = self.mdic_read(phy_addr, MII_BMSR) else {
+            return;
+        };
+        if bmsr == 0xFFFF || bmsr & BMSR_ESTATEN == 0 {
+            return;
+        }
+        let Some(estatus) = self.mdic_read(phy_addr, MII_ESTATUS) else {
+            return;
+        };
+        if estatus == 0xFFFF {
+            return;
+        }
+        let mut capable = 0u16;
+        if estatus & ESTATUS_1000_TFULL != 0 {
+            capable |= ADVERTISE_1000FULL;
+        }
+        if estatus & ESTATUS_1000_THALF != 0 {
+            capable |= ADVERTISE_1000HALF;
+        }
+        if capable == 0 {
+            return;
+        }
+        if let Some(ctrl1000) = self.mdic_read(phy_addr, MII_CTRL1000) {
+            if ctrl1000 != 0xFFFF && ctrl1000 & capable != capable {
+                let want = ctrl1000 | capable;
+                if self.mdic_write(phy_addr, MII_CTRL1000, want) {
+                    crate::klog_warn!(
+                        "[e1000e] widened 1000BASE-T autoneg advertisement {:#06x} -> {:#06x}\n",
+                        ctrl1000,
+                        want
+                    );
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1171,8 +1286,16 @@ impl E1000eHw {
         let ral = mmio_read(self.base, E1000E_RAL0);
         let rah = mmio_read(self.base, E1000E_RAH0);
         if ral == 0 && (rah & 0xFFFF) == 0 {
-            // Try EERD as fallback
-            self.read_mac_from_eeprom();
+            // Try EERD as fallback — but ONLY on discrete parts. On ICH/PCH
+            // silicon there is no EERD: Linux's regs.h maps the same offset
+            // 0x00014 to FEXTNVM5, and `e1000_read_nvm_ich8lan` goes through
+            // the flash interface instead. Probing "EERD" on an I217/I218/I219
+            // therefore does not read the MAC at all — it writes an arbitrary
+            // value into a power-management workaround register and then reads
+            // that register's top half back as if it were EEPROM data.
+            if !self.is_pch() {
+                self.read_mac_from_eeprom();
+            }
             return;
         }
         self.mac[0] = (ral & 0xFF) as u8;
@@ -1611,6 +1734,16 @@ impl E1000eHw {
         self.rx_pending = None;
     }
 
+    /// Give up on the frame currently being reassembled. `saw_eop` says
+    /// whether the descriptor that triggered the abort was the last of its
+    /// frame; when it was not, the rest of the chain is still on its way and
+    /// [`rx_discard_until_eop`](Self::rx_discard_until_eop) swallows it.
+    fn abort_rx_frame(&mut self, saw_eop: bool) {
+        self.rx_pending = None;
+        self.rx_discard_until_eop = !saw_eop;
+        self.stats.rx_dropped += 1;
+    }
+
     /// LK `irq_handler` RXO path: drop any in-flight multi-descriptor frame.
     pub fn handle_rx_irq(&mut self, icr: u32) {
         if icr & ICR_RXO != 0 {
@@ -1695,19 +1828,41 @@ impl E1000eHw {
     fn process_rx_slot(&mut self) -> Option<Vec<u8>> {
         let head = self.rx_next_to_clean;
 
-        // Copy descriptor locally (LK: consistent snapshot after dma_sync).
-        let rxd = unsafe { read_volatile(self.rx_ring.as_ptr::<RxDesc>().add(head)) };
+        // Read the status byte on its own first and only pull the rest of the
+        // descriptor once DD is set, with an acquire fence in between. The
+        // NIC writes all 16 bytes back in one PCIe transaction, but the CPU's
+        // loads are independent: a single `read_volatile` of the whole struct
+        // plus a *trailing* fence lets `len` / `errors` be satisfied from a
+        // load issued before the DD store became visible, i.e. from the
+        // previous occupant of the slot.
+        let desc_ptr = unsafe { self.rx_ring.as_ptr::<RxDesc>().add(head) };
 
         // Never advance past a slot HW owns without DD — skipping desyncs the ring.
-        if rxd.status & RXD_STAT_DD == 0 {
+        if unsafe { read_volatile(&(*desc_ptr).status) } & RXD_STAT_DD == 0 {
             return None;
         }
 
         fence(Ordering::Acquire);
 
+        // Copy descriptor locally (LK: consistent snapshot after dma_sync).
+        let rxd = unsafe { read_volatile(desc_ptr) };
+
         let len = rxd.len as usize;
         let eop = rxd.status & RXD_STAT_EOP != 0;
         let expected_addr = self.rx_buf_paddr(head);
+
+        // Swallow the leftovers of a chain we already abandoned (see
+        // `rx_discard_until_eop`). Must come before any delivery decision.
+        if self.rx_discard_until_eop {
+            if eop {
+                self.rx_discard_until_eop = false;
+            }
+            self.rx_next_to_clean = (head + 1) % NUM_RX;
+            unsafe {
+                self.recycle_rx_slot(head);
+            }
+            return None;
+        }
 
         if rxd.addr != expected_addr {
             crate::klog_warn!(
@@ -1716,8 +1871,7 @@ impl E1000eHw {
                 rxd.addr,
                 expected_addr
             );
-            self.clear_rx_pending();
-            self.stats.rx_dropped += 1;
+            self.abort_rx_frame(eop);
             self.rx_next_to_clean = (head + 1) % NUM_RX;
             unsafe {
                 self.recycle_rx_slot(head);
@@ -1734,8 +1888,7 @@ impl E1000eHw {
         // on I219. AF_PACKET (udhcpc) must see the frame; smoltcp still
         // verifies TCP/UDP itself (Checksum::Both).
         if rxd.errors & !RXD_ERR_CSUM_VERDICT != 0 || len == 0 || len > BUF_SIZE {
-            self.clear_rx_pending();
-            self.stats.rx_dropped += 1;
+            self.abort_rx_frame(eop);
             self.rx_next_to_clean = (head + 1) % NUM_RX;
             unsafe {
                 self.recycle_rx_slot(head);
@@ -1761,8 +1914,7 @@ impl E1000eHw {
 
         let complete = if let Some(ref mut pending) = self.rx_pending {
             if pending.len().saturating_add(len) > MAX_RX_FRAME_BYTES {
-                self.clear_rx_pending();
-                self.stats.rx_dropped += 1;
+                self.abort_rx_frame(eop);
                 None
             } else {
                 pending.extend_from_slice(frag);
@@ -2095,7 +2247,22 @@ impl E1000eHw {
             link_changed = true;
             self.link_up = link;
             if link {
-                crate::klog_warn!("[e1000e] link UP STATUS={:#010x}\n", status);
+                // Report what auto-negotiation actually settled on. Nothing
+                // else in the system surfaces link speed (there is no ethtool
+                // and no /sys/class/net/*/speed), so without this a link that
+                // negotiated 100 Mb/s half duplex on a gigabit switch looks
+                // exactly like a healthy one — and explains a 10x throughput
+                // shortfall that would otherwise be blamed on the stack.
+                crate::klog_warn!(
+                    "[e1000e] link UP {}Mb/s {} STATUS={:#010x}\n",
+                    status_speed_mbps(status),
+                    if status & STATUS_FD != 0 {
+                        "full-duplex"
+                    } else {
+                        "HALF-duplex"
+                    },
+                    status
+                );
             } else {
                 crate::klog_warn!("[e1000e] link DOWN\n");
             }
@@ -2107,6 +2274,33 @@ impl E1000eHw {
             // were dropped (no free descriptors or DMA ring not armed).
             let gprc = mmio_read(self.base, E1000E_GPRC);
             let mpc = mmio_read(self.base, E1000E_MPC);
+            // Good octets in/out since the last sample. These are the MAC's
+            // own counters and clear on read, so they measure what actually
+            // crossed the wire — independent of anything the driver or the
+            // stack thinks it did. Pair them with MPC / RNBC: throughput well
+            // under the negotiated link speed WITH those at zero points at
+            // the stack (software checksums, window, poll latency), whereas
+            // non-zero MPC/RNBC means the driver is not returning RX
+            // descriptors fast enough.
+            let gorc = mmio_read(self.base, E1000E_GORCL) as u64
+                | ((mmio_read(self.base, E1000E_GORCH) as u64) << 32);
+            let gotc = mmio_read(self.base, E1000E_GOTCL) as u64
+                | ((mmio_read(self.base, E1000E_GOTCH) as u64) << 32);
+            let rnbc = mmio_read(self.base, E1000E_RNBC);
+            let elapsed_us = now.saturating_sub(self.throughput_last_us);
+            self.throughput_last_us = now;
+            // Skip the very first sample (no baseline) and any interval
+            // shorter than 100 ms, where rounding noise swamps the result.
+            // Octets/us * 8000 = kbit/s. Mbit/s truncated every rate under a
+            // megabit to a useless "0"; a gigabit link still fits easily.
+            let (rx_kbps, tx_kbps) = if elapsed_us >= 100_000 {
+                (
+                    gorc.saturating_mul(8_000) / elapsed_us,
+                    gotc.saturating_mul(8_000) / elapsed_us,
+                )
+            } else {
+                (0, 0)
+            };
             // GPTC>0 means the MAC actually transmitted frames in this interval.
             // If a download stalls with GPRC stuck but GPTC still climbing, the
             // NIC is still sending our ACKs/window updates and the peer has gone
@@ -2119,10 +2313,15 @@ impl E1000eHw {
             let csum_fp = self.rx_csum_hw_false_positive;
             let tx_dropped = self.tx_dropped;
             crate::klog_info!(
-                "[e1000e] watchdog: link={} GPRC={} MPC={} rx_pkt={} rx_drop={} rx_csum_bad={} hw_csum_fp={} GPTC={} tx_pkt={} tx_drop={} TDH={} TDT={} itr={}\n",
+                "[e1000e] watchdog: link={} {}Mb/s fd={} rx={}kb/s tx={}kb/s GPRC={} MPC={} RNBC={} rx_pkt={} rx_drop={} rx_csum_bad={} hw_csum_fp={} GPTC={} tx_pkt={} tx_drop={} TDH={} TDT={} itr={}\n",
                 link,
+                status_speed_mbps(status),
+                status & STATUS_FD != 0,
+                rx_kbps,
+                tx_kbps,
                 gprc,
                 mpc,
+                rnbc,
                 self.stats.rx_packets,
                 self.stats.rx_dropped,
                 csum_bad,
@@ -2204,6 +2403,14 @@ pub struct E1000eInterface {
     /// the deferred-job queue instead of one merely awaiting its turn.
     poll_pending_set_us: Arc<AtomicU64>,
     pub link_up_seen: Arc<AtomicBool>,
+    /// ICR bits read by [`Scheme::handle_irq`] that it could not hand to a
+    /// bottom-half because one was already pending. Reading ICR clears it in
+    /// hardware, so without this the causes are simply lost — most visibly
+    /// `ICR_LSC` (a carrier change then waits up to a full watchdog period)
+    /// and `ICR_RXO` (the in-flight reassembly is never reset). Merged into
+    /// the next [`poll_with_irq_hint`](E1000eInterface::poll_with_irq_hint),
+    /// IRQ-driven or periodic.
+    pending_icr: Arc<AtomicU32>,
     watchdog_job_scheduled: Arc<AtomicBool>,
     pub routes: Arc<Mutex<Vec<RouteInfo>>>,
     pub ip_addrs: Arc<Mutex<Vec<IpCidr>>>,
@@ -2323,6 +2530,9 @@ impl E1000eInterface {
 
     /// NIC poll; `irq_icr` carries ICR bits when invoked from the deferred IRQ bottom-half.
     fn poll_with_irq_hint(&self, irq_icr: u32) -> DeviceResult {
+        // Pick up any causes a previous `handle_irq` read out of ICR but had
+        // to drop because a bottom-half was already pending (see `pending_icr`).
+        let irq_icr = irq_icr | self.pending_icr.swap(0, Ordering::AcqRel);
         let now = timer_now_as_micros();
         let ts = Instant::from_micros(now as i64);
         // One hw lock for watchdog-due check + RXO + link-arm (skips STATUS
@@ -2417,6 +2627,10 @@ impl Scheme for E1000eInterface {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
+            // A bottom-half is already queued and the ICR read above cleared
+            // these causes in hardware. Stash them so the poll still sees
+            // them instead of dropping a link-state change or an RX overrun.
+            self.pending_icr.fetch_or(icr, Ordering::AcqRel);
             self.ims_rearm();
             return;
         }
@@ -2734,16 +2948,21 @@ impl phy::TxToken for E1000eTxToken {
         F: FnOnce(&mut [u8]) -> SmolResult<R>,
     {
         // Stack scratch instead of `vec![0; len]` for the common MTU-sized
-        // case: smoltcp overwrites the whole frame, so zero-filling a heap
-        // buffer would be pure overhead. Do NOT silently clamp oversized
-        // requests though: the closure expects a slice of exactly `len`, and a
+        // case: a 1536-byte stack memset is far cheaper than a heap
+        // allocation per frame. Do NOT silently clamp oversized requests
+        // though: the closure expects a slice of exactly `len`, and a
         // truncated slice would either panic in `copy_from_slice` or emit a
         // shorter/corrupt frame. Fall back to a heap buffer for the rare jumbo
         // request instead.
-        let mut scratch = MaybeUninit::<[u8; TX_SCRATCH_LEN]>::uninit();
+        //
+        // The scratch is a real `[u8; N]`, not a `MaybeUninit` reinterpreted
+        // through `from_raw_parts_mut`: handing out a `&mut [u8]` over
+        // uninitialised memory is undefined behaviour (the bytes are `poison`
+        // until written), which LLVM is free to exploit however it likes.
+        let mut scratch = [0u8; TX_SCRATCH_LEN];
         let mut heap_buf = Vec::new();
         let buf: &mut [u8] = if len <= TX_SCRATCH_LEN {
-            unsafe { core::slice::from_raw_parts_mut(scratch.as_mut_ptr() as *mut u8, len) }
+            &mut scratch[..len]
         } else {
             heap_buf.resize(len, 0);
             heap_buf.as_mut_slice()
@@ -2837,6 +3056,23 @@ impl E1000eHw {
         let status = mmio_read(self.base, E1000E_STATUS);
         if status & STATUS_LU != 0 {
             self.link_up = true;
+            // Report it HERE as well as in the watchdog. This runs on every
+            // poll and on every transmit, so it almost always wins the race
+            // to observe carrier — and by flipping `link_up` behind the
+            // watchdog's back it made `watchdog_tick`'s `link != link_up`
+            // test false, so the "link UP" line was in practice never
+            // printed at all. The one message that says what speed and
+            // duplex auto-negotiation settled on was dead code.
+            crate::klog_warn!(
+                "[e1000e] link UP {}Mb/s {} STATUS={:#010x}\n",
+                status_speed_mbps(status),
+                if status & STATUS_FD != 0 {
+                    "full-duplex"
+                } else {
+                    "HALF-duplex"
+                },
+                status
+            );
         }
     }
 }
@@ -2927,6 +3163,7 @@ pub fn init(
         rx_buf_coherent,
         rx_next_to_clean: 0,
         rx_pending: None,
+        rx_discard_until_eop: false,
         rx_ready: VecDeque::new(),
         rx_doorbell_dirty: false,
         tx_ring,
@@ -2948,6 +3185,7 @@ pub fn init(
         itr_setting: E1000E_ITR_BALANCED,
         itr_last_rx_packets: 0,
         itr_tune_next_us: 0,
+        throughput_last_us: 0,
     };
 
     unsafe {
@@ -3029,6 +3267,7 @@ pub fn init(
         poll_pending: Arc::new(AtomicBool::new(false)),
         poll_pending_set_us: Arc::new(AtomicU64::new(0)),
         link_up_seen,
+        pending_icr: Arc::new(AtomicU32::new(0)),
         watchdog_job_scheduled: Arc::new(AtomicBool::new(false)),
         routes: Arc::new(Mutex::new(vec![])),
         ip_addrs: Arc::new(Mutex::new(ip_addrs)),
@@ -3208,6 +3447,7 @@ mod rx_ring_tests {
             rx_buf_coherent: false,
             rx_next_to_clean: 0,
             rx_pending: None,
+            rx_discard_until_eop: false,
             rx_ready: VecDeque::new(),
             rx_doorbell_dirty: false,
             tx_ring,
@@ -3229,6 +3469,7 @@ mod rx_ring_tests {
             itr_setting: 0,
             itr_last_rx_packets: 0,
             itr_tune_next_us: 0,
+            throughput_last_us: 0,
         };
         // Initialize the descriptor ring (mirror of init_rx).
         let ring = hw.rx_ring.as_ptr::<RxDesc>();
@@ -3656,6 +3897,75 @@ mod rx_ring_tests {
         hw_deliver(&hw, next, &pkt(0xAB, 256));
         let got = hw.receive().expect("ring did not recover after full drain");
         assert_eq!(got, pkt(0xAB, 256));
+    }
+
+    /// Play the hardware for one fragment of a multi-descriptor frame: DD is
+    /// set but EOP is not, except on the last one.
+    fn hw_deliver_fragment(hw: &E1000eHw, slot: usize, data: &[u8], eop: bool) {
+        assert!(data.len() <= BUF_SIZE);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                hw.rx_buf_vaddr(slot) as *mut u8,
+                data.len(),
+            );
+            let d = &mut *hw.rx_ring.as_ptr::<RxDesc>().add(slot);
+            d.addr = hw.rx_buf_paddr(slot);
+            d.len = data.len() as u16;
+            d.status = RXD_STAT_DD | if eop { RXD_STAT_EOP } else { 0 };
+            d.errors = 0;
+        }
+        reg_write(hw.base, E1000E_RDH, ((slot + 1) % NUM_RX) as u32);
+    }
+
+    #[test]
+    fn an_aborted_fragment_chain_does_not_surface_as_a_frame() {
+        // A chain the driver gives up on (here: one fragment flagged with a
+        // wire error) must be swallowed up to and including its EOP
+        // descriptor. Delivering the tail as if it were a whole Ethernet
+        // frame hands smoltcp — and any AF_PACKET tap — a packet that never
+        // existed on the wire, assembled from the middle of another one.
+        let mut hw = make_hw();
+        let head = pkt(0x11, BUF_SIZE);
+        let middle = pkt(0x22, BUF_SIZE);
+        let tail = pkt(0x33, 512);
+
+        hw_deliver_fragment(&hw, 0, &head, false);
+        // Wire error (not a checksum verdict) on the middle fragment.
+        hw_deliver_fragment(&hw, 1, &middle, false);
+        unsafe {
+            (*hw.rx_ring.as_ptr::<RxDesc>().add(1)).errors = 0x01;
+        }
+        hw_deliver_fragment(&hw, 2, &tail, true);
+
+        assert!(
+            hw.receive().is_none(),
+            "the tail of an aborted chain must not be delivered as a frame"
+        );
+        assert_eq!(hw.stats.rx_packets, 0);
+        assert!(!hw.rx_discard_until_eop, "EOP must end the discard");
+
+        // The ring keeps working: the next whole frame is delivered normally.
+        let good = pkt(0x44, 300);
+        hw_deliver(&hw, 3, &good);
+        assert_eq!(hw.receive().expect("ring wedged after aborted chain"), good);
+        hw.flush_rx_doorbell();
+        assert_eq!(reg_read(hw.base, E1000E_RDT) as usize, 3);
+    }
+
+    #[test]
+    fn a_complete_fragment_chain_is_reassembled() {
+        let mut hw = make_hw();
+        let a = pkt(0x55, BUF_SIZE);
+        let b = pkt(0x66, 700);
+        hw_deliver_fragment(&hw, 0, &a, false);
+        hw_deliver_fragment(&hw, 1, &b, true);
+
+        let mut expected = a.clone();
+        expected.extend_from_slice(&b);
+        assert_eq!(hw.receive().expect("chain not reassembled"), expected);
+        assert_eq!(hw.stats.rx_packets, 1);
+        assert_eq!(hw.stats.rx_dropped, 0);
     }
 
     #[test]

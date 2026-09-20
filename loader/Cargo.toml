@@ -26,7 +26,10 @@ executor = { path = "../vendor/PreemptiveScheduler" }
 default = ["libos", "linux", "zircon"]
 linux = ["linux-object", "linux-syscall"]
 zircon = ["zircon-syscall", "xmas-elf"]
-libos = ["kernel-hal/libos", "zircon-object/aspace-separate"]
+# `zircon-object/libos` is what lets `vmar.rs` know it must map eagerly (see
+# the `map_range || cfg!(feature = "libos")` there); it only forwards
+# `kernel-hal/libos`, which this list already turns on.
+libos = ["kernel-hal/libos", "zircon-object/libos", "zircon-object/aspace-separate"]
 
 [dev-dependencies]
 env_logger = "0.9"

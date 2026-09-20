@@ -308,7 +308,27 @@ impl Syscall<'_> {
                 let optname = match SolOptname::try_from(optname) {
                     Ok(optname) => optname,
                     Err(_) => {
-                        error!("invalid optname: {}", optname);
+                        // ENOPROTOOPT is the right answer, and for some of
+                        // these it is the answer mainline Linux gives too --
+                        // so do not shout about it. dbus, polkit and logind
+                        // ask every AF_UNIX peer for its security context
+                        // (SO_PEERSEC) and supplementary groups
+                        // (SO_PEERGROUPS) on connect; a kernel with no LSM
+                        // returns ENOPROTOOPT for the first and one older
+                        // than 4.13 for the second, and every caller falls
+                        // back cleanly. Logging those at `error!` filled the
+                        // console with a repeating "invalid optname: 31 /
+                        // invalid optname: 59" that reads like a fault and is
+                        // not one.
+                        const SO_PEERSEC: usize = 31;
+                        const SO_PEERGROUPS: usize = 59;
+                        match optname {
+                            SO_PEERSEC | SO_PEERGROUPS => debug!(
+                                "getsockopt: SOL_SOCKET optname {} (peer identity) not supported",
+                                optname
+                            ),
+                            _ => warn!("getsockopt: unsupported SOL_SOCKET optname: {}", optname),
+                        }
                         return Err(LxError::ENOPROTOOPT);
                     }
                 };
@@ -353,7 +373,7 @@ impl Syscall<'_> {
                 let optname = match TcpOptname::try_from(optname) {
                     Ok(optname) => optname,
                     Err(_) => {
-                        error!("invalid optname: {}", optname);
+                        warn!("getsockopt: unsupported IPPROTO_TCP optname: {}", optname);
                         return Err(LxError::ENOPROTOOPT);
                     }
                 };
@@ -365,7 +385,7 @@ impl Syscall<'_> {
                 let optname = match IpOptname::try_from(optname) {
                     Ok(optname) => optname,
                     Err(_) => {
-                        error!("invalid optname: {}", optname);
+                        warn!("getsockopt: unsupported IPPROTO_IP optname: {}", optname);
                         return Err(LxError::ENOPROTOOPT);
                     }
                 };

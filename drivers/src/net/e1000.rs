@@ -22,13 +22,17 @@ use crate::net::get_sockets;
 use crate::scheme::{NetScheme, NetStats, RouteInfo, Scheme, SchemeUpcast};
 use crate::utils::dma::DmaRegion;
 use crate::{Device, DeviceError, DeviceResult};
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{fence, AtomicBool, Ordering};
 use lock::Mutex;
 use pci::{PCIDevice, BAR};
 
 const NUM_DESC: usize = 256;
 /// Size in bytes of each RX/TX DMA buffer (one page).
 const RX_BUF_SIZE: usize = 4096;
+/// Stack scratch for [`E1000TxToken::consume`]; covers the advertised MTU
+/// (1514) with headroom. Longer frames fall back to a heap buffer — they must
+/// never be clipped, see the comment there.
+const TX_SCRATCH_LEN: usize = 1536;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
@@ -312,36 +316,64 @@ impl E1000 {
         Some(pkt)
     }
 
-    pub fn can_send(&self) -> bool {
+    /// Is the descriptor at `idx` free (hardware wrote DD back)?
+    #[inline]
+    fn tx_dd_at(&self, idx: usize) -> bool {
         let ring = self.tx_ring.as_ptr::<E1000SendDesc>();
-        let desc_addr = unsafe { ring.add(self.tx_next_to_use) };
+        let desc_addr = unsafe { ring.add(idx) };
         let status = unsafe { core::ptr::read_volatile(&((*desc_addr).status)) };
         (status & 1) != 0
     }
 
+    /// Can a frame be posted at `tx_next_to_use`? The tail slot must be free
+    /// AND the slot after it too — the latter is the guard slot the hardware
+    /// needs.
+    ///
+    /// The NIC has no ownership bit of its own: it works descriptors from TDH
+    /// up to (but excluding) TDT and reads `TDH == TDT` as an EMPTY ring.
+    /// Gating purely per-slot on DD let software post all `NUM_DESC` slots —
+    /// every descriptor starts pre-armed DD, so with the link still
+    /// negotiating (or the NIC otherwise stalled) 256 frames post in a row,
+    /// the tail wraps onto the head, and the `TDT` write hands the NIC a value
+    /// equal to TDH. From its side the ring is empty: the posted frames are
+    /// never fetched, their DD bits never come back, and every later `send`
+    /// finds DD clear at slot 0 and fails forever. TX is dead until reboot,
+    /// with no watchdog to notice. Linux's `e1000_desc_unused` bounds
+    /// in-flight descriptors to `count - 1` for the same reason, and
+    /// `e1000e::tx_can_post` is the same guard.
+    pub fn can_send(&self) -> bool {
+        self.tx_dd_at(self.tx_next_to_use) && self.tx_dd_at((self.tx_next_to_use + 1) % NUM_DESC)
+    }
+
     /// Post a frame to the TX ring. Returns false (dropping the frame) if the
-    /// target descriptor is still owned by hardware.
+    /// target descriptor is still owned by hardware or the frame is too long
+    /// for a TX buffer.
     pub fn send(&mut self, buffer: &[u8]) -> bool {
+        // Reject instead of truncating: silently clipping a frame to the
+        // buffer size put a corrupt, half-length packet on the wire while
+        // `NetScheme::send` still reported the full length as written.
+        if buffer.is_empty() || buffer.len() > RX_BUF_SIZE {
+            return false;
+        }
+
         let index = self.tx_next_to_use;
         let ring = self.tx_ring.as_ptr::<E1000SendDesc>();
         let desc_addr = unsafe { ring.add(index) };
 
-        // Re-check hardware ownership (DD bit) under the CURRENT lock. The
-        // TxToken path checks can_send() under a different lock acquisition than
-        // this send, so on SMP another CPU can consume the slot in between; the
-        // old debug_assert! was compiled out in release and let that race
-        // silently overwrite a descriptor the NIC was still DMA-reading.
-        if unsafe { (core::ptr::read_volatile(&((*desc_addr).status)) & 1) == 0 } {
+        // Re-check hardware ownership (DD bit) under the CURRENT lock, tail
+        // slot and guard slot both. The TxToken path checks can_send() under a
+        // different lock acquisition than this send, so on SMP another CPU can
+        // consume the slot in between; the old debug_assert! was compiled out
+        // in release and let that race silently overwrite a descriptor the NIC
+        // was still DMA-reading.
+        if !self.can_send() {
             return false;
         }
 
-        // The TX buffer is a single page; never copy more than it can hold,
-        // otherwise we would overflow into adjacent DMA buffers.
-        let len = buffer.len().min(RX_BUF_SIZE);
-        let buffer = &buffer[..len];
+        let len = buffer.len();
         let buf_vaddr = self.tx_bufs[index].vaddr();
         let target = unsafe { core::slice::from_raw_parts_mut(buf_vaddr as *mut u8, len) };
-        target[..len].copy_from_slice(buffer);
+        target.copy_from_slice(buffer);
 
         unsafe {
             core::ptr::write_volatile(&mut (*desc_addr).len, buffer.len() as u16);
@@ -404,17 +436,30 @@ impl E1000Interface {
         // for the duration of the critical section. Manual intr_off/on bypasses
         // the noff accounting and panics ("RefCell already borrowed") under SMP.
         let sockets = get_sockets();
+        // `try_lock`, NOT a blocking `lock()`. This poll runs from a deferred
+        // job, and a socket syscall drains that queue WHILE it holds the
+        // socket set (a read/write pumping the NIC to make progress). On this
+        // IRQ-off kernel the blocking acquire then spins forever on a lock the
+        // same CPU already owns: reproduced in QEMU as
+        //   [DEADLOCK: spinlock(s) stuck >8s] cpu=0 at drivers/src/net/e1000.rs
+        //   HOLDER cpu=0 at linux-object/src/net/tcp.rs
+        // during a 64 MB HTTP download. If either lock is held, skip the
+        // smoltcp poll: the frame that owns the socket set drives it on
+        // release, so nothing is lost. `e1000e::poll_with_irq_hint` documents
+        // and fixes exactly this; e1000 never got the same treatment.
         let res = {
-            let mut sockets = sockets.lock();
-            match self.iface.lock().poll(&mut sockets, timestamp) {
-                Ok(p) => {
-                    trace!("e1000 NetScheme poll: {:?}", p);
-                    Ok(())
-                }
-                Err(err) => {
-                    warn!("poll got err {}", err);
-                    Err(DeviceError::IoError)
-                }
+            match (sockets.try_lock(), self.iface.try_lock()) {
+                (Some(mut sockets), Some(mut iface)) => match iface.poll(&mut sockets, timestamp) {
+                    Ok(p) => {
+                        trace!("e1000 NetScheme poll: {:?}", p);
+                        Ok(())
+                    }
+                    Err(err) => {
+                        warn!("poll got err {}", err);
+                        Err(DeviceError::IoError)
+                    }
+                },
+                _ => Ok(()),
             }
         };
         super::net_flush_deferred_packets();
@@ -447,16 +492,42 @@ impl Scheme for E1000Interface {
                 mmio_write(self.base, E1000_IMC, 0xffffffff);
                 let _ = mmio_read(self.base, E1000_IMC);
             }
-            let poll_pending = self.poll_pending.clone();
+            // The guard is built OUTSIDE the closure and moved in, so
+            // `poll_pending` is cleared and IMS re-armed whether the job runs
+            // or is dropped unexecuted: `deferred_job` caps its queue at 256
+            // and evicts entries under pressure. Clearing it in the closure
+            // BODY meant an evicted bottom-half left the NIC masked and
+            // `poll_pending` stuck true forever — every later IRQ then took
+            // the `else` branch below, read-clearing ICR without ever queuing
+            // a poll, and the interface was demoted to the periodic
+            // `poll_ifaces` path for the life of the kernel. This is the same
+            // `PollPendingGuard` shape `e1000e.rs` uses.
+            struct PollPendingGuard {
+                pending: Arc<AtomicBool>,
+                iface: E1000Interface,
+            }
+            impl Drop for PollPendingGuard {
+                fn drop(&mut self) {
+                    // Clear BEFORE re-arming, so an IRQ firing after the
+                    // unmask finds poll_pending=false and queues a fresh poll
+                    // instead of dropping the RX cause.
+                    self.pending
+                        .store(false, core::sync::atomic::Ordering::SeqCst);
+                    self.iface.ims_rearm();
+                }
+            }
+            let guard = PollPendingGuard {
+                pending: self.poll_pending.clone(),
+                iface: self.clone(),
+            };
             let self_clone = self.clone();
-            crate::utils::deferred_job::push_deferred_job(move || {
-                // Drain WITHOUT re-arming, then clear poll_pending BEFORE
-                // re-arming IMS so an IRQ that fires after ims_rearm() finds
-                // poll_pending=false and queues a fresh poll, instead of hitting
-                // the `else { ims_rearm() }` branch and dropping the RX cause.
+            // Front of the queue: the NIC bottom-half must run before a
+            // backlog of lower-urgency jobs can age it out of the FIFO.
+            crate::utils::deferred_job::push_deferred_job_front(move || {
+                let guard = guard;
+                // Drain WITHOUT re-arming; the guard re-arms on drop.
                 let _ = self_clone.poll_inner();
-                poll_pending.store(false, core::sync::atomic::Ordering::SeqCst);
-                self_clone.ims_rearm();
+                drop(guard);
             });
         } else {
             self.ims_rearm();
@@ -511,6 +582,12 @@ impl NetScheme for E1000Interface {
     }
 
     fn send(&self, data: &[u8]) -> DeviceResult<usize> {
+        // A frame longer than a TX buffer is rejected outright rather than
+        // clipped, so the caller is never told that a corrupt, truncated
+        // packet went out in full.
+        if data.is_empty() || data.len() > RX_BUF_SIZE {
+            return Err(DeviceError::InvalidParam);
+        }
         // send() re-checks descriptor ownership under this same lock, so a
         // full/in-flight ring returns NotReady instead of corrupting a slot.
         let mut driver = self.driver.hw.lock();
@@ -756,23 +833,44 @@ impl phy::TxToken for E1000TxToken {
     where
         F: FnOnce(&mut [u8]) -> Result<R>,
     {
-        let mut buffer = [0u8; 1536];
-        let result = f(&mut buffer[..len]);
+        // Do NOT index a fixed-size stack array with `len`: it is whatever the
+        // IP layer computed for this datagram, and this smoltcp has neither IP
+        // fragmentation nor an egress MTU clamp (`max_transmission_unit` only
+        // feeds the TCP MSS). A single `sendto()` of a 1495-byte UDP payload
+        // — never mind a 64 KiB one, or a raw socket — makes `len` exceed the
+        // buffer and `&mut buffer[..len]` panics inside the kernel.
+        let mut scratch = [0u8; TX_SCRATCH_LEN];
+        let mut heap_buf = Vec::new();
+        let buf: &mut [u8] = if len <= TX_SCRATCH_LEN {
+            &mut scratch[..len]
+        } else {
+            heap_buf.resize(len, 0);
+            heap_buf.as_mut_slice()
+        };
+        let result = f(buf)?;
 
         let mut driver = self.driver.hw.lock();
-        let sent = driver.send(&buffer[..len]);
+        let sent = driver.send(buf);
         drop(driver);
 
-        // Only account a frame that was actually posted; if the descriptor was
-        // still in flight, send() dropped it (smoltcp/TCP will retransmit)
-        // rather than overwriting an in-flight slot.
         if sent {
             let mut stats = self.stats.lock();
             stats.tx_packets += 1;
             stats.tx_bytes += len as u64;
+        } else {
+            // NEVER report a dropped frame as sent. smoltcp's `socket_ingress`
+            // emits the ACK / window-update for a received segment through the
+            // TxToken paired with that RxToken, and it has ALREADY advanced
+            // `remote_last_ack` / `remote_last_win` by the time we are called.
+            // Returning `Ok` there loses the ACK for good: the peer waits on a
+            // window it believes is closed and the transfer stalls mid-stream.
+            // `Err(Exhausted)` keeps smoltcp's state consistent so the segment
+            // is re-emitted. (`e1000e::E1000eTxToken::consume` documents the
+            // same failure; it additionally spins briefly for a free slot.)
+            return Err(smoltcp::Error::Exhausted);
         }
 
-        result
+        Ok(result)
     }
 }
 

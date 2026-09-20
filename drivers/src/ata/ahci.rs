@@ -320,16 +320,33 @@ impl AhciPort {
     }
 
     fn stop_engine(&self) {
+        // AHCI spec §10.1.2 ("Port Idle"): clear PxCMD.ST, wait for PxCMD.CR to
+        // clear (500 ms), and only THEN clear PxCMD.FRE and wait for PxCMD.FR.
+        // Clearing FRE while CR is still set is explicitly disallowed — the
+        // spec leaves HBA behaviour undefined. The old code cleared both in one
+        // go and waited for them together; QEMU drops CR immediately so it never
+        // showed there, but on real hardware a port stopped mid-command (which
+        // is exactly what `reset_port` does after an error) could be left with
+        // the engine half-running.
         self.write_reg(PORT_CMD, self.read_reg(PORT_CMD) & !CMD_ST);
-        self.write_reg(PORT_CMD, self.read_reg(PORT_CMD) & !CMD_FRE);
-        // AHCI spec requires CR and FR to clear within 500 ms of clearing ST/FRE.
         if !wait_until(ENGINE_STOP_TIMEOUT_US, || {
-            self.read_reg(PORT_CMD) & (CMD_CR | CMD_FR) == 0
+            self.read_reg(PORT_CMD) & CMD_CR == 0
         }) {
             warn!(
-                "[AHCI] Port {} stop_engine timeout (CR/FR stuck)",
+                "[AHCI] Port {} stop_engine timeout (CR stuck)",
                 self.port_idx
             );
+        }
+        if self.read_reg(PORT_CMD) & CMD_FRE != 0 {
+            self.write_reg(PORT_CMD, self.read_reg(PORT_CMD) & !CMD_FRE);
+            if !wait_until(ENGINE_STOP_TIMEOUT_US, || {
+                self.read_reg(PORT_CMD) & CMD_FR == 0
+            }) {
+                warn!(
+                    "[AHCI] Port {} stop_engine timeout (FR stuck)",
+                    self.port_idx
+                );
+            }
         }
     }
 

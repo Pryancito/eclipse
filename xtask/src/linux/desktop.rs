@@ -48,6 +48,8 @@ pub fn install(rootfs: &Path) {
     write_terminal_wrapper(rootfs);
     write_firefox_wrapper(rootfs);
     write_firefox_desktop_override(rootfs);
+    write_freedoom_wrapper(rootfs);
+    write_freedoom_desktop_entries(rootfs);
     write_xorg_config(rootfs);
     write_xfce_defaults(rootfs);
     write_fallback_icons(rootfs);
@@ -1425,6 +1427,131 @@ fn write_firefox_desktop_override(rootfs: &Path) {
     .unwrap();
 }
 
+/// `/usr/local/bin/eclipse-freedoom`: launch Freedoom on whichever Doom engine
+/// the image has, with the IWAD chosen for it.
+///
+/// Three things had to be handled, and only one of them is about Doom:
+///
+/// 1. **The IWAD picker.** With more than one IWAD installed and no `-iwad`,
+///    GZDoom opens a GTK dialog to ask which one to play. That dialog is a
+///    full GTK app, and it is the first thing the user sees; picking the WAD
+///    here skips it entirely. `freedoom1` is Phase 1, `freedoom2` Phase 2 --
+///    the wrapper takes `1`/`2` (default 2) or an explicit path.
+/// 2. **The renderer.** GZDoom wants OpenGL 3.3 or Vulkan. In the pixman
+///    session there is no GL driver at all, so it must go through llvmpipe
+///    (`LIBGL_ALWAYS_SOFTWARE=1`): slow but it renders. The
+///    `nvidia.wlr_gles2` / `nvidia.wlr_vulkan` sessions (`WLR_RENDERER` =
+///    `gles2`/`vulkan`) are left alone so zink/NVK can be used. A lighter engine (chocolate-doom,
+///    crispy-doom, prboom-plus) renders in software by design and is tried
+///    FIRST when installed, because on this stack it is the one that plays at
+///    full speed.
+/// 3. **The log.** A game launched from the panel writes to a terminal nobody
+///    is looking at. Everything goes to /tmp/freedoom.log so a failure can be
+///    read after the fact -- the same reason the seatd and labwc wrappers
+///    capture theirs.
+///
+/// Audio and the session bus need nothing here: `eclipse-init` already exports
+/// `ALSOFT_DRIVERS`, `PULSE_SERVER` and `DBUS_SESSION_BUS_ADDRESS`, and the
+/// bus at that address is now a real daemon (`dbus.service`).
+fn write_freedoom_wrapper(rootfs: &Path) {
+    let localbin = rootfs.join("usr/local/bin");
+    let _ = fs::create_dir_all(&localbin);
+    let wrapper = localbin.join("eclipse-freedoom");
+    fs::write(
+        &wrapper,
+        b"#!/bin/sh\n\
+          # Eclipse OS: Freedoom launcher. See write_freedoom_wrapper in\n\
+          # xtask/src/linux/desktop.rs.\n\
+          export HOME=\"${HOME:-/root}\"\n\
+          export XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/0}\"\n\
+          LOG=/tmp/freedoom.log\n\
+          : > \"$LOG\" 2>/dev/null || true\n\
+          exec >>\"$LOG\" 2>&1\n\
+          # Which IWAD. `1`/`2` select the Freedoom phase; anything else is\n\
+          # taken as a path to a WAD (so a real doom2.wad works too).\n\
+          WHICH=\"${1:-2}\"\n\
+          [ $# -gt 0 ] && shift\n\
+          case \"$WHICH\" in\n\
+          \x20 1|2)\n\
+          \x20 \x20 IWAD=\n\
+          \x20 \x20 for d in /usr/share/doom /usr/share/games/doom /usr/share/freedoom \\\n\
+          \x20 \x20 \x20 \x20 \x20 \x20 \"$HOME/.local/share/doom\"; do\n\
+          \x20 \x20 \x20 [ -f \"$d/freedoom$WHICH.wad\" ] && { IWAD=\"$d/freedoom$WHICH.wad\"; break; }\n\
+          \x20 \x20 done\n\
+          \x20 \x20 ;;\n\
+          \x20 *) IWAD=\"$WHICH\" ;;\n\
+          esac\n\
+          if [ -z \"$IWAD\" ] || [ ! -f \"$IWAD\" ]; then\n\
+          \x20 MSG='eclipse-freedoom: no IWAD found. Fix: apk add freedoom\n\
+          (needs network), or pass the path to a .wad as the first argument.'\n\
+          \x20 echo \"$MSG\"\n\
+          \x20 echo \"$MSG\" > /dev/console 2>/dev/null || true\n\
+          \x20 exit 2\n\
+          fi\n\
+          echo \"eclipse-freedoom: iwad=$IWAD wlr_renderer=${WLR_RENDERER:-unset}\"\n\
+          # Software-rendering engines first: on a stack whose best GL is\n\
+          # llvmpipe they are the ones that run at full speed.\n\
+          for e in chocolate-doom crispy-doom prboom-plus prboom; do\n\
+          \x20 if command -v \"$e\" >/dev/null 2>&1; then\n\
+          \x20 \x20 echo \"eclipse-freedoom: engine $e\"\n\
+          \x20 \x20 exec \"$e\" -iwad \"$IWAD\" \"$@\"\n\
+          \x20 fi\n\
+          done\n\
+          if command -v gzdoom >/dev/null 2>&1; then\n\
+          \x20 # GZDoom needs GL 3.3+. Without a GL driver (the pixman session)\n\
+          \x20 # that can only be llvmpipe; the GPU sessions pin their own env\n\
+          \x20 # and are left alone.\n\
+          \x20 # WLR_RENDERER is what eclipse-init pins per session: pixman\n\
+          \x20 # (no GL driver at all) vs gles2/vulkan (zink+NVK).\n\
+          \x20 case \"${WLR_RENDERER:-pixman}\" in\n\
+          \x20 \x20 gles2|vulkan) ;;\n\
+          \x20 \x20 *) LIBGL_ALWAYS_SOFTWARE=1; export LIBGL_ALWAYS_SOFTWARE ;;\n\
+          \x20 esac\n\
+          \x20 echo \"eclipse-freedoom: engine gzdoom\"\n\
+          \x20 exec gzdoom -iwad \"$IWAD\" \"$@\"\n\
+          fi\n\
+          MSG='eclipse-freedoom: no Doom engine installed. Fix: apk add gzdoom\n\
+          (or chocolate-doom, which renders in software and is faster here).'\n\
+          echo \"$MSG\"\n\
+          echo \"$MSG\" > /dev/console 2>/dev/null || true\n\
+          exit 127\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// Launcher entries for both Freedoom phases, so the panel's application menu
+/// lists them and both run through the wrapper rather than through GZDoom's
+/// own `freedoom1`/`freedoom2` scripts (which do not pick a renderer).
+fn write_freedoom_desktop_entries(rootfs: &Path) {
+    let dir = rootfs.join("root/.local/share/applications");
+    let _ = fs::create_dir_all(&dir);
+    for (file, phase, name) in [
+        ("freedoom1.desktop", "1", "Freedoom: Phase 1"),
+        ("freedoom2.desktop", "2", "Freedoom: Phase 2"),
+    ] {
+        let body = format!(
+            "[Desktop Entry]\n\
+             Version=1.0\n\
+             Type=Application\n\
+             Name={name}\n\
+             GenericName=Doom\n\
+             Comment=Freedoom on Eclipse OS (software rendering)\n\
+             Exec=/usr/local/bin/eclipse-freedoom {phase}\n\
+             TryExec=/usr/local/bin/eclipse-freedoom\n\
+             Terminal=false\n\
+             Icon=freedoom\n\
+             Categories=Game;ActionGame;\n\
+             StartupNotify=false\n"
+        );
+        fs::write(dir.join(file), body).unwrap();
+    }
+}
+
 /// Ship an Xorg config + `.xinitrc` so `startx` works out of the box.
 ///
 /// Eclipse pins the **fbdev** driver on `/dev/fb0` rather than modesetting on
@@ -1946,6 +2073,10 @@ const MENU_ES: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
     <separator/>
     <item label="Prueba SDL2 (renderer)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-sdl-probe --hold</command></action></item>
     <item label="Prueba SDL3 (wl_shm)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-sdl-probe --sdl3 --surface --hold</command></action></item>
+    <item label="Prueba D-Bus (bus de sesion)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-dbusd --selftest --hold</command></action></item>
+    <separator/>
+    <item label="Freedoom (Fase 1)"><action name="Execute"><command>/usr/local/bin/eclipse-freedoom 1</command></action></item>
+    <item label="Freedoom (Fase 2)"><action name="Execute"><command>/usr/local/bin/eclipse-freedoom 2</command></action></item>
     <separator/>
     <item label="Teclado (es/us)"><action name="Execute"><command>/usr/local/bin/eclipse-kbd toggle</command></action></item>
     <item label="Recargar labwc"><action name="Reconfigure"/></item>
@@ -1965,6 +2096,10 @@ const MENU_EN: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
     <separator/>
     <item label="SDL2 test (renderer)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-sdl-probe --hold</command></action></item>
     <item label="SDL3 test (wl_shm)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-sdl-probe --sdl3 --surface --hold</command></action></item>
+    <item label="D-Bus test (session bus)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-dbusd --selftest --hold</command></action></item>
+    <separator/>
+    <item label="Freedoom (Phase 1)"><action name="Execute"><command>/usr/local/bin/eclipse-freedoom 1</command></action></item>
+    <item label="Freedoom (Phase 2)"><action name="Execute"><command>/usr/local/bin/eclipse-freedoom 2</command></action></item>
     <separator/>
     <item label="Keyboard (es/us)"><action name="Execute"><command>/usr/local/bin/eclipse-kbd toggle</command></action></item>
     <item label="Reload labwc"><action name="Reconfigure"/></item>
@@ -2433,6 +2568,78 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The Freedoom launcher must be valid shell, must always pass `-iwad`
+    /// (an engine launched without it opens GZDoom's GTK IWAD picker, which is
+    /// the one dialog a first-time user should never meet), must prefer a
+    /// software engine, and must be what the menu and the `.desktop` entries
+    /// actually run.
+    #[test]
+    fn freedoom_wrapper_parses_and_always_picks_an_iwad() {
+        let dir =
+            std::env::temp_dir().join(format!("eclipse-freedoom-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_freedoom_wrapper(&dir);
+        write_freedoom_desktop_entries(&dir);
+
+        let path = dir.join("usr/local/bin/eclipse-freedoom");
+        let src = fs::read_to_string(&path).unwrap();
+        assert!(src.starts_with("#!/bin/sh\n"), "shebang");
+        let st = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(st.success(), "sh -n rejected eclipse-freedoom");
+        for engine in ["chocolate-doom", "gzdoom"] {
+            assert!(src.contains(engine), "{engine} should be tried");
+        }
+        // Every exec of an ENGINE carries -iwad (`exec >>"$LOG"` is the log
+        // redirection, not a program).
+        for line in src
+            .lines()
+            .filter(|l| l.contains("exec ") && !l.contains("exec >>"))
+        {
+            assert!(
+                line.contains("-iwad"),
+                "engine launched without an IWAD: {line}"
+            );
+        }
+        assert!(
+            src.find("chocolate-doom").unwrap() < src.find("gzdoom").unwrap(),
+            "the software engines must be tried before gzdoom"
+        );
+        assert!(
+            src.contains("LIBGL_ALWAYS_SOFTWARE=1"),
+            "pixman needs llvmpipe"
+        );
+        assert!(
+            src.contains("/tmp/freedoom.log"),
+            "failures must be readable later"
+        );
+
+        for (file, phase) in [("freedoom1.desktop", "1"), ("freedoom2.desktop", "2")] {
+            let entry =
+                fs::read_to_string(dir.join("root/.local/share/applications").join(file)).unwrap();
+            assert!(
+                entry.contains(&format!("Exec=/usr/local/bin/eclipse-freedoom {phase}")),
+                "{file} must run the wrapper"
+            );
+        }
+        for menu in [MENU_ES, MENU_EN] {
+            let text = std::str::from_utf8(menu).unwrap();
+            assert!(
+                text.contains("/usr/local/bin/eclipse-freedoom 1")
+                    && text.contains("/usr/local/bin/eclipse-freedoom 2"),
+                "both phases belong in the desktop menu"
+            );
+            assert!(
+                text.contains("/bin/eclipse-dbusd --selftest"),
+                "the session-bus probe belongs in the desktop menu"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Autostart file is intentionally absent (clients come from init).
     #[test]
     fn autostart_is_absent() {
@@ -2521,16 +2728,18 @@ mod tests {
         write_kde_helpers(&dir);
 
         // Both themes ship, so `eclipse-look` can switch either way.
-        let breeze = fs::read_to_string(
-            dir.join("usr/share/themes/Breeze-Dark/openbox-3/themerc"),
-        )
-        .unwrap();
-        assert!(breeze.contains("#3daee9"), "Breeze-Dark must use KDE's accent");
-        let win11 = fs::read_to_string(
-            dir.join("usr/share/themes/Win11-Dark/openbox-3/themerc"),
-        )
-        .unwrap();
-        assert!(win11.contains("#0078d4"), "Win11-Dark must use Windows' accent");
+        let breeze =
+            fs::read_to_string(dir.join("usr/share/themes/Breeze-Dark/openbox-3/themerc")).unwrap();
+        assert!(
+            breeze.contains("#3daee9"),
+            "Breeze-Dark must use KDE's accent"
+        );
+        let win11 =
+            fs::read_to_string(dir.join("usr/share/themes/Win11-Dark/openbox-3/themerc")).unwrap();
+        assert!(
+            win11.contains("#0078d4"),
+            "Win11-Dark must use Windows' accent"
+        );
         assert!(dir
             .join("usr/share/themes/Eclipse-Dark/openbox-3/themerc")
             .is_file());
@@ -2550,28 +2759,39 @@ mod tests {
             "/usr/local/bin/eclipse-files",
             "/usr/local/bin/eclipse-showdesktop",
         ] {
-            assert!(
-                rc.contains(cmd),
-                "rc.xml should bind a key to {cmd}"
-            );
+            assert!(rc.contains(cmd), "rc.xml should bind a key to {cmd}");
             let path = dir.join(cmd.trim_start_matches('/'));
             assert!(path.is_file(), "{cmd} is bound but not installed");
-            if let Ok(status) = std::process::Command::new("sh").arg("-n").arg(&path).status() {
+            if let Ok(status) = std::process::Command::new("sh")
+                .arg("-n")
+                .arg(&path)
+                .status()
+            {
                 assert!(status.success(), "{cmd} does not parse as sh");
             }
         }
 
         // KDE's own keys.
         for key in ["A-space", "A-F2", "C-A-T", "W-E", "W-D", "C-F1"] {
-            assert!(rc.contains(&format!("key=\"{key}\"")), "rc.xml missing {key}");
+            assert!(
+                rc.contains(&format!("key=\"{key}\"")),
+                "rc.xml missing {key}"
+            );
         }
 
         let script = dir.join("usr/local/bin/eclipse-look");
-        if let Ok(status) = std::process::Command::new("sh").arg("-n").arg(&script).status() {
+        if let Ok(status) = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&script)
+            .status()
+        {
             assert!(status.success(), "eclipse-look does not parse as sh");
         }
         let conf = fs::read_to_string(dir.join("etc/eclipse/look")).unwrap();
-        assert!(conf.contains("look=eclipse"), "the image ships Eclipse's own look");
+        assert!(
+            conf.contains("look=eclipse"),
+            "the image ships Eclipse's own look"
+        );
         // Every look eclipse-look accepts must have a theme that exists, or
         // switching to it leaves labwc on its built-in defaults.
         let script = fs::read_to_string(dir.join("usr/local/bin/eclipse-look")).unwrap();
@@ -2602,8 +2822,14 @@ mod tests {
         let ecl = fs::read_to_string(dir.join("root/.config/foot/foot.eclipse.ini")).unwrap();
         let active = fs::read_to_string(dir.join("root/.config/foot/foot.ini")).unwrap();
         assert_eq!(ecl, active, "foot.ini must start as the shipped look");
-        assert!(kde.contains("background=232629"), "KDE terminal palette is Breeze");
-        assert!(win.contains("background=0c0c0c"), "Windows terminal palette is Campbell");
+        assert!(
+            kde.contains("background=232629"),
+            "KDE terminal palette is Breeze"
+        );
+        assert!(
+            win.contains("background=0c0c0c"),
+            "Windows terminal palette is Campbell"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2620,7 +2846,9 @@ mod tests {
         write_labwc_wrapper(&dir);
         let env = fs::read_to_string(dir.join("root/.config/labwc/environment")).unwrap();
         assert!(env.lines().any(|l| l == "QT_QPA_PLATFORM=wayland;xcb"));
-        assert!(env.lines().any(|l| l == "XDG_CURRENT_DESKTOP=labwc:wlroots"));
+        assert!(env
+            .lines()
+            .any(|l| l == "XDG_CURRENT_DESKTOP=labwc:wlroots"));
         // Mentioned in a comment saying why it is absent, never as a setting.
         assert!(
             !env.lines().any(|l| {
@@ -2629,9 +2857,7 @@ mod tests {
             }),
             "no plasma-integration plugin exists here; setting the theme only warns"
         );
-        assert!(!env
-            .lines()
-            .any(|l| l.trim() == "XDG_CURRENT_DESKTOP=KDE"));
+        assert!(!env.lines().any(|l| l.trim() == "XDG_CURRENT_DESKTOP=KDE"));
         let wrapper = fs::read_to_string(dir.join("usr/local/bin/labwc")).unwrap();
         assert!(
             wrapper.contains("QT_QUICK_BACKEND:=software"),
