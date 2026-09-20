@@ -113,6 +113,9 @@ const STATE_XRUN: i32 = 4;
 /// buffer. A 64-frame buffer at 48 kHz is 1.3 ms; declaring XRUN that fast
 /// would turn ordinary scheduling jitter into a stream reset.
 const BUFFER_STALL_FLOOR: core::time::Duration = core::time::Duration::from_millis(200);
+/// How long a blocking `writei` waits before re-offering PCM to a full ring.
+/// The same backoff `/dev/dsp` uses; see the loop in [`PcmDev::writei`].
+const WRITE_RETRY_BACKOFF: core::time::Duration = core::time::Duration::from_micros(250);
 const STATE_PAUSED: i32 = 6;
 
 // snd_pcm_hw_param indexes.
@@ -1067,6 +1070,13 @@ impl PcmDev {
             st.boundary = boundary;
             st.avail_min = period;
             st.state = STATE_SETUP;
+            // The ring was just wiped by `set_params`, so any stall that was
+            // being timed is over. Leaving the clock running meant a stream
+            // that recovered by re-negotiating (HW_FREE + HW_PARAMS rather
+            // than PREPARE) was already past the limit on its very first full
+            // ring, and the next refusal came back as an XRUN it had not
+            // earned.
+            st.stalled_since = None;
         }
 
         // Hand back exact singletons for everything.
@@ -1130,8 +1140,10 @@ impl PcmDev {
     /// against a full ring with nothing to recover from. PulseAudio's ALSA
     /// sink ends that spin by aborting inside libasound:
     ///
-    ///     [alsa-hunt] pid=1029 ioctl PCM_WRITEI_FRAMES -> EAGAIN (11)
-    ///     [exit] pid=1029 (pulseaudio) killed by signal SIGABRT (6)
+    /// ```text
+    /// [alsa-hunt] pid=1029 ioctl PCM_WRITEI_FRAMES -> EAGAIN (11)
+    /// [exit] pid=1029 (pulseaudio) killed by signal SIGABRT (6)
+    /// ```
     ///
     /// Linux calls a ring that stopped draining an underrun: the state goes to
     /// `XRUN`, `writei` answers `EPIPE`, and the client re-prepares the stream.
@@ -1257,14 +1269,35 @@ impl PcmDev {
                 break;
             }
             kernel_hal::deferred_job::drain_deferred_jobs();
-            core::hint::spin_loop();
+            // Back off before re-offering, exactly as the OSS node does. A
+            // bare spin re-entered `queued_frames` as fast as the CPU could
+            // go, and every one of those takes the driver's lock -- which on
+            // this kernel means interrupts off -- to look at a ring that
+            // frees space at 192 KB/s. The device-read side of it is already
+            // throttled inside the driver; this throttles the lock traffic
+            // that surrounds it. The ring holds 341 ms, so a quarter of a
+            // millisecond of granularity costs the refill nothing.
+            let resume = kernel_hal::timer::timer_now() + WRITE_RETRY_BACKOFF;
+            while kernel_hal::timer::timer_now() < resume {
+                core::hint::spin_loop();
+            }
         }
         xfer.result = (done as u64 / BYTES_PER_FRAME) as i64;
         Ok(())
     }
 
     fn drain(&self) -> Result<()> {
-        let rate = self.st.lock().rate.max(1) as u64;
+        let (rate, state) = {
+            let st = self.st.lock();
+            (st.rate.max(1) as u64, st.state)
+        };
+        // Only a stream whose DMA is actually running can drain. Waiting on a
+        // paused one -- PulseAudio corks a sink and then drains it on the way
+        // out -- burns the whole timeout in a spin loop with nothing on the
+        // other end, and the caller's close(2) blocks for seconds. Linux
+        // treats DRAIN on a stopped stream as immediately complete
+        // (`snd_pcm_drain` only waits while the substream is RUNNING).
+        let drainable = state != STATE_PAUSED && self.audio.is_playing();
         let deadline = kernel_hal::timer::timer_now()
             + core::time::Duration::from_secs(
                 (self.audio.queued_bytes() as u64)
@@ -1272,8 +1305,13 @@ impl PcmDev {
                     .saturating_add(2)
                     .min(10),
             );
-        while self.audio.queued_bytes() > 0 {
+        while drainable && self.audio.queued_bytes() > 0 {
             if kernel_hal::timer::timer_now() >= deadline {
+                break;
+            }
+            // The engine stopping mid-drain (the ring ran dry, or it was
+            // reset under us) means the rest is never going to play out.
+            if !self.audio.is_playing() {
                 break;
             }
             kernel_hal::deferred_job::drain_deferred_jobs();
@@ -1283,7 +1321,9 @@ impl PcmDev {
         // loop. PREPARE/DROP also reset; this covers PulseAudio's end-of-stream
         // path that only DRAIN'd.
         let _ = self.audio.reset();
-        self.st.lock().state = STATE_SETUP;
+        let mut st = self.st.lock();
+        st.state = STATE_SETUP;
+        st.stalled_since = None;
         Ok(())
     }
 
@@ -1421,7 +1461,9 @@ impl PcmDev {
             0x12 => {
                 // HW_FREE
                 let _ = self.audio.reset();
-                self.st.lock().state = STATE_OPEN;
+                let mut st = self.st.lock();
+                st.state = STATE_OPEN;
+                st.stalled_since = None;
                 Ok(0)
             }
             0x13 => {
@@ -1489,6 +1531,7 @@ impl PcmDev {
                 let _ = self.audio.reset();
                 let mut st = self.st.lock();
                 st.appl_ptr = 0;
+                st.stalled_since = None;
                 Ok(0)
             }
             0x42 => {
@@ -1500,7 +1543,9 @@ impl PcmDev {
             0x43 => {
                 // DROP
                 let _ = self.audio.reset();
-                self.st.lock().state = STATE_SETUP;
+                let mut st = self.st.lock();
+                st.state = STATE_SETUP;
+                st.stalled_since = None;
                 Ok(0)
             }
             0x44 => self.drain().map(|_| 0),
@@ -1555,14 +1600,41 @@ impl PcmDev {
                 arm_playback_watchdog();
                 Ok(0)
             }
-            0x48 => Ok(0), // XRUN
+            0x48 => {
+                // XRUN — the client forcing its own stream into the underrun
+                // state (alsa-lib's `snd_pcm_hw_xrun`, used by its test and
+                // recovery paths). Linux only accepts it from RUNNING; from
+                // anything else it is EBADFD. Answering `Ok` without moving
+                // the state told the client it had happened when it had not,
+                // and the PREPARE that follows arrived against a stream the
+                // kernel still believed was running.
+                let mut st = self.st.lock();
+                if st.state != STATE_RUNNING {
+                    return Err(FsError::BadState);
+                }
+                st.state = STATE_XRUN;
+                st.stalled_since = None;
+                drop(st);
+                let _ = self.audio.reset();
+                Ok(0)
+            }
             0x49 => {
                 // FORWARD — skip unplayed frames from the playhead.
                 ucheck::<u64>(data)?;
                 let frames = unsafe { *(data as *mut u64) };
                 let bytes = (frames * BYTES_PER_FRAME) as usize;
                 let skipped = self.audio.forward(bytes).unwrap_or(0);
-                unsafe { *(data as *mut u64) = skipped as u64 / BYTES_PER_FRAME };
+                let skipped_frames = skipped as u64 / BYTES_PER_FRAME;
+                if skipped_frames > 0 {
+                    // The mirror image of REWIND: the client has given up
+                    // those frames, so the application pointer moves over
+                    // them. Leaving it behind made the kernel's `avail` and
+                    // alsa-lib's disagree by exactly the skipped amount for
+                    // the rest of the stream.
+                    let mut st = self.st.lock();
+                    st.appl_ptr = (st.appl_ptr + skipped_frames) % st.boundary.max(1);
+                }
+                unsafe { *(data as *mut u64) = skipped_frames };
                 Ok(0)
             }
             0x50 => {
@@ -1654,6 +1726,24 @@ impl INode for PcmDev {
         // case where the kernel invites a write it is going to refuse.
         let ring_free = self.audio.free_bytes() as u64 / BYTES_PER_FRAME;
         let writable = avail.min(ring_free);
+        if st.state == STATE_XRUN {
+            // An underrun is reported to a poller, not hidden from it. The
+            // ring that stopped draining is by definition full, so the gate
+            // above says "not writable" and a client that answered EAGAIN by
+            // going back to poll() -- which is exactly what alsa-lib does --
+            // waits there until its own timeout expires instead of collecting
+            // the EPIPE that tells it to re-prepare. That is the difference
+            // between a stream that recovers with a click and one that goes
+            // quiet for seconds. Linux raises POLLERR together with POLLOUT
+            // (`snd_pcm_playback_poll`); POLLERR is return-only, so it
+            // reaches the client whether or not it asked for it.
+            return Ok(PollStatus {
+                read: false,
+                write: true,
+                error: true,
+                hangup: false,
+            });
+        }
         Ok(PollStatus {
             read: false,
             write: writable >= st.avail_min.max(st.period_size),
@@ -2635,6 +2725,130 @@ mod timer_tests {
             assert_eq!(pcm.st.lock().appl_ptr, 8);
             assert_eq!(sp.control.avail_min, 4);
         }
+
+        /// A stream in XRUN is reported to `poll()`, not hidden from it.
+        ///
+        /// The ring that stopped draining is full, so the ordinary "is there
+        /// room" gate says no and a client that answered EAGAIN by going back
+        /// to poll() waits there instead of collecting the EPIPE that tells it
+        /// to re-prepare. Linux raises POLLERR with POLLOUT.
+        #[test]
+        fn poll_reports_an_underrun_instead_of_blocking_on_it() {
+            let audio = Arc::new(FakeAudio::new(BYTES_PER_FRAME as usize));
+            let pcm = PcmDev::new(audio, 0);
+            {
+                let mut st = pcm.st.lock();
+                st.state = STATE_RUNNING;
+                st.buffer_size = 1;
+                st.avail_min = 1;
+                st.period_size = 1;
+            }
+            let samples = [0u8; BYTES_PER_FRAME as usize];
+            let mut xfer = SndXferI {
+                result: 0,
+                buf: samples.as_ptr() as usize as u64,
+                frames: 1,
+            };
+            pcm.writei(&mut xfer, OpenFlags::NON_BLOCK).unwrap();
+            // Full and not draining: the poller must see "no room" and no error.
+            let full = pcm.poll().unwrap();
+            assert!(!full.write && !full.error);
+            // Once the stall has been declared an underrun, it must.
+            pcm.st.lock().state = STATE_XRUN;
+            let xrun = pcm.poll().unwrap();
+            assert!(xrun.error, "POLLERR");
+            assert!(xrun.write, "POLLOUT, so a client waiting to write wakes");
+        }
+
+        /// DRAIN must not wait on a stream whose DMA is stopped: nothing is
+        /// going to consume the ring, and the caller's close(2) would block
+        /// for the whole timeout. Linux only waits while the substream runs.
+        #[test]
+        fn drain_does_not_wait_on_a_paused_stream() {
+            let audio = Arc::new(FakeAudio::new(8 * BYTES_PER_FRAME as usize));
+            let pcm = PcmDev::new(audio.clone(), 0);
+            pcm.st.lock().state = STATE_PREPARED;
+            let samples = [0u8; 4 * BYTES_PER_FRAME as usize];
+            let mut xfer = SndXferI {
+                result: 0,
+                buf: samples.as_ptr() as usize as u64,
+                frames: 4,
+            };
+            pcm.writei(&mut xfer, OpenFlags::NON_BLOCK).unwrap();
+            assert_eq!(audio.queued_bytes(), 4 * BYTES_PER_FRAME as usize);
+            pcm.st.lock().state = STATE_PAUSED;
+
+            let started = kernel_hal::timer::timer_now();
+            pcm.drain().unwrap();
+            let waited = kernel_hal::timer::timer_now().saturating_sub(started);
+            assert!(
+                waited < core::time::Duration::from_secs(1),
+                "drain spun on a paused stream for {:?}",
+                waited
+            );
+            assert_eq!(pcm.st.lock().state, STATE_SETUP);
+            assert_eq!(audio.queued_bytes(), 0, "the ring is wiped either way");
+        }
+
+        /// `SNDRV_PCM_IOCTL_XRUN` is the client forcing its own underrun.
+        /// Answering Ok without moving the state told it something had
+        /// happened that had not.
+        #[test]
+        fn the_xrun_ioctl_moves_the_stream_into_xrun() {
+            let audio = Arc::new(FakeAudio::new(8 * BYTES_PER_FRAME as usize));
+            let pcm = PcmDev::new(audio.clone(), 0);
+            pcm.st.lock().state = STATE_PREPARED;
+            let samples = [0u8; 4 * BYTES_PER_FRAME as usize];
+            let mut xfer = SndXferI {
+                result: 0,
+                buf: samples.as_ptr() as usize as u64,
+                frames: 4,
+            };
+            pcm.writei(&mut xfer, OpenFlags::NON_BLOCK).unwrap();
+            assert_eq!(pcm.st.lock().state, STATE_RUNNING);
+
+            pcm.io_control(0x4148, 0).unwrap();
+            assert_eq!(pcm.st.lock().state, STATE_XRUN);
+            assert_eq!(
+                audio.queued_bytes(),
+                0,
+                "the stream is stopped, as on Linux"
+            );
+
+            // Not from an arbitrary state: Linux answers EBADFD.
+            pcm.st.lock().state = STATE_SETUP;
+            assert!(matches!(pcm.io_control(0x4148, 0), Err(FsError::BadState)));
+        }
+
+        /// FORWARD is REWIND's mirror image: the frames it gives up move the
+        /// application pointer with them, or the kernel's `avail` and
+        /// alsa-lib's disagree by that much for the rest of the stream.
+        #[test]
+        fn forward_moves_the_application_pointer_like_rewind_does() {
+            let audio = Arc::new(FakeAudio::new(8 * BYTES_PER_FRAME as usize));
+            let pcm = PcmDev::new(audio, 0);
+            pcm.st.lock().state = STATE_PREPARED;
+            let samples = [0u8; 8 * BYTES_PER_FRAME as usize];
+            let mut xfer = SndXferI {
+                result: 0,
+                buf: samples.as_ptr() as usize as u64,
+                frames: 8,
+            };
+            pcm.writei(&mut xfer, OpenFlags::NON_BLOCK).unwrap();
+            assert_eq!(pcm.st.lock().appl_ptr, 8);
+
+            let mut frames: u64 = 3;
+            pcm.io_control(0x4149, &mut frames as *mut u64 as usize)
+                .unwrap();
+            assert_eq!(frames, 3, "three frames skipped");
+            assert_eq!(pcm.st.lock().appl_ptr, 11);
+
+            let mut back: u64 = 3;
+            pcm.io_control(0x4146, &mut back as *mut u64 as usize)
+                .unwrap();
+            assert_eq!(back, 3);
+            assert_eq!(pcm.st.lock().appl_ptr, 8, "REWIND puts it back");
+        }
     }
 
     fn clock(running: bool, periods: u64) -> PeriodClock {
@@ -2915,6 +3129,23 @@ impl CtlDev {
         let offset = list.offset;
         let space = list.space;
         let mut used = 0u32;
+        // `pids` is a second user pointer carried INSIDE the struct, so
+        // validating the struct says nothing about it. Everything else in
+        // this file checks the buffer it is about to dereference
+        // (`user_range_ok`, the kernel's `access_ok`); this one wrote up to
+        // `MIXER_ELEMS` element ids wherever the caller pointed, kernel
+        // addresses included. Only what is actually going to be written is
+        // checked, so a client that offers a huge `space` (alsa-lib sizes it
+        // from `count`) is not refused for space it never uses.
+        let will_write = space.min(MIXER_ELEMS.saturating_sub(offset.min(MIXER_ELEMS)));
+        if will_write > 0
+            && !kernel_hal::user::user_range_ok(
+                list.pids as usize,
+                will_write as usize * core::mem::size_of::<SndCtlElemId>(),
+            )
+        {
+            return Err(FsError::BadAddress);
+        }
         if list.pids != 0 && space > 0 {
             let ids = list.pids as *mut SndCtlElemId;
             while used < space {

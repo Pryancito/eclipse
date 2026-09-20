@@ -255,6 +255,36 @@ const LPIB_POLL_MIN_US: u64 = 250;
 /// rejects most of them and the time budget rejects the rest.
 const POS_SLACK: usize = BDL_SEGMENT;
 
+/// Shortest interval between two presence-detect *triggers* on a digital pin.
+///
+/// `GET_PIN_SENSE` on an HDMI/DP pin only reports what the last
+/// `SET_PIN_SENSE` latched, so every fresh read costs a trigger verb plus the
+/// 2 ms the codec needs to settle -- per pin. That is fine once; it is not
+/// fine on the stream-start path, which runs again after every underrun and
+/// walks every candidate (an NVIDIA codec exposes four HDMI pins, so ~10 ms
+/// of spinning with the device lock held, i.e. interrupts off, before a
+/// single sample moves). The restart that the underrun forced then takes
+/// long enough to make the next underrun likelier, and the stream stutters
+/// its way down instead of recovering.
+///
+/// A monitor does not appear and disappear inside 100 ms, so a trigger that
+/// recent is re-read rather than re-issued. Hotplug is still noticed on the
+/// next start after that.
+const SENSE_PROBE_MIN_US: u64 = 100_000;
+
+/// Shortest interval between two `kick_hdmi_audio` calls from the write path.
+///
+/// Re-pushing the monitor's ELD goes through the display driver and the GSP
+/// display path, which is expensive and takes GPU locks. The write path asks
+/// for it whenever a digital pin is not reporting a live sink at stream
+/// start, and "not live" is the steady state of an HDMI codec with nothing
+/// plugged into it -- so every underrun-driven restart paid for a full ELD
+/// push that had already failed to change anything a moment earlier, and the
+/// restart it was supposed to help took longer than the gap that caused it.
+///
+/// A push that did not take will not take any better a second later.
+const HDMI_KICK_MIN_US: u64 = 1_000_000;
+
 const STOP_HISTORY: usize = 4;
 
 /// One stream stop, as recorded for `/proc/gpusnd`.
@@ -375,6 +405,14 @@ struct HdaInner {
     running: bool,
     /// Software pause: DMA stopped but the ring still holds queued PCM.
     paused: bool,
+    /// The stream descriptor was force-reset (`SRST`) because the engine
+    /// would not acknowledge a cleared `RUN`, so its programming -- BDL
+    /// address, cyclic length, format and above all the stream tag -- is
+    /// gone. Setting `RUN` again on that descriptor starts a stream tagged 0,
+    /// which no converter is listening on: the writer keeps being served, the
+    /// ring never drains, and the client hears nothing until it gives up with
+    /// an underrun. Anything that resumes has to reprogram first.
+    needs_reprogram: bool,
     /// Next byte to write, offset into the ring.
     wp: usize,
     /// Bytes written and not yet played. Derived from the hardware play
@@ -453,6 +491,21 @@ struct HdaInner {
     /// whatever it has, i.e. gaps -- and DESE a bad buffer descriptor.
     stat_fifo_err: u64,
     stat_desc_err: u64,
+    /// RIRB entries discarded before posting a verb: unsolicited jack events,
+    /// plus the late answers to verbs that timed out. A non-zero count is the
+    /// only visible trace of the response stream having slipped. See
+    /// [`HdaInner::drain_rirb`].
+    stat_stale_resp: u64,
+    /// `(pin, timer_now_as_micros())` at each pin's last presence-detect
+    /// trigger, for [`SENSE_PROBE_MIN_US`]. Per pin, because a walk over the
+    /// candidates has to latch a fresh result on every one of them -- a
+    /// single shared timestamp would let the first pin suppress the rest and
+    /// they would all score as absent. One entry per digital pin.
+    sense_probe: Vec<(u32, u64)>,
+    /// `timer_now_as_micros()` at the last `kick_hdmi_audio` asked for by the
+    /// write path, for [`HDMI_KICK_MIN_US`]. 0 = never.
+    last_kick_us: u64,
+
     /// `WALCLK` when the current stream started.
     stream_start_wall: u32,
     /// When the current stream started and how much has been written to it,
@@ -492,11 +545,48 @@ impl HdaInner {
         mmio_w8(self.bar, REG_RIRBSTS, RIRBSTS_IRQ | RIRBSTS_OVERRUN);
     }
 
+    /// Drop every response sitting in the RIRB, and count them.
+    ///
+    /// Verbs are issued one at a time under the device lock and answered by
+    /// polling, so at the moment a verb is posted the ring can only hold
+    /// responses that are NOT its own: an unsolicited jack event, or the late
+    /// answer to a verb that already gave up (`VERB_TIMEOUT_US`). Leaving
+    /// those in place is what makes one timeout poison the rest of the
+    /// session -- the next verb reads the stale entry as its own reply, and
+    /// every verb after it is answered by the previous one's response. The
+    /// codec graph is then read through a one-entry shift: pin caps come back
+    /// as connection lists, presence as config defaults, and the driver
+    /// happily routes to a pin that does not exist. It plays into that route
+    /// with no error at all, and nothing short of a reboot resynchronises it.
+    ///
+    /// Linux does not need this because it correlates each response with the
+    /// command that produced it (`azx_rirb_get_response` counts outstanding
+    /// commands); draining before the doorbell is the same guarantee for a
+    /// transport that sends exactly one verb at a time.
+    fn drain_rirb(&mut self) {
+        let hw_wp = (mmio_r16(self.bar, REG_RIRBWP) & 0xff) as usize % self.rirb_entries;
+        if self.rirb_rp == hw_wp {
+            return;
+        }
+        while self.rirb_rp != hw_wp {
+            self.rirb_rp = (self.rirb_rp + 1) % self.rirb_entries;
+            self.stat_stale_resp += 1;
+        }
+        // Those entries counted against `RINTCNT`, and QEMU holds CORB DMA
+        // until the status is acked (see [`HdaInner::ack_rirb`]). Acking
+        // again here keeps the doorbell that follows from ringing into a
+        // stalled ring.
+        self.ack_rirb();
+    }
+
     // ── Codec verb transport (CORB/RIRB, polled) ────────────────────────────
     fn corb_cmd(&mut self, verb: u32) -> DeviceResult<u32> {
         let bar = self.bar;
         // Unstick a previous RINTCNT stall before ringing the doorbell.
         self.ack_rirb();
+        // Nothing already in the ring can answer the verb we are about to
+        // post. See [`HdaInner::drain_rirb`].
+        self.drain_rirb();
         let wp = (mmio_r16(bar, REG_CORBWP) as usize + 1) % self.corb_entries;
         unsafe { write_volatile((self.corb_va + wp * 4) as *mut u32, verb) };
         clflush_range(self.corb_va + wp * 4, 4);
@@ -825,6 +915,21 @@ impl HdaInner {
             return;
         }
         let dstp = dst as *mut u8;
+        // A trailing partial frame would otherwise be left holding whatever
+        // the previous lap put there. The write path only ever offers whole
+        // stereo frames, so this copies nothing in practice -- but a silently
+        // skipped tail is a stale-audio bug waiting for the first caller that
+        // does not, and the byte-for-byte copy is the honest fallback.
+        let tail = len % 4;
+        if tail != 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    src.as_ptr().add(len - tail),
+                    dstp.add(len - tail),
+                    tail,
+                );
+            }
+        }
         let mut i = 0;
         while i + 4 <= len {
             let l = i16::from_le_bytes([src[i], src[i + 1]]);
@@ -876,6 +981,9 @@ impl HdaInner {
                 core::hint::spin_loop();
             }
             mmio_w32(self.bar, self.sd_base + SD_CTL, 0);
+            // SRST clears the descriptor, tag included: it cannot simply be
+            // restarted. See [`HdaInner::needs_reprogram`].
+            self.needs_reprogram = true;
         }
         self.running = false;
         stopped
@@ -978,6 +1086,22 @@ impl HdaInner {
         if self.running || self.queued == 0 {
             return Ok(());
         }
+        if self.needs_reprogram {
+            // The descriptor was wiped by a forced reset while this PCM was
+            // stopped, so the queued bytes have nothing to play them: their
+            // ring offsets no longer mean anything to an engine that will
+            // restart at 0. Drop them and go back to the stopped state the
+            // write path knows how to start from -- the client hears the gap,
+            // which is what actually happened, instead of an indefinite
+            // silence that ends in an underrun.
+            warn!("[hda] resume after a forced stream reset: dropping the queued PCM");
+            self.silence_ring();
+            self.wp = 0;
+            self.zero_ptr = 0;
+            self.queued = 0;
+            self.last_lpib = 0;
+            return Ok(());
+        }
         // The link clock kept counting while paused; the stream did not.
         self.wall_last = mmio_r32(self.bar, REG_WALCLK);
         self.last_poll_us = timer_now_as_micros();
@@ -1047,6 +1171,7 @@ impl HdaInner {
         self.dpib_trusted = false;
         self.running = true;
         self.paused = false;
+        self.needs_reprogram = false;
         self.stat_restarts += 1;
         self.stream_start_us = self.last_poll_us;
         self.stream_start_wall = mmio_r32(bar, REG_WALCLK);
@@ -1150,8 +1275,7 @@ impl HdaInner {
     /// and we pick the first widget, which is often a dead connector.
     fn score_path(&mut self, p: &OutPath) -> (i32, bool, bool) {
         if p.hdmi_dp {
-            let _ = self.cmd(p.pin, VERB_SET_PIN_SENSE, 0);
-            wait_us(2_000);
+            self.trigger_pin_sense(p.pin);
         }
         let sense = self.cmd(p.pin, VERB_GET_PIN_SENSE, 0).unwrap_or(0);
         let present = sense & (1 << 31) != 0;
@@ -1180,11 +1304,29 @@ impl HdaInner {
         let pin = self.pin_nid;
         let hdmi_dp = self.candidates.iter().any(|c| c.pin == pin && c.hdmi_dp);
         if hdmi_dp {
-            let _ = self.cmd(pin, VERB_SET_PIN_SENSE, 0);
-            wait_us(2_000);
+            self.trigger_pin_sense(pin);
         }
         let sense = self.cmd(pin, VERB_GET_PIN_SENSE, 0).unwrap_or(0);
         sense & (1 << 31) != 0 && sense & (1 << 30) != 0
+    }
+
+    /// Latch a fresh presence-detect result on a digital pin, unless one was
+    /// latched less than [`SENSE_PROBE_MIN_US`] ago -- in which case the
+    /// value `GET_PIN_SENSE` already holds is used as it stands.
+    fn trigger_pin_sense(&mut self, pin: u32) {
+        let now = timer_now_as_micros();
+        if let Some(&(_, last)) = self.sense_probe.iter().find(|(p, _)| *p == pin) {
+            if now.wrapping_sub(last) < SENSE_PROBE_MIN_US {
+                return;
+            }
+        }
+        let _ = self.cmd(pin, VERB_SET_PIN_SENSE, 0);
+        wait_us(2_000);
+        let now = timer_now_as_micros();
+        match self.sense_probe.iter_mut().find(|(p, _)| *p == pin) {
+            Some(slot) => slot.1 = now,
+            None => self.sense_probe.push((pin, now)),
+        }
     }
 
     /// Enumerate the AFG's widgets and collect every viable output path
@@ -1413,7 +1555,8 @@ impl HdaInner {
         }
 
         if path.digital {
-            self.setup_digital_converter(2);
+            let ch = self.channels;
+            self.setup_digital_converter(ch);
         }
         Ok(())
     }
@@ -1616,6 +1759,7 @@ impl HdaDevice {
             bdl_pa,
             running: false,
             paused: false,
+            needs_reprogram: false,
             wp: 0,
             queued: 0,
             last_lpib: 0,
@@ -1645,6 +1789,9 @@ impl HdaDevice {
             last_bad_src: 0,
             stat_fifo_err: 0,
             stat_desc_err: 0,
+            stat_stale_resp: 0,
+            sense_probe: Vec::new(),
+            last_kick_us: 0,
             stream_start_wall: 0,
             stream_start_us: 0,
             stream_written: 0,
@@ -1758,7 +1905,14 @@ impl AudioScheme for HdaDevice {
     fn write(&self, pcm: &[u8]) -> DeviceResult<usize> {
         let kick_hdmi = {
             let mut inner = self.inner.lock();
-            !inner.running && inner.digital && !inner.active_pin_live()
+            let now = timer_now_as_micros();
+            let due =
+                inner.last_kick_us == 0 || now.wrapping_sub(inner.last_kick_us) >= HDMI_KICK_MIN_US;
+            let kick = due && !inner.running && inner.digital && !inner.active_pin_live();
+            if kick {
+                inner.last_kick_us = now;
+            }
+            kick
         };
         if kick_hdmi {
             // GOP never enables audio packets; re-push ELD/unmute now so the
@@ -2002,6 +2156,16 @@ impl AudioScheme for HdaDevice {
             inner.stat_fifo_err,
             inner.stat_desc_err,
             mmio_r16(bar, sd + SD_FIFOS)
+        );
+        let _ = writeln!(
+            out,
+            "[gpusnd] codec link: {} stale RIRB responses discarded{}",
+            inner.stat_stale_resp,
+            if inner.stat_stale_resp > 0 {
+                " (jack events, or late answers to a verb that timed out)"
+            } else {
+                ""
+            }
         );
         // Two clocks against each other. The kernel's is derived from the
         // TSC; the controller's counts its own 24 MHz link clock. Over a
