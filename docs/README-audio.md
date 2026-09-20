@@ -195,6 +195,30 @@ S16LE stereo at the HDA rate set), `SW_PARAMS`, `PREPARE`, `WRITEI_FRAMES`,
 status/control pages are not mmap-able; alsa-lib falls back to `SYNC_PTR`
 automatically).
 
+The stream state machine follows `sound/core/pcm_native.c`:
+
+- `PREPARE` arms the driver's start hold (`AudioScheme::set_start_hold`):
+  writes queue into the ring and the engine starts once `start_threshold`
+  frames are queued (alsa-lib's default is 1, aplay uses a period) or on an
+  explicit `START` (PulseAudio sets the threshold to the boundary). `START`
+  needs PREPARED and data (`EBADFD` / `EPIPE` otherwise).
+- The ring running dry on a RUNNING stream is an underrun once `avail`
+  reaches `stop_threshold` (the buffer size by default): `writei`, `DELAY`
+  and `HWSYNC` answer `EPIPE`, `poll()` raises `POLLERR|POLLOUT`, and
+  `PREPARE` recovers. A `stop_threshold` at the boundary keeps the stream
+  free-running (the HDA engine stops itself and the next write restarts it
+  seamlessly), which is also what a stall with the ring still full reports
+  after a whole buffer's worth of time.
+- `HW_PARAMS` (OPEN/SETUP/PREPARED only), `HW_FREE` (SETUP/PREPARED),
+  `PREPARE` (not OPEN, RUNNING or DRAINING), `DROP` (not OPEN) and `PAUSE`
+  (pause RUNNING, resume PAUSED) refuse other states with `EBADFD`, as Linux
+  does. `SW_PARAMS` validates like `snd_pcm_sw_params` (`avail_min` 0,
+  a bad `tstamp_mode`, an oversized `silence_threshold` are `EINVAL`), keeps
+  every field for readback and reports the kernel's boundary rather than
+  taking the client's.
+- The control node also answers `TLV_READ` (`ENXIO`, no dB scale),
+  `HWDEP_NEXT_DEVICE`/`RAWMIDI_NEXT_DEVICE` (none) and `POWER_STATE` (D0).
+
 `/etc/asound.conf` (written by xtask) sets `default` to the **PulseAudio
 plugin** when `pulseaudio` and `alsa-plugins-pulse` are in the image, so
 mpg123/`aplay` multiplex through the daemon. The kernel PCM remains

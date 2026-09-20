@@ -1079,6 +1079,13 @@ impl HdaInner {
     /// Stop DMA but keep the ring so resume continues from the same LPIB.
     fn pause_stream(&mut self) {
         self.poll_progress();
+        if !self.running {
+            // Nothing is fetching: a stopped stream, or one primed under a
+            // start hold whose descriptor has never been programmed. Marking
+            // that "paused" would make the hold's release skip the start
+            // and the resume set RUN on a descriptor with no stream tag.
+            return;
+        }
         self.stop_stream();
         self.paused = true;
     }
@@ -1086,7 +1093,9 @@ impl HdaInner {
     /// Set RUN without resetting the stream descriptor (LPIB stays put).
     fn resume_stream(&mut self) -> DeviceResult {
         self.paused = false;
-        if self.running || self.queued == 0 {
+        if self.running || self.queued == 0 || self.hold_start {
+            // A held ring starts when the hold is released, through the
+            // full programming path; RUN alone would start stream 0.
             return Ok(());
         }
         if self.needs_reprogram {

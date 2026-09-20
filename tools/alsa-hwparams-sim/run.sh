@@ -19,7 +19,7 @@ python3 - "$root" "$here" "$out" <<'PYEOF'
 import sys
 root, here, out = sys.argv[1], sys.argv[2], sys.argv[3]
 src = open(f'{root}/linux-object/src/fs/devfs/snd.rs').read()
-block = src[src.index('    // ── hw_params refine'):src.index('    /// Blocking interleaved write')]
+block = src[src.index('    // ── hw_params refine'):src.index('    fn commit_write_progress')]
 # Bridge the kernel block into a hosted harness: the ring size is a constant,
 # the device call and the kernel logging macros are stubbed.
 block = block.replace('let ring = self.ring_frames();', 'let ring = RING;')
