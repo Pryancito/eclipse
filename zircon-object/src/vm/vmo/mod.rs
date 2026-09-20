@@ -195,6 +195,16 @@ pub trait VMObjectTrait: Sync + Send {
         0
     }
 
+    /// Decommit generation as `(begin, end)`: two counters that only grow,
+    /// with `begin` bumped before any frame of this object is released and
+    /// `end` once every PTE pointing at those frames is gone. Objects that
+    /// never release a frame under the caller's feet leave it at `(0, 0)`.
+    ///
+    /// Callers do not use this directly: see [`VmObject::decommit_snapshot`].
+    fn decommit_seq(&self) -> (u64, u64) {
+        (0, 0)
+    }
+
     /// If contiguous, transmute vmo to a mutable buffer
     fn as_mut_buf(&self) -> ZxResult<(MutexGuard<'_, ()>, &mut [u8])> {
         Err(ZxError::NOT_SUPPORTED)
@@ -849,6 +859,39 @@ impl VmObject {
 
     pub fn cow_fault_seq(&self) -> u64 {
         self.trait_.cow_fault_seq()
+    }
+
+    /// `(begin, end)` of this object's decommit generation; see
+    /// [`VMObjectTrait::decommit_seq`].
+    pub(crate) fn decommit_seq(&self) -> (u64, u64) {
+        self.trait_.decommit_seq()
+    }
+
+    /// Snapshot the decommit generation before a page fault commits a page.
+    ///
+    /// `commit_page` hands back a frame the object owns *at that instant*, but
+    /// the fault publishes its PTE later, with no VMO lock held in between. A
+    /// `decommit` landing in that gap frees the frame and unmaps every PTE
+    /// that points at it -- every PTE that exists, which does not include the
+    /// one still on its way. Pairing this snapshot with
+    /// [`VmObject::decommit_seq_intact`] at publication time closes the gap:
+    /// the fault gives up and lets the instruction retry.
+    ///
+    /// `None` means a decommit was already in flight when the snapshot was
+    /// taken, which makes the re-check fail outright.
+    pub fn decommit_snapshot(&self) -> Option<u64> {
+        let (begin, end) = self.trait_.decommit_seq();
+        if begin == end {
+            Some(begin)
+        } else {
+            None
+        }
+    }
+
+    /// Whether no decommit has run on this object since `snapshot` was taken
+    /// with [`VmObject::decommit_snapshot`].
+    pub fn decommit_seq_intact(&self, snapshot: Option<u64>) -> bool {
+        matches!(snapshot, Some(begin) if begin == self.trait_.decommit_seq().0)
     }
 
     /// Returns true if this object is backed by ordinary RAM (a paged VMO).

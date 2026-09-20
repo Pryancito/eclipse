@@ -111,6 +111,31 @@ impl Drop for CowFaultSeqGuard<'_> {
     }
 }
 
+/// Marks a `decommit` as in flight on one object, from before the first frame
+/// is released until after the last stale PTE has been unmapped.
+///
+/// Unlike [`CowFaultSeqGuard`] this never has to wait: the two counters stay
+/// ordered (`begin >= end`) however many decommits overlap, and a reader only
+/// needs to tell "some decommit was active during my window" from "none was".
+struct DecommitGuard<'a> {
+    end: &'a AtomicU64,
+}
+
+impl<'a> DecommitGuard<'a> {
+    fn begin(vmo: &'a VMObjectPaged) -> Self {
+        vmo.decommit_begin.fetch_add(1, Ordering::AcqRel);
+        Self {
+            end: &vmo.decommit_end,
+        }
+    }
+}
+
+impl Drop for DecommitGuard<'_> {
+    fn drop(&mut self) {
+        self.end.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 fn apply_deferred_range_changes(range_changes: Vec<DeferredRangeChange>) {
     for range_change in range_changes {
         range_change.apply();
@@ -216,6 +241,26 @@ pub struct VMObjectPaged {
     /// reshape. Write faults that see a change (or an odd value) retry rather
     /// than installing a writable PTE onto a frame that may have become shared.
     cow_fault_seq: AtomicU64,
+    /// Decommit generation, as a pair of counters that only ever grow:
+    /// `decommit_begin` goes up before `decommit` releases its first frame and
+    /// `decommit_end` only once the last PTE pointing at those frames is gone,
+    /// so `decommit_begin == decommit_end` means "no frame of this object is
+    /// being released right now". A page fault snapshots the pair before
+    /// `commit_page` and re-reads it while publishing its PTE; see
+    /// `VmObject::decommit_snapshot`. Two counters rather than one odd/even
+    /// sequence because concurrent decommits of different ranges must not
+    /// serialize on each other.
+    decommit_begin: AtomicU64,
+    decommit_end: AtomicU64,
+    /// The page cache this leaf borrows from (the same object as
+    /// `inner.cache.0`), held OUTSIDE the `RefCell` so the fault path can read
+    /// the cache's decommit generation without taking this object's family
+    /// lock. A borrower's `commit_page` hands back the *cache's* frames, so a
+    /// decommit over there frees pages this object's faults are publishing,
+    /// and the borrower's own counters would never notice. The `cache` field's
+    /// doc explains why re-locking across families on the fault path is not an
+    /// option.
+    cache_ref: Option<Arc<VmObject>>,
 }
 
 /// We always lock the lock before access to the Refcell, so it is actually sync
@@ -494,12 +539,16 @@ impl VMObjectPaged {
         if inner.type_.is_hidden() {
             VMO_HIDDEN_CREATED.fetch_add(1, Ordering::Relaxed);
         }
+        let cache_ref = inner.cache.as_ref().map(|(cache, _, _)| cache.clone());
         let obj = Arc::new(VMObjectPaged {
             lock: lock_ref.unwrap_or_else(|| Arc::new(Mutex::new(()))),
             inner: RefCell::new(inner),
             shared: core::sync::atomic::AtomicBool::new(false),
             borrower_maps: Mutex::new(Vec::new()),
             cow_fault_seq: AtomicU64::new(0),
+            decommit_begin: AtomicU64::new(0),
+            decommit_end: AtomicU64::new(0),
+            cache_ref,
         });
         obj.inner.borrow_mut().self_ref = Arc::downgrade(&obj);
         obj
@@ -964,6 +1013,13 @@ impl VMObjectTrait for VMObjectPaged {
     fn decommit(&self, offset: usize, len: usize) -> ZxResult {
         let start_page = offset / PAGE_SIZE;
         let pages = len / PAGE_SIZE;
+        // Opens the decommit window and closes it when this function returns,
+        // i.e. after the unmap passes below. A page fault that is somewhere
+        // between `commit_page` and publishing its PTE while this window is
+        // open gives up and retries instead of mapping a frame we are about to
+        // hand back to the allocator -- it cannot be reached through the unmap
+        // passes, because its PTE does not exist yet. See `decommit_seq`.
+        let _decommit_guard = DecommitGuard::begin(self);
         let mappings = {
             let mut inner = self.get_inner_mut();
             if inner.parent.is_some() {
@@ -1059,6 +1115,27 @@ impl VMObjectTrait for VMObjectPaged {
 
     fn cow_fault_seq(&self) -> u64 {
         self.cow_fault_seq.load(Ordering::Acquire)
+    }
+
+    fn decommit_seq(&self) -> (u64, u64) {
+        // Read `end` BEFORE `begin`, here and in the cache below. Both
+        // counters only ever grow and `begin >= end` holds at every instant,
+        // so in this order `begin == end` proves that nothing was in flight at
+        // the moment `begin` was read; the opposite order could miss a
+        // decommit that started between the two loads.
+        //
+        // The cache's counters are summed into ours rather than returned
+        // separately: monotone sums are equal only if each part is equal, so
+        // one pair still answers both "is anything in flight" and "did
+        // anything happen since". A borrower therefore inherits its cache's
+        // decommits -- the frames its faults publish belong to the cache.
+        let (cache_begin, cache_end) = match &self.cache_ref {
+            Some(cache) => cache.decommit_seq(),
+            None => (0, 0),
+        };
+        let end = self.decommit_end.load(Ordering::Acquire);
+        let begin = self.decommit_begin.load(Ordering::Acquire);
+        (begin + cache_begin, end + cache_end)
     }
 
     fn register_borrower_mapping(&self, mapping: Weak<VmMapping>, base_page: usize) {
