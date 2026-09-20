@@ -84,7 +84,7 @@ pub(crate) fn open_filesystem(
 ) -> LxResult<Arc<dyn FileSystem>> {
     match fstype {
         "btrfs" => open_btrfs(&backend, read_only).map_err(LxError::from),
-        "vfat" => open_fat(backend)
+        "vfat" => open_fat(&backend)
             .map(|fs| fs as Arc<dyn FileSystem>)
             .map_err(LxError::from),
         _ => Err(LxError::ENODEV),

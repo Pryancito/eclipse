@@ -119,7 +119,8 @@ fn first_mutation_clears_free_space_tree_valid() {
         "mount alone changed compat_ro flags",
     );
 
-    fs.create(root, "hello", FileKind::Regular, 0o644, 0).unwrap();
+    fs.create(root, "hello", FileKind::Regular, 0o644, 0)
+        .unwrap();
 
     // The clear must hit the disk immediately, not wait for the next deferred
     // superblock commit: a crash in between would leave a volume whose extent
@@ -161,7 +162,9 @@ fn read_only_mount_leaves_the_flag_alone() {
     let mut fs = Btrfs::mount(dev.clone(), true).unwrap();
     let root = fs.root_ino();
     fs.readdir(root).unwrap();
-    assert!(fs.create(root, "nope", FileKind::Regular, 0o644, 0).is_err());
+    assert!(fs
+        .create(root, "nope", FileKind::Regular, 0o644, 0)
+        .is_err());
     assert_eq!(
         on_disk_compat_ro(&dev),
         want,
@@ -184,7 +187,8 @@ fn volume_without_free_space_tree_is_untouched() {
 
     let mut fs = Btrfs::mount(dev.clone(), false).unwrap();
     let root = fs.root_ino();
-    fs.create(root, "hello", FileKind::Regular, 0o644, 0).unwrap();
+    fs.create(root, "hello", FileKind::Regular, 0o644, 0)
+        .unwrap();
     fs.sync().unwrap();
 
     assert_eq!(
