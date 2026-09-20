@@ -425,6 +425,22 @@ const TRB_EVT_PORT_STATUS: u32 = 34 << 10;
 const TRB_CC_SUCCESS: u32 = 1;
 const TRB_CC_SHORT: u32 = 13;
 
+/// Does this transfer-event completion code leave the endpoint in the Halted
+/// state, so that it needs Reset Endpoint + Set TR Dequeue Pointer before it
+/// will run again?
+///
+/// xHCI 1.2 table 6-90. The codes below are the ones that reach a transfer
+/// event WITHOUT halting the endpoint, so they must not trigger a reset:
+/// Ring Underrun/Overrun (isoch), Event Ring Full, Missed Service Error (the
+/// host skipped a service interval -- routine on a busy bus), and the four
+/// Stopped codes, which are the answer to a Stop Endpoint command. Anything
+/// else -- Stall, Babble, Transaction Error, Data Buffer Error, TRB Error, or
+/// a code we do not know -- is treated as halting, because the recovery is
+/// harmless on an endpoint that did not need it and mandatory on one that did.
+fn cc_halts_endpoint(cc: u32) -> bool {
+    !matches!(cc, 14 | 15 | 21 | 23 | 24 | 25 | 26 | 27 | 28)
+}
+
 fn trb_link(phys: u64, cycle: bool) -> Trb {
     let mut c = TRB_LINK | (1 << 1);
     if cycle {
@@ -1522,27 +1538,62 @@ impl XhciInner {
         }
 
         if cc != TRB_CC_SUCCESS && cc != TRB_CC_SHORT {
-            // Transfer error. Stall (0x0d) halts the endpoint outright; Babble /
-            // Transaction Error can too. Doing nothing (the old behaviour) left
-            // the endpoint dead until the user unplugged and replugged the
-            // device. Skip the failed TRB and queue a deferred Reset Endpoint +
-            // re-arm (commands must not run nested inside this event drain).
+            // A failed transfer. Skip its TRB, re-arm one in its place, and --
+            // only when the completion code actually leaves the endpoint
+            // Halted -- queue a deferred Reset Endpoint (commands must not run
+            // nested inside this event drain).
             if let Some(idx) = self
                 .hids
                 .iter()
                 .position(|h| h.slot_id == i as u8 && h.ep_dci == dci)
             {
-                let ridx = self.hids[idx].ring_idx;
+                let (ridx, blen, buf_phys) = {
+                    let h = &mut self.hids[idx];
+                    // No report was dispatched for this transfer, so the
+                    // dispatch head moves with the enqueue head below and the
+                    // two stay in lockstep.
+                    h.dispatch_idx = (h.dispatch_idx + 1) % HID_QUEUE_DEPTH;
+                    (
+                        h.ring_idx,
+                        h.report_len as u16,
+                        h.bufs[h.enqueue_idx].sub_phys(0),
+                    )
+                };
                 if let Some(r) = self.xfer_rings.get_mut(ridx).and_then(|o| o.as_mut()) {
                     r.advance_dequeue(1);
                 }
-                // No report dispatched for the errored transfer: advance the
-                // dispatch head too, keeping it in lockstep with the enqueue
-                // head (which the deferred re-arm advances).
-                self.hids[idx].dispatch_idx = (self.hids[idx].dispatch_idx + 1) % HID_QUEUE_DEPTH;
-                let key = (i as u8, dci);
-                if !self.pending_ep_resets.contains(&key) {
-                    self.pending_ep_resets.push(key);
+                // Re-arm HERE, once per failed transfer, rather than once per
+                // deferred reset. The deferred list is deduplicated by
+                // (slot, dci), so a burst of N failures on one endpoint used to
+                // put back a single TRB: the ring lost N-1 of its
+                // HID_QUEUE_DEPTH slots every burst and the two heads drifted
+                // apart by N-1 for good -- reports then came out of the wrong
+                // buffer, and after a few bursts the ring ran empty and the
+                // device went silent until it was unplugged. Pushing onto a
+                // halted endpoint is harmless: the TRB simply waits there, and
+                // `deq_phys()` below is unaffected because the dequeue head
+                // does not move on a push.
+                self.resubmit_hid_normal_trb(ridx, buf_phys, blen, i as u8, dci);
+                if let Some(h) = self.hids.get_mut(idx) {
+                    h.enqueue_idx = (h.enqueue_idx + 1) % HID_QUEUE_DEPTH;
+                }
+                if cc_halts_endpoint(cc) {
+                    let key = (i as u8, dci);
+                    if !self.pending_ep_resets.contains(&key) {
+                        self.pending_ep_resets.push(key);
+                    }
+                } else {
+                    // Missed Service Error is the one a real xHCI actually
+                    // produces on a busy bus, and it does NOT halt anything:
+                    // the host skipped one service interval. Resetting a
+                    // RUNNING endpoint answers Context State Error, so the old
+                    // unconditional reset turned a dropped report into a failed
+                    // recovery -- which is also why this never showed up under
+                    // QEMU, where the code is never emitted.
+                    warn!(
+                        "[xhci] slot={} dci={} transfer cc={} (endpoint not halted); TRB skipped",
+                        i, dci, cc
+                    );
                 }
             }
             return false;
@@ -3116,23 +3167,17 @@ impl XhciInner {
             if self.reset_endpoint_and_dequeue(slot, dci).is_err() {
                 continue;
             }
+            // The replacement TRBs went onto the ring as each failure was
+            // handled, so there is nothing to re-arm here: the endpoint only
+            // needs its doorbell rung to start consuming them again.
             if let Some(idx) = self
                 .hids
                 .iter()
                 .position(|h| h.slot_id == slot && h.ep_dci == dci)
             {
-                let (ridx, blen, buf_phys) = {
-                    let h = &self.hids[idx];
-                    (
-                        h.ring_idx,
-                        h.report_len as u16,
-                        h.bufs[h.enqueue_idx].sub_phys(0),
-                    )
-                };
-                self.resubmit_hid_normal_trb(ridx, buf_phys, blen, slot, dci);
-                if let Some(h) = self.hids.get_mut(idx) {
-                    h.enqueue_idx = (h.enqueue_idx + 1) % HID_QUEUE_DEPTH;
-                }
+                let _ = idx;
+                fence(Ordering::SeqCst);
+                self.mmio.ring_db(slot, dci);
                 warn!(
                     "[xhci] recovered HID endpoint slot={} dci={} after a transfer error",
                     slot, dci
