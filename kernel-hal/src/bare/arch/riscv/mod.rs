@@ -12,11 +12,26 @@ pub mod vm;
 use crate::{mem::phys_to_virt, utils::init_once::InitOnce, PhysAddr};
 use alloc::{string::String, vec::Vec};
 use core::ops::Range;
+use core::sync::atomic::{AtomicBool, Ordering};
 use zcore_drivers::utils::devicetree::Devicetree;
 
 static CMDLINE: InitOnce<String> = InitOnce::new_with_default(String::new());
 static INITRD_REGION: InitOnce<Option<Range<PhysAddr>>> = InitOnce::new_with_default(None);
 static MEMORY_REGIONS: InitOnce<Vec<Range<PhysAddr>>> = InitOnce::new_with_default(Vec::new());
+
+/// Set once the primary hart's device-tree walk has registered every device.
+///
+/// Unlike x86_64 -- where the BSP starts the APs itself, long after
+/// `primary_init()` -- every RISC-V hart is released by SBI at once, and
+/// `zCore/src/platform/riscv/entry.rs` calls `boot_secondary_harts()` BEFORE
+/// `primary_main()`. So a secondary reached `secondary_init()` while the
+/// primary was still walking the device tree, found no `riscv-intc-cpuN`
+/// device yet, and panicked in `drivers::intc_init()` with "IRQ device
+/// 'riscv-intc' not initialized!". That is why the RISC-V jobs failed
+/// non-deterministically: `Linux Libc Test Baremetal (riscv64)` aborted at
+/// test 0 with every secondary down, while `Linux Other Test Baremetal
+/// (riscv64)` passed 24 cases and panicked on 6.
+static DRIVERS_READY: AtomicBool = AtomicBool::new(false);
 
 pub const fn timer_interrupt_vector() -> usize {
     trap::SUPERVISOR_TIMER_INT_VEC
@@ -55,6 +70,9 @@ pub fn primary_init_early() {
 pub fn primary_init() {
     vm::init();
     drivers::init().unwrap();
+    // Release the secondaries spinning in `secondary_init()`: the per-hart
+    // `riscv-intc-cpuN` devices they look up exist only now.
+    DRIVERS_READY.store(true, Ordering::Release);
 }
 
 pub fn timer_init() {
@@ -63,6 +81,12 @@ pub fn timer_init() {
 
 pub fn secondary_init() {
     vm::init();
+    // Wait for the primary hart's device-tree walk (see `DRIVERS_READY`).
+    // Without this the lookups below race it and `.expect()` takes the machine
+    // down. Plain spin: this runs once per hart at boot, with no scheduler yet.
+    while !DRIVERS_READY.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
     info!("cpu {} drivers init ...", crate::cpu::cpu_id());
     drivers::intc_init().unwrap();
     let plic = crate::drivers::all_irq()
