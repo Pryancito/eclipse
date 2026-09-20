@@ -481,14 +481,14 @@ impl DrmDev {
     /// `drm_ioctl()` does.
     #[allow(unsafe_code)]
     fn drm_ioctl_dispatch(&self, cmd: u32, data: usize) -> Result<usize> {
-        // `access_ok()` for the ioctl argument itself. Every arm below (and the
-        // driver-private dispatch) casts `data` straight to the request struct;
-        // `_IOC_SIZE(cmd)` is that struct's size, so one range check here covers
-        // them all. A NULL or kernel address is EFAULT like Linux, instead of a
-        // kernel #PF or an arbitrary kernel-memory read/write. Size-less ioctls
-        // (SET_MASTER, DROP_MASTER) never touch `data`.
-        let arg_size = ((cmd >> 16) & 0x3fff) as usize;
-        ucheck(data, arg_size)?;
+        // NOTE `data` is NOT necessarily a user address here: [`drm_ioctl`] hands
+        // this a kernel bounce buffer whenever it had to reconcile a struct size,
+        // exactly as `drm_ioctl_kernel()` hands the handler `kdata`. The
+        // `access_ok()` for the argument therefore lives in that wrapper, over
+        // the range the CLIENT gave, and every arm below may assume `data` is
+        // `_IOC_SIZE(cmd)` readable/writable bytes. Nested pointers inside the
+        // struct are still the arm's own to check -- they always point at user
+        // memory, whichever buffer the struct itself lives in.
         // Render nodes only accept DRM_RENDER_ALLOW ioctls (drm-uapi.rst
         // "Render nodes"): modeset, dumb-buffer and master/auth commands get
         // EACCES exactly like Linux, so a client probing `renderD128` sees a
@@ -559,6 +559,17 @@ impl DrmDev {
             }
         }
         if (cmd & 0xff) == DRM_ECLIPSE_COMPUTE_NR {
+            // Matched by NR so the `_IOWR` size encoding need not agree bit for
+            // bit -- which means the size the CLIENT chose is the only thing the
+            // argument check above saw. `eclipse_compute_ioctl` writes the whole
+            // 536-byte struct (`status`, `elapsed_ns`, `grid_threads` and a
+            // 512-byte `summary`), so a caller that encodes a smaller one passes
+            // the check and then has half a kilobyte written past the end of its
+            // buffer. Linux never has this hazard: `ksize` there is the KERNEL's
+            // struct size and the buffer is kernel-allocated.
+            if (((cmd >> 16) & 0x3fff) as usize) < core::mem::size_of::<DrmEclipseCompute>() {
+                return Err(FsError::InvalidParam);
+            }
             return eclipse_compute_ioctl(self.minor, data);
         }
         match cmd {
@@ -1784,6 +1795,13 @@ impl DrmDev {
                     && res.enum_blob_ptr != 0
                     && (res.count_enum_blobs as usize) >= spec.enums.len()
                 {
+                    // `access_ok()`. These two arrays were the ONLY nested ioctl
+                    // pointers in this file written without one, and this ioctl
+                    // is unprivileged: a client passing a kernel address as
+                    // `enum_blob_ptr`/`values_ptr` had the kernel write its enum
+                    // records or property values straight to it. Linux copies
+                    // both out with `copy_to_user()`, which faults to EFAULT.
+                    ucheck_n::<DrmModePropertyEnum>(res.enum_blob_ptr as usize, spec.enums.len())?;
                     for (i, (val, nm)) in spec.enums.iter().enumerate() {
                         let mut e = DrmModePropertyEnum {
                             value: *val,
@@ -1801,6 +1819,7 @@ impl DrmDev {
                     && res.values_ptr != 0
                     && (res.count_values as usize) >= spec.values.len()
                 {
+                    ucheck_n::<u64>(res.values_ptr as usize, spec.values.len())?;
                     for (i, v) in spec.values.iter().enumerate() {
                         unsafe {
                             *(res.values_ptr as *mut u64).add(i) = *v;
@@ -3838,20 +3857,36 @@ fn reconcile_sizes(cmd: u32, canon: u32) -> IoctlSizes {
 /// whose struct is longer keeps its trailing bytes untouched. We do the same,
 /// and only when the sizes actually differ — the overwhelmingly common case is
 /// an exact match, which dispatches straight through with no copy at all.
-#[allow(unsafe_code)]
 fn drm_ioctl(dev: &DrmDev, cmd: u32, data: usize) -> Result<usize> {
+    drm_ioctl_reconciled(cmd, data, |canon, kdata| {
+        dev.drm_ioctl_dispatch(canon, kdata)
+    })
+}
+
+/// [`drm_ioctl`] with the dispatch injected, so the copy-in / zero-fill /
+/// copy-back protocol can be tested without a device.
+#[allow(unsafe_code)]
+fn drm_ioctl_reconciled(
+    cmd: u32,
+    data: usize,
+    dispatch: impl FnOnce(u32, usize) -> Result<usize>,
+) -> Result<usize> {
     let nr = cmd & 0xff;
     let canon = match canonical_drm_ioctl(nr) {
         Some(c) => c,
         // Driver-private or unrecognised: hand it to the dispatcher unchanged,
         // which routes it to the driver (Linux consults the driver's own ioctl
         // table for this range) or fails it.
-        None => return dev.drm_ioctl_dispatch(cmd, data),
+        None => {
+            ucheck(data, ioc_size(cmd))?;
+            return dispatch(cmd, data);
+        }
     };
     if ioc_size(cmd) == ioc_size(canon) {
         // Fast path: the client's struct is the one the arms parse. No bounce
         // buffer, no copy -- byte-for-byte the behaviour before this layer.
-        return dev.drm_ioctl_dispatch(canon, data);
+        ucheck(data, ioc_size(cmd))?;
+        return dispatch(canon, data);
     }
     let IoctlSizes {
         in_size,
@@ -3859,7 +3894,7 @@ fn drm_ioctl(dev: &DrmDev, cmd: u32, data: usize) -> Result<usize> {
         ksize,
     } = reconcile_sizes(cmd, canon);
     if ksize == 0 {
-        return dev.drm_ioctl_dispatch(canon, data);
+        return dispatch(canon, data);
     }
     // `access_ok()` over the range the CLIENT encoded, before either copy.
     ucheck(data, core::cmp::max(in_size, out_size))?;
@@ -3873,7 +3908,7 @@ fn drm_ioctl(dev: &DrmDev, cmd: u32, data: usize) -> Result<usize> {
             core::ptr::copy_nonoverlapping(data as *const u8, kdata.as_mut_ptr(), in_size);
         }
     }
-    let ret = dev.drm_ioctl_dispatch(canon, kdata.as_ptr() as usize)?;
+    let ret = dispatch(canon, kdata.as_ptr() as usize)?;
     if out_size != 0 {
         // SAFETY: same range, checked above; `kdata` holds at least `out_size`.
         unsafe {
@@ -4199,6 +4234,43 @@ mod ioctl_size_reconciliation_tests {
         assert!(is_core_drm_nr(0x3A));
         assert!(is_core_drm_nr(0xA0));
         assert!(is_core_drm_nr(0xCF));
+    }
+
+    /// The size-mismatched path must actually WORK, not merely be reachable.
+    /// It hands the dispatcher a KERNEL bounce buffer, so the argument's
+    /// `access_ok()` has to live out here, over the range the client gave --
+    /// leaving it inside the dispatcher made every reconciled ioctl EFAULT,
+    /// i.e. exactly the calls this layer exists to rescue.
+    #[test]
+    fn the_reconciled_path_copies_in_zero_fills_and_copies_back() {
+        // A client whose `drm_mode_fb_cmd2` is 40 bytes shorter than ours.
+        let canon = DRM_IOCTL_MODE_GETFB2;
+        let short_size = ioc_size(canon) - 40;
+        let short = (canon & !(0x3fff << 16)) | ((short_size as u32) << 16);
+        let mut user = alloc::vec![0xAAu8; short_size];
+        user[0] = 7; // fb_id
+        let user_addr = user.as_ptr() as usize;
+        let ret = drm_ioctl_reconciled(short, user_addr, |cmd, kdata| {
+            // Dispatched on the canonical command, never the client's.
+            assert_eq!(cmd, canon);
+            assert_ne!(kdata, user_addr, "the arms must see the bounce buffer");
+            // SAFETY: the wrapper owns `ksize` bytes at `kdata`.
+            let buf = unsafe { core::slice::from_raw_parts_mut(kdata as *mut u8, ioc_size(canon)) };
+            assert_eq!(buf[0], 7, "the client's bytes arrived");
+            assert!(
+                buf[short_size..].iter().all(|&b| b == 0),
+                "the fields the client did not send must read as zero"
+            );
+            buf[1] = 0x5A; // the handler's reply
+            Ok(0)
+        });
+        assert_eq!(ret, Ok(0));
+        assert_eq!(user[1], 0x5A, "the reply reached the client");
+        assert_eq!(
+            user.len(),
+            short_size,
+            "and nothing was written past its buffer"
+        );
     }
 
     /// `sys_ioctl`'s pre-dispatch helpers parse the request struct themselves,
