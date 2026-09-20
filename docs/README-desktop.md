@@ -33,6 +33,12 @@ Un cambio de apariencia reescribe el `<name>` del tema en `rc.xml`, copia la
 paleta de foot correspondiente y reinicia el panel (init lo relanza al
 instante); `labwc --reconfigure` recarga el tema sin cerrar la sesión.
 
+**Sombras**: los tres `themerc` piden sombra bajo las ventanas
+(`window.active.shadow.size`/`.color`), que labwc dibuja de verdad desde
+0.8. Una versión anterior ignora las claves que no conoce, así que no
+rompe nada donde no haya soporte. Esto sí es una sombra del compositor; lo
+que no hay es desenfoque.
+
 **Translucidez**: en `win11` la barra se dibuja sobre un búfer ARGB al 85 % y
 el menú del lanzador al 92 %, así que el fondo se transparenta. Es
 translucidez **plana**: el acrílico y el Mica de Windows desenfocan lo que
@@ -327,6 +333,15 @@ borra `/etc/eclipse/services/labwc.service` o arranca con `desktop=xorg`).
   `/usr/share/backgrounds/eclipse/eclipse-night.png` se regenera fuera de
   un build completo con `cargo test -p xtask dump_wallpaper -- --ignored`.
 - **Apariencia completa**: `eclipse-look eclipse|kde|win11` (ver arriba).
+- **Retoques sin reconstruir**: labwc lee
+  `~/.config/labwc/themerc-override` **encima** del tema, así que ahí puedes
+  cambiar colores, bordes o sombras sin tocar el tema ni el build; `xtask` no
+  crea ni pisa ese fichero. Recarga con `labwc --reconfigure`.
+- **Temas de terceros**: cualquier tema de Openbox 3.6 (los de box-look.org,
+  Kaunas, Fluent...) vale tal cual: copia su carpeta a
+  `/usr/share/themes/<Nombre>/openbox-3/` y pon ese nombre en el `<name>` de
+  `rc.xml`. Ten en cuenta que `eclipse-look` reescribe esa línea, así que un
+  cambio de apariencia te lo sobreescribe.
 - **Colores del tema**: edita el `themerc` de la apariencia activa
   (`/usr/share/themes/{Win11-Dark,Breeze-Dark,Eclipse-Dark}/openbox-3/themerc`)
   y ejecuta la acción «Recargar labwc» del menú (o `labwc --reconfigure`).

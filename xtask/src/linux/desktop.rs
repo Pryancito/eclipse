@@ -1682,7 +1682,13 @@ fn write_theme(rootfs: &Path) {
           \n\
           osd.bg.color: #191430\n\
           osd.border.color: #6b5aa8\n\
-          osd.label.text.color: #e8e4f8\n",
+          osd.label.text.color: #e8e4f8\n\
+          \n\
+          # Drop shadows (labwc >= 0.8; ignored by older builds).\n\
+          window.active.shadow.size: 20\n\
+          window.active.shadow.color: #000000 45\n\
+          window.inactive.shadow.size: 10\n\
+          window.inactive.shadow.color: #000000 25\n",
     )
     .unwrap();
 }
@@ -1730,7 +1736,18 @@ fn write_win11_theme(rootfs: &Path) {
           \n\
           osd.bg.color: #2b2b2b\n\
           osd.border.color: #0078d4\n\
-          osd.label.text.color: #ffffff\n",
+          osd.label.text.color: #ffffff\n\
+          \n\
+          # Windows left-aligns window titles.\n\
+          window.label.text.justify: Left\n\
+          # Drop shadows (labwc >= 0.8; older builds ignore unknown themerc\n\
+          # keys, so this costs nothing where it is not supported). These are\n\
+          # real shadows cast by the compositor -- unlike acrylic, which needs\n\
+          # to BLUR what is behind a surface and labwc cannot.\n\
+          window.active.shadow.size: 26\n\
+          window.active.shadow.color: #000000 40\n\
+          window.inactive.shadow.size: 14\n\
+          window.inactive.shadow.color: #000000 25\n",
     )
     .unwrap();
 }
@@ -1774,7 +1791,15 @@ fn write_breeze_theme(rootfs: &Path) {
           \n\
           osd.bg.color: #31363b\n\
           osd.border.color: #3daee9\n\
-          osd.label.text.color: #fcfcfc\n",
+          osd.label.text.color: #fcfcfc\n\
+          \n\
+          # Breeze centres window titles.\n\
+          window.label.text.justify: Center\n\
+          # Drop shadows (labwc >= 0.8; ignored by older builds).\n\
+          window.active.shadow.size: 22\n\
+          window.active.shadow.color: #000000 45\n\
+          window.inactive.shadow.size: 12\n\
+          window.inactive.shadow.color: #000000 25\n",
     )
     .unwrap();
 }
