@@ -35,6 +35,8 @@ macro_rules! boot_library {
                 boot_library!($name, "../../prebuilt/zircon/x64")
             } else if #[cfg(target_arch = "aarch64")] {
                 boot_library!($name, "../../prebuilt/zircon/arm64")
+            } else if #[cfg(target_arch = "riscv64")] {
+                boot_library!($name, "../../prebuilt/zircon/riscv64")
             } else {
                 compile_error!("Unsupported architecture for zircon mode!")
             }
