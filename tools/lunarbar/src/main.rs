@@ -47,15 +47,17 @@
 //!   `LUNARBAR_DUMP_MENU=1` composites the open app menu over the preview;
 //!   `LUNARBAR_DUMP_CAL=1` composites the calendar popup instead.
 
-mod apps;
-mod fill_guard;
-mod i18n;
-mod icons;
-mod par;
-mod draw;
-mod sysinfo;
+// The drawing stack, /proc readers, .desktop scanner and input tables live in
+// the `lunarbar` library next door, shared with `lunarrun` (see src/lib.rs).
+use lunarbar::look::Look;
+use lunarbar::{apps, draw, fill_guard, i18n, icons, sysinfo};
+use lunarbar::keys::{
+    key_char, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, KEY_BACKSPACE_WL, KEY_DOWN_WL, KEY_ENTER_WL,
+    KEY_ESC_WL, KEY_KPENTER_WL, KEY_LEFT_WL, KEY_PGDN_WL, KEY_PGUP_WL, KEY_RIGHT_WL, KEY_TAB_WL,
+    KEY_UP_WL, WHEEL_NOTCH,
+};
 
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
@@ -83,22 +85,139 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 
 use wp_cursor_shape_device_v1::Shape;
 
-// ── Palette: Eclipse midnight — black ground, dark-blue accents ──────────────
-// (Layout still replicates the old waybar config; only the hues changed from
-// its violet scheme to near-black + navy.)
-const BAR_BG: Rgb = (0x06, 0x0a, 0x14); // bar ground, blue-black
-const BAR_RULE: Rgb = (0x27, 0x5a, 0x9e); // 2px border, dark steel blue
-const TEXT: Rgb = (0xff, 0xff, 0xff); // primary text, white
-const MUTED: Rgb = (0xe8, 0xe8, 0xe8); // module text (cpu/mem/buttons), soft white
-const DIM: Rgb = (0x6d, 0x7f, 0xa3); // minimized windows, placeholders
-const WARN: Rgb = (0xe0, 0x7a, 0x7a); // hot cpu/temp, low battery (semantic)
-const LAUNCH: Rgb = (0x6e, 0xa8, 0xff); // launcher glyph / blue accent
-const PILL: Rgb = (0x12, 0x21, 0x38); // clock/date pill background, navy
-const PILL_HOVER: Rgb = (0x1a, 0x2f, 0x4e); // pill under the pointer
-const BTN_ACTIVE: Rgb = (0x1f, 0x3a, 0x63); // active taskbar button
-const WHITE: Rgb = (0xff, 0xff, 0xff); // active button text
-const MENU_PANEL: Rgb = (0x0b, 0x12, 0x20); // launcher menu panel, deep navy
-const MENU_HOVER: Rgb = (0x1f, 0x3a, 0x63); // hovered menu row
+// ── Palette ─────────────────────────────────────────────────────────────────
+// Two looks, one layout. `/etc/eclipse/look` (written by `eclipse-look`, and
+// read here once at startup) picks between KDE's Breeze Dark and Eclipse's own
+// midnight scheme; the panel's geometry differs too, see `Style`.
+
+/// Every colour the panel draws with, so a look is one value and not a
+/// scattering of constants.
+struct Pal {
+    bar_bg: Rgb,
+    rule: Rgb,
+    text: Rgb,
+    muted: Rgb,
+    dim: Rgb,
+    warn: Rgb,
+    accent: Rgb,
+    pill: Rgb,
+    pill_hover: Rgb,
+    btn_active: Rgb,
+    white: Rgb,
+    menu_panel: Rgb,
+    menu_hover: Rgb,
+}
+
+/// Eclipse midnight — black ground, dark-blue accents. (Layout replicates the
+/// old waybar config; only the hues changed from its violet scheme.)
+const PAL_ECLIPSE: Pal = Pal {
+    bar_bg: (0x06, 0x0a, 0x14),     // bar ground, blue-black
+    rule: (0x27, 0x5a, 0x9e),       // 2px border, dark steel blue
+    text: (0xff, 0xff, 0xff),       // primary text, white
+    muted: (0xe8, 0xe8, 0xe8),      // module text (cpu/mem/buttons), soft white
+    dim: (0x6d, 0x7f, 0xa3),        // minimized windows, placeholders
+    warn: (0xe0, 0x7a, 0x7a),       // hot cpu/temp, low battery (semantic)
+    accent: (0x6e, 0xa8, 0xff),     // launcher glyph / blue accent
+    pill: (0x12, 0x21, 0x38),       // clock/date pill background, navy
+    pill_hover: (0x1a, 0x2f, 0x4e), // pill under the pointer
+    btn_active: (0x1f, 0x3a, 0x63), // active taskbar button
+    white: (0xff, 0xff, 0xff),      // active button text
+    menu_panel: (0x0b, 0x12, 0x20), // launcher menu panel, deep navy
+    menu_hover: (0x1f, 0x3a, 0x63), // hovered menu row
+};
+
+/// KDE Breeze Dark: window `#2a2e32`, view `#1b1e20`, text `#fcfcfc`,
+/// inactive text `#7f8c8d`, selection `#3daee9`, negative `#da4453`.
+const PAL_KDE: Pal = Pal {
+    bar_bg: (0x2a, 0x2e, 0x32),
+    rule: (0x3d, 0xae, 0xe9),
+    text: (0xfc, 0xfc, 0xfc),
+    muted: (0xd0, 0xd4, 0xd6),
+    dim: (0x7f, 0x8c, 0x8d),
+    warn: (0xda, 0x44, 0x53),
+    accent: (0x3d, 0xae, 0xe9),
+    pill: (0x1b, 0x1e, 0x20),
+    pill_hover: (0x31, 0x36, 0x3b),
+    btn_active: (0x1b, 0x1e, 0x20),
+    white: (0xfc, 0xfc, 0xfc),
+    menu_panel: (0x2a, 0x2e, 0x32),
+    menu_hover: (0x3d, 0xae, 0xe9),
+};
+
+/// Windows 11 dark: taskbar `#202020`, flyouts `#2b2b2b`, accent `#0078d4`,
+/// text white over secondary `#c5c5c5`, critical `#e81123`. Drawn rather than
+/// copied: no Microsoft font, icon or image is shipped or needed.
+const PAL_WIN11: Pal = Pal {
+    bar_bg: (0x20, 0x20, 0x20),
+    rule: (0x3d, 0x3d, 0x3d),
+    text: (0xff, 0xff, 0xff),
+    muted: (0xc5, 0xc5, 0xc5),
+    dim: (0x7a, 0x7a, 0x7a),
+    warn: (0xe8, 0x11, 0x23),
+    accent: (0x00, 0x78, 0xd4),
+    pill: (0x2b, 0x2b, 0x2b),
+    pill_hover: (0x3a, 0x3a, 0x3a),
+    btn_active: (0x2d, 0x2d, 0x2d),
+    white: (0xff, 0xff, 0xff),
+    menu_panel: (0x2b, 0x2b, 0x2b),
+    menu_hover: (0x3a, 0x3a, 0x3a),
+};
+
+/// The look, resolved once. Every draw reads it through `pal()`; it cannot
+/// change without restarting the panel, which is exactly what `eclipse-look`
+/// does (eclipse-init respawns it immediately).
+static LOOK: std::sync::OnceLock<Look> = std::sync::OnceLock::new();
+
+fn look() -> Look {
+    *LOOK.get_or_init(Look::current)
+}
+
+fn pal() -> &'static Pal {
+    match look() {
+        Look::Win11 => &PAL_WIN11,
+        Look::Kde => &PAL_KDE,
+        Look::Eclipse => &PAL_ECLIPSE,
+    }
+}
+
+/// KDE and Windows both have a single bottom bar; Eclipse's layout is a top
+/// info bar plus a bottom taskbar. The one flag both layout decisions hang off.
+fn single_bar() -> bool {
+    matches!(look(), Look::Kde | Look::Win11)
+}
+
+/// Windows 11 centres its taskbar buttons, Start included. That one detail is
+/// most of what makes a screenshot read as Windows 11 rather than as any other
+/// dark bar.
+fn centered_tasks() -> bool {
+    look() == Look::Win11
+}
+
+/// Bar opacity. Windows 11's taskbar is translucent (acrylic); labwc cannot
+/// blur what is behind a surface, so this is flat translucency — the closest
+/// honest approximation, and it does make the wallpaper read through the bar.
+/// Anything below 1.0 puts the bar on an ARGB buffer, see `configure`.
+fn bar_alpha() -> f32 {
+    match look() {
+        Look::Win11 => 0.85,
+        _ => 1.0,
+    }
+}
+
+fn translucent() -> bool {
+    bar_alpha() < 1.0
+}
+
+/// Fill a fresh bar canvas with the ground colour, honouring `bar_alpha()`.
+/// `Canvas::clear` is unconditionally opaque, which would silently defeat the
+/// ARGB buffer.
+fn clear_bar(cv: &mut Canvas, w: usize, h: usize) {
+    if translucent() {
+        cv.fill_rect_a(0, 0, w as i32, h as i32, pal().bar_bg, bar_alpha());
+    } else {
+        cv.clear(pal().bar_bg);
+    }
+}
 
 const BUFFERS: usize = 2;
 
@@ -115,25 +234,6 @@ struct TipId;
 // (input-event-codes.h). The famous +8 offset is an xkb keymap convention the
 // CLIENT applies when feeding xkbcommon — it is never added on the wire;
 // wlroots compositors forward libinput's evdev codes unmodified.
-const KEY_ESC_WL: u32 = 1;
-const KEY_BACKSPACE_WL: u32 = 14;
-const KEY_TAB_WL: u32 = 15;
-const KEY_ENTER_WL: u32 = 28;
-const KEY_KPENTER_WL: u32 = 96;
-const KEY_UP_WL: u32 = 103;
-const KEY_DOWN_WL: u32 = 108;
-const KEY_LEFT_WL: u32 = 105;
-const KEY_RIGHT_WL: u32 = 106;
-const KEY_PGUP_WL: u32 = 104;
-const KEY_PGDN_WL: u32 = 109;
-
-// Pointer button codes (linux/input-event-codes.h).
-const BTN_LEFT: u32 = 0x110;
-const BTN_RIGHT: u32 = 0x111;
-const BTN_MIDDLE: u32 = 0x112;
-
-/// One wheel notch in wl_pointer axis units (libinput's convention).
-const WHEEL_NOTCH: f64 = 15.0;
 
 /// Hover dwell before the taskbar tooltip appears.
 const TIP_DELAY: Duration = Duration::from_millis(450);
@@ -514,7 +614,16 @@ impl State {
             })
             .collect();
         for (global_name, output, scale) in pending {
-            for (role, edge) in [(Role::Info, Anchor::Top), (Role::Task, Anchor::Bottom)] {
+            // KDE has ONE panel, along the bottom: its system tray carries
+            // what Eclipse's top bar shows, so that bar is not created at all
+            // (creating it and hiding it would still reserve its exclusive
+            // zone, leaving a dead strip across the top of every window).
+            let roles: &[(Role, Anchor)] = if single_bar() {
+                &[(Role::Task, Anchor::Bottom)]
+            } else {
+                &[(Role::Info, Anchor::Top), (Role::Task, Anchor::Bottom)]
+            };
+            for &(role, edge) in roles {
                 if self.bars.len() >= fill_guard::MAX_BARS {
                     eprintln!(
                         "lunarbar: ignoring bar past MAX_BARS={}",
@@ -616,33 +725,7 @@ impl State {
     /// Allocate a fresh shm mapping + fd. Caller installs buffers. On failure
     /// returns None without touching existing bar state.
     fn map_shm_pool(total: usize) -> Option<(*mut u8, OwnedFd)> {
-        let raw = unsafe {
-            libc::memfd_create(b"lunarbar\0".as_ptr() as *const libc::c_char, libc::MFD_CLOEXEC)
-        };
-        if raw < 0 {
-            eprintln!("lunarbar: memfd_create failed");
-            return None;
-        }
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        if unsafe { libc::ftruncate(raw, total as libc::off_t) } != 0 {
-            eprintln!("lunarbar: ftruncate failed");
-            return None;
-        }
-        let map = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                total,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                raw,
-                0,
-            )
-        };
-        if map == libc::MAP_FAILED {
-            eprintln!("lunarbar: mmap failed");
-            return None;
-        }
-        Some((map as *mut u8, fd))
+        lunarbar::proc::map_shm_pool(total, "lunarbar")
     }
 
     fn bar_index(&self, layer_id: u32) -> Option<usize> {
@@ -727,7 +810,11 @@ impl State {
                 bw as i32,
                 bh as i32,
                 stride as i32,
-                wl_shm::Format::Xrgb8888,
+                if translucent() {
+                    wl_shm::Format::Argb8888
+                } else {
+                    wl_shm::Format::Xrgb8888
+                },
                 qh,
                 (layer_id, i, generation),
             )
@@ -801,7 +888,7 @@ impl State {
                 let data: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(bar.map.add(i * frame_size), frame_size)
                 };
-                if !cv.blit_xrgb_scaled(data, scale) {
+                if !blit_bar(&cv, data, scale) {
                     bar.busy[i] = false;
                     return;
                 }
@@ -845,7 +932,7 @@ impl State {
                 let data: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(bar.map.add(i * frame_size), frame_size)
                 };
-                if !cv.blit_xrgb_scaled(data, scale) {
+                if !blit_bar(&cv, data, scale) {
                     bar.busy[i] = false;
                     return;
                 }
@@ -889,42 +976,7 @@ impl State {
     /// returns at once), so the grandchild is reparented to init — lunarbar
     /// never accumulates zombies.
     fn spawn(&self, cmd: &str) {
-        // Build the argv string BEFORE forking. Between fork() and exec() a
-        // child may call only async-signal-safe functions, and CString::new
-        // allocates. Today that is latent rather than live — par_rows joins
-        // its workers before returning, so no thread is alive when the event
-        // loop calls this — but the safety rests on an invariant nothing
-        // enforces: add any background thread (an async icon loader, say) and
-        // a fork landing while it held the allocator lock would leave the
-        // child deadlocked forever on a lock whose owner does not exist in it,
-        // as a launch that silently never happens. Cheap to make structural.
-        let Ok(c) = std::ffi::CString::new(cmd) else {
-            return; // an interior NUL cannot be passed to exec at all
-        };
-        unsafe {
-            let pid = libc::fork();
-            if pid == 0 {
-                // Intermediate child: new session, fork the real child, exit.
-                libc::setsid();
-                if libc::fork() == 0 {
-                    let sh = b"/bin/sh\0";
-                    let dashc = b"-c\0";
-                    let argv = [
-                        sh.as_ptr() as *const libc::c_char,
-                        dashc.as_ptr() as *const libc::c_char,
-                        c.as_ptr(),
-                        std::ptr::null(),
-                    ];
-                    libc::execv(sh.as_ptr() as *const libc::c_char, argv.as_ptr());
-                    libc::_exit(127);
-                }
-                libc::_exit(0);
-            }
-            if pid > 0 {
-                let mut st = 0;
-                libc::waitpid(pid, &mut st, 0);
-            }
-        }
+        lunarbar::proc::spawn_detached(cmd);
     }
 
     /// Cycle es/us: write `/proc/kbd` first (so the 1 Hz tick cannot snap the
@@ -1913,6 +1965,39 @@ impl State {
 /// instead of writing into shm the compositor may be reading, which both
 /// tears and corrupts the busy[] accounting via the stale Release that would
 /// follow a double-attach.
+/// Compose a bar frame onto the preview's wallpaper fill. An opaque look
+/// overwrites it; a translucent one must be BLENDED, or the preview would show
+/// premultiplied colours over the wallpaper and read far darker than the bar
+/// actually looks on screen.
+fn blit_preview(cv: &Canvas, dst: &mut [u8], w: usize, h: usize) {
+    if !translucent() {
+        let _ = cv.blit_xrgb(dst);
+        return;
+    }
+    let mut src = vec![0u8; w * h * 4];
+    if !cv.blit_argb(&mut src) {
+        return;
+    }
+    // Both buffers are B,G,R,X/A; src is premultiplied, so this is `src + dst
+    // * (1 - a)`, the same operation the compositor performs.
+    for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+        let inv = 255 - s[3] as u32;
+        for c in 0..3 {
+            d[c] = (s[c] as u32 + d[c] as u32 * inv / 255).min(255) as u8;
+        }
+        d[3] = 0xff;
+    }
+}
+
+/// Blit a finished bar frame in whichever format its buffers were created in.
+fn blit_bar(cv: &Canvas, dst: &mut [u8], scale: u32) -> bool {
+    if translucent() {
+        cv.blit_argb_scaled(dst, scale)
+    } else {
+        cv.blit_xrgb_scaled(dst, scale)
+    }
+}
+
 fn pick_buffer(bar: &mut Bar) -> Option<usize> {
     let i = if !bar.busy[bar.next] {
         bar.next
@@ -1961,26 +2046,25 @@ fn draw_task(
     (i32, i32),
     (i32, i32),
 ) {
-    cv.clear(BAR_BG);
+    clear_bar(cv, w, h);
     // border-top: 2px solid #6b5aa8
-    cv.hline(0, 0, w as i32, BAR_RULE, 1.0);
-    cv.hline(0, 1, w as i32, BAR_RULE, 1.0);
+    cv.hline(0, 0, w as i32, pal().rule, 1.0);
+    cv.hline(0, 1, w as i32, pal().rule, 1.0);
 
     let ty = (h as i32 + 2 - GLYPH_H) / 2; // text cell top, below the border
     let btn_h = (h as i32 - 10).max(1); // waybar: margin 3px + 2px border
     let btn_y = ((h as i32 - btn_h) / 2 + 1).max(0);
 
-    // ── left: ◑ launcher (padding 0 10px, like #custom-launcher) ──
+    // ── launcher geometry (padding 0 10px, like #custom-launcher). Where it
+    // is drawn depends on the look: pinned left, or the first item of the
+    // centred group Windows 11 puts in the middle of the bar. Both need the
+    // right side measured first, so only the size is computed here. ──
     let d = (h as i32 * 18) / 34; // ≈18px glyph in a 34px bar
     let ly = (h as i32 - d) / 2;
-    let launcher_hit = (0, 10 + d + 10);
-    if hover == Hover::Launcher {
-        cv.round_rect_a(2, btn_y, launcher_hit.1 - 4, btn_h, 6, MENU_HOVER, 0.45);
-    }
-    cv.disc_half(10, ly, d, LAUNCH);
+    let launcher_w = 10 + d + 10;
 
     // ── right side first, so the taskbar knows where to stop ──
-    let left_min = launcher_hit.1 + 8;
+    let left_min = launcher_w + 8;
     let mut rx = w as i32 - 4;
     let mut clock_hit = (0, 0);
     let mut vol_hit = (0, 0);
@@ -1993,20 +2077,35 @@ fn draw_task(
         let pw_w = pw_size + 16;
         if rx - pw_w >= left_min {
             rx -= pw_w;
-            let pill = if hover == Hover::Power { PILL_HOVER } else { PILL };
+            let pill = if hover == Hover::Power { pal().pill_hover } else { pal().pill };
             cv.round_rect(rx, btn_y, pw_w, btn_h, 6, pill);
-            cv.power_icon(rx + (pw_w - pw_size) / 2, btn_y + (btn_h - pw_size) / 2, pw_size, WHITE);
+            cv.power_icon(rx + (pw_w - pw_size) / 2, btn_y + (btn_h - pw_size) / 2, pw_size, pal().white);
             power_hit = (rx, rx + pw_w);
             rx -= 10;
         }
 
-        // clock: rounded pill, bold — click for calendar.
-        let pw = Canvas::text_width(&m.clock) + 20;
+        // Clock: a rounded pill, click for the calendar. In the KDE look it
+        // is Plasma's digital clock — time over date, two lines — which is
+        // also where the date goes when there is no top bar to carry it.
+        let two_line = single_bar() && h as i32 >= 2 * GLYPH_H + 10;
+        let pw = if two_line {
+            Canvas::text_width(&m.clock).max(Canvas::text_width(&m.date)) + 20
+        } else {
+            Canvas::text_width(&m.clock) + 20
+        };
         if rx - pw >= left_min {
             rx -= pw;
-            let pill = if hover == Hover::Clock { PILL_HOVER } else { PILL };
+            let pill = if hover == Hover::Clock { pal().pill_hover } else { pal().pill };
             cv.round_rect(rx, btn_y, pw, btn_h, 6, pill);
-            cv.text_bold(&m.clock, rx + 10, ty, TEXT);
+            if two_line {
+                let y0 = (h as i32 - (2 * GLYPH_H + 2)) / 2;
+                let cw = Canvas::text_width(&m.clock);
+                let dw = Canvas::text_width(&m.date);
+                cv.text_bold(&m.clock, rx + (pw - cw) / 2, y0, pal().text);
+                cv.text(&m.date, rx + (pw - dw) / 2, y0 + GLYPH_H + 2, pal().muted);
+            } else {
+                cv.text_bold(&m.clock, rx + 10, ty, pal().text);
+            }
             clock_hit = (rx, rx + pw);
             rx -= 10;
         }
@@ -2016,9 +2115,9 @@ fn draw_task(
         let kw = Canvas::text_width(kbd) + 16;
         if rx - kw >= left_min {
             rx -= kw;
-            let pill = if hover == Hover::Kbd { PILL_HOVER } else { PILL };
+            let pill = if hover == Hover::Kbd { pal().pill_hover } else { pal().pill };
             cv.round_rect(rx, btn_y, kw, btn_h, 6, pill);
-            cv.text_bold(kbd, rx + 8, ty, TEXT);
+            cv.text_bold(kbd, rx + 8, ty, pal().text);
             kbd_hit = (rx, rx + kw);
             rx -= 10;
         }
@@ -2029,7 +2128,7 @@ fn draw_task(
             let vw = Canvas::text_width(&vol_str) + 10;
             if rx - vw >= left_min {
                 rx -= vw;
-                let col = if hover == Hover::Volume { WHITE } else { MUTED };
+                let col = if hover == Hover::Volume { pal().white } else { pal().muted };
                 cv.text(&vol_str, rx, ty, col);
                 vol_hit = (rx, rx + vw);
                 rx -= 10;
@@ -2040,7 +2139,7 @@ fn draw_task(
         let mw = Canvas::text_width(&mem_s) + 10;
         if rx - mw >= left_min {
             rx -= mw;
-            let col = if m.mem.unwrap_or(0) >= 90 { WARN } else { MUTED };
+            let col = if m.mem.unwrap_or(0) >= 90 { pal().warn } else { pal().muted };
             cv.text(&mem_s, rx, ty, col);
             rx -= 10;
         }
@@ -2049,16 +2148,24 @@ fn draw_task(
         let cw = Canvas::text_width(&cpu_s) + 10;
         if rx - cw >= left_min {
             rx -= cw;
-            let col = if m.cpu.unwrap_or(0) >= 90 { WARN } else { MUTED };
+            let col = if m.cpu.unwrap_or(0) >= 90 { pal().warn } else { pal().muted };
             cv.text(&cpu_s, rx, ty, col);
             rx -= 10;
+        }
+
+        // Network throughput, in the KDE look only: with a single panel this
+        // is the one place it can live, and it is what Plasma's tray shows.
+        if single_bar() {
+            if let Some(n) = m.net.as_ref() {
+                if let Some(x) = net_module(cv, rx, left_min, ty, h as i32, n) {
+                    rx = x - 10;
+                }
+            }
         }
     }
 
     // ── taskbar window buttons ──
     let mut hits = Vec::new();
-    let x0 = launcher_hit.1;
-    let avail = (rx - 8) - x0;
     let n = items.len() as i32;
     let is = (btn_h - 6).clamp(12, 24);
     let icon_pad = is + 6;
@@ -2066,20 +2173,38 @@ fn draw_task(
         .iter()
         .map(|it| Canvas::text_width(&it.label) + 16 + icon_pad)
         .collect();
-    if n > 0 {
-        let gaps = 4 * (n - 1);
-        let natural: i32 = widths.iter().sum::<i32>() + gaps;
-        if natural > avail {
-            // Force equal widths so every window keeps a hitbox — never drop
-            // buttons with `break` (that contradicted "shrink to fit").
-            let each = if avail > gaps {
-                ((avail - gaps) / n).max(1)
-            } else {
-                1
-            };
-            for bw in widths.iter_mut() {
-                *bw = each;
-            }
+    let gaps = if n > 0 { 4 * (n - 1) } else { 0 };
+    let natural: i32 = widths.iter().sum::<i32>() + gaps;
+    // Windows 11 centres Start and the window buttons as one group between
+    // the left edge and the tray. When they do not fit, it falls back to the
+    // left-pinned layout every other look uses, rather than overlapping.
+    let group = launcher_w + natural;
+    // Centred on the SCREEN, not on the space left of the tray: Windows 11
+    // puts the group in the middle of the bar and lets the tray sit where it
+    // sits. Clamped so a wide group slides left instead of running under it.
+    let lx = if centered_tasks() && group <= (rx - 8) {
+        (((w as i32 - group) / 2).max(0)).min((rx - 8 - group).max(0))
+    } else {
+        0
+    };
+    let launcher_hit = (lx, lx + launcher_w);
+    if hover == Hover::Launcher {
+        cv.round_rect_a(lx + 2, btn_y, launcher_w - 4, btn_h, 6, pal().menu_hover, 0.45);
+    }
+    cv.disc_half(lx + 10, ly, d, pal().accent);
+
+    let x0 = launcher_hit.1;
+    let avail = (rx - 8) - x0;
+    if n > 0 && natural > avail {
+        // Force equal widths so every window keeps a hitbox — never drop
+        // buttons with `break` (that contradicted "shrink to fit").
+        let each = if avail > gaps {
+            ((avail - gaps) / n).max(1)
+        } else {
+            1
+        };
+        for bw in widths.iter_mut() {
+            *bw = each;
         }
     }
     let mut x = x0;
@@ -2095,10 +2220,10 @@ fn draw_task(
         }
         let hovered = hover == Hover::Task(it.tid);
         if it.active {
-            cv.round_rect(x, btn_y, bw, btn_h, 6, BTN_ACTIVE);
-            cv.active_line(x, btn_y + btn_h - 2, bw, LAUNCH);
+            cv.round_rect(x, btn_y, bw, btn_h, 6, pal().btn_active);
+            cv.active_line(x, btn_y + btn_h - 2, bw, pal().accent);
         } else if hovered {
-            cv.round_rect_a(x, btn_y, bw, btn_h, 6, MENU_HOVER, 0.55);
+            cv.round_rect_a(x, btn_y, bw, btn_h, 6, pal().menu_hover, 0.55);
         }
         let text_avail = bw - 16 - icon_pad;
         let icon_only = text_avail < GLYPH_W;
@@ -2108,7 +2233,7 @@ fn draw_task(
             Some(pm) => cv.pixmap(ix, iy, &pm),
             None => {
                 let ch = it.label.chars().next().unwrap_or('?');
-                cv.badge(ix, iy, is, ch, PILL, LAUNCH);
+                cv.badge(ix, iy, is, ch, pal().pill, pal().accent);
             }
         }
         let mut cut = false;
@@ -2125,11 +2250,11 @@ fn draw_task(
                 it.label.clone()
             };
             let fg = if it.active {
-                WHITE
+                pal().white
             } else if it.minimized {
-                DIM
+                pal().dim
             } else {
-                MUTED
+                pal().muted
             };
             cv.text(&label, x + 8 + icon_pad, ty, fg);
         }
@@ -2167,7 +2292,7 @@ fn metric(
     if let Some(f) = gauge {
         let ghh = 7;
         let gy = (h - ghh) / 2;
-        cv.gauge(x, gy, gw, ghh, f, PILL);
+        cv.gauge(x, gy, gw, ghh, f, pal().pill);
     }
     cv.text(label, x + gw + gpad, ty, col);
     Some(x)
@@ -2186,20 +2311,20 @@ fn net_module(cv: &mut Canvas, right: i32, min_x: i32, ty: i32, h: i32, n: &NetR
         return None;
     }
     let mut cx = x;
-    cv.triangle(cx, ty_tri, ts, false, LAUNCH);
+    cv.triangle(cx, ty_tri, ts, false, pal().accent);
     cx += ts + 4;
-    cx += cv.text(&down, cx, ty, MUTED);
+    cx += cv.text(&down, cx, ty, pal().muted);
     cx += 10;
-    cv.triangle(cx, ty_tri, ts, true, LAUNCH);
+    cv.triangle(cx, ty_tri, ts, true, pal().accent);
     cx += ts + 4;
-    cv.text(&up, cx, ty, MUTED);
+    cv.text(&up, cx, ty, pal().muted);
     Some(x)
 }
 
 fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover: Hover) -> ((i32, i32), (i32, i32), (i32, i32)) {
-    cv.clear(BAR_BG);
-    cv.hline(0, h as i32 - 1, w as i32, BAR_RULE, 1.0);
-    cv.hline(0, h as i32 - 2, w as i32, BAR_RULE, 1.0);
+    clear_bar(cv, w, h);
+    cv.hline(0, h as i32 - 1, w as i32, pal().rule, 1.0);
+    cv.hline(0, h as i32 - 2, w as i32, pal().rule, 1.0);
 
     let ty = (h as i32 - 2 - GLYPH_H) / 2;
     let hi = h as i32;
@@ -2212,22 +2337,22 @@ fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover: Hover) -> 
     let wordmark_w = Canvas::text_width("eclipse");
     let launcher_hit = (0, lx + wordmark_w + 4);
     if hover == Hover::Launcher {
-        cv.round_rect_a(2, btn_y, launcher_hit.1 - 4, btn_h, 6, MENU_HOVER, 0.45);
+        cv.round_rect_a(2, btn_y, launcher_hit.1 - 4, btn_h, 6, pal().menu_hover, 0.45);
     }
-    cv.crescent(10, ly, d, LAUNCH);
-    lx += cv.text_bold("eclipse", lx, ty, TEXT);
+    cv.crescent(10, ly, d, pal().accent);
+    lx += cv.text_bold("eclipse", lx, ty, pal().text);
 
     if let Some(up) = &m.uptime {
         lx += 12;
-        cv.vrule(lx, hi, BAR_RULE);
+        cv.vrule(lx, hi, pal().rule);
         lx += 12;
-        lx += cv.text(&format!("up {up}"), lx, ty, MUTED);
+        lx += cv.text(&format!("up {up}"), lx, ty, pal().muted);
     }
     if let Some(load) = m.load {
         lx += 12;
-        cv.vrule(lx, hi, BAR_RULE);
+        cv.vrule(lx, hi, pal().rule);
         lx += 12;
-        lx += cv.text(&format!("load {load:.2}"), lx, ty, MUTED);
+        lx += cv.text(&format!("load {load:.2}"), lx, ty, pal().muted);
     }
 
     let min_x = lx + 12;
@@ -2240,9 +2365,9 @@ fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover: Hover) -> 
         let pw_w = pw_size + 16;
         if rx - pw_w >= min_x {
             rx -= pw_w;
-            let pill = if hover == Hover::Power { PILL_HOVER } else { PILL };
+            let pill = if hover == Hover::Power { pal().pill_hover } else { pal().pill };
             cv.round_rect(rx, btn_y, pw_w, btn_h, 6, pill);
-            cv.power_icon(rx + (pw_w - pw_size) / 2, btn_y + (btn_h - pw_size) / 2, pw_size, WHITE);
+            cv.power_icon(rx + (pw_w - pw_size) / 2, btn_y + (btn_h - pw_size) / 2, pw_size, pal().white);
             power_hit = (rx, rx + pw_w);
             rx -= 10;
         }
@@ -2250,26 +2375,26 @@ fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover: Hover) -> 
         let pw = Canvas::text_width(&m.date) + 20;
         if rx - pw >= min_x {
             rx -= pw;
-            let pill = if hover == Hover::Clock { PILL_HOVER } else { PILL };
+            let pill = if hover == Hover::Clock { pal().pill_hover } else { pal().pill };
             cv.round_rect(rx, btn_y, pw, btn_h, 6, pill);
-            cv.text_bold(&m.date, rx + 10, ty, TEXT);
+            cv.text_bold(&m.date, rx + 10, ty, pal().text);
             clock_hit = (rx, rx + pw);
             rx -= 10;
         }
     }
     if let Some((b, ch)) = m.batt {
         let label = if ch { format!("bat {b}% +") } else { format!("bat {b}%") };
-        let col = if b < 15 && !ch { WARN } else { MUTED };
+        let col = if b < 15 && !ch { pal().warn } else { pal().muted };
         if let Some(x) = metric(cv, rx - 10, min_x, ty, hi, &label, Some(b as f32 / 100.0), col) {
             rx = x - 12;
-            cv.vrule(rx, hi, BAR_RULE);
+            cv.vrule(rx, hi, pal().rule);
         }
     }
     if let Some(t) = m.temp {
-        let col = if t >= 85 { WARN } else { MUTED };
+        let col = if t >= 85 { pal().warn } else { pal().muted };
         if let Some(x) = metric(cv, rx - 10, min_x, ty, hi, &format!("{t}°c"), None, col) {
             rx = x - 12;
-            cv.vrule(rx, hi, BAR_RULE);
+            cv.vrule(rx, hi, pal().rule);
         }
     }
     if let Some(dk) = m.disk {
@@ -2281,10 +2406,10 @@ fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover: Hover) -> 
             hi,
             &format!("disk {dk}%"),
             Some(dk as f32 / 100.0),
-            MUTED,
+            pal().muted,
         ) {
             rx = x - 12;
-            cv.vrule(rx, hi, BAR_RULE);
+            cv.vrule(rx, hi, pal().rule);
         }
     }
     if let Some(n) = &m.net {
@@ -2337,32 +2462,38 @@ fn draw_apps(
     cv.fill_rect_a(0, 0, ow as i32, oh as i32, (0, 0, 0), 0.35);
 
     let pw = APPS_PW;
-    let px = 8;
+    // Pinned to the left edge, under the launcher — except in the Windows 11
+    // look, where the launcher itself is centred and so is its menu.
+    let px = if centered_tasks() {
+        ((ow as i32 - pw) / 2).max(8)
+    } else {
+        8
+    };
     let rows_fit = apps_rows_fit(oh as i32, bar_h);
     let shown = visible.len().clamp(1, rows_fit) as i32; // >=1: empty-state row
     let ph = APPS_HEADER_H + APPS_SEARCH_H + shown * APPS_ROW_H + APPS_PAD;
     let bottom = oh as i32 - bar_h - 6;
     let py = (bottom - ph).max(bar_h + 8);
 
-    cv.round_rect_a(px, py, pw, ph, 12, MENU_PANEL, 0.98);
+    cv.round_rect_a(px, py, pw, ph, 12, pal().menu_panel, 0.98);
     // Violet accent rule under the header.
-    cv.hline(px + 10, py + APPS_HEADER_H - 1, pw - 20, BAR_RULE, 0.7);
+    cv.hline(px + 10, py + APPS_HEADER_H - 1, pw - 20, pal().rule, 0.7);
 
     // Header: crescent + title + result count.
     let icon = 18;
-    cv.crescent(px + 12, py + (APPS_HEADER_H - icon) / 2, icon, LAUNCH);
+    cv.crescent(px + 12, py + (APPS_HEADER_H - icon) / 2, icon, pal().accent);
     cv.text_bold(
         i18n::Lang::current().apps_title(),
         px + 12 + icon + 10,
         py + (APPS_HEADER_H - GLYPH_H) / 2,
-        TEXT,
+        pal().text,
     );
     let count = visible.len().to_string();
     cv.text(
         &count,
         px + pw - 12 - Canvas::text_width(&count),
         py + (APPS_HEADER_H - GLYPH_H) / 2,
-        DIM,
+        pal().dim,
     );
 
     // Search field: what has been typed filters the list live.
@@ -2370,19 +2501,19 @@ fn draw_apps(
     let sy = py + APPS_HEADER_H + 6;
     let sw = pw - 20;
     let sh = APPS_SEARCH_H - 10;
-    cv.round_rect(sx, sy, sw, sh, 6, PILL);
+    cv.round_rect(sx, sy, sw, sh, 6, pal().pill);
     let f_y = sy + (sh - GLYPH_H) / 2;
     let caret_x = if filter.is_empty() {
-        cv.text(i18n::Lang::current().apps_search(), sx + 10, f_y, DIM);
+        cv.text(i18n::Lang::current().apps_search(), sx + 10, f_y, pal().dim);
         sx + 10
     } else {
         // popup_key caps the filter at APPS_FILTER_MAX — exactly what fits
         // here — so the whole filter always renders.
-        sx + 10 + cv.text(filter, sx + 10, f_y, TEXT)
+        sx + 10 + cv.text(filter, sx + 10, f_y, pal().text)
     };
     // Solid, not blinking: the overlay is output-sized, so a blink would cost
     // a full-screen repaint + composite every second (see the tick loop).
-    cv.fill_rect_a(caret_x + 1, sy + 4, 2, sh - 8, LAUNCH, 0.9);
+    cv.fill_rect_a(caret_x + 1, sy + 4, 2, sh - 8, pal().accent, 0.9);
 
     // Rows (the scroll window over `visible`).
     let list_top = py + APPS_HEADER_H + APPS_SEARCH_H;
@@ -2392,7 +2523,7 @@ fn draw_apps(
             "sin resultados",
             px + 14,
             list_top + (APPS_ROW_H - GLYPH_H) / 2,
-            DIM,
+            pal().dim,
         );
     } else {
         let is = 20; // row icon slot
@@ -2400,7 +2531,7 @@ fn draw_apps(
             let y = list_top + (row - scroll) as i32 * APPS_ROW_H;
             let selected = row == sel;
             if selected {
-                cv.round_rect_a(px + 5, y + 1, pw - 10, APPS_ROW_H - 2, 6, MENU_HOVER, 1.0);
+                cv.round_rect_a(px + 5, y + 1, pw - 10, APPS_ROW_H - 2, 6, pal().menu_hover, 1.0);
             }
             let e = &all[ai];
             // Icon slot: the entry's Icon=, else its name against the theme
@@ -2415,10 +2546,10 @@ fn draw_apps(
                 Some(pm) => cv.pixmap(px + 12, iy, &pm),
                 None => {
                     let ch = e.name.chars().next().unwrap_or('?');
-                    cv.badge(px + 12, iy, is, ch, PILL, LAUNCH);
+                    cv.badge(px + 12, iy, is, ch, pal().pill, pal().accent);
                 }
             }
-            let col = if selected { TEXT } else { MUTED };
+            let col = if selected { pal().text } else { pal().muted };
             // Truncate long names to the panel width (font is ISO-8859-1, so a
             // plain '.' marks truncation, not the '…' glyph it lacks).
             let tx = px + 12 + is + 10;
@@ -2436,11 +2567,11 @@ fn draw_apps(
             let track_h = rows_fit as i32 * APPS_ROW_H - 8;
             let tx = px + pw - 7;
             let ty0 = list_top + 4;
-            cv.round_rect_a(tx, ty0, 3, track_h, 1, MUTED, 0.15);
+            cv.round_rect_a(tx, ty0, 3, track_h, 1, pal().muted, 0.15);
             let th = ((rows_fit as f32 / visible.len() as f32) * track_h as f32).max(18.0) as i32;
             let denom = (visible.len() - rows_fit).max(1) as f32;
             let toff = ((track_h - th) as f32 * scroll as f32 / denom) as i32;
-            cv.round_rect_a(tx, ty0 + toff, 3, th, 1, LAUNCH, 0.6);
+            cv.round_rect_a(tx, ty0 + toff, 3, th, 1, pal().accent, 0.6);
         }
     }
 
@@ -2477,21 +2608,21 @@ fn draw_calendar(
         (oh as i32 - bar_h - 6 - ph).max(bar_h + 6)
     };
 
-    cv.round_rect_a(px, py, pw, ph, 12, MENU_PANEL, 0.98);
-    cv.hline(px + 10, py + header_h - 1, pw - 20, BAR_RULE, 0.7);
+    cv.round_rect_a(px, py, pw, ph, 12, pal().menu_panel, 0.98);
+    cv.hline(px + 10, py + header_h - 1, pw - 20, pal().rule, 0.7);
 
     // Header: ◂ month year ▸.
     let ts = 10;
     let ay = py + (header_h - ts) / 2;
-    cv.triangle_h(px + 16, ay, ts, true, LAUNCH);
-    cv.triangle_h(px + pw - 16 - ts, ay, ts, false, LAUNCH);
+    cv.triangle_h(px + 16, ay, ts, true, pal().accent);
+    cv.triangle_h(px + pw - 16 - ts, ay, ts, false, pal().accent);
     let title = format!(
         "{} {}",
         i18n::Lang::current().month_full()[month as usize % 12],
         year
     );
     let tw = Canvas::text_width(&title);
-    cv.text_bold(&title, px + (pw - tw) / 2, py + (header_h - GLYPH_H) / 2, TEXT);
+    cv.text_bold(&title, px + (pw - tw) / 2, py + (header_h - GLYPH_H) / 2, pal().text);
     let hits = vec![
         (px + 4, py, px + 44, py + header_h, Action::PrevMonth),
         (px + pw - 44, py, px + pw - 4, py + header_h, Action::NextMonth),
@@ -2501,7 +2632,7 @@ fn draw_calendar(
     let wkd = i18n::Lang::current().weekday_mon_first();
     for (i, wd) in wkd.iter().enumerate() {
         let x = px + pad + i as i32 * cell_w + (cell_w - Canvas::text_width(wd)) / 2;
-        cv.text(wd, x, py + header_h + (wkd_h - GLYPH_H) / 2, DIM);
+        cv.text(wd, x, py + header_h + (wkd_h - GLYPH_H) / 2, pal().dim);
     }
 
     // Day grid (6 rows always, so the panel height is stable across months).
@@ -2518,11 +2649,11 @@ fn draw_calendar(
         let tx = x + (cell_w - Canvas::text_width(&s)) / 2;
         let dy = y + (cell_h - GLYPH_H) / 2;
         if today == Some((year, month, d as u32)) {
-            cv.round_rect(x + 2, y + 1, cell_w - 4, cell_h - 2, 6, BAR_RULE);
-            cv.text_bold(&s, tx, dy, WHITE);
+            cv.round_rect(x + 2, y + 1, cell_w - 4, cell_h - 2, 6, pal().rule);
+            cv.text_bold(&s, tx, dy, pal().white);
         } else {
             // Weekend columns slightly dimmed, like every desktop calendar.
-            let c = if col >= 5 { DIM } else { MUTED };
+            let c = if col >= 5 { pal().dim } else { pal().muted };
             cv.text(&s, tx, dy, c);
         }
     }
@@ -2549,8 +2680,8 @@ fn draw_power_menu(
         (oh as i32 - bar_h - 6 - ph).max(bar_h + 6)
     };
 
-    cv.round_rect_a(px, py, pw, ph, 10, MENU_PANEL, 0.98);
-    cv.round_rect_a(px, py, pw, ph, 10, BAR_RULE, 0.4);
+    cv.round_rect_a(px, py, pw, ph, 10, pal().menu_panel, 0.98);
+    cv.round_rect_a(px, py, pw, ph, 10, pal().rule, 0.4);
 
     let items = [
         (i18n::Lang::current().power_lock(), Action::PowerLock),
@@ -2574,13 +2705,13 @@ fn draw_power_menu(
         let ty = ry + (row_h - GLYPH_H) / 2;
 
         match act {
-            Action::PowerLock => cv.lock_icon(ix, iy, 14, WHITE),
-            Action::PowerLogout => cv.exit_icon(ix, iy, 14, WHITE),
-            Action::PowerReboot => cv.reboot_icon(ix, iy, 14, WHITE),
-            Action::PowerShutdown => cv.power_icon(ix, iy, 14, WHITE),
+            Action::PowerLock => cv.lock_icon(ix, iy, 14, pal().white),
+            Action::PowerLogout => cv.exit_icon(ix, iy, 14, pal().white),
+            Action::PowerReboot => cv.reboot_icon(ix, iy, 14, pal().white),
+            Action::PowerShutdown => cv.power_icon(ix, iy, 14, pal().white),
             _ => {}
         }
-        cv.text(label, tx, ty, TEXT);
+        cv.text(label, tx, ty, pal().text);
         hits.push((px + 6, ry, px + pw - 6, ry + row_h, *act));
     }
 
@@ -2604,8 +2735,8 @@ fn draw_task_menu(
     let px = (ow as i32 - pw - 10).max(0);
     let py = (oh as i32 - bar_h - 6 - ph).max(bar_h + 6);
 
-    cv.round_rect_a(px, py, pw, ph, 10, MENU_PANEL, 0.98);
-    cv.round_rect_a(px, py, pw, ph, 10, BAR_RULE, 0.4);
+    cv.round_rect_a(px, py, pw, ph, 10, pal().menu_panel, 0.98);
+    cv.round_rect_a(px, py, pw, ph, 10, pal().rule, 0.4);
 
     let max_chars = ((pw - 24) / GLYPH_W) as usize;
     let head: String = if title.chars().count() > max_chars {
@@ -2613,8 +2744,8 @@ fn draw_task_menu(
     } else {
         title.to_string()
     };
-    cv.text_bold(&head, px + 12, py + 10, DIM);
-    cv.hline(px + 10, py + 30, pw - 20, BAR_RULE, 0.5);
+    cv.text_bold(&head, px + 12, py + 10, pal().dim);
+    cv.hline(px + 10, py + 30, pw - 20, pal().rule, 0.5);
 
     let items = [
         ("enfocar", Action::TaskFocus(tid)),
@@ -2630,7 +2761,7 @@ fn draw_task_menu(
         let ry = y0 + i as i32 * row_h;
         let tx = px + 16;
         let ty = ry + (row_h - GLYPH_H) / 2;
-        cv.text(label, tx, ty, TEXT);
+        cv.text(label, tx, ty, pal().text);
         hits.push((px + 6, ry, px + pw - 6, ry + row_h, *act));
     }
 
@@ -2653,16 +2784,16 @@ fn draw_volume_menu(
     let px = (ow as i32 - pw - 60).max(0);
     let py = (oh as i32 - bar_h - 6 - ph).max(bar_h + 6);
 
-    cv.round_rect_a(px, py, pw, ph, 10, MENU_PANEL, 0.98);
+    cv.round_rect_a(px, py, pw, ph, 10, pal().menu_panel, 0.98);
 
-    cv.volume_icon(px + 14, py + 14, 16, WHITE, vol == 0);
+    cv.volume_icon(px + 14, py + 14, 16, pal().white, vol == 0);
     let label = format!("volumen {}%", vol);
-    cv.text_bold(&label, px + 40, py + 16, TEXT);
+    cv.text_bold(&label, px + 40, py + 16, pal().text);
 
     let mut hits = Vec::new();
     let gw = pw - 30;
     let gy = py + 48;
-    cv.gauge(px + 15, gy, gw, 10, vol as f32 / 100.0, PILL);
+    cv.gauge(px + 15, gy, gw, 10, vol as f32 / 100.0, pal().pill);
     // One continuous hitbox — percent is derived from the click x.
     hits.push((px + 15, gy - 10, px + 15 + gw, gy + 20, Action::VolumeGauge));
 
@@ -2674,9 +2805,9 @@ fn draw_volume_menu(
 /// Paint the taskbar tooltip: a hairline-bordered dark pill with the window's
 /// full title.
 fn draw_tooltip(cv: &mut Canvas, w: usize, h: usize, text: &str) {
-    cv.round_rect_a(0, 0, w as i32, h as i32, 6, BAR_RULE, 0.85);
-    cv.round_rect_a(1, 1, w as i32 - 2, h as i32 - 2, 5, MENU_PANEL, 1.0);
-    cv.text(text, 8, (h as i32 - GLYPH_H) / 2, TEXT);
+    cv.round_rect_a(0, 0, w as i32, h as i32, 6, pal().rule, 0.85);
+    cv.round_rect_a(1, 1, w as i32 - 2, h as i32 - 2, 5, pal().menu_panel, 1.0);
+    cv.text(text, 8, (h as i32 - GLYPH_H) / 2, pal().text);
 }
 
 // ── Small helpers ────────────────────────────────────────────────────────────
@@ -2698,19 +2829,6 @@ fn filter_apps(all: &[apps::AppEntry], filter: &str) -> Vec<usize> {
 /// Printable ASCII for a bare evdev keycode (KEY_1=2 … KEY_M=50), assuming
 /// the standard QWERTY core (letters/digits are position-stable across
 /// layouts; good enough for menu filtering without pulling in xkb).
-fn key_char(code: u32) -> Option<char> {
-    Some(match code {
-        2..=10 => (b'1' + (code - 2) as u8) as char, // KEY_1..KEY_9
-        11 => '0',                                   // KEY_0
-        16..=25 => b"qwertyuiop"[(code - 16) as usize] as char,
-        30..=38 => b"asdfghjkl"[(code - 30) as usize] as char,
-        44..=50 => b"zxcvbnm"[(code - 44) as usize] as char,
-        57 => ' ',
-        12 => '-',
-        52 => '.',
-        _ => return None,
-    })
-}
 
 /// A short, font-renderable button label for a window: prefer the title (what
 /// waybar's `{title:.18}` showed), fall back to app_id, capped so buttons stay
@@ -3575,12 +3693,18 @@ fn main() {
         kill_stale_instances();
     }
     // Minimum 26: the 15px font plus the h-10 pill height — anything shorter
-    // draws glyphs taller than the pills that frame them.
+    // draws glyphs taller than the pills that frame them. The default follows
+    // the look: 44 is Plasma's panel height, and the KDE layout needs the room
+    // for a two-line clock; 34 is what the waybar config this replaces used.
     let height: u32 = std::env::var("LUNARBAR_HEIGHT")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|h| (26..=64).contains(h))
-        .unwrap_or(34); // waybar's configured height
+        .unwrap_or(match look() {
+            Look::Win11 => 48, // Windows 11's taskbar height
+            Look::Kde => 44,   // Plasma's default panel height
+            Look::Eclipse => 34, // what the waybar config this replaces used
+        });
     let terminal = std::env::var("LUNARBAR_TERMINAL")
         .unwrap_or_else(|_| "/usr/local/bin/eclipse-terminal".into());
 
@@ -3632,11 +3756,12 @@ fn main() {
             kbd: sysinfo::kbd_layout(),
         };
 
-        // Top info bar occupies rows [0, bh).
-        {
+        // Top info bar occupies rows [0, bh) — in the KDE look there is no
+        // top bar, so the preview shows what the session shows: wallpaper.
+        if !single_bar() {
             let mut cv = Canvas::new(w, bh);
             draw_info(&mut cv, w, bh, &m, Hover::None);
-            let _ = cv.blit_xrgb(&mut buf[..w * bh * 4]);
+            blit_preview(&cv, &mut buf[..w * bh * 4], w, bh);
         }
         // Bottom taskbar occupies rows [full_h-bh, full_h) with sample windows
         // (one accented to exercise the ISO-8859-1 font, one minimized, one
@@ -3666,7 +3791,7 @@ fn main() {
             // Hover the 4th sample (tid 4 — mk numbers them from 1), so the
             // preview exercises the hover highlight on a truncated button.
             draw_task(&mut cv, w, bh, &sample, &m, Hover::Task(4), &mut ic);
-            let _ = cv.blit_xrgb(&mut buf[off..off + w * bh * 4]);
+            blit_preview(&cv, &mut buf[off..off + w * bh * 4], w, bh);
         }
 
         // Optional: composite open launcher menu (LUNARBAR_DUMP_MENU=1),

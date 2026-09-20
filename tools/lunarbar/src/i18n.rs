@@ -56,6 +56,49 @@ impl Lang {
         }
     }
 
+    /// lunarrun's own strings.
+    pub fn run_title(self) -> &'static str {
+        match self {
+            Lang::Es => "ejecutar",
+            Lang::En => "run",
+        }
+    }
+
+    pub fn run_hint(self) -> &'static str {
+        match self {
+            Lang::Es => "escribe para buscar o ejecutar",
+            Lang::En => "type to search or run",
+        }
+    }
+
+    pub fn run_command(self) -> &'static str {
+        match self {
+            Lang::Es => "ejecutar orden",
+            Lang::En => "run command",
+        }
+    }
+
+    pub fn run_empty(self) -> &'static str {
+        match self {
+            Lang::Es => "sin resultados",
+            Lang::En => "no results",
+        }
+    }
+
+    pub fn run_keys(self) -> &'static str {
+        match self {
+            Lang::Es => "Intro ejecuta   Esc cierra",
+            Lang::En => "Enter runs   Esc closes",
+        }
+    }
+
+    pub fn run_reload(self) -> &'static str {
+        match self {
+            Lang::Es => "recargar labwc",
+            Lang::En => "reload labwc",
+        }
+    }
+
     pub fn power_lock(self) -> &'static str {
         match self {
             Lang::Es => "bloquear",

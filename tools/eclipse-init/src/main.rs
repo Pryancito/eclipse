@@ -258,6 +258,7 @@ fn main() {
     apply_keyboard_layout();
     apply_locale();
     apply_timezone();
+    apply_look();
 
     let mut services = load_services(Path::new("/etc/eclipse/services"));
 
@@ -610,6 +611,20 @@ fn overlay_locale(env: &mut Vec<CString>) {
     };
     env.push(CString::new(format!("LANG={posix}")).unwrap());
     env.push(CString::new(format!("LANGUAGE={language}")).unwrap());
+}
+
+/// Apply `/etc/eclipse/look` / cmdline `look=` before the compositor starts:
+/// the labwc theme name in `rc.xml` and the foot palette. The panel reads the
+/// same file itself when it starts, so nothing else needs telling.
+fn apply_look() {
+    match std::process::Command::new("/usr/local/bin/eclipse-look")
+        .arg("--boot")
+        .status()
+    {
+        Ok(st) if st.success() => {}
+        Ok(st) => log(&format!("eclipse-look --boot exited {st}")),
+        Err(e) => log(&format!("eclipse-look --boot skipped: {e}")),
+    }
 }
 
 fn apply_timezone() {
