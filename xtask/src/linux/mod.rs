@@ -2410,13 +2410,19 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         } else {
             b"# eclipse-generated ALSA routing (delete this line to take ownership).\n\
               #\n\
-              # Direct hw:0,0. PulseAudio was not in this image, so there is no\n\
-              # mixer daemon; one playback client at a time.\n\
-              # Format conversion: `aplay -D plug x.wav`.\n\
+              # hw:0,0 behind `plug`. PulseAudio was not in this image, so there\n\
+              # is no mixer daemon; one playback client at a time.\n\
+              #\n\
+              # `default` is the plug-wrapped device, as on any Linux distro:\n\
+              # the kernel PCM is S16LE stereo at the discrete HDA rates and\n\
+              # nothing else, so a bare `type hw` default turned every mono or\n\
+              # off-rate file into `cannot set hw params`. `plug` converts in\n\
+              # alsa-lib (it is core, not a loadable module) and passes an\n\
+              # already-matching stream through untouched.\n\
+              # Unconverted kernel access: `aplay -D eclipse_hw x.wav`.\n\
               pcm.!default {\n\
-              \x20   type hw\n\
-              \x20   card 0\n\
-              \x20   device 0\n\
+              \x20   type plug\n\
+              \x20   slave.pcm \"eclipse_hw\"\n\
               }\n\
               pcm.eclipse_hw {\n\
               \x20   type hw\n\
@@ -2425,7 +2431,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               }\n\
               pcm.plug {\n\
               \x20   type plug\n\
-              \x20   slave.pcm \"hw:0,0\"\n\
+              \x20   slave.pcm \"eclipse_hw\"\n\
               }\n\
               ctl.!default {\n\
               \x20   type hw\n\
