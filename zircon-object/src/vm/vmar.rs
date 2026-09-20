@@ -3517,10 +3517,10 @@ mod tests {
     /// the mappings themselves, the way `copy_on_write_update_mapping` does).
     #[test]
     fn decommit_unmaps_every_mapping() {
-        let vmar = VmAddressRegion::new_root();
+        let vmar = VmAddressRegion::new_root_zircon();
         let vmo = VmObject::new_paged(2);
         vmo.test_write(1, 7);
-        vmar.map_at(0, vmo.clone(), 0, 2 * PAGE_SIZE, MMUFlags::RXW)
+        vmar.map_at(0, vmo.clone(), 0, 2 * PAGE_SIZE, MMUFlags::READ)
             .unwrap();
         let addr = vmar.addr() + PAGE_SIZE;
         vmar.handle_page_fault(addr, MMUFlags::READ).unwrap();
@@ -3590,10 +3590,10 @@ mod tests {
             time::Duration,
         };
 
-        let vmar = VmAddressRegion::new_root();
+        let vmar = VmAddressRegion::new_root_zircon();
         let vmo = VmObject::new_paged(1);
         vmo.test_write(0, 7);
-        vmar.map_at(0, vmo.clone(), 0, PAGE_SIZE, MMUFlags::RXW)
+        vmar.map_at(0, vmo.clone(), 0, PAGE_SIZE, MMUFlags::READ)
             .unwrap();
         let addr = vmar.addr();
         let mapping = vmar.find_mapping(addr).unwrap();
@@ -3646,10 +3646,10 @@ mod tests {
     fn decommit_window_stays_open_through_the_unmap_pass() {
         use std::{sync::mpsc, time::Duration, time::Instant};
 
-        let vmar = VmAddressRegion::new_root();
+        let vmar = VmAddressRegion::new_root_zircon();
         let vmo = VmObject::new_paged(1);
         vmo.test_write(0, 7);
-        vmar.map_at(0, vmo.clone(), 0, PAGE_SIZE, MMUFlags::RXW)
+        vmar.map_at(0, vmo.clone(), 0, PAGE_SIZE, MMUFlags::READ)
             .unwrap();
         let mapping = vmar.find_mapping(vmar.addr()).unwrap();
         assert!(vmo.decommit_snapshot().is_some(), "quiescent to start with");
