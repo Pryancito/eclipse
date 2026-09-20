@@ -1467,6 +1467,9 @@ fn write_freedoom_wrapper(rootfs: &Path) {
           LOG=/tmp/freedoom.log\n\
           : > \"$LOG\" 2>/dev/null || true\n\
           exec >>\"$LOG\" 2>&1\n\
+          # Everything worth reading goes to the log AND to the console: this\n\
+          # runs from a desktop menu entry as often as from a shell.\n\
+          say() { echo \"$*\"; echo \"$*\" > /dev/console 2>/dev/null || true; }\n\
           # Which IWAD. `1`/`2` select the Freedoom phase; anything else is\n\
           # taken as a path to a WAD (so a real doom2.wad works too).\n\
           WHICH=\"${1:-2}\"\n\
@@ -1482,10 +1485,18 @@ fn write_freedoom_wrapper(rootfs: &Path) {
           \x20 *) IWAD=\"$WHICH\" ;;\n\
           esac\n\
           if [ -z \"$IWAD\" ] || [ ! -f \"$IWAD\" ]; then\n\
-          \x20 MSG='eclipse-freedoom: no IWAD found. Fix: apk add freedoom\n\
-          (needs network), or pass the path to a .wad as the first argument.'\n\
-          \x20 echo \"$MSG\"\n\
-          \x20 echo \"$MSG\" > /dev/console 2>/dev/null || true\n\
+          \x20 say 'eclipse-freedoom: no IWAD found. Directories searched:'\n\
+          \x20 for d in /usr/share/doom /usr/share/games/doom /usr/share/freedoom \\\n\
+          \x20 \x20 \x20 \x20 \x20 \x20 \"$HOME/.local/share/doom\"; do\n\
+          \x20 \x20 if [ -d \"$d\" ]; then\n\
+          \x20 \x20 \x20 say \"  $d: $(ls \"$d\" 2>/dev/null | tr '\\n' ' ')\"\n\
+          \x20 \x20 else\n\
+          \x20 \x20 \x20 say \"  $d: does not exist\"\n\
+          \x20 \x20 fi\n\
+          \x20 done\n\
+          \x20 say 'The wads ship in the image; if they are absent there the build'\n\
+          \x20 say 'dropped them. Meanwhile: pass a path to a .wad as the first'\n\
+          \x20 say 'argument, or copy freedoom2.wad into /usr/share/games/doom.'\n\
           \x20 exit 2\n\
           fi\n\
           echo \"eclipse-freedoom: iwad=$IWAD wlr_renderer=${WLR_RENDERER:-unset}\"\n\
@@ -1510,10 +1521,8 @@ fn write_freedoom_wrapper(rootfs: &Path) {
           \x20 echo \"eclipse-freedoom: engine gzdoom\"\n\
           \x20 exec gzdoom -iwad \"$IWAD\" \"$@\"\n\
           fi\n\
-          MSG='eclipse-freedoom: no Doom engine installed. Fix: apk add gzdoom\n\
-          (or chocolate-doom, which renders in software and is faster here).'\n\
-          echo \"$MSG\"\n\
-          echo \"$MSG\" > /dev/console 2>/dev/null || true\n\
+          say 'eclipse-freedoom: no Doom engine installed. gzdoom ships in the'\n\
+          say 'image; if it is absent there the build dropped it.'\n\
           exit 127\n",
     )
     .unwrap();
@@ -1603,20 +1612,39 @@ pub fn ensure_freedoom_iwads(rootfs: &Path) {
         let part = cache.join(format!("freedoom-{VERSION}.zip.part"));
         let _ = fs::remove_file(&part);
         println!("Freedoom: fetching the IWADs from {URL}");
-        let ok = std::process::Command::new("wget")
-            .arg("-q")
-            .arg("-O")
-            .arg(&part)
-            .arg(URL)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        // wget first, curl second: plenty of build hosts ship only one of the
+        // two, and `Command::status()` on a missing binary is an Err, not a
+        // failing exit code -- so a host without wget silently took the "could
+        // not download" path below and shipped an image with no game data.
+        let ok = [
+            ("wget", vec!["-q".to_string(), "-O".to_string()]),
+            (
+                "curl",
+                vec![
+                    "-fsSL".to_string(),
+                    "--retry".into(),
+                    "3".into(),
+                    "-o".into(),
+                ],
+            ),
+        ]
+        .into_iter()
+        .any(|(tool, args)| {
+            std::process::Command::new(tool)
+                .args(&args)
+                .arg(&part)
+                .arg(URL)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        });
         if !ok || fs::rename(&part, &zip).is_err() {
             let _ = fs::remove_file(&part);
             eprintln!(
-                "warning: Freedoom: could not download {URL} -- shipping without the \
-                 IWADs. The launcher will say so; `apk add freedoom` on the running \
-                 system, or drop a .wad into /usr/share/games/doom, fixes it."
+                "warning: Freedoom: neither wget nor curl could download {URL} -- \
+                 shipping without the IWADs. The launcher will say so; drop a .wad \
+                 into /usr/share/games/doom (in the rootfs or on the running \
+                 system) to fix it."
             );
             return;
         }
@@ -2850,6 +2878,17 @@ mod tests {
         assert!(
             src.contains("/tmp/freedoom.log"),
             "failures must be readable later"
+        );
+        // "no IWAD found" was a dead end: it named a fix (`apk add freedoom`)
+        // that cannot work on a machine with no mirror, and said nothing about
+        // where it had looked. The report has to be actionable on its own.
+        assert!(
+            src.contains("Directories searched:"),
+            "the no-IWAD path must name the directories it walked"
+        );
+        assert!(
+            !src.contains("apk add freedoom"),
+            "the wads ship in the image; `apk add` is not the fix"
         );
 
         for (file, phase) in [("freedoom1.desktop", "1"), ("freedoom2.desktop", "2")] {

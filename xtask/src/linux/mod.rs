@@ -109,6 +109,7 @@ impl LinuxRootfs {
             // After apk too: it only downloads the IWADs when the `freedoom`
             // package did not land, which is not known until apk has run.
             desktop::ensure_freedoom_iwads(&dir);
+            xorg::report_freedoom(&dir, "the rootfs");
             // After apk so we can see whether the PulseAudio plugin/binary
             // landed, and so /etc/pulse wins over anything the package dropped.
             Self::write_asound_conf(&dir);
@@ -203,6 +204,7 @@ impl LinuxRootfs {
         // After apk too: it only downloads the IWADs when the `freedoom`
         // package did not land, which is not known until apk has run.
         desktop::ensure_freedoom_iwads(&dir);
+        xorg::report_freedoom(&dir, "the rootfs");
         Self::install_ca_certs(&dir);
 
         // /etc/machine-id — prevents dhcp_vendor "No such file or directory".

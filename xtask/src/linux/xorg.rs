@@ -321,11 +321,22 @@ const DEFAULT_PACKAGES: &[&str] = &[
     //                    this stack and `eclipse-freedoom` prefers one when
     //                    installed; it is not in the default set because the
     //                    repo docs only ever verified gzdoom's name.
-    // Both are shipped rather than left to a runtime `apk add`: an installed
+    //   - bash:          the freedoom package installs `dist/freedoom` as
+    //                    /usr/bin/freedoom1 and /usr/bin/freedoom2, and that
+    //                    script is `#!/usr/bin/env bash` with a genuine bash
+    //                    array in it (`PATHS=( ... )` builds DOOMWADPATH), so
+    //                    busybox ash cannot run it. Without bash the launcher
+    //                    dies as `env: can't execute 'bash': No such file or
+    //                    directory` -- observed on real hardware. Alpine puts
+    //                    the binary in /bin, which the X_TREES merge below
+    //                    deliberately never copies, so it also needs the
+    //                    targeted copy further down.
+    // These are shipped rather than left to a runtime `apk add`: an installed
     // Eclipse has no mirror in reach on first boot, which is exactly when
     // somebody wants to see whether the desktop can run a game at all.
     "freedoom",
     "gzdoom",
+    "bash",
     "sdl2",
     "sdl3",
     "sdl12-compat",
@@ -752,6 +763,46 @@ pub(super) fn install(rootfs: &Path, apk_bin: &Path, arch: &str) {
             // the names that actually installed (per the audit above), never
             // drop or rewrite the base's own entries.
             merge_apk_world(&rootfs.join("etc/apk/world"), &packages, &installed);
+            // `bash`, file by file. X_TREES deliberately never merges `bin/`
+            // (the hand-staged busybox base would be clobbered), and Alpine's
+            // bash package puts its only binary at /bin/bash -- so asking for
+            // the package is not enough on its own: it installs into the
+            // staging root and is then dropped on the floor. That is why
+            // /usr/bin/freedoom2 shipped while `bash` did not, and the
+            // launcher died with `env: can't execute 'bash'`. Copy just the
+            // one binary, additively, and give it a /usr/bin/bash alias so
+            // both spellings of the shebang resolve.
+            {
+                let staged = ["bin/bash", "usr/bin/bash"]
+                    .into_iter()
+                    .map(|rel| stage.join(rel))
+                    .find(|p| p.is_file());
+                if let Some(src) = staged {
+                    let dst = rootfs.join("bin/bash");
+                    let _ = std::fs::create_dir_all(rootfs.join("bin"));
+                    let _ = std::fs::remove_file(&dst);
+                    if std::fs::copy(&src, &dst).is_ok() {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ =
+                            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755));
+                        let alias = rootfs.join("usr/bin/bash");
+                        if !alias.exists() && !alias.is_symlink() {
+                            let _ = std::fs::create_dir_all(rootfs.join("usr/bin"));
+                            let _ = std::os::unix::fs::symlink("../../bin/bash", &alias);
+                        }
+                        println!(
+                            "Xorg stack: installed /bin/bash (+ /usr/bin/bash) from the closure"
+                        );
+                    } else {
+                        eprintln!("warning: could not copy bash out of the staging root");
+                    }
+                } else if installed.iter().any(|i| i == "bash") {
+                    eprintln!(
+                        "warning: apk reports `bash` installed but neither bin/bash nor \
+                         usr/bin/bash is in the staging root"
+                    );
+                }
+            }
             // Alpine's X binaries (Xorg, mcookie, xterm, …) are dynamically
             // linked against Alpine's musl. The hand-staged base ships Eclipse's
             // own (musl-cross) `ld-musl-x86_64.so.1`, and an Alpine binary run
@@ -1209,6 +1260,15 @@ const LIVE_TREES: &[&str] = &[
     "usr/share/icu",
     // Boot chime MP3 + any other Eclipse-owned share files.
     "usr/share/eclipse",
+    // The Freedoom IWADs (`usr/share/games/doom/freedoom{1,2}.wad`, ~27 MiB
+    // each) and the `usr/share/doom` spelling some ports use. Without this
+    // tree the QEMU live root carries /usr/bin/freedoom2 and gzdoom but NO
+    // game data, so `eclipse-freedoom` prints "no IWAD found" and the Alpine
+    // launcher finds an empty DOOMWADPATH -- the game data was the one part
+    // of the stack that never reached the image. LIVE_KEEP omits usr/share
+    // wholesale, so this list is the only way in.
+    "usr/share/games",
+    "usr/share/doom",
     "etc/fonts",
     "etc/libinput", // local-overrides.quirks (if present)
     // ── XFCE4 in QEMU ───────────────────────────────────────────────────────
@@ -1279,6 +1339,48 @@ fn copy_uncapped(src: &Path, dst: &Path, skip: &Path) {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::copy(src, dst);
+}
+
+/// Print whether the Freedoom IWADs and `bash` are present under `root`, naming
+/// `what` (the rootfs, the live root). Purely informational: the build never
+/// fails on it, but a missing line in the log is what the next "no IWAD found"
+/// report will be checked against.
+pub(super) fn report_freedoom(root: &Path, what: &str) {
+    let wad = |name: &str| {
+        [
+            "usr/share/games/doom",
+            "usr/share/doom",
+            "usr/share/freedoom",
+        ]
+        .iter()
+        .map(|d| root.join(d).join(name))
+        .find(|p| p.is_file())
+    };
+    let one = wad("freedoom1.wad");
+    let two = wad("freedoom2.wad");
+    let bash = root.join("bin/bash").is_file() || root.join("usr/bin/bash").is_file();
+    match (&one, &two) {
+        (Some(a), Some(b)) => println!(
+            "Freedoom: {what} has both IWADs ({}, {}), bash={}",
+            a.strip_prefix(root).unwrap_or(a).display(),
+            b.strip_prefix(root).unwrap_or(b).display(),
+            if bash { "yes" } else { "NO" }
+        ),
+        _ => eprintln!(
+            "warning: Freedoom: {what} is missing {} -- `eclipse-freedoom` there will \
+             say \"no IWAD found\" (bash={})",
+            [
+                ("freedoom1.wad", one.is_some()),
+                ("freedoom2.wad", two.is_some())
+            ]
+            .iter()
+            .filter(|(_, ok)| !ok)
+            .map(|(n, _)| *n)
+            .collect::<Vec<_>>()
+            .join(" "),
+            if bash { "yes" } else { "NO" }
+        ),
+    }
 }
 
 /// Total size in bytes of a directory tree (for the size notice). Best-effort.
@@ -1358,6 +1460,11 @@ pub(super) fn copy_into_live(full: &Path, live: &Path) {
     union_apk_world(&full.join("etc/apk/world"), &live.join("etc/apk/world"));
     let mib = tree_size(&live.join("usr")) / (1024 * 1024);
     println!("Xorg stack: live root usr/ is now ~{mib} MiB");
+    // Say out loud whether the game DATA and the shell its launcher needs made
+    // the crossing. Both went missing silently before -- the binaries shipped
+    // and only the boot showed it -- and a build log line is the cheapest place
+    // to catch it again.
+    report_freedoom(live, "live root");
 
     // Inventory the LIVE root, not just the rootfs. The two have diverged:
     // the rootfs reports `icon themes: Adwaita hicolor` while the booted
@@ -1492,5 +1599,64 @@ fn audit_icu_data(full: &Path, live: &Path) {
                  icu-data-full)."
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The game DATA has to reach the image, not just the binaries. Freedoom
+    /// shipped as `/usr/bin/freedoom2` + gzdoom with no wad behind them because
+    /// `LIVE_KEEP` omits `usr/share` wholesale and `LIVE_TREES` never listed the
+    /// directory the wads land in, so the live root carried the launchers and
+    /// nothing to launch. `bash` is the other half: the package's launchers are
+    /// `#!/usr/bin/env bash`.
+    #[test]
+    fn the_live_root_carries_the_freedoom_wads_and_bash() {
+        assert!(
+            LIVE_TREES.contains(&"usr/share/games"),
+            "usr/share/games holds freedoom{{1,2}}.wad; without it the live root \
+             has the launchers and no game data"
+        );
+        for p in ["freedoom", "gzdoom", "bash"] {
+            assert!(
+                DEFAULT_PACKAGES.contains(&p),
+                "{p} is part of the shipped Freedoom stack"
+            );
+        }
+    }
+
+    /// End to end over the one step that was losing them: a rootfs holding a
+    /// wad and a compositor must hand both the launcher AND the wad to the
+    /// live root. Listing the tree is not the same as copying it -- this runs
+    /// the copy.
+    #[test]
+    fn copy_into_live_takes_the_wads_across() {
+        let base = std::env::temp_dir().join(format!("eclipse-live-wad-{}", std::process::id()));
+        let full = base.join("full");
+        let live = base.join("live");
+        let _ = std::fs::remove_dir_all(&base);
+        for d in ["usr/bin", "usr/share/games/doom"] {
+            std::fs::create_dir_all(full.join(d)).unwrap();
+        }
+        // `copy_into_live` only runs when a compositor or Xorg is installed.
+        std::fs::write(full.join("usr/bin/labwc"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(full.join("usr/bin/freedoom2"), b"#!/usr/bin/env bash\n").unwrap();
+        std::fs::write(
+            full.join("usr/share/games/doom/freedoom2.wad"),
+            b"IWAD not really",
+        )
+        .unwrap();
+        std::fs::create_dir_all(&live).unwrap();
+
+        copy_into_live(&full, &live);
+
+        assert!(
+            live.join("usr/share/games/doom/freedoom2.wad").is_file(),
+            "the wad must reach the live root, not just the launcher"
+        );
+        assert!(live.join("usr/bin/freedoom2").is_file());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
