@@ -1051,6 +1051,23 @@ pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<
         return None;
     }
 
+    // The pitch must be a whole number of XRGB8888 pixels. Every consumer of
+    // `fb.pitch` on the CPU present path divides it by 4 to get a row stride in
+    // pixels (`src_stride` in `scanout_region` and in `repaint_for_cursor`), so
+    // a pitch of, say, `width * 4 + 2` makes each successive row start two
+    // bytes early -- a diagonal shear that grows down the screen. The copy
+    // engine does NOT truncate (`ce_present_2d_pitched` takes the raw pitch),
+    // so the two present paths would also disagree about the same image.
+    // Linux rejects this in `drm_mode_addfb2` through the format's cpp
+    // alignment; here the format is always 4 bytes per pixel.
+    if !pitch.is_multiple_of(4) {
+        warn!(
+            "[drm] create_fb (ADDFB2): pitch={} is not a multiple of 4 bytes              (XRGB8888) -- rejecting rather than scanning out a sheared image",
+            pitch
+        );
+        return None;
+    }
+
     // Create a driver-private fb when hardware/CE/surface flip may need it.
     // Under pure software KMS (no surfaceflip) skip it to avoid leaking
     // driver fbs with no destroy path.
@@ -1107,6 +1124,55 @@ pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<
 /// so the zero one was a NULL deref in the compositor. Linux never emits an
 /// event for RMFB; the buffer-lifetime worry it was papering over is now
 /// handled by the fb's own VMO reference.
+/// Retire every framebuffer built on a *driver-private* GEM handle
+/// (`>= gem_mmap::DRIVER_HANDLE_BASE`, i.e. a nouveau `GEM_NEW` object),
+/// returning how many were dropped.
+///
+/// Why this exists, and why it does NOT apply to dumb buffers. A dumb-buffer
+/// framebuffer holds an `Arc<VmObject>` in `fb_backing`, so Linux's rule
+/// applies literally: `GEM_CLOSE` drops the *handle*, the object lives on, and
+/// the framebuffer stays scannable until RMFB
+/// (`gem_close_keeps_a_framebuffer_and_its_memory_alive` asserts exactly
+/// that). A nouveau GEM object has no such reference to hold: `create_fb`
+/// resolves it through `gem_mmap` and stores a bare `phys_addr`/`size`, and
+/// `nouveau_gem_close` hands the memory straight back to the RM. Once that
+/// happens the framebuffer describes memory that belongs to somebody else, and
+/// nothing here used to notice -- `gem_close` only looks at `state.handles`,
+/// and `release_process` builds its `doomed` list from the same table, so a
+/// nouveau-backed fb survived both. A compositor crash therefore left
+/// `crtc_fb` pointing at freed VRAM, and the next `repaint_for_cursor` or
+/// re-present blitted whatever had been allocated there since -- persistent
+/// garbage on the panel, not a single bad frame.
+///
+/// The normal wlroots teardown (RMFB, then close the handle) is unaffected:
+/// the fb is already gone by the time this runs.
+pub fn retire_framebuffers_for_handle(handle_id: u32) -> usize {
+    if handle_id < zcore_drivers::scheme::gem_mmap::DRIVER_HANDLE_BASE {
+        return 0;
+    }
+    let mut state = DRM_STATE.lock();
+    let before = state.framebuffers.len();
+    state
+        .framebuffers
+        .retain(|fb| fb.gem_handle_id != handle_id);
+    let dropped = before - state.framebuffers.len();
+    if dropped == 0 {
+        return 0;
+    }
+    let live: Vec<u32> = state.framebuffers.iter().map(|fb| fb.id).collect();
+    state.fb_backing.retain(|(id, _)| live.contains(id));
+    if !state.framebuffers.iter().any(|fb| fb.id == state.crtc_fb) {
+        state.crtc_fb = 0;
+    }
+    drop(state);
+    warn!(
+        "[drm] handle {:#x} closed with {} framebuffer(s) still on it -- retired \
+         them rather than scanning out freed GEM memory",
+        handle_id, dropped
+    );
+    dropped
+}
+
 pub fn rmfb(fb_id: u32) -> bool {
     let mut state = DRM_STATE.lock();
     let Some(pos) = state.framebuffers.iter().position(|f| f.id == fb_id) else {
@@ -1163,12 +1229,25 @@ fn ce_repack_to_staging(
     src_pa: u64,
     src_stride: usize,
     dst_pitch: usize,
+    dst_visible_bytes: usize,
     w: u32,
     h: u32,
 ) -> Option<(u64, u64)> {
     let t0 = kernel_hal::timer::timer_now();
     let row_bytes = (w as usize).checked_mul(4)?;
     if row_bytes > dst_pitch {
+        return None;
+    }
+    // The caller asks the CE for a FLAT copy of `dst_pitch * h` bytes, so every
+    // byte of every destination row is overwritten -- including the
+    // `row_bytes..dst_pitch` tail, which the row loop below never writes. When
+    // that tail reaches past the visible width it is off-screen padding and
+    // harmless; when it starts INSIDE the visible width, the CE paints the
+    // previous frame's leftovers (or, on the first frame, whatever
+    // `commit_page` left) over real on-screen columns. Decline instead: the
+    // caller falls back to the CPU blit, which writes only the columns it has
+    // pixels for and leaves the rest of the screen alone.
+    if row_bytes < dst_visible_bytes {
         return None;
     }
     let need = dst_pitch.checked_mul(h as usize)?;
@@ -1183,7 +1262,9 @@ fn ce_repack_to_staging(
         None => {
             // Allocate OUTSIDE the IRQ-disabling spinlock: a contiguous
             // multi-MB allocation (plus zeroing) is far too heavy to run with
-            // interrupts off. A racing double-alloc is harmless (one wins).
+            // interrupts off. A racing double-alloc then has to be resolved
+            // when publishing -- see below; it is NOT "harmless (one wins)",
+            // as this comment used to claim.
             let vmo = match VmObject::new_contiguous(pages(need), 12) {
                 Ok(v) => v,
                 Err(_) => {
@@ -1198,8 +1279,22 @@ fn ce_repack_to_staging(
             };
             let pa = vmo.commit_page(0, MMUFlags::READ).ok()? as u64;
             let va = phys_to_virt(pa as usize);
-            *CE_STAGING.lock() = Some((va, pa, need, vmo.clone()));
-            (va, pa, vmo)
+            // Publish under the lock, and re-check first. Two presents can
+            // reach the allocation at once; the store used to overwrite the
+            // slot unconditionally, so the LOSER returned a `pa` whose only
+            // owner was the local `_keepalive` -- which drops when this
+            // function returns, i.e. before the caller hands the address to
+            // `ce_present`. The copy engine then DMA'd out of frames already
+            // back in the allocator. The loser must adopt the winner's buffer
+            // instead and let its own drop.
+            let mut slot = CE_STAGING.lock();
+            match slot.as_ref().filter(|s| s.2 >= need) {
+                Some(s) => (s.0, s.1, s.3.clone()),
+                None => {
+                    *slot = Some((va, pa, need, vmo.clone()));
+                    (va, pa, vmo)
+                }
+            }
         }
     };
     for r in 0..h as usize {
@@ -1215,6 +1310,24 @@ fn ce_repack_to_staging(
                 (va + r * dst_pitch) as *mut u8,
                 row_bytes,
             );
+        }
+        // Define the off-screen tail rather than letting the CE carry over
+        // whatever a previous, wider repack left in it. The guard above makes
+        // this range entirely off-screen padding, so its contents are not
+        // visible -- but the CE copies them, and leaving DMA'd bytes
+        // undefined is how the stale-column bug looked in the first place.
+        // In the common full-screen case the tail is empty and this is a
+        // no-op: `blit_w` is capped at the scanout pitch in pixels.
+        if row_bytes < dst_pitch {
+            // SAFETY: same span as the copy above -- `r * dst_pitch +
+            // dst_pitch <= need`, and the region is the staging buffer's own.
+            unsafe {
+                core::ptr::write_bytes(
+                    (va + r * dst_pitch + row_bytes) as *mut u8,
+                    0,
+                    dst_pitch - row_bytes,
+                );
+            }
         }
     }
     // The repack is suspected to be the remaining present cost: the GEM
@@ -1598,6 +1711,7 @@ pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
                     fb.phys_addr,
                     src_stride,
                     info.pitch as usize,
+                    (info.width as usize).saturating_mul(4),
                     blit_w,
                     blit_h,
                 )
@@ -2221,7 +2335,20 @@ fn vblank_period_ns() -> u64 {
 }
 
 /// Refresh rate (Hz) from a `drm_mode_modeinfo` blob: prefer `vrefresh`, else
-/// `clock_kHz * 1000 / (htotal * vtotal)`. `None` if the blob is unusable.
+/// derive it from the timings the way Linux's `drm_mode_vrefresh` does.
+///
+/// The derivation ROUNDS TO NEAREST (`DIV_ROUND_CLOSEST`), and that is not
+/// cosmetic. A pixel clock is stored in whole kHz, so it cannot express an
+/// exact 60 Hz for most timings: the 1920x1080 mode this driver itself
+/// advertises comes to 139900 kHz over a 2080x1121 total, which is 59.9995 Hz.
+/// Truncating division called that **59**, and `set_vblank_period_from_modeinfo`
+/// turned it into a 16.95 ms synthetic vblank instead of 16.67 ms -- every
+/// frame paced 1.7% slow. Nine of the thirteen common modes `make_modeinfo`
+/// builds were affected. This path is reached whenever a client leaves
+/// `vrefresh` at 0 and lets the kernel compute it, which is legal and what
+/// Linux expects (SETCRTC and the atomic MODE_ID blob both land here).
+///
+/// `None` if the blob is unusable.
 pub fn refresh_hz_from_modeinfo(data: &[u8]) -> Option<u64> {
     if data.len() < 28 {
         return None;
@@ -2236,7 +2363,9 @@ pub fn refresh_hz_from_modeinfo(data: &[u8]) -> Option<u64> {
     if clock_khz == 0 || htotal == 0 || vtotal == 0 {
         return None;
     }
-    Some((clock_khz * 1000) / (htotal * vtotal))
+    let num = clock_khz * 1000;
+    let den = htotal * vtotal;
+    Some((num + den / 2) / den)
 }
 
 /// Set the synthetic vblank period from a `drm_mode_modeinfo` (68 bytes).
@@ -3302,6 +3431,37 @@ pub fn release_process(pid: u64) -> usize {
     // close; DROP_MASTER deliberately no longer cancels events -- see
     // cancel_pending_events.)
     cancel_events_for_exit(pid);
+    // Driver-private (nouveau `GEM_NEW`) framebuffers first, and BEFORE the
+    // early return below: `nouveau_release_process`, which runs right after
+    // this hook, gives their memory back to the RM, and the framebuffer holds
+    // no reference that could keep it -- so a framebuffer left behind here
+    // means `crtc_fb` aimed at freed GEM memory and the next repaint blitting
+    // whatever took its place. This has to happen while `gem_mmap` still
+    // records who held what.
+    //
+    // It cannot live inside the block below, because that returns early when
+    // the pid owns no entry in `state.handles` -- and a compositor using the
+    // GL/Vulkan renderer owns NOTHING there: its buffers are all nouveau GEM
+    // objects tracked in `gem_mmap`. That early return is precisely why a
+    // crashed wlroots left its scanout framebuffer in place.
+    //
+    // Dumb buffers are deliberately not touched here; see
+    // `retire_framebuffers_for_handle` for why their fb outlives its handle.
+    {
+        let mut state = DRM_STATE.lock();
+        let before = state.framebuffers.len();
+        state.framebuffers.retain(|fb| {
+            fb.gem_handle_id < zcore_drivers::scheme::gem_mmap::DRIVER_HANDLE_BASE
+                || !zcore_drivers::scheme::gem_mmap::holds(fb.gem_handle_id, pid)
+        });
+        if state.framebuffers.len() != before {
+            let live: Vec<u32> = state.framebuffers.iter().map(|fb| fb.id).collect();
+            state.fb_backing.retain(|(id, _)| live.contains(id));
+            if !state.framebuffers.iter().any(|fb| fb.id == state.crtc_fb) {
+                state.crtc_fb = 0;
+            }
+        }
+    }
     let (doomed, driver) = {
         let mut state = DRM_STATE.lock();
         if !state.handles.iter().any(|(_, _, owner)| *owner == pid) {
@@ -3865,5 +4025,573 @@ mod node_tests {
         // And past RENDER_MINOR_BASE is where it really breaks, which is why
         // the cap exists at all.
         assert!(NodeMinors::new(0).owns(NodeMinors::new(RENDER_MINOR_BASE).card()));
+    }
+}
+
+/// Tests for the write-combining edge arithmetic of the present path.
+///
+/// Nothing here touches a display: [`expand_x_for_wc`] is pure arithmetic, and
+/// it is the whole of the mitigation for a hardware behaviour the module
+/// documents -- a blit whose left or right edge sits mid-line makes the GOP/BAR1
+/// aperture flush a half-full combine buffer over the neighbouring pixels,
+/// which is seen as leftover squares and stripes.
+#[cfg(test)]
+mod wc_edge_tests {
+    use super::expand_x_for_wc;
+
+    /// 16 XRGB8888 pixels are one 64-byte PCIe burst. Both edges of the
+    /// returned span must sit on such a boundary whenever the limit allows it,
+    /// or the burst the hardware combines is not the burst we wrote.
+    #[test]
+    fn both_edges_land_on_a_sixteen_pixel_boundary() {
+        // A damage box in the middle of the screen: 100..150 becomes 96..160.
+        let (x, w) = expand_x_for_wc(100, 50, 1920);
+        assert_eq!((x, w), (96, 64));
+        assert_eq!(x % 16, 0);
+        assert_eq!((x + w) % 16, 0);
+    }
+
+    /// The expansion may only ever GROW the requested region: a damage rect
+    /// that came back clipped would leave the pixels the client just drew
+    /// unpresented.
+    #[test]
+    fn the_expansion_always_covers_what_was_asked_for() {
+        for limit in [64u32, 640, 1366, 1920, 1936] {
+            for x in 0..limit {
+                for w in [1u32, 3, 15, 16, 17, 64, 100] {
+                    let (ex, ew) = expand_x_for_wc(x, w, limit);
+                    if ew == 0 {
+                        // Only when there was nothing inside the limit to draw.
+                        assert!(x >= limit, "x={} w={} limit={} vanished", x, w, limit);
+                        continue;
+                    }
+                    assert!(ex <= x, "left edge moved right: {} > {}", ex, x);
+                    let want_right = (x + w).min(limit);
+                    assert!(
+                        ex + ew >= want_right,
+                        "right edge {} short of {} (x={} w={} limit={})",
+                        ex + ew,
+                        want_right,
+                        x,
+                        w,
+                        limit
+                    );
+                    // And never past the limit, which is the caller's promise
+                    // that the bytes are inside the destination row.
+                    assert!(
+                        ex + ew <= limit,
+                        "ran past the limit: {} > {}",
+                        ex + ew,
+                        limit
+                    );
+                }
+            }
+        }
+    }
+
+    /// The right limit the present path passes is the PITCH in pixels, not the
+    /// visible width, precisely so the tail can spill into a scanline's
+    /// off-screen padding and complete the last burst. On a 1366-wide mode
+    /// (1366 % 16 == 6) with a padded pitch that is the only way the last six
+    /// visible pixels are ever written as part of a whole line.
+    #[test]
+    fn a_padded_pitch_lets_the_right_edge_reach_its_boundary() {
+        // Visible width 1366, pitch 1536 pixels.
+        let (x, w) = expand_x_for_wc(1360, 6, 1536);
+        assert_eq!((x, w), (1360, 16), "1366 rounds up to 1376");
+        assert_eq!(x + w, 1376);
+        assert!(x + w > 1366, "the tail is off-screen, which is the point");
+
+        // With no padding at all there is nowhere to put the tail, so the span
+        // stops at the limit and stays short of a boundary. That is expected,
+        // and is why `scanout_region` prefers the pitch.
+        let (x, w) = expand_x_for_wc(1360, 6, 1366);
+        assert_eq!((x, w), (1360, 6));
+    }
+
+    /// Degenerate inputs must not produce a span at all: an empty damage rect
+    /// and a zero-width destination are both "present nothing".
+    #[test]
+    fn nothing_to_draw_expands_to_nothing() {
+        // A zero-width rect short-circuits before any alignment: there is no
+        // burst to complete, so the origin is returned as given (clamped).
+        assert_eq!(expand_x_for_wc(100, 0, 1920), (100, 0));
+        assert_eq!(expand_x_for_wc(0, 0, 1920).1, 0);
+        assert_eq!(expand_x_for_wc(0, 64, 0), (0, 0));
+        // An origin already outside the destination yields no width, whatever
+        // was asked for -- not a wrapped or negative span.
+        assert_eq!(expand_x_for_wc(4096, 64, 1920).1, 0);
+    }
+}
+
+/// Tests for ADDFB2 validation and for the refresh rate the synthetic vblank
+/// is paced from. Both are pure functions of their arguments (`create_fb` needs
+/// only a GEM entry in `DRM_STATE`, planted the way `release_tests` does).
+#[cfg(test)]
+mod fb_validation_tests {
+    use super::*;
+
+    /// A GEM entry of `size` bytes, owned by `pid`, planted directly so the
+    /// test does not need a current thread or real contiguous frames.
+    fn plant(id: u32, size: usize, pid: u64) {
+        let vmo = VmObject::new_paged(size.div_ceil(4096));
+        DRM_STATE.lock().handles.push((
+            GemHandle {
+                id,
+                size,
+                phys_addr: 0,
+            },
+            vmo,
+            pid,
+        ));
+    }
+
+    fn unplant(id: u32) {
+        let mut state = DRM_STATE.lock();
+        state.handles.retain(|(h, _, _)| h.id != id);
+        state.framebuffers.retain(|fb| fb.gem_handle_id != id);
+    }
+
+    /// The regression this guards. Every CPU consumer of `fb.pitch` turns it
+    /// into a row stride in PIXELS with `fb.pitch / 4` (`src_stride` in
+    /// `scanout_region` and in `repaint_for_cursor`), so a pitch that is not a
+    /// whole number of XRGB8888 pixels makes each row start a couple of bytes
+    /// early -- a shear that grows down the screen. The copy engine does not
+    /// truncate, so the two present paths would not even agree on the image.
+    /// ADDFB2 used to accept it.
+    #[test]
+    fn addfb_rejects_a_pitch_that_is_not_whole_pixels() {
+        let (w, h) = (64u32, 4u32);
+        // Generous backing so the size guard never decides these cases: what
+        // is under test is the pitch alignment, nothing else.
+        plant(9401, 64 * 1024, 78_001);
+
+        // The aligned pitch for this width is accepted.
+        assert!(create_fb(9401, w, h, w * 4).is_some(), "w*4 must be valid");
+        // A padded but still 4-byte-aligned pitch is fine too: padding is
+        // legal, a fractional pixel is not.
+        assert!(create_fb(9401, w, h, w * 4 + 16).is_some());
+        // Two bytes past a whole pixel is not.
+        assert!(
+            create_fb(9401, w, h, w * 4 + 2).is_none(),
+            "a fractional pitch would scan out a sheared image"
+        );
+        for bad in [1u32, 2, 3] {
+            assert!(create_fb(9401, w, h, w * 4 + bad).is_none(), "+{}", bad);
+        }
+
+        unplant(9401);
+    }
+
+    /// The pre-existing guards, asserted so the new pitch check cannot be
+    /// mistaken for the whole of the validation: a framebuffer must fit inside
+    /// its backing buffer, and must be at least as wide as it claims.
+    #[test]
+    fn addfb_still_rejects_a_framebuffer_that_does_not_fit_its_buffer() {
+        plant(9402, 4096, 78_002);
+        // 64x16 at 4 bytes = 4096, exactly the buffer.
+        assert!(create_fb(9402, 64, 16, 256).is_some());
+        // One row more does not fit.
+        assert!(create_fb(9402, 64, 17, 256).is_none());
+        // A pitch too small for the claimed width would make `scanout_region`
+        // read the next row's pixels as this row's tail.
+        assert!(create_fb(9402, 64, 4, 128).is_none());
+        // Degenerate sizes are not framebuffers.
+        assert!(create_fb(9402, 64, 0, 256).is_none());
+        assert!(create_fb(9402, 0, 4, 0).is_none());
+        // An unknown handle has no backing to scan out.
+        assert!(create_fb(9499, 64, 4, 256).is_none());
+        unplant(9402);
+    }
+}
+
+/// Tests for the refresh rate the synthetic vblank is paced from.
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+
+    /// Build the fields of a `drm_mode_modeinfo` that the reader looks at.
+    fn modeinfo(clock_khz: u32, htotal: u16, vtotal: u16, vrefresh: u32) -> [u8; 68] {
+        let mut m = [0u8; 68];
+        m[0..4].copy_from_slice(&clock_khz.to_ne_bytes());
+        m[10..12].copy_from_slice(&htotal.to_ne_bytes());
+        m[20..22].copy_from_slice(&vtotal.to_ne_bytes());
+        m[24..28].copy_from_slice(&vrefresh.to_ne_bytes());
+        m
+    }
+
+    /// A mode that states its own refresh is believed, timings or not: that is
+    /// the field Linux fills in and the one every mode this driver advertises
+    /// carries.
+    #[test]
+    fn a_stated_vrefresh_wins_over_the_timings() {
+        assert_eq!(
+            refresh_hz_from_modeinfo(&modeinfo(139_900, 2080, 1121, 144)),
+            Some(144)
+        );
+    }
+
+    /// The regression this guards. A pixel clock is stored in whole kHz, so it
+    /// cannot express an exact 60 Hz for most timings: the 1920x1080 mode this
+    /// driver itself advertises is 139900 kHz over 2080x1121, i.e. 59.9995 Hz.
+    /// Truncating division called that 59 and
+    /// `set_vblank_period_from_modeinfo` paced the synthetic vblank at 16.95 ms
+    /// instead of 16.67 ms. Linux rounds to nearest here
+    /// (`drm_mode_vrefresh`'s `DIV_ROUND_CLOSEST`), and a client that leaves
+    /// `vrefresh` at 0 -- legal, and what makes the kernel compute it -- is
+    /// exactly how SETCRTC and an atomic MODE_ID blob reach this path.
+    #[test]
+    fn a_derived_refresh_rounds_to_nearest_like_linux() {
+        // 1920x1080, the mode `make_modeinfo` builds.
+        assert_eq!(
+            refresh_hz_from_modeinfo(&modeinfo(139_900, 2080, 1121, 0)),
+            Some(60),
+            "59.9995 Hz is 60, not 59"
+        );
+        // A few more of the modes that were reading one Hz slow.
+        assert_eq!(
+            refresh_hz_from_modeinfo(&modeinfo(65_750, 1440, 761, 0)),
+            Some(60),
+            "1280x720"
+        );
+        assert_eq!(
+            refresh_hz_from_modeinfo(&modeinfo(74_072, 1526, 809, 0)),
+            Some(60),
+            "1366x768"
+        );
+        assert_eq!(
+            refresh_hz_from_modeinfo(&modeinfo(528_236, 4000, 2201, 0)),
+            Some(60),
+            "3840x2160"
+        );
+        // Rounding to nearest, not simply up: a mode that really is closer to
+        // 59 must not be promoted.
+        assert_eq!(
+            refresh_hz_from_modeinfo(&modeinfo(137_600, 2080, 1121, 0)),
+            Some(59)
+        );
+    }
+
+    /// An unusable blob must not be mistaken for a refresh rate; the caller
+    /// falls back to 60 Hz rather than dividing by zero or pacing off garbage.
+    #[test]
+    fn an_unusable_modeinfo_has_no_refresh() {
+        assert_eq!(refresh_hz_from_modeinfo(&[]), None);
+        assert_eq!(refresh_hz_from_modeinfo(&[0u8; 27]), None, "truncated blob");
+        assert_eq!(refresh_hz_from_modeinfo(&modeinfo(0, 2080, 1121, 0)), None);
+        assert_eq!(
+            refresh_hz_from_modeinfo(&modeinfo(139_900, 0, 1121, 0)),
+            None
+        );
+        assert_eq!(
+            refresh_hz_from_modeinfo(&modeinfo(139_900, 2080, 0, 0)),
+            None
+        );
+    }
+
+    /// The vblank period the timer is armed from. It must never be 0 (a zero
+    /// period is an immediately-and-forever-due timer), and it must follow the
+    /// mode.
+    #[test]
+    fn the_vblank_period_tracks_the_mode_and_is_never_zero() {
+        set_vblank_period_from_modeinfo(&modeinfo(139_900, 2080, 1121, 0));
+        assert_eq!(vblank_period_ns(), 1_000_000_000 / 60);
+        set_vblank_period_from_modeinfo(&modeinfo(0, 0, 0, 144));
+        assert_eq!(vblank_period_ns(), 1_000_000_000 / 144);
+        // No usable refresh at all falls back rather than producing 0.
+        set_vblank_period_from_modeinfo(&[0u8; 68]);
+        assert_eq!(vblank_period_ns(), 1_000_000_000 / FALLBACK_VBLANK_HZ);
+        assert!(vblank_period_ns() > 0);
+        reset_vblank_period();
+        assert_eq!(vblank_period_ns(), 1_000_000_000 / FALLBACK_VBLANK_HZ);
+    }
+}
+
+/// Tests for the rectangle algebra the software cursor uses to decide what to
+/// repaint. Both helpers are pure, and both feed blits into the scanout
+/// aperture, so an over-small union leaves cursor debris and an over-large one
+/// costs a full-screen copy per mouse move.
+#[cfg(test)]
+mod cursor_rect_tests {
+    use super::{rects_overlap, union_i32};
+
+    #[test]
+    fn touching_rectangles_do_not_overlap() {
+        // Adjacent, sharing an edge: repainting one cannot disturb the other.
+        assert!(!rects_overlap(0, 0, 10, 10, 10, 0, 10, 10));
+        assert!(!rects_overlap(0, 0, 10, 10, 0, 10, 10, 10));
+        // One pixel of genuine intersection does.
+        assert!(rects_overlap(0, 0, 10, 10, 9, 9, 10, 10));
+        // Fully contained.
+        assert!(rects_overlap(0, 0, 100, 100, 40, 40, 10, 10));
+        // An empty rectangle overlaps nothing, including itself.
+        assert!(!rects_overlap(0, 0, 0, 10, 0, 0, 10, 10));
+        assert!(!rects_overlap(0, 0, 10, 0, 0, 0, 10, 10));
+    }
+
+    /// A cursor can be partly off the left or top edge, so these coordinates
+    /// are genuinely negative and the union has to keep them.
+    #[test]
+    fn a_union_covers_both_rectangles_including_negative_origins() {
+        assert_eq!(union_i32(0, 0, 10, 10, 20, 20, 10, 10), (0, 0, 30, 30));
+        assert_eq!(union_i32(-5, -5, 10, 10, 0, 0, 10, 10), (-5, -5, 15, 15));
+        // Identical rectangles union to themselves.
+        assert_eq!(union_i32(7, 9, 3, 4, 7, 9, 3, 4), (7, 9, 3, 4));
+        // The union is symmetric.
+        assert_eq!(
+            union_i32(-3, 12, 8, 2, 40, -1, 5, 60),
+            union_i32(40, -1, 5, 60, -3, 12, 8, 2)
+        );
+    }
+
+    /// The property that matters: whatever the union returns must contain both
+    /// inputs, or the repaint misses pixels the cursor moved over.
+    #[test]
+    fn the_union_contains_both_inputs() {
+        let cases = [
+            (0i32, 0i32, 64u32, 64u32),
+            (-32, -32, 64, 64),
+            (1900, 1050, 64, 64),
+            (10, 10, 1, 1),
+        ];
+        for a in cases {
+            for b in cases {
+                let (ux, uy, uw, uh) = union_i32(a.0, a.1, a.2, a.3, b.0, b.1, b.2, b.3);
+                for r in [a, b] {
+                    assert!(ux <= r.0, "union left {} > {}", ux, r.0);
+                    assert!(uy <= r.1, "union top {} > {}", uy, r.1);
+                    assert!(
+                        ux + uw as i32 >= r.0 + r.2 as i32,
+                        "union right {} < {}",
+                        ux + uw as i32,
+                        r.0 + r.2 as i32
+                    );
+                    assert!(
+                        uy + uh as i32 >= r.1 + r.3 as i32,
+                        "union bottom {} < {}",
+                        uy + uh as i32,
+                        r.1 + r.3 as i32
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Tests for the copy-engine staging repack: the buffer the CPU packs a frame
+/// into when the GPU's pitched 2D path is unavailable, before the copy engine
+/// DMAs it flat into the scanout framebuffer.
+///
+/// This runs for real under libos -- `VmObject::new_contiguous` and
+/// `phys_to_virt` both work on the host -- so the test can read the staging
+/// buffer back byte for byte and see exactly what the copy engine would have
+/// carried to the screen.
+#[cfg(test)]
+mod ce_staging_tests {
+    use super::*;
+
+    /// Read `len` bytes of the staging buffer back through the physmap, the
+    /// same way the copy engine reaches them.
+    fn staging_bytes(pa: u64, len: usize) -> alloc::vec::Vec<u8> {
+        let va = phys_to_virt(pa as usize);
+        // SAFETY: `pa` is the start of the contiguous staging VMO, which the
+        // repack just reported as holding at least `len` bytes, and it stays
+        // alive in `CE_STAGING` for the rest of the process.
+        unsafe { core::slice::from_raw_parts(va as *const u8, len).to_vec() }
+    }
+
+    /// Source pixels numbered from `base` so each one is identifiable.
+    fn numbered(base: u32, stride: usize, rows: usize) -> alloc::vec::Vec<u32> {
+        (0..stride * rows).map(|n| base + n as u32).collect()
+    }
+
+    /// The regression this guards. The repack writes `w * 4` bytes per row, but
+    /// the caller then asks the copy engine for a FLAT copy of
+    /// `dst_pitch * h` bytes -- so the `row_bytes..dst_pitch` tail of every row
+    /// is carried to the screen without anyone having written it. A first,
+    /// wider frame leaves its pixels there; a later, narrower frame does not
+    /// overwrite them, and the copy engine paints them. When that tail is
+    /// off-screen padding it is invisible, so the repack now defines it;
+    /// when it would start inside the visible width the repack DECLINES (see
+    /// the next test) rather than clobbering real columns.
+    #[test]
+    fn the_row_tail_the_copy_engine_carries_is_never_left_stale() {
+        const PITCH: usize = 64; // 16 pixels per destination row
+        const H: u32 = 4;
+        // Frame 1 fills whole rows: 16 pixels of 4 bytes = the full pitch.
+        let wide = numbered(0xAAA0_0000, 16, H as usize);
+        let (pa, size) = ce_repack_to_staging(&wide, 0, 16, PITCH, PITCH, 16, H)
+            .expect("a whole-row repack must be accepted");
+        assert_eq!(size, (PITCH * H as usize) as u64);
+        let before = staging_bytes(pa, PITCH * H as usize);
+        assert_eq!(
+            &before[60..64],
+            &0xAAA0_000Fu32.to_ne_bytes(),
+            "frame 1 wrote the end of row 0"
+        );
+
+        // Frame 2 is narrower -- 8 pixels -- with a destination whose visible
+        // part is only those 8 pixels, so the remaining 32 bytes of each row
+        // are off-screen padding and the repack is allowed to proceed.
+        let narrow = numbered(0xBBB0_0000, 8, H as usize);
+        let (pa2, size2) = ce_repack_to_staging(&narrow, 0, 8, PITCH, 32, 8, H)
+            .expect("an off-screen tail must still be accepted");
+        assert_eq!(size2, (PITCH * H as usize) as u64);
+        let after = staging_bytes(pa2, PITCH * H as usize);
+        for r in 0..H as usize {
+            let row = &after[r * PITCH..(r + 1) * PITCH];
+            // The 8 pixels the frame actually has.
+            assert_eq!(
+                u32::from_ne_bytes([row[0], row[1], row[2], row[3]]),
+                0xBBB0_0000 + (r * 8) as u32,
+                "row {} first pixel",
+                r
+            );
+            // And the tail the copy engine will carry regardless: defined, not
+            // frame 1's leftovers. This is the assertion that failed before.
+            assert!(
+                row[32..].iter().all(|&b| b == 0),
+                "row {} tail still holds a previous frame: {:02x?}",
+                r,
+                &row[32..]
+            );
+        }
+    }
+
+    /// A tail that would START inside the visible width must make the repack
+    /// decline, so the caller falls back to the CPU blit -- which writes only
+    /// the columns it has pixels for and leaves the rest of the screen alone.
+    /// Filling that tail (with zeros or with anything else) would paint over
+    /// on-screen columns the frame says nothing about.
+    #[test]
+    fn a_repack_that_cannot_cover_the_visible_width_is_declined() {
+        const PITCH: usize = 64;
+        let src = numbered(0xCCC0_0000, 8, 4);
+        // 8 pixels of source, but 12 pixels (48 bytes) of the row are visible.
+        assert!(
+            ce_repack_to_staging(&src, 0, 8, PITCH, 48, 8, 4).is_none(),
+            "would have clobbered visible columns 8..12"
+        );
+        // Exactly covering the visible width is fine.
+        assert!(ce_repack_to_staging(&src, 0, 8, PITCH, 32, 8, 4).is_some());
+        // A row wider than the destination pitch is refused as before: it
+        // would spill each row into the next.
+        assert!(ce_repack_to_staging(&src, 0, 8, PITCH, 32, 17, 4).is_none());
+        // Degenerate geometry.
+        assert!(ce_repack_to_staging(&src, 0, 8, PITCH, 32, 0, 4).is_none());
+    }
+}
+
+/// Tests for the lifetime of a framebuffer built on a *nouveau* GEM object, as
+/// opposed to a dumb buffer. The two are deliberately different, and getting
+/// them the same way round is what keeps a crashed compositor from leaving the
+/// panel scanning out memory that now belongs to somebody else.
+#[cfg(test)]
+mod nouveau_fb_lifetime_tests {
+    use super::*;
+    use zcore_drivers::scheme::gem_mmap;
+
+    /// Plant a framebuffer over a driver-private handle, the way `create_fb`
+    /// does for a nouveau `GEM_NEW` object: a bare `phys_addr`/`size` resolved
+    /// through `gem_mmap`, and **no** `fb_backing` reference, because there is
+    /// no `VmObject` to take one on.
+    fn plant_nouveau_fb(fb_id: u32, handle: u32, pid: u64) {
+        gem_mmap::register(handle, 0x1_0000, 4096, pid);
+        let mut state = DRM_STATE.lock();
+        state.framebuffers.push(DrmFramebuffer {
+            id: fb_id,
+            driver_fb_id: None,
+            gem_handle_id: handle,
+            width: 1,
+            height: 1,
+            pitch: 4,
+            phys_addr: 0x1_0000,
+            size: 4096,
+        });
+        state.crtc_fb = fb_id;
+    }
+
+    fn fb_exists(fb_id: u32) -> bool {
+        DRM_STATE
+            .lock()
+            .framebuffers
+            .iter()
+            .any(|fb| fb.id == fb_id)
+    }
+
+    /// The regression this guards. `nouveau_gem_close` returns the object's
+    /// memory to the RM, and the framebuffer over it holds no reference that
+    /// could stop that -- so the framebuffer has to go with it. It did not:
+    /// `gem_close` only ever looked at `state.handles`, where a nouveau handle
+    /// never appears, so the fb (and `crtc_fb` pointing at it) survived the
+    /// close and the next repaint blitted freed GEM memory. Persistent garbage
+    /// on the panel, because the scanout keeps reading that address.
+    #[test]
+    fn closing_a_nouveau_handle_retires_the_framebuffer_over_it() {
+        let handle = gem_mmap::DRIVER_HANDLE_BASE + 0x55;
+        plant_nouveau_fb(9501, handle, 0);
+        assert!(fb_exists(9501));
+
+        assert_eq!(retire_framebuffers_for_handle(handle), 1);
+        assert!(!fb_exists(9501), "the fb outlived the memory it points at");
+        assert_eq!(
+            DRM_STATE.lock().crtc_fb,
+            0,
+            "the CRTC must not keep scanning out a retired fb"
+        );
+        // Idempotent: a second close finds nothing left to retire.
+        assert_eq!(retire_framebuffers_for_handle(handle), 0);
+        gem_mmap::unregister(handle);
+    }
+
+    /// The other half of the contract, so the fix above cannot creep into the
+    /// dumb-buffer path: a dumb-buffer fb holds an `Arc` on its VMO, so closing
+    /// the handle drops only the handle and the fb stays scannable until RMFB
+    /// -- which is what Linux does, and what
+    /// `gem_close_keeps_a_framebuffer_and_its_memory_alive` asserts end to end.
+    /// This helper must therefore refuse to touch a low-range handle at all.
+    #[test]
+    fn a_dumb_buffer_framebuffer_is_never_retired_by_this_path() {
+        let mut state = DRM_STATE.lock();
+        state.framebuffers.push(DrmFramebuffer {
+            id: 9502,
+            driver_fb_id: None,
+            gem_handle_id: 42, // low range: a CREATE_DUMB handle
+            width: 1,
+            height: 1,
+            pitch: 4,
+            phys_addr: 0,
+            size: 4096,
+        });
+        drop(state);
+
+        assert_eq!(retire_framebuffers_for_handle(42), 0);
+        assert!(fb_exists(9502), "a dumb fb outlives its handle by design");
+        DRM_STATE.lock().framebuffers.retain(|fb| fb.id != 9502);
+    }
+
+    /// A process exit is the case that actually matters -- a compositor that
+    /// crashed never sends RMFB or GEM_CLOSE. `release_process` builds its
+    /// `doomed` list from `state.handles`, where a nouveau handle never
+    /// appears, so it used to leave every nouveau-backed fb behind while
+    /// `nouveau_release_process` (which runs immediately after) freed the
+    /// memory underneath it.
+    #[test]
+    fn a_process_exit_retires_the_nouveau_framebuffers_that_process_held() {
+        let mine = gem_mmap::DRIVER_HANDLE_BASE + 0x66;
+        let theirs = gem_mmap::DRIVER_HANDLE_BASE + 0x67;
+        plant_nouveau_fb(9503, mine, 78_101);
+        plant_nouveau_fb(9504, theirs, 78_102);
+
+        release_process(78_101);
+        assert!(!fb_exists(9503), "the dead process's fb must be retired");
+        assert!(fb_exists(9504), "another process's fb must survive");
+
+        // And the survivor goes when its own owner exits.
+        release_process(78_102);
+        assert!(!fb_exists(9504));
+        assert_eq!(DRM_STATE.lock().crtc_fb, 0);
+        gem_mmap::unregister(mine);
+        gem_mmap::unregister(theirs);
     }
 }
