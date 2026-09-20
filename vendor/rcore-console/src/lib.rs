@@ -30,6 +30,10 @@ pub use embedded_graphics::{
 };
 pub use graphic::TextOnGraphic;
 pub use cell::{Cell, Flags};
+// `Cell`'s `fg`/`bg` fields are public but their type was not, so nothing
+// outside this crate could build a coloured cell -- or name the colour of
+// one it read back.
+pub use color::{Color, NamedColor};
 pub use text_buffer::TextBuffer;
 pub use text_buffer_cache::TextBufferCache;
 
