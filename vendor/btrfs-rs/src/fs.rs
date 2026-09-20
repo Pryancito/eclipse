@@ -188,6 +188,51 @@ impl Btrfs {
         Ok(())
     }
 
+    /// Gate for every mutation: check writability, then make sure a free space
+    /// tree we are about to invalidate is marked for rebuild.
+    fn begin_write(&mut self) -> Result<()> {
+        self.writable()?;
+        self.invalidate_free_space_tree()
+    }
+
+    /// Drop `FREE_SPACE_TREE_VALID` before the first mutation of a volume that
+    /// carries a free space tree.
+    ///
+    /// We allocate and free extents in the extent tree but do not maintain the
+    /// free space tree (`mkfs.btrfs` has enabled it by default since
+    /// btrfs-progs 5.15, so this is the *common* case for a volume formatted on
+    /// Linux). Leaving `VALID` set would tell Linux that the stale tree still
+    /// describes free space, and it would hand out extents we already
+    /// allocated — silent corruption of live data.
+    ///
+    /// `FREE_SPACE_TREE` without `FREE_SPACE_TREE_VALID` is exactly the state
+    /// the kernel treats as "rebuild it at mount", and is what btrfs-progs
+    /// leaves behind when it changes a filesystem without maintaining the tree.
+    /// Clearing the bit costs one rebuild on the next Linux mount and keeps the
+    /// allocator honest.
+    fn invalidate_free_space_tree(&mut self) -> Result<()> {
+        let flags = self.vol.sb.compat_ro_flags();
+        if flags & COMPAT_RO_FREE_SPACE_TREE == 0 || flags & COMPAT_RO_FREE_SPACE_TREE_VALID == 0 {
+            return Ok(());
+        }
+        info!(
+            "btrfs: clearing FREE_SPACE_TREE_VALID; Linux rebuilds the free space tree at its next mount"
+        );
+        self.vol
+            .sb
+            .set_compat_ro_flags(flags & !COMPAT_RO_FREE_SPACE_TREE_VALID);
+        // Push it out now, before the mutation it guards. Superblock writes are
+        // otherwise deferred (`SUPERBLOCK_COMMIT_INTERVAL`), and a crash between
+        // the first allocation reaching disk and the next commit would leave a
+        // volume whose extent tree moved while `VALID` still claimed the free
+        // space tree described it. This runs once per mount.
+        self.vol.flush_dirty()?;
+        self.vol.write_superblock()?;
+        self.sb_dirty = false;
+        self.deferred_sb_commits = 0;
+        Ok(())
+    }
+
     fn tree(&mut self) -> Tree<'_> {
         Tree {
             vol: &mut self.vol,
@@ -277,7 +322,7 @@ impl Btrfs {
     /// Grow the filesystem to fill the whole device (used after the installer
     /// copies a small image onto a big partition). Returns true if grown.
     pub fn grow_to_device(&mut self) -> Result<bool> {
-        self.writable()?;
+        self.begin_write()?;
         let dev_size = self.vol.dev.size() / 4096 * 4096;
         let dev_item = self.vol.sb.dev_item().ok_or(Error::Corrupt("dev item"))?;
         if dev_size <= dev_item.total_bytes {
@@ -629,7 +674,7 @@ impl Btrfs {
 
     /// Reserve space ahead of a mutating operation.
     fn prepare_mutation(&mut self) -> Result<()> {
-        self.writable()?;
+        self.begin_write()?;
         self.ensure_system_space()?;
         self.ensure_metadata_space()?;
         self.apply_pending()
@@ -682,7 +727,7 @@ impl Btrfs {
         atime: Option<(u64, u32)>,
         mtime: Option<(u64, u32)>,
     ) -> Result<()> {
-        self.writable()?;
+        self.begin_write()?;
         let mut inode = self.read_inode(ino)?;
         if let Some(mode) = mode {
             // Keep the file-type bits.

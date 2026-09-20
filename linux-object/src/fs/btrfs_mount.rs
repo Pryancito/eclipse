@@ -15,7 +15,7 @@ use rcore_fs::vfs::{
 };
 use zcore_drivers::scheme::BlockScheme;
 
-use super::block_mount::{device_from_backend, MountBackend};
+use super::block_mount::{backend_size, device_from_backend, MountBackend};
 
 /// Adapter: rcore-fs `Device` (+ explicit size) → `btrfs::BlockDevice`.
 struct DevAdapter {
@@ -144,13 +144,6 @@ impl btrfs::BlockDevice for DevAdapter {
 
     fn size(&self) -> u64 {
         self.size
-    }
-}
-
-fn backend_size(backend: &MountBackend) -> Result<u64> {
-    match backend {
-        MountBackend::Block(block) => Ok(block.block_count() as u64 * 512),
-        MountBackend::File(file) => Ok(file.metadata()?.size as u64),
     }
 }
 

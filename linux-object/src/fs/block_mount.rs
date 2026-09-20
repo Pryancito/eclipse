@@ -639,6 +639,14 @@ impl Device for CachedDevice {
     }
 }
 
+/// Size in bytes of a mount's backing store.
+pub fn backend_size(backend: &MountBackend) -> VfsResult<u64> {
+    match backend {
+        MountBackend::Block(block) => Ok(block.block_count() as u64 * SECTOR as u64),
+        MountBackend::File(file) => Ok(file.metadata()?.size as u64),
+    }
+}
+
 pub fn device_from_backend(backend: &MountBackend) -> VfsResult<Arc<dyn Device>> {
     let (raw, size_bytes): (Arc<dyn Device>, usize) = match backend {
         MountBackend::Block(block) => (
