@@ -2,9 +2,63 @@
 
 Eclipse OS incluye de serie una sesión de escritorio Wayland basada en
 **labwc** (wlroots + renderizador software pixman, ver
-[README-drm.md](README-drm.md)) con una apariencia propia: tema oscuro con
-acento violeta, wallpaper nocturno con el logo de Eclipse y un panel inferior
-con barra de tareas, reloj e indicadores.
+[README-drm.md](README-drm.md)), con **tres apariencias** intercambiables
+sobre exactamente las mismas piezas nativas: la de Windows 11 (la que trae
+la imagen), la de KDE Plasma y la original de Eclipse. El fondo siempre es
+**lunarbg**, el panel siempre es **lunarbar** y el lanzador siempre es
+**lunarrun**; lo que cambia es la paleta y la disposición.
+
+## Las tres apariencias
+
+Se eligen con `eclipse-look` y se guardan en `/etc/eclipse/look` (manda
+`look=` de la cmdline si está). `eclipse-init` la aplica en el arranque,
+igual que hace con el idioma y la zona horaria.
+
+```sh
+eclipse-look            # imprime la actual
+eclipse-look win11      # Windows 11 (por defecto)
+eclipse-look kde        # KDE Breeze Dark
+eclipse-look eclipse    # la violeta original
+```
+
+| | `win11` | `kde` | `eclipse` |
+|---|---|---|---|
+| Tema de ventanas | `Win11-Dark` (#202020, acento #0078d4) | `Breeze-Dark` (#31363b, acento #3daee9) | `Eclipse-Dark` (violeta) |
+| Panel | una barra inferior de 48 px, **botones centrados**, translúcida | una barra inferior de 44 px, estilo Plasma | dos barras de 34 px (info arriba, tareas abajo) |
+| Reloj | dos líneas, hora sobre fecha | dos líneas, hora sobre fecha | una línea abajo, fecha arriba |
+| Terminal | paleta Campbell (Windows Terminal) | paleta Breeze (Konsole) | paleta violeta |
+| Lanzador | menú Inicio sobre la barra | KRunner en el tercio superior | KRunner en el tercio superior |
+
+Un cambio de apariencia reescribe el `<name>` del tema en `rc.xml`, copia la
+paleta de foot correspondiente y reinicia el panel (init lo relanza al
+instante); `labwc --reconfigure` recarga el tema sin cerrar la sesión.
+
+**Translucidez**: en `win11` la barra se dibuja sobre un búfer ARGB al 85 % y
+el menú del lanzador al 92 %, así que el fondo se transparenta. Es
+translucidez **plana**: el acrílico y el Mica de Windows desenfocan lo que
+hay detrás de la superficie y labwc no sabe desenfocar, así que no hay
+efecto esmerilado. No se distribuye ninguna fuente, icono ni fondo de
+Microsoft: todo está dibujado con colores propios.
+
+## Lo que NO se puede traer de KDE
+
+Plasma no puede correr aquí, y conviene saber por qué antes de intentarlo:
+`plasmashell`, `kded`, `krunner` y el agente de polkit-kde son servicios de
+**D-Bus** de arriba abajo, y esta imagen no tiene bus de sesión a propósito
+(`DBUS_SESSION_BUS_ADDRESS` apunta a un socket sin demonio para que libdbus
+falle al instante en vez de lanzar la cadena `autolaunch:`, que es donde se
+colgaba gzdoom). Tampoco hay Qt ni KF6 en la imagen, ni polkit, ni logind
+(se usa seatd). Lo que sí se recrea es la experiencia: tema, atajos, panel y
+lanzador, con las piezas nativas de Eclipse.
+
+Las variables de Qt (`QT_QPA_PLATFORM=wayland;xcb`,
+`QT_AUTO_SCREEN_SCALE_FACTOR`, y `QT_QUICK_BACKEND=software` en la sesión
+pixman) sí están puestas, para el día que se instale una app Qt.
+Deliberadamente **no** se fijan `QT_QPA_PLATFORMTHEME=kde` ni
+`XDG_CURRENT_DESKTOP=KDE`, que es lo que recomienda cualquier receta de «KDE
+sobre labwc»: el primero necesita el plugin de plasma-integration y el
+segundo hace que los portales y GTK busquen una sesión KDE que no existe.
+`XDG_CURRENT_DESKTOP` dice lo que esta sesión es de verdad, `labwc:wlroots`.
 
 Toda la configuración la genera `xtask` al construir el rootfs
 (`xtask/src/linux/desktop.rs`), así que está presente desde el primer
@@ -16,14 +70,15 @@ arranque sin pasos manuales.
 |---|---|---|
 | **lunarbg** | `/bin/lunarbg` | Cliente de fondo **animado** de Eclipse OS (`tools/lunarbg`, Rust estático). Recrea el fondo del compositor smithay original de eclipse-old: media luna dorada central, anillo de texto «ECLIPSE-SYSTEM-KERNEL…» orbitando, tres arcos tech girando a velocidades distintas, anillos pulsantes y ticks técnicos, sobre base cósmica con estrellas y rejilla de 48 px. Dibuja proceduralmente a resolución nativa vía wlr-layer-shell + wl_shm (sin imágenes ni gdk-pixbuf), con render por *scanline spans* (~2 ms/frame a 1080p) y solo redibuja/daña la región del logo por frame. La animación apunta a 24 fps (`--fps`/`LUNARBG_FPS=1..60`) pero **cada commit se regula con el frame callback del compositor**: nunca renderiza por delante de lo que éste composita (en stacks lentos degrada sola, y con el fondo tapado cae a 1 Hz). Soporta HiDPI (`wl_output.scale` + `set_buffer_scale`), multi-monitor con aspecto físico por salida, `--output NAME` para pintar salidas concretas, pausa/reanuda con `SIGUSR1` y salida limpia con `SIGTERM`. `--static`/`LUNARBG_STATIC=1` desactiva la animación; debug: `--dump /tmp/out.raw:1920x1080` (+`--dump-ms N`) y `--bench` para cronometrar el renderizador. `lunarbg --help` lista todo. |
 | Wallpaper estático | `/usr/share/backgrounds/eclipse/eclipse-night.png` | La misma escena, renderizada en build a PNG (encoder propio, sin dependencias). Hoy ningún componente de la sesión la usa (swaybg no forma parte de ella); queda como imagen de respaldo para quien quiera un fondo estático. |
-| Tema de ventanas | `/usr/share/themes/Eclipse-Dark/openbox-3/themerc` | Tema openbox-3 oscuro que labwc aplica a bordes de ventana, menús y OSD. |
-| Config labwc | `/root/.config/labwc/rc.xml` | Tema `Eclipse-Dark`, esquinas redondeadas, 4 escritorios y atajos de teclado. |
+| Temas de ventanas | `/usr/share/themes/{Win11-Dark,Breeze-Dark,Eclipse-Dark}/openbox-3/themerc` | Los tres temas openbox-3 que labwc aplica a bordes de ventana, menús y OSD. `eclipse-look` elige cuál nombra `rc.xml`. |
+| Config labwc | `/root/.config/labwc/rc.xml` | Tema de la apariencia activa (`Win11-Dark` de fábrica), esquinas redondeadas, 4 escritorios y los atajos de KDE/Windows. |
 | Menú de escritorio | `/root/.config/labwc/menu.xml` | Clic derecho en el fondo: terminal, editor, monitor, recargar y salir. |
 | Entorno de sesión | `/root/.config/labwc/environment` | Cursor Adwaita y `GTK_THEME=Adwaita:dark`. |
-| **lunarbar** | `/bin/lunarbar` | Panel propio de Eclipse OS (`tools/lunarbar`, Rust estático, wlr-layer-shell + wl_shm, sin GTK ni GL): dos barras por salida con lanzador, barra de tareas, reloj, volumen, teclado y apagado, más popups (menú de aplicaciones) y tooltips. Traducido (`i18n.rs`). |
+| **lunarrun** | `/bin/lunarrun` | Lanzador tipo KRunner (`tools/lunarbar`, comparte biblioteca con el panel). Overlay centrado sobre wlr-layer-shell: se escribe para filtrar las aplicaciones instaladas (sin distinguir acentos), ↑/↓ o Tab para elegir, Intro para lanzar, Esc o clic fuera para cerrar. Una palabra que resuelva en `$PATH` sale como «ejecutar orden», así que `Alt+Espacio top` funciona como en KRunner. `lunarrun --toggle-desktop` es el Super+D de KDE: minimiza todas las ventanas por wlr-foreign-toplevel-management, o las restaura si ya lo estaban. `--dump RUTA:AnchoxAlto` lo dibuja a un fichero ARGB8888 sin compositor. Lo lanzan `eclipse-run` y `eclipse-showdesktop`. |
+| **lunarbar** | `/bin/lunarbar` | Panel propio de Eclipse OS (`tools/lunarbar`, Rust estático, wlr-layer-shell + wl_shm, sin GTK ni GL): una barra inferior por salida en `win11`/`kde` (dos en `eclipse`) con lanzador, barra de tareas, reloj, volumen, teclado y apagado, más popups (menú de aplicaciones) y tooltips. Traducido (`i18n.rs`). |
 | Autoarranque | *(ausente a propósito)* | labwc lanza `sh ~/.config/labwc/autostart` con doble `fork`, y esa `ash` cae con SIGSEGV en este kernel (musl mallocng). En su lugar `eclipse-init` arranca el fondo y el panel como **servicios** (`/etc/eclipse/services/{lunarbg,lunarbar}.service`, con `after = labwc` y `wait_socket` sobre `wayland-0`) a través de los wrappers `/usr/local/bin/eclipse-lunarbg` y `eclipse-lunarbar`, que a su vez esperan al socket `wayland-*`. `~/.config/labwc/autostart.README` lo explica en el sistema instalado. |
 | GTK 3/4 | `/root/.config/gtk-{3.0,4.0}/settings.ini` | Modo oscuro por defecto para aplicaciones GTK. |
-| Terminal | `/root/.config/foot/foot.ini` | Paleta violeta oscura a juego con el escritorio. |
+| Terminal | `/root/.config/foot/foot.ini` (+ `foot.win11.ini`, `foot.kde.ini`, `foot.eclipse.ini`) | Paleta a juego con la apariencia activa; `eclipse-look` copia la que toque sobre `foot.ini`. |
 | Lanzador (shell) | `/usr/local/bin/labwc` | Wrapper endurecido de labwc. Lo usan tanto los shells interactivos (`login` limpia env) como `eclipse-init`, para que ambos pasen por la misma selección de renderer y variables de entorno. |
 
 ## Paquetes de runtime
@@ -208,7 +263,13 @@ ya pasan el IWAD.
 
 | Atajo | Acción |
 |---|---|
-| `Super+Enter` / `Alt+Enter` | Abrir terminal (`foot`) |
+| `Alt+Espacio` / `Alt+F2` / `Ctrl+Alt+Supr` | Lanzador de búsqueda (`lunarrun`) |
+| `Super+Enter` / `Alt+Enter` / `Ctrl+Alt+T` | Abrir terminal (`foot`) |
+| `Super+E` | Gestor de archivos (`eclipse-files`) |
+| `Super+D` | Mostrar escritorio (minimiza o restaura todo) |
+| `Ctrl+F1..F4` | Ir al escritorio N (las teclas de KDE) |
+| `Alt+Shift+Tab` | Ventana anterior |
+| `Super+↓` | Minimizar |
 | `Super+Espacio` | Menú de escritorio |
 | `Super+K` | Ciclar layout de teclado (`es` / `us`) |
 | `Alt+Tab` | Cambiar de ventana |
@@ -265,10 +326,13 @@ borra `/etc/eclipse/services/labwc.service` o arranca con `desktop=xorg`).
   `tools/lunarbg/src/scene.rs`). El PNG de
   `/usr/share/backgrounds/eclipse/eclipse-night.png` se regenera fuera de
   un build completo con `cargo test -p xtask dump_wallpaper -- --ignored`.
-- **Colores del tema**: edita
-  `/usr/share/themes/Eclipse-Dark/openbox-3/themerc` y ejecuta la acción
-  «Recargar labwc» del menú (o `labwc --reconfigure`).
-- **Panel**: `lunarbar` no tiene fichero de configuración; los cambios van en
+- **Apariencia completa**: `eclipse-look win11|kde|eclipse` (ver arriba).
+- **Colores del tema**: edita el `themerc` de la apariencia activa
+  (`/usr/share/themes/{Win11-Dark,Breeze-Dark,Eclipse-Dark}/openbox-3/themerc`)
+  y ejecuta la acción «Recargar labwc» del menú (o `labwc --reconfigure`).
+- **Panel**: `lunarbar` no tiene fichero de configuración; su paleta y su
+  disposición salen de `/etc/eclipse/look` (`ECLIPSE_LOOK=` lo pisa para una
+  ejecución suelta) y el resto de los cambios van en
   `tools/lunarbar/src/` (`draw.rs` para el aspecto, `apps.rs` para el menú)
   y `pkill lunarbar` lo relanza vía init con el nuevo binario.
 
