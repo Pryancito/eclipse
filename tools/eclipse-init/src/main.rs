@@ -129,6 +129,11 @@ struct Service {
     /// boots labwc on hardware and Xorg under `make qemu` purely from a
     /// `desktop=` boot argument.
     desktop: Option<String>,
+    /// If set, the service starts only when this token is present on the
+    /// kernel command line. It is how a diagnostic can ship in every image and
+    /// still cost a normal boot nothing: `cmdline = dbus.selftest` runs the
+    /// session-bus probe only on a boot that asked for it.
+    cmdline: Option<String>,
     /// If set, child stdout/stderr append here instead of `/dev/null`.
     log: Option<String>,
     /// Live child pid for a running `respawn` service.
@@ -213,13 +218,17 @@ const CHILD_ENV: &[&str] = &[
     // implemented, so pa_mutex_new() no longer aborts when libpulse loads.
     "ALSOFT_DRIVERS=pulse,alsa",
     "PULSE_SERVER=unix:/run/pulse/native",
-    // No D-Bus session bus on Eclipse OS. An UNSET address makes libdbus
-    // `autolaunch:` -- fork dbus-launch, which opens $DISPLAY and spawns a
-    // dbus-daemon plus a babysitter behind pipes -- and SDL_Init() walks
-    // that chain (SDL_DBus_Init) before anything else; gzdoom hung there.
-    // Pinned to the conventional user-bus path, the connect is refused at
-    // once when no daemon runs and apps carry on bus-less; a dbus-daemon
-    // bound to this path later is picked up by new clients automatically.
+    // The D-Bus session bus. `dbus.service` runs a daemon on exactly this
+    // path (Alpine's dbus-daemon when the image has it, eclipse-dbusd
+    // otherwise), so clients now get a REAL bus: RequestName works, and with
+    // it every single-instance check, GtkApplication and portal client.
+    //
+    // Pinning the address still matters even when the daemon is missing. An
+    // UNSET address makes libdbus `autolaunch:` -- fork dbus-launch, which
+    // opens $DISPLAY and spawns a dbus-daemon plus a babysitter behind pipes
+    // -- and SDL_Init() walks that chain (SDL_DBus_Init) before it does
+    // anything else; gzdoom hung there. Pinned, the connect is refused at
+    // once and the app carries on bus-less instead of hanging.
     "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus",
 ];
 
@@ -270,6 +279,20 @@ fn main() {
         log("console/installer session: compositor services skipped");
     }
     services.retain(|_, s| s.desktop.as_deref().map_or(true, |d| d == desktop));
+    // `cmdline = <token>`: opt-in services (diagnostics) stay out of a normal
+    // boot entirely.
+    services.retain(|name, s| match s.cmdline.as_deref() {
+        None => true,
+        Some(token) => {
+            let on = cmdline_has(token);
+            if !on {
+                log(&format!(
+                    "{name}: skipped (needs '{token}' on the kernel cmdline)"
+                ));
+            }
+            on
+        }
+    });
 
     // Move the display to the dedicated graphics VT (tty7) BEFORE starting the
     // compositor/X, so its libseat binds that reserved, shell-free VT instead of
@@ -717,7 +740,10 @@ fn load_services(dir: &Path) -> BTreeMap<String, Service> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => {
-            log(&format!("no service directory {} (nothing to start)", dir.display()));
+            log(&format!(
+                "no service directory {} (nothing to start)",
+                dir.display()
+            ));
             return out;
         }
     };
@@ -741,7 +767,10 @@ fn load_services(dir: &Path) -> BTreeMap<String, Service> {
             Some(svc) => {
                 out.insert(name, svc);
             }
-            None => log(&format!("warning: {} has no 'exec', skipped", path.display())),
+            None => log(&format!(
+                "warning: {} has no 'exec', skipped",
+                path.display()
+            )),
         }
     }
     out
@@ -753,12 +782,15 @@ fn load_services(dir: &Path) -> BTreeMap<String, Service> {
 ///   type    = respawn | oneshot       (default: oneshot)
 ///   after   = bar baz                 (optional; space-separated dep names)
 ///   desktop = labwc | xorg            (optional; only start under that session)
+///   cmdline = dbus.selftest           (optional; only start when the kernel
+///                                      command line carries this token)
 ///   log     = /tmp/foo.log            (optional; capture child stdout/stderr)
 fn parse_service(name: &str, text: &str) -> Option<Service> {
     let mut exec: Vec<String> = Vec::new();
     let mut kind = Kind::Oneshot;
     let mut after: Vec<String> = Vec::new();
     let mut desktop: Option<String> = None;
+    let mut cmdline: Option<String> = None;
     let mut log_path: Option<String> = None;
     let mut wait_socket: Option<String> = None;
     let mut wait_path: Option<String> = None;
@@ -782,6 +814,7 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
             }
             "after" => after = value.split_whitespace().map(String::from).collect(),
             "desktop" => desktop = Some(value.to_string()),
+            "cmdline" => cmdline = Some(value.to_string()),
             "log" => log_path = Some(value.to_string()),
             "wait_socket" => wait_socket = Some(value.to_string()),
             "wait_path" => wait_path = Some(value.to_string()),
@@ -798,6 +831,7 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
         kind,
         after,
         desktop,
+        cmdline,
         log: log_path,
         wait_socket,
         wait_path,

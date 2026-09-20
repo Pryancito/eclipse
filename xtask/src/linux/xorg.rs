@@ -311,6 +311,21 @@ const DEFAULT_PACKAGES: &[&str] = &[
     //                    server-side decorations via xdg-decoration, which SDL
     //                    prefers when present, so this is only the fallback
     //                    (and what SDL_VIDEO_WAYLAND_PREFER_LIBDECOR=1 uses).
+    // ── Freedoom ────────────────────────────────────────────────────────────
+    //   - freedoom:      the two IWADs (freedoom1.wad, freedoom2.wad). No
+    //                    engine of its own; it is the game DATA.
+    //   - gzdoom:        the engine the freedoom package's own launchers use.
+    //                    It needs OpenGL 3.3+, so on the pixman session it
+    //                    runs on llvmpipe -- playable, not fast. A software
+    //                    engine (chocolate-doom, crispy-doom) is faster on
+    //                    this stack and `eclipse-freedoom` prefers one when
+    //                    installed; it is not in the default set because the
+    //                    repo docs only ever verified gzdoom's name.
+    // Both are shipped rather than left to a runtime `apk add`: an installed
+    // Eclipse has no mirror in reach on first boot, which is exactly when
+    // somebody wants to see whether the desktop can run a game at all.
+    "freedoom",
+    "gzdoom",
     "sdl2",
     "sdl3",
     "sdl12-compat",
