@@ -714,16 +714,45 @@ cfg_if! {
             if used < total / 100 * HEAP_GROW_AT_PCT {
                 return;
             }
+            grow_heap_guarded(used, total);
+        }
+
+        /// Run one growth attempt under the re-entrancy flag. Returns whether
+        /// the heap actually got bigger.
+        fn grow_heap_guarded(used: usize, total: usize) -> bool {
             if HEAP_GROWING.swap(true, Ordering::AcqRel) {
-                return;
+                return false;
             }
-            grow_heap_once(used, total);
+            let grew = grow_heap_once(used, total);
             HEAP_GROWING.store(false, Ordering::Release);
+            grew
+        }
+
+        /// Last resort: the buddy just refused an allocation. Grow **without**
+        /// consulting the watermark and tell the caller whether to retry.
+        ///
+        /// [`try_grow_heap`] alone is not enough to keep the machine alive,
+        /// for two compounding reasons. It only ran from the *success* path of
+        /// `alloc` — a failing allocation fell straight through to
+        /// `alloc_error`, which panics, so the elastic heap could never save
+        /// the one allocation that needed it. And the watermark it consults is
+        /// `HEAP_USED`, which counts the *requested* size while the buddy
+        /// rounds every block up to a power of two; the desktop session was
+        /// observed exhausting the pool with `HEAP_USED` reading ~54%, i.e.
+        /// well under the 70% trigger, so growth was never even considered.
+        /// Growing here needs no accounting to be accurate: the buddy saying
+        /// "no" is the ground truth.
+        #[cold]
+        #[inline(never)]
+        fn grow_heap_on_failure() -> bool {
+            let total = HEAP_TOTAL.load(Ordering::Relaxed);
+            let used = HEAP_USED.load(Ordering::Relaxed);
+            grow_heap_guarded(used, total)
         }
 
         #[cold]
         #[inline(never)]
-        fn grow_heap_once(used: usize, total: usize) {
+        fn grow_heap_once(used: usize, total: usize) -> bool {
             if total >= HEAP_MAX_TOTAL {
                 if HEAP_GROW_REFUSED.fetch_add(1, Ordering::Relaxed) == 0 {
                     emit(format_args!(
@@ -732,13 +761,13 @@ cfg_if! {
                         used >> 20,
                     ));
                 }
-                return;
+                return false;
             }
             // The heap lock is free at the call site (the allocation that
             // brought us here has already released it), but an IRQ can land
             // here on a CPU that holds it. Asking is exact and costs nothing.
             if HEAP_ALLOCATOR.0.held_by_current_cpu() {
-                return;
+                return false;
             }
             // Leave the machine room to commit user pages.
             let ram = TOTAL_MEMORY.load(Ordering::Relaxed);
@@ -755,7 +784,7 @@ cfg_if! {
                         total >> 20,
                     ));
                 }
-                return;
+                return false;
             }
             // A fragmented machine can have GiBs free and no 32 MiB run left:
             // the second growth on the very first test boot was refused for
@@ -781,7 +810,7 @@ cfg_if! {
                         HEAP_GROW_CHUNKS[HEAP_GROW_CHUNKS.len() - 1] >> 20,
                     ));
                 }
-                return;
+                return false;
             };
             let va = kernel_hal::mem::phys_to_virt(pa);
             // SAFETY: these frames were just allocated to us, are inside the
@@ -809,6 +838,7 @@ cfg_if! {
                 new_total >> 20,
                 used >> 20,
             ));
+            true
         }
 
         pub fn init() {
@@ -1162,6 +1192,23 @@ cfg_if! {
                         .alloc(ext)
                         .ok()
                         .map_or(core::ptr::null_mut::<u8>(), |a| a.as_ptr())
+                };
+                // The buddy refused. Before the caller turns that into
+                // `alloc_error` (which panics and ends the machine), take
+                // frames from physical RAM, hand them to the buddy and ask
+                // once more — see `grow_heap_on_failure` for why the
+                // watermark-driven growth on the success path below cannot
+                // catch this case. `held_by_current_cpu` means the null came
+                // from the re-entrancy refusal, not from an empty pool, so
+                // growing would not help and re-locking would deadlock.
+                let p = if p.is_null() && !self.0.held_by_current_cpu() && grow_heap_on_failure() {
+                    self.0
+                        .lock()
+                        .alloc(ext)
+                        .ok()
+                        .map_or(core::ptr::null_mut::<u8>(), |a| a.as_ptr())
+                } else {
+                    p
                 };
                 if !p.is_null() {
                     // [diag] Double-alloc tripwire. Every crash zeroes a live

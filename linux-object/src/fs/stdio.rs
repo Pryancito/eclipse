@@ -753,8 +753,14 @@ pub fn register_tty_intr_waker(waker: core::task::Waker) {
     register_tty_waker_once(&mut TTY_INTR_WAKERS.lock(), &waker);
 }
 
+/// Keep THIS waker registered for the next sleep cycle without disturbing the
+/// other waiters — see `kernel_hal::net::retain_net_rx_waker`, which had the
+/// same inverted `retain` predicate and the same consequence: one waiter's
+/// re-arm deleted everybody else's registration, so they lost their wakes and
+/// fell back to the poll backstop. `wake_tty_intr_waiters` above takes the
+/// whole list, so there is nothing to retain after a wake either.
 pub fn retain_tty_intr_waker(waker: &core::task::Waker) {
-    TTY_INTR_WAKERS.lock().retain(|w| w.will_wake(waker));
+    register_tty_waker_once(&mut TTY_INTR_WAKERS.lock(), waker);
 }
 
 /// Remove a wait's TTY-intr registration on Ready/`Drop` (see net clear_io_wait).
