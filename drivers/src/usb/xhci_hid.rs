@@ -738,6 +738,31 @@ impl XferRing {
         (self.buf.phys + self.xfer_deq * 16) as u64
     }
 
+    /// Data-buffer pointer of the TRB living at physical address `phys`, when
+    /// that address is one of this ring's TRBs.
+    ///
+    /// A Transfer Event points at the TRB it completed, which is how we can
+    /// tell which report buffer the controller just filled instead of trusting
+    /// a software counter that has no way back once it slips.
+    fn trb_buffer_at(&self, phys: u64) -> Option<u64> {
+        let base = self.buf.phys as u64;
+        let end = base + ((self.cap as u64) + 1) * 16;
+        if phys < base || phys >= end || !(phys - base).is_multiple_of(16) {
+            return None;
+        }
+        Some(self.buf.read_u64((phys - base) as usize))
+    }
+
+    /// The TRB physically before `phys` in this ring, wrapping at the start.
+    fn prev_trb_phys(&self, phys: u64) -> u64 {
+        let base = self.buf.phys as u64;
+        if phys <= base {
+            base + (self.cap as u64) * 16
+        } else {
+            phys - 16
+        }
+    }
+
     fn deq_cycle(&self) -> bool {
         if self.xfer_deq == self.enq {
             self.cycle
@@ -885,8 +910,14 @@ fn classify_hid_report(desc: &[u8]) -> HidClass {
     let mut usage_page: u32 = 0;
     let mut local_usages: [u32; 8] = [0; 8];
     let mut n_local: usize = 0;
-    let mut app_page: u32 = 0;
-    let mut app_usage: u32 = 0;
+    // One flag per application collection kind we care about, NOT "the last
+    // one wins". A cheap USB keyboard (and every combo dongle) declares
+    // `Keyboard` and then a `Consumer Control` collection for the media keys;
+    // keeping only the last collection classified the whole interface as
+    // `Skip`, so the keyboard was never bound and the device was dead.
+    let mut app_keyboard = false;
+    let mut app_mouse = false;
+    let mut app_consumer = false;
     let mut saw_rel_x = false;
     let mut saw_rel_y = false;
     let mut saw_abs_x = false;
@@ -933,8 +964,12 @@ fn classify_hid_report(desc: &[u8]) -> HidClass {
             (0, 0xa) => {
                 // Collection
                 if data == 0x01 && n_local > 0 {
-                    app_page = usage_page;
-                    app_usage = local_usages[0];
+                    match (usage_page, local_usages[0]) {
+                        (0x01, 0x06) => app_keyboard = true,
+                        (0x01, 0x02) | (0x01, 0x01) => app_mouse = true,
+                        (0x0c, _) => app_consumer = true,
+                        _ => {}
+                    }
                 }
                 n_local = 0;
             }
@@ -971,13 +1006,16 @@ fn classify_hid_report(desc: &[u8]) -> HidClass {
     if saw_abs_x && saw_abs_y {
         return HidClass::Tablet;
     }
-    if app_page == 0x01 && app_usage == 0x06 {
+    if app_keyboard {
         return HidClass::Key;
     }
-    if app_page == 0x01 && (app_usage == 0x02 || app_usage == 0x01) {
+    if app_mouse {
         return HidClass::Mouse;
     }
-    if app_page == 0x0c {
+    // Consumer-control only, with no pointer and no keyboard anywhere in the
+    // descriptor: nothing we can drive, and binding it would fabricate
+    // pointer events.
+    if app_consumer {
         return HidClass::Skip;
     }
     HidClass::Unknown
@@ -1010,11 +1048,58 @@ struct MouseLayout {
     report_bytes: usize,
 }
 
+/// Layout of a keyboard input report, extracted from its HID report
+/// descriptor. The boot report is one particular instance of this
+/// ([`BOOT_KEY_LAYOUT`]), not a separate case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyLayout {
+    report_id: Option<u8>,
+    /// The modifier bitmap (Keyboard page usages 0xE0..=0xE7, Variable),
+    /// ≤ 8 bits.
+    mods: BitField,
+    /// The keycode array. `off` is the first entry, `len` the width of ONE
+    /// entry; there are `key_count` of them back to back.
+    keys: BitField,
+    key_count: usize,
+    /// Size in bytes of this report, ID byte included.
+    report_bytes: usize,
+}
+
+/// The USB HID boot keyboard report: `[modifiers, reserved, k0..k5]`.
+const BOOT_KEY_LAYOUT: KeyLayout = KeyLayout {
+    report_id: None,
+    mods: BitField { off: 0, len: 8 },
+    keys: BitField { off: 16, len: 8 },
+    key_count: 6,
+    report_bytes: 8,
+};
+
+/// Pull the modifier bitmap and up to six keycodes out of one report.
+///
+/// This replaces the old "`tmp[0]` is modifiers, `tmp[2..8]` are the keys"
+/// assumption, which is true only for a boot-protocol report. A keyboard that
+/// speaks report protocol puts its Report ID in `tmp[0]`, so the ID was
+/// decoded as a modifier bitmap: pressing any key on such a board latched
+/// phantom Ctrl/Shift/Alt that were never released.
+fn decode_keyboard(buf: &[u8], kl: &KeyLayout) -> (u8, [u8; 6]) {
+    let mods = read_bits(buf, kl.mods.off, kl.mods.len.min(8)) as u8;
+    let mut keys = [0u8; 6];
+    let width = kl.keys.len.clamp(1, 8);
+    for (j, slot) in keys.iter_mut().enumerate().take(kl.key_count.min(6)) {
+        *slot = read_bits(buf, kl.keys.off + j * kl.keys.len, width) as u8;
+    }
+    (mods, keys)
+}
+
 /// What a HID report descriptor tells us about an interface.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct HidDescInfo {
     /// The first complete relative-mouse report on the interface, if any.
     mouse: Option<MouseLayout>,
+    /// The first keyboard report on the interface, if any. An interface can
+    /// carry BOTH this and `mouse` under different report IDs — that is what
+    /// every wireless combo receiver looks like.
+    key: Option<KeyLayout>,
     /// Size in bytes of the LARGEST input report on the interface, any report
     /// ID. Interrupt-IN transfers must be armed at least this large: a longer
     /// non-mouse report sharing the endpoint (Logitech HID++ is 20 bytes on
@@ -1099,12 +1184,30 @@ fn emit_scroll(lis: &EventListener<InputEvent>, wheel: i32, hwheel: i32) {
     }
 }
 
+/// Linux's own ceilings on a HID report descriptor (`hid_parser_global` in
+/// `hid-core.c`): a single field is at most 256 bits wide and one report
+/// carries at most 12288 usages.
+///
+/// Without them a malformed (or hostile) descriptor that declares
+/// `Report Count = 0xffffffff` makes the per-field walk below run for four
+/// billion iterations inside the xHCI interrupt handler: the machine simply
+/// stops booting, with no message, at the moment a USB device is enumerated.
+const HID_MAX_REPORT_SIZE_BITS: u32 = 256;
+const HID_MAX_USAGES: u32 = 12288;
+/// Ceiling on the running bit position of one report. 16 KiB of report is far
+/// past anything real (the largest we ever arm is [`MAX_HID_TD`]) and keeps
+/// `bit_pos` from wrapping into a nonsense `max_report_bytes`.
+const HID_MAX_REPORT_BITS: usize = 16 * 1024 * 8;
+
 /// Full 32-bit HID usage: usage page in the high half, usage id in the low.
 const USAGE_GD_X: u32 = 0x0001_0030;
 const USAGE_GD_Y: u32 = 0x0001_0031;
 const USAGE_GD_WHEEL: u32 = 0x0001_0038;
 const USAGE_CONSUMER_AC_PAN: u32 = 0x000C_0238;
 const USAGE_PAGE_BUTTON: u32 = 0x09;
+const USAGE_PAGE_KEYBOARD: u32 = 0x07;
+/// Keyboard page usage 0xE0 (Left Control), the first of the eight modifiers.
+const USAGE_KEY_LEFTCTRL: u32 = 0x0007_00E0;
 
 /// Parse a HID report descriptor: find the relative-mouse report (report ID,
 /// button block, X/Y/wheel/pan fields as bit positions) and the size of the
@@ -1139,6 +1242,8 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
     let mut y: Option<BitField> = None;
     let mut wheel: Option<BitField> = None;
     let mut hwheel: Option<BitField> = None;
+    let mut kmods: Option<BitField> = None;
+    let mut kkeys: Option<(BitField, usize)> = None;
 
     let mut info = HidDescInfo::default();
 
@@ -1154,9 +1259,22 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
         y: Option<BitField>,
         wheel: Option<BitField>,
         hwheel: Option<BitField>,
+        kmods: Option<BitField>,
+        kkeys: Option<(BitField, usize)>,
     ) {
         let bytes = bit_pos.div_ceil(8);
         info.max_report_bytes = info.max_report_bytes.max(bytes);
+        if info.key.is_none() {
+            if let (Some(mods), Some((keys, key_count))) = (kmods, kkeys) {
+                info.key = Some(KeyLayout {
+                    report_id,
+                    mods,
+                    keys,
+                    key_count,
+                    report_bytes: bytes,
+                });
+            }
+        }
         if info.mouse.is_none() {
             if let (Some(buttons), Some(x), Some(y)) = (buttons, x, y) {
                 info.mouse = Some(MouseLayout {
@@ -1204,9 +1322,10 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
         // A usage item of 4 bytes carries its own page in the high half.
         let full_usage = |d: u32| if size == 4 { d } else { (usage_page << 16) | d };
         match (typ, tag) {
-            (1, 0) => usage_page = data,   // Global Usage Page
-            (1, 7) => report_size = data,  // Global Report Size
-            (1, 9) => report_count = data, // Global Report Count
+            (1, 0) => usage_page = data, // Global Usage Page
+            // Global Report Size / Report Count, clamped (see the constants).
+            (1, 7) => report_size = data.min(HID_MAX_REPORT_SIZE_BITS),
+            (1, 9) => report_count = data.min(HID_MAX_USAGES),
             (1, 0xa) => {
                 // Push
                 if sp < stack.len() {
@@ -1229,12 +1348,17 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
                 let id = data as u8;
                 if report_id != Some(id) {
                     if report_id.is_some() || bit_pos > 0 {
-                        finish(&mut info, report_id, bit_pos, buttons, x, y, wheel, hwheel);
+                        finish(
+                            &mut info, report_id, bit_pos, buttons, x, y, wheel, hwheel, kmods,
+                            kkeys,
+                        );
                         buttons = None;
                         x = None;
                         y = None;
                         wheel = None;
                         hwheel = None;
+                        kmods = None;
+                        kkeys = None;
                     }
                     report_id = Some(id);
                     bit_pos = 8;
@@ -1252,11 +1376,32 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
                 // Input main item. data: bit0 Constant, bit1 Variable,
                 // bit2 Relative.
                 let constant = (data & 0x1) != 0;
+                let variable = (data & 0x2) != 0;
                 let relative = (data & 0x4) != 0;
                 let fbits = report_size as usize;
                 let count = report_count as usize;
                 if !constant && fbits > 0 {
-                    if usage_page == USAGE_PAGE_BUTTON {
+                    if usage_page == USAGE_PAGE_KEYBOARD {
+                        // A keyboard report is two items on the Keyboard page:
+                        // a Variable bitmap of the eight modifiers (Usage
+                        // Minimum 0xE0), and an Array of keycodes. Recognising
+                        // them by shape rather than assuming the boot layout is
+                        // what lets a report-protocol keyboard work at all.
+                        if variable && fbits == 1 && usage_min == USAGE_KEY_LEFTCTRL {
+                            kmods.get_or_insert(BitField {
+                                off: bit_pos,
+                                len: count.min(8),
+                            });
+                        } else if !variable && count > 0 {
+                            kkeys.get_or_insert((
+                                BitField {
+                                    off: bit_pos,
+                                    len: fbits,
+                                },
+                                count,
+                            ));
+                        }
+                    } else if usage_page == USAGE_PAGE_BUTTON {
                         // Button block: one bit per button. Only the first 8
                         // map onto BTN_LEFT..BTN_EXTRA; the rest are skipped
                         // but still counted in `bit_pos`.
@@ -1303,7 +1448,9 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
                         }
                     }
                 }
-                bit_pos += fbits.saturating_mul(count);
+                bit_pos = bit_pos
+                    .saturating_add(fbits.saturating_mul(count))
+                    .min(HID_MAX_REPORT_BITS);
                 n_local = 0;
                 usage_min = 0;
                 usage_max = 0;
@@ -1318,7 +1465,9 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
             _ => {}
         }
     }
-    finish(&mut info, report_id, bit_pos, buttons, x, y, wheel, hwheel);
+    finish(
+        &mut info, report_id, bit_pos, buttons, x, y, wheel, hwheel, kmods, kkeys,
+    );
     // Axes wider than the decoder are not a mouse we can drive.
     if let Some(ml) = info.mouse {
         let bad = |f: BitField| f.len == 0 || f.len > 32;
@@ -1417,7 +1566,13 @@ struct HidDev {
     /// Index into `bufs` of the next buffer to be re-armed with a fresh TRB.
     /// Advances after every resubmit.
     enqueue_idx: usize,
+    /// Keyboard modifier bitmap of the last report.
     last_mods: u8,
+    /// Mouse button bitmap of the last report. Separate from `last_mods`: one
+    /// interface can carry both roles, and sharing the field made every
+    /// keystroke on a combo receiver look like a button change (and every
+    /// click like a modifier change).
+    last_buttons: u8,
     last_keys: [u8; 6],
     /// Diagnostics for `/proc/usbhid` (see `XhciUsbHid::debug_report`).
     iface: u8,
@@ -1437,6 +1592,9 @@ struct HidDev {
     /// Parsed relative-mouse report layout, when the descriptor gave one.
     /// `None` → parse the boot `[buttons, dx, dy, …]` layout.
     mouse_layout: Option<MouseLayout>,
+    /// Parsed keyboard report layout. [`BOOT_KEY_LAYOUT`] for a boot-protocol
+    /// keyboard (no report descriptor is read for those).
+    key_layout: Option<KeyLayout>,
 }
 
 impl XhciInner {
@@ -1635,6 +1793,58 @@ impl XhciInner {
             None => return false,
         };
 
+        // Resynchronise the dispatch head from the event itself. `ev.p` is the
+        // TRB the controller completed, and that TRB carries the address of
+        // the buffer it filled: comparing it against `bufs` says which report
+        // just landed, with no dependence on a counter. A single dropped or
+        // reordered event used to put the software head permanently one slot
+        // behind, and from then on every report was decoded out of the
+        // PREVIOUS completion's buffer -- the pointer lagging one motion, keys
+        // arriving on release -- with nothing to ever bring it back.
+        {
+            let (ring_idx, want) = {
+                let h = &self.hids[idx];
+                (h.ring_idx, h.bufs[h.dispatch_idx].sub_phys(0))
+            };
+            let seen = self
+                .xfer_rings
+                .get(ring_idx)
+                .and_then(|o| o.as_ref())
+                .and_then(|r| {
+                    // VirtualBox sometimes reports `ev.p` as the TRB AFTER the
+                    // completed one. If the previous TRB is the buffer we
+                    // expect, believe the counter and leave it alone.
+                    if r.trb_buffer_at(r.prev_trb_phys(ev.p)) == Some(want) {
+                        None
+                    } else {
+                        r.trb_buffer_at(ev.p)
+                    }
+                });
+            if let Some(filled) = seen {
+                if filled != want {
+                    if let Some(k) = self.hids[idx]
+                        .bufs
+                        .iter()
+                        .position(|b| b.sub_phys(0) == filled)
+                    {
+                        warn!(
+                            "[xhci] slot={} dci={} dispatch head {} -> {} (resynced from the event)",
+                            i, dci, self.hids[idx].dispatch_idx, k
+                        );
+                        self.hids[idx].dispatch_idx = k;
+                    }
+                }
+            }
+        }
+
+        // Bytes actually written by the controller. The Transfer Event carries
+        // the RESIDUAL in its low 24 bits (xHCI 1.2 section 6.4.2.1), i.e. what
+        // was NOT transferred; a short report used to be decoded over the full
+        // buffer, so the tail of the PREVIOUS report in that same buffer was
+        // read as live data -- stuck buttons and phantom keys on any device
+        // whose reports vary in length.
+        let residual = (ev.status & 0x00ff_ffff) as usize;
+
         let (ridx, blen, buf_phys, dispatch_idx) = {
             let h = &mut self.hids[idx];
             // Re-arm with the buffer at the enqueue head of the round-robin
@@ -1656,7 +1866,8 @@ impl XhciInner {
             (h.ring_idx, h.report_len as u16, buf_phys, dispatch_idx)
         };
         if let Some(l) = lis {
-            self.dispatch_hid(idx, dispatch_idx, l);
+            let actual = (blen as usize).saturating_sub(residual);
+            self.dispatch_hid(idx, dispatch_idx, actual, l);
         }
         if let Some(r) = self.xfer_rings.get_mut(ridx).and_then(|o| o.as_mut()) {
             r.advance_dequeue(1);
@@ -2647,6 +2858,10 @@ impl XhciInner {
             } else {
                 None
             },
+            // The keyboard layout, on the other hand, is kept whatever the
+            // interface classified as: a combo receiver classifies as Mouse
+            // (it has relative X/Y) and still carries the keyboard reports.
+            key: parsed.key,
             max_report_bytes: parsed.max_report_bytes,
         };
         Some(class)
@@ -2849,6 +3064,7 @@ impl XhciInner {
             dispatch_idx: 0,
             enqueue_idx: 0,
             last_mods: 0,
+            last_buttons: 0,
             last_keys: [0; 6],
             iface,
             if_proto: proto,
@@ -2861,6 +3077,13 @@ impl XhciInner {
             report_desc: report_desc.0,
             report_desc_len: report_desc.1,
             mouse_layout: parsed.mouse,
+            // A boot-protocol keyboard has no report descriptor to parse (we
+            // never read one), and its report IS the boot layout.
+            key_layout: parsed.key.or(if real_proto == HID_PROTO_KEY {
+                Some(BOOT_KEY_LAYOUT)
+            } else {
+                None
+            }),
         });
         // Two ways a pointer can be bound and still deliver nothing, both
         // reported at ERROR level because that is the only level a rig booted
@@ -2933,12 +3156,28 @@ impl XhciInner {
     /// (`handle_hid_transfer_side`) owns the dispatch head and has already
     /// advanced it, so a completion drained without a listener still keeps
     /// the two ring heads in lockstep.
-    fn dispatch_hid(&mut self, idx: usize, dispatch_idx: usize, lis: &EventListener<InputEvent>) {
+    fn dispatch_hid(
+        &mut self,
+        idx: usize,
+        dispatch_idx: usize,
+        actual_len: usize,
+        lis: &EventListener<InputEvent>,
+    ) {
         let h = match self.hids.get_mut(idx) {
             Some(h) => h,
             None => return,
         };
-        let report_len = h.report_len;
+        // Decode only what the controller actually wrote. `tmp` is zeroed
+        // beyond that, so a field that falls outside a short report reads as 0
+        // instead of the stale tail of the previous report in this buffer.
+        //
+        // A zero-length transfer is legal on an interrupt IN endpoint and
+        // means "nothing to report"; decoding it would read as every key and
+        // every button released.
+        if actual_len == 0 {
+            return;
+        }
+        let report_len = h.report_len.min(actual_len);
         let buf_phys = h.bufs[dispatch_idx].phys;
         let v = phys_to_virt(buf_phys);
         // Hold the whole report: a report-protocol mouse layout can place fields
@@ -2979,15 +3218,25 @@ impl XhciInner {
         h.last_report_len = report_len;
         h.report_count = h.report_count.saturating_add(1);
 
+        // Demultiplex by Report ID before anything else. One interrupt
+        // endpoint can carry a keyboard report AND a mouse report under
+        // different IDs -- that is what every wireless combo receiver and
+        // every keyboard with a trackpad looks like -- but an interface used
+        // to be pinned to a single role, so on those devices the keyboard was
+        // simply never delivered.
+        let rid = tmp.first().copied();
+        let key_match = h
+            .key_layout
+            .filter(|k| k.report_id.is_none() || k.report_id == rid);
+        if let Some(kl) = key_match {
+            let (mods, keys) = decode_keyboard(&tmp, &kl);
+            h.last_keys = emit_keyboard_delta(lis, h.last_mods, mods, &h.last_keys, &keys);
+            h.last_mods = mods;
+            return;
+        }
+
         match h.protocol {
-            HID_PROTO_KEY if h.report_len >= 8 => {
-                let mods = tmp[0];
-                let keys = [tmp[2], tmp[3], tmp[4], tmp[5], tmp[6], tmp[7]];
-                emit_keyboard_delta(lis, h.last_mods, mods, &h.last_keys, &keys);
-                h.last_mods = mods;
-                h.last_keys = keys;
-            }
-            HID_PROTO_MOUSE if h.report_len >= 3 => {
+            HID_PROTO_MOUSE | HID_PROTO_KEY if report_len >= 3 => {
                 if USB_ABS_POINTER.load(Ordering::Relaxed) {
                     // A USB tablet already owns the pointer; relative HID mouse
                     // packets would fight it the same way PS/2 aux does.
@@ -3025,21 +3274,30 @@ impl XhciInner {
                                 None
                             }
                         }
-                        None if h.subclass == HID_SUBCLASS_BOOT || h.if_proto != 0 => Some((
-                            tmp[0],
-                            tmp[1] as i8 as i32,
-                            tmp[2] as i8 as i32,
-                            if h.report_len >= 4 {
-                                tmp[3] as i8 as i32
-                            } else {
-                                0
-                            },
-                            if h.report_len >= 5 {
-                                tmp[4] as i8 as i32
-                            } else {
-                                0
-                            },
-                        )),
+                        // The fixed boot layout is only meaningful on an
+                        // interface bound as a mouse. Reaching it from the
+                        // keyboard side of a combo receiver (whose report ID
+                        // matched nothing) would decode keycodes as buttons
+                        // and deltas.
+                        None if h.protocol == HID_PROTO_MOUSE
+                            && (h.subclass == HID_SUBCLASS_BOOT || h.if_proto != 0) =>
+                        {
+                            Some((
+                                tmp[0],
+                                tmp[1] as i8 as i32,
+                                tmp[2] as i8 as i32,
+                                if report_len >= 4 {
+                                    tmp[3] as i8 as i32
+                                } else {
+                                    0
+                                },
+                                if report_len >= 5 {
+                                    tmp[4] as i8 as i32
+                                } else {
+                                    0
+                                },
+                            ))
+                        }
                         None => None,
                     };
                     if let Some((btn, dx, dy, wheel, hwheel)) = parsed {
@@ -3051,7 +3309,7 @@ impl XhciInner {
                             (16u8, BTN_EXTRA),
                         ] {
                             let down = (btn & mask) != 0;
-                            let was = (h.last_mods & mask) != 0;
+                            let was = (h.last_buttons & mask) != 0;
                             if down != was {
                                 lis.trigger(InputEvent {
                                     event_type: InputEventType::Key,
@@ -3060,7 +3318,7 @@ impl XhciInner {
                                 });
                             }
                         }
-                        h.last_mods = btn;
+                        h.last_buttons = btn;
                         if dx != 0 {
                             lis.trigger(InputEvent {
                                 event_type: InputEventType::RelAxis,
@@ -3089,7 +3347,7 @@ impl XhciInner {
                     }
                 }
             }
-            HID_PROTO_TABLET if h.report_len >= 6 && !(h.vbox_tablet && n < 8) => {
+            HID_PROTO_TABLET if report_len >= 6 && !(h.vbox_tablet && n < 8) => {
                 // QEMU usb-tablet: [buttons, X16, Y16, wheel] (6–8 bytes).
                 // VirtualBox USB Tablet: [buttons, dz, dw, pad, X16, Y16]
                 // (UsbMouse.cpp USBHIDT_REPORT). X/Y are 0..=32767 in both.
@@ -3419,8 +3677,13 @@ fn hid_usage_to_linux(u: u8) -> Option<u16> {
         0x2f => KEY_LEFTBRACE,
         0x30 => KEY_RIGHTBRACE,
         0x31 => KEY_BACKSLASH,
-        0x32 => KEY_102ND,
-        0x64 => KEY_102ND,
+        // HID 0x32 is "Keyboard Non-US # and ~", the key that sits where
+        // Backslash does on an ANSI board; `hid-input.c` maps it to
+        // KEY_BACKSLASH. KEY_102ND belongs to 0x64 ("Non-US \\ and |"), the
+        // extra key on an ISO board, alone. Mapping both onto 102ND made the
+        // `#`/`~` key of every UK, German and Spanish keyboard type the ISO
+        // key instead.
+        0x32 => KEY_BACKSLASH,
         0x33 => KEY_SEMICOLON,
         0x34 => KEY_APOSTROPHE,
         0x35 => KEY_GRAVE,
@@ -3470,6 +3733,54 @@ fn hid_usage_to_linux(u: u8) -> Option<u16> {
         0x61 => KEY_KP9,
         0x62 => KEY_KP0,
         0x63 => KEY_KPDOT,
+        0x64 => KEY_102ND,
+        0x65 => KEY_COMPOSE, // Keyboard Application ("Menu")
+        0x66 => KEY_POWER,
+        0x67 => KEY_KPEQUAL,
+        // F13..F24: the top row of a Sun/Mac/gaming board, and what every
+        // macro key on a "media" keyboard is remapped to.
+        0x68 => KEY_F13,
+        0x69 => KEY_F14,
+        0x6a => KEY_F15,
+        0x6b => KEY_F16,
+        0x6c => KEY_F17,
+        0x6d => KEY_F18,
+        0x6e => KEY_F19,
+        0x6f => KEY_F20,
+        0x70 => KEY_F21,
+        0x71 => KEY_F22,
+        0x72 => KEY_F23,
+        0x73 => KEY_F24,
+        0x74 => KEY_OPEN,
+        0x75 => KEY_HELP,
+        0x76 => KEY_PROPS,
+        0x77 => KEY_FRONT,
+        0x78 => KEY_STOP,
+        0x79 => KEY_AGAIN,
+        0x7a => KEY_UNDO,
+        0x7b => KEY_CUT,
+        0x7c => KEY_COPY,
+        0x7d => KEY_PASTE,
+        0x7e => KEY_FIND,
+        0x7f => KEY_MUTE,
+        0x80 => KEY_VOLUMEUP,
+        0x81 => KEY_VOLUMEDOWN,
+        0x85 => KEY_KPCOMMA,
+        // International 1..6 and LANG 1..4: without these a JIS keyboard
+        // cannot switch input method and an ABNT2 (Brazilian) one has no
+        // numpad `.` and no `/` next to the right shift.
+        0x87 => KEY_RO,               // International1 (JIS `\\`/`_`, ABNT2 `/`/`?`)
+        0x88 => KEY_KATAKANAHIRAGANA, // International2
+        0x89 => KEY_YEN,              // International3
+        0x8a => KEY_HENKAN,           // International4
+        0x8b => KEY_MUHENKAN,         // International5
+        0x8c => KEY_KPJPCOMMA,        // International6 (ABNT2 numpad `.`)
+        0x90 => KEY_HANGEUL,          // LANG1
+        0x91 => KEY_HANJA,            // LANG2
+        0x92 => KEY_KATAKANA,         // LANG3
+        0x93 => KEY_HIRAGANA,         // LANG4
+        0xb6 => KEY_KPLEFTPAREN,
+        0xb7 => KEY_KPRIGHTPAREN,
         0xe0 => KEY_LEFTCTRL,
         0xe1 => KEY_LEFTSHIFT,
         0xe2 => KEY_LEFTALT,
@@ -3482,13 +3793,32 @@ fn hid_usage_to_linux(u: u8) -> Option<u16> {
     })
 }
 
+/// HID Keyboard/Keypad page: usages 1..=3 are the error indicators
+/// (`ErrorRollOver`, `POSTFail`, `ErrorUndefined`), not keys. `hid-input.c`
+/// leaves them unmapped and `usbkbd.c` skips every array entry `<= 3`.
+const HID_KEY_ERROR_MAX: u8 = 3;
+
+/// Emit the key transitions between two keyboard reports and return the key
+/// array to latch as "currently held".
+///
+/// The return value matters on a rollover report. When more keys are held than
+/// the report can carry, the keyboard fills every slot with `ErrorRollOver`
+/// (0x01): it is telling us it does not know what is down, not that everything
+/// came up. Taking it literally released every held key and then pressed them
+/// all again the moment one was let go — in a game that reads as the movement
+/// keys dropping out, and under autorepeat as a burst of duplicated
+/// characters. We keep the previous array instead, so the held keys stay held
+/// until the keyboard can report them again.
+#[must_use = "the returned array is the new `last_keys`"]
 fn emit_keyboard_delta(
     lis: &EventListener<InputEvent>,
     prev_m: u8,
     new_m: u8,
     prev_k: &[u8; 6],
     new_k: &[u8; 6],
-) {
+) -> [u8; 6] {
+    // Modifiers are a bitmap, not an array: they are always trustworthy, and a
+    // rollover must not strand a held Shift.
     for bit in 0u8..8u8 {
         let m = 1u8 << bit;
         let was = (prev_m & m) != 0;
@@ -3512,6 +3842,14 @@ fn emit_keyboard_delta(
             code,
             value: if now { 1 } else { 0 },
         });
+    }
+    if new_k.iter().any(|&u| u != 0 && u <= HID_KEY_ERROR_MAX) {
+        lis.trigger(InputEvent {
+            event_type: InputEventType::Syn,
+            code: SYN_REPORT,
+            value: 0,
+        });
+        return *prev_k;
     }
     'p: for &u in new_k {
         if u == 0 {
@@ -3552,6 +3890,7 @@ fn emit_keyboard_delta(
         code: SYN_REPORT,
         value: 0,
     });
+    *new_k
 }
 
 pub struct XhciUsbHid {
@@ -4041,6 +4380,40 @@ mod tests {
         0xC0,
     ];
 
+    /// A boot-shaped keyboard that also declares a Consumer Control
+    /// collection for its media keys, under its own report ID. This is the
+    /// commonest keyboard descriptor there is, and the one that used to
+    /// classify as `Skip` and never bind.
+    const KBD_WITH_CONSUMER: &[u8] = &[
+        0x05, 0x01, // Usage Page (Generic Desktop)
+        0x09, 0x06, // Usage (Keyboard)
+        0xA1, 0x01, // Collection (Application)
+        0x85, 0x01, //   Report ID (1)
+        0x05, 0x07, //   Usage Page (Keyboard)
+        0x19, 0xE0, //   Usage Minimum (LeftControl)
+        0x29, 0xE7, //   Usage Maximum (RightGUI)
+        0x15, 0x00, 0x25, 0x01, //
+        0x75, 0x01, //   Report Size (1)
+        0x95, 0x08, //   Report Count (8)
+        0x81, 0x02, //   Input (Data,Var,Abs)     <- modifier bitmap
+        0x95, 0x01, 0x75, 0x08, 0x81, 0x01, //   reserved byte
+        0x95, 0x06, //   Report Count (6)
+        0x75, 0x08, //   Report Size (8)
+        0x15, 0x00, 0x26, 0xFF, 0x00, //
+        0x19, 0x00, //   Usage Minimum (0)
+        0x29, 0xFF, //   Usage Maximum (255)
+        0x81, 0x00, //   Input (Data,Array)       <- keycodes
+        0xC0, //       End Collection
+        0x05, 0x0C, // Usage Page (Consumer)
+        0x09, 0x01, // Usage (Consumer Control)
+        0xA1, 0x01, // Collection (Application)
+        0x85, 0x02, //   Report ID (2)
+        0x19, 0x00, 0x2A, 0x3C, 0x02, //
+        0x15, 0x00, 0x26, 0x3C, 0x02, //
+        0x95, 0x01, 0x75, 0x10, 0x81, 0x00, //
+        0xC0,
+    ];
+
     fn capture(f: impl FnOnce(&EventListener<InputEvent>)) -> Vec<(u16, u16, i32)> {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let lis = EventListener::<InputEvent>::new();
@@ -4167,5 +4540,135 @@ mod tests {
     #[test]
     fn a_still_wheel_emits_nothing() {
         assert!(capture(|lis| emit_scroll(lis, 0, 0)).is_empty());
+    }
+
+    #[test]
+    fn a_keyboard_with_media_keys_behind_it_still_classifies_as_a_keyboard() {
+        // The Consumer collection comes LAST. Keeping only the last
+        // application collection made this `Skip`, so the interface was never
+        // bound and the keyboard was dead.
+        assert_eq!(classify_hid_report(KBD_WITH_CONSUMER), HidClass::Key);
+    }
+
+    #[test]
+    fn a_report_id_keyboard_does_not_decode_its_id_as_modifiers() {
+        let info = parse_hid_descriptor(KBD_WITH_CONSUMER);
+        let kl = info.key.expect("a keyboard layout");
+        assert_eq!(kl.report_id, Some(1));
+        // Report ID byte first, then the modifier bitmap, then the reserved
+        // byte, then six keycodes.
+        assert_eq!(kl.mods, BitField { off: 8, len: 8 });
+        assert_eq!(kl.keys, BitField { off: 24, len: 8 });
+        assert_eq!(kl.key_count, 6);
+        assert_eq!(kl.report_bytes, 9);
+
+        // Report 1, no modifiers, "A" held.
+        let report = [0x01, 0x00, 0x00, 0x04, 0, 0, 0, 0, 0];
+        let (mods, keys) = decode_keyboard(&report, &kl);
+        assert_eq!(mods, 0, "the report ID must not read as a modifier bitmap");
+        assert_eq!(keys, [0x04, 0, 0, 0, 0, 0]);
+
+        // The boot layout on the same bytes is what the old code did.
+        let (boot_mods, _) = decode_keyboard(&report, &BOOT_KEY_LAYOUT);
+        assert_eq!(boot_mods, 0x01, "left Ctrl, latched by the report ID");
+    }
+
+    #[test]
+    fn the_boot_layout_is_just_another_key_layout() {
+        // [mods, reserved, k0..k5]: left Shift held, "B" and "C" down.
+        let report = [0x02, 0x00, 0x05, 0x06, 0, 0, 0, 0];
+        let (mods, keys) = decode_keyboard(&report, &BOOT_KEY_LAYOUT);
+        assert_eq!(mods, 0x02);
+        assert_eq!(keys, [0x05, 0x06, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_rollover_report_keeps_the_held_keys_down() {
+        let held = [0x04, 0x05, 0x06, 0x07, 0x08, 0x09];
+        let rollover = [0x01; 6];
+        let mut latched = [0u8; 6];
+        let evs = capture(|lis| {
+            latched = emit_keyboard_delta(lis, 0, 0, &held, &rollover);
+        });
+        assert_eq!(latched, held, "a rollover must not release what is held");
+        // Only the SYN; no key went up.
+        assert!(
+            evs.iter().all(|&(t, _, _)| t == InputEventType::Syn as u16),
+            "{:?}",
+            evs
+        );
+    }
+
+    #[test]
+    fn a_normal_report_still_presses_and_releases() {
+        let evs = capture(|lis| {
+            let out =
+                emit_keyboard_delta(lis, 0, 0, &[0x04, 0, 0, 0, 0, 0], &[0x05, 0, 0, 0, 0, 0]);
+            assert_eq!(out, [0x05, 0, 0, 0, 0, 0]);
+        });
+        let keys: Vec<_> = evs
+            .iter()
+            .filter(|&&(t, _, _)| t == InputEventType::Key as u16)
+            .map(|&(_, c, v)| (c, v))
+            .collect();
+        assert_eq!(keys.as_slice(), &[(KEY_B, 1), (KEY_A, 0)]);
+    }
+
+    #[test]
+    fn the_non_us_hash_key_is_backslash_and_102nd_is_its_own_usage() {
+        // HID 0x32 ("Non-US # and ~") sits where Backslash does; 0x64
+        // ("Non-US \\ and |") is the extra ISO key. Mapping both to 102ND
+        // made the `#` key of every UK/DE/ES board type the wrong character.
+        assert_eq!(hid_usage_to_linux(0x32), Some(KEY_BACKSLASH));
+        assert_eq!(hid_usage_to_linux(0x64), Some(KEY_102ND));
+        assert_eq!(hid_usage_to_linux(0x65), Some(KEY_COMPOSE));
+        assert_eq!(hid_usage_to_linux(0x68), Some(KEY_F13));
+        assert_eq!(hid_usage_to_linux(0x73), Some(KEY_F24));
+        assert_eq!(hid_usage_to_linux(0x87), Some(KEY_RO));
+        // The error indicators are not keys.
+        for u in 0x01..=0x03 {
+            assert_eq!(hid_usage_to_linux(u), None, "usage {:#x}", u);
+        }
+    }
+
+    #[test]
+    fn a_hostile_report_count_does_not_hang_the_parser() {
+        // Report Size 32, Report Count 0xffffffff, then an Input item. The
+        // unbounded walk this used to do is 2^32 iterations inside the IRQ
+        // handler: the machine never finishes booting.
+        let desc: &[u8] = &[
+            0x05, 0x01, // Usage Page (Generic Desktop)
+            0x09, 0x02, // Usage (Mouse)
+            0xA1, 0x01, // Collection (Application)
+            0x75, 0x20, //   Report Size (32)
+            0x97, 0xFF, 0xFF, 0xFF, 0xFF, //   Report Count (0xffffffff)
+            0x09, 0x30, //   Usage (X)
+            0x81, 0x06, //   Input (Data,Var,Rel)
+            0xC0,
+        ];
+        let info = parse_hid_descriptor(desc);
+        // Whatever it decides, it has to come back, and with a sane size.
+        assert!(info.max_report_bytes <= HID_MAX_REPORT_BITS / 8);
+    }
+
+    #[test]
+    fn a_short_report_does_not_resurrect_the_previous_one() {
+        // `dispatch_hid` zeroes `tmp` past the actual length, so a field that
+        // falls outside a short report reads 0. This is that invariant on the
+        // decoder itself: byte 5 of a 3-byte report is not the wheel.
+        let ml = parse_hid_descriptor(MOUSE_5BTN_12BIT)
+            .mouse
+            .expect("a mouse layout");
+        let mut tmp = [0u8; 64];
+        // Full 6-byte report with a wheel detent, then only the first 3 bytes
+        // of the next one survive.
+        tmp[..6].copy_from_slice(&[0x01, 0x10, 0x00, 0x00, 0x01, 0x00]);
+        assert_eq!(
+            read_signed_bits(&tmp, ml.wheel.unwrap().off, 8),
+            1,
+            "the full report does carry a detent"
+        );
+        tmp[3..].fill(0);
+        assert_eq!(read_signed_bits(&tmp, ml.wheel.unwrap().off, 8), 0);
     }
 }
