@@ -587,7 +587,18 @@ impl VmAddressRegion {
             flags,
             self.page_table.clone(),
         );
-        if map_range {
+        // ... but libos has no demand paging at all, so there the caller's
+        // `false` is not an option. `kernel-hal`'s libos `PageTable` is a thin
+        // wrapper over mmap/munmap/mprotect in the HOST address space, and
+        // nothing turns the resulting SIGSEGV back into a page fault -- there
+        // is no handler. An uncommitted page is simply absent from the host
+        // process, so the first user access kills the whole kernel with
+        // SIGSEGV. That is what both libos jobs were dying of: `Linux Libc
+        // Test Libos` failed all 302 cases the instant ld-musl touched its
+        // lazily mapped stack (`loader/mod.rs` maps it with `map_range=false`
+        // on purpose), and `Zircon Core Test Libos (x86_64 Linux)` exited -11
+        // right after userboot finished mapping the test binary.
+        if map_range || cfg!(feature = "libos") {
             mapping.map()?;
         }
         inner.mappings.insert(mapping.addr(), mapping);
