@@ -140,14 +140,23 @@ impl Provider for ProviderImpl {
     const PAGE_SIZE: usize = PAGE_SIZE;
 
     fn alloc_dma(size: usize) -> (usize, usize) {
-        let paddr = unsafe { drivers_dma_alloc(size / PAGE_SIZE) };
+        // `div_ceil`, not `/`: truncating division backs a 2048-byte request
+        // with ZERO pages (the caller then writes into memory nobody owns) and
+        // a 5000-byte request with one 4096-byte page. `DmaRegion::alloc_inner`
+        // already rounds up the same way.
+        let pages = size.div_ceil(PAGE_SIZE);
+        let paddr = unsafe { drivers_dma_alloc(pages) };
         let vaddr = phys_to_virt(paddr);
+        // Consumers of this trait (the ixgbe HAL) require zeroed DMA pages.
+        if paddr != 0 {
+            unsafe { core::ptr::write_bytes(vaddr as *mut u8, 0, pages * PAGE_SIZE) };
+        }
         (vaddr, paddr)
     }
 
     fn dealloc_dma(vaddr: usize, size: usize) {
         let paddr = virt_to_phys(vaddr);
-        unsafe { drivers_dma_dealloc(paddr, size / PAGE_SIZE) };
+        unsafe { drivers_dma_dealloc(paddr, size.div_ceil(PAGE_SIZE)) };
     }
 }
 
