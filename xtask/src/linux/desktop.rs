@@ -1857,6 +1857,7 @@ fn write_labwc_menu(rootfs: &Path) {
 const MENU_ES: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
 <openbox_menu>
   <menu id="root-menu" label="Eclipse OS">
+    <item label="Ejecutar (Alt+Espacio)"><action name="Execute"><command>/usr/local/bin/eclipse-run</command></action></item>
     <item label="Terminal"><action name="Execute"><command>/usr/local/bin/eclipse-terminal</command></action></item>
     <item label="Firefox"><action name="Execute"><command>/usr/local/bin/eclipse-firefox</command></action></item>
     <item label="Editor (nano)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal nano</command></action></item>
@@ -1875,6 +1876,7 @@ const MENU_ES: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
 const MENU_EN: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
 <openbox_menu>
   <menu id="root-menu" label="Eclipse OS">
+    <item label="Run (Alt+Space)"><action name="Execute"><command>/usr/local/bin/eclipse-run</command></action></item>
     <item label="Terminal"><action name="Execute"><command>/usr/local/bin/eclipse-terminal</command></action></item>
     <item label="Firefox"><action name="Execute"><command>/usr/local/bin/eclipse-firefox</command></action></item>
     <item label="Editor (nano)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal nano</command></action></item>

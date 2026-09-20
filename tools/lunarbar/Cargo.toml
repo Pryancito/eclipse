@@ -9,9 +9,20 @@ description = "Eclipse OS native status bar (wlr-layer-shell, pure Rust, no GTK/
 # on its own by `xtask` (see `LinuxRootfs::lunarbar`), exactly like lunarbg.
 [workspace]
 
+# The panel and the runner share the drawing stack, the .desktop scanner and
+# the /proc readers, so those live in a library both link.
+[lib]
+name = "lunarbar"
+path = "src/lib.rs"
+
 [[bin]]
 name = "lunarbar"
 path = "src/main.rs"
+
+# lunarrun: the KRunner stand-in (Alt+Space) and KDE's Super+D show-desktop.
+[[bin]]
+name = "lunarrun"
+path = "src/bin/lunarrun.rs"
 
 [dependencies]
 libc = "0.2"

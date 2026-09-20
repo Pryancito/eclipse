@@ -486,12 +486,23 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         // lunarbar: the native status/task bar (Rust, static musl). A two-bar
         // panel over wlr-layer-shell + wlr-foreign-toplevel-management, replacing
         // waybar and its GTK/D-Bus/gdk-pixbuf/fontconfig dependency chain.
-        let lunarbar = self.lunarbar();
+        let (lunarbar, lunarrun) = self.lunar_tools();
         if lunarbar.is_file() {
             let _ = dir::rm(bin.join("lunarbar"));
             fs::copy(&lunarbar, bin.join("lunarbar")).unwrap();
         } else {
             eprintln!("warning: lunarbar not built; autostart will fall back to waybar");
+        }
+
+        // lunarrun: the KRunner stand-in (Alt+Space / Alt+F2) and KDE's
+        // Super+D, from the same package. krunner itself is a D-Bus service
+        // and there is no session bus here; this speaks wlr-layer-shell and
+        // wlr-foreign-toplevel-management instead.
+        if lunarrun.is_file() {
+            let _ = dir::rm(bin.join("lunarrun"));
+            fs::copy(&lunarrun, bin.join("lunarrun")).unwrap();
+        } else {
+            eprintln!("warning: lunarrun not built; Alt+Space will do nothing");
         }
 
         // wavplay: minimal OSS player for the HDA audio driver (`/dev/dsp*`).
@@ -2307,33 +2318,50 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         executable
     }
 
-    /// Cross-compile lunarbar (`tools/lunarbar`, Rust) as a static musl binary
-    /// and return its path. Best-effort: if the build fails the desktop
-    /// autostart falls back to waybar (see xtask/src/linux/desktop.rs).
-    fn lunarbar(&self) -> PathBuf {
+    /// Cross-compile the `tools/lunarbar` package (Rust) as static musl
+    /// binaries and return both: the panel and `lunarrun`, the KRunner-style
+    /// launcher behind Alt+Space and Super+D. One cargo invocation builds the
+    /// two, since they share a library. Best-effort: if the build fails the
+    /// desktop falls back to waybar and the runner keybinds do nothing (their
+    /// wrapper says so in /tmp/lunarrun.log).
+    fn lunar_tools(&self) -> (PathBuf, PathBuf) {
         let dir = PROJECT_DIR.join("tools").join("lunarbar");
         let triple = self.musl_rust_triple();
-        let executable = dir
-            .join("target")
-            .join(triple)
-            .join("release")
-            .join("lunarbar");
-        // Rebuild when any source file is newer than the binary.
+        let out = dir.join("target").join(triple).join("release");
+        let executable = out.join("lunarbar");
+        let runner = out.join("lunarrun");
+        // Rebuild when any source file is newer than the binaries. Every
+        // module is listed: a stale entry here means a source change that
+        // silently does not reach the image.
         let newest_src = [
             "src/main.rs",
+            "src/bin/lunarrun.rs",
+            "src/lib.rs",
             "src/apps.rs",
             "src/draw.rs",
-            "src/sysinfo.rs",
+            "src/fill_guard.rs",
+            "src/i18n.rs",
+            "src/icons.rs",
+            "src/keys.rs",
+            "src/look.rs",
             "src/par.rs",
+            "src/proc.rs",
+            "src/sysinfo.rs",
             "Cargo.toml",
         ]
         .iter()
         .filter_map(|rel| fs::metadata(dir.join(rel)).ok()?.modified().ok())
         .max();
-        if let (Ok(bin_meta), Some(src_mtime)) = (fs::metadata(&executable), newest_src) {
-            if let Ok(bin_mtime) = bin_meta.modified() {
-                if bin_mtime >= src_mtime {
-                    return executable;
+        // BOTH must exist and be current: a tree built before lunarrun existed
+        // has an up-to-date lunarbar and no runner at all.
+        if let (Ok(bin_meta), Ok(run_meta), Some(src_mtime)) = (
+            fs::metadata(&executable),
+            fs::metadata(&runner),
+            newest_src,
+        ) {
+            if let (Ok(bin_mtime), Ok(run_mtime)) = (bin_meta.modified(), run_meta.modified()) {
+                if bin_mtime >= src_mtime && run_mtime >= src_mtime {
+                    return (executable, runner);
                 }
             }
         }
@@ -2353,9 +2381,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             .env("RUSTFLAGS", "-C relocation-model=static")
             .status();
         if !status.success() {
-            eprintln!("warning: lunarbar build failed; waybar fallback remains");
+            eprintln!("warning: lunarbar/lunarrun build failed; waybar fallback remains");
         }
-        executable
+        (executable, runner)
     }
 
     /// `/etc/asound.conf`. When PulseAudio is in the image, ALSA `default`

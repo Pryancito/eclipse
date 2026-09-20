@@ -47,15 +47,16 @@
 //!   `LUNARBAR_DUMP_MENU=1` composites the open app menu over the preview;
 //!   `LUNARBAR_DUMP_CAL=1` composites the calendar popup instead.
 
-mod apps;
-mod fill_guard;
-mod i18n;
-mod icons;
-mod par;
-mod draw;
-mod sysinfo;
+// The drawing stack, /proc readers, .desktop scanner and input tables live in
+// the `lunarbar` library next door, shared with `lunarrun` (see src/lib.rs).
+use lunarbar::{apps, draw, fill_guard, i18n, icons, sysinfo};
+use lunarbar::keys::{
+    key_char, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, KEY_BACKSPACE_WL, KEY_DOWN_WL, KEY_ENTER_WL,
+    KEY_ESC_WL, KEY_KPENTER_WL, KEY_LEFT_WL, KEY_PGDN_WL, KEY_PGUP_WL, KEY_RIGHT_WL, KEY_TAB_WL,
+    KEY_UP_WL, WHEEL_NOTCH,
+};
 
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
@@ -115,25 +116,6 @@ struct TipId;
 // (input-event-codes.h). The famous +8 offset is an xkb keymap convention the
 // CLIENT applies when feeding xkbcommon — it is never added on the wire;
 // wlroots compositors forward libinput's evdev codes unmodified.
-const KEY_ESC_WL: u32 = 1;
-const KEY_BACKSPACE_WL: u32 = 14;
-const KEY_TAB_WL: u32 = 15;
-const KEY_ENTER_WL: u32 = 28;
-const KEY_KPENTER_WL: u32 = 96;
-const KEY_UP_WL: u32 = 103;
-const KEY_DOWN_WL: u32 = 108;
-const KEY_LEFT_WL: u32 = 105;
-const KEY_RIGHT_WL: u32 = 106;
-const KEY_PGUP_WL: u32 = 104;
-const KEY_PGDN_WL: u32 = 109;
-
-// Pointer button codes (linux/input-event-codes.h).
-const BTN_LEFT: u32 = 0x110;
-const BTN_RIGHT: u32 = 0x111;
-const BTN_MIDDLE: u32 = 0x112;
-
-/// One wheel notch in wl_pointer axis units (libinput's convention).
-const WHEEL_NOTCH: f64 = 15.0;
 
 /// Hover dwell before the taskbar tooltip appears.
 const TIP_DELAY: Duration = Duration::from_millis(450);
@@ -616,33 +598,7 @@ impl State {
     /// Allocate a fresh shm mapping + fd. Caller installs buffers. On failure
     /// returns None without touching existing bar state.
     fn map_shm_pool(total: usize) -> Option<(*mut u8, OwnedFd)> {
-        let raw = unsafe {
-            libc::memfd_create(b"lunarbar\0".as_ptr() as *const libc::c_char, libc::MFD_CLOEXEC)
-        };
-        if raw < 0 {
-            eprintln!("lunarbar: memfd_create failed");
-            return None;
-        }
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        if unsafe { libc::ftruncate(raw, total as libc::off_t) } != 0 {
-            eprintln!("lunarbar: ftruncate failed");
-            return None;
-        }
-        let map = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                total,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                raw,
-                0,
-            )
-        };
-        if map == libc::MAP_FAILED {
-            eprintln!("lunarbar: mmap failed");
-            return None;
-        }
-        Some((map as *mut u8, fd))
+        lunarbar::proc::map_shm_pool(total, "lunarbar")
     }
 
     fn bar_index(&self, layer_id: u32) -> Option<usize> {
@@ -889,42 +845,7 @@ impl State {
     /// returns at once), so the grandchild is reparented to init — lunarbar
     /// never accumulates zombies.
     fn spawn(&self, cmd: &str) {
-        // Build the argv string BEFORE forking. Between fork() and exec() a
-        // child may call only async-signal-safe functions, and CString::new
-        // allocates. Today that is latent rather than live — par_rows joins
-        // its workers before returning, so no thread is alive when the event
-        // loop calls this — but the safety rests on an invariant nothing
-        // enforces: add any background thread (an async icon loader, say) and
-        // a fork landing while it held the allocator lock would leave the
-        // child deadlocked forever on a lock whose owner does not exist in it,
-        // as a launch that silently never happens. Cheap to make structural.
-        let Ok(c) = std::ffi::CString::new(cmd) else {
-            return; // an interior NUL cannot be passed to exec at all
-        };
-        unsafe {
-            let pid = libc::fork();
-            if pid == 0 {
-                // Intermediate child: new session, fork the real child, exit.
-                libc::setsid();
-                if libc::fork() == 0 {
-                    let sh = b"/bin/sh\0";
-                    let dashc = b"-c\0";
-                    let argv = [
-                        sh.as_ptr() as *const libc::c_char,
-                        dashc.as_ptr() as *const libc::c_char,
-                        c.as_ptr(),
-                        std::ptr::null(),
-                    ];
-                    libc::execv(sh.as_ptr() as *const libc::c_char, argv.as_ptr());
-                    libc::_exit(127);
-                }
-                libc::_exit(0);
-            }
-            if pid > 0 {
-                let mut st = 0;
-                libc::waitpid(pid, &mut st, 0);
-            }
-        }
+        lunarbar::proc::spawn_detached(cmd);
     }
 
     /// Cycle es/us: write `/proc/kbd` first (so the 1 Hz tick cannot snap the
@@ -2698,19 +2619,6 @@ fn filter_apps(all: &[apps::AppEntry], filter: &str) -> Vec<usize> {
 /// Printable ASCII for a bare evdev keycode (KEY_1=2 … KEY_M=50), assuming
 /// the standard QWERTY core (letters/digits are position-stable across
 /// layouts; good enough for menu filtering without pulling in xkb).
-fn key_char(code: u32) -> Option<char> {
-    Some(match code {
-        2..=10 => (b'1' + (code - 2) as u8) as char, // KEY_1..KEY_9
-        11 => '0',                                   // KEY_0
-        16..=25 => b"qwertyuiop"[(code - 16) as usize] as char,
-        30..=38 => b"asdfghjkl"[(code - 30) as usize] as char,
-        44..=50 => b"zxcvbnm"[(code - 44) as usize] as char,
-        57 => ' ',
-        12 => '-',
-        52 => '.',
-        _ => return None,
-    })
-}
 
 /// A short, font-renderable button label for a window: prefer the title (what
 /// waybar's `{title:.18}` showed), fall back to app_id, capped so buttons stay
