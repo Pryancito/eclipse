@@ -6285,21 +6285,18 @@ mod hw_kms_tests {
         }
     }
 
-    /// Set an 8x8 pointer at (4, 2) and report where the software compositor
-    /// left it. `true` means the CPU drew the pointer into the scanout, which is
-    /// exactly what must NOT happen once the display engine owns it.
-    fn software_pointer_lands_after_a_flip(
-        screen: &kms_emu::Screen,
-        c: &Client,
-        fb: u32,
-        seq: u64,
-    ) -> bool {
+    /// Wipe the scanout, flip `fb`, and report the pixel under the pointer's
+    /// top-left corner. `UNTOUCHED` means the CPU composited nothing there,
+    /// which is what must happen once the display engine owns the pointer -- a
+    /// hardware plane and a software composite both drawing leaves two pointers
+    /// on screen, the CPU one a frame behind.
+    fn pointer_pixel_after_a_flip(screen: &kms_emu::Screen, c: &Client, fb: u32, seq: u64) -> u32 {
         screen.repaint(UNTOUCHED);
         c.page_flip(drm::SYNTH_CRTC_ID, fb, seq).expect("flip");
         drm::flush_pending_flip_completions();
         let mut sink = [0u8; 32];
         let _ = c.read_events(&mut sink);
-        screen.pixel(4, 2) == 0xFF00_00FF
+        screen.pixel(4, 2)
     }
 
     /// With `nvidia.hwcursor` on and a plane that takes the image, the display
@@ -6316,20 +6313,25 @@ mod hw_kms_tests {
         let buf = c.create_dumb(64, 16);
         paint(&buf, 0x0000_1111);
         let fb = c.addfb2(&buf);
-        c.page_flip(drm::SYNTH_CRTC_ID, fb, 1).expect("flip");
-        drm::flush_pending_flip_completions();
-        let mut sink = [0u8; 32];
-        let _ = c.read_events(&mut sink);
+        // SETCRTC, not just a flip: it is what makes the CRTC name this
+        // framebuffer, and the software compositor has nothing to repaint from
+        // until it does. Without it the stand-downs below would hold for the
+        // wrong reason.
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 64, 16);
+        screen.repaint(UNTOUCHED);
 
-        let cur = c.create_dumb(8, 8);
+        // 8 wide by 4 high, deliberately not square and not a multiple of the
+        // buffer's own 16-pixel stride: the bitmap is 32 consecutive words, so a
+        // plane fed by stride, or given the dimensions the other way round, gets
+        // caught here rather than drawing a garbled pointer on real hardware.
+        let cur = c.create_dumb(8, 4);
         paint_indexed(&cur, 0xFF00_0000);
-        set_cursor(&c, drm::SYNTH_CRTC_ID, cur.handle, 8, 8, 4, 2);
+        set_cursor(&c, drm::SYNTH_CRTC_ID, cur.handle, 8, 4, 4, 2);
 
-        // The plane got the image, row-packed, all 64 words of it.
         let images = gpu.cursor_images();
         assert_eq!(images.len(), 1, "the plane was not offered the image");
-        assert_eq!((images[0].width, images[0].height), (8, 8));
-        let want: Vec<u32> = (0..64).map(|i| 0xFF00_0000 | i).collect();
+        assert_eq!((images[0].width, images[0].height), (8, 4));
+        let want: Vec<u32> = (0..32).map(|i| 0xFF00_0000 | i).collect();
         assert_eq!(images[0].argb, want, "the plane got the wrong words");
 
         // And it was landed on the pointer's position. Two moves: taking the
@@ -6345,8 +6347,9 @@ mod hw_kms_tests {
             "the CPU composited a pointer the display engine owns"
         );
         // ...or by the frame that follows it.
-        assert!(
-            !software_pointer_lands_after_a_flip(&screen, &c, fb, 2),
+        assert_eq!(
+            pointer_pixel_after_a_flip(&screen, &c, fb, 2),
+            UNTOUCHED,
             "a driver flip put a second, software pointer on the screen"
         );
         // A motion is one register write in the driver and nothing else.
@@ -6378,10 +6381,7 @@ mod hw_kms_tests {
         let buf = c.create_dumb(64, 16);
         paint(&buf, 0x0000_1111);
         let fb = c.addfb2(&buf);
-        c.page_flip(drm::SYNTH_CRTC_ID, fb, 1).expect("flip");
-        drm::flush_pending_flip_completions();
-        let mut sink = [0u8; 32];
-        let _ = c.read_events(&mut sink);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 64, 16);
 
         let cur = c.create_dumb(8, 8);
         paint(&cur, 0xFF00_00FF);
@@ -6394,8 +6394,9 @@ mod hw_kms_tests {
             "a refused plane was moved anyway"
         );
         // And the CPU is drawing the pointer again.
-        assert!(
-            software_pointer_lands_after_a_flip(&screen, &c, fb, 2),
+        assert_eq!(
+            pointer_pixel_after_a_flip(&screen, &c, fb, 2),
+            0xFF00_00FF,
             "the pointer is drawn by nobody"
         );
 
@@ -6434,6 +6435,64 @@ mod hw_kms_tests {
         c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
     }
 
+    /// A cursor plane without hardware KMS: the display engine composites the
+    /// pointer while the CPU still blits the frame. That is `nvidia.hwcursor`
+    /// without `nvidia.hwflip`, the configuration the flag was added for, and it
+    /// is the only one where the software compositor is running AND has to leave
+    /// the pointer alone -- draw it anyway and there are two pointers on screen,
+    /// the CPU one lagging a frame behind the plane.
+    #[test]
+    fn the_cursor_plane_can_own_the_pointer_while_the_cpu_still_blits_the_frame() {
+        let screen = kms_emu::attach(64, 16);
+        let gpu = screen.attach_gpu(EmuGpu::new("emu-gpu").with_cursor_plane());
+        drm::set_hw_cursor_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 16);
+        paint(&buf, 0x0000_1111);
+        let fb = c.addfb2(&buf);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 64, 16);
+
+        // The CPU really is driving the scanout here.
+        assert!(
+            (0..16).all(|y| (0..64).all(|x| screen.pixel(x, y) == 0x0000_1111)),
+            "the software blit did not run"
+        );
+
+        let cur = c.create_dumb(8, 8);
+        paint(&cur, 0xFF00_00FF);
+        set_cursor(&c, drm::SYNTH_CRTC_ID, cur.handle, 8, 8, 4, 2);
+
+        assert_eq!(gpu.cursor_images().len(), 1, "the plane was not offered");
+        assert!(
+            (0..16).all(|y| (0..64).all(|x| screen.pixel(x, y) == 0x0000_1111)),
+            "the CPU composited a pointer the plane already owns"
+        );
+
+        // A motion goes to the plane and repaints nothing.
+        move_cursor(&c, drm::SYNTH_CRTC_ID, 40, 6);
+        assert_eq!(gpu.cursor_moves().last(), Some(&(40, 6)));
+        assert!(
+            (0..16).all(|y| (0..64).all(|x| screen.pixel(x, y) == 0x0000_1111)),
+            "a pointer motion repainted while the plane owns the pointer"
+        );
+
+        // And the frame after it is still blitted by the CPU, pointer-free.
+        screen.repaint(UNTOUCHED);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 1).expect("flip");
+        drm::flush_pending_flip_completions();
+        let mut sink = [0u8; 32];
+        let _ = c.read_events(&mut sink);
+        assert!(
+            (0..16).all(|y| (0..64).all(|x| screen.pixel(x, y) == 0x0000_1111)),
+            "the frame was not blitted, or carried a software pointer"
+        );
+
+        set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
     /// The plane is not offered the image unless the flag is on. The
     /// display-engine cursor is opt-in (`nvidia.hwcursor`) precisely because it
     /// is the half of the bring-up that is not trusted yet, so a driver that
@@ -6449,10 +6508,7 @@ mod hw_kms_tests {
         let buf = c.create_dumb(64, 16);
         paint(&buf, 0x0000_1111);
         let fb = c.addfb2(&buf);
-        c.page_flip(drm::SYNTH_CRTC_ID, fb, 1).expect("flip");
-        drm::flush_pending_flip_completions();
-        let mut sink = [0u8; 32];
-        let _ = c.read_events(&mut sink);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 64, 16);
 
         let cur = c.create_dumb(8, 8);
         paint(&cur, 0xFF00_00FF);
@@ -6463,8 +6519,9 @@ mod hw_kms_tests {
             "the plane was offered the image with the flag off"
         );
         assert!(gpu.cursor_moves().is_empty());
-        assert!(
-            software_pointer_lands_after_a_flip(&screen, &c, fb, 2),
+        assert_eq!(
+            pointer_pixel_after_a_flip(&screen, &c, fb, 2),
+            0xFF00_00FF,
             "the pointer is drawn by nobody"
         );
 
