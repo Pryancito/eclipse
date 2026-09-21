@@ -61,15 +61,21 @@ impl Syscall<'_> {
         Ok(())
     }
 
-    #[allow(unsafe_code)]
     /// Read log entries from debuglog.
+    ///
+    /// Answers with the number of bytes read, which `zx_debuglog_read` returns
+    /// as a positive status. It used to be smuggled out as
+    /// `Err(transmute::<u32, ZxError>(len))`: a `ZxError` holding a value that
+    /// is not one of its variants, which is undefined behaviour the moment
+    /// anything looks at it -- and the dispatcher's own `info!` line formats
+    /// every result with `{:?}`.
     pub fn sys_debuglog_read(
         &self,
         handle_value: HandleValue,
         options: u32,
         mut buf: UserOutPtr<u8>,
         len: usize,
-    ) -> ZxResult {
+    ) -> ZxResult<usize> {
         info!(
             "debuglog.read: handle={:#x?}, options={:#x?}, buf=({:#x?}; {:#x?})",
             handle_value, options, buf, len,
@@ -85,7 +91,6 @@ impl Syscall<'_> {
             return Err(ZxError::SHOULD_WAIT);
         }
         buf.write_array(&buffer[..actual_len])?;
-        // special case: return actual_len as status
-        Err(unsafe { core::mem::transmute::<u32, ZxError>(actual_len as u32) })
+        Ok(actual_len)
     }
 }

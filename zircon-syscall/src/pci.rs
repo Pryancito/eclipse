@@ -97,6 +97,15 @@ impl Syscall<'_> {
         }
         let mut addr_windows = UserInPtr::<PciInitArgsAddrWindows>::from(init_buf + HEADER_SIZE)
             .read_array(arg_header.addr_window_count as usize)?;
+        // `num_irqs` is a user field and indexes a fixed `[PciInitArgsIrqs; 224]`
+        // inside the header, so an out-of-range count is a kernel
+        // index-out-of-bounds panic rather than an error. `len` above does not
+        // bound it: the length check is about the address windows that follow the
+        // header, and the irq array is inside the header whatever `num_irqs`
+        // says. Zircon refuses the call.
+        if arg_header.num_irqs as usize > PCI_MAX_IRQS {
+            return Err(ZxError::INVALID_ARGS);
+        }
         arg_header.configure_interrupt()?;
         if arg_header.addr_window_count != 1 {
             return Err(ZxError::INVALID_ARGS); // for non DesignWare Controller
@@ -108,24 +117,11 @@ impl Syscall<'_> {
         // Some systems will report overly large PCIe config regions
         // that collide with architectural registers.
         #[cfg(target_arch = "x86_64")]
+        if let Some((size, bus_end)) =
+            clamp_ecam_window(addr_win.base, addr_win.bus_start, addr_win.bus_end)?
         {
-            let num_buses = (addr_win.bus_end - addr_win.bus_start) as u64 + 1;
-            let mut end: u64 = addr_win.base + num_buses * PCIE_ECAM_BYTES_PER_BUS as u64;
-            let high_limit: u64 = 0xfec0_0000;
-            if end > high_limit {
-                end = high_limit;
-                if end < addr_win.base {
-                    return Err(ZxError::INVALID_ARGS);
-                }
-                addr_win.size =
-                    ((end - addr_win.base) & (PCIE_ECAM_BYTES_PER_BUS as u64 - 1)) as usize;
-                let new_bus_end: usize =
-                    addr_win.size / PCIE_ECAM_BYTES_PER_BUS + addr_win.bus_start as usize - 1;
-                if new_bus_end >= PCIE_MAX_BUSSES {
-                    return Err(ZxError::INVALID_ARGS);
-                }
-                addr_win.bus_end = new_bus_end as u8;
-            }
+            addr_win.size = size;
+            addr_win.bus_end = bus_end;
         }
         if addr_win.cfg_space_type == PCI_CFG_SPACE_TYPE_MMIO {
             if addr_win.size < PCIE_ECAM_BYTES_PER_BUS
@@ -302,4 +298,185 @@ pub struct PciBar {
     bar_type: u32,
     size: usize,
     addr: u64,
+}
+
+/// Trim an ECAM window that runs into the architectural registers below 4 GiB.
+///
+/// Some firmware reports a PCIe config region far larger than the machine has,
+/// overlapping the HPET/IOAPIC block at `0xfec0_0000`. Zircon rounds the
+/// surviving length DOWN to whole buses and recomputes the last bus number.
+/// Returns `None` when the window ends below the limit and needs no trimming.
+///
+/// `HIGH_LIMIT` and the bus arithmetic live here rather than inline in
+/// `sys_pci_init` so they can be tested: reaching them through the syscall needs
+/// the root resource and a user buffer, and what went wrong in them is pure
+/// arithmetic.
+#[cfg(target_arch = "x86_64")]
+fn clamp_ecam_window(base: u64, bus_start: u8, bus_end: u8) -> ZxResult<Option<(usize, u8)>> {
+    const HIGH_LIMIT: u64 = 0xfec0_0000;
+    // `sys_pci_init` refuses an inverted range before it gets here; the helper
+    // says so itself so the subtraction below cannot wrap, which would turn a
+    // 256 MiB window into a 4 GiB one.
+    if bus_end < bus_start {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    let num_buses = (bus_end - bus_start) as u64 + 1;
+    // `base` comes from userspace, so the window's end can overflow rather than
+    // merely exceed the limit.
+    let end = num_buses
+        .checked_mul(PCIE_ECAM_BYTES_PER_BUS as u64)
+        .and_then(|len| base.checked_add(len))
+        .ok_or(ZxError::INVALID_ARGS)?;
+    if end <= HIGH_LIMIT {
+        return Ok(None);
+    }
+    if HIGH_LIMIT < base {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    // ROUNDDOWN to whole buses: mask off the low bits, `& !(N - 1)`. Masking
+    // with `& (N - 1)` keeps the sub-megabyte REMAINDER instead, which is
+    // always less than one bus -- so the window came out describing zero buses
+    // and the bus count below went to `0 + 0 - 1`, an underflowing `usize`:
+    // a panic in a debug kernel, `usize::MAX` in release.
+    let size = ((HIGH_LIMIT - base) & !(PCIE_ECAM_BYTES_PER_BUS as u64 - 1)) as usize;
+    let buses = size / PCIE_ECAM_BYTES_PER_BUS;
+    // No whole bus survives the trim, so there is no window to describe. Saying
+    // so is what keeps the subtraction below from wrapping, and it is the answer
+    // the MMIO check further down would reach anyway.
+    if buses == 0 {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    let new_bus_end = buses + bus_start as usize - 1;
+    // Belt and braces: the trim only ever shortens the range, so this cannot
+    // fire for a range that fits in `u8` to begin with. Zircon checks it, so we
+    // keep it.
+    if new_bus_end >= PCIE_MAX_BUSSES {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    Ok(Some((size, new_bus_end as u8)))
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod ecam_clamp_tests {
+    use super::*;
+
+    /// One bus is 1 MiB of config space.
+    const BUS: u64 = PCIE_ECAM_BYTES_PER_BUS as u64;
+
+    #[test]
+    fn a_window_that_ends_below_the_limit_is_left_alone() {
+        // 4 buses starting at 16 MiB ends far below 0xfec0_0000.
+        assert_eq!(clamp_ecam_window(0x0100_0000, 0, 3), Ok(None));
+        // And one that ends exactly on the limit is still untouched.
+        assert_eq!(clamp_ecam_window(0xfec0_0000 - BUS, 0, 0), Ok(None));
+    }
+
+    /// The trimmed window is a whole number of buses, and the bus count follows
+    /// it. This is the case that used to underflow: the mask kept the remainder
+    /// instead of rounding down, so the window described zero buses and the last
+    /// bus number was computed as `0 - 1`.
+    #[test]
+    fn a_window_past_the_limit_is_trimmed_to_whole_buses() {
+        // Firmware claims 256 buses, but only four and a half megabytes of the
+        // window sit below the limit.
+        let base = 0xfec0_0000 - 4 * BUS - BUS / 2;
+        let (size, bus_end) = clamp_ecam_window(base, 0, 255)
+            .expect("a trimmable window")
+            .expect("it needed trimming");
+        assert_eq!(size as u64, 4 * BUS, "the half bus was not rounded away");
+        assert_eq!(size as u64 % BUS, 0, "the window is not whole buses");
+        assert_eq!(bus_end, 3, "the last bus does not match the length");
+        // The length and the bus range agree, which is what the MMIO check
+        // further down relies on.
+        assert_eq!(size / PCIE_ECAM_BYTES_PER_BUS, bus_end as usize + 1);
+    }
+
+    /// The trim only ever shortens the range, so the last bus it names is inside
+    /// the range firmware asked for. This is why the `PCIE_MAX_BUSSES` guard at
+    /// the end of the function cannot fire: removing it leaves every test green,
+    /// and that is the reason, not a hole in the tests.
+    #[test]
+    fn the_trim_never_names_a_bus_past_the_requested_range() {
+        for requested_end in [1u8, 7, 64, 255] {
+            let base = 0xfec0_0000 - BUS * requested_end as u64;
+            if let Ok(Some((_, bus_end))) = clamp_ecam_window(base, 0, requested_end) {
+                assert!(
+                    bus_end <= requested_end,
+                    "asked for {} buses, got bus {}",
+                    requested_end,
+                    bus_end
+                );
+            }
+        }
+    }
+
+    /// An inverted range is refused instead of wrapping the bus count. The
+    /// syscall checks it first, but the helper is the thing under test.
+    #[test]
+    fn an_inverted_bus_range_is_refused() {
+        assert_eq!(
+            clamp_ecam_window(0x0100_0000, 4, 3),
+            Err(ZxError::INVALID_ARGS)
+        );
+    }
+
+    /// A window whose surviving part is smaller than one bus is refused rather
+    /// than described as an empty one. Returning a zero-length window is what
+    /// made the bus arithmetic wrap.
+    #[test]
+    fn a_window_with_less_than_one_bus_left_is_refused() {
+        // Half a megabyte below the limit.
+        assert_eq!(
+            clamp_ecam_window(0xfec0_0000 - BUS / 2, 0, 3),
+            Err(ZxError::INVALID_ARGS)
+        );
+        // And one that starts exactly on the limit.
+        assert_eq!(
+            clamp_ecam_window(0xfec0_0000, 0, 0),
+            Err(ZxError::INVALID_ARGS)
+        );
+    }
+
+    #[test]
+    fn a_window_that_starts_above_the_limit_is_refused() {
+        assert_eq!(
+            clamp_ecam_window(0xffff_0000, 0, 0),
+            Err(ZxError::INVALID_ARGS)
+        );
+    }
+
+    /// A base near the top of the address space makes the window's end
+    /// overflow, not merely exceed the limit. Userspace picks the base.
+    ///
+    /// Only the addition can overflow. The bus count is at most 256 and a bus is
+    /// 1 MiB, so the multiplication tops out at 256 MiB: turning its
+    /// `checked_mul` into a wrapping one leaves every test green because it
+    /// cannot wrap, not because nothing checks it.
+    #[test]
+    fn a_window_whose_end_overflows_is_refused() {
+        assert_eq!(
+            clamp_ecam_window(u64::MAX, 0, 255),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(
+            clamp_ecam_window(u64::MAX - BUS, 0, 0),
+            Err(ZxError::INVALID_ARGS)
+        );
+    }
+
+    /// The trimmed window can never name a bus past the end of the bus space.
+    #[test]
+    fn the_trimmed_window_stays_inside_the_bus_space() {
+        for base in [0u64, 0x1000_0000, 0xe000_0000, 0xfeb0_0000] {
+            if let Ok(Some((size, bus_end))) = clamp_ecam_window(base, 0, 255) {
+                assert!(
+                    (bus_end as usize) < PCIE_MAX_BUSSES,
+                    "base {:#x} named bus {}",
+                    base,
+                    bus_end
+                );
+                assert!(size >= PCIE_ECAM_BYTES_PER_BUS);
+            }
+        }
+    }
 }
