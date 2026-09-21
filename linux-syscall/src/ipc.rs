@@ -5,6 +5,28 @@ use zircon_object::vm::*;
 
 pub use linux_object::ipc::*;
 
+/// The MMU flags a `shmat` mapping is created with.
+///
+/// `USER` is not optional. `VmMapping::handle_page_fault` requires the
+/// page's recorded flags to contain the whole fault mask, and a ring-3
+/// access always faults with `USER` set -- so a mapping recorded without
+/// it answers the very first store with `ACCESS_DENIED`, and the process
+/// takes `SIGSEGV`. `sys_mmap` has always included it; this path did not,
+/// and nobody noticed for as long as the segment `shmat` attached was the
+/// wrong one anyway (shm ids were per-process until #1318). The first
+/// build where MIT-SHM attached the right segment was the first build
+/// where an X client got as far as writing into it:
+///
+///     unhandled page fault @ 0x11937000(WRITE | USER)
+///         [anon+0x0 in map 0x11937000-0x1199b000]: ACCESS_DENIED,
+///         proc=glxgears pc=... [libgallium.so+0x7e0859] -> SIGSEGV
+///
+/// `rep stos` zeroing the freshly attached 400 KiB image, from `glxgears`
+/// and `eglgears_x11` alike, at the first byte.
+fn shmat_mapping_flags() -> MMUFlags {
+    MMUFlags::READ | MMUFlags::WRITE | MMUFlags::EXECUTE | MMUFlags::USER
+}
+
 /// Syscalls of inter-process communication and System V semaphore Set operation.
 ///
 /// # Menu
@@ -392,13 +414,7 @@ impl Syscall<'_> {
             vmo.len(),
             shmflg
         );
-        let addr = vmar.map(
-            None,
-            vmo.clone(),
-            0,
-            vmo.len(),
-            MMUFlags::READ | MMUFlags::WRITE | MMUFlags::EXECUTE,
-        )?;
+        let addr = vmar.map(None, vmo.clone(), 0, vmo.len(), shmat_mapping_flags())?;
         shm_identifier.addr = addr;
         self.linux_process().shm_set(id, shm_identifier.clone());
 
@@ -654,6 +670,19 @@ mod ipc_tests {
     fn setval_refuses_a_value_above_semvmx() {
         assert_eq!(setval_from_arg(SEMVMX as usize + 1), Err(LxError::ERANGE));
         assert_eq!(setval_from_arg(70000), Err(LxError::ERANGE));
+    }
+
+    /// The bit that cost glxgears its first frame: a `shmat` mapping without
+    /// `USER` answers the first user store with `ACCESS_DENIED`.
+    #[test]
+    fn a_shmat_mapping_is_accessible_from_user_mode() {
+        let flags = shmat_mapping_flags();
+        assert!(
+            flags.contains(MMUFlags::USER),
+            "a ring-3 store faults with USER set, and the fault handler \
+             requires the recorded flags to contain the whole mask"
+        );
+        assert!(flags.contains(MMUFlags::READ | MMUFlags::WRITE));
     }
 
     #[test]
