@@ -880,7 +880,7 @@ impl Default for SignalActions {
 
 /// resource limit
 #[repr(C)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct RLimit {
     /// soft limit
     pub cur: u64,

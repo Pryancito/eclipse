@@ -663,8 +663,15 @@ impl Syscall<'_> {
         // null means update file offset
         // non-null means update {in,out}_offset instead
 
+        // Both offsets are `off_t` read from a user pointer, and both are
+        // *walked* by the copy below, so each needs the window checked and not
+        // just the starting position -- see `user_offset_end`. Unvalidated, a
+        // negative one arrived here as a number near 2^64 and went straight
+        // into `read_at`/`seek`, and the `+=` further down wrapped on top.
         let mut read_offset = if !in_offset.is_null() {
-            in_offset.read()?
+            let offset = in_offset.read()?;
+            linux_object::fs::user_offset_end(offset, count)?;
+            offset
         } else {
             in_file.seek(SeekFrom::Current(0))?
         };
@@ -672,6 +679,7 @@ impl Syscall<'_> {
         let orig_out_file_offset = out_file.seek(SeekFrom::Current(0))?;
         let write_offset = if !out_offset.is_null() {
             let offset = out_offset.read()?;
+            linux_object::fs::user_offset_end(offset, count)?;
             out_file.seek(SeekFrom::Start(offset))?
         } else {
             0
@@ -687,7 +695,12 @@ impl Syscall<'_> {
                 break;
             }
             bytes_read += read_len;
-            read_offset += read_len as u64;
+            // `user_offset_end` above bounds the whole window, so this cannot
+            // wrap for a checked call; `checked_add` keeps it true for the
+            // arm that took the file's own position instead.
+            read_offset = read_offset
+                .checked_add(read_len as u64)
+                .ok_or(LxError::EOVERFLOW)?;
 
             let mut bytes_written = 0;
             let mut rlen = read_len;
@@ -718,7 +731,11 @@ impl Syscall<'_> {
         } else {
             in_file.seek(SeekFrom::Current(bytes_read as i64))?;
         }
-        out_offset.write_if_not_null(write_offset + total_written as u64)?;
+        out_offset.write_if_not_null(
+            write_offset
+                .checked_add(total_written as u64)
+                .ok_or(LxError::EOVERFLOW)?,
+        )?;
         if !out_offset.is_null() {
             out_file.seek(SeekFrom::Start(orig_out_file_offset))?;
         }

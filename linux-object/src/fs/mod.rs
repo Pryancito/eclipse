@@ -98,6 +98,35 @@ pub fn user_len(raw: usize) -> LxResult<usize> {
         Ok(raw)
     }
 }
+
+/// The exclusive end of a `[offset, offset + len)` window userspace named
+/// with an `off_t` and a count, or an error.
+///
+/// [`user_offset`] alone is not enough once a syscall *walks* a window rather
+/// than touching one position: `copy_file_range(2)` and `sendfile(2)` advance
+/// the offset by what they copied, and an offset that is a valid `off_t` on
+/// its own can still leave `off_t` before the copy ends. Linux checks both,
+/// with two different errnos (`generic_copy_file_checks`):
+///
+/// ```c
+/// if (unlikely(pos_in < 0 || pos_out < 0))                     return -EINVAL;
+/// if (unlikely((pos_in + count) < pos_in ||
+///              (pos_out + count) < pos_out))                   return -EOVERFLOW;
+/// ```
+///
+/// The wrap test is Linux's exactly, and it is **not** a ceiling of
+/// `i64::MAX`. A ceiling there would be stricter than Linux: it caps `count`
+/// itself further down instead, so `sendfile(out, in, NULL, SIZE_MAX)` -- the
+/// "copy everything" idiom -- is a call Linux accepts and clamps, and
+/// rejecting it here would break a program that works on Linux. The offset is
+/// already non-negative by then, so what the wrap test actually catches is a
+/// `count` with its top bit set: the same signed-argument hole again, this
+/// time in the length.
+pub fn user_offset_end(offset: u64, len: usize) -> LxResult<u64> {
+    let offset = user_offset(offset)?;
+    offset.checked_add(len as u64).ok_or(LxError::EOVERFLOW)
+}
+
 use crate::net::Socket;
 use crate::process::LinuxProcess;
 use devfs::RandomINode;
@@ -2598,6 +2627,57 @@ mod user_argument_tests {
         assert!(user_offset(u64::MAX).is_err());
         assert!(user_offset(u64::MAX - 1).is_err());
         assert!(user_offset(1u64 << 63).is_err());
+    }
+
+    #[test]
+    fn a_window_that_starts_negative_is_einval_not_eoverflow() {
+        // The start is checked first, and with the same errno as everywhere
+        // else: `copy_file_range` with a negative offset is a bad argument,
+        // not an arithmetic accident.
+        assert!(matches!(user_offset_end(u64::MAX, 1), Err(LxError::EINVAL)));
+        assert!(matches!(
+            user_offset_end(1u64 << 63, 0),
+            Err(LxError::EINVAL)
+        ));
+    }
+
+    #[test]
+    fn a_window_whose_length_wraps_it_is_eoverflow() {
+        // This is the case `user_offset` alone cannot see: the start is a
+        // perfectly legal `off_t` and the *length* is what is hostile. Since
+        // the offset is already non-negative here, a sum that wraps a `u64`
+        // means a `count` with its top bit set -- the signed-argument hole
+        // again, moved from the offset to the length. Linux answers EOVERFLOW,
+        // a different errno on purpose: the offset was fine, the window is
+        // not.
+        assert!(matches!(
+            user_offset_end(4096, usize::MAX),
+            Err(LxError::EOVERFLOW)
+        ));
+        assert!(matches!(
+            user_offset_end(1, usize::MAX),
+            Err(LxError::EOVERFLOW)
+        ));
+        // Exactly no wrap is still accepted: the boundary is the wrap itself.
+        assert_eq!(user_offset_end(1, usize::MAX - 1).unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn a_huge_but_finite_window_is_not_refused() {
+        // Deliberately NOT stricter than Linux. `sendfile(out, in, NULL,
+        // SIZE_MAX)` is how programs say "copy everything"; Linux clamps
+        // `count` further down rather than refusing it, so a window that ends
+        // above `i64::MAX` without wrapping has to be accepted here too.
+        let start = i64::MAX as u64 - 4096;
+        assert!(user_offset_end(start, 1 << 20).is_ok());
+        assert!(user_offset_end(i64::MAX as u64, 1).is_ok());
+    }
+
+    #[test]
+    fn an_ordinary_window_comes_back_as_its_end() {
+        assert_eq!(user_offset_end(0, 0).unwrap(), 0);
+        assert_eq!(user_offset_end(0, 4096).unwrap(), 4096);
+        assert_eq!(user_offset_end(1000, 24).unwrap(), 1024);
     }
 
     #[test]
