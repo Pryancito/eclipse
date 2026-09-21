@@ -69,6 +69,15 @@ HDA controller (PCI 04:03) ── codec ── pin ── HDMI/DP or analog jack
   PulseAudio section), already fixes the sink at 48 kHz so the link never
   reprograms per track; wiring this component as a kernel fixed-rate sink is
   the eventual step that takes PulseAudio out of the resampling entirely.
+  `mixer` is SOF's mixer component (`mix_n_s16`): it sums several S16LE
+  streams into one, accumulating each frame in `i32` and clamping once at the
+  end, never pairwise (a pairwise clamp folds a loud stream over a quiet one
+  before they cancel). It carries no per-source gain -- a stream that wants to
+  be quieter runs through `volume` first. The ring is single-client today (a
+  second opener gets `EBUSY`, and PulseAudio mixes in userspace); this
+  component is what a kernel-side mixer is built from, and **not yet wired
+  into a device path**. Wiring it -- answering more than one open on a card
+  and mixing their rings -- is the follow-up.
 - **Codec graph**: the widget walk collects every output-capable pin with a
   reachable converter as a *candidate path*. Path choice is scored (digital
   HDMI/DP pin > presence > ELD valid) and — crucially — **re-evaluated at
