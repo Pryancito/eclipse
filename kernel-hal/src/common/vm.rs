@@ -238,3 +238,309 @@ pub trait GenericPageTable: Sync + Send {
         Ok(())
     }
 }
+
+/// Every [`PageSize`] is used as a mask: `align_down` and `page_offset` do
+/// `addr & !(size - 1)` and `addr & (size - 1)`, which is only the intended
+/// arithmetic while each value is a power of two. A new variant that is not
+/// would not fail here — it would silently align to the wrong boundary and map
+/// a page over its neighbour. Checked at compile time rather than in a test,
+/// because it is a property of the enum.
+const _: () = {
+    assert!((PageSize::Size4K as usize).is_power_of_two());
+    assert!((PageSize::Size2M as usize).is_power_of_two());
+    assert!((PageSize::Size1G as usize).is_power_of_two());
+    assert!((PageSize::Size4K as usize) == 4096);
+};
+
+/// `map_cont` decides, per step, which of the three page sizes to use, and a
+/// wrong answer there is not a crash: it maps a larger page than the caller
+/// asked for, silently covering the next mapping's range. It had no tests.
+///
+/// The fake table below records what it was asked to map instead of touching
+/// hardware, which is all these rules need — the whole decision is alignment
+/// and how much is left.
+#[cfg(test)]
+mod page_size_tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    const K: usize = PageSize::Size4K as usize;
+    const M: usize = PageSize::Size2M as usize;
+    const G: usize = PageSize::Size1G as usize;
+
+    // ── the mask arithmetic ────────────────────────────────────────────────
+
+    #[test]
+    fn align_down_and_page_offset_split_an_address_in_two() {
+        for size in [PageSize::Size4K, PageSize::Size2M, PageSize::Size1G] {
+            let s = size as usize;
+            for addr in [0, 1, s - 1, s, s + 1, 3 * s + 7, usize::MAX - 4096] {
+                assert_eq!(
+                    size.align_down(addr) + size.page_offset(addr),
+                    addr,
+                    "{:?} split {:#x}",
+                    size,
+                    addr
+                );
+                assert!(size.is_aligned(size.align_down(addr)));
+                assert_eq!(size.is_aligned(addr), size.page_offset(addr) == 0);
+            }
+        }
+    }
+
+    #[test]
+    fn only_2m_and_1g_are_huge() {
+        assert!(!PageSize::Size4K.is_huge());
+        assert!(PageSize::Size2M.is_huge());
+        assert!(PageSize::Size1G.is_huge());
+        assert_eq!(BASE_PAGE_SIZE, PageSize::Size4K);
+    }
+
+    #[test]
+    fn a_2m_aligned_address_is_not_necessarily_1g_aligned() {
+        // The three alignments are nested one way only, and `map_cont` relies
+        // on asking about the largest first.
+        assert!(PageSize::Size4K.is_aligned(M));
+        assert!(PageSize::Size2M.is_aligned(M));
+        assert!(!PageSize::Size1G.is_aligned(M));
+        assert!(PageSize::Size4K.is_aligned(G));
+        assert!(PageSize::Size2M.is_aligned(G));
+        assert!(PageSize::Size1G.is_aligned(G));
+    }
+
+    // ── a table that only remembers ────────────────────────────────────────
+
+    #[derive(Default)]
+    struct RecordingTable {
+        mapped: Vec<(VirtAddr, PhysAddr, PageSize)>,
+        /// Sizes `unmap` should report, popped in order; `Size4K` once empty.
+        unmap_sizes: Vec<PageSize>,
+        unmapped: Vec<VirtAddr>,
+        flushes: usize,
+    }
+
+    impl GenericPageTable for RecordingTable {
+        fn table_phys(&self) -> PhysAddr {
+            0x1000
+        }
+        fn map(&mut self, page: Page, paddr: PhysAddr, _flags: MMUFlags) -> PagingResult {
+            self.mapped.push((page.vaddr, paddr, page.size));
+            Ok(())
+        }
+        fn unmap(&mut self, vaddr: VirtAddr) -> PagingResult<(PhysAddr, PageSize)> {
+            self.unmapped.push(vaddr);
+            let size = if self.unmap_sizes.is_empty() {
+                PageSize::Size4K
+            } else {
+                self.unmap_sizes.remove(0)
+            };
+            Ok((vaddr, size))
+        }
+        fn update(
+            &mut self,
+            _vaddr: VirtAddr,
+            _paddr: Option<PhysAddr>,
+            _flags: Option<MMUFlags>,
+        ) -> PagingResult<PageSize> {
+            Ok(PageSize::Size4K)
+        }
+        fn query(&self, _vaddr: VirtAddr) -> PagingResult<(PhysAddr, MMUFlags, PageSize)> {
+            Err(PagingError::NotMapped)
+        }
+        fn remote_flush_all(&self) {
+            // `&self`, so count through a cell the test reads back.
+            FLUSHES.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    static FLUSHES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+    fn flushes_during(f: impl FnOnce()) -> usize {
+        use core::sync::atomic::Ordering::SeqCst;
+        let before = FLUSHES.load(SeqCst);
+        f();
+        FLUSHES.load(SeqCst) - before
+    }
+
+    fn sizes(t: &RecordingTable) -> Vec<usize> {
+        t.mapped.iter().map(|(_, _, s)| *s as usize).collect()
+    }
+
+    // ── choosing a page size ───────────────────────────────────────────────
+
+    #[test]
+    fn without_the_huge_flag_everything_is_a_4k_page() {
+        let mut t = RecordingTable::default();
+        t.map_cont(G, 2 * M, G, MMUFlags::READ).unwrap();
+        assert_eq!(t.mapped.len(), 2 * M / K);
+        assert!(sizes(&t).iter().all(|&s| s == K), "no huge page may appear");
+    }
+
+    #[test]
+    fn a_huge_mapping_takes_the_largest_page_that_fits_and_is_aligned() {
+        let mut t = RecordingTable::default();
+        t.map_cont(G, G + 2 * M, G, MMUFlags::HUGE_PAGE).unwrap();
+        assert_eq!(sizes(&t), alloc::vec![G, M, M]);
+        // And it does not reach for a gigabyte it has not got: one byte less
+        // than 1 GiB of range, however well aligned, is 2 MiB pages.
+        let mut t = RecordingTable::default();
+        t.map_cont(G, G - M, G, MMUFlags::HUGE_PAGE).unwrap();
+        assert_eq!(t.mapped.len(), (G - M) / M);
+        assert!(sizes(&t).iter().all(|&s| s == M));
+    }
+
+    #[test]
+    fn a_range_that_starts_unaligned_climbs_up_to_the_big_pages() {
+        // 4 KiB short of a 2 MiB boundary, then a full gigabyte: the head must
+        // be 4 KiB pages until the address is aligned, and only then grow.
+        let start = G - K;
+        let mut t = RecordingTable::default();
+        t.map_cont(start, K + G, start, MMUFlags::HUGE_PAGE)
+            .unwrap();
+        assert_eq!(sizes(&t), alloc::vec![K, G]);
+    }
+
+    #[test]
+    fn a_tail_too_short_for_a_huge_page_is_mapped_in_4k() {
+        let mut t = RecordingTable::default();
+        t.map_cont(M, M + 3 * K, M, MMUFlags::HUGE_PAGE).unwrap();
+        assert_eq!(sizes(&t), alloc::vec![M, K, K, K]);
+    }
+
+    #[test]
+    fn the_physical_side_has_a_vote_too() {
+        // A 2 MiB-aligned virtual address whose frame is not 2 MiB-aligned
+        // cannot be a huge page: one PTE cannot describe that pairing, and
+        // taking it anyway would map the wrong memory.
+        let mut t = RecordingTable::default();
+        t.map_cont(M, M, M + K, MMUFlags::HUGE_PAGE).unwrap();
+        assert_eq!(t.mapped.len(), M / K);
+        assert!(sizes(&t).iter().all(|&s| s == K));
+    }
+
+    #[test]
+    fn every_page_is_mapped_once_and_covers_the_range_exactly() {
+        let mut t = RecordingTable::default();
+        let start = 2 * G - M;
+        t.map_cont(start, M + G + 4 * K, start, MMUFlags::HUGE_PAGE)
+            .unwrap();
+        let mut expect = start;
+        for (vaddr, paddr, size) in &t.mapped {
+            assert_eq!(*vaddr, expect, "a gap or an overlap at {:#x}", expect);
+            assert_eq!(*paddr, expect, "physical side drifted from virtual");
+            assert!(size.is_aligned(*vaddr), "{:?} page at {:#x}", size, vaddr);
+            expect += *size as usize;
+        }
+        assert_eq!(expect, start + M + G + 4 * K, "the range was not covered");
+    }
+
+    #[test]
+    fn an_empty_range_maps_nothing() {
+        let mut t = RecordingTable::default();
+        t.map_cont(G, 0, G, MMUFlags::HUGE_PAGE).unwrap();
+        assert!(t.mapped.is_empty());
+    }
+
+    // ── unmapping a range ──────────────────────────────────────────────────
+
+    #[test]
+    fn unmapping_a_range_shoots_the_other_cpus_down_once_not_per_page() {
+        // The mmu-gather point: a synchronous shootdown per page turned a
+        // large `munmap` into a livelock against a peer that cannot ack
+        // promptly. One round for the whole range.
+        let mut t = RecordingTable::default();
+        let n = flushes_during(|| t.unmap_cont(0, 64 * K).unwrap());
+        assert_eq!(t.unmapped.len(), 64);
+        assert_eq!(n, 1, "exactly one cross-CPU flush for the whole range");
+    }
+
+    #[test]
+    fn a_range_that_was_never_mapped_shoots_nobody_down() {
+        struct Unmapped;
+        impl GenericPageTable for Unmapped {
+            fn table_phys(&self) -> PhysAddr {
+                0
+            }
+            fn map(&mut self, _: Page, _: PhysAddr, _: MMUFlags) -> PagingResult {
+                Ok(())
+            }
+            fn unmap(&mut self, _: VirtAddr) -> PagingResult<(PhysAddr, PageSize)> {
+                Err(PagingError::NotMapped)
+            }
+            fn update(
+                &mut self,
+                _: VirtAddr,
+                _: Option<PhysAddr>,
+                _: Option<MMUFlags>,
+            ) -> PagingResult<PageSize> {
+                Err(PagingError::NotMapped)
+            }
+            fn query(&self, _: VirtAddr) -> PagingResult<(PhysAddr, MMUFlags, PageSize)> {
+                Err(PagingError::NotMapped)
+            }
+            fn remote_flush_all(&self) {
+                FLUSHES.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let mut t = Unmapped;
+        let n = flushes_during(|| t.unmap_cont(0, 16 * K).unwrap());
+        assert_eq!(n, 0, "nothing was unmapped, so no TLB can be stale");
+    }
+
+    #[test]
+    fn unmapping_advances_by_the_size_the_table_reports() {
+        // A 2 MiB mapping must consume 2 MiB of the walk, not 4 KiB, or the
+        // loop visits the same huge page 512 times.
+        let mut t = RecordingTable {
+            unmap_sizes: alloc::vec![PageSize::Size2M],
+            ..Default::default()
+        };
+        t.unmap_cont(0, M + 2 * K).unwrap();
+        assert_eq!(t.unmapped, alloc::vec![0, M, M + K]);
+    }
+
+    #[test]
+    fn a_failure_that_is_not_not_mapped_stops_the_walk() {
+        struct NoMemory(usize);
+        impl GenericPageTable for NoMemory {
+            fn table_phys(&self) -> PhysAddr {
+                0
+            }
+            fn map(&mut self, _: Page, _: PhysAddr, _: MMUFlags) -> PagingResult {
+                Ok(())
+            }
+            fn unmap(&mut self, _: VirtAddr) -> PagingResult<(PhysAddr, PageSize)> {
+                self.0 += 1;
+                Err(PagingError::NoMemory)
+            }
+            fn update(
+                &mut self,
+                _: VirtAddr,
+                _: Option<PhysAddr>,
+                _: Option<MMUFlags>,
+            ) -> PagingResult<PageSize> {
+                Err(PagingError::NotMapped)
+            }
+            fn query(&self, _: VirtAddr) -> PagingResult<(PhysAddr, MMUFlags, PageSize)> {
+                Err(PagingError::NotMapped)
+            }
+        }
+        let mut t = NoMemory(0);
+        assert!(t.unmap_cont(0, 16 * K).is_err());
+        assert_eq!(t.0, 1, "the walk stops at the first real error");
+    }
+
+    // ── ignoring the one error that is not one ─────────────────────────────
+
+    #[test]
+    fn ignore_swallows_not_mapped_and_nothing_else() {
+        let ok: PagingResult<u32> = Ok(7);
+        assert!(ok.ignore().is_ok());
+        let missing: PagingResult<u32> = Err(PagingError::NotMapped);
+        assert!(missing.ignore().is_ok());
+        for e in [PagingError::NoMemory, PagingError::AlreadyMapped] {
+            let err: PagingResult<u32> = Err(e);
+            assert!(err.ignore().is_err(), "only NotMapped is ignorable");
+        }
+    }
+}

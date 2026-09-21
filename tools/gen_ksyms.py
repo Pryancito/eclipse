@@ -250,7 +250,7 @@ def build(syms, cap):
             entries.pop()
             warn(
                 f"table does not fit in {cap} bytes -- keeping the first {len(entries)} "
-                f"of {len(syms)} symbols. Raise KSYMS_CAP in zCore/src/ksyms.rs."
+                f"of {len(syms)} symbols. Raise KSYMS_CAP in kernel-hal/src/common/ksyms.rs."
             )
             break
     strtab_off = HEADER_LEN + len(entries) * 8

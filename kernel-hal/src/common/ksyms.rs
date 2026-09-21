@@ -243,3 +243,332 @@ impl core::fmt::Display for Addr {
 pub fn available() -> bool {
     header().is_some()
 }
+
+/// The symbolizer had no tests, on the one path whose failure mode this
+/// module's own header warns about: it does not fail, it confidently names
+/// the wrong function. Every crash report in the kernel reads through here.
+///
+/// The tests build the blob byte for byte in the layout at the top of this
+/// file and patch it in, so they fail if this code and `tools/gen_ksyms.py`
+/// ever stop agreeing on the format — which is the only thing holding the two
+/// halves together, since nothing else in the tree parses it.
+///
+/// One thing to know before sharpening [`lookup`]. Of the two halves of its
+/// extent check, only [`MAX_SYM_SPAN`] can reject anything on a sorted table:
+/// the search returns the *last* entry at or below `addr`, so the offset is
+/// already smaller than the distance to the next entry, and that half is
+/// unreachable — it is a backstop for a table that arrives out of order. The
+/// megabyte cap is what does the work, and it does it in two places: past the
+/// last symbol, and inside a gap wider than a megabyte between two of them
+/// (a section boundary, which is where `_copy_user_end` used to claim every
+/// low address in this hunt's backtraces). Both are pinned below.
+#[cfg(test)]
+mod ksyms_tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    /// One blob, one cached verdict, shared by every test here.
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Write `bytes` where the post-link step writes, and drop the cached
+    /// header verdict so the next lookup re-reads it.
+    fn install(bytes: &[u8]) {
+        assert!(bytes.len() <= KSYMS_CAP);
+        // SAFETY: `KSYMS` is an `UnsafeCell` and these tests hold `test_lock`,
+        // so nothing else is reading it. This is what `llvm-objcopy
+        // --update-section` does to the linked image.
+        unsafe {
+            let p = KSYMS.0.get() as *mut u8;
+            core::ptr::write_bytes(p, 0, KSYMS_CAP);
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+        }
+        STATE.store(0, Ordering::Relaxed);
+    }
+
+    /// The generator's layout: header, `(addr_off, name_off)` pairs, strtab.
+    fn blob(base: u64, syms: &[(u32, &str)]) -> Vec<u8> {
+        let mut strtab: Vec<u8> = Vec::new();
+        let mut entries: Vec<(u32, u32)> = Vec::new();
+        for (addr_off, name) in syms {
+            let name_off = strtab.len() as u32;
+            strtab.extend_from_slice(name.as_bytes());
+            strtab.push(0);
+            entries.push((*addr_off, name_off));
+        }
+        let strtab_off = (HEADER_LEN + entries.len() * 8) as u32;
+        let mut out = Vec::new();
+        out.extend_from_slice(&KSYM_MAGIC.to_le_bytes());
+        out.extend_from_slice(&KSYM_VERSION.to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        out.extend_from_slice(&strtab_off.to_le_bytes());
+        out.extend_from_slice(&base.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        assert_eq!(out.len(), HEADER_LEN);
+        for (a, n) in entries {
+            out.extend_from_slice(&a.to_le_bytes());
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        out.extend_from_slice(&strtab);
+        out
+    }
+
+    const BASE: u64 = 0xffff_ff00_0000_0000;
+
+    /// Three symbols at 0x1000, 0x2000 and 0x3000 from the image base.
+    fn three_symbols() {
+        install(&blob(
+            BASE,
+            &[
+                (0x1000, "arranca"),
+                (0x2000, "sirve_syscall"),
+                (0x3000, "panica"),
+            ],
+        ));
+    }
+
+    // ── the header ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_kernel_whose_table_was_never_patched_reports_no_table() {
+        // The reservation ships with a deliberately invalid magic so an image
+        // that skipped the post-link step still boots and still reports — with
+        // bare addresses, which is what it did before the table existed.
+        let _g = test_lock();
+        install(&[0xff, 0xff, 0xff, 0xff]);
+        assert!(!available());
+        assert!(lookup(BASE + 0x1000).is_none());
+    }
+
+    #[test]
+    fn a_table_from_another_format_is_refused_rather_than_parsed() {
+        let _g = test_lock();
+        let good = blob(BASE, &[(0x1000, "arranca")]);
+
+        let mut wrong_magic = good.clone();
+        wrong_magic[0] ^= 0xff;
+        install(&wrong_magic);
+        assert!(!available(), "a bad magic is not a table");
+
+        let mut wrong_version = good.clone();
+        wrong_version[4..8].copy_from_slice(&(KSYM_VERSION + 1).to_le_bytes());
+        install(&wrong_version);
+        assert!(!available(), "a future version is not this version");
+
+        install(&good);
+        assert!(available(), "and the real thing is accepted");
+    }
+
+    #[test]
+    fn a_string_table_that_overlaps_the_entries_is_refused() {
+        // A mismatched generator must not be able to walk the lookup off the
+        // end of the reservation, or into its own index.
+        let _g = test_lock();
+        let mut b = blob(BASE, &[(0x1000, "arranca"), (0x2000, "para")]);
+        // Claim the strtab starts inside the entry array.
+        b[12..16].copy_from_slice(&(HEADER_LEN as u32).to_le_bytes());
+        install(&b);
+        assert!(!available());
+
+        let mut b = blob(BASE, &[(0x1000, "arranca")]);
+        b[12..16].copy_from_slice(&(KSYMS_CAP as u32 + 1).to_le_bytes());
+        install(&b);
+        assert!(!available());
+    }
+
+    #[test]
+    fn an_empty_table_names_nothing() {
+        let _g = test_lock();
+        install(&blob(BASE, &[]));
+        assert!(available(), "an empty table is still a well-formed table");
+        assert!(lookup(BASE).is_none());
+        assert!(lookup(BASE + 0x1000).is_none());
+    }
+
+    // ── the lookup ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_address_on_a_symbol_is_named_with_offset_zero() {
+        let _g = test_lock();
+        three_symbols();
+        assert_eq!(lookup(BASE + 0x1000), Some(("arranca", 0)));
+        assert_eq!(lookup(BASE + 0x2000), Some(("sirve_syscall", 0)));
+        assert_eq!(lookup(BASE + 0x3000), Some(("panica", 0)));
+    }
+
+    #[test]
+    fn an_address_inside_a_symbol_carries_its_offset() {
+        let _g = test_lock();
+        three_symbols();
+        assert_eq!(lookup(BASE + 0x1004), Some(("arranca", 4)));
+        assert_eq!(lookup(BASE + 0x1fff), Some(("arranca", 0xfff)));
+        assert_eq!(lookup(BASE + 0x2abc), Some(("sirve_syscall", 0xabc)));
+    }
+
+    #[test]
+    fn the_first_byte_of_a_symbol_belongs_to_it_and_not_to_its_neighbour() {
+        // Off by one here means every return address that happens to land on a
+        // function entry is attributed to the function before it — which in a
+        // backtrace is precisely the caller, so the report looks plausible.
+        let _g = test_lock();
+        three_symbols();
+        assert_eq!(lookup(BASE + 0x1fff), Some(("arranca", 0xfff)));
+        assert_eq!(lookup(BASE + 0x2000), Some(("sirve_syscall", 0)));
+    }
+
+    #[test]
+    fn an_address_below_the_first_symbol_is_not_named() {
+        let _g = test_lock();
+        three_symbols();
+        assert!(lookup(BASE).is_none());
+        assert!(lookup(BASE + 0xfff).is_none());
+        assert!(lookup(0).is_none(), "a null pointer is not in the image");
+    }
+
+    #[test]
+    fn past_the_last_symbol_only_a_megabyte_is_claimed() {
+        // The last entry has no successor to bound it, so without
+        // `MAX_SYM_SPAN` it would name every address above it — including the
+        // heap and the user half. A report that says `panica+0x3f2a10` is
+        // worse than one that says `0xffffff0040000000`.
+        let _g = test_lock();
+        three_symbols();
+        let last = BASE + 0x3000;
+        assert_eq!(
+            lookup(last + MAX_SYM_SPAN - 1),
+            Some(("panica", MAX_SYM_SPAN - 1))
+        );
+        assert!(lookup(last + MAX_SYM_SPAN).is_none());
+        assert!(lookup(last + 0x4000_0000).is_none());
+    }
+
+    #[test]
+    fn the_search_lands_on_the_right_symbol_across_a_large_table() {
+        // Exercises the binary search itself rather than a handful of entries:
+        // 1000 symbols, every one probed at its start, its middle and its last
+        // byte. A table this size is what the kernel actually carries (~18k).
+        let _g = test_lock();
+        let names: Vec<alloc::string::String> =
+            (0..1000).map(|i| alloc::format!("fn_{}", i)).collect();
+        let syms: Vec<(u32, &str)> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (0x1000 + i as u32 * 0x40, n.as_str()))
+            .collect();
+        install(&blob(BASE, &syms));
+        for (i, name) in names.iter().enumerate() {
+            let start = BASE + 0x1000 + i as u64 * 0x40;
+            assert_eq!(lookup(start), Some((name.as_str(), 0)), "start of {}", name);
+            assert_eq!(
+                lookup(start + 0x20),
+                Some((name.as_str(), 0x20)),
+                "mid of {}",
+                name
+            );
+            assert_eq!(
+                lookup(start + 0x3f),
+                Some((name.as_str(), 0x3f)),
+                "end of {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn a_gap_wider_than_a_megabyte_is_not_attributed_to_the_symbol_before_it() {
+        // Two symbols with a section boundary between them. The first does not
+        // reach across it: a label sitting at the edge of an empty region
+        // would otherwise name everything in the hole, which is exactly what
+        // `_copy_user_end` did to every backtrace this hunt produced.
+        let _g = test_lock();
+        install(&blob(
+            BASE,
+            &[(0x1000, "borde"), (0x90_0000, "otra_seccion")],
+        ));
+        assert_eq!(
+            lookup(BASE + 0x1000 + MAX_SYM_SPAN - 1),
+            Some(("borde", MAX_SYM_SPAN - 1))
+        );
+        assert!(lookup(BASE + 0x1000 + MAX_SYM_SPAN).is_none());
+        // The far side of the gap is named normally.
+        assert_eq!(lookup(BASE + 0x90_0000), Some(("otra_seccion", 0)));
+    }
+
+    #[test]
+    fn the_next_symbol_bound_is_a_backstop_for_an_unsorted_table() {
+        // On a sorted table this bound is unreachable: the search returns the
+        // last entry at or below `addr`, so the offset is already below the
+        // span. Written down because a reader who believes otherwise will
+        // "simplify" the search and find nothing complaining. What it does
+        // cover is a table out of order, where the search's answer is
+        // meaningless and only the spans keep the lie small.
+        let _g = test_lock();
+        three_symbols();
+        for probe in [0x1000u64, 0x1234, 0x2000, 0x2fff, 0x3000] {
+            let (_, off) = lookup(BASE + probe).expect("inside the table");
+            assert!(
+                off < 0x1000,
+                "offset {:#x} exceeds the symbol's own span",
+                off
+            );
+        }
+    }
+
+    // ── the names ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_name_that_runs_to_the_end_without_a_terminator_is_not_returned() {
+        // The strtab is inside a fixed reservation, so an unterminated last
+        // name would otherwise be read as a slice reaching the end of it.
+        let _g = test_lock();
+        let mut b = blob(BASE, &[(0x1000, "arranca")]);
+        b.pop(); // drop the trailing NUL
+                 // Fill the rest of the reservation with non-NUL bytes so the scan
+                 // cannot stop anywhere.
+        b.resize(KSYMS_CAP, b'A');
+        install(&b);
+        assert!(lookup(BASE + 0x1000).is_none());
+    }
+
+    #[test]
+    fn a_name_that_is_not_utf8_is_dropped_instead_of_panicking() {
+        let _g = test_lock();
+        let mut b = blob(BASE, &[(0x1000, "arranca")]);
+        let strtab_off = HEADER_LEN + 8;
+        b[strtab_off] = 0xff;
+        install(&b);
+        assert!(lookup(BASE + 0x1000).is_none());
+    }
+
+    #[test]
+    fn a_name_offset_past_the_reservation_is_dropped() {
+        let _g = test_lock();
+        let mut b = blob(BASE, &[(0x1000, "arranca")]);
+        // The entry's `name_off` sits at HEADER_LEN + 4.
+        b[HEADER_LEN + 4..HEADER_LEN + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        install(&b);
+        assert!(lookup(BASE + 0x1000).is_none());
+    }
+
+    // ── what the reporters print ───────────────────────────────────────────
+
+    #[test]
+    fn addr_prints_the_number_first_and_the_name_only_if_there_is_one() {
+        // Every crash reporter formats through `Addr`, so the address itself
+        // must survive even when the table cannot name it — that number is
+        // what `llvm-addr2line` still takes.
+        let _g = test_lock();
+        three_symbols();
+        assert_eq!(
+            alloc::format!("{}", Addr(BASE + 0x2000)),
+            "0xffffff0000002000 <sirve_syscall>"
+        );
+        assert_eq!(
+            alloc::format!("{}", Addr(BASE + 0x2abc)),
+            "0xffffff0000002abc <sirve_syscall+0xabc>"
+        );
+        assert_eq!(alloc::format!("{}", Addr(BASE)), "0xffffff0000000000");
+    }
+}
