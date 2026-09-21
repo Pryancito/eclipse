@@ -118,7 +118,14 @@ static POLLER_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::Atomic
 /// periodic timer polls the fences on their behalf; the signal hook then
 /// delivers the eventfd exactly as an explicit signal would. Idle otherwise.
 fn arm_poller() {
-    if WAITER_COUNT.load(Ordering::Relaxed) == 0
+    // Keep the poller alive while *either* SYNCOBJ_EVENTFD waiters *or*
+    // sync_file poll waiters (GLX/DRI3) care about hardware fences. Before
+    // this, only the eventfd path armed it — so a lone `sync_wait` on a
+    // sync_file never saw the GPU land its fence and Zink killed the
+    // swapchain (`zink: swapchain killed` → `GLXBadCurrentWindow`).
+    let interested = WAITER_COUNT.load(Ordering::Relaxed) > 0
+        || super::syncobj_file::pending_waiter_count() > 0;
+    if !interested
         || !zcore_drivers::scheme::syncobj::has_pending()
         || POLLER_ARMED.swap(true, Ordering::AcqRel)
     {
@@ -129,11 +136,18 @@ fn arm_poller() {
         alloc::boxed::Box::new(|_| {
             POLLER_ARMED.store(false, Ordering::Release);
             // Resolves landed fences and fires the signal hook (below) for
-            // every point that advanced, which delivers the eventfds.
+            // every point that advanced, which delivers the eventfds / wakes
+            // sync_file EventBuses.
             zcore_drivers::scheme::syncobj::poll_pending();
             arm_poller();
         }),
     );
+}
+
+/// Arm the hardware-fence poller from the sync_file path (a GLX client that
+/// exported a fence still in flight has no SYNCOBJ_EVENTFD waiter).
+pub(super) fn ensure_hw_fence_poller() {
+    arm_poller();
 }
 
 /// Registered point-advance hook (see [`init`]). Deliver every waiter whose
@@ -143,7 +157,13 @@ fn arm_poller() {
 /// `write` takes the eventbus lock, and holding two locks across a wake is how
 /// this codebase has deadlocked before.
 fn on_syncobj_signaled(_handle: u32, _point: u64) {
+    // Always wake sync_file waiters first: they are independent of the
+    // eventfd registry, and returning early when WAITER_COUNT==0 used to
+    // leave GLX `sync_wait` parked forever after a hardware fence landed.
+    super::syncobj_file::wake_ready_waiters();
+
     if WAITER_COUNT.load(Ordering::Relaxed) == 0 {
+        arm_poller();
         return;
     }
     let mut fire: Vec<Arc<dyn FileLike>> = Vec::new();

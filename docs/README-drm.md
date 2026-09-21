@@ -261,7 +261,7 @@ esto no:
 | Divergencia | Qué rompe |
 |---|---|
 | `SYNCOBJ_TRANSFER` pierde el `dst_point` en el camino software | wlroots `linux-drm-syncobj-v1`: el frame del cliente no se libera nunca |
-| ~~Los fd de `sync_file` no se pueden sondear~~ | **Corregido:** `SyncobjHandle::poll` reporta `POLLIN` cuando la fence alcanzó el punto (como `sync_file_poll` en Linux); sin eso `sync_wait()` de Mesa fallaba/colgaba y Zink mataba el swapchain GLX |
+| ~~Los fd de `sync_file` no se pueden sondear~~ | **Corregido:** `SyncobjHandle::poll` reporta `POLLIN` cuando la fence alcanzó el punto; `subscribe_readiness` + el poller de fences HW despiertan `sys_poll` al aterrizar (sin eso `sync_wait()` de Mesa en GLX/DRI3 mataba el swapchain: `zink: swapchain killed`) |
 | `OUT_FENCE_PTR` devuelve una fence ya señalada | Quien marque el ritmo de frames con ella suelta buffers aún en escaneo |
 | El arm síncrono de `SYNCOBJ_WAIT` puede girar sin ceder la CPU | Una corrutina del kernel atascada; la máquina parece congelada |
 | Sin caché de dma-buf por objeto ni de handles PRIME por fichero | wlroots agota el tope global de 64 objetos GEM a los 64 frames |

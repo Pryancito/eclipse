@@ -12,6 +12,9 @@
 //! * [`src`]: a polyphase FIR sample-rate converter (`src/audio/src` in SOF),
 //!   one oversampled prototype low-pass indexed per output sample, fixed-point,
 //!   streaming. Not yet wired into a device path -- that is the follow-up.
+//! * [`mixer`]: saturating N-to-one PCM summing (`src/audio/mixer.c` in SOF),
+//!   `i32` accumulate then clamp once. What a kernel-side mixer is built from,
+//!   so more than one client can share a card; wiring it is the follow-up.
 //!
 //! The HDA driver's DAI-side behaviour (keep the engine running over silence
 //! when the host has nothing, rather than stopping and restarting the link)
@@ -21,6 +24,7 @@
 //! Everything here is pure: no device access, no allocation on the hot
 //! path, and every function is exercised by unit tests without hardware.
 
+pub mod mixer;
 mod proto;
 pub mod src;
 pub mod volume;
