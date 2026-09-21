@@ -105,6 +105,37 @@ fn init_kernel_page_table() -> PagingResult<PageTable> {
         )?;
     }
 
+    // Force the level-1 table of the kernel VMAR window into existence, by
+    // mapping one 4 KiB page there and taking it straight back out. Unmapping
+    // clears the leaf; it does not free the tables above it.
+    //
+    // `zircon_object::vm::KERNEL_ASPACE` is a VMAR with its own page table,
+    // made by `PageTable::from_current().clone_kernel()`, and
+    // `pt_clone_kernel_space` copies the TOP-LEVEL entries by value. That
+    // shares something only if the entry is already there: an empty one gets
+    // filled in the clone alone, so the mapping is invisible from the table
+    // the CPU is running on. The Linux ELF loader maps an executable's VMO
+    // into that VMAR and reads it at boot, off the kernel's own table, so the
+    // first byte faulted every time: `[KERNEL PAGE FAULT]
+    // vaddr=0xffffffff80000001 flags=READ rip=0x0`, then `[KERNEL BUG]
+    // halting`, on every case of `Linux Other Test Baremetal (riscv64)`. The
+    // other architectures get this for free because something already maps
+    // through the top-level entry their `KERNEL_ASPACE_BASE` falls in.
+    //
+    // Hard-coded, and it must keep agreeing with
+    // `zircon_object::vm::KERNEL_ASPACE_BASE` for riscv64: kernel-hal cannot
+    // depend on zircon-object, which depends on it.
+    {
+        const KERNEL_ASPACE_BASE: VirtAddr = 0xffff_ffff_8000_0000;
+        const ONE_PAGE: usize = 0x1000;
+        map_range(
+            KERNEL_ASPACE_BASE,
+            KERNEL_ASPACE_BASE + ONE_PAGE,
+            MMUFlags::READ,
+        )?;
+        pt.unmap_cont(KERNEL_ASPACE_BASE, ONE_PAGE)?;
+    }
+
     info!("initialized kernel page table @ {:#x}", pt.table_phys());
     Ok(pt)
 }
