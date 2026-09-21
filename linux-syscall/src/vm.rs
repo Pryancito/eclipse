@@ -1,6 +1,7 @@
 use super::*;
 use alloc::vec::Vec;
 use bitflags::bitflags;
+use linux_object::loader::HEAP_BASE;
 use zircon_object::vm::{pages, roundup_pages, MMUFlags, VmObject, PAGE_SIZE};
 
 /// Per-call cap for a single `mmap` / `brk` growth. It bounds how much a single
@@ -485,6 +486,22 @@ impl Syscall<'_> {
 
         // brk(0) → return current break unchanged (query).
         if new_brk == 0 {
+            return Ok(current_brk);
+        }
+
+        // Below where the heap starts is not a shrink, it is a bad argument,
+        // and Linux answers it by returning the old break (`if (brk <
+        // mm->start_brk) goto out;`). Without this the shrink branch below
+        // accepts it and moves the break into the middle of the loaded image,
+        // so the next grow tries to map over the program's own text: the
+        // `/oscomp/brk` case does exactly that, because it prints and
+        // round-trips the break through a 32-bit int and `HEAP_BASE` is a
+        // round power of two whose low 32 bits are zero.
+        if new_brk < HEAP_BASE {
+            info!(
+                "brk: {:#x} is below the heap base, keeping {:#x}",
+                new_brk, current_brk
+            );
             return Ok(current_brk);
         }
 

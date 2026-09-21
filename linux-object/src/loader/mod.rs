@@ -112,7 +112,7 @@ const STACK_TOP: usize = USER_ASPACE_BASE as usize + USER_ASPACE_SIZE as usize;
 /// bytes at 0x200000000000: INVALID_ARGS` — on `/bin/busybox ls` as much as on
 /// anything else, which is what `Linux Other Test Baremetal (riscv64)` was
 /// failing cases on even when the program itself printed the right answer.
-const HEAP_BASE: usize = (USER_ASPACE_SIZE as usize).next_power_of_two() / 4;
+pub const HEAP_BASE: usize = (USER_ASPACE_SIZE as usize).next_power_of_two() / 4;
 
 // The image sub-VMARs below are placed with `allocate(None, ..)`, i.e. at the
 // root VMAR's base, and PT_LOAD segments are then mapped at their `p_vaddr`
