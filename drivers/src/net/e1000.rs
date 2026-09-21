@@ -34,6 +34,81 @@ const RX_BUF_SIZE: usize = 4096;
 /// never be clipped, see the comment there.
 const TX_SCRATCH_LEN: usize = 1536;
 
+/// The reason the scratch exists is that the common case must not allocate,
+/// so it has to cover the MTU this driver advertises to smoltcp
+/// (`DeviceCapabilities::max_transmission_unit`, 1514). Checked here rather
+/// than in a test: neither value can change at run time, so the build is the
+/// right place to catch someone lowering one of them.
+const _: () = assert!(TX_SCRATCH_LEN >= 1514);
+
+/// The next descriptor index, wrapping at the end of the ring.
+#[inline]
+fn next_desc(idx: usize) -> usize {
+    (idx + 1) % NUM_DESC
+}
+
+/// How many bytes of an RX buffer a completed descriptor really covers.
+///
+/// `len` is written by the *device*, so it is not ours to trust: the buffer it
+/// describes is one page, and a length past that would have us build a slice
+/// over memory the descriptor never owned.
+#[inline]
+fn rx_len_clamped(device_len: u16) -> usize {
+    (device_len as usize).min(RX_BUF_SIZE)
+}
+
+/// Whether a frame of `len` bytes may be posted at all.
+///
+/// Rejecting is the point: clipping a frame to the buffer size put a corrupt,
+/// half-length packet on the wire while `NetScheme::send` still reported the
+/// full length as written, so the failure showed up as data loss on the peer
+/// rather than as an error here.
+#[inline]
+fn tx_frame_postable(len: usize) -> bool {
+    len != 0 && len <= RX_BUF_SIZE
+}
+
+/// Whether a frame can be posted at `next_to_use`, given a way to read a
+/// descriptor's DD bit. The tail slot must be free **and the one after it**.
+///
+/// The NIC has no ownership bit of its own: it works descriptors from TDH up
+/// to (but excluding) TDT and reads `TDH == TDT` as an EMPTY ring. Gating
+/// purely per-slot on DD let software post all `NUM_DESC` slots -- every
+/// descriptor starts pre-armed DD, so with the link still negotiating (or the
+/// NIC otherwise stalled) 256 frames post in a row, the tail wraps onto the
+/// head, and the `TDT` write hands the NIC a value equal to TDH. From its side
+/// the ring is empty: the posted frames are never fetched, their DD bits never
+/// come back, and every later `send` finds DD clear at slot 0 and fails
+/// forever. TX is dead until reboot, with no watchdog to notice. Linux's
+/// `e1000_desc_unused` bounds in-flight descriptors to `count - 1` for the
+/// same reason, and `e1000e::tx_can_post` is the same guard.
+#[inline]
+fn tx_ring_has_room(next_to_use: usize, dd_at: impl Fn(usize) -> bool) -> bool {
+    dd_at(next_to_use) && dd_at(next_desc(next_to_use))
+}
+
+/// Somewhere to build a `len`-byte frame: the stack scratch when it fits, a
+/// heap buffer when it does not.
+///
+/// Do NOT index a fixed-size stack array with `len`: it is whatever the IP
+/// layer computed for this datagram, and this smoltcp has neither IP
+/// fragmentation nor an egress MTU clamp (`max_transmission_unit` only feeds
+/// the TCP MSS). A single `sendto()` of a 1495-byte UDP payload -- never mind
+/// a 64 KiB one, or a raw socket -- makes `len` exceed the buffer, and
+/// `&mut scratch[..len]` panics inside the kernel.
+fn tx_stage<'a>(
+    len: usize,
+    scratch: &'a mut [u8; TX_SCRATCH_LEN],
+    heap: &'a mut Vec<u8>,
+) -> &'a mut [u8] {
+    if len <= TX_SCRATCH_LEN {
+        &mut scratch[..len]
+    } else {
+        heap.resize(len, 0);
+        heap.as_mut_slice()
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 struct E1000SendDesc {
@@ -291,10 +366,7 @@ impl E1000 {
 
         fence(Ordering::Acquire);
 
-        // `len` is written by the device; clamp it to the actual buffer size so
-        // a misbehaving device cannot make us read past the DMA buffer.
-        let len =
-            (unsafe { core::ptr::read_volatile(&((*desc_addr).len)) } as usize).min(RX_BUF_SIZE);
+        let len = rx_len_clamped(unsafe { core::ptr::read_volatile(&((*desc_addr).len)) });
 
         let buf_vaddr = self.rx_bufs[self.rx_next_to_clean].vaddr();
         let buffer = unsafe { core::slice::from_raw_parts(buf_vaddr as *const u8, len) };
@@ -311,7 +383,7 @@ impl E1000 {
             mmio_write(self.base, E1000_RDT, self.rx_next_to_clean as u32);
         }
 
-        self.rx_next_to_clean = (self.rx_next_to_clean + 1) % NUM_DESC;
+        self.rx_next_to_clean = next_desc(self.rx_next_to_clean);
 
         Some(pkt)
     }
@@ -342,7 +414,7 @@ impl E1000 {
     /// in-flight descriptors to `count - 1` for the same reason, and
     /// `e1000e::tx_can_post` is the same guard.
     pub fn can_send(&self) -> bool {
-        self.tx_dd_at(self.tx_next_to_use) && self.tx_dd_at((self.tx_next_to_use + 1) % NUM_DESC)
+        tx_ring_has_room(self.tx_next_to_use, |i| self.tx_dd_at(i))
     }
 
     /// Post a frame to the TX ring. Returns false (dropping the frame) if the
@@ -352,7 +424,7 @@ impl E1000 {
         // Reject instead of truncating: silently clipping a frame to the
         // buffer size put a corrupt, half-length packet on the wire while
         // `NetScheme::send` still reported the full length as written.
-        if buffer.is_empty() || buffer.len() > RX_BUF_SIZE {
+        if !tx_frame_postable(buffer.len()) {
             return false;
         }
 
@@ -386,7 +458,7 @@ impl E1000 {
 
         fence(Ordering::SeqCst);
 
-        self.tx_next_to_use = (self.tx_next_to_use + 1) % NUM_DESC;
+        self.tx_next_to_use = next_desc(self.tx_next_to_use);
 
         unsafe {
             mmio_write(self.base, E1000_TDT, self.tx_next_to_use as u32);
@@ -841,12 +913,7 @@ impl phy::TxToken for E1000TxToken {
         // buffer and `&mut buffer[..len]` panics inside the kernel.
         let mut scratch = [0u8; TX_SCRATCH_LEN];
         let mut heap_buf = Vec::new();
-        let buf: &mut [u8] = if len <= TX_SCRATCH_LEN {
-            &mut scratch[..len]
-        } else {
-            heap_buf.resize(len, 0);
-            heap_buf.as_mut_slice()
-        };
+        let buf: &mut [u8] = tx_stage(len, &mut scratch, &mut heap_buf);
         let result = f(buf)?;
 
         let mut driver = self.driver.hw.lock();
@@ -978,5 +1045,189 @@ impl PciDriver for E1000DriverPci {
         } else {
             Err(crate::DeviceError::NotSupported)
         }
+    }
+}
+
+#[cfg(test)]
+mod ring_tests {
+    //! The e1000 is QEMU's default NIC, so this driver is the one every guest
+    //! boots with -- and until recently it had no tests at all. Three of the
+    //! bugs fixed in it were the kind that leave no error behind: a frame
+    //! clipped to the buffer size and reported as fully sent, a TX ring that
+    //! wrapped its tail onto its head and died silently until reboot, and a
+    //! `len` from the IP layer used to index a fixed stack array, which
+    //! panics the kernel from one `sendto`. These are the tests those fixes
+    //! never got.
+
+    use super::*;
+
+    #[test]
+    fn the_ring_index_wraps_at_the_end_and_nowhere_else() {
+        assert_eq!(next_desc(0), 1);
+        assert_eq!(next_desc(NUM_DESC - 2), NUM_DESC - 1);
+        assert_eq!(
+            next_desc(NUM_DESC - 1),
+            0,
+            "the last slot wraps to the first"
+        );
+    }
+
+    #[test]
+    fn a_device_length_past_the_buffer_is_clamped() {
+        // `len` comes from the device. A slice built over more than the
+        // buffer holds reads memory the descriptor never owned, and the
+        // contents go straight up the network stack.
+        assert_eq!(rx_len_clamped(0), 0);
+        assert_eq!(rx_len_clamped(60), 60);
+        assert_eq!(rx_len_clamped(RX_BUF_SIZE as u16), RX_BUF_SIZE);
+        assert_eq!(rx_len_clamped(u16::MAX), RX_BUF_SIZE);
+        // The boundary itself: one past the buffer must not survive.
+        assert_eq!(rx_len_clamped(RX_BUF_SIZE as u16 + 1), RX_BUF_SIZE);
+    }
+
+    #[test]
+    fn an_empty_or_oversized_frame_is_refused_rather_than_clipped() {
+        // Clipping put a corrupt half-frame on the wire while the caller was
+        // told the whole thing went out, so the loss surfaced on the peer.
+        assert!(!tx_frame_postable(0), "a zero-length frame is not a frame");
+        assert!(tx_frame_postable(1));
+        assert!(tx_frame_postable(60));
+        assert!(tx_frame_postable(1514), "the advertised MTU must fit");
+        assert!(tx_frame_postable(RX_BUF_SIZE), "a full buffer still fits");
+        assert!(
+            !tx_frame_postable(RX_BUF_SIZE + 1),
+            "one byte past the DMA buffer must be refused, not truncated"
+        );
+        assert!(!tx_frame_postable(65536));
+        assert!(!tx_frame_postable(usize::MAX));
+    }
+
+    #[test]
+    fn the_tail_slot_alone_is_not_enough_to_post() {
+        // The guard slot is the whole point: the NIC reads `TDH == TDT` as an
+        // EMPTY ring, so filling the last free descriptor hands it a tail
+        // equal to its head and it fetches nothing at all.
+        let free_tail_only = |i: usize| i == 10;
+        assert!(
+            !tx_ring_has_room(10, free_tail_only),
+            "a free tail with a busy guard slot must NOT be postable"
+        );
+        let free_both = |i: usize| i == 10 || i == 11;
+        assert!(tx_ring_has_room(10, free_both));
+    }
+
+    #[test]
+    fn the_guard_slot_is_looked_up_with_the_ring_wrapped() {
+        // At the end of the ring the guard slot is index 0, not index 256 --
+        // which would be off the end of the descriptor array.
+        let last = NUM_DESC - 1;
+        let free_last_and_first = |i: usize| i == last || i == 0;
+        assert!(tx_ring_has_room(last, free_last_and_first));
+        let free_last_only = |i: usize| i == last;
+        assert!(
+            !tx_ring_has_room(last, free_last_only),
+            "wrapping must consult slot 0, and a busy slot 0 must block"
+        );
+        // And the index it asks about never leaves the ring.
+        for start in [0usize, 1, NUM_DESC / 2, NUM_DESC - 2, NUM_DESC - 1] {
+            tx_ring_has_room(start, |i| {
+                assert!(i < NUM_DESC, "asked about descriptor {} of {}", i, NUM_DESC);
+                true
+            });
+        }
+    }
+
+    #[test]
+    fn a_ring_that_is_entirely_busy_never_posts() {
+        assert!(!tx_ring_has_room(0, |_| false));
+        assert!(!tx_ring_has_room(NUM_DESC - 1, |_| false));
+    }
+
+    #[test]
+    fn a_frame_that_fits_the_scratch_uses_it_and_is_exactly_its_length() {
+        let mut scratch = [0xAAu8; TX_SCRATCH_LEN];
+        let mut heap = Vec::new();
+        for len in [0usize, 1, 60, 1514, TX_SCRATCH_LEN] {
+            let buf = tx_stage(len, &mut scratch, &mut heap);
+            assert_eq!(buf.len(), len, "staged buffer must be exactly `len`");
+            assert!(heap.is_empty(), "len {} should not have hit the heap", len);
+        }
+    }
+
+    #[test]
+    fn a_frame_longer_than_the_scratch_goes_to_the_heap_instead_of_panicking() {
+        // This is the one that panicked the kernel. `len` is whatever the IP
+        // layer computed, and a single `sendto()` of a 1495-byte UDP payload
+        // takes it past the 1536-byte scratch: 1495 + 20 (IP) + 8 (UDP) + 14
+        // (Ethernet) = 1537.
+        let mut scratch = [0u8; TX_SCRATCH_LEN];
+        let mut heap = Vec::new();
+        let buf = tx_stage(1537, &mut scratch, &mut heap);
+        assert_eq!(buf.len(), 1537);
+
+        // And the extreme a raw socket can ask for.
+        let mut scratch = [0u8; TX_SCRATCH_LEN];
+        let mut heap = Vec::new();
+        let buf = tx_stage(65535, &mut scratch, &mut heap);
+        assert_eq!(buf.len(), 65535);
+    }
+
+    #[test]
+    fn the_staged_buffer_is_zeroed_whichever_side_of_the_boundary_it_is_on() {
+        // smoltcp fills only the headers it knows about; whatever is left is
+        // what goes on the wire. A dirty scratch leaks the previous frame.
+        let mut scratch = [0xFFu8; TX_SCRATCH_LEN];
+        let mut heap = Vec::new();
+        let buf = tx_stage(64, &mut scratch, &mut heap);
+        buf.fill(0);
+        assert!(buf.iter().all(|&b| b == 0));
+
+        let mut scratch = [0u8; TX_SCRATCH_LEN];
+        let mut heap = alloc::vec![0xFFu8; 8];
+        let buf = tx_stage(4000, &mut scratch, &mut heap);
+        assert_eq!(buf.len(), 4000);
+        assert!(
+            buf[8..].iter().all(|&b| b == 0),
+            "the grown tail of the heap buffer must be zero, not stale bytes"
+        );
+    }
+
+    #[test]
+    fn the_scratch_boundary_is_exact() {
+        // One byte either side of `TX_SCRATCH_LEN`: `<=` uses the scratch, and
+        // `>` must not, because `&mut scratch[..len]` past its length is the
+        // panic.
+        let mut scratch = [0u8; TX_SCRATCH_LEN];
+        let mut heap = Vec::new();
+        assert_eq!(
+            tx_stage(TX_SCRATCH_LEN, &mut scratch, &mut heap).len(),
+            TX_SCRATCH_LEN
+        );
+        assert!(heap.is_empty());
+
+        let mut scratch = [0u8; TX_SCRATCH_LEN];
+        let mut heap = Vec::new();
+        assert_eq!(
+            tx_stage(TX_SCRATCH_LEN + 1, &mut scratch, &mut heap).len(),
+            TX_SCRATCH_LEN + 1
+        );
+        assert_eq!(
+            heap.len(),
+            TX_SCRATCH_LEN + 1,
+            "it must have gone to the heap"
+        );
+    }
+
+    #[test]
+    fn the_scratch_covers_the_advertised_mtu() {
+        // The reason the scratch exists at all: the common case must not
+        // allocate. 1514 is the MTU this driver advertises to smoltcp.
+        // (That the scratch covers the advertised MTU is asserted at compile
+        // time next to the constant itself -- a build error beats a test
+        // failure for something neither value can change at run time.)
+        //
+        // A postable frame is allowed to be longer than the scratch, so the
+        // two limits are not the same number and must not be conflated.
+        assert!(tx_frame_postable(TX_SCRATCH_LEN + 1));
     }
 }
