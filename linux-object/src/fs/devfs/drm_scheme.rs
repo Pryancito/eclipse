@@ -4808,6 +4808,11 @@ mod gl_client_sequence_tests {
             self.dev.read_at(0, buf)
         }
 
+        /// `poll(fd, POLLIN)` --- the other half of how a compositor waits.
+        pub(super) fn poll(&self) -> Result<PollStatus> {
+            self.dev.poll()
+        }
+
         /// `drmModeCreateDumbBuffer`: one scanout buffer.
         pub(super) fn create_dumb(&self, width: u32, height: u32) -> DrmModeCreateDumb {
             let mut req = DrmModeCreateDumb {
@@ -7810,5 +7815,337 @@ mod blob_id_space_tests {
             drm::destroy_blob(edid_blob_id(2)),
             drm::BlobDestroy::NotFound
         ));
+    }
+}
+
+/// The compute node's own ioctl (`DRM_ECLIPSE_COMPUTE_NR`), which has no tests
+/// at all and is the one place in this file where a client's own size encoding
+/// decides how much memory the kernel writes.
+///
+/// Every other DRM ioctl is reconciled against the kernel's struct before it
+/// reaches a handler: `drm_ioctl_reconciled` looks the command up in
+/// `canonical_drm_ioctl`, allocates a kernel buffer of the KERNEL's size, and
+/// copies in and out of that. A driver-private command has no canonical entry,
+/// so it takes the other branch -- `ucheck` against the size the CLIENT
+/// encoded, then straight to the handler with the user address. And this
+/// handler writes all 536 bytes of `struct drm_eclipse_compute`. The floor that
+/// refuses a short encoding is therefore the whole defence, it is an open-coded
+/// copy of `ioc_size()`, and nothing exercised either side of it.
+#[cfg(test)]
+mod compute_node_tests {
+    use super::gl_client_sequence_tests::Client;
+    use super::*;
+    use crate::fs::devfs::kms_emu::{self, EmuGpu};
+
+    /// `_IOWR('d', DRM_ECLIPSE_COMPUTE_NR, size)` -- the command word a client
+    /// builds, with the encoded size under the test's control.
+    fn compute_cmd(size: u32) -> u32 {
+        IOC_WRITE_DIR | IOC_READ_DIR | (size << 16) | (b'd' as u32) << 8 | DRM_ECLIPSE_COMPUTE_NR
+    }
+
+    /// A request with recognisable contents, so "was not written" is a real
+    /// assertion rather than "happens to be zero".
+    fn blank_request() -> DrmEclipseCompute {
+        DrmEclipseCompute {
+            op: 0,
+            status: 0x5A5A_5A5A,
+            elapsed_ns: 0x5A5A_5A5A_5A5A_5A5A,
+            grid_threads: 0x5A5A_5A5A,
+            reserved: 0,
+            summary: [0x5A; 512],
+        }
+    }
+
+    fn summary_str(req: &DrmEclipseCompute) -> alloc::string::String {
+        let end = req.summary.iter().position(|&b| b == 0).unwrap_or(0);
+        alloc::string::String::from_utf8_lossy(&req.summary[..end]).into_owned()
+    }
+
+    /// A client that encodes a struct smaller than the kernel's is refused
+    /// outright. The handler writes 536 bytes at the address it is given, and
+    /// the only bound anything checked was the size in the client's own command
+    /// word, so accepting a short encoding is half a kilobyte written past the
+    /// end of the caller's buffer -- from an unprivileged ioctl.
+    #[test]
+    fn a_short_size_encoding_is_refused_instead_of_writing_past_the_caller() {
+        let _screen = kms_emu::headless();
+        let c = Client::open(0);
+        let mut req = blank_request();
+
+        let err = c
+            .ioctl(compute_cmd(8), &mut req)
+            .expect_err("a short encoding must not reach the handler");
+        assert_eq!(err, FsError::InvalidParam);
+        // And it was refused BEFORE anything was written.
+        assert_eq!(req.status, 0x5A5A_5A5A, "the handler ran anyway");
+        assert!(
+            req.summary.iter().all(|&b| b == 0x5A),
+            "the summary was written"
+        );
+    }
+
+    /// One byte short is still short. The floor is `<`, and an off-by-one here
+    /// is the whole bug it exists to prevent.
+    #[test]
+    fn an_encoding_one_byte_short_is_still_refused() {
+        let _screen = kms_emu::headless();
+        let c = Client::open(0);
+        let mut req = blank_request();
+        let exact = core::mem::size_of::<DrmEclipseCompute>() as u32;
+
+        assert_eq!(
+            c.ioctl(compute_cmd(exact - 1), &mut req),
+            Err(FsError::InvalidParam)
+        );
+        // The exact size is accepted, so the refusal above is the size check
+        // and not the command being unknown.
+        assert_eq!(c.ioctl(compute_cmd(exact), &mut req), Ok(0));
+    }
+
+    /// With no GPU at all the answer is in-band: the ioctl SUCCEEDS and the
+    /// status field carries `-ENODEV`. Returning an ioctl error instead would
+    /// be indistinguishable from "this kernel has no compute ioctl", which is
+    /// what a probing client falls back on.
+    #[test]
+    fn a_node_with_no_gpu_answers_enodev_in_band_not_with_an_ioctl_error() {
+        let _screen = kms_emu::headless();
+        let c = Client::open(0);
+        let mut req = blank_request();
+
+        assert_eq!(
+            c.ioctl(
+                compute_cmd(core::mem::size_of::<DrmEclipseCompute>() as u32),
+                &mut req
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            req.status, -19,
+            "-ENODEV belongs in the reply, not in errno"
+        );
+        assert_eq!(summary_str(&req), "no compute GPU");
+    }
+
+    /// With a driver present the driver's own answer is passed through --
+    /// including its refusal. `EmuGpu` does not implement `compute_launch`, so
+    /// it gives the trait default, which is exactly what a driver that has not
+    /// wired compute up returns on real hardware.
+    #[test]
+    fn a_driver_without_compute_support_answers_with_its_own_status() {
+        let screen = kms_emu::headless();
+        let _gpu = screen.attach_gpu(EmuGpu::new("emu-gpu"));
+        let c = Client::open(0);
+        let mut req = blank_request();
+
+        assert_eq!(
+            c.ioctl(
+                compute_cmd(core::mem::size_of::<DrmEclipseCompute>() as u32),
+                &mut req
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            req.status, -38,
+            "-ENOSYS from the driver, not the core's -ENODEV"
+        );
+        assert_ne!(summary_str(&req), "no compute GPU");
+        assert!(
+            !summary_str(&req).is_empty(),
+            "the driver's report was dropped"
+        );
+        // The reply's other fields are always written, so a client cannot read
+        // a previous launch's numbers.
+        assert_eq!(req.elapsed_ns, 0);
+        assert_eq!(req.grid_threads, 0);
+    }
+
+    /// The summary is always NUL-terminated, even when the driver's report is
+    /// longer than the field. It is read by C as a string, so a report that
+    /// filled all 512 bytes would run off the end of the struct.
+    #[test]
+    fn the_summary_is_nul_terminated_even_when_the_report_overflows_it() {
+        let mut dst = [0xFFu8; 512];
+        let long = alloc::string::String::from_utf8(alloc::vec![b'x'; 600]).unwrap();
+        fill_summary(&mut dst, &long);
+        assert_eq!(dst[511], 0, "no room left for the terminator");
+        assert!(dst[..511].iter().all(|&b| b == b'x'));
+
+        // And a short report clears what a previous, longer one left behind.
+        fill_summary(&mut dst, "ok");
+        assert_eq!(&dst[..3], b"ok\0");
+        assert!(dst[3..].iter().all(|&b| b == 0), "stale bytes survived");
+    }
+}
+
+/// The DRM event queue as a client sees it: one queue per open file, read whole
+/// events at a time, with two different errnos for "nothing yet" and "your
+/// buffer is too small".
+///
+/// A compositor's main loop is `poll` then `read`, and both answers are
+/// load-bearing. `EAGAIN` means "come back"; `EINVAL` means "your buffer is
+/// wrong" -- and this is the one place the tree deliberately diverges from what
+/// looks natural, because returning `EAGAIN` for a short buffer livelocks: the
+/// queue is still non-empty, so the file stays readable and a blocking reader's
+/// wait resolves instantly, forever. The existing tests of this file read events
+/// but accept `Err(_) | Ok(0)` where they do, so none of them can tell those two
+/// errnos apart, and none of them has two clients open at once.
+#[cfg(test)]
+mod event_queue_tests {
+    use super::gl_client_sequence_tests::{parse_events, Client, FLIP_COMPLETE};
+    use super::*;
+    use crate::fs::devfs::kms_emu;
+
+    /// Put one flip completion on `c`'s queue. The caller holds the attached
+    /// [`kms_emu::Screen`] the present needs.
+    fn queue_one_flip(c: &Client, user_data: u64) -> (u32, u32) {
+        let buf = c.create_dumb(32, 8);
+        let fb = c.addfb2(&buf);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, user_data)
+            .expect("flip");
+        drm::flush_pending_flip_completions();
+        (fb, buf.handle)
+    }
+
+    /// An empty queue is `EAGAIN`, not a short read and not `EINVAL`. A
+    /// compositor that gets anything else on the very common "poll woke me for
+    /// something else" path treats the card fd as broken and tears the output
+    /// down.
+    #[test]
+    fn an_empty_queue_reads_eagain_and_not_a_broken_fd() {
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+        let mut buf = [0u8; 32];
+
+        assert_eq!(c.read_events(&mut buf), Err(FsError::Again));
+        // And nothing was written into the buffer.
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+
+    /// A buffer too small for one event is `EINVAL`, and the event STAYS
+    /// queued. `EAGAIN` here is a livelock (the queue is non-empty, so the file
+    /// is still readable and the wait resolves instantly, over and over), and
+    /// dropping the event instead would lose the flip completion wlroots is
+    /// waiting on -- a desktop frozen on its current frame.
+    #[test]
+    fn a_buffer_too_small_for_one_event_is_einval_and_keeps_the_event() {
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+        let (fb, handle) = queue_one_flip(&c, 0xABCD);
+
+        let mut small = [0u8; 16];
+        assert_eq!(c.read_events(&mut small), Err(FsError::InvalidParam));
+        assert!(
+            small.iter().all(|&b| b == 0),
+            "a partial event was delivered"
+        );
+
+        // Still there, and still whole.
+        let mut full = [0u8; 32];
+        assert_eq!(c.read_events(&mut full).expect("the event survived"), 32);
+        let ev = parse_events(&full);
+        assert_eq!(ev[0].ev_type, FLIP_COMPLETE);
+        assert_eq!(ev[0].user_data, 0xABCD);
+        // Drained now.
+        assert_eq!(c.read_events(&mut full), Err(FsError::Again));
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(handle).expect("DESTROY_DUMB");
+    }
+
+    /// One client's completion is not readable by another. The queue lives on
+    /// the open file, like Linux's `struct drm_file`: with a single device-wide
+    /// stream, a probing client (Xwayland during session bring-up) reads the
+    /// compositor's flip completion out from under it and wlroots then waits on
+    /// an event that has already been consumed.
+    #[test]
+    fn one_clients_flip_completion_is_not_readable_by_another() {
+        let _screen = kms_emu::attach(32, 8);
+        let flipper = Client::open(0);
+        let bystander = Client::open(0);
+        let (fb, handle) = queue_one_flip(&flipper, 0x1234);
+
+        let mut buf = [0u8; 32];
+        assert_eq!(
+            bystander.read_events(&mut buf),
+            Err(FsError::Again),
+            "another open file drained the completion"
+        );
+        assert!(!bystander.poll().expect("poll").read);
+
+        // And the client that asked for it still has it.
+        assert_eq!(flipper.read_events(&mut buf).expect("own completion"), 32);
+        assert_eq!(parse_events(&buf)[0].user_data, 0x1234);
+
+        flipper.rmfb(fb).expect("RMFB");
+        flipper.destroy_dumb(handle).expect("DESTROY_DUMB");
+    }
+
+    /// `poll` says readable exactly while an event is queued. It is what parks
+    /// the compositor's main loop: stuck at readable burns a core in a spin, and
+    /// stuck at not-readable is a desktop that never sees its own flip land.
+    #[test]
+    fn poll_reports_readable_only_while_an_event_is_queued() {
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+        assert!(
+            !c.poll().expect("poll").read,
+            "readable with an empty queue"
+        );
+
+        let (fb, handle) = queue_one_flip(&c, 1);
+        assert!(
+            c.poll().expect("poll").read,
+            "not readable with an event queued"
+        );
+
+        // A refused short read must not clear it either.
+        let mut small = [0u8; 8];
+        assert_eq!(c.read_events(&mut small), Err(FsError::InvalidParam));
+        assert!(
+            c.poll().expect("poll").read,
+            "a short read consumed the event"
+        );
+
+        let mut full = [0u8; 32];
+        assert_eq!(c.read_events(&mut full).expect("drain"), 32);
+        assert!(!c.poll().expect("poll").read, "readable after the drain");
+        // Writable throughout, on purpose: reporting write=false made labwc's
+        // DRM epoll park and exposed a #DF at session start.
+        assert!(c.poll().expect("poll").write);
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(handle).expect("DESTROY_DUMB");
+    }
+
+    /// Several queued events come out one read at a time, in order, and a
+    /// buffer big enough for two takes two. A reader that got them out of order
+    /// would mis-pair completions with the frames that asked for them.
+    #[test]
+    fn queued_events_come_out_in_order_and_a_big_buffer_takes_several() {
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+        let buf = c.create_dumb(32, 8);
+        let fb = c.addfb2(&buf);
+
+        // Two frames, each completion collected... by a reader that waits until
+        // both are in, which is what a compositor doing two outputs looks like.
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0x11).expect("flip 1");
+        drm::flush_pending_flip_completions();
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0x22).expect("flip 2");
+        drm::flush_pending_flip_completions();
+
+        let mut both = [0u8; 64];
+        assert_eq!(c.read_events(&mut both).expect("two events"), 64);
+        let ev = parse_events(&both);
+        assert_eq!(ev.len(), 2);
+        assert_eq!(ev[0].user_data, 0x11, "the events came out reversed");
+        assert_eq!(ev[1].user_data, 0x22);
+        assert_eq!(
+            ev[0].length, 32,
+            "the wire length must match the reader's stride"
+        );
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
     }
 }
