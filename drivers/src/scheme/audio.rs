@@ -46,10 +46,16 @@ pub trait AudioScheme: Scheme {
         self.buffer_bytes()
     }
 
-    /// Bytes of client PCM queued but not yet played out. Silence the device
-    /// inserted on its own (see [`delay_bytes`](AudioScheme::delay_bytes))
-    /// is not counted: this is what a client's hardware pointer is derived
-    /// from, and it must only ever advance through bytes the client wrote.
+    /// Bytes queued but not yet played out, as the client must count them:
+    /// EXACTLY [`buffer_bytes`](AudioScheme::buffer_bytes) less what
+    /// [`write`](AudioScheme::write) would accept right now. The ALSA node
+    /// derives both `avail` and the client's hardware pointer from this, and
+    /// alsa-lib clients (PulseAudio's sink aborts) treat a write that takes
+    /// nothing after `avail` said there was room as a driver bug. So any
+    /// silence the device inserted on its own that still occupies the ring
+    /// counts here too; a device that keeps its engine running through a
+    /// gap lets the pointer step back once, by that silence, when the gap
+    /// opens, rather than promise room it does not have.
     fn queued_bytes(&self) -> usize;
 
     /// Bytes the link still has to play before the last queued client byte
