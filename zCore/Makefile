@@ -562,9 +562,18 @@ kernel:
 ifneq ($(PLATFORM), libos)
 	@python3 ../tools/gen_ksyms.py $(kernel_elf) || true
 endif
+# Stage the kernel where the aarch64 boot disk expects it. Guarded on libos
+# as well as on the architecture: a libos build has no `--target` (see
+# `build_args`), so cargo builds for the HOST and leaves the binary in
+# `target/$(MODE)/zcore`, not under `target/aarch64/`. Without the guard the
+# aarch64 libos job compiled fine and then died in this `cp` -- which is what
+# `Zircon Core Test Libos (aarch64 Linux)` had been failing on. `$(kernel_elf)`
+# already resolves to whichever of the two paths applies, so use it.
 ifeq ($(ARCH), aarch64)
+ifneq ($(PLATFORM), libos)
 	@mkdir -p disk/EFI/Boot
-	@cp ../target/aarch64/$(MODE)/zcore disk/os
+	@cp $(kernel_elf) disk/os
+endif
 endif
 
 .PHONY: disasm
