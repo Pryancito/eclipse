@@ -377,6 +377,33 @@ cfg_if! {
 pub const KD_TEXT: u32 = 0x00;
 /// Graphics mode: userspace owns the framebuffer; the console stops drawing.
 pub const KD_GRAPHICS: u32 = 0x01;
+/// Obsolete alias of [`KD_TEXT`]. Linux's `vt_ioctl.c` still accepts it (and
+/// [`KD_TEXT1`]) as a request for text mode, and old X servers and VT tools
+/// still send it.
+pub const KD_TEXT0: u32 = 0x02;
+/// Obsolete alias of [`KD_TEXT`]; see [`KD_TEXT0`].
+pub const KD_TEXT1: u32 = 0x03;
+
+/// The canonical mode a `KD_SETMODE` argument asks for, or `None` when it asks
+/// for nothing Linux would accept (`vt_ioctl.c`'s `default: ret = -EINVAL`).
+///
+/// This has to be decided in ONE place, and it has to be decided before the
+/// value is stored, because everything downstream compares against
+/// [`KD_TEXT`]: [`present_allowed`] reads anything else as "userspace owns the
+/// framebuffer" and stops pushing the text console to the display. So a mode
+/// that is neither constant -- `KD_TEXT0` from an old X server, or any stray
+/// value, since nothing rejected them -- blanked the console and left it
+/// blank: [`set_kd_mode_vt`]'s own arms match on the two constants too, so
+/// neither the repaint nor the fall back to the primary text VT ran either.
+/// Same shape as `linux-object`'s `vt_mode_accepted` for `VT_SETMODE`, which
+/// had the identical hole.
+pub fn normalize_kd_mode(mode: u32) -> Option<u32> {
+    match mode {
+        KD_TEXT | KD_TEXT0 | KD_TEXT1 => Some(KD_TEXT),
+        KD_GRAPHICS => Some(KD_GRAPHICS),
+        _ => None,
+    }
+}
 
 // KD mode is per-VT (like Linux): an X server putting *its* VT into
 // `KD_GRAPHICS` must not stop the kernel drawing the other text consoles, so
@@ -404,8 +431,14 @@ fn present_allowed(vt: usize) -> bool {
     kd_mode_vt(vt) == KD_TEXT || DIAG_PRESENT_OVER_GRAPHICS.load(Ordering::Relaxed)
 }
 
-/// Set the KD mode of a specific VT (`KD_TEXT` or `KD_GRAPHICS`).
+/// Set the KD mode of a specific VT (`KD_TEXT` or `KD_GRAPHICS`; the obsolete
+/// text aliases are accepted and stored as `KD_TEXT`). An unrecognised mode is
+/// ignored -- see [`normalize_kd_mode`] -- so the stored mode is always one of
+/// the two the rest of this module compares against.
 pub fn set_kd_mode_vt(vt: usize, mode: u32) {
+    let Some(mode) = normalize_kd_mode(mode) else {
+        return;
+    };
     if let Some(m) = KD_MODES.get(vt) {
         m.store(mode, Ordering::SeqCst);
     }
@@ -845,4 +878,163 @@ macro_rules! klog_err {
             &::alloc::format!($($arg)*),
         )
     };
+}
+
+#[cfg(test)]
+mod kd_mode_tests {
+    extern crate std;
+
+    use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// The KD mode table and the diagnostic flag are process-wide statics, so
+    /// every test here takes the same lock. (`--test-threads=1`, which CI uses,
+    /// hides that; the default parallel run does not.)
+    fn test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Leave the globals as a fresh boot has them.
+    fn reset() {
+        for vt in 0..NUM_VTS {
+            set_kd_mode_vt(vt, KD_TEXT);
+        }
+        set_diag_present_over_graphics(false);
+    }
+
+    /// Linux's `vt_ioctl.c` folds `KD_TEXT0` and `KD_TEXT1` into `KD_TEXT` and
+    /// answers anything else with `-EINVAL`. Storing an unrecognised value
+    /// instead was not a cosmetic divergence: everything downstream tests
+    /// `== KD_TEXT`, so the console stopped being pushed to the display and
+    /// `set_kd_mode_vt`'s own arms matched neither mode, so neither the repaint
+    /// nor the fall back to the primary text VT ran. The screen went blank and
+    /// stayed blank, and the process that asked got `Ok`.
+    #[test]
+    fn a_kd_mode_is_stored_only_in_its_canonical_form() {
+        let _g = test_lock();
+        reset();
+
+        for alias in [KD_TEXT, KD_TEXT0, KD_TEXT1] {
+            assert_eq!(
+                normalize_kd_mode(alias),
+                Some(KD_TEXT),
+                "{:#x} is a request for text mode",
+                alias
+            );
+        }
+        assert_eq!(normalize_kd_mode(KD_GRAPHICS), Some(KD_GRAPHICS));
+        for bogus in [4u32, 0x10, 0xffff_ffff] {
+            assert_eq!(normalize_kd_mode(bogus), None, "{:#x} is not a mode", bogus);
+        }
+
+        // And the store never lets a non-canonical value through, whichever
+        // caller it came from.
+        set_kd_mode_vt(0, KD_TEXT1);
+        assert_eq!(
+            kd_mode_vt(0),
+            KD_TEXT,
+            "an obsolete text alias must read back as text, so KD_GETMODE \
+             answers what Linux answers and the console keeps drawing"
+        );
+        reset();
+    }
+
+    /// An unrecognised mode must leave the VT exactly as it was. It used to
+    /// overwrite it, and since the new value was neither constant the VT was
+    /// then in no mode at all -- unrecoverable except by setting a real mode
+    /// again, which a process that thought it had succeeded will not do.
+    #[test]
+    fn an_unrecognised_mode_leaves_the_vt_untouched() {
+        let _g = test_lock();
+        reset();
+
+        set_kd_mode_vt(GRAPHICS_VT, KD_GRAPHICS);
+        set_kd_mode_vt(GRAPHICS_VT, 0x2a);
+        assert_eq!(
+            kd_mode_vt(GRAPHICS_VT),
+            KD_GRAPHICS,
+            "a rejected mode must not disturb the mode the VT is in"
+        );
+
+        set_kd_mode_vt(0, KD_TEXT);
+        set_kd_mode_vt(0, 0x2a);
+        assert_eq!(kd_mode_vt(0), KD_TEXT);
+        reset();
+    }
+
+    /// KD mode is per-VT, like Linux: a compositor putting tty7 into graphics
+    /// must not stop the kernel drawing the other text consoles, or switching
+    /// away from the graphics VT lands on a blank terminal.
+    #[test]
+    fn graphics_mode_on_one_vt_does_not_silence_the_others() {
+        let _g = test_lock();
+        reset();
+
+        set_kd_mode_vt(GRAPHICS_VT, KD_GRAPHICS);
+        assert!(!present_allowed(GRAPHICS_VT));
+        for vt in 0..GRAPHICS_VT {
+            assert!(
+                present_allowed(vt),
+                "text console {} must keep being presented",
+                vt
+            );
+        }
+        reset();
+    }
+
+    /// A VT index outside the table reads as text rather than as "graphics",
+    /// so a stray index can never be the reason the console stops drawing.
+    #[test]
+    fn a_vt_outside_the_table_reads_as_text() {
+        let _g = test_lock();
+        reset();
+
+        assert_eq!(kd_mode_vt(NUM_VTS), KD_TEXT);
+        assert_eq!(kd_mode_vt(usize::MAX), KD_TEXT);
+        // And setting one is ignored rather than aliasing onto a real VT.
+        set_kd_mode_vt(NUM_VTS, KD_GRAPHICS);
+        for vt in 0..NUM_VTS {
+            assert_eq!(kd_mode_vt(vt), KD_TEXT, "VT {} was written through", vt);
+        }
+        reset();
+    }
+
+    /// The diagnostic that keeps the kernel log on screen over a compositor.
+    /// It is what a monitor-only box has to read the last line before a freeze,
+    /// and until `console.overgraphics` was wired in `zCore/src/main.rs` its
+    /// setter had no caller at all, so it could not be turned on.
+    #[test]
+    fn the_diagnostic_presents_over_a_graphics_vt() {
+        let _g = test_lock();
+        reset();
+
+        set_kd_mode_vt(GRAPHICS_VT, KD_GRAPHICS);
+        assert!(
+            !present_allowed(GRAPHICS_VT),
+            "off by default: the compositor owns the screen"
+        );
+
+        set_diag_present_over_graphics(true);
+        assert!(
+            present_allowed(GRAPHICS_VT),
+            "with the diagnostic on, the kernel console reaches the display \
+             even while the VT is held in graphics mode"
+        );
+
+        set_diag_present_over_graphics(false);
+        assert!(!present_allowed(GRAPHICS_VT));
+        reset();
+    }
+
+    /// The graphics VT is the last one, and `zCore/src/main.rs` spawns no login
+    /// shell on it while the userspace launcher targets `tty7`. Bumping
+    /// `NUM_VTS` has to move both together, and this is the assertion that
+    /// notices if only one of them moves.
+    #[test]
+    fn the_graphics_vt_is_the_last_one() {
+        assert_eq!(GRAPHICS_VT, NUM_VTS - 1);
+        assert_eq!(GRAPHICS_VT + 1, 7, "the launcher targets tty7");
+        assert!(KD_MODES.len() >= NUM_VTS, "one mode slot per VT");
+    }
 }

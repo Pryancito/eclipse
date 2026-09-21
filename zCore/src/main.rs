@@ -244,6 +244,21 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         } else {
             klog_info!("Eclipse: SMP multi-core bring-up enabled (pass `smp=off` to disable)");
         }
+        // Keep the kernel text console on screen even while a compositor holds
+        // its VT in KD_GRAPHICS. Normally KD_GRAPHICS suppresses presentation
+        // so labwc owns the display, which also means a hard hang's last
+        // kernel line is never seen on a monitor-only box -- exactly the
+        // console tail we keep having to ask for when the compositor dies.
+        // `kernel_hal::console::set_diag_present_over_graphics` existed for
+        // this and had no caller, so the diagnostic could not be turned on at
+        // all; this is its switch.
+        if options.cmdline.contains("console.overgraphics") {
+            kernel_hal::console::set_diag_present_over_graphics(true);
+            klog_info!(
+                "Eclipse: console.overgraphics ON — el log del kernel se sigue pintando \
+                 sobre un VT en KD_GRAPHICS (la última línea antes de un cuelgue queda en pantalla)"
+            );
+        }
         // Deterministic TLB-shootdown starvation hammer (see tlb_hammer.rs).
         #[cfg(all(feature = "linux", not(feature = "libos")))]
         if let Some(n) = tlb_hammer::parse_tlbhammer(&options.cmdline) {

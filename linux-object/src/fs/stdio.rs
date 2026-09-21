@@ -476,6 +476,18 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             // switching the console to graphics mode, which is exactly the step
             // an X server (TinyX/Xorg) performs to seize the display.
             let mode = data as u32;
+            // Linux answers a mode that is neither KD_TEXT (nor its obsolete
+            // aliases KD_TEXT0/KD_TEXT1) nor KD_GRAPHICS with EINVAL. Saying
+            // Ok(0) to one was worse than it sounds: the caller believed the
+            // console was in the mode it asked for, and the value went on to
+            // be stored, where every downstream test reads "not KD_TEXT" and
+            // stops presenting the text console -- a screen that goes blank
+            // and stays blank, with nothing reported to the process that did
+            // it. Same hole `vt_mode_accepted` closed for `VT_SETMODE`.
+            let Some(mode) = console::normalize_kd_mode(mode) else {
+                warn!("[vt] KDSETMODE vt={} rejected mode={:#x}", vt, mode);
+                return Err(FsError::InvalidParam);
+            };
             // Once-per-session VT diagnostic. seatd drives KD_GRAPHICS through
             // /dev/tty0, which now resolves to the active VT: this line should
             // show the graphics mode landing on the graphics VT (tty7 == 6),
@@ -2645,7 +2657,9 @@ mod vt_ownership_tests {
     extern crate std;
 
     use super::*;
-    use kernel_hal::console::{kd_mode_vt, set_kd_mode_vt, GRAPHICS_VT, KD_GRAPHICS, KD_TEXT};
+    use kernel_hal::console::{
+        kd_mode_vt, set_kd_mode_vt, GRAPHICS_VT, KD_GRAPHICS, KD_TEXT, KD_TEXT0, KD_TEXT1,
+    };
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     fn test_lock() -> MutexGuard<'static, ()> {
@@ -2863,5 +2877,61 @@ mod vt_ownership_tests {
         // decisions here compare against it. If it stopped being the last VT
         // the reservation in `zCore/src/main.rs` would move without them.
         assert_eq!(GRAPHICS_VT, kernel_hal::console::NUM_VTS - 1);
+    }
+
+    // ---- KDSETMODE / KDGETMODE -------------------------------------------
+
+    /// `KDSETMODE` handed its argument straight to the console with no
+    /// validation. Linux's `vt_ioctl.c` accepts `KD_TEXT`, its two obsolete
+    /// aliases and `KD_GRAPHICS`, and answers everything else with `-EINVAL`;
+    /// here anything at all was accepted and stored, and since every decision
+    /// downstream compares against `KD_TEXT`, a VT in a value that is neither
+    /// constant stops being drawn AND matches no arm of `set_kd_mode_vt`, so
+    /// nothing repaints it either. A blank screen, reported as success.
+    ///
+    /// The two halves of the fix are deliberately redundant: this arm is what
+    /// REPORTS the refusal, and `set_kd_mode_vt` refuses the store on its own,
+    /// so no caller can put a VT into a mode that is not one of the two. A
+    /// mutation that stores the bad mode here anyway is therefore a no-op, and
+    /// that is the point -- the check is not load-bearing for the console's
+    /// state, only for the errno.
+    #[test]
+    fn kdsetmode_refuses_a_mode_that_is_not_a_mode() {
+        let _g = test_lock();
+        set_kd_mode_vt(0, KD_TEXT);
+
+        assert!(
+            tty_ioctl(0, KDSETMODE as u32, 0x2a).is_err(),
+            "an unknown mode has to be EINVAL, not a silently blanked console"
+        );
+        assert_eq!(kd_mode_vt(0), KD_TEXT, "and the VT must be left as it was");
+
+        // The two real modes still go through.
+        assert!(tty_ioctl(0, KDSETMODE as u32, KD_GRAPHICS as usize).is_ok());
+        assert_eq!(kd_mode_vt(0), KD_GRAPHICS);
+        assert!(tty_ioctl(0, KDSETMODE as u32, KD_TEXT as usize).is_ok());
+        assert_eq!(kd_mode_vt(0), KD_TEXT);
+    }
+
+    /// The obsolete text aliases are a request for text mode, and
+    /// `KD_GETMODE` has to answer with the canonical value Linux stores
+    /// (`vc_mode = KD_TEXT`), not with the alias that was sent -- a caller
+    /// comparing the reply against `KD_TEXT` would otherwise conclude the
+    /// console is in graphics mode.
+    #[test]
+    fn kdsetmode_folds_the_obsolete_text_aliases() {
+        let _g = test_lock();
+
+        for alias in [KD_TEXT0, KD_TEXT1] {
+            set_kd_mode_vt(0, KD_GRAPHICS);
+            assert!(tty_ioctl(0, KDSETMODE as u32, alias as usize).is_ok());
+            assert_eq!(kd_mode_vt(0), KD_TEXT, "alias {:#x}", alias);
+
+            let mut out: i32 = -1;
+            assert!(tty_ioctl(0, KDGETMODE as u32, &mut out as *mut i32 as usize).is_ok());
+            assert_eq!(out, KD_TEXT as i32, "KD_GETMODE after alias {:#x}", alias);
+        }
+
+        set_kd_mode_vt(0, KD_TEXT);
     }
 }
