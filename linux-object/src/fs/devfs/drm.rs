@@ -313,6 +313,15 @@ pub struct DrmFramebuffer {
     pub pitch: u32,
     pub phys_addr: u64,
     pub size: usize,
+    /// The pid that created this framebuffer, or 0 for one the kernel made.
+    ///
+    /// Linux keeps framebuffers on a per-`drm_file` list and `drm_mode_rmfb`
+    /// walks it, answering ENOENT for an id that is not the caller's; the same
+    /// list is what `drm_fb_release` cleans up on close. Here they were one
+    /// global set with no owner at all, so any process could `RMFB` the
+    /// compositor's scanout framebuffer -- after which every `SETCRTC` and
+    /// `PAGE_FLIP` on it fails and wlroots retries the modeset forever.
+    pub owner: u64,
 }
 
 struct DrmState {
@@ -932,12 +941,19 @@ pub fn alloc_buffer(size: usize) -> Option<GemHandle> {
 /// Export a GEM handle for PRIME: return its `(phys_addr, size, backing VMO)`
 /// so it can be wrapped in a dma-buf and shared with another DRM node.
 pub fn export_handle(handle_id: u32) -> Option<(u64, usize, Arc<VmObject>)> {
+    // PRIME export is a uAPI entry point, so it resolves the handle the way
+    // Linux's `drm_gem_object_lookup(file_priv, handle)` does -- against what
+    // the CALLER may touch. Without this any process could hand
+    // `PRIME_HANDLE_TO_FD` a small integer, get a dma-buf fd over someone
+    // else's buffer and mmap it: handle ids are sequential from 1, so reading
+    // the compositor's scanout took no guessing at all.
+    let pid = current_pid();
     {
         let state = DRM_STATE.lock();
         if let Some(v) = state
             .handles
             .iter()
-            .find(|(h, _, _)| h.id == handle_id)
+            .find(|(h, _, owner)| h.id == handle_id && owned_by(*owner, pid))
             .map(|(h, vmo, _)| (h.phys_addr, h.size, vmo.clone()))
         {
             return Some(v);
@@ -951,7 +967,10 @@ pub fn export_handle(handle_id: u32) -> Option<(u64, usize, Arc<VmObject>)> {
     // compositor died at "Swapchain for output ... failed test" -- AFTER
     // rendering itself already worked. The physical range registered at
     // GEM_NEW time is exactly what a dma-buf needs.
-    let (phys_addr, size) = zcore_drivers::scheme::gem_mmap::lookup(handle_id)?;
+    // Same ownership rule on the driver-private side: `lookup_for` is
+    // `lookup` plus `holds(handle, pid)`, which is the nouveau table's own
+    // record of who took a reference.
+    let (phys_addr, size) = zcore_drivers::scheme::gem_mmap::lookup_for(handle_id, pid)?;
     let vmo = nouveau_cpu_vmo(handle_id, phys_addr, size as usize);
     Some((phys_addr, size as usize, vmo))
 }
@@ -1096,6 +1115,17 @@ fn owned_by(owner: u64, pid: u64) -> bool {
     pid == 0 || owner == 0 || owner == pid
 }
 
+/// Whether the calling process created `fb`, i.e. whether `GETFB`/`GETFB2`
+/// may hand it the backing GEM handle.
+///
+/// Linux gates that field on DRM master or `CAP_SYS_ADMIN` and zeroes it
+/// otherwise. There is no master state here, so the framebuffer's creator is
+/// the closest honest stand-in: the compositor still gets the handles for its
+/// own framebuffers, and nobody else gets a route to them.
+pub fn fb_owned_by_caller(fb: &DrmFramebuffer) -> bool {
+    owned_by(fb.owner, current_pid())
+}
+
 /// Look up a framebuffer object by id (`DRM_IOCTL_MODE_GETFB`/`GETFB2`).
 pub fn get_fb(fb_id: u32) -> Option<DrmFramebuffer> {
     DRM_STATE
@@ -1130,6 +1160,28 @@ pub fn resolve_gem_backing(handle_id: u32) -> Option<(u64, usize)> {
     zcore_drivers::scheme::gem_mmap::lookup(handle_id).map(|(pa, sz)| (pa, sz as usize))
 }
 
+/// [`resolve_gem_backing`] restricted to what `pid` may touch.
+///
+/// The unchecked resolver is right for the kernel's own present path, which
+/// already holds the framebuffer; it is wrong for `ADDFB`/`ADDFB2`, which take
+/// a handle straight from userspace. Linux resolves those through
+/// `drm_gem_object_lookup(file, handle)` and answers ENOENT for a handle that
+/// is not the caller's. Here it meant process B could build its own
+/// framebuffer over process A's buffer -- and then `SETCRTC` or `PAGE_FLIP`
+/// it onto the panel, or have A's pixels blitted somewhere B could read.
+pub fn resolve_gem_backing_for(handle_id: u32, pid: u64) -> Option<(u64, usize)> {
+    if let Some((h, _, owner)) = DRM_STATE
+        .lock()
+        .handles
+        .iter()
+        .find(|(h, _, _)| h.id == handle_id)
+        .map(|(h, vmo, owner)| (*h, vmo.clone(), *owner))
+    {
+        return owned_by(owner, pid).then_some((h.phys_addr, h.size));
+    }
+    zcore_drivers::scheme::gem_mmap::lookup_for(handle_id, pid).map(|(pa, sz)| (pa, sz as usize))
+}
+
 /// Create a framebuffer from a GEM handle
 pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<u32> {
     // Resolve the backing buffer from EITHER source:
@@ -1140,7 +1192,7 @@ pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<
     // so ADDFB2 MUST accept those handles or the output swapchain test fails
     // ("create_fb returned None") before any atomic commit — the exact RTX
     // bring-up blocker seen as "Swapchain for output 'HDMI-A-1' failed test".
-    let (phys_addr, buf_size) = match resolve_gem_backing(handle_id) {
+    let (phys_addr, buf_size) = match resolve_gem_backing_for(handle_id, current_pid()) {
         Some(v) => v,
         None => {
             // Loud, not a silent `?`: an unresolvable ADDFB2 handle is exactly
@@ -1211,6 +1263,7 @@ pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<
         pitch,
         phys_addr,
         size,
+        owner: current_pid(),
     };
 
     // A dumb buffer's reference is its VMO `Arc` (see `fb_backing`); a nouveau
@@ -1324,10 +1377,20 @@ pub fn retire_framebuffers_for_handle(handle_id: u32) -> usize {
     dropped
 }
 
-pub fn rmfb(fb_id: u32) -> bool {
+/// Remove a framebuffer on behalf of `pid` (`RMFB`/`CLOSEFB`).
+///
+/// `false` covers both "no such id" and "not yours", which the caller reports
+/// as ENOENT either way -- the same answer `drm_mode_rmfb` gives for an id
+/// that is not on the calling file's list, and it does not tell a prober
+/// whether someone else's framebuffer exists.
+pub fn rmfb_for(fb_id: u32, pid: u64) -> bool {
     let handle_id = {
         let mut state = DRM_STATE.lock();
-        let Some(pos) = state.framebuffers.iter().position(|f| f.id == fb_id) else {
+        let Some(pos) = state
+            .framebuffers
+            .iter()
+            .position(|f| f.id == fb_id && owned_by(f.owner, pid))
+        else {
             return false;
         };
         let fb = state.framebuffers.remove(pos);
@@ -1345,6 +1408,11 @@ pub fn rmfb(fb_id: u32) -> bool {
     // returns the memory to the RM -- the `RMFB` that Linux frees on too.
     fb_drop_gem_ref(handle_id);
     true
+}
+
+/// [`rmfb_for`] for the kernel's own teardown paths, which own everything.
+pub fn rmfb(fb_id: u32) -> bool {
+    rmfb_for(fb_id, 0)
 }
 
 /// Native mode of the primary framebuffer display: `(width, height, pitch)`.
@@ -4132,6 +4200,7 @@ mod release_tests {
                 pitch: 4,
                 phys_addr: 0,
                 size: 4096,
+                owner: 77_003,
             });
             state.crtc_fb = 9299;
         }
@@ -4163,6 +4232,7 @@ mod release_tests {
                 pitch: 4,
                 phys_addr: 0,
                 size: 4096,
+                owner: 77_004,
             });
             state.fb_backing.push((9399, vmo.clone()));
             state.crtc_fb = 9399;
@@ -4840,6 +4910,7 @@ mod nouveau_fb_lifetime_tests {
             pitch: 4,
             phys_addr: 0x1_0000,
             size: 4096,
+            owner: pid,
         });
         state.crtc_fb = fb_id;
     }
@@ -4939,6 +5010,7 @@ mod nouveau_fb_lifetime_tests {
             pitch: 4,
             phys_addr: 0,
             size: 4096,
+            owner: 0,
         });
         drop(state);
 
@@ -5005,6 +5077,7 @@ mod present_error_tests {
             pitch: 4,
             phys_addr,
             size,
+            owner: 0,
         });
     }
 
@@ -5090,6 +5163,7 @@ mod present_error_tests {
                 pitch: 4,
                 phys_addr: 0x2_0000,
                 size: 4096,
+                owner: 0,
             });
         }
         // The object is really gone (last reference dropped) -- the only
@@ -5335,5 +5409,116 @@ mod drm_event_read_tests {
 
         assert_eq!(file.read_events(&mut buf), EventRead::Read(32));
         assert_eq!(file.read_events(&mut buf), EventRead::Empty);
+    }
+}
+
+/// Handles and framebuffers are one process-wide table here, not the per-`drm_file`
+/// idr and fb list Linux keeps. The owner pid is what stands in for that, and
+/// these are the uAPI entry points where Linux resolves an id against the
+/// calling file: `drm_gem_object_lookup` for PRIME export and ADDFB, and
+/// `file_priv->fbs` for RMFB. Without the checks, handle ids are sequential
+/// from 1 and fb ids from 1, so reading the compositor's screen from an
+/// unprivileged process took no guessing.
+#[cfg(test)]
+mod gem_ownership_tests {
+    use super::*;
+
+    const A: u64 = 91_001;
+    const B: u64 = 91_002;
+
+    fn plant_handle(id: u32, pid: u64) {
+        let vmo = VmObject::new_paged(1);
+        DRM_STATE.lock().handles.push((
+            GemHandle {
+                id,
+                size: 4096,
+                phys_addr: 0x5_0000,
+            },
+            vmo,
+            pid,
+        ));
+    }
+
+    fn plant_fb(fb_id: u32, owner: u64) {
+        DRM_STATE.lock().framebuffers.push(DrmFramebuffer {
+            id: fb_id,
+            driver_fb_id: None,
+            gem_handle_id: 0,
+            width: 1,
+            height: 1,
+            pitch: 4,
+            phys_addr: 0x5_0000,
+            size: 4096,
+            owner,
+        });
+    }
+
+    fn forget(handle: u32, fb: u32) {
+        let mut state = DRM_STATE.lock();
+        state.handles.retain(|(h, _, _)| h.id != handle);
+        state.framebuffers.retain(|f| f.id != fb);
+    }
+
+    /// `ADDFB2` with someone else's handle. Building a framebuffer over it is
+    /// how process B gets an id it can `SETCRTC`/`PAGE_FLIP` — A's pixels onto
+    /// the panel, or blitted somewhere B can read.
+    #[test]
+    fn a_framebuffer_cannot_be_built_over_another_process_handle() {
+        let _serialised = super::test_globals::lock();
+        plant_handle(9801, A);
+
+        assert!(
+            resolve_gem_backing_for(9801, A).is_some(),
+            "its owner resolves it"
+        );
+        assert!(
+            resolve_gem_backing_for(9801, B).is_none(),
+            "another process must not"
+        );
+        // The kernel's own paths (pid 0) still resolve everything.
+        assert!(resolve_gem_backing_for(9801, 0).is_some());
+        assert!(
+            resolve_gem_backing(9801).is_some(),
+            "and the unchecked resolver the present path uses is unchanged"
+        );
+
+        forget(9801, 0);
+    }
+
+    /// `RMFB` of someone else's framebuffer. Removing the compositor's
+    /// scanout fb makes every later SETCRTC and PAGE_FLIP on it fail, and
+    /// wlroots retries the modeset forever.
+    #[test]
+    fn a_framebuffer_cannot_be_removed_by_another_process() {
+        let _serialised = super::test_globals::lock();
+        plant_fb(9802, A);
+
+        assert!(!rmfb_for(9802, B), "another process must not remove it");
+        assert!(
+            DRM_STATE.lock().framebuffers.iter().any(|f| f.id == 9802),
+            "and it must still be there afterwards"
+        );
+        // Indistinguishable from "no such framebuffer", so a prober learns
+        // nothing about what other clients own.
+        assert!(!rmfb_for(9899, B));
+
+        assert!(rmfb_for(9802, A), "its owner removes it");
+        assert!(!DRM_STATE.lock().framebuffers.iter().any(|f| f.id == 9802));
+    }
+
+    /// `GETFB`'s handle field: the enumeration half. Linux zeroes it for a
+    /// non-master caller rather than failing the call, so the geometry still
+    /// comes back.
+    #[test]
+    fn the_backing_handle_goes_only_to_the_framebuffers_creator() {
+        let _serialised = super::test_globals::lock();
+        plant_fb(9803, A);
+        let fb = get_fb(9803).expect("planted");
+
+        assert!(owned_by(fb.owner, A), "its creator sees the handle");
+        assert!(!owned_by(fb.owner, B), "another process gets zero");
+        assert!(owned_by(fb.owner, 0), "kernel-internal callers still do");
+
+        forget(0, 9803);
     }
 }

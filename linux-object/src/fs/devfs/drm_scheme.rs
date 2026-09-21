@@ -459,7 +459,9 @@ impl DrmDev {
             // the frames alive past DESTROY_DUMB, and the pixels are WB for the
             // renderer -- see `drm::handle_vmo`.
             Ok(vmo)
-        } else if let Some((phys_addr, size)) = zcore_drivers::scheme::gem_mmap::lookup(handle_id) {
+        } else if let Some((phys_addr, size)) =
+            zcore_drivers::scheme::gem_mmap::lookup_for(handle_id, drm::current_pid())
+        {
             // Driver-private GEM object (currently: nouveau-uAPI GEM_NEW) --
             // same fake-offset space, different table (see
             // drivers/src/scheme/gem_mmap.rs's module doc for why this
@@ -468,6 +470,16 @@ impl DrmDev {
             // frames while an older mmap Arc is still live (see `nouveau_cpu_vmo`).
             // Always size the VMO to the full GEM; the caller's `len` only
             // bounds the mapping, not the shared object.
+            //
+            // `lookup_for`, not `lookup`: the mmap offset is `handle << 12`, a
+            // pure function of the handle, so an unchecked lookup let any
+            // process map any driver-private GEM object in the system by
+            // naming an offset. Linux resolves the offset through the device's
+            // `vma_offset_manager` and then checks `drm_vma_node_is_allowed`,
+            // whose allow-list is populated when a handle is created -- so a
+            // file that never got a handle to the object gets EACCES. The
+            // dumb-buffer branch above is already owner-checked inside
+            // `handle_vmo`; this was the remaining door.
             let _ = len;
             Ok(drm::nouveau_cpu_vmo(handle_id, phys_addr, size as usize))
         } else {
@@ -1051,8 +1063,19 @@ impl DrmDev {
             }
             DRM_IOCTL_MODE_RMFB => {
                 let fb_id = unsafe { *(data as *const u32) };
-                drm::rmfb(fb_id);
-                Ok(0)
+                // ENOENT for an id that is not the caller's, whether it does
+                // not exist or belongs to someone else -- `drm_mode_rmfb`
+                // walks `file_priv->fbs` and gives the same answer either way,
+                // so a prober cannot learn that another client's framebuffer
+                // exists. Swallowing the result let any process remove the
+                // compositor's scanout framebuffer, after which every SETCRTC
+                // and PAGE_FLIP on it fails and wlroots retries the modeset
+                // forever.
+                if drm::rmfb_for(fb_id, drm::current_pid()) {
+                    Ok(0)
+                } else {
+                    Err(FsError::EntryNotFound)
+                }
             }
             DRM_IOCTL_MODE_CLOSEFB => {
                 // Our software-KMS `rmfb` already only drops the fb object —
@@ -1061,7 +1084,7 @@ impl DrmDev {
                 // disabling" contract. Reject unknown ids like Linux (EINVAL
                 // via DeviceError is close enough for wlroots' fallback).
                 let fb_id = unsafe { *(data as *const u32) };
-                if drm::rmfb(fb_id) {
+                if drm::rmfb_for(fb_id, drm::current_pid()) {
                     Ok(0)
                 } else {
                     Err(FsError::InvalidParam)
@@ -1078,8 +1101,17 @@ impl DrmDev {
             }
             DRM_IOCTL_MODE_DESTROY_DUMB => {
                 let handle = unsafe { *(data as *const u32) };
-                drm::gem_close(handle);
-                Ok(0)
+                // `gem_close` already refuses a handle that is not the
+                // caller's; reporting its verdict is what tells a client it
+                // freed something twice, or something that was never its own.
+                // Linux's `drm_mode_destroy_dumb_ioctl` answers EINVAL through
+                // `drm_gem_handle_delete`. Swallowing it made every wrong free
+                // look like a good one.
+                if drm::gem_close(handle) {
+                    Ok(0)
+                } else {
+                    Err(FsError::InvalidParam)
+                }
             }
             DRM_IOCTL_MODE_SETCRTC => {
                 // struct drm_mode_crtc has the same layout as DrmModeGetCrtc.
@@ -1212,9 +1244,23 @@ impl DrmDev {
                     cmd.pitch = fb.pitch;
                     cmd.bpp = 32;
                     cmd.depth = 24;
-                    // A single client is implicitly DRM master on the primary
-                    // node here, so handing back the backing GEM handle is safe.
-                    cmd.handle = fb.gem_handle_id;
+                    // The backing GEM handle goes only to the client that
+                    // created this framebuffer. Linux gates it on DRM master
+                    // or CAP_SYS_ADMIN and zeroes the field otherwise, with
+                    // the comment "GET_FB() is an unprivileged ioctl so we
+                    // must not return a buffer-handle to non-master
+                    // processes!". There is no master state to consult here,
+                    // and the premise this used to rest on -- that a single
+                    // client is implicitly master -- is not true of a session
+                    // running Xwayland or any Vulkan probe alongside the
+                    // compositor. Handing the handle out made fb ids, which
+                    // are sequential from 1, an enumeration route straight to
+                    // the compositor's pixels.
+                    cmd.handle = if drm::fb_owned_by_caller(&fb) {
+                        fb.gem_handle_id
+                    } else {
+                        0
+                    };
                     Ok(0)
                 } else {
                     // ENOENT, like `drm_mode_getfb`'s framebuffer lookup. This
@@ -1233,7 +1279,13 @@ impl DrmDev {
                     cmd.height = fb.height;
                     cmd.pixel_format = 0x3432_5258; // DRM_FORMAT_XRGB8888 ("XR24")
                     cmd.flags = 0;
-                    cmd.handles = [fb.gem_handle_id, 0, 0, 0];
+                    // Same gate as GETFB above; `drm_mode_getfb2_ioctl`
+                    // carries the identical check.
+                    cmd.handles = if drm::fb_owned_by_caller(&fb) {
+                        [fb.gem_handle_id, 0, 0, 0]
+                    } else {
+                        [0; 4]
+                    };
                     cmd.pitches = [fb.pitch, 0, 0, 0];
                     cmd.offsets = [0; 4];
                     cmd.modifier = [0; 4];
