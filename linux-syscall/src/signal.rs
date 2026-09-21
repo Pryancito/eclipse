@@ -43,7 +43,9 @@ impl Syscall<'_> {
         mut oldact: UserOutPtr<SignalAction>,
         sigsetsize: usize,
     ) -> SysResult {
-        let signal = Signal::try_from(signum as u8).map_err(|_| LxError::EINVAL)?;
+        // sigaction(2) has no use for the probe: `do_sigaction()` rejects
+        // signal 0 (`sig < 1`) alongside everything out of range.
+        let signal = Signal::from_syscall_arg(signum)?.ok_or(LxError::EINVAL)?;
         info!(
             "rt_sigaction: signal={:?}, act={:?}, oldact={:?}, sigsetsize={}, thread={}",
             signal,
@@ -149,7 +151,11 @@ impl Syscall<'_> {
     /// Send a signal to a process specified by pid
     /// TODO: support all the arguments
     pub fn sys_kill(&self, pid: isize, signum: usize) -> SysResult {
-        let signal = Signal::try_from(signum as u8).map_err(|_| LxError::EINVAL)?;
+        // `None` is signal 0: deliver nothing, but still report whether the
+        // target exists. (An invalid number is EINVAL here, before the target
+        // is resolved; Linux resolves first and answers ESRCH. Only a call
+        // that is wrong twice over can tell the difference.)
+        let signal = Signal::from_syscall_arg(signum)?;
         info!(
             "kill: thread {} kill process {} with signal {:?}",
             self.thread.id(),
@@ -190,7 +196,9 @@ impl Syscall<'_> {
                 return Err(LxError::ESRCH);
             };
             match signal {
-                Signal::SIGKILL => {
+                // kill(pid, 0): the lookup just above is the whole answer.
+                None => Ok(0),
+                Some(Signal::SIGKILL) => {
                     let retcode = (128 + Signal::SIGKILL as i32) as i64;
                     // Same trace as send_signal_to_process: this path ends the
                     // target directly, so it would otherwise leave no record
@@ -209,7 +217,9 @@ impl Syscall<'_> {
                     }
                     Ok(0)
                 }
-                sig => linux_object::process::send_signal_to_process(pid as usize, sig).map(|_| 0),
+                Some(sig) => {
+                    linux_object::process::send_signal_to_process(pid as usize, sig).map(|_| 0)
+                }
             }
         };
         match target {
@@ -240,11 +250,14 @@ impl Syscall<'_> {
                         continue;
                     }
                     match signal {
-                        Signal::SIGKILL => {
+                        // Signal 0 broadcast: every process we could have
+                        // reached counts as reached.
+                        None => any = true,
+                        Some(Signal::SIGKILL) => {
                             proc.exit((128 + Signal::SIGKILL as i32) as i64);
                             any = true;
                         }
-                        sig => {
+                        Some(sig) => {
                             if linux_object::process::send_signal_to_process(
                                 proc.id() as usize,
                                 sig,
@@ -267,7 +280,7 @@ impl Syscall<'_> {
 
     /// Send a signal to a thread specified by tid
     pub fn sys_tkill(&mut self, tid: usize, signum: usize) -> SysResult {
-        let signal = Signal::try_from(signum as u8).map_err(|_| LxError::EINVAL)?;
+        let signal = Signal::from_syscall_arg(signum)?;
         info!(
             "tkill: thread {} kill thread {} with signal {:?}",
             self.thread.id(),
@@ -281,9 +294,12 @@ impl Syscall<'_> {
                     Ok(t) => t,
                     Err(_) => return Err(LxError::ESRCH),
                 };
-                let mut thread_linux = thread.lock_linux();
-                thread_linux.signals.insert(signal);
-                drop(thread_linux);
+                // tkill(tid, 0) probes the thread and delivers nothing.
+                if let Some(signal) = signal {
+                    let mut thread_linux = thread.lock_linux();
+                    thread_linux.signals.insert(signal);
+                    drop(thread_linux);
+                }
                 Ok(0)
             }
             Err(_) => Err(LxError::ESRCH),
@@ -293,7 +309,7 @@ impl Syscall<'_> {
     /// Send a signal to a thread specified by tgid (i.e., process) and pid
     /// Note: the job of the target process should be the same as the calling thread
     pub fn sys_tgkill(&mut self, tgid: usize, tid: usize, signum: usize) -> SysResult {
-        let signal = Signal::try_from(signum as u8).map_err(|_| LxError::EINVAL)?;
+        let signal = Signal::from_syscall_arg(signum)?;
         info!(
             "tkill: thread {} kill thread {} in process {} with signal {:?}",
             self.thread.id(),
@@ -316,9 +332,12 @@ impl Syscall<'_> {
                     Ok(t) => t,
                     Err(_) => return Err(LxError::ESRCH),
                 };
-                let mut thread_linux = thread.lock_linux();
-                thread_linux.signals.insert(signal);
-                drop(thread_linux);
+                // tgkill(tgid, tid, 0) probes the thread and delivers nothing.
+                if let Some(signal) = signal {
+                    let mut thread_linux = thread.lock_linux();
+                    thread_linux.signals.insert(signal);
+                    drop(thread_linux);
+                }
                 Ok(0)
             }
             _ => Err(LxError::ESRCH),
@@ -456,11 +475,10 @@ impl Syscall<'_> {
             return Err(LxError::EPERM);
         }
         let process = ROOT_JOB.find_process(pid as u64).ok_or(LxError::ESRCH)?;
-        if signum == 0 {
+        let Some(signal) = Signal::from_syscall_arg(signum)? else {
             // Existence probe, like kill(pid, 0).
             return Ok(0);
-        }
-        let signal = Signal::try_from(signum as u8).map_err(|_| LxError::EINVAL)?;
+        };
         if signal == Signal::SIGKILL {
             process.exit((128 + Signal::SIGKILL as i32) as i64);
             return Ok(0);
@@ -491,10 +509,10 @@ impl Syscall<'_> {
         let process = ROOT_JOB.find_process(tgid as u64).ok_or(LxError::ESRCH)?;
         let thread_obj = process.get_child(tid as u64).map_err(|_| LxError::ESRCH)?;
         let thread: Arc<Thread> = thread_obj.downcast_arc().map_err(|_| LxError::ESRCH)?;
-        if signum == 0 {
+        let Some(signal) = Signal::from_syscall_arg(signum)? else {
+            // Existence probe, like kill(pid, 0).
             return Ok(0);
-        }
-        let signal = Signal::try_from(signum as u8).map_err(|_| LxError::EINVAL)?;
+        };
         thread
             .try_lock_linux()
             .ok_or(LxError::ESRCH)?
