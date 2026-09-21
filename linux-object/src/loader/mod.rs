@@ -106,13 +106,24 @@ const STACK_TOP: usize = USER_ASPACE_BASE as usize + USER_ASPACE_SIZE as usize;
 /// program. On x86_64 and aarch64 that is the same 32 TiB this used to spell
 /// out, with a 128 TiB space below the stack.
 ///
-/// A fraction rather than a literal because riscv64 runs Sv39, whose user half
-/// is 256 GiB: 32 TiB is not an address there at all, so `brk` could never
-/// place the heap and every growth failed with `brk: failed to map 0x2000
-/// bytes at 0x200000000000: INVALID_ARGS` — on `/bin/busybox ls` as much as on
-/// anything else, which is what `Linux Other Test Baremetal (riscv64)` was
-/// failing cases on even when the program itself printed the right answer.
-pub const HEAP_BASE: usize = (USER_ASPACE_SIZE as usize).next_power_of_two() / 4;
+/// A fraction of the process's own root VMAR rather than a literal, and
+/// measured at runtime rather than compiled in, because neither half of that
+/// is the same everywhere. riscv64 runs Sv39, whose user half is 256 GiB: 32
+/// TiB is not an address there at all, so `brk` could never place the heap and
+/// every growth failed with `brk: failed to map 0x2000 bytes at
+/// 0x200000000000: INVALID_ARGS` — on `/bin/busybox ls` as much as on anything
+/// else, which is what `Linux Other Test Baremetal (riscv64)` was failing
+/// cases on even when the program itself printed the right answer. And a libos
+/// build gives each process a window carved out of the host address space
+/// (`base=0x2_0000_0000, len=0x100_0000_0000`), which `USER_ASPACE_SIZE` does
+/// not describe either, so the same line came back on x86_64 for the whole
+/// `Linux Libc Test Libos` suite. There musl falls back to `mmap` and the
+/// program still gets its memory, but the line is an `ERROR` and the harness
+/// fails any case whose log contains one.
+pub fn heap_base(vmar: &VmAddressRegion) -> usize {
+    let len = vmar.end_addr() - vmar.addr();
+    vmar.addr() + len.next_power_of_two() / 4
+}
 
 // The image sub-VMARs below are placed with `allocate(None, ..)`, i.e. at the
 // root VMAR's base, and PT_LOAD segments are then mapped at their `p_vaddr`
@@ -588,14 +599,14 @@ impl LinuxElfLoader {
             sp -= init_stack.len();
 
             // Initial brk: the dedicated heap base, not the end of the
-            // interpreter -- see [`HEAP_BASE`].
+            // interpreter -- see [`heap_base`].
             //
             // NOTE: dynamically-linked FreeBSD binaries reach here and are built
             // with the Linux-style stack above; running them additionally needs
             // the FreeBSD dynamic linker (`/libexec/ld-elf.so.1`), which this
             // tree does not ship — so in practice only *static* FreeBSD binaries
             // (handled in the no-interpreter path below) get a FreeBSD stack.
-            let initial_brk = HEAP_BASE;
+            let initial_brk = heap_base(&vmar);
             return Ok((interp_entry, sp, initial_brk, path, abi));
         }
 
@@ -759,7 +770,7 @@ impl LinuxElfLoader {
         // Initial brk: the same dedicated heap base as the dynamic case. A
         // static binary has no interpreter mapping its own libraries, but it
         // still mmaps, and the collision is the same one.
-        let initial_brk = HEAP_BASE;
+        let initial_brk = heap_base(&vmar);
         Ok((entry, sp, initial_brk, path, abi))
     }
 }
