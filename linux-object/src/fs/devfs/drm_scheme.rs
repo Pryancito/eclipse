@@ -207,8 +207,7 @@ impl DrmDev {
         if !zcore_drivers::display::nouveau_uapi_enabled() {
             return;
         }
-        let timeline = cmd == DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT
-            || cmd == DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DEADLINE;
+        let timeline = is_syncobj_timeline_wait(cmd);
         // Deadline-sized ioctls carry a trailing hint we never read; the
         // prefix matches the classic structs.
         let prefix = if timeline {
@@ -431,7 +430,7 @@ impl DrmDev {
         // `mmap()` rejects a non-page-aligned offset with EINVAL *before* the
         // syscall, so the cookie must be page-aligned; recover the handle by
         // shifting it back down.
-        let handle_id = (offset >> 12) as u32;
+        let handle_id = handle_from_mmap_cookie(offset);
         let _ = len;
         if let Some(vmo) = drm::handle_vmo(handle_id) {
             // The dumb buffer's OWN (contiguous, cached) VMO: the mapping keeps
@@ -1075,7 +1074,7 @@ impl DrmDev {
                 // subsequent mmap of the dumb buffer passes this back as the file
                 // offset; musl's `mmap()` rejects a non-page-aligned offset with
                 // EINVAL, and `get_vmo()` shifts it back to the handle id.
-                map.offset = (map.handle as u64) << 12;
+                map.offset = mmap_cookie_for(map.handle);
                 Ok(0)
             }
             DRM_IOCTL_MODE_DESTROY_DUMB => {
@@ -2217,8 +2216,10 @@ impl DrmDev {
                 if !zcore_drivers::display::nouveau_uapi_enabled() {
                     return Err(FsError::OpNotSupported);
                 }
-                let timeline = cmd == DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT
-                    || cmd == DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DEADLINE;
+                // One rule for "is this the timeline wait", shared with the
+                // async sleeper that runs before this arm, so the two cannot
+                // read the same request as different structs.
+                let timeline = is_syncobj_timeline_wait(cmd);
                 // Both structs share this prefix layout, so a single path
                 // can read the common fields regardless of which ioctl.
                 let (handles_ptr, points_ptr, timeout_nsec, count_handles, flags) = if timeline {
@@ -2526,12 +2527,28 @@ fn present_failed(
 /// (classic + deadline-sized). Used by `sys_ioctl` to run
 /// [`DrmDev::syncobj_wait_sleep`] before `io_control`.
 pub fn is_syncobj_wait_ioctl(cmd: u32) -> bool {
-    matches!(
+    is_drm_ioctl_nr(cmd, NR_SYNCOBJ_WAIT, core::mem::size_of::<DrmSyncobjWait>())
+        || is_syncobj_timeline_wait(cmd)
+}
+
+/// ioctl NUMBERs of the two syncobj waits. Both structs grew a trailing
+/// `deadline_nsec` in 2023 and nothing says they will not grow again, so
+/// everything that has to recognise them matches on the number with a size
+/// floor -- never on the whole 32-bit command, which carries the size. Pinning
+/// to the sizes of the day is what silently dropped NVK's CPU_WAIT probe on
+/// real hardware; see the note beside `DRM_IOCTL_SYNCOBJ_WAIT_DEADLINE`.
+const NR_SYNCOBJ_WAIT: u32 = 0xC3;
+/// See [`NR_SYNCOBJ_WAIT`].
+const NR_SYNCOBJ_TIMELINE_WAIT: u32 = 0xCA;
+
+/// Whether `cmd` is the timeline wait rather than the classic one. The two
+/// carry different structs, so this decides which one the async sleeper reads,
+/// and it has to answer the same way the dispatcher does.
+fn is_syncobj_timeline_wait(cmd: u32) -> bool {
+    is_drm_ioctl_nr(
         cmd,
-        DRM_IOCTL_SYNCOBJ_WAIT
-            | DRM_IOCTL_SYNCOBJ_WAIT_DEADLINE
-            | DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT
-            | DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DEADLINE
+        NR_SYNCOBJ_TIMELINE_WAIT,
+        core::mem::size_of::<DrmSyncobjTimelineWait>(),
     )
 }
 
@@ -2919,6 +2936,29 @@ struct DrmEclipseCompute {
 
 fn drm_node_name(minor: u32) -> alloc::string::String {
     drm::node_name(minor)
+}
+
+/// The fake, page-aligned mmap offset `DRM_IOCTL_MODE_MAP_DUMB` hands back for
+/// a GEM handle, and its inverse.
+///
+/// There is no real file offset behind a GEM buffer, so the handle is encoded
+/// in the offset itself. musl's `mmap()` refuses a non-page-aligned offset
+/// before the syscall is even made, which is why the cookie is a page shift
+/// and not the handle itself. Linux does the same thing through the device's
+/// `vma_offset_manager`.
+///
+/// The two ends live far apart -- the ioctl arm that mints the cookie and
+/// `DrmDev::get_vmo`, which is reached from `mmap` -- so they are one pair of
+/// functions rather than a shift written out at each end.
+fn mmap_cookie_for(handle: u32) -> u64 {
+    (handle as u64) << 12
+}
+
+/// See [`mmap_cookie_for`]. Truncates above 32 bits, so an offset beyond the
+/// handle space aliases onto a handle rather than failing; both lookups behind
+/// this check the caller owns what it named, so an alias is not a way in.
+fn handle_from_mmap_cookie(offset: usize) -> u32 {
+    (offset >> 12) as u32
 }
 
 /// `access_ok()` for a nested user pointer an ioctl arm is about to read or
@@ -5574,5 +5614,178 @@ mod atomic_walk_tests {
     fn the_walks_bounds_keep_the_span_far_from_overflowing() {
         let widest = 64usize * 64 * core::mem::size_of::<u64>();
         assert!(widest < 1 << 20, "the span a request can ask for grew");
+    }
+}
+
+#[cfg(test)]
+mod syncobj_wait_routing_tests {
+    //! Which commands take the async sleep path, and the mmap cookie.
+    //!
+    //! `sys_ioctl` asks `is_syncobj_wait_ioctl` whether to park the caller
+    //! before running the sync arm. When it says no, the sync arm spin-polls
+    //! the whole timeout and pegs a core -- the starvation `WAIT_VBLANK` used
+    //! to cause. So this router has to recognise every wait the dispatcher
+    //! will accept, and the dispatcher resolves ioctls by NUMBER.
+    //!
+    //! It used to match four exact 32-bit commands instead, which carry the
+    //! struct size. Both wait structs already grew once (the 2023
+    //! `deadline_nsec`), and the next libdrm to append a field would have sent
+    //! a command the dispatcher handles and this router does not: the wait
+    //! would have worked, at the cost of a core spinning for its whole
+    //! timeout, with nothing in any log to say why.
+    //!
+    //! What is *not* covered, so nobody reads more into these than is there:
+    //! the two places that ask `is_syncobj_timeline_wait` which struct to read
+    //! -- the async sleeper and the dispatch arm -- both need a live device
+    //! and `nouveau_uapi_enabled()`, so inverting either one's answer leaves
+    //! this module green. What the tests pin is the rule itself, and that both
+    //! callers now ask the same one instead of spelling it out twice.
+
+    use super::*;
+
+    fn wait_cmd(nr: u32, size: usize) -> u32 {
+        drm_iowr_core(nr, size)
+    }
+
+    const CLASSIC: usize = core::mem::size_of::<DrmSyncobjWait>();
+    const TIMELINE: usize = core::mem::size_of::<DrmSyncobjTimelineWait>();
+
+    /// The two sizes in the wild today, named so a change to either is loud.
+    #[test]
+    fn the_two_sizes_libdrm_sends_today_are_both_waits() {
+        for cmd in [
+            DRM_IOCTL_SYNCOBJ_WAIT,
+            DRM_IOCTL_SYNCOBJ_WAIT_DEADLINE,
+            DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT,
+            DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DEADLINE,
+        ] {
+            assert!(
+                is_syncobj_wait_ioctl(cmd),
+                "{:#x} is a wait and must take the async path",
+                cmd,
+            );
+        }
+        assert_eq!(CLASSIC, 32, "drm_syncobj_wait grew");
+        assert_eq!(TIMELINE, 40, "drm_syncobj_timeline_wait grew");
+    }
+
+    /// The one that was broken. A struct that grows again keeps working
+    /// through the dispatcher, which matches on the number, so the router has
+    /// to follow it there.
+    #[test]
+    fn a_struct_that_grows_again_is_still_a_wait() {
+        for extra in [8, 16, 24, 64, 1000] {
+            let classic = wait_cmd(NR_SYNCOBJ_WAIT, CLASSIC + extra);
+            assert!(
+                is_syncobj_wait_ioctl(classic),
+                "a {}-byte drm_syncobj_wait stopped being a wait",
+                CLASSIC + extra,
+            );
+            assert!(!is_syncobj_timeline_wait(classic), "and it is not timeline");
+
+            let timeline = wait_cmd(NR_SYNCOBJ_TIMELINE_WAIT, TIMELINE + extra);
+            assert!(
+                is_syncobj_wait_ioctl(timeline),
+                "a {}-byte drm_syncobj_timeline_wait stopped being a wait",
+                TIMELINE + extra,
+            );
+            assert!(is_syncobj_timeline_wait(timeline));
+        }
+    }
+
+    /// The floor is the async path's own requirement, not the dispatcher's.
+    /// The sleeper reads the struct **in place** in user memory, so it can
+    /// only run once the client has actually sent a whole one; a short request
+    /// still reaches the sync arm, which copies it into a zero-filled kernel
+    /// buffer and is safe with it. Saying so here because the asymmetry looks
+    /// like an oversight otherwise.
+    #[test]
+    fn a_request_too_short_to_read_in_place_is_left_to_the_sync_arm() {
+        for size in [0, 1, CLASSIC - 1] {
+            assert!(!is_syncobj_wait_ioctl(wait_cmd(NR_SYNCOBJ_WAIT, size)));
+        }
+        assert!(is_syncobj_wait_ioctl(wait_cmd(NR_SYNCOBJ_WAIT, CLASSIC)));
+
+        for size in [0, CLASSIC, TIMELINE - 1] {
+            assert!(!is_syncobj_timeline_wait(wait_cmd(
+                NR_SYNCOBJ_TIMELINE_WAIT,
+                size
+            )));
+        }
+        assert!(is_syncobj_timeline_wait(wait_cmd(
+            NR_SYNCOBJ_TIMELINE_WAIT,
+            TIMELINE
+        )));
+    }
+
+    /// The NUMBER decides which struct the sleeper reads, and it must decide
+    /// it the same way the dispatch arm does. Reading a timeline request as a
+    /// classic one takes `count_handles` and `flags` from the wrong offsets.
+    #[test]
+    fn the_number_decides_the_struct_not_the_size() {
+        // A timeline-sized classic wait is still classic.
+        let odd = wait_cmd(NR_SYNCOBJ_WAIT, TIMELINE);
+        assert!(is_syncobj_wait_ioctl(odd));
+        assert!(!is_syncobj_timeline_wait(odd));
+        // And the canonical commands the dispatch arm sees agree.
+        assert!(!is_syncobj_timeline_wait(DRM_IOCTL_SYNCOBJ_WAIT));
+        assert!(is_syncobj_timeline_wait(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT));
+        assert!(!is_syncobj_timeline_wait(DRM_IOCTL_SYNCOBJ_WAIT_DEADLINE));
+        assert!(is_syncobj_timeline_wait(
+            DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DEADLINE
+        ));
+    }
+
+    /// Everything else stays off the sleep path. The neighbouring syncobj
+    /// numbers are the ones that would hurt: RESET and SIGNAL carry a
+    /// different struct entirely, and parking on one would read it wrong.
+    #[test]
+    fn nothing_but_the_two_waits_takes_the_sleep_path() {
+        for cmd in [
+            DRM_IOCTL_SYNCOBJ_CREATE,
+            DRM_IOCTL_SYNCOBJ_DESTROY,
+            DRM_IOCTL_SYNCOBJ_RESET,
+            DRM_IOCTL_SYNCOBJ_SIGNAL,
+            DRM_IOCTL_SYNCOBJ_QUERY,
+            DRM_IOCTL_SYNCOBJ_TRANSFER,
+            DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL,
+        ] {
+            assert!(!is_syncobj_wait_ioctl(cmd), "{:#x} is not a wait", cmd);
+        }
+        // And the type byte still has to be DRM's, whatever the number says.
+        let not_drm = (3u32 << 30) | (0x65 << 8) | NR_SYNCOBJ_WAIT | ((CLASSIC as u32) << 16);
+        assert!(!is_syncobj_wait_ioctl(not_drm));
+    }
+
+    /// `MAP_DUMB` hands userspace `handle << 12` as a fake file offset and
+    /// `get_vmo` shifts it back. The two live far apart in this file and are
+    /// the only thing standing between a client's `mmap()` and the right
+    /// buffer, so pin the round trip.
+    #[test]
+    fn the_mmap_cookie_round_trips_for_every_handle() {
+        for handle in [1u32, 2, 0xFF, 0x1234, 0x000F_FFFF, 0x8000_0000, u32::MAX] {
+            let offset = mmap_cookie_for(handle);
+            assert_eq!(
+                offset & 0xFFF,
+                0,
+                "musl rejects a non-page-aligned mmap offset before the syscall",
+            );
+            assert_eq!(
+                handle_from_mmap_cookie(offset as usize),
+                handle,
+                "handle {} does not survive the cookie",
+                handle,
+            );
+        }
+    }
+
+    /// And the limit of that encoding, written down rather than discovered.
+    /// The decode truncates to 32 bits, so offsets above `u32::MAX << 12`
+    /// alias onto a handle. It is not a way in -- both lookups behind it check
+    /// the caller owns the handle -- but it is a surprise worth naming.
+    #[test]
+    fn an_offset_above_the_handle_space_aliases_rather_than_failing() {
+        let aliased = ((1u64 << 32) | 5) << 12;
+        assert_eq!(handle_from_mmap_cookie(aliased as usize), 5);
     }
 }
