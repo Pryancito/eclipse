@@ -1891,22 +1891,7 @@ impl Syscall<'_> {
             2 => meta.size as i64,                             // SEEK_END
             _ => return Err(LxError::EINVAL),
         };
-        let mut start = base + fl.l_start;
-        let mut len = fl.l_len;
-        if len < 0 {
-            // POSIX: negative length means the range BEFORE l_start.
-            start += len;
-            len = -len;
-        }
-        if start < 0 {
-            return Err(LxError::EINVAL);
-        }
-        let start = start as u64;
-        let end = if len == 0 {
-            u64::MAX
-        } else {
-            start.saturating_add(len as u64)
-        };
+        let (start, end) = record_lock::resolve_range(base, fl.l_start, fl.l_len)?;
         let owner = self.zircon_process().id();
 
         match fl.l_type {
