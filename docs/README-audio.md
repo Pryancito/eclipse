@@ -39,7 +39,13 @@ HDA controller (PCI 04:03) ── codec ── pin ── HDMI/DP or analog jack
   HDMI/DP pin > presence > ELD valid) and — crucially — **re-evaluated at
   every stream start** (`repick_path`), because on NVIDIA GPUs presence/ELD
   only appear on the pins after the display driver pushes the monitor's ELD,
-  long after this driver's PCI probe.
+  long after this driver's PCI probe. The re-evaluation is sticky
+  (`choose_route`): the current path keeps its place on a tie and is only
+  left for a pin that itself reports presence. A `SET_PIN_SENSE` right after
+  a stop can read PD=0 on the monitor's own pin for a moment, and scoring
+  alone then sent an underrun-triggered restart to the first dead connector
+  and the next one back: the same track audible once and silent the next.
+  `/proc/gpusnd` counts re-routes (`routing:` line) with the last one.
 - **HDMI specifics**: digital converter enable, `SET_CVT_CHAN_COUNT`
   (`0x72d`) + HDMI channel slots, CEA audio infoframe through the pin's
   DIP buffer (reindexed every 8 bytes), and the NVIDIA coherent-DMA
