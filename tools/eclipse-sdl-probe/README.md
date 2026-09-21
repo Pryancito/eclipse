@@ -15,7 +15,7 @@ bibliotecas SDL para construir la imagen.
 ## Uso
 
 Desde un terminal de la sesión (`Super+Enter`) o desde el menú de escritorio
-(«Prueba SDL2 (renderer)» / «Prueba SDL3 (wl_shm)»):
+(«Prueba SDL2 (renderer)» / «Prueba SDL3 (wl_shm)» / «Prueba SDL2 (por subsistema)»):
 
 ```sh
 eclipse-sdl-probe                    # SDL2, SDL_Renderer, 300 frames
@@ -30,7 +30,26 @@ eclipse-sdl-probe --size 1280x720 --frames 600
 | `--surface` | Dibuja por `SDL_GetWindowSurface`/`SDL_UpdateWindowSurface`, la ruta que gobierna `SDL_FRAMEBUFFER_ACCELERATION`, en lugar de un `SDL_Renderer` (la que gobierna `SDL_RENDER_DRIVER`). |
 | `--frames N` | Para tras N frames (300 por defecto; 0 = hasta cerrar). |
 | `--hold` | Igual que `--frames 0`. |
+| `--steps` | Inicializa **un subsistema cada vez** (TIMER, EVENTS, VIDEO, AUDIO, JOYSTICK, GAMECONTROLLER), anunciando cada uno antes de ejecutarlo. No dibuja nada. |
 | `--size WxH` | Tamaño de la ventana (640x400 por defecto). |
+
+## Cuando algo se cuelga dentro de `SDL_Init`
+
+GZDoom pide varios subsistemas en una sola llamada a `SDL_Init` y no imprime
+nada entre su banner de version y esa llamada, asi que un cuelgue ahi se ve
+como un programa que se para sin motivo: eso es lo que hace Freedoom en
+Eclipse, el banner y nada mas. Una llamada combinada no puede decir CUAL de
+los subsistemas bloqueo; `--steps` si, porque la ultima linea
+`step <nombre> starting` sin su `step <nombre> ok` detras nombra al culpable:
+
+```sh
+eclipse-sdl-probe --steps
+```
+
+El sondeo normal se queda corto para esto: solo pide `SDL_INIT_VIDEO`, asi que
+seguia pasando mientras GZDoom se colgaba. La salida va sin bufer, para que
+una linea a medio escribir no se pierda en el buffer de stdio cuando el
+proceso se queda parado.
 
 ## Salida esperada
 
