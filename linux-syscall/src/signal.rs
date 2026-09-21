@@ -310,13 +310,34 @@ impl Syscall<'_> {
         mut old_ss: UserOutPtr<SignalStack>,
     ) -> SysResult {
         info!("sigaltstack: ss={:?}, old_ss={:?}", ss, old_ss);
-        let old = self.thread.lock_linux().signal_alternate_stack;
+        // `SS_ONSTACK` and `SS_DISABLE` come from the stack pointer the caller
+        // is using right now, not from anything stored -- see
+        // `SignalStack::as_reported_from`. Without this the flag was never set
+        // by anyone, so `sigaltstack(NULL, &old)` always answered "no stack
+        // installed" and the EPERM below could never fire.
+        let sp = self
+            .thread
+            .with_context(|ctx| ctx.get_field(kernel_hal::context::UserContextField::StackPointer))
+            .unwrap_or(0);
+        let old = self
+            .thread
+            .lock_linux()
+            .signal_alternate_stack
+            .as_reported_from(sp);
         commit_and_report_old(old, &mut old_ss, || {
             if ss.is_null() {
                 return Ok(());
             }
-            let ss = ss.read()?;
+            let mut ss = ss.read()?;
             check_sigaltstack(ss, old.flags.contains(SignalStackFlags::ONSTACK))?;
+            // `SS_DISABLE` forgets the stack, it does not merely park it:
+            // Linux zeroes `ss_sp`/`ss_size` here, so the next
+            // `sigaltstack(NULL, &old)` reports nothing installed rather
+            // than an address the program may already have freed.
+            if ss.flags.contains(SignalStackFlags::DISABLE) {
+                ss.sp = 0;
+                ss.size = 0;
+            }
             self.thread.lock_linux().signal_alternate_stack = ss;
             Ok(())
         })?;
