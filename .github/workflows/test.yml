@@ -53,6 +53,14 @@ jobs:
           cargo test -p linux-syscall --lib -- --test-threads=1
           cargo test -p kernel-hal --lib -- --test-threads=1
           cargo test -p hunter --lib -- --test-threads=1
+          # The btrfs driver is a path dependency of linux-object, so
+          # `default-members` hid its ~50 tests here too -- including the ones
+          # that cross-validate our images against btrfs-progs (those skip
+          # themselves when `btrfs` is not installed). `--features std` is
+          # what gives them a file-backed block device; release because the
+          # allocator/B-tree scaling tests take ~82s unoptimised against ~28s
+          # optimised, and they are the bulk of the suite.
+          cargo test --release -p btrfs --features std
 
   zircon-core-test-libos:
     name: Zircon Core Test Libos (${{ matrix.name }})
