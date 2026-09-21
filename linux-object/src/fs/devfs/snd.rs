@@ -1657,7 +1657,12 @@ impl PcmDev {
                     return Err(FsError::Broken);
                 }
                 drop(st);
-                unsafe { *(data as *mut i64) = self.queued_frames() as i64 };
+                // Frames until the last written one plays: the client's own
+                // queue plus whatever silence the driver has ahead of it
+                // (Linux adds `runtime->delay`, the hardware's own latency,
+                // the same way).
+                let delay = self.audio.delay_bytes() as u64 / BYTES_PER_FRAME;
+                unsafe { *(data as *mut i64) = delay as i64 };
                 Ok(0)
             }
             0x22 => {

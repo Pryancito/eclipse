@@ -31,9 +31,32 @@ HDA controller (PCI 04:03) ── codec ── pin ── HDMI/DP or analog jack
 
 - **Controller** (`drivers/src/audio/hda.rs`): CRST reset, codec discovery
   via STATESTS, CORB/RIRB rings with polled responses, one output stream
-  over a 128 KiB physically contiguous cyclic ring described by a BDL.
-  Progress is read from LPIB; consumed ring space is re-zeroed behind the
-  DMA position so an underrun plays silence, never stale audio.
+  over a 64 KiB physically contiguous cyclic ring described by a BDL.
+  Progress is derived from the link clock (WALCLK) and capped by the
+  position counters; consumed ring space is re-zeroed behind the DMA
+  position so an underrun plays silence, never stale audio.
+- **The stream is a DAI** (after Sound Open Firmware's `dai-zephyr.c`): when
+  the ring runs out of client PCM the engine is *not* stopped. It keeps
+  cycling over a zeroed ring, the next write is parked one BDL segment past
+  the furthest position any counter reports (so it lands where the engine
+  has not fetched yet), and the silence between the playhead and that point
+  is booked as a *pad*: excluded from the client's queue count (its
+  hardware pointer only moves through bytes it wrote) but included in
+  `DELAY`/`GETODELAY`. The engine is stopped after 5 s of silence
+  (`DAI_IDLE_STOP_US`), PulseAudio's own idle timeout, or on `DROP`,
+  `PREPARE`, `SNDCTL_DSP_SYNC`/`RESET` and close. Before this every
+  underrun stopped the stream and the next write restarted it -- codec
+  verbs, pin sense, HDMI kick -- and an HDMI/DP sink that sees its audio
+  stream restart mutes while it re-locks, hundreds of milliseconds on a
+  television: a 10 ms hole in the data was heard as a half-second hole in
+  the sound, at every underrun.
+- **Processing components** (`drivers/src/audio/pipeline/`), SOF's
+  numerics in Rust, pure and unit-tested without hardware:
+  `volume` is SOF's volume component -- Q8.16 gain (`1 << 16` = 0 dB),
+  rounded multiply (`(x·g >> 15) + 1 >> 1`, saturated), and a 32 ms linear
+  ramp recomputed every 250 µs of audio, so `amixer set Master`, the panel
+  slider and mute are fades rather than steps in the waveform. The mixer
+  percent is linear amplitude (PulseAudio's cubic curve sits above it).
 - **Codec graph**: the widget walk collects every output-capable pin with a
   reachable converter as a *candidate path*. Path choice is scored (digital
   HDMI/DP pin > presence > ELD valid) and — crucially — **re-evaluated at
@@ -101,6 +124,13 @@ cat /proc/gpusnd
   and `SD_LPIB` sampled twice 2 ms apart, reported as `ADVANCING` or
   `STALLED`. `STALLED` with RUN set means the DMA engine is not fetching:
   a controller/BDL problem, not a display one.
+- **Ring and events**: `queued` is the client's PCM, with the driver's
+  silence pad shown beside it, and `gap=` says how long the engine has been
+  idling on silence. The `events` line counts gaps (`drains` and
+  `underruns`), `idle stops` (a gap that reached 5 s), and `stream
+  restarts`; a restart count that climbs during continuous playback means
+  something is stopping the stream (a `DROP`, a `PREPARE` after XRUN), since
+  a gap alone no longer does. Each `gap:` line places one in its stream.
 - **Active path**, read back *from the codec* rather than from what the driver
   believes it wrote: the converter's stream id and format, digital-converter
   enable, power state, and on the pin the OUT_EN bit, presence/ELD-valid from
@@ -406,9 +436,15 @@ so you can hear the guest. Override with `AUDIODEV=wav` (PCM to
 - Several clients can play at once through PulseAudio. Direct `hw:0,0` and
   `/dev/dsp` are single-client (no dmix) and share ONE claim between them, so
   while the daemon holds the card both answer `EBUSY`.
-- Volume is software PCM scaling (no analog AMP programming); already-queued
-  ring contents are not retroactively gained — the new level applies to the
-  next `write`. Pulse sink volume applies to mixed output.
+- Volume is software PCM scaling (no analog AMP programming), ramped over
+  32 ms of audio; already-queued ring contents are not retroactively gained
+  — the new level applies from the next `write`, so with PulseAudio's
+  250 ms sink buffer it is heard a quarter of a second later. Pulse sink
+  volume applies to mixed output.
+- After a gap the first write lands past the engine's fetch position, so up
+  to one BDL segment plus whatever the controller over-reports (on the
+  NVIDIA function, tens of KiB) of extra silence precedes it: `DELAY`
+  reports it, `hw_ptr` does not move through it.
 - The DP audio path uses the same ELD/enable controls but has not been
   exercised; DP-MST audio (device entries > 0) is not implemented.
 - The HDMI/DP unmute is re-sent at every digital stream start (GOP never

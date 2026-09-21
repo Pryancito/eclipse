@@ -33,8 +33,23 @@ pub trait AudioScheme: Scheme {
     /// Total capacity of the playback ring in bytes.
     fn buffer_bytes(&self) -> usize;
 
-    /// Bytes queued but not yet played out.
+    /// Bytes of client PCM queued but not yet played out. Silence the device
+    /// inserted on its own (see [`delay_bytes`](AudioScheme::delay_bytes))
+    /// is not counted: this is what a client's hardware pointer is derived
+    /// from, and it must only ever advance through bytes the client wrote.
     fn queued_bytes(&self) -> usize;
+
+    /// Bytes the link still has to play before the last queued client byte
+    /// is heard: everything [`queued_bytes`](AudioScheme::queued_bytes)
+    /// counts plus any silence the device put ahead of it (a stream that
+    /// kept its engine running through a gap fills the space between the
+    /// playhead and the next write with zeros). This is ALSA's `DELAY` and
+    /// OSS's `GETODELAY`. Default: the same as `queued_bytes`.
+    ///
+    /// [`queued_bytes`]: AudioScheme::queued_bytes
+    fn delay_bytes(&self) -> usize {
+        self.queued_bytes()
+    }
 
     /// True while the DMA engine is fetching the ring. Used by the ALSA
     /// watchdog timer so an idle Pulse sink cannot leave RUN set (cyclic
