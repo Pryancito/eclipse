@@ -61,6 +61,11 @@ jobs:
           # allocator/B-tree scaling tests take ~82s unoptimised against ~28s
           # optimised, and they are the bulk of the suite.
           cargo test --release -p btrfs --features std
+          # The SFS the initramfs root lives on. Its suite is in the tree but
+          # had never run here: the crate is only reached through `[patch]`,
+          # and `--features std` is what gives its tests a file-backed device
+          # (without it the test target does not even compile).
+          cargo test -p rcore-fs-sfs --features std
 
   zircon-core-test-libos:
     name: Zircon Core Test Libos (${{ matrix.name }})

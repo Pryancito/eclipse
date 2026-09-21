@@ -55,6 +55,28 @@ impl IoMapper for IoMapperImpl {
 
 /// Initialize device drivers.
 pub(super) fn init() -> DeviceResult {
+    // PCIe configuration space, before anything can ask for it.
+    //
+    // `zcore_drivers::bus::pci` reads config space through a bare
+    // `phys_to_virt(PCI_BASE)` and maps nothing itself, which was fine only
+    // while the kernel still ran on the boot page table -- that one maps all
+    // of physical memory with 1 GiB pages, this one maps what it was told to.
+    // Nothing in the device-tree walk below claims the window either, because
+    // the `virt` machine's PCIe node has no driver here. So the first config
+    // read anything ever did took the machine down: `busybox du` walking /sys
+    // died on `[KERNEL PAGE FAULT] vaddr=0xffffffc030000000 flags=READ`.
+    //
+    // `query_or_map` is idempotent, so a driver that maps part of this window
+    // later finds it already there.
+    {
+        use zcore_drivers::bus::pci::{PCI_BASE, PCI_CONFIG_SIZE};
+        if IoMapperImpl
+            .query_or_map(PCI_BASE, PCI_CONFIG_SIZE)
+            .is_none()
+        {
+            warn!("failed to map the PCIe config space at {:#x}", PCI_BASE);
+        }
+    }
     // prase DTB and probe devices
     let dev_list =
         DevicetreeDriverBuilder::new(phys_to_virt(crate::KCONFIG.dtb_paddr), IoMapperImpl)?

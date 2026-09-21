@@ -1887,6 +1887,7 @@ dependencies = [
  "rcore-fs",
  "spin 0.9.4",
  "static_assertions",
+ "tempfile",
 ]
 
 [[package]]

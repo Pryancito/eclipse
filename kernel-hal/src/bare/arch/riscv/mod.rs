@@ -67,8 +67,21 @@ pub fn primary_init_early() {
     }
 }
 
-pub fn primary_init() {
+/// Switch this CPU onto the kernel's own page table.
+///
+/// Called from `bare::boot::primary_init`, before the scheduler exists. It
+/// used to sit at the top of [`primary_init`] below, which is much later:
+/// everything in between — `stack_guard::init` and the first `Executor::new`
+/// among it — ran on the page table `entry.rs` built to get out of physical
+/// addressing, and any page table edit made there was thrown away by this very
+/// call. That is what left every coroutine stack without its guard band:
+/// `install` punched its 4 KiB holes into the boot table, saw them, and then
+/// the kernel switched to a table that had never heard of them.
+pub fn activate_kernel_page_table() {
     vm::init();
+}
+
+pub fn primary_init() {
     drivers::init().unwrap();
     // Release the secondaries spinning in `secondary_init()`: the per-hart
     // `riscv-intc-cpuN` devices they look up exist only now.

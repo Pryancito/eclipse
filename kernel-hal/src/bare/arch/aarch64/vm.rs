@@ -99,6 +99,39 @@ fn init_kernel_page_table() -> PagingResult<PageTable> {
         )?;
     }
 
+    // Force the tables under the kernel VMAR window into existence, by mapping
+    // one 4 KiB page there and taking it straight back out. Unmapping clears
+    // the leaf; it does not free the tables above it.
+    //
+    // `zircon_object::vm::KERNEL_ASPACE` is a VMAR with its own page table,
+    // made by `PageTable::from_current().clone_kernel()`, and
+    // `pt_clone_kernel_space` copies the TOP-LEVEL entries by value. That
+    // shares something only if the entry is already there: an empty one gets
+    // filled in the clone alone, so the mapping is invisible from the table
+    // the CPU is running on. The Linux ELF loader maps an executable's VMO
+    // into that VMAR and reads it at boot, off whatever table is loaded, so
+    // the first byte faulted every time: `[KERNEL PAGE FAULT]
+    // vaddr=0xffffff0200000002 flags=READ | WRITE | USER rip=0x0`, on every
+    // case of `Linux Other Test Baremetal (aarch64)`.
+    //
+    // Nothing else here reaches this far up: the physmap sits just above
+    // `phys_to_virt_offset` and 0xffff_ff02_.. is 255 TiB past it. riscv64
+    // needs the same block for the same reason, at its own base.
+    //
+    // Hard-coded, and it must keep agreeing with
+    // `zircon_object::vm::KERNEL_ASPACE_BASE`: kernel-hal cannot depend on
+    // zircon-object, which depends on it.
+    {
+        const KERNEL_ASPACE_BASE: VirtAddr = 0xffff_ff02_0000_0000;
+        const ONE_PAGE: usize = 0x1000;
+        map_range(
+            KERNEL_ASPACE_BASE,
+            KERNEL_ASPACE_BASE + ONE_PAGE,
+            MMUFlags::READ,
+        )?;
+        pt.unmap_cont(KERNEL_ASPACE_BASE, ONE_PAGE)?;
+    }
+
     Ok(pt)
 }
 
@@ -178,10 +211,19 @@ hal_fn_impl! {
             let dst_table = unsafe { core::slice::from_raw_parts_mut(phys_to_virt(dst_pt_root) as *mut AARCH64PTE, 512) };
             let src_table = unsafe { core::slice::from_raw_parts(phys_to_virt(src_pt_root) as *const AARCH64PTE, 512) };
             for i in entry_range {
+                // Copied as they are, empty ones included. An empty entry used
+                // to get PTF::NG stamped onto it here, which no code reads and
+                // which the architecture ignores on a table descriptor anyway
+                // -- but which left the entry non-zero and not valid. That is
+                // the one shape `next_table_mut_or_create` cannot handle: not
+                // unused, so it does not build a table, and not present, so it
+                // returns NotMapped. The first mapping made in this address
+                // space under a top-level entry that happened to be empty when
+                // it was cloned therefore died in `VmMapping::map`'s
+                // `.expect("failed to map")`, which is what every case of
+                // `Linux Other Test Baremetal (aarch64)` hit right after
+                // `create_root_fs` finished.
                 dst_table[i] = src_table[i];
-                if dst_table[i].is_unused() {
-                    dst_table[i].0 |= PTF::NG.bits() as u64;
-                }
             }
         }
     }
@@ -302,10 +344,23 @@ impl From<MMUFlags> for PTF {
 
 impl From<PTF> for MMUFlags {
     fn from(f: PTF) -> Self {
-        let mut ret = Self::empty();
-        if f.contains(PTF::VALID) {
-            ret |= Self::READ;
+        // Every permission bit on AArch64 says what is *forbidden* on top of
+        // an access the descriptor already allows, so none of them means
+        // anything until the descriptor is valid. Reading them out of an
+        // invalid entry is how `stack_guard` lost its guard bands here: a band
+        // whose flags it had just cleared still reported `WRITE`, because
+        // AP_RO is absent from an all-zero entry exactly as it is from a
+        // writable one, and the readback check refused the band. An invalid
+        // entry grants nothing; say so, and leave DEVICE out too, since
+        // attribute index 0 is Device and a cleared entry has index 0 without
+        // ever having been a device mapping.
+        if !f.contains(PTF::VALID) {
+            return Self::empty();
         }
+        // Valid implies readable: AArch64 has no read-disable bit, and
+        // `From<MMUFlags>` above maps an executable-but-not-readable mapping
+        // onto a plain valid leaf for the same reason.
+        let mut ret = Self::READ;
         if !f.contains(PTF::AP_RO) {
             ret |= Self::WRITE;
         }
@@ -314,7 +369,15 @@ impl From<PTF> for MMUFlags {
             if !f.contains(PTF::UXN) {
                 ret |= Self::EXECUTE;
             }
-        } else if f.intersects(PTF::PXN) {
+        } else if !f.contains(PTF::PXN) {
+            // PXN is Privileged eXecute Never, so a kernel mapping is
+            // executable when it is *absent*. This read the bit the other way
+            // round, which inverted EXECUTE on every kernel mapping:
+            // `From<MMUFlags>` sets PXN precisely when EXECUTE was not asked
+            // for. Round-tripping a mapping through `flags()` -- which is what
+            // splitting a huge page into smaller leaves does -- therefore made
+            // the kernel's read-only text non-executable and its heap
+            // executable.
             ret |= Self::EXECUTE;
         }
         if f.mem_type() == MemType::Device {

@@ -1,7 +1,7 @@
 use super::*;
 use alloc::vec::Vec;
 use bitflags::bitflags;
-use linux_object::loader::HEAP_BASE;
+use linux_object::loader::heap_base;
 use zircon_object::vm::{pages, roundup_pages, MMUFlags, VmObject, PAGE_SIZE};
 
 /// Per-call cap for a single `mmap` / `brk` growth. It bounds how much a single
@@ -493,15 +493,17 @@ impl Syscall<'_> {
             return Ok(current_brk);
         }
 
+        let vmar = self.zircon_process().vmar();
+
         // Below where the heap starts is not a shrink, it is a bad argument,
         // and Linux answers it by returning the old break (`if (brk <
         // mm->start_brk) goto out;`). Without this the shrink branch below
         // accepts it and moves the break into the middle of the loaded image,
         // so the next grow tries to map over the program's own text: the
         // `/oscomp/brk` case does exactly that, because it prints and
-        // round-trips the break through a 32-bit int and `HEAP_BASE` is a
+        // round-trips the break through a 32-bit int and the heap base is a
         // round power of two whose low 32 bits are zero.
-        if new_brk < HEAP_BASE {
+        if new_brk < heap_base(&vmar) {
             info!(
                 "brk: {:#x} is below the heap base, keeping {:#x}",
                 new_brk, current_brk
@@ -510,7 +512,6 @@ impl Syscall<'_> {
         }
 
         let new_brk_aligned = roundup_pages(new_brk);
-        let vmar = self.zircon_process().vmar();
 
         if new_brk_aligned < current_brk {
             // Shrink: just move the user-visible break. The reserved pages
@@ -552,9 +553,12 @@ impl Syscall<'_> {
             let mut last_err = None;
             for size in [size, roundup_pages(want)] {
                 let vmo = VmObject::new_paged(pages(size));
-                // vmar.addr() == 0 for user address spaces, so VMAR offset ==
-                // absolute VA.
-                match vmar.map_at(mapped_brk, vmo, 0, size, flags) {
+                // `map_at` takes an offset into the VMAR, not an address:
+                // `addr()` is 0 for a bare-metal user address space but not for
+                // the window a libos process gets, where passing the absolute
+                // break made every growth INVALID_ARGS. Same conversion
+                // `sys_mmap` does for MAP_FIXED.
+                match vmar.map_at(mapped_brk - vmar.addr(), vmo, 0, size, flags) {
                     Ok(_) => {
                         let new_mapped_brk = mapped_brk + size;
                         proc.set_brk(new_brk_aligned);
