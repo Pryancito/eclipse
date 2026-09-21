@@ -10,6 +10,10 @@ description = "Device drivers of zCore"
 [features]
 graphic = ["rcore-console"]
 mock = ["async-std", "sdl2"]
+# The HDA controller in host memory (`audio::hda::hda_fake`) and the test
+# clock behind `timer_now_as_micros`, for another crate's tests: the ALSA and
+# OSS nodes in linux-object run against a real `HdaDevice` on it.
+hda-fake = []
 virtio = ["virtio-drivers"]
 loopback = []
 no-pci = []

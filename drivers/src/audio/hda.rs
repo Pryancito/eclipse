@@ -402,6 +402,7 @@ fn mix_streams(
     acc: &mut [i32],
     pull: &mut [u8],
     out: &mut [u8],
+    at: u64,
 ) -> usize {
     let span = out.len().min(pull.len());
     let samples = (span / 2).min(acc.len());
@@ -411,6 +412,7 @@ fn mix_streams(
     let mut contributors = 0;
     for (_, stream) in streams.iter_mut() {
         let n = stream.pull(&mut pull[..span]);
+        stream.note_pulled(at, n);
         if n > 0 {
             accumulate_s16(acc, &pull[..n]);
             contributors += 1;
@@ -427,33 +429,33 @@ fn mix_streams(
 // (a verb posted through CORBWP is answered in the RIRB, a RUN bit moves
 // the engine). Outside tests the hooks compile to nothing.
 fn mmio_r8(bar: usize, off: usize) -> u8 {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "hda-fake"))]
     hda_fake::on_read(bar, off);
     unsafe { read_volatile((bar + off) as *const u8) }
 }
 fn mmio_r16(bar: usize, off: usize) -> u16 {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "hda-fake"))]
     hda_fake::on_read(bar, off);
     unsafe { read_volatile((bar + off) as *const u16) }
 }
 fn mmio_r32(bar: usize, off: usize) -> u32 {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "hda-fake"))]
     hda_fake::on_read(bar, off);
     unsafe { read_volatile((bar + off) as *const u32) }
 }
 fn mmio_w8(bar: usize, off: usize, v: u8) {
     unsafe { write_volatile((bar + off) as *mut u8, v) }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "hda-fake"))]
     hda_fake::on_write(bar, off, v as u32);
 }
 fn mmio_w16(bar: usize, off: usize, v: u16) {
     unsafe { write_volatile((bar + off) as *mut u16, v) }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "hda-fake"))]
     hda_fake::on_write(bar, off, v as u32);
 }
 fn mmio_w32(bar: usize, off: usize, v: u32) {
     unsafe { write_volatile((bar + off) as *mut u32, v) }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "hda-fake"))]
     hda_fake::on_write(bar, off, v);
 }
 
@@ -476,19 +478,18 @@ fn clflush_range(vaddr: usize, len: usize) {
     let _ = (vaddr, len);
 }
 
-#[cfg(not(test))]
+/// A busy wait on the driver's clock. On the test clock, which only moves
+/// when something moves it, a wait is the same thing as the time passing.
 fn wait_us(us: u64) {
+    #[cfg(any(test, feature = "hda-fake"))]
+    if crate::nvme::nvme_queue::test_clock::installed() {
+        crate::nvme::nvme_queue::test_clock::advance(us);
+        return;
+    }
     let start = timer_now_as_micros();
     while timer_now_as_micros().wrapping_sub(start) < us {
         core::hint::spin_loop();
     }
-}
-
-/// The test clock only moves when something moves it, so a wait is the
-/// same thing as the time passing.
-#[cfg(test)]
-fn wait_us(us: u64) {
-    crate::nvme::nvme_queue::test_clock::advance(us);
 }
 
 // ── Driver state ────────────────────────────────────────────────────────────
@@ -1046,6 +1047,10 @@ impl HdaInner {
 
         // Consumed is the smaller of the two, and never goes backwards.
         self.consumed = self.consumed.max(by_clock.min(reported));
+        let consumed = self.consumed;
+        for (_, s) in self.streams.iter_mut() {
+            s.note_played(consumed, reported);
+        }
         self.fill_ring(now_us, reported);
     }
 
@@ -1116,6 +1121,7 @@ impl HdaInner {
             &mut acc,
             &mut pull,
             &mut self.mix_buf[..span],
+            self.fill_pos,
         );
         self.mix_acc = acc;
         self.pull_buf = pull;
@@ -1172,6 +1178,9 @@ impl HdaInner {
         self.mixed_bytes = 0;
         self.gap_since_us = 0;
         self.consumed = 0;
+        for (_, s) in self.streams.iter_mut() {
+            s.forget_ring();
+        }
         self.lpib_total = 0;
         self.dpib_total = 0;
         if self.digital {
@@ -1199,6 +1208,9 @@ impl HdaInner {
         self.fill_pos = 0;
         self.zero_end = 0;
         self.last_lpib = 0;
+        for (_, s) in self.streams.iter_mut() {
+            s.forget_ring();
+        }
     }
 
     /// Add `stream` to the mix and return its id. The stream is built by
@@ -1222,8 +1234,9 @@ impl HdaInner {
             .map(|(_, s)| s)
     }
 
-    /// Link bytes between the play position and the fill point: what the
-    /// ring still has to play before a stream's next pull is heard.
+    /// Link bytes between the play position and the fill point, for the
+    /// diagnostics: the ring's lead over the link, every stream's PCM and
+    /// the silence between them included.
     fn ring_ahead(&self) -> usize {
         if !self.running {
             return 0;
@@ -2728,8 +2741,6 @@ impl Scheme for HdaStream {
 #[derive(Clone, Copy)]
 struct Engine {
     running: bool,
-    /// See [`HdaInner::ring_ahead`].
-    ahead: usize,
 }
 
 impl HdaStream {
@@ -2746,7 +2757,6 @@ impl HdaStream {
         }
         let engine = Engine {
             running: inner.running,
-            ahead: inner.ring_ahead(),
         };
         let Some(stream) = inner.stream_mut(self.id) else {
             return Err(DeviceError::NotReady);
@@ -2830,11 +2840,12 @@ impl AudioScheme for HdaStream {
     }
 
     fn delay_bytes(&self) -> usize {
-        self.with(true, |s, engine| {
-            // What the stream still holds, plus what the ring holds ahead
-            // of the play position if the stream is being mixed into it.
-            let ahead = if s.is_active() { engine.ahead } else { 0 };
-            s.to_client_bytes(s.queued_link() + ahead)
+        // What the stream still holds, plus its own PCM in the ring the
+        // link has not played: the frames between the client's last write
+        // and the one on the cable. On a controller that fetches ahead of
+        // what it plays this is more than `queued_bytes` by that lead.
+        self.with(true, |s, _| {
+            s.to_client_bytes(s.queued_link() + s.unplayed())
         })
         .unwrap_or(0)
     }
@@ -3524,9 +3535,9 @@ impl PciDriver for HdaDriverPci {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "hda-fake"))]
 #[path = "hda_fake.rs"]
-mod hda_fake;
+pub mod hda_fake;
 
 #[cfg(test)]
 mod dai_tests {
@@ -3664,7 +3675,10 @@ mod dai_tests {
         let mut acc = vec![0i32; 64];
         let mut pull = vec![0u8; 128];
         let mut out = vec![0u8; 8 * 4];
-        assert_eq!(mix_streams(&mut streams, &mut acc, &mut pull, &mut out), 2);
+        assert_eq!(
+            mix_streams(&mut streams, &mut acc, &mut pull, &mut out, 0),
+            2
+        );
         let got = samples(&out);
         assert!(got[..8].iter().all(|&v| v == 700), "{:?}", got);
         assert!(got[8..].iter().all(|&v| v == 1000), "{:?}", got);
@@ -3674,14 +3688,20 @@ mod dai_tests {
         assert_eq!(streams[2].1.queued_link(), 32);
 
         // Nothing left in any active stream: a gap, and a block of zeros.
-        assert_eq!(mix_streams(&mut streams, &mut acc, &mut pull, &mut out), 0);
+        assert_eq!(
+            mix_streams(&mut streams, &mut acc, &mut pull, &mut out, 0),
+            0
+        );
         assert!(samples(&out).iter().all(|&v| v == 0));
 
         // The sum saturates once, at the end: two full-scale streams are
         // full scale, not wrapped to negative.
         streams[0].1.write(&frames(8, i16::MAX));
         streams[1].1.write(&frames(8, i16::MAX));
-        assert_eq!(mix_streams(&mut streams, &mut acc, &mut pull, &mut out), 2);
+        assert_eq!(
+            mix_streams(&mut streams, &mut acc, &mut pull, &mut out, 0),
+            2
+        );
         assert!(samples(&out).iter().all(|&v| v == i16::MAX));
     }
 

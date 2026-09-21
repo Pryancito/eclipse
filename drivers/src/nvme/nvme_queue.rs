@@ -146,6 +146,10 @@ pub fn virt_to_phys(vaddr: VirtAddr) -> PhysAddr {
 }
 
 pub fn timer_now_as_micros() -> u64 {
+    #[cfg(any(test, feature = "hda-fake"))]
+    if test_clock::installed() {
+        return test_clock::now();
+    }
     unsafe { drivers_timer_now_as_micros() }
 }
 
@@ -153,15 +157,31 @@ pub fn timer_now_as_micros() -> u64 {
 /// thread, moved only by the test (and by the driver's own waits), so a
 /// driver's timing decisions -- a poll throttle, a verb timeout, an idle
 /// stop -- can be driven to the microsecond and the tests still run in
-/// parallel. The `drivers_timer_now_as_micros` shim in `net::e1000e`
-/// reads it; it starts at 0, which is what every test before this one saw.
-#[cfg(test)]
+/// parallel. It starts at 0, which is what every test before this one saw.
+///
+/// In this crate's own test binary it is the clock, full stop (the
+/// `drivers_timer_now_as_micros` shim in `net::e1000e` reads it). Built
+/// into another crate's tests (`hda-fake`), the kernel's real clock stays
+/// in charge until a test calls [`install`] on its thread.
+#[cfg(any(test, feature = "hda-fake"))]
 pub mod test_clock {
     extern crate std;
     use core::cell::Cell;
 
     std::thread_local! {
         static NOW_US: Cell<u64> = const { Cell::new(0) };
+        static INSTALLED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Whether [`timer_now_as_micros`](super::timer_now_as_micros) reads
+    /// this clock on the current thread.
+    pub fn installed() -> bool {
+        cfg!(test) || INSTALLED.with(|c| c.get())
+    }
+
+    /// From here on, this thread's driver time is this clock.
+    pub fn install() {
+        INSTALLED.with(|c| c.set(true));
     }
 
     pub fn now() -> u64 {
