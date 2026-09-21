@@ -74,6 +74,17 @@ static CE_PRESENT_ENABLED: core::sync::atomic::AtomicBool =
 /// BAR1 stays quiet during a deferred GSP-RM bring-up (hwcursor path).
 static SCANOUT_PAUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Whether the CRTC has been turned off by the client: DPMS off, a `SETCRTC`
+/// with `fb_id = 0`, or an atomic commit staging `ACTIVE = 0`.
+///
+/// All three were accepted and ignored, so the panel kept showing the last
+/// frame forever while the compositor's own state said the output was off.
+/// That is idle blanking, `wlr-output-power-management` and closing a laptop
+/// lid, none of which could turn a screen off. Linux disables the pipe:
+/// `drm_mode_setcrtc` with a null fb calls `set_config` with `.fb = NULL`, and
+/// DPMS off goes through `drm_atomic_helper_connector_dpms`.
+static CRTC_BLANKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Nanoseconds-since-boot after which a pause set by [`set_scanout_paused_for`]
 /// expires by itself. `0` means "no watchdog" (a plain [`set_scanout_paused`]).
 static SCANOUT_PAUSE_DEADLINE_NS: core::sync::atomic::AtomicU64 =
@@ -85,6 +96,40 @@ static SCANOUT_PAUSE_DEADLINE_NS: core::sync::atomic::AtomicU64 =
 /// labwc's BAR1 traffic right back into the SEC2 window this exists to keep
 /// quiet. Bounded, because the alternative is a permanently frozen desktop.
 pub const SCANOUT_PAUSE_MAX: core::time::Duration = core::time::Duration::from_secs(90);
+
+/// Turn the CRTC off (paint the panel black and stop repainting it) or back on.
+///
+/// There is no hardware pipe to disable on the software-KMS path, so "off" is
+/// black pixels plus a latch that keeps the kernel's own repaints -- cursor
+/// compositing, damage re-scans -- from lighting it back up.
+///
+/// **Divergence from Linux, on purpose.** With the CRTC off, Linux fails a
+/// page flip with EINVAL until the client turns it back on. Here any explicit
+/// present un-blanks instead, because this panel is also the only console: a
+/// stray or mis-ordered DPMS write must cost one black frame, not a machine
+/// with no way to show anything again. Everything that really turns an output
+/// off -- wlroots, Xorg's DPMS -- stops presenting when it does, so the blank
+/// holds exactly as long as it should.
+pub fn set_crtc_blanked(on: bool) {
+    if CRTC_BLANKED.swap(on, Ordering::SeqCst) == on {
+        return;
+    }
+    if on {
+        if let Some(display) = primary_display() {
+            display.clear(zcore_drivers::prelude::RgbColor::new(0, 0, 0));
+            let _ = display.flush();
+        }
+        kernel_hal::klog_info!("[drm] CRTC off: panel blanked");
+    } else {
+        kernel_hal::klog_info!("[drm] CRTC on");
+    }
+}
+
+/// Whether the CRTC is currently off. Drives `GETCRTC`'s readback and the
+/// DPMS property, and gates the kernel's own repaints.
+pub fn crtc_blanked() -> bool {
+    CRTC_BLANKED.load(Ordering::SeqCst)
+}
 
 /// Enable/disable the per-frame CE-offloaded present. Set at boot from the
 /// cmdline flags, and again after a deferred console-GPU bring-up, which can
@@ -2361,7 +2406,11 @@ pub fn move_cursor(x: i32, y: i32) {
 /// scene, which has no cursor baked in) and composite the new cursor on top.
 /// Only two ~64x64 windows are touched per move.
 pub fn repaint_for_cursor() {
-    if !software_kms_active() || scanout_paused() {
+    // `crtc_blanked`: a pointer move is the kernel's own repaint, not a client
+    // present, so it must not light a panel the client turned off. This is the
+    // latch half of `set_crtc_blanked` -- without it a mouse twitch redrew the
+    // whole frame and undid the blank.
+    if !software_kms_active() || scanout_paused() || crtc_blanked() {
         return;
     }
     // Snapshot everything needed under the lock, and record the rect we are
@@ -3146,6 +3195,10 @@ pub fn present_now_checked(
         set_crtc_fb(crtc_id, fb_id);
         return Ok(());
     }
+    // An explicit present is a client putting pixels on this CRTC, so it is on
+    // again. See `set_crtc_blanked` for why this un-blanks rather than failing
+    // the flip the way Linux does for a disabled CRTC.
+    set_crtc_blanked(false);
     if !PRESENT_LOGGED.swap(true, Ordering::Relaxed) {
         // Read `graphics_vt` into a local FIRST: `DRM_STATE.lock()` as a direct
         // argument to `warn!` keeps the MutexGuard temporary alive for the
@@ -3494,6 +3547,27 @@ pub enum AtomicError {
 /// means: referenced objects exist, the mode blob is a well-formed
 /// `drm_mode_modeinfo` matching the native mode, source rects fit the
 /// framebuffer, and mode/active changes carry `ALLOW_MODESET`.
+/// Put back the state [`atomic_commit`] saved before its commit phase, so a
+/// commit that fails at the present is all-or-nothing the way Linux's is.
+fn restore_atomic_state(saved: (AtomicKmsState, u32, Option<(u32, Vec<u8>)>)) {
+    let (atomic, crtc_fb, blob) = saved;
+    let mut state = DRM_STATE.lock();
+    state.atomic = atomic;
+    state.crtc_fb = crtc_fb;
+    if let Some((id, data)) = blob {
+        if let Some(existing) = state.blobs.iter_mut().find(|b| b.id == id) {
+            existing.data = data;
+        }
+    }
+    drop(state);
+    reset_vblank_period();
+    if atomic.mode_blob_id != 0 {
+        if let Some(data) = get_blob(atomic.mode_blob_id) {
+            set_vblank_period_from_modeinfo(&data);
+        }
+    }
+}
+
 pub fn atomic_commit(
     upd: &AtomicUpdate,
     test_only: bool,
@@ -3635,6 +3709,25 @@ pub fn atomic_commit(
     }
 
     // --- Commit phase ---
+    //
+    // Everything below is undone if the present at the end fails. Linux builds
+    // a duplicated `drm_atomic_state` and only swaps it in once the check AND
+    // the commit tail have succeeded (`drm_atomic_helper_swap_state`), so a
+    // failed commit leaves every object exactly as it was. Applying first and
+    // failing afterwards left `ACTIVE` and `MODE_ID` reporting a modeset that
+    // never reached the screen: wlroots' own connector state then agreed with
+    // the readback, so its next commit computed an empty diff and never
+    // retried -- a black output the compositor believes is on.
+    let rollback = {
+        let state = DRM_STATE.lock();
+        let blob_id = state.atomic.mode_blob_id;
+        let blob = state
+            .blobs
+            .iter()
+            .find(|b| b.id == blob_id)
+            .map(|b| (b.id, b.data.clone()));
+        (state.atomic, state.crtc_fb, blob)
+    };
     {
         let mut state = DRM_STATE.lock();
         if let Some(blob_id) = upd.mode_blob {
@@ -3696,6 +3789,13 @@ pub fn atomic_commit(
         }
     }
 
+    // ACTIVE=0 turns the pipe off, as `drm_atomic_helper_commit` does for a
+    // CRTC whose new state is inactive. Staging it and never acting on it was
+    // the atomic half of "a screen that cannot be blanked".
+    if upd.active == Some(false) {
+        set_crtc_blanked(true);
+    }
+
     match upd.plane_fb_id {
         Some(0) => set_crtc_fb(SYNTH_CRTC_ID, 0),
         Some(fb_id) => {
@@ -3707,6 +3807,7 @@ pub fn atomic_commit(
                 damage_rect_from_blob(blob_id, fb.width, fb.height)
             });
             if !present_now_region(fb_id, SYNTH_CRTC_ID, rect) {
+                restore_atomic_state(rollback);
                 return Err(AtomicError::Device);
             }
         }
@@ -5520,5 +5621,68 @@ mod gem_ownership_tests {
         assert!(owned_by(fb.owner, 0), "kernel-internal callers still do");
 
         forget(0, 9803);
+    }
+}
+
+/// Turning a screen off, and a commit that fails leaving nothing behind.
+#[cfg(test)]
+mod blanking_and_atomic_rollback_tests {
+    use super::*;
+
+    /// The latch. There is no display backend in a host test, so what is
+    /// observable here is the state every consumer reads: whether the CRTC
+    /// counts as off, and whether the kernel's own repaints are suppressed.
+    #[test]
+    fn the_crtc_stays_off_until_something_presents() {
+        let _serialised = super::test_globals::lock();
+        set_crtc_blanked(false);
+        assert!(!crtc_blanked());
+
+        set_crtc_blanked(true);
+        assert!(crtc_blanked(), "DPMS off / SETCRTC(fb=0) turns it off");
+        // Idempotent: a compositor that writes DPMS off twice must not repaint.
+        set_crtc_blanked(true);
+        assert!(crtc_blanked());
+
+        set_crtc_blanked(false);
+        assert!(!crtc_blanked(), "and DPMS on turns it back on");
+    }
+
+    /// A commit that fails at the present must leave nothing behind. Applying
+    /// first and failing afterwards left `ACTIVE` and `MODE_ID` describing a
+    /// modeset that never reached the screen, so wlroots' next commit saw an
+    /// empty diff and never retried.
+    #[test]
+    fn a_failed_commit_leaves_the_state_exactly_as_it_was() {
+        let _serialised = super::test_globals::lock();
+        let before = {
+            let mut state = DRM_STATE.lock();
+            state.atomic.active = true;
+            state.atomic.crtc_w = 1920;
+            state.crtc_fb = 4242;
+            (state.atomic, state.crtc_fb)
+        };
+
+        // Stand in for the commit phase having already run: mutate, then roll
+        // back the way the present-failure path does.
+        {
+            let mut state = DRM_STATE.lock();
+            state.atomic.active = false;
+            state.atomic.crtc_w = 640;
+            state.crtc_fb = 7;
+        }
+        restore_atomic_state((before.0, before.1, None));
+
+        let after = {
+            let state = DRM_STATE.lock();
+            (state.atomic, state.crtc_fb)
+        };
+        assert!(after.0.active, "ACTIVE must be what it was");
+        assert_eq!(after.0.crtc_w, 1920, "and so must the plane geometry");
+        assert_eq!(after.1, before.1, "and the CRTC's framebuffer");
+
+        let mut state = DRM_STATE.lock();
+        state.crtc_fb = 0;
+        state.atomic = AtomicKmsState::default();
     }
 }

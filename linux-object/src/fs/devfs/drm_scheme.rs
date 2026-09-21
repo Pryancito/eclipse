@@ -1123,6 +1123,15 @@ impl DrmDev {
                     if let Err(e) = drm::present_now_checked(req.fb_id, req.crtc_id, None) {
                         present_failed("SETCRTC", req.fb_id, req.crtc_id, e)?;
                     }
+                } else {
+                    // `drm_mode_setcrtc` with a null fb turns the pipe off
+                    // (`set_config` with `.fb = NULL`). Doing nothing here is
+                    // half of why a screen could never be blanked: wlroots
+                    // disables an output with DPMS off followed by exactly this
+                    // call, and both were no-ops, so the panel kept the last
+                    // frame lit while the compositor believed it was dark.
+                    drm::set_crtc_blanked(true);
+                    drm::set_crtc_fb(req.crtc_id, 0);
                 }
                 Ok(0)
             }
@@ -1367,6 +1376,13 @@ impl DrmDev {
                 // The software scanout has no programmable object state, so
                 // accept and ignore rather than failing the client's modeset.
                 let req = unsafe { *(data as *const DrmModeObjSetProperty) };
+                // Same DPMS handling as the connector-specific setter above:
+                // `drm_mode_obj_set_property_ioctl` funnels into the very same
+                // `drm_mode_connector_set_obj_prop`.
+                if req.prop_id == PROP_DPMS && drm::get_connector(req.obj_id).is_some() {
+                    drm::set_crtc_blanked(req.value != DRM_MODE_DPMS_ON);
+                    return Ok(0);
+                }
                 log::debug!(
                     "[drm] OBJ_SETPROPERTY obj={} type={:#x} prop={} val={} (accepted, no-op)",
                     req.obj_id,
@@ -1389,6 +1405,22 @@ impl DrmDev {
                         *(data.wrapping_add(12) as *const u32),
                     )
                 };
+                // DPMS is the one legacy connector property with an effect
+                // here. Linux routes it through `connector->funcs->dpms`,
+                // which disables the CRTC for anything but "On"; the other
+                // three levels (Standby, Suspend, Off) all mean "stop lighting
+                // the panel" on a pipe with no power states of its own.
+                if prop_id == PROP_DPMS {
+                    let off = value != DRM_MODE_DPMS_ON;
+                    log::debug!(
+                        "[drm] SETPROPERTY connector={} DPMS={} -> CRTC {}",
+                        connector_id,
+                        value,
+                        if off { "off" } else { "on" }
+                    );
+                    drm::set_crtc_blanked(off);
+                    return Ok(0);
+                }
                 log::debug!(
                     "[drm] SETPROPERTY connector={} prop={} val={} (accepted, no-op)",
                     connector_id,
@@ -2822,6 +2854,9 @@ const _DRM_VBLANK_EVENT: u32 = 0x0400_0000;
 const PROP_TYPE: u32 = 10;
 const PROP_EDID: u32 = 11;
 const PROP_DPMS: u32 = 12;
+/// `DRM_MODE_DPMS_ON`. The other three levels (Standby, Suspend, Off) all mean
+/// "stop lighting the panel" on a pipe with no power states of its own.
+const DRM_MODE_DPMS_ON: u64 = 0;
 const PROP_LINK_STATUS: u32 = 13;
 const PROP_NON_DESKTOP: u32 = 14;
 const PROP_FB_ID: u32 = 15;
@@ -3563,9 +3598,17 @@ fn prop_spec(prop_id: u32) -> Option<PropSpec> {
 /// `DRM_CLIENT_CAP_ATOMIC`, mirroring Linux's atomic-property filtering.
 fn connector_props(connector_id: u32, atomic: bool) -> alloc::vec::Vec<(u32, u64)> {
     let mut props = alloc::vec::Vec::new();
-    // The software scanout is always lit: DPMS "On", link "Good", a desktop
-    // display.
-    props.push((PROP_DPMS, 0));
+    // DPMS reads back what the client last set, so a compositor that turned
+    // the output off and re-reads the property sees "Off" rather than being
+    // told the panel is lit. Link is "Good" and this is a desktop display.
+    props.push((
+        PROP_DPMS,
+        if drm::crtc_blanked() {
+            3 // Off
+        } else {
+            DRM_MODE_DPMS_ON
+        },
+    ));
     props.push((PROP_LINK_STATUS, 0));
     props.push((PROP_NON_DESKTOP, 0));
     if drm::get_connector_edid(connector_id).is_some() {
