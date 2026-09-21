@@ -137,24 +137,12 @@ impl Syscall<'_> {
 
     /// Remove a directory.
     /// - path – pointer to string with directory name
+    ///
+    /// `rmdir(2)` only exists on x86_64; everywhere else libc reaches this
+    /// through `unlinkat(AT_FDCWD, path, AT_REMOVEDIR)`, so the two must not be
+    /// separate implementations that can drift apart.
     pub fn sys_rmdir(&self, path: UserInPtr<u8>) -> SysResult {
-        let path = path.as_c_str()?;
-        info!("rmdir: path={:?}", path);
-
-        let (dir_path, file_name) = split_path(path);
-        let proc = self.linux_process();
-        let dir_inode = proc.lookup_inode(dir_path)?;
-        let dir_metadata = dir_inode.metadata()?;
-        proc.check_access(&dir_metadata, 0o3, true)?;
-        let file_inode = dir_inode.find(file_name)?;
-        let file_metadata = file_inode.metadata()?;
-        if file_metadata.type_ != FileType::Dir {
-            return Err(LxError::ENOTDIR);
-        }
-        proc.check_sticky(&dir_metadata, &file_metadata)?;
-        dir_inode.unlink(file_name)?;
-        linux_object::fs::dcache_invalidate();
-        Ok(0)
+        self.sys_unlinkat(FileDesc::CWD, path, AT_REMOVEDIR)
     }
 
     /// get directory entries
@@ -251,10 +239,10 @@ impl Syscall<'_> {
         } else {
             path
         };
-        let flags = AtFlags::from_bits_truncate(flags);
+        let remove_dir = unlinkat_removes_a_directory(flags)?;
         info!(
-            "unlinkat: dirfd={:?}, path={:?}, flags={:?}",
-            dirfd, path, flags
+            "unlinkat: dirfd={:?}, path={:?}, remove_dir={}",
+            dirfd, path, remove_dir
         );
 
         let proc = self.linux_process();
@@ -264,9 +252,7 @@ impl Syscall<'_> {
         proc.check_access(&dir_metadata, 0o3, true)?;
         let file_inode = dir_inode.find(file_name)?;
         let file_metadata = file_inode.metadata()?;
-        if file_metadata.type_ == FileType::Dir {
-            return Err(LxError::EISDIR);
-        }
+        unlinkat_type_check(remove_dir, file_metadata.type_ == FileType::Dir)?;
         proc.check_sticky(&dir_metadata, &file_metadata)?;
         dir_inode.unlink(file_name)?;
         linux_object::fs::dcache_invalidate();
@@ -559,6 +545,49 @@ bitflags! {
     }
 }
 
+/// `unlinkat(2)`'s `AT_REMOVEDIR`, which turns it into `rmdir`.
+///
+/// It is not in `AtFlags` and must not be: Linux gives it the same value as
+/// `AT_EACCESS` (0x200), because the two belong to different syscalls. Folded
+/// into one bitflags type they become the same flag, and `unlinkat` reads a
+/// request to remove a directory as `faccessat`'s "use the effective uid".
+pub(crate) const AT_REMOVEDIR: usize = 0x200;
+
+/// Which of the two syscalls hiding behind `unlinkat(2)` the caller asked for.
+///
+/// ```c
+/// if ((flag & ~AT_REMOVEDIR) != 0) return -EINVAL;
+/// if (flag & AT_REMOVEDIR) return do_rmdir(dfd, ...);
+/// return do_unlinkat(dfd, ...);
+/// ```
+///
+/// This flag used to be parsed into `AtFlags` and then ignored, so every
+/// `unlinkat(fd, path, AT_REMOVEDIR)` hit the `unlink` half and answered
+/// EISDIR. `rmdir(2)` is only wired up on x86_64, so on aarch64 and riscv64 —
+/// where libc has nothing else to call — no directory could be removed at all.
+fn unlinkat_removes_a_directory(flags: usize) -> linux_object::error::LxResult<bool> {
+    if flags & !AT_REMOVEDIR != 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(flags & AT_REMOVEDIR != 0)
+}
+
+/// The two halves of `unlinkat(2)` disagree about directories on purpose:
+/// `unlink` refuses one, `rmdir` demands one.
+///
+/// Split from the syscall because the lookup around it needs a live process
+/// and this does not, and because getting it backwards is silent: it deletes
+/// the wrong kind of thing, or refuses the right one.
+fn unlinkat_type_check(remove_dir: bool, is_dir: bool) -> linux_object::error::LxResult<()> {
+    match (remove_dir, is_dir) {
+        // `rmdir` on something that is not a directory.
+        (true, false) => Err(LxError::ENOTDIR),
+        // `unlink` on a directory.
+        (false, true) => Err(LxError::EISDIR),
+        _ => Ok(()),
+    }
+}
+
 /// renameat2(2) `RENAME_NOREPLACE`: don't overwrite an existing target.
 const RENAME_NOREPLACE: usize = 1 << 0;
 /// renameat2(2) `RENAME_EXCHANGE`: atomically swap source and target.
@@ -608,6 +637,107 @@ mod rename_flag_tests {
                 check_rename_flags(flags),
                 Err(LxError::EINVAL),
                 "{flags:#x}"
+            );
+        }
+    }
+}
+
+/// `unlinkat(2)` is two syscalls behind one number, and the flag that chooses
+/// between them was parsed into `AtFlags` and then never read.
+///
+/// Every `unlinkat(fd, path, AT_REMOVEDIR)` therefore took the `unlink` half
+/// and answered EISDIR. On x86_64 that stayed hidden because libc has
+/// `rmdir(2)` to call instead; on aarch64 and riscv64 there is no such syscall,
+/// so no directory could be removed at all — not by `rm -r`, not by a package
+/// manager cleaning up, not by anything.
+///
+/// What these tests do **not** cover: the flag word `sys_rmdir` hands to
+/// `sys_unlinkat`. Changing it to 0 leaves every test here green, because
+/// calling either syscall needs a live process and a filesystem and neither
+/// can be built from the host. The contract below is pinned; the one call site
+/// that depends on it is not, so read it before changing it.
+#[cfg(test)]
+mod unlinkat_flag_tests {
+    use super::*;
+
+    #[test]
+    fn no_flags_is_the_unlink_half() {
+        assert_eq!(unlinkat_removes_a_directory(0), Ok(false));
+    }
+
+    #[test]
+    fn at_removedir_is_the_rmdir_half() {
+        assert_eq!(unlinkat_removes_a_directory(AT_REMOVEDIR), Ok(true));
+    }
+
+    #[test]
+    fn at_removedir_is_the_number_linux_uses() {
+        // `include/uapi/linux/fcntl.h`: `#define AT_REMOVEDIR 0x200`. Getting
+        // this wrong does not fail loudly — it silently picks the other half.
+        assert_eq!(AT_REMOVEDIR, 0x200);
+    }
+
+    #[test]
+    fn it_is_deliberately_not_in_at_flags() {
+        // Linux gives AT_REMOVEDIR and AT_EACCESS the same value, because they
+        // belong to different syscalls. `AtFlags` holds AT_EACCESS, so folding
+        // AT_REMOVEDIR in would make the two indistinguishable and put this
+        // bug straight back.
+        assert_eq!(AT_REMOVEDIR, AtFlags::EACCESS.bits());
+        assert!(AtFlags::from_bits(AT_REMOVEDIR).is_some());
+    }
+
+    #[test]
+    fn rmdir_takes_directories_and_unlink_takes_everything_else() {
+        assert_eq!(unlinkat_type_check(true, true), Ok(()));
+        assert_eq!(unlinkat_type_check(false, false), Ok(()));
+    }
+
+    #[test]
+    fn each_half_refuses_the_other_halfs_target_with_its_own_errno() {
+        // `rmdir("file")` is ENOTDIR and `unlink("dir")` is EISDIR, and
+        // userspace tells the two apart: `rm` retries as a directory on
+        // EISDIR and gives up on ENOTDIR.
+        assert_eq!(unlinkat_type_check(true, false), Err(LxError::ENOTDIR));
+        assert_eq!(unlinkat_type_check(false, true), Err(LxError::EISDIR));
+    }
+
+    #[test]
+    fn the_two_syscalls_line_up_end_to_end() {
+        // `rmdir(2)` only exists on x86_64, so `rmdir(path)` and
+        // `unlinkat(AT_FDCWD, path, AT_REMOVEDIR)` must be one implementation.
+        // This walks the flag word the way `sys_rmdir` hands it over.
+        let remove_dir = unlinkat_removes_a_directory(AT_REMOVEDIR).unwrap();
+        assert!(remove_dir);
+        assert_eq!(unlinkat_type_check(remove_dir, true), Ok(()));
+        assert_eq!(
+            unlinkat_type_check(remove_dir, false),
+            Err(LxError::ENOTDIR)
+        );
+        // And plain `unlink(path)`, which hands over 0.
+        let remove_dir = unlinkat_removes_a_directory(0).unwrap();
+        assert!(!remove_dir);
+        assert_eq!(unlinkat_type_check(remove_dir, false), Ok(()));
+        assert_eq!(unlinkat_type_check(remove_dir, true), Err(LxError::EISDIR));
+    }
+
+    #[test]
+    fn any_other_flag_is_einval() {
+        // `if ((flag & ~AT_REMOVEDIR) != 0) return -EINVAL;`. Parsed as
+        // `AtFlags` these were dropped in silence, so `unlinkat` accepted
+        // flags it does not implement and reported success.
+        for bad in [
+            AtFlags::SYMLINK_NOFOLLOW.bits(),
+            AtFlags::EMPTY_PATH.bits(),
+            AtFlags::SYMLINK_FOLLOW.bits(),
+            AT_REMOVEDIR | AtFlags::EMPTY_PATH.bits(),
+            usize::MAX,
+        ] {
+            assert_eq!(
+                unlinkat_removes_a_directory(bad),
+                Err(LxError::EINVAL),
+                "flag {:#x}",
+                bad
             );
         }
     }
