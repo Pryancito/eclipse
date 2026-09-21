@@ -237,7 +237,15 @@ impl From<Endpoint> for SockAddr {
                 sun_path: [0; 108],
             };
             let bytes = path.as_bytes();
-            let len = min(bytes.len(), 107);
+            // `sun_path` is 108 bytes, but how many of them a name may use
+            // depends on which kind of name it is. A PATHNAME socket is
+            // NUL-terminated inside `sun_path`, so at most 107 characters fit.
+            // An ABSTRACT one is not terminated at all -- its length travels in
+            // `addrlen` -- so all 108 are usable: the leading NUL plus a name of
+            // up to 107 bytes. Capping both at 107 silently dropped the last
+            // byte of a maximal abstract name.
+            let cap = if bytes.first() == Some(&0) { 108 } else { 107 };
+            let len = min(bytes.len(), cap);
             addr_un.sun_path[..len].copy_from_slice(&bytes[..len]);
             SockAddr { addr_un }
         } else {
@@ -554,4 +562,285 @@ pub struct ArpReq {
     pub arp_netmask: SockAddrPlaceholder,
     /// missing documentation
     pub arp_dev: [u8; 16],
+}
+
+#[cfg(test)]
+mod sockaddr_tests {
+    //! `struct sockaddr` is the boundary between userspace and every socket in
+    //! the system, in both directions: `bind`/`connect`/`sendto` parse one that
+    //! the process wrote, and `getsockname`/`accept`/`recvfrom` write one back.
+    //! The two directions are separate code, so they can drift apart, and a
+    //! byte-order or length slip does not fail -- it connects somewhere else,
+    //! or hands back a path with its last character missing.
+    //!
+    //! One deliberate breakage survives these on purpose: dropping the
+    //! `len < size_of::<u16>()` guard at the top of `sockaddr_to_endpoint`.
+    //! Every family's own minimum is at least those two bytes, so the check
+    //! right below it refuses the same addresses; the first one is there to
+    //! refuse before reading `family` at all, which no in-process test can
+    //! tell apart.
+
+    use super::*;
+    use alloc::string::{String, ToString};
+
+    fn unix(path: &str) -> SockAddr {
+        SockAddr::from(Endpoint::Unix(path.to_string()))
+    }
+
+    fn path_of(addr: SockAddr, len: usize) -> String {
+        match sockaddr_to_endpoint(addr, len).expect("a unix address must parse") {
+            Endpoint::Unix(p) => p,
+            _ => panic!("AF_UNIX did not parse as a unix endpoint"),
+        }
+    }
+
+    fn ip_of(addr: SockAddr, len: usize) -> IpEndpoint {
+        match sockaddr_to_endpoint(addr, len).expect("an ip address must parse") {
+            Endpoint::Ip(e) => e,
+            _ => panic!("AF_INET did not parse as an ip endpoint"),
+        }
+    }
+
+    #[test]
+    fn an_ipv4_address_survives_the_round_trip() {
+        let want = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(192, 168, 1, 42)), 8080);
+        let addr = SockAddr::from(Endpoint::Ip(want));
+        let got = ip_of(addr, size_of::<SockAddrIn>());
+        assert_eq!(got.port, 8080);
+        assert_eq!(got.addr, want.addr);
+    }
+
+    #[test]
+    fn the_port_and_the_address_are_on_the_wire_big_endian() {
+        // These two fields are network byte order in the struct, not host
+        // order, and a missing swap is invisible on a round trip because the
+        // other direction swaps it back. So look at the bytes.
+        let addr = SockAddr::from(Endpoint::Ip(IpEndpoint::new(
+            IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)),
+            80,
+        )));
+        let raw = unsafe {
+            core::slice::from_raw_parts(
+                &addr as *const SockAddr as *const u8,
+                size_of::<SockAddrIn>(),
+            )
+        };
+        assert_eq!(
+            &raw[2..4],
+            &[0x00, 0x50],
+            "port 80 must be 00 50 on the wire"
+        );
+        assert_eq!(&raw[4..8], &[10, 0, 0, 1], "the address is stored in order");
+    }
+
+    #[test]
+    fn an_ipv6_address_survives_the_round_trip() {
+        let v6 = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let want = IpEndpoint::new(IpAddress::Ipv6(v6), 443);
+        let addr = SockAddr::from(Endpoint::Ip(want));
+        assert_eq!(unsafe { addr.family }, AddressFamily::Internet6.into());
+        let got = ip_of(addr, size_of::<SockAddrIn6>());
+        assert_eq!(got.port, 443);
+        assert_eq!(got.addr, IpAddress::Ipv6(v6));
+    }
+
+    #[test]
+    fn a_pathname_socket_survives_the_round_trip() {
+        let addr = unix("/run/user/1000/wayland-0");
+        assert_eq!(
+            path_of(addr, size_of::<SockAddrUn>()),
+            "/run/user/1000/wayland-0"
+        );
+    }
+
+    #[test]
+    fn the_x11_abstract_socket_survives_the_round_trip() {
+        // What every X client connects to by default. The leading NUL is what
+        // marks it as living in the abstract namespace rather than on disk,
+        // and losing it sends the client looking for a file that is not there.
+        let name = "\0/tmp/.X11-unix/X0";
+        let addr = unix(name);
+        let len = 2 + name.len();
+        assert_eq!(path_of(addr, len), name);
+    }
+
+    #[test]
+    fn a_maximal_abstract_name_keeps_its_last_byte() {
+        // `sun_path` is 108 bytes and an abstract name is NOT NUL-terminated --
+        // its length comes from `addrlen` -- so a leading NUL plus 107 name
+        // bytes is a legal, maximal address. A pathname socket needs room for
+        // its terminator and so stops at 107, and capping both at 107 dropped
+        // the last byte of exactly this address.
+        let name = String::from("\0") + &"x".repeat(107);
+        assert_eq!(name.len(), 108);
+        let addr = SockAddr::from(Endpoint::Unix(name.clone()));
+        assert_eq!(
+            path_of(addr, 2 + 108),
+            name,
+            "the last byte of a maximal abstract name was dropped"
+        );
+    }
+
+    #[test]
+    fn a_maximal_pathname_still_leaves_room_for_its_terminator() {
+        // The other side of the same rule: 107 characters plus the NUL fill
+        // `sun_path` exactly, and the parse side finds the terminator.
+        let path = "/".to_string() + &"a".repeat(106);
+        assert_eq!(path.len(), 107);
+        let addr = SockAddr::from(Endpoint::Unix(path.clone()));
+        assert_eq!(
+            unsafe { addr.addr_un.sun_path[107] },
+            0,
+            "no room for the NUL"
+        );
+        assert_eq!(path_of(addr, size_of::<SockAddrUn>()), path);
+    }
+
+    #[test]
+    fn a_pathname_too_long_to_terminate_is_cut_short_of_the_last_byte() {
+        // A pathname longer than `sun_path` can hold has to lose its tail --
+        // there is no other choice -- but it must keep the terminator, because
+        // everything downstream finds the end of a pathname by looking for it.
+        // Letting the name fill all 108 bytes hands out an address that no
+        // `strlen` ends: `output_len` then reports 111 for a 110-byte struct.
+        let path = "/".to_string() + &"b".repeat(150);
+        let addr = SockAddr::from(Endpoint::Unix(path.clone()));
+        assert_eq!(
+            unsafe { addr.addr_un.sun_path[107] },
+            0,
+            "the last byte of sun_path must stay a terminator"
+        );
+        let got = path_of(addr, size_of::<SockAddrUn>());
+        assert_eq!(got.len(), 107, "the path was not cut to what fits");
+        assert_eq!(got, path[..107], "and what fits is the start of the path");
+        assert_eq!(
+            addr.output_len().unwrap(),
+            2 + 108,
+            "the reported length must not run past the struct"
+        );
+    }
+
+    #[test]
+    fn an_unnamed_socket_is_an_empty_path_and_a_two_byte_address() {
+        // `bind` with `addrlen == 2` is autobind, and `getsockname` on a
+        // socket that was never bound answers with just the family. Reporting
+        // a longer length would have the caller read uninitialised path bytes.
+        let addr = unix("");
+        assert_eq!(addr.output_len().unwrap(), 2);
+        assert_eq!(path_of(addr, 2), "");
+    }
+
+    #[test]
+    fn the_length_reported_back_matches_the_kind_of_name() {
+        // `getsockname` returns this, and libraries compare it: too short
+        // truncates the path, too long makes an abstract name compare unequal
+        // against itself because of the trailing NULs.
+        let pathname = unix("/tmp/s");
+        assert_eq!(
+            pathname.output_len().unwrap(),
+            2 + "/tmp/s".len() + 1,
+            "a pathname address includes its terminating NUL"
+        );
+
+        let abstract_name = unix("\0wayland-1");
+        assert_eq!(
+            abstract_name.output_len().unwrap(),
+            2 + "\0wayland-1".len(),
+            "an abstract address has no terminator to include"
+        );
+    }
+
+    #[test]
+    fn a_two_byte_address_is_enough_for_af_unix_and_not_for_af_inet() {
+        // Linux accepts a `sockaddr_un` as short as the family field (that is
+        // autobind) but requires a whole `sockaddr_in`. Requiring the full
+        // struct for both would break autobind; accepting a short one for
+        // AF_INET would read a port and an address out of whatever follows.
+        let un = unix("");
+        assert!(sockaddr_to_endpoint(un, 2).is_ok());
+
+        let inet = SockAddr::from(Endpoint::Ip(IpEndpoint::new(
+            IpAddress::Ipv4(Ipv4Address::new(1, 2, 3, 4)),
+            1,
+        )));
+        assert!(matches!(
+            sockaddr_to_endpoint(inet, size_of::<SockAddrIn>() - 1),
+            Err(LxError::EINVAL)
+        ));
+        assert!(sockaddr_to_endpoint(inet, size_of::<SockAddrIn>()).is_ok());
+    }
+
+    #[test]
+    fn an_address_too_short_to_hold_a_family_is_refused() {
+        let addr = unix("/tmp/s");
+        assert!(matches!(
+            sockaddr_to_endpoint(addr, 0),
+            Err(LxError::EINVAL)
+        ));
+        assert!(matches!(
+            sockaddr_to_endpoint(addr, 1),
+            Err(LxError::EINVAL)
+        ));
+    }
+
+    #[test]
+    fn an_unknown_family_is_refused_rather_than_guessed_at() {
+        let addr = SockAddr {
+            addr_ph: SockAddrPlaceholder {
+                family: 0x7FFF,
+                data: [0; 14],
+            },
+        };
+        assert!(matches!(
+            sockaddr_to_endpoint(addr, 16),
+            Err(LxError::EINVAL)
+        ));
+    }
+
+    #[test]
+    fn a_netlink_address_survives_the_round_trip() {
+        let addr = SockAddr::from(Endpoint::Netlink(NetlinkEndpoint::new(1234, 0xF)));
+        match sockaddr_to_endpoint(addr, size_of::<SockAddrNl>()).unwrap() {
+            Endpoint::Netlink(nl) => {
+                assert_eq!(nl.port_id, 1234);
+                assert_eq!(nl.multicast_groups_mask, 0xF);
+            }
+            _ => panic!("AF_NETLINK did not parse as a netlink endpoint"),
+        }
+    }
+
+    #[test]
+    fn a_link_level_address_survives_the_round_trip() {
+        let mut want = LinkLevelEndpoint::new(3);
+        want.addr = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0, 0];
+        want.halen = 6;
+        // ETH_P_IP, which is host-endian here and big-endian in the struct.
+        want.protocol = 0x0800;
+        let addr = SockAddr::from(Endpoint::LinkLevel(want.clone()));
+        assert_eq!(
+            unsafe { addr.addr_ll.sll_protocol },
+            0x0800u16.to_be(),
+            "the protocol is network byte order on the wire"
+        );
+        match sockaddr_to_endpoint(addr, size_of::<SockAddrLl>()).unwrap() {
+            Endpoint::LinkLevel(got) => {
+                assert_eq!(got.interface_index, 3);
+                assert_eq!(got.addr, want.addr);
+                assert_eq!(got.halen, 6);
+                assert_eq!(got.protocol, 0x0800, "the protocol came back byte-swapped");
+            }
+            _ => panic!("AF_PACKET did not parse as a link-level endpoint"),
+        }
+    }
+
+    #[test]
+    fn the_loopback_interface_is_reported_as_loopback() {
+        // `ifconfig` and friends read `sll_hatype` to decide whether an
+        // interface has a hardware address at all; reporting ARPHRD_ETHER for
+        // `lo` makes them print a MAC that does not exist.
+        let lo = SockAddr::from(Endpoint::LinkLevel(LinkLevelEndpoint::new(1)));
+        assert_eq!(unsafe { lo.addr_ll.sll_hatype }, ARPHRD_LOOPBACK);
+        let eth = SockAddr::from(Endpoint::LinkLevel(LinkLevelEndpoint::new(2)));
+        assert_eq!(unsafe { eth.addr_ll.sll_hatype }, ARPHRD_ETHER);
+    }
 }
