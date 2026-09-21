@@ -12,6 +12,35 @@
 use super::*;
 use linux_object::{process::FsInfo, time::TimeSpec};
 
+/// `lseek(2)`'s `whence`, which the syscall declares `int` and this tree read
+/// as a `u8`.
+///
+/// The low byte of 0x100 is 0, so `lseek(fd, off, 0x100)` seeked to `off` from
+/// the start of the file instead of answering EINVAL, and the caller then read
+/// the wrong bytes with no error anywhere. The same truncation made
+/// SEEK_DATA (3) and SEEK_HOLE (4) indistinguishable from nothing.
+fn seek_from(whence: usize, offset: i64) -> linux_object::error::LxResult<SeekFrom> {
+    const SEEK_SET: usize = 0;
+    const SEEK_CUR: usize = 1;
+    const SEEK_END: usize = 2;
+    match whence {
+        SEEK_SET => {
+            // `vfs_setpos()`: a negative absolute position is EINVAL. Read as
+            // `offset as u64` it became a position near 2^64 instead, which
+            // comes back out of the syscall looking like an errno.
+            if offset < 0 {
+                return Err(LxError::EINVAL);
+            }
+            Ok(SeekFrom::Start(offset as u64))
+        }
+        // Negative is legal for both of these: they are relative. Linux checks
+        // the *resulting* position, not the argument.
+        SEEK_CUR => Ok(SeekFrom::Current(offset)),
+        SEEK_END => Ok(SeekFrom::End(offset)),
+        _ => Err(LxError::EINVAL),
+    }
+}
+
 impl Syscall<'_> {
     /// Reads from a specified file using a file descriptor. Before using this call,
     /// you must first obtain a file descriptor using the opensyscall. Returns bytes read successfully.
@@ -492,17 +521,8 @@ impl Syscall<'_> {
 
     /// repositions the offset of the open file associated with the file descriptor fd
     /// to the argument offset according to the directive whence
-    pub fn sys_lseek(&self, fd: FileDesc, offset: i64, whence: u8) -> SysResult {
-        const SEEK_SET: u8 = 0;
-        const SEEK_CUR: u8 = 1;
-        const SEEK_END: u8 = 2;
-
-        let pos = match whence {
-            SEEK_SET => SeekFrom::Start(offset as u64),
-            SEEK_END => SeekFrom::End(offset),
-            SEEK_CUR => SeekFrom::Current(offset),
-            _ => return Err(LxError::EINVAL),
-        };
+    pub fn sys_lseek(&self, fd: FileDesc, offset: i64, whence: usize) -> SysResult {
+        let pos = seek_from(whence, offset)?;
         info!("lseek: fd={:?}, pos={:?}", fd, pos);
 
         let proc = self.linux_process();
@@ -512,6 +532,19 @@ impl Syscall<'_> {
         let file = proc.get_file_like(fd)?;
         let offset = file.seek(pos)?;
         Ok(offset as usize)
+    }
+
+    /// `faccessat(2)`'s mode word, which `do_faccessat()` validates rather than
+    /// masks: `if (mode & ~S_IRWXO) return -EINVAL;`.
+    ///
+    /// Masking it with `& 0o7` instead turned a bad constant into F_OK, so
+    /// `access(path, 8)` answered "yes, you may" for any file that merely
+    /// exists -- the one answer a permission probe must never invent.
+    fn access_mode(mode: usize) -> linux_object::error::LxResult<u16> {
+        if mode & !0o7 != 0 {
+            return Err(LxError::EINVAL);
+        }
+        Ok(mode as u16)
     }
 
     /// cause the regular file named by path to be truncated to a size of precisely length bytes.
@@ -1988,7 +2021,7 @@ impl Syscall<'_> {
         let follow = !flags.contains(AtFlags::SYMLINK_NOFOLLOW);
         let inode = proc.lookup_inode_at(dirfd, path, follow)?;
         let metadata = inode.metadata()?;
-        let requested = (mode & 0o7) as u16;
+        let requested = Self::access_mode(mode)?;
         let use_effective = flags.contains(AtFlags::EACCESS);
         proc.check_access(&metadata, requested, use_effective)?;
         Ok(0)
@@ -2400,5 +2433,83 @@ mod pipe_size_tests {
         assert_eq!(pipe_size_round(0), Err(LxError::EINVAL));
         assert_eq!(pipe_size_round(1024 * 1024 + 1), Err(LxError::EPERM));
         assert_eq!(pipe_size_round(usize::MAX), Err(LxError::EPERM));
+    }
+}
+
+/// Two more arguments that the syscall declares wider than this tree read them:
+/// `lseek`'s `whence` (an `int`, read as a `u8`) and `faccessat`'s `mode`
+/// (validated by Linux, masked here).
+///
+/// Both failed the same way — silently and with a plausible answer. A bad
+/// `whence` seeked to the offset instead of erroring, and a bad `mode` became
+/// F_OK, which is the one answer a permission probe must never invent.
+#[cfg(test)]
+mod seek_and_access_tests {
+    use super::*;
+
+    /// `SeekFrom` does not implement `PartialEq`, so compare by shape.
+    fn seek(whence: usize, offset: i64) -> Result<SeekFrom, LxError> {
+        seek_from(whence, offset)
+    }
+
+    #[test]
+    fn the_three_whences_translate() {
+        assert!(matches!(seek(0, 42), Ok(SeekFrom::Start(42))));
+        assert!(matches!(seek(1, -42), Ok(SeekFrom::Current(-42))));
+        assert!(matches!(seek(2, -42), Ok(SeekFrom::End(-42))));
+    }
+
+    #[test]
+    fn a_relative_seek_may_be_negative() {
+        // SEEK_CUR and SEEK_END are relative, so Linux checks the *resulting*
+        // position, not the argument. Rejecting these would break every
+        // `lseek(fd, -n, SEEK_END)`, which is how a reader finds a trailer.
+        assert!(matches!(seek(1, i64::MIN), Ok(SeekFrom::Current(i64::MIN))));
+        assert!(matches!(seek(2, -1), Ok(SeekFrom::End(-1))));
+    }
+
+    #[test]
+    fn an_absolute_seek_may_not_be_negative() {
+        // `vfs_setpos()` answers EINVAL. Read as `offset as u64` it became a
+        // position near 2^64, which leaves the syscall looking like an errno.
+        assert_eq!(seek(0, -1).err(), Some(LxError::EINVAL));
+        assert_eq!(seek(0, i64::MIN).err(), Some(LxError::EINVAL));
+        assert!(matches!(seek(0, 0), Ok(SeekFrom::Start(0))));
+    }
+
+    #[test]
+    fn an_unknown_whence_is_rejected_instead_of_truncated() {
+        // 0x100 has low byte 0, so it used to mean SEEK_SET and the file
+        // position quietly moved to `offset`.
+        assert_eq!(seek(0x100, 42).err(), Some(LxError::EINVAL));
+        assert_eq!(seek(0x102, 42).err(), Some(LxError::EINVAL));
+        // SEEK_DATA and SEEK_HOLE are not implemented; they must say so rather
+        // than land on one of the three above.
+        assert_eq!(seek(3, 0).err(), Some(LxError::EINVAL));
+        assert_eq!(seek(4, 0).err(), Some(LxError::EINVAL));
+        assert_eq!(seek(usize::MAX, 0).err(), Some(LxError::EINVAL));
+    }
+
+    #[test]
+    fn the_access_modes_pass_through() {
+        // R_OK | W_OK | X_OK and every combination below them, F_OK included.
+        for mode in 0..=0o7usize {
+            assert_eq!(
+                Syscall::access_mode(mode),
+                Ok(mode as u16),
+                "mode {:o}",
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn a_mode_outside_rwx_is_rejected_instead_of_masked() {
+        // `do_faccessat()`: `if (mode & ~S_IRWXO) return -EINVAL;`. Masked
+        // instead, `access(path, 8)` asked F_OK and answered "yes, you may"
+        // for any file that merely exists.
+        assert_eq!(Syscall::access_mode(0o10), Err(LxError::EINVAL));
+        assert_eq!(Syscall::access_mode(0o17), Err(LxError::EINVAL));
+        assert_eq!(Syscall::access_mode(usize::MAX), Err(LxError::EINVAL));
     }
 }

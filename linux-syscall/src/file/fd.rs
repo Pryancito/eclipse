@@ -81,6 +81,43 @@ fn prepare_open_inode(inode: Arc<dyn INode>) -> LxResult<Arc<dyn INode>> {
     )
 }
 
+/// The three commands `flock(2)` accepts, after `LOCK_NB` is taken off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlockCmd {
+    /// `LOCK_SH`: shared, read lock.
+    Shared,
+    /// `LOCK_EX`: exclusive, write lock.
+    Exclusive,
+    /// `LOCK_UN`: drop whatever this fd held.
+    Unlock,
+}
+
+/// `flock_translate_cmd()`, which is a `switch` on three exact values and not
+/// a bitmask.
+///
+/// Reading the argument through a `bitflags` type accepted three things Linux
+/// refuses, each of which came back as "lock acquired": `flock(fd, 0)`, which
+/// names no command at all; `flock(fd, LOCK_SH | LOCK_EX)`, which names two;
+/// and any high bit, because the argument was first truncated to a byte, so
+/// `flock(fd, 0x102)` took an exclusive lock on the strength of its low byte.
+fn flock_translate(operation: usize) -> LxResult<(FlockCmd, bool)> {
+    const LOCK_SH: u32 = 1;
+    const LOCK_EX: u32 = 2;
+    const LOCK_NB: u32 = 4;
+    const LOCK_UN: u32 = 8;
+    // `SYSCALL_DEFINE2(flock, unsigned int, fd, unsigned int, cmd)`: 32 bits,
+    // not 8.
+    let cmd = operation as u32;
+    let nonblock = cmd & LOCK_NB != 0;
+    let cmd = match cmd & !LOCK_NB {
+        LOCK_SH => FlockCmd::Shared,
+        LOCK_EX => FlockCmd::Exclusive,
+        LOCK_UN => FlockCmd::Unlock,
+        _ => return Err(LxError::EINVAL),
+    };
+    Ok((cmd, nonblock))
+}
+
 impl Syscall<'_> {
     /// `timerfd_create(2)`: a timer delivered through a readable fd. The
     /// `wl_event_loop` (libwayland) arms one for all its timers.
@@ -534,18 +571,17 @@ impl Syscall<'_> {
     }
 
     /// apply or remove an advisory lock on an open file
-    /// TODO: handle operation
+    ///
+    /// The lock itself is still not taken -- this validates the request and
+    /// reports success, which is what an advisory lock on a single-user system
+    /// amounts to. What it must not do is report success for a request Linux
+    /// refuses, because that is how a caller probes for support.
     pub fn sys_flock(&mut self, fd: FileDesc, operation: usize) -> SysResult {
-        bitflags! {
-            struct Operation: u8 {
-                const LOCK_SH = 1;
-                const LOCK_EX = 2;
-                const LOCK_NB = 4;
-                const LOCK_UN = 8;
-            }
-        }
-        let operation = Operation::from_bits(operation as u8).ok_or(LxError::EINVAL)?;
-        info!("flock: fd: {:?}, operation: {:?}", fd, operation);
+        let (cmd, nonblock) = flock_translate(operation)?;
+        info!(
+            "flock: fd: {:?}, cmd: {:?}, nonblock: {}",
+            fd, cmd, nonblock
+        );
         let proc = self.linux_process();
 
         proc.get_file(fd)?;
@@ -723,5 +759,70 @@ mod open_inode_tests {
         ));
         drop(file);
         assert!(prepare_open_inode(inode).is_ok());
+    }
+}
+
+/// `flock(2)` is a `switch` on three exact values in Linux, and here it was a
+/// bitmask over a truncated byte — so three requests the kernel refuses all
+/// came back as "lock acquired".
+///
+/// The lock still is not taken (see `sys_flock`); what these pin down is that
+/// a request Linux rejects is rejected here too, because reporting success is
+/// how a caller decides the feature works.
+#[cfg(test)]
+mod flock_translate_tests {
+    use super::*;
+
+    #[test]
+    fn the_three_commands_translate() {
+        assert_eq!(flock_translate(1), Ok((FlockCmd::Shared, false)));
+        assert_eq!(flock_translate(2), Ok((FlockCmd::Exclusive, false)));
+        assert_eq!(flock_translate(8), Ok((FlockCmd::Unlock, false)));
+    }
+
+    #[test]
+    fn lock_nb_rides_along_with_each_of_them() {
+        // `cmd & ~LOCK_NB` is what the switch sees, and LOCK_NB itself is the
+        // difference between blocking and EWOULDBLOCK. Dropping it here would
+        // make every lock blocking, which is a hang, not an error.
+        assert_eq!(flock_translate(1 | 4), Ok((FlockCmd::Shared, true)));
+        assert_eq!(flock_translate(2 | 4), Ok((FlockCmd::Exclusive, true)));
+        assert_eq!(flock_translate(8 | 4), Ok((FlockCmd::Unlock, true)));
+    }
+
+    #[test]
+    fn naming_no_command_is_einval() {
+        // `flock(fd, 0)` and `flock(fd, LOCK_NB)` name nothing to do. Through a
+        // `bitflags` both parsed as the empty set and reported success.
+        assert_eq!(flock_translate(0), Err(LxError::EINVAL));
+        assert_eq!(flock_translate(4), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn naming_two_commands_at_once_is_einval() {
+        // Linux switches on the exact value, so no pair of them is a command.
+        for pair in [1 | 2, 1 | 8, 2 | 8, 1 | 2 | 8] {
+            assert_eq!(flock_translate(pair), Err(LxError::EINVAL), "{:#x}", pair);
+        }
+    }
+
+    #[test]
+    fn a_high_bit_is_not_dropped_on_the_way_in() {
+        // This is the truncation: 0x102 has low byte 2, so it took an
+        // exclusive lock. `unsigned int` keeps 32 bits, so it is EINVAL.
+        assert_eq!(flock_translate(0x102), Err(LxError::EINVAL));
+        assert_eq!(flock_translate(0x100), Err(LxError::EINVAL));
+        assert_eq!(flock_translate(usize::MAX), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn the_high_half_of_the_register_is_dropped_the_way_linux_drops_it() {
+        // `cmd` is declared `unsigned int`, so the top 32 bits never reach the
+        // switch. Being stricter than the kernel here would reject a caller
+        // the kernel accepts.
+        assert_eq!(
+            flock_translate(0xdead_beef_0000_0002),
+            Ok((FlockCmd::Exclusive, false))
+        );
     }
 }
