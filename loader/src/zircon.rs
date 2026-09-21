@@ -16,7 +16,7 @@ use zircon_object::kcounter;
 use zircon_object::object::{Handle, KernelObject, Rights};
 use zircon_object::task::{CurrentThread, ExceptionType, Process, Thread, ThreadState};
 use zircon_object::util::elf_loader::{ElfExt, VmarExt};
-use zircon_object::vm::{VmObject, VmarFlags};
+use zircon_object::vm::{pages, VmObject, VmarFlags};
 
 macro_rules! include_bytes_aligned {
     ($path: expr) => {{
@@ -61,7 +61,7 @@ fn kcounter_vmos() -> (Arc<VmObject>, Arc<VmObject>) {
         (desc_vmo, arena_vmo)
     } else {
         use kernel_hal::vm::{GenericPageTable, PageTable};
-        use zircon_object::{util::kcounter::AllCounters, vm::pages};
+        use zircon_object::util::kcounter::AllCounters;
         let pgtable = PageTable::from_current();
 
         // kcounters names table.
@@ -270,6 +270,33 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
     let crash_log_vmo = VmObject::new_paged(1);
     crash_log_vmo.set_name("crashlog");
 
+    // The boot options, as the file Fuchsia's own standalone test runtime
+    // reads them from.
+    //
+    // The kernel command line does not travel down the bootstrap channel --
+    // `_zx_startup_get_arguments` returns nothing -- and userboot hands the
+    // program it starts no environment at all, so neither route carries an
+    // option to the core tests. `src/zircon/testing/standalone-test/
+    // standalone-options.cc` takes a third one: it looks for a kernel file
+    // VMO named `boot-options.txt` and parses that. Without it the
+    // core-tests binary ran every case it contains whatever was asked for,
+    // so `scripts/zircon_core_test.py` could neither list the tests nor
+    // select a batch of them.
+    //
+    // The line format is the boot options' own, one `key=value` per line;
+    // this kernel's command line is the same pairs separated by colons.
+    let boot_options_text = cmdline.replace(':', "\n");
+    let boot_options_vmo = VmObject::new_paged(pages(boot_options_text.len().max(1)));
+    if !boot_options_text.is_empty() {
+        boot_options_vmo
+            .write(0, boot_options_text.as_bytes())
+            .unwrap();
+    }
+    boot_options_vmo
+        .set_content_size(boot_options_text.len())
+        .unwrap();
+    boot_options_vmo.set_name("boot-options.txt");
+
     // kcounter
     let (desc_vmo, arena_vmo) = kcounter_vmos();
 
@@ -395,6 +422,7 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
         Handle::new(vdso_test1, Rights::DEFAULT_VMO | Rights::EXECUTE),
         Handle::new(vdso_test2, Rights::DEFAULT_VMO | Rights::EXECUTE),
         Handle::new(crash_log_vmo, Rights::DEFAULT_VMO),
+        Handle::new(boot_options_vmo, Rights::DEFAULT_VMO),
         Handle::new(desc_vmo, Rights::DEFAULT_VMO),
         Handle::new(arena_vmo, Rights::DEFAULT_VMO),
     ];
@@ -413,11 +441,6 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
             handles,
         })
         .unwrap();
-
-    // The kernel command line no longer travels down the bootstrap channel:
-    // `_zx_startup_get_arguments` returns nothing and userboot reads its
-    // options out of the ZBI's own `CMDLINE` items instead.
-    let _ = cmdline;
 
     proc.start(&thread, entry, sp, Some(handle), vdso_base, thread_fn)
         .expect("failed to start main thread");
