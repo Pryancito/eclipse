@@ -40,8 +40,9 @@
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use crate::mem::PhysFrame;
 use crate::vm::{GenericPageTable, PageTable};
-use crate::MMUFlags;
+use crate::{MMUFlags, PhysAddr};
 
 const PAGE_SIZE: usize = 4096;
 
@@ -403,12 +404,127 @@ static GUARD_HIGH: AtomicUsize = AtomicUsize::new(0);
 static INSTALLED: AtomicUsize = AtomicUsize::new(0);
 static REFUSED: AtomicUsize = AtomicUsize::new(0);
 
+// ── Page-table frames reserved for splitting huge mappings ───────────────────
+//
+// On riscv64 and aarch64 the kernel heap is a window of the physmap, and the
+// kernel page table covers the physmap with 2 MiB pages. A guard band inside
+// one of those cannot be taken away a page at a time: the smallest thing the
+// entry can describe is the whole 2 MiB. So `install` splits the covering
+// entry into 4 KiB ones first — same physical range, same flags, finer
+// granularity — which needs a frame for the new table.
+//
+// It cannot allocate one. `install` runs inside `Executor::new`, which the
+// scheduler calls with the runtime lock held and interrupts off, and the
+// coroutine stack it is guarding came out of the very heap a `frame_alloc`
+// would lock. Hence this pool: frames taken at boot, from `init`, where
+// allocating is ordinary, and never given back — each one becomes a live page
+// table reachable from the kernel root for the rest of the boot.
+//
+// A split is permanent and shared by every address space, so the pool is only
+// ever drawn on the FIRST time a guard band lands in a given 2 MiB region;
+// every later stack in that region finds 4 KiB entries already there. The
+// scheduler recycles its stacks through a pool of its own, so the set of
+// regions that ever host one settles quickly. Running out is not a failure:
+// `install` refuses that band and the scheduler keeps its soft canary, which
+// is exactly what happened for every band before this existed.
+const SPLIT_POOL_FRAMES: usize = 128;
+static SPLIT_POOL: [AtomicUsize; SPLIT_POOL_FRAMES] =
+    [const { AtomicUsize::new(0) }; SPLIT_POOL_FRAMES];
+/// How many slots of [`SPLIT_POOL`] hold a frame. Written once, by `init`.
+static SPLIT_POOL_LEN: AtomicUsize = AtomicUsize::new(0);
+/// The pool's bump cursor; also the count of frames handed out.
+static SPLIT_POOL_TAKEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Serialises the split phase of [`install`].
+///
+/// Two CPUs creating an executor at the same time can hold guard bands in the
+/// same 2 MiB region. Without this, both would see the huge entry, both would
+/// build a table, and the second `set_table` would orphan the first table —
+/// including any 4 KiB split the first CPU had already made inside it, leaving
+/// that CPU convinced the band was 4 KiB-mapped while the live entry still
+/// covered 2 MiB. Clearing the permissions of *that* entry would take 2 MiB of
+/// live heap away instead of one guard band.
+///
+/// A raw spin lock rather than `crate::sync::Mutex`: this is held with
+/// interrupts already off, over a few hundred stores and no allocation.
+static SPLIT_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+/// Reserve the page-table frames [`ensure_4k`] will need. Called from `init`.
+fn fill_split_pool() {
+    for i in 0..SPLIT_POOL_FRAMES {
+        let Some(frame) = PhysFrame::new_zero() else {
+            break;
+        };
+        SPLIT_POOL[i].store(frame.paddr(), Ordering::Relaxed);
+        SPLIT_POOL_LEN.store(i + 1, Ordering::Release);
+        // Leaked deliberately. Dropping a `PhysFrame` returns it to the frame
+        // allocator, and these become live page tables: the allocator would
+        // hand a table that the MMU is walking to the next VMO that asks for a
+        // page.
+        core::mem::forget(frame);
+    }
+}
+
+/// Hand out one reserved frame, or `None` once the pool is spent.
+fn split_pool_take() -> Option<PhysAddr> {
+    let len = SPLIT_POOL_LEN.load(Ordering::Acquire);
+    let i = SPLIT_POOL_TAKEN.fetch_add(1, Ordering::AcqRel);
+    if i >= len {
+        return None;
+    }
+    Some(SPLIT_POOL[i].load(Ordering::Relaxed))
+}
+
+/// `(frames reserved, frames spent on splits)` since boot.
+pub fn split_pool_stats() -> (usize, usize) {
+    (
+        SPLIT_POOL_LEN.load(Ordering::Relaxed),
+        SPLIT_POOL_TAKEN
+            .load(Ordering::Relaxed)
+            .min(SPLIT_POOL_LEN.load(Ordering::Relaxed)),
+    )
+}
+
+/// Make every page of `[base, base + size)` an ordinary 4 KiB entry, splitting
+/// the huge entries that cover it. Idempotent, and never rolled back: a split
+/// leaves the mapping describing exactly the same memory, so a band that is
+/// refused afterwards costs nothing but the frames.
+fn ensure_4k(pt: &mut PageTable, base: usize, size: usize) -> Result<(), &'static str> {
+    let _guard = SPLIT_LOCK.lock();
+    let mut split_any = false;
+    for off in (0..size).step_by(PAGE_SIZE) {
+        let vaddr = base + off;
+        match pt.query(vaddr) {
+            Ok((_, _, crate::vm::PageSize::Size4K)) => continue,
+            // Anything bigger: split it, and the rest of the pages it covered
+            // come back as 4 KiB on their own turn through this loop.
+            Ok(_) => {}
+            Err(_) => return Err("band is not mapped"),
+        }
+        if pt.split_huge_page(vaddr, split_pool_take).is_err() {
+            return Err("no reserved frames left to split the band's huge mapping");
+        }
+        split_any = true;
+    }
+    if split_any {
+        // Every CPU may hold a TLB entry for the huge page this band was part
+        // of, and a kernel mapping is reachable from every address space, so
+        // the shootdown deliberately targets all of them.
+        crate::vm::flush_tlb(None);
+        crate::common::ipi::remote_flush_tlb_aspace(None, None);
+    }
+    Ok(())
+}
+
 /// Register this module's hooks with the scheduler.
 ///
 /// Must run after the kernel page tables are pinned and *before* the first
 /// `Executor::new`, which is why `primary_init` calls it immediately before
 /// `executor::warm_runtimes()`. Boot asserts that the hooks got registered.
 pub fn init() {
+    // Before the hooks, so the first `Executor::new` already finds the frames
+    // its guard bands need (see `SPLIT_POOL`).
+    fill_split_pool();
     // SAFETY: the contract is that `remove` restores any mapping `install`
     // took away before the VA goes back to the heap, and that no `.bss`-owned
     // frame is handed to the frame allocator. `install` never takes a frame out
@@ -532,6 +648,16 @@ fn install(guard_base: usize, guard_size: usize) -> bool {
     // be loaded is enough — and necessary, since this can run under a user CR3
     // left behind by lazy TLB.
     let mut pt = PageTable::from_current();
+
+    // Huge mappings first. On riscv64 and aarch64 the kernel heap is part of
+    // the physmap, which the kernel page table covers with 2 MiB pages, so
+    // every band landed here as "band is covered by a 1 GiB PTE" / "2 MiB PTE"
+    // and every coroutine stack on those architectures ran with a soft canary
+    // and no hard guard. Splitting the covering entries into 4 KiB ones
+    // changes nothing about what is mapped where — see `SPLIT_POOL`.
+    if let Err(reason) = ensure_4k(&mut pt, guard_base, guard_size) {
+        return refuse(reason);
+    }
 
     // Survey first, touch nothing: every page must be an ordinary 4 KiB
     // mapping, and all of them must agree on their flags so `remove` can

@@ -20,13 +20,14 @@ use crate::{KernelConfig, KernelHandler, KCONFIG, KHANDLER};
 /// eight died, which is what `Linux Other Test Baremetal (riscv64)` was
 /// reporting as 22 FAILED and 7 TIMEOUT.
 ///
-/// It is set after `percpu::register()`, not earlier, and that is the whole
-/// point of where it sits. `lock`'s hart -> logical table starts out all
-/// zeroes, so every CPU that has not registered yet reports id 0 and they all
-/// share `CPUS[0]`'s lock-depth counter. Two of them bracketing a lock at the
-/// same time leaves that counter wrong and the next release panics with
-/// `pop_off`. Registering the primary first also keeps the boot CPU at logical
-/// id 0, which `LOGICAL_TO_HART` and the SBI IPI path assume.
+/// `percpu::register()` is the earliest it could be set, and the reason is
+/// `lock`'s hart -> logical table: it starts out all zeroes, so every CPU that
+/// has not registered yet reports id 0 and they all share `CPUS[0]`'s
+/// lock-depth counter. Two of them bracketing a lock at the same time leaves
+/// that counter wrong and the next release panics with `pop_off`. Registering
+/// the primary first also keeps the boot CPU at logical id 0, which
+/// `LOGICAL_TO_HART` and the SBI IPI path assume. It is in fact set later
+/// still, at the end of `primary_init` -- see the comment at the store.
 ///
 /// [`super::arch::secondary_init`]'s own `DRIVERS_READY` gate is a later,
 /// narrower one: it covers the device-tree walk alone.
@@ -84,9 +85,6 @@ hal_fn_impl! {
             crate::vm::pin_kernel_vmtoken();
             // Bind this CPU to its PercpuBlock (sets the GS fast-path on x86_64).
             super::percpu::register();
-            // The primary now holds logical id 0 and everything a secondary
-            // needs; release any that are already spinning (see `PRIMARY_READY`).
-            PRIMARY_READY.store(true, Ordering::Release);
             // Let the scheduler kick halted CPUs on cross-CPU wakes instead of
             // waiting for their next periodic tick (up to 4 ms of latency per
             // pipe write / IO completion / process exit otherwise).
@@ -112,14 +110,33 @@ hal_fn_impl! {
             // enough to diagnose that its precondition belongs in the boot log.
             let (installed, refused) = super::stack_guard::stats();
             let (hard, soft) = executor::hard_guard_executor_counts();
+            let (pool, spent) = super::stack_guard::split_pool_stats();
             crate::klog_info!(
                 "stack_guard: {} guard band(s) installed, {} refused; \
-                 executors hard={} soft={}",
+                 executors hard={} soft={}; split frames {}/{}",
                 installed,
                 refused,
                 hard,
-                soft
+                soft,
+                spent,
+                pool
             );
+            // The primary now holds logical id 0 and everything a secondary
+            // needs; release any that are already spinning (see `PRIMARY_READY`).
+            //
+            // Deliberately down here rather than right after `percpu::register`,
+            // which is as early as correctness allows. Everything above is the
+            // single-CPU part of the boot: reserving the guard frames walks the
+            // heap 128 times, and the first `Executor::new` rewrites the kernel
+            // page table under the coroutine stacks and shoots the TLB down.
+            // With the secondaries still parked, `remote_flush_tlb_aspace` sees
+            // one online CPU and does not send an IPI at all — which matters
+            // because a secondary between its release and its `trapframe::init`
+            // has no trap vector, and a trap there jumps to address 0. That is
+            // exactly the `null-range #PF ... rip=0x0` this used to produce on
+            // roughly one riscv64 boot in five, once the guard bands started
+            // installing instead of being refused.
+            PRIMARY_READY.store(true, Ordering::Release);
             super::arch::primary_init();
         }
 

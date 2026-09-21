@@ -9,6 +9,9 @@
 //!
 //! * [`volume`]: Q8.16 gain with a linear ramp, rounded multiply, and a
 //!   pass-through fast path at 0 dB (`src/audio/volume` in SOF).
+//! * [`src`]: a polyphase FIR sample-rate converter (`src/audio/src` in SOF),
+//!   one oversampled prototype low-pass indexed per output sample, fixed-point,
+//!   streaming. Not yet wired into a device path -- that is the follow-up.
 //!
 //! The HDA driver's DAI-side behaviour (keep the engine running over silence
 //! when the host has nothing, rather than stopping and restarting the link)
@@ -18,4 +21,6 @@
 //! Everything here is pure: no device access, no allocation on the hot
 //! path, and every function is exercised by unit tests without hardware.
 
+mod proto;
+pub mod src;
 pub mod volume;
