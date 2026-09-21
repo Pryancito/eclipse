@@ -71,6 +71,33 @@ lazy_static! {
 use zircon_object::{object::KernelObject, vm::VmObject};
 
 use crate::error::{LxError, LxResult};
+
+/// A file offset as userspace supplied it, or `EINVAL`.
+///
+/// `off_t` is **signed** in the uAPI, but the syscall ABI hands arguments
+/// over as raw machine words, so a negative offset arrives with its sign bit
+/// set and reads as an enormous positive number. Linux checks `pos < 0` and
+/// returns `EINVAL` before it touches the file; without that check a
+/// `pwrite(fd, buf, 1, -1)` reaches the filesystem as an offset of
+/// 2^64 - 1, and the filesystem below will try to honour it.
+pub fn user_offset(raw: u64) -> LxResult<u64> {
+    if (raw as i64) < 0 {
+        Err(LxError::EINVAL)
+    } else {
+        Ok(raw)
+    }
+}
+
+/// A file length as userspace supplied it, or `EINVAL`. Same reasoning as
+/// [`user_offset`]: `ftruncate(fd, -1)` would otherwise ask the filesystem
+/// to grow the file to sixteen exabytes.
+pub fn user_len(raw: usize) -> LxResult<usize> {
+    if (raw as isize) < 0 {
+        Err(LxError::EINVAL)
+    } else {
+        Ok(raw)
+    }
+}
 use crate::net::Socket;
 use crate::process::LinuxProcess;
 use devfs::RandomINode;
@@ -2509,4 +2536,84 @@ pub fn rescan_partitions(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod user_argument_tests {
+    //! The syscall ABI hands every argument over as a raw machine word, so a
+    //! value that is **signed** in the uAPI arrives here with no sign left:
+    //! `-1` reads as `0xFFFF_FFFF_FFFF_FFFF`. Linux checks each of these for
+    //! a negative value and returns `EINVAL` before it touches the file.
+    //! Letting one through means a `pwrite` at offset 2^64 - 1 or an
+    //! `ftruncate` to sixteen exabytes, and the filesystem below will try to
+    //! honour it.
+
+    use super::*;
+
+    #[test]
+    fn a_negative_offset_is_refused() {
+        // These are the bit patterns userspace gets from passing -1, -2 and
+        // LONG_MIN as an `off_t`.
+        assert!(user_offset(u64::MAX).is_err());
+        assert!(user_offset(u64::MAX - 1).is_err());
+        assert!(user_offset(1u64 << 63).is_err());
+    }
+
+    #[test]
+    fn the_refusal_is_einval() {
+        // `pread` returning the wrong errno sends libc down a different
+        // path; EBADF in particular would have a caller close the fd.
+        assert!(matches!(user_offset(u64::MAX), Err(LxError::EINVAL)));
+        assert!(matches!(user_len(usize::MAX), Err(LxError::EINVAL)));
+    }
+
+    #[test]
+    fn every_offset_a_file_can_really_have_is_accepted() {
+        // The boundary is the sign bit, not some smaller cap: a file offset
+        // is allowed all 63 bits.
+        assert_eq!(user_offset(0).unwrap(), 0);
+        assert_eq!(user_offset(1).unwrap(), 1);
+        assert_eq!(
+            user_offset(i64::MAX as u64).unwrap(),
+            i64::MAX as u64,
+            "the largest offset an off_t can name"
+        );
+        assert!(user_offset((1u64 << 63) - 1).is_ok());
+    }
+
+    #[test]
+    fn a_negative_length_is_refused() {
+        assert!(user_len(usize::MAX).is_err());
+        assert!(user_len(1usize << 63).is_err());
+    }
+
+    #[test]
+    fn a_zero_length_is_not_negative() {
+        // `ftruncate(fd, 0)` empties a file and is the single most common
+        // call; only `fallocate` treats zero as an error, and it does that
+        // itself.
+        assert_eq!(user_len(0).unwrap(), 0);
+    }
+
+    #[test]
+    fn every_length_a_file_can_really_have_is_accepted() {
+        assert_eq!(user_len(1).unwrap(), 1);
+        assert_eq!(user_len(isize::MAX as usize).unwrap(), isize::MAX as usize);
+    }
+
+    #[test]
+    fn the_two_checks_draw_the_line_in_the_same_place() {
+        // One is for `u64` and the other for `usize`, and on a 64-bit target
+        // they must agree, or a `pwrite` and an `ftruncate` would disagree
+        // about the same number.
+        for shift in 0..64u32 {
+            let v = 1u64 << shift;
+            assert_eq!(
+                user_offset(v).is_ok(),
+                user_len(v as usize).is_ok(),
+                "1 << {}",
+                shift
+            );
+        }
+    }
 }

@@ -215,6 +215,9 @@ impl Syscall<'_> {
             "pread: fd={:?}, base={:?}, len={}, offset={}",
             fd, base, len, offset
         );
+        // `off_t` is signed: a negative offset is EINVAL, not an offset of
+        // 2^64 - 1 handed to the filesystem.
+        let offset = linux_object::fs::user_offset(offset)?;
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
 
@@ -266,6 +269,7 @@ impl Syscall<'_> {
             "pwrite: fd={:?}, base={:?}, len={}, offset={}",
             fd, base, len, offset
         );
+        let offset = linux_object::fs::user_offset(offset)?;
         self.linux_process()
             .get_file_like(fd)?
             .write_at(offset, base.as_slice(len)?)
@@ -382,6 +386,7 @@ impl Syscall<'_> {
             "preadv: fd={:?}, iov={:?}, count={}, offset={}",
             fd, iov_ptr, iov_count, offset
         );
+        let offset = linux_object::fs::user_offset(offset)?;
         let mut iovs = iov_ptr.read_iovecs(iov_count)?;
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
@@ -408,6 +413,7 @@ impl Syscall<'_> {
             "pwritev: fd={:?}, iov={:?}, count={}, offset={}",
             fd, iov_ptr, iov_count, offset
         );
+        let offset = linux_object::fs::user_offset(offset)?;
         let iovs = iov_ptr.read_iovecs(iov_count)?;
         // Same chunked gather as sys_writev — no artificial total cap, short
         // write on a mid-stream failure — with the position carried in the
@@ -512,6 +518,7 @@ impl Syscall<'_> {
     pub fn sys_truncate(&self, path: UserInPtr<u8>, len: usize) -> SysResult {
         let path = path.as_c_str()?;
         info!("truncate: path={:?}, len={}", path, len);
+        let len = linux_object::fs::user_len(len)?;
         let proc = self.linux_process();
         let inode = proc.lookup_inode(path)?;
         let metadata = inode.metadata()?;
@@ -526,6 +533,9 @@ impl Syscall<'_> {
     /// cause the regular file referenced by fd to be truncated to a size of precisely length bytes.
     pub fn sys_ftruncate(&self, fd: FileDesc, len: usize) -> SysResult {
         info!("ftruncate: fd={:?}, len={}", fd, len);
+        // A negative length is EINVAL in Linux, not a request to grow the
+        // file to sixteen exabytes.
+        let len = linux_object::fs::user_len(len)?;
         let proc = self.linux_process();
         let file = proc.get_file(fd)?;
         // The desktop OOM was a single ftruncate growing one RAM-backed file
@@ -594,6 +604,13 @@ impl Syscall<'_> {
             "fallocate: fd={:?}, mode={:#x}, offset={}, len={}",
             fd, mode, offset, len
         );
+        // `fallocate(2)`: EINVAL for a negative offset or a length that is
+        // not positive.
+        let offset = linux_object::fs::user_len(offset)?;
+        let len = linux_object::fs::user_len(len)?;
+        if len == 0 {
+            return Err(LxError::EINVAL);
+        }
         let file = self.linux_process().get_file(fd)?;
         // Only the plain allocate mode (mode == 0) implies the file may need to
         // grow. KEEP_SIZE, the hole-punch/zero-range variants, and any request
