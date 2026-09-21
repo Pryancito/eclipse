@@ -2711,15 +2711,22 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               enable-shm = yes\n\
               enable-memfd = yes\n\
               default-sample-format = s16le\n\
-              # Fixed sink rate: no `alternate-sample-rate`, so the daemon keeps\n\
-              # the ALSA sink (and thus the HDA link) at 48 kHz for every stream\n\
-              # and resamples 44.1 kHz content itself, rather than following the\n\
-              # stream rate. Switching the link rate reprograms the HDA stream,\n\
-              # which on an HDMI/DP sink is a re-lock mute of the audio -- so a\n\
-              # 44.1 kHz track after a 48 kHz one used to drop the first fraction\n\
-              # of a second. A fixed rate costs a userspace resample of 44.1 kHz\n\
-              # material (below) but never a re-lock.\n\
+              # The kernel is a fixed-rate sink: the HDA link always runs at\n\
+              # 48 kHz and hw:0,0 accepts any client rate, converting it into\n\
+              # the ring with the kernel's polyphase resampler (~-90 dB) -- and\n\
+              # a rate change no longer restarts the stream, so it never\n\
+              # re-locks an HDMI/DP sink. `avoid-resampling` therefore hands a\n\
+              # lone stream to the sink at its native rate (44.1 kHz for most\n\
+              # music) instead of resampling it here with speex: the daemon\n\
+              # only resamples when two streams at different rates play at\n\
+              # once. `default-sample-rate` is what the sink opens at and what\n\
+              # everything mixes to in that case. No `alternate-sample-rate`:\n\
+              # that is the old, reprogram-the-link way of following a rate.\n\
+              # To go back to the daemon resampling everything, set\n\
+              # `avoid-resampling = no` (one line; the kernel side is then\n\
+              # passthrough and byte-identical to before).\n\
               default-sample-rate = 48000\n\
+              avoid-resampling = yes\n\
               default-sample-channels = 2\n\
               default-fragments = 4\n\
               default-fragment-size-msec = 25\n\
