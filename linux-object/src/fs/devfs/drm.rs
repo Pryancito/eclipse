@@ -3882,17 +3882,32 @@ pub fn release_process(pid: u64) -> usize {
     cancel_events_for_exit(pid);
     // Driver-private (nouveau `GEM_NEW`) framebuffers first, and BEFORE the
     // early return below: `nouveau_release_process`, which runs right after
-    // this hook, gives their memory back to the RM, and the framebuffer holds
-    // no reference that could keep it -- so a framebuffer left behind here
-    // means `crtc_fb` aimed at freed GEM memory and the next repaint blitting
-    // whatever took its place. This has to happen while `gem_mmap` still
-    // records who held what.
+    // this hook, drops everything the pid held, so a framebuffer of its own
+    // left behind here means `crtc_fb` aimed at a buffer nobody owns and the
+    // next repaint blitting whatever took its place. This has to happen while
+    // `gem_mmap` still records who held what.
     //
     // It cannot live inside the block below, because that returns early when
     // the pid owns no entry in `state.handles` -- and a compositor using the
     // GL/Vulkan renderer owns NOTHING there: its buffers are all nouveau GEM
     // objects tracked in `gem_mmap`. That early return is precisely why a
     // crashed wlroots left its scanout framebuffer in place.
+    //
+    // What decides is `fb.owner`, the pid that issued the `ADDFB` -- NOT
+    // whether the dying pid happens to be one of the GEM object's holders.
+    // Those two are the same thing only while a buffer has a single holder,
+    // and the X11 path is exactly where it has three: a GL client hands its
+    // buffer to Xwayland, which hands it on to the compositor, so one object
+    // is held by all three (`xwayland_chain_tests`). Keyed on `holds`, the
+    // client exiting retired the COMPOSITOR's framebuffer and zeroed
+    // `crtc_fb` with it -- after which every `PAGE_FLIP` and `SETCRTC` on that
+    // id answers "no such fb" and wlroots has no output left to drive.
+    //
+    // Retiring by owner is also what makes the memory safe: since
+    // `fb_take_gem_ref` the framebuffer holds a reference of its own
+    // (`KMS_FB_HOLDER`), so a holder dying is never the last one while an fb
+    // stands over the object -- the same invariant
+    // `retire_framebuffers_for_handle` already relies on.
     //
     // Dumb buffers are deliberately not touched here; see
     // `retire_framebuffers_for_handle` for why their fb outlives its handle.
@@ -3904,13 +3919,13 @@ pub fn release_process(pid: u64) -> usize {
             .iter()
             .filter(|fb| {
                 fb.gem_handle_id >= zcore_drivers::scheme::gem_mmap::DRIVER_HANDLE_BASE
-                    && zcore_drivers::scheme::gem_mmap::holds(fb.gem_handle_id, pid)
+                    && fb.owner == pid
             })
             .map(|fb| (fb.id, fb.gem_handle_id))
             .collect();
         state.framebuffers.retain(|fb| {
             fb.gem_handle_id < zcore_drivers::scheme::gem_mmap::DRIVER_HANDLE_BASE
-                || !zcore_drivers::scheme::gem_mmap::holds(fb.gem_handle_id, pid)
+                || fb.owner != pid
         });
         for (fb_id, _) in &taken {
             note_fb_retired(&mut state, *fb_id, FbRetired::ProcessExited);
@@ -5144,6 +5159,68 @@ mod nouveau_fb_lifetime_tests {
         assert_eq!(DRM_STATE.lock().crtc_fb, 0);
         gem_mmap::unregister(mine);
         gem_mmap::unregister(theirs);
+    }
+
+    /// The same sweep, over the buffer an X11 GL client actually produces.
+    ///
+    /// A native Wayland client's buffer has one holder, so "the dying pid
+    /// holds this object" and "the dying pid made this framebuffer" are the
+    /// same statement and the test above cannot tell them apart. Under
+    /// Xwayland the buffer has three: the client hands it to Xwayland, which
+    /// hands it on to the compositor, and the compositor is the one that
+    /// issues `ADDFB` over it (a direct scanout).
+    ///
+    /// Keyed on holders, the client exiting -- a tab closing, a GL program
+    /// ending -- retired the COMPOSITOR's framebuffer and zeroed `crtc_fb`
+    /// with it. Every `PAGE_FLIP` and `SETCRTC` on that id then answers "no
+    /// such fb", which leaves wlroots with an output it cannot drive.
+    #[test]
+    fn a_client_exiting_does_not_retire_the_compositor_framebuffer_over_its_buffer() {
+        let _serialised = super::test_globals::lock();
+        const CLIENT: u64 = 78_201;
+        const XWAYLAND: u64 = 78_202;
+        const COMPOSITOR: u64 = 78_203;
+        let shared = gem_mmap::DRIVER_HANDLE_BASE + 0x68;
+
+        // One buffer, three holders, and the framebuffer belongs to the last
+        // of them.
+        gem_mmap::register(shared, 0x2_0000, 4096, CLIENT);
+        gem_mmap::add_ref(shared, XWAYLAND);
+        gem_mmap::add_ref(shared, COMPOSITOR);
+        {
+            let mut state = DRM_STATE.lock();
+            state.framebuffers.push(DrmFramebuffer {
+                id: 9505,
+                driver_fb_id: None,
+                gem_handle_id: shared,
+                width: 1,
+                height: 1,
+                pitch: 4,
+                phys_addr: 0x2_0000,
+                size: 4096,
+                owner: COMPOSITOR,
+            });
+            state.crtc_fb = 9505;
+        }
+
+        release_process(CLIENT);
+        assert!(
+            fb_exists(9505),
+            "a holder exiting must not take a framebuffer somebody else made"
+        );
+        release_process(XWAYLAND);
+        assert!(fb_exists(9505), "nor the hop in the middle exiting");
+        assert_eq!(
+            DRM_STATE.lock().crtc_fb,
+            9505,
+            "the scanout framebuffer must still be the one bound to the CRTC"
+        );
+
+        // The compositor's own exit is what retires it, as before.
+        release_process(COMPOSITOR);
+        assert!(!fb_exists(9505));
+        assert_eq!(DRM_STATE.lock().crtc_fb, 0);
+        gem_mmap::unregister(shared);
     }
 }
 
