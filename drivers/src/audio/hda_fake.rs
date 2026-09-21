@@ -62,6 +62,9 @@ struct FakeState {
     /// A codec that never answers: the verb is logged and the RIRB stays
     /// as it is.
     codec_dead: bool,
+    /// Verb words the codec swallows without answering (one dead verb
+    /// among live ones: what a path re-arm failing halfway looks like).
+    dead_verbs: Vec<u32>,
     /// Unsolicited responses (jack events) delivered with the next answer,
     /// ahead of it.
     unsolicited_with_next: u32,
@@ -168,7 +171,7 @@ pub(super) fn on_write(bar: usize, off: usize, v: u32) {
                 st.corb_rp = (st.corb_rp + 1) % st.corb_entries;
                 let verb: u32 = peek(st.corb_va + st.corb_rp * 4);
                 st.verbs.push(verb);
-                if st.codec_dead {
+                if st.codec_dead || st.dead_verbs.contains(&verb) {
                     continue;
                 }
                 for _ in 0..st.unsolicited_with_next {
@@ -242,10 +245,20 @@ pub(super) const CODEC: u32 = 0;
 pub(super) const AFG: u32 = 1;
 pub(super) const CONV: u32 = 2;
 pub(super) const PIN: u32 = 3;
+/// A second line-out jack, for [`Hw::install_output_codec_with_second_jack`].
+pub(super) const SECOND_PIN: u32 = 4;
 pub(super) const TAG: u32 = 1;
 
 /// Link bytes per second at the link format (48 kHz stereo S16).
 const LINK_BYTES_PER_S: u64 = LINK_RATE as u64 * 4;
+
+/// The HDMI codec's nodes: converters 4 and 5, DisplayPort pin 6, HDMI
+/// pin 7 (see [`Hw::install_hdmi_codec`]).
+pub(super) const HDMI_CONV: u32 = 4;
+pub(super) const DP_PIN: u32 = 6;
+pub(super) const HDMI_PIN: u32 = 7;
+/// Config default: jack, digital other out (HDMI), external, no colour.
+pub(super) const PIN_DEFCFG_DIGITAL_DISPLAY: u32 = 0x1856_0010;
 
 /// The DAC's output amplifier: mute capable, 0 dB at step 0x4a.
 pub(super) const DAC_AMP_CAP: u32 = (1 << 31) | 0x4a;
@@ -341,6 +354,111 @@ impl Hw {
         self.with(|st| {
             st.answers.insert(verb, resp);
         });
+    }
+
+    /// Forget the verbs logged so far, so a test can look at one phase.
+    pub fn clear_verbs(&self) {
+        self.with(|st| st.verbs.clear());
+    }
+
+    /// Verbs of kind `verb` (12-bit) sent to `nid`, in order, by payload.
+    pub fn payloads(&self, nid: u32, verb: u32) -> Vec<u32> {
+        self.with(|st| {
+            st.verbs
+                .iter()
+                .filter(|&&w| (w >> 20) & 0xff == nid && (w >> 8) & 0xfff == verb)
+                .map(|&w| w & 0xff)
+                .collect()
+        })
+    }
+
+    /// The codec stops answering this one verb word.
+    pub fn fail_verb(&self, verb: u32) {
+        self.with(|st| st.dead_verbs.push(verb));
+    }
+
+    /// What `GET_PIN_SENSE` on `pin` reports from now on.
+    pub fn set_pin_sense(&self, pin: u32, present: bool, eld_valid: bool) {
+        let sense = ((present as u32) << 31) | ((eld_valid as u32) << 30);
+        self.answer(verb12(pin, VERB_GET_PIN_SENSE, 0), sense);
+    }
+
+    /// The codec an NVIDIA GPU's HDA function presents, near enough: a
+    /// root node, one AFG, two digital converters (nids 4 and 5) and two
+    /// digital pin complexes, one DisplayPort (nid 6) and one HDMI (nid
+    /// 7), each wired to both converters. Nothing present until a test
+    /// says so.
+    pub fn install_hdmi_codec(&self) {
+        let root = 0;
+        let pairs = [
+            (verb12(root, VERB_GET_PARAMETER, PAR_VENDOR_ID), 0x10de_0022),
+            (
+                verb12(root, VERB_GET_PARAMETER, PAR_NODE_COUNT),
+                (AFG << 16) | 1,
+            ),
+            (verb12(AFG, VERB_GET_PARAMETER, PAR_FUNCTION_TYPE), 0x01),
+            (
+                verb12(AFG, VERB_GET_PARAMETER, PAR_NODE_COUNT),
+                (HDMI_CONV << 16) | 4,
+            ),
+        ];
+        for (verb, resp) in pairs {
+            self.answer(verb, resp);
+        }
+        for conv in [HDMI_CONV, HDMI_CONV + 1] {
+            self.answer(
+                verb12(conv, VERB_GET_PARAMETER, PAR_AUDIO_WIDGET_CAP),
+                (WIDGET_AUDIO_OUT << 20) | (1 << 9) | 1,
+            );
+        }
+        for (pin, link) in [(DP_PIN, 1 << 24), (HDMI_PIN, 1 << 7)] {
+            self.answer(
+                verb12(pin, VERB_GET_PARAMETER, PAR_AUDIO_WIDGET_CAP),
+                (WIDGET_PIN << 20) | (1 << 8) | 1,
+            );
+            self.answer(
+                verb12(pin, VERB_GET_PARAMETER, PAR_PIN_CAP),
+                link | (1 << 4) | (1 << 2),
+            );
+            self.answer(
+                verb12(pin, VERB_GET_CONFIG_DEFAULT, 0),
+                PIN_DEFCFG_DIGITAL_DISPLAY,
+            );
+            self.answer(verb12(pin, VERB_GET_PARAMETER, PAR_CONN_LIST_LEN), 2);
+            self.answer(
+                verb12(pin, VERB_GET_CONN_LIST, 0),
+                HDMI_CONV | ((HDMI_CONV + 1) << 8),
+            );
+            self.set_pin_sense(pin, false, false);
+        }
+    }
+
+    /// [`Hw::install_output_codec`] plus a second line-out jack (nid 4)
+    /// on the same DAC, with nothing plugged into either until a test
+    /// says so.
+    pub fn install_output_codec_with_second_jack(&self) {
+        self.install_output_codec();
+        self.answer(
+            verb12(AFG, VERB_GET_PARAMETER, PAR_NODE_COUNT),
+            (CONV << 16) | 3,
+        );
+        for pin in [PIN, SECOND_PIN] {
+            self.answer(
+                verb12(pin, VERB_GET_PARAMETER, PAR_AUDIO_WIDGET_CAP),
+                (WIDGET_PIN << 20) | (1 << 8) | 1,
+            );
+            self.answer(
+                verb12(pin, VERB_GET_PARAMETER, PAR_PIN_CAP),
+                (1 << 4) | (1 << 2),
+            );
+            self.answer(
+                verb12(pin, VERB_GET_CONFIG_DEFAULT, 0),
+                PIN_DEFCFG_LINE_OUT_JACK,
+            );
+            self.answer(verb12(pin, VERB_GET_PARAMETER, PAR_CONN_LIST_LEN), 1);
+            self.answer(verb12(pin, VERB_GET_CONN_LIST, 0), CONV);
+            self.set_pin_sense(pin, false, false);
+        }
     }
 
     pub fn starts(&self) -> u32 {
@@ -529,6 +647,16 @@ pub(super) fn controller(iss: usize) -> Hw {
     hw
 }
 
+/// Like [`controller`], with the HDMI codec attached instead.
+pub(super) fn hdmi_controller(iss: usize) -> Hw {
+    let hw = install(iss);
+    hw.set_streams(iss, 4);
+    poke::<u8>(hw.bar + REG_CORBSIZE, 0x40);
+    poke::<u8>(hw.bar + REG_RIRBSIZE, 0x40);
+    hw.install_hdmi_codec();
+    hw
+}
+
 /// A fresh, empty controller on this thread and the clock at zero.
 fn install(iss: usize) -> Hw {
     test_clock::set(0);
@@ -556,6 +684,7 @@ fn install(iss: usize) -> Hw {
             verbs: Vec::new(),
             answers: BTreeMap::new(),
             codec_dead: false,
+            dead_verbs: Vec::new(),
             unsolicited_with_next: 0,
             sts: 0,
             run: false,
@@ -1341,6 +1470,23 @@ mod probe_tests {
     }
 
     #[test]
+    fn with_two_jacks_the_probe_picks_the_one_with_something_plugged_in() {
+        let hw = controller(ISS);
+        hw.install_output_codec_with_second_jack();
+        hw.set_pin_sense(SECOND_PIN, true, false);
+        let dev = probe(&hw).expect("probe");
+        let inner = dev.inner.lock();
+        assert_eq!(inner.candidates.len(), 2);
+        assert_eq!((inner.conv_nid, inner.pin_nid), (CONV, SECOND_PIN));
+        assert!(!inner.digital);
+        assert!(
+            !hw.verbs()
+                .contains(&verb12(SECOND_PIN, VERB_SET_PIN_SENSE, 0)),
+            "a jack is not sense-triggered"
+        );
+    }
+
+    #[test]
     fn a_controller_with_no_output_descriptor_is_not_supported() {
         let hw = controller(ISS);
         hw.set_streams(ISS, 0);
@@ -1579,5 +1725,279 @@ mod probe_tests {
             assert!(text.contains(needle), "missing {:?} in:\n{}", needle, text);
         }
         assert!(!text.contains("codec reads cut short"));
+    }
+}
+
+#[cfg(test)]
+mod hdmi_tests {
+    //! The digital path: a GPU's HDA function with two display pins. What
+    //! the probe picks, what a stream start sends the sink, and the route
+    //! decisions between stops (`repick_path`) that decided whether
+    //! `mpg123` was heard or not on the real machine.
+
+    use super::*;
+    use crate::scheme::AudioScheme;
+
+    const ISS: usize = 4;
+
+    /// Probe with the given pins reporting presence (and a valid ELD).
+    fn device_with(present: &[u32]) -> (Hw, HdaDevice) {
+        let hw = hdmi_controller(ISS);
+        for &pin in present {
+            hw.set_pin_sense(pin, true, true);
+        }
+        let dev = HdaDevice::new(hw.bar, String::from("hda-hdmi"), true).expect("probe");
+        (hw, dev)
+    }
+
+    fn tick(hw: &Hw, dev: &dyn AudioScheme) {
+        hw.run_for_us(4_000);
+        dev.queued_bytes();
+    }
+
+    /// The CEA audio infoframe `send_audio_infoframe` builds for stereo.
+    const STEREO_INFOFRAME: [u32; 14] = [0x84, 0x01, 0x0a, 0x70, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    #[test]
+    fn probe_picks_the_pin_with_a_display_on_it() {
+        let (hw, dev) = device_with(&[HDMI_PIN]);
+        let inner = dev.inner.lock();
+        assert_eq!((inner.conv_nid, inner.pin_nid), (HDMI_CONV, HDMI_PIN));
+        assert!(inner.digital);
+        assert_eq!(inner.candidates.len(), 2);
+        for c in &inner.candidates {
+            assert!(c.digital && c.hdmi_dp, "pin {:#x}", c.pin);
+            assert_eq!(c.conv, HDMI_CONV, "the first converter in the list");
+        }
+        let verbs = hw.verbs();
+        let sent = |v: u32| verbs.contains(&v);
+        // Both display pins were powered and enabled before the pick, so
+        // the sink could report presence.
+        for pin in [DP_PIN, HDMI_PIN] {
+            assert!(sent(verb12(pin, VERB_SET_POWER_STATE, 0)));
+            assert!(sent(verb12(pin, VERB_SET_PIN_CTL, PIN_CTL_OUT_EN)));
+            assert!(
+                sent(verb12(pin, VERB_SET_PIN_SENSE, 0)),
+                "sense triggered on {:#x}",
+                pin
+            );
+        }
+        // The digital converter set up for stereo, the infoframe on the pin.
+        assert!(sent(verb12(HDMI_CONV, VERB_SET_DIGI_CVT1, 0x1)));
+        assert!(sent(verb12(HDMI_CONV, VERB_SET_CVT_CHAN_COUNT, 1)));
+        assert!(sent(verb12(HDMI_CONV, VERB_SET_HDMI_CHAN_SLOT, 0x00)));
+        assert!(sent(verb12(HDMI_CONV, VERB_SET_HDMI_CHAN_SLOT, 0x11)));
+        assert_eq!(hw.payloads(HDMI_PIN, VERB_SET_DIP_DATA), STEREO_INFOFRAME);
+        assert_eq!(hw.payloads(HDMI_PIN, VERB_SET_DIP_INDEX), [0, 8]);
+        assert!(sent(verb12(HDMI_PIN, VERB_SET_DIP_XMIT, 0xc0)));
+        assert!(
+            hw.payloads(DP_PIN, VERB_SET_DIP_DATA).is_empty(),
+            "nothing on the dead pin"
+        );
+        assert!(
+            !sent(verb4(HDMI_CONV, 0x3, 0)),
+            "no amp on a digital converter"
+        );
+    }
+
+    #[test]
+    fn with_no_display_anywhere_the_probe_still_picks_a_pin_and_plays() {
+        let (hw, dev) = device_with(&[]);
+        let inner = dev.inner.lock();
+        assert_eq!(inner.pin_nid, DP_PIN, "first on a tie");
+        assert!(!inner.candidates.iter().any(|c| c.present));
+        drop(inner);
+        dev.write(&constant(1000, HOST_BUFFER)).unwrap();
+        assert!(dev.is_playing());
+        tick(&hw, &dev);
+        assert!(samples(&hw.played()).iter().all(|&s| s == 1000));
+    }
+
+    #[test]
+    fn every_start_resends_the_infoframe_and_reprograms_the_converter() {
+        let (hw, dev) = device_with(&[HDMI_PIN]);
+        hw.clear_verbs();
+        dev.write(&constant(1000, HOST_BUFFER)).unwrap();
+        assert!(dev.is_playing());
+        let xmits = hw
+            .verbs()
+            .iter()
+            .filter(|&&v| v == verb12(HDMI_PIN, VERB_SET_DIP_XMIT, 0xc0))
+            .count();
+        assert!(xmits >= 1, "infoframe transmitted at start");
+        assert_eq!(
+            &hw.payloads(HDMI_PIN, VERB_SET_DIP_DATA)[..14],
+            STEREO_INFOFRAME
+        );
+        let verbs = hw.verbs();
+        assert!(verbs.contains(&verb12(HDMI_CONV, VERB_SET_DIGI_CVT1, 0x1)));
+        assert!(verbs.contains(&verb12(HDMI_CONV, VERB_SET_STREAM_ID, TAG << 4)));
+        assert!(
+            verbs.contains(&verb12(AFG, VERB_SET_POWER_STATE, 0)),
+            "path re-armed"
+        );
+        assert_eq!(dev.inner.lock().stat_reroutes, 0);
+    }
+
+    #[test]
+    fn the_stream_moves_to_the_pin_that_came_alive_between_stops() {
+        let (hw, dev) = device_with(&[HDMI_PIN]);
+        dev.write(&constant(1000, HOST_BUFFER)).unwrap();
+        tick(&hw, &dev);
+        dev.inner.lock().stop_engine();
+        // The monitor moved to the DisplayPort connector.
+        hw.set_pin_sense(HDMI_PIN, false, false);
+        hw.set_pin_sense(DP_PIN, true, true);
+        hw.run_for_us(SENSE_PROBE_MIN_US);
+        hw.clear_verbs();
+        dev.write(&constant(1000, HOST_BUFFER)).unwrap();
+        assert!(dev.is_playing());
+        let inner = dev.inner.lock();
+        assert_eq!(inner.pin_nid, DP_PIN);
+        assert_eq!(inner.stat_reroutes, 1);
+        assert_eq!(
+            (inner.last_reroute.0, inner.last_reroute.1),
+            (HDMI_PIN, DP_PIN)
+        );
+        drop(inner);
+        let verbs = hw.verbs();
+        assert!(verbs.contains(&verb12(DP_PIN, VERB_SET_CONN_SELECT, 0)));
+        assert!(verbs.contains(&verb12(DP_PIN, VERB_SET_PIN_CTL, PIN_CTL_OUT_EN)));
+        assert_eq!(
+            &hw.payloads(DP_PIN, VERB_SET_DIP_DATA)[..14],
+            STEREO_INFOFRAME
+        );
+        assert!(dev
+            .diagnostics()
+            .contains("routing: 1 re-routes (last pin 0x7 -> pin 0x6"));
+    }
+
+    #[test]
+    fn a_momentary_sense_dip_does_not_move_the_stream_to_a_dead_pin() {
+        // What #1287 fixed: right after a stop the monitor's own pin can
+        // read PD=0 for a moment, and re-scoring alone sent every restart
+        // to the first dead connector in the list.
+        let (hw, dev) = device_with(&[HDMI_PIN]);
+        dev.write(&constant(1000, HOST_BUFFER)).unwrap();
+        dev.inner.lock().stop_engine();
+        hw.set_pin_sense(HDMI_PIN, false, false);
+        // The other pin even outscores it, on a stale ELD with nothing
+        // plugged in: still not somewhere to move to.
+        hw.set_pin_sense(DP_PIN, false, true);
+        hw.run_for_us(SENSE_PROBE_MIN_US);
+        dev.write(&constant(1000, HOST_BUFFER)).unwrap();
+        let inner = dev.inner.lock();
+        assert_eq!(
+            inner.pin_nid, HDMI_PIN,
+            "stays where the audio last came out"
+        );
+        assert_eq!(inner.stat_reroutes, 0);
+    }
+
+    #[test]
+    fn sense_probes_are_throttled_per_pin() {
+        let (hw, dev) = device_with(&[HDMI_PIN]);
+        let mut inner = dev.inner.lock();
+        hw.clear_verbs();
+        let probes = |pin: u32| {
+            hw.verbs()
+                .iter()
+                .filter(|&&v| v == verb12(pin, VERB_SET_PIN_SENSE, 0))
+                .count()
+        };
+        inner.repick_path();
+        assert_eq!(
+            (probes(DP_PIN), probes(HDMI_PIN)),
+            (0, 0),
+            "just probed by the pick"
+        );
+        hw.run_for_us(SENSE_PROBE_MIN_US);
+        inner.repick_path();
+        assert_eq!(
+            (probes(DP_PIN), probes(HDMI_PIN)),
+            (1, 1),
+            "each pin, once it is due"
+        );
+        inner.repick_path();
+        assert_eq!((probes(DP_PIN), probes(HDMI_PIN)), (1, 1));
+    }
+
+    #[test]
+    fn a_failed_re_route_keeps_the_previous_path_on_the_stream() {
+        let (hw, dev) = device_with(&[HDMI_PIN]);
+        dev.write(&constant(1000, HOST_BUFFER)).unwrap();
+        dev.inner.lock().stop_engine();
+        hw.set_pin_sense(HDMI_PIN, false, false);
+        hw.set_pin_sense(DP_PIN, true, true);
+        hw.fail_verb(verb12(DP_PIN, VERB_SET_PIN_CTL, PIN_CTL_OUT_EN));
+        hw.set_read_tick_us(1_000);
+        hw.run_for_us(SENSE_PROBE_MIN_US);
+        hw.clear_verbs();
+        dev.write(&constant(1000, HOST_BUFFER)).unwrap();
+        assert!(dev.is_playing(), "the old route still plays");
+        let inner = dev.inner.lock();
+        assert_eq!((inner.conv_nid, inner.pin_nid), (HDMI_CONV, HDMI_PIN));
+        assert!(inner.digital);
+        assert_eq!(inner.stat_reroutes, 1, "the attempt is counted");
+        let verbs = hw.verbs();
+        let failed_at = verbs
+            .iter()
+            .position(|&v| v == verb12(DP_PIN, VERB_SET_PIN_CTL, PIN_CTL_OUT_EN))
+            .expect("the re-route was tried");
+        // `setup_path` re-sends the stream id on failure and `start_stream`
+        // sends it again on every start, so this holds either way.
+        assert!(
+            verbs[failed_at..].contains(&verb12(HDMI_CONV, VERB_SET_STREAM_ID, TAG << 4)),
+            "the converter is put back on the stream after the failure"
+        );
+    }
+
+    #[test]
+    fn a_write_with_no_live_display_kicks_the_display_engine_once_a_second() {
+        let (hw, dev) = device_with(&[]);
+        let s = dev.open_stream().unwrap().unwrap();
+        hw.run_for_us(10_000);
+        let t0 = test_clock::now();
+        s.write(&constant(1000, 4096)).unwrap();
+        assert_eq!(
+            dev.inner.lock().last_kick_us,
+            t0,
+            "kicked: nothing reports a display"
+        );
+        // Stopped again within the interval: the next write does not kick.
+        dev.inner.lock().stop_engine();
+        hw.run_for_us(HDMI_KICK_MIN_US / 2);
+        s.write(&constant(1000, 4096)).unwrap();
+        assert_eq!(dev.inner.lock().last_kick_us, t0, "within the interval");
+        // Past it, it does.
+        dev.inner.lock().stop_engine();
+        hw.run_for_us(HDMI_KICK_MIN_US);
+        let t1 = test_clock::now();
+        s.write(&constant(1000, 4096)).unwrap();
+        assert_eq!(dev.inner.lock().last_kick_us, t1, "due again");
+        // A live pin never kicks.
+        let (hw2, dev2) = device_with(&[HDMI_PIN]);
+        hw2.run_for_us(10_000);
+        dev2.write(&constant(1000, 4096)).unwrap();
+        assert_eq!(
+            dev2.inner.lock().last_kick_us,
+            0,
+            "the display side has done its part"
+        );
+    }
+
+    #[test]
+    fn diagnostics_show_the_digital_path_and_every_candidate() {
+        let (_hw, dev) = device_with(&[HDMI_PIN]);
+        let text = dev.diagnostics();
+        for needle in [
+            "active path: converter 0x4 -> pin 0x7 (HDMI/DP)",
+            "candidates (2):",
+            "pin 0x6 -> conv 0x4 digital=1 hdmi/dp=1 present=0 eld_valid=0",
+            "pin 0x7 -> conv 0x4 digital=1 hdmi/dp=1 present=1 eld_valid=1  <== ACTIVE",
+            "NVIDIA HDA function",
+        ] {
+            assert!(text.contains(needle), "missing {:?} in:\n{}", needle, text);
+        }
     }
 }
