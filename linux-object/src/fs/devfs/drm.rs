@@ -217,21 +217,40 @@ impl DrmFileState {
         !self.events.lock().is_empty()
     }
 
-    /// Pop one pending DRM event into `buf`, or `None` if the queue is empty /
-    /// the caller's buffer is too small for a whole event.
-    pub fn read_event(&self, buf: &mut [u8]) -> Option<usize> {
+    /// Fill `buf` with as many whole pending DRM events as fit, like
+    /// `drm_read()`.
+    ///
+    /// The three outcomes are distinct on purpose. Collapsing "the buffer is
+    /// too small for the first event" into "nothing to read" livelocked the
+    /// kernel: the caller saw EAGAIN, but the queue was NOT empty so
+    /// `Event::READABLE` stayed set, so a blocking reader's wait resolved
+    /// instantly, re-read, got EAGAIN again, and spun with no yield point.
+    /// Linux puts the event back and returns EINVAL when nothing has been read
+    /// yet, and never blocks in that case.
+    pub fn read_events(&self, buf: &mut [u8]) -> EventRead {
         let mut events = self.events.lock();
-        let ev = events.front()?;
-        if buf.len() < ev.len() {
-            return None;
+        let mut total = 0usize;
+        while let Some(len) = events.front().map(|e| e.len()) {
+            if total + len > buf.len() {
+                // A buffer that cannot hold even one whole event is the
+                // caller's error, not an empty queue.
+                if total == 0 {
+                    return EventRead::TooSmall;
+                }
+                break;
+            }
+            let ev = events.pop_front().expect("front() just returned it");
+            buf[total..total + len].copy_from_slice(&ev[..len]);
+            total += len;
         }
-        let n = ev.len();
-        buf[..n].copy_from_slice(&ev[..n]);
-        events.pop_front();
         if events.is_empty() {
             self.eventbus.lock().clear(Event::READABLE);
         }
-        Some(n)
+        if total == 0 {
+            EventRead::Empty
+        } else {
+            EventRead::Read(total)
+        }
     }
 
     fn push_event(&self, bytes: Vec<u8>) {
@@ -239,6 +258,18 @@ impl DrmFileState {
         events.push_back(bytes);
         self.eventbus.lock().set(Event::READABLE);
     }
+}
+
+/// What one `read()` on a DRM fd found. See [`DrmFileState::read_events`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum EventRead {
+    /// Nothing queued: EAGAIN, or block until one arrives.
+    Empty,
+    /// The buffer cannot hold even the first queued event: EINVAL, as
+    /// `drm_read()` answers when it has read nothing yet.
+    TooSmall,
+    /// This many bytes of whole events were copied.
+    Read(usize),
 }
 
 impl Drop for DrmFileState {
@@ -4002,6 +4033,30 @@ pub fn get_plane(id: u32) -> Option<DrmPlane> {
 }
 
 #[cfg(test)]
+pub(super) mod test_globals {
+    extern crate std;
+
+    /// `DRM_STATE`, the GEM table, `gem_mmap` and the CRTC's current fb are
+    /// process-wide, and cargo runs a crate's tests in threads. Every test
+    /// module that touches them takes this first, so one test's framebuffers
+    /// are not another's.
+    ///
+    /// Without it the suite failed about one run in two with a different test
+    /// each time -- `crtc_fb` still holding a neighbour's framebuffer, or an
+    /// `ADDFB2` refused because a neighbour had filled the table. That reads
+    /// as a real regression and is not one, which is the worst kind of noise
+    /// to leave in a suite people are meant to trust.
+    static LOCK: self::std::sync::Mutex<()> = self::std::sync::Mutex::new(());
+
+    pub(crate) fn lock() -> self::std::sync::MutexGuard<'static, ()> {
+        // A test that panics while holding this poisons it. The poison is not
+        // a failure for the tests that follow, so step over it -- the panicking
+        // test has already been reported.
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[cfg(test)]
 mod release_tests {
     use super::*;
 
@@ -4029,6 +4084,7 @@ mod release_tests {
 
     #[test]
     fn process_exit_releases_only_that_process_buffers() {
+        let _serialised = super::test_globals::lock();
         // Distinct ids/pids so this cannot collide with another test's state.
         plant(9001, 4096, 77_001);
         plant(9002, 8192, 77_001);
@@ -4052,6 +4108,7 @@ mod release_tests {
 
     #[test]
     fn unowned_buffers_are_never_reclaimed() {
+        let _serialised = super::test_globals::lock();
         // pid 0 means "allocated with no current thread" (boot-time). A process
         // exit must never take those: pid 0 is not a real owner.
         plant(9101, 4096, 0);
@@ -4062,6 +4119,7 @@ mod release_tests {
 
     #[test]
     fn releasing_a_buffer_drops_the_framebuffer_built_on_it() {
+        let _serialised = super::test_globals::lock();
         plant(9201, 4096, 77_003);
         {
             let mut state = DRM_STATE.lock();
@@ -4091,6 +4149,7 @@ mod release_tests {
     /// the VMO) and stays scannable until RMFB, which then releases it.
     #[test]
     fn gem_close_keeps_a_framebuffer_and_its_memory_alive() {
+        let _serialised = super::test_globals::lock();
         plant(9301, 4096, 77_004);
         let vmo = handle_vmo(9301).expect("planted handle resolves to its VMO");
         {
@@ -4431,6 +4490,7 @@ mod fb_validation_tests {
     /// ADDFB2 used to accept it.
     #[test]
     fn addfb_rejects_a_pitch_that_is_not_whole_pixels() {
+        let _serialised = super::test_globals::lock();
         let (w, h) = (64u32, 4u32);
         // Generous backing so the size guard never decides these cases: what
         // is under test is the pitch alignment, nothing else.
@@ -4458,6 +4518,7 @@ mod fb_validation_tests {
     /// its backing buffer, and must be at least as wide as it claims.
     #[test]
     fn addfb_still_rejects_a_framebuffer_that_does_not_fit_its_buffer() {
+        let _serialised = super::test_globals::lock();
         plant(9402, 4096, 78_002);
         // 64x16 at 4 bytes = 4096, exactly the buffer.
         assert!(create_fb(9402, 64, 16, 256).is_some());
@@ -4686,6 +4747,7 @@ mod ce_staging_tests {
     /// the next test) rather than clobbering real columns.
     #[test]
     fn the_row_tail_the_copy_engine_carries_is_never_left_stale() {
+        let _serialised = super::test_globals::lock();
         const PITCH: usize = 64; // 16 pixels per destination row
         const H: u32 = 4;
         // Frame 1 fills whole rows: 16 pixels of 4 bytes = the full pitch.
@@ -4735,6 +4797,7 @@ mod ce_staging_tests {
     /// on-screen columns the frame says nothing about.
     #[test]
     fn a_repack_that_cannot_cover_the_visible_width_is_declined() {
+        let _serialised = super::test_globals::lock();
         const PITCH: usize = 64;
         let src = numbered(0xCCC0_0000, 8, 4);
         // 8 pixels of source, but 12 pixels (48 bytes) of the row are visible.
@@ -4802,6 +4865,7 @@ mod nouveau_fb_lifetime_tests {
     /// RM free, so an absent entry is what "the memory is gone" means here.
     #[test]
     fn closing_a_nouveau_handle_retires_the_framebuffer_over_it() {
+        let _serialised = super::test_globals::lock();
         let handle = gem_mmap::DRIVER_HANDLE_BASE + 0x55;
         plant_nouveau_fb(9501, handle, 0);
         assert!(fb_exists(9501));
@@ -4833,6 +4897,7 @@ mod nouveau_fb_lifetime_tests {
     /// storm, at frame rate.
     #[test]
     fn a_close_that_is_not_the_last_reference_leaves_the_framebuffer_alone() {
+        let _serialised = super::test_globals::lock();
         let handle = gem_mmap::DRIVER_HANDLE_BASE + 0x56;
         plant_nouveau_fb(9505, handle, 0);
         // Still registered: other references remain, so the memory is alive.
@@ -4863,6 +4928,7 @@ mod nouveau_fb_lifetime_tests {
     /// This helper must therefore refuse to touch a low-range handle at all.
     #[test]
     fn a_dumb_buffer_framebuffer_is_never_retired_by_this_path() {
+        let _serialised = super::test_globals::lock();
         let mut state = DRM_STATE.lock();
         state.framebuffers.push(DrmFramebuffer {
             id: 9502,
@@ -4889,6 +4955,7 @@ mod nouveau_fb_lifetime_tests {
     /// memory underneath it.
     #[test]
     fn a_process_exit_retires_the_nouveau_framebuffers_that_process_held() {
+        let _serialised = super::test_globals::lock();
         let mine = gem_mmap::DRIVER_HANDLE_BASE + 0x66;
         let theirs = gem_mmap::DRIVER_HANDLE_BASE + 0x67;
         plant_nouveau_fb(9503, mine, 78_101);
@@ -4956,6 +5023,7 @@ mod present_error_tests {
     /// its scanout path.
     #[test]
     fn an_unknown_fb_id_is_reported_as_no_such_fb() {
+        let _serialised = super::test_globals::lock();
         drop_fb(9601);
         assert_eq!(
             scanout_region_checked(9601, None),
@@ -4974,6 +5042,7 @@ mod present_error_tests {
     /// here would send the reader looking at the wrong half of the system.
     #[test]
     fn a_framebuffer_with_no_backing_is_reported_as_no_backing() {
+        let _serialised = super::test_globals::lock();
         plant_fb(9602, 0, 4096);
         assert_eq!(
             scanout_region_checked(9602, None),
@@ -4992,6 +5061,7 @@ mod present_error_tests {
     /// exactly as they did — the reason is additive, not a change of contract.
     #[test]
     fn the_bool_wrappers_still_report_failure_the_old_way() {
+        let _serialised = super::test_globals::lock();
         drop_fb(9603);
         assert!(!scanout_region(9603, None));
         assert!(!present_now(9603, 1));
@@ -5006,6 +5076,7 @@ mod present_error_tests {
     /// has to say which one the compositor hit.
     #[test]
     fn a_retired_fb_id_remembers_what_took_it() {
+        let _serialised = super::test_globals::lock();
         let handle = zcore_drivers::scheme::gem_mmap::DRIVER_HANDLE_BASE + 0x71;
         zcore_drivers::scheme::gem_mmap::register(handle, 0x2_0000, 4096, 0);
         {
@@ -5042,6 +5113,7 @@ mod present_error_tests {
     /// with it.
     #[test]
     fn the_retirement_history_is_bounded() {
+        let _serialised = super::test_globals::lock();
         for i in 0..(FB_RETIRE_HISTORY as u32 * 4) {
             plant_fb(9700 + i, 0x3_0000, 4096);
             assert!(rmfb(9700 + i));
@@ -5057,6 +5129,7 @@ mod present_error_tests {
     /// and what a bug report gets grepped for.
     #[test]
     fn every_reason_has_its_own_console_text() {
+        let _serialised = super::test_globals::lock();
         let all = [
             PresentError::NoSuchFb,
             PresentError::NoDisplay,
@@ -5110,6 +5183,7 @@ mod nouveau_fb_gem_reference_tests {
     /// because the framebuffer holds one.
     #[test]
     fn addfb2_then_gem_close_leaves_the_framebuffer_backed() {
+        let _serialised = super::test_globals::lock();
         let handle = gem_mmap::DRIVER_HANDLE_BASE + 0x81;
         gem_new(handle, CLIENT);
 
@@ -5149,6 +5223,7 @@ mod nouveau_fb_gem_reference_tests {
     /// out is freed under the compositor.
     #[test]
     fn the_framebuffers_reference_belongs_to_no_process() {
+        let _serialised = super::test_globals::lock();
         let handle = gem_mmap::DRIVER_HANDLE_BASE + 0x82;
         gem_new(handle, CLIENT);
         let fb_id = create_fb(handle, 1, 1, 4).expect("ADDFB2 over a nouveau GEM object");
@@ -5170,6 +5245,7 @@ mod nouveau_fb_gem_reference_tests {
     /// modifier/format it tests a buffer with.
     #[test]
     fn each_framebuffer_takes_its_own_reference() {
+        let _serialised = super::test_globals::lock();
         let handle = gem_mmap::DRIVER_HANDLE_BASE + 0x83;
         gem_new(handle, CLIENT);
         let a = create_fb(handle, 1, 1, 4).expect("first ADDFB2");
@@ -5195,6 +5271,7 @@ mod nouveau_fb_gem_reference_tests {
     /// owns that half of the contract.
     #[test]
     fn a_dumb_buffer_framebuffer_takes_no_gem_reference() {
+        let _serialised = super::test_globals::lock();
         let low = 4242; // below DRIVER_HANDLE_BASE: a CREATE_DUMB handle
         assert!(gem_mmap::lookup(low).is_none());
         fb_take_gem_ref(low);
@@ -5203,5 +5280,60 @@ mod nouveau_fb_gem_reference_tests {
             "a dumb handle must never appear in the nouveau table",
         );
         fb_drop_gem_ref(low); // and dropping one that was never taken is safe
+    }
+}
+
+/// `drm_read()` semantics for the DRM event queue: as many whole events as
+/// fit, and a buffer too small for the first one is the caller's error, not an
+/// empty queue.
+#[cfg(test)]
+mod drm_event_read_tests {
+    use super::*;
+
+    fn event(tag: u8, len: usize) -> Vec<u8> {
+        alloc::vec![tag; len]
+    }
+
+    /// The livelock. A short read left the event queued with `READABLE` still
+    /// set, and answered EAGAIN -- so a blocking reader's wait resolved
+    /// immediately, it re-read, got EAGAIN again, and spun a core with no
+    /// yield point. `drm_read()` returns EINVAL there and never blocks.
+    #[test]
+    fn a_buffer_too_small_for_the_first_event_is_distinguishable_from_empty() {
+        let file = DrmFileState::new();
+        let mut buf = [0u8; 8];
+        assert_eq!(file.read_events(&mut buf), EventRead::Empty);
+
+        file.push_event(event(0xAB, 32));
+        assert_eq!(
+            file.read_events(&mut buf),
+            EventRead::TooSmall,
+            "a short read must not look like an empty queue"
+        );
+        // And the event is still there, unconsumed.
+        assert!(file.has_events());
+        let mut big = [0u8; 32];
+        assert_eq!(file.read_events(&mut big), EventRead::Read(32));
+        assert!(big.iter().all(|&b| b == 0xAB));
+        assert!(!file.has_events());
+    }
+
+    /// Linux fills the buffer with every whole event that fits, not just one.
+    #[test]
+    fn one_read_drains_as_many_whole_events_as_fit() {
+        let file = DrmFileState::new();
+        file.push_event(event(1, 32));
+        file.push_event(event(2, 32));
+        file.push_event(event(3, 32));
+
+        // Room for two and a half: two come back, the third stays queued.
+        let mut buf = [0u8; 80];
+        assert_eq!(file.read_events(&mut buf), EventRead::Read(64));
+        assert!(buf[..32].iter().all(|&b| b == 1));
+        assert!(buf[32..64].iter().all(|&b| b == 2));
+        assert!(file.has_events());
+
+        assert_eq!(file.read_events(&mut buf), EventRead::Read(32));
+        assert_eq!(file.read_events(&mut buf), EventRead::Empty);
     }
 }

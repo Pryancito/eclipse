@@ -60,26 +60,45 @@ fn deliver(ev: &Arc<dyn FileLike>) {
 /// `wait_available` uses the last-submitted point (in-flight EXEC fences).
 pub fn register(handle: u32, point: u64, ev: Arc<dyn FileLike>, wait_available: bool) {
     let target = point.max(1);
-    let cur = if wait_available {
-        zcore_drivers::scheme::syncobj::query_submitted(handle)
-    } else {
-        zcore_drivers::scheme::syncobj::query(handle)
-    };
-    if let Some(cur) = cur {
-        if cur >= target {
-            deliver(&ev);
-            return;
-        }
-    }
-    {
+    // The check and the insertion happen under ONE hold of `WAITERS`, which is
+    // what makes them atomic against `on_syncobj_signaled`. Reading the point
+    // first and taking the lock afterwards left a window: a signal landing in
+    // it ran the hook against a registry that did not yet hold this waiter, and
+    // the waiter was then inserted with a target already reached. Nothing
+    // re-checks it -- `arm_poller` only fires while a hardware fence is
+    // pending, and an explicit SIGNAL leaves none -- so the eventfd was never
+    // written and the compositor's frame never completed. Linux closes the same
+    // window by adding the callback and fetching the fence under `syncobj->lock`
+    // (`drm_syncobj_add_callback_locked`).
+    //
+    // Lock order is WAITERS then the syncobj TABLE (via `query`), the same way
+    // round as the hook; the delivery is done with the lock released, because
+    // writing an eventfd takes the eventbus lock and holding two across a wake
+    // is how this codebase has deadlocked before.
+    let already_reached = {
         let mut waiters = WAITERS.lock();
-        waiters.push(Waiter {
-            handle,
-            point: target,
-            wait_available,
-            ev,
-        });
-        WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
+        let cur = if wait_available {
+            zcore_drivers::scheme::syncobj::query_submitted(handle)
+        } else {
+            zcore_drivers::scheme::syncobj::query(handle)
+        };
+        match cur {
+            Some(cur) if cur >= target => true,
+            _ => {
+                waiters.push(Waiter {
+                    handle,
+                    point: target,
+                    wait_available,
+                    ev: ev.clone(),
+                });
+                WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
+                false
+            }
+        }
+    };
+    if already_reached {
+        deliver(&ev);
+        return;
     }
     arm_poller();
 }

@@ -3923,9 +3923,13 @@ impl INode for DrmDev {
         // Deliver queued DRM events (page-flip completions). When none are
         // pending report `Again` so a non-blocking reader gets EAGAIN and an
         // epoll/poll waiter re-checks on the next tick.
-        match self.file.read_event(buf) {
-            Some(n) => Ok(n),
-            None => Err(FsError::Again),
+        match self.file.read_events(buf) {
+            drm::EventRead::Read(n) => Ok(n),
+            drm::EventRead::Empty => Err(FsError::Again),
+            // EINVAL, like `drm_read()` with nothing read yet. EAGAIN here was
+            // a livelock: the queue is non-empty, so READABLE stays set and a
+            // blocking reader's wait resolves instantly, over and over.
+            drm::EventRead::TooSmall => Err(FsError::InvalidParam),
         }
     }
 
