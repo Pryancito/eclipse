@@ -60,13 +60,12 @@ impl DmaBuf {
         size: usize,
         vmo: Arc<VmObject>,
     ) -> Arc<Self> {
-        let nouveau_handle =
-            if gem_handle >= zcore_drivers::scheme::gem_mmap::DRIVER_HANDLE_BASE {
-                super::devfs::drm::dmabuf_take_gem_ref(gem_handle);
-                Some(gem_handle)
-            } else {
-                None
-            };
+        let nouveau_handle = if gem_handle >= zcore_drivers::scheme::gem_mmap::DRIVER_HANDLE_BASE {
+            super::devfs::drm::dmabuf_take_gem_ref(gem_handle);
+            Some(gem_handle)
+        } else {
+            None
+        };
         Arc::new(Self {
             base: KObjectBase::new(),
             phys_addr,
