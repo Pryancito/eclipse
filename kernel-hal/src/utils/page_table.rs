@@ -101,6 +101,74 @@ impl<L: PageTableLevel, PTE: GenericPTE> PageTableImpl<L, PTE> {
         Ok((p1e, PageSize::Size4K))
     }
 
+    /// Replace the huge leaf that describes `vaddr` with a table of
+    /// next-smaller leaves covering exactly the same physical range with the
+    /// same flags, repeating until `vaddr` is described by a 4 KiB entry.
+    /// A no-op when it already is.
+    ///
+    /// This exists for [`crate::stack_guard`], which has to take a single page
+    /// away from a region the kernel mapped with huge pages, and cannot
+    /// allocate: it runs inside `Executor::new` with the scheduler's runtime
+    /// lock held. So the frames for the new tables come from `alloc`, which
+    /// must hand out zeroed frames that are **never freed** — a table reached
+    /// from the page-table root outlives any `PageTableImpl` value, and this
+    /// method deliberately does not push them onto `intrm_tables` (`self` is
+    /// typically a borrowed `from_current()` view whose vector dies at the end
+    /// of the statement, which would free a live page table).
+    ///
+    /// The caller flushes the TLB — every CPU's, for a kernel mapping — before
+    /// relying on the finer entries.
+    ///
+    /// On a 3-level page table (Sv39) the 1 GiB leaves *are* top-level entries,
+    /// and `pt_clone_kernel_space` copies those by value: splitting one after
+    /// an address space has been cloned would be invisible to that clone. The
+    /// architecture's kernel page table is responsible for not leaving a
+    /// top-level leaf anywhere this is used — see the kernel heap window in
+    /// `bare::arch::riscv::vm::init_kernel_page_table`.
+    pub fn split_huge_page(
+        &mut self,
+        vaddr: VirtAddr,
+        mut alloc: impl FnMut() -> Option<PhysAddr>,
+    ) -> PagingResult {
+        // 1 GiB -> 2 MiB -> 4 KiB: two steps at most, and each one strictly
+        // shrinks the entry, so the bound is a fact rather than a guess.
+        for _ in 0..2 {
+            let (entry, size) = self.get_entry_mut(vaddr)?;
+            let child = match size {
+                PageSize::Size4K => return Ok(()),
+                PageSize::Size2M => PageSize::Size4K,
+                PageSize::Size1G => PageSize::Size2M,
+            };
+            if entry.is_unused() {
+                return Err(PagingError::NotMapped);
+            }
+            let base = entry.addr();
+            let flags = entry.flags();
+            // Allocated before the parent is touched: running out of frames
+            // must leave the mapping exactly as it was.
+            let table_paddr = alloc().ok_or(PagingError::NoMemory)?;
+            let table = table_of_mut::<PTE>(table_paddr);
+            for (i, e) in table.iter_mut().enumerate() {
+                // Built from zero rather than copied from the parent: on
+                // x86_64 a leaf carries its level in the entry itself (the PS
+                // bit, and the PAT bit that moves with it), so only
+                // `set_flags` knows how to spell "same flags, one level down".
+                e.clear();
+                e.set_addr(base + i * child as usize);
+                e.set_flags(flags, child != PageSize::Size4K);
+            }
+            // The 512 stores above have to reach memory before the pointer to
+            // them does: the frame was zeroed when it was reserved, so another
+            // CPU's page-table walker that saw the pointer early would read
+            // "not present" for memory that is mapped.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            // The one store that publishes the split. Until it lands every CPU
+            // walks the old leaf, which describes the same memory.
+            entry.set_table(table_paddr);
+        }
+        Ok(())
+    }
+
     fn get_entry_mut_or_create(&mut self, page: Page) -> PagingResult<&mut PTE> {
         let vaddr = page.vaddr;
         let p3 = if L::LEVEL == 3 {
