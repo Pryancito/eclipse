@@ -32,7 +32,15 @@
 #include <time.h>
 
 /* ---- the slice of the SDL ABI we use (same numbers in SDL2 and SDL3) ---- */
+/* Subsystem bits. Same values in SDL2 and SDL3 except GAMEPAD/GAMECONTROLLER,
+ * which moved; we only step through the ones GZDoom asks SDL_Init for. */
+#define SDL_INIT_TIMER 0x00000001u
+#define SDL_INIT_AUDIO 0x00000010u
 #define SDL_INIT_VIDEO 0x00000020u
+#define SDL_INIT_JOYSTICK 0x00000200u
+#define SDL_INIT_HAPTIC 0x00001000u
+#define SDL_INIT_GAMECONTROLLER 0x00002000u
+#define SDL_INIT_EVENTS 0x00004000u
 #define SDL_WINDOW_RESIZABLE 0x00000020u
 #define SDL2_WINDOWPOS_UNDEFINED 0x1FFF0000
 #define EV_QUIT 0x100u
@@ -67,6 +75,8 @@ struct api {
     int (*UpdateWindowSurface)(void *);
     int (*GetWindowSizeInPixels)(void *, int *, int *); /* optional */
     /* SDL2 shape */
+    int (*InitSubSystem)(uint32_t);    /* same name in SDL2 and SDL3 */
+    void (*QuitSubSystem)(uint32_t);
     int (*Init2)(uint32_t);
     void (*GetVersion2)(sdl2_version *);
     void *(*CreateWindow2)(const char *, int, int, int, int, uint32_t);
@@ -110,6 +120,8 @@ static void load(struct api *a, int is3) {
     printf("SDLPROBE: library %s\n", soname);
     S(GetError, "SDL_GetError", 1);
     S(Quit, "SDL_Quit", 1);
+    S(InitSubSystem, "SDL_InitSubSystem", 0);
+    S(QuitSubSystem, "SDL_QuitSubSystem", 0);
     S(GetCurrentVideoDriver, "SDL_GetCurrentVideoDriver", 1);
     S(GetNumVideoDrivers, "SDL_GetNumVideoDrivers", 1);
     S(GetVideoDriver, "SDL_GetVideoDriver", 1);
@@ -184,22 +196,76 @@ static int drain_events(const struct api *a) {
 }
 
 static void usage(void) {
-    puts("usage: eclipse-sdl-probe [--sdl3] [--surface] [--frames N | --hold] [--size WxH]\n"
+    puts("usage: eclipse-sdl-probe [--sdl3] [--surface] [--steps] [--frames N | --hold] [--size WxH]\n"
          "  --sdl3     probe libSDL3.so.0 instead of libSDL2-2.0.so.0\n"
          "  --surface  draw through SDL_GetWindowSurface/UpdateWindowSurface\n"
          "             (the path SDL_FRAMEBUFFER_ACCELERATION controls) instead\n"
          "             of an SDL_Renderer (the path SDL_RENDER_DRIVER controls)\n"
+         "  --steps    init one subsystem at a time (TIMER, EVENTS, VIDEO, AUDIO,\n"
+         "             JOYSTICK, GAMECONTROLLER) announcing each before it runs,\n"
+         "             so a hang inside SDL_Init says which subsystem hung\n"
          "  --frames N stop after N frames (default 300; 0 = until closed)\n"
          "  --hold     same as --frames 0: keep running, stats every 300 frames,\n"
          "             close the window or press a key to quit\n"
          "  --size WxH window size (default 640x400)");
 }
 
+/* Step through SDL_Init one subsystem at a time, announcing each BEFORE it
+ * runs and with the line already flushed.
+ *
+ * GZDoom calls SDL_Init with several subsystems at once and prints nothing
+ * between its version banner and that call, so a hang inside it looks like a
+ * program that stopped for no reason -- which is exactly what Freedoom does on
+ * Eclipse: the banner, then nothing. One combined call cannot say WHICH
+ * subsystem blocked; these separate ones can, because the last "starting" line
+ * with no "ok" after it names the culprit.
+ *
+ * The plain probe only ever did SDL_INIT_VIDEO, so it kept passing while
+ * GZDoom hung. */
+static int steps(struct api *a) {
+    static const struct { const char *name; uint32_t bit; } sub[] = {
+        {"TIMER", SDL_INIT_TIMER},
+        {"EVENTS", SDL_INIT_EVENTS},
+        {"VIDEO", SDL_INIT_VIDEO},
+        {"AUDIO", SDL_INIT_AUDIO},
+        {"JOYSTICK", SDL_INIT_JOYSTICK},
+        {"GAMECONTROLLER", SDL_INIT_GAMECONTROLLER},
+    };
+    if (!a->InitSubSystem) {
+        fprintf(stderr, "SDLPROBE: FAIL no SDL_InitSubSystem in this library\n");
+        return 1;
+    }
+    int failed = 0;
+    for (unsigned i = 0; i < sizeof sub / sizeof sub[0]; i++) {
+        printf("SDLPROBE: step %s starting\n", sub[i].name);
+        fflush(stdout);
+        int rc = a->InitSubSystem(sub[i].bit);
+        if (ok(a, rc)) {
+            printf("SDLPROBE: step %s ok\n", sub[i].name);
+        } else {
+            /* A subsystem that REFUSES is a fact, not a hang: keep going, the
+             * one we are hunting never comes back at all. */
+            printf("SDLPROBE: step %s failed: %s\n", sub[i].name, a->GetError());
+            failed = 1;
+        }
+        fflush(stdout);
+    }
+    const char *vd = a->GetCurrentVideoDriver();
+    printf("SDLPROBE: video driver in use: %s\n", vd ? vd : "(none)");
+    a->Quit();
+    printf("SDLPROBE: step SDL_Quit ok\n");
+    return failed;
+}
+
 int main(int argc, char **argv) {
-    int is3 = 0, surface = 0, w = 640, h = 400;
+    int is3 = 0, surface = 0, w = 640, h = 400, stepwise = 0;
     long frames = 300;
+    /* Unbuffered: when the point of a run is to find where it stops, a line
+     * still sitting in the stdio buffer is a line that never existed. */
+    setvbuf(stdout, NULL, _IONBF, 0);
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--sdl3")) is3 = 1;
+        else if (!strcmp(argv[i], "--steps")) stepwise = 1;
         else if (!strcmp(argv[i], "--surface")) surface = 1;
         else if (!strcmp(argv[i], "--hold")) frames = 0;
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = atol(argv[++i]);
@@ -220,6 +286,8 @@ int main(int argc, char **argv) {
         a->GetVersion2(&v);
         printf("SDLPROBE: version %d.%d.%d\n", v.major, v.minor, v.patch);
     }
+
+    if (stepwise) return steps(a);
 
     int nvid = a->GetNumVideoDrivers();
     printf("SDLPROBE: video drivers compiled in:");

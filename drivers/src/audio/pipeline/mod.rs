@@ -1,0 +1,21 @@
+//! Audio processing components, modelled on Sound Open Firmware.
+//!
+//! SOF (<https://github.com/thesofproject/sof>) runs audio through a
+//! pipeline of small components -- host buffer, volume, sample-rate
+//! converter, mixer, DAI -- each with a fixed-point contract and a
+//! per-period `copy()`. Eclipse has no audio DSP to run that firmware on, so
+//! the components that matter for playback quality are re-done here, in the
+//! kernel, with the same numerics:
+//!
+//! * [`volume`]: Q8.16 gain with a linear ramp, rounded multiply, and a
+//!   pass-through fast path at 0 dB (`src/audio/volume` in SOF).
+//!
+//! The HDA driver's DAI-side behaviour (keep the engine running over silence
+//! when the host has nothing, rather than stopping and restarting the link)
+//! follows `src/audio/dai-zephyr.c` and lives in `hda.rs`, since it is
+//! bound to the ring.
+//!
+//! Everything here is pure: no device access, no allocation on the hot
+//! path, and every function is exercised by unit tests without hardware.
+
+pub mod volume;

@@ -226,7 +226,7 @@ impl ShadowFramebuffer {
             let Some(mut g) = self.lock_inner() else {
                 return;
             };
-            self.take_dirty(&mut g)
+            self.take_dirty(&mut g, display.fb_write_combining())
         };
         let Some(((x, y, w, h), pixels)) = snap else {
             return;
@@ -275,13 +275,21 @@ impl ShadowFramebuffer {
             let Some(mut g) = self.lock_inner() else {
                 return;
             };
+            // Only a write-combining aperture gains anything from the
+            // widening; on a write-back one it is pure extra bytes -- see
+            // [`Self::wc_expand_x`].
+            let wc = display.fb_write_combining();
             // 1. The dirty content region.
-            let dirty = self.take_dirty(&mut g);
+            let dirty = self.take_dirty(&mut g, wc);
             // Widen a cell blit to whole write-combining lines, keeping any
             // inversion on the cell's own columns.
             let cell_blit = |rect: DirtyRect, invert: bool| {
                 let (x, y, w, h) = rect;
-                let (x0, x1) = Self::wc_expand_x(x, x + w, self.width);
+                let (x0, x1) = if wc {
+                    Self::wc_expand_x(x, x + w, self.width)
+                } else {
+                    (x, x + w)
+                };
                 let window = if invert { x..x + w } else { 0..0 };
                 let wide = (x0, y, x1 - x0, h);
                 (wide, Self::cell_pixels(&g.data, self.width, wide, window))
@@ -315,7 +323,12 @@ impl ShadowFramebuffer {
     /// cell is 9 px = 36 bytes wide, so column *c* starts at byte `36 * c`,
     /// which is a multiple of 64 only every sixteenth column: virtually every
     /// console blit degenerated into scalar head and tail stores in
-    /// `nt_store_row`. Rounding the left edge down fixes that unconditionally.
+    /// `nt_store_row`. Rounding the left edge down fixes that.
+    ///
+    /// Applied only when the destination really is write-combining: on a
+    /// write-back framebuffer (QEMU's virtio-gpu, and every host test that does
+    /// not say otherwise) there are no combine buffers to align to, so the extra
+    /// columns would be bytes spent for nothing.
     ///
     /// `limit` is the shadow's own width, since unlike the DRM path there is no
     /// off-screen padding here to park a right-edge tail in -- so the right edge
@@ -332,11 +345,12 @@ impl ShadowFramebuffer {
         (lo, hi.max(x1))
     }
 
-    /// Take the dirty rectangle, clamped to the screen and widened to whole
-    /// write-combining lines, as `((x, y, w, h), pixels)` with the rows tightly
-    /// packed (`w` pixels per row). `None` when nothing is dirty. Must be called
-    /// with the shadow lock held.
-    fn take_dirty(&self, g: &mut ShadowInner) -> Option<(DirtyRect, Vec<u32>)> {
+    /// Take the dirty rectangle, clamped to the screen and -- when `wc` says the
+    /// destination aperture is write-combining -- widened to whole write-combining
+    /// lines, as `((x, y, w, h), pixels)` with the rows tightly packed (`w` pixels
+    /// per row). `None` when nothing is dirty. Must be called with the shadow lock
+    /// held.
+    fn take_dirty(&self, g: &mut ShadowInner, wc: bool) -> Option<(DirtyRect, Vec<u32>)> {
         let (x0, y0, x1, y1) = g.dirty.take()?;
         let x0 = x0.min(self.width);
         let y0 = y0.min(self.height);
@@ -345,7 +359,11 @@ impl ShadowFramebuffer {
         if x0 >= x1 || y0 >= y1 {
             return None;
         }
-        let (x0, x1) = Self::wc_expand_x(x0, x1, self.width);
+        let (x0, x1) = if wc {
+            Self::wc_expand_x(x0, x1, self.width)
+        } else {
+            (x0, x1)
+        };
         let (w, h) = (x1 - x0, y1 - y0);
         let mut pixels = Vec::with_capacity(w * h);
         for r in y0..y1 {
@@ -382,6 +400,282 @@ impl ShadowFramebuffer {
             }));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Host tests for the console's dirty-region tracking.
+    //!
+    //! Nothing here needs a GPU: the device side is a recorder that keeps
+    //! every `(x, y, w, h)` it was handed together with the pixels. That is
+    //! the contract worth pinning down, because both ways of breaking it are
+    //! silent on a developer's QEMU and obvious on a real screen — a dirty
+    //! rectangle that is too small leaves stale pixels behind (the "visual
+    //! corruption" class), and one that is too large turns a one-cell cursor
+    //! blink into a full-screen blit through the BAR aperture.
+
+    use super::*;
+    use crate::scheme::display::{ColorFormat, DisplayInfo, FrameBuffer};
+    use crate::scheme::Scheme;
+    use lock::Mutex as IrqMutex;
+
+    /// A display that records what it was asked to blit instead of drawing.
+    struct Recorder {
+        info: DisplayInfo,
+        blits: IrqMutex<Vec<(u32, u32, usize, u32, u32, Vec<u32>)>>,
+        mem: IrqMutex<Vec<u8>>,
+        flushes: IrqMutex<usize>,
+    }
+
+    impl Recorder {
+        fn new(width: u32, height: u32) -> Arc<Self> {
+            let size = (width * height * 4) as usize;
+            Arc::new(Self {
+                info: DisplayInfo {
+                    width,
+                    height,
+                    pitch: width * 4,
+                    format: ColorFormat::ARGB8888,
+                    fb_base_vaddr: 0,
+                    fb_size: size,
+                },
+                blits: IrqMutex::new(Vec::new()),
+                mem: IrqMutex::new(alloc::vec![0u8; size]),
+                flushes: IrqMutex::new(0),
+            })
+        }
+
+        /// The recorded blits as `(x, y, w, h)`, oldest first.
+        fn rects(&self) -> Vec<(u32, u32, u32, u32)> {
+            self.blits
+                .lock()
+                .iter()
+                .map(|(x, y, _, w, h, _)| (*x, *y, *w, *h))
+                .collect()
+        }
+
+        /// The pixels of the `n`-th recorded blit.
+        fn pixels(&self, n: usize) -> Vec<u32> {
+            self.blits.lock()[n].5.clone()
+        }
+
+        fn clear_log(&self) {
+            self.blits.lock().clear();
+        }
+    }
+
+    impl Scheme for Recorder {
+        fn name(&self) -> &str {
+            "recorder"
+        }
+    }
+
+    impl DisplayScheme for Recorder {
+        fn info(&self) -> DisplayInfo {
+            self.info
+        }
+        fn fb(&self) -> FrameBuffer<'_> {
+            // SAFETY: the `Vec` is owned by `self` and outlives the view; the
+            // real backends hand out a raw aperture pointer the same way.
+            let mut m = self.mem.lock();
+            unsafe { FrameBuffer::from_raw_parts_mut(m.as_mut_ptr(), m.len()) }
+        }
+        fn blit_from(
+            &self,
+            dst_x: u32,
+            dst_y: u32,
+            src: &[u32],
+            src_stride: usize,
+            width: u32,
+            height: u32,
+        ) {
+            self.blits
+                .lock()
+                .push((dst_x, dst_y, src_stride, width, height, src.to_vec()));
+        }
+        fn need_flush(&self) -> bool {
+            true
+        }
+        fn flush(&self) -> crate::DeviceResult {
+            *self.flushes.lock() += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_clean_shadow_presents_nothing() {
+        let fb = ShadowFramebuffer::new(64, 32);
+        let dev = Recorder::new(64, 32);
+        fb.present(dev.as_ref());
+        assert!(dev.rects().is_empty());
+        assert_eq!(*dev.flushes.lock(), 0);
+    }
+
+    #[test]
+    fn put_pixels_marks_the_bounding_box_and_clips_offscreen_writes() {
+        let fb = ShadowFramebuffer::new(64, 32);
+        let dev = Recorder::new(64, 32);
+        // Two far-apart pixels plus two that fall off the screen entirely.
+        fb.put_pixels(
+            vec![
+                (2usize, 3usize, 0x11u32),
+                (5, 7, 0x22),
+                (64, 0, 0x33), // x == width
+                (0, 32, 0x44), // y == height
+            ]
+            .into_iter(),
+        );
+        fb.present(dev.as_ref());
+        // The union of (2,3) and (5,7), exclusive on the far edge. The two
+        // out-of-range pixels must not have widened it.
+        assert_eq!(dev.rects(), vec![(2, 3, 4, 5)]);
+        let px = dev.pixels(0);
+        assert_eq!(px.len(), 4 * 5);
+        // Rows are tightly packed at `w` pixels, NOT at the screen width.
+        assert_eq!(px[0], 0x11); // (2,3) is the rect's origin
+        assert_eq!(px[4 * 4 + 3], 0x22); // (5,7) is its far corner
+        assert_eq!(*dev.flushes.lock(), 1);
+    }
+
+    #[test]
+    fn a_present_consumes_the_dirty_region() {
+        let fb = ShadowFramebuffer::new(64, 32);
+        let dev = Recorder::new(64, 32);
+        fb.fill_rect(0, 0, 8, 8, 0xFF00_0000);
+        fb.present(dev.as_ref());
+        assert_eq!(dev.rects(), vec![(0, 0, 8, 8)]);
+        dev.clear_log();
+        // Nothing changed since, so the second present is a no-op.
+        fb.present(dev.as_ref());
+        assert!(dev.rects().is_empty());
+    }
+
+    #[test]
+    fn fill_rect_clamps_to_the_screen_and_ignores_empty_rects() {
+        let fb = ShadowFramebuffer::new(16, 8);
+        let dev = Recorder::new(16, 8);
+        // Straddles the right and bottom edges.
+        fb.fill_rect(12, 6, 100, 100, 0xABCD);
+        fb.present(dev.as_ref());
+        assert_eq!(dev.rects(), vec![(12, 6, 4, 2)]);
+        assert!(dev.pixels(0).iter().all(|p| *p == 0xABCD));
+
+        dev.clear_log();
+        // Wholly offscreen, and a zero-sized rect: neither dirties anything.
+        fb.fill_rect(16, 0, 4, 4, 1);
+        fb.fill_rect(0, 0, 0, 4, 1);
+        fb.present(dev.as_ref());
+        assert!(dev.rects().is_empty());
+    }
+
+    #[test]
+    fn clear_dirties_the_whole_screen() {
+        let fb = ShadowFramebuffer::new(16, 8);
+        let dev = Recorder::new(16, 8);
+        fb.clear(0x0000_00FF);
+        fb.present(dev.as_ref());
+        assert_eq!(dev.rects(), vec![(0, 0, 16, 8)]);
+        assert_eq!(dev.pixels(0).len(), 16 * 8);
+        assert!(dev.pixels(0).iter().all(|p| *p == 0x0000_00FF));
+    }
+
+    #[test]
+    fn copy_rect_scrolls_up_and_down_with_memmove_semantics() {
+        // One distinct value per row so an overlapping copy in the wrong
+        // direction shows up as a smear.
+        let fb = ShadowFramebuffer::new(4, 4);
+        let dev = Recorder::new(4, 4);
+        for y in 0..4usize {
+            fb.fill_rect(0, y, 4, 1, (y as u32) + 1);
+        }
+        fb.present(dev.as_ref());
+        dev.clear_log();
+
+        // Scroll up by one row (dy < sy): rows 1..4 move to 0..3.
+        fb.copy_rect(0, 1, 0, 0, 4, 3);
+        fb.present(dev.as_ref());
+        assert_eq!(dev.rects(), vec![(0, 0, 4, 3)]);
+        let px = dev.pixels(0);
+        assert_eq!(&px[0..4], &[2, 2, 2, 2]);
+        assert_eq!(&px[4..8], &[3, 3, 3, 3]);
+        assert_eq!(&px[8..12], &[4, 4, 4, 4]);
+
+        // Scroll back down by one row (dy > sy), overlapping the other way.
+        dev.clear_log();
+        fb.copy_rect(0, 0, 0, 1, 4, 3);
+        fb.present(dev.as_ref());
+        assert_eq!(dev.rects(), vec![(0, 1, 4, 3)]);
+        let px = dev.pixels(0);
+        assert_eq!(&px[0..4], &[2, 2, 2, 2]);
+        assert_eq!(&px[4..8], &[3, 3, 3, 3]);
+        assert_eq!(&px[8..12], &[4, 4, 4, 4]);
+    }
+
+    #[test]
+    fn copy_rect_clamps_a_rectangle_that_would_run_off_the_screen() {
+        let fb = ShadowFramebuffer::new(8, 4);
+        let dev = Recorder::new(8, 4);
+        fb.clear(0);
+        fb.present(dev.as_ref());
+        dev.clear_log();
+        // Asks for 8 columns starting at x=4: only 4 are available at either
+        // end, so the copy is trimmed rather than wrapping into the next row.
+        fb.copy_rect(4, 0, 0, 0, 8, 10);
+        fb.present(dev.as_ref());
+        assert_eq!(dev.rects(), vec![(0, 0, 4, 4)]);
+        // A copy with nothing left after clamping dirties nothing at all.
+        dev.clear_log();
+        fb.copy_rect(8, 0, 0, 0, 4, 4);
+        fb.present(dev.as_ref());
+        assert!(dev.rects().is_empty());
+    }
+
+    #[test]
+    fn the_cursor_is_drawn_inverted_and_erased_when_it_moves() {
+        let fb = ShadowFramebuffer::new(16, 8);
+        let dev = Recorder::new(16, 8);
+        fb.clear(0x0000_0000);
+        // First present: content, then the cursor cell at (0, 0).
+        fb.present_with_cursor(dev.as_ref(), Some((0, 0)), 8, 8);
+        let rects = dev.rects();
+        assert_eq!(rects, vec![(0, 0, 16, 8), (0, 0, 8, 8)]);
+        // The cursor cell is the shadow's pixels XOR-ed with 0x00FF_FFFF.
+        assert!(dev.pixels(1).iter().all(|p| *p == 0x00FF_FFFF));
+
+        // Redrawing the SAME cell with a clean shadow is idempotent: one blit,
+        // no erase, and it must look identical (the inversion is never stored
+        // in the shadow, so it cannot compound).
+        dev.clear_log();
+        fb.present_with_cursor(dev.as_ref(), Some((0, 0)), 8, 8);
+        assert_eq!(dev.rects(), vec![(0, 0, 8, 8)]);
+        assert!(dev.pixels(0).iter().all(|p| *p == 0x00FF_FFFF));
+
+        // Moving it erases the old cell (restored from the clean shadow) and
+        // draws the new one.
+        dev.clear_log();
+        fb.present_with_cursor(dev.as_ref(), Some((1, 0)), 8, 8);
+        assert_eq!(dev.rects(), vec![(0, 0, 8, 8), (8, 0, 8, 8)]);
+        assert!(dev.pixels(0).iter().all(|p| *p == 0x0000_0000)); // erase
+        assert!(dev.pixels(1).iter().all(|p| *p == 0x00FF_FFFF)); // draw
+
+        // Hiding it erases the last cell and draws nothing.
+        dev.clear_log();
+        fb.present_with_cursor(dev.as_ref(), None, 8, 8);
+        assert_eq!(dev.rects(), vec![(8, 0, 8, 8)]);
+        assert!(dev.pixels(0).iter().all(|p| *p == 0x0000_0000));
+    }
+
+    #[test]
+    fn a_cursor_cell_past_the_right_edge_is_dropped_not_clamped() {
+        let fb = ShadowFramebuffer::new(16, 8);
+        let dev = Recorder::new(16, 8);
+        fb.clear(0);
+        dev.clear_log();
+        // Column 2 of an 8px cell starts at x=16, i.e. exactly off-screen.
+        fb.present_with_cursor(dev.as_ref(), Some((2, 0)), 8, 8);
+        // Only the content rect, no cursor blit.
+        assert_eq!(dev.rects(), vec![(0, 0, 16, 8)]);
     }
 }
 

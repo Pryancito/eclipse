@@ -799,6 +799,26 @@ impl Syscall<'_> {
         proc.check_access(&metadata, 0o1, true)?;
         let vmo = inode.read_as_vmo_cached()?;
 
+        // Everything below `vmar.clear()` is past the point of no return: the
+        // caller's address space is gone by then, so a failure after it cannot
+        // be reported BACK to the caller -- the code that would receive the
+        // error is no longer mapped. Resolve the shebang interpreter chain
+        // here, while the caller is still whole, so the common failure (a
+        // script naming an interpreter that is not installed) comes back as an
+        // ordinary ENOENT and the shell reports "not found" instead of the
+        // process dying on the instruction after the syscall. Linux draws the
+        // same line: the `bprm` is fully built before `begin_new_exec` commits.
+        {
+            let mut head = [0u8; 512];
+            let n = inode.read_at(0, &mut head).unwrap_or(0);
+            LinuxElfLoader {
+                syscall_entry: self.syscall_entry,
+                stack_pages: USER_STACK_PAGES,
+                root_inode: proc.root_inode().clone(),
+            }
+            .preflight_interpreters(&head[..n])?;
+        }
+
         proc.remove_cloexec_files();
         // POSIX: caught signals are reset to their default disposition across
         // exec (SIG_IGN stays). Otherwise the child keeps inherited handler
@@ -809,7 +829,7 @@ impl Syscall<'_> {
         // Notice! About to destroy the user space of the old application, now copy the necessary information into kernel!
         let path_str = path_str.to_string();
         let vmar = self.zircon_process().vmar();
-        let (entry, sp, initial_brk, execute_path, abi) = {
+        let load = {
             // mmap_lock across the whole swap: tearing down the old image and
             // loading the new one is one layout mutation — a sibling thread's
             // concurrent fork must never clone the half-empty in-between state
@@ -824,7 +844,29 @@ impl Syscall<'_> {
             .load(&vmar, &vmo, args.clone(), envs.clone(), path_str)
             .inspect_err(|&e| {
                 error!("execve: LinuxElfLoader::load failed: {:?}", e);
-            })?
+            })
+        };
+        // Past the point of no return (see the preflight above): `vmar.clear()`
+        // has already destroyed the caller's image, so returning this error
+        // would resume a process with nothing mapped -- it faults immediately
+        // on the return address, which is the "unhandled page fault ...
+        // [unmapped] -> SIGSEGV" that followed every failed exec. Linux kills
+        // the task with SIGSEGV here rather than returning; do the same, so
+        // the parent sees a dead child instead of a live one wandering through
+        // an empty address space.
+        let (entry, sp, initial_brk, execute_path, abi) = match load {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                error!(
+                    "execve: {:?} failed AFTER the address space was replaced; \
+                     killing pid {} (it has no image left to return to)",
+                    e,
+                    self.zircon_process().id()
+                );
+                // 11 = SIGSEGV, in the "128 + signal" form a shell reports.
+                self.zircon_process().exit(139);
+                return Err(e);
+            }
         };
         // The new image may speak a different ABI than the caller (e.g. a Linux
         // shell exec'ing a FreeBSD binary); adopt the freshly-detected one.

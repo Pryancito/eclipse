@@ -3,6 +3,12 @@
 // The NVIDIA GPU driver is built on the x86_64-only `nvidia-rm-sys` shim
 // (which compiles C objects and links the RM blob for that target), so the
 // whole stack is gated to x86_64. Other arches get UEFI display only.
+// Pure decoding of the 128 bytes a monitor reports about itself. No hardware
+// and no arch gate: it is the one part of the display stack that can be run
+// and tested without a GPU, which matters because QEMU sends no EDID at all,
+// so every caller of this is dead in a VM and live on a real machine.
+pub mod edid;
+
 #[cfg(target_arch = "x86_64")]
 mod nouveau_uapi;
 #[cfg(target_arch = "x86_64")]

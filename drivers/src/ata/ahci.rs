@@ -297,6 +297,13 @@ struct AhciPort {
     ct_virt: usize,
     /// Device supports the 48-bit LBA feature set (IDENTIFY word 83 bit 10).
     lba48: bool,
+    /// Size in bytes of one device logical sector, from IDENTIFY word 106
+    /// (and words 117-118 when it says the sector is longer than 256 words).
+    /// 512 for every 512n and 512e disk; 4096 on a 4Kn one. This is the unit
+    /// the count field of a READ/WRITE DMA command is expressed in, so it
+    /// must not be confused with `SECTOR_SIZE`, the 512-byte unit the
+    /// `BlockScheme` API uses.
+    sector_bytes: usize,
     /// HBA supports 64-bit DMA addressing (CAP.S64A). When false, any DMA
     /// physical address that reaches >= 4 GiB is truncated by the controller
     /// to its low 32 bits, silently reading/writing the wrong memory. On a
@@ -518,11 +525,14 @@ impl AhciPort {
     fn rw_block(&self, lba: u64, prds: &[(u64, usize)], write: bool) -> DeviceResult {
         let slot = 0u32;
         let buf_len: usize = prds.iter().map(|p| p.1).sum();
-        let count = buf_len / SECTOR_SIZE;
+        // The FIS count field is in *device* sectors, which is not 512 bytes
+        // on a 4Kn disk. Getting this wrong asks the drive for eight times
+        // the data it should and walks off the end of the PRDT.
+        let count = buf_len / self.sector_bytes;
         if prds.is_empty()
             || prds.len() > PRDT_MAX
             || buf_len == 0
-            || !buf_len.is_multiple_of(SECTOR_SIZE)
+            || !buf_len.is_multiple_of(self.sector_bytes)
         {
             return Err(DeviceError::InvalidParam);
         }
@@ -778,8 +788,10 @@ impl AhciPort {
         }
     }
 
-    /// Returns `(sectors, lba48_supported)` from ATA IDENTIFY data.
-    fn identify(&self) -> Option<(u64, bool)> {
+    /// Returns `(sectors, lba48_supported, sector_bytes)` from ATA IDENTIFY
+    /// data. `sectors` is in *device* sectors of `sector_bytes` each, not in
+    /// the 512-byte units the `BlockScheme` API uses.
+    fn identify(&self) -> Option<(u64, bool, usize)> {
         // Wait for port to become ready (TFD BUSY/DRQ clear), max 2 seconds
         if !wait_until(TFD_TIMEOUT_US, || {
             self.read_reg(PORT_TFD) & ((ATA_DEV_BUSY | ATA_DEV_DRQ) as u32) == 0
@@ -847,6 +859,39 @@ impl AhciPort {
             | ((read_id(103) as u64) << 48);
         let lba28 = (read_id(60) as u64) | ((read_id(61) as u64) << 16);
         let lba48_supported = (read_id(83) & (1 << 10)) != 0;
+
+        // ATA/ATAPI-7 word 106, "Physical/Logical Sector Size": bit 14 set and
+        // bit 15 clear mark the word as valid; bit 12 then says the logical
+        // sector is longer than the traditional 256 words, in which case words
+        // 117-118 hold its size in words. Everything else is a 512-byte disk.
+        // We only ever believe a power-of-two size in [512, 4096]: a drive
+        // reporting anything else is more likely to be reporting garbage than
+        // to be a sector size worth supporting, and guessing wrong here
+        // mis-addresses every single transfer.
+        let word106 = read_id(106);
+        let sector_bytes = if word106 & (1 << 14) != 0 && word106 & (1 << 15) == 0 {
+            if word106 & (1 << 12) != 0 {
+                let words = (read_id(117) as usize) | ((read_id(118) as usize) << 16);
+                let bytes = words.saturating_mul(2);
+                if (SECTOR_SIZE..=4096).contains(&bytes) && bytes.is_power_of_two() {
+                    bytes
+                } else {
+                    crate::klog_warn!(
+                        "[AHCI] port {} IDENTIFY reports {} bytes per logical sector \
+                         (words 117-118 = {}); ignoring and assuming {}",
+                        self.port_idx,
+                        bytes,
+                        words,
+                        SECTOR_SIZE
+                    );
+                    SECTOR_SIZE
+                }
+            } else {
+                SECTOR_SIZE
+            }
+        } else {
+            SECTOR_SIZE
+        };
         let sectors = if (lba48_supported || lba48 > lba28) && lba48 != 0 {
             lba48
         } else {
@@ -869,8 +914,24 @@ impl AhciPort {
             drivers_dma_dealloc(paddr, 1);
         }
 
-        Some((sectors, lba48_supported))
+        if sector_bytes != SECTOR_SIZE {
+            crate::klog_warn!(
+                "[AHCI] port {} is a 4Kn-style disk: {} bytes per logical sector",
+                self.port_idx,
+                sector_bytes
+            );
+        }
+
+        Some((sectors, lba48_supported, sector_bytes))
     }
+}
+
+/// Round `len` down to a whole number of device sectors. Every command's byte
+/// count has to land on a sector boundary; callers clamp by bounce-buffer size
+/// and by the LBA28 sector cap, neither of which is a multiple of a 4Kn
+/// sector by construction.
+fn whole_sectors(len: usize, sector_bytes: usize) -> usize {
+    len - len % sector_bytes
 }
 
 /// Translate a virtually contiguous kernel buffer into physical ranges
@@ -906,7 +967,11 @@ fn build_prds(vaddr: usize, len: usize, prds: &mut [(u64, usize); PRDT_MAX]) -> 
 pub struct AhciInterface {
     name: String,
     port: Mutex<AhciPort>,
+    /// Capacity in 512-byte sectors (the `BlockScheme` unit), not in device
+    /// sectors — the two differ on a 4Kn disk.
     capacity: u64,
+    /// Device logical sector size in bytes; see `AhciPort::sector_bytes`.
+    sector_bytes: usize,
     /// Page-aligned DMA bounce buffer for callers whose buffers are not
     /// page-aligned (`BOUNCE_PAGES` contiguous pages).
     bounce_phys: usize,
@@ -1029,6 +1094,10 @@ impl AhciInterface {
                     // Assume LBA48 until IDENTIFY says otherwise; READ/WRITE DMA
                     // EXT is mandatory on every SATA device.
                     lba48: true,
+                    // Corrected by IDENTIFY below; 512 is right for all but
+                    // 4Kn disks and is the safe assumption until we have read
+                    // word 106.
+                    sector_bytes: SECTOR_SIZE,
                     supports_64bit,
                 };
 
@@ -1067,8 +1136,14 @@ impl AhciInterface {
                 let is_ata =
                     sig == HBA_SIG_ATA || (sig == 0 && port.read_reg(PORT_SSTS) & 0xF == 3);
                 if is_ata {
-                    if let Some((sectors, lba48)) = port.identify() {
+                    if let Some((sectors, lba48, sector_bytes)) = port.identify() {
                         port.lba48 = lba48;
+                        port.sector_bytes = sector_bytes;
+                        // `capacity` is in the 512-byte units the BlockScheme
+                        // API speaks, so a 4Kn disk's device sectors have to be
+                        // scaled up or the upper half of the disk disappears.
+                        let capacity_512 =
+                            sectors.saturating_mul((sector_bytes / SECTOR_SIZE) as u64);
                         if sectors == 0 {
                             crate::klog_warn!(
                                 "[AHCI] port {} reported 0 sectors after IDENTIFY; skipping device",
@@ -1079,19 +1154,21 @@ impl AhciInterface {
                             }
                             continue;
                         }
-                        if sectors >= 2097152 {
+                        if capacity_512 >= 2097152 {
                             warn!(
-                                "ahci{}: SATA disk attached, {} sectors ({} GiB)",
+                                "ahci{}: SATA disk attached, {} sectors of {}B ({} GiB)",
                                 i,
                                 sectors,
-                                sectors / 2097152
+                                sector_bytes,
+                                capacity_512 / 2097152
                             );
                         } else {
                             warn!(
-                                "ahci{}: SATA disk attached, {} sectors ({} MiB)",
+                                "ahci{}: SATA disk attached, {} sectors of {}B ({} MiB)",
                                 i,
                                 sectors,
-                                sectors / 2048
+                                sector_bytes,
+                                capacity_512 / 2048
                             );
                         }
                         let bounce_phys = unsafe { drivers_dma_alloc(BOUNCE_PAGES) };
@@ -1128,7 +1205,8 @@ impl AhciInterface {
                         disks.push(Self {
                             name: format!("ahci-{}", i),
                             port: Mutex::new(port),
-                            capacity: sectors,
+                            capacity: capacity_512,
+                            sector_bytes,
                             bounce_phys,
                             bounce_virt: phys_to_virt(bounce_phys),
                             bounce_len: BOUNCE_PAGES * 4096,
@@ -1170,27 +1248,54 @@ impl AhciInterface {
         }
     }
 
-    /// Largest chunk a single command may move on this device.
+    /// Largest chunk a single command may move on this device, in bytes and
+    /// always a whole number of *device* sectors. The LBA28 cap is a sector
+    /// count, so on a 4Kn disk it is worth eight times as many bytes.
     fn max_chunk(&self, lba48: bool, path_max: usize) -> usize {
-        if lba48 {
+        let cap = if lba48 {
             path_max
         } else {
-            path_max.min(LBA28_MAX_SECTORS * SECTOR_SIZE)
-        }
+            path_max.min(LBA28_MAX_SECTORS * self.sector_bytes)
+        };
+        cap - cap % self.sector_bytes
     }
 }
 
 impl BlockScheme for AhciInterface {
-    // `block_id` indexes 512-byte sectors; `buf.len()` may be any multiple
-    // of 512 and is transferred in as few commands as possible.
+    // `block_id` indexes 512-byte sectors; `buf.len()` may be any multiple of
+    // 512 and is transferred in as few commands as possible. A 4Kn disk cannot
+    // address anything smaller than its own 4096-byte sector, so a request
+    // that begins or ends inside one is completed by read-modify-write through
+    // the bounce buffer, exactly as the NVMe driver does for a large LBA.
     fn read_block(&self, block_id: usize, read_buf: &mut [u8]) -> DeviceResult {
         self.check_request(block_id, read_buf.len())?;
         let port = self.port.lock();
-        let mut lba = block_id as u64;
-        let mut offset = 0usize;
-        while offset < read_buf.len() {
-            let remaining = read_buf.len() - offset;
-            let ptr = unsafe { read_buf.as_ptr().add(offset) } as usize;
+        let sector_bytes = self.sector_bytes;
+        let mut byte_addr = block_id * SECTOR_SIZE;
+        let mut done = 0usize;
+        while done < read_buf.len() {
+            let remaining = read_buf.len() - done;
+            let lba = (byte_addr / sector_bytes) as u64;
+            let off = byte_addr % sector_bytes;
+
+            if off != 0 || remaining < sector_bytes {
+                // Partial device sector: pull the whole sector in and copy out
+                // the slice the caller asked for.
+                let take = remaining.min(sector_bytes - off);
+                port.rw_block(lba, &[(self.bounce_phys as u64, sector_bytes)], false)?;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (self.bounce_virt + off) as *const u8,
+                        read_buf.as_mut_ptr().add(done),
+                        take,
+                    );
+                }
+                done += take;
+                byte_addr += take;
+                continue;
+            }
+
+            let ptr = unsafe { read_buf.as_ptr().add(done) } as usize;
             let mut prds = [(0u64, 0usize); PRDT_MAX];
             let mut chunk = 0usize;
             // Zero-copy DMA straight into the caller's buffer is unvalidated (no
@@ -1200,25 +1305,31 @@ impl BlockScheme for AhciInterface {
             // but don't flip this back on via a future merge without one.
             if ptr.is_multiple_of(4096) && false {
                 // Zero-copy: DMA straight into the caller's buffer, page by page.
-                let want = remaining.min(self.max_chunk(port.lba48, DIRECT_MAX_BYTES));
+                let want = whole_sectors(
+                    remaining.min(self.max_chunk(port.lba48, DIRECT_MAX_BYTES)),
+                    sector_bytes,
+                );
                 if let Some(n) = build_prds(ptr, want, &mut prds) {
                     port.rw_block(lba, &prds[..n], false)?;
                     chunk = want;
                 }
             }
             if chunk == 0 {
-                chunk = remaining.min(self.max_chunk(port.lba48, self.bounce_len));
+                chunk = whole_sectors(
+                    remaining.min(self.max_chunk(port.lba48, self.bounce_len)),
+                    sector_bytes,
+                );
                 port.rw_block(lba, &[(self.bounce_phys as u64, chunk)], false)?;
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         self.bounce_virt as *const u8,
-                        read_buf.as_mut_ptr().add(offset),
+                        read_buf.as_mut_ptr().add(done),
                         chunk,
                     );
                 }
             }
-            offset += chunk;
-            lba += (chunk / SECTOR_SIZE) as u64;
+            done += chunk;
+            byte_addr += chunk;
         }
         Ok(())
     }
@@ -1226,34 +1337,63 @@ impl BlockScheme for AhciInterface {
     fn write_block(&self, block_id: usize, write_buf: &[u8]) -> DeviceResult {
         self.check_request(block_id, write_buf.len())?;
         let port = self.port.lock();
-        let mut lba = block_id as u64;
-        let mut offset = 0usize;
-        while offset < write_buf.len() {
-            let remaining = write_buf.len() - offset;
-            let ptr = unsafe { write_buf.as_ptr().add(offset) } as usize;
+        let sector_bytes = self.sector_bytes;
+        let mut byte_addr = block_id * SECTOR_SIZE;
+        let mut done = 0usize;
+        while done < write_buf.len() {
+            let remaining = write_buf.len() - done;
+            let lba = (byte_addr / sector_bytes) as u64;
+            let off = byte_addr % sector_bytes;
+
+            if off != 0 || remaining < sector_bytes {
+                // Partial device-sector update: read-modify-write. Writing the
+                // sector without reading it first would zero the bytes either
+                // side of the caller's range.
+                let take = remaining.min(sector_bytes - off);
+                port.rw_block(lba, &[(self.bounce_phys as u64, sector_bytes)], false)?;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        write_buf.as_ptr().add(done),
+                        (self.bounce_virt + off) as *mut u8,
+                        take,
+                    );
+                }
+                port.rw_block(lba, &[(self.bounce_phys as u64, sector_bytes)], true)?;
+                done += take;
+                byte_addr += take;
+                continue;
+            }
+
+            let ptr = unsafe { write_buf.as_ptr().add(done) } as usize;
             let mut prds = [(0u64, 0usize); PRDT_MAX];
             let mut chunk = 0usize;
             // See read_block above: zero-copy DMA is unvalidated, kept off deliberately.
             if ptr.is_multiple_of(4096) && false {
-                let want = remaining.min(self.max_chunk(port.lba48, DIRECT_MAX_BYTES));
+                let want = whole_sectors(
+                    remaining.min(self.max_chunk(port.lba48, DIRECT_MAX_BYTES)),
+                    sector_bytes,
+                );
                 if let Some(n) = build_prds(ptr, want, &mut prds) {
                     port.rw_block(lba, &prds[..n], true)?;
                     chunk = want;
                 }
             }
             if chunk == 0 {
-                chunk = remaining.min(self.max_chunk(port.lba48, self.bounce_len));
+                chunk = whole_sectors(
+                    remaining.min(self.max_chunk(port.lba48, self.bounce_len)),
+                    sector_bytes,
+                );
                 unsafe {
                     core::ptr::copy_nonoverlapping(
-                        write_buf.as_ptr().add(offset),
+                        write_buf.as_ptr().add(done),
                         self.bounce_virt as *mut u8,
                         chunk,
                     );
                 }
                 port.rw_block(lba, &[(self.bounce_phys as u64, chunk)], true)?;
             }
-            offset += chunk;
-            lba += (chunk / SECTOR_SIZE) as u64;
+            done += chunk;
+            byte_addr += chunk;
         }
         Ok(())
     }
@@ -1264,6 +1404,13 @@ impl BlockScheme for AhciInterface {
 
     fn block_count(&self) -> usize {
         self.capacity as usize
+    }
+
+    // The sector size the drive itself addresses, from IDENTIFY word 106.
+    // Reads and writes above translate the 512-byte `block_id` onto it; the
+    // partition tables on the disk are laid out in *these* units.
+    fn logical_block_size(&self) -> usize {
+        self.sector_bytes
     }
 }
 

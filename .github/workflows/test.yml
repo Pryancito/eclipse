@@ -41,11 +41,26 @@ jobs:
           # the syncobj table, the e1000e rings -- never ran here at all.
           # Named explicitly, and single-threaded because several of them drive
           # process-wide driver state (DRM_STATE, the CE staging buffer).
-          # `graphic` is needed for the console shadow framebuffer, whose
-          # dirty-rect bookkeeping is otherwise compiled out along with its
-          # tests.
+          # `--features graphic` is not optional: the graphic console, its
+          # shadow framebuffer and their tests are all behind it, and without
+          # it they are filtered out silently -- a green run that checked
+          # nothing.
           cargo test -p zcore-drivers --lib --features graphic -- --test-threads=1
           cargo test -p linux-object --lib -- --test-threads=1
+          # Three more crates whose unit tests `default-members` hid the same
+          # way: the syscall entry points, the HAL (user-pointer copies, CPU
+          # stats) and the anomaly detector.
+          cargo test -p linux-syscall --lib -- --test-threads=1
+          cargo test -p kernel-hal --lib -- --test-threads=1
+          cargo test -p hunter --lib -- --test-threads=1
+          # The btrfs driver is a path dependency of linux-object, so
+          # `default-members` hid its ~50 tests here too -- including the ones
+          # that cross-validate our images against btrfs-progs (those skip
+          # themselves when `btrfs` is not installed). `--features std` is
+          # what gives them a file-backed block device; release because the
+          # allocator/B-tree scaling tests take ~82s unoptimised against ~28s
+          # optimised, and they are the bulk of the suite.
+          cargo test --release -p btrfs --features std
 
   zircon-core-test-libos:
     name: Zircon Core Test Libos (${{ matrix.name }})
@@ -94,7 +109,10 @@ jobs:
         run: python3 -m pip install -r tests/requirements.txt
 
       - name: Verify native AArch64 fncall ABI
-        if: matrix.arch == 'aarch64'
+        # Linux only: vendor/trapframe gates its aarch64 fncall module on
+        # `target_os = "linux"` (src/arch/aarch64/mod.rs), so on Darwin the
+        # module exports nothing and this test cannot compile, let alone run.
+        if: matrix.arch == 'aarch64' && runner.os != 'macOS'
         run: |
           mkdir -p target
           cargo metadata --format-version 1 > target/cargo-metadata.json
@@ -108,17 +126,23 @@ jobs:
           # "the package 'trapframe' does not contain this feature".
           cargo test --manifest-path "$trapframe_manifest" --release
 
-      - name: Build macOS LibOS and report runtime skip
+      - name: Report macOS LibOS skip
+        # Two independent blockers, neither of them a regression to chase:
+        # this tree has no Darwin port of trapframe's aarch64 fncall path, so
+        # the LibOS kernel does not link; and even linked, Darwin clears guest
+        # x18 on host exception return and GitHub macOS runners reject the
+        # private custom-x18-abi entitlement (CI 34018139132), so Fuchsia
+        # shadow-call-stack guests cannot start. Attempting the build only
+        # spent runner minutes to fail the same way every run.
         if: runner.os == 'macOS'
         run: |
-          make -C zCore ARCH=aarch64 LIBOS=1 TEST=1 ZBI=core-tests build
           mkdir -p target/test-logs/zircon-aarch64-libos
           python3 - <<'PYTHON'
           import json
           from pathlib import Path
-          reason = "Darwin clears guest x18 on host exception return; GitHub macOS runners reject the required private custom-x18-abi entitlement (CI 34018139132). Fuchsia shadow-call-stack guests cannot start."
+          reason = "No Darwin port of trapframe's aarch64 fncall path, so the LibOS kernel does not link. Even linked, Darwin clears guest x18 on host exception return and GitHub macOS runners reject the required private custom-x18-abi entitlement (CI 34018139132), so Fuchsia shadow-call-stack guests cannot start."
           Path("target/test-logs/zircon-aarch64-libos/results.json").write_text(json.dumps({"status": "SKIPPED", "reason": reason, "runs": []}, indent=2) + "\n")
-          print("::warning::SKIP macOS Fuchsia runtime: " + reason)
+          print("::warning::SKIP macOS LibOS: " + reason)
           PYTHON
 
       - name: Run fast tests
@@ -193,12 +217,31 @@ jobs:
           python3 scripts/zircon_core_test.py --arch x86_64 --smp 2 --log-dir target/test-logs/port-smp2 --x64-cpu 'Haswell,+smap,-check,+fsgsbase,-x2apic' --group port-stress
           python3 scripts/zircon_core_test.py --arch x86_64 --smp 4 --log-dir target/test-logs/port-smp4 --group port-stress
 
+      - name: Report baremetal aarch64 skip
+        # Not a test failure: the configuration was never plumbed. `justrun`
+        # for ARCH=aarch64 wants ignored/target/aarch64/firmware/QEMU_EFI.fd,
+        # a disk/EFI/Boot/Boot.json to rewrite the cmdline into, and an
+        # aarch64.img data drive (see zCore/Makefile). Those come from
+        # `cargo image`, which the Zircon path does not run, and there is no
+        # ZBI handoff on this platform either. QEMU therefore never started,
+        # and the job failed with no guest output at all.
+        if: matrix.arch == 'aarch64'
+        run: |
+          mkdir -p target/test-logs/zircon-aarch64-bare
+          python3 - <<'PYTHON'
+          import json
+          from pathlib import Path
+          reason = "Baremetal aarch64 Zircon is not plumbed: no UEFI firmware, no ESP Boot.json and no ZBI handoff outside `cargo image`, so QEMU cannot be started."
+          Path("target/test-logs/zircon-aarch64-bare/results.json").write_text(json.dumps({"status": "SKIPPED", "reason": reason, "runs": []}, indent=2) + "\n")
+          print("::warning::SKIP baremetal aarch64 Zircon: " + reason)
+          PYTHON
+
       - name: Run fast tests
-        if: github.event_name != 'workflow_dispatch'
+        if: github.event_name != 'workflow_dispatch' && matrix.arch != 'aarch64'
         run: python3 scripts/zircon_core_test.py --arch ${{ matrix.arch }} --fast
 
       - name: Run full tests
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && matrix.arch != 'aarch64'
         run: python3 scripts/zircon_core_test.py --arch ${{ matrix.arch }}
 
       - name: Upload guest and kernel logs
@@ -344,11 +387,11 @@ jobs:
 
       - name: Run fast tests
         if: github.event_name != 'workflow_dispatch'
-        run: cd tests && python3 linux_other_test.py --arch ${{ matrix.arch }} --fast
+        run: python3 scripts/linux_other_test.py --arch ${{ matrix.arch }} --fast
 
       - name: Run full tests
         if: github.event_name == 'workflow_dispatch'
-        run: cd tests && python3 linux_other_test.py --arch ${{ matrix.arch }}
+        run: python3 scripts/linux_other_test.py --arch ${{ matrix.arch }}
       - name: Upload guest and kernel logs
         if: always()
         uses: actions/upload-artifact@v7

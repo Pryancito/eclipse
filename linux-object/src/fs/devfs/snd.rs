@@ -23,6 +23,13 @@
 //!   advertise them. `PAUSE` stops DMA (ring kept for resume). `REWIND` /
 //!   `FORWARD` drop queued tail/head and silence that range so PulseAudio
 //!   cannot leave remnants of the last mpg123 track looping in the HDA ring.
+//! * Stream state follows `pcm_native.c`: `PREPARE` arms the driver's start
+//!   hold and the stream runs once `start_threshold` frames are queued (or
+//!   on `START`, which needs data and PREPARED); the ring running dry on a
+//!   RUNNING stream is an XRUN (`stop_threshold`, `EPIPE`, `POLLERR`) unless
+//!   the threshold sits at the boundary; `HW_PARAMS`, `HW_FREE`, `PREPARE`,
+//!   `START`, `DROP` and `PAUSE` refuse the states Linux refuses with
+//!   `EBADFD`; `SW_PARAMS` validates every field and hands the boundary back.
 //!
 //! Ioctls are matched on the `_IOC` type+nr bytes only (not the size bits):
 //! the struct layouts here mirror the x86_64 uapi, but matching the full cmd
@@ -116,7 +123,10 @@ const BUFFER_STALL_FLOOR: core::time::Duration = core::time::Duration::from_mill
 /// How long a blocking `writei` waits before re-offering PCM to a full ring.
 /// The same backoff `/dev/dsp` uses; see the loop in [`PcmDev::writei`].
 const WRITE_RETRY_BACKOFF: core::time::Duration = core::time::Duration::from_micros(250);
+const STATE_DRAINING: i32 = 5;
 const STATE_PAUSED: i32 = 6;
+const TSTAMP_MODE_LAST: i32 = 1;
+const TSTAMP_TYPE_LAST: u32 = 3;
 
 // snd_pcm_hw_param indexes.
 const PAR_ACCESS: usize = 0;
@@ -440,6 +450,28 @@ struct PcmState {
     boundary: u64,
     appl_ptr: u64,
     avail_min: u64,
+    /// Frames queued ahead of `hw_ptr` at which a PREPARED stream starts on
+    /// its own (Linux `start_threshold`; alsa-lib's default is 1, PulseAudio
+    /// sets the boundary so only an explicit START runs it). Until it is
+    /// reached the driver holds the engine (`AudioScheme::set_start_hold`).
+    start_threshold: u64,
+    /// `avail` at which a RUNNING stream is an underrun (Linux
+    /// `stop_threshold`; the buffer size by default, the boundary to never
+    /// underrun -- a free-running stream that plays silence when starved).
+    stop_threshold: u64,
+    /// The rest of `snd_pcm_sw_params`, kept so the ioctl hands back what
+    /// the client set. The ring's own silence-ahead zone stands in for
+    /// silence_threshold/silence_size.
+    silence_threshold: u64,
+    silence_size: u64,
+    tstamp_mode: i32,
+    tstamp_type: u32,
+    period_step: u32,
+    sleep_min: u32,
+    xfer_align: u64,
+    proto: u32,
+    /// When the stream last went RUNNING (`snd_pcm_status.trigger_tstamp`).
+    trigger_tstamp: Timespec,
     /// When the ring first refused a write for want of room, or `None` while
     /// it is still draining. See [`STATE_XRUN`].
     stalled_since: Option<core::time::Duration>,
@@ -498,6 +530,17 @@ impl PcmDev {
                 boundary: 0x4000_0000_0000_0000,
                 appl_ptr: 0,
                 avail_min: 1024,
+                start_threshold: 1,
+                stop_threshold: 16384,
+                silence_threshold: 0,
+                silence_size: 0,
+                tstamp_mode: 0,
+                tstamp_type: 0,
+                period_step: 1,
+                sleep_min: 0,
+                xfer_align: 1,
+                proto: 0,
+                trigger_tstamp: Timespec { sec: 0, nsec: 0 },
                 stalled_since: None,
             })),
             opened,
@@ -558,6 +601,45 @@ impl PcmDev {
         (st.appl_ptr + st.boundary - self.queued_capped(st)) % st.boundary
     }
 
+    /// Linux's underrun rule (`snd_pcm_update_state`): a RUNNING playback
+    /// stream whose `avail` has reached `stop_threshold` is in XRUN. With the
+    /// default threshold, the buffer size, that is the ring running dry: the
+    /// HDA engine then stops itself and loops silence, so the next write
+    /// would restart it seamlessly -- which is not what a client that set a
+    /// stop threshold asked for. It expects `EPIPE` and `POLLERR`, and every
+    /// ALSA client recovers from that with `snd_pcm_prepare()`, so the
+    /// stream state has to say what happened. A threshold at or past the
+    /// boundary keeps the seamless behaviour (Linux's free-running mode).
+    fn note_underrun(&self, st: &mut PcmState) {
+        if st.state != STATE_RUNNING || st.stop_threshold >= st.boundary {
+            return;
+        }
+        if self.avail(st) >= st.stop_threshold {
+            st.state = STATE_XRUN;
+            st.stalled_since = None;
+            info!(
+                "[snd] pcmC{}D0p: ring ran dry (avail {} >= stop_threshold {}) -> XRUN",
+                self.card,
+                self.avail(st),
+                st.stop_threshold
+            );
+        }
+    }
+
+    /// Move a PREPARED stream to RUNNING: release the driver's start hold so
+    /// the primed ring plays, and stamp the trigger time.
+    fn start_running(&self, st: &mut PcmState) {
+        let _ = self.audio.set_start_hold(false);
+        st.state = STATE_RUNNING;
+        st.stalled_since = None;
+        let now = kernel_hal::timer::timer_now();
+        st.trigger_tstamp = Timespec {
+            sec: now.as_secs() as i64,
+            nsec: now.subsec_nanos() as i64,
+        };
+        arm_playback_watchdog();
+    }
+
     /// What the ALSA timer bound to this stream samples: whether the stream
     /// runs, how many whole periods the hardware pointer has passed, and the
     /// period length in ns (the timer's resolution).
@@ -565,7 +647,8 @@ impl PcmDev {
         // Lock order everywhere in this file is `st` then the audio driver
         // (`hw_ptr` -> `queued_frames` refreshes the hardware position);
         // nothing takes them the other way round.
-        let st = self.st.lock();
+        let mut st = self.st.lock();
+        self.note_underrun(&mut st);
         let period = st.period_size.max(1);
         PeriodClock {
             running: st.state == STATE_RUNNING,
@@ -1069,6 +1152,11 @@ impl PcmDev {
             }
             st.boundary = boundary;
             st.avail_min = period;
+            // Linux resets the software parameters with every hw_params.
+            st.start_threshold = 1;
+            st.stop_threshold = buffer;
+            st.silence_threshold = 0;
+            st.silence_size = 0;
             st.state = STATE_SETUP;
             // The ring was just wiped by `set_params`, so any stall that was
             // being timed is over. Leaving the clock running meant a stream
@@ -1125,9 +1213,15 @@ impl PcmDev {
     fn commit_write_progress(&self, bytes: usize) {
         let mut st = self.st.lock();
         st.appl_ptr = (st.appl_ptr + bytes as u64 / BYTES_PER_FRAME) % st.boundary.max(1);
-        st.state = STATE_RUNNING;
         st.stalled_since = None;
-        arm_playback_watchdog();
+        // A PREPARED stream starts once `start_threshold` frames are queued
+        // ahead of the hardware pointer (Linux `snd_pcm_lib_write`); below
+        // that the driver keeps holding the engine and the data waits.
+        if st.state == STATE_PREPARED && self.queued_capped(&st) >= st.start_threshold {
+            self.start_running(&mut st);
+        } else {
+            arm_playback_watchdog();
+        }
     }
 
     /// Answer a write that found no room: `EAGAIN` while the ring is still
@@ -1153,6 +1247,12 @@ impl PcmDev {
     fn no_room(&self, total_bytes: usize) -> Result<()> {
         let now = kernel_hal::timer::timer_now();
         let mut st = self.st.lock();
+        if st.state == STATE_PREPARED {
+            // A primed stream that has not started (start_threshold not
+            // reached, or PulseAudio's explicit START still to come) is not
+            // stalled: nothing is supposed to be draining it yet.
+            return Err(FsError::Again);
+        }
         let since = *st.stalled_since.get_or_insert(now);
         // buffer_size frames at `rate` Hz, floored so a bogus rate cannot make
         // the timeout infinite.
@@ -1181,7 +1281,8 @@ impl PcmDev {
     /// EAGAIN" semantics so alsa-lib/PulseAudio can return to poll().
     fn writei(&self, xfer: &mut SndXferI, flags: OpenFlags) -> Result<()> {
         {
-            let st = self.st.lock();
+            let mut st = self.st.lock();
+            self.note_underrun(&mut st);
             // Linux (`__snd_pcm_lib_xfer`) accepts PREPARED, RUNNING *and*
             // PAUSED, and answers every other state with EBADFD -- never
             // EINVAL. Both halves of that matter to a client:
@@ -1288,7 +1389,12 @@ impl PcmDev {
 
     fn drain(&self) -> Result<()> {
         let (rate, state) = {
-            let st = self.st.lock();
+            let mut st = self.st.lock();
+            // Linux starts a PREPARED stream that holds data before draining
+            // it, whatever its start_threshold.
+            if st.state == STATE_PREPARED && self.queued_frames() > 0 {
+                self.start_running(&mut st);
+            }
             (st.rate.max(1) as u64, st.state)
         };
         // Only a stream whose DMA is actually running can drain. Waiting on a
@@ -1339,6 +1445,7 @@ impl PcmDev {
     /// just under the boundary.
     fn sync_ptr(&self, sp: &mut SndPcmSyncPtr) {
         let mut st = self.st.lock();
+        self.note_underrun(&mut st);
         if sp.flags & SYNC_PTR_APPL != 0 {
             sp.control.appl_ptr = st.appl_ptr;
         } else {
@@ -1368,8 +1475,10 @@ impl PcmDev {
                 core::mem::size_of::<SndPcmStatus>(),
             )
         };
-        let st = self.st.lock();
+        let mut st = self.st.lock();
+        self.note_underrun(&mut st);
         s.state = st.state;
+        s.trigger_tstamp = st.trigger_tstamp;
         s.appl_ptr = st.appl_ptr;
         s.hw_ptr = self.hw_ptr(&st);
         s.delay = self.queued_frames() as i64;
@@ -1452,30 +1561,83 @@ impl PcmDev {
                 }
             }
             0x11 => {
-                // HW_PARAMS
+                // HW_PARAMS: only on a stream that is not live (Linux
+                // `snd_pcm_hw_params`: OPEN, SETUP or PREPARED, else EBADFD).
+                // alsa-lib drops or frees a running stream before it
+                // renegotiates, so this only ever refuses a caller that
+                // skipped that -- and reconfiguring a live ring under it is
+                // exactly what must not happen.
                 ucheck::<SndPcmHwParams>(data)?;
+                let state = self.st.lock().state;
+                if !matches!(state, STATE_OPEN | STATE_SETUP | STATE_PREPARED) {
+                    return Err(FsError::BadState);
+                }
                 let p = unsafe { &mut *(data as *mut SndPcmHwParams) };
                 self.install(p)?;
+                let _ = self.audio.set_start_hold(false);
                 Ok(0)
             }
             0x12 => {
-                // HW_FREE
-                let _ = self.audio.reset();
+                // HW_FREE: from SETUP or PREPARED only, as on Linux.
                 let mut st = self.st.lock();
+                if !matches!(st.state, STATE_SETUP | STATE_PREPARED) {
+                    return Err(FsError::BadState);
+                }
+                let _ = self.audio.reset();
+                let _ = self.audio.set_start_hold(false);
                 st.state = STATE_OPEN;
                 st.stalled_since = None;
                 Ok(0)
             }
             0x13 => {
-                // SW_PARAMS
+                // SW_PARAMS, with Linux's validation (`snd_pcm_sw_params`)
+                // and the struct handed back the way the kernel keeps it:
+                // the boundary is the kernel's to report, never the client's
+                // to set.
                 ucheck::<SndPcmSwParams>(data)?;
                 let p = unsafe { &mut *(data as *mut SndPcmSwParams) };
                 let mut st = self.st.lock();
-                if p.avail_min > 0 {
-                    st.avail_min = p.avail_min;
+                if st.state == STATE_OPEN {
+                    return Err(FsError::BadState);
                 }
-                if p.boundary > 0 {
-                    st.boundary = p.boundary;
+                if p.tstamp_mode < 0 || p.tstamp_mode > TSTAMP_MODE_LAST {
+                    return Err(FsError::InvalidParam);
+                }
+                if p.proto >= 0x0002_000c && p.tstamp_type > TSTAMP_TYPE_LAST {
+                    return Err(FsError::InvalidParam);
+                }
+                if p.avail_min == 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                if p.silence_size >= st.boundary {
+                    if p.silence_threshold != 0 {
+                        return Err(FsError::InvalidParam);
+                    }
+                } else if p.silence_size > p.silence_threshold
+                    || p.silence_threshold > st.buffer_size
+                {
+                    return Err(FsError::InvalidParam);
+                }
+                st.tstamp_mode = p.tstamp_mode;
+                st.tstamp_type = p.tstamp_type;
+                st.period_step = p.period_step;
+                st.sleep_min = p.sleep_min;
+                st.avail_min = p.avail_min;
+                st.xfer_align = p.xfer_align;
+                st.start_threshold = p.start_threshold;
+                st.stop_threshold = p.stop_threshold;
+                st.silence_threshold = p.silence_threshold;
+                st.silence_size = p.silence_size;
+                st.proto = p.proto;
+                p.boundary = st.boundary;
+                // A running stream whose start_threshold just dropped to
+                // what is already queued starts now (Linux does the same
+                // check on the spot).
+                if st.state == STATE_PREPARED
+                    && self.queued_frames() > 0
+                    && self.queued_capped(&st) >= st.start_threshold
+                {
+                    self.start_running(&mut st);
                 }
                 Ok(0)
             }
@@ -1489,11 +1651,27 @@ impl PcmDev {
             0x21 => {
                 // DELAY
                 ucheck::<i64>(data)?;
-                unsafe { *(data as *mut i64) = self.queued_frames() as i64 };
+                let mut st = self.st.lock();
+                self.note_underrun(&mut st);
+                if st.state == STATE_XRUN {
+                    return Err(FsError::Broken);
+                }
+                drop(st);
+                // Frames until the last written one plays: the client's own
+                // queue plus whatever silence the driver has ahead of it
+                // (Linux adds `runtime->delay`, the hardware's own latency,
+                // the same way).
+                let delay = self.audio.delay_bytes() as u64 / BYTES_PER_FRAME;
+                unsafe { *(data as *mut i64) = delay as i64 };
                 Ok(0)
             }
             0x22 => {
-                let _ = self.queued_frames();
+                // HWSYNC
+                let mut st = self.st.lock();
+                self.note_underrun(&mut st);
+                if st.state == STATE_XRUN {
+                    return Err(FsError::Broken);
+                }
                 Ok(0)
             }
             0x23 => {
@@ -1518,9 +1696,19 @@ impl PcmDev {
             }
             0x40 => {
                 // PREPARE — also the recovery path out of XRUN, so the stall
-                // clock starts over with the freshly reset ring.
-                let _ = self.audio.reset();
+                // clock starts over with the freshly reset ring. Linux
+                // refuses it from OPEN (no hw_params yet, EBADFD) and while
+                // the stream is live (`snd_pcm_pre_prepare`: EBUSY).
                 let mut st = self.st.lock();
+                if st.state == STATE_OPEN {
+                    return Err(FsError::BadState);
+                }
+                if matches!(st.state, STATE_RUNNING | STATE_DRAINING) {
+                    return Err(FsError::Busy);
+                }
+                let _ = self.audio.reset();
+                // The engine waits for start_threshold, or for START.
+                let _ = self.audio.set_start_hold(true);
                 st.stalled_since = None;
                 st.appl_ptr = 0;
                 st.state = STATE_PREPARED;
@@ -1535,42 +1723,63 @@ impl PcmDev {
                 Ok(0)
             }
             0x42 => {
-                // START — the driver starts the stream on first data; just
-                // reflect the state change.
-                self.st.lock().state = STATE_RUNNING;
+                // START: from PREPARED only (EBADFD otherwise), and a
+                // playback stream with nothing queued has nothing to start
+                // (EPIPE) -- unless its stop_threshold sits at the boundary,
+                // in which case it is free-running and may start empty
+                // (`snd_pcm_pre_start` via `snd_pcm_playback_data`). That
+                // second half is what PulseAudio relies on: its sink sets
+                // both thresholds to the boundary, and an EPIPE here is
+                // logged and ignored, leaving the stream primed and held
+                // with nothing ever releasing it.
+                let mut st = self.st.lock();
+                if st.state != STATE_PREPARED {
+                    return Err(FsError::BadState);
+                }
+                if st.stop_threshold < st.boundary && self.queued_frames() == 0 {
+                    return Err(FsError::Broken);
+                }
+                self.start_running(&mut st);
                 Ok(0)
             }
             0x43 => {
                 // DROP
-                let _ = self.audio.reset();
                 let mut st = self.st.lock();
+                if st.state == STATE_OPEN {
+                    return Err(FsError::BadState);
+                }
+                let _ = self.audio.reset();
+                let _ = self.audio.set_start_hold(false);
                 st.state = STATE_SETUP;
                 st.stalled_since = None;
                 Ok(0)
             }
             0x44 => self.drain().map(|_| 0),
             0x45 => {
-                // PAUSE: arg 1 = pause, 0 = resume. Pulse suspend-on-idle and
-                // stream cork both land here; a no-op left DMA looping the
-                // last buffer (mpg123 remnants).
+                // PAUSE: arg 1 = pause, 0 = resume. Linux (`snd_pcm_pre_pause`)
+                // pauses a RUNNING stream and resumes a PAUSED one; any other
+                // state is EBADFD. A primed PREPARED stream in particular is
+                // not pausable: its engine has never run (see the driver's
+                // start hold), so there is nothing to stop, and pretending
+                // there was is how a resume ends up setting RUN on a
+                // descriptor with no stream tag.
                 ucheck::<i32>(data)?;
                 let enable = unsafe { *(data as *const i32) };
-                let state = self.st.lock().state;
+                let mut st = self.st.lock();
                 if enable != 0 {
-                    if state == STATE_RUNNING || state == STATE_PREPARED {
-                        let _ = self.audio.pause();
-                        // Idle cork with nothing left to play: wipe remnants so
-                        // a later RUN cannot loop the last mpg123 period.
-                        if self.audio.queued_bytes() == 0 {
-                            let _ = self.audio.reset();
-                            self.st.lock().state = STATE_SETUP;
-                        } else {
-                            self.st.lock().state = STATE_PAUSED;
-                        }
+                    if st.state != STATE_RUNNING {
+                        return Err(FsError::BadState);
                     }
-                } else if state == STATE_PAUSED {
+                    let _ = self.audio.pause();
+                    st.state = STATE_PAUSED;
+                    st.stalled_since = None;
+                } else {
+                    if st.state != STATE_PAUSED {
+                        return Err(FsError::BadState);
+                    }
                     let _ = self.audio.resume();
-                    self.st.lock().state = STATE_RUNNING;
+                    st.state = STATE_RUNNING;
+                    drop(st);
                     arm_playback_watchdog();
                 }
                 Ok(0)
@@ -1616,6 +1825,7 @@ impl PcmDev {
                 st.stalled_since = None;
                 drop(st);
                 let _ = self.audio.reset();
+                let _ = self.audio.set_start_hold(false);
                 Ok(0)
             }
             0x49 => {
@@ -1672,8 +1882,10 @@ impl Drop for PcmDev {
         // `mpg123 -o oss` blocked without ever playing a sample. A re-open of
         // hw:0,0 fared no better: the flag was free but the ring was not.
         //
-        // Same two steps as the DROP ioctl, in the same order.
+        // Same two steps as the DROP ioctl, in the same order. A start hold
+        // belongs to this open and must not reach the next client.
         let _ = self.audio.reset();
+        let _ = self.audio.set_start_hold(false);
         {
             let mut st = self.st.lock();
             st.state = STATE_SETUP;
@@ -1695,7 +1907,8 @@ impl INode for PcmDev {
 
     fn poll(&self) -> Result<PollStatus> {
         let _ = self.audio.queued_bytes();
-        let st = self.st.lock();
+        let mut st = self.st.lock();
+        self.note_underrun(&mut st);
         let avail = self.avail(&st);
         // Linux reports POLLOUT when `avail >= avail_min`, but it only
         // re-evaluates that on a period interrupt, so a feeder wakes at most
@@ -1726,7 +1939,10 @@ impl INode for PcmDev {
         // case where the kernel invites a write it is going to refuse.
         let ring_free = self.audio.free_bytes() as u64 / BYTES_PER_FRAME;
         let writable = avail.min(ring_free);
-        if st.state == STATE_XRUN {
+        if !matches!(
+            st.state,
+            STATE_RUNNING | STATE_PREPARED | STATE_PAUSED | STATE_DRAINING
+        ) {
             // An underrun is reported to a poller, not hidden from it. The
             // ring that stopped draining is by definition full, so the gate
             // above says "not writable" and a client that answered EAGAIN by
@@ -1735,8 +1951,9 @@ impl INode for PcmDev {
             // the EPIPE that tells it to re-prepare. That is the difference
             // between a stream that recovers with a click and one that goes
             // quiet for seconds. Linux raises POLLERR together with POLLOUT
-            // (`snd_pcm_playback_poll`); POLLERR is return-only, so it
-            // reaches the client whether or not it asked for it.
+            // (`snd_pcm_poll`) for XRUN and for every other state in which
+            // the stream cannot be waited on (OPEN, SETUP); POLLERR is
+            // return-only, so it reaches the client whether or not it asked.
             return Ok(PollStatus {
                 read: false,
                 write: true,
@@ -2393,22 +2610,34 @@ mod timer_tests {
     }
 
     #[cfg(test)]
-    mod pcm_tests {
+    pub(super) mod pcm_tests {
         use super::*;
         use crate::fs::devfs::DspDev;
         use zcore_drivers::DeviceResult;
 
-        struct FakeAudio {
+        pub(super) struct FakeAudio {
             cap: usize,
             queued: Mutex<usize>,
+            hold: Mutex<bool>,
         }
 
         impl FakeAudio {
-            fn new(cap: usize) -> Self {
+            pub(super) fn new(cap: usize) -> Self {
                 Self {
                     cap,
                     queued: Mutex::new(0),
+                    hold: Mutex::new(false),
                 }
+            }
+
+            pub(super) fn held(&self) -> bool {
+                *self.hold.lock()
+            }
+
+            /// Play out `frames`.
+            pub(super) fn drain(&self, frames: u64) {
+                let mut queued = self.queued.lock();
+                *queued = queued.saturating_sub(frames as usize * BYTES_PER_FRAME as usize);
             }
         }
 
@@ -2448,11 +2677,16 @@ mod timer_tests {
             }
 
             fn is_playing(&self) -> bool {
-                self.queued_bytes() > 0
+                self.queued_bytes() > 0 && !self.held()
             }
 
             fn reset(&self) -> DeviceResult {
                 *self.queued.lock() = 0;
+                Ok(())
+            }
+
+            fn set_start_hold(&self, hold: bool) -> DeviceResult {
+                *self.hold.lock() = hold;
                 Ok(())
             }
 
@@ -2848,6 +3082,275 @@ mod timer_tests {
                 .unwrap();
             assert_eq!(back, 3);
             assert_eq!(pcm.st.lock().appl_ptr, 8, "REWIND puts it back");
+        }
+    }
+
+    #[cfg(test)]
+    mod sw_params_tests {
+        use super::pcm_tests_support::*;
+        use super::*;
+
+        /// alsa-lib's default: start_threshold 1, so the first frame written
+        /// to a PREPARED stream starts it -- through the hold PREPARE set.
+        #[test]
+        fn prepare_holds_and_the_first_write_starts_with_the_default_threshold() {
+            let (audio, pcm) = pcm(64);
+            pcm.io_control(0x4140, 0).unwrap(); // PREPARE
+            assert!(audio.held(), "PREPARE arms the driver's start hold");
+            assert_eq!(pcm.st.lock().state, STATE_PREPARED);
+            write(&pcm, 1);
+            assert!(!audio.held());
+            assert_eq!(pcm.st.lock().state, STATE_RUNNING);
+        }
+
+        /// aplay sets start_threshold to a period: writes below it queue
+        /// without starting, the one that reaches it starts.
+        #[test]
+        fn a_start_threshold_is_waited_for() {
+            let (audio, pcm) = pcm(64);
+            pcm.io_control(0x4140, 0).unwrap();
+            set_sw(&pcm, |p| p.start_threshold = 8);
+            write(&pcm, 4);
+            assert_eq!(pcm.st.lock().state, STATE_PREPARED);
+            assert!(audio.held());
+            assert_eq!(audio.queued_bytes(), 4 * BYTES_PER_FRAME as usize);
+            // hw_ptr stays put while the engine is held.
+            let mut status: SndPcmStatus = unsafe { core::mem::zeroed() };
+            pcm.fill_status(&mut status);
+            assert_eq!(
+                (status.state, status.hw_ptr, status.appl_ptr),
+                (STATE_PREPARED, 0, 4)
+            );
+            write(&pcm, 4);
+            assert_eq!(pcm.st.lock().state, STATE_RUNNING);
+            assert!(!audio.held());
+        }
+
+        /// PulseAudio's pattern: start_threshold at the boundary, fill,
+        /// then an explicit START.
+        #[test]
+        fn a_boundary_start_threshold_waits_for_start() {
+            let (audio, pcm) = pcm(32);
+            pcm.io_control(0x4140, 0).unwrap();
+            let boundary = pcm.st.lock().boundary;
+            set_sw(&pcm, |p| p.start_threshold = boundary);
+            // START with nothing queued is EPIPE, as in snd_pcm_pre_start...
+            assert!(matches!(pcm.io_control(0x4142, 0), Err(FsError::Broken)));
+            // ...unless the stream is free-running (stop_threshold at the
+            // boundary, PulseAudio's setting), when it starts empty.
+            set_sw(&pcm, |p| p.stop_threshold = boundary);
+            pcm.io_control(0x4142, 0).unwrap();
+            assert_eq!(pcm.st.lock().state, STATE_RUNNING);
+            assert!(!audio.held());
+            pcm.io_control(0x4143, 0).unwrap(); // DROP
+            pcm.io_control(0x4140, 0).unwrap(); // PREPARE
+            set_sw(&pcm, |p| p.stop_threshold = 32);
+            write(&pcm, 16);
+            write(&pcm, 16);
+            assert_eq!(pcm.st.lock().state, STATE_PREPARED);
+            assert!(audio.held());
+            // A full buffer is EAGAIN, never an XRUN, while it waits to start.
+            let samples = [0u8; BYTES_PER_FRAME as usize];
+            let mut xfer = SndXferI {
+                result: 0,
+                buf: samples.as_ptr() as usize as u64,
+                frames: 1,
+            };
+            assert!(matches!(
+                pcm.writei(&mut xfer, OpenFlags::NON_BLOCK),
+                Err(FsError::Again)
+            ));
+            assert!(pcm.st.lock().stalled_since.is_none());
+            pcm.io_control(0x4142, 0).unwrap();
+            assert_eq!(pcm.st.lock().state, STATE_RUNNING);
+            assert!(!audio.held());
+            assert!(pcm.st.lock().trigger_tstamp.sec >= 0);
+            // START is from PREPARED only.
+            assert!(matches!(pcm.io_control(0x4142, 0), Err(FsError::BadState)));
+        }
+
+        /// The ring running dry on a RUNNING stream is an underrun: EPIPE on
+        /// write, POLLERR to a poller, and PREPARE recovers. With the stop
+        /// threshold at the boundary it is not, and the stream free-runs.
+        #[test]
+        fn the_ring_running_dry_is_an_xrun_unless_the_stop_threshold_says_otherwise() {
+            let (audio, pcm) = pcm(64);
+            pcm.io_control(0x4140, 0).unwrap();
+            write(&pcm, 8);
+            assert_eq!(pcm.st.lock().state, STATE_RUNNING);
+            audio.drain(8);
+            let polled = pcm.poll().unwrap();
+            assert!(polled.error && polled.write);
+            assert_eq!(pcm.st.lock().state, STATE_XRUN);
+            let samples = [0u8; BYTES_PER_FRAME as usize];
+            let mut xfer = SndXferI {
+                result: 0,
+                buf: samples.as_ptr() as usize as u64,
+                frames: 1,
+            };
+            assert!(matches!(
+                pcm.writei(&mut xfer, OpenFlags::NON_BLOCK),
+                Err(FsError::Broken)
+            ));
+            let mut delay: i64 = 0;
+            assert!(matches!(
+                pcm.io_control(0x4121, &mut delay as *mut i64 as usize),
+                Err(FsError::Broken)
+            ));
+            pcm.io_control(0x4140, 0).unwrap();
+            assert_eq!(pcm.st.lock().state, STATE_PREPARED);
+            write(&pcm, 8);
+            assert_eq!(pcm.st.lock().state, STATE_RUNNING);
+
+            // Free-running: the boundary as stop threshold.
+            let boundary = pcm.st.lock().boundary;
+            set_sw(&pcm, |p| p.stop_threshold = boundary);
+            audio.drain(8);
+            assert!(!pcm.poll().unwrap().error);
+            assert_eq!(pcm.st.lock().state, STATE_RUNNING);
+            write(&pcm, 1);
+            assert_eq!(pcm.st.lock().state, STATE_RUNNING);
+        }
+
+        #[test]
+        fn sw_params_validate_like_linux_and_hand_the_boundary_back() {
+            let (_, pcm) = pcm(64);
+            pcm.io_control(0x4140, 0).unwrap();
+            let mut p: SndPcmSwParams = unsafe { core::mem::zeroed() };
+            p.avail_min = 0;
+            p.boundary = 12345;
+            assert!(matches!(
+                pcm.io_control(0x4113, &mut p as *mut SndPcmSwParams as usize),
+                Err(FsError::InvalidParam)
+            ));
+            p.avail_min = 4;
+            p.tstamp_mode = 2;
+            assert!(matches!(
+                pcm.io_control(0x4113, &mut p as *mut SndPcmSwParams as usize),
+                Err(FsError::InvalidParam)
+            ));
+            p.tstamp_mode = 1;
+            p.silence_threshold = 1 << 40;
+            assert!(matches!(
+                pcm.io_control(0x4113, &mut p as *mut SndPcmSwParams as usize),
+                Err(FsError::InvalidParam)
+            ));
+            p.silence_threshold = 0;
+            p.stop_threshold = 16;
+            pcm.io_control(0x4113, &mut p as *mut SndPcmSwParams as usize)
+                .unwrap();
+            let st = pcm.st.lock();
+            assert_eq!(p.boundary, st.boundary, "the boundary is the kernel's");
+            assert_eq!(
+                (st.avail_min, st.stop_threshold, st.tstamp_mode),
+                (4, 16, 1)
+            );
+        }
+
+        #[test]
+        fn hw_params_hw_free_and_pause_refuse_the_wrong_states() {
+            let (audio, pcm) = pcm(64);
+            pcm.io_control(0x4140, 0).unwrap();
+            write(&pcm, 8);
+            assert_eq!(pcm.st.lock().state, STATE_RUNNING);
+            // A live ring is not renegotiated or freed under the client.
+            let mut hp: SndPcmHwParams = unsafe { core::mem::zeroed() };
+            assert!(matches!(
+                pcm.io_control(0x4111, &mut hp as *mut SndPcmHwParams as usize),
+                Err(FsError::BadState)
+            ));
+            assert!(matches!(pcm.io_control(0x4112, 0), Err(FsError::BadState)));
+            assert_eq!(audio.queued_bytes(), 8 * BYTES_PER_FRAME as usize);
+            // PAUSE pauses RUNNING and resumes PAUSED, nothing else.
+            let mut on: i32 = 1;
+            let mut off: i32 = 0;
+            assert!(matches!(
+                pcm.io_control(0x4145, &mut off as *mut i32 as usize),
+                Err(FsError::BadState)
+            ));
+            pcm.io_control(0x4145, &mut on as *mut i32 as usize)
+                .unwrap();
+            assert_eq!(pcm.st.lock().state, STATE_PAUSED);
+            assert!(matches!(
+                pcm.io_control(0x4145, &mut on as *mut i32 as usize),
+                Err(FsError::BadState)
+            ));
+            pcm.io_control(0x4145, &mut off as *mut i32 as usize)
+                .unwrap();
+            assert_eq!(pcm.st.lock().state, STATE_RUNNING);
+            // DROP then HW_FREE is the way down.
+            pcm.io_control(0x4143, 0).unwrap();
+            pcm.io_control(0x4112, 0).unwrap();
+            assert_eq!(pcm.st.lock().state, STATE_OPEN);
+            assert!(matches!(pcm.io_control(0x4140, 0), Err(FsError::BadState)));
+        }
+
+        #[test]
+        fn prepare_on_a_running_stream_is_ebusy() {
+            let (_, pcm) = pcm(64);
+            pcm.io_control(0x4140, 0).unwrap();
+            write(&pcm, 8);
+            assert!(matches!(pcm.io_control(0x4140, 0), Err(FsError::Busy)));
+        }
+
+        #[test]
+        fn closing_a_primed_pcm_releases_the_hold() {
+            let audio = Arc::new(FakeAudio::new(64 * BYTES_PER_FRAME as usize));
+            let pcm = Arc::new(PcmDev::new(audio.clone(), 0));
+            pcm.st.lock().state = STATE_SETUP; // hw_params done
+            let client = pcm.open_client().unwrap();
+            client.io_control(0x4140, 0).unwrap();
+            assert!(audio.held());
+            drop(client);
+            assert!(!audio.held());
+        }
+    }
+
+    /// Shared scaffolding for the sw_params tests: a PREPARED-ready PCM with
+    /// `frames` of ring, a whole-frames write, and a sw_params edit.
+    #[cfg(test)]
+    mod pcm_tests_support {
+        pub(super) use super::pcm_tests::FakeAudio;
+        use super::*;
+
+        pub(super) fn pcm(frames: usize) -> (Arc<FakeAudio>, PcmDev) {
+            let audio = Arc::new(FakeAudio::new(frames * BYTES_PER_FRAME as usize));
+            let pcm = PcmDev::new(audio.clone(), 0);
+            {
+                let mut st = pcm.st.lock();
+                st.state = STATE_SETUP;
+                st.buffer_size = frames as u64;
+                st.stop_threshold = frames as u64;
+                st.period_size = 4;
+                st.avail_min = 4;
+            }
+            (audio, pcm)
+        }
+
+        pub(super) fn write(pcm: &PcmDev, frames: u64) {
+            let samples = alloc::vec![0u8; frames as usize * BYTES_PER_FRAME as usize];
+            let mut xfer = SndXferI {
+                result: 0,
+                buf: samples.as_ptr() as usize as u64,
+                frames,
+            };
+            pcm.writei(&mut xfer, OpenFlags::NON_BLOCK).unwrap();
+            assert_eq!(xfer.result as u64, frames);
+        }
+
+        pub(super) fn set_sw(pcm: &PcmDev, edit: impl FnOnce(&mut SndPcmSwParams)) {
+            let mut p: SndPcmSwParams = unsafe { core::mem::zeroed() };
+            {
+                let st = pcm.st.lock();
+                p.avail_min = st.avail_min;
+                p.start_threshold = st.start_threshold;
+                p.stop_threshold = st.stop_threshold;
+                p.period_step = 1;
+                p.xfer_align = 1;
+            }
+            edit(&mut p);
+            pcm.io_control(0x4113, &mut p as *mut SndPcmSwParams as usize)
+                .unwrap();
         }
     }
 
@@ -3335,6 +3838,26 @@ impl INode for CtlDev {
                 Ok(0)
             }
             0x32 => Ok(0), // PCM_PREFER_SUBDEVICE
+            0x1a => {
+                // TLV_READ: neither control carries a dB scale (the gain is
+                // a percentage the driver applies in software). Linux
+                // answers ENXIO for a control without TLV data; alsamixer
+                // then shows plain percentages.
+                Err(FsError::NoSuchDeviceOrAddress)
+            }
+            0x20 | 0x40 => {
+                // HWDEP_NEXT_DEVICE / RAWMIDI_NEXT_DEVICE: none on this card.
+                ucheck::<i32>(data)?;
+                unsafe { *(data as *mut i32) = -1 };
+                Ok(0)
+            }
+            0xd0 => Ok(0), // POWER (no power management)
+            0xd1 => {
+                // POWER_STATE: SNDRV_CTL_POWER_D0.
+                ucheck::<i32>(data)?;
+                unsafe { *(data as *mut i32) = 0 };
+                Ok(0)
+            }
             _ => {
                 debug!("[snd] ctl ioctl 'U' nr={:#x} unsupported", nr);
                 Err(FsError::NotSupported)

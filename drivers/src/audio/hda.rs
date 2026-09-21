@@ -24,6 +24,18 @@
 //!   an underrun plays silence instead of looping stale audio. A 4 ms ALSA
 //!   watchdog (`arm_playback_watchdog`) keeps polling LPIB after clients
 //!   cork, so RUN cannot stay set with a leftover fragment.
+//! * **The engine is a DAI, not a one-shot.** As in Sound Open Firmware,
+//!   running out of client PCM does not stop the stream: the engine keeps
+//!   cycling over zeros, the next write is parked just past wherever it
+//!   has fetched up to, and only [`DAI_IDLE_STOP_US`] of silence stops it
+//!   (see [`HdaInner::run_gap`]). Every stop costs a full restart on the
+//!   next write -- codec verbs, pin sense, the HDMI kick -- and an HDMI
+//!   sink that hears its stream restart mutes while it re-locks, so a stop
+//!   per underrun turned every short gap into a long one.
+//! * **Gain is a ramp.** The software volume is applied on the way into the
+//!   ring by `crate::audio::pipeline::volume`, SOF's volume component in
+//!   Rust: Q8.16, rounded, and ramped over a few milliseconds so a slider
+//!   notch or a mute is a fade and not a click.
 //! * **HDMI vs analog is a codec-graph decision.** After the widget walk the
 //!   driver prefers a connected (presence-detect) HDMI/DP pin; analog
 //!   line-out/speaker/HP pins are the fallback. Both paths share the same
@@ -45,6 +57,7 @@ use core::sync::atomic::{fence, Ordering};
 use lock::Mutex;
 use pci::{PCIDevice, BAR};
 
+use crate::audio::pipeline::volume::{gain_from_percent, Volume};
 use crate::builder::IoMapper;
 use crate::bus::pci_drivers::PciDriver;
 use crate::nvme::nvme_queue::{timer_now_as_micros, Provider, ProviderImpl, PAGE_SIZE};
@@ -285,9 +298,39 @@ const SENSE_PROBE_MIN_US: u64 = 100_000;
 /// A push that did not take will not take any better a second later.
 const HDMI_KICK_MIN_US: u64 = 1_000_000;
 
+/// How long the engine keeps running over silence once the ring has run out
+/// of client PCM, before it is stopped.
+///
+/// This is the DAI side of Sound Open Firmware (`src/audio/dai-zephyr.c`):
+/// the DMA keeps cycling while the pipeline is up, and when the host has
+/// nothing to give it is handed zeros -- the stop is a decision the host
+/// makes, not something an empty buffer triggers. Stopping here instead
+/// cost far more than the gap that caused it. Every restart re-runs the
+/// codec verbs, the pin-sense probe and the HDMI kick, and an HDMI or DP
+/// sink that sees its audio stream stop and start again mutes while it
+/// re-locks, which on a television is hundreds of milliseconds: a 10 ms
+/// hole in the data became a half-second hole in the sound, at every
+/// underrun of a client that never noticed one. 5 s is PulseAudio's own
+/// idle timeout for a sink; a client that stays quiet for longer than that
+/// is not between two notes.
+const DAI_IDLE_STOP_US: u64 = 5_000_000;
+
+/// Silence left between the furthest point the engine could have fetched
+/// up to and the place where the next write lands after a gap.
+///
+/// During a gap the engine is running and its fetch position is somewhere
+/// past the link's play position: the controller's counters over-report by
+/// up to a few segments on the hardware this runs on (see [`RING_GUARD`]),
+/// and whatever they say, a fetch is a burst of up to one BDL segment. PCM
+/// written where the engine has already been is played as the zeros that
+/// were there, i.e. the start of the sound is cut. One segment past the
+/// highest position any counter reports is beyond every burst.
+const PARK_MARGIN: usize = BDL_SEGMENT;
+
 const STOP_HISTORY: usize = 4;
 
-/// One stream stop, as recorded for `/proc/gpusnd`.
+/// One gap (the ring running out of client PCM), as recorded for
+/// `/proc/gpusnd`.
 #[derive(Clone, Copy, Default)]
 struct StopEvent {
     /// `b'U'` underrun, `b'D'` drain, 0 = unused slot.
@@ -300,24 +343,21 @@ struct StopEvent {
     written: usize,
 }
 
-/// Q15 multiplier for a 0..=100 percent. 100% is 1.0 (32768) so a shift-15
-/// multiply is a no-op; mute/0% is silence.
-fn gain_q15(percent: u8, mute: bool) -> i32 {
-    if mute || percent == 0 {
-        0
-    } else if percent >= 100 {
-        32768
-    } else {
-        percent as i32 * 32768 / 100
-    }
+/// Where the next write lands once the ring has run out of client PCM and
+/// the engine is left running: past the furthest position any counter
+/// reports (`consumed` is the link clock's estimate, the two totals are the
+/// controller's own counters, whichever of them over-reports), plus
+/// [`PARK_MARGIN`]. Bytes since RUN, like its inputs.
+fn park_target(consumed: u64, lpib_total: u64, dpib_total: u64, margin: u64) -> u64 {
+    consumed.max(lpib_total).max(dpib_total) + margin
 }
 
-fn scale_q15(sample: i16, gain: i32) -> i16 {
-    if gain == 32768 {
-        sample
-    } else {
-        ((sample as i32 * gain) >> 15) as i16
-    }
+/// Client PCM still queued, given the raw ring occupancy `queued` and the
+/// silence pad that ends at stream position `pad_end`: the pad is ring
+/// space the driver filled on its own, and it is not the client's to count.
+fn exposed_queued(queued: usize, pad_end: u64, consumed: u64) -> usize {
+    let pad = pad_end.saturating_sub(consumed);
+    queued.saturating_sub(pad.min(queued as u64) as usize)
 }
 
 // ── MMIO helpers ────────────────────────────────────────────────────────────
@@ -405,6 +445,9 @@ struct HdaInner {
     running: bool,
     /// Software pause: DMA stopped but the ring still holds queued PCM.
     paused: bool,
+    /// Start hold (`AudioScheme::set_start_hold`): writes queue into the
+    /// ring but the engine is not started until the hold is released.
+    hold_start: bool,
     /// The stream descriptor was force-reset (`SRST`) because the engine
     /// would not acknowledge a cleared `RUN`, so its programming -- BDL
     /// address, cyclic length, format and above all the stream tag -- is
@@ -456,13 +499,18 @@ struct HdaInner {
     /// Counters behind the `/proc/gpusnd` "events" line. A tone that plays
     /// with short repeated dropouts sounds the same whatever produced it;
     /// these say which of them actually happened on this machine.
-    /// `drains` is the ring running dry with the writer still feeding it,
-    /// `underruns` the engine lapping the writer, `restarts` the full stream
-    /// reset (codec verbs and all) that either one costs on the next write,
-    /// and `stop_timeouts` the engine not acknowledging a cleared RUN bit --
-    /// the case where wiping the ring would race a still-fetching DMA.
+    /// `drains` and `underruns` both open a gap (the ring ran out of client
+    /// PCM with the engine running): a drain is the engine reaching the end
+    /// of what was written, an underrun the engine having already been past
+    /// it when the shortfall was noticed. `idle_stops` is a gap lasting
+    /// [`DAI_IDLE_STOP_US`] and the engine being stopped for it, `restarts`
+    /// the full stream reset (codec verbs and all) on the next write after
+    /// any stop, and `stop_timeouts` the engine not acknowledging a cleared
+    /// RUN bit -- the case where wiping the ring would race a still-fetching
+    /// DMA.
     stat_drains: u64,
     stat_underruns: u64,
+    stat_idle_stops: u64,
     stat_restarts: u64,
     stat_stop_timeouts: u64,
     /// Position-register reads (WALCLK + LPIB per poll) timed: how many, the
@@ -496,6 +544,12 @@ struct HdaInner {
     /// only visible trace of the response stream having slipped. See
     /// [`HdaInner::drain_rirb`].
     stat_stale_resp: u64,
+    /// Output re-routes decided by [`HdaInner::repick_path`], and the last
+    /// one (`from pin`, `to pin`, ms since boot). A stream that restarts on
+    /// the wrong pin plays into a connector nobody is listening to, with
+    /// every call returning `Ok`; this is how that shows up.
+    stat_reroutes: u64,
+    last_reroute: (u32, u32, u64),
     /// `(pin, timer_now_as_micros())` at each pin's last presence-detect
     /// trigger, for [`SENSE_PROBE_MIN_US`]. Per pin, because a walk over the
     /// candidates has to latch a fresh result on every one of them -- a
@@ -519,12 +573,30 @@ struct HdaInner {
     rate: u32,
     channels: u8,
 
-    /// Software playback gain (HDMI has no analog volume). Applied while
-    /// copying S16LE into the ring so OSS and ALSA share one control.
+    /// `timer_now_as_micros()` when the ring last ran out of client PCM
+    /// with the engine left running (a gap), or 0 while it holds some. The
+    /// engine plays silence for the gap's duration and is stopped after
+    /// [`DAI_IDLE_STOP_US`] of it.
+    gap_since_us: u64,
+    /// Stream position (bytes since RUN) where the silence pad parked ahead
+    /// of the playhead during a gap ends, or 0. Ring bytes below it are
+    /// zeros the driver put there, not client PCM: [`HdaInner::exposed_queued`]
+    /// leaves them out so a client's hardware pointer only ever moves
+    /// through bytes the client wrote, while [`AudioScheme::delay_bytes`]
+    /// counts them, since they do play before the next write does.
+    pad_end: u64,
+
+    /// Software playback gain (HDMI has no analog volume), applied while
+    /// copying S16LE into the ring so OSS and ALSA share one control. The
+    /// percent/mute pair is what the mixer control reads back; `vol` is the
+    /// ramped Q8.16 gain the copy actually applies (see
+    /// `crate::audio::pipeline::volume`), so a slider notch or a mute is a
+    /// fade over a few milliseconds of audio and not a step in the waveform.
     gain_l: u8,
     gain_r: u8,
     mute_l: bool,
     mute_r: bool,
+    vol: Volume,
 }
 
 pub struct HdaDevice {
@@ -756,24 +828,17 @@ impl HdaInner {
         }
     }
 
-    /// Fold DMA progress since the last poll into `queued`, detect underrun,
-    /// and re-zero consumed ring space (so an underrun loops silence).
+    /// Fold DMA progress since the last poll into `queued`, and when the
+    /// ring has run out of client PCM keep the engine fed with silence (see
+    /// [`HdaInner::run_gap`]).
     fn poll_progress(&mut self) {
         if !self.running {
             return;
         }
-        if self.queued == 0 {
-            self.stat_drains += 1;
-            self.record_stop(b'D');
-            if self.stop_stream() {
-                self.silence_ring();
-            }
-            return;
-        }
-        // Rate-limit the device reads (see [`LPIB_POLL_MIN_US`]). Only the
-        // "still playing" path is throttled: the drain/stop decisions above
-        // and below run on every call, so nothing is deferred that could
-        // leave the stream running with an empty ring.
+        // Rate-limit the device reads (see [`LPIB_POLL_MIN_US`]). A gap is
+        // handled below from a fresh position read, so it waits for the
+        // next accepted read like everything else: the ring is all zeros
+        // by then and the engine plays silence in the meantime.
         let now_us = timer_now_as_micros();
         let dt_us = now_us.wrapping_sub(self.last_poll_us);
         if dt_us < LPIB_POLL_MIN_US {
@@ -881,69 +946,86 @@ impl HdaInner {
         // Never more than the writer is allowed to have in flight, so a
         // garbage value cannot underflow `free_bytes`.
         self.queued = queued.min(ring - RING_GUARD);
-        if self.queued == 0 {
+        if self.queued == 0 || self.gap_since_us != 0 {
+            self.run_gap(now_us, reported);
+        }
+    }
+
+    /// The ring holds no client PCM (or the gap that started when it ran
+    /// out is still open). This is where the driver used to stop the
+    /// engine; it now does what SOF's DAI does -- keeps it running and gives
+    /// it silence -- and stops only after [`DAI_IDLE_STOP_US`] of that.
+    ///
+    /// Each poll re-parks the write pointer just past the engine
+    /// ([`park_target`]), over zeros, and books the stretch between the
+    /// playhead and that point as a pad (`pad_end`) so the next write lands
+    /// where the engine has not been and the client's queue count stays
+    /// honest. The whole ring is zeroed once, when the gap opens: at that
+    /// moment everything in it has been played.
+    fn run_gap(&mut self, now_us: u64, reported: u64) {
+        let ring = self.ring_len;
+        if self.gap_since_us == 0 {
             // The link has played everything written. If the engine's own
             // position also passed the tail, it got there before the writer
             // did: that is the underrun; otherwise the stream simply ended.
-            if reported > written {
+            if reported > self.stream_written as u64 {
                 self.stat_underruns += 1;
                 self.record_stop(b'U');
             } else {
                 self.stat_drains += 1;
                 self.record_stop(b'D');
             }
+            self.gap_since_us = now_us;
+            self.silence_ring();
+        } else if now_us.wrapping_sub(self.gap_since_us) >= DAI_IDLE_STOP_US {
+            self.stat_idle_stops += 1;
             if self.stop_stream() {
                 self.silence_ring();
             }
+            self.gap_since_us = 0;
+            self.pad_end = 0;
+            self.queued = 0;
+            self.wp = 0;
+            self.zero_ptr = 0;
+            self.last_lpib = 0;
+            return;
         }
+        let park = park_target(
+            self.consumed,
+            self.lpib_total,
+            self.dpib_total,
+            PARK_MARGIN as u64,
+        );
+        self.wp = (park % ring as u64) as usize;
+        // The ring is all zeros: the silence band ahead of `wp` is already
+        // there, so tell `silence_ahead` so it does not rewrite it per poll.
+        self.zero_ptr = (self.wp + SILENCE_AHEAD) % ring;
+        self.stream_written = park as usize;
+        self.pad_end = park;
+        self.queued = ((park - self.consumed) as usize).min(ring - RING_GUARD);
+    }
+
+    /// Client PCM queued: the ring occupancy less the silence pad.
+    fn exposed_queued(&self) -> usize {
+        exposed_queued(self.queued, self.pad_end, self.consumed)
     }
 
     /// Copy `src` into the ring at `dst` (virtual address), applying the
-    /// current stereo gain. `len` is a whole number of S16LE stereo frames
-    /// (the write path never splits a frame across the ring wrap).
-    fn copy_pcm_scaled(&self, src: &[u8], dst: usize, len: usize) {
-        let gl = gain_q15(self.gain_l, self.mute_l);
-        let gr = gain_q15(self.gain_r, self.mute_r);
-        if gl == 32768 && gr == 32768 {
+    /// current (ramped) gain. `len` is a whole number of S16LE frames (the
+    /// write path never splits a frame across the ring wrap); a trailing
+    /// partial frame is copied byte for byte rather than left holding the
+    /// previous lap.
+    fn copy_pcm_scaled(&mut self, src: &[u8], dst: usize, len: usize) {
+        if self.vol.is_passthrough() {
             unsafe {
                 core::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, len);
             }
             return;
         }
-        if gl == 0 && gr == 0 {
-            unsafe { core::ptr::write_bytes(dst as *mut u8, 0, len) };
-            return;
-        }
-        let dstp = dst as *mut u8;
-        // A trailing partial frame would otherwise be left holding whatever
-        // the previous lap put there. The write path only ever offers whole
-        // stereo frames, so this copies nothing in practice -- but a silently
-        // skipped tail is a stale-audio bug waiting for the first caller that
-        // does not, and the byte-for-byte copy is the honest fallback.
-        let tail = len % 4;
-        if tail != 0 {
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    src.as_ptr().add(len - tail),
-                    dstp.add(len - tail),
-                    tail,
-                );
-            }
-        }
-        let mut i = 0;
-        while i + 4 <= len {
-            let l = i16::from_le_bytes([src[i], src[i + 1]]);
-            let r = i16::from_le_bytes([src[i + 2], src[i + 3]]);
-            let lo = scale_q15(l, gl).to_le_bytes();
-            let ro = scale_q15(r, gr).to_le_bytes();
-            unsafe {
-                *dstp.add(i) = lo[0];
-                *dstp.add(i + 1) = lo[1];
-                *dstp.add(i + 2) = ro[0];
-                *dstp.add(i + 3) = ro[1];
-            }
-            i += 4;
-        }
+        // SAFETY: `dst..dst + len` lies inside the ring, which is owned by
+        // this device for its lifetime and only ever written under its lock.
+        let out = unsafe { core::slice::from_raw_parts_mut(dst as *mut u8, len) };
+        self.vol.process(&src[..len], out);
     }
 
     fn free_bytes(&self) -> usize {
@@ -1019,7 +1101,7 @@ impl HdaInner {
     fn rewind_bytes(&mut self, bytes: usize) -> usize {
         self.poll_progress();
         let frame = self.frame_bytes();
-        let n = bytes.min(self.queued) / frame * frame;
+        let n = bytes.min(self.exposed_queued()) / frame * frame;
         if n == 0 {
             return 0;
         }
@@ -1030,7 +1112,9 @@ impl HdaInner {
         self.zero_range(self.wp, n);
         self.zero_ptr = self.wp;
         self.silence_ahead();
-        if self.queued == 0 {
+        // A running engine that now has nothing left is a gap, handled by
+        // the next poll; only a stopped one is reset here.
+        if self.queued == 0 && !self.running {
             let stopped = self.stop_stream();
             self.paused = false;
             if stopped {
@@ -1047,7 +1131,7 @@ impl HdaInner {
     fn forward_bytes(&mut self, bytes: usize) -> usize {
         self.poll_progress();
         let frame = self.frame_bytes();
-        let n = bytes.min(self.queued) / frame * frame;
+        let n = bytes.min(self.exposed_queued()) / frame * frame;
         if n == 0 {
             return 0;
         }
@@ -1060,7 +1144,7 @@ impl HdaInner {
         // to play (as silence); the queue depth is what the link clock says
         // it is, so it is not adjusted here.
         self.zero_range(start, n);
-        if self.queued == 0 {
+        if self.queued == 0 && !self.running {
             let stopped = self.stop_stream();
             self.paused = false;
             if stopped {
@@ -1076,6 +1160,13 @@ impl HdaInner {
     /// Stop DMA but keep the ring so resume continues from the same LPIB.
     fn pause_stream(&mut self) {
         self.poll_progress();
+        if !self.running {
+            // Nothing is fetching: a stopped stream, or one primed under a
+            // start hold whose descriptor has never been programmed. Marking
+            // that "paused" would make the hold's release skip the start
+            // and the resume set RUN on a descriptor with no stream tag.
+            return;
+        }
         self.stop_stream();
         self.paused = true;
     }
@@ -1083,7 +1174,9 @@ impl HdaInner {
     /// Set RUN without resetting the stream descriptor (LPIB stays put).
     fn resume_stream(&mut self) -> DeviceResult {
         self.paused = false;
-        if self.running || self.queued == 0 {
+        if self.running || self.queued == 0 || self.hold_start {
+            // A held ring starts when the hold is released, through the
+            // full programming path; RUN alone would start stream 0.
             return Ok(());
         }
         if self.needs_reprogram {
@@ -1100,11 +1193,17 @@ impl HdaInner {
             self.zero_ptr = 0;
             self.queued = 0;
             self.last_lpib = 0;
+            self.gap_since_us = 0;
+            self.pad_end = 0;
             return Ok(());
         }
         // The link clock kept counting while paused; the stream did not.
         self.wall_last = mmio_r32(self.bar, REG_WALCLK);
         self.last_poll_us = timer_now_as_micros();
+        if self.gap_since_us != 0 {
+            // Neither did the idle clock.
+            self.gap_since_us = self.last_poll_us;
+        }
         let ctl = mmio_r32(self.bar, self.sd_base + SD_CTL);
         mmio_w32(self.bar, self.sd_base + SD_CTL, ctl | 0x2);
         self.running = true;
@@ -1182,7 +1281,11 @@ impl HdaInner {
         self.consumed = 0;
         self.stat_lead = 0;
         self.lead_now = 0;
-        self.stream_written = 0;
+        self.gap_since_us = 0;
+        self.pad_end = 0;
+        // `stream_written` is NOT reset here: the write path zeroes it when
+        // it re-anchors an empty ring, and a ring filled under a start hold
+        // already holds bytes that this start is about to play.
         Ok(())
     }
 }
@@ -1223,6 +1326,103 @@ fn nearest_rate(rate: u32) -> u32 {
         .iter()
         .min_by_key(|&&r| (r as i64 - rate as i64).unsigned_abs())
         .unwrap_or(&48000)
+}
+
+/// Which of the scored candidate paths to play on, given the one in use.
+///
+/// The highest score wins, but a route change is only worth its cost -- a
+/// full path re-arm on a stream that is restarting anyway -- when it leads
+/// somewhere better, and a momentary dip in the current pin's sense bits is
+/// not that. So the current path keeps its place on a tie, and it is never
+/// abandoned for a pin that does not itself report presence. On the NVIDIA
+/// codecs this runs against, a `SET_PIN_SENSE` right after the stream stops
+/// can read back PD=0 on the monitor's own pin for a moment; scoring alone
+/// then sent every underrun-triggered restart to the first dead connector
+/// in the list, and the next restart brought it back -- the same track
+/// audible one time and silent the next, with every call returning `Ok`.
+fn choose_route(scored: &[(OutPath, i32)], current: Option<(u32, u32)>) -> Option<&OutPath> {
+    let is_current = |p: &OutPath| current == Some((p.pin, p.conv));
+    let mut best: Option<&(OutPath, i32)> = None;
+    for cand in scored {
+        let better = match best {
+            None => true,
+            Some(b) => cand.1 > b.1 || (cand.1 == b.1 && is_current(&cand.0)),
+        };
+        if better {
+            best = Some(cand);
+        }
+    }
+    let (best, _) = best?;
+    if current.is_some() && !is_current(best) && !best.present {
+        // Nothing live to move to: stay where the audio last came out.
+        return scored.iter().map(|(p, _)| p).find(|p| is_current(p));
+    }
+    Some(best)
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    fn path(pin: u32, present: bool) -> OutPath {
+        OutPath {
+            conv: 0x4,
+            pin,
+            pin_conn_idx: 0,
+            digital: true,
+            hdmi_dp: true,
+            present,
+        }
+    }
+
+    fn pins(chosen: Option<&OutPath>) -> Option<u32> {
+        chosen.map(|p| p.pin)
+    }
+
+    #[test]
+    fn the_initial_pick_is_the_best_score_first_on_ties() {
+        let scored = [
+            (path(0x5, false), 0),
+            (path(0x6, true), 7),
+            (path(0x7, true), 7),
+        ];
+        assert_eq!(pins(choose_route(&scored, None)), Some(0x6));
+        assert_eq!(pins(choose_route(&[], None)), None);
+    }
+
+    #[test]
+    fn the_current_path_keeps_its_place_on_a_tie() {
+        // Two pins, neither present, equal scores: the first in the list
+        // used to win, so a stream on pin 6 hopped to pin 5 on restart.
+        let scored = [(path(0x5, false), 0), (path(0x6, false), 0)];
+        assert_eq!(pins(choose_route(&scored, Some((0x6, 0x4)))), Some(0x6));
+        let scored = [(path(0x5, true), 7), (path(0x6, true), 7)];
+        assert_eq!(pins(choose_route(&scored, Some((0x6, 0x4)))), Some(0x6));
+    }
+
+    #[test]
+    fn a_momentary_presence_loss_does_not_move_the_stream_to_a_dead_pin() {
+        // The monitor's pin read PD=0 this once; the other pin never had
+        // anything. Its higher score (first in list, equal otherwise) is
+        // not a reason to leave.
+        let scored = [(path(0x5, false), 1), (path(0x6, false), 0)];
+        assert_eq!(pins(choose_route(&scored, Some((0x6, 0x4)))), Some(0x6));
+    }
+
+    #[test]
+    fn a_live_pin_still_wins_over_a_dead_current_one() {
+        // The monitor moved to another connector: follow it.
+        let scored = [(path(0x5, true), 7), (path(0x6, false), 0)];
+        assert_eq!(pins(choose_route(&scored, Some((0x6, 0x4)))), Some(0x5));
+        // A converter change on the same pin counts as a move too.
+        let mut other = path(0x6, true);
+        other.conv = 0x8;
+        let scored = [(other, 7), (path(0x6, false), 0)];
+        assert_eq!(
+            choose_route(&scored, Some((0x6, 0x4))).map(|p| (p.pin, p.conv)),
+            Some((0x6, 0x8))
+        );
+    }
 }
 
 // ── Codec graph walk ────────────────────────────────────────────────────────
@@ -1413,11 +1613,10 @@ impl HdaInner {
         }
     }
 
-    /// Pick the best-scoring path among `self.candidates` right now.
-    fn best_candidate(&mut self) -> Option<OutPath> {
+    /// Score every candidate path right now.
+    fn scored_candidates(&mut self) -> Vec<(OutPath, i32)> {
         let candidates = self.candidates.clone();
-        let mut best: Option<OutPath> = None;
-        let mut best_score = -1i32;
+        let mut out = Vec::with_capacity(candidates.len());
         for mut p in candidates {
             let (score, present, eld_valid) = self.score_path(&p);
             p.present = present;
@@ -1425,12 +1624,16 @@ impl HdaInner {
                 "[hda] path candidate: pin {:#x} -> conv {:#x} (digital={}, hdmi/dp={}, present={}, eld={}, score={})",
                 p.pin, p.conv, p.digital, p.hdmi_dp, present, eld_valid, score
             );
-            if score > best_score {
-                best_score = score;
-                best = Some(p);
-            }
+            out.push((p, score));
         }
-        best
+        out
+    }
+
+    /// Pick the best-scoring path among `self.candidates` right now. Used
+    /// for the initial pick, where there is no current path to prefer.
+    fn best_candidate(&mut self) -> Option<OutPath> {
+        let scored = self.scored_candidates();
+        choose_route(&scored, None).cloned()
     }
 
     /// Re-evaluate the candidate paths and re-route if a better pin has
@@ -1454,14 +1657,18 @@ impl HdaInner {
 
         // Re-score only when there is something to choose between.
         if self.candidates.len() >= 2 {
-            let Some(best) = self.best_candidate() else {
+            let scored = self.scored_candidates();
+            let current = (self.pin_nid, self.conv_nid);
+            let Some(best) = choose_route(&scored, Some(current)).cloned() else {
                 return;
             };
             if best.pin != self.pin_nid || best.conv != self.conv_nid {
-                info!(
-                    "[hda] re-routing output: pin {:#x} -> pin {:#x}",
-                    self.pin_nid, best.pin
+                warn!(
+                    "[hda] re-routing output: pin {:#x} -> pin {:#x} (present={})",
+                    self.pin_nid, best.pin, best.present
                 );
+                self.stat_reroutes += 1;
+                self.last_reroute = (self.pin_nid, best.pin, timer_now_as_micros() / 1000);
                 if let Err(e) = self.setup_path(afg, &best) {
                     warn!("[hda] re-route failed: {:?} — keeping previous path", e);
                 }
@@ -1777,6 +1984,7 @@ impl HdaDevice {
             lead_now: 0,
             stat_drains: 0,
             stat_underruns: 0,
+            stat_idle_stops: 0,
             stat_restarts: 0,
             stat_stop_timeouts: 0,
             stat_pos_reads: 0,
@@ -1790,18 +1998,24 @@ impl HdaDevice {
             stat_fifo_err: 0,
             stat_desc_err: 0,
             stat_stale_resp: 0,
+            stat_reroutes: 0,
+            last_reroute: (0, 0, 0),
             sense_probe: Vec::new(),
             last_kick_us: 0,
             stream_start_wall: 0,
             stream_start_us: 0,
             stream_written: 0,
+            hold_start: false,
             stops: [StopEvent::default(); STOP_HISTORY],
             rate: 48000,
             channels: 2,
+            gap_since_us: 0,
+            pad_end: 0,
             gain_l: 100,
             gain_r: 100,
             mute_l: false,
             mute_r: false,
+            vol: Volume::new(48000, 2),
         };
 
         // ── Codec discovery ────────────────────────────────────────────────
@@ -1886,10 +2100,13 @@ impl AudioScheme for HdaDevice {
         inner.queued = 0;
         inner.wp = 0;
         inner.zero_ptr = 0;
+        inner.gap_since_us = 0;
+        inner.pad_end = 0;
         unsafe { core::ptr::write_bytes(inner.ring_va as *mut u8, 0, inner.ring_len) };
         clflush_range(inner.ring_va, inner.ring_len);
         inner.rate = rate;
         inner.channels = channels;
+        inner.vol.set_format(rate, channels as usize);
         if inner.digital {
             let ch = channels;
             inner.send_audio_infoframe(ch);
@@ -1925,8 +2142,13 @@ impl AudioScheme for HdaDevice {
         }
         let mut inner = self.inner.lock();
         inner.poll_progress();
-        let starting = !inner.running && !inner.paused;
-        if starting {
+        // A stream with nothing in flight: the next start begins at ring
+        // offset 0. Under a start hold the ring fills across several writes
+        // before the engine runs, so "fresh" is an empty ring, not merely a
+        // stopped engine -- re-anchoring the pointers on the second held
+        // write would drop the first one.
+        let fresh = !inner.running && !inner.paused && inner.queued == 0;
+        if fresh {
             warn!(
                 "[hda] stream start: {} B offered at {} Hz, repick + stream reset next",
                 pcm.len(),
@@ -1941,7 +2163,10 @@ impl AudioScheme for HdaDevice {
             inner.wp = 0;
             inner.zero_ptr = 0;
             inner.queued = 0;
+            inner.stream_written = 0;
+            inner.pad_end = 0;
         }
+        let starting = !inner.running && !inner.paused && !inner.hold_start;
         let free = inner.free_bytes();
         // Whole frames only, so channels never swap on a partial write.
         let frame = inner.channels as usize * 2;
@@ -1953,13 +2178,18 @@ impl AudioScheme for HdaDevice {
         let mut done = 0;
         while done < n {
             let chunk = (n - done).min(inner.ring_len - p);
-            inner.copy_pcm_scaled(&pcm[done..done + chunk], inner.ring_va + p, chunk);
-            clflush_range(inner.ring_va + p, chunk);
+            let dst = inner.ring_va + p;
+            inner.copy_pcm_scaled(&pcm[done..done + chunk], dst, chunk);
+            clflush_range(dst, chunk);
             p = (p + chunk) % inner.ring_len;
             done += chunk;
         }
         inner.wp = p;
         inner.queued += n;
+        inner.stream_written += n;
+        // Client PCM again: the gap, if one was open, ends here. The pad
+        // ahead of it plays out on its own.
+        inner.gap_since_us = 0;
         inner.silence_ahead();
         if starting {
             inner.start_stream()?;
@@ -1969,7 +2199,6 @@ impl AudioScheme for HdaDevice {
                 mmio_r32(inner.bar, inner.sd_base + SD_CTL)
             );
         }
-        inner.stream_written += n;
         Ok(n)
     }
 
@@ -1987,6 +2216,12 @@ impl AudioScheme for HdaDevice {
     fn queued_bytes(&self) -> usize {
         let mut inner = self.inner.lock();
         inner.poll_progress();
+        inner.exposed_queued()
+    }
+
+    fn delay_bytes(&self) -> usize {
+        let mut inner = self.inner.lock();
+        inner.poll_progress();
         inner.queued
     }
 
@@ -2001,6 +2236,8 @@ impl AudioScheme for HdaDevice {
         inner.queued = 0;
         inner.wp = 0;
         inner.zero_ptr = 0;
+        inner.gap_since_us = 0;
+        inner.pad_end = 0;
         inner.silence_ring();
         Ok(())
     }
@@ -2022,12 +2259,35 @@ impl AudioScheme for HdaDevice {
         self.inner.lock().resume_stream()
     }
 
+    fn set_start_hold(&self, hold: bool) -> DeviceResult {
+        let mut inner = self.inner.lock();
+        inner.hold_start = hold;
+        if hold || inner.running || inner.paused || inner.queued == 0 {
+            return Ok(());
+        }
+        // Released with a primed ring: start it now, exactly as the write
+        // that filled it would have.
+        inner.start_stream()?;
+        warn!(
+            "[hda] stream started on trigger: {} B queued, CTL {:#x}",
+            inner.queued,
+            mmio_r32(inner.bar, inner.sd_base + SD_CTL)
+        );
+        Ok(())
+    }
+
     fn set_gain(&self, left: u8, right: u8, mute_left: bool, mute_right: bool) -> DeviceResult {
         let mut inner = self.inner.lock();
         inner.gain_l = left.min(100);
         inner.gain_r = right.min(100);
         inner.mute_l = mute_left;
         inner.mute_r = mute_right;
+        let (l, r) = (
+            gain_from_percent(left, mute_left),
+            gain_from_percent(right, mute_right),
+        );
+        inner.vol.set_target(0, l);
+        inner.vol.set_target(1, r);
         Ok(())
     }
 
@@ -2094,8 +2354,22 @@ impl AudioScheme for HdaDevice {
         );
         let _ = writeln!(
             out,
-            "[gpusnd] ring: running={} queued={} wp={} rate={} ch={}",
-            inner.running, inner.queued, inner.wp, inner.rate, inner.channels
+            "[gpusnd] ring: running={} queued={} (pad {} B of driver silence ahead of it) wp={} rate={} ch={} gap={}",
+            inner.running,
+            inner.exposed_queued(),
+            inner.queued - inner.exposed_queued(),
+            inner.wp,
+            inner.rate,
+            inner.channels,
+            if inner.gap_since_us != 0 {
+                alloc::format!(
+                    "{} ms (engine idling on silence, stops at {} ms)",
+                    timer_now_as_micros().wrapping_sub(inner.gap_since_us) / 1000,
+                    DAI_IDLE_STOP_US / 1000
+                )
+            } else {
+                String::from("none")
+            }
         );
         // Which position source the ring is pacing against. LPIB alone is the
         // fragile case: on a controller whose LPIB runs ahead of what has been
@@ -2120,9 +2394,10 @@ impl AudioScheme for HdaDevice {
         );
         let _ = writeln!(
             out,
-            "[gpusnd] events: {} drains, {} underruns, {} stream restarts, {} stop timeouts, {} rejected position reads{}",
+            "[gpusnd] events: {} drains, {} underruns (gaps the engine idled through), {} idle stops, {} stream restarts, {} stop timeouts, {} rejected position reads{}",
             inner.stat_drains,
             inner.stat_underruns,
+            inner.stat_idle_stops,
             inner.stat_restarts,
             inner.stat_stop_timeouts,
             inner.stat_bad_pos,
@@ -2156,6 +2431,21 @@ impl AudioScheme for HdaDevice {
             inner.stat_fifo_err,
             inner.stat_desc_err,
             mmio_r16(bar, sd + SD_FIFOS)
+        );
+        let _ = writeln!(
+            out,
+            "[gpusnd] routing: {} re-routes{}",
+            inner.stat_reroutes,
+            if inner.stat_reroutes > 0 {
+                alloc::format!(
+                    " (last pin {:#x} -> pin {:#x} at {} ms)",
+                    inner.last_reroute.0,
+                    inner.last_reroute.1,
+                    inner.last_reroute.2
+                )
+            } else {
+                String::new()
+            }
         );
         let _ = writeln!(
             out,
@@ -2196,13 +2486,13 @@ impl AudioScheme for HdaDevice {
                     / (inner.rate as u64 * inner.frame_bytes() as u64).max(1)
             );
         }
-        // The last stops, oldest first. wavplay's tone is 576000 B, so a stop
-        // that ends a stream short of that, well before 3000 ms, is a dropout;
-        // one at ~3000 ms with all of it written is the tone ending.
+        // The last gaps, oldest first. wavplay's tone is 576000 B, so a gap
+        // that opens short of that, well before 3000 ms, is a dropout; one
+        // at ~3000 ms with all of it written is the tone ending.
         for ev in inner.stops.iter().filter(|e| e.kind != 0) {
             let _ = writeln!(
                 out,
-                "[gpusnd]   stop: {} at {} ms by kernel clock / {} ms by HDA wall clock, {} B written to that stream",
+                "[gpusnd]   gap: {} at {} ms by kernel clock / {} ms by HDA wall clock, {} B written to that stream",
                 if ev.kind == b'U' { "underrun" } else { "drain" },
                 ev.at_ms,
                 ev.wall_ms,
@@ -2479,5 +2769,40 @@ impl PciDriver for HdaDriverPci {
         );
         let hda = Arc::new(HdaDevice::new(vaddr, name, dev.id.vendor_id == 0x10de)?);
         Ok(Device::Audio(hda))
+    }
+}
+
+#[cfg(test)]
+mod dai_tests {
+    use super::*;
+
+    #[test]
+    fn park_lands_past_the_furthest_counter_plus_the_margin() {
+        // The link clock is behind both counters: the engine has fetched
+        // ahead, so the park goes past what the counters say.
+        assert_eq!(park_target(1000, 9000, 4000, 8192), 9000 + 8192);
+        assert_eq!(park_target(1000, 4000, 9000, 8192), 9000 + 8192);
+        // Counters that lag the clock (a rejected read) do not pull it back.
+        assert_eq!(park_target(9000, 0, 0, 8192), 9000 + 8192);
+    }
+
+    #[test]
+    fn the_pad_is_not_the_clients_to_count() {
+        // 16 KiB in the ring, 10 KiB of it the pad still ahead of the
+        // playhead: the client sees only its own 6 KiB.
+        assert_eq!(exposed_queued(16384, 30000, 20000 - 240), 16384 - 10240);
+        // The pad shrinks as the link plays it and the client's share does
+        // not change until the link reaches its data.
+        assert_eq!(
+            exposed_queued(16384 - 4096, 30000, 20000 - 240 + 4096),
+            16384 - 10240
+        );
+        // Once the playhead is past the pad, everything queued is the client's.
+        assert_eq!(exposed_queued(6144, 30000, 30000), 6144);
+        assert_eq!(exposed_queued(6144, 30000, 31000), 6144);
+        // Never negative, whatever the bookkeeping says.
+        assert_eq!(exposed_queued(100, 30000, 0), 0);
+        // No pad: identity.
+        assert_eq!(exposed_queued(777, 0, 12345), 777);
     }
 }

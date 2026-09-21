@@ -106,8 +106,21 @@ impl<T, P: Policy> Debug for UserPtr<T, P> {
 /// First address above the user half. Canonical x86_64 splits at
 /// `0x0000_8000_0000_0000`, and Sv39/Sv48/aarch64 user ranges all sit below it,
 /// so one constant covers every bare-metal target.
-#[cfg(not(feature = "libos"))]
 const USER_MAX: usize = 0x0000_8000_0000_0000;
+
+/// Whether `[addr, addr + bytes)` fits below `max` without wrapping.
+///
+/// Split out of [`in_user_half`] so the arithmetic — which is the part that
+/// can regress — is compiled and unit-tested on the host, where the only
+/// buildable configuration is `libos` and [`in_user_half`] itself is a
+/// constant `true`.
+#[inline]
+fn range_within(addr: usize, bytes: usize, max: usize) -> bool {
+    match addr.checked_add(bytes) {
+        Some(end) => end <= max,
+        None => false,
+    }
+}
 
 /// Whether `[addr, addr + bytes)` lies entirely in the user half.
 ///
@@ -122,18 +135,11 @@ const USER_MAX: usize = 0x0000_8000_0000_0000;
 /// host addresses, so the bound does not apply there.
 #[inline]
 fn in_user_half(addr: usize, bytes: usize) -> bool {
-    #[cfg(feature = "libos")]
-    {
-        let _ = (addr, bytes);
-        true
-    }
-    #[cfg(not(feature = "libos"))]
-    {
-        match addr.checked_add(bytes) {
-            Some(end) => end <= USER_MAX,
-            None => false,
-        }
-    }
+    // `cfg!` rather than `#[cfg]` so the bare-metal arm is type-checked in
+    // every configuration -- including the only one that builds on a
+    // developer's host and in the unit-test job, which is `libos`. The
+    // constant makes it fold away there.
+    cfg!(feature = "libos") || range_within(addr, bytes, USER_MAX)
 }
 
 /// `access_ok()` for a raw `(addr, bytes)` pair that a device ioctl is about
@@ -596,5 +602,301 @@ impl<P: Policy> IoVec<P> {
         } else {
             Err(Error::InvalidVectorAddress)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Host tests for the user-pointer copy primitives.
+    //!
+    //! Every syscall that moves bytes between the kernel and a process goes
+    //! through this module, so a regression here is either an arbitrary
+    //! kernel-memory read/write reachable from userspace (the bound checks) or
+    //! silent data corruption in `read`/`write`/`readv`/`writev` (the copy
+    //! helpers). Both are invisible until something far away misbehaves, which
+    //! is exactly what a unit test is for.
+    //!
+    //! The host's own heap and stack live below `USER_MAX`
+    //! (`0x0000_8000_0000_0000`) on x86_64 Linux, so a plain `Vec` is a valid
+    //! stand-in for a user buffer and the copies below run for real.
+
+    use super::*;
+    use crate::kernel_handler::KernelHandler;
+
+    struct TestHandler;
+    impl KernelHandler for TestHandler {}
+
+    /// `check()` consults `KHANDLER`, which has no default outside `libos`.
+    /// `init_once_by` is a `call_once`, so every test may call this.
+    fn init_handler() {
+        crate::KHANDLER.init_once_by(&TestHandler);
+    }
+
+    // ---- bounds ---------------------------------------------------------
+
+    /// The bound arithmetic itself. `in_user_half` is a constant `true` under
+    /// `libos`, the only configuration `kernel-hal` builds in on the host, so
+    /// the bare-metal behaviour is tested through [`range_within`] — the
+    /// function `in_user_half` delegates to when the bound applies.
+    #[test]
+    fn range_within_refuses_to_cross_or_wrap_past_the_limit() {
+        // Wholly below the limit.
+        assert!(range_within(0x1000, 0x100, USER_MAX));
+        // The last byte is in; the first byte above it is out.
+        assert!(range_within(USER_MAX - 1, 1, USER_MAX));
+        assert!(!range_within(USER_MAX, 1, USER_MAX));
+        // A zero-length range exactly at the limit still fits.
+        assert!(range_within(USER_MAX, 0, USER_MAX));
+        // A range that STARTS below the limit but runs past it is rejected as
+        // a whole -- the case that made every syscall out-pointer an
+        // arbitrary kernel-memory write.
+        assert!(range_within(USER_MAX - 8, 8, USER_MAX));
+        assert!(!range_within(USER_MAX - 8, 9, USER_MAX));
+        // `addr + bytes` must not be allowed to wrap around back into range.
+        assert!(!range_within(usize::MAX, 1, USER_MAX));
+        assert!(!range_within(0x1000, usize::MAX, USER_MAX));
+        // A kernel-half address, which is what a malicious pointer looks like.
+        assert!(!range_within(0xffff_8000_0000_0000, 1, USER_MAX));
+    }
+
+    #[test]
+    fn user_range_ok_lets_zero_length_through_but_never_a_null_pointer() {
+        // A zero-length range is always fine, even from a null pointer: that
+        // is what `read(fd, buf, 0)` and an empty ioctl payload pass.
+        assert!(user_range_ok(0, 0));
+        // A null pointer with bytes to move is not.
+        assert!(!user_range_ok(0, 1));
+        // An ordinary buffer is.
+        let buf = [0u8; 16];
+        assert!(user_range_ok(buf.as_ptr() as usize, buf.len()));
+        // The bound itself only applies on bare metal; assert it where it does.
+        #[cfg(not(feature = "libos"))]
+        {
+            assert!(!user_range_ok(USER_MAX, 1));
+            assert!(!user_range_ok(USER_MAX - 8, 9));
+        }
+    }
+
+    #[test]
+    fn check_rejects_null_and_unaligned_pointers() {
+        init_handler();
+        assert_eq!(
+            UserInPtr::<u64>::from(0).check().err(),
+            Some(Error::InvalidPointer)
+        );
+        // Aligned: fine.
+        let v = [0u64; 2];
+        let p = UserInPtr::<u64>::from(v.as_ptr() as usize);
+        assert_eq!(p.check(), Ok(()));
+        // Same buffer off by one byte: `u64` needs 8-byte alignment.
+        assert_eq!(
+            UserInPtr::<u64>::from(v.as_ptr() as usize + 1)
+                .check()
+                .err(),
+            Some(Error::InvalidPointer)
+        );
+        // A kernel-half address is refused however well aligned it is.
+        #[cfg(not(feature = "libos"))]
+        assert_eq!(
+            UserInPtr::<u64>::from(0xffff_8000_0000_0000).check().err(),
+            Some(Error::InvalidPointer)
+        );
+    }
+
+    #[test]
+    fn check_len_refuses_a_count_whose_byte_size_overflows() {
+        init_handler();
+        // `count * size_of::<T>()` must not be allowed to wrap: a count that
+        // overflows is a length error, never a pass.
+        let v = [0u32; 4];
+        let p = UserInPtr::<u32>::from(v.as_ptr() as usize);
+        assert_eq!(p.check_len(4), Ok(()));
+        assert_eq!(p.check_len(usize::MAX).err(), Some(Error::InvalidLength));
+        // And an array that runs off the top of the user half is refused.
+        #[cfg(not(feature = "libos"))]
+        {
+            let top = UserInPtr::<u32>::from(USER_MAX - 0x1000);
+            assert_eq!(top.check_len(0x400), Ok(()));
+            assert_eq!(top.check_len(0x401).err(), Some(Error::InvalidPointer));
+        }
+    }
+
+    #[test]
+    fn from_addr_size_requires_room_for_the_whole_value() {
+        // `size` is the buffer userspace offered, in bytes.
+        assert!(UserInPtr::<u64>::from_addr_size(0x1000, 8).is_ok());
+        assert!(UserInPtr::<u64>::from_addr_size(0x1000, 9).is_ok());
+        assert_eq!(
+            UserInPtr::<u64>::from_addr_size(0x1000, 7).err(),
+            Some(Error::BufferTooSmall)
+        );
+    }
+
+    // ---- copies ---------------------------------------------------------
+
+    #[test]
+    fn read_array_and_as_slice_copy_the_requested_elements() {
+        init_handler();
+        let src: Vec<u32> = (0..16).collect();
+        let p = UserInPtr::<u32>::from(src.as_ptr() as usize);
+        assert_eq!(p.read_array(4).unwrap(), [0, 1, 2, 3]);
+        assert_eq!(p.add(12).as_slice(4).unwrap(), &[12, 13, 14, 15]);
+        // A zero-length read is legal and allocates nothing, even though the
+        // pointer is never checked on that path.
+        assert!(p.read_array(0).unwrap().is_empty());
+        assert!(UserInPtr::<u32>::from(0).as_slice(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn as_c_str_stops_at_the_nul_and_validates_utf8() {
+        init_handler();
+        let s = b"hola\0resto ignorado\0";
+        let p = UserInPtr::<u8>::from(s.as_ptr() as usize);
+        assert_eq!(p.as_c_str().unwrap(), "hola");
+        // An empty C string is a valid one.
+        let empty = b"\0";
+        assert_eq!(
+            UserInPtr::<u8>::from(empty.as_ptr() as usize)
+                .as_c_str()
+                .unwrap(),
+            ""
+        );
+        // Bytes that are not UTF-8 are rejected rather than transmuted.
+        let bad = b"\xff\xfe\0";
+        assert_eq!(
+            UserInPtr::<u8>::from(bad.as_ptr() as usize).as_c_str(),
+            Err(Error::InvalidUtf8)
+        );
+    }
+
+    #[test]
+    fn write_cstring_bounds_the_trailing_nul() {
+        init_handler();
+        let mut buf = [0xAAu8; 8];
+        let mut p = UserOutPtr::<u8>::from(buf.as_mut_ptr() as usize);
+        p.write_cstring("abc").unwrap();
+        assert_eq!(&buf[..5], b"abc\0\xAA");
+    }
+
+    #[test]
+    fn read_cstring_array_stops_at_the_null_entry() {
+        init_handler();
+        let a = b"uno\0";
+        let b = b"dos\0";
+        // argv-shaped: pointers to C strings, terminated by a null pointer.
+        let argv: Vec<usize> = vec![a.as_ptr() as usize, b.as_ptr() as usize, 0];
+        let p = UserInPtr::<UserInPtr<u8>>::from(argv.as_ptr() as usize);
+        assert_eq!(p.read_cstring_array().unwrap(), vec!["uno", "dos"]);
+    }
+
+    // ---- iovecs ---------------------------------------------------------
+
+    /// Build a user-visible `struct iovec[]` over `slices` and read it back
+    /// through the same path `readv`/`writev` use. The returned `Vec` must
+    /// outlive the `IoVecs`, hence the tuple.
+    fn iovecs_over<P: Policy>(slices: &[(usize, usize)]) -> (Vec<IoVec<P>>, IoVecs<P>) {
+        let raw: Vec<IoVec<P>> = slices
+            .iter()
+            .map(|&(ptr, len)| IoVec {
+                ptr: UserPtr::from(ptr),
+                len,
+            })
+            .collect();
+        let vecs = UserInPtr::<IoVec<P>>::from(raw.as_ptr() as usize)
+            .read_iovecs(raw.len())
+            .unwrap();
+        (raw, vecs)
+    }
+
+    #[test]
+    fn read_iovecs_enforces_iov_max_and_a_non_overflowing_total() {
+        init_handler();
+        // A null iov array is EFAULT-shaped, not an empty gather list.
+        assert_eq!(
+            UserInPtr::<IoVecIn>::from(0).read_iovecs(0).err(),
+            Some(Error::InvalidPointer)
+        );
+        let one = [0u8; 1];
+        let raw = vec![IoVecIn {
+            ptr: UserPtr::from(one.as_ptr() as usize),
+            len: 1,
+        }];
+        let p = UserInPtr::<IoVecIn>::from(raw.as_ptr() as usize);
+        // IOV_MAX is 1024; a larger count is refused before any allocation.
+        assert_eq!(p.read_iovecs(1025).err(), Some(Error::InvalidLength));
+        // Two iovecs whose lengths sum past `usize` are refused too: the sum
+        // is what the caller sizes its kernel buffer with.
+        let huge = vec![
+            IoVecIn {
+                ptr: UserPtr::from(one.as_ptr() as usize),
+                len: usize::MAX,
+            },
+            IoVecIn {
+                ptr: UserPtr::from(one.as_ptr() as usize),
+                len: 2,
+            },
+        ];
+        assert_eq!(
+            UserInPtr::<IoVecIn>::from(huge.as_ptr() as usize)
+                .read_iovecs(2)
+                .err(),
+            Some(Error::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn read_bytes_at_walks_the_gather_list_through_a_bounded_buffer() {
+        init_handler();
+        let a = b"abcd";
+        let empty: [u8; 0] = [];
+        let b = b"efghij";
+        // A zero-length iovec in the middle is legal and contributes nothing.
+        let (_raw, vecs) = iovecs_over::<In>(&[
+            (a.as_ptr() as usize, a.len()),
+            (empty.as_ptr() as usize, 0),
+            (b.as_ptr() as usize, b.len()),
+        ]);
+        assert_eq!(vecs.total_len(), 10);
+        assert_eq!(vecs.read_to_vec().unwrap(), b"abcdefghij");
+
+        // Whole stream through a buffer smaller than any single iovec.
+        let mut out = Vec::new();
+        let mut off = 0;
+        loop {
+            let mut chunk = [0u8; 3];
+            let n = vecs.read_bytes_at(off, &mut chunk).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..n]);
+            off += n;
+        }
+        assert_eq!(out, b"abcdefghij");
+
+        // An offset that lands inside the second non-empty iovec.
+        let mut chunk = [0u8; 4];
+        assert_eq!(vecs.read_bytes_at(6, &mut chunk).unwrap(), 4);
+        assert_eq!(&chunk, b"ghij");
+        // Past the end of the stream is 0 bytes, not an error.
+        assert_eq!(vecs.read_bytes_at(10, &mut chunk).unwrap(), 0);
+        assert_eq!(vecs.read_bytes_at(99, &mut chunk).unwrap(), 0);
+    }
+
+    #[test]
+    fn write_from_buf_scatters_and_reports_what_it_placed() {
+        init_handler();
+        let mut a = [0u8; 4];
+        let mut b = [0u8; 4];
+        let (_raw, mut vecs) =
+            iovecs_over::<Out>(&[(a.as_mut_ptr() as usize, 4), (b.as_mut_ptr() as usize, 4)]);
+        // A buffer shorter than the scatter list fills it partially and
+        // reports the bytes actually placed.
+        assert_eq!(vecs.write_from_buf(b"12345").unwrap(), 5);
+        assert_eq!(&a, b"1234");
+        assert_eq!(&b[..1], b"5");
+        // A buffer longer than the scatter list stops at its capacity.
+        assert_eq!(vecs.write_from_buf(b"ABCDEFGHIJ").unwrap(), 8);
+        assert_eq!(&a, b"ABCD");
+        assert_eq!(&b, b"EFGH");
     }
 }

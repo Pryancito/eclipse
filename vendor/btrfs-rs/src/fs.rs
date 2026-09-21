@@ -77,6 +77,17 @@ pub struct Btrfs {
     /// Entries are keyed by the volume's write epoch so any mutation
     /// invalidates them.
     read_cache: Vec<ReadCacheEntry>,
+    /// The most recently inflated compressed extent, so that a stream of small
+    /// reads over one 128 KiB extent inflates it once instead of once per
+    /// call. Keyed by the volume write epoch, like [`ReadCacheEntry`].
+    decompressed: Option<DecompressedExtent>,
+}
+
+/// One inflated compressed extent (see [`Btrfs::decompressed`]).
+struct DecompressedExtent {
+    epoch: u64,
+    disk_bytenr: u64,
+    data: Vec<u8>,
 }
 
 /// Number of files whose extent maps are kept cached for reads. Demand paging
@@ -84,6 +95,44 @@ pub struct Btrfs {
 /// interleaved pattern; a few dozen entries keep all of them warm at a few
 /// hundred bytes each.
 const READ_CACHE_FILES: usize = 32;
+
+/// Ceiling on the bytes one compressed extent may claim, compressed or not.
+/// Linux caps an uncompressed extent at 128 KiB before compressing it
+/// (`BTRFS_MAX_UNCOMPRESSED`), so this is generous; it is here only so that a
+/// corrupt or hostile item cannot make us allocate an arbitrary buffer from
+/// a field we read straight off the disk.
+const MAX_COMPRESSED_EXTENT: u64 = 1 << 20;
+
+/// Inflate one compressed extent payload.
+///
+/// `ram_bytes` is what the extent item claims the result is, and doubles as
+/// the output ceiling: a stream that wants to produce more than its own item
+/// admits to is not something we should be allocating for.
+fn inflate(compression: u8, src: &[u8], ram_bytes: u64) -> Result<Vec<u8>> {
+    if ram_bytes > MAX_COMPRESSED_EXTENT {
+        return Err(Error::Corrupt("compressed extent too large"));
+    }
+    match compression {
+        COMPRESS_ZLIB => {
+            miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(src, ram_bytes as usize)
+                .map_err(|e| {
+                    warn!(
+                        "btrfs: zlib inflate failed: {:?} ({} compressed bytes, {} expected)",
+                        e.status,
+                        src.len(),
+                        ram_bytes,
+                    );
+                    Error::Corrupt("zlib inflate failed")
+                })
+        }
+        // Both carry an incompat flag, so `Volume::open` already refused the
+        // mount; this arm only exists so that a hand-built item cannot reach
+        // the `_` arm and be reported as corruption.
+        COMPRESS_LZO => Err(Error::Unsupported("lzo-compressed extent")),
+        COMPRESS_ZSTD => Err(Error::Unsupported("zstd-compressed extent")),
+        _ => Err(Error::Corrupt("unknown extent compression")),
+    }
+}
 
 struct ReadCacheEntry {
     ino: u64,
@@ -134,6 +183,7 @@ impl Btrfs {
             sb_dirty: false,
             deferred_sb_commits: 0,
             read_cache: Vec::new(),
+            decompressed: None,
             clock: None,
         };
         fs.alloc.nodesize = fs.vol.nodesize as u64;
@@ -1268,8 +1318,12 @@ impl Btrfs {
                 if key.objectid != ino || key.item_type != EXTENT_DATA_KEY || key.offset >= end {
                     return Ok(false);
                 }
-                if let Some(ext) = FileExtent::parse(data) {
-                    out.push((key.offset, ext, data.to_vec()));
+                // Skipping an item we cannot parse leaves a gap that `read`
+                // fills with zeros, so an encrypted or truncated extent used
+                // to read back as silent garbage. Fail the read instead.
+                match FileExtent::parse(data) {
+                    Some(ext) => out.push((key.offset, ext, data.to_vec())),
+                    None => return Err(Error::Corrupt("file extent")),
                 }
                 Ok(true)
             },
@@ -1368,13 +1422,25 @@ impl Btrfs {
             c.cached_start = offset;
             c.cached_end = end;
         }
+        // Uncompressed extents are served here, straight into `buf`, without
+        // cloning anything out of the read cache. Compressed ones need
+        // `&mut self` (they inflate through `self.decompressed`), which the
+        // borrow on `self.read_cache` rules out, so they are set aside and
+        // handled in a second pass. Compression is rare enough that paying a
+        // clone for it keeps the common path allocation-free.
+        let mut compressed: Vec<(u64, FileExtent, Vec<u8>)> = Vec::new();
         let cache = self.read_cache.last().unwrap();
         for (file_off, ext, raw) in cache.extents.iter() {
             let file_off = *file_off;
+            if ext.compression() != COMPRESS_NONE {
+                compressed.push((file_off, ext.clone(), raw.clone()));
+                continue;
+            }
             match ext {
                 FileExtent::Inline {
                     ram_bytes,
                     data_off,
+                    ..
                 } => {
                     let data = &raw[*data_off..];
                     let len = (*ram_bytes as usize).min(data.len());
@@ -1413,7 +1479,92 @@ impl Btrfs {
                 }
             }
         }
+        for (file_off, ext, raw) in compressed {
+            self.read_compressed_extent(file_off, &ext, &raw, offset, end, buf)?;
+        }
         Ok(want)
+    }
+
+    /// Copy the part of one compressed extent that falls inside
+    /// `[offset, end)` into `buf` (which starts at file offset `offset`).
+    fn read_compressed_extent(
+        &mut self,
+        file_off: u64,
+        ext: &FileExtent,
+        raw: &[u8],
+        offset: u64,
+        end: u64,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        match *ext {
+            FileExtent::Inline {
+                ram_bytes,
+                data_off,
+                compression,
+            } => {
+                // An inline extent is the whole file and always starts at
+                // offset 0, so the decompressed buffer is indexed by file
+                // offset directly. They are at most one sector, so there is
+                // nothing worth caching.
+                let plain = inflate(compression, &raw[data_off..], ram_bytes)?;
+                let lo = offset.max(file_off) as usize;
+                let hi = (end as usize).min(plain.len());
+                if lo < hi {
+                    buf[lo - offset as usize..hi - offset as usize].copy_from_slice(&plain[lo..hi]);
+                }
+                Ok(())
+            }
+            FileExtent::Regular {
+                disk_bytenr,
+                disk_num_bytes,
+                offset: ext_off,
+                num_bytes,
+                ram_bytes,
+                compression,
+            } => {
+                if disk_bytenr == 0 {
+                    return Ok(()); // hole; cannot be compressed, but be safe
+                }
+                if file_off >= end || file_off + num_bytes <= offset {
+                    return Ok(());
+                }
+                let lo = offset.max(file_off);
+                let hi = end.min(file_off + num_bytes);
+                if lo >= hi {
+                    return Ok(());
+                }
+                // `offset` and `num_bytes` index the DECOMPRESSED extent, so
+                // the whole thing has to be inflated even for a 4 KiB read.
+                let epoch = self.vol.write_epoch();
+                let hit = matches!(
+                    &self.decompressed,
+                    Some(d) if d.epoch == epoch && d.disk_bytenr == disk_bytenr
+                );
+                if !hit {
+                    if disk_num_bytes > MAX_COMPRESSED_EXTENT {
+                        return Err(Error::Corrupt("compressed extent too large"));
+                    }
+                    let mut raw_extent = alloc::vec![0u8; disk_num_bytes as usize];
+                    self.vol.read_logical(disk_bytenr, &mut raw_extent)?;
+                    let data = inflate(compression, &raw_extent, ram_bytes)?;
+                    self.decompressed = Some(DecompressedExtent {
+                        epoch,
+                        disk_bytenr,
+                        data,
+                    });
+                }
+                let plain = &self.decompressed.as_ref().unwrap().data;
+                let from = (ext_off + (lo - file_off)) as usize;
+                let to = from + (hi - lo) as usize;
+                if to > plain.len() {
+                    // The extent decompressed to less than its own item claims.
+                    return Err(Error::Corrupt("short compressed extent"));
+                }
+                buf[(lo - offset) as usize..(hi - offset) as usize]
+                    .copy_from_slice(&plain[from..to]);
+                Ok(())
+            }
+        }
     }
 
     /// Allocate, zero and record one data extent for `[pos, pos+len)`.
@@ -1680,6 +1831,14 @@ impl Btrfs {
         let extent_count = extents.len();
         let mut done = offset;
         for (file_off, ext, _) in extents {
+            // `disk_bytenr + ext_off` addresses COMPRESSED bytes on a
+            // compressed extent, so writing plaintext there would destroy the
+            // stream and every other mapping into it. We only ever create
+            // uncompressed extents, so this is about foreign volumes written
+            // by Linux with `compress=zlib`: they stay readable, not writable.
+            if ext.compression() != COMPRESS_NONE {
+                return Err(Error::Unsupported("write to a compressed extent"));
+            }
             if let FileExtent::Regular {
                 disk_bytenr,
                 offset: ext_off,
@@ -1856,6 +2015,7 @@ impl Btrfs {
                         disk_bytenr,
                         disk_num_bytes,
                         num_bytes,
+                        compression,
                         ..
                     } => {
                         if file_off >= keep {
@@ -1876,7 +2036,17 @@ impl Btrfs {
                             inode.nbytes = inode.nbytes.saturating_sub(num_bytes);
                         } else if file_off + num_bytes > keep {
                             // Straddling: shrink the mapping (the disk extent
-                            // stays allocated in full).
+                            // stays allocated in full). Only sound when the
+                            // extent is stored plain -- `num_bytes` then
+                            // matches the bytes on disk. On a compressed
+                            // extent, rewriting ram_bytes would tell the next
+                            // reader (us or Linux) to inflate to the wrong
+                            // size.
+                            if compression != COMPRESS_NONE {
+                                return Err(Error::Unsupported(
+                                    "truncate inside a compressed extent",
+                                ));
+                            }
                             let new_len = keep - file_off;
                             let mut t = self.tree();
                             t.update_in_place(
@@ -1981,4 +2151,352 @@ fn check_name(name: &str) -> Result<&[u8]> {
         return Err(Error::Invalid);
     }
     Ok(b)
+}
+
+// ---------------------------------------------------------------------------
+// Compressed-extent tests
+// ---------------------------------------------------------------------------
+//
+// These live inside the crate rather than in `tests/` because building a
+// compressed extent needs the private tree and allocator APIs: nothing in
+// this driver ever *writes* compression, and nothing in this container can
+// mount btrfs to have Linux write one for us (no btrfs module, no privileged
+// mount). So the item is hand-built here -- and then handed to btrfs-progs,
+// which parses it with the real `struct btrfs_file_extent_item`, as an
+// independent check that the layout is right rather than merely
+// self-consistent.
+#[cfg(all(test, feature = "std"))]
+mod compressed_tests {
+    use super::*;
+    use crate::device::FileDevice;
+    use crate::mkfs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn tmpfile(name: &str, size: u64) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(std::format!("btrfs-zlib-{}-{}", std::process::id(), name));
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        f.set_len(size).unwrap();
+        path
+    }
+
+    fn open_dev(path: &Path) -> Arc<dyn BlockDevice> {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        Arc::new(FileDevice::open(f).unwrap())
+    }
+
+    fn opts() -> mkfs::MkfsOptions {
+        let mut seed = 0x0bad_c0de_dead_beefu64;
+        let mut uuid = || {
+            let mut u = [0u8; 16];
+            for b in u.iter_mut() {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *b = (seed >> 33) as u8;
+            }
+            u[6] = (u[6] & 0x0f) | 0x40;
+            u[8] = (u[8] & 0x3f) | 0x80;
+            u
+        };
+        mkfs::MkfsOptions {
+            label: "eclipse".into(),
+            fsid: uuid(),
+            chunk_uuid: uuid(),
+            dev_uuid: uuid(),
+            subvol_uuid: uuid(),
+            now: (1_700_000_000, 0),
+        }
+    }
+
+    fn have_progs() -> bool {
+        Command::new("btrfs")
+            .arg("version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Data that compresses well but is not a constant run, so a decoder that
+    /// silently produced zeros (or dropped a block) cannot pass by accident.
+    fn payload(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut seed = 1u32;
+        while out.len() < len {
+            seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+            let word = std::format!("word{} ", (seed >> 20) % 64);
+            out.extend_from_slice(word.as_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    fn zlib(data: &[u8]) -> Vec<u8> {
+        miniz_oxide::deflate::compress_to_vec_zlib(data, 6)
+    }
+
+    /// Same field layout as [`FileExtent::encode_regular`], plus compression.
+    fn encode_compressed_regular(
+        generation: u64,
+        disk_bytenr: u64,
+        disk_num_bytes: u64,
+        offset: u64,
+        num_bytes: u64,
+        ram_bytes: u64,
+    ) -> [u8; FILE_EXTENT_REG_LEN] {
+        let mut b = [0u8; FILE_EXTENT_REG_LEN];
+        put_u64(&mut b, 0, generation);
+        put_u64(&mut b, 8, ram_bytes);
+        b[16] = COMPRESS_ZLIB;
+        b[20] = FILE_EXTENT_REG;
+        put_u64(&mut b, 21, disk_bytenr);
+        put_u64(&mut b, 29, disk_num_bytes);
+        put_u64(&mut b, 37, offset);
+        put_u64(&mut b, 45, num_bytes);
+        b
+    }
+
+    fn encode_compressed_inline(generation: u64, ram_bytes: u64, zdata: &[u8]) -> Vec<u8> {
+        let mut b = alloc::vec![0u8; FILE_EXTENT_HDR_LEN + zdata.len()];
+        put_u64(&mut b, 0, generation);
+        put_u64(&mut b, 8, ram_bytes);
+        b[16] = COMPRESS_ZLIB;
+        b[20] = FILE_EXTENT_INLINE;
+        b[FILE_EXTENT_HDR_LEN..].copy_from_slice(zdata);
+        b
+    }
+
+    /// Create `name` under the root and give it one zlib-compressed regular
+    /// extent holding `plain`, the way `compress=zlib` on Linux would.
+    fn install_zlib_file(fs: &mut Btrfs, name: &str, plain: &[u8]) -> u64 {
+        let root = fs.root_ino();
+        let ino = fs.create(root, name, FileKind::Regular, 0o644, 0).unwrap();
+        let sector = fs.vol.sectorsize as u64;
+        let z = zlib(plain);
+        let disk_len = (z.len() as u64).div_ceil(sector) * sector;
+
+        fs.ensure_data_space(disk_len).unwrap();
+        let (bytenr, got) = fs.alloc.alloc_data(disk_len).unwrap();
+        assert_eq!(got, disk_len, "allocator split the extent");
+        // The tail of the last sector is padding; zero it so the image is
+        // deterministic, then lay the stream down.
+        let mut sectors = alloc::vec![0u8; disk_len as usize];
+        sectors[..z.len()].copy_from_slice(&z);
+        fs.vol.write_logical(bytenr, &sectors).unwrap();
+        fs.alloc.note_data_extent(bytenr, disk_len, FS_TREE, ino, 0);
+
+        let item = encode_compressed_regular(
+            fs.generation,
+            bytenr,
+            disk_len,
+            0,
+            plain.len() as u64,
+            plain.len() as u64,
+        );
+        fs.tree()
+            .insert(FS_TREE, Key::new(ino, EXTENT_DATA_KEY, 0), &item)
+            .unwrap();
+        fs.apply_pending().unwrap();
+
+        // Linux always checksums compressed data, and btrfs-progs enforces it:
+        // `check_file_extent` raises I_ERR_BAD_FILE_EXTENT for
+        // `compression && nodatasum`, and I_ERR_SOME_CSUM_MISSING unless the
+        // csums cover disk_num_bytes (the COMPRESSED length). This driver
+        // creates every file NODATASUM|NODATACOW, so an image that is to pass
+        // `btrfs check` has to undo that here and lay the csums down itself.
+        install_csums(fs, bytenr, &sectors);
+
+        let mut inode = fs.read_inode(ino).unwrap();
+        inode.size = plain.len() as u64;
+        // btrfs accounts a file's nbytes in DECOMPRESSED bytes: `btrfs check`
+        // sums the extents' `num_bytes`, not what they occupy on disk.
+        inode.nbytes = plain.len() as u64;
+        inode.flags &= !(INODE_NODATASUM | INODE_NODATACOW);
+        fs.write_inode(ino, &inode).unwrap();
+        fs.commit(true).unwrap();
+        ino
+    }
+
+    /// Checksum every sector of `data` (which lives at logical `bytenr`) into
+    /// one EXTENT_CSUM item, the way Linux would for a compressed extent.
+    fn install_csums(fs: &mut Btrfs, bytenr: u64, data: &[u8]) {
+        let sector = fs.vol.sectorsize;
+        assert_eq!(data.len() % sector, 0);
+        let mut item = Vec::with_capacity(data.len() / sector * 4);
+        for chunk in data.chunks(sector) {
+            item.extend_from_slice(&crate::crc::checksum(chunk).to_le_bytes());
+        }
+        fs.tree()
+            .insert(
+                CSUM_TREE,
+                Key::new(EXTENT_CSUM_OBJECTID, EXTENT_CSUM_KEY, bytenr),
+                &item,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn regular_zlib_extent_reads_back() {
+        let path = tmpfile("regular", 64 * 1024 * 1024);
+        let dev = open_dev(&path);
+        mkfs::format(&*dev, &opts()).unwrap();
+        let mut fs = Btrfs::mount(dev, false).unwrap();
+        let plain = payload(96 * 1024);
+        let ino = install_zlib_file(&mut fs, "z", &plain);
+        drop(fs);
+
+        // Re-mount: nothing may be served out of a cache built while writing.
+        let mut fs = Btrfs::mount(open_dev(&path), true).unwrap();
+        let mut got = alloc::vec![0u8; plain.len()];
+        assert_eq!(fs.read(ino, 0, &mut got).unwrap(), plain.len());
+        assert_eq!(got, plain, "whole-file read");
+
+        // Partial reads: the mapping is indexed in DECOMPRESSED bytes, so an
+        // implementation that seeks into the compressed stream lands wrong.
+        for &(off, len) in &[
+            (0u64, 4096usize),
+            (4096, 4096),
+            (40_000, 1234),
+            (95_000, 1000),
+        ] {
+            let mut got = alloc::vec![0u8; len];
+            let n = fs.read(ino, off, &mut got).unwrap();
+            assert_eq!(n, len, "short read at {}", off);
+            assert_eq!(
+                got,
+                &plain[off as usize..off as usize + len],
+                "mismatch at offset {}",
+                off
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn inline_zlib_extent_reads_back() {
+        let path = tmpfile("inline", 64 * 1024 * 1024);
+        let dev = open_dev(&path);
+        mkfs::format(&*dev, &opts()).unwrap();
+        let mut fs = Btrfs::mount(dev, false).unwrap();
+        let root = fs.root_ino();
+        let ino = fs
+            .create(root, "small", FileKind::Regular, 0o644, 0)
+            .unwrap();
+        let plain = payload(2000);
+        let z = zlib(&plain);
+        let item = encode_compressed_inline(fs.generation, plain.len() as u64, &z);
+        fs.tree()
+            .insert(FS_TREE, Key::new(ino, EXTENT_DATA_KEY, 0), &item)
+            .unwrap();
+        let mut inode = fs.read_inode(ino).unwrap();
+        inode.size = plain.len() as u64;
+        inode.nbytes = plain.len() as u64;
+        inode.flags &= !(INODE_NODATASUM | INODE_NODATACOW);
+        fs.write_inode(ino, &inode).unwrap();
+        fs.commit(true).unwrap();
+        drop(fs);
+
+        let mut fs = Btrfs::mount(open_dev(&path), true).unwrap();
+        let mut got = alloc::vec![0u8; plain.len()];
+        assert_eq!(fs.read(ino, 0, &mut got).unwrap(), plain.len());
+        assert_eq!(got, plain);
+        let mut tail = alloc::vec![0u8; 500];
+        assert_eq!(fs.read(ino, 1500, &mut tail).unwrap(), 500);
+        assert_eq!(tail, &plain[1500..2000]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn writing_over_a_compressed_extent_is_refused() {
+        let path = tmpfile("rw", 64 * 1024 * 1024);
+        let dev = open_dev(&path);
+        mkfs::format(&*dev, &opts()).unwrap();
+        let mut fs = Btrfs::mount(dev, false).unwrap();
+        let plain = payload(96 * 1024);
+        let ino = install_zlib_file(&mut fs, "z", &plain);
+        drop(fs);
+
+        let mut fs = Btrfs::mount(open_dev(&path), false).unwrap();
+        // Overwriting in place would scribble plaintext into the middle of
+        // the deflate stream and destroy the whole extent.
+        assert_eq!(
+            fs.write(ino, 8192, b"hello"),
+            Err(Error::Unsupported("write to a compressed extent"))
+        );
+        // Truncating inside it would leave a ram_bytes that lies.
+        assert_eq!(
+            fs.truncate(ino, 40_000),
+            Err(Error::Unsupported("truncate inside a compressed extent"))
+        );
+        // ...and the data is still intact after both refusals.
+        let mut got = alloc::vec![0u8; plain.len()];
+        assert_eq!(fs.read(ino, 0, &mut got).unwrap(), plain.len());
+        assert_eq!(got, plain);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The layout oracle: btrfs-progs parses the item we built with the real
+    /// `struct btrfs_file_extent_item`. If any field sat at the wrong offset,
+    /// `btrfs check` would reject the image and the dump would not report a
+    /// zlib extent of the right size.
+    #[test]
+    fn btrfs_progs_agrees_with_our_compressed_item() {
+        if !have_progs() {
+            std::eprintln!("btrfs-progs not available; skipping");
+            return;
+        }
+        let path = tmpfile("progs", 64 * 1024 * 1024);
+        let dev = open_dev(&path);
+        mkfs::format(&*dev, &opts()).unwrap();
+        let mut fs = Btrfs::mount(dev, false).unwrap();
+        let plain = payload(96 * 1024);
+        install_zlib_file(&mut fs, "z", &plain);
+        drop(fs);
+
+        let out = Command::new("btrfs")
+            .args(["check", "--force"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "btrfs check failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let out = Command::new("btrfs")
+            .args(["inspect-internal", "dump-tree", "-t", "5"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        let dump = String::from_utf8_lossy(&out.stdout);
+        // Every one of these lines is btrfs-progs reading a field of our item
+        // through the real `struct btrfs_file_extent_item`; each would read
+        // as garbage if we had put that field at the wrong offset.
+        for expect in [
+            "extent data disk byte 13631488 nr 20480",
+            "extent data offset 0 nr 98304 ram 98304",
+            "extent compression 1 (zlib)",
+        ] {
+            assert!(
+                dump.lines().any(|l| l.trim() == expect),
+                "btrfs-progs did not read back {:?}; dump:\n{}",
+                expect,
+                dump
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 }

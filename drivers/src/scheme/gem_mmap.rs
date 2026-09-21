@@ -118,14 +118,16 @@ struct MappedGem {
     /// Every holder of a reference to this object, BY PID, one entry per
     /// reference: the `GEM_NEW` creator first, then one entry per PRIME
     /// *self-import* (`FD_TO_HANDLE` handing back this ORIGINAL handle, see
-    /// `lookup_by_phys`). Real Linux DRM keeps a GEM object alive as long as
-    /// any handle or dma-buf references it, and handles are per `drm_file`;
-    /// this is the closest a global handle namespace gets. Each `GEM_CLOSE`
-    /// drops ONE entry of the closing pid ([`dec_ref`]), a process exit drops
-    /// every entry of that pid ([`release_pid`]), and the object is only truly
-    /// freed when the list is empty. A pid that is not in the list may not
-    /// use, map, bind or close the object ([`holds`]) -- before this the
-    /// count was anonymous, so any process could `GEM_CLOSE` or `VM_BIND` the
+    /// `lookup_by_phys`), plus one entry per live dma-buf exported from it
+    /// ([`DMABUF_HOLDER`]) and per KMS framebuffer that pins it. Real Linux
+    /// DRM keeps a GEM object alive as long as any handle or dma-buf
+    /// references it, and handles are per `drm_file`; this is the closest a
+    /// global handle namespace gets. Each `GEM_CLOSE` drops ONE entry of the
+    /// closing pid ([`dec_ref`]), a process exit drops every entry of that
+    /// pid ([`release_pid`]), and the object is only truly freed when the
+    /// list is empty. A pid that is not in the list may not use, map, bind
+    /// or close the object ([`holds`]) -- before this the count was
+    /// anonymous, so any process could `GEM_CLOSE` or `VM_BIND` the
     /// compositor's buffers by guessing a handle, and a client that died
     /// without closing its own self-imports leaked the buffer until reboot
     /// (its import references were not attributable to it).
@@ -154,6 +156,21 @@ pub enum DecRef {
 lazy_static::lazy_static! {
     static ref MAPPINGS: Mutex<Vec<MappedGem>> = Mutex::new(Vec::new());
 }
+
+/// Holder id a live dma-buf fd records against a nouveau GEM object.
+///
+/// Real Linux keeps a GEM object alive for as long as any handle **or dma-buf**
+/// references it. Our export path used to wrap the physical range in a
+/// dma-buf without taking a `gem_mmap` reference,
+/// so the exporter's subsequent `GEM_CLOSE` (the normal DRI3 dance: export fd,
+/// hand it to Xwayland, close the local handle) freed the object while the
+/// dma-buf fd was still in flight. `lookup_by_phys` then missed on the
+/// importer side → generic handle → `GEM_INFO` ENOENT. Wayland-native clients
+/// usually keep their GEM handle open until `wl_buffer.release`, so the same
+/// bug was invisible there; the X11/Xwayland chain of three processes is what
+/// surfaces it. `u64::MAX - 1` is never a real pid (and is distinct from the
+/// KMS framebuffer sentinel `u64::MAX` in `linux-object`'s drm module).
+pub const DMABUF_HOLDER: u64 = u64::MAX - 1;
 
 /// Registers the physical mapping for `handle`, with `owner_pid` as its first
 /// holder. If `handle` is already present (re-registration of the same id)
@@ -277,8 +294,39 @@ pub fn lookup(handle: u32) -> Option<(u64, u64)> {
 }
 
 /// Like [`lookup`], but only if [`holds`] says `pid` may use `handle`.
+///
+/// A refusal here is SILENT to the caller -- PRIME export, the driver-private
+/// mmap and `ADDFB` all just see `None` and answer the same ENOENT/EINVAL they
+/// would for a handle that does not exist. That is the right answer for a
+/// prober and a terrible one to debug: if some legitimate holder is ever
+/// missing from `holders`, a real client (NVK under Xwayland, where the buffer
+/// crosses client -> Xwayland -> compositor) loses a buffer it owns and hangs
+/// with nothing in the log to say why.
+///
+/// So say it, loudly and at most a few times per boot: an entry that EXISTS but
+/// is not held by the caller is the only case worth reporting -- an unknown
+/// handle is an ordinary miss, not an ownership decision.
 pub fn lookup_for(handle: u32, pid: u64) -> Option<(u64, u64)> {
     if !holds(handle, pid) {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static DENIED: AtomicU32 = AtomicU32::new(0);
+        // Bound to a `let`, NOT left as an `if` condition: a temporary lock
+        // guard in the condition lives to the end of the `if`, which would
+        // hold MAPPINGS across the log call below.
+        let tracked = MAPPINGS.lock().iter().any(|e| e.handle == handle);
+        if tracked {
+            let n = DENIED.fetch_add(1, Ordering::Relaxed);
+            if n < 8 {
+                log::error!(
+                    "[gem] handle={:#x} refused to pid={} -- it is tracked but that pid holds no \
+                     reference (denial {}/8 this boot). If a working client just lost a buffer, \
+                     this is why: the holder list is missing whoever legitimately imported it.",
+                    handle,
+                    pid,
+                    n + 1
+                );
+            }
+        }
         return None;
     }
     lookup(handle)
@@ -344,5 +392,200 @@ mod handle_slice_tests {
         let last_end =
             (DRIVER_HANDLE_BASE as u64) + (HANDLE_SLICES as u64) * (HANDLES_PER_GPU as u64);
         assert_eq!(last_end, (u32::MAX as u64) + 1);
+    }
+}
+
+/// The buffer-sharing chain an X11 GL client actually walks, which is one hop
+/// longer than a Wayland one and is the reason it breaks on its own.
+///
+/// A native Wayland client hands its buffer to the compositor: two processes,
+/// one export and one import. An X11 client under Xwayland hands it to
+/// Xwayland, which hands it on to the compositor: **three** processes, and the
+/// middle one both imports and re-exports a buffer it did not allocate. Every
+/// ownership rule at the uAPI edge has to let that middle hop through, and a
+/// rule that is correct for two processes can be wrong for three — which is
+/// invisible in QEMU, where there is no nouveau GEM object in the first place
+/// and the whole path is never walked.
+///
+/// These drive the pid-parameterised layer directly (`lookup_for`, `add_ref`,
+/// `dec_ref`, `release_pid`) because the uAPI entry points above read the
+/// caller from the current thread, which a host test does not have.
+#[cfg(test)]
+mod xwayland_chain_tests {
+    use super::*;
+
+    /// Handles must be in the driver-private range: [`holds`] is deliberately
+    /// strict there and permissive below it, so a low id would pass every
+    /// assertion here for the wrong reason.
+    const CLIENT: u64 = 88_001;
+    const XWAYLAND: u64 = 88_002;
+    const COMPOSITOR: u64 = 88_003;
+    const STRANGER: u64 = 88_004;
+
+    fn drop_handle(handle: u32) {
+        while !matches!(dec_ref(handle, 0), DecRef::NotTracked | DecRef::Freed) {}
+    }
+
+    /// Client allocates and exports, Xwayland imports and re-exports, the
+    /// compositor imports. Every hop must resolve the buffer for the process
+    /// making it.
+    #[test]
+    fn a_buffer_survives_the_client_xwayland_compositor_chain() {
+        let handle = DRIVER_HANDLE_BASE + 0x10_0001;
+        let phys = 0x4_0000_0000;
+        register(handle, phys, 0x10_0000, CLIENT);
+
+        // 1. The client exports it (PRIME_HANDLE_TO_FD).
+        assert!(
+            lookup_for(handle, CLIENT).is_some(),
+            "the allocator can export its own buffer"
+        );
+
+        // 2. Xwayland imports it. A self-import resolves back to the original
+        //    nouveau handle — only that handle works with GEM_INFO/VM_BIND —
+        //    and takes a reference for the importer.
+        let (resolved, _) = lookup_by_phys(phys).expect("self-import finds the original handle");
+        assert_eq!(resolved, handle);
+        assert_eq!(add_ref(resolved, XWAYLAND), Some(2));
+
+        // 3. Xwayland re-exports it to the compositor. THIS is the hop a
+        //    Wayland client never makes, and the one an ownership rule
+        //    written for "the allocator" alone refuses.
+        assert!(
+            lookup_for(handle, XWAYLAND).is_some(),
+            "Xwayland can re-export a buffer it imported but did not allocate"
+        );
+
+        // 4. The compositor imports it and can reach it too.
+        assert_eq!(add_ref(handle, COMPOSITOR), Some(3));
+        assert!(
+            lookup_for(handle, COMPOSITOR).is_some(),
+            "the compositor can scan out what reached it through Xwayland"
+        );
+
+        drop_handle(handle);
+    }
+
+    /// An X11 client exiting is routine — the window closes — and must not
+    /// pull the buffer out from under Xwayland or the compositor, which are
+    /// still holding references to it.
+    #[test]
+    fn the_client_exiting_does_not_pull_the_buffer_from_xwayland() {
+        let handle = DRIVER_HANDLE_BASE + 0x10_0002;
+        let phys = 0x4_0010_0000;
+        register(handle, phys, 0x10_0000, CLIENT);
+        add_ref(handle, XWAYLAND);
+        add_ref(handle, COMPOSITOR);
+
+        let freed = release_pid(CLIENT);
+        assert!(
+            !freed
+                .iter()
+                .any(|(h, was_freed)| *h == handle && *was_freed),
+            "the client's exit drops its own reference only"
+        );
+        assert!(
+            lookup_for(handle, XWAYLAND).is_some(),
+            "Xwayland still holds the buffer after the client is gone"
+        );
+        assert!(
+            lookup_for(handle, COMPOSITOR).is_some(),
+            "so does the compositor"
+        );
+        assert!(
+            lookup_for(handle, CLIENT).is_none(),
+            "the process that left no longer holds it"
+        );
+
+        drop_handle(handle);
+    }
+
+    /// The other half of the same rule: passing through Xwayland must not turn
+    /// the buffer into something any process can name. A process that never
+    /// imported it gets nothing, even while three others hold it.
+    #[test]
+    fn a_process_that_never_imported_cannot_reach_the_buffer() {
+        let handle = DRIVER_HANDLE_BASE + 0x10_0003;
+        register(handle, 0x4_0020_0000, 0x10_0000, CLIENT);
+        add_ref(handle, XWAYLAND);
+        add_ref(handle, COMPOSITOR);
+
+        assert!(
+            lookup_for(handle, STRANGER).is_none(),
+            "an unrelated process cannot resolve the handle"
+        );
+        assert!(
+            matches!(dec_ref(handle, STRANGER), DecRef::NotHolder),
+            "nor close it out from under the three that hold it"
+        );
+        assert!(
+            lookup_for(handle, XWAYLAND).is_some(),
+            "and the refused close changed nothing"
+        );
+
+        drop_handle(handle);
+    }
+
+    /// Each hop's `GEM_CLOSE` drops exactly one reference; the backing memory
+    /// is freed only when the last one goes. A chain one process longer than
+    /// the Wayland case is one more chance to free it too early.
+    #[test]
+    fn the_buffer_is_freed_only_after_the_last_hop_closes_it() {
+        let handle = DRIVER_HANDLE_BASE + 0x10_0004;
+        register(handle, 0x4_0030_0000, 0x10_0000, CLIENT);
+        add_ref(handle, XWAYLAND);
+        add_ref(handle, COMPOSITOR);
+
+        assert!(matches!(
+            dec_ref(handle, CLIENT),
+            DecRef::StillReferenced(2)
+        ));
+        assert!(matches!(
+            dec_ref(handle, XWAYLAND),
+            DecRef::StillReferenced(1)
+        ));
+        assert!(matches!(dec_ref(handle, COMPOSITOR), DecRef::Freed));
+        assert!(
+            lookup(handle).is_none(),
+            "the entry goes before the VRAM behind it is released"
+        );
+    }
+
+    /// The regression this guards. An X11 GL client exports a dma-buf, hands
+    /// the fd to Xwayland, and closes its local GEM handle — that close must
+    /// NOT free the object while the dma-buf is still live. Without a
+    /// `DMABUF_HOLDER` reference taken at export, `lookup_by_phys` misses on
+    /// the importer and the whole DRI3 chain collapses.
+    #[test]
+    fn a_dmabuf_keeps_the_buffer_alive_after_the_exporter_closes() {
+        let handle = DRIVER_HANDLE_BASE + 0x10_0005;
+        let phys = 0x4_0040_0000;
+        register(handle, phys, 0x10_0000, CLIENT);
+
+        // PRIME_HANDLE_TO_FD: the dma-buf takes its own reference.
+        assert_eq!(add_ref(handle, DMABUF_HOLDER), Some(2));
+
+        // Client GEM_CLOSE after export — the DRI3 dance.
+        assert!(
+            matches!(dec_ref(handle, CLIENT), DecRef::StillReferenced(1)),
+            "closing the exporter's handle must leave the dma-buf's reference"
+        );
+        assert!(
+            lookup_by_phys(phys).is_some(),
+            "self-import on the receiving end still finds the original handle"
+        );
+
+        // Xwayland (or the compositor) imports the still-live dma-buf.
+        assert_eq!(add_ref(handle, XWAYLAND), Some(2));
+        assert!(lookup_for(handle, XWAYLAND).is_some());
+
+        // Last close of the dma-buf fd drops its holder; Xwayland still owns it.
+        assert!(matches!(
+            dec_ref(handle, DMABUF_HOLDER),
+            DecRef::StillReferenced(1)
+        ));
+        assert!(lookup_for(handle, XWAYLAND).is_some());
+
+        drop_handle(handle);
     }
 }

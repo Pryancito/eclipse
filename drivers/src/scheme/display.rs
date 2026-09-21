@@ -649,6 +649,13 @@ mod blit_tests {
             })
         }
 
+        /// The whole aperture, padding included. A blit that differs from
+        /// another only in the off-screen bytes is still a blit that differs:
+        /// those bytes are the next scanline's neighbours.
+        fn snapshot(&self) -> alloc::vec::Vec<u8> {
+            self.mem.lock().clone()
+        }
+
         /// The pixel at `(x, y)`, addressed through the pitch, so `x` may point
         /// into the off-screen padding past the visible width.
         fn px(&self, x: u32, y: u32) -> u32 {
@@ -863,5 +870,99 @@ mod blit_tests {
         // Nothing beyond: the buffer is exactly 2 rows, so a 3rd would have to
         // land outside it.
         assert_eq!(d.mem.lock().len(), 16 * 4 * 2);
+    }
+
+    /// A write-combining destination has **two** implementations of the same
+    /// blit: `MOVNTDQ` stores when the CPU has SSE4.1, and `copy_from_slice`
+    /// rows otherwise. Only the second one ever runs here or in QEMU --
+    /// `HAS_NT_BLIT` is set by `probe_cpu_features` at boot, which no test
+    /// calls, and the emulator's framebuffer is not write-combining anyway --
+    /// so the fast path that Moebius's GOP takes on every single present was
+    /// running untested while the slow path was the one under the microscope.
+    ///
+    /// If the two ever disagree, they disagree about pixels on a real screen
+    /// and about nothing at all in CI. So: same blit, same source, both paths,
+    /// byte for byte, over the geometries where they are most likely to part
+    /// company -- a padded scanline, a width that is not a multiple of 16, an
+    /// odd destination x, and a source window narrower than its stride.
+    #[test]
+    fn the_two_write_combining_paths_agree_byte_for_byte() {
+        // (screen_w, screen_h, pitch_px, dst_x, dst_y, src_stride, w, h)
+        let cases: &[(u32, u32, u32, u32, u32, usize, u32, u32)] = &[
+            // A 1920 mode on a 2048-pixel pitch: 512 bytes of padding a row.
+            (1920, 4, 2048, 0, 0, 1920, 1920, 4),
+            // 1366 * 4 = 5464 bytes, which is 8 mod 16: every row ends inside
+            // a step and leans on the bytewise tail.
+            (1366, 4, 1536, 0, 0, 1366, 1366, 4),
+            // The `expand_x_for_wc` shape: a 16-pixel window whose tail lands
+            // in the off-screen padding.
+            (1366, 4, 1536, 1360, 0, 16, 16, 2),
+            // An odd destination x, so every row starts mid-16-byte-line.
+            (800, 6, 800, 3, 1, 101, 101, 3),
+            // A window of a wider source buffer: the bytes between `w` and the
+            // stride must not be read.
+            (640, 8, 704, 5, 2, 512, 200, 4),
+            // One row, which is the cursor overlay and a one-line damage
+            // rectangle both.
+            (640, 8, 704, 0, 3, 640, 640, 1),
+            // Clipped at the last visible row: the clip happens before either
+            // path is chosen, so both must clip the same.
+            (640, 4, 704, 0, 2, 640, 640, 9),
+        ];
+
+        for &(sw, sh, pitch, dx, dy, stride, w, h) in cases {
+            let src = numbered(stride, h as usize + 1);
+            let label = alloc::format!(
+                "{}x{} pitch {} blit {}x{} at ({},{})",
+                sw,
+                sh,
+                pitch,
+                w,
+                h,
+                dx,
+                dy
+            );
+
+            let slow = FakeDisplay::new(sw, sh, pitch);
+            {
+                let flag = crate::utils::dma_sync::test_flag::pinned(false);
+                assert!(!flag.nt);
+                slow.blit_from(dx, dy, &src, stride, w, h);
+            }
+
+            let fast = FakeDisplay::new(sw, sh, pitch);
+            let took_fast_path = {
+                let flag = crate::utils::dma_sync::test_flag::as_detected();
+                let before = crate::utils::dma_sync::test_flag::nt_store_calls();
+                fast.blit_from(dx, dy, &src, stride, w, h);
+                let after = crate::utils::dma_sync::test_flag::nt_store_calls();
+                if !flag.nt {
+                    // No SSE4.1 here, so there is no second path to compare
+                    // against and the case proves nothing. Say so rather than
+                    // report a pass.
+                    return;
+                }
+                after > before
+            };
+            assert!(
+                took_fast_path,
+                "{} never reached the non-temporal path, so comparing it with \
+                 the scalar one compares the scalar one with itself",
+                label
+            );
+            assert_eq!(
+                fast.snapshot(),
+                slow.snapshot(),
+                "the non-temporal and scalar paths disagree for {}",
+                label
+            );
+            // And not vacuously equal because neither wrote anything.
+            assert_ne!(
+                fast.snapshot(),
+                FakeDisplay::new(sw, sh, pitch).snapshot(),
+                "{} wrote nothing at all",
+                label
+            );
+        }
     }
 }

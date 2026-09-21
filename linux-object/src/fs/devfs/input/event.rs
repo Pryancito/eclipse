@@ -384,3 +384,226 @@ impl INode for EventDev {
         self
     }
 }
+
+#[cfg(test)]
+mod frame_tests {
+    //! An evdev frame is a run of events ending in `SYN_REPORT`, and libinput
+    //! treats the whole run as one instant. It checks that by the timestamp:
+    //! if the time changes before the `SYN_REPORT` arrives, it reports
+    //! `kernel bug: event frame missing SYN_REPORT, forcing frame` and
+    //! resynchronises, which on a mouse looks like the pointer stuttering.
+    //!
+    //! That happened here for real, on hardware and not in QEMU, because it
+    //! needs a multi-event report to straddle a clock tick -- and a report
+    //! only has several events when a real mouse sends X and Y (and a wheel)
+    //! in one packet, at a rate that makes straddling likely. It was fixed
+    //! once with no test on it; this is that test.
+
+    use super::*;
+    use core::convert::TryInto;
+    use zcore_drivers::input::input_event_codes::{rel::*, syn::*};
+
+    fn inner() -> EventDevInner {
+        EventDevInner {
+            buf: VecDeque::with_capacity(BUF_CAPACITY),
+            frame_time: None,
+        }
+    }
+
+    fn rel(code: u16, value: i32) -> InputEvent {
+        InputEvent {
+            event_type: InputEventType::RelAxis,
+            code,
+            value,
+        }
+    }
+
+    fn syn() -> InputEvent {
+        InputEvent {
+            event_type: InputEventType::Syn,
+            code: SYN_REPORT,
+            value: 0,
+        }
+    }
+
+    #[test]
+    fn every_event_of_a_frame_carries_the_same_timestamp() {
+        // The mouse reports X, Y and a wheel notch in one packet, and they
+        // must all be stamped with the instant the frame opened -- not each
+        // with the clock as it was when the kernel got round to it.
+        //
+        // The host clock cannot be moved from here, so the frame is opened
+        // with a marker no monotonic clock can reach (it would need sixty
+        // years of uptime). Any event stamped from the clock instead of from
+        // the open frame therefore shows up as a different value.
+        let mut dev = inner();
+        let marker = TimeVal {
+            sec: 0x7000_0000,
+            usec: 500,
+        };
+        dev.frame_time = Some(marker);
+
+        for e in [rel(REL_X, 3), rel(REL_Y, -2), rel(REL_WHEEL, 1)] {
+            dev.handle_input_event(&e);
+        }
+        dev.handle_input_event(&syn());
+
+        assert_eq!(dev.buf.len(), 4, "the frame and its SYN_REPORT");
+        for (i, ev) in dev.buf.iter().enumerate() {
+            assert_eq!(
+                (ev.time.sec, ev.time.usec),
+                (marker.sec, marker.usec),
+                "event {} of the frame was stamped separately",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn the_syn_report_closes_the_frame_so_the_next_one_takes_a_new_time() {
+        // If `SYN_REPORT` did not clear it, every event for the rest of the
+        // session would carry the first frame's timestamp and libinput's
+        // debounce, tap and scroll timers would all fire on a clock that
+        // never moves.
+        let mut dev = inner();
+        dev.frame_time = Some(TimeVal { sec: 1, usec: 0 });
+        dev.handle_input_event(&rel(REL_X, 1));
+        assert!(dev.frame_time.is_some(), "the frame is still open");
+        dev.handle_input_event(&syn());
+        assert!(
+            dev.frame_time.is_none(),
+            "the SYN_REPORT did not close the frame"
+        );
+
+        // The next frame opens with its own time.
+        dev.frame_time = Some(TimeVal { sec: 2, usec: 0 });
+        dev.handle_input_event(&rel(REL_X, 1));
+        assert_eq!(dev.buf.back().unwrap().time.sec, 2);
+    }
+
+    #[test]
+    fn a_syn_of_another_kind_does_not_close_the_frame() {
+        // `SYN_MT_REPORT` separates the fingers of a multitouch packet and is
+        // NOT a frame boundary; only `SYN_REPORT` is. Closing on any Syn
+        // event would split one touch frame into several.
+        let mut dev = inner();
+        dev.frame_time = Some(TimeVal { sec: 5, usec: 0 });
+        dev.handle_input_event(&rel(REL_X, 1));
+        dev.handle_input_event(&InputEvent {
+            event_type: InputEventType::Syn,
+            code: SYN_MT_REPORT,
+            value: 0,
+        });
+        assert!(
+            dev.frame_time.is_some(),
+            "SYN_MT_REPORT closed the frame, which only SYN_REPORT may do"
+        );
+        for ev in dev.buf.iter() {
+            assert_eq!(ev.time.sec, 5);
+        }
+    }
+
+    #[test]
+    fn events_are_read_back_in_the_order_they_arrived() {
+        // evdev is a stream: a reader that gets Y before X moves the pointer
+        // somewhere else entirely.
+        let mut dev = inner();
+        dev.frame_time = Some(TimeVal { sec: 1, usec: 0 });
+        dev.handle_input_event(&rel(REL_X, 7));
+        dev.handle_input_event(&rel(REL_Y, -9));
+        dev.handle_input_event(&syn());
+
+        let size = size_of::<TimedInputEvent>();
+        let mut buf = alloc::vec![0u8; size * 3];
+        let n = dev.read_at(&mut buf).unwrap();
+        assert_eq!(n, size * 3, "all three events fit and must all come out");
+
+        let decode = |i: usize| -> (u16, i32) {
+            let base = i * size + size_of::<TimeVal>();
+            let code = u16::from_ne_bytes([buf[base + 2], buf[base + 3]]);
+            let value =
+                i32::from_ne_bytes([buf[base + 4], buf[base + 5], buf[base + 6], buf[base + 7]]);
+            (code, value)
+        };
+        assert_eq!(decode(0), (REL_X, 7));
+        assert_eq!(decode(1), (REL_Y, -9));
+        assert_eq!(decode(2), (SYN_REPORT, 0));
+        assert!(dev.buf.is_empty(), "the events were not consumed");
+    }
+
+    #[test]
+    fn a_read_takes_only_whole_events_and_leaves_the_rest() {
+        // A reader with room for two events must get exactly two, not two and
+        // a fragment: the next read would then start mid-struct and every
+        // event after it would be garbage.
+        let mut dev = inner();
+        dev.frame_time = Some(TimeVal { sec: 1, usec: 0 });
+        for i in 0..5 {
+            dev.handle_input_event(&rel(REL_X, i));
+        }
+        let size = size_of::<TimedInputEvent>();
+        let mut buf = alloc::vec![0u8; size * 2 + size / 2];
+        let n = dev.read_at(&mut buf).unwrap();
+        assert_eq!(n, size * 2);
+        assert_eq!(dev.buf.len(), 3, "the rest must still be queued");
+    }
+
+    #[test]
+    fn a_reader_with_no_room_for_one_event_is_refused() {
+        // Returning a short count here would have the reader advance by less
+        // than a struct and desynchronise for good.
+        let mut dev = inner();
+        dev.frame_time = Some(TimeVal { sec: 1, usec: 0 });
+        dev.handle_input_event(&rel(REL_X, 1));
+        let mut tiny = alloc::vec![0u8; size_of::<TimedInputEvent>() - 1];
+        assert!(matches!(dev.read_at(&mut tiny), Err(FsError::InvalidParam)));
+    }
+
+    #[test]
+    fn an_empty_queue_says_try_again_rather_than_end_of_file() {
+        // A blocking reader takes a zero-length read as EOF and closes the
+        // device; `EAGAIN` is what tells it to wait for more.
+        let mut dev = inner();
+        let mut buf = alloc::vec![0u8; size_of::<TimedInputEvent>()];
+        assert!(matches!(dev.read_at(&mut buf), Err(FsError::Again)));
+    }
+
+    #[test]
+    fn a_reader_that_never_drains_loses_the_oldest_events_not_the_newest() {
+        // The queue is bounded, and when a client stops reading, what matters
+        // is that the pointer ends up where the mouse actually is. Dropping
+        // the NEWEST events would leave it lagging for ever.
+        let mut dev = inner();
+        dev.frame_time = Some(TimeVal { sec: 1, usec: 0 });
+        for i in 0..(BUF_CAPACITY as i32 + 10) {
+            dev.handle_input_event(&rel(REL_X, i));
+        }
+        assert_eq!(dev.buf.len(), BUF_CAPACITY, "the queue grew past its bound");
+        assert_eq!(
+            dev.buf.back().unwrap().value,
+            BUF_CAPACITY as i32 + 9,
+            "the most recent event was dropped"
+        );
+        assert_eq!(
+            dev.buf.front().unwrap().value,
+            10,
+            "the oldest survivor is not the one the bound implies"
+        );
+    }
+
+    #[test]
+    fn the_struct_on_the_wire_is_the_one_evdev_clients_read() {
+        // `struct input_event` on 64-bit Linux is a 16-byte timeval, then
+        // type, code and value. libinput reads exactly this many bytes per
+        // event and indexes the fields by offset, so the layout is ABI.
+        assert_eq!(size_of::<TimeVal>(), 16, "timeval is two 64-bit words");
+        assert_eq!(size_of::<TimedInputEvent>(), 24);
+        let e = TimedInputEvent::with_time(&rel(REL_X, -5), TimeVal { sec: 3, usec: 4 });
+        let raw = e.as_buf();
+        assert_eq!(raw.len(), 24);
+        assert_eq!(usize::from_ne_bytes(raw[0..8].try_into().unwrap()), 3);
+        assert_eq!(usize::from_ne_bytes(raw[8..16].try_into().unwrap()), 4);
+        assert_eq!(u16::from_ne_bytes([raw[18], raw[19]]), REL_X);
+        assert_eq!(i32::from_ne_bytes(raw[20..24].try_into().unwrap()), -5);
+    }
+}

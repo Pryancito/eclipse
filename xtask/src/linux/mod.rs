@@ -76,6 +76,21 @@ impl LinuxRootfs {
             if gfx_probe.is_file() {
                 let _ = fs::copy(&gfx_probe, bin.join("gfx-probe"));
             }
+            // These two were refreshed only on a from-scratch build, so an
+            // ordinary `make image` shipped whatever binary the rootfs already
+            // had. A diagnostic that is a build behind is worse than none: it
+            // answers questions about a system that no longer exists. Both are
+            // cheap to copy and the from-scratch path does the same.
+            let sdl_probe = self.eclipse_sdl_probe(&musl);
+            if sdl_probe.is_file() {
+                let _ = dir::rm(bin.join("eclipse-sdl-probe"));
+                let _ = fs::copy(&sdl_probe, bin.join("eclipse-sdl-probe"));
+            }
+            let dbusd = self.eclipse_dbusd();
+            if dbusd.is_file() {
+                let _ = dir::rm(bin.join("eclipse-dbusd"));
+                let _ = fs::copy(&dbusd, bin.join("eclipse-dbusd"));
+            }
             self.install_thread_tests(&dir);
             // INIT (PID 1): the Eclipse-native Rust init by default, with busybox
             // init as a resilient fallback. `install_busybox_init` runs first so
@@ -106,6 +121,10 @@ impl LinuxRootfs {
             desktop::write_firefox_default_prefs(&dir);
             // Needs the GTK/gsettings packages on disk, same reason.
             desktop::compile_gsettings_schemas(&dir);
+            // After apk too: it only downloads the IWADs when the `freedoom`
+            // package did not land, which is not known until apk has run.
+            desktop::ensure_freedoom_iwads(&dir);
+            xorg::report_freedoom(&dir, "the rootfs");
             // After apk so we can see whether the PulseAudio plugin/binary
             // landed, and so /etc/pulse wins over anything the package dropped.
             Self::write_asound_conf(&dir);
@@ -197,6 +216,10 @@ impl LinuxRootfs {
         desktop::write_firefox_default_prefs(&dir);
         // Needs the GTK/gsettings packages on disk, same reason.
         desktop::compile_gsettings_schemas(&dir);
+        // After apk too: it only downloads the IWADs when the `freedoom`
+        // package did not land, which is not known until apk has run.
+        desktop::ensure_freedoom_iwads(&dir);
+        xorg::report_freedoom(&dir, "the rootfs");
         Self::install_ca_certs(&dir);
 
         // /etc/machine-id — prevents dhcp_vendor "No such file or directory".
@@ -1270,6 +1293,34 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             if !link.exists() && !link.is_symlink() {
                 #[cfg(unix)]
                 let _ = std::os::unix::fs::symlink("busybox", &link);
+            }
+        }
+
+        // `/usr/bin/env`, which is NOT one of the applet links above because
+        // those all live in /bin.
+        //
+        // `#!/usr/bin/env <cmd>` is the single most common shebang there is --
+        // it is how a script finds an interpreter through $PATH instead of
+        // hardcoding its location -- and Eclipse had no /usr/bin/env at all,
+        // only /bin/env. Every such script therefore failed to exec, and
+        // (until the loader stopped tearing the address space down before it
+        // could fail) took the calling process with it:
+        //
+        //   shebang: lookup interp "usr/bin/env" failed: EntryNotFound
+        //   execve: LinuxElfLoader::load failed: ENOENT
+        //   unhandled page fault ... -> SIGSEGV
+        //
+        // Alpine has no such split -- there /bin IS /usr/bin -- so nothing in
+        // the apk closure supplies it either. A relative symlink to busybox,
+        // which dispatches on argv[0], is the whole fix; apk may later install
+        // a real coreutils `env` over it, which is equally fine.
+        #[cfg(unix)]
+        if let Some(rootfs) = bin.parent() {
+            let usr_bin = rootfs.join("usr/bin");
+            let _ = fs::create_dir_all(&usr_bin);
+            let link = usr_bin.join("env");
+            if !link.exists() && !link.is_symlink() {
+                let _ = std::os::unix::fs::symlink("../../bin/busybox", &link);
             }
         }
     }
@@ -3654,6 +3705,41 @@ fn check_so<P: AsRef<Path>>(path: P) -> bool {
 mod var_run_tests {
     use super::*;
 
+    /// `#!/usr/bin/env <cmd>` is the most common shebang in existence, and
+    /// Eclipse shipped with no `/usr/bin/env` -- only `/bin/env` -- so every
+    /// script using it failed to exec. The link must be relative (the rootfs is
+    /// assembled on the host and mounted at a different root in the guest) and
+    /// must point at busybox, which dispatches on argv[0].
+    #[test]
+    fn usr_bin_env_is_linked_to_busybox() {
+        let dir =
+            std::env::temp_dir().join(format!("eclipse-usrbinenv-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        LinuxRootfs::ensure_busybox_applets(&bin);
+
+        let link = dir.join("usr/bin/env");
+        assert!(
+            link.is_symlink(),
+            "no /usr/bin/env: every `#!/usr/bin/env ...` script fails to exec"
+        );
+        let target = fs::read_link(&link).unwrap();
+        assert!(
+            target.is_relative(),
+            "/usr/bin/env must not point at a host-absolute path: {target:?}"
+        );
+        // Resolved from /usr/bin, the target must name the rootfs's busybox.
+        assert_eq!(
+            dir.join("usr/bin").join(&target),
+            dir.join("usr/bin/../../bin/busybox"),
+            "the link must resolve to /bin/busybox inside the rootfs, not {target:?}"
+        );
+        // And the applet it shadows in /bin is still there.
+        assert!(bin.join("env").is_symlink());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// The session-bus wrapper must be valid POSIX shell, must prefer Alpine's
     /// dbus-daemon over Eclipse's own daemon, must bind the SAME address every
     /// session already exports (`unix:path=/run/user/0/bus`) -- a wrapper that
@@ -3820,5 +3906,32 @@ mod var_run_tests {
         assert_eq!(fs::read_link(&link).unwrap(), Path::new("../run"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod lunar_client_tests {
+    use super::*;
+
+    /// Every Wayland client that binds the foreign-toplevel manager must tell
+    /// wayland-client what object its `toplevel` event creates. Without that
+    /// specialization the client aborts on the first window it is told about,
+    /// which is a crash that only shows up under a real compositor: it needs
+    /// another window to exist, so neither a build nor a `--dump` catches it.
+    #[test]
+    fn wayland_clients_specialize_the_toplevel_event() {
+        let dir = PROJECT_DIR.join("tools").join("lunarbar").join("src");
+        for rel in ["main.rs", "bin/lunarrun.rs"] {
+            let src = fs::read_to_string(dir.join(rel)).unwrap();
+            if !src.contains("ZwlrForeignToplevelManagerV1") {
+                continue;
+            }
+            assert!(
+                src.contains("event_created_child!"),
+                "{rel} binds zwlr_foreign_toplevel_manager_v1 without an \
+                 event_created_child! specialization; it will abort as soon \
+                 as a window exists"
+            );
+        }
     }
 }

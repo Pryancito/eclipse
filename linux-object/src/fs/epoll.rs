@@ -401,3 +401,231 @@ mod abi_tests {
         assert_eq!(size_of::<EpollEvent>(), 12);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Host tests for `EPOLL_CTL_*` and the readiness walk.
+    //!
+    //! `Epoll::wait` needs a process and the timer, but everything a
+    //! regression would break first does not: the interest list bookkeeping,
+    //! and `any_ready`, which is what makes a **nested** epoll surface its
+    //! inner readiness. wlroots/labwc depends on that exact behaviour — it
+    //! puts `libinput_get_fd()` (an epoll fd) inside its own event loop, so
+    //! losing it means input events are silently never dispatched.
+    //!
+    //! The watched files are real `EventFd`s: they are `FileLike`, they need
+    //! no process context, and a `write` makes one readable.
+
+    use super::*;
+    use crate::fs::eventfd::EventFd;
+
+    fn epoll() -> Arc<Epoll> {
+        Epoll::new(OpenFlags::empty())
+    }
+
+    /// An eventfd, readable iff `ready`.
+    fn evfd(ready: bool) -> Arc<dyn FileLike> {
+        let fd = EventFd::new(0, OpenFlags::empty());
+        if ready {
+            fd.write(&1u64.to_ne_bytes()).unwrap();
+        }
+        fd
+    }
+
+    const ADD: i32 = 1;
+    const DEL: i32 = 2;
+    const MOD: i32 = 3;
+
+    fn ev(mask: PollEvents, data: u64) -> EpollEvent {
+        EpollEvent {
+            events: mask.bits() as u32,
+            data,
+        }
+    }
+
+    fn readable(e: &Epoll) -> bool {
+        e.poll(PollEvents::IN).unwrap().read
+    }
+
+    #[test]
+    fn ctl_add_del_mod_report_the_linux_errors() {
+        let ep = epoll();
+        let fd = FileDesc::from(5);
+        let f = evfd(false);
+        // MOD and DEL before the fd is in the interest list.
+        assert_eq!(
+            ep.ctl(MOD, fd, ev(PollEvents::IN, 0), Some(f.clone())),
+            Err(LxError::ENOENT)
+        );
+        assert_eq!(
+            ep.ctl(DEL, fd, ev(PollEvents::IN, 0), None),
+            Err(LxError::ENOENT)
+        );
+        // ADD needs the resolved handle.
+        assert_eq!(
+            ep.ctl(ADD, fd, ev(PollEvents::IN, 0), None),
+            Err(LxError::EBADF)
+        );
+        assert_eq!(
+            ep.ctl(ADD, fd, ev(PollEvents::IN, 0), Some(f.clone())),
+            Ok(0)
+        );
+        // A second ADD of the same fd is EEXIST, not a silent replace.
+        assert_eq!(
+            ep.ctl(ADD, fd, ev(PollEvents::IN, 0), Some(f.clone())),
+            Err(LxError::EEXIST)
+        );
+        // An unknown op is EINVAL.
+        assert_eq!(
+            ep.ctl(9, fd, ev(PollEvents::IN, 0), Some(f)),
+            Err(LxError::EINVAL)
+        );
+        // DEL removes it, and is ENOENT the second time.
+        assert_eq!(ep.ctl(DEL, fd, ev(PollEvents::IN, 0), None), Ok(0));
+        assert_eq!(
+            ep.ctl(DEL, fd, ev(PollEvents::IN, 0), None),
+            Err(LxError::ENOENT)
+        );
+    }
+
+    #[test]
+    fn readiness_follows_the_requested_mask() {
+        let ep = epoll();
+        let fd = FileDesc::from(3);
+        let quiet = evfd(false);
+        ep.ctl(ADD, fd, ev(PollEvents::IN, 7), Some(quiet.clone()))
+            .unwrap();
+        assert!(!readable(&ep));
+        // An eventfd is always writable, so watching it for OUT is ready now.
+        ep.ctl(MOD, fd, ev(PollEvents::OUT, 7), Some(quiet.clone()))
+            .unwrap();
+        assert!(readable(&ep));
+        // Back to IN, and make the eventfd actually readable.
+        ep.ctl(MOD, fd, ev(PollEvents::IN, 7), Some(quiet.clone()))
+            .unwrap();
+        assert!(!readable(&ep));
+        quiet.write(&1u64.to_ne_bytes()).unwrap();
+        assert!(readable(&ep));
+        // Removing the only watched fd makes it quiet again.
+        ep.ctl(DEL, fd, ev(PollEvents::IN, 7), None).unwrap();
+        assert!(!readable(&ep));
+    }
+
+    #[test]
+    fn an_empty_interest_list_is_never_ready() {
+        assert!(!readable(&epoll()));
+    }
+
+    #[test]
+    fn a_nested_epoll_surfaces_its_inner_readiness() {
+        // The wlroots shape: inner watches a device fd, outer watches inner.
+        let inner = epoll();
+        let outer = epoll();
+        let dev = evfd(false);
+        inner
+            .ctl(
+                ADD,
+                FileDesc::from(4),
+                ev(PollEvents::IN, 1),
+                Some(dev.clone()),
+            )
+            .unwrap();
+        outer
+            .ctl(
+                ADD,
+                FileDesc::from(5),
+                ev(PollEvents::IN, 2),
+                Some(inner.clone()),
+            )
+            .unwrap();
+        assert!(!readable(&outer));
+        // An event on the device must reach the outer epoll.
+        dev.write(&1u64.to_ne_bytes()).unwrap();
+        assert!(readable(&inner));
+        assert!(readable(&outer));
+    }
+
+    #[test]
+    fn an_epoll_cannot_watch_itself_or_close_a_cycle() {
+        let a = epoll();
+        assert_eq!(
+            a.ctl(
+                ADD,
+                FileDesc::from(1),
+                ev(PollEvents::IN, 0),
+                Some(a.clone())
+            ),
+            Err(LxError::ELOOP)
+        );
+        let b = epoll();
+        // a watches b is fine...
+        a.ctl(
+            ADD,
+            FileDesc::from(2),
+            ev(PollEvents::IN, 0),
+            Some(b.clone()),
+        )
+        .unwrap();
+        // ...but b watching a would close the loop, and `any_ready` would
+        // then walk it forever.
+        assert_eq!(
+            b.ctl(
+                ADD,
+                FileDesc::from(3),
+                ev(PollEvents::IN, 0),
+                Some(a.clone())
+            ),
+            Err(LxError::ELOOP)
+        );
+    }
+
+    #[test]
+    fn nesting_deeper_than_ep_max_nests_is_refused() {
+        // A chain a0 -> a1 -> ... -> a4, five levels deep.
+        let chain: Vec<Arc<Epoll>> = (0..=EPOLL_MAX_NEST_DEPTH).map(|_| epoll()).collect();
+        for i in 0..EPOLL_MAX_NEST_DEPTH {
+            chain[i]
+                .ctl(
+                    ADD,
+                    FileDesc::from(i as i32),
+                    ev(PollEvents::IN, 0),
+                    Some(chain[i + 1].clone()),
+                )
+                .unwrap();
+        }
+        // Hanging that whole chain off one more epoll exceeds the limit, and
+        // is refused conservatively rather than walked.
+        let root = epoll();
+        assert_eq!(
+            root.ctl(
+                ADD,
+                FileDesc::from(99),
+                ev(PollEvents::IN, 0),
+                Some(chain[0].clone())
+            ),
+            Err(LxError::ELOOP)
+        );
+        // The chain itself still works: readiness at the bottom reaches the top.
+        let dev = evfd(true);
+        chain[EPOLL_MAX_NEST_DEPTH]
+            .ctl(ADD, FileDesc::from(50), ev(PollEvents::IN, 0), Some(dev))
+            .unwrap();
+        assert!(readable(&chain[0]));
+    }
+
+    #[test]
+    fn dup_copies_the_interest_list_without_sharing_it() {
+        let ep = epoll();
+        let dev = evfd(true);
+        ep.ctl(ADD, FileDesc::from(6), ev(PollEvents::IN, 0), Some(dev))
+            .unwrap();
+        let copy = ep.dup();
+        assert!(copy.poll(PollEvents::IN).unwrap().read);
+        // Removing the watch from the original leaves the copy watching it --
+        // a dup'd epoll fd is its own description in this kernel.
+        ep.ctl(DEL, FileDesc::from(6), ev(PollEvents::IN, 0), None)
+            .unwrap();
+        assert!(!readable(&ep));
+        assert!(copy.poll(PollEvents::IN).unwrap().read);
+    }
+}

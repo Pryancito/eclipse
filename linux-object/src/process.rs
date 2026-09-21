@@ -15,7 +15,7 @@ use alloc::{
     vec::Vec,
 };
 use core::convert::TryFrom;
-use core::sync::atomic::AtomicI32;
+use core::sync::atomic::{AtomicI32, Ordering};
 use hashbrown::{HashMap, HashSet};
 use kernel_hal::sync::{Mutex, MutexGuard};
 use kernel_hal::VirtAddr;
@@ -2067,6 +2067,93 @@ pub fn deliver_sigint_to_foreground() {
     }
 }
 
+/// First Ctrl-C for a foreground group delivers `SIGINT` (graceful, as before).
+/// A **second** Ctrl-C for the same `pgid` while the arm is still set escalates
+/// to `SIGKILL`, so a process that ignores or hangs on the interrupt can be
+/// torn down without closing the terminal. Changing the tty's foreground
+/// group ([`clear_interrupt_arm`]) clears the arm so a later job starts fresh.
+///
+/// `armed_pgid` is per-tty state (console VT or pty pair): two terminals must
+/// not share it, or a Ctrl-C in one would escalate the other.
+pub fn interrupt_or_force_pgrp(pgid: i32, armed_pgid: &AtomicI32) -> LinuxSignal {
+    if pgid <= 0 {
+        return LinuxSignal::SIGINT;
+    }
+    let prev = armed_pgid.load(Ordering::Relaxed);
+    if prev == pgid {
+        armed_pgid.store(0, Ordering::Relaxed);
+        let _ = send_signal_to_pgrp(pgid as usize, LinuxSignal::SIGKILL);
+        zcore_drivers::klog_warn!(
+            "[tty] second Ctrl-C on pgrp {} -> SIGKILL (forced)",
+            pgid
+        );
+        LinuxSignal::SIGKILL
+    } else {
+        armed_pgid.store(pgid, Ordering::Relaxed);
+        let _ = send_signal_to_pgrp(pgid as usize, LinuxSignal::SIGINT);
+        LinuxSignal::SIGINT
+    }
+}
+
+/// Drop the double-Ctrl-C arm (new foreground job, ctty change, etc.).
+pub fn clear_interrupt_arm(armed_pgid: &AtomicI32) {
+    armed_pgid.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod interrupt_escalate_tests {
+    use super::*;
+    use core::sync::atomic::AtomicI32;
+
+    #[test]
+    fn first_ctrl_c_arms_sigint_second_escalates_to_sigkill() {
+        let armed = AtomicI32::new(0);
+        // No live members → ESRCH inside send, but the arm / escalate choice
+        // is independent of that.
+        assert_eq!(
+            interrupt_or_force_pgrp(4242, &armed),
+            LinuxSignal::SIGINT,
+            "first press is graceful"
+        );
+        assert_eq!(armed.load(Ordering::Relaxed), 4242);
+        assert_eq!(
+            interrupt_or_force_pgrp(4242, &armed),
+            LinuxSignal::SIGKILL,
+            "second press for the same pgrp is forced"
+        );
+        assert_eq!(armed.load(Ordering::Relaxed), 0, "arm clears after force");
+        assert_eq!(
+            interrupt_or_force_pgrp(4242, &armed),
+            LinuxSignal::SIGINT,
+            "a third press starts over with SIGINT"
+        );
+    }
+
+    #[test]
+    fn a_different_pgrp_does_not_inherit_the_force_arm() {
+        let armed = AtomicI32::new(0);
+        assert_eq!(interrupt_or_force_pgrp(100, &armed), LinuxSignal::SIGINT);
+        assert_eq!(
+            interrupt_or_force_pgrp(200, &armed),
+            LinuxSignal::SIGINT,
+            "a new job gets a fresh SIGINT, not an inherited SIGKILL"
+        );
+        assert_eq!(armed.load(Ordering::Relaxed), 200);
+    }
+
+    #[test]
+    fn clear_interrupt_arm_resets_escalation() {
+        let armed = AtomicI32::new(0);
+        assert_eq!(interrupt_or_force_pgrp(55, &armed), LinuxSignal::SIGINT);
+        clear_interrupt_arm(&armed);
+        assert_eq!(
+            interrupt_or_force_pgrp(55, &armed),
+            LinuxSignal::SIGINT,
+            "after clear, the next Ctrl-C is SIGINT again"
+        );
+    }
+}
+
 /// This process's effective process-group id: its raw pgid, or its own pid when
 /// the raw value is unset (`0`).
 fn effective_pgid(proc: &Arc<Process>) -> KoID {
@@ -2465,7 +2552,7 @@ pub fn check_signals() -> LxResult<()> {
             // so nothing is pending and nothing can interrupt: return Ok rather
             // than unwrap-panicking ("init has no LinuxThread ext").
             let pending = match thread.try_lock_linux() {
-                Some(linux_thread) => linux_thread.signals.mask_with(&linux_thread.signal_mask),
+                Some(linux_thread) => linux_thread.signals.mask_with(&linux_thread.signal_mask()),
                 None => return Ok(()),
             };
             if pending.is_not_empty() {
@@ -2656,7 +2743,7 @@ pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
                 if let Ok(thread) = thread_obj.downcast_arc::<Thread>() {
                     // Peek without holding the guard across a move of `thread`.
                     let delivered = if let Some(mut lt) = thread.try_lock_linux() {
-                        if lt.signal_mask.contains(signal) {
+                        if lt.signal_mask().contains(signal) {
                             false
                         } else {
                             lt.signals.insert(signal);

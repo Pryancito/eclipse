@@ -236,8 +236,16 @@ pub struct LinuxThread {
     clear_child_tid: UserOutPtr<i32>,
     /// Linux signals
     pub signals: Sigset,
-    /// Signal mask
-    pub signal_mask: Sigset,
+    /// Signal mask.
+    ///
+    /// Private on purpose: SIGKILL and SIGSTOP must never be in it, and while
+    /// this was a public field that rule lived at four separate call sites --
+    /// `sigprocmask`, `sigsuspend`, `ppoll`/`pselect`'s temporary mask and
+    /// `sigreturn`'s restored one. Two of them applied it and two did not, so
+    /// a process could block the two signals it is never allowed to block and
+    /// stop answering `SIGSTOP` for good. Go through [`Self::set_signal_mask`]
+    /// and friends, which cannot forget.
+    signal_mask: Sigset,
     /// Signal mask to restore once the currently-awaited signal handler
     /// returns. Set by `rt_sigsuspend` so that the original mask is restored
     /// after the temporarily-unblocked signal is delivered.
@@ -303,8 +311,41 @@ impl LinuxThread {
         }
         *ctx = *old_ctx;
         ctx.set_field(UserContextField::InstrPointer, user_ctx.context.get_pc());
-        self.signal_mask = Sigset::new(user_ctx.sig_mask.val());
+        // The ucontext is userland's to modify between the handler running
+        // and `sigreturn`, so this mask is untrusted input like any other:
+        // without the filter a handler could return with SIGKILL blocked.
+        self.set_signal_mask(Sigset::new(user_ctx.sig_mask.val()));
         self.handling_signal = None;
+    }
+
+    /// The signals this thread currently has blocked.
+    pub fn signal_mask(&self) -> Sigset {
+        self.signal_mask
+    }
+
+    /// Replace the blocked-signal mask, dropping the two signals that can
+    /// never be blocked. `sigprocmask(2)` is explicit that the attempt is
+    /// *ignored*, not refused, so this returns nothing and fails at nothing.
+    pub fn set_signal_mask(&mut self, mask: Sigset) {
+        self.signal_mask = mask.blockable();
+    }
+
+    /// `SIG_BLOCK`: add `set` to what is blocked.
+    pub fn block_signals(&mut self, set: &Sigset) {
+        let mut new = self.signal_mask;
+        new.insert_set(set);
+        self.set_signal_mask(new);
+    }
+
+    /// `SIG_UNBLOCK`: take `set` out of what is blocked.
+    ///
+    /// The filter in the setter can never fire on this path -- taking signals
+    /// out of a mask cannot put SIGKILL into it -- so going through the setter
+    /// here is for the day the invariant is maintained by something else.
+    pub fn unblock_signals(&mut self, set: &Sigset) {
+        let mut new = self.signal_mask;
+        new.remove_set(set);
+        self.set_signal_mask(new);
     }
 
     /// Get signal info
@@ -336,5 +377,340 @@ impl LinuxThread {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod signal_delivery_tests {
+    //! `handle_signal` is the whole of signal delivery: every Ctrl-C, every
+    //! `kill`, every SIGCHLD a shell waits on comes out of this one function.
+    //! It needs no process and no scheduler -- it reads two bitmaps and writes
+    //! three fields -- so the rules it enforces can be pinned exactly.
+
+    use super::*;
+    use core::convert::TryFrom;
+
+    /// A one-signal set, for the mask helpers.
+    fn one(sig: Signal) -> Sigset {
+        let mut s = Sigset::empty();
+        s.insert(sig);
+        s
+    }
+
+    /// A thread with nothing pending and nothing blocked, which is how one
+    /// starts life.
+    fn thread() -> LinuxThread {
+        LinuxThread {
+            clear_child_tid: 0.into(),
+            signals: Sigset::default(),
+            signal_mask: Sigset::default(),
+            saved_sigmask: None,
+            signal_alternate_stack: SignalStack::default(),
+            robust_list: 0.into(),
+            robust_list_len: 0,
+            handling_signal: None,
+            comm: String::new(),
+            timerslack_ns: 0,
+        }
+    }
+
+    #[test]
+    fn nothing_pending_delivers_nothing() {
+        let mut t = thread();
+        assert!(t.handle_signal().is_none());
+        assert!(t.handling_signal.is_none());
+    }
+
+    #[test]
+    fn a_pending_signal_is_taken_and_stops_being_pending() {
+        // Taking it must clear it: left pending, the same signal is delivered
+        // again on the next check, and the handler runs for ever.
+        let mut t = thread();
+        t.signals.insert(Signal::SIGINT);
+        let (sig, mask) = t.handle_signal().expect("SIGINT was pending");
+        assert_eq!(sig, Signal::SIGINT);
+        assert!(
+            mask.is_empty(),
+            "nothing was blocked, so nothing is restored"
+        );
+        assert!(!t.signals.contains(Signal::SIGINT), "it is still pending");
+        assert_eq!(t.handling_signal, Some(Signal::SIGINT as u32));
+    }
+
+    #[test]
+    fn the_lowest_numbered_pending_signal_goes_first() {
+        let mut t = thread();
+        t.signals.insert(Signal::SIGWINCH);
+        t.signals.insert(Signal::SIGTERM);
+        t.signals.insert(Signal::SIGUSR1);
+        let (sig, _) = t.handle_signal().unwrap();
+        assert_eq!(
+            sig,
+            Signal::SIGUSR1,
+            "SIGUSR1 is 10, the lowest of the three"
+        );
+        // The other two are untouched and will be taken in turn.
+        assert!(t.signals.contains(Signal::SIGTERM));
+        assert!(t.signals.contains(Signal::SIGWINCH));
+    }
+
+    #[test]
+    fn a_blocked_signal_stays_pending_instead_of_being_delivered() {
+        // This is what `sigprocmask` buys: the signal is not lost, it waits.
+        // Delivering it anyway defeats every critical section userspace has;
+        // dropping it loses the signal for good.
+        let mut t = thread();
+        t.signals.insert(Signal::SIGINT);
+        t.block_signals(&one(Signal::SIGINT));
+        assert!(
+            t.handle_signal().is_none(),
+            "a blocked signal was delivered"
+        );
+        assert!(
+            t.signals.contains(Signal::SIGINT),
+            "it was dropped, not held"
+        );
+
+        // Unblocking releases it, still pending, with no second `kill` needed.
+        t.unblock_signals(&one(Signal::SIGINT));
+        let (sig, _) = t.handle_signal().expect("unblocking must release it");
+        assert_eq!(sig, Signal::SIGINT);
+    }
+
+    #[test]
+    fn a_blocked_signal_does_not_hide_an_unblocked_one_behind_it() {
+        // The blocked signal has the lower number, so a mask applied *after*
+        // picking the first pending signal would return SIGINT and deliver
+        // something the process explicitly blocked.
+        let mut t = thread();
+        t.signals.insert(Signal::SIGINT);
+        t.signals.insert(Signal::SIGTERM);
+        t.block_signals(&one(Signal::SIGINT));
+        let (sig, _) = t.handle_signal().unwrap();
+        assert_eq!(sig, Signal::SIGTERM, "the blocked SIGINT was delivered");
+        assert!(
+            t.signals.contains(Signal::SIGINT),
+            "and it stopped being pending"
+        );
+    }
+
+    #[test]
+    fn nothing_new_is_delivered_while_a_handler_is_running() {
+        // Re-entering the handler would build a second signal frame on a stack
+        // that already holds one, on top of the first handler's locals.
+        let mut t = thread();
+        t.signals.insert(Signal::SIGUSR1);
+        assert!(t.handle_signal().is_some());
+        t.signals.insert(Signal::SIGUSR2);
+        assert!(
+            t.handle_signal().is_none(),
+            "a second signal was delivered on top of the running handler"
+        );
+        assert!(
+            t.signals.contains(Signal::SIGUSR2),
+            "and it was consumed doing it"
+        );
+    }
+
+    #[test]
+    fn a_saved_mask_is_handed_back_once_and_then_forgotten() {
+        // `sigsuspend` installs a temporary mask and leaves the old one here
+        // to be reinstated when the handler returns. Handing it back twice
+        // would restore a stale mask over whatever the process set since.
+        let mut t = thread();
+        let mut original = Sigset::empty();
+        original.insert(Signal::SIGCHLD);
+        t.saved_sigmask = Some(original);
+        t.signals.insert(Signal::SIGINT);
+
+        let (_, restore) = t.handle_signal().unwrap();
+        assert!(
+            restore.contains(Signal::SIGCHLD),
+            "the mask to reinstate is the one sigsuspend saved, not the temporary one"
+        );
+        assert!(t.saved_sigmask.is_none(), "the saved mask was not taken");
+
+        // Next time round there is nothing saved, so the current mask is what
+        // the frame carries.
+        t.handling_signal = None;
+        t.block_signals(&one(Signal::SIGWINCH));
+        t.signals.insert(Signal::SIGTERM);
+        let (_, restore) = t.handle_signal().unwrap();
+        assert!(restore.contains(Signal::SIGWINCH));
+        assert!(
+            !restore.contains(Signal::SIGCHLD),
+            "the stale mask came back"
+        );
+    }
+
+    #[test]
+    fn get_signal_info_reports_what_delivery_just_did() {
+        // `/proc/<pid>/status` reads SigPnd/SigBlk from here, and it is the
+        // only window onto this state from outside.
+        let mut t = thread();
+        t.signals.insert(Signal::SIGTERM);
+        t.block_signals(&one(Signal::SIGWINCH));
+        let (pending, blocked, handling) = t.get_signal_info();
+        assert!(pending.contains(Signal::SIGTERM));
+        assert!(blocked.contains(Signal::SIGWINCH));
+        assert!(handling.is_none());
+
+        t.handle_signal().unwrap();
+        let (pending, _, handling) = t.get_signal_info();
+        assert!(
+            !pending.contains(Signal::SIGTERM),
+            "still reported as pending"
+        );
+        assert_eq!(handling, Some(Signal::SIGTERM as u32));
+    }
+
+    #[test]
+    fn the_two_unblockable_signals_never_enter_the_mask() {
+        // Every route userspace has to this field goes through these three
+        // helpers, and none of them may let SIGKILL or SIGSTOP in: a thread
+        // that blocks SIGSTOP can no longer be stopped, and `handle_signal`
+        // below would mask the signal out for ever.
+        let mut wanted = Sigset::empty();
+        for sig in [Signal::SIGKILL, Signal::SIGSTOP, Signal::SIGINT] {
+            wanted.insert(sig);
+        }
+
+        // SIG_SETMASK.
+        let mut t = thread();
+        t.set_signal_mask(wanted);
+        assert!(!t.signal_mask().contains(Signal::SIGKILL));
+        assert!(!t.signal_mask().contains(Signal::SIGSTOP));
+        assert!(
+            t.signal_mask().contains(Signal::SIGINT),
+            "SIGINT was dropped too"
+        );
+
+        // SIG_BLOCK, which adds to what is already there.
+        let mut t = thread();
+        t.block_signals(&one(Signal::SIGCHLD));
+        t.block_signals(&wanted);
+        assert!(!t.signal_mask().contains(Signal::SIGKILL));
+        assert!(!t.signal_mask().contains(Signal::SIGSTOP));
+        assert!(
+            t.signal_mask().contains(Signal::SIGCHLD),
+            "the earlier block was lost"
+        );
+        assert!(t.signal_mask().contains(Signal::SIGINT));
+
+        // And the whole point: a SIGSTOP sent to a thread that tried to block
+        // it is still delivered.
+        let mut t = thread();
+        t.set_signal_mask(wanted);
+        t.signals.insert(Signal::SIGSTOP);
+        let (sig, _) = t
+            .handle_signal()
+            .expect("SIGSTOP was blocked, so the thread can never be stopped");
+        assert_eq!(sig, Signal::SIGSTOP);
+    }
+
+    #[test]
+    fn sigreturn_cannot_smuggle_a_blocked_sigkill_back_in() {
+        // The mask `sigreturn` installs comes out of a ucontext that the
+        // signal handler had every opportunity to rewrite, so it is untrusted
+        // input and gets the same filter as `sigprocmask`.
+        let mut t = thread();
+        let mut doctored = Sigset::empty();
+        doctored.insert(Signal::SIGKILL);
+        doctored.insert(Signal::SIGSTOP);
+        doctored.insert(Signal::SIGUSR1);
+        t.set_signal_mask(doctored);
+        assert!(!t.signal_mask().contains(Signal::SIGKILL));
+        assert!(!t.signal_mask().contains(Signal::SIGSTOP));
+        assert!(t.signal_mask().contains(Signal::SIGUSR1));
+    }
+
+    #[test]
+    fn unblocking_a_signal_that_was_not_blocked_does_not_block_it() {
+        // `sigprocmask(SIG_UNBLOCK, set)` where `set` is wider than what the
+        // thread actually blocks is ordinary and must be a no-op for the
+        // extra signals, not their inverse.
+        let mut t = thread();
+        t.block_signals(&one(Signal::SIGINT));
+        let mut wide = Sigset::empty();
+        wide.insert(Signal::SIGINT);
+        wide.insert(Signal::SIGTERM);
+        t.unblock_signals(&wide);
+        assert!(!t.signal_mask().contains(Signal::SIGINT));
+        assert!(
+            !t.signal_mask().contains(Signal::SIGTERM),
+            "unblocking SIGTERM blocked it"
+        );
+    }
+
+    #[test]
+    fn sigreturn_restores_the_pc_and_filters_the_mask_it_is_handed() {
+        // `restore_after_handle_signal` is the kernel side of `sigreturn`, and
+        // everything it reads -- the PC to resume at, the mask to reinstate --
+        // comes out of a `ucontext` sitting on the user stack that the handler
+        // had every opportunity to rewrite before returning. So it is
+        // untrusted input, and in particular the mask gets the same filter as
+        // `sigprocmask`: otherwise a handler returns with SIGKILL blocked and
+        // the process can no longer be stopped.
+        let mut t = thread();
+        t.handling_signal = Some(Signal::SIGUSR1 as u32);
+
+        let info = SigInfo::default();
+        let mut uctx = SignalUserContext::default();
+        const RESUME_AT: usize = 0x4000_1234;
+        uctx.context.set_pc(RESUME_AT);
+        let mut doctored = Sigset::empty();
+        doctored.insert(Signal::SIGKILL);
+        doctored.insert(Signal::SIGSTOP);
+        doctored.insert(Signal::SIGUSR2);
+        uctx.sig_mask = doctored;
+
+        let mut old_ctx = UserContext::default();
+        old_ctx.set_field(UserContextField::InstrPointer, 0xBAD0_0000);
+        let mut ctx = UserContext::default();
+
+        t.restore_after_handle_signal(
+            &mut ctx,
+            &old_ctx,
+            &info as *const SigInfo as usize,
+            &uctx as *const SignalUserContext as usize,
+        );
+
+        assert_eq!(
+            ctx.get_field(UserContextField::InstrPointer),
+            RESUME_AT,
+            "the thread did not resume where the ucontext said"
+        );
+        assert!(
+            !t.signal_mask().contains(Signal::SIGKILL),
+            "sigreturn let a handler block SIGKILL"
+        );
+        assert!(
+            !t.signal_mask().contains(Signal::SIGSTOP),
+            "sigreturn let a handler block SIGSTOP"
+        );
+        assert!(
+            t.signal_mask().contains(Signal::SIGUSR2),
+            "the rest of the restored mask was thrown away"
+        );
+        assert!(
+            t.handling_signal.is_none(),
+            "the handler is still marked as running, so no further signal is delivered"
+        );
+    }
+
+    #[test]
+    fn every_signal_can_be_delivered() {
+        // The real-time signals go up to 64, which is the last bit of the
+        // word: a loop bound that stopped at 63 would make SIGRT64
+        // undeliverable and `find_first_signal` would have to invent one.
+        for n in 1..=64u8 {
+            let sig = Signal::try_from(n).unwrap();
+            let mut t = thread();
+            t.signals.insert(sig);
+            let (got, _) = t
+                .handle_signal()
+                .unwrap_or_else(|| panic!("{:?} was never delivered", sig));
+            assert_eq!(got, sig);
+        }
     }
 }

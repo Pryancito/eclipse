@@ -105,9 +105,25 @@ pub fn register_net_rx_waker(waker: Waker) {
     register_waker_once(&mut NET_RX_WAKERS.lock(), &waker);
 }
 
-/// After an IRQ-driven wake: keep the waker for the next sleep cycle.
+/// After an IRQ-driven wake: keep THIS waker registered for the next sleep
+/// cycle, leaving every other waiter's registration alone.
+///
+/// It used to be `retain(|w| w.will_wake(waker))`, which keeps the elements the
+/// predicate accepts — i.e. it kept this waker and **deleted every other
+/// waiter's**. (Contrast [`clear_net_rx_waker`] just below, which negates the
+/// same predicate and is correct.) With a single waiter that is invisible,
+/// which is why it survived: one waiter is the whole list. With N waiters —
+/// several sockets in one poll set, or several processes blocked on the
+/// network at once — every other poll by any of them wiped the other N-1, so
+/// their real RX wakes were lost and they fell back to the 4 ms `IO_WAIT_TICK`
+/// backstop. The damage therefore grew with concurrency, which is exactly the
+/// shape of "fine under a light QEMU session, slow on a loaded desktop".
+///
+/// `register_waker_once` is also the right primitive for what the caller
+/// wants: [`wake_net_rx_waiters`] `mem::take`s the list, so after a wake there
+/// is nothing left to retain and the registration has to be re-made.
 pub fn retain_net_rx_waker(waker: &Waker) {
-    NET_RX_WAKERS.lock().retain(|w| w.will_wake(waker));
+    register_waker_once(&mut NET_RX_WAKERS.lock(), waker);
 }
 
 /// Drop a wait's registration once the wait future is Ready/`Drop`ed.

@@ -374,8 +374,8 @@ pub struct CachedDevice {
     /// One past the last addressable byte, rounded up to a sector. Read-ahead is
     /// clamped to this so a prefetch never runs off the end of the device.
     dev_end: usize,
-    /// A small ring of independent sequential-read streams for read-ahead
-    /// detection. One shared "last read end" is not enough: btrfs interleaves a
+    /// Independent sequential-read streams, for read-ahead detection. One
+    /// shared "last read end" is not enough: btrfs interleaves a
     /// btree-node metadata read between consecutive file-data reads, so a single
     /// flag ping-pongs between the data offset and the far-away metadata offset
     /// and the byte-exact continuation test never holds during streaming —
@@ -385,54 +385,108 @@ pub struct CachedDevice {
     /// pure streaming read is recognised and collapses into one big command per
     /// window, while a random walk still matches no stream and prefetches
     /// nothing (preserving the random-4K win). Behind a `Mutex` because the
-    /// critical section is a 4-entry scan and btrfs already serialises device
-    /// I/O behind its own lock; never held across the backing read.
-    streams: Mutex<StreamRing>,
+    /// critical section is a single hashed lookup and btrfs already serialises
+    /// device I/O behind its own lock; never held across the backing read.
+    streams: Mutex<StreamTable>,
 }
 
-/// Read-ahead stream tracker: `NUM_STREAMS` most-recent sequential streams.
-struct StreamRing {
-    slots: [Stream; Self::NUM_STREAMS],
-    clock: u64,
+/// Read-ahead stream tracker: a direct-mapped table of in-flight sequential
+/// streams, keyed by the device offset each one will read next.
+///
+/// This was a small ring scanned linearly, and it had a capacity cliff. Once
+/// more sequential readers interleaved than there were slots, LRU eviction
+/// meant every slot was replaced before its own stream came back, no stream
+/// ever reached `CONF_THRESH`, read-ahead stopped firing **entirely**, and
+/// every 4 KiB request became its own device command. On the polled AHCI/NVMe
+/// drivers that is a synchronous round trip with interrupts disabled and one
+/// command in flight, so the cliff is the difference between a fast boot and
+/// an unusable one.
+///
+/// Measured against N interleaved 1 MiB streams of 4 KiB reads
+/// (`concurrent_demand_paging_stays_batched`), device commands per 1000 pages
+/// with the 8-slot ring were 7, 7, 7 for 1/4/8 streams and then **1000** for
+/// 12 — a 128x jump for one extra reader. That is not a corner case: demand
+/// paging `libxul.so` and dozens of shared objects across a browser's parent,
+/// GPU, socket and content processes is dozens of streams at once, plus
+/// btrfs's own metadata stream. It is also invisible under QEMU, whose root is
+/// a RAM-backed image that issues no device commands at all.
+///
+/// Raising the slot count only moves the cliff, so the lookup is keyed instead
+/// of scanned: a stream is stored at `idx(last_end)` and looked up at
+/// `idx(aligned_start)`, which collide exactly when `last_end == aligned_start`
+/// — the same byte-exact continuation test as before, now in O(1). A collision
+/// costs one stream its slot (it restarts unproven), never correctness. With
+/// [`StreamTable::SLOTS`] entries the table holds far more concurrent streams
+/// than any plausible workload, at 32 bytes each.
+///
+/// Random access is unaffected by design: an isolated read continues nothing,
+/// so it matches no entry, stays at confidence 0 and prefetches nothing. That
+/// gate is what keeps a 1 MiB window from evicting the metadata the next
+/// random op needs, and it is untouched here.
+struct StreamTable {
+    slots: [Stream; Self::SLOTS],
 }
 
 #[derive(Clone, Copy)]
 struct Stream {
     valid: bool,
-    /// Device offset one past this stream's most recent backing read.
+    /// Device offset one past this stream's most recent backing read. This is
+    /// also the key: the entry lives at `idx(last_end)`.
     last_end: usize,
     /// Exact-continuation count; prefetch only once a stream has proven itself
-    /// (>= 1), so a brand-new stream — including every isolated random read —
-    /// never triggers the window that would thrash the cache.
+    /// (see `CONF_THRESH`), so a brand-new stream — including every isolated
+    /// random read — never triggers the window that would thrash the cache.
     confidence: u32,
-    /// LRU tick for victim selection.
-    lru: u64,
 }
 
-impl StreamRing {
-    /// 8, not 4: session bring-up demand-pages several libraries from several
-    /// processes at once, plus the btrfs metadata stream — with only 4 slots
-    /// the interleaved sequential streams evicted each other, read-ahead
-    /// stopped firing, and reads degraded to one 4 KiB command each.
-    const NUM_STREAMS: usize = 8;
-    const CONF_THRESH: u32 = 1;
+/// What `plan` decided, and what `commit` needs to record the stream at the
+/// offset the backing read actually reached.
+struct Plan {
+    read_end: usize,
+    confidence: u32,
+}
+
+impl StreamTable {
+    /// 1024 entries, 32 bytes each = 32 KiB per mount. Sized to be far beyond
+    /// any realistic concurrent-stream count rather than to be tight: the
+    /// whole point is that exceeding it is a cliff, and the table is only
+    /// consulted on a cache MISS.
+    const SLOTS: usize = 1024;
+    /// Two continuations, not one. The ring this replaced kept so few streams
+    /// that an entry was almost always evicted before an unrelated read could
+    /// happen to start exactly where it ended, so one continuation was proof
+    /// enough. A table that remembers a thousand streams for a long time makes
+    /// that coincidence common: over a random 4 KiB walk, accidental
+    /// `last_end == aligned_start` matches fired 1 MiB windows and dragged in
+    /// 13x the bytes, evicting the working set
+    /// (`random_4k_walk_does_not_prefetch` pins this). Two consecutive
+    /// continuations cost a real sequential reader one extra 4 KiB command
+    /// before its first window and make the coincidence vanish.
+    const CONF_THRESH: u32 = 2;
 
     fn new() -> Self {
-        StreamRing {
+        StreamTable {
             slots: [Stream {
                 valid: false,
                 last_end: 0,
                 confidence: 0,
-                lru: 0,
-            }; Self::NUM_STREAMS],
-            clock: 0,
+            }; Self::SLOTS],
         }
     }
 
+    /// Bucket for a device offset. Offsets are sector-aligned, so the low 9
+    /// bits carry no information; mix the rest so that streams walking the
+    /// device in step (several processes reading several files laid out near
+    /// each other) do not pile into one bucket.
+    #[inline]
+    fn idx(offset: usize) -> usize {
+        let h = (offset as u64 / SECTOR as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        ((h >> 32) as usize) % Self::SLOTS
+    }
+
     /// Decide the read span for a request whose sector-aligned bounds are
-    /// `[aligned_start, aligned_end)`. Returns `(read_end, slot)`: `read_end`
-    /// is `aligned_end` for non-prefetch, or extended by `window` for a proven
-    /// sequential stream. `slot` receives the corrected end after the read.
+    /// `[aligned_start, aligned_end)`. `read_end` is `aligned_end` for
+    /// non-prefetch, or extended by `window` for a proven sequential stream.
     fn plan(
         &mut self,
         aligned_start: usize,
@@ -440,44 +494,44 @@ impl StreamRing {
         buf_len: usize,
         window: usize,
         dev_end: usize,
-    ) -> (usize, usize) {
-        self.clock += 1;
-        let tick = self.clock;
-        if let Some(i) = self
-            .slots
-            .iter()
-            .position(|s| s.valid && s.last_end == aligned_start)
-        {
-            let s = &mut self.slots[i];
-            s.confidence = s.confidence.saturating_add(1);
-            s.lru = tick;
-            let read_end = if buf_len < window && s.confidence >= Self::CONF_THRESH {
+    ) -> Plan {
+        let i = Self::idx(aligned_start);
+        let slot = &mut self.slots[i];
+        if slot.valid && slot.last_end == aligned_start {
+            let confidence = slot.confidence.saturating_add(1);
+            // The entry is about to move to a new key (`commit` re-inserts it
+            // at `idx(actual_end)`), so vacate it here rather than leaving a
+            // stale duplicate behind.
+            slot.valid = false;
+            let read_end = if buf_len < window && confidence >= Self::CONF_THRESH {
                 (aligned_end + window).min(dev_end).max(aligned_end)
             } else {
                 aligned_end
             };
-            s.last_end = read_end; // predicted; corrected in `commit`
-            (read_end, i)
+            Plan {
+                read_end,
+                confidence,
+            }
         } else {
-            // No stream continues here: start a fresh low-confidence one and
-            // prefetch nothing. Victim = an invalid slot, else the LRU.
-            let v = (0..Self::NUM_STREAMS)
-                .min_by_key(|&k| (self.slots[k].valid, self.slots[k].lru))
-                .unwrap();
-            self.slots[v] = Stream {
-                valid: true,
-                last_end: aligned_end,
+            // Nothing continues here: this is a fresh, unproven stream (which
+            // is also what every isolated random read looks like). Prefetch
+            // nothing; `commit` will record where it ended.
+            Plan {
+                read_end: aligned_end,
                 confidence: 0,
-                lru: tick,
-            };
-            (aligned_end, v)
+            }
         }
     }
 
-    /// Correct a stream's end to the bytes actually transferred (matters only at
-    /// end-of-device, where the backing read returns short of the plan).
-    fn commit(&mut self, slot: usize, actual_end: usize) {
-        self.slots[slot].last_end = actual_end;
+    /// Record the stream at the offset the backing read actually reached. The
+    /// plan's `read_end` is only a prediction — a read at end-of-device comes
+    /// back short — and the key must be where the *next* read will start.
+    fn commit(&mut self, plan: &Plan, actual_end: usize) {
+        self.slots[Self::idx(actual_end)] = Stream {
+            valid: true,
+            last_end: actual_end,
+            confidence: plan.confidence,
+        };
     }
 }
 
@@ -492,7 +546,7 @@ impl CachedDevice {
             inner,
             cache: Mutex::new(BlockCache::new(capacity_sectors)),
             dev_end,
-            streams: Mutex::new(StreamRing::new()),
+            streams: Mutex::new(StreamTable::new()),
         }
     }
 
@@ -558,11 +612,11 @@ impl Device for CachedDevice {
         // thrash.
         // Read-ahead only for a PROVEN sequential stream (byte-exact
         // continuation, tracked per-stream so btrfs's interleaved metadata reads
-        // do not break the data stream's continuity — see `StreamRing`). A
+        // do not break the data stream's continuity — see `StreamTable`). A
         // random walk matches no stream and prefetches nothing, preserving the
         // random-4K win; a streaming read matches its stream and extends by the
         // window, collapsing hundreds of 4 KiB reads into one command.
-        let (read_end, slot) = {
+        let plan = {
             let mut streams = self.streams.lock();
             streams.plan(
                 aligned_start,
@@ -572,14 +626,14 @@ impl Device for CachedDevice {
                 self.dev_end,
             )
         };
-        let read_len = read_end - aligned_start;
+        let read_len = plan.read_end - aligned_start;
 
         // No read-ahead and already sector-aligned: read straight into the
         // caller's buffer and cache from it — no temporary allocation.
-        if read_end == aligned_end && offset == aligned_start && buf.len() == read_len {
+        if plan.read_end == aligned_end && offset == aligned_start && buf.len() == read_len {
             let n = self.inner.read_at(aligned_start, buf)?;
             self.populate(first, buf, n);
-            self.streams.lock().commit(slot, aligned_start + n);
+            self.streams.lock().commit(&plan, aligned_start + n);
             return Ok(n);
         }
 
@@ -588,7 +642,7 @@ impl Device for CachedDevice {
         let mut tmp = vec![0u8; read_len];
         let n = self.inner.read_at(aligned_start, &mut tmp)?;
         self.populate(first, &tmp, n);
-        self.streams.lock().commit(slot, aligned_start + n);
+        self.streams.lock().commit(&plan, aligned_start + n);
         let skip = offset - aligned_start;
         let avail = n.saturating_sub(skip);
         let copy = min(buf.len(), avail);
@@ -691,6 +745,7 @@ mod block_byte_tests {
         sectors: Mutex<Vec<u8>>,
         nsec: usize,
         sectors_read: AtomicUsize,
+        commands: AtomicUsize,
     }
     impl MockBlock {
         fn new(nsec: usize) -> Arc<Self> {
@@ -698,11 +753,19 @@ mod block_byte_tests {
                 sectors: Mutex::new(vec![0u8; nsec * 512]),
                 nsec,
                 sectors_read: AtomicUsize::new(0),
+                commands: AtomicUsize::new(0),
             })
         }
         /// Total sectors transferred out of the device via `read_block`.
         fn sectors_read(&self) -> usize {
             self.sectors_read.load(Ordering::Relaxed)
+        }
+        /// Read commands issued to the device. On the polled AHCI/NVMe drivers
+        /// each one is a synchronous round trip with interrupts disabled and
+        /// only one command in flight, so this — not the byte count — is what
+        /// a demand-paging workload actually pays for.
+        fn commands(&self) -> usize {
+            self.commands.load(Ordering::Relaxed)
         }
     }
     impl Scheme for MockBlock {
@@ -723,6 +786,7 @@ mod block_byte_tests {
             buf.copy_from_slice(&d[start..start + buf.len()]);
             self.sectors_read
                 .fetch_add(buf.len() / 512, Ordering::Relaxed);
+            self.commands.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
         fn write_block(&self, block_id: usize, buf: &[u8]) -> DeviceResult {
@@ -830,7 +894,7 @@ mod block_byte_tests {
         CachedDevice::with_capacity(Arc::new(BlockByteDevice::new(dev)), size, cap_sectors)
     }
 
-    /// Read-ahead is gated on a PROVEN sequential stream (see `StreamRing`):
+    /// Read-ahead is gated on a PROVEN sequential stream (see `StreamTable`):
     /// the first cold read fetches exactly what was asked — an isolated random
     /// read must never trigger a window that would thrash the cache — and once
     /// byte-exact continuations prove the stream, the window fires and further
@@ -879,6 +943,69 @@ mod block_byte_tests {
             dev.sectors_read(),
             after_seq,
             "a sequential read within the prefetch window must not touch the device"
+        );
+    }
+
+    /// Several mapped files demand-paged at once — a desktop session start, or
+    /// a browser bringing up its content processes — must stay batched. This
+    /// is the regression test for `StreamTable`'s predecessor, a fixed ring
+    /// whose LRU eviction collapsed completely one stream past its capacity:
+    /// at 8 slots, 8 interleaved streams cost 7 device commands per 1000 pages
+    /// and 12 streams cost 1000, one per 4 KiB page.
+    #[test]
+    fn concurrent_demand_paging_stays_batched() {
+        let nsec = 64 * 1024; // 32 MiB
+        for nstreams in [1usize, 8, 12, 64, 200] {
+            let dev = MockBlock::new(nsec);
+            let cache = cached(dev.clone(), nsec);
+            // Give each stream a page-aligned span of its own and walk them
+            // round-robin, one 4 KiB page at a time, as concurrent faulting
+            // processes do.
+            let span = ((nsec * 512) / nstreams) / 4096 * 4096;
+            let pages = 64usize;
+            let mut buf = [0u8; 4096];
+            for p in 0..pages {
+                for st in 0..nstreams {
+                    cache.read_at(st * span + p * 4096, &mut buf).unwrap();
+                }
+            }
+            let total_pages = pages * nstreams;
+            let per_1000 = dev.commands() * 1000 / total_pages;
+            assert!(
+                per_1000 <= 100,
+                "{nstreams} interleaved streams: {} commands for {total_pages} pages \
+                 ({per_1000} per 1000) — read-ahead stopped firing",
+                dev.commands(),
+            );
+        }
+    }
+
+    /// The counter-test: a random 4 KiB walk must still prefetch nothing, so a
+    /// re-visited working set that fits in the cache is served entirely from
+    /// RAM. An unconditional read-ahead floor (tried, and reverted) turned the
+    /// second pass here from 0 device commands into one per page, because each
+    /// 4 KiB read dragged in enough neighbours to evict the whole set.
+    #[test]
+    fn random_4k_walk_does_not_prefetch() {
+        let nsec = 512 * 1024; // 256 MiB device
+        let dev = MockBlock::new(nsec);
+        let cache = cached(dev.clone(), 64 * 1024 * 1024 / 512);
+        let mut buf = [0u8; 4096];
+        let pages = nsec * 512 / 4096;
+        let pick = |i: usize| ((i.wrapping_mul(2654435761) >> 7) % pages) * 4096;
+        let ws = 4096usize; // 16 MiB working set, comfortably inside the cache
+        for i in 0..ws {
+            cache.read_at(pick(i), &mut buf).unwrap();
+        }
+        let cold = dev.commands();
+        for i in 0..ws {
+            cache.read_at(pick(i), &mut buf).unwrap();
+        }
+        assert_eq!(
+            dev.commands(),
+            cold,
+            "a random working set that fits in the cache must survive its own \
+             first pass; read-ahead evicted it"
         );
     }
 
