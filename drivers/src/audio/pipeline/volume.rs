@@ -206,10 +206,8 @@ mod tests {
     }
 
     fn samples(bytes: &[u8]) -> Vec<i16> {
-        bytes
-            .chunks_exact(2)
-            .map(|c| i16::from_le_bytes([c[0], c[1]]))
-            .collect()
+        let (pairs, _) = bytes.as_chunks::<2>();
+        pairs.iter().map(|c| i16::from_le_bytes(*c)).collect()
     }
 
     /// Run `frames` stereo frames of a constant `level` through `v`,

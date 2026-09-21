@@ -3711,7 +3711,7 @@ mod rx_ring_tests {
     }
     #[no_mangle]
     extern "C" fn drivers_timer_now_as_micros() -> u64 {
-        0
+        crate::nvme::nvme_queue::test_clock::now()
     }
     #[no_mangle]
     extern "C" fn drivers_klog_emit(_priority: u8, _msg: *const u8, _len: usize) {}
