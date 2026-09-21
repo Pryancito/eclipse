@@ -391,8 +391,10 @@ impl KObjectBase {
     /// interrupts off. The detector named it with holder and waiter on the
     /// same line:
     ///
-    ///     cpu=3 at zircon-object/src/object/mod.rs:387
-    ///     HOLDER cpu=3 at zircon-object/src/object/mod.rs:387
+    /// ```text
+    /// cpu=3 at zircon-object/src/object/mod.rs:387
+    /// HOLDER cpu=3 at zircon-object/src/object/mod.rs:387
+    /// ```
     ///
     /// [`Self::try_name`] exists for callers that can handle the absence, and
     /// the known call sites use it. This is the backstop for the ones that
