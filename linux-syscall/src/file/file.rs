@@ -804,9 +804,9 @@ impl Syscall<'_> {
         use linux_object::fs::devfs::drm;
         use linux_object::fs::DmaBuf;
 
-        const PRIME_HANDLE_TO_FD: usize = 0xC00C_642E; // DRM_IOWR(0x2e, drm_prime_handle)
-        const PRIME_FD_TO_HANDLE: usize = 0xC00C_642D; // DRM_IOWR(0x2d, drm_prime_handle)
-        const MODE_CREATE_LEASE: usize = 0xC018_64C6;
+        const PRIME_HANDLE_TO_FD: u32 = 0x2E; // DRM_IOWR(0x2e, drm_prime_handle)
+        const PRIME_FD_TO_HANDLE: u32 = 0x2D; // DRM_IOWR(0x2d, drm_prime_handle)
+        const MODE_CREATE_LEASE: u32 = 0xC6; // DRM_IOWR(0xc6, drm_mode_create_lease)
 
         // struct drm_prime_handle { __u32 handle; __u32 flags; __s32 fd; }
         #[repr(C)]
@@ -830,11 +830,30 @@ impl Syscall<'_> {
             fd: i32,
         }
 
-        // These ioctl numbers are DRM-specific (libdrm only issues them on a DRM
-        // fd), and each operation errors gracefully on a wrong fd, so handle by
-        // request number alone — no fragile fd-type detection.
+        // The fd really has to be a DRM node. Dispatching on the request number
+        // alone meant `PRIME_HANDLE_TO_FD` on ANY fd reached the export path,
+        // so a process that had never opened `/dev/dri/*` could still ask for a
+        // dma-buf over a GEM handle. Linux only ever reaches
+        // `drm_prime_handle_to_fd_ioctl` through a DRM file. The export path
+        // now also checks who owns the handle (see `drm::export_handle`), but
+        // both gates belong here: this is the one that keeps the ioctl on the
+        // device it is defined for. Same downcast `WAIT_VBLANK` already uses.
+        let is_drm_fd = file_like
+            .downcast_ref::<File>()
+            .map(|f| {
+                f.inode()
+                    .as_any_ref()
+                    .downcast_ref::<linux_object::fs::devfs::DrmDev>()
+                    .is_some()
+            })
+            .unwrap_or(false);
+        if !is_drm_fd {
+            return Ok(None);
+        }
         let proc = self.linux_process();
-        match request {
+        // Match on the DRM ioctl NR only. The struct size the client encoded is
+        // deliberately NOT part of the comparison -- see `is_drm_ioctl_nr`.
+        match request as u32 & 0xff {
             // EXPORT (HANDLE_TO_FD) and IMPORT (FD_TO_HANDLE) share one arm and
             // are told apart by STRUCT CONTENT, not the ioctl number. On real
             // hardware the number-based dispatch mis-routed 0xc00c642d (export)
@@ -1247,8 +1266,10 @@ impl Syscall<'_> {
         request: usize,
         arg1: usize,
     ) -> Result<Option<usize>, LxError> {
-        const SYNCOBJ_EVENTFD: usize = 0xC018_64CF; // DRM_IOWR(0xcf, drm_syncobj_eventfd)
-        if request != SYNCOBJ_EVENTFD {
+        // NR + type only; the encoded struct size is not part of the match.
+        // The caller (`sys_ioctl`) has already checked it is at least the 24
+        // bytes read below.
+        if !linux_object::fs::devfs::drm_scheme::is_drm_ioctl_nr(request as u32, 0xCF, 24) {
             return Ok(None);
         }
         if !kernel_hal::drivers::nouveau_uapi_enabled() {
@@ -1406,7 +1427,11 @@ impl Syscall<'_> {
         // number alone: sleeping is a side effect, and it must not be possible
         // to inflict it on an unrelated fd that happens to be handed this
         // number.
-        if request as u32 == linux_object::fs::devfs::drm_scheme::WAIT_VBLANK_IOCTL {
+        if {
+            use linux_object::fs::devfs::drm_scheme::{is_drm_ioctl_nr, nr};
+            let (n, min) = nr::WAIT_VBLANK;
+            is_drm_ioctl_nr(request as u32, n, min)
+        } {
             if let Some(file) = file_like.downcast_ref::<File>() {
                 if let Some(dev) = file
                     .inode()
@@ -1439,7 +1464,11 @@ impl Syscall<'_> {
         // for the client's rendering to land before the sync arm scans that
         // buffer out. Without this the fence was accepted and ignored, so an
         // explicit-sync compositor could have a half-drawn frame presented.
-        if request as u32 == linux_object::fs::devfs::drm_scheme::ATOMIC_IOCTL {
+        if {
+            use linux_object::fs::devfs::drm_scheme::{is_drm_ioctl_nr, nr};
+            let (n, min) = nr::MODE_ATOMIC;
+            is_drm_ioctl_nr(request as u32, n, min)
+        } {
             if let Some(file) = file_like.downcast_ref::<File>() {
                 if let Some(dev) = file
                     .inode()
@@ -1525,7 +1554,17 @@ impl Syscall<'_> {
         // matching. Without this the dispatch misses and the ioctl falls
         // through to ENOTTY ("Not a tty").
         let cmd = request as u32 as usize;
-        if cmd == 0xC00C_642D || cmd == 0xC00C_642E || cmd == 0xC018_64C6 {
+        if {
+            use linux_object::fs::devfs::drm_scheme::{is_drm_ioctl_nr, nr};
+            let c = cmd as u32;
+            [
+                nr::PRIME_FD_TO_HANDLE,
+                nr::PRIME_HANDLE_TO_FD,
+                nr::MODE_CREATE_LEASE,
+            ]
+            .iter()
+            .any(|&(n, min)| is_drm_ioctl_nr(c, n, min))
+        } {
             // `sys_drm_prime` logs only on genuine failures; the wrapper stays
             // silent on the hot path. Ok(None) means "not a PRIME request after
             // all"; fall through to the inode `io_control`.
@@ -1553,7 +1592,11 @@ impl Syscall<'_> {
         }
         // SYNCOBJ_EVENTFD — same fd-table-access reasoning as the syncobj FD
         // ioctls above (it takes an eventfd), and the same sign-extension caveat.
-        if cmd == 0xC018_64CF {
+        if {
+            use linux_object::fs::devfs::drm_scheme::{is_drm_ioctl_nr, nr};
+            let (n, min) = nr::SYNCOBJ_EVENTFD;
+            is_drm_ioctl_nr(cmd as u32, n, min)
+        } {
             match self.sys_drm_syncobj_eventfd(cmd, arg1) {
                 Ok(Some(ret)) => return Ok(ret),
                 Ok(None) => {}

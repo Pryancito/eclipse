@@ -459,7 +459,9 @@ impl DrmDev {
             // the frames alive past DESTROY_DUMB, and the pixels are WB for the
             // renderer -- see `drm::handle_vmo`.
             Ok(vmo)
-        } else if let Some((phys_addr, size)) = zcore_drivers::scheme::gem_mmap::lookup(handle_id) {
+        } else if let Some((phys_addr, size)) =
+            zcore_drivers::scheme::gem_mmap::lookup_for(handle_id, drm::current_pid())
+        {
             // Driver-private GEM object (currently: nouveau-uAPI GEM_NEW) --
             // same fake-offset space, different table (see
             // drivers/src/scheme/gem_mmap.rs's module doc for why this
@@ -468,10 +470,1970 @@ impl DrmDev {
             // frames while an older mmap Arc is still live (see `nouveau_cpu_vmo`).
             // Always size the VMO to the full GEM; the caller's `len` only
             // bounds the mapping, not the shared object.
+            //
+            // `lookup_for`, not `lookup`: the mmap offset is `handle << 12`, a
+            // pure function of the handle, so an unchecked lookup let any
+            // process map any driver-private GEM object in the system by
+            // naming an offset. Linux resolves the offset through the device's
+            // `vma_offset_manager` and then checks `drm_vma_node_is_allowed`,
+            // whose allow-list is populated when a handle is created -- so a
+            // file that never got a handle to the object gets EACCES. The
+            // dumb-buffer branch above is already owner-checked inside
+            // `handle_vmo`; this was the remaining door.
             let _ = len;
             Ok(drm::nouveau_cpu_vmo(handle_id, phys_addr, size as usize))
         } else {
             Err(FsError::InvalidParam)
+        }
+    }
+    /// One DRM ioctl, dispatched on the CANONICAL command -- the encoding
+    /// whose `_IOC_SIZE` matches the struct layout the arms below parse.
+    /// Callers reach it through [`INode::io_control`], which reconciles the
+    /// size the client encoded with the size we parse, exactly as Linux's
+    /// `drm_ioctl()` does.
+    #[allow(unsafe_code)]
+    fn drm_ioctl_dispatch(&self, cmd: u32, data: usize) -> Result<usize> {
+        // NOTE `data` is NOT necessarily a user address here: [`drm_ioctl`] hands
+        // this a kernel bounce buffer whenever it had to reconcile a struct size,
+        // exactly as `drm_ioctl_kernel()` hands the handler `kdata`. The
+        // `access_ok()` for the argument therefore lives in that wrapper, over
+        // the range the CLIENT gave, and every arm below may assume `data` is
+        // `_IOC_SIZE(cmd)` readable/writable bytes. Nested pointers inside the
+        // struct are still the arm's own to check -- they always point at user
+        // memory, whichever buffer the struct itself lives in.
+        // Render nodes only accept DRM_RENDER_ALLOW ioctls (drm-uapi.rst
+        // "Render nodes"): modeset, dumb-buffer and master/auth commands get
+        // EACCES exactly like Linux, so a client probing `renderD128` sees a
+        // render node, not a second KMS device.
+        if self.minor >= 128 && !render_allowed(cmd) {
+            // OBSERVE, DO NOT ENFORCE (yet).
+            //
+            // `render_allowed` used to extract the NR as `(cmd >> 8) & 0xff`,
+            // which is the ioctl TYPE byte -- 'd' (0x64) for every DRM ioctl,
+            // and 0x64 sits inside the driver-private `0x40..=0x9F` arm. The
+            // filter has therefore ACCEPTED EVERYTHING since it was written,
+            // and renderD128 has behaved as a fully-open second KMS node.
+            //
+            // Fixing the extraction (correct, and it now matches Linux's
+            // DRM_RENDER_ALLOW set exactly) would in the same step start
+            // refusing every dumb-buffer and modeset ioctl on the render node
+            // -- CREATE_DUMB/MAP_DUMB/ADDFB2/PAGE_FLIP/... -- on a software-GL
+            // desktop that currently boots and that this change cannot be
+            // tested against. Turning a silent no-op into an enforcing gate
+            // blind is exactly the kind of regression worth avoiding, so log
+            // the would-be refusal and let the call through. Flip this to
+            // `return Err(FsError::NoPermission)` once a boot log shows the
+            // line never appears on the software path.
+            //
+            // De-duped per NR: the caller controls the rate, and `klog_info!`
+            // has no level filter, no rate limit and goes straight out the
+            // UART -- an unthrottled line here would let a client that retries
+            // in a loop flood the serial console and stall the boot.
+            static REFUSAL_LOGGED: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
+            let nr = (cmd & 0xff) as usize;
+            if !REFUSAL_LOGGED[nr].swap(true, Ordering::Relaxed) {
+                kernel_hal::klog_info!(
+                    "[drm] render node: ioctl {:#010x} (drm nr={:#04x}) is NOT in Linux's \
+                     DRM_RENDER_ALLOW set -- allowed anyway for now, see render_allowed()",
+                    cmd,
+                    cmd & 0xff
+                );
+            }
+        }
+        // KMS-query trace for Vulkan's VK_KHR_display probe (wsi_display).
+        // `vulkaninfo` dies with ERROR_OUT_OF_HOST_MEMORY inside
+        // vkGetPhysicalDeviceDisplayPlanePropertiesKHR on RTX, and Mesa
+        // returns that code when one of these six GET calls fails (NULL from
+        // libdrm) -- but every failure arm below logs at log::warn/debug,
+        // INVISIBLE under LOG=error. Name each call and its caller pid via
+        // klog (level-filter-free) so one dmesg photo shows the exact query
+        // sequence and which one refused. Bounded noise: these six only fire
+        // at client startup / probe time, never per frame.
+        {
+            let wsi_name = match cmd {
+                DRM_IOCTL_MODE_GETRESOURCES => Some("GETRESOURCES"),
+                DRM_IOCTL_MODE_GETCONNECTOR => Some("GETCONNECTOR"),
+                DRM_IOCTL_MODE_GETENCODER => Some("GETENCODER"),
+                DRM_IOCTL_MODE_GETCRTC => Some("GETCRTC"),
+                DRM_IOCTL_MODE_GETPLANERESOURCES => Some("GETPLANERESOURCES"),
+                DRM_IOCTL_MODE_GETPLANE => Some("GETPLANE"),
+                _ => None,
+            };
+            if let Some(name) = wsi_name {
+                if wsi_trace_take() {
+                    kernel_hal::klog_info!(
+                        "[drm-wsi] pid={} {} (minor={})",
+                        drm::current_pid(),
+                        name,
+                        self.minor
+                    );
+                }
+            }
+        }
+        if (cmd & 0xff) == DRM_ECLIPSE_COMPUTE_NR {
+            // Matched by NR so the `_IOWR` size encoding need not agree bit for
+            // bit -- which means the size the CLIENT chose is the only thing the
+            // argument check above saw. `eclipse_compute_ioctl` writes the whole
+            // 536-byte struct (`status`, `elapsed_ns`, `grid_threads` and a
+            // 512-byte `summary`), so a caller that encodes a smaller one passes
+            // the check and then has half a kilobyte written past the end of its
+            // buffer. Linux never has this hazard: `ksize` there is the KERNEL's
+            // struct size and the buffer is kernel-allocated.
+            if (((cmd >> 16) & 0x3fff) as usize) < core::mem::size_of::<DrmEclipseCompute>() {
+                return Err(FsError::InvalidParam);
+            }
+            return eclipse_compute_ioctl(self.minor, data);
+        }
+        match cmd {
+            DRM_IOCTL_VERSION => {
+                let node = drm_node_name(self.minor);
+                let compute_node = drm::is_compute_minor(self.minor);
+                // When the nouveau experiment is on, make this visible at the
+                // default `warn` level and name the primary DRM driver: it tells
+                // us in one boot whether NVK/Mesa even reached VERSION on this
+                // node (discovery/enumeration OK) and whether the driver behind
+                // it is the real NvidiaGpu ("Nvidia GPU") or a software fallback
+                // (which would route every nouveau ioctl to the wrong driver).
+                if zcore_drivers::display::nouveau_uapi_enabled() {
+                    // klog_info!, not log::warn!: hardware boots default to
+                    // LOG=error. This one line tells us in a quiet boot whether
+                    // NVK/Mesa even reached VERSION on the node (discovery OK) and
+                    // whether the driver behind it is the real NvidiaGpu.
+                    //
+                    // ONCE PER MINOR. `klog_info!` has no level filter, no rate
+                    // limit and writes straight to the UART, and VERSION is on a
+                    // path whose rate userspace controls: libdrm calls it on
+                    // every `drmGetVersion`, so every `drmGetDevices2` scan, every
+                    // Vulkan/EGL probe and every wlroots backend retry emits one.
+                    // A desktop that retries in a loop turns that into hundreds
+                    // of synchronous serial writes -- the same unthrottled-klog
+                    // defect already fixed for the render_allowed line above. The
+                    // answer it carries (did a client reach VERSION, and which
+                    // driver is behind the node) is the same every time, so the
+                    // first line per node is the whole diagnostic.
+                    static VERSION_LOGGED: [AtomicBool; 256] =
+                        [const { AtomicBool::new(false) }; 256];
+                    let slot = (self.minor & 0xff) as usize;
+                    if !VERSION_LOGGED[slot].swap(true, Ordering::Relaxed) {
+                        let vname = if compute_node {
+                            "eclipse-compute"
+                        } else {
+                            "nouveau"
+                        };
+                        match self.driver() {
+                            Some(d) => kernel_hal::klog_info!(
+                                "[drm] VERSION on /dev/dri/{} (minor={}) -> name=\"{}\"; driver={:?} pci_bdf={:x?} (client reached VERSION — DRM discovery OK; logged once per node)",
+                                node,
+                                self.minor,
+                                vname,
+                                d.name(),
+                                d.pci_bdf()
+                            ),
+                            None => kernel_hal::klog_info!(
+                                "[drm] VERSION on /dev/dri/{} (minor={}) -> name=\"{}\"; driver=<none> (logged once per node)",
+                                node,
+                                self.minor,
+                                vname
+                            ),
+                        }
+                    }
+                } else {
+                    log::debug!(
+                        "[drm] VERSION — /dev/dri/{} opened by userspace (minor={})",
+                        node,
+                        self.minor
+                    );
+                }
+                // Mesa selects the userspace DRI driver from this NAME. With the
+                // nouveau uAPI enabled (the RTX experiment: `nvidia.nouveau_uapi`,
+                // only ever set alongside a real NVIDIA card — QEMU's virtio-gpu
+                // path never sets it, so it keeps the "zcore" identity), report
+                // "nouveau" so Mesa loads nouveau_dri.so, and version 1.4.0 —
+                // the drm_nouveau version that gates the NEW submission uAPI
+                // (VM_INIT/VM_BIND/EXEC), which is what this driver implements
+                // (NOT the legacy GEM_PUSHBUF path, absent here). If Mesa's GL
+                // winsys still reaches for GEM_PUSHBUF, the boot log's
+                // "[nouveau-uapi] unhandled ioctl ... GEM_PUSHBUF" line says so.
+                let nouveau = zcore_drivers::display::nouveau_uapi_enabled();
+                let v = unsafe { &mut *(data as *mut DrmVersion) };
+                if compute_node {
+                    v.version_major = 0;
+                    v.version_minor = 1;
+                    v.version_patchlevel = 0;
+                } else if nouveau {
+                    v.version_major = 1;
+                    v.version_minor = 4;
+                    v.version_patchlevel = 0;
+                } else {
+                    v.version_major = 1;
+                    v.version_minor = 0;
+                    v.version_patchlevel = 0;
+                }
+
+                let name: &[u8] = if compute_node {
+                    b"eclipse-compute\0"
+                } else if nouveau {
+                    b"nouveau\0"
+                } else {
+                    b"zcore\0"
+                };
+                let date = b"20260503\0";
+                let desc: &[u8] = if compute_node {
+                    b"Eclipse NVIDIA compute\0"
+                } else if nouveau {
+                    b"nouveau\0"
+                } else {
+                    b"zCore DRM Driver\0"
+                };
+
+                unsafe {
+                    if v.name_len > 0 && !v.name.is_null() {
+                        let len = core::cmp::min(v.name_len, name.len());
+                        ucheck(v.name as usize, len)?;
+                        core::ptr::copy_nonoverlapping(name.as_ptr(), v.name, len);
+                    }
+                    if v.date_len > 0 && !v.date.is_null() {
+                        let len = core::cmp::min(v.date_len, date.len());
+                        ucheck(v.date as usize, len)?;
+                        core::ptr::copy_nonoverlapping(date.as_ptr(), v.date, len);
+                    }
+                    if v.desc_len > 0 && !v.desc.is_null() {
+                        let len = core::cmp::min(v.desc_len, desc.len());
+                        ucheck(v.desc as usize, len)?;
+                        core::ptr::copy_nonoverlapping(desc.as_ptr(), v.desc, len);
+                    }
+                }
+                v.name_len = name.len();
+                v.date_len = date.len();
+                v.desc_len = desc.len();
+                Ok(0)
+            }
+            DRM_IOCTL_GET_UNIQUE => {
+                let u = unsafe { &mut *(data as *mut DrmUnique) };
+                let name = b"zcore-gpu\0";
+                unsafe {
+                    if u.unique_len > 0 && !u.unique.is_null() {
+                        let len = core::cmp::min(u.unique_len, name.len());
+                        ucheck(u.unique as usize, len)?;
+                        core::ptr::copy_nonoverlapping(name.as_ptr(), u.unique, len);
+                    }
+                }
+                u.unique_len = name.len();
+                Ok(0)
+            }
+            DRM_IOCTL_GET_CAP => {
+                let cap = unsafe { &mut *(data as *mut DrmGetCap) };
+                match cap.capability {
+                    0x1 => cap.value = 1, // DRM_CAP_DUMB_BUFFER
+                    // DRM_CAP_DUMB_PREFERRED_DEPTH: XRGB8888 scanout = 24.
+                    0x3 => cap.value = 24,
+                    // DRM_CAP_DUMB_PREFER_SHADOW: the dumb buffer lives behind
+                    // a CPU blit over PCIe — clients should render to a shadow
+                    // and copy, exactly what this cap advises.
+                    0x4 => cap.value = 1,
+                    // DRM_CAP_PRIME: IMPORT|EXPORT. wlroots' check_drm_features
+                    // *requires* DRM_PRIME_CAP_IMPORT or the whole DRM backend
+                    // fails ("PRIME import not supported") — it is mandatory for
+                    // any output (pixman or GL), not just GBM clients. We now
+                    // implement PRIME_HANDLE_TO_FD / FD_TO_HANDLE (dma-buf), so
+                    // advertise it.
+                    0x5 => cap.value = 3,
+                    0x6 => cap.value = 1,  // DRM_CAP_TIMESTAMP_MONOTONIC
+                    0x8 => cap.value = 64, // DRM_CAP_CURSOR_WIDTH
+                    0x9 => cap.value = 64, // DRM_CAP_CURSOR_HEIGHT
+                    // DRM_CAP_ADDFB2_MODIFIERS: report NO modifier support.
+                    // Our scanout is a CPU blit that reads the framebuffer
+                    // LINEARLY, so the only layout it can present is
+                    // DRM_FORMAT_MOD_LINEAR. Advertising modifier support (1)
+                    // let wlroots negotiate a BLOCK-LINEAR swapchain with NVK
+                    // (PTE kind 0x06), and binding it hit VM_BIND's refusal of
+                    // non-zero PTE kinds ("PTE kind 0x06 requested (tiled) ...
+                    // refusing"), so `vkBindImageMemory` failed and the
+                    // swapchain never allocated (`gbm_bo_create failed`,
+                    // "Swapchain for output 'HDMI-A-1' failed test"). With 0,
+                    // wlroots restricts scanout to implicit/linear buffers,
+                    // which bind with PTE kind 0 and blit correctly. (The
+                    // Vulkan renderer's VK_EXT_image_drm_format_modifier is a
+                    // separate device extension, unaffected by this KMS cap.)
+                    0x10 => cap.value = 0, // DRM_CAP_ADDFB2_MODIFIERS
+                    // DRM_CAP_CRTC_IN_VBLANK_EVENT: our page-flip event carries
+                    // the crtc_id, so report support (wlroots requires it).
+                    0x12 => cap.value = 1,
+                    // DRM_CAP_SYNCOBJ / DRM_CAP_SYNCOBJ_TIMELINE: real
+                    // (create/destroy/wait/signal all work, see
+                    // zcore_drivers::scheme::syncobj), but gated on the same
+                    // opt-in flag as the rest of this session's nouveau-uAPI
+                    // work (`nvidia.nouveau_uapi`) so a driver/setup nothing
+                    // here has touched (virtio-gpu, or NVIDIA without the
+                    // flag) never sees a capability bit flip by default.
+                    0x13 | 0x14 => {
+                        cap.value = zcore_drivers::display::nouveau_uapi_enabled() as u64;
+                        // One-shot per cap, VISIBLE on hardware (klog has no level
+                        // filter, unlike the log::debug! below). NVK probes
+                        // DRM_CAP_SYNCOBJ (0x13) and DRM_CAP_SYNCOBJ_TIMELINE (0x14)
+                        // before it will back a timeline VkSemaphore with a kernel
+                        // syncobj. If the next boot's dmesg shows these as `-> 1`
+                        // but zink still logs "failed to create timeline semaphore"
+                        // with NO `SYNCOBJ_CREATE` line after (see that arm), NVK
+                        // gave up in USERSPACE over a capability beyond the cap —
+                        // the same class as the external-semaphore block, and NOT a
+                        // kernel syncobj bug. `->1` followed by `SYNCOBJ_CREATE`
+                        // lines means the create path is reached and the failure is
+                        // downstream of the syncobj.
+                        static SYNCOBJ_CAP_LOGGED: AtomicBool = AtomicBool::new(false);
+                        static TIMELINE_CAP_LOGGED: AtomicBool = AtomicBool::new(false);
+                        let latch = if cap.capability == 0x14 {
+                            &TIMELINE_CAP_LOGGED
+                        } else {
+                            &SYNCOBJ_CAP_LOGGED
+                        };
+                        if !latch.swap(true, Ordering::Relaxed) {
+                            kernel_hal::klog_info!(
+                                "[drm] GET_CAP {} -> {} (probed by pid {})",
+                                if cap.capability == 0x14 {
+                                    "SYNCOBJ_TIMELINE"
+                                } else {
+                                    "SYNCOBJ"
+                                },
+                                cap.value,
+                                drm::current_pid()
+                            );
+                        }
+                    }
+                    // Everything else — DRM_CAP_ASYNC_PAGE_FLIP (0x7),
+                    // DRM_CAP_PAGE_FLIP_TARGET (0x11) and
+                    // DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP (0x15) — is honestly 0.
+                    _ => cap.value = 0,
+                }
+                log::debug!(
+                    "[drm] GET_CAP minor={} cap={:#x} -> {}",
+                    self.minor,
+                    cap.capability,
+                    cap.value
+                );
+                log::debug!("[drm] GET_CAP cap={:#x} -> {}", cap.capability, cap.value);
+                Ok(0)
+            }
+            // A single DRM client on the primary node is implicitly master;
+            // accept (drop-)master so seatd/wlroots session activation succeeds.
+            // Magic/auth: `drmIsMaster()` authenticates magic 0 and treats
+            // success as "this fd is DRM master". wlroots' dumb-buffer allocator
+            // (pixman path) requires master, so always succeed — the single
+            // client on the primary node is implicitly master here.
+            DRM_IOCTL_GET_MAGIC => {
+                // struct drm_auth { __u32 magic; }
+                unsafe { *(data as *mut u32) = 1 };
+                Ok(0)
+            }
+            DRM_IOCTL_AUTH_MAGIC => Ok(0),
+            DRM_IOCTL_SET_MASTER => {
+                // Become DRM master, but do NOT switch the console to graphics
+                // yet: defer that to the first real scanout (`drm::scanout`). If
+                // the client stalls before presenting a frame (e.g. its renderer
+                // fails to init), the kernel text console stays usable and its
+                // logs visible instead of freezing on a black screen.
+                log::debug!("[drm] SET_MASTER (minor={})", self.minor);
+                // A new compositor session gets a fresh present-failure trace
+                // budget. The budget is what keeps a failing present from
+                // flooding the console, but as a per-BOOT count it was useless
+                // on a rig that stays up for days: the machine that produced
+                // the `Failed to set CRTC` log had been up 21 hours and had
+                // started labwc several times, so the eight lines that would
+                // have named the cause were spent on a session long gone. One
+                // compositor session is the right unit -- it is exactly one
+                // attempt at bringing the desktop up.
+                PRESENT_FAIL_TRACED.store(0, Ordering::Relaxed);
+                Ok(0)
+            }
+            DRM_IOCTL_DROP_MASTER => {
+                // In a seat-managed session (seatd owns tty7 via VT_PROCESS) the
+                // SEAT -- not DRM master -- drives the console KD mode: seatd
+                // already put tty7 into KD_GRAPHICS and will restore text via
+                // its own VT handshake when the session ends. A DROP_MASTER here
+                // is then typically TRANSIENT (wlroots/Xwayland resetting the DRM
+                // backend during renderer fallback -- e.g. "EGL setup failed,
+                // falling back to sw"), not a real relinquish. The old
+                // unconditional set_kd_mode(KD_TEXT) flipped the active graphics
+                // VT (tty7) back to text, which switch_vt_impl(0) reverted to
+                // tty1 -- so the compositor's very first present landed on VT 0
+                // and the desktop never appeared on tty7. Restore text only when
+                // NO seat owns the graphics VT (bare DRM client / QEMU pixman /
+                // Xorg path), where this mechanism is the only one in play.
+                let seat_owned = crate::fs::stdio::graphics_vt_seat_owned();
+                kernel_hal::klog_info!(
+                    "[drm] DROP_MASTER (minor={}) seat_owned={} -- {}",
+                    self.minor,
+                    seat_owned,
+                    if seat_owned {
+                        "seat drives KD mode, NOT restoring text"
+                    } else {
+                        "restoring text console"
+                    }
+                );
+                if !seat_owned {
+                    kernel_hal::console::set_kd_mode(kernel_hal::console::KD_TEXT);
+                }
+                // Forget the compositor's DRM VT ownership so text consoles are
+                // no longer gated off screen/input (a live compositor's next
+                // present re-claims it).
+                //
+                // Deliberately NOT done here any more (both were Linux-divergent
+                // and both were mutated GLOBALLY by whichever client dropped
+                // master, clobbering the live compositor's state):
+                //  * cancel_pending_events(): pending DRM events belong to the
+                //    drm_file that queued them and survive a master drop in
+                //    Linux. A transient DROP_MASTER from a probing client
+                //    (Xwayland at session bring-up) inside the one-vblank window
+                //    after labwc's first page-flip swallowed labwc's completion
+                //    -- wlroots waited on it forever and the desktop froze on
+                //    its first frame until a VT cycle forced a re-enable. Events
+                //    are now cancelled only when the flip-owning process EXITS
+                //    (drm::cancel_events_for_exit in release_process).
+                //  * set_atomic_client(false): DRM_CLIENT_CAP_ATOMIC is
+                //    per-file in Linux and never revoked by a master drop;
+                //    clearing it globally made the compositor's atomic
+                //    property view flip mid-session.
+                drm::clear_graphics_owner();
+                Ok(0)
+            }
+            DRM_IOCTL_SET_VERSION => {
+                // drm_setversion: report the current interface (1.4) and
+                // driver (1.0) versions, validating any requested majors.
+                // -1 means "query only". Xorg's modesetting driver calls this
+                // right after open and treats ENOTTY as "not a DRM device".
+                let sv = unsafe { &mut *(data as *mut DrmSetVersion) };
+                let req_if = (sv.drm_di_major, sv.drm_di_minor);
+                let req_dd = sv.drm_dd_major;
+                sv.drm_di_major = 1;
+                sv.drm_di_minor = 4;
+                sv.drm_dd_major = 1;
+                sv.drm_dd_minor = 0;
+                if req_if.0 != -1 && (req_if.0 != 1 || req_if.1 < 0 || req_if.1 > 4) {
+                    return Err(FsError::InvalidParam);
+                }
+                if req_dd != -1 && req_dd != 1 {
+                    return Err(FsError::InvalidParam);
+                }
+                Ok(0)
+            }
+            DRM_IOCTL_SET_CLIENT_CAP => {
+                // struct drm_set_client_cap { __u64 capability; __u64 value; }
+                let cap = unsafe { *(data as *const u64) };
+                let value = unsafe { *(data.wrapping_add(8) as *const u64) };
+                match cap {
+                    DRM_CLIENT_CAP_ATOMIC => {
+                        // Linux refuses this with EOPNOTSUPP unless the driver
+                        // has DRIVER_ATOMIC. Eclipse's atomic path covers the
+                        // software-KMS pipeline and — until it has the same
+                        // mileage as the proven legacy path — is opt-in via
+                        // the `drm.atomic` cmdline flag (nouveau shipped its
+                        // atomic support gated the same way).
+                        if !drm::atomic_enabled() || !drm::software_kms_active() {
+                            log::debug!(
+                                "[drm] SET_CLIENT_CAP ATOMIC -> EOPNOTSUPP (legacy KMS; boot with drm.atomic to enable)"
+                            );
+                            return Err(FsError::OpNotSupported);
+                        }
+                        // Linux: values 0..2 (2 = relaxed checking); > 2 EINVAL.
+                        if value > 2 {
+                            return Err(FsError::InvalidParam);
+                        }
+                        // Setting atomic also implies universal planes.
+                        self.file.set_atomic_client(value != 0);
+                        log::debug!("[drm] SET_CLIENT_CAP ATOMIC={} -> accepted", value);
+                        Ok(0)
+                    }
+                    DRM_CLIENT_CAP_WRITEBACK_CONNECTORS => {
+                        // Linux: atomic clients only. There are no writeback
+                        // connectors to expose, so accepting is a no-op.
+                        if !self.file.atomic_client() || value > 1 {
+                            log::debug!("[drm] SET_CLIENT_CAP WRITEBACK -> EINVAL");
+                            return Err(FsError::InvalidParam);
+                        }
+                        Ok(0)
+                    }
+                    // STEREO_3D, UNIVERSAL_PLANES, ASPECT_RATIO: accept.
+                    _ => {
+                        log::debug!("[drm] SET_CLIENT_CAP cap={} -> accepted", cap);
+                        Ok(0)
+                    }
+                }
+            }
+            DRM_IOCTL_MODE_CREATE_DUMB => {
+                let info = unsafe { &mut *(data as *mut DrmModeCreateDumb) };
+                let bpp = info.bpp.max(32);
+                // width/height/bpp are userspace-controlled: compute pitch/size
+                // in 64-bit. A 32-bit `width*bpp` or `pitch*height` would wrap
+                // (e.g. 50000x50000x32) and under-allocate the buffer while
+                // echoing a huge size back, becoming an OOB read at scanout.
+                // Bound the result to a sane ceiling (64 MiB — a 4K XRGB frame
+                // is ~33 MiB) and require pitch to fit the u32 written back.
+                const MAX_DUMB_SIZE: u64 = 64 * 1024 * 1024;
+                let mut pitch64 = (info.width as u64 * bpp as u64 / 8 + 63) & !63;
+                let mut size64 = pitch64.saturating_mul(info.height as u64);
+                // When the compositor requests a full-screen dumb buffer, align
+                // its pitch with the display scanout pitch so the CE-offload
+                // present path can fire (flat copy needs equal strides). Without
+                // this, wlroots' 64-byte-aligned pitch often differs from the
+                // GOP framebuffer pitch and every frame falls back to the slow
+                // CPU blit (~7-10 FPS on dual RTX).
+                if let Some((dw, dh, dp)) = drm::display_mode() {
+                    if info.width == dw && info.height == dh && dp as u64 >= pitch64 {
+                        pitch64 = dp as u64;
+                        size64 = pitch64.saturating_mul(info.height as u64);
+                    }
+                }
+                if pitch64 == 0
+                    || pitch64 > u32::MAX as u64
+                    || size64 == 0
+                    || size64 > MAX_DUMB_SIZE
+                {
+                    log::warn!(
+                        "[drm] CREATE_DUMB {}x{} bpp={} -> rejected (pitch={} size={} out of range)",
+                        info.width, info.height, bpp, pitch64, size64
+                    );
+                    return Err(FsError::InvalidParam);
+                }
+                let pitch = pitch64 as u32;
+                let size = size64 as usize;
+
+                if let Some(handle) = drm::alloc_buffer(size) {
+                    info.handle = handle.id;
+                    info.pitch = pitch;
+                    info.size = size as u64;
+                    log::debug!(
+                        "[drm] CREATE_DUMB {}x{} bpp={} -> handle={} pitch={} size={}",
+                        info.width,
+                        info.height,
+                        bpp,
+                        handle.id,
+                        pitch,
+                        size
+                    );
+                    Ok(0)
+                } else {
+                    log::error!(
+                        "[drm] CREATE_DUMB {}x{} bpp={} -> alloc failed (size={})",
+                        info.width,
+                        info.height,
+                        bpp,
+                        size
+                    );
+                    Err(FsError::NoDeviceSpace)
+                }
+            }
+            DRM_IOCTL_MODE_ADDFB => {
+                let cmd = unsafe { &mut *(data as *mut DrmModeFbCmd) };
+                if let Some(fb_id) = drm::create_fb(cmd.handle, cmd.width, cmd.height, cmd.pitch) {
+                    cmd.fb_id = fb_id;
+                    Ok(0)
+                } else {
+                    // [swapchain-diag] error!-visible at LOG=error: a failed FB
+                    // creation makes wlroots' swapchain test fail before any
+                    // atomic commit is even attempted.
+                    log::error!(
+                        "[drm] ADDFB failed: {}x{} handle={:#x} pitch={} (create_fb returned None)",
+                        cmd.width,
+                        cmd.height,
+                        cmd.handle,
+                        cmd.pitch
+                    );
+                    Err(FsError::DeviceError)
+                }
+            }
+            DRM_IOCTL_MODE_ADDFB2 => {
+                let cmd = unsafe { &mut *(data as *mut DrmModeFbCmd2) };
+                if let Some(fb_id) =
+                    drm::create_fb(cmd.handles[0], cmd.width, cmd.height, cmd.pitches[0])
+                {
+                    cmd.fb_id = fb_id;
+                    Ok(0)
+                } else {
+                    // [swapchain-diag] error!-visible at LOG=error: the scanout
+                    // buffer wlroots hands us is rejected HERE, before the atomic
+                    // TEST_ONLY commit — so an empty "ATOMIC reject" grep with
+                    // this line present localises the failure to FB creation.
+                    log::error!(
+                        "[drm] ADDFB2 failed: {}x{} handle={:#x} pitch={} fmt={:#x} modifier={:#x} \
+                         (create_fb returned None)",
+                        cmd.width, cmd.height, cmd.handles[0], cmd.pitches[0], cmd.pixel_format, cmd.modifier[0]
+                    );
+                    Err(FsError::DeviceError)
+                }
+            }
+            DRM_IOCTL_MODE_RMFB => {
+                let fb_id = unsafe { *(data as *const u32) };
+                // ENOENT for an id that is not the caller's, whether it does
+                // not exist or belongs to someone else -- `drm_mode_rmfb`
+                // walks `file_priv->fbs` and gives the same answer either way,
+                // so a prober cannot learn that another client's framebuffer
+                // exists. Swallowing the result let any process remove the
+                // compositor's scanout framebuffer, after which every SETCRTC
+                // and PAGE_FLIP on it fails and wlroots retries the modeset
+                // forever.
+                if drm::rmfb_for(fb_id, drm::current_pid()) {
+                    Ok(0)
+                } else {
+                    Err(FsError::EntryNotFound)
+                }
+            }
+            DRM_IOCTL_MODE_CLOSEFB => {
+                // Our software-KMS `rmfb` already only drops the fb object —
+                // scanout keeps showing the last blitted frame until the next
+                // present — which is exactly CLOSEFB's "close without
+                // disabling" contract. Reject unknown ids like Linux (EINVAL
+                // via DeviceError is close enough for wlroots' fallback).
+                let fb_id = unsafe { *(data as *const u32) };
+                if drm::rmfb_for(fb_id, drm::current_pid()) {
+                    Ok(0)
+                } else {
+                    Err(FsError::InvalidParam)
+                }
+            }
+            DRM_IOCTL_MODE_MAP_DUMB => {
+                let map = unsafe { &mut *(data as *mut DrmModeMapDumb) };
+                // Return a page-aligned fake offset (`handle << PAGE_SHIFT`). The
+                // subsequent mmap of the dumb buffer passes this back as the file
+                // offset; musl's `mmap()` rejects a non-page-aligned offset with
+                // EINVAL, and `get_vmo()` shifts it back to the handle id.
+                map.offset = (map.handle as u64) << 12;
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_DESTROY_DUMB => {
+                let handle = unsafe { *(data as *const u32) };
+                // `gem_close` already refuses a handle that is not the
+                // caller's; reporting its verdict is what tells a client it
+                // freed something twice, or something that was never its own.
+                // Linux's `drm_mode_destroy_dumb_ioctl` answers EINVAL through
+                // `drm_gem_handle_delete`. Swallowing it made every wrong free
+                // look like a good one.
+                if drm::gem_close(handle) {
+                    Ok(0)
+                } else {
+                    Err(FsError::InvalidParam)
+                }
+            }
+            DRM_IOCTL_MODE_SETCRTC => {
+                // struct drm_mode_crtc has the same layout as DrmModeGetCrtc.
+                let req = unsafe { &mut *(data as *mut DrmModeGetCrtc) };
+                if req.mode_valid != 0 {
+                    drm::set_vblank_period_from_modeinfo(&req.mode);
+                }
+                if req.fb_id != 0 {
+                    if let Err(e) = drm::present_now_checked(req.fb_id, req.crtc_id, None) {
+                        present_failed("SETCRTC", req.fb_id, req.crtc_id, e)?;
+                    }
+                } else {
+                    // `drm_mode_setcrtc` with a null fb turns the pipe off
+                    // (`set_config` with `.fb = NULL`). Doing nothing here is
+                    // half of why a screen could never be blanked: wlroots
+                    // disables an output with DPMS off followed by exactly this
+                    // call, and both were no-ops, so the panel kept the last
+                    // frame lit while the compositor believed it was dark.
+                    drm::set_crtc_blanked(true);
+                    drm::set_crtc_fb(req.crtc_id, 0);
+                }
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_PAGE_FLIP => {
+                let flip = unsafe { *(data as *const DrmModeCrtcPageFlip) };
+                // Linux `drm_mode_page_flip_ioctl`: unknown flags and a
+                // non-zero reserved word are EINVAL; ASYNC is EINVAL while
+                // DRM_CAP_ASYNC_PAGE_FLIP is 0 and the TARGET_* flags while
+                // DRM_CAP_PAGE_FLIP_TARGET is 0; an unknown fb is ENOENT. A
+                // completion event is queued only when the caller asked.
+                const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
+                const DRM_MODE_PAGE_FLIP_ASYNC: u32 = 0x02;
+                const DRM_MODE_PAGE_FLIP_TARGET: u32 = 0x0c;
+                const DRM_MODE_PAGE_FLIP_FLAGS: u32 = 0x0f;
+                if flip.flags & !DRM_MODE_PAGE_FLIP_FLAGS != 0
+                    || flip.reserved != 0
+                    || flip.flags & (DRM_MODE_PAGE_FLIP_ASYNC | DRM_MODE_PAGE_FLIP_TARGET) != 0
+                {
+                    return Err(FsError::InvalidParam);
+                }
+                if drm::get_fb(flip.fb_id).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
+                let want_event = flip.flags & DRM_MODE_PAGE_FLIP_EVENT != 0;
+                match drm::page_flip(
+                    flip.fb_id,
+                    flip.crtc_id,
+                    flip.user_data,
+                    want_event,
+                    &self.file,
+                ) {
+                    Ok(()) => Ok(0),
+                    Err(drm::FlipError::Busy) => Err(FsError::Busy),
+                    Err(drm::FlipError::Failed) => Err(FsError::DeviceError),
+                }
+            }
+            DRM_IOCTL_WAIT_VBLANK => {
+                // union drm_wait_vblank. A software framebuffer has no real
+                // vblank, so synthesize the next sequence from the monotonic
+                // clock. If the caller asked for an event (`_DRM_VBLANK_EVENT`)
+                // deliver a DRM_EVENT_VBLANK on the card fd; otherwise fill the
+                // reply and return immediately instead of blocking.
+                let req = unsafe { &mut *(data as *mut DrmWaitVblank) };
+                let typ = req.typ;
+                let signal = req.val1;
+                // Only ask the driver for a real vblank when it has hardware
+                // KMS support. Without hardware KMS (e.g. the NVIDIA stub
+                // registers has_hardware_kms()=false) wait_vblank is
+                // implemented as a busy 16.7 ms spin, and calling it on every
+                // WAIT_VBLANK ioctl causes severe CPU starvation on a
+                // cooperative async runtime — making the system appear frozen.
+                if !drm::software_kms_active() {
+                    if let Some(driver) = drm::get_primary_driver() {
+                        if driver.has_hardware_kms() {
+                            let _ = driver.wait_vblank(0);
+                        }
+                    }
+                }
+                // Resolve the requested vblank like `drm_wait_vblank_ioctl`:
+                // `_DRM_VBLANK_RELATIVE` counts from the current sequence,
+                // absolute is taken as is, and `_DRM_VBLANK_NEXTONMISS` moves a
+                // target that already passed to the next vblank. The request
+                // used to be ignored entirely (event at the next vblank, or an
+                // immediate reply), so "+2" or an absolute future MSC came
+                // back early with a smaller sequence than asked.
+                const _DRM_VBLANK_RELATIVE: u32 = 0x1;
+                const _DRM_VBLANK_NEXTONMISS: u32 = 0x1000_0000;
+                let now_seq = drm::vblank_seq_now();
+                let mut target = if typ & _DRM_VBLANK_RELATIVE != 0 {
+                    now_seq.wrapping_add(req.sequence)
+                } else {
+                    req.sequence
+                };
+                let passed = (target.wrapping_sub(now_seq) as i32) <= 0;
+                if passed && typ & _DRM_VBLANK_NEXTONMISS != 0 {
+                    target = now_seq.wrapping_add(1);
+                }
+                if typ & _DRM_VBLANK_EVENT != 0 {
+                    // Post the event when the counter reaches `target`, never
+                    // before the next synthetic vblank: delivering it instantly
+                    // turns a vblank-paced client loop into a busy spin (see
+                    // `schedule_flip_event`).
+                    drm::schedule_vblank_event(signal, target, &self.file);
+                } else {
+                    // Blocking form. The wait itself already happened in
+                    // `sys_ioctl` (see `DrmDev::wait_vblank_sleep`): this arm
+                    // is synchronous and cannot sleep, so it only reports the
+                    // sequence that has completed by the time it runs -- which
+                    // is the requested one, because the sleep preceded it.
+                    let now = kernel_hal::timer::timer_now();
+                    req.typ = 0; // _DRM_VBLANK_ABSOLUTE
+                                 // Return the *current* completed vblank sequence.  Returning
+                                 // vblank_seq_now()+1 (the upcoming vblank) was incorrect: it
+                                 // made the X11 Present MSC tracker believe the display was
+                                 // always one vblank ahead, so it added an extra ~16.7 ms wait
+                                 // per frame, halving the achievable frame rate.
+                    req.sequence = now_seq;
+                    req.val1 = now.as_secs(); // tval_sec
+                    req.val2 = now.subsec_micros() as u64; // tval_usec
+                }
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_SETPLANE => {
+                // Primary-plane update: present immediately on the target CRTC.
+                // fb_id == 0 disables the plane, which we treat as a no-op.
+                let req = unsafe { *(data as *const DrmModeSetPlane) };
+                if req.fb_id != 0 {
+                    if let Err(e) = drm::present_now_checked(req.fb_id, req.crtc_id, None) {
+                        present_failed("SETPLANE", req.fb_id, req.crtc_id, e)?;
+                    }
+                }
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_GETFB => {
+                let cmd = unsafe { &mut *(data as *mut DrmModeFbCmd) };
+                if let Some(fb) = drm::get_fb(cmd.fb_id) {
+                    cmd.width = fb.width;
+                    cmd.height = fb.height;
+                    cmd.pitch = fb.pitch;
+                    cmd.bpp = 32;
+                    cmd.depth = 24;
+                    // The backing GEM handle goes only to the client that
+                    // created this framebuffer. Linux gates it on DRM master
+                    // or CAP_SYS_ADMIN and zeroes the field otherwise, with
+                    // the comment "GET_FB() is an unprivileged ioctl so we
+                    // must not return a buffer-handle to non-master
+                    // processes!". There is no master state to consult here,
+                    // and the premise this used to rest on -- that a single
+                    // client is implicitly master -- is not true of a session
+                    // running Xwayland or any Vulkan probe alongside the
+                    // compositor. Handing the handle out made fb ids, which
+                    // are sequential from 1, an enumeration route straight to
+                    // the compositor's pixels.
+                    cmd.handle = if drm::fb_owned_by_caller(&fb) {
+                        fb.gem_handle_id
+                    } else {
+                        0
+                    };
+                    Ok(0)
+                } else {
+                    // ENOENT, like `drm_mode_getfb`'s framebuffer lookup. This
+                    // answered EINVAL, which reached the boot log only as a
+                    // bare `[einval-hunt] ... a1=0xc01c64ad -> EINVAL` with
+                    // nothing to say the fb id was the problem -- the same
+                    // unknown-fb id that `SETCRTC` was failing on, wearing a
+                    // different errno.
+                    Err(FsError::EntryNotFound)
+                }
+            }
+            DRM_IOCTL_MODE_GETFB2 => {
+                let cmd = unsafe { &mut *(data as *mut DrmModeFbCmd2) };
+                if let Some(fb) = drm::get_fb(cmd.fb_id) {
+                    cmd.width = fb.width;
+                    cmd.height = fb.height;
+                    cmd.pixel_format = 0x3432_5258; // DRM_FORMAT_XRGB8888 ("XR24")
+                    cmd.flags = 0;
+                    // Same gate as GETFB above; `drm_mode_getfb2_ioctl`
+                    // carries the identical check.
+                    cmd.handles = if drm::fb_owned_by_caller(&fb) {
+                        [fb.gem_handle_id, 0, 0, 0]
+                    } else {
+                        [0; 4]
+                    };
+                    cmd.pitches = [fb.pitch, 0, 0, 0];
+                    cmd.offsets = [0; 4];
+                    cmd.modifier = [0; 4];
+                    Ok(0)
+                } else {
+                    // ENOENT, like `drm_mode_getfb2_ioctl`. Same reasoning as
+                    // GETFB above.
+                    Err(FsError::EntryNotFound)
+                }
+            }
+            DRM_IOCTL_MODE_DIRTYFB => {
+                // Flush accumulated damage by re-scanning the framebuffer out.
+                // Clients that keep one persistent FB and signal damage with
+                // DIRTYFB (X's modesetting shadow, simple toolkits) rely on this
+                // to update the screen. When clip rects are given, blit only
+                // their bounding union — a full-frame copy of a swapchain
+                // buffer that only has those boxes painted left stale tiles
+                // (squares) on the GOP. Scanout expands the union to 64-byte
+                // WC lines so a partial store cannot smear neighbouring pixels.
+                // An oversized, zero, or unreadable clip list means "the whole
+                // frame is dirty" (true DIRTYFB semantics for num_clips == 0).
+                let cmd = unsafe { *(data as *const DrmModeFbDirtyCmd) };
+                let rect = if cmd.num_clips > 0 && cmd.num_clips <= 64 && cmd.clips_ptr != 0 {
+                    ucheck_n::<DrmClipRect>(cmd.clips_ptr as usize, cmd.num_clips as usize)?;
+                    let mut union: Option<(u32, u32, u32, u32)> = None;
+                    for i in 0..cmd.num_clips as usize {
+                        let clip = unsafe { *(cmd.clips_ptr as *const DrmClipRect).add(i) };
+                        if clip.x2 <= clip.x1 || clip.y2 <= clip.y1 {
+                            continue;
+                        }
+                        let (x1, y1, x2, y2) = (
+                            clip.x1 as u32,
+                            clip.y1 as u32,
+                            clip.x2 as u32,
+                            clip.y2 as u32,
+                        );
+                        union = Some(match union {
+                            Some((ux, uy, uw, uh)) => {
+                                let nx = ux.min(x1);
+                                let ny = uy.min(y1);
+                                let fx = (ux + uw).max(x2);
+                                let fy = (uy + uh).max(y2);
+                                (nx, ny, fx - nx, fy - ny)
+                            }
+                            None => (x1, y1, x2 - x1, y2 - y1),
+                        });
+                    }
+                    union
+                } else {
+                    None
+                };
+                if !drm::present_now_region(cmd.fb_id, 1, rect) {
+                    // Best-effort: a damage flush that can't scan out (e.g. the
+                    // fb id is unknown to the software path) is not fatal — the
+                    // client keeps its shadow and will re-present. Returning EIO
+                    // here made Xorg's modesetting shadow abort its frame loop,
+                    // so swallow it rather than failing every DirtyFB.
+                    log::debug!("[drm] DIRTYFB fb={} not presented (no-op)", cmd.fb_id);
+                }
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_GETGAMMA | DRM_IOCTL_MODE_SETGAMMA => {
+                // No programmable gamma on the software scanout: accept and
+                // ignore. (Get leaves the caller's ramp buffers untouched, which
+                // Xorg treats as the identity it will "restore" on exit — a
+                // no-op against our no-op Set.)
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_LIST_LESSEES => {
+                // No leases exist; report an empty list. The struct's first u32
+                // is `count_lessees` — zero it so the client copies out none.
+                unsafe {
+                    *(data as *mut u32) = 0;
+                }
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_OBJ_SETPROPERTY => {
+                // Legacy property writes (connector DPMS, plane rotation, …).
+                // The software scanout has no programmable object state, so
+                // accept and ignore rather than failing the client's modeset.
+                let req = unsafe { *(data as *const DrmModeObjSetProperty) };
+                // Same DPMS handling as the connector-specific setter above:
+                // `drm_mode_obj_set_property_ioctl` funnels into the very same
+                // `drm_mode_connector_set_obj_prop`.
+                if req.prop_id == PROP_DPMS && drm::get_connector(req.obj_id).is_some() {
+                    drm::set_crtc_blanked(req.value != DRM_MODE_DPMS_ON);
+                    return Ok(0);
+                }
+                log::debug!(
+                    "[drm] OBJ_SETPROPERTY obj={} type={:#x} prop={} val={} (accepted, no-op)",
+                    req.obj_id,
+                    req.obj_type,
+                    req.prop_id,
+                    req.value
+                );
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_SETPROPERTY => {
+                // Legacy connector property write — wlroots sets the DPMS
+                // property to "on" as part of committing a modeset. Software
+                // scanout is always powered, so accept and ignore rather than
+                // failing the commit (which left the screen blank with
+                // "Failed to set DPMS property").
+                let value = unsafe { *(data as *const u64) };
+                let (prop_id, connector_id) = unsafe {
+                    (
+                        *(data.wrapping_add(8) as *const u32),
+                        *(data.wrapping_add(12) as *const u32),
+                    )
+                };
+                // DPMS is the one legacy connector property with an effect
+                // here. Linux routes it through `connector->funcs->dpms`,
+                // which disables the CRTC for anything but "On"; the other
+                // three levels (Standby, Suspend, Off) all mean "stop lighting
+                // the panel" on a pipe with no power states of its own.
+                if prop_id == PROP_DPMS {
+                    let off = value != DRM_MODE_DPMS_ON;
+                    log::debug!(
+                        "[drm] SETPROPERTY connector={} DPMS={} -> CRTC {}",
+                        connector_id,
+                        value,
+                        if off { "off" } else { "on" }
+                    );
+                    drm::set_crtc_blanked(off);
+                    return Ok(0);
+                }
+                log::debug!(
+                    "[drm] SETPROPERTY connector={} prop={} val={} (accepted, no-op)",
+                    connector_id,
+                    prop_id,
+                    value
+                );
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_CURSOR | DRM_IOCTL_MODE_CURSOR2 => {
+                // Kernel-composited hardware cursor. wlroots is forced onto the
+                // legacy KMS path (atomic is rejected), so it drives the pointer
+                // with these ioctls; `scanout()` draws the bitmap over each
+                // frame. The `drm_mode_cursor2` layout begins with the same 28
+                // bytes as `drm_mode_cursor` (flags, crtc_id, x, y, width,
+                // height, handle) and only appends hot_x/hot_y — which we don't
+                // need for drawing, since the compositor pre-adjusts x/y for the
+                // hotspot — so one 28-byte view serves both ioctls.
+                #[repr(C)]
+                struct DrmModeCursor {
+                    flags: u32,
+                    crtc_id: u32,
+                    x: i32,
+                    y: i32,
+                    width: u32,
+                    height: u32,
+                    handle: u32,
+                }
+                const DRM_MODE_CURSOR_BO: u32 = 0x01;
+                const DRM_MODE_CURSOR_MOVE: u32 = 0x02;
+                let cur = unsafe { &*(data as *const DrmModeCursor) };
+                let mut changed = false;
+                if cur.flags & DRM_MODE_CURSOR_BO != 0 {
+                    // Linux: a cursor larger than DRM_CAP_CURSOR_WIDTH/HEIGHT
+                    // is EINVAL. Nothing else bounds the bitmap the kernel
+                    // copies and composites on every frame.
+                    if cur.handle != 0
+                        && (cur.width > drm::MAX_CURSOR_DIM || cur.height > drm::MAX_CURSOR_DIM)
+                    {
+                        return Err(FsError::InvalidParam);
+                    }
+                    changed |= drm::set_cursor_bo(cur.handle, cur.width, cur.height);
+                }
+                if cur.flags & DRM_MODE_CURSOR_MOVE != 0 {
+                    drm::move_cursor(cur.x, cur.y);
+                    changed = true;
+                }
+                if changed {
+                    drm::repaint_for_cursor();
+                }
+                Ok(0)
+            }
+            DRM_IOCTL_GEM_CLOSE => {
+                let handle = unsafe { *(data as *const u32) };
+                // linux-object's own CREATE_DUMB/PRIME table first; a miss
+                // there might still be a driver-private handle (e.g.
+                // nouveau-uAPI GEM_NEW) the driver itself keeps track of.
+                // A nouveau GEM object's memory goes back to the RM inside
+                // `nouveau_gem_close`, and nothing here holds a reference to
+                // it, so any framebuffer still built on it has to be retired in
+                // the same breath -- otherwise `crtc_fb` keeps pointing at
+                // memory that now belongs to someone else. Dumb buffers are
+                // deliberately NOT retired: their fb holds an `Arc` on the VMO
+                // and outlives the handle, exactly as Linux does.
+                let generic_closed = drm::gem_close(handle);
+                let driver_closed = !generic_closed
+                    && self
+                        .driver()
+                        .map(|d| d.nouveau_gem_close(handle, drm::current_pid()))
+                        .unwrap_or(false);
+                if driver_closed {
+                    drm::retire_framebuffers_for_handle(handle);
+                }
+                if generic_closed || driver_closed {
+                    // Drop the shared CPU-map cache entry; any live mmap Arc
+                    // keeps its pin until munmap/Drop.
+                    drm::nouveau_cpu_vmo_forget(handle);
+                    Ok(0)
+                } else {
+                    Err(FsError::InvalidParam)
+                }
+            }
+            DRM_IOCTL_MODE_GETRESOURCES => {
+                let res = unsafe { &mut *(data as *mut DrmModeCardRes) };
+                if drm::is_compute_minor(self.minor) {
+                    // Headless compute node: not a KMS card. drmIsKMS sees
+                    // zero CRTCs/connectors and leaves this node alone, so
+                    // labwc stays on card0 even without WLR_DRM_DEVICES.
+                    res.count_fbs = 0;
+                    res.count_crtcs = 0;
+                    res.count_connectors = 0;
+                    res.count_encoders = 0;
+                    return Ok(0);
+                }
+                let (fbs, crtcs, connectors) = drm::get_resources();
+
+                if res.fb_id_ptr != 0 && res.count_fbs >= fbs.len() as u32 {
+                    ucheck_n::<u32>(res.fb_id_ptr as usize, fbs.len())?;
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            fbs.as_ptr(),
+                            res.fb_id_ptr as *mut u32,
+                            fbs.len(),
+                        );
+                    }
+                }
+                if res.crtc_id_ptr != 0 && res.count_crtcs >= crtcs.len() as u32 {
+                    ucheck_n::<u32>(res.crtc_id_ptr as usize, crtcs.len())?;
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            crtcs.as_ptr(),
+                            res.crtc_id_ptr as *mut u32,
+                            crtcs.len(),
+                        );
+                    }
+                }
+                if res.connector_id_ptr != 0 && res.count_connectors >= connectors.len() as u32 {
+                    ucheck_n::<u32>(res.connector_id_ptr as usize, connectors.len())?;
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            connectors.as_ptr(),
+                            res.connector_id_ptr as *mut u32,
+                            connectors.len(),
+                        );
+                    }
+                }
+
+                res.count_fbs = fbs.len() as u32;
+                res.count_crtcs = crtcs.len() as u32;
+                res.count_connectors = connectors.len() as u32;
+
+                // Always expose the synthetic encoder when connectors exist so
+                // that `drmIsKMS` (which checks count_crtcs > 0 &&
+                // count_connectors > 0 && count_encoders > 0) succeeds.  The
+                // synthetic encoder is valid for both the software KMS path and
+                // the hardware KMS path: `possible_crtcs = 1` maps to index 0
+                // of the CRTC list, which is SYNTH_CRTC_ID on the software path
+                // and the hardware CRTC on the hardware path.
+                if !connectors.is_empty() {
+                    if res.encoder_id_ptr != 0 && res.count_encoders >= 1 {
+                        ucheck_n::<u32>(res.encoder_id_ptr as usize, 1)?;
+                        unsafe {
+                            *(res.encoder_id_ptr as *mut u32) = drm::SYNTH_ENCODER_ID;
+                        }
+                    }
+                    res.count_encoders = 1;
+                } else {
+                    res.count_encoders = 0;
+                }
+
+                if let Some(caps) = drm::get_caps() {
+                    res.max_width = caps.max_width;
+                    res.max_height = caps.max_height;
+                }
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_GETCONNECTOR => {
+                let conn_res = unsafe { &mut *(data as *mut DrmModeGetConnector) };
+                if let Some(conn) = drm::get_connector(conn_res.connector_id) {
+                    conn_res.connection = if conn.connected { 1 } else { 2 };
+                    // Physical dimensions, best source first:
+                    //  1. the connector's own values (NVIDIA RM data);
+                    //  2. the display's EDID — the preferred detailed timing
+                    //     carries the image size in mm (bytes 66/67/68 of the
+                    //     descriptor), and bytes 21/22 give cm as a coarser
+                    //     fallback (observed: a 32" TV reported as 270x203mm by
+                    //     the old 96-DPI guess vs its real 885x497mm, skewing
+                    //     every DPI-aware client);
+                    //  3. a ~96 DPI guess from the resolution, so wlroots never
+                    //     sees "Physical size: 0x0".
+                    let edid_mm = drm::get_connector_edid(conn_res.connector_id).and_then(|e| {
+                        let d = &e[54..72];
+                        let pixel_clock = u16::from_le_bytes([d[0], d[1]]);
+                        if pixel_clock != 0 {
+                            let w = d[12] as u32 | ((d[14] as u32 & 0xF0) << 4);
+                            let h = d[13] as u32 | ((d[14] as u32 & 0x0F) << 8);
+                            if (10..=2000).contains(&w) && (10..=2000).contains(&h) {
+                                return Some((w, h));
+                            }
+                        }
+                        // Coarse: max image size in cm (0 = unspecified).
+                        let (w_cm, h_cm) = (e[21] as u32, e[22] as u32);
+                        if w_cm > 0 && h_cm > 0 {
+                            Some((w_cm * 10, h_cm * 10))
+                        } else {
+                            None
+                        }
+                    });
+                    let (fallback_w, fallback_h) = edid_mm.unwrap_or_else(|| {
+                        drm::display_mode()
+                            .map(|(w, h, _)| {
+                                // Assume ~96 DPI (1 in = 25.4 mm, 96 px/in).
+                                ((w * 254 / 960).max(1), (h * 254 / 960).max(1))
+                            })
+                            .unwrap_or((1, 1))
+                    });
+                    conn_res.mm_width = if conn.mm_width > 0 {
+                        conn.mm_width
+                    } else {
+                        fallback_w
+                    };
+                    conn_res.mm_height = if conn.mm_height > 0 {
+                        conn.mm_height
+                    } else {
+                        fallback_h
+                    };
+                    // Real DRM_MODE_CONNECTOR_* from the driver (NVIDIA fills
+                    // it from the RM's GET_CONNECTOR_DATA); synthetic and
+                    // fallback connectors keep the historical 11.
+                    conn_res.connector_type = conn.connector_type;
+                    conn_res.connector_type_id = 1;
+                    conn_res.encoder_id = drm::SYNTH_ENCODER_ID;
+                    conn_res.subpixel = 0; // SubPixelUnknown
+
+                    // Report exactly one encoder. wlroots calls this twice: once
+                    // to learn the counts, then again with allocated arrays.
+                    if conn_res.encoders_ptr != 0 && conn_res.count_encoders >= 1 {
+                        ucheck_n::<u32>(conn_res.encoders_ptr as usize, 1)?;
+                        unsafe {
+                            *(conn_res.encoders_ptr as *mut u32) = drm::SYNTH_ENCODER_ID;
+                        }
+                    }
+                    conn_res.count_encoders = 1;
+
+                    // Report exactly one mode: the display's native resolution.
+                    if let Some((w, h, _)) = drm::display_mode() {
+                        if conn_res.modes_ptr != 0 && conn_res.count_modes >= 1 {
+                            let mode = make_modeinfo(w, h);
+                            ucheck(conn_res.modes_ptr as usize, mode.len())?;
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    mode.as_ptr(),
+                                    conn_res.modes_ptr as *mut u8,
+                                    mode.len(),
+                                );
+                            }
+                        }
+                        conn_res.count_modes = 1;
+                    } else {
+                        conn_res.count_modes = 0;
+                    }
+                    // Standard connector properties (DPMS, link-status,
+                    // non-desktop, EDID, and CRTC_ID for atomic clients), via
+                    // the usual two-call count/fill pattern.
+                    let props = connector_props(conn_res.connector_id, self.file.atomic_client());
+                    if !props.is_empty()
+                        && conn_res.props_ptr != 0
+                        && conn_res.prop_values_ptr != 0
+                        && conn_res.count_props >= props.len() as u32
+                    {
+                        ucheck_n::<u32>(conn_res.props_ptr as usize, props.len())?;
+                        ucheck_n::<u64>(conn_res.prop_values_ptr as usize, props.len())?;
+                        for (i, (pid, val)) in props.iter().enumerate() {
+                            unsafe {
+                                *(conn_res.props_ptr as *mut u32).add(i) = *pid;
+                                *(conn_res.prop_values_ptr as *mut u64).add(i) = *val;
+                            }
+                        }
+                    }
+                    conn_res.count_props = props.len() as u32;
+                    // klog (budget-shared with the wsi trace) so a black-screen
+                    // bring-up shows, under LOG=error, whether the compositor
+                    // saw a CONNECTED output with a usable mode: connected=false
+                    // or modes=0 makes wlroots skip the output and never present.
+                    if wsi_trace_take() {
+                        kernel_hal::klog_info!(
+                            "[drm] GETCONNECTOR id={} connected={} modes={} mode={:?}",
+                            conn_res.connector_id,
+                            conn.connected,
+                            conn_res.count_modes,
+                            drm::display_mode()
+                        );
+                    }
+                    Ok(0)
+                } else {
+                    // klog: this refusal makes Mesa's wsi_display bail the whole
+                    // VK_KHR_display query with OUT_OF_HOST_MEMORY -- it must be
+                    // visible under LOG=error. Same per-boot budget as the call
+                    // trace: a retry loop on a refused id must not storm klog.
+                    if wsi_trace_take() {
+                        kernel_hal::klog_info!(
+                            "[drm-wsi] GETCONNECTOR id={} -> NOT FOUND (EINVAL)",
+                            conn_res.connector_id
+                        );
+                    }
+                    Err(FsError::InvalidParam)
+                }
+            }
+            DRM_IOCTL_MODE_GETENCODER => {
+                let enc = unsafe { &mut *(data as *mut DrmModeGetEncoder) };
+                enc.encoder_id = drm::SYNTH_ENCODER_ID;
+                // DRM_MODE_ENCODER_VIRTUAL=6: correct type for a software/
+                // virtual encoder that drives a dumb-buffer scanout path.
+                // Reporting NONE(0) causes some compositors to skip property
+                // queries and misidentify the output type.
+                enc.encoder_type = 6; // DRM_MODE_ENCODER_VIRTUAL
+                                      // On the software KMS path the only CRTC is the synthetic one
+                                      // (id=1). On the hardware KMS path, report crtc_id=0 (no
+                                      // currently active CRTC) because CRTC 1 does not appear in the
+                                      // resource list that hardware drivers expose; wlroots will
+                                      // configure the CRTC itself via SETCRTC.
+                                      // possible_crtcs=1 means bit 0 = index 0 of the CRTC list,
+                                      // which is correct in both paths.
+                enc.crtc_id = if drm::software_kms_active() {
+                    drm::SYNTH_CRTC_ID
+                } else {
+                    0
+                };
+                enc.possible_crtcs = 1; // bitmask: CRTC index 0
+                enc.possible_clones = 0;
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_GETCRTC => {
+                let crtc_res = unsafe { &mut *(data as *mut DrmModeGetCrtc) };
+                if let Some(crtc) = drm::get_crtc(crtc_res.crtc_id) {
+                    crtc_res.fb_id = crtc.fb_id;
+                    crtc_res.x = crtc.x;
+                    crtc_res.y = crtc.y;
+                    crtc_res.gamma_size = 0;
+                    // Report the current mode: the display's native timings
+                    // (the only mode the pipeline has). Linux fills this from
+                    // crtc->state; compositors read it back to seed their
+                    // initial output state.
+                    if let Some((w, h, _)) = drm::display_mode() {
+                        crtc_res.mode = make_modeinfo(w, h);
+                        crtc_res.mode_valid = 1;
+                    } else {
+                        crtc_res.mode_valid = 0;
+                    }
+                    Ok(0)
+                } else {
+                    if wsi_trace_take() {
+                        kernel_hal::klog_info!(
+                            "[drm-wsi] GETCRTC id={} -> NOT FOUND (EINVAL)",
+                            crtc_res.crtc_id
+                        );
+                    }
+                    Err(FsError::InvalidParam)
+                }
+            }
+            DRM_IOCTL_MODE_GETPLANERESOURCES => {
+                let res = unsafe { &mut *(data as *mut DrmModeGetPlaneRes) };
+                let planes = drm::get_planes();
+                if res.plane_id_ptr != 0 && res.count_planes >= planes.len() as u32 {
+                    ucheck_n::<u32>(res.plane_id_ptr as usize, planes.len())?;
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            planes.as_ptr(),
+                            res.plane_id_ptr as *mut u32,
+                            planes.len(),
+                        );
+                    }
+                }
+                res.count_planes = planes.len() as u32;
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_GETPLANE => {
+                let res = unsafe { &mut *(data as *mut DrmModeGetPlane) };
+                if let Some(plane) = drm::get_plane(res.plane_id) {
+                    res.crtc_id = plane.crtc_id;
+                    res.fb_id = plane.fb_id;
+                    res.possible_crtcs = plane.possible_crtcs;
+                    // Advertise the formats the software scanout consumes, via
+                    // the two-call pattern (count first, then fill).
+                    const FORMATS: [u32; 2] = [
+                        0x3432_5258, // DRM_FORMAT_XRGB8888 ("XR24")
+                        0x3432_5241, // DRM_FORMAT_ARGB8888 ("AR24")
+                    ];
+                    if res.format_type_ptr != 0 && res.count_format_types >= FORMATS.len() as u32 {
+                        ucheck_n::<u32>(res.format_type_ptr as usize, FORMATS.len())?;
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                FORMATS.as_ptr(),
+                                res.format_type_ptr as *mut u32,
+                                FORMATS.len(),
+                            );
+                        }
+                    }
+                    res.count_format_types = FORMATS.len() as u32;
+                    Ok(0)
+                } else {
+                    if wsi_trace_take() {
+                        kernel_hal::klog_info!(
+                            "[drm-wsi] GETPLANE id={} -> NOT FOUND (EINVAL)",
+                            res.plane_id
+                        );
+                    }
+                    Err(FsError::InvalidParam)
+                }
+            }
+            DRM_IOCTL_MODE_OBJ_GETPROPERTIES => {
+                let res = unsafe { &mut *(data as *mut DrmModeObjGetProperties) };
+                // Identify the object by id (libdrm often passes obj_type=ANY).
+                // Look up any registered plane — not only SYNTH_PLANE_ID — so
+                // hardware planes (e.g. NVIDIA 3001, VirtIO 3000) are also
+                // classified as PRIMARY/OVERLAY/CURSOR by wlroots. Atomic
+                // properties (FB_ID, CRTC_ID, ACTIVE, MODE_ID, rects) only
+                // appear for atomic clients, like Linux's atomic filtering;
+                // legacy clients keep seeing exactly the pre-atomic set.
+                let atomic = self.file.atomic_client();
+                let props: alloc::vec::Vec<(u32, u64)> = if let Some(p) = drm::get_plane(res.obj_id)
+                {
+                    plane_props(&p, atomic)
+                } else if drm::get_crtc(res.obj_id).is_some() {
+                    crtc_props(atomic)
+                } else if drm::get_connector(res.obj_id).is_some() {
+                    connector_props(res.obj_id, atomic)
+                } else {
+                    // Encoders exist but carry no properties; anything
+                    // else is unknown. Keep the historical empty-list
+                    // answer (Linux: EINVAL/ENOENT) — some clients probe
+                    // every id returned by GETRESOURCES.
+                    alloc::vec::Vec::new()
+                };
+                let n = props.len();
+                // Both output arrays are written below, so both pointers must be
+                // non-null: a client passing props_ptr set but prop_values_ptr=0
+                // would otherwise trigger a kernel write to address 0.
+                if n > 0
+                    && res.props_ptr != 0
+                    && res.prop_values_ptr != 0
+                    && (res.count_props as usize) >= n
+                {
+                    ucheck_n::<u32>(res.props_ptr as usize, n)?;
+                    ucheck_n::<u64>(res.prop_values_ptr as usize, n)?;
+                    for (i, (pid, val)) in props.iter().enumerate() {
+                        unsafe {
+                            *(res.props_ptr as *mut u32).add(i) = *pid;
+                            *(res.prop_values_ptr as *mut u64).add(i) = *val;
+                        }
+                    }
+                }
+                res.count_props = n as u32;
+                log::debug!(
+                    "[drm] OBJ_GETPROPERTIES obj_id={} obj_type={:#x} -> {} props",
+                    res.obj_id,
+                    res.obj_type,
+                    n
+                );
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_GETPROPERTY => {
+                let res = unsafe { &mut *(data as *mut DrmModeGetProperty) };
+                let spec = match prop_spec(res.prop_id) {
+                    Some(s) => s,
+                    None => return Err(FsError::EntryNotFound),
+                };
+                res.flags = spec.flags;
+                let mut name = [0u8; 32];
+                let n = spec.name.len().min(31);
+                name[..n].copy_from_slice(&spec.name.as_bytes()[..n]);
+                res.name = name;
+                // Two-call pattern: report counts, fill when arrays are big
+                // enough. Enum properties expose both the (value, name) pairs
+                // and the raw value list; range/object properties only values.
+                if !spec.enums.is_empty()
+                    && res.enum_blob_ptr != 0
+                    && (res.count_enum_blobs as usize) >= spec.enums.len()
+                {
+                    // `access_ok()`. These two arrays were the ONLY nested ioctl
+                    // pointers in this file written without one, and this ioctl
+                    // is unprivileged: a client passing a kernel address as
+                    // `enum_blob_ptr`/`values_ptr` had the kernel write its enum
+                    // records or property values straight to it. Linux copies
+                    // both out with `copy_to_user()`, which faults to EFAULT.
+                    ucheck_n::<DrmModePropertyEnum>(res.enum_blob_ptr as usize, spec.enums.len())?;
+                    for (i, (val, nm)) in spec.enums.iter().enumerate() {
+                        let mut e = DrmModePropertyEnum {
+                            value: *val,
+                            name: [0u8; 32],
+                        };
+                        let ln = nm.len().min(31);
+                        e.name[..ln].copy_from_slice(&nm.as_bytes()[..ln]);
+                        unsafe {
+                            *(res.enum_blob_ptr as *mut DrmModePropertyEnum).add(i) = e;
+                        }
+                    }
+                }
+                res.count_enum_blobs = spec.enums.len() as u32;
+                if !spec.values.is_empty()
+                    && res.values_ptr != 0
+                    && (res.count_values as usize) >= spec.values.len()
+                {
+                    ucheck_n::<u64>(res.values_ptr as usize, spec.values.len())?;
+                    for (i, v) in spec.values.iter().enumerate() {
+                        unsafe {
+                            *(res.values_ptr as *mut u64).add(i) = *v;
+                        }
+                    }
+                }
+                res.count_values = spec.values.len() as u32;
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_GETPROPBLOB => {
+                let res = unsafe { &mut *(data as *mut DrmModeGetBlob) };
+                // Property-blob store first (user MODE_ID blobs, the kernel's
+                // current-mode blob); EDID blobs keep their reserved
+                // 20000+connector ids.
+                if let Some(blob) = drm::get_blob(res.blob_id) {
+                    if res.data != 0 && res.length >= blob.len() as u32 {
+                        ucheck(res.data as usize, blob.len())?;
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                blob.as_ptr(),
+                                res.data as *mut u8,
+                                blob.len(),
+                            );
+                        }
+                    }
+                    res.length = blob.len() as u32;
+                    return Ok(0);
+                }
+                let connector_id = res.blob_id.checked_sub(20000);
+                if let Some(conn_id) = connector_id {
+                    if let Some(edid) = drm::get_connector_edid(conn_id) {
+                        if res.data != 0 && res.length >= edid.len() as u32 {
+                            ucheck(res.data as usize, edid.len())?;
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    edid.as_ptr(),
+                                    res.data as *mut u8,
+                                    edid.len(),
+                                );
+                            }
+                        }
+                        res.length = edid.len() as u32;
+                        Ok(0)
+                    } else {
+                        Err(FsError::InvalidParam)
+                    }
+                } else {
+                    Err(FsError::InvalidParam)
+                }
+            }
+            DRM_IOCTL_MODE_CREATEPROPBLOB => {
+                let req = unsafe { &mut *(data as *mut DrmModeCreateBlob) };
+                // Linux: NULL data / zero length are EINVAL. Bound the copy —
+                // real blobs (modes, gamma LUTs) are at most a few KiB.
+                if req.data == 0 || req.length == 0 || req.length > 64 * 1024 {
+                    return Err(FsError::InvalidParam);
+                }
+                ucheck(req.data as usize, req.length as usize)?;
+                let src = unsafe {
+                    core::slice::from_raw_parts(req.data as *const u8, req.length as usize)
+                };
+                req.blob_id = drm::create_blob(src.to_vec(), true);
+                log::debug!(
+                    "[drm] CREATEPROPBLOB len={} -> blob={}",
+                    req.length,
+                    req.blob_id
+                );
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_DESTROYPROPBLOB => {
+                // struct drm_mode_destroy_blob { __u32 blob_id; }
+                let blob_id = unsafe { *(data as *const u32) };
+                match drm::destroy_blob(blob_id) {
+                    drm::BlobDestroy::Destroyed => Ok(0),
+                    drm::BlobDestroy::NotFound => Err(FsError::EntryNotFound),
+                    // Linux: only the creator may destroy a blob -> EPERM-ish.
+                    drm::BlobDestroy::KernelOwned => Err(FsError::NoPermission),
+                }
+            }
+            DRM_IOCTL_MODE_ATOMIC => {
+                let req = unsafe { &*(data as *const DrmModeAtomic) };
+                // Linux contract: the client must have negotiated
+                // DRM_CLIENT_CAP_ATOMIC (EINVAL otherwise), flags must be
+                // known, reserved must be 0, TEST_ONLY cannot carry a flip
+                // event, and async flips are refused when unsupported.
+                if !self.file.atomic_client() {
+                    return Err(FsError::InvalidParam);
+                }
+                if req.flags & !DRM_MODE_ATOMIC_FLAGS != 0 || req.reserved != 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                if req.flags & DRM_MODE_PAGE_FLIP_ASYNC != 0 {
+                    // DRM_CAP_ASYNC_PAGE_FLIP / ATOMIC_ASYNC_PAGE_FLIP are 0.
+                    return Err(FsError::InvalidParam);
+                }
+                let test_only = req.flags & DRM_MODE_ATOMIC_TEST_ONLY != 0;
+                let want_event = req.flags & DRM_MODE_PAGE_FLIP_EVENT != 0;
+                let allow_modeset = req.flags & DRM_MODE_ATOMIC_ALLOW_MODESET != 0;
+                if test_only && want_event {
+                    return Err(FsError::InvalidParam);
+                }
+                if req.count_objs == 0 {
+                    // Empty commit: no objects, no events (Linux allows it).
+                    return Ok(0);
+                }
+                // The pipeline has 3 objects x <=16 properties; bound the
+                // user-array walk well above that.
+                if req.count_objs > 64 || req.objs_ptr == 0 || req.count_props_ptr == 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                ucheck_n::<u32>(req.objs_ptr as usize, req.count_objs as usize)?;
+                ucheck_n::<u32>(req.count_props_ptr as usize, req.count_objs as usize)?;
+                let mut upd = drm::AtomicUpdate::default();
+                let mut prop_idx = 0usize;
+                for i in 0..req.count_objs as usize {
+                    let obj_id = unsafe { *(req.objs_ptr as *const u32).add(i) };
+                    let count_props = unsafe { *(req.count_props_ptr as *const u32).add(i) };
+                    if count_props > 64 {
+                        return Err(FsError::InvalidParam);
+                    }
+                    if count_props > 0 && (req.props_ptr == 0 || req.prop_values_ptr == 0) {
+                        return Err(FsError::InvalidParam);
+                    }
+                    // The property arrays are shared across objects and indexed
+                    // by the running `prop_idx`; check the span this object
+                    // will consume before touching it.
+                    let span = prop_idx + count_props as usize;
+                    ucheck_n::<u32>(req.props_ptr as usize, span)?;
+                    ucheck_n::<u64>(req.prop_values_ptr as usize, span)?;
+                    for _ in 0..count_props {
+                        let prop_id = unsafe { *(req.props_ptr as *const u32).add(prop_idx) };
+                        let value = unsafe { *(req.prop_values_ptr as *const u64).add(prop_idx) };
+                        prop_idx += 1;
+                        // [swapchain-diag] error!-visible at LOG=error: a wlroots
+                        // "Swapchain failed test" can be an unknown/immutable prop
+                        // rejected here, not just an atomic_commit check.
+                        if let Err(e) = atomic_stage(&mut upd, obj_id, prop_id, value) {
+                            log::error!(
+                                "[drm] ATOMIC stage rejected: obj={:#x} prop={:#x} value={:#x} -> {:?}",
+                                obj_id, prop_id, value, e
+                            );
+                            return Err(e);
+                        }
+                    }
+                }
+                log::debug!(
+                    "[drm] ATOMIC objs={} test_only={} allow_modeset={} event={} fb={:?} mode_blob={:?} active={:?}",
+                    req.count_objs,
+                    test_only,
+                    allow_modeset,
+                    want_event,
+                    upd.plane_fb_id,
+                    upd.mode_blob,
+                    upd.active
+                );
+                let commit = drm::atomic_commit(
+                    &upd,
+                    test_only,
+                    allow_modeset,
+                    want_event,
+                    req.user_data,
+                    &self.file,
+                );
+                // OUT_FENCE_PTR writeback: Linux writes -1 on TEST_ONLY/failure
+                // and a sync_file fd on success. Real out-fences need HW flip
+                // completion; we install a signaled stub when possible.
+                if let Some(ptr) = upd.out_fence_ptr {
+                    if commit.is_err() || test_only {
+                        let _ = write_out_fence_ptr(ptr, true);
+                    } else {
+                        write_out_fence_ptr(ptr, false)?;
+                    }
+                }
+                commit.map_err(|e| match e {
+                    drm::AtomicError::Invalid => FsError::InvalidParam,
+                    drm::AtomicError::NotFound => FsError::EntryNotFound,
+                    drm::AtomicError::Device => FsError::DeviceError,
+                    drm::AtomicError::Busy => FsError::Busy,
+                })?;
+                Ok(0)
+            }
+            DRM_IOCTL_SYNCOBJ_CREATE => {
+                if !zcore_drivers::display::nouveau_uapi_enabled() {
+                    return Err(FsError::OpNotSupported);
+                }
+                let req = unsafe { &mut *(data as *mut DrmSyncobjCreate) };
+                let handle = zcore_drivers::scheme::syncobj::create(
+                    req.flags & DRM_SYNCOBJ_CREATE_SIGNALED != 0,
+                );
+                req.handle = handle;
+                // Bounded probe (first N this boot), VISIBLE on hardware. Answers
+                // the one thing the "failed to create timeline semaphore" spam
+                // cannot: does NVK actually reach the kernel to create the syncobj
+                // a timeline VkSemaphore is backed by? The create itself always
+                // succeeds here, so a `SYNCOBJ_CREATE` line right before zink's
+                // error proves the failure is DOWNSTREAM of the syncobj (NVK
+                // internal / device already wedged), not in it. NO line before the
+                // error means NVK never got here — it bailed in userspace (cf. the
+                // GET_CAP probe above). And the pid + climbing count is the
+                // accumulation signature if compositor respawns are leaking.
+                {
+                    static CREATE_LOG_BUDGET: core::sync::atomic::AtomicU32 =
+                        core::sync::atomic::AtomicU32::new(0);
+                    let n = CREATE_LOG_BUDGET.fetch_add(1, Ordering::Relaxed);
+                    if n < 16 {
+                        kernel_hal::klog_info!(
+                            "[drm] SYNCOBJ_CREATE #{} pid={} -> handle={} flags={:#x}",
+                            n + 1,
+                            drm::current_pid(),
+                            handle,
+                            req.flags
+                        );
+                    }
+                }
+                Ok(0)
+            }
+
+            DRM_IOCTL_SYNCOBJ_DESTROY => {
+                if !zcore_drivers::display::nouveau_uapi_enabled() {
+                    return Err(FsError::OpNotSupported);
+                }
+                let req = unsafe { &*(data as *const DrmSyncobjDestroy) };
+                if zcore_drivers::scheme::syncobj::destroy(req.handle) {
+                    Ok(0)
+                } else {
+                    Err(FsError::EntryNotFound)
+                }
+            }
+
+            DRM_IOCTL_SYNCOBJ_RESET | DRM_IOCTL_SYNCOBJ_SIGNAL => {
+                if !zcore_drivers::display::nouveau_uapi_enabled() {
+                    return Err(FsError::OpNotSupported);
+                }
+                let req = unsafe { &*(data as *const DrmSyncobjArray) };
+                const MAX_HANDLES: u32 = 64;
+                if req.count_handles == 0 || req.count_handles > MAX_HANDLES || req.handles == 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                ucheck_n::<u32>(req.handles as usize, req.count_handles as usize)?;
+                let apply = if cmd == DRM_IOCTL_SYNCOBJ_RESET {
+                    zcore_drivers::scheme::syncobj::reset
+                } else {
+                    zcore_drivers::scheme::syncobj::signal
+                };
+                for i in 0..req.count_handles {
+                    let handle = unsafe { *(req.handles as *const u32).add(i as usize) };
+                    if !apply(handle) {
+                        return Err(FsError::EntryNotFound);
+                    }
+                }
+                let h0 = unsafe { *(req.handles as *const u32) };
+                trace_syncobj(
+                    if cmd == DRM_IOCTL_SYNCOBJ_RESET {
+                        "RESET"
+                    } else {
+                        "SIGNAL"
+                    },
+                    drm::current_pid(),
+                    h0,
+                    0,
+                    "ok",
+                );
+                Ok(0)
+            }
+
+            DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL => {
+                if !zcore_drivers::display::nouveau_uapi_enabled() {
+                    return Err(FsError::OpNotSupported);
+                }
+                let req = unsafe { &*(data as *const DrmSyncobjTimelineArray) };
+                const MAX_HANDLES: u32 = 64;
+                if req.count_handles == 0
+                    || req.count_handles > MAX_HANDLES
+                    || req.handles == 0
+                    || req.points == 0
+                {
+                    return Err(FsError::InvalidParam);
+                }
+                ucheck_n::<u32>(req.handles as usize, req.count_handles as usize)?;
+                ucheck_n::<u64>(req.points as usize, req.count_handles as usize)?;
+                for i in 0..req.count_handles as usize {
+                    let handle = unsafe { *(req.handles as *const u32).add(i) };
+                    let point = unsafe { *(req.points as *const u64).add(i) };
+                    if !zcore_drivers::scheme::syncobj::timeline_signal(handle, point) {
+                        return Err(FsError::EntryNotFound);
+                    }
+                }
+                let (h0, p0) =
+                    unsafe { (*(req.handles as *const u32), *(req.points as *const u64)) };
+                trace_syncobj("TIMELINE_SIGNAL", drm::current_pid(), h0, p0, "ok");
+                Ok(0)
+            }
+
+            DRM_IOCTL_SYNCOBJ_TRANSFER => {
+                if !zcore_drivers::display::nouveau_uapi_enabled() {
+                    return Err(FsError::OpNotSupported);
+                }
+                let req = unsafe { &*(data as *const DrmSyncobjTransfer) };
+                let ok = zcore_drivers::scheme::syncobj::transfer(
+                    req.dst_handle,
+                    req.dst_point,
+                    req.src_handle,
+                    req.src_point,
+                );
+                trace_syncobj(
+                    "TRANSFER",
+                    drm::current_pid(),
+                    req.dst_handle,
+                    req.dst_point,
+                    if ok { "ok" } else { "ENOENT" },
+                );
+                if ok {
+                    Ok(0)
+                } else {
+                    Err(FsError::EntryNotFound)
+                }
+            }
+
+            DRM_IOCTL_SYNCOBJ_QUERY => {
+                if !zcore_drivers::display::nouveau_uapi_enabled() {
+                    return Err(FsError::OpNotSupported);
+                }
+                let req = unsafe { &*(data as *const DrmSyncobjTimelineArray) };
+                const MAX_HANDLES: u32 = 64;
+                if req.count_handles == 0
+                    || req.count_handles > MAX_HANDLES
+                    || req.handles == 0
+                    || req.points == 0
+                {
+                    return Err(FsError::InvalidParam);
+                }
+                let last_submitted = req.flags & DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED != 0;
+                // LAST_SUBMITTED must include in-flight EXEC fences: the fast
+                // path returns before the GPU writes the landing zone, and NVK
+                // uses this query as the timeline value of that submit. Treating
+                // it as a no-op left the timeline at the previous signaled
+                // point — Mesa then walked `supported_sync_types` off the NULL
+                // terminator (`libvulkan_nouveau.so+0x9cc48`).
+                ucheck_n::<u32>(req.handles as usize, req.count_handles as usize)?;
+                ucheck_n::<u64>(req.points as usize, req.count_handles as usize)?;
+                let mut first_pt = 0u64;
+                for i in 0..req.count_handles as usize {
+                    let handle = unsafe { *(req.handles as *const u32).add(i) };
+                    let looked_up = if last_submitted {
+                        zcore_drivers::scheme::syncobj::query_submitted(handle)
+                    } else {
+                        zcore_drivers::scheme::syncobj::query(handle)
+                    };
+                    let Some(point) = looked_up else {
+                        return Err(FsError::EntryNotFound);
+                    };
+                    if i == 0 {
+                        first_pt = point;
+                    }
+                    unsafe { *(req.points as *mut u64).add(i) = point };
+                }
+                let h0 = unsafe { *(req.handles as *const u32) };
+                trace_syncobj(
+                    if last_submitted {
+                        "QUERY_LAST_SUBMITTED"
+                    } else {
+                        "QUERY"
+                    },
+                    drm::current_pid(),
+                    h0,
+                    first_pt,
+                    "ok",
+                );
+                Ok(0)
+            }
+
+            DRM_IOCTL_SYNCOBJ_WAIT
+            | DRM_IOCTL_SYNCOBJ_WAIT_DEADLINE
+            | DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT
+            | DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DEADLINE => {
+                if !zcore_drivers::display::nouveau_uapi_enabled() {
+                    return Err(FsError::OpNotSupported);
+                }
+                let timeline = cmd == DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT
+                    || cmd == DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DEADLINE;
+                // Both structs share this prefix layout, so a single path
+                // can read the common fields regardless of which ioctl.
+                let (handles_ptr, points_ptr, timeout_nsec, count_handles, flags) = if timeline {
+                    let req = unsafe { &*(data as *const DrmSyncobjTimelineWait) };
+                    (
+                        req.handles,
+                        req.points,
+                        req.timeout_nsec,
+                        req.count_handles,
+                        req.flags,
+                    )
+                } else {
+                    let req = unsafe { &*(data as *const DrmSyncobjWait) };
+                    (
+                        req.handles,
+                        0,
+                        req.timeout_nsec,
+                        req.count_handles,
+                        req.flags,
+                    )
+                };
+                const MAX_HANDLES: u32 = 64;
+                if count_handles == 0 || count_handles > MAX_HANDLES || handles_ptr == 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                ucheck_n::<u32>(handles_ptr as usize, count_handles as usize)?;
+                if timeline && points_ptr != 0 {
+                    ucheck_n::<u64>(points_ptr as usize, count_handles as usize)?;
+                }
+                let handles: alloc::vec::Vec<u32> = (0..count_handles as usize)
+                    .map(|i| unsafe { *(handles_ptr as *const u32).add(i) })
+                    .collect();
+                let points: Option<alloc::vec::Vec<u64>> = if timeline && points_ptr != 0 {
+                    Some(
+                        (0..count_handles as usize)
+                            .map(|i| unsafe { *(points_ptr as *const u64).add(i) })
+                            .collect(),
+                    )
+                } else {
+                    None
+                };
+                // `timeout_nsec` is an ABSOLUTE CLOCK_MONOTONIC deadline (real
+                // Linux semantics, confirmed against this kernel's own
+                // `now_monotonic()` -> `kernel_hal::timer::timer_now()`), not a
+                // relative duration -- treating it as relative would turn any
+                // real userspace deadline (computed from `clock_gettime`) into
+                // an effectively unbounded wait.
+                let deadline_us = (timeout_nsec.max(0) as u64) / 1000;
+                let wait_all = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL != 0;
+                let available_only = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE != 0;
+                trace_syncobj(
+                    if timeline { "TIMELINE_WAIT" } else { "WAIT" },
+                    drm::current_pid(),
+                    handles.first().copied().unwrap_or(0),
+                    points
+                        .as_ref()
+                        .and_then(|p| p.first().copied())
+                        .unwrap_or(0),
+                    &alloc::format!(
+                        "timeout_ns={} flags={:#x} available={}",
+                        timeout_nsec,
+                        flags,
+                        available_only
+                    ),
+                );
+                let wait_fn = if available_only {
+                    zcore_drivers::scheme::syncobj::wait_available
+                } else {
+                    zcore_drivers::scheme::syncobj::wait
+                };
+                match wait_fn(&handles, points.as_deref(), wait_all, deadline_us) {
+                    zcore_drivers::scheme::syncobj::WaitOutcome::Signaled {
+                        first_signaled_index,
+                    } => {
+                        if timeline {
+                            let req = unsafe { &mut *(data as *mut DrmSyncobjTimelineWait) };
+                            req.first_signaled = first_signaled_index;
+                        } else {
+                            let req = unsafe { &mut *(data as *mut DrmSyncobjWait) };
+                            req.first_signaled = first_signaled_index;
+                        }
+                        Ok(0)
+                    }
+                    // Real Linux returns -ETIME on a wait deadline, and Mesa
+                    // checks for it EXACTLY (`errno == ETIME` -> `VK_TIMEOUT`;
+                    // anything else -> lost device). Returning EAGAIN here (the
+                    // old behaviour) was doubly wrong: libdrm's drmIoctl()
+                    // retries EAGAIN, so a caller whose deadline already passed
+                    // spins this arm in a tight busy-loop instead of seeing a
+                    // timeout, and NVK never gets its VK_TIMEOUT. `FsError::TimedOut`
+                    // now maps to `LxError::ETIME` (62).
+                    zcore_drivers::scheme::syncobj::WaitOutcome::Timeout => {
+                        syncobj_wait_klog(timeline, &handles, "timeout (ETIME to caller)");
+                        Err(FsError::TimedOut)
+                    }
+                    zcore_drivers::scheme::syncobj::WaitOutcome::Invalid => {
+                        syncobj_wait_klog(timeline, &handles, "unknown handle (ENOENT to caller)");
+                        Err(FsError::EntryNotFound)
+                    }
+                }
+            }
+
+            _ => {
+                // Reverse-engineering hook: log every DRM ioctl wlroots/labwc
+                // issues that we do not handle. The DRM nr (`(cmd >> 8) & 0xff`)
+                // maps to a DRM_IOCTL_* command, so a photo of this line tells us
+                // exactly what labwc wants next. `dir` 1=W 2=R 3=RW, `size` is the
+                // arg struct length.
+                let nr = cmd & 0xff;
+                let size = (cmd >> 16) & 0x3fff;
+                let dir = cmd >> 30;
+                log::debug!(
+                    "[drm] UNHANDLED ioctl cmd={:#010x} (drm nr={:#04x} size={} dir={})",
+                    cmd,
+                    nr,
+                    size,
+                    dir
+                );
+                if let Some(driver) = self.driver() {
+                    driver
+                        .ioctl_owned(cmd, data, drm::current_pid())
+                        // Map the driver's errno through instead of folding it
+                        // all into DeviceError(EIO): mesa distinguishes them
+                        // (e.g. `nouveau_ws_context_killed` tests specifically
+                        // for -ENODEV), and a driver that carefully returns
+                        // ENODEV/EINVAL/EBUSY only for userspace to see EIO
+                        // makes every one of those messages a lie.
+                        .map_err(|e| match e {
+                            2 => FsError::EntryNotFound,  // ENOENT
+                            12 => FsError::NoDeviceSpace, // ENOMEM
+                            16 => FsError::Busy,          // EBUSY
+                            19 => FsError::NoDevice,      // ENODEV
+                            22 => FsError::InvalidParam,  // EINVAL
+                            38 => FsError::NotSupported,  // ENOSYS
+                            95 => FsError::NotSupported,  // EOPNOTSUPP
+                            _ => FsError::DeviceError,
+                        })
+                } else if is_core_drm_nr(nr) {
+                    // Linux answers an unknown CORE ioctl number with EINVAL
+                    // (`drm_ioctl`: the `drm_ioctls[]` slot has no `.func`, so
+                    // `retcode = -EINVAL`), never ENOSYS. Mesa and libdrm read
+                    // the two differently: EINVAL is "this kernel does not have
+                    // that call", which makes a client fall back, while ENOSYS
+                    // leaks out of `drmIoctl` as an unexpected errno.
+                    Err(FsError::InvalidParam)
+                } else {
+                    // Driver-private range with no driver behind the node.
+                    Err(FsError::NotSupported)
+                }
+            }
         }
     }
 }
@@ -484,6 +2446,46 @@ impl DrmDev {
 /// [`DrmDev::wait_vblank_sleep`]) and lets the sync arm below fill in the
 /// reply once the requested vblank has actually arrived.
 pub const WAIT_VBLANK_IOCTL: u32 = DRM_IOCTL_WAIT_VBLANK;
+
+/// Whether `cmd` is the DRM ioctl numbered `nr`, **whatever struct size it
+/// encodes**.
+///
+/// The ioctl type byte of every DRM command is `'d'` (0x64) and the NR is the
+/// low byte; the size is encoded too, and that is exactly what must NOT be
+/// matched on. Linux's `drm_ioctl()` selects the handler by NR alone and
+/// reconciles the size afterwards, which is why a struct can grow a trailing
+/// field without breaking older or newer userspace. Pinning a constant to one
+/// size has already cost this tree three separate bugs found only on real
+/// hardware (`SYNCOBJ_HANDLE_TO_FD` at 24 bytes, the deadline sizes of
+/// `SYNCOBJ_WAIT`/`TIMELINE_WAIT`, and `PRIME_*`), each landing as a fall-
+/// through to the driver and an ENOSYS the client read as a lost device.
+///
+/// `min_size` is the floor the *caller* needs: `sys_ioctl`'s pre-dispatch
+/// helpers read the request struct themselves, so a command encoding fewer
+/// bytes than they parse must not reach them -- it falls through to the normal
+/// path, where [`INode::io_control`] zero-pads it the way Linux does.
+pub fn is_drm_ioctl_nr(cmd: u32, nr: u32, min_size: usize) -> bool {
+    ((cmd >> 8) & 0xff) == 0x64
+        && (cmd & 0xff) == nr
+        && (((cmd >> 16) & 0x3fff) as usize) >= min_size
+}
+
+/// `DRM_IOCTL_*` numbers `sys_ioctl` intercepts before the inode dispatch,
+/// with the byte count each of its helpers parses. See [`is_drm_ioctl_nr`].
+pub mod nr {
+    /// `struct drm_wait_vblank` (24 B, frozen).
+    pub const WAIT_VBLANK: (u32, usize) = (0x3A, 24);
+    /// `struct drm_mode_atomic` (56 B, frozen).
+    pub const MODE_ATOMIC: (u32, usize) = (0xBC, 56);
+    /// `struct drm_prime_handle` (12 B, frozen).
+    pub const PRIME_FD_TO_HANDLE: (u32, usize) = (0x2D, 12);
+    /// `struct drm_prime_handle` (12 B, frozen).
+    pub const PRIME_HANDLE_TO_FD: (u32, usize) = (0x2E, 12);
+    /// `struct drm_mode_create_lease` (24 B).
+    pub const MODE_CREATE_LEASE: (u32, usize) = (0xC6, 24);
+    /// `struct drm_syncobj_eventfd` (24 B).
+    pub const SYNCOBJ_EVENTFD: (u32, usize) = (0xCF, 24);
+}
 
 /// The atomic-commit ioctl. Used by `sys_ioctl` to run
 /// [`DrmDev::atomic_in_fence_sleep`] before `io_control`, so a commit
@@ -852,6 +2854,9 @@ const _DRM_VBLANK_EVENT: u32 = 0x0400_0000;
 const PROP_TYPE: u32 = 10;
 const PROP_EDID: u32 = 11;
 const PROP_DPMS: u32 = 12;
+/// `DRM_MODE_DPMS_ON`. The other three levels (Standby, Suspend, Off) all mean
+/// "stop lighting the panel" on a pipe with no power states of its own.
+const DRM_MODE_DPMS_ON: u64 = 0;
 const PROP_LINK_STATUS: u32 = 13;
 const PROP_NON_DESKTOP: u32 = 14;
 const PROP_FB_ID: u32 = 15;
@@ -1593,9 +3598,17 @@ fn prop_spec(prop_id: u32) -> Option<PropSpec> {
 /// `DRM_CLIENT_CAP_ATOMIC`, mirroring Linux's atomic-property filtering.
 fn connector_props(connector_id: u32, atomic: bool) -> alloc::vec::Vec<(u32, u64)> {
     let mut props = alloc::vec::Vec::new();
-    // The software scanout is always lit: DPMS "On", link "Good", a desktop
-    // display.
-    props.push((PROP_DPMS, 0));
+    // DPMS reads back what the client last set, so a compositor that turned
+    // the output off and re-reads the property sees "Off" rather than being
+    // told the panel is lit. Link is "Good" and this is a desktop display.
+    props.push((
+        PROP_DPMS,
+        if drm::crtc_blanked() {
+            3 // Off
+        } else {
+            DRM_MODE_DPMS_ON
+        },
+    ));
     props.push((PROP_LINK_STATUS, 0));
     props.push((PROP_NON_DESKTOP, 0));
     if drm::get_connector_edid(connector_id).is_some() {
@@ -1785,14 +3798,233 @@ fn wsi_trace_take() -> bool {
     n < MAX
 }
 
+/// The canonical encoding of a core DRM ioctl: the `_IOC` word whose
+/// `_IOC_SIZE` is the struct layout [`DrmDev::drm_ioctl_dispatch`] parses.
+///
+/// Linux never dispatches on the encoded command. `drm_ioctl()` takes
+/// `nr = _IOC_NR(cmd)`, looks the handler up in `drm_ioctls[]` by that number
+/// alone, and then *reconciles* the caller's `_IOC_SIZE(cmd)` with the size of
+/// the struct the kernel parses (`drm_ioctl_kernel`: allocate
+/// `max(in_size, out_size, drv_size)`, copy the caller's bytes in, zero the
+/// rest, run the handler, copy `out_size` bytes back). That is the entire
+/// reason a libdrm built against a 2019 `drm.h` keeps working on a 2026 kernel,
+/// and why a struct may grow a trailing field without a flag day.
+///
+/// This tree matched the full 32-bit command instead, so every struct that ever
+/// grew a field became a *different* ioctl that fell through to the driver and
+/// out as ENOSYS. It cost three separate hand-patches already — the deadline
+/// sizes of `SYNCOBJ_WAIT`/`TIMELINE_WAIT`, `SYNCOBJ_HANDLE_TO_FD` matched by
+/// NR in the syscall layer, `PRIME_*` likewise — each found only after a client
+/// broke on real hardware. Returning `None` here means "not a core ioctl we
+/// know": driver-private numbers (`DRM_COMMAND_BASE..DRM_COMMAND_END`) and
+/// anything unrecognised pass through untouched.
+fn canonical_drm_ioctl(nr: u32) -> Option<u32> {
+    Some(match nr {
+        0x00 => DRM_IOCTL_VERSION,
+        0x01 => DRM_IOCTL_GET_UNIQUE,
+        0x02 => DRM_IOCTL_GET_MAGIC,
+        0x07 => DRM_IOCTL_SET_VERSION,
+        0x09 => DRM_IOCTL_GEM_CLOSE,
+        0x0C => DRM_IOCTL_GET_CAP,
+        0x0D => DRM_IOCTL_SET_CLIENT_CAP,
+        0x11 => DRM_IOCTL_AUTH_MAGIC,
+        0x1E => DRM_IOCTL_SET_MASTER,
+        0x1F => DRM_IOCTL_DROP_MASTER,
+        0x3A => DRM_IOCTL_WAIT_VBLANK,
+        0xA0 => DRM_IOCTL_MODE_GETRESOURCES,
+        0xA1 => DRM_IOCTL_MODE_GETCRTC,
+        0xA2 => DRM_IOCTL_MODE_SETCRTC,
+        0xA3 => DRM_IOCTL_MODE_CURSOR,
+        0xA4 => DRM_IOCTL_MODE_GETGAMMA,
+        0xA5 => DRM_IOCTL_MODE_SETGAMMA,
+        0xA6 => DRM_IOCTL_MODE_GETENCODER,
+        0xA7 => DRM_IOCTL_MODE_GETCONNECTOR,
+        0xAA => DRM_IOCTL_MODE_GETPROPERTY,
+        0xAB => DRM_IOCTL_MODE_SETPROPERTY,
+        0xAC => DRM_IOCTL_MODE_GETPROPBLOB,
+        0xAD => DRM_IOCTL_MODE_GETFB,
+        0xAE => DRM_IOCTL_MODE_ADDFB,
+        0xAF => DRM_IOCTL_MODE_RMFB,
+        0xB0 => DRM_IOCTL_MODE_PAGE_FLIP,
+        0xB1 => DRM_IOCTL_MODE_DIRTYFB,
+        0xB2 => DRM_IOCTL_MODE_CREATE_DUMB,
+        0xB3 => DRM_IOCTL_MODE_MAP_DUMB,
+        0xB4 => DRM_IOCTL_MODE_DESTROY_DUMB,
+        0xB5 => DRM_IOCTL_MODE_GETPLANERESOURCES,
+        0xB6 => DRM_IOCTL_MODE_GETPLANE,
+        0xB7 => DRM_IOCTL_MODE_SETPLANE,
+        0xB8 => DRM_IOCTL_MODE_ADDFB2,
+        0xB9 => DRM_IOCTL_MODE_OBJ_GETPROPERTIES,
+        0xBA => DRM_IOCTL_MODE_OBJ_SETPROPERTY,
+        0xBB => DRM_IOCTL_MODE_CURSOR2,
+        0xBC => DRM_IOCTL_MODE_ATOMIC,
+        0xBD => DRM_IOCTL_MODE_CREATEPROPBLOB,
+        0xBE => DRM_IOCTL_MODE_DESTROYPROPBLOB,
+        0xBF => DRM_IOCTL_SYNCOBJ_CREATE,
+        0xC0 => DRM_IOCTL_SYNCOBJ_DESTROY,
+        0xC3 => DRM_IOCTL_SYNCOBJ_WAIT,
+        0xC4 => DRM_IOCTL_SYNCOBJ_RESET,
+        0xC5 => DRM_IOCTL_SYNCOBJ_SIGNAL,
+        0xC7 => DRM_IOCTL_MODE_LIST_LESSEES,
+        0xCA => DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT,
+        0xCB => DRM_IOCTL_SYNCOBJ_QUERY,
+        0xCC => DRM_IOCTL_SYNCOBJ_TRANSFER,
+        0xCD => DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL,
+        0xCE => DRM_IOCTL_MODE_GETFB2,
+        0xD0 => DRM_IOCTL_MODE_CLOSEFB,
+        _ => return None,
+    })
+}
+
+/// Whether `nr` is a core DRM ioctl number at all, i.e. NOT in the
+/// driver-private `DRM_COMMAND_BASE..DRM_COMMAND_END` window. Linux answers an
+/// unknown core number with EINVAL (`drm_ioctl`: `if (!func) ... -EINVAL`),
+/// never ENOSYS.
+pub(crate) fn is_core_drm_nr(nr: u32) -> bool {
+    !(DRM_COMMAND_BASE..DRM_COMMAND_END).contains(&nr)
+}
+
+const DRM_COMMAND_BASE: u32 = 0x40;
+const DRM_COMMAND_END: u32 = 0xA0;
+
+const IOC_WRITE_DIR: u32 = 1 << 30;
+const IOC_READ_DIR: u32 = 2 << 30;
+
+const fn ioc_size(cmd: u32) -> usize {
+    ((cmd >> 16) & 0x3fff) as usize
+}
+
+/// The byte counts `drm_ioctl()` derives for one call: what to copy in from the
+/// caller, what to copy back, and how big the kernel-side struct must be.
+#[derive(Debug, PartialEq, Eq)]
+struct IoctlSizes {
+    in_size: usize,
+    out_size: usize,
+    ksize: usize,
+}
+
+/// `drm_ioctl()`'s size arithmetic, verbatim:
+///
+/// ```text
+/// in_size = out_size = _IOC_SIZE(cmd);
+/// if ((cmd & ioctl->cmd & IOC_IN)  == 0) in_size  = 0;
+/// if ((cmd & ioctl->cmd & IOC_OUT) == 0) out_size = 0;
+/// ksize = max(max(in_size, out_size), drv_size);
+/// ```
+///
+/// Direction is INTERSECTED with the handler's own, which is what stops a
+/// caller from encoding `_IOC_READ` on a write-only ioctl to have the kernel
+/// copy a struct back that it was never going to fill.
+fn reconcile_sizes(cmd: u32, canon: u32) -> IoctlSizes {
+    let user_size = ioc_size(cmd);
+    let in_size = if cmd & canon & IOC_WRITE_DIR != 0 {
+        user_size
+    } else {
+        0
+    };
+    let out_size = if cmd & canon & IOC_READ_DIR != 0 {
+        user_size
+    } else {
+        0
+    };
+    IoctlSizes {
+        in_size,
+        out_size,
+        ksize: core::cmp::max(core::cmp::max(in_size, out_size), ioc_size(canon)),
+    }
+}
+
+/// `drm_ioctl()`: reconcile the size the client encoded with the size we parse,
+/// then dispatch on the canonical command.
+///
+/// Linux computes, for the handler found by NR:
+///
+/// ```text
+/// in_size  = out_size = _IOC_SIZE(cmd)
+/// if ((cmd & ioctl->cmd & IOC_IN)  == 0) in_size  = 0;
+/// if ((cmd & ioctl->cmd & IOC_OUT) == 0) out_size = 0;
+/// ksize = max(max(in_size, out_size), drv_size)
+/// ```
+///
+/// then allocates `ksize` bytes, copies `in_size` from the caller, **zeroes the
+/// tail**, runs the handler and copies `out_size` back. A caller whose struct is
+/// shorter than ours sees the fields it does not know about default to zero; one
+/// whose struct is longer keeps its trailing bytes untouched. We do the same,
+/// and only when the sizes actually differ — the overwhelmingly common case is
+/// an exact match, which dispatches straight through with no copy at all.
+fn drm_ioctl(dev: &DrmDev, cmd: u32, data: usize) -> Result<usize> {
+    drm_ioctl_reconciled(cmd, data, |canon, kdata| {
+        dev.drm_ioctl_dispatch(canon, kdata)
+    })
+}
+
+/// [`drm_ioctl`] with the dispatch injected, so the copy-in / zero-fill /
+/// copy-back protocol can be tested without a device.
+#[allow(unsafe_code)]
+fn drm_ioctl_reconciled(
+    cmd: u32,
+    data: usize,
+    dispatch: impl FnOnce(u32, usize) -> Result<usize>,
+) -> Result<usize> {
+    let nr = cmd & 0xff;
+    let canon = match canonical_drm_ioctl(nr) {
+        Some(c) => c,
+        // Driver-private or unrecognised: hand it to the dispatcher unchanged,
+        // which routes it to the driver (Linux consults the driver's own ioctl
+        // table for this range) or fails it.
+        None => {
+            ucheck(data, ioc_size(cmd))?;
+            return dispatch(cmd, data);
+        }
+    };
+    if ioc_size(cmd) == ioc_size(canon) {
+        // Fast path: the client's struct is the one the arms parse. No bounce
+        // buffer, no copy -- byte-for-byte the behaviour before this layer.
+        ucheck(data, ioc_size(cmd))?;
+        return dispatch(canon, data);
+    }
+    let IoctlSizes {
+        in_size,
+        out_size,
+        ksize,
+    } = reconcile_sizes(cmd, canon);
+    if ksize == 0 {
+        return dispatch(canon, data);
+    }
+    // `access_ok()` over the range the CLIENT encoded, before either copy.
+    ucheck(data, core::cmp::max(in_size, out_size))?;
+    let mut kdata = alloc::vec![0u8; ksize];
+    if in_size != 0 {
+        // SAFETY: `ucheck` proved `data..data + in_size` is user memory, and
+        // `kdata` is `ksize >= in_size` bytes we own. The tail stays zero, which
+        // is the whole point: fields a shorter client did not send must read as
+        // zero, not as whatever the arm would otherwise find.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data as *const u8, kdata.as_mut_ptr(), in_size);
+        }
+    }
+    let ret = dispatch(canon, kdata.as_ptr() as usize)?;
+    if out_size != 0 {
+        // SAFETY: same range, checked above; `kdata` holds at least `out_size`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(kdata.as_ptr(), data as *mut u8, out_size);
+        }
+    }
+    Ok(ret)
+}
+
 impl INode for DrmDev {
     fn read_at(&self, _offset: usize, buf: &mut [u8]) -> Result<usize> {
         // Deliver queued DRM events (page-flip completions). When none are
         // pending report `Again` so a non-blocking reader gets EAGAIN and an
         // epoll/poll waiter re-checks on the next tick.
-        match self.file.read_event(buf) {
-            Some(n) => Ok(n),
-            None => Err(FsError::Again),
+        match self.file.read_events(buf) {
+            drm::EventRead::Read(n) => Ok(n),
+            drm::EventRead::Empty => Err(FsError::Again),
+            // EINVAL, like `drm_read()` with nothing read yet. EAGAIN here was
+            // a livelock: the queue is non-empty, so READABLE stays set and a
+            // blocking reader's wait resolves instantly, over and over.
+            drm::EventRead::TooSmall => Err(FsError::InvalidParam),
         }
     }
 
@@ -1855,1850 +4087,8 @@ impl INode for DrmDev {
         })
     }
 
-    #[allow(unsafe_code)]
     fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
-        // `access_ok()` for the ioctl argument itself. Every arm below (and the
-        // driver-private dispatch) casts `data` straight to the request struct;
-        // `_IOC_SIZE(cmd)` is that struct's size, so one range check here covers
-        // them all. A NULL or kernel address is EFAULT like Linux, instead of a
-        // kernel #PF or an arbitrary kernel-memory read/write. Size-less ioctls
-        // (SET_MASTER, DROP_MASTER) never touch `data`.
-        let arg_size = ((cmd >> 16) & 0x3fff) as usize;
-        ucheck(data, arg_size)?;
-        // Render nodes only accept DRM_RENDER_ALLOW ioctls (drm-uapi.rst
-        // "Render nodes"): modeset, dumb-buffer and master/auth commands get
-        // EACCES exactly like Linux, so a client probing `renderD128` sees a
-        // render node, not a second KMS device.
-        if self.minor >= 128 && !render_allowed(cmd) {
-            // OBSERVE, DO NOT ENFORCE (yet).
-            //
-            // `render_allowed` used to extract the NR as `(cmd >> 8) & 0xff`,
-            // which is the ioctl TYPE byte -- 'd' (0x64) for every DRM ioctl,
-            // and 0x64 sits inside the driver-private `0x40..=0x9F` arm. The
-            // filter has therefore ACCEPTED EVERYTHING since it was written,
-            // and renderD128 has behaved as a fully-open second KMS node.
-            //
-            // Fixing the extraction (correct, and it now matches Linux's
-            // DRM_RENDER_ALLOW set exactly) would in the same step start
-            // refusing every dumb-buffer and modeset ioctl on the render node
-            // -- CREATE_DUMB/MAP_DUMB/ADDFB2/PAGE_FLIP/... -- on a software-GL
-            // desktop that currently boots and that this change cannot be
-            // tested against. Turning a silent no-op into an enforcing gate
-            // blind is exactly the kind of regression worth avoiding, so log
-            // the would-be refusal and let the call through. Flip this to
-            // `return Err(FsError::NoPermission)` once a boot log shows the
-            // line never appears on the software path.
-            //
-            // De-duped per NR: the caller controls the rate, and `klog_info!`
-            // has no level filter, no rate limit and goes straight out the
-            // UART -- an unthrottled line here would let a client that retries
-            // in a loop flood the serial console and stall the boot.
-            static REFUSAL_LOGGED: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
-            let nr = (cmd & 0xff) as usize;
-            if !REFUSAL_LOGGED[nr].swap(true, Ordering::Relaxed) {
-                kernel_hal::klog_info!(
-                    "[drm] render node: ioctl {:#010x} (drm nr={:#04x}) is NOT in Linux's \
-                     DRM_RENDER_ALLOW set -- allowed anyway for now, see render_allowed()",
-                    cmd,
-                    cmd & 0xff
-                );
-            }
-        }
-        // KMS-query trace for Vulkan's VK_KHR_display probe (wsi_display).
-        // `vulkaninfo` dies with ERROR_OUT_OF_HOST_MEMORY inside
-        // vkGetPhysicalDeviceDisplayPlanePropertiesKHR on RTX, and Mesa
-        // returns that code when one of these six GET calls fails (NULL from
-        // libdrm) -- but every failure arm below logs at log::warn/debug,
-        // INVISIBLE under LOG=error. Name each call and its caller pid via
-        // klog (level-filter-free) so one dmesg photo shows the exact query
-        // sequence and which one refused. Bounded noise: these six only fire
-        // at client startup / probe time, never per frame.
-        {
-            let wsi_name = match cmd {
-                DRM_IOCTL_MODE_GETRESOURCES => Some("GETRESOURCES"),
-                DRM_IOCTL_MODE_GETCONNECTOR => Some("GETCONNECTOR"),
-                DRM_IOCTL_MODE_GETENCODER => Some("GETENCODER"),
-                DRM_IOCTL_MODE_GETCRTC => Some("GETCRTC"),
-                DRM_IOCTL_MODE_GETPLANERESOURCES => Some("GETPLANERESOURCES"),
-                DRM_IOCTL_MODE_GETPLANE => Some("GETPLANE"),
-                _ => None,
-            };
-            if let Some(name) = wsi_name {
-                if wsi_trace_take() {
-                    kernel_hal::klog_info!(
-                        "[drm-wsi] pid={} {} (minor={})",
-                        drm::current_pid(),
-                        name,
-                        self.minor
-                    );
-                }
-            }
-        }
-        if (cmd & 0xff) == DRM_ECLIPSE_COMPUTE_NR {
-            return eclipse_compute_ioctl(self.minor, data);
-        }
-        match cmd {
-            DRM_IOCTL_VERSION => {
-                let node = drm_node_name(self.minor);
-                let compute_node = drm::is_compute_minor(self.minor);
-                // When the nouveau experiment is on, make this visible at the
-                // default `warn` level and name the primary DRM driver: it tells
-                // us in one boot whether NVK/Mesa even reached VERSION on this
-                // node (discovery/enumeration OK) and whether the driver behind
-                // it is the real NvidiaGpu ("Nvidia GPU") or a software fallback
-                // (which would route every nouveau ioctl to the wrong driver).
-                if zcore_drivers::display::nouveau_uapi_enabled() {
-                    // klog_info!, not log::warn!: hardware boots default to
-                    // LOG=error. This one line tells us in a quiet boot whether
-                    // NVK/Mesa even reached VERSION on the node (discovery OK) and
-                    // whether the driver behind it is the real NvidiaGpu.
-                    //
-                    // ONCE PER MINOR. `klog_info!` has no level filter, no rate
-                    // limit and writes straight to the UART, and VERSION is on a
-                    // path whose rate userspace controls: libdrm calls it on
-                    // every `drmGetVersion`, so every `drmGetDevices2` scan, every
-                    // Vulkan/EGL probe and every wlroots backend retry emits one.
-                    // A desktop that retries in a loop turns that into hundreds
-                    // of synchronous serial writes -- the same unthrottled-klog
-                    // defect already fixed for the render_allowed line above. The
-                    // answer it carries (did a client reach VERSION, and which
-                    // driver is behind the node) is the same every time, so the
-                    // first line per node is the whole diagnostic.
-                    static VERSION_LOGGED: [AtomicBool; 256] =
-                        [const { AtomicBool::new(false) }; 256];
-                    let slot = (self.minor & 0xff) as usize;
-                    if !VERSION_LOGGED[slot].swap(true, Ordering::Relaxed) {
-                        let vname = if compute_node {
-                            "eclipse-compute"
-                        } else {
-                            "nouveau"
-                        };
-                        match self.driver() {
-                            Some(d) => kernel_hal::klog_info!(
-                                "[drm] VERSION on /dev/dri/{} (minor={}) -> name=\"{}\"; driver={:?} pci_bdf={:x?} (client reached VERSION — DRM discovery OK; logged once per node)",
-                                node,
-                                self.minor,
-                                vname,
-                                d.name(),
-                                d.pci_bdf()
-                            ),
-                            None => kernel_hal::klog_info!(
-                                "[drm] VERSION on /dev/dri/{} (minor={}) -> name=\"{}\"; driver=<none> (logged once per node)",
-                                node,
-                                self.minor,
-                                vname
-                            ),
-                        }
-                    }
-                } else {
-                    log::debug!(
-                        "[drm] VERSION — /dev/dri/{} opened by userspace (minor={})",
-                        node,
-                        self.minor
-                    );
-                }
-                // Mesa selects the userspace DRI driver from this NAME. With the
-                // nouveau uAPI enabled (the RTX experiment: `nvidia.nouveau_uapi`,
-                // only ever set alongside a real NVIDIA card — QEMU's virtio-gpu
-                // path never sets it, so it keeps the "zcore" identity), report
-                // "nouveau" so Mesa loads nouveau_dri.so, and version 1.4.0 —
-                // the drm_nouveau version that gates the NEW submission uAPI
-                // (VM_INIT/VM_BIND/EXEC), which is what this driver implements
-                // (NOT the legacy GEM_PUSHBUF path, absent here). If Mesa's GL
-                // winsys still reaches for GEM_PUSHBUF, the boot log's
-                // "[nouveau-uapi] unhandled ioctl ... GEM_PUSHBUF" line says so.
-                let nouveau = zcore_drivers::display::nouveau_uapi_enabled();
-                let v = unsafe { &mut *(data as *mut DrmVersion) };
-                if compute_node {
-                    v.version_major = 0;
-                    v.version_minor = 1;
-                    v.version_patchlevel = 0;
-                } else if nouveau {
-                    v.version_major = 1;
-                    v.version_minor = 4;
-                    v.version_patchlevel = 0;
-                } else {
-                    v.version_major = 1;
-                    v.version_minor = 0;
-                    v.version_patchlevel = 0;
-                }
-
-                let name: &[u8] = if compute_node {
-                    b"eclipse-compute\0"
-                } else if nouveau {
-                    b"nouveau\0"
-                } else {
-                    b"zcore\0"
-                };
-                let date = b"20260503\0";
-                let desc: &[u8] = if compute_node {
-                    b"Eclipse NVIDIA compute\0"
-                } else if nouveau {
-                    b"nouveau\0"
-                } else {
-                    b"zCore DRM Driver\0"
-                };
-
-                unsafe {
-                    if v.name_len > 0 && !v.name.is_null() {
-                        let len = core::cmp::min(v.name_len, name.len());
-                        ucheck(v.name as usize, len)?;
-                        core::ptr::copy_nonoverlapping(name.as_ptr(), v.name, len);
-                    }
-                    if v.date_len > 0 && !v.date.is_null() {
-                        let len = core::cmp::min(v.date_len, date.len());
-                        ucheck(v.date as usize, len)?;
-                        core::ptr::copy_nonoverlapping(date.as_ptr(), v.date, len);
-                    }
-                    if v.desc_len > 0 && !v.desc.is_null() {
-                        let len = core::cmp::min(v.desc_len, desc.len());
-                        ucheck(v.desc as usize, len)?;
-                        core::ptr::copy_nonoverlapping(desc.as_ptr(), v.desc, len);
-                    }
-                }
-                v.name_len = name.len();
-                v.date_len = date.len();
-                v.desc_len = desc.len();
-                Ok(0)
-            }
-            DRM_IOCTL_GET_UNIQUE => {
-                let u = unsafe { &mut *(data as *mut DrmUnique) };
-                let name = b"zcore-gpu\0";
-                unsafe {
-                    if u.unique_len > 0 && !u.unique.is_null() {
-                        let len = core::cmp::min(u.unique_len, name.len());
-                        ucheck(u.unique as usize, len)?;
-                        core::ptr::copy_nonoverlapping(name.as_ptr(), u.unique, len);
-                    }
-                }
-                u.unique_len = name.len();
-                Ok(0)
-            }
-            DRM_IOCTL_GET_CAP => {
-                let cap = unsafe { &mut *(data as *mut DrmGetCap) };
-                match cap.capability {
-                    0x1 => cap.value = 1, // DRM_CAP_DUMB_BUFFER
-                    // DRM_CAP_DUMB_PREFERRED_DEPTH: XRGB8888 scanout = 24.
-                    0x3 => cap.value = 24,
-                    // DRM_CAP_DUMB_PREFER_SHADOW: the dumb buffer lives behind
-                    // a CPU blit over PCIe — clients should render to a shadow
-                    // and copy, exactly what this cap advises.
-                    0x4 => cap.value = 1,
-                    // DRM_CAP_PRIME: IMPORT|EXPORT. wlroots' check_drm_features
-                    // *requires* DRM_PRIME_CAP_IMPORT or the whole DRM backend
-                    // fails ("PRIME import not supported") — it is mandatory for
-                    // any output (pixman or GL), not just GBM clients. We now
-                    // implement PRIME_HANDLE_TO_FD / FD_TO_HANDLE (dma-buf), so
-                    // advertise it.
-                    0x5 => cap.value = 3,
-                    0x6 => cap.value = 1,  // DRM_CAP_TIMESTAMP_MONOTONIC
-                    0x8 => cap.value = 64, // DRM_CAP_CURSOR_WIDTH
-                    0x9 => cap.value = 64, // DRM_CAP_CURSOR_HEIGHT
-                    // DRM_CAP_ADDFB2_MODIFIERS: report NO modifier support.
-                    // Our scanout is a CPU blit that reads the framebuffer
-                    // LINEARLY, so the only layout it can present is
-                    // DRM_FORMAT_MOD_LINEAR. Advertising modifier support (1)
-                    // let wlroots negotiate a BLOCK-LINEAR swapchain with NVK
-                    // (PTE kind 0x06), and binding it hit VM_BIND's refusal of
-                    // non-zero PTE kinds ("PTE kind 0x06 requested (tiled) ...
-                    // refusing"), so `vkBindImageMemory` failed and the
-                    // swapchain never allocated (`gbm_bo_create failed`,
-                    // "Swapchain for output 'HDMI-A-1' failed test"). With 0,
-                    // wlroots restricts scanout to implicit/linear buffers,
-                    // which bind with PTE kind 0 and blit correctly. (The
-                    // Vulkan renderer's VK_EXT_image_drm_format_modifier is a
-                    // separate device extension, unaffected by this KMS cap.)
-                    0x10 => cap.value = 0, // DRM_CAP_ADDFB2_MODIFIERS
-                    // DRM_CAP_CRTC_IN_VBLANK_EVENT: our page-flip event carries
-                    // the crtc_id, so report support (wlroots requires it).
-                    0x12 => cap.value = 1,
-                    // DRM_CAP_SYNCOBJ / DRM_CAP_SYNCOBJ_TIMELINE: real
-                    // (create/destroy/wait/signal all work, see
-                    // zcore_drivers::scheme::syncobj), but gated on the same
-                    // opt-in flag as the rest of this session's nouveau-uAPI
-                    // work (`nvidia.nouveau_uapi`) so a driver/setup nothing
-                    // here has touched (virtio-gpu, or NVIDIA without the
-                    // flag) never sees a capability bit flip by default.
-                    0x13 | 0x14 => {
-                        cap.value = zcore_drivers::display::nouveau_uapi_enabled() as u64;
-                        // One-shot per cap, VISIBLE on hardware (klog has no level
-                        // filter, unlike the log::debug! below). NVK probes
-                        // DRM_CAP_SYNCOBJ (0x13) and DRM_CAP_SYNCOBJ_TIMELINE (0x14)
-                        // before it will back a timeline VkSemaphore with a kernel
-                        // syncobj. If the next boot's dmesg shows these as `-> 1`
-                        // but zink still logs "failed to create timeline semaphore"
-                        // with NO `SYNCOBJ_CREATE` line after (see that arm), NVK
-                        // gave up in USERSPACE over a capability beyond the cap —
-                        // the same class as the external-semaphore block, and NOT a
-                        // kernel syncobj bug. `->1` followed by `SYNCOBJ_CREATE`
-                        // lines means the create path is reached and the failure is
-                        // downstream of the syncobj.
-                        static SYNCOBJ_CAP_LOGGED: AtomicBool = AtomicBool::new(false);
-                        static TIMELINE_CAP_LOGGED: AtomicBool = AtomicBool::new(false);
-                        let latch = if cap.capability == 0x14 {
-                            &TIMELINE_CAP_LOGGED
-                        } else {
-                            &SYNCOBJ_CAP_LOGGED
-                        };
-                        if !latch.swap(true, Ordering::Relaxed) {
-                            kernel_hal::klog_info!(
-                                "[drm] GET_CAP {} -> {} (probed by pid {})",
-                                if cap.capability == 0x14 {
-                                    "SYNCOBJ_TIMELINE"
-                                } else {
-                                    "SYNCOBJ"
-                                },
-                                cap.value,
-                                drm::current_pid()
-                            );
-                        }
-                    }
-                    // Everything else — DRM_CAP_ASYNC_PAGE_FLIP (0x7),
-                    // DRM_CAP_PAGE_FLIP_TARGET (0x11) and
-                    // DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP (0x15) — is honestly 0.
-                    _ => cap.value = 0,
-                }
-                log::debug!(
-                    "[drm] GET_CAP minor={} cap={:#x} -> {}",
-                    self.minor,
-                    cap.capability,
-                    cap.value
-                );
-                log::debug!("[drm] GET_CAP cap={:#x} -> {}", cap.capability, cap.value);
-                Ok(0)
-            }
-            // A single DRM client on the primary node is implicitly master;
-            // accept (drop-)master so seatd/wlroots session activation succeeds.
-            // Magic/auth: `drmIsMaster()` authenticates magic 0 and treats
-            // success as "this fd is DRM master". wlroots' dumb-buffer allocator
-            // (pixman path) requires master, so always succeed — the single
-            // client on the primary node is implicitly master here.
-            DRM_IOCTL_GET_MAGIC => {
-                // struct drm_auth { __u32 magic; }
-                unsafe { *(data as *mut u32) = 1 };
-                Ok(0)
-            }
-            DRM_IOCTL_AUTH_MAGIC => Ok(0),
-            DRM_IOCTL_SET_MASTER => {
-                // Become DRM master, but do NOT switch the console to graphics
-                // yet: defer that to the first real scanout (`drm::scanout`). If
-                // the client stalls before presenting a frame (e.g. its renderer
-                // fails to init), the kernel text console stays usable and its
-                // logs visible instead of freezing on a black screen.
-                log::debug!("[drm] SET_MASTER (minor={})", self.minor);
-                // A new compositor session gets a fresh present-failure trace
-                // budget. The budget is what keeps a failing present from
-                // flooding the console, but as a per-BOOT count it was useless
-                // on a rig that stays up for days: the machine that produced
-                // the `Failed to set CRTC` log had been up 21 hours and had
-                // started labwc several times, so the eight lines that would
-                // have named the cause were spent on a session long gone. One
-                // compositor session is the right unit -- it is exactly one
-                // attempt at bringing the desktop up.
-                PRESENT_FAIL_TRACED.store(0, Ordering::Relaxed);
-                Ok(0)
-            }
-            DRM_IOCTL_DROP_MASTER => {
-                // In a seat-managed session (seatd owns tty7 via VT_PROCESS) the
-                // SEAT -- not DRM master -- drives the console KD mode: seatd
-                // already put tty7 into KD_GRAPHICS and will restore text via
-                // its own VT handshake when the session ends. A DROP_MASTER here
-                // is then typically TRANSIENT (wlroots/Xwayland resetting the DRM
-                // backend during renderer fallback -- e.g. "EGL setup failed,
-                // falling back to sw"), not a real relinquish. The old
-                // unconditional set_kd_mode(KD_TEXT) flipped the active graphics
-                // VT (tty7) back to text, which switch_vt_impl(0) reverted to
-                // tty1 -- so the compositor's very first present landed on VT 0
-                // and the desktop never appeared on tty7. Restore text only when
-                // NO seat owns the graphics VT (bare DRM client / QEMU pixman /
-                // Xorg path), where this mechanism is the only one in play.
-                let seat_owned = crate::fs::stdio::graphics_vt_seat_owned();
-                kernel_hal::klog_info!(
-                    "[drm] DROP_MASTER (minor={}) seat_owned={} -- {}",
-                    self.minor,
-                    seat_owned,
-                    if seat_owned {
-                        "seat drives KD mode, NOT restoring text"
-                    } else {
-                        "restoring text console"
-                    }
-                );
-                if !seat_owned {
-                    kernel_hal::console::set_kd_mode(kernel_hal::console::KD_TEXT);
-                }
-                // Forget the compositor's DRM VT ownership so text consoles are
-                // no longer gated off screen/input (a live compositor's next
-                // present re-claims it).
-                //
-                // Deliberately NOT done here any more (both were Linux-divergent
-                // and both were mutated GLOBALLY by whichever client dropped
-                // master, clobbering the live compositor's state):
-                //  * cancel_pending_events(): pending DRM events belong to the
-                //    drm_file that queued them and survive a master drop in
-                //    Linux. A transient DROP_MASTER from a probing client
-                //    (Xwayland at session bring-up) inside the one-vblank window
-                //    after labwc's first page-flip swallowed labwc's completion
-                //    -- wlroots waited on it forever and the desktop froze on
-                //    its first frame until a VT cycle forced a re-enable. Events
-                //    are now cancelled only when the flip-owning process EXITS
-                //    (drm::cancel_events_for_exit in release_process).
-                //  * set_atomic_client(false): DRM_CLIENT_CAP_ATOMIC is
-                //    per-file in Linux and never revoked by a master drop;
-                //    clearing it globally made the compositor's atomic
-                //    property view flip mid-session.
-                drm::clear_graphics_owner();
-                Ok(0)
-            }
-            DRM_IOCTL_SET_VERSION => {
-                // drm_setversion: report the current interface (1.4) and
-                // driver (1.0) versions, validating any requested majors.
-                // -1 means "query only". Xorg's modesetting driver calls this
-                // right after open and treats ENOTTY as "not a DRM device".
-                let sv = unsafe { &mut *(data as *mut DrmSetVersion) };
-                let req_if = (sv.drm_di_major, sv.drm_di_minor);
-                let req_dd = sv.drm_dd_major;
-                sv.drm_di_major = 1;
-                sv.drm_di_minor = 4;
-                sv.drm_dd_major = 1;
-                sv.drm_dd_minor = 0;
-                if req_if.0 != -1 && (req_if.0 != 1 || req_if.1 < 0 || req_if.1 > 4) {
-                    return Err(FsError::InvalidParam);
-                }
-                if req_dd != -1 && req_dd != 1 {
-                    return Err(FsError::InvalidParam);
-                }
-                Ok(0)
-            }
-            DRM_IOCTL_SET_CLIENT_CAP => {
-                // struct drm_set_client_cap { __u64 capability; __u64 value; }
-                let cap = unsafe { *(data as *const u64) };
-                let value = unsafe { *(data.wrapping_add(8) as *const u64) };
-                match cap {
-                    DRM_CLIENT_CAP_ATOMIC => {
-                        // Linux refuses this with EOPNOTSUPP unless the driver
-                        // has DRIVER_ATOMIC. Eclipse's atomic path covers the
-                        // software-KMS pipeline and — until it has the same
-                        // mileage as the proven legacy path — is opt-in via
-                        // the `drm.atomic` cmdline flag (nouveau shipped its
-                        // atomic support gated the same way).
-                        if !drm::atomic_enabled() || !drm::software_kms_active() {
-                            log::debug!(
-                                "[drm] SET_CLIENT_CAP ATOMIC -> EOPNOTSUPP (legacy KMS; boot with drm.atomic to enable)"
-                            );
-                            return Err(FsError::OpNotSupported);
-                        }
-                        // Linux: values 0..2 (2 = relaxed checking); > 2 EINVAL.
-                        if value > 2 {
-                            return Err(FsError::InvalidParam);
-                        }
-                        // Setting atomic also implies universal planes.
-                        self.file.set_atomic_client(value != 0);
-                        log::debug!("[drm] SET_CLIENT_CAP ATOMIC={} -> accepted", value);
-                        Ok(0)
-                    }
-                    DRM_CLIENT_CAP_WRITEBACK_CONNECTORS => {
-                        // Linux: atomic clients only. There are no writeback
-                        // connectors to expose, so accepting is a no-op.
-                        if !self.file.atomic_client() || value > 1 {
-                            log::debug!("[drm] SET_CLIENT_CAP WRITEBACK -> EINVAL");
-                            return Err(FsError::InvalidParam);
-                        }
-                        Ok(0)
-                    }
-                    // STEREO_3D, UNIVERSAL_PLANES, ASPECT_RATIO: accept.
-                    _ => {
-                        log::debug!("[drm] SET_CLIENT_CAP cap={} -> accepted", cap);
-                        Ok(0)
-                    }
-                }
-            }
-            DRM_IOCTL_MODE_CREATE_DUMB => {
-                let info = unsafe { &mut *(data as *mut DrmModeCreateDumb) };
-                let bpp = info.bpp.max(32);
-                // width/height/bpp are userspace-controlled: compute pitch/size
-                // in 64-bit. A 32-bit `width*bpp` or `pitch*height` would wrap
-                // (e.g. 50000x50000x32) and under-allocate the buffer while
-                // echoing a huge size back, becoming an OOB read at scanout.
-                // Bound the result to a sane ceiling (64 MiB — a 4K XRGB frame
-                // is ~33 MiB) and require pitch to fit the u32 written back.
-                const MAX_DUMB_SIZE: u64 = 64 * 1024 * 1024;
-                let mut pitch64 = (info.width as u64 * bpp as u64 / 8 + 63) & !63;
-                let mut size64 = pitch64.saturating_mul(info.height as u64);
-                // When the compositor requests a full-screen dumb buffer, align
-                // its pitch with the display scanout pitch so the CE-offload
-                // present path can fire (flat copy needs equal strides). Without
-                // this, wlroots' 64-byte-aligned pitch often differs from the
-                // GOP framebuffer pitch and every frame falls back to the slow
-                // CPU blit (~7-10 FPS on dual RTX).
-                if let Some((dw, dh, dp)) = drm::display_mode() {
-                    if info.width == dw && info.height == dh && dp as u64 >= pitch64 {
-                        pitch64 = dp as u64;
-                        size64 = pitch64.saturating_mul(info.height as u64);
-                    }
-                }
-                if pitch64 == 0
-                    || pitch64 > u32::MAX as u64
-                    || size64 == 0
-                    || size64 > MAX_DUMB_SIZE
-                {
-                    log::warn!(
-                        "[drm] CREATE_DUMB {}x{} bpp={} -> rejected (pitch={} size={} out of range)",
-                        info.width, info.height, bpp, pitch64, size64
-                    );
-                    return Err(FsError::InvalidParam);
-                }
-                let pitch = pitch64 as u32;
-                let size = size64 as usize;
-
-                if let Some(handle) = drm::alloc_buffer(size) {
-                    info.handle = handle.id;
-                    info.pitch = pitch;
-                    info.size = size as u64;
-                    log::debug!(
-                        "[drm] CREATE_DUMB {}x{} bpp={} -> handle={} pitch={} size={}",
-                        info.width,
-                        info.height,
-                        bpp,
-                        handle.id,
-                        pitch,
-                        size
-                    );
-                    Ok(0)
-                } else {
-                    log::error!(
-                        "[drm] CREATE_DUMB {}x{} bpp={} -> alloc failed (size={})",
-                        info.width,
-                        info.height,
-                        bpp,
-                        size
-                    );
-                    Err(FsError::NoDeviceSpace)
-                }
-            }
-            DRM_IOCTL_MODE_ADDFB => {
-                let cmd = unsafe { &mut *(data as *mut DrmModeFbCmd) };
-                if let Some(fb_id) = drm::create_fb(cmd.handle, cmd.width, cmd.height, cmd.pitch) {
-                    cmd.fb_id = fb_id;
-                    Ok(0)
-                } else {
-                    // [swapchain-diag] error!-visible at LOG=error: a failed FB
-                    // creation makes wlroots' swapchain test fail before any
-                    // atomic commit is even attempted.
-                    log::error!(
-                        "[drm] ADDFB failed: {}x{} handle={:#x} pitch={} (create_fb returned None)",
-                        cmd.width,
-                        cmd.height,
-                        cmd.handle,
-                        cmd.pitch
-                    );
-                    Err(FsError::DeviceError)
-                }
-            }
-            DRM_IOCTL_MODE_ADDFB2 => {
-                let cmd = unsafe { &mut *(data as *mut DrmModeFbCmd2) };
-                if let Some(fb_id) =
-                    drm::create_fb(cmd.handles[0], cmd.width, cmd.height, cmd.pitches[0])
-                {
-                    cmd.fb_id = fb_id;
-                    Ok(0)
-                } else {
-                    // [swapchain-diag] error!-visible at LOG=error: the scanout
-                    // buffer wlroots hands us is rejected HERE, before the atomic
-                    // TEST_ONLY commit — so an empty "ATOMIC reject" grep with
-                    // this line present localises the failure to FB creation.
-                    log::error!(
-                        "[drm] ADDFB2 failed: {}x{} handle={:#x} pitch={} fmt={:#x} modifier={:#x} \
-                         (create_fb returned None)",
-                        cmd.width, cmd.height, cmd.handles[0], cmd.pitches[0], cmd.pixel_format, cmd.modifier[0]
-                    );
-                    Err(FsError::DeviceError)
-                }
-            }
-            DRM_IOCTL_MODE_RMFB => {
-                let fb_id = unsafe { *(data as *const u32) };
-                drm::rmfb(fb_id);
-                Ok(0)
-            }
-            DRM_IOCTL_MODE_CLOSEFB => {
-                // Our software-KMS `rmfb` already only drops the fb object —
-                // scanout keeps showing the last blitted frame until the next
-                // present — which is exactly CLOSEFB's "close without
-                // disabling" contract. Reject unknown ids like Linux (EINVAL
-                // via DeviceError is close enough for wlroots' fallback).
-                let fb_id = unsafe { *(data as *const u32) };
-                if drm::rmfb(fb_id) {
-                    Ok(0)
-                } else {
-                    Err(FsError::InvalidParam)
-                }
-            }
-            DRM_IOCTL_MODE_MAP_DUMB => {
-                let map = unsafe { &mut *(data as *mut DrmModeMapDumb) };
-                // Return a page-aligned fake offset (`handle << PAGE_SHIFT`). The
-                // subsequent mmap of the dumb buffer passes this back as the file
-                // offset; musl's `mmap()` rejects a non-page-aligned offset with
-                // EINVAL, and `get_vmo()` shifts it back to the handle id.
-                map.offset = (map.handle as u64) << 12;
-                Ok(0)
-            }
-            DRM_IOCTL_MODE_DESTROY_DUMB => {
-                let handle = unsafe { *(data as *const u32) };
-                drm::gem_close(handle);
-                Ok(0)
-            }
-            DRM_IOCTL_MODE_SETCRTC => {
-                // struct drm_mode_crtc has the same layout as DrmModeGetCrtc.
-                let req = unsafe { &mut *(data as *mut DrmModeGetCrtc) };
-                if req.mode_valid != 0 {
-                    drm::set_vblank_period_from_modeinfo(&req.mode);
-                }
-                if req.fb_id != 0 {
-                    if let Err(e) = drm::present_now_checked(req.fb_id, req.crtc_id, None) {
-                        present_failed("SETCRTC", req.fb_id, req.crtc_id, e)?;
-                    }
-                }
-                Ok(0)
-            }
-            DRM_IOCTL_MODE_PAGE_FLIP => {
-                let flip = unsafe { *(data as *const DrmModeCrtcPageFlip) };
-                // Linux `drm_mode_page_flip_ioctl`: unknown flags and a
-                // non-zero reserved word are EINVAL; ASYNC is EINVAL while
-                // DRM_CAP_ASYNC_PAGE_FLIP is 0 and the TARGET_* flags while
-                // DRM_CAP_PAGE_FLIP_TARGET is 0; an unknown fb is ENOENT. A
-                // completion event is queued only when the caller asked.
-                const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
-                const DRM_MODE_PAGE_FLIP_ASYNC: u32 = 0x02;
-                const DRM_MODE_PAGE_FLIP_TARGET: u32 = 0x0c;
-                const DRM_MODE_PAGE_FLIP_FLAGS: u32 = 0x0f;
-                if flip.flags & !DRM_MODE_PAGE_FLIP_FLAGS != 0
-                    || flip.reserved != 0
-                    || flip.flags & (DRM_MODE_PAGE_FLIP_ASYNC | DRM_MODE_PAGE_FLIP_TARGET) != 0
-                {
-                    return Err(FsError::InvalidParam);
-                }
-                if drm::get_fb(flip.fb_id).is_none() {
-                    return Err(FsError::EntryNotFound);
-                }
-                let want_event = flip.flags & DRM_MODE_PAGE_FLIP_EVENT != 0;
-                match drm::page_flip(
-                    flip.fb_id,
-                    flip.crtc_id,
-                    flip.user_data,
-                    want_event,
-                    &self.file,
-                ) {
-                    Ok(()) => Ok(0),
-                    Err(drm::FlipError::Busy) => Err(FsError::Busy),
-                    Err(drm::FlipError::Failed) => Err(FsError::DeviceError),
-                }
-            }
-            DRM_IOCTL_WAIT_VBLANK => {
-                // union drm_wait_vblank. A software framebuffer has no real
-                // vblank, so synthesize the next sequence from the monotonic
-                // clock. If the caller asked for an event (`_DRM_VBLANK_EVENT`)
-                // deliver a DRM_EVENT_VBLANK on the card fd; otherwise fill the
-                // reply and return immediately instead of blocking.
-                let req = unsafe { &mut *(data as *mut DrmWaitVblank) };
-                let typ = req.typ;
-                let signal = req.val1;
-                // Only ask the driver for a real vblank when it has hardware
-                // KMS support. Without hardware KMS (e.g. the NVIDIA stub
-                // registers has_hardware_kms()=false) wait_vblank is
-                // implemented as a busy 16.7 ms spin, and calling it on every
-                // WAIT_VBLANK ioctl causes severe CPU starvation on a
-                // cooperative async runtime — making the system appear frozen.
-                if !drm::software_kms_active() {
-                    if let Some(driver) = drm::get_primary_driver() {
-                        if driver.has_hardware_kms() {
-                            let _ = driver.wait_vblank(0);
-                        }
-                    }
-                }
-                // Resolve the requested vblank like `drm_wait_vblank_ioctl`:
-                // `_DRM_VBLANK_RELATIVE` counts from the current sequence,
-                // absolute is taken as is, and `_DRM_VBLANK_NEXTONMISS` moves a
-                // target that already passed to the next vblank. The request
-                // used to be ignored entirely (event at the next vblank, or an
-                // immediate reply), so "+2" or an absolute future MSC came
-                // back early with a smaller sequence than asked.
-                const _DRM_VBLANK_RELATIVE: u32 = 0x1;
-                const _DRM_VBLANK_NEXTONMISS: u32 = 0x1000_0000;
-                let now_seq = drm::vblank_seq_now();
-                let mut target = if typ & _DRM_VBLANK_RELATIVE != 0 {
-                    now_seq.wrapping_add(req.sequence)
-                } else {
-                    req.sequence
-                };
-                let passed = (target.wrapping_sub(now_seq) as i32) <= 0;
-                if passed && typ & _DRM_VBLANK_NEXTONMISS != 0 {
-                    target = now_seq.wrapping_add(1);
-                }
-                if typ & _DRM_VBLANK_EVENT != 0 {
-                    // Post the event when the counter reaches `target`, never
-                    // before the next synthetic vblank: delivering it instantly
-                    // turns a vblank-paced client loop into a busy spin (see
-                    // `schedule_flip_event`).
-                    drm::schedule_vblank_event(signal, target, &self.file);
-                } else {
-                    // Blocking form. The wait itself already happened in
-                    // `sys_ioctl` (see `DrmDev::wait_vblank_sleep`): this arm
-                    // is synchronous and cannot sleep, so it only reports the
-                    // sequence that has completed by the time it runs -- which
-                    // is the requested one, because the sleep preceded it.
-                    let now = kernel_hal::timer::timer_now();
-                    req.typ = 0; // _DRM_VBLANK_ABSOLUTE
-                                 // Return the *current* completed vblank sequence.  Returning
-                                 // vblank_seq_now()+1 (the upcoming vblank) was incorrect: it
-                                 // made the X11 Present MSC tracker believe the display was
-                                 // always one vblank ahead, so it added an extra ~16.7 ms wait
-                                 // per frame, halving the achievable frame rate.
-                    req.sequence = now_seq;
-                    req.val1 = now.as_secs(); // tval_sec
-                    req.val2 = now.subsec_micros() as u64; // tval_usec
-                }
-                Ok(0)
-            }
-            DRM_IOCTL_MODE_SETPLANE => {
-                // Primary-plane update: present immediately on the target CRTC.
-                // fb_id == 0 disables the plane, which we treat as a no-op.
-                let req = unsafe { *(data as *const DrmModeSetPlane) };
-                if req.fb_id != 0 {
-                    if let Err(e) = drm::present_now_checked(req.fb_id, req.crtc_id, None) {
-                        present_failed("SETPLANE", req.fb_id, req.crtc_id, e)?;
-                    }
-                }
-                Ok(0)
-            }
-            DRM_IOCTL_MODE_GETFB => {
-                let cmd = unsafe { &mut *(data as *mut DrmModeFbCmd) };
-                if let Some(fb) = drm::get_fb(cmd.fb_id) {
-                    cmd.width = fb.width;
-                    cmd.height = fb.height;
-                    cmd.pitch = fb.pitch;
-                    cmd.bpp = 32;
-                    cmd.depth = 24;
-                    // A single client is implicitly DRM master on the primary
-                    // node here, so handing back the backing GEM handle is safe.
-                    cmd.handle = fb.gem_handle_id;
-                    Ok(0)
-                } else {
-                    // ENOENT, like `drm_mode_getfb`'s framebuffer lookup. This
-                    // answered EINVAL, which reached the boot log only as a
-                    // bare `[einval-hunt] ... a1=0xc01c64ad -> EINVAL` with
-                    // nothing to say the fb id was the problem -- the same
-                    // unknown-fb id that `SETCRTC` was failing on, wearing a
-                    // different errno.
-                    Err(FsError::EntryNotFound)
-                }
-            }
-            DRM_IOCTL_MODE_GETFB2 => {
-                let cmd = unsafe { &mut *(data as *mut DrmModeFbCmd2) };
-                if let Some(fb) = drm::get_fb(cmd.fb_id) {
-                    cmd.width = fb.width;
-                    cmd.height = fb.height;
-                    cmd.pixel_format = 0x3432_5258; // DRM_FORMAT_XRGB8888 ("XR24")
-                    cmd.flags = 0;
-                    cmd.handles = [fb.gem_handle_id, 0, 0, 0];
-                    cmd.pitches = [fb.pitch, 0, 0, 0];
-                    cmd.offsets = [0; 4];
-                    cmd.modifier = [0; 4];
-                    Ok(0)
-                } else {
-                    // ENOENT, like `drm_mode_getfb2_ioctl`. Same reasoning as
-                    // GETFB above.
-                    Err(FsError::EntryNotFound)
-                }
-            }
-            DRM_IOCTL_MODE_DIRTYFB => {
-                // Flush accumulated damage by re-scanning the framebuffer out.
-                // Clients that keep one persistent FB and signal damage with
-                // DIRTYFB (X's modesetting shadow, simple toolkits) rely on this
-                // to update the screen. When clip rects are given, blit only
-                // their bounding union — a full-frame copy of a swapchain
-                // buffer that only has those boxes painted left stale tiles
-                // (squares) on the GOP. Scanout expands the union to 64-byte
-                // WC lines so a partial store cannot smear neighbouring pixels.
-                // An oversized, zero, or unreadable clip list means "the whole
-                // frame is dirty" (true DIRTYFB semantics for num_clips == 0).
-                let cmd = unsafe { *(data as *const DrmModeFbDirtyCmd) };
-                let rect = if cmd.num_clips > 0 && cmd.num_clips <= 64 && cmd.clips_ptr != 0 {
-                    ucheck_n::<DrmClipRect>(cmd.clips_ptr as usize, cmd.num_clips as usize)?;
-                    let mut union: Option<(u32, u32, u32, u32)> = None;
-                    for i in 0..cmd.num_clips as usize {
-                        let clip = unsafe { *(cmd.clips_ptr as *const DrmClipRect).add(i) };
-                        if clip.x2 <= clip.x1 || clip.y2 <= clip.y1 {
-                            continue;
-                        }
-                        let (x1, y1, x2, y2) = (
-                            clip.x1 as u32,
-                            clip.y1 as u32,
-                            clip.x2 as u32,
-                            clip.y2 as u32,
-                        );
-                        union = Some(match union {
-                            Some((ux, uy, uw, uh)) => {
-                                let nx = ux.min(x1);
-                                let ny = uy.min(y1);
-                                let fx = (ux + uw).max(x2);
-                                let fy = (uy + uh).max(y2);
-                                (nx, ny, fx - nx, fy - ny)
-                            }
-                            None => (x1, y1, x2 - x1, y2 - y1),
-                        });
-                    }
-                    union
-                } else {
-                    None
-                };
-                if !drm::present_now_region(cmd.fb_id, 1, rect) {
-                    // Best-effort: a damage flush that can't scan out (e.g. the
-                    // fb id is unknown to the software path) is not fatal — the
-                    // client keeps its shadow and will re-present. Returning EIO
-                    // here made Xorg's modesetting shadow abort its frame loop,
-                    // so swallow it rather than failing every DirtyFB.
-                    log::debug!("[drm] DIRTYFB fb={} not presented (no-op)", cmd.fb_id);
-                }
-                Ok(0)
-            }
-            DRM_IOCTL_MODE_GETGAMMA | DRM_IOCTL_MODE_SETGAMMA => {
-                // No programmable gamma on the software scanout: accept and
-                // ignore. (Get leaves the caller's ramp buffers untouched, which
-                // Xorg treats as the identity it will "restore" on exit — a
-                // no-op against our no-op Set.)
-                Ok(0)
-            }
-            DRM_IOCTL_MODE_LIST_LESSEES => {
-                // No leases exist; report an empty list. The struct's first u32
-                // is `count_lessees` — zero it so the client copies out none.
-                unsafe {
-                    *(data as *mut u32) = 0;
-                }
-                Ok(0)
-            }
-            DRM_IOCTL_MODE_OBJ_SETPROPERTY => {
-                // Legacy property writes (connector DPMS, plane rotation, …).
-                // The software scanout has no programmable object state, so
-                // accept and ignore rather than failing the client's modeset.
-                let req = unsafe { *(data as *const DrmModeObjSetProperty) };
-                log::debug!(
-                    "[drm] OBJ_SETPROPERTY obj={} type={:#x} prop={} val={} (accepted, no-op)",
-                    req.obj_id,
-                    req.obj_type,
-                    req.prop_id,
-                    req.value
-                );
-                Ok(0)
-            }
-            DRM_IOCTL_MODE_SETPROPERTY => {
-                // Legacy connector property write — wlroots sets the DPMS
-                // property to "on" as part of committing a modeset. Software
-                // scanout is always powered, so accept and ignore rather than
-                // failing the commit (which left the screen blank with
-                // "Failed to set DPMS property").
-                let value = unsafe { *(data as *const u64) };
-                let (prop_id, connector_id) = unsafe {
-                    (
-                        *(data.wrapping_add(8) as *const u32),
-                        *(data.wrapping_add(12) as *const u32),
-                    )
-                };
-                log::debug!(
-                    "[drm] SETPROPERTY connector={} prop={} val={} (accepted, no-op)",
-                    connector_id,
-                    prop_id,
-                    value
-                );
-                Ok(0)
-            }
-            DRM_IOCTL_MODE_CURSOR | DRM_IOCTL_MODE_CURSOR2 => {
-                // Kernel-composited hardware cursor. wlroots is forced onto the
-                // legacy KMS path (atomic is rejected), so it drives the pointer
-                // with these ioctls; `scanout()` draws the bitmap over each
-                // frame. The `drm_mode_cursor2` layout begins with the same 28
-                // bytes as `drm_mode_cursor` (flags, crtc_id, x, y, width,
-                // height, handle) and only appends hot_x/hot_y — which we don't
-                // need for drawing, since the compositor pre-adjusts x/y for the
-                // hotspot — so one 28-byte view serves both ioctls.
-                #[repr(C)]
-                struct DrmModeCursor {
-                    flags: u32,
-                    crtc_id: u32,
-                    x: i32,
-                    y: i32,
-                    width: u32,
-                    height: u32,
-                    handle: u32,
-                }
-                const DRM_MODE_CURSOR_BO: u32 = 0x01;
-                const DRM_MODE_CURSOR_MOVE: u32 = 0x02;
-                let cur = unsafe { &*(data as *const DrmModeCursor) };
-                let mut changed = false;
-                if cur.flags & DRM_MODE_CURSOR_BO != 0 {
-                    // Linux: a cursor larger than DRM_CAP_CURSOR_WIDTH/HEIGHT
-                    // is EINVAL. Nothing else bounds the bitmap the kernel
-                    // copies and composites on every frame.
-                    if cur.handle != 0
-                        && (cur.width > drm::MAX_CURSOR_DIM || cur.height > drm::MAX_CURSOR_DIM)
-                    {
-                        return Err(FsError::InvalidParam);
-                    }
-                    changed |= drm::set_cursor_bo(cur.handle, cur.width, cur.height);
-                }
-                if cur.flags & DRM_MODE_CURSOR_MOVE != 0 {
-                    drm::move_cursor(cur.x, cur.y);
-                    changed = true;
-                }
-                if changed {
-                    drm::repaint_for_cursor();
-                }
-                Ok(0)
-            }
-            DRM_IOCTL_GEM_CLOSE => {
-                let handle = unsafe { *(data as *const u32) };
-                // linux-object's own CREATE_DUMB/PRIME table first; a miss
-                // there might still be a driver-private handle (e.g.
-                // nouveau-uAPI GEM_NEW) the driver itself keeps track of.
-                // A nouveau GEM object's memory goes back to the RM inside
-                // `nouveau_gem_close`, and nothing here holds a reference to
-                // it, so any framebuffer still built on it has to be retired in
-                // the same breath -- otherwise `crtc_fb` keeps pointing at
-                // memory that now belongs to someone else. Dumb buffers are
-                // deliberately NOT retired: their fb holds an `Arc` on the VMO
-                // and outlives the handle, exactly as Linux does.
-                let generic_closed = drm::gem_close(handle);
-                let driver_closed = !generic_closed
-                    && self
-                        .driver()
-                        .map(|d| d.nouveau_gem_close(handle, drm::current_pid()))
-                        .unwrap_or(false);
-                if driver_closed {
-                    drm::retire_framebuffers_for_handle(handle);
-                }
-                if generic_closed || driver_closed {
-                    // Drop the shared CPU-map cache entry; any live mmap Arc
-                    // keeps its pin until munmap/Drop.
-                    drm::nouveau_cpu_vmo_forget(handle);
-                    Ok(0)
-                } else {
-                    Err(FsError::InvalidParam)
-                }
-            }
-            DRM_IOCTL_MODE_GETRESOURCES => {
-                let res = unsafe { &mut *(data as *mut DrmModeCardRes) };
-                if drm::is_compute_minor(self.minor) {
-                    // Headless compute node: not a KMS card. drmIsKMS sees
-                    // zero CRTCs/connectors and leaves this node alone, so
-                    // labwc stays on card0 even without WLR_DRM_DEVICES.
-                    res.count_fbs = 0;
-                    res.count_crtcs = 0;
-                    res.count_connectors = 0;
-                    res.count_encoders = 0;
-                    return Ok(0);
-                }
-                let (fbs, crtcs, connectors) = drm::get_resources();
-
-                if res.fb_id_ptr != 0 && res.count_fbs >= fbs.len() as u32 {
-                    ucheck_n::<u32>(res.fb_id_ptr as usize, fbs.len())?;
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            fbs.as_ptr(),
-                            res.fb_id_ptr as *mut u32,
-                            fbs.len(),
-                        );
-                    }
-                }
-                if res.crtc_id_ptr != 0 && res.count_crtcs >= crtcs.len() as u32 {
-                    ucheck_n::<u32>(res.crtc_id_ptr as usize, crtcs.len())?;
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            crtcs.as_ptr(),
-                            res.crtc_id_ptr as *mut u32,
-                            crtcs.len(),
-                        );
-                    }
-                }
-                if res.connector_id_ptr != 0 && res.count_connectors >= connectors.len() as u32 {
-                    ucheck_n::<u32>(res.connector_id_ptr as usize, connectors.len())?;
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            connectors.as_ptr(),
-                            res.connector_id_ptr as *mut u32,
-                            connectors.len(),
-                        );
-                    }
-                }
-
-                res.count_fbs = fbs.len() as u32;
-                res.count_crtcs = crtcs.len() as u32;
-                res.count_connectors = connectors.len() as u32;
-
-                // Always expose the synthetic encoder when connectors exist so
-                // that `drmIsKMS` (which checks count_crtcs > 0 &&
-                // count_connectors > 0 && count_encoders > 0) succeeds.  The
-                // synthetic encoder is valid for both the software KMS path and
-                // the hardware KMS path: `possible_crtcs = 1` maps to index 0
-                // of the CRTC list, which is SYNTH_CRTC_ID on the software path
-                // and the hardware CRTC on the hardware path.
-                if !connectors.is_empty() {
-                    if res.encoder_id_ptr != 0 && res.count_encoders >= 1 {
-                        ucheck_n::<u32>(res.encoder_id_ptr as usize, 1)?;
-                        unsafe {
-                            *(res.encoder_id_ptr as *mut u32) = drm::SYNTH_ENCODER_ID;
-                        }
-                    }
-                    res.count_encoders = 1;
-                } else {
-                    res.count_encoders = 0;
-                }
-
-                if let Some(caps) = drm::get_caps() {
-                    res.max_width = caps.max_width;
-                    res.max_height = caps.max_height;
-                }
-                Ok(0)
-            }
-            DRM_IOCTL_MODE_GETCONNECTOR => {
-                let conn_res = unsafe { &mut *(data as *mut DrmModeGetConnector) };
-                if let Some(conn) = drm::get_connector(conn_res.connector_id) {
-                    conn_res.connection = if conn.connected { 1 } else { 2 };
-                    // Physical dimensions, best source first:
-                    //  1. the connector's own values (NVIDIA RM data);
-                    //  2. the display's EDID — the preferred detailed timing
-                    //     carries the image size in mm (bytes 66/67/68 of the
-                    //     descriptor), and bytes 21/22 give cm as a coarser
-                    //     fallback (observed: a 32" TV reported as 270x203mm by
-                    //     the old 96-DPI guess vs its real 885x497mm, skewing
-                    //     every DPI-aware client);
-                    //  3. a ~96 DPI guess from the resolution, so wlroots never
-                    //     sees "Physical size: 0x0".
-                    let edid_mm = drm::get_connector_edid(conn_res.connector_id).and_then(|e| {
-                        let d = &e[54..72];
-                        let pixel_clock = u16::from_le_bytes([d[0], d[1]]);
-                        if pixel_clock != 0 {
-                            let w = d[12] as u32 | ((d[14] as u32 & 0xF0) << 4);
-                            let h = d[13] as u32 | ((d[14] as u32 & 0x0F) << 8);
-                            if (10..=2000).contains(&w) && (10..=2000).contains(&h) {
-                                return Some((w, h));
-                            }
-                        }
-                        // Coarse: max image size in cm (0 = unspecified).
-                        let (w_cm, h_cm) = (e[21] as u32, e[22] as u32);
-                        if w_cm > 0 && h_cm > 0 {
-                            Some((w_cm * 10, h_cm * 10))
-                        } else {
-                            None
-                        }
-                    });
-                    let (fallback_w, fallback_h) = edid_mm.unwrap_or_else(|| {
-                        drm::display_mode()
-                            .map(|(w, h, _)| {
-                                // Assume ~96 DPI (1 in = 25.4 mm, 96 px/in).
-                                ((w * 254 / 960).max(1), (h * 254 / 960).max(1))
-                            })
-                            .unwrap_or((1, 1))
-                    });
-                    conn_res.mm_width = if conn.mm_width > 0 {
-                        conn.mm_width
-                    } else {
-                        fallback_w
-                    };
-                    conn_res.mm_height = if conn.mm_height > 0 {
-                        conn.mm_height
-                    } else {
-                        fallback_h
-                    };
-                    // Real DRM_MODE_CONNECTOR_* from the driver (NVIDIA fills
-                    // it from the RM's GET_CONNECTOR_DATA); synthetic and
-                    // fallback connectors keep the historical 11.
-                    conn_res.connector_type = conn.connector_type;
-                    conn_res.connector_type_id = 1;
-                    conn_res.encoder_id = drm::SYNTH_ENCODER_ID;
-                    conn_res.subpixel = 0; // SubPixelUnknown
-
-                    // Report exactly one encoder. wlroots calls this twice: once
-                    // to learn the counts, then again with allocated arrays.
-                    if conn_res.encoders_ptr != 0 && conn_res.count_encoders >= 1 {
-                        ucheck_n::<u32>(conn_res.encoders_ptr as usize, 1)?;
-                        unsafe {
-                            *(conn_res.encoders_ptr as *mut u32) = drm::SYNTH_ENCODER_ID;
-                        }
-                    }
-                    conn_res.count_encoders = 1;
-
-                    // Report exactly one mode: the display's native resolution.
-                    if let Some((w, h, _)) = drm::display_mode() {
-                        if conn_res.modes_ptr != 0 && conn_res.count_modes >= 1 {
-                            let mode = make_modeinfo(w, h);
-                            ucheck(conn_res.modes_ptr as usize, mode.len())?;
-                            unsafe {
-                                core::ptr::copy_nonoverlapping(
-                                    mode.as_ptr(),
-                                    conn_res.modes_ptr as *mut u8,
-                                    mode.len(),
-                                );
-                            }
-                        }
-                        conn_res.count_modes = 1;
-                    } else {
-                        conn_res.count_modes = 0;
-                    }
-                    // Standard connector properties (DPMS, link-status,
-                    // non-desktop, EDID, and CRTC_ID for atomic clients), via
-                    // the usual two-call count/fill pattern.
-                    let props = connector_props(conn_res.connector_id, self.file.atomic_client());
-                    if !props.is_empty()
-                        && conn_res.props_ptr != 0
-                        && conn_res.prop_values_ptr != 0
-                        && conn_res.count_props >= props.len() as u32
-                    {
-                        ucheck_n::<u32>(conn_res.props_ptr as usize, props.len())?;
-                        ucheck_n::<u64>(conn_res.prop_values_ptr as usize, props.len())?;
-                        for (i, (pid, val)) in props.iter().enumerate() {
-                            unsafe {
-                                *(conn_res.props_ptr as *mut u32).add(i) = *pid;
-                                *(conn_res.prop_values_ptr as *mut u64).add(i) = *val;
-                            }
-                        }
-                    }
-                    conn_res.count_props = props.len() as u32;
-                    // klog (budget-shared with the wsi trace) so a black-screen
-                    // bring-up shows, under LOG=error, whether the compositor
-                    // saw a CONNECTED output with a usable mode: connected=false
-                    // or modes=0 makes wlroots skip the output and never present.
-                    if wsi_trace_take() {
-                        kernel_hal::klog_info!(
-                            "[drm] GETCONNECTOR id={} connected={} modes={} mode={:?}",
-                            conn_res.connector_id,
-                            conn.connected,
-                            conn_res.count_modes,
-                            drm::display_mode()
-                        );
-                    }
-                    Ok(0)
-                } else {
-                    // klog: this refusal makes Mesa's wsi_display bail the whole
-                    // VK_KHR_display query with OUT_OF_HOST_MEMORY -- it must be
-                    // visible under LOG=error. Same per-boot budget as the call
-                    // trace: a retry loop on a refused id must not storm klog.
-                    if wsi_trace_take() {
-                        kernel_hal::klog_info!(
-                            "[drm-wsi] GETCONNECTOR id={} -> NOT FOUND (EINVAL)",
-                            conn_res.connector_id
-                        );
-                    }
-                    Err(FsError::InvalidParam)
-                }
-            }
-            DRM_IOCTL_MODE_GETENCODER => {
-                let enc = unsafe { &mut *(data as *mut DrmModeGetEncoder) };
-                enc.encoder_id = drm::SYNTH_ENCODER_ID;
-                // DRM_MODE_ENCODER_VIRTUAL=6: correct type for a software/
-                // virtual encoder that drives a dumb-buffer scanout path.
-                // Reporting NONE(0) causes some compositors to skip property
-                // queries and misidentify the output type.
-                enc.encoder_type = 6; // DRM_MODE_ENCODER_VIRTUAL
-                                      // On the software KMS path the only CRTC is the synthetic one
-                                      // (id=1). On the hardware KMS path, report crtc_id=0 (no
-                                      // currently active CRTC) because CRTC 1 does not appear in the
-                                      // resource list that hardware drivers expose; wlroots will
-                                      // configure the CRTC itself via SETCRTC.
-                                      // possible_crtcs=1 means bit 0 = index 0 of the CRTC list,
-                                      // which is correct in both paths.
-                enc.crtc_id = if drm::software_kms_active() {
-                    drm::SYNTH_CRTC_ID
-                } else {
-                    0
-                };
-                enc.possible_crtcs = 1; // bitmask: CRTC index 0
-                enc.possible_clones = 0;
-                Ok(0)
-            }
-            DRM_IOCTL_MODE_GETCRTC => {
-                let crtc_res = unsafe { &mut *(data as *mut DrmModeGetCrtc) };
-                if let Some(crtc) = drm::get_crtc(crtc_res.crtc_id) {
-                    crtc_res.fb_id = crtc.fb_id;
-                    crtc_res.x = crtc.x;
-                    crtc_res.y = crtc.y;
-                    crtc_res.gamma_size = 0;
-                    // Report the current mode: the display's native timings
-                    // (the only mode the pipeline has). Linux fills this from
-                    // crtc->state; compositors read it back to seed their
-                    // initial output state.
-                    if let Some((w, h, _)) = drm::display_mode() {
-                        crtc_res.mode = make_modeinfo(w, h);
-                        crtc_res.mode_valid = 1;
-                    } else {
-                        crtc_res.mode_valid = 0;
-                    }
-                    Ok(0)
-                } else {
-                    if wsi_trace_take() {
-                        kernel_hal::klog_info!(
-                            "[drm-wsi] GETCRTC id={} -> NOT FOUND (EINVAL)",
-                            crtc_res.crtc_id
-                        );
-                    }
-                    Err(FsError::InvalidParam)
-                }
-            }
-            DRM_IOCTL_MODE_GETPLANERESOURCES => {
-                let res = unsafe { &mut *(data as *mut DrmModeGetPlaneRes) };
-                let planes = drm::get_planes();
-                if res.plane_id_ptr != 0 && res.count_planes >= planes.len() as u32 {
-                    ucheck_n::<u32>(res.plane_id_ptr as usize, planes.len())?;
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            planes.as_ptr(),
-                            res.plane_id_ptr as *mut u32,
-                            planes.len(),
-                        );
-                    }
-                }
-                res.count_planes = planes.len() as u32;
-                Ok(0)
-            }
-            DRM_IOCTL_MODE_GETPLANE => {
-                let res = unsafe { &mut *(data as *mut DrmModeGetPlane) };
-                if let Some(plane) = drm::get_plane(res.plane_id) {
-                    res.crtc_id = plane.crtc_id;
-                    res.fb_id = plane.fb_id;
-                    res.possible_crtcs = plane.possible_crtcs;
-                    // Advertise the formats the software scanout consumes, via
-                    // the two-call pattern (count first, then fill).
-                    const FORMATS: [u32; 2] = [
-                        0x3432_5258, // DRM_FORMAT_XRGB8888 ("XR24")
-                        0x3432_5241, // DRM_FORMAT_ARGB8888 ("AR24")
-                    ];
-                    if res.format_type_ptr != 0 && res.count_format_types >= FORMATS.len() as u32 {
-                        ucheck_n::<u32>(res.format_type_ptr as usize, FORMATS.len())?;
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                FORMATS.as_ptr(),
-                                res.format_type_ptr as *mut u32,
-                                FORMATS.len(),
-                            );
-                        }
-                    }
-                    res.count_format_types = FORMATS.len() as u32;
-                    Ok(0)
-                } else {
-                    if wsi_trace_take() {
-                        kernel_hal::klog_info!(
-                            "[drm-wsi] GETPLANE id={} -> NOT FOUND (EINVAL)",
-                            res.plane_id
-                        );
-                    }
-                    Err(FsError::InvalidParam)
-                }
-            }
-            DRM_IOCTL_MODE_OBJ_GETPROPERTIES => {
-                let res = unsafe { &mut *(data as *mut DrmModeObjGetProperties) };
-                // Identify the object by id (libdrm often passes obj_type=ANY).
-                // Look up any registered plane — not only SYNTH_PLANE_ID — so
-                // hardware planes (e.g. NVIDIA 3001, VirtIO 3000) are also
-                // classified as PRIMARY/OVERLAY/CURSOR by wlroots. Atomic
-                // properties (FB_ID, CRTC_ID, ACTIVE, MODE_ID, rects) only
-                // appear for atomic clients, like Linux's atomic filtering;
-                // legacy clients keep seeing exactly the pre-atomic set.
-                let atomic = self.file.atomic_client();
-                let props: alloc::vec::Vec<(u32, u64)> = if let Some(p) = drm::get_plane(res.obj_id)
-                {
-                    plane_props(&p, atomic)
-                } else if drm::get_crtc(res.obj_id).is_some() {
-                    crtc_props(atomic)
-                } else if drm::get_connector(res.obj_id).is_some() {
-                    connector_props(res.obj_id, atomic)
-                } else {
-                    // Encoders exist but carry no properties; anything
-                    // else is unknown. Keep the historical empty-list
-                    // answer (Linux: EINVAL/ENOENT) — some clients probe
-                    // every id returned by GETRESOURCES.
-                    alloc::vec::Vec::new()
-                };
-                let n = props.len();
-                // Both output arrays are written below, so both pointers must be
-                // non-null: a client passing props_ptr set but prop_values_ptr=0
-                // would otherwise trigger a kernel write to address 0.
-                if n > 0
-                    && res.props_ptr != 0
-                    && res.prop_values_ptr != 0
-                    && (res.count_props as usize) >= n
-                {
-                    ucheck_n::<u32>(res.props_ptr as usize, n)?;
-                    ucheck_n::<u64>(res.prop_values_ptr as usize, n)?;
-                    for (i, (pid, val)) in props.iter().enumerate() {
-                        unsafe {
-                            *(res.props_ptr as *mut u32).add(i) = *pid;
-                            *(res.prop_values_ptr as *mut u64).add(i) = *val;
-                        }
-                    }
-                }
-                res.count_props = n as u32;
-                log::debug!(
-                    "[drm] OBJ_GETPROPERTIES obj_id={} obj_type={:#x} -> {} props",
-                    res.obj_id,
-                    res.obj_type,
-                    n
-                );
-                Ok(0)
-            }
-            DRM_IOCTL_MODE_GETPROPERTY => {
-                let res = unsafe { &mut *(data as *mut DrmModeGetProperty) };
-                let spec = match prop_spec(res.prop_id) {
-                    Some(s) => s,
-                    None => return Err(FsError::EntryNotFound),
-                };
-                res.flags = spec.flags;
-                let mut name = [0u8; 32];
-                let n = spec.name.len().min(31);
-                name[..n].copy_from_slice(&spec.name.as_bytes()[..n]);
-                res.name = name;
-                // Two-call pattern: report counts, fill when arrays are big
-                // enough. Enum properties expose both the (value, name) pairs
-                // and the raw value list; range/object properties only values.
-                if !spec.enums.is_empty()
-                    && res.enum_blob_ptr != 0
-                    && (res.count_enum_blobs as usize) >= spec.enums.len()
-                {
-                    for (i, (val, nm)) in spec.enums.iter().enumerate() {
-                        let mut e = DrmModePropertyEnum {
-                            value: *val,
-                            name: [0u8; 32],
-                        };
-                        let ln = nm.len().min(31);
-                        e.name[..ln].copy_from_slice(&nm.as_bytes()[..ln]);
-                        unsafe {
-                            *(res.enum_blob_ptr as *mut DrmModePropertyEnum).add(i) = e;
-                        }
-                    }
-                }
-                res.count_enum_blobs = spec.enums.len() as u32;
-                if !spec.values.is_empty()
-                    && res.values_ptr != 0
-                    && (res.count_values as usize) >= spec.values.len()
-                {
-                    for (i, v) in spec.values.iter().enumerate() {
-                        unsafe {
-                            *(res.values_ptr as *mut u64).add(i) = *v;
-                        }
-                    }
-                }
-                res.count_values = spec.values.len() as u32;
-                Ok(0)
-            }
-            DRM_IOCTL_MODE_GETPROPBLOB => {
-                let res = unsafe { &mut *(data as *mut DrmModeGetBlob) };
-                // Property-blob store first (user MODE_ID blobs, the kernel's
-                // current-mode blob); EDID blobs keep their reserved
-                // 20000+connector ids.
-                if let Some(blob) = drm::get_blob(res.blob_id) {
-                    if res.data != 0 && res.length >= blob.len() as u32 {
-                        ucheck(res.data as usize, blob.len())?;
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                blob.as_ptr(),
-                                res.data as *mut u8,
-                                blob.len(),
-                            );
-                        }
-                    }
-                    res.length = blob.len() as u32;
-                    return Ok(0);
-                }
-                let connector_id = res.blob_id.checked_sub(20000);
-                if let Some(conn_id) = connector_id {
-                    if let Some(edid) = drm::get_connector_edid(conn_id) {
-                        if res.data != 0 && res.length >= edid.len() as u32 {
-                            ucheck(res.data as usize, edid.len())?;
-                            unsafe {
-                                core::ptr::copy_nonoverlapping(
-                                    edid.as_ptr(),
-                                    res.data as *mut u8,
-                                    edid.len(),
-                                );
-                            }
-                        }
-                        res.length = edid.len() as u32;
-                        Ok(0)
-                    } else {
-                        Err(FsError::InvalidParam)
-                    }
-                } else {
-                    Err(FsError::InvalidParam)
-                }
-            }
-            DRM_IOCTL_MODE_CREATEPROPBLOB => {
-                let req = unsafe { &mut *(data as *mut DrmModeCreateBlob) };
-                // Linux: NULL data / zero length are EINVAL. Bound the copy —
-                // real blobs (modes, gamma LUTs) are at most a few KiB.
-                if req.data == 0 || req.length == 0 || req.length > 64 * 1024 {
-                    return Err(FsError::InvalidParam);
-                }
-                ucheck(req.data as usize, req.length as usize)?;
-                let src = unsafe {
-                    core::slice::from_raw_parts(req.data as *const u8, req.length as usize)
-                };
-                req.blob_id = drm::create_blob(src.to_vec(), true);
-                log::debug!(
-                    "[drm] CREATEPROPBLOB len={} -> blob={}",
-                    req.length,
-                    req.blob_id
-                );
-                Ok(0)
-            }
-            DRM_IOCTL_MODE_DESTROYPROPBLOB => {
-                // struct drm_mode_destroy_blob { __u32 blob_id; }
-                let blob_id = unsafe { *(data as *const u32) };
-                match drm::destroy_blob(blob_id) {
-                    drm::BlobDestroy::Destroyed => Ok(0),
-                    drm::BlobDestroy::NotFound => Err(FsError::EntryNotFound),
-                    // Linux: only the creator may destroy a blob -> EPERM-ish.
-                    drm::BlobDestroy::KernelOwned => Err(FsError::NoPermission),
-                }
-            }
-            DRM_IOCTL_MODE_ATOMIC => {
-                let req = unsafe { &*(data as *const DrmModeAtomic) };
-                // Linux contract: the client must have negotiated
-                // DRM_CLIENT_CAP_ATOMIC (EINVAL otherwise), flags must be
-                // known, reserved must be 0, TEST_ONLY cannot carry a flip
-                // event, and async flips are refused when unsupported.
-                if !self.file.atomic_client() {
-                    return Err(FsError::InvalidParam);
-                }
-                if req.flags & !DRM_MODE_ATOMIC_FLAGS != 0 || req.reserved != 0 {
-                    return Err(FsError::InvalidParam);
-                }
-                if req.flags & DRM_MODE_PAGE_FLIP_ASYNC != 0 {
-                    // DRM_CAP_ASYNC_PAGE_FLIP / ATOMIC_ASYNC_PAGE_FLIP are 0.
-                    return Err(FsError::InvalidParam);
-                }
-                let test_only = req.flags & DRM_MODE_ATOMIC_TEST_ONLY != 0;
-                let want_event = req.flags & DRM_MODE_PAGE_FLIP_EVENT != 0;
-                let allow_modeset = req.flags & DRM_MODE_ATOMIC_ALLOW_MODESET != 0;
-                if test_only && want_event {
-                    return Err(FsError::InvalidParam);
-                }
-                if req.count_objs == 0 {
-                    // Empty commit: no objects, no events (Linux allows it).
-                    return Ok(0);
-                }
-                // The pipeline has 3 objects x <=16 properties; bound the
-                // user-array walk well above that.
-                if req.count_objs > 64 || req.objs_ptr == 0 || req.count_props_ptr == 0 {
-                    return Err(FsError::InvalidParam);
-                }
-                ucheck_n::<u32>(req.objs_ptr as usize, req.count_objs as usize)?;
-                ucheck_n::<u32>(req.count_props_ptr as usize, req.count_objs as usize)?;
-                let mut upd = drm::AtomicUpdate::default();
-                let mut prop_idx = 0usize;
-                for i in 0..req.count_objs as usize {
-                    let obj_id = unsafe { *(req.objs_ptr as *const u32).add(i) };
-                    let count_props = unsafe { *(req.count_props_ptr as *const u32).add(i) };
-                    if count_props > 64 {
-                        return Err(FsError::InvalidParam);
-                    }
-                    if count_props > 0 && (req.props_ptr == 0 || req.prop_values_ptr == 0) {
-                        return Err(FsError::InvalidParam);
-                    }
-                    // The property arrays are shared across objects and indexed
-                    // by the running `prop_idx`; check the span this object
-                    // will consume before touching it.
-                    let span = prop_idx + count_props as usize;
-                    ucheck_n::<u32>(req.props_ptr as usize, span)?;
-                    ucheck_n::<u64>(req.prop_values_ptr as usize, span)?;
-                    for _ in 0..count_props {
-                        let prop_id = unsafe { *(req.props_ptr as *const u32).add(prop_idx) };
-                        let value = unsafe { *(req.prop_values_ptr as *const u64).add(prop_idx) };
-                        prop_idx += 1;
-                        // [swapchain-diag] error!-visible at LOG=error: a wlroots
-                        // "Swapchain failed test" can be an unknown/immutable prop
-                        // rejected here, not just an atomic_commit check.
-                        if let Err(e) = atomic_stage(&mut upd, obj_id, prop_id, value) {
-                            log::error!(
-                                "[drm] ATOMIC stage rejected: obj={:#x} prop={:#x} value={:#x} -> {:?}",
-                                obj_id, prop_id, value, e
-                            );
-                            return Err(e);
-                        }
-                    }
-                }
-                log::debug!(
-                    "[drm] ATOMIC objs={} test_only={} allow_modeset={} event={} fb={:?} mode_blob={:?} active={:?}",
-                    req.count_objs,
-                    test_only,
-                    allow_modeset,
-                    want_event,
-                    upd.plane_fb_id,
-                    upd.mode_blob,
-                    upd.active
-                );
-                let commit = drm::atomic_commit(
-                    &upd,
-                    test_only,
-                    allow_modeset,
-                    want_event,
-                    req.user_data,
-                    &self.file,
-                );
-                // OUT_FENCE_PTR writeback: Linux writes -1 on TEST_ONLY/failure
-                // and a sync_file fd on success. Real out-fences need HW flip
-                // completion; we install a signaled stub when possible.
-                if let Some(ptr) = upd.out_fence_ptr {
-                    if commit.is_err() || test_only {
-                        let _ = write_out_fence_ptr(ptr, true);
-                    } else {
-                        write_out_fence_ptr(ptr, false)?;
-                    }
-                }
-                commit.map_err(|e| match e {
-                    drm::AtomicError::Invalid => FsError::InvalidParam,
-                    drm::AtomicError::NotFound => FsError::EntryNotFound,
-                    drm::AtomicError::Device => FsError::DeviceError,
-                    drm::AtomicError::Busy => FsError::Busy,
-                })?;
-                Ok(0)
-            }
-            DRM_IOCTL_SYNCOBJ_CREATE => {
-                if !zcore_drivers::display::nouveau_uapi_enabled() {
-                    return Err(FsError::OpNotSupported);
-                }
-                let req = unsafe { &mut *(data as *mut DrmSyncobjCreate) };
-                let handle = zcore_drivers::scheme::syncobj::create(
-                    req.flags & DRM_SYNCOBJ_CREATE_SIGNALED != 0,
-                );
-                req.handle = handle;
-                // Bounded probe (first N this boot), VISIBLE on hardware. Answers
-                // the one thing the "failed to create timeline semaphore" spam
-                // cannot: does NVK actually reach the kernel to create the syncobj
-                // a timeline VkSemaphore is backed by? The create itself always
-                // succeeds here, so a `SYNCOBJ_CREATE` line right before zink's
-                // error proves the failure is DOWNSTREAM of the syncobj (NVK
-                // internal / device already wedged), not in it. NO line before the
-                // error means NVK never got here — it bailed in userspace (cf. the
-                // GET_CAP probe above). And the pid + climbing count is the
-                // accumulation signature if compositor respawns are leaking.
-                {
-                    static CREATE_LOG_BUDGET: core::sync::atomic::AtomicU32 =
-                        core::sync::atomic::AtomicU32::new(0);
-                    let n = CREATE_LOG_BUDGET.fetch_add(1, Ordering::Relaxed);
-                    if n < 16 {
-                        kernel_hal::klog_info!(
-                            "[drm] SYNCOBJ_CREATE #{} pid={} -> handle={} flags={:#x}",
-                            n + 1,
-                            drm::current_pid(),
-                            handle,
-                            req.flags
-                        );
-                    }
-                }
-                Ok(0)
-            }
-
-            DRM_IOCTL_SYNCOBJ_DESTROY => {
-                if !zcore_drivers::display::nouveau_uapi_enabled() {
-                    return Err(FsError::OpNotSupported);
-                }
-                let req = unsafe { &*(data as *const DrmSyncobjDestroy) };
-                if zcore_drivers::scheme::syncobj::destroy(req.handle) {
-                    Ok(0)
-                } else {
-                    Err(FsError::EntryNotFound)
-                }
-            }
-
-            DRM_IOCTL_SYNCOBJ_RESET | DRM_IOCTL_SYNCOBJ_SIGNAL => {
-                if !zcore_drivers::display::nouveau_uapi_enabled() {
-                    return Err(FsError::OpNotSupported);
-                }
-                let req = unsafe { &*(data as *const DrmSyncobjArray) };
-                const MAX_HANDLES: u32 = 64;
-                if req.count_handles == 0 || req.count_handles > MAX_HANDLES || req.handles == 0 {
-                    return Err(FsError::InvalidParam);
-                }
-                ucheck_n::<u32>(req.handles as usize, req.count_handles as usize)?;
-                let apply = if cmd == DRM_IOCTL_SYNCOBJ_RESET {
-                    zcore_drivers::scheme::syncobj::reset
-                } else {
-                    zcore_drivers::scheme::syncobj::signal
-                };
-                for i in 0..req.count_handles {
-                    let handle = unsafe { *(req.handles as *const u32).add(i as usize) };
-                    if !apply(handle) {
-                        return Err(FsError::EntryNotFound);
-                    }
-                }
-                let h0 = unsafe { *(req.handles as *const u32) };
-                trace_syncobj(
-                    if cmd == DRM_IOCTL_SYNCOBJ_RESET {
-                        "RESET"
-                    } else {
-                        "SIGNAL"
-                    },
-                    drm::current_pid(),
-                    h0,
-                    0,
-                    "ok",
-                );
-                Ok(0)
-            }
-
-            DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL => {
-                if !zcore_drivers::display::nouveau_uapi_enabled() {
-                    return Err(FsError::OpNotSupported);
-                }
-                let req = unsafe { &*(data as *const DrmSyncobjTimelineArray) };
-                const MAX_HANDLES: u32 = 64;
-                if req.count_handles == 0
-                    || req.count_handles > MAX_HANDLES
-                    || req.handles == 0
-                    || req.points == 0
-                {
-                    return Err(FsError::InvalidParam);
-                }
-                ucheck_n::<u32>(req.handles as usize, req.count_handles as usize)?;
-                ucheck_n::<u64>(req.points as usize, req.count_handles as usize)?;
-                for i in 0..req.count_handles as usize {
-                    let handle = unsafe { *(req.handles as *const u32).add(i) };
-                    let point = unsafe { *(req.points as *const u64).add(i) };
-                    if !zcore_drivers::scheme::syncobj::timeline_signal(handle, point) {
-                        return Err(FsError::EntryNotFound);
-                    }
-                }
-                let (h0, p0) =
-                    unsafe { (*(req.handles as *const u32), *(req.points as *const u64)) };
-                trace_syncobj("TIMELINE_SIGNAL", drm::current_pid(), h0, p0, "ok");
-                Ok(0)
-            }
-
-            DRM_IOCTL_SYNCOBJ_TRANSFER => {
-                if !zcore_drivers::display::nouveau_uapi_enabled() {
-                    return Err(FsError::OpNotSupported);
-                }
-                let req = unsafe { &*(data as *const DrmSyncobjTransfer) };
-                let ok = zcore_drivers::scheme::syncobj::transfer(
-                    req.dst_handle,
-                    req.dst_point,
-                    req.src_handle,
-                    req.src_point,
-                );
-                trace_syncobj(
-                    "TRANSFER",
-                    drm::current_pid(),
-                    req.dst_handle,
-                    req.dst_point,
-                    if ok { "ok" } else { "ENOENT" },
-                );
-                if ok {
-                    Ok(0)
-                } else {
-                    Err(FsError::EntryNotFound)
-                }
-            }
-
-            DRM_IOCTL_SYNCOBJ_QUERY => {
-                if !zcore_drivers::display::nouveau_uapi_enabled() {
-                    return Err(FsError::OpNotSupported);
-                }
-                let req = unsafe { &*(data as *const DrmSyncobjTimelineArray) };
-                const MAX_HANDLES: u32 = 64;
-                if req.count_handles == 0
-                    || req.count_handles > MAX_HANDLES
-                    || req.handles == 0
-                    || req.points == 0
-                {
-                    return Err(FsError::InvalidParam);
-                }
-                let last_submitted = req.flags & DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED != 0;
-                // LAST_SUBMITTED must include in-flight EXEC fences: the fast
-                // path returns before the GPU writes the landing zone, and NVK
-                // uses this query as the timeline value of that submit. Treating
-                // it as a no-op left the timeline at the previous signaled
-                // point — Mesa then walked `supported_sync_types` off the NULL
-                // terminator (`libvulkan_nouveau.so+0x9cc48`).
-                ucheck_n::<u32>(req.handles as usize, req.count_handles as usize)?;
-                ucheck_n::<u64>(req.points as usize, req.count_handles as usize)?;
-                let mut first_pt = 0u64;
-                for i in 0..req.count_handles as usize {
-                    let handle = unsafe { *(req.handles as *const u32).add(i) };
-                    let looked_up = if last_submitted {
-                        zcore_drivers::scheme::syncobj::query_submitted(handle)
-                    } else {
-                        zcore_drivers::scheme::syncobj::query(handle)
-                    };
-                    let Some(point) = looked_up else {
-                        return Err(FsError::EntryNotFound);
-                    };
-                    if i == 0 {
-                        first_pt = point;
-                    }
-                    unsafe { *(req.points as *mut u64).add(i) = point };
-                }
-                let h0 = unsafe { *(req.handles as *const u32) };
-                trace_syncobj(
-                    if last_submitted {
-                        "QUERY_LAST_SUBMITTED"
-                    } else {
-                        "QUERY"
-                    },
-                    drm::current_pid(),
-                    h0,
-                    first_pt,
-                    "ok",
-                );
-                Ok(0)
-            }
-
-            DRM_IOCTL_SYNCOBJ_WAIT
-            | DRM_IOCTL_SYNCOBJ_WAIT_DEADLINE
-            | DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT
-            | DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DEADLINE => {
-                if !zcore_drivers::display::nouveau_uapi_enabled() {
-                    return Err(FsError::OpNotSupported);
-                }
-                let timeline = cmd == DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT
-                    || cmd == DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DEADLINE;
-                // Both structs share this prefix layout, so a single path
-                // can read the common fields regardless of which ioctl.
-                let (handles_ptr, points_ptr, timeout_nsec, count_handles, flags) = if timeline {
-                    let req = unsafe { &*(data as *const DrmSyncobjTimelineWait) };
-                    (
-                        req.handles,
-                        req.points,
-                        req.timeout_nsec,
-                        req.count_handles,
-                        req.flags,
-                    )
-                } else {
-                    let req = unsafe { &*(data as *const DrmSyncobjWait) };
-                    (
-                        req.handles,
-                        0,
-                        req.timeout_nsec,
-                        req.count_handles,
-                        req.flags,
-                    )
-                };
-                const MAX_HANDLES: u32 = 64;
-                if count_handles == 0 || count_handles > MAX_HANDLES || handles_ptr == 0 {
-                    return Err(FsError::InvalidParam);
-                }
-                ucheck_n::<u32>(handles_ptr as usize, count_handles as usize)?;
-                if timeline && points_ptr != 0 {
-                    ucheck_n::<u64>(points_ptr as usize, count_handles as usize)?;
-                }
-                let handles: alloc::vec::Vec<u32> = (0..count_handles as usize)
-                    .map(|i| unsafe { *(handles_ptr as *const u32).add(i) })
-                    .collect();
-                let points: Option<alloc::vec::Vec<u64>> = if timeline && points_ptr != 0 {
-                    Some(
-                        (0..count_handles as usize)
-                            .map(|i| unsafe { *(points_ptr as *const u64).add(i) })
-                            .collect(),
-                    )
-                } else {
-                    None
-                };
-                // `timeout_nsec` is an ABSOLUTE CLOCK_MONOTONIC deadline (real
-                // Linux semantics, confirmed against this kernel's own
-                // `now_monotonic()` -> `kernel_hal::timer::timer_now()`), not a
-                // relative duration -- treating it as relative would turn any
-                // real userspace deadline (computed from `clock_gettime`) into
-                // an effectively unbounded wait.
-                let deadline_us = (timeout_nsec.max(0) as u64) / 1000;
-                let wait_all = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL != 0;
-                let available_only = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE != 0;
-                trace_syncobj(
-                    if timeline { "TIMELINE_WAIT" } else { "WAIT" },
-                    drm::current_pid(),
-                    handles.first().copied().unwrap_or(0),
-                    points
-                        .as_ref()
-                        .and_then(|p| p.first().copied())
-                        .unwrap_or(0),
-                    &alloc::format!(
-                        "timeout_ns={} flags={:#x} available={}",
-                        timeout_nsec,
-                        flags,
-                        available_only
-                    ),
-                );
-                let wait_fn = if available_only {
-                    zcore_drivers::scheme::syncobj::wait_available
-                } else {
-                    zcore_drivers::scheme::syncobj::wait
-                };
-                match wait_fn(&handles, points.as_deref(), wait_all, deadline_us) {
-                    zcore_drivers::scheme::syncobj::WaitOutcome::Signaled {
-                        first_signaled_index,
-                    } => {
-                        if timeline {
-                            let req = unsafe { &mut *(data as *mut DrmSyncobjTimelineWait) };
-                            req.first_signaled = first_signaled_index;
-                        } else {
-                            let req = unsafe { &mut *(data as *mut DrmSyncobjWait) };
-                            req.first_signaled = first_signaled_index;
-                        }
-                        Ok(0)
-                    }
-                    // Real Linux returns -ETIME on a wait deadline, and Mesa
-                    // checks for it EXACTLY (`errno == ETIME` -> `VK_TIMEOUT`;
-                    // anything else -> lost device). Returning EAGAIN here (the
-                    // old behaviour) was doubly wrong: libdrm's drmIoctl()
-                    // retries EAGAIN, so a caller whose deadline already passed
-                    // spins this arm in a tight busy-loop instead of seeing a
-                    // timeout, and NVK never gets its VK_TIMEOUT. `FsError::TimedOut`
-                    // now maps to `LxError::ETIME` (62).
-                    zcore_drivers::scheme::syncobj::WaitOutcome::Timeout => {
-                        syncobj_wait_klog(timeline, &handles, "timeout (ETIME to caller)");
-                        Err(FsError::TimedOut)
-                    }
-                    zcore_drivers::scheme::syncobj::WaitOutcome::Invalid => {
-                        syncobj_wait_klog(timeline, &handles, "unknown handle (ENOENT to caller)");
-                        Err(FsError::EntryNotFound)
-                    }
-                }
-            }
-
-            _ => {
-                // Reverse-engineering hook: log every DRM ioctl wlroots/labwc
-                // issues that we do not handle. The DRM nr (`(cmd >> 8) & 0xff`)
-                // maps to a DRM_IOCTL_* command, so a photo of this line tells us
-                // exactly what labwc wants next. `dir` 1=W 2=R 3=RW, `size` is the
-                // arg struct length.
-                let nr = cmd & 0xff;
-                let size = (cmd >> 16) & 0x3fff;
-                let dir = cmd >> 30;
-                log::debug!(
-                    "[drm] UNHANDLED ioctl cmd={:#010x} (drm nr={:#04x} size={} dir={})",
-                    cmd,
-                    nr,
-                    size,
-                    dir
-                );
-                if let Some(driver) = self.driver() {
-                    driver
-                        .ioctl_owned(cmd, data, drm::current_pid())
-                        // Map the driver's errno through instead of folding it
-                        // all into DeviceError(EIO): mesa distinguishes them
-                        // (e.g. `nouveau_ws_context_killed` tests specifically
-                        // for -ENODEV), and a driver that carefully returns
-                        // ENODEV/EINVAL/EBUSY only for userspace to see EIO
-                        // makes every one of those messages a lie.
-                        .map_err(|e| match e {
-                            2 => FsError::EntryNotFound,  // ENOENT
-                            12 => FsError::NoDeviceSpace, // ENOMEM
-                            16 => FsError::Busy,          // EBUSY
-                            19 => FsError::NoDevice,      // ENODEV
-                            22 => FsError::InvalidParam,  // EINVAL
-                            38 => FsError::NotSupported,  // ENOSYS
-                            95 => FsError::NotSupported,  // EOPNOTSUPP
-                            _ => FsError::DeviceError,
-                        })
-                } else {
-                    Err(FsError::NotSupported)
-                }
-            }
-        }
+        drm_ioctl(self, cmd, data)
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -3779,5 +4169,220 @@ mod present_failure_policy_tests {
             traced, PRESENT_FAIL_TRACE_BUDGET,
             "the budget is spent exactly once, not per call",
         );
+    }
+}
+
+/// Linux dispatches a DRM ioctl on its NUMBER and reconciles the struct size
+/// afterwards (`drm_ioctl`/`drm_ioctl_kernel`). Matching the full 32-bit
+/// command instead turns every struct that ever grew a trailing field into an
+/// unknown ioctl, which is how this tree lost `SYNCOBJ_HANDLE_TO_FD` (24 B),
+/// the deadline sizes of `SYNCOBJ_WAIT`/`TIMELINE_WAIT`, and `PRIME_*` --
+/// each found only when a client broke on real hardware.
+#[cfg(test)]
+mod ioctl_size_reconciliation_tests {
+    use super::*;
+
+    /// Every canonical command must be reachable from its own NR. A typo in
+    /// the table (two NRs mapping to one command, or a command filed under the
+    /// wrong number) silently reroutes a client's ioctl to another handler,
+    /// which is worse than not handling it at all.
+    #[test]
+    fn every_canonical_command_round_trips_through_its_nr() {
+        const ALL: &[u32] = &[
+            DRM_IOCTL_VERSION,
+            DRM_IOCTL_GET_UNIQUE,
+            DRM_IOCTL_GET_MAGIC,
+            DRM_IOCTL_SET_VERSION,
+            DRM_IOCTL_GEM_CLOSE,
+            DRM_IOCTL_GET_CAP,
+            DRM_IOCTL_SET_CLIENT_CAP,
+            DRM_IOCTL_AUTH_MAGIC,
+            DRM_IOCTL_SET_MASTER,
+            DRM_IOCTL_DROP_MASTER,
+            DRM_IOCTL_WAIT_VBLANK,
+            DRM_IOCTL_MODE_GETRESOURCES,
+            DRM_IOCTL_MODE_GETCRTC,
+            DRM_IOCTL_MODE_SETCRTC,
+            DRM_IOCTL_MODE_CURSOR,
+            DRM_IOCTL_MODE_GETGAMMA,
+            DRM_IOCTL_MODE_SETGAMMA,
+            DRM_IOCTL_MODE_GETENCODER,
+            DRM_IOCTL_MODE_GETCONNECTOR,
+            DRM_IOCTL_MODE_GETPROPERTY,
+            DRM_IOCTL_MODE_SETPROPERTY,
+            DRM_IOCTL_MODE_GETPROPBLOB,
+            DRM_IOCTL_MODE_GETFB,
+            DRM_IOCTL_MODE_ADDFB,
+            DRM_IOCTL_MODE_RMFB,
+            DRM_IOCTL_MODE_PAGE_FLIP,
+            DRM_IOCTL_MODE_DIRTYFB,
+            DRM_IOCTL_MODE_CREATE_DUMB,
+            DRM_IOCTL_MODE_MAP_DUMB,
+            DRM_IOCTL_MODE_DESTROY_DUMB,
+            DRM_IOCTL_MODE_GETPLANERESOURCES,
+            DRM_IOCTL_MODE_GETPLANE,
+            DRM_IOCTL_MODE_SETPLANE,
+            DRM_IOCTL_MODE_ADDFB2,
+            DRM_IOCTL_MODE_OBJ_GETPROPERTIES,
+            DRM_IOCTL_MODE_OBJ_SETPROPERTY,
+            DRM_IOCTL_MODE_CURSOR2,
+            DRM_IOCTL_MODE_ATOMIC,
+            DRM_IOCTL_MODE_CREATEPROPBLOB,
+            DRM_IOCTL_MODE_DESTROYPROPBLOB,
+            DRM_IOCTL_SYNCOBJ_CREATE,
+            DRM_IOCTL_SYNCOBJ_DESTROY,
+            DRM_IOCTL_SYNCOBJ_WAIT,
+            DRM_IOCTL_SYNCOBJ_RESET,
+            DRM_IOCTL_SYNCOBJ_SIGNAL,
+            DRM_IOCTL_MODE_LIST_LESSEES,
+            DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT,
+            DRM_IOCTL_SYNCOBJ_QUERY,
+            DRM_IOCTL_SYNCOBJ_TRANSFER,
+            DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL,
+            DRM_IOCTL_MODE_GETFB2,
+            DRM_IOCTL_MODE_CLOSEFB,
+        ];
+        let mut seen = alloc::vec::Vec::new();
+        for &cmd in ALL {
+            let nr = cmd & 0xff;
+            assert_eq!(
+                canonical_drm_ioctl(nr),
+                Some(cmd),
+                "nr {:#04x} does not map back to {:#010x}",
+                nr,
+                cmd
+            );
+            assert!(
+                !seen.contains(&nr),
+                "nr {:#04x} is claimed by two commands",
+                nr
+            );
+            seen.push(nr);
+            // Every DRM ioctl's type byte is 'd'.
+            assert_eq!(
+                (cmd >> 8) & 0xff,
+                0x64,
+                "{:#010x} is not a DRM command",
+                cmd
+            );
+        }
+    }
+
+    /// The regression that motivated the whole layer: the 2023 fence-deadline
+    /// feature appended a `__u64 deadline_nsec` to both wait structs, so a
+    /// current libdrm encodes 40/48 bytes where this tree parses 32/40. Linux
+    /// dispatches both to the same handler; we must too, without the pair of
+    /// hand-written `*_DEADLINE` constants that used to be the only reason the
+    /// larger encoding worked.
+    #[test]
+    fn a_grown_struct_reaches_the_same_handler() {
+        for (canon, grown) in [
+            (DRM_IOCTL_SYNCOBJ_WAIT, DRM_IOCTL_SYNCOBJ_WAIT_DEADLINE),
+            (
+                DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT,
+                DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DEADLINE,
+            ),
+        ] {
+            assert_ne!(canon, grown, "the two encodings must actually differ");
+            assert_eq!(canonical_drm_ioctl(grown & 0xff), Some(canon));
+            // And the kernel-side buffer is the LARGER of the two, so the
+            // trailing bytes the client sent survive the round trip.
+            let sizes = reconcile_sizes(grown, canon);
+            assert_eq!(sizes.ksize, ioc_size(grown));
+            assert_eq!(sizes.in_size, ioc_size(grown));
+            assert_eq!(sizes.out_size, ioc_size(grown));
+        }
+    }
+
+    /// A client older than us encodes FEWER bytes. Linux copies only those in,
+    /// zeroes the rest of its struct and copies only those back -- it never
+    /// writes past the end of the caller's buffer.
+    #[test]
+    fn a_short_struct_is_zero_padded_and_never_overwritten() {
+        let canon = DRM_IOCTL_MODE_GETFB2; // 104 bytes
+        let short = (canon & !(0x3fff << 16)) | (64u32 << 16);
+        let sizes = reconcile_sizes(short, canon);
+        assert_eq!(sizes.in_size, 64);
+        assert_eq!(sizes.out_size, 64, "only the caller's 64 bytes go back");
+        assert_eq!(sizes.ksize, 104, "but we parse our own full struct");
+    }
+
+    /// Direction is intersected with the handler's, so a caller cannot encode
+    /// `_IOC_READ` on a write-only ioctl to have a struct copied back.
+    #[test]
+    fn direction_is_intersected_with_the_handler() {
+        // GEM_CLOSE is _IOW: write-only.
+        let canon = DRM_IOCTL_GEM_CLOSE;
+        assert_eq!(canon & IOC_READ_DIR, 0);
+        let forged = canon | IOC_READ_DIR;
+        let sizes = reconcile_sizes(forged, canon);
+        assert_eq!(sizes.out_size, 0, "nothing may be copied back");
+        assert_eq!(sizes.in_size, ioc_size(canon));
+    }
+
+    /// Driver-private numbers keep passing through untouched: Linux consults
+    /// the driver's own ioctl table for `DRM_COMMAND_BASE..DRM_COMMAND_END`,
+    /// and nouveau's uAPI lives there.
+    #[test]
+    fn driver_private_numbers_are_left_alone() {
+        for nr in DRM_COMMAND_BASE..DRM_COMMAND_END {
+            assert_eq!(canonical_drm_ioctl(nr), None, "nr {:#04x}", nr);
+            assert!(!is_core_drm_nr(nr));
+        }
+        assert!(is_core_drm_nr(0x00));
+        assert!(is_core_drm_nr(0x3A));
+        assert!(is_core_drm_nr(0xA0));
+        assert!(is_core_drm_nr(0xCF));
+    }
+
+    /// The size-mismatched path must actually WORK, not merely be reachable.
+    /// It hands the dispatcher a KERNEL bounce buffer, so the argument's
+    /// `access_ok()` has to live out here, over the range the client gave --
+    /// leaving it inside the dispatcher made every reconciled ioctl EFAULT,
+    /// i.e. exactly the calls this layer exists to rescue.
+    #[test]
+    fn the_reconciled_path_copies_in_zero_fills_and_copies_back() {
+        // A client whose `drm_mode_fb_cmd2` is 40 bytes shorter than ours.
+        let canon = DRM_IOCTL_MODE_GETFB2;
+        let short_size = ioc_size(canon) - 40;
+        let short = (canon & !(0x3fff << 16)) | ((short_size as u32) << 16);
+        let mut user = alloc::vec![0xAAu8; short_size];
+        user[0] = 7; // fb_id
+        let user_addr = user.as_ptr() as usize;
+        let ret = drm_ioctl_reconciled(short, user_addr, |cmd, kdata| {
+            // Dispatched on the canonical command, never the client's.
+            assert_eq!(cmd, canon);
+            assert_ne!(kdata, user_addr, "the arms must see the bounce buffer");
+            // SAFETY: the wrapper owns `ksize` bytes at `kdata`.
+            let buf = unsafe { core::slice::from_raw_parts_mut(kdata as *mut u8, ioc_size(canon)) };
+            assert_eq!(buf[0], 7, "the client's bytes arrived");
+            assert!(
+                buf[short_size..].iter().all(|&b| b == 0),
+                "the fields the client did not send must read as zero"
+            );
+            buf[1] = 0x5A; // the handler's reply
+            Ok(0)
+        });
+        assert_eq!(ret, Ok(0));
+        assert_eq!(user[1], 0x5A, "the reply reached the client");
+        assert_eq!(
+            user.len(),
+            short_size,
+            "and nothing was written past its buffer"
+        );
+    }
+
+    /// `sys_ioctl`'s pre-dispatch helpers parse the request struct themselves,
+    /// so they match on the NR but still need a size floor: a command encoding
+    /// fewer bytes than they read must fall through to the padded path instead
+    /// of over-reading the caller's buffer.
+    #[test]
+    fn nr_matching_keeps_a_size_floor() {
+        let (n, min) = nr::PRIME_HANDLE_TO_FD;
+        assert!(is_drm_ioctl_nr(0xC00C_642E, n, min), "the frozen encoding");
+        assert!(is_drm_ioctl_nr(0xC018_642E, n, min), "a grown one");
+        assert!(!is_drm_ioctl_nr(0xC008_642E, n, min), "a short one");
+        assert!(!is_drm_ioctl_nr(0xC00C_652E, n, min), "not a DRM type byte");
+        assert!(!is_drm_ioctl_nr(0xC00C_642D, n, min), "a different NR");
     }
 }

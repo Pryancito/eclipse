@@ -74,6 +74,17 @@ static CE_PRESENT_ENABLED: core::sync::atomic::AtomicBool =
 /// BAR1 stays quiet during a deferred GSP-RM bring-up (hwcursor path).
 static SCANOUT_PAUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Whether the CRTC has been turned off by the client: DPMS off, a `SETCRTC`
+/// with `fb_id = 0`, or an atomic commit staging `ACTIVE = 0`.
+///
+/// All three were accepted and ignored, so the panel kept showing the last
+/// frame forever while the compositor's own state said the output was off.
+/// That is idle blanking, `wlr-output-power-management` and closing a laptop
+/// lid, none of which could turn a screen off. Linux disables the pipe:
+/// `drm_mode_setcrtc` with a null fb calls `set_config` with `.fb = NULL`, and
+/// DPMS off goes through `drm_atomic_helper_connector_dpms`.
+static CRTC_BLANKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Nanoseconds-since-boot after which a pause set by [`set_scanout_paused_for`]
 /// expires by itself. `0` means "no watchdog" (a plain [`set_scanout_paused`]).
 static SCANOUT_PAUSE_DEADLINE_NS: core::sync::atomic::AtomicU64 =
@@ -85,6 +96,40 @@ static SCANOUT_PAUSE_DEADLINE_NS: core::sync::atomic::AtomicU64 =
 /// labwc's BAR1 traffic right back into the SEC2 window this exists to keep
 /// quiet. Bounded, because the alternative is a permanently frozen desktop.
 pub const SCANOUT_PAUSE_MAX: core::time::Duration = core::time::Duration::from_secs(90);
+
+/// Turn the CRTC off (paint the panel black and stop repainting it) or back on.
+///
+/// There is no hardware pipe to disable on the software-KMS path, so "off" is
+/// black pixels plus a latch that keeps the kernel's own repaints -- cursor
+/// compositing, damage re-scans -- from lighting it back up.
+///
+/// **Divergence from Linux, on purpose.** With the CRTC off, Linux fails a
+/// page flip with EINVAL until the client turns it back on. Here any explicit
+/// present un-blanks instead, because this panel is also the only console: a
+/// stray or mis-ordered DPMS write must cost one black frame, not a machine
+/// with no way to show anything again. Everything that really turns an output
+/// off -- wlroots, Xorg's DPMS -- stops presenting when it does, so the blank
+/// holds exactly as long as it should.
+pub fn set_crtc_blanked(on: bool) {
+    if CRTC_BLANKED.swap(on, Ordering::SeqCst) == on {
+        return;
+    }
+    if on {
+        if let Some(display) = primary_display() {
+            display.clear(zcore_drivers::prelude::RgbColor::new(0, 0, 0));
+            let _ = display.flush();
+        }
+        kernel_hal::klog_info!("[drm] CRTC off: panel blanked");
+    } else {
+        kernel_hal::klog_info!("[drm] CRTC on");
+    }
+}
+
+/// Whether the CRTC is currently off. Drives `GETCRTC`'s readback and the
+/// DPMS property, and gates the kernel's own repaints.
+pub fn crtc_blanked() -> bool {
+    CRTC_BLANKED.load(Ordering::SeqCst)
+}
 
 /// Enable/disable the per-frame CE-offloaded present. Set at boot from the
 /// cmdline flags, and again after a deferred console-GPU bring-up, which can
@@ -217,21 +262,40 @@ impl DrmFileState {
         !self.events.lock().is_empty()
     }
 
-    /// Pop one pending DRM event into `buf`, or `None` if the queue is empty /
-    /// the caller's buffer is too small for a whole event.
-    pub fn read_event(&self, buf: &mut [u8]) -> Option<usize> {
+    /// Fill `buf` with as many whole pending DRM events as fit, like
+    /// `drm_read()`.
+    ///
+    /// The three outcomes are distinct on purpose. Collapsing "the buffer is
+    /// too small for the first event" into "nothing to read" livelocked the
+    /// kernel: the caller saw EAGAIN, but the queue was NOT empty so
+    /// `Event::READABLE` stayed set, so a blocking reader's wait resolved
+    /// instantly, re-read, got EAGAIN again, and spun with no yield point.
+    /// Linux puts the event back and returns EINVAL when nothing has been read
+    /// yet, and never blocks in that case.
+    pub fn read_events(&self, buf: &mut [u8]) -> EventRead {
         let mut events = self.events.lock();
-        let ev = events.front()?;
-        if buf.len() < ev.len() {
-            return None;
+        let mut total = 0usize;
+        while let Some(len) = events.front().map(|e| e.len()) {
+            if total + len > buf.len() {
+                // A buffer that cannot hold even one whole event is the
+                // caller's error, not an empty queue.
+                if total == 0 {
+                    return EventRead::TooSmall;
+                }
+                break;
+            }
+            let ev = events.pop_front().expect("front() just returned it");
+            buf[total..total + len].copy_from_slice(&ev[..len]);
+            total += len;
         }
-        let n = ev.len();
-        buf[..n].copy_from_slice(&ev[..n]);
-        events.pop_front();
         if events.is_empty() {
             self.eventbus.lock().clear(Event::READABLE);
         }
-        Some(n)
+        if total == 0 {
+            EventRead::Empty
+        } else {
+            EventRead::Read(total)
+        }
     }
 
     fn push_event(&self, bytes: Vec<u8>) {
@@ -239,6 +303,18 @@ impl DrmFileState {
         events.push_back(bytes);
         self.eventbus.lock().set(Event::READABLE);
     }
+}
+
+/// What one `read()` on a DRM fd found. See [`DrmFileState::read_events`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum EventRead {
+    /// Nothing queued: EAGAIN, or block until one arrives.
+    Empty,
+    /// The buffer cannot hold even the first queued event: EINVAL, as
+    /// `drm_read()` answers when it has read nothing yet.
+    TooSmall,
+    /// This many bytes of whole events were copied.
+    Read(usize),
 }
 
 impl Drop for DrmFileState {
@@ -282,6 +358,15 @@ pub struct DrmFramebuffer {
     pub pitch: u32,
     pub phys_addr: u64,
     pub size: usize,
+    /// The pid that created this framebuffer, or 0 for one the kernel made.
+    ///
+    /// Linux keeps framebuffers on a per-`drm_file` list and `drm_mode_rmfb`
+    /// walks it, answering ENOENT for an id that is not the caller's; the same
+    /// list is what `drm_fb_release` cleans up on close. Here they were one
+    /// global set with no owner at all, so any process could `RMFB` the
+    /// compositor's scanout framebuffer -- after which every `SETCRTC` and
+    /// `PAGE_FLIP` on it fails and wlroots retries the modeset forever.
+    pub owner: u64,
 }
 
 struct DrmState {
@@ -901,12 +986,19 @@ pub fn alloc_buffer(size: usize) -> Option<GemHandle> {
 /// Export a GEM handle for PRIME: return its `(phys_addr, size, backing VMO)`
 /// so it can be wrapped in a dma-buf and shared with another DRM node.
 pub fn export_handle(handle_id: u32) -> Option<(u64, usize, Arc<VmObject>)> {
+    // PRIME export is a uAPI entry point, so it resolves the handle the way
+    // Linux's `drm_gem_object_lookup(file_priv, handle)` does -- against what
+    // the CALLER may touch. Without this any process could hand
+    // `PRIME_HANDLE_TO_FD` a small integer, get a dma-buf fd over someone
+    // else's buffer and mmap it: handle ids are sequential from 1, so reading
+    // the compositor's scanout took no guessing at all.
+    let pid = current_pid();
     {
         let state = DRM_STATE.lock();
         if let Some(v) = state
             .handles
             .iter()
-            .find(|(h, _, _)| h.id == handle_id)
+            .find(|(h, _, owner)| h.id == handle_id && owned_by(*owner, pid))
             .map(|(h, vmo, _)| (h.phys_addr, h.size, vmo.clone()))
         {
             return Some(v);
@@ -920,7 +1012,10 @@ pub fn export_handle(handle_id: u32) -> Option<(u64, usize, Arc<VmObject>)> {
     // compositor died at "Swapchain for output ... failed test" -- AFTER
     // rendering itself already worked. The physical range registered at
     // GEM_NEW time is exactly what a dma-buf needs.
-    let (phys_addr, size) = zcore_drivers::scheme::gem_mmap::lookup(handle_id)?;
+    // Same ownership rule on the driver-private side: `lookup_for` is
+    // `lookup` plus `holds(handle, pid)`, which is the nouveau table's own
+    // record of who took a reference.
+    let (phys_addr, size) = zcore_drivers::scheme::gem_mmap::lookup_for(handle_id, pid)?;
     let vmo = nouveau_cpu_vmo(handle_id, phys_addr, size as usize);
     Some((phys_addr, size as usize, vmo))
 }
@@ -1065,6 +1160,17 @@ fn owned_by(owner: u64, pid: u64) -> bool {
     pid == 0 || owner == 0 || owner == pid
 }
 
+/// Whether the calling process created `fb`, i.e. whether `GETFB`/`GETFB2`
+/// may hand it the backing GEM handle.
+///
+/// Linux gates that field on DRM master or `CAP_SYS_ADMIN` and zeroes it
+/// otherwise. There is no master state here, so the framebuffer's creator is
+/// the closest honest stand-in: the compositor still gets the handles for its
+/// own framebuffers, and nobody else gets a route to them.
+pub fn fb_owned_by_caller(fb: &DrmFramebuffer) -> bool {
+    owned_by(fb.owner, current_pid())
+}
+
 /// Look up a framebuffer object by id (`DRM_IOCTL_MODE_GETFB`/`GETFB2`).
 pub fn get_fb(fb_id: u32) -> Option<DrmFramebuffer> {
     DRM_STATE
@@ -1099,6 +1205,28 @@ pub fn resolve_gem_backing(handle_id: u32) -> Option<(u64, usize)> {
     zcore_drivers::scheme::gem_mmap::lookup(handle_id).map(|(pa, sz)| (pa, sz as usize))
 }
 
+/// [`resolve_gem_backing`] restricted to what `pid` may touch.
+///
+/// The unchecked resolver is right for the kernel's own present path, which
+/// already holds the framebuffer; it is wrong for `ADDFB`/`ADDFB2`, which take
+/// a handle straight from userspace. Linux resolves those through
+/// `drm_gem_object_lookup(file, handle)` and answers ENOENT for a handle that
+/// is not the caller's. Here it meant process B could build its own
+/// framebuffer over process A's buffer -- and then `SETCRTC` or `PAGE_FLIP`
+/// it onto the panel, or have A's pixels blitted somewhere B could read.
+pub fn resolve_gem_backing_for(handle_id: u32, pid: u64) -> Option<(u64, usize)> {
+    if let Some((h, _, owner)) = DRM_STATE
+        .lock()
+        .handles
+        .iter()
+        .find(|(h, _, _)| h.id == handle_id)
+        .map(|(h, vmo, owner)| (*h, vmo.clone(), *owner))
+    {
+        return owned_by(owner, pid).then_some((h.phys_addr, h.size));
+    }
+    zcore_drivers::scheme::gem_mmap::lookup_for(handle_id, pid).map(|(pa, sz)| (pa, sz as usize))
+}
+
 /// Create a framebuffer from a GEM handle
 pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<u32> {
     // Resolve the backing buffer from EITHER source:
@@ -1109,7 +1237,7 @@ pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<
     // so ADDFB2 MUST accept those handles or the output swapchain test fails
     // ("create_fb returned None") before any atomic commit — the exact RTX
     // bring-up blocker seen as "Swapchain for output 'HDMI-A-1' failed test".
-    let (phys_addr, buf_size) = match resolve_gem_backing(handle_id) {
+    let (phys_addr, buf_size) = match resolve_gem_backing_for(handle_id, current_pid()) {
         Some(v) => v,
         None => {
             // Loud, not a silent `?`: an unresolvable ADDFB2 handle is exactly
@@ -1180,6 +1308,7 @@ pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<
         pitch,
         phys_addr,
         size,
+        owner: current_pid(),
     };
 
     // A dumb buffer's reference is its VMO `Arc` (see `fb_backing`); a nouveau
@@ -1293,10 +1422,20 @@ pub fn retire_framebuffers_for_handle(handle_id: u32) -> usize {
     dropped
 }
 
-pub fn rmfb(fb_id: u32) -> bool {
+/// Remove a framebuffer on behalf of `pid` (`RMFB`/`CLOSEFB`).
+///
+/// `false` covers both "no such id" and "not yours", which the caller reports
+/// as ENOENT either way -- the same answer `drm_mode_rmfb` gives for an id
+/// that is not on the calling file's list, and it does not tell a prober
+/// whether someone else's framebuffer exists.
+pub fn rmfb_for(fb_id: u32, pid: u64) -> bool {
     let handle_id = {
         let mut state = DRM_STATE.lock();
-        let Some(pos) = state.framebuffers.iter().position(|f| f.id == fb_id) else {
+        let Some(pos) = state
+            .framebuffers
+            .iter()
+            .position(|f| f.id == fb_id && owned_by(f.owner, pid))
+        else {
             return false;
         };
         let fb = state.framebuffers.remove(pos);
@@ -1314,6 +1453,11 @@ pub fn rmfb(fb_id: u32) -> bool {
     // returns the memory to the RM -- the `RMFB` that Linux frees on too.
     fb_drop_gem_ref(handle_id);
     true
+}
+
+/// [`rmfb_for`] for the kernel's own teardown paths, which own everything.
+pub fn rmfb(fb_id: u32) -> bool {
+    rmfb_for(fb_id, 0)
 }
 
 /// Native mode of the primary framebuffer display: `(width, height, pitch)`.
@@ -2262,7 +2406,11 @@ pub fn move_cursor(x: i32, y: i32) {
 /// scene, which has no cursor baked in) and composite the new cursor on top.
 /// Only two ~64x64 windows are touched per move.
 pub fn repaint_for_cursor() {
-    if !software_kms_active() || scanout_paused() {
+    // `crtc_blanked`: a pointer move is the kernel's own repaint, not a client
+    // present, so it must not light a panel the client turned off. This is the
+    // latch half of `set_crtc_blanked` -- without it a mouse twitch redrew the
+    // whole frame and undid the blank.
+    if !software_kms_active() || scanout_paused() || crtc_blanked() {
         return;
     }
     // Snapshot everything needed under the lock, and record the rect we are
@@ -3047,6 +3195,10 @@ pub fn present_now_checked(
         set_crtc_fb(crtc_id, fb_id);
         return Ok(());
     }
+    // An explicit present is a client putting pixels on this CRTC, so it is on
+    // again. See `set_crtc_blanked` for why this un-blanks rather than failing
+    // the flip the way Linux does for a disabled CRTC.
+    set_crtc_blanked(false);
     if !PRESENT_LOGGED.swap(true, Ordering::Relaxed) {
         // Read `graphics_vt` into a local FIRST: `DRM_STATE.lock()` as a direct
         // argument to `warn!` keeps the MutexGuard temporary alive for the
@@ -3395,6 +3547,27 @@ pub enum AtomicError {
 /// means: referenced objects exist, the mode blob is a well-formed
 /// `drm_mode_modeinfo` matching the native mode, source rects fit the
 /// framebuffer, and mode/active changes carry `ALLOW_MODESET`.
+/// Put back the state [`atomic_commit`] saved before its commit phase, so a
+/// commit that fails at the present is all-or-nothing the way Linux's is.
+fn restore_atomic_state(saved: (AtomicKmsState, u32, Option<(u32, Vec<u8>)>)) {
+    let (atomic, crtc_fb, blob) = saved;
+    let mut state = DRM_STATE.lock();
+    state.atomic = atomic;
+    state.crtc_fb = crtc_fb;
+    if let Some((id, data)) = blob {
+        if let Some(existing) = state.blobs.iter_mut().find(|b| b.id == id) {
+            existing.data = data;
+        }
+    }
+    drop(state);
+    reset_vblank_period();
+    if atomic.mode_blob_id != 0 {
+        if let Some(data) = get_blob(atomic.mode_blob_id) {
+            set_vblank_period_from_modeinfo(&data);
+        }
+    }
+}
+
 pub fn atomic_commit(
     upd: &AtomicUpdate,
     test_only: bool,
@@ -3536,6 +3709,25 @@ pub fn atomic_commit(
     }
 
     // --- Commit phase ---
+    //
+    // Everything below is undone if the present at the end fails. Linux builds
+    // a duplicated `drm_atomic_state` and only swaps it in once the check AND
+    // the commit tail have succeeded (`drm_atomic_helper_swap_state`), so a
+    // failed commit leaves every object exactly as it was. Applying first and
+    // failing afterwards left `ACTIVE` and `MODE_ID` reporting a modeset that
+    // never reached the screen: wlroots' own connector state then agreed with
+    // the readback, so its next commit computed an empty diff and never
+    // retried -- a black output the compositor believes is on.
+    let rollback = {
+        let state = DRM_STATE.lock();
+        let blob_id = state.atomic.mode_blob_id;
+        let blob = state
+            .blobs
+            .iter()
+            .find(|b| b.id == blob_id)
+            .map(|b| (b.id, b.data.clone()));
+        (state.atomic, state.crtc_fb, blob)
+    };
     {
         let mut state = DRM_STATE.lock();
         if let Some(blob_id) = upd.mode_blob {
@@ -3597,6 +3789,13 @@ pub fn atomic_commit(
         }
     }
 
+    // ACTIVE=0 turns the pipe off, as `drm_atomic_helper_commit` does for a
+    // CRTC whose new state is inactive. Staging it and never acting on it was
+    // the atomic half of "a screen that cannot be blanked".
+    if upd.active == Some(false) {
+        set_crtc_blanked(true);
+    }
+
     match upd.plane_fb_id {
         Some(0) => set_crtc_fb(SYNTH_CRTC_ID, 0),
         Some(fb_id) => {
@@ -3608,6 +3807,7 @@ pub fn atomic_commit(
                 damage_rect_from_blob(blob_id, fb.width, fb.height)
             });
             if !present_now_region(fb_id, SYNTH_CRTC_ID, rect) {
+                restore_atomic_state(rollback);
                 return Err(AtomicError::Device);
             }
         }
@@ -4002,6 +4202,30 @@ pub fn get_plane(id: u32) -> Option<DrmPlane> {
 }
 
 #[cfg(test)]
+pub(super) mod test_globals {
+    extern crate std;
+
+    /// `DRM_STATE`, the GEM table, `gem_mmap` and the CRTC's current fb are
+    /// process-wide, and cargo runs a crate's tests in threads. Every test
+    /// module that touches them takes this first, so one test's framebuffers
+    /// are not another's.
+    ///
+    /// Without it the suite failed about one run in two with a different test
+    /// each time -- `crtc_fb` still holding a neighbour's framebuffer, or an
+    /// `ADDFB2` refused because a neighbour had filled the table. That reads
+    /// as a real regression and is not one, which is the worst kind of noise
+    /// to leave in a suite people are meant to trust.
+    static LOCK: self::std::sync::Mutex<()> = self::std::sync::Mutex::new(());
+
+    pub(crate) fn lock() -> self::std::sync::MutexGuard<'static, ()> {
+        // A test that panics while holding this poisons it. The poison is not
+        // a failure for the tests that follow, so step over it -- the panicking
+        // test has already been reported.
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[cfg(test)]
 mod release_tests {
     use super::*;
 
@@ -4029,6 +4253,7 @@ mod release_tests {
 
     #[test]
     fn process_exit_releases_only_that_process_buffers() {
+        let _serialised = super::test_globals::lock();
         // Distinct ids/pids so this cannot collide with another test's state.
         plant(9001, 4096, 77_001);
         plant(9002, 8192, 77_001);
@@ -4052,6 +4277,7 @@ mod release_tests {
 
     #[test]
     fn unowned_buffers_are_never_reclaimed() {
+        let _serialised = super::test_globals::lock();
         // pid 0 means "allocated with no current thread" (boot-time). A process
         // exit must never take those: pid 0 is not a real owner.
         plant(9101, 4096, 0);
@@ -4062,6 +4288,7 @@ mod release_tests {
 
     #[test]
     fn releasing_a_buffer_drops_the_framebuffer_built_on_it() {
+        let _serialised = super::test_globals::lock();
         plant(9201, 4096, 77_003);
         {
             let mut state = DRM_STATE.lock();
@@ -4074,6 +4301,7 @@ mod release_tests {
                 pitch: 4,
                 phys_addr: 0,
                 size: 4096,
+                owner: 77_003,
             });
             state.crtc_fb = 9299;
         }
@@ -4091,6 +4319,7 @@ mod release_tests {
     /// the VMO) and stays scannable until RMFB, which then releases it.
     #[test]
     fn gem_close_keeps_a_framebuffer_and_its_memory_alive() {
+        let _serialised = super::test_globals::lock();
         plant(9301, 4096, 77_004);
         let vmo = handle_vmo(9301).expect("planted handle resolves to its VMO");
         {
@@ -4104,6 +4333,7 @@ mod release_tests {
                 pitch: 4,
                 phys_addr: 0,
                 size: 4096,
+                owner: 77_004,
             });
             state.fb_backing.push((9399, vmo.clone()));
             state.crtc_fb = 9399;
@@ -4431,6 +4661,7 @@ mod fb_validation_tests {
     /// ADDFB2 used to accept it.
     #[test]
     fn addfb_rejects_a_pitch_that_is_not_whole_pixels() {
+        let _serialised = super::test_globals::lock();
         let (w, h) = (64u32, 4u32);
         // Generous backing so the size guard never decides these cases: what
         // is under test is the pitch alignment, nothing else.
@@ -4458,6 +4689,7 @@ mod fb_validation_tests {
     /// its backing buffer, and must be at least as wide as it claims.
     #[test]
     fn addfb_still_rejects_a_framebuffer_that_does_not_fit_its_buffer() {
+        let _serialised = super::test_globals::lock();
         plant(9402, 4096, 78_002);
         // 64x16 at 4 bytes = 4096, exactly the buffer.
         assert!(create_fb(9402, 64, 16, 256).is_some());
@@ -4686,6 +4918,7 @@ mod ce_staging_tests {
     /// the next test) rather than clobbering real columns.
     #[test]
     fn the_row_tail_the_copy_engine_carries_is_never_left_stale() {
+        let _serialised = super::test_globals::lock();
         const PITCH: usize = 64; // 16 pixels per destination row
         const H: u32 = 4;
         // Frame 1 fills whole rows: 16 pixels of 4 bytes = the full pitch.
@@ -4735,6 +4968,7 @@ mod ce_staging_tests {
     /// on-screen columns the frame says nothing about.
     #[test]
     fn a_repack_that_cannot_cover_the_visible_width_is_declined() {
+        let _serialised = super::test_globals::lock();
         const PITCH: usize = 64;
         let src = numbered(0xCCC0_0000, 8, 4);
         // 8 pixels of source, but 12 pixels (48 bytes) of the row are visible.
@@ -4777,6 +5011,7 @@ mod nouveau_fb_lifetime_tests {
             pitch: 4,
             phys_addr: 0x1_0000,
             size: 4096,
+            owner: pid,
         });
         state.crtc_fb = fb_id;
     }
@@ -4802,6 +5037,7 @@ mod nouveau_fb_lifetime_tests {
     /// RM free, so an absent entry is what "the memory is gone" means here.
     #[test]
     fn closing_a_nouveau_handle_retires_the_framebuffer_over_it() {
+        let _serialised = super::test_globals::lock();
         let handle = gem_mmap::DRIVER_HANDLE_BASE + 0x55;
         plant_nouveau_fb(9501, handle, 0);
         assert!(fb_exists(9501));
@@ -4833,6 +5069,7 @@ mod nouveau_fb_lifetime_tests {
     /// storm, at frame rate.
     #[test]
     fn a_close_that_is_not_the_last_reference_leaves_the_framebuffer_alone() {
+        let _serialised = super::test_globals::lock();
         let handle = gem_mmap::DRIVER_HANDLE_BASE + 0x56;
         plant_nouveau_fb(9505, handle, 0);
         // Still registered: other references remain, so the memory is alive.
@@ -4863,6 +5100,7 @@ mod nouveau_fb_lifetime_tests {
     /// This helper must therefore refuse to touch a low-range handle at all.
     #[test]
     fn a_dumb_buffer_framebuffer_is_never_retired_by_this_path() {
+        let _serialised = super::test_globals::lock();
         let mut state = DRM_STATE.lock();
         state.framebuffers.push(DrmFramebuffer {
             id: 9502,
@@ -4873,6 +5111,7 @@ mod nouveau_fb_lifetime_tests {
             pitch: 4,
             phys_addr: 0,
             size: 4096,
+            owner: 0,
         });
         drop(state);
 
@@ -4889,6 +5128,7 @@ mod nouveau_fb_lifetime_tests {
     /// memory underneath it.
     #[test]
     fn a_process_exit_retires_the_nouveau_framebuffers_that_process_held() {
+        let _serialised = super::test_globals::lock();
         let mine = gem_mmap::DRIVER_HANDLE_BASE + 0x66;
         let theirs = gem_mmap::DRIVER_HANDLE_BASE + 0x67;
         plant_nouveau_fb(9503, mine, 78_101);
@@ -4938,6 +5178,7 @@ mod present_error_tests {
             pitch: 4,
             phys_addr,
             size,
+            owner: 0,
         });
     }
 
@@ -4956,6 +5197,7 @@ mod present_error_tests {
     /// its scanout path.
     #[test]
     fn an_unknown_fb_id_is_reported_as_no_such_fb() {
+        let _serialised = super::test_globals::lock();
         drop_fb(9601);
         assert_eq!(
             scanout_region_checked(9601, None),
@@ -4974,6 +5216,7 @@ mod present_error_tests {
     /// here would send the reader looking at the wrong half of the system.
     #[test]
     fn a_framebuffer_with_no_backing_is_reported_as_no_backing() {
+        let _serialised = super::test_globals::lock();
         plant_fb(9602, 0, 4096);
         assert_eq!(
             scanout_region_checked(9602, None),
@@ -4992,6 +5235,7 @@ mod present_error_tests {
     /// exactly as they did — the reason is additive, not a change of contract.
     #[test]
     fn the_bool_wrappers_still_report_failure_the_old_way() {
+        let _serialised = super::test_globals::lock();
         drop_fb(9603);
         assert!(!scanout_region(9603, None));
         assert!(!present_now(9603, 1));
@@ -5006,6 +5250,7 @@ mod present_error_tests {
     /// has to say which one the compositor hit.
     #[test]
     fn a_retired_fb_id_remembers_what_took_it() {
+        let _serialised = super::test_globals::lock();
         let handle = zcore_drivers::scheme::gem_mmap::DRIVER_HANDLE_BASE + 0x71;
         zcore_drivers::scheme::gem_mmap::register(handle, 0x2_0000, 4096, 0);
         {
@@ -5019,6 +5264,7 @@ mod present_error_tests {
                 pitch: 4,
                 phys_addr: 0x2_0000,
                 size: 4096,
+                owner: 0,
             });
         }
         // The object is really gone (last reference dropped) -- the only
@@ -5042,6 +5288,7 @@ mod present_error_tests {
     /// with it.
     #[test]
     fn the_retirement_history_is_bounded() {
+        let _serialised = super::test_globals::lock();
         for i in 0..(FB_RETIRE_HISTORY as u32 * 4) {
             plant_fb(9700 + i, 0x3_0000, 4096);
             assert!(rmfb(9700 + i));
@@ -5057,6 +5304,7 @@ mod present_error_tests {
     /// and what a bug report gets grepped for.
     #[test]
     fn every_reason_has_its_own_console_text() {
+        let _serialised = super::test_globals::lock();
         let all = [
             PresentError::NoSuchFb,
             PresentError::NoDisplay,
@@ -5110,6 +5358,7 @@ mod nouveau_fb_gem_reference_tests {
     /// because the framebuffer holds one.
     #[test]
     fn addfb2_then_gem_close_leaves_the_framebuffer_backed() {
+        let _serialised = super::test_globals::lock();
         let handle = gem_mmap::DRIVER_HANDLE_BASE + 0x81;
         gem_new(handle, CLIENT);
 
@@ -5149,6 +5398,7 @@ mod nouveau_fb_gem_reference_tests {
     /// out is freed under the compositor.
     #[test]
     fn the_framebuffers_reference_belongs_to_no_process() {
+        let _serialised = super::test_globals::lock();
         let handle = gem_mmap::DRIVER_HANDLE_BASE + 0x82;
         gem_new(handle, CLIENT);
         let fb_id = create_fb(handle, 1, 1, 4).expect("ADDFB2 over a nouveau GEM object");
@@ -5170,6 +5420,7 @@ mod nouveau_fb_gem_reference_tests {
     /// modifier/format it tests a buffer with.
     #[test]
     fn each_framebuffer_takes_its_own_reference() {
+        let _serialised = super::test_globals::lock();
         let handle = gem_mmap::DRIVER_HANDLE_BASE + 0x83;
         gem_new(handle, CLIENT);
         let a = create_fb(handle, 1, 1, 4).expect("first ADDFB2");
@@ -5195,6 +5446,7 @@ mod nouveau_fb_gem_reference_tests {
     /// owns that half of the contract.
     #[test]
     fn a_dumb_buffer_framebuffer_takes_no_gem_reference() {
+        let _serialised = super::test_globals::lock();
         let low = 4242; // below DRIVER_HANDLE_BASE: a CREATE_DUMB handle
         assert!(gem_mmap::lookup(low).is_none());
         fb_take_gem_ref(low);
@@ -5203,5 +5455,234 @@ mod nouveau_fb_gem_reference_tests {
             "a dumb handle must never appear in the nouveau table",
         );
         fb_drop_gem_ref(low); // and dropping one that was never taken is safe
+    }
+}
+
+/// `drm_read()` semantics for the DRM event queue: as many whole events as
+/// fit, and a buffer too small for the first one is the caller's error, not an
+/// empty queue.
+#[cfg(test)]
+mod drm_event_read_tests {
+    use super::*;
+
+    fn event(tag: u8, len: usize) -> Vec<u8> {
+        alloc::vec![tag; len]
+    }
+
+    /// The livelock. A short read left the event queued with `READABLE` still
+    /// set, and answered EAGAIN -- so a blocking reader's wait resolved
+    /// immediately, it re-read, got EAGAIN again, and spun a core with no
+    /// yield point. `drm_read()` returns EINVAL there and never blocks.
+    #[test]
+    fn a_buffer_too_small_for_the_first_event_is_distinguishable_from_empty() {
+        let file = DrmFileState::new();
+        let mut buf = [0u8; 8];
+        assert_eq!(file.read_events(&mut buf), EventRead::Empty);
+
+        file.push_event(event(0xAB, 32));
+        assert_eq!(
+            file.read_events(&mut buf),
+            EventRead::TooSmall,
+            "a short read must not look like an empty queue"
+        );
+        // And the event is still there, unconsumed.
+        assert!(file.has_events());
+        let mut big = [0u8; 32];
+        assert_eq!(file.read_events(&mut big), EventRead::Read(32));
+        assert!(big.iter().all(|&b| b == 0xAB));
+        assert!(!file.has_events());
+    }
+
+    /// Linux fills the buffer with every whole event that fits, not just one.
+    #[test]
+    fn one_read_drains_as_many_whole_events_as_fit() {
+        let file = DrmFileState::new();
+        file.push_event(event(1, 32));
+        file.push_event(event(2, 32));
+        file.push_event(event(3, 32));
+
+        // Room for two and a half: two come back, the third stays queued.
+        let mut buf = [0u8; 80];
+        assert_eq!(file.read_events(&mut buf), EventRead::Read(64));
+        assert!(buf[..32].iter().all(|&b| b == 1));
+        assert!(buf[32..64].iter().all(|&b| b == 2));
+        assert!(file.has_events());
+
+        assert_eq!(file.read_events(&mut buf), EventRead::Read(32));
+        assert_eq!(file.read_events(&mut buf), EventRead::Empty);
+    }
+}
+
+/// Handles and framebuffers are one process-wide table here, not the per-`drm_file`
+/// idr and fb list Linux keeps. The owner pid is what stands in for that, and
+/// these are the uAPI entry points where Linux resolves an id against the
+/// calling file: `drm_gem_object_lookup` for PRIME export and ADDFB, and
+/// `file_priv->fbs` for RMFB. Without the checks, handle ids are sequential
+/// from 1 and fb ids from 1, so reading the compositor's screen from an
+/// unprivileged process took no guessing.
+#[cfg(test)]
+mod gem_ownership_tests {
+    use super::*;
+
+    const A: u64 = 91_001;
+    const B: u64 = 91_002;
+
+    fn plant_handle(id: u32, pid: u64) {
+        let vmo = VmObject::new_paged(1);
+        DRM_STATE.lock().handles.push((
+            GemHandle {
+                id,
+                size: 4096,
+                phys_addr: 0x5_0000,
+            },
+            vmo,
+            pid,
+        ));
+    }
+
+    fn plant_fb(fb_id: u32, owner: u64) {
+        DRM_STATE.lock().framebuffers.push(DrmFramebuffer {
+            id: fb_id,
+            driver_fb_id: None,
+            gem_handle_id: 0,
+            width: 1,
+            height: 1,
+            pitch: 4,
+            phys_addr: 0x5_0000,
+            size: 4096,
+            owner,
+        });
+    }
+
+    fn forget(handle: u32, fb: u32) {
+        let mut state = DRM_STATE.lock();
+        state.handles.retain(|(h, _, _)| h.id != handle);
+        state.framebuffers.retain(|f| f.id != fb);
+    }
+
+    /// `ADDFB2` with someone else's handle. Building a framebuffer over it is
+    /// how process B gets an id it can `SETCRTC`/`PAGE_FLIP` — A's pixels onto
+    /// the panel, or blitted somewhere B can read.
+    #[test]
+    fn a_framebuffer_cannot_be_built_over_another_process_handle() {
+        let _serialised = super::test_globals::lock();
+        plant_handle(9801, A);
+
+        assert!(
+            resolve_gem_backing_for(9801, A).is_some(),
+            "its owner resolves it"
+        );
+        assert!(
+            resolve_gem_backing_for(9801, B).is_none(),
+            "another process must not"
+        );
+        // The kernel's own paths (pid 0) still resolve everything.
+        assert!(resolve_gem_backing_for(9801, 0).is_some());
+        assert!(
+            resolve_gem_backing(9801).is_some(),
+            "and the unchecked resolver the present path uses is unchanged"
+        );
+
+        forget(9801, 0);
+    }
+
+    /// `RMFB` of someone else's framebuffer. Removing the compositor's
+    /// scanout fb makes every later SETCRTC and PAGE_FLIP on it fail, and
+    /// wlroots retries the modeset forever.
+    #[test]
+    fn a_framebuffer_cannot_be_removed_by_another_process() {
+        let _serialised = super::test_globals::lock();
+        plant_fb(9802, A);
+
+        assert!(!rmfb_for(9802, B), "another process must not remove it");
+        assert!(
+            DRM_STATE.lock().framebuffers.iter().any(|f| f.id == 9802),
+            "and it must still be there afterwards"
+        );
+        // Indistinguishable from "no such framebuffer", so a prober learns
+        // nothing about what other clients own.
+        assert!(!rmfb_for(9899, B));
+
+        assert!(rmfb_for(9802, A), "its owner removes it");
+        assert!(!DRM_STATE.lock().framebuffers.iter().any(|f| f.id == 9802));
+    }
+
+    /// `GETFB`'s handle field: the enumeration half. Linux zeroes it for a
+    /// non-master caller rather than failing the call, so the geometry still
+    /// comes back.
+    #[test]
+    fn the_backing_handle_goes_only_to_the_framebuffers_creator() {
+        let _serialised = super::test_globals::lock();
+        plant_fb(9803, A);
+        let fb = get_fb(9803).expect("planted");
+
+        assert!(owned_by(fb.owner, A), "its creator sees the handle");
+        assert!(!owned_by(fb.owner, B), "another process gets zero");
+        assert!(owned_by(fb.owner, 0), "kernel-internal callers still do");
+
+        forget(0, 9803);
+    }
+}
+
+/// Turning a screen off, and a commit that fails leaving nothing behind.
+#[cfg(test)]
+mod blanking_and_atomic_rollback_tests {
+    use super::*;
+
+    /// The latch. There is no display backend in a host test, so what is
+    /// observable here is the state every consumer reads: whether the CRTC
+    /// counts as off, and whether the kernel's own repaints are suppressed.
+    #[test]
+    fn the_crtc_stays_off_until_something_presents() {
+        let _serialised = super::test_globals::lock();
+        set_crtc_blanked(false);
+        assert!(!crtc_blanked());
+
+        set_crtc_blanked(true);
+        assert!(crtc_blanked(), "DPMS off / SETCRTC(fb=0) turns it off");
+        // Idempotent: a compositor that writes DPMS off twice must not repaint.
+        set_crtc_blanked(true);
+        assert!(crtc_blanked());
+
+        set_crtc_blanked(false);
+        assert!(!crtc_blanked(), "and DPMS on turns it back on");
+    }
+
+    /// A commit that fails at the present must leave nothing behind. Applying
+    /// first and failing afterwards left `ACTIVE` and `MODE_ID` describing a
+    /// modeset that never reached the screen, so wlroots' next commit saw an
+    /// empty diff and never retried.
+    #[test]
+    fn a_failed_commit_leaves_the_state_exactly_as_it_was() {
+        let _serialised = super::test_globals::lock();
+        let before = {
+            let mut state = DRM_STATE.lock();
+            state.atomic.active = true;
+            state.atomic.crtc_w = 1920;
+            state.crtc_fb = 4242;
+            (state.atomic, state.crtc_fb)
+        };
+
+        // Stand in for the commit phase having already run: mutate, then roll
+        // back the way the present-failure path does.
+        {
+            let mut state = DRM_STATE.lock();
+            state.atomic.active = false;
+            state.atomic.crtc_w = 640;
+            state.crtc_fb = 7;
+        }
+        restore_atomic_state((before.0, before.1, None));
+
+        let after = {
+            let state = DRM_STATE.lock();
+            (state.atomic, state.crtc_fb)
+        };
+        assert!(after.0.active, "ACTIVE must be what it was");
+        assert_eq!(after.0.crtc_w, 1920, "and so must the plane geometry");
+        assert_eq!(after.1, before.1, "and the CRTC's framebuffer");
+
+        let mut state = DRM_STATE.lock();
+        state.crtc_fb = 0;
+        state.atomic = AtomicKmsState::default();
     }
 }
