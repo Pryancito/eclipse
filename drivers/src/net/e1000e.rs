@@ -1468,7 +1468,7 @@ impl E1000eHw {
     /// Bank detect via signature word 0x13 (Linux `e1000_valid_nvm_bank_detect_ich8lan` SPT).
     unsafe fn ich_flash_active_bank_words(&self) -> u32 {
         let strap = mmio_read(self.base, E1000E_STRAP);
-        let nvm_size = ((((strap >> 1) & 0x1F) + 1) * 4096) as u32;
+        let nvm_size = (((strap >> 1) & 0x1F) + 1) * 4096;
         let bank_words = (nvm_size / 2) / 2; // words per bank
 
         // Signature at word offset 0x13 of each bank; valid if (sig & 0xC0) == 0x80.

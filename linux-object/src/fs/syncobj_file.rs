@@ -301,11 +301,9 @@ impl FileLike for SyncobjHandle {
         events: PollEvents,
         waker: &core::task::Waker,
     ) -> Option<crate::sync::ReadinessSub> {
-        if self.sync_file_point.is_none() {
-            // Opaque syncobj fds are not the sync_wait path; leave them
-            // unsubscribable so sys_poll keeps its short tick.
-            return None;
-        }
+        // Opaque syncobj fds are not the sync_wait path; leave them
+        // unsubscribable so sys_poll keeps its short tick.
+        self.sync_file_point?;
         // Re-check before parking: a fence that landed between the scan and
         // subscribe must latch READABLE so the EventBus fires the waker now.
         let _ = self.fence_ready();
