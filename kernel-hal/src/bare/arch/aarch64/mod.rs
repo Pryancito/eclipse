@@ -46,8 +46,13 @@ pub fn primary_init_early() {
     drivers::init_early();
 }
 
-pub fn primary_init() {
+/// Switch this CPU onto the kernel's own page table. See the riscv64 twin of
+/// this function for why it is not the first line of [`primary_init`].
+pub fn activate_kernel_page_table() {
     vm::init();
+}
+
+pub fn primary_init() {
     drivers::init();
     // Bring up secondary cores now that the kernel page table and GIC are ready.
     smp::start_secondary_cores();

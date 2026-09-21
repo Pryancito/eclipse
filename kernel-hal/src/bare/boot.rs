@@ -83,6 +83,12 @@ hal_fn_impl! {
                 }
             );
             crate::vm::pin_kernel_vmtoken();
+            // And run on it from here, rather than several steps further down
+            // in `arch::primary_init`. `stack_guard::init` and the first
+            // `Executor::new` are below, and they edit the page table the CPU
+            // is actually running on -- which, until this call, was the one the
+            // boot code built to leave physical addressing behind.
+            super::arch::activate_kernel_page_table();
             // Bind this CPU to its PercpuBlock (sets the GS fast-path on x86_64).
             super::percpu::register();
             // Let the scheduler kick halted CPUs on cross-CPU wakes instead of
