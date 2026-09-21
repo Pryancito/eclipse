@@ -566,8 +566,10 @@ impl Syscall<'_> {
         if which > ITIMER_PROF {
             return Err(LxError::EINVAL);
         }
-        // Linux validates the microsecond fields' range.
-        if val.value.usec >= 1_000_000 || val.interval.usec >= 1_000_000 {
+        // Linux validates both fields of both timevals: the microseconds
+        // have to be a fraction of a second and the seconds must not be
+        // negative.
+        if !val.value.valid() || !val.interval.valid() {
             return Err(LxError::EINVAL);
         }
         let value = Duration::from(val.value);
@@ -706,6 +708,10 @@ impl Syscall<'_> {
         const TIMER_ABSTIME: usize = 1;
         let owner = self.zircon_process().id();
         let spec = new_value.read()?;
+        // Linux validates both timespecs of the itimerspec before arming.
+        if !spec.interval.valid() || !spec.value.valid() {
+            return Err(LxError::EINVAL);
+        }
         let interval = timespec_to_duration(spec.interval);
         let init = timespec_to_duration(spec.value);
         let now = kernel_hal::timer::timer_now();

@@ -396,7 +396,10 @@ impl Syscall<'_> {
         } else {
             let timeout = timeout.read()?;
             info!("sys_ppoll: timeout: {:?}", timeout);
-            timeout.to_msec() as isize
+            // Validated, not cast: a `timespec` out of range is EINVAL, and
+            // a huge one must stay finite rather than turn into the
+            // negative value that means "wait for ever".
+            timeout.try_into_poll_msecs()?
         };
 
         let mut guard = self.install_temp_sigmask(sigmask, sigsetsize)?;
@@ -427,7 +430,7 @@ impl Syscall<'_> {
         let timeout_msecs = if timeout.is_null() {
             -1
         } else {
-            timeout.read()?.to_msec() as isize
+            timeout.read()?.try_into_poll_msecs()?
         };
         // 6th arg is a pointer to `{ const sigset_t *ss; size_t ss_len; }`.
         let (sigmask, sigsetsize) = if sigset_arg == 0 {
@@ -476,7 +479,7 @@ impl Syscall<'_> {
         } */
         let timeout_msecs = if !timeout.is_null() {
             let timeout = timeout.read()?;
-            timeout.to_msec() as isize
+            timeout.try_into_poll_msecs()?
         } else {
             // infinity
             -1

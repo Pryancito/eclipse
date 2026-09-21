@@ -103,6 +103,26 @@ impl TimeVal {
     pub fn valid(&self) -> bool {
         self.usec < USEC_PER_SEC && (self.sec as isize) >= 0
     }
+
+    /// See [`TimeSpec::try_into_poll_msecs`]; `select(2)` takes its timeout
+    /// as a `timeval`.
+    pub fn try_into_poll_msecs(&self) -> crate::error::LxResult<isize> {
+        if self.valid() {
+            Ok(self.to_msec().min(isize::MAX as usize) as isize)
+        } else {
+            Err(crate::error::LxError::EINVAL)
+        }
+    }
+
+    /// The duration this `timeval` names, or `EINVAL` if it does not name
+    /// one.
+    pub fn try_into_duration(&self) -> crate::error::LxResult<Duration> {
+        if self.valid() {
+            Ok(Duration::new(self.sec as u64, (self.usec * 1_000) as u32))
+        } else {
+            Err(crate::error::LxError::EINVAL)
+        }
+    }
 }
 
 impl TimeSpec {
@@ -154,6 +174,20 @@ impl TimeSpec {
     /// reads.
     pub fn valid(&self) -> bool {
         self.nsec < NSEC_PER_SEC && (self.sec as isize) >= 0
+    }
+
+    /// Timeout in milliseconds for `poll` and `select`, in the
+    /// representation those take: a **negative** value there means "wait for
+    /// ever". A cast alone is not enough, because the milliseconds are a
+    /// `usize` and anything from 2^63 up comes out negative -- a program
+    /// asking for a very long but finite wait would silently get an infinite
+    /// one and hang with no way to tell why. Clamping keeps it finite.
+    pub fn try_into_poll_msecs(&self) -> crate::error::LxResult<isize> {
+        if self.valid() {
+            Ok(self.to_msec().min(isize::MAX as usize) as isize)
+        } else {
+            Err(crate::error::LxError::EINVAL)
+        }
     }
 
     /// The duration this `timespec` names, or `EINVAL` if it does not name
@@ -466,6 +500,121 @@ mod time_tests {
                     nsec
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_huge_timeout_stays_finite_instead_of_meaning_for_ever() {
+        // `poll` and `select` spell "wait for ever" as a negative isize. The
+        // milliseconds are a usize, so anything from 2^63 up casts to a
+        // negative value and the caller silently gets an infinite wait with
+        // no way to tell why. A legal `tv_sec` reaches that easily: the
+        // field is a signed 64-bit time_t, and 2^63 milliseconds is only
+        // about 2^53 seconds.
+        let huge = TimeSpec {
+            sec: 1 << 60,
+            nsec: 0,
+        };
+        assert!(huge.valid(), "this is a timespec userspace may send");
+        let ms = huge.try_into_poll_msecs().unwrap();
+        assert!(ms > 0, "a finite wait came out as {}", ms);
+        assert_eq!(ms, isize::MAX, "and is clamped, not wrapped");
+        // The largest legal one, too.
+        let ms = TimeSpec {
+            sec: isize::MAX as usize,
+            nsec: 0,
+        }
+        .try_into_poll_msecs()
+        .unwrap();
+        assert!(ms > 0);
+        // `select(2)` takes a timeval and has exactly the same hazard.
+        let huge = TimeVal {
+            sec: 1 << 60,
+            usec: 0,
+        };
+        assert!(huge.valid());
+        let ms = huge.try_into_poll_msecs().unwrap();
+        assert!(ms > 0, "a finite wait came out as {}", ms);
+        assert_eq!(ms, isize::MAX);
+    }
+
+    #[test]
+    fn an_out_of_range_timeout_is_refused_by_the_poll_conversion_too() {
+        assert!(TimeSpec {
+            sec: NEG_ONE,
+            nsec: 0
+        }
+        .try_into_poll_msecs()
+        .is_err());
+        assert!(TimeSpec {
+            sec: 0,
+            nsec: NSEC_PER_SEC
+        }
+        .try_into_poll_msecs()
+        .is_err());
+        assert!(TimeVal {
+            sec: NEG_ONE,
+            usec: 0
+        }
+        .try_into_poll_msecs()
+        .is_err());
+        assert!(TimeVal {
+            sec: 0,
+            usec: USEC_PER_SEC
+        }
+        .try_into_poll_msecs()
+        .is_err());
+    }
+
+    #[test]
+    fn an_ordinary_timeout_converts_to_the_milliseconds_it_names() {
+        // Zero has to stay zero: `poll` reads it as "check and return now",
+        // and turning it into anything else makes a non-blocking poll block.
+        assert_eq!(
+            TimeSpec { sec: 0, nsec: 0 }.try_into_poll_msecs().unwrap(),
+            0
+        );
+        assert_eq!(
+            TimeSpec {
+                sec: 0,
+                nsec: 100_000_000
+            }
+            .try_into_poll_msecs()
+            .unwrap(),
+            100
+        );
+        assert_eq!(
+            TimeVal {
+                sec: 2,
+                usec: 500_000
+            }
+            .try_into_poll_msecs()
+            .unwrap(),
+            2_500
+        );
+    }
+
+    #[test]
+    fn a_timeval_converts_to_exactly_the_duration_it_names() {
+        assert_eq!(
+            TimeVal {
+                sec: 1,
+                usec: 250_000
+            }
+            .try_into_duration()
+            .unwrap(),
+            Duration::from_millis(1_250)
+        );
+        assert!(TimeVal {
+            sec: 0,
+            usec: USEC_PER_SEC
+        }
+        .try_into_duration()
+        .is_err());
+        // And agrees with the infallible conversion where both are defined.
+        for &(sec, usec) in &[(0usize, 0usize), (1, 1), (7, 999_999), (1 << 40, 500_000)] {
+            let t = TimeVal { sec, usec };
+            assert_eq!(Duration::from(t), t.try_into_duration().unwrap());
         }
     }
 

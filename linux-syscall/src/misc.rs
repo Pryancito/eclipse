@@ -549,14 +549,21 @@ impl Syscall<'_> {
                     None
                 } else {
                     let timeout_addr: UserInPtr<TimeSpec> = val2.into();
-                    timeout_addr.read_if_not_null()?.map(|timeout| {
-                        let now = if cmd == FUTEX_LOCK_PI || op & FUTEX_CLOCK_REALTIME != 0 {
-                            Duration::from(TimeSpec::now())
-                        } else {
-                            Duration::from(TimeSpec::now_monotonic())
-                        };
-                        timer_now() + Duration::from(timeout).saturating_sub(now)
-                    })
+                    match timeout_addr.read_if_not_null()? {
+                        None => None,
+                        Some(timeout) => {
+                            let now = if cmd == FUTEX_LOCK_PI || op & FUTEX_CLOCK_REALTIME != 0 {
+                                Duration::from(TimeSpec::now())
+                            } else {
+                                Duration::from(TimeSpec::now_monotonic())
+                            };
+                            // Validated and saturating: a `timespec` out of
+                            // range is EINVAL, and adding a `Duration`
+                            // panics on overflow.
+                            let dur = timeout.try_into_duration()?;
+                            Some(timer_now().saturating_add(dur.saturating_sub(now)))
+                        }
+                    }
                 };
                 loop {
                     let cur = futex.load();
@@ -638,15 +645,18 @@ impl Syscall<'_> {
                     // takes an absolute one on the clock selected by
                     // FUTEX_CLOCK_REALTIME. Convert absolute deadlines to the
                     // kernel's monotonic deadline base.
+                    // Validated and saturating: a `timespec` out of range is
+                    // EINVAL, and adding a `Duration` panics on overflow.
+                    let dur = timeout.try_into_duration()?;
                     let deadline = if cmd == FUTEX_WAIT_BITSET {
                         let now = if op & FUTEX_CLOCK_REALTIME != 0 {
                             Duration::from(TimeSpec::now())
                         } else {
                             Duration::from(TimeSpec::now_monotonic())
                         };
-                        timer_now() + Duration::from(timeout).saturating_sub(now)
+                        timer_now().saturating_add(dur.saturating_sub(now))
                     } else {
-                        timer_now() + Duration::from(timeout)
+                        timer_now().saturating_add(dur)
                     };
                     self.thread
                         .blocking_run(future, ThreadState::BlockedFutex, deadline, None)
