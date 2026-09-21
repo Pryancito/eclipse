@@ -8149,3 +8149,273 @@ mod event_queue_tests {
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
     }
 }
+
+/// `DRM_IOCTL_MODE_ATOMIC` end to end, and the `OUT_FENCE_PTR` writeback in
+/// particular.
+///
+/// No test in this file issued this ioctl at all: the atomic uAPI is opt-in via
+/// the `drm.atomic` cmdline flag, so `SET_CLIENT_CAP(ATOMIC)` refused every
+/// client and the whole arm was unreachable. `drm::set_atomic_enabled` makes it
+/// reachable, which matters because `OUT_FENCE_PTR` is a pointer the client
+/// hands the kernel to write a file descriptor into, and the decision table
+/// around that write is subtle: Linux writes `-1` on `TEST_ONLY` and on failure,
+/// a real fd on success, and -- the part that is easy to get backwards -- the
+/// write happens BEFORE the commit's own error is returned to the client. A
+/// client that gets an error with its fence slot untouched reads whatever was in
+/// it, which for an uninitialised `int` is a descriptor belonging to something
+/// else.
+#[cfg(test)]
+mod out_fence_tests {
+    use super::gl_client_sequence_tests::Client;
+    use super::*;
+    use crate::fs::devfs::kms_emu;
+    use alloc::vec::Vec;
+
+    /// A value that is neither a valid fd nor `-1`, so "was written" and "was
+    /// left alone" are distinguishable.
+    const UNWRITTEN: i32 = 0x5A5A_5A5A;
+
+    /// The property arrays of one atomic request, kept alive for as long as the
+    /// request points at them.
+    struct Request {
+        objs: Vec<u32>,
+        counts: Vec<u32>,
+        props: Vec<u32>,
+        values: Vec<u64>,
+    }
+
+    impl Request {
+        fn new(objs: &[u32], counts: &[u32], props: &[u32], values: &[u64]) -> Request {
+            Request {
+                objs: objs.to_vec(),
+                counts: counts.to_vec(),
+                props: props.to_vec(),
+                values: values.to_vec(),
+            }
+        }
+
+        fn ioctl(&self, flags: u32) -> DrmModeAtomic {
+            DrmModeAtomic {
+                flags,
+                count_objs: self.objs.len() as u32,
+                objs_ptr: self.objs.as_ptr() as u64,
+                count_props_ptr: self.counts.as_ptr() as u64,
+                props_ptr: self.props.as_ptr() as u64,
+                prop_values_ptr: self.values.as_ptr() as u64,
+                reserved: 0,
+                user_data: 0,
+            }
+        }
+    }
+
+    /// An atomic client on an output, with the cmdline flag on. Returns the
+    /// screen (which holds the test lock and puts the flag back on Drop) and the
+    /// client.
+    fn atomic_client(width: u32, height: u32) -> (kms_emu::Screen, Client) {
+        let screen = kms_emu::attach(width, height);
+        drm::set_atomic_enabled(true);
+        let c = Client::open(0);
+        let mut cap: [u64; 2] = [DRM_CLIENT_CAP_ATOMIC, 1];
+        c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap)
+            .expect("SET_CLIENT_CAP ATOMIC");
+        (screen, c)
+    }
+
+    /// A commit the check phase accepts as is: leaving the CRTC inactive needs
+    /// no mode and no modeset flag. It is the baseline every refusal below is
+    /// measured against, so a refusal cannot be the request's own fault.
+    fn benign_request() -> Request {
+        Request::new(&[drm::SYNTH_CRTC_ID], &[1], &[PROP_ACTIVE], &[0])
+    }
+
+    fn commit(c: &Client, req: &Request, flags: u32) -> Result<usize> {
+        let mut ioctl = req.ioctl(flags);
+        c.ioctl(DRM_IOCTL_MODE_ATOMIC, &mut ioctl)
+    }
+
+    /// Without the cap the ioctl is refused, and the cap itself is refused
+    /// unless the boot asked for it. That is the gate the whole arm sits behind
+    /// -- and with it shut, the rest of this module is unreachable, which is why
+    /// nothing tested it.
+    #[test]
+    fn the_atomic_ioctl_is_refused_until_the_boot_and_the_client_both_opt_in() {
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+        let mut cap: [u64; 2] = [DRM_CLIENT_CAP_ATOMIC, 1];
+
+        // Flag off: the capability is EOPNOTSUPP, like a Linux driver without
+        // DRIVER_ATOMIC, so a compositor falls back to legacy KMS.
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap),
+            Err(FsError::OpNotSupported)
+        );
+        let req = benign_request();
+        assert_eq!(
+            commit(&c, &req, 0),
+            Err(FsError::InvalidParam),
+            "a non-atomic client got an atomic commit"
+        );
+
+        // Flag on, cap negotiated: now it is reachable.
+        drm::set_atomic_enabled(true);
+        c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap)
+            .expect("SET_CLIENT_CAP ATOMIC");
+        assert!(commit(&c, &req, 0).is_ok());
+    }
+
+    /// A commit that FAILS still writes the out-fence slot, and writes `-1`.
+    /// The writeback sits before the commit's error is mapped on purpose: the
+    /// slot is the client's `int out_fence` local, and leaving it untouched
+    /// means the client reads whatever was on its stack and then closes or waits
+    /// on a descriptor that belongs to something else.
+    #[test]
+    fn a_failed_commit_still_writes_minus_one_into_the_out_fence_slot() {
+        let (_screen, c) = atomic_client(32, 8);
+        let mut slot: i32 = UNWRITTEN;
+        // A plane pointed at a CRTC that does not exist: staged fine, refused by
+        // the commit's check phase.
+        let req = Request::new(
+            &[drm::SYNTH_CRTC_ID, drm::SYNTH_PLANE_ID],
+            &[1, 1],
+            &[PROP_OUT_FENCE_PTR, PROP_CRTC_ID],
+            &[&mut slot as *mut i32 as u64, 0x999],
+        );
+
+        assert_eq!(
+            commit(&c, &req, 0),
+            Err(FsError::EntryNotFound),
+            "the bogus CRTC reference was accepted"
+        );
+        assert_eq!(slot, -1, "the client's fence slot was left uninitialised");
+    }
+
+    /// `TEST_ONLY` writes `-1` too: nothing was committed, so there is nothing
+    /// to fence. Handing back a real (already signaled) fd here would leak one
+    /// descriptor per `TEST_ONLY` probe, and wlroots probes on every output
+    /// reconfiguration.
+    #[test]
+    fn a_test_only_commit_writes_minus_one_and_presents_nothing() {
+        let (screen, c) = atomic_client(32, 8);
+        let mut slot: i32 = UNWRITTEN;
+        let req = Request::new(
+            &[drm::SYNTH_CRTC_ID],
+            &[2],
+            &[PROP_OUT_FENCE_PTR, PROP_ACTIVE],
+            &[&mut slot as *mut i32 as u64, 0],
+        );
+
+        commit(&c, &req, DRM_MODE_ATOMIC_TEST_ONLY).expect("TEST_ONLY commit");
+
+        assert_eq!(slot, -1, "TEST_ONLY did not write the fence slot");
+        assert!(
+            (0..8).all(|y| (0..32).all(|x| screen.pixel(x, y) == kms_emu::UNTOUCHED)),
+            "a TEST_ONLY commit put pixels on the screen"
+        );
+    }
+
+    /// A property the walk rejects aborts the commit BEFORE the fence is
+    /// written. The client sees an error and its slot untouched, which is the
+    /// one case where not writing is right: no commit was attempted, so there is
+    /// no fence to describe -- and `-1` would look like "committed, no fence".
+    #[test]
+    fn a_rejected_property_aborts_before_the_fence_is_written() {
+        let (_screen, c) = atomic_client(32, 8);
+        let mut slot: i32 = UNWRITTEN;
+        // The fence pointer is staged first, then an unknown property id.
+        let req = Request::new(
+            &[drm::SYNTH_CRTC_ID],
+            &[2],
+            &[PROP_OUT_FENCE_PTR, 0xDEAD],
+            &[&mut slot as *mut i32 as u64, 0],
+        );
+
+        assert!(
+            commit(&c, &req, 0).is_err(),
+            "an unknown property was staged"
+        );
+        assert_eq!(
+            slot, UNWRITTEN,
+            "a commit that never ran handed the client a fence"
+        );
+    }
+
+    /// A NULL out-fence pointer is legal and writes nothing. libdrm passes NULL
+    /// whenever the caller did not ask for a fence, so faulting on it would
+    /// refuse every ordinary commit.
+    #[test]
+    fn a_null_out_fence_pointer_is_accepted_and_writes_nothing() {
+        let (_screen, c) = atomic_client(32, 8);
+        let req = Request::new(
+            &[drm::SYNTH_CRTC_ID],
+            &[2],
+            &[PROP_OUT_FENCE_PTR, PROP_ACTIVE],
+            &[0, 0],
+        );
+
+        commit(&c, &req, 0).expect("a commit with no fence must be accepted");
+    }
+
+    /// The flag guards of the arm, all of which Linux enforces: an unknown flag,
+    /// a non-zero `reserved`, an async flip (this tree advertises no async
+    /// support) and `TEST_ONLY` carrying a flip event are each `EINVAL`. A
+    /// kernel that quietly accepts a flag it does not implement is worse than
+    /// one that refuses it: the client then waits for behaviour that never
+    /// arrives.
+    #[test]
+    fn the_flag_guards_refuse_what_this_tree_does_not_implement() {
+        let (_screen, c) = atomic_client(32, 8);
+        let req = benign_request();
+
+        let unknown = DRM_MODE_ATOMIC_FLAGS.wrapping_add(1) & !DRM_MODE_ATOMIC_FLAGS;
+        assert_eq!(commit(&c, &req, unknown), Err(FsError::InvalidParam));
+        assert_eq!(
+            commit(&c, &req, DRM_MODE_PAGE_FLIP_ASYNC),
+            Err(FsError::InvalidParam),
+            "an async flip was accepted without async support"
+        );
+        assert_eq!(
+            commit(
+                &c,
+                &req,
+                DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_PAGE_FLIP_EVENT
+            ),
+            Err(FsError::InvalidParam),
+            "a test commit was allowed to queue a flip event"
+        );
+        // `reserved` must be zero.
+        let mut ioctl = req.ioctl(0);
+        ioctl.reserved = 1;
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_MODE_ATOMIC, &mut ioctl),
+            Err(FsError::InvalidParam)
+        );
+        // And the same request with none of that is fine, so the refusals above
+        // are the flags and not the request.
+        assert!(commit(&c, &req, 0).is_ok());
+    }
+
+    /// Turning a CRTC on is a modeset, and a modeset needs both the client's
+    /// `ALLOW_MODESET` flag and a mode. Linux refuses `ACTIVE=1` without the
+    /// flag ("[CRTC] requires full modeset") and again without a mode; a kernel
+    /// that let either through would light a CRTC with no timings programmed,
+    /// which on real hardware is a blank panel the compositor believes is up.
+    #[test]
+    fn activating_a_crtc_needs_both_the_modeset_flag_and_a_mode() {
+        let (_screen, c) = atomic_client(32, 8);
+        let req = Request::new(&[drm::SYNTH_CRTC_ID], &[1], &[PROP_ACTIVE], &[1]);
+
+        assert_eq!(
+            commit(&c, &req, 0),
+            Err(FsError::InvalidParam),
+            "a modeset went through without ALLOW_MODESET"
+        );
+        assert_eq!(
+            commit(&c, &req, DRM_MODE_ATOMIC_ALLOW_MODESET),
+            Err(FsError::InvalidParam),
+            "a CRTC was activated with no mode set"
+        );
+        // Leaving it off is not a modeset, so the same property with the other
+        // value needs neither.
+        assert!(commit(&c, &benign_request(), 0).is_ok());
+    }
+}
