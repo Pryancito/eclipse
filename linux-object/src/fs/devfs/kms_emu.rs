@@ -278,12 +278,28 @@ pub(crate) struct CreatedFb {
     pub(crate) driver_fb_id: u32,
 }
 
+/// One cursor image the emulated GPU was offered, exactly as the core handed it
+/// over. The pixels matter: a plane fed the wrong rows draws a garbled pointer,
+/// and that is indistinguishable from "the plane took it" if only the call is
+/// counted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CursorImage {
+    pub(crate) argb: Vec<u32>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
 #[derive(Default)]
 struct GpuCalls {
     created_fbs: Vec<CreatedFb>,
     /// Framebuffer ids `page_flip` was called with, in order.
     flips: Vec<u32>,
     vblank_waits: u32,
+    /// Every image offered to `hw_cursor_set`, accepted or not.
+    cursor_images: Vec<CursorImage>,
+    /// Positions `hw_cursor_move` was given, in order.
+    cursor_moves: Vec<(i32, i32)>,
+    cursor_hides: u32,
 }
 
 /// An emulated GPU driver. Build one with [`EmuGpu::new`], set what it claims,
@@ -297,6 +313,10 @@ pub(crate) struct EmuGpu {
     /// Whether `page_flip` succeeds. A driver that refuses is the whole reason
     /// the software fallback exists, so it has to be reachable.
     accepts_flips: AtomicBool,
+    /// Whether the display engine has a cursor plane to give. A driver without
+    /// one still gets offered the image and answers `false`, which is what puts
+    /// the software pointer back in charge.
+    hw_cursor_plane: AtomicBool,
     next_fb: AtomicU32,
     calls: Mutex<GpuCalls>,
 }
@@ -312,6 +332,7 @@ impl EmuGpu {
             connectors: alloc::vec![41],
             planes: alloc::vec![42],
             accepts_flips: AtomicBool::new(true),
+            hw_cursor_plane: AtomicBool::new(false),
             next_fb: AtomicU32::new(EMU_DRIVER_FB_BASE),
             calls: Mutex::new(GpuCalls::default()),
         }
@@ -334,6 +355,14 @@ impl EmuGpu {
         self.crtcs = alloc::vec![crtc];
         self.connectors = alloc::vec![connector];
         self.planes = alloc::vec![plane];
+        self
+    }
+
+    /// Give this GPU a working display-engine cursor plane, like the NVIDIA
+    /// driver's NVC57E cursor surface with `nvidia.hwcursor` on. Without it
+    /// `hw_cursor_set` refuses, which is the default everywhere else.
+    pub(crate) fn with_cursor_plane(self) -> EmuGpu {
+        self.hw_cursor_plane.store(true, Ordering::Relaxed);
         self
     }
 }
@@ -375,10 +404,29 @@ impl DrmScheme for EmuGpu {
         self.accepts_flips.load(Ordering::Relaxed)
     }
 
-    /// No hardware cursor plane, which is the default on this tree: the
-    /// `nvidia.hwcursor` flag is off, so the pointer stays software-composited.
+    /// The legacy per-driver cursor ioctl, which nothing on this tree uses: the
+    /// pointer goes through `hw_cursor_*` or through the software compositor.
     fn set_cursor(&self, _crtc_id: u32, _x: i32, _y: i32, _handle: u32, _flags: u32) -> bool {
         false
+    }
+
+    fn hw_cursor_set(&self, argb: &[u32], w: u32, h: u32) -> bool {
+        self.calls.lock().cursor_images.push(CursorImage {
+            argb: argb.to_vec(),
+            width: w,
+            height: h,
+        });
+        self.hw_cursor_plane.load(Ordering::Relaxed)
+    }
+
+    fn hw_cursor_move(&self, x: i32, y: i32) -> bool {
+        self.calls.lock().cursor_moves.push((x, y));
+        self.hw_cursor_plane.load(Ordering::Relaxed)
+    }
+
+    fn hw_cursor_hide(&self) -> bool {
+        self.calls.lock().cursor_hides += 1;
+        self.hw_cursor_plane.load(Ordering::Relaxed)
     }
 
     fn wait_vblank(&self, _crtc_id: u32) -> bool {
@@ -483,6 +531,21 @@ impl Gpu {
     /// to the software blit rather than leave the panel dark.
     pub(crate) fn refuse_flips(&self) {
         self.gpu.accepts_flips.store(false, Ordering::Relaxed);
+    }
+
+    /// Every cursor image the driver was offered, in order.
+    pub(crate) fn cursor_images(&self) -> Vec<CursorImage> {
+        self.gpu.calls.lock().cursor_images.clone()
+    }
+
+    /// Every position the driver's cursor plane was moved to, in order.
+    pub(crate) fn cursor_moves(&self) -> Vec<(i32, i32)> {
+        self.gpu.calls.lock().cursor_moves.clone()
+    }
+
+    /// How many times the driver was told to switch its cursor plane off.
+    pub(crate) fn cursor_hides(&self) -> u32 {
+        self.gpu.calls.lock().cursor_hides
     }
 }
 

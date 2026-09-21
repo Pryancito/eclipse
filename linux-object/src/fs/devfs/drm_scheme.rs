@@ -6251,6 +6251,233 @@ mod hw_kms_tests {
         c.rmfb(fb).expect("RMFB");
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
     }
+
+    /// `DRM_MODE_CURSOR` with the MOVE bit alone, which is what a compositor
+    /// sends on every pointer motion.
+    fn move_cursor(c: &Client, crtc_id: u32, x: i32, y: i32) {
+        let mut cur = ModeCursor {
+            flags: 0x02, // MOVE
+            crtc_id,
+            x,
+            y,
+            width: 0,
+            height: 0,
+            handle: 0,
+        };
+        c.ioctl(DRM_IOCTL_MODE_CURSOR, &mut cur)
+            .expect("CURSOR MOVE");
+    }
+
+    /// Paint a dumb buffer so every word says which word it is. The cursor
+    /// bitmap is read tightly packed at `w * h` words while the buffer's own
+    /// pitch is rounded up to 64 bytes, so a bitmap taken by stride instead of
+    /// by row would hand the plane the wrong words -- and a flat fill could not
+    /// tell the two apart.
+    fn paint_indexed(buf: &DrmModeCreateDumb, base: u32) {
+        let (pa, size) =
+            drm::resolve_gem_backing(buf.handle).expect("a dumb buffer must have backing");
+        let va = phys_to_virt(pa as usize);
+        // SAFETY: `size` bytes of contiguous physical memory owned by this
+        // buffer, identity-mapped into the kernel window at `va`.
+        let px = unsafe { core::slice::from_raw_parts_mut(va as *mut u32, size / 4) };
+        for (i, p) in px.iter_mut().enumerate() {
+            *p = base | i as u32;
+        }
+    }
+
+    /// Set an 8x8 pointer at (4, 2) and report where the software compositor
+    /// left it. `true` means the CPU drew the pointer into the scanout, which is
+    /// exactly what must NOT happen once the display engine owns it.
+    fn software_pointer_lands_after_a_flip(
+        screen: &kms_emu::Screen,
+        c: &Client,
+        fb: u32,
+        seq: u64,
+    ) -> bool {
+        screen.repaint(UNTOUCHED);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, seq).expect("flip");
+        drm::flush_pending_flip_completions();
+        let mut sink = [0u8; 32];
+        let _ = c.read_events(&mut sink);
+        screen.pixel(4, 2) == 0xFF00_00FF
+    }
+
+    /// With `nvidia.hwcursor` on and a plane that takes the image, the display
+    /// engine owns the pointer: it gets the bitmap and every motion, and the CPU
+    /// never composites again. That last half is the point -- the hardware plane
+    /// and the software compositor drawing the same pointer leaves two of them
+    /// on screen, the CPU one smearing a frame behind.
+    #[test]
+    fn the_display_engine_cursor_plane_takes_the_pointer_when_the_driver_accepts_it() {
+        let screen = kms_emu::attach(64, 16);
+        let gpu = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu").with_cursor_plane());
+        drm::set_hw_cursor_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 16);
+        paint(&buf, 0x0000_1111);
+        let fb = c.addfb2(&buf);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 1).expect("flip");
+        drm::flush_pending_flip_completions();
+        let mut sink = [0u8; 32];
+        let _ = c.read_events(&mut sink);
+
+        let cur = c.create_dumb(8, 8);
+        paint_indexed(&cur, 0xFF00_0000);
+        set_cursor(&c, drm::SYNTH_CRTC_ID, cur.handle, 8, 8, 4, 2);
+
+        // The plane got the image, row-packed, all 64 words of it.
+        let images = gpu.cursor_images();
+        assert_eq!(images.len(), 1, "the plane was not offered the image");
+        assert_eq!((images[0].width, images[0].height), (8, 8));
+        let want: Vec<u32> = (0..64).map(|i| 0xFF00_0000 | i).collect();
+        assert_eq!(images[0].argb, want, "the plane got the wrong words");
+
+        // And it was landed on the pointer's position. Two moves: taking the
+        // image puts the plane where the pointer already is (without that, a
+        // client that sets an image and never moves again leaves the pointer
+        // wherever the plane happened to be), then the MOVE half of the same
+        // ioctl carries it to (4, 2).
+        assert_eq!(gpu.cursor_moves(), alloc::vec![(0, 0), (4, 2)]);
+
+        // Nothing was drawn by the CPU, either by the cursor ioctl...
+        assert!(
+            (0..16).all(|y| (0..64).all(|x| screen.pixel(x, y) == UNTOUCHED)),
+            "the CPU composited a pointer the display engine owns"
+        );
+        // ...or by the frame that follows it.
+        assert!(
+            !software_pointer_lands_after_a_flip(&screen, &c, fb, 2),
+            "a driver flip put a second, software pointer on the screen"
+        );
+        // A motion is one register write in the driver and nothing else.
+        screen.repaint(UNTOUCHED);
+        move_cursor(&c, drm::SYNTH_CRTC_ID, 9, 3);
+        assert_eq!(gpu.cursor_moves().last(), Some(&(9, 3)));
+        assert!(
+            (0..16).all(|y| (0..64).all(|x| screen.pixel(x, y) == UNTOUCHED)),
+            "a pointer motion repainted while the display engine owns the plane"
+        );
+
+        set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// A driver whose plane will not take the image must leave the software
+    /// pointer in charge. The upload goes through the RM gate and can fail on a
+    /// real card (no cursor surface on the head, a format the engine refuses);
+    /// standing down on the CPU side anyway is a desktop with no pointer at all.
+    #[test]
+    fn a_driver_that_refuses_the_cursor_image_leaves_the_software_pointer_in_charge() {
+        let screen = kms_emu::attach(64, 16);
+        // Hardware KMS, but no cursor plane to give.
+        let gpu = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu"));
+        drm::set_hw_cursor_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 16);
+        paint(&buf, 0x0000_1111);
+        let fb = c.addfb2(&buf);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 1).expect("flip");
+        drm::flush_pending_flip_completions();
+        let mut sink = [0u8; 32];
+        let _ = c.read_events(&mut sink);
+
+        let cur = c.create_dumb(8, 8);
+        paint(&cur, 0xFF00_00FF);
+        set_cursor(&c, drm::SYNTH_CRTC_ID, cur.handle, 8, 8, 4, 2);
+
+        // The image was offered and refused, so the plane was never moved.
+        assert_eq!(gpu.cursor_images().len(), 1, "the plane was not offered");
+        assert!(
+            gpu.cursor_moves().is_empty(),
+            "a refused plane was moved anyway"
+        );
+        // And the CPU is drawing the pointer again.
+        assert!(
+            software_pointer_lands_after_a_flip(&screen, &c, fb, 2),
+            "the pointer is drawn by nobody"
+        );
+
+        set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// Hiding the pointer switches the hardware plane off. The software path
+    /// hides by simply not drawing, so a plane that is never told stays
+    /// composited by the display engine -- the pointer sticks on screen after
+    /// the compositor has hidden it (fullscreen video, a game grabbing it) and
+    /// nothing userspace does can take it away.
+    #[test]
+    fn hiding_the_pointer_switches_the_hardware_plane_off() {
+        let screen = kms_emu::attach(64, 16);
+        let gpu = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu").with_cursor_plane());
+        drm::set_hw_cursor_enabled(true);
+        let c = Client::open(0);
+
+        let cur = c.create_dumb(8, 8);
+        paint(&cur, 0xFF00_00FF);
+        set_cursor(&c, drm::SYNTH_CRTC_ID, cur.handle, 8, 8, 4, 2);
+        assert_eq!(gpu.cursor_images().len(), 1);
+        assert_eq!(gpu.cursor_hides(), 0, "the plane was hidden while in use");
+
+        set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
+        assert_eq!(gpu.cursor_hides(), 1, "the plane was left switched on");
+
+        // And a second hide does not go back to the driver: there is nothing on
+        // the plane to switch off, and this runs per hidden frame.
+        set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
+        assert_eq!(gpu.cursor_hides(), 1);
+
+        c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
+    }
+
+    /// The plane is not offered the image unless the flag is on. The
+    /// display-engine cursor is opt-in (`nvidia.hwcursor`) precisely because it
+    /// is the half of the bring-up that is not trusted yet, so a driver that
+    /// implements it must not start owning the pointer on a default boot.
+    #[test]
+    fn the_plane_is_not_offered_the_image_unless_the_flag_is_on() {
+        let screen = kms_emu::attach(64, 16);
+        // A plane that WOULD take it, which is what makes the flag the only
+        // thing standing between this boot and the hardware path.
+        let gpu = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu").with_cursor_plane());
+        drm::set_hw_cursor_enabled(false);
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 16);
+        paint(&buf, 0x0000_1111);
+        let fb = c.addfb2(&buf);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 1).expect("flip");
+        drm::flush_pending_flip_completions();
+        let mut sink = [0u8; 32];
+        let _ = c.read_events(&mut sink);
+
+        let cur = c.create_dumb(8, 8);
+        paint(&cur, 0xFF00_00FF);
+        set_cursor(&c, drm::SYNTH_CRTC_ID, cur.handle, 8, 8, 4, 2);
+
+        assert!(
+            gpu.cursor_images().is_empty(),
+            "the plane was offered the image with the flag off"
+        );
+        assert!(gpu.cursor_moves().is_empty());
+        assert!(
+            software_pointer_lands_after_a_flip(&screen, &c, fb, 2),
+            "the pointer is drawn by nobody"
+        );
+
+        set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
+        assert_eq!(
+            gpu.cursor_hides(),
+            0,
+            "a plane that never took the pointer was told to hide it"
+        );
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
 }
 
 #[cfg(test)]

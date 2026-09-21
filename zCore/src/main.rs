@@ -520,6 +520,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // Deferred bring-up is scheduled AFTER 100% (see
             // schedule_deferred_console_bringup) with scanout paused.
             if options.cmdline.contains("nvidia.hwcursor") {
+                linux_object::fs::devfs::drm::set_hw_cursor_enabled(true);
                 klog_info!(
                     "Eclipse: nvidia.hwcursor ON — bring-up diferido tras escritorio \
                      (scanout pausado); cursor software hasta entonces"

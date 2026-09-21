@@ -2485,18 +2485,32 @@ pub fn set_cursor_bo(handle_id: u32, w: u32, h: u32) -> bool {
     true
 }
 
-/// `true` when the kernel cmdline opts into the display-engine hardware
-/// cursor (`nvidia.hwcursor`). Cached after the first look: this is on every
-/// pointer-motion path.
+/// Whether the display-engine cursor plane may take the pointer
+/// (`nvidia.hwcursor`): 0 = nobody has said, 1 = yes, 2 = no. Read on every
+/// pointer-motion path, so it is an atomic and never re-parses anything.
+static HW_CURSOR: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Opt into (or out of) the display-engine hardware cursor.
+///
+/// Called from boot where every other `nvidia.*` flag is parsed. It used to be
+/// the only one of them read straight from the cmdline down here, which meant
+/// nothing could ever exercise the hardware-cursor path except a real boot with
+/// the flag on -- and that path decides whether the pointer is drawn by the CPU
+/// or by the display engine, so "the pointer vanished" had no test either way.
+pub fn set_hw_cursor_enabled(v: bool) {
+    HW_CURSOR.store(if v { 1 } else { 2 }, Ordering::Relaxed);
+}
+
+/// `true` when the display-engine hardware cursor is opted into.
 fn hw_cursor_wanted() -> bool {
-    use core::sync::atomic::AtomicU8;
-    static WANTED: AtomicU8 = AtomicU8::new(0); // 0 unknown, 1 yes, 2 no
-    match WANTED.load(Ordering::Relaxed) {
+    match HW_CURSOR.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
+        // Nobody called `set_hw_cursor_enabled`: fall back to the cmdline, so
+        // the flag still works in a build whose boot path does not set it.
         _ => {
             let yes = kernel_hal::boot::cmdline().contains("nvidia.hwcursor");
-            WANTED.store(if yes { 1 } else { 2 }, Ordering::Relaxed);
+            HW_CURSOR.store(if yes { 1 } else { 2 }, Ordering::Relaxed);
             yes
         }
     }
@@ -4538,6 +4552,8 @@ pub fn get_plane(id: u32) -> Option<DrmPlane> {
 #[cfg(test)]
 pub(crate) fn reset_output_state_for_test() {
     set_crtc_blanked(false);
+    // Back to "nobody has said", which is what a fresh process looks like.
+    HW_CURSOR.store(0, Ordering::Relaxed);
     let mut st = DRM_STATE.lock();
     st.cursor = CursorState::default();
     st.crtc_fb = 0;
