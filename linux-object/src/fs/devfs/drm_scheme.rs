@@ -8462,4 +8462,55 @@ mod out_fence_tests {
         commit(&c, &req, DRM_MODE_ATOMIC_ALLOW_MODESET)
             .expect("a modeset with the flag and a matching mode must be accepted");
     }
+
+    /// A `MODE_ID` blob has to be exactly one `drm_mode_modeinfo` and has to
+    /// name the mode the panel actually scans out. Neither is pedantry: the
+    /// timings are read out of the blob by offset, so a short one reads past it,
+    /// and a mode this tree cannot scan out is the "wlroots picked a mode we
+    /// don't scan out" failure, where the commit succeeds and the screen stays
+    /// black.
+    ///
+    /// Two of the three are defended twice, so do not go chasing a surviving
+    /// mutation here: a short blob and a missing one both end up read as
+    /// `0x0`, which the panel-mode comparison refuses anyway. Deleting either
+    /// of those two checks on its own therefore keeps every assertion below
+    /// green. What the test pins is the contract -- none of the three is ever
+    /// accepted -- not which line does the refusing.
+    #[test]
+    fn a_mode_blob_must_be_one_modeinfo_and_name_the_panels_own_mode() {
+        let (_screen, c) = atomic_client(32, 8);
+
+        let new_blob = |bytes: &[u8]| -> u32 {
+            let mut blob = DrmModeCreateBlob {
+                data: bytes.as_ptr() as u64,
+                length: bytes.len() as u32,
+                blob_id: 0,
+            };
+            c.ioctl(DRM_IOCTL_MODE_CREATEPROPBLOB, &mut blob)
+                .expect("CREATEPROPBLOB");
+            blob.blob_id
+        };
+
+        let short = new_blob(&[0u8; 32]);
+        let wrong_size = new_blob(&make_modeinfo(64, 16));
+        let unknown = 0x7FFF_FFFF;
+
+        for (blob_id, what) in [
+            (short, "a 32-byte blob"),
+            (wrong_size, "a mode the panel does not have"),
+            (unknown, "a blob that does not exist"),
+        ] {
+            let req = Request::new(
+                &[drm::SYNTH_CRTC_ID],
+                &[2],
+                &[PROP_MODE_ID, PROP_ACTIVE],
+                &[u64::from(blob_id), 1],
+            );
+            assert!(
+                commit(&c, &req, DRM_MODE_ATOMIC_ALLOW_MODESET).is_err(),
+                "{} was accepted as a mode",
+                what
+            );
+        }
+    }
 }
