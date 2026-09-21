@@ -2142,6 +2142,47 @@ impl VmMapping {
         Ok(())
     }
 
+    /// Re-install the PTEs that committing the pages tore down.
+    ///
+    /// `commit_page` on a copy-on-write page tells every mapping of that VMO
+    /// node to drop its PTE, and those notifications are applied only after the
+    /// commit loop has returned. A mapping that is being built is already on
+    /// that list, so it commits a page, maps it, and then unmaps it again on
+    /// its own behalf. On hardware that is merely wasted work -- the next
+    /// access faults the page straight back in -- but libos has no page-fault
+    /// path at all, so the page just stayed missing.
+    ///
+    /// That is what killed `Zircon Core Test Libos`: userboot maps two pages of
+    /// a `SNAPSHOT_AT_LEAST_ON_WRITE` clone of `ld.so.1`, and only the single
+    /// page it had already written to (and so had already committed) survived
+    /// the mapping call. The guest took SIGSEGV on the other one before the
+    /// test binary said a word.
+    #[cfg(feature = "libos")]
+    fn remap_pages_dropped_by_commit(self: &Arc<Self>) {
+        let inner = self.inner.lock();
+        let mut page_table = self.page_table.lock();
+        let page_num = inner.size / PAGE_SIZE;
+        let vmo_offset = inner.vmo_offset / PAGE_SIZE;
+        for i in 0..page_num {
+            if !inner.flags[i].intersects(MMUFlags::RXW) {
+                continue;
+            }
+            let vaddr = inner.addr + i * PAGE_SIZE;
+            if page_table.query(vaddr).is_ok() {
+                continue;
+            }
+            if let Some(paddr) = self.vmo.committed_paddr(vmo_offset + i) {
+                page_table
+                    .map(
+                        Page::new_aligned(vaddr, BASE_PAGE_SIZE),
+                        paddr,
+                        inner.flags[i],
+                    )
+                    .expect("failed to map");
+            }
+        }
+    }
+
     fn map(self: &Arc<Self>) -> ZxResult {
         self.vmo.commit_pages_with(&mut |commit| {
             let inner = self.inner.lock();
@@ -2149,6 +2190,16 @@ impl VmMapping {
             let page_num = inner.size / PAGE_SIZE;
             let vmo_offset = inner.vmo_offset / PAGE_SIZE;
             for i in 0..page_num {
+                // A page with no access bits cannot be touched, so it needs no
+                // PTE and no frame. Skipping it is what makes a large PROT_NONE
+                // reservation affordable: libos maps eagerly (it has no page
+                // fault path) and one host mmap per page, so the ~4 GiB region
+                // a Zircon guest reserves took a million host VMAs and died in
+                // the middle with ENOMEM. An `mprotect` that later grants
+                // access maps the pages then — see `protect`.
+                if !inner.flags[i].intersects(MMUFlags::RXW) {
+                    continue;
+                }
                 let paddr = commit(vmo_offset + i, inner.flags[i])?;
                 page_table
                     .map(
@@ -2159,7 +2210,10 @@ impl VmMapping {
                     .expect("failed to map");
             }
             Ok(())
-        })
+        })?;
+        #[cfg(feature = "libos")]
+        self.remap_pages_dropped_by_commit();
+        Ok(())
     }
 
     fn unmap(&self) -> ZxResult {
@@ -2402,10 +2456,18 @@ impl VmMapping {
                     dropped.push(i);
                 }
             } else {
-                pg_table
-                    .update_no_shootdown(va, None, Some(new_flags))
-                    .ignore()
-                    .unwrap();
+                let updated = pg_table.update_no_shootdown(va, None, Some(new_flags));
+                // Nothing was mapped here (a page that was never faulted in, or
+                // one `map` skipped because it had no access bits). On hardware
+                // the next access faults it in; libos has no fault path, so it
+                // has to be mapped now that it may be touched.
+                if cfg!(feature = "libos")
+                    && matches!(updated, Err(PagingError::NotMapped))
+                    && new_flags.intersects(MMUFlags::RXW)
+                {
+                    dropped.push(i);
+                }
+                updated.ignore().unwrap();
             }
         }
         if start_index < end_index {
