@@ -24,7 +24,14 @@ extern crate std;
 /// The controller's mutable side, behind the thread-local.
 struct FakeState {
     bar: usize,
+    /// Input and output stream descriptors the controller advertises
+    /// (`GCAP`); the driver's output descriptor is the first after the
+    /// inputs, and that is the one this engine runs.
+    iss: usize,
     sd_base: usize,
+    /// Where the CORB, RIRB, PCM ring and position buffer are. Preset by
+    /// [`engine`]; learnt from the base-address registers, and from the
+    /// BDL at RUN, when the driver programs them itself ([`controller`]).
     corb_va: usize,
     corb_entries: usize,
     rirb_va: usize,
@@ -33,6 +40,20 @@ struct FakeState {
     ring_len: usize,
     /// This stream's entry in the DMA position buffer.
     pos_va: usize,
+    /// The CORB read pointer: the doorbell fetches from here up to the
+    /// write pointer, so writing `CORBWP` back to where it stands (as the
+    /// reset sequence does) posts nothing.
+    corb_rp: usize,
+    /// Low halves of the 64-bit base addresses, until the high half lands.
+    corb_lo: u32,
+    rirb_lo: u32,
+    dp_hi: u32,
+    bdl_lo: u32,
+    /// A codec answers the controller reset (`STATESTS`).
+    codec_present: bool,
+    /// A controller that will not take a DMA position buffer: the enable
+    /// bit reads back clear.
+    refuse_pos_buffer: bool,
 
     /// Every verb word posted through the CORB, in order.
     verbs: Vec<u32>,
@@ -111,19 +132,53 @@ pub(super) fn on_read(bar: usize, _off: usize) {
 /// Every register write by the driver, after the value landed in memory.
 pub(super) fn on_write(bar: usize, off: usize, v: u32) {
     with_state(bar, |st| match off {
+        REG_GCTL => {
+            if v & GCTL_CRST != 0 && st.codec_present {
+                // Out of reset: the codec requests a state change.
+                poke::<u16>(bar + REG_STATESTS, 1 << CODEC);
+            }
+        }
+        REG_CORBSIZE => st.corb_entries = entries_for(v as u8),
+        REG_RIRBSIZE => st.rirb_entries = entries_for(v as u8),
+        REG_CORBLBASE => st.corb_lo = v,
+        REG_CORBUBASE => st.corb_va = ((v as usize) << 32) | st.corb_lo as usize,
+        REG_RIRBLBASE => st.rirb_lo = v,
+        REG_RIRBUBASE => st.rirb_va = ((v as usize) << 32) | st.rirb_lo as usize,
+        REG_DPUBASE => st.dp_hi = v,
+        REG_DPLBASE => {
+            if st.refuse_pos_buffer {
+                poke::<u32>(bar + REG_DPLBASE, v & !DPLBASE_ENABLE);
+            } else if v & DPLBASE_ENABLE != 0 {
+                let base = ((st.dp_hi as usize) << 32) | (v & !DPLBASE_ENABLE) as usize;
+                st.pos_va = base + st.iss * 8;
+            }
+        }
+        o if o == st.sd_base + SD_BDPL => st.bdl_lo = v,
+        o if o == st.sd_base + SD_BDPU => {
+            // The ring is what the BDL describes: first entry's address,
+            // CBL bytes. A BDL pointing elsewhere plays elsewhere.
+            let bdl = ((v as usize) << 32) | st.bdl_lo as usize;
+            st.ring_va = peek::<u64>(bdl) as usize;
+        }
+        o if o == st.sd_base + SD_CBL => st.ring_len = v as usize,
+        REG_CORBRP if v & (1 << 15) != 0 => st.corb_rp = 0,
         REG_CORBWP => {
             let wp = v as usize % st.corb_entries;
-            let verb: u32 = peek(st.corb_va + wp * 4);
-            st.verbs.push(verb);
-            if st.codec_dead {
-                return;
+            while st.corb_rp != wp {
+                st.corb_rp = (st.corb_rp + 1) % st.corb_entries;
+                let verb: u32 = peek(st.corb_va + st.corb_rp * 4);
+                st.verbs.push(verb);
+                if st.codec_dead {
+                    continue;
+                }
+                for _ in 0..st.unsolicited_with_next {
+                    post_rirb(st, 0, 1 << 4);
+                }
+                st.unsolicited_with_next = 0;
+                let resp = st.answers.get(&verb).copied().unwrap_or(0);
+                post_rirb(st, resp, 0);
             }
-            for _ in 0..st.unsolicited_with_next {
-                post_rirb(st, 0, 1 << 4);
-            }
-            st.unsolicited_with_next = 0;
-            let resp = st.answers.get(&verb).copied().unwrap_or(0);
-            post_rirb(st, resp, 0);
+            poke::<u16>(bar + REG_CORBRP, st.corb_rp as u16);
         }
         REG_RIRBWP if v & (1 << 15) != 0 => poke::<u16>(bar + REG_RIRBWP, 0),
         o if o == st.sd_base + SD_CTL => {
@@ -135,7 +190,9 @@ pub(super) fn on_write(bar: usize, off: usize, v: u32) {
                 st.run = false;
                 st.consumed = 0;
                 poke::<u32>(bar + st.sd_base + SD_LPIB, 0);
-                poke::<u32>(st.pos_va, 0);
+                if st.pos_va != 0 {
+                    poke::<u32>(st.pos_va, 0);
+                }
                 return;
             }
             let run = v & 0x2 != 0;
@@ -160,6 +217,15 @@ pub(super) fn on_write(bar: usize, off: usize, v: u32) {
     });
 }
 
+/// CORB/RIRB entries for a SIZE code, as the driver programs it.
+fn entries_for(code: u8) -> usize {
+    match code & 0x3 {
+        0x2 => 256,
+        0x1 => 16,
+        _ => 2,
+    }
+}
+
 fn post_rirb(st: &mut FakeState, resp: u32, ext: u32) {
     let wp = ((peek::<u16>(st.bar + REG_RIRBWP) as usize & 0xff) + 1) % st.rirb_entries;
     poke::<u32>(st.rirb_va + wp * 8, resp);
@@ -181,19 +247,46 @@ pub(super) const TAG: u32 = 1;
 /// Link bytes per second at the link format (48 kHz stereo S16).
 const LINK_BYTES_PER_S: u64 = LINK_RATE as u64 * 4;
 
-/// The test's handle on the controller: addresses, and the engine's
+/// The DAC's output amplifier: mute capable, 0 dB at step 0x4a.
+pub(super) const DAC_AMP_CAP: u32 = (1 << 31) | 0x4a;
+/// Config default: jack, line out, front, green.
+pub(super) const PIN_DEFCFG_LINE_OUT_JACK: u32 = 0x0101_4010;
+
+/// The test's handle on the controller: its BAR, and the engine's
 /// controls.
 #[derive(Clone, Copy)]
 pub(super) struct Hw {
     pub bar: usize,
-    pub ring_va: usize,
-    pub ring_len: usize,
-    pub bdl_pa: usize,
 }
 
 impl Hw {
     fn with<R>(&self, f: impl FnOnce(&mut FakeState) -> R) -> R {
         with_state(self.bar, f).expect("fake controller installed on this thread")
+    }
+
+    /// The PCM ring as the engine knows it (from the BDL once RUN).
+    pub fn ring_len(&self) -> usize {
+        self.with(|st| st.ring_len)
+    }
+
+    pub fn ring_va(&self) -> usize {
+        self.with(|st| st.ring_va)
+    }
+
+    pub fn sd_base(&self) -> usize {
+        self.with(|st| st.sd_base)
+    }
+
+    pub fn corb_va(&self) -> usize {
+        self.with(|st| st.corb_va)
+    }
+
+    pub fn rirb_va(&self) -> usize {
+        self.with(|st| st.rirb_va)
+    }
+
+    pub fn pos_va(&self) -> usize {
+        self.with(|st| st.pos_va)
     }
 
     /// The link runs for `us`: PCM leaves the ring at the link rate (whole
@@ -221,7 +314,7 @@ impl Hw {
                     st.bar + st.sd_base + SD_LPIB,
                     st.lpib_override.take().unwrap_or(reported),
                 );
-                if !st.pos_buffer_dead {
+                if !st.pos_buffer_dead && st.pos_va != 0 {
                     poke::<u32>(st.pos_va, reported);
                 }
             }
@@ -236,7 +329,8 @@ impl Hw {
 
     /// The ring as the engine sees it.
     pub fn ring(&self) -> Vec<u8> {
-        unsafe { core::slice::from_raw_parts(self.ring_va as *const u8, self.ring_len) }.to_vec()
+        let (va, len) = self.with(|st| (st.ring_va, st.ring_len));
+        unsafe { core::slice::from_raw_parts(va as *const u8, len) }.to_vec()
     }
 
     pub fn verbs(&self) -> Vec<u32> {
@@ -289,6 +383,74 @@ impl Hw {
         self.with(|st| st.read_tick_us = us);
     }
 
+    /// No codec answers the controller reset.
+    pub fn set_codec_absent(&self) {
+        self.with(|st| st.codec_present = false);
+    }
+
+    pub fn set_refuse_pos_buffer(&self) {
+        self.with(|st| st.refuse_pos_buffer = true);
+    }
+
+    /// The controller advertises `iss` input and `oss` output stream
+    /// descriptors (`GCAP`), 64-bit capable.
+    pub fn set_streams(&self, iss: usize, oss: usize) {
+        self.with(|st| {
+            st.iss = iss;
+            st.sd_base = REG_SD_BASE + iss * 0x20;
+            poke::<u16>(
+                st.bar + REG_GCAP,
+                ((oss as u16) << 12) | ((iss as u16) << 8) | 1,
+            );
+        });
+    }
+
+    /// The codec QEMU's `hda-output` presents, near enough: a root node,
+    /// one audio function group, a stereo DAC with an output amp (nid 2)
+    /// wired to one line-out pin complex with a jack (nid 3).
+    pub fn install_output_codec(&self) {
+        let vendor_id = 0x1af4_0010;
+        let root = 0;
+        let pairs = [
+            (verb12(root, VERB_GET_PARAMETER, PAR_VENDOR_ID), vendor_id),
+            (
+                verb12(root, VERB_GET_PARAMETER, PAR_NODE_COUNT),
+                (AFG << 16) | 1,
+            ),
+            (verb12(AFG, VERB_GET_PARAMETER, PAR_FUNCTION_TYPE), 0x01),
+            (
+                verb12(AFG, VERB_GET_PARAMETER, PAR_NODE_COUNT),
+                (CONV << 16) | 2,
+            ),
+            (
+                verb12(CONV, VERB_GET_PARAMETER, PAR_AUDIO_WIDGET_CAP),
+                (WIDGET_AUDIO_OUT << 20) | (1 << 2) | 1,
+            ),
+            (
+                verb12(CONV, VERB_GET_PARAMETER, PAR_OUT_AMP_CAP),
+                DAC_AMP_CAP,
+            ),
+            (
+                verb12(PIN, VERB_GET_PARAMETER, PAR_AUDIO_WIDGET_CAP),
+                (WIDGET_PIN << 20) | (1 << 8) | 1,
+            ),
+            (
+                verb12(PIN, VERB_GET_PARAMETER, PAR_PIN_CAP),
+                (1 << 4) | (1 << 2),
+            ),
+            (
+                verb12(PIN, VERB_GET_CONFIG_DEFAULT, 0),
+                PIN_DEFCFG_LINE_OUT_JACK,
+            ),
+            (verb12(PIN, VERB_GET_PARAMETER, PAR_CONN_LIST_LEN), 1),
+            (verb12(PIN, VERB_GET_CONN_LIST, 0), CONV),
+            (verb12(PIN, VERB_GET_PIN_SENSE, 0), 1 << 31),
+        ];
+        for (verb, resp) in pairs {
+            self.answer(verb, resp);
+        }
+    }
+
     pub fn corrupt_next_lpib(&self, v: u32) {
         self.with(|st| st.lpib_override = Some(v));
     }
@@ -316,26 +478,81 @@ impl Hw {
 /// stands after codec discovery: one analog path found, nothing running,
 /// the clock at zero.
 pub(super) fn engine() -> (Hw, HdaInner) {
-    test_clock::set(0);
-    let (bar, _) = ProviderImpl::alloc_dma(PAGE_SIZE);
+    let hw = install(0);
+    let bar = hw.bar;
     let (corb_va, _) = ProviderImpl::alloc_dma(PAGE_SIZE);
     let (rirb_va, _) = ProviderImpl::alloc_dma(PAGE_SIZE);
     let ring_len = RING_PAGES * PAGE_SIZE;
     let (ring_va, _) = ProviderImpl::alloc_dma(ring_len);
     let (bdl_va, bdl_pa) = ProviderImpl::alloc_dma(PAGE_SIZE);
     let (pos_va, _) = ProviderImpl::alloc_dma(PAGE_SIZE);
+    for i in 0..ring_len / BDL_SEGMENT {
+        poke::<u64>(bdl_va + i * 16, (ring_va + i * BDL_SEGMENT) as u64);
+        poke::<u32>(bdl_va + i * 16 + 8, BDL_SEGMENT as u32);
+    }
     let sd_base = REG_SD_BASE;
+    hw.with(|st| {
+        st.corb_va = corb_va;
+        st.rirb_va = rirb_va;
+        st.ring_va = ring_va;
+        st.ring_len = ring_len;
+        st.pos_va = pos_va;
+    });
+    let mut inner = HdaInner::bare(
+        bar, corb_va, 256, rirb_va, 256, CODEC, sd_base, ring_va, ring_len, bdl_pa, pos_va,
+    );
+    inner.afg = AFG;
+    inner.conv_nid = CONV;
+    inner.pin_nid = PIN;
+    inner.stream_tag = TAG;
+    inner.candidates.push(OutPath {
+        conv: CONV,
+        pin: PIN,
+        pin_conn_idx: 0,
+        digital: false,
+        hdmi_dp: false,
+        present: true,
+    });
+    (hw, inner)
+}
+
+/// A controller as `HdaDevice::new` finds it at PCI probe: `iss` input
+/// and 4 output descriptors, 256-entry CORB/RIRB on offer, the output
+/// codec attached, nothing programmed. The test calls `HdaDevice::new`
+/// on `hw.bar` itself, after any change of circumstances it wants.
+pub(super) fn controller(iss: usize) -> Hw {
+    let hw = install(iss);
+    hw.set_streams(iss, 4);
+    poke::<u8>(hw.bar + REG_CORBSIZE, 0x40);
+    poke::<u8>(hw.bar + REG_RIRBSIZE, 0x40);
+    hw.install_output_codec();
+    hw
+}
+
+/// A fresh, empty controller on this thread and the clock at zero.
+fn install(iss: usize) -> Hw {
+    test_clock::set(0);
+    let (bar, _) = ProviderImpl::alloc_dma(PAGE_SIZE);
+    let sd_base = REG_SD_BASE + iss * 0x20;
     FAKE.with(|cell| {
         *cell.borrow_mut() = Some(FakeState {
             bar,
+            iss,
             sd_base,
-            corb_va,
+            corb_va: 0,
             corb_entries: 256,
-            rirb_va,
+            rirb_va: 0,
             rirb_entries: 256,
-            ring_va,
-            ring_len,
-            pos_va,
+            ring_va: 0,
+            ring_len: 0,
+            pos_va: 0,
+            corb_rp: 0,
+            corb_lo: 0,
+            rirb_lo: 0,
+            dp_hi: 0,
+            bdl_lo: 0,
+            codec_present: true,
+            refuse_pos_buffer: false,
             verbs: Vec::new(),
             answers: BTreeMap::new(),
             codec_dead: false,
@@ -356,31 +573,7 @@ pub(super) fn engine() -> (Hw, HdaInner) {
             walclk: 0,
         });
     });
-    let mut inner = HdaInner::bare(
-        bar, corb_va, 256, rirb_va, 256, CODEC, sd_base, ring_va, ring_len, bdl_pa, pos_va,
-    );
-    inner.afg = AFG;
-    inner.conv_nid = CONV;
-    inner.pin_nid = PIN;
-    inner.stream_tag = TAG;
-    inner.candidates.push(OutPath {
-        conv: CONV,
-        pin: PIN,
-        pin_conn_idx: 0,
-        digital: false,
-        hdmi_dp: false,
-        present: true,
-    });
-    let _ = bdl_va;
-    (
-        Hw {
-            bar,
-            ring_va,
-            ring_len,
-            bdl_pa,
-        },
-        inner,
-    )
+    Hw { bar }
 }
 
 /// The verb word `HdaInner::cmd` posts.
@@ -525,13 +718,13 @@ mod engine_tests {
 
         let sd = REG_SD_BASE;
         assert_eq!(mmio_r32(hw.bar, sd + SD_CTL), (TAG << 20) | 0x2);
-        assert_eq!(mmio_r32(hw.bar, sd + SD_CBL), hw.ring_len as u32);
+        assert_eq!(mmio_r32(hw.bar, sd + SD_CBL), hw.ring_len() as u32);
         assert_eq!(
             mmio_r16(hw.bar, sd + SD_LVI),
-            (hw.ring_len / BDL_SEGMENT - 1) as u16
+            (hw.ring_len() / BDL_SEGMENT - 1) as u16
         );
         assert_eq!(mmio_r16(hw.bar, sd + SD_FMT), stream_format(LINK_RATE, 2));
-        assert_eq!(mmio_r32(hw.bar, sd + SD_BDPL), hw.bdl_pa as u32);
+        assert_eq!(mmio_r32(hw.bar, sd + SD_BDPL), inner.bdl_pa as u32);
         let verbs = hw.verbs();
         let fmt = stream_format(LINK_RATE, 2) as u32;
         assert!(verbs.contains(&verb4(CONV, 0x2, fmt)), "converter format");
@@ -565,7 +758,7 @@ mod engine_tests {
         // Two and a half laps of the ring, fed as the client would be. The
         // watchdog's ticks are not exact, so neither are these: the fills
         // then straddle the end of the ring rather than always ending on it.
-        let target = hw.ring_len * 5 / 2;
+        let target = hw.ring_len() * 5 / 2;
         let mut n = 0;
         let mut straddled = 0;
         while hw.played().len() < target {
@@ -573,7 +766,7 @@ mod engine_tests {
             hw.run_for_us(3_700 + (n % 7) * 100);
             let before = inner.fill_pos;
             inner.poll_progress();
-            let ring = hw.ring_len as u64;
+            let ring = hw.ring_len() as u64;
             if inner.fill_pos / ring > before / ring && inner.fill_pos % ring != 0 {
                 straddled += 1;
             }
@@ -624,15 +817,15 @@ mod engine_tests {
         inner.ensure_engine().unwrap();
         // Past one lap, so the ring beyond the band holds last lap's PCM.
         for _ in 0..1_000 {
-            if hw.played().len() >= hw.ring_len * 3 / 2 {
+            if hw.played().len() >= hw.ring_len() * 3 / 2 {
                 break;
             }
             ramp.feed(&mut inner, id);
             tick(&hw, &mut inner);
         }
-        assert!(hw.played().len() >= hw.ring_len * 3 / 2);
+        assert!(hw.played().len() >= hw.ring_len() * 3 / 2);
         let ring = hw.ring();
-        let at = |pos: u64| (pos % hw.ring_len as u64) as usize;
+        let at = |pos: u64| (pos % hw.ring_len() as u64) as usize;
         let band: Vec<u8> = (0..SILENCE_AHEAD)
             .map(|i| ring[at(inner.fill_pos + i as u64)])
             .collect();
@@ -902,11 +1095,11 @@ mod engine_tests {
         tick(&hw, &mut inner);
         let consumed = inner.consumed;
         let fill = inner.fill_pos;
-        hw.corrupt_next_lpib((hw.ring_len / 2) as u32);
+        hw.corrupt_next_lpib((hw.ring_len() / 2) as u32);
         tick(&hw, &mut inner);
         assert_eq!(inner.stat_bad_pos, 1);
         assert_eq!(inner.last_bad_src, b'L');
-        assert_eq!(inner.last_bad_pos, (hw.ring_len / 2) as u32);
+        assert_eq!(inner.last_bad_pos, (hw.ring_len() / 2) as u32);
         assert_eq!(inner.consumed, consumed, "one bad read moves nothing");
         assert_eq!(inner.fill_pos, fill, "and the writer is not handed a lap");
         // The next sane read is judged against the widened budget.
@@ -990,7 +1183,7 @@ mod engine_tests {
         // ring less the guard reads as the engine having lapped the fill,
         // and the fill skips to it (see `fill_ring`) -- past the envelope
         // the constants were chosen for.
-        let most = hw.ring_len - RING_GUARD - 8192;
+        let most = hw.ring_len() - RING_GUARD - 8192;
         let mut lead = 0;
         let mut bound = false;
         for _ in 0..120 {
@@ -999,7 +1192,7 @@ mod engine_tests {
             ramp.feed(&mut inner, id);
             tick(&hw, &mut inner);
             assert_eq!(inner.stat_bad_pos, 0, "the lead grows within the budget");
-            let window = inner.consumed + (hw.ring_len - RING_GUARD) as u64;
+            let window = inner.consumed + (hw.ring_len() - RING_GUARD) as u64;
             assert!(
                 inner.fill_pos <= window,
                 "fill at {} B, {} B past the guard",
@@ -1011,7 +1204,7 @@ mod engine_tests {
             }
         }
         assert!(bound, "the guard was never what limited the fill");
-        assert!(inner.lead_now > (hw.ring_len - RING_GUARD - FILL_DEPTH) as u64);
+        assert!(inner.lead_now > (hw.ring_len() - RING_GUARD - FILL_DEPTH) as u64);
         let played = hw.played();
         assert_same_pcm(
             &played,
@@ -1033,5 +1226,358 @@ mod engine_tests {
         assert_eq!(mmio_r8(hw.bar, REG_SD_BASE + SD_STS) & SD_STS_FIFOE, 0);
         tick(&hw, &mut inner);
         assert_eq!(inner.stat_fifo_err, 1, "cleared: counted once");
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    //! `HdaDevice::new` from the first register read to the chosen path,
+    //! against the controller and codec the fake presents, and the device
+    //! through its public interface after that: what a front end sees.
+
+    use super::*;
+    use crate::scheme::AudioScheme;
+
+    const ISS: usize = 4;
+
+    fn probe(hw: &Hw) -> DeviceResult<HdaDevice> {
+        HdaDevice::new(hw.bar, String::from("hda-fake"), false)
+    }
+
+    fn device() -> (Hw, HdaDevice) {
+        let hw = controller(ISS);
+        let dev = probe(&hw).expect("probe");
+        (hw, dev)
+    }
+
+    /// One watchdog tick through the public interface: the link plays,
+    /// the front end asks what is queued (which polls).
+    fn tick(hw: &Hw, dev: &dyn AudioScheme) {
+        hw.run_for_us(4_000);
+        dev.queued_bytes();
+    }
+
+    #[test]
+    fn probe_brings_the_controller_up_and_hands_it_its_rings() {
+        let (hw, dev) = device();
+        let bar = hw.bar;
+        assert_ne!(mmio_r32(bar, REG_GCTL) & GCTL_CRST, 0, "out of reset");
+        assert_eq!(mmio_r32(bar, REG_INTCTL), 0, "polled: no interrupts");
+        let inner = dev.inner.lock();
+        assert_eq!(inner.cad, CODEC);
+        assert_eq!((inner.corb_entries, inner.rirb_entries), (256, 256));
+        assert_eq!(mmio_r8(bar, REG_CORBSIZE), 0x2);
+        assert_eq!(mmio_r8(bar, REG_RIRBSIZE), 0x2);
+        assert_eq!(hw.corb_va(), inner.corb_va, "CORB base is the CORB");
+        assert_eq!(hw.rirb_va(), inner.rirb_va, "RIRB base is the RIRB");
+        assert_ne!(inner.corb_va, 0);
+        assert_eq!(mmio_r8(bar, REG_CORBCTL) & 0x2, 0x2, "CORB DMA running");
+        assert_eq!(mmio_r8(bar, REG_RIRBCTL), RIRBCTL_DMA_EN | RIRBCTL_IRQ_EN);
+        assert_eq!(mmio_r16(bar, REG_RINTCNT), 1, "one response per status");
+        assert_eq!(
+            inner.sd_base,
+            REG_SD_BASE + ISS * 0x20,
+            "the first output descriptor comes after the inputs"
+        );
+        assert_eq!(
+            hw.pos_va(),
+            inner.dma_pos_va,
+            "position buffer entry for that descriptor"
+        );
+        assert_eq!(hw.ring_va(), 0, "the ring is not the engine's until RUN");
+        assert_ne!(inner.dma_pos_va, 0);
+        // The BDL: one entry per segment, contiguous over the ring, no IOC.
+        let n_seg = inner.ring_len / BDL_SEGMENT;
+        for i in 0..n_seg {
+            let e = inner.bdl_pa + i * 16;
+            assert_eq!(
+                peek::<u64>(e),
+                (inner.ring_va + i * BDL_SEGMENT) as u64,
+                "entry {}",
+                i
+            );
+            assert_eq!(peek::<u32>(e + 8), BDL_SEGMENT as u32);
+            assert_eq!(peek::<u32>(e + 12), 0);
+        }
+        assert_eq!(inner.ring_len, RING_PAGES * PAGE_SIZE);
+        assert_eq!(inner.streams.len(), 1, "the device's own stream");
+        assert!(!inner.running);
+    }
+
+    #[test]
+    fn probe_walks_the_codec_to_the_line_out_pin_and_arms_it() {
+        let (hw, dev) = device();
+        let inner = dev.inner.lock();
+        assert_eq!(inner.afg, AFG);
+        assert_eq!((inner.conv_nid, inner.pin_nid), (CONV, PIN));
+        assert!(!inner.digital);
+        assert_eq!(inner.candidates.len(), 1);
+        let c = &inner.candidates[0];
+        assert_eq!(
+            (c.conv, c.pin, c.pin_conn_idx, c.hdmi_dp),
+            (CONV, PIN, 0, false)
+        );
+        let verbs = hw.verbs();
+        let sent = |v: u32| verbs.contains(&v);
+        assert!(sent(verb12(0, VERB_GET_PARAMETER, PAR_VENDOR_ID)));
+        assert!(sent(verb12(AFG, VERB_GET_PARAMETER, PAR_NODE_COUNT)));
+        assert!(sent(verb12(PIN, VERB_GET_CONFIG_DEFAULT, 0)));
+        assert!(sent(verb12(PIN, VERB_GET_CONN_LIST, 0)));
+        // The path armed: power, routing, pin enabled, DAC amp unmuted at
+        // 0 dB, and nothing digital.
+        assert!(sent(verb12(AFG, VERB_SET_POWER_STATE, 0)));
+        assert!(sent(verb12(CONV, VERB_SET_POWER_STATE, 0)));
+        assert!(sent(verb12(PIN, VERB_SET_POWER_STATE, 0)));
+        assert!(sent(verb12(PIN, VERB_SET_CONN_SELECT, 0)));
+        assert!(sent(verb12(PIN, VERB_SET_PIN_CTL, PIN_CTL_OUT_EN)));
+        let unmuted_0db = (1 << 15) | (1 << 13) | (1 << 12) | (DAC_AMP_CAP & 0x7f);
+        assert!(sent(verb4(CONV, 0x3, unmuted_0db)), "DAC amp");
+        assert!(
+            !sent(verb12(PIN, VERB_SET_EAPD, 0x2)),
+            "no EAPD on this pin"
+        );
+        assert!(!sent(verb12(CONV, VERB_SET_DIGI_CVT1, 0x1)), "analog");
+        assert_eq!(inner.stat_stale_resp, 0);
+    }
+
+    #[test]
+    fn a_controller_with_no_output_descriptor_is_not_supported() {
+        let hw = controller(ISS);
+        hw.set_streams(ISS, 0);
+        assert!(matches!(probe(&hw), Err(DeviceError::NotSupported)));
+        assert!(hw.verbs().is_empty());
+    }
+
+    #[test]
+    fn no_codec_answering_the_reset_is_a_clean_failure() {
+        let hw = controller(ISS);
+        hw.set_codec_absent();
+        assert!(matches!(probe(&hw), Err(DeviceError::NoResources)));
+        assert!(
+            hw.verbs().is_empty(),
+            "nothing is asked of a codec that is not there"
+        );
+    }
+
+    #[test]
+    fn a_codec_that_never_answers_fails_the_probe_after_one_timeout() {
+        let hw = controller(ISS);
+        hw.set_codec_dead();
+        hw.set_read_tick_us(1_000);
+        let t0 = test_clock::now();
+        assert!(matches!(probe(&hw), Err(DeviceError::IoError)));
+        assert_eq!(hw.verbs().len(), 1, "the first verb is the last");
+        assert!(test_clock::now() - t0 < 2 * VERB_TIMEOUT_US);
+    }
+
+    #[test]
+    fn a_pin_wired_to_nothing_leaves_no_path() {
+        let hw = controller(ISS);
+        // Port connectivity 01b: no physical connection.
+        hw.answer(
+            verb12(PIN, VERB_GET_CONFIG_DEFAULT, 0),
+            PIN_DEFCFG_LINE_OUT_JACK | (0x1 << 30),
+        );
+        assert!(matches!(probe(&hw), Err(DeviceError::NotSupported)));
+    }
+
+    #[test]
+    fn a_controller_refusing_the_position_buffer_is_paced_by_lpib_alone() {
+        let hw = controller(ISS);
+        hw.set_refuse_pos_buffer();
+        let dev = probe(&hw).expect("probe");
+        assert_eq!(dev.inner.lock().dma_pos_va, 0);
+        dev.write(&constant(1000, HOST_BUFFER)).unwrap();
+        assert!(dev.is_playing());
+        for _ in 0..10 {
+            tick(&hw, &dev);
+        }
+        let inner = dev.inner.lock();
+        assert_eq!(inner.consumed, 10 * 768);
+        assert!(!inner.dpib_trusted);
+        assert_eq!(inner.stat_bad_pos, 0);
+    }
+
+    #[test]
+    fn playback_runs_on_the_descriptor_after_the_input_ones() {
+        let (hw, dev) = device();
+        dev.write(&constant(1000, HOST_BUFFER)).unwrap();
+        let sd = REG_SD_BASE + ISS * 0x20;
+        assert_eq!(mmio_r32(hw.bar, sd + SD_CTL), (TAG << 20) | 0x2);
+        assert_eq!(mmio_r32(hw.bar, sd + SD_CBL), hw.ring_len() as u32);
+        assert_eq!(
+            hw.ring_va(),
+            dev.inner.lock().ring_va,
+            "the BDL points at the ring"
+        );
+        assert_eq!(
+            mmio_r32(hw.bar, REG_SD_BASE + SD_CTL),
+            0,
+            "input descriptor 0 untouched"
+        );
+        assert_eq!(hw.starts(), 1);
+        tick(&hw, &dev);
+        assert_eq!(&samples(&hw.played())[..4], &[1000; 4]);
+    }
+
+    #[test]
+    fn each_open_is_a_stream_of_its_own_mixed_into_the_link() {
+        let (hw, dev) = device();
+        let a = dev.open_stream().unwrap().expect("a stream per open");
+        let b = dev.open_stream().unwrap().expect("a stream per open");
+        assert_eq!(dev.inner.lock().streams.len(), 3, "own + two opens");
+        assert_eq!(
+            a.write(&constant(20_000, HOST_BUFFER)).unwrap(),
+            HOST_BUFFER
+        );
+        assert_eq!(
+            b.write(&constant(-5_000, HOST_BUFFER)).unwrap(),
+            HOST_BUFFER
+        );
+        assert!(a.is_playing() && b.is_playing());
+        assert!(!dev.own.is_playing(), "the device's own stream has nothing");
+        // The first write started the engine, which primed the ring from
+        // the one stream it had; the second joined at the fill point.
+        assert_eq!(a.buffer_bytes(), HOST_BUFFER);
+        assert_eq!(a.free_bytes(), FILL_DEPTH);
+        assert_eq!(a.queued_bytes(), HOST_BUFFER - FILL_DEPTH);
+        assert_eq!(b.free_bytes(), 0);
+        assert_eq!(b.queued_bytes(), HOST_BUFFER);
+        for _ in 0..(FILL_DEPTH / 768 + 2) {
+            tick(&hw, &dev);
+        }
+        let heard = samples(&hw.played());
+        assert!(
+            heard[..FILL_DEPTH / 2].iter().all(|&s| s == 20_000),
+            "primed from a alone"
+        );
+        assert!(
+            heard[FILL_DEPTH / 2..].iter().all(|&s| s == 15_000),
+            "then the mix"
+        );
+        // Each stream's queue is its own, and the fill takes from both alike.
+        assert_eq!(a.queued_bytes() + FILL_DEPTH, b.queued_bytes());
+        assert_eq!(a.free_bytes() + a.queued_bytes(), a.buffer_bytes());
+        // Delay is the queue plus what the ring holds ahead of the link.
+        let inner = dev.inner.lock();
+        let ahead = inner.ring_ahead();
+        drop(inner);
+        assert_eq!(a.delay_bytes(), a.queued_bytes() + ahead);
+    }
+
+    #[test]
+    fn dropping_an_open_takes_its_stream_out_of_the_mix() {
+        let (hw, dev) = device();
+        let a = dev.open_stream().unwrap().unwrap();
+        let b = dev.open_stream().unwrap().unwrap();
+        a.write(&constant(20_000, HOST_BUFFER)).unwrap();
+        b.write(&constant(-5_000, HOST_BUFFER)).unwrap();
+        tick(&hw, &dev);
+        drop(b);
+        assert_eq!(dev.inner.lock().streams.len(), 2);
+        let before = hw.played().len();
+        for _ in 0..(FILL_DEPTH / 768 + 2) {
+            tick(&hw, &dev);
+        }
+        let heard = samples(&hw.played()[before + FILL_DEPTH..]);
+        assert!(heard.iter().all(|&s| s == 20_000), "{:?}", &heard[..4]);
+        assert!(a.is_playing());
+    }
+
+    #[test]
+    fn a_start_hold_fills_the_stream_without_starting_the_engine() {
+        let (hw, dev) = device();
+        dev.set_start_hold(true).unwrap();
+        assert_eq!(
+            dev.write(&constant(1000, HOST_BUFFER)).unwrap(),
+            HOST_BUFFER
+        );
+        assert!(!dev.is_playing());
+        assert_eq!(hw.starts(), 0);
+        assert_eq!(dev.queued_bytes(), HOST_BUFFER, "the PCM is kept");
+        dev.set_start_hold(false).unwrap();
+        assert!(dev.is_playing());
+        assert_eq!(hw.starts(), 1);
+        tick(&hw, &dev);
+        assert!(samples(&hw.played()).iter().all(|&s| s == 1000));
+    }
+
+    #[test]
+    fn the_client_rate_is_resampled_and_the_link_stays_at_48k() {
+        let (hw, dev) = device();
+        let s = dev.open_stream().unwrap().unwrap();
+        assert_eq!(s.set_params(44_100, 2).unwrap(), (44_100, 2));
+        assert_eq!(s.params(), (44_100, 2));
+        assert!(
+            s.buffer_bytes() < HOST_BUFFER,
+            "the client's buffer is in its own frames"
+        );
+        let free = s.free_bytes();
+        assert_eq!(
+            free + s.queued_bytes(),
+            s.buffer_bytes(),
+            "avail == accept, before"
+        );
+        let n = s.write(&constant(8_000, HOST_BUFFER)).unwrap();
+        assert_eq!(n, free, "a write takes exactly what free said");
+        assert_eq!(
+            s.free_bytes() + s.queued_bytes(),
+            s.buffer_bytes(),
+            "and after"
+        );
+        assert_eq!(
+            mmio_r16(hw.bar, hw.sd_base() + SD_FMT),
+            stream_format(LINK_RATE, 2),
+            "the link is not reprogrammed for the client"
+        );
+        for _ in 0..12 {
+            tick(&hw, &dev);
+        }
+        let heard = samples(&hw.played());
+        // A DC signal through the converter is the same DC, once it settles.
+        let tail = &heard[heard.len() - 512..];
+        assert!(
+            tail.iter().all(|&v| (v - 8_000).abs() <= 2),
+            "{:?}",
+            &tail[..8]
+        );
+    }
+
+    #[test]
+    fn the_gain_control_reads_back_and_scales_the_link() {
+        let (hw, dev) = device();
+        assert_eq!(dev.gain(), (100, 100, false, false));
+        dev.set_gain(50, 50, false, false).unwrap();
+        assert_eq!(dev.gain(), (50, 50, false, false));
+        dev.write(&constant(10_000, HOST_BUFFER)).unwrap();
+        for _ in 0..(FILL_DEPTH / 768 + 12) {
+            tick(&hw, &dev);
+        }
+        let heard = samples(&hw.played());
+        let tail = &heard[heard.len() - 64..];
+        assert!(
+            tail.iter().all(|&v| (v - 5_000).abs() <= 1),
+            "{:?}",
+            &tail[..4]
+        );
+    }
+
+    #[test]
+    fn diagnostics_render_against_the_live_controller() {
+        let (hw, dev) = device();
+        dev.write(&constant(1000, HOST_BUFFER)).unwrap();
+        tick(&hw, &dev);
+        let text = dev.diagnostics();
+        for needle in [
+            "controller: GCAP 0x4401",
+            "ring: running=true",
+            "stream 0: client=48000 Hz src=passthrough",
+            "events: 0 drains, 0 underruns",
+            "active path: converter 0x2 -> pin 0x3 (analog)",
+            "codec link: 0 stale RIRB responses",
+        ] {
+            assert!(text.contains(needle), "missing {:?} in:\n{}", needle, text);
+        }
+        assert!(!text.contains("codec reads cut short"));
     }
 }
