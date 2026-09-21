@@ -65,10 +65,10 @@ HDA controller (PCI 04:03) ── codec ── pin ── HDMI/DP or analog jack
   the cutoff follows the lower Nyquist and nothing aliases. Fixed-point and
   streaming (it keeps the input history a straddling window needs, so a
   chunked stream resamples the same as one buffer). It is **not yet wired
-  into a device path**: the next step is a fixed-rate sink (run the HDA link
-  at one rate, resample any client rate to it in the kernel) so PulseAudio's
-  low-quality `speex-float-1` and the stream reprogram on every rate switch
-  both drop out of the HDMI path.
+  into a device path**. The interim step, done in PulseAudio config (see the
+  PulseAudio section), already fixes the sink at 48 kHz so the link never
+  reprograms per track; wiring this component as a kernel fixed-rate sink is
+  the eventual step that takes PulseAudio out of the resampling entirely.
 - **Codec graph**: the widget walk collects every output-capable pin with a
   reachable converter as a *candidate path*. Path choice is scored (digital
   HDMI/DP pin > presence > ELD valid) and — crucially — **re-evaluated at
@@ -183,6 +183,17 @@ cannot loop the last fragment. `module-suspend-on-idle` is deliberately NOT
 loaded: a suspended sink was not being resumed when a new stream attached
 (the resume runs in the sink IO thread), so every later play went silent.
 The sink stays IDLE with the PCM open instead.
+- **Fixed sink rate.** `daemon.conf` sets `default-sample-rate = 48000` with
+  no `alternate-sample-rate`, so the daemon holds the sink -- and the HDA
+  link -- at 48 kHz for every stream and resamples 44.1 kHz material itself,
+  rather than following each stream's rate. Following it reprograms the HDA
+  stream on a rate change, which on an HDMI/DP sink is a re-lock mute, so a
+  44.1 kHz track after a 48 kHz one dropped its first fraction of a second.
+  The resampler is `speex-float-3` (up from the shipped `speex-float-1`, the
+  lowest quality): now that every non-48k stream is resampled it earns a few
+  % more CPU; dial toward `-5`/`soxr-mq` with headroom, back to `-1` if the
+  daemon starts arriving late. The kernel's own `pipeline::src` will later
+  take this over so PulseAudio is out of the resampling entirely.
 - A bare `mpg123 file.mp3` reaches the daemon because `/dev/dsp` refuses it.
   mpg123 1.3x has no config file at all, so with no `-o` libout123 walks its
   built-in driver list and takes the first module that both loads AND opens --
