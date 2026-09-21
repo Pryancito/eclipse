@@ -447,7 +447,7 @@ impl LinuxElfLoader {
             })?;
             let interp_entry = interp_base + interp_elf.header.pt2.entry_point() as usize;
 
-            match interp_elf.relocate(interp_vmar, vmar) {
+            match interp_elf.relocate(interp_vmar.clone(), vmar) {
                 Ok(()) => info!("interp relocate passed!"),
                 Err(e) => {
                     debug!(
@@ -455,6 +455,34 @@ impl LinuxElfLoader {
                         e, interp_base
                     )
                 }
+            }
+
+            // The interpreter needs the same patch the main program got above,
+            // and in a dynamically linked program it is the only one that
+            // matters: `rcore_syscall_entry` lives in musl -- which *is* the
+            // interpreter here -- and not in the executable at all, so the
+            // patch above finds no symbol to write. On libos the guest reaches
+            // the kernel by jumping through that pointer instead of executing
+            // `syscall`, and it ships initialised to 0xdead_beaf, so the very
+            // first call made through it (`__init_tp` -> `__set_thread_area`,
+            // before `main`) jumped to that address and took the host process
+            // down with it. Every one of the 302 cases of `Linux Libc Test
+            // Libos` died there, with no output at all to say so.
+            //
+            // After the relocation pass, not before: an interpreter whose
+            // relocations cover this slot would otherwise put 0xdead_beaf back.
+            if let Some(offset) = interp_elf.get_symbol_address("rcore_syscall_entry") {
+                interp_vmar
+                    .write_memory(
+                        interp_base + offset as usize,
+                        &self.syscall_entry.to_ne_bytes(),
+                    )
+                    .inspect_err(|&e| {
+                        error!(
+                            "elf: patching the interpreter's syscall entry failed: {:?}",
+                            e
+                        )
+                    })?;
             }
 
             zircon_object::vm::KERNEL_ASPACE.unmap(interp_virt, interp_size_aligned)?;
