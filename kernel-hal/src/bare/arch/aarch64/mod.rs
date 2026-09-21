@@ -28,7 +28,12 @@ pub fn init_ram_disk() -> Option<&'static mut [u8]> {
     })
 }
 
-pub fn primary_init_early() {
+/// Per-CPU control registers that have to be set on every core, not once.
+///
+/// The secondaries get the same two out of the SMP trampoline, which copies
+/// this core's values; see `smp::TransRegs` for what happens to a core that
+/// misses them.
+fn init_percpu_control_regs() {
     use cortex_a::{asm::barrier, registers::CPACR_EL1};
     use tock_registers::interfaces::{Readable, Writeable};
 
@@ -42,6 +47,10 @@ pub fn primary_init_early() {
         core::arch::asm!("msr cntkctl_el1, {0}", in(reg) (cntkctl | 0b11));
     }
     unsafe { barrier::isb(barrier::SY) };
+}
+
+pub fn primary_init_early() {
+    init_percpu_control_regs();
     CMDLINE.init_once_by(KCONFIG.cmdline.to_string());
     drivers::init_early();
 }
@@ -59,6 +68,8 @@ pub fn primary_init() {
 }
 
 pub fn secondary_init() {
+    // CPACR_EL1/CNTKCTL_EL1 are set by the SMP trampoline, before any compiled
+    // Rust runs on this core -- see `smp::TransRegs`.
     // Enable this core's GIC CPU interface so it can receive SGIs/PPIs.
     unsafe {
         let gicc = phys_to_virt(KCONFIG.gic_base + 0x1_0000);

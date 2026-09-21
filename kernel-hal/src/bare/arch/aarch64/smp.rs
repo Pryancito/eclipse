@@ -43,13 +43,15 @@ pub static AP_ONLINE_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// load-bearing — the trampoline reads it by fixed byte offsets.
 #[repr(C)]
 struct SecondaryContext {
-    ttbr0: u64, // +0
-    ttbr1: u64, // +8
-    tcr: u64,   // +16
-    mair: u64,  // +24
-    sctlr: u64, // +32
-    sp: u64,    // +40  (virtual stack top)
-    entry: u64, // +48  (virtual kernel entry, ap_fn)
+    ttbr0: u64,   // +0
+    ttbr1: u64,   // +8
+    tcr: u64,     // +16
+    mair: u64,    // +24
+    sctlr: u64,   // +32
+    sp: u64,      // +40  (virtual stack top)
+    entry: u64,   // +48  (virtual kernel entry, ap_fn)
+    cpacr: u64,   // +56
+    cntkctl: u64, // +64
 }
 
 /// Physical address of a kernel virtual address.
@@ -64,6 +66,18 @@ struct TransRegs {
     tcr: u64,
     mair: u64,
     sctlr: u64,
+    /// CPACR_EL1 and CNTKCTL_EL1 are banked per CPU and reset to "trap", so a
+    /// core that does not get them traps on its first FP/SIMD instruction with
+    /// `EC=0x07` -- and `trap_handler` contains one, so the handler takes the
+    /// same trap again, forever, until the pushed frames run off the bottom of
+    /// the stack and the loop settles into a write fault at
+    /// `__vectors + 0x200`. That is what every aarch64 boot with more than one
+    /// core did, silently: the one core still able to print was waiting on a
+    /// frame-allocator lock a dead one held. They are set in the trampoline
+    /// rather than in `secondary_init`, which is already several calls of
+    /// compiled Rust too late.
+    cpacr: u64,
+    cntkctl: u64,
 }
 
 /// Build a TTBR0 page table that identity-maps the trampoline code page so the PC
@@ -96,6 +110,12 @@ pub fn start_secondary_cores() {
         tcr: TCR_EL1.get(),
         mair: MAIR_EL1.get(),
         sctlr: SCTLR_EL1.get(),
+        cpacr: CPACR_EL1.get(),
+        cntkctl: {
+            let v: u64;
+            unsafe { core::arch::asm!("mrs {0}, cntkctl_el1", out(reg) v) };
+            v
+        },
     };
 
     crate::klog_info!("[smp] starting secondary cores (PSCI CPU_ON)");
@@ -118,6 +138,8 @@ pub fn start_secondary_cores() {
             tcr: regs.tcr,
             mair: regs.mair,
             sctlr: regs.sctlr,
+            cpacr: regs.cpacr,
+            cntkctl: regs.cntkctl,
             sp: stack_top as u64,
             entry: KCONFIG.ap_fn as usize as u64,
         });
@@ -222,6 +244,8 @@ unsafe extern "C" fn secondary_trampoline() -> ! {
         // the physical context pointer in x0 is still valid.
         "ldr x9, [x0, #40]",  // sp
         "ldr x10, [x0, #48]", // entry
+        "ldr x11, [x0, #56]", // cpacr (FP/SIMD not trapped)
+        "ldr x12, [x0, #64]", // cntkctl (EL0 may read the counters)
         "dsb sy",
         "isb",
         "tlbi vmalle1",
@@ -229,6 +253,10 @@ unsafe extern "C" fn secondary_trampoline() -> ! {
         "isb",
         "ldr x1, [x0, #32]", // sctlr (with M/C/I set) -> enable MMU
         "msr sctlr_el1, x1",
+        "isb",
+        // Per-CPU, and reset to "trap" on every core: see `TransRegs::cpacr`.
+        "msr cpacr_el1, x11",
+        "msr cntkctl_el1, x12",
         "isb",
         "mov sp, x9",
         "br x10",
