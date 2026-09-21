@@ -173,10 +173,170 @@ fn on_syncobj_signaled(_handle: u32, _point: u64) {
     for ev in fire {
         deliver(&ev);
     }
+    // Re-arm for the waiters that are still here. `register` is the only other
+    // place that arms the poller, and it gives up when nothing is pending --
+    // which is the normal case, because a compositor registers the acquire
+    // point BEFORE the client submits the work that will reach it.
+    //
+    // The submit is what creates the hardware fence, and `attach_hw_fence`
+    // announces it through this very hook, with the point it just *submitted*.
+    // A plain waiter (no WAIT_AVAILABLE) does not accept a submitted point, so
+    // it stays registered -- and without re-arming here, nothing is watching
+    // when the GPU finally lands that fence. Hardware fences are resolved
+    // lazily, only inside some other syncobj call, so "nothing is watching"
+    // means the eventfd is never written and the frame never completes.
+    //
+    // Only reachable on hardware: a fence exists only when a real EXEC put one
+    // there, so the software path never walks this at all.
+    arm_poller();
 }
 
 /// Wire [`on_syncobj_signaled`] into the syncobj layer's point-advance upcall.
 /// Called once at boot.
 pub fn init() {
     zcore_drivers::scheme::syncobj::set_signal_hook(on_syncobj_signaled);
+}
+
+/// The half of explicit sync that only real hardware walks.
+///
+/// A fence here is either explicit — some ioctl sets the point, and the signal
+/// hook runs right then — or a *hardware* fence, which the GPU lands on its
+/// own with nobody notified. The second kind exists only when a real `EXEC`
+/// put one there, so QEMU, where there is no nouveau at all, never reaches it.
+/// That is why this path could be broken for a day without a single test or
+/// boot noticing.
+#[cfg(test)]
+mod hardware_fence_tests {
+    use super::*;
+    use crate::error::LxResult;
+    use crate::fs::{OpenFlags, PollEvents, PollStatus};
+    use alloc::boxed::Box;
+    use core::sync::atomic::AtomicU32;
+    use zcore_drivers::scheme::syncobj;
+    use zircon_object::object::*;
+
+    /// An eventfd stand-in that counts what was written to it. Delivery is a
+    /// plain `write` of 1, so a non-zero count is the compositor being told
+    /// its frame is ready.
+    struct CountingEventfd {
+        base: KObjectBase,
+        writes: AtomicU32,
+    }
+
+    impl_kobject!(CountingEventfd);
+
+    impl CountingEventfd {
+        fn new() -> Arc<Self> {
+            Arc::new(CountingEventfd {
+                base: KObjectBase::default(),
+                writes: AtomicU32::new(0),
+            })
+        }
+        fn delivered(&self) -> u32 {
+            self.writes.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FileLike for CountingEventfd {
+        fn flags(&self) -> OpenFlags {
+            OpenFlags::RDWR
+        }
+        fn set_flags(&self, _f: OpenFlags) -> LxResult {
+            Ok(())
+        }
+        async fn read(&self, _buf: &mut [u8]) -> LxResult<usize> {
+            Ok(0)
+        }
+        fn write(&self, buf: &[u8]) -> LxResult<usize> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(buf.len())
+        }
+        async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
+            Ok(0)
+        }
+        fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
+            Ok(PollStatus::default())
+        }
+        async fn async_poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
+            Ok(PollStatus::default())
+        }
+    }
+
+    fn reset() {
+        WAITERS.lock().clear();
+        WAITER_COUNT.store(0, Ordering::SeqCst);
+        POLLER_ARMED.store(false, Ordering::Release);
+    }
+
+    /// An explicit signal delivers, which is the path that always worked and
+    /// the baseline for the one below.
+    #[test]
+    fn an_explicit_signal_delivers_the_eventfd() {
+        reset();
+        syncobj::set_signal_hook(on_syncobj_signaled);
+        let handle = syncobj::create(false);
+        let ev = CountingEventfd::new();
+
+        register(handle, 1, ev.clone(), false);
+        assert_eq!(ev.delivered(), 0, "nothing has reached the point yet");
+
+        syncobj::timeline_signal(handle, 1);
+        assert_eq!(ev.delivered(), 1, "the signal releases the waiter");
+    }
+
+    /// The regression. A compositor registers the acquire point BEFORE the
+    /// client submits the work that will reach it, so at registration there is
+    /// no hardware fence to poll and the poller stands down. The submit then
+    /// creates one and announces it through the signal hook — with the point
+    /// it just *submitted*, which a plain waiter does not accept, so the
+    /// waiter stays.
+    ///
+    /// If nothing re-arms the poller at that moment, the GPU lands the fence
+    /// with nobody watching: hardware fences are only resolved inside some
+    /// other syncobj call, so the eventfd is never written, the frame never
+    /// completes, and the client sits in its next swap for ever — a window
+    /// that is up and frozen, with no error anywhere.
+    #[test]
+    fn a_fence_submitted_after_the_waiter_still_gets_polled() {
+        reset();
+        syncobj::set_signal_hook(on_syncobj_signaled);
+        let handle = syncobj::create(false);
+        let ev = CountingEventfd::new();
+
+        // Registration first, with nothing in flight — the poller has nothing
+        // to watch and correctly does not arm.
+        register(handle, 1, ev.clone(), false);
+        assert_eq!(ev.delivered(), 0);
+
+        // Now the client submits. The fence has NOT landed: the GPU writes the
+        // payload into this word later, and it still reads zero.
+        let landing_zone: u32 = 0;
+        syncobj::attach_hw_fence(
+            handle,
+            1,
+            &landing_zone as *const u32 as usize,
+            0,
+            1,
+            0,
+            false,
+        );
+
+        assert_eq!(
+            ev.delivered(),
+            0,
+            "submitting is not landing: a plain waiter must not fire yet"
+        );
+        assert!(
+            syncobj::has_pending(),
+            "the fence is in flight, so there is something to poll"
+        );
+        assert!(
+            POLLER_ARMED.load(Ordering::Acquire),
+            "a waiter with an in-flight fence must leave the poller armed, or \
+             nothing will ever notice the GPU landing it"
+        );
+
+        reset();
+    }
 }
