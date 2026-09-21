@@ -1,4 +1,5 @@
 use super::*;
+use crate::outparams::hand_out_one;
 use core::fmt::Debug;
 use core::mem::size_of;
 
@@ -312,7 +313,21 @@ impl Syscall<'_> {
                 let pidfd =
                     linux_object::fs::PidFd::new(process, linux_object::fs::OpenFlags::CLOEXEC);
                 let fd = self.linux_process().add_file(pidfd)?;
-                parent_tid.write(fd.into())?;
+                // Taken back if the caller never gets the number. (Linux also
+                // unwinds the whole child here; this one is already forked, so
+                // the child survives a faulting `parent_tid` — a divergence
+                // left alone on purpose, since undoing a live process is not
+                // something to bolt onto an error path.)
+                hand_out_one(
+                    fd,
+                    |fd| {
+                        parent_tid.write(fd.into())?;
+                        Ok(())
+                    },
+                    |fd| {
+                        let _ = self.linux_process().close_file(fd);
+                    },
+                )?;
             }
             return Ok(pid);
         }

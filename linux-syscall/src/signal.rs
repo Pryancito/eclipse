@@ -9,6 +9,7 @@
 //! - sigaltstack
 
 use super::*;
+use crate::outparams::commit_and_report_old;
 use linux_object::signal::{SigInfo, Signal, SignalAction, SignalStack, SignalStackFlags, Sigset};
 use linux_object::thread::ThreadExt;
 use linux_object::time::TimeSpec;
@@ -177,28 +178,6 @@ const SI_TKILL: i32 = -6;
 /// ```
 fn may_queue_siginfo(code: i32, target_is_caller: bool) -> bool {
     target_is_caller || (code < 0 && code != SI_TKILL)
-}
-
-/// Apply a change, and copy the previous value out only once it succeeded.
-///
-/// `rt_sigaction`, `rt_sigprocmask` and `sigaltstack` each take a new value
-/// and a pointer to receive the old one, and each one ends with the
-/// `copy_to_user` of the old value: a call that fails leaves the caller's
-/// buffer exactly as it found it. All three wrote it up front instead, so a
-/// refused call still handed back a value it never promised — and the reason
-/// a program asks for the old state is to restore it later, which is how a
-/// failed `sigprocmask` ends with a thread running under a mask nobody chose.
-///
-/// Same shape as the `fd_set` of `select`, which was emptied before the wait
-/// could fail. One helper, so the rule cannot be half-applied again.
-fn commit_and_report_old<T>(
-    old: T,
-    out: &mut UserOutPtr<T>,
-    change: impl FnOnce() -> Result<(), LxError>,
-) -> Result<(), LxError> {
-    change()?;
-    out.write_if_not_null(old)?;
-    Ok(())
 }
 
 /// `MINSIGSTKSZ` on the architectures this kernel runs.
@@ -1161,67 +1140,5 @@ mod signal_tests {
             ),
             Ok(())
         );
-    }
-
-    // ---- the old value is copied out only on success -----------------------
-    //
-    // `libos` addresses are ordinary host addresses, so a local variable is a
-    // valid stand-in for the caller's buffer and the copy below runs for real.
-
-    fn user_out<T>(slot: &mut T) -> UserOutPtr<T> {
-        UserOutPtr::from(slot as *mut T as usize)
-    }
-
-    #[test]
-    fn a_call_that_fails_leaves_the_callers_old_value_alone() {
-        // rt_sigaction, rt_sigprocmask and sigaltstack all end with the
-        // `copy_to_user` of the old value, so a refused call hands back
-        // nothing. All three wrote it first instead — and the reason a
-        // program asks for the old state is to put it back later.
-        let mut slot = 0xdead_beefu64;
-        let mut out = user_out(&mut slot);
-        let err = commit_and_report_old(1234u64, &mut out, || Err(LxError::EFAULT));
-        assert_eq!(err, Err(LxError::EFAULT));
-        assert_eq!(slot, 0xdead_beef, "a failed call wrote the caller's buffer");
-    }
-
-    #[test]
-    fn a_call_that_succeeds_reports_the_value_from_before_it() {
-        let mut slot = 0xdead_beefu64;
-        let mut out = user_out(&mut slot);
-        assert_eq!(commit_and_report_old(1234u64, &mut out, || Ok(())), Ok(()));
-        assert_eq!(slot, 1234);
-    }
-
-    #[test]
-    fn the_change_happens_before_the_old_value_is_reported() {
-        // Order, not just outcome: the closure must have run by the time the
-        // copy out does, or a caller could observe a mask it never set.
-        let mut ran = false;
-        let mut slot = 0u64;
-        let mut out = user_out(&mut slot);
-        commit_and_report_old(7u64, &mut out, || {
-            ran = true;
-            Ok(())
-        })
-        .expect("nothing failed");
-        assert!(ran, "the change never ran");
-        assert_eq!(slot, 7);
-    }
-
-    #[test]
-    fn a_null_out_pointer_is_not_a_fault() {
-        // Every one of these syscalls takes NULL for "do not report the old
-        // value"; it is the common case for a program that only sets.
-        let mut ran = false;
-        let mut out: UserOutPtr<u64> = UserOutPtr::from(0usize);
-        assert_eq!(
-            commit_and_report_old(7u64, &mut out, || {
-                ran = true;
-                Ok(())
-            }),
-            Ok(())
-        );
-        assert!(ran);
     }
 }

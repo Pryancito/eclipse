@@ -1,4 +1,5 @@
 use super::*;
+use crate::outparams::hand_out_pair;
 use alloc::vec::Vec;
 use core::convert::TryInto;
 use core::mem::size_of;
@@ -1033,8 +1034,18 @@ impl Syscall<'_> {
             socket2.set_flags(new_flags)?;
         }
         let fd1 = proc.add_socket(socket1)?;
-        let fd2 = proc.add_socket(socket2)?;
-        sv.write_array(&[fd1.into(), fd2.into()])?;
+        // Taken back if the caller never gets the numbers, like `pipe2`.
+        hand_out_pair(
+            fd1,
+            || proc.add_socket(socket2),
+            |fd1, fd2| {
+                sv.write_array(&[fd1.into(), fd2.into()])?;
+                Ok(())
+            },
+            |fd| {
+                let _ = proc.close_file(fd);
+            },
+        )?;
         Ok(0)
     }
 

@@ -6,6 +6,7 @@
 //! - pipe
 
 use super::*;
+use crate::outparams::{commit_and_report_old, hand_out_pair};
 use alloc::string::String;
 use alloc::sync::Arc;
 use linux_object::error::LxResult;
@@ -148,27 +149,32 @@ impl Syscall<'_> {
         const TFD_TIMER_ABSTIME: usize = 1;
         let file_like = self.linux_process().get_file_like(fd)?;
         let tfd = file_like.downcast_ref::<TimerFd>().ok_or(LxError::EINVAL)?;
-        if !old_value.is_null() {
-            let (iv, rem) = tfd.get_time();
-            old_value.write(ITimerSpec::from_ns(iv, rem))?;
-        }
-        let v = new_value.read()?;
-        // Same rule as `timer_settime`: an out-of-range `timespec` is EINVAL.
-        if !v.it_interval.valid() || !v.it_value.valid() {
-            return Err(LxError::EINVAL);
-        }
-        info!(
-            "timerfd_settime: fd={:?}, flags={:#x}, value_ns={}, interval_ns={}",
-            fd,
-            flags,
-            v.value_ns(),
-            v.interval_ns()
-        );
-        tfd.set_time(
-            v.value_ns(),
-            v.interval_ns(),
-            flags & TFD_TIMER_ABSTIME != 0,
-        );
+        let (iv, rem) = tfd.get_time();
+        let old = ITimerSpec::from_ns(iv, rem);
+        // The old value is reported LAST, after the timer is set, as
+        // timerfd_settime(2) does: reading `new_value` can fault and an
+        // out-of-range timespec is EINVAL, and neither of those may have
+        // already written the caller's `old_value`.
+        commit_and_report_old(old, &mut old_value, || {
+            let v = new_value.read()?;
+            // Same rule as `timer_settime`: an out-of-range `timespec` is EINVAL.
+            if !v.it_interval.valid() || !v.it_value.valid() {
+                return Err(LxError::EINVAL);
+            }
+            info!(
+                "timerfd_settime: fd={:?}, flags={:#x}, value_ns={}, interval_ns={}",
+                fd,
+                flags,
+                v.value_ns(),
+                v.interval_ns()
+            );
+            tfd.set_time(
+                v.value_ns(),
+                v.interval_ns(),
+                flags & TFD_TIMER_ABSTIME != 0,
+            );
+            Ok(())
+        })?;
         Ok(0)
     }
 
@@ -555,17 +561,27 @@ impl Syscall<'_> {
             String::from("pipe_r:[]"),
         ))?;
 
-        let write_fd = proc.add_file(File::new(
-            Arc::new(write),
-            base_flags | OpenFlags::WRONLY,
-            String::from("pipe_w:[]"),
-        ))?;
-        fds.write([read_fd.into(), write_fd.into()])?;
-
-        info!(
-            "pipe2: created rfd={:?} wfd={:?} fds={:?}",
-            read_fd, write_fd, fds
-        );
+        // The descriptors only belong to the caller once it has their numbers:
+        // until then a failure has to take them back, or they sit in the fd
+        // table with nothing left that can close them. See `hand_out_pair`.
+        hand_out_pair(
+            read_fd,
+            || {
+                proc.add_file(File::new(
+                    Arc::new(write),
+                    base_flags | OpenFlags::WRONLY,
+                    String::from("pipe_w:[]"),
+                ))
+            },
+            |read_fd, write_fd| {
+                fds.write([read_fd.into(), write_fd.into()])?;
+                info!("pipe2: created rfd={:?} wfd={:?}", read_fd, write_fd);
+                Ok(())
+            },
+            |fd| {
+                let _ = proc.close_file(fd);
+            },
+        )?;
 
         Ok(0)
     }

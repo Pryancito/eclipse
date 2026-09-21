@@ -118,6 +118,7 @@ mod file;
 mod ipc;
 mod misc;
 mod net;
+mod outparams;
 mod signal;
 mod task;
 mod time;
