@@ -156,7 +156,7 @@ pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
 /// Only the Linux personality arms this. The Zircon side reaches the
 /// queue-empty path on its own, and a parked watcher task would keep that
 /// queue non-empty forever.
-#[cfg(all(not(feature = "libos"), feature = "baremetal-test"))]
+#[cfg(all(not(feature = "libos"), feature = "baremetal-test", feature = "linux"))]
 pub fn reset_when_process_exits(proc: Arc<Process>) {
     kernel_hal::thread::spawn(async move {
         use zircon_object::object::Signal;
