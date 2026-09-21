@@ -451,11 +451,11 @@ static SPLIT_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
 /// Reserve the page-table frames [`ensure_4k`] will need. Called from `init`.
 fn fill_split_pool() {
-    for i in 0..SPLIT_POOL_FRAMES {
+    for (i, slot) in SPLIT_POOL.iter().enumerate().take(SPLIT_POOL_FRAMES) {
         let Some(frame) = PhysFrame::new_zero() else {
             break;
         };
-        SPLIT_POOL[i].store(frame.paddr(), Ordering::Relaxed);
+        slot.store(frame.paddr(), Ordering::Relaxed);
         SPLIT_POOL_LEN.store(i + 1, Ordering::Release);
         // Leaked deliberately. Dropping a `PhysFrame` returns it to the frame
         // allocator, and these become live page tables: the allocator would
