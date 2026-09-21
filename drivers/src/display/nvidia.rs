@@ -9443,12 +9443,19 @@ impl NvidiaGpu {
                 // GPPut is re-read from the USERD rather than cached: the
                 // /proc/gpustepNN self-tests still submit on ctx 0 through the
                 // RM path and move it behind our back.
-                let put =
-                    unsafe { core::ptr::read_volatile(f.userd_gpput as *const u32) } % entries;
-                let get =
-                    unsafe { core::ptr::read_volatile(f.userd_gpget as *const u32) } % entries;
-                let used = (put + entries - get) % entries;
-                if used + needed < entries {
+                let put_raw = unsafe { core::ptr::read_volatile(f.userd_gpput as *const u32) };
+                let get_raw = unsafe { core::ptr::read_volatile(f.userd_gpget as *const u32) };
+                // A channel whose ring has no entries is one the RM handed us
+                // without a usable GPFIFO: the wrap arithmetic would divide by
+                // zero, which from an `EXEC` ioctl is a kernel panic any
+                // process with the device open could raise. Report the
+                // direct-submit state as gone so `EXEC` falls back to the RM.
+                let Some(nv::RingState { put, get, room }) =
+                    nv::ring_state(put_raw, get_raw, entries, needed)
+                else {
+                    return Err(nv::FastSubmitError::Gone);
+                };
+                if room {
                     let mut slot = put;
                     // Same-ctx wait fences: GPU ACQUIRE before user pushes so
                     // the channel stalls in hardware instead of the CPU spinning.
