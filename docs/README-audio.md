@@ -80,7 +80,15 @@ HDA controller (PCI 04:03) ── codec ── pin ── HDMI/DP or analog jack
   (`try_recover`'s EAGAIN assert). Converting `queued` independently broke
   it near a full ring by one to four frames, and the daemon died within
   seconds of the converter engaging; the unit tests now check the identity
-  at every fill level and pin the old formula as broken. A client
+  at every fill level and pin the old formula as broken. The same identity
+  has to hold at negotiation time: the ring holds a rate-dependent number
+  of *client* frames (12288 at 48 kHz, 11289 at 44.1 kHz), and the ALSA
+  node bounds `buffer_size` before the `set_params` that switches the
+  device, so it asks the device for the capacity *at the requested rate*
+  (`AudioScheme::buffer_bytes_at`). Bounding a 44.1 kHz request with the
+  previous 48 kHz stream's figure granted PulseAudio 999 frames the ring
+  did not have, `avail` never reached zero, and the daemon aborted the
+  same way a few seconds into every 44.1 kHz track. A client
   at 48 kHz takes the pre-existing path byte for byte, so with the daemon's
   sink fixed at 48 kHz (below) the converter is dormant; it engages when a
   front end negotiates another rate. `/proc/gpusnd` shows `client=.. Hz

@@ -513,6 +513,20 @@ fn client_queued_bytes(
 /// programmed, not paused (a paused engine is stopped DMA, and restarting
 /// it is the hard path's job), and the LINK format unchanged -- which, with
 /// the link fixed, is every call after the first.
+/// The ring's capacity as a client at `client_rate` counts it: identical
+/// to the link's when the client is at [`LINK_RATE`], scaled down (or up)
+/// by the rate ratio otherwise. `set_params` clamps the rate the same way,
+/// so this is exactly what `buffer_bytes` reports after that rate is set,
+/// and a front end can size a buffer for a rate before applying it.
+fn client_buffer_bytes(link_buffer: usize, client_rate: u32, frame: usize) -> usize {
+    let client_rate = client_rate.clamp(CLIENT_RATE_MIN, CLIENT_RATE_MAX);
+    if client_rate == LINK_RATE {
+        link_buffer
+    } else {
+        link_to_client_bytes(link_buffer, client_rate, LINK_RATE, frame)
+    }
+}
+
 fn prepare_keeps_engine(
     running: bool,
     paused: bool,
@@ -1671,9 +1685,10 @@ mod format_and_ring_tests {
     //! position that runs backwards is what the intermittent dropouts were.
 
     use super::{
-        accept_client_frames, client_queued_bytes, client_to_link_bytes, exposed_queued,
-        free_bytes_of, honourable_bytes, link_to_client_bytes, nearest_rate, park_target,
-        prepare_keeps_engine, stream_format, sub_nodes, Resampler, LINK_RATE, SRC_SLACK_FRAMES,
+        accept_client_frames, client_buffer_bytes, client_queued_bytes, client_to_link_bytes,
+        exposed_queued, free_bytes_of, honourable_bytes, link_to_client_bytes, nearest_rate,
+        park_target, prepare_keeps_engine, stream_format, sub_nodes, Resampler, CLIENT_RATE_MAX,
+        CLIENT_RATE_MIN, LINK_RATE, SRC_SLACK_FRAMES,
     };
 
     /// The one case a prepare keeps the engine running: running, not
@@ -1898,6 +1913,47 @@ mod format_and_ring_tests {
                 empty
             );
         }
+    }
+
+    /// The buffer a front end sizes for a rate BEFORE applying it is the
+    /// buffer the device reports AFTER: the ALSA node bounds `buffer_size`
+    /// with the device's capacity while negotiating, then calls
+    /// `set_params`, and on a fixed-rate ring the capacity in client frames
+    /// changes with that call. Bounding a 44.1 kHz buffer with the previous
+    /// (48 kHz) stream's figure left the node 999 frames it did not have:
+    /// `avail` stayed positive with the ring full, `write` took nothing,
+    /// and PulseAudio's `try_recover` asserted on the EAGAIN.
+    #[test]
+    fn the_capacity_promised_for_a_rate_is_the_capacity_after_it_is_set() {
+        let frame = 4usize;
+        let link_buffer = 12288 * frame;
+        for &rate in &CLIENT_RATES {
+            let before = client_buffer_bytes(link_buffer, rate, frame);
+            // What `buffer_bytes` computes once `client_rate == rate`.
+            let after = if rate == LINK_RATE {
+                link_buffer
+            } else {
+                link_to_client_bytes(link_buffer, rate, LINK_RATE, frame)
+            };
+            assert_eq!(before, after, "{} Hz", rate);
+            assert_eq!(before % frame, 0, "{} Hz: whole frames", rate);
+        }
+        // The exact figures for the two rates that matter in practice.
+        assert_eq!(client_buffer_bytes(link_buffer, 48_000, frame), 49152);
+        assert_eq!(
+            client_buffer_bytes(link_buffer, 44_100, frame),
+            11289 * frame
+        );
+        // The same clamp as `set_params`: a rate the device would refuse is
+        // sized as the rate it will actually get.
+        assert_eq!(
+            client_buffer_bytes(link_buffer, 4_000, frame),
+            client_buffer_bytes(link_buffer, CLIENT_RATE_MIN, frame)
+        );
+        assert_eq!(
+            client_buffer_bytes(link_buffer, 1_000_000, frame),
+            client_buffer_bytes(link_buffer, CLIENT_RATE_MAX, frame)
+        );
     }
 
     /// Decode an HDA stream format word the way the controller does
@@ -3072,7 +3128,16 @@ impl AudioScheme for HdaDevice {
 
     fn buffer_bytes(&self) -> usize {
         let inner = self.inner.lock();
-        inner.to_client_bytes(inner.ring_len - RING_GUARD)
+        client_buffer_bytes(
+            inner.ring_len - RING_GUARD,
+            inner.client_rate,
+            inner.frame_bytes(),
+        )
+    }
+
+    fn buffer_bytes_at(&self, rate: u32) -> usize {
+        let inner = self.inner.lock();
+        client_buffer_bytes(inner.ring_len - RING_GUARD, rate, inner.frame_bytes())
     }
 
     fn queued_bytes(&self) -> usize {
