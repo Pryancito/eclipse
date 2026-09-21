@@ -77,12 +77,20 @@ HDA controller (PCI 04:03) ── codec ── pin ── HDMI/DP or analog jack
   at 48 kHz takes the pre-existing path byte for byte, so with the daemon's
   sink fixed at 48 kHz (below) the converter is dormant; it engages when a
   front end negotiates another rate. `/proc/gpusnd` shows `client=.. Hz
-  src=passthrough|resampling`. Turning it on for the desktop means letting
-  the daemon hand streams to the sink at their native rate
-  (`avoid-resampling` in `daemon.conf`); that is a separate, reversible step
-  because a rate change still goes through `set_params`, which stops and
-  wipes the stream, and on HDMI a stop/start can re-lock. Keeping the engine
-  running across a client-rate change is the step after.
+  src=passthrough|resampling`. A rate change does not restart the stream
+  either: `set_params` is ALSA's prepare, and while the engine is running on
+  an unchanged link format (with the link fixed, every call after the first)
+  it is a **soft prepare** -- the queued PCM is dropped and the engine is
+  left running into a gap, the two steps every natural drain already takes
+  (`run_gap` zeroes the ring with the engine running, then re-parks the
+  writer), instead of a stop, a wipe and a full restart with its codec
+  verbs, pin sense and HDMI kick. `/proc/gpusnd` counts them as `soft
+  prepares`; a rate switch adds nothing to `stream restarts`. The same
+  applies to a re-prepare after an XRUN. Only a stopped, paused or
+  un-programmed engine, or a real link-format change, takes the hard path.
+  Turning the converter on for the desktop is then one reversible line:
+  let the daemon hand streams to the sink at their native rate
+  (`avoid-resampling` in `daemon.conf`).
   `mixer` is SOF's mixer component (`mix_n_s16`): it sums several S16LE
   streams into one, accumulating each frame in `i32` and clamping once at the
   end, never pairwise (a pairwise clamp folds a loud stream over a quiet one

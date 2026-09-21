@@ -334,7 +334,8 @@ const STOP_HISTORY: usize = 4;
 /// `/proc/gpusnd`.
 #[derive(Clone, Copy, Default)]
 struct StopEvent {
-    /// `b'U'` underrun, `b'D'` drain, 0 = unused slot.
+    /// `b'U'` underrun, `b'D'` drain, `b'P'` a prepare that kept the engine
+    /// running (see [`HdaInner::soft_prepare`]), 0 = unused slot.
     kind: u8,
     /// Milliseconds after the stream started, by the kernel clock.
     at_ms: u64,
@@ -467,6 +468,21 @@ fn client_to_link_bytes(client_bytes: usize, fin: u32, fout: u32, frame: usize) 
     }
     let frames = (client_bytes / frame) as u64;
     (frames * fout as u64 / fin as u64) as usize * frame
+}
+
+/// Whether a `set_params` may keep the engine running (a soft prepare, see
+/// [`HdaInner::soft_prepare`]) rather than stop and wipe the stream. Only
+/// with the engine actually running on a descriptor that is still
+/// programmed, not paused (a paused engine is stopped DMA, and restarting
+/// it is the hard path's job), and the LINK format unchanged -- which, with
+/// the link fixed, is every call after the first.
+fn prepare_keeps_engine(
+    running: bool,
+    paused: bool,
+    needs_reprogram: bool,
+    link_unchanged: bool,
+) -> bool {
+    running && !paused && !needs_reprogram && link_unchanged
 }
 
 // ── MMIO helpers ────────────────────────────────────────────────────────────
@@ -621,6 +637,12 @@ struct HdaInner {
     stat_underruns: u64,
     stat_idle_stops: u64,
     stat_restarts: u64,
+    /// Prepares (a `set_params`, i.e. a client rate change or a re-prepare)
+    /// served with the engine kept running: the queued PCM dropped and a
+    /// gap opened, as a drain does, instead of a stop and a full restart.
+    /// See [`HdaInner::soft_prepare`]. With this at work a rate switch adds
+    /// nothing to `restarts`.
+    stat_soft_prepares: u64,
     stat_stop_timeouts: u64,
     /// Position-register reads (WALCLK + LPIB per poll) timed: how many, the
     /// slowest, and how many took over 1 ms. Under a hypervisor each read is
@@ -1086,7 +1108,6 @@ impl HdaInner {
     /// honest. The whole ring is zeroed once, when the gap opens: at that
     /// moment everything in it has been played.
     fn run_gap(&mut self, now_us: u64, reported: u64) {
-        let ring = self.ring_len;
         if self.gap_since_us == 0 {
             // The link has played everything written. If the engine's own
             // position also passed the tail, it got there before the writer
@@ -1113,6 +1134,15 @@ impl HdaInner {
             self.last_lpib = 0;
             return;
         }
+        self.park_write_pointer();
+    }
+
+    /// Re-park the write pointer just past the engine over a zeroed ring,
+    /// booking the stretch from the playhead to there as the silence pad.
+    /// The tail of [`run_gap`](HdaInner::run_gap), on its own so a
+    /// [`soft_prepare`](HdaInner::soft_prepare) can do the same thing.
+    fn park_write_pointer(&mut self) {
+        let ring = self.ring_len;
         let park = park_target(
             self.consumed,
             self.lpib_total,
@@ -1126,6 +1156,36 @@ impl HdaInner {
         self.stream_written = park as usize;
         self.pad_end = park;
         self.queued = ((park - self.consumed) as usize).min(ring - RING_GUARD);
+    }
+
+    /// A prepare that keeps the engine running.
+    ///
+    /// `set_params` is ALSA's prepare: drop whatever is queued and start the
+    /// stream over. It used to do that by stopping the engine and wiping
+    /// the ring, and the next write then restarted everything -- codec
+    /// verbs, pin sense, the HDMI kick -- which on an HDMI/DP sink is a
+    /// re-lock and a mute of a few hundred milliseconds. With the link
+    /// fixed at [`LINK_RATE`] a client rate change never alters the stream
+    /// format, so there is nothing to reprogram: the queued PCM is dropped
+    /// and the engine is left running into a gap, exactly the state a drain
+    /// leaves it in. Both steps are the ones every natural drain already
+    /// takes (`run_gap` zeroes the whole ring with the engine running and
+    /// then re-parks the writer); the only difference is that here the
+    /// zeroed bytes had not all been played yet -- that is the point, they
+    /// are being discarded -- and the engine hears at most a fetch's worth
+    /// of the old stream before the zeros land, then silence until the new
+    /// stream's first write parks past it.
+    ///
+    /// Only called when [`prepare_keeps_engine`] says so; the caller has
+    /// polled progress first so `consumed` and the position counters are
+    /// fresh for the park.
+    fn soft_prepare(&mut self, now_us: u64) {
+        self.stat_soft_prepares += 1;
+        self.record_stop(b'P');
+        self.paused = false;
+        self.gap_since_us = now_us;
+        self.silence_ring();
+        self.park_write_pointer();
     }
 
     /// Client PCM queued: the ring occupancy less the silence pad.
@@ -1557,9 +1617,26 @@ mod format_and_ring_tests {
 
     use super::{
         accept_client_frames, client_to_link_bytes, exposed_queued, free_bytes_of,
-        honourable_bytes, link_to_client_bytes, nearest_rate, park_target, stream_format,
-        sub_nodes, Resampler, LINK_RATE, SRC_SLACK_FRAMES,
+        honourable_bytes, link_to_client_bytes, nearest_rate, park_target, prepare_keeps_engine,
+        stream_format, sub_nodes, Resampler, LINK_RATE, SRC_SLACK_FRAMES,
     };
+
+    /// The one case a prepare keeps the engine running: running, not
+    /// paused, still programmed, same link format. Any other combination
+    /// takes the stop-and-wipe path, so a soft prepare can never be asked
+    /// to re-park an engine that is not actually fetching.
+    #[test]
+    fn a_prepare_keeps_the_engine_only_when_it_is_running_and_the_link_is_unchanged() {
+        assert!(prepare_keeps_engine(true, false, false, true));
+        // Stopped: nothing to keep running.
+        assert!(!prepare_keeps_engine(false, false, false, true));
+        // Paused DMA is stopped DMA; the hard path restarts it.
+        assert!(!prepare_keeps_engine(true, true, false, true));
+        // A descriptor that lost its programming must be set up again.
+        assert!(!prepare_keeps_engine(true, false, true, true));
+        // A link format change is a real reprogram.
+        assert!(!prepare_keeps_engine(true, false, false, false));
+    }
 
     /// Rates a desktop actually plays, paired against the fixed link.
     const CLIENT_RATES: [u32; 9] = [
@@ -2557,6 +2634,7 @@ impl HdaDevice {
             stat_underruns: 0,
             stat_idle_stops: 0,
             stat_restarts: 0,
+            stat_soft_prepares: 0,
             stat_stop_timeouts: 0,
             stat_pos_reads: 0,
             stat_pos_read_max_us: 0,
@@ -2674,15 +2752,32 @@ impl AudioScheme for HdaDevice {
                 inner.client_rate, client_rate, LINK_RATE, inner.running
             );
         }
-        inner.stop_stream();
-        inner.paused = false;
-        inner.queued = 0;
-        inner.wp = 0;
-        inner.zero_ptr = 0;
-        inner.gap_since_us = 0;
-        inner.pad_end = 0;
-        unsafe { core::ptr::write_bytes(inner.ring_va as *mut u8, 0, inner.ring_len) };
-        clflush_range(inner.ring_va, inner.ring_len);
+        let link_unchanged = inner.rate == LINK_RATE && inner.channels == channels;
+        let soft = prepare_keeps_engine(
+            inner.running,
+            inner.paused,
+            inner.needs_reprogram,
+            link_unchanged,
+        );
+        if soft {
+            // The link format is what it will be: drop the queued PCM and
+            // leave the engine running into a gap, no stop, no restart, no
+            // re-lock. Progress first, so the park lands past where the
+            // engine really is.
+            inner.poll_progress();
+            let now = timer_now_as_micros();
+            inner.soft_prepare(now);
+        } else {
+            inner.stop_stream();
+            inner.paused = false;
+            inner.queued = 0;
+            inner.wp = 0;
+            inner.zero_ptr = 0;
+            inner.gap_since_us = 0;
+            inner.pad_end = 0;
+            unsafe { core::ptr::write_bytes(inner.ring_va as *mut u8, 0, inner.ring_len) };
+            clflush_range(inner.ring_va, inner.ring_len);
+        }
         inner.rate = LINK_RATE;
         inner.channels = channels;
         inner.client_rate = client_rate;
@@ -2693,10 +2788,16 @@ impl AudioScheme for HdaDevice {
         } else {
             None
         };
-        inner.vol.set_format(LINK_RATE, channels as usize);
-        if inner.digital {
-            let ch = channels;
-            inner.send_audio_infoframe(ch);
+        if !soft {
+            // The link format and the infoframe only need (re)stating when
+            // the stream is being set up from a stop; on a soft prepare
+            // they are unchanged by construction, and re-sending the
+            // infoframe is itself something a monitor may re-lock on.
+            inner.vol.set_format(LINK_RATE, channels as usize);
+            if inner.digital {
+                let ch = channels;
+                inner.send_audio_infoframe(ch);
+            }
         }
         Ok((client_rate, channels))
     }
@@ -3031,11 +3132,12 @@ impl AudioScheme for HdaDevice {
         );
         let _ = writeln!(
             out,
-            "[gpusnd] events: {} drains, {} underruns (gaps the engine idled through), {} idle stops, {} stream restarts, {} stop timeouts, {} rejected position reads{}",
+            "[gpusnd] events: {} drains, {} underruns (gaps the engine idled through), {} idle stops, {} stream restarts, {} soft prepares (rate changes served without a restart), {} stop timeouts, {} rejected position reads{}",
             inner.stat_drains,
             inner.stat_underruns,
             inner.stat_idle_stops,
             inner.stat_restarts,
+            inner.stat_soft_prepares,
             inner.stat_stop_timeouts,
             inner.stat_bad_pos,
             if inner.stat_bad_pos > 0 {
@@ -3130,7 +3232,11 @@ impl AudioScheme for HdaDevice {
             let _ = writeln!(
                 out,
                 "[gpusnd]   gap: {} at {} ms by kernel clock / {} ms by HDA wall clock, {} B written to that stream",
-                if ev.kind == b'U' { "underrun" } else { "drain" },
+                match ev.kind {
+                    b'U' => "underrun",
+                    b'P' => "prepare",
+                    _ => "drain",
+                },
                 ev.at_ms,
                 ev.wall_ms,
                 ev.written
