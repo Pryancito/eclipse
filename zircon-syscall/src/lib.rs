@@ -81,6 +81,17 @@ impl Syscall<'_> {
             _ => {}
         }
         let [a0, a1, a2, a3, a4, a5, a6, a7] = args;
+        // The one syscall whose answer is a COUNT rather than a status: it is
+        // dispatched apart because the `ZxResult` every other arm returns has
+        // nowhere to carry it. Losing this early return costs a
+        // `ZX_ERR_NOT_SUPPORTED` from the fallback arm below, which is what the
+        // previous shape (a length transmuted into a `ZxError`) traded for
+        // undefined behaviour.
+        if sys_type == Sys::DEBUGLOG_READ {
+            let ret = self.sys_debuglog_read(a0 as _, a1 as _, a2.into(), a3 as _);
+            info!("{}|{} {:?} <= {:?}", proc_name, thread_name, sys_type, ret);
+            return syscall_status(ret);
+        }
         let ret = match sys_type {
             Sys::COUNTER_ADD => self.sys_counter_add(a0 as _, a1 as i64),
             Sys::COUNTER_CREATE => self.sys_counter_create(a0 as _, a1.into()),
@@ -299,7 +310,6 @@ impl Syscall<'_> {
             Sys::DEBUG_WRITE => self.sys_debug_write(a0.into(), a1 as _),
             Sys::DEBUGLOG_CREATE => self.sys_debuglog_create(a0 as _, a1 as _, a2.into()),
             Sys::DEBUGLOG_WRITE => self.sys_debuglog_write(a0 as _, a1 as _, a2.into(), a3 as _),
-            Sys::DEBUGLOG_READ => self.sys_debuglog_read(a0 as _, a1 as _, a2.into(), a3 as _),
             Sys::RESOURCE_CREATE => self.sys_resource_create(
                 a0 as _,
                 a1 as _,
@@ -414,9 +424,79 @@ impl Syscall<'_> {
             }
         };
         info!("{}|{} {:?} <= {:?}", proc_name, thread_name, sys_type, ret);
-        match ret {
-            Ok(_) => 0,
-            Err(err) => err as isize,
+        syscall_status(ret.map(|_| 0))
+    }
+}
+
+/// The value userspace reads out of the return register.
+///
+/// A Zircon status is an `int32_t`: zero is success and every error is
+/// negative, so the positive half is free and a handful of syscalls
+/// (`zx_debuglog_read`) answer with a byte count there instead. Both shapes go
+/// through here, so the sign convention is written once.
+fn syscall_status(ret: ZxResult<usize>) -> isize {
+    match ret {
+        // A count too big for the positive half of the status word would read as
+        // an error code. Nothing can produce one today, but answering with a
+        // truncated count would be a lie and answering with a wrapped one a
+        // bogus error.
+        Ok(n) if n > i32::MAX as usize => ZxError::OUT_OF_RANGE as isize,
+        Ok(n) => n as isize,
+        Err(err) => err as isize,
+    }
+}
+
+/// The sign convention of the return register, which every syscall's answer goes
+/// through and nothing checked.
+#[cfg(test)]
+mod syscall_status_tests {
+    use super::*;
+
+    #[test]
+    fn success_is_zero_and_a_count_is_itself() {
+        assert_eq!(syscall_status(Ok(0)), 0);
+        assert_eq!(syscall_status(Ok(1)), 1);
+        assert_eq!(syscall_status(Ok(224)), 224);
+        assert_eq!(syscall_status(Ok(i32::MAX as usize)), i32::MAX as isize);
+    }
+
+    /// Every error is negative, so no count can be read as one and no error as a
+    /// count. This is the whole reason a byte count may ride in the status word.
+    #[test]
+    fn errors_are_negative_and_counts_are_not() {
+        for err in [
+            ZxError::INTERNAL,
+            ZxError::NOT_SUPPORTED,
+            ZxError::INVALID_ARGS,
+            ZxError::BUFFER_TOO_SMALL,
+            ZxError::SHOULD_WAIT,
+            ZxError::BAD_HANDLE,
+            ZxError::ACCESS_DENIED,
+        ] {
+            let status = syscall_status(Err(err));
+            assert!(status < 0, "{:?} is not a negative status", err);
+            assert_eq!(status, err as isize);
+        }
+    }
+
+    /// A count that does not fit the positive half of the status word is refused
+    /// rather than truncated or wrapped: on a 64-bit kernel `n as isize` keeps
+    /// the high bits, and the caller would read a large count as a wild error
+    /// code.
+    #[test]
+    fn a_count_too_big_for_the_status_word_is_an_error() {
+        for n in [
+            i32::MAX as usize + 1,
+            u32::MAX as usize,
+            usize::MAX,
+            0x1_0000_0000,
+        ] {
+            assert_eq!(
+                syscall_status(Ok(n)),
+                ZxError::OUT_OF_RANGE as isize,
+                "{:#x} was not refused",
+                n
+            );
         }
     }
 }
