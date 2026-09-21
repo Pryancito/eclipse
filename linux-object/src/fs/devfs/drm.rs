@@ -5069,6 +5069,7 @@ mod refresh_tests {
     /// carries.
     #[test]
     fn a_stated_vrefresh_wins_over_the_timings() {
+        let _serialised = super::test_globals::lock();
         assert_eq!(
             refresh_hz_from_modeinfo(&modeinfo(139_900, 2080, 1121, 144)),
             Some(144)
@@ -5086,6 +5087,7 @@ mod refresh_tests {
     /// exactly how SETCRTC and an atomic MODE_ID blob reach this path.
     #[test]
     fn a_derived_refresh_rounds_to_nearest_like_linux() {
+        let _serialised = super::test_globals::lock();
         // 1920x1080, the mode `make_modeinfo` builds.
         assert_eq!(
             refresh_hz_from_modeinfo(&modeinfo(139_900, 2080, 1121, 0)),
@@ -5120,6 +5122,7 @@ mod refresh_tests {
     /// falls back to 60 Hz rather than dividing by zero or pacing off garbage.
     #[test]
     fn an_unusable_modeinfo_has_no_refresh() {
+        let _serialised = super::test_globals::lock();
         assert_eq!(refresh_hz_from_modeinfo(&[]), None);
         assert_eq!(refresh_hz_from_modeinfo(&[0u8; 27]), None, "truncated blob");
         assert_eq!(refresh_hz_from_modeinfo(&modeinfo(0, 2080, 1121, 0)), None);
@@ -5138,6 +5141,7 @@ mod refresh_tests {
     /// mode.
     #[test]
     fn the_vblank_period_tracks_the_mode_and_is_never_zero() {
+        let _serialised = super::test_globals::lock();
         set_vblank_period_from_modeinfo(&modeinfo(139_900, 2080, 1121, 0));
         assert_eq!(vblank_period_ns(), 1_000_000_000 / 60);
         set_vblank_period_from_modeinfo(&modeinfo(0, 0, 0, 144));
@@ -6324,6 +6328,7 @@ mod flip_latch_tests {
     /// scanout inside one vblank period.
     #[test]
     fn a_flip_being_delivered_still_counts_as_pending() {
+        let _serialised = super::test_globals::lock();
         reset();
         let file = DrmFileState::new();
         queue_one(&file);
@@ -6361,6 +6366,7 @@ mod flip_latch_tests {
     /// skipped the flush and the queue held two.
     #[test]
     fn delivering_one_of_two_flips_leaves_the_latch_set() {
+        let _serialised = super::test_globals::lock();
         reset();
         let file = DrmFileState::new();
         queue_one(&file);
@@ -6383,6 +6389,7 @@ mod flip_latch_tests {
     /// output teardown.
     #[test]
     fn a_truly_stale_latch_is_still_cleared() {
+        let _serialised = super::test_globals::lock();
         reset();
         FLIP_EVENT_PENDING.store(true, Ordering::Release);
         clear_stale_flip_pending();
@@ -6394,6 +6401,7 @@ mod flip_latch_tests {
     /// zero: an underflow would wrap and latch the flag on forever.
     #[test]
     fn cancelling_clears_the_latch_and_never_underflows() {
+        let _serialised = super::test_globals::lock();
         reset();
         let file = DrmFileState::new();
         queue_one(&file);
@@ -6423,6 +6431,7 @@ mod present_lifetime_tests {
     /// the allocator while the blit was still reading them.
     #[test]
     fn a_present_snapshot_keeps_the_framebuffer_memory_alive() {
+        let _serialised = super::test_globals::lock();
         let vmo = VmObject::new_paged(1);
         {
             let mut state = DRM_STATE.lock();
@@ -6472,6 +6481,7 @@ mod present_lifetime_tests {
     /// object is freed -- which is what `retire_framebuffers_for_handle` does.
     #[test]
     fn a_nouveau_backed_framebuffer_has_no_reference_to_take() {
+        let _serialised = super::test_globals::lock();
         let handle = zcore_drivers::scheme::gem_mmap::DRIVER_HANDLE_BASE + 0x77;
         {
             let mut state = DRM_STATE.lock();
@@ -6499,6 +6509,7 @@ mod present_lifetime_tests {
     /// An unknown id is not a framebuffer.
     #[test]
     fn an_unknown_framebuffer_cannot_be_snapshotted() {
+        let _serialised = super::test_globals::lock();
         assert!(snapshot_fb_for_present(0).is_none());
         assert!(snapshot_fb_for_present(0xDEAD_BEEF).is_none());
     }
