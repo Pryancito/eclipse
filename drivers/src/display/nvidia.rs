@@ -538,6 +538,19 @@ pub fn set_boot_edid(edid: &[u8], len: u32) {
     let mut buf = [0u8; 128];
     let n = (len as usize).min(edid.len()).min(128);
     buf[..n].copy_from_slice(&edid[..n]);
+    // Whatever the firmware last read off the DDC line lands here, and an
+    // unpowered sink, a flaky line or a GOP that never filled its buffer all
+    // produce something that looks like an EDID. Storing it would hand every
+    // reader -- the DRM connector property, procfs, the physical size every
+    // DPI-aware client scales by -- a panel invented out of line noise, so a
+    // block that fails its own header or checksum is dropped here instead.
+    if !crate::display::edid::block_valid(&buf[..n]) {
+        warn!(
+            "[edid] firmware handed over {} bytes that are not a valid EDID block; ignoring",
+            n
+        );
+        return;
+    }
     *BOOT_EDID.lock() = Some((buf, n as u32));
 }
 

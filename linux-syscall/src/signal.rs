@@ -96,16 +96,19 @@ impl Syscall<'_> {
         if sigsetsize != core::mem::size_of::<Sigset>() {
             return Err(LxError::EINVAL);
         }
-        oldset.write_if_not_null(self.thread.lock_linux().signal_mask)?;
+        oldset.write_if_not_null(self.thread.lock_linux().signal_mask())?;
         if set.is_null() {
             return Ok(0);
         }
         let set = set.read()?;
         let mut thread = self.thread.lock_linux();
+        // SIGKILL and SIGSTOP can never be blocked; the three helpers below
+        // all drop them, and `sigprocmask(2)` is explicit that the attempt is
+        // ignored rather than refused.
         match how {
-            How::Block => thread.signal_mask.insert_set(&set),
-            How::Unblock => thread.signal_mask.remove_set(&set),
-            How::SetMask => thread.signal_mask = set,
+            How::Block => thread.block_signals(&set),
+            How::Unblock => thread.unblock_signals(&set),
+            How::SetMask => thread.set_signal_mask(set),
         }
         Ok(0)
     }
@@ -371,10 +374,7 @@ impl Syscall<'_> {
         if sigsetsize != core::mem::size_of::<Sigset>() {
             return Err(LxError::EINVAL);
         }
-        let mut newmask = mask.read()?;
-        // SIGKILL and SIGSTOP can never be blocked.
-        newmask.remove(Signal::SIGKILL);
-        newmask.remove(Signal::SIGSTOP);
+        let newmask = mask.read()?;
         info!(
             "rt_sigsuspend: mask={:#x}, thread={}",
             newmask.val(),
@@ -384,8 +384,9 @@ impl Syscall<'_> {
         // restored once the awakening signal handler returns.
         {
             let mut thread = self.thread.lock_linux();
-            let old_mask = thread.signal_mask;
-            thread.signal_mask = newmask;
+            let old_mask = thread.signal_mask();
+            // Drops SIGKILL and SIGSTOP, which can never be blocked.
+            thread.set_signal_mask(newmask);
             thread.saved_sigmask = Some(old_mask);
         }
         // Block until a signal becomes deliverable under the temporary mask
@@ -422,7 +423,7 @@ impl Syscall<'_> {
         // Pending here means "sent but withheld by the mask": what is both in
         // the undelivered set and currently blocked. Unblocked entries are on
         // their way to delivery and are not reported, matching Linux.
-        let pending = Sigset::new(thread.signals.val() & thread.signal_mask.val());
+        let pending = Sigset::new(thread.signals.val() & thread.signal_mask().val());
         drop(thread);
         info!("rt_sigpending: pending={:#x}", pending.val());
         set.write(pending)?;
@@ -595,15 +596,13 @@ impl Syscall<'_> {
         if sigsetsize != core::mem::size_of::<Sigset>() {
             return Err(LxError::EINVAL);
         }
-        let mut newmask = sigmask.read()?;
-        // SIGKILL and SIGSTOP can never be blocked.
-        newmask.remove(Signal::SIGKILL);
-        newmask.remove(Signal::SIGSTOP);
+        let newmask = sigmask.read()?;
         let thread = alloc::sync::Arc::clone(self.thread);
         let old = {
             let mut lt = thread.lock_linux();
-            let old = lt.signal_mask;
-            lt.signal_mask = newmask;
+            let old = lt.signal_mask();
+            // Drops SIGKILL and SIGSTOP, which can never be blocked.
+            lt.set_signal_mask(newmask);
             lt.saved_sigmask = Some(old);
             old
         };
@@ -643,7 +642,7 @@ impl Drop for TempSigmaskGuard {
         // If a signal already claimed `saved_sigmask` for its frame, leave the
         // mask alone — `sigreturn` will reinstate `old`.
         if thread.saved_sigmask.is_some() {
-            thread.signal_mask = self.old;
+            thread.set_signal_mask(self.old);
             thread.saved_sigmask = None;
         }
     }

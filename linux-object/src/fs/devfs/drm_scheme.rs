@@ -1590,30 +1590,11 @@ impl DrmDev {
                     //     every DPI-aware client);
                     //  3. a ~96 DPI guess from the resolution, so wlroots never
                     //     sees "Physical size: 0x0".
-                    let edid_mm = drm::get_connector_edid(conn_res.connector_id).and_then(|e| {
-                        let d = &e[54..72];
-                        let pixel_clock = u16::from_le_bytes([d[0], d[1]]);
-                        if pixel_clock != 0 {
-                            let w = d[12] as u32 | ((d[14] as u32 & 0xF0) << 4);
-                            let h = d[13] as u32 | ((d[14] as u32 & 0x0F) << 8);
-                            if (10..=2000).contains(&w) && (10..=2000).contains(&h) {
-                                return Some((w, h));
-                            }
-                        }
-                        // Coarse: max image size in cm (0 = unspecified).
-                        let (w_cm, h_cm) = (e[21] as u32, e[22] as u32);
-                        if w_cm > 0 && h_cm > 0 {
-                            Some((w_cm * 10, h_cm * 10))
-                        } else {
-                            None
-                        }
-                    });
+                    let edid_mm = drm::get_connector_edid(conn_res.connector_id)
+                        .and_then(|e| zcore_drivers::display::edid::physical_size_mm(&e));
                     let (fallback_w, fallback_h) = edid_mm.unwrap_or_else(|| {
                         drm::display_mode()
-                            .map(|(w, h, _)| {
-                                // Assume ~96 DPI (1 in = 25.4 mm, 96 px/in).
-                                ((w * 254 / 960).max(1), (h * 254 / 960).max(1))
-                            })
+                            .map(|(w, h, _)| zcore_drivers::display::edid::estimated_size_mm(w, h))
                             .unwrap_or((1, 1))
                     });
                     conn_res.mm_width = if conn.mm_width > 0 {

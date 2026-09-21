@@ -4105,14 +4105,16 @@ pub fn get_connector(id: u32) -> Option<DrmConnector> {
         return None;
     }
     let (w, h, _) = display_mode()?;
-    // Prefer the real panel size from the UEFI-captured EDID (bytes 21/22 =
-    // max image size in cm); fall back to a ~96 DPI estimate from the mode.
-    let (mm_width, mm_height) = match zcore_drivers::display::boot_edid() {
-        Some((e, len)) if len >= 23 && (e[21] != 0 || e[22] != 0) => {
-            (e[21] as u32 * 10, e[22] as u32 * 10)
-        }
-        _ => ((w * 254 / 960).max(1), (h * 254 / 960).max(1)),
-    };
+    // The real panel size from the UEFI-captured EDID, falling back to a
+    // ~96 DPI estimate. This used to read only the coarse centimetre bytes,
+    // and to accept either one of them alone — so a display that states its
+    // size to the millimetre in a detailed timing (a TV: 885x497 mm) was
+    // reported rounded to whole centimetres, and one that fills in only the
+    // width was reported as `600x0` mm, which is an infinite DPI to every
+    // client that divides by it.
+    let (mm_width, mm_height) = get_connector_edid(SYNTH_CONNECTOR_ID)
+        .and_then(|e| zcore_drivers::display::edid::physical_size_mm(&e))
+        .unwrap_or_else(|| zcore_drivers::display::edid::estimated_size_mm(w, h));
     Some(DrmConnector {
         id: SYNTH_CONNECTOR_ID,
         connected: true,
