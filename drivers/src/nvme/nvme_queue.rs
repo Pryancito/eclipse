@@ -149,6 +149,34 @@ pub fn timer_now_as_micros() -> u64 {
     unsafe { drivers_timer_now_as_micros() }
 }
 
+/// The clock behind [`timer_now_as_micros`] in the test binary: one per
+/// thread, moved only by the test (and by the driver's own waits), so a
+/// driver's timing decisions -- a poll throttle, a verb timeout, an idle
+/// stop -- can be driven to the microsecond and the tests still run in
+/// parallel. The `drivers_timer_now_as_micros` shim in `net::e1000e`
+/// reads it; it starts at 0, which is what every test before this one saw.
+#[cfg(test)]
+pub mod test_clock {
+    extern crate std;
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static NOW_US: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub fn now() -> u64 {
+        NOW_US.with(|c| c.get())
+    }
+
+    pub fn set(us: u64) {
+        NOW_US.with(|c| c.set(us));
+    }
+
+    pub fn advance(us: u64) {
+        NOW_US.with(|c| c.set(c.get().wrapping_add(us)));
+    }
+}
+
 unsafe extern "C" {
     fn drivers_dma_alloc(pages: usize) -> PhysAddr;
     fn drivers_dma_dealloc(paddr: PhysAddr, pages: usize) -> i32;
