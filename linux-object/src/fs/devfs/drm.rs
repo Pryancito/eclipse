@@ -37,6 +37,13 @@ pub const SYNTH_ENCODER_ID: u32 = 3;
 /// Primary plane id exposed to userspace for the synthetic output.
 pub const SYNTH_PLANE_ID: u32 = 4;
 
+/// First id handed to a KMS property blob (`CREATEPROPBLOB`, and the
+/// kernel-owned current-mode blob). libdrm identifies a blob by id alone, and
+/// so does this tree's `GETPROPBLOB`, which consults the blob store and then
+/// the reserved EDID range; the two must not overlap. `drm_scheme` asserts
+/// that against its own `EDID_BLOB_BASE` at compile time.
+pub const BLOB_ID_BASE: u32 = 30_000;
+
 /// One-shot guard so the first scanout logs (every-frame logging would spam).
 static SCANOUT_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// One-shot latch for the "framebuffer has no backing" scanout warning.
@@ -438,8 +445,8 @@ struct DrmState {
     /// (e.g. the `MODE_ID` blob an atomic compositor uploads) and
     /// kernel-created (the current-mode blob echoed via OBJ_GETPROPERTIES).
     blobs: Vec<DrmBlob>,
-    /// Next blob id. Starts high above the synthetic KMS ids, fb ids and the
-    /// EDID blob ids (20000+connector) so the object-id namespaces never
+    /// Next blob id. Starts at [`BLOB_ID_BASE`], above the synthetic KMS ids,
+    /// the fb ids and the EDID blob ids, so the object-id namespaces never
     /// collide — libdrm identifies blobs purely by id.
     next_blob_id: u32,
     /// Software-KMS state mirrored back to atomic clients (see
@@ -543,7 +550,7 @@ lazy_static::lazy_static! {
             hw: false,
         },
         blobs: Vec::new(),
-        next_blob_id: 30000,
+        next_blob_id: BLOB_ID_BASE,
         atomic: AtomicKmsState::default(),
     });
     /// Shared CPU-mmap VMOs for nouveau-uAPI GEM handles. Without this,
