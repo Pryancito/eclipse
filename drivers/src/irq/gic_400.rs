@@ -18,10 +18,16 @@ static GICC_EOIR: u32 = 0x0010;
 static GICC_CTLR: u32 = 0x0000;
 static GICC_PMR: u32 = 0x0004;
 
+/// Interrupt IDs a GICv2 distributor can route. 1020..=1023 are reserved
+/// (1023 is "spurious"), and `pending_irq` already turns everything from
+/// 0x3fe up into `usize::MAX`.
+const GIC_IRQ_COUNT: usize = 1024;
+const GIC_IRQ_RANGE: core::ops::Range<usize> = 0..1020;
+
 pub struct IntController {
     gicc: GicCpuIf,
     gicd: GicDistIf,
-    manager: Mutex<IrqManager<50>>,
+    manager: Mutex<IrqManager<GIC_IRQ_COUNT>>,
 }
 
 struct GicDistIf {
@@ -43,7 +49,12 @@ impl IntController {
                 ncpus: 0,
                 nirqs: 0,
             },
-            manager: Mutex::new(IrqManager::new(0..50)),
+            // Was 0..50, which is neither the distributor's range nor
+            // anything else: SPIs start at ID 32, so a board with more than
+            // eighteen of them had devices whose IRQ could not be registered
+            // at all, while `is_valid_irq` below went on saying every ID was
+            // fine. riscv's PLIC already sizes its table to the controller.
+            manager: Mutex::new(IrqManager::new(GIC_IRQ_RANGE)),
         }
     }
 
