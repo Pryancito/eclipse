@@ -5,6 +5,7 @@ use crate::io::{Io, Mmio};
 use crate::prelude::IrqHandler;
 use crate::scheme::{IrqScheme, Scheme};
 use crate::sync::Mutex;
+use crate::utils::{bounded_drain, DRAIN_BURST};
 use crate::{utils::IrqManager, DeviceError, DeviceResult};
 use cfg_if::cfg_if;
 
@@ -119,13 +120,28 @@ impl Scheme for Plic {
 
     fn handle_irq(&self, _unused: usize) {
         let mut inner = self.inner.lock();
-        while let Some(irq_num) = inner.pending_irq() {
-            if inner.manager.handle(irq_num).is_err() {
-                warn!("no registered handler for IRQ {}!", irq_num);
-                inner.set_priority(irq_num, 0);
+        // Bounded: a level-triggered source whose handler does not quiesce it
+        // is claimed again the instant it is acknowledged, and this loop holds
+        // the one lock every hart needs to service its own interrupts. The
+        // rest of the queue arrives on the next interrupt, which is still
+        // asserted.
+        let cut_short = bounded_drain(DRAIN_BURST, || match inner.pending_irq() {
+            Some(irq_num) => {
+                if inner.manager.handle(irq_num).is_err() {
+                    warn!("no registered handler for IRQ {}!", irq_num);
+                    inner.set_priority(irq_num, 0);
+                }
+                trace!("riscv plic handle irq: {}", irq_num);
+                inner.eoi(irq_num);
+                true
             }
-            trace!("riscv plic handle irq: {}", irq_num);
-            inner.eoi(irq_num);
+            None => false,
+        });
+        if cut_short {
+            warn!(
+                "[plic] {} interrupts in one pass; more pending",
+                DRAIN_BURST
+            );
         }
     }
 }
