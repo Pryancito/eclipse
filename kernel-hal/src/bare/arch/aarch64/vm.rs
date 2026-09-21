@@ -302,10 +302,23 @@ impl From<MMUFlags> for PTF {
 
 impl From<PTF> for MMUFlags {
     fn from(f: PTF) -> Self {
-        let mut ret = Self::empty();
-        if f.contains(PTF::VALID) {
-            ret |= Self::READ;
+        // Every permission bit on AArch64 says what is *forbidden* on top of
+        // an access the descriptor already allows, so none of them means
+        // anything until the descriptor is valid. Reading them out of an
+        // invalid entry is how `stack_guard` lost its guard bands here: a band
+        // whose flags it had just cleared still reported `WRITE`, because
+        // AP_RO is absent from an all-zero entry exactly as it is from a
+        // writable one, and the readback check refused the band. An invalid
+        // entry grants nothing; say so, and leave DEVICE out too, since
+        // attribute index 0 is Device and a cleared entry has index 0 without
+        // ever having been a device mapping.
+        if !f.contains(PTF::VALID) {
+            return Self::empty();
         }
+        // Valid implies readable: AArch64 has no read-disable bit, and
+        // `From<MMUFlags>` above maps an executable-but-not-readable mapping
+        // onto a plain valid leaf for the same reason.
+        let mut ret = Self::READ;
         if !f.contains(PTF::AP_RO) {
             ret |= Self::WRITE;
         }
@@ -314,7 +327,15 @@ impl From<PTF> for MMUFlags {
             if !f.contains(PTF::UXN) {
                 ret |= Self::EXECUTE;
             }
-        } else if f.intersects(PTF::PXN) {
+        } else if !f.contains(PTF::PXN) {
+            // PXN is Privileged eXecute Never, so a kernel mapping is
+            // executable when it is *absent*. This read the bit the other way
+            // round, which inverted EXECUTE on every kernel mapping:
+            // `From<MMUFlags>` sets PXN precisely when EXECUTE was not asked
+            // for. Round-tripping a mapping through `flags()` -- which is what
+            // splitting a huge page into smaller leaves does -- therefore made
+            // the kernel's read-only text non-executable and its heap
+            // executable.
             ret |= Self::EXECUTE;
         }
         if f.mem_type() == MemType::Device {
