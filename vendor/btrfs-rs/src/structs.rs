@@ -77,6 +77,8 @@ pub const INCOMPAT_DEFAULT_SUBVOL: u64 = 1 << 1;
 pub const INCOMPAT_MIXED_GROUPS: u64 = 1 << 2;
 pub const INCOMPAT_COMPRESS_LZO: u64 = 1 << 3;
 pub const INCOMPAT_COMPRESS_ZSTD: u64 = 1 << 4;
+// Note there is no incompat flag for zlib: `compress=zlib` volumes mount on
+// any btrfs driver, so a driver that cannot inflate must say so per extent.
 pub const INCOMPAT_BIG_METADATA: u64 = 1 << 5;
 pub const INCOMPAT_EXTENDED_IREF: u64 = 1 << 6;
 pub const INCOMPAT_RAID56: u64 = 1 << 7;
@@ -110,6 +112,12 @@ pub const S_IFCHR: u32 = 0o020000;
 pub const S_IFIFO: u32 = 0o010000;
 
 // File extent types.
+// btrfs_file_extent_item::compression.
+pub const COMPRESS_NONE: u8 = 0;
+pub const COMPRESS_ZLIB: u8 = 1;
+pub const COMPRESS_LZO: u8 = 2;
+pub const COMPRESS_ZSTD: u8 = 3;
+
 pub const FILE_EXTENT_INLINE: u8 = 0;
 pub const FILE_EXTENT_REG: u8 = 1;
 pub const FILE_EXTENT_PREALLOC: u8 = 2;
@@ -584,19 +592,38 @@ impl RootItem {
 #[derive(Debug, Clone)]
 pub enum FileExtent {
     Inline {
-        /// Uncompressed length (== inline data length, we don't support
-        /// compression).
+        /// Length of the data once decompressed.
         ram_bytes: u64,
         /// Offset of the inline data inside the item.
         data_off: usize,
+        /// One of the `COMPRESS_*` constants.
+        compression: u8,
     },
     Regular {
         disk_bytenr: u64,
+        /// Length on disk, i.e. of the *compressed* bytes when compressed.
         disk_num_bytes: u64,
         /// Offset into the (decompressed) extent where this mapping starts.
         offset: u64,
+        /// Length of this mapping, in decompressed bytes.
         num_bytes: u64,
+        /// Decompressed length of the whole extent this mapping points into.
+        /// Equal to `disk_num_bytes` when uncompressed.
+        ram_bytes: u64,
+        /// One of the `COMPRESS_*` constants.
+        compression: u8,
     },
+}
+
+impl FileExtent {
+    /// The `COMPRESS_*` algorithm this extent was stored with.
+    pub fn compression(&self) -> u8 {
+        match self {
+            FileExtent::Inline { compression, .. } | FileExtent::Regular { compression, .. } => {
+                *compression
+            }
+        }
+    }
 }
 
 impl FileExtent {
@@ -606,13 +633,24 @@ impl FileExtent {
         }
         let compression = b[16];
         let ty = b[20];
-        if compression != 0 || b[17] != 0 {
-            return None; // compressed/encrypted not supported
+        // b[17] is `encryption` and b[18..20] `other_encoding`. Linux has
+        // never defined a non-zero value for either, and we could not decode
+        // one, so refuse rather than hand back bytes we cannot interpret.
+        // Compression, by contrast, is decoded on read; LZO and ZSTD carry
+        // incompat flags and so never reach a mounted volume, but zlib does
+        // not, and treating a zlib extent as unparseable used to make every
+        // read of it come back as silent zeros.
+        if b[17] != 0 || get_u16(b, 18) != 0 {
+            return None;
+        }
+        if compression > COMPRESS_ZSTD {
+            return None;
         }
         match ty {
             FILE_EXTENT_INLINE => Some(FileExtent::Inline {
                 ram_bytes: get_u64(b, 8),
                 data_off: FILE_EXTENT_HDR_LEN,
+                compression,
             }),
             FILE_EXTENT_REG | FILE_EXTENT_PREALLOC => {
                 if b.len() < FILE_EXTENT_REG_LEN {
@@ -623,6 +661,8 @@ impl FileExtent {
                     disk_num_bytes: get_u64(b, 29),
                     offset: get_u64(b, 37),
                     num_bytes: get_u64(b, 45),
+                    ram_bytes: get_u64(b, 8),
+                    compression,
                 })
             }
             _ => None,

@@ -10,3 +10,9 @@ std = []
 
 [dependencies]
 log = "0.4"
+# DEFLATE decoder for zlib-compressed file extents. `with-alloc` is the
+# no_std + alloc build; the default `with-std` would not link in the kernel.
+# Reading a compressed extent means handing an inflater bytes straight off
+# the disk, so this is one of the few places where a fuzzed, widely used
+# implementation is worth a dependency over 400 lines of our own.
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
