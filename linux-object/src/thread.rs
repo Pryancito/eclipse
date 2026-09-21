@@ -5,6 +5,7 @@ use crate::process::ProcessExt;
 use crate::signal::{SigInfo, Signal, SignalStack, SignalUserContext, Sigset};
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use kernel_hal::context::{UserContext, UserContextField};
 use kernel_hal::sync::{Mutex, MutexGuard};
 use kernel_hal::user::{Out, UserInPtr, UserOutPtr, UserPtr};
@@ -169,9 +170,94 @@ impl ThreadExt for Thread {
     }
 }
 
+/// Release every robust lock a dying thread still holds.
+trait RobustExit {
+    fn release_robust_locks(&self);
+}
+
+impl RobustExit for CurrentThread {
+    fn release_robust_locks(&self) {
+        let (head_addr, len) = {
+            let linux = self.lock_linux();
+            (linux.robust_list.as_addr(), linux.robust_list_len)
+        };
+        // A length other than the struct's own is what `set_robust_list`
+        // refuses, so it can only be the never-registered zero.
+        if head_addr == 0 || len != core::mem::size_of::<RobustList>() {
+            return;
+        }
+        // Every read here is a `get_user` on the dying thread's own address
+        // space, in kernel mode. The list head lives in the thread's TLS and
+        // the entries in mutexes it just held, so the pages are normally
+        // resident -- but "normally" is not enough on a path that runs at
+        // every thread exit, and this kernel does not recover from a fault
+        // taken on a raw access (see the `clear_child_tid` code below, which
+        // faults its page in for the same reason). So: inside the process's
+        // own mappings, and faulted in first.
+        let vmar = self.proc().vmar();
+        let held = walk_robust_list(head_addr, |addr| {
+            if !addr.is_multiple_of(core::mem::align_of::<usize>()) {
+                return None;
+            }
+            #[cfg(target_os = "none")]
+            {
+                if !vmar.contains(addr) {
+                    return None;
+                }
+                let present = vmar.get_vaddr_flags(addr).is_ok();
+                if !present
+                    && vmar
+                        .handle_page_fault(addr, kernel_hal::MMUFlags::USER)
+                        .is_err()
+                {
+                    return None;
+                }
+            }
+            let word: UserInPtr<usize> = addr.into();
+            word.read().ok()
+        });
+        drop(vmar);
+        if held.is_empty() {
+            return;
+        }
+        let tid = self.id() as i32;
+        let proc = self.proc();
+        for lock in held {
+            let Some(futex) = proc.linux().get_futex(lock.addr) else {
+                continue;
+            };
+            // Retry on a lost race, as Linux's `handle_futex_death` does: the
+            // word can still change under us while this thread is dying.
+            loop {
+                let uval = futex.load();
+                match robust_death_action(uval, tid, lock.pi) {
+                    RobustDeath::NotOurs => break,
+                    RobustDeath::Died { new_value, wake } => {
+                        if futex.compare_exchange(uval, new_value).is_err() {
+                            continue;
+                        }
+                        if wake {
+                            futex.wake(1);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl CurrentThreadExt for CurrentThread {
     /// Exit current thread for Linux.
     fn exit_linux(&self, _exit_code: i32) {
+        // Linux's `mm_release` does this first, before the `clear_child_tid`
+        // wake below: release every robust lock this thread still holds. The
+        // list was registered by `set_robust_list` -- which both glibc and
+        // musl call for every thread they create -- and was stored and read
+        // by nobody, so a thread that died holding a robust or process-shared
+        // mutex left every waiter blocked in the kernel for the life of the
+        // process, with no way for userspace to break it.
+        self.release_robust_locks();
         let mut linux_thread = self.lock_linux();
         let clear_child_tid = &mut linux_thread.clear_child_tid;
         // perform futex wake 1
@@ -228,15 +314,140 @@ impl CurrentThreadExt for CurrentThread {
     }
 }
 
-/// robust_list
+/// Linux's `struct robust_list_head`: the head of the list of locks a thread
+/// holds, so the kernel can release them if the thread dies holding one.
+///
+/// `repr(C)` because userspace writes this: the three words are read back out
+/// of the process's own memory at thread exit, by offset.
 #[derive(Default)]
+#[repr(C)]
 pub struct RobustList {
-    /// head
+    /// First entry, or the address of this head itself when the list is empty.
+    /// Bit 0 is the PI flag, not part of the address.
     pub head: usize,
-    /// off
+    /// Signed distance from a list node to the futex word it guards. Negative
+    /// in both glibc and musl -- the lock word sits *before* the list node
+    /// inside `pthread_mutex_t`.
     pub off: isize,
-    /// pending
+    /// The entry a thread is part-way through adding or removing. Handled last
+    /// and exactly once, because it may or may not be on the list yet.
     pub pending: usize,
+}
+
+/// Linux's `ROBUST_LIST_LIMIT`. The list lives in user memory and is walked at
+/// every thread exit, so a program that builds a circular one -- by accident
+/// or on purpose -- would otherwise keep a CPU in the kernel forever.
+pub const ROBUST_LIST_LIMIT: usize = 2048;
+
+/// One lock a dying thread still holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RobustFutex {
+    /// The futex word itself, already offset from the list node.
+    pub addr: usize,
+    /// Whether the entry was tagged as priority-inheriting (bit 0 of the
+    /// pointer that named it).
+    pub pi: bool,
+}
+
+/// Walk the robust list a dying thread registered, newest lock first.
+///
+/// `read_word` reads one machine word of the thread's memory, or returns
+/// `None` when that address cannot be read -- which ends the walk, exactly as
+/// a failed `get_user` ends Linux's. The list is userspace's, so every part of
+/// it is untrusted: the length is capped, the terminator is the head's own
+/// address, and the offset is applied as the signed quantity it is declared to
+/// be.
+pub fn walk_robust_list(
+    head_addr: usize,
+    mut read_word: impl FnMut(usize) -> Option<usize>,
+) -> Vec<RobustFutex> {
+    let mut found = Vec::new();
+    if head_addr == 0 {
+        return found;
+    }
+    // Bit 0 of every list pointer is the PI flag; the address is the rest.
+    let split = |word: usize| (word & !1, word & 1 == 1);
+    let (mut entry, mut pi) = match read_word(head_addr) {
+        Some(word) => split(word),
+        None => return found,
+    };
+    let offset = match read_word(head_addr + core::mem::size_of::<usize>()) {
+        Some(word) => word as isize,
+        None => return found,
+    };
+    let (pending, pending_pi) = match read_word(head_addr + 2 * core::mem::size_of::<usize>()) {
+        Some(word) => split(word),
+        None => return found,
+    };
+    // The list is circular by construction: it ends by pointing back at the
+    // head. An entry of 0 is an empty list that was never linked up.
+    let mut limit = ROBUST_LIST_LIMIT;
+    while entry != head_addr && entry != 0 && limit > 0 {
+        let next = read_word(entry);
+        // The pending entry may already be linked in; it is handled once, at
+        // the end, so skip it here rather than releasing the same lock twice.
+        if entry != pending {
+            found.push(RobustFutex {
+                addr: entry.wrapping_add(offset as usize),
+                pi,
+            });
+        }
+        match next {
+            Some(word) => {
+                let (next_entry, next_pi) = split(word);
+                entry = next_entry;
+                pi = next_pi;
+            }
+            None => break,
+        }
+        limit -= 1;
+    }
+    if pending != 0 {
+        found.push(RobustFutex {
+            addr: pending.wrapping_add(offset as usize),
+            pi: pending_pi,
+        });
+    }
+    found
+}
+
+/// What to do with one futex word a dying thread may be holding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RobustDeath {
+    /// The word does not name this thread as the owner: it was released
+    /// already, or the list entry is stale. Leave it alone.
+    NotOurs,
+    /// Mark the owner as dead, and wake a waiter if the word says one is
+    /// waiting and the lock is not priority-inheriting.
+    Died {
+        /// The value to store: the waiters bit as found, plus the death mark.
+        new_value: i32,
+        /// Whether a `FUTEX_WAKE` has to follow.
+        wake: bool,
+    },
+}
+
+/// Linux's `handle_futex_death`, without the memory access.
+///
+/// Userspace cannot do this itself: the whole point is that the owner is gone.
+/// The next thread to take the lock sees `FUTEX_OWNER_DIED` and gets
+/// `EOWNERDEAD` from `pthread_mutex_lock`, its chance to repair whatever the
+/// dead owner left half-done. Without the mark, every waiter stays blocked in
+/// the kernel for as long as the process lives.
+pub fn robust_death_action(uval: i32, tid: i32, pi: bool) -> RobustDeath {
+    const FUTEX_WAITERS: i32 = 0x8000_0000_u32 as i32;
+    const FUTEX_OWNER_DIED: i32 = 0x4000_0000;
+    const FUTEX_TID_MASK: i32 = 0x3fff_ffff;
+    if uval & FUTEX_TID_MASK != tid & FUTEX_TID_MASK {
+        return RobustDeath::NotOurs;
+    }
+    RobustDeath::Died {
+        new_value: (uval & FUTEX_WAITERS) | FUTEX_OWNER_DIED,
+        // A PI lock's waiters are woken by the PI unlock path, which hands the
+        // lock over rather than racing for it; waking them here as well would
+        // put a second thread into a queue that has already picked a winner.
+        wake: !pi && uval & FUTEX_WAITERS != 0,
+    }
 }
 
 /// Linux specific thread information.
@@ -722,5 +933,346 @@ mod signal_delivery_tests {
                 .unwrap_or_else(|| panic!("{:?} was never delivered", sig));
             assert_eq!(got, sig);
         }
+    }
+}
+
+#[cfg(test)]
+mod robust_list_tests {
+    //! The robust list is how a thread that dies holding a lock stops being
+    //! everyone else's problem: the kernel walks it, marks each lock's owner
+    //! dead and wakes a waiter, and the next thread to take the lock gets
+    //! `EOWNERDEAD` instead of blocking forever. Both glibc and musl register
+    //! one for every thread they create, so this runs at every thread exit in
+    //! the system -- on a list that lives in user memory and can say anything.
+
+    use super::*;
+    use alloc::collections::BTreeMap;
+
+    const HEAD: usize = 0x7000_0000;
+    const W: usize = core::mem::size_of::<usize>();
+
+    /// The head's three words plus whatever entries a test lays out.
+    fn memory(next: usize, offset: isize, pending: usize) -> BTreeMap<usize, usize> {
+        BTreeMap::from([
+            (HEAD, next),
+            (HEAD + W, offset as usize),
+            (HEAD + 2 * W, pending),
+        ])
+    }
+
+    fn walk(mem: &BTreeMap<usize, usize>) -> Vec<RobustFutex> {
+        walk_robust_list(HEAD, |addr| mem.get(&addr).copied())
+    }
+
+    #[test]
+    fn an_empty_list_points_back_at_its_own_head() {
+        // This is how both libcs initialise it, and it is what almost every
+        // thread exit sees. Treating the head as an entry would hand the
+        // futex code an address inside the list head itself.
+        assert!(walk(&memory(HEAD, -16, 0)).is_empty());
+    }
+
+    #[test]
+    fn a_list_that_was_never_linked_up_is_empty() {
+        assert!(walk(&memory(0, -16, 0)).is_empty());
+        // And a thread that never called `set_robust_list` at all.
+        assert!(walk_robust_list(0, |_| panic!("must not read anything")).is_empty());
+    }
+
+    #[test]
+    fn the_futex_word_is_found_by_a_signed_offset_from_the_node() {
+        // `futex_offset` is a `long`, and in both glibc and musl it is
+        // NEGATIVE: the lock word sits before the list node inside
+        // `pthread_mutex_t`. Read as unsigned it becomes a huge number, the
+        // address wraps, and the kernel marks a word nowhere near the mutex.
+        let node = HEAD + 0x1000;
+        let mut mem = memory(node, -16, 0);
+        mem.insert(node, HEAD);
+        let held = walk(&mem);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].addr, node - 16, "the word is before the node");
+    }
+
+    #[test]
+    fn a_positive_offset_works_too() {
+        let node = HEAD + 0x1000;
+        let mut mem = memory(node, 24, 0);
+        mem.insert(node, HEAD);
+        assert_eq!(walk(&mem)[0].addr, node + 24);
+    }
+
+    #[test]
+    fn every_entry_of_a_chain_is_visited_in_order() {
+        // Newest lock first: a thread pushes each lock onto the head as it
+        // takes it, so the walk releases in reverse order of acquisition.
+        let (a, b, c) = (HEAD + 0x1000, HEAD + 0x2000, HEAD + 0x3000);
+        let mut mem = memory(a, -8, 0);
+        mem.insert(a, b);
+        mem.insert(b, c);
+        mem.insert(c, HEAD);
+        let held = walk(&mem);
+        assert_eq!(
+            held.iter().map(|f| f.addr).collect::<Vec<_>>(),
+            vec![a - 8, b - 8, c - 8]
+        );
+    }
+
+    #[test]
+    fn the_low_bit_of_a_pointer_is_the_pi_flag_and_not_an_address() {
+        // Each list pointer carries the PI flag in bit 0. Leaving it in the
+        // address would misalign every entry by one byte -- and `get_futex`
+        // refuses an unaligned word, so every robust lock would be skipped
+        // in silence.
+        let node = HEAD + 0x1000;
+        let mut mem = memory(node | 1, -8, 0);
+        mem.insert(node, HEAD);
+        let held = walk(&mem);
+        assert_eq!(held.len(), 1);
+        assert_eq!(
+            held[0].addr,
+            node - 8,
+            "the flag is not part of the address"
+        );
+        assert!(held[0].pi, "and it is not lost either");
+    }
+
+    #[test]
+    fn each_entry_keeps_its_own_pi_flag() {
+        let (a, b) = (HEAD + 0x1000, HEAD + 0x2000);
+        let mut mem = memory(a, 0, 0);
+        mem.insert(a, b | 1);
+        mem.insert(b, HEAD);
+        let held = walk(&mem);
+        assert!(!held[0].pi, "the first entry was named by the head");
+        assert!(held[1].pi, "the second by the first entry's own pointer");
+    }
+
+    #[test]
+    fn the_pending_entry_is_handled_last_and_only_once() {
+        // `list_op_pending` is the lock a thread was part-way through adding
+        // or removing when it died, so it may or may not be on the list.
+        // Releasing it twice would mark a word the thread no longer owns.
+        let (a, b) = (HEAD + 0x1000, HEAD + 0x2000);
+        let mut mem = memory(a, 0, b);
+        mem.insert(a, b);
+        mem.insert(b, HEAD);
+        let held = walk(&mem);
+        assert_eq!(
+            held.iter().map(|f| f.addr).collect::<Vec<_>>(),
+            vec![a, b],
+            "b appears once, at the end"
+        );
+    }
+
+    #[test]
+    fn a_pending_entry_that_never_made_it_onto_the_list_is_still_released() {
+        // The other half of the same race: the thread died before linking it.
+        // This is the entry the mechanism exists for -- a lock taken and not
+        // yet recorded is exactly what no one else can clean up.
+        let pending = HEAD + 0x5000;
+        let held = walk(&memory(HEAD, -8, pending));
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].addr, pending - 8);
+    }
+
+    #[test]
+    fn a_pending_entry_carries_its_own_pi_flag() {
+        let pending = HEAD + 0x5000;
+        let held = walk(&memory(HEAD, 0, pending | 1));
+        assert_eq!(held[0].addr, pending);
+        assert!(held[0].pi);
+    }
+
+    #[test]
+    fn a_circular_list_does_not_keep_the_cpu_forever() {
+        // The list is user memory and the kernel walks it at every thread
+        // exit. Two entries pointing at each other is all it takes, and a
+        // process can build one deliberately. Linux caps the walk at
+        // ROBUST_LIST_LIMIT for this reason and so do we.
+        let (a, b) = (HEAD + 0x1000, HEAD + 0x2000);
+        let mut mem = memory(a, 0, 0);
+        mem.insert(a, b);
+        mem.insert(b, a);
+        assert_eq!(walk(&mem).len(), ROBUST_LIST_LIMIT);
+    }
+
+    #[test]
+    fn the_limit_is_the_one_linux_uses() {
+        // A number, not a constant compared to itself: userspace can rely on
+        // a list of this length being walked completely.
+        assert_eq!(ROBUST_LIST_LIMIT, 2048);
+    }
+
+    #[test]
+    fn a_self_referential_entry_stops_at_the_limit_too() {
+        let a = HEAD + 0x1000;
+        let mut mem = memory(a, 0, 0);
+        mem.insert(a, a);
+        assert_eq!(walk(&mem).len(), ROBUST_LIST_LIMIT);
+    }
+
+    #[test]
+    fn an_unreadable_word_ends_the_walk_where_it_is() {
+        // Every read is a `get_user` on a dying thread's address space, and
+        // the page may already be gone. Linux stops; it does not guess, and
+        // it does not give up on the entries it already has.
+        let (a, b) = (HEAD + 0x1000, HEAD + 0x2000);
+        let mut mem = memory(a, 0, 0);
+        mem.insert(a, b);
+        // `b` is deliberately absent: reading its `next` fails.
+        let held = walk(&mem);
+        assert_eq!(
+            held.iter().map(|f| f.addr).collect::<Vec<_>>(),
+            vec![a, b],
+            "both known entries are released before the walk stops"
+        );
+    }
+
+    #[test]
+    fn a_broken_list_does_not_cost_the_pending_entry_its_release() {
+        // Linux returns outright when a `next` read fails, pending entry and
+        // all (`if (rc) return;` in `exit_robust_list`). We go on to the
+        // pending one instead, on purpose: its address came from a read of
+        // the head that *did* succeed, a failed read somewhere down the list
+        // says nothing about it, and it is the entry most likely to be held
+        // and unrecorded -- which is the whole case this mechanism exists
+        // for. Marking a word this thread owns costs nothing if it is wrong.
+        let (a, b, pending) = (HEAD + 0x1000, HEAD + 0x2000, HEAD + 0x5000);
+        let mut mem = memory(a, 0, pending);
+        mem.insert(a, b);
+        // `b`'s own `next` is unreadable, so the walk stops there.
+        let held = walk(&mem);
+        assert_eq!(
+            held.iter().map(|f| f.addr).collect::<Vec<_>>(),
+            vec![a, b, pending]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_head_releases_nothing() {
+        // Each of the head's three words is a separate read, and any of them
+        // can fail. None of them may be guessed: an offset read as zero would
+        // mark the list node instead of the lock.
+        for missing in [HEAD, HEAD + W, HEAD + 2 * W] {
+            let mut mem = memory(HEAD + 0x1000, -8, 0);
+            mem.insert(HEAD + 0x1000, HEAD);
+            mem.remove(&missing);
+            assert!(
+                walk(&mem).is_empty(),
+                "a head with {:#x} unreadable must release nothing",
+                missing
+            );
+        }
+    }
+
+    // ---- what to write into each word -----------------------------------
+
+    const WAITERS: i32 = 0x8000_0000_u32 as i32;
+    const OWNER_DIED: i32 = 0x4000_0000;
+
+    #[test]
+    fn a_lock_owned_by_someone_else_is_left_alone() {
+        // A stale list entry, or a lock this thread released without
+        // unlinking. Marking it would tell its real owner's waiters that the
+        // owner is dead while it is still running.
+        assert_eq!(robust_death_action(99, 7, false), RobustDeath::NotOurs);
+        assert_eq!(robust_death_action(0, 7, false), RobustDeath::NotOurs);
+    }
+
+    #[test]
+    fn a_lock_we_hold_is_marked_dead_and_keeps_its_waiters_bit() {
+        // The waiters bit has to survive: it is what tells the next unlock
+        // that it must come into the kernel at all.
+        assert_eq!(
+            robust_death_action(7 | WAITERS, 7, false),
+            RobustDeath::Died {
+                new_value: WAITERS | OWNER_DIED,
+                wake: true
+            }
+        );
+        // Uncontended: marked, but there is nobody to wake.
+        assert_eq!(
+            robust_death_action(7, 7, false),
+            RobustDeath::Died {
+                new_value: OWNER_DIED,
+                wake: false
+            }
+        );
+    }
+
+    #[test]
+    fn the_owner_is_read_out_of_the_low_thirty_bits_only() {
+        // The top two bits of the word are flags, not part of the tid.
+        // Comparing the whole word would leave a contended lock -- the only
+        // kind anyone is waiting on -- looking like someone else's.
+        assert_eq!(
+            robust_death_action(7 | WAITERS | OWNER_DIED, 7, false),
+            RobustDeath::Died {
+                new_value: WAITERS | OWNER_DIED,
+                wake: true
+            },
+            "a lock already marked dead is marked again, waiters woken again"
+        );
+    }
+
+    #[test]
+    fn the_highest_possible_tid_is_still_recognised() {
+        // The tid mask is 30 bits. A thread whose id has bit 30 or 31 set
+        // would otherwise never match its own locks.
+        let tid = 0x3fff_ffff;
+        assert!(matches!(
+            robust_death_action(tid, tid, false),
+            RobustDeath::Died { .. }
+        ));
+    }
+
+    #[test]
+    fn a_priority_inheriting_lock_is_marked_but_not_woken_here() {
+        // The PI unlock path hands the lock to a chosen waiter rather than
+        // letting them race. A wake from here would put a second thread into
+        // a queue that has already picked its winner.
+        assert_eq!(
+            robust_death_action(7 | WAITERS, 7, true),
+            RobustDeath::Died {
+                new_value: WAITERS | OWNER_DIED,
+                wake: false
+            }
+        );
+    }
+
+    #[test]
+    fn the_three_lock_word_bits_are_the_ones_the_libcs_use() {
+        // These are the uAPI: glibc and musl write and read the same word.
+        assert_eq!(OWNER_DIED, 1 << 30);
+        assert_eq!(WAITERS, 1i32 << 31);
+        // And the mask is everything below them.
+        assert_eq!(
+            robust_death_action(0x3fff_ffff, 0x3fff_ffff, false),
+            RobustDeath::Died {
+                new_value: OWNER_DIED,
+                wake: false
+            }
+        );
+    }
+
+    #[test]
+    fn the_head_is_the_three_words_userspace_writes() {
+        // `struct robust_list_head` is filled in by the libc and read back by
+        // offset: a field out of place reads the offset as the head pointer.
+        assert_eq!(core::mem::size_of::<RobustList>(), 3 * W);
+        let head = RobustList {
+            head: 0x1111_1111_1111_1111,
+            off: -16,
+            pending: 0x3333_3333_3333_3333,
+        };
+        let bytes: [u8; 24] = unsafe { core::mem::transmute(head) };
+        let word = |at: usize| {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(&bytes[at..at + 8]);
+            usize::from_ne_bytes(w)
+        };
+        assert_eq!(word(0), 0x1111_1111_1111_1111);
+        assert_eq!(word(8) as isize, -16);
+        assert_eq!(word(16), 0x3333_3333_3333_3333);
     }
 }
