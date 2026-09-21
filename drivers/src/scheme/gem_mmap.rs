@@ -346,3 +346,160 @@ mod handle_slice_tests {
         assert_eq!(last_end, (u32::MAX as u64) + 1);
     }
 }
+
+/// The buffer-sharing chain an X11 GL client actually walks, which is one hop
+/// longer than a Wayland one and is the reason it breaks on its own.
+///
+/// A native Wayland client hands its buffer to the compositor: two processes,
+/// one export and one import. An X11 client under Xwayland hands it to
+/// Xwayland, which hands it on to the compositor: **three** processes, and the
+/// middle one both imports and re-exports a buffer it did not allocate. Every
+/// ownership rule at the uAPI edge has to let that middle hop through, and a
+/// rule that is correct for two processes can be wrong for three — which is
+/// invisible in QEMU, where there is no nouveau GEM object in the first place
+/// and the whole path is never walked.
+///
+/// These drive the pid-parameterised layer directly (`lookup_for`, `add_ref`,
+/// `dec_ref`, `release_pid`) because the uAPI entry points above read the
+/// caller from the current thread, which a host test does not have.
+#[cfg(test)]
+mod xwayland_chain_tests {
+    use super::*;
+
+    /// Handles must be in the driver-private range: [`holds`] is deliberately
+    /// strict there and permissive below it, so a low id would pass every
+    /// assertion here for the wrong reason.
+    const CLIENT: u64 = 88_001;
+    const XWAYLAND: u64 = 88_002;
+    const COMPOSITOR: u64 = 88_003;
+    const STRANGER: u64 = 88_004;
+
+    fn drop_handle(handle: u32) {
+        while !matches!(dec_ref(handle, 0), DecRef::NotTracked | DecRef::Freed) {}
+    }
+
+    /// Client allocates and exports, Xwayland imports and re-exports, the
+    /// compositor imports. Every hop must resolve the buffer for the process
+    /// making it.
+    #[test]
+    fn a_buffer_survives_the_client_xwayland_compositor_chain() {
+        let handle = DRIVER_HANDLE_BASE + 0x10_0001;
+        let phys = 0x4_0000_0000;
+        register(handle, phys, 0x10_0000, CLIENT);
+
+        // 1. The client exports it (PRIME_HANDLE_TO_FD).
+        assert!(
+            lookup_for(handle, CLIENT).is_some(),
+            "the allocator can export its own buffer"
+        );
+
+        // 2. Xwayland imports it. A self-import resolves back to the original
+        //    nouveau handle — only that handle works with GEM_INFO/VM_BIND —
+        //    and takes a reference for the importer.
+        let (resolved, _) = lookup_by_phys(phys).expect("self-import finds the original handle");
+        assert_eq!(resolved, handle);
+        assert_eq!(add_ref(resolved, XWAYLAND), Some(2));
+
+        // 3. Xwayland re-exports it to the compositor. THIS is the hop a
+        //    Wayland client never makes, and the one an ownership rule
+        //    written for "the allocator" alone refuses.
+        assert!(
+            lookup_for(handle, XWAYLAND).is_some(),
+            "Xwayland can re-export a buffer it imported but did not allocate"
+        );
+
+        // 4. The compositor imports it and can reach it too.
+        assert_eq!(add_ref(handle, COMPOSITOR), Some(3));
+        assert!(
+            lookup_for(handle, COMPOSITOR).is_some(),
+            "the compositor can scan out what reached it through Xwayland"
+        );
+
+        drop_handle(handle);
+    }
+
+    /// An X11 client exiting is routine — the window closes — and must not
+    /// pull the buffer out from under Xwayland or the compositor, which are
+    /// still holding references to it.
+    #[test]
+    fn the_client_exiting_does_not_pull_the_buffer_from_xwayland() {
+        let handle = DRIVER_HANDLE_BASE + 0x10_0002;
+        let phys = 0x4_0010_0000;
+        register(handle, phys, 0x10_0000, CLIENT);
+        add_ref(handle, XWAYLAND);
+        add_ref(handle, COMPOSITOR);
+
+        let freed = release_pid(CLIENT);
+        assert!(
+            !freed
+                .iter()
+                .any(|(h, was_freed)| *h == handle && *was_freed),
+            "the client's exit drops its own reference only"
+        );
+        assert!(
+            lookup_for(handle, XWAYLAND).is_some(),
+            "Xwayland still holds the buffer after the client is gone"
+        );
+        assert!(
+            lookup_for(handle, COMPOSITOR).is_some(),
+            "so does the compositor"
+        );
+        assert!(
+            lookup_for(handle, CLIENT).is_none(),
+            "the process that left no longer holds it"
+        );
+
+        drop_handle(handle);
+    }
+
+    /// The other half of the same rule: passing through Xwayland must not turn
+    /// the buffer into something any process can name. A process that never
+    /// imported it gets nothing, even while three others hold it.
+    #[test]
+    fn a_process_that_never_imported_cannot_reach_the_buffer() {
+        let handle = DRIVER_HANDLE_BASE + 0x10_0003;
+        register(handle, 0x4_0020_0000, 0x10_0000, CLIENT);
+        add_ref(handle, XWAYLAND);
+        add_ref(handle, COMPOSITOR);
+
+        assert!(
+            lookup_for(handle, STRANGER).is_none(),
+            "an unrelated process cannot resolve the handle"
+        );
+        assert!(
+            matches!(dec_ref(handle, STRANGER), DecRef::NotHolder),
+            "nor close it out from under the three that hold it"
+        );
+        assert!(
+            lookup_for(handle, XWAYLAND).is_some(),
+            "and the refused close changed nothing"
+        );
+
+        drop_handle(handle);
+    }
+
+    /// Each hop's `GEM_CLOSE` drops exactly one reference; the backing memory
+    /// is freed only when the last one goes. A chain one process longer than
+    /// the Wayland case is one more chance to free it too early.
+    #[test]
+    fn the_buffer_is_freed_only_after_the_last_hop_closes_it() {
+        let handle = DRIVER_HANDLE_BASE + 0x10_0004;
+        register(handle, 0x4_0030_0000, 0x10_0000, CLIENT);
+        add_ref(handle, XWAYLAND);
+        add_ref(handle, COMPOSITOR);
+
+        assert!(matches!(
+            dec_ref(handle, CLIENT),
+            DecRef::StillReferenced(2)
+        ));
+        assert!(matches!(
+            dec_ref(handle, XWAYLAND),
+            DecRef::StillReferenced(1)
+        ));
+        assert!(matches!(dec_ref(handle, COMPOSITOR), DecRef::Freed));
+        assert!(
+            lookup(handle).is_none(),
+            "the entry goes before the VRAM behind it is released"
+        );
+    }
+}
