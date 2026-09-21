@@ -76,6 +76,21 @@ impl LinuxRootfs {
             if gfx_probe.is_file() {
                 let _ = fs::copy(&gfx_probe, bin.join("gfx-probe"));
             }
+            // These two were refreshed only on a from-scratch build, so an
+            // ordinary `make image` shipped whatever binary the rootfs already
+            // had. A diagnostic that is a build behind is worse than none: it
+            // answers questions about a system that no longer exists. Both are
+            // cheap to copy and the from-scratch path does the same.
+            let sdl_probe = self.eclipse_sdl_probe(&musl);
+            if sdl_probe.is_file() {
+                let _ = dir::rm(bin.join("eclipse-sdl-probe"));
+                let _ = fs::copy(&sdl_probe, bin.join("eclipse-sdl-probe"));
+            }
+            let dbusd = self.eclipse_dbusd();
+            if dbusd.is_file() {
+                let _ = dir::rm(bin.join("eclipse-dbusd"));
+                let _ = fs::copy(&dbusd, bin.join("eclipse-dbusd"));
+            }
             self.install_thread_tests(&dir);
             // INIT (PID 1): the Eclipse-native Rust init by default, with busybox
             // init as a resilient fallback. `install_busybox_init` runs first so

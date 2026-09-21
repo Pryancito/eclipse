@@ -2308,6 +2308,7 @@ const MENU_ES: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
     <separator/>
     <item label="Prueba SDL2 (renderer)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-sdl-probe --hold</command></action></item>
     <item label="Prueba SDL3 (wl_shm)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-sdl-probe --sdl3 --surface --hold</command></action></item>
+    <item label="Prueba SDL2 (por subsistema)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-sdl-probe --steps</command></action></item>
     <item label="Prueba D-Bus (bus de sesion)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-dbusd --selftest --hold</command></action></item>
     <separator/>
     <item label="Freedoom (Fase 1)"><action name="Execute"><command>/usr/local/bin/eclipse-freedoom 1</command></action></item>
@@ -2331,6 +2332,7 @@ const MENU_EN: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
     <separator/>
     <item label="SDL2 test (renderer)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-sdl-probe --hold</command></action></item>
     <item label="SDL3 test (wl_shm)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-sdl-probe --sdl3 --surface --hold</command></action></item>
+    <item label="SDL2 test (per subsystem)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-sdl-probe --steps</command></action></item>
     <item label="D-Bus test (session bus)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-dbusd --selftest --hold</command></action></item>
     <separator/>
     <item label="Freedoom (Phase 1)"><action name="Execute"><command>/usr/local/bin/eclipse-freedoom 1</command></action></item>
@@ -3302,6 +3304,9 @@ mod tests {
         let menu = fs::read_to_string(dir.join("root/.config/labwc/menu.xml")).unwrap();
         assert!(menu.contains("/bin/eclipse-sdl-probe --hold"));
         assert!(menu.contains("/bin/eclipse-sdl-probe --sdl3 --surface --hold"));
+        // And on the stepwise path: the one that says WHICH subsystem of
+        // SDL_Init hangs, which is what GZDoom needed and no other entry gives.
+        assert!(menu.contains("/bin/eclipse-sdl-probe --steps"));
         let _ = fs::remove_dir_all(&dir);
     }
 }
