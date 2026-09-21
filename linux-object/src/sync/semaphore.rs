@@ -165,6 +165,23 @@ impl Semaphore {
         self.lock.lock().pid = pid;
     }
 
+    /// Add `delta` to the count, in one step, and leave the "can acquire"
+    /// signal telling the truth afterwards.
+    ///
+    /// This is what a `SEM_UNDO` record needs at process exit: the adjustment
+    /// it has accumulated is any integer, not a count of `release()` calls, and
+    /// it may well be negative. Doing it as `set(get() + delta)` would be two
+    /// separate lock acquisitions with a window in between.
+    pub fn adjust(&self, delta: isize) {
+        let mut inner = self.lock.lock();
+        inner.count = inner.count.saturating_add(delta);
+        if inner.count >= 1 {
+            inner.eventbus.set(Event::SEMAPHORE_CAN_ACQUIRE);
+        } else {
+            inner.eventbus.clear(Event::SEMAPHORE_CAN_ACQUIRE);
+        }
+    }
+
     /// Set the current count
     pub fn set(&self, value: isize) {
         let mut inner = self.lock.lock();
@@ -193,6 +210,67 @@ impl Deref for SemaphoreGuard<'_> {
 mod tests {
     use super::*;
     use crate::error::LxError;
+
+    #[test]
+    fn adjust_moves_the_count_either_way_in_one_step() {
+        // What a `SEM_UNDO` record needs at process exit: an adjustment of any
+        // sign, applied under a single lock.
+        let sem = Semaphore::new(5);
+        sem.adjust(3);
+        assert_eq!(sem.get(), 8);
+        sem.adjust(-6);
+        assert_eq!(sem.get(), 2);
+        sem.adjust(0);
+        assert_eq!(sem.get(), 2);
+    }
+
+    #[test]
+    fn adjust_saturates_instead_of_overflowing() {
+        let sem = Semaphore::new(isize::MAX);
+        sem.adjust(10);
+        assert_eq!(sem.get(), isize::MAX);
+        let sem = Semaphore::new(isize::MIN);
+        sem.adjust(-10);
+        assert_eq!(sem.get(), isize::MIN);
+    }
+
+    #[test]
+    fn adjust_down_past_zero_clears_the_can_acquire_signal() {
+        // The count is allowed to go negative, and while it is there nobody
+        // can acquire. A signal left set from an earlier release wakes every
+        // waiter on the bus for a resource that is not there.
+        let sem = Semaphore::new(0);
+        sem.adjust(2);
+        assert!(sem
+            .lock
+            .lock()
+            .eventbus
+            .events()
+            .contains(Event::SEMAPHORE_CAN_ACQUIRE));
+        sem.adjust(-5);
+        assert_eq!(sem.get(), -3);
+        assert!(!sem
+            .lock
+            .lock()
+            .eventbus
+            .events()
+            .contains(Event::SEMAPHORE_CAN_ACQUIRE));
+    }
+
+    #[async_std::test]
+    async fn adjust_wakes_a_waiter_once_the_count_is_positive_again() {
+        let sem = Arc::new(Semaphore::new(1));
+        sem.adjust(-3);
+        assert_eq!(sem.get(), -2);
+        let waiter = {
+            let sem = Arc::clone(&sem);
+            async_std::task::spawn(async move { sem.acquire().await })
+        };
+        async_std::task::yield_now().await;
+        sem.adjust(3);
+        waiter.await.unwrap();
+        assert_eq!(sem.get(), 0);
+    }
 
     #[async_std::test]
     async fn acquire_decrements_count() {

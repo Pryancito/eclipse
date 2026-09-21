@@ -176,14 +176,18 @@ impl Syscall<'_> {
                 Ok(0)
             }
             _ => {
-                let sem = &sem_array[num];
+                // `num` comes from userspace. This used to index the set
+                // directly, so `semctl(id, 9999, GETVAL)` from any process was
+                // a kernel panic; semctl(2) says EINVAL. Its sibling `semop`
+                // had the check all along — see `SemArray::get_sem`.
+                let sem = sem_array.get_sem(num).ok_or(LxError::EINVAL)?;
                 match cmd {
                     SemctlCmds::GETPID => Ok(sem.get_pid()),
                     SemctlCmds::GETVAL => Ok(sem.get() as usize),
                     SemctlCmds::GETNCNT => Ok(sem.get_ncnt()),
                     SemctlCmds::GETZCNT => Ok(0),
                     SemctlCmds::SETVAL => {
-                        sem.set(arg as isize);
+                        sem.set(setval_from_arg(arg)?);
                         sem.set_pid(self.zircon_process().id() as usize);
                         sem_array.ctime();
                         Ok(0)
@@ -481,6 +485,25 @@ impl Syscall<'_> {
     }
 }
 
+/// Largest value a semaphore may be set to (`SEMVMX`, include/uapi/linux/sem.h).
+const SEMVMX: i32 = 32767;
+
+/// What `semctl(.., SETVAL, arg)` makes of its `arg`.
+///
+/// `arg` is the `int val` member of `union semun`, and a variadic argument
+/// arrives in a whole register: reading all 64 bits of it turns the `-1` a
+/// program passes by mistake into 4294967295 and sets the semaphore to it,
+/// rather than answering. Linux reads the `int`, and `semctl(2)` says ERANGE
+/// for anything outside `[0, SEMVMX]`.
+fn setval_from_arg(arg: usize) -> Result<isize, LxError> {
+    let val = arg as u32 as i32;
+    if (0..=SEMVMX).contains(&val) {
+        Ok(val as isize)
+    } else {
+        Err(LxError::ERANGE)
+    }
+}
+
 numeric_enum! {
     #[repr(usize)]
     #[derive(Debug, Eq, PartialEq)]
@@ -577,3 +600,45 @@ const MSG_NOERROR: usize = 0o10000;
 /// msgrcv(2) `MSG_EXCEPT`: with msgtyp > 0, take the first message of a
 /// *different* type.
 const MSG_EXCEPT: usize = 0o20000;
+
+/// The System V IPC syscalls, tested where they can be: the parts that are a
+/// decision about a userspace value rather than a walk through process state.
+///
+/// The bounds check `sys_semctl` was missing lives in
+/// `linux_object::ipc::SemArray::get_sem` and is tested there; the `Index`
+/// impl it used to go through is gone, so the line cannot be written again.
+#[cfg(test)]
+mod ipc_tests {
+    use super::*;
+
+    #[test]
+    fn setval_takes_the_int_and_not_the_register() {
+        assert_eq!(setval_from_arg(0), Ok(0));
+        assert_eq!(setval_from_arg(1), Ok(1));
+        assert_eq!(setval_from_arg(SEMVMX as usize), Ok(SEMVMX as isize));
+    }
+
+    #[test]
+    fn setval_refuses_a_negative_value() {
+        // `semctl(id, 0, SETVAL, -1)`: the register holds 0xffff_ffff_ffff_ffff
+        // on a 64-bit caller and 0xffff_ffff sign-extended from the `int` on
+        // the wire either way. Both are -1, and neither may become 4294967295.
+        assert_eq!(setval_from_arg(usize::MAX), Err(LxError::ERANGE));
+        assert_eq!(setval_from_arg(0xffff_ffff), Err(LxError::ERANGE));
+        assert_eq!(setval_from_arg(-1i64 as usize), Err(LxError::ERANGE));
+        assert_eq!(setval_from_arg(0x8000_0000), Err(LxError::ERANGE));
+    }
+
+    #[test]
+    fn setval_refuses_a_value_above_semvmx() {
+        assert_eq!(setval_from_arg(SEMVMX as usize + 1), Err(LxError::ERANGE));
+        assert_eq!(setval_from_arg(70000), Err(LxError::ERANGE));
+    }
+
+    #[test]
+    fn setval_ignores_the_high_half_of_the_register() {
+        // Whatever a variadic caller left in the top 32 bits is not part of
+        // the `int`, so it must neither reach the semaphore nor cause ERANGE.
+        assert_eq!(setval_from_arg(0xdead_beef_0000_0005), Ok(5));
+    }
+}
