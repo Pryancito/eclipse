@@ -1012,7 +1012,25 @@ mod itimer_tests {
 
 #[cfg(test)]
 mod adjtimex_tests {
+    extern crate std;
     use super::*;
+
+    /// `NTP_STATE` is one global kernel state and cargo runs a crate's tests in
+    /// threads, so every test that resets it takes this first.
+    ///
+    /// Without it `frequency_roundtrips` failed about 4% of runs on its own and
+    /// once in a hundred full-suite runs: it writes a frequency and reads it
+    /// back, and a neighbour's `*NTP_STATE.lock() = NtpState::default()` landing
+    /// in between makes the readback 0. That reads as a real regression in
+    /// `adjtimex` and is not one. CI runs with `--test-threads=1`, so it never
+    /// sees any of this.
+    static LOCK: self::std::sync::Mutex<()> = self::std::sync::Mutex::new(());
+
+    fn serialised() -> self::std::sync::MutexGuard<'static, ()> {
+        // A test that panics while holding this poisons it; the tests that
+        // follow are not at fault, so step over the poison.
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn timex_matches_linux_x86_64_layout() {
@@ -1025,6 +1043,7 @@ mod adjtimex_tests {
 
     #[test]
     fn read_reports_unsync_and_fills_tick() {
+        let _serialised = serialised();
         *NTP_STATE.lock() = NtpState::default();
         let mut tx = Timex::default();
         let r = adjtimex_apply(&mut tx).unwrap();
@@ -1036,6 +1055,7 @@ mod adjtimex_tests {
 
     #[test]
     fn clearing_unsync_returns_time_ok() {
+        let _serialised = serialised();
         *NTP_STATE.lock() = NtpState::default();
         let mut tx = Timex {
             modes: ADJ_STATUS,
@@ -1049,6 +1069,7 @@ mod adjtimex_tests {
 
     #[test]
     fn setoffset_rejects_out_of_range_usec() {
+        let _serialised = serialised();
         *NTP_STATE.lock() = NtpState::default();
         let mut tx = Timex {
             modes: ADJ_SETOFFSET,
@@ -1063,6 +1084,7 @@ mod adjtimex_tests {
 
     #[test]
     fn frequency_roundtrips() {
+        let _serialised = serialised();
         *NTP_STATE.lock() = NtpState::default();
         let mut tx = Timex {
             modes: ADJ_FREQUENCY,
@@ -1077,6 +1099,7 @@ mod adjtimex_tests {
 
     #[test]
     fn bad_tick_is_einval() {
+        let _serialised = serialised();
         *NTP_STATE.lock() = NtpState::default();
         let mut tx = Timex {
             modes: ADJ_TICK,

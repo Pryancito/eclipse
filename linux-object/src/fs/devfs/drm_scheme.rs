@@ -4808,6 +4808,11 @@ mod gl_client_sequence_tests {
             self.dev.read_at(0, buf)
         }
 
+        /// `poll(fd, POLLIN)` --- the other half of how a compositor waits.
+        pub(super) fn poll(&self) -> Result<PollStatus> {
+            self.dev.poll()
+        }
+
         /// `drmModeCreateDumbBuffer`: one scanout buffer.
         pub(super) fn create_dumb(&self, width: u32, height: u32) -> DrmModeCreateDumb {
             let mut req = DrmModeCreateDumb {
@@ -7810,5 +7815,702 @@ mod blob_id_space_tests {
             drm::destroy_blob(edid_blob_id(2)),
             drm::BlobDestroy::NotFound
         ));
+    }
+}
+
+/// The compute node's own ioctl (`DRM_ECLIPSE_COMPUTE_NR`), which has no tests
+/// at all and is the one place in this file where a client's own size encoding
+/// decides how much memory the kernel writes.
+///
+/// Every other DRM ioctl is reconciled against the kernel's struct before it
+/// reaches a handler: `drm_ioctl_reconciled` looks the command up in
+/// `canonical_drm_ioctl`, allocates a kernel buffer of the KERNEL's size, and
+/// copies in and out of that. A driver-private command has no canonical entry,
+/// so it takes the other branch -- `ucheck` against the size the CLIENT
+/// encoded, then straight to the handler with the user address. And this
+/// handler writes all 536 bytes of `struct drm_eclipse_compute`. The floor that
+/// refuses a short encoding is therefore the whole defence, it is an open-coded
+/// copy of `ioc_size()`, and nothing exercised either side of it.
+#[cfg(test)]
+mod compute_node_tests {
+    use super::gl_client_sequence_tests::Client;
+    use super::*;
+    use crate::fs::devfs::kms_emu::{self, EmuGpu};
+
+    /// `_IOWR('d', DRM_ECLIPSE_COMPUTE_NR, size)` -- the command word a client
+    /// builds, with the encoded size under the test's control.
+    fn compute_cmd(size: u32) -> u32 {
+        IOC_WRITE_DIR | IOC_READ_DIR | (size << 16) | (b'd' as u32) << 8 | DRM_ECLIPSE_COMPUTE_NR
+    }
+
+    /// A request with recognisable contents, so "was not written" is a real
+    /// assertion rather than "happens to be zero".
+    fn blank_request() -> DrmEclipseCompute {
+        DrmEclipseCompute {
+            op: 0,
+            status: 0x5A5A_5A5A,
+            elapsed_ns: 0x5A5A_5A5A_5A5A_5A5A,
+            grid_threads: 0x5A5A_5A5A,
+            reserved: 0,
+            summary: [0x5A; 512],
+        }
+    }
+
+    fn summary_str(req: &DrmEclipseCompute) -> alloc::string::String {
+        let end = req.summary.iter().position(|&b| b == 0).unwrap_or(0);
+        alloc::string::String::from_utf8_lossy(&req.summary[..end]).into_owned()
+    }
+
+    /// A client that encodes a struct smaller than the kernel's is refused
+    /// outright. The handler writes 536 bytes at the address it is given, and
+    /// the only bound anything checked was the size in the client's own command
+    /// word, so accepting a short encoding is half a kilobyte written past the
+    /// end of the caller's buffer -- from an unprivileged ioctl.
+    #[test]
+    fn a_short_size_encoding_is_refused_instead_of_writing_past_the_caller() {
+        let _screen = kms_emu::headless();
+        let c = Client::open(0);
+        let mut req = blank_request();
+
+        let err = c
+            .ioctl(compute_cmd(8), &mut req)
+            .expect_err("a short encoding must not reach the handler");
+        assert_eq!(err, FsError::InvalidParam);
+        // And it was refused BEFORE anything was written.
+        assert_eq!(req.status, 0x5A5A_5A5A, "the handler ran anyway");
+        assert!(
+            req.summary.iter().all(|&b| b == 0x5A),
+            "the summary was written"
+        );
+    }
+
+    /// One byte short is still short. The floor is `<`, and an off-by-one here
+    /// is the whole bug it exists to prevent.
+    #[test]
+    fn an_encoding_one_byte_short_is_still_refused() {
+        let _screen = kms_emu::headless();
+        let c = Client::open(0);
+        let mut req = blank_request();
+        let exact = core::mem::size_of::<DrmEclipseCompute>() as u32;
+
+        assert_eq!(
+            c.ioctl(compute_cmd(exact - 1), &mut req),
+            Err(FsError::InvalidParam)
+        );
+        // The exact size is accepted, so the refusal above is the size check
+        // and not the command being unknown.
+        assert_eq!(c.ioctl(compute_cmd(exact), &mut req), Ok(0));
+    }
+
+    /// With no GPU at all the answer is in-band: the ioctl SUCCEEDS and the
+    /// status field carries `-ENODEV`. Returning an ioctl error instead would
+    /// be indistinguishable from "this kernel has no compute ioctl", which is
+    /// what a probing client falls back on.
+    #[test]
+    fn a_node_with_no_gpu_answers_enodev_in_band_not_with_an_ioctl_error() {
+        let _screen = kms_emu::headless();
+        let c = Client::open(0);
+        let mut req = blank_request();
+
+        assert_eq!(
+            c.ioctl(
+                compute_cmd(core::mem::size_of::<DrmEclipseCompute>() as u32),
+                &mut req
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            req.status, -19,
+            "-ENODEV belongs in the reply, not in errno"
+        );
+        assert_eq!(summary_str(&req), "no compute GPU");
+    }
+
+    /// With a driver present the driver's own answer is passed through --
+    /// including its refusal. `EmuGpu` does not implement `compute_launch`, so
+    /// it gives the trait default, which is exactly what a driver that has not
+    /// wired compute up returns on real hardware.
+    #[test]
+    fn a_driver_without_compute_support_answers_with_its_own_status() {
+        let screen = kms_emu::headless();
+        let _gpu = screen.attach_gpu(EmuGpu::new("emu-gpu"));
+        let c = Client::open(0);
+        let mut req = blank_request();
+
+        assert_eq!(
+            c.ioctl(
+                compute_cmd(core::mem::size_of::<DrmEclipseCompute>() as u32),
+                &mut req
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            req.status, -38,
+            "-ENOSYS from the driver, not the core's -ENODEV"
+        );
+        assert_ne!(summary_str(&req), "no compute GPU");
+        assert!(
+            !summary_str(&req).is_empty(),
+            "the driver's report was dropped"
+        );
+        // The reply's other fields are always written, so a client cannot read
+        // a previous launch's numbers.
+        assert_eq!(req.elapsed_ns, 0);
+        assert_eq!(req.grid_threads, 0);
+    }
+
+    /// The summary is always NUL-terminated, even when the driver's report is
+    /// longer than the field. It is read by C as a string, so a report that
+    /// filled all 512 bytes would run off the end of the struct.
+    #[test]
+    fn the_summary_is_nul_terminated_even_when_the_report_overflows_it() {
+        let mut dst = [0xFFu8; 512];
+        let long = alloc::string::String::from_utf8(alloc::vec![b'x'; 600]).unwrap();
+        fill_summary(&mut dst, &long);
+        assert_eq!(dst[511], 0, "no room left for the terminator");
+        assert!(dst[..511].iter().all(|&b| b == b'x'));
+
+        // And a short report clears what a previous, longer one left behind.
+        fill_summary(&mut dst, "ok");
+        assert_eq!(&dst[..3], b"ok\0");
+        assert!(dst[3..].iter().all(|&b| b == 0), "stale bytes survived");
+    }
+}
+
+/// The DRM event queue as a client sees it: one queue per open file, read whole
+/// events at a time, with two different errnos for "nothing yet" and "your
+/// buffer is too small".
+///
+/// A compositor's main loop is `poll` then `read`, and both answers are
+/// load-bearing. `EAGAIN` means "come back"; `EINVAL` means "your buffer is
+/// wrong" -- and this is the one place the tree deliberately diverges from what
+/// looks natural, because returning `EAGAIN` for a short buffer livelocks: the
+/// queue is still non-empty, so the file stays readable and a blocking reader's
+/// wait resolves instantly, forever. The existing tests of this file read events
+/// but accept `Err(_) | Ok(0)` where they do, so none of them can tell those two
+/// errnos apart, and none of them has two clients open at once.
+#[cfg(test)]
+mod event_queue_tests {
+    use super::gl_client_sequence_tests::{parse_events, Client, FLIP_COMPLETE};
+    use super::*;
+    use crate::fs::devfs::kms_emu;
+
+    /// Put one flip completion on `c`'s queue. The caller holds the attached
+    /// [`kms_emu::Screen`] the present needs.
+    fn queue_one_flip(c: &Client, user_data: u64) -> (u32, u32) {
+        let buf = c.create_dumb(32, 8);
+        let fb = c.addfb2(&buf);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, user_data)
+            .expect("flip");
+        drm::flush_pending_flip_completions();
+        (fb, buf.handle)
+    }
+
+    /// An empty queue is `EAGAIN`, not a short read and not `EINVAL`. A
+    /// compositor that gets anything else on the very common "poll woke me for
+    /// something else" path treats the card fd as broken and tears the output
+    /// down.
+    #[test]
+    fn an_empty_queue_reads_eagain_and_not_a_broken_fd() {
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+        let mut buf = [0u8; 32];
+
+        assert_eq!(c.read_events(&mut buf), Err(FsError::Again));
+        // And nothing was written into the buffer.
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+
+    /// A buffer too small for one event is `EINVAL`, and the event STAYS
+    /// queued. `EAGAIN` here is a livelock (the queue is non-empty, so the file
+    /// is still readable and the wait resolves instantly, over and over), and
+    /// dropping the event instead would lose the flip completion wlroots is
+    /// waiting on -- a desktop frozen on its current frame.
+    #[test]
+    fn a_buffer_too_small_for_one_event_is_einval_and_keeps_the_event() {
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+        let (fb, handle) = queue_one_flip(&c, 0xABCD);
+
+        let mut small = [0u8; 16];
+        assert_eq!(c.read_events(&mut small), Err(FsError::InvalidParam));
+        assert!(
+            small.iter().all(|&b| b == 0),
+            "a partial event was delivered"
+        );
+
+        // Still there, and still whole.
+        let mut full = [0u8; 32];
+        assert_eq!(c.read_events(&mut full).expect("the event survived"), 32);
+        let ev = parse_events(&full);
+        assert_eq!(ev[0].ev_type, FLIP_COMPLETE);
+        assert_eq!(ev[0].user_data, 0xABCD);
+        // Drained now.
+        assert_eq!(c.read_events(&mut full), Err(FsError::Again));
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(handle).expect("DESTROY_DUMB");
+    }
+
+    /// One client's completion is not readable by another. The queue lives on
+    /// the open file, like Linux's `struct drm_file`: with a single device-wide
+    /// stream, a probing client (Xwayland during session bring-up) reads the
+    /// compositor's flip completion out from under it and wlroots then waits on
+    /// an event that has already been consumed.
+    #[test]
+    fn one_clients_flip_completion_is_not_readable_by_another() {
+        let _screen = kms_emu::attach(32, 8);
+        let flipper = Client::open(0);
+        let bystander = Client::open(0);
+        let (fb, handle) = queue_one_flip(&flipper, 0x1234);
+
+        let mut buf = [0u8; 32];
+        assert_eq!(
+            bystander.read_events(&mut buf),
+            Err(FsError::Again),
+            "another open file drained the completion"
+        );
+        assert!(!bystander.poll().expect("poll").read);
+
+        // And the client that asked for it still has it.
+        assert_eq!(flipper.read_events(&mut buf).expect("own completion"), 32);
+        assert_eq!(parse_events(&buf)[0].user_data, 0x1234);
+
+        flipper.rmfb(fb).expect("RMFB");
+        flipper.destroy_dumb(handle).expect("DESTROY_DUMB");
+    }
+
+    /// `poll` says readable exactly while an event is queued. It is what parks
+    /// the compositor's main loop: stuck at readable burns a core in a spin, and
+    /// stuck at not-readable is a desktop that never sees its own flip land.
+    #[test]
+    fn poll_reports_readable_only_while_an_event_is_queued() {
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+        assert!(
+            !c.poll().expect("poll").read,
+            "readable with an empty queue"
+        );
+
+        let (fb, handle) = queue_one_flip(&c, 1);
+        assert!(
+            c.poll().expect("poll").read,
+            "not readable with an event queued"
+        );
+
+        // A refused short read must not clear it either.
+        let mut small = [0u8; 8];
+        assert_eq!(c.read_events(&mut small), Err(FsError::InvalidParam));
+        assert!(
+            c.poll().expect("poll").read,
+            "a short read consumed the event"
+        );
+
+        let mut full = [0u8; 32];
+        assert_eq!(c.read_events(&mut full).expect("drain"), 32);
+        assert!(!c.poll().expect("poll").read, "readable after the drain");
+        // Writable throughout, on purpose: reporting write=false made labwc's
+        // DRM epoll park and exposed a #DF at session start.
+        assert!(c.poll().expect("poll").write);
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(handle).expect("DESTROY_DUMB");
+    }
+
+    /// Several queued events come out one read at a time, in order, and a
+    /// buffer big enough for two takes two. A reader that got them out of order
+    /// would mis-pair completions with the frames that asked for them.
+    #[test]
+    fn queued_events_come_out_in_order_and_a_big_buffer_takes_several() {
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+        let buf = c.create_dumb(32, 8);
+        let fb = c.addfb2(&buf);
+
+        // Two frames, each completion collected... by a reader that waits until
+        // both are in, which is what a compositor doing two outputs looks like.
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0x11).expect("flip 1");
+        drm::flush_pending_flip_completions();
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0x22).expect("flip 2");
+        drm::flush_pending_flip_completions();
+
+        let mut both = [0u8; 64];
+        assert_eq!(c.read_events(&mut both).expect("two events"), 64);
+        let ev = parse_events(&both);
+        assert_eq!(ev.len(), 2);
+        assert_eq!(ev[0].user_data, 0x11, "the events came out reversed");
+        assert_eq!(ev[1].user_data, 0x22);
+        assert_eq!(
+            ev[0].length, 32,
+            "the wire length must match the reader's stride"
+        );
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+}
+
+/// `DRM_IOCTL_MODE_ATOMIC` end to end, and the `OUT_FENCE_PTR` writeback in
+/// particular.
+///
+/// No test in this file issued this ioctl at all: the atomic uAPI is opt-in via
+/// the `drm.atomic` cmdline flag, so `SET_CLIENT_CAP(ATOMIC)` refused every
+/// client and the whole arm was unreachable. `drm::set_atomic_enabled` makes it
+/// reachable, which matters because `OUT_FENCE_PTR` is a pointer the client
+/// hands the kernel to write a file descriptor into, and the decision table
+/// around that write is subtle: Linux writes `-1` on `TEST_ONLY` and on failure,
+/// a real fd on success, and -- the part that is easy to get backwards -- the
+/// write happens BEFORE the commit's own error is returned to the client. A
+/// client that gets an error with its fence slot untouched reads whatever was in
+/// it, which for an uninitialised `int` is a descriptor belonging to something
+/// else.
+#[cfg(test)]
+mod out_fence_tests {
+    use super::gl_client_sequence_tests::Client;
+    use super::*;
+    use crate::fs::devfs::kms_emu;
+    use alloc::vec::Vec;
+
+    /// A value that is neither a valid fd nor `-1`, so "was written" and "was
+    /// left alone" are distinguishable.
+    const UNWRITTEN: i32 = 0x5A5A_5A5A;
+
+    /// The property arrays of one atomic request, kept alive for as long as the
+    /// request points at them.
+    struct Request {
+        objs: Vec<u32>,
+        counts: Vec<u32>,
+        props: Vec<u32>,
+        values: Vec<u64>,
+    }
+
+    impl Request {
+        fn new(objs: &[u32], counts: &[u32], props: &[u32], values: &[u64]) -> Request {
+            Request {
+                objs: objs.to_vec(),
+                counts: counts.to_vec(),
+                props: props.to_vec(),
+                values: values.to_vec(),
+            }
+        }
+
+        fn ioctl(&self, flags: u32) -> DrmModeAtomic {
+            DrmModeAtomic {
+                flags,
+                count_objs: self.objs.len() as u32,
+                objs_ptr: self.objs.as_ptr() as u64,
+                count_props_ptr: self.counts.as_ptr() as u64,
+                props_ptr: self.props.as_ptr() as u64,
+                prop_values_ptr: self.values.as_ptr() as u64,
+                reserved: 0,
+                user_data: 0,
+            }
+        }
+    }
+
+    /// An atomic client on an output, with the cmdline flag on. Returns the
+    /// screen (which holds the test lock and puts the flag back on Drop) and the
+    /// client.
+    fn atomic_client(width: u32, height: u32) -> (kms_emu::Screen, Client) {
+        let screen = kms_emu::attach(width, height);
+        drm::set_atomic_enabled(true);
+        let c = Client::open(0);
+        let mut cap: [u64; 2] = [DRM_CLIENT_CAP_ATOMIC, 1];
+        c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap)
+            .expect("SET_CLIENT_CAP ATOMIC");
+        (screen, c)
+    }
+
+    /// A commit the check phase accepts as is: leaving the CRTC inactive needs
+    /// no mode and no modeset flag. It is the baseline every refusal below is
+    /// measured against, so a refusal cannot be the request's own fault.
+    fn benign_request() -> Request {
+        Request::new(&[drm::SYNTH_CRTC_ID], &[1], &[PROP_ACTIVE], &[0])
+    }
+
+    fn commit(c: &Client, req: &Request, flags: u32) -> Result<usize> {
+        let mut ioctl = req.ioctl(flags);
+        c.ioctl(DRM_IOCTL_MODE_ATOMIC, &mut ioctl)
+    }
+
+    /// Without the cap the ioctl is refused, and the cap itself is refused
+    /// unless the boot asked for it. That is the gate the whole arm sits behind
+    /// -- and with it shut, the rest of this module is unreachable, which is why
+    /// nothing tested it.
+    #[test]
+    fn the_atomic_ioctl_is_refused_until_the_boot_and_the_client_both_opt_in() {
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+        let mut cap: [u64; 2] = [DRM_CLIENT_CAP_ATOMIC, 1];
+
+        // Flag off: the capability is EOPNOTSUPP, like a Linux driver without
+        // DRIVER_ATOMIC, so a compositor falls back to legacy KMS.
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap),
+            Err(FsError::OpNotSupported)
+        );
+        let req = benign_request();
+        assert_eq!(
+            commit(&c, &req, 0),
+            Err(FsError::InvalidParam),
+            "a non-atomic client got an atomic commit"
+        );
+
+        // Flag on, cap negotiated: now it is reachable.
+        drm::set_atomic_enabled(true);
+        c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap)
+            .expect("SET_CLIENT_CAP ATOMIC");
+        assert!(commit(&c, &req, 0).is_ok());
+    }
+
+    /// A commit that FAILS still writes the out-fence slot, and writes `-1`.
+    /// The writeback sits before the commit's error is mapped on purpose: the
+    /// slot is the client's `int out_fence` local, and leaving it untouched
+    /// means the client reads whatever was on its stack and then closes or waits
+    /// on a descriptor that belongs to something else.
+    #[test]
+    fn a_failed_commit_still_writes_minus_one_into_the_out_fence_slot() {
+        let (_screen, c) = atomic_client(32, 8);
+        let mut slot: i32 = UNWRITTEN;
+        // A plane pointed at a CRTC that does not exist: staged fine, refused by
+        // the commit's check phase.
+        let req = Request::new(
+            &[drm::SYNTH_CRTC_ID, drm::SYNTH_PLANE_ID],
+            &[1, 1],
+            &[PROP_OUT_FENCE_PTR, PROP_CRTC_ID],
+            &[&mut slot as *mut i32 as u64, 0x999],
+        );
+
+        assert_eq!(
+            commit(&c, &req, 0),
+            Err(FsError::EntryNotFound),
+            "the bogus CRTC reference was accepted"
+        );
+        assert_eq!(slot, -1, "the client's fence slot was left uninitialised");
+    }
+
+    /// `TEST_ONLY` writes `-1` too: nothing was committed, so there is nothing
+    /// to fence. Handing back a real (already signaled) fd here would leak one
+    /// descriptor per `TEST_ONLY` probe, and wlroots probes on every output
+    /// reconfiguration.
+    #[test]
+    fn a_test_only_commit_writes_minus_one_and_presents_nothing() {
+        let (screen, c) = atomic_client(32, 8);
+        let mut slot: i32 = UNWRITTEN;
+        let req = Request::new(
+            &[drm::SYNTH_CRTC_ID],
+            &[2],
+            &[PROP_OUT_FENCE_PTR, PROP_ACTIVE],
+            &[&mut slot as *mut i32 as u64, 0],
+        );
+
+        commit(&c, &req, DRM_MODE_ATOMIC_TEST_ONLY).expect("TEST_ONLY commit");
+
+        // What this pins is that the slot IS written, with `-1`. That it is `-1`
+        // *rather than a real fd* is not separable here and no sharper test will
+        // separate it: installing the signaled stub needs a current thread with
+        // a Linux fd table, and a hosted test has neither, so
+        // `try_signaled_out_fence_fd` returns `None` and the success leg writes
+        // `-1` too. Swapping the two legs therefore survives this module by
+        // construction; the leg that is checkable is checked above and in
+        // `a_failed_commit_still_writes_minus_one_into_the_out_fence_slot`.
+        assert_eq!(slot, -1, "TEST_ONLY did not write the fence slot");
+        assert!(
+            (0..8).all(|y| (0..32).all(|x| screen.pixel(x, y) == kms_emu::UNTOUCHED)),
+            "a TEST_ONLY commit put pixels on the screen"
+        );
+    }
+
+    /// A property the walk rejects aborts the commit BEFORE the fence is
+    /// written. The client sees an error and its slot untouched, which is the
+    /// one case where not writing is right: no commit was attempted, so there is
+    /// no fence to describe -- and `-1` would look like "committed, no fence".
+    #[test]
+    fn a_rejected_property_aborts_before_the_fence_is_written() {
+        let (_screen, c) = atomic_client(32, 8);
+        let mut slot: i32 = UNWRITTEN;
+        // The fence pointer is staged first, then an unknown property id.
+        let req = Request::new(
+            &[drm::SYNTH_CRTC_ID],
+            &[2],
+            &[PROP_OUT_FENCE_PTR, 0xDEAD],
+            &[&mut slot as *mut i32 as u64, 0],
+        );
+
+        assert!(
+            commit(&c, &req, 0).is_err(),
+            "an unknown property was staged"
+        );
+        assert_eq!(
+            slot, UNWRITTEN,
+            "a commit that never ran handed the client a fence"
+        );
+    }
+
+    /// A NULL out-fence pointer is legal and writes nothing. libdrm passes NULL
+    /// whenever the caller did not ask for a fence, so faulting on it would
+    /// refuse every ordinary commit.
+    #[test]
+    fn a_null_out_fence_pointer_is_accepted_and_writes_nothing() {
+        let (_screen, c) = atomic_client(32, 8);
+        let req = Request::new(
+            &[drm::SYNTH_CRTC_ID],
+            &[2],
+            &[PROP_OUT_FENCE_PTR, PROP_ACTIVE],
+            &[0, 0],
+        );
+
+        commit(&c, &req, 0).expect("a commit with no fence must be accepted");
+    }
+
+    /// The flag guards of the arm, all of which Linux enforces: an unknown flag,
+    /// a non-zero `reserved`, an async flip (this tree advertises no async
+    /// support) and `TEST_ONLY` carrying a flip event are each `EINVAL`. A
+    /// kernel that quietly accepts a flag it does not implement is worse than
+    /// one that refuses it: the client then waits for behaviour that never
+    /// arrives.
+    #[test]
+    fn the_flag_guards_refuse_what_this_tree_does_not_implement() {
+        let (_screen, c) = atomic_client(32, 8);
+        let req = benign_request();
+
+        let unknown = DRM_MODE_ATOMIC_FLAGS.wrapping_add(1) & !DRM_MODE_ATOMIC_FLAGS;
+        assert_eq!(commit(&c, &req, unknown), Err(FsError::InvalidParam));
+        assert_eq!(
+            commit(&c, &req, DRM_MODE_PAGE_FLIP_ASYNC),
+            Err(FsError::InvalidParam),
+            "an async flip was accepted without async support"
+        );
+        assert_eq!(
+            commit(
+                &c,
+                &req,
+                DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_PAGE_FLIP_EVENT
+            ),
+            Err(FsError::InvalidParam),
+            "a test commit was allowed to queue a flip event"
+        );
+        // `reserved` must be zero.
+        let mut ioctl = req.ioctl(0);
+        ioctl.reserved = 1;
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_MODE_ATOMIC, &mut ioctl),
+            Err(FsError::InvalidParam)
+        );
+        // And the same request with none of that is fine, so the refusals above
+        // are the flags and not the request.
+        assert!(commit(&c, &req, 0).is_ok());
+    }
+
+    /// Turning a CRTC on is a modeset, and a modeset needs both the client's
+    /// `ALLOW_MODESET` flag and a mode. Linux refuses `ACTIVE=1` without the
+    /// flag ("[CRTC] requires full modeset") and again without a mode; a kernel
+    /// that let either through would light a CRTC with no timings programmed,
+    /// which on real hardware is a blank panel the compositor believes is up.
+    #[test]
+    fn activating_a_crtc_needs_both_the_modeset_flag_and_a_mode() {
+        let (_screen, c) = atomic_client(32, 8);
+        let req = Request::new(&[drm::SYNTH_CRTC_ID], &[1], &[PROP_ACTIVE], &[1]);
+
+        assert_eq!(
+            commit(&c, &req, 0),
+            Err(FsError::InvalidParam),
+            "a modeset went through without ALLOW_MODESET"
+        );
+        assert_eq!(
+            commit(&c, &req, DRM_MODE_ATOMIC_ALLOW_MODESET),
+            Err(FsError::InvalidParam),
+            "a CRTC was activated with no mode set"
+        );
+        // Leaving it off is not a modeset, so the same property with the other
+        // value needs neither.
+        assert!(commit(&c, &benign_request(), 0).is_ok());
+    }
+
+    /// And with a mode in hand, the `ALLOW_MODESET` flag is still required on
+    /// its own. Both guards refuse the same request with the same errno, so this
+    /// is the only shape that tells them apart: a commit that carries a mode has
+    /// nothing left to object to except the missing flag. Linux's rule is that a
+    /// client which has not opted into modesetting never gets one -- wlroots
+    /// relies on it to probe configurations without disturbing the screen.
+    #[test]
+    fn a_modeset_that_carries_a_mode_still_needs_the_allow_modeset_flag() {
+        let (_screen, c) = atomic_client(32, 8);
+        // The panel's own mode: anything else is refused for a different reason.
+        let mode = make_modeinfo(32, 8);
+        let mut blob = DrmModeCreateBlob {
+            data: mode.as_ptr() as u64,
+            length: mode.len() as u32,
+            blob_id: 0,
+        };
+        c.ioctl(DRM_IOCTL_MODE_CREATEPROPBLOB, &mut blob)
+            .expect("CREATEPROPBLOB");
+        assert_ne!(blob.blob_id, 0, "the mode blob was not created");
+
+        let req = Request::new(
+            &[drm::SYNTH_CRTC_ID],
+            &[2],
+            &[PROP_MODE_ID, PROP_ACTIVE],
+            &[u64::from(blob.blob_id), 1],
+        );
+
+        assert_eq!(
+            commit(&c, &req, 0),
+            Err(FsError::InvalidParam),
+            "a modeset went through without ALLOW_MODESET"
+        );
+        commit(&c, &req, DRM_MODE_ATOMIC_ALLOW_MODESET)
+            .expect("a modeset with the flag and a matching mode must be accepted");
+    }
+
+    /// A `MODE_ID` blob has to be exactly one `drm_mode_modeinfo` and has to
+    /// name the mode the panel actually scans out. Neither is pedantry: the
+    /// timings are read out of the blob by offset, so a short one reads past it,
+    /// and a mode this tree cannot scan out is the "wlroots picked a mode we
+    /// don't scan out" failure, where the commit succeeds and the screen stays
+    /// black.
+    ///
+    /// Two of the three are defended twice, so do not go chasing a surviving
+    /// mutation here: a short blob and a missing one both end up read as
+    /// `0x0`, which the panel-mode comparison refuses anyway. Deleting either
+    /// of those two checks on its own therefore keeps every assertion below
+    /// green. What the test pins is the contract -- none of the three is ever
+    /// accepted -- not which line does the refusing.
+    #[test]
+    fn a_mode_blob_must_be_one_modeinfo_and_name_the_panels_own_mode() {
+        let (_screen, c) = atomic_client(32, 8);
+
+        let new_blob = |bytes: &[u8]| -> u32 {
+            let mut blob = DrmModeCreateBlob {
+                data: bytes.as_ptr() as u64,
+                length: bytes.len() as u32,
+                blob_id: 0,
+            };
+            c.ioctl(DRM_IOCTL_MODE_CREATEPROPBLOB, &mut blob)
+                .expect("CREATEPROPBLOB");
+            blob.blob_id
+        };
+
+        let short = new_blob(&[0u8; 32]);
+        let wrong_size = new_blob(&make_modeinfo(64, 16));
+        let unknown = 0x7FFF_FFFF;
+
+        for (blob_id, what) in [
+            (short, "a 32-byte blob"),
+            (wrong_size, "a mode the panel does not have"),
+            (unknown, "a blob that does not exist"),
+        ] {
+            let req = Request::new(
+                &[drm::SYNTH_CRTC_ID],
+                &[2],
+                &[PROP_MODE_ID, PROP_ACTIVE],
+                &[u64::from(blob_id), 1],
+            );
+            assert!(
+                commit(&c, &req, DRM_MODE_ATOMIC_ALLOW_MODESET).is_err(),
+                "{} was accepted as a mode",
+                what
+            );
+        }
     }
 }

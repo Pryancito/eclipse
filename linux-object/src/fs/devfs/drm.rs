@@ -4561,9 +4561,15 @@ pub(crate) fn reset_output_state_for_test() {
     set_crtc_blanked(false);
     // Back to "nobody has said", which is what a fresh process looks like.
     HW_CURSOR.store(0, Ordering::Relaxed);
+    // And back to the default boot, where the atomic uAPI is off.
+    set_atomic_enabled(false);
     let mut st = DRM_STATE.lock();
     st.cursor = CursorState::default();
     st.crtc_fb = 0;
+    // A committed atomic state outlives the test that committed it: the next
+    // one's ACTIVE=0 then reads as a modeset (the CRTC is on) and is refused
+    // for a reason that has nothing to do with what it was testing.
+    st.atomic = AtomicKmsState::default();
 }
 
 #[cfg(test)]
