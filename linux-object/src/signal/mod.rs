@@ -226,6 +226,48 @@ impl Default for SignalStack {
     }
 }
 
+impl SignalStack {
+    /// Is `sp` a stack pointer inside this alternate signal stack?
+    ///
+    /// Linux's `on_sig_stack()`. Strict at the bottom and inclusive at the
+    /// top, because a stack pointer sits one past the byte it last pushed: a
+    /// thread that has just switched here has `sp == self.sp + self.size`.
+    pub fn contains_sp(&self, sp: usize) -> bool {
+        sp > self.sp && sp - self.sp <= self.size
+    }
+
+    /// Can a signal frame be moved onto this stack, for a thread currently
+    /// using `sp`?
+    ///
+    /// Linux's `sas_ss_flags(sp) == 0`. Switching to the base of a stack we
+    /// are already running on would overwrite the frames below us -- the exact
+    /// crash `sigaltstack(2)` exists to avoid -- so being on it already
+    /// disqualifies it, and so does never having been given a size.
+    pub fn usable_from(&self, sp: usize) -> bool {
+        self.size != 0 && !self.flags.contains(SignalStackFlags::DISABLE) && !self.contains_sp(sp)
+    }
+
+    /// This stack as `sigaltstack(2)` reports it to a thread using `sp`.
+    ///
+    /// `SS_ONSTACK` and `SS_DISABLE` are *derived*, never stored: Linux keeps
+    /// only `SS_AUTODISARM` in the task and computes the other two from the
+    /// caller's stack pointer (`sas_ss_flags`). Reporting them is not
+    /// cosmetic -- glibc and the Rust runtime read `ss_flags` back to decide
+    /// whether they may install a stack of their own, and a kernel that
+    /// always answers `SS_DISABLE` tells every one of them the slot is free.
+    pub fn as_reported_from(&self, sp: usize) -> SignalStack {
+        let mut out = *self;
+        out.flags
+            .remove(SignalStackFlags::ONSTACK | SignalStackFlags::DISABLE);
+        if self.size == 0 || self.flags.contains(SignalStackFlags::DISABLE) {
+            out.flags.insert(SignalStackFlags::DISABLE);
+        } else if self.contains_sp(sp) {
+            out.flags.insert(SignalStackFlags::ONSTACK);
+        }
+        out
+    }
+}
+
 numeric_enum! {
     #[repr(u8)]
     #[derive(Eq, PartialEq, Debug, Copy, Clone)]
@@ -443,5 +485,207 @@ mod signal_arg_tests {
         );
         assert!(!Signal::SIGRT32.is_standard());
         assert!(Signal::SIGSYS.is_standard());
+    }
+}
+
+#[cfg(test)]
+mod sigaltstack_tests {
+    //! `sigaltstack(2)` is how a program survives its own stack running out:
+    //! it hands the kernel a second, small stack and asks (with `SA_ONSTACK`)
+    //! that signal handlers run there. The whole point is the handler for the
+    //! signal a blown stack raises, so getting the "is it usable" answer wrong
+    //! is only ever noticed at the worst possible moment. Both the kernel side
+    //! (where to put the frame) and the userspace side (what `ss_flags` reads
+    //! back) come out of these three functions.
+
+    use super::*;
+
+    const BASE: usize = 0x7000_0000;
+    const SIZE: usize = 0x4000;
+
+    fn alt() -> SignalStack {
+        SignalStack {
+            sp: BASE,
+            flags: SignalStackFlags::empty(),
+            size: SIZE,
+        }
+    }
+
+    #[test]
+    fn the_stack_holds_every_pointer_that_could_have_pushed_onto_it() {
+        let alt = alt();
+        // A stack pointer is one past the byte it last pushed, so a thread
+        // that has just switched here has sp == base + size and has pushed
+        // nothing yet. Excluding the top (a `<` instead of `<=`) would make
+        // `sigaltstack` report "not on it" for exactly the thread that just
+        // got there, and the next signal would restart the frame at the top,
+        // on top of the handler already running.
+        assert!(alt.contains_sp(BASE + SIZE), "the top is on the stack");
+        assert!(alt.contains_sp(BASE + 1), "one byte in is on the stack");
+        assert!(alt.contains_sp(BASE + SIZE / 2));
+        // The base itself is not: sp == base means the stack is completely
+        // full, and Linux's `on_sig_stack` is strict here for the same reason
+        // the top is inclusive.
+        assert!(!alt.contains_sp(BASE), "the base is not on the stack");
+        assert!(!alt.contains_sp(BASE - 1));
+        assert!(!alt.contains_sp(BASE + SIZE + 1), "one past the top is off");
+    }
+
+    #[test]
+    fn a_stack_pointer_below_the_base_does_not_wrap_into_range() {
+        // `sp - self.sp` on two `usize`s: a stack pointer below the base
+        // underflows if the `sp > self.sp` guard is dropped, and every low
+        // address then reads as "on the alternate stack" -- which would stop
+        // the kernel from ever switching to it.
+        let alt = alt();
+        assert!(!alt.contains_sp(0));
+        assert!(!alt.contains_sp(0x1000));
+    }
+
+    #[test]
+    fn a_stack_that_was_never_installed_is_not_usable() {
+        let mut none = SignalStack::default();
+        assert!(!none.usable_from(0x1000));
+        // Even with a plausible address: it is the size that says whether
+        // `sigaltstack` was ever called.
+        none.sp = BASE;
+        assert!(!none.usable_from(0x1000));
+    }
+
+    #[test]
+    fn a_stack_with_no_size_is_not_usable_even_without_the_disable_flag() {
+        // The syscall refuses to store a stack smaller than MINSIGSTKSZ
+        // unless SS_DISABLE is set, so the two conditions always agree in
+        // practice -- but the frame placement must not depend on that. A
+        // size of zero means every address is off the end, so switching
+        // there would put the frame in whatever follows the base address.
+        let empty = SignalStack {
+            sp: BASE,
+            flags: SignalStackFlags::empty(),
+            size: 0,
+        };
+        assert!(!empty.usable_from(0x1000));
+        assert!(empty
+            .as_reported_from(0x1000)
+            .flags
+            .contains(SignalStackFlags::DISABLE));
+    }
+
+    #[test]
+    fn an_explicitly_disabled_stack_is_not_usable() {
+        // A disabled stack that still carries a size. The syscall zeroes both
+        // fields on SS_DISABLE, as Linux does, so this pairing should not
+        // reach us -- but neither the placement nor the report may lean on
+        // that, or a stack a program disabled would come back usable.
+        let mut alt = alt();
+        alt.flags.insert(SignalStackFlags::DISABLE);
+        assert!(!alt.usable_from(0x1000));
+        let reported = alt.as_reported_from(BASE + SIZE / 2);
+        assert!(reported.flags.contains(SignalStackFlags::DISABLE));
+        assert!(
+            !reported.flags.contains(SignalStackFlags::ONSTACK),
+            "a disabled stack is never the one we are running on"
+        );
+    }
+
+    #[test]
+    fn a_stack_we_are_already_running_on_is_not_usable() {
+        // The nested case: a handler already running on the alternate stack
+        // takes a second signal. Switching again would put the new frame at
+        // the top, over the frames of the handler that is still live. Linux
+        // stays on the current stack instead, which is why `sas_ss_flags`
+        // returns SS_ONSTACK rather than 0 here.
+        let alt = alt();
+        assert!(!alt.usable_from(BASE + SIZE / 2));
+        assert!(!alt.usable_from(BASE + SIZE));
+        // ...but a thread on its ordinary stack may switch.
+        assert!(alt.usable_from(0xffff_0000));
+    }
+
+    #[test]
+    fn an_installed_stack_reads_back_as_onstack_only_while_in_use() {
+        let alt = alt();
+        let from_outside = alt.as_reported_from(0xffff_0000);
+        assert!(
+            !from_outside.flags.contains(SignalStackFlags::ONSTACK),
+            "a thread on its ordinary stack is not on the alternate one"
+        );
+        assert!(!from_outside.flags.contains(SignalStackFlags::DISABLE));
+
+        let from_inside = alt.as_reported_from(BASE + SIZE / 2);
+        assert!(
+            from_inside.flags.contains(SignalStackFlags::ONSTACK),
+            "a handler running on the alternate stack must see SS_ONSTACK"
+        );
+        assert!(!from_inside.flags.contains(SignalStackFlags::DISABLE));
+    }
+
+    #[test]
+    fn a_stack_that_was_never_installed_reads_back_as_disabled() {
+        let reported = SignalStack::default().as_reported_from(0xffff_0000);
+        assert!(reported.flags.contains(SignalStackFlags::DISABLE));
+        assert!(!reported.flags.contains(SignalStackFlags::ONSTACK));
+        assert_eq!(reported.size, 0);
+    }
+
+    #[test]
+    fn the_address_and_size_survive_the_report_untouched() {
+        // `sigaltstack(NULL, &old)` is how a library saves the stack it found
+        // so it can put it back afterwards. Rounding or zeroing either field
+        // here hands back a stack that is not the one that was installed.
+        let reported = alt().as_reported_from(0xffff_0000);
+        assert_eq!(reported.sp, BASE);
+        assert_eq!(reported.size, SIZE);
+    }
+
+    #[test]
+    fn autodisarm_is_stored_and_survives_the_report() {
+        // SS_AUTODISARM is the one flag Linux really does keep in the task
+        // (`current->sas_ss_flags`); the other two are computed. Dropping it
+        // on the way out would make a `sigaltstack(NULL, &old)` +
+        // `sigaltstack(&old, NULL)` round trip silently disarm the
+        // auto-disarm, which is what makecontext/swapcontext users rely on.
+        let mut alt = alt();
+        alt.flags.insert(SignalStackFlags::AUTODISARM);
+        let reported = alt.as_reported_from(BASE + SIZE / 2);
+        assert!(reported.flags.contains(SignalStackFlags::AUTODISARM));
+        assert!(reported.flags.contains(SignalStackFlags::ONSTACK));
+    }
+
+    #[test]
+    fn the_three_flag_values_are_the_ones_userspace_sends() {
+        // These numbers are the uAPI: userspace writes them into `ss_flags`
+        // and reads them back out. A test that compared the constant to
+        // itself would move with it and check nothing.
+        assert_eq!(SignalStackFlags::ONSTACK.bits(), 1);
+        assert_eq!(SignalStackFlags::DISABLE.bits(), 2);
+        assert_eq!(SignalStackFlags::AUTODISARM.bits(), 1 << 31);
+    }
+
+    #[test]
+    fn the_struct_is_the_linux_stack_t_layout() {
+        // `struct stack_t { void *ss_sp; int ss_flags; size_t ss_size; }`:
+        // 8 + 4 (+4 padding) + 8 on 64-bit. Userspace fills this in itself,
+        // so a field at the wrong offset reads the flags out of the pointer.
+        use core::mem::{align_of, size_of};
+        assert_eq!(size_of::<SignalStack>(), 24);
+        assert_eq!(align_of::<SignalStack>(), 8);
+        let s = SignalStack {
+            sp: 0x1122_3344_5566_7788,
+            flags: SignalStackFlags::ONSTACK,
+            size: 0x99aa_bbcc_ddee_ff00,
+        };
+        let bytes: [u8; 24] = unsafe { core::mem::transmute(s) };
+        let word = |at: usize| {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(&bytes[at..at + 8]);
+            usize::from_ne_bytes(w)
+        };
+        assert_eq!(word(0), s.sp);
+        assert_eq!(
+            u32::from_ne_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            1
+        );
+        assert_eq!(word(16), s.size);
     }
 }

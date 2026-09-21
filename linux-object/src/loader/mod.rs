@@ -606,7 +606,7 @@ impl LinuxElfLoader {
             // the FreeBSD dynamic linker (`/libexec/ld-elf.so.1`), which this
             // tree does not ship — so in practice only *static* FreeBSD binaries
             // (handled in the no-interpreter path below) get a FreeBSD stack.
-            let initial_brk = heap_base(&vmar);
+            let initial_brk = heap_base(vmar);
             return Ok((interp_entry, sp, initial_brk, path, abi));
         }
 
@@ -770,7 +770,7 @@ impl LinuxElfLoader {
         // Initial brk: the same dedicated heap base as the dynamic case. A
         // static binary has no interpreter mapping its own libraries, but it
         // still mmaps, and the collision is the same one.
-        let initial_brk = heap_base(&vmar);
+        let initial_brk = heap_base(vmar);
         Ok((entry, sp, initial_brk, path, abi))
     }
 }
