@@ -161,8 +161,16 @@ use super::{phys_to_virt, read, write};
 #[cfg(all(feature = "board_malta", target_arch = "mips"))]
 const PCI_BASE: usize = 0xbbe00000;
 
+/// QEMU `virt` PCIe ECAM configuration space base.
+///
+/// Public because the config accessors below reach it with a bare
+/// `phys_to_virt`, with no mapping of their own, so somebody has to put it in
+/// the kernel page table first -- see `kernel_hal`'s riscv64 `drivers::init`.
 #[cfg(target_arch = "riscv64")]
-const PCI_BASE: usize = 0x30000000;
+pub const PCI_BASE: usize = 0x30000000;
+/// The whole ECAM window: 256 buses x 32 devices x 8 functions x 4 KiB.
+#[cfg(target_arch = "riscv64")]
+pub const PCI_CONFIG_SIZE: usize = 256 * 32 * 8 * 4096;
 #[cfg(target_arch = "riscv64")]
 #[allow(dead_code)]
 const E1000_BASE: usize = 0x40000000;
