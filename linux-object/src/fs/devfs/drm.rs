@@ -1039,6 +1039,52 @@ pub fn nouveau_gem_add_ref(handle: u32) -> Option<u32> {
     zcore_drivers::scheme::gem_mmap::add_ref(handle, current_pid())
 }
 
+/// Holder id a live dma-buf fd records against a nouveau GEM object. Re-export
+/// of [`zcore_drivers::scheme::gem_mmap::DMABUF_HOLDER`] so the syscall layer
+/// and `DmaBuf` do not need a direct drivers dependency for the sentinel.
+pub const DMABUF_HOLDER: u64 = zcore_drivers::scheme::gem_mmap::DMABUF_HOLDER;
+
+/// Take the dma-buf's reference on a nouveau GEM object at `PRIME_HANDLE_TO_FD`
+/// time. No-op for low-range (dumb/generic) handles — those stay alive via the
+/// `Arc<VmObject>` the dma-buf already holds. See `DMABUF_HOLDER`.
+pub fn dmabuf_take_gem_ref(handle_id: u32) {
+    if handle_id < zcore_drivers::scheme::gem_mmap::DRIVER_HANDLE_BASE {
+        return;
+    }
+    let n = zcore_drivers::scheme::gem_mmap::add_ref(handle_id, DMABUF_HOLDER);
+    if n.is_none() {
+        // Export of a handle that is not in gem_mmap: either it was never a
+        // nouveau object, or it was already freed under us. The export path
+        // itself will have failed `lookup_for` before reaching here for the
+        // latter; this is a belt-and-braces log for the former.
+        log::debug!(
+            "[drm] dmabuf_take_gem_ref handle={:#x}: not tracked in gem_mmap",
+            handle_id
+        );
+    }
+}
+
+/// Release the reference [`dmabuf_take_gem_ref`] took, freeing the GEM object
+/// when it was the last one. Routed through the driver's `GEM_CLOSE` so the
+/// last close also drains VM_BIND mappings and returns memory to the RM —
+/// same contract as [`fb_drop_gem_ref`].
+pub fn dmabuf_drop_gem_ref(handle_id: u32) {
+    if handle_id < zcore_drivers::scheme::gem_mmap::DRIVER_HANDLE_BASE {
+        return;
+    }
+    if zcore_drivers::scheme::gem_mmap::lookup(handle_id).is_none() {
+        return;
+    }
+    match get_primary_driver() {
+        Some(driver) => {
+            driver.nouveau_gem_close(handle_id, DMABUF_HOLDER);
+        }
+        None => {
+            zcore_drivers::scheme::gem_mmap::dec_ref(handle_id, DMABUF_HOLDER);
+        }
+    }
+}
+
 /// The holder id a KMS framebuffer's own reference on a nouveau GEM object is
 /// recorded under.
 ///

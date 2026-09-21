@@ -499,6 +499,12 @@ struct HdaInner {
     /// only visible trace of the response stream having slipped. See
     /// [`HdaInner::drain_rirb`].
     stat_stale_resp: u64,
+    /// Output re-routes decided by [`HdaInner::repick_path`], and the last
+    /// one (`from pin`, `to pin`, ms since boot). A stream that restarts on
+    /// the wrong pin plays into a connector nobody is listening to, with
+    /// every call returning `Ok`; this is how that shows up.
+    stat_reroutes: u64,
+    last_reroute: (u32, u32, u64),
     /// `(pin, timer_now_as_micros())` at each pin's last presence-detect
     /// trigger, for [`SENSE_PROBE_MIN_US`]. Per pin, because a walk over the
     /// candidates has to latch a fresh result on every one of them -- a
@@ -1239,6 +1245,103 @@ fn nearest_rate(rate: u32) -> u32 {
         .unwrap_or(&48000)
 }
 
+/// Which of the scored candidate paths to play on, given the one in use.
+///
+/// The highest score wins, but a route change is only worth its cost -- a
+/// full path re-arm on a stream that is restarting anyway -- when it leads
+/// somewhere better, and a momentary dip in the current pin's sense bits is
+/// not that. So the current path keeps its place on a tie, and it is never
+/// abandoned for a pin that does not itself report presence. On the NVIDIA
+/// codecs this runs against, a `SET_PIN_SENSE` right after the stream stops
+/// can read back PD=0 on the monitor's own pin for a moment; scoring alone
+/// then sent every underrun-triggered restart to the first dead connector
+/// in the list, and the next restart brought it back -- the same track
+/// audible one time and silent the next, with every call returning `Ok`.
+fn choose_route(scored: &[(OutPath, i32)], current: Option<(u32, u32)>) -> Option<&OutPath> {
+    let is_current = |p: &OutPath| current == Some((p.pin, p.conv));
+    let mut best: Option<&(OutPath, i32)> = None;
+    for cand in scored {
+        let better = match best {
+            None => true,
+            Some(b) => cand.1 > b.1 || (cand.1 == b.1 && is_current(&cand.0)),
+        };
+        if better {
+            best = Some(cand);
+        }
+    }
+    let (best, _) = best?;
+    if current.is_some() && !is_current(best) && !best.present {
+        // Nothing live to move to: stay where the audio last came out.
+        return scored.iter().map(|(p, _)| p).find(|p| is_current(p));
+    }
+    Some(best)
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    fn path(pin: u32, present: bool) -> OutPath {
+        OutPath {
+            conv: 0x4,
+            pin,
+            pin_conn_idx: 0,
+            digital: true,
+            hdmi_dp: true,
+            present,
+        }
+    }
+
+    fn pins(chosen: Option<&OutPath>) -> Option<u32> {
+        chosen.map(|p| p.pin)
+    }
+
+    #[test]
+    fn the_initial_pick_is_the_best_score_first_on_ties() {
+        let scored = [
+            (path(0x5, false), 0),
+            (path(0x6, true), 7),
+            (path(0x7, true), 7),
+        ];
+        assert_eq!(pins(choose_route(&scored, None)), Some(0x6));
+        assert_eq!(pins(choose_route(&[], None)), None);
+    }
+
+    #[test]
+    fn the_current_path_keeps_its_place_on_a_tie() {
+        // Two pins, neither present, equal scores: the first in the list
+        // used to win, so a stream on pin 6 hopped to pin 5 on restart.
+        let scored = [(path(0x5, false), 0), (path(0x6, false), 0)];
+        assert_eq!(pins(choose_route(&scored, Some((0x6, 0x4)))), Some(0x6));
+        let scored = [(path(0x5, true), 7), (path(0x6, true), 7)];
+        assert_eq!(pins(choose_route(&scored, Some((0x6, 0x4)))), Some(0x6));
+    }
+
+    #[test]
+    fn a_momentary_presence_loss_does_not_move_the_stream_to_a_dead_pin() {
+        // The monitor's pin read PD=0 this once; the other pin never had
+        // anything. Its higher score (first in list, equal otherwise) is
+        // not a reason to leave.
+        let scored = [(path(0x5, false), 1), (path(0x6, false), 0)];
+        assert_eq!(pins(choose_route(&scored, Some((0x6, 0x4)))), Some(0x6));
+    }
+
+    #[test]
+    fn a_live_pin_still_wins_over_a_dead_current_one() {
+        // The monitor moved to another connector: follow it.
+        let scored = [(path(0x5, true), 7), (path(0x6, false), 0)];
+        assert_eq!(pins(choose_route(&scored, Some((0x6, 0x4)))), Some(0x5));
+        // A converter change on the same pin counts as a move too.
+        let mut other = path(0x6, true);
+        other.conv = 0x8;
+        let scored = [(other, 7), (path(0x6, false), 0)];
+        assert_eq!(
+            choose_route(&scored, Some((0x6, 0x4))).map(|p| (p.pin, p.conv)),
+            Some((0x6, 0x8))
+        );
+    }
+}
+
 // ── Codec graph walk ────────────────────────────────────────────────────────
 #[derive(Clone)]
 struct OutPath {
@@ -1427,11 +1530,10 @@ impl HdaInner {
         }
     }
 
-    /// Pick the best-scoring path among `self.candidates` right now.
-    fn best_candidate(&mut self) -> Option<OutPath> {
+    /// Score every candidate path right now.
+    fn scored_candidates(&mut self) -> Vec<(OutPath, i32)> {
         let candidates = self.candidates.clone();
-        let mut best: Option<OutPath> = None;
-        let mut best_score = -1i32;
+        let mut out = Vec::with_capacity(candidates.len());
         for mut p in candidates {
             let (score, present, eld_valid) = self.score_path(&p);
             p.present = present;
@@ -1439,12 +1541,16 @@ impl HdaInner {
                 "[hda] path candidate: pin {:#x} -> conv {:#x} (digital={}, hdmi/dp={}, present={}, eld={}, score={})",
                 p.pin, p.conv, p.digital, p.hdmi_dp, present, eld_valid, score
             );
-            if score > best_score {
-                best_score = score;
-                best = Some(p);
-            }
+            out.push((p, score));
         }
-        best
+        out
+    }
+
+    /// Pick the best-scoring path among `self.candidates` right now. Used
+    /// for the initial pick, where there is no current path to prefer.
+    fn best_candidate(&mut self) -> Option<OutPath> {
+        let scored = self.scored_candidates();
+        choose_route(&scored, None).cloned()
     }
 
     /// Re-evaluate the candidate paths and re-route if a better pin has
@@ -1468,14 +1574,18 @@ impl HdaInner {
 
         // Re-score only when there is something to choose between.
         if self.candidates.len() >= 2 {
-            let Some(best) = self.best_candidate() else {
+            let scored = self.scored_candidates();
+            let current = (self.pin_nid, self.conv_nid);
+            let Some(best) = choose_route(&scored, Some(current)).cloned() else {
                 return;
             };
             if best.pin != self.pin_nid || best.conv != self.conv_nid {
-                info!(
-                    "[hda] re-routing output: pin {:#x} -> pin {:#x}",
-                    self.pin_nid, best.pin
+                warn!(
+                    "[hda] re-routing output: pin {:#x} -> pin {:#x} (present={})",
+                    self.pin_nid, best.pin, best.present
                 );
+                self.stat_reroutes += 1;
+                self.last_reroute = (self.pin_nid, best.pin, timer_now_as_micros() / 1000);
                 if let Err(e) = self.setup_path(afg, &best) {
                     warn!("[hda] re-route failed: {:?} — keeping previous path", e);
                 }
@@ -1804,6 +1914,8 @@ impl HdaDevice {
             stat_fifo_err: 0,
             stat_desc_err: 0,
             stat_stale_resp: 0,
+            stat_reroutes: 0,
+            last_reroute: (0, 0, 0),
             sense_probe: Vec::new(),
             last_kick_us: 0,
             stream_start_wall: 0,
@@ -2195,6 +2307,21 @@ impl AudioScheme for HdaDevice {
             inner.stat_fifo_err,
             inner.stat_desc_err,
             mmio_r16(bar, sd + SD_FIFOS)
+        );
+        let _ = writeln!(
+            out,
+            "[gpusnd] routing: {} re-routes{}",
+            inner.stat_reroutes,
+            if inner.stat_reroutes > 0 {
+                alloc::format!(
+                    " (last pin {:#x} -> pin {:#x} at {} ms)",
+                    inner.last_reroute.0,
+                    inner.last_reroute.1,
+                    inner.last_reroute.2
+                )
+            } else {
+                String::new()
+            }
         );
         let _ = writeln!(
             out,

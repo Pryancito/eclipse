@@ -880,9 +880,9 @@ fn force_fault_signal(thread: &CurrentThread, signal: Signal) {
         // Deliverable custom handler: unblock so it cannot be deferred and queue
         // it for the next pass of the run loop.
         let mut linux = inner.lock_linux();
-        let mut mask = linux.signal_mask();
-        mask.remove(signal);
-        linux.set_signal_mask(mask);
+        let mut unblock = Sigset::empty();
+        unblock.insert(signal);
+        linux.unblock_signals(&unblock);
         linux.signals.insert(signal);
     }
 }

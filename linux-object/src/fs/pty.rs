@@ -95,6 +95,10 @@ pub struct Pty {
     slave_bus: Arc<Mutex<EventBus>>,
     /// Foreground process group of the terminal (for signal delivery).
     fg_pgrp: AtomicI32,
+    /// Double-Ctrl-C arm: first VINTR for a pgrp stores it here; a second
+    /// VINTR for the same pgrp escalates to SIGKILL (see
+    /// [`crate::process::interrupt_or_force_pgrp`]).
+    ctrl_c_armed_pgid: AtomicI32,
     /// Number of currently-open slave fds.
     slave_open: AtomicI32,
     /// Set once the slave has been opened at least once; the master only reports
@@ -213,9 +217,38 @@ impl Pty {
 
                 // Signal-generating characters.
                 if lflag & ISIG != 0 {
-                    let sig = if cc[VINTR] != 0 && c == cc[VINTR] {
-                        Some((Signal::SIGINT, "^C"))
-                    } else if cc[VQUIT] != 0 && c == cc[VQUIT] {
+                    // Ctrl-C: first press → SIGINT; second for the same pgrp →
+                    // SIGKILL so a hung job can be torn down without closing
+                    // the terminal emulator (foot, etc.).
+                    if cc[VINTR] != 0 && c == cc[VINTR] {
+                        if lflag & NOFLSH == 0 {
+                            inner.input.clear();
+                            inner.canon.clear();
+                            inner.eof_pending = false;
+                            clear_slave_readable = true;
+                        }
+                        if inner.stopped {
+                            inner.stopped = false;
+                            wake_master = true;
+                        }
+                        let pgid = self.fg_pgrp.load(Ordering::Relaxed);
+                        let sent = crate::process::interrupt_or_force_pgrp(
+                            pgid,
+                            &self.ctrl_c_armed_pgid,
+                        );
+                        if lflag & ECHO != 0 {
+                            let label: &[u8] = if sent == Signal::SIGKILL {
+                                b"^C (killed)"
+                            } else {
+                                b"^C"
+                            };
+                            inner.output.extend(label);
+                            inner.output.extend(b"\r\n");
+                            wake_master = true;
+                        }
+                        continue;
+                    }
+                    let sig = if cc[VQUIT] != 0 && c == cc[VQUIT] {
                         Some((Signal::SIGQUIT, "^\\"))
                     } else if cc[VSUSP] != 0 && c == cc[VSUSP] {
                         Some((Signal::SIGTSTP, "^Z"))
@@ -568,7 +601,10 @@ impl Pty {
             }
             TIOCSPGRP => {
                 let pgid = unsafe { *(data as *const i32) };
-                self.fg_pgrp.store(pgid, Ordering::Relaxed);
+                let old = self.fg_pgrp.swap(pgid, Ordering::Relaxed);
+                if old != pgid {
+                    crate::process::clear_interrupt_arm(&self.ctrl_c_armed_pgid);
+                }
                 Ok(0)
             }
             TCFLSH | TIOCSCTTY | TIOCNOTTY => Ok(0),
@@ -696,6 +732,7 @@ pub fn alloc_ptmx() -> Arc<dyn INode> {
         master_bus: Arc::new(Mutex::new(EventBus::default())),
         slave_bus: Arc::new(Mutex::new(EventBus::default())),
         fg_pgrp: AtomicI32::new(0),
+        ctrl_c_armed_pgid: AtomicI32::new(0),
         slave_open: AtomicI32::new(0),
         slave_ever_open: AtomicBool::new(false),
         master_closed: AtomicBool::new(false),
@@ -787,7 +824,10 @@ impl PtySlave {
     /// group to the caller's pgrp (Linux `tty_jobctrl.c` semantics), which the
     /// inode-level ioctl cannot do itself — it has no process context.
     pub fn set_fg_pgrp(&self, pgid: i32) {
-        self.pty.fg_pgrp.store(pgid, Ordering::Relaxed);
+        let old = self.pty.fg_pgrp.swap(pgid, Ordering::Relaxed);
+        if old != pgid {
+            crate::process::clear_interrupt_arm(&self.pty.ctrl_c_armed_pgid);
+        }
     }
 }
 
@@ -1038,6 +1078,7 @@ mod tests {
             master_bus: Arc::new(Mutex::new(EventBus::default())),
             slave_bus: Arc::new(Mutex::new(EventBus::default())),
             fg_pgrp: AtomicI32::new(0),
+            ctrl_c_armed_pgid: AtomicI32::new(0),
             slave_open: AtomicI32::new(1),
             slave_ever_open: AtomicBool::new(true),
             master_closed: AtomicBool::new(false),
@@ -1447,6 +1488,44 @@ mod tests {
         p.master_write(&[CTRL_C]);
         assert!(!p.inner.lock().stopped);
         assert_eq!(master_drain(&p), "x^C\r\n");
+    }
+
+    #[test]
+    fn a_second_ctrl_c_escalates_to_sigkill_and_echoes_killed() {
+        let p = pty();
+        p.fg_pgrp.store(4242, Ordering::Relaxed);
+        p.master_write(&[CTRL_C]);
+        assert_eq!(
+            p.ctrl_c_armed_pgid.load(Ordering::Relaxed),
+            4242,
+            "first Ctrl-C arms the pgrp"
+        );
+        assert_eq!(master_drain(&p), "^C\r\n");
+        p.master_write(&[CTRL_C]);
+        assert_eq!(
+            p.ctrl_c_armed_pgid.load(Ordering::Relaxed),
+            0,
+            "second Ctrl-C clears the arm after force-kill"
+        );
+        assert_eq!(master_drain(&p), "^C (killed)\r\n");
+    }
+
+    #[test]
+    fn changing_fg_pgrp_clears_the_ctrl_c_arm() {
+        let p = pty();
+        p.fg_pgrp.store(100, Ordering::Relaxed);
+        p.master_write(&[CTRL_C]);
+        assert_eq!(p.ctrl_c_armed_pgid.load(Ordering::Relaxed), 100);
+        let mut pgid: i32 = 200;
+        assert!(p
+            .ioctl(TIOCSPGRP as u32, &mut pgid as *mut i32 as usize, true)
+            .is_ok());
+        assert_eq!(p.fg_pgrp.load(Ordering::Relaxed), 200);
+        assert_eq!(
+            p.ctrl_c_armed_pgid.load(Ordering::Relaxed),
+            0,
+            "a new foreground job must not inherit a force-kill arm"
+        );
     }
 
     #[test]
