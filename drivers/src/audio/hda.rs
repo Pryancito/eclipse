@@ -470,6 +470,43 @@ fn client_to_link_bytes(client_bytes: usize, fin: u32, fout: u32, frame: usize) 
     (frames * fout as u64 / fin as u64) as usize * frame
 }
 
+/// Client bytes queued, as the front ends must see them while a converter
+/// is in the path. Derived from the SAME [`accept_client_frames`] figure that
+/// `free_bytes` reports and `write` accepts, so that
+/// `buffer_bytes - queued_bytes == free_bytes` holds exactly.
+///
+/// That identity is load-bearing. The ALSA node does not ask the driver how
+/// much is free: it computes `avail = buffer_size - queued` itself, offers
+/// that many frames, and PulseAudio's `alsa-sink.c` aborts (`try_recover`:
+/// `pa_assert(err != -EAGAIN)`) if a write it was just told had room comes
+/// back with 0. Converting `queued` on its own -- `link_to_client_bytes` of
+/// the ring occupancy -- broke the identity near a full ring: three
+/// independently floored conversions plus the [`SRC_SLACK_FRAMES`] held
+/// back by `accept_client_frames` left `avail` at one to four frames while
+/// `write` accepted none. That was a SIGABRT inside libalsa-util within
+/// seconds of the converter engaging.
+///
+/// `exposed_link` is the ring occupancy less the driver's silence pad, as
+/// [`HdaInner::exposed_queued`] reports it, so this stays monotonic while
+/// a gap's pad grows -- the hardware pointer derived from it must never run
+/// backwards. Near a full ring there is no pad, and the figure then equals
+/// `buffer - free` to the byte.
+fn client_queued_bytes(
+    buffer_link: usize,
+    exposed_link: usize,
+    fin: u32,
+    fout: u32,
+    frame: usize,
+) -> usize {
+    if frame == 0 {
+        return 0;
+    }
+    let buffer = link_to_client_bytes(buffer_link, fin, fout, frame);
+    let room_link = buffer_link.saturating_sub(exposed_link);
+    let free = accept_client_frames(room_link / frame, fin, fout) * frame;
+    buffer.saturating_sub(free)
+}
+
 /// Whether a `set_params` may keep the engine running (a soft prepare, see
 /// [`HdaInner::soft_prepare`]) rather than stop and wipe the stream. Only
 /// with the engine actually running on a descriptor that is still
@@ -1250,6 +1287,24 @@ impl HdaInner {
         }
     }
 
+    /// Client bytes queued as the front ends see them: the ring occupancy
+    /// less the pad without a converter (unchanged from before the fixed-rate
+    /// sink), and [`client_queued_bytes`] with one, so `avail` agrees with
+    /// what `write` accepts.
+    fn client_queued_bytes(&self) -> usize {
+        let exposed = self.exposed_queued();
+        match self.src_rates() {
+            Some((fin, fout)) => client_queued_bytes(
+                self.ring_len - RING_GUARD,
+                exposed,
+                fin,
+                fout,
+                self.frame_bytes(),
+            ),
+            None => exposed,
+        }
+    }
+
     /// Convert `client_frames` whole frames of client S16LE `pcm` through the
     /// resampler into `self.src_bytes` (ring-rate S16LE). Returns the link
     /// byte count. Only called with a converter present.
@@ -1616,9 +1671,9 @@ mod format_and_ring_tests {
     //! position that runs backwards is what the intermittent dropouts were.
 
     use super::{
-        accept_client_frames, client_to_link_bytes, exposed_queued, free_bytes_of,
-        honourable_bytes, link_to_client_bytes, nearest_rate, park_target, prepare_keeps_engine,
-        stream_format, sub_nodes, Resampler, LINK_RATE, SRC_SLACK_FRAMES,
+        accept_client_frames, client_queued_bytes, client_to_link_bytes, exposed_queued,
+        free_bytes_of, honourable_bytes, link_to_client_bytes, nearest_rate, park_target,
+        prepare_keeps_engine, stream_format, sub_nodes, Resampler, LINK_RATE, SRC_SLACK_FRAMES,
     };
 
     /// The one case a prepare keeps the engine running: running, not
@@ -1761,6 +1816,87 @@ mod format_and_ring_tests {
                     slop
                 );
             }
+        }
+    }
+
+    /// The identity PulseAudio's life depends on: at EVERY fill level of the
+    /// ring, `buffer - queued` (what the ALSA node computes as avail and
+    /// offers) equals what `write` will accept. A single frame of daylight
+    /// between them is a write answered with 0 right after avail said there
+    /// was room, and alsa-sink's `try_recover` aborts the daemon on that.
+    /// Checked with no pad, which is the only state a full ring can be in.
+    #[test]
+    fn avail_equals_what_write_accepts_at_every_fill_level() {
+        let frame = 4usize;
+        let buffer_link = 16384 * frame;
+        for &fin in &CLIENT_RATES {
+            let buffer = link_to_client_bytes(buffer_link, fin, LINK_RATE, frame);
+            for exposed_frames in 0..=16384usize {
+                let exposed = exposed_frames * frame;
+                let queued = client_queued_bytes(buffer_link, exposed, fin, LINK_RATE, frame);
+                let avail = buffer - queued;
+                let free_link = buffer_link - exposed;
+                let accept = accept_client_frames(free_link / frame, fin, LINK_RATE) * frame;
+                assert_eq!(
+                    avail, accept,
+                    "{} Hz, {} link frames queued: avail {} vs accept {}",
+                    fin, exposed_frames, avail, accept
+                );
+            }
+        }
+    }
+
+    /// And the converted-occupancy formula this replaced really did break
+    /// it: for a 44.1 kHz client there are fill levels where it leaves avail
+    /// positive while `write` accepts nothing. This pins the bug so the
+    /// derivation cannot quietly drift back to it.
+    #[test]
+    fn converting_the_occupancy_on_its_own_left_avail_positive_with_nothing_accepted() {
+        let frame = 4usize;
+        let buffer_link = 16384 * frame;
+        let fin = 44100;
+        let buffer = link_to_client_bytes(buffer_link, fin, LINK_RATE, frame);
+        let mut broken_levels = 0;
+        for exposed_frames in 0..=16384usize {
+            let exposed = exposed_frames * frame;
+            let old_queued = link_to_client_bytes(exposed, fin, LINK_RATE, frame);
+            let old_avail = buffer.saturating_sub(old_queued);
+            let accept =
+                accept_client_frames((buffer_link - exposed) / frame, fin, LINK_RATE) * frame;
+            if old_avail > 0 && accept == 0 {
+                broken_levels += 1;
+            }
+        }
+        assert!(
+            broken_levels > 0,
+            "the old formula should have had a zero-accept level with avail > 0"
+        );
+    }
+
+    /// Queued as the client sees it never runs backwards as the ring fills,
+    /// and never exceeds the buffer (avail would wrap to ~boundary).
+    #[test]
+    fn client_queued_is_monotonic_and_bounded_by_the_buffer() {
+        let frame = 4usize;
+        let buffer_link = 16384 * frame;
+        for &fin in &CLIENT_RATES {
+            let buffer = link_to_client_bytes(buffer_link, fin, LINK_RATE, frame);
+            let mut last = 0usize;
+            for exposed_frames in 0..=16384usize {
+                let q =
+                    client_queued_bytes(buffer_link, exposed_frames * frame, fin, LINK_RATE, frame);
+                assert!(q >= last, "{} Hz: queued went {} -> {}", fin, last, q);
+                assert!(q <= buffer, "{} Hz: queued {} > buffer {}", fin, q, buffer);
+                last = q;
+            }
+            // An empty ring is reported as (nearly) empty: only the slack.
+            let empty = client_queued_bytes(buffer_link, 0, fin, LINK_RATE, frame);
+            assert!(
+                empty <= (SRC_SLACK_FRAMES + 2) * frame * 4,
+                "{} Hz: empty ring queued {}",
+                fin,
+                empty
+            );
         }
     }
 
@@ -2942,7 +3078,7 @@ impl AudioScheme for HdaDevice {
     fn queued_bytes(&self) -> usize {
         let mut inner = self.inner.lock();
         inner.poll_progress();
-        inner.to_client_bytes(inner.exposed_queued())
+        inner.client_queued_bytes()
     }
 
     fn delay_bytes(&self) -> usize {

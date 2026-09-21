@@ -72,8 +72,15 @@ HDA controller (PCI 04:03) ── codec ── pin ── HDMI/DP or analog jack
   numbers the front ends see (free, queued, delay, buffer) and the write
   itself cross into client frames, through `accept_client_frames` /
   `link_to_client_bytes` / `client_to_link_bytes`. `free_bytes` reports
-  exactly what `write` will accept, so a client that just saw room is never
-  answered with 0 (the EAGAIN-after-avail that aborts PulseAudio). A client
+  exactly what `write` will accept, and `queued_bytes` is derived from that
+  same figure (`client_queued_bytes`: `buffer - accept`), so the ALSA node's
+  own `avail = buffer_size - queued` equals what `write` takes at every fill
+  level of the ring. That identity is what keeps PulseAudio alive: its
+  `alsa-sink.c` aborts if a write it was just told had room returns 0
+  (`try_recover`'s EAGAIN assert). Converting `queued` independently broke
+  it near a full ring by one to four frames, and the daemon died within
+  seconds of the converter engaging; the unit tests now check the identity
+  at every fill level and pin the old formula as broken. A client
   at 48 kHz takes the pre-existing path byte for byte, so with the daemon's
   sink fixed at 48 kHz (below) the converter is dormant; it engages when a
   front end negotiates another rate. `/proc/gpusnd` shows `client=.. Hz
@@ -214,20 +221,25 @@ cannot loop the last fragment. `module-suspend-on-idle` is deliberately NOT
 loaded: a suspended sink was not being resumed when a new stream attached
 (the resume runs in the sink IO thread), so every later play went silent.
 The sink stays IDLE with the PCM open instead.
-- **Fixed sink rate.** `daemon.conf` sets `default-sample-rate = 48000` with
-  no `alternate-sample-rate`, so the daemon holds the sink -- and the HDA
-  link -- at 48 kHz for every stream and resamples 44.1 kHz material itself,
-  rather than following each stream's rate. Following it reprograms the HDA
-  stream on a rate change, which on an HDMI/DP sink is a re-lock mute, so a
-  44.1 kHz track after a 48 kHz one dropped its first fraction of a second.
-  The resampler is `speex-float-5` (up from the shipped `speex-float-1` and an
-  interim `-3`): since every non-48k stream is resampled (most music is
-  44.1 kHz), the resampler quality is the audible lever, and `-5` is speex's
-  high-quality tier -- flat passband to ~20 kHz, inaudible stopband -- for a
-  few % of one core. Dial toward `-7`/`-10` or `soxr-hq` (with libsoxr) for
-  more, back to `-1` only if the daemon starts arriving late. The kernel's own
-  `pipeline::src` will later take this over so PulseAudio is out of the
-  resampling entirely.
+- **The kernel resamples, not the daemon.** `daemon.conf` sets
+  `avoid-resampling = yes` with `default-sample-rate = 48000` and no
+  `alternate-sample-rate`. The kernel is a fixed-rate sink (see the
+  processing components above): the HDA link always runs at 48 kHz, `hw:0,0`
+  accepts any client rate and converts it into the ring with `pipeline::src`
+  (~-90 dB), and a rate change is a soft prepare that never restarts the
+  stream, so it never re-locks an HDMI/DP sink. `avoid-resampling` therefore
+  hands a lone stream to the sink at its native rate -- 44.1 kHz for most
+  music -- instead of resampling it in userspace with speex; the daemon only
+  resamples when two streams at different rates play at once, to
+  `default-sample-rate`. `alternate-sample-rate` stays unset: that is the
+  old way of following a rate, by reprogramming the link, which is exactly
+  the re-lock mute this avoids. The daemon's own resampler, for the
+  two-streams case, is `speex-float-5` (speex's high-quality tier). To fall
+  back to the daemon resampling everything, `avoid-resampling = no` is the
+  one line: the kernel side is then passthrough, byte-identical to before.
+  What to look at in `/proc/gpusnd` with a 44.1 kHz track playing: the
+  `ring:` line reads `client=44100 Hz src=resampling`, and switching tracks
+  bumps `soft prepares`, not `stream restarts`.
 - A bare `mpg123 file.mp3` reaches the daemon because `/dev/dsp` refuses it.
   mpg123 1.3x has no config file at all, so with no `-o` libout123 walks its
   built-in driver list and takes the first module that both loads AND opens --

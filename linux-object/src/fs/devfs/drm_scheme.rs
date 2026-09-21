@@ -207,8 +207,7 @@ impl DrmDev {
         if !zcore_drivers::display::nouveau_uapi_enabled() {
             return;
         }
-        let timeline = cmd == DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT
-            || cmd == DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DEADLINE;
+        let timeline = is_syncobj_timeline_wait(cmd);
         // Deadline-sized ioctls carry a trailing hint we never read; the
         // prefix matches the classic structs.
         let prefix = if timeline {
@@ -402,33 +401,12 @@ impl DrmDev {
         if req.flags & DRM_MODE_ATOMIC_TEST_ONLY != 0 {
             return None;
         }
-        if req.count_objs == 0 || req.count_objs > 64 || req.count_props_ptr == 0 {
-            return None;
-        }
-        ucheck_n::<u32>(req.count_props_ptr as usize, req.count_objs as usize).ok()?;
-        let mut prop_idx = 0usize;
         let mut fd: Option<i32> = None;
-        for i in 0..req.count_objs as usize {
-            let count_props = unsafe { *(req.count_props_ptr as *const u32).add(i) };
-            if count_props > 64 {
-                return None;
-            }
-            if count_props > 0 && (req.props_ptr == 0 || req.prop_values_ptr == 0) {
-                return None;
-            }
-            let span = prop_idx + count_props as usize;
-            ucheck_n::<u32>(req.props_ptr as usize, span).ok()?;
-            ucheck_n::<u64>(req.prop_values_ptr as usize, span).ok()?;
-            for _ in 0..count_props {
-                let prop_id = unsafe { *(req.props_ptr as *const u32).add(prop_idx) };
-                let value = unsafe { *(req.prop_values_ptr as *const u64).add(prop_idx) };
-                prop_idx += 1;
-                // Last one wins, matching the sync arm's staging.
-                if prop_id == PROP_IN_FENCE_FD && (value as i32) >= 0 {
-                    fd = Some(value as i32);
-                }
-            }
-        }
+        walk_atomic_props(&req, |_obj_id, prop_id, value| {
+            fold_in_fence(&mut fd, prop_id, value);
+            Ok(())
+        })
+        .ok()?;
         let fd = fd?;
         let thread = kernel_hal::thread::get_current_thread()?
             .downcast::<Thread>()
@@ -452,7 +430,7 @@ impl DrmDev {
         // `mmap()` rejects a non-page-aligned offset with EINVAL *before* the
         // syscall, so the cookie must be page-aligned; recover the handle by
         // shifting it back down.
-        let handle_id = (offset >> 12) as u32;
+        let handle_id = handle_from_mmap_cookie(offset);
         let _ = len;
         if let Some(vmo) = drm::handle_vmo(handle_id) {
             // The dumb buffer's OWN (contiguous, cached) VMO: the mapping keeps
@@ -1096,7 +1074,7 @@ impl DrmDev {
                 // subsequent mmap of the dumb buffer passes this back as the file
                 // offset; musl's `mmap()` rejects a non-page-aligned offset with
                 // EINVAL, and `get_vmo()` shifts it back to the handle id.
-                map.offset = (map.handle as u64) << 12;
+                map.offset = mmap_cookie_for(map.handle);
                 Ok(0)
             }
             DRM_IOCTL_MODE_DESTROY_DUMB => {
@@ -1903,8 +1881,8 @@ impl DrmDev {
             DRM_IOCTL_MODE_GETPROPBLOB => {
                 let res = unsafe { &mut *(data as *mut DrmModeGetBlob) };
                 // Property-blob store first (user MODE_ID blobs, the kernel's
-                // current-mode blob); EDID blobs keep their reserved
-                // 20000+connector ids.
+                // current-mode blob); EDID blobs keep their own reserved range
+                // of ids below it (see `edid_blob_id`).
                 if let Some(blob) = drm::get_blob(res.blob_id) {
                     if res.data != 0 && res.length >= blob.len() as u32 {
                         ucheck(res.data as usize, blob.len())?;
@@ -1919,7 +1897,7 @@ impl DrmDev {
                     res.length = blob.len() as u32;
                     return Ok(0);
                 }
-                let connector_id = res.blob_id.checked_sub(20000);
+                let connector_id = connector_of_edid_blob(res.blob_id);
                 if let Some(conn_id) = connector_id {
                     if let Some(edid) = drm::get_connector_edid(conn_id) {
                         if res.data != 0 && res.length >= edid.len() as u32 {
@@ -1996,46 +1974,21 @@ impl DrmDev {
                     // Empty commit: no objects, no events (Linux allows it).
                     return Ok(0);
                 }
-                // The pipeline has 3 objects x <=16 properties; bound the
-                // user-array walk well above that.
-                if req.count_objs > 64 || req.objs_ptr == 0 || req.count_props_ptr == 0 {
-                    return Err(FsError::InvalidParam);
-                }
-                ucheck_n::<u32>(req.objs_ptr as usize, req.count_objs as usize)?;
-                ucheck_n::<u32>(req.count_props_ptr as usize, req.count_objs as usize)?;
                 let mut upd = drm::AtomicUpdate::default();
-                let mut prop_idx = 0usize;
-                for i in 0..req.count_objs as usize {
-                    let obj_id = unsafe { *(req.objs_ptr as *const u32).add(i) };
-                    let count_props = unsafe { *(req.count_props_ptr as *const u32).add(i) };
-                    if count_props > 64 {
-                        return Err(FsError::InvalidParam);
-                    }
-                    if count_props > 0 && (req.props_ptr == 0 || req.prop_values_ptr == 0) {
-                        return Err(FsError::InvalidParam);
-                    }
-                    // The property arrays are shared across objects and indexed
-                    // by the running `prop_idx`; check the span this object
-                    // will consume before touching it.
-                    let span = prop_idx + count_props as usize;
-                    ucheck_n::<u32>(req.props_ptr as usize, span)?;
-                    ucheck_n::<u64>(req.prop_values_ptr as usize, span)?;
-                    for _ in 0..count_props {
-                        let prop_id = unsafe { *(req.props_ptr as *const u32).add(prop_idx) };
-                        let value = unsafe { *(req.prop_values_ptr as *const u64).add(prop_idx) };
-                        prop_idx += 1;
-                        // [swapchain-diag] error!-visible at LOG=error: a wlroots
-                        // "Swapchain failed test" can be an unknown/immutable prop
-                        // rejected here, not just an atomic_commit check.
-                        if let Err(e) = atomic_stage(&mut upd, obj_id, prop_id, value) {
-                            log::error!(
-                                "[drm] ATOMIC stage rejected: obj={:#x} prop={:#x} value={:#x} -> {:?}",
-                                obj_id, prop_id, value, e
-                            );
-                            return Err(e);
-                        }
-                    }
-                }
+                walk_atomic_props(req, |obj_id, prop_id, value| {
+                    // [swapchain-diag] error!-visible at LOG=error: a wlroots
+                    // "Swapchain failed test" can be an unknown/immutable prop
+                    // rejected here, not just an atomic_commit check.
+                    atomic_stage(&mut upd, obj_id, prop_id, value).inspect_err(|e| {
+                        log::error!(
+                            "[drm] ATOMIC stage rejected: obj={:#x} prop={:#x} value={:#x} -> {:?}",
+                            obj_id,
+                            prop_id,
+                            value,
+                            e
+                        );
+                    })
+                })?;
                 log::debug!(
                     "[drm] ATOMIC objs={} test_only={} allow_modeset={} event={} fb={:?} mode_blob={:?} active={:?}",
                     req.count_objs,
@@ -2269,8 +2222,10 @@ impl DrmDev {
                 if !zcore_drivers::display::nouveau_uapi_enabled() {
                     return Err(FsError::OpNotSupported);
                 }
-                let timeline = cmd == DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT
-                    || cmd == DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DEADLINE;
+                // One rule for "is this the timeline wait", shared with the
+                // async sleeper that runs before this arm, so the two cannot
+                // read the same request as different structs.
+                let timeline = is_syncobj_timeline_wait(cmd);
                 // Both structs share this prefix layout, so a single path
                 // can read the common fields regardless of which ioctl.
                 let (handles_ptr, points_ptr, timeout_nsec, count_handles, flags) = if timeline {
@@ -2578,12 +2533,28 @@ fn present_failed(
 /// (classic + deadline-sized). Used by `sys_ioctl` to run
 /// [`DrmDev::syncobj_wait_sleep`] before `io_control`.
 pub fn is_syncobj_wait_ioctl(cmd: u32) -> bool {
-    matches!(
+    is_drm_ioctl_nr(cmd, NR_SYNCOBJ_WAIT, core::mem::size_of::<DrmSyncobjWait>())
+        || is_syncobj_timeline_wait(cmd)
+}
+
+/// ioctl NUMBERs of the two syncobj waits. Both structs grew a trailing
+/// `deadline_nsec` in 2023 and nothing says they will not grow again, so
+/// everything that has to recognise them matches on the number with a size
+/// floor -- never on the whole 32-bit command, which carries the size. Pinning
+/// to the sizes of the day is what silently dropped NVK's CPU_WAIT probe on
+/// real hardware; see the note beside `DRM_IOCTL_SYNCOBJ_WAIT_DEADLINE`.
+const NR_SYNCOBJ_WAIT: u32 = 0xC3;
+/// See [`NR_SYNCOBJ_WAIT`].
+const NR_SYNCOBJ_TIMELINE_WAIT: u32 = 0xCA;
+
+/// Whether `cmd` is the timeline wait rather than the classic one. The two
+/// carry different structs, so this decides which one the async sleeper reads,
+/// and it has to answer the same way the dispatcher does.
+fn is_syncobj_timeline_wait(cmd: u32) -> bool {
+    is_drm_ioctl_nr(
         cmd,
-        DRM_IOCTL_SYNCOBJ_WAIT
-            | DRM_IOCTL_SYNCOBJ_WAIT_DEADLINE
-            | DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT
-            | DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DEADLINE
+        NR_SYNCOBJ_TIMELINE_WAIT,
+        core::mem::size_of::<DrmSyncobjTimelineWait>(),
     )
 }
 
@@ -2971,6 +2942,58 @@ struct DrmEclipseCompute {
 
 fn drm_node_name(minor: u32) -> alloc::string::String {
     drm::node_name(minor)
+}
+
+/// First id of the range reserved for EDID blobs, one per connector.
+///
+/// A connector's EDID is served through `GETPROPBLOB` like any other property
+/// blob, but it is not in the blob store: it comes from the driver on demand.
+/// So it gets a reserved slice of the same id space, below the ids
+/// `CREATEPROPBLOB` hands out ([`drm::BLOB_ID_BASE`]).
+const EDID_BLOB_BASE: u32 = 20_000;
+
+/// The reserved range has to end before the blob store's ids begin, or a
+/// user blob and a connector's EDID would answer to the same id and
+/// `GETPROPBLOB` -- which tries the store first -- would hide the EDID.
+const _: () = assert!(EDID_BLOB_BASE < drm::BLOB_ID_BASE);
+
+/// The blob id that serves `connector_id`'s EDID, and its inverse. The two
+/// ends are far apart -- `connector_props` advertises the id, `GETPROPBLOB`
+/// resolves it -- so they are one pair of functions.
+fn edid_blob_id(connector_id: u32) -> u32 {
+    EDID_BLOB_BASE + connector_id
+}
+
+/// See [`edid_blob_id`]. `None` for an id outside the reserved range, which
+/// includes every id the blob store can hand out.
+fn connector_of_edid_blob(blob_id: u32) -> Option<u32> {
+    if blob_id >= drm::BLOB_ID_BASE {
+        return None;
+    }
+    blob_id.checked_sub(EDID_BLOB_BASE)
+}
+
+/// The fake, page-aligned mmap offset `DRM_IOCTL_MODE_MAP_DUMB` hands back for
+/// a GEM handle, and its inverse.
+///
+/// There is no real file offset behind a GEM buffer, so the handle is encoded
+/// in the offset itself. musl's `mmap()` refuses a non-page-aligned offset
+/// before the syscall is even made, which is why the cookie is a page shift
+/// and not the handle itself. Linux does the same thing through the device's
+/// `vma_offset_manager`.
+///
+/// The two ends live far apart -- the ioctl arm that mints the cookie and
+/// `DrmDev::get_vmo`, which is reached from `mmap` -- so they are one pair of
+/// functions rather than a shift written out at each end.
+fn mmap_cookie_for(handle: u32) -> u64 {
+    (handle as u64) << 12
+}
+
+/// See [`mmap_cookie_for`]. Truncates above 32 bits, so an offset beyond the
+/// handle space aliases onto a handle rather than failing; both lookups behind
+/// this check the caller owns what it named, so an alias is not a way in.
+fn handle_from_mmap_cookie(offset: usize) -> u32 {
+    (offset >> 12) as u32
 }
 
 /// `access_ok()` for a nested user pointer an ioctl arm is about to read or
@@ -3603,7 +3626,7 @@ fn connector_props(connector_id: u32, atomic: bool) -> alloc::vec::Vec<(u32, u64
     props.push((PROP_LINK_STATUS, 0));
     props.push((PROP_NON_DESKTOP, 0));
     if drm::get_connector_edid(connector_id).is_some() {
-        props.push((PROP_EDID, (20000 + connector_id) as u64));
+        props.push((PROP_EDID, edid_blob_id(connector_id) as u64));
     }
     if atomic {
         let (st, _) = drm::atomic_snapshot();
@@ -3652,6 +3675,69 @@ fn plane_props(plane: &drm::DrmPlane, atomic: bool) -> alloc::vec::Vec<(u32, u64
         props.push((PROP_FB_DAMAGE_CLIPS, 0));
     }
     props
+}
+
+/// Fold one `(property, value)` of an atomic request into the IN_FENCE_FD the
+/// commit will wait on: the last real fd named. -1 is the "no fence"
+/// sentinel and leaves whatever came before it, which is what
+/// `atomic_stage_on` does with the same property.
+fn fold_in_fence(fd: &mut Option<i32>, prop_id: u32, value: u64) {
+    if prop_id == PROP_IN_FENCE_FD && (value as i32) >= 0 {
+        *fd = Some(value as i32);
+    }
+}
+
+/// Walk the `(object, property, value)` triples of a `DRM_IOCTL_MODE_ATOMIC`
+/// request, with Linux's bounds, and hand each one to `visit`. A failing
+/// `visit` stops the walk and is the walk's error.
+///
+/// There are two readers of these arrays: the sync ioctl arm that stages the
+/// commit, and `DrmDev::atomic_in_fence`, which runs first to find the
+/// IN_FENCE_FD to sleep on. They used to be two copies of this loop, which is
+/// a standing invitation for one to see a property the other does not -- the
+/// commit waiting on a fence it will not stage, or staging one it never
+/// waited on. One walk, so they cannot disagree.
+///
+/// The shape is the uAPI's: `props_ptr`/`prop_values_ptr` are *one* pair of
+/// arrays shared by every object, and `count_props_ptr[i]` says how many of
+/// them object `i` claims, running on from where the previous object stopped.
+/// So each object's span is checked against the user mapping before it is
+/// read, not the array as a whole -- its total length is never stated.
+fn walk_atomic_props(
+    req: &DrmModeAtomic,
+    mut visit: impl FnMut(u32, u32, u64) -> Result<()>,
+) -> Result<()> {
+    if req.count_objs == 0 {
+        return Ok(());
+    }
+    // The pipeline has 3 objects x <=16 properties; bound the user-array walk
+    // well above that.
+    if req.count_objs > 64 || req.objs_ptr == 0 || req.count_props_ptr == 0 {
+        return Err(FsError::InvalidParam);
+    }
+    ucheck_n::<u32>(req.objs_ptr as usize, req.count_objs as usize)?;
+    ucheck_n::<u32>(req.count_props_ptr as usize, req.count_objs as usize)?;
+    let mut prop_idx = 0usize;
+    for i in 0..req.count_objs as usize {
+        let obj_id = unsafe { *(req.objs_ptr as *const u32).add(i) };
+        let count_props = unsafe { *(req.count_props_ptr as *const u32).add(i) };
+        if count_props > 64 {
+            return Err(FsError::InvalidParam);
+        }
+        if count_props > 0 && (req.props_ptr == 0 || req.prop_values_ptr == 0) {
+            return Err(FsError::InvalidParam);
+        }
+        let span = prop_idx + count_props as usize;
+        ucheck_n::<u32>(req.props_ptr as usize, span)?;
+        ucheck_n::<u64>(req.prop_values_ptr as usize, span)?;
+        for _ in 0..count_props {
+            let prop_id = unsafe { *(req.props_ptr as *const u32).add(prop_idx) };
+            let value = unsafe { *(req.prop_values_ptr as *const u64).add(prop_idx) };
+            prop_idx += 1;
+            visit(obj_id, prop_id, value)?;
+        }
+    }
+    Ok(())
 }
 
 /// Which of the three KMS object kinds an atomic request names. Resolving the
@@ -7121,5 +7207,608 @@ mod property_table_tests {
             Ok(()),
         );
         assert_eq!(upd.out_fence_ptr, Some(&slot as *const i32 as u64));
+    }
+}
+
+#[cfg(test)]
+mod atomic_walk_tests {
+    //! The walk over a `DRM_IOCTL_MODE_ATOMIC` request's property arrays.
+    //!
+    //! Its shape is the uAPI's and it is easy to get subtly wrong:
+    //! `props_ptr` and `prop_values_ptr` are **one** pair of arrays shared by
+    //! every object in the request, and `count_props_ptr[i]` says how many of
+    //! them object `i` takes, carrying on from where the previous object
+    //! stopped. Nothing states their total length, so each object's span is
+    //! what gets checked against the user mapping.
+    //!
+    //! Until this walk was pulled out there were two copies of it: the ioctl
+    //! arm that stages the commit, and the fence scan that runs first to find
+    //! the IN_FENCE_FD to sleep on. Two readers of the same arrays is a
+    //! standing invitation for one to see a property the other does not.
+    //!
+    //! One thing here cannot be tested from the host, and it is worth saying
+    //! so rather than leaving someone to wonder: the `access_ok()` on each
+    //! object's span always passes. On libos there is no user/kernel split,
+    //! so `user_range_ok` only refuses a null pointer with bytes to move,
+    //! and that case is already caught by the explicit check above it. Taking
+    //! both span checks out leaves every test here green. What *is* covered
+    //! is the arithmetic that feeds them: the running index, the two counts
+    //! that bound it, and `ucheck_n`'s refusal to wrap.
+
+    use super::*;
+    use alloc::vec::Vec;
+
+    /// Back a request with real arrays. Everything stays alive as long as the
+    /// `Request` does, which is what makes the raw pointers inside it sound.
+    struct Request {
+        objs: Vec<u32>,
+        counts: Vec<u32>,
+        props: Vec<u32>,
+        values: Vec<u64>,
+    }
+
+    impl Request {
+        fn new(objs: &[u32], counts: &[u32], props: &[u32], values: &[u64]) -> Self {
+            Self {
+                objs: objs.to_vec(),
+                counts: counts.to_vec(),
+                props: props.to_vec(),
+                values: values.to_vec(),
+            }
+        }
+
+        fn req(&self) -> DrmModeAtomic {
+            DrmModeAtomic {
+                flags: 0,
+                count_objs: self.objs.len() as u32,
+                objs_ptr: self.objs.as_ptr() as u64,
+                count_props_ptr: self.counts.as_ptr() as u64,
+                props_ptr: self.props.as_ptr() as u64,
+                prop_values_ptr: self.values.as_ptr() as u64,
+                reserved: 0,
+                user_data: 0,
+            }
+        }
+
+        fn visited(&self) -> Result<Vec<(u32, u32, u64)>> {
+            let mut seen = Vec::new();
+            walk_atomic_props(&self.req(), |o, p, v| {
+                seen.push((o, p, v));
+                Ok(())
+            })?;
+            Ok(seen)
+        }
+    }
+
+    #[test]
+    fn a_request_is_visited_object_by_object_in_order() {
+        let r = Request::new(
+            &[4, 1],
+            &[2, 1],
+            &[PROP_FB_ID, PROP_CRTC_ID, PROP_ACTIVE],
+            &[7, 1, 1],
+        );
+        assert_eq!(
+            r.visited().unwrap(),
+            alloc::vec![
+                (4, PROP_FB_ID, 7),
+                (4, PROP_CRTC_ID, 1),
+                (1, PROP_ACTIVE, 1),
+            ],
+        );
+    }
+
+    /// The one that bites. The shared arrays are indexed by a *running*
+    /// counter, not restarted per object: the second object's properties
+    /// begin where the first object's ended. Restarting at 0 would hand
+    /// object 1 object 0's properties -- a commit that looks well-formed and
+    /// programs the wrong thing.
+    #[test]
+    fn the_shared_arrays_run_on_from_one_object_to_the_next() {
+        let r = Request::new(
+            &[4, 1, 2],
+            &[2, 1, 1],
+            &[PROP_SRC_W, PROP_SRC_H, PROP_ACTIVE, PROP_CRTC_ID],
+            &[100, 200, 1, 1],
+        );
+        let seen = r.visited().unwrap();
+        assert_eq!(seen.len(), 4);
+        assert_eq!(
+            seen[2],
+            (1, PROP_ACTIVE, 1),
+            "the CRTC got the plane's properties: the index restarted",
+        );
+        assert_eq!(seen[3], (2, PROP_CRTC_ID, 1));
+    }
+
+    /// An object may name no properties at all, and then it consumes none of
+    /// the shared arrays -- the next object still starts where the last one
+    /// that had properties stopped.
+    #[test]
+    fn an_object_with_no_properties_consumes_none_of_the_shared_arrays() {
+        let r = Request::new(&[4, 1, 2], &[1, 0, 1], &[PROP_FB_ID, PROP_CRTC_ID], &[7, 1]);
+        assert_eq!(
+            r.visited().unwrap(),
+            alloc::vec![(4, PROP_FB_ID, 7), (2, PROP_CRTC_ID, 1)],
+        );
+    }
+
+    #[test]
+    fn an_empty_request_visits_nothing() {
+        let r = Request::new(&[], &[], &[], &[]);
+        assert_eq!(r.visited().unwrap(), Vec::new());
+    }
+
+    /// Both counts are bounded before anything is read. The pipeline has three
+    /// objects with sixteen properties between them; the bound is well above
+    /// that and its job is to keep a hostile request from walking for a long
+    /// time inside the kernel.
+    #[test]
+    fn the_two_counts_are_bounded() {
+        let objs: Vec<u32> = (0..65).collect();
+        let counts: Vec<u32> = alloc::vec![0; 65];
+        let r = Request::new(&objs, &counts, &[], &[]);
+        assert_eq!(r.visited(), Err(FsError::InvalidParam), "65 objects");
+
+        let objs: Vec<u32> = (0..64).collect();
+        let counts: Vec<u32> = alloc::vec![0; 64];
+        let r = Request::new(&objs, &counts, &[], &[]);
+        assert!(r.visited().is_ok(), "64 objects is the last accepted");
+
+        let props: Vec<u32> = alloc::vec![PROP_ACTIVE; 65];
+        let values: Vec<u64> = alloc::vec![0; 65];
+        let r = Request::new(&[1], &[65], &props, &values);
+        assert_eq!(
+            r.visited(),
+            Err(FsError::InvalidParam),
+            "65 properties on one object",
+        );
+        let r = Request::new(&[1], &[64], &props, &values);
+        assert_eq!(
+            r.visited().map(|v| v.len()),
+            Ok(64),
+            "64 on one object is the last accepted",
+        );
+    }
+
+    /// A request that claims properties but hands no array to read them from.
+    /// Claiming none is fine: that is how a client names an object without
+    /// changing anything on it.
+    #[test]
+    fn an_absent_array_is_only_an_error_when_there_is_something_to_read() {
+        let r = Request::new(&[4], &[1], &[PROP_FB_ID], &[7]);
+
+        let mut req = r.req();
+        req.props_ptr = 0;
+        assert_eq!(
+            walk_atomic_props(&req, |_, _, _| Ok(())),
+            Err(FsError::InvalidParam),
+        );
+
+        let mut req = r.req();
+        req.prop_values_ptr = 0;
+        assert_eq!(
+            walk_atomic_props(&req, |_, _, _| Ok(())),
+            Err(FsError::InvalidParam),
+        );
+
+        // Same request with nothing claimed: the arrays are never touched.
+        let empty = Request::new(&[4], &[0], &[], &[]);
+        let mut req = empty.req();
+        req.props_ptr = 0;
+        req.prop_values_ptr = 0;
+        assert_eq!(walk_atomic_props(&req, |_, _, _| Ok(())), Ok(()));
+
+        // The object list itself is not optional.
+        let mut req = r.req();
+        req.objs_ptr = 0;
+        assert_eq!(
+            walk_atomic_props(&req, |_, _, _| Ok(())),
+            Err(FsError::InvalidParam),
+        );
+        let mut req = r.req();
+        req.count_props_ptr = 0;
+        assert_eq!(
+            walk_atomic_props(&req, |_, _, _| Ok(())),
+            Err(FsError::InvalidParam),
+        );
+    }
+
+    /// A property the pipeline refuses stops the commit there and then. The
+    /// walk must not carry on staging the rest: a partly-applied atomic commit
+    /// is the one thing the atomic uAPI promises cannot happen.
+    #[test]
+    fn a_refused_property_stops_the_walk_where_it_failed() {
+        // One object claiming three properties, the middle one immutable.
+        let r = Request::new(
+            &[4],
+            &[3],
+            &[PROP_FB_ID, PROP_TYPE, PROP_CRTC_ID],
+            &[7, 1, 1],
+        );
+        let mut seen = Vec::new();
+        let got = walk_atomic_props(&r.req(), |o, p, v| {
+            seen.push((o, p, v));
+            // `type` is immutable, exactly as `atomic_stage_on` says.
+            if p == PROP_TYPE {
+                return Err(FsError::InvalidParam);
+            }
+            Ok(())
+        });
+        assert_eq!(got, Err(FsError::InvalidParam));
+        assert_eq!(seen.len(), 2, "the third property was read anyway");
+    }
+
+    /// The reason the walk is shared. The fence scan runs before the commit
+    /// and picks the IN_FENCE_FD to sleep on; the commit then stages it. When
+    /// a request names the property twice, both have to land on the same one,
+    /// or the commit sleeps on a fence it will not use.
+    #[test]
+    fn the_fence_scan_and_the_staging_pick_the_same_in_fence() {
+        // Both readings of the same request: `atomic_in_fence`'s fold, and
+        // what the ioctl arm ends up staging.
+        let both = |values: &[u64]| -> (Option<i32>, Option<i32>) {
+            let props = alloc::vec![PROP_IN_FENCE_FD; values.len()];
+            let counts = alloc::vec![1u32; values.len()];
+            let objs = alloc::vec![4u32; values.len()];
+            let r = Request::new(&objs, &counts, &props, values);
+
+            let mut fd: Option<i32> = None;
+            walk_atomic_props(&r.req(), |_, prop_id, value| {
+                fold_in_fence(&mut fd, prop_id, value);
+                Ok(())
+            })
+            .unwrap();
+
+            let mut upd = drm::AtomicUpdate::default();
+            walk_atomic_props(&r.req(), |_, prop_id, value| {
+                atomic_stage_on(&mut upd, AtomicObject::Plane, prop_id, value)
+            })
+            .unwrap();
+            (fd, upd.in_fence_fd)
+        };
+
+        for (values, want) in [
+            (alloc::vec![3u64, 9], Some(9)),            // last one wins
+            (alloc::vec![3u64, -1i64 as u64], Some(3)), // the sentinel keeps it
+            (alloc::vec![0u64], Some(0)),               // fd 0 is a real fd
+            (alloc::vec![-1i64 as u64], None),          // only the sentinel
+        ] {
+            let (scanned, staged) = both(&values);
+            assert_eq!(scanned, want, "the fence scan read {:?} wrong", values);
+            assert_eq!(
+                staged, scanned,
+                "the commit stages a different fence than it sleeps on",
+            );
+        }
+    }
+
+    /// `ucheck_n` multiplies a userspace count by a struct size. The bounds
+    /// above keep that far from overflowing, but the helper is the guard for
+    /// every nested array in this file, and some of those counts are not
+    /// bounded at all.
+    #[test]
+    fn a_count_that_overflows_its_byte_size_is_refused_not_wrapped() {
+        let buf = [0u64; 4];
+        let addr = buf.as_ptr() as usize;
+        assert_eq!(ucheck_n::<u64>(addr, 4), Ok(()));
+        // 2^61 u64s is 2^64 bytes: wrapping would make this a zero-length
+        // range, which `user_range_ok` waves through.
+        assert_eq!(
+            ucheck_n::<u64>(addr, 1usize << 61),
+            Err(FsError::InvalidParam),
+        );
+        assert_eq!(
+            ucheck_n::<u64>(addr, usize::MAX),
+            Err(FsError::InvalidParam)
+        );
+        // A zero-length range is fine from anywhere, a non-empty one is not
+        // from a null pointer.
+        assert_eq!(ucheck(0, 0), Ok(()));
+        assert_eq!(ucheck(0, 1), Err(FsError::BadAddress));
+    }
+
+    /// The walk's own bounds are what keep the multiply above out of reach:
+    /// 64 objects x 64 properties x 8 bytes is nowhere near `usize`.
+    #[test]
+    fn the_walks_bounds_keep_the_span_far_from_overflowing() {
+        let widest = 64usize * 64 * core::mem::size_of::<u64>();
+        assert!(widest < 1 << 20, "the span a request can ask for grew");
+    }
+}
+
+#[cfg(test)]
+mod syncobj_wait_routing_tests {
+    //! Which commands take the async sleep path, and the mmap cookie.
+    //!
+    //! `sys_ioctl` asks `is_syncobj_wait_ioctl` whether to park the caller
+    //! before running the sync arm. When it says no, the sync arm spin-polls
+    //! the whole timeout and pegs a core -- the starvation `WAIT_VBLANK` used
+    //! to cause. So this router has to recognise every wait the dispatcher
+    //! will accept, and the dispatcher resolves ioctls by NUMBER.
+    //!
+    //! It used to match four exact 32-bit commands instead, which carry the
+    //! struct size. Both wait structs already grew once (the 2023
+    //! `deadline_nsec`), and the next libdrm to append a field would have sent
+    //! a command the dispatcher handles and this router does not: the wait
+    //! would have worked, at the cost of a core spinning for its whole
+    //! timeout, with nothing in any log to say why.
+    //!
+    //! What is *not* covered, so nobody reads more into these than is there:
+    //! the two places that ask `is_syncobj_timeline_wait` which struct to read
+    //! -- the async sleeper and the dispatch arm -- both need a live device
+    //! and `nouveau_uapi_enabled()`, so inverting either one's answer leaves
+    //! this module green. What the tests pin is the rule itself, and that both
+    //! callers now ask the same one instead of spelling it out twice.
+
+    use super::*;
+
+    fn wait_cmd(nr: u32, size: usize) -> u32 {
+        drm_iowr_core(nr, size)
+    }
+
+    const CLASSIC: usize = core::mem::size_of::<DrmSyncobjWait>();
+    const TIMELINE: usize = core::mem::size_of::<DrmSyncobjTimelineWait>();
+
+    /// The two sizes in the wild today, named so a change to either is loud.
+    #[test]
+    fn the_two_sizes_libdrm_sends_today_are_both_waits() {
+        for cmd in [
+            DRM_IOCTL_SYNCOBJ_WAIT,
+            DRM_IOCTL_SYNCOBJ_WAIT_DEADLINE,
+            DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT,
+            DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DEADLINE,
+        ] {
+            assert!(
+                is_syncobj_wait_ioctl(cmd),
+                "{:#x} is a wait and must take the async path",
+                cmd,
+            );
+        }
+        assert_eq!(CLASSIC, 32, "drm_syncobj_wait grew");
+        assert_eq!(TIMELINE, 40, "drm_syncobj_timeline_wait grew");
+    }
+
+    /// The one that was broken. A struct that grows again keeps working
+    /// through the dispatcher, which matches on the number, so the router has
+    /// to follow it there.
+    #[test]
+    fn a_struct_that_grows_again_is_still_a_wait() {
+        for extra in [8, 16, 24, 64, 1000] {
+            let classic = wait_cmd(NR_SYNCOBJ_WAIT, CLASSIC + extra);
+            assert!(
+                is_syncobj_wait_ioctl(classic),
+                "a {}-byte drm_syncobj_wait stopped being a wait",
+                CLASSIC + extra,
+            );
+            assert!(!is_syncobj_timeline_wait(classic), "and it is not timeline");
+
+            let timeline = wait_cmd(NR_SYNCOBJ_TIMELINE_WAIT, TIMELINE + extra);
+            assert!(
+                is_syncobj_wait_ioctl(timeline),
+                "a {}-byte drm_syncobj_timeline_wait stopped being a wait",
+                TIMELINE + extra,
+            );
+            assert!(is_syncobj_timeline_wait(timeline));
+        }
+    }
+
+    /// The floor is the async path's own requirement, not the dispatcher's.
+    /// The sleeper reads the struct **in place** in user memory, so it can
+    /// only run once the client has actually sent a whole one; a short request
+    /// still reaches the sync arm, which copies it into a zero-filled kernel
+    /// buffer and is safe with it. Saying so here because the asymmetry looks
+    /// like an oversight otherwise.
+    #[test]
+    fn a_request_too_short_to_read_in_place_is_left_to_the_sync_arm() {
+        for size in [0, 1, CLASSIC - 1] {
+            assert!(!is_syncobj_wait_ioctl(wait_cmd(NR_SYNCOBJ_WAIT, size)));
+        }
+        assert!(is_syncobj_wait_ioctl(wait_cmd(NR_SYNCOBJ_WAIT, CLASSIC)));
+
+        for size in [0, CLASSIC, TIMELINE - 1] {
+            assert!(!is_syncobj_timeline_wait(wait_cmd(
+                NR_SYNCOBJ_TIMELINE_WAIT,
+                size
+            )));
+        }
+        assert!(is_syncobj_timeline_wait(wait_cmd(
+            NR_SYNCOBJ_TIMELINE_WAIT,
+            TIMELINE
+        )));
+    }
+
+    /// The NUMBER decides which struct the sleeper reads, and it must decide
+    /// it the same way the dispatch arm does. Reading a timeline request as a
+    /// classic one takes `count_handles` and `flags` from the wrong offsets.
+    #[test]
+    fn the_number_decides_the_struct_not_the_size() {
+        // A timeline-sized classic wait is still classic.
+        let odd = wait_cmd(NR_SYNCOBJ_WAIT, TIMELINE);
+        assert!(is_syncobj_wait_ioctl(odd));
+        assert!(!is_syncobj_timeline_wait(odd));
+        // And the canonical commands the dispatch arm sees agree.
+        assert!(!is_syncobj_timeline_wait(DRM_IOCTL_SYNCOBJ_WAIT));
+        assert!(is_syncobj_timeline_wait(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT));
+        assert!(!is_syncobj_timeline_wait(DRM_IOCTL_SYNCOBJ_WAIT_DEADLINE));
+        assert!(is_syncobj_timeline_wait(
+            DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DEADLINE
+        ));
+    }
+
+    /// Everything else stays off the sleep path. The neighbouring syncobj
+    /// numbers are the ones that would hurt: RESET and SIGNAL carry a
+    /// different struct entirely, and parking on one would read it wrong.
+    #[test]
+    fn nothing_but_the_two_waits_takes_the_sleep_path() {
+        for cmd in [
+            DRM_IOCTL_SYNCOBJ_CREATE,
+            DRM_IOCTL_SYNCOBJ_DESTROY,
+            DRM_IOCTL_SYNCOBJ_RESET,
+            DRM_IOCTL_SYNCOBJ_SIGNAL,
+            DRM_IOCTL_SYNCOBJ_QUERY,
+            DRM_IOCTL_SYNCOBJ_TRANSFER,
+            DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL,
+        ] {
+            assert!(!is_syncobj_wait_ioctl(cmd), "{:#x} is not a wait", cmd);
+        }
+        // And the type byte still has to be DRM's, whatever the number says.
+        let not_drm = (3u32 << 30) | (0x65 << 8) | NR_SYNCOBJ_WAIT | ((CLASSIC as u32) << 16);
+        assert!(!is_syncobj_wait_ioctl(not_drm));
+    }
+
+    /// `MAP_DUMB` hands userspace `handle << 12` as a fake file offset and
+    /// `get_vmo` shifts it back. The two live far apart in this file and are
+    /// the only thing standing between a client's `mmap()` and the right
+    /// buffer, so pin the round trip.
+    #[test]
+    fn the_mmap_cookie_round_trips_for_every_handle() {
+        for handle in [1u32, 2, 0xFF, 0x1234, 0x000F_FFFF, 0x8000_0000, u32::MAX] {
+            let offset = mmap_cookie_for(handle);
+            assert_eq!(
+                offset & 0xFFF,
+                0,
+                "musl rejects a non-page-aligned mmap offset before the syscall",
+            );
+            assert_eq!(
+                handle_from_mmap_cookie(offset as usize),
+                handle,
+                "handle {} does not survive the cookie",
+                handle,
+            );
+        }
+    }
+
+    /// And the limit of that encoding, written down rather than discovered.
+    /// The decode truncates to 32 bits, so offsets above `u32::MAX << 12`
+    /// alias onto a handle. It is not a way in -- both lookups behind it check
+    /// the caller owns the handle -- but it is a surprise worth naming.
+    #[test]
+    fn an_offset_above_the_handle_space_aliases_rather_than_failing() {
+        let aliased = ((1u64 << 32) | 5) << 12;
+        assert_eq!(handle_from_mmap_cookie(aliased as usize), 5);
+    }
+}
+
+#[cfg(test)]
+mod blob_id_space_tests {
+    //! The property-blob id space, which has three tenants and no referee.
+    //!
+    //! `GETPROPBLOB` takes an id and nothing else -- libdrm identifies a blob
+    //! purely by id -- and resolves it against the blob store first, then the
+    //! range reserved for connector EDIDs. The synthetic KMS objects and the
+    //! framebuffers number from 1 upwards in the same space.
+    //!
+    //! Until now the only thing keeping the three apart was a comment and the
+    //! literal `20000` written out at both ends of the EDID encoding, in two
+    //! files. Now the bases are named, the encoding is one pair of functions,
+    //! and the gap between them is a compile-time assertion.
+
+    use super::*;
+
+    #[test]
+    fn an_edid_blob_id_round_trips_for_every_connector() {
+        for connector in [0u32, 1, 2, 3, 16, 255, 4096] {
+            let id = edid_blob_id(connector);
+            assert_eq!(
+                connector_of_edid_blob(id),
+                Some(connector),
+                "connector {} does not survive its blob id",
+                connector,
+            );
+        }
+    }
+
+    /// The store's ids and the EDID range must not meet. They do not today by
+    /// a margin of ten thousand, and that margin is the number of connectors
+    /// the encoding can name -- far more than a machine has, but write it
+    /// down, because the failure would be a connector's EDID silently shadowed
+    /// by somebody's MODE_ID blob.
+    #[test]
+    fn the_edid_range_ends_before_the_blob_store_begins() {
+        // The gap itself is a `const _: () = assert!(...)` beside the
+        // constant, so it is a build error rather than a test failure. What is
+        // left here is that the decoder honours it.
+        let last = drm::BLOB_ID_BASE - EDID_BLOB_BASE - 1;
+        assert_eq!(connector_of_edid_blob(edid_blob_id(last)), Some(last));
+        // One past the end belongs to the store, not to a connector.
+        assert_eq!(connector_of_edid_blob(drm::BLOB_ID_BASE), None);
+        assert_eq!(connector_of_edid_blob(drm::BLOB_ID_BASE + 1), None);
+        assert_eq!(connector_of_edid_blob(u32::MAX), None);
+    }
+
+    /// And nothing below the range is an EDID either: the synthetic KMS object
+    /// ids and the framebuffer ids live down there.
+    #[test]
+    fn the_low_ids_belong_to_objects_and_framebuffers() {
+        for id in [
+            0,
+            drm::SYNTH_CRTC_ID,
+            drm::SYNTH_ENCODER_ID,
+            drm::SYNTH_PLANE_ID,
+            1000,
+            EDID_BLOB_BASE - 1,
+        ] {
+            assert_eq!(
+                connector_of_edid_blob(id),
+                None,
+                "id {} is not an EDID blob",
+                id,
+            );
+        }
+        assert_eq!(connector_of_edid_blob(EDID_BLOB_BASE), Some(0));
+    }
+
+    /// Ids the store hands out are unique, land where they are supposed to,
+    /// and keep landing there after a destroy -- an id is never reused, which
+    /// is what stops a client that freed a blob from reading a later one
+    /// through the same number.
+    #[test]
+    fn the_store_numbers_its_blobs_above_the_reserved_range_and_never_reuses_one() {
+        let _serialised = drm::test_globals::lock();
+        let a = drm::create_blob(alloc::vec![1u8, 2, 3], true);
+        let b = drm::create_blob(alloc::vec![4u8], true);
+        assert!(
+            a >= drm::BLOB_ID_BASE,
+            "blob {} is inside the EDID range",
+            a
+        );
+        assert!(b > a, "ids must not repeat");
+        assert_eq!(drm::get_blob(a).as_deref(), Some(&[1u8, 2, 3][..]));
+
+        assert!(matches!(drm::destroy_blob(a), drm::BlobDestroy::Destroyed));
+        assert_eq!(drm::get_blob(a), None);
+        let c = drm::create_blob(alloc::vec![5u8], true);
+        assert!(c > b, "a freed id came back: {} after {}", c, b);
+
+        assert!(matches!(drm::destroy_blob(b), drm::BlobDestroy::Destroyed));
+        assert!(matches!(drm::destroy_blob(c), drm::BlobDestroy::Destroyed));
+    }
+
+    /// Linux splits `DESTROYPROPBLOB`'s refusals: ENOENT for an id that names
+    /// nothing, EPERM for a blob the caller did not create. The kernel's own
+    /// current-mode blob is the second case, and a client that could free it
+    /// would take `MODE_ID` readback down with it.
+    #[test]
+    fn only_the_creator_may_destroy_a_blob() {
+        let _serialised = drm::test_globals::lock();
+        let kernel = drm::create_blob(alloc::vec![0u8; 68], false);
+        assert!(
+            matches!(drm::destroy_blob(kernel), drm::BlobDestroy::KernelOwned),
+            "a kernel-owned blob must answer EPERM, not vanish",
+        );
+        assert!(
+            drm::get_blob(kernel).is_some(),
+            "and it must still be there afterwards",
+        );
+
+        assert!(matches!(
+            drm::destroy_blob(drm::BLOB_ID_BASE - 1),
+            drm::BlobDestroy::NotFound
+        ));
+        assert!(matches!(
+            drm::destroy_blob(edid_blob_id(2)),
+            drm::BlobDestroy::NotFound
+        ));
     }
 }
