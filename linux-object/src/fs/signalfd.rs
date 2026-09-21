@@ -151,9 +151,26 @@ mod tests {
     use super::*;
     use async_std::task::block_on;
 
-    /// SIGINT, SIGTERM, SIGCHLD — the three `wl_event_loop_add_signal` takes.
+    /// A `sigset_t` the way userspace builds one, which is also the way the
+    /// rest of the kernel reads one: `sigaddset` sets bit `sig - 1`, so
+    /// signal 1 is bit 0. This used to shift by the signal number itself,
+    /// which is a set one bit too high all the way along -- harmless while
+    /// these tests only pass the value around, and a mask naming the wrong
+    /// signals the moment one of them compares it against a pending set.
     fn mask_of(signals: &[LinuxSignal]) -> u64 {
-        signals.iter().fold(0u64, |m, s| m | (1u64 << (*s as u64)))
+        signals.iter().fold(0u64, |m, s| m | s.as_bit())
+    }
+
+    #[test]
+    fn the_mask_is_in_the_same_numbering_as_every_other_signal_set() {
+        // `pending_matched` ANDs this mask with the thread's pending `Sigset`,
+        // so the two have to agree on which bit is which signal or a signalfd
+        // watching SIGINT wakes on SIGQUIT.
+        let mask = mask_of(&[LinuxSignal::SIGINT]);
+        let mut pending = Sigset::empty();
+        pending.insert(LinuxSignal::SIGINT);
+        assert_eq!(mask, pending.val());
+        assert_eq!(mask, 1 << 1, "SIGINT is signal 2, so it is bit 1");
     }
 
     fn sfd(mask: u64, flags: OpenFlags) -> Arc<SignalFd> {

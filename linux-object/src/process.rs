@@ -2465,7 +2465,7 @@ pub fn check_signals() -> LxResult<()> {
             // so nothing is pending and nothing can interrupt: return Ok rather
             // than unwrap-panicking ("init has no LinuxThread ext").
             let pending = match thread.try_lock_linux() {
-                Some(linux_thread) => linux_thread.signals.mask_with(&linux_thread.signal_mask),
+                Some(linux_thread) => linux_thread.signals.mask_with(&linux_thread.signal_mask()),
                 None => return Ok(()),
             };
             if pending.is_not_empty() {
@@ -2656,7 +2656,7 @@ pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
                 if let Ok(thread) = thread_obj.downcast_arc::<Thread>() {
                     // Peek without holding the guard across a move of `thread`.
                     let delivered = if let Some(mut lt) = thread.try_lock_linux() {
-                        if lt.signal_mask.contains(signal) {
+                        if lt.signal_mask().contains(signal) {
                             false
                         } else {
                             lt.signals.insert(signal);
