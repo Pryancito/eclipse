@@ -1604,3 +1604,277 @@ pub(super) fn format_exec_profile() -> alloc::string::String {
     }
     s
 }
+
+/// What an OpenGL or Vulkan client makes the *NVIDIA* side of the kernel do.
+///
+/// `glxgears` and `glmark2` reach this file through Mesa: nvc0 (classic Gallium
+/// GL) submits through `GEM_PUSHBUF`, NVK (Vulkan, which is what `zink` and
+/// `wlr_gles2` end up on here) through `VM_INIT`/`VM_BIND`/`EXEC`. None of that
+/// can run on a host --- the arms live in `nvidia.rs` behind MMIO and a GSP-RM
+/// handshake. What CAN run here is the part that has actually broken, twice, and
+/// both times took every GL client on the machine down with it: the *request
+/// numbers and struct layouts*.
+///
+/// A DRM ioctl number encodes `sizeof(struct)` in bits 16..29. So a Rust struct
+/// whose layout drifts by one field from the real uAPI does not produce a
+/// slightly-wrong result --- it produces an ioctl number Mesa never sends, and
+/// the client gets `ENOSYS` from a call it believes is mandatory. That is the
+/// `deadline_nsec` saga in `README-nvk-hardware-status.md`: the field was first
+/// removed (fixing QEMU's old libdrm, breaking Alpine's 2.4.134 on the real
+/// card) and then restored, each time diagnosed only after a client died on
+/// hardware. Nothing in the tree pinned the sizes, so nothing caught either.
+///
+/// The expected sizes below are the real ABI, taken from libdrm's own
+/// `nouveau_drm.h` and `drm.h`. They are written as literals on purpose: a
+/// struct edit here is supposed to fail this test and make its author go and
+/// check the header, which is exactly the step that was skipped.
+#[cfg(test)]
+mod gl_client_abi_tests {
+    use super::*;
+    use core::mem::size_of;
+
+    /// `struct drm_nouveau_*`, byte for byte, as libdrm lays them out on
+    /// x86_64. Verified against the vendored `nouveau_drm.h` for every struct
+    /// that header defines; the `VM_*`/`EXEC`/`sync` group is newer than it and
+    /// comes from the upstream header the new submission uAPI was added with.
+    #[test]
+    fn every_request_struct_matches_the_real_uapi_layout() {
+        // (what it is, ours, the ABI's)
+        let table: &[(&str, usize, usize)] = &[
+            ("drm_nouveau_getparam", size_of::<DrmNouveauGetparam>(), 16),
+            (
+                "drm_nouveau_channel_alloc",
+                size_of::<DrmNouveauChannelAlloc>(),
+                88,
+            ),
+            (
+                "drm_nouveau_channel_free",
+                size_of::<DrmNouveauChannelFree>(),
+                4,
+            ),
+            ("drm_nouveau_gem_info", size_of::<DrmNouveauGemInfo>(), 40),
+            ("drm_nouveau_gem_new", size_of::<DrmNouveauGemNew>(), 48),
+            (
+                "drm_nouveau_gem_cpu_prep",
+                size_of::<DrmNouveauGemCpuPrep>(),
+                8,
+            ),
+            (
+                "drm_nouveau_gem_cpu_fini",
+                size_of::<DrmNouveauGemCpuFini>(),
+                4,
+            ),
+            // The legacy submission path, which is what the image's Mesa
+            // (mesa-dri-gallium, i.e. nvc0) actually uses for OpenGL.
+            (
+                "drm_nouveau_gem_pushbuf_bo_presumed",
+                size_of::<DrmNouveauGemPushbufBoPresumed>(),
+                16,
+            ),
+            (
+                "drm_nouveau_gem_pushbuf_bo",
+                size_of::<DrmNouveauGemPushbufBo>(),
+                40,
+            ),
+            (
+                "drm_nouveau_gem_pushbuf_reloc",
+                size_of::<DrmNouveauGemPushbufReloc>(),
+                28,
+            ),
+            (
+                "drm_nouveau_gem_pushbuf_push",
+                size_of::<DrmNouveauGemPushbufPush>(),
+                24,
+            ),
+            (
+                "drm_nouveau_gem_pushbuf",
+                size_of::<DrmNouveauGemPushbuf>(),
+                64,
+            ),
+            // The new submission uAPI, which NVK uses.
+            ("drm_nouveau_vm_init", size_of::<DrmNouveauVmInit>(), 16),
+            (
+                "drm_nouveau_vm_bind_op",
+                size_of::<DrmNouveauVmBindOp>(),
+                40,
+            ),
+            ("drm_nouveau_vm_bind", size_of::<DrmNouveauVmBind>(), 40),
+            ("drm_nouveau_sync", size_of::<DrmNouveauSync>(), 16),
+            ("drm_nouveau_exec_push", size_of::<DrmNouveauExecPush>(), 16),
+            ("drm_nouveau_exec", size_of::<DrmNouveauExec>(), 40),
+        ];
+        for &(what, ours, abi) in table {
+            assert_eq!(
+                ours, abi,
+                "{} is {} bytes here and {} in the ABI: Mesa's ioctl number for \
+                 it will not be the one we answer",
+                what, ours, abi,
+            );
+        }
+    }
+
+    /// The command numbers themselves, against `nouveau_drm.h`'s
+    /// `DRM_NOUVEAU_*` offsets plus `DRM_COMMAND_BASE`. Getting one wrong routes
+    /// a client's call to another arm, which is worse than not handling it.
+    #[test]
+    fn the_command_numbers_are_the_ones_nouveau_publishes() {
+        assert_eq!(DRM_COMMAND_BASE, 0x40, "DRM_COMMAND_BASE is fixed at 0x40");
+        let table: &[(&str, u32, u32)] = &[
+            ("GETPARAM", NR_GETPARAM, 0x40 + 0x00),
+            ("CHANNEL_ALLOC", NR_CHANNEL_ALLOC, 0x40 + 0x02),
+            ("CHANNEL_FREE", NR_CHANNEL_FREE, 0x40 + 0x03),
+            ("NVIF", NR_NVIF, 0x40 + 0x07),
+            (
+                "SVM_INIT is 0x08 and SVM_BIND 0x09: not ours",
+                NR_VM_INIT,
+                0x40 + 0x10,
+            ),
+            ("VM_BIND", NR_VM_BIND, 0x40 + 0x11),
+            ("EXEC", NR_EXEC, 0x40 + 0x12),
+            ("GET_ZCULL_INFO", NR_GET_ZCULL_INFO, 0x40 + 0x13),
+            ("GEM_NEW", NR_GEM_NEW, 0x40 + 0x40),
+            ("GEM_PUSHBUF", NR_GEM_PUSHBUF, 0x40 + 0x41),
+            ("GEM_CPU_PREP", NR_GEM_CPU_PREP, 0x40 + 0x42),
+            ("GEM_CPU_FINI", NR_GEM_CPU_FINI, 0x40 + 0x43),
+            ("GEM_INFO", NR_GEM_INFO, 0x40 + 0x44),
+        ];
+        let mut seen = alloc::vec::Vec::new();
+        for &(what, ours, abi) in table {
+            assert_eq!(ours, abi, "{} is filed under the wrong NR", what);
+            assert!(
+                !seen.contains(&ours),
+                "NR {:#04x} is claimed twice ({})",
+                ours,
+                what
+            );
+            seen.push(ours);
+            // Every one has to fit the 8-bit NR field of an ioctl number.
+            assert!(ours <= 0xff, "{} does not fit the NR field", what);
+        }
+    }
+
+    /// The payload floor every arm leans on before it casts. Present for each
+    /// NR that is dispatched, and equal to that NR's own struct --- a floor that
+    /// is too small lets a short request through and the arm then writes past
+    /// the end of the caller's buffer.
+    #[test]
+    fn each_dispatched_command_declares_its_own_struct_as_the_floor() {
+        let table: &[(u32, usize)] = &[
+            (NR_GETPARAM, size_of::<DrmNouveauGetparam>()),
+            (NR_CHANNEL_ALLOC, size_of::<DrmNouveauChannelAlloc>()),
+            (NR_CHANNEL_FREE, size_of::<DrmNouveauChannelFree>()),
+            (NR_VM_INIT, size_of::<DrmNouveauVmInit>()),
+            (NR_VM_BIND, size_of::<DrmNouveauVmBind>()),
+            (NR_EXEC, size_of::<DrmNouveauExec>()),
+            (NR_GEM_NEW, size_of::<DrmNouveauGemNew>()),
+            (NR_GEM_PUSHBUF, size_of::<DrmNouveauGemPushbuf>()),
+            (NR_GEM_CPU_PREP, size_of::<DrmNouveauGemCpuPrep>()),
+            (NR_GEM_CPU_FINI, size_of::<DrmNouveauGemCpuFini>()),
+            (NR_GEM_INFO, size_of::<DrmNouveauGemInfo>()),
+        ];
+        for &(nr, want) in table {
+            assert_eq!(
+                min_payload_for_nr(nr),
+                Some(want),
+                "{} has the wrong payload floor",
+                nouveau_ioctl_name(nr),
+            );
+        }
+        // NVIF is the one exception, and deliberately: five different request
+        // layouts ride one NR, so it validates its own header instead. A floor
+        // here would reject four of the five.
+        assert_eq!(
+            min_payload_for_nr(NR_NVIF),
+            None,
+            "NVIF must not carry a fixed floor",
+        );
+        // And a number that is not ours declares nothing.
+        assert_eq!(min_payload_for_nr(DRM_COMMAND_BASE + 0x7f), None);
+    }
+
+    /// Dispatch is by NR alone, so neither the direction bits nor the size a
+    /// client encoded can hide an arm. This is not a style preference: Mesa
+    /// issues `VM_INIT` with `drmCommandWrite` (`_IOW`) although the header says
+    /// `_IOWR`, and matching the full request number made it unreachable --- and
+    /// with it the whole GPU, because NVK calls it while creating the physical
+    /// device.
+    #[test]
+    fn a_command_is_found_by_its_nr_whatever_size_and_direction_it_carries() {
+        /// `_IOC(dir, 'd', nr, size)`.
+        fn ioc(dir: u32, nr: u32, size: usize) -> u32 {
+            (dir << 30) | (0x64 << 8) | (nr & 0xff) | (((size as u32) & 0x3fff) << 16)
+        }
+        const WRITE: u32 = 1;
+        const READ_WRITE: u32 = 3;
+
+        for &(dir, size) in &[
+            (WRITE, size_of::<DrmNouveauVmInit>()), // what Mesa really sends
+            (READ_WRITE, size_of::<DrmNouveauVmInit>()), // what the header says
+            (READ_WRITE, size_of::<DrmNouveauVmInit>() + 8), // a grown struct
+            (WRITE, size_of::<DrmNouveauVmInit>() + 64),
+        ] {
+            let (got_dir, nr, got_size) = decode_ioc(ioc(dir, NR_VM_INIT, size));
+            assert_eq!(nr, NR_VM_INIT, "VM_INIT stopped being reachable");
+            assert_eq!(got_dir, dir);
+            assert_eq!(got_size as usize, size);
+        }
+
+        // And the five NVIF layouts, which is the case that forced this design.
+        for size in [16usize, 24, 32, 40, 48] {
+            let (_, nr, _) = decode_ioc(ioc(READ_WRITE, NR_NVIF, size));
+            assert_eq!(nr, NR_NVIF, "NVIF at {} bytes lost its arm", size);
+        }
+    }
+
+    /// The tile-kind boundary. Turing's UNCOMPRESSED kind set is `0x00..=0x06`
+    /// (PITCH, the Z/S family Z16/S8/S8Z24/ZF32_X24S8/Z24S8, and
+    /// GENERIC_MEMORY, per tu102's `dev_mmu.h`): all of those go into the PTEs
+    /// verbatim and need no compression tags. `0x07` is INVALID and
+    /// `0x08..=0x0f` are the COMPRESSIBLE kinds, which this driver cannot
+    /// program because it has no comptag allocator.
+    ///
+    /// Where the line is drawn matters in both directions. Too strict and a
+    /// depth surface NVK is entitled to allocate gets refused; too loose and a
+    /// compressed kind reaches the page tables, where the bytes are
+    /// byte-inexact. And it has to be enforced at `GEM_NEW`, while NVK can
+    /// still choose another kind --- refusing it at `VM_BIND` instead left the
+    /// surface unmapped and hung the channel on the first draw that used it,
+    /// with no MMU fault to point at it (seen on the RTX with kind `0x01`).
+    #[test]
+    fn the_supported_tile_kinds_are_exactly_the_uncompressed_turing_set() {
+        for kind in 0x00u32..=0x06 {
+            assert!(
+                pte_kind_is_supported(kind),
+                "tile kind {:#04x} is uncompressed on Turing and must be accepted",
+                kind,
+            );
+        }
+        assert!(
+            !pte_kind_is_supported(0x07),
+            "0x07 is INVALID in the Turing kind set",
+        );
+        for kind in 0x08u32..=0xff {
+            assert!(
+                !pte_kind_is_supported(kind),
+                "tile kind {:#04x} needs comptags, which this driver has none of",
+                kind,
+            );
+        }
+
+        // The kind is the low byte of a VM_BIND op's flags, so the op bits
+        // above it must not leak into the decision.
+        assert_eq!(vm_bind_pte_kind(PTE_KIND_GENERIC), PTE_KIND_GENERIC);
+        assert_eq!(
+            vm_bind_pte_kind(VM_BIND_SPARSE | PTE_KIND_GENERIC),
+            PTE_KIND_GENERIC,
+            "the SPARSE bit must not change the kind",
+        );
+        assert_eq!(vm_bind_pte_kind(0xABCD_EF00 | 0x06), PTE_KIND_GENERIC);
+        assert_eq!(vm_bind_pte_kind(0x0000_0001), 0x01);
+        assert_eq!(
+            vm_bind_pte_kind(0xFFFF_FF00),
+            PTE_KIND_PITCH,
+            "no kind bits set is plain linear, whatever else is on",
+        );
+    }
+}

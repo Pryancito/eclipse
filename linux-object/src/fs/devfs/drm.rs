@@ -840,6 +840,17 @@ pub fn driver_for_minor(minor: u32) -> Option<Arc<dyn DrmScheme>> {
         .map(|n| n.driver.clone())
 }
 
+/// How many framebuffer objects and GEM handles the kernel is holding.
+///
+/// For tests that run a frame loop and then check it came back into balance:
+/// both tables are process-wide here, not per `drm_file` as in Linux, so a
+/// leaked entry is visible globally and only globally.
+#[cfg(test)]
+pub(crate) fn table_sizes_for_test() -> (usize, usize) {
+    let state = DRM_STATE.lock();
+    (state.framebuffers.len(), state.handles.len())
+}
+
 /// Whether `minor` is one of the compute-only nodes (index 1 and up). Those
 /// advertise themselves as `eclipse-compute` and report no CRTCs, so Mesa and
 /// wlroots leave them alone and stay on `card0`.
@@ -2990,8 +3001,18 @@ pub fn reset_vblank_period() {
 pub enum FlipError {
     /// A previous flip's completion event has not been posted yet (Linux EBUSY).
     Busy,
-    /// Present/scanout failed.
-    Failed,
+    /// The frame could not be put on the screen, and why.
+    ///
+    /// Carries the reason so the ioctl arm can apply the same policy `SETCRTC`
+    /// does (see `present_failed` there): a missing framebuffer is the client's
+    /// own error and fails the ioctl with `ENOENT`, while a frame that merely
+    /// could not be copied is reported and accepted. Collapsing all three to
+    /// one `Failed` answered `EIO` for every one of them, and wlroots escalates
+    /// an unexpected page-flip failure into an output teardown -- it drops DRM
+    /// master and the desktop falls back to the text console. `SETCRTC` was
+    /// given this distinction and the flip path was left without it, so the
+    /// identical condition was survivable on one and fatal on the other.
+    Present(PresentError),
 }
 
 /// `want_event`: the request carried `DRM_MODE_PAGE_FLIP_EVENT`. Without it
@@ -3030,14 +3051,23 @@ pub fn page_flip(
             return Err(FlipError::Busy);
         }
     }
-    let flipped = present_now(fb_id, crtc_id);
-    if !flipped {
-        return Err(FlipError::Failed);
+    let present = present_now_checked(fb_id, crtc_id, None);
+    // A framebuffer that is not there is the one reason to fail the flip, and
+    // it owes no completion. For the others the flip stands: the event MUST
+    // still be queued, because a client that asked for one and does not get it
+    // blocks in `poll()` on the card fd for a frame that will never be
+    // reported -- the frame loop stops dead, which is worse than a frame that
+    // was not copied.
+    if matches!(present, Err(PresentError::NoSuchFb)) {
+        return Err(FlipError::Present(PresentError::NoSuchFb));
     }
     if want_event {
         schedule_flip_event(crtc_id, user_data, file);
     }
-    Ok(())
+    match present {
+        Ok(()) => Ok(()),
+        Err(e) => Err(FlipError::Present(e)),
+    }
 }
 
 /// Deliver a page-flip completion at the next synthetic vblank boundary rather
@@ -3229,7 +3259,7 @@ fn schedule_flip_event(crtc_id: u32, user_data: u64, file: &Arc<DrmFileState>) {
 /// accepting the new flip) and still delivers exactly one event per flip — no
 /// dropped or overwritten completion, so no stale `wl_listener` free in labwc.
 /// Pending vblank-wait jobs keep their own pacing and stay queued.
-fn flush_pending_flip_completions() {
+pub(crate) fn flush_pending_flip_completions() {
     let flips: Vec<(u32, u64, Weak<DrmFileState>)> = {
         let mut q = PENDING_DRM_TIMERS.lock();
         let mut kept = VecDeque::with_capacity(q.len());
