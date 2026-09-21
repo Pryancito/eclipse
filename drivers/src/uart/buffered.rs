@@ -8,17 +8,17 @@ use crate::DeviceResult;
 
 const BUF_CAPACITY: usize = 4096;
 
-/// How many bytes one interrupt may take out of the hardware FIFO.
-///
 /// The drain loop below used to run until `try_recv` said there was nothing
 /// left, which is fine for a FIFO that empties and is a hang for one that does
 /// not: a wedged UART that keeps reporting "data ready" — a stuck line, a
 /// device whose status register never clears — never lets the handler return,
 /// and the `Vec` it fills grows until memory runs out. On the two
 /// architectures being brought up this UART *is* the console, so the machine
-/// dies with nothing to say. Linux's 8250 handler bounds its own loop the same
-/// way (`max_count`); the leftover bytes come back on the next interrupt.
-const DRAIN_BURST: usize = 256;
+/// dies with nothing to say.
+///
+/// The bound and the reasoning now live in [`crate::utils::bounded_drain`],
+/// because the same loop was written without one in three drivers.
+use crate::utils::{bounded_drain, DRAIN_BURST};
 
 pub struct BufferedUart {
     inner: Arc<dyn UartScheme>,
@@ -52,12 +52,15 @@ impl Scheme for BufferedUart {
         // Drain the hardware FIFO first (lock-free on our side; the inner
         // UART driver acquires its own lock per byte), for at most one burst.
         let mut drained = alloc::vec::Vec::with_capacity(DRAIN_BURST.min(16));
-        for _ in 0..DRAIN_BURST {
+        bounded_drain(DRAIN_BURST, || {
             match self.inner.try_recv().unwrap_or(None) {
-                Some(c) => drained.push(if c == b'\r' { b'\n' } else { c }),
-                None => break,
+                Some(c) => {
+                    drained.push(if c == b'\r' { b'\n' } else { c });
+                    true
+                }
+                None => false,
             }
-        }
+        });
         if drained.is_empty() {
             return;
         }

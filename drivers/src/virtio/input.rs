@@ -5,7 +5,7 @@ use virtio_drivers::{InputConfigSelect, VirtIOHeader, VirtIOInput as InnerDriver
 
 use crate::prelude::{CapabilityType, InputCapability, InputEvent, InputEventType};
 use crate::scheme::{impl_event_scheme, InputScheme, Scheme};
-use crate::utils::EventListener;
+use crate::utils::{bounded_drain, EventListener, DRAIN_BURST};
 use crate::DeviceResult;
 
 pub struct VirtIoInput<'a> {
@@ -33,14 +33,27 @@ impl<'a> Scheme for VirtIoInput<'a> {
     fn handle_irq(&self, _irq_num: usize) {
         let mut inner = self.inner.lock();
         inner.ack_interrupt();
-        while let Some(e) = inner.pop_pending_event() {
-            if let Ok(event_type) = InputEventType::try_from(e.event_type) {
-                self.listener.trigger(InputEvent {
-                    event_type,
-                    code: e.code,
-                    value: e.value as i32,
-                });
+        // Bounded: the event queue is refilled by whatever is on the other
+        // side of the virtqueue, so an unbounded drain lets it decide how long
+        // this handler runs. What is left comes back on the next interrupt.
+        let cut_short = bounded_drain(DRAIN_BURST, || match inner.pop_pending_event() {
+            Some(e) => {
+                if let Ok(event_type) = InputEventType::try_from(e.event_type) {
+                    self.listener.trigger(InputEvent {
+                        event_type,
+                        code: e.code,
+                        value: e.value as i32,
+                    });
+                }
+                true
             }
+            None => false,
+        });
+        if cut_short {
+            warn!(
+                "[virtio-input] {} events in one pass; more pending",
+                DRAIN_BURST
+            );
         }
     }
 }

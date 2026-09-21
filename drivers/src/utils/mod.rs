@@ -1,5 +1,6 @@
 //! Event handler and device tree.
 
+pub mod bounded_drain;
 pub mod deferred_job;
 mod event_listener;
 pub mod fat_ptr;
@@ -18,6 +19,7 @@ pub mod dma_sync;
 pub(super) use id_allocator::IdAllocator;
 pub(super) use irq_manager::IrqManager;
 
+pub use bounded_drain::{bounded_drain, DRAIN_BURST};
 pub use event_listener::{EventHandler, EventListener};
 pub use fat_ptr::{
     dyn_fat_ptr_live, heap_smash_suspected, note_heap_smash_suspected, set_vtable_max,
