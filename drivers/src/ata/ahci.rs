@@ -116,6 +116,10 @@ struct PrdEntry {
 // the per-port DMA footprint.
 const PRDT_MAX: usize = 56;
 
+/// A PRD's Data Byte Count is 22 bits wide and holds `len - 1`, so one entry
+/// can describe at most 4 MiB (AHCI spec §4.2.3.3).
+const PRD_MAX_BYTES: usize = 1 << 22;
+
 #[repr(C, align(1024))]
 struct CommandTable {
     cfis: [u8; 64],
@@ -525,24 +529,7 @@ impl AhciPort {
     fn rw_block(&self, lba: u64, prds: &[(u64, usize)], write: bool) -> DeviceResult {
         let slot = 0u32;
         let buf_len: usize = prds.iter().map(|p| p.1).sum();
-        // The FIS count field is in *device* sectors, which is not 512 bytes
-        // on a 4Kn disk. Getting this wrong asks the drive for eight times
-        // the data it should and walks off the end of the PRDT.
-        let count = buf_len / self.sector_bytes;
-        if prds.is_empty()
-            || prds.len() > PRDT_MAX
-            || buf_len == 0
-            || !buf_len.is_multiple_of(self.sector_bytes)
-        {
-            return Err(DeviceError::InvalidParam);
-        }
-        if self.lba48 {
-            if count > 65536 {
-                return Err(DeviceError::InvalidParam);
-            }
-        } else if count > LBA28_MAX_SECTORS || lba + count as u64 > (1 << 28) {
-            return Err(DeviceError::InvalidParam);
-        }
+        let count = validate_rw(prds, buf_len, self.sector_bytes, lba, self.lba48)?;
 
         // Guard against a DMA descriptor the controller cannot address. On a
         // 32-bit-only HBA (CAP.S64A == 0) a physical address >= 4 GiB is
@@ -550,16 +537,16 @@ impl AhciPort {
         // wrong memory and "succeed" with no error bit — the real-hardware-only
         // corruption we are chasing. Fail loudly instead.
         if !self.supports_64bit {
-            for &(phys, len) in prds {
-                if phys + len as u64 > DMA_4G {
-                    crate::klog_err!(
-                        "[AHCI] port {} {} at lba {:#x}: PRD {:#x}+{} exceeds 4 GiB on a 32-bit-only HBA",
-                        self.port_idx,
-                        if write { "write" } else { "read" },
-                        lba, phys, len,
-                    );
-                    return Err(DeviceError::IoError);
-                }
+            if let Some((phys, len)) = first_prd_above_4g(prds) {
+                crate::klog_err!(
+                    "[AHCI] port {} {} at lba {:#x}: PRD {:#x}+{} exceeds 4 GiB on a 32-bit-only HBA",
+                    self.port_idx,
+                    if write { "write" } else { "read" },
+                    lba,
+                    phys,
+                    len,
+                );
+                return Err(DeviceError::IoError);
             }
         }
 
@@ -583,49 +570,9 @@ impl AhciPort {
                 core::mem::size_of::<CommandTable>(),
             );
 
-            let fis = (*cmd_table).cfis.as_mut_ptr();
-            *fis.add(0) = FIS_TYPE_REG_H2D;
-            *fis.add(1) = 0x80;
-            *fis.add(2) = if write {
-                if self.lba48 {
-                    ATA_CMD_WRITE_DMA_EXT
-                } else {
-                    ATA_CMD_WRITE_DMA
-                }
-            } else {
-                if self.lba48 {
-                    ATA_CMD_READ_DMA_EXT
-                } else {
-                    ATA_CMD_READ_DMA
-                }
-            };
-            if self.lba48 {
-                *fis.add(4) = lba as u8;
-                *fis.add(5) = (lba >> 8) as u8;
-                *fis.add(6) = (lba >> 16) as u8;
-                *fis.add(7) = 0x40;
-                *fis.add(8) = (lba >> 24) as u8;
-                *fis.add(9) = (lba >> 32) as u8;
-                *fis.add(10) = (lba >> 40) as u8;
-                // count == 65536 encodes as 0 per the ATA spec.
-                *fis.add(12) = count as u8;
-                *fis.add(13) = (count >> 8) as u8;
-            } else {
-                *fis.add(4) = lba as u8;
-                *fis.add(5) = (lba >> 8) as u8;
-                *fis.add(6) = (lba >> 16) as u8;
-                *fis.add(7) = 0xE0 | ((lba >> 24) & 0x0F) as u8;
-                *fis.add(12) = count as u8;
-                *fis.add(13) = 0;
-            }
+            encode_rw_fis(&mut (*cmd_table).cfis, lba, count, write, self.lba48);
 
-            for (i, &(phys, len)) in prds.iter().enumerate() {
-                let e = &mut (*cmd_table).prdt[i];
-                e.dba = phys as u32;
-                e.dbau = (phys >> 32) as u32;
-                let ioc = if i == prds.len() - 1 { 1u32 << 31 } else { 0 };
-                e.dbc_ioc = ((len as u32) - 1) | ioc;
-            }
+            encode_prdt(&mut (*cmd_table).prdt, prds);
 
             let header = self.cl_virt as *mut CommandHeader;
             (*header).cfl = 5 | (if write { 1 << 6 } else { 0 });
@@ -860,37 +807,20 @@ impl AhciPort {
         let lba28 = (read_id(60) as u64) | ((read_id(61) as u64) << 16);
         let lba48_supported = (read_id(83) & (1 << 10)) != 0;
 
-        // ATA/ATAPI-7 word 106, "Physical/Logical Sector Size": bit 14 set and
-        // bit 15 clear mark the word as valid; bit 12 then says the logical
-        // sector is longer than the traditional 256 words, in which case words
-        // 117-118 hold its size in words. Everything else is a 512-byte disk.
-        // We only ever believe a power-of-two size in [512, 4096]: a drive
-        // reporting anything else is more likely to be reporting garbage than
-        // to be a sector size worth supporting, and guessing wrong here
-        // mis-addresses every single transfer.
-        let word106 = read_id(106);
-        let sector_bytes = if word106 & (1 << 14) != 0 && word106 & (1 << 15) == 0 {
-            if word106 & (1 << 12) != 0 {
-                let words = (read_id(117) as usize) | ((read_id(118) as usize) << 16);
-                let bytes = words.saturating_mul(2);
-                if (SECTOR_SIZE..=4096).contains(&bytes) && bytes.is_power_of_two() {
-                    bytes
-                } else {
-                    crate::klog_warn!(
-                        "[AHCI] port {} IDENTIFY reports {} bytes per logical sector \
-                         (words 117-118 = {}); ignoring and assuming {}",
-                        self.port_idx,
-                        bytes,
-                        words,
-                        SECTOR_SIZE
-                    );
+        let sector_bytes = match identify_sector_bytes(read_id(106), read_id(117), read_id(118)) {
+            Some(Ok(bytes)) => bytes,
+            Some(Err(words)) => {
+                crate::klog_warn!(
+                    "[AHCI] port {} IDENTIFY reports {} bytes per logical sector \
+                     (words 117-118 = {}); ignoring and assuming {}",
+                    self.port_idx,
+                    words.saturating_mul(2),
+                    words,
                     SECTOR_SIZE
-                }
-            } else {
+                );
                 SECTOR_SIZE
             }
-        } else {
-            SECTOR_SIZE
+            None => SECTOR_SIZE,
         };
         let sectors = if (lba48_supported || lba48 > lba28) && lba48 != 0 {
             lba48
@@ -926,6 +856,140 @@ impl AhciPort {
     }
 }
 
+/// The largest LBA a 48-bit command FIS can carry. Bytes 4-6 and 8-10 hold
+/// six bytes of address and nothing else does: an LBA above this is written
+/// truncated, and the drive then reads or writes a completely different
+/// sector and reports success. Same idea for the 28-bit form, whose top
+/// nibble shares byte 7 with the device select bits.
+const LBA48_MAX: u64 = 1 << 48;
+const LBA28_MAX: u64 = 1 << 28;
+
+/// Check a transfer against everything the command FIS and the PRDT can
+/// actually express, and return its length in *device* sectors.
+///
+/// The count field is in device sectors, which is not 512 bytes on a 4Kn
+/// disk; getting it wrong asks the drive for eight times the data it should
+/// and walks off the end of the PRDT.
+fn validate_rw(
+    prds: &[(u64, usize)],
+    buf_len: usize,
+    sector_bytes: usize,
+    lba: u64,
+    lba48: bool,
+) -> DeviceResult<usize> {
+    if prds.is_empty()
+        || prds.len() > PRDT_MAX
+        || buf_len == 0
+        || sector_bytes == 0
+        || !buf_len.is_multiple_of(sector_bytes)
+    {
+        return Err(DeviceError::InvalidParam);
+    }
+    // A PRD's byte count is a 22-bit field holding `len - 1`, so no single
+    // entry may carry more than 4 MiB, and bit 0 must be 1 -- an odd length
+    // is not expressible at all.
+    if prds
+        .iter()
+        .any(|&(_, len)| len == 0 || len > PRD_MAX_BYTES || !len.is_multiple_of(2))
+    {
+        return Err(DeviceError::InvalidParam);
+    }
+    let count = buf_len / sector_bytes;
+    if lba48 {
+        if count > 65536 || lba >= LBA48_MAX || lba + count as u64 > LBA48_MAX {
+            return Err(DeviceError::InvalidParam);
+        }
+    } else if count > LBA28_MAX_SECTORS || lba + count as u64 > LBA28_MAX {
+        return Err(DeviceError::InvalidParam);
+    }
+    Ok(count)
+}
+
+/// Lay out a Register Host-to-Device FIS for a read or a write.
+///
+/// The LBA is split across two runs of bytes with the device-select byte
+/// wedged between them, and the two addressing modes disagree about what
+/// that byte holds: LBA48 sets only the LBA-mode bit, while LBA28 has to
+/// carry the top nibble of the address in it as well.
+fn encode_rw_fis(fis: &mut [u8; 64], lba: u64, count: usize, write: bool, lba48: bool) {
+    fis[0] = FIS_TYPE_REG_H2D;
+    fis[1] = 0x80; // C: this is a command, not a control update
+    fis[2] = match (write, lba48) {
+        (true, true) => ATA_CMD_WRITE_DMA_EXT,
+        (true, false) => ATA_CMD_WRITE_DMA,
+        (false, true) => ATA_CMD_READ_DMA_EXT,
+        (false, false) => ATA_CMD_READ_DMA,
+    };
+    fis[4] = lba as u8;
+    fis[5] = (lba >> 8) as u8;
+    fis[6] = (lba >> 16) as u8;
+    if lba48 {
+        fis[7] = 0x40; // LBA mode; the address does not reach into this byte
+        fis[8] = (lba >> 24) as u8;
+        fis[9] = (lba >> 32) as u8;
+        fis[10] = (lba >> 40) as u8;
+        // A count of 65536 is encoded as zero, which is what truncating to
+        // two bytes already does.
+        fis[12] = count as u8;
+        fis[13] = (count >> 8) as u8;
+    } else {
+        fis[7] = 0xE0 | ((lba >> 24) & 0x0F) as u8;
+        fis[12] = count as u8;
+        fis[13] = 0;
+    }
+}
+
+/// Fill the PRDT from a scatter list.
+///
+/// The byte count is stored as `len - 1` (a zero-length PRD is not
+/// representable), and the interrupt-on-completion bit goes on the last
+/// entry only -- put it on every entry and the controller raises an
+/// interrupt per descriptor instead of per command.
+fn encode_prdt(prdt: &mut [PrdEntry], prds: &[(u64, usize)]) {
+    for (i, &(phys, len)) in prds.iter().enumerate() {
+        let e = &mut prdt[i];
+        e.dba = phys as u32;
+        e.dbau = (phys >> 32) as u32;
+        let ioc = if i == prds.len() - 1 { 1u32 << 31 } else { 0 };
+        e.dbc_ioc = ((len as u32) - 1) | ioc;
+    }
+}
+
+/// The first PRD a 32-bit-only HBA (CAP.S64A == 0) cannot reach, if any.
+/// Such a controller truncates a physical address to its low 32 bits, so the
+/// transfer lands on the wrong memory and still reports success.
+fn first_prd_above_4g(prds: &[(u64, usize)]) -> Option<(u64, usize)> {
+    prds.iter()
+        .copied()
+        .find(|&(phys, len)| phys + len as u64 > DMA_4G)
+}
+
+/// Decode the logical sector size out of IDENTIFY words 106 and 117-118.
+///
+/// ATA/ATAPI-7 word 106, "Physical/Logical Sector Size": bit 14 set and bit
+/// 15 clear mark the word as valid; bit 12 then says the logical sector is
+/// longer than the traditional 256 words, in which case words 117-118 hold
+/// its size in words. Everything else is a 512-byte disk.
+///
+/// Only a power-of-two size in [512, 4096] is believed: a drive reporting
+/// anything else is likelier to be reporting garbage than to be a sector
+/// size worth supporting, and guessing wrong here mis-addresses every single
+/// transfer. `None` means "not stated, assume 512"; `Some(Err(words))` means
+/// the drive stated something unusable, which is worth a line in the log.
+#[allow(clippy::result_unit_err)]
+fn identify_sector_bytes(word106: u16, word117: u16, word118: u16) -> Option<Result<usize, usize>> {
+    if word106 & (1 << 14) == 0 || word106 & (1 << 15) != 0 || word106 & (1 << 12) == 0 {
+        return None;
+    }
+    let words = (word117 as usize) | ((word118 as usize) << 16);
+    let bytes = words.saturating_mul(2);
+    if (SECTOR_SIZE..=4096).contains(&bytes) && bytes.is_power_of_two() {
+        Some(Ok(bytes))
+    } else {
+        Some(Err(words))
+    }
+}
+
 /// Round `len` down to a whole number of device sectors. Every command's byte
 /// count has to land on a sector boundary; callers clamp by bounce-buffer size
 /// and by the LBA28 sector cap, neither of which is a multiple of a 4Kn
@@ -940,13 +1004,24 @@ fn whole_sectors(len: usize, sector_bytes: usize) -> usize {
 /// would need more than `PRDT_MAX` entries (callers then fall back to the
 /// bounce buffer).
 fn build_prds(vaddr: usize, len: usize, prds: &mut [(u64, usize); PRDT_MAX]) -> Option<usize> {
+    build_prds_with(vaddr, len, prds, |va| virt_to_phys(va) as u64)
+}
+
+/// The body of [`build_prds`], with the page-table lookup passed in so the
+/// splitting can be exercised against a mapping chosen by the caller.
+fn build_prds_with<F: Fn(usize) -> u64>(
+    vaddr: usize,
+    len: usize,
+    prds: &mut [(u64, usize); PRDT_MAX],
+    translate: F,
+) -> Option<usize> {
     let mut n = 0usize;
     let mut va = vaddr;
     let end = vaddr + len;
     while va < end {
         let page_rem = 4096 - (va & 4095);
         let piece = page_rem.min(end - va);
-        let pa = virt_to_phys(va) as u64;
+        let pa = translate(va);
         if pa == 0 {
             return None;
         }
@@ -1238,27 +1313,41 @@ impl AhciInterface {
 impl AhciInterface {
     /// Validate a request and return the sector count, or `InvalidParam`.
     fn check_request(&self, block_id: usize, len: usize) -> DeviceResult<usize> {
-        if len == 0 || !len.is_multiple_of(SECTOR_SIZE) {
-            return Err(DeviceError::InvalidParam);
-        }
-        let nsectors = len / SECTOR_SIZE;
-        match block_id.checked_add(nsectors) {
-            Some(end) if end as u64 <= self.capacity => Ok(nsectors),
-            _ => Err(DeviceError::InvalidParam),
-        }
+        check_request(block_id, len, self.capacity)
     }
 
-    /// Largest chunk a single command may move on this device, in bytes and
-    /// always a whole number of *device* sectors. The LBA28 cap is a sector
-    /// count, so on a 4Kn disk it is worth eight times as many bytes.
     fn max_chunk(&self, lba48: bool, path_max: usize) -> usize {
-        let cap = if lba48 {
-            path_max
-        } else {
-            path_max.min(LBA28_MAX_SECTORS * self.sector_bytes)
-        };
-        cap - cap % self.sector_bytes
+        max_chunk(lba48, path_max, self.sector_bytes)
     }
+}
+
+/// Validate a `BlockScheme` request against the disk and return its length in
+/// 512-byte blocks, which is the unit that API speaks whatever the drive's
+/// own sector size is.
+fn check_request(block_id: usize, len: usize, capacity: u64) -> DeviceResult<usize> {
+    if len == 0 || !len.is_multiple_of(SECTOR_SIZE) {
+        return Err(DeviceError::InvalidParam);
+    }
+    let nsectors = len / SECTOR_SIZE;
+    match block_id.checked_add(nsectors) {
+        Some(end) if end as u64 <= capacity => Ok(nsectors),
+        _ => Err(DeviceError::InvalidParam),
+    }
+}
+
+/// Largest chunk a single command may move on this device, in bytes and
+/// always a whole number of *device* sectors. The LBA28 cap is a sector
+/// count, so on a 4Kn disk it is worth eight times as many bytes.
+///
+/// This must never come out zero: the transfer loops advance by exactly this
+/// much and would otherwise spin for ever.
+fn max_chunk(lba48: bool, path_max: usize, sector_bytes: usize) -> usize {
+    let cap = if lba48 {
+        path_max
+    } else {
+        path_max.min(LBA28_MAX_SECTORS * sector_bytes)
+    };
+    cap - cap % sector_bytes
 }
 
 impl BlockScheme for AhciInterface {
@@ -1509,4 +1598,509 @@ static EXTRA_DISKS: Mutex<Vec<Device>> = Mutex::new(Vec::new());
 /// Take (and clear) the AHCI disks discovered beyond the first per controller.
 pub fn take_extra_disks() -> Vec<Device> {
     core::mem::take(&mut *EXTRA_DISKS.lock())
+}
+
+#[cfg(test)]
+mod command_tests {
+    //! Host tests for the parts of the AHCI driver a real controller reads
+    //! and QEMU does not.
+    //!
+    //! Every byte below goes straight onto the wire: the command FIS the
+    //! drive decodes, and the PRDT the HBA walks to find the data. Get one
+    //! field wrong and the drive happily reads or writes a *different* part
+    //! of the disk, or DMAs into memory that belongs to something else, and
+    //! the command still completes with no error bit set. There is no log
+    //! line for that -- the first sign is a corrupt filesystem.
+    //!
+    //! None of this is reachable from CI: eclipse boots in QEMU from an
+    //! image in RAM, so the AHCI path never runs a single line there. On a
+    //! real machine it is the root filesystem.
+
+    use super::*;
+
+    fn fis_for(lba: u64, count: usize, write: bool, lba48: bool) -> [u8; 64] {
+        let mut fis = [0u8; 64];
+        encode_rw_fis(&mut fis, lba, count, write, lba48);
+        fis
+    }
+
+    fn prdt(n: usize) -> Vec<PrdEntry> {
+        (0..n)
+            .map(|_| PrdEntry {
+                dba: 0,
+                dbau: 0,
+                _rsvd: 0,
+                dbc_ioc: 0,
+            })
+            .collect()
+    }
+
+    // --- the command FIS ---
+
+    #[test]
+    fn a_read_command_names_itself_as_one() {
+        // Byte 0 is the FIS type and byte 1's top bit is the C flag, which is
+        // what distinguishes "run this command" from "update the control
+        // register". Without C the drive takes the FIS as a device-control
+        // write and never transfers anything, and the command times out.
+        let fis = fis_for(0, 1, false, true);
+        assert_eq!(fis[0], FIS_TYPE_REG_H2D);
+        assert_eq!(fis[1] & 0x80, 0x80, "the C bit is not set");
+        assert_eq!(fis[2], ATA_CMD_READ_DMA_EXT);
+    }
+
+    #[test]
+    fn each_direction_and_addressing_mode_has_its_own_opcode() {
+        // Sending the 28-bit opcode with a 48-bit address is the classic way
+        // to write to the wrong half of a large disk.
+        assert_eq!(fis_for(0, 1, false, true)[2], ATA_CMD_READ_DMA_EXT);
+        assert_eq!(fis_for(0, 1, true, true)[2], ATA_CMD_WRITE_DMA_EXT);
+        assert_eq!(fis_for(0, 1, false, false)[2], ATA_CMD_READ_DMA);
+        assert_eq!(fis_for(0, 1, true, false)[2], ATA_CMD_WRITE_DMA);
+    }
+
+    #[test]
+    fn a_48_bit_lba_is_split_across_the_two_runs_of_address_bytes() {
+        // Bytes 4-6 hold the low three, bytes 8-10 the high three, and the
+        // device-select byte sits between them. Every byte here is distinct
+        // so a swapped or dropped one cannot hide.
+        let fis = fis_for(0x0605_0403_0201, 1, false, true);
+        assert_eq!(
+            [fis[4], fis[5], fis[6], fis[8], fis[9], fis[10]],
+            [0x01, 0x02, 0x03, 0x04, 0x05, 0x06]
+        );
+        assert_eq!(fis[7], 0x40, "LBA mode, and no address in this byte");
+    }
+
+    #[test]
+    fn a_28_bit_lba_carries_its_top_nibble_in_the_device_byte() {
+        // The 28-bit form has nowhere else to put bits 24-27: they share byte
+        // 7 with the 0xE0 select bits. Dropping them addresses somewhere in
+        // the first 8 GiB of the disk instead.
+        let fis = fis_for(0x0FED_CBA9, 1, false, false);
+        assert_eq!([fis[4], fis[5], fis[6]], [0xA9, 0xCB, 0xED]);
+        assert_eq!(fis[7], 0xE0 | 0x0F);
+        assert_eq!(fis[8], 0, "the 48-bit address bytes stay clear");
+    }
+
+    #[test]
+    fn the_largest_48_bit_transfer_encodes_its_count_as_zero() {
+        // 65536 sectors is the maximum and the spec spells it as a count of
+        // 0; 65535 is spelled normally. Rejecting the larger one instead
+        // would cap every transfer at 32 MiB.
+        let fis = fis_for(0, 65536, false, true);
+        assert_eq!((fis[12], fis[13]), (0, 0));
+        let fis = fis_for(0, 65535, false, true);
+        assert_eq!((fis[12], fis[13]), (0xFF, 0xFF));
+        let fis = fis_for(0, 256, false, true);
+        assert_eq!((fis[12], fis[13]), (0x00, 0x01));
+    }
+
+    #[test]
+    fn a_28_bit_command_leaves_the_high_count_byte_clear() {
+        // Its count is one byte wide; byte 13 belongs to the 48-bit form
+        // only. `validate_rw` caps a 28-bit transfer at 255 sectors, so
+        // today the two spellings happen to agree -- but the encoder is what
+        // decides what goes on the wire, and it has to be right on its own
+        // for the day that cap moves.
+        let fis = fis_for(0, 255, false, false);
+        assert_eq!((fis[12], fis[13]), (255, 0));
+        let fis = fis_for(0, 0x1FF, false, false);
+        assert_eq!(fis[13], 0, "byte 13 is not part of a 28-bit command");
+    }
+
+    // --- the PRDT ---
+
+    #[test]
+    fn a_prd_stores_one_less_than_its_byte_count() {
+        // The field cannot express zero, so it holds len - 1. Storing len
+        // itself makes the controller move one byte too many into the next
+        // buffer.
+        let mut t = prdt(1);
+        encode_prdt(&mut t, &[(0x1000, 4096)]);
+        assert_eq!(t[0].dbc_ioc & 0x003F_FFFF, 4095);
+    }
+
+    #[test]
+    fn only_the_last_prd_asks_for_an_interrupt() {
+        // The bit means "interrupt when this descriptor is done". On every
+        // entry it is one interrupt per page instead of one per command.
+        let mut t = prdt(3);
+        encode_prdt(&mut t, &[(0x1000, 4096), (0x9000, 4096), (0x2000, 512)]);
+        assert_eq!(t[0].dbc_ioc & (1 << 31), 0);
+        assert_eq!(t[1].dbc_ioc & (1 << 31), 0);
+        assert_eq!(t[2].dbc_ioc & (1 << 31), 1 << 31);
+    }
+
+    #[test]
+    fn a_prd_address_above_4_gib_keeps_its_high_half() {
+        // The address is two separate 32-bit words. Dropping the upper one
+        // silently aims the transfer at the same offset in the first 4 GiB
+        // of RAM, which on a machine with plenty of memory is somebody
+        // else's page.
+        let mut t = prdt(1);
+        encode_prdt(&mut t, &[(0x0000_0007_ABCD_E000, 4096)]);
+        assert_eq!(t[0].dba, 0xABCD_E000);
+        assert_eq!(t[0].dbau, 7);
+    }
+
+    #[test]
+    fn a_single_entry_list_still_gets_the_interrupt_bit() {
+        let mut t = prdt(1);
+        encode_prdt(&mut t, &[(0x1000, 512)]);
+        assert_eq!(t[0].dbc_ioc, 511 | (1 << 31));
+    }
+
+    // --- what never reaches the wire ---
+
+    #[test]
+    fn the_sector_count_is_in_device_sectors_not_in_512_byte_blocks() {
+        // This is the whole 4Kn hazard: 4096 bytes is eight blocks to the
+        // filesystem and one sector to the drive. Asking for eight would
+        // fetch 32 KiB and run off the end of the PRDT.
+        assert_eq!(
+            validate_rw(&[(0x1000, 4096)], 4096, 4096, 0, true).unwrap(),
+            1
+        );
+        assert_eq!(
+            validate_rw(&[(0x1000, 4096)], 4096, 512, 0, true).unwrap(),
+            8
+        );
+    }
+
+    #[test]
+    fn a_transfer_that_is_not_a_whole_number_of_device_sectors_is_refused() {
+        // A 4Kn drive cannot address half a sector; the caller has to do
+        // read-modify-write instead.
+        assert!(validate_rw(&[(0x1000, 512)], 512, 4096, 0, true).is_err());
+        assert!(validate_rw(&[(0x1000, 512)], 512, 512, 0, true).is_ok());
+    }
+
+    #[test]
+    fn an_empty_or_oversized_scatter_list_is_refused() {
+        assert!(validate_rw(&[], 0, 512, 0, true).is_err());
+        let many: Vec<(u64, usize)> = (0..PRDT_MAX + 1)
+            .map(|i| ((i as u64 + 1) * 0x2000, 512))
+            .collect();
+        let total = many.iter().map(|p| p.1).sum();
+        assert!(
+            validate_rw(&many, total, 512, 0, true).is_err(),
+            "the table only has {} entries",
+            PRDT_MAX
+        );
+        let fits = &many[..PRDT_MAX];
+        let total = fits.iter().map(|p| p.1).sum();
+        assert!(validate_rw(fits, total, 512, 0, true).is_ok());
+    }
+
+    #[test]
+    fn an_lba_the_command_cannot_express_is_refused_rather_than_truncated() {
+        // The FIS has six bytes of address and no more. An LBA above that is
+        // written truncated and the drive reads a completely different
+        // sector, successfully. The capacity this is bounded against comes
+        // from the drive's own IDENTIFY words, so a drive that misreports
+        // its size is all it takes to get here.
+        assert!(validate_rw(&[(0x1000, 512)], 512, 512, LBA48_MAX, true).is_err());
+        assert!(validate_rw(&[(0x1000, 512)], 512, 512, LBA48_MAX - 1, true).is_ok());
+        // ...and the last sector of the address space is still addressable,
+        // but a transfer running one past the end is not.
+        assert!(validate_rw(&[(0x1000, 1024)], 1024, 512, LBA48_MAX - 1, true).is_err());
+    }
+
+    #[test]
+    fn a_28_bit_transfer_running_past_the_28_bit_limit_is_refused() {
+        assert!(validate_rw(&[(0x1000, 512)], 512, 512, LBA28_MAX - 1, false).is_ok());
+        assert!(validate_rw(&[(0x1000, 1024)], 1024, 512, LBA28_MAX - 1, false).is_err());
+        assert!(validate_rw(&[(0x1000, 512)], 512, 512, LBA28_MAX, false).is_err());
+    }
+
+    #[test]
+    fn the_two_addressing_modes_have_different_sector_count_limits() {
+        // LBA28 tops out at 255 sectors per command and LBA48 at 65536.
+        let ok28 = LBA28_MAX_SECTORS * 512;
+        assert!(validate_rw(&[(0x1000, ok28)], ok28, 512, 0, false).is_ok());
+        let too28 = ok28 + 512;
+        assert!(validate_rw(&[(0x1000, too28)], too28, 512, 0, false).is_err());
+        // The same byte count is fine in 48-bit mode.
+        assert!(validate_rw(&[(0x1000, too28)], too28, 512, 0, true).is_ok());
+    }
+
+    #[test]
+    fn a_scatter_entry_longer_than_one_prd_can_describe_is_refused() {
+        // The byte count field is 22 bits. A longer entry spills into the
+        // reserved bits and the controller moves the wrong amount.
+        let big = PRD_MAX_BYTES;
+        assert!(validate_rw(&[(0x1000, big)], big, 512, 0, true).is_ok());
+        let over = PRD_MAX_BYTES + 512;
+        assert!(validate_rw(&[(0x1000, over)], over, 512, 0, true).is_err());
+    }
+
+    #[test]
+    fn an_odd_length_scatter_entry_is_refused() {
+        // Bit 0 of the byte count must read back as 1, which only happens
+        // when the length is even. An odd one is not expressible at all.
+        assert!(validate_rw(&[(0x1000, 511), (0x2000, 1)], 512, 512, 0, true).is_err());
+        assert!(validate_rw(&[(0x1000, 510), (0x2000, 2)], 512, 512, 0, true).is_ok());
+    }
+
+    #[test]
+    fn a_zero_length_scatter_entry_is_refused() {
+        // It would encode as `0 - 1`, which reads back as a 4 MiB transfer.
+        assert!(validate_rw(&[(0x1000, 512), (0x2000, 0)], 512, 512, 0, true).is_err());
+    }
+
+    #[test]
+    fn a_prd_beyond_4_gib_is_spotted_on_a_32_bit_only_controller() {
+        assert!(first_prd_above_4g(&[(0x1000, 4096), (0x9000, 4096)]).is_none());
+        // The last byte of the 4 GiB boundary is still reachable; one past it
+        // is not.
+        assert!(first_prd_above_4g(&[(DMA_4G - 4096, 4096)]).is_none());
+        assert_eq!(
+            first_prd_above_4g(&[(0x1000, 4096), (DMA_4G - 512, 4096)]),
+            Some((DMA_4G - 512, 4096)),
+            "a descriptor straddling the boundary is just as unreachable"
+        );
+    }
+
+    // --- the scatter list itself ---
+
+    fn empty_prds() -> [(u64, usize); PRDT_MAX] {
+        [(0u64, 0usize); PRDT_MAX]
+    }
+
+    /// A mapping that scatters page `n` of the test buffer to physical page
+    /// `2n + 1`, so no two consecutive pages are adjacent and nothing can
+    /// coalesce by accident.
+    fn scattered(va: usize) -> u64 {
+        let page = (va - 0x10_0000) / 4096;
+        ((2 * page as u64 + 1) * 4096) + (va & 4095) as u64
+    }
+
+    #[test]
+    fn a_scattered_buffer_needs_one_entry_per_page() {
+        // A kernel buffer is contiguous in virtual memory and almost never in
+        // physical memory. Assuming otherwise DMAs into whatever happens to
+        // follow the first page.
+        let mut prds = empty_prds();
+        let n = build_prds_with(0x10_0000, 4 * 4096, &mut prds, scattered).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(prds[0], (4096, 4096));
+        assert_eq!(prds[1], (3 * 4096, 4096));
+        assert_eq!(prds[2], (5 * 4096, 4096));
+        assert_eq!(prds[3], (7 * 4096, 4096));
+    }
+
+    #[test]
+    fn physically_adjacent_pages_are_merged_into_one_entry() {
+        // The table has 56 slots; without merging, a 224 KiB request that is
+        // physically contiguous would still need all of them and anything
+        // larger would fall back to the bounce buffer for nothing.
+        let mut prds = empty_prds();
+        let n = build_prds_with(0x10_0000, 8 * 4096, &mut prds, |va| va as u64).unwrap();
+        assert_eq!(n, 1, "one contiguous run is one descriptor");
+        assert_eq!(prds[0], (0x10_0000, 8 * 4096));
+    }
+
+    #[test]
+    fn a_buffer_that_starts_mid_page_splits_at_the_page_boundary() {
+        // Only the first piece is short. Splitting every piece at 4096 from
+        // the start instead would run each descriptor over a page boundary
+        // it has no translation for.
+        let mut prds = empty_prds();
+        let n = build_prds_with(0x10_0000 + 4000, 4096 + 200, &mut prds, scattered).unwrap();
+        assert_eq!(n, 3, "96 bytes, then a whole page, then the tail");
+        assert_eq!(prds[0].1, 96, "only up to the end of the first page");
+        assert_eq!(prds[1].1, 4096);
+        assert_eq!(prds[2].1, 4296 - 96 - 4096);
+    }
+
+    #[test]
+    fn a_buffer_needing_more_entries_than_the_table_holds_is_refused() {
+        // Refusing is how the caller knows to fall back to the bounce
+        // buffer. Writing past the end of a fixed-size table would be the
+        // alternative.
+        let mut prds = empty_prds();
+        assert_eq!(
+            build_prds_with(0x10_0000, PRDT_MAX * 4096, &mut prds, scattered),
+            Some(PRDT_MAX)
+        );
+        assert_eq!(
+            build_prds_with(0x10_0000, (PRDT_MAX + 1) * 4096, &mut prds, scattered),
+            None
+        );
+    }
+
+    #[test]
+    fn a_page_with_no_translation_aborts_the_whole_list() {
+        // Half a scatter list is worse than none: the command would transfer
+        // the pages that did translate and leave the rest of the buffer
+        // untouched, with no error.
+        let mut prds = empty_prds();
+        let hole = |va: usize| if va >= 0x10_2000 { 0 } else { scattered(va) };
+        assert_eq!(build_prds_with(0x10_0000, 4 * 4096, &mut prds, hole), None);
+    }
+
+    #[test]
+    fn the_pieces_always_add_up_to_the_whole_buffer() {
+        // Whatever the geometry, a descriptor list that covers fewer bytes
+        // than the caller asked for is a short read nobody reports.
+        for &start in &[0usize, 1, 7, 512, 4095, 4096, 4097, 8191] {
+            for &len in &[2usize, 512, 4096, 4608, 3 * 4096, 5 * 4096 + 8] {
+                let mut prds = empty_prds();
+                let base = 0x10_0000 + start;
+                let n = build_prds_with(base, len, &mut prds, scattered)
+                    .unwrap_or_else(|| panic!("start {} len {} was refused", start, len));
+                let total: usize = prds[..n].iter().map(|p| p.1).sum();
+                assert_eq!(total, len, "start {} len {}", start, len);
+                for (i, p) in prds[..n].iter().enumerate() {
+                    assert_ne!(p.1, 0, "empty descriptor {} at start {}", i, start);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_request_produces_no_descriptors() {
+        let mut prds = empty_prds();
+        assert_eq!(build_prds_with(0x10_0000, 0, &mut prds, scattered), Some(0));
+    }
+
+    // --- what IDENTIFY says about the sector size ---
+
+    /// Word 106 with the validity bits set and bit 12 saying "longer than
+    /// 256 words".
+    const W106_LONG_SECTOR: u16 = (1 << 14) | (1 << 12);
+
+    #[test]
+    fn a_plain_512_byte_disk_does_not_state_a_sector_size() {
+        assert_eq!(identify_sector_bytes(1 << 14, 0, 0), None);
+        assert_eq!(identify_sector_bytes(0, 2048, 0), None);
+    }
+
+    #[test]
+    fn a_4kn_disk_is_believed() {
+        // 2048 words is 4096 bytes. This is the whole point of the word.
+        assert_eq!(
+            identify_sector_bytes(W106_LONG_SECTOR, 2048, 0),
+            Some(Ok(4096))
+        );
+        assert_eq!(
+            identify_sector_bytes(W106_LONG_SECTOR, 512, 0),
+            Some(Ok(1024))
+        );
+    }
+
+    #[test]
+    fn a_word_106_that_is_not_marked_valid_is_ignored() {
+        // Bit 14 set and bit 15 clear is what marks the word as meaningful.
+        // An unimplemented word reads as all-ones or all-zeroes, and taking
+        // either at face value mis-addresses every transfer on the disk.
+        assert_eq!(identify_sector_bytes(0xFFFF, 2048, 0), None);
+        assert_eq!(identify_sector_bytes(0x0000, 2048, 0), None);
+        assert_eq!(
+            identify_sector_bytes(W106_LONG_SECTOR | (1 << 15), 2048, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn a_sector_size_that_is_not_believable_is_reported_and_dropped() {
+        // Out of range either way, and not a power of two. Each of these
+        // falls back to 512 with a line in the log rather than being used.
+        assert_eq!(
+            identify_sector_bytes(W106_LONG_SECTOR, 128, 0),
+            Some(Err(128))
+        );
+        assert_eq!(
+            identify_sector_bytes(W106_LONG_SECTOR, 4096, 0),
+            Some(Err(4096)),
+            "8192 bytes is past what we support"
+        );
+        assert_eq!(
+            identify_sector_bytes(W106_LONG_SECTOR, 1500, 0),
+            Some(Err(1500)),
+            "3000 bytes is not a power of two"
+        );
+        assert_eq!(identify_sector_bytes(W106_LONG_SECTOR, 0, 0), Some(Err(0)));
+        assert_eq!(
+            identify_sector_bytes(W106_LONG_SECTOR, 0xFFFF, 0xFFFF),
+            Some(Err(0xFFFF_FFFF))
+        );
+    }
+
+    // --- the chunking the transfer loops depend on ---
+
+    #[test]
+    fn a_chunk_is_always_a_whole_number_of_device_sectors() {
+        // The caps it is built from (the bounce buffer, the LBA28 sector
+        // count) are not multiples of a 4Kn sector by construction.
+        for &sector in &[512usize, 1024, 2048, 4096] {
+            for &path_max in &[4096usize, 32 * 4096, 56 * 4096, 100_000] {
+                for &lba48 in &[true, false] {
+                    let c = max_chunk(lba48, path_max, sector);
+                    assert_eq!(c % sector, 0, "sector {} path_max {}", sector, path_max);
+                    assert!(c <= path_max);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_chunk_is_never_zero_or_the_transfer_loop_would_spin_for_ever() {
+        // read_block and write_block advance by exactly this much; a zero
+        // chunk hangs the kernel on the first read of the root filesystem.
+        for &sector in &[512usize, 1024, 2048, 4096] {
+            for &lba48 in &[true, false] {
+                assert_ne!(max_chunk(lba48, 32 * 4096, sector), 0);
+                assert_ne!(max_chunk(lba48, sector, sector), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn the_28_bit_cap_is_a_sector_count_so_a_4kn_disk_moves_more_bytes() {
+        // 255 sectors is 127 KiB on a 512-byte disk and 1020 KiB on a 4Kn
+        // one. Capping by bytes instead would throttle the 4Kn disk to an
+        // eighth of what it can do per command.
+        let huge = 8 * 1024 * 1024;
+        assert_eq!(max_chunk(false, huge, 512), 255 * 512);
+        assert_eq!(max_chunk(false, huge, 4096), 255 * 4096);
+        // In 48-bit mode only the path's own limit applies.
+        assert_eq!(max_chunk(true, huge, 512), huge);
+    }
+
+    #[test]
+    fn whole_sectors_rounds_down_and_never_up() {
+        assert_eq!(whole_sectors(4096 + 512, 4096), 4096);
+        assert_eq!(whole_sectors(4096, 4096), 4096);
+        assert_eq!(whole_sectors(512, 4096), 0);
+        assert_eq!(whole_sectors(1536, 512), 1536);
+    }
+
+    // --- the request the filesystem hands us ---
+
+    #[test]
+    fn a_request_past_the_end_of_the_disk_is_refused() {
+        // 1000 blocks of 512 bytes.
+        assert_eq!(check_request(0, 512, 1000).unwrap(), 1);
+        assert_eq!(check_request(999, 512, 1000).unwrap(), 1);
+        assert!(check_request(1000, 512, 1000).is_err());
+        assert!(check_request(999, 1024, 1000).is_err());
+    }
+
+    #[test]
+    fn a_request_whose_length_is_not_a_whole_block_is_refused() {
+        assert!(check_request(0, 0, 1000).is_err());
+        assert!(check_request(0, 511, 1000).is_err());
+        assert!(check_request(0, 513, 1000).is_err());
+    }
+
+    #[test]
+    fn a_request_that_would_wrap_round_is_refused_rather_than_accepted() {
+        // `block_id + len/512` overflowing would come out small and pass a
+        // naive bounds check, and the transfer would then be aimed at the
+        // start of the disk.
+        assert!(check_request(usize::MAX, 512, u64::MAX).is_err());
+        assert!(check_request(usize::MAX - 1, 4096, u64::MAX).is_err());
+    }
 }
