@@ -1,6 +1,36 @@
 //! Bootstrap and initialization.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::{KernelConfig, KernelHandler, KCONFIG, KHANDLER};
+
+/// Set once the primary CPU has a heap, a `KernelHandler` and its own logical
+/// CPU id. No secondary may run a line of `secondary_init` before that.
+///
+/// On x86_64 the BSP starts the APs itself, at the end of `primary_init()`, so
+/// this is already true by the time any of them runs. RISC-V is the other way
+/// round: SBI releases every hart at once, and
+/// `zCore/src/platform/riscv/entry.rs` calls `boot_secondary_harts()` BEFORE
+/// `primary_main()`. A secondary therefore went straight into the per-CPU
+/// setup below while the primary had not yet run `memory::init()` or
+/// `primary_init_early()`, and died one of two ways: allocating against a heap
+/// that did not exist -- `kernel OOM: alloc 2686976 bytes failed (used 0 /
+/// total 0 MiB)`, the PercpuBlock -- or reading the handler and panicking with
+/// `uninitialized InitOnce<&dyn KernelHandler>`. Eight riscv64 boots out of
+/// eight died, which is what `Linux Other Test Baremetal (riscv64)` was
+/// reporting as 22 FAILED and 7 TIMEOUT.
+///
+/// It is set after `percpu::register()`, not earlier, and that is the whole
+/// point of where it sits. `lock`'s hart -> logical table starts out all
+/// zeroes, so every CPU that has not registered yet reports id 0 and they all
+/// share `CPUS[0]`'s lock-depth counter. Two of them bracketing a lock at the
+/// same time leaves that counter wrong and the next release panics with
+/// `pop_off`. Registering the primary first also keeps the boot CPU at logical
+/// id 0, which `LOGICAL_TO_HART` and the SBI IPI path assume.
+///
+/// [`super::arch::secondary_init`]'s own `DRIVERS_READY` gate is a later,
+/// narrower one: it covers the device-tree walk alone.
+static PRIMARY_READY: AtomicBool = AtomicBool::new(false);
 
 hal_fn_impl! {
     impl mod crate::hal_fn::boot {
@@ -54,6 +84,9 @@ hal_fn_impl! {
             crate::vm::pin_kernel_vmtoken();
             // Bind this CPU to its PercpuBlock (sets the GS fast-path on x86_64).
             super::percpu::register();
+            // The primary now holds logical id 0 and everything a secondary
+            // needs; release any that are already spinning (see `PRIMARY_READY`).
+            PRIMARY_READY.store(true, Ordering::Release);
             // Let the scheduler kick halted CPUs on cross-CPU wakes instead of
             // waiting for their next periodic tick (up to 4 ms of latency per
             // pipe write / IO completion / process exit otherwise).
@@ -91,6 +124,12 @@ hal_fn_impl! {
         }
 
         fn secondary_init() {
+            // Nothing below may run before the primary is ready; on RISC-V it
+            // has not even started yet. Plain spin: this runs once per CPU at
+            // boot, with no scheduler to yield to.
+            while !PRIMARY_READY.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
             #[cfg(target_arch = "x86_64")]
             {
                 let logical = super::arch::ap_trampoline_logical_id();
@@ -111,10 +150,19 @@ hal_fn_impl! {
                 // one once the AP has switched its own LAPIC to x2APIC.
                 lock::set_logical_cpu_id(lock::hardware_apic_id(), logical);
             }
+            // Claim this CPU's logical id BEFORE anything that can take a
+            // lock. `lock`'s hart -> logical table is all zeroes to start with,
+            // so a CPU that has not registered reports id 0 and brackets its
+            // lock guards on the primary's depth counter; the moment the two
+            // interleave, one of them releases a lock the counter says it does
+            // not hold and `pop_off` panics. x86_64 solves the same problem its
+            // own way above, with `with_ap_boot_logical` around `init_ap`.
             #[cfg(not(target_arch = "x86_64"))]
-            unsafe {
-                trapframe::init();
+            {
+                super::percpu::register();
+                unsafe { trapframe::init() };
             }
+            #[cfg(target_arch = "x86_64")]
             super::percpu::register();
             super::arch::secondary_init();
         }
