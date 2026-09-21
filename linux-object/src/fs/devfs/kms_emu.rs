@@ -26,8 +26,9 @@
 
 extern crate std;
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use kernel_hal::drivers::prelude::{ColorFormat, DisplayInfo, FrameBuffer};
 use kernel_hal::drivers::scheme::{DisplayScheme, Scheme};
 use spin::{Mutex, Once};
@@ -216,5 +217,270 @@ impl Screen {
         // SAFETY: bounds checked above against the geometry `attach_with`
         // validated against `MAX_BYTES`.
         unsafe { core::ptr::read((fb_ptr() as *const u32).add(off)) }
+    }
+}
+
+/// ---------------------------------------------------------------------------
+/// The hardware-KMS half: an emulated GPU that owns scanout itself.
+/// ---------------------------------------------------------------------------
+///
+/// A display alone puts the DRM core on the SOFTWARE KMS path: it blits dumb
+/// buffers into the framebuffer itself. That is what runs under QEMU and what
+/// [`Screen`] above exercises. On Moebius's machine it is not the only path:
+/// with `nvidia.hwflip` (or NVC57E surface flip) the NVIDIA driver declares
+/// `has_hardware_kms()` and the core hands it the frame instead, which changes
+/// four things at once -- ADDFB2 asks the driver to make its OWN framebuffer
+/// object, the flip goes to the driver by that private id, the software blit is
+/// skipped entirely, and the pointer has to be recomposited on top afterwards
+/// because the driver's flip replaced the whole scanout.
+///
+/// None of that ran in CI either, and it cannot: it needs a driver that claims
+/// hardware KMS, and the only one is `NvidiaGpu` behind MMIO. So this is one,
+/// recording what it was asked to do and answering as a real driver would --
+/// including refusing a flip, which is the case the fallback exists for.
+use kernel_hal::drivers::scheme::drm::{DrmCaps, DrmConnector, DrmCrtc, DrmPlane};
+use kernel_hal::drivers::scheme::DrmScheme;
+
+/// First framebuffer id the emulated GPU hands out. Deliberately nowhere near
+/// the DRM core's ids (which start at 1): the core and the driver keep separate
+/// framebuffer namespaces, and every test that watches a flip checks the driver
+/// was given ITS OWN id. Mixing the two is invisible while both count from 1.
+pub(crate) const EMU_DRIVER_FB_BASE: u32 = 0x9000;
+
+/// One `create_fb` the emulated GPU served: the core's GEM handle and the
+/// geometry it was given, plus the private id it answered with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CreatedFb {
+    pub(crate) gem_handle: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) pitch: u32,
+    pub(crate) driver_fb_id: u32,
+}
+
+#[derive(Default)]
+struct GpuCalls {
+    created_fbs: Vec<CreatedFb>,
+    /// Framebuffer ids `page_flip` was called with, in order.
+    flips: Vec<u32>,
+    vblank_waits: u32,
+}
+
+/// An emulated GPU driver. Build one with [`EmuGpu::new`], set what it claims,
+/// and attach it with [`Screen::attach_gpu`].
+pub(crate) struct EmuGpu {
+    name: &'static str,
+    hardware_kms: bool,
+    crtcs: Vec<u32>,
+    connectors: Vec<u32>,
+    planes: Vec<u32>,
+    /// Whether `page_flip` succeeds. A driver that refuses is the whole reason
+    /// the software fallback exists, so it has to be reachable.
+    accepts_flips: AtomicBool,
+    next_fb: AtomicU32,
+    calls: Mutex<GpuCalls>,
+}
+
+impl EmuGpu {
+    /// A GPU that does NOT own scanout -- a VirtIO-like driver, which is what
+    /// the mixed-topology filter is about.
+    pub(crate) fn new(name: &'static str) -> EmuGpu {
+        EmuGpu {
+            name,
+            hardware_kms: false,
+            crtcs: alloc::vec![40],
+            connectors: alloc::vec![41],
+            planes: alloc::vec![42],
+            accepts_flips: AtomicBool::new(true),
+            next_fb: AtomicU32::new(EMU_DRIVER_FB_BASE),
+            calls: Mutex::new(GpuCalls::default()),
+        }
+    }
+
+    /// A GPU that declares `has_hardware_kms()`, like the NVIDIA driver with
+    /// `nvidia.hwflip`.
+    pub(crate) fn hardware_kms(name: &'static str) -> EmuGpu {
+        EmuGpu {
+            hardware_kms: true,
+            ..EmuGpu::new(name)
+        }
+    }
+
+    /// The CRTC, connector and plane ids this GPU reports. Two GPUs given the
+    /// same ids is not a contrived case: two cards of the same model really do
+    /// return the same synthetic ids, and that is what the de-duplication in
+    /// `get_resources` is for.
+    pub(crate) fn with_ids(mut self, crtc: u32, connector: u32, plane: u32) -> EmuGpu {
+        self.crtcs = alloc::vec![crtc];
+        self.connectors = alloc::vec![connector];
+        self.planes = alloc::vec![plane];
+        self
+    }
+}
+
+impl Scheme for EmuGpu {
+    fn name(&self) -> &str {
+        self.name
+    }
+}
+
+impl DrmScheme for EmuGpu {
+    fn get_caps(&self) -> DrmCaps {
+        DrmCaps {
+            has_3d: false,
+            has_cursor: true,
+            max_width: 4096,
+            max_height: 4096,
+        }
+    }
+
+    fn has_hardware_kms(&self) -> bool {
+        self.hardware_kms
+    }
+
+    fn create_fb(&self, handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<u32> {
+        let driver_fb_id = self.next_fb.fetch_add(1, Ordering::Relaxed);
+        self.calls.lock().created_fbs.push(CreatedFb {
+            gem_handle: handle_id,
+            width,
+            height,
+            pitch,
+            driver_fb_id,
+        });
+        Some(driver_fb_id)
+    }
+
+    fn page_flip(&self, fb_id: u32) -> bool {
+        self.calls.lock().flips.push(fb_id);
+        self.accepts_flips.load(Ordering::Relaxed)
+    }
+
+    /// No hardware cursor plane, which is the default on this tree: the
+    /// `nvidia.hwcursor` flag is off, so the pointer stays software-composited.
+    fn set_cursor(&self, _crtc_id: u32, _x: i32, _y: i32, _handle: u32, _flags: u32) -> bool {
+        false
+    }
+
+    fn wait_vblank(&self, _crtc_id: u32) -> bool {
+        self.calls.lock().vblank_waits += 1;
+        true
+    }
+
+    fn get_resources(&self) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+        (Vec::new(), self.crtcs.clone(), self.connectors.clone())
+    }
+
+    fn get_connector(&self, id: u32) -> Option<DrmConnector> {
+        self.connectors.contains(&id).then_some(DrmConnector {
+            id,
+            connected: true,
+            mm_width: 530,
+            mm_height: 300,
+            connector_type: 11,
+        })
+    }
+
+    fn get_crtc(&self, id: u32) -> Option<DrmCrtc> {
+        self.crtcs.contains(&id).then_some(DrmCrtc {
+            id,
+            // The driver's own idea of what it is scanning out, in its own
+            // framebuffer namespace. The core must not pass this to userspace.
+            fb_id: EMU_DRIVER_FB_BASE,
+            x: 0,
+            y: 0,
+        })
+    }
+
+    fn get_plane(&self, id: u32) -> Option<DrmPlane> {
+        self.planes.contains(&id).then_some(DrmPlane {
+            id,
+            crtc_id: self.crtcs[0],
+            fb_id: EMU_DRIVER_FB_BASE,
+            possible_crtcs: 1,
+            plane_type: 1,
+        })
+    }
+
+    fn get_planes(&self) -> Vec<u32> {
+        self.planes.clone()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn set_plane(
+        &self,
+        _plane_id: u32,
+        _crtc_id: u32,
+        _fb_id: u32,
+        _x: i32,
+        _y: i32,
+        _w: u32,
+        _h: u32,
+        _src_x: u32,
+        _src_y: u32,
+        _src_w: u32,
+        _src_h: u32,
+    ) -> bool {
+        false
+    }
+}
+
+/// An attached emulated GPU, for the duration of one test. Dropping it takes the
+/// driver back out of both registries, including while a panic unwinds -- a
+/// driver left behind would put every later test in the process on the hardware
+/// path (see `drm::unregister_driver`).
+pub(crate) struct Gpu {
+    dev: Device,
+    driver: Arc<dyn DrmScheme>,
+    gpu: Arc<EmuGpu>,
+}
+
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        kernel_hal::drivers::remove_device_hosted(&self.dev);
+        super::drm::unregister_driver(&self.driver);
+    }
+}
+
+impl Gpu {
+    /// The framebuffer ids the driver was asked to flip, in order. These are the
+    /// DRIVER's ids, not the DRM core's.
+    pub(crate) fn flips(&self) -> Vec<u32> {
+        self.gpu.calls.lock().flips.clone()
+    }
+
+    /// Every `create_fb` the driver served.
+    pub(crate) fn created_fbs(&self) -> Vec<CreatedFb> {
+        self.gpu.calls.lock().created_fbs.clone()
+    }
+
+    /// How many times the driver's `wait_vblank` was called.
+    pub(crate) fn vblank_waits(&self) -> u32 {
+        self.gpu.calls.lock().vblank_waits
+    }
+
+    /// Make the driver refuse every following flip, as a real one does when the
+    /// display engine will not take the surface. The core then has to fall back
+    /// to the software blit rather than leave the panel dark.
+    pub(crate) fn refuse_flips(&self) {
+        self.gpu.accepts_flips.store(false, Ordering::Relaxed);
+    }
+}
+
+impl Screen {
+    /// Register `gpu` as a DRM driver for as long as the returned guard lives.
+    ///
+    /// Taking `&self` is the point: an attached [`Screen`] is already holding
+    /// the DRM test lock, and a driver registered without it would change what
+    /// `software_kms_active()` answers under a test running in another thread.
+    /// It is also the honest configuration -- a hardware-KMS GPU on this tree
+    /// still has the boot framebuffer beside it, and that is where the pointer
+    /// is composited after a driver flip.
+    pub(crate) fn attach_gpu(&self, gpu: EmuGpu) -> Gpu {
+        let gpu = Arc::new(gpu);
+        let driver: Arc<dyn DrmScheme> = gpu.clone();
+        super::drm::register_driver(driver.clone());
+        let dev = Device::Drm(driver.clone());
+        kernel_hal::drivers::add_device_hosted(dev.clone());
+        Gpu { dev, driver, gpu }
     }
 }

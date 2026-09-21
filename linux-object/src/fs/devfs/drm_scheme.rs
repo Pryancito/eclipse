@@ -5524,3 +5524,421 @@ mod kms_scanout_tests {
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
     }
 }
+
+/// The hardware-KMS path: what changes when a driver owns scanout.
+///
+/// [`kms_scanout_tests`] covers the software path, where the DRM core blits dumb
+/// buffers into the framebuffer itself -- what runs under QEMU. It is not the
+/// only path on real hardware: with `nvidia.hwflip` (or NVC57E surface flip) the
+/// NVIDIA driver declares `has_hardware_kms()` and four things change at once.
+/// ADDFB2 asks the driver for its OWN framebuffer object, the flip goes to the
+/// driver by that private id, the software blit is skipped, and the pointer has
+/// to be put back on top afterwards because the driver's flip replaced the whole
+/// scanout. The topology stops being synthetic too, and starts being filtered
+/// and de-duplicated across drivers.
+///
+/// None of it could run in CI: it needs a driver that claims hardware KMS, and
+/// the only one is `NvidiaGpu` behind MMIO. [`kms_emu::EmuGpu`] is one that
+/// records what it was asked to do -- including refusing a flip, which is the
+/// case the software fallback exists for and the one that decides whether a
+/// failed flip leaves the panel dark.
+#[cfg(test)]
+mod hw_kms_tests {
+    use super::gl_client_sequence_tests::{blank_card_res, parse_events, Client, FLIP_COMPLETE};
+    use super::*;
+    use crate::fs::devfs::kms_emu::{self, EmuGpu, UNTOUCHED};
+    use alloc::vec::Vec;
+    use kernel_hal::mem::phys_to_virt;
+
+    /// Paint a dumb buffer through its physical backing (see
+    /// `kms_scanout_tests::paint`, which this deliberately mirrors).
+    fn paint(buf: &DrmModeCreateDumb, value: u32) {
+        let (pa, size) =
+            drm::resolve_gem_backing(buf.handle).expect("a dumb buffer must have backing");
+        let va = phys_to_virt(pa as usize);
+        // SAFETY: `size` bytes of contiguous physical memory owned by this
+        // buffer, identity-mapped into the kernel window at `va`.
+        let px = unsafe { core::slice::from_raw_parts_mut(va as *mut u32, size / 4) };
+        for p in px.iter_mut() {
+            *p = value;
+        }
+    }
+
+    fn set_crtc(c: &Client, crtc_id: u32, fb_id: u32, w: u32, h: u32) {
+        let mut req = DrmModeGetCrtc {
+            set_connectors_ptr: 0,
+            count_connectors: 0,
+            crtc_id,
+            fb_id,
+            x: 0,
+            y: 0,
+            gamma_size: 0,
+            mode_valid: 1,
+            mode: make_modeinfo(w, h),
+        };
+        c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut req).expect("SETCRTC");
+    }
+
+    fn get_crtc_fb(c: &Client, crtc_id: u32) -> u32 {
+        let mut crtc = DrmModeGetCrtc {
+            set_connectors_ptr: 0,
+            count_connectors: 0,
+            crtc_id,
+            fb_id: 0,
+            x: 0,
+            y: 0,
+            gamma_size: 0,
+            mode_valid: 0,
+            mode: [0; 68],
+        };
+        c.ioctl(DRM_IOCTL_MODE_GETCRTC, &mut crtc).expect("GETCRTC");
+        crtc.fb_id
+    }
+
+    /// `struct drm_mode_cursor`, 28 bytes.
+    #[repr(C)]
+    struct ModeCursor {
+        flags: u32,
+        crtc_id: u32,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        handle: u32,
+    }
+
+    fn set_cursor(c: &Client, crtc_id: u32, handle: u32, w: u32, h: u32, x: i32, y: i32) {
+        let mut cur = ModeCursor {
+            flags: 0x01 | 0x02, // BO | MOVE
+            crtc_id,
+            x,
+            y,
+            width: w,
+            height: h,
+            handle,
+        };
+        c.ioctl(DRM_IOCTL_MODE_CURSOR, &mut cur).expect("CURSOR");
+    }
+
+    /// `drmWaitVBlank` with a relative target of 0, which asks for the current
+    /// sequence and must not block.
+    fn wait_vblank(c: &Client) {
+        const DRM_VBLANK_RELATIVE: u32 = 0x1;
+        let mut req = DrmWaitVblank {
+            typ: DRM_VBLANK_RELATIVE,
+            sequence: 0,
+            val1: 0,
+            val2: 0,
+        };
+        c.ioctl(DRM_IOCTL_WAIT_VBLANK, &mut req)
+            .expect("WAIT_VBLANK");
+    }
+
+    /// Read the CRTC and connector ids `drmModeGetResources` would hand a
+    /// compositor, in the two passes libdrm makes.
+    fn topology(c: &Client) -> (Vec<u32>, Vec<u32>) {
+        let mut probe = blank_card_res();
+        c.ioctl(DRM_IOCTL_MODE_GETRESOURCES, &mut probe)
+            .expect("GETRESOURCES");
+        let mut crtcs = alloc::vec![0u32; probe.count_crtcs as usize];
+        let mut conns = alloc::vec![0u32; probe.count_connectors as usize];
+        let mut fill = blank_card_res();
+        fill.crtc_id_ptr = crtcs.as_mut_ptr() as u64;
+        fill.connector_id_ptr = conns.as_mut_ptr() as u64;
+        fill.count_crtcs = probe.count_crtcs;
+        fill.count_connectors = probe.count_connectors;
+        c.ioctl(DRM_IOCTL_MODE_GETRESOURCES, &mut fill)
+            .expect("GETRESOURCES fill");
+        (crtcs, conns)
+    }
+
+    fn planes(c: &Client) -> Vec<u32> {
+        let mut probe = DrmModeGetPlaneRes {
+            plane_id_ptr: 0,
+            count_planes: 0,
+        };
+        c.ioctl(DRM_IOCTL_MODE_GETPLANERESOURCES, &mut probe)
+            .expect("GETPLANERESOURCES");
+        let mut ids = alloc::vec![0u32; probe.count_planes as usize];
+        let mut fill = DrmModeGetPlaneRes {
+            plane_id_ptr: ids.as_mut_ptr() as u64,
+            count_planes: probe.count_planes,
+        };
+        c.ioctl(DRM_IOCTL_MODE_GETPLANERESOURCES, &mut fill)
+            .expect("GETPLANERESOURCES fill");
+        ids
+    }
+
+    /// The frame goes to the driver and the CPU never touches the scanout. If
+    /// the software blit ran too, every present would pay for a full-frame copy
+    /// over PCIe that the display engine had already made unnecessary -- which
+    /// is the whole reason the hardware path exists.
+    #[test]
+    fn a_driver_that_owns_scanout_gets_the_frame_and_the_cpu_does_not_blit() {
+        let screen = kms_emu::attach(64, 16);
+        let gpu = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu"));
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 16);
+        paint(&buf, 0x0000_ABCD);
+        let fb = c.addfb2(&buf);
+
+        // ADDFB2 asked the driver for its own framebuffer object, with the
+        // geometry the client asked for.
+        let created = gpu.created_fbs();
+        assert_eq!(created.len(), 1, "the driver was not asked for an fb");
+        assert_eq!(created[0].gem_handle, buf.handle);
+        assert_eq!((created[0].width, created[0].height), (64, 16));
+        assert_eq!(created[0].pitch, buf.pitch);
+        let driver_fb = created[0].driver_fb_id;
+        assert_ne!(driver_fb, fb, "the two namespaces must not coincide");
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0x1234).expect("flip");
+
+        // The driver was flipped to ITS OWN id, not the core's.
+        assert_eq!(gpu.flips(), alloc::vec![driver_fb]);
+        // And nothing was copied into the framebuffer.
+        assert!(
+            (0..16).all(|y| (0..64).all(|x| screen.pixel(x, y) == UNTOUCHED)),
+            "the software blit ran even though the driver took the flip"
+        );
+        // The client still gets its completion.
+        drm::flush_pending_flip_completions();
+        let mut b = [0u8; 32];
+        assert_eq!(c.read_events(&mut b).expect("completion"), 32);
+        let ev = parse_events(&b);
+        assert_eq!(ev[0].ev_type, FLIP_COMPLETE);
+        assert_eq!(ev[0].user_data, 0x1234);
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// A driver that refuses the flip must not leave the panel dark: the core
+    /// falls back to the software blit. This is the failure mode the fallback
+    /// was written for -- a display engine that will not take the surface -- and
+    /// it is unreachable without a driver that can say no.
+    #[test]
+    fn a_driver_that_refuses_the_flip_falls_back_to_the_software_blit() {
+        let screen = kms_emu::attach(64, 16);
+        let gpu = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu"));
+        gpu.refuse_flips();
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 16);
+        paint(&buf, 0x0000_BEEF);
+        let fb = c.addfb2(&buf);
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 1).expect("flip");
+
+        assert_eq!(
+            gpu.flips().len(),
+            1,
+            "the driver was still offered the flip"
+        );
+        assert!(
+            (0..16).all(|y| (0..64).all(|x| screen.pixel(x, y) == 0x0000_BEEF)),
+            "the refused flip left the screen unwritten"
+        );
+
+        drm::flush_pending_flip_completions();
+        let mut sink = [0u8; 32];
+        let _ = c.read_events(&mut sink);
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// The pointer is put back on top of a frame the driver flipped. A driver
+    /// flip short-circuits the only place the software cursor is composited, so
+    /// every accepted flip used to land a frame with no pointer in it -- and a
+    /// cursor move on this path stands down entirely, so nothing else would ever
+    /// draw it again.
+    #[test]
+    fn the_pointer_is_put_back_on_top_of_a_frame_the_driver_flipped() {
+        let screen = kms_emu::attach(64, 16);
+        let gpu = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu"));
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 16);
+        paint(&buf, 0x0000_1111);
+        let fb = c.addfb2(&buf);
+        // A first flip so the CRTC names this framebuffer.
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 1).expect("flip");
+        drm::flush_pending_flip_completions();
+        let mut sink = [0u8; 32];
+        let _ = c.read_events(&mut sink);
+
+        let cur = c.create_dumb(8, 8);
+        paint(&cur, 0xFF00_00FF);
+        set_cursor(&c, drm::SYNTH_CRTC_ID, cur.handle, 8, 8, 4, 2);
+
+        // Setting the pointer draws nothing on this path: the software repaint
+        // stands down, because on real hardware the display engine is scanning
+        // out the client's own surface and a CPU composite into the boot
+        // framebuffer would be invisible.
+        assert!(
+            (0..16).all(|y| (0..64).all(|x| screen.pixel(x, y) == UNTOUCHED)),
+            "a cursor move repainted while a driver owns scanout"
+        );
+
+        screen.repaint(UNTOUCHED);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 2).expect("flip");
+
+        // Now the pointer is there, over the pixels of the frame it belongs to.
+        // The patch the composite writes is the pointer's rectangle widened to
+        // whole 16-pixel write-combining lines -- [0, 16) here, for a pointer at
+        // x = 4 -- and it carries the frame's own pixels in the columns the
+        // pointer does not cover, which is what makes it a composite rather than
+        // a stamp. Everything outside the patch stays as the driver left it.
+        for y in 0..16 {
+            for x in 0..64 {
+                let in_patch = x < 16 && (2..10).contains(&y);
+                let want = if (4..12).contains(&x) && (2..10).contains(&y) {
+                    0xFF00_00FF
+                } else if in_patch {
+                    0x0000_1111
+                } else {
+                    UNTOUCHED
+                };
+                assert_eq!(screen.pixel(x, y), want, "pixel ({}, {})", x, y);
+            }
+        }
+        assert_eq!(gpu.flips().len(), 2);
+
+        set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
+        drm::flush_pending_flip_completions();
+        let _ = c.read_events(&mut sink);
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// Only a hardware-KMS driver's topology is exposed once one exists. Mixing
+    /// a non-KMS driver's CRTCs in alongside produces a topology with two CRTCs
+    /// sharing one synthetic encoder, and wlroots answers that with "Failed to
+    /// create DRM backend" -- no desktop at all.
+    #[test]
+    fn a_non_kms_drivers_topology_is_not_mixed_in_with_a_kms_one() {
+        let screen = kms_emu::attach(64, 16);
+        let _virtio = screen.attach_gpu(EmuGpu::new("emu-virtio").with_ids(50, 51, 52));
+        let _nvidia = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu").with_ids(60, 61, 62));
+        let c = Client::open(0);
+
+        let (crtcs, conns) = topology(&c);
+        assert_eq!(crtcs, alloc::vec![60], "the non-KMS CRTC was exposed too");
+        assert_eq!(conns, alloc::vec![61]);
+        assert_eq!(planes(&c), alloc::vec![62]);
+    }
+
+    /// Two GPUs of the same model return the SAME synthetic ids, and a topology
+    /// that repeats an id makes wlroots create two outputs with identical
+    /// resource ids -- which ends in 0x0 dumb-buffer allocations and EINVAL.
+    /// This is the dual-card case, so it is the one that has to hold.
+    #[test]
+    fn two_gpus_reporting_the_same_ids_are_each_reported_once() {
+        let screen = kms_emu::attach(64, 16);
+        let _first = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu-0").with_ids(60, 61, 62));
+        let _second = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu-1").with_ids(60, 61, 62));
+        let c = Client::open(0);
+
+        let (crtcs, conns) = topology(&c);
+        assert_eq!(
+            crtcs,
+            alloc::vec![60],
+            "a duplicate CRTC id reached userspace"
+        );
+        assert_eq!(
+            conns,
+            alloc::vec![61],
+            "a duplicate connector id reached userspace"
+        );
+    }
+
+    /// `GETCRTC` reports the framebuffer id in the DRM CORE's namespace, even
+    /// though the driver answers with its own. Handing a client a driver-private
+    /// id would make its next `RMFB` or `GETFB` name a framebuffer that does not
+    /// exist -- and the ids look alike, so nothing would say so.
+    #[test]
+    fn getcrtc_reports_the_core_framebuffer_id_not_the_drivers() {
+        let screen = kms_emu::attach(32, 8);
+        let gpu = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu").with_ids(60, 61, 62));
+        let c = Client::open(0);
+        let buf = c.create_dumb(32, 8);
+        paint(&buf, 0x0000_2222);
+        let fb = c.addfb2(&buf);
+        let driver_fb = gpu.created_fbs()[0].driver_fb_id;
+
+        set_crtc(&c, 60, fb, 32, 8);
+
+        let reported = get_crtc_fb(&c, 60);
+        assert_eq!(reported, fb, "GETCRTC did not report the core's fb id");
+        assert_ne!(reported, driver_fb, "the driver's private id leaked out");
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// `WAIT_VBLANK` reaches a driver that really has hardware vblank.
+    #[test]
+    fn wait_vblank_reaches_a_driver_that_owns_scanout() {
+        let screen = kms_emu::attach(64, 16);
+        let gpu = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu"));
+        let c = Client::open(0);
+
+        wait_vblank(&c);
+
+        assert_eq!(
+            gpu.vblank_waits(),
+            1,
+            "the driver was not asked for a vblank"
+        );
+    }
+
+    /// And never reaches one without it. A driver with no hardware KMS
+    /// implements `wait_vblank` as a busy 16.7 ms spin, so calling it on every
+    /// `WAIT_VBLANK` starves a cooperative async runtime -- the system looks
+    /// frozen. The synthetic timer paces the software path instead.
+    #[test]
+    fn wait_vblank_never_reaches_a_driver_without_hardware_kms() {
+        let screen = kms_emu::attach(64, 16);
+        let gpu = screen.attach_gpu(EmuGpu::new("emu-virtio"));
+        let c = Client::open(0);
+
+        wait_vblank(&c);
+
+        assert_eq!(
+            gpu.vblank_waits(),
+            0,
+            "a 16.7 ms driver spin was entered from an ioctl"
+        );
+    }
+
+    /// Under pure software KMS the driver is NOT asked to make a framebuffer of
+    /// its own. It has no destroy path here, so one per ADDFB2 is a leak for
+    /// every frame a compositor ever allocates -- and nothing would ever use it,
+    /// because the software path does the copy itself.
+    #[test]
+    fn a_driver_that_does_not_own_scanout_is_not_asked_for_framebuffers() {
+        let screen = kms_emu::attach(64, 16);
+        let gpu = screen.attach_gpu(EmuGpu::new("emu-virtio"));
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 16);
+        paint(&buf, 0x0000_3333);
+        let fb = c.addfb2(&buf);
+
+        assert!(
+            gpu.created_fbs().is_empty(),
+            "a driver framebuffer was created with nothing to use it"
+        );
+        // And the software path still put the frame on the screen.
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 1).expect("flip");
+        assert!(
+            gpu.flips().is_empty(),
+            "a non-KMS driver was offered a flip"
+        );
+        assert_eq!(screen.pixel(0, 0), 0x0000_3333);
+
+        drm::flush_pending_flip_completions();
+        let mut sink = [0u8; 32];
+        let _ = c.read_events(&mut sink);
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+}

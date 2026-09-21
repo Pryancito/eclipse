@@ -648,6 +648,28 @@ pub fn register_driver(driver: Arc<dyn DrmScheme>) {
     }
 }
 
+/// Unregister a driver [`register_driver`] added, matched by identity
+/// (`Arc::ptr_eq`) rather than by name. Returns whether one was removed.
+///
+/// Test-only, and `DRM_STATE.drivers` is append-only for a reason: nothing in
+/// this kernel unplugs a GPU. But a unit-test binary runs every test of the
+/// crate in ONE process, and a registered driver changes the answers the whole
+/// DRM core gives -- `software_kms_active()` asks every driver whether it can
+/// scan out, `get_primary_driver()` takes the first entry, and `get_resources`
+/// filters the topology on whether any driver has hardware KMS. One left behind
+/// would put every later test on the hardware path.
+#[cfg(test)]
+pub(crate) fn unregister_driver(driver: &Arc<dyn DrmScheme>) -> bool {
+    let mut state = DRM_STATE.lock();
+    match state.drivers.iter().position(|d| Arc::ptr_eq(d, driver)) {
+        Some(pos) => {
+            state.drivers.remove(pos);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Get the primary DRM driver
 pub fn get_primary_driver() -> Option<Arc<dyn DrmScheme>> {
     DRM_STATE.lock().drivers.first().cloned()
