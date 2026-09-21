@@ -143,9 +143,10 @@ fn init_kernel_page_table() -> PagingResult<PageTable> {
     // into that VMAR and reads it at boot, off the kernel's own table, so the
     // first byte faulted every time: `[KERNEL PAGE FAULT]
     // vaddr=0xffffffff80000001 flags=READ rip=0x0`, then `[KERNEL BUG]
-    // halting`, on every case of `Linux Other Test Baremetal (riscv64)`. The
-    // other architectures get this for free because something already maps
-    // through the top-level entry their `KERNEL_ASPACE_BASE` falls in.
+    // halting`, on every case of `Linux Other Test Baremetal (riscv64)`.
+    // x86_64 gets this for free, because the bootloader's table already maps
+    // through the top-level entry its `KERNEL_ASPACE_BASE` falls in; aarch64
+    // does not, and carries the same block in its own `init_kernel_page_table`.
     //
     // Hard-coded, and it must keep agreeing with
     // `zircon_object::vm::KERNEL_ASPACE_BASE` for riscv64: kernel-hal cannot

@@ -497,7 +497,7 @@ impl vfs::INode for INodeImpl {
             read: true,
             write: true,
             error: false,
-        hangup: false,
+            hangup: false,
         })
     }
     /// the size returned here is logical size(entry num for directory), not the disk space used.
@@ -893,23 +893,74 @@ impl SimpleFileSystem {
         unsafe { Arc::from_raw(ptr) }
     }
 
+    /// Persist the one freemap block that covers `block_id`, and the super
+    /// block's free-block count with it.
+    ///
+    /// Write-ahead, and the reason is that SFS is only half a write-back
+    /// filesystem: an inode and the directory entry that names it go straight
+    /// to the device through `sync_all`, while the bitmap that says the inode's
+    /// block is taken stayed in RAM until someone called
+    /// [`vfs::FileSystem::sync`] -- which nothing in the kernel's boot path
+    /// does. Anything created on an SFS root therefore left the image with a
+    /// directory entry pointing at a block the bitmap still called free, and
+    /// the next boot to look that name up died in `get_inode`'s
+    /// `assert!(!self.free_map.read()[id])`.
+    ///
+    /// That is what `Linux Other Test Baremetal (aarch64)` was reporting: QEMU
+    /// hands aarch64 the live `aarch64.img` as a raw read-write drive, so
+    /// `create_root_fs`'s two `mkdir`s for the `/var/cache/apk` mount point
+    /// were written back into the image, and every run after the first one
+    /// panicked before reaching its test case.
+    ///
+    /// Ordering the bitmap first leaves the opposite failure on a crash: a
+    /// block marked taken that nothing references. That leaks space, which is
+    /// recoverable and harmless, where the other way round is corruption.
+    ///
+    /// The inode itself is the third link in the same chain, and the
+    /// `new_inode_*` constructors write it for the same reason: it used to
+    /// reach the device only from `INodeImpl::drop`, so an inode the kernel
+    /// keeps alive forever -- a mount point, say -- stayed all zeroes on disk
+    /// under a directory entry that named it, and the next mount read
+    /// `FileType::Invalid` out of it and panicked with "Unknown file type".
+    ///
+    /// Best effort: a device that refuses the write leaves the filesystem
+    /// exactly as before, usable in RAM, and `sync` will try again.
+    fn sync_freemap_block(&self, free_map: &BitVec<Lsb0, u8>, block_id: BlockId) {
+        let i = block_id / BLKBITS;
+        let data = free_map.as_buf();
+        let (start, end) = (i * BLKSIZE, (i + 1) * BLKSIZE);
+        if end > data.len() {
+            return;
+        }
+        if self
+            .device
+            .write_at(BLKSIZE * (BLKN_FREEMAP + i), &data[start..end])
+            .is_err()
+        {
+            return;
+        }
+        let super_block = self.super_block.read();
+        let _ = self
+            .device
+            .write_at(BLKSIZE * BLKN_SUPER, super_block.as_buf());
+    }
     /// Allocate a block, return block id
     fn alloc_block(&self) -> Option<usize> {
         let mut free_map = self.free_map.write();
         let id = free_map.alloc();
         if let Some(block_id) = id {
-            let mut super_block = self.super_block.write();
-            if super_block.unused_blocks == 0 {
-                free_map.set(block_id, true);
-                return None;
+            {
+                let mut super_block = self.super_block.write();
+                if super_block.unused_blocks == 0 {
+                    free_map.set(block_id, true);
+                    return None;
+                }
+                super_block.unused_blocks -= 1; // will not underflow
             }
-            super_block.unused_blocks -= 1; // will not underflow
+            self.sync_freemap_block(&free_map, block_id);
             trace!("alloc block {:#x}", block_id);
         } else {
-            trace!(
-                "SFS out of space: {:?}",
-                self.super_block.read()
-            );
+            trace!("SFS out of space: {:?}", self.super_block.read());
             return None;
         }
         id
@@ -919,6 +970,13 @@ impl SimpleFileSystem {
         let mut free_map = self.free_map.write();
         assert!(!free_map[block_id]);
         free_map.set(block_id, true);
+        // Deliberately NOT written through, unlike `alloc_block`. Freeing is
+        // the other direction: the bitmap may only say "free" once nothing
+        // references the block any more, and this runs while the directory
+        // entry that named the inode may still be on the device. Leaving the
+        // block marked taken on disk leaks it until the next `sync`, which is
+        // the recoverable failure; publishing the free bit early is the
+        // corruption `sync_freemap_block` exists to prevent.
         self.super_block.write().unused_blocks += 1;
         trace!("free block {:#x}", block_id);
     }
@@ -962,13 +1020,17 @@ impl SimpleFileSystem {
     fn new_inode_file(&self) -> vfs::Result<Arc<INodeImpl>> {
         let id = self.alloc_block().ok_or(FsError::NoDeviceSpace)?;
         let disk_inode = Dirty::new_dirty(DiskINode::new_file());
-        Ok(self._new_inode(id, disk_inode))
+        let inode = self._new_inode(id, disk_inode);
+        inode.sync_all()?;
+        Ok(inode)
     }
     /// Create a new INode symlink
     fn new_inode_symlink(&self) -> vfs::Result<Arc<INodeImpl>> {
         let id = self.alloc_block().ok_or(FsError::NoDeviceSpace)?;
         let disk_inode = Dirty::new_dirty(DiskINode::new_symlink());
-        Ok(self._new_inode(id, disk_inode))
+        let inode = self._new_inode(id, disk_inode);
+        inode.sync_all()?;
+        Ok(inode)
     }
     /// Create a new INode dir
     fn new_inode_dir(&self, parent: INodeId) -> vfs::Result<Arc<INodeImpl>> {
@@ -976,6 +1038,7 @@ impl SimpleFileSystem {
         let disk_inode = Dirty::new_dirty(DiskINode::new_dir());
         let inode = self._new_inode(id, disk_inode);
         inode.init_direntry(parent)?;
+        inode.sync_all()?;
         Ok(inode)
     }
     /// Create a new INode chardevice
@@ -983,6 +1046,7 @@ impl SimpleFileSystem {
         let id = self.alloc_block().ok_or(FsError::NoDeviceSpace)?;
         let disk_inode = Dirty::new_dirty(DiskINode::new_chardevice(device_inode_id));
         let new_inode = self._new_inode(id, disk_inode);
+        new_inode.sync_all()?;
         Ok(new_inode)
     }
     fn flush_weak_inodes(&self) {

@@ -17,4 +17,9 @@ tempfile = "3.2"
 [features]
 # `lib.rs` tests `feature = "std"` for its `no_std` gate; declare it so the
 # path-patched crate does not raise `unexpected_cfgs` on every build.
-std = []
+#
+# Forwarded to `rcore-fs` so that `cargo test -p rcore-fs-sfs --features std`
+# gets the `Device` impl for `Mutex<File>` that every test in `tests.rs`
+# builds its filesystem on. Without it the test target does not compile at
+# all, which is how this crate's suite went unrun.
+std = ["rcore-fs/std"]

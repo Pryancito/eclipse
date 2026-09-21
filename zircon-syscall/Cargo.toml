@@ -24,6 +24,12 @@ futures = { version = "0.3", default-features = false, features = [
 ] }
 cfg-if = "1.0"
 
+[dev-dependencies]
+# Host unit tests: `kernel-hal`'s hosted (libos) backend is what makes the
+# crate buildable for a test binary at all -- without it the bare-metal HAL's
+# arch modules do not resolve off-target. Same shape as `linux-object`.
+kernel-hal = { path = "../kernel-hal", features = ["libos"] }
+
 [[test]]
 name = "regressions"
 required-features = ["libos"]

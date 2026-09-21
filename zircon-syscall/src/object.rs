@@ -39,11 +39,7 @@ impl Syscall<'_> {
                 }
                 let s = object.name();
                 info!("name={:?}", s);
-                let mut name = [0u8; MAX_NAME_LEN];
-                let bytes = s.as_bytes();
-                let len = bytes.len().min(MAX_NAME_LEN - 1);
-                name[..len].copy_from_slice(&bytes[..len]);
-                UserOutPtr::<u8>::from(buffer).write_array(&name)?;
+                UserOutPtr::<u8>::from(buffer).write_array(&name_buffer(&s))?;
                 Ok(())
             }
             Property::ProcessDebugAddr => {
@@ -144,7 +140,7 @@ impl Syscall<'_> {
             Property::Name => {
                 let length = buffer_size.min(MAX_NAME_LEN);
                 let name = UserInPtr::<u8>::from(buffer).as_str(length)?;
-                object.set_name(name.split('\0').next().unwrap_or(""));
+                object.set_name(stored_name(name));
                 Ok(())
             }
             Property::ProcessDebugAddr => {
@@ -883,4 +879,106 @@ struct KmemInfoExtended {
     ipc_bytes: u64,
     other_bytes: u64,
     vmo_reclaim_disabled_bytes: u64,
+}
+
+/// How much of a `ZX_PROP_NAME` write is kept.
+///
+/// `ZX_MAX_NAME_LEN` counts the terminator, so a name is at most 31 bytes and a
+/// NUL -- which is exactly what the read path writes back. The write path kept
+/// 32, so a process that set a 32-byte name read back 31 of them: the same
+/// decision, taken twice, with the two halves disagreeing by one byte. Both
+/// halves now come from here.
+fn stored_name(written: &str) -> &str {
+    let s = written.split('\0').next().unwrap_or("");
+    let mut end = s.len().min(MAX_NAME_LEN - 1);
+    // The cut is at a byte offset and the name comes from userspace, so it can
+    // land inside a multi-byte character; slicing there panics.
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// The `ZX_MAX_NAME_LEN` buffer a `ZX_PROP_NAME` read hands back: the name, then
+/// a NUL and zeroes. Always terminated, so a caller that treats it as a C string
+/// cannot run off the end.
+fn name_buffer(name: &str) -> [u8; MAX_NAME_LEN] {
+    let mut out = [0u8; MAX_NAME_LEN];
+    let bytes = stored_name(name).as_bytes();
+    out[..bytes.len()].copy_from_slice(bytes);
+    out
+}
+
+#[cfg(test)]
+mod name_property_tests {
+    use super::*;
+    use alloc::string::String;
+
+    /// A name that fits comes back byte for byte, with a terminator after it.
+    #[test]
+    fn a_short_name_survives_the_round_trip() {
+        let out = name_buffer("blobfs");
+        assert_eq!(&out[..6], b"blobfs");
+        assert_eq!(out[6], 0, "the name is not terminated");
+        assert!(out[6..].iter().all(|&b| b == 0), "there is stale tail data");
+        assert_eq!(stored_name("blobfs"), "blobfs");
+    }
+
+    /// What a write keeps is exactly what a read hands back. This is the bug:
+    /// `set` kept 32 bytes and `get` wrote 31 plus a NUL, so a 32-byte name read
+    /// back a byte short of what the process had just set.
+    #[test]
+    fn what_is_stored_is_what_is_read_back() {
+        for len in [0usize, 1, 30, 31, MAX_NAME_LEN, 40] {
+            let written: String = core::iter::repeat('a').take(len).collect();
+            let kept = stored_name(&written);
+            let out = name_buffer(kept);
+            let read_back = core::str::from_utf8(&out[..kept.len()]).unwrap();
+            assert_eq!(
+                read_back, kept,
+                "a name of {} bytes did not round trip",
+                len
+            );
+            assert!(
+                kept.len() < MAX_NAME_LEN,
+                "{} bytes left no room for the NUL",
+                len
+            );
+            assert_eq!(out[kept.len()], 0, "a name of {} bytes lost its NUL", len);
+            // The read path is also given names the kernel set itself, which
+            // never went through the write path's limit, so it applies the same
+            // one rather than trusting its input.
+            let raw = name_buffer(&written);
+            assert_eq!(raw, out, "a {}-byte name read back differently", len);
+            assert_eq!(raw[MAX_NAME_LEN - 1], 0, "the buffer is not terminated");
+        }
+    }
+
+    /// The write stops at the first NUL, the way a C caller passing a short
+    /// string inside a 32-byte buffer expects.
+    #[test]
+    fn a_name_stops_at_its_terminator() {
+        assert_eq!(stored_name("vmo\0\0\0leftovers"), "vmo");
+        assert_eq!(stored_name("\0anything"), "");
+        assert_eq!(name_buffer("vmo\0junk")[3], 0);
+    }
+
+    /// A 32-byte name whose 31st byte is inside a multi-byte character is cut
+    /// before it, not through it. Slicing a `str` at a byte that is not a
+    /// character boundary panics, and the name is userspace's to choose.
+    #[test]
+    fn a_cut_never_lands_inside_a_character() {
+        // 30 bytes of ASCII and a two-byte 'n~': the limit falls between them.
+        let mut written = String::from("abcdefghijklmnopqrstuvwxyz0123");
+        written.push('\u{f1}');
+        assert_eq!(written.len(), 32);
+        let kept = stored_name(&written);
+        assert_eq!(kept.len(), 30, "the character was split or kept whole");
+        assert!(written.starts_with(kept));
+        // And one that does fit is kept whole.
+        let mut fits = String::from("abcdefghijklmnopqrstuvwxyz012");
+        fits.push('\u{f1}');
+        assert_eq!(fits.len(), 31);
+        assert_eq!(stored_name(&fits), fits.as_str());
+    }
 }

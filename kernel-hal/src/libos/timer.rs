@@ -1,6 +1,7 @@
 //! Time and clock functions.
 
 use async_std::task;
+use core::sync::atomic::{AtomicI64, Ordering};
 use nix::time::{clock_gettime, ClockId};
 use std::time::{Duration, SystemTime};
 
@@ -29,18 +30,45 @@ hal_fn_impl! {
     }
 }
 
-/// Wall-clock (libos: host time from `SystemTime`).
+/// Nanoseconds `settimeofday` has shifted the wall clock by, relative to the
+/// host's own `CLOCK_REALTIME`. Signed: the clock may legitimately be set back.
+static WALL_CLOCK_OFFSET_NS: AtomicI64 = AtomicI64::new(0);
+
+/// Wall-clock time (Unix epoch).
+///
+/// This used to return `timer_now()`, i.e. `CLOCK_MONOTONIC` -- the host's
+/// UPTIME, a few thousand seconds. So `time()`, `gettimeofday()` and every
+/// timestamp the kernel stamps on a file said 1970 while hostfs handed back the
+/// host's real mtimes, and `functional/stat.exe` failed on exactly that:
+///
+///     st.st_ctime<=t failed: 1790001664 > 2497
+///
+/// Anything that compares a file's time against the clock -- `make`, `find
+/// -newer`, a cache's freshness check -- saw the whole filesystem dated decades
+/// into the future.
 pub fn wall_clock_now() -> Duration {
-    timer_now()
+    let host = timer_now_realtime();
+    let offset = WALL_CLOCK_OFFSET_NS.load(Ordering::Relaxed);
+    if offset >= 0 {
+        host + Duration::from_nanos(offset as u64)
+    } else {
+        host.saturating_sub(Duration::from_nanos(offset.unsigned_abs()))
+    }
 }
 
-/// Adjust wall clock (libos: no effect on host; satisfies syscall for tests).
-pub fn wall_clock_set(_target: Duration) {}
+/// Adjust the wall clock (`settimeofday`). The host's clock is never touched --
+/// the kernel only remembers how far its own clock has been moved from it.
+pub fn wall_clock_set(target: Duration) {
+    let host = timer_now_realtime().as_nanos() as i128;
+    let delta = (target.as_nanos() as i128 - host).clamp(i64::MIN as i128, i64::MAX as i128);
+    WALL_CLOCK_OFFSET_NS.store(delta as i64, Ordering::Relaxed);
+}
 
-/// Wall-clock offset in nanoseconds (libos: the host clock is already
-/// wall-clock, so there is nothing to add).
+/// Wall-clock offset in nanoseconds, for the vDSO. libos has no vDSO (processes
+/// are host threads), so nothing reads this; it reports the offset against the
+/// host clock rather than against monotonic time.
 pub fn wall_clock_offset_ns() -> u64 {
-    0
+    WALL_CLOCK_OFFSET_NS.load(Ordering::Relaxed).max(0) as u64
 }
 
 /// TSC multiplier for the vDSO (libos: there is no vDSO — processes are host

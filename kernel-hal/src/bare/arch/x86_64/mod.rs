@@ -103,6 +103,11 @@ pub fn primary_init_early() {
     drivers::init_early().unwrap();
 }
 
+/// Nothing to do: the bootloader hands the kernel a page table that already
+/// maps everything the kernel needs, and it is the one the kernel keeps. The
+/// riscv64 and aarch64 twins of this function do have work to do.
+pub fn activate_kernel_page_table() {}
+
 pub fn primary_init() {
     // Give this CPU a write-combining PAT entry and retype the framebuffer's
     // physmap PTEs to it BEFORE the display drivers come up, so the graphic
