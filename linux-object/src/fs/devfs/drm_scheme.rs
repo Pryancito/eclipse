@@ -4003,7 +4003,9 @@ fn drm_ioctl_reconciled(
             core::ptr::copy_nonoverlapping(data as *const u8, kdata.as_mut_ptr(), in_size);
         }
     }
-    let ret = dispatch(canon, kdata.as_ptr() as usize)?;
+    // `as_mut_ptr`: the arms cast this straight to `*mut T` and write their
+    // reply through it, so the pointer they get has to carry write provenance.
+    let ret = dispatch(canon, kdata.as_mut_ptr() as usize)?;
     if out_size != 0 {
         // SAFETY: same range, checked above; `kdata` holds at least `out_size`.
         unsafe {
