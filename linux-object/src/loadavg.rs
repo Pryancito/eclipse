@@ -123,26 +123,38 @@ static SAMPLER_LIVE: AtomicBool = AtomicBool::new(false);
 
 /// Advance the EWMA windows up to `now`, decaying toward `active` (the
 /// runnable count in `FSHIFT` fixed point) for every elapsed 5 s step.
-fn advance(active: u64) {
-    let now = timer_now().as_secs();
-    let mut g = STATE.lock();
-    if g.last_secs == 0 {
-        g.last_secs = now;
-    }
+///
+/// Pure, so the catch-up walk can be exercised without driving the clock:
+/// takes the state and the time, returns the state it leaves behind.
+fn advance_from(loads: [u64; 3], last_secs: u64, now: u64, active: u64) -> ([u64; 3], u64) {
+    let mut loads = loads;
+    // 0 means "never advanced": adopt `now` rather than walking from the
+    // epoch, which would be 256 wasted steps on the first sample.
+    let mut last_secs = if last_secs == 0 { now } else { last_secs };
     let mut steps = 0;
-    while now >= g.last_secs + LOAD_FREQ_SECS && steps < MAX_CATCHUP_STEPS {
-        g.last_secs += LOAD_FREQ_SECS;
-        let l = g.loads;
-        g.loads[0] = calc_load(l[0], EXP_1, active);
-        g.loads[1] = calc_load(l[1], EXP_5, active);
-        g.loads[2] = calc_load(l[2], EXP_15, active);
+    while now >= last_secs + LOAD_FREQ_SECS && steps < MAX_CATCHUP_STEPS {
+        last_secs += LOAD_FREQ_SECS;
+        let l = loads;
+        loads[0] = calc_load(l[0], EXP_1, active);
+        loads[1] = calc_load(l[1], EXP_5, active);
+        loads[2] = calc_load(l[2], EXP_15, active);
         steps += 1;
     }
     // Skipped a large gap (e.g. the sampler was started late): snap the clock
     // forward so the next advance doesn't re-walk the whole interval.
     if steps == MAX_CATCHUP_STEPS {
-        g.last_secs = now;
+        last_secs = now;
     }
+    (loads, last_secs)
+}
+
+/// See [`advance_from`]; this is the same thing against the shared state.
+fn advance(active: u64) {
+    let now = timer_now().as_secs();
+    let mut g = STATE.lock();
+    let (loads, last_secs) = advance_from(g.loads, g.last_secs, now, active);
+    g.loads = loads;
+    g.last_secs = last_secs;
 }
 
 /// Return the averages in `FSHIFT` fixed point. With the periodic sampler
@@ -186,4 +198,213 @@ pub fn loadavg_sysinfo() -> [u64; 3] {
     let l = sample();
     let shift = SI_LOAD_SHIFT - FSHIFT;
     [l[0] << shift, l[1] << shift, l[2] << shift]
+}
+
+#[cfg(test)]
+mod loadavg_tests {
+    //! The load-average arithmetic, which had no tests and is the kind of
+    //! thing that drifts without anything failing: a wrong constant or a lost
+    //! rounding term still produces a plausible-looking number, and nobody
+    //! reads `/proc/loadavg` closely enough to notice it is wrong.
+
+    use super::*;
+
+    /// Linux's `calc_load` rounds **up** while the load is rising
+    /// (`active >= load`), and that `FIXED_1 - 1` is not cosmetic: without it
+    /// a permanently busy box converges on 0.99 and never reaches 1.00,
+    /// because integer division keeps eating the last fraction. Drop the term
+    /// and this test stops terminating at the right value.
+    #[test]
+    fn a_steady_load_is_reached_exactly_and_not_approached_forever() {
+        let target = FIXED_1; // 1.00
+        let mut load = 0;
+        for _ in 0..4096 {
+            load = calc_load(load, EXP_1, target);
+            if load == target {
+                break;
+            }
+        }
+        assert_eq!(load, target, "a load of 1.00 must actually read 1.00");
+    }
+
+    /// And the other direction: an idle box must reach exactly zero, not sit
+    /// at 0.01 for ever. Here the truncation of the division is what carries
+    /// it home, since the rounding term only applies while rising.
+    #[test]
+    fn an_idle_box_decays_all_the_way_to_zero() {
+        let mut load = 64 * FIXED_1; // a load of 64, then nothing to do
+        for _ in 0..4096 {
+            load = calc_load(load, EXP_1, 0);
+            if load == 0 {
+                break;
+            }
+        }
+        assert_eq!(load, 0, "an idle system must read 0.00");
+    }
+
+    /// The fixed point of the recurrence: a load that already equals the
+    /// current activity does not move. If this fails the average drifts on a
+    /// perfectly steady machine, up or down, for no reason.
+    #[test]
+    fn a_load_equal_to_the_activity_does_not_move() {
+        for exp in [EXP_1, EXP_5, EXP_15] {
+            for load in [0, 1, FIXED_1 / 2, FIXED_1, 7 * FIXED_1, 1000 * FIXED_1] {
+                assert_eq!(
+                    calc_load(load, exp, load),
+                    load,
+                    "exp={} moved a steady load of {}",
+                    exp,
+                    load,
+                );
+            }
+        }
+    }
+
+    /// Monotone in the right direction, for all three windows.
+    #[test]
+    fn the_average_always_moves_toward_the_current_activity() {
+        for exp in [EXP_1, EXP_5, EXP_15] {
+            let rising = calc_load(FIXED_1, exp, 4 * FIXED_1);
+            assert!(rising > FIXED_1, "exp={} did not rise", exp);
+            assert!(rising < 4 * FIXED_1, "exp={} overshot in one step", exp);
+
+            let falling = calc_load(4 * FIXED_1, exp, FIXED_1);
+            assert!(falling < 4 * FIXED_1, "exp={} did not fall", exp);
+            assert!(falling > FIXED_1, "exp={} undershot in one step", exp);
+        }
+    }
+
+    /// One step of decay with nothing runnable leaves exactly the constant:
+    /// the `active` term drops out and the rounding does not apply, so
+    /// `calc_load` is a plain multiply by `exp/2048`. That is the shape the
+    /// window test below relies on.
+    #[test]
+    fn one_idle_step_from_a_full_load_leaves_the_decay_constant_itself() {
+        for exp in [EXP_1, EXP_5, EXP_15] {
+            assert_eq!(calc_load(FIXED_1, exp, 0), exp);
+        }
+    }
+
+    /// The three constants *are* the three windows. Rather than assert the
+    /// magic numbers back at themselves, measure what they do: from a full
+    /// load with nothing left to run, an exponentially-weighted average with
+    /// that time constant falls to 1/e after one window's worth of samples.
+    /// Swapping two constants, or moving any of them by one, moves these
+    /// numbers.
+    ///
+    /// They land a little *under* 1/e, and by more the longer the window,
+    /// because every step's integer division truncates and the loss compounds.
+    /// That is why the assertion is a value and a band rather than 753 with
+    /// slack: the band says where the value may be, the value says where it is.
+    #[test]
+    fn each_decay_constant_matches_the_window_it_is_named_after() {
+        // 1/e of 1.00 in FSHIFT fixed point: 2048 / 2.71828 = 753.
+        const ONE_OVER_E: u64 = 753;
+        for (exp, window_secs, landing, name) in [
+            (EXP_1, 60u64, 749u64, "1 minute"),
+            (EXP_5, 300, 731, "5 minutes"),
+            (EXP_15, 900, 720, "15 minutes"),
+        ] {
+            let steps = window_secs / LOAD_FREQ_SECS;
+            let mut load = FIXED_1;
+            for _ in 0..steps {
+                load = calc_load(load, exp, 0);
+            }
+            assert_eq!(
+                load, landing,
+                "the {} window no longer decays the way it did",
+                name,
+            );
+            assert!(
+                load < ONE_OVER_E && load >= ONE_OVER_E - steps,
+                "after {}s the {} average is {}, outside [{}, {}) -- truncation \
+                 can only lose one unit per step, so this is not rounding",
+                window_secs,
+                name,
+                load,
+                ONE_OVER_E - steps,
+                ONE_OVER_E,
+            );
+        }
+    }
+
+    /// `sysinfo(2)` reports the same averages in its own fixed point. The
+    /// shift between the two is the whole conversion, and getting it wrong
+    /// scales every reading by a power of two without any other symptom.
+    #[test]
+    fn the_sysinfo_shift_turns_one_point_zero_into_si_load_shift() {
+        assert_eq!(SI_LOAD_SHIFT - FSHIFT, 5);
+        assert_eq!(FIXED_1 << (SI_LOAD_SHIFT - FSHIFT), 1 << SI_LOAD_SHIFT);
+    }
+
+    /// The catch-up walk. Nothing happens until a whole period has passed,
+    /// and then exactly one step happens per period.
+    #[test]
+    fn the_walk_takes_one_step_per_elapsed_period() {
+        let start = [FIXED_1; 3];
+        let (loads, last) = advance_from(start, 1000, 1000 + LOAD_FREQ_SECS - 1, 0);
+        assert_eq!((loads, last), (start, 1000), "a partial period is no step");
+
+        let (one, last) = advance_from(start, 1000, 1000 + LOAD_FREQ_SECS, 0);
+        assert_eq!(last, 1000 + LOAD_FREQ_SECS);
+        assert_eq!(one, [EXP_1, EXP_5, EXP_15], "one idle step is the constant");
+
+        let (three, last) = advance_from(start, 1000, 1000 + 3 * LOAD_FREQ_SECS, 0);
+        assert_eq!(last, 1000 + 3 * LOAD_FREQ_SECS);
+        // All three slots, each with its own constant: the windows sit in one
+        // array and swapping two of them is a silent, plausible-looking
+        // change that nothing else here would see.
+        for (slot, exp) in [(0usize, EXP_1), (1, EXP_5), (2, EXP_15)] {
+            let mut by_hand = FIXED_1;
+            for _ in 0..3 {
+                by_hand = calc_load(by_hand, exp, 0);
+            }
+            assert_eq!(
+                three[slot], by_hand,
+                "slot {} is not decaying with its own constant",
+                slot,
+            );
+        }
+    }
+
+    /// A first sample adopts the clock instead of walking from the epoch. The
+    /// difference is 256 pointless steps on the very first read, and an
+    /// average that starts out already decayed to nothing.
+    #[test]
+    fn the_first_sample_adopts_the_clock_rather_than_walking_from_boot() {
+        let (loads, last) = advance_from([FIXED_1; 3], 0, 100_000, 0);
+        assert_eq!(last, 100_000);
+        assert_eq!(loads, [FIXED_1; 3], "the first sample must not decay");
+    }
+
+    /// A long gap is capped, and the clock snaps forward so the *next* call
+    /// does not walk the same interval again. Without the snap, every read
+    /// after a long sleep pays for 256 steps, for ever.
+    #[test]
+    fn a_long_gap_is_capped_and_does_not_have_to_be_walked_twice() {
+        let now = 10_000_000u64;
+        let (loads, last) = advance_from([FIXED_1; 3], 1, now, 0);
+        assert_eq!(last, now, "the clock must snap forward after a capped walk");
+
+        let mut by_hand = FIXED_1;
+        for _ in 0..MAX_CATCHUP_STEPS {
+            by_hand = calc_load(by_hand, EXP_15, 0);
+        }
+        assert_eq!(loads[2], by_hand, "exactly the cap, no more and no fewer");
+
+        // The second call has nothing left to do.
+        assert_eq!(advance_from(loads, last, now, 0), (loads, last));
+    }
+
+    /// The cap has to cover the longest window, or a box that was quiet for a
+    /// while reports a 15-minute average that never finished settling.
+    #[test]
+    fn the_catch_up_cap_outlasts_the_longest_window() {
+        let covered = MAX_CATCHUP_STEPS as u64 * LOAD_FREQ_SECS;
+        assert!(
+            covered >= 15 * 60,
+            "the cap covers {}s, less than the 15-minute window",
+            covered,
+        );
+    }
 }
