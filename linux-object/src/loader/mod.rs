@@ -100,10 +100,19 @@ const STACK_TOP: usize = USER_ASPACE_BASE as usize + USER_ASPACE_SIZE as usize;
 /// Linux keeps the two apart by construction: the heap grows up from the image
 /// and the mmap arena grows DOWN from just below the stack. This tree's
 /// allocator is bottom-up, so the equivalent is to start the heap high above
-/// where mmap will be working. 32 TiB leaves the mmap arena the whole bottom of
-/// a 128 TiB address space and the heap ~96 TiB to grow into: neither can
-/// reach the other in any realistic program.
-const HEAP_BASE: usize = 0x0000_2000_0000_0000;
+/// where mmap will be working: a quarter of the way up leaves the mmap arena
+/// the whole bottom of the address space and the heap the other three
+/// quarters to grow into, so neither can reach the other in any realistic
+/// program. On x86_64 and aarch64 that is the same 32 TiB this used to spell
+/// out, with a 128 TiB space below the stack.
+///
+/// A fraction rather than a literal because riscv64 runs Sv39, whose user half
+/// is 256 GiB: 32 TiB is not an address there at all, so `brk` could never
+/// place the heap and every growth failed with `brk: failed to map 0x2000
+/// bytes at 0x200000000000: INVALID_ARGS` — on `/bin/busybox ls` as much as on
+/// anything else, which is what `Linux Other Test Baremetal (riscv64)` was
+/// failing cases on even when the program itself printed the right answer.
+pub const HEAP_BASE: usize = (USER_ASPACE_SIZE as usize).next_power_of_two() / 4;
 
 // The image sub-VMARs below are placed with `allocate(None, ..)`, i.e. at the
 // root VMAR's base, and PT_LOAD segments are then mapped at their `p_vaddr`

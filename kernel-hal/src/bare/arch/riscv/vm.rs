@@ -96,13 +96,38 @@ fn init_kernel_page_table() -> PagingResult<PageTable> {
         MMUFlags::READ,
     )?;
     // physical frames
+    //
+    // Capped at 2 MiB pages, where every other range above takes whatever
+    // `map_cont` can fit. Sv39 has three levels, so a 1 GiB mapping *is* a
+    // top-level entry — and `pt_clone_kernel_space` copies the top-level
+    // entries BY VALUE into every address space it makes. A top-level entry
+    // that points at a table is genuinely shared (the copy is the same
+    // pointer); a top-level entry that is a leaf is not. This window is the
+    // kernel heap, which is where the scheduler's coroutine stacks come from,
+    // and `stack_guard` has to punch a 4 KiB hole in it to give a stack an
+    // unmapped guard band. Splitting a 1 GiB leaf to do that would be
+    // invisible to every address space cloned before the split — the guard
+    // would exist on the kernel's own table and nowhere else. Keeping the
+    // top-level entries tables makes the split happen one level down, in a
+    // table all of them already share.
+    //
+    // The price is one extra table per GiB of RAM (4 KiB) and 2 MiB TLB
+    // entries instead of 1 GiB ones.
+    const MAX_KERNEL_HEAP_PAGE: usize = 0x20_0000;
     for r in crate::mem::free_pmem_regions() {
         info!("FREE PHY MEM: {:x?}", r);
-        map_range(
-            phys_to_virt(r.start),
-            phys_to_virt(r.end),
-            MMUFlags::READ | MMUFlags::WRITE,
-        )?;
+        let start = align_down(phys_to_virt(r.start));
+        let end = align_up(phys_to_virt(r.end));
+        let mut vaddr = start;
+        while vaddr < end {
+            // Chunks stop on 2 MiB boundaries, so `map_cont` sees a run that
+            // is never big enough for a 1 GiB page and is 2 MiB-aligned as
+            // soon as the region is.
+            let chunk =
+                (MAX_KERNEL_HEAP_PAGE - (vaddr & (MAX_KERNEL_HEAP_PAGE - 1))).min(end - vaddr);
+            map_range(vaddr, vaddr + chunk, MMUFlags::READ | MMUFlags::WRITE)?;
+            vaddr += chunk;
+        }
     }
 
     // Force the level-1 table of the kernel VMAR window into existence, by
