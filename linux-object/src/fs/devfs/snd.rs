@@ -479,18 +479,18 @@ struct PcmState {
 
 /// The single-client claim on one audio device, shared by every front end
 /// onto it: the native ALSA PCM at `/dev/snd/pcmC<card>D0p` and the OSS node
-/// at `/dev/dsp<card>`. Both drive the SAME hardware ring, and the ring has
-/// no mixer — two writers interleave into each other's frames, which is why a
-/// second front end has to be refused rather than served. Linux does the same
-/// thing with one substream behind both its ALSA and OSS-emulation nodes: the
-/// second opener gets `EBUSY`.
+/// at `/dev/dsp<card>`. It is only used on a device that has one ring and
+/// no mixer (`open_stream` answers `None`): there both front ends drive
+/// the SAME hardware ring, two writers would interleave into each other's
+/// frames, and the second opener has to be refused (`EBUSY`), as Linux
+/// refuses a second open of one substream. A device that mixes hands each
+/// open a stream of its own instead, and the claim is never taken.
 ///
-/// That refusal is what makes clients recover on their own. `mpg123` with no
-/// `-o` walks libout123's built-in driver list and takes the first module
-/// that both loads AND opens, OSS included; an `EBUSY` from `/dev/dsp` moves
-/// it on to the next one (ALSA -> the pulse plugin -> the daemon that DOES
-/// mix). Answering the open and then playing into a ring PulseAudio owns is
-/// what made a bare `mpg123 file.mp3` silent.
+/// On an unmixed device that refusal is what makes clients recover on
+/// their own: `mpg123` with no `-o` walks libout123's built-in driver list
+/// and takes the first module that both loads AND opens, OSS included, so
+/// an `EBUSY` from `/dev/dsp` moves it on to the next one (ALSA -> the
+/// pulse plugin -> the daemon that mixes).
 pub type AudioClaim = Arc<AtomicBool>;
 
 /// An unheld claim, for one audio device.
@@ -504,6 +504,13 @@ pub struct PcmDev {
     inode_id: usize,
     st: Arc<Mutex<PcmState>>,
     opened: AudioClaim,
+    /// A client handle (from [`open_client`](PcmDev::open_client)): drops
+    /// the stream when it goes. The registry node that `new` built is not
+    /// one and owns nothing.
+    client: bool,
+    /// This handle took [`opened`](PcmDev::opened) and releases it on drop:
+    /// a client of an unmixed device. A client with a stream of its own
+    /// never took it.
     release_opened_on_drop: bool,
 }
 
@@ -522,37 +529,65 @@ impl PcmDev {
             audio,
             card,
             inode_id: DevFS::new_inode_id(),
-            st: Arc::new(Mutex::new(PcmState {
-                state: STATE_OPEN,
-                rate: 48000,
-                buffer_size: 16384,
-                period_size: 1024,
-                boundary: 0x4000_0000_0000_0000,
-                appl_ptr: 0,
-                avail_min: 1024,
-                start_threshold: 1,
-                stop_threshold: 16384,
-                silence_threshold: 0,
-                silence_size: 0,
-                tstamp_mode: 0,
-                tstamp_type: 0,
-                period_step: 1,
-                sleep_min: 0,
-                xfer_align: 1,
-                proto: 0,
-                trigger_tstamp: Timespec { sec: 0, nsec: 0 },
-                stalled_since: None,
-            })),
+            st: Self::fresh_state(),
             opened,
+            client: false,
             release_opened_on_drop: false,
         }
     }
 
-    /// `hw:card,0` is a single-client PCM: the one process that owns it keeps
-    /// the shared runtime state and timer view until close, and everyone else
-    /// gets `EBUSY` as on Linux — `/dev/dsp<card>`, which shares the claim,
-    /// included.
+    /// The runtime state of a PCM that has just been opened.
+    fn fresh_state() -> Arc<Mutex<PcmState>> {
+        Arc::new(Mutex::new(PcmState {
+            state: STATE_OPEN,
+            rate: 48000,
+            buffer_size: 16384,
+            period_size: 1024,
+            boundary: 0x4000_0000_0000_0000,
+            appl_ptr: 0,
+            avail_min: 1024,
+            start_threshold: 1,
+            stop_threshold: 16384,
+            silence_threshold: 0,
+            silence_size: 0,
+            tstamp_mode: 0,
+            tstamp_type: 0,
+            period_step: 1,
+            sleep_min: 0,
+            xfer_align: 1,
+            proto: 0,
+            trigger_tstamp: Timespec { sec: 0, nsec: 0 },
+            stalled_since: None,
+        }))
+    }
+
+    /// `open(2)` on `hw:card,0`.
+    ///
+    /// On a device that mixes, every open is a client of its own: a stream
+    /// from [`AudioScheme::open_stream`] with its own rate, buffer, pointer
+    /// and state, mixed in the kernel with every other open (PulseAudio's
+    /// and a bare `mpg123 -o alsa` at once). The runtime state is fresh
+    /// per open, so nothing one client sets reaches another. The timer
+    /// node (`/dev/snd/timer`) still samples the registry node's state,
+    /// which no client-of-a-stream drives; a `dmix` on top of a device
+    /// that already mixes has nothing to add anyway.
+    ///
+    /// On a device with one ring and no mixer, the one process that owns
+    /// it keeps the shared runtime state and timer view until close, and
+    /// everyone else gets `EBUSY` as on Linux — `/dev/dsp<card>`, which
+    /// shares the claim, included.
     pub fn open_client(&self) -> Result<Arc<dyn INode>> {
+        if let Some(stream) = self.audio.open_stream().map_err(|_| FsError::DeviceError)? {
+            return Ok(Arc::new(PcmDev {
+                audio: stream,
+                card: self.card,
+                inode_id: self.inode_id,
+                st: Self::fresh_state(),
+                opened: self.opened.clone(),
+                client: true,
+                release_opened_on_drop: false,
+            }));
+        }
         if self
             .opened
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -566,6 +601,7 @@ impl PcmDev {
             inode_id: self.inode_id,
             st: self.st.clone(),
             opened: self.opened.clone(),
+            client: true,
             release_opened_on_drop: true,
         }))
     }
@@ -1887,7 +1923,7 @@ impl Drop for PcmDev {
     fn drop(&mut self) {
         // Only a client handle releases the device; the registry node that
         // `new` built owns nothing.
-        if !self.release_opened_on_drop {
+        if !self.client {
             return;
         }
         // Closing a PCM DROPS it, as on Linux: the stream stops and whatever
@@ -1913,7 +1949,9 @@ impl Drop for PcmDev {
             st.appl_ptr = 0;
             st.stalled_since = None;
         }
-        self.opened.store(false, Ordering::Release);
+        if self.release_opened_on_drop {
+            self.opened.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -2646,9 +2684,20 @@ mod timer_tests {
             /// the capacity is the same at every rate.
             link: Option<u32>,
             rate: Mutex<u32>,
+            /// `open_stream` answers with a fresh `FakeAudio` of the same
+            /// capacity: a device that mixes.
+            mixing: bool,
         }
 
         impl FakeAudio {
+            /// As [`new`](FakeAudio::new), but every open gets a stream of
+            /// its own.
+            pub(super) fn mixing(cap: usize) -> Self {
+                let mut fake = Self::new(cap);
+                fake.mixing = true;
+                fake
+            }
+
             pub(super) fn new(cap: usize) -> Self {
                 Self {
                     cap,
@@ -2656,6 +2705,7 @@ mod timer_tests {
                     hold: Mutex::new(false),
                     link: None,
                     rate: Mutex::new(48_000),
+                    mixing: false,
                 }
             }
 
@@ -2701,6 +2751,14 @@ mod timer_tests {
         }
 
         impl AudioScheme for FakeAudio {
+            fn open_stream(&self) -> DeviceResult<Option<Arc<dyn AudioScheme>>> {
+                Ok(if self.mixing {
+                    Some(Arc::new(FakeAudio::new(self.cap)))
+                } else {
+                    None
+                })
+            }
+
             fn set_params(&self, rate: u32, channels: u8) -> DeviceResult<(u32, u8)> {
                 *self.rate.lock() = rate;
                 Ok((rate, channels))
@@ -3048,6 +3106,56 @@ mod timer_tests {
             drop(dsp_client);
 
             assert!(pcm.open_client().is_ok(), "closing /dev/dsp frees the card");
+        }
+
+        /// On a device that mixes, every open is a stream of its own: the
+        /// second `open` of `hw:0,0` is served, not refused, and the two
+        /// clients have separate rings, pointers and states. This is what
+        /// lets PulseAudio and a bare `mpg123 -o alsa` play at once.
+        #[test]
+        fn a_mixing_device_serves_every_open_with_a_stream_of_its_own() {
+            let audio = Arc::new(FakeAudio::mixing(8 * BYTES_PER_FRAME as usize));
+            let pcm = Arc::new(PcmDev::new(audio.clone(), 0));
+            let first_open = pcm.open_client().unwrap();
+            let second_open = pcm
+                .open_client()
+                .expect("a second open of a mixing device is a second stream");
+            let first = first_open.downcast_ref::<PcmDev>().unwrap();
+            let second = second_open.downcast_ref::<PcmDev>().unwrap();
+            assert!(
+                !Arc::ptr_eq(&first.st, &second.st),
+                "each open has runtime state of its own"
+            );
+            let samples = [0u8; 4 * BYTES_PER_FRAME as usize];
+            first.audio.write(&samples).unwrap();
+            assert_eq!(first.audio.queued_bytes(), samples.len());
+            assert_eq!(
+                second.audio.queued_bytes(),
+                0,
+                "one client's PCM is not in the other's queue"
+            );
+            assert_eq!(
+                audio.queued_bytes(),
+                0,
+                "nor in the device's own (the registry node's) queue"
+            );
+            // The claim is never taken on a mixing device, so `/dev/dsp`
+            // sharing it is served too.
+            let dsp = Arc::new(DspDev::with_claim(audio.clone(), 0, pcm.opened.clone()));
+            let dsp_client = dsp
+                .open_client()
+                .expect("/dev/dsp is a third stream, not EBUSY");
+            assert!(
+                !pcm.opened.load(Ordering::Acquire),
+                "a stream of its own, not the shared claim"
+            );
+            drop(dsp_client);
+            // Closing a client still DROPs its own stream (and nobody
+            // else's), claim or no claim.
+            let first_stream = first.audio.clone();
+            drop(first_open);
+            assert_eq!(first_stream.queued_bytes(), 0, "close drops the stream");
+            assert!(pcm.open_client().is_ok());
         }
 
         /// A node built with its own claim (no sharing) stays exclusive

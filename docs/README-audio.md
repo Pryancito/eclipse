@@ -23,36 +23,66 @@ userspace:  wavplay / ffmpeg -f oss
                  │ write(2) + OSS ioctls
 /dev/dsp[N] ─ linux-object/src/fs/devfs/dsp.rs   (OSS node, one per controller)
 /dev/snd/*  ─ linux-object/src/fs/devfs/snd.rs   (ALSA, Pulse's backend)
-                 │ AudioScheme
-drivers/src/audio/hda.rs                          (controller + codec + PCM ring)
+                 │ AudioScheme::open_stream  → one stream per open(2)
+drivers/src/audio/pipeline/host.rs                (host buffer + SRC, per stream)
+                 │ pulled by the fill loop, every 4 ms while the engine runs
+drivers/src/audio/pipeline/mixer.rs + volume.rs   (sum of every stream, master gain)
+                 │
+drivers/src/audio/hda.rs                          (controller + codec + DMA ring: the DAI)
                  │ CORB/RIRB verbs + stream DMA (all polled, no interrupts)
 HDA controller (PCI 04:03) ── codec ── pin ── HDMI/DP or analog jack
 ```
 
+This is Sound Open Firmware's playback pipeline (`host -> src -> mixer ->
+volume -> dai`) run in the kernel instead of on a DSP: every client owns a
+host buffer, the mixer pulls from all of them at the DAI's pace, and the
+DAI -- the HDA stream and its ring -- never sees a client.
+
 - **Controller** (`drivers/src/audio/hda.rs`): CRST reset, codec discovery
   via STATESTS, CORB/RIRB rings with polled responses, one output stream
-  over a 64 KiB physically contiguous cyclic ring described by a BDL.
+  over a 256 KiB physically contiguous cyclic ring described by a BDL.
   Progress is derived from the link clock (WALCLK) and capped by the
-  position counters; consumed ring space is re-zeroed behind the DMA
-  position so an underrun plays silence, never stale audio.
-- **The stream is a DAI** (after Sound Open Firmware's `dai-zephyr.c`): when
-  the ring runs out of client PCM the engine is *not* stopped. It keeps
-  cycling over a zeroed ring, the next write is parked one BDL segment past
-  the furthest position any counter reports (so it lands where the engine
-  has not fetched yet), and the silence between the playhead and that point
-  is booked as a *pad*: it counts in the client's queue and in
-  `DELAY`/`GETODELAY` alike, so `avail` never promises the room the pad
-  occupies (the client's hardware pointer steps back once, by the pad,
-  when the gap opens; leaving the pad out kept the pointer still but had
-  PulseAudio fill the ring, wake while the pad was still ahead of the
-  playhead, and abort on the write that took nothing). The engine is stopped after 5 s of silence
-  (`DAI_IDLE_STOP_US`), PulseAudio's own idle timeout, or on `DROP`,
-  `PREPARE`, `SNDCTL_DSP_SYNC`/`RESET` and close. Before this every
-  underrun stopped the stream and the next write restarted it -- codec
-  verbs, pin sense, HDMI kick -- and an HDMI/DP sink that sees its audio
-  stream restart mutes while it re-locks, hundreds of milliseconds on a
+  position counters.
+- **The ring is the DAI's, filled by the kernel** (after Sound Open
+  Firmware's `dai-zephyr.c`). No client writes into it. A *fill loop*
+  (`HdaInner::fill_ring`, run from every front-end call and from the ALSA
+  watchdog timer every 4 ms while the engine runs) keeps the ring
+  `FILL_DEPTH` (16 KiB, 85 ms) ahead of the furthest point the engine can
+  have reached -- the link clock's play position or the controller's own
+  counter, whichever runs ahead (`fill_span`) -- with the mix of every
+  active stream, never within `RING_GUARD` of the play position from
+  behind. A `SILENCE_AHEAD` band of zeros is kept past the fill point so a
+  fill that comes late plays silence rather than a lap-old ring, and a
+  fill the engine overtook skips forward (`late fills` in `/proc/gpusnd`):
+  the streams' PCM is late, not lost. A fill that mixes nothing (no
+  stream has PCM) opens a *gap*: the engine is *not* stopped, it keeps
+  cycling over zeros, and is stopped after 5 s of that
+  (`DAI_IDLE_STOP_US`, PulseAudio's own idle timeout). Nothing a client
+  does -- prepare, drop, pause, close, a rate change -- touches the
+  engine; only the idle stop does. Before the DAI model every underrun
+  stopped the stream and the next write restarted it -- codec verbs, pin
+  sense, HDMI kick -- and an HDMI/DP sink that sees its audio stream
+  restart mutes while it re-locks, hundreds of milliseconds on a
   television: a 10 ms hole in the data was heard as a half-second hole in
-  the sound, at every underrun.
+  the sound. The ring's size is not the latency any more: a client's
+  latency is its own buffer (`HOST_BUFFER`, 48 KiB, 256 ms: what the old
+  ring offered once the guard was taken off, so nothing a client sees
+  changed) plus the fill depth. What the ring has to cover is the
+  position *lead* -- QEMU's `intel-hda` fetches for its backend's buffer
+  and has been seen 106 KB ahead of the link clock, which with the old
+  64 KiB ring left no write window at all (`free = 0` with nothing
+  audible queued).
+- **Streams** (`drivers/src/audio/pipeline/host.rs`): SOF's host
+  component. `AudioScheme::open_stream` hands each `open(2)` of `hw:0,0`
+  or `/dev/dsp` a `HostStream` of its own, a full `AudioScheme`: rate,
+  buffer, counts, pause, start hold, rewind/forward and reset are all per
+  stream, and dropping the handle removes it from the mix. The device's
+  own trait implementation is one more stream. Several clients therefore
+  play at once through the kernel -- PulseAudio on `hw:0,0` and a bare
+  `mpg123` on `/dev/dsp` are mixed in `mix_block` -- and a second open is
+  no longer `EBUSY`. The single-client claim the front ends used to
+  serialise opens with still exists, for a device whose `open_stream`
+  answers `None` (one ring, no mixer); the HDA driver never answers that.
 - **Processing components** (`drivers/src/audio/pipeline/`), SOF's
   numerics in Rust, pure and unit-tested without hardware:
   `volume` is SOF's volume component -- Q8.16 gain (`1 << 16` = 0 dB),
@@ -67,59 +97,45 @@ HDA controller (PCI 04:03) ── codec ── pin ── HDMI/DP or analog jack
   output sample, with the phase step scaled by the ratio on downsampling so
   the cutoff follows the lower Nyquist and nothing aliases. Fixed-point and
   streaming (it keeps the input history a straddling window needs, so a
-  chunked stream resamples the same as one buffer). It is **wired into the
-  HDA driver as a fixed-rate sink**: the link is always programmed at 48 kHz
-  (`LINK_RATE` in `hda.rs`), `set_params` accepts any client rate, and a
-  client at another rate is resampled into the ring on the way in. The ring
-  and every counter derived from it stay in link frames; only the four
-  numbers the front ends see (free, queued, delay, buffer) and the write
-  itself cross into client frames, through `accept_client_frames` /
-  `link_to_client_bytes` / `client_to_link_bytes`. `free_bytes` reports
-  exactly what `write` will accept, and `queued_bytes` is derived from that
-  same figure (`client_queued_bytes`: `buffer - accept`), so the ALSA node's
-  own `avail = buffer_size - queued` equals what `write` takes at every fill
-  level of the ring. That identity is what keeps PulseAudio alive: its
-  `alsa-sink.c` aborts if a write it was just told had room returns 0
-  (`try_recover`'s EAGAIN assert). Converting `queued` independently broke
-  it near a full ring by one to four frames, and the daemon died within
-  seconds of the converter engaging; the unit tests now check the identity
-  at every fill level and pin the old formula as broken. The same identity
-  has to hold at negotiation time: the ring holds a rate-dependent number
-  of *client* frames (12288 at 48 kHz, 11289 at 44.1 kHz), and the ALSA
-  node bounds `buffer_size` before the `set_params` that switches the
-  device, so it asks the device for the capacity *at the requested rate*
-  (`AudioScheme::buffer_bytes_at`). Bounding a 44.1 kHz request with the
-  previous 48 kHz stream's figure granted PulseAudio 999 frames the ring
-  did not have, `avail` never reached zero, and the daemon aborted the
-  same way a few seconds into every 44.1 kHz track. And it has to hold
-  through the silence pad of a gap: both counts come from the ring's whole
-  occupancy (`client_counts`), pad included. A client
-  at 48 kHz takes the pre-existing path byte for byte, so with the daemon's
-  sink fixed at 48 kHz (below) the converter is dormant; it engages when a
-  front end negotiates another rate. `/proc/gpusnd` shows `client=.. Hz
-  src=passthrough|resampling`. A rate change does not restart the stream
-  either: `set_params` is ALSA's prepare, and while the engine is running on
-  an unchanged link format (with the link fixed, every call after the first)
-  it is a **soft prepare** -- the queued PCM is dropped and the engine is
-  left running into a gap, the two steps every natural drain already takes
-  (`run_gap` zeroes the ring with the engine running, then re-parks the
-  writer), instead of a stop, a wipe and a full restart with its codec
-  verbs, pin sense and HDMI kick. `/proc/gpusnd` counts them as `soft
-  prepares`; a rate switch adds nothing to `stream restarts`. The same
-  applies to a re-prepare after an XRUN. Only a stopped, paused or
-  un-programmed engine, or a real link-format change, takes the hard path.
-  Turning the converter on for the desktop is then one reversible line:
-  let the daemon hand streams to the sink at their native rate
-  (`avoid-resampling` in `daemon.conf`).
+  chunked stream resamples the same as one buffer). It is **wired into
+  every stream as a fixed-rate sink**: the link is always programmed at
+  48 kHz (`LINK_RATE`), `set_params` accepts any client rate, and a client
+  at another rate is resampled into its stream on the way in. The stream
+  holds link frames; only the four numbers the front ends see (free,
+  queued, delay, buffer) and the write itself cross into client frames,
+  through `accept_client_frames` / `link_to_client_bytes` /
+  `client_to_link_bytes`. `free_bytes` reports exactly what `write` will
+  accept, and `queued_bytes` is derived from that same figure
+  (`client_counts`: `buffer - accept`), so the ALSA node's own `avail =
+  buffer_size - queued` equals what `write` takes at every fill level.
+  That identity is what keeps PulseAudio alive: its `alsa-sink.c` aborts
+  if a write it was just told had room returns 0 (`try_recover`'s EAGAIN
+  assert). Three separate ways of losing it each cost the daemon a
+  SIGABRT -- converting `queued` independently (off by one to four
+  frames near a full buffer), bounding the client's buffer with the
+  previous stream's capacity at negotiation time (the buffer holds a
+  rate-dependent number of *client* frames, 12288 at 48 kHz and 11289 at
+  44.1 kHz, so the ALSA node asks for the capacity *at the requested
+  rate*, `AudioScheme::buffer_bytes_at`, before the `set_params` that
+  switches), and, back when clients wrote straight into the DMA ring,
+  leaving the driver's own silence pad out of `queued` while `write` was
+  bounded by it. With the ring the kernel's there is no pad and no third
+  case: both counts come out of one function from one occupancy figure,
+  by construction, and the host tests check the identity at every fill
+  level for every rate with the real converter. A client at 48 kHz takes
+  a byte-for-byte path; `/proc/gpusnd` shows `client=.. Hz
+  src=passthrough|resampling` per stream. A rate change never touches
+  the engine: `set_params` is the stream's prepare (queued PCM dropped, a
+  fresh converter), and the link's format is fixed. Letting the daemon
+  hand streams to the sink at their native rate (`avoid-resampling` in
+  `daemon.conf`) is then one reversible line.
   `mixer` is SOF's mixer component (`mix_n_s16`): it sums several S16LE
   streams into one, accumulating each frame in `i32` and clamping once at the
   end, never pairwise (a pairwise clamp folds a loud stream over a quiet one
-  before they cancel). It carries no per-source gain -- a stream that wants to
-  be quieter runs through `volume` first. The ring is single-client today (a
-  second opener gets `EBUSY`, and PulseAudio mixes in userspace); this
-  component is what a kernel-side mixer is built from, and **not yet wired
-  into a device path**. Wiring it -- answering more than one open on a card
-  and mixing their rings -- is the follow-up.
+  before they cancel). It carries no per-source gain; the master `volume`
+  runs on the mix, on its way into the ring. The fill loop is its caller
+  (`mix_block`: one `pull` per stream into a shared `i32` accumulator, a
+  stream with less than the block contributes silence past what it has).
 - **Codec graph**: the widget walk collects every output-capable pin with a
   reachable converter as a *candidate path*. Path choice is scored (digital
   HDMI/DP pin > presence > ELD valid) and — crucially — **re-evaluated at
@@ -187,13 +203,18 @@ cat /proc/gpusnd
   and `SD_LPIB` sampled twice 2 ms apart, reported as `ADVANCING` or
   `STALLED`. `STALLED` with RUN set means the DMA engine is not fetching:
   a controller/BDL problem, not a display one.
-- **Ring and events**: `queued` is the client's PCM, with the driver's
-  silence pad shown beside it, and `gap=` says how long the engine has been
-  idling on silence. The `events` line counts gaps (`drains` and
-  `underruns`), `idle stops` (a gap that reached 5 s), and `stream
-  restarts`; a restart count that climbs during continuous playback means
-  something is stopping the stream (a `DROP`, a `PREPARE` after XRUN), since
-  a gap alone no longer does. Each `gap:` line places one in its stream.
+- **Ring, streams and events**: the `ring:` line says how far ahead of
+  the playhead the ring is filled, how many streams are open, and `gap=`
+  how long the engine has been idling on silence; one `stream N:` line
+  per open follows, with its client rate, whether it resamples, what it
+  holds, its state (`started`, `stopped`, `paused`, `start held`) and its
+  own `underruns` (pulls that found a started stream empty: that client
+  fell behind). The `events` line counts gaps (`drains`: no stream was
+  started; `underruns`: a started stream had nothing), `idle stops` (a
+  gap that reached 5 s), `stream restarts` (an engine start from stopped:
+  the first write after an idle stop) and `late fills` (the engine
+  overtook the fill loop: a scheduling hole longer than the fill depth
+  plus the silence band). Each `gap:` line places one in its stream.
 - **Active path**, read back *from the codec* rather than from what the driver
   believes it wrote: the converter's stream id and format, digital-converter
   enable, power state, and on the pin the OUT_EN bit, presence/ELD-valid from
@@ -218,8 +239,12 @@ cat /proc/gpusnd
 ## Userspace API: PulseAudio
 
 The session runs a **system-instance** PulseAudio daemon (`pulseaudio --system`)
-on top of ALSA card 0. That is what gives Eclipse several simultaneous playback
-clients: the kernel PCM is single-client (no dmix — it needs SysV IPC), and
+on top of ALSA card 0. It is what gives every libpulse and ALSA-`default`
+client per-stream volume and format conversion in userspace; the kernel PCM
+itself mixes too (one stream per open, see the architecture above), so a
+client that opens `hw:0,0` or `/dev/dsp` directly plays alongside the daemon
+rather than being refused. (No dmix — it needs SysV IPC, and there is
+nothing left for it to do.) The daemon
 Pulse mixes in userspace.
 
 - Socket: `unix:/run/pulse/native` (`PULSE_SERVER` is set in eclipse-init, the
@@ -238,9 +263,9 @@ The sink stays IDLE with the PCM open instead.
   `avoid-resampling = yes` with `default-sample-rate = 48000` and no
   `alternate-sample-rate`. The kernel is a fixed-rate sink (see the
   processing components above): the HDA link always runs at 48 kHz, `hw:0,0`
-  accepts any client rate and converts it into the ring with `pipeline::src`
-  (~-90 dB), and a rate change is a soft prepare that never restarts the
-  stream, so it never re-locks an HDMI/DP sink. `avoid-resampling` therefore
+  accepts any client rate and converts it into the client's stream with
+  `pipeline::src` (~-90 dB), and a rate change is that stream's own prepare
+  and never touches the engine, so it never re-locks an HDMI/DP sink. `avoid-resampling` therefore
   hands a lone stream to the sink at its native rate -- 44.1 kHz for most
   music -- instead of resampling it in userspace with speex; the daemon only
   resamples when two streams at different rates play at once, to
@@ -251,17 +276,19 @@ The sink stays IDLE with the PCM open instead.
   back to the daemon resampling everything, `avoid-resampling = no` is the
   one line: the kernel side is then passthrough, byte-identical to before.
   What to look at in `/proc/gpusnd` with a 44.1 kHz track playing: the
-  `ring:` line reads `client=44100 Hz src=resampling`, and switching tracks
-  bumps `soft prepares`, not `stream restarts`.
-- A bare `mpg123 file.mp3` reaches the daemon because `/dev/dsp` refuses it.
-  mpg123 1.3x has no config file at all, so with no `-o` libout123 walks its
-  built-in driver list and takes the first module that both loads AND opens --
-  and the OSS one is in that list. `/dev/dsp` shares the native PCM's
-  single-client claim, so while PulseAudio holds `hw:0,0` the OSS open returns
-  `EBUSY` and libout123 moves on to its ALSA module, `/etc/asound.conf`, the
-  pulse plugin and the daemon. (Before that claim existed, OSS won the list,
-  put a second writer into Pulse's ring and played silent.) `audio-probe`
-  checks it in `[daemon]`, and `[oss]` skips while the daemon has the card.
+  daemon's `stream N:` line reads `client=44100 Hz src=resampling`, and
+  switching tracks leaves `stream restarts` where it was.
+- A bare `mpg123 file.mp3` may play through `/dev/dsp` rather than the
+  daemon. mpg123 1.3x has no config file at all, so with no `-o` libout123
+  walks its built-in driver list and takes the first module that both loads
+  AND opens -- and the OSS one is in that list. With the kernel mixing, that
+  open is served (a stream of its own, mixed with the daemon's) and plays;
+  it just bypasses the daemon's per-stream volume. `mpg123 -o alsa` goes
+  through `/etc/asound.conf` and the pulse plugin as before. (When the
+  kernel PCM was single-client, `/dev/dsp` answered `EBUSY` while the
+  daemon held the card and that refusal was what sent mpg123 on to the
+  daemon; before the claim existed, OSS won the list, put a second writer
+  into Pulse's ring and played silent.)
 - OpenAL (`ALSOFT_DRIVERS=pulse,alsa`) talks native libpulse. PI-futexes are
   implemented, so `pa_mutex_new()` no longer aborts.
 
@@ -277,7 +304,7 @@ speaker-test -c 2 -t sine # ALSA default → Pulse
 it the module loads-or-creates a cookie under a path the `pulse` account
 cannot write, fails to initialise, and the daemon runs on with **no socket**:
 alive, owning the cards, refusing every client (`Connection refused` from the
-pulse plugin, `EBUSY` from `/dev/dsp`). xtask only rewrites configs carrying
+pulse plugin). xtask only rewrites configs carrying
 its `# eclipse-generated` marker, so an older `system.pa` used to survive
 every rebuild in that state; it now moves such a file aside (`system.pa.bak`),
 always ships the canonical script as `/etc/pulse/system.pa.eclipse`, and
@@ -287,8 +314,7 @@ the config in place lacks the key. `audio-probe` checks the line directly.
 `system.pa` loads `module-native-protocol-unix` **before** the ALSA sinks.
 `module-alsa-sink` touches hardware, and a card whose load wedges leaves the
 daemon alive, owning that PCM, with the socket module never reached: every
-client gets `Connection refused` (ALSA `default` is the pulse plugin) while
-`/dev/dsp` answers `EBUSY` because the daemon really does hold the card. With
+client gets `Connection refused` (ALSA `default` is the pulse plugin). With
 the socket first, that costs one sink instead of the whole daemon, and
 `pactl list sinks` still names the card that did not come up. `audio-probe`
 reports a live daemon with no socket as its own failure.
@@ -341,8 +367,8 @@ The stream state machine follows `sound/core/pcm_native.c`:
 plugin** when `pulseaudio` and `alsa-plugins-pulse` are in the image, so
 mpg123/`aplay` multiplex through the daemon. The kernel PCM remains
 `eclipse_hw` (`hw:0,0`) for Pulse's own ALSA sink. Format conversion is still
-available as `aplay -D plug`. Without Pulse in the image, `default` is `hw:0,0`
-and playback is single-client. Card 0 is the preferred playback device (HDMI/DP
+available as `aplay -D plug`. Without Pulse in the image, `default` is `hw:0,0`,
+and the kernel mixes its opens. Card 0 is the preferred playback device (HDMI/DP
 with a live display outranks analog jacks); the remaining controllers follow
 in PCI probe order:
 
@@ -468,15 +494,13 @@ volume, the driver scales S16LE), a channel written as 0 is muted,
 `SOUND_MIXER_INFO` names the card. `aumix`, `ossmix` and mpv's OSS volume
 control land here.
 
-`/dev/dsp<N>` and `/dev/snd/pcmC<N>D0p` are two front ends onto the SAME
-hardware ring, and the ring has no mixer, so they share one single-client
-claim: whichever opens second gets `EBUSY`, as on Linux (one substream behind
-both nodes). With PulseAudio running — it keeps `hw:0,0` open, since
-`module-suspend-on-idle` is not loaded — every OSS client therefore gets
-`EBUSY` and should play through the daemon instead (`mpg123 file.mp3`,
-`paplay`). Stop `pulseaudio` to use `/dev/dsp` or `wavplay` directly. Two
-writers on one ring is the failure this refusal prevents: the second one
-interleaves into the first one's frames and both come out wrong or silent.
+`/dev/dsp<N>` and `/dev/snd/pcmC<N>D0p` are two front ends onto the same
+card, and every open of either is a stream of its own, mixed in the kernel:
+`wavplay` on `/dev/dsp` plays while PulseAudio holds `hw:0,0`. (On a device
+whose driver does not answer `open_stream`, the two nodes fall back to one
+shared single-client claim and whichever opens second gets `EBUSY`, as on
+Linux with one substream behind both nodes; the HDA driver never takes that
+path.)
 
 ## Testing
 
@@ -515,18 +539,25 @@ so you can hear the guest. Override with `AUDIODEV=wav` (PCM to
 
 - Playback only (no capture), stereo only, S16LE only at the kernel PCM.
   PulseAudio resamples other formats in userspace.
-- Several clients can play at once through PulseAudio. Direct `hw:0,0` and
-  `/dev/dsp` are single-client (no dmix) and share ONE claim between them, so
-  while the daemon holds the card both answer `EBUSY`.
+- Several clients play at once, through PulseAudio or directly: every open
+  of `hw:0,0` and `/dev/dsp` is a stream mixed in the kernel. There is no
+  per-stream volume at the kernel (the one `Master` gain is applied to the
+  mix); PulseAudio's per-stream volume is the daemon's.
+- `/dev/snd/timer` samples the registry node's PCM state, which no
+  client-of-a-stream drives, so an ALSA timer bound to `hw:0,0` does not
+  tick for a client's stream. Nothing in the image uses one (`dmix` would,
+  and there is nothing left for it to do).
 - Volume is software PCM scaling (no analog AMP programming), ramped over
   32 ms of audio; already-queued ring contents are not retroactively gained
   — the new level applies from the next `write`, so with PulseAudio's
   250 ms sink buffer it is heard a quarter of a second later. Pulse sink
   volume applies to mixed output.
-- After a gap the first write lands past the engine's fetch position, so up
-  to one BDL segment plus whatever the controller over-reports (on the
-  NVIDIA function, tens of KiB) of extra silence precedes it: `DELAY`
-  reports it, `hw_ptr` does not move through it.
+- A stream's PCM is mixed into the ring up to `FILL_DEPTH` (85 ms) plus
+  the position lead ahead of the playhead, so a client's hardware pointer
+  runs that far ahead of what is audible; `DELAY`/`GETODELAY` report the
+  difference. A stall of the fill loop longer than the depth plus the
+  silence band delays the streams rather than dropping their PCM (`late
+  fills` in `/proc/gpusnd`).
 - The DP audio path uses the same ELD/enable controls but has not been
   exercised; DP-MST audio (device entries > 0) is not implemented.
 - The HDMI/DP unmute is re-sent at every digital stream start (GOP never
