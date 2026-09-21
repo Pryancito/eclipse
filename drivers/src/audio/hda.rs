@@ -470,41 +470,70 @@ fn client_to_link_bytes(client_bytes: usize, fin: u32, fout: u32, frame: usize) 
     (frames * fout as u64 / fin as u64) as usize * frame
 }
 
-/// Client bytes queued, as the front ends must see them while a converter
-/// is in the path. Derived from the SAME [`accept_client_frames`] figure that
-/// `free_bytes` reports and `write` accepts, so that
-/// `buffer_bytes - queued_bytes == free_bytes` holds exactly.
+/// The two counts the front ends see, `(free, queued)` in client bytes, for
+/// a ring with `queued_link` bytes occupied -- the whole occupancy, the
+/// driver's silence pad included. `free` is exactly what `write` will
+/// accept ([`accept_client_frames`] of the room left, or the room itself
+/// without a converter), and `queued` is `buffer - free`, so that
+/// `buffer_bytes - queued_bytes == free_bytes` holds to the byte at every
+/// fill level, pad or no pad.
 ///
 /// That identity is load-bearing. The ALSA node does not ask the driver how
 /// much is free: it computes `avail = buffer_size - queued` itself, offers
 /// that many frames, and PulseAudio's `alsa-sink.c` aborts (`try_recover`:
 /// `pa_assert(err != -EAGAIN)`) if a write it was just told had room comes
-/// back with 0. Converting `queued` on its own -- `link_to_client_bytes` of
-/// the ring occupancy -- broke the identity near a full ring: three
-/// independently floored conversions plus the [`SRC_SLACK_FRAMES`] held
-/// back by `accept_client_frames` left `avail` at one to four frames while
-/// `write` accepted none. That was a SIGABRT inside libalsa-util within
-/// seconds of the converter engaging.
+/// back with 0. Two ways of breaking it have each cost the daemon:
 ///
-/// `exposed_link` is the ring occupancy less the driver's silence pad, as
-/// [`HdaInner::exposed_queued`] reports it, so this stays monotonic while
-/// a gap's pad grows -- the hardware pointer derived from it must never run
-/// backwards. Near a full ring there is no pad, and the figure then equals
-/// `buffer - free` to the byte.
+/// * converting `queued` on its own (`link_to_client_bytes` of the
+///   occupancy) left `avail` at one to four frames near a full ring while
+///   `write` accepted none -- three independently floored conversions plus
+///   the [`SRC_SLACK_FRAMES`] held back by `accept_client_frames`;
+/// * deriving `queued` from the occupancy *less the pad* (so the hardware
+///   pointer never stepped back) while `write` was bounded by the whole
+///   occupancy left `avail` overstating the room by the pad: after every
+///   underrun the daemon filled the ring, woke while the pad was still
+///   ahead of the playhead, was told there was room, and got 0. On QEMU,
+///   where VM exits stall the guest for tens of milliseconds and the pad
+///   runs to 180 ms, that was every underrun.
+///
+/// So the pad counts. The price is that the client's hardware pointer
+/// (`appl_ptr - queued`) steps back once, by the pad, when a gap opens and
+/// the writer is parked past the engine: the honest reading of "the device
+/// put silence between what you wrote and what you will write next". A
+/// pointer that keeps still through a gap while the ring fills up behind
+/// the client's back is the alternative, and it is the one that aborts.
+fn client_counts(
+    buffer_link: usize,
+    queued_link: usize,
+    src: Option<(u32, u32)>,
+    frame: usize,
+) -> (usize, usize) {
+    if frame == 0 {
+        return (0, 0);
+    }
+    let room = buffer_link.saturating_sub(queued_link);
+    let (buffer, free) = match src {
+        Some((fin, fout)) => (
+            link_to_client_bytes(buffer_link, fin, fout, frame),
+            accept_client_frames(room / frame, fin, fout) * frame,
+        ),
+        None => (buffer_link, room),
+    };
+    (free, buffer.saturating_sub(free))
+}
+
+/// Client bytes queued with a converter in the path: the `queued` half of
+/// [`client_counts`], for a ring with `queued_link` bytes occupied. The
+/// driver goes through `client_counts` itself; this is the tests' handle.
+#[cfg(test)]
 fn client_queued_bytes(
     buffer_link: usize,
-    exposed_link: usize,
+    queued_link: usize,
     fin: u32,
     fout: u32,
     frame: usize,
 ) -> usize {
-    if frame == 0 {
-        return 0;
-    }
-    let buffer = link_to_client_bytes(buffer_link, fin, fout, frame);
-    let room_link = buffer_link.saturating_sub(exposed_link);
-    let free = accept_client_frames(room_link / frame, fin, fout) * frame;
-    buffer.saturating_sub(free)
+    client_counts(buffer_link, queued_link, Some((fin, fout)), frame).1
 }
 
 /// Whether a `set_params` may keep the engine running (a soft prepare, see
@@ -1287,36 +1316,33 @@ impl HdaInner {
         }
     }
 
+    /// `(free, queued)` as the front ends see them, from the ONE figure
+    /// both derive from: the ring's whole occupancy, pad included (see
+    /// [`client_counts`]).
+    fn client_counts(&self) -> (usize, usize) {
+        client_counts(
+            self.ring_len - RING_GUARD,
+            self.queued,
+            self.src_rates(),
+            self.frame_bytes(),
+        )
+    }
+
     /// Client bytes a write may take right now. This is what `free_bytes`
     /// reports to the front ends and exactly what `write` accepts, so the
     /// two never disagree (see [`accept_client_frames`]).
     fn client_free_bytes(&self) -> usize {
-        let free = self.free_bytes();
-        match self.src_rates() {
-            Some((fin, fout)) => {
-                let frame = self.frame_bytes();
-                accept_client_frames(free / frame, fin, fout) * frame
-            }
-            None => free,
-        }
+        self.client_counts().0
     }
 
-    /// Client bytes queued as the front ends see them: the ring occupancy
-    /// less the pad without a converter (unchanged from before the fixed-rate
-    /// sink), and [`client_queued_bytes`] with one, so `avail` agrees with
-    /// what `write` accepts.
+    /// Client bytes queued as the front ends see them: `buffer - free`, so
+    /// `avail` agrees with what `write` accepts. The silence pad is in it
+    /// (see [`client_counts`] for why); [`exposed_queued`] is what a
+    /// rewind may take back.
+    ///
+    /// [`exposed_queued`]: HdaInner::exposed_queued
     fn client_queued_bytes(&self) -> usize {
-        let exposed = self.exposed_queued();
-        match self.src_rates() {
-            Some((fin, fout)) => client_queued_bytes(
-                self.ring_len - RING_GUARD,
-                exposed,
-                fin,
-                fout,
-                self.frame_bytes(),
-            ),
-            None => exposed,
-        }
+        self.client_counts().1
     }
 
     /// Convert `client_frames` whole frames of client S16LE `pcm` through the
@@ -1685,10 +1711,10 @@ mod format_and_ring_tests {
     //! position that runs backwards is what the intermittent dropouts were.
 
     use super::{
-        accept_client_frames, client_buffer_bytes, client_queued_bytes, client_to_link_bytes,
-        exposed_queued, free_bytes_of, honourable_bytes, link_to_client_bytes, nearest_rate,
-        park_target, prepare_keeps_engine, stream_format, sub_nodes, Resampler, CLIENT_RATE_MAX,
-        CLIENT_RATE_MIN, LINK_RATE, SRC_SLACK_FRAMES,
+        accept_client_frames, client_buffer_bytes, client_counts, client_queued_bytes,
+        client_to_link_bytes, exposed_queued, free_bytes_of, honourable_bytes,
+        link_to_client_bytes, nearest_rate, park_target, prepare_keeps_engine, stream_format,
+        sub_nodes, Resampler, CLIENT_RATE_MAX, CLIENT_RATE_MIN, LINK_RATE, SRC_SLACK_FRAMES,
     };
 
     /// The one case a prepare keeps the engine running: running, not
@@ -1886,6 +1912,81 @@ mod format_and_ring_tests {
             broken_levels > 0,
             "the old formula should have had a zero-accept level with avail > 0"
         );
+    }
+
+    /// The identity holds through a silence pad, with and without a
+    /// converter: the two counts come from the one occupancy figure, so
+    /// `buffer - queued` is exactly what `write` accepts whatever share of
+    /// the ring is the driver's own silence.
+    #[test]
+    fn avail_equals_what_write_accepts_through_a_silence_pad() {
+        let frame = 4usize;
+        let buffer_link = 12288 * frame;
+        for src in [None, Some((44_100, LINK_RATE)), Some((96_000, LINK_RATE))] {
+            let buffer = match src {
+                Some((fin, fout)) => link_to_client_bytes(buffer_link, fin, fout, frame),
+                None => buffer_link,
+            };
+            for pad_frames in [0usize, 1, 5, 2048, 9000, 12288] {
+                for exposed_frames in (0..=12288usize).step_by(7) {
+                    let occupied = ((pad_frames + exposed_frames) * frame).min(buffer_link);
+                    let (free, queued) = client_counts(buffer_link, occupied, src, frame);
+                    // What `write` accepts for that physical room.
+                    let accept = match src {
+                        Some((fin, fout)) => {
+                            accept_client_frames((buffer_link - occupied) / frame, fin, fout)
+                                * frame
+                        }
+                        None => buffer_link - occupied,
+                    };
+                    assert_eq!(
+                        free, accept,
+                        "{:?} pad {} exposed {}",
+                        src, pad_frames, exposed_frames
+                    );
+                    assert_eq!(
+                        buffer - queued,
+                        accept,
+                        "{:?} pad {} exposed {}: avail {} accept {}",
+                        src,
+                        pad_frames,
+                        exposed_frames,
+                        buffer - queued,
+                        accept
+                    );
+                }
+            }
+        }
+    }
+
+    /// The formula this replaces: `queued` from the occupancy LESS the pad
+    /// (so the hardware pointer never stepped back) while `write` was bound
+    /// by the whole occupancy. With a pad ahead of the playhead and the ring
+    /// full, `avail` promised the pad's worth and `write` took nothing --
+    /// PulseAudio's abort after every underrun on QEMU (a 9000-frame pad
+    /// is what its stalled position reads produce).
+    #[test]
+    fn leaving_the_pad_out_of_queued_promised_room_the_write_refused() {
+        let frame = 4usize;
+        let buffer_link = 12288 * frame;
+        for src in [None, Some((44_100, LINK_RATE))] {
+            let pad = 9000 * frame;
+            let exposed = buffer_link - pad; // the ring is physically full
+            let (accept, _) = client_counts(buffer_link, exposed + pad, src, frame);
+            let (_, old_queued) = client_counts(buffer_link, exposed, src, frame);
+            let buffer = match src {
+                Some((fin, fout)) => link_to_client_bytes(buffer_link, fin, fout, frame),
+                None => buffer_link,
+            };
+            let old_avail = buffer - old_queued;
+            assert_eq!(accept, 0, "{:?}: the ring is full", src);
+            assert!(
+                old_avail >= 8000 * frame,
+                "{:?}: the old avail promised {} B with nothing accepted",
+                src,
+                old_avail
+            );
+        }
     }
 
     /// Queued as the client sees it never runs backwards as the ring fills,

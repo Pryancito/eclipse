@@ -40,9 +40,12 @@ HDA controller (PCI 04:03) ── codec ── pin ── HDMI/DP or analog jack
   cycling over a zeroed ring, the next write is parked one BDL segment past
   the furthest position any counter reports (so it lands where the engine
   has not fetched yet), and the silence between the playhead and that point
-  is booked as a *pad*: excluded from the client's queue count (its
-  hardware pointer only moves through bytes it wrote) but included in
-  `DELAY`/`GETODELAY`. The engine is stopped after 5 s of silence
+  is booked as a *pad*: it counts in the client's queue and in
+  `DELAY`/`GETODELAY` alike, so `avail` never promises the room the pad
+  occupies (the client's hardware pointer steps back once, by the pad,
+  when the gap opens; leaving the pad out kept the pointer still but had
+  PulseAudio fill the ring, wake while the pad was still ahead of the
+  playhead, and abort on the write that took nothing). The engine is stopped after 5 s of silence
   (`DAI_IDLE_STOP_US`), PulseAudio's own idle timeout, or on `DROP`,
   `PREPARE`, `SNDCTL_DSP_SYNC`/`RESET` and close. Before this every
   underrun stopped the stream and the next write restarted it -- codec
@@ -88,7 +91,9 @@ HDA controller (PCI 04:03) ── codec ── pin ── HDMI/DP or analog jack
   (`AudioScheme::buffer_bytes_at`). Bounding a 44.1 kHz request with the
   previous 48 kHz stream's figure granted PulseAudio 999 frames the ring
   did not have, `avail` never reached zero, and the daemon aborted the
-  same way a few seconds into every 44.1 kHz track. A client
+  same way a few seconds into every 44.1 kHz track. And it has to hold
+  through the silence pad of a gap: both counts come from the ring's whole
+  occupancy (`client_counts`), pad included. A client
   at 48 kHz takes the pre-existing path byte for byte, so with the daemon's
   sink fixed at 48 kHz (below) the converter is dormant; it engages when a
   front end negotiates another rate. `/proc/gpusnd` shows `client=.. Hz
