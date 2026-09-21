@@ -2394,6 +2394,47 @@ mod tests {
         assert_eq!(b[0], 0, "nothing comes back from before the truncate");
     }
 
+    /// `mmap`'s offset is a raw machine word from userspace, and it arrives
+    /// here in bytes, where the page cache adds it to the mapping length.
+    ///
+    /// `mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0xFFFFFFFFFFFFF000)` is
+    /// page-aligned, so the one check this path had let it through, and
+    /// `offset + len` wrapped to zero: a kernel panic in debug, and in release
+    /// a cache that claimed to cover a window it does not.
+    ///
+    /// The syscall layer rejects that offset now, but `get_vmo_shared` is a
+    /// trait method, so the invariant it owes its caller is asserted here:
+    /// whatever it returns, `off + len` must fit inside the VMO, because
+    /// `sys_mmap` computes `vmo.len() - off` from it.
+    #[async_std::test]
+    async fn a_mapping_offset_that_wraps_is_refused_not_wrapped() {
+        use super::{new_memfd, FileLike};
+        const PAGE: usize = 4096;
+        let f = new_memfd("hostile-offset", 0).unwrap();
+        f.set_len(4 * PAGE as u64).unwrap();
+        // Make the cache exist first: the wrap used to be *worse* on this arm,
+        // where a registered cache is returned for a window it cannot cover.
+        let (_warm, _) = f.get_vmo_shared(0, PAGE).unwrap();
+
+        for offset in [
+            usize::MAX - PAGE + 1,     // sum wraps to exactly 0
+            usize::MAX - 2 * PAGE + 1, // sum wraps to PAGE
+            usize::MAX / PAGE * PAGE,  // the highest page-aligned offset there is
+        ] {
+            assert_eq!(offset % PAGE, 0, "the offsets under test are aligned");
+            if let Ok((vmo, off)) = f.get_vmo_shared(offset, PAGE) {
+                assert!(
+                    off.checked_add(PAGE).is_some_and(|end| end <= vmo.len()),
+                    "get_vmo_shared({:#x}) returned off={:#x} for a vmo of {:#x}: \
+                     sys_mmap computes vmo.len() - off and would underflow",
+                    offset,
+                    off,
+                    vmo.len()
+                );
+            }
+        }
+    }
+
     /// A read fault on a shared object commits a real page (so a later write
     /// through another mapping is seen); a private one still gets the global
     /// zero frame.

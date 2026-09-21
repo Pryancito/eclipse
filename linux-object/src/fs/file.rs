@@ -302,16 +302,24 @@ fn inode_cache_vmo(
     len: usize,
     mark_shared: bool,
 ) -> Option<Arc<VmObject>> {
+    // Every arm below adds `offset + len`, and `offset` is a byte offset that
+    // came from userspace via `mmap`. Unchecked, the addition is a kernel panic
+    // in debug and a wrap in release -- and a wrap is worse than the panic here,
+    // because it makes the "does the cache cover this window?" test below answer
+    // yes for a window the cache does not cover at all. The syscall layer
+    // (`validate_mmap_offset`) rejects such an offset now, but `get_vmo_shared`
+    // is a trait method, so the arithmetic defends itself too.
+    let end = offset.checked_add(len)?;
     let key = cache_key(inode);
     let mut registry = SHARED_FILE_VMOS.lock();
     prune_shared_vmos(&mut registry);
     if let Some((vmo, inode_weak, ever_shared)) = registry.get_mut(&key) {
-        if offset + len > vmo.len() {
+        if end > vmo.len() {
             // The file grew since the cache was made: grow the cache, so the
             // new window shares the very same pages as every earlier mapper
             // and `read(2)`. The old fallback (a private snapshot) was what
             // made a mapping of a grown memfd read zeros for its head.
-            if vmo.set_len(offset + len).is_err() {
+            if vmo.set_len(end).is_err() {
                 return None;
             }
         }
@@ -327,7 +335,7 @@ fn inode_cache_vmo(
     // Cover the whole file (so later mappers at other offsets share it too),
     // demand-paged from the inode. Created under the registry lock so a
     // concurrent first-map cannot race us into two caches.
-    let vmo_len = file_size.max(offset + len);
+    let vmo_len = file_size.max(end);
     let source: Arc<dyn zircon_object::vm::FrameFiller> = Arc::new(FileFrameFiller {
         inode: inode.clone(),
         file_offset: 0,
