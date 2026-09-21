@@ -5891,22 +5891,36 @@ mod hw_kms_tests {
         );
     }
 
-    /// And never reaches one without it. A driver with no hardware KMS
-    /// implements `wait_vblank` as a busy 16.7 ms spin, so calling it on every
-    /// `WAIT_VBLANK` starves a cooperative async runtime -- the system looks
-    /// frozen. The synthetic timer paces the software path instead.
+    /// And never reaches one without it, in either configuration that can
+    /// arise. A driver with no hardware KMS implements `wait_vblank` as a busy
+    /// 16.7 ms spin, so calling it per `WAIT_VBLANK` starves a cooperative async
+    /// runtime and the whole system looks frozen; the synthetic timer paces the
+    /// software path instead. Two guards stand between the ioctl and that spin,
+    /// and they cover different cases: with an output attached the software-KMS
+    /// check stops it, and with no output at all (a VirtIO-only guest) only the
+    /// driver's own `has_hardware_kms()` does.
     #[test]
-    fn wait_vblank_never_reaches_a_driver_without_hardware_kms() {
+    fn wait_vblank_never_reaches_a_driver_that_does_not_own_scanout() {
+        // No output: `software_kms_active()` is false, so the per-driver check
+        // is the only thing left.
+        {
+            let headless = kms_emu::headless();
+            let gpu = headless.attach_gpu(EmuGpu::new("emu-virtio"));
+            wait_vblank(&Client::open(0));
+            assert_eq!(
+                gpu.vblank_waits(),
+                0,
+                "a 16.7 ms driver spin was entered with no output attached"
+            );
+        }
+        // With an output, the software path owns the pacing.
         let screen = kms_emu::attach(64, 16);
         let gpu = screen.attach_gpu(EmuGpu::new("emu-virtio"));
-        let c = Client::open(0);
-
-        wait_vblank(&c);
-
+        wait_vblank(&Client::open(0));
         assert_eq!(
             gpu.vblank_waits(),
             0,
-            "a 16.7 ms driver spin was entered from an ioctl"
+            "a 16.7 ms driver spin was entered while software KMS drives the output"
         );
     }
 

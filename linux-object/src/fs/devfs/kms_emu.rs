@@ -123,7 +123,9 @@ impl DisplayScheme for EmuDisplay {
 /// unregisters the display again, including while a panic unwinds.
 pub(crate) struct Screen {
     _serialised: std::sync::MutexGuard<'static, ()>,
-    dev: Device,
+    /// `None` for a [`headless`] guard, which takes the lock without attaching
+    /// an output at all.
+    dev: Option<Device>,
     height: u32,
     pitch_px: u32,
 }
@@ -132,7 +134,9 @@ impl Drop for Screen {
     fn drop(&mut self) {
         // Detach first, THEN reset: unblanking with a display still registered
         // would clear it, and the reset has to happen with nothing to clear.
-        kernel_hal::drivers::remove_device_hosted(&self.dev);
+        if let Some(dev) = self.dev.take() {
+            kernel_hal::drivers::remove_device_hosted(&dev);
+        }
         super::drm::reset_output_state_for_test();
     }
 }
@@ -182,9 +186,25 @@ pub(crate) fn attach_with(width: u32, height: u32, pitch_px: u32, wc: bool) -> S
 
     Screen {
         _serialised: serialised,
-        dev,
+        dev: Some(dev),
         height,
         pitch_px,
+    }
+}
+
+/// Take the DRM test lock with NO output attached.
+///
+/// The configuration where a DRM driver is the only graphics device: no boot
+/// framebuffer, so `software_kms_active()` is false whatever the driver claims,
+/// and the core has to fall through to the driver for everything. A VirtIO-only
+/// guest with no framebuffer display is exactly this, and it is the only place
+/// some of the per-driver guards are load-bearing rather than redundant.
+pub(crate) fn headless() -> Screen {
+    Screen {
+        _serialised: super::drm::test_globals::lock(),
+        dev: None,
+        height: 0,
+        pitch_px: 0,
     }
 }
 
