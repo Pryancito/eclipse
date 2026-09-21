@@ -1446,48 +1446,140 @@ impl LinuxProcess {
         mode & !self.umask()
     }
 
-    fn gid_in_groups(creds: &Credentials, gid: u32) -> bool {
-        creds.egid == gid || creds.rgid == gid || creds.groups.contains(&gid)
+    // Which of a caller's three ids an unprivileged id switch may name is NOT
+    // one set: Linux draws a different one per syscall argument, and collapsing
+    // them into "any of the three" quietly accepts switches Linux refuses.
+    // Each rule below cites the `kernel/sys.c` test it comes from.
+
+    /// `setuid(2)`/`setgid(2)`: the real or the SAVED id.
+    /// `sys_setuid`: `!uid_eq(kuid, old->uid) && !uid_eq(kuid, new->suid)`
+    /// -> `-EPERM`. The EFFECTIVE id is deliberately not in this set.
+    fn setid_allowed(real: u32, saved: u32, id: u32) -> bool {
+        id == real || id == saved
+    }
+
+    /// The REAL id argument of `setreuid(2)`/`setregid(2)`: the real or the
+    /// effective id, never the saved one. `sys_setreuid`:
+    /// `ruid != -1 && !uid_eq(kruid, old->uid) && !uid_eq(kruid, old->euid)`
+    /// -> `-EPERM`. This is the narrowest of the three rules, and the one that
+    /// keeps a saved id from being laundered into the real id.
+    fn set_real_allowed(real: u32, effective: u32, id: u32) -> bool {
+        id == real || id == effective
+    }
+
+    /// Any of the three: the EFFECTIVE argument of `setreuid(2)`, and every
+    /// argument of `setresuid(2)`/`setresgid(2)`.
+    fn set_any_allowed(real: u32, effective: u32, saved: u32, id: u32) -> bool {
+        id == real || id == effective || id == saved
+    }
+
+    /// Whether `setreuid(real, eff)`/`setregid` also rewrites the SAVED id (to
+    /// the new effective one). Linux: `if (ruid != -1 || (euid != -1 &&
+    /// !uid_eq(keuid, old->uid))) new->suid = new->euid;` -- and nothing
+    /// else. There used to be a `privileged ||` term in front, so a root
+    /// `setreuid(-1, -1)`, which asks for nothing at all, still overwrote the
+    /// saved uid and threw away an id the caller had deliberately kept in
+    /// order to come back to it.
+    fn setreid_updates_saved(real_arg: u32, eff_arg: u32, old_real: u32) -> bool {
+        real_arg != NO_ID || (eff_arg != NO_ID && eff_arg != old_real)
     }
 
     fn allowed_uid(creds: &Credentials, uid: u32) -> bool {
-        uid == creds.ruid || uid == creds.euid || uid == creds.suid
+        Self::set_any_allowed(creds.ruid, creds.euid, creds.suid, uid)
     }
 
     fn allowed_gid(creds: &Credentials, gid: u32) -> bool {
-        gid == creds.rgid || gid == creds.egid || gid == creds.sgid
+        Self::set_any_allowed(creds.rgid, creds.egid, creds.sgid, gid)
     }
 
     fn check_requested_access(mode: u16, requested: u16) -> bool {
         requested == 0 || (mode & requested) == requested
     }
 
-    fn access_bits_for(creds: &Credentials, metadata: &Metadata, use_effective: bool) -> u16 {
+    /// Whether the credentials belong to group `gid`, the way Linux's
+    /// `in_group_p()` decides it: the ACTING group (fsgid, which is `egid`
+    /// here) plus the supplementary list -- and nothing else.
+    ///
+    /// The effective path used to also accept `rgid` (through a helper that
+    /// mixed this question up with which gids a caller may switch TO, a
+    /// different set). That handed a process the file's GROUP
+    /// permission bits on the strength of a group it no longer acts as, which
+    /// is the one thing `setegid`/`setregid` exists to take away: a program
+    /// that drops its effective gid to give up access keeps it. Group bits are
+    /// normally wider than other bits, so the divergence only ever granted
+    /// more than Linux would.
+    fn acts_as_group(creds: &Credentials, gid: u32, use_effective: bool) -> bool {
+        let acting = if use_effective {
+            creds.egid
+        } else {
+            creds.rgid
+        };
+        acting == gid || creds.groups.contains(&gid)
+    }
+
+    /// The permission bits `creds` gets on a file owned by `owner_uid:owner_gid`
+    /// with mode `mode`. Linux's `acl_permission_check`: owner, else group,
+    /// else other -- and the owner arm is EXCLUSIVE, never falling back to the
+    /// wider group or other bits.
+    fn access_bits(
+        creds: &Credentials,
+        owner_uid: u32,
+        owner_gid: u32,
+        mode: u16,
+        use_effective: bool,
+    ) -> u16 {
         let uid = if use_effective {
             creds.euid
         } else {
             creds.ruid
         };
-        let gid = if use_effective {
-            creds.egid
-        } else {
-            creds.rgid
-        };
         if uid == ROOT_UID {
-            return metadata.mode & 0o777;
+            return mode & 0o777;
         }
-        if uid == metadata.uid as u32 {
-            return (metadata.mode >> 6) & 0o7;
+        if uid == owner_uid {
+            return (mode >> 6) & 0o7;
         }
-        let in_group = if use_effective {
-            Self::gid_in_groups(creds, metadata.gid as u32)
+        if Self::acts_as_group(creds, owner_gid, use_effective) {
+            return (mode >> 3) & 0o7;
+        }
+        mode & 0o7
+    }
+
+    /// The whole DAC decision (Linux's `generic_permission`) on pure inputs:
+    /// may `creds` do `requested` (an `0o7` mask) to a file owned by
+    /// `owner_uid:owner_gid` with mode `mode`? `use_effective` selects the
+    /// effective ids (every normal path) or the real ones (`access(2)`).
+    fn access_verdict(
+        creds: &Credentials,
+        owner_uid: u32,
+        owner_gid: u32,
+        mode: u16,
+        is_dir: bool,
+        requested: u16,
+        use_effective: bool,
+    ) -> LxResult {
+        let selected_uid = if use_effective {
+            creds.euid
         } else {
-            gid == metadata.gid as u32 || creds.groups.contains(&(metadata.gid as u32))
+            creds.ruid
         };
-        if in_group {
-            return (metadata.mode >> 3) & 0o7;
+        if selected_uid == ROOT_UID {
+            // CAP_DAC_OVERRIDE semantics: root bypasses permission checks
+            // except executing a non-directory with no exec bit set anywhere
+            // (mode & 0o111 == 0). Directories are always searchable by root;
+            // testing only the others-exec bit here used to lock root out of
+            // 0700 directories (e.g. apk's /lib/apk/exec, breaking triggers).
+            if requested & ACCESS_EXEC != 0 && !is_dir && mode & 0o111 == 0 {
+                return Err(LxError::EACCES);
+            }
+            return Ok(());
         }
-        metadata.mode & 0o7
+        let granted = Self::access_bits(creds, owner_uid, owner_gid, mode, use_effective);
+        if Self::check_requested_access(granted, requested) {
+            Ok(())
+        } else {
+            Err(LxError::EACCES)
+        }
     }
 
     /// Check inode access against current credentials.
@@ -1497,32 +1589,15 @@ impl LinuxProcess {
         requested: u16,
         use_effective: bool,
     ) -> LxResult {
-        let creds = self.credentials();
-        let selected_uid = if use_effective {
-            creds.euid
-        } else {
-            creds.ruid
-        };
-        let granted = Self::access_bits_for(&creds, metadata, use_effective);
-        if selected_uid == ROOT_UID {
-            // CAP_DAC_OVERRIDE semantics: root bypasses permission checks
-            // except executing a non-directory with no exec bit set anywhere
-            // (mode & 0o111 == 0). Directories are always searchable by root;
-            // testing only the others-exec bit here used to lock root out of
-            // 0700 directories (e.g. apk's /lib/apk/exec, breaking triggers).
-            if requested & ACCESS_EXEC != 0
-                && metadata.type_ != FileType::Dir
-                && metadata.mode & 0o111 == 0
-            {
-                return Err(LxError::EACCES);
-            }
-            return Ok(());
-        }
-        if Self::check_requested_access(granted, requested) {
-            Ok(())
-        } else {
-            Err(LxError::EACCES)
-        }
+        Self::access_verdict(
+            &self.credentials(),
+            metadata.uid as u32,
+            metadata.gid as u32,
+            metadata.mode,
+            metadata.type_ == FileType::Dir,
+            requested,
+            use_effective,
+        )
     }
 
     /// Check inode access by fetching metadata first.
@@ -1557,16 +1632,49 @@ impl LinuxProcess {
         }
     }
 
+    /// The mode a `chmod` by `creds` actually lands on a file owned by
+    /// `owner_uid:owner_gid` whose current mode is `cur_mode`, or `EPERM` when
+    /// the caller may not chmod it at all (Linux's `inode_owner_or_capable`:
+    /// the owner, or root).
+    ///
+    /// Linux (`setattr_prepare`) strips exactly ONE bit, and only sometimes:
+    /// `S_ISGID` is cleared when the caller is not in the file's group, "so
+    /// that a chmod cannot give away group-execute privilege it does not
+    /// hold". `S_ISUID` is never stripped from the owner's own chmod -- that
+    /// is how an unprivileged user makes a setuid binary of a file they own.
+    ///
+    /// Both bits used to be stripped from every non-root chmod, and silently:
+    /// the call still returned success, so `chmod 4755 prog` left 0755 behind
+    /// and a program that checked the mode it had just set saw a different
+    /// one. Being stricter than Linux is not the safe direction -- it breaks
+    /// programs that work on Linux, and it breaks them without an error.
+    fn chmod_bits(
+        creds: &Credentials,
+        owner_uid: u32,
+        owner_gid: u32,
+        cur_mode: u16,
+        mode: u16,
+    ) -> LxResult<u16> {
+        if creds.euid != ROOT_UID && creds.euid != owner_uid {
+            return Err(LxError::EPERM);
+        }
+        let mut out = cur_mode & !MODE_PERM_MASK | (mode & MODE_PERM_MASK);
+        if creds.euid != ROOT_UID && !Self::acts_as_group(creds, owner_gid, true) {
+            out &= !MODE_SET_GID;
+        }
+        Ok(out)
+    }
+
     /// Change mode if current process is owner or root.
     pub fn chmod_metadata(&self, metadata: &mut Metadata, mode: u16) -> LxResult {
         let creds = self.credentials();
-        if creds.euid != ROOT_UID && creds.euid != metadata.uid as u32 {
-            return Err(LxError::EPERM);
-        }
-        metadata.mode = (metadata.mode & !MODE_PERM_MASK | (mode & MODE_PERM_MASK)) as _;
-        if creds.euid != ROOT_UID {
-            metadata.mode &= !(MODE_SET_UID | MODE_SET_GID);
-        }
+        metadata.mode = Self::chmod_bits(
+            &creds,
+            metadata.uid as u32,
+            metadata.gid as u32,
+            metadata.mode,
+            mode,
+        )?;
         Ok(())
     }
 
@@ -1581,7 +1689,10 @@ impl LinuxProcess {
             if creds.euid != metadata.uid as u32 {
                 return Err(LxError::EPERM);
             }
-            if gid != NO_ID && !Self::gid_in_groups(&creds, gid) {
+            // Linux `chgrp_ok`: `in_group_p(gid)` -- the acting gid plus the
+            // supplementary list, the same set `acts_as_group` answers for
+            // the permission check. The real gid is not in it.
+            if gid != NO_ID && !Self::acts_as_group(&creds, gid, true) {
                 return Err(LxError::EPERM);
             }
         }
@@ -1655,7 +1766,7 @@ impl LinuxProcess {
             inner.credentials.suid = uid;
             return Ok(());
         }
-        if Self::allowed_uid(&inner.credentials, uid) {
+        if Self::setid_allowed(inner.credentials.ruid, inner.credentials.suid, uid) {
             inner.credentials.euid = uid;
             Ok(())
         } else {
@@ -1673,7 +1784,7 @@ impl LinuxProcess {
             inner.credentials.sgid = gid;
             return Ok(());
         }
-        if Self::allowed_gid(&inner.credentials, gid) {
+        if Self::setid_allowed(inner.credentials.rgid, inner.credentials.sgid, gid) {
             inner.credentials.egid = gid;
             Ok(())
         } else {
@@ -1686,7 +1797,9 @@ impl LinuxProcess {
         let mut inner = self.inner.lock();
         let privileged = inner.credentials.euid == ROOT_UID;
         if !privileged {
-            if ruid != NO_ID && !Self::allowed_uid(&inner.credentials, ruid) {
+            if ruid != NO_ID
+                && !Self::set_real_allowed(inner.credentials.ruid, inner.credentials.euid, ruid)
+            {
                 return Err(LxError::EPERM);
             }
             if euid != NO_ID && !Self::allowed_uid(&inner.credentials, euid) {
@@ -1700,7 +1813,7 @@ impl LinuxProcess {
         if euid != NO_ID {
             inner.credentials.euid = euid;
         }
-        if privileged || ruid != NO_ID || (euid != NO_ID && euid != old_ruid) {
+        if Self::setreid_updates_saved(ruid, euid, old_ruid) {
             inner.credentials.suid = inner.credentials.euid;
         }
         Ok(())
@@ -1711,7 +1824,9 @@ impl LinuxProcess {
         let mut inner = self.inner.lock();
         let privileged = inner.credentials.euid == ROOT_UID;
         if !privileged {
-            if rgid != NO_ID && !Self::allowed_gid(&inner.credentials, rgid) {
+            if rgid != NO_ID
+                && !Self::set_real_allowed(inner.credentials.rgid, inner.credentials.egid, rgid)
+            {
                 return Err(LxError::EPERM);
             }
             if egid != NO_ID && !Self::allowed_gid(&inner.credentials, egid) {
@@ -1725,7 +1840,7 @@ impl LinuxProcess {
         if egid != NO_ID {
             inner.credentials.egid = egid;
         }
-        if privileged || rgid != NO_ID || (egid != NO_ID && egid != old_rgid) {
+        if Self::setreid_updates_saved(rgid, egid, old_rgid) {
             inner.credentials.sgid = inner.credentials.egid;
         }
         Ok(())
@@ -2790,5 +2905,235 @@ pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
         Ok(())
     } else {
         Err(LxError::ESRCH)
+    }
+}
+
+#[cfg(test)]
+mod dac_tests {
+    //! The discretionary-access decisions of `LinuxProcess`, on pure inputs:
+    //! who gets which permission bits, what a `chmod` really lands, and which
+    //! of a caller's three ids an unprivileged id switch may name. Each test
+    //! cites the Linux rule it pins (`fs/namei.c`, `fs/attr.c`, `kernel/sys.c`).
+
+    use super::*;
+
+    const OWNER: u32 = 1000;
+    const GROUP: u32 = 100;
+    const OTHER_GROUP: u32 = 200;
+
+    /// An ordinary user: every id the same, no supplementary groups.
+    fn user(uid: u32, gid: u32) -> Credentials {
+        Credentials {
+            ruid: uid,
+            euid: uid,
+            suid: uid,
+            rgid: gid,
+            egid: gid,
+            sgid: gid,
+            groups: Vec::new(),
+            umask: 0o022,
+        }
+    }
+
+    fn may(creds: &Credentials, mode: u16, requested: u16, use_effective: bool) -> bool {
+        LinuxProcess::access_verdict(creds, OWNER, GROUP, mode, false, requested, use_effective)
+            .is_ok()
+    }
+
+    fn may_dir(creds: &Credentials, mode: u16, requested: u16) -> bool {
+        LinuxProcess::access_verdict(creds, OWNER, GROUP, mode, true, requested, true).is_ok()
+    }
+
+    /// `acl_permission_check`: "Are we the owner? If so, ACL's don't matter"
+    /// -- and neither do the group or other bits. `0o077` gives the owner
+    /// nothing even though everybody else can do everything.
+    #[test]
+    fn the_owner_arm_is_exclusive() {
+        let owner = user(OWNER, GROUP);
+        assert!(
+            !may(&owner, 0o077, 0o4, true),
+            "owner denied read by the owner bits"
+        );
+        assert!(!may(&owner, 0o077, 0o2, true));
+        assert!(!may(&owner, 0o077, 0o1, true));
+        let stranger = user(4242, 4242);
+        assert!(
+            may(&stranger, 0o077, 0o7, true),
+            "other bits still apply to others"
+        );
+    }
+
+    /// `in_group_p()` consults the ACTING gid and the supplementary list. A
+    /// process that dropped its effective gid must lose the group bits with
+    /// it: keeping them is keeping the very access the drop gave up.
+    #[test]
+    fn a_dropped_effective_gid_loses_group_access() {
+        // rgid is still the file's group, egid is not.
+        let mut dropped = user(4242, GROUP);
+        dropped.egid = OTHER_GROUP;
+        dropped.sgid = OTHER_GROUP;
+
+        assert!(
+            !may(&dropped, 0o060, 0o4, true),
+            "the effective path must not read group bits through the REAL gid"
+        );
+        // `access(2)` asks about the real ids, and there the real gid counts.
+        assert!(
+            may(&dropped, 0o060, 0o4, false),
+            "the real path is the one place the real gid belongs"
+        );
+    }
+
+    /// The supplementary list counts on both paths, as `in_group_p` walks it
+    /// regardless of which primary gid is being asked about.
+    #[test]
+    fn a_supplementary_group_counts_on_both_paths() {
+        let mut member = user(4242, OTHER_GROUP);
+        member.groups = vec![7, GROUP, 9];
+        assert!(may(&member, 0o060, 0o6, true));
+        assert!(may(&member, 0o060, 0o6, false));
+        let outsider = user(4242, OTHER_GROUP);
+        assert!(!may(&outsider, 0o060, 0o4, true));
+        assert!(
+            may(&outsider, 0o004, 0o4, true),
+            "falls through to the other bits"
+        );
+    }
+
+    /// `generic_permission`: read/write DACs are always overridable by
+    /// CAP_DAC_OVERRIDE; executing a file needs at least one x bit somewhere;
+    /// a directory is always searchable.
+    #[test]
+    fn root_reads_and_writes_anything_but_executes_only_what_has_an_x_bit() {
+        let root = user(ROOT_UID, ROOT_UID);
+        assert!(may(&root, 0o000, 0o6, true));
+        assert!(
+            !may(&root, 0o000, 0o1, true),
+            "no x bit anywhere: even root may not exec"
+        );
+        assert!(
+            may(&root, 0o001, 0o1, true),
+            "one x bit, any column, is enough"
+        );
+        assert!(
+            may_dir(&root, 0o000, 0o1),
+            "a 0700 (or 0000) directory is searchable by root"
+        );
+        // The override follows the SELECTED uid: a setuid-root program asked
+        // about its real ids is not root for `access(2)`.
+        let mut setuid_root = user(OWNER, GROUP);
+        setuid_root.euid = ROOT_UID;
+        assert!(may(&setuid_root, 0o000, 0o2, true));
+        assert!(!may(&setuid_root, 0o000, 0o2, false));
+    }
+
+    /// `mask & ~mode` with an empty mask is zero: `F_OK` is existence only.
+    #[test]
+    fn nothing_requested_is_always_granted() {
+        let stranger = user(4242, 4242);
+        assert!(may(&stranger, 0o000, 0, true));
+        assert!(may(&stranger, 0o000, 0, false));
+    }
+
+    // ---- chmod -------------------------------------------------------------
+
+    fn chmod(creds: &Credentials, cur: u16, mode: u16) -> LxResult<u16> {
+        LinuxProcess::chmod_bits(creds, OWNER, GROUP, cur, mode)
+    }
+
+    /// `setattr_prepare` never touches `S_ISUID`: this is how a user makes a
+    /// setuid binary of a file they own. It used to be stripped from every
+    /// non-root chmod, and the call still returned success, so `chmod 4755`
+    /// silently left `0755` behind.
+    #[test]
+    fn the_owner_keeps_setuid_on_chmod() {
+        let owner = user(OWNER, GROUP);
+        assert_eq!(chmod(&owner, 0o100_644, 0o4755), Ok(0o104_755));
+        // File-type bits above the permission mask are never the caller's to
+        // change.
+        assert_eq!(chmod(&owner, 0o100_644, 0o7777), Ok(0o107_777));
+    }
+
+    /// "Normal users cannot set the setgid bit if they are not in the group"
+    /// -- and that is the only bit `setattr_prepare` strips, and only then.
+    #[test]
+    fn setgid_is_stripped_only_from_a_caller_outside_the_file_group() {
+        let owner_in_group = user(OWNER, GROUP);
+        assert_eq!(chmod(&owner_in_group, 0o644, 0o2755), Ok(0o2755));
+
+        let mut owner_outside = user(OWNER, OTHER_GROUP);
+        assert_eq!(
+            chmod(&owner_outside, 0o644, 0o6755),
+            Ok(0o4755),
+            "setgid stripped, setuid kept"
+        );
+        // A supplementary membership is membership.
+        owner_outside.groups = vec![GROUP];
+        assert_eq!(chmod(&owner_outside, 0o644, 0o2755), Ok(0o2755));
+        // And, per `in_group_p`, the REAL gid is not.
+        let mut owner_real_only = user(OWNER, GROUP);
+        owner_real_only.egid = OTHER_GROUP;
+        owner_real_only.sgid = OTHER_GROUP;
+        assert_eq!(chmod(&owner_real_only, 0o644, 0o2755), Ok(0o755));
+    }
+
+    /// `inode_owner_or_capable`: the owner or root, nobody else; and root is
+    /// exempt from the setgid rule.
+    #[test]
+    fn a_stranger_cannot_chmod_and_root_keeps_every_bit() {
+        let stranger = user(4242, GROUP);
+        assert_eq!(chmod(&stranger, 0o644, 0o600), Err(LxError::EPERM));
+        let root = user(ROOT_UID, ROOT_UID);
+        assert_eq!(chmod(&root, 0o644, 0o6755), Ok(0o6755));
+    }
+
+    // ---- which id an unprivileged switch may name --------------------------
+
+    /// `sys_setuid`: `!uid_eq(kuid, old->uid) && !uid_eq(kuid, new->suid)`
+    /// -> EPERM. The effective id is not in the set: with (r=1000, e=2000,
+    /// s=3000), `setuid(2000)` is refused by Linux.
+    #[test]
+    fn setuid_draws_from_real_and_saved_not_effective() {
+        assert!(LinuxProcess::setid_allowed(1000, 3000, 1000));
+        assert!(LinuxProcess::setid_allowed(1000, 3000, 3000));
+        assert!(!LinuxProcess::setid_allowed(1000, 3000, 2000));
+        assert!(!LinuxProcess::setid_allowed(1000, 3000, ROOT_UID));
+    }
+
+    /// `sys_setreuid`: the real argument may be the old real or effective id,
+    /// never the saved one. With (r=1000, e=1000, s=0) -- a daemon that
+    /// dropped root and kept it in the saved slot -- `setreuid(0, -1)` is
+    /// EPERM on Linux; letting it through moved the saved id into the REAL
+    /// slot, where every later rule accepts it. The effective argument, and
+    /// every `setresuid` argument, may name any of the three.
+    #[test]
+    fn the_real_argument_of_setreuid_never_takes_the_saved_id() {
+        assert!(!LinuxProcess::set_real_allowed(1000, 1000, ROOT_UID));
+        assert!(LinuxProcess::set_real_allowed(1000, 2000, 2000));
+        assert!(LinuxProcess::set_real_allowed(1000, 2000, 1000));
+        assert!(LinuxProcess::set_any_allowed(
+            1000, 1000, ROOT_UID, ROOT_UID
+        ));
+        assert!(!LinuxProcess::set_any_allowed(1000, 2000, 3000, 4000));
+    }
+
+    /// `if (ruid != -1 || (euid != -1 && !uid_eq(keuid, old->uid))) new->suid
+    /// = new->euid;` -- there is no privileged term, so a `setreuid(-1, -1)`
+    /// that asks for nothing leaves the saved id alone, root or not.
+    #[test]
+    fn setreuid_with_nothing_to_do_leaves_the_saved_id_alone() {
+        assert!(!LinuxProcess::setreid_updates_saved(NO_ID, NO_ID, 1000));
+        assert!(
+            LinuxProcess::setreid_updates_saved(1000, NO_ID, 1000),
+            "a real id is set"
+        );
+        assert!(
+            LinuxProcess::setreid_updates_saved(NO_ID, 2000, 1000),
+            "an effective id other than the old real one is set"
+        );
+        assert!(
+            !LinuxProcess::setreid_updates_saved(NO_ID, 1000, 1000),
+            "setting the effective id back to the real one is not a new identity"
+        );
     }
 }
