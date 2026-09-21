@@ -4,6 +4,8 @@ pub mod drm_scheme;
 mod dsp;
 mod fbdev;
 mod input;
+#[cfg(test)]
+pub(crate) mod kms_emu;
 mod mixer;
 pub mod pty;
 mod random;

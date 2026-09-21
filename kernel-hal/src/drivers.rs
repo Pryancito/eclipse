@@ -22,6 +22,21 @@ impl<T: Scheme + ?Sized> DeviceList<T> {
         self.0.write().push(dev);
     }
 
+    /// Drop the entry that IS `dev` (same allocation, not merely equal),
+    /// returning whether one was found. Hosted builds only -- see
+    /// [`remove_device_hosted`].
+    #[cfg(feature = "libos")]
+    fn remove(&self, dev: &Arc<T>) -> bool {
+        let mut list = self.0.write();
+        match list.iter().position(|d| Arc::ptr_eq(d, dev)) {
+            Some(pos) => {
+                list.remove(pos);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Convert self into a vector.
     pub fn as_vec(&self) -> RwLockReadGuard<'_, Vec<Arc<T>>> {
         self.0.read()
@@ -72,6 +87,25 @@ struct AllDeviceList {
 }
 
 impl AllDeviceList {
+    #[cfg(feature = "libos")]
+    pub fn remove_device(&self, dev: &Device) -> bool {
+        match dev {
+            Device::Block(d) => self.block.remove(d),
+            Device::Display(d) => self.display.remove(d),
+            Device::Input(d) => self.input.remove(d),
+            Device::Irq(d) => self.irq.remove(d),
+            Device::Net(d) => self.net.remove(d),
+            Device::Uart(d) => self.uart.remove(d),
+            Device::Drm(d) => self.drm.remove(d),
+            Device::DrmDisplay(drm, display) => {
+                let a = self.drm.remove(drm);
+                let b = self.display.remove(display);
+                a || b
+            }
+            Device::Audio(d) => self.audio.remove(d),
+        }
+    }
+
     pub fn add_device(&self, dev: Device) {
         match dev {
             Device::Block(d) => self.block.add(d),
@@ -96,6 +130,44 @@ lazy_static! {
 
 pub(crate) fn add_device(dev: Device) {
     DEVICES.add_device(dev)
+}
+
+/// Register a device from a hosted (libos) build.
+///
+/// On bare metal every device comes from this crate's own bus probes, so
+/// `add_device` stays crate-private there. A hosted build has no buses: the
+/// devices it owns are mocks, and the ones a *unit test* needs are whatever
+/// the code under test reaches for through `all_*()`. The DRM software-KMS
+/// path is the case that forced this open — `primary_display()` is
+/// `all_display().first()`, so with nothing registered `software_kms_active()`
+/// is false, the synthetic CRTC/connector never exist, and every present
+/// stops at `PresentError::NoDisplay` before a single pixel is copied. Half
+/// the present path was therefore unreachable from a test on a machine with
+/// no GPU, which is every machine in CI.
+///
+/// Note there is deliberately no *removal*: `DeviceList` is append-only, and
+/// `primary_display()` takes the first entry, so the first display a process
+/// registers is the one every later caller sees. A test-side emulation
+/// registers exactly one device and reprograms it instead (see
+/// `linux-object`'s `kms_emu`).
+#[cfg(feature = "libos")]
+pub fn add_device_hosted(dev: Device) {
+    DEVICES.add_device(dev)
+}
+
+/// Unregister a device that [`add_device_hosted`] registered, matched by
+/// identity rather than by value, and report whether one was found.
+///
+/// The device lists are process-wide and a unit-test binary runs every test of
+/// a crate in one process, so a test that registers an emulated display to
+/// exercise the scanout path would otherwise leave it registered for the tests
+/// that assert there is no display at all -- and `primary_display()` takes the
+/// FIRST entry, so it would win over anything registered later too. A test
+/// therefore attaches its device for its own duration and detaches it here.
+/// Bare metal never unregisters a device, which is why this is hosted-only.
+#[cfg(feature = "libos")]
+pub fn remove_device_hosted(dev: &Device) -> bool {
+    DEVICES.remove_device(dev)
 }
 
 /// Returns all devices which implement the [`BlockScheme`].

@@ -4506,6 +4506,21 @@ pub fn get_plane(id: u32) -> Option<DrmPlane> {
     None
 }
 
+/// Put the process-wide output state a present depends on back to its defaults.
+///
+/// Called when an emulated output detaches, INCLUDING while a panic unwinds. A
+/// test that fails half way through would otherwise leave a visible software
+/// cursor, or a blanked CRTC, behind, and the next test then fails for a reason
+/// that is not its own -- exactly the noise [`test_globals`] exists to remove.
+/// Call it with no display registered, so unblanking cannot clear one.
+#[cfg(test)]
+pub(crate) fn reset_output_state_for_test() {
+    set_crtc_blanked(false);
+    let mut st = DRM_STATE.lock();
+    st.cursor = CursorState::default();
+    st.crtc_fb = 0;
+}
+
 #[cfg(test)]
 pub(super) mod test_globals {
     extern crate std;

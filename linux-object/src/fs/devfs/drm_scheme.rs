@@ -4388,13 +4388,13 @@ mod ioctl_size_reconciliation_tests {
 /// in `poll()` forever. All of that is reachable with no GPU, no Mesa and no
 /// display, because it is all bookkeeping.
 ///
-/// What a host run genuinely cannot reach is noted per test rather than
-/// pretended: `primary_display()` is always `None` here (`kernel_hal`'s
-/// `add_device` is `pub(crate)`), so `software_kms_active()` is false, the
-/// synthetic CRTC and connector do not exist, and nothing is ever blitted. The
-/// present path's own answer to that is `PresentError::NoDisplay`, which the
-/// arms deliberately report as success --- so the sequence still runs end to
-/// end, and what these tests pin is the bookkeeping either side of the copy.
+/// These tests deliberately run with NO output attached, which is the case the
+/// present path answers with `PresentError::NoDisplay` and the ioctl arms
+/// report as success --- so the sequence runs end to end and what is pinned here
+/// is the bookkeeping on either side of the copy. The copy itself, and
+/// everything that decides which pixels it moves, is in
+/// [`kms_scanout_tests`](super::kms_scanout_tests), which attaches an emulated
+/// output first.
 #[cfg(test)]
 mod gl_client_sequence_tests {
     use super::*;
@@ -4404,30 +4404,30 @@ mod gl_client_sequence_tests {
     /// calls to `drm::*` helpers --- the entry point, the size reconciliation
     /// and the `access_ok` check are part of what a client depends on, and a
     /// test that skips them cannot see an ioctl go unreachable.
-    struct Client {
+    pub(super) struct Client {
         dev: DrmDev,
     }
 
     impl Client {
         /// `open("/dev/dri/card0")`.
-        fn open(minor: u32) -> Client {
+        pub(super) fn open(minor: u32) -> Client {
             Client {
                 dev: DrmDev::new(minor),
             }
         }
 
         /// `drmIoctl(fd, request, &arg)`.
-        fn ioctl<T>(&self, request: u32, arg: &mut T) -> Result<usize> {
+        pub(super) fn ioctl<T>(&self, request: u32, arg: &mut T) -> Result<usize> {
             drm_ioctl(&self.dev, request, arg as *mut T as usize)
         }
 
         /// `read(fd, buf, len)` --- how a compositor collects flip completions.
-        fn read_events(&self, buf: &mut [u8]) -> Result<usize> {
+        pub(super) fn read_events(&self, buf: &mut [u8]) -> Result<usize> {
             self.dev.read_at(0, buf)
         }
 
         /// `drmModeCreateDumbBuffer`: one scanout buffer.
-        fn create_dumb(&self, width: u32, height: u32) -> DrmModeCreateDumb {
+        pub(super) fn create_dumb(&self, width: u32, height: u32) -> DrmModeCreateDumb {
             let mut req = DrmModeCreateDumb {
                 height,
                 width,
@@ -4445,7 +4445,7 @@ mod gl_client_sequence_tests {
         }
 
         /// `drmModeAddFB2`: wrap a buffer in a framebuffer object.
-        fn addfb2(&self, buf: &DrmModeCreateDumb) -> u32 {
+        pub(super) fn addfb2(&self, buf: &DrmModeCreateDumb) -> u32 {
             // DRM_FORMAT_XRGB8888, which is what every GL swapchain on this
             // tree ends up presenting.
             const DRM_FORMAT_XRGB8888: u32 = 0x3443_5258;
@@ -4466,7 +4466,7 @@ mod gl_client_sequence_tests {
         }
 
         /// `drmModePageFlip` with `DRM_MODE_PAGE_FLIP_EVENT`.
-        fn page_flip(&self, crtc_id: u32, fb_id: u32, user_data: u64) -> Result<usize> {
+        pub(super) fn page_flip(&self, crtc_id: u32, fb_id: u32, user_data: u64) -> Result<usize> {
             let mut flip = DrmModeCrtcPageFlip {
                 crtc_id,
                 fb_id,
@@ -4478,13 +4478,13 @@ mod gl_client_sequence_tests {
         }
 
         /// `drmModeRmFB`.
-        fn rmfb(&self, fb_id: u32) -> Result<usize> {
+        pub(super) fn rmfb(&self, fb_id: u32) -> Result<usize> {
             let mut id = fb_id;
             self.ioctl(DRM_IOCTL_MODE_RMFB, &mut id)
         }
 
         /// `drmModeDestroyDumbBuffer`.
-        fn destroy_dumb(&self, handle: u32) -> Result<usize> {
+        pub(super) fn destroy_dumb(&self, handle: u32) -> Result<usize> {
             let mut h = handle;
             self.ioctl(DRM_IOCTL_MODE_DESTROY_DUMB, &mut h)
         }
@@ -4493,11 +4493,11 @@ mod gl_client_sequence_tests {
     /// A `DRM_EVENT_FLIP_COMPLETE` as libdrm's `drmHandleEvent` reads it off
     /// the fd: `struct drm_event_vblank`, 32 bytes.
     #[derive(Debug, PartialEq, Eq)]
-    struct FlipEvent {
-        ev_type: u32,
-        length: u32,
-        user_data: u64,
-        crtc_id: u32,
+    pub(super) struct FlipEvent {
+        pub(super) ev_type: u32,
+        pub(super) length: u32,
+        pub(super) user_data: u64,
+        pub(super) crtc_id: u32,
     }
 
     fn le32(e: &[u8], at: usize) -> u32 {
@@ -4513,7 +4513,7 @@ mod gl_client_sequence_tests {
         }
     }
 
-    fn parse_events(buf: &[u8]) -> alloc::vec::Vec<FlipEvent> {
+    pub(super) fn parse_events(buf: &[u8]) -> alloc::vec::Vec<FlipEvent> {
         buf.chunks_exact(32)
             .map(|e| FlipEvent {
                 ev_type: le32(e, 0),
@@ -4525,11 +4525,11 @@ mod gl_client_sequence_tests {
     }
 
     /// `DRM_EVENT_FLIP_COMPLETE`.
-    const FLIP_COMPLETE: u32 = 2;
+    pub(super) const FLIP_COMPLETE: u32 = 2;
 
     /// A zeroed `struct drm_mode_card_res`, which is how libdrm starts both
     /// passes of every `drmModeGetResources`.
-    fn blank_card_res() -> DrmModeCardRes {
+    pub(super) fn blank_card_res() -> DrmModeCardRes {
         DrmModeCardRes {
             fb_id_ptr: 0,
             crtc_id_ptr: 0,
@@ -4820,5 +4820,707 @@ mod gl_client_sequence_tests {
 
         assert_eq!(client.rmfb(fb), Ok(0));
         assert_eq!(client.destroy_dumb(buf.handle), Ok(0));
+    }
+}
+
+/// The present itself: what pixels actually reach the screen, with an emulated
+/// DRM/KMS output attached.
+///
+/// [`gl_client_sequence_tests`] above replays a GL client's ioctl sequence with
+/// nothing to scan out to, so it pins the bookkeeping on either side of the
+/// copy. The copy was the half no host test could reach: `primary_display()` is
+/// `all_display().first()` and a unit-test binary never runs the hosted kernel's
+/// device bring-up, so `software_kms_active()` was false, the synthetic
+/// CRTC/connector/plane did not exist, and every present stopped at
+/// `PresentError::NoDisplay` before touching a pixel.
+///
+/// [`kms_emu`](super::super::kms_emu) attaches one for the duration of a test.
+/// It is a real [`DisplayScheme`](kernel_hal::drivers::scheme::DisplayScheme)
+/// over a heap buffer, so the present goes through `blit_from` exactly as a UEFI
+/// GOP or a GPU BAR1 aperture does; it can carry a padded scanline and claim to
+/// be write-combining, which is what makes the two mitigations that live in this
+/// path -- the 16-pixel line expansion and the non-temporal store loop -- testable
+/// at all. Every pixel starts at [`UNTOUCHED`](super::super::kms_emu::UNTOUCHED),
+/// so "the present wrote this" and "the present left this alone" are
+/// distinguishable; that distinction is the whole point when the bug is writing
+/// too few columns or too many.
+#[cfg(test)]
+mod kms_scanout_tests {
+    use super::gl_client_sequence_tests::{blank_card_res, parse_events, Client, FLIP_COMPLETE};
+    use super::*;
+    use crate::fs::devfs::kms_emu::{self, UNTOUCHED};
+    use kernel_hal::mem::phys_to_virt;
+
+    /// The dumb buffer's pixels, reached the way its owner reaches them through
+    /// its CPU mapping: `MAP_DUMB` hands out an offset into the backing VMO, and
+    /// the backing is contiguous physical memory the kernel can address
+    /// directly.
+    fn map_dumb(buf: &DrmModeCreateDumb) -> &'static mut [u32] {
+        let (pa, size) =
+            drm::resolve_gem_backing(buf.handle).expect("a dumb buffer must have backing");
+        assert!(size as u64 >= buf.size, "backing smaller than the buffer");
+        let va = phys_to_virt(pa as usize);
+        // SAFETY: `size` bytes of contiguous physical memory, identity-mapped
+        // into the kernel window at `va`, owned by this buffer for as long as
+        // the handle lives.
+        unsafe { core::slice::from_raw_parts_mut(va as *mut u32, size / 4) }
+    }
+
+    /// Paint every pixel of `buf`, PADDING INCLUDED, with `f(x, y)` in the
+    /// buffer's own stride coordinates. A swapchain buffer really does have
+    /// pixels past the visible width (`CREATE_DUMB` rounds the pitch up to 64
+    /// bytes, and matches the display's pitch outright for a full-screen
+    /// request), and whether the present is allowed to carry them to the screen
+    /// is exactly what the write-combining tests below check.
+    fn paint(buf: &DrmModeCreateDumb, f: impl Fn(u32, u32) -> u32) {
+        let stride = (buf.pitch / 4) as usize;
+        let px = map_dumb(buf);
+        for y in 0..buf.height as usize {
+            for x in 0..stride {
+                px[y * stride + x] = f(x as u32, y as u32);
+            }
+        }
+    }
+
+    /// `drmModeSetCrtc`: the modeset that puts the first frame up.
+    fn set_crtc(c: &Client, crtc_id: u32, fb_id: u32, w: u32, h: u32) {
+        let mut req = DrmModeGetCrtc {
+            set_connectors_ptr: 0,
+            count_connectors: 0,
+            crtc_id,
+            fb_id,
+            x: 0,
+            y: 0,
+            gamma_size: 0,
+            mode_valid: 1,
+            mode: make_modeinfo(w, h),
+        };
+        c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut req).expect("SETCRTC");
+    }
+
+    /// `drmModeDirtyFB`: "these boxes changed, put them on the screen".
+    fn dirtyfb(c: &Client, fb_id: u32, clips: &[DrmClipRect]) {
+        let mut cmd = DrmModeFbDirtyCmd {
+            fb_id,
+            flags: 0,
+            color: 0,
+            num_clips: clips.len() as u32,
+            clips_ptr: clips.as_ptr() as u64,
+        };
+        c.ioctl(DRM_IOCTL_MODE_DIRTYFB, &mut cmd).expect("DIRTYFB");
+    }
+
+    fn clip(x1: u16, y1: u16, x2: u16, y2: u16) -> DrmClipRect {
+        DrmClipRect { x1, y1, x2, y2 }
+    }
+
+    /// `struct drm_mode_cursor`, 28 bytes -- the layout the ioctl number
+    /// encodes, so a wrong one here would not even reach the arm.
+    #[repr(C)]
+    struct ModeCursor {
+        flags: u32,
+        crtc_id: u32,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        handle: u32,
+    }
+
+    const CURSOR_BO: u32 = 0x01;
+    const CURSOR_MOVE: u32 = 0x02;
+
+    /// `drmModeSetCursor`: hand the kernel a pointer bitmap and place it.
+    fn set_cursor(c: &Client, crtc_id: u32, handle: u32, w: u32, h: u32, x: i32, y: i32) {
+        let mut cur = ModeCursor {
+            flags: CURSOR_BO | CURSOR_MOVE,
+            crtc_id,
+            x,
+            y,
+            width: w,
+            height: h,
+            handle,
+        };
+        c.ioctl(DRM_IOCTL_MODE_CURSOR, &mut cur).expect("CURSOR BO");
+    }
+
+    /// `drmModeMoveCursor`.
+    fn move_cursor(c: &Client, crtc_id: u32, x: i32, y: i32) {
+        let mut cur = ModeCursor {
+            flags: CURSOR_MOVE,
+            crtc_id,
+            x,
+            y,
+            width: 0,
+            height: 0,
+            handle: 0,
+        };
+        c.ioctl(DRM_IOCTL_MODE_CURSOR, &mut cur)
+            .expect("CURSOR MOVE");
+    }
+
+    /// A pixel value that is recognisable per coordinate, so a wrapped or
+    /// shifted copy is visible rather than merely "different".
+    fn tag(base: u32, x: u32, y: u32) -> u32 {
+        base | (y << 8) | x
+    }
+
+    /// The test the module exists for: a flip really does copy the client's
+    /// pixels onto the output, unchanged and in the right place.
+    #[test]
+    fn a_page_flip_puts_the_clients_pixels_on_the_screen() {
+        let screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 16);
+        paint(&buf, |x, y| tag(0x0011_0000, x, y));
+        let fb = c.addfb2(&buf);
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+
+        for y in 0..16 {
+            for x in 0..64 {
+                assert_eq!(
+                    screen.pixel(x, y),
+                    tag(0x0011_0000, x, y),
+                    "pixel ({}, {}) never reached the screen",
+                    x,
+                    y
+                );
+            }
+        }
+        // And the client still gets its completion, so its frame loop advances.
+        drm::flush_pending_flip_completions();
+        let mut b = [0u8; 32];
+        assert_eq!(c.read_events(&mut b).expect("completion"), 32);
+        let ev = parse_events(&b);
+        assert_eq!(ev[0].ev_type, FLIP_COMPLETE);
+        assert_eq!(ev[0].user_data, 0xF00D);
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// A framebuffer larger than the mode is CLIPPED, not wrapped. The source is
+    /// strided, so an implementation that walked it as a flat run would fill the
+    /// screen with the framebuffer's first `width * height` pixels -- every row
+    /// after the first shifted left. That is the classic "the desktop is skewed"
+    /// symptom and it is invisible to any test that does not compare per pixel.
+    #[test]
+    fn a_framebuffer_bigger_than_the_mode_is_clipped_not_wrapped() {
+        let screen = kms_emu::attach(24, 6);
+        let c = Client::open(0);
+        // 40 columns wide, so `CREATE_DUMB` rounds the pitch up to 48 pixels:
+        // the stride and the width differ, which is what makes a flat walk of
+        // the source visible at all.
+        let buf = c.create_dumb(40, 12);
+        assert_eq!(buf.pitch / 4, 48, "the pitch is rounded up to 64 bytes");
+        paint(&buf, |x, y| tag(0x0022_0000, x, y));
+        let fb = c.addfb2(&buf);
+
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 24, 6);
+
+        for y in 0..6 {
+            for x in 0..24 {
+                assert_eq!(
+                    screen.pixel(x, y),
+                    tag(0x0022_0000, x, y),
+                    "pixel ({}, {}) came from the wrong source row",
+                    x,
+                    y
+                );
+            }
+        }
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// A framebuffer smaller than the mode leaves the rest of the screen alone.
+    /// Writing past it would be an out-of-bounds store into the scanout aperture
+    /// on real hardware, and the pixels it would land on belong to whatever was
+    /// there before -- the text console, usually.
+    #[test]
+    fn a_framebuffer_smaller_than_the_mode_leaves_the_rest_of_the_screen_alone() {
+        let screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+        let buf = c.create_dumb(16, 4);
+        paint(&buf, |x, y| tag(0x0033_0000, x, y));
+        let fb = c.addfb2(&buf);
+
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 64, 16);
+
+        for y in 0..16 {
+            for x in 0..64 {
+                let want = if x < 16 && y < 4 {
+                    tag(0x0033_0000, x, y)
+                } else {
+                    UNTOUCHED
+                };
+                assert_eq!(screen.pixel(x, y), want, "pixel ({}, {})", x, y);
+            }
+        }
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// A damage rectangle repaints its own rows and nothing else. This is what
+    /// keeps a `DIRTYFB` client (Xorg's modesetting shadow, simple toolkits)
+    /// from paying for a full-frame copy per damage box, and getting it wrong in
+    /// the other direction -- copying the whole frame -- is what smeared stale
+    /// tiles over the screen from a swapchain buffer with only the boxes drawn.
+    #[test]
+    fn a_damage_rectangle_repaints_only_its_own_box() {
+        let screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 16);
+        paint(&buf, |x, y| tag(0x0044_0000, x, y));
+        let fb = c.addfb2(&buf);
+
+        // Frame one, whole screen.
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 64, 16);
+        // The client now changes EVERY pixel of its buffer but declares only one
+        // box dirty. That asymmetry is the point: with a full-frame copy the
+        // screen would show the new pixels everywhere and the test could not
+        // tell the two apart. It is also the real case -- the frame a client has
+        // drawn only the damage boxes into is the one whose untouched areas hold
+        // a previous frame, and copying them is what put stale tiles on screen.
+        // Box edges are on 16-pixel boundaries so the write-combining expansion
+        // (which is unconditional here) does not widen them; that widening has
+        // its own test below.
+        paint(&buf, |x, y| tag(0x0055_0000, x, y));
+        dirtyfb(&c, fb, &[clip(16, 4, 32, 8)]);
+
+        for y in 0..16 {
+            for x in 0..64 {
+                let want = if (16..32).contains(&x) && (4..8).contains(&y) {
+                    tag(0x0055_0000, x, y)
+                } else {
+                    tag(0x0044_0000, x, y)
+                };
+                assert_eq!(screen.pixel(x, y), want, "pixel ({}, {})", x, y);
+            }
+        }
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// A damage box that does not sit on a 64-byte boundary is widened to whole
+    /// write-combining lines. A partial store to a write-combining aperture
+    /// flushes a half-full combine buffer over the neighbouring pixels, which is
+    /// the leftover-squares corruption; the present rounds the box out to
+    /// 16-pixel (64-byte) lines so every store completes a line.
+    #[test]
+    fn a_damage_box_is_widened_to_whole_write_combining_lines() {
+        let screen = kms_emu::attach(64, 4);
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 4);
+        paint(&buf, |_, _| 0x0000_00AA);
+        let fb = c.addfb2(&buf);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 64, 4);
+
+        // One pixel, at x = 21: inside the line [16, 32).
+        paint(&buf, |x, y| {
+            if x == 21 && y == 1 {
+                0x0000_00BB
+            } else {
+                0x0000_00AA
+            }
+        });
+        screen.repaint(UNTOUCHED);
+        dirtyfb(&c, fb, &[clip(21, 1, 22, 2)]);
+
+        for x in 0..64 {
+            let want = if (16..32).contains(&x) {
+                if x == 21 {
+                    0x0000_00BB
+                } else {
+                    0x0000_00AA
+                }
+            } else {
+                UNTOUCHED
+            };
+            assert_eq!(screen.pixel(x, 1), want, "row 1, x = {}", x);
+        }
+        for y in [0u32, 2, 3] {
+            assert!(
+                (0..64).all(|x| screen.pixel(x, y) == UNTOUCHED),
+                "row {} was repainted for a box that does not touch it",
+                y
+            );
+        }
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// The expansion at the right edge lands in the scanline's OFF-SCREEN
+    /// PADDING, and this is the end of the chain that could not be checked
+    /// before: `expand_x_for_wc` deliberately rounds the right edge up past the
+    /// visible width and caps it at the pitch, and `blit_from` has to accept
+    /// that wider run. It clamped to `info.width` instead, which silently
+    /// truncated the tail back off and made the whole mitigation inert on
+    /// exactly the hardware that needs it -- a padded pitch is the normal case
+    /// (a UEFI GOP reports 2048 pixels per scanline for a 1920-wide mode).
+    ///
+    /// The geometry is the real one: a full-screen `CREATE_DUMB` is given the
+    /// DISPLAY's pitch, so the client's own buffer carries those padding pixels
+    /// too, and a test can tell padding written from padding skipped.
+    #[test]
+    fn the_right_edge_expansion_reaches_the_off_screen_padding() {
+        // 40 visible columns, 64 per scanline: 24 columns of padding.
+        let screen = kms_emu::attach_with(40, 4, 64, true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(40, 4);
+        assert_eq!(
+            buf.pitch / 4,
+            64,
+            "a full-screen dumb buffer takes the display's pitch"
+        );
+        // Visible columns and padding columns carry different values, so the
+        // assertion can say WHERE a pixel came from.
+        let src = |x: u32, y: u32| {
+            if x < 40 {
+                tag(0x0066_0000, x, y)
+            } else {
+                tag(0x0077_0000, x, y)
+            }
+        };
+        paint(&buf, src);
+        let fb = c.addfb2(&buf);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 40, 4);
+
+        // A box at the right edge: [36, 40). Expanded, that is [32, 48) --
+        // eight visible columns and eight of padding.
+        screen.repaint(UNTOUCHED);
+        dirtyfb(&c, fb, &[clip(36, 1, 40, 2)]);
+
+        for x in 0..screen.pitch_px() {
+            let want = if (32..48).contains(&x) {
+                src(x, 1)
+            } else {
+                UNTOUCHED
+            };
+            assert_eq!(
+                screen.pixel(x, 1),
+                want,
+                "row 1, x = {} (visible width 40, pitch {})",
+                x,
+                screen.pitch_px()
+            );
+        }
+        // And nothing spilled into the next scanline, which is what the cap at
+        // the pitch is for: past the padding is row 2's pixel 0.
+        assert!(
+            (0..screen.pitch_px()).all(|x| screen.pixel(x, 2) == UNTOUCHED),
+            "the expansion ran past the end of the scanline"
+        );
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// The software pointer is composited on top of the frame, and a move
+    /// restores what it was covering from the framebuffer. wlroots is held on
+    /// the legacy KMS path, so it never re-renders the scene for a pointer
+    /// move: if the erase half of this is wrong the cursor leaves a trail, and
+    /// if the composite half is wrong there is no pointer at all.
+    #[test]
+    fn the_software_cursor_is_drawn_over_the_frame_and_erased_when_it_moves() {
+        let screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 16);
+        paint(&buf, |_, _| 0x0000_1111);
+        let fb = c.addfb2(&buf);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 64, 16);
+
+        // An 8x8 fully opaque pointer. The bitmap is read as `w * h`
+        // consecutive pixels, so its own stride is its width.
+        let cur = c.create_dumb(8, 8);
+        {
+            let px = map_dumb(&cur);
+            for p in px.iter_mut().take(64) {
+                *p = 0xFF00_00FF;
+            }
+        }
+        set_cursor(&c, drm::SYNTH_CRTC_ID, cur.handle, 8, 8, 4, 2);
+
+        for y in 0..16 {
+            for x in 0..64 {
+                let want = if (4..12).contains(&x) && (2..10).contains(&y) {
+                    0xFF00_00FF
+                } else {
+                    0x0000_1111
+                };
+                assert_eq!(screen.pixel(x, y), want, "cursor at (4, 2): ({}, {})", x, y);
+            }
+        }
+
+        move_cursor(&c, drm::SYNTH_CRTC_ID, 40, 6);
+
+        for y in 0..16 {
+            for x in 0..64 {
+                let want = if (40..48).contains(&x) && (6..14).contains(&y) {
+                    0xFF00_00FF
+                } else {
+                    0x0000_1111
+                };
+                assert_eq!(
+                    screen.pixel(x, y),
+                    want,
+                    "after the move to (40, 6): ({}, {})",
+                    x,
+                    y
+                );
+            }
+        }
+
+        // Leave no pointer behind for the tests that follow.
+        set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// The topology a compositor reads before it presents anything. With an
+    /// output attached this is a KMS card: `drmIsKMS` wants a CRTC, a connector
+    /// and an encoder, and wlroots then wants the connector CONNECTED with at
+    /// least one mode. Any one of those at zero and the output is skipped
+    /// entirely -- the black screen that reports nothing.
+    #[test]
+    fn the_synthetic_topology_is_what_a_compositor_reads() {
+        let _screen = kms_emu::attach(128, 32);
+        let c = Client::open(0);
+
+        // Pass one: counts.
+        let mut probe = blank_card_res();
+        c.ioctl(DRM_IOCTL_MODE_GETRESOURCES, &mut probe)
+            .expect("GETRESOURCES");
+        assert_eq!(probe.count_crtcs, 1, "drmIsKMS needs a CRTC");
+        assert_eq!(probe.count_connectors, 1, "drmIsKMS needs a connector");
+        assert_eq!(probe.count_encoders, 1, "drmIsKMS needs an encoder");
+
+        // Pass two: ids, into arrays the caller sized from pass one.
+        let mut crtcs = [0u32; 1];
+        let mut conns = [0u32; 1];
+        let mut encs = [0u32; 1];
+        let mut fill = blank_card_res();
+        fill.crtc_id_ptr = crtcs.as_mut_ptr() as u64;
+        fill.connector_id_ptr = conns.as_mut_ptr() as u64;
+        fill.encoder_id_ptr = encs.as_mut_ptr() as u64;
+        fill.count_crtcs = 1;
+        fill.count_connectors = 1;
+        fill.count_encoders = 1;
+        c.ioctl(DRM_IOCTL_MODE_GETRESOURCES, &mut fill)
+            .expect("GETRESOURCES fill");
+        assert_eq!(crtcs[0], drm::SYNTH_CRTC_ID);
+        assert_eq!(encs[0], drm::SYNTH_ENCODER_ID);
+
+        // The connector, with the mode wlroots will pick.
+        let mut mode = [0u8; 68];
+        let mut conn = DrmModeGetConnector {
+            encoders_ptr: 0,
+            modes_ptr: mode.as_mut_ptr() as u64,
+            props_ptr: 0,
+            prop_values_ptr: 0,
+            count_modes: 1,
+            count_props: 0,
+            count_encoders: 0,
+            encoder_id: 0,
+            connector_id: conns[0],
+            connector_type: 0,
+            connector_type_id: 0,
+            connection: 0,
+            mm_width: 0,
+            mm_height: 0,
+            subpixel: 0,
+            pad: 0,
+        };
+        c.ioctl(DRM_IOCTL_MODE_GETCONNECTOR, &mut conn)
+            .expect("GETCONNECTOR");
+        assert_eq!(conn.connection, 1, "the output must report CONNECTED");
+        assert_eq!(conn.count_modes, 1, "and offer a mode");
+        assert_eq!(
+            u16::from_ne_bytes([mode[4], mode[5]]),
+            128,
+            "hdisplay is the attached output's width"
+        );
+        assert_eq!(
+            u16::from_ne_bytes([mode[14], mode[15]]),
+            32,
+            "vdisplay is its height"
+        );
+        assert!(
+            conn.mm_width > 0 && conn.mm_height > 0,
+            "a physical size of 0 is an infinite DPI to every client that divides by it"
+        );
+
+        // One primary plane on that CRTC.
+        let mut planes = [0u32; 1];
+        let mut plane_res = DrmModeGetPlaneRes {
+            plane_id_ptr: planes.as_mut_ptr() as u64,
+            count_planes: 1,
+        };
+        c.ioctl(DRM_IOCTL_MODE_GETPLANERESOURCES, &mut plane_res)
+            .expect("GETPLANERESOURCES");
+        assert_eq!(plane_res.count_planes, 1);
+        assert_eq!(planes[0], drm::SYNTH_PLANE_ID);
+    }
+
+    /// `GETCRTC` reports the framebuffer that is really on screen. A compositor
+    /// reads this back to decide whether its modeset took, and the id has to be
+    /// in the DRM core's namespace, not a driver-private one.
+    #[test]
+    fn getcrtc_reports_the_framebuffer_that_was_flipped_to() {
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+        let buf = c.create_dumb(32, 8);
+        paint(&buf, |_, _| 0x0000_2222);
+        let fb = c.addfb2(&buf);
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 1).expect("flip");
+        drm::flush_pending_flip_completions();
+        let mut sink = [0u8; 32];
+        let _ = c.read_events(&mut sink);
+
+        let mut crtc = DrmModeGetCrtc {
+            set_connectors_ptr: 0,
+            count_connectors: 0,
+            crtc_id: drm::SYNTH_CRTC_ID,
+            fb_id: 0,
+            x: 0,
+            y: 0,
+            gamma_size: 0,
+            mode_valid: 0,
+            mode: [0; 68],
+        };
+        c.ioctl(DRM_IOCTL_MODE_GETCRTC, &mut crtc).expect("GETCRTC");
+        assert_eq!(crtc.fb_id, fb, "the CRTC does not name the flipped fb");
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// A full-frame present fills the scanline out to the last write-combining
+    /// line and stops. The lines past it belong to no visible pixel, and the
+    /// byte after the last one is the NEXT ROW's leftmost pixel -- running into
+    /// it is how a blit smears a frame diagonally down the screen.
+    #[test]
+    fn a_full_frame_present_stops_at_the_end_of_the_scanline() {
+        // 40 visible columns of a 64-pixel scanline, write-combining: so the
+        // expansion of [0, 40) is [0, 48) and 16 columns must stay untouched.
+        let screen = kms_emu::attach_with(40, 8, 64, true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(40, 8);
+        let src = |x: u32, y: u32| {
+            if x < 40 {
+                tag(0x0088_0000, x, y)
+            } else {
+                tag(0x0099_0000, x, y)
+            }
+        };
+        paint(&buf, src);
+        let fb = c.addfb2(&buf);
+
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 40, 8);
+
+        for y in 0..8 {
+            for x in 0..screen.pitch_px() {
+                let want = if x < 48 { src(x, y) } else { UNTOUCHED };
+                assert_eq!(screen.pixel(x, y), want, "pixel ({}, {})", x, y);
+            }
+        }
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// The pointer at the right edge of a padded scanline does not wrap onto the
+    /// next row. Its patch is widened to whole write-combining lines just like a
+    /// present, so it can legitimately reach into the off-screen padding -- but
+    /// past the padding is the next row's leftmost pixel, and a pointer whose
+    /// tail appears on the far left of the line below is the visible form of
+    /// that off-by-one.
+    #[test]
+    fn the_pointer_at_the_right_edge_does_not_wrap_onto_the_next_row() {
+        let screen = kms_emu::attach_with(40, 8, 64, true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(40, 8);
+        paint(&buf, |_, _| 0x0000_3333);
+        let fb = c.addfb2(&buf);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 40, 8);
+
+        // A pointer bitmap tagged by position, so a row or column read from the
+        // wrong place in it is visible rather than merely "opaque".
+        let cur = c.create_dumb(8, 8);
+        {
+            let px = map_dumb(&cur);
+            for (i, p) in px.iter_mut().take(64).enumerate() {
+                *p = 0xFF00_0000 | ((i as u32 / 8) << 8) | (i as u32 % 8);
+            }
+        }
+        // x = 36: four columns visible, four in the padding.
+        set_cursor(&c, drm::SYNTH_CRTC_ID, cur.handle, 8, 8, 36, 1);
+
+        for row in 0..8u32 {
+            for x in 0..screen.pitch_px() {
+                let p = screen.pixel(x, row);
+                let in_cursor = (36..44).contains(&x) && (1..8).contains(&row);
+                if in_cursor {
+                    // Exactly the pointer pixel for this position, taken from
+                    // the right row and column of the bitmap.
+                    let want = 0xFF00_0000 | ((row - 1) << 8) | (x - 36);
+                    assert_eq!(want, p, "pointer pixel at ({}, {})", x, row);
+                } else {
+                    assert_ne!(
+                        p >> 24,
+                        0xFF,
+                        "a pointer pixel landed at ({}, {}) -- outside the pointer",
+                        x,
+                        row
+                    );
+                }
+            }
+        }
+
+        set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// A damage box that runs off the end of the framebuffer is clamped to it.
+    /// The clip rectangle comes straight from a client, and the present reads
+    /// the framebuffer at `(y * stride + x)` -- an unclamped box is an
+    /// out-of-bounds read of whatever follows the buffer, painted on screen.
+    #[test]
+    fn a_damage_box_that_runs_off_the_framebuffer_is_clamped_to_it() {
+        let screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 16);
+        paint(&buf, |x, y| tag(0x00AA_0000, x, y));
+        let fb = c.addfb2(&buf);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 64, 16);
+
+        paint(&buf, |x, y| tag(0x00BB_0000, x, y));
+        screen.repaint(UNTOUCHED);
+        // Bottom-right corner, running far past both edges.
+        dirtyfb(&c, fb, &[clip(56, 12, 200, 200)]);
+
+        for y in 0..16 {
+            for x in 0..64 {
+                // [56, 64) widened to the 16-pixel line [48, 64), rows 12..16.
+                let want = if x >= 48 && y >= 12 {
+                    tag(0x00BB_0000, x, y)
+                } else {
+                    UNTOUCHED
+                };
+                assert_eq!(screen.pixel(x, y), want, "pixel ({}, {})", x, y);
+            }
+        }
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
     }
 }
