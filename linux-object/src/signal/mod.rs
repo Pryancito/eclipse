@@ -1,4 +1,5 @@
 //! Linux signals
+use crate::error::{LxError, LxResult};
 use bitflags::*;
 use numeric_enum_macro::numeric_enum;
 
@@ -301,11 +302,146 @@ impl Signal {
     pub const RTMIN: usize = 32;
     pub const RTMAX: usize = 64;
 
+    /// Read a signal number as it arrives in a syscall argument register.
+    ///
+    /// Every syscall that takes one declares it `int` — `kill(2)`, `tkill(2)`,
+    /// `tgkill(2)`, `rt_sigaction(2)`, `rt_sigqueueinfo(2)`,
+    /// `pidfd_send_signal(2)`, `prctl(PR_SET_PDEATHSIG)` — so Linux truncates
+    /// the register to 32 bits and then hands it to `valid_signal()`, which
+    /// takes it as `unsigned long`: a negative number becomes enormous and is
+    /// rejected, and anything above `_NSIG` (64) is rejected too.
+    ///
+    /// Signal 0 is *valid* and delivers nothing: it is the existence probe
+    /// behind `kill(pid, 0)`. It comes back as `Ok(None)` so each caller can
+    /// answer it where Linux does — after looking the target up, so a dead
+    /// process still gets `ESRCH`. A caller that has no use for it (sigaction)
+    /// turns `None` into `EINVAL`.
+    ///
+    /// Reading the register as `signum as u8` instead, which is what every
+    /// call site did, **truncated**: `kill(pid, 265)` delivered SIGKILL and
+    /// `prctl(PR_SET_PDEATHSIG, 265)` latched it, where Linux answers EINVAL
+    /// to both; and `kill(pid, 0)` answered EINVAL, which is how a stale lock
+    /// file looks alive to the program holding it.
+    pub fn from_syscall_arg(signum: usize) -> LxResult<Option<Self>> {
+        // The declared `int` of the uAPI: drop the high half, keep the sign.
+        let sig = signum as u32 as i32;
+        if sig == 0 {
+            return Ok(None);
+        }
+        // `valid_signal()`: 1..=_NSIG, with negatives failing as huge unsigned.
+        if sig < 1 || sig > Self::RTMAX as i32 {
+            return Err(LxError::EINVAL);
+        }
+        core::convert::TryFrom::try_from(sig as u8)
+            .map(Some)
+            .map_err(|_| LxError::EINVAL)
+    }
+
     pub fn is_standard(self) -> bool {
         (self as usize) < Self::RTMIN
     }
 
     pub fn as_bit(&self) -> u64 {
         1 << (*self as u64 - 1)
+    }
+}
+
+/// The signal number every syscall receives is an `int` in a register, and the
+/// tree read it as `signum as u8` in eight places.
+///
+/// What that costs is not theoretical: the low byte of 265 is 9, so
+/// `kill(pid, 265)` killed the target outright, and the low byte of 0 is 0,
+/// which no `Signal` variant matches, so `kill(pid, 0)` — the existence probe
+/// every lock file in userspace is built on — answered EINVAL. The comment in
+/// `sys_kill`'s own `send_to_pid` describes what a profile lock does with
+/// ESRCH versus anything else, and the probe never reached it.
+#[cfg(test)]
+mod signal_arg_tests {
+    use super::*;
+
+    #[test]
+    fn signal_zero_is_a_probe_not_an_error() {
+        // `kill(pid, 0)` sends nothing and reports whether the target exists.
+        // `None` is how the caller learns to skip delivery and still answer
+        // ESRCH for a pid that is gone.
+        assert_eq!(Signal::from_syscall_arg(0), Ok(None));
+    }
+
+    #[test]
+    fn every_named_signal_survives_the_round_trip() {
+        for n in 1..=Signal::RTMAX {
+            let got = Signal::from_syscall_arg(n).expect("1..=64 are all valid");
+            let got = got.expect("only 0 is the probe");
+            assert_eq!(got as usize, n, "signal {} came back as {:?}", n, got);
+        }
+    }
+
+    #[test]
+    fn a_number_above_nsig_is_rejected_instead_of_truncated() {
+        // 265 & 0xff == 9 == SIGKILL. This is the whole bug in one line.
+        assert_eq!(Signal::from_syscall_arg(265), Err(LxError::EINVAL));
+        assert_eq!(Signal::from_syscall_arg(256), Err(LxError::EINVAL));
+        assert_eq!(Signal::from_syscall_arg(65), Err(LxError::EINVAL));
+        assert_eq!(Signal::from_syscall_arg(usize::MAX), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn the_gap_between_nsig_and_a_full_byte_is_rejected() {
+        // 65..=255 fit in a `u8` and would have reached `Signal::try_from`,
+        // which rejects them; the range check has to agree, or a stricter
+        // guard here would start refusing what the enum accepts.
+        for n in (Signal::RTMAX + 1)..=255 {
+            assert_eq!(
+                Signal::from_syscall_arg(n),
+                Err(LxError::EINVAL),
+                "{} is not a signal",
+                n
+            );
+        }
+    }
+
+    #[test]
+    fn a_negative_signal_number_is_rejected_whatever_its_low_byte() {
+        // A negative `int` arrives sign-extended in the register. -247 has low
+        // byte 9, so `as u8` turned `kill(pid, -247)` into SIGKILL.
+        for sig in [-1i32, -9, -247, -256, i32::MIN] {
+            let arg = sig as isize as usize;
+            assert_eq!(
+                Signal::from_syscall_arg(arg),
+                Err(LxError::EINVAL),
+                "kill(_, {}) must be EINVAL",
+                sig
+            );
+        }
+    }
+
+    #[test]
+    fn the_high_half_of_the_register_is_dropped_the_way_linux_drops_it() {
+        // `SYSCALL_DEFINE` truncates to the declared `int` before validating,
+        // so a caller that leaves rubbish in the high 32 bits gets the same
+        // answer as one that does not. Matching Linux here matters more than
+        // being stricter than it: a guard harder than the kernel's rejects
+        // programs the kernel accepts.
+        assert_eq!(
+            Signal::from_syscall_arg(0xdead_beef_0000_0009),
+            Ok(Some(Signal::SIGKILL))
+        );
+        assert_eq!(Signal::from_syscall_arg(0xffff_ffff_0000_0000), Ok(None));
+    }
+
+    #[test]
+    fn the_real_time_range_is_reachable() {
+        // musl's `SIGRTMIN` is 34 after it reserves three for its own use, so
+        // a threaded program that never gets here has no cancellation.
+        assert_eq!(
+            Signal::from_syscall_arg(Signal::RTMIN),
+            Ok(Some(Signal::SIGRT32))
+        );
+        assert_eq!(
+            Signal::from_syscall_arg(Signal::RTMAX),
+            Ok(Some(Signal::SIGRT64))
+        );
+        assert!(!Signal::SIGRT32.is_standard());
+        assert!(Signal::SIGSYS.is_standard());
     }
 }

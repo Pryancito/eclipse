@@ -1572,7 +1572,6 @@ impl Syscall<'_> {
     /// that does not know the option. (The previous behaviour — returning 0
     /// for *every* option — silently claimed e.g. seccomp had been engaged.)
     pub fn sys_prctl(&self, option: i32, a2: usize, a3: usize, a4: usize, a5: usize) -> SysResult {
-        use linux_object::signal::Signal as LinuxSignal;
         use linux_object::thread::TASK_COMM_LEN;
 
         const PR_SET_PDEATHSIG: i32 = 1;
@@ -1606,13 +1605,7 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         match option {
             PR_SET_PDEATHSIG => {
-                if a2 == 0 {
-                    proc.set_pdeathsig(0);
-                    return Ok(0);
-                }
-                // Only real, deliverable signal numbers may be latched.
-                LinuxSignal::try_from(a2 as u8).map_err(|_| LxError::EINVAL)?;
-                proc.set_pdeathsig(a2 as u8);
+                proc.set_pdeathsig(pdeathsig_from_arg(a2)?);
                 Ok(0)
             }
             PR_GET_PDEATHSIG => {
@@ -1803,6 +1796,20 @@ impl Syscall<'_> {
     }
 }
 
+/// Validate `prctl(PR_SET_PDEATHSIG, arg2)` and return the byte to latch.
+///
+/// Not the same rule as `kill(2)`: prctl declares `arg2` as `unsigned long`, so
+/// nothing is truncated to `int` first and a number with rubbish in its high
+/// half is simply out of range. 0 disarms. `arg2 as u8` latched SIGKILL for
+/// `arg2 = 265`, which then fires at the parent's death.
+fn pdeathsig_from_arg(arg: usize) -> linux_object::error::LxResult<u8> {
+    use linux_object::signal::Signal as LinuxSignal;
+    if arg > LinuxSignal::RTMAX {
+        return Err(LxError::EINVAL);
+    }
+    Ok(LinuxSignal::from_syscall_arg(arg)?.map_or(0, |sig| sig as u8))
+}
+
 bitflags! {
     pub struct CloneFlags: usize {
         ///
@@ -1855,5 +1862,59 @@ bitflags! {
         const NEWNET =          1 << 30;
         /// the new process shares an I/O context with the calling process.
         const IO =              1 << 31;
+    }
+}
+
+/// `prctl(PR_SET_PDEATHSIG)` took its argument as a byte, so any number whose
+/// low byte happened to name a signal was latched as that signal.
+#[cfg(test)]
+mod pdeathsig_tests {
+    use super::*;
+    use linux_object::signal::Signal as LinuxSignal;
+
+    #[test]
+    fn zero_disarms() {
+        assert_eq!(pdeathsig_from_arg(0), Ok(0));
+    }
+
+    #[test]
+    fn every_signal_is_latched_as_itself() {
+        for n in 1..=LinuxSignal::RTMAX {
+            assert_eq!(pdeathsig_from_arg(n), Ok(n as u8), "PR_SET_PDEATHSIG {}", n);
+        }
+    }
+
+    #[test]
+    fn a_number_above_nsig_is_rejected_not_truncated() {
+        // 265 & 0xff == 9: the child asked for a signal that does not exist and
+        // got SIGKILL on its parent's death.
+        assert_eq!(pdeathsig_from_arg(265), Err(LxError::EINVAL));
+        assert_eq!(pdeathsig_from_arg(65), Err(LxError::EINVAL));
+        assert_eq!(pdeathsig_from_arg(256), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn prctl_does_not_truncate_to_int_the_way_kill_does() {
+        // prctl(2) declares arg2 `unsigned long`, so unlike kill(2) there is no
+        // 32-bit narrowing before `valid_signal()`: the high half makes the
+        // number out of range instead of disappearing.
+        assert_eq!(
+            pdeathsig_from_arg(0xdead_beef_0000_0009),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(pdeathsig_from_arg(0x1_0000_0000), Err(LxError::EINVAL));
+        // The same two words through kill(2)'s rule, for contrast.
+        assert_eq!(
+            LinuxSignal::from_syscall_arg(0xdead_beef_0000_0009),
+            Ok(Some(LinuxSignal::SIGKILL))
+        );
+        assert_eq!(LinuxSignal::from_syscall_arg(0x1_0000_0000), Ok(None));
+    }
+
+    #[test]
+    fn a_negative_argument_is_out_of_range() {
+        // prctl never sees it as negative; it sees a very large unsigned.
+        assert_eq!(pdeathsig_from_arg(usize::MAX), Err(LxError::EINVAL));
+        assert_eq!(pdeathsig_from_arg(-9i64 as usize), Err(LxError::EINVAL));
     }
 }

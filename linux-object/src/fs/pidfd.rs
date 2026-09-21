@@ -8,7 +8,12 @@ use zircon_object::object::*;
 use zircon_object::task::{Process, Status};
 
 /// Linux `PIDFD_THREAD` (unsupported here — pid must name a process).
-pub const PIDFD_THREAD: u32 = 2;
+///
+/// The kernel spells it `O_EXCL`, so it is `1 << 7`, not 2. Both values end in
+/// EINVAL from `pidfd_open` today — 2 because it is not a flag we know, 128
+/// because it is one we refuse — so this is the number being right rather than
+/// a behaviour change; it stops being harmless the day thread pidfds work.
+pub const PIDFD_THREAD: u32 = OpenFlags::EXCLUSIVE.bits() as u32;
 
 /// Anonymous fd referring to a live or zombie process (pollable on exit).
 pub struct PidFd {
