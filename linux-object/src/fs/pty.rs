@@ -232,10 +232,8 @@ impl Pty {
                             wake_master = true;
                         }
                         let pgid = self.fg_pgrp.load(Ordering::Relaxed);
-                        let sent = crate::process::interrupt_or_force_pgrp(
-                            pgid,
-                            &self.ctrl_c_armed_pgid,
-                        );
+                        let sent =
+                            crate::process::interrupt_or_force_pgrp(pgid, &self.ctrl_c_armed_pgid);
                         if lflag & ECHO != 0 {
                             let label: &[u8] = if sent == Signal::SIGKILL {
                                 b"^C (killed)"

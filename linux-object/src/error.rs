@@ -109,6 +109,10 @@ pub enum LxError {
     /// is not in a state that allows the operation. ALSA returns it from
     /// `writei`/`readi` on a stream that is neither prepared nor running.
     EBADFD = 77,
+    /// Value too large for defined data type. `fcntl(2)`'s record locks
+    /// return it when `l_whence` + `l_start` + `l_len` resolve to a range
+    /// that will not fit an `off_t`.
+    EOVERFLOW = 75,
     /// Socket operation on non-socket
     ENOTSOCK = 88,
     /// Protocol not available
@@ -183,6 +187,7 @@ impl fmt::Display for LxError {
             EDEADLK => "Resource deadlock would occur",
             ENAMETOOLONG => "File name too long",
             ENOLCK => "No record locks available",
+            EOVERFLOW => "Value too large for defined data type",
             ENOSYS => "Function not implemented",
             ENOTEMPTY => "Directory not empty",
             ELOOP => "Too many symbolic links encountered",

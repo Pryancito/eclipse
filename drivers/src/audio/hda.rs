@@ -355,6 +355,35 @@ fn park_target(consumed: u64, lpib_total: u64, dpib_total: u64, margin: u64) -> 
 /// Client PCM still queued, given the raw ring occupancy `queued` and the
 /// silence pad that ends at stream position `pad_end`: the pad is ring
 /// space the driver filled on its own, and it is not the client's to count.
+/// Ring space the client may still write into: everything but the guard and
+/// what is already queued.
+///
+/// `saturating_sub`, like `exposed_queued` and `frame_bytes` and every other
+/// bit of arithmetic here. It holds today -- `queued` is clamped to
+/// `ring_len - RING_GUARD` at both places that set it, and `RING_PAGES *
+/// PAGE_SIZE` is four times `RING_GUARD` -- but this is the number the write
+/// path uses to decide how much to copy INTO the ring, so an underflow would
+/// not be a panic in release: it would be a free-space figure near 2^64 and a
+/// copy past the end of the ring.
+fn free_bytes_of(ring_len: usize, guard: usize, queued: usize) -> usize {
+    ring_len.saturating_sub(guard).saturating_sub(queued)
+}
+
+/// How much of a `rewind`/`forward` request can actually be honoured: never
+/// more PCM than the client still has queued, and always a whole number of
+/// frames.
+///
+/// The frame rounding is not cosmetic. These move `wp` and zero a span of the
+/// ring, so a byte count that is not a multiple of the frame size leaves the
+/// ring straddling a sample: from there on every left sample is read as a
+/// right one and the image swaps channels for the rest of the stream.
+fn honourable_bytes(bytes: usize, exposed: usize, frame: usize) -> usize {
+    if frame == 0 {
+        return 0;
+    }
+    bytes.min(exposed) / frame * frame
+}
+
 fn exposed_queued(queued: usize, pad_end: u64, consumed: u64) -> usize {
     let pad = pad_end.saturating_sub(consumed);
     queued.saturating_sub(pad.min(queued as u64) as usize)
@@ -1029,7 +1058,7 @@ impl HdaInner {
     }
 
     fn free_bytes(&self) -> usize {
-        self.ring_len - RING_GUARD - self.queued
+        free_bytes_of(self.ring_len, RING_GUARD, self.queued)
     }
 
     /// Clear RUN and wait for the engine to acknowledge it. Returns whether it
@@ -1100,8 +1129,7 @@ impl HdaInner {
     /// silence that tail so a looping DMA cannot replay it.
     fn rewind_bytes(&mut self, bytes: usize) -> usize {
         self.poll_progress();
-        let frame = self.frame_bytes();
-        let n = bytes.min(self.exposed_queued()) / frame * frame;
+        let n = honourable_bytes(bytes, self.exposed_queued(), self.frame_bytes());
         if n == 0 {
             return 0;
         }
@@ -1130,8 +1158,7 @@ impl HdaInner {
     /// Skip the next `bytes` of unplayed PCM (silence from the playhead).
     fn forward_bytes(&mut self, bytes: usize) -> usize {
         self.poll_progress();
-        let frame = self.frame_bytes();
-        let n = bytes.min(self.exposed_queued()) / frame * frame;
+        let n = honourable_bytes(bytes, self.exposed_queued(), self.frame_bytes());
         if n == 0 {
             return 0;
         }
@@ -1314,7 +1341,13 @@ fn stream_format(rate: u32, channels: u8) -> u16 {
     fmt |= ((mult - 1) as u16) << 11;
     fmt |= ((div - 1) as u16) << 8;
     fmt |= 0b001 << 4; // 16-bit
-    fmt |= (channels as u16 - 1) & 0xf;
+                       // `channels.max(1)`, as `frame_bytes`, `setup_digital_converter` and
+                       // `send_audio_infoframe` all do with the same field. A bare
+                       // `channels - 1` underflows on zero: a panic in debug, and in release
+                       // `0xFFFF & 0xf` == 15, i.e. sixteen channels. `set_params` pins this to
+                       // stereo today ("stereo only for now"), so zero cannot arrive yet -- this
+                       // is here so that lifting that line stays a one-line change.
+    fmt |= (channels.max(1) as u16 - 1) & 0xf;
     fmt
 }
 
@@ -1358,6 +1391,264 @@ fn choose_route(scored: &[(OutPath, i32)], current: Option<(u32, u32)>) -> Optio
         return scored.iter().map(|(p, _)| p).find(|p| is_current(p));
     }
     Some(best)
+}
+
+#[cfg(test)]
+mod format_and_ring_tests {
+    //! The arithmetic this driver does between the client's PCM and the
+    //! controller's own counters. None of it touches MMIO, and all of it is
+    //! the kind that fails quietly: a wrong bit in the stream format plays
+    //! the track at the wrong speed, a byte count that is not a whole number
+    //! of frames swaps the channels for the rest of the stream, and a
+    //! position that runs backwards is what the intermittent dropouts were.
+
+    use super::{
+        exposed_queued, free_bytes_of, honourable_bytes, nearest_rate, park_target, stream_format,
+        sub_nodes,
+    };
+
+    /// Decode an HDA stream format word the way the controller does
+    /// (Intel HDA §3.7.1): base rate bit, multiplier, divisor, sample size,
+    /// channel count.
+    fn decode(fmt: u16) -> (u32, u32, u32, u32, u32) {
+        let base = if fmt & (1 << 14) != 0 { 44100 } else { 48000 };
+        let mult = ((fmt >> 11) & 0b111) as u32 + 1;
+        let div = ((fmt >> 8) & 0b111) as u32 + 1;
+        let bits = (fmt >> 4) & 0b111;
+        let chans = (fmt & 0xf) as u32 + 1;
+        (base, mult, div, bits as u32, chans)
+    }
+
+    #[test]
+    fn every_supported_rate_decodes_back_to_itself() {
+        // The whole point of the table: `base * mult / div` is what the
+        // codec will actually clock the samples out at. One wrong nibble and
+        // the track plays fast or slow, with no error anywhere.
+        for rate in [
+            8000u32, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 176400, 192000,
+        ] {
+            let (base, mult, div, _, _) = decode(stream_format(rate, 2));
+            assert_eq!(
+                base * mult / div,
+                rate,
+                "{} Hz encoded as base {} x{} /{}",
+                rate,
+                base,
+                mult,
+                div
+            );
+        }
+    }
+
+    #[test]
+    fn the_base_rate_bit_follows_the_family_not_the_magnitude() {
+        // 44.1k and 48k families are not interchangeable: asking for 88200 on
+        // the 48k base gives 96000, which is a 9% pitch error.
+        for rate in [11025u32, 22050, 44100, 88200, 176400] {
+            assert_eq!(decode(stream_format(rate, 2)).0, 44100, "{} Hz", rate);
+        }
+        for rate in [8000u32, 16000, 32000, 48000, 96000, 192000] {
+            assert_eq!(decode(stream_format(rate, 2)).0, 48000, "{} Hz", rate);
+        }
+    }
+
+    #[test]
+    fn an_unknown_rate_falls_back_to_48k_exactly() {
+        // The `_ =>` arm claims 48000; it has to actually encode as 48000
+        // and not as whatever the previous arm left behind.
+        let (base, mult, div, _, _) = decode(stream_format(1234, 2));
+        assert_eq!((base, mult, div), (48000, 1, 1));
+        assert_eq!(base * mult / div, 48000);
+    }
+
+    #[test]
+    fn the_sample_size_is_always_sixteen_bits() {
+        // The ring, `frame_bytes` and the volume stage are all S16LE. A
+        // format word that says anything else desynchronises every one of
+        // them from the controller.
+        for rate in [8000u32, 44100, 48000, 192000, 999] {
+            assert_eq!(decode(stream_format(rate, 2)).3, 0b001, "{} Hz", rate);
+        }
+    }
+
+    #[test]
+    fn the_channel_count_is_encoded_base_zero() {
+        assert_eq!(decode(stream_format(48000, 1)).4, 1);
+        assert_eq!(decode(stream_format(48000, 2)).4, 2);
+        assert_eq!(decode(stream_format(48000, 8)).4, 8);
+    }
+
+    #[test]
+    fn a_zero_channel_count_does_not_underflow_into_sixteen_channels() {
+        // `channels - 1` on zero is a panic in debug and `0xFFFF & 0xf` == 15
+        // in release, i.e. sixteen channels. Every sibling that touches this
+        // field uses `.max(1)`; this one now does too.
+        assert_eq!(decode(stream_format(48000, 0)).4, 1);
+    }
+
+    #[test]
+    fn the_rate_snapping_picks_the_nearest_supported_rate() {
+        assert_eq!(nearest_rate(48000), 48000, "an exact rate is left alone");
+        assert_eq!(nearest_rate(44100), 44100);
+        assert_eq!(nearest_rate(47999), 48000);
+        assert_eq!(nearest_rate(44000), 44100);
+        assert_eq!(
+            nearest_rate(0),
+            8000,
+            "below the table clamps to the lowest"
+        );
+        assert_eq!(
+            nearest_rate(u32::MAX),
+            192000,
+            "above the table clamps to the highest"
+        );
+    }
+
+    #[test]
+    fn the_snapped_rate_is_always_one_the_format_table_knows() {
+        // The contract between the two functions: `stream_format`'s `_ =>`
+        // arm silently means 48000, so anything `nearest_rate` returns must
+        // have its own arm, or a 44.1k-family request lands on 48k.
+        for raw in [
+            0u32,
+            1,
+            7999,
+            8000,
+            30000,
+            44099,
+            44100,
+            60000,
+            100000,
+            1 << 30,
+            u32::MAX,
+        ] {
+            let rate = nearest_rate(raw);
+            let (base, mult, div, _, _) = decode(stream_format(rate, 2));
+            assert_eq!(
+                base * mult / div,
+                rate,
+                "nearest_rate({}) = {} has no entry in the format table",
+                raw,
+                rate
+            );
+        }
+    }
+
+    #[test]
+    fn the_park_target_clears_whichever_counter_reports_furthest() {
+        // Parking behind any of the three counters means writing where the
+        // engine has already been, which it never fetches: silence that never
+        // ends.
+        assert_eq!(park_target(100, 50, 50, 8), 108, "the link clock is ahead");
+        assert_eq!(park_target(50, 100, 50, 8), 108, "LPIB is ahead");
+        assert_eq!(park_target(50, 50, 100, 8), 108, "DPIB is ahead");
+        assert_eq!(park_target(0, 0, 0, 0), 0);
+    }
+
+    #[test]
+    fn the_silence_pad_is_not_counted_as_the_clients_pcm() {
+        // The pad is ring space the driver filled on its own. Counting it as
+        // queued makes the client's own "how much is left to play" answer too
+        // large, and it waits for a drain that already happened.
+        assert_eq!(
+            exposed_queued(1000, 0, 0),
+            1000,
+            "no pad, nothing to take off"
+        );
+        assert_eq!(exposed_queued(1000, 400, 0), 600, "400 bytes of it are pad");
+        assert_eq!(
+            exposed_queued(1000, 400, 400),
+            1000,
+            "a pad the engine has already played is no longer in the ring"
+        );
+        assert_eq!(
+            exposed_queued(100, 1_000_000, 0),
+            0,
+            "a pad larger than the ring cannot make the answer negative"
+        );
+        assert_eq!(
+            exposed_queued(1000, 0, 5000),
+            1000,
+            "consumed past the pad end must not add anything back"
+        );
+        // Note for whoever mutates this: dropping the `.min(queued as u64)`
+        // from `exposed_queued` survives every test here, and it is right
+        // that it does. `saturating_sub` already floors at zero, so on a
+        // 64-bit target the `min` changes nothing. It is load-bearing only
+        // where `usize` is narrower than `u64` and `pad as usize` would
+        // truncate a large pad to a small one -- and then it would
+        // under-subtract instead of saturating. Every target this kernel
+        // builds for is 64-bit, so the mutation is EQUIVALENT here, not a
+        // gap in the tests. Do not go chasing it.
+    }
+
+    #[test]
+    fn the_free_space_never_wraps_past_the_end_of_the_ring() {
+        // The write path copies this many bytes into the ring. An underflow
+        // here is not a panic in release -- it is a free-space figure near
+        // 2^64 and a copy off the end of the ring.
+        assert_eq!(free_bytes_of(65536, 16384, 0), 49152);
+        assert_eq!(free_bytes_of(65536, 16384, 49152), 0, "exactly full");
+        assert_eq!(
+            free_bytes_of(65536, 16384, 49153),
+            0,
+            "one byte over full is zero free, not 2^64 - 1"
+        );
+        assert_eq!(free_bytes_of(65536, 16384, usize::MAX), 0);
+        // And a ring smaller than its own guard, which is what an
+        // uninitialised `ring_len` of 0 looks like.
+        assert_eq!(free_bytes_of(0, 16384, 0), 0);
+        assert_eq!(free_bytes_of(1024, 16384, 0), 0);
+    }
+
+    #[test]
+    fn a_rewind_is_rounded_down_to_whole_frames() {
+        // Not cosmetic: `wp` moves by this number and a half-frame offset
+        // swaps left and right for the rest of the stream.
+        assert_eq!(honourable_bytes(100, 1000, 4), 100);
+        assert_eq!(honourable_bytes(101, 1000, 4), 100);
+        assert_eq!(honourable_bytes(103, 1000, 4), 100);
+        assert_eq!(
+            honourable_bytes(3, 1000, 4),
+            0,
+            "less than a frame is nothing"
+        );
+    }
+
+    #[test]
+    fn a_rewind_never_exceeds_what_the_client_still_has_queued() {
+        assert_eq!(honourable_bytes(10_000, 400, 4), 400);
+        assert_eq!(
+            honourable_bytes(10_000, 402, 4),
+            400,
+            "and still whole frames"
+        );
+        assert_eq!(honourable_bytes(10_000, 0, 4), 0);
+        assert_eq!(honourable_bytes(usize::MAX, 1024, 4), 1024);
+    }
+
+    #[test]
+    fn a_zero_frame_size_asks_for_nothing_instead_of_dividing_by_zero() {
+        // `frame_bytes()` is `channels.max(1) * 2`, so it cannot be zero
+        // today; the guard is here because the bare `/ frame` this replaced
+        // would be a divide-by-zero panic in the kernel if it ever were.
+        assert_eq!(honourable_bytes(1000, 1000, 0), 0);
+    }
+
+    #[test]
+    fn the_subnode_response_splits_into_start_and_count() {
+        // GET_PARAMETER(SUB_NODE_COUNT): start node in 23:16, count in 7:0.
+        // Reading the two the wrong way round walks a node list that does not
+        // exist, and the codec enumerates as having no widgets at all.
+        assert_eq!(sub_nodes(0x0002_0005), (2, 5));
+        assert_eq!(sub_nodes(0), (0, 0));
+        assert_eq!(sub_nodes(0x00FF_00FF), (0xFF, 0xFF));
+        assert_eq!(
+            sub_nodes(0xFF00_FF00),
+            (0, 0),
+            "the bits outside the two fields are not part of either"
+        );
+    }
 }
 
 #[cfg(test)]

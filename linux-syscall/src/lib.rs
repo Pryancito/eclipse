@@ -858,7 +858,9 @@ fn alsa_ioctl_name(cmd: u32) -> Option<&'static str> {
 /// impossible, so when PulseAudio dies inside libasound the question is always
 /// "which ioctl returned what". `HW_REFINE` returning `EINVAL` is excluded: the
 /// `*_near` helpers find a supported rate/period BY refining until the kernel
-/// says no, so that one is a search, not a fault.
+/// says no, so that one is a search, not a fault. `ENOTTY` (wrong device) and
+/// `EAGAIN` (a full ring under a nonblocking write, which alsa-lib retries via
+/// poll) are excluded for the same reason: expected answers, not aborts.
 fn alsa_hunt(pid: KoID, num: u32, args: &[usize; 6], err: LxError) {
     use core::sync::atomic::{AtomicU32, Ordering};
     static BUDGET: AtomicU32 = AtomicU32::new(0);
@@ -874,6 +876,16 @@ fn alsa_hunt(pid: KoID, num: u32, args: &[usize; 6], err: LxError) {
     }
     // ENOTTY is "this fd is not that kind of device" -- a probe, not a fault.
     if matches!(err, LxError::ENOTTY) {
+        return;
+    }
+    // EAGAIN is "no room right now, poll and retry": the normal answer to a
+    // nonblocking WRITEI against a full ring, which alsa-lib handles by going
+    // back to poll(), never by asserting. It is not what this hunter is for
+    // (an abort inside libasound), and logging every one at error! floods the
+    // console with a line that reads like a fault -- the exact false alarm
+    // that kept getting reported. A genuine stall still surfaces: the driver
+    // escalates a ring that stopped draining to EPIPE, not EAGAIN.
+    if matches!(err, LxError::EAGAIN) {
         return;
     }
     if BUDGET.fetch_add(1, Ordering::Relaxed) < 64 {

@@ -23,10 +23,22 @@
 //! and every blocking wait hang until the caller's deadline — which under
 //! GLX/DRI3 (client ↔ Xwayland exchanging sync_files) collapses into
 //! `zink: swapchain killed` / `GLXBadCurrentWindow` on `SwapBuffers`. A
-//! Wayland-native client rarely polls these fds the same way.
+//! Wayland-native client rarely polls these fds the same way; it uses
+//! `SYNCOBJ_EVENTFD` instead.
+//!
+//! Hardware fences advance only when something calls
+//! [`poll_pending`](zcore_drivers::scheme::syncobj::poll_pending). The
+//! eventfd path already arms a short timer for that; sync_file waiters must
+//! do the same, and must publish [`Event::READABLE`] so `sys_poll`'s
+//! `subscribe_readiness` wakes the moment the point lands rather than on a
+//! timer tick (or never).
 
 use super::*;
-use core::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::{Event, EventBus};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use lock::Mutex;
 use zircon_object::object::*;
 
 /// A file object carrying a syncobj handle number across the fd boundary.
@@ -48,8 +60,24 @@ pub struct SyncobjHandle {
     /// Latched the first time a sync_file fence is observed signaled. A real
     /// `sync_file` wraps the fence at export time; later reset/signal of the
     /// source syncobj must not make this fd go unready again.
-    signaled: AtomicBool,
+    signaled: Arc<AtomicBool>,
+    /// Wakes `sys_poll` subscribers when the fence becomes ready.
+    eventbus: Arc<Mutex<EventBus>>,
 }
+
+/// One live sync_file that is still waiting for its point. Dropped once
+/// signaled (or when the syncobj disappears).
+struct SyncFileWaiter {
+    handle: u32,
+    point: u64,
+    signaled: Arc<AtomicBool>,
+    eventbus: Arc<Mutex<EventBus>>,
+}
+
+lazy_static::lazy_static! {
+    static ref WAITERS: Mutex<Vec<SyncFileWaiter>> = Mutex::new(Vec::new());
+}
+static WAITER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 impl_kobject!(SyncobjHandle);
 
@@ -59,23 +87,34 @@ impl SyncobjHandle {
             base: KObjectBase::new(),
             handle,
             sync_file_point: None,
-            signaled: AtomicBool::new(false),
+            signaled: Arc::new(AtomicBool::new(false)),
+            eventbus: EventBus::new(),
         })
     }
 
     /// A `sync_file` fd: the fence "`handle` reaches `point`".
     pub fn new_sync_file(handle: u32, point: u64) -> Arc<Self> {
         // If the snapshot is already satisfied at export time (the common
-        // case: EXEC signals its syncobjs before returning), latch ready
-        // immediately so the first `sync_wait(fd, 0)` succeeds.
+        // case on the software path: EXEC signals its syncobjs before
+        // returning), latch ready immediately so the first `sync_wait(fd, 0)`
+        // succeeds. On real hardware the fence is often still in flight —
+        // register a waiter and arm the HW-fence poller instead.
         let already = zcore_drivers::scheme::syncobj::query(handle)
             .map(|p| p >= point)
             .unwrap_or(false);
+        let signaled = Arc::new(AtomicBool::new(already));
+        let eventbus = EventBus::new();
+        if already {
+            eventbus.lock().set(Event::READABLE);
+        } else {
+            register_waiter(handle, point, signaled.clone(), eventbus.clone());
+        }
         Arc::new(Self {
             base: KObjectBase::new(),
             handle,
             sync_file_point: Some(point),
-            signaled: AtomicBool::new(already),
+            signaled,
+            eventbus,
         })
     }
 
@@ -88,13 +127,92 @@ impl SyncobjHandle {
         if self.signaled.load(Ordering::Acquire) {
             return true;
         }
+        // Hardware fences only advance when something resolves them. Without
+        // this, a blocking `sync_wait` re-polls forever against a stale point
+        // and Mesa kills the GLX swapchain.
+        let _ = zcore_drivers::scheme::syncobj::poll_pending();
         let reached = zcore_drivers::scheme::syncobj::query(self.handle)
             .map(|p| p >= point)
             .unwrap_or(false);
         if reached {
-            self.signaled.store(true, Ordering::Release);
+            self.publish_ready();
         }
         reached
+    }
+
+    fn publish_ready(&self) {
+        if self
+            .signaled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.eventbus.lock().set(Event::READABLE);
+        } else {
+            // Already latched (e.g. by the signal hook); still publish so a
+            // late subscriber sees the latched bit.
+            self.eventbus.lock().set(Event::READABLE);
+        }
+    }
+}
+
+fn register_waiter(
+    handle: u32,
+    point: u64,
+    signaled: Arc<AtomicBool>,
+    eventbus: Arc<Mutex<EventBus>>,
+) {
+    {
+        let mut waiters = WAITERS.lock();
+        waiters.push(SyncFileWaiter {
+            handle,
+            point,
+            signaled,
+            eventbus,
+        });
+        WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
+    }
+    // Same poller the SYNCOBJ_EVENTFD path uses: without it, a GPU fence that
+    // lands with nobody else issuing syncobj ioctls is never noticed.
+    super::syncobj_eventfd::ensure_hw_fence_poller();
+}
+
+/// How many sync_file fds are still waiting on a future point. The eventfd
+/// poller consults this so it keeps running when only GLX/DRI3 (not wlroots
+/// eventfd) is waiting.
+pub(super) fn pending_waiter_count() -> usize {
+    WAITER_COUNT.load(Ordering::Relaxed)
+}
+
+/// Called from the syncobj point-advance hook (and from our own poll path
+/// after `poll_pending`). Latch + wake every sync_file whose point is now
+/// reached.
+pub(super) fn wake_ready_waiters() {
+    if WAITER_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mut fire: Vec<(Arc<AtomicBool>, Arc<Mutex<EventBus>>)> = Vec::new();
+    {
+        let mut waiters = WAITERS.lock();
+        let mut i = 0;
+        while i < waiters.len() {
+            match zcore_drivers::scheme::syncobj::query(waiters[i].handle) {
+                Some(cur) if cur >= waiters[i].point => {
+                    let w = waiters.swap_remove(i);
+                    fire.push((w.signaled, w.eventbus));
+                }
+                None => {
+                    // Syncobj gone: the fd can never become ready. Drop the
+                    // waiter (Mesa will time out the same way Linux does).
+                    waiters.swap_remove(i);
+                }
+                _ => i += 1,
+            }
+        }
+        WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
+    }
+    for (signaled, bus) in fire {
+        signaled.store(true, Ordering::Release);
+        bus.lock().set(Event::READABLE);
     }
 }
 
@@ -102,6 +220,18 @@ impl Drop for SyncobjHandle {
     fn drop(&mut self) {
         // Last fd reference: drop the syncobj table ref taken at export/dup.
         let _ = zcore_drivers::scheme::syncobj::destroy(self.handle);
+        // Drop any waiter we registered (fd closed before the fence landed).
+        if let Some(point) = self.sync_file_point {
+            if !self.signaled.load(Ordering::Acquire) {
+                let mut waiters = WAITERS.lock();
+                waiters.retain(|w| {
+                    !(core::ptr::eq(Arc::as_ptr(&w.signaled), Arc::as_ptr(&self.signaled))
+                        && w.handle == self.handle
+                        && w.point == point)
+                });
+                WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
+            }
+        }
     }
 }
 
@@ -118,12 +248,16 @@ impl FileLike for SyncobjHandle {
     fn dup(&self) -> Arc<dyn FileLike> {
         // Another fd reference — bump the syncobj refcount to match Drop.
         let _ = zcore_drivers::scheme::syncobj::add_ref(self.handle);
-        Arc::new(Self {
+        let duped = Arc::new(Self {
             base: KObjectBase::new(),
             handle: self.handle,
             sync_file_point: self.sync_file_point,
-            signaled: AtomicBool::new(self.signaled.load(Ordering::Acquire)),
-        })
+            signaled: self.signaled.clone(),
+            eventbus: self.eventbus.clone(),
+        });
+        // A dup of an unready sync_file shares the waiter via the Arc pair;
+        // no second registration.
+        duped
     }
 
     async fn read(&self, _buf: &mut [u8]) -> LxResult<usize> {
@@ -152,9 +286,35 @@ impl FileLike for SyncobjHandle {
     }
 
     async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
-        // sys_poll uses the sync `poll` path; keep this consistent for any
-        // leftover caller.
-        self.poll(events)
+        loop {
+            let status = self.poll(events)?;
+            if !events.contains(PollEvents::IN) || status.read {
+                return Ok(status);
+            }
+            let bus = self.eventbus.clone();
+            crate::sync::wait_for_event(bus, Event::READABLE).await;
+        }
+    }
+
+    fn subscribe_readiness(
+        &self,
+        events: PollEvents,
+        waker: &core::task::Waker,
+    ) -> Option<crate::sync::ReadinessSub> {
+        if self.sync_file_point.is_none() {
+            // Opaque syncobj fds are not the sync_wait path; leave them
+            // unsubscribable so sys_poll keeps its short tick.
+            return None;
+        }
+        // Re-check before parking: a fence that landed between the scan and
+        // subscribe must latch READABLE so the EventBus fires the waker now.
+        let _ = self.fence_ready();
+        let mask = super::poll_events_to_bus_mask(events);
+        Some(crate::sync::subscribe_readiness_on(
+            &self.eventbus,
+            mask,
+            waker,
+        ))
     }
 }
 
@@ -193,8 +353,36 @@ mod sync_file_poll_tests {
         let status = fd.poll(PollEvents::IN).expect("poll");
         assert!(!status.read, "point 5 has not been reached");
         assert!(zcore_drivers::scheme::syncobj::timeline_signal(handle, 5));
+        // The signal hook (or a direct poll after an explicit signal) must
+        // publish READABLE.
+        wake_ready_waiters();
         let status = fd.poll(PollEvents::IN).expect("poll after signal");
         assert!(status.read, "once the point lands, POLLIN must fire");
+        drop(fd);
+    }
+
+    #[test]
+    fn subscribe_readiness_is_offered_for_sync_files() {
+        let handle = zcore_drivers::scheme::syncobj::create(false);
+        assert!(zcore_drivers::scheme::syncobj::add_ref(handle));
+        let fd = SyncobjHandle::new_sync_file(handle, 1);
+        // A no-op waker is enough: we only care that the fd participates in
+        // sys_poll's covered path (Some(...)), not that it fires.
+        let waker = {
+            use core::task::{RawWaker, RawWakerVTable, Waker};
+            fn clone(p: *const ()) -> RawWaker {
+                RawWaker::new(p, &VTABLE)
+            }
+            fn wake(_: *const ()) {}
+            fn wake_by_ref(_: *const ()) {}
+            fn drop(_: *const ()) {}
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+            unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
+        };
+        assert!(
+            fd.subscribe_readiness(PollEvents::IN, &waker).is_some(),
+            "sys_poll must be able to park on a sync_file"
+        );
         drop(fd);
     }
 }

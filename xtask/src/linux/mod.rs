@@ -2711,12 +2711,25 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               enable-shm = yes\n\
               enable-memfd = yes\n\
               default-sample-format = s16le\n\
+              # Fixed sink rate: no `alternate-sample-rate`, so the daemon keeps\n\
+              # the ALSA sink (and thus the HDA link) at 48 kHz for every stream\n\
+              # and resamples 44.1 kHz content itself, rather than following the\n\
+              # stream rate. Switching the link rate reprograms the HDA stream,\n\
+              # which on an HDMI/DP sink is a re-lock mute of the audio -- so a\n\
+              # 44.1 kHz track after a 48 kHz one used to drop the first fraction\n\
+              # of a second. A fixed rate costs a userspace resample of 44.1 kHz\n\
+              # material (below) but never a re-lock.\n\
               default-sample-rate = 48000\n\
-              alternate-sample-rate = 44100\n\
               default-sample-channels = 2\n\
               default-fragments = 4\n\
               default-fragment-size-msec = 25\n\
-              resample-method = speex-float-1\n\
+              # speex-float-1 is the lowest speex quality (chosen for battery on\n\
+              # the phones PA ships on); with the sink now resampling every\n\
+              # non-48k stream it is worth a few % more CPU for a much flatter\n\
+              # passband and deeper stopband. -3 is a safe middle on this\n\
+              # software-rendered, no-RT setup; raise toward -5 or soxr-mq if the\n\
+              # CPU headroom is there, lower to -1 if PA starts arriving late.\n\
+              resample-method = speex-float-3\n\
               log-target = stderr\n\
               log-level = info\n",
         );

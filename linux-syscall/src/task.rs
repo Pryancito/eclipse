@@ -998,7 +998,10 @@ impl Syscall<'_> {
     /// To represent a duration, see TimeSpec.
     pub async fn sys_nanosleep(&self, req: UserInPtr<TimeSpec>) -> SysResult {
         info!("nanosleep: deadline={:?}", req);
-        let duration = req.read()?.into();
+        // A `timespec` out of range is EINVAL, not a sleep of some other
+        // length: `tv_nsec` has to be a fraction of a second and `tv_sec`
+        // must not be negative.
+        let duration = req.read()?.try_into_duration()?;
         let deadline = kernel_hal::timer::deadline_after(duration);
         // Check for pending signals before blocking.
         linux_object::process::check_signals()?;

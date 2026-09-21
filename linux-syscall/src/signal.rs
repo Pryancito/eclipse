@@ -534,8 +534,10 @@ impl Syscall<'_> {
         let deadline = if timeout.is_null() {
             None
         } else {
-            let dur = core::time::Duration::from(timeout.read()?);
-            Some(kernel_hal::timer::timer_now() + dur)
+            let dur = timeout.read()?.try_into_duration()?;
+            // Saturating: adding a `Duration` panics on overflow, and this
+            // one comes from userspace.
+            Some(kernel_hal::timer::timer_now().saturating_add(dur))
         };
         info!(
             "rt_sigtimedwait: set={:#x}, timeout={:?}, thread={}",

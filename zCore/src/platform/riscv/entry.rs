@@ -100,6 +100,14 @@ extern "C" fn secondary_rust_main() -> ! {
 
 /// 根据硬件线程号设置启动栈。
 ///
+/// The array is indexed by raw hart id, so a hart id at or past
+/// [`MAX_HART_NUM`] has no slot. It is parked here rather than handed a stack
+/// pointer past the end of the array, which is what used to happen and left
+/// the hart pushing onto `sbss` — the counter arena and the bootstrap heap —
+/// before the kernel had printed anything at all. The message goes out through
+/// the SBI legacy console by hand: there is no stack yet, so nothing that
+/// needs one can report this.
+///
 /// # Safety
 ///
 /// 裸函数。
@@ -109,8 +117,12 @@ unsafe extern "C" fn select_stack(hartid: usize) {
     const STACK_LEN_TOTAL: usize = STACK_LEN_PER_HART * MAX_HART_NUM;
     #[link_section = ".bss.bootstack"]
     static mut BOOT_STACK: [u8; STACK_LEN_TOTAL] = [0u8; STACK_LEN_TOTAL];
+    static NO_STACK_MSG: [u8; 58] =
+        *b"hart id is past MAX_HART_NUM: no boot stack, parking it.\n\0";
 
     core::arch::naked_asm!(
+        "   li   t2, {max_hart}
+            bgeu a0, t2, 2f",
         "   mv   tp, a0",
         "   addi t0, a0,  1
             la   sp, {stack}
@@ -120,8 +132,22 @@ unsafe extern "C" fn select_stack(hartid: usize) {
             bnez t0, 1b
             ret
         ",
+        // SBI legacy console putchar (EID 0x01), one byte at a time, then halt.
+        "2: la   t0, {msg}
+         3: lbu  a0, 0(t0)
+            beqz a0, 4f
+            li   a6, 0
+            li   a7, 1
+            ecall
+            addi t0, t0, 1
+            j    3b
+         4: wfi
+            j    4b
+        ",
         stack        =   sym BOOT_STACK,
+        msg          =   sym NO_STACK_MSG,
         len_per_hart = const STACK_LEN_PER_HART,
+        max_hart     = const MAX_HART_NUM,
     )
 }
 

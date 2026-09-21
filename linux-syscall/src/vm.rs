@@ -1,6 +1,7 @@
 use super::*;
 use alloc::vec::Vec;
 use bitflags::bitflags;
+use linux_object::loader::HEAP_BASE;
 use zircon_object::vm::{pages, roundup_pages, MMUFlags, VmObject, PAGE_SIZE};
 
 /// Per-call cap for a single `mmap` / `brk` growth. It bounds how much a single
@@ -192,6 +193,10 @@ impl Syscall<'_> {
             return Err(LxError::EINVAL);
         }
         let len = roundup_pages(len);
+        // `offset` is the sixth raw machine word from userspace, and nothing
+        // below treats it as anything but a trustworthy byte offset -- see
+        // `validate_mmap_offset` for what that cost.
+        let offset = validate_mmap_offset(offset, len, flags.contains(MmapFlags::ANONYMOUS))?;
         // hunter W^X: reject (or audit) simultaneously writable+executable maps.
         if !hunter::check_mmap(
             self.zircon_process().id(),
@@ -287,7 +292,7 @@ impl Syscall<'_> {
             // MAP_PRIVATE keeps the per-call demand-paged snapshot.
             let (vmo, vmo_offset) = if flags.contains(MmapFlags::SHARED) {
                 let (vmo, off) = file_like
-                    .get_vmo_shared(offset as usize, len)
+                    .get_vmo_shared(offset, len)
                     .inspect_err(|e| {
                         // Name the failing fd. `File` carries a path (the
                         // device/file node); anything else has none, which
@@ -304,8 +309,8 @@ impl Syscall<'_> {
                         // ENOSYS is an EXPECTED, handled fallback, not a failure:
                         // log it at info so it stops reading as a compositor
                         // crash. Every other shared-mmap ENOSYS is still an error.
-                        const PCM_MMAP_STATUS: u64 = 0x8000_0000;
-                        const PCM_MMAP_CONTROL: u64 = 0x8100_0000;
+                        const PCM_MMAP_STATUS: usize = 0x8000_0000;
+                        const PCM_MMAP_CONTROL: usize = 0x8100_0000;
                         let alsa_syncptr_probe = path.contains("/dev/snd/pcm")
                             && (offset == PCM_MMAP_STATUS || offset == PCM_MMAP_CONTROL);
                         if alsa_syncptr_probe {
@@ -332,7 +337,7 @@ impl Syscall<'_> {
                 vmo.set_share_on_fork();
                 (vmo, off)
             } else {
-                let vmo = file_like.get_vmo(offset as usize, len).inspect_err(|e| {
+                let vmo = file_like.get_vmo(offset, len).inspect_err(|e| {
                     error!(
                         "mmap(file) get_vmo FAILED: {:?} fd={:?} offset={:#x} len={:#x}",
                         e, fd, offset, len
@@ -358,7 +363,7 @@ impl Syscall<'_> {
             // full-file read that froze the machine on `perf` (libLLVM ~150 MiB).
             // For a shared full-file VMO the requested window starts at
             // `vmo_offset` inside it; snapshots bake the offset in and use 0.
-            let map_len = len.min(vmo.len() - vmo_offset);
+            let map_len = file_map_len(len, vmo.len(), vmo_offset);
             let addr = if map_len < len {
                 // The file cannot back the whole request (mmap past EOF, or a
                 // PT_LOAD segment whose memsz exceeds its filesz). Linux STILL
@@ -485,6 +490,22 @@ impl Syscall<'_> {
 
         // brk(0) → return current break unchanged (query).
         if new_brk == 0 {
+            return Ok(current_brk);
+        }
+
+        // Below where the heap starts is not a shrink, it is a bad argument,
+        // and Linux answers it by returning the old break (`if (brk <
+        // mm->start_brk) goto out;`). Without this the shrink branch below
+        // accepts it and moves the break into the middle of the loaded image,
+        // so the next grow tries to map over the program's own text: the
+        // `/oscomp/brk` case does exactly that, because it prints and
+        // round-trips the break through a 32-bit int and `HEAP_BASE` is a
+        // round power of two whose low 32 bits are zero.
+        if new_brk < HEAP_BASE {
+            info!(
+                "brk: {:#x} is below the heap base, keeping {:#x}",
+                new_brk, current_brk
+            );
             return Ok(current_brk);
         }
 
@@ -984,6 +1005,70 @@ impl Syscall<'_> {
     }
 }
 
+/// How much of a file-backed mapping the file itself can back.
+///
+/// `get_vmo_shared` promises a VMO that reaches `vmo_offset + len`, but it is a
+/// trait method any file-like can implement, so the promise is not enforceable
+/// here. A plain `vmo_len - vmo_offset` turns a broken promise into an
+/// underflow: a panic in a debug build, and in a release one (no
+/// `overflow-checks`) a length near 2^64 that `min` then hands straight to the
+/// mapper.
+///
+/// Saturating instead degrades to `0`, which is the honest reading -- the file
+/// backs none of this window -- and takes the caller's demand-zero path,
+/// exactly like a mapping that begins past end-of-file.
+fn file_map_len(len: usize, vmo_len: usize, vmo_offset: usize) -> usize {
+    len.min(vmo_len.saturating_sub(vmo_offset))
+}
+
+/// Validate the `offset` argument of `mmap(2)`.
+///
+/// Two separate rules, because Linux applies them to different calls:
+///
+/// 1. **Page alignment, for every `mmap`.** x86-64's `SYSCALL_DEFINE6(mmap)`
+///    opens with `if (off & ~PAGE_MASK) return -EINVAL;`, before it has even
+///    looked at the flags, so an anonymous mapping is held to it too. Nothing
+///    that works on Linux can fail this check.
+///
+/// 2. **`offset + len` must not overflow, for a file-backed `mmap`.** Linux
+///    checks the same thing in page units (`do_mmap`: `if ((pgoff + (len >>
+///    PAGE_SHIFT)) < pgoff) return -EOVERFLOW;`); this kernel carries the
+///    offset in *bytes* all the way down -- `get_vmo(offset, len)` and the page
+///    cache both add `offset + len` -- so bytes are the unit that has to be
+///    checked here, and the errno is the one Linux uses for it.
+///
+/// Rule 2 is not theoretical. `offset` arrives as the sixth raw machine word
+/// and went unchecked into `FileLike::get_vmo{,_shared}`, so
+///
+/// ```c
+/// mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0xFFFFFFFFFFFFF000);
+/// ```
+///
+/// -- page-aligned, so it passed the one check that did exist -- reached
+/// `inode_cache_vmo`, where `offset + len` wraps to 0. In a debug build that
+/// addition is a kernel panic from an unprivileged process. In a release build
+/// (no `overflow-checks`) it wraps instead, the "does the cache cover this
+/// window?" test reads `0 > vmo.len()` and says yes, and the caller then
+/// computes `vmo.len() - offset`, which underflows in turn.
+///
+/// Returns the offset as a `usize`, which is what every layer below wants.
+fn validate_mmap_offset(
+    offset: u64,
+    len: usize,
+    anonymous: bool,
+) -> linux_object::error::LxResult<usize> {
+    if !offset.is_multiple_of(PAGE_SIZE as u64) {
+        return Err(LxError::EINVAL);
+    }
+    // 32-bit targets: an offset a `usize` cannot even name is an overflow by
+    // definition. On 64-bit this conversion cannot fail.
+    let offset = usize::try_from(offset).map_err(|_| LxError::EOVERFLOW)?;
+    if !anonymous && offset.checked_add(len).is_none() {
+        return Err(LxError::EOVERFLOW);
+    }
+    Ok(offset)
+}
+
 /// `madvise(2)` advice values zCore recognises. All of zCore's target arches
 /// (x86_64/aarch64/riscv64) share this (asm-generic) numbering:
 ///   0 NORMAL, 1 RANDOM, 2 SEQUENTIAL, 3 WILLNEED, 4 DONTNEED, 8 FREE,
@@ -998,6 +1083,148 @@ const KNOWN_MADVISE: &[usize] = &[
 /// classification is unit-testable independently of the syscall plumbing.
 fn madvise_advice_known(advice: usize) -> bool {
     KNOWN_MADVISE.contains(&advice)
+}
+
+#[cfg(test)]
+mod mmap_offset_tests {
+    //! `mmap`'s sixth argument is a raw machine word that userspace chooses,
+    //! and this kernel carries it in bytes into the page cache, where it is
+    //! added to the mapping length. An offset that is not page-aligned, or one
+    //! whose sum with the length does not fit, has to be refused at the door:
+    //! below this point the addition either panics the kernel or wraps, and the
+    //! wrap is the worse of the two -- it makes a window the cache does not
+    //! cover look like one it does.
+
+    use super::validate_mmap_offset;
+    use linux_object::error::LxError;
+
+    const PAGE: usize = 4096;
+
+    #[test]
+    fn a_page_aligned_offset_is_accepted_and_comes_back_unchanged() {
+        for off in [0u64, 4096, 8192, 1 << 20, 1 << 32] {
+            assert_eq!(
+                validate_mmap_offset(off, PAGE, false).unwrap(),
+                off as usize,
+                "offset {:#x} should be accepted verbatim",
+                off
+            );
+        }
+    }
+
+    #[test]
+    fn an_unaligned_offset_is_einval() {
+        // Linux checks this before it looks at anything else:
+        // `if (off & ~PAGE_MASK) return -EINVAL;`.
+        // 2048 and 6144 are in the list on purpose: they are aligned to half
+        // a page, so a check written against the wrong constant still passes
+        // every other case here.
+        for off in [1u64, 511, 2048, 4095, 4097, 6144, 8191, u64::MAX] {
+            assert_eq!(
+                validate_mmap_offset(off, PAGE, false),
+                Err(LxError::EINVAL),
+                "offset {:#x} is not page-aligned and must be EINVAL",
+                off
+            );
+        }
+    }
+
+    #[test]
+    fn an_unaligned_offset_is_einval_for_an_anonymous_mapping_too() {
+        // The man page says `fd` and `offset` are ignored with MAP_ANONYMOUS,
+        // and they are -- but Linux still rejects an unaligned one, because the
+        // check is in the syscall entry, above the flag. Nothing that runs on
+        // Linux can trip over this.
+        assert_eq!(validate_mmap_offset(4097, PAGE, true), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn the_offset_that_wrapped_the_page_cache_is_eoverflow() {
+        // The reachable one:
+        //   mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0xFFFFFFFFFFFFF000)
+        // Page-aligned, so the only check that existed let it through, and
+        // `offset + len` in `inode_cache_vmo` wraps to exactly 0.
+        let offset = u64::MAX - PAGE as u64 + 1;
+        assert_eq!(offset % PAGE as u64, 0, "the offset under test is aligned");
+        assert_eq!(
+            (offset as usize).wrapping_add(PAGE),
+            0,
+            "this is the offset whose sum wraps to zero"
+        );
+        assert_eq!(
+            validate_mmap_offset(offset, PAGE, false),
+            Err(LxError::EOVERFLOW)
+        );
+    }
+
+    #[test]
+    fn the_largest_sum_that_still_fits_is_accepted() {
+        // The boundary is exact: `offset + len == usize::MAX + 1` overflows,
+        // `offset + len == usize::MAX` does not -- but `usize::MAX` is not
+        // page-aligned, so the last acceptable offset for a one-page mapping is
+        // two pages below the wrap.
+        let last_ok = (usize::MAX - 2 * PAGE + 1) as u64;
+        assert_eq!(last_ok % PAGE as u64, 0);
+        assert!(validate_mmap_offset(last_ok, PAGE, false).is_ok());
+        assert_eq!(
+            validate_mmap_offset(last_ok + PAGE as u64, PAGE, false),
+            Err(LxError::EOVERFLOW),
+            "one page further and the sum no longer fits"
+        );
+    }
+
+    #[test]
+    fn the_overflow_depends_on_the_length_not_just_the_offset() {
+        // The same offset is fine for a small mapping and not for a big one:
+        // the check is about the window, not about how large the offset looks.
+        // Sixteen pages below the wrap, so the window may be fifteen pages
+        // long but not sixteen.
+        let offset = (usize::MAX - 16 * PAGE + 1) as u64;
+        assert_eq!(offset % PAGE as u64, 0);
+        assert!(validate_mmap_offset(offset, PAGE, false).is_ok());
+        assert!(validate_mmap_offset(offset, 15 * PAGE, false).is_ok());
+        assert_eq!(
+            validate_mmap_offset(offset, 16 * PAGE, false),
+            Err(LxError::EOVERFLOW)
+        );
+    }
+
+    #[test]
+    fn an_anonymous_mapping_keeps_an_offset_linux_would_keep() {
+        // Linux's overflow check is in page units, so a huge *aligned* offset
+        // survives it; with MAP_ANONYMOUS the offset is then ignored outright
+        // and nothing ever adds it to anything. Rejecting it here would fail a
+        // call Linux accepts, so the overflow rule is the file-backed path's
+        // alone.
+        let offset = u64::MAX - PAGE as u64 + 1;
+        assert_eq!(
+            validate_mmap_offset(offset, PAGE, true).unwrap(),
+            offset as usize
+        );
+    }
+
+    #[test]
+    fn the_file_backed_length_never_underflows() {
+        use super::file_map_len;
+        // The ordinary case: the VMO covers the whole window.
+        assert_eq!(file_map_len(2 * PAGE, 8 * PAGE, 0), 2 * PAGE);
+        assert_eq!(file_map_len(2 * PAGE, 8 * PAGE, 6 * PAGE), 2 * PAGE);
+        // Mapping partly past the end of the file: only the head is backed.
+        assert_eq!(file_map_len(4 * PAGE, 8 * PAGE, 6 * PAGE), 2 * PAGE);
+        // The offset sits exactly at, or beyond, the end of the VMO. A plain
+        // subtraction underflows here; the answer has to be "nothing".
+        assert_eq!(file_map_len(PAGE, 8 * PAGE, 8 * PAGE), 0);
+        assert_eq!(file_map_len(PAGE, 8 * PAGE, 9 * PAGE), 0);
+        assert_eq!(file_map_len(PAGE, 0, usize::MAX), 0);
+    }
+
+    #[test]
+    fn a_zero_offset_is_always_fine() {
+        // What every anonymous mapping and almost every file mapping passes.
+        assert_eq!(validate_mmap_offset(0, 0, false).unwrap(), 0);
+        assert_eq!(validate_mmap_offset(0, usize::MAX, false).unwrap(), 0);
+        assert_eq!(validate_mmap_offset(0, PAGE, true).unwrap(), 0);
+    }
 }
 
 #[cfg(test)]

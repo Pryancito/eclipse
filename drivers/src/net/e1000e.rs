@@ -36,6 +36,80 @@ const E1000E_ITR_WINDOW_HOLD: u64 = 16;
 /// tick or two, so this is comfortably above any legitimate latency.
 const POLL_PENDING_STUCK_US: u64 = 500_000;
 
+// ---------------------------------------------------------------------------
+// PCI device identity — single source of truth for matched / is_pch / SPT+
+// ---------------------------------------------------------------------------
+// Scope 1A: QEMU 82574L/LA (+ 82583V) and PCH-integrated I217/I218/I219
+// (Linux board_pch_lpt … board_pch_ptp). Explicitly excludes igb (I210/I211)
+// and ICH9 0x10F5.
+
+const E1000E_MTA_REG_COUNT: usize = 128;
+
+/// Discrete copper parts this driver owns (Linux board_82574 / board_82583).
+#[inline]
+fn e1000e_is_discrete(device_id: u16) -> bool {
+    matches!(device_id, 0x10d3 | 0x10f6 | 0x150c) // 82574L, 82574LA, 82583V
+}
+
+/// PCH-integrated copper: I217 / I218 / I219 (+ 82579 already used on some boards).
+#[inline]
+fn e1000e_is_pch(device_id: u16) -> bool {
+    matches!(
+        device_id,
+        0x1502 | 0x1503 | // 82579 (pch2lan)
+            0x153a | 0x153b | // I217
+            0x155a | 0x1559 | // I218-LM/V
+            0x15a0..=0x15a3 | // I218-x
+            0x156f | 0x1570 | // I219 SPT
+            0x15b7..=0x15be | // I219 SPT-H / CNP
+            0x15d6..=0x15d8 | 0x15e3 | // I219 SPT later
+            0x15df..=0x15e2 | // I219 ICP
+            0x0d4c..=0x0d4f | 0x0d53 | 0x0d55 | // I219 CMP
+            0x15f4..=0x15fc | // I219 TGP
+            0x1a1c..=0x1a1f | // I219 ADP
+            0x0dc5..=0x0dc8 | // I219 RPL
+            0x550a..=0x5511 | // I219 MTP/LNP/ADP
+            0x57a0 | 0x57a1 | // I219 ARL
+            0x57b3..=0x57ba // I219 PTP/NVL
+    )
+}
+
+/// Sunrise Point and later — need RXDCTL.QUEUE_ENABLE and flash@BAR0+0xE000.
+#[inline]
+fn e1000e_is_pch_spt_or_later(device_id: u16) -> bool {
+    matches!(
+        device_id,
+        0x156f | 0x1570 |
+            0x15b7..=0x15be |
+            0x15d6..=0x15d8 | 0x15e3 |
+            0x15df..=0x15e2 |
+            0x0d4c..=0x0d4f | 0x0d53 | 0x0d55 |
+            0x15f4..=0x15fc |
+            0x1a1c..=0x1a1f |
+            0x0dc5..=0x0dc8 |
+            0x550a..=0x5511 |
+            0x57a0 | 0x57a1 |
+            0x57b3..=0x57ba
+    )
+}
+
+#[inline]
+fn e1000e_device_matched(device_id: u16) -> bool {
+    e1000e_is_discrete(device_id) || e1000e_is_pch(device_id)
+}
+
+/// Linux `e1000_hash_mc_addr` with `mc_filter_type == 0` and 128 MTA regs.
+#[inline]
+fn e1000e_hash_mc_addr(mc_addr: &[u8; 6]) -> u32 {
+    let hash_mask = (E1000E_MTA_REG_COUNT as u32 * 32) - 1;
+    let mut bit_shift = 0u8;
+    while hash_mask >> bit_shift != 0xFF {
+        bit_shift += 1;
+    }
+    hash_mask
+        & (((mc_addr[4] as u32) >> (8 - bit_shift)) | ((mc_addr[5] as u32) << bit_shift))
+}
+
 /// Pick the next ITR setting from traffic samples (pure; unit-tested).
 ///
 /// `rx_burst` is packets observed in the current poll; `rx_delta` is packets
@@ -97,7 +171,18 @@ use super::timer_now_as_micros;
 // ---------------------------------------------------------------------------
 const E1000E_CTRL: usize = 0x0000 / 4;
 const E1000E_STATUS: usize = 0x0008 / 4;
-const E1000E_EECD: usize = 0x0010 / 4;
+const E1000E_STRAP: usize = 0x0000C / 4;
+/// SPT+ flash register window relative to BAR0 (Linux E1000_FLASH_BASE_ADDR).
+const E1000E_FLASH_BASE_OFF: usize = 0xE000;
+const ICH_FLASH_HSFSTS: usize = 0x04;
+const ICH_FLASH_FADDR: usize = 0x08;
+const ICH_FLASH_FDATA0: usize = 0x10;
+const ICH_FLASH_LINEAR_ADDR_MASK: u32 = 0x00FF_FFFF;
+const HSFSTS_FLCDONE: u16 = 1 << 0;
+const HSFSTS_FLCERR: u16 = 1 << 1;
+const HSFSTS_DAEL: u16 = 1 << 2;
+const HSFSTS_FLCINPROG: u16 = 1 << 5;
+const HSFSTS_FLDESVALID: u16 = 1 << 14;
 const E1000E_EERD: usize = 0x0014 / 4;
 const E1000E_CTRL_EXT: usize = 0x0018 / 4;
 const E1000E_MDIC: usize = 0x0020 / 4;
@@ -738,6 +823,15 @@ pub struct E1000eHw {
     /// computed over the interval that actually elapsed rather than the
     /// nominal log period.
     throughput_last_us: u64,
+
+    /// False after [`Self::hw_down`]; TX/RX refuse until reinit/`reset_and_init`.
+    hw_running: bool,
+    /// Software view of RCTL.UPE (unicast promiscuous).
+    rx_promisc: bool,
+    /// Software view of RCTL.MPE (multicast promiscuous / allmulti).
+    rx_allmulti: bool,
+    /// Multicast addresses programmed into the MTA when not allmulti.
+    mc_list: Vec<[u8; 6]>,
 }
 
 impl E1000eHw {
@@ -812,45 +906,11 @@ impl E1000eHw {
     // -----------------------------------------------------------------------
 
     fn is_pch(&self) -> bool {
-        // I217 (PCH-LPT), I218, I219 (PCH-SPT+) — all PCH-integrated NICs
-        matches!(self.device_id,
-            0x1502 | 0x1503 |                       // I82579
-            0x153a | 0x153b |                       // I217
-            0x155a | 0x1559 |                       // I218-LM/V (PCH-LPT)
-            0x15a0..=0x15a3 |                       // I218-x (PCH-LPT)
-            0x156f | 0x1570 |                       // I219-LM/V (PCH-SPT step A)
-            0x15b7..=0x15be |                       // I219-x (PCH-SPT / KBP)
-            0x15d6..=0x15d8 |                       // I219-x (PCH-CNP)
-            0x15e3 |
-            0x0d4c..=0x0d4f |
-            0x15f4..=0x15fc |
-            0x1a1c..=0x1a1f |
-            0x0dc5..=0x0dc8 |
-            0x550a..=0x5511 |
-            0x57a0 | 0x57a1 |
-            0x57b3..=0x57ba |
-            0x15df..=0x15e2 |
-            0x0d53 | 0x0d55
-        )
+        e1000e_is_pch(self.device_id)
     }
 
     fn is_pch_spt_or_later(&self) -> bool {
-        // PCH-SPT (Sunrise Point, Kaby Lake, Coffee Lake, …) — device 0x156f+
-        matches!(self.device_id,
-            0x156f | 0x1570 |
-            0x15b7..=0x15be |
-            0x15d6..=0x15d8 |
-            0x15e3 |
-            0x0d4c..=0x0d4f |
-            0x15f4..=0x15fc |
-            0x1a1c..=0x1a1f |
-            0x0dc5..=0x0dc8 |
-            0x550a..=0x5511 |
-            0x57a0 | 0x57a1 |
-            0x57b3..=0x57ba |
-            0x15df..=0x15e2 |
-            0x0d53 | 0x0d55
-        )
+        e1000e_is_pch_spt_or_later(self.device_id)
     }
 
     // -----------------------------------------------------------------------
@@ -1293,7 +1353,11 @@ impl E1000eHw {
             // therefore does not read the MAC at all — it writes an arbitrary
             // value into a power-management workaround register and then reads
             // that register's top half back as if it were EEPROM data.
-            if !self.is_pch() {
+            if self.is_pch() {
+                if self.read_mac_from_ich_flash() {
+                    return;
+                }
+            } else {
                 self.read_mac_from_eeprom();
             }
             return;
@@ -1337,6 +1401,221 @@ impl E1000eHw {
         let all_zeros = self.mac.iter().all(|&b| b == 0);
         let all_ff = self.mac.iter().all(|&b| b == 0xFF);
         !all_zeros && !all_ff
+    }
+
+    // -----------------------------------------------------------------------
+    // ICH/SPT flash NVM — minimal MAC read (Linux e1000_read_nvm_spt subset)
+    // -----------------------------------------------------------------------
+
+    #[inline]
+    unsafe fn flash_read32(&self, off: usize) -> u32 {
+        read_volatile((self.base + E1000E_FLASH_BASE_OFF + off) as *const u32)
+    }
+
+    #[inline]
+    unsafe fn flash_write32(&self, off: usize, val: u32) {
+        write_volatile((self.base + E1000E_FLASH_BASE_OFF + off) as *mut u32, val);
+    }
+
+    /// SPT-style flash cycle init (HSFSTS via dword at offset 0x4).
+    unsafe fn flash_cycle_init_spt(&self) -> bool {
+        let mut hs = self.flash_read32(ICH_FLASH_HSFSTS) as u16;
+        if hs & HSFSTS_FLDESVALID == 0 {
+            return false;
+        }
+        // W1C flcerr | dael
+        hs |= HSFSTS_FLCERR | HSFSTS_DAEL;
+        self.flash_write32(ICH_FLASH_HSFSTS, hs as u32);
+        for _ in 0..10_000u32 {
+            hs = self.flash_read32(ICH_FLASH_HSFSTS) as u16;
+            if hs & HSFSTS_FLCINPROG == 0 {
+                hs |= HSFSTS_FLCDONE;
+                self.flash_write32(ICH_FLASH_HSFSTS, hs as u32);
+                return true;
+            }
+            Self::udelay(1);
+        }
+        false
+    }
+
+    /// Read one dword from SPT+ flash window (Linux `e1000_read_flash_data32`).
+    unsafe fn flash_read_dword_spt(&self, byte_off: u32) -> Option<u32> {
+        for _ in 0..10u32 {
+            if !self.flash_cycle_init_spt() {
+                return None;
+            }
+            // HSFCTL lives in the upper 16 bits of the dword at HSFSTS (SPT).
+            let mut ctl = (self.flash_read32(ICH_FLASH_HSFSTS) >> 16) as u16;
+            ctl &= !((3 << 1) | (3 << 8) | 1); // clear flcycle, fldbcount, flcgo
+            ctl |= 3 << 8; // fldbcount = 3 → 4-byte read; flcycle = READ (0)
+            self.flash_write32(ICH_FLASH_HSFSTS, (ctl as u32) << 16);
+            self.flash_write32(ICH_FLASH_FADDR, byte_off & ICH_FLASH_LINEAR_ADDR_MASK);
+            ctl |= 1; // flcgo
+            self.flash_write32(ICH_FLASH_HSFSTS, (ctl as u32) << 16);
+            for _ in 0..2000u32 {
+                let hs = self.flash_read32(ICH_FLASH_HSFSTS) as u16;
+                if hs & HSFSTS_FLCDONE != 0 {
+                    if hs & HSFSTS_FLCERR != 0 {
+                        break;
+                    }
+                    return Some(self.flash_read32(ICH_FLASH_FDATA0));
+                }
+                Self::udelay(1);
+            }
+        }
+        None
+    }
+
+    /// Bank detect via signature word 0x13 (Linux `e1000_valid_nvm_bank_detect_ich8lan` SPT).
+    unsafe fn ich_flash_active_bank_words(&self) -> u32 {
+        let strap = mmio_read(self.base, E1000E_STRAP);
+        let nvm_size = ((((strap >> 1) & 0x1F) + 1) * 4096) as u32;
+        let bank_words = (nvm_size / 2) / 2; // words per bank
+        // Signature at word offset 0x13 of each bank; valid if (sig & 0xC0) == 0x80.
+        if let Some(d) = self.flash_read_dword_spt(0x13 << 1) {
+            let sig = ((d >> 8) & 0xFF) as u16;
+            if sig & 0xC0 == 0x80 {
+                return 0;
+            }
+        }
+        if bank_words > 0 {
+            if let Some(d) = self.flash_read_dword_spt((bank_words + 0x13) << 1) {
+                let sig = ((d >> 8) & 0xFF) as u16;
+                if sig & 0xC0 == 0x80 {
+                    return bank_words;
+                }
+            }
+        }
+        0
+    }
+
+    /// Read MAC words 0..2 from ICH/SPT flash. Returns true if a plausible MAC was loaded.
+    unsafe fn read_mac_from_ich_flash(&mut self) -> bool {
+        if !self.is_pch_spt_or_later() {
+            // Pre-SPT needs BAR1; we only map BAR0. Leave MAC unset → placeholder.
+            return false;
+        }
+        let bank = self.ich_flash_active_bank_words();
+        let Some(d0) = self.flash_read_dword_spt(bank << 1) else {
+            return false;
+        };
+        let Some(d1) = self.flash_read_dword_spt((bank + 2) << 1) else {
+            return false;
+        };
+        let words = [
+            (d0 & 0xFFFF) as u16,
+            (d0 >> 16) as u16,
+            (d1 & 0xFFFF) as u16,
+        ];
+        for (i, w) in words.iter().enumerate() {
+            self.mac[i * 2] = (w & 0xFF) as u8;
+            self.mac[i * 2 + 1] = (w >> 8) as u8;
+        }
+        if self.is_valid_mac() {
+            crate::klog_warn!(
+                "[e1000e] MAC from ICH flash bank_words={}: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+                bank,
+                self.mac[0],
+                self.mac[1],
+                self.mac[2],
+                self.mac[3],
+                self.mac[4],
+                self.mac[5]
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // RX mode (promisc / allmulti / MTA) — Linux e1000e_set_rx_mode subset
+    // -----------------------------------------------------------------------
+
+    /// Program the multicast hash table from `mc_list` (or clear it).
+    unsafe fn write_mta(&self, addrs: &[[u8; 6]]) {
+        let mut shadow = [0u32; E1000E_MTA_REG_COUNT];
+        for addr in addrs {
+            let hash = e1000e_hash_mc_addr(addr);
+            let reg = ((hash >> 5) as usize) & (E1000E_MTA_REG_COUNT - 1);
+            let bit = hash & 0x1F;
+            shadow[reg] |= 1u32 << bit;
+        }
+        for i in (0..E1000E_MTA_REG_COUNT).rev() {
+            mmio_write(self.base, E1000E_MTA_BASE + i, shadow[i]);
+        }
+        let _ = mmio_read(self.base, E1000E_STATUS);
+    }
+
+    /// Apply RCTL UPE/MPE + MTA from the software rx-mode flags.
+    ///
+    /// Keeps EN/BAM/SECRC (and any other bits) from the current RCTL value.
+    unsafe fn apply_rx_mode_rctl(&mut self) {
+        let mut rctl = mmio_read(self.base, E1000E_RCTL);
+        rctl &= !(RCTL_UPE | RCTL_MPE);
+        if self.rx_promisc {
+            rctl |= RCTL_UPE | RCTL_MPE;
+            self.write_mta(&[]);
+        } else {
+            if self.rx_allmulti {
+                rctl |= RCTL_MPE;
+                self.write_mta(&[]);
+            } else {
+                let list = self.mc_list.clone();
+                self.write_mta(&list);
+            }
+        }
+        // Preserve EN if already running; init_rx ORs EN before calling us.
+        mmio_write(self.base, E1000E_RCTL, rctl);
+        let _ = mmio_read(self.base, E1000E_RCTL);
+    }
+
+    pub unsafe fn set_rx_mode(
+        &mut self,
+        promisc: bool,
+        allmulti: bool,
+        mc_addrs: &[[u8; 6]],
+    ) {
+        self.rx_promisc = promisc;
+        self.rx_allmulti = allmulti;
+        self.mc_list.clear();
+        self.mc_list.extend_from_slice(mc_addrs);
+        if self.hw_running {
+            self.apply_rx_mode_rctl();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Down / reinit — Linux e1000e_down subset (no PHY soft-reset)
+    // -----------------------------------------------------------------------
+
+    /// Quiesce RX/TX and mask IRQs. Soft state is retained for a later reinit.
+    pub unsafe fn hw_down(&mut self) {
+        self.hw_running = false;
+        mmio_write(self.base, E1000E_IMC, 0xFFFF_FFFF);
+        let _ = mmio_read(self.base, E1000E_ICR);
+
+        let rctl = mmio_read(self.base, E1000E_RCTL) & !RCTL_EN;
+        mmio_write(self.base, E1000E_RCTL, rctl);
+        let tctl = mmio_read(self.base, E1000E_TCTL) & !TCTL_EN;
+        mmio_write(self.base, E1000E_TCTL, tctl);
+        let _ = mmio_read(self.base, E1000E_STATUS);
+        Self::udelay(10_000);
+
+        self.rx_ready.clear();
+        self.rx_pending = None;
+        self.rx_discard_until_eop = false;
+        self.rx_doorbell_dirty = false;
+        self.tx_doorbell_dirty = false;
+        self.tx_desc_dirty_start = None;
+        self.tx_desc_dirty_count = 0;
+        self.link_up = false;
+    }
+
+    /// Down then full `reset_and_init` (rings already allocated).
+    pub unsafe fn reinit_locked(&mut self) -> DeviceResult<()> {
+        self.hw_down();
+        self.reset_and_init()
     }
 
     // -----------------------------------------------------------------------
@@ -1512,6 +1791,7 @@ impl E1000eHw {
             E1000E_DRIVER_TAG
         );
 
+        self.hw_running = true;
         Ok(())
     }
 
@@ -1708,15 +1988,20 @@ impl E1000eHw {
         // Small settle before enabling RCTL
         Self::udelay(1_000);
 
-        // RCTL: LK-style — EN, promisc, mcast promisc, broadcast, 2048-byte
-        // buffers, strip Ethernet FCS. SECRC (bit 26) is a standard RCTL bit
-        // across the whole 8254x/e1000e family, not a PCH-only feature — gating
-        // it on is_pch() left every non-PCH part (82574L, and QEMU's e1000e
-        // model) delivering 4 extra FCS/garbage bytes on every received frame.
-        // `e1000.rs` sets it unconditionally for the same reason.
-        let rctl = RCTL_EN | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_SECRC;
+        // RCTL: EN + BAM + SECRC; UPE/MPE come from set_rx_mode defaults
+        // (promisc+allmulti at bring-up for DHCP/bridge compatibility).
+        let mut rctl = RCTL_EN | RCTL_BAM | RCTL_SECRC;
+        if self.rx_promisc {
+            rctl |= RCTL_UPE | RCTL_MPE;
+        } else if self.rx_allmulti {
+            rctl |= RCTL_MPE;
+        }
         mmio_write(self.base, E1000E_RCTL, rctl);
         let _ = mmio_read(self.base, E1000E_RCTL);
+        if !self.rx_promisc && !self.rx_allmulti {
+            let list = self.mc_list.clone();
+            self.write_mta(&list);
+        }
 
         compiler_fence(Ordering::SeqCst);
         fence(Ordering::SeqCst);
@@ -1991,6 +2276,9 @@ impl E1000eHw {
     }
 
     fn receive(&mut self) -> Option<Vec<u8>> {
+        if !self.hw_running {
+            return None;
+        }
         if let Some(pkt) = self.rx_ready.pop_front() {
             return Some(pkt);
         }
@@ -2067,7 +2355,7 @@ impl E1000eHw {
     /// posted descriptor carries CMD.RS (Report Status). `e1000.rs` uses the
     /// same DD-bit check; this mirrors it instead of trusting TDH.
     fn can_send(&self) -> bool {
-        self.tx_can_post(/* sync */ true)
+        self.hw_running && self.tx_can_post(/* sync */ true)
     }
 
     /// Can a frame be posted at `tx_tail`? True when the tail slot itself is
@@ -2227,6 +2515,9 @@ impl E1000eHw {
     }
 
     pub fn send(&mut self, data: &[u8]) -> DeviceResult {
+        if !self.hw_running {
+            return Err(DeviceError::NotReady);
+        }
         self.post_tx_frame(data)?;
         self.flush_tx_doorbell();
         Ok(())
@@ -2748,9 +3039,49 @@ impl NetScheme for E1000eInterface {
     fn refresh_link(&self) -> DeviceResult {
         {
             let mut hw = self.driver.hw.lock();
-            hw.link_up = false;
+            if !hw.hw_running {
+                // Admin-up after down: bring rings/RCTL back without PHY soft-reset.
+                unsafe {
+                    hw.reinit_locked()?;
+                }
+            } else {
+                hw.link_up = false;
+            }
         }
         self.schedule_watchdog(true);
+        Ok(())
+    }
+    fn admin_down(&self) -> DeviceResult {
+        unsafe {
+            self.driver.hw.lock().hw_down();
+        }
+        Ok(())
+    }
+    fn set_promiscuous(&self, on: bool) -> DeviceResult {
+        let mut hw = self.driver.hw.lock();
+        let allmulti = hw.rx_allmulti;
+        let list = hw.mc_list.clone();
+        unsafe {
+            hw.set_rx_mode(on, allmulti, &list);
+        }
+        Ok(())
+    }
+    fn set_allmulti(&self, on: bool) -> DeviceResult {
+        let mut hw = self.driver.hw.lock();
+        let promisc = hw.rx_promisc;
+        let list = hw.mc_list.clone();
+        unsafe {
+            hw.set_rx_mode(promisc, on, &list);
+        }
+        Ok(())
+    }
+    fn set_multicast_list(&self, addrs: &[[u8; 6]]) -> DeviceResult {
+        let mut hw = self.driver.hw.lock();
+        let promisc = hw.rx_promisc;
+        let allmulti = hw.rx_allmulti;
+        unsafe {
+            hw.set_rx_mode(promisc, allmulti, addrs);
+        }
         Ok(())
     }
     fn link_carrier_up(&self) -> bool {
@@ -3186,6 +3517,12 @@ pub fn init(
         itr_last_rx_packets: 0,
         itr_tune_next_us: 0,
         throughput_last_us: 0,
+        hw_running: false,
+        // Start promiscuous like the historical LK path (DHCP/bridges); userspace
+        // can clear via NetScheme::set_promiscuous / set_allmulti.
+        rx_promisc: true,
+        rx_allmulti: true,
+        mc_list: Vec::new(),
     };
 
     unsafe {
@@ -3288,26 +3625,7 @@ impl PciDriver for E1000eDriverPci {
     }
 
     fn matched(&self, vendor_id: u16, device_id: u16) -> bool {
-        if vendor_id != 0x8086 {
-            return false;
-        }
-        matches!(
-            device_id,
-            // NOTE: 0x1533 (I210), 0x1539 (I211) and 0x157b/0x157c (I210
-            // flashless) are deliberately NOT matched here — they are igb-family
-            // silicon (Linux drives them with `igb`, not `e1000e`) and this
-            // driver's is_pch()/is_pch_spt_or_later() gates exclude them, so
-            // RXDCTL.QUEUE_ENABLE is never programmed for them: matching those
-            // IDs bound the interface but left it permanently unable to RX/TX
-            // with no error reported.
-            0x10d3 | 0x10f5 | 0x150c |
-            0x1502..=0x1503 | 0x153a..=0x153b | 0x155a | 0x1559 |
-            0x15a0..=0x15a3 | 0x156f..=0x1570 | 0x15b7..=0x15be |
-            0x15d6..=0x15d8 | 0x15e3 |
-            0x0d4c..=0x0d4f | 0x15f4..=0x15fc | 0x1a1c..=0x1a1f |
-            0x0dc5..=0x0dc8 | 0x550a..=0x5511 | 0x57a0..=0x57a1 |
-            0x57b3..=0x57ba | 0x15df..=0x15e2 | 0x0d53 | 0x0d55
-        )
+        vendor_id == 0x8086 && e1000e_device_matched(device_id)
     }
 
     fn init(
@@ -3470,6 +3788,10 @@ mod rx_ring_tests {
             itr_last_rx_packets: 0,
             itr_tune_next_us: 0,
             throughput_last_us: 0,
+            hw_running: true,
+            rx_promisc: true,
+            rx_allmulti: true,
+            mc_list: Vec::new(),
         };
         // Initialize the descriptor ring (mirror of init_rx).
         let ring = hw.rx_ring.as_ptr::<RxDesc>();
@@ -4472,5 +4794,77 @@ mod itr_tune_tests {
             choose_itr(E1000E_ITR_LOW_LATENCY, E1000E_ITR_WINDOW_LOW + 1, 0),
             E1000E_ITR_BALANCED
         );
+    }
+}
+
+#[cfg(test)]
+mod rx_mode_and_id_tests {
+    use super::rx_ring_tests::make_hw;
+    use super::*;
+
+    fn reg_read(base: usize, reg: usize) -> u32 {
+        unsafe { core::ptr::read_volatile((base + reg * 4) as *const u32) }
+    }
+
+    #[test]
+    fn pci_ids_match_82574_la_and_i219_reject_ich9_and_igb() {
+        assert!(e1000e_device_matched(0x10d3)); // 82574L
+        assert!(e1000e_device_matched(0x10f6)); // 82574LA
+        assert!(e1000e_device_matched(0x15b8)); // I219-V
+        assert!(e1000e_is_pch(0x15b8));
+        assert!(e1000e_is_pch_spt_or_later(0x15b8));
+        assert!(!e1000e_is_pch(0x10d3));
+        assert!(!e1000e_device_matched(0x10f5)); // ICH9 — out of scope
+        assert!(!e1000e_device_matched(0x1533)); // I210 igb
+        assert!(!e1000e_device_matched(0x1539)); // I211 igb
+    }
+
+    #[test]
+    fn mta_hash_matches_linux_case0_example() {
+        // Linux mac.c comment: 01:AA:00:12:34:56 → hash 0x563 with 128 MTA regs.
+        let addr = [0x01, 0xAA, 0x00, 0x12, 0x34, 0x56];
+        assert_eq!(e1000e_hash_mc_addr(&addr), 0x563);
+    }
+
+    #[test]
+    fn set_rx_mode_clears_promisc_and_programs_mta() {
+        let mut hw = make_hw();
+        // Seed RCTL like init_rx would after EN.
+        unsafe {
+            mmio_write(
+                hw.base,
+                E1000E_RCTL,
+                RCTL_EN | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_SECRC,
+            );
+            hw.set_rx_mode(false, false, &[[0x01, 0xAA, 0x00, 0x12, 0x34, 0x56]]);
+        }
+        let rctl = reg_read(hw.base, E1000E_RCTL);
+        assert_eq!(rctl & RCTL_UPE, 0, "UPE cleared when not promisc");
+        assert_eq!(rctl & RCTL_MPE, 0, "MPE cleared when not allmulti");
+        assert_ne!(rctl & RCTL_EN, 0);
+        let hash = e1000e_hash_mc_addr(&[0x01, 0xAA, 0x00, 0x12, 0x34, 0x56]);
+        let reg = ((hash >> 5) as usize) & (E1000E_MTA_REG_COUNT - 1);
+        let bit = hash & 0x1F;
+        let mta = reg_read(hw.base, E1000E_MTA_BASE + reg);
+        assert_ne!(mta & (1u32 << bit), 0, "MTA bit set for hashed address");
+    }
+
+    #[test]
+    fn hw_down_blocks_tx_until_flags_restored() {
+        let mut hw = make_hw();
+        assert!(hw.can_send());
+        unsafe {
+            // Seed RCTL/TCTL bits so hw_down has something to clear.
+            mmio_write(hw.base, E1000E_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC);
+            mmio_write(hw.base, E1000E_TCTL, TCTL_EN | TCTL_PSP);
+            hw.hw_down();
+        }
+        assert!(!hw.can_send());
+        assert_eq!(reg_read(hw.base, E1000E_RCTL) & RCTL_EN, 0);
+        assert_eq!(reg_read(hw.base, E1000E_TCTL) & TCTL_EN, 0);
+        // Rings still allocated — flip running for unit-test recovery without
+        // a full CTRL_RST against mock MMIO.
+        hw.hw_running = true;
+        assert!(hw.can_send());
     }
 }

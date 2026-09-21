@@ -1707,14 +1707,15 @@ pub fn handle_net_ioctl(
                     "down"
                 }
             );
-            // Do not reset the PHY (that used to drop RX on every `ifconfig up`).
-            // Poll once on admin-up so a deferred IRQ/link-arm is not left sitting
-            // until the next timer tick — udhcpc's deconfig/bound scripts both
-            // `ip link set up` immediately before DISCOVER.
+            let iface = iface_by_name(ifname)?;
+            let _ = iface.set_promiscuous(new_flags & IFF_PROMISC != 0);
+            let _ = iface.set_allmulti(new_flags & IFF_ALLMULTI != 0);
+            // Do not soft-reset the PHY (that used to drop RX on every `ifconfig up`).
             if new_flags & IFF_UP != 0 {
-                if let Ok(iface) = iface_by_name(ifname) {
-                    let _ = iface.poll();
-                }
+                let _ = iface.refresh_link();
+                let _ = iface.poll();
+            } else {
+                let _ = iface.admin_down();
             }
             Ok(0)
         }

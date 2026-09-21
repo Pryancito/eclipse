@@ -880,7 +880,7 @@ impl Default for SignalActions {
 
 /// resource limit
 #[repr(C)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct RLimit {
     /// soft limit
     pub cur: u64,
@@ -2083,10 +2083,7 @@ pub fn interrupt_or_force_pgrp(pgid: i32, armed_pgid: &AtomicI32) -> LinuxSignal
     if prev == pgid {
         armed_pgid.store(0, Ordering::Relaxed);
         let _ = send_signal_to_pgrp(pgid as usize, LinuxSignal::SIGKILL);
-        zcore_drivers::klog_warn!(
-            "[tty] second Ctrl-C on pgrp {} -> SIGKILL (forced)",
-            pgid
-        );
+        zcore_drivers::klog_warn!("[tty] second Ctrl-C on pgrp {} -> SIGKILL (forced)", pgid);
         LinuxSignal::SIGKILL
     } else {
         armed_pgid.store(pgid, Ordering::Relaxed);

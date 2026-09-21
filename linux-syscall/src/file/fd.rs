@@ -22,11 +22,18 @@ pub struct ITimerSpec {
 }
 
 impl ITimerSpec {
+    /// Saturating: the fields come straight from userspace, where
+    /// `sec * 1_000_000_000` overflows a `u64` well inside the range a
+    /// `time_t` can hold. Callers validate first; this is the backstop.
     fn value_ns(&self) -> u64 {
-        self.it_value.sec as u64 * 1_000_000_000 + self.it_value.nsec as u64
+        (self.it_value.sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(self.it_value.nsec as u64)
     }
     fn interval_ns(&self) -> u64 {
-        self.it_interval.sec as u64 * 1_000_000_000 + self.it_interval.nsec as u64
+        (self.it_interval.sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(self.it_interval.nsec as u64)
     }
     fn from_ns(interval_ns: u64, value_ns: u64) -> Self {
         let ts = |ns: u64| TimeSpec {
@@ -109,6 +116,10 @@ impl Syscall<'_> {
             old_value.write(ITimerSpec::from_ns(iv, rem))?;
         }
         let v = new_value.read()?;
+        // Same rule as `timer_settime`: an out-of-range `timespec` is EINVAL.
+        if !v.it_interval.valid() || !v.it_value.valid() {
+            return Err(LxError::EINVAL);
+        }
         info!(
             "timerfd_settime: fd={:?}, flags={:#x}, value_ns={}, interval_ns={}",
             fd,
