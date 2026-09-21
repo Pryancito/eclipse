@@ -263,6 +263,19 @@ mod hardware_fence_tests {
         }
     }
 
+    lazy_static::lazy_static! {
+        /// Both tests below drive the same process-wide waiter table, and cargo
+        /// runs them on two threads at once. Without this, one test's `reset()`
+        /// lands between the other's `register` and the signal it is about to
+        /// check for, wiping the waiter: the eventfd is never delivered and the
+        /// assertion reads `0` where it wanted `1`. It failed 9 runs in 60 that
+        /// way, and never once under `--test-threads=1`.
+        ///
+        /// Held for the whole body, not just around `reset`, because every step
+        /// in between touches the same globals.
+        static ref TEST_SERIAL: Mutex<()> = Mutex::new(());
+    }
+
     fn reset() {
         WAITERS.lock().clear();
         WAITER_COUNT.store(0, Ordering::SeqCst);
@@ -273,6 +286,7 @@ mod hardware_fence_tests {
     /// the baseline for the one below.
     #[test]
     fn an_explicit_signal_delivers_the_eventfd() {
+        let _serial = TEST_SERIAL.lock();
         reset();
         syncobj::set_signal_hook(on_syncobj_signaled);
         let handle = syncobj::create(false);
@@ -299,6 +313,7 @@ mod hardware_fence_tests {
     /// that is up and frozen, with no error anywhere.
     #[test]
     fn a_fence_submitted_after_the_waiter_still_gets_polled() {
+        let _serial = TEST_SERIAL.lock();
         reset();
         syncobj::set_signal_hook(on_syncobj_signaled);
         let handle = syncobj::create(false);
