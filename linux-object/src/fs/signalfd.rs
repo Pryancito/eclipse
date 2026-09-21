@@ -136,3 +136,85 @@ impl FileLike for SignalFd {
         Ok(status)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Host tests for `signalfd(2)`.
+    //!
+    //! Everything that *delivers* a signal here goes through the calling
+    //! thread's pending set, and a host unit test has no such thread — so what
+    //! is covered is the part a regression would break first and that needs no
+    //! thread: the accepted-signal mask, the `dup` that shares it, and the
+    //! read/write contract. With no thread context `pending_matched` is empty,
+    //! which is also the state a real signalfd sits in almost all the time.
+
+    use super::*;
+    use async_std::task::block_on;
+
+    /// SIGINT, SIGTERM, SIGCHLD — the three `wl_event_loop_add_signal` takes.
+    fn mask_of(signals: &[LinuxSignal]) -> u64 {
+        signals.iter().fold(0u64, |m, s| m | (1u64 << (*s as u64)))
+    }
+
+    fn sfd(mask: u64, flags: OpenFlags) -> Arc<SignalFd> {
+        SignalFd::new(mask, flags)
+    }
+
+    #[test]
+    fn the_accepted_mask_is_what_it_was_created_with_and_can_be_replaced() {
+        let wanted = mask_of(&[LinuxSignal::SIGINT, LinuxSignal::SIGTERM]);
+        let fd = sfd(wanted, OpenFlags::NON_BLOCK);
+        assert_eq!(fd.mask.load(SeqCst), wanted);
+        // `signalfd4` on an existing fd replaces the set rather than making a
+        // new fd, so an event loop that narrows what it accepts keeps the same
+        // descriptor registered with epoll.
+        let narrowed = mask_of(&[LinuxSignal::SIGCHLD]);
+        fd.set_mask(narrowed);
+        assert_eq!(fd.mask.load(SeqCst), narrowed);
+    }
+
+    #[test]
+    fn a_dup_shares_the_mask_so_updating_one_updates_both() {
+        let fd = sfd(mask_of(&[LinuxSignal::SIGINT]), OpenFlags::NON_BLOCK);
+        let dup = fd.dup();
+        let dup = dup.downcast_arc::<SignalFd>().ok().unwrap();
+        let wider = mask_of(&[LinuxSignal::SIGINT, LinuxSignal::SIGTERM]);
+        fd.set_mask(wider);
+        assert_eq!(dup.mask.load(SeqCst), wider);
+        assert_eq!(dup.flags(), fd.flags());
+    }
+
+    #[test]
+    fn a_read_must_have_room_for_a_whole_siginfo() {
+        // `struct signalfd_siginfo` is 128 bytes and glibc reads exactly that
+        // much; a short read has to be refused rather than half-filled.
+        assert_eq!(SIGINFO_SIZE, 128);
+        let fd = sfd(mask_of(&[LinuxSignal::SIGINT]), OpenFlags::NON_BLOCK);
+        let mut short = [0u8; 127];
+        assert_eq!(block_on(fd.read(&mut short)), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn a_signalfd_is_read_only_and_quiet_when_nothing_is_pending() {
+        let fd = sfd(mask_of(&[LinuxSignal::SIGINT]), OpenFlags::NON_BLOCK);
+        assert_eq!(fd.write(&[0u8; SIGINFO_SIZE]), Err(LxError::EINVAL));
+        let s = fd.poll(PollEvents::IN | PollEvents::OUT).unwrap();
+        // No error and no hangup: an event loop seeing either would drop the
+        // fd and stop handling Ctrl-C for the rest of the session.
+        assert!(!s.read && !s.write && !s.error && !s.hangup);
+        let mut buf = [0u8; SIGINFO_SIZE];
+        assert_eq!(block_on(fd.read(&mut buf)), Err(LxError::EAGAIN));
+        // `async_poll` answers from the same state instead of parking, which
+        // is what lets epoll fall back to its own re-poll tick.
+        let s = block_on(fd.async_poll(PollEvents::IN)).unwrap();
+        assert!(!s.read);
+    }
+
+    #[test]
+    fn an_empty_mask_accepts_nothing() {
+        let fd = sfd(0, OpenFlags::NON_BLOCK);
+        assert!(fd.pending_matched().is_empty());
+        assert!(!fd.poll(PollEvents::IN).unwrap().read);
+        assert!(fd.consume_one().is_none());
+    }
+}
