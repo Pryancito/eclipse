@@ -2724,12 +2724,14 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               default-fragments = 4\n\
               default-fragment-size-msec = 25\n\
               # speex-float-1 is the lowest speex quality (chosen for battery on\n\
-              # the phones PA ships on); with the sink now resampling every\n\
-              # non-48k stream it is worth a few % more CPU for a much flatter\n\
-              # passband and deeper stopband. -3 is a safe middle on this\n\
-              # software-rendered, no-RT setup; raise toward -5 or soxr-mq if the\n\
-              # CPU headroom is there, lower to -1 if PA starts arriving late.\n\
-              resample-method = speex-float-3\n\
+              # the phones PA ships on); with the sink resampling every non-48k\n\
+              # stream (most music is 44.1 kHz), the resampler quality is what\n\
+              # is left to hear. -5 is speex's high-quality tier: a flat\n\
+              # passband to ~20 kHz and a stopband deep enough to be inaudible,\n\
+              # at a few % of one core for stereo -- nothing on this desktop.\n\
+              # Raise toward -7/-10 or soxr-hq (if the PA build has libsoxr) for\n\
+              # more, lower to -1 only if PA ever starts arriving late.\n\
+              resample-method = speex-float-5\n\
               log-target = stderr\n\
               log-level = info\n",
         );

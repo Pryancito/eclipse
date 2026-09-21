@@ -198,11 +198,14 @@ The sink stays IDLE with the PCM open instead.
   rather than following each stream's rate. Following it reprograms the HDA
   stream on a rate change, which on an HDMI/DP sink is a re-lock mute, so a
   44.1 kHz track after a 48 kHz one dropped its first fraction of a second.
-  The resampler is `speex-float-3` (up from the shipped `speex-float-1`, the
-  lowest quality): now that every non-48k stream is resampled it earns a few
-  % more CPU; dial toward `-5`/`soxr-mq` with headroom, back to `-1` if the
-  daemon starts arriving late. The kernel's own `pipeline::src` will later
-  take this over so PulseAudio is out of the resampling entirely.
+  The resampler is `speex-float-5` (up from the shipped `speex-float-1` and an
+  interim `-3`): since every non-48k stream is resampled (most music is
+  44.1 kHz), the resampler quality is the audible lever, and `-5` is speex's
+  high-quality tier -- flat passband to ~20 kHz, inaudible stopband -- for a
+  few % of one core. Dial toward `-7`/`-10` or `soxr-hq` (with libsoxr) for
+  more, back to `-1` only if the daemon starts arriving late. The kernel's own
+  `pipeline::src` will later take this over so PulseAudio is out of the
+  resampling entirely.
 - A bare `mpg123 file.mp3` reaches the daemon because `/dev/dsp` refuses it.
   mpg123 1.3x has no config file at all, so with no `-o` libout123 walks its
   built-in driver list and takes the first module that both loads AND opens --
