@@ -26,8 +26,13 @@ impl ProcInitInfo {
         // push below). A fixed 0x4000 overran and asserted -> kernel panic on a
         // big argv/envp; total argv+envp is separately capped to E2BIG in
         // sys_execve, so this bound stays modest.
+        // `argv[0]` is what `AT_EXECFN` points at. `sys_execve` refuses an
+        // empty argv before it ever gets here, but this is a `pub fn` and
+        // indexing `args[0]` on an empty vector is a kernel panic, not an
+        // error -- so name the empty case rather than rely on the caller.
+        let execfn: &str = self.args.first().map(|s| s.as_str()).unwrap_or("");
         let table_entries = 1 + self.args.len() + 1 + self.envs.len() + 1 + self.auxv.len() * 2 + 6;
-        let strings: usize = self.args[0].len()
+        let strings: usize = execfn.len()
             + 1
             + self.args.iter().map(|s| s.len() + 1).sum::<usize>()
             + self.envs.iter().map(|s| s.len() + 1).sum::<usize>();
@@ -40,7 +45,7 @@ impl ProcInitInfo {
         let random_ptr = writer.sp;
 
         // 2. Program name for AT_EXECFN
-        writer.push_str(&self.args[0]);
+        writer.push_str(execfn);
         let execfn_ptr = writer.sp;
 
         // 3. Environment strings
@@ -155,10 +160,27 @@ impl Stack {
         self.sp -= self.sp % align;
         assert!(self.stack_top - self.sp <= self.data.len());
         let offset = self.data.len() - (self.stack_top - self.sp);
+        // Copy as bytes, which has no alignment requirement.
+        //
+        // The `align` above is about the address the NEW PROCESS will see --
+        // `sp` -- and says nothing about where that byte lands inside `data`.
+        // This buffer is addressed from its END (`data.len() - (stack_top -
+        // sp)`), so the alignment of the destination is the alignment of
+        // `data.len()` plus whatever the allocator chose for a `Vec<u8>`,
+        // which has alignment 1. Building a `&mut [usize]` over that address
+        // is undefined behaviour whenever it does not happen to be 8-aligned,
+        // and it does not happen to be as soon as the buffer is sized to its
+        // contents rather than rounded to 16 KiB -- which is to say, on a
+        // large argv. On x86 the store merely runs slower; on the aarch64 and
+        // riscv64 targets a misaligned store faults.
+        #[allow(unsafe_code)]
         unsafe {
-            core::slice::from_raw_parts_mut(self.data.as_mut_ptr().add(offset) as *mut T, vs.len())
+            core::ptr::copy_nonoverlapping(
+                vs.as_ptr() as *const u8,
+                self.data.as_mut_ptr().add(offset),
+                size_of_val(vs),
+            );
         }
-        .copy_from_slice(vs);
     }
 
     fn push_usize_slice(&mut self, vs: &[usize]) {
@@ -388,3 +410,296 @@ pub const AT_EGID: u8 = 14;
 pub const AT_SECURE: u8 = 23;
 pub const AT_RANDOM: u8 = 25;
 pub const AT_EXECFN: u8 = 31;
+
+#[cfg(test)]
+mod initial_stack_tests {
+    //! The image `push_at` builds is the very first thing a new process sees:
+    //! `_start` reads `argc` off the stack pointer it was given and walks
+    //! forward from there. Everything here is arithmetic over one buffer, so
+    //! it can be checked exactly -- and it has to be, because the failure mode
+    //! is a program that dies in libc before `main`, with nothing in the log
+    //! pointing back here.
+
+    use super::*;
+    use alloc::string::ToString;
+    use alloc::vec;
+
+    /// Somewhere plausible and 16-byte aligned, like the real stack top.
+    const TOP: usize = 0x7fff_ffff_f000;
+
+    /// A decoded initial stack, addressed the way the new process will.
+    struct Image {
+        bytes: Vec<u8>,
+        sp: usize,
+    }
+
+    impl Image {
+        fn of(args: &[&str], envs: &[&str], auxv: BTreeMap<u8, usize>) -> Image {
+            let info = ProcInitInfo {
+                args: args.iter().map(|s| s.to_string()).collect(),
+                envs: envs.iter().map(|s| s.to_string()).collect(),
+                auxv,
+            };
+            let stack = info.push_at(TOP);
+            let bytes = stack.to_vec();
+            Image {
+                sp: TOP - bytes.len(),
+                bytes,
+            }
+        }
+
+        /// The machine word at address `addr`.
+        fn word(&self, addr: usize) -> usize {
+            let off = addr - self.sp;
+            let mut w = [0u8; 8];
+            w.copy_from_slice(&self.bytes[off..off + 8]);
+            usize::from_ne_bytes(w)
+        }
+
+        /// The NUL-terminated string at address `addr`.
+        fn cstr(&self, addr: usize) -> String {
+            let off = addr - self.sp;
+            let end = self.bytes[off..]
+                .iter()
+                .position(|&b| b == 0)
+                .expect("a string on the stack must be NUL-terminated")
+                + off;
+            String::from_utf8_lossy(&self.bytes[off..end]).into_owned()
+        }
+
+        fn in_bounds(&self, addr: usize, len: usize) -> bool {
+            addr >= self.sp && addr + len <= TOP
+        }
+
+        /// `argc`, then the argv strings, the envp strings, and the auxv pairs
+        /// -- read exactly as `_start` walks them.
+        fn decode(&self) -> (usize, Vec<String>, Vec<String>, Vec<(usize, usize)>) {
+            let argc = self.word(self.sp);
+            let mut at = self.sp + 8;
+            let mut args = Vec::new();
+            for _ in 0..argc {
+                args.push(self.cstr(self.word(at)));
+                at += 8;
+            }
+            assert_eq!(self.word(at), 0, "argv is not NULL-terminated");
+            at += 8;
+            let mut envs = Vec::new();
+            while self.word(at) != 0 {
+                envs.push(self.cstr(self.word(at)));
+                at += 8;
+            }
+            at += 8;
+            let mut auxv = Vec::new();
+            loop {
+                let (k, v) = (self.word(at), self.word(at + 8));
+                at += 16;
+                if k == 0 {
+                    break;
+                }
+                auxv.push((k, v));
+            }
+            (argc, args, envs, auxv)
+        }
+    }
+
+    fn auxv_of(pairs: &[(u8, usize)]) -> BTreeMap<u8, usize> {
+        pairs.iter().copied().collect()
+    }
+
+    #[test]
+    fn a_process_reads_back_its_own_arguments_and_environment() {
+        let img = Image::of(
+            &["/bin/sh", "-c", "echo hola"],
+            &["PATH=/usr/bin", "HOME=/root"],
+            auxv_of(&[(AT_PAGESZ as u8, 4096)]),
+        );
+        let (argc, args, envs, _) = img.decode();
+        assert_eq!(argc, 3);
+        assert_eq!(args, vec!["/bin/sh", "-c", "echo hola"]);
+        assert_eq!(envs, vec!["PATH=/usr/bin", "HOME=/root"]);
+    }
+
+    #[test]
+    fn the_stack_pointer_is_sixteen_byte_aligned_whatever_is_on_it() {
+        // The x86-64 ABI requires `rsp % 16 == 0` at `_start`, and libc's
+        // early code uses SSE: a misaligned stack is a #GP inside the dynamic
+        // loader before a single line of the program runs. The padding that
+        // guarantees it depends on how many pointers and how many string
+        // bytes there are, so walk both parities of each.
+        for nargs in 0..6usize {
+            for nenvs in 0..6usize {
+                for pad in 0..3usize {
+                    let args: Vec<String> = (0..nargs).map(|i| "a".repeat(i + pad + 1)).collect();
+                    let envs: Vec<String> = (0..nenvs)
+                        .map(|i| "E=".to_string() + &"e".repeat(i))
+                        .collect();
+                    let info = ProcInitInfo {
+                        args: args.clone(),
+                        envs,
+                        auxv: auxv_of(&[(AT_PAGESZ as u8, 4096), (AT_BASE as u8, 0x1000)]),
+                    };
+                    let stack = info.push_at(TOP);
+                    let sp = TOP - stack.len();
+                    assert!(
+                        sp.is_multiple_of(16),
+                        "sp {:#x} is not 16-byte aligned for {} args and {} envs",
+                        sp,
+                        nargs,
+                        nenvs
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_pointers_point_inside_the_image_at_the_strings_themselves() {
+        // A pointer past the end of what was copied into the stack VMO reads
+        // as zero in the new process, so `argv[0]` becomes the empty string
+        // and everything that logs a program name goes blank.
+        let img = Image::of(
+            &["/usr/bin/env", "sh"],
+            &["LANG=C"],
+            auxv_of(&[(AT_ENTRY as u8, 0x400000)]),
+        );
+        let argc = img.word(img.sp);
+        for i in 0..argc {
+            let p = img.word(img.sp + 8 + i * 8);
+            assert!(img.in_bounds(p, 1), "argv[{}] points outside the image", i);
+        }
+        let (_, args, envs, _) = img.decode();
+        assert_eq!(args[0], "/usr/bin/env");
+        assert_eq!(envs[0], "LANG=C");
+    }
+
+    #[test]
+    fn the_auxiliary_vector_carries_what_the_loader_put_there_and_ends_in_at_null() {
+        // libc reads AT_PHDR/AT_PHNUM to find the program headers and
+        // AT_PAGESZ for every mmap it rounds; a missing entry reads as zero
+        // and the process divides by it.
+        let img = Image::of(
+            &["/bin/true"],
+            &[],
+            auxv_of(&[
+                (AT_PHDR as u8, 0x400040),
+                (AT_PHNUM as u8, 11),
+                (AT_PAGESZ as u8, 4096),
+                (AT_ENTRY as u8, 0x401000),
+            ]),
+        );
+        let (_, _, _, auxv) = img.decode();
+        for (key, want) in [
+            (AT_PHDR, 0x400040usize),
+            (AT_PHNUM, 11),
+            (AT_PAGESZ, 4096),
+            (AT_ENTRY, 0x401000),
+        ] {
+            let got = auxv.iter().find(|(k, _)| *k == key as usize);
+            assert_eq!(got.map(|(_, v)| *v), Some(want), "auxv[{}] is wrong", key);
+        }
+    }
+
+    #[test]
+    fn at_random_points_at_sixteen_readable_bytes() {
+        // Every glibc and musl start-up reads 16 bytes through this pointer
+        // to seed the stack canary. Pointing it anywhere else is a read of
+        // whatever happens to be there, or a fault.
+        let img = Image::of(&["/bin/true"], &[], BTreeMap::new());
+        let (_, _, _, auxv) = img.decode();
+        let random = auxv
+            .iter()
+            .find(|(k, _)| *k == AT_RANDOM as usize)
+            .expect("AT_RANDOM must always be supplied")
+            .1;
+        assert!(
+            img.in_bounds(random, 16),
+            "AT_RANDOM points at {:#x}, outside the image",
+            random
+        );
+    }
+
+    #[test]
+    fn at_execfn_names_the_program() {
+        // `AT_EXECFN` is what `/proc/self/comm` and every crash reporter
+        // falls back to, and it is a separate copy from `argv[0]` -- a
+        // program is free to rewrite its own `argv`.
+        let img = Image::of(
+            &["/usr/bin/gzdoom", "-iwad", "freedoom1.wad"],
+            &[],
+            BTreeMap::new(),
+        );
+        let (_, _, _, auxv) = img.decode();
+        let execfn = auxv
+            .iter()
+            .find(|(k, _)| *k == AT_EXECFN as usize)
+            .expect("AT_EXECFN must always be supplied")
+            .1;
+        assert_eq!(img.cstr(execfn), "/usr/bin/gzdoom");
+    }
+
+    #[test]
+    fn a_huge_argument_list_does_not_overrun_the_image_buffer() {
+        // `rm dir/*` on a directory with thousands of files expands to
+        // thousands of argv entries. The buffer used to be a fixed 16 KiB and
+        // the copy asserts on overrun -- so an ordinary shell command panicked
+        // the kernel. The size has to be computed from the actual contents.
+        let args: Vec<String> = (0..4000)
+            .map(|i| alloc::format!("/tmp/dir/file{:06}", i))
+            .collect();
+        let envs: Vec<String> = (0..200)
+            .map(|i| alloc::format!("VAR{}={}", i, "v".repeat(80)))
+            .collect();
+        let info = ProcInitInfo {
+            args: args.clone(),
+            envs: envs.clone(),
+            auxv: auxv_of(&[(AT_PAGESZ as u8, 4096)]),
+        };
+        let stack = info.push_at(TOP);
+        let img = Image {
+            sp: TOP - stack.len(),
+            bytes: stack.to_vec(),
+        };
+        let (argc, got_args, got_envs, _) = img.decode();
+        assert_eq!(argc, 4000);
+        assert_eq!(got_args.len(), 4000);
+        assert_eq!(got_args[0], args[0]);
+        assert_eq!(got_args[3999], args[3999]);
+        assert_eq!(got_envs.len(), 200);
+        assert!(img.sp.is_multiple_of(16));
+    }
+
+    #[test]
+    fn an_empty_argument_list_builds_a_stack_instead_of_panicking() {
+        // `sys_execve` refuses this before it gets here, but `push_at` is a
+        // public function and indexing `args[0]` on an empty vector is a
+        // kernel panic rather than an error.
+        let img = Image::of(&[], &["PATH=/bin"], BTreeMap::new());
+        let (argc, args, envs, _) = img.decode();
+        assert_eq!(argc, 0);
+        assert!(args.is_empty());
+        assert_eq!(envs, vec!["PATH=/bin"]);
+        assert!(img.sp.is_multiple_of(16));
+    }
+
+    #[test]
+    fn an_empty_environment_is_still_null_terminated() {
+        // `envp` with no entries is just the NULL, and a missing one sends
+        // every `getenv` walking off the end of the stack.
+        let img = Image::of(&["/bin/true"], &[], BTreeMap::new());
+        let (argc, _, envs, auxv) = img.decode();
+        assert_eq!(argc, 1);
+        assert!(envs.is_empty());
+        assert!(!auxv.is_empty(), "the auxv follows the envp NULL");
+    }
+
+    #[test]
+    fn arguments_holding_spaces_and_empty_strings_survive_intact() {
+        // `sh -c "echo a b"` passes one argument with spaces in it, and an
+        // empty argument is legal too; both are just NUL-terminated strings.
+        let img = Image::of(&["/bin/sh", "-c", "echo a  b", ""], &[], BTreeMap::new());
+        let (argc, args, _, _) = img.decode();
+        assert_eq!(argc, 4);
+        assert_eq!(args[2], "echo a  b");
+        assert_eq!(args[3], "", "an empty argument was dropped");
+    }
+}

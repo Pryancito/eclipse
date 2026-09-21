@@ -118,14 +118,16 @@ struct MappedGem {
     /// Every holder of a reference to this object, BY PID, one entry per
     /// reference: the `GEM_NEW` creator first, then one entry per PRIME
     /// *self-import* (`FD_TO_HANDLE` handing back this ORIGINAL handle, see
-    /// `lookup_by_phys`). Real Linux DRM keeps a GEM object alive as long as
-    /// any handle or dma-buf references it, and handles are per `drm_file`;
-    /// this is the closest a global handle namespace gets. Each `GEM_CLOSE`
-    /// drops ONE entry of the closing pid ([`dec_ref`]), a process exit drops
-    /// every entry of that pid ([`release_pid`]), and the object is only truly
-    /// freed when the list is empty. A pid that is not in the list may not
-    /// use, map, bind or close the object ([`holds`]) -- before this the
-    /// count was anonymous, so any process could `GEM_CLOSE` or `VM_BIND` the
+    /// `lookup_by_phys`), plus one entry per live dma-buf exported from it
+    /// ([`DMABUF_HOLDER`]) and per KMS framebuffer that pins it. Real Linux
+    /// DRM keeps a GEM object alive as long as any handle or dma-buf
+    /// references it, and handles are per `drm_file`; this is the closest a
+    /// global handle namespace gets. Each `GEM_CLOSE` drops ONE entry of the
+    /// closing pid ([`dec_ref`]), a process exit drops every entry of that
+    /// pid ([`release_pid`]), and the object is only truly freed when the
+    /// list is empty. A pid that is not in the list may not use, map, bind
+    /// or close the object ([`holds`]) -- before this the count was
+    /// anonymous, so any process could `GEM_CLOSE` or `VM_BIND` the
     /// compositor's buffers by guessing a handle, and a client that died
     /// without closing its own self-imports leaked the buffer until reboot
     /// (its import references were not attributable to it).
@@ -154,6 +156,21 @@ pub enum DecRef {
 lazy_static::lazy_static! {
     static ref MAPPINGS: Mutex<Vec<MappedGem>> = Mutex::new(Vec::new());
 }
+
+/// Holder id a live dma-buf fd records against a nouveau GEM object.
+///
+/// Real Linux keeps a GEM object alive for as long as any handle **or dma-buf**
+/// references it. Our export path used to wrap the physical range in a
+/// dma-buf without taking a `gem_mmap` reference,
+/// so the exporter's subsequent `GEM_CLOSE` (the normal DRI3 dance: export fd,
+/// hand it to Xwayland, close the local handle) freed the object while the
+/// dma-buf fd was still in flight. `lookup_by_phys` then missed on the
+/// importer side → generic handle → `GEM_INFO` ENOENT. Wayland-native clients
+/// usually keep their GEM handle open until `wl_buffer.release`, so the same
+/// bug was invisible there; the X11/Xwayland chain of three processes is what
+/// surfaces it. `u64::MAX - 1` is never a real pid (and is distinct from the
+/// KMS framebuffer sentinel `u64::MAX` in `linux-object`'s drm module).
+pub const DMABUF_HOLDER: u64 = u64::MAX - 1;
 
 /// Registers the physical mapping for `handle`, with `owner_pid` as its first
 /// holder. If `handle` is already present (re-registration of the same id)
@@ -532,5 +549,43 @@ mod xwayland_chain_tests {
             lookup(handle).is_none(),
             "the entry goes before the VRAM behind it is released"
         );
+    }
+
+    /// The regression this guards. An X11 GL client exports a dma-buf, hands
+    /// the fd to Xwayland, and closes its local GEM handle — that close must
+    /// NOT free the object while the dma-buf is still live. Without a
+    /// `DMABUF_HOLDER` reference taken at export, `lookup_by_phys` misses on
+    /// the importer and the whole DRI3 chain collapses.
+    #[test]
+    fn a_dmabuf_keeps_the_buffer_alive_after_the_exporter_closes() {
+        let handle = DRIVER_HANDLE_BASE + 0x10_0005;
+        let phys = 0x4_0040_0000;
+        register(handle, phys, 0x10_0000, CLIENT);
+
+        // PRIME_HANDLE_TO_FD: the dma-buf takes its own reference.
+        assert_eq!(add_ref(handle, DMABUF_HOLDER), Some(2));
+
+        // Client GEM_CLOSE after export — the DRI3 dance.
+        assert!(
+            matches!(dec_ref(handle, CLIENT), DecRef::StillReferenced(1)),
+            "closing the exporter's handle must leave the dma-buf's reference"
+        );
+        assert!(
+            lookup_by_phys(phys).is_some(),
+            "self-import on the receiving end still finds the original handle"
+        );
+
+        // Xwayland (or the compositor) imports the still-live dma-buf.
+        assert_eq!(add_ref(handle, XWAYLAND), Some(2));
+        assert!(lookup_for(handle, XWAYLAND).is_some());
+
+        // Last close of the dma-buf fd drops its holder; Xwayland still owns it.
+        assert!(matches!(
+            dec_ref(handle, DMABUF_HOLDER),
+            DecRef::StillReferenced(1)
+        ));
+        assert!(lookup_for(handle, XWAYLAND).is_some());
+
+        drop_handle(handle);
     }
 }
