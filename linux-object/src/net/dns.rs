@@ -338,6 +338,17 @@ fn encode_qname(name: &str, out: &mut Vec<u8>) -> LxResult {
         out.push(0);
         return Ok(());
     }
+    // A fully-qualified name ends in a dot (`example.com.`), which `split`
+    // turns into a trailing empty label. That is legal syntax -- it appears in
+    // `resolv.conf` search lists and in anything a user typed with the root
+    // spelled out -- and rejecting it made the whole lookup fail with EINVAL
+    // rather than resolve. The dot IS the root label the encoding already adds
+    // at the end, so there is nothing else to do with it.
+    let name = name.strip_suffix('.').unwrap_or(name);
+    if name.is_empty() {
+        out.push(0);
+        return Ok(());
+    }
     for label in name.split('.') {
         if label.is_empty() || label.len() > 63 {
             return Err(LxError::EINVAL);
@@ -458,7 +469,18 @@ fn parse_addresses(data: &[u8], qtype: u16) -> LxResult<Vec<IpAddress>> {
     }
     let mut addrs = Vec::new();
     for _ in 0..an {
-        off = skip_name(data, off).ok_or(LxError::EINVAL)?;
+        // `an` is the sender's word for how many records follow, and a packet
+        // that overstates it -- by accident or on purpose -- runs this loop
+        // past the end. The two bounds checks below already treat that as
+        // "the answers stop here" and keep what was parsed; this one used to
+        // throw the whole packet away with EINVAL instead, so the SAME lie
+        // failed the lookup or not depending on exactly which byte the packet
+        // ended on. The records already read were well formed and matched the
+        // question, so they are worth as much as any: stop, do not discard.
+        off = match skip_name(data, off) {
+            Some(next) => next,
+            None => break,
+        };
         if off + 10 > data.len() {
             break;
         }
@@ -486,5 +508,413 @@ fn parse_addresses(data: &[u8], qtype: u16) -> LxResult<Vec<IpAddress>> {
         Err(LxError::ENOENT)
     } else {
         Ok(addrs)
+    }
+}
+
+#[cfg(test)]
+mod dns_tests {
+    //! Everything here reads bytes that came off the network or out of a
+    //! config file, so it is the one place in the resolver that a hostile or
+    //! merely broken answer reaches first. The failure modes are quiet:
+    //! a length read past the end of the packet, a `::` expanded to the wrong
+    //! number of zero groups, an address taken from the wrong record.
+
+    use super::*;
+
+    /// A DNS response: header, one question, then the answers as given.
+    fn response(rcode: u8, qname: &[u8], answers: &[&[u8]]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&[0x12, 0x34]); // id
+        v.push(0x81); // QR=1, RD=1
+        v.push(0x80 | rcode); // RA + rcode
+        v.extend_from_slice(&[0x00, 0x01]); // QDCOUNT
+        v.extend_from_slice(&(answers.len() as u16).to_be_bytes());
+        v.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // NS/AR
+        v.extend_from_slice(qname);
+        v.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // QTYPE=A QCLASS=IN
+        for a in answers {
+            v.extend_from_slice(a);
+        }
+        v
+    }
+
+    /// One resource record, with the name as a compression pointer to offset
+    /// 12 -- which is what a real server sends.
+    fn record(rtype: u16, rdata: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&[0xC0, 0x0C]); // pointer to the question's name
+        v.extend_from_slice(&rtype.to_be_bytes());
+        v.extend_from_slice(&QCLASS_IN.to_be_bytes());
+        v.extend_from_slice(&[0, 0, 0, 60]); // ttl
+        v.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        v.extend_from_slice(rdata);
+        v
+    }
+
+    fn qname(name: &str) -> Vec<u8> {
+        let mut v = Vec::new();
+        encode_qname(name, &mut v).unwrap();
+        v
+    }
+
+    // ── the address literals in resolv.conf and /etc/hosts ──────────────────
+
+    #[test]
+    fn an_ipv4_literal_needs_exactly_four_octets() {
+        assert_eq!(
+            parse_ipv4("192.168.1.1"),
+            Some(Ipv4Address::new(192, 168, 1, 1))
+        );
+        assert_eq!(parse_ipv4("0.0.0.0"), Some(Ipv4Address::new(0, 0, 0, 0)));
+        assert_eq!(
+            parse_ipv4("255.255.255.255"),
+            Some(Ipv4Address::new(255, 255, 255, 255))
+        );
+        assert_eq!(parse_ipv4("1.2.3"), None, "three octets is not an address");
+        assert_eq!(parse_ipv4("1.2.3.4.5"), None, "five is not either");
+        assert_eq!(parse_ipv4("1.2.3.256"), None, "256 does not fit an octet");
+        assert_eq!(parse_ipv4("1.2.3.x"), None);
+        assert_eq!(parse_ipv4(""), None);
+    }
+
+    #[test]
+    fn an_ipv6_literal_without_compression() {
+        let a = parse_ipv6("2001:0db8:0000:0000:0000:0000:0000:0001").unwrap();
+        assert_eq!(a, Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        assert_eq!(
+            parse_ipv6("1:2:3:4:5:6:7"),
+            None,
+            "seven groups is not enough"
+        );
+        assert_eq!(parse_ipv6("1:2:3:4:5:6:7:8:9"), None, "nine is too many");
+    }
+
+    #[test]
+    fn the_double_colon_expands_to_the_zeros_it_stands_for() {
+        // This is the whole of the compressed form, and getting the count
+        // wrong puts every group after it in the wrong place -- an address
+        // that parses cleanly and points somewhere else entirely.
+        assert_eq!(
+            parse_ipv6("2001:db8::1"),
+            Some(Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))
+        );
+        assert_eq!(
+            parse_ipv6("::1"),
+            Some(Ipv6Address::new(0, 0, 0, 0, 0, 0, 0, 1)),
+            "the loopback address"
+        );
+        assert_eq!(
+            parse_ipv6("fe80::"),
+            Some(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0))
+        );
+        assert_eq!(
+            parse_ipv6("::"),
+            Some(Ipv6Address::new(0, 0, 0, 0, 0, 0, 0, 0)),
+            "the unspecified address"
+        );
+        assert_eq!(
+            parse_ipv6("1:2:3::7:8"),
+            Some(Ipv6Address::new(1, 2, 3, 0, 0, 0, 7, 8)),
+            "the zeros go where the :: was, not at the end"
+        );
+    }
+
+    #[test]
+    fn a_double_colon_that_stands_for_nothing_is_refused() {
+        // `::` must cover at least one group. `1:2:3:4:5:6:7::8` names nine.
+        assert_eq!(parse_ipv6("1:2:3:4:5:6:7:8::"), None);
+        assert_eq!(parse_ipv6("1:2:3:4:5:6:7::8"), None);
+    }
+
+    #[test]
+    fn a_malformed_ipv6_literal_is_refused_rather_than_half_parsed() {
+        assert_eq!(parse_ipv6(":::1"), None, "three colons");
+        assert_eq!(parse_ipv6(":1"), None, "a lone leading colon");
+        assert_eq!(parse_ipv6("1:"), None, "a lone trailing colon");
+        assert_eq!(
+            parse_ipv6("1::2::3"),
+            None,
+            "two compressions are ambiguous"
+        );
+        assert_eq!(parse_ipv6(""), None);
+        assert_eq!(parse_ipv6("gggg::1"), None, "not hexadecimal");
+    }
+
+    #[test]
+    fn a_scope_suffix_is_dropped_rather_than_refused() {
+        // Link-local addresses come with `%iface` attached, and a nameserver
+        // line that carries one has to resolve to the address, not to nothing.
+        assert_eq!(
+            parse_ipv6("fe80::1%eth0"),
+            Some(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))
+        );
+    }
+
+    // ── the query that goes out ─────────────────────────────────────────────
+
+    #[test]
+    fn a_name_is_encoded_as_length_prefixed_labels() {
+        assert_eq!(qname("www.example.com"), b"\x03www\x07example\x03com\x00");
+        assert_eq!(qname(""), b"\x00", "the empty name is the root");
+    }
+
+    #[test]
+    fn a_fully_qualified_name_keeps_its_meaning_and_loses_its_dot() {
+        // `example.com.` is legal and ordinary -- it is how you spell a name
+        // that must not have a search domain appended. `split('.')` turns the
+        // trailing dot into an empty label, which used to be an outright
+        // EINVAL: the lookup failed instead of resolving.
+        assert_eq!(qname("example.com."), qname("example.com"));
+        assert_eq!(qname("."), b"\x00", "the root, spelled out");
+    }
+
+    #[test]
+    fn an_empty_or_oversized_label_is_refused() {
+        // An empty label in the middle (`a..b`) has no encoding, and a label
+        // over 63 bytes does not fit its length byte -- the top two bits are
+        // the compression marker, so a longer one would read as a pointer.
+        let mut out = Vec::new();
+        assert!(matches!(
+            encode_qname("a..b", &mut out),
+            Err(LxError::EINVAL)
+        ));
+        let long = "x".repeat(64);
+        assert!(matches!(
+            encode_qname(&long, &mut out),
+            Err(LxError::EINVAL)
+        ));
+        let just_fits = "x".repeat(63);
+        let mut ok = Vec::new();
+        assert!(
+            encode_qname(&just_fits, &mut ok).is_ok(),
+            "63 bytes must fit"
+        );
+        assert_eq!(ok[0], 63);
+    }
+
+    #[test]
+    fn the_query_header_asks_for_recursion_and_one_question() {
+        let q = build_query("example.com", 0xBEEF, QTYPE_A).unwrap();
+        assert_eq!(&q[0..2], &[0xBE, 0xEF], "the id must go out as given");
+        assert_eq!(
+            q[2] & 0x01,
+            0x01,
+            "RD must be set or the server will not recurse"
+        );
+        assert_eq!(&q[4..6], &[0x00, 0x01], "exactly one question");
+        assert_eq!(&q[6..12], &[0, 0, 0, 0, 0, 0], "no answers in a query");
+        assert_eq!(&q[12..q.len() - 4], qname("example.com").as_slice());
+        assert_eq!(&q[q.len() - 4..], &[0x00, 0x01, 0x00, 0x01], "A, IN");
+        let q6 = build_query("example.com", 1, QTYPE_AAAA).unwrap();
+        assert_eq!(&q6[q6.len() - 4..], &[0x00, 0x1C, 0x00, 0x01], "AAAA, IN");
+    }
+
+    // ── the answer that comes back ──────────────────────────────────────────
+
+    #[test]
+    fn a_name_is_skipped_label_by_label_to_the_root() {
+        let data = b"\x03www\x07example\x03com\x00rest";
+        assert_eq!(skip_name(data, 0), Some(17), "past the terminating zero");
+        assert_eq!(skip_name(b"\x00", 0), Some(1), "the root is one byte");
+    }
+
+    #[test]
+    fn a_compression_pointer_is_two_bytes_and_is_not_followed() {
+        // Following pointers is how a resolver is made to loop for ever on a
+        // packet that points at itself; this one only has to step over them.
+        let data = [0xC0, 0x0C, 0xFF];
+        assert_eq!(skip_name(&data, 0), Some(2));
+        // A pointer whose second byte is off the end of the packet.
+        assert_eq!(skip_name(&[0xC0], 0), None);
+    }
+
+    #[test]
+    fn a_name_that_runs_off_the_end_of_the_packet_is_refused() {
+        // A truncated packet claiming a 200-byte label: the parser must stop,
+        // not read past the buffer.
+        // 63 is the longest a label may be, and the top two bits of the
+        // length byte are the compression marker -- so a genuine length that
+        // overruns is at most 0x3F, and anything above 0xC0 is a pointer.
+        assert_eq!(skip_name(b"\x3Fabc", 0), None, "a 63-byte label in 4 bytes");
+        assert_eq!(skip_name(b"\x03ww", 0), None, "the label is cut short");
+        assert_eq!(skip_name(b"", 0), None);
+        assert_eq!(skip_name(b"\x03www", 5), None, "an offset past the end");
+    }
+
+    #[test]
+    fn an_a_record_yields_its_address() {
+        let pkt = response(
+            0,
+            &qname("example.com"),
+            &[&record(QTYPE_A, &[93, 184, 216, 34])],
+        );
+        let got = parse_addresses(&pkt, QTYPE_A).unwrap();
+        assert_eq!(
+            got,
+            alloc::vec![IpAddress::Ipv4(Ipv4Address::new(93, 184, 216, 34))]
+        );
+    }
+
+    #[test]
+    fn several_answers_all_come_back_in_order() {
+        // A load-balanced name answers with every address it has, and a
+        // resolver that stops at the first one never fails over.
+        let pkt = response(
+            0,
+            &qname("example.com"),
+            &[
+                &record(QTYPE_A, &[1, 1, 1, 1]),
+                &record(QTYPE_A, &[8, 8, 8, 8]),
+            ],
+        );
+        let got = parse_addresses(&pkt, QTYPE_A).unwrap();
+        assert_eq!(
+            got,
+            alloc::vec![
+                IpAddress::Ipv4(Ipv4Address::new(1, 1, 1, 1)),
+                IpAddress::Ipv4(Ipv4Address::new(8, 8, 8, 8))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cname_in_front_of_the_answer_is_stepped_over() {
+        // The commonest real answer shape: the name is an alias, so the
+        // packet carries a CNAME and then the A record it points at. Taking
+        // the first record's rdata as an address would read four bytes of a
+        // hostname as an IPv4 address.
+        let cname = record(5, b"\x03www\x07example\x03com\x00");
+        let a = record(QTYPE_A, &[203, 0, 113, 7]);
+        let pkt = response(0, &qname("example.com"), &[&cname, &a]);
+        let got = parse_addresses(&pkt, QTYPE_A).unwrap();
+        assert_eq!(
+            got,
+            alloc::vec![IpAddress::Ipv4(Ipv4Address::new(203, 0, 113, 7))]
+        );
+    }
+
+    #[test]
+    fn an_aaaa_answer_is_sixteen_bytes_and_an_a_answer_is_four() {
+        // The length is what tells them apart, and a record whose rdlen does
+        // not match its type is malformed: taking it anyway would build an
+        // address out of whatever followed.
+        let v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let pkt = response(0, &qname("example.com"), &[&record(QTYPE_AAAA, &v6)]);
+        let got = parse_addresses(&pkt, QTYPE_AAAA).unwrap();
+        assert_eq!(
+            got,
+            alloc::vec![IpAddress::Ipv6(Ipv6Address::new(
+                0x2001, 0xdb8, 0, 0, 0, 0, 0, 1
+            ))]
+        );
+
+        // Too short and too long are both malformed, and the long one is the
+        // dangerous shape: an address built from the first four bytes of a
+        // six-byte record silently drops what the rest of it said.
+        for rdata in [&[1u8, 2, 3][..], &[1, 2, 3, 4, 5, 6][..]] {
+            let wrong = response(0, &qname("example.com"), &[&record(QTYPE_A, rdata)]);
+            assert!(
+                matches!(parse_addresses(&wrong, QTYPE_A), Err(LxError::ENOENT)),
+                "an A record of {} bytes was taken as an address",
+                rdata.len()
+            );
+        }
+        let short6 = response(0, &qname("example.com"), &[&record(QTYPE_AAAA, &[0u8; 15])]);
+        assert!(matches!(
+            parse_addresses(&short6, QTYPE_AAAA),
+            Err(LxError::ENOENT)
+        ));
+    }
+
+    #[test]
+    fn a_server_error_is_reported_rather_than_read_past() {
+        // NXDOMAIN and SERVFAIL carry no answers, and the counts in the header
+        // are not to be trusted on one.
+        for rcode in [2u8, 3, 5] {
+            let pkt = response(rcode, &qname("nope.invalid"), &[]);
+            assert!(
+                matches!(parse_addresses(&pkt, QTYPE_A), Err(LxError::EIO)),
+                "rcode {} was not reported as an error",
+                rcode
+            );
+        }
+    }
+
+    #[test]
+    fn an_answer_with_nothing_of_the_right_type_is_not_found() {
+        let pkt = response(0, &qname("example.com"), &[&record(16, b"some text")]);
+        assert!(matches!(
+            parse_addresses(&pkt, QTYPE_A),
+            Err(LxError::ENOENT)
+        ));
+
+        // The type has to be checked, not guessed from the length. A TXT
+        // record carrying exactly four bytes is the same size as an A record,
+        // and a parser that only looked at `rdlen` would hand back 3.97.98.99
+        // -- a real-looking address made out of the string "abc".
+        let same_size = response(0, &qname("example.com"), &[&record(16, b"\x03abc")]);
+        assert!(
+            matches!(parse_addresses(&same_size, QTYPE_A), Err(LxError::ENOENT)),
+            "a four-byte TXT record was read as an address"
+        );
+        let empty = response(0, &qname("example.com"), &[]);
+        assert!(matches!(
+            parse_addresses(&empty, QTYPE_A),
+            Err(LxError::ENOENT)
+        ));
+    }
+
+    #[test]
+    fn a_packet_too_short_to_hold_a_header_is_refused() {
+        for n in 0..12usize {
+            assert!(
+                matches!(
+                    parse_addresses(&alloc::vec![0u8; n], QTYPE_A),
+                    Err(LxError::EINVAL)
+                ),
+                "a {}-byte packet was accepted",
+                n
+            );
+        }
+    }
+
+    #[test]
+    fn a_record_whose_rdata_runs_past_the_packet_is_dropped() {
+        // The length inside the packet is the attacker's to choose. A record
+        // claiming 200 bytes of rdata in a packet with 4 left must yield
+        // nothing, not 200 bytes of whatever is next in memory.
+        let mut pkt = response(0, &qname("example.com"), &[&record(QTYPE_A, &[1, 2, 3, 4])]);
+        let len = pkt.len();
+        pkt[len - 6] = 0x00;
+        pkt[len - 5] = 0xC8; // rdlen = 200, with 4 bytes actually there
+        assert!(matches!(
+            parse_addresses(&pkt, QTYPE_A),
+            Err(LxError::ENOENT)
+        ));
+    }
+
+    #[test]
+    fn a_header_claiming_more_answers_than_the_packet_holds_is_refused() {
+        // AN=8 with one record in the packet: the loop must run out of data
+        // and stop, not keep reading.
+        let mut pkt = response(0, &qname("example.com"), &[&record(QTYPE_A, &[5, 6, 7, 8])]);
+        pkt[7] = 8;
+        // The one real answer is still found, and the seven that are not there
+        // do not take the parser past the end.
+        let got = parse_addresses(&pkt, QTYPE_A).unwrap();
+        assert_eq!(
+            got,
+            alloc::vec![IpAddress::Ipv4(Ipv4Address::new(5, 6, 7, 8))]
+        );
+    }
+
+    #[test]
+    fn a_question_count_that_eats_the_answers_is_refused() {
+        let mut pkt = response(0, &qname("example.com"), &[&record(QTYPE_A, &[1, 2, 3, 4])]);
+        pkt[5] = 9; // QDCOUNT=9, so skipping the questions runs off the end
+        assert!(matches!(
+            parse_addresses(&pkt, QTYPE_A),
+            Err(LxError::EINVAL)
+        ));
     }
 }
