@@ -87,7 +87,7 @@ pub fn shm_unregister(id: ShmId) -> bool {
 ///
 /// struct shmid_ds
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ShmidDs {
     /// Ownership and permissions
     pub perm: IpcPerm,
