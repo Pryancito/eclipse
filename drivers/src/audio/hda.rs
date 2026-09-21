@@ -57,7 +57,8 @@ use core::sync::atomic::{fence, Ordering};
 use lock::Mutex;
 use pci::{PCIDevice, BAR};
 
-use crate::audio::pipeline::src::Resampler;
+use crate::audio::pipeline::host::{HostStream, LINK_RATE};
+use crate::audio::pipeline::mixer::{accumulate_s16, drain_to_s16};
 use crate::audio::pipeline::volume::{gain_from_percent, Volume};
 use crate::builder::IoMapper;
 use crate::bus::pci_drivers::PciDriver;
@@ -197,16 +198,18 @@ impl DiagBudget {
 
 /// PCM ring: 16 pages = 64 KiB (341 ms of 48 kHz S16LE stereo).
 ///
-/// The ring is the audio latency: `/dev/dsp` blocks the writer only when the
-/// ring is full, so an application always has it filled and every sample it
-/// writes waits a ring's worth of playback before it is heard. 256 KiB was
-/// sized for a DMA engine believed to fetch ~96 KB ahead of the link; that
-/// figure turned out to be an artefact of the emulator it was measured in,
-/// and once the play position came from the link clock rather than from the
-/// position registers the ring stopped having to cover it at all. 341 ms is
-/// still several times what a desktop audio stack runs with, and leaves the
-/// writer -- a userspace loop subject to scheduling -- an ample margin.
-const RING_PAGES: usize = 16;
+/// The ring is the DAI's, not the client's. A client writes into its own
+/// [`HostStream`] (see [`HOST_BUFFER`]) and the kernel keeps this ring
+/// filled [`FILL_DEPTH`] ahead of the engine with the mix of every stream,
+/// so the ring's size is not the latency: what the ring has to hold is the
+/// stretch between where the engine has really got to and where the fill
+/// lands, plus the guard. That stretch is the position lead -- how far the
+/// controller's reported position runs ahead of the link clock -- and it is
+/// not small everywhere: QEMU's `intel-hda` fetches for its audio backend's
+/// buffer and has been seen 106 KB ahead. With a 64 KiB ring that lead ate
+/// the whole write window (free = 0 with nothing audible queued); 256 KiB
+/// covers it with room to spare, and costs nothing in latency.
+const RING_PAGES: usize = 64;
 /// The BDL splits the ring into fixed 8 KiB cyclic segments (8 entries).
 const BDL_SEGMENT: usize = 8 * 1024;
 /// Keep the software write pointer at least this far behind the reported play
@@ -232,13 +235,34 @@ const BDL_SEGMENT: usize = 8 * 1024;
 /// guard is dead ring, so it is not free.
 const RING_GUARD: usize = 16384;
 
-/// Silence kept ahead of the write pointer, so that an engine that runs past
-/// the end of what was written plays silence -- not the previous lap -- for
-/// as long as it takes the next poll to notice and stop it. Much smaller
-/// than the guard: the band must end well short of the estimated play
-/// position, never at it, for the same start-up-latency reason. It ends
-/// 12 KiB (64 ms) short of it.
-const SILENCE_AHEAD: usize = 4096;
+/// Silence kept ahead of the fill point, so that an engine that runs past
+/// the end of what was filled -- the fill loop is driven by the ALSA
+/// watchdog and the front ends, and a scheduling hole can hold it up --
+/// plays silence, not the previous lap, until the next fill lands. The
+/// band is clipped to the write window: it never reaches into the guard
+/// behind the play position, for the same reporting-error reason the guard
+/// exists.
+const SILENCE_AHEAD: usize = 2 * BDL_SEGMENT;
+
+/// How far ahead of the engine the ring is kept filled: the mixer's block,
+/// and how long the engine can run before a late fill is heard. Two
+/// segments, 85 ms at the link rate, against a fill loop that runs every
+/// 4 ms; a bigger figure only adds delay between a client's write and the
+/// speaker, since a client's PCM is mixed into the ring this far ahead.
+const FILL_DEPTH: usize = 2 * BDL_SEGMENT;
+
+/// The most one fill writes. A fill that finds itself far behind the
+/// engine (a stall, or the QEMU lead above at stream start) catches up
+/// over a few polls rather than in one block, which bounds the mixing
+/// done under the device lock and the scratch that backs it.
+const FILL_MAX: usize = 8 * BDL_SEGMENT;
+
+/// Link bytes each client stream holds: the client's `buffer_bytes`, and
+/// so its latency when it keeps the buffer full (`/dev/dsp` blocks only on
+/// a full buffer). 256 ms at the link rate: what the old ring offered the
+/// client once the guard was taken off, so nothing a client sees changed
+/// when the ring stopped being its buffer.
+const HOST_BUFFER: usize = 48 * 1024;
 
 /// Minimum interval between reads of the stream position register.
 ///
@@ -316,253 +340,84 @@ const HDMI_KICK_MIN_US: u64 = 1_000_000;
 /// is not between two notes.
 const DAI_IDLE_STOP_US: u64 = 5_000_000;
 
-/// Silence left between the furthest point the engine could have fetched
-/// up to and the place where the next write lands after a gap.
-///
-/// During a gap the engine is running and its fetch position is somewhere
-/// past the link's play position: the controller's counters over-report by
-/// up to a few segments on the hardware this runs on (see [`RING_GUARD`]),
-/// and whatever they say, a fetch is a burst of up to one BDL segment. PCM
-/// written where the engine has already been is played as the zeros that
-/// were there, i.e. the start of the sound is cut. One segment past the
-/// highest position any counter reports is beyond every burst.
-const PARK_MARGIN: usize = BDL_SEGMENT;
-
 const STOP_HISTORY: usize = 4;
 
-/// One gap (the ring running out of client PCM), as recorded for
+/// One gap (the mix running out of client PCM), as recorded for
 /// `/proc/gpusnd`.
 #[derive(Clone, Copy, Default)]
 struct StopEvent {
-    /// `b'U'` underrun, `b'D'` drain, `b'P'` a prepare that kept the engine
-    /// running (see [`HdaInner::soft_prepare`]), 0 = unused slot.
+    /// `b'U'` underrun (a started stream had nothing to give), `b'D'` drain
+    /// (no stream was started), 0 = unused slot.
     kind: u8,
     /// Milliseconds after the stream started, by the kernel clock.
     at_ms: u64,
     /// The same interval by the controller's 24 MHz wall clock.
     wall_ms: u64,
-    /// Bytes written to that stream by then.
+    /// Bytes of mixed PCM written to the ring by then.
     written: usize,
 }
 
-/// Where the next write lands once the ring has run out of client PCM and
-/// the engine is left running: past the furthest position any counter
-/// reports (`consumed` is the link clock's estimate, the two totals are the
-/// controller's own counters, whichever of them over-reports), plus
-/// [`PARK_MARGIN`]. Bytes since RUN, like its inputs.
-fn park_target(consumed: u64, lpib_total: u64, dpib_total: u64, margin: u64) -> u64 {
-    consumed.max(lpib_total).max(dpib_total) + margin
-}
-
-/// Client PCM still queued, given the raw ring occupancy `queued` and the
-/// silence pad that ends at stream position `pad_end`: the pad is ring
-/// space the driver filled on its own, and it is not the client's to count.
-/// Ring space the client may still write into: everything but the guard and
-/// what is already queued.
+/// How many bytes the next fill writes at `fill_pos`, all positions being
+/// bytes since RUN.
 ///
-/// `saturating_sub`, like `exposed_queued` and `frame_bytes` and every other
-/// bit of arithmetic here. It holds today -- `queued` is clamped to
-/// `ring_len - RING_GUARD` at both places that set it, and `RING_PAGES *
-/// PAGE_SIZE` is four times `RING_GUARD` -- but this is the number the write
-/// path uses to decide how much to copy INTO the ring, so an underflow would
-/// not be a panic in release: it would be a free-space figure near 2^64 and a
-/// copy past the end of the ring.
-fn free_bytes_of(ring_len: usize, guard: usize, queued: usize) -> usize {
-    ring_len.saturating_sub(guard).saturating_sub(queued)
-}
-
-/// How much of a `rewind`/`forward` request can actually be honoured: never
-/// more PCM than the client still has queued, and always a whole number of
-/// frames.
-///
-/// The frame rounding is not cosmetic. These move `wp` and zero a span of the
-/// ring, so a byte count that is not a multiple of the frame size leaves the
-/// ring straddling a sample: from there on every left sample is read as a
-/// right one and the image swaps channels for the rest of the stream.
-fn honourable_bytes(bytes: usize, exposed: usize, frame: usize) -> usize {
-    if frame == 0 {
-        return 0;
-    }
-    bytes.min(exposed) / frame * frame
-}
-
-fn exposed_queued(queued: usize, pad_end: u64, consumed: u64) -> usize {
-    let pad = pad_end.saturating_sub(consumed);
-    queued.saturating_sub(pad.min(queued as u64) as usize)
-}
-
-// ── Fixed-rate sink ─────────────────────────────────────────────────────────
-//
-// The HDA link runs at ONE rate, `LINK_RATE`, whatever rate a client asks
-// for. A client at another rate is resampled into the ring by
-// `crate::audio::pipeline::src` on the way in (SOF's SRC sits in front of
-// its DAI the same way). Two things come of that:
-//
-//  * The stream is never reprogrammed for a rate change. On an HDMI/DP sink
-//    a format change is a re-lock, and the monitor mutes for a few hundred
-//    milliseconds while it does it -- the missing first half-second of every
-//    44.1 kHz track after a 48 kHz one. Fixing the sink rate in PulseAudio's
-//    config already avoided that; this moves the resampling that costs into
-//    the kernel, where the converter is the polyphase one rather than
-//    speex's.
-//  * The ring, and every counter derived from it (positions, `queued`,
-//    `consumed`, the gap pad), stays in LINK frames. Only the four numbers
-//    the front ends see -- free, queued, delay, buffer -- and the write
-//    itself cross into CLIENT frames, through the helpers below. Frame SIZE
-//    is the same on both sides (S16LE stereo throughout); only the frame
-//    COUNT scales, by `client_rate / LINK_RATE`.
-//
-// A client at exactly `LINK_RATE` takes the same path as before this
-// existed: no converter, byte-for-byte copy, identity conversions.
-
-/// The one rate the HDA stream is ever programmed at.
-const LINK_RATE: u32 = 48000;
-
-/// Link frames held back below the free space when sizing a resampled
-/// write. The converter's output for N input frames is `N * fout / fin`
-/// give or take one (the fractional phase carries between calls); this keeps
-/// that one, and a couple more, from landing past what fits.
-const SRC_SLACK_FRAMES: usize = 4;
-
-/// Client rates outside this range are clamped rather than refused: the
-/// converter's window covers ratios down to about a third, and nothing a
-/// desktop plays sits outside it.
-const CLIENT_RATE_MIN: u32 = 8000;
-const CLIENT_RATE_MAX: u32 = 192_000;
-
-/// How many CLIENT frames a resampled write may take when the ring has
-/// `free_link_frames` free: the largest count whose converted output is sure
-/// to fit. Zero when there is no room for the slack -- the client then sees
-/// a full ring and polls, which is the normal answer.
-///
-/// This is the one number `free_bytes` reports AND the one `write` accepts,
-/// so a client that just read "N free" and offers N is never turned away
-/// with 0 (alsa-lib's `try_recover` aborts PulseAudio on EAGAIN right after
-/// `snd_pcm_avail()` said there was room).
-fn accept_client_frames(free_link_frames: usize, fin: u32, fout: u32) -> usize {
-    if fin == 0 || fout == 0 {
-        return 0;
-    }
-    let usable = free_link_frames.saturating_sub(SRC_SLACK_FRAMES);
-    (usable as u64 * fin as u64 / fout as u64) as usize
-}
-
-/// `link_bytes` of ring, seen as client bytes: the frame count scaled by
-/// `fin / fout`, floored to a whole frame. Used for what is QUEUED and for
-/// the buffer size, where under-reporting is the safe direction (a client
-/// thinks slightly less is waiting, never more than it wrote).
-fn link_to_client_bytes(link_bytes: usize, fin: u32, fout: u32, frame: usize) -> usize {
-    if frame == 0 || fout == 0 {
-        return 0;
-    }
-    let frames = (link_bytes / frame) as u64;
-    (frames * fin as u64 / fout as u64) as usize * frame
-}
-
-/// `client_bytes` of a client's request, as ring bytes: the inverse of
-/// [`link_to_client_bytes`], floored to a whole frame. For `rewind` and
-/// `forward`, which name an amount of the client's own PCM.
-fn client_to_link_bytes(client_bytes: usize, fin: u32, fout: u32, frame: usize) -> usize {
-    if frame == 0 || fin == 0 {
-        return 0;
-    }
-    let frames = (client_bytes / frame) as u64;
-    (frames * fout as u64 / fin as u64) as usize * frame
-}
-
-/// The two counts the front ends see, `(free, queued)` in client bytes, for
-/// a ring with `queued_link` bytes occupied -- the whole occupancy, the
-/// driver's silence pad included. `free` is exactly what `write` will
-/// accept ([`accept_client_frames`] of the room left, or the room itself
-/// without a converter), and `queued` is `buffer - free`, so that
-/// `buffer_bytes - queued_bytes == free_bytes` holds to the byte at every
-/// fill level, pad or no pad.
-///
-/// That identity is load-bearing. The ALSA node does not ask the driver how
-/// much is free: it computes `avail = buffer_size - queued` itself, offers
-/// that many frames, and PulseAudio's `alsa-sink.c` aborts (`try_recover`:
-/// `pa_assert(err != -EAGAIN)`) if a write it was just told had room comes
-/// back with 0. Two ways of breaking it have each cost the daemon:
-///
-/// * converting `queued` on its own (`link_to_client_bytes` of the
-///   occupancy) left `avail` at one to four frames near a full ring while
-///   `write` accepted none -- three independently floored conversions plus
-///   the [`SRC_SLACK_FRAMES`] held back by `accept_client_frames`;
-/// * deriving `queued` from the occupancy *less the pad* (so the hardware
-///   pointer never stepped back) while `write` was bounded by the whole
-///   occupancy left `avail` overstating the room by the pad: after every
-///   underrun the daemon filled the ring, woke while the pad was still
-///   ahead of the playhead, was told there was room, and got 0. On QEMU,
-///   where VM exits stall the guest for tens of milliseconds and the pad
-///   runs to 180 ms, that was every underrun.
-///
-/// So the pad counts. The price is that the client's hardware pointer
-/// (`appl_ptr - queued`) steps back once, by the pad, when a gap opens and
-/// the writer is parked past the engine: the honest reading of "the device
-/// put silence between what you wrote and what you will write next". A
-/// pointer that keeps still through a gap while the ring fills up behind
-/// the client's back is the alternative, and it is the one that aborts.
-fn client_counts(
-    buffer_link: usize,
-    queued_link: usize,
-    src: Option<(u32, u32)>,
-    frame: usize,
-) -> (usize, usize) {
-    if frame == 0 {
-        return (0, 0);
-    }
-    let room = buffer_link.saturating_sub(queued_link);
-    let (buffer, free) = match src {
-        Some((fin, fout)) => (
-            link_to_client_bytes(buffer_link, fin, fout, frame),
-            accept_client_frames(room / frame, fin, fout) * frame,
-        ),
-        None => (buffer_link, room),
-    };
-    (free, buffer.saturating_sub(free))
-}
-
-/// Client bytes queued with a converter in the path: the `queued` half of
-/// [`client_counts`], for a ring with `queued_link` bytes occupied. The
-/// driver goes through `client_counts` itself; this is the tests' handle.
-#[cfg(test)]
-fn client_queued_bytes(
-    buffer_link: usize,
-    queued_link: usize,
-    fin: u32,
-    fout: u32,
+/// The fill keeps the ring `depth` bytes ahead of the furthest point the
+/// engine can have reached: `consumed` is the link clock's play position
+/// and `reported` the controller's own counter, whichever of the two runs
+/// ahead (the counter over-reports on some controllers and QEMU's fetches
+/// far ahead of what it plays; the clock is a floor). It never writes
+/// within `guard` of the play position from behind, i.e. more than
+/// `ring - guard` past `consumed`: that is where the guard's reporting
+/// error lives, and PCM written there overwrites what is still playing.
+/// Whole frames only, and nothing when the fill is already at or past its
+/// target -- or when the lead has eaten the whole window, which a ring
+/// sized for it (see [`RING_PAGES`]) does not let happen.
+fn fill_span(
+    fill_pos: u64,
+    consumed: u64,
+    reported: u64,
+    ring: usize,
+    guard: usize,
+    depth: usize,
     frame: usize,
 ) -> usize {
-    client_counts(buffer_link, queued_link, Some((fin, fout)), frame).1
-}
-
-/// Whether a `set_params` may keep the engine running (a soft prepare, see
-/// [`HdaInner::soft_prepare`]) rather than stop and wipe the stream. Only
-/// with the engine actually running on a descriptor that is still
-/// programmed, not paused (a paused engine is stopped DMA, and restarting
-/// it is the hard path's job), and the LINK format unchanged -- which, with
-/// the link fixed, is every call after the first.
-/// The ring's capacity as a client at `client_rate` counts it: identical
-/// to the link's when the client is at [`LINK_RATE`], scaled down (or up)
-/// by the rate ratio otherwise. `set_params` clamps the rate the same way,
-/// so this is exactly what `buffer_bytes` reports after that rate is set,
-/// and a front end can size a buffer for a rate before applying it.
-fn client_buffer_bytes(link_buffer: usize, client_rate: u32, frame: usize) -> usize {
-    let client_rate = client_rate.clamp(CLIENT_RATE_MIN, CLIENT_RATE_MAX);
-    if client_rate == LINK_RATE {
-        link_buffer
-    } else {
-        link_to_client_bytes(link_buffer, client_rate, LINK_RATE, frame)
+    if frame == 0 {
+        return 0;
     }
+    let ahead = consumed.max(reported).saturating_add(depth as u64);
+    let window = consumed.saturating_add(ring.saturating_sub(guard) as u64);
+    let target = ahead.min(window);
+    (target.saturating_sub(fill_pos) as usize) / frame * frame
 }
 
-fn prepare_keeps_engine(
-    running: bool,
-    paused: bool,
-    needs_reprogram: bool,
-    link_unchanged: bool,
-) -> bool {
-    running && !paused && !needs_reprogram && link_unchanged
+/// One block of the mixer (SOF `mixer`, `mix_n_s16`): pull `out.len()`
+/// link bytes from every stream in `streams` into the `i32` accumulator
+/// `acc`, saturate once into `out`. A stream with less than the block
+/// queued, or one that is not active, contributes silence past what it
+/// gives (the pull answers 0 for it). `pull` is scratch of at least
+/// `out.len()` bytes and `acc` of at least half that many entries; both
+/// are the caller's so the fill allocates nothing. Returns how many
+/// streams contributed anything -- zero is a gap.
+fn mix_streams(
+    streams: &mut [(u32, HostStream)],
+    acc: &mut [i32],
+    pull: &mut [u8],
+    out: &mut [u8],
+) -> usize {
+    let span = out.len().min(pull.len());
+    let samples = (span / 2).min(acc.len());
+    // `acc` is clear on entry: it starts zeroed and `drain_to_s16` leaves
+    // it zeroed, so no block carries a sum into the next.
+    let acc = &mut acc[..samples];
+    let mut contributors = 0;
+    for (_, stream) in streams.iter_mut() {
+        let n = stream.pull(&mut pull[..span]);
+        if n > 0 {
+            accumulate_s16(acc, &pull[..n]);
+            contributors += 1;
+        }
+    }
+    drain_to_s16(acc, out);
+    contributors
 }
 
 // ── MMIO helpers ────────────────────────────────────────────────────────────
@@ -648,26 +503,7 @@ struct HdaInner {
 
     // Software state.
     running: bool,
-    /// Software pause: DMA stopped but the ring still holds queued PCM.
-    paused: bool,
-    /// Start hold (`AudioScheme::set_start_hold`): writes queue into the
-    /// ring but the engine is not started until the hold is released.
-    hold_start: bool,
-    /// The stream descriptor was force-reset (`SRST`) because the engine
-    /// would not acknowledge a cleared `RUN`, so its programming -- BDL
-    /// address, cyclic length, format and above all the stream tag -- is
-    /// gone. Setting `RUN` again on that descriptor starts a stream tagged 0,
-    /// which no converter is listening on: the writer keeps being served, the
-    /// ring never drains, and the client hears nothing until it gives up with
-    /// an underrun. Anything that resumes has to reprogram first.
-    needs_reprogram: bool,
-    /// Next byte to write, offset into the ring.
-    wp: usize,
-    /// Bytes written and not yet played. Derived from the hardware play
-    /// position on every poll (see [`HdaInner::queued_at`]), never accumulated.
-    queued: usize,
-    /// LPIB at the last progress poll. Only underrun detection reads it: it is
-    /// the one question that needs a delta rather than a position.
+    /// LPIB at the last progress poll, for the delta the next one accepts.
     last_lpib: u32,
     /// `timer_now_as_micros()` at the last poll that actually read LPIB.
     /// Throttles that read to [`LPIB_POLL_MIN_US`].
@@ -680,8 +516,16 @@ struct HdaInner {
     /// maintaining it, and it must not be allowed to stall playback.
     last_dpib: u32,
     dpib_trusted: bool,
-    /// Ring offset up to which the silence ahead of `wp` has been written.
-    zero_ptr: usize,
+    /// Bytes since RUN the ring is filled up to: mixed PCM, or zeros during
+    /// a gap. The mixer writes here and only here; see [`fill_span`].
+    fill_pos: u64,
+    /// Bytes since RUN up to which the ring is known to be zero past
+    /// `fill_pos` (the [`SILENCE_AHEAD`] band), so the band is rewritten
+    /// incrementally rather than per fill.
+    zero_end: u64,
+    /// Bytes of mixed PCM (a fill with at least one contributing stream)
+    /// written to the ring since RUN, for the gap record.
+    mixed_bytes: usize,
     /// Bytes the link has taken from the ring since RUN: the smaller of what
     /// its own clock says and what the controller's position reports. This is
     /// the play position everything else is derived from.
@@ -704,25 +548,24 @@ struct HdaInner {
     /// Counters behind the `/proc/gpusnd` "events" line. A tone that plays
     /// with short repeated dropouts sounds the same whatever produced it;
     /// these say which of them actually happened on this machine.
-    /// `drains` and `underruns` both open a gap (the ring ran out of client
-    /// PCM with the engine running): a drain is the engine reaching the end
-    /// of what was written, an underrun the engine having already been past
-    /// it when the shortfall was noticed. `idle_stops` is a gap lasting
-    /// [`DAI_IDLE_STOP_US`] and the engine being stopped for it, `restarts`
-    /// the full stream reset (codec verbs and all) on the next write after
-    /// any stop, and `stop_timeouts` the engine not acknowledging a cleared
-    /// RUN bit -- the case where wiping the ring would race a still-fetching
-    /// DMA.
+    /// `drains` and `underruns` both open a gap (a fill with no stream to
+    /// mix): an underrun is a started stream found empty -- the client
+    /// fell behind -- and a drain is no stream being started at all.
+    /// `idle_stops` is a gap lasting [`DAI_IDLE_STOP_US`] and the engine
+    /// being stopped for it, `restarts` the full stream reset (codec verbs
+    /// and all) on the next start, and `stop_timeouts` the engine not
+    /// acknowledging a cleared RUN bit -- the case where wiping the ring
+    /// would race a still-fetching DMA.
     stat_drains: u64,
     stat_underruns: u64,
     stat_idle_stops: u64,
     stat_restarts: u64,
-    /// Prepares (a `set_params`, i.e. a client rate change or a re-prepare)
-    /// served with the engine kept running: the queued PCM dropped and a
-    /// gap opened, as a drain does, instead of a stop and a full restart.
-    /// See [`HdaInner::soft_prepare`]. With this at work a rate switch adds
-    /// nothing to `restarts`.
-    stat_soft_prepares: u64,
+    /// Fills that found the engine already past the fill point: the fill
+    /// loop was held up for longer than [`FILL_DEPTH`] plus the silence
+    /// band, and the engine played a lap-old ring for the difference. The
+    /// fill skips to the engine, so a stall delays the streams' PCM rather
+    /// than dropping it.
+    stat_late_fills: u64,
     stat_stop_timeouts: u64,
     /// Position-register reads (WALCLK + LPIB per poll) timed: how many, the
     /// slowest, and how many took over 1 ms. Under a hypervisor each read is
@@ -773,10 +616,8 @@ struct HdaInner {
 
     /// `WALCLK` when the current stream started.
     stream_start_wall: u32,
-    /// When the current stream started and how much has been written to it,
-    /// so a stop can be placed within the stream it ended.
+    /// When the current stream started, so a gap can be placed within it.
     stream_start_us: u64,
-    stream_written: usize,
     /// The last few stops, newest last: WHEN in the stream and after how
     /// much data, which is what tells a stop mid-tone from the tone ending.
     stops: [StopEvent; STOP_HISTORY],
@@ -784,21 +625,14 @@ struct HdaInner {
     rate: u32,
     channels: u8,
 
-    /// `timer_now_as_micros()` when the ring last ran out of client PCM
-    /// with the engine left running (a gap), or 0 while it holds some. The
-    /// engine plays silence for the gap's duration and is stopped after
+    /// `timer_now_as_micros()` when the mix last ran out of client PCM
+    /// (a fill with no contributing stream: a gap), or 0 while it has some.
+    /// The engine plays silence for the gap's duration and is stopped after
     /// [`DAI_IDLE_STOP_US`] of it.
     gap_since_us: u64,
-    /// Stream position (bytes since RUN) where the silence pad parked ahead
-    /// of the playhead during a gap ends, or 0. Ring bytes below it are
-    /// zeros the driver put there, not client PCM: [`HdaInner::exposed_queued`]
-    /// leaves them out so a client's hardware pointer only ever moves
-    /// through bytes the client wrote, while [`AudioScheme::delay_bytes`]
-    /// counts them, since they do play before the next write does.
-    pad_end: u64,
 
-    /// Software playback gain (HDMI has no analog volume), applied while
-    /// copying S16LE into the ring so OSS and ALSA share one control. The
+    /// Software playback gain (HDMI has no analog volume), applied to the
+    /// mix on its way into the ring so OSS and ALSA share one control. The
     /// percent/mute pair is what the mixer control reads back; `vol` is the
     /// ramped Q8.16 gain the copy actually applies (see
     /// `crate::audio::pipeline::volume`), so a slider notch or a mute is a
@@ -809,19 +643,18 @@ struct HdaInner {
     mute_r: bool,
     vol: Volume,
 
-    /// The rate the client negotiated (what [`AudioScheme::params`] reports
-    /// and what its byte counts are in). The ring itself is always at
-    /// [`LINK_RATE`]; see the fixed-rate sink notes above `LINK_RATE`.
-    client_rate: u32,
-    /// The converter from `client_rate` into the ring, or `None` when the
-    /// client is at `LINK_RATE` and the write is a plain copy.
-    src: Option<Resampler>,
-    /// Scratch for one resampled write: the client frames taken, the link
-    /// frames they became, and those as the bytes the ring copy reads. Kept
-    /// across writes so the hot path does not allocate.
-    src_in: Vec<i16>,
-    src_out: Vec<i16>,
-    src_bytes: Vec<u8>,
+    /// The host side of the pipeline: one [`HostStream`] per open, by id.
+    /// Every client writes into its own; the fill loop pulls from all of
+    /// them and mixes. The device's own trait implementation is stream 0,
+    /// which lives as long as the device.
+    streams: Vec<(u32, HostStream)>,
+    next_stream: u32,
+    /// Scratch for one fill: the `i32` mix accumulator, the saturated mix
+    /// block, and one stream's pull. Sized once for [`FILL_MAX`], so the
+    /// fill allocates nothing.
+    mix_acc: Vec<i32>,
+    mix_buf: Vec<u8>,
+    pull_buf: Vec<u8>,
 }
 
 pub struct HdaDevice {
@@ -829,7 +662,33 @@ pub struct HdaDevice {
     /// PCI vendor is NVIDIA: this HDA function lives on a GPU, so its audio
     /// only reaches the cable when the display engine transmits it.
     is_nvidia: bool,
-    inner: Mutex<HdaInner>,
+    inner: Arc<Mutex<HdaInner>>,
+    /// The device's own stream, for callers that use the device as a
+    /// [`AudioScheme`] directly rather than through
+    /// [`open_stream`](AudioScheme::open_stream).
+    own: HdaStream,
+}
+
+/// One client's handle on an [`HdaDevice`]: a [`HostStream`] in the
+/// device's table, mixed with every other open's. Dropping it removes the
+/// stream; the engine notices on its next fill.
+pub struct HdaStream {
+    inner: Arc<Mutex<HdaInner>>,
+    id: u32,
+    name: String,
+}
+
+impl Drop for HdaStream {
+    fn drop(&mut self) {
+        // Take the stream out under the lock, free it after: the lock is
+        // IRQ-off and the stream owns a buffer.
+        let removed = {
+            let mut inner = self.inner.lock();
+            let at = inner.streams.iter().position(|(id, _)| *id == self.id);
+            at.map(|i| inner.streams.swap_remove(i))
+        };
+        drop(removed);
+    }
 }
 
 impl HdaInner {
@@ -994,29 +853,23 @@ impl HdaInner {
         Some(unsafe { core::ptr::read_volatile(self.dma_pos_va as *const u32) })
     }
 
-    /// Keep [`SILENCE_AHEAD`] bytes of zeros immediately after the write
-    /// pointer. Incremental: only the bytes newly exposed since the last call
-    /// are written, so the cost is one extra store per byte of audio.
-    ///
-    /// The zone is the start of the free region, i.e. the oldest played data;
-    /// it ends at least `RING_GUARD - SILENCE_AHEAD` short of the estimated
-    /// play position, so a small error in that estimate cannot silence audio
-    /// still to be played -- which is what #1096 removed and this must not
-    /// bring back.
-    fn silence_ahead(&mut self) {
-        let ring = self.ring_len;
-        let have = (self.zero_ptr + ring - self.wp) % ring;
-        let (start, len) = if have == SILENCE_AHEAD {
-            return;
-        } else if have < SILENCE_AHEAD {
-            (self.zero_ptr, SILENCE_AHEAD - have)
-        } else {
-            // The writer overtook the zone (a write longer than it): restart
-            // from the write pointer. Never touch anything before it.
-            (self.wp, SILENCE_AHEAD)
-        };
-        self.zero_range(start, len);
-        self.zero_ptr = (self.wp + SILENCE_AHEAD) % ring;
+    /// Keep [`SILENCE_AHEAD`] bytes of zeros immediately after the fill
+    /// point, clipped to the write window (never into the guard behind the
+    /// play position). Incremental: `zero_end` remembers how far the band
+    /// already reaches, so only the bytes a fill newly exposed are written.
+    fn keep_silence_ahead(&mut self) {
+        let ring = self.ring_len as u64;
+        let window = self.consumed + ring.saturating_sub(RING_GUARD as u64);
+        let want = (self.fill_pos + SILENCE_AHEAD as u64).min(window);
+        if self.zero_end < self.fill_pos {
+            self.zero_end = self.fill_pos;
+        }
+        if want > self.zero_end {
+            let len = (want - self.zero_end) as usize;
+            let start = (self.zero_end % ring) as usize;
+            self.zero_range(start, len);
+            self.zero_end = want;
+        }
     }
 
     /// Milliseconds since the stream started by the controller's own clock.
@@ -1031,7 +884,7 @@ impl HdaInner {
             kind,
             at_ms: timer_now_as_micros().wrapping_sub(self.stream_start_us) / 1000,
             wall_ms: self.stream_wall_ms(),
-            written: self.stream_written,
+            written: self.mixed_bytes,
         };
     }
 
@@ -1053,9 +906,11 @@ impl HdaInner {
         }
     }
 
-    /// Fold DMA progress since the last poll into `queued`, and when the
-    /// ring has run out of client PCM keep the engine fed with silence (see
-    /// [`HdaInner::run_gap`]).
+    /// Fold DMA progress since the last poll into the play position, then
+    /// run the DAI side: fill the ring ahead of the engine with the mix of
+    /// every stream (see [`HdaInner::fill_ring`]). Called from every front
+    /// end call and from the ALSA watchdog every 4 ms while the engine
+    /// runs, which is what paces the fill.
     fn poll_progress(&mut self) {
         if !self.running {
             return;
@@ -1166,111 +1021,189 @@ impl HdaInner {
 
         // Consumed is the smaller of the two, and never goes backwards.
         self.consumed = self.consumed.max(by_clock.min(reported));
-        let written = self.stream_written as u64;
-        let queued = written.saturating_sub(self.consumed) as usize;
-        // Never more than the writer is allowed to have in flight, so a
-        // garbage value cannot underflow `free_bytes`.
-        self.queued = queued.min(ring - RING_GUARD);
-        if self.queued == 0 || self.gap_since_us != 0 {
-            self.run_gap(now_us, reported);
-        }
+        self.fill_ring(now_us, reported);
     }
 
-    /// The ring holds no client PCM (or the gap that started when it ran
-    /// out is still open). This is where the driver used to stop the
-    /// engine; it now does what SOF's DAI does -- keeps it running and gives
-    /// it silence -- and stops only after [`DAI_IDLE_STOP_US`] of that.
-    ///
-    /// Each poll re-parks the write pointer just past the engine
-    /// ([`park_target`]), over zeros, and books the stretch between the
-    /// playhead and that point as a pad (`pad_end`) so the next write lands
-    /// where the engine has not been and the client's queue count stays
-    /// honest. The whole ring is zeroed once, when the gap opens: at that
-    /// moment everything in it has been played.
-    fn run_gap(&mut self, now_us: u64, reported: u64) {
-        if self.gap_since_us == 0 {
-            // The link has played everything written. If the engine's own
-            // position also passed the tail, it got there before the writer
-            // did: that is the underrun; otherwise the stream simply ended.
-            if reported > self.stream_written as u64 {
-                self.stat_underruns += 1;
-                self.record_stop(b'U');
-            } else {
-                self.stat_drains += 1;
-                self.record_stop(b'D');
-            }
-            self.gap_since_us = now_us;
-            self.silence_ring();
-        } else if now_us.wrapping_sub(self.gap_since_us) >= DAI_IDLE_STOP_US {
-            self.stat_idle_stops += 1;
-            if self.stop_stream() {
-                self.silence_ring();
-            }
-            self.gap_since_us = 0;
-            self.pad_end = 0;
-            self.queued = 0;
-            self.wp = 0;
-            self.zero_ptr = 0;
-            self.last_lpib = 0;
-            return;
+    /// The DAI side of the pipeline (SOF's `dai` component, fed by its
+    /// mixer): keep the ring [`FILL_DEPTH`] ahead of the engine with the
+    /// mix of every active stream, zeros where none has PCM. A fill that
+    /// mixes nothing opens a gap; the engine keeps running over silence
+    /// through it, as SOF's DAI does, and is stopped after
+    /// [`DAI_IDLE_STOP_US`] of it. `reported` is the controller's own
+    /// position, for [`fill_span`].
+    fn fill_ring(&mut self, now_us: u64, reported: u64) {
+        let frame = self.frame_bytes() as u64;
+        let reach = self.consumed.max(reported) / frame * frame;
+        if self.fill_pos < reach {
+            // The engine got past the fill: what it played from there was
+            // the silence band and then a lap-old ring. Skip to it; the
+            // streams' PCM is late, not lost.
+            self.stat_late_fills += 1;
+            self.fill_pos = reach;
         }
-        self.park_write_pointer();
-    }
-
-    /// Re-park the write pointer just past the engine over a zeroed ring,
-    /// booking the stretch from the playhead to there as the silence pad.
-    /// The tail of [`run_gap`](HdaInner::run_gap), on its own so a
-    /// [`soft_prepare`](HdaInner::soft_prepare) can do the same thing.
-    fn park_write_pointer(&mut self) {
-        let ring = self.ring_len;
-        let park = park_target(
+        let span = fill_span(
+            self.fill_pos,
             self.consumed,
-            self.lpib_total,
-            self.dpib_total,
-            PARK_MARGIN as u64,
+            reported,
+            self.ring_len,
+            RING_GUARD,
+            FILL_DEPTH,
+            frame as usize,
+        )
+        .min(FILL_MAX);
+        if span > 0 {
+            let contributors = self.mix_block(span);
+            if contributors == 0 {
+                if self.gap_since_us == 0 {
+                    let starved = self.streams.iter().any(|(_, s)| s.is_active());
+                    if starved {
+                        self.stat_underruns += 1;
+                        self.record_stop(b'U');
+                    } else {
+                        self.stat_drains += 1;
+                        self.record_stop(b'D');
+                    }
+                    self.gap_since_us = now_us;
+                }
+            } else {
+                self.gap_since_us = 0;
+                self.mixed_bytes += span;
+            }
+            let block = core::mem::take(&mut self.mix_buf);
+            self.copy_to_ring(self.fill_pos, &block[..span]);
+            self.mix_buf = block;
+            self.fill_pos += span as u64;
+        }
+        self.keep_silence_ahead();
+        if self.gap_since_us != 0 && now_us.wrapping_sub(self.gap_since_us) >= DAI_IDLE_STOP_US {
+            self.stat_idle_stops += 1;
+            self.stop_engine();
+        }
+    }
+
+    /// Mix the next `span` link bytes of every active stream into
+    /// `mix_buf[..span]`; see [`mix_streams`].
+    fn mix_block(&mut self, span: usize) -> usize {
+        let mut acc = core::mem::take(&mut self.mix_acc);
+        let mut pull = core::mem::take(&mut self.pull_buf);
+        let n = mix_streams(
+            &mut self.streams,
+            &mut acc,
+            &mut pull,
+            &mut self.mix_buf[..span],
         );
-        self.wp = (park % ring as u64) as usize;
-        // The ring is all zeros: the silence band ahead of `wp` is already
-        // there, so tell `silence_ahead` so it does not rewrite it per poll.
-        self.zero_ptr = (self.wp + SILENCE_AHEAD) % ring;
-        self.stream_written = park as usize;
-        self.pad_end = park;
-        self.queued = ((park - self.consumed) as usize).min(ring - RING_GUARD);
+        self.mix_acc = acc;
+        self.pull_buf = pull;
+        n
     }
 
-    /// A prepare that keeps the engine running.
-    ///
-    /// `set_params` is ALSA's prepare: drop whatever is queued and start the
-    /// stream over. It used to do that by stopping the engine and wiping
-    /// the ring, and the next write then restarted everything -- codec
-    /// verbs, pin sense, the HDMI kick -- which on an HDMI/DP sink is a
-    /// re-lock and a mute of a few hundred milliseconds. With the link
-    /// fixed at [`LINK_RATE`] a client rate change never alters the stream
-    /// format, so there is nothing to reprogram: the queued PCM is dropped
-    /// and the engine is left running into a gap, exactly the state a drain
-    /// leaves it in. Both steps are the ones every natural drain already
-    /// takes (`run_gap` zeroes the whole ring with the engine running and
-    /// then re-parks the writer); the only difference is that here the
-    /// zeroed bytes had not all been played yet -- that is the point, they
-    /// are being discarded -- and the engine hears at most a fetch's worth
-    /// of the old stream before the zeros land, then silence until the new
-    /// stream's first write parks past it.
-    ///
-    /// Only called when [`prepare_keeps_engine`] says so; the caller has
-    /// polled progress first so `consumed` and the position counters are
-    /// fresh for the park.
-    fn soft_prepare(&mut self, now_us: u64) {
-        self.stat_soft_prepares += 1;
-        self.record_stop(b'P');
-        self.paused = false;
-        self.gap_since_us = now_us;
+    /// Copy a mixed block into the ring at stream position `pos`, through
+    /// the master gain, wrapping at the end of the ring and flushing every
+    /// line written (the engine's DMA does not snoop).
+    fn copy_to_ring(&mut self, pos: u64, block: &[u8]) {
+        let ring = self.ring_len;
+        let mut p = (pos % ring as u64) as usize;
+        let mut done = 0;
+        while done < block.len() {
+            let chunk = (block.len() - done).min(ring - p);
+            let dst = self.ring_va + p;
+            self.copy_pcm_scaled(&block[done..done + chunk], dst, chunk);
+            clflush_range(dst, chunk);
+            p = (p + chunk) % ring;
+            done += chunk;
+        }
+    }
+
+    /// Start the engine if it is stopped and some stream has PCM to play.
+    /// Every path that can give a stopped engine something to do -- a
+    /// write, a resume, a start hold released -- ends here.
+    fn ensure_engine(&mut self) -> DeviceResult {
+        if self.running {
+            return Ok(());
+        }
+        if !self
+            .streams
+            .iter()
+            .any(|(_, s)| s.is_active() && s.queued_link() > 0)
+        {
+            return Ok(());
+        }
+        self.start_engine()
+    }
+
+    /// Bring the DAI up: re-pick the output path (on NVIDIA GPUs the ELD
+    /// lands long after PCI probe), zero the ring, prime [`FILL_DEPTH`] of
+    /// mix at offset 0, and set RUN.
+    fn start_engine(&mut self) -> DeviceResult {
+        warn!(
+            "[hda] engine start: {} stream(s), repick + stream reset next",
+            self.streams.len()
+        );
+        self.repick_path();
+        // Positions first, then the wipe: `silence_ring` books the zeros
+        // relative to `fill_pos`.
+        self.fill_pos = 0;
         self.silence_ring();
-        self.park_write_pointer();
+        self.mixed_bytes = 0;
+        self.gap_since_us = 0;
+        self.consumed = 0;
+        self.lpib_total = 0;
+        self.dpib_total = 0;
+        if self.digital {
+            let ch = self.channels;
+            self.send_audio_infoframe(ch);
+        }
+        let now = timer_now_as_micros();
+        self.fill_ring(now, 0);
+        self.start_stream()?;
+        warn!(
+            "[hda] engine started: {} B primed, CTL {:#x}",
+            self.fill_pos,
+            mmio_r32(self.bar, self.sd_base + SD_CTL)
+        );
+        Ok(())
     }
 
-    /// Client PCM queued: the ring occupancy less the silence pad.
-    fn exposed_queued(&self) -> usize {
-        exposed_queued(self.queued, self.pad_end, self.consumed)
+    /// Stop the engine and forget the ring's positions. The streams keep
+    /// theirs: whatever they hold plays when the engine next starts.
+    fn stop_engine(&mut self) {
+        if self.stop_stream() {
+            self.silence_ring();
+        }
+        self.gap_since_us = 0;
+        self.fill_pos = 0;
+        self.zero_end = 0;
+        self.last_lpib = 0;
+    }
+
+    /// Add `stream` to the mix and return its id. The stream is built by
+    /// the caller ([`HdaInner::new_stream`]), outside the lock: it owns a
+    /// buffer, and the lock is IRQ-off.
+    fn add_stream(&mut self, stream: HostStream) -> u32 {
+        let id = self.next_stream;
+        self.next_stream += 1;
+        self.streams.push((id, stream));
+        id
+    }
+
+    fn new_stream() -> HostStream {
+        HostStream::new(HOST_BUFFER, 2)
+    }
+
+    fn stream_mut(&mut self, id: u32) -> Option<&mut HostStream> {
+        self.streams
+            .iter_mut()
+            .find(|(i, _)| *i == id)
+            .map(|(_, s)| s)
+    }
+
+    /// Link bytes between the play position and the fill point: what the
+    /// ring still has to play before a stream's next pull is heard.
+    fn ring_ahead(&self) -> usize {
+        if !self.running {
+            return 0;
+        }
+        self.fill_pos.saturating_sub(self.consumed) as usize
     }
 
     /// Copy `src` into the ring at `dst` (virtual address), applying the
@@ -1289,79 +1222,6 @@ impl HdaInner {
         // this device for its lifetime and only ever written under its lock.
         let out = unsafe { core::slice::from_raw_parts_mut(dst as *mut u8, len) };
         self.vol.process(&src[..len], out);
-    }
-
-    fn free_bytes(&self) -> usize {
-        free_bytes_of(self.ring_len, RING_GUARD, self.queued)
-    }
-
-    /// `(client_rate, LINK_RATE)` when a converter is in the path.
-    fn src_rates(&self) -> Option<(u32, u32)> {
-        self.src.as_ref().map(|s| s.rates())
-    }
-
-    /// Ring bytes as the client counts them (identity without a converter).
-    fn to_client_bytes(&self, link_bytes: usize) -> usize {
-        match self.src_rates() {
-            Some((fin, fout)) => link_to_client_bytes(link_bytes, fin, fout, self.frame_bytes()),
-            None => link_bytes,
-        }
-    }
-
-    /// A client's byte count as ring bytes (identity without a converter).
-    fn to_link_bytes(&self, client_bytes: usize) -> usize {
-        match self.src_rates() {
-            Some((fin, fout)) => client_to_link_bytes(client_bytes, fin, fout, self.frame_bytes()),
-            None => client_bytes,
-        }
-    }
-
-    /// `(free, queued)` as the front ends see them, from the ONE figure
-    /// both derive from: the ring's whole occupancy, pad included (see
-    /// [`client_counts`]).
-    fn client_counts(&self) -> (usize, usize) {
-        client_counts(
-            self.ring_len - RING_GUARD,
-            self.queued,
-            self.src_rates(),
-            self.frame_bytes(),
-        )
-    }
-
-    /// Client bytes a write may take right now. This is what `free_bytes`
-    /// reports to the front ends and exactly what `write` accepts, so the
-    /// two never disagree (see [`accept_client_frames`]).
-    fn client_free_bytes(&self) -> usize {
-        self.client_counts().0
-    }
-
-    /// Client bytes queued as the front ends see them: `buffer - free`, so
-    /// `avail` agrees with what `write` accepts. The silence pad is in it
-    /// (see [`client_counts`] for why); [`exposed_queued`] is what a
-    /// rewind may take back.
-    ///
-    /// [`exposed_queued`]: HdaInner::exposed_queued
-    fn client_queued_bytes(&self) -> usize {
-        self.client_counts().1
-    }
-
-    /// Convert `client_frames` whole frames of client S16LE `pcm` through the
-    /// resampler into `self.src_bytes` (ring-rate S16LE). Returns the link
-    /// byte count. Only called with a converter present.
-    fn resample_client(&mut self, pcm: &[u8], client_frames: usize) -> usize {
-        let frame = self.frame_bytes();
-        let (samples, _) = pcm[..client_frames * frame].as_chunks::<2>();
-        self.src_in.clear();
-        self.src_in
-            .extend(samples.iter().map(|s| i16::from_le_bytes(*s)));
-        self.src_out.clear();
-        if let Some(src) = self.src.as_mut() {
-            src.process(&self.src_in, &mut self.src_out);
-        }
-        self.src_bytes.clear();
-        self.src_bytes
-            .extend(self.src_out.iter().flat_map(|s| s.to_le_bytes()));
-        self.src_bytes.len()
     }
 
     /// Clear RUN and wait for the engine to acknowledge it. Returns whether it
@@ -1395,9 +1255,8 @@ impl HdaInner {
                 core::hint::spin_loop();
             }
             mmio_w32(self.bar, self.sd_base + SD_CTL, 0);
-            // SRST clears the descriptor, tag included: it cannot simply be
-            // restarted. See [`HdaInner::needs_reprogram`].
-            self.needs_reprogram = true;
+            // SRST clears the descriptor, tag included. Every start goes
+            // through the full programming path, so nothing else to do.
         }
         self.running = false;
         stopped
@@ -1406,7 +1265,8 @@ impl HdaInner {
     fn silence_ring(&mut self) {
         unsafe { core::ptr::write_bytes(self.ring_va as *mut u8, 0, self.ring_len) };
         clflush_range(self.ring_va, self.ring_len);
-        self.zero_ptr = 0;
+        // Every position up to a full lap past the fill point is zero now.
+        self.zero_end = self.fill_pos + self.ring_len as u64;
     }
 
     fn zero_range(&mut self, start: usize, len: usize) {
@@ -1426,118 +1286,6 @@ impl HdaInner {
 
     fn frame_bytes(&self) -> usize {
         (self.channels as usize).max(1) * 2
-    }
-
-    /// Drop the most recently queued `bytes` (whole frames, ≤ queued) and
-    /// silence that tail so a looping DMA cannot replay it.
-    fn rewind_bytes(&mut self, bytes: usize) -> usize {
-        self.poll_progress();
-        let n = honourable_bytes(bytes, self.exposed_queued(), self.frame_bytes());
-        if n == 0 {
-            return 0;
-        }
-        self.wp = (self.wp + self.ring_len - n) % self.ring_len;
-        self.queued -= n;
-        // The bytes are un-written as far as the play position is concerned.
-        self.stream_written = self.stream_written.saturating_sub(n);
-        self.zero_range(self.wp, n);
-        self.zero_ptr = self.wp;
-        self.silence_ahead();
-        // A running engine that now has nothing left is a gap, handled by
-        // the next poll; only a stopped one is reset here.
-        if self.queued == 0 && !self.running {
-            let stopped = self.stop_stream();
-            self.paused = false;
-            if stopped {
-                self.silence_ring();
-            }
-            self.wp = 0;
-            self.zero_ptr = 0;
-            self.last_lpib = 0;
-        }
-        n
-    }
-
-    /// Skip the next `bytes` of unplayed PCM (silence from the playhead).
-    fn forward_bytes(&mut self, bytes: usize) -> usize {
-        self.poll_progress();
-        let n = honourable_bytes(bytes, self.exposed_queued(), self.frame_bytes());
-        if n == 0 {
-            return 0;
-        }
-        let start = if self.running {
-            self.lpib() as usize % self.ring_len
-        } else {
-            (self.wp + self.ring_len - self.queued) % self.ring_len
-        };
-        // The skipped bytes still occupy the ring and still take their time
-        // to play (as silence); the queue depth is what the link clock says
-        // it is, so it is not adjusted here.
-        self.zero_range(start, n);
-        if self.queued == 0 && !self.running {
-            let stopped = self.stop_stream();
-            self.paused = false;
-            if stopped {
-                self.silence_ring();
-            }
-            self.wp = 0;
-            self.zero_ptr = 0;
-            self.last_lpib = 0;
-        }
-        n
-    }
-
-    /// Stop DMA but keep the ring so resume continues from the same LPIB.
-    fn pause_stream(&mut self) {
-        self.poll_progress();
-        if !self.running {
-            // Nothing is fetching: a stopped stream, or one primed under a
-            // start hold whose descriptor has never been programmed. Marking
-            // that "paused" would make the hold's release skip the start
-            // and the resume set RUN on a descriptor with no stream tag.
-            return;
-        }
-        self.stop_stream();
-        self.paused = true;
-    }
-
-    /// Set RUN without resetting the stream descriptor (LPIB stays put).
-    fn resume_stream(&mut self) -> DeviceResult {
-        self.paused = false;
-        if self.running || self.queued == 0 || self.hold_start {
-            // A held ring starts when the hold is released, through the
-            // full programming path; RUN alone would start stream 0.
-            return Ok(());
-        }
-        if self.needs_reprogram {
-            // The descriptor was wiped by a forced reset while this PCM was
-            // stopped, so the queued bytes have nothing to play them: their
-            // ring offsets no longer mean anything to an engine that will
-            // restart at 0. Drop them and go back to the stopped state the
-            // write path knows how to start from -- the client hears the gap,
-            // which is what actually happened, instead of an indefinite
-            // silence that ends in an underrun.
-            warn!("[hda] resume after a forced stream reset: dropping the queued PCM");
-            self.silence_ring();
-            self.wp = 0;
-            self.zero_ptr = 0;
-            self.queued = 0;
-            self.last_lpib = 0;
-            self.gap_since_us = 0;
-            self.pad_end = 0;
-            return Ok(());
-        }
-        // The link clock kept counting while paused; the stream did not.
-        self.wall_last = mmio_r32(self.bar, REG_WALCLK);
-        self.last_poll_us = timer_now_as_micros();
-        if self.gap_since_us != 0 {
-            // Neither did the idle clock.
-            self.gap_since_us = self.last_poll_us;
-        }
-        let ctl = mmio_r32(self.bar, self.sd_base + SD_CTL);
-        mmio_w32(self.bar, self.sd_base + SD_CTL, ctl | 0x2);
-        self.running = true;
-        Ok(())
     }
 
     /// Reset + program the stream descriptor and start the DMA engine.
@@ -1599,8 +1347,6 @@ impl HdaInner {
         self.last_dpib = 0;
         self.dpib_trusted = false;
         self.running = true;
-        self.paused = false;
-        self.needs_reprogram = false;
         self.stat_restarts += 1;
         self.stream_start_us = self.last_poll_us;
         self.stream_start_wall = mmio_r32(bar, REG_WALCLK);
@@ -1611,11 +1357,7 @@ impl HdaInner {
         self.consumed = 0;
         self.stat_lead = 0;
         self.lead_now = 0;
-        self.gap_since_us = 0;
-        self.pad_end = 0;
-        // `stream_written` is NOT reset here: the write path zeroes it when
-        // it re-anchors an empty ring, and a ring filled under a start hold
-        // already holds bytes that this start is about to play.
+        // `fill_pos` is not reset here: the ring was primed before RUN.
         Ok(())
     }
 }
@@ -1710,28 +1452,22 @@ mod format_and_ring_tests {
     //! of frames swaps the channels for the rest of the stream, and a
     //! position that runs backwards is what the intermittent dropouts were.
 
-    use super::{
-        accept_client_frames, client_buffer_bytes, client_counts, client_queued_bytes,
-        client_to_link_bytes, exposed_queued, free_bytes_of, honourable_bytes,
-        link_to_client_bytes, nearest_rate, park_target, prepare_keeps_engine, stream_format,
-        sub_nodes, Resampler, CLIENT_RATE_MAX, CLIENT_RATE_MIN, LINK_RATE, SRC_SLACK_FRAMES,
+    use super::{nearest_rate, stream_format, sub_nodes};
+    use crate::audio::pipeline::host::{
+        accept_client_frames, client_buffer_bytes, client_counts, client_to_link_bytes,
+        link_to_client_bytes, CLIENT_RATE_MAX, CLIENT_RATE_MIN, LINK_RATE, SRC_SLACK_FRAMES,
     };
+    use crate::audio::pipeline::src::Resampler;
 
-    /// The one case a prepare keeps the engine running: running, not
-    /// paused, still programmed, same link format. Any other combination
-    /// takes the stop-and-wipe path, so a soft prepare can never be asked
-    /// to re-park an engine that is not actually fetching.
-    #[test]
-    fn a_prepare_keeps_the_engine_only_when_it_is_running_and_the_link_is_unchanged() {
-        assert!(prepare_keeps_engine(true, false, false, true));
-        // Stopped: nothing to keep running.
-        assert!(!prepare_keeps_engine(false, false, false, true));
-        // Paused DMA is stopped DMA; the hard path restarts it.
-        assert!(!prepare_keeps_engine(true, true, false, true));
-        // A descriptor that lost its programming must be set up again.
-        assert!(!prepare_keeps_engine(true, false, true, true));
-        // A link format change is a real reprogram.
-        assert!(!prepare_keeps_engine(true, false, false, false));
+    /// `client_counts(..).1` on its own, for the tests below.
+    fn client_queued_bytes(
+        buffer_link: usize,
+        queued_link: usize,
+        fin: u32,
+        fout: u32,
+        frame: usize,
+    ) -> usize {
+        client_counts(buffer_link, queued_link, Some((fin, fout)), frame).1
     }
 
     /// Rates a desktop actually plays, paired against the fixed link.
@@ -2182,107 +1918,6 @@ mod format_and_ring_tests {
                 rate
             );
         }
-    }
-
-    #[test]
-    fn the_park_target_clears_whichever_counter_reports_furthest() {
-        // Parking behind any of the three counters means writing where the
-        // engine has already been, which it never fetches: silence that never
-        // ends.
-        assert_eq!(park_target(100, 50, 50, 8), 108, "the link clock is ahead");
-        assert_eq!(park_target(50, 100, 50, 8), 108, "LPIB is ahead");
-        assert_eq!(park_target(50, 50, 100, 8), 108, "DPIB is ahead");
-        assert_eq!(park_target(0, 0, 0, 0), 0);
-    }
-
-    #[test]
-    fn the_silence_pad_is_not_counted_as_the_clients_pcm() {
-        // The pad is ring space the driver filled on its own. Counting it as
-        // queued makes the client's own "how much is left to play" answer too
-        // large, and it waits for a drain that already happened.
-        assert_eq!(
-            exposed_queued(1000, 0, 0),
-            1000,
-            "no pad, nothing to take off"
-        );
-        assert_eq!(exposed_queued(1000, 400, 0), 600, "400 bytes of it are pad");
-        assert_eq!(
-            exposed_queued(1000, 400, 400),
-            1000,
-            "a pad the engine has already played is no longer in the ring"
-        );
-        assert_eq!(
-            exposed_queued(100, 1_000_000, 0),
-            0,
-            "a pad larger than the ring cannot make the answer negative"
-        );
-        assert_eq!(
-            exposed_queued(1000, 0, 5000),
-            1000,
-            "consumed past the pad end must not add anything back"
-        );
-        // Note for whoever mutates this: dropping the `.min(queued as u64)`
-        // from `exposed_queued` survives every test here, and it is right
-        // that it does. `saturating_sub` already floors at zero, so on a
-        // 64-bit target the `min` changes nothing. It is load-bearing only
-        // where `usize` is narrower than `u64` and `pad as usize` would
-        // truncate a large pad to a small one -- and then it would
-        // under-subtract instead of saturating. Every target this kernel
-        // builds for is 64-bit, so the mutation is EQUIVALENT here, not a
-        // gap in the tests. Do not go chasing it.
-    }
-
-    #[test]
-    fn the_free_space_never_wraps_past_the_end_of_the_ring() {
-        // The write path copies this many bytes into the ring. An underflow
-        // here is not a panic in release -- it is a free-space figure near
-        // 2^64 and a copy off the end of the ring.
-        assert_eq!(free_bytes_of(65536, 16384, 0), 49152);
-        assert_eq!(free_bytes_of(65536, 16384, 49152), 0, "exactly full");
-        assert_eq!(
-            free_bytes_of(65536, 16384, 49153),
-            0,
-            "one byte over full is zero free, not 2^64 - 1"
-        );
-        assert_eq!(free_bytes_of(65536, 16384, usize::MAX), 0);
-        // And a ring smaller than its own guard, which is what an
-        // uninitialised `ring_len` of 0 looks like.
-        assert_eq!(free_bytes_of(0, 16384, 0), 0);
-        assert_eq!(free_bytes_of(1024, 16384, 0), 0);
-    }
-
-    #[test]
-    fn a_rewind_is_rounded_down_to_whole_frames() {
-        // Not cosmetic: `wp` moves by this number and a half-frame offset
-        // swaps left and right for the rest of the stream.
-        assert_eq!(honourable_bytes(100, 1000, 4), 100);
-        assert_eq!(honourable_bytes(101, 1000, 4), 100);
-        assert_eq!(honourable_bytes(103, 1000, 4), 100);
-        assert_eq!(
-            honourable_bytes(3, 1000, 4),
-            0,
-            "less than a frame is nothing"
-        );
-    }
-
-    #[test]
-    fn a_rewind_never_exceeds_what_the_client_still_has_queued() {
-        assert_eq!(honourable_bytes(10_000, 400, 4), 400);
-        assert_eq!(
-            honourable_bytes(10_000, 402, 4),
-            400,
-            "and still whole frames"
-        );
-        assert_eq!(honourable_bytes(10_000, 0, 4), 0);
-        assert_eq!(honourable_bytes(usize::MAX, 1024, 4), 1024);
-    }
-
-    #[test]
-    fn a_zero_frame_size_asks_for_nothing_instead_of_dividing_by_zero() {
-        // `frame_bytes()` is `channels.max(1) * 2`, so it cannot be zero
-        // today; the guard is here because the bare `/ frame` this replaced
-        // would be a divide-by-zero panic in the kernel if it ever were.
-        assert_eq!(honourable_bytes(1000, 1000, 0), 0);
     }
 
     #[test]
@@ -2906,16 +2541,14 @@ impl HdaDevice {
             ring_len,
             bdl_pa,
             running: false,
-            paused: false,
-            needs_reprogram: false,
-            wp: 0,
-            queued: 0,
             last_lpib: 0,
             last_poll_us: 0,
             dma_pos_va,
             last_dpib: 0,
             dpib_trusted: false,
-            zero_ptr: 0,
+            fill_pos: 0,
+            zero_end: 0,
+            mixed_bytes: 0,
             consumed: 0,
             wall_last: 0,
             wall_ticks: 0,
@@ -2927,7 +2560,7 @@ impl HdaDevice {
             stat_underruns: 0,
             stat_idle_stops: 0,
             stat_restarts: 0,
-            stat_soft_prepares: 0,
+            stat_late_fills: 0,
             stat_stop_timeouts: 0,
             stat_pos_reads: 0,
             stat_pos_read_max_us: 0,
@@ -2946,23 +2579,20 @@ impl HdaDevice {
             last_kick_us: 0,
             stream_start_wall: 0,
             stream_start_us: 0,
-            stream_written: 0,
-            hold_start: false,
             stops: [StopEvent::default(); STOP_HISTORY],
-            rate: 48000,
+            rate: LINK_RATE,
             channels: 2,
             gap_since_us: 0,
-            pad_end: 0,
             gain_l: 100,
             gain_r: 100,
             mute_l: false,
             mute_r: false,
-            vol: Volume::new(48000, 2),
-            client_rate: LINK_RATE,
-            src: None,
-            src_in: Vec::new(),
-            src_out: Vec::new(),
-            src_bytes: Vec::new(),
+            vol: Volume::new(LINK_RATE, 2),
+            streams: Vec::new(),
+            next_stream: 0,
+            mix_acc: alloc::vec![0; FILL_MAX / 2],
+            mix_buf: alloc::vec![0; FILL_MAX],
+            pull_buf: alloc::vec![0; FILL_MAX],
         };
 
         // ── Codec discovery ────────────────────────────────────────────────
@@ -2997,10 +2627,17 @@ impl HdaDevice {
         );
         inner.setup_path(afg, &path)?;
 
+        let own_id = inner.add_stream(HdaInner::new_stream());
+        let inner = Arc::new(Mutex::new(inner));
         Ok(HdaDevice {
+            own: HdaStream {
+                inner: inner.clone(),
+                id: own_id,
+                name: name.clone(),
+            },
             name,
             is_nvidia,
-            inner: Mutex::new(inner),
+            inner,
         })
     }
 }
@@ -3018,86 +2655,69 @@ fn ring_size(szcap: u8) -> (usize, u8) {
     }
 }
 
-impl Scheme for HdaDevice {
+impl Scheme for HdaStream {
     fn name(&self) -> &str {
         &self.name
     }
 
-    fn handle_irq(&self, _irq: usize) {
-        // Fully polled.
+    fn handle_irq(&self, _irq: usize) {}
+}
+
+/// What a stream method needs to know about the engine, read before the
+/// stream is borrowed out of the table.
+#[derive(Clone, Copy)]
+struct Engine {
+    running: bool,
+    /// See [`HdaInner::ring_ahead`].
+    ahead: usize,
+}
+
+impl HdaStream {
+    /// Run `f` on this handle's stream, after a progress poll (which runs
+    /// the fill for every stream, this one included) when `poll` is set.
+    /// The stream exists for as long as the handle does (its `Drop` is
+    /// what removes it), so the `None` arm is unreachable in practice; it
+    /// is an error rather than a panic because this runs with the device
+    /// lock held and interrupts off.
+    fn with<R>(&self, poll: bool, f: impl FnOnce(&mut HostStream, Engine) -> R) -> DeviceResult<R> {
+        let mut inner = self.inner.lock();
+        if poll {
+            inner.poll_progress();
+        }
+        let engine = Engine {
+            running: inner.running,
+            ahead: inner.ring_ahead(),
+        };
+        let Some(stream) = inner.stream_mut(self.id) else {
+            return Err(DeviceError::NotReady);
+        };
+        Ok(f(stream, engine))
     }
 }
 
-impl AudioScheme for HdaDevice {
+impl AudioScheme for HdaStream {
     fn set_params(&self, rate: u32, channels: u8) -> DeviceResult<(u32, u8)> {
         // The client gets the rate it asked for (within reason); the link
-        // stays at LINK_RATE and the difference is resampled on the way in.
-        // See the fixed-rate sink notes above `LINK_RATE`.
-        let client_rate = rate.clamp(CLIENT_RATE_MIN, CLIENT_RATE_MAX);
+        // stays at LINK_RATE and the difference is resampled on the way
+        // into the stream. Only stereo, whatever was asked.
         let _ = channels;
-        let channels = 2u8; // stereo only for now
-        let mut inner = self.inner.lock();
-        if inner.client_rate != client_rate {
-            // One line per rate switch: the last serial line before a
-            // machine dies at a stream start says which step it reached.
-            warn!(
-                "[hda] set_params: client {} Hz -> {} Hz, link stays {} Hz (running={})",
-                inner.client_rate, client_rate, LINK_RATE, inner.running
-            );
-        }
-        let link_unchanged = inner.rate == LINK_RATE && inner.channels == channels;
-        let soft = prepare_keeps_engine(
-            inner.running,
-            inner.paused,
-            inner.needs_reprogram,
-            link_unchanged,
-        );
-        if soft {
-            // The link format is what it will be: drop the queued PCM and
-            // leave the engine running into a gap, no stop, no restart, no
-            // re-lock. Progress first, so the park lands past where the
-            // engine really is.
-            inner.poll_progress();
-            let now = timer_now_as_micros();
-            inner.soft_prepare(now);
-        } else {
-            inner.stop_stream();
-            inner.paused = false;
-            inner.queued = 0;
-            inner.wp = 0;
-            inner.zero_ptr = 0;
-            inner.gap_since_us = 0;
-            inner.pad_end = 0;
-            unsafe { core::ptr::write_bytes(inner.ring_va as *mut u8, 0, inner.ring_len) };
-            clflush_range(inner.ring_va, inner.ring_len);
-        }
-        inner.rate = LINK_RATE;
-        inner.channels = channels;
-        inner.client_rate = client_rate;
-        // A fresh converter per prepare: its input history belongs to the
-        // stream that was just dropped.
-        inner.src = if client_rate != LINK_RATE {
-            Some(Resampler::new(client_rate, LINK_RATE, channels as usize))
-        } else {
-            None
-        };
-        if !soft {
-            // The link format and the infoframe only need (re)stating when
-            // the stream is being set up from a stop; on a soft prepare
-            // they are unchanged by construction, and re-sending the
-            // infoframe is itself something a monitor may re-lock on.
-            inner.vol.set_format(LINK_RATE, channels as usize);
-            if inner.digital {
-                let ch = channels;
-                inner.send_audio_infoframe(ch);
+        let rate = self.with(false, |s, engine| {
+            let was = s.client_rate();
+            let now = s.set_params(rate);
+            if was != now {
+                warn!(
+                    "[hda] stream {}: client {} Hz -> {} Hz, link stays {} Hz (running={})",
+                    self.id, was, now, LINK_RATE, engine.running
+                );
             }
-        }
-        Ok((client_rate, channels))
+            now
+        })?;
+        Ok((rate, 2))
     }
 
     fn params(&self) -> (u32, u8) {
-        let inner = self.inner.lock();
-        (inner.client_rate, inner.channels)
+        self.with(false, |s, _| (s.client_rate(), 2))
+            .unwrap_or((LINK_RATE, 2))
     }
 
     fn write(&self, pcm: &[u8]) -> DeviceResult<usize> {
@@ -3121,213 +2741,223 @@ impl AudioScheme for HdaDevice {
             // stream start is not something a running desktop should see.
             crate::display::kick_hdmi_audio();
         }
-        let mut inner = self.inner.lock();
-        inner.poll_progress();
-        // A stream with nothing in flight: the next start begins at ring
-        // offset 0. Under a start hold the ring fills across several writes
-        // before the engine runs, so "fresh" is an empty ring, not merely a
-        // stopped engine -- re-anchoring the pointers on the second held
-        // write would drop the first one.
-        let fresh = !inner.running && !inner.paused && inner.queued == 0;
-        if fresh {
-            warn!(
-                "[hda] stream start: {} B offered at {} Hz, repick + stream reset next",
-                pcm.len(),
-                inner.rate
-            );
-            // Give the codec graph a chance to re-route to a pin that has
-            // gained presence/ELD since the last pick (on NVIDIA GPUs the ELD
-            // lands long after PCI probe)...
-            inner.repick_path();
-            // ...and re-anchor the software pointers: a started stream always
-            // begins DMA at ring offset 0.
-            inner.wp = 0;
-            inner.zero_ptr = 0;
-            inner.queued = 0;
-            inner.stream_written = 0;
-            inner.pad_end = 0;
-        }
-        let starting = !inner.running && !inner.paused && !inner.hold_start;
-        // Whole frames only, so channels never swap on a partial write.
-        let frame = inner.channels as usize * 2;
-        // `n` is what the CLIENT wrote and what this call returns; `link`
-        // is what goes into the ring. Without a converter they are the same
-        // bytes. With one, `n` is sized so its converted output is sure to
-        // fit (`accept_client_frames`), then converted into `src_bytes`.
-        let n = inner.client_free_bytes().min(pcm.len()) / frame * frame;
-        if n == 0 {
-            return Ok(0);
-        }
-        let taken = if inner.src.is_some() {
-            let link_len = inner.resample_client(pcm, n / frame);
-            let free = inner.free_bytes();
-            if link_len > free {
-                // Cannot happen (the slack in `accept_client_frames` covers
-                // the converter's ±1 frame, and the unit tests hold it to
-                // that), but a copy past the ring is the one outcome never
-                // worth risking: drop the excess rather than overrun.
-                warn!(
-                    "[hda] resampled write of {} B exceeds {} B free; truncating",
-                    link_len, free
-                );
-            }
-            let link_len = link_len.min(free) / frame * frame;
-            let bytes = core::mem::take(&mut inner.src_bytes);
-            let mut p = inner.wp;
-            let mut done = 0;
-            while done < link_len {
-                let chunk = (link_len - done).min(inner.ring_len - p);
-                let dst = inner.ring_va + p;
-                inner.copy_pcm_scaled(&bytes[done..done + chunk], dst, chunk);
-                clflush_range(dst, chunk);
-                p = (p + chunk) % inner.ring_len;
-                done += chunk;
-            }
-            inner.src_bytes = bytes;
-            inner.wp = p;
-            link_len
-        } else {
-            let mut p = inner.wp;
-            let mut done = 0;
-            while done < n {
-                let chunk = (n - done).min(inner.ring_len - p);
-                let dst = inner.ring_va + p;
-                inner.copy_pcm_scaled(&pcm[done..done + chunk], dst, chunk);
-                clflush_range(dst, chunk);
-                p = (p + chunk) % inner.ring_len;
-                done += chunk;
-            }
-            inner.wp = p;
-            n
-        };
-        inner.queued += taken;
-        inner.stream_written += taken;
-        // Client PCM again: the gap, if one was open, ends here. The pad
-        // ahead of it plays out on its own.
-        inner.gap_since_us = 0;
-        inner.silence_ahead();
-        if starting {
-            inner.start_stream()?;
-            warn!(
-                "[hda] stream started: {} B queued, CTL {:#x}",
-                inner.queued,
-                mmio_r32(inner.bar, inner.sd_base + SD_CTL)
-            );
+        let n = self.with(true, |s, _| s.write(pcm))?;
+        if n > 0 {
+            self.inner.lock().ensure_engine()?;
         }
         Ok(n)
     }
 
-    // The four counts the front ends see are in CLIENT bytes: identical to
-    // the ring's own when the client is at LINK_RATE, scaled by the rate
-    // ratio when a converter is in the path.
+    // The four counts the front ends see are the stream's, in CLIENT bytes
+    // (see `HostStream`): the ring never enters into them, except through
+    // `delay_bytes`.
 
     fn free_bytes(&self) -> usize {
-        let mut inner = self.inner.lock();
-        inner.poll_progress();
-        inner.client_free_bytes()
+        self.with(true, |s, _| s.free_bytes()).unwrap_or(0)
     }
 
     fn buffer_bytes(&self) -> usize {
-        let inner = self.inner.lock();
-        client_buffer_bytes(
-            inner.ring_len - RING_GUARD,
-            inner.client_rate,
-            inner.frame_bytes(),
-        )
+        self.with(false, |s, _| s.buffer_bytes()).unwrap_or(0)
     }
 
     fn buffer_bytes_at(&self, rate: u32) -> usize {
-        let inner = self.inner.lock();
-        client_buffer_bytes(inner.ring_len - RING_GUARD, rate, inner.frame_bytes())
+        self.with(false, |s, _| s.buffer_bytes_at(rate))
+            .unwrap_or(0)
     }
 
     fn queued_bytes(&self) -> usize {
-        let mut inner = self.inner.lock();
-        inner.poll_progress();
-        inner.client_queued_bytes()
+        self.with(true, |s, _| s.queued_bytes()).unwrap_or(0)
     }
 
     fn delay_bytes(&self) -> usize {
-        let mut inner = self.inner.lock();
-        inner.poll_progress();
-        inner.to_client_bytes(inner.queued)
+        self.with(true, |s, engine| {
+            // What the stream still holds, plus what the ring holds ahead
+            // of the play position if the stream is being mixed into it.
+            let ahead = if s.is_active() { engine.ahead } else { 0 };
+            s.to_client_bytes(s.queued_link() + ahead)
+        })
+        .unwrap_or(0)
     }
 
+    fn is_playing(&self) -> bool {
+        self.with(false, |s, engine| engine.running && s.is_active())
+            .unwrap_or(false)
+    }
+
+    fn reset(&self) -> DeviceResult {
+        self.with(false, |s, _| s.reset())
+    }
+
+    fn rewind(&self, bytes: usize) -> DeviceResult<usize> {
+        self.with(false, |s, _| s.rewind(bytes))
+    }
+
+    fn forward(&self, bytes: usize) -> DeviceResult<usize> {
+        self.with(false, |s, _| s.forward(bytes))
+    }
+
+    fn pause(&self) -> DeviceResult {
+        self.with(false, |s, _| s.pause())
+    }
+
+    fn resume(&self) -> DeviceResult {
+        self.with(false, |s, _| s.resume())?;
+        self.inner.lock().ensure_engine()
+    }
+
+    fn set_start_hold(&self, hold: bool) -> DeviceResult {
+        let started = self.with(false, |s, _| s.set_start_hold(hold))?;
+        if started {
+            // Released with a primed stream: it plays now, exactly as the
+            // write that filled it would have.
+            self.inner.lock().ensure_engine()?;
+        }
+        Ok(())
+    }
+
+    fn set_gain(&self, left: u8, right: u8, mute_left: bool, mute_right: bool) -> DeviceResult {
+        self.inner
+            .lock()
+            .set_gain(left, right, mute_left, mute_right);
+        Ok(())
+    }
+
+    fn gain(&self) -> (u8, u8, bool, bool) {
+        self.inner.lock().gain()
+    }
+
+    fn default_score(&self) -> i32 {
+        self.inner.lock().default_score()
+    }
+}
+
+impl HdaInner {
+    fn set_gain(&mut self, left: u8, right: u8, mute_left: bool, mute_right: bool) {
+        self.gain_l = left.min(100);
+        self.gain_r = right.min(100);
+        self.mute_l = mute_left;
+        self.mute_r = mute_right;
+        let (l, r) = (
+            gain_from_percent(left, mute_left),
+            gain_from_percent(right, mute_right),
+        );
+        self.vol.set_target(0, l);
+        self.vol.set_target(1, r);
+    }
+
+    fn gain(&self) -> (u8, u8, bool, bool) {
+        (self.gain_l, self.gain_r, self.mute_l, self.mute_r)
+    }
+
+    fn default_score(&mut self) -> i32 {
+        let pin = self.pin_nid;
+        if let Some(p) = self.candidates.iter().find(|c| c.pin == pin).cloned() {
+            self.score_path(&p).0
+        } else if self.digital {
+            1
+        } else {
+            0
+        }
+    }
+}
+
+impl Scheme for HdaDevice {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn handle_irq(&self, _irq: usize) {
+        // Fully polled.
+    }
+}
+
+/// The device as a client: its own stream, mixed like any other. What the
+/// front ends use is [`open_stream`](AudioScheme::open_stream).
+impl AudioScheme for HdaDevice {
+    fn open_stream(&self) -> DeviceResult<Option<Arc<dyn AudioScheme>>> {
+        let stream = HdaInner::new_stream();
+        let id = self.inner.lock().add_stream(stream);
+        Ok(Some(Arc::new(HdaStream {
+            inner: self.inner.clone(),
+            id,
+            name: alloc::format!("{}#{}", self.name, id),
+        })))
+    }
+
+    fn set_params(&self, rate: u32, channels: u8) -> DeviceResult<(u32, u8)> {
+        self.own.set_params(rate, channels)
+    }
+
+    fn params(&self) -> (u32, u8) {
+        self.own.params()
+    }
+
+    fn write(&self, pcm: &[u8]) -> DeviceResult<usize> {
+        self.own.write(pcm)
+    }
+
+    fn free_bytes(&self) -> usize {
+        self.own.free_bytes()
+    }
+
+    fn buffer_bytes(&self) -> usize {
+        self.own.buffer_bytes()
+    }
+
+    fn buffer_bytes_at(&self, rate: u32) -> usize {
+        self.own.buffer_bytes_at(rate)
+    }
+
+    /// Polls the engine as a side effect: the ALSA watchdog calls this on
+    /// every registered device every 4 ms while one is playing, and that
+    /// is what paces the ring fill for every stream on the device.
+    fn queued_bytes(&self) -> usize {
+        self.own.queued_bytes()
+    }
+
+    fn delay_bytes(&self) -> usize {
+        self.own.delay_bytes()
+    }
+
+    /// Whether the DMA engine is running, for any stream: the watchdog's
+    /// question, not the device stream's.
     fn is_playing(&self) -> bool {
         self.inner.lock().running
     }
 
     fn reset(&self) -> DeviceResult {
-        let mut inner = self.inner.lock();
-        inner.stop_stream();
-        inner.paused = false;
-        inner.queued = 0;
-        inner.wp = 0;
-        inner.zero_ptr = 0;
-        inner.gap_since_us = 0;
-        inner.pad_end = 0;
-        inner.silence_ring();
-        Ok(())
+        self.own.reset()
     }
 
     fn rewind(&self, bytes: usize) -> DeviceResult<usize> {
-        let mut inner = self.inner.lock();
-        let link = inner.to_link_bytes(bytes);
-        let done = inner.rewind_bytes(link);
-        Ok(inner.to_client_bytes(done))
+        self.own.rewind(bytes)
     }
 
     fn forward(&self, bytes: usize) -> DeviceResult<usize> {
-        let mut inner = self.inner.lock();
-        let link = inner.to_link_bytes(bytes);
-        let done = inner.forward_bytes(link);
-        Ok(inner.to_client_bytes(done))
+        self.own.forward(bytes)
     }
 
     fn pause(&self) -> DeviceResult {
-        self.inner.lock().pause_stream();
-        Ok(())
+        self.own.pause()
     }
 
     fn resume(&self) -> DeviceResult {
-        self.inner.lock().resume_stream()
+        self.own.resume()
     }
 
     fn set_start_hold(&self, hold: bool) -> DeviceResult {
-        let mut inner = self.inner.lock();
-        inner.hold_start = hold;
-        if hold || inner.running || inner.paused || inner.queued == 0 {
-            return Ok(());
-        }
-        // Released with a primed ring: start it now, exactly as the write
-        // that filled it would have.
-        inner.start_stream()?;
-        warn!(
-            "[hda] stream started on trigger: {} B queued, CTL {:#x}",
-            inner.queued,
-            mmio_r32(inner.bar, inner.sd_base + SD_CTL)
-        );
-        Ok(())
+        self.own.set_start_hold(hold)
     }
 
     fn set_gain(&self, left: u8, right: u8, mute_left: bool, mute_right: bool) -> DeviceResult {
-        let mut inner = self.inner.lock();
-        inner.gain_l = left.min(100);
-        inner.gain_r = right.min(100);
-        inner.mute_l = mute_left;
-        inner.mute_r = mute_right;
-        let (l, r) = (
-            gain_from_percent(left, mute_left),
-            gain_from_percent(right, mute_right),
-        );
-        inner.vol.set_target(0, l);
-        inner.vol.set_target(1, r);
+        self.inner
+            .lock()
+            .set_gain(left, right, mute_left, mute_right);
         Ok(())
     }
 
     fn gain(&self) -> (u8, u8, bool, bool) {
-        let inner = self.inner.lock();
-        (inner.gain_l, inner.gain_r, inner.mute_l, inner.mute_r)
+        self.inner.lock().gain()
     }
 
     fn diagnostics(&self) -> String {
@@ -3388,19 +3018,14 @@ impl AudioScheme for HdaDevice {
         );
         let _ = writeln!(
             out,
-            "[gpusnd] ring: running={} queued={} (pad {} B of driver silence ahead of it) wp={} rate={} ch={} client={} Hz src={} gap={}",
+            "[gpusnd] ring: running={} filled {} B ahead of the playhead (fill depth {} B, {} B mixed this stream) rate={} ch={} streams={} gap={}",
             inner.running,
-            inner.exposed_queued(),
-            inner.queued - inner.exposed_queued(),
-            inner.wp,
+            inner.ring_ahead(),
+            FILL_DEPTH,
+            inner.mixed_bytes,
             inner.rate,
             inner.channels,
-            inner.client_rate,
-            if inner.src.is_some() {
-                "resampling"
-            } else {
-                "passthrough"
-            },
+            inner.streams.len(),
             if inner.gap_since_us != 0 {
                 alloc::format!(
                     "{} ms (engine idling on silence, stops at {} ms)",
@@ -3411,6 +3036,37 @@ impl AudioScheme for HdaDevice {
                 String::from("none")
             }
         );
+        // One line per client stream: the host side of the pipeline. A
+        // stream that is started with nothing queued and `underruns` going
+        // up is a client that falls behind; one that is held or paused
+        // is what PulseAudio's cork looks like from here.
+        for (id, s) in inner.streams.iter() {
+            let (written, pulled, underruns) = s.stats();
+            let _ = writeln!(
+                out,
+                "[gpusnd]   stream {}: client={} Hz src={} queued={} B (link) of {} B state={}{} written={} B pulled={} B underruns={}",
+                id,
+                s.client_rate(),
+                if s.is_resampling() {
+                    "resampling"
+                } else {
+                    "passthrough"
+                },
+                s.queued_link(),
+                HOST_BUFFER,
+                if s.is_started() { "started" } else { "stopped" },
+                if s.is_paused() {
+                    " (paused)"
+                } else if s.is_held() {
+                    " (start held)"
+                } else {
+                    ""
+                },
+                written,
+                pulled,
+                underruns
+            );
+        }
         // Which position source the ring is pacing against. LPIB alone is the
         // fragile case: on a controller whose LPIB runs ahead of what has been
         // played, the writer is handed space that is still going to be played
@@ -3420,7 +3076,7 @@ impl AudioScheme for HdaDevice {
         let dpib = inner.dma_pos();
         let _ = writeln!(
             out,
-            "[gpusnd] position: LPIB {}{} guard={}B queued={}B free={}B of {}B",
+            "[gpusnd] position: LPIB {}{} guard={}B ahead={}B window={}B of {}B",
             inner.lpib(),
             match dpib {
                 Some(p) if inner.dpib_trusted => alloc::format!(" + DMA-pos {} (in use)", p),
@@ -3428,18 +3084,18 @@ impl AudioScheme for HdaDevice {
                 None => alloc::string::String::from(" only (controller refused a position buffer)"),
             },
             RING_GUARD,
-            inner.queued,
-            inner.free_bytes(),
+            inner.ring_ahead(),
+            (inner.ring_len - RING_GUARD).saturating_sub(inner.ring_ahead()),
             inner.ring_len
         );
         let _ = writeln!(
             out,
-            "[gpusnd] events: {} drains, {} underruns (gaps the engine idled through), {} idle stops, {} stream restarts, {} soft prepares (rate changes served without a restart), {} stop timeouts, {} rejected position reads{}",
+            "[gpusnd] events: {} drains, {} underruns (gaps the engine idled through), {} idle stops, {} stream restarts, {} late fills (the engine overtook the fill), {} stop timeouts, {} rejected position reads{}",
             inner.stat_drains,
             inner.stat_underruns,
             inner.stat_idle_stops,
             inner.stat_restarts,
-            inner.stat_soft_prepares,
+            inner.stat_late_fills,
             inner.stat_stop_timeouts,
             inner.stat_bad_pos,
             if inner.stat_bad_pos > 0 {
@@ -3536,7 +3192,6 @@ impl AudioScheme for HdaDevice {
                 "[gpusnd]   gap: {} at {} ms by kernel clock / {} ms by HDA wall clock, {} B written to that stream",
                 match ev.kind {
                     b'U' => "underrun",
-                    b'P' => "prepare",
                     _ => "drain",
                 },
                 ev.at_ms,
@@ -3725,15 +3380,7 @@ impl AudioScheme for HdaDevice {
     }
 
     fn default_score(&self) -> i32 {
-        let mut inner = self.inner.lock();
-        let pin = inner.pin_nid;
-        if let Some(p) = inner.candidates.iter().find(|c| c.pin == pin).cloned() {
-            inner.score_path(&p).0
-        } else if inner.digital {
-            1
-        } else {
-            0
-        }
+        self.inner.lock().default_score()
     }
 }
 
@@ -3819,35 +3466,173 @@ impl PciDriver for HdaDriverPci {
 
 #[cfg(test)]
 mod dai_tests {
-    use super::*;
+    //! The DAI side's one piece of arithmetic: where the next fill goes.
+    //! Everything else in the fill loop is a copy into the ring, which
+    //! needs the ring; the span is what decides whether that copy lands
+    //! ahead of the engine (audible), behind it (never heard), or over what
+    //! is still playing (heard as a dropout).
+
+    use super::{fill_span, mix_streams, BDL_SEGMENT, FILL_DEPTH, RING_GUARD, RING_PAGES};
+    use crate::audio::pipeline::host::HostStream;
+    use crate::nvme::nvme_queue::PAGE_SIZE;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    const RING: usize = RING_PAGES * PAGE_SIZE;
+    const FRAME: usize = 4;
 
     #[test]
-    fn park_lands_past_the_furthest_counter_plus_the_margin() {
-        // The link clock is behind both counters: the engine has fetched
-        // ahead, so the park goes past what the counters say.
-        assert_eq!(park_target(1000, 9000, 4000, 8192), 9000 + 8192);
-        assert_eq!(park_target(1000, 4000, 9000, 8192), 9000 + 8192);
-        // Counters that lag the clock (a rejected read) do not pull it back.
-        assert_eq!(park_target(9000, 0, 0, 8192), 9000 + 8192);
+    fn a_fresh_ring_is_primed_to_the_fill_depth() {
+        assert_eq!(
+            fill_span(0, 0, 0, RING, RING_GUARD, FILL_DEPTH, FRAME),
+            FILL_DEPTH
+        );
     }
 
     #[test]
-    fn the_pad_is_not_the_clients_to_count() {
-        // 16 KiB in the ring, 10 KiB of it the pad still ahead of the
-        // playhead: the client sees only its own 6 KiB.
-        assert_eq!(exposed_queued(16384, 30000, 20000 - 240), 16384 - 10240);
-        // The pad shrinks as the link plays it and the client's share does
-        // not change until the link reaches its data.
+    fn the_fill_follows_whichever_position_runs_furthest_ahead() {
+        // The link clock is ahead of the counter: fill to the clock + depth.
         assert_eq!(
-            exposed_queued(16384 - 4096, 30000, 20000 - 240 + 4096),
-            16384 - 10240
+            fill_span(10_000, 10_000, 4_000, RING, RING_GUARD, FILL_DEPTH, FRAME),
+            FILL_DEPTH
         );
-        // Once the playhead is past the pad, everything queued is the client's.
-        assert_eq!(exposed_queued(6144, 30000, 30000), 6144);
-        assert_eq!(exposed_queued(6144, 30000, 31000), 6144);
-        // Never negative, whatever the bookkeeping says.
-        assert_eq!(exposed_queued(100, 30000, 0), 0);
-        // No pad: identity.
-        assert_eq!(exposed_queued(777, 0, 12345), 777);
+        // The counter is ahead of the clock (QEMU's prefetch, an
+        // over-reporting LPIB): fill to the counter + depth. Behind the
+        // counter is where the engine has already been, and PCM written
+        // there is never fetched.
+        assert_eq!(
+            fill_span(10_000, 4_000, 10_000, RING, RING_GUARD, FILL_DEPTH, FRAME),
+            FILL_DEPTH
+        );
+        // A fill already ahead of both does nothing.
+        assert_eq!(
+            fill_span(
+                10_000 + FILL_DEPTH as u64,
+                10_000,
+                4_000,
+                RING,
+                RING_GUARD,
+                FILL_DEPTH,
+                FRAME
+            ),
+            0
+        );
+        // Part-way: the difference.
+        assert_eq!(
+            fill_span(
+                10_000 + 1_000,
+                10_000,
+                4_000,
+                RING,
+                RING_GUARD,
+                FILL_DEPTH,
+                FRAME
+            ),
+            FILL_DEPTH - 1_000
+        );
+    }
+
+    #[test]
+    fn the_fill_never_reaches_into_the_guard_behind_the_playhead() {
+        // A counter so far ahead of the clock that clock + ring - guard
+        // comes first: the window, not the depth, bounds the fill. PCM
+        // past the window overwrites what the link is still playing.
+        let lead = (RING - RING_GUARD) as u64;
+        assert_eq!(
+            fill_span(0, 0, lead, RING, RING_GUARD, FILL_DEPTH, FRAME),
+            RING - RING_GUARD
+        );
+        // And a fill already at the window edge writes nothing more.
+        assert_eq!(
+            fill_span(lead, 0, lead, RING, RING_GUARD, FILL_DEPTH, FRAME),
+            0
+        );
+        // A lead that has eaten the whole window: nothing, not a wrap.
+        assert_eq!(
+            fill_span(0, 0, 2 * RING as u64, RING, RING_GUARD, FILL_DEPTH, FRAME),
+            RING - RING_GUARD
+        );
+    }
+
+    #[test]
+    fn the_ring_covers_the_lead_qemu_was_seen_to_run_at() {
+        // 106 KB of reported position ahead of the link clock, plus the
+        // depth, still leaves the window open. With the 64 KiB ring this
+        // was zero: free = 0 with nothing audible queued.
+        let lead = 106_192u64;
+        let span = fill_span(0, 0, lead, RING, RING_GUARD, FILL_DEPTH, FRAME);
+        assert_eq!(span, lead as usize + FILL_DEPTH);
+        assert!(span + BDL_SEGMENT < RING - RING_GUARD);
+    }
+
+    /// Stereo S16LE frames of one constant sample.
+    fn frames(frames: usize, value: i16) -> Vec<u8> {
+        core::iter::repeat_n(value.to_le_bytes(), frames * 2)
+            .flatten()
+            .collect()
+    }
+
+    fn samples(block: &[u8]) -> Vec<i16> {
+        block
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| i16::from_le_bytes(*c))
+            .collect()
+    }
+
+    /// The mixer step the fill runs: every active stream is summed, a
+    /// short one is silence past its end, a paused one gives nothing, and
+    /// the count says whether the block holds anyone's PCM (a fill with
+    /// no contributor is a gap, and the gap is what the idle stop and the
+    /// underrun counter hang off).
+    #[test]
+    fn a_block_is_the_saturated_sum_of_every_active_stream() {
+        let mut streams = vec![
+            (0u32, HostStream::new(4096, 2)),
+            (1u32, HostStream::new(4096, 2)),
+            (2u32, HostStream::new(4096, 2)),
+        ];
+        streams[0].1.write(&frames(8, 1000));
+        streams[1].1.write(&frames(4, -300)); // shorter: silence after 4 frames
+        streams[2].1.write(&frames(8, 5)); // and paused: nothing at all
+        streams[2].1.pause();
+        let mut acc = vec![0i32; 64];
+        let mut pull = vec![0u8; 128];
+        let mut out = vec![0u8; 8 * 4];
+        assert_eq!(mix_streams(&mut streams, &mut acc, &mut pull, &mut out), 2);
+        let got = samples(&out);
+        assert!(got[..8].iter().all(|&v| v == 700), "{:?}", got);
+        assert!(got[8..].iter().all(|&v| v == 1000), "{:?}", got);
+        // The streams were drained by what was pulled, the paused one not.
+        assert_eq!(streams[0].1.queued_link(), 0);
+        assert_eq!(streams[1].1.queued_link(), 0);
+        assert_eq!(streams[2].1.queued_link(), 32);
+
+        // Nothing left in any active stream: a gap, and a block of zeros.
+        assert_eq!(mix_streams(&mut streams, &mut acc, &mut pull, &mut out), 0);
+        assert!(samples(&out).iter().all(|&v| v == 0));
+
+        // The sum saturates once, at the end: two full-scale streams are
+        // full scale, not wrapped to negative.
+        streams[0].1.write(&frames(8, i16::MAX));
+        streams[1].1.write(&frames(8, i16::MAX));
+        assert_eq!(mix_streams(&mut streams, &mut acc, &mut pull, &mut out), 2);
+        assert!(samples(&out).iter().all(|&v| v == i16::MAX));
+    }
+
+    #[test]
+    fn a_fill_is_whole_frames_and_never_negative() {
+        // Not cosmetic: a byte count that is not a multiple of the frame
+        // leaves the ring straddling a sample, and every left sample is
+        // read as a right one for the rest of the stream.
+        assert_eq!(fill_span(1, 0, 0, RING, RING_GUARD, 10, FRAME), 8);
+        assert_eq!(fill_span(3, 0, 0, RING, RING_GUARD, 10, FRAME), 4);
+        // Fill ahead of the target: zero, not a wrap to 2^64.
+        assert_eq!(fill_span(u64::MAX, 0, 0, RING, RING_GUARD, 10, FRAME), 0);
+        // A zero frame size asks for nothing instead of dividing by zero.
+        assert_eq!(fill_span(0, 0, 0, RING, RING_GUARD, FILL_DEPTH, 0), 0);
+        // A ring smaller than its guard (an uninitialised `ring_len`) too.
+        assert_eq!(fill_span(0, 0, 0, 0, RING_GUARD, FILL_DEPTH, FRAME), 0);
     }
 }

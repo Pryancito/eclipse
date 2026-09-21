@@ -11,8 +11,22 @@
 
 use super::Scheme;
 use crate::DeviceResult;
+use alloc::sync::Arc;
 
 pub trait AudioScheme: Scheme {
+    /// A stream of this device's own for one client, mixed with every
+    /// other open one -- the host side of a Sound Open Firmware playback
+    /// pipeline (`host -> src -> mixer -> dai`), where the DAI never sees
+    /// the applications. The handle is a full [`AudioScheme`]: the
+    /// client's rate, buffer, counts, pause, hold and reset are all its
+    /// own, and `set_gain`/`gain` reach the device's master volume. Its
+    /// drop removes the stream. `Ok(None)` (the default) means the device
+    /// has one ring and no mixer, and the front ends serialise opens on it
+    /// with a claim instead.
+    fn open_stream(&self) -> DeviceResult<Option<Arc<dyn AudioScheme>>> {
+        Ok(None)
+    }
+
     /// Negotiate the PCM output format. `rate` in Hz, `channels` interleaved
     /// S16LE. The device picks the nearest configuration it supports and
     /// returns the actual `(rate, channels)` now in effect. Implies

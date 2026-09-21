@@ -388,10 +388,14 @@ pub struct DspDev {
     index: usize,
     inode_id: usize,
     defaults: OssDefaults,
-    /// Shared with `/dev/snd/pcmC<index>D0p`: one writer per device ring.
+    /// Shared with `/dev/snd/pcmC<index>D0p`: one writer per device ring,
+    /// on a device that has one ring and no mixer.
     opened: AudioClaim,
-    /// Set on the per-open handle [`open_client`](DspDev::open_client) hands
-    /// out; the registry node that [`new`](DspDev::new) built owns nothing.
+    /// A per-open handle from [`open_client`](DspDev::open_client); the
+    /// registry node that [`new`](DspDev::new) built owns nothing.
+    client: bool,
+    /// This handle took `opened` and releases it on drop: a client of an
+    /// unmixed device. A client with a stream of its own never took it.
     release_opened_on_drop: bool,
     rt: Mutex<OssRuntime>,
 }
@@ -424,39 +428,51 @@ impl DspDev {
             inode_id: DevFS::new_inode_id(),
             defaults,
             opened,
+            client: false,
             release_opened_on_drop: false,
             rt: Mutex::new(OssRuntime::new(defaults.params())),
         }
     }
 
-    /// `open(2)` on `/dev/dsp<N>`: take the device or fail with `EBUSY`.
+    /// `open(2)` on `/dev/dsp<N>`.
     ///
-    /// The OSS node and the native PCM are two front ends onto ONE hardware
-    /// ring with no mixing, so the second one has to be refused — Linux
-    /// refuses it too. The refusal is also what fixes a bare `mpg123
-    /// file.mp3`: libout123 walks its built-in driver list and takes the
-    /// first module that loads AND opens, so an `EBUSY` here sends it on to
-    /// the ALSA module, `/etc/asound.conf`, the pulse plugin and a daemon
-    /// that mixes. Answering the open instead put a second writer into
-    /// PulseAudio's ring, and OSS playback came out silent.
+    /// On a device that mixes, the open is a stream of its own
+    /// ([`AudioScheme::open_stream`]), mixed in the kernel with the native
+    /// PCM's clients and every other `/dev/dsp` open: a bare `mpg123
+    /// file.mp3`, whose libout123 takes the first module that loads AND
+    /// opens, plays through here alongside PulseAudio rather than being
+    /// sent on to it with `EBUSY`.
+    ///
+    /// On a device with one ring and no mixer, the OSS node and the native
+    /// PCM are two front ends onto that ring, so the second one is refused
+    /// — Linux refuses it too — and that `EBUSY` is what sends mpg123 on
+    /// to the ALSA module, the pulse plugin and a daemon that mixes.
     ///
     /// Every open starts from the node's defaults: the runtime (format,
     /// fragments, trigger) belongs to the fd, as on Linux.
     pub fn open_client(&self) -> Result<Arc<dyn INode>> {
-        if self
-            .opened
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Err(FsError::Busy);
-        }
+        let (audio, release_opened_on_drop) =
+            match self.audio.open_stream().map_err(|_| FsError::DeviceError)? {
+                Some(stream) => (stream, false),
+                None => {
+                    if self
+                        .opened
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                    {
+                        return Err(FsError::Busy);
+                    }
+                    (self.audio.clone(), true)
+                }
+            };
         Ok(Arc::new(DspDev {
-            audio: self.audio.clone(),
+            audio,
             index: self.index,
             inode_id: self.inode_id,
             defaults: self.defaults,
             opened: self.opened.clone(),
-            release_opened_on_drop: true,
+            client: true,
+            release_opened_on_drop,
             rt: Mutex::new(OssRuntime::new(self.defaults.params())),
         }))
     }
@@ -801,7 +817,7 @@ impl DspDev {
 
 impl Drop for DspDev {
     fn drop(&mut self) {
-        if !self.release_opened_on_drop {
+        if !self.client {
             return;
         }
         // Close does NOT reset the stream: OSS `close(2)` drains by default
@@ -813,7 +829,9 @@ impl Drop for DspDev {
         // ring is by definition not playing, and the next client must not
         // inherit it.
         let _ = self.audio.set_start_hold(false);
-        self.opened.store(false, Ordering::Release);
+        if self.release_opened_on_drop {
+            self.opened.store(false, Ordering::Release);
+        }
     }
 }
 
